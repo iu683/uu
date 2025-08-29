@@ -226,150 +226,6 @@ cleanup_docker() {
     pause
 }
 
-# ================== Docker 备份/恢复 ==================
-docker_backup_restore() {
-    root_use
-
-    BACKUP_DIR="/opt/docker_backups"
-    mkdir -p "$BACKUP_DIR"
-
-    while true; do
-        clear
-        echo "===== Docker 备份与恢复 ====="
-        echo "1) 备份 Docker"
-        echo "2) 恢复 Docker"
-        echo "3) 删除备份文件"
-        echo "0) 返回上一级菜单"
-        read -p "请选择: " choice
-        case $choice in
-            1)
-                # 备份
-                echo "选择备份类型:"
-                echo "1. 容器"
-                echo "2. 镜像"
-                echo "3. 卷"
-                echo "4. 全量"
-                read -p "请输入选择: " btype
-
-                read -p "请输入备份文件名（默认 docker_backup_$(date +%F).tar.gz）: " backup_name
-                backup_name=${backup_name:-docker_backup_$(date +%F).tar.gz}
-                backup_path="$BACKUP_DIR/$backup_name"
-
-                mkdir -p /tmp/docker_backup
-
-                # 容器备份
-                if [ "$btype" = "1" ] || [ "$btype" = "4" ]; then
-                    echo "可用容器列表："
-                    docker ps -a --format "{{.Names}}"
-                    read -p "请输入要备份的容器名（多个用空格，留空则全部）: " selected_containers
-                    [ -z "$selected_containers" ] && selected_containers=$(docker ps -a --format "{{.Names}}")
-                    for cname in $selected_containers; do
-                        cid=$(docker ps -a -q -f name="^${cname}$")
-                        [ -z "$cid" ] && echo "容器 $cname 不存在，跳过" && continue
-                        # commit 容器为镜像再保存
-                        docker commit "$cid" "${cname}_backup"
-                        docker save "${cname}_backup" -o /tmp/docker_backup/image_"$cname".tar
-                        # 保存容器配置
-                        docker inspect "$cid" > /tmp/docker_backup/container_"$cname".json
-                    done
-                fi
-
-                # 镜像备份
-                if [ "$btype" = "2" ] || [ "$btype" = "4" ]; then
-                    echo "可用镜像列表："
-                    docker images --format "{{.Repository}}:{{.Tag}}"
-                    read -p "请输入要备份的镜像（多个用空格，留空则全部）: " selected_images
-                    [ -z "$selected_images" ] && selected_images=$(docker images --format "{{.Repository}}:{{.Tag}}")
-                    for iname in $selected_images; do
-                        [ "$iname" = "<none>:<none>" ] && continue
-                        safe_name=$(echo "$iname" | tr '/:' '_')
-                        docker save "$iname" -o /tmp/docker_backup/image_"$safe_name".tar
-                    done
-                fi
-
-                # 卷备份
-                if [ "$btype" = "3" ] || [ "$btype" = "4" ]; then
-                    echo "可用卷列表："
-                    docker volume ls -q
-                    read -p "请输入要备份的卷名（多个用空格，留空则全部）: " selected_volumes
-                    [ -z "$selected_volumes" ] && selected_volumes=$(docker volume ls -q)
-                    for vol in $selected_volumes; do
-                        [ ! -d /var/lib/docker/volumes/"$vol"/_data ] && echo "卷 $vol 不存在，跳过" && continue
-                        tar -czf /tmp/docker_backup/volume_"$vol".tar.gz -C /var/lib/docker/volumes/"$vol"/_data .
-                    done
-                fi
-
-                tar -czf "$backup_path" -C /tmp docker_backup
-                rm -rf /tmp/docker_backup
-                echo "备份完成: $backup_path"
-                read -p "按回车继续..."
-                ;;
-            2)
-                # 恢复
-                echo "选择恢复类型:"
-                echo "1. 容器"
-                echo "2. 镜像"
-                echo "3. 卷"
-                echo "4. 全量"
-                read -p "请输入选择: " rtype
-
-                read -p "请输入备份文件路径: " backup_file
-                [ ! -f "$backup_file" ] && echo "备份文件不存在" && read -p "按回车继续..." && continue
-                mkdir -p /tmp/docker_restore
-                tar -xzf "$backup_file" -C /tmp/docker_restore
-
-                # 恢复镜像（容器依赖）
-                for img_tar in /tmp/docker_restore/docker_backup/image_*.tar; do
-                    [ -f "$img_tar" ] && docker load -i "$img_tar"
-                done
-
-                # 容器恢复
-                if [ "$rtype" = "1" ] || [ "$rtype" = "4" ]; then
-                    for cjson in /tmp/docker_restore/docker_backup/container_*.json; do
-                        [ ! -f "$cjson" ] && continue
-                        cname=$(basename "$cjson" | sed 's/container_\(.*\).json/\1/')
-                        # 获取对应镜像名
-                        image_name="${cname}_backup"
-                        envs=$(jq -r '.[0].Config.Env | join(" -e ")' "$cjson")
-                        [ -n "$envs" ] && envs="-e $envs"
-                        ports=$(jq -r '.[0].HostConfig.PortBindings | to_entries | map("\(.value[0].HostPort):\(.key)") | join(" -p ")' "$cjson")
-                        [ -n "$ports" ] && ports="-p $ports"
-                        mounts=$(jq -r '.[0].Mounts | map("-v \(.Source):\(.Destination)") | join(" ")' "$cjson")
-                        network=$(jq -r '.[0].HostConfig.NetworkMode' "$cjson")
-                        docker run -d --name "$cname" $envs $ports $mounts --network "$network" "$image_name"
-                        echo "恢复容器: $cname"
-                    done
-                fi
-
-                # 卷恢复
-                if [ "$rtype" = "3" ] || [ "$rtype" = "4" ]; then
-                    for vol_file in /tmp/docker_restore/docker_backup/volume_*.tar.gz; do
-                        [ ! -f "$vol_file" ] && continue
-                        vol_name=$(basename "$vol_file" | sed 's/volume_\(.*\).tar.gz/\1/')
-                        docker volume create "$vol_name" >/dev/null 2>&1
-                        tar -xzf "$vol_file" -C /var/lib/docker/volumes/"$vol_name"/_data
-                    done
-                fi
-
-                rm -rf /tmp/docker_restore
-                echo "恢复完成"
-                read -p "按回车继续..."
-                ;;
-            3)
-                echo "当前备份目录：$BACKUP_DIR"
-                ls "$BACKUP_DIR"
-                read -p "请输入要删除的备份文件名（输入0返回上一级）: " del_file
-                [ "$del_file" != "0" ] && rm -f "$BACKUP_DIR/$del_file" && echo "已删除"
-                read -p "按回车继续..."
-                ;;
-            0) break ;;
-            *) echo "无效选择"; read -p "按回车继续..." ;;
-        esac
-    done
-}
-
-
-
 
 # ================== 主菜单 ==================
 main_menu() {
@@ -401,8 +257,7 @@ main_menu() {
         echo -e "${GREEN}7)  IPv6 开关${RESET}"
         echo -e "${GREEN}8)  开放所有端口${RESET}"
         echo -e "${GREEN}9)  一键清理 Docker${RESET}"
-        echo -e "${GREEN}10) Docker 备份/恢复${RESET}"
-        echo -e "${GREEN}11) 重启 Docker${RESET}"
+        echo -e "${GREEN}10) 重启 Docker${RESET}"
         echo -e "${GREEN}0)  退出${RESET}"
         read -p "请选择: " choice
         case $choice in
@@ -415,8 +270,7 @@ main_menu() {
             7) ipv6_menu ;;
             8) open_all_ports ;;
             9) cleanup_docker ;;
-            10) docker_backup_restore ;;
-            11) restart_docker ;;
+            10) restart_docker ;;
             0) exit 0 ;;
             *) warn "无效选项"; pause ;;
         esac

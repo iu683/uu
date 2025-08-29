@@ -5,6 +5,7 @@
 # =============================
 GREEN="\033[32m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
 # =============================
@@ -13,7 +14,7 @@ RESET="\033[0m"
 menu() {
     clear
     echo -e "${GREEN}=== 甲骨文管理菜单 ===${RESET}"
-    echo -e "${GREEN}当前时间: $(date '+%Y-%m-%d %H:%M:%S')${RESET}"
+    echo -e "${YELLOW}当前时间: $(date '+%Y-%m-%d %H:%M:%S')${RESET}"
     printf "${GREEN}[01] 甲骨文救砖${RESET}\n"
     printf "${GREEN}[02] 开启 ROOT 登录${RESET}\n"
     printf "${GREEN}[03] 一键重装系统${RESET}\n"

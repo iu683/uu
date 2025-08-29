@@ -346,7 +346,7 @@ main_menu() {
             7) ipv6_menu ;;
             8) open_all_ports ;;
             9) cleanup_docker ;;
-            10) docker_backup_menu ;;
+            10) docker_backup_restore ;;
             11) restart_docker ;;
             0) exit 0 ;;
             *) warn "无效选项"; pause ;;

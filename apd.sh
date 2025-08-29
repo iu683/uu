@@ -107,59 +107,91 @@ check_status() {
 
 # ================== 容器管理 ==================
 container_menu() {
-    while true; do
-        echo -e "${GREEN}===== 容器管理 =====${RESET}"
-        echo -e "${GREEN}1) 查看所有容器${RESET}"
-        echo -e "${GREEN}2) 启动容器${RESET}"
-        echo -e "${GREEN}3) 停止容器${RESET}"
-        echo -e "${GREEN}4) 删除容器${RESET}"
-        echo -e "${GREEN}0) 返回主菜单${RESET}"
-        read -p "请选择: " c_choice
-        case $c_choice in
-            1) docker ps -a; pause ;;
-            2) read -p "容器名称/ID: " cid; docker start "$cid"; pause ;;
-            3) read -p "容器名称/ID: " cid; docker stop "$cid"; pause ;;
-            4) read -p "容器名称/ID: " cid; docker rm "$cid"; pause ;;
-            0) break ;;
-            *) warn "无效选项"; pause ;;
-        esac
-    done
+    echo -e "${GREEN}===== 容器管理 =====${RESET}"
+    echo -e "${GREEN}1) 查看所有容器${RESET}"
+    echo -e "${GREEN}2) 启动容器${RESET}"
+    echo -e "${GREEN}3) 停止容器${RESET}"
+    echo -e "${GREEN}4) 删除容器${RESET}"
+    echo -e "${GREEN}0) 返回主菜单${RESET}"
+    read -p "请选择: " c_choice
+    case $c_choice in
+        1)
+            docker ps -a
+            pause
+            ;;
+        2)
+            read -p "容器名称/ID: " cid
+            if [ -n "$cid" ]; then
+                docker start "$cid"
+                info "容器 $cid 已启动"
+            else
+                warn "容器名称或ID不能为空"
+            fi
+            pause
+            ;;
+        3)
+            read -p "容器名称/ID: " cid
+            if [ -n "$cid" ]; then
+                docker stop "$cid"
+                info "容器 $cid 已停止"
+            else
+                warn "容器名称或ID不能为空"
+            fi
+            pause
+            ;;
+        4)
+            read -p "容器名称/ID: " cid
+            if [ -n "$cid" ]; then
+                # 自动停止运行中的容器
+                if [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)" = "true" ]; then
+                    info "容器正在运行，先停止容器..."
+                    docker stop "$cid"
+                fi
+                docker rm "$cid"
+                info "容器 $cid 已删除"
+            else
+                warn "容器名称或ID不能为空"
+            fi
+            pause
+            ;;
+        0) return ;;
+        *) warn "无效选项"; pause ;;
+    esac
+    container_menu
 }
 
 # ================== 镜像管理 ==================
 image_menu() {
-    while true; do
-        echo -e "${GREEN}===== 镜像管理 =====${RESET}"
-        echo -e "${GREEN}1) 查看镜像列表${RESET}"
-        echo -e "${GREEN}2) 拉取镜像${RESET}"
-        echo -e "${GREEN}3) 删除镜像${RESET}"
-        echo -e "${GREEN}0) 返回主菜单${RESET}"
-        read -p "请选择: " i_choice
-        case $i_choice in
-            1) docker images; pause ;;
-            2) read -p "镜像名称: " img; docker pull "$img"; pause ;;
-            3) read -p "镜像名称/ID: " img; docker rmi "$img"; pause ;;
-            0) break ;;
-            *) warn "无效选项"; pause ;;
-        esac
-    done
+    echo -e "${GREEN}===== 镜像管理 =====${RESET}"
+    echo -e "${GREEN}1) 查看镜像列表${RESET}"
+    echo -e "${GREEN}2) 拉取镜像${RESET}"
+    echo -e "${GREEN}3) 删除镜像${RESET}"
+    echo -e "${GREEN}0) 返回主菜单${RESET}"
+    read -p "请选择: " i_choice
+    case $i_choice in
+        1) docker images; pause ;;
+        2) read -p "镜像名称: " img; docker pull "$img"; pause ;;
+        3) read -p "镜像名称/ID: " img; docker rmi "$img"; pause ;;
+        0) return ;;
+        *) warn "无效选项"; pause ;;
+    esac
+    image_menu
 }
 
 # ================== 卷管理 ==================
 volume_menu() {
-    while true; do
-        echo -e "${GREEN}===== 卷管理 =====${RESET}"
-        echo -e "${GREEN}1) 查看卷列表${RESET}"
-        echo -e "${GREEN}2) 删除卷${RESET}"
-        echo -e "${GREEN}0) 返回主菜单${RESET}"
-        read -p "请选择: " v_choice
-        case $v_choice in
-            1) docker volume ls; pause ;;
-            2) read -p "卷名称: " vol; docker volume rm "$vol"; pause ;;
-            0) break ;;
-            *) warn "无效选项"; pause ;;
-        esac
-    done
+    echo -e "${GREEN}===== 卷管理 =====${RESET}"
+    echo -e "${GREEN}1) 查看卷列表${RESET}"
+    echo -e "${GREEN}2) 删除卷${RESET}"
+    echo -e "${GREEN}0) 返回主菜单${RESET}"
+    read -p "请选择: " v_choice
+    case $v_choice in
+        1) docker volume ls; pause ;;
+        2) read -p "卷名称: " vol; docker volume rm "$vol"; pause ;;
+        0) return ;;
+        *) warn "无效选项"; pause ;;
+    esac
+    volume_menu
 }
 
 # ================== IPv6 开关 ==================
@@ -273,7 +305,6 @@ main_menu() {
     root_use
     while true; do
         clear
-        # ---------- 状态栏 ----------
         if command -v docker >/dev/null 2>&1; then
             docker_status=$(docker info >/dev/null 2>&1 && echo "运行中" || echo "未运行")
             total_containers=$(docker ps -a -q 2>/dev/null | wc -l)
@@ -288,21 +319,20 @@ main_menu() {
         ipv6_display=$([ "$IPV6_STATUS" -eq 0 ] && echo "启用" || echo "禁用")
 
         echo -e "${GREEN}====== Alpine Docker 管理 ======${RESET}"
-        echo -e "${YELLOW}Docker: $docker_status | 容器: $running_containers/$total_containers | IPv6: $ipv6_display${RESET}"
-        echo
+        echo -e "${YELLOW}Docker: $docker_status | 容器: $running_containers/$total_containers | IPv6: $ipv6_display${RESET}\n"
 
-        echo -e "${GREEN}1) 安装/更新 Docker${RESET}"
-        echo -e "${GREEN}2) 安装/更新 Docker Compose${RESET}"
-        echo -e "${GREEN}3) 卸载 Docker & Compose${RESET}"
-        echo -e "${GREEN}4) 容器管理${RESET}"
-        echo -e "${GREEN}5) 镜像管理${RESET}"
-        echo -e "${GREEN}6) 卷管理${RESET}"
-        echo -e "${GREEN}7) IPv6 开关${RESET}"
-        echo -e "${GREEN}8) 开放所有端口${RESET}"
-        echo -e "${GREEN}9) 一键清理 Docker${RESET}"
+        echo -e "${GREEN}1)  安装/更新 Docker${RESET}"
+        echo -e "${GREEN}2)  安装/更新 Docker Compose${RESET}"
+        echo -e "${GREEN}3)  卸载 Docker & Compose${RESET}"
+        echo -e "${GREEN}4)  容器管理${RESET}"
+        echo -e "${GREEN}5)  镜像管理${RESET}"
+        echo -e "${GREEN}6)  卷管理${RESET}"
+        echo -e "${GREEN}7)  IPv6 开关${RESET}"
+        echo -e "${GREEN}8)  开放所有端口${RESET}"
+        echo -e "${GREEN}9)  一键清理 Docker${RESET}"
         echo -e "${GREEN}10) Docker 备份/恢复${RESET}"
         echo -e "${GREEN}11) 重启 Docker${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
+        echo -e "${GREEN}0)  退出${RESET}"
         read -p "请选择: " choice
         case $choice in
             1) install_docker ;;

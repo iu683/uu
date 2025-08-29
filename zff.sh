@@ -1,185 +1,114 @@
 #!/bin/bash
-set -e
+# IPv4 / IPv6 切换脚本 (循环版，跨系统，自动安装依赖)
 
+# 颜色
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-LOG_PATH="/var/log/auth.log"
+# 检查命令是否存在
+has_cmd() {
+    command -v "$1" >/dev/null 2>&1
+}
 
-info() { echo -e "${GREEN}[INFO] $1${RESET}"; }
-warn() { echo -e "${YELLOW}[WARN] $1${RESET}"; }
-error() { echo -e "${RED}[ERROR] $1${RESET}"; }
+# 自动安装函数
+install_pkg() {
+    local pkg="$1"
+    echo -e "${YELLOW}🔧 检查依赖: $pkg${RESET}"
 
-# -------------------------
-# 检查系统
-# -------------------------
-if [[ ! -f /etc/alpine-release ]]; then
-    echo -e "${RED}❌ 本脚本仅适用于 Alpine Linux${RESET}"
-    exit 1
-fi
-
-# -------------------------
-# 安装 Fail2Ban 和 rsyslog
-# -------------------------
-install_fail2ban() {
-    info "更新apk索引并安装 fail2ban 和 rsyslog..."
-    apk update
-    apk add --no-cache fail2ban rsyslog openssh
-
-    # 开机自启
-    rc-update add rsyslog
-    rc-update add sshd
-    rc-update add fail2ban
-
-    service rsyslog start
-    service sshd start
-    service fail2ban start
-
-    # 配置 SSH 输出日志
-    if ! grep -q "^SyslogFacility AUTH" /etc/ssh/sshd_config; then
-        echo "SyslogFacility AUTH" >> /etc/ssh/sshd_config
-        echo "LogLevel INFO" >> /etc/ssh/sshd_config
-        service sshd restart
+    if has_cmd "$pkg"; then
+        echo -e "${GREEN}✔ 已安装 $pkg${RESET}"
+        return 0
     fi
 
-    # 配置 rsyslog 写入 auth.log
-    mkdir -p /etc/rsyslog.d
-    echo "auth,authpriv.*    /var/log/auth.log" >/etc/rsyslog.d/sshd.conf
-    touch "$LOG_PATH"
-    chmod 600 "$LOG_PATH"
-    service rsyslog restart
+    echo -e "${RED}✘ 未找到 $pkg，正在安装...${RESET}"
 
-    info "✅ Fail2Ban 和 SSH 日志配置完成"
-}
-
-# -------------------------
-# 配置 SSH 防护
-# -------------------------
-configure_ssh() {
-    read -p $'\033[32m请输入 SSH 端口（默认22）: \033[0m' SSH_PORT
-    SSH_PORT=${SSH_PORT:-22}
-
-    read -p $'\033[32m请输入最大失败尝试次数 maxretry（默认5）: \033[0m' MAX_RETRY
-    MAX_RETRY=${MAX_RETRY:-5}
-
-    read -p $'\033[32m请输入封禁时间 bantime(秒，默认600): \033[0m' BAN_TIME
-    BAN_TIME=${BAN_TIME:-600}
-
-    mkdir -p /etc/fail2ban/jail.d
-    cat >/etc/fail2ban/jail.d/sshd.local <<EOF
-[sshd]
-enabled = true
-port = $SSH_PORT
-filter = sshd
-logpath = $LOG_PATH
-maxretry = $MAX_RETRY
-bantime  = $BAN_TIME
-EOF
-
-    service fail2ban restart
-    info "✅ SSH 防暴力破解配置完成"
-}
-
-# -------------------------
-# 卸载 Fail2Ban
-# -------------------------
-uninstall_fail2ban() {
-    info "正在卸载 Fail2Ban..."
-    service fail2ban stop || true
-    apk del fail2ban rsyslog
-    sed -i '/SyslogFacility AUTH/d;/LogLevel INFO/d' /etc/ssh/sshd_config || true
-    info "✅ Fail2Ban 已卸载"
-}
-
-# -------------------------
-# 查看被封禁 IP
-# -------------------------
-view_banned() {
-    if command -v fail2ban-client &>/dev/null; then
-        BANNED=$(fail2ban-client status sshd 2>/dev/null | grep 'Banned IP list' | cut -d: -f2)
-        echo -e "${GREEN}当前被封禁的 IP:${RESET} ${BANNED:-无}"
+    if has_cmd apt; then
+        apt update -y && apt install -y "$pkg"
+    elif has_cmd apk; then
+        apk add --no-cache "$pkg"
+    elif has_cmd yum; then
+        yum install -y "$pkg"
+    elif has_cmd dnf; then
+        dnf install -y "$pkg"
     else
-        echo -e "${RED}Fail2Ban 未安装或未启动${RESET}"
+        echo -e "${RED}❌ 未找到可用的包管理器，无法安装 $pkg${RESET}"
     fi
-    read -p $'\033[32m按回车返回菜单...\033[0m'
 }
 
-# -------------------------
-# 查看规则列表
-# -------------------------
-view_jails() {
-    if command -v fail2ban-client &>/dev/null; then
-        JAILS=$(fail2ban-client status 2>/dev/null | grep 'Jail list' | cut -d: -f2)
-        echo -e "${GREEN}当前防御规则列表:${RESET} ${JAILS:-无}"
-    else
-        echo -e "${RED}Fail2Ban 未安装或未启动${RESET}"
-    fi
-    read -p $'\033[32m按回车返回菜单...\033[0m'
-}
+# 先检查并安装常用依赖
+install_pkg curl
+install_pkg iproute2 || install_pkg iproute   # 有的系统包名不同
+install_pkg iputils-ping || install_pkg inetutils-ping || install_pkg iputils
 
-# -------------------------
-# 日志实时监控
-# -------------------------
-monitor_log() {
-    if [[ -f "$LOG_PATH" ]]; then
-        echo -e "${GREEN}进入日志实时监控，按 Ctrl+C 返回菜单${RESET}"
-        trap 'echo -e "\n${GREEN}已退出日志监控${RESET}"' SIGINT
-        tail -n 20 -f "$LOG_PATH" || true
-        trap - SIGINT
-    else
-        echo -e "${RED}日志文件不存在${RESET}"
-    fi
-    read -p $'\033[32m按回车返回菜单...\033[0m'
-}
-
-# -------------------------
-# 菜单
-# -------------------------
 while true; do
-    clear
-    echo -e "${GREEN}Alpine Linux SSH 防暴力破解管理菜单${RESET}"
-    echo -e "${GREEN}---------------------------------${RESET}"
-    echo -e "${GREEN}1. 安装并开启 SSH 防暴力破解${RESET}"
-    echo -e "${GREEN}2. 配置 SSH 防护参数${RESET}"
-    echo -e "${GREEN}3. 查看被封禁 IP${RESET}"
-    echo -e "${GREEN}4. 查看规则列表${RESET}"
-    echo -e "${GREEN}5. 日志实时监控${RESET}"
-    echo -e "${GREEN}6. 卸载 Fail2Ban${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}---------------------------------${RESET}"
+    echo "=============================="
+    echo " 1) IPv4 优先 (禁用 IPv6)"
+    echo " 2) IPv6 优先 (启用 IPv6)"
+    echo " 3) 查看 IPv6 状态 & 公网IP"
+    echo " 0) 退出"
+    echo "=============================="
+    read -p "请输入选择: " choice
 
-    read -p $'\033[32m请输入你的选择: \033[0m' choice
-
-    case "$choice" in
+    case $choice in
         1)
-            install_fail2ban
-            configure_ssh
-            read -p $'\033[32m按回车返回菜单...\033[0m'
+            if has_cmd sysctl; then
+                sysctl -w net.ipv6.conf.all.disable_ipv6=1 > /dev/null 2>&1
+                sysctl -w net.ipv6.conf.default.disable_ipv6=1 > /dev/null 2>&1
+                echo -e "${GREEN}✅ 已切换为 IPv4 优先（禁用 IPv6）${RESET}"
+            else
+                echo -e "${RED}⚠️ 系统不支持 sysctl，无法切换${RESET}"
+            fi
             ;;
         2)
-            configure_ssh
+            if has_cmd sysctl; then
+                sysctl -w net.ipv6.conf.all.disable_ipv6=0 > /dev/null 2>&1
+                sysctl -w net.ipv6.conf.default.disable_ipv6=0 > /dev/null 2>&1
+                echo -e "${GREEN}✅ 已切换为 IPv6 优先（启用 IPv6）${RESET}"
+            else
+                echo -e "${RED}⚠️ 系统不支持 sysctl，无法切换${RESET}"
+            fi
             ;;
         3)
-            view_banned
-            ;;
-        4)
-            view_jails
-            ;;
-        5)
-            monitor_log
-            ;;
-        6)
-            uninstall_fail2ban
-            read -p $'\033[32m按回车返回菜单...\033[0m'
+            echo "🌐 当前 IPv6 状态："
+            if has_cmd sysctl; then
+                sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null || true
+                sysctl net.ipv6.conf.default.disable_ipv6 2>/dev/null || true
+            fi
+
+            ip -6 addr | grep "inet6 " || echo "未检测到 IPv6 地址"
+
+            echo
+            echo "🔎 测试 IPv6 连通性..."
+            if has_cmd ping6; then
+                ping6 -c 3 ipv6.google.com >/dev/null 2>&1 && echo -e "${GREEN}✅ IPv6 网络连通正常${RESET}" || echo -e "${RED}❌ IPv6 无法访问公网${RESET}"
+            elif has_cmd ping; then
+                ping -6 -c 3 ipv6.google.com >/dev/null 2>&1 && echo -e "${GREEN}✅ IPv6 网络连通正常${RESET}" || echo -e "${RED}❌ IPv6 无法访问公网${RESET}"
+            else
+                echo -e "${RED}⚠️ 系统没有 ping/ping6 命令${RESET}"
+            fi
+
+            echo
+            echo "🌍 公网 IP 信息："
+            if has_cmd curl; then
+                echo -n "IPv4: "
+                curl -4 -s ifconfig.co || echo "获取失败"
+                echo
+                echo -n "IPv6: "
+                curl -6 -s ifconfig.co || echo "获取失败"
+                echo
+            else
+                echo -e "${RED}⚠️ 未安装 curl，无法获取公网 IP${RESET}"
+            fi
             ;;
         0)
-            break
+            echo "👋 已退出"
+            exit 0
             ;;
         *)
-            echo -e "${RED}无效选择，请重新输入${RESET}"
-            sleep 1
+            echo -e "${RED}❌ 无效选项，请重新输入${RESET}"
             ;;
     esac
+    echo
 done

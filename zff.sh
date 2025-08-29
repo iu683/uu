@@ -2,9 +2,11 @@
 set -e
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
+
+LOG_PATH="/var/log/auth.log"
 
 info() { echo -e "${GREEN}[INFO] $1${RESET}"; }
 warn() { echo -e "${YELLOW}[WARN] $1${RESET}"; }
@@ -18,37 +20,38 @@ if [[ ! -f /etc/alpine-release ]]; then
     exit 1
 fi
 
-LOG_PATH="/var/log/auth.log"
-
 # -------------------------
 # 安装 Fail2Ban 和 rsyslog
 # -------------------------
 install_fail2ban() {
-    info "安装 fail2ban 和 rsyslog..."
+    info "更新apk索引并安装 fail2ban 和 rsyslog..."
     apk update
     apk add --no-cache fail2ban rsyslog openssh
 
-    # 启动服务并设置开机启动
+    # 开机自启
     rc-update add rsyslog
-    service rsyslog start
-
     rc-update add sshd
-    service sshd start
-
     rc-update add fail2ban
+
+    service rsyslog start
+    service sshd start
     service fail2ban start
 
-    # 创建日志文件
-    [[ ! -f "$LOG_PATH" ]] && touch "$LOG_PATH" && chmod 600 "$LOG_PATH"
-
-    # 配置 SSH 日志
+    # 配置 SSH 输出日志
     if ! grep -q "^SyslogFacility AUTH" /etc/ssh/sshd_config; then
         echo "SyslogFacility AUTH" >> /etc/ssh/sshd_config
         echo "LogLevel INFO" >> /etc/ssh/sshd_config
         service sshd restart
     fi
 
-    info "✅ Fail2Ban 已安装并启动"
+    # 配置 rsyslog 写入 auth.log
+    mkdir -p /etc/rsyslog.d
+    echo "auth,authpriv.*    /var/log/auth.log" >/etc/rsyslog.d/sshd.conf
+    touch "$LOG_PATH"
+    chmod 600 "$LOG_PATH"
+    service rsyslog restart
+
+    info "✅ Fail2Ban 和 SSH 日志配置完成"
 }
 
 # -------------------------
@@ -67,17 +70,16 @@ configure_ssh() {
     mkdir -p /etc/fail2ban/jail.d
     cat >/etc/fail2ban/jail.d/sshd.local <<EOF
 [sshd]
-enabled  = true
-port     = $SSH_PORT
-filter   = sshd
-logpath  = $LOG_PATH
+enabled = true
+port = $SSH_PORT
+filter = sshd
+logpath = $LOG_PATH
 maxretry = $MAX_RETRY
 bantime  = $BAN_TIME
 EOF
 
     service fail2ban restart
     info "✅ SSH 防暴力破解配置完成"
-    read -p $'\033[32m按回车返回菜单...\033[0m'
 }
 
 # -------------------------
@@ -87,11 +89,8 @@ uninstall_fail2ban() {
     info "正在卸载 Fail2Ban..."
     service fail2ban stop || true
     apk del fail2ban rsyslog
-    # 恢复 SSH 配置
-    sed -i '/SyslogFacility AUTH/d;/LogLevel INFO/d' /etc/ssh/sshd_config
-    service sshd restart
+    sed -i '/SyslogFacility AUTH/d;/LogLevel INFO/d' /etc/ssh/sshd_config || true
     info "✅ Fail2Ban 已卸载"
-    read -p $'\033[32m按回车返回菜单...\033[0m'
 }
 
 # -------------------------
@@ -157,6 +156,7 @@ while true; do
         1)
             install_fail2ban
             configure_ssh
+            read -p $'\033[32m按回车返回菜单...\033[0m'
             ;;
         2)
             configure_ssh
@@ -172,6 +172,7 @@ while true; do
             ;;
         6)
             uninstall_fail2ban
+            read -p $'\033[32m按回车返回菜单...\033[0m'
             ;;
         0)
             break

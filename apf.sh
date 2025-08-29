@@ -2,7 +2,7 @@
 set -e
 
 # ===============================
-# Alpine Linux 防火墙管理脚本 (IPv4/IPv6)
+# Alpine Linux 防火墙管理脚本 (IPv4/IPv6 自动识别)
 # ===============================
 
 GREEN='\033[32m'
@@ -33,7 +33,7 @@ save_rules() {
 }
 
 # ===============================
-# 初始化防火墙规则
+# 初始化默认规则
 # ===============================
 init_rules() {
     SSH_PORT=$(get_ssh_port)
@@ -55,72 +55,78 @@ init_rules() {
         [ "$proto" = "ip6tables" ] && $proto -A INPUT -p icmpv6 -j ACCEPT
     done
     save_rules
-    info "✅ 默认规则已初始化，放行 SSH/80/443"
+    info "✅ 默认规则已初始化 (放行 SSH/80/443)"
     read -r -p "按回车返回菜单..."
 }
 
 # ===============================
-# 安装必要工具
+# 安装必要工具（首次检测）
 # ===============================
 install_firewall_tools() {
-    NEED_INSTALL=0
+    FIRST_INSTALL=0
     for cmd in iptables ip6tables bash curl wget vim sudo git; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
-            NEED_INSTALL=1
+            FIRST_INSTALL=1
             break
         fi
     done
 
-    if [ "$NEED_INSTALL" -eq 1 ]; then
+    if [ "$FIRST_INSTALL" -eq 1 ]; then
         info "检测到部分工具未安装，正在安装..."
         apk update
         apk add --no-cache iptables ip6tables bash curl wget vim sudo git || true
         mkdir -p /etc/iptables
         info "✅ 防火墙工具安装完成"
-        read -r -p "按回车继续..."
     else
+        # 如果已有规则文件，恢复
+        if [ -f /etc/iptables/rules.v4 ] || [ -f /etc/iptables/rules.v6 ]; then
+            iptables-restore < /etc/iptables/rules.v4 2>/dev/null || true
+            ip6tables-restore < /etc/iptables/rules.v6 2>/dev/null || true
+            info "✅ 检测到已保存防火墙规则，正在恢复..."
+        fi
         info "所有必要工具已安装，无需重复安装"
     fi
 }
 
 # ===============================
-# IP 规则操作
+# IP 规则操作 (IPv4/IPv6 自动识别)
 # ===============================
 ip_action() {
     ACTION=$1
     IP=$2
 
-    if echo "$IP" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
-        PROTOS="iptables"
-    elif echo "$IP" | grep -Eq '^([0-9a-fA-F:]+)$'; then
-        PROTOS="ip6tables"
+    if echo "$IP" | grep -q ':'; then
+        PROTO=ip6tables
     else
-        warn "输入不是有效 IPv4 或 IPv6"
+        PROTO=iptables
+    fi
+
+    if ! echo "$IP" | grep -E -q '^[0-9a-fA-F:.]+$'; then
+        warn "输入不是有效 IP"
         read -r -p "按回车返回菜单..."
         return
     fi
 
-    for proto in $PROTOS; do
-        case $ACTION in
-            accept) $proto -I INPUT -s "$IP" -j ACCEPT ;;
-            drop)   $proto -I INPUT -s "$IP" -j DROP ;;
-            delete)
-                while $proto -C INPUT -s "$IP" -j ACCEPT 2>/dev/null; do
-                    $proto -D INPUT -s "$IP" -j ACCEPT
-                done
-                while $proto -C INPUT -s "$IP" -j DROP 2>/dev/null; do
-                    $proto -D INPUT -s "$IP" -j DROP
-                done
-                ;;
-        esac
-    done
+    case $ACTION in
+        accept) $PROTO -I INPUT -s "$IP" -j ACCEPT ;;
+        drop)   $PROTO -I INPUT -s "$IP" -j DROP ;;
+        delete)
+            while $PROTO -C INPUT -s "$IP" -j ACCEPT 2>/dev/null; do
+                $PROTO -D INPUT -s "$IP" -j ACCEPT
+            done
+            while $PROTO -C INPUT -s "$IP" -j DROP 2>/dev/null; do
+                $PROTO -D INPUT -s "$IP" -j DROP
+            done
+            ;;
+    esac
+
     save_rules
     info "✅ 操作完成: $ACTION $IP"
     read -r -p "按回车返回菜单..."
 }
 
 # ===============================
-# 开放端口
+# 开放指定端口（TCP/UDP）
 # ===============================
 open_port() {
     read -r -p "请输入要开放的端口号: " PORT
@@ -139,7 +145,7 @@ open_port() {
 }
 
 # ===============================
-# 关闭端口
+# 关闭指定端口（TCP/UDP）
 # ===============================
 close_port() {
     read -r -p "请输入要关闭的端口号: " PORT
@@ -231,6 +237,22 @@ show_rules() {
     ip6tables -L -n --line-numbers
     read -r -p "按回车返回菜单..."
 }
+# ===============================
+# 设置开机自动恢复防火墙规则
+# ===============================
+enable_autoload() {
+    mkdir -p /etc/local.d
+    cat >/etc/local.d/firewall.start <<'EOF'
+#!/bin/sh
+iptables-restore < /etc/iptables/rules.v4 2>/dev/null || true
+ip6tables-restore < /etc/iptables/rules.v6 2>/dev/null || true
+EOF
+    chmod +x /etc/local.d/firewall.start
+    rc-update add local default
+    info "✅ 已设置开机自动恢复防火墙规则"
+    read -r -p "按回车返回菜单..."
+}
+
 
 # ===============================
 # 菜单
@@ -241,17 +263,18 @@ menu() {
         echo -e "${GREEN}============================${RESET}"
         echo -e "${GREEN} 🔥 Alpine 防火墙管理脚本 ${RESET}"
         echo -e "${GREEN}============================${RESET}"
-        echo -e "${GREEN}1) 初始化默认规则 (放行 SSH/80/443)${RESET}"
-        echo -e "${GREEN}2) 开放指定 IP${RESET}"
-        echo -e "${GREEN}3) 封禁指定 IP${RESET}"
-        echo -e "${GREEN}4) 删除指定 IP 规则${RESET}"
-        echo -e "${GREEN}5) 开放指定端口 (TCP/UDP)${RESET}"
-        echo -e "${GREEN}6) 关闭指定端口 (TCP/UDP)${RESET}"
-        echo -e "${GREEN}7) 禁止 PING${RESET}"
-        echo -e "${GREEN}8) 允许 PING${RESET}"
-        echo -e "${GREEN}9) 清空防火墙规则${RESET}"
+        echo -e "${GREEN}1)  初始化默认规则 (放行 SSH/80/443)${RESET}"
+        echo -e "${GREEN}2)  开放指定 IP${RESET}"
+        echo -e "${GREEN}3)  封禁指定 IP${RESET}"
+        echo -e "${GREEN}4)  删除指定 IP 规则${RESET}"
+        echo -e "${GREEN}5)  开放指定端口 (TCP/UDP)${RESET}"
+        echo -e "${GREEN}6)  关闭指定端口 (TCP/UDP)${RESET}"
+        echo -e "${GREEN}7)  禁止 PING${RESET}"
+        echo -e "${GREEN}8)  允许 PING${RESET}"
+        echo -e "${GREEN}9)  清空防火墙规则${RESET}"
         echo -e "${GREEN}10) 显示当前规则${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
+        echo -e "${GREEN}11) 设置开机自动恢复防火墙规则${RESET}"
+        echo -e "${GREEN}0)  退出${RESET}"
         echo -e "============================"
         read -r -p "请选择操作 (0-10): " choice
 
@@ -266,6 +289,7 @@ menu() {
             8) enable_ping ;;
             9) clear_firewall ;;
             10) show_rules ;;
+            11) enable_autoload ;;
             0) break ;;
             *) warn "无效输入，请重新选择"; read -r -p "按回车返回菜单..." ;;
         esac
@@ -276,17 +300,4 @@ menu() {
 # 脚本入口
 # ===============================
 install_firewall_tools
-
-# 恢复已保存规则
-if [ -f /etc/iptables/rules.v4 ] || [ -f /etc/iptables/rules.v6 ]; then
-    info "检测到已保存防火墙规则，正在恢复..."
-    iptables-restore < /etc/iptables/rules.v4 2>/dev/null || true
-    ip6tables-restore < /etc/iptables/rules.v6 2>/dev/null || true
-    info "✅ 防火墙规则已恢复"
-    read -r -p "按回车继续..."
-else
-    info "未检测到已保存规则，可选择初始化默认规则"
-    read -r -p "按回车继续..."
-fi
-
 menu

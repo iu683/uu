@@ -5,7 +5,9 @@
 
 GREEN="\033[32m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
+
 
 # 在 Alpine 上安装 tzdata
 install_tzdata_alpine() {
@@ -79,7 +81,7 @@ show_menu() {
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
     echo -e "${GREEN}         🌍 通用时区管理脚本${RESET}"
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-    echo -e "${GREEN}当前时区:${YELLOW} $(get_timezone)${RESET}"
+    echo -e "${GREEN} 当前时区:${YELLOW} $(get_timezone)${RESET}"
     echo -e "${GREEN} 1) 设置为 Asia/Shanghai (中国)${RESET}"
     echo -e "${GREEN} 2) 设置为 America/New_York(美国)${RESET}"
     echo -e "${GREEN} 3) 设置为 Europe/London(英国)${RESET}"

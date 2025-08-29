@@ -55,11 +55,12 @@ init_rules() {
         [ "$proto" = "ip6tables" ] && $proto -A INPUT -p icmpv6 -j ACCEPT
     done
     save_rules
-    info "默认规则已初始化，放行 SSH/80/443"
+    info "✅ 默认规则已初始化，放行 SSH/80/443"
+    read -r -p "按回车返回菜单..."
 }
 
 # ===============================
-# 安装必要工具（只在缺少时安装）
+# 安装必要工具
 # ===============================
 install_firewall_tools() {
     NEED_INSTALL=0
@@ -75,7 +76,8 @@ install_firewall_tools() {
         apk update
         apk add --no-cache iptables ip6tables bash curl wget vim sudo git || true
         mkdir -p /etc/iptables
-        info "防火墙工具安装完成"
+        info "✅ 防火墙工具安装完成"
+        read -r -p "按回车继续..."
     else
         info "所有必要工具已安装，无需重复安装"
     fi
@@ -87,11 +89,18 @@ install_firewall_tools() {
 ip_action() {
     ACTION=$1
     IP=$2
-    if ! echo "$IP" | grep -E -q '^[0-9a-fA-F:.]+$'; then
-        warn "输入不是有效 IP"
+
+    if echo "$IP" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+        PROTOS="iptables"
+    elif echo "$IP" | grep -Eq '^([0-9a-fA-F:]+)$'; then
+        PROTOS="ip6tables"
+    else
+        warn "输入不是有效 IPv4 或 IPv6"
+        read -r -p "按回车返回菜单..."
         return
     fi
-    for proto in iptables ip6tables; do
+
+    for proto in $PROTOS; do
         case $ACTION in
             accept) $proto -I INPUT -s "$IP" -j ACCEPT ;;
             drop)   $proto -I INPUT -s "$IP" -j DROP ;;
@@ -106,16 +115,18 @@ ip_action() {
         esac
     done
     save_rules
-    info "操作完成: $ACTION $IP"
+    info "✅ 操作完成: $ACTION $IP"
+    read -r -p "按回车返回菜单..."
 }
 
 # ===============================
-# 开放指定端口（TCP/UDP）
+# 开放端口
 # ===============================
 open_port() {
     read -r -p "请输入要开放的端口号: " PORT
     if ! echo "$PORT" | grep -E -q '^[0-9]+$'; then
         warn "无效端口"
+        read -r -p "按回车返回菜单..."
         return
     fi
     for proto in iptables ip6tables; do
@@ -123,16 +134,18 @@ open_port() {
         $proto -I INPUT -p udp --dport "$PORT" -j ACCEPT
     done
     save_rules
-    info "端口 $PORT 已开放 (TCP/UDP)"
+    info "✅ 端口 $PORT 已开放 (TCP/UDP)"
+    read -r -p "按回车返回菜单..."
 }
 
 # ===============================
-# 关闭指定端口（TCP/UDP）
+# 关闭端口
 # ===============================
 close_port() {
     read -r -p "请输入要关闭的端口号: " PORT
     if ! echo "$PORT" | grep -E -q '^[0-9]+$'; then
         warn "无效端口"
+        read -r -p "按回车返回菜单..."
         return
     fi
     for proto in iptables ip6tables; do
@@ -144,7 +157,8 @@ close_port() {
         done
     done
     save_rules
-    info "端口 $PORT 已关闭 (TCP/UDP)"
+    info "✅ 端口 $PORT 已关闭 (TCP/UDP)"
+    read -r -p "按回车返回菜单..."
 }
 
 # ===============================
@@ -169,7 +183,8 @@ disable_ping() {
         fi
     done
     save_rules
-    info "已禁止 PING (ICMP)"
+    info "✅ 已禁止 PING (ICMP)"
+    read -r -p "按回车返回菜单..."
 }
 
 # ===============================
@@ -186,7 +201,8 @@ enable_ping() {
         fi
     done
     save_rules
-    info "已允许 PING (ICMP)"
+    info "✅ 已允许 PING (ICMP)"
+    read -r -p "按回车返回菜单..."
 }
 
 # ===============================
@@ -201,7 +217,8 @@ clear_firewall() {
         $proto -P OUTPUT ACCEPT
     done
     save_rules
-    info "已清空防火墙规则，所有流量放行"
+    info "✅ 已清空防火墙规则，所有流量放行"
+    read -r -p "按回车返回菜单..."
 }
 
 # ===============================
@@ -212,6 +229,7 @@ show_rules() {
     iptables -L -n --line-numbers
     echo "===== IPv6 ====="
     ip6tables -L -n --line-numbers
+    read -r -p "按回车返回菜单..."
 }
 
 # ===============================
@@ -247,7 +265,7 @@ menu() {
             7) disable_ping ;;
             8) enable_ping ;;
             9) clear_firewall ;;
-            10) show_rules; read -r -p "按回车返回菜单..." ;;
+            10) show_rules ;;
             0) break ;;
             *) warn "无效输入，请重新选择"; read -r -p "按回车返回菜单..." ;;
         esac
@@ -258,4 +276,17 @@ menu() {
 # 脚本入口
 # ===============================
 install_firewall_tools
+
+# 恢复已保存规则
+if [ -f /etc/iptables/rules.v4 ] || [ -f /etc/iptables/rules.v6 ]; then
+    info "检测到已保存防火墙规则，正在恢复..."
+    iptables-restore < /etc/iptables/rules.v4 2>/dev/null || true
+    ip6tables-restore < /etc/iptables/rules.v6 2>/dev/null || true
+    info "✅ 防火墙规则已恢复"
+    read -r -p "按回车继续..."
+else
+    info "未检测到已保存规则，可选择初始化默认规则"
+    read -r -p "按回车继续..."
+fi
+
 menu

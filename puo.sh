@@ -18,17 +18,17 @@ if [[ ! -f "$FIRST_RUN_FLAG" ]]; then
 
     # 下载菜单脚本（如果不存在）
     if [[ ! -f "$SCRIPT_PATH" ]]; then
-        echo -e "${GREEN}菜单脚本不存在，正在下载...${RESET}"
+        echo -e "${RED}菜单脚本不存在，正在下载...${RESET}"
         curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_PATH"
         chmod +x "$SCRIPT_PATH"
-        echo -e "${GREEN}下载完成: $SCRIPT_PATH${RESET}"
+        echo -e "${RED}下载完成: $SCRIPT_PATH${RESET}"
     fi
 
     # 添加 F/f 快捷键
     if ! grep -q "alias F='bash \$HOME/proxy.sh'" "$SHELL_RC"; then
         echo "alias F='bash \$HOME/proxy.sh'" >> "$SHELL_RC"
         echo "alias f='bash \$HOME/proxy.sh'" >> "$SHELL_RC"
-        echo -e "${GREEN} F/f 快捷键已添加,重新登录生效${RESET}"
+        echo -e "${RED} F/f 快捷键已添加,重新登录生效${RESET}"
     fi
 
     # 创建首次运行标记

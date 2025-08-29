@@ -159,22 +159,47 @@ volume_menu() {
     volume_menu
 }
 
-# ================== IPv6 开关 ==================
 ipv6_menu() {
-    IPV6_STATUS=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)
-    echo -e "${GREEN}当前 IPv6 状态: $([ "$IPV6_STATUS" -eq 0 ] && echo "启用" || echo "禁用")${RESET}"
-    echo -e "${GREEN}1) 启用 IPv6${RESET}"
-    echo -e "${GREEN}2) 禁用 IPv6${RESET}"
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
-    read -p "请选择: " ip_choice
-    case $ip_choice in
-        1) echo 0 > /proc/sys/net/ipv6/conf/all/disable_ipv6; sysctl -p >/dev/null 2>&1 || true; pause ;;
-        2) echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6; sysctl -p >/dev/null 2>&1 || true; pause ;;
-        0) return ;;
-        *) warn "无效选项"; pause ;;
-    esac
-    ipv6_menu
+    while true; do
+        IPV6_STATUS=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)
+        CURRENT_STATUS=$([ "$IPV6_STATUS" -eq 0 ] && echo "启用" || echo "禁用")
+
+        echo -e "\033[32m===== IPv6 设置 =====\033[0m"
+        echo -e "\033[33m当前 IPv6 状态: $CURRENT_STATUS\033[0m"
+        echo -e "\033[32m1) 启用 IPv6\033[0m"
+        echo -e "\033[32m2) 禁用 IPv6\033[0m"
+        echo -e "\033[32m0) 返回主菜单\033[0m"
+
+        read -p "请选择: " ip_choice
+        case $ip_choice in
+            1)
+                echo 0 > /proc/sys/net/ipv6/conf/all/disable_ipv6
+                if ! grep -q "^net.ipv6.conf.all.disable_ipv6" /etc/sysctl.conf 2>/dev/null; then
+                    echo "net.ipv6.conf.all.disable_ipv6 = 0" >> /etc/sysctl.conf
+                else
+                    sed -i 's/^net.ipv6.conf.all.disable_ipv6.*/net.ipv6.conf.all.disable_ipv6 = 0/' /etc/sysctl.conf
+                fi
+                sysctl -p >/dev/null 2>&1 || true
+                echo -e "\033[32m[INFO] IPv6 已启用（永久生效）\033[0m"
+                read -p "按回车键返回菜单..." dummy
+                ;;
+            2)
+                echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6
+                if ! grep -q "^net.ipv6.conf.all.disable_ipv6" /etc/sysctl.conf 2>/dev/null; then
+                    echo "net.ipv6.conf.all.disable_ipv6 = 1" >> /etc/sysctl.conf
+                else
+                    sed -i 's/^net.ipv6.conf.all.disable_ipv6.*/net.ipv6.conf.all.disable_ipv6 = 1/' /etc/sysctl.conf
+                fi
+                sysctl -p >/dev/null 2>&1 || true
+                echo -e "\033[32m[INFO] IPv6 已禁用（永久生效）\033[0m"
+                read -p "按回车键返回菜单..." dummy
+                ;;
+            0) break ;;
+            *) echo -e "\033[33m[WARN] 无效选项\033[0m" ;;
+        esac
+    done
 }
+
 
 # ================== 开放所有端口 ==================
 open_all_ports() {

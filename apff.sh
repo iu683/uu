@@ -103,6 +103,23 @@ open_port() {
 }
 
 # ===============================
+# 关闭指定端口（TCP/UDP）
+# ===============================
+close_port() {
+    read -r -p "请输入要关闭的端口号: " PORT
+    for proto in iptables ip6tables; do
+        while $proto -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; do
+            $proto -D INPUT -p tcp --dport "$PORT" -j ACCEPT
+        done
+        while $proto -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; do
+            $proto -D INPUT -p udp --dport "$PORT" -j ACCEPT
+        done
+    done
+    save_rules
+    info "端口 $PORT 已关闭 (TCP/UDP)"
+}
+
+# ===============================
 # 禁止 PING
 # ===============================
 disable_ping() {
@@ -116,6 +133,18 @@ disable_ping() {
     done
     save_rules
     info "已禁止 PING (ICMP)"
+}
+
+# ===============================
+# 允许 PING
+# ===============================
+enable_ping() {
+    for proto in iptables ip6tables; do
+        $proto -I INPUT -p icmp --icmp-type echo-request -j ACCEPT
+        $proto -I OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT
+    done
+    save_rules
+    info "已允许 PING (ICMP)"
 }
 
 # ===============================
@@ -147,9 +176,11 @@ menu() {
         echo -e "${GREEN}3) 封禁指定 IP${RESET}"
         echo -e "${GREEN}4) 删除 IP 规则${RESET}"
         echo -e "${GREEN}5) 开放指定端口 (TCP/UDP)${RESET}"
-        echo -e "${GREEN}6) 禁止 PING${RESET}"
-        echo -e "${GREEN}7) 清空防火墙（全放行）${RESET}"
-        echo -e "${GREEN}8) 显示当前规则${RESET}"
+        echo -e "${GREEN}6) 关闭指定端口 (TCP/UDP)${RESET}"
+        echo -e "${GREEN}7) 禁止 PING${RESET}"
+        echo -e "${GREEN}8) 允许 PING${RESET}"
+        echo -e "${GREEN}9) 清空防火墙（全放行）${RESET}"
+        echo -e "${GREEN}10) 显示当前规则${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         echo -e "----------------------------"
         read -r -p "请选择操作: " CHOICE
@@ -160,9 +191,11 @@ menu() {
             3) read -r -p "请输入要封禁的 IP: " IP; ip_action drop "$IP"; read -r -p "按回车返回菜单..." ;;
             4) read -r -p "请输入要删除的 IP: " IP; ip_action delete "$IP"; read -r -p "按回车返回菜单..." ;;
             5) open_port; read -r -p "按回车返回菜单..." ;;
-            6) disable_ping; read -r -p "按回车返回菜单..." ;;
-            7) clear_firewall; read -r -p "按回车返回菜单..." ;;
-            8) iptables -L -n --line-numbers; ip6tables -L -n --line-numbers; read -r -p "按回车返回菜单..." ;;
+            6) close_port; read -r -p "按回车返回菜单..." ;;
+            7) disable_ping; read -r -p "按回车返回菜单..." ;;
+            8) enable_ping; read -r -p "按回车返回菜单..." ;;
+            9) clear_firewall; read -r -p "按回车返回菜单..." ;;
+            10) iptables -L -n --line-numbers; ip6tables -L -n --line-numbers; read -r -p "按回车返回菜单..." ;;
             0) break ;;
             *) warn "无效选择"; read -r -p "按回车返回菜单..." ;;
         esac

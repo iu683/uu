@@ -327,7 +327,7 @@ docker_ps() {
         echo -e "${GREEN}11. 查看日志${RESET}"
         echo -e "${GREEN}12. 查看网络信息${RESET}"
         echo -e "${GREEN}13. 查看占用资源${RESET}"
-        echo -e "${GREEN}0. 返回主菜单${RESET}"
+        echo -e "${GREEN} 0. 返回主菜单${RESET}"
         read -p "请选择: " choice
         case $choice in
             01|1) read -p "请输入创建命令: " cmd; $cmd ;;
@@ -364,7 +364,7 @@ docker_image() {
         echo -e "${GREEN}02. 更新镜像${RESET}"
         echo -e "${GREEN}03. 删除镜像${RESET}"
         echo -e "${GREEN}04. 删除所有镜像${RESET}"
-        echo -e "${GREEN}0. 返回主菜单${RESET}"
+        echo -e "${GREEN} 0. 返回主菜单${RESET}"
         read -p "请选择: " choice
         case $choice in
             01|1) read -p "请输入镜像名: " imgs; for img in $imgs; do docker pull $img; done ;;
@@ -533,11 +533,11 @@ docker_backup_menu() {
                 # -----------------------------
                 while true; do
                     echo -e "${YELLOW}选择备份类型:${RESET}"
-                    echo "1. 容器"
-                    echo "2. 镜像"
-                    echo "3. 卷"
-                    echo "4. 全量"
-                    echo "0. 返回上一级"
+                    echo -e "${GREEN}1. 容器${RESET}"
+                    echo -e "${GREEN}2. 镜像${RESET}"
+                    echo -e "${GREEN}3. 卷${RESET}"
+                    echo -e "${GREEN}4. 全量${RESET}"
+                    echo -e "${GREEN}0. 返回上一级${RESET}"
                     read -p "请输入选择: " btype
                     [[ "$btype" == "0" ]] && break
 
@@ -603,11 +603,11 @@ docker_backup_menu() {
                 # -----------------------------
                 while true; do
                     echo -e "${YELLOW}选择恢复类型:${RESET}"
-                    echo "1. 容器"
-                    echo "2. 镜像"
-                    echo "3. 卷"
-                    echo "4. 全量"
-                    echo "0. 返回上一级"
+                    echo -e "${GREEN}1. 容器${RESET}"
+                    echo -e "${GREEN}2. 镜像${RESET}"
+                    echo -e "${GREEN}3. 卷${RESET}"
+                    echo -e "${GREEN}4. 全量${RESET}"
+                    echo -e "${GREEN}0. 返回上一级${RESET}"
                     read -p "请输入选择: " rtype
                     [[ "$rtype" == "0" ]] && break
 

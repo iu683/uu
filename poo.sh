@@ -5,6 +5,7 @@
 
 RED="\033[31m"
 GREEN="\033[32m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
 SCRIPT_PATH="$HOME/proxy.sh"
@@ -27,7 +28,7 @@ if [[ ! -f "$FIRST_RUN_FLAG" ]]; then
     if ! grep -q "alias F='bash \$HOME/proxy.sh'" "$SHELL_RC"; then
         echo "alias F='bash \$HOME/proxy.sh'" >> "$SHELL_RC"
         echo "alias f='bash \$HOME/proxy.sh'" >> "$SHELL_RC"
-        echo -e "${GREEN} F/f 快捷键已添加，执行 'source $SHELL_RC' 或重新登录生效${RESET}"
+        echo -e "${GREEN} F/f 快捷键已添加,重新登录生效${RESET}"
     fi
 
     # 创建首次运行标记
@@ -37,7 +38,7 @@ fi
 show_menu() {
     clear
     echo -e "${GREEN}========= 代理协议一键安装菜单 =========${RESET}"
-    echo -e "${RED}当前时间: $(date '+%Y-%m-%d %H:%M:%S')${RESET}"
+    echo -e "${YELLOW}当前时间: $(date '+%Y-%m-%d %H:%M:%S')${RESET}"
     echo -e "${GREEN}[01] 老王 Sing-box 四合一${RESET}"
     echo -e "${GREEN}[02] 老王 Xray-2go 一键脚本${RESET}"
     echo -e "${GREEN}[03] mack-a 八合一脚本${RESET}"

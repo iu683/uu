@@ -447,8 +447,6 @@ docker_backup_menu() {
     root_use
 
     BACKUP_DIR="/opt/docker_backups"
-
-    # 创建备份目录
     mkdir -p "$BACKUP_DIR"
 
     # 检查 jq 是否安装，否则自动安装
@@ -465,62 +463,6 @@ docker_backup_menu() {
             read -p "按回车返回菜单..."
             return
         fi
-        if ! command -v jq &>/dev/null; then
-            echo -e "${RED}jq 安装失败，请手动安装后再运行脚本${RESET}"
-            read -p "按回车返回菜单..."
-            return
-        fi
-        echo -e "${GREEN}jq 安装成功！${RESET}"
-        sleep 1
-    fi
-
-    # 检查 Docker 是否安装
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在自动安装...${RESET}"
-        if command -v apt &>/dev/null; then
-            apt update -y && apt install -y docker.io
-        elif command -v yum &>/dev/null; then
-            yum install -y docker
-        elif command -v dnf &>/dev/null; then
-            dnf install -y docker
-        else
-            echo -e "${RED}无法检测到支持的包管理器，请手动安装 Docker${RESET}"
-            read -p "按回车返回菜单..."
-            return
-        fi
-        if ! command -v docker &>/dev/null; then
-            echo -e "${RED}Docker 安装失败，请手动安装后再运行脚本${RESET}"
-            read -p "按回车返回菜单..."
-            return
-        fi
-        echo -e "${GREEN}Docker 安装成功！${RESET}"
-        sleep 1
-    fi
-
-    # 检查 Docker 是否运行
-    if ! pgrep -x dockerd &>/dev/null; then
-        echo -e "${YELLOW}Docker 服务未运行，正在启动...${RESET}"
-        if command -v systemctl &>/dev/null; then
-            systemctl start docker
-            systemctl enable docker
-        else
-            service docker start
-        fi
-        sleep 2
-        if ! pgrep -x dockerd &>/dev/null; then
-            echo -e "${RED}Docker 启动失败，请手动检查服务${RESET}"
-            read -p "按回车返回菜单..."
-            return
-        fi
-        echo -e "${GREEN}Docker 已启动！${RESET}"
-    fi
-
-    # 检查磁盘空间
-    avail_space=$(df --output=avail "$BACKUP_DIR" | tail -1)
-    if (( avail_space < 1048576 )); then  # 小于 1GB
-        echo -e "${RED}磁盘剩余空间不足 1GB，无法执行备份！${RESET}"
-        read -p "按回车返回菜单..."
-        return
     fi
 
     while true; do
@@ -547,7 +489,6 @@ docker_backup_menu() {
                     read -p "请输入备份文件名（默认 docker_backup_$(date +%F).tar.gz）: " backup_name
                     backup_name=${backup_name:-docker_backup_$(date +%F).tar.gz}
                     backup_path="$BACKUP_DIR/$backup_name"
-
                     mkdir -p /tmp/docker_backup
 
                     # 容器备份
@@ -597,7 +538,7 @@ docker_backup_menu() {
                 done
                 ;;
             2)
-                # 恢复逻辑保持不变
+                # 恢复逻辑
                 while true; do
                     echo -e "${YELLOW}选择恢复类型:${RESET}"
                     echo "1. 容器"
@@ -615,54 +556,42 @@ docker_backup_menu() {
 
                     # 容器恢复
                     if [[ "$rtype" == "1" || "$rtype" == "4" ]]; then
-                        echo "可用容器备份："
-                        ls /tmp/docker_restore/docker_backup/container_*.json 2>/dev/null | xargs -n1 basename
-                        read -p "请输入要恢复的容器（多个用空格，留空则全部）: " restore_containers
-                        [[ -z "$restore_containers" ]] && restore_containers=$(ls /tmp/docker_restore/docker_backup/container_*.json | xargs -n1 basename)
-                        for cjson_file in $restore_containers; do
-                            cjson="/tmp/docker_restore/docker_backup/$cjson_file"
+                        for cjson in /tmp/docker_restore/docker_backup/container_*.json; do
                             [[ ! -f "$cjson" ]] && continue
                             cname=$(basename "$cjson" | sed 's/container_\(.*\).json/\1/')
                             image=$(jq -r '.[0].Config.Image' "$cjson")
+
+                            # 如果镜像不存在，则从备份加载
+                            if ! docker image inspect "$image" &>/dev/null; then
+                                img_tar="/tmp/docker_restore/docker_backup/image_$(echo $image | tr '/:' '_').tar"
+                                [[ -f "$img_tar" ]] && docker load -i "$img_tar"
+                            fi
+
                             envs=$(jq -r '.[0].Config.Env | join(" -e ")' "$cjson")
                             [[ -n "$envs" ]] && envs="-e $envs"
                             ports=$(jq -r '.[0].HostConfig.PortBindings | to_entries | map("\(.value[0].HostPort):\(.key)") | join(" -p ")' "$cjson")
                             [[ -n "$ports" ]] && ports="-p $ports"
                             mounts=$(jq -r '.[0].Mounts | map("-v \(.Source):\(.Destination)") | join(" ")' "$cjson")
                             network=$(jq -r '.[0].HostConfig.NetworkMode' "$cjson")
-                            cmd="docker run -d --name $cname $envs $ports $mounts --network $network $image"
+
                             echo "正在创建容器: $cname"
-                            eval $cmd
+                            docker run -d --name "$cname" $envs $ports $mounts --network "$network" "$image"
                         done
                     fi
 
                     # 镜像恢复
                     if [[ "$rtype" == "2" || "$rtype" == "4" ]]; then
-                        echo "可用镜像备份："
-                        ls /tmp/docker_restore/docker_backup/image_*.tar 2>/dev/null | xargs -n1 basename
-                        read -p "请输入要恢复的镜像（多个用空格，留空则全部）: " restore_images
-                        [[ -z "$restore_images" ]] && restore_images=$(ls /tmp/docker_restore/docker_backup/image_*.tar | xargs -n1 basename)
-                        for img_file in $restore_images; do
-                            img="/tmp/docker_restore/docker_backup/$img_file"
-                            [[ -f "$img" ]] && docker load -i "$img"
+                        for img_file in /tmp/docker_restore/docker_backup/image_*.tar; do
+                            [[ -f "$img_file" ]] && docker load -i "$img_file"
                         done
                     fi
 
                     # 卷恢复
                     if [[ "$rtype" == "3" || "$rtype" == "4" ]]; then
-                        echo "可用卷备份："
-                        ls /tmp/docker_restore/docker_backup/volume_*.tar.gz 2>/dev/null | xargs -n1 basename
-                        read -p "请输入要恢复的卷（多个用空格，留空则全部）: " restore_volumes
-                        [[ -z "$restore_volumes" ]] && restore_volumes=$(ls /tmp/docker_restore/docker_backup/volume_*.tar.gz | xargs -n1 basename)
-                        for vol_file in $restore_volumes; do
-                            vol="/tmp/docker_restore/docker_backup/$vol_file"
-                            vol_name=$(basename "$vol" | sed 's/volume_\(.*\).tar.gz/\1/')
-                            if docker volume inspect "$vol_name" &>/dev/null; then
-                                read -p "卷 $vol_name 已存在，是否覆盖? (y/N): " confirm
-                                [[ "$confirm" != "y" ]] && continue
-                            fi
-                            docker volume create "$vol_name" >/dev/null 2>&1
-                            tar -xzf "$vol" -C /var/lib/docker/volumes/"$vol_name"/_data
+                        for vol_file in /tmp/docker_restore/docker_backup/volume_*.tar.gz; do
+                            vol_name=$(basename "$vol_file" | sed 's/volume_\(.*\).tar.gz/\1/')
+                            [[ -d /var/lib/docker/volumes/"$vol_name"/_data ]] || docker volume create "$vol_name"
+                            tar -xzf "$vol_file" -C /var/lib/docker/volumes/"$vol_name"/_data
                         done
                     fi
 
@@ -690,6 +619,7 @@ docker_backup_menu() {
         esac
     done
 }
+
 
 
 # -----------------------------

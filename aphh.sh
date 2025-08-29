@@ -57,10 +57,23 @@ EOF
     info "已切换源为 $main / $community"
 }
 
+detect_latest_version() {
+    # 从 latest-stable 的 APKINDEX 里取版本号（类似 v3.22）
+    local version
+    version=$(wget -qO- ${LATEST_MAIN}/APKINDEX.tar.gz | tar -Oxz APKINDEX 2>/dev/null | grep -m1 '^P:' | awk -F- '{print $1}')
+    if [ -n "$version" ]; then
+        echo "$version"
+    else
+        echo "未知版本"
+    fi
+}
+
 validate_repo() {
     local url="$1"
     if ! wget --spider -q "${url}/APKINDEX.tar.gz"; then
-        warn "检测到 $url 不可用，自动切换到 latest-stable"
+        local latest_ver
+        latest_ver=$(detect_latest_version)
+        warn "检测到 ${url} 不可用，v${ALPINE_VERSION} 源不存在，已自动回退到 latest-stable (当前指向 ${latest_ver})"
         cat > "$REPO_FILE" <<EOF
 $LATEST_MAIN
 $LATEST_COMMUNITY

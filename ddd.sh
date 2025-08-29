@@ -255,74 +255,131 @@ cleanup_docker() {
 }
 
 # ================== Docker 备份/恢复 ==================
-docker_backup_restore() {
+docker_backup_menu() {
+    root_use
     while true; do
-        echo -e "${GREEN}===== Docker 备份/恢复 =====${RESET}"
-        echo -e "${GREEN}1) 备份容器${RESET}"
-        echo -e "${GREEN}2) 恢复容器${RESET}"
-        echo -e "${GREEN}3) 备份镜像${RESET}"
-        echo -e "${GREEN}4) 恢复镜像${RESET}"
-        echo -e "${GREEN}0) 返回主菜单${RESET}"
-
-        read -p "请选择: " dr_choice
-        case $dr_choice in
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker 备份与恢复 =====${RESET}"
+        echo -e "${GREEN}1. 备份 Docker${RESET}"
+        echo -e "${GREEN}2. 恢复 Docker${RESET}"
+        echo -e "${GREEN}3. 删除备份文件${RESET}"
+        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
+        read -p "请选择: " choice
+        case $choice in
             1)
-                echo -e "${YELLOW}当前所有容器:${RESET}"
-                docker ps -a --format "table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}"
-                read -p "输入要备份的容器名称/ID: " cid
-                read -p "输入备份路径 (如 /root/backups): " path
-                mkdir -p "$path"
-                if [ -n "$cid" ]; then
-                    # 使用 docker commit 将容器生成新镜像
-                    img_name="backup_$cid_$(date +%Y%m%d%H%M%S)"
-                    docker commit "$cid" "$img_name"
-                    # 使用 docker save 保存镜像到文件
-                    docker save "$img_name" -o "$path/$img_name.tar"
-                    info "容器 $cid 已备份为镜像 $img_name，保存到 $path/$img_name.tar"
-                else
-                    warn "容器名称或ID不能为空"
-                fi
-                pause
+                # 备份类型选择
+                while true; do
+                    echo -e "${YELLOW}选择备份类型:${RESET}"
+                    echo "1. 容器"
+                    echo "2. 镜像"
+                    echo "3. 卷"
+                    echo "4. 全量"
+                    echo "0. 返回上一级"
+                    read -p "请输入选择: " btype
+                    [[ "$btype" == "0" ]] && break  # 返回上一级备份菜单
+
+                    read -p "请输入备份文件名（默认 docker_backup_$(date +%F).tar.gz）: " backup_name
+                    backup_name=${backup_name:-docker_backup_$(date +%F).tar.gz}
+                    mkdir -p /tmp/docker_backup
+
+                    [[ "$btype" == "1" || "$btype" == "4" ]] && {
+                        docker ps -a -q | while read cid; do
+                            cname=$(docker inspect --format '{{.Name}}' $cid | sed 's/\///g')
+                            docker inspect $cid > /tmp/docker_backup/container_"$cname".json
+                            docker export "$cid" -o /tmp/docker_backup/container_"$cname".tar
+                        done
+                    }
+
+                    [[ "$btype" == "2" || "$btype" == "4" ]] && {
+                        docker images -q | while read img; do
+                            iname=$(docker image inspect --format '{{.RepoTags}}' $img | tr -d '[]/:')
+                            docker save "$img" -o /tmp/docker_backup/image_"$iname".tar
+                        done
+                    }
+
+                    [[ "$btype" == "3" || "$btype" == "4" ]] && {
+                        docker volume ls -q | while read vol; do
+                            tar -czf /tmp/docker_backup/volume_"$vol".tar.gz -C /var/lib/docker/volumes/"$vol"/_data .
+                        done
+                    }
+
+                    tar -czf "$backup_name" -C /tmp docker_backup
+                    rm -rf /tmp/docker_backup
+                    echo -e "${GREEN}备份完成: $backup_name${RESET}"
+                    read -p "按回车继续..."
+                    break
+                done
                 ;;
             2)
-                read -p "输入备份文件路径 (如 /root/backups/backup_container.tar): " tarfile
-                if [ -f "$tarfile" ]; then
-                    docker load -i "$tarfile"
-                    info "容器镜像已从 $tarfile 恢复"
-                else
-                    warn "备份文件不存在"
-                fi
-                pause
+                # 恢复类型选择
+                while true; do
+                    echo -e "${YELLOW}选择恢复类型:${RESET}"
+                    echo "1. 容器"
+                    echo "2. 镜像"
+                    echo "3. 卷"
+                    echo "4. 全量"
+                    echo "0. 返回上一级"
+                    read -p "请输入选择: " rtype
+                    [[ "$rtype" == "0" ]] && break  # 返回上一级恢复菜单
+
+                    read -p "请输入备份文件路径: " backup_file
+                    [[ ! -f "$backup_file" ]] && echo -e "${RED}备份文件不存在${RESET}" && read -p "按回车继续..." && continue
+                    mkdir -p /tmp/docker_restore
+                    tar -xzf "$backup_file" -C /tmp/docker_restore
+
+                    [[ "$rtype" == "1" || "$rtype" == "4" ]] && {
+                        for cjson in /tmp/docker_restore/docker_backup/container_*.json; do
+                            [[ -f "$cjson" ]] || continue
+                            cname=$(basename "$cjson" | sed 's/container_\(.*\).json/\1/')
+                            image=$(jq -r '.[0].Config.Image' "$cjson")
+                            envs=$(jq -r '.[0].Config.Env | join(" -e ")' "$cjson")
+                            ports=$(jq -r '.[0].HostConfig.PortBindings | to_entries | map("\(.value[0].HostPort):\(.key | split("/")[0])") | join(" -p ")' "$cjson")
+                            mounts=$(jq -r '.[0].Mounts | map("-v \(.Source):\(.Destination)") | join(" ")' "$cjson")
+                            network=$(jq -r '.[0].HostConfig.NetworkMode' "$cjson")
+                            cmd="docker run -d --name $cname -e $envs -p $ports $mounts --network $network $image"
+                            echo "正在创建容器: $cname"
+                            eval $cmd
+                        done
+                    }
+
+                    [[ "$rtype" == "2" || "$rtype" == "4" ]] && {
+                        for img in /tmp/docker_restore/docker_backup/image_*.tar; do
+                            [[ -f "$img" ]] || continue
+                            docker load -i "$img"
+                        done
+                    }
+
+                    [[ "$rtype" == "3" || "$rtype" == "4" ]] && {
+                        for vol in /tmp/docker_restore/docker_backup/volume_*.tar.gz; do
+                            [[ -f "$vol" ]] || continue
+                            vol_name=$(basename "$vol" | sed 's/volume_\(.*\).tar.gz/\1/')
+                            docker volume create "$vol_name"
+                            tar -xzf "$vol" -C /var/lib/docker/volumes/"$vol_name"/_data
+                        done
+                    }
+
+                    rm -rf /tmp/docker_restore
+                    echo -e "${GREEN}恢复完成${RESET}"
+                    read -p "按回车继续..."
+                    break
+                done
                 ;;
             3)
-                echo -e "${YELLOW}当前所有镜像:${RESET}"
-                docker images
-                read -p "输入要备份的镜像名称: " img
-                read -p "输入备份路径 (如 /root/backups): " path
-                mkdir -p "$path"
-                if [ -n "$img" ]; then
-                    docker save "$img" -o "$path/$(echo $img | tr '/:' '__').tar"
-                    info "镜像 $img 已备份到 $path"
-                else
-                    warn "镜像名称不能为空"
-                fi
-                pause
-                ;;
-            4)
-                read -p "输入镜像备份文件路径 (如 /root/backups/nginx__latest.tar): " imgfile
-                if [ -f "$imgfile" ]; then
-                    docker load -i "$imgfile"
-                    info "镜像已从 $imgfile 恢复"
-                else
-                    warn "备份文件不存在"
-                fi
-                pause
+                # 删除备份文件
+                while true; do
+                    read -p "请输入要删除的备份文件路径（输入0返回上一级）: " del_file
+                    [[ "$del_file" == "0" ]] && break
+                    [[ -f "$del_file" ]] && rm -f "$del_file" && echo -e "${GREEN}备份文件已删除${RESET}" || echo -e "${RED}备份文件不存在${RESET}"
+                    read -p "按回车继续..."
+                    break
+                done
                 ;;
             0) break ;;
-            *) warn "无效选项"; pause ;;
+            *) echo "无效选择"; read -p "按回车继续..." ;;
         esac
     done
 }
+
 
 
 # ================== 主菜单 ==================

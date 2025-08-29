@@ -27,6 +27,9 @@ OFFICIAL_COMMUNITY="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/com
 ALIYUN_MAIN="https://mirrors.aliyun.com/alpine/v${ALPINE_VERSION}/main"
 ALIYUN_COMMUNITY="https://mirrors.aliyun.com/alpine/v${ALPINE_VERSION}/community"
 
+TSINGHUA_MAIN="https://mirrors.tuna.tsinghua.edu.cn/alpine/v${ALPINE_VERSION}/main"
+TSINGHUA_COMMUNITY="https://mirrors.tuna.tsinghua.edu.cn/alpine/v${ALPINE_VERSION}/community"
+
 LATEST_MAIN="https://dl-cdn.alpinelinux.org/alpine/latest-stable/main"
 LATEST_COMMUNITY="https://dl-cdn.alpinelinux.org/alpine/latest-stable/community"
 
@@ -58,9 +61,10 @@ EOF
 }
 
 detect_latest_version() {
-    # 从 latest-stable 的 APKINDEX 里取版本号（类似 v3.22）
     local version
-    version=$(wget -qO- ${LATEST_MAIN}/APKINDEX.tar.gz | tar -Oxz APKINDEX 2>/dev/null | grep -m1 '^P:' | awk -F- '{print $1}')
+    version=$(wget -qO- https://dl-cdn.alpinelinux.org/alpine/ 2>/dev/null \
+        | grep -o 'v[0-9]\+\.[0-9]\+' \
+        | sort -V | tail -n1)
     if [ -n "$version" ]; then
         echo "$version"
     else
@@ -107,8 +111,9 @@ while true; do
     show_current_repo
     echo -e "${GREEN}1) 切换到阿里云源并更新缓存${RESET}"
     echo -e "${GREEN}2) 切换到官方源并更新缓存${RESET}"
-    echo -e "${GREEN}3) 备份当前源${RESET}"
-    echo -e "${GREEN}4) 还原备份源并更新缓存${RESET}"
+    echo -e "${GREEN}3) 切换到清华源并更新缓存${RESET}"
+    echo -e "${GREEN}4) 备份当前源${RESET}"
+    echo -e "${GREEN}5) 还原备份源并更新缓存${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
     echo -e "------------------------------"
     read -rp "$(echo -e ${GREEN}请选择操作: ${RESET})" choice
@@ -128,8 +133,14 @@ while true; do
             ;;
         3)
             backup_repo
+            switch_source "$TSINGHUA_MAIN" "$TSINGHUA_COMMUNITY"
+            validate_repo "$TSINGHUA_MAIN"
+            update_cache
             ;;
         4)
+            backup_repo
+            ;;
+        5)
             restore_repo
             update_cache
             ;;

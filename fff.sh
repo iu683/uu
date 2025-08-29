@@ -6,18 +6,10 @@ RED="\033[31m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-LOG_PATH=""
+LOG_PATH="/var/log/auth.log"
 
 # -------------------------
-# 检查系统
-# -------------------------
-if [[ ! -f /etc/alpine-release ]]; then
-    echo -e "${RED}❌ 本脚本仅适用于 Alpine Linux${RESET}"
-    exit 1
-fi
-
-# -------------------------
-# 安装 Fail2Ban 和 rsyslog
+# 安装 Fail2Ban
 # -------------------------
 install_fail2ban() {
     echo -e "${GREEN}更新apk索引并安装 fail2ban 和 rsyslog...${RESET}"
@@ -33,24 +25,24 @@ install_fail2ban() {
     rc-update add fail2ban
     service fail2ban start
 
-    # 设置 SSH 日志输出
+    [[ ! -f "$LOG_PATH" ]] && touch "$LOG_PATH" && chmod 600 "$LOG_PATH"
+
+    # 配置 SSH 输出日志
     if ! grep -q "^SyslogFacility AUTH" /etc/ssh/sshd_config; then
         echo "SyslogFacility AUTH" >> /etc/ssh/sshd_config
         echo "LogLevel INFO" >> /etc/ssh/sshd_config
         service sshd restart
     fi
 
-    # 自动检测日志路径
-    if [[ -f /var/log/auth.log ]]; then
-        LOG_PATH="/var/log/auth.log"
-    elif [[ -f /var/log/messages ]]; then
-        LOG_PATH="/var/log/messages"
-    else
-        touch /var/log/messages
-        LOG_PATH="/var/log/messages"
-    fi
+    # 创建自定义 filter
+    mkdir -p /etc/fail2ban/filter.d
+    cat >/etc/fail2ban/filter.d/sshd-alpine.conf <<'EOF'
+[Definition]
+failregex = ^%(__prefix_line)sFailed password for .* from <HOST> port .* ssh2$
+ignoreregex =
+EOF
 
-    echo -e "${GREEN}✅ Fail2Ban 已安装并启动，日志文件: $LOG_PATH${RESET}"
+    echo -e "${GREEN}✅ Fail2Ban 已安装并启动${RESET}"
 }
 
 # -------------------------
@@ -71,7 +63,7 @@ configure_ssh() {
 [sshd]
 enabled = true
 port = $SSH_PORT
-filter = sshd
+filter = sshd-alpine
 logpath = $LOG_PATH
 maxretry = $MAX_RETRY
 bantime  = $BAN_TIME
@@ -98,7 +90,8 @@ uninstall_fail2ban() {
 view_banned() {
     if command -v fail2ban-client &>/dev/null; then
         BANNED=$(fail2ban-client status sshd 2>/dev/null | grep 'Banned IP list' | cut -d: -f2 | xargs)
-        echo -e "${GREEN}当前被封禁的 IP:${RESET} ${BANNED:-无}"
+        [ -z "$BANNED" ] && BANNED="无"
+        echo -e "${GREEN}当前被封禁的 IP: ${BANNED}${RESET}"
     else
         echo -e "${RED}Fail2Ban 未安装或未启动${RESET}"
     fi
@@ -111,7 +104,8 @@ view_banned() {
 view_jails() {
     if command -v fail2ban-client &>/dev/null; then
         JAILS=$(fail2ban-client status 2>/dev/null | grep 'Jail list' | cut -d: -f2 | xargs)
-        echo -e "${GREEN}当前防御规则列表:${RESET} ${JAILS:-无}"
+        [ -z "$JAILS" ] && JAILS="无"
+        echo -e "${GREEN}当前防御规则列表: ${JAILS}${RESET}"
     else
         echo -e "${RED}Fail2Ban 未安装或未启动${RESET}"
     fi

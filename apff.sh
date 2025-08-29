@@ -2,7 +2,7 @@
 set -e
 
 # ===============================
-# Alpine Linux 防火墙管理脚本 (IPv4/IPv6)
+# Alpine Linux 防火墙管理脚本 (IPv4/IPv6 自动识别)
 # ===============================
 
 GREEN='\033[32m'
@@ -36,18 +36,12 @@ save_rules() {
 # 恢复规则
 # ===============================
 restore_rules() {
-    if [ -f /etc/iptables/rules.v4 ]; then
-        iptables-restore < /etc/iptables/rules.v4 || true
-        info "IPv4 规则已恢复"
-    fi
-    if [ -f /etc/iptables/rules.v6 ]; then
-        ip6tables-restore < /etc/iptables/rules.v6 || true
-        info "IPv6 规则已恢复"
-    fi
+    [ -f /etc/iptables/rules.v4 ] && iptables-restore < /etc/iptables/rules.v4 || true
+    [ -f /etc/iptables/rules.v6 ] && ip6tables-restore < /etc/iptables/rules.v6 || true
 }
 
 # ===============================
-# 初始化防火墙规则
+# 初始化默认规则
 # ===============================
 init_rules() {
     SSH_PORT=$(get_ssh_port)
@@ -96,35 +90,49 @@ install_firewall_tools() {
 }
 
 # ===============================
-# IP 规则操作
+# IP 规则操作（IPv4/IPv6 自动识别）
 # ===============================
 ip_action() {
     ACTION=$1
     IP=$2
-    if ! echo "$IP" | grep -E -q '^[0-9a-fA-F:.]+$'; then
+
+    # 判断 IPv4 或 IPv6
+    IPV4=$(echo "$IP" | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || true)
+    IPV6=$(echo "$IP" | grep -E ':' || true)
+
+    if [ -n "$IPV4" ]; then
+        for proto in iptables; do
+            case $ACTION in
+                accept) $proto -I INPUT -s "$IP" -j ACCEPT ;;
+                drop)   $proto -I INPUT -s "$IP" -j DROP ;;
+                delete)
+                    while $proto -C INPUT -s "$IP" -j ACCEPT 2>/dev/null; do $proto -D INPUT -s "$IP" -j ACCEPT; done
+                    while $proto -C INPUT -s "$IP" -j DROP 2>/dev/null; do $proto -D INPUT -s "$IP" -j DROP; done
+                    ;;
+            esac
+        done
+    elif [ -n "$IPV6" ]; then
+        for proto in ip6tables; do
+            case $ACTION in
+                accept) $proto -I INPUT -s "$IP" -j ACCEPT ;;
+                drop)   $proto -I INPUT -s "$IP" -j DROP ;;
+                delete)
+                    while $proto -C INPUT -s "$IP" -j ACCEPT 2>/dev/null; do $proto -D INPUT -s "$IP" -j ACCEPT; done
+                    while $proto -C INPUT -s "$IP" -j DROP 2>/dev/null; do $proto -D INPUT -s "$IP" -j DROP; done
+                    ;;
+            esac
+        done
+    else
         warn "输入不是有效 IP"
         return
     fi
-    for proto in iptables ip6tables; do
-        case $ACTION in
-            accept) $proto -I INPUT -s "$IP" -j ACCEPT ;;
-            drop)   $proto -I INPUT -s "$IP" -j DROP ;;
-            delete)
-                while $proto -C INPUT -s "$IP" -j ACCEPT 2>/dev/null; do
-                    $proto -D INPUT -s "$IP" -j ACCEPT
-                done
-                while $proto -C INPUT -s "$IP" -j DROP 2>/dev/null; do
-                    $proto -D INPUT -s "$IP" -j DROP
-                done
-                ;;
-        esac
-    done
+
     save_rules
     info "操作完成: $ACTION $IP"
 }
 
 # ===============================
-# 开放指定端口（TCP/UDP）
+# 开放端口
 # ===============================
 open_port() {
     read -r -p "请输入要开放的端口号: " PORT
@@ -141,7 +149,7 @@ open_port() {
 }
 
 # ===============================
-# 关闭指定端口（TCP/UDP）
+# 关闭端口
 # ===============================
 close_port() {
     read -r -p "请输入要关闭的端口号: " PORT
@@ -167,19 +175,11 @@ close_port() {
 disable_ping() {
     for proto in iptables ip6tables; do
         if [ "$proto" = "iptables" ]; then
-            while $proto -C INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null; do
-                $proto -D INPUT -p icmp --icmp-type echo-request -j ACCEPT
-            done
-            while $proto -C OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT 2>/dev/null; do
-                $proto -D OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT
-            done
+            while $proto -C INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null; do $proto -D INPUT -p icmp --icmp-type echo-request -j ACCEPT; done
+            while $proto -C OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT 2>/dev/null; do $proto -D OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT; done
         else
-            while $proto -C INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT 2>/dev/null; do
-                $proto -D INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT
-            done
-            while $proto -C OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT 2>/dev/null; do
-                $proto -D OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT
-            done
+            while $proto -C INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT 2>/dev/null; do $proto -D INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT; done
+            while $proto -C OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT 2>/dev/null; do $proto -D OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT; done
         fi
     done
     save_rules
@@ -234,21 +234,19 @@ show_rules() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}============================${RESET}"
-        echo -e "${GREEN} 🔥 Alpine 防火墙管理脚本 ${RESET}"
-        echo -e "${GREEN}============================${RESET}"
-        echo -e "${GREEN}1) 初始化默认规则 (放行 SSH/80/443)${RESET}"
-        echo -e "${GREEN}2) 开放指定 IP${RESET}"
-        echo -e "${GREEN}3) 封禁指定 IP${RESET}"
-        echo -e "${GREEN}4) 删除指定 IP 规则${RESET}"
-        echo -e "${GREEN}5) 开放指定端口 (TCP/UDP)${RESET}"
-        echo -e "${GREEN}6) 关闭指定端口 (TCP/UDP)${RESET}"
-        echo -e "${GREEN}7) 禁止 PING${RESET}"
-        echo -e "${GREEN}8) 允许 PING${RESET}"
-        echo -e "${GREEN}9) 清空防火墙规则${RESET}"
-        echo -e "${GREEN}10) 显示当前规则${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        echo -e "============================"
+        echo "============================"
+        echo "1) 初始化默认规则 (放行 SSH/80/443)"
+        echo "2) 开放指定 IP"
+        echo "3) 封禁指定 IP"
+        echo "4) 删除指定 IP 规则"
+        echo "5) 开放指定端口 (TCP/UDP)"
+        echo "6) 关闭指定端口 (TCP/UDP)"
+        echo "7) 禁止 PING"
+        echo "8) 允许 PING"
+        echo "9) 清空防火墙规则"
+        echo "10) 显示当前规则"
+        echo "0) 退出"
+        echo "============================"
         read -r -p "请选择操作 (0-10): " choice
 
         case $choice in

@@ -2,6 +2,7 @@
 # =========================================
 # Alpine Linux Docker 管理脚本
 # =========================================
+
 set -e
 
 # ================== 颜色 ==================
@@ -177,22 +178,28 @@ ipv6_menu() {
         case $ip_choice in
             1)
                 echo 0 > /proc/sys/net/ipv6/conf/all/disable_ipv6
-                sed -i '/^net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
-                echo "net.ipv6.conf.all.disable_ipv6 = 0" >> /etc/sysctl.conf
+                if ! grep -q "^net.ipv6.conf.all.disable_ipv6" /etc/sysctl.conf 2>/dev/null; then
+                    echo "net.ipv6.conf.all.disable_ipv6 = 0" >> /etc/sysctl.conf
+                else
+                    sed -i 's/^net.ipv6.conf.all.disable_ipv6.*/net.ipv6.conf.all.disable_ipv6 = 0/' /etc/sysctl.conf
+                fi
                 sysctl -p >/dev/null 2>&1 || true
                 info "IPv6 已启用（永久生效）"
                 pause
                 ;;
             2)
                 echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6
-                sed -i '/^net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
-                echo "net.ipv6.conf.all.disable_ipv6 = 1" >> /etc/sysctl.conf
+                if ! grep -q "^net.ipv6.conf.all.disable_ipv6" /etc/sysctl.conf 2>/dev/null; then
+                    echo "net.ipv6.conf.all.disable_ipv6 = 1" >> /etc/sysctl.conf
+                else
+                    sed -i 's/^net.ipv6.conf.all.disable_ipv6.*/net.ipv6.conf.all.disable_ipv6 = 1/' /etc/sysctl.conf
+                fi
                 sysctl -p >/dev/null 2>&1 || true
                 info "IPv6 已禁用（永久生效）"
                 pause
                 ;;
             0) break ;;
-            *) warn "无效选项"; pause ;;
+            *) warn "无效选项" ;;
         esac
     done
 }
@@ -261,7 +268,6 @@ docker_backup_restore() {
     done
 }
 
-
 # ================== 主菜单 ==================
 main_menu() {
     root_use
@@ -285,20 +291,18 @@ main_menu() {
         echo -e "${YELLOW}Docker: $docker_status | 容器: $running_containers/$total_containers | IPv6: $ipv6_display${RESET}"
         echo
 
-        # ---------- 菜单 ----------
-        echo -e "${GREEN}1)  安装/更新 Docker${RESET}"
-        echo -e "${GREEN}2)  安装/更新 Docker Compose${RESET}"
-        echo -e "${GREEN}3)  卸载 Docker & Compose${RESET}"
-        echo -e "${GREEN}4)  容器管理${RESET}"
-        echo -e "${GREEN}5)  镜像管理${RESET}"
-        echo -e "${GREEN}6)  卷管理${RESET}"
-        echo -e "${GREEN}7)  IPv6 开关${RESET}"
-        echo -e "${GREEN}8)  开放所有端口${RESET}"
-        echo -e "${GREEN}9)  一键清理 Docker${RESET}"
+        echo -e "${GREEN}1) 安装/更新 Docker${RESET}"
+        echo -e "${GREEN}2) 安装/更新 Docker Compose${RESET}"
+        echo -e "${GREEN}3) 卸载 Docker & Compose${RESET}"
+        echo -e "${GREEN}4) 容器管理${RESET}"
+        echo -e "${GREEN}5) 镜像管理${RESET}"
+        echo -e "${GREEN}6) 卷管理${RESET}"
+        echo -e "${GREEN}7) IPv6 开关${RESET}"
+        echo -e "${GREEN}8) 开放所有端口${RESET}"
+        echo -e "${GREEN}9) 一键清理 Docker${RESET}"
         echo -e "${GREEN}10) Docker 备份/恢复${RESET}"
         echo -e "${GREEN}11) 重启 Docker${RESET}"
-        echo -e "${GREEN}0)  退出${RESET}"
-
+        echo -e "${GREEN}0) 退出${RESET}"
         read -p "请选择: " choice
         case $choice in
             1) install_docker ;;
@@ -315,10 +319,6 @@ main_menu() {
             0) exit 0 ;;
             *) warn "无效选项"; pause ;;
         esac
-
-        echo
-        echo -e "${GREEN}操作已完成，按回车返回主菜单...${RESET}"
-        read -r dummy
     done
 }
 

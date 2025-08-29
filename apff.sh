@@ -27,8 +27,23 @@ get_ssh_port() {
 # 保存规则
 # ===============================
 save_rules() {
+    mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4 || true
     ip6tables-save > /etc/iptables/rules.v6 || true
+}
+
+# ===============================
+# 恢复规则
+# ===============================
+restore_rules() {
+    if [ -f /etc/iptables/rules.v4 ]; then
+        iptables-restore < /etc/iptables/rules.v4 || true
+        info "IPv4 规则已恢复"
+    fi
+    if [ -f /etc/iptables/rules.v6 ]; then
+        ip6tables-restore < /etc/iptables/rules.v6 || true
+        info "IPv6 规则已恢复"
+    fi
 }
 
 # ===============================
@@ -51,19 +66,33 @@ init_rules() {
         $proto -A INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT
         $proto -A INPUT -p tcp --dport 80 -j ACCEPT
         $proto -A INPUT -p tcp --dport 443 -j ACCEPT
+        [ "$proto" = "ip6tables" ] && $proto -A INPUT -p icmpv6 -j ACCEPT
     done
     save_rules
     info "默认规则已初始化，放行 SSH/80/443"
 }
 
 # ===============================
-# 安装必要工具
+# 安装必要工具（只在缺少时安装）
 # ===============================
 install_firewall_tools() {
-    apk update
-    apk add --no-cache iptables ip6tables bash curl wget vim sudo git || true
-    mkdir -p /etc/iptables
-    info "防火墙工具安装完成"
+    NEED_INSTALL=0
+    for cmd in iptables ip6tables bash curl wget vim sudo git; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            NEED_INSTALL=1
+            break
+        fi
+    done
+
+    if [ "$NEED_INSTALL" -eq 1 ]; then
+        info "检测到部分工具未安装，正在安装..."
+        apk update
+        apk add --no-cache iptables ip6tables bash curl wget vim sudo git || true
+        mkdir -p /etc/iptables
+        info "防火墙工具安装完成"
+    else
+        info "所有必要工具已安装，无需重复安装"
+    fi
 }
 
 # ===============================
@@ -72,6 +101,10 @@ install_firewall_tools() {
 ip_action() {
     ACTION=$1
     IP=$2
+    if ! echo "$IP" | grep -E -q '^[0-9a-fA-F:.]+$'; then
+        warn "输入不是有效 IP"
+        return
+    fi
     for proto in iptables ip6tables; do
         case $ACTION in
             accept) $proto -I INPUT -s "$IP" -j ACCEPT ;;
@@ -87,6 +120,7 @@ ip_action() {
         esac
     done
     save_rules
+    info "操作完成: $ACTION $IP"
 }
 
 # ===============================
@@ -94,6 +128,10 @@ ip_action() {
 # ===============================
 open_port() {
     read -r -p "请输入要开放的端口号: " PORT
+    if ! echo "$PORT" | grep -E -q '^[0-9]+$'; then
+        warn "无效端口"
+        return
+    fi
     for proto in iptables ip6tables; do
         $proto -I INPUT -p tcp --dport "$PORT" -j ACCEPT
         $proto -I INPUT -p udp --dport "$PORT" -j ACCEPT
@@ -107,6 +145,10 @@ open_port() {
 # ===============================
 close_port() {
     read -r -p "请输入要关闭的端口号: " PORT
+    if ! echo "$PORT" | grep -E -q '^[0-9]+$'; then
+        warn "无效端口"
+        return
+    fi
     for proto in iptables ip6tables; do
         while $proto -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; do
             $proto -D INPUT -p tcp --dport "$PORT" -j ACCEPT
@@ -124,12 +166,21 @@ close_port() {
 # ===============================
 disable_ping() {
     for proto in iptables ip6tables; do
-        while $proto -C INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null; do
-            $proto -D INPUT -p icmp --icmp-type echo-request -j ACCEPT
-        done
-        while $proto -C OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT 2>/dev/null; do
-            $proto -D OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT
-        done
+        if [ "$proto" = "iptables" ]; then
+            while $proto -C INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null; do
+                $proto -D INPUT -p icmp --icmp-type echo-request -j ACCEPT
+            done
+            while $proto -C OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT 2>/dev/null; do
+                $proto -D OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT
+            done
+        else
+            while $proto -C INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT 2>/dev/null; do
+                $proto -D INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT
+            done
+            while $proto -C OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT 2>/dev/null; do
+                $proto -D OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT
+            done
+        fi
     done
     save_rules
     info "已禁止 PING (ICMP)"
@@ -140,8 +191,13 @@ disable_ping() {
 # ===============================
 enable_ping() {
     for proto in iptables ip6tables; do
-        $proto -I INPUT -p icmp --icmp-type echo-request -j ACCEPT
-        $proto -I OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT
+        if [ "$proto" = "iptables" ]; then
+            $proto -I INPUT -p icmp --icmp-type echo-request -j ACCEPT
+            $proto -I OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT
+        else
+            $proto -I INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT
+            $proto -I OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT
+        fi
     done
     save_rules
     info "已允许 PING (ICMP)"
@@ -163,6 +219,16 @@ clear_firewall() {
 }
 
 # ===============================
+# 显示规则
+# ===============================
+show_rules() {
+    echo "===== IPv4 ====="
+    iptables -L -n --line-numbers
+    echo "===== IPv6 ====="
+    ip6tables -L -n --line-numbers
+}
+
+# ===============================
 # 菜单
 # ===============================
 menu() {
@@ -174,30 +240,30 @@ menu() {
         echo -e "${GREEN}1) 初始化默认规则 (放行 SSH/80/443)${RESET}"
         echo -e "${GREEN}2) 开放指定 IP${RESET}"
         echo -e "${GREEN}3) 封禁指定 IP${RESET}"
-        echo -e "${GREEN}4) 删除 IP 规则${RESET}"
+        echo -e "${GREEN}4) 删除指定 IP 规则${RESET}"
         echo -e "${GREEN}5) 开放指定端口 (TCP/UDP)${RESET}"
         echo -e "${GREEN}6) 关闭指定端口 (TCP/UDP)${RESET}"
         echo -e "${GREEN}7) 禁止 PING${RESET}"
         echo -e "${GREEN}8) 允许 PING${RESET}"
-        echo -e "${GREEN}9) 清空防火墙（全放行）${RESET}"
+        echo -e "${GREEN}9) 清空防火墙规则${RESET}"
         echo -e "${GREEN}10) 显示当前规则${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
-        echo -e "----------------------------"
-        read -r -p "请选择操作: " CHOICE
+        echo -e "============================"
+        read -r -p "请选择操作 (0-10): " choice
 
-        case $CHOICE in
-            1) init_rules; read -r -p "按回车返回菜单..." ;;
-            2) read -r -p "请输入要放行的 IP: " IP; ip_action accept "$IP"; read -r -p "按回车返回菜单..." ;;
-            3) read -r -p "请输入要封禁的 IP: " IP; ip_action drop "$IP"; read -r -p "按回车返回菜单..." ;;
-            4) read -r -p "请输入要删除的 IP: " IP; ip_action delete "$IP"; read -r -p "按回车返回菜单..." ;;
-            5) open_port; read -r -p "按回车返回菜单..." ;;
-            6) close_port; read -r -p "按回车返回菜单..." ;;
-            7) disable_ping; read -r -p "按回车返回菜单..." ;;
-            8) enable_ping; read -r -p "按回车返回菜单..." ;;
-            9) clear_firewall; read -r -p "按回车返回菜单..." ;;
-            10) iptables -L -n --line-numbers; ip6tables -L -n --line-numbers; read -r -p "按回车返回菜单..." ;;
+        case $choice in
+            1) init_rules ;;
+            2) read -r -p "请输入要放行的 IP: " IP; ip_action accept "$IP" ;;
+            3) read -r -p "请输入要封禁的 IP: " IP; ip_action drop "$IP" ;;
+            4) read -r -p "请输入要删除的 IP: " IP; ip_action delete "$IP" ;;
+            5) open_port ;;
+            6) close_port ;;
+            7) disable_ping ;;
+            8) enable_ping ;;
+            9) clear_firewall ;;
+            10) show_rules; read -r -p "按回车返回菜单..." ;;
             0) break ;;
-            *) warn "无效选择"; read -r -p "按回车返回菜单..." ;;
+            *) warn "无效输入，请重新选择"; read -r -p "按回车返回菜单..." ;;
         esac
     done
 }
@@ -206,4 +272,5 @@ menu() {
 # 脚本入口
 # ===============================
 install_firewall_tools
+restore_rules
 menu

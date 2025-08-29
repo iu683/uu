@@ -255,7 +255,7 @@ cleanup_docker() {
 }
 
 # ================== Docker 备份/恢复 ==================
-docker_backup_menu() {
+docker_backup_restore() {
     root_use
     while true; do
         clear
@@ -379,8 +379,6 @@ docker_backup_menu() {
         esac
     done
 }
-
-
 
 # ================== 主菜单 ==================
 main_menu() {

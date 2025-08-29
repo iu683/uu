@@ -43,13 +43,29 @@ check_nginx() {
     fi
 }
 
+setup_certbot_renew() {
+    echo -e "${GREEN}配置 Certbot 自动续期...${RESET}"
+    mkdir -p /etc/periodic/daily
+    cat > /etc/periodic/daily/certbot-renew <<'EOF'
+#!/bin/sh
+certbot renew --quiet --deploy-hook "rc-service nginx reload"
+EOF
+    chmod +x /etc/periodic/daily/certbot-renew
+
+    if ! rc-update show | grep -q crond; then
+        rc-update add crond
+        rc-service crond start
+    fi
+    echo -e "${GREEN}自动续期已配置 (每日检查)${RESET}"
+}
+
 install_nginx() {
     check_nginx || {
         echo -e "${GREEN}安装 Nginx 和 Certbot...${RESET}"
         apk update
-        apk add --no-cache nginx certbot py3-certbot-nginx bash
+        apk add --no-cache nginx certbot bash
 
-        mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+        mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /var/www/html
         # 确保 include sites-enabled
         if ! grep -q "sites-enabled" /etc/nginx/nginx.conf; then
             sed -i '/http {/a \    include /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf
@@ -64,6 +80,12 @@ install_nginx() {
     echo -ne "${GREEN}请输入反代目标 (http://127.0.0.1:3000): ${RESET}"; read TARGET
     echo -ne "${GREEN}请输入邮箱: ${RESET}"; read EMAIL
 
+    # 先申请证书
+    certbot certonly --webroot -w /var/www/html -d "$DOMAIN" --email "$EMAIL" --non-interactive --agree-tos || {
+        echo -e "${RED}证书申请失败，请检查域名解析${RESET}"
+        exit 1
+    }
+
     CONFIG="/etc/nginx/sites-available/$DOMAIN"
     LNCONFIG="/etc/nginx/sites-enabled/$DOMAIN"
 
@@ -71,6 +93,15 @@ install_nginx() {
 server {
     listen 80;
     server_name $DOMAIN;
+    return 301 https://$DOMAIN\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name $DOMAIN;
+
+    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
 
     location / {
         proxy_pass $TARGET;
@@ -85,10 +116,7 @@ EOF
     ln -sf "$CONFIG" "$LNCONFIG"
     nginx -t && rc-service nginx reload
 
-    certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL" || {
-        echo -e "${RED}证书申请失败，请检查域名解析${RESET}"
-        exit 1
-    }
+    setup_certbot_renew
 
     echo -e "${GREEN}安装完成，访问: https://$DOMAIN${RESET}"
 }
@@ -97,6 +125,11 @@ add_config() {
     echo -ne "${GREEN}请输入域名: ${RESET}"; read DOMAIN
     echo -ne "${GREEN}请输入反代目标: ${RESET}"; read TARGET
     echo -ne "${GREEN}请输入邮箱: ${RESET}"; read EMAIL
+
+    certbot certonly --webroot -w /var/www/html -d "$DOMAIN" --email "$EMAIL" --non-interactive --agree-tos || {
+        echo -e "${RED}证书申请失败，请检查域名解析${RESET}"
+        return
+    }
 
     CONFIG="/etc/nginx/sites-available/$DOMAIN"
     LNCONFIG="/etc/nginx/sites-enabled/$DOMAIN"
@@ -109,6 +142,15 @@ add_config() {
 server {
     listen 80;
     server_name $DOMAIN;
+    return 301 https://$DOMAIN\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name $DOMAIN;
+
+    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
 
     location / {
         proxy_pass $TARGET;
@@ -122,7 +164,7 @@ EOF
 
     ln -sf "$CONFIG" "$LNCONFIG"
     nginx -t && rc-service nginx reload
-    certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
+
     echo -e "${GREEN}添加完成，访问: https://$DOMAIN${RESET}"
 }
 
@@ -138,7 +180,6 @@ modify_config() {
     echo -ne "${GREEN}请输入要修改的域名: ${RESET}"; read DOMAIN
 
     CONFIG="/etc/nginx/sites-available/$DOMAIN"
-    LNCONFIG="/etc/nginx/sites-enabled/$DOMAIN"
 
     if [ ! -f "$CONFIG" ]; then
         echo -e "${RED}配置不存在${RESET}"
@@ -146,15 +187,21 @@ modify_config() {
     fi
 
     echo -ne "${GREEN}请输入新的反代目标 (http://127.0.0.1:3000): ${RESET}"; read NEW_TARGET
-    echo -ne "${GREEN}是否更新邮箱? (y/n): ${RESET}"; read choice
-    if [ "$choice" = "y" ]; then
-        echo -ne "${GREEN}请输入新邮箱: ${RESET}"; read NEW_EMAIL
-    fi
 
+    # 不重新申请证书，只更新反代
     cat > "$CONFIG" <<EOF
 server {
     listen 80;
     server_name $DOMAIN;
+    return 301 https://$DOMAIN\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name $DOMAIN;
+
+    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
 
     location / {
         proxy_pass $NEW_TARGET;
@@ -168,12 +215,6 @@ EOF
 
     nginx -t && rc-service nginx reload
 
-    if [ -n "$NEW_EMAIL" ]; then
-        certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$NEW_EMAIL"
-    else
-        certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos
-    fi
-
     echo -e "${GREEN}修改完成！访问: https://$DOMAIN${RESET}"
 }
 
@@ -181,8 +222,8 @@ uninstall_nginx() {
     echo -ne "${YELLOW}确定卸载 Nginx? (y/n): ${RESET}"; read CONFIRM
     [ "$CONFIRM" != "y" ] && return
     rc-service nginx stop
-    apk del nginx certbot py3-certbot-nginx
-    rm -rf /etc/nginx/sites-available /etc/nginx/sites-enabled
+    apk del nginx certbot
+    rm -rf /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/periodic/daily/certbot-renew
     echo -e "${GREEN}已卸载 Nginx${RESET}"
 }
 

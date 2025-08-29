@@ -230,7 +230,7 @@ main_menu() {
         echo -e "${red} 9. 一键卸载Java${re}"
         echo -e "${red}10. 一键卸载PHP${re}"
         echo "------------------------"
-        echo -e "${green}0. 退出${re}"
+        echo -e "${green} 0. 退出${re}"
         echo "------------------------"
         read -p $'\033[1;91m请输入你的选择: \033[0m' choice
 

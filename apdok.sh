@@ -2,7 +2,6 @@
 # =========================================
 # Alpine Linux Docker 管理脚本
 # =========================================
-
 set -e
 
 # ================== 颜色 ==================
@@ -107,99 +106,96 @@ check_status() {
 
 # ================== 容器管理 ==================
 container_menu() {
-    echo -e "${GREEN}===== 容器管理 =====${RESET}"
-    echo -e "${GREEN}1) 查看所有容器${RESET}"
-    echo -e "${GREEN}2) 启动容器${RESET}"
-    echo -e "${GREEN}3) 停止容器${RESET}"
-    echo -e "${GREEN}4) 删除容器${RESET}"
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
-    read -p "请选择: " c_choice
-    case $c_choice in
-        1) docker ps -a; pause ;;
-        2) read -p "容器名称/ID: " cid; docker start "$cid"; pause ;;
-        3) read -p "容器名称/ID: " cid; docker stop "$cid"; pause ;;
-        4) read -p "容器名称/ID: " cid; docker rm "$cid"; pause ;;
-        0) return ;;
-        *) warn "无效选项"; pause ;;
-    esac
-    container_menu
+    while true; do
+        echo -e "${GREEN}===== 容器管理 =====${RESET}"
+        echo -e "${GREEN}1) 查看所有容器${RESET}"
+        echo -e "${GREEN}2) 启动容器${RESET}"
+        echo -e "${GREEN}3) 停止容器${RESET}"
+        echo -e "${GREEN}4) 删除容器${RESET}"
+        echo -e "${GREEN}0) 返回主菜单${RESET}"
+        read -p "请选择: " c_choice
+        case $c_choice in
+            1) docker ps -a; pause ;;
+            2) read -p "容器名称/ID: " cid; docker start "$cid"; pause ;;
+            3) read -p "容器名称/ID: " cid; docker stop "$cid"; pause ;;
+            4) read -p "容器名称/ID: " cid; docker rm "$cid"; pause ;;
+            0) break ;;
+            *) warn "无效选项"; pause ;;
+        esac
+    done
 }
 
 # ================== 镜像管理 ==================
 image_menu() {
-    echo -e "${GREEN}===== 镜像管理 =====${RESET}"
-    echo -e "${GREEN}1) 查看镜像列表${RESET}"
-    echo -e "${GREEN}2) 拉取镜像${RESET}"
-    echo -e "${GREEN}3) 删除镜像${RESET}"
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
-    read -p "请选择: " i_choice
-    case $i_choice in
-        1) docker images; pause ;;
-        2) read -p "镜像名称: " img; docker pull "$img"; pause ;;
-        3) read -p "镜像名称/ID: " img; docker rmi "$img"; pause ;;
-        0) return ;;
-        *) warn "无效选项"; pause ;;
-    esac
-    image_menu
+    while true; do
+        echo -e "${GREEN}===== 镜像管理 =====${RESET}"
+        echo -e "${GREEN}1) 查看镜像列表${RESET}"
+        echo -e "${GREEN}2) 拉取镜像${RESET}"
+        echo -e "${GREEN}3) 删除镜像${RESET}"
+        echo -e "${GREEN}0) 返回主菜单${RESET}"
+        read -p "请选择: " i_choice
+        case $i_choice in
+            1) docker images; pause ;;
+            2) read -p "镜像名称: " img; docker pull "$img"; pause ;;
+            3) read -p "镜像名称/ID: " img; docker rmi "$img"; pause ;;
+            0) break ;;
+            *) warn "无效选项"; pause ;;
+        esac
+    done
 }
 
 # ================== 卷管理 ==================
 volume_menu() {
-    echo -e "${GREEN}===== 卷管理 =====${RESET}"
-    echo -e "${GREEN}1) 查看卷列表${RESET}"
-    echo -e "${GREEN}2) 删除卷${RESET}"
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
-    read -p "请选择: " v_choice
-    case $v_choice in
-        1) docker volume ls; pause ;;
-        2) read -p "卷名称: " vol; docker volume rm "$vol"; pause ;;
-        0) return ;;
-        *) warn "无效选项"; pause ;;
-    esac
-    volume_menu
+    while true; do
+        echo -e "${GREEN}===== 卷管理 =====${RESET}"
+        echo -e "${GREEN}1) 查看卷列表${RESET}"
+        echo -e "${GREEN}2) 删除卷${RESET}"
+        echo -e "${GREEN}0) 返回主菜单${RESET}"
+        read -p "请选择: " v_choice
+        case $v_choice in
+            1) docker volume ls; pause ;;
+            2) read -p "卷名称: " vol; docker volume rm "$vol"; pause ;;
+            0) break ;;
+            *) warn "无效选项"; pause ;;
+        esac
+    done
 }
 
+# ================== IPv6 开关 ==================
 ipv6_menu() {
     while true; do
         IPV6_STATUS=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)
         CURRENT_STATUS=$([ "$IPV6_STATUS" -eq 0 ] && echo "启用" || echo "禁用")
 
-        echo -e "\033[32m===== IPv6 设置 =====\033[0m"
-        echo -e "\033[33m当前 IPv6 状态: $CURRENT_STATUS\033[0m"
-        echo -e "\033[32m1) 启用 IPv6\033[0m"
-        echo -e "\033[32m2) 禁用 IPv6\033[0m"
-        echo -e "\033[32m0) 返回主菜单\033[0m"
+        echo -e "${GREEN}===== IPv6 设置 =====${RESET}"
+        echo -e "${YELLOW}当前 IPv6 状态: $CURRENT_STATUS${RESET}"
+        echo -e "${GREEN}1) 启用 IPv6${RESET}"
+        echo -e "${GREEN}2) 禁用 IPv6${RESET}"
+        echo -e "${GREEN}0) 返回主菜单${RESET}"
 
         read -p "请选择: " ip_choice
         case $ip_choice in
             1)
                 echo 0 > /proc/sys/net/ipv6/conf/all/disable_ipv6
-                if ! grep -q "^net.ipv6.conf.all.disable_ipv6" /etc/sysctl.conf 2>/dev/null; then
-                    echo "net.ipv6.conf.all.disable_ipv6 = 0" >> /etc/sysctl.conf
-                else
-                    sed -i 's/^net.ipv6.conf.all.disable_ipv6.*/net.ipv6.conf.all.disable_ipv6 = 0/' /etc/sysctl.conf
-                fi
+                sed -i '/^net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
+                echo "net.ipv6.conf.all.disable_ipv6 = 0" >> /etc/sysctl.conf
                 sysctl -p >/dev/null 2>&1 || true
-                echo -e "\033[32m[INFO] IPv6 已启用（永久生效）\033[0m"
-                read -p "按回车键返回菜单..." dummy
+                info "IPv6 已启用（永久生效）"
+                pause
                 ;;
             2)
                 echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6
-                if ! grep -q "^net.ipv6.conf.all.disable_ipv6" /etc/sysctl.conf 2>/dev/null; then
-                    echo "net.ipv6.conf.all.disable_ipv6 = 1" >> /etc/sysctl.conf
-                else
-                    sed -i 's/^net.ipv6.conf.all.disable_ipv6.*/net.ipv6.conf.all.disable_ipv6 = 1/' /etc/sysctl.conf
-                fi
+                sed -i '/^net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
+                echo "net.ipv6.conf.all.disable_ipv6 = 1" >> /etc/sysctl.conf
                 sysctl -p >/dev/null 2>&1 || true
-                echo -e "\033[32m[INFO] IPv6 已禁用（永久生效）\033[0m"
-                read -p "按回车键返回菜单..." dummy
+                info "IPv6 已禁用（永久生效）"
+                pause
                 ;;
             0) break ;;
-            *) echo -e "\033[33m[WARN] 无效选项\033[0m" ;;
+            *) warn "无效选项"; pause ;;
         esac
     done
 }
-
 
 # ================== 开放所有端口 ==================
 open_all_ports() {
@@ -221,9 +217,50 @@ cleanup_docker() {
 
 # ================== Docker 备份/恢复 ==================
 docker_backup_restore() {
-    info "此功能可按需扩展"
-    pause
+    while true; do
+        echo -e "${GREEN}===== Docker 备份/恢复 =====${RESET}"
+        echo -e "${GREEN}1) 备份容器${RESET}"
+        echo -e "${GREEN}2) 恢复容器${RESET}"
+        echo -e "${GREEN}3) 备份镜像${RESET}"
+        echo -e "${GREEN}4) 恢复镜像${RESET}"
+        echo -e "${GREEN}0) 返回主菜单${RESET}"
+
+        read -p "请选择: " dr_choice
+        case $dr_choice in
+            1)
+                read -p "输入容器名称/ID: " cid
+                read -p "输入备份路径 (如 /root/backups): " path
+                mkdir -p "$path"
+                docker export "$cid" -o "$path/$cid.tar"
+                info "容器 $cid 已备份到 $path/$cid.tar"
+                pause
+                ;;
+            2)
+                read -p "输入备份文件路径 (如 /root/backups/container.tar): " tarfile
+                docker import "$tarfile"
+                info "容器已从 $tarfile 恢复"
+                pause
+                ;;
+            3)
+                read -p "输入镜像名称 (如 nginx:latest): " img
+                read -p "输入备份路径 (如 /root/backups): " path
+                mkdir -p "$path"
+                docker save "$img" -o "$path/$(echo $img | tr '/:' '__').tar"
+                info "镜像 $img 已备份到 $path"
+                pause
+                ;;
+            4)
+                read -p "输入镜像备份文件路径 (如 /root/backups/nginx__latest.tar): " imgfile
+                docker load -i "$imgfile"
+                info "镜像已从 $imgfile 恢复"
+                pause
+                ;;
+            0) break ;;
+            *) warn "无效选项"; pause ;;
+        esac
+    done
 }
+
 
 # ================== 主菜单 ==================
 main_menu() {
@@ -249,18 +286,19 @@ main_menu() {
         echo
 
         # ---------- 菜单 ----------
-        echo -e "${GREEN}1) 安装/更新 Docker${RESET}"
-        echo -e "${GREEN}2) 安装/更新 Docker Compose${RESET}"
-        echo -e "${GREEN}3) 卸载 Docker & Compose${RESET}"
-        echo -e "${GREEN}4) 容器管理${RESET}"
-        echo -e "${GREEN}5) 镜像管理${RESET}"
-        echo -e "${GREEN}6) 卷管理${RESET}"
-        echo -e "${GREEN}7) IPv6 开关${RESET}"
-        echo -e "${GREEN}8) 开放所有端口${RESET}"
-        echo -e "${GREEN}9) 一键清理 Docker${RESET}"
+        echo -e "${GREEN}1)  安装/更新 Docker${RESET}"
+        echo -e "${GREEN}2)  安装/更新 Docker Compose${RESET}"
+        echo -e "${GREEN}3)  卸载 Docker & Compose${RESET}"
+        echo -e "${GREEN}4)  容器管理${RESET}"
+        echo -e "${GREEN}5)  镜像管理${RESET}"
+        echo -e "${GREEN}6)  卷管理${RESET}"
+        echo -e "${GREEN}7)  IPv6 开关${RESET}"
+        echo -e "${GREEN}8)  开放所有端口${RESET}"
+        echo -e "${GREEN}9)  一键清理 Docker${RESET}"
         echo -e "${GREEN}10) Docker 备份/恢复${RESET}"
         echo -e "${GREEN}11) 重启 Docker${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
+        echo -e "${GREEN}0)  退出${RESET}"
+
         read -p "请选择: " choice
         case $choice in
             1) install_docker ;;
@@ -277,6 +315,10 @@ main_menu() {
             0) exit 0 ;;
             *) warn "无效选项"; pause ;;
         esac
+
+        echo
+        echo -e "${GREEN}操作已完成，按回车返回主菜单...${RESET}"
+        read -r dummy
     done
 }
 

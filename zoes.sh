@@ -56,7 +56,7 @@ ensure_nginx_include() {
   fi
 }
 
-# 封禁（手动输入端口）
+# 封禁端口（手动输入，不使用 default_server）
 block_direct_ip_manual() {
   echo -ne "${GREEN}请输入要封禁的端口(空格分开, 例: 80 443): ${RESET}"
   read PORTS
@@ -76,7 +76,7 @@ block_direct_ip_manual() {
 
       cat > "$CONF" <<EOF
 server {
-    listen 443 ssl default_server;
+    listen 443 ssl;
     server_name _;
     ssl_certificate $CRT;
     ssl_certificate_key $KEY;
@@ -86,7 +86,7 @@ EOF
     else
       cat > "$CONF" <<EOF
 server {
-    listen $PORT default_server;
+    listen $PORT;
     server_name _;
     return 444;
 }

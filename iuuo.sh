@@ -1,7 +1,7 @@
 #!/bin/bash
 # =========================================
-# 一键部署/管理脚本（最终版）
-# 适配 Debian，带绿色菜单 + 自动续期检测 + 防浏览器访问 + DNS 检测 + 访问日志 + HTTP自动跳转HTTPS
+# 一键部署/管理脚本（Debian 兼容）
+# 带绿色菜单 + 自动续期检测 + 防浏览器访问 + DNS 检测 + 访问日志 + HTTP自动跳转HTTPS
 # =========================================
 
 WEB_ROOT="/var/www/html"
@@ -77,8 +77,8 @@ server {
     ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
 
-    # 日志文件
-    access_log $LOG_FILE timed;
+    # 日志文件（Debian 默认兼容格式）
+    access_log $LOG_FILE combined;
 
     # 仅允许命令行工具访问
     location = / {
@@ -112,7 +112,7 @@ EOF
     echo -e "${GREEN}==========================================${RESET}"
     echo -e "${GREEN}部署完成！${RESET}"
     echo -e "${GREEN}一键安装命令：${RESET}"
-    echo -e "${GREEN}bash <(curl -sL $DOMAIN)${RESET}"
+    echo -e "${GREEN}bash <(curl -sL https://$DOMAIN)${RESET}"
     echo -e "${GREEN}本地脚本已下载到：$LOCAL_DIR/tim${RESET}"
     echo -e "${GREEN}HTTPS 已启用 https://$DOMAIN${RESET}"
     echo -e "${GREEN}拉取日志文件路径：$LOG_FILE${RESET}"

@@ -40,6 +40,15 @@ install_deps(){
   local deps=("curl" "vnstat" "bc")
   local missing=()
 
+  # 检查 lsb_release 或 redhat-lsb-core
+  if ! command -v lsb_release >/dev/null 2>&1; then
+    if command -v apt >/dev/null 2>&1 || command -v zypper >/dev/null 2>&1 || command -v apk >/dev/null 2>&1 || command -v pacman >/dev/null 2>&1; then
+      deps+=("lsb-release")
+    elif command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
+      deps+=("redhat-lsb-core")
+    fi
+  fi
+
   # 检查缺少的依赖
   for pkg in "${deps[@]}"; do
     if ! command -v "$pkg" >/dev/null 2>&1; then
@@ -47,7 +56,7 @@ install_deps(){
     fi
   done
 
-  # 如果都已安装，直接返回
+  # 如果没有缺失，直接返回
   if [ ${#missing[@]} -eq 0 ]; then
     return
   fi
@@ -63,10 +72,16 @@ install_deps(){
     dnf install -y "${missing[@]}"
   elif command -v zypper >/dev/null 2>&1; then
     zypper install -y "${missing[@]}"
+  elif command -v apk >/dev/null 2>&1; then
+    apk update
+    apk add "${missing[@]}"
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm "${missing[@]}"
   else
-    echo -e "${red}❌ 无法检测到包管理器，请手动安装: ${missing[*]}${re}"
+    echo -e "${red}❌ 未检测到支持的包管理器，请手动安装: ${missing[*]}${re}"
   fi
 }
+
 
 
 # ================== 公网IP ==================

@@ -140,71 +140,87 @@ send_to_telegram() {
         -d parse_mode="Markdown" \
         -d text="$TG_MSG"
     echo "信息已发送到 Telegram。"
-    # 发送后清理临时文件
     rm -f "$OUTPUT_FILE"
     read -p "按回车返回菜单..."
 }
 
 # =============================
-# 设置定时任务
+# 设置定时任务（稳定版）
 # =============================
 setup_cron() {
     SCRIPT_PATH="$(readlink -f "$0")"
 
-    echo -e "${GREEN}===== 定时任务管理 =====${RESET}"
-    echo -e "${GREEN}1) 每天${RESET}"
-    echo -e "${GREEN}2) 每周${RESET}"
-    echo -e "${GREEN}3) 每月${RESET}"
-    echo -e "${GREEN}4) 取消定时任务${RESET}"
-    echo -e "${GREEN}5) 查看当前定时任务${RESET}"
-    echo -e "${GREEN}6) 立即执行一次任务${RESET}"
-    echo -e "${GREEN}7) 返回上级菜单${RESET}"
-    echo -n "请选择操作 [1-7]: "
-    read -r cron_choice
+    while true; do
+        echo -e "${GREEN}===== 定时任务管理 =====${RESET}"
+        echo -e "${GREEN}1) 每天${RESET}"
+        echo -e "${GREEN}2) 每周${RESET}"
+        echo -e "${GREEN}3) 每月${RESET}"
+        echo -e "${GREEN}4) 取消定时任务${RESET}"
+        echo -e "${GREEN}5) 查看当前定时任务${RESET}"
+        echo -e "${GREEN}6) 立即执行一次任务${RESET}"
+        echo -e "${GREEN}7) 返回上级菜单${RESET}"
+        echo -n "请选择操作 [1-7]: "
+        read -r cron_choice
 
-    case $cron_choice in
-        1) CRON_TIME="0 0 * * *" ;;
-        2) CRON_TIME="0 0 * * 0" ;;
-        3) CRON_TIME="0 0 1 * *" ;;
-        4) 
-            crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --cron" | crontab -
-            echo -e "${GREEN}定时任务已取消！${RESET}"
-            read -p "按回车返回菜单..."
-            return
-            ;;
-        5)
-            echo -e "${GREEN}当前定时任务:${RESET}"
-            crontab -l 2>/dev/null | grep "$SCRIPT_PATH --cron" || echo "（没有相关任务）"
-            read -p "按回车返回菜单..."
-            return
-            ;;
-        6)
-            echo -e "${GREEN}正在立即执行一次定时任务...${RESET}"
-            setup_telegram
-            collect_network_info
-            send_to_telegram
-            echo -e "${GREEN}✅ 定时任务已立即执行完成${RESET}"
-            read -p "按回车返回菜单..."
-            return
-            ;;
-        7)
-            echo "返回上级菜单..."
-            read -p "按回车返回菜单..."
-            return
-            ;;
-        *)
-            echo -e "${RED}无效选择，返回菜单${RESET}"
-            read -p "按回车返回菜单..."
-            return
-            ;;
-    esac
+        TMP_CRON=$(mktemp)
+        crontab -l 2>/dev/null > "$TMP_CRON"
 
-    # 如果选择了 1-3，写入 crontab
-    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --cron" | crontab -
-    (crontab -l 2>/dev/null; echo "$CRON_TIME bash $SCRIPT_PATH --cron >/dev/null 2>&1") | crontab -
-    echo -e "${GREEN}定时任务已设置成功！${RESET}"
-    echo "cron 表达式: $CRON_TIME"
-    read -p "按回车返回菜单..."
+        case $cron_choice in
+            1) CRON_TIME="0 0 * * *" ;;
+            2) CRON_TIME="0 0 * * 0" ;;
+            3) CRON_TIME="0 0 1 * *" ;;
+            4)
+                grep -v "$SCRIPT_PATH --cron" "$TMP_CRON" > "$TMP_CRON.tmp"
+                mv "$TMP_CRON.tmp" "$TMP_CRON"
+                crontab "$TMP_CRON"
+                echo -e "${GREEN}定时任务已取消！${RESET}"
+                read -p "按回车返回菜单..."
+                rm -f "$TMP_CRON"
+                return
+                ;;
+            5)
+                echo -e "${GREEN}当前定时任务:${RESET}"
+                grep "$SCRIPT_PATH --cron" "$TMP_CRON" || echo "（没有相关任务）"
+                read -p "按回车返回菜单..."
+                rm -f "$TMP_CRON"
+                return
+                ;;
+            6)
+                echo -e "${GREEN}正在立即执行一次定时任务...${RESET}"
+                setup_telegram
+                collect_network_info
+                send_to_telegram
+                echo -e "${GREEN}✅ 定时任务已立即执行完成${RESET}"
+                read -p "按回车返回菜单..."
+                rm -f "$TMP_CRON"
+                return
+                ;;
+            7)
+                echo "返回上级菜单..."
+                read -p "按回车返回菜单..."
+                rm -f "$TMP_CRON"
+                return
+                ;;
+            *)
+                echo -e "${RED}无效选择，返回菜单${RESET}"
+                read -p "按回车返回菜单..."
+                rm -f "$TMP_CRON"
+                return
+                ;;
+        esac
+
+        # 选择 1-3 时写入 crontab
+        grep -v "$SCRIPT_PATH --cron" "$TMP_CRON" > "$TMP_CRON.tmp"
+        mv "$TMP_CRON.tmp" "$TMP_CRON"
+        echo "$CRON_TIME bash $SCRIPT_PATH --cron >/dev/null 2>&1" >> "$TMP_CRON"
+        crontab "$TMP_CRON"
+        rm -f "$TMP_CRON"
+
+        echo -e "${GREEN}定时任务已设置成功！${RESET}"
+        echo "cron 表达式: $CRON_TIME"
+        read -p "按回车返回菜单..."
+        return
+    done
 }
 
 # =============================

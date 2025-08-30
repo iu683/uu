@@ -11,6 +11,8 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 RESET='\033[0m'
 
+TASK_TAG="#vps_network_task"
+
 # =============================
 # 获取 Telegram 参数
 # =============================
@@ -158,8 +160,7 @@ setup_cron() {
         echo -e "${GREEN}4) 取消定时任务${RESET}"
         echo -e "${GREEN}5) 查看当前定时任务${RESET}"
         echo -e "${GREEN}6) 立即执行一次任务${RESET}"
-        echo -e "${GREEN}7) 返回上级菜单${RESET}"
-        echo -n "请选择操作 [1-7]: "
+        echo -n "请选择操作 [1-6]: "
         read -r cron_choice
 
         TMP_CRON=$(mktemp)
@@ -170,7 +171,7 @@ setup_cron() {
             2) CRON_TIME="0 0 * * 0" ;;
             3) CRON_TIME="0 0 1 * *" ;;
             4)
-                grep -v "$SCRIPT_PATH --cron" "$TMP_CRON" > "$TMP_CRON.tmp"
+                grep -v "$TASK_TAG" "$TMP_CRON" > "$TMP_CRON.tmp"
                 mv "$TMP_CRON.tmp" "$TMP_CRON"
                 crontab "$TMP_CRON"
                 echo -e "${GREEN}定时任务已取消！${RESET}"
@@ -180,7 +181,7 @@ setup_cron() {
                 ;;
             5)
                 echo -e "${GREEN}当前定时任务:${RESET}"
-                grep "$SCRIPT_PATH --cron" "$TMP_CRON" || echo "（没有相关任务）"
+                grep "$TASK_TAG" "$TMP_CRON" || echo "（没有相关任务）"
                 read -p "按回车返回菜单..."
                 rm -f "$TMP_CRON"
                 return
@@ -195,12 +196,6 @@ setup_cron() {
                 rm -f "$TMP_CRON"
                 return
                 ;;
-            7)
-                echo "返回上级菜单..."
-                read -p "按回车返回菜单..."
-                rm -f "$TMP_CRON"
-                return
-                ;;
             *)
                 echo -e "${RED}无效选择，返回菜单${RESET}"
                 read -p "按回车返回菜单..."
@@ -209,10 +204,10 @@ setup_cron() {
                 ;;
         esac
 
-        # 选择 1-3 时写入 crontab
-        grep -v "$SCRIPT_PATH --cron" "$TMP_CRON" > "$TMP_CRON.tmp"
+        # 写入 crontab (1-3)
+        grep -v "$TASK_TAG" "$TMP_CRON" > "$TMP_CRON.tmp"
         mv "$TMP_CRON.tmp" "$TMP_CRON"
-        echo "$CRON_TIME bash $SCRIPT_PATH --cron >/dev/null 2>&1" >> "$TMP_CRON"
+        echo "$CRON_TIME bash \"$SCRIPT_PATH\" --cron >/dev/null 2>&1 $TASK_TAG" >> "$TMP_CRON"
         crontab "$TMP_CRON"
         rm -f "$TMP_CRON"
 

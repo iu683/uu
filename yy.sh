@@ -1,299 +1,233 @@
 #!/bin/bash
+# =========================================
+# VPS 网络信息管理脚本（绿色菜单版 + 定时任务 + Telegram 美观消息）
+# =========================================
 
-# ================== 颜色定义 ==================
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-RESET="\033[0m"
-BOLD="\033[1m"
+CONFIG_FILE="$HOME/.vps_tg_config"
+OUTPUT_FILE="/tmp/vps_network_info.txt"
 
-# ================== 脚本路径 ==================
-SCRIPT_PATH="$HOME/store.sh"
+# 颜色定义
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+RESET='\033[0m'
 
-# ================== 首次运行自动保存 ==================
-if [ ! -f "$SCRIPT_PATH" ]; then
-    echo -e "${YELLOW}首次运行，正在保存脚本到 $SCRIPT_PATH ...${RESET}"
-    curl -fsSL -o "$SCRIPT_PATH" "https://raw.githubusercontent.com/Polarisiu/app-store/main/store.sh"
-    chmod +x "$SCRIPT_PATH"
-    echo -e "${GREEN}保存完成！${RESET}"
-fi
-
-# ================== 快捷键 d/D ==================
-added=false
-if ! grep -q "alias d=" ~/.bashrc; then
-    echo "alias d='bash $SCRIPT_PATH'" >> ~/.bashrc
-    added=true
-fi
-if ! grep -q "alias D=" ~/.bashrc; then
-    echo "alias D='bash $SCRIPT_PATH'" >> ~/.bashrc
-    added=true
-fi
-
-if [ "$added" = true ]; then
-    source ~/.bashrc 2>/dev/null || true
-    echo -e "${GREEN}已添加快捷键 D/d，重启终端可直接输入启动脚本！${RESET}"
-fi
-
-# ================== 一级菜单分类 ==================
-declare -A categories=(
-    [1]= "Docker及数据库"
-    [2]= "订阅服务"
-    [3]= "监控通知"
-    [4]= "管理面板"
-    [5]= "多媒体工具"
-    [6]= "图床工具"
-    [7]= "实用工具"
-    [8]= "交易商店"
-)
-
-# ================== 二级菜单应用 ==================
-declare -A apps=(
-    [1,1]="安装/管理 Docker"
-    [1,2]="MySQL数据管理"
-    [1,3]="Docker备份恢复"
-    [1,4]="Docker容器迁移"
-    [2,1]="Wallos订阅"
-    [2,2]="Vaultwarden (密码管理)"
-    [2,3]="2FBA"
-    [3,1]="Kuma-Mieru"
-    [3,2]="Komari监控"
-    [3,3]="哪吒监控"
-    [4,1]= "运维面板"
-    [4,2]= "XTrafficDash(流量监控)"
-    [4,3]= "Sun-Panel"
-    [4,4]= "WebSSH"
-    [4,5]= "NexusTerminal(SSH)"
-    [4,6]= "Sub-store"
-    [4,7]= "Poste.io邮局"
-    [4,8]= "oci-start"
-    [4,9]= "Y探长"
-    [4,10]="R探长"
-    [4,11]="OneNav书签管理"
-    [4,12]="彩虹聚合DNS"
-    [4,13]="ONE API"
-    [4,14]="NEW API"
-    [4,15]="青龙面板"
-    [5,1]= "音乐服务（三合一）"
-    [5,2]= "LrcApi(歌词)"
-    [5,3]= "Openlist"
-    [5,4]= "SPlayer音乐"
-    [5,5]= "AutoBangumi"
-    [5,6]= "MoviePilot"
-    [5,7]= "qBittorrentv4.6.3"
-    [5,8]= "Vertex"
-    [5,9]= "yt-dlp视频下载工具"
-    [5,10]="libretv"
-    [5,11]="MoonTV"
-    [5,12]="Emby(开心版)"
-    [5,13]="Emby"
-    [5,14]="Jellyfin"
-    [6,1]= "Foxel图片管理"
-    [6,2]= "STB图床"
-    [6,3]= "兰空图床(无MySQL)"
-    [6,4]= "兰空图床(有MySQL)"
-    [6,5]= "图片API (兰空图床)"
-    [6,6]= "简单图床"
-    [7,1]= "ALLinSSL证书"
-    [7,2]= "SaveAnyBot(TG转存)"
-    [7,3]= "github镜像"
-    [7,4]= "Docker加速"
-    [7,5]= "计算圆周率"
-    [7,6]= "DockerGitHub加速代理"
-    [7,7]= "超级短链"
-    [7,8]= "多功能文件分享"
-    [7,9]= "订阅转换"
-    [7,10]="笔记"
-    [8,1]="异次元商城"
-    [8,2]="萌次元商城"
-    [8,3]="BEpusdt收款"
-)
-
-# ================== 二级菜单命令 ==================
-declare -A commands=(
-    [1,1]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/Docker.sh)'
-    [1,2]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/mysql.sh)'
-    [1,3]='curl -fsSL https://raw.githubusercontent.com/xymn2023/DMR/main/docker_back.sh -o docker_back.sh && chmod +x docker_back.sh && ./docker_back.sh'
-    [1,4]='curl -sL https://raw.githubusercontent.com/ceocok/Docker_container_migration/refs/heads/main/Docker_container_migration.sh -o Docker_container_migration.sh && chmod +x Docker_container_migration.sh && ./Docker_container_migration.sh'
-    [2,1]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/wallos.sh)'
-    [2,2]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/vaultwarden.sh)'
-    [2,3]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/2fauth.sh)'
-    [3,1]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/kuma-mieru.sh)'
-    [3,2]='bash <(curl -fsSL https://raw.githubusercontent.com/Polarisiu/app-store/main/komarigl.sh)'
-    [3,3]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/panel/main/nezha.sh)'
-    [4,1]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/panel/main/Panel.sh)'
-    [4,2]='bash <(curl -fsSL https://raw.githubusercontent.com/Polarisiu/app-store/main/xtrafficdash.sh)'
-    [4,3]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/sun-panel.sh)'
-    [4,4]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/webssh.sh)'
-    [4,5]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/nexus-terminal.sh)'
-    [4,6]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/sub-store.sh)'
-    [4,7]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/Poste.io.sh)'
-    [4,8]='bash <(curl -fsSL https://raw.githubusercontent.com/Polarisiu/oracle/main/oci-start.sh)'
-    [4,9]='bash <(curl -fsSL https://raw.githubusercontent.com/Polarisiu/oracle/main/Yoci-helper.sh)'
-    [4,10]='bash <(curl -fsSL https://raw.githubusercontent.com/Polarisiu/oracle/main/R-Bot.sh)'
-    [4,11]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/onenav.sh)'
-    [4,12]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/dnss.sh)'
-    [4,13]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/oneapi.sh)'
-    [4,14]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/newapi.sh)'
-    [4,15]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/qlmb.sh)'
-    [5,1]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/music_full_auto.sh)'
-    [5,2]='bash <(curl -fsSL https://raw.githubusercontent.com/Polarisiu/app-store/main/lacapi.sh)'
-    [5,3]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/Openlist.sh)'
-    [5,4]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/splayer.sh)'
-    [5,5]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/Autobangumi.sh)'
-    [5,6]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/moviepilot.sh)'
-    [5,7]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/qbittorrent.sh)'
-    [5,8]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/vertex.sh)'
-    [5,9]='bash <(curl -fsSL https://raw.githubusercontent.com/Polarisiu/app-store/main/ytdlb.sh)'
-    [5,10]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/libretv.sh)'
-    [5,11]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/mootv.sh)'
-    [5,12]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/kxemby.sh)'
-    [5,13]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/emby.sh)'
-    [5,14]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/Jellyfin.sh)'
-    [6,1]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/foxel.sh)'
-    [6,2]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/stb.sh)'
-    [6,3]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/lsky_menu.sh)'
-    [6,4]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/Lsky.sh)'
-    [6,5]='bash <(curl -fsSL https://raw.githubusercontent.com/Polarisiu/app-store/main/apitu.sh)'
-    [6,6]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/EasyImage.sh)'
-    [7,1]='bash <(curl -fsSL https://raw.githubusercontent.com/Polarisiu/app-store/main/ALLSSL.sh)'
-    [7,2]='bash <(curl -fsSL https://raw.githubusercontent.com/Polarisiu/app-store/main/SaveAnyBot.sh)'
-    [7,3]='bash <(curl -fsSL https://raw.githubusercontent.com/Polarisiu/app-store/main/fdgit.sh)'
-    [7,4]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/dockhub.sh)'
-    [7,5]='bash <(curl -fsSL https://raw.githubusercontent.com/Polarisiu/toy/main/pai.sh)'
-    [7,6]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/hubproxy.sh)'
-    [7,7]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/Zurl.sh)'
-    [7,8]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/Zdir.sh)'
-    [7,9]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/subzh.sh)'
-    [7,10]='bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/Trilium.sh)'
-    [8,1]='bash <(curl -fsSL https://raw.githubusercontent.com/Polarisiu/app-store/main/ycyk.sh)'
-    [8,2]='bash <(curl -fsSL https://raw.githubusercontent.com/Polarisiu/app-store/main/mcygl.sh)'
-    [8,3]='bash <(curl -fsSL https://raw.githubusercontent.com/Polarisiu/app-store/main/BEpusdt.sh)'
-)
-
-# ================== 菜单显示函数 ==================
-show_category_menu() {
-    clear
-    echo -e "${GREEN}${BOLD}╔════════════════════════════════════════╗${RESET}"
-    echo -e "${GREEN}${BOLD}         应用分类菜单${RESET}"
-    echo -e "${GREEN}${BOLD}╚════════════════════════════════════════╝${RESET}\n"
-
-    for i in $(seq 1 ${#categories[@]}); do
-        echo -e "${GREEN}[$i] ${categories[$i]}${RESET}"
-    done
-    echo -e "${GREEN}[88] 更新脚本${RESET}"
-    echo -e "${GREEN}[99] 卸载脚本${RESET}"
-    echo -e "${GREEN}[0]  退出脚本${RESET}"
+# =============================
+# 获取 Telegram 参数（首次提示）
+# =============================
+setup_telegram() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    else
+        echo -e "${YELLOW}第一次运行，需要配置 Telegram 参数${RESET}"
+        echo -n "请输入 Telegram Bot Token: "
+        read -r TG_BOT_TOKEN
+        echo -n "请输入 Telegram Chat ID: "
+        read -r TG_CHAT_ID
+        echo "TG_BOT_TOKEN=\"$TG_BOT_TOKEN\"" > "$CONFIG_FILE"
+        echo "TG_CHAT_ID=\"$TG_CHAT_ID\"" >> "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE"
+        echo -e "${GREEN}配置已保存，下次运行可直接使用。${RESET}"
+    fi
 }
 
-show_app_menu() {
-    local cat=$1
-    clear
-    echo -e "${GREEN}${BOLD}╔════════════════════════════════════════╗${RESET}"
-    echo -e "${GREEN}${BOLD}        ${categories[$cat]}${RESET}"
-    echo -e "${GREEN}${BOLD}╚════════════════════════════════════════╝${RESET}\n"
-
-    local i=1
-    declare -gA menu_map
-    menu_map=()
-
-    keys=()
-    for key in "${!apps[@]}"; do
-        if [[ $key == $cat,* ]]; then
-            keys+=("$key")
-        fi
-    done
-
-    IFS=$'\n' sorted_keys=($(sort -t, -k2n <<<"${keys[*]}"))
-    unset IFS
-
-    for key in "${sorted_keys[@]}"; do
-        menu_map[$i]=$key
-        echo -e "${GREEN}[$i] ${apps[$key]}${RESET}"
-        ((i++))
-    done
-
-    echo -e "${GREEN}[0] 返回上一级${RESET}"
+# =============================
+# 修改 Telegram 配置
+# =============================
+modify_config() {
+    echo -e "${YELLOW}修改 Telegram 配置:${RESET}"
+    echo -n "请输入新的 Bot Token: "
+    read -r TG_BOT_TOKEN
+    echo -n "请输入新的 Chat ID: "
+    read -r TG_CHAT_ID
+    echo "TG_BOT_TOKEN=\"$TG_BOT_TOKEN\"" > "$CONFIG_FILE"
+    echo "TG_CHAT_ID=\"$TG_CHAT_ID\"" >> "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+    echo -e "${GREEN}配置已更新。${RESET}"
 }
 
-# ================== 菜单处理函数 ==================
-category_menu_handler() {
+# =============================
+# 删除临时文件
+# =============================
+delete_file() {
+    if [ -f "$OUTPUT_FILE" ]; then
+        rm -f "$OUTPUT_FILE"
+        echo -e "${GREEN}文件 $OUTPUT_FILE 已删除。${RESET}"
+    else
+        echo -e "${YELLOW}文件 $OUTPUT_FILE 不存在。${RESET}"
+    fi
+}
+
+# =============================
+# 收集网络信息
+# =============================
+collect_network_info() {
+    echo "收集网络信息..."
+    {
+    echo "================= VPS 网络信息 ================="
+    echo "日期: $(date)"
+    echo "主机名: $(hostname)"
+    echo ""
+    echo "=== 系统信息 ==="
+    if command -v hostnamectl >/dev/null 2>&1; then
+        hostnamectl
+    else
+        cat /etc/os-release
+    fi
+    echo ""
+    } > "$OUTPUT_FILE"
+
+    echo "=== 网络接口信息 ===" >> "$OUTPUT_FILE"
+
+    for IFACE in $(ls /sys/class/net/); do
+        DESC="$IFACE"
+        [ "$IFACE" = "lo" ] && DESC="$IFACE (回环接口)"
+        [ "$IFACE" != "lo" ] && DESC="$IFACE (主网卡)"
+        echo "------------------------" >> "$OUTPUT_FILE"
+        echo "接口: $DESC" >> "$OUTPUT_FILE"
+
+        IPV4=$(ip -4 addr show $IFACE | grep -oP 'inet \K[\d./]+')
+        [ -n "$IPV4" ] && echo "IPv4: $IPV4" >> "$OUTPUT_FILE" || echo "IPv4: 无" >> "$OUTPUT_FILE"
+
+        IPV6=$(ip -6 addr show $IFACE scope global | grep -oP 'inet6 \K[0-9a-f:]+/[0-9]+')
+        [ -n "$IPV6" ] && echo "IPv6: $IPV6" >> "$OUTPUT_FILE" || echo "IPv6: 无" >> "$OUTPUT_FILE"
+
+        LL6=$(ip -6 addr show $IFACE scope link | grep -oP 'inet6 \K[0-9a-f:]+/[0-9]+')
+        [ -n "$LL6" ] && echo "链路本地 IPv6: $LL6" >> "$OUTPUT_FILE"
+
+        MAC=$(cat /sys/class/net/$IFACE/address)
+        echo "MAC: $MAC" >> "$OUTPUT_FILE"
+    done
+    echo "------------------------" >> "$OUTPUT_FILE"
+
+    echo "" >> "$OUTPUT_FILE"
+    echo "=== 默认路由 ===" >> "$OUTPUT_FILE"
+    echo "IPv4 默认路由:" >> "$OUTPUT_FILE"
+    ip route show default >> "$OUTPUT_FILE"
+    echo "" >> "$OUTPUT_FILE"
+    echo "IPv6 默认路由:" >> "$OUTPUT_FILE"
+    ip -6 route show default >> "$OUTPUT_FILE"
+    echo "" >> "$OUTPUT_FILE"
+
+    echo "=== 网络连通性测试 ===" >> "$OUTPUT_FILE"
+    ping -c 3 8.8.8.8 >> "$OUTPUT_FILE" 2>&1
+    ping6 -c 3 google.com >> "$OUTPUT_FILE" 2>&1
+}
+
+# =============================
+# 发送美观信息到 Telegram
+# =============================
+send_to_telegram() {
+    if [ ! -f "$OUTPUT_FILE" ]; then
+        echo -e "${YELLOW}⚠️ 文件 $OUTPUT_FILE 不存在，请先收集网络信息。${RESET}"
+        return
+    fi
+
+    TG_MSG="📡 VPS 网络信息\n===============================\n"
+    TG_MSG+="主机名: $(hostname)\n"
+
+    for IFACE in $(ls /sys/class/net/); do
+        DESC="$IFACE"
+        [ "$IFACE" = "lo" ] && DESC="$IFACE (回环接口)"
+        [ "$IFACE" != "lo" ] && DESC="$IFACE (主网卡)"
+
+        IPV4=$(ip -4 addr show $IFACE | grep -oP 'inet \K[\d./]+')
+        IPV4=${IPV4:-无}
+
+        IPV6=$(ip -6 addr show $IFACE scope global | grep -oP 'inet6 \K[0-9a-f:]+/[0-9]+')
+        IPV6=${IPV6:-无}
+
+        LL6=$(ip -6 addr show $IFACE scope link | grep -oP 'inet6 \K[0-9a-f:]+/[0-9]+')
+        LL6=${LL6:-无}
+
+        MAC=$(cat /sys/class/net/$IFACE/address)
+
+        TG_MSG+="\n接口: $DESC\nIPv4: $IPV4\nIPv6: $IPV6\n链路本地 IPv6: $LL6\nMAC: $MAC\n"
+        TG_MSG+="-------------------------------\n"
+    done
+
+    # 默认路由
+    TG_MSG+="IPv4 默认路由:\n$(ip route show default)\n"
+    TG_MSG+="IPv6 默认路由:\n$(ip -6 route show default)\n"
+    TG_MSG+="-------------------------------\n"
+
+    # Ping 测试
+    PING4=$(ping -c 2 8.8.8.8 | grep 'packet loss' | awk '{print $6 " " $7}')
+    PING6=$(ping6 -c 2 google.com | grep 'packet loss' | awk '{print $6 " " $7}')
+    TG_MSG+="Ping 8.8.8.8: $PING4\nPing6 google.com: $PING6\n"
+
+    curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
+        -d chat_id="$TG_CHAT_ID" \
+        -d parse_mode="Markdown" \
+        -d text="\`\`\`$TG_MSG\`\`\`"
+
+    echo -e "${GREEN}信息已发送到 Telegram。${RESET}"
+}
+
+# =============================
+# 设置定时任务
+# =============================
+setup_cron() {
+    echo -e "${GREEN}===== 设置定时任务 =====${RESET}"
+    echo "1) 每天"
+    echo "2) 每周"
+    echo "3) 每月"
+    echo -n "请选择执行周期 [1-3]，按回车返回菜单: "
+    read -r cron_choice
+    case $cron_choice in
+        1) CRON_TIME="0 0 * * *" ;;
+        2) CRON_TIME="0 0 * * 0" ;;
+        3) CRON_TIME="0 0 1 * *" ;;
+        "") echo "返回菜单..."; return ;;
+        *) echo -e "${RED}无效选择，返回菜单${RESET}"; return ;;
+    esac
+
+    SCRIPT_PATH="$(realpath "$0")"
+    # 删除已有 VPS 网络信息任务
+    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab -
+    # 添加新的定时任务
+    (crontab -l 2>/dev/null; echo "$CRON_TIME bash $SCRIPT_PATH --cron") | crontab -
+    echo -e "${GREEN}定时任务已设置成功！${RESET}"
+    echo "cron 表达式: $CRON_TIME"
+}
+
+# =============================
+# 支持 --cron 参数，后台执行
+# =============================
+if [ "$1" == "--cron" ]; then
+    setup_telegram
+    collect_network_info
+    send_to_telegram
+    exit 0
+fi
+
+# =============================
+# 菜单主函数
+# =============================
+menu() {
     while true; do
-        show_category_menu
-        read -rp "$(echo -e "${RED}请输入分类编号: ${RESET}")" cat_choice
-        cat_choice=$(echo "$cat_choice" | xargs)
-
-        if ! [[ "$cat_choice" =~ ^[0-9]+$ ]]; then
-            echo -e "${RED}无效选择，请输入数字!${RESET}"
-            sleep 1
-            continue
-        fi
-
-        case "$cat_choice" in
-            0) echo -e "${RED}退出脚本！${RESET}"; exit 0 ;;
-            88) update_script ;;
-            99) uninstall_script ;;
-            *) 
-               if [[ -n "${categories[$cat_choice]}" ]]; then
-                   app_menu_handler "$cat_choice"
-               else
-                   echo -e "${RED}无效选择，请重新输入!${RESET}"
-                   sleep 1
-               fi
-            ;;
+        echo ""
+        echo -e "${GREEN}===== VPS 网络管理菜单 =====${RESET}"
+        echo -e "${GREEN}1) 查看并发送网络信息到 Telegram${RESET}"
+        echo -e "${GREEN}2) 修改 Telegram 配置${RESET}"
+        echo -e "${GREEN}3) 删除临时文件${RESET}"
+        echo -e "${GREEN}4) 设置定时任务（每天/每周/每月）${RESET}"
+        echo -e "${GREEN}5) 退出${RESET}"
+        echo -ne "${GREEN}请选择操作 [1-5]，按回车刷新菜单: ${RESET}"
+        read -r choice
+        case $choice in
+            1) setup_telegram; collect_network_info; send_to_telegram ;;
+            2) modify_config ;;
+            3) delete_file ;;
+            4) setup_cron ;;
+            5) echo -e "${GREEN}退出脚本。${RESET}"; exit 0 ;;
+            "") continue ;;
+            *) echo -e "${RED}无效选择，请输入 1-5 或按回车刷新菜单。${RESET}" ;;
         esac
     done
 }
 
-app_menu_handler() {
-    local cat=$1
-    while true; do
-        show_app_menu "$cat"
-        read -rp "$(echo -e "${RED}请输入应用编号: ${RESET}")" app_choice
-        app_choice=$(echo "$app_choice" | xargs)
-
-        if ! [[ "$app_choice" =~ ^[0-9]+$ ]]; then
-            echo -e "${RED}无效选择，请输入数字!${RESET}"
-            sleep 1
-            continue
-        fi
-
-        if [[ "$app_choice" == "0" ]]; then
-            break
-        elif [[ -n "${menu_map[$app_choice]}" ]]; then
-            key="${menu_map[$app_choice]}"
-            bash -c "${commands[$key]}"
-        else
-            echo -e "${RED}无效选择，请重新输入!${RESET}"
-            sleep 1
-        fi
-
-        read -rp $'\n\033[33m按回车返回应用菜单...\033[0m'
-    done
-}
-
-# ================== 脚本更新与卸载 ==================
-update_script() {
-    echo -e "${YELLOW}正在更新脚本...${RESET}"
-    curl -fsSL -o "$SCRIPT_PATH" https://raw.githubusercontent.com/Polarisiu/app-store/main/store.sh
-    chmod +x "$SCRIPT_PATH"
-    echo -e "${GREEN}更新完成! 可直接使用 D/d 启动脚本${RESET}"
-}
-
-uninstall_script() {
-    echo -e "${YELLOW}正在卸载脚本...${RESET}"
-    rm -f "$SCRIPT_PATH"
-
-    sed -i "/alias d='bash .*store.sh'/d" ~/.bashrc
-    sed -i "/alias D='bash .*store.sh'/d" ~/.bashrc
-    sed -i "/alias d='bash .*store.sh'/d" ~/.zshrc 2>/dev/null || true
-    sed -i "/alias D='bash .*store.sh'/d" ~/.zshrc 2>/dev/null || true
-    source ~/.bashrc 2>/dev/null || true
-
-    echo -e "${RED}卸载完成! 已清理 D/d 快捷键${RESET}"
-    exit 0
-}
-
-# ================== 主循环 ==================
-while true; do
-    category_menu_handler
-done
+# =============================
+# 启动菜单
+# =============================
+menu

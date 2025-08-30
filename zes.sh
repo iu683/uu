@@ -63,12 +63,16 @@ block_direct_ip_manual() {
 
   for PORT in $PORTS; do
     CONF="/etc/nginx/sites-available/block_port_$PORT.conf"
+    ENABLED="/etc/nginx/sites-enabled/block_port_$PORT.conf"
+
+    # 删除旧封禁配置
+    [[ -f "$CONF" ]] && rm -f "$CONF"
+    [[ -f "$ENABLED" ]] && rm -f "$ENABLED"
+
     if [[ "$PORT" == "443" ]]; then
       echo -e "${YELLOW}封禁 HTTPS 端口需要证书${RESET}"
-      echo -ne "${GREEN}请输入 ssl_certificate 路径: ${RESET}"
-      read CRT
-      echo -ne "${GREEN}请输入 ssl_certificate_key 路径: ${RESET}"
-      read KEY
+      echo -ne "${GREEN}请输入 ssl_certificate 路径: ${RESET}"; read CRT
+      echo -ne "${GREEN}请输入 ssl_certificate_key 路径: ${RESET}"; read KEY
 
       cat > "$CONF" <<EOF
 server {
@@ -89,7 +93,7 @@ server {
 EOF
     fi
 
-    ln -sf "$CONF" "/etc/nginx/sites-enabled/$(basename $CONF)"
+    ln -sf "$CONF" "$ENABLED"
   done
 
   nginx -t && systemctl reload nginx
@@ -97,14 +101,21 @@ EOF
   pause
 }
 
-# 解除封禁
-unblock_direct_ip() {
-  for CONF in /etc/nginx/sites-available/block_port_*.conf; do
-    [[ -f "$CONF" ]] && rm -f "$CONF"
-    [[ -f "/etc/nginx/sites-enabled/$(basename $CONF)" ]] && rm -f "/etc/nginx/sites-enabled/$(basename $CONF)"
+# 手动解除封禁
+unblock_direct_ip_manual() {
+  echo -ne "${GREEN}请输入要解除封禁的端口(空格分开, 例: 80 443): ${RESET}"
+  read PORTS
+
+  for PORT in $PORTS; do
+    CONF="/etc/nginx/sites-available/block_port_$PORT.conf"
+    ENABLED="/etc/nginx/sites-enabled/block_port_$PORT.conf"
+
+    [[ -f "$CONF" ]] && rm -f "$CONF" && echo "已删除 $CONF"
+    [[ -f "$ENABLED" ]] && rm -f "$ENABLED"
   done
+
   nginx -t && systemctl reload nginx
-  echo -e "${GREEN}已解除封禁${RESET}"
+  echo -e "${GREEN}手动解除封禁完成${RESET}"
   pause
 }
 
@@ -281,7 +292,7 @@ while true; do
     2) add_config ;;
     3) modify_config ;;
     4) block_direct_ip_manual ;;
-    5) unblock_direct_ip ;;
+    5) unblock_direct_ip_manual ;;
     6) uninstall_nginx ;;
     0) exit 0 ;;
     *) echo -e "${RED}无效选项${RESET}"; pause ;;

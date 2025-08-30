@@ -73,17 +73,18 @@ detect_iface() {
 # 刷新 IPv6 地址
 refresh_ipv6() {
     local iface="$1"
+    local os=$(get_os_type)
     echo -e "${YELLOW}🔄 刷新 IPv6 地址 (${iface})...${RESET}"
 
-    if has_cmd dhclient; then
-        dhclient -6 -r "$iface" 2>/dev/null
-        dhclient -6 "$iface" 2>/dev/null && echo -e "${GREEN}✔ IPv6 已刷新${RESET}"
-    elif has_cmd systemctl; then
-        systemctl restart networking 2>/dev/null && echo -e "${GREEN}✔ 已重启 networking 服务${RESET}"
-    elif has_cmd rc-service; then
-        rc-service networking restart 2>/dev/null && echo -e "${GREEN}✔ 已重启 networking 服务${RESET}"
+    if [[ "$os" == "alpine" ]]; then
+        if has_cmd dhclient; then
+            dhclient -6 -r "$iface" 2>/dev/null
+            dhclient -6 "$iface" 2>/dev/null && echo -e "${GREEN}✔ IPv6 已刷新${RESET}"
+        elif has_cmd rc-service; then
+            rc-service networking restart 2>/dev/null && echo -e "${GREEN}✔ 已重启 networking 服务${RESET}"
+        fi
     else
-        echo -e "${RED}⚠️ 未找到刷新网络方式，请手动执行 ifdown/ifup ${iface}${RESET}"
+        echo -e "${YELLOW}⚠️ Debian/Ubuntu 系统需重启网络服务或 VPS 才能获取公网 IPv6 地址${RESET}"
     fi
 }
 
@@ -130,6 +131,14 @@ while true; do
                 ping -6 -c 3 ipv6.google.com >/dev/null 2>&1 && echo -e "${GREEN}✅ IPv6 网络连通正常${RESET}" || echo -e "${RED}❌ IPv6 无法访问公网${RESET}"
             else
                 echo -e "${RED}⚠️ 系统没有 ping/ping6 命令${RESET}"
+            fi
+
+            echo
+            echo -e "${GREEN}🔎 测试 IPv4 连通性...${RESET}"
+            if has_cmd ping; then
+                ping -c 3 1.1.1.1 >/dev/null 2>&1 && echo -e "${GREEN}✅ IPv4 网络连通正常${RESET}" || echo -e "${RED}❌ IPv4 无法访问公网${RESET}"
+            else
+                echo -e "${RED}⚠️ 系统没有 ping 命令${RESET}"
             fi
 
             echo

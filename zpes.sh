@@ -56,8 +56,16 @@ ensure_nginx_include() {
   fi
 }
 
-# 封禁端口（手动输入，不使用 default_server）
+# 清理无效符号链接
+clean_invalid_symlinks() {
+  for f in /etc/nginx/sites-enabled/block_port_*.conf; do
+    [[ ! -f "/etc/nginx/sites-available/$(basename $f)" ]] && rm -f "$f"
+  done
+}
+
+# 封禁端口（手动输入，不用 default_server）
 block_direct_ip_manual() {
+  clean_invalid_symlinks
   echo -ne "${GREEN}请输入要封禁的端口(空格分开, 例: 80 443): ${RESET}"
   read PORTS
 
@@ -65,9 +73,8 @@ block_direct_ip_manual() {
     CONF="/etc/nginx/sites-available/block_port_$PORT.conf"
     ENABLED="/etc/nginx/sites-enabled/block_port_$PORT.conf"
 
-    # 删除旧封禁配置
     [[ -f "$CONF" ]] && rm -f "$CONF"
-    [[ -f "$ENABLED" ]] && rm -f "$ENABLED"
+    [[ -L "$ENABLED" ]] && rm -f "$ENABLED"
 
     if [[ "$PORT" == "443" ]]; then
       echo -e "${YELLOW}封禁 HTTPS 端口需要证书${RESET}"
@@ -103,6 +110,7 @@ EOF
 
 # 手动解除封禁
 unblock_direct_ip_manual() {
+  clean_invalid_symlinks
   echo -ne "${GREEN}请输入要解除封禁的端口(空格分开, 例: 80 443): ${RESET}"
   read PORTS
 
@@ -111,7 +119,7 @@ unblock_direct_ip_manual() {
     ENABLED="/etc/nginx/sites-enabled/block_port_$PORT.conf"
 
     [[ -f "$CONF" ]] && rm -f "$CONF" && echo "已删除 $CONF"
-    [[ -f "$ENABLED" ]] && rm -f "$ENABLED"
+    [[ -L "$ENABLED" ]] && rm -f "$ENABLED"
   done
 
   nginx -t && systemctl reload nginx

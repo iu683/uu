@@ -1,7 +1,8 @@
 #!/bin/bash
 # =========================================
 # 一键部署/管理脚本（Debian 兼容）
-# 带绿色菜单 + 自动续期检测 + 防浏览器访问 + DNS 检测 + 访问日志 + HTTP自动跳转HTTPS
+# HTTP 先行，HTTPS 自动申请
+# 带绿色菜单 + 自动续期检测 + 防浏览器访问 + DNS 检测 + 访问日志
 # =========================================
 
 WEB_ROOT="/var/www/html"
@@ -56,28 +57,14 @@ install_tim() {
     chmod +x "$WEB_ROOT/tim.sh"
     cp "$WEB_ROOT/tim.sh" "$LOCAL_DIR/tim"
 
-    # 配置 Nginx（HTTP → HTTPS 自动跳转）
+    # 配置 Nginx HTTP 服务
     NGINX_CONF="/etc/nginx/sites-available/$DOMAIN"
     cat > "$NGINX_CONF" <<EOF
 server {
     listen 80;
     server_name $DOMAIN;
-    # 所有 HTTP 请求重定向到 HTTPS
-    return 301 https://\$host\$request_uri;
-}
-
-server {
-    listen 443 ssl;
-    server_name $DOMAIN;
 
     root $WEB_ROOT;
-
-    # HTTPS 证书路径（certbot 会自动配置）
-    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
-
-    # 日志文件（Debian 默认兼容格式）
-    access_log $LOG_FILE combined;
 
     # 命令行 UA 访问脚本，其他返回 403
     location = / {
@@ -86,16 +73,18 @@ server {
             return 403;
         }
     }
+
+    access_log $LOG_FILE combined;
 }
 EOF
 
     ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/
     nginx -t && systemctl restart nginx
 
-    # 申请 HTTPS
+    # 申请 HTTPS（Certbot 会自动修改 Nginx 配置）
     echo -e "${GREEN}申请 HTTPS 证书...${RESET}"
     certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL" || {
-        echo -e "${RED}HTTPS 安装失败，请检查 DNS 或 Nginx 配置后重试:${RESET}"
+        echo -e "${RED}HTTPS 安装失败，请检查 DNS 或 Nginx 配置后重试${RESET}"
         echo "certbot install --cert-name $DOMAIN"
     }
 
@@ -108,10 +97,9 @@ EOF
 
     echo -e "${GREEN}==========================================${RESET}"
     echo -e "${GREEN}部署完成！${RESET}"
-    echo -e "${GREEN}一键安装命令：${RESET}"
-    echo -e "${GREEN}bash <(curl -sL https://$DOMAIN)${RESET}"
+    echo -e "${GREEN}一键安装命令：${RESET}bash <(curl -sL https://$DOMAIN)"
     echo -e "${GREEN}本地脚本已下载到：$LOCAL_DIR/tim${RESET}"
-    echo -e "${GREEN}HTTPS 已启用 https://$DOMAIN${RESET}"
+    echo -e "${GREEN}HTTPS 已启用 https://$DOMAIN（如证书申请成功）${RESET}"
     echo -e "${GREEN}拉取日志文件路径：$LOG_FILE${RESET}"
     echo -e "${GREEN}==========================================${RESET}"
 }

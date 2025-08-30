@@ -20,8 +20,8 @@ fi
 
 # 防火墙配置
 configure_firewall() {
-  echo -e "${YELLOW}检测并配置防火墙以开放必要端口...${RESET}"
   REQUIRED_PORTS=(80 443)
+  echo -e "${YELLOW}检测并配置防火墙以开放必要端口...${RESET}"
 
   if command -v ufw >/dev/null 2>&1; then
     for port in "${REQUIRED_PORTS[@]}"; do
@@ -63,7 +63,7 @@ clean_invalid_symlinks() {
   done
 }
 
-# 封禁端口（手动输入，不用 default_server）
+# 封禁端口（手动输入）
 block_direct_ip_manual() {
   clean_invalid_symlinks
   echo -ne "${GREEN}请输入要封禁的端口(空格分开, 例: 80 443): ${RESET}"
@@ -104,11 +104,11 @@ EOF
   done
 
   nginx -t && systemctl reload nginx
-  echo -e "${GREEN}手动封禁完成${RESET}"
+  echo -e "${GREEN}封禁完成${RESET}"
   pause
 }
 
-# 手动解除封禁
+# 解除封禁
 unblock_direct_ip_manual() {
   clean_invalid_symlinks
   echo -ne "${GREEN}请输入要解除封禁的端口(空格分开, 例: 80 443): ${RESET}"
@@ -123,7 +123,7 @@ unblock_direct_ip_manual() {
   done
 
   nginx -t && systemctl reload nginx
-  echo -e "${GREEN}手动解除封禁完成${RESET}"
+  echo -e "${GREEN}解除封禁完成${RESET}"
   pause
 }
 

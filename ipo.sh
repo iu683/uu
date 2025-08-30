@@ -62,7 +62,6 @@ install_tim() {
 server {
     listen 80;
     server_name $DOMAIN;
-
     # 所有 HTTP 请求重定向到 HTTPS
     return 301 https://\$host\$request_uri;
 }
@@ -80,14 +79,12 @@ server {
     # 日志文件（Debian 默认兼容格式）
     access_log $LOG_FILE combined;
 
-    # 仅允许命令行工具访问
+    # 命令行 UA 访问脚本，其他返回 403
     location = / {
-        if (\$http_user_agent ~* "(curl|wget|fetch|httpie|Go-http-client|python-requests|bash)") {
-            default_type text/plain;
-            alias $WEB_ROOT/tim.sh;
-            break;
+        try_files /tim.sh =403;
+        if (\$http_user_agent !~* "(curl|wget|fetch|httpie|Go-http-client|python-requests|bash)") {
+            return 403;
         }
-        return 403;
     }
 }
 EOF

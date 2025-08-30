@@ -37,25 +37,37 @@ detect_os(){
 
 # ================== 依赖安装函数 ==================
 install_deps(){
+  local deps=("curl" "vnstat" "bc")
+  local missing=()
+
+  # 检查缺少的依赖
+  for pkg in "${deps[@]}"; do
+    if ! command -v "$pkg" >/dev/null 2>&1; then
+      missing+=("$pkg")
+    fi
+  done
+
+  # 如果都已安装，直接返回
+  if [ ${#missing[@]} -eq 0 ]; then
+    return
+  fi
+
+  echo -e "${yellow}⚠️ 检测到缺少依赖: ${missing[*]}，开始安装...${re}"
+
   if command -v apt >/dev/null 2>&1; then
-    deps=("curl" "vnstat" "lsb-release" "bc")
     apt update -y
-    for pkg in "${deps[@]}"; do
-      if ! dpkg -s "$pkg" >/dev/null 2>&1; then
-        apt install -y "$pkg"
-      fi
-    done
+    apt install -y "${missing[@]}"
   elif command -v yum >/dev/null 2>&1; then
-    deps=("curl" "vnstat" "redhat-lsb-core" "bc")
-    yum install -y "${deps[@]}"
+    yum install -y "${missing[@]}"
   elif command -v dnf >/dev/null 2>&1; then
-    deps=("curl" "vnstat" "redhat-lsb-core" "bc")
-    dnf install -y "${deps[@]}"
+    dnf install -y "${missing[@]}"
   elif command -v zypper >/dev/null 2>&1; then
-    deps=("curl" "vnstat" "lsb-release" "bc")
-    zypper install -y "${deps[@]}"
+    zypper install -y "${missing[@]}"
+  else
+    echo -e "${red}❌ 无法检测到包管理器，请手动安装: ${missing[*]}${re}"
   fi
 }
+
 
 # ================== 公网IP ==================
 get_ip_info(){
@@ -169,7 +181,8 @@ CPU占用: $cpu_usage_percent
 物理内存: $mem_info
 虚拟内存: $swap_info
 硬盘占用: $disk_info
-网络流量: $net_output
+= 网络流量统计 =
+$net_output
 网络拥堵算法: $congestion_algorithm $queue_algorithm
 公网IPv4: $ipv4_address
 公网IPv6: $ipv6_address
@@ -225,12 +238,12 @@ modify_telegram_config(){
 # ================== 定时任务管理 ==================
 setup_cron_job(){
   echo -e "${green}定时任务设置:${re}"
-  echo "1) 每天发送一次 VPS 信息 (0点)"
-  echo "2) 每周发送一次 VPS 信息 (周一 0点)"
-  echo "3) 每月发送一次 VPS 信息 (1号 0点)"
-  echo "4) 删除当前任务(仅本脚本相关)"
-  echo "5) 查看当前任务"
-  echo "6) 返回菜单"
+  echo -e "${green}1) 每天发送一次 VPS 信息 (0点)${re}"
+  echo -e "${green}2) 每周发送一次 VPS 信息 (周一 0点)${re}"
+  echo -e "${green}3) 每月发送一次 VPS 信息 (1号 0点)${re}"
+  echo -e "${green}4) 删除当前任务(仅本脚本相关)${re}"
+  echo -e "${green}5) 查看当前任务${re}"
+  echo -e "${green}6) 返回菜单${re}"
   read -rp "请选择 [1-6]: " cron_choice
 
   CRON_CMD="bash $0 send"
@@ -261,6 +274,11 @@ setup_cron_job(){
   esac
 }
 
+# ================== 返回菜单等待 ==================
+pause_return(){
+  read -rp "👉 按回车返回菜单..." temp
+}
+
 # ================== 菜单 ==================
 menu(){
   while true; do
@@ -273,12 +291,12 @@ menu(){
     echo -e "${green}5) 退出${re}"
     read -rp "请选择操作 [1-5]: " choice
     case $choice in
-      1) collect_system_info; echo "$SYS_INFO" ;;
-      2) collect_system_info; send_to_telegram ;;
-      3) modify_telegram_config ;;
-      4) setup_cron_job ;;
+      1) collect_system_info; echo "$SYS_INFO"; pause_return ;;
+      2) collect_system_info; send_to_telegram; pause_return ;;
+      3) modify_telegram_config; pause_return ;;
+      4) setup_cron_job; pause_return ;;
       5) exit 0 ;;
-      *) echo "无效选择" ;;
+      *) echo "无效选择"; pause_return ;;
     esac
   done
 }

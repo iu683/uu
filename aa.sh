@@ -1,141 +1,55 @@
 #!/bin/bash
-# ==========================================
-# XTrafficDash Docker 管理脚本
-# ==========================================
 
-set -e
-
-# 颜色定义
 GREEN="\033[32m"
+RED="\033[31m"
 YELLOW="\033[33m"
-CYAN="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="xtrafficdash"
-IMAGE="sanqi37/xtrafficdash"
-DATA_DIR="/usr/xtrafficdash/data"
-TZ="Asia/Shanghai"
-PORT=37022
-DEFAULT_PASSWORD="admin123"
-
-# ================== 功能函数 ==================
-
-create_data_dir() {
-    if [ ! -d "$DATA_DIR" ]; then
-        mkdir -p "$DATA_DIR"
-        chmod 777 "$DATA_DIR"
-        echo -e "${GREEN}数据目录已创建: $DATA_DIR${RESET}"
-    fi
-}
-
-read_password() {
-    read -p "请输入管理密码 [默认 $DEFAULT_PASSWORD]: " PASSWORD
-    PASSWORD=${PASSWORD:-$DEFAULT_PASSWORD}
-}
-
-start_container() {
-    create_data_dir
-    read_password
-    if [ "$(docker ps -aq -f name=$APP_NAME)" ]; then
-        echo -e "${YELLOW}容器已存在，尝试启动...${RESET}"
-        docker start $APP_NAME
-    else
-        echo -e "${GREEN}启动新容器...${RESET}"
-        docker run -d \
-            --name $APP_NAME \
-            -p $PORT:$PORT \
-            -v $DATA_DIR:/app/data \
-            -e TZ=$TZ \
-            -e PASSWORD=$PASSWORD \
-            --log-opt max-size=5m \
-            --log-opt max-file=3 \
-            --restart unless-stopped \
-            $IMAGE
-    fi
-    echo -e "${GREEN}容器状态:${RESET}"
-    docker ps -f name=$APP_NAME
-    echo -e "${GREEN}✅ 容器已启动，访问地址: http://$(curl -s https://api.ipify.org):$PORT${RESET}"
-}
-
-stop_container() {
-    if [ "$(docker ps -q -f name=$APP_NAME)" ]; then
-        docker stop $APP_NAME
-        echo -e "${GREEN}容器已停止${RESET}"
-    else
-        echo -e "${YELLOW}容器未运行${RESET}"
-    fi
-}
-
-restart_container() {
-    stop_container
-    start_container
-}
-
-view_logs() {
-    if [ "$(docker ps -q -f name=$APP_NAME)" ]; then
-        echo -e "${CYAN}显示最近 100 行日志，按 Ctrl+C 退出:${RESET}"
-        docker logs --tail 100 -f $APP_NAME
-    else
-        echo -e "${YELLOW}容器未运行${RESET}"
-    fi
-}
-
-delete_container() {
-    stop_container
-    if [ "$(docker ps -aq -f name=$APP_NAME)" ]; then
-        docker rm $APP_NAME
-        echo -e "${GREEN}容器已删除${RESET}"
-    else
-        echo -e "${YELLOW}容器不存在${RESET}"
-    fi
-}
-
-update_image() {
-    echo -e "${CYAN}拉取最新镜像...${RESET}"
-    docker pull $IMAGE
-    echo -e "${GREEN}镜像更新完成${RESET}"
-
-    read_password
-
-    echo -e "${YELLOW}重启容器以应用新镜像...${RESET}"
-    docker stop $APP_NAME
-    docker rm $APP_NAME
-
-    docker run -d \
-        --name $APP_NAME \
-        -p $PORT:$PORT \
-        -v $DATA_DIR:/app/data \
-        -e TZ=$TZ \
-        -e PASSWORD=$PASSWORD \
-        --log-opt max-size=5m \
-        --log-opt max-file=3 \
-        --restart unless-stopped \
-        $IMAGE
-
-    echo -e "${GREEN}✅ 容器已更新并启动，访问地址: http://$(curl -s https://api.ipify.org):$PORT${RESET}"
-}
-
-# ================== 菜单 ==================
-while true; do
-    echo
-    echo -e "${GREEN}=== XTrafficDash 管理菜单 ===${RESET}"
-    echo -e "${GREEN}[1] 启动容器${RESET}"
-    echo -e "${GREEN}[2] 重启容器${RESET}"
-    echo -e "${GREEN}[3] 停止容器${RESET}"
-    echo -e "${GREEN}[4] 删除容器${RESET}"
-    echo -e "${GREEN}[5] 更新镜像并重启容器${RESET}"
-    echo -e "${GREEN}[6] 查看日志${RESET}"
-    echo -e "${GREEN}[0] 退出${RESET}"
-    echo -e "${GREEN}=============================${RESET}"
-    read -p "请选择操作 [0-6]: " choice
+menu() {
+    clear
+    echo -e "${GREEN}=== DD飞牛管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装重装系统脚本${RESET}"
+    echo -e "${GREEN}2) DD 飞牛系统${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    read -p $'\033[32m请选择操作 (0-2): \033[0m' choice
     case $choice in
-        1) start_container ;;
-        2) restart_container ;;
-        3) stop_container ;;
-        4) delete_container ;;
-        5) update_image ;;
-        6) view_logs ;;
-        0) exit 0 ;;
-        *) echo -e "${YELLOW}无效选项，请重新选择${RESET}" ;;
+        1)
+            echo -e "${GREEN}正在下载重装系统脚本...${RESET}"
+            curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh || wget -O reinstall.sh https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh
+            chmod +x reinstall.sh
+            echo -e "${GREEN}✅ 脚本已下载完成，可以执行 DD 系统${RESET}"
+            pause
+            ;;
+        2)
+            if [ ! -f "reinstall.sh" ]; then
+                echo -e "${RED}❌ 未找到 reinstall.sh，请先执行 [1 安装重装系统脚本]${RESET}"
+            else
+                echo -e "${YELLOW}⚠️ 重要提示：执行 DD 飞牛系统会重装系统并清空所有数据！${RESET}"
+                echo -e "${YELLOW}⚠️ 此操作不可逆，请谨慎选择！${RESET}"
+                read -p $'\033[31m是否继续？(y/N): \033[0m' confirm
+                if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                    echo -e "${GREEN}🚀 正在执行 DD 飞牛系统...${RESET}"
+                    bash reinstall.sh fnos
+                else
+                    echo -e "${RED}已取消操作${RESET}"
+                fi
+            fi
+            pause
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}无效选择，请重新输入${RESET}"
+            sleep 1
+            menu
+            ;;
     esac
-done
+}
+
+pause() {
+    read -p $'\033[32m按回车键返回菜单...\033[0m'
+    menu
+}
+
+menu

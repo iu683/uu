@@ -1,151 +1,217 @@
 #!/bin/bash
-# ==========================================
-# XTrafficDash Docker 管理脚本
-# ==========================================
+# =========================================
+# 一键部署/管理脚本（Debian/Ubuntu 兼容，IPv4+IPv6 双栈）
+# HTTP 先行，HTTPS 自动申请
+# 支持自动续期 + 防浏览器访问 + DNS 检测 + 访问日志
+# =========================================
 
-set -e
+WEB_ROOT="/var/www/html"
+LOG_FILE="/var/log/nginx/tim_access.log"
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+RESET='\033[0m'
 
-# 颜色定义
-GREEN="\033[32m"
-RESET="\033[0m"
-
-CONTAINER_NAME="xtrafficdash"
-IMAGE_NAME="sanqi37/xtrafficdash"
-DATA_DIR="/usr/xtrafficdash/data"
-TIMEZONE="Asia/Shanghai"
-
-# ================== 功能函数 ==================
-
-get_public_ip() {
-    # 返回公网 IP
-    curl -s https://api.ip.sb/ip
+show_menu() {
+    clear
+    echo -e "${GREEN}=========================================${RESET}"
+    echo -e "${GREEN}       tim 脚本管理菜单 (IPv4+IPv6)      ${RESET}"
+    echo -e "${GREEN}=========================================${RESET}"
+    echo -e "${GREEN}1) 安装/部署脚本${RESET}"
+    echo -e "${GREEN}2) 卸载/清除脚本${RESET}"
+    echo -e "${GREEN}3) 升级/更新脚本${RESET}"
+    echo -e "${GREEN}4) 查看访问日志${RESET}"
+    echo -e "${GREEN}5) 退出${RESET}"
+    echo -e "${GREEN}=========================================${RESET}"
 }
 
-pause() {
-    read -p "按回车返回菜单..."
-}
+install_tim() {
+    read -p "请输入你的域名： " DOMAIN
+    read -p "请输入脚本 URL（可选，留空默认不下载）： " TIM_URL
+    read -p "请输入你的邮箱（用于 HTTPS）： " EMAIL
+    read -p "请输入 VPS 本地脚本存放目录（默认 /root/tim）： " LOCAL_DIR
+    LOCAL_DIR=${LOCAL_DIR:-/root/tim}
 
-install_xtrafficdash() {
-    echo -e "${GREEN}🚀 安装 XTrafficDash${RESET}"
+    echo -e "${GREEN}安装依赖: nginx, curl, certbot, dnsutils...${RESET}"
+    apt update
+    apt install -y nginx curl certbot python3-certbot-nginx dnsutils
 
-    if [ "$(docker ps -aq -f name=$CONTAINER_NAME)" ]; then
-        echo -e "${GREEN}⚠️ 已检测到容器 $CONTAINER_NAME，请先卸载再安装${RESET}"
-        pause
-        return
-    fi
+    # 检查域名解析 (IPv4 + IPv6)
+    VPS_IPv4=$(curl -s4 https://ifconfig.co || true)
+    VPS_IPv6=$(curl -s6 https://ifconfig.co || true)
+    DOMAIN_A=$(dig +short A "$DOMAIN" | tail -n1)
+    DOMAIN_AAAA=$(dig +short AAAA "$DOMAIN" | tail -n1)
 
-    read -p "请输入访问端口 [默认 37022]: " HOST_PORT
-    HOST_PORT=${HOST_PORT:-37022}
+    echo -e "${GREEN}VPS IPv4: $VPS_IPv4${RESET}"
+    echo -e "${GREEN}VPS IPv6: $VPS_IPv6${RESET}"
+    echo -e "${GREEN}域名 A 记录: $DOMAIN_A${RESET}"
+    echo -e "${GREEN}域名 AAAA 记录: $DOMAIN_AAAA${RESET}"
 
-    read -p "请输入管理密码 [默认 admin123]: " PASSWORD
-    PASSWORD=${PASSWORD:-admin123}
-
-    echo -e "${GREEN}✅ 创建数据目录：$DATA_DIR${RESET}"
-    mkdir -p "$DATA_DIR"
-    chmod 777 "$DATA_DIR"
-
-    echo -e "${GREEN}🚀 启动容器 $CONTAINER_NAME${RESET}"
-    docker run -d \
-      --name $CONTAINER_NAME \
-      -p $HOST_PORT:$HOST_PORT \
-      -v $DATA_DIR:/app/data \
-      -e TZ=$TIMEZONE \
-      -e PASSWORD=$PASSWORD \
-      --log-opt max-size=5m \
-      --log-opt max-file=3 \
-      --restart unless-stopped \
-      $IMAGE_NAME
-
-    IP=$(get_public_ip)
-    echo -e "${GREEN}✅ XTrafficDash 安装完成！访问地址：${IP}:${HOST_PORT}${RESET}"
-    pause
-}
-
-update_xtrafficdash() {
-    echo -e "${GREEN}🔄 更新 XTrafficDash${RESET}"
-
-    if [ ! "$(docker ps -aq -f name=$CONTAINER_NAME)" ]; then
-        echo -e "${GREEN}⚠️ 未检测到容器 $CONTAINER_NAME，请先安装${RESET}"
-        pause
-        return
-    fi
-
-    # 获取当前端口和密码
-    CURRENT_PORT=$(docker inspect -f '{{(index (index .HostConfig.PortBindings "37022/tcp") 0).HostPort}}' $CONTAINER_NAME 2>/dev/null || echo "37022")
-    CURRENT_PASS=$(docker inspect -f '{{range $k,$v := .Config.Env}}{{println $v}}{{end}}' $CONTAINER_NAME | grep PASSWORD | cut -d= -f2)
-
-    read -p "请输入访问端口 [默认 $CURRENT_PORT]: " HOST_PORT
-    HOST_PORT=${HOST_PORT:-$CURRENT_PORT}
-
-    read -p "请输入管理密码 [默认 $CURRENT_PASS]: " PASSWORD
-    PASSWORD=${PASSWORD:-$CURRENT_PASS}
-
-    echo -e "${GREEN}⚠️ 删除旧容器...${RESET}"
-    docker rm -f $CONTAINER_NAME
-
-    echo -e "${GREEN}🚀 拉取最新镜像...${RESET}"
-    docker pull $IMAGE_NAME
-
-    echo -e "${GREEN}🚀 启动新容器...${RESET}"
-    docker run -d \
-      --name $CONTAINER_NAME \
-      -p $HOST_PORT:$HOST_PORT \
-      -v $DATA_DIR:/app/data \
-      -e TZ=$TIMEZONE \
-      -e PASSWORD=$PASSWORD \
-      --log-opt max-size=5m \
-      --log-opt max-file=3 \
-      --restart unless-stopped \
-      $IMAGE_NAME
-
-    IP=$(get_public_ip)
-    echo -e "${GREEN}✅ XTrafficDash 已更新完成！访问地址：${IP}:${HOST_PORT}${RESET}"
-    pause
-}
-
-uninstall() {
-    echo -e "${GREEN}🗑 卸载 XTrafficDash${RESET}"
-    if [ "$(docker ps -aq -f name=$CONTAINER_NAME)" ]; then
-        docker rm -f $CONTAINER_NAME
-        echo -e "${GREEN}✅ 容器已删除${RESET}"
+    if [[ "$VPS_IPv4" == "$DOMAIN_A" || "$VPS_IPv6" == "$DOMAIN_AAAA" ]]; then
+        echo -e "${GREEN}✅ 域名解析正确，继续安装${RESET}"
     else
-        echo -e "${GREEN}⚠️ 未检测到容器${RESET}"
+        echo -e "${RED}❌ 域名 $DOMAIN 未解析到本 VPS 公网 IP${RESET}"
+        echo -e "${RED}请确认 DNS 指向后再运行安装脚本${RESET}"
+        return
     fi
-    read -p "是否删除数据目录 $DATA_DIR ? [y/N]: " yn
-    if [[ "$yn" =~ ^[Yy]$ ]]; then
-        rm -rf "$DATA_DIR"
-        echo -e "${GREEN}✅ 数据目录已删除${RESET}"
+
+    # 创建目录
+    mkdir -p "$WEB_ROOT"
+    mkdir -p "$LOCAL_DIR"
+    chmod 700 "$LOCAL_DIR"
+
+    # 下载脚本（可选）
+    if [[ -n "$TIM_URL" ]]; then
+        curl -fsSL "$TIM_URL" -o "$WEB_ROOT/$DOMAIN"
+        chmod +x "$WEB_ROOT/$DOMAIN"
+        cp "$WEB_ROOT/$DOMAIN" "$LOCAL_DIR/$DOMAIN"
     fi
-    pause
+
+    # 配置 Nginx HTTP 服务（双栈）
+    NGINX_CONF="/etc/nginx/sites-available/$DOMAIN"
+    cat > "$NGINX_CONF" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $DOMAIN;
+
+    root $WEB_ROOT;
+
+    location = / {
+        try_files /$DOMAIN =200;
+
+        if (\$http_user_agent !~* "(curl|wget|fetch|httpie|Go-http-client|python-requests|bash)") {
+            add_header Content-Type text/html;
+            return 200 '<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>时钟</title>
+<style>
+html, body { margin:0; padding:0; height:100%; display:flex; justify-content:center; align-items:center; background:#f0f0f0; font-family:Arial,sans-serif; flex-direction:column;}
+h1 { font-size:3rem; margin:0;}
+#time { font-size:5rem; font-weight:bold; margin-top:20px;}
+</style>
+</head>
+<body>
+<h1>🌎世界时间</h1>
+<div id="time"></div>
+<script>
+function updateTime() {
+    const now = new Date();
+    document.getElementById("time").innerText = now.toLocaleString();
+}
+setInterval(updateTime, 1000);
+updateTime();
+</script>
+</body>
+</html>';
+        }
+    }
+
+    access_log $LOG_FILE combined;
+}
+EOF
+
+    ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/
+    nginx -t && systemctl restart nginx
+
+    # 申请 HTTPS
+    echo -e "${GREEN}申请 HTTPS 证书...${RESET}"
+    certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL" || {
+        echo -e "${RED}HTTPS 安装失败，请检查 DNS 或 Nginx 配置后重试${RESET}"
+    }
+
+    # 创建自动续期脚本
+    RENEW_SCRIPT="/root/tim/renew_cert.sh"
+    cat > "$RENEW_SCRIPT" <<EOF
+#!/bin/bash
+certbot renew --quiet --deploy-hook "systemctl reload nginx"
+EOF
+    chmod +x "$RENEW_SCRIPT"
+
+    # 添加 cron 自动续期任务
+    (crontab -l 2>/dev/null; echo "0 0,12 * * * $RENEW_SCRIPT >> /var/log/renew_cert.log 2>&1") | crontab -
+
+    echo -e "${GREEN}✅ 自动续期任务已设置，每天 0 点和 12 点检测证书${RESET}"
+
+    echo -e "${GREEN}==========================================${RESET}"
+    echo -e "${GREEN}部署完成！${RESET}"
+    echo -e "${GREEN}本地脚本已保存到：$LOCAL_DIR/$DOMAIN${RESET}"
+    echo -e "${GREEN}HTTPS 已启用 https://$DOMAIN${RESET}"
+    echo -e "${GREEN}访问日志：$LOG_FILE${RESET}"
+    echo -e "${GREEN}==========================================${RESET}"
+}
+
+uninstall_tim() {
+    read -p "请输入你的域名 ： " DOMAIN
+    read -p "请输入 VPS 本地脚本存放目录（默认 /root/tim）： " LOCAL_DIR
+    LOCAL_DIR=${LOCAL_DIR:-/root/tim}
+
+    echo -e "${GREEN}停止 Nginx...${RESET}"
+    systemctl stop nginx
+
+    echo -e "${GREEN}删除 Nginx 配置...${RESET}"
+    rm -f /etc/nginx/sites-available/"$DOMAIN"
+    rm -f /etc/nginx/sites-enabled/"$DOMAIN"
+
+    echo -e "${GREEN}删除本地脚本...${RESET}"
+    rm -rf "$LOCAL_DIR"
+
+    echo -e "${GREEN}删除网页根目录脚本...${RESET}"
+    rm -f "$WEB_ROOT/$DOMAIN"
+
+    echo -e "${GREEN}删除 HTTPS 证书...${RESET}"
+    certbot delete --cert-name "$DOMAIN" --non-interactive || echo "证书可能不存在"
+
+    echo -e "${GREEN}重启 Nginx...${RESET}"
+    systemctl restart nginx
+
+    echo -e "${GREEN}==========================================${RESET}"
+    echo -e "${GREEN}卸载完成！${RESET}"
+    echo -e "${GREEN}==========================================${RESET}"
+}
+
+update_tim() {
+    read -p "请输入最新脚本 URL： " TIM_URL
+    read -p "请输入 VPS 本地脚本存放目录（默认 /root/tim）： " LOCAL_DIR
+    LOCAL_DIR=${LOCAL_DIR:-/root/tim}
+
+    if [[ -z "$DOMAIN" ]]; then
+        read -p "请输入域名（用于生成文件名）： " DOMAIN
+    fi
+
+    mkdir -p "$LOCAL_DIR"
+    curl -fsSL "$TIM_URL" -o "$LOCAL_DIR/$DOMAIN" || { 
+        echo -e "${RED}❌ 下载脚本失败，请检查 URL、权限或路径${RESET}"
+        return
+    }
+    chmod +x "$LOCAL_DIR/$DOMAIN"
+
+    cp -f "$LOCAL_DIR/$DOMAIN" "$WEB_ROOT/$DOMAIN"
+    echo -e "${GREEN}✅ 更新完成！本地和网页脚本已同步最新版本${RESET}"
 }
 
 view_logs() {
-    if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
-        echo -e "${GREEN}📖 查看日志，按 Ctrl+C 退出${RESET}"
-        docker logs -f $CONTAINER_NAME
+    if [ -f "$LOG_FILE" ]; then
+        echo -e "${GREEN}显示最近 20 条访问记录：${RESET}"
+        tail -n 20 "$LOG_FILE"
+        echo -e "${GREEN}统计不同 IP (IPv4/IPv6) 访问次数：${RESET}"
+        awk '{print $1}' "$LOG_FILE" | sort | uniq -c | sort -nr
     else
-        echo -e "${GREEN}⚠️ 容器未运行${RESET}"
+        echo -e "${RED}日志文件不存在${RESET}"
     fi
-    pause
 }
 
-# ================== 菜单 ==================
 while true; do
-    echo
-    echo -e "${GREEN}=== XTrafficDash 管理菜单 ===${RESET}"
-    echo -e "${GREEN}[1] 安装 XTrafficDash${RESET}"
-    echo -e "${GREEN}[2] 更新 XTrafficDash${RESET}"
-    echo -e "${GREEN}[3] 卸载 XTrafficDash${RESET}"
-    echo -e "${GREEN}[4] 查看日志${RESET}"
-    echo -e "${GREEN}[0] 退出${RESET}"
-    echo -e "${GREEN}=============================${RESET}"
-    read -p "请选择操作 [0-4]: " choice
+    show_menu
+    read -p "请选择操作 [1-5]：" choice
     case $choice in
-        1) install_xtrafficdash ;;
-        2) update_xtrafficdash ;;
-        3) uninstall ;;
+        1) install_tim ;;
+        2) uninstall_tim ;;
+        3) update_tim ;;
         4) view_logs ;;
-        0) exit 0 ;;
-        *) echo -e "${GREEN}❌ 无效选项，请重新选择${RESET}" ;;
+        5) exit 0 ;;
+        *) echo -e "${RED}请输入有效选项 [1-5]${RESET}" ;;
     esac
+    read -p "按回车返回菜单..."
 done

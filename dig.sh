@@ -1,146 +1,105 @@
 #!/bin/bash
-set -e
+# ============================================
+# Termix 一键管理脚本 (仅自定义端口, 兼容 docker-compose)
+# ============================================
 
-# ==========================================
-# 一键系统更新 & 常用依赖安装 & 修复 APT 源（Debian 11/12 兼容版）
-# ==========================================
+APP_NAME="termix"
+COMPOSE_FILE="docker-compose.yml"
+IMAGE_NAME="ghcr.io/lukegus/termix:latest"
+DATA_DIR="./termix-data"
 
-# 颜色定义
-RED="\033[31m"
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RESET="\033[0m"
 
-# 检查是否 root
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}❌ 请使用 root 用户运行此脚本${RESET}"
-    exit 1
-fi
-
-# -------------------------
-# 常用依赖（新增 dnsutils，包含 dig）
-# -------------------------
-deps=(curl wget git net-tools lsof tar unzip rsync pv sudo nc dnsutils)
-
-# -------------------------
-# 检查并安装依赖（兼容不同系统）
-# -------------------------
-check_and_install() {
-    local check_cmd="$1"
-    local install_cmd="$2"
-    local missing=()
-    for pkg in "${deps[@]}"; do
-        if ! eval "$check_cmd \"$pkg\"" &>/dev/null; then
-            missing+=("$pkg")
-        else
-            echo -e "${GREEN}✔ 已安装: $pkg${RESET}"
-        fi
-    done
-
-    if [ ${#missing[@]} -gt 0 ]; then
-        echo -e "${YELLOW}👉 安装缺失依赖: ${missing[*]}${RESET}"
-        # Debian 系统处理 netcat
-        if [ "$OS_TYPE" = "debian" ]; then
-            apt update -y
-            for pkg in "${missing[@]}"; do
-                if [ "$pkg" = "nc" ]; then
-                    apt install -y netcat-openbsd
-                else
-                    apt install -y "$pkg"
-                fi
-            done
-        else
-            eval "$install_cmd \"\${missing[@]}\""
-        fi
+# 检查环境 & 选择 compose 命令
+check_env() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${GREEN}❌ 未检测到 Docker，请先安装 Docker${RESET}"
+        exit 1
     fi
-}
-
-# -------------------------
-# 清理重复 Docker 源
-# -------------------------
-fix_duplicate_docker_sources() {
-    echo -e "${YELLOW}🔍 检查重复 Docker APT 源...${RESET}"
-    local docker_sources
-    docker_sources=$(grep -rl "download.docker.com" /etc/apt/sources.list.d/ 2>/dev/null || true)
-    if [ "$(echo "$docker_sources" | grep -c .)" -gt 1 ]; then
-        echo -e "${RED}⚠️ 检测到重复 Docker 源:${RESET}"
-        echo "$docker_sources"
-        for f in $docker_sources; do
-            if [[ "$f" == *"archive_uri"* ]]; then
-                rm -f "$f"
-                echo -e "${GREEN}✔ 删除多余源: $f${RESET}"
-            fi
-        done
+    if command -v docker compose &> /dev/null; then
+        COMPOSE_CMD="docker compose"
+    elif command -v docker-compose &> /dev/null; then
+        COMPOSE_CMD="docker-compose"
     else
-        echo -e "${GREEN}✔ Docker 源正常${RESET}"
+        echo -e "${GREEN}❌ 未检测到 docker-compose，请先安装${RESET}"
+        exit 1
     fi
 }
 
-# -------------------------
-# 修复 sources.list（兼容 Bullseye / Bookworm）
-# -------------------------
-fix_sources_for_version() {
-    echo -e "${YELLOW}🔍 修复 sources.list 兼容性...${RESET}"
-    local version="$1"
-    local files
-    files=$(grep -rl "deb" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true)
-    for f in $files; do
-        if [[ "$version" == "bullseye" ]]; then
-            sed -i -r 's/\bnon-free(-firmware){0,3}\b/non-free/g' "$f"
-            sed -i '/bullseye-backports/s/^/##/' "$f"
-        elif [[ "$version" == "bookworm" ]]; then
-            # Bookworm 保留 non-free-firmware 但去掉重复 non-free
-            sed -i -r 's/\bnon-free non-free\b/non-free/g' "$f"
-        fi
-    done
-    echo -e "${GREEN}✔ sources.list 已优化${RESET}"
+generate_compose() {
+    cat > $COMPOSE_FILE <<EOF
+services:
+  $APP_NAME:
+    image: $IMAGE_NAME
+    container_name: $APP_NAME
+    restart: unless-stopped
+    ports:
+      - "$PORT:$PORT"
+    volumes:
+      - "$(realpath $DATA_DIR):/app/data"
+    environment:
+      PORT: "$PORT"
+EOF
 }
 
-# -------------------------
-# 系统更新函数
-# -------------------------
-update_system() {
-    echo -e "${GREEN}🔄 检测系统发行版并更新...${RESET}"
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        echo -e "${YELLOW}👉 当前系统: $PRETTY_NAME${RESET}"
+install_app() {
+    read -p "请输入映射端口 (默认 8080): " PORT
+    PORT=${PORT:-8080}
 
-        # 系统类型
-        if [[ "$ID" =~ debian|ubuntu ]]; then
-            OS_TYPE="debian"
-            fix_duplicate_docker_sources
-            fix_sources_for_version "$VERSION_CODENAME"
-            apt update && apt upgrade -y
-            check_and_install "dpkg -s" "apt install -y"
-        elif [[ "$ID" =~ fedora ]]; then
-            OS_TYPE="rhel"
-            dnf check-update || true
-            dnf upgrade -y
-            check_and_install "rpm -q" "dnf install -y"
-        elif [[ "$ID" =~ centos|rhel ]]; then
-            OS_TYPE="rhel"
-            yum check-update || true
-            yum upgrade -y
-            check_and_install "rpm -q" "yum install -y"
-        elif [[ "$ID" =~ alpine ]]; then
-            OS_TYPE="alpine"
-            apk update && apk upgrade
-            check_and_install "apk info -e" "apk add"
-        else
-            echo -e "${RED}❌ 暂不支持的 Linux 发行版: $ID${RESET}"
-            return 1
-        fi
+    mkdir -p "$DATA_DIR"
+
+    echo -e "${GREEN}🚀 正在安装并启动 $APP_NAME (端口: $PORT) ...${RESET}"
+
+    generate_compose
+    $COMPOSE_CMD up -d
+    echo -e "${GREEN}✅ $APP_NAME 已启动，访问地址: http://$(curl -s https://api.ipify.org):$PORT${RESET}"
+}
+
+update_app() {
+    echo -e "${GREEN}🔄 正在更新 $APP_NAME ...${RESET}"
+    $COMPOSE_CMD pull
+    $COMPOSE_CMD up -d
+    echo -e "${GREEN}✅ 容器已更新并启动${RESET}"
+}
+
+uninstall_app() {
+    read -p "⚠️ 确认要卸载 $APP_NAME 并删除数据吗？(y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        $COMPOSE_CMD down -v
+        rm -f $COMPOSE_FILE
+        echo -e "${GREEN}✅ $APP_NAME 已卸载并清理${RESET}"
     else
-        echo -e "${RED}❌ 无法检测系统发行版 (/etc/os-release 不存在)${RESET}"
-        return 1
+        echo -e "${GREEN}❌ 已取消${RESET}"
     fi
-
-    echo -e "${GREEN}✅ 系统更新和依赖安装完成！${RESET}"
 }
 
-# -------------------------
-# 执行
-# -------------------------
-clear
-update_system
-echo -e "${GREEN}✅ 脚本执行完成！${RESET}"
+logs_app() {
+    docker logs -f $APP_NAME
+}
+
+menu() {
+    clear
+    echo -e "${GREEN}=== Termix 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装/启动 Termix${RESET}"
+    echo -e "${GREEN}2) 更新 Termix${RESET}"
+    echo -e "${GREEN}3) 卸载 Termix${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    echo -e "${GREEN}========================${RESET}"
+    read -p "请选择: " choice
+    case $choice in
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) logs_app ;;
+        0) exit 0 ;;
+        *) echo -e "${GREEN}无效选择${RESET}" ;;
+    esac
+}
+
+check_env
+while true; do
+    menu
+    read -p "按回车键返回菜单..." enter
+done

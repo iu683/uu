@@ -1,55 +1,42 @@
 #!/bin/bash
-# 命令行美化工具（支持彩色提示符）
+# 命令行美化工具
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RESET="\033[0m"
-CONFIG="$HOME/.bashrc"
+CONFIG_FILE="$HOME/.bashrc"
+[ -n "$ZSH_VERSION" ] && CONFIG_FILE="$HOME/.zshrc"
 
-menu() {
-    clear
-    echo "命令行美化工具"
-    echo "------------------------"
-    echo "1. \[\033[31m\]root\[\033[0m\] localhost ~ #   (root 红色)"
-    echo "2. root \[\033[32m\]localhost\[\033[0m\] ~ #   (localhost 绿色)"
-    echo "3. root localhost \[\033[34m\]~\[\033[0m\] #   (~ 蓝色)"
-    echo "4. \[\033[35m\]root\[\033[0m\] \[\033[36m\]localhost\[\033[0m\] ~ # (紫+青)"
-    echo "5. \[\033[33m\]root\[\033[0m\] \[\033[31m\]localhost\[\033[0m\] ~ # (黄+红)"
-    echo "6. \[\033[36m\]root@localhost\[\033[0m\] ~ #  (整体青色)"
-    echo "7. \[\033[32m\][root@localhost]\[\033[34m\] ~\[\033[0m\] # (绿+蓝)"
-    echo "------------------------"
-    echo "8. 还原默认提示符"
-    echo "0. 返回上一级选单"
-    echo "------------------------"
-    read -p "输入你的选择: " choice
-}
-
-set_ps1() {
-    case $1 in
-        1) PS1="\[\033[31m\]root\[\033[0m\] localhost ~ # " ;;
-        2) PS1="root \[\033[32m\]localhost\[\033[0m\] ~ # " ;;
-        3) PS1="root localhost \[\033[34m\]~\[\033[0m\] # " ;;
-        4) PS1="\[\033[35m\]root\[\033[0m\] \[\033[36m\]localhost\[\033[0m\] ~ # " ;;
-        5) PS1="\[\033[33m\]root\[\033[0m\] \[\033[31m\]localhost\[\033[0m\] ~ # " ;;
-        6) PS1="\[\033[36m\]root@localhost\[\033[0m\] ~ # " ;;
-        7) PS1="\[\033[32m\][root@localhost]\[\033[34m\] ~\[\033[0m\] # " ;;
-        8) PS1="\\u@\\h:\\w\\$ " ;; # 默认提示符
-        *) return ;;
-    esac
-
-    # 写入配置
-    sed -i '/^PS1=/d' "$CONFIG"
-    echo "PS1='$PS1'" >> "$CONFIG"
-    echo -e "${GREEN}变更完成。重新连接SSH后可查看变化！${RESET}"
-    echo -e "${YELLOW}操作完成${RESET}"
-    read -n 1 -s -r -p "按任意键继续..."
+apply_prompt() {
+    local ps1="$1"
+    sed -i '/^PS1=/d' "$CONFIG_FILE"         # 删除旧配置
+    echo "PS1=$ps1" >> "$CONFIG_FILE"        # 写入新配置
+    eval "PS1=$ps1"                          # 立即生效
+    echo -e "\033[32m✅ 已应用新命令行样式，重启终端可永久生效\033[0m"
+    read -p "按回车返回菜单..."
 }
 
 while true; do
-    menu
+    echo "命令行美化工具"
+    echo "------------------------"
+    echo -e "1. \033[1;32mroot \033[0m\033[1;33m@\033[0m\033[1;34mlocalhost \033[0m\033[1;31m~ \033[0m#"
+    echo -e "2. \033[1;35mroot \033[0m\033[1;33m@\033[0m\033[1;36mlocalhost \033[0m\033[1;33m~ \033[0m#"
+    echo -e "3. \033[1;31mroot \033[0m\033[1;33m@\033[0m\033[1;32mlocalhost \033[0m\033[1;34m~ \033[0m#"
+    echo -e "4. \033[1;36mroot \033[0m\033[1;33m@\033[0m\033[1;33mlocalhost \033[0m\033[1;37m~ \033[0m#"
+    echo -e "5. \033[1;37mroot \033[0m\033[1;33m@\033[0m\033[1;31mlocalhost \033[0m\033[1;32m~ \033[0m#"
+    echo -e "6. \033[1;33mroot \033[0m\033[1;33m@\033[0m\033[1;34mlocalhost \033[0m\033[1;35m~ \033[0m#"
+    echo -e "7. root \033[1;33m@\033[0mlocalhost ~ # (默认)"
+    echo "------------------------"
+    echo "0. 退出"
+    echo "------------------------"
+    read -e -p "输入你的选择: " choice
+
     case $choice in
-        0) break ;;
-        [1-8]) set_ps1 $choice ;;
-        *) echo "无效选项"; sleep 1 ;;
+      1) apply_prompt "'\[\033[1;32m\]\u\[\033[0m\]\[\033[1;33m\]@\[\033[0m\]\[\033[1;34m\]\h\[\033[0m\] \[\033[1;31m\]\w\[\033[0m\] # '" ;;
+      2) apply_prompt "'\[\033[1;35m\]\u\[\033[0m\]\[\033[1;33m\]@\[\033[0m\]\[\033[1;36m\]\h\[\033[0m\] \[\033[1;33m\]\w\[\033[0m\] # '" ;;
+      3) apply_prompt "'\[\033[1;31m\]\u\[\033[0m\]\[\033[1;33m\]@\[\033[0m\]\[\033[1;32m\]\h\[\033[0m\] \[\033[1;34m\]\w\[\033[0m\] # '" ;;
+      4) apply_prompt "'\[\033[1;36m\]\u\[\033[0m\]\[\033[1;33m\]@\[\033[0m\]\[\033[1;33m\]\h\[\033[0m\] \[\033[1;37m\]\w\[\033[0m\] # '" ;;
+      5) apply_prompt "'\[\033[1;37m\]\u\[\033[0m\]\[\033[1;33m\]@\[\033[0m\]\[\033[1;31m\]\h\[\033[0m\] \[\033[1;32m\]\w\[\033[0m\] # '" ;;
+      6) apply_prompt "'\[\033[1;33m\]\u\[\033[0m\]\[\033[1;33m\]@\[\033[0m\]\[\033[1;34m\]\h\[\033[0m\] \[\033[1;35m\]\w\[\033[0m\] # '" ;;
+      7) apply_prompt "'\u\[\033[1;33m\]@\[\033[0m\]\h \w # '" ;;
+      0) echo "退出"; break ;;
+      *) echo "无效选择"; read -p "按回车返回菜单..." ;;
     esac
 done

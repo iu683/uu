@@ -1,110 +1,45 @@
 #!/bin/bash
-# ============================================
-# Komari 管理脚本（菜单版）
-# 功能: 安装/更新/卸载/日志
-# ============================================
+# 命令行美化工具
 
-set -e
+CONFIG_FILE="$HOME/.bashrc"
+[ -n "$ZSH_VERSION" ] && CONFIG_FILE="$HOME/.zshrc"
 
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+apply_prompt() {
+    local ps1="$1"
+    # 删除旧的配置
+    sed -i '/^PS1=/d' "$CONFIG_FILE"
+    # 写入新配置
+    echo "$ps1" >> "$CONFIG_FILE"
+    # 立即生效
+    eval "$ps1"
+    echo -e "\033[32m✅ 已应用新命令行样式，重启终端可永久生效\033[0m"
+}
 
-COMPOSE_FILE="docker-compose.yml"
-CONTAINER_NAME="komari"
-
-menu() {
+while true; do
     clear
-    echo -e "${GREEN}=== Komari 管理菜单 ===${RESET}"
-    echo -e "${YELLOW}1) 安装/部署 Komari${RESET}"
-    echo -e "${YELLOW}2) 更新 Komari${RESET}"
-    echo -e "${YELLOW}3) 卸载 Komari${RESET}"
-    echo -e "${YELLOW}4) 查看日志${RESET}"
-    echo -e "${YELLOW}0) 退出${RESET}"
-    echo
-    read -p "请选择操作: " choice
+    echo "命令行美化工具"
+    echo "------------------------"
+    echo -e "1. \033[1;32mroot \033[1;34mlocalhost \033[1;31m~ \033[0m#"
+    echo -e "2. \033[1;35mroot \033[1;36mlocalhost \033[1;33m~ \033[0m#"
+    echo -e "3. \033[1;31mroot \033[1;32mlocalhost \033[1;34m~ \033[0m#"
+    echo -e "4. \033[1;36mroot \033[1;33mlocalhost \033[1;37m~ \033[0m#"
+    echo -e "5. \033[1;37mroot \033[1;31mlocalhost \033[1;32m~ \033[0m#"
+    echo -e "6. \033[1;33mroot \033[1;34mlocalhost \033[1;35m~ \033[0m#"
+    echo -e "7. root localhost ~ # (默认)"
+    echo "------------------------"
+    echo "0. 退出"
+    echo "------------------------"
+    read -e -p "输入你的选择: " choice
 
     case $choice in
-        1) install_komari ;;
-        2) update_komari ;;
-        3) uninstall_komari ;;
-        4) view_logs ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择！${RESET}" && sleep 1 && menu ;;
+      1) apply_prompt "PS1='\\[\\033[1;32m\\]\\u\\[\\033[0m\\]@\\[\\033[1;34m\\]\\h\\[\\033[0m\\] \\[\\033[1;31m\\]\\w\\[\\033[0m\\] # '" ;;
+      2) apply_prompt "PS1='\\[\\033[1;35m\\]\\u\\[\\033[0m\\]@\\[\\033[1;36m\\]\\h\\[\\033[0m\\] \\[\\033[1;33m\\]\\w\\[\\033[0m\\] # '" ;;
+      3) apply_prompt "PS1='\\[\\033[1;31m\\]\\u\\[\\033[0m\\]@\\[\\033[1;32m\\]\\h\\[\\033[0m\\] \\[\\033[1;34m\\]\\w\\[\\033[0m\\] # '" ;;
+      4) apply_prompt "PS1='\\[\\033[1;36m\\]\\u\\[\\033[0m\\]@\\[\\033[1;33m\\]\\h\\[\\033[0m\\] \\[\\033[1;37m\\]\\w\\[\\033[0m\\] # '" ;;
+      5) apply_prompt "PS1='\\[\\033[1;37m\\]\\u\\[\\033[0m\\]@\\[\\033[1;31m\\]\\h\\[\\033[0m\\] \\[\\033[1;32m\\]\\w\\[\\033[0m\\] # '" ;;
+      6) apply_prompt "PS1='\\[\\033[1;33m\\]\\u\\[\\033[0m\\]@\\[\\033[1;34m\\]\\h\\[\\033[0m\\] \\[\\033[1;35m\\]\\w\\[\\033[0m\\] # '" ;;
+      7) apply_prompt "PS1='\\u@\\h \\w # '" ;;
+      0) echo "退出"; break ;;
+      *) echo "无效选择"; sleep 1 ;;
     esac
-}
-
-install_komari() {
-    echo -e "${GREEN}=== 开始安装 Komari ===${RESET}"
-
-    read -p "请输入管理员用户名 (默认: admin): " ADMIN_USERNAME
-    ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
-
-    read -p "请输入管理员密码 (默认: admin123): " ADMIN_PASSWORD
-    ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
-
-    read -p "是否启用 Cloudflared? (true/false, 默认: false): " KOMARI_ENABLE_CLOUDFLARED
-    KOMARI_ENABLE_CLOUDFLARED=${KOMARI_ENABLE_CLOUDFLARED:-false}
-
-    if [ "$KOMARI_ENABLE_CLOUDFLARED" == "true" ]; then
-        read -p "请输入 Cloudflared Token: " KOMARI_CLOUDFLARED_TOKEN
-    else
-        KOMARI_CLOUDFLARED_TOKEN=""
-    fi
-
-    read -p "请输入映射端口 (默认: 25774): " PORT
-    PORT=${PORT:-25774}
-
-    cat > $COMPOSE_FILE <<EOF
-services:
-  komari:
-    image: ghcr.io/komari-monitor/komari:latest
-    container_name: $CONTAINER_NAME
-    ports:
-      - "${PORT}:${PORT}"
-    volumes:
-      - ./data:/app/data
-    environment:
-      - ADMIN_USERNAME=$ADMIN_USERNAME
-      - ADMIN_PASSWORD=$ADMIN_PASSWORD
-      - KOMARI_ENABLE_CLOUDFLARED=$KOMARI_ENABLE_CLOUDFLARED
-      - KOMARI_CLOUDFLARED_TOKEN=$KOMARI_CLOUDFLARED_TOKEN
-      - PORT=$PORT
-    restart: unless-stopped
-EOF
-
-    docker compose up -d
-    echo -e "${GREEN}✅ 部署完成！访问地址: http://$(curl -s https://api.ipify.org):$PORT${RESET}"
-    echo -e "${YELLOW}用户名: $ADMIN_USERNAME  密码: $ADMIN_PASSWORD${RESET}"
-    read -p "按回车返回菜单..." && menu
-}
-
-update_komari() {
-    echo -e "${GREEN}=== 更新 Komari ===${RESET}"
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ 更新完成！${RESET}"
-    read -p "按回车返回菜单..." && menu
-}
-
-uninstall_komari() {
-    echo -e "${RED}⚠️  即将卸载 Komari，并删除相关数据！${RESET}"
-    read -p "确认卸载? (y/N): " confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        docker compose down -v
-        rm -rf $COMPOSE_FILE ./data
-        echo -e "${GREEN}✅ 卸载完成${RESET}"
-    else
-        echo -e "${YELLOW}已取消${RESET}"
-    fi
-    read -p "按回车返回菜单..." && menu
-}
-
-view_logs() {
-    echo -e "${GREEN}=== 查看 Komari 日志 ===${RESET}"
-    docker logs -f $CONTAINER_NAME
-    read -p "按回车返回菜单..." && menu
-}
-
-menu
+done

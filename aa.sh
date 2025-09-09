@@ -1,42 +1,275 @@
 #!/bin/bash
-# 命令行美化工具（root@host:~# 格式，: 和 # 可彩色，无空格）
+set -e
 
-CONFIG_FILE="$HOME/.bashrc"
-[ -n "$ZSH_VERSION" ] && CONFIG_FILE="$HOME/.zshrc"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-apply_prompt() {
-    local ps1="$1"
-    sed -i '/^PS1=/d' "$CONFIG_FILE"
-    echo "PS1=$ps1" >> "$CONFIG_FILE"
-    eval "PS1=$ps1"
-    echo -e "\033[32m✅ 已应用新命令行样式，重启终端可永久生效\033[0m"
-    read -p "按回车返回菜单..."
+# ------------------------------
+# 工具函数
+# ------------------------------
+pause() {
+    echo -ne "${YELLOW}按回车返回菜单...${RESET}"
+    read
 }
 
-while true; do
-    echo "命令行美化工具"
-    echo "------------------------"
-    echo -e "1. \033[1;32mroot\033[0m\033[1;33m@\033[0m\033[1;34m\h\033[0m\033[1;36m:\033[0m\033[1;31m~\033[0m\033[1;35m#\033[0m"
-    echo -e "2. \033[1;35mroot\033[0m\033[1;33m@\033[0m\033[1;36m\h\033[0m\033[1;34m:\033[0m\033[1;33m~\033[0m\033[1;31m#\033[0m"
-    echo -e "3. \033[1;31mroot\033[0m\033[1;33m@\033[0m\033[1;32m\h\033[0m\033[1;36m:\033[0m\033[1;34m~\033[0m\033[1;36m#\033[0m"
-    echo -e "4. \033[1;36mroot\033[0m\033[1;33m@\033[0m\033[1;33m\h\033[0m\033[1;35m:\033[0m\033[1;37m~\033[0m\033[1;32m#\033[0m"
-    echo -e "5. \033[1;37mroot\033[0m\033[1;33m@\033[0m\033[1;31m\h\033[0m\033[1;36m:\033[0m\033[1;32m~\033[0m\033[1;36m#\033[0m"
-    echo -e "6. \033[1;33mroot\033[0m\033[1;33m@\033[0m\033[1;34m\h\033[0m\033[1;36m:\033[0m\033[1;35m~\033[0m\033[1;37m#\033[0m"
-    echo -e "7. root@\h:~# (默认无颜色)"
-    echo "------------------------"
-    echo "0. 退出"
-    echo "------------------------"
-    read -e -p "输入你的选择: " choice
+configure_firewall() {
+    for PORT in 80 443; do
+        if command -v ufw >/dev/null 2>&1; then
+            ufw allow $PORT || true
+        elif command -v firewall-cmd >/dev/null 2>&1; then
+            firewall-cmd --permanent --add-port=$PORT/tcp || true
+            firewall-cmd --reload || true
+        fi
+    done
+}
 
+ensure_nginx_conf() {
+    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/modules-enabled
+
+    # nginx.conf
+    if [ ! -f /etc/nginx/nginx.conf ]; then
+        cat > /etc/nginx/nginx.conf <<'EOF'
+user www-data;
+worker_processes auto;
+pid /run/nginx.pid;
+include /etc/nginx/modules-enabled/*.conf;
+
+events {
+    worker_connections 768;
+}
+
+http {
+    sendfile on;
+    tcp_nopush on;
+    types_hash_max_size 2048;
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    access_log /var/log/nginx/access.log;
+    error_log /var/log/nginx/error.log;
+
+    gzip on;
+    include /etc/nginx/conf.d/*.conf;
+    include /etc/nginx/sites-enabled/*;
+}
+EOF
+    fi
+
+    # mime.types
+    if [ ! -f /etc/nginx/mime.types ]; then
+        cat > /etc/nginx/mime.types <<'EOF'
+types {
+    text/html  html htm shtml;
+    text/css   css;
+    text/xml   xml;
+    image/gif  gif;
+    image/jpeg jpeg jpg;
+    application/javascript js;
+    application/atom+xml atom;
+    application/rss+xml rss;
+}
+EOF
+    fi
+}
+
+create_default_server() {
+    DEFAULT_PATH="/etc/nginx/sites-available/default_server_block"
+    [ ! -f "$DEFAULT_PATH" ] && cat > "$DEFAULT_PATH" <<EOF
+server {
+    listen 80 default_server;
+    server_name _;
+    return 403;
+}
+EOF
+    ln -sf "$DEFAULT_PATH" /etc/nginx/sites-enabled/default_server_block
+}
+
+generate_server_config() {
+    DOMAIN=$1
+    TARGET=$2
+    IS_WS=$3
+    CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
+
+    if [ "$IS_WS" == "y" ]; then
+        WS_HEADERS="proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \"Upgrade\";"
+    else
+        WS_HEADERS=""
+    fi
+
+    cat > "$CONFIG_PATH" <<EOF
+server {
+    listen 80;
+    server_name $DOMAIN;
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name $DOMAIN;
+
+    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+
+    location / {
+        proxy_pass $TARGET;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        $WS_HEADERS
+    }
+}
+EOF
+    ln -sf "$CONFIG_PATH" "/etc/nginx/sites-enabled/$DOMAIN"
+}
+
+check_domain_resolution() {
+    DOMAIN=$1
+    VPS_IP=$(curl -s https://ipinfo.io/ip)
+    DOMAIN_IP=$(dig +short "$DOMAIN" | tail -n1)
+    if [ "$DOMAIN_IP" != "$VPS_IP" ]; then
+        echo -e "${RED}警告: 域名 $DOMAIN 解析为 $DOMAIN_IP, VPS IP 为 $VPS_IP${RESET}"
+    else
+        echo -e "${GREEN}域名解析正常${RESET}"
+    fi
+}
+
+# ------------------------------
+# 功能函数
+# ------------------------------
+install_nginx() {
+    echo -e "${GREEN}=== 安装 Nginx & Certbot ===${RESET}"
+
+    ensure_nginx_conf
+
+    # 删除重复 default_server，避免启动失败
+    for f in /etc/nginx/sites-enabled/*; do
+        if grep -q "default_server" "$f"; then
+            rm -f "$f"
+        fi
+    done
+
+    # 非交互安装 Nginx & Certbot
+    export DEBIAN_FRONTEND=noninteractive
+    apt update && apt upgrade -y
+    apt install -y nginx certbot python3-certbot-nginx
+    unset DEBIAN_FRONTEND
+
+    configure_firewall
+
+    systemctl daemon-reload
+    systemctl enable nginx
+    if ! systemctl restart nginx; then
+        echo -e "${RED}Nginx 启动失败，请检查配置${RESET}"
+        nginx -t
+        pause
+        return
+    fi
+
+    echo -ne "${GREEN}请输入邮箱地址: ${RESET}"; read EMAIL
+    echo -ne "${GREEN}请输入域名: ${RESET}"; read DOMAIN
+    check_domain_resolution "$DOMAIN"
+    echo -ne "${GREEN}请输入反代目标: ${RESET}"; read TARGET
+    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n): ${RESET}"; read IS_WS
+
+    certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
+    generate_server_config "$DOMAIN" "$TARGET" "$IS_WS"
+    create_default_server
+
+    nginx -t && systemctl reload nginx
+    systemctl enable --now certbot.timer
+    echo -e "${GREEN}安装完成！访问: https://$DOMAIN${RESET}"
+    pause
+}
+
+add_config() {
+    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+    echo -ne "${GREEN}请输入域名: ${RESET}"; read DOMAIN
+    check_domain_resolution "$DOMAIN"
+    echo -ne "${GREEN}请输入反代目标: ${RESET}"; read TARGET
+    echo -ne "${GREEN}请输入邮箱地址: ${RESET}"; read EMAIL
+    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n): ${RESET}"; read IS_WS
+
+    [ -f "/etc/nginx/sites-available/$DOMAIN" ] && echo -e "${YELLOW}配置已存在${RESET}" && pause && return
+
+    certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
+    generate_server_config "$DOMAIN" "$TARGET" "$IS_WS"
+    create_default_server
+    nginx -t && systemctl reload nginx
+    echo -e "${GREEN}添加完成！访问: https://$DOMAIN${RESET}"
+    pause
+}
+
+modify_config() {
+    [ ! -d "/etc/nginx/sites-available" ] && echo -e "${YELLOW}还没有任何配置文件！${RESET}" && pause && return
+    echo -e "${GREEN}现有配置的域名:${RESET}"
+    ls /etc/nginx/sites-available/
+    echo -ne "${GREEN}请输入要修改的域名: ${RESET}"; read DOMAIN
+    CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
+    [ ! -f "$CONFIG_PATH" ] && echo -e "${RED}配置不存在${RESET}" && pause && return
+
+    echo -ne "${GREEN}请输入新反代目标: ${RESET}"; read TARGET
+    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n): ${RESET}"; read IS_WS
+    echo -ne "${GREEN}是否更新邮箱? (y/n): ${RESET}"; read choice
+    if [[ "$choice" == "y" ]]; then
+        echo -ne "${GREEN}新邮箱: ${RESET}"; read EMAIL
+        certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
+    fi
+
+    generate_server_config "$DOMAIN" "$TARGET" "$IS_WS"
+    create_default_server
+    nginx -t && systemctl reload nginx
+    echo -e "${GREEN}修改完成！访问: https://$DOMAIN${RESET}"
+    pause
+}
+
+test_renew() {
+    certbot renew --dry-run
+    echo -e "${GREEN}证书续期测试完成！${RESET}"
+    pause
+}
+
+check_cert() {
+    certbot certificates
+    pause
+}
+
+uninstall_nginx() {
+    systemctl stop nginx || true
+    apt purge -y nginx certbot python3-certbot-nginx
+    apt autoremove -y
+    rm -rf /etc/nginx /etc/letsencrypt
+    echo -e "${GREEN}Nginx 和 Certbot 已卸载${RESET}"
+    pause
+}
+
+# ------------------------------
+# 主菜单
+# ------------------------------
+while true; do
+    clear
+    echo -e "${GREEN}===== Nginx 管理脚本 =====${RESET}"
+    echo -e "${GREEN}1) 安装 Nginx + 证书${RESET}"
+    echo -e "${GREEN}2) 添加配置${RESET}"
+    echo -e "${GREEN}3) 修改配置${RESET}"
+    echo -e "${GREEN}4) 测试证书续期${RESET}"
+    echo -e "${GREEN}5) 查看证书有效期${RESET}"
+    echo -e "${GREEN}6) 卸载 Nginx + 证书${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    echo -ne "${GREEN}请选择 [0-6]: ${RESET}"
+    read choice
     case $choice in
-      1) apply_prompt "'\[\033[1;32m\]\u\[\033[0m\]\[\033[1;33m\]@\[\033[0m\]\[\033[1;34m\]\h\[\033[0m\]\[\033[1;36m\]:\[\033[0m\]\[\033[1;31m\]\w\[\033[0m\]\[\033[1;35m\]#\[\033[0m\]'" ;;
-      2) apply_prompt "'\[\033[1;35m\]\u\[\033[0m\]\[\033[1;33m\]@\[\033[0m\]\[\033[1;36m\]\h\[\033[0m\]\[\033[1;34m\]:\[\033[0m\]\[\033[1;33m\]\w\[\033[0m\]\[\033[1;31m\]#\[\033[0m\]'" ;;
-      3) apply_prompt "'\[\033[1;31m\]\u\[\033[0m\]\[\033[1;33m\]@\[\033[0m\]\[\033[1;32m\]\h\[\033[0m\]\[\033[1;36m\]:\[\033[0m\]\[\033[1;34m\]\w\[\033[0m\]\[\033[1;36m\]#\[\033[0m\]'" ;;
-      4) apply_prompt "'\[\033[1;36m\]\u\[\033[0m\]\[\033[1;33m\]@\[\033[0m\]\[\033[1;33m\]\h\[\033[0m\]\[\033[1;35m\]:\[\033[0m\]\[\033[1;37m\]\w\[\033[0m\]\[\033[1;32m\]#\[\033[0m\]'" ;;
-      5) apply_prompt "'\[\033[1;37m\]\u\[\033[0m\]\[\033[1;33m\]@\[\033[0m\]\[\033[1;31m\]\h\[\033[0m\]\[\033[1;36m\]:\[\033[0m\]\[\033[1;32m\]\w\[\033[0m\]\[\033[1;36m\]#\[\033[0m\]'" ;;
-      6) apply_prompt "'\[\033[1;33m\]\u\[\033[0m\]\[\033[1;33m\]@\[\033[0m\]\[\033[1;34m\]\h\[\033[0m\]\[\033[1;36m\]:\[\033[0m\]\[\033[1;35m\]\w\[\033[0m\]\[\033[1;37m\]#\[\033[0m\]'" ;;
-      7) apply_prompt "'\u@\h:\w#'" ;;   # 默认无颜色，无空格
-      0) echo "退出"; break ;;
-      *) echo "无效选择"; read -p "按回车返回菜单..." ;;
+        1) install_nginx ;;
+        2) add_config ;;
+        3) modify_config ;;
+        4) test_renew ;;
+        5) check_cert ;;
+        6) uninstall_nginx ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ; pause ;;
     esac
 done

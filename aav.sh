@@ -1,209 +1,101 @@
 #!/bin/bash
+# ============================================
+# Termix 一键管理脚本 (仅自定义端口)
+# 功能: 安装/更新/卸载/查看日志
+# ============================================
 
-# ============ 颜色 ============
+APP_NAME="termix"
+COMPOSE_FILE="docker-compose.yml"
+IMAGE_NAME="ghcr.io/lukegus/termix:latest"
+DATA_DIR="./termix-data"
+
 GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
 RESET="\033[0m"
 
-pause() {
-    read -p "按回车继续..." _
-}
-# ============ 自动开放 80/443 ============
-open_ports() {
-    echo -e "${YELLOW}正在检测防火墙并开放 80/443 端口...${RESET}"
-
-    # Ubuntu/Debian 常用 UFW
-    if command -v ufw >/dev/null 2>&1; then
-        ufw allow 80/tcp
-        ufw allow 443/tcp
-        echo -e "${GREEN}已通过 UFW 开放 80/443${RESET}"
+check_env() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${GREEN}❌ 未检测到 Docker，请先安装 Docker${RESET}"
+        exit 1
     fi
-
-    # RHEL 系 firewalld
-    if command -v firewall-cmd >/dev/null 2>&1; then
-        firewall-cmd --permanent --add-service=http
-        firewall-cmd --permanent --add-service=https
-        firewall-cmd --reload
-        echo -e "${GREEN}已通过 firewalld 开放 80/443${RESET}"
-    fi
-
-    # 直接 iptables（万一没有防火墙）
-    if command -v iptables >/dev/null 2>&1; then
-        iptables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport 80 -j ACCEPT
-        iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport 443 -j ACCEPT
-        echo -e "${GREEN}已通过 iptables 开放 80/443${RESET}"
+    if ! command -v docker compose &> /dev/null && ! command -v docker-compose &> /dev/null; then
+        echo -e "${GREEN}❌ 未检测到 docker-compose，请先安装 docker-compose${RESET}"
+        exit 1
     fi
 }
 
-# ============ 安装 Nginx + Certbot ============
-install_nginx() {
-    echo -e "${GREEN}正在安装 Nginx 和 Certbot...${RESET}"
-    apt update -y
-    DEBIAN_FRONTEND=noninteractive \
-    apt install -y nginx certbot python3-certbot-nginx dnsutils --no-install-recommends \
-    -o Dpkg::Options::="--force-confold" \
-    -o Dpkg::Options::="--force-confdef"
-
-    systemctl enable nginx
-    systemctl start nginx
-    open_ports
-    echo -e "${GREEN}Nginx 和 Certbot 安装完成${RESET}"
-}
-# ============ 默认 server 去重 ============
-create_default_server() {
-    local default_conf="/etc/nginx/sites-enabled/default"
-    if [ -f "$default_conf" ]; then
-        sed -i 's/default_server//g' "$default_conf"
-    fi
-}
-
-# ============ 修复 Nginx 配置 ============
-fix_nginx_config() {
-    echo -e "${YELLOW}开始检测并修复 Nginx 配置...${RESET}"
-
-    # 确保 mime.types 存在
-    if [ ! -f "/etc/nginx/mime.types" ]; then
-        echo -e "${RED}/etc/nginx/mime.types 丢失，正在修复...${RESET}"
-        cat > /etc/nginx/mime.types <<EOF
-types {
-    text/html                             html htm shtml;
-    text/css                              css;
-    text/xml                              xml;
-    image/gif                             gif;
-    image/jpeg                            jpeg jpg;
-    application/javascript                js;
-    application/atom+xml                  atom;
-    application/rss+xml                   rss;
-    text/plain                            txt;
-    image/png                             png;
-    image/x-icon                          ico;
-    image/webp                            webp;
-}
+generate_compose() {
+    cat > $COMPOSE_FILE <<EOF
+services:
+  $APP_NAME:
+    image: $IMAGE_NAME
+    container_name: $APP_NAME
+    restart: unless-stopped
+    ports:
+      - "$PORT:$PORT"
+    volumes:
+      - "$(realpath $DATA_DIR):/app/data"
+    environment:
+      PORT: "$PORT"
 EOF
-        echo -e "${GREEN}mime.types 修复完成${RESET}"
-    fi
+}
 
-    # 确保目录存在
-    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/conf.d
+install_app() {
+    read -p "请输入映射端口 (默认 8080): " PORT
+    PORT=${PORT:-8080}
 
-    # 检查 nginx.conf 是否包含 sites-enabled
-    if ! grep -q "include /etc/nginx/sites-enabled/\*;" /etc/nginx/nginx.conf; then
-        echo -e "${YELLOW}nginx.conf 未包含 sites-enabled，自动添加...${RESET}"
-        sed -i '/http {/a \    include /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf
-    fi
+    mkdir -p "$DATA_DIR"
 
-    # 检查配置文件语法
-    if ! nginx -t 2>/dev/null; then
-        echo -e "${RED}Nginx 配置存在错误，请手动检查: nginx -t${RESET}"
+    echo -e "${GREEN}🚀 正在安装并启动 $APP_NAME (端口: $PORT) ...${RESET}"
+
+    generate_compose
+    docker compose up -d
+    echo -e "${GREEN}✅ $APP_NAME 已启动，访问地址: http://$(curl -s https://api.ipify.org):$PORT${RESET}"
+}
+
+update_app() {
+    echo -e "${GREEN}🔄 正在更新 $APP_NAME ...${RESET}"
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ 容器已更新并启动${RESET}"
+}
+
+uninstall_app() {
+    read -p "⚠️ 确认要卸载 $APP_NAME 并删除数据吗？(y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        docker compose down -v
+        rm -f $COMPOSE_FILE
+        echo -e "${GREEN}✅ $APP_NAME 已卸载并清理${RESET}"
     else
-        echo -e "${GREEN}Nginx 配置检测通过，正在重载...${RESET}"
-        systemctl restart nginx
+        echo -e "${GREEN}❌ 已取消${RESET}"
     fi
 }
 
-# ============ 添加反代配置 ============
-add_config() {
-    read -p "请输入邮箱地址: " EMAIL
-    read -p "请输入域名: " DOMAIN
-    read -p "请输入反代目标: " TARGET
-    read -p "是否为 WebSocket 反代? (y/n): " IS_WS
-
-    # 检查 DNS
-    if ! dig +short "$DOMAIN" > /dev/null; then
-        echo -e "${RED}域名未解析或无法解析${RESET}"
-        return
-    fi
-
-    CONF_PATH="/etc/nginx/sites-available/$DOMAIN.conf"
-    ln -sf "$CONF_PATH" "/etc/nginx/sites-enabled/$DOMAIN.conf"
-
-    if [[ "$IS_WS" == "y" ]]; then
-        cat > "$CONF_PATH" <<EOF
-server {
-    listen 80;
-    server_name $DOMAIN;
-    location / {
-        proxy_pass $TARGET;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-    }
-}
-EOF
-    else
-        cat > "$CONF_PATH" <<EOF
-server {
-    listen 80;
-    server_name $DOMAIN;
-    location / {
-        proxy_pass $TARGET;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-}
-EOF
-    fi
-
-    nginx -t && systemctl reload nginx
-    certbot --nginx --non-interactive --agree-tos -m "$EMAIL" -d "$DOMAIN"
-    echo -e "${GREEN}安装完成！访问: https://$DOMAIN${RESET}"
-
-    fix_nginx_config
+logs_app() {
+    docker logs -f $APP_NAME
 }
 
-# ============ 修改配置 ============
-modify_config() {
-    echo -e "${GREEN}现有配置:${RESET}"
-    ls /etc/nginx/sites-available/
-    read -p "请输入要修改的域名: " DOMAIN
-    nano "/etc/nginx/sites-available/$DOMAIN.conf"
-    nginx -t && systemctl reload nginx
-}
-
-# ============ 测试续期 ============
-test_renew() {
-    certbot renew --dry-run
-}
-
-# ============ 查看证书 ============
-check_cert() {
-    read -p "请输入域名: " DOMAIN
-    openssl x509 -in "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" -noout -dates
-}
-
-# ============ 卸载 ============
-uninstall_nginx() {
-    systemctl stop nginx
-    apt purge -y nginx certbot python3-certbot-nginx
-    rm -rf /etc/nginx /etc/letsencrypt
-    echo -e "${GREEN}Nginx 与证书已卸载${RESET}"
-}
-
-# ============ 菜单 ============
-while true; do
+menu() {
     clear
-    echo -e "${GREEN}=== Nginx + Certbot 管理工具 ===${RESET}"
-    echo -e "${GREEN}1) 安装 Nginx + Certbot${RESET}"
-    echo -e "${GREEN}2) 添加反代配置并申请证书${RESET}"
-    echo -e "${GREEN}3) 修改现有配置${RESET}"
-    echo -e "${GREEN}4) 测试证书续期${RESET}"
-    echo -e "${GREEN}5) 查看证书有效期${RESET}"
-    echo -e "${GREEN}6) 卸载 Nginx + 证书${RESET}"
+    echo -e "${GREEN}=== Termix 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装/启动 Termix${RESET}"
+    echo -e "${GREEN}2) 更新 Termix${RESET}"
+    echo -e "${GREEN}3) 卸载 Termix${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    echo -ne "${GREEN}请选择 [0-6]: ${RESET}"
-    read choice
+    echo -e "${GREEN}========================${RESET}"
+    read -p "请选择: " choice
     case $choice in
-        1) install_nginx; create_default_server; fix_nginx_config; pause ;;
-        2) add_config; pause ;;
-        3) modify_config; pause ;;
-        4) test_renew; pause ;;
-        5) check_cert; pause ;;
-        6) uninstall_nginx; pause ;;
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) logs_app ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ; pause ;;
+        *) echo -e "${GREEN}无效选择${RESET}" ;;
     esac
+}
+
+check_env
+while true; do
+    menu
+    read -p "按回车键返回菜单..." enter
 done

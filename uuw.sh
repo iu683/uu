@@ -1,133 +1,97 @@
 #!/bin/bash
-# ==========================================
-# XTrafficDash Docker 管理脚本
-# ==========================================
+# ============================================
+# TGBot_RSS 一键管理脚本
+# 功能: 安装/更新/卸载/查看日志
+# ============================================
 
-set -e
+APP_NAME="TGBot_RSS"
+IMAGE_NAME="kwxos/tgbot-rss:latest"
+DATA_DIR="./TGBot_RSS"
 
-# 颜色定义
 GREEN="\033[32m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="xtrafficdash"
-IMAGE="sanqi37/xtrafficdash"
-DATA_DIR="/usr/xtrafficdash/data"
-TZ="Asia/Shanghai"
-PORT=37022
-DEFAULT_PASSWORD="admin123"
-
-pause() {
-    read -p "按回车返回菜单..."
-}
-
-# ================== 功能函数 ==================
-
-create_data_dir() {
-    if [ ! -d "$DATA_DIR" ]; then
-        mkdir -p "$DATA_DIR"
-        chmod 777 "$DATA_DIR"
-        echo -e "${GREEN}数据目录已创建: $DATA_DIR${RESET}"
+check_env() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${GREEN}❌ 未检测到 Docker，请先安装 Docker${RESET}"
+        exit 1
     fi
 }
 
-read_password() {
-    read -p "请输入管理密码 [默认 $DEFAULT_PASSWORD]: " PASSWORD
-    PASSWORD=${PASSWORD:-$DEFAULT_PASSWORD}
-}
+install_app() {
+    read -p "请输入 Telegram Bot Token: " BOT_TOKEN
+    read -p "请输入管理员 UID (0 表示所有用户可用): " ADMINIDS
+    read -p "请输入 RSS 检查周期 (分钟，默认 1): " CYCLETIME
+    CYCLETIME=${CYCLETIME:-1}
+    read -p "是否开启调试模式 (true/false，默认 false): " DEBUG
+    DEBUG=${DEBUG:-false}
+    read -p "请输入代理服务器 URL (例如 http://127.0.0.1:7890, 默认空): " PROXYURL
+    read -p "请输入推送接口 URL (默认空): " PUSHINFO
 
-start_container() {
-    create_data_dir
-    read_password
-    if [ "$(docker ps -aq -f name=$APP_NAME)" ]; then
-        echo -e "${YELLOW}容器已存在，尝试启动...${RESET}"
-        docker start $APP_NAME
-    else
-        echo -e "${GREEN}启动新容器...${RESET}"
-        docker run -d \
-            --name $APP_NAME \
-            -p $PORT:$PORT \
-            -v $DATA_DIR:/app/data \
-            -e TZ=$TZ \
-            -e PASSWORD=$PASSWORD \
-            --log-opt max-size=5m \
-            --log-opt max-file=3 \
-            --restart unless-stopped \
-            $IMAGE
-    fi
-    echo -e "${GREEN}容器状态:${RESET}"
-    docker ps -f name=$APP_NAME
-    echo -e "${GREEN}✅ 容器已启动，访问地址: http://$(curl -s https://api.ipify.org):$PORT${RESET}"
-    pause
-}
+    mkdir -p "$DATA_DIR"
 
-view_logs() {
-    if [ "$(docker ps -q -f name=$APP_NAME)" ]; then
-        echo -e "${CYAN}显示最近 100 行日志，按 Ctrl+C 退出:${RESET}"
-        docker logs --tail 100 -f $APP_NAME
-    else
-        echo -e "${YELLOW}容器未运行${RESET}"
-    fi
-    pause
-}
-
-delete_container() {
-    if [ "$(docker ps -q -f name=$APP_NAME)" ]; then
-        docker stop $APP_NAME
-    fi
-    if [ "$(docker ps -aq -f name=$APP_NAME)" ]; then
-        docker rm $APP_NAME
-        echo -e "${GREEN}容器已删除${RESET}"
-    else
-        echo -e "${YELLOW}容器不存在${RESET}"
-    fi
-    pause
-}
-
-update_image() {
-    echo -e "${CYAN}拉取最新镜像...${RESET}"
-    docker pull $IMAGE
-    echo -e "${GREEN}镜像更新完成${RESET}"
-
-    read_password
-
-    echo -e "${YELLOW}重启容器以应用新镜像...${RESET}"
-    docker stop $APP_NAME 2>/dev/null || true
-    docker rm $APP_NAME 2>/dev/null || true
+    echo -e "${GREEN}🚀 正在安装并启动 $APP_NAME ...${RESET}"
 
     docker run -d \
-        --name $APP_NAME \
-        -p $PORT:$PORT \
-        -v $DATA_DIR:/app/data \
-        -e TZ=$TZ \
-        -e PASSWORD=$PASSWORD \
-        --log-opt max-size=5m \
-        --log-opt max-file=3 \
-        --restart unless-stopped \
-        $IMAGE
+      --name $APP_NAME \
+      -e BotToken="$BOT_TOKEN" \
+      -e ADMINIDS="$ADMINIDS" \
+      -e Cycletime="$CYCLETIME" \
+      -e Debug="$DEBUG" \
+      -e ProxyURL="$PROXYURL" \
+      -e Pushinfo="$PUSHINFO" \
+      -e TZ="Asia/Shanghai" \
+      -v "$(realpath $DATA_DIR):/root/" \
+      $IMAGE_NAME
 
-    echo -e "${GREEN}✅ 容器已更新并启动，访问地址: http://$(curl -s https://api.ipify.org):$PORT${RESET}"
-    pause
+    echo -e "${GREEN}✅ $APP_NAME 已启动${RESET}"
 }
 
-# ================== 菜单 ==================
-while true; do
-    echo
-    echo -e "${GREEN}=== XTrafficDash 管理菜单 ===${RESET}"
-    echo -e "${GREEN}[1] 启动容器${RESET}"
-    echo -e "${GREEN}[2] 删除容器${RESET}"
-    echo -e "${GREEN}[3] 更新镜像并启动容器${RESET}"
-    echo -e "${GREEN}[4] 查看日志${RESET}"
-    echo -e "${GREEN}[0] 退出${RESET}"
-    echo -e "${GREEN}=============================${RESET}"
-    read -p "请选择操作 [0-4]: " choice
+update_app() {
+    echo -e "${GREEN}🔄 正在更新 $APP_NAME ...${RESET}"
+    docker pull $IMAGE_NAME
+    docker stop $APP_NAME && docker rm $APP_NAME
+    install_app
+    echo -e "${GREEN}✅ 容器已更新并启动${RESET}"
+}
+
+uninstall_app() {
+    read -p "⚠️ 确认要卸载 $APP_NAME 并删除数据吗？(y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        docker stop $APP_NAME && docker rm $APP_NAME
+        rm -rf $DATA_DIR
+        echo -e "${GREEN}✅ $APP_NAME 已卸载并清理${RESET}"
+    else
+        echo -e "${GREEN}❌ 已取消${RESET}"
+    fi
+}
+
+logs_app() {
+    docker logs -f $APP_NAME
+}
+
+menu() {
+    clear
+    echo -e "${GREEN}=== TGBot_RSS 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装/启动 TGBot_RSS${RESET}"
+    echo -e "${GREEN}2) 更新 TGBot_RSS${RESET}"
+    echo -e "${GREEN}3) 卸载 TGBot_RSS${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    echo -e "${GREEN}==========================${RESET}"
+    read -p "请选择: " choice
     case $choice in
-        1) start_container ;;
-        2) delete_container ;;
-        3) update_image ;;
-        4) view_logs ;;
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) logs_app ;;
         0) exit 0 ;;
-        *) echo -e "${YELLOW}无效选项，请重新选择${RESET}" ;;
+        *) echo -e "${GREEN}无效选择${RESET}" ;;
     esac
+}
+
+check_env
+while true; do
+    menu
+    read -p "按回车键返回菜单..." enter
 done

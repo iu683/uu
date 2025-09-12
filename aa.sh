@@ -1,265 +1,113 @@
 #!/bin/bash
-set -e
+# ============================================
+# Homepage 一键管理脚本
+# 功能: 安装/更新/卸载/查看日志
+# ============================================
+
+APP_NAME="homepage"
+IMAGE_NAME="ghcr.io/gethomepage/homepage:latest"
+DATA_DIR="./homepage_config"
+CONFIG_FILE="./homepage.conf"
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
 RESET="\033[0m"
 
-# ------------------------------
-# 工具函数
-# ------------------------------
-pause() {
-    echo -ne "${YELLOW}按回车返回菜单...${RESET}"
-    read
-}
-
-configure_firewall() {
-    for PORT in 80 443; do
-        if command -v ufw >/dev/null 2>&1; then
-            ufw allow $PORT || true
-        elif command -v firewall-cmd >/dev/null 2>&1; then
-            firewall-cmd --permanent --add-port=$PORT/tcp || true
-            firewall-cmd --reload || true
-        fi
-    done
-}
-
-ensure_nginx_conf() {
-    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/modules-enabled
-    # 创建最小 nginx.conf 避免安装报错
-    if [ ! -f /etc/nginx/nginx.conf ]; then
-        cat > /etc/nginx/nginx.conf <<'EOF'
-user www-data;
-worker_processes auto;
-pid /run/nginx.pid;
-include /etc/nginx/modules-enabled/*.conf;
-
-events {
-    worker_connections 768;
-}
-
-http {
-    sendfile on;
-    tcp_nopush on;
-    types_hash_max_size 2048;
-    include /etc/nginx/mime.types;
-    default_type application/octet-stream;
-
-    access_log /var/log/nginx/access.log;
-    error_log /var/log/nginx/error.log;
-
-    gzip on;
-    include /etc/nginx/conf.d/*.conf;
-    include /etc/nginx/sites-enabled/*;
-}
-EOF
-    fi
-
-    # 创建 mime.types
-    if [ ! -f /etc/nginx/mime.types ]; then
-        cat > /etc/nginx/mime.types <<'EOF'
-types {
-    text/html  html htm shtml;
-    text/css   css;
-    text/xml   xml;
-    image/gif  gif;
-    image/jpeg jpeg jpg;
-    application/javascript js;
-    application/atom+xml atom;
-    application/rss+xml rss;
-}
-EOF
+check_env() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${GREEN}❌ 未检测到 Docker，请先安装 Docker${RESET}"
+        exit 1
     fi
 }
 
-create_default_server() {
-    DEFAULT_PATH="/etc/nginx/sites-available/default_server_block"
-    [ ! -f "$DEFAULT_PATH" ] && cat > "$DEFAULT_PATH" <<EOF
-server {
-    listen 80 default_server;
-    server_name _;
-    return 403;
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    fi
 }
+
+save_config() {
+    cat > "$CONFIG_FILE" <<EOF
+PORT="$PORT"
+CONFIG_DIR="$CONFIG_DIR"
+HOMEPAGE_ALLOWED_HOSTS="$HOMEPAGE_ALLOWED_HOSTS"
 EOF
-    ln -sf "$DEFAULT_PATH" /etc/nginx/sites-enabled/default_server_block
 }
 
-generate_server_config() {
-    DOMAIN=$1
-    TARGET=$2
-    IS_WS=$3
-    CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
+install_app() {
+    load_config
 
-    if [ "$IS_WS" == "y" ]; then
-        WS_HEADERS="proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \"Upgrade\";"
+    read -p "请输入映射端口 (默认 ${PORT:-3000}): " input
+    PORT=${input:-${PORT:-3000}}
+
+    read -p "请输入配置目录路径 (默认 ${CONFIG_DIR:-$DATA_DIR}): " input
+    CONFIG_DIR=${input:-${CONFIG_DIR:-$DATA_DIR}}
+
+    read -p "请输入 HOMEPAGE_ALLOWED_HOSTS (默认 ${HOMEPAGE_ALLOWED_HOSTS:-gethomepage.dev}): " input
+    HOMEPAGE_ALLOWED_HOSTS=${input:-${HOMEPAGE_ALLOWED_HOSTS:-gethomepage.dev}}
+
+    mkdir -p "$CONFIG_DIR"
+
+    save_config
+
+    echo -e "${GREEN}🚀 正在安装并启动 $APP_NAME ...${RESET}"
+
+    docker run -d \
+      --name $APP_NAME \
+      -p ${PORT}:3000 \
+      -v "$(realpath $CONFIG_DIR):/app/config" \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      -e HOMEPAGE_ALLOWED_HOSTS="$HOMEPAGE_ALLOWED_HOSTS" \
+      $IMAGE_NAME
+
+    echo -e "${GREEN}✅ $APP_NAME 已启动，访问地址: http://<服务器IP>:$PORT${RESET}"
+}
+
+update_app() {
+    echo -e "${GREEN}🔄 正在更新 $APP_NAME ...${RESET}"
+    docker pull $IMAGE_NAME
+    docker stop $APP_NAME && docker rm $APP_NAME
+    install_app
+    echo -e "${GREEN}✅ 容器已更新并启动${RESET}"
+}
+
+uninstall_app() {
+    read -p "⚠️ 确认要卸载 $APP_NAME 并删除数据和配置吗？(y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        docker stop $APP_NAME && docker rm $APP_NAME
+        rm -rf $DATA_DIR
+        rm -f $CONFIG_FILE
+        echo -e "${GREEN}✅ $APP_NAME 已卸载并清理（含配置文件）${RESET}"
     else
-        WS_HEADERS=""
-    fi
-
-    cat > "$CONFIG_PATH" <<EOF
-server {
-    listen 80;
-    server_name $DOMAIN;
-    return 301 https://\$host\$request_uri;
-}
-
-server {
-    listen 443 ssl;
-    server_name $DOMAIN;
-
-    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
-
-    location / {
-        proxy_pass $TARGET;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        $WS_HEADERS
-    }
-}
-EOF
-    ln -sf "$CONFIG_PATH" "/etc/nginx/sites-enabled/$DOMAIN"
-}
-
-check_domain_resolution() {
-    DOMAIN=$1
-    VPS_IP=$(curl -s https://ipinfo.io/ip)
-    DOMAIN_IP=$(dig +short "$DOMAIN" | tail -n1)
-    if [ "$DOMAIN_IP" != "$VPS_IP" ]; then
-        echo -e "${RED}警告: 域名 $DOMAIN 解析为 $DOMAIN_IP, VPS IP 为 $VPS_IP${RESET}"
-    else
-        echo -e "${GREEN}域名解析正常${RESET}"
+        echo -e "${GREEN}❌ 已取消${RESET}"
     fi
 }
 
-# ------------------------------
-# 功能函数
-# ------------------------------
-install_nginx() {
-    ensure_nginx_conf
-    create_default_server
-    apt update && apt upgrade -y
-
-    echo -e "${GREEN}开始安装 Nginx 和 Certbot...${RESET}"
-    if ! apt install -y nginx certbot python3-certbot-nginx; then
-        echo -e "${RED}安装失败，尝试自动修复...${RESET}"
-        uninstall_nginx
-        echo -e "${YELLOW}重新尝试安装...${RESET}"
-        if ! apt install -y nginx certbot python3-certbot-nginx; then
-            echo -e "${RED}修复后安装仍然失败，请手动检查系统环境！${RESET}"
-            pause
-            return
-        fi
-    fi
-
-    configure_firewall
-    systemctl daemon-reload
-    systemctl enable --now nginx
-
-    echo -ne "${GREEN}请输入邮箱地址: ${RESET}"; read EMAIL
-    echo -ne "${GREEN}请输入域名: ${RESET}"; read DOMAIN
-    check_domain_resolution "$DOMAIN"
-    echo -ne "${GREEN}请输入反代目标: ${RESET}"; read TARGET
-    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n): ${RESET}"; read IS_WS
-
-    certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-    generate_server_config "$DOMAIN" "$TARGET" "$IS_WS"
-    nginx -t && systemctl reload nginx
-    systemctl enable --now certbot.timer
-    echo -e "${GREEN}安装完成！访问: https://$DOMAIN${RESET}"
-    pause
+logs_app() {
+    docker logs -f $APP_NAME
 }
 
-
-add_config() {
-    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-    echo -ne "${GREEN}请输入域名: ${RESET}"; read DOMAIN
-    check_domain_resolution "$DOMAIN"
-    echo -ne "${GREEN}请输入反代目标: ${RESET}"; read TARGET
-    echo -ne "${GREEN}请输入邮箱地址: ${RESET}"; read EMAIL
-    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n): ${RESET}"; read IS_WS
-
-    [ -f "/etc/nginx/sites-available/$DOMAIN" ] && echo -e "${YELLOW}配置已存在${RESET}" && pause && return
-
-    certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-    generate_server_config "$DOMAIN" "$TARGET" "$IS_WS"
-    create_default_server
-    nginx -t && systemctl reload nginx
-    echo -e "${GREEN}添加完成！访问: https://$DOMAIN${RESET}"
-    pause
-}
-
-modify_config() {
-    [ ! -d "/etc/nginx/sites-available" ] && echo -e "${YELLOW}还没有任何配置文件！${RESET}" && pause && return
-    echo -e "${GREEN}现有配置的域名:${RESET}"
-    ls /etc/nginx/sites-available/
-    echo -ne "${GREEN}请输入要修改的域名: ${RESET}"; read DOMAIN
-    CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
-    [ ! -f "$CONFIG_PATH" ] && echo -e "${RED}配置不存在${RESET}" && pause && return
-
-    echo -ne "${GREEN}请输入新反代目标: ${RESET}"; read TARGET
-    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n): ${RESET}"; read IS_WS
-    echo -ne "${GREEN}是否更新邮箱? (y/n): ${RESET}"; read choice
-    if [[ "$choice" == "y" ]]; then
-        echo -ne "${GREEN}新邮箱: ${RESET}"; read EMAIL
-        certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-    fi
-
-    generate_server_config "$DOMAIN" "$TARGET" "$IS_WS"
-    create_default_server
-    nginx -t && systemctl reload nginx
-    echo -e "${GREEN}修改完成！访问: https://$DOMAIN${RESET}"
-    pause
-}
-
-test_renew() {
-    certbot renew --dry-run
-    echo -e "${GREEN}证书续期测试完成！${RESET}"
-    pause
-}
-
-check_cert() {
-    certbot certificates
-    pause
-}
-
-uninstall_nginx() {
-    systemctl stop nginx || true
-    apt purge -y nginx certbot python3-certbot-nginx
-    apt autoremove -y
-    rm -rf /etc/nginx /etc/letsencrypt
-    echo -e "${GREEN}Nginx 和 Certbot 已卸载${RESET}"
-    pause
-}
-
-# ------------------------------
-# 主菜单
-# ------------------------------
-while true; do
+menu() {
     clear
-    echo -e "${GREEN}===== Nginx 管理脚本 =====${RESET}"
-    echo -e "${GREEN}1) 安装 Nginx + 证书${RESET}"
-    echo -e "${GREEN}2) 添加配置${RESET}"
-    echo -e "${GREEN}3) 修改配置${RESET}"
-    echo -e "${GREEN}4) 测试证书续期${RESET}"
-    echo -e "${GREEN}5) 查看证书有效期${RESET}"
-    echo -e "${GREEN}6) 卸载 Nginx + 证书${RESET}"
+    echo -e "${GREEN}=== Homepage 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装/启动 Homepage${RESET}"
+    echo -e "${GREEN}2) 更新 Homepage${RESET}"
+    echo -e "${GREEN}3) 卸载 Homepage${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    echo -ne "${GREEN}请选择 [0-6]: ${RESET}"
-    read choice
+    echo -e "${GREEN}==========================${RESET}"
+    read -p "请选择: " choice
     case $choice in
-        1) install_nginx ;;
-        2) add_config ;;
-        3) modify_config ;;
-        4) test_renew ;;
-        5) check_cert ;;
-        6) uninstall_nginx ;;
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) logs_app ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ; pause ;;
+        *) echo -e "${GREEN}无效选择${RESET}" ;;
     esac
+}
+
+check_env
+while true; do
+    menu
+    read -p "按回车键返回菜单..." enter
 done

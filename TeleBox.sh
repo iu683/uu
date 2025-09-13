@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================
-# TeleBox 一键管理脚本 (带配置向导 + 登录功能)
-# 功能: 安装 / 启动 / 停止 / 卸载 / 日志查看 / 配置 / 登录
+# TeleBox 一键管理脚本 (带配置向导 + 登录功能 + PM2 管理 + 更新)
+# 功能: 安装 / 启动 / 停止 / 重启 / 卸载 / 日志查看 / 配置 / 登录 / 更新 / PM2命令
 # ============================================
 
 APP_NAME="telebox"
@@ -23,6 +23,8 @@ show_menu() {
     echo -e "${GREEN}6) 配置 API 信息${RESET}"
     echo -e "${GREEN}7) 卸载 TeleBox${RESET}"
     echo -e "${GREEN}8) 登录 TeleBox（手机号验证）${RESET}"
+    echo -e "${GREEN}9) 更新 TeleBox${RESET}"
+    echo -e "${GREEN}10) PM2 管理命令${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
     echo
 }
@@ -99,9 +101,9 @@ EOF
 login_telebox() {
     echo -e "${GREEN}>>> 正在启动 TeleBox 登录流程...${RESET}"
     echo -e "${GREEN}请根据提示输入手机号、验证码、二步验证密码（如有）${RESET}"
-    echo -e "${GREEN}登录成功后按 CTRL+C 停止，再通过菜单 2 启动 PM2 服务${RESET}"
     cd "$APP_DIR" || exit
     npm start
+    echo -e "${GREEN}登录完成，请返回主菜单选择 '2' 启动 PM2 服务即可${RESET}"
 }
 
 uninstall_telebox() {
@@ -109,6 +111,53 @@ uninstall_telebox() {
     pm2 delete "$APP_NAME"
     rm -rf "$APP_DIR"
     echo -e "${GREEN}>>> TeleBox 已卸载${RESET}"
+}
+
+update_telebox() {
+    echo -e "${GREEN}>>> 更新 TeleBox...${RESET}"
+    if [ ! -d "$APP_DIR" ]; then
+        echo -e "${GREEN}TeleBox 未安装，请先安装${RESET}"
+        return
+    fi
+    cd "$APP_DIR" || exit
+    git pull
+    npm install
+    pm2 restart "$APP_NAME"
+    echo -e "${GREEN}>>> TeleBox 已更新并重启服务${RESET}"
+}
+
+pm2_tools() {
+    clear
+    echo -e "${GREEN}=== PM2 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 查看服务状态 (pm2 status)${RESET}"
+    echo -e "${GREEN}2) 查看运行日志 (pm2 logs telebox)${RESET}"
+    echo -e "${GREEN}3) 重启服务 (pm2 restart telebox)${RESET}"
+    echo -e "${GREEN}4) 停止服务 (pm2 stop telebox)${RESET}"
+    echo -e "${GREEN}5) 查看所有进程 (pm2 list)${RESET}"
+    echo -e "${GREEN}6) 实时监控 (pm2 monit)${RESET}"
+    echo -e "${GREEN}7) 无缝重载 (pm2 reload telebox)${RESET}"
+    echo -e "${GREEN}8) 删除进程 (pm2 delete telebox)${RESET}"
+    echo -e "${GREEN}9) 安装 pm2-logrotate 插件 (日志管理)${RESET}"
+    echo -e "${GREEN}0) 返回主菜单${RESET}"
+    echo
+
+    read -rp "请选择 PM2 操作: " pm2_choice
+    case $pm2_choice in
+        1) pm2 status ;;
+        2) pm2 logs "$APP_NAME" ;;
+        3) pm2 restart "$APP_NAME" ;;
+        4) pm2 stop "$APP_NAME" ;;
+        5) pm2 list ;;
+        6) pm2 monit ;;
+        7) pm2 reload "$APP_NAME" ;;
+        8) pm2 delete "$APP_NAME" ;;
+        9) pm2 install pm2-logrotate ;;
+        0) return ;;
+        *) echo -e "${GREEN}无效选择${RESET}" ;;
+    esac
+    echo -e "${GREEN}按回车返回 PM2 菜单...${RESET}"
+    read
+    pm2_tools
 }
 
 while true; do
@@ -123,6 +172,8 @@ while true; do
         6) configure_telebox ;;
         7) uninstall_telebox ;;
         8) login_telebox ;;
+        9) update_telebox ;;
+        10) pm2_tools ;;
         0) exit 0 ;;
         *) echo -e "${GREEN}无效选择，请重新输入${RESET}" ;;
     esac

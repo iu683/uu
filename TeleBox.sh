@@ -15,17 +15,17 @@ RESET="\033[0m"
 show_menu() {
     clear
     echo -e "${GREEN}=== TeleBox 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装 TeleBox${RESET}"
-    echo -e "${GREEN}2) 启动 TeleBox (PM2)${RESET}"
-    echo -e "${GREEN}3) 停止 TeleBox (PM2)${RESET}"
-    echo -e "${GREEN}4) 重启 TeleBox (PM2)${RESET}"
-    echo -e "${GREEN}5) 查看运行日志${RESET}"
-    echo -e "${GREEN}6) 配置 API 信息${RESET}"
-    echo -e "${GREEN}7) 卸载 TeleBox${RESET}"
-    echo -e "${GREEN}8) 登录 TeleBox（手机号验证）${RESET}"
-    echo -e "${GREEN}9) 更新 TeleBox${RESET}"
+    echo -e "${GREEN} 1) 安装 TeleBox${RESET}"
+    echo -e "${GREEN} 2) 启动 TeleBox (PM2)${RESET}"
+    echo -e "${GREEN} 3) 停止 TeleBox (PM2)${RESET}"
+    echo -e "${GREEN} 4) 重启 TeleBox (PM2)${RESET}"
+    echo -e "${GREEN} 5) 查看运行日志${RESET}"
+    echo -e "${GREEN} 6) 配置 API 信息${RESET}"
+    echo -e "${GREEN} 7) 卸载 TeleBox${RESET}"
+    echo -e "${GREEN} 8) 登录 TeleBox（手机号验证）${RESET}"
+    echo -e "${GREEN} 9) 更新 TeleBox${RESET}"
     echo -e "${GREEN}10) PM2 管理命令${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
+    echo -e "${GREEN} 0) 退出${RESET}"
     echo
 }
 

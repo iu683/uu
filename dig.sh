@@ -1,105 +1,111 @@
 #!/bin/bash
-# ============================================
-# Termix 一键管理脚本 (仅自定义端口, 兼容 docker-compose)
-# ============================================
-
-APP_NAME="termix"
-COMPOSE_FILE="docker-compose.yml"
-IMAGE_NAME="ghcr.io/lukegus/termix:latest"
-DATA_DIR="./termix-data"
 
 GREEN="\033[32m"
 RESET="\033[0m"
 
-# 检查环境 & 选择 compose 命令
-check_env() {
-    if ! command -v docker &> /dev/null; then
-        echo -e "${GREEN}❌ 未检测到 Docker，请先安装 Docker${RESET}"
-        exit 1
-    fi
-    if command -v docker compose &> /dev/null; then
-        COMPOSE_CMD="docker compose"
-    elif command -v docker-compose &> /dev/null; then
-        COMPOSE_CMD="docker-compose"
-    else
-        echo -e "${GREEN}❌ 未检测到 docker-compose，请先安装${RESET}"
-        exit 1
-    fi
-}
+APP_NAME="music-tag-web"
+YML_FILE="music-tag-compose.yml"
 
-generate_compose() {
-    cat > $COMPOSE_FILE <<EOF
-services:
-  $APP_NAME:
-    image: $IMAGE_NAME
-    container_name: $APP_NAME
-    restart: unless-stopped
-    ports:
-      - "$PORT:$PORT"
-    volumes:
-      - "$(realpath $DATA_DIR):/app/data"
-    environment:
-      PORT: "$PORT"
-EOF
-}
+# 存储上次安装时的目录（便于卸载时清理）
+CONF_FILE=".music_tag_dirs"
 
-install_app() {
-    read -p "请输入映射端口 (默认 8080): " PORT
-    PORT=${PORT:-8080}
-
-    mkdir -p "$DATA_DIR"
-
-    echo -e "${GREEN}🚀 正在安装并启动 $APP_NAME (端口: $PORT) ...${RESET}"
-
-    generate_compose
-    $COMPOSE_CMD up -d
-    echo -e "${GREEN}✅ $APP_NAME 已启动，访问地址: http://$(curl -s https://api.ipify.org):$PORT${RESET}"
-}
-
-update_app() {
-    echo -e "${GREEN}🔄 正在更新 $APP_NAME ...${RESET}"
-    $COMPOSE_CMD pull
-    $COMPOSE_CMD up -d
-    echo -e "${GREEN}✅ 容器已更新并启动${RESET}"
-}
-
-uninstall_app() {
-    read -p "⚠️ 确认要卸载 $APP_NAME 并删除数据吗？(y/N): " confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        $COMPOSE_CMD down -v
-        rm -f $COMPOSE_FILE
-        echo -e "${GREEN}✅ $APP_NAME 已卸载并清理${RESET}"
-    else
-        echo -e "${GREEN}❌ 已取消${RESET}"
-    fi
-}
-
-logs_app() {
-    docker logs -f $APP_NAME
-}
-
-menu() {
+show_menu() {
     clear
-    echo -e "${GREEN}=== Termix 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装/启动 Termix${RESET}"
-    echo -e "${GREEN}2) 更新 Termix${RESET}"
-    echo -e "${GREEN}3) 卸载 Termix${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}========================${RESET}"
+    echo -e "${GREEN}=== Music Tag 管理菜单 ===${RESET}"
+    echo "1) 安装/启动 Music Tag"
+    echo "2) 更新 Music Tag"
+    echo "3) 卸载 Music Tag"
+    echo "4) 查看日志"
+    echo "0) 退出"
+    echo "==========================="
     read -p "请选择: " choice
     case $choice in
         1) install_app ;;
         2) update_app ;;
         3) uninstall_app ;;
         4) logs_app ;;
-        0) exit 0 ;;
-        *) echo -e "${GREEN}无效选择${RESET}" ;;
+        0) exit ;;
+        *) echo "❌ 无效选择"; sleep 1; show_menu ;;
     esac
 }
 
-check_env
-while true; do
-    menu
-    read -p "按回车键返回菜单..." enter
-done
+install_app() {
+    read -p "请输入音乐目录路径 (默认 /mnt/nas/music): " music_dir
+    music_dir=${music_dir:-/mnt/nas/music}
+
+    read -p "请输入配置文件目录路径 (默认 /opt/music-tag/config): " config_dir
+    config_dir=${config_dir:-/opt/music-tag/config}
+
+    read -p "请输入下载目录路径 (默认 /opt/music-tag/download): " download_dir
+    download_dir=${download_dir:-/opt/music-tag/download}
+
+    mkdir -p "$music_dir" "$config_dir" "$download_dir"
+
+    cat > $YML_FILE <<EOF
+version: '3'
+
+services:
+  music-tag:
+    image: xhongc/music_tag_web:latest
+    container_name: $APP_NAME
+    ports:
+      - "8002:8002"
+    volumes:
+      - ${music_dir}:/app/media
+      - ${config_dir}:/app/data
+      - ${download_dir}:/app/download
+    restart: always
+EOF
+
+    # 保存目录信息，卸载时使用
+    echo "$config_dir" > $CONF_FILE
+    echo "$download_dir" >> $CONF_FILE
+
+    docker compose -f $YML_FILE up -d
+    echo -e "${GREEN}✅ $APP_NAME 已启动，访问地址: http://$(hostname -I | awk '{print $1}'):8002${RESET}"
+    read -p "按回车键返回菜单..."
+    show_menu
+}
+
+update_app() {
+    docker compose -f $YML_FILE pull
+    docker compose -f $YML_FILE up -d
+    echo -e "${GREEN}✅ $APP_NAME 已更新${RESET}"
+    read -p "按回车键返回菜单..."
+    show_menu
+}
+
+uninstall_app() {
+    read -p "⚠️ 确认要卸载 $APP_NAME 吗？(y/N): " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        docker compose -f $YML_FILE down
+        rm -f $YML_FILE
+        echo -e "${GREEN}✅ $APP_NAME 已卸载${RESET}"
+
+        if [[ -f $CONF_FILE ]]; then
+            config_dir=$(sed -n '1p' $CONF_FILE)
+            download_dir=$(sed -n '2p' $CONF_FILE)
+
+            read -p "是否同时删除配置目录 [$config_dir] 和下载目录 [$download_dir]？(y/N): " del_confirm
+            if [[ "$del_confirm" =~ ^[Yy]$ ]]; then
+                rm -rf "$config_dir" "$download_dir"
+                echo -e "${GREEN}✅ 配置目录和下载目录已删除${RESET}"
+            else
+                echo "❌ 已保留配置目录和下载目录"
+            fi
+            rm -f $CONF_FILE
+        fi
+    else
+        echo "❌ 已取消"
+    fi
+    read -p "按回车键返回菜单..."
+    show_menu
+}
+
+logs_app() {
+    docker logs -f $APP_NAME
+    read -p "按回车键返回菜单..."
+    show_menu
+}
+
+show_menu

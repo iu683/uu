@@ -64,6 +64,7 @@ install_app() {
       $IMAGE
 
     echo -e "${GREEN}✅ $APP_NAME 已启动，访问地址: http://$(hostname -I | awk '{print $1}'):$PORT${RESET}"
+    echo -e "${GREEN}✅ $APP_NAME 已启动，初始账号密码：在日志文件中，直接查看即可${RESET}"
     read -p "按回车键返回菜单..."
     show_menu
 }
@@ -92,10 +93,13 @@ update_app() {
 }
 
 uninstall_app() {
-    read -p "⚠️ 确认要卸载 $APP_NAME 吗？(y/N): " confirm
+    read -p "⚠️ 确认要卸载 $APP_NAME 吗？（这将删除所有数据，包括日志和数据库）（y/N): " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        # 停止并删除容器
         docker stop $APP_NAME && docker rm $APP_NAME
-        echo -e "${GREEN}✅ $APP_NAME 已卸载${RESET}"
+        # 删除数据卷（日志和数据库）
+        docker volume rm $LOG_VOLUME $DB_VOLUME
+        echo -e "${GREEN}✅ $APP_NAME 已卸载，所有相关数据已删除${RESET}"
     else
         echo "❌ 已取消"
     fi
@@ -103,9 +107,12 @@ uninstall_app() {
     show_menu
 }
 
+
 logs_app() {
     docker logs -f $APP_NAME
     read -p "按回车键返回菜单..."
     show_menu
+}
 
+# 调用主菜单
 show_menu

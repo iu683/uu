@@ -3,18 +3,30 @@
 GREEN="\033[32m"
 RESET="\033[0m"
 
-APP_NAME="music-tag-web"
-YML_FILE="music-tag-compose.yml"
+APP_NAME="upay_pro"
+LOG_VOLUME="upay_logs"
+DB_VOLUME="upay_db"
+PORT="8090"
+YML_FILE="upay-compose.yml"
 
-# 存储上次安装时的目录（便于卸载时清理）
-CONF_FILE=".music_tag_dirs"
+# 判断架构
+get_arch() {
+    arch=$(uname -m)
+    if [[ "$arch" == "x86_64" ]]; then
+        echo "amd64"
+    elif [[ "$arch" == "aarch64" ]]; then
+        echo "arm64"
+    else
+        echo "unknown"
+    fi
+}
 
 show_menu() {
     clear
-    echo -e "${GREEN}=== Music Tag 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装/启动 Music Tag${RESET}"
-    echo -e "${GREEN}2) 更新 Music Tag${RESET}"
-    echo -e "${GREEN}3) 卸载 Music Tag${RESET}"
+    echo -e "${GREEN}=== Upay 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装/启动 Upay${RESET}"
+    echo -e "${GREEN}2) 更新 Upay${RESET}"
+    echo -e "${GREEN}3) 卸载 Upay${RESET}"
     echo -e "${GREEN}4) 查看日志${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
     echo -e "${GREEN}===========================${RESET}"
@@ -30,51 +42,52 @@ show_menu() {
 }
 
 install_app() {
-    read -p "请输入音乐目录路径 (默认 /mnt/nas/music): " music_dir
-    music_dir=${music_dir:-/mnt/nas/music}
+    arch=$(get_arch)
 
-    read -p "请输入配置文件目录路径 (默认 /opt/music-tag/config): " config_dir
-    config_dir=${config_dir:-/opt/music-tag/config}
+    if [[ "$arch" == "amd64" ]]; then
+        IMAGE="wangergou111/upay:latest"
+    elif [[ "$arch" == "arm64" ]]; then
+        IMAGE="wangergou111/upay:latest-arm64"
+    else
+        echo "❌ 未识别的架构，无法选择镜像！"
+        exit 1
+    fi
 
-    read -p "请输入下载目录路径 (默认 /opt/music-tag/download): " download_dir
-    download_dir=${download_dir:-/opt/music-tag/download}
+    echo -e "${GREEN}🚀 正在安装并启动 $APP_NAME (镜像: $IMAGE)...${RESET}"
 
-    read -p "请输入访问端口 (默认 8002): " port
-    port=${port:-8002}
+    docker run -d \
+      --name $APP_NAME \
+      -p $PORT:8090 \
+      -v $LOG_VOLUME:/app/logs \
+      -v $DB_VOLUME:/app/DBS \
+      --restart always \
+      $IMAGE
 
-    mkdir -p "$music_dir" "$config_dir" "$download_dir"
-
-    cat > $YML_FILE <<EOF
-version: '3'
-
-services:
-  music-tag:
-    image: xhongc/music_tag_web:latest
-    container_name: $APP_NAME
-    ports:
-      - "${port}:8002"
-    volumes:
-      - ${music_dir}:/app/media
-      - ${config_dir}:/app/data
-      - ${download_dir}:/app/download
-    restart: always
-EOF
-
-    # 保存目录信息和端口
-    echo "$config_dir" > $CONF_FILE
-    echo "$download_dir" >> $CONF_FILE
-    echo "$port" >> $CONF_FILE
-
-    docker compose -f $YML_FILE up -d
-    echo -e "${GREEN}✅ $APP_NAME 已启动，访问地址: http://$(hostname -I | awk '{print $1}'):${port}${RESET}"
+    echo -e "${GREEN}✅ $APP_NAME 已启动，访问地址: http://$(hostname -I | awk '{print $1}'):$PORT${RESET}"
+    echo -e "${GREEN}✅ $APP_NAME 已启动，初始账号密码：在日志文件中，直接查看即可${RESET}"
     read -p "按回车键返回菜单..."
     show_menu
 }
 
 update_app() {
-    docker compose -f $YML_FILE pull
-    docker compose -f $YML_FILE up -d
-    echo -e "${GREEN}✅ $APP_NAME 已更新${RESET}"
+    arch=$(get_arch)
+
+    if [[ "$arch" == "amd64" ]]; then
+        IMAGE="wangergou111/upay:latest"
+    elif [[ "$arch" == "arm64" ]]; then
+        IMAGE="wangergou111/upay:latest-arm64"
+    else
+        echo "❌ 未识别的架构，无法选择镜像！"
+        exit 1
+    fi
+
+    echo -e "${GREEN}🔄 正在更新 $APP_NAME...${RESET}"
+
+    docker pull $IMAGE
+    docker stop $APP_NAME && docker rm $APP_NAME
+    install_app
+
+    echo -e "${GREEN}✅ $APP_NAME 已更新并启动${RESET}"
     read -p "按回车键返回菜单..."
     show_menu
 }
@@ -82,24 +95,8 @@ update_app() {
 uninstall_app() {
     read -p "⚠️ 确认要卸载 $APP_NAME 吗？(y/N): " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        docker compose -f $YML_FILE down
-        rm -f $YML_FILE
+        docker stop $APP_NAME && docker rm $APP_NAME
         echo -e "${GREEN}✅ $APP_NAME 已卸载${RESET}"
-
-        if [[ -f $CONF_FILE ]]; then
-            config_dir=$(sed -n '1p' $CONF_FILE)
-            download_dir=$(sed -n '2p' $CONF_FILE)
-            port=$(sed -n '3p' $CONF_FILE)
-
-            read -p "是否同时删除配置目录 [$config_dir] 和下载目录 [$download_dir]？(y/N): " del_confirm
-            if [[ "$del_confirm" =~ ^[Yy]$ ]]; then
-                rm -rf "$config_dir" "$download_dir"
-                echo -e "${GREEN}✅ 配置目录和下载目录已删除${RESET}"
-            else
-                echo "❌ 已保留配置目录和下载目录"
-            fi
-            rm -f $CONF_FILE
-        fi
     else
         echo "❌ 已取消"
     fi
@@ -113,4 +110,5 @@ logs_app() {
     show_menu
 }
 
+# 调用主菜单
 show_menu

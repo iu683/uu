@@ -1,99 +1,122 @@
 #!/bin/bash
+# QMediaSync 一键管理脚本
 
 GREEN="\033[32m"
 RESET="\033[0m"
 
-APP_NAME="OCI-Start"
-SCRIPT_URL="https://raw.githubusercontent.com/doubleDimple/shell-tools/master/oci-start.sh"
-SCRIPT_NAME="oci-start.sh"
+APP_NAME="qmediasync"
+YML_FILE="qmediasync-compose.yml"
 
-# 创建文件夹并下载脚本
-setup_script() {
-    echo -e "${GREEN}🚀 正在设置脚本...${RESET}"
-    mkdir -p oci-start && cd oci-start
-    wget -O $SCRIPT_NAME $SCRIPT_URL
-    chmod +x $SCRIPT_NAME
-    echo -e "${GREEN}✅ 脚本下载并设置完毕${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
+CONFIG_DIR="/vol1/1000/docker/qmediasync/config"
+MEDIA_DIR="/vol2/1000/网盘"
+
+# 获取公网IP
+get_ip() {
+    curl -s ipv4.icanhazip.com || curl -s ifconfig.me
 }
 
-# 安装应用
-install_app() {
-    ./oci-start.sh install
-    echo -e "${GREEN}✅ 应用已安装${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
+create_compose() {
+    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$MEDIA_DIR"
+
+    cat > $YML_FILE <<EOF
+version: "3.8"
+
+services:
+  qmediasync:
+    image: qicfan/qmediasync:latest
+    container_name: qmediasync
+    restart: unless-stopped
+    ports:
+      - "12333:12333"
+      - "8095:8095"
+      - "8094:8094"
+    volumes:
+      - $CONFIG_DIR:/app/config
+      - $MEDIA_DIR:/media
+    environment:
+      - TZ=Asia/Shanghai
+
+networks:
+  default:
+    name: qmediasync
+EOF
 }
 
-# 启动应用
-start_app() {
-    ./oci-start.sh start
-    echo -e "${GREEN}✅ 应用已启动${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 停止应用
-stop_app() {
-    ./oci-start.sh stop
-    echo -e "${GREEN}✅ 应用已停止${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 重启应用
-restart_app() {
-    ./oci-start.sh restart
-    echo -e "${GREEN}✅ 应用已重启${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 更新应用
-update_app() {
-    ./oci-start.sh update
-    echo -e "${GREEN}✅ 应用已更新到最新版本${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 卸载应用
-uninstall_app() {
-    read -p "⚠️ 确认要完全卸载应用吗？(y/N): " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        ./oci-start.sh uninstall
-        echo -e "${GREEN}✅ 应用已完全卸载${RESET}"
-    else
-        echo "❌ 卸载操作已取消"
-    fi
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 显示主菜单
 show_menu() {
-    clear
-    echo -e "${GREEN}=== OCI-Start 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装应用${RESET}"
-    echo -e "${GREEN}2) 启动应用${RESET}"
-    echo -e "${GREEN}3) 停止应用${RESET}"
-    echo -e "${GREEN}4) 重启应用${RESET}"
-    echo -e "${GREEN}5) 更新应用${RESET}"
-    echo -e "${GREEN}6) 卸载应用${RESET}"
+    echo -e "${GREEN}=== QMediaSync 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装并启动 QMediaSync${RESET}"
+    echo -e "${GREEN}2) 停止 QMediaSync${RESET}"
+    echo -e "${GREEN}3) 启动 QMediaSync${RESET}"
+    echo -e "${GREEN}4) 重启 QMediaSync${RESET}"
+    echo -e "${GREEN}5) 更新 QMediaSync${RESET}"
+    echo -e "${GREEN}6) 查看日志${RESET}"
+    echo -e "${GREEN}7) 卸载 QMediaSync${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}===========================${RESET}"
+    echo -e "${GREEN}==========================${RESET}"
     read -p "请选择: " choice
+}
+
+print_access_info() {
+    local ip=$(get_ip)
+    echo -e "🌐 访问地址: ${GREEN}http://$ip:12333${RESET}"
+    echo -e "👤 默认用户: ${GREEN}admin${RESET}"
+    echo -e "🔑 默认密码: ${GREEN}admin123${RESET}"
+}
+
+install_app() {
+    create_compose
+    docker compose -f $YML_FILE up -d
+    echo -e "✅ ${GREEN}QMediaSync 已安装并启动${RESET}"
+    print_access_info
+}
+
+stop_app() {
+    docker compose -f $YML_FILE down
+    echo -e "🛑 ${GREEN}QMediaSync 已停止${RESET}"
+}
+
+start_app() {
+    docker compose -f $YML_FILE up -d
+    echo -e "🚀 ${GREEN}QMediaSync 已启动${RESET}"
+    print_access_info
+}
+
+restart_app() {
+    docker compose -f $YML_FILE down
+    docker compose -f $YML_FILE up -d
+    echo -e "🔄 ${GREEN}QMediaSync 已重启${RESET}"
+    print_access_info
+}
+
+update_app() {
+    docker compose -f $YML_FILE pull
+    docker compose -f $YML_FILE up -d
+    echo -e "⬆️ ${GREEN}QMediaSync 已更新到最新版本${RESET}"
+    print_access_info
+}
+
+logs_app() {
+    docker logs -f $APP_NAME
+}
+
+uninstall_app() {
+    docker compose -f $YML_FILE down
+    rm -f $YML_FILE
+    echo -e "🗑️ ${GREEN}QMediaSync 已卸载 (数据目录保留在 $CONFIG_DIR 和 $MEDIA_DIR)${RESET}"
+}
+
+while true; do
+    show_menu
     case $choice in
-        1) setup_script ;;
-        2) start_app ;;
-        3) stop_app ;;
+        1) install_app ;;
+        2) stop_app ;;
+        3) start_app ;;
         4) restart_app ;;
         5) update_app ;;
-        6) uninstall_app ;;
-        0) exit ;;
-        *) echo "❌ 无效选择"; sleep 1; show_menu ;;
+        6) logs_app ;;
+        7) uninstall_app ;;
+        0) exit 0 ;;
+        *) echo -e "❌ ${GREEN}无效选择${RESET}" ;;
     esac
-}
-
-show_menu
+done

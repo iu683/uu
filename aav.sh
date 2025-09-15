@@ -1,113 +1,124 @@
 #!/bin/bash
+# QMediaSync 一键管理脚本
 
 GREEN="\033[32m"
 RESET="\033[0m"
 
-APP_NAME="upay_pro"
-LOG_VOLUME="upay_logs"
-DB_VOLUME="upay_db"
-PORT="8090"
-YML_FILE="upay-compose.yml"
+APP_NAME="qmediasync"
+BASE_DIR="/opt/qmediasync"
+CONFIG_DIR="$BASE_DIR/config"
+MEDIA_DIR="$BASE_DIR/media"
+YML_FILE="$BASE_DIR/qmediasync-compose.yml"
 
-# 判断架构
-get_arch() {
-    arch=$(uname -m)
-    if [[ "$arch" == "x86_64" ]]; then
-        echo "amd64"
-    elif [[ "$arch" == "aarch64" ]]; then
-        echo "arm64"
-    else
-        echo "unknown"
-    fi
+# 获取公网IP
+get_ip() {
+    curl -s ipv4.icanhazip.com || curl -s ifconfig.me
+}
+
+create_compose() {
+    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$MEDIA_DIR"
+    mkdir -p "$BASE_DIR"
+
+    cat > $YML_FILE <<EOF
+version: "3.8"
+
+services:
+  qmediasync:
+    image: qicfan/qmediasync:latest
+    container_name: qmediasync
+    restart: unless-stopped
+    ports:
+      - "12333:12333"
+      - "8095:8095"
+      - "8094:8094"
+    volumes:
+      - $CONFIG_DIR:/app/config
+      - $MEDIA_DIR:/media
+    environment:
+      - TZ=Asia/Shanghai
+
+networks:
+  default:
+    name: qmediasync
+EOF
 }
 
 show_menu() {
-    clear
-    echo -e "${GREEN}=== Upay 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装/启动 Upay${RESET}"
-    echo -e "${GREEN}2) 更新 Upay${RESET}"
-    echo -e "${GREEN}3) 卸载 Upay${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}=== QMediaSync 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装并启动 QMediaSync${RESET}"
+    echo -e "${GREEN}2) 停止 QMediaSync${RESET}"
+    echo -e "${GREEN}3) 启动 QMediaSync${RESET}"
+    echo -e "${GREEN}4) 重启 QMediaSync${RESET}"
+    echo -e "${GREEN}5) 更新 QMediaSync${RESET}"
+    echo -e "${GREEN}6) 查看日志${RESET}"
+    echo -e "${GREEN}7) 卸载 QMediaSync（含数据）${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}===========================${RESET}"
+    echo -e "${GREEN}==========================${RESET}"
     read -p "请选择: " choice
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
-        4) logs_app ;;
-        0) exit ;;
-        *) echo "❌ 无效选择"; sleep 1; show_menu ;;
-    esac
+}
+
+print_access_info() {
+    local ip=$(get_ip)
+    echo -e "🌐 访问地址: ${GREEN}http://$ip:12333${RESET}"
+    echo -e "👤 默认用户: ${GREEN}admin${RESET}"
+    echo -e "🔑 默认密码: ${GREEN}admin123${RESET}"
 }
 
 install_app() {
-    arch=$(get_arch)
+    create_compose
+    docker compose -f $YML_FILE up -d
+    echo -e "✅ ${GREEN}QMediaSync 已安装并启动${RESET}"
+    print_access_info
+}
 
-    if [[ "$arch" == "amd64" ]]; then
-        IMAGE="wangergou111/upay:latest"
-    elif [[ "$arch" == "arm64" ]]; then
-        IMAGE="wangergou111/upay:latest-arm64"
-    else
-        echo "❌ 未识别的架构，无法选择镜像！"
-        exit 1
-    fi
+stop_app() {
+    docker compose -f $YML_FILE down
+    echo -e "🛑 ${GREEN}QMediaSync 已停止${RESET}"
+}
 
-    echo -e "${GREEN}🚀 正在安装并启动 $APP_NAME (镜像: $IMAGE)...${RESET}"
+start_app() {
+    docker compose -f $YML_FILE up -d
+    echo -e "🚀 ${GREEN}QMediaSync 已启动${RESET}"
+    print_access_info
+}
 
-    docker run -d \
-      --name $APP_NAME \
-      -p $PORT:8090 \
-      -v $LOG_VOLUME:/app/logs \
-      -v $DB_VOLUME:/app/DBS \
-      --restart always \
-      $IMAGE
-
-    echo -e "${GREEN}✅ $APP_NAME 已启动，访问地址: http://$(hostname -I | awk '{print $1}'):$PORT${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
+restart_app() {
+    docker compose -f $YML_FILE down
+    docker compose -f $YML_FILE up -d
+    echo -e "🔄 ${GREEN}QMediaSync 已重启${RESET}"
+    print_access_info
 }
 
 update_app() {
-    arch=$(get_arch)
-
-    if [[ "$arch" == "amd64" ]]; then
-        IMAGE="wangergou111/upay:latest"
-    elif [[ "$arch" == "arm64" ]]; then
-        IMAGE="wangergou111/upay:latest-arm64"
-    else
-        echo "❌ 未识别的架构，无法选择镜像！"
-        exit 1
-    fi
-
-    echo -e "${GREEN}🔄 正在更新 $APP_NAME...${RESET}"
-
-    docker pull $IMAGE
-    docker stop $APP_NAME && docker rm $APP_NAME
-    install_app
-
-    echo -e "${GREEN}✅ $APP_NAME 已更新并启动${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-uninstall_app() {
-    read -p "⚠️ 确认要卸载 $APP_NAME 吗？(y/N): " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        docker stop $APP_NAME && docker rm $APP_NAME
-        echo -e "${GREEN}✅ $APP_NAME 已卸载${RESET}"
-    else
-        echo "❌ 已取消"
-    fi
-    read -p "按回车键返回菜单..."
-    show_menu
+    docker compose -f $YML_FILE pull
+    docker compose -f $YML_FILE up -d
+    echo -e "⬆️ ${GREEN}QMediaSync 已更新到最新版本${RESET}"
+    print_access_info
 }
 
 logs_app() {
     docker logs -f $APP_NAME
-    read -p "按回车键返回菜单..."
-    show_menu
 }
 
-# 调用主菜单
-show_menu
+uninstall_app() {
+    docker compose -f $YML_FILE down
+    rm -f $YML_FILE
+    rm -rf "$CONFIG_DIR" "$MEDIA_DIR"
+    echo -e "🗑️ ${GREEN}QMediaSync 已卸载，数据目录也已删除${RESET}"
+}
+
+while true; do
+    show_menu
+    case $choice in
+        1) install_app ;;
+        2) stop_app ;;
+        3) start_app ;;
+        4) restart_app ;;
+        5) update_app ;;
+        6) logs_app ;;
+        7) uninstall_app ;;
+        0) exit 0 ;;
+        *) echo -e "❌ ${GREEN}无效选择${RESET}" ;;
+    esac
+done

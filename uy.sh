@@ -1,161 +1,210 @@
 #!/bin/bash
+# EmbyServer 一键部署与更新菜单脚本（绿色菜单、官方镜像、强制root、GPU加速、显示公网IP）
 
-GREEN="\033[32m"
-RESET="\033[0m"
-gl_huang="\033[33m"
-gl_bai="\033[97m"
-gl_lv="\033[34m"
+GREEN='\033[0;32m'
+RESET='\033[0m'
 
-docker_name="wireguard"
-docker_img="lscr.io/linuxserver/wireguard:latest"
-docker_port=8097
+DEFAULT_CONTAINER_NAME="emby"
+DEFAULT_DATA_DIR="$HOME/emby"
+DEFAULT_HTTP_PORT="8096"
+IMAGE_NAME="emby/embyserver:latest"
+CONFIG_FILE="$HOME/.emby_config"
 
-# 默认值
-DEFAULT_COUNT=5
-DEFAULT_NETWORK="10.13.13.0"
+CONTAINER_NAME=""
+DATA_DIR=""
+HTTP_PORT=""
 
-# 获取当前配置
-COUNT=${DEFAULT_COUNT}
-NETWORK=${DEFAULT_NETWORK}
-
-show_menu() {
-    clear
-    echo -e "${GREEN}=== WireGuard VPN 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装/启动 WireGuard 服务${RESET}"
-    echo -e "${GREEN}2) 更新 WireGuard 服务${RESET}"
-    echo -e "${GREEN}3) 查看所有客户端配置${RESET}"
-    echo -e "${GREEN}4) 修改客户端数量和网段${RESET}"
-    echo -e "${GREEN}5) 卸载 WireGuard 服务${RESET}"
-    echo -e "${GREEN}6) 退出${RESET}"
-    read -e -p "请输入选项 (1-6): " option
-    case $option in
-        1) install_start_wireguard ;;
-        2) update_wireguard ;;
-        3) view_client_configs ;;
-        4) modify_config ;;
-        5) stop_wireguard ;;
-        6) exit 0 ;;
-        *) echo -e "${gl_huang}无效选项，请重新选择！${gl_bai}" && sleep 2 && show_menu ;;
+# 检查 Docker 是否安装
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${GREEN}错误: Docker 未安装，请先安装 Docker${RESET}"
+        exit 1
+    fi
+}
+# 检测 CPU 架构，自动选择镜像
+get_arch() {
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)   IMAGE_NAME="emby/embyserver" ;;
+        aarch64)  IMAGE_NAME="emby/embyserver_arm64v8" ;;
+        arm64)    IMAGE_NAME="emby/embyserver_arm64v8" ;;
+        *)        echo -e "${GREEN}未知架构: $arch，默认使用 amd64 镜像${RESET}"
+                  IMAGE_NAME="emby/embyserver"
+                  ;;
     esac
 }
 
-install_start_wireguard() {
-    echo -e "${gl_huang}当前配置: ${gl_bai}客户端数量 = $COUNT, 网段 = $NETWORK"
-    
-    PEERS=$(seq -f "wg%02g" 1 "$COUNT" | paste -sd,)
+# 获取公网 IP
+get_public_ip() {
+    PUBLIC_IP=$(curl -s https://ipinfo.io/ip)
+    if ! [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        PUBLIC_IP=$(curl -s https://ifconfig.me/ip)
+    fi
+    if ! [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        PUBLIC_IP=""
+    fi
+    echo "$PUBLIC_IP"
+}
 
-    ip link delete wg0 &>/dev/null
+# 读取或输入配置
+load_or_input_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    fi
+
+    read -p "请输入容器名 [${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}]: " input_container
+    CONTAINER_NAME=${input_container:-${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}}
+
+    read -p "请输入统一存放目录（配置+媒体） [${DATA_DIR:-$DEFAULT_DATA_DIR}]: " input_dir
+    DATA_DIR=${input_dir:-${DATA_DIR:-$DEFAULT_DATA_DIR}}
+
+    read -p "请输入宿主机 HTTP 映射端口 [${HTTP_PORT:-$DEFAULT_HTTP_PORT}]: " input_port
+    HTTP_PORT=${input_port:-${HTTP_PORT:-$DEFAULT_HTTP_PORT}}
+
+    # 保存当前配置
+    echo "CONTAINER_NAME=\"$CONTAINER_NAME\"" > "$CONFIG_FILE"
+    echo "DATA_DIR=\"$DATA_DIR\"" >> "$CONFIG_FILE"
+    echo "HTTP_PORT=\"$HTTP_PORT\"" >> "$CONFIG_FILE"
+}
+
+# 创建数据目录
+create_dirs() {
+    mkdir -p "$DATA_DIR/config" "$DATA_DIR/media"
+    echo -e "${GREEN}目录已创建: $DATA_DIR${RESET}"
+    chmod -R 755 "$DATA_DIR"
+}
+
+# 判断 GPU 是否可用
+gpu_args() {
+    if [ -d /dev/dri ]; then
+        echo "--device /dev/dri:/dev/dri"
+    else
+        echo ""
+    fi
+}
+
+# 部署 EmbyServer
+deploy_emby() {
+    load_or_input_config
+    create_dirs
+    echo -e "${GREEN}正在部署 EmbyServer 容器...${RESET}"
 
     docker run -d \
-      --name=wireguard \
-      --network host \
-      --cap-add=NET_ADMIN \
-      --cap-add=SYS_MODULE \
-      -e PUID=1000 \
-      -e PGID=1000 \
-      -e TZ=Etc/UTC \
-      -e SERVERURL=$(curl -s https://api.ipify.org) \
-      -e SERVERPORT=51820 \
-      -e PEERS=${PEERS} \
-      -e INTERNAL_SUBNET=${NETWORK} \
-      -e ALLOWEDIPS=${NETWORK}/24 \
-      -e PERSISTENTKEEPALIVE_PEERS=all \
-      -e LOG_CONFS=true \
-      -v /home/docker/wireguard/config:/config \
-      -v /lib/modules:/lib/modules \
-      --restart=always \
-      lscr.io/linuxserver/wireguard:latest
+        --name $CONTAINER_NAME \
+        --restart unless-stopped \
+        -e TZ=Asia/Shanghai \
+        -e UID=0 \
+        -e GID=0 \
+        -e GIDLIST=0 \
+        -p $HTTP_PORT:8096 \
+        -p 8920:8920 \
+        -v $DATA_DIR/config:/config \
+        -v $DATA_DIR/media:/mnt/share1 \
+        $(gpu_args) \
+        $IMAGE_NAME
 
-    sleep 3
-    docker exec wireguard sh -c "
-    f='/config/wg_confs/wg0.conf'
-    sed -i 's/51820/${docker_port}/g' \$f
-    "
-
-    docker exec wireguard sh -c "
-    for d in /config/peer_*; do
-      sed -i 's/51820/${docker_port}/g' \$d/*.conf
-    done
-    "
-
-    docker exec wireguard sh -c '
-    for d in /config/peer_*; do
-      sed -i "/^DNS/d" "$d"/*.conf
-    done
-    '
-
-    docker exec wireguard sh -c '
-    for d in /config/peer_*; do
-      for f in "$d"/*.conf; do
-        grep -q "^PersistentKeepalive" "$f" || \
-        sed -i "/^AllowedIPs/ a PersistentKeepalive = 25" "$f"
-      done
-    done
-    '
-
-    docker exec -it wireguard bash -c '
-    for d in /config/peer_*; do
-      cd "$d" || continue
-      conf_file=$(ls *.conf)
-      base_name="${conf_file%.conf}"
-      qrencode -o "$base_name.png" < "$conf_file"
-    done
-    '
-
-    docker restart wireguard
-
-    sleep 2
-    echo
-    echo -e "${gl_huang}所有客户端二维码配置: ${gl_bai}"
-    docker exec -it wireguard bash -c 'for i in $(ls /config | grep peer_ | sed "s/peer_//"); do echo "--- $i ---"; /app/show-peer $i; done'
-    sleep 2
-    echo
-    echo -e "${gl_huang}所有客户端配置代码: ${gl_bai}"
-    docker exec wireguard sh -c 'for d in /config/peer_*; do echo "# $(basename $d) "; cat $d/*.conf; echo; done'
-    sleep 2
-    echo -e "${gl_lv}${COUNT}个客户端配置全部输出，使用方法如下：${gl_bai}"
-    echo -e "${gl_lv}1. 手机下载wg的APP，扫描上方二维码，可以快速连接网络${gl_bai}"
-    echo -e "${gl_lv}2. Windows下载客户端，复制配置代码连接网络。${gl_bai}"
-    echo -e "${gl_lv}3. Linux用脚本部署WG客户端，复制配置代码连接网络。${gl_bai}"
-    echo -e "${gl_lv}官方客户端下载方式: https://www.wireguard.com/install/${gl_bai}"
-    read -p "按任意键返回主菜单..." && show_menu
+    PUBLIC_IP=$(get_public_ip)
+    if [[ $PUBLIC_IP != "无法获取公网 IP" ]]; then
+        echo -e "${GREEN}部署完成！公网访问地址: http://${PUBLIC_IP}:${HTTP_PORT}${RESET}"
+    else
+        echo -e "${GREEN}部署完成，但未能获取公网 IP，请使用内网访问${RESET}"
+    fi
 }
 
-update_wireguard() {
-    echo "更新 WireGuard 服务..."
-    docker pull lscr.io/linuxserver/wireguard:latest
-    docker stop wireguard
-    docker rm wireguard
-    install_start_wireguard
+# 启动、停止、删除、查看日志
+start_emby() { docker start $CONTAINER_NAME && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_emby() { docker stop $CONTAINER_NAME && echo -e "${GREEN}容器已停止${RESET}"; }
+remove_emby() { docker rm -f $CONTAINER_NAME && echo -e "${GREEN}容器已删除${RESET}"; }
+view_logs() { docker logs -f $CONTAINER_NAME; }
+
+# 卸载所有数据
+uninstall_all() {
+    stop_emby
+    remove_emby
+    if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
+        read -p "确定要删除 $DATA_DIR 吗？此操作不可恢复 [y/N]: " confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            rm -rf "$DATA_DIR"
+            echo -e "${GREEN}数据目录已删除${RESET}"
+        fi
+    fi
+    [ -f "$CONFIG_FILE" ] && rm -f "$CONFIG_FILE" && echo -e "${GREEN}配置文件已删除${RESET}"
 }
 
-view_client_configs() {
-    echo "查看所有客户端配置..."
-    docker exec wireguard sh -c 'for d in /config/peer_*; do echo "# $(basename $d) "; cat $d/*.conf; done'
-    read -p "按任意键返回主菜单..." && show_menu
+# 更新镜像并重启容器
+update_image() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    else
+        echo -e "${GREEN}配置文件不存在，请先部署容器${RESET}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}正在拉取最新镜像: $IMAGE_NAME ...${RESET}"
+    docker pull $IMAGE_NAME
+
+    if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
+        echo -e "${GREEN}停止正在运行的容器...${RESET}"
+        docker stop $CONTAINER_NAME
+    fi
+
+    if [ "$(docker ps -a -q -f name=$CONTAINER_NAME)" ]; then
+        echo -e "${GREEN}删除旧容器（保留数据）...${RESET}"
+        docker rm $CONTAINER_NAME
+    fi
+
+    echo -e "${GREEN}使用最新镜像重启容器...${RESET}"
+    docker run -d \
+        --name $CONTAINER_NAME \
+        --restart unless-stopped \
+        -e TZ=Asia/Shanghai \
+        -e UID=0 \
+        -e GID=0 \
+        -e GIDLIST=0 \
+        -p $HTTP_PORT:8096 \
+        -p 8920:8920 \
+        -v $DATA_DIR/config:/config \
+        -v $DATA_DIR/media:/mnt/share1 \
+        $(gpu_args) \
+        $IMAGE_NAME
+
+    PUBLIC_IP=$(get_public_ip)
+    if [[ $PUBLIC_IP != "无法获取公网 IP" ]]; then
+        echo -e "${GREEN}更新完成！公网访问地址: http://${PUBLIC_IP}:${HTTP_PORT}${RESET}"
+    else
+        echo -e "${GREEN}更新完成，但未能获取公网 IP，请使用内网访问${RESET}"
+    fi
 }
 
-stop_wireguard() {
-    echo "停止 WireGuard 服务..."
-    docker stop wireguard
-    docker rm wireguard
-    read -p "按任意键返回主菜单..." && show_menu
+# 显示菜单
+show_menu() {
+    echo -e "${GREEN}===== EMBY一键部署与更新菜单 =====${RESET}"
+    echo -e "${GREEN}1.部署 EmbyServer${RESET}"
+    echo -e "${GREEN}2.启动容器${RESET}"
+    echo -e "${GREEN}3.停止容器${RESET}"
+    echo -e "${GREEN}4.删除容器${RESET}"
+    echo -e "${GREEN}5.查看日志${RESET}"
+    echo -e "${GREEN}6.卸载全部数据（容器+统一目录+配置文件)${RESET}"
+    echo -e "${GREEN}7.更新镜像并重启容器${RESET}"
+    echo -e "${GREEN}0.退出${RESET}"
+    echo -n "请输入编号: "
 }
 
-modify_config() {
-    echo -e "${gl_huang}当前配置: ${gl_bai}客户端数量 = $COUNT, 网段 = $NETWORK"
-    
-    # 修改客户端数量
-    read -e -p "请输入新的客户端数量 (默认 ${DEFAULT_COUNT}): " new_count
-    COUNT=${new_count:-$DEFAULT_COUNT}
+# 主循环
+check_docker
 
-    # 修改网段
-    read -e -p "请输入新的 WireGuard 网段 (默认 ${DEFAULT_NETWORK}): " new_network
-    NETWORK=${new_network:-$DEFAULT_NETWORK}
-
-    echo -e "${gl_huang}新配置: ${gl_bai}客户端数量 = $COUNT, 网段 = $NETWORK"
-    read -p "按任意键返回主菜单..." && show_menu
-}
-
-# 启动菜单
-show_menu
+while true; do
+    show_menu
+    read choice
+    case $choice in
+        1) deploy_emby ;;
+        2) start_emby ;;
+        3) stop_emby ;;
+        4) remove_emby ;;
+        5) view_logs ;;
+        6) uninstall_all ;;
+        7) update_image ;;
+        0) echo "退出脚本"; exit 0 ;;
+        *) echo -e "${GREEN}无效选项${RESET}" ;;
+    esac
+done

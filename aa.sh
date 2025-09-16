@@ -1,120 +1,184 @@
 #!/bin/bash
+# EmbyServer 一键部署与更新菜单脚本（绿色菜单、更新镜像重启、显示公网IP）
 
-GREEN="\033[32m"
-RESET="\033[0m"
+GREEN='\033[0;32m'
+RESET='\033[0m'
 
-APP_NAME="danmu-api"
-IMAGE_NAME="logvar/danmu-api:latest"
-PORT_FILE="./danmu_port.conf"
-TOKEN_FILE="./danmu_token.conf"
-DEFAULT_TOKEN="87654321"
+DEFAULT_CONTAINER_NAME="amilys_embyserver"
+DEFAULT_DATA_DIR="/data/emby"
+DEFAULT_HTTP_PORT="7568"
+CONFIG_FILE="$HOME/.emby_config"
 
-# 获取公网IP
-get_public_ip() {
-    curl -s ifconfig.me || curl -s ipinfo.io/ip
-}
+CONTAINER_NAME=""
+DATA_DIR=""
+HTTP_PORT=""
+IMAGE_NAME=""
 
-# 安装/启动容器（含拉取镜像）
-install_app() {
-    echo -e "${GREEN}🚀 正在拉取最新镜像...${RESET}"
-    docker pull $IMAGE_NAME
-
-    # 读取 TOKEN
-    if [ -f "$TOKEN_FILE" ]; then
-        TOKEN=$(cat "$TOKEN_FILE")
-    else
-        read -p "请输入 TOKEN (默认: $DEFAULT_TOKEN): " TOKEN
-        TOKEN=${TOKEN:-$DEFAULT_TOKEN}
-        echo "$TOKEN" > "$TOKEN_FILE"
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${GREEN}错误: Docker 未安装，请先安装 Docker${RESET}"
+        exit 1
     fi
-
-    # 读取端口
-    if [ -f "$PORT_FILE" ]; then
-        PORT=$(cat "$PORT_FILE")
-    else
-        read -p "请输入映射端口 (默认 9321): " PORT
-        PORT=${PORT:-9321}
-        echo "$PORT" > "$PORT_FILE"
-    fi
-
-    # 如果容器存在，先删除
-    if docker ps -a --format '{{.Names}}' | grep -q "^${APP_NAME}$"; then
-        docker stop $APP_NAME && docker rm $APP_NAME
-    fi
-
-    echo -e "${GREEN}🚀 正在运行容器 (端口: $PORT, TOKEN: $TOKEN)...${RESET}"
-    docker run -d --name $APP_NAME -p $PORT:9321 -e TOKEN="$TOKEN" $IMAGE_NAME
-
-    IP=$(get_public_ip)
-    echo -e "${GREEN}✅ $APP_NAME 已启动${RESET}"
-    echo -e "${GREEN}访问地址: http://$IP:$PORT${RESET}"
-    echo -e "${GREEN}TOKEN: $TOKEN${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
 }
 
-# 更新容器
-update_app() {
-    echo -e "${GREEN}🔄 正在更新 $APP_NAME...${RESET}"
-    docker stop $APP_NAME && docker rm $APP_NAME
-    install_app
-}
-
-# 卸载容器
-uninstall_app() {
-    read -p "⚠️ 确认要卸载 $APP_NAME 并删除配置吗？(y/N): " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        docker stop $APP_NAME && docker rm $APP_NAME
-        rm -f $TOKEN_FILE $PORT_FILE
-        echo -e "${GREEN}✅ $APP_NAME 已卸载并清理${RESET}"
-    else
-        echo -e "${GREEN}❌ 已取消${RESET}"
-    fi
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 查看日志
-show_logs() {
-    docker logs -f $APP_NAME
-}
-
-# 查看配置信息
-show_config() {
-    PORT=$(cat "$PORT_FILE" 2>/dev/null || echo "未设置")
-    TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null || echo "未设置")
-    IP=$(get_public_ip)
-
-    echo -e "${GREEN}=== 当前配置 ===${RESET}"
-    echo -e "${GREEN}公网IP: $IP${RESET}"
-    echo -e "${GREEN}端口:   $PORT${RESET}"
-    echo -e "${GREEN}TOKEN:  $TOKEN${RESET}"
-    echo -e "${GREEN}=================${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 菜单
-show_menu() {
-    clear
-    echo -e "${GREEN}=== Danmu-API 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装/启动 Danmu-API${RESET}"
-    echo -e "${GREEN}2) 更新 Danmu-API${RESET}"
-    echo -e "${GREEN}3) 卸载 Danmu-API${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 查看当前配置${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}===========================${RESET}"
-    read -p "请选择: " choice
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
-        4) show_logs ;;
-        5) show_config ;;
-        0) exit ;;
-        *) echo "❌ 无效选择"; sleep 1; show_menu ;;
+# 检测 CPU 架构，自动选择镜像
+get_arch() {
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)   IMAGE_NAME="amilys/embyserver" ;;
+        aarch64)  IMAGE_NAME="amilys/embyserver_arm64v8" ;;
+        arm64)    IMAGE_NAME="amilys/embyserver_arm64v8" ;;
+        *)        echo -e "${GREEN}未知架构: $arch，默认使用 amd64 镜像${RESET}"
+                  IMAGE_NAME="amilys/embyserver"
+                  ;;
     esac
 }
 
-show_menu
+get_public_ip() {
+    PUBLIC_IP=$(curl -s https://ipinfo.io/ip)
+    if ! [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        PUBLIC_IP=$(curl -s https://ifconfig.me/ip)
+    fi
+    if ! [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        PUBLIC_IP=""
+    fi
+    echo "$PUBLIC_IP"
+}
+
+load_or_input_config() {
+    # 如果存在旧配置文件则读取默认值
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    fi
+
+    read -p "请输入容器名 [${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}]: " input_container
+    CONTAINER_NAME=${input_container:-${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}}
+
+    read -p "请输入统一存放目录（配置+媒体） [${DATA_DIR:-$DEFAULT_DATA_DIR}]: " input_dir
+    DATA_DIR=${input_dir:-${DATA_DIR:-$DEFAULT_DATA_DIR}}
+
+    read -p "请输入宿主机 HTTP 映射端口 [${HTTP_PORT:-$DEFAULT_HTTP_PORT}]: " input_port
+    HTTP_PORT=${input_port:-${HTTP_PORT:-$DEFAULT_HTTP_PORT}}
+
+    # 保存当前配置
+    echo "CONTAINER_NAME=\"$CONTAINER_NAME\"" > "$CONFIG_FILE"
+    echo "DATA_DIR=\"$DATA_DIR\"" >> "$CONFIG_FILE"
+    echo "HTTP_PORT=\"$HTTP_PORT\"" >> "$CONFIG_FILE"
+}
+
+create_dirs() {
+    [ ! -d "$DATA_DIR" ] && mkdir -p "$DATA_DIR"
+}
+
+deploy_emby() {
+    load_or_input_config
+    create_dirs
+    get_arch
+    echo -e "${GREEN}正在部署 EmbyServer 容器（镜像: $IMAGE_NAME）...${RESET}"
+    docker run -d \
+        --name $CONTAINER_NAME \
+        --network bridge \
+        -e UID=0 \
+        -e GID=0 \
+        -e GIDLIST=0 \
+        -e TZ=Asia/Shanghai \
+        -v $DATA_DIR:/data \
+        -p $HTTP_PORT:8096 \
+        --restart unless-stopped \
+        $IMAGE_NAME
+
+    PUBLIC_IP=$(get_public_ip)
+    if [ -n "$PUBLIC_IP" ]; then
+        echo -e "${GREEN}部署完成！公网访问地址: http://${PUBLIC_IP}:${HTTP_PORT}${RESET}"
+    else
+        echo -e "${GREEN}部署完成，但未能获取公网 IP，请使用内网访问${RESET}"
+    fi
+}
+
+start_emby() { docker start $CONTAINER_NAME && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_emby() { docker stop $CONTAINER_NAME && echo -e "${GREEN}容器已停止${RESET}"; }
+remove_emby() { docker rm -f $CONTAINER_NAME && echo -e "${GREEN}容器已删除${RESET}"; }
+view_logs() { docker logs -f $CONTAINER_NAME; }
+
+uninstall_all() {
+    stop_emby
+    remove_emby
+    if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
+        echo -e "${GREEN}正在删除统一数据目录: $DATA_DIR ...${RESET}"
+        rm -rf "$DATA_DIR"
+        echo -e "${GREEN}全部数据已卸载完成${RESET}"
+    fi
+    [ -f "$CONFIG_FILE" ] && rm -f "$CONFIG_FILE"
+    echo -e "${GREEN}配置文件已删除${RESET}"
+}
+
+update_image() {
+    CONTAINER_NAME=${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}
+    DATA_DIR=${DATA_DIR:-$DEFAULT_DATA_DIR}
+    HTTP_PORT=${HTTP_PORT:-$DEFAULT_HTTP_PORT}
+    get_arch
+
+    echo -e "${GREEN}正在拉取最新镜像: $IMAGE_NAME ...${RESET}"
+    docker pull $IMAGE_NAME
+
+    if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
+        echo -e "${GREEN}停止正在运行的容器...${RESET}"
+        docker stop $CONTAINER_NAME
+    fi
+
+    if [ "$(docker ps -a -q -f name=$CONTAINER_NAME)" ]; then
+        echo -e "${GREEN}删除旧容器（保留数据）...${RESET}"
+        docker rm $CONTAINER_NAME
+    fi
+
+    echo -e "${GREEN}使用最新镜像重启容器...${RESET}"
+    docker run -d \
+        --name $CONTAINER_NAME \
+        --network bridge \
+        -e UID=0 \
+        -e GID=0 \
+        -e GIDLIST=0 \
+        -e TZ=Asia/Shanghai \
+        -v $DATA_DIR:/data \
+        -p $HTTP_PORT:8096 \
+        --restart unless-stopped \
+        $IMAGE_NAME
+
+    PUBLIC_IP=$(get_public_ip)
+    if [ -n "$PUBLIC_IP" ]; then
+        echo -e "${GREEN}更新完成！公网访问地址: http://${PUBLIC_IP}:${HTTP_PORT}${RESET}"
+    else
+        echo -e "${GREEN}更新完成，但未能获取公网 IP，请使用内网访问${RESET}"
+    fi
+}
+
+show_menu() {
+    echo -e "${GREEN}===== EmbyServer 一键部署与更新菜单 =====${RESET}"
+    echo -e "${GREEN}1.部署 EmbyServer${RESET}"
+    echo -e "${GREEN}2.启动容器${RESET}"
+    echo -e "${GREEN}3.停止容器${RESET}"
+    echo -e "${GREEN}4.删除容器${RESET}"
+    echo -e "${GREEN}5.查看日志${RESET}"
+    echo -e "${GREEN}6.卸载全部数据（容器+统一目录+配置文件）${RESET}"
+    echo -e "${GREEN}7.更新镜像并重启容器${RESET}"
+    echo -e "${GREEN}0.退出${RESET}"
+    echo -n "请输入编号: "
+}
+
+check_docker
+
+while true; do
+    show_menu
+    read choice
+    case $choice in
+        1) deploy_emby ;;
+        2) start_emby ;;
+        3) stop_emby ;;
+        4) remove_emby ;;
+        5) view_logs ;;
+        6) uninstall_all ;;
+        7) update_image ;;
+        0) echo "退出脚本"; exit 0 ;;
+        *) echo -e "${GREEN}无效选项${RESET}" ;;
+    esac
+done

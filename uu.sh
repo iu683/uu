@@ -1,114 +1,188 @@
 #!/bin/bash
+# EmbyServer 一键部署与更新菜单脚本（绿色菜单、更新镜像重启、显示公网IP）
+# 宿主机目录: /docker/emby 映射到容器 /config
 
-GREEN="\033[32m"
-RESET="\033[0m"
+GREEN='\033[0;32m'
+RESET='\033[0m'
 
-APP_NAME="upay_pro"
-LOG_VOLUME="upay_logs"
-DB_VOLUME="upay_db"
-PORT="8090"
-YML_FILE="upay-compose.yml"
+DEFAULT_CONTAINER_NAME="amilys_embyserver"
+DEFAULT_DATA_DIR="/docker/emby"
+DEFAULT_HTTP_PORT="8096"
 
-# 判断架构
+CONTAINER_NAME=""
+DATA_DIR=""
+HTTP_PORT=""
+IMAGE_NAME=""
+CONFIG_FILE=""
+
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${GREEN}错误: Docker 未安装，请先安装 Docker${RESET}"
+        exit 1
+    fi
+}
+
+# 检测 CPU 架构，自动选择镜像
 get_arch() {
     arch=$(uname -m)
-    if [[ "$arch" == "x86_64" ]]; then
-        echo "amd64"
-    elif [[ "$arch" == "aarch64" ]]; then
-        echo "arm64"
+    case "$arch" in
+        x86_64)   IMAGE_NAME="amilys/embyserver" ;;
+        aarch64)  IMAGE_NAME="amilys/embyserver_arm64v8" ;;
+        arm64)    IMAGE_NAME="amilys/embyserver_arm64v8" ;;
+        *)        echo -e "${GREEN}未知架构: $arch，默认使用 amd64 镜像${RESET}"
+                  IMAGE_NAME="amilys/embyserver"
+                  ;;
+    esac
+}
+
+get_public_ip() {
+    PUBLIC_IP=$(curl -s https://ipinfo.io/ip)
+    if ! [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        PUBLIC_IP=$(curl -s https://ifconfig.me/ip)
+    fi
+    if ! [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        PUBLIC_IP=""
+    fi
+    echo "$PUBLIC_IP"
+}
+
+load_or_input_config() {
+    # 如果存在旧的 home 目录配置文件，也兼容一次读取
+    if [ -z "$CONFIG_FILE" ] && [ -f "$HOME/.emby_config" ]; then
+        source "$HOME/.emby_config"
+    fi
+
+    read -p "请输入容器名 [${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}]: " input_container
+    CONTAINER_NAME=${input_container:-${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}}
+
+    read -p "请输入存放配置目录（宿主机） [${DATA_DIR:-$DEFAULT_DATA_DIR}]: " input_dir
+    DATA_DIR=${input_dir:-${DATA_DIR:-$DEFAULT_DATA_DIR}}
+
+    read -p "请输入宿主机 HTTP 映射端口 [${HTTP_PORT:-$DEFAULT_HTTP_PORT}]: " input_port
+    HTTP_PORT=${input_port:-${HTTP_PORT:-$DEFAULT_HTTP_PORT}}
+
+    # 配置文件路径: /docker/emby/emby_config
+    CONFIG_FILE="$DATA_DIR/emby_config"
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+
+    # 保存当前配置
+    {
+        echo "CONTAINER_NAME=\"$CONTAINER_NAME\""
+        echo "DATA_DIR=\"$DATA_DIR\""
+        echo "HTTP_PORT=\"$HTTP_PORT\""
+    } > "$CONFIG_FILE"
+}
+
+create_dirs() {
+    [ ! -d "$DATA_DIR" ] && mkdir -p "$DATA_DIR"
+}
+
+deploy_emby() {
+    load_or_input_config
+    create_dirs
+    get_arch
+    echo -e "${GREEN}正在部署 EmbyServer 容器（镜像: $IMAGE_NAME）...${RESET}"
+    docker run -d \
+        --name $CONTAINER_NAME \
+        --network bridge \
+        -e UID=0 \
+        -e GID=0 \
+        -e GIDLIST=0 \
+        -e TZ=Asia/Shanghai \
+        -v $DATA_DIR:/config \
+        -p $HTTP_PORT:8096 \
+        --restart unless-stopped \
+        $IMAGE_NAME
+
+    PUBLIC_IP=$(get_public_ip)
+    if [ -n "$PUBLIC_IP" ]; then
+        echo -e "${GREEN}部署完成！公网访问地址: http://${PUBLIC_IP}:${HTTP_PORT}${RESET}"
     else
-        echo "unknown"
+        echo -e "${GREEN}部署完成，但未能获取公网 IP，请使用内网访问${RESET}"
+    fi
+}
+
+start_emby() { docker start $CONTAINER_NAME && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_emby() { docker stop $CONTAINER_NAME && echo -e "${GREEN}容器已停止${RESET}"; }
+remove_emby() { docker rm -f $CONTAINER_NAME && echo -e "${GREEN}容器已删除${RESET}"; }
+view_logs() { docker logs -f $CONTAINER_NAME; }
+
+uninstall_all() {
+    stop_emby
+    remove_emby
+    if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
+        echo -e "${GREEN}正在删除配置目录: $DATA_DIR ...${RESET}"
+        rm -rf "$DATA_DIR"
+        echo -e "${GREEN}全部数据已卸载完成${RESET}"
+    fi
+    echo -e "${GREEN}配置文件已删除（位于 $CONFIG_FILE）${RESET}"
+}
+
+update_image() {
+    load_or_input_config
+    get_arch
+
+    echo -e "${GREEN}正在拉取最新镜像: $IMAGE_NAME ...${RESET}"
+    docker pull $IMAGE_NAME
+
+    if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
+        echo -e "${GREEN}停止正在运行的容器...${RESET}"
+        docker stop $CONTAINER_NAME
+    fi
+
+    if [ "$(docker ps -a -q -f name=$CONTAINER_NAME)" ]; then
+        echo -e "${GREEN}删除旧容器（保留数据）...${RESET}"
+        docker rm $CONTAINER_NAME
+    fi
+
+    echo -e "${GREEN}使用最新镜像重启容器...${RESET}"
+    docker run -d \
+        --name $CONTAINER_NAME \
+        --network bridge \
+        -e UID=0 \
+        -e GID=0 \
+        -e GIDLIST=0 \
+        -e TZ=Asia/Shanghai \
+        -v $DATA_DIR:/config \
+        -p $HTTP_PORT:8096 \
+        --restart unless-stopped \
+        $IMAGE_NAME
+
+    PUBLIC_IP=$(get_public_ip)
+    if [ -n "$PUBLIC_IP" ]; then
+        echo -e "${GREEN}更新完成！公网访问地址: http://${PUBLIC_IP}:${HTTP_PORT}${RESET}"
+    else
+        echo -e "${GREEN}更新完成，但未能获取公网 IP，请使用内网访问${RESET}"
     fi
 }
 
 show_menu() {
-    clear
-    echo -e "${GREEN}=== Upay 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装/启动 Upay${RESET}"
-    echo -e "${GREEN}2) 更新 Upay${RESET}"
-    echo -e "${GREEN}3) 卸载 Upay${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}===========================${RESET}"
-    read -p "请选择: " choice
+    echo -e "${GREEN}===== EmbyServer 一键部署与更新菜单 =====${RESET}"
+    echo -e "${GREEN}1.部署 EmbyServer${RESET}"
+    echo -e "${GREEN}2.启动容器${RESET}"
+    echo -e "${GREEN}3.停止容器${RESET}"
+    echo -e "${GREEN}4.删除容器${RESET}"
+    echo -e "${GREEN}5.查看日志${RESET}"
+    echo -e "${GREEN}6.卸载全部数据（容器+配置目录+配置文件）${RESET}"
+    echo -e "${GREEN}7.更新镜像并重启容器${RESET}"
+    echo -e "${GREEN}0.退出${RESET}"
+    echo -n "请输入编号: "
+}
+
+check_docker
+
+while true; do
+    show_menu
+    read choice
     case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
-        4) logs_app ;;
-        0) exit ;;
-        *) echo "❌ 无效选择"; sleep 1; show_menu ;;
+        1) deploy_emby ;;
+        2) start_emby ;;
+        3) stop_emby ;;
+        4) remove_emby ;;
+        5) view_logs ;;
+        6) uninstall_all ;;
+        7) update_image ;;
+        0) echo "退出脚本"; exit 0 ;;
+        *) echo -e "${GREEN}无效选项${RESET}" ;;
     esac
-}
-
-install_app() {
-    arch=$(get_arch)
-
-    if [[ "$arch" == "amd64" ]]; then
-        IMAGE="wangergou111/upay:latest"
-    elif [[ "$arch" == "arm64" ]]; then
-        IMAGE="wangergou111/upay:latest-arm64"
-    else
-        echo "❌ 未识别的架构，无法选择镜像！"
-        exit 1
-    fi
-
-    echo -e "${GREEN}🚀 正在安装并启动 $APP_NAME (镜像: $IMAGE)...${RESET}"
-
-    docker run -d \
-      --name $APP_NAME \
-      -p $PORT:8090 \
-      -v $LOG_VOLUME:/app/logs \
-      -v $DB_VOLUME:/app/DBS \
-      --restart always \
-      $IMAGE
-
-    echo -e "${GREEN}✅ $APP_NAME 已启动，访问地址: http://$(hostname -I | awk '{print $1}'):$PORT${RESET}"
-    echo -e "${GREEN}✅ $APP_NAME 已启动，初始账号密码：在日志文件中，直接查看即可${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-update_app() {
-    arch=$(get_arch)
-
-    if [[ "$arch" == "amd64" ]]; then
-        IMAGE="wangergou111/upay:latest"
-    elif [[ "$arch" == "arm64" ]]; then
-        IMAGE="wangergou111/upay:latest-arm64"
-    else
-        echo "❌ 未识别的架构，无法选择镜像！"
-        exit 1
-    fi
-
-    echo -e "${GREEN}🔄 正在更新 $APP_NAME...${RESET}"
-
-    docker pull $IMAGE
-    docker stop $APP_NAME && docker rm $APP_NAME
-    install_app
-
-    echo -e "${GREEN}✅ $APP_NAME 已更新并启动${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-uninstall_app() {
-    read -p "⚠️ 确认要卸载 $APP_NAME 吗？(y/N): " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        docker stop $APP_NAME && docker rm $APP_NAME
-        echo -e "${GREEN}✅ $APP_NAME 已卸载${RESET}"
-    else
-        echo "❌ 已取消"
-    fi
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-logs_app() {
-    docker logs -f $APP_NAME
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 调用主菜单
-show_menu
+done

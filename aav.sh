@@ -1,124 +1,187 @@
 #!/bin/bash
-# QMediaSync 一键管理脚本
+# EmbyServer 一键部署与更新菜单脚本（绿色菜单、更新镜像重启、显示公网IP）
 
-GREEN="\033[32m"
-RESET="\033[0m"
+GREEN='\033[0;32m'
+RESET='\033[0m'
 
-APP_NAME="qmediasync"
-BASE_DIR="/opt/qmediasync"
-CONFIG_DIR="$BASE_DIR/config"
-MEDIA_DIR="$BASE_DIR/media"
-YML_FILE="$BASE_DIR/qmediasync-compose.yml"
+DEFAULT_CONTAINER_NAME="amilys_embyserver"
+DEFAULT_DATA_DIR="/opt/emby"
+DEFAULT_HTTP_PORT="8096"
 
-# 获取公网IP
-get_ip() {
-    curl -s ipv4.icanhazip.com || curl -s ifconfig.me
+CONTAINER_NAME=""
+DATA_DIR=""
+HTTP_PORT=""
+IMAGE_NAME=""
+CONFIG_FILE=""
+
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${GREEN}错误: Docker 未安装，请先安装 Docker${RESET}"
+        exit 1
+    fi
 }
 
-create_compose() {
-    mkdir -p "$CONFIG_DIR"
-    mkdir -p "$MEDIA_DIR"
-    mkdir -p "$BASE_DIR"
+# 检测 CPU 架构，自动选择镜像
+get_arch() {
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)   IMAGE_NAME="amilys/embyserver" ;;
+        aarch64)  IMAGE_NAME="amilys/embyserver_arm64v8" ;;
+        arm64)    IMAGE_NAME="amilys/embyserver_arm64v8" ;;
+        *)        echo -e "${GREEN}未知架构: $arch，默认使用 amd64 镜像${RESET}"
+                  IMAGE_NAME="amilys/embyserver"
+                  ;;
+    esac
+}
 
-    cat > $YML_FILE <<EOF
-version: "3.8"
+get_public_ip() {
+    PUBLIC_IP=$(curl -s https://ipinfo.io/ip)
+    if ! [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        PUBLIC_IP=$(curl -s https://ifconfig.me/ip)
+    fi
+    if ! [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        PUBLIC_IP=""
+    fi
+    echo "$PUBLIC_IP"
+}
 
-services:
-  qmediasync:
-    image: qicfan/qmediasync:latest
-    container_name: qmediasync
-    restart: unless-stopped
-    ports:
-      - "12333:12333"
-      - "8095:8095"
-      - "8094:8094"
-    volumes:
-      - $CONFIG_DIR:/app/config
-      - $MEDIA_DIR:/media
-    environment:
-      - TZ=Asia/Shanghai
+load_or_input_config() {
+    # 如果存在旧的 home 目录配置文件，也兼容一次读取
+    if [ -z "$CONFIG_FILE" ] && [ -f "$HOME/.emby_config" ]; then
+        source "$HOME/.emby_config"
+    fi
 
-networks:
-  default:
-    name: qmediasync
-EOF
+    read -p "请输入容器名 [${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}]: " input_container
+    CONTAINER_NAME=${input_container:-${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}}
+
+    read -p "请输入统一存放目录（配置+媒体） [${DATA_DIR:-$DEFAULT_DATA_DIR}]: " input_dir
+    DATA_DIR=${input_dir:-${DATA_DIR:-$DEFAULT_DATA_DIR}}
+
+    read -p "请输入宿主机 HTTP 映射端口 [${HTTP_PORT:-$DEFAULT_HTTP_PORT}]: " input_port
+    HTTP_PORT=${input_port:-${HTTP_PORT:-$DEFAULT_HTTP_PORT}}
+
+    # 新配置文件路径放到 DATA_DIR/config/emby_config
+    CONFIG_FILE="$DATA_DIR/config/emby_config"
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+
+    # 保存当前配置
+    {
+        echo "CONTAINER_NAME=\"$CONTAINER_NAME\""
+        echo "DATA_DIR=\"$DATA_DIR\""
+        echo "HTTP_PORT=\"$HTTP_PORT\""
+    } > "$CONFIG_FILE"
+}
+
+create_dirs() {
+    [ ! -d "$DATA_DIR" ] && mkdir -p "$DATA_DIR"
+}
+
+deploy_emby() {
+    load_or_input_config
+    create_dirs
+    get_arch
+    echo -e "${GREEN}正在部署 EmbyServer 容器（镜像: $IMAGE_NAME）...${RESET}"
+    docker run -d \
+        --name $CONTAINER_NAME \
+        --network bridge \
+        -e UID=0 \
+        -e GID=0 \
+        -e GIDLIST=0 \
+        -e TZ=Asia/Shanghai \
+        -v $DATA_DIR:/data \
+        -p $HTTP_PORT:8096 \
+        --restart unless-stopped \
+        $IMAGE_NAME
+
+    PUBLIC_IP=$(get_public_ip)
+    if [ -n "$PUBLIC_IP" ]; then
+        echo -e "${GREEN}部署完成！公网访问地址: http://${PUBLIC_IP}:${HTTP_PORT}${RESET}"
+    else
+        echo -e "${GREEN}部署完成，但未能获取公网 IP，请使用内网访问${RESET}"
+    fi
+}
+
+start_emby() { docker start $CONTAINER_NAME && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_emby() { docker stop $CONTAINER_NAME && echo -e "${GREEN}容器已停止${RESET}"; }
+remove_emby() { docker rm -f $CONTAINER_NAME && echo -e "${GREEN}容器已删除${RESET}"; }
+view_logs() { docker logs -f $CONTAINER_NAME; }
+
+uninstall_all() {
+    stop_emby
+    remove_emby
+    if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
+        echo -e "${GREEN}正在删除统一数据目录: $DATA_DIR ...${RESET}"
+        rm -rf "$DATA_DIR"
+        echo -e "${GREEN}全部数据已卸载完成${RESET}"
+    fi
+    echo -e "${GREEN}配置文件已删除（位于 $CONFIG_FILE）${RESET}"
+}
+
+update_image() {
+    load_or_input_config
+    get_arch
+
+    echo -e "${GREEN}正在拉取最新镜像: $IMAGE_NAME ...${RESET}"
+    docker pull $IMAGE_NAME
+
+    if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
+        echo -e "${GREEN}停止正在运行的容器...${RESET}"
+        docker stop $CONTAINER_NAME
+    fi
+
+    if [ "$(docker ps -a -q -f name=$CONTAINER_NAME)" ]; then
+        echo -e "${GREEN}删除旧容器（保留数据）...${RESET}"
+        docker rm $CONTAINER_NAME
+    fi
+
+    echo -e "${GREEN}使用最新镜像重启容器...${RESET}"
+    docker run -d \
+        --name $CONTAINER_NAME \
+        --network bridge \
+        -e UID=0 \
+        -e GID=0 \
+        -e GIDLIST=0 \
+        -e TZ=Asia/Shanghai \
+        -v $DATA_DIR:/data \
+        -p $HTTP_PORT:8096 \
+        --restart unless-stopped \
+        $IMAGE_NAME
+
+    PUBLIC_IP=$(get_public_ip)
+    if [ -n "$PUBLIC_IP" ]; then
+        echo -e "${GREEN}更新完成！公网访问地址: http://${PUBLIC_IP}:${HTTP_PORT}${RESET}"
+    else
+        echo -e "${GREEN}更新完成，但未能获取公网 IP，请使用内网访问${RESET}"
+    fi
 }
 
 show_menu() {
-    echo -e "${GREEN}=== QMediaSync 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装并启动 QMediaSync${RESET}"
-    echo -e "${GREEN}2) 停止 QMediaSync${RESET}"
-    echo -e "${GREEN}3) 启动 QMediaSync${RESET}"
-    echo -e "${GREEN}4) 重启 QMediaSync${RESET}"
-    echo -e "${GREEN}5) 更新 QMediaSync${RESET}"
-    echo -e "${GREEN}6) 查看日志${RESET}"
-    echo -e "${GREEN}7) 卸载 QMediaSync（含数据）${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}==========================${RESET}"
-    read -p "请选择: " choice
+    echo -e "${GREEN}===== EmbyServer 一键部署与更新菜单 =====${RESET}"
+    echo -e "${GREEN}1.部署 EmbyServer${RESET}"
+    echo -e "${GREEN}2.启动容器${RESET}"
+    echo -e "${GREEN}3.停止容器${RESET}"
+    echo -e "${GREEN}4.删除容器${RESET}"
+    echo -e "${GREEN}5.查看日志${RESET}"
+    echo -e "${GREEN}6.卸载全部数据（容器+统一目录+配置文件）${RESET}"
+    echo -e "${GREEN}7.更新镜像并重启容器${RESET}"
+    echo -e "${GREEN}0.退出${RESET}"
+    echo -n "请输入编号: "
 }
 
-print_access_info() {
-    local ip=$(get_ip)
-    echo -e "🌐 访问地址: ${GREEN}http://$ip:12333${RESET}"
-    echo -e "👤 默认用户: ${GREEN}admin${RESET}"
-    echo -e "🔑 默认密码: ${GREEN}admin123${RESET}"
-}
-
-install_app() {
-    create_compose
-    docker compose -f $YML_FILE up -d
-    echo -e "✅ ${GREEN}QMediaSync 已安装并启动${RESET}"
-    print_access_info
-}
-
-stop_app() {
-    docker compose -f $YML_FILE down
-    echo -e "🛑 ${GREEN}QMediaSync 已停止${RESET}"
-}
-
-start_app() {
-    docker compose -f $YML_FILE up -d
-    echo -e "🚀 ${GREEN}QMediaSync 已启动${RESET}"
-    print_access_info
-}
-
-restart_app() {
-    docker compose -f $YML_FILE down
-    docker compose -f $YML_FILE up -d
-    echo -e "🔄 ${GREEN}QMediaSync 已重启${RESET}"
-    print_access_info
-}
-
-update_app() {
-    docker compose -f $YML_FILE pull
-    docker compose -f $YML_FILE up -d
-    echo -e "⬆️ ${GREEN}QMediaSync 已更新到最新版本${RESET}"
-    print_access_info
-}
-
-logs_app() {
-    docker logs -f $APP_NAME
-}
-
-uninstall_app() {
-    docker compose -f $YML_FILE down
-    rm -f $YML_FILE
-    rm -rf "$CONFIG_DIR" "$MEDIA_DIR"
-    echo -e "🗑️ ${GREEN}QMediaSync 已卸载，数据目录也已删除${RESET}"
-}
+check_docker
 
 while true; do
     show_menu
+    read choice
     case $choice in
-        1) install_app ;;
-        2) stop_app ;;
-        3) start_app ;;
-        4) restart_app ;;
-        5) update_app ;;
-        6) logs_app ;;
-        7) uninstall_app ;;
-        0) exit 0 ;;
-        *) echo -e "❌ ${GREEN}无效选择${RESET}" ;;
+        1) deploy_emby ;;
+        2) start_emby ;;
+        3) stop_emby ;;
+        4) remove_emby ;;
+        5) view_logs ;;
+        6) uninstall_all ;;
+        7) update_image ;;
+        0) echo "退出脚本"; exit 0 ;;
+        *) echo -e "${GREEN}无效选项${RESET}" ;;
     esac
 done

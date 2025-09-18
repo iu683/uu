@@ -1,112 +1,175 @@
 #!/bin/bash
+# Sehuatang Crawler 一键管理脚本（支持自定义端口和管理员密码，卸载彻底删除数据）
 
 GREEN="\033[32m"
 RESET="\033[0m"
 
-APP_NAME="navidrome"
-YML_FILE="navidrome-compose.yml"
-CONF_FILE=".navidrome_dirs"
+APP_NAME="sehuatang-crawler"
+POSTGRES_NAME="sehuatang-postgres"
+BASE_DIR="/opt/sehuatang"
+YML_FILE="$BASE_DIR/docker-compose.yml"
 
+# 默认端口和密码
+DEFAULT_PORT=8000
+DEFAULT_ADMIN_PASS="admin123"
+
+# 获取公网IP
+get_ip() {
+    ip=$(curl -s ipv4.icanhazip.com || curl -s ifconfig.me)
+    echo "${ip:-localhost}"
+}
+
+# 创建 docker-compose.yml
+create_compose() {
+    local port=$1
+    local admin_pass=$2
+
+    mkdir -p "$BASE_DIR"
+
+    cat > $YML_FILE <<EOF
+services:
+  sehuatang-crawler:
+    image: wyh3210277395/sehuatang-crawler:latest
+    container_name: ${APP_NAME}
+    ports:
+      - "${port}:8000"
+    environment:
+      - DATABASE_HOST=postgres
+      - DATABASE_PORT=5432
+      - DATABASE_NAME=sehuatang_db
+      - DATABASE_USER=postgres
+      - DATABASE_PASSWORD=postgres123
+      - PYTHONPATH=/app/backend
+      - ENVIRONMENT=production
+      - ADMIN_PASSWORD=${admin_pass}
+    volumes:
+      - sehuatang_data:/app/data
+      - sehuatang_logs:/app/logs
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: ${POSTGRES_NAME}
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=sehuatang_db
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres123
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  sehuatang_data:
+  sehuatang_logs:
+  postgres_data:
+
+networks:
+  default:
+    name: sehuatang-network
+EOF
+}
+
+# 显示菜单
 show_menu() {
-    clear
-    echo -e "${GREEN}=== Navidrome 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装/启动 Navidrome${RESET}"
-    echo -e "${GREEN}2) 更新 Navidrome${RESET}"
-    echo -e "${GREEN}3) 卸载 Navidrome${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}=== Sehuatang 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装并启动服务${RESET}"
+    echo -e "${GREEN}2) 停止服务${RESET}"
+    echo -e "${GREEN}3) 启动服务${RESET}"
+    echo -e "${GREEN}4) 重启服务${RESET}"
+    echo -e "${GREEN}5) 更新服务${RESET}"
+    echo -e "${GREEN}6) 查看爬虫日志${RESET}"
+    echo -e "${GREEN}7) 查看数据库日志${RESET}"
+    echo -e "${GREEN}8) 卸载服务（含数据）${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}===========================${RESET}"
+    echo -e "${GREEN}========================${RESET}"
+}
+
+# 打印访问信息
+print_access_info() {
+    local ip=$(get_ip)
+    echo -e "🌐 访问地址: ${GREEN}http://$ip:${PORT}${RESET}"
+    echo -e "👤 管理员密码: ${GREEN}${ADMIN_PASSWORD}${RESET}"
+}
+
+# 安装服务
+install_app() {
+    read -p "请输入映射端口 (默认 ${DEFAULT_PORT}): " PORT
+    PORT=${PORT:-$DEFAULT_PORT}
+    read -p "请输入管理员密码 (默认 ${DEFAULT_ADMIN_PASS}): " ADMIN_PASSWORD
+    ADMIN_PASSWORD=${ADMIN_PASSWORD:-$DEFAULT_ADMIN_PASS}
+
+    create_compose "$PORT" "$ADMIN_PASSWORD"
+    docker compose -f $YML_FILE up -d --remove-orphans
+    echo -e "✅ ${GREEN}Sehuatang 服务已安装并启动${RESET}"
+    print_access_info
+}
+
+# 停止服务
+stop_app() {
+    docker compose -f $YML_FILE down
+    echo -e "🛑 ${GREEN}Sehuatang 服务已停止${RESET}"
+}
+
+# 启动服务
+start_app() {
+    docker compose -f $YML_FILE up -d --remove-orphans
+    echo -e "🚀 ${GREEN}Sehuatang 服务已启动${RESET}"
+    print_access_info
+}
+
+# 重启服务
+restart_app() {
+    docker compose -f $YML_FILE down
+    docker compose -f $YML_FILE up -d --remove-orphans
+    echo -e "🔄 ${GREEN}Sehuatang 服务已重启${RESET}"
+    print_access_info
+}
+
+# 更新服务
+update_app() {
+    docker compose -f $YML_FILE pull
+    docker compose -f $YML_FILE up -d --remove-orphans
+    echo -e "⬆️ ${GREEN}Sehuatang 服务已更新到最新版本${RESET}"
+    print_access_info
+}
+
+# 查看爬虫日志
+logs_app() {
+    docker logs -f $APP_NAME
+}
+
+# 查看数据库日志
+logs_db() {
+    docker logs -f $POSTGRES_NAME
+}
+
+# 卸载服务
+uninstall_app() {
+    docker compose -f $YML_FILE down
+    rm -f $YML_FILE
+    # 删除数据卷，强制删除避免报错
+    docker volume rm -f sehuatang_data sehuatang_logs postgres_data
+    echo -e "🗑️ ${GREEN}Sehuatang 服务已卸载，所有数据已删除${RESET}"
+}
+
+# 主循环
+while true; do
+    show_menu
     read -p "请选择: " choice
     case $choice in
         1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
-        4) logs_app ;;
-        0) exit ;;
-        *) echo "❌ 无效选择"; sleep 1; show_menu ;;
+        2) stop_app ;;
+        3) start_app ;;
+        4) restart_app ;;
+        5) update_app ;;
+        6) logs_app ;;
+        7) logs_db ;;
+        8) uninstall_app ;;
+        0) exit 0 ;;
+        *) echo -e "❌ ${GREEN}无效选择${RESET}" ;;
     esac
-}
-
-install_app() {
-    read -p "请输入音乐目录路径 (默认 /mnt/nas/music): " music_dir
-    music_dir=${music_dir:-/mnt/nas/music}
-
-    read -p "请输入数据目录路径 (默认 /opt/navidrome/data): " data_dir
-    data_dir=${data_dir:-/opt/navidrome/data}
-
-    read -p "请输入映射端口 (默认 4533): " port
-    port=${port:-4533}
-
-    mkdir -p "$music_dir" "$data_dir"
-
-    uid=$(id -u)
-    gid=$(id -g)
-
-    cat > $YML_FILE <<EOF
-version: "3"
-
-services:
-  navidrome:
-    image: deluan/navidrome:latest
-    container_name: $APP_NAME
-    user: "${uid}:${gid}"
-    ports:
-      - "${port}:4533"
-    restart: unless-stopped
-    environment:
-      ND_LOGLEVEL: info
-      ND_SESSIONTIMEOUT: 24h
-      ND_SCANSCHEDULE: 1h
-    volumes:
-      - "${data_dir}:/data"
-      - "${music_dir}:/music:ro"
-EOF
-
-    echo "$data_dir" > $CONF_FILE
-
-    docker compose -f $YML_FILE up -d
-    echo -e "${GREEN}✅ $APP_NAME 已启动，访问地址: http://$(hostname -I | awk '{print $1}'):${port}${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-update_app() {
-    docker compose -f $YML_FILE pull
-    docker compose -f $YML_FILE up -d
-    echo -e "${GREEN}✅ $APP_NAME 已更新${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-uninstall_app() {
-    read -p "⚠️ 确认要卸载 $APP_NAME 吗？(y/N): " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        docker compose -f $YML_FILE down
-        rm -f $YML_FILE
-        echo -e "${GREEN}✅ $APP_NAME 已卸载${RESET}"
-
-        if [[ -f $CONF_FILE ]]; then
-            data_dir=$(cat $CONF_FILE)
-            read -p "是否同时删除数据目录 [$data_dir]？(y/N): " del_confirm
-            if [[ "$del_confirm" =~ ^[Yy]$ ]]; then
-                rm -rf "$data_dir"
-                echo -e "${GREEN}✅ 数据目录已删除${RESET}"
-            else
-                echo "❌ 已保留数据目录"
-            fi
-            rm -f $CONF_FILE
-        fi
-    else
-        echo "❌ 已取消"
-    fi
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-logs_app() {
-    docker logs -f $APP_NAME
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-show_menu
+done

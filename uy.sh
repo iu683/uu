@@ -1,210 +1,123 @@
 #!/bin/bash
-# EmbyServer 一键部署与更新菜单脚本（绿色菜单、官方镜像、强制root、GPU加速、显示公网IP）
+# Music Player 一键管理脚本（支持自定义端口和管理员密码）
 
-GREEN='\033[0;32m'
-RESET='\033[0m'
+GREEN="\033[32m"
+RESET="\033[0m"
 
-DEFAULT_CONTAINER_NAME="emby"
-DEFAULT_DATA_DIR="$HOME/emby"
-DEFAULT_HTTP_PORT="8096"
-IMAGE_NAME="emby/embyserver:latest"
-CONFIG_FILE="$HOME/.emby_config"
+APP_NAME="music-player"
+BASE_DIR="/opt/music-player"
+YML_FILE="$BASE_DIR/docker-compose.yml"
 
-CONTAINER_NAME=""
-DATA_DIR=""
-HTTP_PORT=""
+# 默认端口和管理员密码
+DEFAULT_PORT=3000
+DEFAULT_ADMIN_PASS="admin123"
 
-# 检查 Docker 是否安装
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${GREEN}错误: Docker 未安装，请先安装 Docker${RESET}"
-        exit 1
-    fi
-}
-# 检测 CPU 架构，自动选择镜像
-get_arch() {
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64)   IMAGE_NAME="emby/embyserver" ;;
-        aarch64)  IMAGE_NAME="emby/embyserver_arm64v8" ;;
-        arm64)    IMAGE_NAME="emby/embyserver_arm64v8" ;;
-        *)        echo -e "${GREEN}未知架构: $arch，默认使用 amd64 镜像${RESET}"
-                  IMAGE_NAME="emby/embyserver"
-                  ;;
-    esac
-}
+create_compose() {
+    local port=$1
+    local admin_pass=$2
 
-# 获取公网 IP
-get_public_ip() {
-    PUBLIC_IP=$(curl -s https://ipinfo.io/ip)
-    if ! [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        PUBLIC_IP=$(curl -s https://ifconfig.me/ip)
-    fi
-    if ! [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        PUBLIC_IP=""
-    fi
-    echo "$PUBLIC_IP"
+    mkdir -p "$BASE_DIR"
+
+    cat > $YML_FILE <<EOF
+version: '3'
+
+services:
+  music-player:
+    image: ghcr.io/eooce/music-player:latest
+    ports:
+      - "${port}:3000"
+    environment:
+      - PORT=3000
+      - ADMIN_PASSWORD=${admin_pass}
+    volumes:
+      - music-data:/app/music
+    restart: unless-stopped
+
+volumes:
+  music-data:
+EOF
 }
 
-# 读取或输入配置
-load_or_input_config() {
-    if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
-    fi
-
-    read -p "请输入容器名 [${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}]: " input_container
-    CONTAINER_NAME=${input_container:-${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}}
-
-    read -p "请输入统一存放目录（配置+媒体） [${DATA_DIR:-$DEFAULT_DATA_DIR}]: " input_dir
-    DATA_DIR=${input_dir:-${DATA_DIR:-$DEFAULT_DATA_DIR}}
-
-    read -p "请输入宿主机 HTTP 映射端口 [${HTTP_PORT:-$DEFAULT_HTTP_PORT}]: " input_port
-    HTTP_PORT=${input_port:-${HTTP_PORT:-$DEFAULT_HTTP_PORT}}
-
-    # 保存当前配置
-    echo "CONTAINER_NAME=\"$CONTAINER_NAME\"" > "$CONFIG_FILE"
-    echo "DATA_DIR=\"$DATA_DIR\"" >> "$CONFIG_FILE"
-    echo "HTTP_PORT=\"$HTTP_PORT\"" >> "$CONFIG_FILE"
-}
-
-# 创建数据目录
-create_dirs() {
-    mkdir -p "$DATA_DIR/config" "$DATA_DIR/media"
-    echo -e "${GREEN}目录已创建: $DATA_DIR${RESET}"
-    chmod -R 755 "$DATA_DIR"
-}
-
-# 判断 GPU 是否可用
-gpu_args() {
-    if [ -d /dev/dri ]; then
-        echo "--device /dev/dri:/dev/dri"
-    else
-        echo ""
-    fi
-}
-
-# 部署 EmbyServer
-deploy_emby() {
-    load_or_input_config
-    create_dirs
-    echo -e "${GREEN}正在部署 EmbyServer 容器...${RESET}"
-
-    docker run -d \
-        --name $CONTAINER_NAME \
-        --restart unless-stopped \
-        -e TZ=Asia/Shanghai \
-        -e UID=0 \
-        -e GID=0 \
-        -e GIDLIST=0 \
-        -p $HTTP_PORT:8096 \
-        -p 8920:8920 \
-        -v $DATA_DIR/config:/config \
-        -v $DATA_DIR/media:/mnt/share1 \
-        $(gpu_args) \
-        $IMAGE_NAME
-
-    PUBLIC_IP=$(get_public_ip)
-    if [[ $PUBLIC_IP != "无法获取公网 IP" ]]; then
-        echo -e "${GREEN}部署完成！公网访问地址: http://${PUBLIC_IP}:${HTTP_PORT}${RESET}"
-    else
-        echo -e "${GREEN}部署完成，但未能获取公网 IP，请使用内网访问${RESET}"
-    fi
-}
-
-# 启动、停止、删除、查看日志
-start_emby() { docker start $CONTAINER_NAME && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_emby() { docker stop $CONTAINER_NAME && echo -e "${GREEN}容器已停止${RESET}"; }
-remove_emby() { docker rm -f $CONTAINER_NAME && echo -e "${GREEN}容器已删除${RESET}"; }
-view_logs() { docker logs -f $CONTAINER_NAME; }
-
-# 卸载所有数据
-uninstall_all() {
-    stop_emby
-    remove_emby
-    if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
-        read -p "确定要删除 $DATA_DIR 吗？此操作不可恢复 [y/N]: " confirm
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            rm -rf "$DATA_DIR"
-            echo -e "${GREEN}数据目录已删除${RESET}"
-        fi
-    fi
-    [ -f "$CONFIG_FILE" ] && rm -f "$CONFIG_FILE" && echo -e "${GREEN}配置文件已删除${RESET}"
-}
-
-# 更新镜像并重启容器
-update_image() {
-    if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
-    else
-        echo -e "${GREEN}配置文件不存在，请先部署容器${RESET}"
-        exit 1
-    fi
-
-    echo -e "${GREEN}正在拉取最新镜像: $IMAGE_NAME ...${RESET}"
-    docker pull $IMAGE_NAME
-
-    if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
-        echo -e "${GREEN}停止正在运行的容器...${RESET}"
-        docker stop $CONTAINER_NAME
-    fi
-
-    if [ "$(docker ps -a -q -f name=$CONTAINER_NAME)" ]; then
-        echo -e "${GREEN}删除旧容器（保留数据）...${RESET}"
-        docker rm $CONTAINER_NAME
-    fi
-
-    echo -e "${GREEN}使用最新镜像重启容器...${RESET}"
-    docker run -d \
-        --name $CONTAINER_NAME \
-        --restart unless-stopped \
-        -e TZ=Asia/Shanghai \
-        -e UID=0 \
-        -e GID=0 \
-        -e GIDLIST=0 \
-        -p $HTTP_PORT:8096 \
-        -p 8920:8920 \
-        -v $DATA_DIR/config:/config \
-        -v $DATA_DIR/media:/mnt/share1 \
-        $(gpu_args) \
-        $IMAGE_NAME
-
-    PUBLIC_IP=$(get_public_ip)
-    if [[ $PUBLIC_IP != "无法获取公网 IP" ]]; then
-        echo -e "${GREEN}更新完成！公网访问地址: http://${PUBLIC_IP}:${HTTP_PORT}${RESET}"
-    else
-        echo -e "${GREEN}更新完成，但未能获取公网 IP，请使用内网访问${RESET}"
-    fi
-}
-
-# 显示菜单
 show_menu() {
-    echo -e "${GREEN}===== EMBY一键部署与更新菜单 =====${RESET}"
-    echo -e "${GREEN}1.部署 EmbyServer${RESET}"
-    echo -e "${GREEN}2.启动容器${RESET}"
-    echo -e "${GREEN}3.停止容器${RESET}"
-    echo -e "${GREEN}4.删除容器${RESET}"
-    echo -e "${GREEN}5.查看日志${RESET}"
-    echo -e "${GREEN}6.卸载全部数据（容器+统一目录+配置文件)${RESET}"
-    echo -e "${GREEN}7.更新镜像并重启容器${RESET}"
-    echo -e "${GREEN}0.退出${RESET}"
-    echo -n "请输入编号: "
+    echo -e "${GREEN}=== Music Player 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装并启动服务${RESET}"
+    echo -e "${GREEN}2) 停止服务${RESET}"
+    echo -e "${GREEN}3) 启动服务${RESET}"
+    echo -e "${GREEN}4) 重启服务${RESET}"
+    echo -e "${GREEN}5) 更新服务${RESET}"
+    echo -e "${GREEN}6) 查看日志${RESET}"
+    echo -e "${GREEN}7) 卸载服务（含数据）${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    echo -e "${GREEN}==========================${RESET}"
+    read -p "请选择: " choice
 }
 
-# 主循环
-check_docker
+print_access_info() {
+    local ip=$(curl -s ipv4.icanhazip.com || curl -s ifconfig.me)
+    echo -e "🌐 访问地址: ${GREEN}http://$ip:${PORT}${RESET}"
+    echo -e "🔑 管理员密码: ${GREEN}${ADMIN_PASSWORD}${RESET}"
+}
+
+install_app() {
+    read -p "请输入映射端口 (默认 ${DEFAULT_PORT}): " PORT
+    PORT=${PORT:-$DEFAULT_PORT}
+
+    read -p "请输入管理员密码 (默认 ${DEFAULT_ADMIN_PASS}): " ADMIN_PASSWORD
+    ADMIN_PASSWORD=${ADMIN_PASSWORD:-$DEFAULT_ADMIN_PASS}
+
+    create_compose "$PORT" "$ADMIN_PASSWORD"
+    docker compose -f $YML_FILE up -d
+    echo -e "✅ ${GREEN}Music Player 已安装并启动${RESET}"
+    print_access_info
+}
+
+stop_app() {
+    docker compose -f $YML_FILE down
+    echo -e "🛑 ${GREEN}Music Player 已停止${RESET}"
+}
+
+start_app() {
+    docker compose -f $YML_FILE up -d
+    echo -e "🚀 ${GREEN}Music Player 已启动${RESET}"
+    print_access_info
+}
+
+restart_app() {
+    docker compose -f $YML_FILE down
+    docker compose -f $YML_FILE up -d
+    echo -e "🔄 ${GREEN}Music Player 已重启${RESET}"
+    print_access_info
+}
+
+update_app() {
+    docker compose -f $YML_FILE pull
+    docker compose -f $YML_FILE up -d
+    echo -e "⬆️ ${GREEN}Music Player 已更新到最新版本${RESET}"
+    print_access_info
+}
+
+logs_app() {
+    docker logs -f $APP_NAME
+}
+
+uninstall_app() {
+    docker compose -f $YML_FILE down
+    rm -f $YML_FILE
+    docker volume rm music-data
+    echo -e "🗑️ ${GREEN}Music Player 已卸载，数据已删除${RESET}"
+}
 
 while true; do
     show_menu
-    read choice
     case $choice in
-        1) deploy_emby ;;
-        2) start_emby ;;
-        3) stop_emby ;;
-        4) remove_emby ;;
-        5) view_logs ;;
-        6) uninstall_all ;;
-        7) update_image ;;
-        0) echo "退出脚本"; exit 0 ;;
-        *) echo -e "${GREEN}无效选项${RESET}" ;;
+        1) install_app ;;
+        2) stop_app ;;
+        3) start_app ;;
+        4) restart_app ;;
+        5) update_app ;;
+        6) logs_app ;;
+        7) uninstall_app ;;
+        0) exit 0 ;;
+        *) echo -e "❌ ${GREEN}无效选择${RESET}" ;;
     esac
 done

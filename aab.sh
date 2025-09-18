@@ -1,114 +1,98 @@
 #!/bin/bash
-# ============================================
-# MetaTube 管理脚本（菜单版，支持自定义端口）
-# 功能: 安装/更新/卸载/日志
-# ============================================
-
-set -e
+# Nezha Telegram Bot 一键管理脚本（可选择保留数据库）
 
 GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
 RESET="\033[0m"
 
-CONTAINER_NAME="metatube"
-IMAGE_NAME="ghcr.io/metatube-community/metatube-server:latest"
-CONFIG_DIR="$PWD/config"
-CONF_FILE="$CONFIG_DIR/metatube.conf"
-DB_FILE="$CONFIG_DIR/metatube.db"
+APP_NAME="nezhatgbot-v1"
+BASE_DIR="$HOME/nezhabot"
+IMAGE_NAME="ghcr.io/nezhahq/nezhatgbot-v1:latest"
 
-# 读取或设置端口
-load_port() {
-    if [ -f "$CONF_FILE" ]; then
-        source "$CONF_FILE"
-    fi
-    PORT=${PORT:-8080}
+show_menu() {
+    echo -e "${GREEN}=== Nezha Telegram Bot 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装并启动服务${RESET}"
+    echo -e "${GREEN}2) 停止服务${RESET}"
+    echo -e "${GREEN}3) 启动服务${RESET}"
+    echo -e "${GREEN}4) 重启服务${RESET}"
+    echo -e "${GREEN}5) 更新服务${RESET}"
+    echo -e "${GREEN}6) 查看日志${RESET}"
+    echo -e "${GREEN}7) 卸载服务（可选择保留数据库）${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    read -p "请选择: " choice
 }
 
-save_port() {
-    echo "PORT=$PORT" > "$CONF_FILE"
+install_app() {
+    read -p "请输入 Telegram Bot Token: " TELEGRAM_TOKEN
+    mkdir -p "$BASE_DIR"
+
+    docker pull $IMAGE_NAME
+    docker run -d --name $APP_NAME --restart unless-stopped \
+        -e TELEGRAM_TOKEN="$TELEGRAM_TOKEN" \
+        -e TZ="Asia/Shanghai" \
+        -v "$BASE_DIR:/app/db" \
+        $IMAGE_NAME
+
+    echo -e "✅ ${GREEN}Nezha Telegram Bot 已安装并启动${RESET}"
 }
 
-menu() {
-    clear
-    echo -e "${GREEN}=== MetaTube 管理菜单 ===${RESET}"
-    echo -e "${YELLOW}1) 安装/部署 MetaTube${RESET}"
-    echo -e "${YELLOW}2) 更新 MetaTube${RESET}"
-    echo -e "${YELLOW}3) 卸载 MetaTube${RESET}"
-    echo -e "${YELLOW}4) 查看日志${RESET}"
-    echo -e "${YELLOW}0) 退出${RESET}"
-    echo
-    read -p "请选择操作: " choice
-
-    case $choice in
-        1) install_metatube ;;
-        2) update_metatube ;;
-        3) uninstall_metatube ;;
-        4) view_logs ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择！${RESET}" && sleep 1 && menu ;;
-    esac
+stop_app() {
+    docker stop $APP_NAME
+    echo -e "🛑 ${GREEN}Nezha Telegram Bot 已停止${RESET}"
 }
 
-install_metatube() {
-    echo -e "${GREEN}=== 安装/部署 MetaTube ===${RESET}"
-
-    mkdir -p "$CONFIG_DIR"
-
-    load_port
-    read -p "请输入 Web 服务端口 [默认: $PORT]: " input_port
-    PORT=${input_port:-$PORT}
-    save_port
-
-    docker run -d \
-        -p ${PORT}:8080 \
-        -v "$CONFIG_DIR":/config \
-        --name "$CONTAINER_NAME" \
-        "$IMAGE_NAME" \
-        -dsn /config/metatube.db
-
-    echo -e "${GREEN}✅ 部署完成！访问地址: http://$(curl -s https://api.ipify.org):${PORT}${RESET}"
-    read -p "按回车返回菜单..." && menu
+start_app() {
+    docker start $APP_NAME
+    echo -e "🚀 ${GREEN}Nezha Telegram Bot 已启动${RESET}"
 }
 
-update_metatube() {
-    echo -e "${GREEN}=== 更新 MetaTube ===${RESET}"
-
-    load_port
-
-    docker pull "$IMAGE_NAME"
-    docker stop "$CONTAINER_NAME" 2>/dev/null || true
-    docker rm "$CONTAINER_NAME" 2>/dev/null || true
-
-    docker run -d \
-        -p ${PORT}:8080 \
-        -v "$CONFIG_DIR":/config \
-        --name "$CONTAINER_NAME" \
-        "$IMAGE_NAME" \
-        -dsn /config/metatube.db
-
-    echo -e "${GREEN}✅ 更新完成！访问地址: http://$(curl -s https://api.ipify.org):${PORT}${RESET}"
-    read -p "按回车返回菜单..." && menu
+restart_app() {
+    docker restart $APP_NAME
+    echo -e "🔄 ${GREEN}Nezha Telegram Bot 已重启${RESET}"
 }
 
-uninstall_metatube() {
-    echo -e "${RED}⚠️  即将卸载 MetaTube，并删除相关配置数据！${RESET}"
-    read -p "确认卸载? (y/N): " confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        docker stop "$CONTAINER_NAME" 2>/dev/null || true
-        docker rm "$CONTAINER_NAME" 2>/dev/null || true
-        rm -rf "$CONFIG_DIR"
-        echo -e "${GREEN}✅ 卸载完成${RESET}"
+update_app() {
+    docker pull $IMAGE_NAME
+    docker stop $APP_NAME
+    docker rm $APP_NAME
+    docker run -d --name $APP_NAME --restart unless-stopped \
+        -e TELEGRAM_TOKEN="$TELEGRAM_TOKEN" \
+        -e TZ="Asia/Shanghai" \
+        -v "$BASE_DIR:/app/db" \
+        $IMAGE_NAME
+    echo -e "⬆️ ${GREEN}Nezha Telegram Bot 已更新${RESET}"
+}
+
+logs_app() {
+    docker logs -f $APP_NAME
+}
+
+uninstall_app() {
+    read -p "是否保留数据库？(y保留/n删除，默认y): " keep_db
+    keep_db=${keep_db:-y}
+
+    docker stop $APP_NAME
+    docker rm $APP_NAME
+
+    if [[ "$keep_db" == "n" || "$keep_db" == "N" ]]; then
+        rm -rf "$BASE_DIR"
+        echo -e "🗑️ ${GREEN}Nezha Telegram Bot 已卸载，数据库已删除${RESET}"
     else
-        echo -e "${YELLOW}已取消${RESET}"
+        echo -e "🗑️ ${GREEN}Nezha Telegram Bot 已卸载，数据库已保留在 $BASE_DIR${RESET}"
     fi
-    read -p "按回车返回菜单..." && menu
 }
 
-view_logs() {
-    echo -e "${GREEN}=== 查看 MetaTube 日志 ===${RESET}"
-    docker logs -f "$CONTAINER_NAME"
-    read -p "按回车返回菜单..." && menu
-}
-
-menu
+while true; do
+    show_menu
+    case $choice in
+        1) install_app ;;
+        2) stop_app ;;
+        3) start_app ;;
+        4) restart_app ;;
+        5) update_app ;;
+        6) logs_app ;;
+        7) uninstall_app ;;
+        0) exit 0 ;;
+        *) echo -e "❌ ${GREEN}无效选择${RESET}" ;;
+    esac
+done

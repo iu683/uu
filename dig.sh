@@ -1,99 +1,151 @@
 #!/bin/bash
+# ========================================
+# tg_faka 一键管理脚本
+# ========================================
+
+APP_NAME="tg_faka"
+TG_FAKA_URL="https://github.com/yuimoi/tg_faka/releases/download/release/tg_faka_linux.zip"
+INSTALL_DIR="$HOME/tg_faka"
+TG_FAKA_BIN="$INSTALL_DIR/tg_faka_linux"
+LOG_FILE="$INSTALL_DIR/tg_faka.log"
+SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 
 GREEN="\033[32m"
 RESET="\033[0m"
 
-APP_NAME="OCI-Start"
-SCRIPT_URL="https://raw.githubusercontent.com/doubleDimple/shell-tools/master/oci-start.sh"
-SCRIPT_NAME="oci-start.sh"
-
-# 创建文件夹并下载脚本
-setup_script() {
-    echo -e "${GREEN}🚀 正在安装应用...${RESET}"
-    mkdir -p oci-start && cd oci-start
-    wget -O $SCRIPT_NAME $SCRIPT_URL
-    chmod +x $SCRIPT_NAME
-    echo -e "${GREEN}✅ 安装并设置完毕,选择2启动应用${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 安装应用
+# 安装函数
 install_app() {
-    ./oci-start.sh install
-    echo -e "${GREEN}✅ 应用已安装${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
+    echo -e "${GREEN}>>> 开始安装 $APP_NAME ...${RESET}"
+    mkdir -p "$INSTALL_DIR"
+    wget -q --show-progress "$TG_FAKA_URL" -O "$INSTALL_DIR/tg_faka_linux.zip"
+    unzip -q -o "$INSTALL_DIR/tg_faka_linux.zip" -d "$INSTALL_DIR"
+    chmod +x "$TG_FAKA_BIN"
+    echo -e "${GREEN}>>> 安装完成！请确保 $INSTALL_DIR/.env/ 下存在配置文件${RESET}"
+    echo -e "${GREEN}>>> 项目地址 https://github.com/yuimoi/tg_faka/tree/main/.env${RESET}"
 }
 
-# 启动应用
+# 启动函数
 start_app() {
-    ./oci-start.sh start
-    echo -e "${GREEN}✅ 应用已启动${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 停止应用
-stop_app() {
-    ./oci-start.sh stop
-    echo -e "${GREEN}✅ 应用已停止${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 重启应用
-restart_app() {
-    ./oci-start.sh restart
-    echo -e "${GREEN}✅ 应用已重启${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 更新应用
-update_app() {
-    ./oci-start.sh update
-    echo -e "${GREEN}✅ 应用已更新到最新版本${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 卸载应用
-uninstall_app() {
-    read -p "⚠️ 确认要完全卸载应用吗？(y/N): " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        ./oci-start.sh uninstall
-        echo -e "${GREEN}✅ 应用已完全卸载${RESET}"
+    if pgrep -f "$TG_FAKA_BIN" > /dev/null; then
+        echo -e "${GREEN}>>> $APP_NAME 已经在运行${RESET}"
     else
-        echo "❌ 卸载操作已取消"
+        nohup "$TG_FAKA_BIN" > "$LOG_FILE" 2>&1 &
+        echo -e "${GREEN}>>> $APP_NAME 已启动，日志文件: $LOG_FILE${RESET}"
     fi
-    read -p "按回车键返回菜单..."
-    show_menu
 }
 
-# 显示主菜单
+# 停止函数
+stop_app() {
+    pkill -f "$TG_FAKA_BIN" && echo -e "${GREEN}>>> $APP_NAME 已停止${RESET}" || echo -e "${GREEN}>>> $APP_NAME 未运行${RESET}"
+}
+
+# 重启函数
+restart_app() {
+    stop_app
+    sleep 2
+    start_app
+}
+
+# 查看状态
+status_app() {
+    if pgrep -f "$TG_FAKA_BIN" > /dev/null; then
+        echo -e "${GREEN}>>> $APP_NAME 正在运行${RESET}"
+    else
+        echo -e "${GREEN}>>> $APP_NAME 未运行${RESET}"
+    fi
+}
+
+# 查看日志
+show_log() {
+    tail -f "$LOG_FILE"
+}
+
+# 卸载函数
+uninstall_app() {
+    stop_app
+    rm -rf "$INSTALL_DIR"
+    rm -f "$SERVICE_FILE"
+    systemctl daemon-reload
+    echo -e "${GREEN}>>> $APP_NAME 已卸载，文件目录和自启配置已删除${RESET}"
+}
+
+# 添加 systemd 服务
+enable_autostart() {
+    if [ ! -f "$SERVICE_FILE" ]; then
+        sudo bash -c "cat > $SERVICE_FILE" <<EOF
+[Unit]
+Description=$APP_NAME Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$TG_FAKA_BIN
+WorkingDirectory=$INSTALL_DIR
+Restart=always
+StandardOutput=append:$LOG_FILE
+StandardError=append:$LOG_FILE
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        sudo systemctl daemon-reload
+        sudo systemctl enable $APP_NAME
+        sudo systemctl start $APP_NAME
+        echo -e "${GREEN}>>> systemd 自启已启用，并已启动 $APP_NAME${RESET}"
+    else
+        echo -e "${GREEN}>>> systemd 自启已存在${RESET}"
+    fi
+}
+
+# 取消 systemd 自启
+disable_autostart() {
+    if [ -f "$SERVICE_FILE" ]; then
+        sudo systemctl disable --now $APP_NAME
+        sudo rm -f "$SERVICE_FILE"
+        sudo systemctl daemon-reload
+        echo -e "${GREEN}>>> systemd 自启已取消${RESET}"
+    else
+        echo -e "${GREEN}>>> 未检测到 systemd 自启配置${RESET}"
+    fi
+}
+
+# 菜单
 show_menu() {
     clear
-    echo -e "${GREEN}=== OCI-Start 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装应用${RESET}"
-    echo -e "${GREEN}2) 启动应用${RESET}"
-    echo -e "${GREEN}3) 停止应用${RESET}"
-    echo -e "${GREEN}4) 重启应用${RESET}"
-    echo -e "${GREEN}5) 更新应用${RESET}"
-    echo -e "${GREEN}6) 卸载应用${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}===========================${RESET}"
-    read -p "请选择: " choice
+    echo -e "${GREEN}======================================${RESET}"
+    echo -e "${GREEN} $APP_NAME 一键管理脚本${RESET}"
+    echo -e "${GREEN} 安装目录: $INSTALL_DIR${RESET}"
+    echo -e "${GREEN}======================================${RESET}"
+    echo -e "${GREEN}1. 安装 $APP_NAME${RESET}"
+    echo -e "${GREEN}2. 启动 $APP_NAME${RESET}"
+    echo -e "${GREEN}3. 停止 $APP_NAME${RESET}"
+    echo -e "${GREEN}4. 重启 $APP_NAME${RESET}"
+    echo -e "${GREEN}5. 查看状态${RESET}"
+    echo -e "${GREEN}6. 查看日志${RESET}"
+    echo -e "${GREEN}7. 卸载 $APP_NAME${RESET}"
+    echo -e "${GREEN}8. 启用开机自启${RESET}"
+    echo -e "${GREEN}9. 取消开机自启${RESET}"
+    echo -e "${GREEN}0. 退出"
+    echo -e "${GREEN}======================================${RESET}"
+}
+
+# 主逻辑
+while true; do
+    show_menu
+    read -p "请输入选项: " choice
     case $choice in
-        1) setup_script ;;
+        1) install_app ;;
         2) start_app ;;
         3) stop_app ;;
         4) restart_app ;;
-        5) update_app ;;
-        6) uninstall_app ;;
-        0) exit ;;
-        *) echo "❌ 无效选择"; sleep 1; show_menu ;;
+        5) status_app ;;
+        6) show_log ;;
+        7) uninstall_app ;;
+        8) enable_autostart ;;
+        9) disable_autostart ;;
+        0) exit 0 ;;
+        *) echo -e "${GREEN}无效选项，请重新输入${RESET}" ;;
     esac
-}
-
-show_menu
+    echo ""
+    read -p "按回车键继续..."
+done

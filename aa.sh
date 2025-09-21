@@ -1,110 +1,130 @@
 #!/bin/bash
-# =========================================
-# Uptime Kuma 一键管理脚本
-# 支持安装 / 更新 / 重启 / 停止 / 卸载 / 查看日志
-# =========================================
 
-APP_NAME="uptime-kuma"
-IMAGE_NAME="louislam/uptime-kuma:1"
-VOLUME_NAME="uptime-kuma"
-CONFIG_FILE="./uptime-kuma.conf"
+# ================= 配置 =================
+docker_name="easyimage"
+docker_img="ddsderek/easyimage:latest"
+docker_port=5663
+config_dir="/home/docker/easyimage/config"
+image_dir="/home/docker/easyimage/i"
 
+# 颜色定义
 GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-# 获取公网 IP
-function get_ip() {
-    curl -s ifconfig.me || curl -s ip.sb || echo "your-ip"
+# ================= 函数 =================
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${RED}Docker 未安装，请先安装 Docker！${RESET}"
+        exit 1
+    fi
 }
 
-# 读取保存的端口
-if [ -f "$CONFIG_FILE" ]; then
-    source "$CONFIG_FILE"
-else
-    PORT=3001
-fi
-
-function save_config() {
-    echo "PORT=$PORT" > $CONFIG_FILE
+check_port() {
+    local port=$1
+    while lsof -i:$port &>/dev/null; do
+        echo -e "${YELLOW}端口 $port 已被占用，尝试下一个端口...${RESET}"
+        port=$((port+1))
+    done
+    echo $port
 }
 
-function install_app() {
-    read -p "请输入访问端口 [默认:3001]: " input_port
-    PORT=${input_port:-3001}
-    save_config
+install_container() {
+    mkdir -p "$config_dir" "$image_dir"
 
-    echo -e "${GREEN}开始安装 ${APP_NAME}，端口: $PORT${RESET}"
-    docker pull $IMAGE_NAME
-    docker rm -f $APP_NAME 2>/dev/null
+    # 检测端口
+    docker_port=$(check_port $docker_port)
+
+    echo -e "${GREEN}正在拉取镜像...${RESET}"
+    docker pull $docker_img
+
+    echo -e "${GREEN}正在启动容器...${RESET}"
     docker run -d \
-        --name=$APP_NAME \
-        --restart=unless-stopped \
-        -p $PORT:3001 \
-        -v $VOLUME_NAME:/app/data \
-        $IMAGE_NAME
-    IP=$(get_ip)
-    echo -e "${GREEN}安装完成！访问: http://$IP:$PORT${RESET}"
+        --name $docker_name \
+        -p $docker_port:80 \
+        -e TZ=Asia/Shanghai \
+        -e PUID=1000 \
+        -e PGID=1000 \
+        -v $config_dir:/app/web/config \
+        -v $image_dir:/app/web/i \
+        --restart unless-stopped \
+        $docker_img
+
+    # 获取公网 IP
+    public_ip=$(curl -s ifconfig.me)
+    echo -e "${GREEN}容器启动完成！${RESET}"
+    echo -e "${YELLOW}访问地址: http://$public_ip:$docker_port${RESET}"
 }
 
-function update_app() {
-    echo -e "${GREEN}开始更新 ${APP_NAME}...${RESET}"
-    docker pull $IMAGE_NAME
-    docker rm -f $APP_NAME 2>/dev/null
-    docker run -d \
-        --name=$APP_NAME \
-        --restart=unless-stopped \
-        -p $PORT:3001 \
-        -v $VOLUME_NAME:/app/data \
-        $IMAGE_NAME
-    IP=$(get_ip)
-    echo -e "${GREEN}更新完成！访问: http://$IP:$PORT${RESET}"
+update_container() {
+    echo -e "${GREEN}正在更新镜像...${RESET}"
+    docker pull $docker_img
+    docker stop $docker_name
+    docker rm $docker_name
+
+    echo -e "${GREEN}重新启动容器...${RESET}"
+    install_container
 }
 
-function restart_app() {
-    echo -e "${GREEN}正在重启 ${APP_NAME}...${RESET}"
-    docker restart $APP_NAME
-    IP=$(get_ip)
-    echo -e "${GREEN}重启完成！访问: http://$IP:$PORT${RESET}"
+start_container() {
+    docker start $docker_name
+    echo -e "${GREEN}容器已启动！${RESET}"
 }
 
-function stop_app() {
-    echo -e "${GREEN}正在停止 ${APP_NAME}...${RESET}"
-    docker stop $APP_NAME
-    echo -e "${GREEN}停止完成！${RESET}"
+stop_container() {
+    docker stop $docker_name
+    echo -e "${RED}容器已停止！${RESET}"
 }
 
-function uninstall_app() {
-    echo -e "${GREEN}正在彻底卸载 ${APP_NAME} (包括数据)...${RESET}"
-    docker rm -f $APP_NAME 2>/dev/null
-    docker volume rm -f $VOLUME_NAME 2>/dev/null
-    rm -f $CONFIG_FILE
-    echo -e "${GREEN}已彻底卸载 ${APP_NAME}，数据卷和配置文件也已删除${RESET}"
+restart_container() {
+    docker restart $docker_name
+    echo -e "${GREEN}容器已重启！${RESET}"
 }
 
-function view_logs() {
-    echo -e "${GREEN}正在查看 ${APP_NAME} 日志 (Ctrl+C 退出)...${RESET}"
-    docker logs -f $APP_NAME
+status_container() {
+    docker ps -a --filter "name=$docker_name"
 }
 
+view_logs() {
+    echo -e "${GREEN}显示容器日志，按 Ctrl+C 返回菜单${RESET}"
+    docker logs -f $docker_name
+}
+
+uninstall_all() {
+    docker stop $docker_name
+    docker rm $docker_name
+    echo -e "${RED}容器及所有数据已删除！${RESET}"
+    rm -rf "$config_dir" "$image_dir"
+}
+
+# ================= 菜单 =================
 while true; do
-    echo -e "\n${GREEN}=== Uptime Kuma 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1. 安装${RESET}"
-    echo -e "${GREEN}2. 更新${RESET}"
-    echo -e "${GREEN}3. 重启${RESET}"
-    echo -e "${GREEN}4. 停止${RESET}"
-    echo -e "${GREEN}5. 卸载 (包括数据)${RESET}"
-    echo -e "${GREEN}6. 查看日志${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN} EasyImage 图床 Docker 管理菜单 ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}1. 安装并启动容器${RESET}"
+    echo -e "${GREEN}2. 启动容器${RESET}"
+    echo -e "${GREEN}3. 停止容器${RESET}"
+    echo -e "${GREEN}4. 重启容器${RESET}"
+    echo -e "${GREEN}5. 查看容器状态${RESET}"
+    echo -e "${GREEN}6. 更新容器镜像${RESET}"
+    echo -e "${GREEN}7. 查看容器日志${RESET}"
+    echo -e "${RED}8. 卸载容器并删除所有数据${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    read -p "请选择操作: " choice
+    echo -e "${GREEN}==============================${RESET}"
+    read -p "请选择操作 [0-8]: " choice
 
     case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) restart_app ;;
-        4) stop_app ;;
-        5) uninstall_app ;;
-        6) view_logs ;;
-        0) exit ;;
-        *) echo -e "${GREEN}无效选择${RESET}" ;;
+        1) install_container ;;
+        2) start_container ;;
+        3) stop_container ;;
+        4) restart_container ;;
+        5) status_container ;;
+        6) update_container ;;
+        7) view_logs ;;
+        8) uninstall_all ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}输入错误，请重新选择。${RESET}" ;;
     esac
 done

@@ -1,157 +1,110 @@
 #!/bin/bash
-# Sehuatang Crawler 一键管理脚本（支持自定义端口和管理员密码，卸载彻底删除数据）
+# =========================================
+# Uptime Kuma 一键管理脚本
+# 支持安装 / 更新 / 重启 / 停止 / 卸载 / 查看日志
+# =========================================
+
+APP_NAME="uptime-kuma"
+IMAGE_NAME="louislam/uptime-kuma:1"
+VOLUME_NAME="uptime-kuma"
+CONFIG_FILE="./uptime-kuma.conf"
 
 GREEN="\033[32m"
 RESET="\033[0m"
 
-APP_NAME="sehuatang-crawler"
-BASE_DIR="/opt/sehuatang"
-YML_FILE="$BASE_DIR/docker-compose.yml"
-
-# 默认端口和密码
-DEFAULT_PORT=8000
-DEFAULT_ADMIN_PASS="admin123"
-
-# 获取公网IP
-get_ip() {
-    curl -s ipv4.icanhazip.com || curl -s ifconfig.me
+# 获取公网 IP
+function get_ip() {
+    curl -s ifconfig.me || curl -s ip.sb || echo "your-ip"
 }
 
-create_compose() {
-    local port=$1
-    local admin_pass=$2
+# 读取保存的端口
+if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+else
+    PORT=3001
+fi
 
-    mkdir -p "$BASE_DIR"
-
-    cat > $YML_FILE <<EOF
-version: '3.8'
-
-services:
-  sehuatang-crawler:
-    image: wyh3210277395/sehuatang-crawler:latest
-    container_name: sehuatang-crawler
-    ports:
-      - "${port}:${port}"
-    environment:
-      - DATABASE_HOST=postgres
-      - DATABASE_PORT=5432
-      - DATABASE_NAME=sehuatang_db
-      - DATABASE_USER=postgres
-      - DATABASE_PASSWORD=postgres123
-      - PYTHONPATH=/app/backend
-      - ENVIRONMENT=production
-      - ADMIN_PASSWORD=${admin_pass}
-    volumes:
-      - sehuatang_data:/app/data
-      - sehuatang_logs:/app/logs
-    depends_on:
-      - postgres
-    restart: unless-stopped
-
-  postgres:
-    image: postgres:15-alpine
-    container_name: sehuatang-postgres
-    ports:
-      - "5432:5432"
-    environment:
-      - POSTGRES_DB=sehuatang_db
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres123
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    restart: unless-stopped
-
-volumes:
-  sehuatang_data:
-  sehuatang_logs:
-  postgres_data:
-
-networks:
-  default:
-    name: sehuatang-network
-EOF
+function save_config() {
+    echo "PORT=$PORT" > $CONFIG_FILE
 }
 
-show_menu() {
-    echo -e "${GREEN}=== Sehuatang 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装并启动服务${RESET}"
-    echo -e "${GREEN}2) 停止服务${RESET}"
-    echo -e "${GREEN}3) 启动服务${RESET}"
-    echo -e "${GREEN}4) 重启服务${RESET}"
-    echo -e "${GREEN}5) 更新服务${RESET}"
-    echo -e "${GREEN}6) 查看爬虫日志${RESET}"
-    echo -e "${GREEN}7) 卸载服务（含数据）${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}========================${RESET}"
-    read -p "请选择: " choice
+function install_app() {
+    read -p "请输入访问端口 [默认:3001]: " input_port
+    PORT=${input_port:-3001}
+    save_config
+
+    echo -e "${GREEN}开始安装 ${APP_NAME}，端口: $PORT${RESET}"
+    docker pull $IMAGE_NAME
+    docker rm -f $APP_NAME 2>/dev/null
+    docker run -d \
+        --name=$APP_NAME \
+        --restart=unless-stopped \
+        -p $PORT:3001 \
+        -v $VOLUME_NAME:/app/data \
+        $IMAGE_NAME
+    IP=$(get_ip)
+    echo -e "${GREEN}安装完成！访问: http://$IP:$PORT${RESET}"
 }
 
-print_access_info() {
-    local ip=$(get_ip)
-    echo -e "🌐 访问地址: ${GREEN}http://$ip:${PORT}${RESET}"
-    echo -e "👤 管理员密码: ${GREEN}${ADMIN_PASSWORD}${RESET}"
+function update_app() {
+    echo -e "${GREEN}开始更新 ${APP_NAME}...${RESET}"
+    docker pull $IMAGE_NAME
+    docker rm -f $APP_NAME 2>/dev/null
+    docker run -d \
+        --name=$APP_NAME \
+        --restart=unless-stopped \
+        -p $PORT:3001 \
+        -v $VOLUME_NAME:/app/data \
+        $IMAGE_NAME
+    IP=$(get_ip)
+    echo -e "${GREEN}更新完成！访问: http://$IP:$PORT${RESET}"
 }
 
-install_app() {
-    read -p "请输入映射端口 (默认 ${DEFAULT_PORT}): " PORT
-    PORT=${PORT:-$DEFAULT_PORT}
-    read -p "请输入管理员密码 (默认 ${DEFAULT_ADMIN_PASS}): " ADMIN_PASSWORD
-    ADMIN_PASSWORD=${ADMIN_PASSWORD:-$DEFAULT_ADMIN_PASS}
-
-    create_compose "$PORT" "$ADMIN_PASSWORD"
-    docker compose -f $YML_FILE up -d
-    echo -e "✅ ${GREEN}Sehuatang 服务已安装并启动${RESET}"
-    print_access_info
+function restart_app() {
+    echo -e "${GREEN}正在重启 ${APP_NAME}...${RESET}"
+    docker restart $APP_NAME
+    IP=$(get_ip)
+    echo -e "${GREEN}重启完成！访问: http://$IP:$PORT${RESET}"
 }
 
-stop_app() {
-    docker compose -f $YML_FILE down
-    echo -e "🛑 ${GREEN}Sehuatang 服务已停止${RESET}"
+function stop_app() {
+    echo -e "${GREEN}正在停止 ${APP_NAME}...${RESET}"
+    docker stop $APP_NAME
+    echo -e "${GREEN}停止完成！${RESET}"
 }
 
-start_app() {
-    docker compose -f $YML_FILE up -d
-    echo -e "🚀 ${GREEN}Sehuatang 服务已启动${RESET}"
-    print_access_info
+function uninstall_app() {
+    echo -e "${GREEN}正在彻底卸载 ${APP_NAME} (包括数据)...${RESET}"
+    docker rm -f $APP_NAME 2>/dev/null
+    docker volume rm -f $VOLUME_NAME 2>/dev/null
+    rm -f $CONFIG_FILE
+    echo -e "${GREEN}已彻底卸载 ${APP_NAME}，数据卷和配置文件也已删除${RESET}"
 }
 
-restart_app() {
-    docker compose -f $YML_FILE down
-    docker compose -f $YML_FILE up -d
-    echo -e "🔄 ${GREEN}Sehuatang 服务已重启${RESET}"
-    print_access_info
-}
-
-update_app() {
-    docker compose -f $YML_FILE pull
-    docker compose -f $YML_FILE up -d
-    echo -e "⬆️ ${GREEN}Sehuatang 服务已更新到最新版本${RESET}"
-    print_access_info
-}
-
-logs_app() {
+function view_logs() {
+    echo -e "${GREEN}正在查看 ${APP_NAME} 日志 (Ctrl+C 退出)...${RESET}"
     docker logs -f $APP_NAME
 }
 
-uninstall_app() {
-    docker compose -f $YML_FILE down
-    rm -f $YML_FILE
-    # 删除数据卷
-    docker volume rm sehuatang_data sehuatang_logs postgres_data
-    echo -e "🗑️ ${GREEN}Sehuatang 服务已卸载，所有数据已删除${RESET}"
-}
-
 while true; do
-    show_menu
+    echo -e "\n${GREEN}=== Uptime Kuma 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1. 安装${RESET}"
+    echo -e "${GREEN}2. 更新${RESET}"
+    echo -e "${GREEN}3. 重启${RESET}"
+    echo -e "${GREEN}4. 停止${RESET}"
+    echo -e "${GREEN}5. 卸载 (包括数据)${RESET}"
+    echo -e "${GREEN}6. 查看日志${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    read -p "请选择操作: " choice
+
     case $choice in
         1) install_app ;;
-        2) stop_app ;;
-        3) start_app ;;
-        4) restart_app ;;
-        5) update_app ;;
-        6) logs_app ;;
-        7) uninstall_app ;;
-        0) exit 0 ;;
-        *) echo -e "❌ ${GREEN}无效选择${RESET}" ;;
+        2) update_app ;;
+        3) restart_app ;;
+        4) stop_app ;;
+        5) uninstall_app ;;
+        6) view_logs ;;
+        0) exit ;;
+        *) echo -e "${GREEN}无效选择${RESET}" ;;
     esac
 done

@@ -1,130 +1,206 @@
 #!/bin/bash
+# Sestea 管理脚本
 
-# ================= 配置 =================
-docker_name="easyimage"
-docker_img="ddsderek/easyimage:latest"
-docker_port=5663
-config_dir="/home/docker/easyimage/config"
-image_dir="/home/docker/easyimage/i"
+SERVICE_NAME="sestea"
+INSTALL_DIR="/opt/$SERVICE_NAME"
+PY_FILE="$INSTALL_DIR/sestea.py"
+SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
+PORT_FILE="$INSTALL_DIR/port.conf"
+DEFAULT_PORT=7122
 
-# 颜色定义
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-RESET="\033[0m"
+# 颜色
+GREEN="\e[32m"
+RESET="\e[0m"
 
-# ================= 函数 =================
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${RED}Docker 未安装，请先安装 Docker！${RESET}"
-        exit 1
+get_port() {
+    if [ -f "$PORT_FILE" ]; then
+        cat "$PORT_FILE"
+    else
+        echo "$DEFAULT_PORT"
     fi
 }
 
-check_port() {
-    local port=$1
-    while lsof -i:$port &>/dev/null; do
-        echo -e "${YELLOW}端口 $port 已被占用，尝试下一个端口...${RESET}"
-        port=$((port+1))
+check_env() {
+    echo ">>> 检查运行环境..."
+    if ! command -v python3 &>/dev/null; then
+        echo ">>> 未检测到 python3，正在安装..."
+        if command -v apt &>/dev/null; then
+            apt update -y && apt install -y python3 python3-pip curl
+        elif command -v yum &>/dev/null; then
+            yum install -y python3 python3-pip curl
+        elif command -v dnf &>/dev/null; then
+            dnf install -y python3 python3-pip curl
+        else
+            echo "请手动安装 python3"
+            exit 1
+        fi
+    fi
+
+    if ! python3 -m pip show psutil &>/dev/null; then
+        echo ">>> 未检测到 psutil，正在安装..."
+        python3 -m pip install --upgrade pip
+        python3 -m pip install psutil
+    fi
+}
+
+get_public_ip() {
+    ip=$(curl -s ifconfig.me || curl -s ipinfo.io/ip || curl -s api.ipify.org)
+    echo "$ip"
+}
+
+install_sestea() {
+    check_env
+    PORT=$(get_port)
+    echo ">>> 安装 Sestea 服务 (端口: $PORT)..."
+    mkdir -p $INSTALL_DIR
+
+    # 写入 Python 文件
+    cat > $PY_FILE <<EOF
+#!/usr/bin/env python3
+# Sestea
+
+import http.server
+import socketserver
+import json
+import time
+import psutil
+
+port = $PORT
+
+class RequestHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+
+        time.sleep(1)
+
+        cpu_usage = psutil.cpu_percent()
+        mem_usage = psutil.virtual_memory().percent
+        bytes_sent = psutil.net_io_counters().bytes_sent
+        bytes_recv = psutil.net_io_counters().bytes_recv
+        bytes_total = bytes_sent + bytes_recv
+
+        utc_timestamp = int(time.time())
+        uptime = int(time.time() - psutil.boot_time())
+        last_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+        response_dict = {
+            "utc_timestamp": utc_timestamp,
+            "uptime": uptime,
+            "cpu_usage": cpu_usage,
+            "mem_usage": mem_usage,
+            "bytes_sent": str(bytes_sent),
+            "bytes_recv": str(bytes_recv),
+            "bytes_total": str(bytes_total),
+            "last_time": last_time
+        }
+
+        response_json = json.dumps(response_dict).encode('utf-8')
+        self.wfile.write(response_json)
+
+    def log_message(self, format, *args):
+        return
+
+with socketserver.ThreadingTCPServer(("", port), RequestHandler) as httpd:
+    try:
+        print(f"Serving at port {port}")
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("Shutting down server...")
+        httpd.shutdown()
+EOF
+
+    chmod +x $PY_FILE
+
+    # 写入 systemd 服务
+    cat > $SERVICE_FILE <<EOF
+[Unit]
+Description=Sestea Monitoring Service
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 $PY_FILE
+WorkingDirectory=$INSTALL_DIR
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # 重新加载 systemd 并启动
+    systemctl daemon-reexec
+    systemctl enable --now $SERVICE_NAME
+
+    public_ip=$(get_public_ip)
+    echo ">>> 安装完成，服务已启动"
+    echo -e "访问地址: ${GREEN}http://$public_ip:$PORT/${RESET}"
+}
+
+uninstall_sestea() {
+    echo ">>> 卸载 Sestea 服务..."
+    systemctl stop $SERVICE_NAME
+    systemctl disable $SERVICE_NAME
+    rm -f $SERVICE_FILE
+    rm -rf $INSTALL_DIR
+    systemctl daemon-reexec
+    echo ">>> 已卸载完成"
+}
+
+start_sestea() {
+    systemctl start $SERVICE_NAME
+    echo ">>> 服务已启动"
+}
+
+stop_sestea() {
+    systemctl stop $SERVICE_NAME
+    echo ">>> 服务已停止"
+}
+
+status_sestea() {
+    systemctl status $SERVICE_NAME --no-pager
+}
+
+change_port() {
+    read -p "请输入新的端口号: " new_port
+    if [[ ! "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -le 0 ] || [ "$new_port" -gt 65535 ]; then
+        echo "无效端口号"
+        return
+    fi
+    echo "$new_port" > $PORT_FILE
+    echo "端口已修改为 $new_port，请卸载后，重新安装服务。"
+}
+
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}======================"
+        echo "   Sestea 管理菜单"
+        echo "======================${RESET}"
+        echo -e "${GREEN}1. 安装/部署${RESET}"
+        echo -e "${GREEN}2. 启动${RESET}"
+        echo -e "${GREEN}3. 停止${RESET}"
+        echo -e "${GREEN}4. 查看状态${RESET}"
+        echo -e "${GREEN}5. 卸载${RESET}"
+        echo -e "${GREEN}6. 修改端口${RESET}"
+        echo -e "${GREEN}0. 退出${RESET}"
+        echo -e "${GREEN}======================${RESET}"
+        read -p "请输入选项: " choice
+
+        case $choice in
+            1) install_sestea ;;
+            2) start_sestea ;;
+            3) stop_sestea ;;
+            4) status_sestea ;;
+            5) uninstall_sestea ;;
+            6) change_port ;;
+            0) exit 0 ;;
+            *) echo "无效选项" ;;
+        esac
+
+        read -p "按回车键继续..."
     done
-    echo $port
 }
 
-install_container() {
-    mkdir -p "$config_dir" "$image_dir"
-
-    # 检测端口
-    docker_port=$(check_port $docker_port)
-
-    echo -e "${GREEN}正在拉取镜像...${RESET}"
-    docker pull $docker_img
-
-    echo -e "${GREEN}正在启动容器...${RESET}"
-    docker run -d \
-        --name $docker_name \
-        -p $docker_port:80 \
-        -e TZ=Asia/Shanghai \
-        -e PUID=1000 \
-        -e PGID=1000 \
-        -v $config_dir:/app/web/config \
-        -v $image_dir:/app/web/i \
-        --restart unless-stopped \
-        $docker_img
-
-    # 获取公网 IP
-    public_ip=$(curl -s ifconfig.me)
-    echo -e "${GREEN}容器启动完成！${RESET}"
-    echo -e "${YELLOW}访问地址: http://$public_ip:$docker_port${RESET}"
-}
-
-update_container() {
-    echo -e "${GREEN}正在更新镜像...${RESET}"
-    docker pull $docker_img
-    docker stop $docker_name
-    docker rm $docker_name
-
-    echo -e "${GREEN}重新启动容器...${RESET}"
-    install_container
-}
-
-start_container() {
-    docker start $docker_name
-    echo -e "${GREEN}容器已启动！${RESET}"
-}
-
-stop_container() {
-    docker stop $docker_name
-    echo -e "${RED}容器已停止！${RESET}"
-}
-
-restart_container() {
-    docker restart $docker_name
-    echo -e "${GREEN}容器已重启！${RESET}"
-}
-
-status_container() {
-    docker ps -a --filter "name=$docker_name"
-}
-
-view_logs() {
-    echo -e "${GREEN}显示容器日志，按 Ctrl+C 返回菜单${RESET}"
-    docker logs -f $docker_name
-}
-
-uninstall_all() {
-    docker stop $docker_name
-    docker rm $docker_name
-    echo -e "${RED}容器及所有数据已删除！${RESET}"
-    rm -rf "$config_dir" "$image_dir"
-}
-
-# ================= 菜单 =================
-while true; do
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN} EasyImage 图床 Docker 管理菜单 ${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}1. 安装并启动容器${RESET}"
-    echo -e "${GREEN}2. 启动容器${RESET}"
-    echo -e "${GREEN}3. 停止容器${RESET}"
-    echo -e "${GREEN}4. 重启容器${RESET}"
-    echo -e "${GREEN}5. 查看容器状态${RESET}"
-    echo -e "${GREEN}6. 更新容器镜像${RESET}"
-    echo -e "${GREEN}7. 查看容器日志${RESET}"
-    echo -e "${RED}8. 卸载容器并删除所有数据${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    read -p "请选择操作 [0-8]: " choice
-
-    case $choice in
-        1) install_container ;;
-        2) start_container ;;
-        3) stop_container ;;
-        4) restart_container ;;
-        5) status_container ;;
-        6) update_container ;;
-        7) view_logs ;;
-        8) uninstall_all ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}输入错误，请重新选择。${RESET}" ;;
-    esac
-done
+menu

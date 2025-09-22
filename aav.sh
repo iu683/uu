@@ -1,99 +1,148 @@
 #!/bin/bash
+# ServerTraffic 管理脚本（菜单版，绿色字体）
+# 使用方法同前
 
-GREEN="\033[32m"
-RESET="\033[0m"
+SERVICE_NAME="servertraffic"
+PY_FILE="/root/${SERVICE_NAME}.py"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
-APP_NAME="OCI-Start"
-SCRIPT_URL="https://raw.githubusercontent.com/doubleDimple/shell-tools/master/oci-start.sh"
-SCRIPT_NAME="oci-start.sh"
+# 颜色
+GREEN="\e[32m"
+RESET="\e[0m"
 
-# 创建文件夹并下载脚本
-setup_script() {
-    echo -e "${GREEN}🚀 正在安装应用...${RESET}"
-    mkdir -p oci-start && cd oci-start
-    wget -O $SCRIPT_NAME $SCRIPT_URL
-    chmod +x $SCRIPT_NAME
-    echo -e "${GREEN}✅ 安装并设置完毕,选择2启动应用${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
+install_service() {
+    read -p "请输入服务端口（默认7122）: " PORT
+    PORT=${PORT:-7122}
+    echo -e "${GREEN}安装 ServerTraffic 服务，端口: $PORT${RESET}"
 
-# 安装应用
-install_app() {
-    ./oci-start.sh install
-    echo -e "${GREEN}✅ 应用已安装${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 启动应用
-start_app() {
-    oci-start start
-    echo -e "${GREEN}✅ 应用已启动${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 停止应用
-stop_app() {
-    oci-start stop
-    echo -e "${GREEN}✅ 应用已停止${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 重启应用
-restart_app() {
-    oci-start restart
-    echo -e "${GREEN}✅ 应用已重启${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 更新应用
-update_app() {
-    oci-start update
-    echo -e "${GREEN}✅ 应用已更新到最新版本${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 卸载应用
-uninstall_app() {
-    read -p "⚠️ 确认要完全卸载应用吗？(y/N): " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        oci-start uninstall
-        echo -e "${GREEN}✅ 应用已完全卸载${RESET}"
+    # 检查 Python3
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo -e "${GREEN}Python3 未安装，正在安装...${RESET}"
+        apt update
+        apt install -y python3
     else
-        echo "❌ 卸载操作已取消"
+        echo -e "${GREEN}Python3 已安装: $(python3 --version)${RESET}"
     fi
-    read -p "按回车键返回菜单..."
-    show_menu
+
+    # 检查 pip3
+    if ! command -v pip3 >/dev/null 2>&1; then
+        echo -e "${GREEN}pip3 未安装，正在安装...${RESET}"
+        apt install -y python3-pip
+    else
+        echo -e "${GREEN}pip3 已安装: $(pip3 --version)${RESET}"
+    fi
+
+    # 安装依赖
+    pip3 install --upgrade psutil
+
+    # 写入 Python 脚本
+    cat > "$PY_FILE" <<EOF
+#!/usr/bin/env python3
+import http.server
+import socketserver
+import json
+import time
+import psutil
+
+port = $PORT
+
+class RequestHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        time.sleep(1)
+        cpu_usage = psutil.cpu_percent()
+        mem_usage = psutil.virtual_memory().percent
+        net = psutil.net_io_counters()
+        bytes_sent = net.bytes_sent
+        bytes_recv = net.bytes_recv
+        bytes_total = bytes_sent + bytes_recv
+        response_dict = {
+            "utc_timestamp": int(time.time()),
+            "uptime": int(time.time() - psutil.boot_time()),
+            "cpu_usage": cpu_usage,
+            "mem_usage": mem_usage,
+            "bytes_sent": str(bytes_sent),
+            "bytes_recv": str(bytes_recv),
+            "bytes_total": str(bytes_total),
+            "last_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        }
+        self.wfile.write(json.dumps(response_dict).encode('utf-8'))
+
+with socketserver.ThreadingTCPServer(("", port), RequestHandler) as httpd:
+    try:
+        print(f"Serving at port {port}")
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt captured, exiting")
+EOF
+
+    chmod +x "$PY_FILE"
+
+    # 创建 systemd 服务
+    cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Server Traffic Monitor
+
+[Service]
+Type=simple
+WorkingDirectory=/root/
+User=root
+ExecStart=/usr/bin/python3 $PY_FILE
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl start "$SERVICE_NAME"
+    systemctl enable "$SERVICE_NAME"
+    echo -e "${GREEN}安装完成，服务正在运行。${RESET}"
 }
 
-# 显示主菜单
-show_menu() {
-    clear
-    echo -e "${GREEN}=== OCI-Start 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装应用${RESET}"
-    echo -e "${GREEN}2) 启动应用${RESET}"
-    echo -e "${GREEN}3) 停止应用${RESET}"
-    echo -e "${GREEN}4) 重启应用${RESET}"
-    echo -e "${GREEN}5) 更新应用${RESET}"
-    echo -e "${GREEN}6) 卸载应用${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}===========================${RESET}"
-    read -p "请选择: " choice
-    case $choice in
-        1) setup_script ;;
-        2) start_app ;;
-        3) stop_app ;;
-        4) restart_app ;;
-        5) update_app ;;
-        6) uninstall_app ;;
-        0) exit ;;
-        *) echo "❌ 无效选择"; sleep 1; show_menu ;;
+uninstall_service() {
+    echo -e "${GREEN}卸载 ServerTraffic 服务...${RESET}"
+    systemctl stop "$SERVICE_NAME" 2>/dev/null
+    systemctl disable "$SERVICE_NAME" 2>/dev/null
+    rm -f "$PY_FILE"
+    rm -f "$SERVICE_FILE"
+    systemctl daemon-reload
+    echo -e "${GREEN}卸载完成。${RESET}"
+}
+
+status_service() {
+    systemctl status "$SERVICE_NAME" --no-pager
+}
+
+# 菜单循环
+while true; do
+    echo -e "${GREEN}======================================${RESET}"
+    echo -e "${GREEN}        ServerTraffic 管理菜单        ${RESET}"
+    echo -e "${GREEN}======================================${RESET}"
+    echo -e "${GREEN}1) 安装服务${RESET}"
+    echo -e "${GREEN}2) 卸载服务${RESET}"
+    echo -e "${GREEN}3) 查看服务状态${RESET}"
+    echo -e "${GREEN}4) 退出${RESET}"
+    read -p "$(echo -e ${GREEN}请选择操作 [1-4]: ${RESET})" choice
+
+    case "$choice" in
+        1)
+            install_service
+            ;;
+        2)
+            uninstall_service
+            ;;
+        3)
+            status_service
+            ;;
+        4)
+            echo -e "${GREEN}退出脚本${RESET}"
+            exit 0
+            ;;
+        *)
+            echo -e "${GREEN}无效选项，请重新选择${RESET}"
+            ;;
     esac
-}
-
-show_menu
+done

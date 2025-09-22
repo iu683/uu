@@ -1,175 +1,147 @@
 #!/bin/bash
-# Sehuatang Crawler 一键管理脚本（支持自定义端口和管理员密码，卸载彻底删除数据）
+# Docker 监控管理脚本（菜单版，绿色字体，可自定义端口）
 
-GREEN="\033[32m"
-RESET="\033[0m"
+SERVICE_NAME="docker-monitor"
+PY_FILE="/root/docker_monitor.py"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
-APP_NAME="sehuatang-crawler"
-POSTGRES_NAME="sehuatang-postgres"
-BASE_DIR="/opt/sehuatang"
-YML_FILE="$BASE_DIR/docker-compose.yml"
-
-# 默认端口和密码
-DEFAULT_PORT=8000
-DEFAULT_ADMIN_PASS="admin123"
-
-# 获取公网IP
-get_ip() {
-    ip=$(curl -s ipv4.icanhazip.com || curl -s ifconfig.me)
-    echo "${ip:-localhost}"
-}
-
-# 创建 docker-compose.yml
-create_compose() {
-    local port=$1
-    local admin_pass=$2
-
-    mkdir -p "$BASE_DIR"
-
-    cat > $YML_FILE <<EOF
-services:
-  sehuatang-crawler:
-    image: wyh3210277395/sehuatang-crawler:latest
-    container_name: ${APP_NAME}
-    ports:
-      - "${port}:8000"
-    environment:
-      - DATABASE_HOST=postgres
-      - DATABASE_PORT=5432
-      - DATABASE_NAME=sehuatang_db
-      - DATABASE_USER=postgres
-      - DATABASE_PASSWORD=postgres123
-      - PYTHONPATH=/app/backend
-      - ENVIRONMENT=production
-      - ADMIN_PASSWORD=${admin_pass}
-    volumes:
-      - sehuatang_data:/app/data
-      - sehuatang_logs:/app/logs
-    depends_on:
-      - postgres
-    restart: unless-stopped
-
-  postgres:
-    image: postgres:15-alpine
-    container_name: ${POSTGRES_NAME}
-    ports:
-      - "5432:5432"
-    environment:
-      - POSTGRES_DB=sehuatang_db
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres123
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    restart: unless-stopped
-
-volumes:
-  sehuatang_data:
-  sehuatang_logs:
-  postgres_data:
-
-networks:
-  default:
-    name: sehuatang-network
-EOF
-}
-
-# 显示菜单
-show_menu() {
-    echo -e "${GREEN}=== Sehuatang 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装并启动服务${RESET}"
-    echo -e "${GREEN}2) 停止服务${RESET}"
-    echo -e "${GREEN}3) 启动服务${RESET}"
-    echo -e "${GREEN}4) 重启服务${RESET}"
-    echo -e "${GREEN}5) 更新服务${RESET}"
-    echo -e "${GREEN}6) 查看爬虫日志${RESET}"
-    echo -e "${GREEN}7) 查看数据库日志${RESET}"
-    echo -e "${GREEN}8) 卸载服务（含数据）${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}========================${RESET}"
-}
-
-# 打印访问信息
-print_access_info() {
-    local ip=$(get_ip)
-    echo -e "🌐 访问地址: ${GREEN}http://$ip:${PORT}${RESET}"
-    echo -e "👤 管理员密码: ${GREEN}${ADMIN_PASSWORD}${RESET}"
-}
+# 颜色
+GREEN="\e[32m"
+RESET="\e[0m"
 
 # 安装服务
-install_app() {
-    read -p "请输入映射端口 (默认 ${DEFAULT_PORT}): " PORT
-    PORT=${PORT:-$DEFAULT_PORT}
-    read -p "请输入管理员密码 (默认 ${DEFAULT_ADMIN_PASS}): " ADMIN_PASSWORD
-    ADMIN_PASSWORD=${ADMIN_PASSWORD:-$DEFAULT_ADMIN_PASS}
+install_service() {
+    read -p "请输入服务端口（默认7124）: " PORT
+    PORT=${PORT:-7124}
+    echo -e "${GREEN}安装 Docker 监控服务，端口: $PORT${RESET}"
 
-    create_compose "$PORT" "$ADMIN_PASSWORD"
-    docker compose -f $YML_FILE up -d --remove-orphans
-    echo -e "✅ ${GREEN}Sehuatang 服务已安装并启动${RESET}"
-    print_access_info
-}
+    # 检查 Python3
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo -e "${GREEN}Python3 未安装，正在安装...${RESET}"
+        apt update
+        apt install -y python3
+    else
+        echo -e "${GREEN}Python3 已安装: $(python3 --version)${RESET}"
+    fi
 
-# 停止服务
-stop_app() {
-    docker compose -f $YML_FILE down
-    echo -e "🛑 ${GREEN}Sehuatang 服务已停止${RESET}"
-}
+    # 写入 Python 脚本
+    cat > "$PY_FILE" <<EOF
+#!/usr/bin/env python3
+import http.server
+import socketserver
+import json
+import subprocess
+import time
 
-# 启动服务
-start_app() {
-    docker compose -f $YML_FILE up -d --remove-orphans
-    echo -e "🚀 ${GREEN}Sehuatang 服务已启动${RESET}"
-    print_access_info
-}
+PORT = $PORT
 
-# 重启服务
-restart_app() {
-    docker compose -f $YML_FILE down
-    docker compose -f $YML_FILE up -d --remove-orphans
-    echo -e "🔄 ${GREEN}Sehuatang 服务已重启${RESET}"
-    print_access_info
-}
+class SimpleDockerMonitor(http.server.BaseHTTPRequestHandler):
+    def get_docker_status(self):
+        try:
+            subprocess.run(["docker", "info"], capture_output=True, text=True, check=True)
+            docker_status = "运行中"
+        except subprocess.CalledProcessError:
+            docker_status = "未运行"
 
-# 更新服务
-update_app() {
-    docker compose -f $YML_FILE pull
-    docker compose -f $YML_FILE up -d --remove-orphans
-    echo -e "⬆️ ${GREEN}Sehuatang 服务已更新到最新版本${RESET}"
-    print_access_info
-}
+        try:
+            total = len(subprocess.check_output(["docker", "ps", "-a", "-q"]).decode().splitlines())
+            running = len(subprocess.check_output(["docker", "ps", "-q"]).decode().splitlines())
+        except Exception:
+            total = 0
+            running = 0
 
-# 查看爬虫日志
-logs_app() {
-    docker logs -f $APP_NAME
-}
+        return {
+            "docker_status": docker_status,
+            "total_containers": total,
+            "running_containers": running
+        }
 
-# 查看数据库日志
-logs_db() {
-    docker logs -f $POSTGRES_NAME
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        response = self.get_docker_status()
+        response["last_time"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        self.wfile.write(json.dumps(response, indent=2).encode('utf-8'))
+
+with socketserver.ThreadingTCPServer(("", PORT), SimpleDockerMonitor) as httpd:
+    print(f"Serving simplified Docker monitor at port {PORT}")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt captured, exiting")
+EOF
+
+    chmod +x "$PY_FILE"
+
+    # 创建 systemd 服务
+    cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Simple Docker Monitor
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root
+ExecStart=/usr/bin/python3 $PY_FILE
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # 启动并开机自启
+    systemctl daemon-reload
+    systemctl start "$SERVICE_NAME"
+    systemctl enable "$SERVICE_NAME"
+    echo -e "${GREEN}安装完成，服务正在运行。访问端口: $PORT${RESET}"
 }
 
 # 卸载服务
-uninstall_app() {
-    docker compose -f $YML_FILE down
-    rm -f $YML_FILE
-    # 删除数据卷，强制删除避免报错
-    docker volume rm -f sehuatang_data sehuatang_logs postgres_data
-    echo -e "🗑️ ${GREEN}Sehuatang 服务已卸载，所有数据已删除${RESET}"
+uninstall_service() {
+    echo -e "${GREEN}卸载 Docker 监控服务...${RESET}"
+    systemctl stop "$SERVICE_NAME" 2>/dev/null
+    systemctl disable "$SERVICE_NAME" 2>/dev/null
+    rm -f "$PY_FILE"
+    rm -f "$SERVICE_FILE"
+    systemctl daemon-reload
+    echo -e "${GREEN}卸载完成。${RESET}"
 }
 
-# 主循环
+# 查看状态
+status_service() {
+    systemctl status "$SERVICE_NAME" --no-pager
+}
+
+# 菜单循环
 while true; do
-    show_menu
-    read -p "请选择: " choice
-    case $choice in
-        1) install_app ;;
-        2) stop_app ;;
-        3) start_app ;;
-        4) restart_app ;;
-        5) update_app ;;
-        6) logs_app ;;
-        7) logs_db ;;
-        8) uninstall_app ;;
-        0) exit 0 ;;
-        *) echo -e "❌ ${GREEN}无效选择${RESET}" ;;
+    echo -e "${GREEN}======================================${RESET}"
+    echo -e "${GREEN}        Docker 监控管理菜单           ${RESET}"
+    echo -e "${GREEN}======================================${RESET}"
+    echo -e "${GREEN}1) 安装服务${RESET}"
+    echo -e "${GREEN}2) 卸载服务${RESET}"
+    echo -e "${GREEN}3) 查看服务状态${RESET}"
+    echo -e "${GREEN}4) 退出${RESET}"
+    read -p "$(echo -e ${GREEN}请选择操作 [1-4]: ${RESET})" choice
+
+    case "$choice" in
+        1)
+            install_service
+            ;;
+        2)
+            uninstall_service
+            ;;
+        3)
+            status_service
+            ;;
+        4)
+            echo -e "${GREEN}退出脚本${RESET}"
+            exit 0
+            ;;
+        *)
+            echo -e "${GREEN}无效选项，请重新选择${RESET}"
+            ;;
     esac
 done

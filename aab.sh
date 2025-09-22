@@ -1,99 +1,221 @@
 #!/bin/bash
+# Sestea 管理脚本 - 公网监听版
 
-GREEN="\033[32m"
-RESET="\033[0m"
+SERVICE_NAME="sestea"
+INSTALL_DIR="/opt/$SERVICE_NAME"
+PY_FILE="$INSTALL_DIR/sestea.py"
+SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
+PORT_FILE="$INSTALL_DIR/port.conf"
+DEFAULT_PORT=7122
 
-APP_NAME="OCI-Start"
-SCRIPT_URL="https://raw.githubusercontent.com/doubleDimple/shell-tools/master/oci-start.sh"
-SCRIPT_NAME="oci-start.sh"
+# 颜色
+GREEN="\e[32m"
+RESET="\e[0m"
+RED="\e[31m"
 
-# 创建文件夹并下载脚本
-setup_script() {
-    echo -e "${GREEN}🚀 正在安装应用...${RESET}"
-    mkdir -p oci-start && cd oci-start
-    wget -O $SCRIPT_NAME $SCRIPT_URL
-    chmod +x $SCRIPT_NAME
-    echo -e "${GREEN}✅ 安装并设置完毕,选择2启动应用${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 安装应用
-install_app() {
-    ./oci-start.sh install
-    echo -e "${GREEN}✅ 应用已安装${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 启动应用
-start_app() {
-    ./oci-start.sh start
-    echo -e "${GREEN}✅ 应用已启动${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 停止应用
-stop_app() {
-    oci-start stop
-    echo -e "${GREEN}✅ 应用已停止${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 重启应用
-restart_app() {
-    oci-start restart
-    echo -e "${GREEN}✅ 应用已重启${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 更新应用
-update_app() {
-    oci-start update
-    echo -e "${GREEN}✅ 应用已更新到最新版本${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
-}
-
-# 卸载应用
-uninstall_app() {
-    read -p "⚠️ 确认要完全卸载应用吗？(y/N): " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        oci-start uninstall
-        echo -e "${GREEN}✅ 应用已完全卸载${RESET}"
+get_port() {
+    if [ -f "$PORT_FILE" ]; then
+        cat "$PORT_FILE"
     else
-        echo "❌ 卸载操作已取消"
+        echo "$DEFAULT_PORT"
     fi
-    read -p "按回车键返回菜单..."
-    show_menu
 }
 
-# 显示主菜单
-show_menu() {
-    clear
-    echo -e "${GREEN}=== OCI-Start 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装应用${RESET}"
-    echo -e "${GREEN}2) 启动应用${RESET}"
-    echo -e "${GREEN}3) 停止应用${RESET}"
-    echo -e "${GREEN}4) 重启应用${RESET}"
-    echo -e "${GREEN}5) 更新应用${RESET}"
-    echo -e "${GREEN}6) 卸载应用${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}===========================${RESET}"
-    read -p "请选择: " choice
-    case $choice in
-        1) setup_script ;;
-        2) start_app ;;
-        3) stop_app ;;
-        4) restart_app ;;
-        5) update_app ;;
-        6) uninstall_app ;;
-        0) exit ;;
-        *) echo "❌ 无效选择"; sleep 1; show_menu ;;
-    esac
+check_env() {
+    echo ">>> 检查运行环境..."
+    if ! command -v python3 &>/dev/null; then
+        echo ">>> 未检测到 python3，正在安装..."
+        if command -v apt &>/dev/null; then
+            apt update -y && apt install -y python3 python3-pip curl
+        elif command -v yum &>/dev/null; then
+            yum install -y python3 python3-pip curl
+        elif command -v dnf &>/dev/null; then
+            dnf install -y python3 python3-pip curl
+        else
+            echo "请手动安装 python3"
+            exit 1
+        fi
+    fi
+
+    if ! python3 -m pip show psutil &>/dev/null; then
+        echo ">>> 未检测到 psutil，正在安装..."
+        python3 -m pip install --upgrade pip
+        python3 -m pip install psutil
+    fi
 }
 
-show_menu
+get_public_ip() {
+    ip=$(curl -s ifconfig.me || curl -s ipinfo.io/ip || curl -s api.ipify.org || dig +short myip.opendns.com @resolver1.opendns.com)
+    echo "$ip"
+}
+
+write_python_file() {
+    PORT=$(get_port)
+    mkdir -p $INSTALL_DIR
+
+    cat > $PY_FILE <<EOF
+#!/usr/bin/env python3
+# Sestea
+
+import http.server
+import socketserver
+import json
+import time
+import psutil
+
+port = $PORT
+bind = "0.0.0.0"  # 公网监听
+
+class RequestHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+
+        cpu_usage = psutil.cpu_percent()
+        mem_usage = psutil.virtual_memory().percent
+        bytes_sent = psutil.net_io_counters().bytes_sent
+        bytes_recv = psutil.net_io_counters().bytes_recv
+        bytes_total = bytes_sent + bytes_recv
+
+        utc_timestamp = int(time.time())
+        uptime = int(time.time() - psutil.boot_time())
+        last_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+        response_dict = {
+            "utc_timestamp": utc_timestamp,
+            "uptime": uptime,
+            "cpu_usage": cpu_usage,
+            "mem_usage": mem_usage,
+            "bytes_sent": str(bytes_sent),
+            "bytes_recv": str(bytes_recv),
+            "bytes_total": str(bytes_total),
+            "last_time": last_time
+        }
+
+        response_json = json.dumps(response_dict).encode('utf-8')
+        self.wfile.write(response_json)
+
+    def log_message(self, format, *args):
+        return
+
+with socketserver.ThreadingTCPServer((bind, port), RequestHandler) as httpd:
+    try:
+        print(f"Serving at {bind}:{port}")
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("Shutting down server...")
+        httpd.shutdown()
+EOF
+    chmod +x $PY_FILE
+}
+
+install_sestea() {
+    check_env
+    PORT=$(get_port)
+
+    echo ">>> 安装 Sestea 服务 (公网监听, 端口: $PORT)..."
+    write_python_file
+
+    echo ">>> 测试 Python 服务..."
+    if ! timeout 3 python3 $PY_FILE &>/dev/null & then
+        echo -e "${RED}>>> Python 文件运行失败，请检查依赖${RESET}"
+        exit 1
+    fi
+    sleep 2
+    pkill -f "$PY_FILE"
+
+    cat > $SERVICE_FILE <<EOF
+[Unit]
+Description=Sestea Monitoring Service
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 $PY_FILE
+WorkingDirectory=$INSTALL_DIR
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now $SERVICE_NAME
+
+    public_ip=$(get_public_ip)
+    echo ">>> 安装完成，服务已启动"
+    echo -e "访问地址: ${GREEN}http://$public_ip:$PORT ${RESET}"
+}
+
+uninstall_sestea() {
+    echo ">>> 卸载 Sestea 服务..."
+    systemctl stop $SERVICE_NAME
+    systemctl disable $SERVICE_NAME
+    rm -f $SERVICE_FILE
+    rm -rf $INSTALL_DIR
+    systemctl daemon-reload
+    echo ">>> 已卸载完成"
+}
+
+start_sestea() {
+    systemctl start $SERVICE_NAME
+    echo ">>> 服务已启动"
+}
+
+stop_sestea() {
+    systemctl stop $SERVICE_NAME
+    echo ">>> 服务已停止"
+}
+
+status_sestea() {
+    systemctl status $SERVICE_NAME --no-pager
+}
+
+change_port() {
+    read -p "请输入新的端口号: " new_port
+    if [[ ! "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -le 0 ] || [ "$new_port" -gt 65535 ]; then
+        echo "无效端口号"
+        return
+    fi
+    echo "$new_port" > $PORT_FILE
+    write_python_file
+    systemctl daemon-reload
+    systemctl restart $SERVICE_NAME
+    echo "端口已修改为 $new_port，并已重启服务。"
+}
+
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}======================${RESET}"
+        echo -e "${GREEN}   Sestea 管理菜单     ${RESET}"
+        echo -e "${GREEN}======================${RESET}"
+        echo -e "${GREEN}1. 安装/部署${RESET}"
+        echo -e "${GREEN}2. 启动${RESET}"
+        echo -e "${GREEN}3. 停止${RESET}"
+        echo -e "${GREEN}4. 查看状态${RESET}"
+        echo -e "${GREEN}5. 卸载${RESET}"
+        echo -e "${GREEN}6. 修改端口${RESET}"
+        echo -e "${GREEN}0. 退出${RESET}"
+        echo -e "${GREEN}======================${RESET}"
+        read -p "请输入选项: " choice
+
+        case $choice in
+            1) install_sestea ;;
+            2) start_sestea ;;
+            3) stop_sestea ;;
+            4) status_sestea ;;
+            5) uninstall_sestea ;;
+            6) change_port ;;
+            0) exit 0 ;;
+            *) echo "无效选项" ;;
+        esac
+
+        read -p "按回车键继续..."
+    done
+}
+
+menu

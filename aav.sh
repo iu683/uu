@@ -1,148 +1,135 @@
 #!/bin/bash
-# ServerTraffic 管理脚本（菜单版，绿色字体）
-# 使用方法同前
+# Cloudreve 管理脚本（部署 + 管理菜单，统一目录 /opt/cloudreve）
 
-SERVICE_NAME="servertraffic"
-PY_FILE="/root/${SERVICE_NAME}.py"
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+BASE_DIR="/opt/cloudreve"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
+
+# 默认值
+DEFAULT_PORT=5212
+DEFAULT_DB_PASS="55689"
+DEFAULT_REDIS_PASS="55697"
 
 # 颜色
 GREEN="\e[32m"
+RED="\e[31m"
 RESET="\e[0m"
 
-install_service() {
-    read -p "请输入服务端口（默认7122）: " PORT
-    PORT=${PORT:-7122}
-    echo -e "${GREEN}安装 ServerTraffic 服务，端口: $PORT${RESET}"
+# 确保目录存在
+mkdir -p "$BASE_DIR"
 
-    # 检查 Python3
-    if ! command -v python3 >/dev/null 2>&1; then
-        echo -e "${GREEN}Python3 未安装，正在安装...${RESET}"
-        apt update
-        apt install -y python3
-    else
-        echo -e "${GREEN}Python3 已安装: $(python3 --version)${RESET}"
-    fi
+# 部署函数
+deploy() {
+    echo -e "${GREEN}=== Cloudreve 部署 ===${RESET}"
+    read -p "$(echo -e ${GREEN}请输入 Cloudreve 端口 [默认: $DEFAULT_PORT]: ${RESET})" PORT
+    PORT=${PORT:-$DEFAULT_PORT}
 
-    # 检查 pip3
-    if ! command -v pip3 >/dev/null 2>&1; then
-        echo -e "${GREEN}pip3 未安装，正在安装...${RESET}"
-        apt install -y python3-pip
-    else
-        echo -e "${GREEN}pip3 已安装: $(pip3 --version)${RESET}"
-    fi
+    read -p "$(echo -e ${GREEN}请输入 PostgreSQL 密码 [默认: $DEFAULT_DB_PASS]: ${RESET})" DB_PASSWORD
+    DB_PASSWORD=${DB_PASSWORD:-$DEFAULT_DB_PASS}
 
-    # 安装依赖
-    pip3 install --upgrade psutil
+    read -p "$(echo -e ${GREEN}请输入 Redis 密码 [默认: $DEFAULT_REDIS_PASS]: ${RESET})" REDIS_PASSWORD
+    REDIS_PASSWORD=${REDIS_PASSWORD:-$DEFAULT_REDIS_PASS}
 
-    # 写入 Python 脚本
-    cat > "$PY_FILE" <<EOF
-#!/usr/bin/env python3
-import http.server
-import socketserver
-import json
-import time
-import psutil
-
-port = $PORT
-
-class RequestHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'application/json')
-        self.end_headers()
-        time.sleep(1)
-        cpu_usage = psutil.cpu_percent()
-        mem_usage = psutil.virtual_memory().percent
-        net = psutil.net_io_counters()
-        bytes_sent = net.bytes_sent
-        bytes_recv = net.bytes_recv
-        bytes_total = bytes_sent + bytes_recv
-        response_dict = {
-            "utc_timestamp": int(time.time()),
-            "uptime": int(time.time() - psutil.boot_time()),
-            "cpu_usage": cpu_usage,
-            "mem_usage": mem_usage,
-            "bytes_sent": str(bytes_sent),
-            "bytes_recv": str(bytes_recv),
-            "bytes_total": str(bytes_total),
-            "last_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        }
-        self.wfile.write(json.dumps(response_dict).encode('utf-8'))
-
-with socketserver.ThreadingTCPServer(("", port), RequestHandler) as httpd:
-    try:
-        print(f"Serving at port {port}")
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        print("KeyboardInterrupt captured, exiting")
+    # 生成 .env 文件
+    cat > $ENV_FILE <<EOF
+PORT=$PORT
+DB_PASSWORD=$DB_PASSWORD
+REDIS_PASSWORD=$REDIS_PASSWORD
 EOF
+    echo -e "${GREEN}[√] 已生成 $ENV_FILE${RESET}"
 
-    chmod +x "$PY_FILE"
+    # 生成 docker-compose.yml
+    cat > $COMPOSE_FILE <<EOF
+services:
+  cloudreve:
+    image: cloudreve/cloudreve:latest
+    container_name: cloudreve-backend
+    depends_on:
+      - postgresql
+      - redis
+    restart: always
+    ports:
+      - "\${PORT}:5212"
+      - "6888:6888"
+      - "6888:6888/udp"
+    environment:
+      - CR_CONF_Database.Type=postgres
+      - CR_CONF_Database.Host=postgresql
+      - CR_CONF_Database.User=cloudreve
+      - CR_CONF_Database.Password=\${DB_PASSWORD}
+      - CR_CONF_Database.Name=cloudreve
+      - CR_CONF_Database.Port=5432
+      - CR_CONF_Redis.Server=redis:6379
+      - CR_CONF_Redis.Password=\${REDIS_PASSWORD}
+    volumes:
+      - ${BASE_DIR}/cloudreve:/cloudreve/data
 
-    # 创建 systemd 服务
-    cat > "$SERVICE_FILE" <<EOF
-[Unit]
-Description=Server Traffic Monitor
+  postgresql:
+    image: postgres:17
+    container_name: postgresql
+    environment:
+      - POSTGRES_USER=cloudreve
+      - POSTGRES_PASSWORD=\${DB_PASSWORD}
+      - POSTGRES_DB=cloudreve
+    volumes:
+      - ${BASE_DIR}/postgres:/var/lib/postgresql/data
 
-[Service]
-Type=simple
-WorkingDirectory=/root/
-User=root
-ExecStart=/usr/bin/python3 $PY_FILE
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
+  redis:
+    image: redis:latest
+    container_name: redis
+    command: ["redis-server", "--requirepass", "\${REDIS_PASSWORD}"]
+    volumes:
+      - ${BASE_DIR}/redis:/data
 EOF
+    echo -e "${GREEN}[√] 已生成 $COMPOSE_FILE${RESET}"
 
-    systemctl daemon-reload
-    systemctl start "$SERVICE_NAME"
-    systemctl enable "$SERVICE_NAME"
-    echo -e "${GREEN}安装完成，服务正在运行。${RESET}"
+    cd "$BASE_DIR" && docker compose up -d
+    echo -e "${GREEN}=== 部署完成！===${RESET}"
+    echo -e "${GREEN}Cloudreve 管理面板: http://<服务器IP>:$PORT${RESET}"
 }
 
-uninstall_service() {
-    echo -e "${GREEN}卸载 ServerTraffic 服务...${RESET}"
-    systemctl stop "$SERVICE_NAME" 2>/dev/null
-    systemctl disable "$SERVICE_NAME" 2>/dev/null
-    rm -f "$PY_FILE"
-    rm -f "$SERVICE_FILE"
-    systemctl daemon-reload
-    echo -e "${GREEN}卸载完成。${RESET}"
+# 卸载函数
+uninstall() {
+    echo -e "${RED}警告: 这将删除 Cloudreve, PostgreSQL, Redis 及其数据！${RESET}"
+    read -p "是否继续? (y/N): " CONFIRM
+    if [[ "$CONFIRM" == "y" || "$CONFIRM" == "Y" ]]; then
+        cd "$BASE_DIR" && docker compose down -v
+        rm -rf "$BASE_DIR"
+        echo -e "${GREEN}[√] 已卸载 Cloudreve${RESET}"
+    else
+        echo -e "${GREEN}已取消操作${RESET}"
+    fi
 }
 
-status_service() {
-    systemctl status "$SERVICE_NAME" --no-pager
+# 更新函数
+update() {
+    echo -e "${GREEN}=== 更新 Cloudreve / PostgreSQL / Redis 镜像 ===${RESET}"
+    cd "$BASE_DIR" && docker compose pull && docker compose up -d
+    echo -e "${GREEN}[√] 更新完成${RESET}"
 }
 
-# 菜单循环
+# 管理菜单
 while true; do
-    echo -e "${GREEN}======================================${RESET}"
-    echo -e "${GREEN}        ServerTraffic 管理菜单        ${RESET}"
-    echo -e "${GREEN}======================================${RESET}"
-    echo -e "${GREEN}1) 安装服务${RESET}"
-    echo -e "${GREEN}2) 卸载服务${RESET}"
-    echo -e "${GREEN}3) 查看服务状态${RESET}"
-    echo -e "${GREEN}4) 退出${RESET}"
-    read -p "$(echo -e ${GREEN}请选择操作 [1-4]: ${RESET})" choice
+    echo -e "${GREEN}=== Cloudreve 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 部署/重新部署${RESET}"
+    echo -e "${GREEN}2) 启动${RESET}"
+    echo -e "${GREEN}3) 停止${RESET}"
+    echo -e "${GREEN}4) 重启${RESET}"
+    echo -e "${GREEN}5) 查看日志${RESET}"
+    echo -e "${GREEN}6) 卸载${RESET}"
+    echo -e "${GREEN}7) 更新${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    read -p "$(echo -e ${GREEN}请输入选项: ${RESET})" CHOICE
 
-    case "$choice" in
-        1)
-            install_service
-            ;;
-        2)
-            uninstall_service
-            ;;
-        3)
-            status_service
-            ;;
-        4)
-            echo -e "${GREEN}退出脚本${RESET}"
-            exit 0
-            ;;
-        *)
-            echo -e "${GREEN}无效选项，请重新选择${RESET}"
-            ;;
+    case $CHOICE in
+        1) deploy ;;
+        2) cd "$BASE_DIR" && docker compose start ;;
+        3) cd "$BASE_DIR" && docker compose stop ;;
+        4) cd "$BASE_DIR" && docker compose restart ;;
+        5) cd "$BASE_DIR" && docker compose logs -f ;;
+        6) uninstall ;;
+        7) update ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项，请重试${RESET}" ;;
     esac
 done

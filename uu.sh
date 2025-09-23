@@ -1,115 +1,158 @@
 #!/bin/bash
-# Pairdrop 管理脚本 (绿色菜单版)
+# 随机图片 API 管理脚本 (支持自动安装 PHP + SSL 证书)
+# 系统支持: Debian/Ubuntu
 
-SERVICE_NAME="pairdrop"
-INSTALL_DIR="/opt/$SERVICE_NAME"
-COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+RESET="\033[0m"
 
-# 颜色
-GREEN="\e[32m"
-RESET="\e[0m"
+NGINX_CONF_DIR="/etc/nginx/sites-available"
+NGINX_ENABLED_DIR="/etc/nginx/sites-enabled"
+PHP_VERSION="8.2"
+PHP_FPM_SOCK="/run/php/php${PHP_VERSION}-fpm.sock"
 
-install() {
-    echo -e "${GREEN}>>> 开始安装 Pairdrop 服务...${RESET}"
+# 检查 root 权限
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}请用 root 用户运行${RESET}"
+    exit 1
+fi
 
-    read -p "请输入映射端口 (默认 3000): " PORT
-    PORT=${PORT:-3000}
+# 安装依赖
+install_dependencies() {
+    echo -e "${YELLOW}>>> 安装 Nginx, PHP, Certbot...${RESET}"
+    apt update
+    apt install -y nginx php${PHP_VERSION}-fpm php${PHP_VERSION}-cli php${PHP_VERSION}-common unzip curl certbot python3-certbot-nginx
+    systemctl enable --now nginx
+    systemctl enable --now php${PHP_VERSION}-fpm
+}
 
-    read -p "请输入时区 (默认 Asia/Shanghai): " TZ
-    TZ=${TZ:-Asia/Shanghai}
+# 安装随机图片服务
+install_random() {
+    read -p "请输入你的域名 (例如 api.qhola.com): " DOMAIN
+    WEB_ROOT="/var/www/$DOMAIN"
+    PHP_FILE="$WEB_ROOT/random.php"
+    IMG_DIR="$WEB_ROOT/images"
+    CONF_FILE="$NGINX_CONF_DIR/$DOMAIN.conf"
 
-    mkdir -p "$INSTALL_DIR/config"
+    echo -e "${YELLOW}>>> 安装随机图片服务，域名: $DOMAIN${RESET}"
 
-    cat > $COMPOSE_FILE <<EOF
-version: "3.8"
+    mkdir -p "$IMG_DIR"
 
-services:
-  pairdrop:
-    image: lscr.io/linuxserver/pairdrop:latest
-    container_name: $SERVICE_NAME
-    restart: unless-stopped
-    environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=$TZ
-      - WS_FALLBACK=false
-      - RATE_LIMIT=false
-      - RTC_CONFIG=false
-      - DEBUG_MODE=false
-    ports:
-      - "$PORT:3000"
-    volumes:
-      - ./config:/config
+    # 写 PHP 脚本
+    cat > "$PHP_FILE" <<'EOF'
+<?php
+$images_dir = __DIR__ . '/images/';
+$images = glob($images_dir . '*.{jpg,jpeg,png,gif,webp}', GLOB_BRACE);
+
+header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+header("Pragma: no-cache");
+
+if ($images) {
+    $random_image = $images[array_rand($images)];
+    $info = getimagesize($random_image);
+    header('Content-Type: ' . $info['mime']);
+    readfile($random_image);
+} else {
+    header("HTTP/1.0 404 Not Found");
+    echo "No images found.";
+}
 EOF
 
-    cd "$INSTALL_DIR"
-    docker compose up -d
-    echo -e "${GREEN}>>> Pairdrop 服务已安装并运行在端口: $PORT${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
+    # 写 Nginx 配置
+    cat > "$CONF_FILE" <<EOF
+server {
+    listen 80;
+    server_name $DOMAIN;
+
+    root $WEB_ROOT;
+    index index.php;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location /random {
+        rewrite ^/random\$ /random.php last;
+    }
+
+    location ~ \.php\$ {
+        include fastcgi_params;
+        fastcgi_pass unix:$PHP_FPM_SOCK;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+    }
+}
+EOF
+
+    ln -sf "$CONF_FILE" "$NGINX_ENABLED_DIR/$DOMAIN.conf"
+    nginx -t && systemctl reload nginx
+
+    # 自动申请 SSL 证书
+    echo -e "${YELLOW}>>> 申请 Let's Encrypt SSL 证书...${RESET}"
+    certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "admin@$DOMAIN" --redirect
+
+    echo -e "${GREEN}安装完成！${RESET}"
+    echo -e "图片目录: $IMG_DIR"
+    echo -e "访问地址: https://$DOMAIN/random"
+    echo -e "${YELLOW}>>> 请把图片放到: $IMG_DIR${RESET}"
 }
 
-start() {
-    cd "$INSTALL_DIR" && docker compose up -d
-    echo -e "${GREEN}>>> Pairdrop 服务已启动${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
+# 卸载
+uninstall_random() {
+    read -p "请输入要卸载的域名: " DOMAIN
+    WEB_ROOT="/var/www/$DOMAIN"
+    CONF_FILE="$NGINX_CONF_DIR/$DOMAIN.conf"
+
+    echo -e "${YELLOW}>>> 卸载随机图片服务，域名: $DOMAIN${RESET}"
+
+    certbot delete --cert-name "$DOMAIN"
+    rm -rf "$WEB_ROOT"
+    rm -f "$CONF_FILE"
+    rm -f "$NGINX_ENABLED_DIR/$DOMAIN.conf"
+
+    nginx -t && systemctl reload nginx
+    echo -e "${RED}已卸载 $DOMAIN${RESET}"
 }
 
-stop() {
-    cd "$INSTALL_DIR" && docker compose down
-    echo -e "${GREEN}>>> Pairdrop 服务已停止${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
+# 状态
+status_random() {
+    read -p "请输入要查看的域名: " DOMAIN
+    WEB_ROOT="/var/www/$DOMAIN"
+    PHP_FILE="$WEB_ROOT/random.php"
+    IMG_DIR="$WEB_ROOT/images"
+
+    if [ -f "$PHP_FILE" ]; then
+        echo -e "${GREEN}$DOMAIN 已安装随机图片服务${RESET}"
+        echo "网站目录: $WEB_ROOT"
+        echo "脚本文件: $PHP_FILE"
+        echo "图片目录: $IMG_DIR"
+        count=$(ls "$IMG_DIR" 2>/dev/null | wc -l)
+        echo "图片数量: $count"
+    else
+        echo -e "${RED}$DOMAIN 未安装${RESET}"
+    fi
 }
 
-restart() {
-    stop
-    start
-}
-
-update() {
-    cd "$INSTALL_DIR"
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}>>> Pairdrop 服务已更新${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
-}
-
-uninstall() {
-    stop
-    rm -rf "$INSTALL_DIR"
-    echo -e "${GREEN}>>> Pairdrop 服务已卸载${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
-}
-
-menu() {
-    clear
+# 菜单
+while true; do
     echo -e "${GREEN}======================${RESET}"
-    echo -e "${GREEN} Pairdrop 管理菜单${RESET}"
+    echo -e "${GREEN} 随机图片 API 管理菜单${RESET}"
     echo -e "${GREEN}======================${RESET}"
-    echo -e "${GREEN}1. 安装${RESET}"
-    echo -e "${GREEN}2. 启动${RESET}"
-    echo -e "${GREEN}3. 停止${RESET}"
-    echo -e "${GREEN}4. 重启${RESET}"
-    echo -e "${GREEN}5. 更新${RESET}"
-    echo -e "${GREEN}6. 卸载${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}======================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read CHOICE
-    case $CHOICE in
-        1) install ;;
-        2) start ;;
-        3) stop ;;
-        4) restart ;;
-        5) update ;;
-        6) uninstall ;;
+    echo -e "${GREEN}1) 安装依赖 (Nginx + PHP + Certbot)${RESET}"
+    echo -e "${GREEN}2) 安装随机图片服务 (输入域名)${RESET}"
+    echo -e "${GREEN}3) 卸载随机图片服务 (输入域名)${RESET}"
+    echo -e "${GREEN}4) 查看状态 (输入域名)${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    echo -n "请输入选项: "
+    read choice
+
+    case "$choice" in
+        1) install_dependencies ;;
+        2) install_random ;;
+        3) uninstall_random ;;
+        4) status_random ;;
         0) exit 0 ;;
-        *) echo -e "${GREEN}无效选项${RESET}" ; sleep 1 ; menu ;;
+        *) echo "无效选项" ;;
     esac
-}
-
-menu
+done

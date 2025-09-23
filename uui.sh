@@ -1,123 +1,135 @@
 #!/bin/bash
-# Telegram Message Bot 管理脚本 (绿色菜单版)
-# API 信息通过环境变量或 .env 文件提供，不再交互输入
+# 随机图片服务管理脚本
 
-SERVICE_NAME="telegram-message-bot"
-INSTALL_DIR="/opt/$SERVICE_NAME"
-COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-# 颜色
-GREEN="\e[32m"
-RESET="\e[0m"
+NGINX_CONF="/etc/nginx/sites-available/random_image"
+NGINX_LINK="/etc/nginx/sites-enabled/random_image"
+WWW_DIR="/var/www/random"
+PHP_VERSION=""
+PHP_FPM_SOCK=""
 
-install() {
-    echo -e "${GREEN}>>> 开始安装 Telegram Message Bot...${RESET}"
-
-    read -p "请输入映射端口 (默认 9393): " PORT
-    PORT=${PORT:-9393}
-
-    read -p "请输入时区 (默认 Asia/Shanghai): " TZ
-    TZ=${TZ:-Asia/Shanghai}
-
-    mkdir -p "$INSTALL_DIR"/{data,logs,sessions,temp}
-
-    cat > $COMPOSE_FILE <<EOF
-version: '3.8'
-
-services:
-  telegram-message-bot:
-    image: hav93/telegram-message-bot:latest
-    container_name: telegram-message-bot
-    restart: always
-    ports:
-      - "$PORT:9393"
-    environment:
-      - TZ=$TZ
-      - ENABLE_PROXY=false
-      - DATABASE_URL=sqlite:///data/bot.db
-      - LOG_LEVEL=INFO
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./sessions:/app/sessions
-      - ./temp:/app/temp
-EOF
-
-    cd "$INSTALL_DIR"
-    docker compose up -d
-
-    # 获取服务器IP
-    IP=$(curl -s ifconfig.me)
-    if [ -z "$IP" ]; then
-        IP=$(hostname -I | awk '{print $1}')
+# 自动检测 PHP 版本
+detect_php_version() {
+    if command -v php >/dev/null 2>&1; then
+        PHP_VERSION=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+        if [ -S "/run/php/php${PHP_VERSION}-fpm.sock" ]; then
+            PHP_FPM_SOCK="/run/php/php${PHP_VERSION}-fpm.sock"
+            return
+        fi
     fi
 
-    echo -e "${GREEN}>>> Telegram Message Bot 已安装并运行在: http://$IP:$PORT${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
+    if apt-cache search php | grep -q "php8.3-fpm"; then
+        PHP_VERSION="8.3"
+    elif apt-cache search php | grep -q "php8.2-fpm"; then
+        PHP_VERSION="8.2"
+    else
+        echo -e "${RED}未找到合适的 PHP 版本，请检查系统源${RESET}"
+        exit 1
+    fi
+    PHP_FPM_SOCK="/run/php/php${PHP_VERSION}-fpm.sock"
 }
 
+# 安装依赖
+install_dependencies() {
+    echo -e "${YELLOW}>>> 检查并安装依赖...${RESET}"
+    apt update
 
-start() {
-    cd "$INSTALL_DIR" && docker compose up -d
-    echo -e "${GREEN}>>> Telegram Message Bot 已启动${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
+    detect_php_version
+    echo -e "${GREEN}>>> 使用 PHP ${PHP_VERSION}${RESET}"
+
+    apt install -y nginx php${PHP_VERSION}-fpm php${PHP_VERSION}-cli php${PHP_VERSION}-common unzip curl certbot python3-certbot-nginx
+
+    systemctl enable --now nginx
+    systemctl enable --now php${PHP_VERSION}-fpm
 }
 
-stop() {
-    cd "$INSTALL_DIR" && docker compose down
-    echo -e "${GREEN}>>> Telegram Message Bot 已停止${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
+# 安装随机图片服务
+install_service() {
+    read -p "请输入绑定的域名: " DOMAIN
+    if [ -z "$DOMAIN" ]; then
+        echo -e "${RED}域名不能为空！${RESET}"
+        exit 1
+    fi
+
+    mkdir -p $WWW_DIR/images
+
+cat > $WWW_DIR/index.php <<'EOF'
+<?php
+$images_dir = __DIR__ . '/images/';
+$images = glob($images_dir . '*.{jpg,jpeg,png,gif}', GLOB_BRACE);
+if ($images) {
+    $random_image = $images[array_rand($images)];
+    $info = getimagesize($random_image);
+    header('Content-type: ' . $info['mime']);
+    readfile($random_image);
+} else {
+    header("HTTP/1.0 404 Not Found");
+    echo "No images found.";
+}
+?>
+EOF
+
+cat > $NGINX_CONF <<EOF
+server {
+    listen 80;
+    server_name ${DOMAIN};
+
+    root ${WWW_DIR};
+    index index.php;
+
+    location / {
+        try_files \$uri /index.php;
+    }
+
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:${PHP_FPM_SOCK};
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
+
+    ln -sf $NGINX_CONF $NGINX_LINK
+    nginx -t && systemctl reload nginx
+
+    echo -e "${YELLOW}>>> 配置 HTTPS 证书...${RESET}"
+    certbot --nginx -d ${DOMAIN} --non-interactive --agree-tos -m admin@${DOMAIN}
+
+    echo -e "${GREEN}安装完成！${RESET}"
+    echo -e "访问地址: ${YELLOW}https://${DOMAIN}/${RESET}"
+    echo -e "上传图片目录: ${GREEN}${WWW_DIR}/images/${RESET}"
+    echo -e "请将 JPG/PNG/GIF 文件放到该目录，刷新网页即可随机显示。"
 }
 
-restart() {
-    stop
-    start
+# 卸载
+uninstall_service() {
+    echo -e "${YELLOW}>>> 正在卸载服务...${RESET}"
+    rm -rf $WWW_DIR
+    rm -f $NGINX_CONF $NGINX_LINK
+    nginx -t && systemctl reload nginx
+    echo -e "${GREEN}卸载完成${RESET}"
 }
 
-update() {
-    cd "$INSTALL_DIR"
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}>>> Telegram Message Bot 已更新${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
-}
-
-uninstall() {
-    stop
-    rm -rf "$INSTALL_DIR"
-    echo -e "${GREEN}>>> Telegram Message Bot 已卸载${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
-}
-
+# 菜单
 menu() {
-    clear
     echo -e "${GREEN}======================${RESET}"
-    echo -e "${GREEN} Telegram Bot 管理菜单${RESET}"
-    echo -e "${GREEN}======================${RESET}"
-    echo -e "${GREEN}1. 安装${RESET}"
-    echo -e "${GREEN}2. 启动${RESET}"
-    echo -e "${GREEN}3. 停止${RESET}"
-    echo -e "${GREEN}4. 重启${RESET}"
-    echo -e "${GREEN}5. 更新${RESET}"
-    echo -e "${GREEN}6. 卸载${RESET}"
+    echo -e "${GREEN}1. 安装随机图片服务${RESET}"
+    echo -e "${GREEN}2. 卸载随机图片服务${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}======================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read CHOICE
+    read -p "请输入选项: " CHOICE
     case $CHOICE in
-        1) install ;;
-        2) start ;;
-        3) stop ;;
-        4) restart ;;
-        5) update ;;
-        6) uninstall ;;
+        1) install_dependencies; install_service ;;
+        2) uninstall_service ;;
         0) exit 0 ;;
-        *) echo -e "${GREEN}无效选项${RESET}" ; sleep 1 ; menu ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
 }
 

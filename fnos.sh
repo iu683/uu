@@ -1,57 +1,132 @@
 #!/bin/bash
+# Telegram Monitor 管理脚本 (绿色菜单版)
 
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+SERVICE_NAME="telegram-monitor"
+INSTALL_DIR="/opt/$SERVICE_NAME"
+COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
+
+# 颜色
+GREEN="\e[32m"
+RESET="\e[0m"
+
+install() {
+    echo -e "${GREEN}>>> 开始安装 Telegram Monitor...${RESET}"
+
+    read -p "请输入映射端口 (默认 5005): " PORT
+    PORT=${PORT:-5005}
+
+    mkdir -p "$INSTALL_DIR/data"
+
+    cat > $COMPOSE_FILE <<EOF
+version: '3.8'
+
+services:
+  telegram-monitor:
+    image: ghcr.io/riniba/telegrammonitor:latest
+    container_name: $SERVICE_NAME
+    restart: unless-stopped
+    ports:
+      - "$PORT:5005"
+    volumes:
+      - ./data:/app
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+EOF
+
+    cd "$INSTALL_DIR"
+    docker compose up -d
+
+    # 获取服务器IP
+    IP=$(curl -s ifconfig.me)
+    if [ -z "$IP" ]; then
+        IP=$(hostname -I | awk '{print $1}')
+    fi
+
+    echo -e "${GREEN}>>> Telegram Monitor 已安装并运行在: http://$IP:$PORT${RESET}"
+    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+    menu
+}
+
+start() {
+    cd "$INSTALL_DIR" && docker compose up -d
+    echo -e "${GREEN}>>> Telegram Monitor 已启动${RESET}"
+    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+    menu
+}
+
+stop() {
+    cd "$INSTALL_DIR" && docker compose down
+    echo -e "${GREEN}>>> Telegram Monitor 已停止${RESET}"
+    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+    menu
+}
+
+restart() {
+    stop
+    start
+}
+
+update() {
+    echo -e "${GREEN}>>> 更新 Telegram Monitor 容器（拉取最新镜像）...${RESET}"
+
+    # 拉取最新镜像
+    docker pull $IMAGE
+
+    # 停止并删除旧容器
+    docker stop $SERVICE_NAME 2>/dev/null
+    docker rm $SERVICE_NAME 2>/dev/null
+
+    # 使用最新镜像重新创建容器
+    docker run -d \
+        --name $SERVICE_NAME \
+        --restart unless-stopped \
+        -p $PORT:5005 \
+        -v $INSTALL_DIR/data:/app \
+        $IMAGE
+
+    # 获取服务器IP
+    IP=$(curl -s ifconfig.me)
+    [ -z "$IP" ] && IP=$(hostname -I | awk '{print $1}')
+
+    echo -e "${GREEN}>>> Telegram Monitor 已更新并重新创建容器: http://$IP:$PORT${RESET}"
+    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+    menu
+}
+
+
+uninstall() {
+    stop
+    rm -rf "$INSTALL_DIR"
+    echo -e "${GREEN}>>> Telegram Monitor 已卸载${RESET}"
+    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+    menu
+}
 
 menu() {
     clear
-    echo -e "${GREEN}=== DD飞牛管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装重装系统脚本${RESET}"
-    echo -e "${GREEN}2) DD 飞牛系统${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo
-    read -p $'\033[32m请选择操作 (0-2): \033[0m' choice
-    case $choice in
-        1)
-            echo -e "${GREEN}正在下载重装系统脚本...${RESET}"
-            curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh || wget -O reinstall.sh https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh
-            chmod +x reinstall.sh
-            echo -e "${GREEN}✅ 脚本已下载完成，可以执行 DD 系统${RESET}"
-            pause
-            ;;
-        2)
-            if [ ! -f "reinstall.sh" ]; then
-                echo -e "${RED}❌ 未找到 reinstall.sh，请先执行 [1 安装重装系统脚本]${RESET}"
-            else
-                echo -e "${YELLOW}⚠️ 重要提示：执行 DD 飞牛系统会重装系统并清空所有数据！${RESET}"
-                echo -e "${YELLOW}⚠️ 此操作不可逆，请谨慎选择！${RESET}"
-                echo
-                read -p $'\033[31m是否继续？(y/N): \033[0m' confirm
-                if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                    echo -e "${GREEN}🚀 正在执行 DD 飞牛系统...${RESET}"
-                    bash reinstall.sh fnos
-                else
-                    echo -e "${RED}已取消操作${RESET}"
-                fi
-            fi
-            pause
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            echo -e "${RED}无效选择，请重新输入${RESET}"
-            sleep 1
-            menu
-            ;;
+    echo -e "${GREEN}======================${RESET}"
+    echo -e "${GREEN} Telegram Monitor 管理菜单${RESET}"
+    echo -e "${GREEN}======================${RESET}"
+    echo -e "${GREEN}1. 安装${RESET}"
+    echo -e "${GREEN}2. 启动${RESET}"
+    echo -e "${GREEN}3. 停止${RESET}"
+    echo -e "${GREEN}4. 重启${RESET}"
+    echo -e "${GREEN}5. 更新${RESET}"
+    echo -e "${GREEN}6. 卸载${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}======================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read CHOICE
+    case $CHOICE in
+        1) install ;;
+        2) start ;;
+        3) stop ;;
+        4) restart ;;
+        5) update ;;
+        6) uninstall ;;
+        0) exit 0 ;;
+        *) echo -e "${GREEN}无效选项${RESET}" ; sleep 1 ; menu ;;
     esac
-}
-
-pause() {
-    read -p $'\033[32m按回车键返回菜单...\033[0m'
-    menu
 }
 
 menu

@@ -1,100 +1,113 @@
 #!/bin/bash
-# ============================================
-# MetaTube 管理脚本（菜单版）
-# 功能: 安装/更新/卸载/日志
-# ============================================
+# Telegram Monitor 管理脚本 (绿色菜单版)
 
-set -e
+SERVICE_NAME="telegram-monitor"
+INSTALL_DIR="/opt/$SERVICE_NAME"
+COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
 
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+# 颜色
+GREEN="\e[32m"
+RESET="\e[0m"
 
-CONTAINER_NAME="metatube"
-IMAGE_NAME="ghcr.io/metatube-community/metatube-server:latest"
-CONFIG_DIR="$PWD/config"
-DB_FILE="$CONFIG_DIR/metatube.db"
+install() {
+    echo -e "${GREEN}>>> 开始安装 Telegram Monitor...${RESET}"
+
+    read -p "请输入映射端口 (默认 5005): " PORT
+    PORT=${PORT:-5005}
+
+    mkdir -p "$INSTALL_DIR/data"
+
+    cat > $COMPOSE_FILE <<EOF
+version: '3.8'
+
+services:
+  telegram-monitor:
+    image: ghcr.io/riniba/telegrammonitor:latest
+    container_name: $SERVICE_NAME
+    restart: unless-stopped
+    ports:
+      - "$PORT:5005"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+EOF
+
+    cd "$INSTALL_DIR"
+    docker compose up -d
+
+    # 获取服务器IP
+    IP=$(curl -s ifconfig.me)
+    if [ -z "$IP" ]; then
+        IP=$(hostname -I | awk '{print $1}')
+    fi
+
+    echo -e "${GREEN}>>> Telegram Monitor 已安装并运行在: http://$IP:$PORT${RESET}"
+    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+    menu
+}
+
+start() {
+    cd "$INSTALL_DIR" && docker compose up -d
+    echo -e "${GREEN}>>> Telegram Monitor 已启动${RESET}"
+    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+    menu
+}
+
+stop() {
+    cd "$INSTALL_DIR" && docker compose down
+    echo -e "${GREEN}>>> Telegram Monitor 已停止${RESET}"
+    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+    menu
+}
+
+restart() {
+    stop
+    start
+}
+
+update() {
+    cd "$INSTALL_DIR"
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}>>> Telegram Monitor 已更新${RESET}"
+    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+    menu
+}
+
+uninstall() {
+    stop
+    rm -rf "$INSTALL_DIR"
+    echo -e "${GREEN}>>> Telegram Monitor 已卸载${RESET}"
+    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+    menu
+}
 
 menu() {
     clear
-    echo -e "${GREEN}=== MetaTube 管理菜单 ===${RESET}"
-    echo -e "${YELLOW}1) 安装/部署 MetaTube${RESET}"
-    echo -e "${YELLOW}2) 更新 MetaTube${RESET}"
-    echo -e "${YELLOW}3) 卸载 MetaTube${RESET}"
-    echo -e "${YELLOW}4) 查看日志${RESET}"
-    echo -e "${YELLOW}0) 退出${RESET}"
-    echo
-    read -p "请选择操作: " choice
-
-    case $choice in
-        1) install_metatube ;;
-        2) update_metatube ;;
-        3) uninstall_metatube ;;
-        4) view_logs ;;
+    echo -e "${GREEN}======================${RESET}"
+    echo -e "${GREEN} Telegram Monitor 管理菜单${RESET}"
+    echo -e "${GREEN}======================${RESET}"
+    echo -e "${GREEN}1. 安装${RESET}"
+    echo -e "${GREEN}2. 启动${RESET}"
+    echo -e "${GREEN}3. 停止${RESET}"
+    echo -e "${GREEN}4. 重启${RESET}"
+    echo -e "${GREEN}5. 更新${RESET}"
+    echo -e "${GREEN}6. 卸载${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}======================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read CHOICE
+    case $CHOICE in
+        1) install ;;
+        2) start ;;
+        3) stop ;;
+        4) restart ;;
+        5) update ;;
+        6) uninstall ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选择！${RESET}" && sleep 1 && menu ;;
+        *) echo -e "${GREEN}无效选项${RESET}" ; sleep 1 ; menu ;;
     esac
-}
-
-install_metatube() {
-    echo -e "${GREEN}=== 安装/部署 MetaTube ===${RESET}"
-
-    # 创建配置目录
-    mkdir -p "$CONFIG_DIR"
-
-    # 运行容器
-    docker run -d \
-        -p 8080:8080 \
-        -v "$CONFIG_DIR":/config \
-        --name "$CONTAINER_NAME" \
-        "$IMAGE_NAME" \
-        -dsn /config/metatube.db
-
-    echo -e "${GREEN}✅ 部署完成！访问地址: http://$(curl -s https://api.ipify.org):8080${RESET}"
-    read -p "按回车返回菜单..." && menu
-}
-
-update_metatube() {
-    echo -e "${GREEN}=== 更新 MetaTube ===${RESET}"
-
-    # 拉取最新镜像
-    docker pull "$IMAGE_NAME"
-
-    # 停止并删除旧容器（数据在 ./config 下不会丢失）
-    docker stop "$CONTAINER_NAME" 2>/dev/null || true
-    docker rm "$CONTAINER_NAME" 2>/dev/null || true
-
-    # 重新运行容器
-    docker run -d \
-        -p 8080:8080 \
-        -v "$CONFIG_DIR":/config \
-        --name "$CONTAINER_NAME" \
-        "$IMAGE_NAME" \
-        -dsn /config/metatube.db
-
-    echo -e "${GREEN}✅ 更新完成！访问地址: http://$(curl -s https://api.ipify.org):8080${RESET}"
-    read -p "按回车返回菜单..." && menu
-}
-
-uninstall_metatube() {
-    echo -e "${RED}⚠️  即将卸载 MetaTube，并删除相关配置数据！${RESET}"
-    read -p "确认卸载? (y/N): " confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        docker stop "$CONTAINER_NAME" 2>/dev/null || true
-        docker rm "$CONTAINER_NAME" 2>/dev/null || true
-        rm -rf "$CONFIG_DIR"
-        echo -e "${GREEN}✅ 卸载完成${RESET}"
-    else
-        echo -e "${YELLOW}已取消${RESET}"
-    fi
-    read -p "按回车返回菜单..." && menu
-}
-
-view_logs() {
-    echo -e "${GREEN}=== 查看 MetaTube 日志 ===${RESET}"
-    docker logs -f "$CONTAINER_NAME"
-    read -p "按回车返回菜单..." && menu
 }
 
 menu

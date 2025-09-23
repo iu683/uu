@@ -1,123 +1,132 @@
 #!/bin/bash
-# Music Player 一键管理脚本（支持自定义端口和管理员密码）
+# Send 管理脚本 (绿色菜单版，含Redis，自定义文件大小)
 
-GREEN="\033[32m"
-RESET="\033[0m"
+SERVICE_NAME="send"
+INSTALL_DIR="/opt/$SERVICE_NAME"
+COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
 
-APP_NAME="music-player"
-BASE_DIR="/opt/music-player"
-YML_FILE="$BASE_DIR/docker-compose.yml"
+# 颜色
+GREEN="\e[32m"
+RESET="\e[0m"
 
-# 默认端口和管理员密码
-DEFAULT_PORT=3000
-DEFAULT_ADMIN_PASS="admin123"
+install() {
+    echo -e "${GREEN}>>> 开始安装 Send 服务...${RESET}"
 
-create_compose() {
-    local port=$1
-    local admin_pass=$2
+    read -p "请输入映射端口 (默认 1443): " PORT
+    PORT=${PORT:-1443}
 
-    mkdir -p "$BASE_DIR"
+    read -p "请输入域名 (如 https://send.example.com): " DOMAIN
 
-    cat > $YML_FILE <<EOF
-version: '3'
+    read -p "请输入最大文件大小(单位GB, 默认4): " MAX_GB
+    MAX_GB=${MAX_GB:-4}
+    MAX_FILE_SIZE=$((MAX_GB * 1024 * 1024 * 1024))   # 转换为字节
+
+    mkdir -p "$INSTALL_DIR/uploads"
+
+    cat > $COMPOSE_FILE <<EOF
+version: "3.8"
 
 services:
-  music-player:
-    image: ghcr.io/eooce/music-player:latest
+  send:
+    image: registry.gitlab.com/timvisee/send:latest
+    container_name: $SERVICE_NAME
+    depends_on:
+      - redis
     ports:
-      - "${port}:3000"
+      - "$PORT:1443"
     environment:
-      - PORT=3000
-      - ADMIN_PASSWORD=${admin_pass}
+      - NODE_ENV=production
+      - PORT=1443
+      - BASE_URL=$DOMAIN
+      - MAX_FILE_SIZE=$MAX_FILE_SIZE
+      - REDIS_ENABLED=true
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
     volumes:
-      - music-data:/app/music
+      - ./uploads:/uploads
+    restart: unless-stopped
+
+  redis:
+    image: redis:latest
+    container_name: ${SERVICE_NAME}_redis
+    volumes:
+      - redis_data:/data
     restart: unless-stopped
 
 volumes:
-  music-data:
+  redis_data:
 EOF
+
+    cd "$INSTALL_DIR"
+    docker compose up -d
+    echo -e "${GREEN}>>> Send 服务已安装并运行在: $DOMAIN${RESET}"
+    echo -e "${GREEN}>>> 最大上传文件大小: ${MAX_GB}GB (${MAX_FILE_SIZE} 字节)${RESET}"
+
+    read -p "按回车返回菜单..."  
+    menu
 }
 
-show_menu() {
-    echo -e "${GREEN}=== Music Player 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装并启动服务${RESET}"
-    echo -e "${GREEN}2) 停止服务${RESET}"
-    echo -e "${GREEN}3) 启动服务${RESET}"
-    echo -e "${GREEN}4) 重启服务${RESET}"
-    echo -e "${GREEN}5) 更新服务${RESET}"
-    echo -e "${GREEN}6) 查看日志${RESET}"
-    echo -e "${GREEN}7) 卸载服务（含数据）${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}==========================${RESET}"
-    read -p "请选择: " choice
+start() {
+    cd "$INSTALL_DIR" && docker compose up -d
+    echo -e "${GREEN}>>> Send 服务已启动${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
-print_access_info() {
-    local ip=$(curl -s ipv4.icanhazip.com || curl -s ifconfig.me)
-    echo -e "🌐 访问地址: ${GREEN}http://$ip:${PORT}${RESET}"
-    echo -e "🔑 管理员密码: ${GREEN}${ADMIN_PASSWORD}${RESET}"
+stop() {
+    cd "$INSTALL_DIR" && docker compose down
+    echo -e "${GREEN}>>> Send 服务已停止${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
-install_app() {
-    read -p "请输入映射端口 (默认 ${DEFAULT_PORT}): " PORT
-    PORT=${PORT:-$DEFAULT_PORT}
-
-    read -p "请输入管理员密码 (默认 ${DEFAULT_ADMIN_PASS}): " ADMIN_PASSWORD
-    ADMIN_PASSWORD=${ADMIN_PASSWORD:-$DEFAULT_ADMIN_PASS}
-
-    create_compose "$PORT" "$ADMIN_PASSWORD"
-    docker compose -f $YML_FILE up -d
-    echo -e "✅ ${GREEN}Music Player 已安装并启动${RESET}"
-    print_access_info
+restart() {
+    stop
+    start
 }
 
-stop_app() {
-    docker compose -f $YML_FILE down
-    echo -e "🛑 ${GREEN}Music Player 已停止${RESET}"
+update() {
+    cd "$INSTALL_DIR"
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}>>> Send 服务已更新${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
-start_app() {
-    docker compose -f $YML_FILE up -d
-    echo -e "🚀 ${GREEN}Music Player 已启动${RESET}"
-    print_access_info
+uninstall() {
+    stop
+    rm -rf "$INSTALL_DIR"
+    echo -e "${GREEN}>>> Send 服务已卸载${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
-restart_app() {
-    docker compose -f $YML_FILE down
-    docker compose -f $YML_FILE up -d
-    echo -e "🔄 ${GREEN}Music Player 已重启${RESET}"
-    print_access_info
-}
-
-update_app() {
-    docker compose -f $YML_FILE pull
-    docker compose -f $YML_FILE up -d
-    echo -e "⬆️ ${GREEN}Music Player 已更新到最新版本${RESET}"
-    print_access_info
-}
-
-logs_app() {
-    docker logs -f $APP_NAME
-}
-
-uninstall_app() {
-    docker compose -f $YML_FILE down
-    rm -f $YML_FILE
-    docker volume rm music-data
-    echo -e "🗑️ ${GREEN}Music Player 已卸载，数据已删除${RESET}"
-}
-
-while true; do
-    show_menu
-    case $choice in
-        1) install_app ;;
-        2) stop_app ;;
-        3) start_app ;;
-        4) restart_app ;;
-        5) update_app ;;
-        6) logs_app ;;
-        7) uninstall_app ;;
+menu() {
+    clear
+    echo -e "${GREEN}======================${RESET}"
+    echo -e "${GREEN} Send 管理菜单         ${RESET}"
+    echo -e "${GREEN}======================${RESET}"
+    echo -e "${GREEN}1. 安装${RESET}"
+    echo -e "${GREEN}2. 启动${RESET}"
+    echo -e "${GREEN}3. 停止${RESET}"
+    echo -e "${GREEN}4. 重启${RESET}"
+    echo -e "${GREEN}5. 更新${RESET}"
+    echo -e "${GREEN}6. 卸载${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}======================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read CHOICE
+    case $CHOICE in
+        1) install ;;
+        2) start ;;
+        3) stop ;;
+        4) restart ;;
+        5) update ;;
+        6) uninstall ;;
         0) exit 0 ;;
-        *) echo -e "❌ ${GREEN}无效选择${RESET}" ;;
+        *) echo -e "${GREEN}无效选项${RESET}" ; sleep 1 ; menu ;;
     esac
-done
+}
+
+menu

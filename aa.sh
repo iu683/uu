@@ -1,106 +1,99 @@
 #!/bin/bash
-# =========================================
-# FastSend 一键管理脚本
-# 支持安装 / 更新 / 重启 / 停止 / 卸载 / 查看日志
-# =========================================
+# TelegramMonitor 一键管理脚本
+# 支持启动/停止/查看日志/删除/更新容器
+# 可自定义端口，不挂载数据卷
+# 绿色字体显示
 
-APP_NAME="fastsend"
-IMAGE_NAME="shouchenicu/fastsend:0.6.0"
-CONFIG_FILE="./fastsend.conf"
+SERVICE_NAME="telegram-monitor"
+IMAGE_NAME="ghcr.io/riniba/telegrammonitor:latest"
+DEFAULT_PORT=5005
 
-GREEN="\033[32m"
-RESET="\033[0m"
+# 颜色
+GREEN="\e[32m"
+RESET="\e[0m"
 
-# 获取公网 IP
-function get_ip() {
-    curl -s ifconfig.me || curl -s ip.sb || echo "your-ip"
+print_menu() {
+    echo -e "${GREEN}======================${RESET}"
+    echo -e "${GREEN}  TelegramMonitor 管理菜单  ${RESET}"
+    echo -e "${GREEN}======================${RESET}"
+    echo -e "${GREEN}1. 启动容器${RESET}"
+    echo -e "${GREEN}2. 停止容器${RESET}"
+    echo -e "${GREEN}3. 查看日志${RESET}"
+    echo -e "${GREEN}4. 删除容器${RESET}"
+    echo -e "${GREEN}5. 更新容器${RESET}"
+    echo -e "${GREEN}6. 退出${RESET}"
+    echo -e "${GREEN}======================${RESET}"
+    read -p "请输入选项: " choice
 }
 
-# 读取保存的端口
-if [ -f "$CONFIG_FILE" ]; then
-    source "$CONFIG_FILE"
-else
-    PORT=3000
-fi
-
-function save_config() {
-    echo "PORT=$PORT" > $CONFIG_FILE
+read_port() {
+    read -p "请输入容器端口（默认 $DEFAULT_PORT）: " PORT
+    PORT=${PORT:-$DEFAULT_PORT}
 }
 
-function install_app() {
-    read -p "请输入访问端口 [默认:3000]: " input_port
-    PORT=${input_port:-3000}
-    save_config
+start_container() {
+    if [ "$(docker ps -q -f name=$SERVICE_NAME)" ]; then
+        echo -e "${GREEN}容器已在运行中${RESET}"
+    else
+        read_port
+        echo -e "${GREEN}拉取最新镜像...${RESET}"
+        docker pull $IMAGE_NAME
+        echo -e "${GREEN}启动容器...${RESET}"
+        docker run -d \
+          --name $SERVICE_NAME \
+          --restart unless-stopped \
+          -p $PORT:5005 \
+          $IMAGE_NAME
+        echo -e "${GREEN}容器启动完成，访问：http://localhost:$PORT${RESET}"
+    fi
+}
 
-    echo -e "${GREEN}开始安装 ${APP_NAME}，端口: $PORT${RESET}"
+stop_container() {
+    if [ "$(docker ps -q -f name=$SERVICE_NAME)" ]; then
+        docker stop $SERVICE_NAME
+        echo -e "${GREEN}容器已停止${RESET}"
+    else
+        echo -e "${GREEN}容器未运行${RESET}"
+    fi
+}
+
+view_logs() {
+    if [ "$(docker ps -q -f name=$SERVICE_NAME)" ]; then
+        docker logs -f $SERVICE_NAME
+    else
+        echo -e "${GREEN}容器未运行，无法查看日志${RESET}"
+    fi
+}
+
+delete_container() {
+    if [ "$(docker ps -aq -f name=$SERVICE_NAME)" ]; then
+        docker rm -f $SERVICE_NAME
+        echo -e "${GREEN}容器已删除${RESET}"
+    else
+        echo -e "${GREEN}容器不存在${RESET}"
+    fi
+}
+
+update_container() {
+    echo -e "${GREEN}拉取最新镜像...${RESET}"
     docker pull $IMAGE_NAME
-    docker rm -f $APP_NAME 2>/dev/null
-    docker run -d \
-        --name=$APP_NAME \
-        --restart=unless-stopped \
-        -p $PORT:3000 \
-        $IMAGE_NAME
-    IP=$(get_ip)
-    echo -e "${GREEN}安装完成！访问: http://$IP:$PORT${RESET}"
-}
-
-function update_app() {
-    echo -e "${GREEN}开始更新 ${APP_NAME}...${RESET}"
-    docker pull $IMAGE_NAME
-    docker rm -f $APP_NAME 2>/dev/null
-    docker run -d \
-        --name=$APP_NAME \
-        --restart=unless-stopped \
-        -p $PORT:3000 \
-        $IMAGE_NAME
-    IP=$(get_ip)
-    echo -e "${GREEN}更新完成！访问: http://$IP:$PORT${RESET}"
-}
-
-function restart_app() {
-    echo -e "${GREEN}正在重启 ${APP_NAME}...${RESET}"
-    docker restart $APP_NAME
-    IP=$(get_ip)
-    echo -e "${GREEN}重启完成！访问: http://$IP:$PORT${RESET}"
-}
-
-function stop_app() {
-    echo -e "${GREEN}正在停止 ${APP_NAME}...${RESET}"
-    docker stop $APP_NAME
-    echo -e "${GREEN}停止完成！${RESET}"
-}
-
-function uninstall_app() {
-    echo -e "${GREEN}正在卸载 ${APP_NAME}...${RESET}"
-    docker rm -f $APP_NAME 2>/dev/null
-    rm -f $CONFIG_FILE
-    echo -e "${GREEN}已卸载 ${APP_NAME}，配置文件已删除${RESET}"
-}
-
-function view_logs() {
-    echo -e "${GREEN}正在查看 ${APP_NAME} 日志 (Ctrl+C 退出)...${RESET}"
-    docker logs -f $APP_NAME
+    if [ "$(docker ps -aq -f name=$SERVICE_NAME)" ]; then
+        echo -e "${GREEN}停止并删除旧容器...${RESET}"
+        docker rm -f $SERVICE_NAME
+    fi
+    start_container
+    echo -e "${GREEN}容器已更新到最新版本${RESET}"
 }
 
 while true; do
-    echo -e "\n${GREEN}=== FastSend 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1. 安装${RESET}"
-    echo -e "${GREEN}2. 更新${RESET}"
-    echo -e "${GREEN}3. 重启${RESET}"
-    echo -e "${GREEN}4. 停止${RESET}"
-    echo -e "${GREEN}5. 卸载${RESET}"
-    echo -e "${GREEN}6. 查看日志${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    read -p "请选择操作: " choice
-
+    print_menu
     case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) restart_app ;;
-        4) stop_app ;;
-        5) uninstall_app ;;
-        6) view_logs ;;
-        0) exit ;;
-        *) echo -e "${GREEN}无效选择${RESET}" ;;
+        1) start_container ;;
+        2) stop_container ;;
+        3) view_logs ;;
+        4) delete_container ;;
+        5) update_container ;;
+        6) exit 0 ;;
+        *) echo -e "${GREEN}无效选项，请重新输入${RESET}" ;;
     esac
 done

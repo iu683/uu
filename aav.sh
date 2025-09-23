@@ -1,135 +1,103 @@
 #!/bin/bash
-# Cloudreve 管理脚本（部署 + 管理菜单，统一目录 /opt/cloudreve）
+# TelegramMonitor 一键管理脚本（挂载 /app/data）
+# 支持启动/停止/查看日志/删除/更新容器
+# 绿色字体显示
 
-BASE_DIR="/opt/cloudreve"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/.env"
-
-# 默认值
-DEFAULT_PORT=5212
-DEFAULT_DB_PASS="55689"
-DEFAULT_REDIS_PASS="55697"
+SERVICE_NAME="telegram-monitor"
+IMAGE_NAME="ghcr.io/riniba/telegrammonitor:latest"
+DEFAULT_PORT=5005
+DATA_DIR="$HOME/telegram-monitor-data"
 
 # 颜色
 GREEN="\e[32m"
-RED="\e[31m"
 RESET="\e[0m"
 
-# 确保目录存在
-mkdir -p "$BASE_DIR"
+# 创建数据目录
+mkdir -p "$DATA_DIR"
 
-# 部署函数
-deploy() {
-    echo -e "${GREEN}=== Cloudreve 部署 ===${RESET}"
-    read -p "$(echo -e ${GREEN}请输入 Cloudreve 端口 [默认: $DEFAULT_PORT]: ${RESET})" PORT
-    PORT=${PORT:-$DEFAULT_PORT}
-
-    read -p "$(echo -e ${GREEN}请输入 PostgreSQL 密码 [默认: $DEFAULT_DB_PASS]: ${RESET})" DB_PASSWORD
-    DB_PASSWORD=${DB_PASSWORD:-$DEFAULT_DB_PASS}
-
-    read -p "$(echo -e ${GREEN}请输入 Redis 密码 [默认: $DEFAULT_REDIS_PASS]: ${RESET})" REDIS_PASSWORD
-    REDIS_PASSWORD=${REDIS_PASSWORD:-$DEFAULT_REDIS_PASS}
-
-    # 生成 .env 文件
-    cat > $ENV_FILE <<EOF
-PORT=$PORT
-DB_PASSWORD=$DB_PASSWORD
-REDIS_PASSWORD=$REDIS_PASSWORD
-EOF
-    echo -e "${GREEN}[√] 已生成 $ENV_FILE${RESET}"
-
-    # 生成 docker-compose.yml
-    cat > $COMPOSE_FILE <<EOF
-services:
-  cloudreve:
-    image: cloudreve/cloudreve:latest
-    container_name: cloudreve-backend
-    depends_on:
-      - postgresql
-      - redis
-    restart: always
-    ports:
-      - "\${PORT}:5212"
-      - "6888:6888"
-      - "6888:6888/udp"
-    environment:
-      - CR_CONF_Database.Type=postgres
-      - CR_CONF_Database.Host=postgresql
-      - CR_CONF_Database.User=cloudreve
-      - CR_CONF_Database.Password=\${DB_PASSWORD}
-      - CR_CONF_Database.Name=cloudreve
-      - CR_CONF_Database.Port=5432
-      - CR_CONF_Redis.Server=redis:6379
-      - CR_CONF_Redis.Password=\${REDIS_PASSWORD}
-    volumes:
-      - ${BASE_DIR}/cloudreve:/cloudreve/data
-
-  postgresql:
-    image: postgres:17
-    container_name: postgresql
-    environment:
-      - POSTGRES_USER=cloudreve
-      - POSTGRES_PASSWORD=\${DB_PASSWORD}
-      - POSTGRES_DB=cloudreve
-    volumes:
-      - ${BASE_DIR}/postgres:/var/lib/postgresql/data
-
-  redis:
-    image: redis:latest
-    container_name: redis
-    command: ["redis-server", "--requirepass", "\${REDIS_PASSWORD}"]
-    volumes:
-      - ${BASE_DIR}/redis:/data
-EOF
-    echo -e "${GREEN}[√] 已生成 $COMPOSE_FILE${RESET}"
-
-    cd "$BASE_DIR" && docker compose up -d
-    echo -e "${GREEN}=== 部署完成！===${RESET}"
-    echo -e "${GREEN}Cloudreve 管理面板: http://<服务器IP>:$PORT${RESET}"
+print_menu() {
+    echo -e "${GREEN}======================${RESET}"
+    echo -e "${GREEN}  TelegramMonitor 管理菜单  ${RESET}"
+    echo -e "${GREEN}======================${RESET}"
+    echo -e "${GREEN}1. 启动容器${RESET}"
+    echo -e "${GREEN}2. 停止容器${RESET}"
+    echo -e "${GREEN}3. 查看日志${RESET}"
+    echo -e "${GREEN}4. 删除容器${RESET}"
+    echo -e "${GREEN}5. 更新容器${RESET}"
+    echo -e "${GREEN}6. 退出${RESET}"
+    echo -e "${GREEN}======================${RESET}"
+    read -p "请输入选项: " choice
 }
 
-# 卸载函数
-uninstall() {
-    echo -e "${RED}警告: 这将删除 Cloudreve, PostgreSQL, Redis 及其数据！${RESET}"
-    read -p "是否继续? (y/N): " CONFIRM
-    if [[ "$CONFIRM" == "y" || "$CONFIRM" == "Y" ]]; then
-        cd "$BASE_DIR" && docker compose down -v
-        rm -rf "$BASE_DIR"
-        echo -e "${GREEN}[√] 已卸载 Cloudreve${RESET}"
+read_port() {
+    read -p "请输入容器端口（默认 $DEFAULT_PORT）: " PORT
+    PORT=${PORT:-$DEFAULT_PORT}
+}
+
+start_container() {
+    if [ "$(docker ps -q -f name=$SERVICE_NAME)" ]; then
+        echo -e "${GREEN}容器已在运行中${RESET}"
     else
-        echo -e "${GREEN}已取消操作${RESET}"
+        read_port
+        echo -e "${GREEN}拉取最新镜像...${RESET}"
+        docker pull $IMAGE_NAME
+        echo -e "${GREEN}启动容器...${RESET}"
+        docker run -d \
+          --name $SERVICE_NAME \
+          --restart unless-stopped \
+          -p $PORT:5005 \
+          -v "$DATA_DIR":/app/data \
+          $IMAGE_NAME
+        echo -e "${GREEN}容器启动完成，访问：http://localhost:$PORT${RESET}"
     fi
 }
 
-# 更新函数
-update() {
-    echo -e "${GREEN}=== 更新 Cloudreve / PostgreSQL / Redis 镜像 ===${RESET}"
-    cd "$BASE_DIR" && docker compose pull && docker compose up -d
-    echo -e "${GREEN}[√] 更新完成${RESET}"
+stop_container() {
+    if [ "$(docker ps -q -f name=$SERVICE_NAME)" ]; then
+        docker stop $SERVICE_NAME
+        echo -e "${GREEN}容器已停止${RESET}"
+    else
+        echo -e "${GREEN}容器未运行${RESET}"
+    fi
 }
 
-# 管理菜单
-while true; do
-    echo -e "${GREEN}=== Cloudreve 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 部署/重新部署${RESET}"
-    echo -e "${GREEN}2) 启动${RESET}"
-    echo -e "${GREEN}3) 停止${RESET}"
-    echo -e "${GREEN}4) 重启${RESET}"
-    echo -e "${GREEN}5) 查看日志${RESET}"
-    echo -e "${GREEN}6) 卸载${RESET}"
-    echo -e "${GREEN}7) 更新${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    read -p "$(echo -e ${GREEN}请输入选项: ${RESET})" CHOICE
+view_logs() {
+    if [ "$(docker ps -q -f name=$SERVICE_NAME)" ]; then
+        docker logs -f $SERVICE_NAME
+    else
+        echo -e "${GREEN}容器未运行，无法查看日志${RESET}"
+    fi
+}
 
-    case $CHOICE in
-        1) deploy ;;
-        2) cd "$BASE_DIR" && docker compose start ;;
-        3) cd "$BASE_DIR" && docker compose stop ;;
-        4) cd "$BASE_DIR" && docker compose restart ;;
-        5) cd "$BASE_DIR" && docker compose logs -f ;;
-        6) uninstall ;;
-        7) update ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项，请重试${RESET}" ;;
+delete_container() {
+    if [ "$(docker ps -aq -f name=$SERVICE_NAME)" ]; then
+        docker rm -f $SERVICE_NAME
+        echo -e "${GREEN}容器已删除${RESET}"
+    else
+        echo -e "${GREEN}容器不存在${RESET}"
+    fi
+}
+
+update_container() {
+    echo -e "${GREEN}拉取最新镜像...${RESET}"
+    docker pull $IMAGE_NAME
+    if [ "$(docker ps -aq -f name=$SERVICE_NAME)" ]; then
+        echo -e "${GREEN}停止并删除旧容器...${RESET}"
+        docker rm -f $SERVICE_NAME
+    fi
+    start_container
+    echo -e "${GREEN}容器已更新到最新版本${RESET}"
+}
+
+while true; do
+    print_menu
+    case $choice in
+        1) start_container ;;
+        2) stop_container ;;
+        3) view_logs ;;
+        4) delete_container ;;
+        5) update_container ;;
+        6) exit 0 ;;
+        *) echo -e "${GREEN}无效选项，请重新输入${RESET}" ;;
     esac
 done

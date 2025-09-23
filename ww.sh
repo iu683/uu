@@ -1,123 +1,164 @@
 #!/bin/bash
-# Pairdrop 管理脚本 (绿色菜单版)
+# 随机图片多路径 API 管理脚本
+# 系统支持: Ubuntu 22.04/24.04
 
-SERVICE_NAME="pairdrop"
-INSTALL_DIR="/opt/$SERVICE_NAME"
-COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-# 颜色
-GREEN="\e[32m"
-RESET="\e[0m"
+BASE_DIR="/var/www/random"
+NGINX_CONF_DIR="/etc/nginx/sites-available"
+NGINX_LINK_DIR="/etc/nginx/sites-enabled"
+NGINX_CONF_FILE="$NGINX_CONF_DIR/random_image.conf"
+PHP_VERSION=""
+PHP_FPM_SOCK=""
 
-install() {
-    echo -e "${GREEN}>>> 开始安装 Pairdrop 服务...${RESET}"
+# 检查 root
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}请用 root 用户运行${RESET}"
+    exit 1
+fi
 
-    read -p "请输入映射端口 (默认 3000): " PORT
-    PORT=${PORT:-3000}
+# 自动检测 PHP 版本
+detect_php() {
+    if command -v php >/dev/null 2>&1; then
+        PHP_VERSION=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+        if [ -S "/run/php/php${PHP_VERSION}-fpm.sock" ]; then
+            PHP_FPM_SOCK="/run/php/php${PHP_VERSION}-fpm.sock"
+            return
+        fi
+    fi
+    if apt-cache search php | grep -q "php8.3-fpm"; then
+        PHP_VERSION="8.3"
+    elif apt-cache search php | grep -q "php8.2-fpm"; then
+        PHP_VERSION="8.2"
+    else
+        echo -e "${RED}未找到合适的 PHP 版本，请检查系统源${RESET}"
+        exit 1
+    fi
+    PHP_FPM_SOCK="/run/php/php${PHP_VERSION}-fpm.sock"
+}
 
-    read -p "请输入时区 (默认 Asia/Shanghai): " TZ
-    TZ=${TZ:-Asia/Shanghai}
+# 安装依赖
+install_dependencies() {
+    echo -e "${YELLOW}>>> 安装依赖 Nginx + PHP + Certbot + tree...${RESET}"
+    apt update
+    detect_php
+    echo -e "${GREEN}>>> 检测到 PHP ${PHP_VERSION}${RESET}"
+    apt install -y nginx php${PHP_VERSION}-fpm php${PHP_VERSION}-cli php${PHP_VERSION}-common unzip curl certbot python3-certbot-nginx tree
+    systemctl enable --now nginx
+    systemctl enable --now php${PHP_VERSION}-fpm
+}
 
-    mkdir -p "$INSTALL_DIR/config"
-
-    cat > $COMPOSE_FILE <<EOF
-version: "3.8"
-
-services:
-  pairdrop:
-    image: lscr.io/linuxserver/pairdrop:latest
-    container_name: $SERVICE_NAME
-    restart: unless-stopped
-    environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=$TZ
-      - WS_FALLBACK=false
-      - RATE_LIMIT=false
-      - RTC_CONFIG=false
-      - DEBUG_MODE=false
-    ports:
-      - "$PORT:3000"
-    volumes:
-      - ./config:/config
-EOF
-
-    cd "$INSTALL_DIR"
-    docker compose up -d
-
-    # 获取服务器外网IP
-    IP=$(curl -s ifconfig.me)
-    if [ -z "$IP" ]; then
-        IP=$(hostname -I | awk '{print $1}')
+# 安装多路径随机图片服务
+install_service() {
+    read -p "请输入你的域名 (例如 api.com): " DOMAIN
+    if [ -z "$DOMAIN" ]; then
+        echo -e "${RED}域名不能为空${RESET}"
+        exit 1
     fi
 
-    echo -e "${GREEN}>>> Pairdrop 服务已安装并运行在: http://$IP:$PORT${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
+    # 创建基础目录
+    mkdir -p $BASE_DIR/images/random
+    mkdir -p $BASE_DIR/images/random1
+    mkdir -p $BASE_DIR/images/random2
+
+    # 创建 PHP 脚本
+    cat > $BASE_DIR/index.php <<'EOF'
+<?php
+$base_dir = __DIR__ . '/images/';
+$request_uri = $_SERVER['REQUEST_URI'];
+$path = basename(parse_url($request_uri, PHP_URL_PATH), ".json");
+$is_json = str_ends_with($request_uri, '.json');
+$image_dir = $base_dir . $path . '/';
+if (!is_dir($image_dir)) { $image_dir = $base_dir . 'random/'; $path='random'; }
+$images = glob($image_dir . '*.{jpg,jpeg,png,gif,webp}', GLOB_BRACE);
+$protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS']!=='off')?"https://":"http://";
+$host = $_SERVER['HTTP_HOST'];
+if ($images) {
+    $random_image = $images[array_rand($images)];
+    $image_url = $protocol . $host . '/images/' . $path . '/' . basename($random_image);
+    if($is_json){ header('Content-Type: application/json'); echo json_encode(["url"=>$image_url],JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE); exit; }
+    $ext = strtolower(pathinfo($random_image,PATHINFO_EXTENSION));
+    $mime_types=['jpg'=>'image/jpeg','jpeg'=>'image/jpeg','png'=>'image/png','gif'=>'image/gif','webp'=>'image/webp'];
+    $mime=$mime_types[$ext]??'application/octet-stream';
+    header("Content-Type: $mime"); header("Content-Length: ".filesize($random_image)); readfile($random_image); exit;
+} else {
+    header("HTTP/1.0 404 Not Found");
+    if($is_json){ header('Content-Type: application/json'); echo json_encode(["error"=>"No images found for $path"],JSON_UNESCAPED_UNICODE); }
+    else { echo "No images found for $path"; }
+}
+EOF
+
+    # 创建 Nginx 配置
+    cat > $NGINX_CONF_FILE <<EOF
+server {
+    listen 80;
+    server_name ${DOMAIN};
+    root ${BASE_DIR};
+    index index.php;
+
+    location / {
+        try_files \$uri /index.php;
+    }
+
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:${PHP_FPM_SOCK};
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
+
+    ln -sf $NGINX_CONF_FILE $NGINX_LINK_DIR/random_image.conf
+    nginx -t && systemctl reload nginx
+
+    # 自动申请 HTTPS
+    echo -e "${YELLOW}>>> 申请 HTTPS 证书...${RESET}"
+    certbot --nginx -d ${DOMAIN} --non-interactive --agree-tos -m admin@${DOMAIN}
+
+    echo -e "${GREEN}安装完成！${RESET}"
+    echo -e "访问地址: ${YELLOW}https://${DOMAIN}/random${RESET}"
+    echo -e "访问 JSON 地址: ${YELLOW}https://${DOMAIN}/random.json${RESET}"
+    echo -e "多路径目录: ${GREEN}${BASE_DIR}/images/random*, 例如 random1, random2${RESET}"
+    echo -e "请上传 JPG/PNG/GIF/WEBP 图片到对应目录"
 }
 
-
-start() {
-    cd "$INSTALL_DIR" && docker compose up -d
-    echo -e "${GREEN}>>> Pairdrop 服务已启动${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
+# 卸载
+uninstall_service() {
+    read -p "请输入域名: " DOMAIN
+    echo -e "${YELLOW}>>> 卸载服务...${RESET}"
+    certbot delete --cert-name "$DOMAIN"
+    rm -rf $BASE_DIR
+    rm -f $NGINX_CONF_FILE $NGINX_LINK_DIR/random_image.conf
+    nginx -t && systemctl reload nginx
+    echo -e "${GREEN}卸载完成${RESET}"
 }
 
-stop() {
-    cd "$INSTALL_DIR" && docker compose down
-    echo -e "${GREEN}>>> Pairdrop 服务已停止${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
+# 查看状态
+status_service() {
+    echo -e "${GREEN}目录结构:${RESET}"
+    tree -L 2 $BASE_DIR
 }
 
-restart() {
-    stop
-    start
-}
-
-update() {
-    cd "$INSTALL_DIR"
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}>>> Pairdrop 服务已更新${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
-}
-
-uninstall() {
-    stop
-    rm -rf "$INSTALL_DIR"
-    echo -e "${GREEN}>>> Pairdrop 服务已卸载${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
-}
-
-menu() {
-    clear
+# 菜单
+while true; do
     echo -e "${GREEN}======================${RESET}"
-    echo -e "${GREEN} Pairdrop 管理菜单${RESET}"
+    echo -e "${GREEN} 1) 安装依赖 & 随机图片服务${RESET}"
+    echo -e "${GREEN} 2) 卸载服务${RESET}"
+    echo -e "${GREEN} 3) 查看状态${RESET}"
+    echo -e "${GREEN} 0) 退出${RESET}"
     echo -e "${GREEN}======================${RESET}"
-    echo -e "${GREEN}1. 安装${RESET}"
-    echo -e "${GREEN}2. 启动${RESET}"
-    echo -e "${GREEN}3. 停止${RESET}"
-    echo -e "${GREEN}4. 重启${RESET}"
-    echo -e "${GREEN}5. 更新${RESET}"
-    echo -e "${GREEN}6. 卸载${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}======================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read CHOICE
+    read -p "请输入选项: " CHOICE
     case $CHOICE in
-        1) install ;;
-        2) start ;;
-        3) stop ;;
-        4) restart ;;
-        5) update ;;
-        6) uninstall ;;
+        1) install_dependencies; install_service ;;
+        2) uninstall_service ;;
+        3) status_service ;;
         0) exit 0 ;;
-        *) echo -e "${GREEN}无效选项${RESET}" ; sleep 1 ; menu ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
-}
-
-menu
+done

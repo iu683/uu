@@ -1,206 +1,121 @@
 #!/bin/bash
-# Sestea 管理脚本
+# Send 管理脚本 (绿色菜单版，含Redis，自定义文件大小)
 
-SERVICE_NAME="sestea"
+SERVICE_NAME="send"
 INSTALL_DIR="/opt/$SERVICE_NAME"
-PY_FILE="$INSTALL_DIR/sestea.py"
-SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
-PORT_FILE="$INSTALL_DIR/port.conf"
-DEFAULT_PORT=7122
+COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
 
 # 颜色
 GREEN="\e[32m"
 RESET="\e[0m"
 
-get_port() {
-    if [ -f "$PORT_FILE" ]; then
-        cat "$PORT_FILE"
-    else
-        echo "$DEFAULT_PORT"
-    fi
-}
+install() {
+    echo -e "${GREEN}>>> 开始安装 Send 服务...${RESET}"
 
-check_env() {
-    echo ">>> 检查运行环境..."
-    if ! command -v python3 &>/dev/null; then
-        echo ">>> 未检测到 python3，正在安装..."
-        if command -v apt &>/dev/null; then
-            apt update -y && apt install -y python3 python3-pip curl
-        elif command -v yum &>/dev/null; then
-            yum install -y python3 python3-pip curl
-        elif command -v dnf &>/dev/null; then
-            dnf install -y python3 python3-pip curl
-        else
-            echo "请手动安装 python3"
-            exit 1
-        fi
-    fi
+    read -p "请输入映射端口 (默认 1443): " PORT
+    PORT=${PORT:-1443}
 
-    if ! python3 -m pip show psutil &>/dev/null; then
-        echo ">>> 未检测到 psutil，正在安装..."
-        python3 -m pip install --upgrade pip
-        python3 -m pip install psutil
-    fi
-}
+    read -p "请输入域名 (如 https://send.example.com): " DOMAIN
 
-get_public_ip() {
-    ip=$(curl -s ifconfig.me || curl -s ipinfo.io/ip || curl -s api.ipify.org)
-    echo "$ip"
-}
+    read -p "请输入最大文件大小(单位GB, 默认4): " MAX_GB
+    MAX_GB=${MAX_GB:-4}
+    MAX_FILE_SIZE=$((MAX_GB * 1024 * 1024 * 1024))   # 转换为字节
 
-install_sestea() {
-    check_env
-    PORT=$(get_port)
-    echo ">>> 安装 Sestea 服务 (端口: $PORT)..."
-    mkdir -p $INSTALL_DIR
+    mkdir -p "$INSTALL_DIR/uploads"
 
-    # 写入 Python 文件
-    cat > $PY_FILE <<EOF
-#!/usr/bin/env python3
-# Sestea
+    cat > $COMPOSE_FILE <<EOF
+version: "3.8"
 
-import http.server
-import socketserver
-import json
-import time
-import psutil
+services:
+  send:
+    image: registry.gitlab.com/timvisee/send:latest
+    container_name: $SERVICE_NAME
+    depends_on:
+      - redis
+    ports:
+      - "$PORT:1443"
+    environment:
+      - NODE_ENV=production
+      - PORT=1443
+      - BASE_URL=$DOMAIN
+      - MAX_FILE_SIZE=$MAX_FILE_SIZE
+      - REDIS_ENABLED=true
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./uploads:/uploads
+    restart: unless-stopped
 
-port = $PORT
+  redis:
+    image: redis:latest
+    container_name: ${SERVICE_NAME}_redis
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
 
-class RequestHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'application/json')
-        self.end_headers()
-
-        time.sleep(1)
-
-        cpu_usage = psutil.cpu_percent()
-        mem_usage = psutil.virtual_memory().percent
-        bytes_sent = psutil.net_io_counters().bytes_sent
-        bytes_recv = psutil.net_io_counters().bytes_recv
-        bytes_total = bytes_sent + bytes_recv
-
-        utc_timestamp = int(time.time())
-        uptime = int(time.time() - psutil.boot_time())
-        last_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-
-        response_dict = {
-            "utc_timestamp": utc_timestamp,
-            "uptime": uptime,
-            "cpu_usage": cpu_usage,
-            "mem_usage": mem_usage,
-            "bytes_sent": str(bytes_sent),
-            "bytes_recv": str(bytes_recv),
-            "bytes_total": str(bytes_total),
-            "last_time": last_time
-        }
-
-        response_json = json.dumps(response_dict).encode('utf-8')
-        self.wfile.write(response_json)
-
-    def log_message(self, format, *args):
-        return
-
-with socketserver.ThreadingTCPServer(("", port), RequestHandler) as httpd:
-    try:
-        print(f"Serving at port {port}")
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        print("Shutting down server...")
-        httpd.shutdown()
+volumes:
+  redis_data:
 EOF
 
-    chmod +x $PY_FILE
-
-    # 写入 systemd 服务
-    cat > $SERVICE_FILE <<EOF
-[Unit]
-Description=Sestea Monitoring Service
-After=network.target
-
-[Service]
-ExecStart=/usr/bin/python3 $PY_FILE
-WorkingDirectory=$INSTALL_DIR
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    # 重新加载 systemd 并启动
-    systemctl daemon-reexec
-    systemctl enable --now $SERVICE_NAME
-
-    public_ip=$(get_public_ip)
-    echo ">>> 安装完成，服务已启动"
-    echo -e "访问地址: ${GREEN}http://$public_ip:$PORT/${RESET}"
+    cd "$INSTALL_DIR"
+    docker compose up -d
+    echo -e "${GREEN}>>> Send 服务已安装并运行在端口: $PORT${RESET}"
+    echo -e "${GREEN}>>> 最大上传文件大小: ${MAX_GB}GB (${MAX_FILE_SIZE} 字节)${RESET}"
 }
 
-uninstall_sestea() {
-    echo ">>> 卸载 Sestea 服务..."
-    systemctl stop $SERVICE_NAME
-    systemctl disable $SERVICE_NAME
-    rm -f $SERVICE_FILE
-    rm -rf $INSTALL_DIR
-    systemctl daemon-reexec
-    echo ">>> 已卸载完成"
+start() {
+    cd "$INSTALL_DIR" && docker compose up -d
+    echo -e "${GREEN}>>> Send 服务已启动${RESET}"
 }
 
-start_sestea() {
-    systemctl start $SERVICE_NAME
-    echo ">>> 服务已启动"
+stop() {
+    cd "$INSTALL_DIR" && docker compose down
+    echo -e "${GREEN}>>> Send 服务已停止${RESET}"
 }
 
-stop_sestea() {
-    systemctl stop $SERVICE_NAME
-    echo ">>> 服务已停止"
+restart() {
+    stop
+    start
 }
 
-status_sestea() {
-    systemctl status $SERVICE_NAME --no-pager
+update() {
+    cd "$INSTALL_DIR"
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}>>> Send 服务已更新${RESET}"
 }
 
-change_port() {
-    read -p "请输入新的端口号: " new_port
-    if [[ ! "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -le 0 ] || [ "$new_port" -gt 65535 ]; then
-        echo "无效端口号"
-        return
-    fi
-    echo "$new_port" > $PORT_FILE
-    echo "端口已修改为 $new_port，请卸载后，重新安装服务。"
+uninstall() {
+    stop
+    rm -rf "$INSTALL_DIR"
+    echo -e "${GREEN}>>> Send 服务已卸载${RESET}"
 }
 
 menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}======================${RESET}"
-        echo -e "${GREEN}   Sestea 管理菜单     ${RESET}"
-        echo -e "${GREEN}======================${RESET}"
-        echo -e "${GREEN}1. 安装/部署${RESET}"
-        echo -e "${GREEN}2. 启动${RESET}"
-        echo -e "${GREEN}3. 停止${RESET}"
-        echo -e "${GREEN}4. 查看状态${RESET}"
-        echo -e "${GREEN}5. 卸载${RESET}"
-        echo -e "${GREEN}6. 修改端口${RESET}"
-        echo -e "${GREEN}0. 退出${RESET}"
-        echo -e "${GREEN}======================${RESET}"
-        read -p "请输入选项: " choice
-
-        case $choice in
-            1) install_sestea ;;
-            2) start_sestea ;;
-            3) stop_sestea ;;
-            4) status_sestea ;;
-            5) uninstall_sestea ;;
-            6) change_port ;;
-            0) exit 0 ;;
-            *) echo "无效选项" ;;
-        esac
-
-        read -p "按回车键继续..."
-    done
+    clear
+    echo -e "${GREEN}======================${RESET}"
+    echo -e "${GREEN} Send 管理菜单         ${RESET}"
+    echo -e "${GREEN}======================${RESET}"
+    echo -e "${GREEN}1. 安装${RESET}"
+    echo -e "${GREEN}2. 启动${RESET}"
+    echo -e "${GREEN}3. 停止${RESET}"
+    echo -e "${GREEN}4. 重启${RESET}"
+    echo -e "${GREEN}5. 更新${RESET}"
+    echo -e "${GREEN}6. 卸载${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}======================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read CHOICE
+    case $CHOICE in
+        1) install ;;
+        2) start ;;
+        3) stop ;;
+        4) restart ;;
+        5) update ;;
+        6) uninstall ;;
+        0) exit 0 ;;
+        *) echo -e "${GREEN}无效选项${RESET}" ;;
+    esac
 }
 
 menu

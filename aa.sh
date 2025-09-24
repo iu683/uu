@@ -1,177 +1,103 @@
 #!/bin/bash
-# ===============================================
-# Cloudflare SSL + Nginx 管理脚本（多域名 + WS 反代）
-# ===============================================
 
-export CF_Token="你的域名DNS编辑的API Token"
-export CF_Account_ID="你的账户ID"
-
+# ================== 颜色定义 ==================
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-DOMAIN_FILE="$HOME/cf_domains.list"
+# ================== 变量 ==================
+COMPOSE_FILE="docker-compose.yaml"
+SERVICE_NAME="neko"
 
-install_acme() {
-    if ! command -v acme.sh >/dev/null 2>&1; then
-        echo -e "${YELLOW}安装 acme.sh...${RESET}"
-        curl https://get.acme.sh | sh
-        source ~/.bashrc
-    fi
-    acme.sh --set-default-ca --server letsencrypt
-    echo -e "${GREEN}acme.sh 安装完成${RESET}"
+# ================== 获取公网IP ==================
+get_ip() {
+  curl -s ifconfig.me || curl -s ipinfo.io/ip
 }
 
-install_nginx() {
-    if ! command -v nginx >/dev/null 2>&1; then
-        echo -e "${YELLOW}安装 Nginx...${RESET}"
-        if [ -f /etc/debian_version ]; then
-            apt update && apt install -y nginx
-        elif [ -f /etc/redhat-release ]; then
-            yum install -y epel-release && yum install -y nginx
-        else
-            echo -e "${RED}未识别系统，请手动安装 Nginx${RESET}"
-            return
-        fi
-        systemctl enable nginx
-        systemctl start nginx
-        echo -e "${GREEN}Nginx 已安装并启动${RESET}"
-    else
-        echo -e "${GREEN}检测到 Nginx 已安装${RESET}"
-    fi
-}
+# ================== 部署函数 ==================
+deploy() {
+  read -p "请输入Web访问端口 (默认8080): " WEB_PORT
+  WEB_PORT=${WEB_PORT:-8080}
 
-get_domain_array() {
-    [ ! -f "$DOMAIN_FILE" ] && touch "$DOMAIN_FILE"
-    DOMAIN_LIST=$(cat "$DOMAIN_FILE")
-    DOMAIN_ARR=($DOMAIN_LIST)
-}
+  read -p "请输入普通用户密码 (默认: stronguser): " USER_PASS
+  USER_PASS=${USER_PASS:-stronguser}
 
-cert_path() {
-    echo "/etc/ssl/$1"
-}
+  read -p "请输入管理员密码 (默认: strongadmin): " ADMIN_PASS
+  ADMIN_PASS=${ADMIN_PASS:-strongadmin}
 
-add_or_modify_domain() {
-    echo -e "${GREEN}请输入要添加/修改的域名（可空格分隔多个）:${RESET}"
-    read -r NEW_DOMAINS
-    if [ -n "$NEW_DOMAINS" ]; then
-        echo "$NEW_DOMAINS" >> "$DOMAIN_FILE"
-        sort -u "$DOMAIN_FILE" -o "$DOMAIN_FILE"
-    fi
-    echo -e "${GREEN}当前域名列表:${RESET}"
-    cat "$DOMAIN_FILE"
-}
+  PUBLIC_IP=$(get_ip)
 
-# 🟢 设置反代目标
-declare -A BACKEND_MAP
-set_backend_for_domains() {
-    get_domain_array
-    for DOMAIN in "${DOMAIN_ARR[@]}"; do
-        read -p "请输入 $DOMAIN 的反代目标 (如 http://127.0.0.1:8080): " TARGET
-        BACKEND_MAP["$DOMAIN"]=$TARGET
-    done
-}
+  cat > $COMPOSE_FILE <<EOF
+version: '3.8'
 
-# 🟢 一键批量操作
-one_click_all() {
-    get_domain_array
-    [ ${#DOMAIN_ARR[@]} -eq 0 ] && { echo -e "${RED}没有域名，请先添加域名${RESET}"; return; }
-
-    set_backend_for_domains
-
-    for DOMAIN in "${DOMAIN_ARR[@]}"; do
-        echo -e "${GREEN}处理 $DOMAIN ...${RESET}"
-        TARGET=${BACKEND_MAP["$DOMAIN"]}
-        CERT_DIR=$(cert_path "$DOMAIN")
-        KEY_FILE="$CERT_DIR/private.key"
-        FULLCHAIN_FILE="$CERT_DIR/fullchain.cer"
-        mkdir -p "$CERT_DIR"
-
-        # 申请证书
-        acme.sh --issue --dns dns_cf -d "$DOMAIN" --home "$HOME/.acme.sh" --renew-hook "nginx -s reload"
-        acme.sh --install-cert -d "$DOMAIN" \
-            --key-file "$KEY_FILE" \
-            --fullchain-file "$FULLCHAIN_FILE" \
-            --reloadcmd "nginx -s reload"
-
-        # 生成 Nginx 配置
-        nginx_conf="/etc/nginx/conf.d/$DOMAIN.conf"
-        cat > "$nginx_conf" <<EOF
-server {
-    listen 443 ssl;
-    server_name $DOMAIN;
-
-    ssl_certificate $FULLCHAIN_FILE;
-    ssl_certificate_key $KEY_FILE;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-
-    location / {
-        proxy_pass $TARGET;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-    }
-}
-
-server {
-    listen 80;
-    server_name $DOMAIN;
-    return 301 https://\$host\$request_uri;
-}
+services:
+  ${SERVICE_NAME}:
+    image: ghcr.io/m1k1o/neko/firefox:latest
+    container_name: ${SERVICE_NAME}
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT}:8080"
+      - "56000-56100:56000-56100/udp"
+    environment:
+      NEKO_WEBRTC_EPR: "56000-56100"
+      NEKO_WEBRTC_NAT1TO1: "${PUBLIC_IP}"
+      NEKO_MEMBER_MULTIUSER_USER_PASSWORD: "${USER_PASS}"
+      NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD: "${ADMIN_PASS}"
 EOF
-        echo -e "${GREEN}$DOMAIN 完成证书 + 配置生成${RESET}"
-    done
 
-    nginx -t && nginx -s reload
-    echo -e "${GREEN}所有域名处理完成，Nginx 已重载${RESET}"
+  echo -e "${GREEN}生成配置完成，开始启动容器...${RESET}"
+  docker compose up -d
+  echo -e "${GREEN}部署完成！${RESET}"
+  echo -e "${GREEN}访问地址: http://${PUBLIC_IP}:${WEB_PORT}${RESET}"
+  echo -e "${GREEN}普通用户密码: ${USER_PASS}${RESET}"
+  echo -e "${GREEN}管理员密码: ${ADMIN_PASS}${RESET}"
 }
 
-# 🟢 删除域名及证书
-delete_domain() {
-    get_domain_array
-    if [ ${#DOMAIN_ARR[@]} -eq 0 ]; then
-        echo -e "${YELLOW}没有域名可删除${RESET}"
-        return
-    fi
-    echo -e "${YELLOW}请选择要删除的域名:${RESET}"
-    select DOMAIN in "${DOMAIN_ARR[@]}" "取消"; do
-        [ "$DOMAIN" == "取消" ] && return
-        CERT_DIR=$(cert_path "$DOMAIN")
-        acme.sh --remove -d "$DOMAIN"
-        rm -rf "$CERT_DIR"
-        rm -f "/etc/nginx/conf.d/$DOMAIN.conf"
-        grep -v "^$DOMAIN\$" "$DOMAIN_FILE" > "$DOMAIN_FILE.tmp" && mv "$DOMAIN_FILE.tmp" "$DOMAIN_FILE"
-        nginx -s reload
-        echo -e "${GREEN}$DOMAIN 已删除证书和配置并重载 Nginx${RESET}"
-        break
-    done
-}
-
-# 🟢 主菜单
+# ================== 管理菜单 ==================
 while true; do
-    echo -e "${GREEN}======================${RESET}"
-    echo -e "${GREEN} Cloudflare SSL + Nginx 多域名管理（WS 支持）${RESET}"
-    echo -e "${GREEN}======================${RESET}"
-    echo "1) 安装 acme.sh"
-    echo "2) 安装 Nginx"
-    echo "3) 添加/修改域名"
-    echo "4) 一键批量操作（证书 + Nginx + WS）"
-    echo "5) 删除域名及证书"
-    echo "6) 退出"
-    read -p "请选择操作 [1-6]: " choice
-    case "$choice" in
-        1) install_acme ;;
-        2) install_nginx ;;
-        3) add_or_modify_domain ;;
-        4) one_click_all ;;
-        5) delete_domain ;;
-        6) echo "退出"; break ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
-    esac
+  echo -e "${GREEN}==============================${RESET}"
+  echo -e "${GREEN}      Neko 一键管理脚本       ${RESET}"
+  echo -e "${GREEN}==============================${RESET}"
+  echo -e "${GREEN}1) 部署/安装${RESET}"
+  echo -e "${GREEN}2) 启动${RESET}"
+  echo -e "${GREEN}3) 停止${RESET}"
+  echo -e "${GREEN}4) 删除 (包含配置)${RESET}"
+  echo -e "${GREEN}5) 查看日志${RESET}"
+  echo -e "${GREEN}6) 更新 (拉取最新镜像并重启)${RESET}"
+  echo -e "${GREEN}7) 退出${RESET}"
+  echo -e "${GREEN}==============================${RESET}"
+
+  read -p "请输入选项 [1-7]: " choice
+  case $choice in
+    1)
+      deploy
+      ;;
+    2)
+      docker compose start
+      ;;
+    3)
+      docker compose stop
+      ;;
+    4)
+      docker compose down
+      rm -f $COMPOSE_FILE
+      echo -e "${RED}Neko 已删除${RESET}"
+      ;;
+    5)
+      docker compose logs -f
+      ;;
+    6)
+      echo -e "${GREEN}开始更新 Neko...${RESET}"
+      docker compose pull
+      docker compose up -d
+      echo -e "${GREEN}更新完成并已重启 Neko${RESET}"
+      ;;
+    7)
+      echo -e "${GREEN}退出脚本${RESET}"
+      exit 0
+      ;;
+    *)
+      echo -e "${RED}无效选项，请重新输入${RESET}"
+      ;;
+  esac
 done

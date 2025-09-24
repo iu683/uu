@@ -1,121 +1,104 @@
 #!/bin/bash
-# Send 管理脚本 (绿色菜单版，含Redis，自定义文件大小)
 
-SERVICE_NAME="send"
-INSTALL_DIR="/opt/$SERVICE_NAME"
-COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
+BASE_PORT=20000                  # 起始端口
+DATA_DIR="$HOME/socks5_users"    # 存储账号目录
+BIN_PATH="/usr/bin/microsocks"   # socks5 程序路径
+mkdir -p "$DATA_DIR"
 
-# 颜色
-GREEN="\e[32m"
-RESET="\e[0m"
+# 获取服务器 IP
+SERVER_IP=$(curl -s ifconfig.me || echo "127.0.0.1")
 
-install() {
-    echo -e "${GREEN}>>> 开始安装 Send 服务...${RESET}"
-
-    read -p "请输入映射端口 (默认 1443): " PORT
-    PORT=${PORT:-1443}
-
-    read -p "请输入域名 (如 https://send.example.com): " DOMAIN
-
-    read -p "请输入最大文件大小(单位GB, 默认4): " MAX_GB
-    MAX_GB=${MAX_GB:-4}
-    MAX_FILE_SIZE=$((MAX_GB * 1024 * 1024 * 1024))   # 转换为字节
-
-    mkdir -p "$INSTALL_DIR/uploads"
-
-    cat > $COMPOSE_FILE <<EOF
-version: "3.8"
-
-services:
-  send:
-    image: registry.gitlab.com/timvisee/send:latest
-    container_name: $SERVICE_NAME
-    depends_on:
-      - redis
-    ports:
-      - "$PORT:1443"
-    environment:
-      - NODE_ENV=production
-      - PORT=1443
-      - BASE_URL=$DOMAIN
-      - MAX_FILE_SIZE=$MAX_FILE_SIZE
-      - REDIS_ENABLED=true
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-    volumes:
-      - ./uploads:/uploads
-    restart: unless-stopped
-
-  redis:
-    image: redis:latest
-    container_name: ${SERVICE_NAME}_redis
-    volumes:
-      - redis_data:/data
-    restart: unless-stopped
-
-volumes:
-  redis_data:
-EOF
-
-    cd "$INSTALL_DIR"
-    docker compose up -d
-    echo -e "${GREEN}>>> Send 服务已安装并运行在端口: $PORT${RESET}"
-    echo -e "${GREEN}>>> 最大上传文件大小: ${MAX_GB}GB (${MAX_FILE_SIZE} 字节)${RESET}"
+install_socks5() {
+    if [ ! -f "$BIN_PATH" ]; then
+        echo "未检测到 microsocks，正在安装..."
+        apt update && apt install -y microsocks
+    fi
+    echo "microsocks 已安装。"
 }
 
-start() {
-    cd "$INSTALL_DIR" && docker compose up -d
-    echo -e "${GREEN}>>> Send 服务已启动${RESET}"
+start_socks5() {
+    for file in "$DATA_DIR"/*.conf; do
+        [ -e "$file" ] || continue
+        eval $(cat "$file")
+        nohup $BIN_PATH -1 -i 0.0.0.0 -p "$PORT" -u "$USER" -P "$PASS" >/dev/null 2>&1 &
+    done
+    echo "所有 Socks5 已启动。"
 }
 
-stop() {
-    cd "$INSTALL_DIR" && docker compose down
-    echo -e "${GREEN}>>> Send 服务已停止${RESET}"
+stop_socks5() {
+    pkill microsocks && echo "已停止所有 Socks5。"
 }
 
-restart() {
-    stop
-    start
+gen_accounts() {
+    read -p "请输入要生成的账号数量: " COUNT
+    for i in $(seq 1 $COUNT); do
+        USER="user$i"
+        PASS=$(openssl rand -hex 4)
+        PORT=$((BASE_PORT+i-1))
+        CONF="$DATA_DIR/$USER.conf"
+        echo "USER=$USER" > "$CONF"
+        echo "PASS=$PASS" >> "$CONF"
+        echo "PORT=$PORT" >> "$CONF"
+        nohup $BIN_PATH -1 -i 0.0.0.0 -p "$PORT" -u "$USER" -P "$PASS" >/dev/null 2>&1 &
+        echo "生成账号: socks://$USER:$PASS@$SERVER_IP:$PORT"
+    done
 }
 
-update() {
-    cd "$INSTALL_DIR"
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}>>> Send 服务已更新${RESET}"
+list_accounts() {
+    for file in "$DATA_DIR"/*.conf; do
+        [ -e "$file" ] || { echo "没有账号。"; return; }
+        source "$file"
+        echo "socks://$USER:$PASS@$SERVER_IP:$PORT"
+    done
 }
 
-uninstall() {
-    stop
-    rm -rf "$INSTALL_DIR"
-    echo -e "${GREEN}>>> Send 服务已卸载${RESET}"
+delete_account() {
+    list_accounts
+    read -p "请输入要删除的用户名: " DEL_USER
+    FILE="$DATA_DIR/$DEL_USER.conf"
+    if [ -f "$FILE" ]; then
+        source "$FILE"
+        rm -f "$FILE"
+        fuser -k "$PORT"/tcp >/dev/null 2>&1
+        echo "已删除账号 $DEL_USER"
+    else
+        echo "未找到账号 $DEL_USER"
+    fi
 }
 
-menu() {
-    clear
-    echo -e "${GREEN}======================${RESET}"
-    echo -e "${GREEN} Send 管理菜单         ${RESET}"
-    echo -e "${GREEN}======================${RESET}"
-    echo -e "${GREEN}1. 安装${RESET}"
-    echo -e "${GREEN}2. 启动${RESET}"
-    echo -e "${GREEN}3. 停止${RESET}"
-    echo -e "${GREEN}4. 重启${RESET}"
-    echo -e "${GREEN}5. 更新${RESET}"
-    echo -e "${GREEN}6. 卸载${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}======================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read CHOICE
-    case $CHOICE in
-        1) install ;;
-        2) start ;;
-        3) stop ;;
-        4) restart ;;
-        5) update ;;
-        6) uninstall ;;
-        0) exit 0 ;;
-        *) echo -e "${GREEN}无效选项${RESET}" ;;
+delete_all() {
+    rm -f "$DATA_DIR"/*.conf
+    pkill microsocks
+    echo "已删除所有账号。"
+}
+
+status() {
+    pgrep microsocks >/dev/null && echo "Socks5 正在运行。" || echo "Socks5 未运行。"
+}
+
+while true; do
+    echo "    Socks5 管理工具     "
+    echo "=============================="
+    echo "1) 安装 socks5"
+    echo "2) 启动 socks5"
+    echo "3) 停止 socks5"
+    echo "4) 批量生成账号"
+    echo "5) 查看账号列表"
+    echo "6) 删除指定账号"
+    echo "7) 删除所有账号"
+    echo "8) 状态"
+    echo "9) 退出"
+    read -p "请选择 (1-9): " choice
+    case $choice in
+        1) install_socks5 ;;
+        2) start_socks5 ;;
+        3) stop_socks5 ;;
+        4) gen_accounts ;;
+        5) list_accounts ;;
+        6) delete_account ;;
+        7) delete_all ;;
+        8) status ;;
+        9) exit 0 ;;
+        *) echo "无效选项" ;;
     esac
-}
-
-menu
+done

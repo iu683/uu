@@ -1,132 +1,125 @@
 #!/bin/bash
-# Send 管理脚本 (绿色菜单版，含Redis，自定义文件大小)
 
-SERVICE_NAME="send"
-INSTALL_DIR="/opt/$SERVICE_NAME"
-COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
+# ================== 颜色 ==================
+GREEN="\033[32m"
+RED="\033[31m"
+RESET="\033[0m"
 
-# 颜色
-GREEN="\e[32m"
-RESET="\e[0m"
+# ================== 变量 ==================
+SERVICE_NAME="firefox"
+COMPOSE_FILE="docker-compose.yaml"
+CONFIG_DIR=~/firefox
 
-install() {
-    echo -e "${GREEN}>>> 开始安装 Send 服务...${RESET}"
+# ================== 获取公网IP ==================
+get_ip() {
+  curl -s ifconfig.me || curl -s ipinfo.io/ip
+}
 
-    read -p "请输入映射端口 (默认 1443): " PORT
-    PORT=${PORT:-1443}
-
-    read -p "请输入域名 (如 https://send.example.com): " DOMAIN
-
-    read -p "请输入最大文件大小(单位GB, 默认4): " MAX_GB
-    MAX_GB=${MAX_GB:-4}
-    MAX_FILE_SIZE=$((MAX_GB * 1024 * 1024 * 1024))   # 转换为字节
-
-    mkdir -p "$INSTALL_DIR/uploads"
-
-    cat > $COMPOSE_FILE <<EOF
-version: "3.8"
+# ================== 生成 docker-compose.yaml ==================
+generate_compose() {
+  cat > $COMPOSE_FILE <<EOF
+version: '3.8'
 
 services:
-  send:
-    image: registry.gitlab.com/timvisee/send:latest
-    container_name: $SERVICE_NAME
-    depends_on:
-      - redis
-    ports:
-      - "$PORT:1443"
+  ${SERVICE_NAME}:
+    image: lscr.io/linuxserver/firefox:latest
+    container_name: ${SERVICE_NAME}
+    restart: unless-stopped
+    security_opt:
+      - seccomp=unconfined
     environment:
-      - NODE_ENV=production
-      - PORT=1443
-      - BASE_URL=$DOMAIN
-      - MAX_FILE_SIZE=$MAX_FILE_SIZE
-      - REDIS_ENABLED=true
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+      PUID: 1000
+      PGID: 1000
+      TZ: Asia/Shanghai
+      DOCKER_MODS: linuxserver/mods:universal-package-install
+      INSTALL_PACKAGES: fonts-noto-cjk
+      LC_ALL: zh_CN.UTF-8
+      CUSTOM_USER: "${CUSTOM_USER}"
+      PASSWORD: "${PASSWORD}"
+    ports:
+      - "${WEB_PORT}:3000"
+      - "${VNC_PORT}:3001"
     volumes:
-      - ./uploads:/uploads
-    restart: unless-stopped
-
-  redis:
-    image: redis:latest
-    container_name: ${SERVICE_NAME}_redis
-    volumes:
-      - redis_data:/data
-    restart: unless-stopped
-
-volumes:
-  redis_data:
+      - ${CONFIG_DIR}:/config
+    shm_size: 1gb
 EOF
-
-    cd "$INSTALL_DIR"
-    docker compose up -d
-    echo -e "${GREEN}>>> Send 服务已安装并运行在端口: $PORT${RESET}"
-    echo -e "${GREEN}>>> 最大上传文件大小: ${MAX_GB}GB (${MAX_FILE_SIZE} 字节)${RESET}"
-
-    read -p "按回车返回菜单..."  
-    menu
 }
 
-start() {
-    cd "$INSTALL_DIR" && docker compose up -d
-    echo -e "${GREEN}>>> Send 服务已启动${RESET}"
-    read -p "按回车返回菜单..."
-    menu
+# ================== 部署函数 ==================
+deploy() {
+  read -p "请输入Web登录用户名 (默认 admin): " CUSTOM_USER
+  CUSTOM_USER=${CUSTOM_USER:-admin}
+
+  read -p "请输入Web登录密码 (默认 123456): " PASSWORD
+  PASSWORD=${PASSWORD:-123456}
+
+  read -p "请输入Web UI端口 (默认3000): " WEB_PORT
+  WEB_PORT=${WEB_PORT:-3000}
+
+  read -p "请输入VNC端口 (默认3001): " VNC_PORT
+  VNC_PORT=${VNC_PORT:-3001}
+
+  mkdir -p $CONFIG_DIR
+
+  generate_compose
+
+  echo -e "${GREEN}生成 docker-compose.yaml 并启动容器...${RESET}"
+  docker compose up -d
+
+  echo -e "${GREEN}部署完成！${RESET}"
+  echo -e "${GREEN}Web访问: http://$(get_ip):${WEB_PORT}${RESET}"
+  echo -e "${GREEN}VNC端口: ${VNC_PORT}${RESET}"
+  echo -e "${GREEN}用户名: ${CUSTOM_USER}${RESET}"
+  echo -e "${GREEN}密码: ${PASSWORD}${RESET}"
 }
 
-stop() {
-    cd "$INSTALL_DIR" && docker compose down
-    echo -e "${GREEN}>>> Send 服务已停止${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
+# ================== 管理菜单 ==================
+while true; do
+  echo -e "${GREEN}==============================${RESET}"
+  echo -e "${GREEN}       Firefox 容器管理        ${RESET}"
+  echo -e "${GREEN}==============================${RESET}"
+  echo -e "${GREEN}1) 部署安装${RESET}"
+  echo -e "${GREEN}2) 启动${RESET}"
+  echo -e "${GREEN}3) 停止${RESET}"
+  echo -e "${GREEN}4) 删除 (包含配置)${RESET}"
+  echo -e "${GREEN}5) 查看日志${RESET}"
+  echo -e "${GREEN}6) 更新${RESET}"
+  echo -e "${GREEN}7) 退出${RESET}"
+  echo -e "${GREEN}==============================${RESET}"
 
-restart() {
-    stop
-    start
-}
-
-update() {
-    cd "$INSTALL_DIR"
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}>>> Send 服务已更新${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-uninstall() {
-    stop
-    rm -rf "$INSTALL_DIR"
-    echo -e "${GREEN}>>> Send 服务已卸载${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-menu() {
-    clear
-    echo -e "${GREEN}======================${RESET}"
-    echo -e "${GREEN} Send 管理菜单         ${RESET}"
-    echo -e "${GREEN}======================${RESET}"
-    echo -e "${GREEN}1. 安装${RESET}"
-    echo -e "${GREEN}2. 启动${RESET}"
-    echo -e "${GREEN}3. 停止${RESET}"
-    echo -e "${GREEN}4. 重启${RESET}"
-    echo -e "${GREEN}5. 更新${RESET}"
-    echo -e "${GREEN}6. 卸载${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}======================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read CHOICE
-    case $CHOICE in
-        1) install ;;
-        2) start ;;
-        3) stop ;;
-        4) restart ;;
-        5) update ;;
-        6) uninstall ;;
-        0) exit 0 ;;
-        *) echo -e "${GREEN}无效选项${RESET}" ; sleep 1 ; menu ;;
-    esac
-}
-
-menu
+  read -p "请输入选项 [1-7]: " choice
+  case $choice in
+    1)
+      deploy
+      ;;
+    2)
+      docker compose start
+      echo -e "${GREEN}已启动${RESET}"
+      ;;
+    3)
+      docker compose stop
+      echo -e "${GREEN}已停止${RESET}"
+      ;;
+    4)
+      docker compose down
+      rm -rf $CONFIG_DIR $COMPOSE_FILE
+      echo -e "${RED}Firefox 容器已删除${RESET}"
+      ;;
+    5)
+      docker compose logs -f
+      ;;
+    6)
+      echo -e "${GREEN}开始更新 Firefox...${RESET}"
+      docker compose pull
+      docker compose up -d
+      echo -e "${GREEN}更新完成并已重启 Firefox${RESET}"
+      ;;
+    7)
+      echo -e "${GREEN}退出脚本${RESET}"
+      exit 0
+      ;;
+    *)
+      echo -e "${RED}无效选项，请重新输入${RESET}"
+      ;;
+  esac
+done

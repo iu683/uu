@@ -1,69 +1,91 @@
 #!/bin/bash
 
-# ================== 颜色定义 ==================
+# ========== 颜色 ==========
 GREEN="\033[32m"
 RED="\033[31m"
 RESET="\033[0m"
 
-# ================== 变量 ==================
-COMPOSE_FILE="docker-compose.yaml"
-SERVICE_NAME="neko"
+# ========== 变量 ==========
+CONTAINER_NAME="nodeseeker"
+IMAGE_NAME="ersichub/nodeseeker:latest"
+DATA_PATH=~/nodeseeker_data
+CONFIG_FILE="./nodeseeker.conf"
 
-# ================== 获取公网IP ==================
+# ========== 获取公网IP ==========
 get_ip() {
   curl -s ifconfig.me || curl -s ipinfo.io/ip
 }
 
-# ================== 部署函数 ==================
-deploy() {
-  read -p "请输入Web访问端口 (默认8080): " WEB_PORT
-  WEB_PORT=${WEB_PORT:-8080}
-
-  read -p "请输入普通用户密码 (默认: stronguser): " USER_PASS
-  USER_PASS=${USER_PASS:-stronguser}
-
-  read -p "请输入管理员密码 (默认: strongadmin): " ADMIN_PASS
-  ADMIN_PASS=${ADMIN_PASS:-strongadmin}
-
-  PUBLIC_IP=$(get_ip)
-
-  cat > $COMPOSE_FILE <<EOF
-version: '3.8'
-
-services:
-  ${SERVICE_NAME}:
-    image: ghcr.io/m1k1o/neko/firefox:latest
-    container_name: ${SERVICE_NAME}
-    restart: unless-stopped
-    ports:
-      - "${WEB_PORT}:8080"
-      - "56000-56100:56000-56100/udp"
-    environment:
-      NEKO_WEBRTC_EPR: "56000-56100"
-      NEKO_WEBRTC_NAT1TO1: "${PUBLIC_IP}"
-      NEKO_MEMBER_MULTIUSER_USER_PASSWORD: "${USER_PASS}"
-      NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD: "${ADMIN_PASS}"
-EOF
-
-  echo -e "${GREEN}生成配置完成，开始启动容器...${RESET}"
-  docker compose up -d
-  echo -e "${GREEN}部署完成！${RESET}"
-  echo -e "${GREEN}访问地址: http://${PUBLIC_IP}:${WEB_PORT}${RESET}"
-  echo -e "${GREEN}普通用户密码: ${USER_PASS}${RESET}"
-  echo -e "${GREEN}管理员密码: ${ADMIN_PASS}${RESET}"
+# ========== 加载配置 ==========
+load_config() {
+  if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+  else
+    WEB_PORT=3010
+  fi
 }
 
-# ================== 管理菜单 ==================
+# ========== 保存配置 ==========
+save_config() {
+  cat > "$CONFIG_FILE" <<EOF
+WEB_PORT=${WEB_PORT}
+EOF
+}
+
+# ========== 部署函数 ==========
+deploy() {
+  read -p "请输入Web端口 (默认${WEB_PORT}): " input_port
+  WEB_PORT=${input_port:-$WEB_PORT}
+
+  mkdir -p $DATA_PATH
+  save_config
+
+  echo -e "${GREEN}正在部署 NodeSeeker...${RESET}"
+  docker run -d \
+    --name $CONTAINER_NAME \
+    -p ${WEB_PORT}:3010 \
+    -v $DATA_PATH:/usr/src/app/data \
+    --restart unless-stopped \
+    $IMAGE_NAME
+
+  echo -e "${GREEN}部署完成！${RESET}"
+  echo -e "${GREEN}访问地址: http://$(get_ip):${WEB_PORT}${RESET}"
+}
+
+# ========== 更新函数 ==========
+update() {
+  echo -e "${GREEN}开始更新 NodeSeeker...${RESET}"
+  docker pull $IMAGE_NAME
+  docker rm -f $CONTAINER_NAME >/dev/null 2>&1
+  # 使用保存的端口，直接重建容器
+  docker run -d \
+    --name $CONTAINER_NAME \
+    -p ${WEB_PORT}:3010 \
+    -v $DATA_PATH:/usr/src/app/data \
+    --restart unless-stopped \
+    $IMAGE_NAME
+  echo -e "${GREEN}更新完成！访问地址: http://$(get_ip):${WEB_PORT}${RESET}"
+}
+
+# ========== 卸载函数 ==========
+uninstall() {
+  docker rm -f $CONTAINER_NAME >/dev/null 2>&1
+  rm -rf $DATA_PATH $CONFIG_FILE
+  echo -e "${RED}NodeSeeker 已彻底卸载，数据和配置已删除${RESET}"
+}
+
+# ========== 菜单 ==========
+load_config
 while true; do
   echo -e "${GREEN}==============================${RESET}"
-  echo -e "${GREEN}      Neko 一键管理脚本       ${RESET}"
+  echo -e "${GREEN}       NodeSeeker 管理        ${RESET}"
   echo -e "${GREEN}==============================${RESET}"
-  echo -e "${GREEN}1) 部署/安装${RESET}"
+  echo -e "${GREEN}1) 部署安装${RESET}"
   echo -e "${GREEN}2) 启动${RESET}"
   echo -e "${GREEN}3) 停止${RESET}"
-  echo -e "${GREEN}4) 删除 (包含配置)${RESET}"
+  echo -e "${GREEN}4) 卸载${RESET}"
   echo -e "${GREEN}5) 查看日志${RESET}"
-  echo -e "${GREEN}6) 更新 (拉取最新镜像并重启)${RESET}"
+  echo -e "${GREEN}6) 更新${RESET}"
   echo -e "${GREEN}7) 退出${RESET}"
   echo -e "${GREEN}==============================${RESET}"
 
@@ -73,24 +95,21 @@ while true; do
       deploy
       ;;
     2)
-      docker compose start
+      docker start $CONTAINER_NAME
+      echo -e "${GREEN}已启动${RESET}"
       ;;
     3)
-      docker compose stop
+      docker stop $CONTAINER_NAME
+      echo -e "${GREEN}已停止${RESET}"
       ;;
     4)
-      docker compose down
-      rm -f $COMPOSE_FILE
-      echo -e "${RED}Neko 已删除${RESET}"
+      uninstall
       ;;
     5)
-      docker compose logs -f
+      docker logs -f $CONTAINER_NAME
       ;;
     6)
-      echo -e "${GREEN}开始更新 Neko...${RESET}"
-      docker compose pull
-      docker compose up -d
-      echo -e "${GREEN}更新完成并已重启 Neko${RESET}"
+      update
       ;;
     7)
       echo -e "${GREEN}退出脚本${RESET}"

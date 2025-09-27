@@ -1,153 +1,139 @@
 #!/bin/bash
-set -e
+# ========================================
+# AutoBangumi 一键管理脚本（支持自定义端口）
+# ========================================
 
-# ================== 颜色 ==================
+# 颜色
+RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-# ================== 配置 ==================
-QL_DIR="$PWD/ql"
-DATA_DIR="$QL_DIR/data"
-PORT_FILE="$QL_DIR/ql_port.conf"
+# 配置
+APP_NAME="AutoBangumi"
+DEFAULT_PORT=7892
+CONFIG_FILE="${HOME}/.autobangumi.conf"
+CONFIG_DIR="${HOME}/AutoBangumi/config"
+DATA_DIR="${HOME}/AutoBangumi/data"
+IMAGE_NAME="ghcr.io/estrellaxd/auto_bangumi:latest"
+TIMEZONE="Asia/Shanghai"
 
-# ================== 获取公网 IP ==================
-get_public_ip() {
-    PUBLIC_IP=$(curl -s https://ifconfig.me)
-    if [[ -z "$PUBLIC_IP" ]]; then
-        echo -e "${RED}无法获取公网 IP，请检查网络设置。${RESET}"
+# 读取或设置端口
+if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+else
+    read -p "请输入 AutoBangumi 映射端口 (默认 $DEFAULT_PORT): " input_port
+    APP_PORT=${input_port:-$DEFAULT_PORT}
+    echo "APP_PORT=$APP_PORT" > "$CONFIG_FILE"
+fi
+
+# 检查 Docker
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker，请先安装！${RESET}"
         exit 1
     fi
-    echo "$PUBLIC_IP"
 }
 
-# ================== 部署 QingLong ==================
-deploy_qinglong() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${RED}未检测到 Docker，请先安装 Docker${RESET}"
-        return
+# 部署 AutoBangumi
+install_app() {
+    check_docker
+    mkdir -p "${CONFIG_DIR}" "${DATA_DIR}"
+    echo -e "${YELLOW}拉取镜像：${IMAGE_NAME}${RESET}"
+    docker pull "${IMAGE_NAME}"
+
+    if docker ps -a --format '{{.Names}}' | grep -q "^${APP_NAME}$"; then
+        echo -e "${YELLOW}已有容器 ${APP_NAME}，正在删除...${RESET}"
+        docker stop "${APP_NAME}" && docker rm "${APP_NAME}"
     fi
 
-    read -rp "请输入 QingLong 部署端口 (默认 5700): " QL_PORT
-    QL_PORT=${QL_PORT:-5700}
+    echo -e "${YELLOW}正在启动 AutoBangumi...${RESET}"
+    docker run -d \
+      --name="${APP_NAME}" \
+      -v "${CONFIG_DIR}:/app/config" \
+      -v "${DATA_DIR}:/app/data" \
+      -p ${APP_PORT}:7892 \
+      -e TZ=${TIMEZONE} \
+      -e PUID=$(id -u) \
+      -e PGID=$(id -g) \
+      -e UMASK=022 \
+      --network=bridge \
+      --dns=8.8.8.8 \
+      --restart unless-stopped \
+      "${IMAGE_NAME}"
 
-    mkdir -p "$DATA_DIR"
-    echo "$QL_PORT" > "$PORT_FILE"   # 保存端口
-
-    echo -e "${GREEN}拉取 QingLong 镜像...${RESET}"
-    docker pull whyour/qinglong:latest
-
-    if docker ps -a --format '{{.Names}}' | grep -q '^qinglong$'; then
-        echo -e "${YELLOW}发现已存在的 QingLong 容器，正在停止并删除...${RESET}"
-        docker stop qinglong
-        docker rm qinglong
-    fi
-
-    docker run -dit \
-        -v "$DATA_DIR:/ql/data" \
-        -p "${QL_PORT}:${QL_PORT}" \
-        -e QlBaseUrl="/" \
-        -e QlPort="${QL_PORT}" \
-        --name qinglong \
-        --hostname qinglong \
-        --restart unless-stopped \
-        whyour/qinglong:latest
-
-    PUBLIC_IP=$(get_public_ip)
-    echo -e "${GREEN}QingLong 已成功启动，访问地址: http://${PUBLIC_IP}:${QL_PORT}${RESET}"
+    echo -e "${GREEN}AutoBangumi 部署完成！${RESET}"
+    echo -e "${CYAN}访问地址：http://$(hostname -I | awk '{print $1}'):${APP_PORT}${RESET}"
 }
 
-# ================== 更新 QingLong ==================
-update_qinglong() {
-    if [[ -f "$PORT_FILE" ]]; then
-        QL_PORT=$(cat "$PORT_FILE")
-        echo -e "${GREEN}检测到原来的端口: $QL_PORT${RESET}"
-    else
-        read -rp "请输入容器端口 (默认 5700): " QL_PORT
-        QL_PORT=${QL_PORT:-5700}
-        echo "$QL_PORT" > "$PORT_FILE"
-    fi
+# 启动
+start_app() { docker start "${APP_NAME}" && echo -e "${GREEN}已启动 ${APP_NAME}${RESET}"; }
 
-    echo -e "${GREEN}>>> 拉取最新 QingLong 镜像...${RESET}"
-    docker pull whyour/qinglong:latest
+# 停止
+stop_app() { docker stop "${APP_NAME}" && echo -e "${YELLOW}已停止 ${APP_NAME}${RESET}"; }
 
-    if docker ps -a --format '{{.Names}}' | grep -q '^qinglong$'; then
-        echo -e "${GREEN}>>> 删除旧容器...${RESET}"
-        docker stop qinglong
-        docker rm qinglong
-    fi
+# 重启
+restart_app() { docker restart "${APP_NAME}" && echo -e "${GREEN}已重启 ${APP_NAME}${RESET}"; }
 
-    docker run -dit \
-        -v "$DATA_DIR:/ql/data" \
-        -p "${QL_PORT}:${QL_PORT}" \
-        -e QlBaseUrl="/" \
-        -e QlPort="${QL_PORT}" \
-        --name qinglong \
-        --hostname qinglong \
-        --restart unless-stopped \
-        whyour/qinglong:latest
+# 查看日志
+logs_app() { docker logs -f "${APP_NAME}"; }
 
-    PUBLIC_IP=$(get_public_ip)
-    echo -e "${GREEN}✅ QingLong 已更新并启动完成，访问地址: http://${PUBLIC_IP}:${QL_PORT}${RESET}"
+# 更新镜像
+update_app() {
+    echo -e "${YELLOW}正在更新 ${APP_NAME}...${RESET}"
+    docker pull "${IMAGE_NAME}"
+    docker stop "${APP_NAME}" && docker rm "${APP_NAME}"
+    install_app
 }
 
-# ================== 卸载 QingLong 并删除数据 ==================
-uninstall_qinglong() {
-    read -rp "⚠️ 确定要卸载 QingLong 并删除所有数据吗？(y/n): " confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        echo -e "${YELLOW}>>> 停止并删除容器...${RESET}"
-        docker stop qinglong 2>/dev/null || true
-        docker rm qinglong 2>/dev/null || true
-
-        echo -e "${YELLOW}>>> 删除数据目录...${RESET}"
-        rm -rf "$QL_DIR"
-
-        echo -e "${GREEN}✅ QingLong 已彻底卸载并清理完成${RESET}"
-    else
-        echo -e "${GREEN}已取消操作${RESET}"
+# 卸载
+uninstall_app() {
+    docker stop "${APP_NAME}" && docker rm "${APP_NAME}"
+    echo -e "${YELLOW}是否删除配置和数据目录？[y/N]${RESET}"
+    read -r del
+    if [[ "$del" == "y" || "$del" == "Y" ]]; then
+        rm -rf "${CONFIG_DIR}" "${DATA_DIR}" "${CONFIG_FILE}"
+        echo -e "${RED}已删除配置和数据目录${RESET}"
     fi
+    echo -e "${GREEN}${APP_NAME} 已卸载${RESET}"
 }
 
-# ================== 管理菜单 ==================
-manage_qinglong() {
-    while true; do
-        echo -e "${GREEN}=== QingLong 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1. 部署 QingLong${RESET}"
-        echo -e "${GREEN}2. 查看容器状态${RESET}"
-        echo -e "${GREEN}3. 启动容器${RESET}"
-        echo -e "${GREEN}4. 停止容器${RESET}"
-        echo -e "${GREEN}5. 重启容器${RESET}"
-        echo -e "${GREEN}6. 查看日志${RESET}"
-        echo -e "${GREEN}7. 删除容器（保留数据）${RESET}"
-        echo -e "${GREEN}8. 更新镜像并重启（保留数据和端口）${RESET}"
-        echo -e "${GREEN}9. 卸载并删除所有数据${RESET}"
-        echo -e "${GREEN}0. 退出${RESET}"
-
-        read -rp "请选择操作: " choice
-        case "$choice" in
-            1) deploy_qinglong ;;
-            2) docker ps -a | grep qinglong || echo -e "${GREEN}未找到 QingLong 容器${RESET}" ;;
-            3) docker start qinglong ;;
-            4) docker stop qinglong ;;
-            5) docker restart qinglong ;;
-            6) docker logs -f qinglong ;;
-            7)
-                read -rp "确定要删除 QingLong 容器吗? (y/n): " confirm
-                if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-                    docker stop qinglong
-                    docker rm qinglong
-                fi
-                ;;
-            8) update_qinglong ;;
-            9) uninstall_qinglong ;;
-            0) break ;;
-            *) echo -e "${RED}无效选项${RESET}" ;;
-        esac
-        echo
-    done
+# 菜单
+menu() {
+    clear
+    echo -e "${GREEN}==== AutoBangumi 管理菜单 ====${RESET}"
+    echo -e "${GREEN}1. 部署 AutoBangumi（可自定义端口）${RESET}"
+    echo -e "${GREEN}2. 启动 AutoBangumi${RESET}"
+    echo -e "${GREEN}3. 停止 AutoBangumi${RESET}"
+    echo -e "${GREEN}4. 重启 AutoBangumi${RESET}"
+    echo -e "${GREEN}5. 查看日志${RESET}"
+    echo -e "${GREEN}6. 更新 AutoBangumi${RESET}"
+    echo -e "${GREEN}7. 卸载 AutoBangumi${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -ne "${YELLOW}请输入选项: ${RESET}"
+    read -r choice
+    case "$choice" in
+        1) 
+            read -p "请输入 AutoBangumi 映射端口 (默认 $DEFAULT_PORT): " input_port
+            APP_PORT=${input_port:-$DEFAULT_PORT}
+            echo "APP_PORT=$APP_PORT" > "$CONFIG_FILE"
+            install_app
+            ;;
+        2) start_app ;;
+        3) stop_app ;;
+        4) restart_app ;;
+        5) logs_app ;;
+        6) update_app ;;
+        7) uninstall_app ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
+    esac
 }
 
-# ================== 执行 ==================
-manage_qinglong
-```
+# 循环菜单
+while true; do
+    menu
+    echo -e "${YELLOW}按回车键继续...${RESET}"
+    read -r
+done

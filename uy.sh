@@ -1,144 +1,154 @@
 #!/bin/bash
 
-# ================= 配置 =================
-docker_name="easyimage"
-docker_img="ddsderek/easyimage:latest"
-config_dir="/home/docker/easyimage/config"
-image_dir="/home/docker/easyimage/i"
-port_file="/home/docker/easyimage/easyimage_port.conf"
-
-# 颜色定义
+# ================== 颜色 ==================
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-# ================= 函数 =================
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${RED}Docker 未安装，请先安装 Docker！${RESET}"
-        exit 1
-    fi
+COMPOSE_DIR="/root/bepusdt"
+COMPOSE_FILE="${COMPOSE_DIR}/docker-compose.yml"
+ENV_FILE="${COMPOSE_DIR}/bepusdt.env"
+SERVICE_NAME="bepusdt"
+
+# ================== 检查 root ==================
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}请使用 root 用户运行此脚本！${RESET}"
+    exit 1
+fi
+
+# ================== 函数 ==================
+
+pause_return() {
+    read -p "按回车返回菜单..."
 }
 
-get_port() {
-    if [[ -f "$port_file" ]]; then
-        docker_port=$(cat "$port_file")
+load_config() {
+    mkdir -p "$COMPOSE_DIR"
+    if [ -f "$ENV_FILE" ]; then
+        source "$ENV_FILE"
     else
-        read -rp "请输入端口 (默认 5663): " docker_port
-        docker_port=${docker_port:-5663}
-        echo "$docker_port" > "$port_file"
+        read -p "请输入映射端口 [默认: 8080]: " input_port
+        PORT=${input_port:-8080}
+
+        read -p "请输入 conf.toml 配置文件路径 [默认: ${COMPOSE_DIR}/conf.toml]: " input_conf
+        CONF_PATH=${input_conf:-${COMPOSE_DIR}/conf.toml}
+
+        read -p "请输入数据目录路径 [默认: ${COMPOSE_DIR}/data]: " input_data
+        DATA_PATH=${input_data:-${COMPOSE_DIR}/data}
+
+        cat > "$ENV_FILE" <<EOF
+PORT=$PORT
+CONF_PATH=$CONF_PATH
+DATA_PATH=$DATA_PATH
+EOF
     fi
 }
 
-check_port() {
-    local port=$1
-    while lsof -i:$port &>/dev/null; do
-        echo -e "${YELLOW}端口 $port 已被占用，尝试下一个端口...${RESET}"
-        port=$((port+1))
-    done
-    echo $port
-}
+generate_compose() {
+    load_config
+    cat > "$COMPOSE_FILE" <<EOF
+version: "3.8"
 
-install_container() {
-    mkdir -p "$config_dir" "$image_dir"
-
-    get_port
-    docker_port=$(check_port $docker_port)
-    echo "$docker_port" > "$port_file"
-
-    echo -e "${GREEN}正在拉取镜像...${RESET}"
-    docker pull $docker_img
-
-    if docker ps -a --format '{{.Names}}' | grep -q "^$docker_name$"; then
-        docker stop $docker_name
-        docker rm $docker_name
-    fi
-
-    echo -e "${GREEN}正在启动容器...${RESET}"
-    docker run -d \
-        --name $docker_name \
-        -p $docker_port:80 \
-        -e TZ=Asia/Shanghai \
-        -e PUID=1000 \
-        -e PGID=1000 \
-        -v $config_dir:/app/web/config \
-        -v $image_dir:/app/web/i \
-        --restart unless-stopped \
-        $docker_img
-
-    public_ip=$(curl -s ifconfig.me)
-    echo -e "${GREEN}容器启动完成！${RESET}"
-    echo -e "${YELLOW}访问地址: http://$public_ip:$docker_port${RESET}"
-}
-
-update_container() {
-    get_port
-    echo -e "${GREEN}正在更新镜像...${RESET}"
-    docker pull $docker_img
-    docker stop $docker_name 2>/dev/null || true
-    docker rm $docker_name 2>/dev/null || true
-    install_container
+services:
+  bepusdt:
+    image: v03413/bepusdt:latest
+    container_name: bepusdt
+    restart: unless-stopped
+    env_file:
+      - bepusdt.env
+    ports:
+      - "\${PORT}:8080"
+    volumes:
+      - "\${CONF_PATH}:/usr/local/bepusdt/conf.toml"
+      - "\${DATA_PATH}:/var/lib/bepusdt"
+EOF
+    echo -e "${GREEN}已生成 docker-compose.yml${RESET}"
 }
 
 start_container() {
-    docker start $docker_name
-    echo -e "${GREEN}容器已启动！${RESET}"
+    generate_compose
+    cd "$COMPOSE_DIR"
+    docker compose up -d
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}容器已启动成功！端口: $PORT${RESET}"
+    else
+        echo -e "${RED}容器启动失败，请检查配置！${RESET}"
+    fi
+    pause_return
 }
 
 stop_container() {
-    docker stop $docker_name
-    echo -e "${RED}容器已停止！${RESET}"
+    cd "$COMPOSE_DIR"
+    docker compose stop
+    echo -e "${GREEN}容器已停止${RESET}"
+    pause_return
 }
 
 restart_container() {
-    docker restart $docker_name
-    echo -e "${GREEN}容器已重启！${RESET}"
+    cd "$COMPOSE_DIR"
+    docker compose restart
+    echo -e "${GREEN}容器已重启${RESET}"
+    pause_return
+}
+
+remove_container() {
+    cd "$COMPOSE_DIR"
+    read -p "确认删除容器但保留数据和配置文件吗？[y/N]: " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        docker compose down
+        echo -e "${GREEN}容器已删除${RESET}"
+    else
+        echo "取消删除操作"
+    fi
+    pause_return
+}
+
+update_container() {
+    generate_compose
+    cd "$COMPOSE_DIR"
+    echo -e "${GREEN}开始拉取最新镜像...${RESET}"
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}容器已更新并启动成功${RESET}"
+    pause_return
+}
+
+logs_container() {
+    cd "$COMPOSE_DIR"
+    read -p "输入查看日志行数，默认显示最近 100 行: " LINES
+    LINES=${LINES:-100}
+    docker compose logs --tail $LINES ${SERVICE_NAME}
+    pause_return
 }
 
 status_container() {
-    docker ps -a --filter "name=$docker_name"
+    docker ps -a --filter "name=${SERVICE_NAME}"
+    pause_return
 }
 
-view_logs() {
-    echo -e "${GREEN}显示容器日志，按 Ctrl+C 返回菜单${RESET}"
-    docker logs -f $docker_name
-}
-
-uninstall_all() {
-    docker stop $docker_name 2>/dev/null || true
-    docker rm $docker_name 2>/dev/null || true
-    echo -e "${RED}容器及所有数据已删除！${RESET}"
-    rm -rf "$config_dir" "$image_dir" "$port_file"
-}
-
-# ================= 菜单 =================
+# ================== 菜单 ==================
 while true; do
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN} EasyImage 图床 Docker 管理菜单 ${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}1. 安装并启动容器${RESET}"
-    echo -e "${GREEN}2. 启动容器${RESET}"
-    echo -e "${GREEN}3. 停止容器${RESET}"
-    echo -e "${GREEN}4. 重启容器${RESET}"
-    echo -e "${GREEN}5. 查看容器状态${RESET}"
-    echo -e "${GREEN}6. 更新容器镜像${RESET}"
-    echo -e "${GREEN}7. 查看容器日志${RESET}"
-    echo -e "${RED}8. 卸载容器并删除所有数据${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    read -p "请选择操作 [0-8]: " choice
+    echo -e "\n${GREEN}====== BEPUSDT 容器管理 ======${RESET}"
+    echo -e "${GREEN}1) 启动容器${RESET}"
+    echo -e "${GREEN}2) 停止容器${RESET}"
+    echo -e "${GREEN}3) 重启容器${RESET}"
+    echo -e "${GREEN}4) 删除容器${RESET}"
+    echo -e "${GREEN}5) 查看状态${RESET}"
+    echo -e "${GREEN}6) 更新容器${RESET}"
+    echo -e "${GREEN}7) 查看日志${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    read -p "请选择操作: " choice
 
     case $choice in
-        1) install_container ;;
-        2) start_container ;;
-        3) stop_container ;;
-        4) restart_container ;;
+        1) start_container ;;
+        2) stop_container ;;
+        3) restart_container ;;
+        4) remove_container ;;
         5) status_container ;;
         6) update_container ;;
-        7) view_logs ;;
-        8) uninstall_all ;;
+        7) logs_container ;;
         0) exit 0 ;;
-        *) echo -e "${RED}输入错误，请重新选择。${RESET}" ;;
+        *) echo -e "${RED}无效选择，返回菜单${RESET}" ;;
     esac
 done

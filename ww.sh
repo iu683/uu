@@ -43,12 +43,13 @@ function install_app() {
 
     # 生成 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
+version: '3.8'
 services:
   easyimage:
     image: ddsderek/easyimage:latest
     container_name: easyimage
     ports:
-      - "127.0.0.1:$PORT:80"
+      - "$PORT:80"
     environment:
       - TZ=Asia/Shanghai
       - PUID=1000
@@ -66,7 +67,7 @@ EOF
     docker compose up -d
 
     echo -e "${GREEN}✅ EasyImage 已启动${RESET}"
-    echo -e "${GREEN}🌐 Web UI 地址: http://127.0.0.1:$PORT${RESET}"
+    echo -e "${GREEN}🌐 Web UI 地址: http://$(get_ip):$PORT${RESET}"
     echo -e "${GREEN}📂 配置目录: $APP_DIR/config${RESET}"
     echo -e "${GREEN}📂 图片目录: $APP_DIR/i${RESET}"
     read -p "按回车返回菜单..."

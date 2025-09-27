@@ -1,13 +1,14 @@
 #!/bin/bash
 # ========================================
-# OneNav 一键管理脚本
+# Wallos 一键管理脚本 (Docker Compose)
 # ========================================
 
 GREEN="\033[32m"
 RESET="\033[0m"
-APP_NAME="onenav"
-COMPOSE_DIR="$HOME/OneNav"
-COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yml"
+APP_NAME="wallos"
+APP_DIR="$HOME/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/config.env"
 
 function get_ip() {
     curl -s ifconfig.me || curl -s ip.sb || echo "your-ip"
@@ -15,13 +16,13 @@ function get_ip() {
 
 function menu() {
     clear
-    echo -e "${GREEN}=== OneNav 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装/启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}=======================${RESET}"
+    echo -e "${GREEN}=== Wallos 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装/启动=${RESET}"
+    echo -e "${GREEN}2) 更新=${RESET}"
+    echo -e "${GREEN}3) 卸载 (含数据)=${RESET}"
+    echo -e "${GREEN}4) 查看日志=${RESET}"
+    echo -e "${GREEN}0) 退出=${RESET}"
+    echo -e "${GREEN}========================${RESET}"
     read -p "请选择: " choice
     case $choice in
         1) install_app ;;
@@ -34,54 +35,59 @@ function menu() {
 }
 
 function install_app() {
-    read -p "请输入映射端口 [默认:3080]: " input_port
-    PORT=${input_port:-3080}
+    mkdir -p "$APP_DIR/db" "$APP_DIR/logos"
 
-    mkdir -p "$COMPOSE_DIR/data"
+    read -p "请输入 Web 端口 [默认:8282]: " input_port
+    PORT=${input_port:-8282}
 
     cat > "$COMPOSE_FILE" <<EOF
-version: '3'
-
+version: "3.8"
 services:
-  onenav:
-    container_name: onenav
-    image: helloz/onenav
-    restart: always
+  wallos:
+    container_name: wallos
+    image: bellamy/wallos:latest
     ports:
-      - "${PORT}:80"
+      - "127.0.0.1:\${PORT}:80"
+    environment:
+      TZ: Asia/Shanghai
     volumes:
-      - "${COMPOSE_DIR}/data:/data/wwwroot/default/data"
+      - ./db:/var/www/html/db
+      - ./logos:/var/www/html/images/uploads/logos
+    restart: unless-stopped
 EOF
 
-    cd "$COMPOSE_DIR"
+    echo "PORT=$PORT" > "$CONFIG_FILE"
+
+    cd "$APP_DIR"
     docker compose up -d
-    echo -e "${GREEN}✅ OneNav 已启动${RESET}"
-    echo -e "${GREEN}🌐 访问地址: http://$(get_ip):$PORT${RESET}"
-    echo -e "${GREEN}📂 数据目录: $COMPOSE_DIR/data${RESET}"
+
+    echo -e "${GREEN}✅ Wallos 已启动${RESET}"
+    echo -e "${GREEN}🌐 Web UI 地址: http://$(get_ip):$PORT${RESET}"
+    echo -e "${GREEN}📂 配置目录: $APP_DIR${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 function update_app() {
-    cd "$COMPOSE_DIR" || exit
+    cd "$APP_DIR" || { echo "未检测到配置文件，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ OneNav 已更新并重启完成${RESET}"
+    echo -e "${GREEN}✅ Wallos 已更新并重启完成${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 function uninstall_app() {
-    cd "$COMPOSE_DIR" || exit
+    cd "$APP_DIR" || { echo "未检测到配置文件，请先安装"; sleep 1; menu; }
     docker compose down -v
-    rm -rf "$COMPOSE_DIR"
-    echo -e "${GREEN}✅ OneNav 已卸载，数据已删除${RESET}"
+    rm -rf "$APP_DIR"
+    echo -e "${GREEN}✅ Wallos 已卸载，数据已删除${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 function view_logs() {
-    docker logs -f onenav
+    docker logs -f $APP_NAME
     read -p "按回车返回菜单..."
     menu
 }

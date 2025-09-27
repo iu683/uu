@@ -1,12 +1,12 @@
 #!/bin/bash
 # ========================================
-# ZDir 一键管理脚本
+# OneNav 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
 RESET="\033[0m"
-APP_NAME="zdir"
-COMPOSE_DIR="/opt/zdir"
+APP_NAME="onenav"
+COMPOSE_DIR="$HOME/OneNav"
 COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yml"
 
 function get_ip() {
@@ -15,7 +15,7 @@ function get_ip() {
 
 function menu() {
     clear
-    echo -e "${GREEN}=== ZDir 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== OneNav 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装/启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
@@ -34,31 +34,29 @@ function menu() {
 }
 
 function install_app() {
-    read -p "请输入访问端口 [默认:6080]: " input_port
-    PORT=${input_port:-6080}
+    read -p "请输入映射端口 [默认:3080]: " input_port
+    PORT=${input_port:-3080}
 
-    mkdir -p "$COMPOSE_DIR/data" "$COMPOSE_DIR/data/public" "$COMPOSE_DIR/data/private"
+    mkdir -p "$COMPOSE_DIR/data"
 
     cat > "$COMPOSE_FILE" <<EOF
-version: '3.3'
+version: '3'
 
 services:
-    zdir:
-        container_name: zdir
-        privileged: true
-        image: helloz/zdir:4
-        restart: always
-        ports:
-            - '${PORT}:6080'
-        volumes:
-            - '${COMPOSE_DIR}/data:/opt/zdir/data'
-            - '${COMPOSE_DIR}/data/public:/opt/zdir/data/public'
-            - '${COMPOSE_DIR}/data/private:/opt/zdir/data/private'
+  onenav:
+    container_name: onenav
+    image: helloz/onenav
+    restart: always
+    ports:
+      - "${PORT}:80"
+    volumes:
+      - "${COMPOSE_DIR}/data:/data/wwwroot/default/data"
 EOF
 
     cd "$COMPOSE_DIR"
     docker compose up -d
-    echo -e "${GREEN}✅ ZDir 已启动，访问地址: http://$(get_ip):$PORT${RESET}"
+    echo -e "${GREEN}✅ OneNav 已启动${RESET}"
+    echo -e "${GREEN}🌐 访问地址: http://$(get_ip):$PORT${RESET}"
     echo -e "${GREEN}📂 数据目录: $COMPOSE_DIR/data${RESET}"
     read -p "按回车返回菜单..."
     menu
@@ -68,7 +66,7 @@ function update_app() {
     cd "$COMPOSE_DIR" || exit
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ ZDir 已更新并重启完成${RESET}"
+    echo -e "${GREEN}✅ OneNav 已更新并重启完成${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
@@ -77,13 +75,13 @@ function uninstall_app() {
     cd "$COMPOSE_DIR" || exit
     docker compose down -v
     rm -rf "$COMPOSE_DIR"
-    echo -e "${GREEN}✅ ZDir 已卸载，数据已删除${RESET}"
+    echo -e "${GREEN}✅ OneNav 已卸载，数据已删除${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 function view_logs() {
-    docker logs -f zdir
+    docker logs -f onenav
     read -p "按回车返回菜单..."
     menu
 }

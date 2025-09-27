@@ -1,23 +1,21 @@
 #!/bin/bash
 # ========================================
-# OpenList 一键管理脚本
-# 支持自定义端口 & 管理员密码
+# LibreTV 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
 RESET="\033[0m"
-APP_NAME="openlist"
-COMPOSE_DIR="/opt/openlist"
+APP_NAME="libretv"
+COMPOSE_DIR="$HOME/LibreTV"
 COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yml"
 
-# 获取公网IP
 function get_ip() {
     curl -s ifconfig.me || curl -s ip.sb || echo "your-ip"
 }
 
 function menu() {
     clear
-    echo -e "${GREEN}=== OpenList 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== LibreTV 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装/启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
@@ -36,38 +34,33 @@ function menu() {
 }
 
 function install_app() {
-    read -p "请输入映射端口 [默认:5244]: " input_port
-    PORT=${input_port:-5244}
+    read -p "请输入映射端口 [默认:8899]: " input_port
+    PORT=${input_port:-8899}
 
-    read -p "请输入管理员密码 [默认:adminadmin]: " input_pwd
-    ADMIN_PWD=${input_pwd:-adminadmin}
+    read -p "请输入访问密码 [默认:111111]: " input_pwd
+    PASSWORD=${input_pwd:-111111}
 
-    mkdir -p "$COMPOSE_DIR/data"
+    mkdir -p "$COMPOSE_DIR"
 
     cat > "$COMPOSE_FILE" <<EOF
 version: "3.8"
 
 services:
-  openlist:
-    image: openlistteam/openlist:latest
-    container_name: openlist
-    user: "0:0"
+  libretv:
+    image: bestzwei/libretv:latest
+    container_name: libretv
     restart: unless-stopped
     ports:
-      - "${PORT}:5244"
+      - "${PORT}:8080"
     environment:
-      - UMASK=022
-      - OPENLIST_ADMIN_PASSWORD=${ADMIN_PWD}
-    volumes:
-      - ${COMPOSE_DIR}/data:/opt/openlist/data
+      - PASSWORD=${PASSWORD}
 EOF
 
     cd "$COMPOSE_DIR"
     docker compose up -d
-    echo -e "${GREEN}✅ OpenList 已启动${RESET}"
+    echo -e "${GREEN}✅ LibreTV 已启动${RESET}"
     echo -e "${GREEN}🌐 访问地址: http://$(get_ip):$PORT${RESET}"
-    echo -e "${GREEN}👤 管理员密码: $ADMIN_PWD${RESET}"
-    echo -e "${GREEN}📂 数据目录: $COMPOSE_DIR/data${RESET}"
+    echo -e "${GREEN}🔑 访问密码: $PASSWORD${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
@@ -76,7 +69,7 @@ function update_app() {
     cd "$COMPOSE_DIR" || exit
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ OpenList 已更新并重启完成${RESET}"
+    echo -e "${GREEN}✅ LibreTV 已更新并重启完成${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
@@ -85,13 +78,13 @@ function uninstall_app() {
     cd "$COMPOSE_DIR" || exit
     docker compose down -v
     rm -rf "$COMPOSE_DIR"
-    echo -e "${GREEN}✅ OpenList 已卸载，数据已删除${RESET}"
+    echo -e "${GREEN}✅ LibreTV 已卸载，数据已删除${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 function view_logs() {
-    docker logs -f openlist
+    docker logs -f libretv
     read -p "按回车返回菜单..."
     menu
 }

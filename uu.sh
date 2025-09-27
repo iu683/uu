@@ -1,158 +1,121 @@
 #!/bin/bash
-# 随机图片 API 管理脚本 (支持自动安装 PHP + SSL 证书)
-# 系统支持: Debian/Ubuntu
+set -e
 
+# ========================================
+# Vaultwarden 一键管理脚本
+# 功能：启动/停止/更新/查看日志/卸载 + 自定义域名和端口
+# ========================================
+
+WORKDIR="$HOME/vaultwarden-data"
+CONTAINER_NAME="vaultwarden"
+IMAGE_NAME="vaultwarden/server:latest"
+CONFIG_FILE="$WORKDIR/vw.conf"
+
+# ========== 颜色 ==========
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-NGINX_CONF_DIR="/etc/nginx/sites-available"
-NGINX_ENABLED_DIR="/etc/nginx/sites-enabled"
-PHP_VERSION="8.2"
-PHP_FPM_SOCK="/run/php/php${PHP_VERSION}-fpm.sock"
-
-# 检查 root 权限
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}请用 root 用户运行${RESET}"
-    exit 1
-fi
-
-# 安装依赖
-install_dependencies() {
-    echo -e "${YELLOW}>>> 安装 Nginx, PHP, Certbot...${RESET}"
-    apt update
-    apt install -y nginx php${PHP_VERSION}-fpm php${PHP_VERSION}-cli php${PHP_VERSION}-common unzip curl certbot python3-certbot-nginx
-    systemctl enable --now nginx
-    systemctl enable --now php${PHP_VERSION}-fpm
+# ========== 获取公网 IP ==========
+get_public_ip() {
+    IP=$(curl -s https://ifconfig.me || echo "服务器IP")
+    if ! [[ $IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        IP="服务器IP"
+    fi
+    echo "$IP"
 }
 
-# 安装随机图片服务
-install_random() {
-    read -p "请输入你的域名 (例如 api.qhola.com): " DOMAIN
-    WEB_ROOT="/var/www/$DOMAIN"
-    PHP_FILE="$WEB_ROOT/random.php"
-    IMG_DIR="$WEB_ROOT/images"
-    CONF_FILE="$NGINX_CONF_DIR/$DOMAIN.conf"
-
-    echo -e "${YELLOW}>>> 安装随机图片服务，域名: $DOMAIN${RESET}"
-
-    mkdir -p "$IMG_DIR"
-
-    # 写 PHP 脚本
-    cat > "$PHP_FILE" <<'EOF'
-<?php
-$images_dir = __DIR__ . '/images/';
-$images = glob($images_dir . '*.{jpg,jpeg,png,gif,webp}', GLOB_BRACE);
-
-header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
-header("Pragma: no-cache");
-
-if ($images) {
-    $random_image = $images[array_rand($images)];
-    $info = getimagesize($random_image);
-    header('Content-Type: ' . $info['mime']);
-    readfile($random_image);
-} else {
-    header("HTTP/1.0 404 Not Found");
-    echo "No images found.";
-}
-EOF
-
-    # 写 Nginx 配置
-    cat > "$CONF_FILE" <<EOF
-server {
-    listen 80;
-    server_name $DOMAIN;
-
-    root $WEB_ROOT;
-    index index.php;
-
-    location / {
-        try_files \$uri \$uri/ /index.php?\$query_string;
-    }
-
-    location /random {
-        rewrite ^/random\$ /random.php last;
-    }
-
-    location ~ \.php\$ {
-        include fastcgi_params;
-        fastcgi_pass unix:$PHP_FPM_SOCK;
-        fastcgi_index index.php;
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-    }
-}
-EOF
-
-    ln -sf "$CONF_FILE" "$NGINX_ENABLED_DIR/$DOMAIN.conf"
-    nginx -t && systemctl reload nginx
-
-    # 自动申请 SSL 证书
-    echo -e "${YELLOW}>>> 申请 Let's Encrypt SSL 证书...${RESET}"
-    certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "admin@$DOMAIN" --redirect
-
-    echo -e "${GREEN}安装完成！${RESET}"
-    echo -e "图片目录: $IMG_DIR"
-    echo -e "访问地址: https://$DOMAIN/random"
-    echo -e "${YELLOW}>>> 请把图片放到: $IMG_DIR${RESET}"
-}
-
-# 卸载
-uninstall_random() {
-    read -p "请输入要卸载的域名: " DOMAIN
-    WEB_ROOT="/var/www/$DOMAIN"
-    CONF_FILE="$NGINX_CONF_DIR/$DOMAIN.conf"
-
-    echo -e "${YELLOW}>>> 卸载随机图片服务，域名: $DOMAIN${RESET}"
-
-    certbot delete --cert-name "$DOMAIN"
-    rm -rf "$WEB_ROOT"
-    rm -f "$CONF_FILE"
-    rm -f "$NGINX_ENABLED_DIR/$DOMAIN.conf"
-
-    nginx -t && systemctl reload nginx
-    echo -e "${RED}已卸载 $DOMAIN${RESET}"
-}
-
-# 状态
-status_random() {
-    read -p "请输入要查看的域名: " DOMAIN
-    WEB_ROOT="/var/www/$DOMAIN"
-    PHP_FILE="$WEB_ROOT/random.php"
-    IMG_DIR="$WEB_ROOT/images"
-
-    if [ -f "$PHP_FILE" ]; then
-        echo -e "${GREEN}$DOMAIN 已安装随机图片服务${RESET}"
-        echo "网站目录: $WEB_ROOT"
-        echo "脚本文件: $PHP_FILE"
-        echo "图片目录: $IMG_DIR"
-        count=$(ls "$IMG_DIR" 2>/dev/null | wc -l)
-        echo "图片数量: $count"
+# ========== 读取配置 ==========
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
     else
-        echo -e "${RED}$DOMAIN 未安装${RESET}"
+        echo -ne "${YELLOW}请输入域名 (如 https://vw.domain.tld): ${RESET}"
+        read -r DOMAIN
+        echo -ne "${YELLOW}请输入端口 (默认 8000): ${RESET}"
+        read -r PORT
+        PORT=${PORT:-8000}
+        mkdir -p "$WORKDIR"
+        cat > "$CONFIG_FILE" <<EOF
+DOMAIN="$DOMAIN"
+PORT=$PORT
+EOF
     fi
 }
 
-# 菜单
-while true; do
-    echo -e "${GREEN}======================${RESET}"
-    echo -e "${GREEN} 随机图片 API 管理菜单${RESET}"
-    echo -e "${GREEN}======================${RESET}"
-    echo -e "${GREEN}1) 安装依赖 (Nginx + PHP + Certbot)${RESET}"
-    echo -e "${GREEN}2) 安装随机图片服务 (输入域名)${RESET}"
-    echo -e "${GREEN}3) 卸载随机图片服务 (输入域名)${RESET}"
-    echo -e "${GREEN}4) 查看状态 (输入域名)${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -n "请输入选项: "
-    read choice
+# ========== 菜单 ==========
+show_menu() {
+    echo -e "${GREEN}===== Vaultwarden 管理菜单 =====${RESET}"
+    echo -e "${GREEN}1. 启动 Vaultwarden${RESET}"
+    echo -e "${GREEN}2. 停止 Vaultwarden${RESET}"
+    echo -e "${GREEN}3. 更新 Vaultwarden${RESET}"
+    echo -e "${GREEN}4. 查看日志${RESET}"
+    echo -e "${GREEN}5. 卸载 Vaultwarden${RESET}"
+    echo -e "${GREEN}6. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+}
 
-    case "$choice" in
-        1) install_dependencies ;;
-        2) install_random ;;
-        3) uninstall_random ;;
-        4) status_random ;;
-        0) exit 0 ;;
-        *) echo "无效选项" ;;
+# ========== 主逻辑 ==========
+load_config
+
+while true; do
+    show_menu
+    echo -ne "${YELLOW}请选择操作 [1-6]: ${RESET}"
+    read -r choice
+    case $choice in
+        1)
+            echo -e "${GREEN}启动 Vaultwarden...${RESET}"
+            docker run -d \
+                --name $CONTAINER_NAME \
+                --env DOMAIN="$DOMAIN" \
+                --volume "$WORKDIR:/data/" \
+                --restart unless-stopped \
+                -p 0.0.0.0:$PORT:80 \
+                $IMAGE_NAME
+            echo -e "${GREEN}Vaultwarden 已启动${RESET}"
+            echo -e "${GREEN}访问地址：$DOMAIN （或 http://$(get_public_ip):$PORT）${RESET}"
+            ;;
+        2)
+            echo -e "${GREEN}停止 Vaultwarden...${RESET}"
+            docker stop $CONTAINER_NAME
+            ;;
+        3)
+            echo -e "${GREEN}更新 Vaultwarden...${RESET}"
+            docker stop $CONTAINER_NAME 2>/dev/null || true
+            docker rm $CONTAINER_NAME 2>/dev/null || true
+            docker pull $IMAGE_NAME
+            docker run -d \
+                --name $CONTAINER_NAME \
+                --env DOMAIN="$DOMAIN" \
+                --volume "$WORKDIR:/data/" \
+                --restart unless-stopped \
+                -p 0.0.0.0:$PORT:80 \
+                $IMAGE_NAME
+            echo -e "${GREEN}Vaultwarden 已更新并启动${RESET}"
+            echo -e "${GREEN}访问地址：$DOMAIN （或 http://$(get_public_ip):$PORT）${RESET}"
+            ;;
+        4)
+            echo -e "${GREEN}查看日志（Ctrl+C 退出）${RESET}"
+            docker logs -f $CONTAINER_NAME
+            ;;
+        5)
+            echo -ne "${YELLOW}确认卸载 Vaultwarden 并删除数据吗？[y/N]: ${RESET}"
+            read -r confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                docker stop $CONTAINER_NAME 2>/dev/null || true
+                docker rm $CONTAINER_NAME 2>/dev/null || true
+                rm -rf "$WORKDIR"
+                echo -e "${GREEN}Vaultwarden 已卸载${RESET}"
+                exit 0
+            fi
+            ;;
+        6)
+            echo -e "${YELLOW}退出脚本${RESET}"
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}输入错误，请重新选择${RESET}"
+            ;;
     esac
 done

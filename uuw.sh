@@ -1,113 +1,91 @@
 #!/bin/bash
-# Telegram Monitor 管理脚本 (绿色菜单版)
+# ========================================
+# Sun Panel 一键管理脚本
+# ========================================
 
-SERVICE_NAME="telegram-monitor"
-INSTALL_DIR="/opt/$SERVICE_NAME"
-COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
+GREEN="\033[32m"
+RESET="\033[0m"
+APP_NAME="sun-panel"
+COMPOSE_DIR="$HOME/sun-panel"
+COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yml"
+DEFAULT_PORT=3002
 
-# 颜色
-GREEN="\e[32m"
-RESET="\e[0m"
+function get_ip() {
+    curl -s ifconfig.me || curl -s ip.sb || echo "your-ip"
+}
 
-install() {
-    echo -e "${GREEN}>>> 开始安装 Telegram Monitor...${RESET}"
+function menu() {
+    clear
+    echo -e "${GREEN}=== sun-panel 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装/启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    echo -e "${GREEN}=======================${RESET}"
+    read -p "请选择: " choice
+    case $choice in
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) view_logs ;;
+        0) exit 0 ;;
+        *) echo "无效选择"; sleep 1; menu ;;
+    esac
+}
 
-    read -p "请输入映射端口 (默认 5005): " PORT
-    PORT=${PORT:-5005}
+function install_app() {
+    read -p "请输入 Web 端口 [默认:${DEFAULT_PORT}]: " input_port
+    PORT=${input_port:-$DEFAULT_PORT}
 
-    mkdir -p "$INSTALL_DIR/data"
+    mkdir -p "$COMPOSE_DIR/conf"
 
-    cat > $COMPOSE_FILE <<EOF
-version: '3.8'
-
+    cat > "$COMPOSE_FILE" <<EOF
+version: '3.2'
 services:
-  telegram-monitor:
-    image: ghcr.io/riniba/telegrammonitor:latest
-    container_name: $SERVICE_NAME
-    restart: unless-stopped
+  sun-panel:
+    image: hslr/sun-panel:latest
+    container_name: sun-panel
+    restart: always
     ports:
-      - "$PORT:5005"
+      - "${PORT}:3002"
     volumes:
-      - ./data:/app
-    environment:
-      - ASPNETCORE_ENVIRONMENT=Production
+      - ${COMPOSE_DIR}/conf:/app/conf
+      - /var/run/docker.sock:/var/run/docker.sock
 EOF
 
-    cd "$INSTALL_DIR"
+    cd "$COMPOSE_DIR"
     docker compose up -d
 
-    # 获取服务器IP
-    IP=$(curl -s ifconfig.me)
-    if [ -z "$IP" ]; then
-        IP=$(hostname -I | awk '{print $1}')
-    fi
-
-    echo -e "${GREEN}>>> Telegram Monitor 已安装并运行在: http://$IP:$PORT${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+    echo -e "${GREEN}✅ ${APP_NAME} 已启动${RESET}"
+    echo -e "${GREEN}🌐 Web UI 地址: http://$(get_ip):$PORT${RESET}"
+    echo -e "${GREEN}📂 配置目录: $COMPOSE_DIR/conf${RESET}"
+    read -p "按回车返回菜单..."
     menu
 }
 
-start() {
-    cd "$INSTALL_DIR" && docker compose up -d
-    echo -e "${GREEN}>>> Telegram Monitor 已启动${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
-}
-
-stop() {
-    cd "$INSTALL_DIR" && docker compose down
-    echo -e "${GREEN}>>> Telegram Monitor 已停止${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
-}
-
-restart() {
-    stop
-    start
-}
-
-update() {
-    cd "$INSTALL_DIR"
+function update_app() {
+    cd "$COMPOSE_DIR" || exit
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}>>> Telegram Monitor 已更新${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+    echo -e "${GREEN}✅ ${APP_NAME} 已更新并重启完成${RESET}"
+    read -p "按回车返回菜单..."
     menu
 }
 
-uninstall() {
-    stop
-    rm -rf "$INSTALL_DIR"
-    echo -e "${GREEN}>>> Telegram Monitor 已卸载${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+function uninstall_app() {
+    cd "$COMPOSE_DIR" || exit
+    docker compose down -v
+    rm -rf "$COMPOSE_DIR"
+    echo -e "${GREEN}✅ ${APP_NAME} 已卸载，数据已删除${RESET}"
+    read -p "按回车返回菜单..."
     menu
 }
 
-menu() {
-    clear
-    echo -e "${GREEN}======================${RESET}"
-    echo -e "${GREEN} Telegram Monitor 管理菜单${RESET}"
-    echo -e "${GREEN}======================${RESET}"
-    echo -e "${GREEN}1. 安装${RESET}"
-    echo -e "${GREEN}2. 启动${RESET}"
-    echo -e "${GREEN}3. 停止${RESET}"
-    echo -e "${GREEN}4. 重启${RESET}"
-    echo -e "${GREEN}5. 更新${RESET}"
-    echo -e "${GREEN}6. 卸载${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}======================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read CHOICE
-    case $CHOICE in
-        1) install ;;
-        2) start ;;
-        3) stop ;;
-        4) restart ;;
-        5) update ;;
-        6) uninstall ;;
-        0) exit 0 ;;
-        *) echo -e "${GREEN}无效选项${RESET}" ; sleep 1 ; menu ;;
-    esac
+function view_logs() {
+    docker logs -f sun-panel
+    read -p "按回车返回菜单..."
+    menu
 }
 
 menu

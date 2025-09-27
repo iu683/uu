@@ -1,381 +1,144 @@
-#!/usr/bin/env bash
-#
-set -o errexit
-set -o nounset
-set -o pipefail
+#!/bin/bash
 
-GREEN="\e[32m"
-YELLOW="\e[33m"
-RED="\e[31m"
-RESET="\e[0m"
+# ================= 配置 =================
+docker_name="easyimage"
+docker_img="ddsderek/easyimage:latest"
+config_dir="/home/docker/easyimage/config"
+image_dir="/home/docker/easyimage/i"
+port_file="/home/docker/easyimage/easyimage_port.conf"
 
-WORKDIR="${HOME:-/root}/.s5_manager"
-PID_FILE="${WORKDIR}/s5.pid"
-META_FILE="${WORKDIR}/meta.env"
-CONFIG_S5="${WORKDIR}/config.json"
-CONFIG_3PROXY="${WORKDIR}/3proxy.cfg"
-DEFAULT_PORT=1080
-DEFAULT_USER="s5user"
+# 颜色定义
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-PREFERRED_IMPLS=("s5" "3proxy" "microsocks" "ss5" "danted" "sockd")
-
-ensure_workdir() {
-  mkdir -p "${WORKDIR}"
-  chmod 700 "${WORKDIR}"
+# ================= 函数 =================
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${RED}Docker 未安装，请先安装 Docker！${RESET}"
+        exit 1
+    fi
 }
 
-load_meta() {
-  if [ -f "${META_FILE}" ]; then
-    # shellcheck disable=SC1090
-    source "${META_FILE}"
-  else
-    ACCOUNTS=()
-    BIN_TYPE=""
-  fi
+get_port() {
+    if [[ -f "$port_file" ]]; then
+        docker_port=$(cat "$port_file")
+    else
+        read -rp "请输入端口 (默认 5663): " docker_port
+        docker_port=${docker_port:-5663}
+        echo "$docker_port" > "$port_file"
+    fi
 }
 
-save_meta() {
-  {
-    echo "ACCOUNTS=("
-    for acc in "${ACCOUNTS[@]}"; do
-      echo "  \"$acc\""
+check_port() {
+    local port=$1
+    while lsof -i:$port &>/dev/null; do
+        echo -e "${YELLOW}端口 $port 已被占用，尝试下一个端口...${RESET}"
+        port=$((port+1))
     done
-    echo ")"
-    echo "BIN_TYPE='${BIN_TYPE}'"
-  } > "${META_FILE}"
-  chmod 600 "${META_FILE}"
+    echo $port
 }
 
-prompt() {
-  local prompt_text="$1"
-  local default="${2:-}"
-  local varname="$3"
-  local input
-  if [ -n "${default}" ]; then
-    printf "%s [%s]: " "${prompt_text}" "${default}" > /dev/tty
-  else
-    printf "%s: " "${prompt_text}" > /dev/tty
-  fi
-  read -r input < /dev/tty || input=""
-  if [ -z "${input}" ]; then
-    input="${default}"
-  fi
-  printf -v "${varname}" "%s" "${input}"
-}
+install_container() {
+    mkdir -p "$config_dir" "$image_dir"
 
-random_pass() {
-  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12 || echo "s5pass123"
-}
+    get_port
+    docker_port=$(check_port $docker_port)
+    echo "$docker_port" > "$port_file"
 
-detect_existing_impl() {
-  for impl in "${PREFERRED_IMPLS[@]}"; do
-    case "${impl}" in
-      s5) command -v s5 >/dev/null 2>&1 && echo "s5" && return 0 ;;
-      3proxy) command -v 3proxy >/dev/null 2>&1 && echo "3proxy" && return 0 ;;
-      microsocks) command -v microsocks >/dev/null 2>&1 && echo "microsocks" && return 0 ;;
-      ss5) command -v ss5 >/dev/null 2>&1 && echo "ss5" && return 0 ;;
-      danted|sockd) command -v sockd >/dev/null 2>&1 || command -v danted >/dev/null 2>&1 && echo "danted" && return 0 ;;
-    esac
-  done
-  echo ""
-}
+    echo -e "${GREEN}正在拉取镜像...${RESET}"
+    docker pull $docker_img
 
-try_install_3proxy() {
-  echo "尝试通过包管理器安装 3proxy..."
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -y && apt-get install -y 3proxy && return 0 || return 1
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y 3proxy && return 0 || return 1
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y 3proxy && return 0 || return 1
-  elif command -v apk >/dev/null 2>&1; then
-    apk add --no-cache 3proxy && return 0 || return 1
-  elif command -v pacman >/dev/null 2>&1; then
-    pacman -Sy --noconfirm 3proxy && return 0 || return 1
-  elif command -v pkg >/dev/null 2>&1; then
-    pkg install -y 3proxy && return 0 || return 1
-  fi
-  return 1
-}
-
-try_install_microsocks() {
-  echo "尝试通过包管理器安装 microsocks..."
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -y && apt-get install -y microsocks && return 0 || return 1
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y microsocks && return 0 || return 1
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y microsocks && return 0 || return 1
-  elif command -v apk >/dev/null 2>&1; then
-    apk add --no-cache microsocks && return 0 || return 1
-  elif command -v pacman >/dev/null 2>&1; then
-    pacman -Sy --noconfirm microsocks && return 0 || return 1
-  elif command -v pkg >/dev/null 2>&1; then
-    pkg install -y microsocks && return 0 || return 1
-  fi
-  return 1
-}
-
-get_best_ip() {
-  local ip
-  for svc in "https://icanhazip.com" "https://ifconfig.me" "https://ipinfo.io/ip" "https://4.ipw.cn"; do
-    ip=$(curl -s --max-time 5 "$svc" || true)
-    ip=$(echo "$ip" | tr -d '[:space:]')
-    if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      echo "$ip"
-      return 0
+    if docker ps -a --format '{{.Names}}' | grep -q "^$docker_name$"; then
+        docker stop $docker_name
+        docker rm $docker_name
     fi
-  done
-  echo "127.0.0.1"
+
+    echo -e "${GREEN}正在启动容器...${RESET}"
+    docker run -d \
+        --name $docker_name \
+        -p $docker_port:80 \
+        -e TZ=Asia/Shanghai \
+        -e PUID=1000 \
+        -e PGID=1000 \
+        -v $config_dir:/app/web/config \
+        -v $image_dir:/app/web/i \
+        --restart unless-stopped \
+        $docker_img
+
+    public_ip=$(curl -s ifconfig.me)
+    echo -e "${GREEN}容器启动完成！${RESET}"
+    echo -e "${YELLOW}访问地址: http://$public_ip:$docker_port${RESET}"
 }
 
-urlencode() {
-  local s="$1"
-  if command -v python3 >/dev/null 2>&1; then
-    python3 -c "import sys,urllib.parse as u; print(u.quote(sys.argv[1], safe=''))" "$s"
-  elif command -v python >/dev/null 2>&1; then
-    python -c "import sys,urllib as u; print(u.quote(sys.argv[1]))" "$s"
-  elif command -v perl >/dev/null 2>&1; then
-    perl -MURI::Escape -e 'print uri_escape($ARGV[0]);' "$s"
-  else
-    printf '%s' "$s"
-  fi
+update_container() {
+    get_port
+    echo -e "${GREEN}正在更新镜像...${RESET}"
+    docker pull $docker_img
+    docker stop $docker_name 2>/dev/null || true
+    docker rm $docker_name 2>/dev/null || true
+    install_container
 }
 
-show_links() {
-  local ip port user pass enc_user enc_pass enc_ip socksurl tlink
-  ip="$(get_best_ip)"
-  echo
-  echo -e "${GREEN}账号连接信息:${RESET}"
-  local i=1
-  for acc in "${ACCOUNTS[@]}"; do
-    IFS=":" read -r port user pass <<<"$acc"
-    enc_user="$(urlencode "$user")"
-    enc_pass="$(urlencode "$pass")"
-    enc_ip="$(urlencode "$ip")"
-    socksurl="socks://${user}:${pass}@${ip}:${port}"
-    tlink="https://t.me/socks?server=${enc_ip}&port=${port}&user=${enc_user}&pass=${enc_pass}"
-    echo "$i) $socksurl"
-    echo "   Telegram: $tlink"
-    i=$((i+1))
-  done
-  echo
+start_container() {
+    docker start $docker_name
+    echo -e "${GREEN}容器已启动！${RESET}"
 }
 
-start_by_type() {
-  local type="$1"
-  stop_socks
-  case "${type}" in
-    3proxy)
-      local cfg="${CONFIG_3PROXY}"
-      {
-        echo "daemon"
-        echo "maxconn 100"
-        echo "nserver 8.8.8.8"
-        echo "nserver 8.8.4.4"
-        echo "timeouts 1 5 30 60 180 1800 15 60"
-        for acc in "${ACCOUNTS[@]}"; do
-          IFS=":" read -r port user pass <<<"$acc"
-          echo "users ${user}:CL:${pass}"
-          echo "auth strong"
-          echo "allow ${user}"
-          echo "socks -p${port}"
-        done
-      } > "${cfg}"
-      chmod 600 "${cfg}"
-      nohup 3proxy "${cfg}" >/dev/null 2>&1 &
-      echo $! > "${PID_FILE}"
-      ;;
-    microsocks)
-      for acc in "${ACCOUNTS[@]}"; do
-        IFS=":" read -r port user pass <<<"$acc"
-        nohup microsocks -p "${port}" -u "${user}" -P "${pass}" >/dev/null 2>&1 &
-        echo $! >> "${PID_FILE}"
-      done
-      ;;
-    s5)
-      for acc in "${ACCOUNTS[@]}"; do
-        IFS=":" read -r port user pass <<<"$acc"
-        local cfg="${WORKDIR}/s5_${port}.json"
-        cat > "${cfg}" <<EOF
-{
-  "inbounds": [
-    {
-      "port": ${port},
-      "protocol": "socks",
-      "settings": {
-        "auth": "password",
-        "udp": false,
-        "accounts": [
-          {"user": "${user}", "pass": "${pass}"}
-        ]
-      }
-    }
-  ],
-  "outbounds": [
-    {"protocol": "freedom"}
-  ]
-}
-EOF
-        nohup s5 -c "${cfg}" >/dev/null 2>&1 &
-        echo $! >> "${PID_FILE}"
-      done
-      ;;
-    *)
-      echo -e "${RED}未知或未支持的实现: ${type}${RESET}"
-      return 1
-      ;;
-  esac
-  sleep 1
-  if [ -s "${PID_FILE}" ]; then
-    echo -e "${GREEN}已启动 ${type}${RESET}"
-    show_links
-    return 0
-  else
-    echo -e "${RED}启动失败${RESET}"
-    return 1
-  fi
+stop_container() {
+    docker stop $docker_name
+    echo -e "${RED}容器已停止！${RESET}"
 }
 
-stop_socks() {
-  if [ -f "${PID_FILE}" ]; then
-    while read -r pid; do
-      kill "$pid" >/dev/null 2>&1 || true
-    done < "${PID_FILE}"
-    rm -f "${PID_FILE}"
-  fi
-  for p in s5 3proxy microsocks ss5 danted sockd; do
-    pkill -x "${p}" >/dev/null 2>&1 || true
-  done
+restart_container() {
+    docker restart $docker_name
+    echo -e "${GREEN}容器已重启！${RESET}"
 }
 
-list_accounts() {
-  load_meta
-  if [ "${#ACCOUNTS[@]}" -eq 0 ]; then
-    echo "暂无账号"
-    return
-  fi
-  echo -e "${GREEN}账号列表:${RESET}"
-  local i=1
-  for acc in "${ACCOUNTS[@]}"; do
-    IFS=":" read -r port user pass <<<"$acc"
-    echo "$i) 端口: $port, 用户名: $user, 密码: $pass"
-    i=$((i+1))
-  done
+status_container() {
+    docker ps -a --filter "name=$docker_name"
 }
 
-add_accounts() {
-  ensure_workdir
-  load_meta
-  prompt "要生成几个账号" "3" COUNT
-  prompt "起始端口号" "${DEFAULT_PORT}" BASEPORT
-  for ((i=0; i<COUNT; i++)); do
-    user="s5user$((i+1))"
-    pass="$(random_pass)"
-    port=$((BASEPORT+i))
-    ACCOUNTS+=("${port}:${user}:${pass}")
-    echo "生成账号 -> 端口: $port, 用户名: $user, 密码: $pass"
-  done
-  save_meta
-  echo -e "${GREEN}批量生成完成${RESET}"
+view_logs() {
+    echo -e "${GREEN}显示容器日志，按 Ctrl+C 返回菜单${RESET}"
+    docker logs -f $docker_name
 }
 
-delete_account() {
-  ensure_workdir
-  load_meta
-  list_accounts
-  prompt "输入要删除的编号" "" IDX
-  if ! [[ "$IDX" =~ ^[0-9]+$ ]]; then
-    echo "无效编号"
-    return
-  fi
-  if [ "$IDX" -lt 1 ] || [ "$IDX" -gt "${#ACCOUNTS[@]}" ]; then
-    echo "编号不存在"
-    return
-  fi
-  unset 'ACCOUNTS[IDX-1]'
-  ACCOUNTS=("${ACCOUNTS[@]}")
-  save_meta
-  echo -e "${YELLOW}已删除账号 ${IDX}${RESET}"
+uninstall_all() {
+    docker stop $docker_name 2>/dev/null || true
+    docker rm $docker_name 2>/dev/null || true
+    echo -e "${RED}容器及所有数据已删除！${RESET}"
+    rm -rf "$config_dir" "$image_dir" "$port_file"
 }
 
-delete_all_accounts() {
-  ensure_workdir
-  load_meta
-  prompt "确认要删除所有账号? 输入 y 确认" "N" CONFIRM
-  if [ "$CONFIRM" != "y" ]; then
-    echo "已取消"
-    return
-  fi
-  ACCOUNTS=()
-  save_meta
-  echo -e "${RED}所有账号已删除${RESET}"
-}
-
-install_flow() {
-  ensure_workdir
-  EXIST="$(detect_existing_impl || true)"
-  if [ -n "${EXIST}" ]; then
-    BIN_TYPE="${EXIST}"
-  else
-    echo "未检测到受支持的实现，尝试安装 microsocks ..."
-    if try_install_microsocks; then
-      BIN_TYPE="microsocks"
-    elif try_install_3proxy; then
-      BIN_TYPE="3proxy"
-    fi
-  fi
-  if [ -z "${BIN_TYPE}" ]; then
-    echo -e "${RED}未能安装任何 socks5 实现${RESET}"
-    return 1
-  fi
-  save_meta
-  start_by_type "${BIN_TYPE}" || return 1
-  return 0
-}
-
-status_flow() {
-  ensure_workdir
-  load_meta
-  if [ -f "${PID_FILE}" ]; then
-    echo -e "${GREEN}socks5 已运行:${RESET}"
-    list_accounts
-  else
-    echo -e "${YELLOW}未运行${RESET}"
-  fi
-}
-
-main_menu() {
-  while true; do
-    echo
+# ================= 菜单 =================
+while true; do
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}     Socks5 管理工具     ${RESET}"
+    echo -e "${GREEN} EasyImage 图床 Docker 管理菜单 ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}1) 安装 socks5${RESET}"
-    echo -e "${GREEN}2) 启动 socks5${RESET}"
-    echo -e "${GREEN}3) 停止 socks5${RESET}"
-    echo -e "${GREEN}4) 批量生成账号${RESET}"
-    echo -e "${GREEN}5) 查看账号列表${RESET}"
-    echo -e "${GREEN}6) 删除指定账号${RESET}"
-    echo -e "${GREEN}7) 删除所有账号${RESET}"
-    echo -e "${GREEN}8) 状态${RESET}"
-    echo -e "${GREEN}9) 退出${RESET}"
-    read -r -p "$(echo -e "${GREEN}请选择 (1-9): ${RESET}")" opt < /dev/tty || opt="9"
-    case "${opt}" in
-      1) install_flow ;;
-      2) start_by_type "${BIN_TYPE:-microsocks}" ;;
-      3) stop_socks ;;
-      4) add_accounts ;;
-      5) list_accounts ;;
-      6) delete_account ;;
-      7) delete_all_accounts ;;
-      8) status_flow ;;
-      9) echo -e "${GREEN}退出${RESET}"; exit 0 ;;
-      *) echo -e "${RED}无效选项${RESET}" ;;
+    echo -e "${GREEN}1. 安装并启动容器${RESET}"
+    echo -e "${GREEN}2. 启动容器${RESET}"
+    echo -e "${GREEN}3. 停止容器${RESET}"
+    echo -e "${GREEN}4. 重启容器${RESET}"
+    echo -e "${GREEN}5. 查看容器状态${RESET}"
+    echo -e "${GREEN}6. 更新容器镜像${RESET}"
+    echo -e "${GREEN}7. 查看容器日志${RESET}"
+    echo -e "${RED}8. 卸载容器并删除所有数据${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    read -p "请选择操作 [0-8]: " choice
+
+    case $choice in
+        1) install_container ;;
+        2) start_container ;;
+        3) stop_container ;;
+        4) restart_container ;;
+        5) status_container ;;
+        6) update_container ;;
+        7) view_logs ;;
+        8) uninstall_all ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}输入错误，请重新选择。${RESET}" ;;
     esac
-  done
-}
-
-ensure_workdir
-load_meta
-main_menu
+done

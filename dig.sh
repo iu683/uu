@@ -1,104 +1,156 @@
 #!/bin/bash
 
-BASE_PORT=20000                  # 起始端口
-DATA_DIR="$HOME/socks5_users"    # 存储账号目录
-BIN_PATH="/usr/bin/microsocks"   # socks5 程序路径
-mkdir -p "$DATA_DIR"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-# 获取服务器 IP
-SERVER_IP=$(curl -s ifconfig.me || echo "127.0.0.1")
+# 容器配置
+DOCKER_NAME="npm"
+DOCKER_IMG="jc21/nginx-proxy-manager:latest"
+DATA_PATH="/home/docker/npm/data"
+CERT_PATH="/home/docker/npm/letsencrypt"
+CONFIG_FILE="/home/docker/npm/config.conf"
 
-install_socks5() {
-    if [ ! -f "$BIN_PATH" ]; then
-        echo "未检测到 microsocks，正在安装..."
-        apt update && apt install -y microsocks
+# 获取公网 IP
+get_public_ip() {
+    local ip
+    ip=$(curl -s ipv4.ip.sb)
+    [[ -z "$ip" ]] && ip=$(curl -s ifconfig.me)
+    [[ -z "$ip" ]] && ip=$(curl -s ipinfo.io/ip)
+    if [[ -z "$ip" ]]; then
+        echo -e "${RED}无法获取公网 IP${RESET}"
+        return 1
     fi
-    echo "microsocks 已安装。"
+    echo "$ip"
 }
 
-start_socks5() {
-    for file in "$DATA_DIR"/*.conf; do
-        [ -e "$file" ] || continue
-        eval $(cat "$file")
-        nohup $BIN_PATH -1 -i 0.0.0.0 -p "$PORT" -u "$USER" -P "$PASS" >/dev/null 2>&1 &
-    done
-    echo "所有 Socks5 已启动。"
+# ================== 初始化配置 ==================
+if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+else
+    read -p "请输入 NPM 面板端口 (默认 81): " input_port
+    DOCKER_PORT=${input_port:-81}
+    mkdir -p "$(dirname $CONFIG_FILE)"
+    echo "DOCKER_PORT=$DOCKER_PORT" > "$CONFIG_FILE"
+fi
+
+# ================== 函数 ==================
+docker_update_image() {
+    echo -e "${GREEN}正在拉取最新 NPM 镜像...${RESET}"
+    docker pull $DOCKER_IMG
 }
 
-stop_socks5() {
-    pkill microsocks && echo "已停止所有 Socks5。"
-}
-
-gen_accounts() {
-    read -p "请输入要生成的账号数量: " COUNT
-    for i in $(seq 1 $COUNT); do
-        USER="user$i"
-        PASS=$(openssl rand -hex 4)
-        PORT=$((BASE_PORT+i-1))
-        CONF="$DATA_DIR/$USER.conf"
-        echo "USER=$USER" > "$CONF"
-        echo "PASS=$PASS" >> "$CONF"
-        echo "PORT=$PORT" >> "$CONF"
-        nohup $BIN_PATH -1 -i 0.0.0.0 -p "$PORT" -u "$USER" -P "$PASS" >/dev/null 2>&1 &
-        echo "生成账号: socks://$USER:$PASS@$SERVER_IP:$PORT"
-    done
-}
-
-list_accounts() {
-    for file in "$DATA_DIR"/*.conf; do
-        [ -e "$file" ] || { echo "没有账号。"; return; }
-        source "$file"
-        echo "socks://$USER:$PASS@$SERVER_IP:$PORT"
-    done
-}
-
-delete_account() {
-    list_accounts
-    read -p "请输入要删除的用户名: " DEL_USER
-    FILE="$DATA_DIR/$DEL_USER.conf"
-    if [ -f "$FILE" ]; then
-        source "$FILE"
-        rm -f "$FILE"
-        fuser -k "$PORT"/tcp >/dev/null 2>&1
-        echo "已删除账号 $DEL_USER"
-    else
-        echo "未找到账号 $DEL_USER"
+docker_install() {
+    # 检测端口是否被占用
+    if lsof -i:$DOCKER_PORT -sTCP:LISTEN || lsof -i:80 -sTCP:LISTEN || lsof -i:443 -sTCP:LISTEN; then
+        echo -e "${RED}⚠️ 端口 $DOCKER_PORT / 80 / 443 已被占用，请先释放端口再运行 NPM${RESET}"
+        return 1
     fi
+
+    mkdir -p "$DATA_PATH" "$CERT_PATH"
+    docker_update_image
+
+    if docker ps -a --format '{{.Names}}' | grep -q "^${DOCKER_NAME}$"; then
+        echo -e "${YELLOW}检测到已有 NPM 容器，无法重复安装，请选择更新或启动${RESET}"
+        return 1
+    fi
+
+    docker run -d \
+      --name=$DOCKER_NAME \
+      -p ${DOCKER_PORT}:81 \
+      -p 80:80 \
+      -p 443:443 \
+      -v $DATA_PATH:/data \
+      -v $CERT_PATH:/etc/letsencrypt \
+      --restart=always \
+      $DOCKER_IMG
+
+    local ip=$(get_public_ip)
+    echo -e "${GREEN}✅ Nginx Proxy Manager 已安装并启动${RESET}"
+    echo -e "${GREEN}管理面板地址: http://${ip}:${DOCKER_PORT}${RESET}"
+    echo -e "${GREEN}初始用户名: admin@example.com${RESET}"
+    echo -e "${GREEN}初始密码: changeme${RESET}"
 }
 
-delete_all() {
-    rm -f "$DATA_DIR"/*.conf
-    pkill microsocks
-    echo "已删除所有账号。"
+docker_update() {
+    docker_update_image
+
+    if docker ps -a --format '{{.Names}}' | grep -q "^${DOCKER_NAME}$"; then
+        echo -e "${YELLOW}停止旧容器并删除（保留数据）...${RESET}"
+        docker stop $DOCKER_NAME
+        docker rm $DOCKER_NAME
+    fi
+
+    docker run -d \
+      --name=$DOCKER_NAME \
+      -p ${DOCKER_PORT}:81 \
+      -p 80:80 \
+      -p 443:443 \
+      -v $DATA_PATH:/data \
+      -v $CERT_PATH:/etc/letsencrypt \
+      --restart=always \
+      $DOCKER_IMG
+
+    local ip=$(get_public_ip)
+    echo -e "${GREEN}✅ NPM 已更新并重启${RESET}"
+    echo -e "${GREEN}管理面板地址: http://${ip}:${DOCKER_PORT}${RESET}"
 }
 
-status() {
-    pgrep microsocks >/dev/null && echo "Socks5 正在运行。" || echo "Socks5 未运行。"
+docker_remove() {
+    docker rm -f $DOCKER_NAME 2>/dev/null
+    echo -e "${GREEN}✅ NPM 已卸载${RESET}"
+    # 删除数据
+    rm -rf "$DATA_PATH" "$CERT_PATH" "$CONFIG_FILE"
+    echo -e "${RED}数据目录已删除${RESET}"
 }
 
-while true; do
-    echo "    Socks5 管理工具     "
-    echo "=============================="
-    echo "1) 安装 socks5"
-    echo "2) 启动 socks5"
-    echo "3) 停止 socks5"
-    echo "4) 批量生成账号"
-    echo "5) 查看账号列表"
-    echo "6) 删除指定账号"
-    echo "7) 删除所有账号"
-    echo "8) 状态"
-    echo "9) 退出"
-    read -p "请选择 (1-9): " choice
+docker_logs() {
+    docker logs -f $DOCKER_NAME
+}
+
+docker_start() {
+    docker start $DOCKER_NAME
+}
+
+docker_stop() {
+    docker stop $DOCKER_NAME
+}
+
+docker_restart() {
+    docker restart $DOCKER_NAME
+}
+
+# ================== 菜单 ==================
+menu() {
+    clear
+    echo -e "${GREEN}=== Nginx Proxy Manager 一键管理菜单 ===${RESET}"
+    echo -e "${GREEN}1. 安装 NPM${RESET}"
+    echo -e "${GREEN}2. 更新 NPM 镜像并重启容器${RESET}"
+    echo -e "${GREEN}3. 启动 NPM${RESET}"
+    echo -e "${GREEN}4. 停止 NPM${RESET}"
+    echo -e "${GREEN}5. 重启 NPM${RESET}"
+    echo -e "${GREEN}6. 查看日志${RESET}"
+    echo -e "${GREEN}7. 卸载 NPM（删除容器和数据）${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}=========================================${RESET}"
+    read -p $'\033[32m请输入选项: \033[0m' choice
+
     case $choice in
-        1) install_socks5 ;;
-        2) start_socks5 ;;
-        3) stop_socks5 ;;
-        4) gen_accounts ;;
-        5) list_accounts ;;
-        6) delete_account ;;
-        7) delete_all ;;
-        8) status ;;
-        9) exit 0 ;;
-        *) echo "无效选项" ;;
+        1) docker_install ;;
+        2) docker_update ;;
+        3) docker_start ;;
+        4) docker_stop ;;
+        5) docker_restart ;;
+        6) docker_logs ;;
+        7) docker_remove ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
+}
+
+# ================== 主循环 ==================
+while true; do
+    menu
+    read -p $'\033[32m按回车返回菜单...\033[0m' foo
 done

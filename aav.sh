@@ -6,12 +6,12 @@
 GREEN="\033[32m"
 RESET="\033[0m"
 APP_NAME="sub-store"
-DATA_DIR="$HOME/sub-store-data"
+APP_DIR="$HOME/$APP_NAME"
+DATA_DIR="$APP_DIR/data"
+CONFIG_FILE="$APP_DIR/config.env"
 DEFAULT_PORT=3001
-COMPOSE_DIR="$HOME/$APP_NAME"
-CONFIG_FILE="$COMPOSE_DIR/config.env"
 
-mkdir -p "$DATA_DIR" "$COMPOSE_DIR"
+mkdir -p "$DATA_DIR"
 
 function get_ip() {
     curl -s ifconfig.me || curl -s ip.sb || echo "your-ip"
@@ -45,6 +45,8 @@ function install_app() {
 
     # 随机生成路径（16 位）
     RANDOM_PATH=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 16)
+
+    mkdir -p "$APP_DIR"
 
     cat > "$CONFIG_FILE" <<EOF
 PORT=$PORT
@@ -84,7 +86,7 @@ function update_app() {
 
 function uninstall_app() {
     docker rm -f $APP_NAME >/dev/null 2>&1
-    rm -rf "$DATA_DIR" "$COMPOSE_DIR"
+    rm -rf "$APP_DIR"
     echo -e "${GREEN}✅ Sub-Store 已卸载，数据已删除${RESET}"
     read -p "按回车返回菜单..."
     menu

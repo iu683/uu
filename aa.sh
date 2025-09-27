@@ -1,93 +1,114 @@
 #!/bin/bash
 # ========================================
-# HubP 一键管理脚本
+# vps-value-calculator 菜单式管理脚本
 # ========================================
 
+# ========== 颜色 ==========
+RED="\033[31m"
 GREEN="\033[32m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
 RESET="\033[0m"
-APP_NAME="HubP"
-COMPOSE_DIR="$HOME/HubP"
-COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yml"
 
-function get_ip() {
-    curl -s ifconfig.me || curl -s ip.sb || echo "your-ip"
+# ========== 设置变量 ==========
+APP_NAME="vps-value-calculator"
+REPO_URL="https://github.com/podcctv/vps-value-calculator.git"
+APP_DIR="$HOME/$APP_NAME"
+
+# ========== 检查 Docker ==========
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${RED}错误: Docker 未安装！${RESET}"
+        exit 1
+    fi
+    if ! command -v docker-compose &>/dev/null && ! docker compose version &>/dev/null; then
+        echo -e "${RED}错误: Docker Compose 未安装！${RESET}"
+        exit 1
+    fi
 }
 
-function menu() {
-    clear
-    echo -e "${GREEN}=== HubP 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装/启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}=======================${RESET}"
-    read -p "请选择: " choice
+# ========== 部署或更新项目 ==========
+deploy_app() {
+    if [ -d "$APP_DIR" ]; then
+        echo -e "${YELLOW}项目目录已存在，拉取最新代码...${RESET}"
+        cd "$APP_DIR" || exit
+        git pull
+    else
+        echo -e "${BLUE}克隆项目到 $APP_DIR ...${RESET}"
+        git clone "$REPO_URL" "$APP_DIR"
+        cd "$APP_DIR" || exit
+    fi
+
+    if [ -f ".env.example" ] && [ ! -f ".env" ]; then
+        echo -e "${BLUE}创建 .env 文件...${RESET}"
+        cp .env.example .env
+        echo -e "${GREEN}.env 文件创建完成，可根据需要修改.${RESET}"
+    fi
+
+    echo -e "${BLUE}启动 Docker 容器...${RESET}"
+    docker compose up -d
+    echo -e "${GREEN}服务已启动.${RESET}"
+}
+
+# ========== 停止服务 ==========
+stop_app() {
+    cd "$APP_DIR" || exit
+    docker compose down
+    echo -e "${GREEN}服务已停止.${RESET}"
+}
+
+# ========== 重启服务 ==========
+restart_app() {
+    cd "$APP_DIR" || exit
+    docker compose down
+    docker compose up -d
+    echo -e "${GREEN}服务已重启.${RESET}"
+}
+
+# ========== 删除容器和镜像 ==========
+remove_app() {
+    cd "$APP_DIR" || exit
+    docker compose down --rmi all
+    echo -e "${GREEN}容器和镜像已删除.${RESET}"
+}
+
+# ========== 查看日志 ==========
+logs_app() {
+    cd "$APP_DIR" || exit
+    docker compose logs -f
+}
+
+# ========== 显示访问地址 ==========
+show_address() {
+    HOST_IP=$(hostname -I | awk '{print $1}')
+    if grep -q "ports:" docker-compose.yml; then
+        PORT=$(grep "ports:" -A 1 docker-compose.yml | grep -oP '\d+(?=:)')
+        echo -e "${GREEN}服务访问地址: http://${HOST_IP}:${PORT}${RESET}"
+    else
+        echo -e "${GREEN}请根据 docker-compose.yml 配置的端口访问服务.${RESET}"
+    fi
+}
+
+# ========== 菜单 ==========
+while true; do
+    echo -e "\n${GREEN}========== VPS Value Calculator 管理菜单 ==========${RESET}"
+    echo -e "${GREEN}1. 部署 / 更新并启动服务${RESET}"
+    echo -e "${GREEN}2. 停止服务${RESET}"
+    echo -e "${GREEN}3. 重启服务${RESET}"
+    echo -e "${GREEN}4. 删除容器和镜像${RESET}"
+    echo -e "${GREEN}5. 查看日志${RESET}"
+    echo -e "${GREEN}6. 显示访问地址${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -ne "${YELLOW}请选择操作 [0-6]: ${RESET}"
+    read -r choice
     case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
-        4) view_logs ;;
-        0) exit 0 ;;
-        *) echo "无效选择"; sleep 1; menu ;;
+        1) check_docker && deploy_app ;;
+        2) stop_app ;;
+        3) restart_app ;;
+        4) remove_app ;;
+        5) logs_app ;;
+        6) show_address ;;
+        0) echo -e "${YELLOW}退出管理脚本.${RESET}"; exit 0 ;;
+        *) echo -e "${RED}无效选项，请重新选择.${RESET}" ;;
     esac
-}
-
-function install_app() {
-    read -p "请输入映射端口 [默认 18184]: " input_port
-    PORT=${input_port:-18184}
-
-    read -p "请输入 HUBP_DISGUISE [默认: onlinealarmkur.com]: " input_disguise
-    DISGUISE=${input_disguise:-onlinealarmkur.com}
-
-    mkdir -p "$COMPOSE_DIR"
-
-    cat > "$COMPOSE_FILE" <<EOF
-version: "3.8"
-
-services:
-  hubp:
-    image: ymyuuu/hubp:latest
-    container_name: hubp
-    restart: unless-stopped
-    ports:
-      - "${PORT}:18826"
-    environment:
-      - HUBP_LOG_LEVEL=debug
-      - HUBP_DISGUISE=${DISGUISE}
-EOF
-
-    cd "$COMPOSE_DIR"
-    docker compose up -d
-    echo -e "${GREEN}✅ HubP 已启动${RESET}"
-    echo -e "${GREEN}🌐 访问地址: http://$(get_ip):${PORT}${RESET}"
-    echo -e "${GREEN}🕵️ HUBP_DISGUISE: $DISGUISE${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function update_app() {
-    cd "$COMPOSE_DIR" || exit
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ HubP 已更新并重启完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function uninstall_app() {
-    cd "$COMPOSE_DIR" || exit
-    docker compose down -v
-    rm -rf "$COMPOSE_DIR"
-    echo -e "${GREEN}✅ HubP 已卸载${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function view_logs() {
-    docker logs -f hubp
-    read -p "按回车返回菜单..."
-    menu
-}
-
-menu
+done

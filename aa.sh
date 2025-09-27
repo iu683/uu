@@ -48,7 +48,7 @@ services:
     image: ddsderek/easyimage:latest
     container_name: easyimage
     ports:
-      - "$PORT:80"
+      - "127.0.0.1:$PORT:80"
     environment:
       - TZ=Asia/Shanghai
     volumes:

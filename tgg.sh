@@ -1,128 +1,140 @@
 #!/bin/bash
-# Telegram Monitor Docker 一键管理脚本（智能端口和数据目录）
+# ========================================
+# AutoBangumi 一键管理脚本（修正版）
+# ========================================
 
-CONTAINER_NAME="telegram-monitor"
-IMAGE="ghcr.io/riniba/telegrammonitor:latest"
+# 颜色
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+CYAN="\033[36m"
+RESET="\033[0m"
 
-GREEN="\e[32m"
-RED="\e[31m"
-RESET="\e[0m"
+# 默认配置
+APP_NAME="AutoBangumi"
+DEFAULT_PORT=7892
+CONFIG_FILE="${HOME}/.autobangumi.conf"
+CONFIG_DIR="${HOME}/AutoBangumi/config"
+DATA_DIR="${HOME}/AutoBangumi/data"
+IMAGE_NAME="ghcr.io/estrellaxd/auto_bangumi:latest"
+TIMEZONE="Asia/Shanghai"
 
-# 检查 Docker 是否安装
+# 读取端口配置，如果没有配置文件则创建
+if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+else
+    read -p "请输入 AutoBangumi 映射端口 (默认 $DEFAULT_PORT): " input_port
+    APP_PORT=${input_port:-$DEFAULT_PORT}
+    echo "APP_PORT=$APP_PORT" > "$CONFIG_FILE"
+fi
+
+# 检查 Docker
 check_docker() {
     if ! command -v docker &>/dev/null; then
-        echo -e "${RED}Docker 未安装，请先安装 Docker${RESET}"
+        echo -e "${RED}错误: 未检测到 Docker，请先安装！${RESET}"
         exit 1
     fi
 }
 
-# 获取容器端口和数据目录
-get_container_info() {
-    if [ "$(docker ps -aq -f name=$CONTAINER_NAME)" ]; then
-        PORT=$(docker inspect $CONTAINER_NAME --format '{{(index (index .NetworkSettings.Ports "5005/tcp") 0).HostPort}}')
-        DATA_DIR=$(docker inspect $CONTAINER_NAME --format '{{range .Mounts}}{{if eq .Destination "/app"}}{{.Source}}{{end}}{{end}}')
-    else
-        PORT=""
-        DATA_DIR=""
+# 部署或安装 AutoBangumi
+install_app() {
+    check_docker
+    mkdir -p "${CONFIG_DIR}" "${DATA_DIR}"
+
+    echo -e "${YELLOW}拉取镜像：${IMAGE_NAME}${RESET}"
+    docker pull "${IMAGE_NAME}"
+
+    # 删除旧容器（如果存在）
+    if docker ps -a --format '{{.Names}}' | grep -q "^${APP_NAME}$"; then
+        echo -e "${YELLOW}已有容器 ${APP_NAME}，正在删除...${RESET}"
+        docker stop "${APP_NAME}" && docker rm "${APP_NAME}"
     fi
+
+    echo -e "${YELLOW}正在启动 AutoBangumi...${RESET}"
+    docker run -d \
+      --name="${APP_NAME}" \
+      -v "${CONFIG_DIR}:/app/config" \
+      -v "${DATA_DIR}:/app/data" \
+      -p ${APP_PORT}:7892 \
+      -e TZ=${TIMEZONE} \
+      -e PUID=$(id -u) \
+      -e PGID=$(id -g) \
+      -e UMASK=022 \
+      --network=bridge \
+      --dns=8.8.8.8 \
+      --restart unless-stopped \
+      "${IMAGE_NAME}"
+
+    echo -e "${GREEN}AutoBangumi 部署完成！${RESET}"
+    echo -e "${CYAN}访问地址：http://$(hostname -I | awk '{print $1}'):${APP_PORT}${RESET}"
 }
 
-# 安装/启动容器
-install_container() {
-    get_container_info
-    if [ -n "$PORT" ] && [ -n "$DATA_DIR" ]; then
-        echo -e "${GREEN}容器已存在，启动中...${RESET}"
-        docker start $CONTAINER_NAME
-    else
-        read -p "请输入本地映射端口（默认5005）: " PORT
-        PORT=${PORT:-5005}
-        read -p "请输入数据存储目录（默认./data）: " DATA_DIR
-        DATA_DIR=${DATA_DIR:-./data}
+# 启动
+start_app() { docker start "${APP_NAME}" && echo -e "${GREEN}已启动 ${APP_NAME}${RESET}"; }
 
-        echo -e "${GREEN}创建并启动容器...${RESET}"
-        mkdir -p "$DATA_DIR"
-        docker run -d \
-            --name $CONTAINER_NAME \
-            --restart unless-stopped \
-            -p $PORT:5005 \
-            -v $INSTALL_DIR/data:/app/data \
-            -e ASPNETCORE_ENVIRONMENT=Production \
-            $IMAGE
-    fi
-}
+# 停止
+stop_app() { docker stop "${APP_NAME}" && echo -e "${YELLOW}已停止 ${APP_NAME}${RESET}"; }
 
-# 停止容器
-stop_container() {
-    if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
-        echo -e "${GREEN}停止容器...${RESET}"
-        docker stop $CONTAINER_NAME
-    else
-        echo -e "${RED}容器未运行${RESET}"
-    fi
-}
-
-# 重启容器
-restart_container() {
-    echo -e "${GREEN}重启容器...${RESET}"
-    docker restart $CONTAINER_NAME
-}
-
-# 更新镜像并重启
-update_container() {
-    get_container_info
-    echo -e "${GREEN}拉取最新镜像...${RESET}"
-    docker pull $IMAGE
-
-    if [ -n "$PORT" ] && [ -n "$DATA_DIR" ]; then
-        echo -e "${GREEN}删除旧容器并启动新容器（保留原端口和数据目录）...${RESET}"
-        docker rm -f $CONTAINER_NAME
-        docker run -d \
-            --name $CONTAINER_NAME \
-            --restart unless-stopped \
-            -p $PORT:5005 \
-            -v $INSTALL_DIR/data:/app/data\
-            -e ASPNETCORE_ENVIRONMENT=Production \
-            $IMAGE
-    else
-        echo -e "${GREEN}容器不存在，执行安装流程...${RESET}"
-        install_container
-    fi
-}
+# 重启
+restart_app() { docker restart "${APP_NAME}" && echo -e "${GREEN}已重启 ${APP_NAME}${RESET}"; }
 
 # 查看日志
-logs_container() {
-    echo -e "${GREEN}查看容器日志（按 Ctrl+C 退出）...${RESET}"
-    docker logs -f $CONTAINER_NAME
+logs_app() { docker logs -f "${APP_NAME}"; }
+
+# 更新镜像
+update_app() {
+    echo -e "${YELLOW}正在更新 ${APP_NAME}...${RESET}"
+    docker pull "${IMAGE_NAME}"
+    if docker ps -a --format '{{.Names}}' | grep -q "^${APP_NAME}$"; then
+        echo -e "${YELLOW}停止并删除旧容器...${RESET}"
+        docker stop "${APP_NAME}" && docker rm "${APP_NAME}"
+    fi
+    # 使用已保存端口重新安装
+    install_app
 }
 
-# 卸载容器
-uninstall_container() {
-    echo -e "${RED}停止并删除容器...${RESET}"
-    docker rm -f $CONTAINER_NAME
-    echo -e "${GREEN}卸载完成${RESET}"
+# 卸载
+uninstall_app() {
+    docker stop "${APP_NAME}" && docker rm "${APP_NAME}"
+    echo -e "${YELLOW}是否删除配置和数据目录？[y/N]${RESET}"
+    read -r del
+    if [[ "$del" =~ ^[Yy]$ ]]; then
+        rm -rf "${CONFIG_DIR}" "${DATA_DIR}" "${CONFIG_FILE}"
+        echo -e "${RED}已删除配置和数据目录${RESET}"
+    fi
+    echo -e "${GREEN}${APP_NAME} 已卸载${RESET}"
 }
 
 # 菜单
-while true; do
-    echo -e "\n${GREEN}======================${RESET}"
-    echo -e "${GREEN}=== Telegram Monitor 管理菜单 ===${RESET}"
-    echo -e "${GREEN}======================${RESET}"
-    echo -e "${GREEN}1) 安装/启动容器${RESET}"
-    echo -e "${GREEN}2) 停止容器${RESET}"
-    echo -e "${GREEN}3) 重启容器${RESET}"
-    echo -e "${GREEN}4) 更新容器${RESET}"
-    echo -e "${GREEN}5) 查看日志${RESET}"
-    echo -e "${GREEN}6) 卸载容器${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    read -p "请选择操作: " choice
-    case $choice in
-        1) install_container ;;
-        2) stop_container ;;
-        3) restart_container ;;
-        4) update_container ;;
-        5) logs_container ;;
-        6) uninstall_container ;;
+menu() {
+    clear
+    echo -e "${GREEN}==== AutoBangumi 管理菜单 ====${RESET}"
+    echo -e "${GREEN}1. 部署 / 安装 AutoBangumi${RESET}"
+    echo -e "${GREEN}2. 启动 AutoBangumi${RESET}"
+    echo -e "${GREEN}3. 停止 AutoBangumi${RESET}"
+    echo -e "${GREEN}4. 重启 AutoBangumi${RESET}"
+    echo -e "${GREEN}5. 查看日志${RESET}"
+    echo -e "${GREEN}6. 更新 AutoBangumi${RESET}"
+    echo -e "${GREEN}7. 卸载 AutoBangumi${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -ne "${YELLOW}请输入选项: ${RESET}"
+    read -r choice
+    case "$choice" in
+        1) install_app ;;
+        2) start_app ;;
+        3) stop_app ;;
+        4) restart_app ;;
+        5) logs_app ;;
+        6) update_app ;;
+        7) uninstall_app ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac
+}
+
+# 循环显示菜单
+while true; do
+    menu
+    echo -e "${YELLOW}按回车键返回菜单...${RESET}"
+    read -r
 done

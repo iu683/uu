@@ -17,12 +17,12 @@ function get_ip() {
 function menu() {
     clear
     echo -e "${GREEN}=== Wallos 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装/启动=${RESET}"
-    echo -e "${GREEN}2) 更新=${RESET}"
-    echo -e "${GREEN}3) 卸载 (含数据)=${RESET}"
-    echo -e "${GREEN}4) 查看日志=${RESET}"
-    echo -e "${GREEN}0) 退出=${RESET}"
-    echo -e "${GREEN}========================${RESET}"
+    echo -e "${GREEN}1) 安装/启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    echo -e "${GREEN}=======================${RESET}"
     read -p "请选择: " choice
     case $choice in
         1) install_app ;;
@@ -39,24 +39,24 @@ function install_app() {
 
     read -p "请输入 Web 端口 [默认:8282]: " input_port
     PORT=${input_port:-8282}
+    echo "PORT=$PORT" > "$CONFIG_FILE"
 
     cat > "$COMPOSE_FILE" <<EOF
-version: "3.8"
 services:
   wallos:
     container_name: wallos
     image: bellamy/wallos:latest
     ports:
-      - "127.0.0.1:\${PORT}:80"
+       - "127.0.0.1:$PORT:80"
     environment:
       TZ: Asia/Shanghai
     volumes:
       - ./db:/var/www/html/db
       - ./logos:/var/www/html/images/uploads/logos
     restart: unless-stopped
+    env_file:
+      - ./config.env
 EOF
-
-    echo "PORT=$PORT" > "$CONFIG_FILE"
 
     cd "$APP_DIR"
     docker compose up -d

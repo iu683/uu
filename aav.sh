@@ -91,18 +91,19 @@ logs_app() {
 }
 
 menu() {
-    clear
-    echo -e "${GREEN}===============================${RESET}"
-    echo -e "${GREEN}    EasyImage 管理脚本          ${RESET}"
-    echo -e "${GREEN}===============================${RESET}"
-    echo -e "${GREEN}1. 安装并启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 启动容器${RESET}"
-    echo -e "${GREEN}4. 停止容器${RESET}"
-    echo -e "${GREEN}5. 卸载容器${RESET}"
-    echo -e "${GREEN}6. 查看日志${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}===============================${RESET}"
+    while true; do
+        clear
+        echo -e "${GREEN}===============================${RESET}"
+        echo -e "${GREEN}    EasyImage 管理脚本          ${RESET}"
+        echo -e "${GREEN}===============================${RESET}"
+        echo -e "${GREEN}1. 安装并启动${RESET}"
+        echo -e "${GREEN}2. 更新容器${RESET}"
+        echo -e "${GREEN}3. 启动容器${RESET}"
+        echo -e "${GREEN}4. 停止容器${RESET}"
+        echo -e "${GREEN}5. 卸载容器${RESET}"
+        echo -e "${GREEN}6. 查看日志${RESET}"
+        echo -e "${GREEN}0. 退出${RESET}"
+        echo -e "${GREEN}===============================${RESET}"
         read -p "请输入操作编号: " num
         case "$num" in
             1) install_app ;;
@@ -120,4 +121,3 @@ menu() {
 }
 
 menu
-

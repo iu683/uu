@@ -1,166 +1,112 @@
 #!/bin/bash
-# MySQL Docker 管理菜单
 
-CONTAINER_NAME="mysql8"
-MYSQL_ROOT_PASSWORD="123456"
-MYSQL_DATABASE="mydb"
-MYSQL_USER="myuser"
-MYSQL_PASSWORD="mypassword"
-MYSQL_VERSION="8.0"
-DATA_DIR="/opt/mysql/data"
-CONF_DIR="/opt/mysql/conf"
+CONTAINER_NAME="gh-proxy-py"
+IMAGE_NAME="hunsh/gh-proxy-py:latest"
 
-# 菜单颜色
-GREEN="\033[32m"
-RESET="\033[0m"
+# 颜色
+green="\033[32m"
+red="\033[31m"
+yellow="\033[33m"
+reset="\033[0m"
 
-function show_access_info() {
-    HOST_IP=$(hostname -I | awk '{print $1}')
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "📌 访问地址: $HOST_IP:3306"
-    echo "👤 root 用户: root"
-    echo "🔑 root 密码: $MYSQL_ROOT_PASSWORD"
-    echo "👤 默认数据库用户: $MYSQL_USER"
-    echo "🔑 默认用户密码: $MYSQL_PASSWORD"
-    echo "🗄 预设数据库: $MYSQL_DATABASE"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+# 保存端口和数据目录
+CONFIG_FILE="$HOME/.gh_proxy_config"
+
+# 获取本机 IP
+get_ip() {
+  IP=$(hostname -I | awk '{print $1}')
 }
 
-function install_mysql() {
-    mkdir -p "$DATA_DIR" "$CONF_DIR"
-
-    cat > "$CONF_DIR/my.cnf" <<'EOF'
-[mysqld]
-character-set-server=utf8mb4
-collation-server=utf8mb4_general_ci
-
-[client]
-default-character-set=utf8mb4
-
-[mysql]
-default-character-set=utf8mb4
-EOF
-
-    docker run --name $CONTAINER_NAME \
-        -e MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD \
-        -e MYSQL_DATABASE=$MYSQL_DATABASE \
-        -e MYSQL_USER=$MYSQL_USER \
-        -e MYSQL_PASSWORD=$MYSQL_PASSWORD \
-        -p 3306:3306 \
-        -v $DATA_DIR:/var/lib/mysql \
-        -v $CONF_DIR:/etc/mysql/conf.d \
-        --restart unless-stopped \
-        -d mysql:$MYSQL_VERSION
-
-    echo "✅ MySQL 容器已启动"
-    show_access_info
+menu() {
+  clear
+  echo -e "${green}====== gh-proxy-py Docker 管理脚本 ======${reset}"
+  echo -e "${green}1.${green} 部署并运行容器${reset}"
+  echo -e "${green}2.${green} 启动容器${reset}"
+  echo -e "${green}3.${green} 停止容器${reset}"
+  echo -e "${green}4.${green} 重启容器${reset}"
+  echo -e "${green}5.${green} 查看容器日志${reset}"
+  echo -e "${green}6.${green} 删除容器${reset}"
+  echo -e "${green}7.${green} 更新容器${reset}"
+  echo -e "${green}0.${green} 退出${reset}"
+  echo -e "${green}=====================================${reset}"
 }
 
-function start_mysql() { docker start $CONTAINER_NAME; show_access_info; }
-function stop_mysql() { docker stop $CONTAINER_NAME; }
-function restart_mysql() { docker restart $CONTAINER_NAME; }
-function logs_mysql() { docker logs -f $CONTAINER_NAME; }
-function remove_mysql_keep_data() { docker rm -f $CONTAINER_NAME; echo "✅ 容器已删除，数据保留在 $DATA_DIR"; }
-function remove_mysql_and_data() { docker rm -f $CONTAINER_NAME; rm -rf "$DATA_DIR" "$CONF_DIR"; echo "✅ 容器和数据已删除"; }
-
-function update_mysql() {
-    echo "🔄 正在拉取最新 MySQL 镜像..."
-    docker pull mysql:$MYSQL_VERSION
-
-    if [ "$(docker ps -aq -f name=$CONTAINER_NAME)" ]; then
-        echo "⚠️ 容器已存在，正在重启以应用新镜像..."
-        docker rm -f $CONTAINER_NAME
-        install_mysql
-    else
-        echo "⚠️ 容器不存在，直接启动新容器..."
-        install_mysql
-    fi
-    echo "✅ MySQL 已更新并启动完成"
+# 读取端口和数据目录
+load_config() {
+  if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+  else
+    read -p "请输入要映射的外部端口 (默认 5569): " PORT
+    PORT=${PORT:-5569}
+    read -p "请输入数据目录路径 (默认 ~/gh_proxy_data): " DATA_DIR
+    DATA_DIR=${DATA_DIR:-$HOME/gh_proxy_data}
+    mkdir -p "$DATA_DIR"
+    echo "PORT=$PORT" > "$CONFIG_FILE"
+    echo "DATA_DIR=$DATA_DIR" >> "$CONFIG_FILE"
+  fi
 }
 
-function create_database() {
-    read -p "请输入新数据库名: " new_db
-    read -p "请输入字符集(默认utf8mb4): " charset
-    charset=${charset:-utf8mb4}
-
-    docker exec -i $CONTAINER_NAME \
-        mysql -uroot -p$MYSQL_ROOT_PASSWORD \
-        -e "CREATE DATABASE IF NOT EXISTS \`$new_db\` CHARACTER SET $charset COLLATE ${charset}_general_ci;"
-
-    echo "✅ 数据库 $new_db 已创建 (字符集: $charset)"
+deploy_container() {
+  load_config
+  docker rm -f $CONTAINER_NAME >/dev/null 2>&1
+  echo -e "${yellow}正在部署容器，端口: $PORT，数据目录: $DATA_DIR${reset}"
+  docker run -d --name="$CONTAINER_NAME" \
+    -p 0.0.0.0:$PORT:80 \
+    -v "$DATA_DIR":/app/data \
+    --restart=always \
+    $IMAGE_NAME
+  if [ $? -eq 0 ]; then
+    get_ip
+    echo -e "${green}容器已成功运行！访问地址：http://$IP:$PORT${reset}"
+  else
+    echo -e "${red}部署失败，请检查 Docker 是否正常运行${reset}"
+  fi
 }
 
-function create_user_and_grant() {
-    read -p "请输入新用户名: " new_user
-    read -p "请输入新用户密码: " new_pass
-    read -p "请输入要授权的数据库名: " grant_db
-
-    docker exec -i $CONTAINER_NAME \
-        mysql -uroot -p$MYSQL_ROOT_PASSWORD <<EOF
-CREATE USER IF NOT EXISTS '$new_user'@'%' IDENTIFIED BY '$new_pass';
-GRANT ALL PRIVILEGES ON \`$grant_db\`.* TO '$new_user'@'%';
-FLUSH PRIVILEGES;
-EOF
-
-    echo "✅ 用户 $new_user 已创建，并对数据库 $grant_db 授予全部权限"
+check_status() {
+  if docker ps -a --format '{{.Names}}' | grep -q "^$CONTAINER_NAME$"; then
+    echo -e "${green}容器状态:${reset}"
+    docker ps -a --filter "name=$CONTAINER_NAME"
+  else
+    echo -e "${red}容器 $CONTAINER_NAME 未安装${reset}"
+  fi
 }
 
-function create_db_user_grant_all() {
-    read -p "请输入新数据库名: " new_db
-    read -p "请输入字符集(默认utf8mb4): " charset
-    charset=${charset:-utf8mb4}
-    read -p "请输入新用户名: " new_user
-    read -p "请输入新用户密码: " new_pass
+update_image() {
+  load_config
+  echo -e "${yellow}正在拉取最新镜像...${reset}"
+  docker pull $IMAGE_NAME
+  echo -e "${yellow}更新完成，正在重新部署...${reset}"
+  deploy_container
+}
 
-    docker exec -i $CONTAINER_NAME \
-        mysql -uroot -p$MYSQL_ROOT_PASSWORD <<EOF
-CREATE DATABASE IF NOT EXISTS \`$new_db\` CHARACTER SET $charset COLLATE ${charset}_general_ci;
-CREATE USER IF NOT EXISTS '$new_user'@'%' IDENTIFIED BY '$new_pass';
-GRANT ALL PRIVILEGES ON \`$new_db\`.* TO '$new_user'@'%';
-FLUSH PRIVILEGES;
-EOF
-
-    echo "✅ 数据库 $new_db 已创建 (字符集: $charset)"
-    echo "✅ 用户 $new_user 已创建，并拥有数据库 $new_db 的全部权限"
+delete_container() {
+  load_config
+  read -p "是否同时删除数据目录 $DATA_DIR ? [y/N]: " yn
+  docker rm -f $CONTAINER_NAME
+  if [[ "$yn" =~ ^[Yy]$ ]]; then
+    rm -rf "$DATA_DIR"
+    rm -f "$CONFIG_FILE"
+    echo -e "${green}容器和数据已删除${reset}"
+  else
+    echo -e "${green}容器已删除，数据保留在 $DATA_DIR${reset}"
+  fi
 }
 
 while true; do
-    clear
-    # 菜单文字加颜色
-    echo -e "${GREEN}=== MySQL Docker 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1.  安装并启动 MySQL (持久化 & UTF8MB4)${RESET}"
-    echo -e "${GREEN}2.  启动 MySQL${RESET}"
-    echo -e "${GREEN}3.  停止 MySQL${RESET}"
-    echo -e "${GREEN}4.  重启 MySQL${RESET}"
-    echo -e "${GREEN}5.  查看 MySQL 日志${RESET}"
-    echo -e "${GREEN}6.  删除容器 (保留数据)${RESET}"
-    echo -e "${GREEN}7.  删除容器和数据${RESET}"
-    echo -e "${GREEN}8.  创建新数据库${RESET}"
-    echo -e "${GREEN}9.  创建用户并授权${RESET}"
-    echo -e "${GREEN}10. 一键创建数据库+用户+授权${RESET}"
-    echo -e "${GREEN}11. 查看访问地址${RESET}"
-    echo -e "${GREEN}12. 更新 MySQL${RESET}"
-    echo -e "${GREEN}0.  退出${RESET}"
-    echo -e "${GREEN}===========================${RESET}"
-
-    read -p "请输入选项: " choice
-
-    case $choice in
-        1) install_mysql ;;
-        2) start_mysql ;;
-        3) stop_mysql ;;
-        4) restart_mysql ;;
-        5) logs_mysql ;;
-        6) remove_mysql_keep_data ;;
-        7) remove_mysql_and_data ;;
-        8) create_database ;;
-        9) create_user_and_grant ;;
-        10) create_db_user_grant_all ;;
-        11) show_access_info ;;
-        12) update_mysql ;;
-        0) exit 0 ;;
-        *) echo "❌ 无效选项" ;;
-    esac
-
-    read -p "按回车继续..."
+  menu
+  read -p "请选择操作: " choice
+  case $choice in
+    1) deploy_container ;;
+    2) load_config; docker start $CONTAINER_NAME && echo -e "${green}容器已启动${reset}" ;;
+    3) docker stop $CONTAINER_NAME && echo -e "${green}容器已停止${reset}" ;;
+    4) docker restart $CONTAINER_NAME && echo -e "${green}容器已重启${reset}" ;;
+    5) docker logs -f $CONTAINER_NAME ;;
+    6) delete_container ;;
+    7) update_image ;;
+    0) echo -e "${green}退出${reset}"; exit 0 ;;
+    *) echo -e "${red}无效选项，请重试${reset}" ;;
+  esac
+  echo -e "\n按任意键返回菜单..."
+  read -n 1
 done

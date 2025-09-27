@@ -1,140 +1,192 @@
 #!/bin/bash
-# ========================================
-# AutoBangumi 一键管理脚本（修正版）
-# ========================================
+# =========================================
+# DNSMgr Docker 管理脚本 (显示访问信息)
+# =========================================
 
-# 颜色
-RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-CYAN="\033[36m"
+RED="\033[31m"
 RESET="\033[0m"
 
-# 默认配置
-APP_NAME="AutoBangumi"
-DEFAULT_PORT=7892
-CONFIG_FILE="${HOME}/.autobangumi.conf"
-CONFIG_DIR="${HOME}/AutoBangumi/config"
-DATA_DIR="${HOME}/AutoBangumi/data"
-IMAGE_NAME="ghcr.io/estrellaxd/auto_bangumi:latest"
-TIMEZONE="Asia/Shanghai"
+COMPOSE_FILE="./docker-compose.yml"
+WEB_DIR="./web"
+MYSQL_CONF_DIR="./mysql/conf"
+MYSQL_LOGS_DIR="./mysql/logs"
+MYSQL_DATA_DIR="./mysql/data"
+NETWORK_NAME="dnsmgr-network"
 
-# 读取端口配置，如果没有配置文件则创建
-if [[ -f "$CONFIG_FILE" ]]; then
-    source "$CONFIG_FILE"
-else
-    read -p "请输入 AutoBangumi 映射端口 (默认 $DEFAULT_PORT): " input_port
-    APP_PORT=${input_port:-$DEFAULT_PORT}
-    echo "APP_PORT=$APP_PORT" > "$CONFIG_FILE"
-fi
+MYSQL_ROOT_PASSWORD="554751"
+MYSQL_DB_NAME="dnsmgr"
 
-# 检查 Docker
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker，请先安装！${RESET}"
-        exit 1
+# 检查端口是否被占用
+function check_port() {
+    local port=$1
+    if lsof -i:"$port" &>/dev/null; then
+        return 1
+    else
+        return 0
     fi
 }
 
-# 部署或安装 AutoBangumi
-install_app() {
-    check_docker
-    mkdir -p "${CONFIG_DIR}" "${DATA_DIR}"
-
-    echo -e "${YELLOW}拉取镜像：${IMAGE_NAME}${RESET}"
-    docker pull "${IMAGE_NAME}"
-
-    # 删除旧容器（如果存在）
-    if docker ps -a --format '{{.Names}}' | grep -q "^${APP_NAME}$"; then
-        echo -e "${YELLOW}已有容器 ${APP_NAME}，正在删除...${RESET}"
-        docker stop "${APP_NAME}" && docker rm "${APP_NAME}"
-    fi
-
-    echo -e "${YELLOW}正在启动 AutoBangumi...${RESET}"
-    docker run -d \
-      --name="${APP_NAME}" \
-      -v "${CONFIG_DIR}:/app/config" \
-      -v "${DATA_DIR}:/app/data" \
-      -p ${APP_PORT}:7892 \
-      -e TZ=${TIMEZONE} \
-      -e PUID=$(id -u) \
-      -e PGID=$(id -g) \
-      -e UMASK=022 \
-      --network=bridge \
-      --dns=8.8.8.8 \
-      --restart unless-stopped \
-      "${IMAGE_NAME}"
-
-    echo -e "${GREEN}AutoBangumi 部署完成！${RESET}"
-    echo -e "${CYAN}访问地址：http://$(hostname -I | awk '{print $1}'):${APP_PORT}${RESET}"
+# 创建目录
+function create_dirs() {
+    mkdir -p "$WEB_DIR" "$MYSQL_CONF_DIR" "$MYSQL_LOGS_DIR" "$MYSQL_DATA_DIR"
 }
 
-# 启动
-start_app() { docker start "${APP_NAME}" && echo -e "${GREEN}已启动 ${APP_NAME}${RESET}"; }
-
-# 停止
-stop_app() { docker stop "${APP_NAME}" && echo -e "${YELLOW}已停止 ${APP_NAME}${RESET}"; }
-
-# 重启
-restart_app() { docker restart "${APP_NAME}" && echo -e "${GREEN}已重启 ${APP_NAME}${RESET}"; }
-
-# 查看日志
-logs_app() { docker logs -f "${APP_NAME}"; }
-
-# 更新镜像
-update_app() {
-    echo -e "${YELLOW}正在更新 ${APP_NAME}...${RESET}"
-    docker pull "${IMAGE_NAME}"
-    if docker ps -a --format '{{.Names}}' | grep -q "^${APP_NAME}$"; then
-        echo -e "${YELLOW}停止并删除旧容器...${RESET}"
-        docker stop "${APP_NAME}" && docker rm "${APP_NAME}"
+# 生成 my.cnf
+function generate_my_cnf() {
+    local cnf_file="$MYSQL_CONF_DIR/my.cnf"
+    if [ ! -f "$cnf_file" ]; then
+        cat > "$cnf_file" <<'EOF'
+[mysqld]
+sql_mode=STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION
+EOF
     fi
-    # 使用已保存端口重新安装
-    install_app
 }
 
-# 卸载
-uninstall_app() {
-    docker stop "${APP_NAME}" && docker rm "${APP_NAME}"
-    echo -e "${YELLOW}是否删除配置和数据目录？[y/N]${RESET}"
-    read -r del
-    if [[ "$del" =~ ^[Yy]$ ]]; then
-        rm -rf "${CONFIG_DIR}" "${DATA_DIR}" "${CONFIG_FILE}"
-        echo -e "${RED}已删除配置和数据目录${RESET}"
+# 生成 docker-compose.yml
+function generate_docker_compose() {
+    local web_port="$1"
+    cat > "$COMPOSE_FILE" <<EOF
+version: '3'
+services:
+  dnsmgr-web:
+    container_name: dnsmgr-web
+    stdin_open: true
+    tty: true
+    ports:
+      - ${web_port}:80
+    volumes:
+      - ./web:/app/www
+    image: netcccyun/dnsmgr
+    depends_on:
+      - dnsmgr-mysql
+    networks:
+      - $NETWORK_NAME
+
+  dnsmgr-mysql:
+    container_name: dnsmgr-mysql
+    restart: always
+    ports:
+      - 3306:3306
+    volumes:
+      - ./mysql/conf/my.cnf:/etc/mysql/my.cnf
+      - ./mysql/logs:/logs
+      - ./mysql/data:/var/lib/mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD
+      - MYSQL_DATABASE=$MYSQL_DB_NAME
+      - TZ=Asia/Shanghai
+    image: mysql:5.7
+    networks:
+      - $NETWORK_NAME
+
+networks:
+  $NETWORK_NAME:
+    driver: bridge
+EOF
+}
+
+# 等待 MySQL 启动完成
+function wait_mysql_ready() {
+    echo "等待 MySQL 启动..."
+    while ! docker exec dnsmgr-mysql mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent &>/dev/null; do
+        sleep 2
+    done
+    echo "MySQL 已就绪"
+}
+
+# 初始化 MySQL (第一次启动自动创建数据库)
+function init_mysql() {
+    docker-compose up -d dnsmgr-mysql
+    wait_mysql_ready
+}
+
+# 启动服务
+function start_all() {
+    docker-compose up -d
+}
+
+# 停止服务
+function stop_all() {
+    docker-compose down
+}
+
+# 更新服务
+function update_services() {
+    docker-compose pull
+    docker-compose up -d
+}
+
+# 卸载服务
+function uninstall() {
+    read -p "是否保留数据? [y/N]: " keep
+    stop_all
+    docker rm -f dnsmgr-web dnsmgr-mysql 2>/dev/null || true
+    docker network rm $NETWORK_NAME 2>/dev/null || true
+
+    if [[ "$keep" =~ ^[Yy]$ ]]; then
+        docker rmi netcccyun/dnsmgr mysql:5.7 2>/dev/null || true
+    else
+        docker-compose down -v --rmi all
+        rm -rf "$WEB_DIR" "$MYSQL_CONF_DIR" "$MYSQL_LOGS_DIR" "$MYSQL_DATA_DIR"
     fi
-    echo -e "${GREEN}${APP_NAME} 已卸载${RESET}"
+    echo -e "${GREEN}卸载完成！${RESET}"
+}
+
+# 显示访问信息
+function show_info() {
+    local web_port="$1"
+    local ip=$(hostname -I | awk '{print $1}')
+    echo -e "\n${GREEN}==== 安装完成信息 ====${RESET}"
+    echo -e "${YELLOW}访问 dnsmgr-web:${RESET} http://$ip:$web_port"
+    echo -e "${YELLOW}MySQL 主机:${RESET} dnsmgr-mysql"
+    echo -e "${YELLOW}MySQL 端口:${RESET} 3306"
+    echo -e "${YELLOW}MySQL 用户名:${RESET} root"
+    echo -e "${YELLOW}MySQL 密码:${RESET} $MYSQL_ROOT_PASSWORD"
+    echo -e "${YELLOW}数据库名称:${RESET} $MYSQL_DB_NAME"
 }
 
 # 菜单
-menu() {
-    clear
-    echo -e "${GREEN}==== AutoBangumi 管理菜单 ====${RESET}"
-    echo -e "${GREEN}1. 部署 / 安装 AutoBangumi${RESET}"
-    echo -e "${GREEN}2. 启动 AutoBangumi${RESET}"
-    echo -e "${GREEN}3. 停止 AutoBangumi${RESET}"
-    echo -e "${GREEN}4. 重启 AutoBangumi${RESET}"
-    echo -e "${GREEN}5. 查看日志${RESET}"
-    echo -e "${GREEN}6. 更新 AutoBangumi${RESET}"
-    echo -e "${GREEN}7. 卸载 AutoBangumi${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -ne "${YELLOW}请输入选项: ${RESET}"
-    read -r choice
-    case "$choice" in
-        1) install_app ;;
-        2) start_app ;;
-        3) stop_app ;;
-        4) restart_app ;;
-        5) logs_app ;;
-        6) update_app ;;
-        7) uninstall_app ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
-    esac
+function menu() {
+    while true; do
+        echo -e "${GREEN}==== DNSMgr Docker 管理菜单 ====${RESET}"
+        echo -e "${GREEN}1) 安装并初始化${RESET}"
+        echo -e "${GREEN}2) 启动服务${RESET}"
+        echo -e "${GREEN}3) 停止服务${RESET}"
+        echo -e "${GREEN}4) 更新服务${RESET}"
+        echo -e "${GREEN}5) 卸载${RESET}"
+        echo -e "${GREEN}6) 退出${RESET}"
+        read -p "请输入操作编号: " choice
+        case "$choice" in
+            1)
+                while true; do
+                    read -p "请输入 dnsmgr-web 映射端口 (默认 8081): " web_port
+                    web_port=${web_port:-8081}
+                    if check_port "$web_port"; then
+                        break
+                    else
+                        echo -e "${RED}端口 $web_port 已被占用，请重新输入！${RESET}"
+                    fi
+                done
+                create_dirs
+                generate_my_cnf
+                generate_docker_compose "$web_port"
+                init_mysql
+                start_all
+                show_info "$web_port"
+                ;;
+            2)
+                start_all
+                echo -e "${GREEN}服务已启动！${RESET}"
+                ;;
+            3) stop_all ;;
+            4) update_services ;;
+            5) uninstall ;;
+            6) exit 0 ;;
+            *) echo -e "${RED}无效选项！${RESET}" ;;
+        esac
+    done
 }
 
-# 循环显示菜单
-while true; do
-    menu
-    echo -e "${YELLOW}按回车键返回菜单...${RESET}"
-    read -r
-done
+menu

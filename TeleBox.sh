@@ -26,15 +26,14 @@ function menu() {
     echo -e "${GREEN}=== MySQL 管理菜单 ===${RESET}"
     echo -e "${GREEN}1.  安装启动${RESET}"
     echo -e "${GREEN}2.  更新${RESET}"
-    echo -e "${GREEN}3.  卸载 (含数据)${RESET}"
+    echo -e "${GREEN}3.  卸载${RESET}"
     echo -e "${GREEN}4.  查看日志${RESET}"
-    echo -e "${GREEN}7.  删除容器和数据${RESET}"
-    echo -e "${GREEN}8.  创建新数据库${RESET}"
-    echo -e "${GREEN}9.  创建用户并授权${RESET}"
-    echo -e "${GREEN}10. 一键创建数据库+用户+授权${RESET}"
-    echo -e "${GREEN}11. 查看数据库信息${RESET}"
-    echo -e "${GREEN}12. 备份数据库${RESET}"
-    echo -e "${GREEN}13. 恢复数据库${RESET}"
+    echo -e "${GREEN}5.  创建新数据库${RESET}"
+    echo -e "${GREEN}6.  创建用户并授权${RESET}"
+    echo -e "${GREEN}7.  一键创建数据库+用户+授权${RESET}"
+    echo -e "${GREEN}8.  查看数据库信息${RESET}"
+    echo -e "${GREEN}9.  备份数据库${RESET}"
+    echo -e "${GREEN}10. 恢复数据库${RESET}"
     echo -e "${GREEN}0.  退出${RESET}"
     echo -e "${GREEN}=======================${RESET}"
     read -p "请选择: " choice
@@ -43,13 +42,12 @@ function menu() {
         2) update_app ;;
         3) uninstall_app ;;
         4) view_logs ;;
-        7) remove_container ;;
-        8) create_database ;;
-        9) create_user ;;
-        10) create_db_user ;;
-        11) show_info ;;
-        12) backup_db ;;
-        13) restore_db ;;
+        5) create_database ;;
+        6) create_user ;;
+        7) create_db_user ;;
+        8) show_info ;;
+        9) backup_db ;;
+        10) restore_db ;;
         0) exit 0 ;;
         *) echo "无效选择"; sleep 1; menu ;;
     esac

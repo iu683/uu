@@ -1,115 +1,192 @@
 #!/bin/bash
+# ========================================
+# MoviePilot 一键管理脚本 (Docker Compose)
+# ========================================
 
 GREEN="\033[32m"
 RESET="\033[0m"
+APP_NAME="moviepilot"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/config.env"
 
-APP_NAME="music-tag-web"
-YML_FILE="/opt/music-tag/music-tag-compose.yml"
+function get_ip() {
+    curl -s ifconfig.me || curl -s ip.sb || echo "127.0.0.1"
+}
 
-# 存储上次安装时的目录（便于卸载时清理）
-CONF_FILE="/opt/music-tag/music_tag_dirs"
-
-show_menu() {
+function menu() {
     clear
-    echo -e "${GREEN}=== Music Tag 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动 Music Tag${RESET}"
-    echo -e "${GREEN}2) 更新 Music Tag${RESET}"
-    echo -e "${GREEN}3) 卸载 Music Tag${RESET}"
+    echo -e "${GREEN}=== MoviePilot 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
     echo -e "${GREEN}4) 查看日志${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}===========================${RESET}"
+    echo -e "${GREEN}=======================${RESET}"
     read -p "请选择: " choice
     case $choice in
         1) install_app ;;
         2) update_app ;;
         3) uninstall_app ;;
-        4) logs_app ;;
-        0) exit ;;
-        *) echo "❌ 无效选择"; sleep 1; show_menu ;;
+        4) view_logs ;;
+        0) exit 0 ;;
+        *) echo "无效选择"; sleep 1; menu ;;
     esac
 }
 
-install_app() {
-    read -p "请输入音乐目录路径 (默认 /opt/music-tag/music): " music_dir
-    music_dir=${music_dir:-/opt/music-tag/music}
+function install_app() {
+    read -p "请输入 Nginx Web端口 [默认:3000]: " input_web
+    PORT_WEB=${input_web:-3000}
+    read -p "请输入 API端口 [默认:3001]: " input_api
+    PORT_API=${input_api:-3001}
 
-    read -p "请输入配置文件目录路径 (默认 /opt/music-tag/config): " config_dir
-    config_dir=${config_dir:-/opt/music-tag/config}
+    read -p "请输入管理员账号 [默认:admin]: " ADMIN
+    ADMIN=${ADMIN:-admin}
+    read -p "请输入管理员密码 [默认:admin123]: " ADMIN_PWD
+    ADMIN_PWD=${ADMIN_PWD:-admin123}
 
-    read -p "请输入下载目录路径 (默认 /opt/music-tag/download): " download_dir
-    download_dir=${download_dir:-/opt/music-tag/download}
+    # 创建统一目录
+    mkdir -p "$APP_DIR"/{media,config,core,torrents,bt_backup,redis,postgresql/data}
 
-    read -p "请输入访问端口 (默认 8002): " port
-    port=${port:-8002}
+    # 设置 PostgreSQL 数据目录权限
+    chown -R 999:999 "$APP_DIR/postgresql/data"
+    chmod 700 "$APP_DIR/postgresql/data"
 
-    mkdir -p "$music_dir" "$config_dir" "$download_dir"
-
-    cat > $YML_FILE <<EOF
-
+    # 生成 docker-compose.yml
+    cat > "$COMPOSE_FILE" <<EOF
 services:
-  music-tag:
-    image: xhongc/music_tag_web:latest
-    container_name: $APP_NAME
-    ports:
-      - "127.0.0.1:${port}:8002"
-    volumes:
-      - ${music_dir}:/app/media
-      - ${config_dir}:/app/data
-      - ${download_dir}:/app/download
+  redis:
+    image: redis:latest
+    container_name: redis
     restart: always
+    volumes:
+      - $APP_DIR/redis/data:/data
+    command: redis-server --save 600 1 --requirepass redis_password
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis_password", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  postgresql:
+    image: postgres:latest
+    container_name: postgresql
+    restart: always
+    environment:
+      POSTGRES_DB: moviepilot
+      POSTGRES_USER: moviepilot
+      POSTGRES_PASSWORD: pg_password
+    volumes:
+      - $APP_DIR/postgresql/data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U moviepilot -d moviepilot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  pgloader:
+    image: dimitri/pgloader:latest
+    container_name: pgloader
+    restart: "no"
+    volumes:
+      - $APP_DIR/config:/mp_config
+    command: >
+      pgloader
+      sqlite:///mp_config/user.db
+      postgresql://moviepilot:pg_password@postgresql:5432/moviepilot
+    depends_on:
+      postgresql:
+        condition: service_healthy
+
+  moviepilot:
+    image: jxxghp/moviepilot-v2:latest
+    container_name: moviepilot-v2
+    hostname: moviepilot-v2
+    stdin_open: true
+    tty: true
+    restart: always
+    ports:
+      - "127.0.0.1:$PORT_WEB:3000"
+      - "127.0.0.1:$PORT_API:3001"
+    volumes:
+      - $APP_DIR/media:/media
+      - $APP_DIR/config:/config
+      - $APP_DIR/core:/moviepilot/.cache/ms-playwright
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - $APP_DIR/torrents:/torrents
+      - $APP_DIR/bt_backup:/BT_backup
+    environment:
+      - NGINX_PORT=$PORT_WEB
+      - PORT=$PORT_API
+      - PUID=0
+      - PGID=0
+      - UMASK=000
+      - TZ=Asia/Shanghai
+      - SUPERUSER=$ADMIN
+      - SUPERUSER_PASSWORD=$ADMIN_PWD
+      - DB_TYPE=postgresql
+      - DB_POSTGRESQL_HOST=postgresql
+      - DB_POSTGRESQL_PORT=5432
+      - DB_POSTGRESQL_DATABASE=moviepilot
+      - DB_POSTGRESQL_USERNAME=moviepilot
+      - DB_POSTGRESQL_PASSWORD=pg_password
+      - CACHE_BACKEND_TYPE=redis
+      - CACHE_BACKEND_URL=redis://:redis_password@redis:6379
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      pgloader:
+        condition: service_completed_successfully
+
+networks:
+  default:
+    name: moviepilot-network
 EOF
 
-    # 保存目录信息和端口
-    echo "$config_dir" > $CONF_FILE
-    echo "$download_dir" >> $CONF_FILE
-    echo "$port" >> $CONF_FILE
+    # 保存配置
+    echo "PORT_WEB=$PORT_WEB" > "$CONFIG_FILE"
+    echo "PORT_API=$PORT_API" >> "$CONFIG_FILE"
+    echo "SUPERUSER=$ADMIN" >> "$CONFIG_FILE"
+    echo "SUPERUSER_PASSWORD=$ADMIN_PWD" >> "$CONFIG_FILE"
 
-    docker compose -f $YML_FILE up -d
-    echo -e "${GREEN}✅ $APP_NAME 已启动，访问地址: http://127.0.0.1:${port}${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
+    cd "$APP_DIR"
+    docker compose up -d
+
+    echo -e "${GREEN}✅ MoviePilot 已启动${RESET}"
+    echo -e "${GREEN}🌐 Web UI: http://127.0.0.1:$PORT_WEB${RESET}"
+    echo -e "${GREEN}📂 配置目录: $APP_DIR/config${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
-update_app() {
-    docker compose -f $YML_FILE pull
-    docker compose -f $YML_FILE up -d
-    echo -e "${GREEN}✅ $APP_NAME 已更新${RESET}"
-    read -p "按回车键返回菜单..."
-    show_menu
+
+
+function update_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ MoviePilot 已更新并重启完成${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
-uninstall_app() {
-    read -p "⚠️ 确认要卸载 $APP_NAME 吗？(y/N): " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        docker compose -f $YML_FILE down
-        rm -f $YML_FILE
-        echo -e "${GREEN}✅ $APP_NAME 已卸载${RESET}"
-
-        if [[ -f $CONF_FILE ]]; then
-            config_dir=$(sed -n '1p' $CONF_FILE)
-            download_dir=$(sed -n '2p' $CONF_FILE)
-            port=$(sed -n '3p' $CONF_FILE)
-
-            read -p "是否同时删除配置目录 [$config_dir] 和下载目录 [$download_dir]？(y/N): " del_confirm
-            if [[ "$del_confirm" =~ ^[Yy]$ ]]; then
-                rm -rf "$config_dir" "$download_dir"
-                echo -e "${GREEN}✅ 配置目录和下载目录已删除${RESET}"
-            else
-                echo "❌ 已保留配置目录和下载目录"
-            fi
-            rm -f $CONF_FILE
-        fi
-    else
-        echo "❌ 已取消"
-    fi
-    read -p "按回车键返回菜单..."
-    show_menu
+function uninstall_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${GREEN}✅ MoviePilot 已卸载，数据已删除${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
-logs_app() {
-    docker logs -f $APP_NAME
-    read -p "按回车键返回菜单..."
-    show_menu
+function view_logs() {
+    docker logs -f moviepilot-v2
+    read -p "按回车返回菜单..."
+    menu
 }
 
-show_menu
+menu

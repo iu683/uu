@@ -1,124 +1,173 @@
 #!/bin/bash
-# Pairdrop 管理脚本 (绿色菜单版)
+set -e
 
-SERVICE_NAME="pairdrop"
-INSTALL_DIR="/opt/$SERVICE_NAME"
-COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
+GREEN="\033[32m"
+RESET="\033[0m"
+BASE_DIR="/opt/newapi"
+DATA_DIR="$BASE_DIR/data"
+LOG_DIR="$BASE_DIR/logs"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$DATA_DIR/.env"
 
-# 颜色
-GREEN="\e[32m"
-RESET="\e[0m"
+MYSQL_CONTAINER="newapi-mysql"
+MYSQL_ROOT_PASSWORD="123456"
+MYSQL_DB="newapi"
+MYSQL_USER="newapi"
+MYSQL_PASSWORD="newapi123"
 
-install() {
-    echo -e "${GREEN}>>> 开始安装 Pairdrop 服务...${RESET}"
+DEFAULT_PORT=3000
+API_PORT=$DEFAULT_PORT
 
-    read -p "请输入映射端口 (默认 3000): " PORT
-    PORT=${PORT:-3000}
+mkdir -p "$DATA_DIR" "$LOG_DIR"
 
-    read -p "请输入时区 (默认 Asia/Shanghai): " TZ
-    TZ=${TZ:-Asia/Shanghai}
-
-    mkdir -p "$INSTALL_DIR/config"
-
-    cat > $COMPOSE_FILE <<EOF
-
-services:
-  pairdrop:
-    image: lscr.io/linuxserver/pairdrop:latest
-    container_name: $SERVICE_NAME
-    restart: unless-stopped
-    environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=$TZ
-      - WS_FALLBACK=false
-      - RATE_LIMIT=false
-      - RTC_CONFIG=false
-      - DEBUG_MODE=false
-    ports:
-      - "127.0.0.1:$PORT:3000"
-    volumes:
-      - ./config:/config
+generate_env() {
+    echo -e "${GREEN}生成 .env 文件...${RESET}"
+    cat > "$ENV_FILE" <<EOF
+SQL_DSN=$MYSQL_USER:$MYSQL_PASSWORD@tcp(mysql:3306)/$MYSQL_DB
+REDIS_CONN_STRING=redis://redis
+TZ=Asia/Shanghai
 EOF
+}
 
-    cd "$INSTALL_DIR"
-    docker compose up -d
+generate_compose() {
+    echo -e "${GREEN}生成 docker-compose.yml 文件...${RESET}"
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  new-api:
+    image: calciumion/new-api:latest
+    container_name: new-api
+    restart: always
+    command: --log-dir /app/logs
+    ports:
+      - "127.0.0.1:$API_PORT:3000"
+    volumes:
+      - ./data:/data
+      - ./logs:/app/logs
+    env_file:
+      - ./data/.env
+    depends_on:
+      - redis
+      - mysql
 
-    # 获取服务器外网IP
-    IP=$(curl -s ifconfig.me)
-    if [ -z "$IP" ]; then
-        IP=$(hostname -I | awk '{print $1}')
+  redis:
+    image: redis:latest
+    container_name: redis
+    restart: always
+
+  mysql:
+    image: mysql:8
+    container_name: mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: $MYSQL_ROOT_PASSWORD
+      MYSQL_DATABASE: $MYSQL_DB
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+volumes:
+  mysql_data:
+EOF
+}
+
+check_port() {
+    if lsof -i:"$API_PORT" &>/dev/null; then
+        echo -e "${GREEN}端口 $API_PORT 已被占用，请选择其他端口${RESET}"
+        return 1
+    fi
+    return 0
+}
+
+init_database() {
+    echo -e "${GREEN}等待 MySQL 启动...${RESET}"
+    docker-compose -f "$COMPOSE_FILE" up -d mysql
+    echo -e "${GREEN}初始化数据库...${RESET}"
+    # 等待数据库就绪
+    while ! docker exec -i mysql mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent; do
+        sleep 2
+    done
+    docker exec -i mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" <<EOF
+CREATE DATABASE IF NOT EXISTS $MYSQL_DB;
+CREATE USER IF NOT EXISTS '$MYSQL_USER'@'%' IDENTIFIED BY '$MYSQL_PASSWORD';
+GRANT ALL PRIVILEGES ON $MYSQL_DB.* TO '$MYSQL_USER'@'%';
+FLUSH PRIVILEGES;
+EOF
+    echo -e "${GREEN}数据库初始化完成${RESET}"
+}
+
+start_service() {
+    read -p "请输入访问端口(默认 $DEFAULT_PORT): " PORT
+    API_PORT=${PORT:-$DEFAULT_PORT}
+    if ! check_port; then
+        return
     fi
 
-    echo -e "${GREEN}>>> Pairdrop 服务已安装并运行在: http://127.0.0.1:$PORT${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
+    mkdir -p "$BASE_DIR"
+    generate_env
+    generate_compose
+    init_database
+    docker-compose -f "$COMPOSE_FILE" up -d
+    show_ip_port
+}
+
+stop_service() {
+    docker-compose -f "$COMPOSE_FILE" down
+}
+
+restart_service() {
+    stop_service
+    start_service
+}
+
+update_service() {
+    echo -e "${GREEN}正在拉取最新镜像...${RESET}"
+    docker compose -f "$COMPOSE_FILE" pull
+    docker compose -f "$COMPOSE_FILE" up -d
+    echo -e "${GREEN}✅ 已更新并重启服务${RESET}"
 }
 
 
-start() {
-    cd "$INSTALL_DIR" && docker compose up -d
-    echo -e "${GREEN}>>> Pairdrop 服务已启动${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
+uninstall_service() {
+    stop_service
+    rm -rf "$BASE_DIR"
 }
 
-stop() {
-    cd "$INSTALL_DIR" && docker compose down
-    echo -e "${GREEN}>>> Pairdrop 服务已停止${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
+show_logs_api() {
+    docker logs -f new-api
 }
 
-restart() {
-    stop
-    start
+show_logs_mysql() {
+    docker logs -f mysql
 }
 
-update() {
-    cd "$INSTALL_DIR"
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}>>> Pairdrop 服务已更新${RESET}"
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-    menu
-}
-
-uninstall() {
-    cd "$INSTALL_DIR" || exit
-    docker compose down -v
-    rm -rf "$INSTALL_DIR"
-    echo -e "${GREEN}✅ Pairdrop已卸载，数据已删除${RESET}"
-    read -p "按回车返回菜单..."
-    menu
+show_ip_port() {
+    IP=$(hostname -I | awk '{print $1}')
+    echo -e "${GREEN}访问地址: http://127.0.0.1:$API_PORT${RESET}"
 }
 
 
-menu() {
-    clear
-    echo -e "${GREEN}======================${RESET}"
-    echo -e "${GREEN} Pairdrop 管理菜单${RESET}"
-    echo -e "${GREEN}======================${RESET}"
-    echo -e "${GREEN}1. 安装${RESET}"
-    echo -e "${GREEN}2. 启动${RESET}"
-    echo -e "${GREEN}3. 停止${RESET}"
-    echo -e "${GREEN}4. 重启${RESET}"
-    echo -e "${GREEN}5. 更新${RESET}"
-    echo -e "${GREEN}6. 卸载${RESET}"
+# 菜单循环
+while true; do
+    echo -e "${GREEN}====== New API 管理菜单 ======${RESET}"
+    echo -e "${GREEN}1. 启动服务${RESET}"
+    echo -e "${GREEN}2. 停止服务${RESET}"
+    echo -e "${GREEN}3. 重启服务${RESET}"
+    echo -e "${GREEN}4. 更新 New API${RESET}"
+    echo -e "${GREEN}5. 卸载服务${RESET}"
+    echo -e "${GREEN}6. 查看 New API 日志${RESET}"
+    echo -e "${GREEN}7. 查看 MySQL 日志${RESET}"
+    echo -e "${GREEN}8. 显示访问地址${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}======================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read CHOICE
-    case $CHOICE in
-        1) install ;;
-        2) start ;;
-        3) stop ;;
-        4) restart ;;
-        5) update ;;
-        6) uninstall ;;
-        0) exit 0 ;;
-        *) echo -e "${GREEN}无效选项${RESET}" ; sleep 1 ; menu ;;
+    read -p "请选择操作: " choice
+    case $choice in
+        1) start_service ;;
+        2) stop_service ;;
+        3) restart_service ;;
+        4) update_service ;;
+        5) uninstall_service; exit ;;
+        6) show_logs_api ;;
+        7) show_logs_mysql ;;
+        8) show_ip_port ;;
+        0) exit ;;
+        *) echo "无效选项" ;;
     esac
-}
-
-menu
+done

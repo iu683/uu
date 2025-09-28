@@ -1,160 +1,105 @@
 #!/bin/bash
+# ========================================
+# Vertex 一键管理脚本
+# ========================================
 
-# ================================
-# kuma-mieru 管理脚本（菜单式）
-# 自动显示访问 IP+端口，配置 .env
-# ================================
+GREEN="\033[32m"
+RESET="\033[0m"
+APP_NAME="vertex"
+APP_DIR="$HOME/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/config.env"
 
-# 颜色输出
-green="\033[32m"
-red="\033[31m"
-plain="\033[0m"
-
-# 项目目录
-APP_DIR="$HOME/kuma-mieru"
-# 默认宿主机端口（映射 docker-compose.yml 的端口）
-HOST_PORT=3883
-
-# 检查 root
-if [ "$(id -u)" != "0" ]; then
-    echo -e "${red}请使用 root 用户运行脚本${plain}"
-    exit 1
-fi
-
-# 安装 Docker / Compose
-install_docker() {
-    if ! command -v docker &> /dev/null; then
-        echo -e "${green}安装 Docker...${plain}"
-        apt update
-        apt install -y docker.io
-    fi
-    if ! docker compose version &> /dev/null; then
-        echo -e "${green}安装 Docker Compose 插件...${plain}"
-        apt install -y docker-compose-plugin
-    fi
-}
-
-# 配置 .env（基础变量 + 功能变量可自定义）
-configure_env() {
-    cp -f .env.example .env
-
-    # 基础变量
-    sed -i "s|^UPTIME_KUMA_BASE_URL=.*|UPTIME_KUMA_BASE_URL=${UPTIME_KUMA_BASE_URL}|" .env
-    sed -i "s|^PAGE_ID=.*|PAGE_ID=${PAGE_ID}|" .env
-
-    # 功能变量，自定义输入，默认值回车即可
-    read -p "FEATURE_EDIT_THIS_PAGE [默认: false]: " FEATURE_EDIT_THIS_PAGE
-    FEATURE_EDIT_THIS_PAGE=${FEATURE_EDIT_THIS_PAGE:-false}
-
-    read -p "FEATURE_SHOW_STAR_BUTTON [默认: true]: " FEATURE_SHOW_STAR_BUTTON
-    FEATURE_SHOW_STAR_BUTTON=${FEATURE_SHOW_STAR_BUTTON:-true}
-
-    read -p "FEATURE_TITLE [默认: Kuma Mieru]: " FEATURE_TITLE
-    FEATURE_TITLE=${FEATURE_TITLE:-"Kuma Mieru"}
-
-    read -p "FEATURE_DESCRIPTION [默认: A beautiful and modern uptime monitoring dashboard]: " FEATURE_DESCRIPTION
-    FEATURE_DESCRIPTION=${FEATURE_DESCRIPTION:-"A beautiful and modern uptime monitoring dashboard"}
-
-    read -p "FEATURE_ICON [默认: /icon.svg]: " FEATURE_ICON
-    FEATURE_ICON=${FEATURE_ICON:-"/icon.svg"}
-
-    # 写入 .env
-    env_vars=(
-        "FEATURE_EDIT_THIS_PAGE=${FEATURE_EDIT_THIS_PAGE}"
-        "FEATURE_SHOW_STAR_BUTTON=${FEATURE_SHOW_STAR_BUTTON}"
-        "FEATURE_TITLE=${FEATURE_TITLE}"
-        "FEATURE_DESCRIPTION=${FEATURE_DESCRIPTION}"
-        "FEATURE_ICON=${FEATURE_ICON}"
-    )
-
-    for var in "${env_vars[@]}"; do
-        key="${var%%=*}"
-        if grep -q "^$key=" .env; then
-            sed -i "s|^$key=.*|$var|" .env
-        else
-            echo "$var" >> .env
-        fi
-    done
-}
-
-# 部署安装
-install_app() {
-    install_docker
-
-    # 输入基础变量
-    echo -e "${green}请输入 Uptime Kuma 地址 (例如 https://example.kuma-mieru.invalid):${plain}"
-    read UPTIME_KUMA_BASE_URL
-    echo -e "${green}请输入页面 ID:${plain}"
-    read PAGE_ID
-
-    # 克隆或更新仓库
-    if [ -d "$APP_DIR" ]; then
-        echo -e "${green}检测到已有项目，拉取最新代码...${plain}"
-        cd "$APP_DIR"
-        git pull
-    else
-        git clone https://github.com/Alice39s/kuma-mieru.git "$APP_DIR"
-        cd "$APP_DIR"
-    fi
-
-    # 配置 .env
-    configure_env
-
-    # 启动服务
-    docker compose up -d
-
-    SERVER_IP=$(hostname -I | awk '{print $1}')
-    echo -e "${green}部署完成！访问地址: http://${SERVER_IP}:${HOST_PORT}${plain}"
-}
-
-# 更新服务
-update_app() {
-    if [ ! -d "$APP_DIR" ]; then
-        echo -e "${red}项目未安装，请先安装！${plain}"
-        return
-    fi
-    cd "$APP_DIR"
-
-    echo -e "${green}拉取最新代码并重启服务...${plain}"
-    git pull
-    docker compose pull
-    docker compose up -d
-
-    # 保持原来的基础变量，功能变量可自定义
-    configure_env
-
-    SERVER_IP=$(hostname -I | awk '{print $1}')
-    echo -e "${green}更新完成！访问地址: http://${SERVER_IP}:${HOST_PORT}${plain}"
-}
-
-# 卸载服务
-uninstall_app() {
-    if [ ! -d "$APP_DIR" ]; then
-        echo -e "${red}项目未安装，无需卸载${plain}"
-        return
-    fi
-    cd "$APP_DIR"
-    echo -e "${green}停止并删除容器和镜像...${plain}"
-    docker compose down --rmi all
-    cd ~
-    rm -rf "$APP_DIR"
-    echo -e "${green}卸载完成！${plain}"
-}
-
-# 菜单
-while true; do
-    echo -e "\n${green}=== kuma-mieru 管理菜单 ===${plain}"
-    echo -e "${green}1) 安装 / 部署${plain}"
-    echo -e "${green}2) 更新${plain}"
-    echo -e "${green}3) 卸载${plain}"
-    echo -e "${green}0) 退出${plain}"
-    echo -ne "${green}请选择操作: ${plain}"
-    read choice
-    case "$choice" in
+function menu() {
+    clear
+    echo -e "${GREEN}=== Vertex 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装/启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}5) 查看初始密码${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    echo -e "${GREEN}=======================${RESET}"
+    read -p "请选择: " choice
+    case $choice in
         1) install_app ;;
         2) update_app ;;
         3) uninstall_app ;;
+        4) view_logs ;;
+        5) show_password ;;
         0) exit 0 ;;
-        *) echo -e "${red}无效选项${plain}" ;;
+        *) echo "无效选择"; sleep 1; menu ;;
     esac
-done
+}
+
+function install_app() {
+    read -p "请输入 Web 端口 [默认:3000]: " input_port
+    PORT=${input_port:-3000}
+
+    mkdir -p "$APP_DIR/config"
+
+    cat > "$COMPOSE_FILE" <<EOF
+version: '3'
+services:
+  vertex:
+    image: lswl/vertex:stable
+    container_name: vertex
+    restart: unless-stopped
+    network_mode: bridge
+    environment:
+      - TZ=Asia/Shanghai
+      - PORT=$PORT
+    ports:
+      - "127.0.0.1:$PORT:3000"
+    volumes:
+      - $APP_DIR/config:/vertex
+EOF
+
+    echo "PORT=$PORT" > "$CONFIG_FILE"
+
+    cd "$APP_DIR"
+    docker compose up -d
+
+    echo -e "${GREEN}✅ Vertex 已启动${RESET}"
+    echo -e "${GREEN}🌐 Web UI 地址: http://127.0.0.1:$PORT${RESET}"
+    echo -e "${GREEN}📂 配置目录: $APP_DIR/config${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function update_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ Vertex 已更新并重启完成${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function uninstall_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${GREEN}✅ Vertex 已卸载，数据已删除${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function view_logs() {
+    docker logs -f vertex
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function show_password() {
+    if [ -f "$APP_DIR/config/password" ]; then
+        echo -e "${GREEN}初始密码内容:${RESET}"
+        more "$APP_DIR/config/password"
+    else
+        echo -e "${GREEN}未找到初始密码文件${RESET}"
+    fi
+    read -p "按回车返回菜单..."
+    menu
+}
+
+menu

@@ -1,125 +1,137 @@
 #!/bin/bash
 set -e
 
+# ================== 配置 ==================
+APP_NAME="TGBot_RSS"
+IMAGE_NAME="kwxos/tgbot-rss:latest"
+INSTALL_DIR="/opt/tgbot_rss"
+DATA_DIR="$INSTALL_DIR/data"
+CONFIG_FILE="$INSTALL_DIR/tgbot_rss.conf"
+
 # ================== 颜色 ==================
 GREEN="\033[32m"
-RED="\033[31m"
 RESET="\033[0m"
 
-# ================== 变量 ==================
-SERVICE_NAME="firefox"
-INSTALL_DIR="/opt/firefox"
-COMPOSE_FILE="$INSTALL_DIR/docker-compose.yaml"
-
-# ================== 获取公网IP ==================
-get_ip() {
-    curl -s ifconfig.me || curl -s ipinfo.io/ip
+# ================== 公共函数 ==================
+check_env() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${GREEN}❌ 未检测到 Docker，请先安装 Docker${RESET}"
+        exit 1
+    fi
 }
 
-# ================== 生成 docker-compose.yaml ==================
-generate_compose() {
-  cat > $COMPOSE_FILE <<EOF
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    fi
+}
 
-services:
-  ${SERVICE_NAME}:
-    image: lscr.io/linuxserver/firefox:latest
-    container_name: ${SERVICE_NAME}
-    restart: unless-stopped
-    security_opt:
-      - seccomp=unconfined
-    environment:
-      PUID: 1000
-      PGID: 1000
-      TZ: Asia/Shanghai
-      DOCKER_MODS: linuxserver/mods:universal-package-install
-      INSTALL_PACKAGES: fonts-noto-cjk
-      LC_ALL: zh_CN.UTF-8
-      CUSTOM_USER: "${CUSTOM_USER}"
-      PASSWORD: "${PASSWORD}"
-    ports:
-      - "127.0.0.1:${WEB_PORT}:3000"
-      - "127.0.0.1:${VNC_PORT}:3001"
-    volumes:
-      - ${INSTALL_DIR}/config:/config
-    shm_size: 1gb
+save_config() {
+    mkdir -p "$INSTALL_DIR"
+    cat > "$CONFIG_FILE" <<EOF
+BotToken="$BotToken"
+ADMINIDS="$ADMINIDS"
+Cycletime="$Cycletime"
+Debug="$Debug"
+ProxyURL="$ProxyURL"
+Pushinfo="$Pushinfo"
 EOF
 }
 
-# ================== 部署函数 ==================
-deploy() {
-  read -p "请输入Web登录用户名 (默认 admin): " CUSTOM_USER
-  CUSTOM_USER=${CUSTOM_USER:-admin}
+# ================== 安装/启动 ==================
+install_app() {
+    load_config
 
-  read -p "请输入Web登录密码 (默认 123456): " PASSWORD
-  PASSWORD=${PASSWORD:-123456}
+    read -p "请输入 Telegram Bot Token (默认: $BotToken): " input
+    BotToken=${input:-$BotToken}
 
-  read -p "请输入Web UI端口 (默认3000): " WEB_PORT
-  WEB_PORT=${WEB_PORT:-3000}
+    read -p "请输入管理员 UID (默认: $ADMINIDS, 0 表示所有用户): " input
+    ADMINIDS=${input:-$ADMINIDS}
 
-  read -p "请输入VNC端口 (默认3001): " VNC_PORT
-  VNC_PORT=${VNC_PORT:-3001}
+    read -p "RSS 检查周期(分钟, 默认 ${Cycletime:-1}): " input
+    Cycletime=${input:-${Cycletime:-1}}
 
-  mkdir -p "$INSTALL_DIR/config"
+    read -p "是否开启调试模式 (true/false, 默认 ${Debug:-false}): " input
+    Debug=${input:-${Debug:-false}}
 
-  generate_compose
+    read -p "代理服务器 URL (默认 ${ProxyURL:-空}): " input
+    ProxyURL=${input:-$ProxyURL}
 
-  echo -e "${GREEN}生成 docker-compose.yaml 并启动容器...${RESET}"
-  docker compose -f $COMPOSE_FILE up -d
+    read -p "推送接口 URL (默认 ${Pushinfo:-空}): " input
+    Pushinfo=${input:-$Pushinfo}
 
-  echo -e "${GREEN}部署完成！${RESET}"
-  echo -e "${GREEN}Web访问: http://127.0.0.1:${WEB_PORT}${RESET}"
-  echo -e "${GREEN}VNC端口: ${VNC_PORT}${RESET}"
-  echo -e "${GREEN}用户名: ${CUSTOM_USER}${RESET}"
-  echo -e "${GREEN}密码: ${PASSWORD}${RESET}"
+    save_config
+    mkdir -p "$DATA_DIR"
+
+    echo -e "${GREEN}🚀 正在安装并启动 $APP_NAME ...${RESET}"
+
+    docker run -d \
+      --name $APP_NAME \
+      -e BotToken="$BotToken" \
+      -e ADMINIDS="$ADMINIDS" \
+      -e Cycletime="$Cycletime" \
+      -e Debug="$Debug" \
+      -e ProxyURL="$ProxyURL" \
+      -e Pushinfo="$Pushinfo" \
+      -e TZ="Asia/Shanghai" \
+      -v "$DATA_DIR:/root/" \
+      $IMAGE_NAME
+
+    echo -e "${GREEN}✅ $APP_NAME 已启动${RESET}"
 }
 
-# ================== 管理菜单 ==================
-while true; do
-  echo -e "${GREEN}==============================${RESET}"
-  echo -e "${GREEN}       Firefox 容器管理        ${RESET}"
-  echo -e "${GREEN}==============================${RESET}"
-  echo -e "${GREEN}1) 部署安装${RESET}"
-  echo -e "${GREEN}2) 启动${RESET}"
-  echo -e "${GREEN}3) 停止${RESET}"
-  echo -e "${GREEN}4) 删除（含数据）${RESET}"
-  echo -e "${GREEN}5) 查看日志${RESET}"
-  echo -e "${GREEN}6) 更新${RESET}"
-  echo -e "${GREEN}0) 退出${RESET}"
-  echo -e "${GREEN}==============================${RESET}"
+# ================== 更新 ==================
+update_app() {
+    echo -e "${GREEN}🔄 正在更新 $APP_NAME ...${RESET}"
+    docker pull $IMAGE_NAME
+    docker stop $APP_NAME 2>/dev/null || true
+    docker rm $APP_NAME 2>/dev/null || true
+    install_app
+    echo -e "${GREEN}✅ 容器已更新并启动${RESET}"
+}
 
-  read -p "请输入选项 : " choice
-  case $choice in
-    1)
-      deploy
-      ;;
-    2)
-      docker compose -f $COMPOSE_FILE start
-      echo -e "${GREEN}已启动${RESET}"
-      ;;
-    3)
-      docker compose -f $COMPOSE_FILE stop
-      echo -e "${GREEN}已停止${RESET}"
-      ;;
-    4)
-      docker compose -f $COMPOSE_FILE down
-      rm -rf "$INSTALL_DIR"
-      echo -e "${RED}Firefox 容器及数据已删除${RESET}"
-      ;;
-    5)
-      docker compose -f $COMPOSE_FILE logs -f
-      ;;
-    6)
-      echo -e "${GREEN}开始更新 Firefox...${RESET}"
-      docker compose -f $COMPOSE_FILE pull
-      docker compose -f $COMPOSE_FILE up -d
-      echo -e "${GREEN}更新完成并已重启 Firefox${RESET}"
-      ;;
-    0)
-      echo -e "${GREEN}退出脚本${RESET}"
-      exit 0
-      ;;
-    *)
-      echo -e "${RED}无效选项，请重新输入${RESET}"
-      ;;
-  esac
+# ================== 卸载 ==================
+uninstall_app() {
+    read -p "⚠️ 确认卸载 $APP_NAME 并删除数据和配置吗? (y/N): " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        docker stop $APP_NAME 2>/dev/null || true
+        docker rm $APP_NAME 2>/dev/null || true
+        rm -rf "$INSTALL_DIR"
+        echo -e "${GREEN}✅ $APP_NAME 已卸载并清理数据${RESET}"
+    else
+        echo -e "${GREEN}❌ 已取消卸载${RESET}"
+    fi
+}
+
+# ================== 查看日志 ==================
+logs_app() {
+    docker logs -f $APP_NAME
+}
+
+# ================== 菜单 ==================
+menu() {
+    clear
+    echo -e "${GREEN}=== TGBot_RSS 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 卸载${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    echo -e "${GREEN}==========================${RESET}"
+    read -p "请选择: " choice
+    case $choice in
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) logs_app ;;
+        0) exit 0 ;;
+        *) echo -e "${GREEN}无效选择${RESET}" ;;
+    esac
+}
+
+# ================== 主循环 ==================
+check_env
+while true; do
+    menu
+    read -p "按回车键返回菜单..." dummy
 done

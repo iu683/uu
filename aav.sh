@@ -1,123 +1,127 @@
 #!/bin/bash
-# =========================================
-# EasyImage 一键管理脚本（循环菜单 + .env）
-# =========================================
+# ============================================
+# Komari 管理脚本（统一文件夹 + 支持自定义端口）
+# ============================================
 
-APP_NAME="easyimage"
-COMPOSE_DIR="/root/easyimage/$APP_NAME"
-COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yml"
-ENV_FILE="$COMPOSE_DIR/.env"
+set -e
 
 GREEN="\033[32m"
-RESET="\033[0m"
 RED="\033[31m"
+YELLOW="\033[33m"
+RESET="\033[0m"
 
-# ---------- 初始化配置 ----------
-init_config() {
-    mkdir -p "$COMPOSE_DIR"
-
-    if [ ! -f "$ENV_FILE" ]; then
-        read -p "请输入映射端口 (默认 8080): " input_port
-        APP_PORT=${input_port:-8080}
-
-        cat > "$ENV_FILE" <<EOF
-APP_NAME=$APP_NAME
-APP_PORT=$APP_PORT
-COMPOSE_DIR=$COMPOSE_DIR
-EOF
-    fi
-
-    source "$ENV_FILE"
-}
-
-# ---------- 生成 docker-compose ----------
-gen_compose() {
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  \${APP_NAME}:
-    image: ddsderek/easyimage:latest
-    container_name: \${APP_NAME}
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:\${APP_PORT}:80"
-    volumes:
-      - "\${COMPOSE_DIR}/config:/app/web/config"
-      - "\${COMPOSE_DIR}/i:/app/web/i"
-    environment:
-      - TZ=Asia/Shanghai
-      - PUID=1000
-      - PGID=1000
-      - DEBUG=false
-EOF
-}
-
-# ---------- 操作 ----------
-install_app() {
-    init_config
-    gen_compose
-    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d
-    echo -e "${GREEN}安装完成，访问地址: http://127.0.0.1:${APP_PORT}${RESET}"
-}
-
-update_app() {
-    source "$ENV_FILE"
-    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" pull
-    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d
-    echo -e "${GREEN}更新完成${RESET}"
-}
-
-start_app() {
-    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" start
-    echo -e "${GREEN}已启动${RESET}"
-}
-
-stop_app() {
-    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" stop
-    echo -e "${GREEN}已停止${RESET}"
-}
-
-uninstall_app() {
-    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" down
-    read -p "是否删除数据文件夹 $COMPOSE_DIR? (y/n): " rmdata
-    if [ "$rmdata" == "y" ]; then
-        rm -rf "$COMPOSE_DIR"
-        echo -e "${RED}数据已删除${RESET}"
-    fi
-    echo -e "${RED}已卸载${RESET}"
-}
-
-logs_app() {
-    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" logs -f
-}
+APP_DIR="$HOME/komari"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/komari_config.env"
+DATA_DIR="$APP_DIR/data"
+CONTAINER_NAME="komari"
 
 menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}===============================${RESET}"
-        echo -e "${GREEN}    EasyImage 管理脚本          ${RESET}"
-        echo -e "${GREEN}===============================${RESET}"
-        echo -e "${GREEN}1. 安装并启动${RESET}"
-        echo -e "${GREEN}2. 更新容器${RESET}"
-        echo -e "${GREEN}3. 启动容器${RESET}"
-        echo -e "${GREEN}4. 停止容器${RESET}"
-        echo -e "${GREEN}5. 卸载容器${RESET}"
-        echo -e "${GREEN}6. 查看日志${RESET}"
-        echo -e "${GREEN}0. 退出${RESET}"
-        echo -e "${GREEN}===============================${RESET}"
-        read -p "请输入操作编号: " num
-        case "$num" in
-            1) install_app ;;
-            2) update_app ;;
-            3) start_app ;;
-            4) stop_app ;;
-            5) uninstall_app ;;
-            6) logs_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效输入${RESET}" ;;
-        esac
-        echo -e "\n按回车返回菜单..."
-        read
-    done
+    clear
+    echo -e "${GREEN}=== Komari 管理菜单 ===${RESET}"
+    echo -e "${YELLOW}1) 安装/部署 Komari${RESET}"
+    echo -e "${YELLOW}2) 更新 Komari${RESET}"
+    echo -e "${YELLOW}3) 卸载 Komari${RESET}"
+    echo -e "${YELLOW}4) 查看日志${RESET}"
+    echo -e "${YELLOW}0) 退出${RESET}"
+    echo
+    read -p "请选择操作: " choice
+
+    case $choice in
+        1) install_komari ;;
+        2) update_komari ;;
+        3) uninstall_komari ;;
+        4) view_logs ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选择！${RESET}" && sleep 1 && menu ;;
+    esac
+}
+
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    fi
+}
+
+install_komari() {
+    echo -e "${GREEN}=== 开始安装 Komari ===${RESET}"
+
+    mkdir -p "$APP_DIR" "$DATA_DIR"
+
+    read -p "请输入管理员用户名 (默认: admin): " ADMIN_USERNAME
+    ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+
+    read -p "请输入管理员密码 (默认: admin123): " ADMIN_PASSWORD
+    ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
+
+    read -p "是否启用 Cloudflared? (true/false, 默认: false): " KOMARI_ENABLE_CLOUDFLARED
+    KOMARI_ENABLE_CLOUDFLARED=${KOMARI_ENABLE_CLOUDFLARED:-false}
+
+    if [ "$KOMARI_ENABLE_CLOUDFLARED" == "true" ]; then
+        read -p "请输入 Cloudflared Token: " KOMARI_CLOUDFLARED_TOKEN
+    else
+        KOMARI_CLOUDFLARED_TOKEN=""
+    fi
+
+    read -p "请输入 Komari 端口 (默认: 25774): " PORT
+    PORT=${PORT:-25774}
+
+    # 保存配置
+    cat > "$CONFIG_FILE" <<EOF
+ADMIN_USERNAME="$ADMIN_USERNAME"
+ADMIN_PASSWORD="$ADMIN_PASSWORD"
+KOMARI_ENABLE_CLOUDFLARED="$KOMARI_ENABLE_CLOUDFLARED"
+KOMARI_CLOUDFLARED_TOKEN="$KOMARI_CLOUDFLARED_TOKEN"
+PORT="$PORT"
+EOF
+
+    # 生成 docker-compose.yml
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  komari:
+    image: ghcr.io/komari-monitor/komari:latest
+    container_name: $CONTAINER_NAME
+    ports:
+      - "127.0.0.1:$PORT:25774"
+    volumes:
+      - $DATA_DIR:/app/data
+    env_file:
+      - $CONFIG_FILE
+    restart: unless-stopped
+EOF
+
+    (cd "$APP_DIR" && docker compose up -d)
+
+    echo -e "${GREEN}✅ 部署完成！访问地址:  http://127.0.0.1:$PORT${RESET}"
+    echo -e "${YELLOW}用户名: $ADMIN_USERNAME  密码: $ADMIN_PASSWORD${RESET}"
+    read -p "按回车返回菜单..." && menu
+}
+
+update_komari() {
+    load_config
+    echo -e "${GREEN}=== 更新 Komari ===${RESET}"
+    (cd "$APP_DIR" && docker compose pull && docker compose up -d)
+    echo -e "${GREEN}✅ 更新完成！${RESET}"
+    read -p "按回车返回菜单..." && menu
+}
+
+uninstall_komari() {
+    echo -e "${RED}⚠️  即将卸载 Komari，并删除相关数据！${RESET}"
+    read -p "确认卸载? (y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        (cd "$APP_DIR" && docker compose down -v)
+        rm -rf "$APP_DIR"
+        echo -e "${GREEN}✅ 卸载完成${RESET}"
+    else
+        echo -e "${YELLOW}已取消${RESET}"
+    fi
+    read -p "按回车返回菜单..." && menu
+}
+
+view_logs() {
+    echo -e "${GREEN}=== 查看 Komari 日志 ===${RESET}"
+    docker logs -f $CONTAINER_NAME
+    read -p "按回车返回菜单..." && menu
 }
 
 menu

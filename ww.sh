@@ -1,109 +1,180 @@
 #!/bin/bash
-# ========================================
-# MoviePilot 一键管理脚本 (Docker Compose)
-# ========================================
+# Jellyfin 一键部署与更新菜单脚本（统一 /opt/jellyfin，循环菜单版）
 
-GREEN="\033[32m"
-RESET="\033[0m"
-APP_NAME="moviepilot-v2"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.env"
+GREEN='\033[0;32m'
+RESET='\033[0m'
 
-function menu() {
-    clear
-    echo -e "${GREEN}=== MoviePilot 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}=======================${RESET}"
-    read -p "请选择: " choice
+DEFAULT_CONTAINER_NAME="jellyfin"
+DEFAULT_DATA_DIR="/opt/jellyfin"
+DEFAULT_HTTP_PORT="8096"
+IMAGE_NAME="jellyfin/jellyfin:latest"
+CONFIG_FILE="$DEFAULT_DATA_DIR/config.env"
+
+CONTAINER_NAME=""
+DATA_DIR=""
+HTTP_PORT=""
+
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${GREEN}错误: Docker 未安装，请先安装 Docker${RESET}"
+        exit 1
+    fi
+}
+
+get_public_ip() {
+    PUBLIC_IP=$(curl -s https://ipinfo.io/ip)
+    if ! [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+        PUBLIC_IP=$(curl -s https://ifconfig.me/ip)
+    fi
+    [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || PUBLIC_IP=""
+    echo "$PUBLIC_IP"
+}
+
+load_or_input_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    fi
+
+    read -p "请输入容器名 [${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}]: " input_container
+    CONTAINER_NAME=${input_container:-${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}}
+
+    DATA_DIR="$DEFAULT_DATA_DIR"
+
+    read -p "请输入宿主机 HTTP 映射端口 [${HTTP_PORT:-$DEFAULT_HTTP_PORT}]: " input_port
+    HTTP_PORT=${input_port:-${HTTP_PORT:-$DEFAULT_HTTP_PORT}}
+
+    mkdir -p "$(dirname $CONFIG_FILE)"
+    {
+        echo "CONTAINER_NAME=\"$CONTAINER_NAME\""
+        echo "DATA_DIR=\"$DATA_DIR\""
+        echo "HTTP_PORT=\"$HTTP_PORT\""
+    } > "$CONFIG_FILE"
+}
+
+create_dirs() {
+    mkdir -p "$DATA_DIR/config" "$DATA_DIR/cache" "$DATA_DIR/media"
+    chmod -R 755 "$DATA_DIR"
+    echo -e "${GREEN}已创建数据目录: $DATA_DIR${RESET}"
+}
+
+deploy_jellyfin() {
+    load_or_input_config
+    create_dirs
+    echo -e "${GREEN}正在部署 Jellyfin 容器...${RESET}"
+
+    docker run -d \
+        --name $CONTAINER_NAME \
+        --restart unless-stopped \
+        -e TZ=Asia/Shanghai \
+        -e UID=0 \
+        -e GID=0 \
+        -e GIDLIST=0 \
+        -p 127.0.0.1:$HTTP_PORT:8096 \
+        -p 8920:8920 \
+        -v $DATA_DIR/config:/config \
+        -v $DATA_DIR/cache:/cache \
+        -v $DATA_DIR/media:/media \
+        $IMAGE_NAME
+
+    PUBLIC_IP=$(get_public_ip)
+    echo -e "${GREEN}部署完成！访问地址: http://127.0.0.1:${HTTP_PORT}${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+start_jellyfin() {
+    docker start $CONTAINER_NAME && echo -e "${GREEN}容器已启动${RESET}"
+    read -p "按回车返回菜单..."
+}
+stop_jellyfin() {
+    docker stop $CONTAINER_NAME && echo -e "${GREEN}容器已停止${RESET}"
+    read -p "按回车返回菜单..."
+}
+remove_jellyfin() {
+    docker rm -f $CONTAINER_NAME && echo -e "${GREEN}容器已删除${RESET}"
+}
+view_logs() {
+    docker logs -f $CONTAINER_NAME
+}
+
+uninstall_all() {
+    docker stop $CONTAINER_NAME
+    remove_jellyfin
+    if [ -d "$DEFAULT_DATA_DIR" ]; then
+        read -p "确定要删除 $DEFAULT_DATA_DIR 吗？此操作不可恢复 [y/N]: " confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            rm -rf "$DEFAULT_DATA_DIR"
+            echo -e "${GREEN}数据和配置已删除${RESET}"
+        fi
+    fi
+    read -p "按回车返回菜单..."
+}
+
+update_image() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    else
+        echo -e "${GREEN}配置文件不存在，请先部署容器${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    fi
+
+    echo -e "${GREEN}正在拉取最新镜像: $IMAGE_NAME ...${RESET}"
+    docker pull $IMAGE_NAME
+
+    if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
+        echo -e "${GREEN}停止正在运行的容器...${RESET}"
+        docker stop $CONTAINER_NAME
+    fi
+
+    if [ "$(docker ps -a -q -f name=$CONTAINER_NAME)" ]; then
+        echo -e "${GREEN}删除旧容器（保留数据）...${RESET}"
+        docker rm $CONTAINER_NAME
+    fi
+
+    echo -e "${GREEN}使用最新镜像重启容器...${RESET}"
+    docker run -d \
+        --name $CONTAINER_NAME \
+        --restart unless-stopped \
+        -e TZ=Asia/Shanghai \
+        -e UID=0 \
+        -e GID=0 \
+        -e GIDLIST=0 \
+        -p 127.0.0.1:$HTTP_PORT:8096 \
+        -p 8920:8920 \
+        -v $DATA_DIR/config:/config \
+        -v $DATA_DIR/cache:/cache \
+        -v $DATA_DIR/media:/media \
+        $IMAGE_NAME
+
+    echo -e "${GREEN}更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+show_menu() {
+    echo -e "${GREEN}===== Jellyfin 菜单 =====${RESET}"
+    echo -e "${GREEN}1. 部署${RESET}"
+    echo -e "${GREEN}2. 启动容器${RESET}"
+    echo -e "${GREEN}3. 停止容器${RESET}"
+    echo -e "${GREEN}4. 查看日志${RESET}"
+    echo -e "${GREEN}5. 卸载${RESET}"
+    echo -e "${GREEN}6. 更新${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -n "请输入编号: "
+}
+
+check_docker
+
+while true; do
+    show_menu
+    read choice
     case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
+        1) deploy_jellyfin ;;
+        2) start_jellyfin ;;
+        3) stop_jellyfin ;;
         4) view_logs ;;
-        0) exit 0 ;;
-        *) echo "无效选择"; sleep 1; menu ;;
+        5) uninstall_all ;;
+        6) update_image ;;
+        0) echo "退出脚本"; exit 0 ;;
+        *) echo -e "${GREEN}无效选项${RESET}"; read -p "按回车返回菜单..." ;;
     esac
-}
-
-function install_app() {
-    read -p "请输入 Web 端口 [默认:3000]: " input_web
-    PORT_WEB=${input_web:-3000}
-    read -p "请输入 API 端口 [默认:3001]: " input_api
-    PORT_API=${input_api:-3001}
-    read -p "请输入超级管理员密码 [默认:admin123]: " SUPERPASS
-    SUPERPASS=${SUPERPASS:-admin123}
-
-    # 创建统一目录
-    mkdir -p "$APP_DIR/config" "$APP_DIR/core" "$APP_DIR/media"
-
-    # 生成 docker-compose.yml
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  moviepilot:
-    image: jxxghp/moviepilot-v2:latest
-    container_name: moviepilot-v2
-    stdin_open: true
-    tty: true
-    restart: always
-    volumes:
-      - $APP_DIR/config:/config
-      - $APP_DIR/core:/moviepilot/.cache/ms-playwright
-      - $APP_DIR/media:/media
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    environment:
-      - NGINX_PORT=3000
-      - PORT=3001
-      - PUID=0
-      - PGID=0
-      - UMASK=000
-      - TZ=Asia/Shanghai
-      - SUPERUSER=admin
-      - SUPERUSER_PASSWORD=$SUPERPASS
-    ports:
-      - "127.0.0.1:$PORT_WEB:3000"
-      - "$PORT_API:3001"
-EOF
-
-    echo "PORT_WEB=$PORT_WEB" > "$CONFIG_FILE"
-    echo "PORT_API=$PORT_API" >> "$CONFIG_FILE"
-    echo "SUPERPASS=$SUPERPASS" >> "$CONFIG_FILE"
-
-    cd "$APP_DIR"
-    docker compose up -d
-
-    echo -e "${GREEN}✅ MoviePilot 已启动${RESET}"
-    echo -e "${GREEN}🌐 Web UI 地址: http://127.0.0.1:$PORT_WEB${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ MoviePilot 已更新并重启完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function uninstall_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${GREEN}✅ MoviePilot 已卸载，数据已删除${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function view_logs() {
-    docker logs -f moviepilot-v2
-    read -p "按回车返回菜单..."
-    menu
-}
-
-menu
+done

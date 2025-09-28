@@ -1,119 +1,98 @@
 #!/bin/bash
-# =========================================
-# DNSMgr Docker 管理脚本 (无数据库版, /opt 统一目录)
-# =========================================
+# ========================================
+# qBittorrent 一键管理脚本
+# ========================================
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
 RESET="\033[0m"
+APP_NAME="qbittorrent"
+COMPOSE_DIR="/opt/qbittorrent"
+COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yml"
 
-APP_DIR="/opt/dnsmgr"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-WEB_DIR="$APP_DIR/web"
-NETWORK_NAME="dnsmgr-net"
-
-mkdir -p "$WEB_DIR"
-
-check_port() {
-    local port=$1
-    if lsof -i:"$port" &>/dev/null; then
-        return 1
-    else
-        return 0
-    fi
+function get_ip() {
+    curl -s ifconfig.me || curl -s ip.sb || echo "your-ip"
 }
 
-generate_docker_compose() {
-    local web_port="$1"
+function menu() {
+    clear
+    echo -e "${GREEN}=== qBittorrent 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    echo -e "${GREEN}=======================${RESET}"
+    read -p "请选择: " choice
+    case $choice in
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) view_logs ;;
+        0) exit 0 ;;
+        *) echo "无效选择"; sleep 1; menu ;;
+    esac
+}
+
+function install_app() {
+    read -p "请输入 Web UI 端口 [默认:8082]: " input_port
+    WEB_PORT=${input_port:-8082}
+
+    read -p "请输入 Torrent 传输端口 [默认:6881]: " input_tport
+    TORRENT_PORT=${input_tport:-6881}
+
+    mkdir -p "$COMPOSE_DIR/config" "$COMPOSE_DIR/downloads"
+
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  dnsmgr-web:
-    container_name: dnsmgr-web
-    stdin_open: true
-    tty: true
+  qbittorrent:
+    image: linuxserver/qbittorrent
+    container_name: qbittorrent
+    restart: unless-stopped
     ports:
-      - 127.0.0.1:${web_port}:80
+      - "${TORRENT_PORT}:${TORRENT_PORT}"
+      - "${TORRENT_PORT}:${TORRENT_PORT}/udp"
+      - "127.0.0.1:${WEB_PORT}:8080"
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Asia/Shanghai
     volumes:
-      - ./web:/app/www
-    image: netcccyun/dnsmgr
-    networks:
-      - $NETWORK_NAME
-
-networks:
-  $NETWORK_NAME:
-    driver: bridge
+      - ${COMPOSE_DIR}/config:/config
+      - ${COMPOSE_DIR}/downloads:/downloads
 EOF
+
+    cd "$COMPOSE_DIR"
+    docker compose up -d
+    echo -e "${GREEN}✅ qBittorrent 已启动${RESET}"
+    echo -e "${GREEN}🌐 Web UI 地址: http://127.0.0.1:$WEB_PORT${RESET}"
+    echo -e "${GREEN}📂 配置目录: $COMPOSE_DIR/config${RESET}"
+    echo -e "${GREEN}📂 下载目录: $COMPOSE_DIR/downloads${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
-start_all() {
-    cd "$APP_DIR"
-    docker compose -f "$COMPOSE_FILE" up -d
+function update_app() {
+    cd "$COMPOSE_DIR" || exit
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ qBittorrent 已更新并重启完成${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
-stop_all() {
-    cd "$APP_DIR"
-    docker compose -f "$COMPOSE_FILE" down
+function uninstall_app() {
+    cd "$COMPOSE_DIR" || exit
+    docker compose down -v
+    rm -rf "$COMPOSE_DIR"
+    echo -e "${GREEN}✅ qBittorrent 已卸载，数据已删除${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
-update_services() {
-    cd "$APP_DIR"
-    docker compose -f "$COMPOSE_FILE" pull
-    docker compose -f "$COMPOSE_FILE" up -d
-}
-
-uninstall() {
-    read -p "是否删除 web 文件? [y/N]: " keep
-    stop_all
-    docker rm -f dnsmgr-web 2>/dev/null || true
-    docker network rm $NETWORK_NAME 2>/dev/null || true
-
-    if [[ ! "$keep" =~ ^[Yy]$ ]]; then
-        rm -rf "$WEB_DIR"
-    fi
-    docker rmi netcccyun/dnsmgr 2>/dev/null || true
-    echo -e "${GREEN}卸载完成！${RESET}"
-}
-
-show_info() {
-    local web_port="$1"
-    echo -e "\n${GREEN}==== 安装完成信息 ====${RESET}"
-    echo -e "${YELLOW}访问 dnsmgr-web:${RESET} http://127.0.0.1:$web_port"
-}
-
-menu() {
-    while true; do
-        echo -e "${GREEN}==== DNSMgr Docker 管理菜单 (无数据库版) ====${RESET}"
-        echo -e "${GREEN}1) 安装并启动${RESET}"
-        echo -e "${GREEN}2) 启动服务${RESET}"
-        echo -e "${GREEN}3) 停止服务${RESET}"
-        echo -e "${GREEN}4) 更新服务${RESET}"
-        echo -e "${GREEN}5) 卸载${RESET}"
-        echo -e "${GREEN}6) 退出${RESET}"
-        read -p "请输入操作编号: " choice
-        case "$choice" in
-            1)
-                while true; do
-                    read -p "请输入 dnsmgr-web 映射端口 (默认 8081): " web_port
-                    web_port=${web_port:-8081}
-                    if check_port "$web_port"; then
-                        break
-                    else
-                        echo -e "${RED}端口 $web_port 已被占用，请重新输入！${RESET}"
-                    fi
-                done
-                generate_docker_compose "$web_port"
-                start_all
-                show_info "$web_port"
-                ;;
-            2) start_all; echo -e "${GREEN}服务已启动！${RESET}" ;;
-            3) stop_all ;;
-            4) update_services ;;
-            5) uninstall ;;
-            6) exit 0 ;;
-            *) echo -e "${RED}无效选项！${RESET}" ;;
-        esac
-    done
+function view_logs() {
+    docker logs -f qbittorrent
+    read -p "按回车返回菜单..."
+    menu
 }
 
 menu

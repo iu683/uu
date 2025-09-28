@@ -1,175 +1,178 @@
 #!/bin/bash
-# EmbyServer 一键部署与更新菜单脚本
-# 宿主机目录: /docker/emby 映射到容器 /config
+set -e
 
-GREEN='\033[0;32m'
-RESET='\033[0m'
+# ================== 颜色 ==================
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-DEFAULT_CONTAINER_NAME="amilys_embyserver"
-DEFAULT_DATA_DIR="/opt/emby"
-DEFAULT_HTTP_PORT="8096"
+# ================== 变量 ==================
+INSTALL_DIR="/opt/dnsmgr"
+COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
+WEB_DIR="$INSTALL_DIR/web"
+MYSQL_CONF_DIR="$INSTALL_DIR/mysql/conf"
+MYSQL_LOGS_DIR="$INSTALL_DIR/mysql/logs"
+MYSQL_DATA_DIR="$INSTALL_DIR/mysql/data"
+NETWORK_NAME="dnsmgr-network"
 
-CONTAINER_NAME=""
-DATA_DIR=""
-HTTP_PORT=""
-IMAGE_NAME=""
-CONFIG_FILE="$DEFAULT_DATA_DIR/emby_config"
+MYSQL_ROOT_PASSWORD="554751"
+MYSQL_DB_NAME="dnsmgr"
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${GREEN}错误: Docker 未安装，请先安装 Docker${RESET}"
-        exit 1
-    fi
-}
-
-# 检测 CPU 架构，自动选择镜像
-get_arch() {
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64)   IMAGE_NAME="amilys/embyserver" ;;
-        aarch64|arm64) IMAGE_NAME="amilys/embyserver_arm64v8" ;;
-        *) echo -e "${GREEN}未知架构: $arch，默认使用 amd64 镜像${RESET}"
-           IMAGE_NAME="amilys/embyserver" ;;
-    esac
-}
-
-get_public_ip() {
-    PUBLIC_IP=$(curl -s https://ipinfo.io/ip)
-    if ! [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        PUBLIC_IP=$(curl -s https://ifconfig.me/ip)
-    fi
-    if ! [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        PUBLIC_IP=""
-    fi
-    echo "$PUBLIC_IP"
-}
-
-load_or_input_config() {
-    # 配置文件存在就直接加载，否则第一次部署提示输入
-    if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
+# ================== 公共函数 ==================
+check_port() {
+    local port=$1
+    if lsof -i:"$port" &>/dev/null; then
+        return 1
     else
-        read -p "请输入容器名 [${DEFAULT_CONTAINER_NAME}]: " input_container
-        CONTAINER_NAME=${input_container:-$DEFAULT_CONTAINER_NAME}
-
-        read -p "请输入存放配置目录（宿主机） [${DEFAULT_DATA_DIR}]: " input_dir
-        DATA_DIR=${input_dir:-$DEFAULT_DATA_DIR}
-
-        read -p "请输入宿主机 HTTP 映射端口 [${DEFAULT_HTTP_PORT}]: " input_port
-        HTTP_PORT=${input_port:-$DEFAULT_HTTP_PORT}
-
-        mkdir -p "$(dirname "$CONFIG_FILE")"
-        {
-            echo "CONTAINER_NAME=\"$CONTAINER_NAME\""
-            echo "DATA_DIR=\"$DATA_DIR\""
-            echo "HTTP_PORT=\"$HTTP_PORT\""
-        } > "$CONFIG_FILE"
+        return 0
     fi
 }
 
 create_dirs() {
-    [ ! -d "$DATA_DIR" ] && mkdir -p "$DATA_DIR"
+    mkdir -p "$WEB_DIR" "$MYSQL_CONF_DIR" "$MYSQL_LOGS_DIR" "$MYSQL_DATA_DIR"
 }
 
-deploy_emby() {
-    load_or_input_config
-    create_dirs
-    get_arch
-    echo -e "${GREEN}正在部署 EmbyServer 容器（镜像: $IMAGE_NAME）...${RESET}"
-    docker run -d \
-        --name $CONTAINER_NAME \
-        --network bridge \
-        -e UID=0 \
-        -e GID=0 \
-        -e GIDLIST=0 \
-        -e TZ=Asia/Shanghai \
-        -v $DATA_DIR:/config \
-        -p 127.0.0.1:$HTTP_PORT:8096 \
-        --restart unless-stopped \
-        $IMAGE_NAME
-
-    PUBLIC_IP=$(get_public_ip)
-    echo -e "${GREEN}部署完成 访问地址: http://127.0.0.1:${HTTP_PORT}${RESET}"
-}
-
-start_emby() { load_or_input_config; docker start $CONTAINER_NAME && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_emby() { load_or_input_config; docker stop $CONTAINER_NAME && echo -e "${GREEN}容器已停止${RESET}"; }
-remove_emby() { load_or_input_config; docker rm -f $CONTAINER_NAME && echo -e "${GREEN}容器已删除${RESET}"; }
-view_logs() { load_or_input_config; docker logs -f $CONTAINER_NAME; }
-
-uninstall_all() {
-    load_or_input_config
-    stop_emby
-    remove_emby
-    if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
-        echo -e "${GREEN}正在删除配置目录: $DATA_DIR ...${RESET}"
-        rm -rf "$DATA_DIR"
-        echo -e "${GREEN}全部数据已卸载完成${RESET}"
+generate_my_cnf() {
+    local cnf_file="$MYSQL_CONF_DIR/my.cnf"
+    if [ ! -f "$cnf_file" ]; then
+        cat > "$cnf_file" <<'EOF'
+[mysqld]
+sql_mode=STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION
+EOF
     fi
-    [ -f "$CONFIG_FILE" ] && rm -f "$CONFIG_FILE"
-    echo -e "${GREEN}配置文件已删除（位于 $CONFIG_FILE）${RESET}"
 }
 
-update_image() {
-    load_or_input_config
-    get_arch
+generate_docker_compose() {
+    local web_port="$1"
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  dnsmgr-web:
+    container_name: dnsmgr-web
+    stdin_open: true
+    tty: true
+    ports:
+      - 127.0.0.1:${web_port}:80
+    volumes:
+      - ${WEB_DIR}:/app/www
+    image: netcccyun/dnsmgr
+    depends_on:
+      - dnsmgr-mysql
+    networks:
+      - $NETWORK_NAME
 
-    echo -e "${GREEN}正在拉取最新镜像: $IMAGE_NAME ...${RESET}"
-    docker pull $IMAGE_NAME
+  dnsmgr-mysql:
+    container_name: dnsmgr-mysql
+    restart: always
+    ports:
+      - 3306:3306
+    volumes:
+      - ${MYSQL_CONF_DIR}/my.cnf:/etc/mysql/my.cnf
+      - ${MYSQL_LOGS_DIR}:/logs
+      - ${MYSQL_DATA_DIR}:/var/lib/mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD
+      - MYSQL_DATABASE=$MYSQL_DB_NAME
+      - TZ=Asia/Shanghai
+    image: mysql:5.7
+    networks:
+      - $NETWORK_NAME
 
-    if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
-        echo -e "${GREEN}停止正在运行的容器...${RESET}"
-        docker stop $CONTAINER_NAME
-    fi
-
-    if [ "$(docker ps -a -q -f name=$CONTAINER_NAME)" ]; then
-        echo -e "${GREEN}删除旧容器（保留数据）...${RESET}"
-        docker rm $CONTAINER_NAME
-    fi
-
-    echo -e "${GREEN}使用最新镜像重启容器...${RESET}"
-    docker run -d \
-        --name $CONTAINER_NAME \
-        --network bridge \
-        -e UID=0 \
-        -e GID=0 \
-        -e GIDLIST=0 \
-        -e TZ=Asia/Shanghai \
-        -v $DATA_DIR:/config \
-        -p 127.0.0.1:$HTTP_PORT:8096 \
-        --restart unless-stopped \
-        $IMAGE_NAME
-
-    echo -e "${GREEN}更新完成${RESET}"
+networks:
+  $NETWORK_NAME:
+    driver: bridge
+EOF
 }
 
-show_menu() {
-    echo -e "${GREEN}===== EmbyServer菜单 =====${RESET}"
-    echo -e "${GREEN}1.部署${RESET}"
-    echo -e "${GREEN}2.启动容器${RESET}"
-    echo -e "${GREEN}3.停止容器${RESET}"
-    echo -e "${GREEN}4.删除容器${RESET}"
-    echo -e "${GREEN}5.查看日志${RESET}"
-    echo -e "${GREEN}6.卸载${RESET}"
-    echo -e "${GREEN}7.更新${RESET}"
-    echo -e "${GREEN}0.退出${RESET}"
-    echo -n "请输入编号: "
+wait_mysql_ready() {
+    echo "等待 MySQL 启动..."
+    while ! docker exec dnsmgr-mysql mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent &>/dev/null; do
+        sleep 2
+    done
+    echo "MySQL 已就绪"
 }
 
-check_docker
+init_mysql() {
+    docker compose -f $COMPOSE_FILE up -d dnsmgr-mysql
+    wait_mysql_ready
+}
 
-while true; do
-    show_menu
-    read choice
-    case $choice in
-        1) deploy_emby ;;
-        2) start_emby ;;
-        3) stop_emby ;;
-        4) remove_emby ;;
-        5) view_logs ;;
-        6) uninstall_all ;;
-        7) update_image ;;
-        0) echo "退出脚本"; exit 0 ;;
-        *) echo -e "${GREEN}无效选项${RESET}" ;;
-    esac
-done
+start_all() {
+    docker compose -f $COMPOSE_FILE up -d
+}
+
+stop_all() {
+    docker compose -f $COMPOSE_FILE down
+}
+
+update_services() {
+    docker compose -f $COMPOSE_FILE pull
+    docker compose -f $COMPOSE_FILE up -d
+}
+
+uninstall() {
+    cd "$APP_DIR" || exit
+    # 停止服务并删除容器
+    docker compose down -v
+    docker rm -f dnsmgr-web 2>/dev/null || true
+    docker network rm $NETWORK_NAME 2>/dev/null || true
+    docker rmi netcccyun/dnsmgr 2>/dev/null || true
+
+    # 删除整个安装目录（包括 web 文件）
+    rm -rf "$APP_DIR"
+
+    echo -e "${GREEN}✅ DNSMgr 已卸载，数据已删除${RESET}"
+
+}
+
+
+show_info() {
+    local web_port="$1"
+    echo -e "\n${GREEN}==== 安装完成信息 ====${RESET}"
+    echo -e "${YELLOW}访问 dnsmgr-web:${RESET} http://127.0.0.1:${web_port}"
+    echo -e "${YELLOW}MySQL 主机:${RESET} dnsmgr-mysql"
+    echo -e "${YELLOW}MySQL 端口:${RESET} 3306"
+    echo -e "${YELLOW}MySQL 用户名:${RESET} root"
+    echo -e "${YELLOW}MySQL 密码:${RESET} $MYSQL_ROOT_PASSWORD"
+    echo -e "${YELLOW}数据库名称:${RESET} $MYSQL_DB_NAME"
+}
+
+menu() {
+    while true; do
+        echo -e "${GREEN}==== DNSMgr 管理菜单 ====${RESET}"
+        echo -e "${GREEN}1) 安装${RESET}"
+        echo -e "${GREEN}2) 启动服务${RESET}"
+        echo -e "${GREEN}3) 停止服务${RESET}"
+        echo -e "${GREEN}4) 更新服务${RESET}"
+        echo -e "${GREEN}5) 卸载${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "请输入操作编号: " choice
+        case "$choice" in
+            1)
+                while true; do
+                    read -p "请输入 dnsmgr-web 映射端口 (默认 8081): " web_port
+                    web_port=${web_port:-8081}
+                    if check_port "$web_port"; then
+                        break
+                    else
+                        echo -e "${RED}端口 $web_port 已被占用，请重新输入！${RESET}"
+                    fi
+                done
+                create_dirs
+                generate_my_cnf
+                generate_docker_compose "$web_port"
+                init_mysql
+                start_all
+                show_info "$web_port"
+                ;;
+            2) start_all ; echo -e "${GREEN}服务已启动！${RESET}" ;;
+            3) stop_all ; echo -e "${GREEN}服务已停止！${RESET}" ;;
+            4) update_services ; echo -e "${GREEN}服务已更新！${RESET}" ;;
+            5) uninstall ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选项！${RESET}" ;;
+        esac
+    done
+}
+
+menu

@@ -40,7 +40,6 @@ function install_app() {
     mkdir -p "$COMPOSE_DIR/data"
 
     cat > "$COMPOSE_FILE" <<EOF
-version: '3'
 
 services:
   onenav:

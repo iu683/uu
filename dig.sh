@@ -1,4 +1,4 @@
-```bash
+bash
 #!/bin/bash
 # Jellyfin 一键部署与更新菜单脚本（统一 /opt/jellyfin，循环菜单版）
 
@@ -179,4 +179,4 @@ while true; do
         *) echo -e "${GREEN}无效选项${RESET}"; read -p "按回车返回菜单..." ;;
     esac
 done
-```
+

@@ -1,182 +1,108 @@
-bash
 #!/bin/bash
-# Jellyfin 一键部署与更新菜单脚本（统一 /opt/jellyfin，循环菜单版）
+# =========================================
+# FastSend 一键管理脚本
+# 支持安装 / 更新 / 重启 / 停止 / 卸载 / 查看日志
+# =========================================
 
-GREEN='\033[0;32m'
-RESET='\033[0m'
+APP_NAME="fastsend"
+IMAGE_NAME="shouchenicu/fastsend:0.6.0"
+INSTALL_DIR="/opt/$APP_NAME"
+CONFIG_FILE="$INSTALL_DIR/${APP_NAME}.conf"
 
-DEFAULT_CONTAINER_NAME="jellyfin"
-DEFAULT_DATA_DIR="/opt/jellyfin"
-DEFAULT_HTTP_PORT="8096"
-IMAGE_NAME="jellyfin/jellyfin:latest"
-CONFIG_FILE="$DEFAULT_DATA_DIR/config.env"
+GREEN="\033[32m"
+RESET="\033[0m"
 
-CONTAINER_NAME=""
-DATA_DIR=""
-HTTP_PORT=""
-
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${GREEN}错误: Docker 未安装，请先安装 Docker${RESET}"
-        exit 1
-    fi
+# 获取公网 IP
+function get_ip() {
+    curl -s ifconfig.me || curl -s ip.sb || echo "your-ip"
 }
 
-get_public_ip() {
-    PUBLIC_IP=$(curl -s https://ipinfo.io/ip)
-    if ! [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
-        PUBLIC_IP=$(curl -s https://ifconfig.me/ip)
-    fi
-    [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || PUBLIC_IP=""
-    echo "$PUBLIC_IP"
+# 初始化配置目录
+mkdir -p "$INSTALL_DIR"
+
+# 读取保存的端口
+if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+else
+    PORT=3000
+fi
+
+function save_config() {
+    echo "PORT=$PORT" > "$CONFIG_FILE"
 }
 
-load_or_input_config() {
-    if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
-    fi
+function install_app() {
+    read -p "请输入访问端口 [默认:3000]: " input_port
+    PORT=${input_port:-3000}
+    save_config
 
-    read -p "请输入容器名 [${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}]: " input_container
-    CONTAINER_NAME=${input_container:-${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}}
-
-    DATA_DIR="$DEFAULT_DATA_DIR"
-
-    read -p "请输入宿主机 HTTP 映射端口 [${HTTP_PORT:-$DEFAULT_HTTP_PORT}]: " input_port
-    HTTP_PORT=${input_port:-${HTTP_PORT:-$DEFAULT_HTTP_PORT}}
-
-    mkdir -p "$(dirname $CONFIG_FILE)"
-    {
-        echo "CONTAINER_NAME=\"$CONTAINER_NAME\""
-        echo "DATA_DIR=\"$DATA_DIR\""
-        echo "HTTP_PORT=\"$HTTP_PORT\""
-    } > "$CONFIG_FILE"
-}
-
-create_dirs() {
-    mkdir -p "$DATA_DIR/config" "$DATA_DIR/cache" "$DATA_DIR/media"
-    chmod -R 755 "$DATA_DIR"
-    echo -e "${GREEN}已创建数据目录: $DATA_DIR${RESET}"
-}
-
-deploy_jellyfin() {
-    load_or_input_config
-    create_dirs
-    echo -e "${GREEN}正在部署 Jellyfin 容器...${RESET}"
-
-    docker run -d \
-        --name $CONTAINER_NAME \
-        --restart unless-stopped \
-        -e TZ=Asia/Shanghai \
-        -e UID=0 \
-        -e GID=0 \
-        -e GIDLIST=0 \
-        -p 127.0.0.1:$HTTP_PORT:8096 \
-        -p 8920:8920 \
-        -v $DATA_DIR/config:/config \
-        -v $DATA_DIR/cache:/cache \
-        -v $DATA_DIR/media:/media \
-        $IMAGE_NAME
-
-    PUBLIC_IP=$(get_public_ip)
-    echo -e "${GREEN}部署完成！访问地址: http://127.0.0.1:${HTTP_PORT}${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-start_jellyfin() {
-    docker start $CONTAINER_NAME && echo -e "${GREEN}容器已启动${RESET}"
-    read -p "按回车返回菜单..."
-}
-stop_jellyfin() {
-    docker stop $CONTAINER_NAME && echo -e "${GREEN}容器已停止${RESET}"
-    read -p "按回车返回菜单..."
-}
-remove_jellyfin() {
-    docker rm -f $CONTAINER_NAME && echo -e "${GREEN}容器已删除${RESET}"
-}
-view_logs() {
-    docker logs -f $CONTAINER_NAME
-}
-
-uninstall_all() {
-    stop_jellyfin
-    remove_jellyfin
-    if [ -d "$DEFAULT_DATA_DIR" ]; then
-        read -p "确定要删除 $DEFAULT_DATA_DIR 吗？此操作不可恢复 [y/N]: " confirm
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            rm -rf "$DEFAULT_DATA_DIR"
-            echo -e "${GREEN}数据和配置已删除${RESET}"
-        fi
-    fi
-    read -p "按回车返回菜单..."
-}
-
-update_image() {
-    if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
-    else
-        echo -e "${GREEN}配置文件不存在，请先部署容器${RESET}"
-        read -p "按回车返回菜单..."
-        return
-    fi
-
-    echo -e "${GREEN}正在拉取最新镜像: $IMAGE_NAME ...${RESET}"
+    echo -e "${GREEN}开始安装 ${APP_NAME}，端口: $PORT${RESET}"
     docker pull $IMAGE_NAME
-
-    if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
-        echo -e "${GREEN}停止正在运行的容器...${RESET}"
-        docker stop $CONTAINER_NAME
-    fi
-
-    if [ "$(docker ps -a -q -f name=$CONTAINER_NAME)" ]; then
-        echo -e "${GREEN}删除旧容器（保留数据）...${RESET}"
-        docker rm $CONTAINER_NAME
-    fi
-
-    echo -e "${GREEN}使用最新镜像重启容器...${RESET}"
+    docker rm -f $APP_NAME 2>/dev/null
     docker run -d \
-        --name $CONTAINER_NAME \
-        --restart unless-stopped \
-        -e TZ=Asia/Shanghai \
-        -e UID=0 \
-        -e GID=0 \
-        -e GIDLIST=0 \
-        -p 127.0.0.1:$HTTP_PORT:8096 \
-        -p 8920:8920 \
-        -v $DATA_DIR/config:/config \
-        -v $DATA_DIR/cache:/cache \
-        -v $DATA_DIR/media:/media \
+        --name=$APP_NAME \
+        --restart=unless-stopped \
+        -p 127.0.0.1:$PORT:3000 \
         $IMAGE_NAME
-
-    echo -e "${GREEN}更新完成${RESET}"
-    read -p "按回车返回菜单..."
+    IP=$(get_ip)
+    echo -e "${GREEN}安装完成！访问: http://127.0.0.1:$PORT${RESET}"
 }
 
-show_menu() {
-    echo -e "${GREEN}===== Jellyfin 菜单 =====${RESET}"
-    echo -e "${GREEN}1. 部署${RESET}"
-    echo -e "${GREEN}2. 启动容器${RESET}"
-    echo -e "${GREEN}3. 停止容器${RESET}"
-    echo -e "${GREEN}4. 查看日志${RESET}"
-    echo -e "${GREEN}5. 卸载${RESET}"
-    echo -e "${GREEN}6. 更新${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -n "请输入编号: "
+function update_app() {
+    echo -e "${GREEN}开始更新 ${APP_NAME}...${RESET}"
+    docker pull $IMAGE_NAME
+    docker rm -f $APP_NAME 2>/dev/null
+    docker run -d \
+        --name=$APP_NAME \
+        --restart=unless-stopped \
+        -p 127.0.0.1:$PORT:3000 \
+        $IMAGE_NAME
+    echo -e "${GREEN}更新完成！${RESET}"
 }
 
-check_docker
+function restart_app() {
+    echo -e "${GREEN}正在重启 ${APP_NAME}...${RESET}"
+    docker restart $APP_NAME
+    echo -e "${GREEN}重启完成${RESET}"
+}
+
+function stop_app() {
+    echo -e "${GREEN}正在停止 ${APP_NAME}...${RESET}"
+    docker stop $APP_NAME
+    echo -e "${GREEN}停止完成！${RESET}"
+}
+
+function uninstall_app() {
+    echo -e "${GREEN}正在卸载 ${APP_NAME}...${RESET}"
+    docker rm -f $APP_NAME 2>/dev/null
+    rm -rf "$INSTALL_DIR"
+    echo -e "${GREEN}已卸载 ${APP_NAME}，配置和数据已删除${RESET}"
+}
+
+function view_logs() {
+    echo -e "${GREEN}正在查看 ${APP_NAME} 日志 (Ctrl+C 退出)...${RESET}"
+    docker logs -f $APP_NAME
+}
 
 while true; do
-    show_menu
-    read choice
+    echo -e "${GREEN}=== FastSend 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1. 安装${RESET}"
+    echo -e "${GREEN}2. 更新${RESET}"
+    echo -e "${GREEN}3. 重启${RESET}"
+    echo -e "${GREEN}4. 停止${RESET}"
+    echo -e "${GREEN}5. 卸载${RESET}"
+    echo -e "${GREEN}6. 查看日志${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    read -p "请选择操作: " choice
+
     case $choice in
-        1) deploy_jellyfin ;;
-        2) start_jellyfin ;;
-        3) stop_jellyfin ;;
-        4) view_logs ;;
-        5) uninstall_all ;;
-        6) update_image ;;
-        0) echo "退出脚本"; exit 0 ;;
-        *) echo -e "${GREEN}无效选项${RESET}"; read -p "按回车返回菜单..." ;;
+        1) install_app ;;
+        2) update_app ;;
+        3) restart_app ;;
+        4) stop_app ;;
+        5) uninstall_app ;;
+        6) view_logs ;;
+        0) exit ;;
+        *) echo -e "${GREEN}无效选择${RESET}" ;;
     esac
 done
-

@@ -32,7 +32,7 @@ function menu() {
     echo -e "${GREEN}8.  创建新数据库${RESET}"
     echo -e "${GREEN}9.  创建用户并授权${RESET}"
     echo -e "${GREEN}10. 一键创建数据库+用户+授权${RESET}"
-    echo -e "${GREEN}11. 查看访问地址${RESET}"
+    echo -e "${GREEN}11. 查看数据库信息${RESET}"
     echo -e "${GREEN}12. 备份数据库${RESET}"
     echo -e "${GREEN}13. 恢复数据库${RESET}"
     echo -e "${GREEN}0.  退出${RESET}"

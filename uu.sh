@@ -1,109 +1,137 @@
 #!/bin/bash
-# ========================================
-# MoviePilot 一键管理脚本 (Docker Compose)
-# ========================================
 
 GREEN="\033[32m"
 RESET="\033[0m"
-APP_NAME="moviepilot-v2"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.env"
 
-function menu() {
+APP_NAME="upay_pro"
+APP_DIR="/opt/$APP_NAME"
+DATA_DIR="$APP_DIR/data"
+LOG_DIR="$APP_DIR/logs"
+PORT_FILE="$APP_DIR/.port"
+DEFAULT_PORT="8090"
+
+YML_FILE="$APP_DIR/upay-compose.yml"
+
+# 判断架构
+get_arch() {
+    arch=$(uname -m)
+    if [[ "$arch" == "x86_64" ]]; then
+        echo "amd64"
+    elif [[ "$arch" == "aarch64" ]]; then
+        echo "arm64"
+    else
+        echo "unknown"
+    fi
+}
+
+# 加载端口配置
+load_port() {
+    if [ -f "$PORT_FILE" ]; then
+        PORT=$(cat "$PORT_FILE")
+    else
+        read -p "请输入宿主机 HTTP 端口 [默认: $DEFAULT_PORT]: " input_port
+        PORT=${input_port:-$DEFAULT_PORT}
+        mkdir -p "$APP_DIR"
+        echo "$PORT" > "$PORT_FILE"
+    fi
+}
+
+show_menu() {
     clear
-    echo -e "${GREEN}=== MoviePilot 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
+    echo -e "${GREEN}=== Upay 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动 Upay${RESET}"
+    echo -e "${GREEN}2) 更新 Upay${RESET}"
+    echo -e "${GREEN}3) 卸载 Upay${RESET}"
     echo -e "${GREEN}4) 查看日志${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}=======================${RESET}"
+    echo -e "${GREEN}===========================${RESET}"
     read -p "请选择: " choice
     case $choice in
         1) install_app ;;
         2) update_app ;;
         3) uninstall_app ;;
-        4) view_logs ;;
-        0) exit 0 ;;
-        *) echo "无效选择"; sleep 1; menu ;;
+        4) logs_app ;;
+        0) exit ;;
+        *) echo "❌ 无效选择"; sleep 1; show_menu ;;
     esac
 }
 
-function install_app() {
-    read -p "请输入 Web 端口 [默认:3000]: " input_web
-    PORT_WEB=${input_web:-3000}
-    read -p "请输入 API 端口 [默认:3001]: " input_api
-    PORT_API=${input_api:-3001}
-    read -p "请输入超级管理员密码 [默认:admin123]: " SUPERPASS
-    SUPERPASS=${SUPERPASS:-admin123}
+install_app() {
+    load_port
+    arch=$(get_arch)
 
-    # 创建统一目录
-    mkdir -p "$APP_DIR/config" "$APP_DIR/core" "$APP_DIR/media"
+    if [[ "$arch" == "amd64" ]]; then
+        IMAGE="wangergou111/upay:latest"
+    elif [[ "$arch" == "arm64" ]]; then
+        IMAGE="wangergou111/upay:latest-arm64"
+    else
+        echo "❌ 未识别的架构，无法选择镜像！"
+        exit 1
+    fi
 
-    # 生成 docker-compose.yml
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  moviepilot:
-    image: jxxghp/moviepilot-v2:latest
-    container_name: moviepilot-v2
-    stdin_open: true
-    tty: true
-    restart: always
-    volumes:
-      - $APP_DIR/config:/config
-      - $APP_DIR/core:/moviepilot/.cache/ms-playwright
-      - $APP_DIR/media:/media
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    environment:
-      - NGINX_PORT=$PORT_WEB
-      - PORT=$PORT_API
-      - PUID=0
-      - PGID=0
-      - UMASK=000
-      - TZ=Asia/Shanghai
-      - SUPERUSER=admin
-      - SUPERUSER_PASSWORD=$SUPERPASS
-    ports:
-      - "127.0.0.1:$PORT_WEB:3000"
-      - "127.0.0.1:$PORT_API:3001"
-EOF
+    echo -e "${GREEN}🚀 正在安装并启动 $APP_NAME (镜像: $IMAGE)...${RESET}"
 
-    echo "PORT_WEB=$PORT_WEB" > "$CONFIG_FILE"
-    echo "PORT_API=$PORT_API" >> "$CONFIG_FILE"
-    echo "SUPERPASS=$SUPERPASS" >> "$CONFIG_FILE"
+    mkdir -p "$DATA_DIR" "$LOG_DIR"
 
-    cd "$APP_DIR"
-    docker compose up -d
+    docker run -d \
+      --name $APP_NAME \
+      -p 127.0.0.1:$PORT:8090 \
+      -v $LOG_DIR:/app/logs \
+      -v $DATA_DIR:/app/DBS \
+      --restart always \
+      $IMAGE
 
-    echo -e "${GREEN}✅ MoviePilot 已启动${RESET}"
-    echo -e "${GREEN}🌐 Web UI 地址: http://127.0.0.1:$PORT_WEB${RESET}"
-    read -p "按回车返回菜单..."
-    menu
+    echo -e "${GREEN}✅ $APP_NAME 已启动，访问地址: http://127.0.0.1:$PORT${RESET}"
+    echo -e "${GREEN}✅ 初始账号密码请查看日志文件: $LOG_DIR${RESET}"
+    read -p "按回车键返回菜单..."
+    show_menu
 }
 
-function update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ MoviePilot 已更新并重启完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
+update_app() {
+    load_port
+    arch=$(get_arch)
+
+    if [[ "$arch" == "amd64" ]]; then
+        IMAGE="wangergou111/upay:latest"
+    elif [[ "$arch" == "arm64" ]]; then
+        IMAGE="wangergou111/upay:latest-arm64"
+    else
+        echo "❌ 未识别的架构，无法选择镜像！"
+        exit 1
+    fi
+
+    echo -e "${GREEN}🔄 正在更新 $APP_NAME...${RESET}"
+    docker pull $IMAGE
+
+    if docker ps -a --format '{{.Names}}' | grep -q "^$APP_NAME$"; then
+        docker stop $APP_NAME && docker rm $APP_NAME
+    fi
+
+    install_app
+    echo -e "${GREEN}✅ $APP_NAME 已更新并启动${RESET}"
+    read -p "按回车键返回菜单..."
+    show_menu
 }
 
-function uninstall_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${GREEN}✅ MoviePilot 已卸载，数据已删除${RESET}"
-    read -p "按回车返回菜单..."
-    menu
+uninstall_app() {
+    read -p "⚠️ 确认要卸载 $APP_NAME 吗？（这将删除所有数据）（y/N): " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        docker stop $APP_NAME 2>/dev/null
+        docker rm $APP_NAME 2>/dev/null
+        rm -rf "$APP_DIR"
+        echo -e "${GREEN}✅ $APP_NAME 已卸载，所有数据已删除${RESET}"
+    else
+        echo "❌ 已取消"
+    fi
+    read -p "按回车键返回菜单..."
+    show_menu
 }
 
-function view_logs() {
-    docker logs -f moviepilot-v2
-    read -p "按回车返回菜单..."
-    menu
+logs_app() {
+    docker logs -f $APP_NAME
+    read -p "按回车键返回菜单..."
+    show_menu
 }
 
-menu
+# 调用主菜单
+show_menu

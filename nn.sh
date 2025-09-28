@@ -1,35 +1,23 @@
 #!/bin/bash
 # ========================================
-# Sub-Store 一键管理脚本 (Docker Compose)
+# QMediaSync 一键管理脚本 (Docker Compose)
 # ========================================
 
 GREEN="\033[32m"
 RESET="\033[0m"
-APP_NAME="sub-store"
+APP_NAME="qmediasync"
 APP_DIR="$HOME/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 CONFIG_FILE="$APP_DIR/config.env"
 
-# 获取本机IP
-function get_ip() {
-    curl -s ifconfig.me || curl -s ip.sb || echo "127.0.0.1"
-}
-
-# 生成随机路径
-function random_path() {
-    tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 20
-}
-
-# 菜单
 function menu() {
     clear
-    echo -e "${GREEN}=== Sub-Store 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== QMediaSync 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装/启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
     echo -e "${GREEN}4) 查看日志${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}===========================${RESET}"
     read -p "请选择: " choice
     case $choice in
         1) install_app ;;
@@ -41,67 +29,70 @@ function menu() {
     esac
 }
 
-# 安装/启动
 function install_app() {
-    read -p "请输入 Web 端口 [默认:3001]: " input_port
-    PORT=${input_port:-3001}
+    read -p "请输入 QMediaSync 主端口 [默认:12333]: " input_main
+    PORT=${input_main:-12333}
 
-    mkdir -p "$APP_DIR/sub-store-data"
+    # 创建统一文件夹
+    mkdir -p /vol1/1000/docker/qmediasync/config
+    mkdir -p "/vol2/1000/网盘"
 
-    BACKEND_PATH=$(random_path)
-
+    # 固定 Web 端口 8095、API 端口 8094
     cat > "$COMPOSE_FILE" <<EOF
 
 services:
-  sub-store:
-    image: xream/sub-store:latest
-    container_name: sub-store
-    restart: always
-    volumes:
-      - $APP_DIR/sub-store-data:/opt/app/data
-    environment:
-      - SUB_STORE_FRONTEND_BACKEND_PATH=$BACKEND_PATH
+  qmediasync:
+    image: qicfan/qmediasync:latest
+    container_name: qmediasync
+    restart: unless-stopped
     ports:
-      - "127.0.0.1:$PORT:3001"
+      - "127.0.0.1:$PORT:12333"
+      - "8095:8095"
+      - "8094:8094"
+    volumes:
+      - /vol1/1000/docker/qmediasync/config:/app/config
+      - /vol2/1000/网盘:/media
+    environment:
+      - TZ=Asia/Shanghai
+
+networks:
+  default:
+    name: qmediasync
 EOF
 
-    echo "PORT=$PORT" > "$CONFIG_FILE"
-    echo "SUB_STORE_FRONTEND_BACKEND_PATH=$BACKEND_PATH" >> "$CONFIG_FILE"
+    echo "PORT_MAIN=$PORT" > "$CONFIG_FILE"
 
     cd "$APP_DIR"
     docker compose up -d
 
-    echo -e "${GREEN}✅ Sub-Store 已启动${RESET}"
+    echo -e "${GREEN}✅ QMediaSync 已启动${RESET}"
     echo -e "${GREEN}🌐 Web UI 地址: http://127.0.0.1:$PORT${RESET}"
-    echo -e "${GREEN}🔑 后端路径: /$BACKEND_PATH${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/sub-store-data${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
-# 更新
 function update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Sub-Store 已更新并重启完成${RESET}"
+    echo -e "${GREEN}✅ QMediaSync 已更新并重启完成${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
-# 卸载
 function uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${GREEN}✅ Sub-Store 已卸载，数据已删除${RESET}"
+    rm -rf /vol1/1000/docker/qmediasync/config
+    rm -rf "/vol2/1000/网盘"
+    echo -e "${GREEN}✅ QMediaSync 已卸载，数据已删除${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
-# 查看日志
 function view_logs() {
-    docker logs -f sub-store
+    docker logs -f qmediasync
     read -p "按回车返回菜单..."
     menu
 }

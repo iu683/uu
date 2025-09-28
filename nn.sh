@@ -1,140 +1,188 @@
 #!/bin/bash
-# ========================================
-# Lsky-Pro 一键管理脚本 (Docker Compose)
-# ========================================
+# EmbyServer 一键部署与更新菜单脚本（绿色菜单、更新镜像重启、显示公网IP）
+# 宿主机目录: /docker/emby 映射到容器 /config
 
-GREEN="\033[32m"
-RESET="\033[0m"
-APP_NAME="lsky-pro"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.env"
+GREEN='\033[0;32m'
+RESET='\033[0m'
 
-function menu() {
-    clear
-    echo -e "${GREEN}=== Lsky-Pro 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装/启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 查看数据库信息${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}=========================${RESET}"
-    read -p "请选择: " choice
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
-        4) view_logs ;;
-        5) show_db_info ;;
-        0) exit 0 ;;
-        *) echo "无效选择"; sleep 1; menu ;;
+DEFAULT_CONTAINER_NAME="amilys_embyserver"
+DEFAULT_DATA_DIR="/opt/emby"
+DEFAULT_HTTP_PORT="8096"
+
+CONTAINER_NAME=""
+DATA_DIR=""
+HTTP_PORT=""
+IMAGE_NAME=""
+CONFIG_FILE=""
+
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${GREEN}错误: Docker 未安装，请先安装 Docker${RESET}"
+        exit 1
+    fi
+}
+
+# 检测 CPU 架构，自动选择镜像
+get_arch() {
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)   IMAGE_NAME="amilys/embyserver" ;;
+        aarch64)  IMAGE_NAME="amilys/embyserver_arm64v8" ;;
+        arm64)    IMAGE_NAME="amilys/embyserver_arm64v8" ;;
+        *)        echo -e "${GREEN}未知架构: $arch，默认使用 amd64 镜像${RESET}"
+                  IMAGE_NAME="amilys/embyserver"
+                  ;;
     esac
 }
 
-function install_app() {
-    read -p "请输入 Web 端口 [默认:7791]: " input_port
-    PORT=${input_port:-7791}
-    read -p "请输入数据库名 [默认:lskypro]: " input_db
-    MYSQL_DATABASE=${input_db:-lskypro}
-    read -p "请输入数据库用户 [默认:lskyuser]: " input_user
-    MYSQL_USER=${input_user:-lskyuser}
-    read -p "请输入数据库密码 [默认:自动生成]: " input_pass
-    MYSQL_PASSWORD=${input_pass:-$(openssl rand -hex 8)}
-    read -p "请输入 Root 密码 [默认:自动生成]: " input_root
-    MYSQL_ROOT_PASSWORD=${input_root:-$(openssl rand -hex 8)}
-
-    mkdir -p "$APP_DIR/data/html" "$APP_DIR/data/db"
-
-    # 保存配置
-    cat > "$CONFIG_FILE" <<EOF
-PORT=$PORT
-MYSQL_DATABASE=$MYSQL_DATABASE
-MYSQL_USER=$MYSQL_USER
-MYSQL_PASSWORD=$MYSQL_PASSWORD
-MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD
-EOF
-
-    # 生成 compose
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  lsky-pro:
-    image: dko0/lsky-pro:latest
-    container_name: lsky-pro
-    restart: always
-    ports:
-      - "127.0.0.1:${PORT}:80"
-    volumes:
-      - ./data/html:/var/www/html
-    environment:
-      - MYSQL_HOST=mysql
-      - MYSQL_DATABASE=\${MYSQL_DATABASE}
-      - MYSQL_USER=\${MYSQL_USER}
-      - MYSQL_PASSWORD=\${MYSQL_PASSWORD}
-    depends_on:
-      - mysql
-
-  mysql:
-    image: mysql:8.0
-    container_name: lsky-pro-db
-    restart: always
-    environment:
-      - MYSQL_DATABASE=\${MYSQL_DATABASE}
-      - MYSQL_USER=\${MYSQL_USER}
-      - MYSQL_PASSWORD=\${MYSQL_PASSWORD}
-      - MYSQL_ROOT_PASSWORD=\${MYSQL_ROOT_PASSWORD}
-    command: --default-authentication-plugin=mysql_native_password
-    volumes:
-      - ./data/db:/var/lib/mysql
-EOF
-
-    cd "$APP_DIR"
-    docker compose up -d
-
-    echo -e "${GREEN}✅ Lsky-Pro 已启动${RESET}"
-    echo -e "${GREEN}🌐 访问地址: http://127.0.0.1:$PORT${RESET}"
-    show_db_info
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ Lsky-Pro 已更新${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function uninstall_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${GREEN}✅ Lsky-Pro 已卸载并清理数据${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function view_logs() {
-    docker logs -f lsky-pro
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function show_db_info() {
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo "未找到配置文件，请先安装"
-        sleep 1
-        menu
+get_public_ip() {
+    PUBLIC_IP=$(curl -s https://ipinfo.io/ip)
+    if ! [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        PUBLIC_IP=$(curl -s https://ifconfig.me/ip)
     fi
-    source "$CONFIG_FILE"
-    echo -e "${GREEN}📂 数据库信息:${RESET}"
-    echo -e "数据库名: ${MYSQL_DATABASE}"
-    echo -e "用户名:   ${MYSQL_USER}"
-    echo -e "密码:     ${MYSQL_PASSWORD}"
-    echo -e "Root 密码:${MYSQL_ROOT_PASSWORD}"
-    echo -e "访问方式: mysql -u${MYSQL_USER} -p${MYSQL_PASSWORD} -h 127.0.0.1 -P3306 ${MYSQL_DATABASE}"
+    if ! [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        PUBLIC_IP=""
+    fi
+    echo "$PUBLIC_IP"
 }
 
-menu
+load_or_input_config() {
+    # 如果存在旧的 home 目录配置文件，也兼容一次读取
+    if [ -z "$CONFIG_FILE" ] && [ -f "$HOME/.emby_config" ]; then
+        source "$HOME/.emby_config"
+    fi
+
+    read -p "请输入容器名 [${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}]: " input_container
+    CONTAINER_NAME=${input_container:-${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}}
+
+    read -p "请输入存放配置目录（宿主机） [${DATA_DIR:-$DEFAULT_DATA_DIR}]: " input_dir
+    DATA_DIR=${input_dir:-${DATA_DIR:-$DEFAULT_DATA_DIR}}
+
+    read -p "请输入宿主机 HTTP 映射端口 [${HTTP_PORT:-$DEFAULT_HTTP_PORT}]: " input_port
+    HTTP_PORT=${input_port:-${HTTP_PORT:-$DEFAULT_HTTP_PORT}}
+
+    # 配置文件路径: /docker/emby/emby_config
+    CONFIG_FILE="$DATA_DIR/emby_config"
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+
+    # 保存当前配置
+    {
+        echo "CONTAINER_NAME=\"$CONTAINER_NAME\""
+        echo "DATA_DIR=\"$DATA_DIR\""
+        echo "HTTP_PORT=\"$HTTP_PORT\""
+    } > "$CONFIG_FILE"
+}
+
+create_dirs() {
+    [ ! -d "$DATA_DIR" ] && mkdir -p "$DATA_DIR"
+}
+
+deploy_emby() {
+    load_or_input_config
+    create_dirs
+    get_arch
+    echo -e "${GREEN}正在部署 EmbyServer 容器（镜像: $IMAGE_NAME）...${RESET}"
+    docker run -d \
+        --name $CONTAINER_NAME \
+        --network bridge \
+        -e UID=0 \
+        -e GID=0 \
+        -e GIDLIST=0 \
+        -e TZ=Asia/Shanghai \
+        -v $DATA_DIR:/config \
+        -p 127.0.0.1:$HTTP_PORT:8096 \
+        --restart unless-stopped \
+        $IMAGE_NAME
+
+    PUBLIC_IP=$(get_public_ip)
+    if [ -n "$PUBLIC_IP" ]; then
+        echo -e "${GREEN}部署完成 访问地址: http://127.0.0.1:${HTTP_PORT}${RESET}"
+    else
+        echo -e "${GREEN}部署完成 访问地址: http://127.0.0.1:${HTTP_PORT}${RESET}"
+    fi
+}
+
+start_emby() { docker start $CONTAINER_NAME && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_emby() { docker stop $CONTAINER_NAME && echo -e "${GREEN}容器已停止${RESET}"; }
+remove_emby() { docker rm -f $CONTAINER_NAME && echo -e "${GREEN}容器已删除${RESET}"; }
+view_logs() { docker logs -f $CONTAINER_NAME; }
+
+uninstall_all() {
+    stop_emby
+    remove_emby
+    if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
+        echo -e "${GREEN}正在删除配置目录: $DATA_DIR ...${RESET}"
+        rm -rf "$DATA_DIR"
+        echo -e "${GREEN}全部数据已卸载完成${RESET}"
+    fi
+    echo -e "${GREEN}配置文件已删除（位于 $CONFIG_FILE）${RESET}"
+}
+
+update_image() {
+    load_or_input_config
+    get_arch
+
+    echo -e "${GREEN}正在拉取最新镜像: $IMAGE_NAME ...${RESET}"
+    docker pull $IMAGE_NAME
+
+    if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
+        echo -e "${GREEN}停止正在运行的容器...${RESET}"
+        docker stop $CONTAINER_NAME
+    fi
+
+    if [ "$(docker ps -a -q -f name=$CONTAINER_NAME)" ]; then
+        echo -e "${GREEN}删除旧容器（保留数据）...${RESET}"
+        docker rm $CONTAINER_NAME
+    fi
+
+    echo -e "${GREEN}使用最新镜像重启容器...${RESET}"
+    docker run -d \
+        --name $CONTAINER_NAME \
+        --network bridge \
+        -e UID=0 \
+        -e GID=0 \
+        -e GIDLIST=0 \
+        -e TZ=Asia/Shanghai \
+        -v $DATA_DIR:/config \
+        -p 127.0.0.1:$HTTP_PORT:8096 \
+        --restart unless-stopped \
+        $IMAGE_NAME
+
+    PUBLIC_IP=$(get_public_ip)
+    if [ -n "$PUBLIC_IP" ]; then
+        echo -e "${GREEN}更新完成${RESET}"
+    else
+        echo -e "${GREEN}更新完成${RESET}"
+    fi
+}
+
+show_menu() {
+    echo -e "${GREEN}===== EmbyServer 一键部署与更新菜单 =====${RESET}"
+    echo -e "${GREEN}1.部署 EmbyServer${RESET}"
+    echo -e "${GREEN}2.启动容器${RESET}"
+    echo -e "${GREEN}3.停止容器${RESET}"
+    echo -e "${GREEN}4.删除容器${RESET}"
+    echo -e "${GREEN}5.查看日志${RESET}"
+    echo -e "${GREEN}6.卸载全部数据${RESET}"
+    echo -e "${GREEN}7.更新${RESET}"
+    echo -e "${GREEN}0.退出${RESET}"
+    echo -n "请输入编号: "
+}
+
+check_docker
+
+while true; do
+    show_menu
+    read choice
+    case $choice in
+        1) deploy_emby ;;
+        2) start_emby ;;
+        3) stop_emby ;;
+        4) remove_emby ;;
+        5) view_logs ;;
+        6) uninstall_all ;;
+        7) update_image ;;
+        0) echo "退出脚本"; exit 0 ;;
+        *) echo -e "${GREEN}无效选项${RESET}" ;;
+    esac
+done

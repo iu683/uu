@@ -1,23 +1,23 @@
 #!/bin/bash
 # ========================================
-# Vaultwarden 一键管理脚本 (Docker Compose)
+# Sehuatang-Crawler 一键管理脚本 (Docker Compose)
 # ========================================
 
 GREEN="\033[32m"
 RESET="\033[0m"
-APP_NAME="vaultwarden"
+APP_NAME="magnetboard"
 APP_DIR="$HOME/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 CONFIG_FILE="$APP_DIR/config.env"
 
 function get_ip() {
-    curl -s ifconfig.me || curl -s ip.sb || echo "127.0.0.1"
+    echo "127.0.0.1"
 }
 
 function menu() {
     clear
-    echo -e "${GREEN}=== Vaultwarden 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装/启动${RESET}"
+    echo -e "${GREEN}=== magnetboard 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
     echo -e "${GREEN}4) 查看日志${RESET}"
@@ -35,46 +35,70 @@ function menu() {
 }
 
 function install_app() {
-    read -p "请输入 Web 端口 [默认:11001]: " input_port
-    PORT=${input_port:-11001}
+    read -p "请输入 Web 端口 [默认:8000]: " input_port
+    WEB_PORT=${input_port:-8000}
 
-    read -p "请输入域名（反向代理用，可留空）: " DOMAIN
-    read -p "允许注册新用户? (true/false) [默认:true]: " SIGNUPS_ALLOWED_INPUT
-    SIGNUPS_ALLOWED=${SIGNUPS_ALLOWED_INPUT:-true}
+    read -p "请输入管理员密码 [默认:admin123]: " input_pass
+    ADMIN_PASSWORD=${input_pass:-admin123}
 
-    # 创建统一数据目录
-    mkdir -p "$APP_DIR/vw-data"
+    mkdir -p "$APP_DIR"
 
-    # 生成 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
+
 services:
-  vaultwarden:
-    image: vaultwarden/server:latest
-    container_name: vaultwarden
-    restart: always
-    environment:
-      DOMAIN: "$DOMAIN"
-      SIGNUPS_ALLOWED: "$SIGNUPS_ALLOWED"
-    volumes:
-      - $APP_DIR/vw-data:/data
+  sehuatang-crawler:
+    image: wyh3210277395/magnetboard:latest
+    container_name: magnetboard
     ports:
-      - "$PORT:80"
+      - "127.0.0.1:${WEB_PORT}:8000"
+    environment:
+      - DATABASE_HOST=postgres
+      - DATABASE_PORT=5432
+      - DATABASE_NAME=sehuatang_db
+      - DATABASE_USER=postgres
+      - DATABASE_PASSWORD=postgres123
+      - PYTHONPATH=/app/backend
+      - ENVIRONMENT=production
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+    volumes:
+      - sehuatang_data:/app/data
+      - sehuatang_logs:/app/logs
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: sehuatang-postgres
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      - POSTGRES_DB=sehuatang_db
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres123
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  sehuatang_data:
+  sehuatang_logs:
+  postgres_data:
+
+networks:
+  default:
+    name: sehuatang-network
 EOF
 
-    # 保存配置
-    cat > "$CONFIG_FILE" <<EOF
-PORT=$PORT
-DOMAIN=$DOMAIN
-SIGNUPS_ALLOWED=$SIGNUPS_ALLOWED
-EOF
+    echo "WEB_PORT=$WEB_PORT" > "$CONFIG_FILE"
+    echo "ADMIN_PASSWORD=$ADMIN_PASSWORD" >> "$CONFIG_FILE"
 
     cd "$APP_DIR"
     docker compose up -d
 
-    echo -e "${GREEN}✅ Vaultwarden 已启动${RESET}"
-    echo -e "${GREEN}🌐 Web UI 地址: http://127.0.0.1:$PORT${RESET}"
-    [ -n "$DOMAIN" ] && echo -e "${GREEN}🔗 域名: $DOMAIN${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/vw-data${RESET}"
+    echo -e "${GREEN}✅ Sehuatang-Crawler 已启动${RESET}"
+    echo -e "${GREEN}🌐 Web UI 地址: http://127.0.0.1:$WEB_PORT${RESET}"
+    echo -e "${GREEN}📂 数据卷: $APP_DIR${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
@@ -83,7 +107,7 @@ function update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Vaultwarden 已更新并重启完成${RESET}"
+    echo -e "${GREEN}✅ Sehuatang-Crawler 已更新并重启完成${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
@@ -92,13 +116,13 @@ function uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${GREEN}✅ Vaultwarden 已卸载，数据已删除${RESET}"
+    echo -e "${GREEN}✅ Sehuatang-Crawler 已卸载，数据已删除${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 function view_logs() {
-    docker logs -f vaultwarden
+    docker logs -f sehuatang-crawler
     read -p "按回车返回菜单..."
     menu
 }

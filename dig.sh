@@ -1,23 +1,24 @@
 #!/bin/bash
 # ========================================
-# MoviePilot 一键管理脚本 (Docker Compose)
+# MoonTV 一键管理脚本 (Docker Compose)
 # ========================================
 
 GREEN="\033[32m"
 RESET="\033[0m"
-APP_NAME="moviepilot"
-APP_DIR="/opt/$APP_NAME"
+APP_NAME="moontv"
+APP_DIR="$HOME/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 CONFIG_FILE="$APP_DIR/config.env"
 
-function get_ip() {
+# 获取公网IP
+get_ip() {
     curl -s ifconfig.me || curl -s ip.sb || echo "127.0.0.1"
 }
 
-function menu() {
+menu() {
     clear
-    echo -e "${GREEN}=== MoviePilot 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}=== MoonTV 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装/启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
     echo -e "${GREEN}4) 查看日志${RESET}"
@@ -34,182 +35,88 @@ function menu() {
     esac
 }
 
-function install_app() {
-    read -p "请输入 Nginx Web端口 [默认:3000]: " input_web
-    PORT_WEB=${input_web:-3000}
-    read -p "请输入 API端口 [默认:3001]: " input_api
-    PORT_API=${input_api:-3001}
+install_app() {
+    read -p "请输入 Web 端口 [默认:3000]: " input_port
+    PORT_WEB=${input_port:-3000}
 
-    read -p "请输入管理员账号 [默认:admin]: " ADMIN
-    ADMIN=${ADMIN:-admin}
-    read -p "请输入管理员密码 [默认:admin123]: " ADMIN_PWD
-    ADMIN_PWD=${ADMIN_PWD:-admin123}
+    read -p "请输入管理员用户名 [默认:admin]: " input_user
+    ADMIN_USER=${input_user:-admin}
 
-    # 创建统一目录
-    mkdir -p "$APP_DIR"/{media,config,core,torrents,bt_backup,redis,postgresql/data}
+    read -p "请输入管理员密码 [默认:admin123]: " input_pass
+    ADMIN_PASS=${input_pass:-admin123}
 
-    # 设置 PostgreSQL 数据目录权限
-    chown -R 999:999 "$APP_DIR/postgresql/data"
-    chmod 700 "$APP_DIR/postgresql/data"
+    # 创建统一文件夹
+    mkdir -p "$APP_DIR/config" "$APP_DIR/data"
 
     # 生成 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
+
 services:
-  redis:
-    image: redis:latest
-    container_name: redis
-    restart: always
-    volumes:
-      - $APP_DIR/redis/data:/data
-    command: redis-server --save 600 1 --requirepass redis_password
-    healthcheck:
-      test: ["CMD", "redis-cli", "-a", "redis_password", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 5s
-
-  postgresql:
-    image: postgres:latest
-    container_name: postgresql
-    restart: always
-    environment:
-      POSTGRES_DB: moviepilot
-      POSTGRES_USER: moviepilot
-      POSTGRES_PASSWORD: pg_password
-    volumes:
-      - $APP_DIR/postgresql/data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U moviepilot -d moviepilot"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 5s
-
-  pgloader:
-    image: dimitri/pgloader:latest
-    container_name: pgloader
-    restart: "no"
-    volumes:
-      - $APP_DIR/config:/mp_config
-    command: >
-      pgloader
-      sqlite:///mp_config/user.db
-      postgresql://moviepilot:pg_password@postgresql:5432/moviepilot
-    depends_on:
-      postgresql:
-        condition: service_healthy
-
-  moviepilot:
-    image: jxxghp/moviepilot-v2:latest
-    container_name: moviepilot-v2
-    hostname: moviepilot-v2
-    stdin_open: true
-    tty: true
-    restart: always
+  moontv-core:
+    image: ghcr.io/moontechlab/lunatv:latest
+    container_name: moontv-core
+    restart: on-failure
     ports:
-      - "127.0.0.1:$PORT_WEB:3000"
-      - "127.0.0.1:$PORT_API:3001"
-    volumes:
-      - $APP_DIR/media:/media
-      - $APP_DIR/config:/config
-      - $APP_DIR/core:/moviepilot/.cache/ms-playwright
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - $APP_DIR/torrents:/torrents
-      - $APP_DIR/bt_backup:/BT_backup
+      - "127.0.0.1:${PORT_WEB}:3000"
     environment:
-      - NGINX_PORT=$PORT_WEB
-      - PORT=$PORT_API
-      - PUID=0
-      - PGID=0
-      - UMASK=000
-      - TZ=Asia/Shanghai
-      - SUPERUSER=$ADMIN
-      - SUPERUSER_PASSWORD=$ADMIN_PWD
-      - DB_TYPE=postgresql
-      - DB_POSTGRESQL_HOST=postgresql
-      - DB_POSTGRESQL_PORT=5432
-      - DB_POSTGRESQL_DATABASE=moviepilot
-      - DB_POSTGRESQL_USERNAME=moviepilot
-      - DB_POSTGRESQL_PASSWORD=pg_password
-      - CACHE_BACKEND_TYPE=redis
-      - CACHE_BACKEND_URL=redis://:redis_password@redis:6379
+      - USERNAME=${ADMIN_USER}
+      - PASSWORD=${ADMIN_PASS}
+      - NEXT_PUBLIC_STORAGE_TYPE=redis
+      - REDIS_URL=redis://moontv-redis:6379
+    volumes:
+      - $APP_DIR/config:/config
+    networks:
+      - moontv-network
     depends_on:
-      postgresql:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      pgloader:
-        condition: service_completed_successfully
+      - moontv-redis
+
+  moontv-redis:
+    image: redis:alpine
+    container_name: moontv-redis
+    restart: unless-stopped
+    volumes:
+      - $APP_DIR/data:/data
+    networks:
+      - moontv-network
 
 networks:
-  default:
-    name: moviepilot-network
+  moontv-network:
+    driver: bridge
 EOF
 
-    # 保存配置
-    echo "PORT_WEB=$PORT_WEB" > "$CONFIG_FILE"
-    echo "PORT_API=$PORT_API" >> "$CONFIG_FILE"
-    echo "SUPERUSER=$ADMIN" >> "$CONFIG_FILE"
-    echo "SUPERUSER_PASSWORD=$ADMIN_PWD" >> "$CONFIG_FILE"
+    echo -e "PORT_WEB=$PORT_WEB\nADMIN_USER=$ADMIN_USER\nADMIN_PASS=$ADMIN_PASS" > "$CONFIG_FILE"
 
     cd "$APP_DIR"
     docker compose up -d
 
-    echo -e "${GREEN}⏳ 等待 PostgreSQL 容器启动完成...${RESET}"
-    # 等待 PostgreSQL 健康
-    until docker exec postgresql pg_isready -U moviepilot -d moviepilot >/dev/null 2>&1; do
-        sleep 2
-    done
-
-    echo -e "${GREEN}✅ PostgreSQL 已启动，开始初始化数据库...${RESET}"
-    # 初始化数据库：创建管理员用户
-    docker exec -i postgresql psql -U moviepilot -d moviepilot <<SQL
--- 如果表不存在就创建
-CREATE TABLE IF NOT EXISTS admin_users (
-    id SERIAL PRIMARY KEY,
-    username VARCHAR(50) UNIQUE NOT NULL,
-    password VARCHAR(255) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- 插入管理员账号，如果已存在则更新密码
-INSERT INTO admin_users (username, password)
-VALUES ('$ADMIN', '$ADMIN_PWD')
-ON CONFLICT (username) DO UPDATE SET password = EXCLUDED.password;
-SQL
-
-    echo -e "${GREEN}✅ 数据库初始化完成${RESET}"
-    echo -e "${GREEN}✅ MoviePilot 已启动${RESET}"
-    echo -e "${GREEN}🌐 Web UI: http://127.0.0.1:$PORT_WEB${RESET}"
+    echo -e "${GREEN}✅ MoonTV 已启动${RESET}"
+    echo -e "${GREEN}🌐 Web UI 地址: http://127.0.0.1:$PORT_WEB${RESET}"
     echo -e "${GREEN}📂 配置目录: $APP_DIR/config${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
-
-
-
-function update_app() {
+update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ MoviePilot 已更新并重启完成${RESET}"
+    echo -e "${GREEN}✅ MoonTV 已更新并重启完成${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
-function uninstall_app() {
+uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${GREEN}✅ MoviePilot 已卸载，数据已删除${RESET}"
+    echo -e "${GREEN}✅ MoonTV 已卸载，数据已删除${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
-function view_logs() {
-    docker logs -f moviepilot-v2
+view_logs() {
+    docker logs -f moontv-core
     read -p "按回车返回菜单..."
     menu
 }

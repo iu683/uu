@@ -1,156 +1,90 @@
 #!/bin/bash
-# ================== 一键部署/管理异次元发卡（无数据库版） ==================
-# 功能：Docker 部署 ACGFaka，带 Redis、OPcache 加速
-# ================== 颜色 ==================
+# ========================================
+# sub-web-modify 一键管理脚本
+# ========================================
+
 GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
 RESET="\033[0m"
+APP_NAME="sub-web-modify"
+COMPOSE_DIR="$HOME/sub-web-modify"
+COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yml"
+DEFAULT_PORT=8090
 
-# ================== 检查 root ==================
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}请以 root 用户运行此脚本！${RESET}"
-    exit 1
-fi
-
-# ================== 检查 Docker ==================
-if ! command -v docker >/dev/null 2>&1; then
-    echo -e "${YELLOW}Docker 未安装，正在安装...${RESET}"
-    curl -fsSL https://get.docker.com | bash
-    systemctl enable docker
-    systemctl start docker
-fi
-
-if ! command -v docker-compose >/dev/null 2>&1; then
-    echo -e "${YELLOW}docker-compose 未安装，正在安装...${RESET}"
-    apt update -y
-    apt install -y docker-compose
-fi
-
-# ================== 配置路径 ==================
-INSTALL_DIR=~/acgfaka
-mkdir -p $INSTALL_DIR/acgfaka
-
-# ================== 状态检测函数 ==================
-check_status() {
-    cd $INSTALL_DIR
-    echo -e "${GREEN}===== 当前服务状态 =====${RESET}"
-    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-
-    # 检测 Redis
-    if docker exec -it acgfaka php -r "echo extension_loaded('redis') ? '已启用' : '未启用';" &>/dev/null; then
-        REDIS_STATUS="已启用"
-    else
-        REDIS_STATUS="未启用"
-    fi
-
-    # 检测 OPcache
-    if docker exec -it acgfaka php -r "echo ini_get('opcache.enable') ? '已启用' : '未启用';" &>/dev/null; then
-        OPCACHE_STATUS="已启用"
-    else
-        OPCACHE_STATUS="未启用"
-    fi
-
-    echo -e "${GREEN}Redis 扩展: ${REDIS_STATUS}${RESET}"
-    echo -e "${GREEN}OPcache 扩展: ${OPCACHE_STATUS}${RESET}"
-    echo -e "${GREEN}=======================${RESET}"
+function get_ip() {
+    curl -s ifconfig.me || curl -s ip.sb || echo "your-ip"
 }
 
-# ================== 菜单函数 ==================
-show_menu() {
-    while true; do
-        echo -e "${GREEN}===== 异次元发卡 Docker 管理菜单（无数据库版） =====${RESET}"
-        echo -e "${GREEN}1. 安装/启动服务${RESET}"
-        echo -e "${GREEN}2. 停止服务${RESET}"
-        echo -e "${GREEN}3. 重启服务${RESET}"
-        echo -e "${GREEN}4. 查看日志${RESET}"
-        echo -e "${GREEN}5. 更新服务${RESET}"
-        echo -e "${GREEN}6. 卸载服务${RESET}"
-        echo -e "${GREEN}7. 查看状态（含 Redis/OPcache 信息）${RESET}"
-        echo -e "${GREEN}8. 退出${RESET}"
-        read -p "请选择操作: " choice
-        case $choice in
-            1)
-                # ===== 输入配置（只在安装时执行） =====
-                read -p "请输入网站端口（默认 9000）: " WEB_PORT
-                WEB_PORT=${WEB_PORT:-9000}
+function menu() {
+    clear
+    echo -e "${GREEN}=== sub-web-modify 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装/启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    echo -e "${GREEN}=======================${RESET}"
+    read -p "请选择: " choice
+    case $choice in
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) view_logs ;;
+        0) exit 0 ;;
+        *) echo "无效选择"; sleep 1; menu ;;
+    esac
+}
 
-                # ===== 生成 docker-compose.yaml =====
-                cat > $INSTALL_DIR/docker-compose.yaml <<EOF
+function install_app() {
+    read -p "请输入 Web 端口 [默认:${DEFAULT_PORT}]: " input_port
+    PORT=${input_port:-$DEFAULT_PORT}
+
+    mkdir -p "$COMPOSE_DIR/data"
+
+    cat > "$COMPOSE_FILE" <<EOF
+
 services:
-  acgfaka:
-    image: dapiaoliang666/acgfaka
+  sub-web-modify:
+    image: youshandefeiyang/sub-web-modify:latest
+    container_name: sub-web-modify
+    restart: unless-stopped
     ports:
-      - "127.0.0.1:$WEB_PORT:80"
-    depends_on:
-      - redis
-    restart: always
-    environment:
-      PHP_OPCACHE_ENABLE: 1
-      PHP_OPCACHE_MEMORY_CONSUMPTION: 128
-      PHP_OPCACHE_MAX_ACCELERATED_FILES: 10000
-      PHP_OPCACHE_REVALIDATE_FREQ: 2
-      PHP_REDIS_HOST: redis
-      PHP_REDIS_PORT: 6379
+      - "127.0.0.1:$PORT:80"
     volumes:
-      - ./acgfaka:/var/www/html
-
-  redis:
-    image: redis:latest
-    restart: always
+      - ${COMPOSE_DIR}/data:/app/data
 EOF
 
-                cd $INSTALL_DIR
-                docker compose up -d
-                echo -e "${GREEN}网站访问地址: http://127.0.0.1:$WEB_PORT${RESET}"
-                echo -e "${GREEN}后台路径: http://127.0.0.1:$WEB_PORT/admin${RESET}"
-                read -p "回车返回菜单..."
-                ;;
-            2)
-                cd $INSTALL_DIR
-                docker compose stop
-                read -p "回车返回菜单..."
-                ;;
-            3)
-                cd $INSTALL_DIR
-                docker compose restart
-                read -p "回车返回菜单..."
-                ;;
-            4)
-                cd $INSTALL_DIR
-                docker compose logs -f
-                read -p "回车返回菜单..."
-                ;;
-            5)
-                cd $INSTALL_DIR
-                docker compose pull
-                docker compose up -d
-                echo -e "${GREEN}已更新到最新镜像并重启服务${RESET}"
-                read -p "回车返回菜单..."
-                ;;
-            6)
-                read -p "确认卸载？此操作将删除容器和数据！(y/n): " yn
-                if [[ $yn == "y" || $yn == "Y" ]]; then
-                    cd $INSTALL_DIR
-                    docker compose down -v
-                    rm -rf $INSTALL_DIR
-                    echo -e "${GREEN}已完全卸载！${RESET}"
-                    exit
-                fi
-                ;;
-            7)
-                check_status
-                read -p "回车返回菜单..."
-                ;;
-            8)
-                exit
-                ;;
-            *)
-                echo -e "${RED}无效选项！${RESET}"
-                ;;
-        esac
-    done
+    cd "$COMPOSE_DIR"
+    docker compose up -d
+
+    echo -e "${GREEN}✅ ${APP_NAME} 已启动${RESET}"
+    echo -e "${GREEN}🌐 Web UI 地址: http://127.0.0.1:$PORT${RESET}"
+    echo -e "${GREEN}📂 数据目录: $COMPOSE_DIR/data${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
-# ================== 执行菜单 ==================
-show_menu
+function update_app() {
+    cd "$COMPOSE_DIR" || exit
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ ${APP_NAME} 已更新并重启完成${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function uninstall_app() {
+    cd "$COMPOSE_DIR" || exit
+    docker compose down -v
+    rm -rf "$COMPOSE_DIR"
+    echo -e "${GREEN}✅ ${APP_NAME} 已卸载，数据已删除${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function view_logs() {
+    docker logs -f sub-web-modify
+    read -p "按回车返回菜单..."
+    menu
+}
+
+menu

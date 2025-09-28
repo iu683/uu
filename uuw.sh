@@ -1,102 +1,132 @@
 #!/bin/bash
-# ========================================
-# Vaultwarden 一键管理脚本（可自定义域名和注册选项）
-# ========================================
+# Send 管理脚本 (绿色菜单版，含Redis，自定义文件大小)
 
-GREEN="\033[32m"
-RESET="\033[0m"
-APP_NAME="vaultwarden"
-APP_DIR="$HOME/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.env"
+SERVICE_NAME="send"
+INSTALL_DIR="/root/$SERVICE_NAME"
+COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
 
-function get_ip() {
-    curl -s ifconfig.me || curl -s ip.sb || echo "127.0.0.1"
-}
+# 颜色
+GREEN="\e[32m"
+RESET="\e[0m"
 
-function menu() {
-    clear
-    echo -e "${GREEN}=== Vaultwarden 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装/启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}=======================${RESET}"
-    read -p "请选择: " choice
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
-        4) view_logs ;;
-        0) exit 0 ;;
-        *) echo "无效选择"; sleep 1; menu ;;
-    esac
-}
+install() {
+    echo -e "${GREEN}>>> 开始安装 Send 服务...${RESET}"
 
-function install_app() {
-    read -p "请输入 Web 端口 [默认:11001]: " input_port
-    PORT=${input_port:-11001}
+    read -p "请输入映射端口 (默认 1443): " PORT
+    PORT=${PORT:-1443}
 
-    read -p "请输入 Vaultwarden 域名（可留空）: " DOMAIN
-    read -p "是否允许注册新账户？(true/false) [默认:true]: " SIGNUPS_ALLOWED
-    SIGNUPS_ALLOWED=${SIGNUPS_ALLOWED:-true}
+    read -p "请输入域名 (如 https://send.example.com): " DOMAIN
 
-    # 创建数据目录
-    mkdir -p "$APP_DIR/vw-data"
+    read -p "请输入最大文件大小(单位GB, 默认4): " MAX_GB
+    MAX_GB=${MAX_GB:-4}
+    MAX_FILE_SIZE=$((MAX_GB * 1024 * 1024 * 1024))   # 转换为字节
 
-    # 生成 docker-compose.yml
-    cat > "$COMPOSE_FILE" <<EOF
+    mkdir -p "$INSTALL_DIR/uploads"
+
+    cat > $COMPOSE_FILE <<EOF
+
+
 services:
-  vaultwarden:
-    image: vaultwarden/server:latest
-    container_name: vaultwarden
-    restart: always
-    environment:
-      DOMAIN: "${DOMAIN}"
-      SIGNUPS_ALLOWED: "${SIGNUPS_ALLOWED}"
-    volumes:
-      - $APP_DIR/vw-data:/data
+  send:
+    image: registry.gitlab.com/timvisee/send:latest
+    container_name: $SERVICE_NAME
+    depends_on:
+      - redis
     ports:
-      - "$PORT:80"
+      - "127.0.0.1:$PORT:1443"
+    environment:
+      - NODE_ENV=production
+      - PORT=1443
+      - BASE_URL=$DOMAIN
+      - MAX_FILE_SIZE=$MAX_FILE_SIZE
+      - REDIS_ENABLED=true
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./uploads:/uploads
+    restart: unless-stopped
+
+  redis:
+    image: redis:latest
+    container_name: ${SERVICE_NAME}_redis
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  redis_data:
 EOF
 
-    echo -e "PORT=$PORT\nDOMAIN=$DOMAIN\nSIGNUPS_ALLOWED=$SIGNUPS_ALLOWED" > "$CONFIG_FILE"
-
-    cd "$APP_DIR"
+    cd "$INSTALL_DIR"
     docker compose up -d
+    echo -e "${GREEN}>>> Send 服务已安装并运行在: $DOMAIN${RESET}"
+    echo -e "${GREEN}>>> 最大上传文件大小: ${MAX_GB}GB (${MAX_FILE_SIZE} 字节)${RESET}"
 
-    echo -e "${GREEN}✅ Vaultwarden 已启动${RESET}"
-    echo -e "${GREEN}🌐 Web UI 地址: http://127.0.0.1:$PORT${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/vw-data${RESET}"
-    echo -e "${GREEN}🛡 注册允许: $SIGNUPS_ALLOWED${RESET}"
-    [ -n "$DOMAIN" ] && echo -e "${GREEN}🌍 域名: $DOMAIN${RESET}"
+    read -p "按回车返回菜单..."  
+    menu
+}
+
+start() {
+    cd "$INSTALL_DIR" && docker compose up -d
+    echo -e "${GREEN}>>> Send 服务已启动${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
-function update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
+stop() {
+    cd "$INSTALL_DIR" && docker compose down
+    echo -e "${GREEN}>>> Send 服务已停止${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+restart() {
+    stop
+    start
+}
+
+update() {
+    cd "$INSTALL_DIR"
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Vaultwarden 已更新并重启完成${RESET}"
+    echo -e "${GREEN}>>> Send 服务已更新${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
-function uninstall_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${GREEN}✅ Vaultwarden 已卸载，数据已删除${RESET}"
+uninstall() {
+    stop
+    rm -rf "$INSTALL_DIR"
+    echo -e "${GREEN}>>> Send 服务已卸载${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
-function view_logs() {
-    docker logs -f vaultwarden
-    read -p "按回车返回菜单..."
-    menu
+menu() {
+    clear
+    echo -e "${GREEN}======================${RESET}"
+    echo -e "${GREEN} Send 管理菜单         ${RESET}"
+    echo -e "${GREEN}======================${RESET}"
+    echo -e "${GREEN}1. 安装${RESET}"
+    echo -e "${GREEN}2. 启动${RESET}"
+    echo -e "${GREEN}3. 停止${RESET}"
+    echo -e "${GREEN}4. 重启${RESET}"
+    echo -e "${GREEN}5. 更新${RESET}"
+    echo -e "${GREEN}6. 卸载${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}======================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read CHOICE
+    case $CHOICE in
+        1) install ;;
+        2) start ;;
+        3) stop ;;
+        4) restart ;;
+        5) update ;;
+        6) uninstall ;;
+        0) exit 0 ;;
+        *) echo -e "${GREEN}无效选项${RESET}" ; sleep 1 ; menu ;;
+    esac
 }
 
 menu

@@ -1,173 +1,115 @@
 #!/bin/bash
-set -e
+# =========================================
+# DNSMgr Docker 管理脚本 (无数据库版, /opt 统一目录)
+# =========================================
 
 GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
-BASE_DIR="/opt/newapi"
-DATA_DIR="$BASE_DIR/data"
-LOG_DIR="$BASE_DIR/logs"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$DATA_DIR/.env"
 
-MYSQL_CONTAINER="newapi-mysql"
-MYSQL_ROOT_PASSWORD="123456"
-MYSQL_DB="newapi"
-MYSQL_USER="newapi"
-MYSQL_PASSWORD="newapi123"
+APP_DIR="/opt/dnsmgr"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+WEB_DIR="$APP_DIR/web"
+NETWORK_NAME="dnsmgr-net"
 
-DEFAULT_PORT=3000
-API_PORT=$DEFAULT_PORT
-
-mkdir -p "$DATA_DIR" "$LOG_DIR"
-
-generate_env() {
-    echo -e "${GREEN}生成 .env 文件...${RESET}"
-    cat > "$ENV_FILE" <<EOF
-SQL_DSN=$MYSQL_USER:$MYSQL_PASSWORD@tcp(mysql:3306)/$MYSQL_DB
-REDIS_CONN_STRING=redis://redis
-TZ=Asia/Shanghai
-EOF
-}
-
-generate_compose() {
-    echo -e "${GREEN}生成 docker-compose.yml 文件...${RESET}"
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  new-api:
-    image: calciumion/new-api:latest
-    container_name: new-api
-    restart: always
-    command: --log-dir /app/logs
-    ports:
-      - "127.0.0.1:$API_PORT:3000"
-    volumes:
-      - ./data:/data
-      - ./logs:/app/logs
-    env_file:
-      - ./data/.env
-    depends_on:
-      - redis
-      - mysql
-
-  redis:
-    image: redis:latest
-    container_name: redis
-    restart: always
-
-  mysql:
-    image: mysql:8
-    container_name: mysql
-    restart: always
-    environment:
-      MYSQL_ROOT_PASSWORD: $MYSQL_ROOT_PASSWORD
-      MYSQL_DATABASE: $MYSQL_DB
-    volumes:
-      - mysql_data:/var/lib/mysql
-
-volumes:
-  mysql_data:
-EOF
-}
+mkdir -p "$WEB_DIR"
 
 check_port() {
-    if lsof -i:"$API_PORT" &>/dev/null; then
-        echo -e "${GREEN}端口 $API_PORT 已被占用，请选择其他端口${RESET}"
+    local port=$1
+    if lsof -i:"$port" &>/dev/null; then
         return 1
+    else
+        return 0
     fi
-    return 0
 }
 
-init_database() {
-    echo -e "${GREEN}等待 MySQL 启动...${RESET}"
-    docker-compose -f "$COMPOSE_FILE" up -d mysql
-    echo -e "${GREEN}初始化数据库...${RESET}"
-    # 等待数据库就绪
-    while ! docker exec -i mysql mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent; do
-        sleep 2
-    done
-    docker exec -i mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" <<EOF
-CREATE DATABASE IF NOT EXISTS $MYSQL_DB;
-CREATE USER IF NOT EXISTS '$MYSQL_USER'@'%' IDENTIFIED BY '$MYSQL_PASSWORD';
-GRANT ALL PRIVILEGES ON $MYSQL_DB.* TO '$MYSQL_USER'@'%';
-FLUSH PRIVILEGES;
+generate_docker_compose() {
+    local web_port="$1"
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  dnsmgr-web:
+    container_name: dnsmgr-web
+    stdin_open: true
+    tty: true
+    ports:
+      - 127.0.0.1:${web_port}:80
+    volumes:
+      - ./web:/app/www
+    image: netcccyun/dnsmgr
+    networks:
+      - $NETWORK_NAME
+
+networks:
+  $NETWORK_NAME:
+    driver: bridge
 EOF
-    echo -e "${GREEN}数据库初始化完成${RESET}"
 }
 
-start_service() {
-    read -p "请输入访问端口(默认 $DEFAULT_PORT): " PORT
-    API_PORT=${PORT:-$DEFAULT_PORT}
-    if ! check_port; then
-        return
-    fi
-
-    mkdir -p "$BASE_DIR"
-    generate_env
-    generate_compose
-    init_database
-    docker-compose -f "$COMPOSE_FILE" up -d
-    show_ip_port
+start_all() {
+    cd "$APP_DIR"
+    docker compose -f "$COMPOSE_FILE" up -d
 }
 
-stop_service() {
-    docker-compose -f "$COMPOSE_FILE" down
+stop_all() {
+    cd "$APP_DIR"
+    docker compose -f "$COMPOSE_FILE" down
 }
 
-restart_service() {
-    stop_service
-    start_service
-}
-
-update_service() {
-    echo -e "${GREEN}正在拉取最新镜像...${RESET}"
+update_services() {
+    cd "$APP_DIR"
     docker compose -f "$COMPOSE_FILE" pull
     docker compose -f "$COMPOSE_FILE" up -d
-    echo -e "${GREEN}✅ 已更新并重启服务${RESET}"
 }
 
-
-uninstall_service() {
-    stop_service
-    rm -rf "$BASE_DIR"
+uninstall() {
+    stop_all
+    docker rm -f dnsmgr-web 2>/dev/null || true
+    docker network rm $NETWORK_NAME 2>/dev/null || true
+    rm -rf "$WEB_DIR"
+    docker rmi netcccyun/dnsmgr 2>/dev/null || true
+    echo -e "${GREEN}卸载完成，web 文件已删除！${RESET}"
 }
 
-show_logs_api() {
-    docker logs -f new-api
+show_info() {
+    local web_port="$1"
+    echo -e "\n${GREEN}==== 安装完成信息 ====${RESET}"
+    echo -e "${YELLOW}访问 dnsmgr-web:${RESET} http://127.0.0.1:$web_port"
 }
 
-show_logs_mysql() {
-    docker logs -f mysql
+menu() {
+    while true; do
+        echo -e "${GREEN}==== DNSMgr Docker 管理菜单====${RESET}"
+        echo -e "${GREEN}1) 安装并启动${RESET}"
+        echo -e "${GREEN}2) 启动服务${RESET}"
+        echo -e "${GREEN}3) 停止服务${RESET}"
+        echo -e "${GREEN}4) 更新服务${RESET}"
+        echo -e "${GREEN}5) 卸载${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "请输入操作编号: " choice
+        case "$choice" in
+            1)
+                while true; do
+                    read -p "请输入 dnsmgr-web 映射端口 (默认 8081): " web_port
+                    web_port=${web_port:-8081}
+                    if check_port "$web_port"; then
+                        break
+                    else
+                        echo -e "${RED}端口 $web_port 已被占用，请重新输入！${RESET}"
+                    fi
+                done
+                generate_docker_compose "$web_port"
+                start_all
+                show_info "$web_port"
+                ;;
+            2) start_all; echo -e "${GREEN}服务已启动！${RESET}" ;;
+            3) stop_all ;;
+            4) update_services ;;
+            5) uninstall ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选项！${RESET}" ;;
+        esac
+    done
 }
 
-show_ip_port() {
-    IP=$(hostname -I | awk '{print $1}')
-    echo -e "${GREEN}访问地址: http://127.0.0.1:$API_PORT${RESET}"
-}
-
-
-# 菜单循环
-while true; do
-    echo -e "${GREEN}====== New API 管理菜单 ======${RESET}"
-    echo -e "${GREEN}1. 启动服务${RESET}"
-    echo -e "${GREEN}2. 停止服务${RESET}"
-    echo -e "${GREEN}3. 重启服务${RESET}"
-    echo -e "${GREEN}4. 更新 New API${RESET}"
-    echo -e "${GREEN}5. 卸载服务${RESET}"
-    echo -e "${GREEN}6. 查看 New API 日志${RESET}"
-    echo -e "${GREEN}7. 查看 MySQL 日志${RESET}"
-    echo -e "${GREEN}8. 显示访问地址${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    read -p "请选择操作: " choice
-    case $choice in
-        1) start_service ;;
-        2) stop_service ;;
-        3) restart_service ;;
-        4) update_service ;;
-        5) uninstall_service; exit ;;
-        6) show_logs_api ;;
-        7) show_logs_mysql ;;
-        8) show_ip_port ;;
-        0) exit ;;
-        *) echo "无效选项" ;;
-    esac
-done
+menu

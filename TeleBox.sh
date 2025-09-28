@@ -89,7 +89,6 @@ EOF
     docker compose up -d
 
     echo -e "${GREEN}✅ MySQL 已启动${RESET}"
-    show_info
     pause
     menu
 }

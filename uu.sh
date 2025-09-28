@@ -1,101 +1,135 @@
 #!/bin/bash
-# ========================================
-# AutoBangumi 一键管理脚本
-# ========================================
+# Cloudreve 管理脚本（部署 + 管理菜单，统一目录 /opt/cloudreve）
 
-GREEN="\033[32m"
-RESET="\033[0m"
-CONFIG_DIR="/opt/AutoBangumi/config"
-DATA_DIR="/opt/AutoBangumi/data"
-COMPOSE_FILE="/opt/AutoBangumi/docker-compose.yml"
-ENV_FILE="/opt/AutoBangumi/.env"
+BASE_DIR="/opt/cloudreve"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
 
-function menu() {
-    clear
-    echo -e "${GREEN}=== AutoBangumi 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新 AutoBangumi${RESET}"
-    echo -e "${GREEN}3) 卸载 AutoBangumi${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    read -p "请选择: " choice
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
-        4) view_logs ;;
-        0) exit 0 ;;
-        *) echo "无效选择"; sleep 1; menu ;;
-    esac
-}
+# 默认值
+DEFAULT_PORT=5212
+DEFAULT_DB_PASS="55689"
+DEFAULT_REDIS_PASS="55697"
 
-function install_app() {
-    read -p "请输入映射端口 (默认 7892): " input_port
-    APP_PORT=${input_port:-7892}
+# 颜色
+GREEN="\e[32m"
+RED="\e[31m"
+RESET="\e[0m"
 
-    mkdir -p "$CONFIG_DIR" "$DATA_DIR"
+# 确保目录存在
+mkdir -p "$BASE_DIR"
 
-    echo "PUID=$(id -u)" > "$ENV_FILE"
-    echo "PGID=$(id -g)" >> "$ENV_FILE"
-    echo "APP_PORT=$APP_PORT" >> "$ENV_FILE"
+# 部署函数
+deploy() {
+    echo -e "${GREEN}=== Cloudreve 部署 ===${RESET}"
+    read -p "$(echo -e ${GREEN}请输入 Cloudreve 端口 [默认: $DEFAULT_PORT]: ${RESET})" PORT
+    PORT=${PORT:-$DEFAULT_PORT}
 
-    cat > "$COMPOSE_FILE" <<EOF
+    read -p "$(echo -e ${GREEN}请输入 PostgreSQL 密码 [默认: $DEFAULT_DB_PASS]: ${RESET})" DB_PASSWORD
+    DB_PASSWORD=${DB_PASSWORD:-$DEFAULT_DB_PASS}
 
-services:
-  autobangumi:
-    image: ghcr.io/estrellaxd/auto_bangumi:latest
-    container_name: autobangumi
-    restart: unless-stopped
-    network_mode: bridge
-    ports:
-      - "127.0.0.1:$APP_PORT:7892"
-    environment:
-      - TZ=Asia/Shanghai
-      - PUID=$PUID
-      - PGID=$PGID
-      - UMASK=022
-    volumes:
-      - $CONFIG_DIR:/app/config
-      - $DATA_DIR:/app/data
-    dns:
-      - 8.8.8.8
+    read -p "$(echo -e ${GREEN}请输入 Redis 密码 [默认: $DEFAULT_REDIS_PASS]: ${RESET})" REDIS_PASSWORD
+    REDIS_PASSWORD=${REDIS_PASSWORD:-$DEFAULT_REDIS_PASS}
+
+    # 生成 .env 文件
+    cat > $ENV_FILE <<EOF
+PORT=$PORT
+DB_PASSWORD=$DB_PASSWORD
+REDIS_PASSWORD=$REDIS_PASSWORD
 EOF
+    echo -e "${GREEN}[√] 已生成 $ENV_FILE${RESET}"
 
-    cd "$HOME/AutoBangumi"
-    docker compose up -d
-    echo -e "✅ 已启动 AutoBangumi"
-    echo -e "🌐 访问地址: ${GREEN}http://127.0.0.1:${APP_PORT}${RESET}"
-    echo -e "👤 默认用户名: ${GREEN}admin${RESET}"
-    echo -e "🔑 默认密码: ${GREEN}adminadmin${RESET}"
-    echo -e "📂 配置目录: ${GREEN}$CONFIG_DIR${RESET}"
-    echo -e "📂 数据目录: ${GREEN}$DATA_DIR${RESET}"
-    read -p "按回车返回菜单..."
-    menu
+    # 生成 docker-compose.yml
+    cat > $COMPOSE_FILE <<EOF
+services:
+  cloudreve:
+    image: cloudreve/cloudreve:latest
+    container_name: cloudreve-backend
+    depends_on:
+      - postgresql
+      - redis
+    restart: always
+    ports:
+      - "127.0.0.1:$PORT:5212"
+      - "6888:6888"
+      - "6888:6888/udp"
+    environment:
+      - CR_CONF_Database.Type=postgres
+      - CR_CONF_Database.Host=postgresql
+      - CR_CONF_Database.User=cloudreve
+      - CR_CONF_Database.Password=\${DB_PASSWORD}
+      - CR_CONF_Database.Name=cloudreve
+      - CR_CONF_Database.Port=5432
+      - CR_CONF_Redis.Server=redis:6379
+      - CR_CONF_Redis.Password=\${REDIS_PASSWORD}
+    volumes:
+      - ${BASE_DIR}/cloudreve:/cloudreve/data
+
+  postgresql:
+    image: postgres:17
+    container_name: postgresql
+    environment:
+      - POSTGRES_USER=cloudreve
+      - POSTGRES_PASSWORD=\${DB_PASSWORD}
+      - POSTGRES_DB=cloudreve
+    volumes:
+      - ${BASE_DIR}/postgres:/var/lib/postgresql/data
+
+  redis:
+    image: redis:latest
+    container_name: redis
+    command: ["redis-server", "--requirepass", "\${REDIS_PASSWORD}"]
+    volumes:
+      - ${BASE_DIR}/redis:/data
+EOF
+    echo -e "${GREEN}[√] 已生成 $COMPOSE_FILE${RESET}"
+
+    cd "$BASE_DIR" && docker compose up -d
+    echo -e "${GREEN}=== 部署完成！===${RESET}"
+    echo -e "${GREEN}Cloudreve 管理面板: http://127.0.0.1:$PORT${RESET}"
 }
 
-function update_app() {
-    cd "$HOME/AutoBangumi" || exit
-    docker compose pull
-    docker compose up -d
-    echo "✅ AutoBangumi 已更新并重启完成"
-    read -p "按回车返回菜单..."
-    menu
+# 卸载函数
+uninstall() {
+    echo -e "${RED}警告: 这将删除 Cloudreve, PostgreSQL, Redis 及其数据！${RESET}"
+    read -p "是否继续? (y/N): " CONFIRM
+    if [[ "$CONFIRM" == "y" || "$CONFIRM" == "Y" ]]; then
+        cd "$BASE_DIR" && docker compose down -v
+        rm -rf "$BASE_DIR"
+        echo -e "${GREEN}[√] 已卸载 Cloudreve${RESET}"
+    else
+        echo -e "${GREEN}已取消操作${RESET}"
+    fi
 }
 
-function uninstall_app() {
-    cd "$HOME/AutoBangumi" || exit
-    docker compose down -v
-    rm -rf "$HOME/AutoBangumi"
-    echo "✅ AutoBangumi 已彻底卸载（含数据与配置）"
-    read -p "按回车返回菜单..."
-    menu
+# 更新函数
+update() {
+    echo -e "${GREEN}=== 更新 Cloudreve / PostgreSQL / Redis 镜像 ===${RESET}"
+    cd "$BASE_DIR" && docker compose pull && docker compose up -d
+    echo -e "${GREEN}[√] 更新完成${RESET}"
 }
 
-function view_logs() {
-    docker logs -f autobangumi
-    read -p "按回车返回菜单..."
-    menu
-}
+# 管理菜单
+while true; do
+    echo -e "${GREEN}=== Cloudreve 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装部署${RESET}"
+    echo -e "${GREEN}2) 启动${RESET}"
+    echo -e "${GREEN}3) 停止${RESET}"
+    echo -e "${GREEN}4) 重启${RESET}"
+    echo -e "${GREEN}5) 查看日志${RESET}"
+    echo -e "${GREEN}6) 卸载${RESET}"
+    echo -e "${GREEN}7) 更新${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    read -p "$(echo -e ${GREEN}请输入选项: ${RESET})" CHOICE
 
-menu
+    case $CHOICE in
+        1) deploy ;;
+        2) cd "$BASE_DIR" && docker compose start ;;
+        3) cd "$BASE_DIR" && docker compose stop ;;
+        4) cd "$BASE_DIR" && docker compose restart ;;
+        5) cd "$BASE_DIR" && docker compose logs -f ;;
+        6) uninstall ;;
+        7) update ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项，请重试${RESET}" ;;
+    esac
+done

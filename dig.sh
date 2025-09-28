@@ -1,134 +1,106 @@
 #!/bin/bash
-# ============================================
-# Kuma-Mieru 管理脚本（支持自定义端口 + 环境变量）
-# ============================================
-
-set -e
+# ========================================
+# XTrafficDash 一键管理脚本
+# ========================================
 
 GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
 RESET="\033[0m"
+APP_NAME="xtrafficdash"
+COMPOSE_DIR="/usr/xtrafficdash"
+COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yml"
+DEFAULT_PORT=37022
+DEFAULT_PASSWORD="admin123"
 
-APP_DIR="$HOME/kuma-mieru"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-ENV_FILE="$APP_DIR/kuma-mieru.env"
-CONTAINER_NAME="kuma-mieru"
+function get_ip() {
+    curl -s ifconfig.me || curl -s ip.sb || echo "your-ip"
+}
 
-menu() {
+function menu() {
     clear
-    echo -e "${GREEN}=== Kuma-Mieru 管理菜单 ===${RESET}"
-    echo -e "${YELLOW}1) 安装/部署 Kuma-Mieru${RESET}"
-    echo -e "${YELLOW}2) 更新 Kuma-Mieru${RESET}"
-    echo -e "${YELLOW}3) 卸载 Kuma-Mieru${RESET}"
-    echo -e "${YELLOW}4) 查看日志${RESET}"
-    echo -e "${YELLOW}0) 退出${RESET}"
-    echo
-    read -p "请选择操作: " choice
-
+    echo -e "${GREEN}=== xtrafficdash 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装/启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    echo -e "${GREEN}=======================${RESET}"
+    read -p "请选择: " choice
     case $choice in
-        1) install ;;
-        2) update ;;
-        3) uninstall ;;
-        4) logs ;;
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) view_logs ;;
+        5) show_password ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选择！${RESET}" && sleep 1 && menu ;;
+        *) echo "无效选择"; sleep 1; menu ;;
     esac
 }
 
-install() {
-    echo -e "${GREEN}=== 开始安装 Kuma-Mieru ===${RESET}"
+function install_app() {
+    read -p "请输入 Web 端口 [默认:${DEFAULT_PORT}]: " input_port
+    PORT=${input_port:-$DEFAULT_PORT}
 
-    mkdir -p "$APP_DIR"
+    read -p "请输入管理员密码 [默认:${DEFAULT_PASSWORD}]: " input_pass
+    PASSWORD=${input_pass:-$DEFAULT_PASSWORD}
 
-    read -p "请输入映射端口 (默认: 3883): " KUMA_PORT
-    KUMA_PORT=${KUMA_PORT:-3883}
+    mkdir -p "$COMPOSE_DIR/data"
+    chmod 777 "$COMPOSE_DIR/data"
 
-    read -p "请输入 Uptime Kuma 基础 URL (必填): " UPTIME_KUMA_BASE_URL
-    [ -z "$UPTIME_KUMA_BASE_URL" ] && echo -e "${RED}必须填写 Uptime Kuma 基础 URL！${RESET}" && exit 1
-
-    read -p "请输入 Uptime Kuma 状态页面 ID (必填): " PAGE_ID
-    [ -z "$PAGE_ID" ] && echo -e "${RED}必须填写状态页面 ID！${RESET}" && exit 1
-
-    read -p "是否展示 'Edit This Page' 按钮? (true/false, 默认: false): " FEATURE_EDIT_THIS_PAGE
-    FEATURE_EDIT_THIS_PAGE=${FEATURE_EDIT_THIS_PAGE:-false}
-
-    read -p "是否展示 'Star on Github' 按钮? (true/false, 默认: true): " FEATURE_SHOW_STAR_BUTTON
-    FEATURE_SHOW_STAR_BUTTON=${FEATURE_SHOW_STAR_BUTTON:-true}
-
-    read -p "请输入页面标题 (默认: Kuma Mieru): " FEATURE_TITLE
-    FEATURE_TITLE=${FEATURE_TITLE:-Kuma Mieru}
-
-    read -p "请输入页面描述 (默认: A beautiful and modern uptime monitoring dashboard): " FEATURE_DESCRIPTION
-    FEATURE_DESCRIPTION=${FEATURE_DESCRIPTION:-"A beautiful and modern uptime monitoring dashboard"}
-
-    read -p "请输入页面图标 URL (默认: /icon.svg): " FEATURE_ICON
-    FEATURE_ICON=${FEATURE_ICON:-/icon.svg}
-
-    # 写入 .env
-    cat > "$ENV_FILE" <<EOF
-KUMA_PORT=$KUMA_PORT
-UPTIME_KUMA_BASE_URL=$UPTIME_KUMA_BASE_URL
-PAGE_ID=$PAGE_ID
-FEATURE_EDIT_THIS_PAGE=$FEATURE_EDIT_THIS_PAGE
-FEATURE_SHOW_STAR_BUTTON=$FEATURE_SHOW_STAR_BUTTON
-FEATURE_TITLE="$FEATURE_TITLE"
-FEATURE_DESCRIPTION="$FEATURE_DESCRIPTION"
-FEATURE_ICON=$FEATURE_ICON
-EOF
-
-    # 写入 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
+version: '3.8'
 services:
-  kuma-mieru:
-    image: ghcr.io/alice39s/kuma-mieru:latest
-    container_name: $CONTAINER_NAME
+  xtrafficdash:
+    image: sanqi37/xtrafficdash
+    container_name: xtrafficdash
     restart: unless-stopped
     ports:
-      - "127.0.0.1:$PORT:3000"
-    env_file:
-      - ./kuma-mieru.env
+      - "127.0.0.1:${PORT}:37022"
     environment:
-      NODE_ENV: production
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
-      interval: 30s
-      timeout: 3s
-      retries: 3
-    tmpfs:
-      - /tmp
+      - TZ=Asia/Shanghai
+      - DATABASE_PATH=/app/data/xtrafficdash.db
+      - PASSWORD=${PASSWORD}
+    volumes:
+      - ${COMPOSE_DIR}/data:/app/data
+    logging:
+      options:
+        max-size: "5m"
+        max-file: "3"
 EOF
 
-    (cd "$APP_DIR" && docker compose up -d)
+    cd "$COMPOSE_DIR"
+    docker compose up -d
 
-    echo -e "${GREEN}✅ 部署完成！访问地址: http://127.0.0.1:$KUMA_PORT${RESET}"
-    read -p "按回车返回菜单..." && menu
+    echo -e "${GREEN}✅ ${APP_NAME} 已启动${RESET}"
+    echo -e "${GREEN}🌐 Web UI 地址: http://$(get_ip):$PORT${RESET}"
+    echo -e "${GREEN}📂 数据目录: $COMPOSE_DIR/data${RESET}"
+    echo -e "${GREEN}🔑 管理员密码: $PASSWORD${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
-update() {
-    echo -e "${GREEN}=== 更新 Kuma-Mieru ===${RESET}"
-    (cd "$APP_DIR" && docker compose pull && docker compose up -d)
-    echo -e "${GREEN}✅ 更新完成！${RESET}"
-    read -p "按回车返回菜单..." && menu
+function update_app() {
+    cd "$COMPOSE_DIR" || exit
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ ${APP_NAME} 已更新并重启完成${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
-uninstall() {
-    echo -e "${RED}⚠️  即将卸载 Kuma-Mieru，并删除相关数据！${RESET}"
-    read -p "确认卸载? (y/N): " confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        (cd "$APP_DIR" && docker compose down -v)
-        rm -rf "$APP_DIR"
-        echo -e "${GREEN}✅ 卸载完成${RESET}"
-    else
-        echo -e "${YELLOW}已取消${RESET}"
-    fi
-    read -p "按回车返回菜单..." && menu
+function uninstall_app() {
+    cd "$COMPOSE_DIR" || exit
+    docker compose down -v
+    rm -rf "$COMPOSE_DIR"
+    echo -e "${GREEN}✅ ${APP_NAME} 已卸载，数据已删除${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
-logs() {
-    echo -e "${GREEN}=== 查看 Kuma-Mieru 日志 ===${RESET}"
-    docker logs -f $CONTAINER_NAME
-    read -p "按回车返回菜单..." && menu
+function view_logs() {
+    docker logs -f xtrafficdash
+    read -p "按回车返回菜单..."
+    menu
 }
+
 
 menu

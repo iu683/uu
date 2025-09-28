@@ -1,111 +1,123 @@
 #!/bin/bash
-# ========================================
-# Sub-Store 一键管理脚本 (Docker Compose)
-# ========================================
+# QMediaSync 一键管理脚本
 
 GREEN="\033[32m"
 RESET="\033[0m"
-APP_NAME="sub-store"
-APP_DIR="$HOME/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.env"
 
-# 获取本机IP
-function get_ip() {
-    curl -s ifconfig.me || curl -s ip.sb || echo "127.0.0.1"
+APP_NAME="qmediasync"
+BASE_DIR="/opt/qmediasync"
+CONFIG_DIR="$BASE_DIR/config"
+MEDIA_DIR="$BASE_DIR/media"
+YML_FILE="$BASE_DIR/qmediasync-compose.yml"
+
+# 获取公网IP
+get_ip() {
+    curl -s ipv4.icanhazip.com || curl -s ifconfig.me
 }
 
-# 生成随机路径
-function random_path() {
-    tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 20
+create_compose() {
+    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$MEDIA_DIR"
+    mkdir -p "$BASE_DIR"
+
+    cat > $YML_FILE <<EOF
+
+services:
+  qmediasync:
+    image: qicfan/qmediasync:latest
+    container_name: qmediasync
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:12333:12333"
+      - "8095:8095"
+      - "8094:8094"
+    volumes:
+      - $CONFIG_DIR:/app/config
+      - $MEDIA_DIR:/media
+    environment:
+      - TZ=Asia/Shanghai
+
+networks:
+  default:
+    name: qmediasync
+EOF
 }
 
-# 菜单
-function menu() {
-    clear
-    echo -e "${GREEN}=== Sub-Store 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装/启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
+show_menu() {
+    echo -e "${GREEN}=== QMediaSync 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装并启动 QMediaSync${RESET}"
+    echo -e "${GREEN}2) 停止 QMediaSync${RESET}"
+    echo -e "${GREEN}3) 启动 QMediaSync${RESET}"
+    echo -e "${GREEN}4) 重启 QMediaSync${RESET}"
+    echo -e "${GREEN}5) 更新 QMediaSync${RESET}"
+    echo -e "${GREEN}6) 查看日志${RESET}"
+    echo -e "${GREEN}7) 卸载 QMediaSync（含数据）${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}===========================${RESET}"
+    echo -e "${GREEN}==========================${RESET}"
     read -p "请选择: " choice
+}
+
+print_access_info() {
+    local ip=$(get_ip)
+    echo -e "🌐 访问地址: ${GREEN}http://$ip:12333${RESET}"
+    echo -e "👤 默认用户: ${GREEN}admin${RESET}"
+    echo -e "🔑 默认密码: ${GREEN}admin123${RESET}"
+}
+
+install_app() {
+    create_compose
+    docker compose -f $YML_FILE up -d
+    echo -e "✅ ${GREEN}QMediaSync 已安装并启动${RESET}"
+    print_access_info
+}
+
+stop_app() {
+    docker compose -f $YML_FILE down
+    echo -e "🛑 ${GREEN}QMediaSync 已停止${RESET}"
+}
+
+start_app() {
+    docker compose -f $YML_FILE up -d
+    echo -e "🚀 ${GREEN}QMediaSync 已启动${RESET}"
+    print_access_info
+}
+
+restart_app() {
+    docker compose -f $YML_FILE down
+    docker compose -f $YML_FILE up -d
+    echo -e "🔄 ${GREEN}QMediaSync 已重启${RESET}"
+    print_access_info
+}
+
+update_app() {
+    docker compose -f $YML_FILE pull
+    docker compose -f $YML_FILE up -d
+    echo -e "⬆️ ${GREEN}QMediaSync 已更新到最新版本${RESET}"
+    print_access_info
+}
+
+logs_app() {
+    docker logs -f $APP_NAME
+}
+
+uninstall_app() {
+    docker compose -f $YML_FILE down
+    rm -f $YML_FILE
+    rm -rf "$CONFIG_DIR" "$MEDIA_DIR"
+    echo -e "🗑️ ${GREEN}QMediaSync 已卸载，数据目录也已删除${RESET}"
+}
+
+while true; do
+    show_menu
     case $choice in
         1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
-        4) view_logs ;;
+        2) stop_app ;;
+        3) start_app ;;
+        4) restart_app ;;
+        5) update_app ;;
+        6) logs_app ;;
+        7) uninstall_app ;;
         0) exit 0 ;;
-        *) echo "无效选择"; sleep 1; menu ;;
+        *) echo -e "❌ ${GREEN}无效选择${RESET}" ;;
     esac
-}
-
-# 安装/启动
-function install_app() {
-    read -p "请输入 Web 端口 [默认:3001]: " input_port
-    PORT=${input_port:-3001}
-
-    mkdir -p "$APP_DIR/sub-store-data"
-
-    BACKEND_PATH=$(random_path)
-
-    cat > "$COMPOSE_FILE" <<EOF
-version: '3'
-services:
-  sub-store:
-    image: xream/sub-store:latest
-    container_name: sub-store
-    restart: always
-    volumes:
-      - $APP_DIR/sub-store-data:/opt/app/data
-    environment:
-      - SUB_STORE_FRONTEND_BACKEND_PATH=$BACKEND_PATH
-    ports:
-      - "$PORT:3001"
-    stdin_open: true
-    tty: true
-EOF
-
-    echo "PORT=$PORT" > "$CONFIG_FILE"
-    echo "SUB_STORE_FRONTEND_BACKEND_PATH=$BACKEND_PATH" >> "$CONFIG_FILE"
-
-    cd "$APP_DIR"
-    docker compose up -d
-
-    echo -e "${GREEN}✅ Sub-Store 已启动${RESET}"
-    echo -e "${GREEN}🌐 Web UI 地址: http://127.0.0.1:$PORT${RESET}"
-    echo -e "${GREEN}🔑 前端路径: /$BACKEND_PATH${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/sub-store-data${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-# 更新
-function update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ Sub-Store 已更新并重启完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-# 卸载
-function uninstall_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${GREEN}✅ Sub-Store 已卸载，数据已删除${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-# 查看日志
-function view_logs() {
-    docker logs -f sub-store
-    read -p "按回车返回菜单..."
-    menu
-}
-
-menu
+done

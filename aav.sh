@@ -1,115 +1,115 @@
 #!/bin/bash
-# =========================================
-# DNSMgr Docker 管理脚本 (无数据库版, /opt 统一目录)
-# =========================================
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
 RESET="\033[0m"
 
-APP_DIR="/opt/dnsmgr"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-WEB_DIR="$APP_DIR/web"
-NETWORK_NAME="dnsmgr-net"
+APP_NAME="music-tag-web"
+YML_FILE="/opt/music-tag/music-tag-compose.yml"
 
-mkdir -p "$WEB_DIR"
+# 存储上次安装时的目录（便于卸载时清理）
+CONF_FILE="/opt/music-tag/music_tag_dirs"
 
-check_port() {
-    local port=$1
-    if lsof -i:"$port" &>/dev/null; then
-        return 1
-    else
-        return 0
-    fi
+show_menu() {
+    clear
+    echo -e "${GREEN}=== Music Tag 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动 Music Tag${RESET}"
+    echo -e "${GREEN}2) 更新 Music Tag${RESET}"
+    echo -e "${GREEN}3) 卸载 Music Tag${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    echo -e "${GREEN}===========================${RESET}"
+    read -p "请选择: " choice
+    case $choice in
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) logs_app ;;
+        0) exit ;;
+        *) echo "❌ 无效选择"; sleep 1; show_menu ;;
+    esac
 }
 
-generate_docker_compose() {
-    local web_port="$1"
-    cat > "$COMPOSE_FILE" <<EOF
+install_app() {
+    read -p "请输入音乐目录路径 (默认 /opt/music-tag/music): " music_dir
+    music_dir=${music_dir:-/opt/music-tag/music}
+
+    read -p "请输入配置文件目录路径 (默认 /opt/music-tag/config): " config_dir
+    config_dir=${config_dir:-/opt/music-tag/config}
+
+    read -p "请输入下载目录路径 (默认 /opt/music-tag/download): " download_dir
+    download_dir=${download_dir:-/opt/music-tag/download}
+
+    read -p "请输入访问端口 (默认 8002): " port
+    port=${port:-8002}
+
+    mkdir -p "$music_dir" "$config_dir" "$download_dir"
+
+    cat > $YML_FILE <<EOF
+
 services:
-  dnsmgr-web:
-    container_name: dnsmgr-web
-    stdin_open: true
-    tty: true
+  music-tag:
+    image: xhongc/music_tag_web:latest
+    container_name: $APP_NAME
     ports:
-      - 127.0.0.1:${web_port}:80
+      - "127.0.0.1:${port}:8002"
     volumes:
-      - ./web:/app/www
-    image: netcccyun/dnsmgr
-    networks:
-      - $NETWORK_NAME
-
-networks:
-  $NETWORK_NAME:
-    driver: bridge
+      - ${music_dir}:/app/media
+      - ${config_dir}:/app/data
+      - ${download_dir}:/app/download
+    restart: always
 EOF
+
+    # 保存目录信息和端口
+    echo "$config_dir" > $CONF_FILE
+    echo "$download_dir" >> $CONF_FILE
+    echo "$port" >> $CONF_FILE
+
+    docker compose -f $YML_FILE up -d
+    echo -e "${GREEN}✅ $APP_NAME 已启动，访问地址: http://127.0.0.1:${port}${RESET}"
+    read -p "按回车键返回菜单..."
+    show_menu
 }
 
-start_all() {
-    cd "$APP_DIR"
-    docker compose -f "$COMPOSE_FILE" up -d
+update_app() {
+    docker compose -f $YML_FILE pull
+    docker compose -f $YML_FILE up -d
+    echo -e "${GREEN}✅ $APP_NAME 已更新${RESET}"
+    read -p "按回车键返回菜单..."
+    show_menu
 }
 
-stop_all() {
-    cd "$APP_DIR"
-    docker compose -f "$COMPOSE_FILE" down
+uninstall_app() {
+    read -p "⚠️ 确认要卸载 $APP_NAME 吗？(y/N): " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        docker compose -f $YML_FILE down
+        rm -f $YML_FILE
+        echo -e "${GREEN}✅ $APP_NAME 已卸载${RESET}"
+
+        if [[ -f $CONF_FILE ]]; then
+            config_dir=$(sed -n '1p' $CONF_FILE)
+            download_dir=$(sed -n '2p' $CONF_FILE)
+            port=$(sed -n '3p' $CONF_FILE)
+
+            read -p "是否同时删除配置目录 [$config_dir] 和下载目录 [$download_dir]？(y/N): " del_confirm
+            if [[ "$del_confirm" =~ ^[Yy]$ ]]; then
+                rm -rf "$config_dir" "$download_dir"
+                echo -e "${GREEN}✅ 配置目录和下载目录已删除${RESET}"
+            else
+                echo "❌ 已保留配置目录和下载目录"
+            fi
+            rm -f $CONF_FILE
+        fi
+    else
+        echo "❌ 已取消"
+    fi
+    read -p "按回车键返回菜单..."
+    show_menu
 }
 
-update_services() {
-    cd "$APP_DIR"
-    docker compose -f "$COMPOSE_FILE" pull
-    docker compose -f "$COMPOSE_FILE" up -d
+logs_app() {
+    docker logs -f $APP_NAME
+    read -p "按回车键返回菜单..."
+    show_menu
 }
 
-uninstall() {
-    stop_all
-    docker rm -f dnsmgr-web 2>/dev/null || true
-    docker network rm $NETWORK_NAME 2>/dev/null || true
-    rm -rf "$WEB_DIR"
-    docker rmi netcccyun/dnsmgr 2>/dev/null || true
-    echo -e "${GREEN}卸载完成，web 文件已删除！${RESET}"
-}
-
-show_info() {
-    local web_port="$1"
-    echo -e "\n${GREEN}==== 安装完成信息 ====${RESET}"
-    echo -e "${YELLOW}访问 dnsmgr-web:${RESET} http://127.0.0.1:$web_port"
-}
-
-menu() {
-    while true; do
-        echo -e "${GREEN}==== DNSMgr Docker 管理菜单====${RESET}"
-        echo -e "${GREEN}1) 安装并启动${RESET}"
-        echo -e "${GREEN}2) 启动服务${RESET}"
-        echo -e "${GREEN}3) 停止服务${RESET}"
-        echo -e "${GREEN}4) 更新服务${RESET}"
-        echo -e "${GREEN}5) 卸载${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "请输入操作编号: " choice
-        case "$choice" in
-            1)
-                while true; do
-                    read -p "请输入 dnsmgr-web 映射端口 (默认 8081): " web_port
-                    web_port=${web_port:-8081}
-                    if check_port "$web_port"; then
-                        break
-                    else
-                        echo -e "${RED}端口 $web_port 已被占用，请重新输入！${RESET}"
-                    fi
-                done
-                generate_docker_compose "$web_port"
-                start_all
-                show_info "$web_port"
-                ;;
-            2) start_all; echo -e "${GREEN}服务已启动！${RESET}" ;;
-            3) stop_all ;;
-            4) update_services ;;
-            5) uninstall ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选项！${RESET}" ;;
-        esac
-    done
-}
-
-menu
+show_menu

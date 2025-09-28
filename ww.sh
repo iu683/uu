@@ -1,180 +1,155 @@
 #!/bin/bash
-# Jellyfin 一键部署与更新菜单脚本（统一 /opt/jellyfin，循环菜单版）
 
-GREEN='\033[0;32m'
-RESET='\033[0m'
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-DEFAULT_CONTAINER_NAME="jellyfin"
-DEFAULT_DATA_DIR="/opt/jellyfin"
-DEFAULT_HTTP_PORT="8096"
-IMAGE_NAME="jellyfin/jellyfin:latest"
-CONFIG_FILE="$DEFAULT_DATA_DIR/config.env"
+# 容器配置
+DOCKER_NAME="npm"
+DOCKER_IMG="jc21/nginx-proxy-manager:latest"
+DATA_PATH="/opt/npm/data"
+CERT_PATH="/opt/npm/letsencrypt"
+CONFIG_FILE="/opt/npm/config.conf"
 
-CONTAINER_NAME=""
-DATA_DIR=""
-HTTP_PORT=""
-
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${GREEN}错误: Docker 未安装，请先安装 Docker${RESET}"
-        exit 1
-    fi
-}
-
+# 获取公网 IP
 get_public_ip() {
-    PUBLIC_IP=$(curl -s https://ipinfo.io/ip)
-    if ! [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
-        PUBLIC_IP=$(curl -s https://ifconfig.me/ip)
+    local ip
+    ip=$(curl -s ipv4.ip.sb)
+    [[ -z "$ip" ]] && ip=$(curl -s ifconfig.me)
+    [[ -z "$ip" ]] && ip=$(curl -s ipinfo.io/ip)
+    if [[ -z "$ip" ]]; then
+        echo -e "${RED}无法获取公网 IP${RESET}"
+        return 1
     fi
-    [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || PUBLIC_IP=""
-    echo "$PUBLIC_IP"
+    echo "$ip"
 }
 
-load_or_input_config() {
-    if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
-    fi
-
-    read -p "请输入容器名 [${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}]: " input_container
-    CONTAINER_NAME=${input_container:-${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}}
-
-    DATA_DIR="$DEFAULT_DATA_DIR"
-
-    read -p "请输入宿主机 HTTP 映射端口 [${HTTP_PORT:-$DEFAULT_HTTP_PORT}]: " input_port
-    HTTP_PORT=${input_port:-${HTTP_PORT:-$DEFAULT_HTTP_PORT}}
-
+# ================== 初始化配置 ==================
+if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+else
+    read -p "请输入 NPM 面板端口 (默认 81): " input_port
+    DOCKER_PORT=${input_port:-81}
     mkdir -p "$(dirname $CONFIG_FILE)"
-    {
-        echo "CONTAINER_NAME=\"$CONTAINER_NAME\""
-        echo "DATA_DIR=\"$DATA_DIR\""
-        echo "HTTP_PORT=\"$HTTP_PORT\""
-    } > "$CONFIG_FILE"
+    echo "DOCKER_PORT=$DOCKER_PORT" > "$CONFIG_FILE"
+fi
+
+# ================== 函数 ==================
+docker_update_image() {
+    echo -e "${GREEN}正在拉取最新 NPM 镜像...${RESET}"
+    docker pull $DOCKER_IMG
 }
 
-create_dirs() {
-    mkdir -p "$DATA_DIR/config" "$DATA_DIR/cache" "$DATA_DIR/media"
-    chmod -R 755 "$DATA_DIR"
-    echo -e "${GREEN}已创建数据目录: $DATA_DIR${RESET}"
-}
+docker_install() {
+    # 检测端口是否被占用
+    if lsof -i:$DOCKER_PORT -sTCP:LISTEN || lsof -i:80 -sTCP:LISTEN || lsof -i:443 -sTCP:LISTEN; then
+        echo -e "${RED}⚠️ 端口 $DOCKER_PORT / 80 / 443 已被占用，请先释放端口再运行 NPM${RESET}"
+        return 1
+    fi
 
-deploy_jellyfin() {
-    load_or_input_config
-    create_dirs
-    echo -e "${GREEN}正在部署 Jellyfin 容器...${RESET}"
+    mkdir -p "$DATA_PATH" "$CERT_PATH"
+    docker_update_image
+
+    if docker ps -a --format '{{.Names}}' | grep -q "^${DOCKER_NAME}$"; then
+        echo -e "${YELLOW}检测到已有 NPM 容器，无法重复安装，请选择更新或启动${RESET}"
+        return 1
+    fi
 
     docker run -d \
-        --name $CONTAINER_NAME \
-        --restart unless-stopped \
-        -e TZ=Asia/Shanghai \
-        -e UID=0 \
-        -e GID=0 \
-        -e GIDLIST=0 \
-        -p 127.0.0.1:$HTTP_PORT:8096 \
-        -p 8920:8920 \
-        -v $DATA_DIR/config:/config \
-        -v $DATA_DIR/cache:/cache \
-        -v $DATA_DIR/media:/media \
-        $IMAGE_NAME
+      --name=$DOCKER_NAME \
+      -p ${DOCKER_PORT}:81 \
+      -p 80:80 \
+      -p 443:443 \
+      -v $DATA_PATH:/data \
+      -v $CERT_PATH:/etc/letsencrypt \
+      --restart=always \
+      $DOCKER_IMG
 
-    PUBLIC_IP=$(get_public_ip)
-    echo -e "${GREEN}部署完成！访问地址: http://127.0.0.1:${HTTP_PORT}${RESET}"
-    read -p "按回车返回菜单..."
+    local ip=$(get_public_ip)
+    echo -e "${GREEN}✅ Nginx Proxy Manager 已安装并启动${RESET}"
+    echo -e "${GREEN}管理面板地址: http://${ip}:${DOCKER_PORT}${RESET}"
+    echo -e "${GREEN}初始用户名: admin@example.com${RESET}"
+    echo -e "${GREEN}初始密码: changeme${RESET}"
 }
 
-start_jellyfin() {
-    docker start $CONTAINER_NAME && echo -e "${GREEN}容器已启动${RESET}"
-    read -p "按回车返回菜单..."
-}
-stop_jellyfin() {
-    docker stop $CONTAINER_NAME && echo -e "${GREEN}容器已停止${RESET}"
-    read -p "按回车返回菜单..."
-}
-remove_jellyfin() {
-    docker rm -f $CONTAINER_NAME && echo -e "${GREEN}容器已删除${RESET}"
-}
-view_logs() {
-    docker logs -f $CONTAINER_NAME
-}
+docker_update() {
+    docker_update_image
 
-uninstall_all() {
-    docker stop $CONTAINER_NAME
-    remove_jellyfin
-    if [ -d "$DEFAULT_DATA_DIR" ]; then
-        read -p "确定要删除 $DEFAULT_DATA_DIR 吗？此操作不可恢复 [y/N]: " confirm
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            rm -rf "$DEFAULT_DATA_DIR"
-            echo -e "${GREEN}数据和配置已删除${RESET}"
-        fi
-    fi
-    read -p "按回车返回菜单..."
-}
-
-update_image() {
-    if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
-    else
-        echo -e "${GREEN}配置文件不存在，请先部署容器${RESET}"
-        read -p "按回车返回菜单..."
-        return
+    if docker ps -a --format '{{.Names}}' | grep -q "^${DOCKER_NAME}$"; then
+        echo -e "${YELLOW}停止旧容器并删除（保留数据）...${RESET}"
+        docker stop $DOCKER_NAME
+        docker rm $DOCKER_NAME
     fi
 
-    echo -e "${GREEN}正在拉取最新镜像: $IMAGE_NAME ...${RESET}"
-    docker pull $IMAGE_NAME
-
-    if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
-        echo -e "${GREEN}停止正在运行的容器...${RESET}"
-        docker stop $CONTAINER_NAME
-    fi
-
-    if [ "$(docker ps -a -q -f name=$CONTAINER_NAME)" ]; then
-        echo -e "${GREEN}删除旧容器（保留数据）...${RESET}"
-        docker rm $CONTAINER_NAME
-    fi
-
-    echo -e "${GREEN}使用最新镜像重启容器...${RESET}"
     docker run -d \
-        --name $CONTAINER_NAME \
-        --restart unless-stopped \
-        -e TZ=Asia/Shanghai \
-        -e UID=0 \
-        -e GID=0 \
-        -e GIDLIST=0 \
-        -p 127.0.0.1:$HTTP_PORT:8096 \
-        -p 8920:8920 \
-        -v $DATA_DIR/config:/config \
-        -v $DATA_DIR/cache:/cache \
-        -v $DATA_DIR/media:/media \
-        $IMAGE_NAME
+      --name=$DOCKER_NAME \
+      -p ${DOCKER_PORT}:81 \
+      -p 80:80 \
+      -p 443:443 \
+      -v $DATA_PATH:/data \
+      -v $CERT_PATH:/etc/letsencrypt \
+      --restart=always \
+      $DOCKER_IMG
 
-    echo -e "${GREEN}更新完成${RESET}"
-    read -p "按回车返回菜单..."
+    local ip=$(get_public_ip)
+    echo -e "${GREEN}✅ NPM 已更新并重启${RESET}"
 }
 
-show_menu() {
-    echo -e "${GREEN}===== Jellyfin 菜单 =====${RESET}"
-    echo -e "${GREEN}1. 部署${RESET}"
-    echo -e "${GREEN}2. 启动容器${RESET}"
-    echo -e "${GREEN}3. 停止容器${RESET}"
-    echo -e "${GREEN}4. 查看日志${RESET}"
-    echo -e "${GREEN}5. 卸载${RESET}"
-    echo -e "${GREEN}6. 更新${RESET}"
+docker_remove() {
+    docker rm -f $DOCKER_NAME 2>/dev/null
+    echo -e "${GREEN}✅ NPM 已卸载${RESET}"
+    # 删除数据
+    rm -rf "$DATA_PATH" "$CERT_PATH" "$CONFIG_FILE"
+    echo -e "${RED}数据目录已删除${RESET}"
+}
+
+docker_logs() {
+    docker logs -f $DOCKER_NAME
+}
+
+docker_start() {
+    docker start $DOCKER_NAME
+}
+
+docker_stop() {
+    docker stop $DOCKER_NAME
+}
+
+docker_restart() {
+    docker restart $DOCKER_NAME
+}
+
+# ================== 菜单 ==================
+menu() {
+    clear
+    echo -e "${GREEN}=== Nginx Proxy Manager管理菜单 ===${RESET}"
+    echo -e "${GREEN}1. 安装 NPM${RESET}"
+    echo -e "${GREEN}2. 更新 NPM${RESET}"
+    echo -e "${GREEN}3. 启动 NPM${RESET}"
+    echo -e "${GREEN}4. 停止 NPM${RESET}"
+    echo -e "${GREEN}5. 重启 NPM${RESET}"
+    echo -e "${GREEN}6. 查看日志${RESET}"
+    echo -e "${GREEN}7. 卸载 NPM${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -n "请输入编号: "
+    echo -e "${GREEN}=========================================${RESET}"
+    read -p $'\033[32m请输入选项: \033[0m' choice
+
+    case $choice in
+        1) docker_install ;;
+        2) docker_update ;;
+        3) docker_start ;;
+        4) docker_stop ;;
+        5) docker_restart ;;
+        6) docker_logs ;;
+        7) docker_remove ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
+    esac
 }
 
-check_docker
-
+# ================== 主循环 ==================
 while true; do
-    show_menu
-    read choice
-    case $choice in
-        1) deploy_jellyfin ;;
-        2) start_jellyfin ;;
-        3) stop_jellyfin ;;
-        4) view_logs ;;
-        5) uninstall_all ;;
-        6) update_image ;;
-        0) echo "退出脚本"; exit 0 ;;
-        *) echo -e "${GREEN}无效选项${RESET}"; read -p "按回车返回菜单..." ;;
-    esac
+    menu
+    read -p $'\033[32m按回车返回菜单...\033[0m' foo
 done

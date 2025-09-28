@@ -1,22 +1,23 @@
 #!/bin/bash
 # ========================================
-# Vaultwarden 一键管理脚本（可自定义域名和注册选项）
+# SPlayer 一键管理脚本（更新自动复用安装端口和目录）
 # ========================================
 
 GREEN="\033[32m"
 RESET="\033[0m"
-APP_NAME="vaultwarden"
-APP_DIR="$HOME/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.env"
+APP_NAME="SPlayer"
+CONTAINER_NAME="SPlayer"
+DEFAULT_PORT=25884
+DEFAULT_DATA_DIR="$HOME/SPlayer/data"
+CONFIG_FILE="$HOME/SPlayer/splayer.conf"
 
 function get_ip() {
-    curl -s ifconfig.me || curl -s ip.sb || echo "127.0.0.1"
+    curl -s ifconfig.me || curl -s ip.sb || echo "your-ip"
 }
 
 function menu() {
     clear
-    echo -e "${GREEN}=== Vaultwarden 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== SPlayer 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装/启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
@@ -35,66 +36,67 @@ function menu() {
 }
 
 function install_app() {
-    read -p "请输入 Web 端口 [默认:11001]: " input_port
-    PORT=${input_port:-11001}
+    mkdir -p "$HOME/SPlayer"
 
-    read -p "请输入 Vaultwarden 域名（可留空）: " DOMAIN
-    read -p "是否允许注册新账户？(true/false) [默认:true]: " SIGNUPS_ALLOWED
-    SIGNUPS_ALLOWED=${SIGNUPS_ALLOWED:-true}
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    else
+        read -p "请输入映射端口 [默认:${DEFAULT_PORT}]: " input_port
+        PORT=${input_port:-$DEFAULT_PORT}
 
-    # 创建数据目录
-    mkdir -p "$APP_DIR/vw-data"
+        read -p "请输入数据目录 [默认:${DEFAULT_DATA_DIR}]: " input_data
+        DATA_DIR=${input_data:-$DEFAULT_DATA_DIR}
 
-    # 生成 docker-compose.yml
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  vaultwarden:
-    image: vaultwarden/server:latest
-    container_name: vaultwarden
-    restart: always
-    environment:
-      DOMAIN: "${DOMAIN}"
-      SIGNUPS_ALLOWED: "${SIGNUPS_ALLOWED}"
-    volumes:
-      - $APP_DIR/vw-data:/data
-    ports:
-      - "127.0.0.1:$PORT:80"
-EOF
+        mkdir -p "$DATA_DIR"
 
-    echo -e "PORT=$PORT\nDOMAIN=$DOMAIN\nSIGNUPS_ALLOWED=$SIGNUPS_ALLOWED" > "$CONFIG_FILE"
+        echo "PORT=$PORT" > "$CONFIG_FILE"
+        echo "DATA_DIR=$DATA_DIR" >> "$CONFIG_FILE"
+    fi
 
-    cd "$APP_DIR"
-    docker compose up -d
+    docker pull imsyy/splayer:latest
+    docker stop "$CONTAINER_NAME" 2>/dev/null
+    docker rm "$CONTAINER_NAME" 2>/dev/null
 
-    echo -e "${GREEN}✅ Vaultwarden 已启动${RESET}"
-    echo -e "${GREEN}🌐 Web UI 地址: http://127.0.0.1:$PORT${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/vw-data${RESET}"
-    echo -e "${GREEN}🛡 注册允许: $SIGNUPS_ALLOWED${RESET}"
-    [ -n "$DOMAIN" ] && echo -e "${GREEN}🌍 域名: $DOMAIN${RESET}"
+    docker run -d --name "$CONTAINER_NAME" -p 127.0.0.1:${PORT}:25884 \
+        -v "${DATA_DIR}:/app/data" \
+        --restart unless-stopped \
+        imsyy/splayer:latest
+
+    echo -e "${GREEN}✅ SPlayer 已启动${RESET}"
+    echo -e "${GREEN}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📂 数据目录: $DATA_DIR${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 function update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ Vaultwarden 已更新并重启完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${GREEN}⚠️ 未检测到安装记录，请先执行安装${RESET}"
+        sleep 2
+        menu
+    fi
+    source "$CONFIG_FILE"
+    echo -e "${GREEN}🔄 拉取最新镜像并重装 SPlayer${RESET}"
+    install_app
 }
 
 function uninstall_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${GREEN}✅ Vaultwarden 已卸载，数据已删除${RESET}"
+    docker stop "$CONTAINER_NAME" 2>/dev/null
+    docker rm "$CONTAINER_NAME" 2>/dev/null
+    read -p "是否同时删除数据目录? [y/N]: " deldata
+    if [[ "$deldata" =~ ^[Yy]$ ]]; then
+        source "$CONFIG_FILE"
+        rm -rf "$DATA_DIR"
+        echo -e "${GREEN}✅ 数据目录已删除${RESET}"
+    fi
+    rm -f "$CONFIG_FILE"
+    echo -e "${GREEN}✅ SPlayer 已卸载${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 function view_logs() {
-    docker logs -f vaultwarden
+    docker logs -f "$CONTAINER_NAME"
     read -p "按回车返回菜单..."
     menu
 }

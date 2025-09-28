@@ -1,18 +1,21 @@
 #!/bin/bash
 # ========================================
-# HubProxy 一键管理脚本 (Docker Compose)
+# HubP 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
 RESET="\033[0m"
-APP_NAME="hubproxy"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.env"
+APP_NAME="HubP"
+COMPOSE_DIR="/opt/HubP"
+COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yml"
+
+function get_ip() {
+    curl -s ifconfig.me || curl -s ip.sb || echo "your-ip"
+}
 
 function menu() {
     clear
-    echo -e "${GREEN}=== HubProxy 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== HubP 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
@@ -31,54 +34,57 @@ function menu() {
 }
 
 function install_app() {
-    read -p "请输入 Web 端口 [默认:5000]: " input_port
-    PORT=${input_port:-5000}
+    read -p "请输入映射端口 [默认 18184]: " input_port
+    PORT=${input_port:-18184}
 
-    mkdir -p "$APP_DIR"
+    read -p "请输入 HUBP_DISGUISE [默认: onlinealarmkur.com]: " input_disguise
+    DISGUISE=${input_disguise:-onlinealarmkur.com}
+
+    mkdir -p "$COMPOSE_DIR"
 
     cat > "$COMPOSE_FILE" <<EOF
+
 services:
-  hubproxy:
-    image: ghcr.io/sky22333/hubproxy
-    container_name: hubproxy
-    restart: always
+  hubp:
+    image: ymyuuu/hubp:latest
+    container_name: hubp
+    restart: unless-stopped
     ports:
-      - "127.0.0.1:$PORT:5000"
+      - "127.0.0.1:$PORT:18826"
+    environment:
+      - HUBP_LOG_LEVEL=debug
+      - HUBP_DISGUISE=${DISGUISE}
 EOF
 
-    echo "PORT=$PORT" > "$CONFIG_FILE"
-
-    cd "$APP_DIR"
+    cd "$COMPOSE_DIR"
     docker compose up -d
-
-    echo -e "${GREEN}✅ HubProxy 已启动${RESET}"
-    echo -e "${GREEN}🌐 Web 地址: http://127.0.0.1:$PORT${RESET}"
+    echo -e "${GREEN}✅ HubP 已启动${RESET}"
+    echo -e "${GREEN}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}🕵️ HUBP_DISGUISE: $DISGUISE${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 function update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
+    cd "$COMPOSE_DIR" || exit
     docker compose pull
     docker compose up -d
-    source "$CONFIG_FILE"
-    echo -e "${GREEN}✅ HubProxy 已更新并重启完成${RESET}"
-    echo -e "${GREEN}🌐 Web 地址: http://127.0.0.1:$PORT${RESET}"
+    echo -e "${GREEN}✅ HubP 已更新并重启完成${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 function uninstall_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose down
-    rm -rf "$APP_DIR"
-    echo -e "${GREEN}✅ HubProxy 已卸载${RESET}"
+    cd "$COMPOSE_DIR" || exit
+    docker compose down -v
+    rm -rf "$COMPOSE_DIR"
+    echo -e "${GREEN}✅ HubP 已卸载${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 function view_logs() {
-    docker logs -f hubproxy
+    docker logs -f hubp
     read -p "按回车返回菜单..."
     menu
 }

@@ -1,119 +1,149 @@
 #!/bin/bash
-# Music Player 一键管理脚本（支持自定义端口和管理员密码）
+# ========================================
+# Lsky-Pro 一键管理脚本 (Docker Compose)
+# ========================================
 
 GREEN="\033[32m"
 RESET="\033[0m"
+APP_NAME="lsky-pro"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/config.env"
 
-APP_NAME="music-player"
-BASE_DIR="/opt/music-player"
-YML_FILE="$BASE_DIR/docker-compose.yml"
-
-# 默认端口和管理员密码
-DEFAULT_PORT=3000
-DEFAULT_ADMIN_PASS="admin123"
-
-create_compose() {
-    local port=$1
-    local admin_pass=$2
-
-    mkdir -p "$BASE_DIR"
-
-    cat > $YML_FILE <<EOF
-services:
-  music-player:
-    image: ghcr.io/eooce/music-player:latest
-    ports:
-      - "127.0.0.1:${port}:3000"
-    environment:
-      - PORT=3000
-      - ADMIN_PASSWORD=${admin_pass}
-    volumes:
-      - music-data:/app/music
-    restart: unless-stopped
-
-volumes:
-  music-data:
-EOF
-}
-
-show_menu() {
-    echo -e "${GREEN}=== Music Player 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装并启动服务${RESET}"
-    echo -e "${GREEN}2) 停止服务${RESET}"
-    echo -e "${GREEN}3) 启动服务${RESET}"
-    echo -e "${GREEN}4) 重启服务${RESET}"
-    echo -e "${GREEN}5) 更新服务${RESET}"
-    echo -e "${GREEN}6) 查看日志${RESET}"
-    echo -e "${GREEN}7) 卸载服务（含数据）${RESET}"
+function menu() {
+    clear
+    echo -e "${GREEN}=== Lsky-Pro 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装/启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}5) 查看数据库信息${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}==========================${RESET}"
+    echo -e "${GREEN}=========================${RESET}"
     read -p "请选择: " choice
-}
-
-print_access_info() {
-    local ip=$(curl -s ipv4.icanhazip.com || curl -s ifconfig.me)
-    echo -e "🌐 访问地址: ${GREEN}http://127.0.0.1:${PORT}${RESET}"
-    echo -e "🔑 管理员密码: ${GREEN}${ADMIN_PASSWORD}${RESET}"
-}
-
-install_app() {
-    read -p "请输入映射端口 (默认 ${DEFAULT_PORT}): " PORT
-    PORT=${PORT:-$DEFAULT_PORT}
-
-    read -p "请输入管理员密码 (默认 ${DEFAULT_ADMIN_PASS}): " ADMIN_PASSWORD
-    ADMIN_PASSWORD=${ADMIN_PASSWORD:-$DEFAULT_ADMIN_PASS}
-
-    create_compose "$PORT" "$ADMIN_PASSWORD"
-    docker compose -f $YML_FILE up -d
-    echo -e "✅ ${GREEN}Music Player 已安装并启动${RESET}"
-    print_access_info
-}
-
-stop_app() {
-    docker compose -f $YML_FILE down
-    echo -e "🛑 ${GREEN}Music Player 已停止${RESET}"
-}
-
-start_app() {
-    docker compose -f $YML_FILE up -d
-    echo -e "🚀 ${GREEN}Music Player 已启动${RESET}"
-}
-
-restart_app() {
-    docker compose -f $YML_FILE down
-    docker compose -f $YML_FILE up -d
-    echo -e "🔄 ${GREEN}Music Player 已重启${RESET}"
-}
-
-update_app() {
-    docker compose -f $YML_FILE pull
-    docker compose -f $YML_FILE up -d
-    echo -e "⬆️ ${GREEN}Music Player 已更新到最新版本${RESET}"
-}
-
-logs_app() {
-    docker logs -f $APP_NAME
-}
-
-uninstall_app() {
-    cd "$BASE_DIR" || { echo -e "❌ ${GREEN}安装目录不存在${RESET}"; return; }
-    docker compose down -v
-    rm -rf "$BASE_DIR"
-    echo -e "🗑️ ${GREEN}Music Player 已卸载，安装目录和数据已删除${RESET}"
-}
-
-
-while true; do
-    show_menu
     case $choice in
         1) install_app ;;
-        2) stop_app ;;
-        3) start_app ;;
-        4) restart_app ;;
-        5) update_app ;;
-        6) logs_app ;;
-        7) uninstall_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) view_logs ;;
+        5) show_db_info ;;
         0) exit 0 ;;
-        *) echo -e "❌ ${GREEN}无效选择${RESET}" ;;
+        *) echo "无效选择"; sleep 1; menu ;;
     esac
-done
+}
+
+function install_app() {
+    read -p "请输入 Web 端口 [默认:7791]: " input_port
+    PORT=${input_port:-7791}
+    read -p "请输入数据库名 [默认:lskypro]: " input_db
+    MYSQL_DATABASE=${input_db:-lskypro}
+    read -p "请输入数据库用户 [默认:lskyuser]: " input_user
+    MYSQL_USER=${input_user:-lskyuser}
+    read -p "请输入数据库密码 [默认:自动生成]: " input_pass
+    MYSQL_PASSWORD=${input_pass:-$(openssl rand -hex 8)}
+    read -p "请输入 Root 密码 [默认:自动生成]: " input_root
+    MYSQL_ROOT_PASSWORD=${input_root:-$(openssl rand -hex 8)}
+
+    mkdir -p "$APP_DIR/data/html" "$APP_DIR/data/db"
+
+    # 保存配置
+    cat > "$CONFIG_FILE" <<EOF
+PORT=$PORT
+MYSQL_DATABASE=$MYSQL_DATABASE
+MYSQL_USER=$MYSQL_USER
+MYSQL_PASSWORD=$MYSQL_PASSWORD
+MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD
+EOF
+
+    # 生成 compose
+    cat > "$COMPOSE_FILE" <<EOF
+version: "3.8"
+
+networks:
+  lsky-net:
+
+services:
+  lsky-pro:
+    image: dko0/lsky-pro:latest
+    container_name: lsky-pro
+    restart: always
+    ports:
+      - "127.0.0.1:${PORT}:80"
+    volumes:
+      - ./data/html:/var/www/html
+    environment:
+      - DB_HOST=mysql
+      - DB_DATABASE=${MYSQL_DATABASE}
+      - DB_USERNAME=${MYSQL_USER}
+      - DB_PASSWORD=${MYSQL_PASSWORD}
+    depends_on:
+      - mysql
+    networks:
+      - lsky-net
+
+  mysql:
+    image: mysql:8.0
+    container_name: lsky-pro-db
+    restart: always
+    environment:
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+    command: --default-authentication-plugin=mysql_native_password
+    volumes:
+      - ./data/db:/var/lib/mysql
+    networks:
+      - lsky-net
+EOF
+
+    cd "$APP_DIR"
+    docker compose up -d
+
+    echo -e "${GREEN}✅ Lsky-Pro 已启动${RESET}"
+    echo -e "${GREEN}🌐 访问地址: http://127.0.0.1:$PORT${RESET}"
+    show_db_info
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function update_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ Lsky-Pro 已更新${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function uninstall_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${GREEN}✅ Lsky-Pro 已卸载并清理数据${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function view_logs() {
+    docker logs -f lsky-pro
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function show_db_info() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "未找到配置文件，请先安装"
+        sleep 1
+        menu
+    fi
+    source "$CONFIG_FILE"
+    echo -e "${GREEN}📂 数据库信息:${RESET}"
+    echo -e "数据库名: ${MYSQL_DATABASE}"
+    echo -e "用户名:   ${MYSQL_USER}"
+    echo -e "密码:     ${MYSQL_PASSWORD}"
+    echo -e "Root 密码:${MYSQL_ROOT_PASSWORD}"
+    echo -e "连接地址: lsky-pro-db"
+}
+
+menu

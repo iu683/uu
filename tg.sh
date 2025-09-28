@@ -1,156 +1,160 @@
 #!/bin/bash
-# ============================================
-# Kuma-Mieru 管理脚本（支持公网访问 + 自定义端口）
-# ============================================
 
-set -e
+# ================================
+# kuma-mieru 管理脚本（菜单式）
+# 自动显示访问 IP+端口，配置 .env
+# ================================
 
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+# 颜色输出
+green="\033[32m"
+red="\033[31m"
+plain="\033[0m"
 
+# 项目目录
 APP_DIR="$HOME/kuma-mieru"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-ENV_FILE="$APP_DIR/kuma-mieru.env"
-CONTAINER_NAME="kuma-mieru"
+# 默认宿主机端口（映射 docker-compose.yml 的端口）
+HOST_PORT=3883
 
-menu() {
-    clear
-    echo -e "${GREEN}=== Kuma-Mieru 管理菜单 ===${RESET}"
-    echo -e "${YELLOW}1) 安装/部署 Kuma-Mieru${RESET}"
-    echo -e "${YELLOW}2) 更新 Kuma-Mieru${RESET}"
-    echo -e "${YELLOW}3) 卸载 Kuma-Mieru${RESET}"
-    echo -e "${YELLOW}4) 查看日志${RESET}"
-    echo -e "${YELLOW}5) 查看访问信息${RESET}"
-    echo -e "${YELLOW}0) 退出${RESET}"
-    echo
-    read -p "请选择操作: " choice
+# 检查 root
+if [ "$(id -u)" != "0" ]; then
+    echo -e "${red}请使用 root 用户运行脚本${plain}"
+    exit 1
+fi
 
-    case $choice in
-        1) install ;;
-        2) update ;;
-        3) uninstall ;;
-        4) logs ;;
-        5) show_info ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择！${RESET}" && sleep 1 && menu ;;
-    esac
-}
-
-load_env() {
-    if [ -f "$ENV_FILE" ]; then
-        source "$ENV_FILE"
+# 安装 Docker / Compose
+install_docker() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${green}安装 Docker...${plain}"
+        apt update
+        apt install -y docker.io
+    fi
+    if ! docker compose version &> /dev/null; then
+        echo -e "${green}安装 Docker Compose 插件...${plain}"
+        apt install -y docker-compose-plugin
     fi
 }
 
-install() {
-    echo -e "${GREEN}=== 开始安装 Kuma-Mieru ===${RESET}"
+# 配置 .env（基础变量 + 功能变量可自定义）
+configure_env() {
+    cp -f .env.example .env
 
-    mkdir -p "$APP_DIR"
+    # 基础变量
+    sed -i "s|^UPTIME_KUMA_BASE_URL=.*|UPTIME_KUMA_BASE_URL=${UPTIME_KUMA_BASE_URL}|" .env
+    sed -i "s|^PAGE_ID=.*|PAGE_ID=${PAGE_ID}|" .env
 
-    read -p "请输入映射端口 (默认: 3883): " KUMA_PORT
-    KUMA_PORT=${KUMA_PORT:-3883}
-
-    read -p "请输入 Uptime Kuma 基础 URL (公网访问必填): " UPTIME_KUMA_BASE_URL
-    [ -z "$UPTIME_KUMA_BASE_URL" ] && echo -e "${RED}必须填写 Uptime Kuma 基础 URL！${RESET}" && exit 1
-
-    read -p "请输入 Uptime Kuma 状态页面 ID (必填): " PAGE_ID
-    [ -z "$PAGE_ID" ] && echo -e "${RED}必须填写状态页面 ID！${RESET}" && exit 1
-
-    read -p "是否展示 'Edit This Page' 按钮? (true/false, 默认: false): " FEATURE_EDIT_THIS_PAGE
+    # 功能变量，自定义输入，默认值回车即可
+    read -p "FEATURE_EDIT_THIS_PAGE [默认: false]: " FEATURE_EDIT_THIS_PAGE
     FEATURE_EDIT_THIS_PAGE=${FEATURE_EDIT_THIS_PAGE:-false}
 
-    read -p "是否展示 'Star on Github' 按钮? (true/false, 默认: true): " FEATURE_SHOW_STAR_BUTTON
+    read -p "FEATURE_SHOW_STAR_BUTTON [默认: true]: " FEATURE_SHOW_STAR_BUTTON
     FEATURE_SHOW_STAR_BUTTON=${FEATURE_SHOW_STAR_BUTTON:-true}
 
-    read -p "请输入页面标题 (默认: Kuma Mieru): " FEATURE_TITLE
-    FEATURE_TITLE=${FEATURE_TITLE:-Kuma Mieru}
+    read -p "FEATURE_TITLE [默认: Kuma Mieru]: " FEATURE_TITLE
+    FEATURE_TITLE=${FEATURE_TITLE:-"Kuma Mieru"}
 
-    read -p "请输入页面描述 (默认: A beautiful and modern uptime monitoring dashboard): " FEATURE_DESCRIPTION
+    read -p "FEATURE_DESCRIPTION [默认: A beautiful and modern uptime monitoring dashboard]: " FEATURE_DESCRIPTION
     FEATURE_DESCRIPTION=${FEATURE_DESCRIPTION:-"A beautiful and modern uptime monitoring dashboard"}
 
-    read -p "请输入页面图标 URL (默认: /icon.svg): " FEATURE_ICON
-    FEATURE_ICON=${FEATURE_ICON:-/icon.svg}
+    read -p "FEATURE_ICON [默认: /icon.svg]: " FEATURE_ICON
+    FEATURE_ICON=${FEATURE_ICON:-"/icon.svg"}
 
     # 写入 .env
-    cat > "$ENV_FILE" <<EOF
-KUMA_PORT=$KUMA_PORT
-UPTIME_KUMA_BASE_URL=$UPTIME_KUMA_BASE_URL
-PAGE_ID=$PAGE_ID
-FEATURE_EDIT_THIS_PAGE=$FEATURE_EDIT_THIS_PAGE
-FEATURE_SHOW_STAR_BUTTON=$FEATURE_SHOW_STAR_BUTTON
-FEATURE_TITLE="$FEATURE_TITLE"
-FEATURE_DESCRIPTION="$FEATURE_DESCRIPTION"
-FEATURE_ICON=$FEATURE_ICON
-EOF
+    env_vars=(
+        "FEATURE_EDIT_THIS_PAGE=${FEATURE_EDIT_THIS_PAGE}"
+        "FEATURE_SHOW_STAR_BUTTON=${FEATURE_SHOW_STAR_BUTTON}"
+        "FEATURE_TITLE=${FEATURE_TITLE}"
+        "FEATURE_DESCRIPTION=${FEATURE_DESCRIPTION}"
+        "FEATURE_ICON=${FEATURE_ICON}"
+    )
 
-    # 写入 docker-compose.yml（绑定公网）
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  kuma-mieru:
-    image: ghcr.io/alice39s/kuma-mieru:latest
-    container_name: $CONTAINER_NAME
-    restart: unless-stopped
-    ports:
-      - "0.0.0.0:\${KUMA_PORT}:3000"
-    env_file:
-      - ./kuma-mieru.env
-    environment:
-      NODE_ENV: production
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
-      interval: 30s
-      timeout: 3s
-      retries: 3
-    tmpfs:
-      - /tmp
-EOF
-
-    (cd "$APP_DIR" && docker compose up -d)
-
-    show_info
-    read -p "按回车返回菜单..." && menu
+    for var in "${env_vars[@]}"; do
+        key="${var%%=*}"
+        if grep -q "^$key=" .env; then
+            sed -i "s|^$key=.*|$var|" .env
+        else
+            echo "$var" >> .env
+        fi
+    done
 }
 
-update() {
-    echo -e "${GREEN}=== 更新 Kuma-Mieru ===${RESET}"
-    (cd "$APP_DIR" && docker compose pull && docker compose up -d)
-    echo -e "${GREEN}✅ 更新完成！${RESET}"
-    read -p "按回车返回菜单..." && menu
-}
+# 部署安装
+install_app() {
+    install_docker
 
-uninstall() {
-    echo -e "${RED}⚠️  即将卸载 Kuma-Mieru，并删除相关数据！${RESET}"
-    read -p "确认卸载? (y/N): " confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        (cd "$APP_DIR" && docker compose down -v)
-        rm -rf "$APP_DIR"
-        echo -e "${GREEN}✅ 卸载完成${RESET}"
+    # 输入基础变量
+    echo -e "${green}请输入 Uptime Kuma 地址 (例如 https://example.kuma-mieru.invalid):${plain}"
+    read UPTIME_KUMA_BASE_URL
+    echo -e "${green}请输入页面 ID:${plain}"
+    read PAGE_ID
+
+    # 克隆或更新仓库
+    if [ -d "$APP_DIR" ]; then
+        echo -e "${green}检测到已有项目，拉取最新代码...${plain}"
+        cd "$APP_DIR"
+        git pull
     else
-        echo -e "${YELLOW}已取消${RESET}"
+        git clone https://github.com/Alice39s/kuma-mieru.git "$APP_DIR"
+        cd "$APP_DIR"
     fi
-    read -p "按回车返回菜单..." && menu
+
+    # 配置 .env
+    configure_env
+
+    # 启动服务
+    docker compose up -d
+
+    SERVER_IP=$(hostname -I | awk '{print $1}')
+    echo -e "${green}部署完成！访问地址: http://${SERVER_IP}:${HOST_PORT}${plain}"
 }
 
-logs() {
-    echo -e "${GREEN}=== 查看 Kuma-Mieru 日志 ===${RESET}"
-    docker logs -f $CONTAINER_NAME
-    read -p "按回车返回菜单..." && menu
+# 更新服务
+update_app() {
+    if [ ! -d "$APP_DIR" ]; then
+        echo -e "${red}项目未安装，请先安装！${plain}"
+        return
+    fi
+    cd "$APP_DIR"
+
+    echo -e "${green}拉取最新代码并重启服务...${plain}"
+    git pull
+    docker compose pull
+    docker compose up -d
+
+    # 保持原来的基础变量，功能变量可自定义
+    configure_env
+
+    SERVER_IP=$(hostname -I | awk '{print $1}')
+    echo -e "${green}更新完成！访问地址: http://${SERVER_IP}:${HOST_PORT}${plain}"
 }
 
-show_info() {
-    load_env
-    PUBLIC_IP=$(curl -s ifconfig.me || echo "your-server-ip")
-    echo -e "${GREEN}=== 当前 Kuma-Mieru 配置信息 ===${RESET}"
-    echo -e "访问地址: ${YELLOW}http://${PUBLIC_IP}:${KUMA_PORT}${RESET}"
-    echo -e "UPTIME_KUMA_BASE_URL: ${UPTIME_KUMA_BASE_URL}"
-    echo -e "PAGE_ID: ${PAGE_ID}"
-    echo -e "FEATURE_EDIT_THIS_PAGE: ${FEATURE_EDIT_THIS_PAGE}"
-    echo -e "FEATURE_SHOW_STAR_BUTTON: ${FEATURE_SHOW_STAR_BUTTON}"
-    echo -e "FEATURE_TITLE: ${FEATURE_TITLE}"
-    echo -e "FEATURE_DESCRIPTION: ${FEATURE_DESCRIPTION}"
-    echo -e "FEATURE_ICON: ${FEATURE_ICON}"
+# 卸载服务
+uninstall_app() {
+    if [ ! -d "$APP_DIR" ]; then
+        echo -e "${red}项目未安装，无需卸载${plain}"
+        return
+    fi
+    cd "$APP_DIR"
+    echo -e "${green}停止并删除容器和镜像...${plain}"
+    docker compose down --rmi all
+    cd ~
+    rm -rf "$APP_DIR"
+    echo -e "${green}卸载完成！${plain}"
 }
 
-menu
+# 菜单
+while true; do
+    echo -e "\n${green}=== kuma-mieru 管理菜单 ===${plain}"
+    echo -e "${green}1) 安装 / 部署${plain}"
+    echo -e "${green}2) 更新${plain}"
+    echo -e "${green}3) 卸载${plain}"
+    echo -e "${green}0) 退出${plain}"
+    echo -ne "${green}请选择操作: ${plain}"
+    read choice
+    case "$choice" in
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        0) exit 0 ;;
+        *) echo -e "${red}无效选项${plain}" ;;
+    esac
+done

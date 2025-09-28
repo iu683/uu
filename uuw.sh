@@ -1,22 +1,22 @@
 #!/bin/bash
 # ========================================
-# Sun Panel 一键管理脚本
+# Vaultwarden 一键管理脚本（可自定义域名和注册选项）
 # ========================================
 
 GREEN="\033[32m"
 RESET="\033[0m"
-APP_NAME="sun-panel"
-COMPOSE_DIR="$HOME/sun-panel"
-COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yml"
-DEFAULT_PORT=3002
+APP_NAME="vaultwarden"
+APP_DIR="$HOME/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/config.env"
 
 function get_ip() {
-    curl -s ifconfig.me || curl -s ip.sb || echo "your-ip"
+    curl -s ifconfig.me || curl -s ip.sb || echo "127.0.0.1"
 }
 
 function menu() {
     clear
-    echo -e "${GREEN}=== sun-panel 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== Vaultwarden 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装/启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载 (含数据)${RESET}"
@@ -35,55 +35,66 @@ function menu() {
 }
 
 function install_app() {
-    read -p "请输入 Web 端口 [默认:${DEFAULT_PORT}]: " input_port
-    PORT=${input_port:-$DEFAULT_PORT}
+    read -p "请输入 Web 端口 [默认:11001]: " input_port
+    PORT=${input_port:-11001}
 
-    mkdir -p "$COMPOSE_DIR/conf"
+    read -p "请输入 Vaultwarden 域名（可留空）: " DOMAIN
+    read -p "是否允许注册新账户？(true/false) [默认:true]: " SIGNUPS_ALLOWED
+    SIGNUPS_ALLOWED=${SIGNUPS_ALLOWED:-true}
 
+    # 创建数据目录
+    mkdir -p "$APP_DIR/vw-data"
+
+    # 生成 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
-version: '3.2'
 services:
-  sun-panel:
-    image: hslr/sun-panel:latest
-    container_name: sun-panel
+  vaultwarden:
+    image: vaultwarden/server:latest
+    container_name: vaultwarden
     restart: always
-    ports:
-      - "${PORT}:3002"
+    environment:
+      DOMAIN: "${DOMAIN}"
+      SIGNUPS_ALLOWED: "${SIGNUPS_ALLOWED}"
     volumes:
-      - ${COMPOSE_DIR}/conf:/app/conf
-      - /var/run/docker.sock:/var/run/docker.sock
+      - $APP_DIR/vw-data:/data
+    ports:
+      - "$PORT:80"
 EOF
 
-    cd "$COMPOSE_DIR"
+    echo -e "PORT=$PORT\nDOMAIN=$DOMAIN\nSIGNUPS_ALLOWED=$SIGNUPS_ALLOWED" > "$CONFIG_FILE"
+
+    cd "$APP_DIR"
     docker compose up -d
 
-    echo -e "${GREEN}✅ ${APP_NAME} 已启动${RESET}"
-    echo -e "${GREEN}🌐 Web UI 地址: http://$(get_ip):$PORT${RESET}"
-    echo -e "${GREEN}📂 配置目录: $COMPOSE_DIR/conf${RESET}"
+    echo -e "${GREEN}✅ Vaultwarden 已启动${RESET}"
+    echo -e "${GREEN}🌐 Web UI 地址: http://127.0.0.1:$PORT${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR/vw-data${RESET}"
+    echo -e "${GREEN}🛡 注册允许: $SIGNUPS_ALLOWED${RESET}"
+    [ -n "$DOMAIN" ] && echo -e "${GREEN}🌍 域名: $DOMAIN${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 function update_app() {
-    cd "$COMPOSE_DIR" || exit
+    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ ${APP_NAME} 已更新并重启完成${RESET}"
+    echo -e "${GREEN}✅ Vaultwarden 已更新并重启完成${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 function uninstall_app() {
-    cd "$COMPOSE_DIR" || exit
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
-    rm -rf "$COMPOSE_DIR"
-    echo -e "${GREEN}✅ ${APP_NAME} 已卸载，数据已删除${RESET}"
+    rm -rf "$APP_DIR"
+    echo -e "${GREEN}✅ Vaultwarden 已卸载，数据已删除${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 function view_logs() {
-    docker logs -f sun-panel
+    docker logs -f vaultwarden
     read -p "按回车返回菜单..."
     menu
 }

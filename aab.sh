@@ -1,222 +1,176 @@
 #!/bin/bash
+# Jellyfin 一键部署与更新菜单脚本（绿色菜单、强制root、显示公网IP）
 
-# ================== 颜色变量 ==================
-RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+RESET='\033[0m'
 
-check_root() {
-    if [ "$(id -u)" != "0" ]; then
-        echo -e "${RED}错误: 请使用root用户运行此脚本${NC}"
+DEFAULT_CONTAINER_NAME="jellyfin"
+DEFAULT_DATA_DIR="/opt/jellyfin"
+DEFAULT_HTTP_PORT="8096"
+IMAGE_NAME="jellyfin/jellyfin:latest"
+CONFIG_FILE="/opt/jellyfin/jellyfin_config"
+
+CONTAINER_NAME=""
+DATA_DIR=""
+HTTP_PORT=""
+
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${GREEN}错误: Docker 未安装，请先安装 Docker${RESET}"
         exit 1
     fi
 }
 
-check_docker() {
-    export PATH=$PATH:/usr/local/bin
-    if ! command -v docker &> /dev/null; then
-        echo "正在安装 Docker..."
-        curl -fsSL https://get.docker.com | sh || { echo "Docker 安装失败"; exit 1; }
+get_public_ip() {
+    PUBLIC_IP=$(curl -s https://ipinfo.io/ip)
+    if ! [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        PUBLIC_IP=$(curl -s https://ifconfig.me/ip)
     fi
-    if ! command -v docker-compose &> /dev/null; then
-        echo "正在安装 Docker Compose..."
-        curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose || { echo "Docker Compose 下载失败"; exit 1; }
-        chmod +x /usr/local/bin/docker-compose
+    if ! [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        PUBLIC_IP=""
     fi
+    echo "$PUBLIC_IP"
 }
 
-check_port() {
-    local port=$1
-    if lsof -i:$port &> /dev/null; then
-        echo -e "✗ 端口 $port........ ${RED}被占用${NC}"
+load_or_input_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    fi
+
+    read -p "请输入容器名 [${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}]: " input_container
+    CONTAINER_NAME=${input_container:-${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}}
+
+    read -p "请输入统一存放目录（配置+媒体+缓存） [${DATA_DIR:-$DEFAULT_DATA_DIR}]: " input_dir
+    DATA_DIR=${input_dir:-${DATA_DIR:-$DEFAULT_DATA_DIR}}
+
+    read -p "请输入宿主机 HTTP 映射端口 [${HTTP_PORT:-$DEFAULT_HTTP_PORT}]: " input_port
+    HTTP_PORT=${input_port:-${HTTP_PORT:-$DEFAULT_HTTP_PORT}}
+
+    echo "CONTAINER_NAME=\"$CONTAINER_NAME\"" > "$CONFIG_FILE"
+    echo "DATA_DIR=\"$DATA_DIR\"" >> "$CONFIG_FILE"
+    echo "HTTP_PORT=\"$HTTP_PORT\"" >> "$CONFIG_FILE"
+}
+
+create_dirs() {
+    mkdir -p "$DATA_DIR/config" "$DATA_DIR/cache" "$DATA_DIR/media"
+    echo -e "${GREEN}已创建数据目录: $DATA_DIR${RESET}"
+    chmod -R 755 "$DATA_DIR"
+}
+
+deploy_jellyfin() {
+    load_or_input_config
+    create_dirs
+    echo -e "${GREEN}正在部署 Jellyfin 容器...${RESET}"
+
+    docker run -d \
+        --name $CONTAINER_NAME \
+        --restart unless-stopped \
+        -e TZ=Asia/Shanghai \
+        -e UID=0 \
+        -e GID=0 \
+        -e GIDLIST=0 \
+        -p 127.0.0.1:$HTTP_PORT:8096 \
+        -p 8920:8920 \
+        -v $DATA_DIR/config:/config \
+        -v $DATA_DIR/cache:/cache \
+        -v $DATA_DIR/media:/media \
+        $IMAGE_NAME
+
+    PUBLIC_IP=$(get_public_ip)
+    if [[ $PUBLIC_IP != "无法获取公网 IP" ]]; then
+        echo -e "${GREEN}部署完成！公网访问地址: http://127.0.0.1:${HTTP_PORT}${RESET}"
     else
-        echo -e "✓ 端口 $port........ ${GREEN}可用${NC}"
+        echo -e "${GREEN}部署完成${RESET}"
     fi
 }
 
-create_docker_compose() {
-    local domain=$1
-    local root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
-    local admin_email="admin@${root_domain}"
+start_jellyfin() { docker start $CONTAINER_NAME && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_jellyfin() { docker stop $CONTAINER_NAME && echo -e "${GREEN}容器已停止${RESET}"; }
+remove_jellyfin() { docker rm -f $CONTAINER_NAME && echo -e "${GREEN}容器已删除${RESET}"; }
+view_logs() { docker logs -f $CONTAINER_NAME; }
 
-    mkdir -p /opt/posteio
-    cd /opt/posteio || exit 1
-
-    cat > docker-compose.yml << EOF
-services:
-  mailserver:
-    image: analogic/poste.io
-    hostname: ${domain}
-    ports:
-      - "25:25"
-      - "110:110"
-      - "143:143"
-      - "587:587"
-      - "993:993"
-      - "995:995"
-      - "4190:4190"
-      - "465:465"
-      - "8808:80"
-      - "8843:443"
-    environment:
-      - LETSENCRYPT_EMAIL=${admin_email}
-      - LETSENCRYPT_HOST=${domain}
-      - VIRTUAL_HOST=${domain}
-      - DISABLE_CLAMAV=TRUE
-      - DISABLE_RSPAMD=TRUE
-      - TZ=Asia/Shanghai
-      - HTTPS=OFF
-    volumes:
-      - /etc/localtime:/etc/localtime:ro
-      - ./mail-data:/data
-EOF
+uninstall_all() {
+    stop_jellyfin
+    remove_jellyfin
+    if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
+        read -p "确定要删除 $DATA_DIR 吗？此操作不可恢复 [y/N]: " confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            rm -rf "$DATA_DIR"
+            echo -e "${GREEN}数据目录已删除${RESET}"
+        fi
+    fi
+    [ -f "$CONFIG_FILE" ] && rm -f "$CONFIG_FILE" && echo -e "${GREEN}配置文件已删除${RESET}"
 }
 
-show_dns_info() {
-    local domain=$1
-    local ip=$(curl -s ifconfig.me)
-    local root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+update_image() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    else
+        echo -e "${GREEN}配置文件不存在，请先部署容器${RESET}"
+        exit 1
+    fi
 
-    echo -e "\n\033[38;5;81m────────────────────────\033[0m"
-    echo -e "${GREEN}▶ 请配置以下DNS记录：${NC}"
-    echo -e "${GREEN}▶ A       mail      ${ip}${NC}"
-    echo -e "${GREEN}▶ CNAME   imap      ${domain}${NC}"
-    echo -e "${GREEN}▶ CNAME   pop       ${domain}${NC}"
-    echo -e "${GREEN}▶ CNAME   smtp      ${domain}${NC}"
-    echo -e "${GREEN}▶ MX      @         ${domain}${NC}"
-    echo -e "${GREEN}▶ TXT     @         v=spf1 mx ~all${NC}"
-    echo -e "${GREEN}▶ TXT     _dmarc    v=DMARC1; p=none; rua=mailto:admin@${root_domain}${NC}"
-    echo -e "\033[38;5;81m────────────────────────\033[0m"
+    echo -e "${GREEN}正在拉取最新镜像: $IMAGE_NAME ...${RESET}"
+    docker pull $IMAGE_NAME
+
+    if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
+        echo -e "${GREEN}停止正在运行的容器...${RESET}"
+        docker stop $CONTAINER_NAME
+    fi
+
+    if [ "$(docker ps -a -q -f name=$CONTAINER_NAME)" ]; then
+        echo -e "${GREEN}删除旧容器（保留数据）...${RESET}"
+        docker rm $CONTAINER_NAME
+    fi
+
+    echo -e "${GREEN}使用最新镜像重启容器...${RESET}"
+    docker run -d \
+        --name $CONTAINER_NAME \
+        --restart unless-stopped \
+        -e TZ=Asia/Shanghai \
+        -e UID=0 \
+        -e GID=0 \
+        -e GIDLIST=0 \
+        -p 127.0.0.1:$HTTP_PORT:8096 \
+        -p 8920:8920 \
+        -v $DATA_DIR/config:/config \
+        -v $DATA_DIR/cache:/cache \
+        -v $DATA_DIR/media:/media \
+        $IMAGE_NAME
+
+    PUBLIC_IP=$(get_public_ip)
+    if [[ $PUBLIC_IP != "无法获取公网 IP" ]]; then
+        echo -e "${GREEN}更新完成${RESET}"
+    else
+        echo -e "${GREEN}更新完成${RESET}"
+    fi
 }
 
-main_menu_action() {
-    local choice=$1
+show_menu() {
+    echo -e "${GREEN}===== Jellyfin菜单 =====${RESET}"
+    echo -e "${GREEN}1. 部署${RESET}"
+    echo -e "${GREEN}2. 启动容器${RESET}"
+    echo -e "${GREEN}3. 停止容器${RESET}"
+    echo -e "${GREEN}4. 查看日志${RESET}"
+    echo -e "${GREEN}5. 卸载${RESET}"
+    echo -e "${GREEN}6. 更新${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -n "请输入编号: "
+}
+
+check_docker
+
+while true; do
+    show_menu
+    read choice
     case $choice in
-        1)
-            read -p "请输入邮箱域名 (例如: mail.example.com): " domain
-            create_docker_compose "$domain"
-            cd /opt/posteio
-            echo "正在启动服务..."
-            docker-compose up -d || { echo -e "${RED}启动失败！${NC}"; exit 1; }
-            show_dns_info "$domain"
-            local ip=$(curl -s ifconfig.me)
-
-            echo -e "\n\033[38;5;81m────────────────────────\033[0m"
-            echo -e "${GREEN}▶ 安装完成！${NC}"
-            echo -e "${GREEN}▶ 首次配置页面: https://${domain}${NC}"
-            echo -e "${GREEN}▶ 管理后台: https://${domain}/admin${NC}"
-            echo -e "${GREEN}▶ 默认管理员账号: admin@${domain#mail.}${NC}"
-            echo -e "${GREEN}▶ 访问地址(IP:8808): http://${ip}:8808${NC}"
-            echo -e "\033[38;5;81m────────────────────────\033[0m"
-            ;;
-        2)
-            if [ -d "/opt/posteio" ]; then
-                cd /opt/posteio
-                echo "正在更新服务..."
-                docker-compose pull
-                docker-compose up -d
-                echo -e "\n\033[38;5;81m────────────────────────\033[0m"
-                echo -e "${GREEN}▶ 更新完成！${NC}"
-                echo -e "\033[38;5;81m────────────────────────\033[0m"
-            else
-                echo -e "\n${RED}未找到安装目录！${NC}"
-            fi
-            ;;
-        3)
-            if [ -d "/opt/posteio" ]; then
-                cd /opt/posteio
-                echo "正在卸载服务..."
-                docker-compose down
-                docker images | awk '/poste\.io/ {print $3}' | xargs -r docker rmi -f
-                cd /root/data/docker_data
-                rm -rf posteio
-                echo -e "\n\033[38;5;81m────────────────────────\033[0m"
-                echo -e "${GREEN}▶ 已完全卸载服务、数据和镜像！${NC}"
-                echo -e "\033[38;5;81m────────────────────────\033[0m"
-            else
-                echo -e "\n${RED}未找到安装目录！${NC}"
-            fi
-            ;;
+        1) deploy_jellyfin ;;
+        2) start_jellyfin ;;
+        3) stop_jellyfin ;;
+        4) view_logs ;;
+        5) uninstall_all ;;
+        6) update_image ;;
+        0) echo "退出脚本"; exit 0 ;;
+        *) echo -e "${GREEN}无效选项${RESET}" ;;
     esac
-
-    read -p "按回车返回菜单，或输入 q 退出: " back
-    [[ "$back" == "q" ]] && exit 0
-    initial_check
-}
-
-initial_check() {
-    clear
-    check_docker
-
-    # 菜单标题
-    echo -e "\033[1;36m=====  Poste.io菜单管理 =====\033[0m\n"
-
-    echo -e "\033[1;36m系统检查\033[0m"
-    echo -e "\033[38;5;81m────────────────────────\033[0m"
-
-    echo -n "✓ Telnet......... "
-    if command -v telnet &> /dev/null; then
-        echo -e "${GREEN}已安装${NC}"
-    else
-        echo -e "${RED}未安装${NC}"
-        echo "正在安装telnet..."
-        apt-get update && apt-get install -y telnet > /dev/null 2>&1
-    fi
-
-    echo -n "✓ 邮局服务....... "
-    if [ -d "/root/data/docker_data/posteio" ]; then
-        echo -e "${GREEN}已安装${NC}"
-    else
-        echo -e "${RED}未安装${NC}"
-    fi
-
-    echo -e "\n\033[1;36m端口检测\033[0m"
-    echo -e "\033[38;5;81m────────────────────────\033[0m"
-
-    # 远程25端口检测
-    port=25
-    timeout=3
-    telnet_output=$(echo "quit" | timeout $timeout telnet smtp.qq.com $port 2>&1)
-    if echo "$telnet_output" | grep -q "Connected"; then
-        echo -e "✓ 端口 $port........ ${GREEN}可访问外网SMTP${NC}"
-    else
-        echo -e "✗ 端口 $port........ ${RED}不可访问外网SMTP${NC}"
-    fi
-
-    # 其他端口检查
-    for port in 587 110 143 993 995 465 80 443; do
-        check_port $port
-    done
-
-    echo -e "\n\033[1;36m操作选项\033[0m"
-    echo -e "\033[38;5;81m────────────────────────\033[0m"
-
-    local menu_options=("安装 Poste.io" "更新服务" "卸载 Poste.io" "退出脚本")
-    local colors=($GREEN $GREEN $RED $RED)
-
-    for i in "${!menu_options[@]}"; do
-        printf "${colors[i]}▶ %d. %s${NC}\n" $((i+1)) "${menu_options[i]}"
-    done
-
-    echo -e "\033[38;5;81m────────────────────────\033[0m"
-    read -p "$(echo -e "\033[1;33m请输入选项 [1-4]: \033[0m")" choice
-
-    case $choice in
-        1|2|3)
-            main_menu_action $choice
-            ;;
-        4)
-            echo -e "\n${GREEN}感谢使用，再见！${NC}"
-            exit 0
-            ;;
-        *)
-            echo -e "\n${RED}无效选项，请重新选择${NC}"
-            sleep 2
-            initial_check
-            ;;
-    esac
-}
-
-check_root
-initial_check
+done

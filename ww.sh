@@ -1,155 +1,107 @@
 #!/bin/bash
+# ============================================
+# Komari 管理脚本（菜单版）
+# 功能: 安装/更新/卸载/日志
+# ============================================
+
+set -e
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-# 容器配置
-DOCKER_NAME="npm"
-DOCKER_IMG="jc21/nginx-proxy-manager:latest"
-DATA_PATH="/opt/npm/data"
-CERT_PATH="/opt/npm/letsencrypt"
-CONFIG_FILE="/opt/npm/config.conf"
+COMPOSE_FILE="/opt/komari/docker-compose.yml"
+DATA_DIR="/opt/komari/data"
+CONTAINER_NAME="komari"
+PORT=25774
 
-# 获取公网 IP
-get_public_ip() {
-    local ip
-    ip=$(curl -s ipv4.ip.sb)
-    [[ -z "$ip" ]] && ip=$(curl -s ifconfig.me)
-    [[ -z "$ip" ]] && ip=$(curl -s ipinfo.io/ip)
-    if [[ -z "$ip" ]]; then
-        echo -e "${RED}无法获取公网 IP${RESET}"
-        return 1
-    fi
-    echo "$ip"
-}
-
-# ================== 初始化配置 ==================
-if [[ -f "$CONFIG_FILE" ]]; then
-    source "$CONFIG_FILE"
-else
-    read -p "请输入 NPM 面板端口 (默认 81): " input_port
-    DOCKER_PORT=${input_port:-81}
-    mkdir -p "$(dirname $CONFIG_FILE)"
-    echo "DOCKER_PORT=$DOCKER_PORT" > "$CONFIG_FILE"
-fi
-
-# ================== 函数 ==================
-docker_update_image() {
-    echo -e "${GREEN}正在拉取最新 NPM 镜像...${RESET}"
-    docker pull $DOCKER_IMG
-}
-
-docker_install() {
-    # 检测端口是否被占用
-    if lsof -i:$DOCKER_PORT -sTCP:LISTEN || lsof -i:80 -sTCP:LISTEN || lsof -i:443 -sTCP:LISTEN; then
-        echo -e "${RED}⚠️ 端口 $DOCKER_PORT / 80 / 443 已被占用，请先释放端口再运行 NPM${RESET}"
-        return 1
-    fi
-
-    mkdir -p "$DATA_PATH" "$CERT_PATH"
-    docker_update_image
-
-    if docker ps -a --format '{{.Names}}' | grep -q "^${DOCKER_NAME}$"; then
-        echo -e "${YELLOW}检测到已有 NPM 容器，无法重复安装，请选择更新或启动${RESET}"
-        return 1
-    fi
-
-    docker run -d \
-      --name=$DOCKER_NAME \
-      -p ${DOCKER_PORT}:81 \
-      -p 80:80 \
-      -p 443:443 \
-      -v $DATA_PATH:/data \
-      -v $CERT_PATH:/etc/letsencrypt \
-      --restart=always \
-      $DOCKER_IMG
-
-    local ip=$(get_public_ip)
-    echo -e "${GREEN}✅ Nginx Proxy Manager 已安装并启动${RESET}"
-    echo -e "${GREEN}管理面板地址: http://${ip}:${DOCKER_PORT}${RESET}"
-    echo -e "${GREEN}初始用户名: admin@example.com${RESET}"
-    echo -e "${GREEN}初始密码: changeme${RESET}"
-}
-
-docker_update() {
-    docker_update_image
-
-    if docker ps -a --format '{{.Names}}' | grep -q "^${DOCKER_NAME}$"; then
-        echo -e "${YELLOW}停止旧容器并删除（保留数据）...${RESET}"
-        docker stop $DOCKER_NAME
-        docker rm $DOCKER_NAME
-    fi
-
-    docker run -d \
-      --name=$DOCKER_NAME \
-      -p ${DOCKER_PORT}:81 \
-      -p 80:80 \
-      -p 443:443 \
-      -v $DATA_PATH:/data \
-      -v $CERT_PATH:/etc/letsencrypt \
-      --restart=always \
-      $DOCKER_IMG
-
-    local ip=$(get_public_ip)
-    echo -e "${GREEN}✅ NPM 已更新并重启${RESET}"
-}
-
-docker_remove() {
-    docker rm -f $DOCKER_NAME 2>/dev/null
-    echo -e "${GREEN}✅ NPM 已卸载${RESET}"
-    # 删除数据
-    rm -rf "$DATA_PATH" "$CERT_PATH" "$CONFIG_FILE"
-    echo -e "${RED}数据目录已删除${RESET}"
-}
-
-docker_logs() {
-    docker logs -f $DOCKER_NAME
-}
-
-docker_start() {
-    docker start $DOCKER_NAME
-}
-
-docker_stop() {
-    docker stop $DOCKER_NAME
-}
-
-docker_restart() {
-    docker restart $DOCKER_NAME
-}
-
-# ================== 菜单 ==================
 menu() {
     clear
-    echo -e "${GREEN}=== Nginx Proxy Manager管理菜单 ===${RESET}"
-    echo -e "${GREEN}1. 安装 NPM${RESET}"
-    echo -e "${GREEN}2. 更新 NPM${RESET}"
-    echo -e "${GREEN}3. 启动 NPM${RESET}"
-    echo -e "${GREEN}4. 停止 NPM${RESET}"
-    echo -e "${GREEN}5. 重启 NPM${RESET}"
-    echo -e "${GREEN}6. 查看日志${RESET}"
-    echo -e "${GREEN}7. 卸载 NPM${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}=========================================${RESET}"
-    read -p $'\033[32m请输入选项: \033[0m' choice
+    echo -e "${GREEN}=== Komari 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装/部署 Komari${RESET}"
+    echo -e "${GREEN}2) 更新 Komari${RESET}"
+    echo -e "${GREEN}3) 卸载 Komari${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    echo
+    read -p "请选择操作: " choice
 
     case $choice in
-        1) docker_install ;;
-        2) docker_update ;;
-        3) docker_start ;;
-        4) docker_stop ;;
-        5) docker_restart ;;
-        6) docker_logs ;;
-        7) docker_remove ;;
+        1) install_komari ;;
+        2) update_komari ;;
+        3) uninstall_komari ;;
+        4) view_logs ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
+        *) echo -e "${RED}无效选择！${RESET}" && sleep 1 && menu ;;
     esac
 }
 
-# ================== 主循环 ==================
-while true; do
-    menu
-    read -p $'\033[32m按回车返回菜单...\033[0m' foo
-done
+install_komari() {
+    echo -e "${GREEN}=== 开始安装 Komari ===${RESET}"
+
+    mkdir -p "$DATA_DIR"
+
+    read -p "请输入管理员用户名 (默认: admin): " ADMIN_USERNAME
+    ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+
+    read -p "请输入管理员密码 (默认: admin123): " ADMIN_PASSWORD
+    ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
+
+    read -p "启用 Cloudflared? (默认: true): " KOMARI_ENABLE_CLOUDFLARED
+    KOMARI_ENABLE_CLOUDFLARED=${KOMARI_ENABLE_CLOUDFLARED:true}
+
+    read -p "请输入 Cloudflared Token: " KOMARI_CLOUDFLARED_TOKEN
+    KOMARI_CLOUDFLARED_TOKEN=""
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  komari:
+    image: ghcr.io/komari-monitor/komari:latest
+    container_name: $CONTAINER_NAME
+    ports:
+      - "${PORT}:${PORT}"
+    volumes:
+      - $DATA_DIR:/app/data
+    environment:
+      ADMIN_USERNAME: "$ADMIN_USERNAME"
+      ADMIN_PASSWORD: "$ADMIN_PASSWORD"
+      KOMARI_ENABLE_CLOUDFLARED: "$KOMARI_ENABLE_CLOUDFLARED"
+      KOMARI_CLOUDFLARED_TOKEN: "$KOMARI_CLOUDFLARED_TOKEN"
+      PORT: "$PORT"
+    restart: unless-stopped
+EOF
+
+    docker compose -f "$COMPOSE_FILE" up -d
+    echo -e "${GREEN}✅ 部署完成！访问地址: http://$(curl -s https://api.ipify.org):$PORT${RESET}"
+    echo -e "${GREEN}用户名: $ADMIN_USERNAME  密码: $ADMIN_PASSWORD${RESET}"
+    read -p "按回车返回菜单..." && menu
+}
+
+update_komari() {
+    echo -e "${GREEN}=== 更新 Komari ===${RESET}"
+    docker compose -f "$COMPOSE_FILE" pull
+    docker compose -f "$COMPOSE_FILE" up -d
+    echo -e "${GREEN}✅ 更新完成！访问地址: http://$(curl -s https://api.ipify.org):$PORT${RESET}"
+    read -p "按回车返回菜单..." && menu
+}
+
+uninstall_komari() {
+    echo -e "${RED} 即将卸载 Komari，并删除相关数据！${RESET}"
+    read -p "确认卸载? (y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        docker compose -f "$COMPOSE_FILE" down -v
+        rm -rf "/opt/komari"
+        echo -e "${GREEN}✅ 卸载完成${RESET}"
+    else
+        echo -e "${GREEN}已取消${RESET}"
+    fi
+    read -p "按回车返回菜单..." && menu
+}
+
+view_logs() {
+    echo -e "${GREEN}=== 查看 Komari 日志 ===${RESET}"
+    docker logs -f $CONTAINER_NAME
+    read -p "按回车返回菜单..." && menu
+}
+
+menu

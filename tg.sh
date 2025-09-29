@@ -1,25 +1,105 @@
 #!/bin/bash
 # ========================================
-# Koodo Reader 一键管理脚本 (Docker Compose)
+# Setube/STB 一键管理脚本 (Docker)
 # ========================================
 
 GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
-APP_NAME="koodo-reader"
+
+APP_NAME="stb"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-SECRET_FILE="$APP_DIR/my_secret.txt"
-CONFIG_FILE="$APP_DIR/config.env"
+DATA_DIR="$APP_DIR/data"
+CONTAINER_NAME="stb"
+IMAGE_NAME="setube/stb:latest"
 
-function menu() {
+# ---------- 端口检查函数 ----------
+check_port() {
+    local PORT=$1
+    while lsof -i :"$PORT" >/dev/null 2>&1; do
+        echo -e "${RED}❌ 端口 $PORT 已被占用，请输入其他端口${RESET}"
+        read -p "请输入端口: " PORT
+    done
+    echo $PORT
+}
+
+# ---------- 安装/启动 ----------
+install_app() {
+    mkdir -p "$DATA_DIR"
+
+    read -p "请输入容器映射端口 [默认 25519]: " input_port
+    PORT=${input_port:-25519}
+    PORT=$(check_port $PORT)
+
+    # 拉取最新镜像
+    echo -e "${YELLOW}拉取镜像 $IMAGE_NAME ...${RESET}"
+    docker pull $IMAGE_NAME
+    # 启动容器
+    docker run -d \
+        --name $CONTAINER_NAME \
+        -p 127.0.0.1:$PORT:25519 \
+        -v $DATA_DIR:/app/data \
+        --restart unless-stopped \
+        $IMAGE_NAME
+
+    echo -e "${GREEN}✅ $APP_NAME 已启动${RESET}"
+    echo -e "${GREEN}访问地址: http://127.0.0.1:$PORT${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+# ---------- 更新 ----------
+update_app() {
+    echo -e "${YELLOW}拉取最新镜像并更新容器...${RESET}"
+    docker pull $IMAGE_NAME
+    docker stop $CONTAINER_NAME 2>/dev/null
+    docker rm $CONTAINER_NAME 2>/dev/null
+    docker run -d \
+        --name $CONTAINER_NAME \
+        -p 127.0.0.1:$PORT:25519 \
+        -v $DATA_DIR:/app/data \
+        --restart unless-stopped \
+        $IMAGE_NAME
+    echo -e "${GREEN}✅ 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+# ---------- 卸载 ----------
+uninstall_app() {
+    read -p "⚠️ 确认卸载并删除数据? (y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        docker stop $CONTAINER_NAME 2>/dev/null
+        docker rm $CONTAINER_NAME 2>/dev/null
+        docker rmi $IMAGE_NAME 2>/dev/null
+        rm -rf "$APP_DIR"
+        echo -e "${GREEN}✅ 已卸载 $APP_NAME 并删除数据${RESET}"
+    else
+        echo "已取消卸载"
+    fi
+    read -p "按回车返回菜单..."
+    menu
+}
+
+# ---------- 查看日志 ----------
+view_logs() {
+    docker logs -f $CONTAINER_NAME
+    read -p "按回车返回菜单..."
+    menu
+}
+
+# ---------- 管理菜单 ----------
+menu() {
     clear
-    echo -e "${GREEN}=== Koodo Reader 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== STB图床 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载(含数据)${RESET}"
     echo -e "${GREEN}4) 查看日志${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}==========================${RESET}"
     read -p "请选择: " choice
     case $choice in
         1) install_app ;;
@@ -31,88 +111,5 @@ function menu() {
     esac
 }
 
-function install_app() {
-    read -p "请输入 web端口 [默认:80]: " input_web
-    PORT_WEB=${input_web:-80}
-
-    read -p "请输入 数据源端口 [默认:8080]: " input_http
-    PORT_HTTP=${input_http:-8080}
-
-    read -p "请输入管理用户名 [默认:admin]: " input_user
-    USERNAME=${input_user:-admin}
-
-    read -p "请输入管理密码 [默认:admin123]: " input_pwd
-    PASSWORD=${input_pwd:-admin123}
-
-    mkdir -p "$APP_DIR/uploads"
-
-    # 写入 secret 文件
-    echo "$PASSWORD" > "$SECRET_FILE"
-
-    # 生成 docker-compose.yml
-    cat > "$COMPOSE_FILE" <<EOF
-
-
-services:
-  koodo-reader:
-    image: ghcr.io/koodo-reader/koodo-reader:master
-    container_name: koodo-reader
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:$PORT_WEB:80"
-      - "127.0.0.1:$PORT_HTTP:8080"
-    environment:
-      - SERVER_USERNAME=$USERNAME
-      - SERVER_PASSWORD_FILE=my_secret
-      - ENABLE_HTTP_SERVER=false
-    volumes:
-      - $APP_DIR/uploads:/app/uploads
-    secrets:
-      - my_secret
-
-secrets:
-  my_secret:
-    file: $SECRET_FILE
-EOF
-
-    echo "PORT_HTTP=$PORT_HTTP" > "$CONFIG_FILE"
-    echo "PORT_WEB=$PORT_WEB" >> "$CONFIG_FILE"
-    echo "USERNAME=$USERNAME" >> "$CONFIG_FILE"
-    echo "PASSWORD=$PASSWORD" >> "$CONFIG_FILE"
-
-    cd "$APP_DIR"
-    docker compose up -d
-
-    echo -e "${GREEN}✅ Koodo Reader 已启动${RESET}"
-    echo -e "${GREEN}🌐 Web UI 地址: http://127.0.0.1:$PORT_WEB${RESET}"
-    echo -e "${GREEN}📂 上传目录: $APP_DIR/uploads${RESET}"
-    echo -e "${GREEN}🔑 管理员账号: $USERNAME  密码: $PASSWORD${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ Koodo Reader 已更新并重启完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function uninstall_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${GREEN}✅ Koodo Reader 已卸载，数据已删除${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function view_logs() {
-    docker logs -f koodo-reader
-    read -p "按回车返回菜单..."
-    menu
-}
-
+# ---------- 执行 ----------
 menu

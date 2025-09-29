@@ -1,120 +1,99 @@
 #!/bin/bash
-# ========================================
-# Setube/STB 一键管理脚本 (Docker)
-# ========================================
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="stb"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-DATA_DIR="$APP_DIR/data"
-CONTAINER_NAME="stb"
-IMAGE_NAME="setube/stb:latest"
+APP_NAME="OCI-Start"
+SCRIPT_URL="https://raw.githubusercontent.com/doubleDimple/shell-tools/master/oci-start.sh"
+SCRIPT_NAME="oci-start.sh"
 
-# ---------- 端口检查函数 ----------
-check_port() {
-    local PORT=$1
-    while lsof -i :"$PORT" >/dev/null 2>&1; do
-        echo -e "${RED}❌ 端口 $PORT 已被占用，请输入其他端口${RESET}"
-        read -p "请输入端口: " PORT
-    done
-    echo $PORT
+# 创建文件夹并下载脚本
+setup_script() {
+    echo -e "${GREEN}🚀 正在安装应用...${RESET}"
+    mkdir -p oci-start && cd oci-start
+    wget -O $SCRIPT_NAME $SCRIPT_URL
+    chmod +x $SCRIPT_NAME
+    echo -e "${GREEN}✅ 安装并设置完毕,选择2启动应用${RESET}"
+    read -p "按回车键返回菜单..."
+    show_menu
 }
 
-# ---------- 安装/启动 ----------
-install_app() {
-    mkdir -p "$DATA_DIR"
 
-    read -p "请输入容器映射端口 [默认 25519]: " input_port
-    PORT=${input_port:-25519}
-    PORT=$(check_port $PORT)
-
-    # 拉取最新镜像
-    echo -e "${YELLOW}拉取镜像 $IMAGE_NAME ...${RESET}"
-    docker pull $IMAGE_NAME
-
-    # 如果 Dockerfile 在当前目录并想构建本地镜像，可以取消下面注释
-     echo -e "${YELLOW}构建本地镜像...${RESET}"
-     docker build -t $IMAGE_NAME .
-
-    # 启动容器
-    docker run -d \
-        --name $CONTAINER_NAME \
-        -p 127.0.0.1:$PORT:25519 \
-        -v $DATA_DIR:/app/data \
-        --restart unless-stopped \
-        $IMAGE_NAME
-
-    echo -e "${GREEN}✅ $APP_NAME 已启动${RESET}"
-    echo -e "${GREEN}访问地址: http://127.0.0.1:$PORT${RESET}"
-    read -p "按回车返回菜单..."
-    menu
+# 启动应用
+start_app() {
+    oci-start.sh start
+    echo -e "${GREEN}✅ 应用已启动${RESET}"
+    read -p "按回车键返回菜单..."
+    show_menu
 }
 
-# ---------- 更新 ----------
+# 停止应用
+stop_app() {
+    oci-start stop
+    echo -e "${GREEN}✅ 应用已停止${RESET}"
+    read -p "按回车键返回菜单..."
+    show_menu
+}
+
+# 重启应用
+restart_app() {
+    oci-start restart
+    echo -e "${GREEN}✅ 应用已重启${RESET}"
+    read -p "按回车键返回菜单..."
+    show_menu
+}
+
+# 更新应用
 update_app() {
-    echo -e "${YELLOW}拉取最新镜像并更新容器...${RESET}"
-    docker pull $IMAGE_NAME
-    docker stop $CONTAINER_NAME 2>/dev/null
-    docker rm $CONTAINER_NAME 2>/dev/null
-    docker run -d \
-        --name $CONTAINER_NAME \
-        -p 127.0.0.1:$PORT:25519 \
-        -v $DATA_DIR:/app/data \
-        --restart unless-stopped \
-        $IMAGE_NAME
-    echo -e "${GREEN}✅ 更新完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
+    oci-start update
+    echo -e "${GREEN}✅ 应用已更新到最新版本${RESET}"
+    read -p "按回车键返回菜单..."
+    show_menu
 }
-
-# ---------- 卸载 ----------
+# 查看启动状态
+status_app() {
+    oci-start.sh status
+    read -p "按回车键返回菜单..."
+    show_menu
+}
+# 卸载应用
 uninstall_app() {
-    read -p "⚠️ 确认卸载并删除数据? (y/N): " confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        docker stop $CONTAINER_NAME 2>/dev/null
-        docker rm $CONTAINER_NAME 2>/dev/null
-        docker rmi $IMAGE_NAME 2>/dev/null
-        rm -rf "$APP_DIR"
-        echo -e "${GREEN}✅ 已卸载 $APP_NAME 并删除数据${RESET}"
+    read -p "⚠️ 确认要完全卸载应用吗？(y/N): " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        oci-start uninstall
+        echo -e "${GREEN}✅ 应用已完全卸载${RESET}"
     else
-        echo "已取消卸载"
+        echo "❌ 卸载操作已取消"
     fi
-    read -p "按回车返回菜单..."
-    menu
+    read -p "按回车键返回菜单..."
+    show_menu
 }
 
-# ---------- 查看日志 ----------
-view_logs() {
-    docker logs -f $CONTAINER_NAME
-    read -p "按回车返回菜单..."
-    menu
-}
-
-# ---------- 管理菜单 ----------
-menu() {
+# 显示主菜单
+show_menu() {
     clear
-    echo -e "${GREEN}=== STB图床 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载(含数据)${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}=== OCI-Start 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装应用${RESET}"
+    echo -e "${GREEN}2) 启动应用${RESET}"
+    echo -e "${GREEN}3) 停止应用${RESET}"
+    echo -e "${GREEN}4) 重启应用${RESET}"
+    echo -e "${GREEN}5) 更新应用${RESET}"
+    echo -e "${GREEN}6) 卸载应用${RESET}"
+    echo -e "${GREEN}7) 查看启动状态${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}==========================${RESET}"
+    echo -e "${GREEN}===========================${RESET}"
     read -p "请选择: " choice
     case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
-        4) view_logs ;;
-        0) exit 0 ;;
-        *) echo "无效选择"; sleep 1; menu ;;
+        1) setup_script ;;
+        2) start_app ;;
+        3) stop_app ;;
+        4) restart_app ;;
+        5) update_app ;;
+        6) uninstall_app ;;
+        7) status_app ;;
+        0) exit ;;
+        *) echo "❌ 无效选择"; sleep 1; show_menu ;;
     esac
 }
 
-# ---------- 执行 ----------
-menu
+show_menu

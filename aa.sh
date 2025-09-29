@@ -1,146 +1,116 @@
 #!/bin/bash
-# ========================================
-# Nexus Terminal 一键管理脚本 (Docker Compose)
-# ========================================
+# ============================================
+# Komari 管理脚本（统一文件夹 + 支持自定义端口）
+# ============================================
+
+set -e
 
 GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
-APP_NAME="nexus-terminal"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.env"
 
-function menu() {
+APP_DIR="/opt/komari"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/komari_config.env"
+DATA_DIR="$APP_DIR/data"
+CONTAINER_NAME="komari"
+
+menu() {
     clear
-    echo -e "${GREEN}=== Nexus Terminal 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载(含数据)${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    read -p "请选择: " choice
+    echo -e "${GREEN}=== Komari 管理菜单 ===${RESET}"
+    echo -e "${YELLOW}1) 安装部署 Komari${RESET}"
+    echo -e "${YELLOW}2) 更新 Komari${RESET}"
+    echo -e "${YELLOW}3) 卸载 Komari${RESET}"
+    echo -e "${YELLOW}4) 查看日志${RESET}"
+    echo -e "${YELLOW}0) 退出${RESET}"
+    echo
+    read -p "请选择操作: " choice
+
     case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
+        1) install_komari ;;
+        2) update_komari ;;
+        3) uninstall_komari ;;
         4) view_logs ;;
         0) exit 0 ;;
-        *) echo "无效选择"; sleep 1; menu ;;
+        *) echo -e "${RED}无效选择！${RESET}" && sleep 1 && menu ;;
     esac
 }
 
-function install_app() {
-    read -p "请输入前端宿主机端口 [默认:18111]: " input_front
-    PORT_FRONT=${input_front:-18111}
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    fi
+}
 
-    read -p "请输入后端宿主机端口 [默认:3001]: " input_back
-    PORT_BACK=${input_back:-3001}
+install_komari() {
+    echo -e "${GREEN}=== 开始安装 Komari ===${RESET}"
 
-    read -p "请输入远程网关 HTTP 端口 [默认:9090]: " input_gateway_http
-    PORT_GATEWAY_HTTP=${input_gateway_http:-9090}
+    mkdir -p "$APP_DIR" "$DATA_DIR"
 
-    read -p "请输入远程网关 WS 端口 [默认:8080]: " input_gateway_ws
-    PORT_GATEWAY_WS=${input_gateway_ws:-8080}
+    read -p "请输入管理员用户名 (默认: admin): " ADMIN_USERNAME
+    ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
 
-    mkdir -p "$APP_DIR/data"
+    read -p "请输入管理员密码 (默认: admin123): " ADMIN_PASSWORD
+    ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
 
+    read -p "请输入 Komari 端口 (默认: 25774): " PORT
+    PORT=${PORT:-25774}
+
+    # 保存配置
+    cat > "$CONFIG_FILE" <<EOF
+ADMIN_USERNAME="$ADMIN_USERNAME"
+ADMIN_PASSWORD="$ADMIN_PASSWORD"
+PORT="$PORT"
+EOF
+
+    # 生成 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
-
 services:
-  frontend:
-    image: heavrnl/nexus-terminal-frontend:latest
-    container_name: nexus-terminal-frontend
+  komari:
+    image: ghcr.io/komari-monitor/komari:latest
+    container_name: $CONTAINER_NAME
     ports:
-      - "127.0.0.1:$PORT_FRONT:80"
-    depends_on:
-      - backend
-      - remote-gateway
-
-  backend:
-    image: heavrnl/nexus-terminal-backend:latest
-    container_name: nexus-terminal-backend
-    environment:
-      NODE_ENV: production
-      PORT: 3001
-      DEPLOYMENT_MODE: docker
-      REMOTE_GATEWAY_API_BASE_LOCAL: http://localhost:$PORT_GATEWAY_HTTP
-      REMOTE_GATEWAY_API_BASE_DOCKER: http://remote-gateway:$PORT_GATEWAY_HTTP
-      REMOTE_GATEWAY_WS_URL_DOCKER: ws://remote-gateway:$PORT_GATEWAY_WS
-      RP_ID: localhost
-      RP_ORIGIN: http://localhost
-    ports:
-      - "127.0.0.1:$PORT_BACK:3001"
+      - "127.0.0.1:$PORT:25774"
     volumes:
-      - $APP_DIR/data:/app/data  
-
-  remote-gateway:
-    image: heavrnl/nexus-terminal-remote-gateway:latest
-    container_name: nexus-terminal-remote-gateway
-    environment:
-      GUACD_HOST: guacd
-      GUACD_PORT: 4822
-      REMOTE_GATEWAY_API_PORT: $PORT_GATEWAY_HTTP
-      REMOTE_GATEWAY_WS_PORT: $PORT_GATEWAY_WS
-      FRONTEND_URL: http://frontend
-      MAIN_BACKEND_URL: http://backend:3001
-      NODE_ENV: production
-    ports:
-      - "127.0.0.1:$PORT_GATEWAY_HTTP:$PORT_GATEWAY_HTTP"
-      - "127.0.0.1:$PORT_GATEWAY_WS:$PORT_GATEWAY_WS"
-    depends_on:
-      - guacd
-      - backend  
-
-  guacd:
-    image: guacamole/guacd:latest
-    container_name: nexus-terminal-guacd
+      - $DATA_DIR:/app/data
+    env_file:
+      - $CONFIG_FILE
     restart: unless-stopped
 EOF
 
-    echo "PORT_FRONT=$PORT_FRONT" > "$CONFIG_FILE"
-    echo "PORT_BACK=$PORT_BACK" >> "$CONFIG_FILE"
-    echo "PORT_GATEWAY_HTTP=$PORT_GATEWAY_HTTP" >> "$CONFIG_FILE"
-    echo "PORT_GATEWAY_WS=$PORT_GATEWAY_WS" >> "$CONFIG_FILE"
+    (cd "$APP_DIR" && docker compose up -d)
 
-    cd "$APP_DIR"
-    docker compose up -d
-
-    # 获取公网 IP
-    get_ip() {
-        curl -s ifconfig.me || curl -s ip.sb || echo "127.0.0.1"
-    }
-
-    echo -e "${GREEN}✅ Nexus Terminal 已启动${RESET}"
-    echo -e "${GREEN}🌐 前端 Web UI 地址: http://127.0.0.1:$PORT_FRONT${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
-    echo -e "${GREEN}⚙️ 后端端口: $PORT_BACK, 远程网关 HTTP: $PORT_GATEWAY_HTTP, WS: $PORT_GATEWAY_WS${RESET}"
-    read -p "按回车返回菜单..."
-    menu
+    echo -e "${GREEN}✅ 部署完成！访问地址:  http://127.0.0.1:$PORT${RESET}"
+    echo -e "${YELLOW}用户名: $ADMIN_USERNAME  密码: $ADMIN_PASSWORD${RESET}"
+    read -p "按回车返回菜单..." && menu
 }
 
-function update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ Nexus Terminal 已更新并重启完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
+update_komari() {
+    load_config
+    echo -e "${GREEN}=== 更新 Komari ===${RESET}"
+    (cd "$APP_DIR" && docker compose pull && docker compose up -d)
+    echo -e "${GREEN}✅ 更新完成！${RESET}"
+    read -p "按回车返回菜单..." && menu
 }
 
-function uninstall_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${GREEN}✅ Nexus Terminal 已卸载，数据已删除${RESET}"
-    read -p "按回车返回菜单..."
-    menu
+uninstall_komari() {
+    echo -e "${RED} 即将卸载 Komari，并删除相关数据！${RESET}"
+    read -p "确认卸载? (y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        (cd "$APP_DIR" && docker compose down -v)
+        rm -rf "$APP_DIR"
+        echo -e "${GREEN}✅ 卸载完成${RESET}"
+    else
+        echo -e "${YELLOW}已取消${RESET}"
+    fi
+    read -p "按回车返回菜单..." && menu
 }
 
-function view_logs() {
-    docker logs -f nexus-terminal-frontend
-    read -p "按回车返回菜单..."
-    menu
+view_logs() {
+    echo -e "${GREEN}=== 查看 Komari 日志 ===${RESET}"
+    docker logs -f $CONTAINER_NAME
+    read -p "按回车返回菜单..." && menu
 }
 
 menu

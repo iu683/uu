@@ -1,196 +1,146 @@
 #!/bin/bash
 # ========================================
-# STB 本地源码一键管理脚本
-# 统一目录 /opt/stb，含源码、日志、Docker MongoDB
+# Nexus Terminal 一键管理脚本 (Docker Compose)
 # ========================================
 
-RED="\033[31m"
 GREEN="\033[32m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
 RESET="\033[0m"
+APP_NAME="nexus-terminal"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/config.env"
 
-REPO_URL="https://github.com/setube/stb.git"
-BASE_DIR="/opt/stb"
-APP_DIR="$BASE_DIR/app"
-LOG_FILE="$BASE_DIR/app.log"
-MONGO_CONTAINER="stb-mongo"
-MONGO_PORT=27017
-MONGO_HOST="mongodb://localhost:${MONGO_PORT}/stb"
-
-mkdir -p "$BASE_DIR"
-
-# ================== 菜单 ==================
-function show_menu() {
-    echo -e "${CYAN}================= STB 管理脚本 =================${RESET}"
-    echo -e "${GREEN}1.  下载源码${RESET}"
-    echo -e "${GREEN}2.  安装 Node.js / pnpm / 项目依赖${RESET}"
-    echo -e "${GREEN}3.  编译项目${RESET}"
-    echo -e "${GREEN}4.  安装 MongoDB(Docker)${RESET}"
-    echo -e "${GREEN}5.  检测 MongoDB${RESET}"
-    echo -e "${GREEN}6.  启动项目${RESET}"
-    echo -e "${GREEN}7.  查看日志${RESET}"
-    echo -e "${GREEN}8.  停止项目${RESET}"
-    echo -e "${GREEN}9.  卸载项目及环境${RESET}"
-    echo -e "${GREEN}10. 更新项目${RESET}"
-    echo -e "${GREEN}0.  退出${RESET}"
-    echo -e "${CYAN}==============================================${RESET}"
+function menu() {
+    clear
+    echo -e "${GREEN}=== Nexus Terminal 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    read -p "请选择: " choice
+    case $choice in
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) view_logs ;;
+        0) exit 0 ;;
+        *) echo "无效选择"; sleep 1; menu ;;
+    esac
 }
 
-# ================== 功能 ==================
-function clone_repo() {
-    if [ -d "$APP_DIR" ]; then
-        echo -e "${YELLOW}目录 $APP_DIR 已存在，跳过克隆${RESET}"
-    else
-        echo -e "${GREEN}正在克隆源码...${RESET}"
-        git clone $REPO_URL "$APP_DIR"
-    fi
+function install_app() {
+    read -p "请输入前端宿主机端口 [默认:18111]: " input_front
+    PORT_FRONT=${input_front:-18111}
+
+    read -p "请输入后端宿主机端口 [默认:3001]: " input_back
+    PORT_BACK=${input_back:-3001}
+
+    read -p "请输入远程网关 HTTP 端口 [默认:9090]: " input_gateway_http
+    PORT_GATEWAY_HTTP=${input_gateway_http:-9090}
+
+    read -p "请输入远程网关 WS 端口 [默认:8080]: " input_gateway_ws
+    PORT_GATEWAY_WS=${input_gateway_ws:-8080}
+
+    mkdir -p "$APP_DIR/data"
+
+    cat > "$COMPOSE_FILE" <<EOF
+
+services:
+  frontend:
+    image: heavrnl/nexus-terminal-frontend:latest
+    container_name: nexus-terminal-frontend
+    ports:
+      - "127.0.0.1:$PORT_FRONT:80"
+    depends_on:
+      - backend
+      - remote-gateway
+
+  backend:
+    image: heavrnl/nexus-terminal-backend:latest
+    container_name: nexus-terminal-backend
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      DEPLOYMENT_MODE: docker
+      REMOTE_GATEWAY_API_BASE_LOCAL: http://localhost:$PORT_GATEWAY_HTTP
+      REMOTE_GATEWAY_API_BASE_DOCKER: http://remote-gateway:$PORT_GATEWAY_HTTP
+      REMOTE_GATEWAY_WS_URL_DOCKER: ws://remote-gateway:$PORT_GATEWAY_WS
+      RP_ID: localhost
+      RP_ORIGIN: http://localhost
+    ports:
+      - "127.0.0.1:$PORT_BACK:3001"
+    volumes:
+      - $APP_DIR/data:/app/data  
+
+  remote-gateway:
+    image: heavrnl/nexus-terminal-remote-gateway:latest
+    container_name: nexus-terminal-remote-gateway
+    environment:
+      GUACD_HOST: guacd
+      GUACD_PORT: 4822
+      REMOTE_GATEWAY_API_PORT: $PORT_GATEWAY_HTTP
+      REMOTE_GATEWAY_WS_PORT: $PORT_GATEWAY_WS
+      FRONTEND_URL: http://frontend
+      MAIN_BACKEND_URL: http://backend:3001
+      NODE_ENV: production
+    ports:
+      - "127.0.0.1:$PORT_GATEWAY_HTTP:$PORT_GATEWAY_HTTP"
+      - "127.0.0.1:$PORT_GATEWAY_WS:$PORT_GATEWAY_WS"
+    depends_on:
+      - guacd
+      - backend  
+
+  guacd:
+    image: guacamole/guacd:latest
+    container_name: nexus-terminal-guacd
+    restart: unless-stopped
+EOF
+
+    echo "PORT_FRONT=$PORT_FRONT" > "$CONFIG_FILE"
+    echo "PORT_BACK=$PORT_BACK" >> "$CONFIG_FILE"
+    echo "PORT_GATEWAY_HTTP=$PORT_GATEWAY_HTTP" >> "$CONFIG_FILE"
+    echo "PORT_GATEWAY_WS=$PORT_GATEWAY_WS" >> "$CONFIG_FILE"
+
+    cd "$APP_DIR"
+    docker compose up -d
+
+    # 获取公网 IP
+    get_ip() {
+        curl -s ifconfig.me || curl -s ip.sb || echo "127.0.0.1"
+    }
+
+    echo -e "${GREEN}✅ Nexus Terminal 已启动${RESET}"
+    echo -e "${GREEN}🌐 前端 Web UI 地址: http://127.0.0.1:$PORT_FRONT${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
+    echo -e "${GREEN}⚙️ 后端端口: $PORT_BACK, 远程网关 HTTP: $PORT_GATEWAY_HTTP, WS: $PORT_GATEWAY_WS${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
-function install_dependencies() {
-    echo -e "${YELLOW}检查 Node.js 是否安装...${RESET}"
-    if ! command -v node >/dev/null 2>&1; then
-        echo -e "${GREEN}未检测到 Node.js，开始安装...${RESET}"
-        curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-        sudo apt install -y nodejs
-    fi
-    echo -e "${GREEN}Node.js 已安装: $(node -v)${RESET}"
-
-    echo -e "${YELLOW}检查 pnpm 是否安装...${RESET}"
-    if ! command -v pnpm >/dev/null 2>&1; then
-        echo -e "${GREEN}未检测到 pnpm，开始安装...${RESET}"
-        npm install -g pnpm
-    fi
-    echo -e "${GREEN}pnpm 已安装: $(pnpm -v)${RESET}"
-
-    echo -e "${GREEN}安装项目依赖...${RESET}"
-    cd "$APP_DIR" || exit
-    pnpm install
+function update_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ Nexus Terminal 已更新并重启完成${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
-function build_project() {
-    echo -e "${GREEN}编译项目...${RESET}"
-    cd "$APP_DIR" || exit
-    pnpm build
-}
-
-function check_mongo() {
-    echo -e "${YELLOW}检测 MongoDB 服务...${RESET}"
-    nc -z -w 3 localhost $MONGO_PORT
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}MongoDB 可用: $MONGO_HOST${RESET}"
-        return 0
-    else
-        echo -e "${RED}无法连接 MongoDB: $MONGO_HOST${RESET}"
-        return 1
-    fi
-}
-
-function start_project() {
-    check_mongo || { echo -e "${RED}请先确保 MongoDB 可用${RESET}"; return; }
-    echo -e "${GREEN}启动项目...${RESET}"
-    cd "$APP_DIR" || exit
-    export MONGO_URL=$MONGO_HOST
-    nohup pnpm start > "$LOG_FILE" 2>&1 &
-    echo -e "${YELLOW}项目已启动，日志输出到 $LOG_FILE${RESET}"
+function uninstall_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${GREEN}✅ Nexus Terminal 已卸载，数据已删除${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
 function view_logs() {
-    if [ -f "$LOG_FILE" ]; then
-        tail -f "$LOG_FILE"
-    else
-        echo -e "${RED}日志文件不存在，请先启动项目${RESET}"
-    fi
+    docker logs -f nexus-terminal-frontend
+    read -p "按回车返回菜单..."
+    menu
 }
 
-function stop_project() {
-    echo -e "${YELLOW}停止项目...${RESET}"
-    PID=$(pgrep -f "pnpm start")
-    if [ "$PID" ]; then
-        kill -9 $PID
-        echo -e "${GREEN}项目已停止${RESET}"
-    else
-        echo -e "${RED}项目未运行${RESET}"
-    fi
-}
-
-function install_mongo() {
-    echo -e "${YELLOW}使用 Docker 安装 MongoDB...${RESET}"
-    docker pull mongo:6
-    docker run -d --name $MONGO_CONTAINER -p $MONGO_PORT:27017 -v "$BASE_DIR/mongo_data:/data/db" mongo:6
-    echo -e "${GREEN}MongoDB Docker 容器已启动，端口 $MONGO_PORT${RESET}"
-}
-
-function uninstall_all() {
-    echo -e "${YELLOW}停止项目...${RESET}"
-    stop_project
-
-    echo -e "${YELLOW}删除 STB 项目目录...${RESET}"
-    rm -rf "$APP_DIR" "$LOG_FILE"
-    echo -e "${GREEN}STB 项目目录已删除${RESET}"
-
-    echo -e "${YELLOW}删除 MongoDB Docker 容器...${RESET}"
-    if docker ps -a | grep $MONGO_CONTAINER >/dev/null; then
-        docker stop $MONGO_CONTAINER
-        docker rm $MONGO_CONTAINER
-        rm -rf "$BASE_DIR/mongo_data"
-        echo -e "${GREEN}MongoDB Docker 容器及数据已删除${RESET}"
-    fi
-
-    echo -e "${YELLOW}是否卸载 Node.js 和 pnpm? (y/N)${RESET}"
-    read -p "请输入: " yn
-    if [[ "$yn" == "y" || "$yn" == "Y" ]]; then
-        sudo apt purge -y nodejs
-        sudo npm uninstall -g pnpm
-        sudo apt autoremove -y
-        echo -e "${GREEN}Node.js 和 pnpm 已卸载${RESET}"
-    fi
-
-    echo -e "${GREEN}卸载完成${RESET}"
-}
-
-function update_project() {
-    echo -e "${YELLOW}停止项目以便更新...${RESET}"
-    stop_project
-
-    if [ -d "$APP_DIR" ]; then
-        echo -e "${GREEN}进入项目目录更新源码...${RESET}"
-        cd "$APP_DIR" || exit
-        git fetch --all
-        git reset --hard origin/main
-    else
-        echo -e "${RED}项目目录不存在，先下载源码${RESET}"
-        clone_repo
-    fi
-
-    echo -e "${GREEN}更新依赖并编译...${RESET}"
-    cd "$APP_DIR" || exit
-    pnpm install
-    pnpm build
-
-    echo -e "${YELLOW}更新完成。是否立即启动项目? (y/N)${RESET}"
-    read -p "请输入: " yn
-    if [[ "$yn" == "y" || "$yn" == "Y" ]]; then
-        start_project
-    fi
-}
-
-# ================== 主循环 ==================
-while true; do
-    show_menu
-    read -p "请输入选项: " choice
-    case $choice in
-        1) clone_repo ;;
-        2) install_dependencies ;;
-        3) build_project ;;
-        4) install_mongo ;;
-        5) check_mongo ;;
-        6) start_project ;;
-        7) view_logs ;;
-        8) stop_project ;;
-        9) uninstall_all ;;
-        10) update_project ;;
-        0) echo -e "${GREEN}退出脚本${RESET}"; exit 0 ;;
-        *) echo -e "${RED}无效选项，请重新输入${RESET}" ;;
-    esac
-done
+menu

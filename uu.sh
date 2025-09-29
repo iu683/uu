@@ -19,6 +19,7 @@ download_script(){
     chmod +x "$SCRIPT_PATH"
     echo -e "${green}✅ 脚本已保存到 $SCRIPT_PATH${re}"
 }
+
 # ================== ASCII VPS Logo ==================
 printf -- "${red}"
 printf -- " _    __ ____   _____ \n"
@@ -277,15 +278,14 @@ setup_cron_job(){
   echo -e "${green}6) 返回菜单${re}"
   read -rp "请选择 [1-6]: " cron_choice
 
-  # 这里改成固定路径调用，不再依赖 $0 或 <(...)>
   CRON_CMD="bash $SCRIPT_PATH send"
 
   case $cron_choice in
-    1) (crontab -l 2>/dev/null | grep -v "$CRON_CMD"; echo "0 0 * * * $CRON_CMD") | crontab -
+    1) (crontab -l 2>/dev/null | grep -v "$CRON_CMD"; echo "0 0 * * * $CRON_CMD") | crontab - 
        echo -e "${green}✅ 已设置每天 0 点发送一次 VPS 信息${re}" ;;
-    2) (crontab -l 2>/dev/null | grep -v "$CRON_CMD"; echo "0 0 * * 1 $CRON_CMD") | crontab -
+    2) (crontab -l 2>/dev/null | grep -v "$CRON_CMD"; echo "0 0 * * 1 $CRON_CMD") | crontab - 
        echo -e "${green}✅ 已设置每周一 0 点发送一次 VPS 信息${re}" ;;
-    3) (crontab -l 2>/dev/null | grep -v "$CRON_CMD"; echo "0 0 1 * * $CRON_CMD") | crontab -
+    3) (crontab -l 2>/dev/null | grep -v "$CRON_CMD"; echo "0 0 1 * * $CRON_CMD") | crontab - 
        echo -e "${green}✅ 已设置每月 1 日 0 点发送一次 VPS 信息${re}" ;;
     4) crontab -l 2>/dev/null | grep -v "$CRON_CMD" | crontab -
        echo -e "${red}❌ 已删除本脚本相关的定时任务${re}" ;;
@@ -305,14 +305,10 @@ uninstall_script(){
     echo -e "${yellow}⚠️ 即将卸载 tg.sh 脚本及配置和定时任务${re}"
     read -rp "确认卸载吗？(y/N): " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        # 删除定时任务
         CRON_CMD="bash $SCRIPT_PATH send"
         crontab -l 2>/dev/null | grep -v "$CRON_CMD" | crontab -
-        
-        # 删除脚本和配置文件
         rm -f "$SCRIPT_PATH"
         rm -f "$TG_CONFIG_FILE"
-        
         echo -e "${green}✅ 卸载完成,相关数据和定时任务已删除${re}"
         exit 0
     else
@@ -320,6 +316,7 @@ uninstall_script(){
     fi
 }
 
+# ================== 菜单 ==================
 menu(){
   while true; do
     echo ""
@@ -330,7 +327,7 @@ menu(){
     echo -e "${green}4) 设置定时任务${re}"
     echo -e "${green}5) 退出${re}"
     echo -e "${green}6) 卸载脚本${re}"
-    read -rp "请选择操作 [1-5]: " choice
+    read -rp "请选择操作 [1-6]: " choice
     case $choice in
       1) collect_system_info; echo "$SYS_INFO"; pause_return ;;
       2) collect_system_info; send_to_telegram; pause_return ;;
@@ -350,5 +347,6 @@ if [ "$1" == "send" ]; then
 fi
 
 # ================== 脚本入口 ==================
-install_deps
-menu
+install_deps      # 安装依赖
+download_script   # 启动时自动下载/更新自身
+menu              # 进入菜单

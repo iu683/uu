@@ -1,158 +1,219 @@
 #!/bin/bash
-# ========================================
-# WireGuard 一键管理脚本 (Docker Compose)
-# ========================================
+# iperf3 VPS 双端测速管理菜单 (统一目录版)
+# 功能:
+# 1) TCP 测速 (最大可用带宽)
+# 2) UDP 测速 (丢包率/延迟/抖动)
+# 3) 删除日志
+# 4) 启动/停止后台服务端
+# 5) 查看实时日志
+# 自动保存结果到日志，并给出解释
 
+APP_DIR="/opt/iperf3"
+LOGFILE="$APP_DIR/iperf3_results.log"
+SERVER_PID_FILE="$APP_DIR/iperf3_server.pid"
+
+PORT=5201
+TIME=30
+PARALLEL=4
+UDP_BANDWIDTH="100M"
+
+# 颜色
 GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
-APP_NAME="wireguard"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.env"
 
-# 自动安装 qrencode
-if ! command -v qrencode &>/dev/null; then
-    echo -e "${GREEN}📦 安装 qrencode 用于生成二维码${RESET}"
-    if command -v apt &>/dev/null; then
-        apt update && apt install -y qrencode
-    elif command -v yum &>/dev/null; then
-        yum install -y qrencode
+# 初始化目录
+init_dir() {
+    sudo mkdir -p "$APP_DIR"
+    sudo chown -R $(id -u):$(id -g) "$APP_DIR"
+}
+
+# 检查/安装 iperf3
+install_iperf3() {
+    if ! command -v iperf3 &>/dev/null; then
+        echo "正在安装 iperf3..."
+        if [ -f /etc/debian_version ]; then
+            sudo apt update && sudo apt install -y iperf3
+        elif [ -f /etc/redhat-release ]; then
+            sudo yum install -y iperf3
+        else
+            echo "❌ 无法自动安装 iperf3，请手动安装"
+            exit 1
+        fi
     fi
-fi
+}
 
-function menu() {
+log_result() {
+    echo -e "\n===============================" >> $LOGFILE
+    echo "📅 测试时间: $(date '+%Y-%m-%d %H:%M:%S')" >> $LOGFILE
+    echo "🔧 模式: $1" >> $LOGFILE
+    echo "===============================" >> $LOGFILE
+    echo "$2" >> $LOGFILE
+    echo -e "===============================\n" >> $LOGFILE
+}
+
+interpret_tcp() {
+    BANDWIDTH=$(echo "$1" | grep -E "receiver" | tail -n1 | awk '{print $(NF-1), $NF}')
+    echo -e "📊 TCP 结果: $BANDWIDTH"
+    log_result "TCP" "$1"
+    echo ""
+    echo "💡 解释:"
+    echo "- 这是你链路的最大可用带宽"
+    echo "- 如果接近 VPS 带宽上限，说明链路健康"
+    echo "- 如果远低于标称带宽，可能是延迟大或丢包导致"
+}
+
+interpret_udp() {
+    LINE=$(echo "$1" | grep -A1 "receiver" | tail -n1)
+    BANDWIDTH=$(echo "$LINE" | awk '{print $(NF-4), $(NF-3)}')
+    LOSS=$(echo "$LINE" | awk '{print $(NF-1)}')
+    JITTER=$(echo "$LINE" | awk '{print $(NF-2)}')
+    echo -e "📊 UDP 结果: $BANDWIDTH, 丢包率 $LOSS, 平均抖动 $JITTER ms"
+    log_result "UDP" "$1"
+    echo ""
+    echo "💡 解释:"
+    if [[ "$LOSS" == "0.000%" ]]; then
+        echo "- 丢包率几乎为 0，链路很稳定"
+    else
+        echo "- 丢包率较高，说明网络质量不好，跑大流量可能掉速"
+    fi
+    echo "- 平均抖动: $JITTER ms"
+    echo "- UDP 模式主要看丢包和延迟，不代表真实下载速度"
+}
+
+# 服务端后台启动
+start_server() {
+    if [ -f "$SERVER_PID_FILE" ]; then
+        PID=$(cat $SERVER_PID_FILE)
+        if ps -p $PID &>/dev/null; then
+            echo -e "${YELLOW}ℹ️ 服务端已经在运行 (PID=$PID)${RESET}"
+            read -p "是否要先停止它？(y/N): " ans
+            if [[ "$ans" =~ ^[Yy]$ ]]; then
+                stop_server
+            else
+                return
+            fi
+        fi
+    fi
+    nohup iperf3 -s -p $PORT >/dev/null 2>&1 &
+    echo $! > $SERVER_PID_FILE
+    echo -e "${GREEN}✅ iperf3 服务端已后台启动，PID=$(cat $SERVER_PID_FILE)${RESET}"
+}
+
+stop_server() {
+    if [ -f "$SERVER_PID_FILE" ]; then
+        PID=$(cat $SERVER_PID_FILE)
+        if ps -p $PID &>/dev/null; then
+            kill -9 $PID
+            echo -e "${RED}✅ 服务端已停止 (PID=$PID)${RESET}"
+        else
+            echo -e "${YELLOW}ℹ️ 没有找到运行中的服务端${RESET}"
+        fi
+        rm -f $SERVER_PID_FILE
+    else
+        echo -e "${YELLOW}ℹ️ 没有找到运行中的服务端${RESET}"
+    fi
+    read -p "按回车键返回菜单..."
+}
+
+# 前台服务端
+run_server() {
+    echo "🚀 启动 iperf3 服务端，监听端口 $PORT ..."
+    echo "👉 你的公网 IP 是: $(curl -s ifconfig.me || curl -s ipinfo.io/ip)"
+    echo "👉 请在另一台 VPS 上选择 TCP 或 UDP 输入此 IP"
+    iperf3 -s -p $PORT
+}
+
+# TCP 客户端
+run_client_tcp() {
+    read -p "请输入 VPS A 的公网 IP: " SERVER_IP
+    [ -z "$SERVER_IP" ] && { echo "❌ 不能为空"; return; }
+    echo "⏱ 测试时间: $TIME 秒, 并行流数: $PARALLEL"
+    echo "🚀 开始 TCP 测速 (目标 $SERVER_IP)"
+    RESULT=$(iperf3 -c $SERVER_IP -p $PORT -t $TIME -P $PARALLEL)
+    echo "$RESULT"
+    interpret_tcp "$RESULT"
+    echo -e "✅ 结果已保存到 $LOGFILE"
+    read -p "按回车键返回菜单..."
+}
+
+# UDP 客户端
+run_client_udp() {
+    read -p "请输入 VPS A 的公网 IP: " SERVER_IP
+    [ -z "$SERVER_IP" ] && { echo "❌ 不能为空"; return; }
+    read -p "请输入测试带宽 (默认 $UDP_BANDWIDTH): " BW
+    [ -n "$BW" ] && UDP_BANDWIDTH=$BW
+    echo "⏱ 测试时间: $TIME 秒"
+    echo "🚀 开始 UDP 测速 (目标 $SERVER_IP, 带宽 $UDP_BANDWIDTH)"
+    RESULT=$(iperf3 -c $SERVER_IP -p $PORT -u -b $UDP_BANDWIDTH -t $TIME)
+    echo "$RESULT"
+    interpret_udp "$RESULT"
+    echo -e "✅ 结果已保存到 $LOGFILE"
+    read -p "按回车键返回菜单..."
+}
+
+# 删除日志
+delete_log() {
+    if [ -f "$LOGFILE" ]; then
+        read -p "⚠️ 确认要删除日志 $LOGFILE 吗？(y/N): " confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            rm -f "$LOGFILE"
+            echo -e "${GREEN}✅ 日志已删除${RESET}"
+        else
+            echo -e "${YELLOW}❌ 已取消${RESET}"
+        fi
+    else
+        echo -e "${YELLOW}ℹ️ 日志文件不存在${RESET}"
+    fi
+    read -p "按回车键返回菜单..."
+}
+
+# 查看实时日志
+view_log() {
+    if [ -f "$LOGFILE" ]; then
+        echo -e "${YELLOW}📄 实时查看日志，按 Ctrl+C 退出${RESET}"
+        tail -f "$LOGFILE"
+    else
+        echo -e "${YELLOW}ℹ️ 日志文件不存在${RESET}"
+        read -p "按回车键返回菜单..."
+    fi
+}
+
+# 菜单
+show_menu() {
     clear
-    echo -e "${GREEN}=== WireGuard 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载(含数据)${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 查看客户端配置与二维码${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}=======================${RESET}"
-    read -p "请选择: " choice
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
-        4) view_logs ;;
-        5) view_client ;;
-        0) exit 0 ;;
-        *) echo "无效选择"; sleep 1; menu ;;
-    esac
+    echo -e "${YELLOW}🚀 iperf3 VPS 双端测速菜单${RESET}"
+    echo "=============================="
+    echo -e "${GREEN}1) 在 VPS A 上运行服务端 (前台)${RESET}"
+    echo -e "${GREEN}2) 启动后台服务端${RESET}"
+    echo -e "${GREEN}3) 停止后台服务端${RESET}"
+    echo -e "${GREEN}4) 在 VPS B 上运行客户端 (TCP)${RESET}"
+    echo -e "${GREEN}5) 在 VPS B 上运行客户端 (UDP)${RESET}"
+    echo -e "${GREEN}6) 删除日志文件${RESET}"
+    echo -e "${GREEN}7) 查看实时日志${RESET}"
+    echo -e "${RED}  0) 退出${RESET}"
+    echo "=============================="
 }
 
-function install_app() {
-    read -p "请输入 WireGuard 服务端口 [默认:51820]: " input_port
-    SERVERPORT=${input_port:-51820}
-
-    read -p "请输入客户端数量 [默认:1]: " input_peers
-    PEERS=${input_peers:-1}
-
-    read -p "请输入公网域名或IP [默认:$(curl -s ifconfig.me)]: " input_ip
-    SERVERURL=${input_ip:-$(curl -s ifconfig.me)}
-
-    read -p "请输入 IPv4 内网段 [默认:192.168.18.0]: " input_subnet
-    INTERNAL_SUBNET=${input_subnet:-192.168.18.0}
-
-    read -p "请输入 IPv6 内网段 [默认:fd00:1234:5678::/64]: " input_subnet_v6
-    INTERNAL_SUBNET_V6=${input_subnet_v6:-fd00:1234:5678::/64}
-
-    read -p "请输入允许访问的 IP 范围 [默认:0.0.0.0/0,::/0]: " input_allowed
-    ALLOWEDIPS=${input_allowed:-0.0.0.0/0,::/0}
-
-    mkdir -p "$APP_DIR/config"
-
-    cat > "$COMPOSE_FILE" <<EOF
-
-services:
-  wireguard:
-    image: lscr.io/linuxserver/wireguard:latest
-    container_name: wireguard1
-    cap_add:
-      - NET_ADMIN
-      - SYS_MODULE
-    environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=Asia/Shanghai
-      - SERVERURL=$SERVERURL
-      - SERVERPORT=$SERVERPORT
-      - PEERS=$PEERS
-      - PEERDNS=auto
-      - INTERNAL_SUBNET=$INTERNAL_SUBNET
-      - INTERNAL_SUBNET_V6=$INTERNAL_SUBNET_V6
-      - ALLOWEDIPS=$ALLOWEDIPS
-      - PERSISTENTKEEPALIVE_PEERS=
-      - LOG_CONFS=true
-    volumes:
-      - $APP_DIR/config:/config
-      - /lib/modules:/lib/modules
-    ports:
-      - "$SERVERPORT:$SERVERPORT/udp"
-      - "[::]:$SERVERPORT:$SERVERPORT/udp"
-    sysctls:
-      - net.ipv4.conf.all.src_valid_mark=1
-      - net.ipv6.conf.all.disable_ipv6=0
-      - net.ipv6.conf.all.forwarding=1
-    restart: unless-stopped
-EOF
-
-    echo "SERVERPORT=$SERVERPORT" > "$CONFIG_FILE"
-    echo "PEERS=$PEERS" >> "$CONFIG_FILE"
-    echo "SERVERURL=$SERVERURL" >> "$CONFIG_FILE"
-    echo "INTERNAL_SUBNET=$INTERNAL_SUBNET" >> "$CONFIG_FILE"
-    echo "INTERNAL_SUBNET_V6=$INTERNAL_SUBNET_V6" >> "$CONFIG_FILE"
-    echo "ALLOWEDIPS=$ALLOWEDIPS" >> "$CONFIG_FILE"
-
-    cd "$APP_DIR"
-    docker compose up -d
-
-    echo -e "${GREEN}✅ WireGuard 已启动${RESET}"
-    echo -e "${GREEN}🌐 公网访问地址: $SERVERURL:$SERVERPORT${RESET}"
-    echo -e "${GREEN}📂 配置目录: $APP_DIR/config${RESET}"
-    echo -e "${GREEN}🌐 IPv4 内网段: $INTERNAL_SUBNET${RESET}"
-    echo -e "${GREEN}🌐 IPv6 内网段: $INTERNAL_SUBNET_V6${RESET}"
-    echo -e "${GREEN}🌐 允许访问的 IP: $ALLOWEDIPS${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ WireGuard 已更新并重启完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function uninstall_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${GREEN}✅ WireGuard 已卸载，数据已删除${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function view_logs() {
-    docker logs -f wireguard1
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function view_client() {
-    cd "$APP_DIR/config/peer_configs" 2>/dev/null || { echo "未找到客户端配置，请先安装"; sleep 1; menu; }
-    for file in *.conf; do
-        echo -e "${GREEN}📄 客户端配置文件: $file${RESET}"
-        cat "$file"
-        echo -e "${GREEN}🔑 二维码预览:${RESET}"
-        qrencode -t ansiutf8 < "$file"
-        echo "=============================="
+main() {
+    init_dir
+    install_iperf3
+    while true; do
+        show_menu
+        read -p "请选择操作: " choice
+        case $choice in
+            1) run_server ;;
+            2) start_server ;;
+            3) stop_server ;;
+            4) run_client_tcp ;;
+            5) run_client_udp ;;
+            6) delete_log ;;
+            7) view_log ;;
+            0) exit 0 ;;
+            *) echo "❌ 无效选择，请重新输入" ; read -p "按回车键返回菜单..." ;;
+        esac
     done
-    read -p "按回车返回菜单..."
-    menu
 }
 
-menu
+main

@@ -1,246 +1,185 @@
 #!/bin/bash
 
+# ================== 配色 ==================
 GREEN="\033[32m"
+CYAN="\033[36m"
+YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
-gl_huang="\033[33m"
-gl_bai="\033[97m"
-gl_lv="\033[34m"
 
-docker_name="wireguard"
-docker_img="lscr.io/linuxserver/wireguard:latest"
-DEFAULT_PORT=51820  # 默认端口
-docker_port=$DEFAULT_PORT
+# 默认备份目录
+DEFAULT_BACKUP_DIR="/opt/docker_backups"
+mkdir -p "$DEFAULT_BACKUP_DIR"
 
-# 默认配置
-DEFAULT_COUNT=5
-DEFAULT_NETWORK="10.13.13.0"
+# ================== 获取卷目录函数 ==================
+get_volume_dirs() {
+    local PROJECT_DIR=$1
+    # 查找 docker-compose.yml 中的挂载目录
+    VOLUME_DIRS=()
+    while read -r line; do
+        # 匹配 "volumes: ..." 形式
+        if [[ $line =~ ^[[:space:]]*-?[[:space:]]*([./a-zA-Z0-9_-]+): ]]; then
+            host_dir=${BASH_REMATCH[1]}
+            # 转换成绝对路径
+            if [[ ! "$host_dir" =~ ^/ ]]; then
+                host_dir="$PROJECT_DIR/$host_dir"
+            fi
+            [[ -d "$host_dir" ]] && VOLUME_DIRS+=("$host_dir")
+        fi
+    done < <(grep '^[[:space:]]*-[[:space:]]*.*:.*' "$PROJECT_DIR/docker-compose.yml")
+    echo "${VOLUME_DIRS[@]}"
+}
 
-# 获取当前配置
-COUNT=${DEFAULT_COUNT}
-NETWORK=${DEFAULT_NETWORK}
+# ================== 备份函数 ==================
+backup() {
+    read -rp "请输入要备份的项目目录（多个空格分隔）: " -a PROJECT_DIRS
+    read -rp "请输入备份存放目录（默认 $DEFAULT_BACKUP_DIR）: " BACKUP_DIR
+    BACKUP_DIR=${BACKUP_DIR:-$DEFAULT_BACKUP_DIR}
+    mkdir -p "$BACKUP_DIR"
+    TIMESTAMP=$(date +%F_%H-%M-%S)
 
-show_menu() {
+    for PROJECT_DIR in "${PROJECT_DIRS[@]}"; do
+        if [[ ! -d "$PROJECT_DIR" ]]; then
+            echo -e "${RED}❌ 目录不存在: $PROJECT_DIR${RESET}"
+            continue
+        fi
+
+        BASENAME=$(basename "$PROJECT_DIR")
+        BACKUP_FILE="$BACKUP_DIR/${BASENAME}_backup_$TIMESTAMP.tar.gz"
+
+        echo -e "${CYAN}📦 开始备份项目目录: $PROJECT_DIR → $BACKUP_FILE${RESET}"
+
+        # 获取卷目录
+        VOLUME_DIRS=$(get_volume_dirs "$PROJECT_DIR")
+        # 生成临时目录放置卷数据和配置
+        TMP_DIR=$(mktemp -d)
+        cp -r "$PROJECT_DIR/docker-compose.yml" "$TMP_DIR/"
+
+        for vol in $VOLUME_DIRS; do
+            vol_name=$(basename "$vol")
+            mkdir -p "$TMP_DIR/$vol_name"
+            cp -r "$vol/." "$TMP_DIR/$vol_name/"
+        done
+
+        tar czf "$BACKUP_FILE" -C "$TMP_DIR" .
+        rm -rf "$TMP_DIR"
+
+        echo -e "${GREEN}✅ 已备份 $PROJECT_DIR → $BACKUP_FILE${RESET}"
+    done
+}
+
+# ================== 恢复函数 ==================
+restore() {
+    read -rp "请输入备份文件路径（支持多个空格分隔）: " -a BACKUP_FILES
+
+    for BACKUP_FILE in "${BACKUP_FILES[@]}"; do
+        if [[ ! -f "$BACKUP_FILE" ]]; then
+            echo -e "${RED}❌ 备份文件不存在: $BACKUP_FILE${RESET}"
+            continue
+        fi
+
+        # 自动获取原项目目录名
+        BASENAME=$(basename "$BACKUP_FILE")
+        PROJECT_DIR_NAME="${BASENAME%%_backup_*}"
+        PROJECT_DIR="$PWD/$PROJECT_DIR_NAME"
+        mkdir -p "$PROJECT_DIR"
+
+        echo -e "${CYAN}📂 解压备份到项目目录: $PROJECT_DIR${RESET}"
+
+        # 解压配置文件和卷目录
+        TMP_DIR=$(mktemp -d)
+        tar xzf "$BACKUP_FILE" -C "$TMP_DIR"
+
+        # 恢复 docker-compose.yml
+        cp -f "$TMP_DIR/docker-compose.yml" "$PROJECT_DIR/"
+
+        # 恢复卷数据
+        for dir in "$TMP_DIR"/*; do
+            [[ $(basename "$dir") == "docker-compose.yml" ]] && continue
+            target_dir="$PROJECT_DIR/$(basename "$dir")"
+            mkdir -p "$target_dir"
+            cp -r "$dir/." "$target_dir/"
+        done
+
+        rm -rf "$TMP_DIR"
+
+        # 启动容器
+        if [[ -f "$PROJECT_DIR/docker-compose.yml" ]]; then
+            echo -e "${CYAN}🚀 启动容器...${RESET}"
+            cd "$PROJECT_DIR" || continue
+            docker compose up -d
+            echo -e "${GREEN}✅ 已恢复: $PROJECT_DIR${RESET}"
+        else
+            echo -e "${YELLOW}⚠️ docker-compose.yml 不存在，跳过启动容器${RESET}"
+        fi
+    done
+}
+
+# ================== 删除备份 ==================
+delete_backup() {
+    read -rp "请输入备份存放目录（默认 $DEFAULT_BACKUP_DIR）: " BACKUP_DIR
+    BACKUP_DIR=${BACKUP_DIR:-$DEFAULT_BACKUP_DIR}
+
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        echo -e "${RED}❌ 目录不存在: $BACKUP_DIR${RESET}"
+        return
+    fi
+
+    ls -1 "$BACKUP_DIR"
+    read -rp "请输入要删除的备份文件名（多个用空格分隔）: " -a FILES
+    for FILE in "${FILES[@]}"; do
+        if [[ -f "$BACKUP_DIR/$FILE" ]]; then
+            rm -f "$BACKUP_DIR/$FILE"
+            echo -e "${GREEN}✅ 已删除 $FILE${RESET}"
+        else
+            echo -e "${RED}❌ 文件不存在: $FILE${RESET}"
+        fi
+    done
+}
+
+# ================== 远程备份 ==================
+remote_backup() {
+    read -rp "请输入要远程传输的备份文件（多个空格分隔）: " -a FILES
+    read -rp "请输入远程 VPS 用户名: " REMOTE_USER
+    read -rp "请输入远程 VPS IP 或域名: " REMOTE_HOST
+    read -rp "请输入远程目录: " REMOTE_DIR
+    read -rp "请输入远程 SSH 端口（默认 22）: " REMOTE_PORT
+    REMOTE_PORT=${REMOTE_PORT:-22}
+
+    for FILE in "${FILES[@]}"; do
+        if [[ ! -f "$FILE" ]]; then
+            echo -e "${RED}❌ 文件不存在: $FILE${RESET}"
+            continue
+        fi
+        echo -e "${CYAN}🚀 传输 $FILE → $REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR (端口 $REMOTE_PORT)${RESET}"
+        scp -P "$REMOTE_PORT" "$FILE" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR"
+        if [[ $? -eq 0 ]]; then
+            echo -e "${GREEN}✅ 传输成功: $FILE${RESET}"
+        else
+            echo -e "${RED}❌ 传输失败: $FILE${RESET}"
+        fi
+    done
+}
+
+# ================== 菜单 ==================
+while true; do
     clear
-    echo -e "${GREEN}=== WireGuard VPN 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装/启动 WireGuard 服务${RESET}"
-    echo -e "${GREEN}2) 更新 WireGuard 服务${RESET}"
-    echo -e "${GREEN}3) 查看所有客户端配置${RESET}"
-    echo -e "${GREEN}4) 卸载 WireGuard 服务${RESET}"
-    echo -e "${GREEN}5) 退出${RESET}"
-    read -e -p "请输入选项 (1-5): " option
-    case $option in
-        1) modify_and_install_start_wireguard ;;
-        2) update_wireguard ;;
-        3) view_client_configs ;;
-        4) stop_wireguard ;;
-        5) exit 0 ;;
-        *) echo -e "${gl_huang}无效选项，请重新选择！${gl_bai}" && sleep 2 && show_menu ;;
+    echo -e "${CYAN}===== Docker Compose 多项目备份恢复 =====${RESET}"
+    echo -e "${GREEN}1. 备份项目（包含卷数据）${RESET}"
+    echo -e "${GREEN}2. 恢复项目（自动恢复到原目录${RESET}"
+    echo -e "${GREEN}3. 删除备份文件${RESET}"
+    echo -e "${GREEN}4. 远程备份到 VPS${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    read -rp "请选择操作: " CHOICE
+
+    case $CHOICE in
+        1) backup ;;
+        2) restore ;;
+        3) delete_backup ;;
+        4) remote_backup ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}❌ 无效选择${RESET}" ;;
     esac
-}
-
-modify_and_install_start_wireguard() {
-    echo -e "${gl_huang}当前配置: ${gl_bai}客户端数量 = $COUNT, 网段 = $NETWORK, 端口 = $docker_port"
-    
-    # 修改客户端数量
-    read -e -p "请输入新的客户端数量 (默认 ${DEFAULT_COUNT}): " new_count
-    COUNT=${new_count:-$DEFAULT_COUNT}
-
-    # 修改网段
-    read -e -p "请输入新的 WireGuard 网段 (默认 ${DEFAULT_NETWORK}): " new_network
-    NETWORK=${new_network:-$DEFAULT_NETWORK}
-
-    # 修改端口
-    read -e -p "请输入新的 WireGuard 端口 (默认 ${DEFAULT_PORT}): " new_port
-    docker_port=${new_port:-$DEFAULT_PORT}
-
-    echo -e "${gl_huang}新配置: ${gl_bai}客户端数量 = $COUNT, 网段 = $NETWORK, 端口 = $docker_port"
-
-    PEERS=$(seq -f "wg%02g" 1 "$COUNT" | paste -sd,)
-
-    ip link delete wg0 &>/dev/null
-
-    docker run -d \
-      --name=wireguard \
-      --network host \
-      --cap-add=NET_ADMIN \
-      --cap-add=SYS_MODULE \
-      -e PUID=1000 \
-      -e PGID=1000 \
-      -e TZ=Etc/UTC \
-      -e SERVERURL=$(curl -s https://api.ipify.org) \
-      -e SERVERPORT=$docker_port \
-      -e PEERS=${PEERS} \
-      -e INTERNAL_SUBNET=${NETWORK} \
-      -e ALLOWEDIPS=${NETWORK}/24 \
-      -e PERSISTENTKEEPALIVE_PEERS=all \
-      -e LOG_CONFS=true \
-      -v /opt/wireguard/config:/config \
-      -v /lib/modules:/lib/modules \
-      --restart=always \
-      lscr.io/linuxserver/wireguard:latest
-
-    sleep 3
-    docker exec wireguard sh -c "
-    f='/config/wg_confs/wg0.conf'
-    sed -i 's/51820/${docker_port}/g' \$f
-    "
-
-    docker exec wireguard sh -c "
-    for d in /config/peer_*; do
-      sed -i 's/51820/${docker_port}/g' \$d/*.conf
-    done
-    "
-
-    docker exec wireguard sh -c '
-    for d in /config/peer_*; do
-      sed -i "/^DNS/d" "$d"/*.conf
-    done
-    '
-
-    docker exec wireguard sh -c '
-    for d in /config/peer_*; do
-      for f in "$d"/*.conf; do
-        grep -q "^PersistentKeepalive" "$f" || \
-        sed -i "/^AllowedIPs/ a PersistentKeepalive = 25" "$f"
-      done
-    done
-    '
-
-    docker exec -it wireguard bash -c '
-    for d in /config/peer_*; do
-      cd "$d" || continue
-      conf_file=$(ls *.conf)
-      base_name="${conf_file%.conf}"
-      qrencode -o "$base_name.png" < "$conf_file"
-    done
-    '
-
-    docker restart wireguard
-
-    sleep 2
-    echo
-    echo -e "${gl_huang}所有客户端二维码配置: ${gl_bai}"
-    docker exec -it wireguard bash -c 'for i in $(ls /config | grep peer_ | sed "s/peer_//"); do echo "--- $i ---"; /app/show-peer $i; done'
-    sleep 2
-    echo
-    echo -e "${gl_huang}所有客户端配置代码: ${gl_bai}"
-    docker exec wireguard sh -c 'for d in /config/peer_*; do echo "# $(basename $d) "; cat $d/*.conf; echo; done'
-    sleep 2
-    echo -e "${gl_lv}${COUNT}个客户端配置全部输出，使用方法如下：${gl_bai}"
-    echo -e "${gl_lv}1. 手机下载wg的APP，扫描上方二维码，可以快速连接网络${gl_bai}"
-    echo -e "${gl_lv}2. Windows下载客户端，复制配置代码连接网络。${gl_bai}"
-    echo -e "${gl_lv}3. Linux用脚本部署WG客户端，复制配置代码连接网络。${gl_bai}"
-    echo -e "${gl_lv}官方客户端下载方式: https://www.wireguard.com/install/${gl_bai}"
-    read -p "按任意键返回主菜单..." && show_menu
-}
-
-# 更新 WireGuard 服务，无需输入
-update_wireguard() {
-    echo "更新 WireGuard 服务..."
-    docker pull lscr.io/linuxserver/wireguard:latest
-
-    # 停止并删除旧容器
-    docker stop wireguard
-    docker rm wireguard
-
-    # 使用当前配置重新启动容器
-    echo -e "${gl_huang}当前配置: ${gl_bai}客户端数量 = $COUNT, 网段 = $NETWORK, 端口 = $docker_port"
-    PEERS=$(seq -f "wg%02g" 1 "$COUNT" | paste -sd,)
-
-    ip link delete wg0 &>/dev/null
-
-    docker run -d \
-      --name=wireguard \
-      --network host \
-      --cap-add=NET_ADMIN \
-      --cap-add=SYS_MODULE \
-      -e PUID=1000 \
-      -e PGID=1000 \
-      -e TZ=Etc/UTC \
-      -e SERVERURL=$(curl -s https://api.ipify.org) \
-      -e SERVERPORT=$docker_port \
-      -e PEERS=${PEERS} \
-      -e INTERNAL_SUBNET=${NETWORK} \
-      -e ALLOWEDIPS=${NETWORK}/24 \
-      -e PERSISTENTKEEPALIVE_PEERS=all \
-      -e LOG_CONFS=true \
-      -v /opt/wireguard/config:/config \
-      -v /lib/modules:/lib/modules \
-      --restart=always \
-      lscr.io/linuxserver/wireguard:latest
-
-    sleep 3
-    docker exec wireguard sh -c "
-    f='/config/wg_confs/wg0.conf'
-    sed -i 's/51820/${docker_port}/g' \$f
-    "
-
-    docker exec wireguard sh -c "
-    for d in /config/peer_*; do
-      sed -i 's/51820/${docker_port}/g' \$d/*.conf
-    done
-    "
-
-    docker exec wireguard sh -c '
-    for d in /config/peer_*; do
-      sed -i "/^DNS/d" "$d"/*.conf
-    done
-    '
-
-    docker exec wireguard sh -c '
-    for d in /config/peer_*; do
-      for f in "$d"/*.conf; do
-        grep -q "^PersistentKeepalive" "$f" || \
-        sed -i "/^AllowedIPs/ a PersistentKeepalive = 25" "$f"
-      done
-    done
-    '
-
-    docker exec -it wireguard bash -c '
-    for d in /config/peer_*; do
-      cd "$d" || continue
-      conf_file=$(ls *.conf)
-      base_name="${conf_file%.conf}"
-      qrencode -o "$base_name.png" < "$conf_file"
-    done
-    '
-
-    docker restart wireguard
-
-    sleep 2
-    echo
-    echo -e "${gl_huang}所有客户端二维码配置: ${gl_bai}"
-    docker exec -it wireguard bash -c 'for i in $(ls /config | grep peer_ | sed "s/peer_//"); do echo "--- $i ---"; /app/show-peer $i; done'
-    sleep 2
-    echo
-    echo -e "${gl_huang}所有客户端配置代码: ${gl_bai}"
-    docker exec wireguard sh -c 'for d in /config/peer_*; do echo "# $(basename $d) "; cat $d/*.conf; echo; done'
-    sleep 2
-    echo -e "${gl_lv}${COUNT}个客户端配置全部输出，使用方法如下：${gl_bai}"
-    echo -e "${gl_lv}1. 手机下载wg的APP，扫描上方二维码，可以快速连接网络${gl_bai}"
-    echo -e "${gl_lv}2. Windows下载客户端，复制配置代码连接网络。${gl_bai}"
-    echo -e "${gl_lv}3. Linux用脚本部署WG客户端，复制配置代码连接网络。${gl_bai}"
-    echo -e "${gl_lv}官方客户端下载方式: https://www.wireguard.com/install/${gl_bai}"
-    read -p "按任意键返回主菜单..." && show_menu
-}
-
-view_client_configs() {
-    echo "查看所有客户端配置..."
-    docker exec wireguard sh -c 'for d in /config/peer_*; do echo "# $(basename $d) "; cat $d/*.conf; done'
-    read -p "按任意键返回主菜单..." && show_menu
-}
-
-# 停止并删除 WireGuard 服务及所有数据
-stop_wireguard() {
-    echo "停止 WireGuard 服务并删除配置数据..."
-    docker stop wireguard
-    docker rm wireguard
-    # 删除配置文件
-    rm -rf $CONFIG_DIR
-    rm -rf /opt/wireguard
-    echo -e "${gl_huang}WireGuard 服务及所有配置数据已删除！${gl_bai}"
-    read -p "按任意键返回主菜单..." && show_menu
-}
-
-# 启动菜单
-show_menu
+    echo -e "\n按回车键继续..."
+    read
+done

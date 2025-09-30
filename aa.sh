@@ -1,219 +1,245 @@
 #!/bin/bash
-# iperf3 VPS 双端测速管理菜单 (统一目录版)
-# 功能:
-# 1) TCP 测速 (最大可用带宽)
-# 2) UDP 测速 (丢包率/延迟/抖动)
-# 3) 删除日志
-# 4) 启动/停止后台服务端
-# 5) 查看实时日志
-# 自动保存结果到日志，并给出解释
 
-APP_DIR="/opt/iperf3"
-LOGFILE="$APP_DIR/iperf3_results.log"
-SERVER_PID_FILE="$APP_DIR/iperf3_server.pid"
-
-PORT=5201
-TIME=30
-PARALLEL=4
-UDP_BANDWIDTH="100M"
-
-# 颜色
 GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
 RESET="\033[0m"
+gl_huang="\033[33m"
+gl_bai="\033[97m"
+gl_lv="\033[34m"
 
-# 初始化目录
-init_dir() {
-    sudo mkdir -p "$APP_DIR"
-    sudo chown -R $(id -u):$(id -g) "$APP_DIR"
-}
+docker_name="wireguard"
+docker_img="lscr.io/linuxserver/wireguard:latest"
+DEFAULT_PORT=51820  # 默认端口
+docker_port=$DEFAULT_PORT
 
-# 检查/安装 iperf3
-install_iperf3() {
-    if ! command -v iperf3 &>/dev/null; then
-        echo "正在安装 iperf3..."
-        if [ -f /etc/debian_version ]; then
-            sudo apt update && sudo apt install -y iperf3
-        elif [ -f /etc/redhat-release ]; then
-            sudo yum install -y iperf3
-        else
-            echo "❌ 无法自动安装 iperf3，请手动安装"
-            exit 1
-        fi
-    fi
-}
+# 默认配置
+DEFAULT_COUNT=5
+DEFAULT_NETWORK="10.13.13.0"
 
-log_result() {
-    echo -e "\n===============================" >> $LOGFILE
-    echo "📅 测试时间: $(date '+%Y-%m-%d %H:%M:%S')" >> $LOGFILE
-    echo "🔧 模式: $1" >> $LOGFILE
-    echo "===============================" >> $LOGFILE
-    echo "$2" >> $LOGFILE
-    echo -e "===============================\n" >> $LOGFILE
-}
+# 获取当前配置
+COUNT=${DEFAULT_COUNT}
+NETWORK=${DEFAULT_NETWORK}
 
-interpret_tcp() {
-    BANDWIDTH=$(echo "$1" | grep -E "receiver" | tail -n1 | awk '{print $(NF-1), $NF}')
-    echo -e "📊 TCP 结果: $BANDWIDTH"
-    log_result "TCP" "$1"
-    echo ""
-    echo "💡 解释:"
-    echo "- 这是你链路的最大可用带宽"
-    echo "- 如果接近 VPS 带宽上限，说明链路健康"
-    echo "- 如果远低于标称带宽，可能是延迟大或丢包导致"
-}
-
-interpret_udp() {
-    LINE=$(echo "$1" | grep -A1 "receiver" | tail -n1)
-    BANDWIDTH=$(echo "$LINE" | awk '{print $(NF-4), $(NF-3)}')
-    LOSS=$(echo "$LINE" | awk '{print $(NF-1)}')
-    JITTER=$(echo "$LINE" | awk '{print $(NF-2)}')
-    echo -e "📊 UDP 结果: $BANDWIDTH, 丢包率 $LOSS, 平均抖动 $JITTER ms"
-    log_result "UDP" "$1"
-    echo ""
-    echo "💡 解释:"
-    if [[ "$LOSS" == "0.000%" ]]; then
-        echo "- 丢包率几乎为 0，链路很稳定"
-    else
-        echo "- 丢包率较高，说明网络质量不好，跑大流量可能掉速"
-    fi
-    echo "- 平均抖动: $JITTER ms"
-    echo "- UDP 模式主要看丢包和延迟，不代表真实下载速度"
-}
-
-# 服务端后台启动
-start_server() {
-    if [ -f "$SERVER_PID_FILE" ]; then
-        PID=$(cat $SERVER_PID_FILE)
-        if ps -p $PID &>/dev/null; then
-            echo -e "${YELLOW}ℹ️ 服务端已经在运行 (PID=$PID)${RESET}"
-            read -p "是否要先停止它？(y/N): " ans
-            if [[ "$ans" =~ ^[Yy]$ ]]; then
-                stop_server
-            else
-                return
-            fi
-        fi
-    fi
-    nohup iperf3 -s -p $PORT >/dev/null 2>&1 &
-    echo $! > $SERVER_PID_FILE
-    echo -e "${GREEN}✅ iperf3 服务端已后台启动，PID=$(cat $SERVER_PID_FILE)${RESET}"
-}
-
-stop_server() {
-    if [ -f "$SERVER_PID_FILE" ]; then
-        PID=$(cat $SERVER_PID_FILE)
-        if ps -p $PID &>/dev/null; then
-            kill -9 $PID
-            echo -e "${RED}✅ 服务端已停止 (PID=$PID)${RESET}"
-        else
-            echo -e "${YELLOW}ℹ️ 没有找到运行中的服务端${RESET}"
-        fi
-        rm -f $SERVER_PID_FILE
-    else
-        echo -e "${YELLOW}ℹ️ 没有找到运行中的服务端${RESET}"
-    fi
-    read -p "按回车键返回菜单..."
-}
-
-# 前台服务端
-run_server() {
-    echo "🚀 启动 iperf3 服务端，监听端口 $PORT ..."
-    echo "👉 你的公网 IP 是: $(curl -s ifconfig.me || curl -s ipinfo.io/ip)"
-    echo "👉 请在另一台 VPS 上选择 TCP 或 UDP 输入此 IP"
-    iperf3 -s -p $PORT
-}
-
-# TCP 客户端
-run_client_tcp() {
-    read -p "请输入 VPS A 的公网 IP: " SERVER_IP
-    [ -z "$SERVER_IP" ] && { echo "❌ 不能为空"; return; }
-    echo "⏱ 测试时间: $TIME 秒, 并行流数: $PARALLEL"
-    echo "🚀 开始 TCP 测速 (目标 $SERVER_IP)"
-    RESULT=$(iperf3 -c $SERVER_IP -p $PORT -t $TIME -P $PARALLEL)
-    echo "$RESULT"
-    interpret_tcp "$RESULT"
-    echo -e "✅ 结果已保存到 $LOGFILE"
-    read -p "按回车键返回菜单..."
-}
-
-# UDP 客户端
-run_client_udp() {
-    read -p "请输入 VPS A 的公网 IP: " SERVER_IP
-    [ -z "$SERVER_IP" ] && { echo "❌ 不能为空"; return; }
-    read -p "请输入测试带宽 (默认 $UDP_BANDWIDTH): " BW
-    [ -n "$BW" ] && UDP_BANDWIDTH=$BW
-    echo "⏱ 测试时间: $TIME 秒"
-    echo "🚀 开始 UDP 测速 (目标 $SERVER_IP, 带宽 $UDP_BANDWIDTH)"
-    RESULT=$(iperf3 -c $SERVER_IP -p $PORT -u -b $UDP_BANDWIDTH -t $TIME)
-    echo "$RESULT"
-    interpret_udp "$RESULT"
-    echo -e "✅ 结果已保存到 $LOGFILE"
-    read -p "按回车键返回菜单..."
-}
-
-# 删除日志
-delete_log() {
-    if [ -f "$LOGFILE" ]; then
-        read -p "⚠️ 确认要删除日志 $LOGFILE 吗？(y/N): " confirm
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            rm -f "$LOGFILE"
-            echo -e "${GREEN}✅ 日志已删除${RESET}"
-        else
-            echo -e "${YELLOW}❌ 已取消${RESET}"
-        fi
-    else
-        echo -e "${YELLOW}ℹ️ 日志文件不存在${RESET}"
-    fi
-    read -p "按回车键返回菜单..."
-}
-
-# 查看实时日志
-view_log() {
-    if [ -f "$LOGFILE" ]; then
-        echo -e "${YELLOW}📄 实时查看日志，按 Ctrl+C 退出${RESET}"
-        tail -f "$LOGFILE"
-    else
-        echo -e "${YELLOW}ℹ️ 日志文件不存在${RESET}"
-        read -p "按回车键返回菜单..."
-    fi
-}
-
-# 菜单
 show_menu() {
     clear
-    echo -e "${YELLOW}🚀 iperf3 VPS 双端测速菜单${RESET}"
-    echo "=============================="
-    echo -e "${GREEN}1) 在 VPS A 上运行服务端 (前台)${RESET}"
-    echo -e "${GREEN}2) 启动后台服务端${RESET}"
-    echo -e "${GREEN}3) 停止后台服务端${RESET}"
-    echo -e "${GREEN}4) 在 VPS B 上运行客户端 (TCP)${RESET}"
-    echo -e "${GREEN}5) 在 VPS B 上运行客户端 (UDP)${RESET}"
-    echo -e "${GREEN}6) 删除日志文件${RESET}"
-    echo -e "${GREEN}7) 查看实时日志${RESET}"
-    echo -e "${RED}  0) 退出${RESET}"
-    echo "=============================="
+    echo -e "${GREEN}=== WireGuard VPN 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装/启动 WireGuard 服务${RESET}"
+    echo -e "${GREEN}2) 更新 WireGuard 服务${RESET}"
+    echo -e "${GREEN}3) 查看所有客户端配置${RESET}"
+    echo -e "${GREEN}4) 卸载 WireGuard 服务${RESET}"
+    echo -e "${GREEN}5) 退出${RESET}"
+    read -e -p "请输入选项 (1-5): " option
+    case $option in
+        1) modify_and_install_start_wireguard ;;
+        2) update_wireguard ;;
+        3) view_client_configs ;;
+        4) stop_wireguard ;;
+        5) exit 0 ;;
+        *) echo -e "${gl_huang}无效选项，请重新选择！${gl_bai}" && sleep 2 && show_menu ;;
+    esac
 }
 
-main() {
-    init_dir
-    install_iperf3
-    while true; do
-        show_menu
-        read -p "请选择操作: " choice
-        case $choice in
-            1) run_server ;;
-            2) start_server ;;
-            3) stop_server ;;
-            4) run_client_tcp ;;
-            5) run_client_udp ;;
-            6) delete_log ;;
-            7) view_log ;;
-            0) exit 0 ;;
-            *) echo "❌ 无效选择，请重新输入" ; read -p "按回车键返回菜单..." ;;
-        esac
+modify_and_install_start_wireguard() {
+    echo -e "${gl_huang}当前配置: ${gl_bai}客户端数量 = $COUNT, 网段 = $NETWORK, 端口 = $docker_port"
+    
+    # 修改客户端数量
+    read -e -p "请输入新的客户端数量 (默认 ${DEFAULT_COUNT}): " new_count
+    COUNT=${new_count:-$DEFAULT_COUNT}
+
+    # 修改网段
+    read -e -p "请输入新的 WireGuard 网段 (默认 ${DEFAULT_NETWORK}): " new_network
+    NETWORK=${new_network:-$DEFAULT_NETWORK}
+
+    # 修改端口
+    read -e -p "请输入新的 WireGuard 端口 (默认 ${DEFAULT_PORT}): " new_port
+    docker_port=${new_port:-$DEFAULT_PORT}
+
+    echo -e "${gl_huang}新配置: ${gl_bai}客户端数量 = $COUNT, 网段 = $NETWORK, 端口 = $docker_port"
+
+    PEERS=$(seq -f "wg%02g" 1 "$COUNT" | paste -sd,)
+
+    ip link delete wg0 &>/dev/null
+
+    docker run -d \
+      --name=wireguard \
+      --network host \
+      --cap-add=NET_ADMIN \
+      --cap-add=SYS_MODULE \
+      -e PUID=1000 \
+      -e PGID=1000 \
+      -e TZ=Etc/UTC \
+      -e SERVERURL=$(curl -s https://api.ipify.org) \
+      -e SERVERPORT=$docker_port \
+      -e PEERS=${PEERS} \
+      -e INTERNAL_SUBNET=${NETWORK} \
+      -e ALLOWEDIPS=${NETWORK}/24 \
+      -e PERSISTENTKEEPALIVE_PEERS=all \
+      -e LOG_CONFS=true \
+      -v /home/docker/wireguard/config:/config \
+      -v /lib/modules:/lib/modules \
+      --restart=always \
+      lscr.io/linuxserver/wireguard:latest
+
+    sleep 3
+    docker exec wireguard sh -c "
+    f='/config/wg_confs/wg0.conf'
+    sed -i 's/51820/${docker_port}/g' \$f
+    "
+
+    docker exec wireguard sh -c "
+    for d in /config/peer_*; do
+      sed -i 's/51820/${docker_port}/g' \$d/*.conf
     done
+    "
+
+    docker exec wireguard sh -c '
+    for d in /config/peer_*; do
+      sed -i "/^DNS/d" "$d"/*.conf
+    done
+    '
+
+    docker exec wireguard sh -c '
+    for d in /config/peer_*; do
+      for f in "$d"/*.conf; do
+        grep -q "^PersistentKeepalive" "$f" || \
+        sed -i "/^AllowedIPs/ a PersistentKeepalive = 25" "$f"
+      done
+    done
+    '
+
+    docker exec -it wireguard bash -c '
+    for d in /config/peer_*; do
+      cd "$d" || continue
+      conf_file=$(ls *.conf)
+      base_name="${conf_file%.conf}"
+      qrencode -o "$base_name.png" < "$conf_file"
+    done
+    '
+
+    docker restart wireguard
+
+    sleep 2
+    echo
+    echo -e "${gl_huang}所有客户端二维码配置: ${gl_bai}"
+    docker exec -it wireguard bash -c 'for i in $(ls /config | grep peer_ | sed "s/peer_//"); do echo "--- $i ---"; /app/show-peer $i; done'
+    sleep 2
+    echo
+    echo -e "${gl_huang}所有客户端配置代码: ${gl_bai}"
+    docker exec wireguard sh -c 'for d in /config/peer_*; do echo "# $(basename $d) "; cat $d/*.conf; echo; done'
+    sleep 2
+    echo -e "${gl_lv}${COUNT}个客户端配置全部输出，使用方法如下：${gl_bai}"
+    echo -e "${gl_lv}1. 手机下载wg的APP，扫描上方二维码，可以快速连接网络${gl_bai}"
+    echo -e "${gl_lv}2. Windows下载客户端，复制配置代码连接网络。${gl_bai}"
+    echo -e "${gl_lv}3. Linux用脚本部署WG客户端，复制配置代码连接网络。${gl_bai}"
+    echo -e "${gl_lv}官方客户端下载方式: https://www.wireguard.com/install/${gl_bai}"
+    read -p "按任意键返回主菜单..." && show_menu
 }
 
-main
+# 更新 WireGuard 服务，无需输入
+update_wireguard() {
+    echo "更新 WireGuard 服务..."
+    docker pull lscr.io/linuxserver/wireguard:latest
+
+    # 停止并删除旧容器
+    docker stop wireguard
+    docker rm wireguard
+
+    # 使用当前配置重新启动容器
+    echo -e "${gl_huang}当前配置: ${gl_bai}客户端数量 = $COUNT, 网段 = $NETWORK, 端口 = $docker_port"
+    PEERS=$(seq -f "wg%02g" 1 "$COUNT" | paste -sd,)
+
+    ip link delete wg0 &>/dev/null
+
+    docker run -d \
+      --name=wireguard \
+      --network host \
+      --cap-add=NET_ADMIN \
+      --cap-add=SYS_MODULE \
+      -e PUID=1000 \
+      -e PGID=1000 \
+      -e TZ=Etc/UTC \
+      -e SERVERURL=$(curl -s https://api.ipify.org) \
+      -e SERVERPORT=$docker_port \
+      -e PEERS=${PEERS} \
+      -e INTERNAL_SUBNET=${NETWORK} \
+      -e ALLOWEDIPS=${NETWORK}/24 \
+      -e PERSISTENTKEEPALIVE_PEERS=all \
+      -e LOG_CONFS=true \
+      -v /opt/wireguard/config:/config \
+      -v /lib/modules:/lib/modules \
+      --restart=always \
+      lscr.io/linuxserver/wireguard:latest
+
+    sleep 3
+    docker exec wireguard sh -c "
+    f='/config/wg_confs/wg0.conf'
+    sed -i 's/51820/${docker_port}/g' \$f
+    "
+
+    docker exec wireguard sh -c "
+    for d in /config/peer_*; do
+      sed -i 's/51820/${docker_port}/g' \$d/*.conf
+    done
+    "
+
+    docker exec wireguard sh -c '
+    for d in /config/peer_*; do
+      sed -i "/^DNS/d" "$d"/*.conf
+    done
+    '
+
+    docker exec wireguard sh -c '
+    for d in /config/peer_*; do
+      for f in "$d"/*.conf; do
+        grep -q "^PersistentKeepalive" "$f" || \
+        sed -i "/^AllowedIPs/ a PersistentKeepalive = 25" "$f"
+      done
+    done
+    '
+
+    docker exec -it wireguard bash -c '
+    for d in /config/peer_*; do
+      cd "$d" || continue
+      conf_file=$(ls *.conf)
+      base_name="${conf_file%.conf}"
+      qrencode -o "$base_name.png" < "$conf_file"
+    done
+    '
+
+    docker restart wireguard
+
+    sleep 2
+    echo
+    echo -e "${gl_huang}所有客户端二维码配置: ${gl_bai}"
+    docker exec -it wireguard bash -c 'for i in $(ls /config | grep peer_ | sed "s/peer_//"); do echo "--- $i ---"; /app/show-peer $i; done'
+    sleep 2
+    echo
+    echo -e "${gl_huang}所有客户端配置代码: ${gl_bai}"
+    docker exec wireguard sh -c 'for d in /config/peer_*; do echo "# $(basename $d) "; cat $d/*.conf; echo; done'
+    sleep 2
+    echo -e "${gl_lv}${COUNT}个客户端配置全部输出，使用方法如下：${gl_bai}"
+    echo -e "${gl_lv}1. 手机下载wg的APP，扫描上方二维码，可以快速连接网络${gl_bai}"
+    echo -e "${gl_lv}2. Windows下载客户端，复制配置代码连接网络。${gl_bai}"
+    echo -e "${gl_lv}3. Linux用脚本部署WG客户端，复制配置代码连接网络。${gl_bai}"
+    echo -e "${gl_lv}官方客户端下载方式: https://www.wireguard.com/install/${gl_bai}"
+    read -p "按任意键返回主菜单..." && show_menu
+}
+
+view_client_configs() {
+    echo "查看所有客户端配置..."
+    docker exec wireguard sh -c 'for d in /config/peer_*; do echo "# $(basename $d) "; cat $d/*.conf; done'
+    read -p "按任意键返回主菜单..." && show_menu
+}
+
+# 停止并删除 WireGuard 服务及所有数据
+stop_wireguard() {
+    echo "停止 WireGuard 服务并删除配置数据..."
+    docker stop wireguard
+    docker rm wireguard
+    # 删除配置文件
+    rm -rf $CONFIG_DIR
+    echo -e "${gl_huang}WireGuard 服务及所有配置数据已删除！${gl_bai}"
+    read -p "按任意键返回主菜单..." && show_menu
+}
+
+# 启动菜单
+show_menu

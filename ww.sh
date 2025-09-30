@@ -1,185 +1,132 @@
 #!/bin/bash
 
-# ================== 配色 ==================
+# ================== 颜色定义 ==================
 GREEN="\033[32m"
-CYAN="\033[36m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-# 默认备份目录
-DEFAULT_BACKUP_DIR="/opt/docker_backups"
-mkdir -p "$DEFAULT_BACKUP_DIR"
+# ================== 基础信息 ==================
+CONTAINER_NAME="3x-ui"
+IMAGE_NAME="ghcr.io/mhsanaei/3x-ui:latest"
+DB_DIR="/opt/3xui/db"
+CERT_DIR="/opt/3xui/cert"
+PANEL_PORT=2053
 
-# ================== 获取卷目录函数 ==================
-get_volume_dirs() {
-    local PROJECT_DIR=$1
-    # 查找 docker-compose.yml 中的挂载目录
-    VOLUME_DIRS=()
-    while read -r line; do
-        # 匹配 "volumes: ..." 形式
-        if [[ $line =~ ^[[:space:]]*-?[[:space:]]*([./a-zA-Z0-9_-]+): ]]; then
-            host_dir=${BASH_REMATCH[1]}
-            # 转换成绝对路径
-            if [[ ! "$host_dir" =~ ^/ ]]; then
-                host_dir="$PROJECT_DIR/$host_dir"
-            fi
-            [[ -d "$host_dir" ]] && VOLUME_DIRS+=("$host_dir")
-        fi
-    done < <(grep '^[[:space:]]*-[[:space:]]*.*:.*' "$PROJECT_DIR/docker-compose.yml")
-    echo "${VOLUME_DIRS[@]}"
-}
+# ================== 函数 ==================
 
-# ================== 备份函数 ==================
-backup() {
-    read -rp "请输入要备份的项目目录（多个空格分隔）: " -a PROJECT_DIRS
-    read -rp "请输入备份存放目录（默认 $DEFAULT_BACKUP_DIR）: " BACKUP_DIR
-    BACKUP_DIR=${BACKUP_DIR:-$DEFAULT_BACKUP_DIR}
-    mkdir -p "$BACKUP_DIR"
-    TIMESTAMP=$(date +%F_%H-%M-%S)
+install_3xui() {
+    echo -e "${GREEN}🚀 开始安装 3x-ui 官方镜像 ...${RESET}"
 
-    for PROJECT_DIR in "${PROJECT_DIRS[@]}"; do
-        if [[ ! -d "$PROJECT_DIR" ]]; then
-            echo -e "${RED}❌ 目录不存在: $PROJECT_DIR${RESET}"
-            continue
-        fi
-
-        BASENAME=$(basename "$PROJECT_DIR")
-        BACKUP_FILE="$BACKUP_DIR/${BASENAME}_backup_$TIMESTAMP.tar.gz"
-
-        echo -e "${CYAN}📦 开始备份项目目录: $PROJECT_DIR → $BACKUP_FILE${RESET}"
-
-        # 获取卷目录
-        VOLUME_DIRS=$(get_volume_dirs "$PROJECT_DIR")
-        # 生成临时目录放置卷数据和配置
-        TMP_DIR=$(mktemp -d)
-        cp -r "$PROJECT_DIR/docker-compose.yml" "$TMP_DIR/"
-
-        for vol in $VOLUME_DIRS; do
-            vol_name=$(basename "$vol")
-            mkdir -p "$TMP_DIR/$vol_name"
-            cp -r "$vol/." "$TMP_DIR/$vol_name/"
-        done
-
-        tar czf "$BACKUP_FILE" -C "$TMP_DIR" .
-        rm -rf "$TMP_DIR"
-
-        echo -e "${GREEN}✅ 已备份 $PROJECT_DIR → $BACKUP_FILE${RESET}"
-    done
-}
-
-# ================== 恢复函数 ==================
-restore() {
-    read -rp "请输入备份文件路径（支持多个空格分隔）: " -a BACKUP_FILES
-
-    for BACKUP_FILE in "${BACKUP_FILES[@]}"; do
-        if [[ ! -f "$BACKUP_FILE" ]]; then
-            echo -e "${RED}❌ 备份文件不存在: $BACKUP_FILE${RESET}"
-            continue
-        fi
-
-        # 自动获取原项目目录名
-        BASENAME=$(basename "$BACKUP_FILE")
-        PROJECT_DIR_NAME="${BASENAME%%_backup_*}"
-        PROJECT_DIR="$PWD/$PROJECT_DIR_NAME"
-        mkdir -p "$PROJECT_DIR"
-
-        echo -e "${CYAN}📂 解压备份到项目目录: $PROJECT_DIR${RESET}"
-
-        # 解压配置文件和卷目录
-        TMP_DIR=$(mktemp -d)
-        tar xzf "$BACKUP_FILE" -C "$TMP_DIR"
-
-        # 恢复 docker-compose.yml
-        cp -f "$TMP_DIR/docker-compose.yml" "$PROJECT_DIR/"
-
-        # 恢复卷数据
-        for dir in "$TMP_DIR"/*; do
-            [[ $(basename "$dir") == "docker-compose.yml" ]] && continue
-            target_dir="$PROJECT_DIR/$(basename "$dir")"
-            mkdir -p "$target_dir"
-            cp -r "$dir/." "$target_dir/"
-        done
-
-        rm -rf "$TMP_DIR"
-
-        # 启动容器
-        if [[ -f "$PROJECT_DIR/docker-compose.yml" ]]; then
-            echo -e "${CYAN}🚀 启动容器...${RESET}"
-            cd "$PROJECT_DIR" || continue
-            docker compose up -d
-            echo -e "${GREEN}✅ 已恢复: $PROJECT_DIR${RESET}"
-        else
-            echo -e "${YELLOW}⚠️ docker-compose.yml 不存在，跳过启动容器${RESET}"
-        fi
-    done
-}
-
-# ================== 删除备份 ==================
-delete_backup() {
-    read -rp "请输入备份存放目录（默认 $DEFAULT_BACKUP_DIR）: " BACKUP_DIR
-    BACKUP_DIR=${BACKUP_DIR:-$DEFAULT_BACKUP_DIR}
-
-    if [[ ! -d "$BACKUP_DIR" ]]; then
-        echo -e "${RED}❌ 目录不存在: $BACKUP_DIR${RESET}"
-        return
+    # 检查 root
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "${RED}❌ 请用 root 用户运行脚本${RESET}"
+        exit 1
     fi
 
-    ls -1 "$BACKUP_DIR"
-    read -rp "请输入要删除的备份文件名（多个用空格分隔）: " -a FILES
-    for FILE in "${FILES[@]}"; do
-        if [[ -f "$BACKUP_DIR/$FILE" ]]; then
-            rm -f "$BACKUP_DIR/$FILE"
-            echo -e "${GREEN}✅ 已删除 $FILE${RESET}"
-        else
-            echo -e "${RED}❌ 文件不存在: $FILE${RESET}"
-        fi
-    done
+    # 检查 Docker
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}⚙️ 未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | sh
+        systemctl enable docker
+        systemctl start docker
+    else
+        echo -e "${GREEN}✅ Docker 已安装${RESET}"
+    fi
+
+    # 创建目录
+    mkdir -p "$DB_DIR" "$CERT_DIR"
+
+    # 删除旧容器
+    if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        echo -e "${YELLOW}⚠️ 已存在容器 ${CONTAINER_NAME}，正在删除...${RESET}"
+        docker stop ${CONTAINER_NAME} >/dev/null 2>&1
+        docker rm ${CONTAINER_NAME} >/dev/null 2>&1
+    fi
+
+    # 运行新容器
+    echo -e "${GREEN}📦 拉取镜像并启动容器...${RESET}"
+    docker run -itd \
+      --name ${CONTAINER_NAME} \
+      --restart=always \
+      --network=host \
+      -e XRAY_VMESS_AEAD_FORCED=false \
+      -v ${DB_DIR}:/etc/x-ui/ \
+      -v ${CERT_DIR}:/root/cert/ \
+      ${IMAGE_NAME}
+
+    echo -e "${GREEN}✅ 安装完成！${RESET}"
+    echo -e "👉 管理面板: ${YELLOW}http://$(curl -s ifconfig.me):${PANEL_PORT}${RESET}"
+    echo -e "👉 默认用户: ${YELLOW}admin${RESET} / 密码: ${YELLOW}admin${RESET}"
 }
 
-# ================== 远程备份 ==================
-remote_backup() {
-    read -rp "请输入要远程传输的备份文件（多个空格分隔）: " -a FILES
-    read -rp "请输入远程 VPS 用户名: " REMOTE_USER
-    read -rp "请输入远程 VPS IP 或域名: " REMOTE_HOST
-    read -rp "请输入远程目录: " REMOTE_DIR
-    read -rp "请输入远程 SSH 端口（默认 22）: " REMOTE_PORT
-    REMOTE_PORT=${REMOTE_PORT:-22}
+update_3xui() {
+    echo -e "${GREEN}🔄 更新 3x-ui ...${RESET}"
 
-    for FILE in "${FILES[@]}"; do
-        if [[ ! -f "$FILE" ]]; then
-            echo -e "${RED}❌ 文件不存在: $FILE${RESET}"
-            continue
-        fi
-        echo -e "${CYAN}🚀 传输 $FILE → $REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR (端口 $REMOTE_PORT)${RESET}"
-        scp -P "$REMOTE_PORT" "$FILE" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR"
-        if [[ $? -eq 0 ]]; then
-            echo -e "${GREEN}✅ 传输成功: $FILE${RESET}"
-        else
-            echo -e "${RED}❌ 传输失败: $FILE${RESET}"
-        fi
-    done
+    # 拉取最新镜像
+    docker pull ${IMAGE_NAME}
+
+    # 检查容器是否存在
+    if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        echo -e "${GREEN}🔁 容器已存在，正在重启以应用新镜像...${RESET}"
+        docker stop ${CONTAINER_NAME} >/dev/null 2>&1
+
+        # 使用最新镜像重启容器，保留卷和网络模式
+        docker commit ${CONTAINER_NAME} temp_image_backup >/dev/null 2>&1
+        docker rm ${CONTAINER_NAME} >/dev/null 2>&1
+        docker run -itd \
+          --name ${CONTAINER_NAME} \
+          --restart=always \
+          --network=host \
+          -e XRAY_VMESS_AEAD_FORCED=false \
+          -v ${DB_DIR}:/etc/x-ui/ \
+          -v ${CERT_DIR}:/root/cert/ \
+          ${IMAGE_NAME}
+
+        echo -e "${GREEN}✅ 更新完成，容器已重启${RESET}"
+    else
+        echo -e "${RED}❌ 容器不存在，无法更新。请先安装${RESET}"
+    fi
+}
+
+
+uninstall_3xui() {
+    echo -e "${RED}⚠️ 卸载 3x-ui ...${RESET}"
+    docker stop ${CONTAINER_NAME} >/dev/null 2>&1
+    docker rm ${CONTAINER_NAME} >/dev/null 2>&1
+    rm -rf /opt/3xui
+    echo -e "${GREEN}✅ 已卸载容器 ${CONTAINER_NAME}${RESET}"
+}
+
+logs_3xui() {
+    if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        echo -e "${GREEN}📖 正在查看日志，按 Ctrl+C 退出...${RESET}"
+        docker logs -f ${CONTAINER_NAME}
+    else
+        echo -e "${RED}❌ 容器 ${CONTAINER_NAME} 未运行${RESET}"
+    fi
 }
 
 # ================== 菜单 ==================
 while true; do
     clear
-    echo -e "${CYAN}===== Docker Compose 多项目备份恢复 =====${RESET}"
-    echo -e "${GREEN}1. 备份项目（包含卷数据）${RESET}"
-    echo -e "${GREEN}2. 恢复项目（自动恢复到原目录${RESET}"
-    echo -e "${GREEN}3. 删除备份文件${RESET}"
-    echo -e "${GREEN}4. 远程备份到 VPS${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    read -rp "请选择操作: " CHOICE
+    echo -e "${GREEN}========= 3x-ui 管理菜单 =========${RESET}"
+    echo -e "${YELLOW}1.安装 3x-ui${RESET}"
+    echo -e "${YELLOW}2.更新 3x-ui${RESET}"
+    echo -e "${YELLOW}3.卸载 3x-ui${RESET}"
+    echo -e "${YELLOW}4.查看日志${RESET}"
+    echo -e "${YELLOW}0.退出${RESET}"
+    echo -ne "${GREEN}请选择操作 [0-4]: ${RESET}"
+    read opt
 
-    case $CHOICE in
-        1) backup ;;
-        2) restore ;;
-        3) delete_backup ;;
-        4) remote_backup ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}❌ 无效选择${RESET}" ;;
+    case $opt in
+        1) install_3xui ;;
+        2) update_3xui ;;
+        3) uninstall_3xui ;;
+        4) logs_3xui ;;
+        0) echo -e "${GREEN}退出脚本${RESET}"; exit 0 ;;
+        *) echo -e "${RED}无效选项，请重新输入${RESET}" ;;
     esac
-    echo -e "\n按回车键继续..."
+    echo -e "${YELLOW}按回车键返回菜单...${RESET}"
     read
 done

@@ -1,12 +1,9 @@
 /*
-注⚠️：脚本的运行需提前在VPS上完成相关操作
+注⚠️：脚本需在 VPS 上运行 Docker 监控服务
 参数：
 url：你的 Docker 监控服务 URL
-name：Panel的标题
-icon：Panel的图标
-
-示例：
-argument = url=http://127.0.0.1:7124&name=Docker监控&icon=shippingbox.fill
+name：Panel标题
+icon：Panel图标
 */
 
 (async () => {
@@ -26,12 +23,29 @@ argument = url=http://127.0.0.1:7124&name=Docker监控&icon=shippingbox.fill
   panel.icon = params.icon || 'shippingbox.fill';
   panel["icon-color"] = dockerStatus === '运行中' ? '#06D6A0' : '#f44336';
 
-  // 每条信息单独一行
+  // 构建运行中容器信息
+  let containersInfo = '';
+  if (jsonData.containers && jsonData.containers.length > 0) {
+    jsonData.containers.forEach(c => {
+      const name = c.name || '未知';
+      const status = c.status || '未知';
+      const uptime = c.uptime || '未知';
+      const cpu = c.cpu ? c.cpu.toFixed(1) + '%' : '未知';
+      const memory = c.memory || '未知';
+      const netIO = c.net || '未知';
+      containersInfo += `\n▶️ ${name} (${status})\n   ⏱️ ${uptime} | CPU: ${cpu} | MEM: ${memory} | NET: ${netIO}`;
+    });
+  } else {
+    containersInfo = '\n无容器数据';
+  }
+
+  // Panel 内容
   panel.content = 
     `🐳 Docker: ${dockerStatus}\n` +
     `📦 总容器: ${totalContainers}\n` +
-    `▶️ 运行中: ${runningContainers}\n` +
-    `🕒 Update: ${timeString}`;
+    `▶️ 运行中: ${runningContainers}` +
+    containersInfo +
+    `\n🕒 Update: ${timeString}`;
 
   $done(panel);
 })().catch((e) => {

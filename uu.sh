@@ -1,166 +1,240 @@
 #!/bin/bash
-# ========================================
-# WireGuard 一键管理脚本 (Docker Compose)
-# ========================================
 
 GREEN="\033[32m"
 RESET="\033[0m"
-APP_NAME="wireguard"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.env"
+gl_huang="\033[33m"
+gl_bai="\033[97m"
+gl_lv="\033[34m"
 
-# 自动安装 qrencode
-if ! command -v qrencode &>/dev/null; then
-    echo -e "${GREEN}📦 安装 qrencode 用于生成二维码${RESET}"
-    if command -v apt &>/dev/null; then
-        apt update && apt install -y qrencode
-    elif command -v yum &>/dev/null; then
-        yum install -y qrencode
-    fi
-fi
+docker_name="wireguard"
+docker_img="lscr.io/linuxserver/wireguard:latest"
+DEFAULT_PORT=51820  # 默认端口
+docker_port=$DEFAULT_PORT
 
-function menu() {
+# 默认配置
+DEFAULT_COUNT=5
+DEFAULT_NETWORK="10.13.13.0"
+
+# 获取当前配置
+COUNT=${DEFAULT_COUNT}
+NETWORK=${DEFAULT_NETWORK}
+
+show_menu() {
     clear
-    echo -e "${GREEN}=== WireGuard 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载(含数据)${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 查看客户端配置与二维码${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}=======================${RESET}"
-    read -p "请选择: " choice
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
-        4) view_logs ;;
-        5) view_clients ;;
-        0) exit 0 ;;
-        *) echo "无效选择"; sleep 1; menu ;;
+    echo -e "${GREEN}=== WireGuard VPN 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装/启动 WireGuard 服务${RESET}"
+    echo -e "${GREEN}2) 更新 WireGuard 服务${RESET}"
+    echo -e "${GREEN}3) 查看所有客户端配置${RESET}"
+    echo -e "${GREEN}4) 卸载 WireGuard 服务${RESET}"
+    echo -e "${GREEN}5) 退出${RESET}"
+    read -e -p "请输入选项 (1-5): " option
+    case $option in
+        1) modify_and_install_start_wireguard ;;
+        2) update_wireguard ;;
+        3) view_client_configs ;;
+        4) stop_wireguard ;;
+        5) exit 0 ;;
+        *) echo -e "${gl_huang}无效选项，请重新选择！${gl_bai}" && sleep 2 && show_menu ;;
     esac
 }
 
-function install_app() {
-    read -p "请输入 WireGuard 服务端口 [默认:51820]: " input_port
-    SERVERPORT=${input_port:-51820}
+modify_and_install_start_wireguard() {
+    echo -e "${gl_huang}当前配置: ${gl_bai}客户端数量 = $COUNT, 网段 = $NETWORK, 端口 = $docker_port"
+    
+    # 修改客户端数量
+    read -e -p "请输入新的客户端数量 (默认 ${DEFAULT_COUNT}): " new_count
+    COUNT=${new_count:-$DEFAULT_COUNT}
 
-    read -p "请输入客户端数量 [默认:1]: " input_peers
-    PEERS=${input_peers:-1}
+    # 修改网段
+    read -e -p "请输入新的 WireGuard 网段 (默认 ${DEFAULT_NETWORK}): " new_network
+    NETWORK=${new_network:-$DEFAULT_NETWORK}
 
-    read -p "请输入公网域名 [默认:$(curl -s ifconfig.me)]: " input_ip
-    SERVERURL=${input_ip:-$(curl -s ifconfig.me)}
+    # 修改端口
+    read -e -p "请输入新的 WireGuard 端口 (默认 ${DEFAULT_PORT}): " new_port
+    docker_port=${new_port:-$DEFAULT_PORT}
 
-    read -p "请输入 IPv4 内网段 [默认:192.168.18.0]: " input_subnet
-    INTERNAL_SUBNET=${input_subnet:-192.168.18.0}
+    echo -e "${gl_huang}新配置: ${gl_bai}客户端数量 = $COUNT, 网段 = $NETWORK, 端口 = $docker_port"
 
-    read -p "请输入 IPv6 内网段 [默认:fd00:1234:5678::/64]: " input_subnet_v6
-    INTERNAL_SUBNET_V6=${input_subnet_v6:-fd00:1234:5678::/64}
+    PEERS=$(seq -f "wg%02g" 1 "$COUNT" | paste -sd,)
 
-    read -p "请输入允许访问的 IP 范围 [默认:0.0.0.0/0,::/0]: " input_allowed
-    ALLOWEDIPS=${input_allowed:-0.0.0.0/0,::/0}
+    ip link delete wg0 &>/dev/null
 
-    mkdir -p "$APP_DIR/config"
+    docker run -d \
+      --name=wireguard \
+      --network host \
+      --cap-add=NET_ADMIN \
+      --cap-add=SYS_MODULE \
+      -e PUID=1000 \
+      -e PGID=1000 \
+      -e TZ=Etc/UTC \
+      -e SERVERURL=$(curl -s https://api.ipify.org) \
+      -e SERVERPORT=$docker_port \
+      -e PEERS=${PEERS} \
+      -e INTERNAL_SUBNET=${NETWORK} \
+      -e ALLOWEDIPS=${NETWORK}/24 \
+      -e PERSISTENTKEEPALIVE_PEERS=all \
+      -e LOG_CONFS=true \
+      -v /opt/wireguard/config:/config \
+      -v /lib/modules:/lib/modules \
+      --restart=always \
+      lscr.io/linuxserver/wireguard:latest
 
-    cat > "$COMPOSE_FILE" <<EOF
+    sleep 3
+    docker exec wireguard sh -c "
+    f='/config/wg_confs/wg0.conf'
+    sed -i 's/51820/${docker_port}/g' \$f
+    "
 
-services:
-  wireguard:
-    image: lscr.io/linuxserver/wireguard:latest
-    container_name: wireguard1
-    cap_add:
-      - NET_ADMIN
-      - SYS_MODULE
-    environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=Asia/Shanghai
-      - SERVERURL=$SERVERURL
-      - SERVERPORT=$SERVERPORT
-      - PEERS=$PEERS
-      - PEERDNS=auto
-      - INTERNAL_SUBNET=$INTERNAL_SUBNET
-      - INTERNAL_SUBNET_V6=$INTERNAL_SUBNET_V6
-      - ALLOWEDIPS=$ALLOWEDIPS
-      - PERSISTENTKEEPALIVE_PEERS=
-      - LOG_CONFS=true
-    volumes:
-      - $APP_DIR/config:/config
-      - /lib/modules:/lib/modules
-    ports:
-      - "$SERVERPORT:$SERVERPORT/udp"
-      - "[::]:$SERVERPORT:$SERVERPORT/udp"
-    sysctls:
-      - net.ipv4.conf.all.src_valid_mark=1
-      - net.ipv6.conf.all.disable_ipv6=0
-      - net.ipv6.conf.all.forwarding=1
-    restart: unless-stopped
-EOF
-
-    echo "SERVERPORT=$SERVERPORT" > "$CONFIG_FILE"
-    echo "PEERS=$PEERS" >> "$CONFIG_FILE"
-    echo "SERVERURL=$SERVERURL" >> "$CONFIG_FILE"
-    echo "INTERNAL_SUBNET=$INTERNAL_SUBNET" >> "$CONFIG_FILE"
-    echo "INTERNAL_SUBNET_V6=$INTERNAL_SUBNET_V6" >> "$CONFIG_FILE"
-    echo "ALLOWEDIPS=$ALLOWEDIPS" >> "$CONFIG_FILE"
-
-    cd "$APP_DIR"
-    docker compose up -d
-
-    echo -e "${GREEN}✅ WireGuard 已启动${RESET}"
-    echo -e "${GREEN}🌐 公网访问地址: $SERVERURL:$SERVERPORT${RESET}"
-    echo -e "${GREEN}📂 配置目录: $APP_DIR/config${RESET}"
-    echo -e "${GREEN}🌐 IPv4 内网段: $INTERNAL_SUBNET${RESET}"
-    echo -e "${GREEN}🌐 IPv6 内网段: $INTERNAL_SUBNET_V6${RESET}"
-    echo -e "${GREEN}🌐 允许访问的 IP: $ALLOWEDIPS${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ WireGuard 已更新并重启完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function uninstall_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${GREEN}✅ WireGuard 已卸载，数据已删除${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function view_logs() {
-    docker logs -f wireguard1
-    read -p "按回车返回菜单..."
-    menu
-}
-
-# 显示每个客户端的配置和二维码
-function view_clients() {
-    echo -e "${GREEN}=== 客户端配置列表 ===${RESET}"
-    PEER_DIR="$APP_DIR/config/peer*"
-    COUNT=0
-    for conf in $PEER_DIR/peer*.conf; do
-        if [ -f "$conf" ]; then
-            COUNT=$((COUNT+1))
-            echo -e "${GREEN}客户端 #$COUNT 配置文件: $conf${RESET}"
-            echo -e "${GREEN}📱 扫码连接:${RESET}"
-            qrencode -t ansiutf8 < "$conf"
-            echo "-----------------------------------------"
-        fi
+    docker exec wireguard sh -c "
+    for d in /config/peer_*; do
+      sed -i 's/51820/${docker_port}/g' \$d/*.conf
     done
-    if [ $COUNT -eq 0 ]; then
-        echo -e "${GREEN}⚠️ 暂无客户端配置，请先安装或增加客户端${RESET}"
-    fi
-    read -p "按回车返回菜单..."
-    menu
+    "
+
+    docker exec wireguard sh -c '
+    for d in /config/peer_*; do
+      sed -i "/^DNS/d" "$d"/*.conf
+    done
+    '
+
+    docker exec wireguard sh -c '
+    for d in /config/peer_*; do
+      for f in "$d"/*.conf; do
+        grep -q "^PersistentKeepalive" "$f" || \
+        sed -i "/^AllowedIPs/ a PersistentKeepalive = 25" "$f"
+      done
+    done
+    '
+
+    docker exec -it wireguard bash -c '
+    for d in /config/peer_*; do
+      cd "$d" || continue
+      conf_file=$(ls *.conf)
+      base_name="${conf_file%.conf}"
+      qrencode -o "$base_name.png" < "$conf_file"
+    done
+    '
+
+    docker restart wireguard
+
+    sleep 2
+    echo
+    echo -e "${gl_huang}所有客户端二维码配置: ${gl_bai}"
+    docker exec -it wireguard bash -c 'for i in $(ls /config | grep peer_ | sed "s/peer_//"); do echo "--- $i ---"; /app/show-peer $i; done'
+    sleep 2
+    echo
+    echo -e "${gl_huang}所有客户端配置代码: ${gl_bai}"
+    docker exec wireguard sh -c 'for d in /config/peer_*; do echo "# $(basename $d) "; cat $d/*.conf; echo; done'
+    sleep 2
+    echo -e "${gl_lv}${COUNT}个客户端配置全部输出，使用方法如下：${gl_bai}"
+    echo -e "${gl_lv}1. 手机下载wg的APP，扫描上方二维码，可以快速连接网络${gl_bai}"
+    echo -e "${gl_lv}2. Windows下载客户端，复制配置代码连接网络。${gl_bai}"
+    echo -e "${gl_lv}3. Linux用脚本部署WG客户端，复制配置代码连接网络。${gl_bai}"
+    echo -e "${gl_lv}官方客户端下载方式: https://www.wireguard.com/install/${gl_bai}"
+    read -p "按任意键返回主菜单..." && show_menu
 }
 
-menu
+# 更新 WireGuard 服务，无需输入
+update_wireguard() {
+    echo "更新 WireGuard 服务..."
+    docker pull lscr.io/linuxserver/wireguard:latest
+
+    docker stop wireguard
+    docker rm wireguard
+
+    echo -e "${gl_huang}当前配置: ${gl_bai}客户端数量 = $COUNT, 网段 = $NETWORK, 端口 = $docker_port"
+    PEERS=$(seq -f "wg%02g" 1 "$COUNT" | paste -sd,)
+
+    ip link delete wg0 &>/dev/null
+
+    docker run -d \
+      --name=wireguard \
+      --network host \
+      --cap-add=NET_ADMIN \
+      --cap-add=SYS_MODULE \
+      -e PUID=1000 \
+      -e PGID=1000 \
+      -e TZ=Etc/UTC \
+      -e SERVERURL=$(curl -s https://api.ipify.org) \
+      -e SERVERPORT=$docker_port \
+      -e PEERS=${PEERS} \
+      -e INTERNAL_SUBNET=${NETWORK} \
+      -e ALLOWEDIPS=${NETWORK}/24 \
+      -e PERSISTENTKEEPALIVE_PEERS=all \
+      -e LOG_CONFS=true \
+      -v /opt/wireguard/config:/config \
+      -v /lib/modules:/lib/modules \
+      --restart=always \
+      lscr.io/linuxserver/wireguard:latest
+
+    sleep 3
+    docker exec wireguard sh -c "
+    f='/config/wg_confs/wg0.conf'
+    sed -i 's/51820/${docker_port}/g' \$f
+    "
+
+    docker exec wireguard sh -c "
+    for d in /config/peer_*; do
+      sed -i 's/51820/${docker_port}/g' \$d/*.conf
+    done
+    "
+
+    docker exec wireguard sh -c '
+    for d in /config/peer_*; do
+      sed -i "/^DNS/d" "$d"/*.conf
+    done
+    '
+
+    docker exec wireguard sh -c '
+    for d in /config/peer_*; do
+      for f in "$d"/*.conf; do
+        grep -q "^PersistentKeepalive" "$f" || \
+        sed -i "/^AllowedIPs/ a PersistentKeepalive = 25" "$f"
+      done
+    done
+    '
+
+    docker exec -it wireguard bash -c '
+    for d in /config/peer_*; do
+      cd "$d" || continue
+      conf_file=$(ls *.conf)
+      base_name="${conf_file%.conf}"
+      qrencode -o "$base_name.png" < "$conf_file"
+    done
+    '
+
+    docker restart wireguard
+
+    sleep 2
+    echo
+    echo -e "${gl_huang}所有客户端二维码配置: ${gl_bai}"
+    docker exec -it wireguard bash -c 'for i in $(ls /config | grep peer_ | sed "s/peer_//"); do echo "--- $i ---"; /app/show-peer $i; done'
+    sleep 2
+    echo
+    echo -e "${gl_huang}所有客户端配置代码: ${gl_bai}"
+    docker exec wireguard sh -c 'for d in /config/peer_*; do echo "# $(basename $d) "; cat $d/*.conf; echo; done'
+    sleep 2
+    echo -e "${gl_lv}${COUNT}个客户端配置全部输出，使用方法如下：${gl_bai}"
+    echo -e "${gl_lv}1. 手机下载wg的APP，扫描上方二维码，可以快速连接网络${gl_bai}"
+    echo -e "${gl_lv}2. Windows下载客户端，复制配置代码连接网络。${gl_bai}"
+    echo -e "${gl_lv}3. Linux用脚本部署WG客户端，复制配置代码连接网络。${gl_bai}"
+    echo -e "${gl_lv}官方客户端下载方式: https://www.wireguard.com/install/${gl_bai}"
+    read -p "按任意键返回主菜单..." && show_menu
+}
+
+view_client_configs() {
+    echo "查看所有客户端配置..."
+    docker exec wireguard sh -c 'for d in /config/peer_*; do echo "# $(basename $d) "; cat $d/*.conf; done'
+    read -p "按任意键返回主菜单..." && show_menu
+}
+
+stop_wireguard() {
+    echo "停止 WireGuard 服务并删除配置数据..."
+    docker stop wireguard
+    docker rm wireguard
+    rm -rf /opt/wireguard/config
+    echo -e "${gl_huang}WireGuard 服务及所有配置数据已删除！${gl_bai}"
+    read -p "按任意键返回主菜单..." && show_menu
+}
+
+show_menu

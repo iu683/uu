@@ -10,7 +10,7 @@ re="\033[0m"
 # ================== 基础配置 ==================
 SCRIPT_PATH="/opt/vpsd/docker_info.sh"
 TG_CONFIG_FILE="/opt/vpsd/.vps_tgd_config"
-SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/nn.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/uu.sh"
 
 # ================== 下载或更新脚本 ==================
 download_script(){
@@ -192,7 +192,7 @@ menu(){
     echo -e "${green}0) 退出${re}"
     read -rp "请选择操作: " choice
     case $choice in
-      1) collect_docker_info; echo "$SYS_INFO"; pause_return ;;
+      1) get_docker_info; echo "$SYS_INFO"; pause_return ;;
       2) collect_docker_info; send_to_telegram; pause_return ;;
       3) modify_telegram_config; pause_return ;;
       4) setup_cron_job; pause_return ;;

@@ -10,7 +10,7 @@ re="\033[0m"
 # ================== 基础配置 ==================
 SCRIPT_PATH="/opt/vpsd/docker_info.sh"
 TG_CONFIG_FILE="/opt/vpsd/.vps_tgd_config"
-SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/uu.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/nn.sh"
 
 # ================== 下载或更新脚本 ==================
 download_script(){
@@ -33,7 +33,7 @@ enable_cron_service(){
 }
 
 # ================== Docker 信息 ==================
-get_docker_info(){
+collect_docker_info(){
   if ! command -v docker >/dev/null 2>&1; then
     DOCKER_INFO="❌ *未检测到 Docker*"
     return
@@ -43,13 +43,16 @@ get_docker_info(){
   container_count=$(docker ps -q | wc -l)
   all_container_count=$(docker ps -aq | wc -l)
 
+  # 容器资源占用（按内存排序）
   container_stats=$(docker stats --no-stream --format "{{.Name}} | CPU: {{.CPUPerc}} | MEM: {{.MemUsage}} | NET: {{.NetIO}}" \
     | sort -k6 -h 2>/dev/null)
   [ -z "$container_stats" ] && container_stats="暂无运行中的容器"
 
+  # 镜像信息（大小）
   images_info=$(docker images --format "{{.Repository}}:{{.Tag}} ({{.Size}})")
   [ -z "$images_info" ] && images_info="暂无镜像"
 
+  # 磁盘占用
   disk_usage=$(docker system df --format "Images: {{.Images}} ({{.Size}}) | Containers: {{.Containers}} ({{.Size}}) | Volumes: {{.Volumes}} ({{.Size}})" 2>/dev/null)
 
   DOCKER_INFO=$(cat <<EOF
@@ -75,6 +78,7 @@ $disk_usage
 EOF
 )
 }
+
 
 
 # ================== Telegram 配置 ==================
@@ -192,7 +196,7 @@ menu(){
     echo -e "${green}0) 退出${re}"
     read -rp "请选择操作: " choice
     case $choice in
-      1) get_docker_info; echo "$SYS_INFO"; pause_return ;;
+      1) collect_docker_info; echo "$SYS_INFO"; pause_return ;;
       2) collect_docker_info; send_to_telegram; pause_return ;;
       3) modify_telegram_config; pause_return ;;
       4) setup_cron_job; pause_return ;;

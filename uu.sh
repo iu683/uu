@@ -1,240 +1,200 @@
 #!/bin/bash
 
-GREEN="\033[32m"
-RESET="\033[0m"
-gl_huang="\033[33m"
-gl_bai="\033[97m"
-gl_lv="\033[34m"
+# ================== 颜色定义 ==================
+green="\033[32m"
+yellow="\033[33m"
+red="\033[31m"
+white="\033[37m"
+re="\033[0m"
 
-docker_name="wireguard"
-docker_img="lscr.io/linuxserver/wireguard:latest"
-DEFAULT_PORT=51820  # 默认端口
-docker_port=$DEFAULT_PORT
+# ================== 基础配置 ==================
+SCRIPT_PATH="/opt/vpsd/docker_info.sh"
+TG_CONFIG_FILE="/opt/vpsd/.vps_tgd_config"
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/uu.sh"
 
-# 默认配置
-DEFAULT_COUNT=5
-DEFAULT_NETWORK="10.13.13.0"
+# ================== 下载或更新脚本 ==================
+download_script(){
+    mkdir -p "$(dirname "$SCRIPT_PATH")"
+    curl -sSL "$SCRIPT_URL" -o "$SCRIPT_PATH"
+    chmod +x "$SCRIPT_PATH"
+}
 
-# 获取当前配置
-COUNT=${DEFAULT_COUNT}
-NETWORK=${DEFAULT_NETWORK}
+# ================== 确保 cron 服务已开启 ==================
+enable_cron_service(){
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl list-unit-files | grep -q "^cron.service"; then
+      systemctl enable --now cron >/dev/null 2>&1
+    elif systemctl list-unit-files | grep -q "^crond.service"; then
+      systemctl enable --now crond >/dev/null 2>&1
+    fi
+  elif command -v service >/dev/null 2>&1; then
+    service cron start 2>/dev/null || service crond start 2>/dev/null
+  fi
+}
 
-show_menu() {
+# ================== Docker 信息收集 ==================
+collect_docker_info(){
+  if ! command -v docker >/dev/null 2>&1; then
+    SYS_INFO="❌ 未安装 Docker"
+    return
+  fi
+
+  container_count=$(docker ps -q | wc -l)
+  running=$(docker ps --format '{{.Names}} ({{.Status}})' | sed 's/^/▶ /')
+  images=$(docker images --format '{{.Repository}}:{{.Tag}} ({{.ID}})' | sed 's/^/📦 /')
+
+  current_time=$(date "+%Y-%m-%d %H:%M")
+
+  SYS_INFO=$(cat <<EOF
+🐳 Docker 信息推送
+========================
+容器数量: $container_count
+运行中容器:
+$running
+
+镜像列表:
+$images
+
+系统时间: $current_time
+========================
+EOF
+)
+}
+
+# ================== Telegram 配置 ==================
+setup_telegram(){
+  mkdir -p "$(dirname "$TG_CONFIG_FILE")"
+  echo "第一次运行或缺少配置文件，需要配置 Telegram 参数"
+  echo "请输入 Telegram Bot Token:"
+  read -r TG_BOT_TOKEN
+  echo "请输入 Telegram Chat ID:"
+  read -r TG_CHAT_ID
+  echo "TG_BOT_TOKEN=\"$TG_BOT_TOKEN\"" > "$TG_CONFIG_FILE"
+  echo "TG_CHAT_ID=\"$TG_CHAT_ID\"" >> "$TG_CONFIG_FILE"
+  chmod 600 "$TG_CONFIG_FILE"
+  echo -e "\n配置已保存到 $TG_CONFIG_FILE，下次运行可直接使用。"
+}
+
+send_to_telegram(){
+  local first_run=0
+  if [ ! -f "$TG_CONFIG_FILE" ]; then
+    first_run=1
+    setup_telegram
+  fi
+
+  source "$TG_CONFIG_FILE"
+  [ -z "$SYS_INFO" ] && collect_docker_info
+
+  if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+    echo "⚠️ Telegram 配置缺失"
+    return
+  fi
+
+  curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
+    -d chat_id="$TG_CHAT_ID" \
+    -d text="$SYS_INFO" >/dev/null 2>&1
+
+  if [ "$first_run" -eq 1 ]; then
+    echo -e "${green}✅ 配置已保存，并已发送第一次 Docker 信息到 Telegram${re}"
+  else
+    echo -e "${green}✅ 信息已发送到 Telegram${re}"
+  fi
+}
+
+modify_telegram_config(){
+  echo "请输入新的 Telegram Bot Token:"
+  read -r TG_BOT_TOKEN
+  echo "请输入新的 Telegram Chat ID:"
+  read -r TG_CHAT_ID
+  mkdir -p "$(dirname "$TG_CONFIG_FILE")"
+  echo "TG_BOT_TOKEN=\"$TG_BOT_TOKEN\"" > "$TG_CONFIG_FILE"
+  echo "TG_CHAT_ID=\"$TG_CHAT_ID\"" >> "$TG_CONFIG_FILE"
+  chmod 600 "$TG_CONFIG_FILE"
+  echo -e "${green}✅ Telegram 配置已更新${re}"
+}
+
+# ================== 定时任务管理 ==================
+setup_cron_job(){
+  echo -e "${green}定时任务设置:${re}"
+  echo -e "${green}1) 每天发送一次 Docker 信息 (0点)${re}"
+  echo -e "${green}2) 每周发送一次 Docker 信息 (周一 0点)${re}"
+  echo -e "${green}3) 每月发送一次 Docker 信息 (1号 0点)${re}"
+  echo -e "${green}4) 删除当前任务(仅本脚本相关)${re}"
+  echo -e "${green}5) 查看当前任务${re}"
+  echo -e "${green}6) 返回菜单${re}"
+  read -rp "请选择 [1-6]: " cron_choice
+
+  CRON_CMD="bash $SCRIPT_PATH send"
+
+  case $cron_choice in
+    1) (crontab -l 2>/dev/null | grep -v "$CRON_CMD"; echo "0 0 * * * $CRON_CMD") | crontab -
+       echo -e "${green}✅ 已设置每天 0 点发送一次 Docker 信息${re}" ;;
+    2) (crontab -l 2>/dev/null | grep -v "$CRON_CMD"; echo "0 0 * * 1 $CRON_CMD") | crontab -
+       echo -e "${green}✅ 已设置每周一 0 点发送一次 Docker 信息${re}" ;;
+    3) (crontab -l 2>/dev/null | grep -v "$CRON_CMD"; echo "0 0 1 * * $CRON_CMD") | crontab -
+       echo -e "${green}✅ 已设置每月 1 日 0 点发送一次 Docker 信息${re}" ;;
+    4) crontab -l 2>/dev/null | grep -v "$CRON_CMD" | crontab -
+       echo -e "${red}❌ 已删除本脚本相关的定时任务${re}" ;;
+    5) echo -e "${yellow}当前已配置的定时任务:${re}"
+       crontab -l 2>/dev/null | grep "$CRON_CMD" || echo "没有找到和本脚本相关的定时任务" ;;
+    6) return ;;
+    *) echo "无效选择" ;;
+  esac
+}
+
+pause_return(){
+  read -rp "👉 按回车返回菜单..." temp
+}
+
+# ================== 卸载脚本 ==================
+uninstall_script(){
+    echo -e "${yellow}即将卸载脚本及配置和定时任务${re}"
+    read -rp "确认卸载吗？(y/N): " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        CRON_CMD="bash $SCRIPT_PATH send"
+        crontab -l 2>/dev/null | grep -v "$CRON_CMD" | crontab -
+        rm -f "$SCRIPT_PATH"
+        rm -f "$TG_CONFIG_FILE"
+        rm -rf /opt/vpsd
+        echo -e "${green}✅ 卸载完成,相关数据和定时任务已删除${re}"
+        exit 0
+    else
+        echo "取消卸载"
+    fi
+}
+
+# ================== 菜单 ==================
+menu(){
+  while true; do
     clear
-    echo -e "${GREEN}=== WireGuard VPN 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装/启动 WireGuard 服务${RESET}"
-    echo -e "${GREEN}2) 更新 WireGuard 服务${RESET}"
-    echo -e "${GREEN}3) 查看所有客户端配置${RESET}"
-    echo -e "${GREEN}4) 卸载 WireGuard 服务${RESET}"
-    echo -e "${GREEN}5) 退出${RESET}"
-    read -e -p "请输入选项 (1-5): " option
-    case $option in
-        1) modify_and_install_start_wireguard ;;
-        2) update_wireguard ;;
-        3) view_client_configs ;;
-        4) stop_wireguard ;;
-        5) exit 0 ;;
-        *) echo -e "${gl_huang}无效选项，请重新选择！${gl_bai}" && sleep 2 && show_menu ;;
+    echo -e "${green}====== Docker 信息管理菜单 ======${re}"
+    echo -e "${green}1) 查看 Docker 信息${re}"
+    echo -e "${green}2) 发送 Docker 信息到 Telegram${re}"
+    echo -e "${green}3) 修改 Telegram 配置${re}"
+    echo -e "${green}4) 设置定时任务${re}"
+    echo -e "${green}5) 卸载脚本${re}"
+    echo -e "${green}0) 退出${re}"
+    read -rp "请选择操作: " choice
+    case $choice in
+      1) collect_docker_info; echo "$SYS_INFO"; pause_return ;;
+      2) collect_docker_info; send_to_telegram; pause_return ;;
+      3) modify_telegram_config; pause_return ;;
+      4) setup_cron_job; pause_return ;;
+      5) uninstall_script ;;
+      0) exit 0 ;;
+      *) echo "无效选择"; pause_return ;;
     esac
+  done
 }
 
-modify_and_install_start_wireguard() {
-    echo -e "${gl_huang}当前配置: ${gl_bai}客户端数量 = $COUNT, 网段 = $NETWORK, 端口 = $docker_port"
-    
-    # 修改客户端数量
-    read -e -p "请输入新的客户端数量 (默认 ${DEFAULT_COUNT}): " new_count
-    COUNT=${new_count:-$DEFAULT_COUNT}
+# ================== 命令行模式 ==================
+if [ "$1" == "send" ]; then
+  collect_docker_info
+  send_to_telegram
+  exit 0
+fi
 
-    # 修改网段
-    read -e -p "请输入新的 WireGuard 网段 (默认 ${DEFAULT_NETWORK}): " new_network
-    NETWORK=${new_network:-$DEFAULT_NETWORK}
-
-    # 修改端口
-    read -e -p "请输入新的 WireGuard 端口 (默认 ${DEFAULT_PORT}): " new_port
-    docker_port=${new_port:-$DEFAULT_PORT}
-
-    echo -e "${gl_huang}新配置: ${gl_bai}客户端数量 = $COUNT, 网段 = $NETWORK, 端口 = $docker_port"
-
-    PEERS=$(seq -f "wg%02g" 1 "$COUNT" | paste -sd,)
-
-    ip link delete wg0 &>/dev/null
-
-    docker run -d \
-      --name=wireguard \
-      --network host \
-      --cap-add=NET_ADMIN \
-      --cap-add=SYS_MODULE \
-      -e PUID=1000 \
-      -e PGID=1000 \
-      -e TZ=Etc/UTC \
-      -e SERVERURL=$(curl -s https://api.ipify.org) \
-      -e SERVERPORT=$docker_port \
-      -e PEERS=${PEERS} \
-      -e INTERNAL_SUBNET=${NETWORK} \
-      -e ALLOWEDIPS=${NETWORK}/24 \
-      -e PERSISTENTKEEPALIVE_PEERS=all \
-      -e LOG_CONFS=true \
-      -v /opt/wireguard/config:/config \
-      -v /lib/modules:/lib/modules \
-      --restart=always \
-      lscr.io/linuxserver/wireguard:latest
-
-    sleep 3
-    docker exec wireguard sh -c "
-    f='/config/wg_confs/wg0.conf'
-    sed -i 's/51820/${docker_port}/g' \$f
-    "
-
-    docker exec wireguard sh -c "
-    for d in /config/peer_*; do
-      sed -i 's/51820/${docker_port}/g' \$d/*.conf
-    done
-    "
-
-    docker exec wireguard sh -c '
-    for d in /config/peer_*; do
-      sed -i "/^DNS/d" "$d"/*.conf
-    done
-    '
-
-    docker exec wireguard sh -c '
-    for d in /config/peer_*; do
-      for f in "$d"/*.conf; do
-        grep -q "^PersistentKeepalive" "$f" || \
-        sed -i "/^AllowedIPs/ a PersistentKeepalive = 25" "$f"
-      done
-    done
-    '
-
-    docker exec -it wireguard bash -c '
-    for d in /config/peer_*; do
-      cd "$d" || continue
-      conf_file=$(ls *.conf)
-      base_name="${conf_file%.conf}"
-      qrencode -o "$base_name.png" < "$conf_file"
-    done
-    '
-
-    docker restart wireguard
-
-    sleep 2
-    echo
-    echo -e "${gl_huang}所有客户端二维码配置: ${gl_bai}"
-    docker exec -it wireguard bash -c 'for i in $(ls /config | grep peer_ | sed "s/peer_//"); do echo "--- $i ---"; /app/show-peer $i; done'
-    sleep 2
-    echo
-    echo -e "${gl_huang}所有客户端配置代码: ${gl_bai}"
-    docker exec wireguard sh -c 'for d in /config/peer_*; do echo "# $(basename $d) "; cat $d/*.conf; echo; done'
-    sleep 2
-    echo -e "${gl_lv}${COUNT}个客户端配置全部输出，使用方法如下：${gl_bai}"
-    echo -e "${gl_lv}1. 手机下载wg的APP，扫描上方二维码，可以快速连接网络${gl_bai}"
-    echo -e "${gl_lv}2. Windows下载客户端，复制配置代码连接网络。${gl_bai}"
-    echo -e "${gl_lv}3. Linux用脚本部署WG客户端，复制配置代码连接网络。${gl_bai}"
-    echo -e "${gl_lv}官方客户端下载方式: https://www.wireguard.com/install/${gl_bai}"
-    read -p "按任意键返回主菜单..." && show_menu
-}
-
-# 更新 WireGuard 服务，无需输入
-update_wireguard() {
-    echo "更新 WireGuard 服务..."
-    docker pull lscr.io/linuxserver/wireguard:latest
-
-    docker stop wireguard
-    docker rm wireguard
-
-    echo -e "${gl_huang}当前配置: ${gl_bai}客户端数量 = $COUNT, 网段 = $NETWORK, 端口 = $docker_port"
-    PEERS=$(seq -f "wg%02g" 1 "$COUNT" | paste -sd,)
-
-    ip link delete wg0 &>/dev/null
-
-    docker run -d \
-      --name=wireguard \
-      --network host \
-      --cap-add=NET_ADMIN \
-      --cap-add=SYS_MODULE \
-      -e PUID=1000 \
-      -e PGID=1000 \
-      -e TZ=Etc/UTC \
-      -e SERVERURL=$(curl -s https://api.ipify.org) \
-      -e SERVERPORT=$docker_port \
-      -e PEERS=${PEERS} \
-      -e INTERNAL_SUBNET=${NETWORK} \
-      -e ALLOWEDIPS=${NETWORK}/24 \
-      -e PERSISTENTKEEPALIVE_PEERS=all \
-      -e LOG_CONFS=true \
-      -v /opt/wireguard/config:/config \
-      -v /lib/modules:/lib/modules \
-      --restart=always \
-      lscr.io/linuxserver/wireguard:latest
-
-    sleep 3
-    docker exec wireguard sh -c "
-    f='/config/wg_confs/wg0.conf'
-    sed -i 's/51820/${docker_port}/g' \$f
-    "
-
-    docker exec wireguard sh -c "
-    for d in /config/peer_*; do
-      sed -i 's/51820/${docker_port}/g' \$d/*.conf
-    done
-    "
-
-    docker exec wireguard sh -c '
-    for d in /config/peer_*; do
-      sed -i "/^DNS/d" "$d"/*.conf
-    done
-    '
-
-    docker exec wireguard sh -c '
-    for d in /config/peer_*; do
-      for f in "$d"/*.conf; do
-        grep -q "^PersistentKeepalive" "$f" || \
-        sed -i "/^AllowedIPs/ a PersistentKeepalive = 25" "$f"
-      done
-    done
-    '
-
-    docker exec -it wireguard bash -c '
-    for d in /config/peer_*; do
-      cd "$d" || continue
-      conf_file=$(ls *.conf)
-      base_name="${conf_file%.conf}"
-      qrencode -o "$base_name.png" < "$conf_file"
-    done
-    '
-
-    docker restart wireguard
-
-    sleep 2
-    echo
-    echo -e "${gl_huang}所有客户端二维码配置: ${gl_bai}"
-    docker exec -it wireguard bash -c 'for i in $(ls /config | grep peer_ | sed "s/peer_//"); do echo "--- $i ---"; /app/show-peer $i; done'
-    sleep 2
-    echo
-    echo -e "${gl_huang}所有客户端配置代码: ${gl_bai}"
-    docker exec wireguard sh -c 'for d in /config/peer_*; do echo "# $(basename $d) "; cat $d/*.conf; echo; done'
-    sleep 2
-    echo -e "${gl_lv}${COUNT}个客户端配置全部输出，使用方法如下：${gl_bai}"
-    echo -e "${gl_lv}1. 手机下载wg的APP，扫描上方二维码，可以快速连接网络${gl_bai}"
-    echo -e "${gl_lv}2. Windows下载客户端，复制配置代码连接网络。${gl_bai}"
-    echo -e "${gl_lv}3. Linux用脚本部署WG客户端，复制配置代码连接网络。${gl_bai}"
-    echo -e "${gl_lv}官方客户端下载方式: https://www.wireguard.com/install/${gl_bai}"
-    read -p "按任意键返回主菜单..." && show_menu
-}
-
-view_client_configs() {
-    echo "查看所有客户端配置..."
-    docker exec wireguard sh -c 'for d in /config/peer_*; do echo "# $(basename $d) "; cat $d/*.conf; done'
-    read -p "按任意键返回主菜单..." && show_menu
-}
-
-stop_wireguard() {
-    echo "停止 WireGuard 服务并删除配置数据..."
-    docker stop wireguard
-    docker rm wireguard
-    rm -rf /opt/wireguard/config
-    echo -e "${gl_huang}WireGuard 服务及所有配置数据已删除！${gl_bai}"
-    read -p "按任意键返回主菜单..." && show_menu
-}
-
-show_menu
+# ================== 脚本入口 ==================
+enable_cron_service
+download_script
+menu

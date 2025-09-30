@@ -27,16 +27,18 @@ icon：Panel图标
   let containersInfo = '';
   if (jsonData.containers && jsonData.containers.length > 0) {
     jsonData.containers.forEach(c => {
-      const name = c.name || '未知';
-      const status = c.status || '未知';
-      const uptime = c.uptime || '未知';
-      const cpu = c.cpu ? c.cpu.toFixed(1) + '%' : '未知';
-      const memory = c.memory || '未知';
-      const netIO = c.net || '未知';
-      containersInfo += `\n▶️ ${name} (${status})\n   ⏱️ ${uptime} | CPU: ${cpu} | MEM: ${memory} | NET: ${netIO}`;
+      if (c.status === 'running') {
+        const name = c.name || '未知';
+        const status = c.status || '未知';
+        const uptime = c.uptime || '未知';
+        const cpu = c.cpu !== undefined ? c.cpu.toFixed(1) + '%' : '未知';
+        const memory = c.memory || '未知';
+        const netIO = c.net || '未知';
+        containersInfo += `\n▶️ ${name} (${status})\n   ⏱️ ${uptime} | CPU: ${cpu} | MEM: ${memory} | NET: ${netIO}`;
+      }
     });
   } else {
-    containersInfo = '\n无容器数据';
+    containersInfo = '\n无运行中容器';
   }
 
   // Panel 内容

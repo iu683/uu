@@ -1,7 +1,6 @@
 #!/bin/bash
 # ======================================
-# Stb 图床 一键管理脚本 (Docker)
-# 自动下载 Dockerfile 并构建镜像
+# Stb 图床 一键部署脚本 (自动下载源码+构建)
 # ======================================
 
 GREEN="\033[32m"
@@ -10,12 +9,11 @@ RED="\033[31m"
 RESET="\033[0m"
 
 APP_NAME="stb"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-ENV_FILE="$APP_DIR/.env"
-IMAGE_NAME="stb_app_image"
-DOCKERFILE_URL="https://raw.githubusercontent.com/setube/stb/main/Dockerfile"
+APP_DIR="/opt/stb"
+IMAGE_NAME="stb:latest"
+REPO_URL="https://github.com/setube/stb.git"
 
+# 检查 Docker
 check_docker() {
     if ! command -v docker &>/dev/null; then
         echo -e "${RED}未检测到 Docker，请先安装 Docker${RESET}"
@@ -23,9 +21,81 @@ check_docker() {
     fi
 }
 
+# 随机生成 JWT_SECRET
+gen_secret() {
+    openssl rand -hex 32
+}
+
+# 下载源码
+download_source() {
+    echo -e "${YELLOW}📥 正在下载 Stb 源码...${RESET}"
+    rm -rf $APP_DIR
+    git clone $REPO_URL $APP_DIR
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}❌ 下载失败，请检查网络或 Git 是否可用${RESET}"
+        exit 1
+    fi
+}
+
+# 构建并启动
+install_app() {
+    read -rp "请输入 Web 端口 [默认:25519]: " PORT
+    PORT=${PORT:-25519}
+
+    download_source
+    cd $APP_DIR || exit
+
+    echo -e "${YELLOW}📦 正在构建镜像...${RESET}"
+    docker build -t $IMAGE_NAME .
+
+    echo -e "${YELLOW}🚀 正在启动容器...${RESET}"
+    mkdir -p "$APP_DIR/uploads"
+    JWT_SECRET=$(gen_secret)
+
+    docker run -d \
+        --name $APP_NAME \
+        -p ${PORT}:25519 \
+        -e JWT_SECRET=$JWT_SECRET \
+        -e VITE_APP_TITLE="Stb 图床" \
+        -v $APP_DIR/uploads:/app/uploads \
+        $IMAGE_NAME
+
+    echo -e "${GREEN}✅ Stb 图床已启动${RESET}"
+    echo -e "本地访问地址: ${YELLOW}http://127.0.0.1:${PORT}${RESET}"
+    echo -e "JWT_SECRET: ${GREEN}${JWT_SECRET}${RESET}"
+    echo -e "上传目录: ${GREEN}$APP_DIR/uploads${RESET}"
+
+    read -rp "按回车返回菜单..."
+    menu
+}
+
+# 更新
+update_app() {
+    echo -e "${YELLOW}🔄 更新源码并重新构建...${RESET}"
+    docker stop $APP_NAME && docker rm $APP_NAME
+    install_app
+}
+
+# 卸载
+uninstall_app() {
+    docker stop $APP_NAME && docker rm $APP_NAME
+    docker rmi $IMAGE_NAME
+    rm -rf $APP_DIR
+    echo -e "${RED}✅ 已卸载 Stb 图床${RESET}"
+    read -rp "按回车返回菜单..."
+    menu
+}
+
+# 查看日志
+view_logs() {
+    docker logs -f $APP_NAME
+    read -rp "按回车返回菜单..."
+    menu
+}
+
 menu() {
     clear
-    echo -e "${GREEN}=== Stb 图床管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== Stb 图床 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载${RESET}"
@@ -40,133 +110,6 @@ menu() {
         0) exit 0 ;;
         *) echo "无效选择"; sleep 1; menu ;;
     esac
-}
-
-install_app() {
-    mkdir -p "$APP_DIR/uploads"
-    mkdir -p "$APP_DIR/server"
-    chown -R 1000:1000 "$APP_DIR"
-    chmod -R 755 "$APP_DIR"
-
-    cd "$APP_DIR" || exit
-
-    # 下载官方 Dockerfile
-    echo -e "${YELLOW}📥 正在下载官方 Dockerfile...${RESET}"
-    curl -L -o Dockerfile "$DOCKERFILE_URL"
-    if [[ ! -f Dockerfile ]]; then
-        echo -e "${RED}❌ Dockerfile 下载失败，请检查网络${RESET}"
-        exit 1
-    fi
-    echo -e "${GREEN}✅ Dockerfile 下载完成${RESET}"
-
-    # 自定义端口
-    read -rp "请输入 Web 端口 [默认:25519]: " APP_PORT
-    APP_PORT=${APP_PORT:-25519}
-
-    # 随机生成 JWT_SECRET
-    JWT_SECRET=$(openssl rand -hex 32)
-
-    # 写入 .env 文件
-    cat > "$ENV_FILE" <<EOF
-JWT_SECRET=${JWT_SECRET}
-PORT=25519
-MONGODB_URI=mongodb://mongodb:27017/stb
-VITE_APP_TITLE=Stb图床
-EOF
-
-    # 生成 docker-compose.yml
-    cat > "$COMPOSE_FILE" <<EOF
-
-services:
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: stb_app
-    image: $IMAGE_NAME
-    ports:
-      - "127.0.0.1:${APP_PORT}:25519"
-    volumes:
-      - uploads_volume:/app/server/uploads
-      - ./server/.env:/app/server/.env:ro
-    depends_on:
-      mongodb:
-        condition: service_healthy
-    networks:
-      - app-network
-    restart: unless-stopped
-    environment:
-      - PORT=25519
-      - MONGODB_URI=mongodb://mongodb:27017/stb
-      - JWT_SECRET=${JWT_SECRET}
-      - VITE_APP_TITLE=Stb图床
-    expose:
-      - 25519
-
-  mongodb:
-    image: mongo:6.0
-    container_name: mongodb
-    ports:
-      - "27017:27017"
-    volumes:
-      - mongodb_data:/data/db
-    networks:
-      - app-network
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.runCommand({ ping: 1 })"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    restart: unless-stopped
-
-networks:
-  app-network:
-    driver: bridge
-
-volumes:
-  mongodb_data:
-  uploads_volume:
-EOF
-
-    # 构建镜像并启动
-    echo -e "${YELLOW}🚀 正在构建 Docker 镜像，请稍等...${RESET}"
-    docker compose build
-    echo -e "${YELLOW}📦 镜像构建完成，启动容器...${RESET}"
-    docker compose up -d
-
-    echo -e "${GREEN}✅ Stb 图床已启动${RESET}"
-    echo -e "${YELLOW}本地访问地址: http://127.0.0.1:${APP_PORT}${RESET}"
-    echo -e "${GREEN}JWT_SECRET: ${JWT_SECRET}${RESET}"
-    echo -e "${GREEN}上传目录: $APP_DIR/uploads${RESET}"
-    read -rp "按回车返回菜单..."
-    menu
-}
-
-update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
-    echo -e "${YELLOW}🚀 拉取最新镜像并重建容器...${RESET}"
-    docker compose pull
-    docker compose build
-    docker compose up -d
-    echo -e "${GREEN}✅ Stb 图床已更新并重启完成${RESET}"
-    read -rp "按回车返回菜单..."
-    menu
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Stb 图床已卸载，数据已删除${RESET}"
-    read -rp "按回车返回菜单..."
-    menu
-}
-
-view_logs() {
-    docker logs -f stb_app
-    read -rp "按回车返回菜单..."
-    menu
 }
 
 check_docker

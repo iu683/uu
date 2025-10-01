@@ -1,6 +1,6 @@
 #!/bin/bash
 # ======================================
-# ACGFaka 一键管理脚本 (端口映射模式)
+# Stb 图床 一键管理脚本 (Docker)
 # ======================================
 
 GREEN="\033[32m"
@@ -8,9 +8,10 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="acgfaka"
+APP_NAME="stb"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+ENV_FILE="$APP_DIR/.env"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -21,10 +22,10 @@ check_docker() {
 
 menu() {
     clear
-    echo -e "${GREEN}=== ACGFaka 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== Stb 图床管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}3) 卸载${RESET}"
     echo -e "${GREEN}4) 查看日志${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
     read -rp "请选择: " choice
@@ -39,43 +40,84 @@ menu() {
 }
 
 install_app() {
-    mkdir -p "$APP_DIR/acgfaka"
+    mkdir -p "$APP_DIR/uploads"
+    mkdir -p "$APP_DIR/server"
+    chown -R 1000:1000 "$APP_DIR"
+    chmod -R 755 "$APP_DIR"
 
-    read -rp "请输入 Web 端口 [默认 8080]: " WEB_PORT
-    WEB_PORT=${WEB_PORT:-8080}
+    # 生成随机 JWT_SECRET
+    JWT_SECRET=$(openssl rand -hex 20)
 
+    # 自定义端口
+    read -rp "请输入 Web 端口 [默认:25519]: " APP_PORT
+    APP_PORT=${APP_PORT:-25519}
+
+    # 写入 .env
+    cat > "$ENV_FILE" <<EOF
+JWT_SECRET=${JWT_SECRET}
+EOF
+
+    # 生成 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
 
 services:
-  acgfaka:
-    image: dapiaoliang666/acgfaka
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stb_app
     ports:
-      - "127.0.0.1:${WEB_PORT}:80"
-    depends_on:
-      - redis
-    restart: always
-    environment:
-      PHP_OPCACHE_ENABLE: 1
-      PHP_OPCACHE_MEMORY_CONSUMPTION: 128
-      PHP_OPCACHE_MAX_ACCELERATED_FILES: 10000
-      PHP_OPCACHE_REVALIDATE_FREQ: 2
-      PHP_REDIS_HOST: redis
-      PHP_REDIS_PORT: 6379
+      - "127.0.0.1:${APP_PORT}:25519"
     volumes:
-      - ./acgfaka:/var/www/html
+      - uploads_volume:/app/server/uploads
+      - ./server/.env:/app/server/.env:ro
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
+    environment:
+      - PORT=25519
+      - MONGODB_URI=mongodb://mongodb:27017/stb
+      - JWT_SECRET=${JWT_SECRET}
+      - VITE_APP_TITLE=Stb图床
+    expose:
+      - 25519
 
-  redis:
-    image: redis:latest
-    restart: always
+  mongodb:
+    image: mongo:6.0
+    container_name: mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  mongodb_data:
+  uploads_volume:
 EOF
 
     cd "$APP_DIR" || exit
-    docker compose up -d
+    docker compose up -d --build
 
-    echo -e "${GREEN}✅ ACGFaka 已启动${RESET}"
-    echo -e "${GREEN}本地访问地址: http://127.0.0.1:${WEB_PORT}${RESET}"
-    echo -e "${GREEN}后台路径: http://127.0.0.1:$WEB_PORT/admin${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR${RESET}"
+    echo -e "${GREEN}✅ Stb 图床已启动${RESET}"
+    echo -e "${YELLOW}本地访问地址: http://127.0.0.1:${APP_PORT}${RESET}"
+    echo -e "${GREEN}JWT_SECRET: ${JWT_SECRET}${RESET}"
+    echo -e "${GREEN}上传目录: $APP_DIR/uploads${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
@@ -83,8 +125,8 @@ EOF
 update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ ACGFaka 已更新并重启完成${RESET}"
+    docker compose up -d --build
+    echo -e "${GREEN}✅ Stb 图床已更新并重启完成${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
@@ -93,13 +135,13 @@ uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ ACGFaka 已卸载${RESET}"
+    echo -e "${RED}✅ Stb 图床已卸载，数据已删除${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
 
 view_logs() {
-    docker logs -f acgfaka
+    docker logs -f stb_app
     read -rp "按回车返回菜单..."
     menu
 }

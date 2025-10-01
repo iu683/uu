@@ -61,6 +61,15 @@ EOF
 
     echo "PORT=$PORT" > "$CONFIG_FILE"
 
+    # —— 新增：检查并创建外部卷 ——
+    for vol in upay_logs upay_db; do
+        if ! docker volume inspect "$vol" >/dev/null 2>&1; then
+            echo -e "${YELLOW}⚠️ 卷 $vol 不存在，正在创建...${RESET}"
+            docker volume create "$vol"
+        fi
+    done
+    # —— 新增结束 —— 
+
     cd "$APP_DIR" || exit
     docker compose up -d
 
@@ -68,7 +77,6 @@ EOF
     echo -e "${YELLOW}🌐 本地访问地址: http://127.0.0.1:$PORT${RESET}"
     echo -e "${GREEN}📂 数据目录: $APP_DIR${RESET}"
     read -rp "按回车返回菜单..."
-    menu
 }
 
 update_app() {
@@ -93,6 +101,6 @@ view_logs() {
     docker logs -f upay_pro
     read -rp "按回车返回菜单..."
     menu
-}
+}  
 
-menu
+menu  

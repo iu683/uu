@@ -1,6 +1,8 @@
 #!/bin/bash
 # ======================================
-# WireGuard 一键管理脚本 (LinuxServer Docker)
+# Stb 图床 一键管理脚本 (Docker)
+# 支持自定义端口绑定127.0.0.1
+# 自动生成 JWT_SECRET
 # ======================================
 
 GREEN="\033[32m"
@@ -8,9 +10,11 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="wireguard"
+APP_NAME="stb"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+ENV_FILE="$APP_DIR/.env"
+IMAGE_NAME="stb_app_image"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -21,7 +25,7 @@ check_docker() {
 
 menu() {
     clear
-    echo -e "${GREEN}=== WireGuard 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== Stb 图床管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载${RESET}"
@@ -39,62 +43,102 @@ menu() {
 }
 
 install_app() {
-    mkdir -p "$APP_DIR/config"
+    mkdir -p "$APP_DIR/uploads"
+    mkdir -p "$APP_DIR/server"
     chown -R 1000:1000 "$APP_DIR"
     chmod -R 755 "$APP_DIR"
 
-    read -rp "请输入服务器公网 IP 或域名: " SERVERURL
-    read -rp "请输入 WireGuard 端口 [默认:51820]: " SERVERPORT
-    SERVERPORT=${SERVERPORT:-51820}
-    read -rp "要创建的客户端数量 [默认:1]: " PEERS
-    PEERS=${PEERS:-1}
-    read -rp "内部子网 [默认:10.13.13.0]: " NETWORK
-    NETWORK=${NETWORK:-10.13.13.0}
+    # 自定义端口
+    read -rp "请输入 Web 端口 [默认:25519]: " APP_PORT
+    APP_PORT=${APP_PORT:-25519}
 
+    # 随机生成 JWT_SECRET
+    JWT_SECRET=$(openssl rand -hex 32)
+
+    # 写入 .env 文件
+    cat > "$ENV_FILE" <<EOF
+JWT_SECRET=${JWT_SECRET}
+PORT=25519
+MONGODB_URI=mongodb://mongodb:27017/stb
+VITE_APP_TITLE=Stb图床
+EOF
+
+    # 生成 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
+
 services:
-  wireguard:
-    container_name: wireguard
-    image: lscr.io/linuxserver/wireguard:latest
-    network_mode: host
-    cap_add:
-      - NET_ADMIN
-      - SYS_MODULE
-    environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=Etc/UTC
-      - SERVERURL=${SERVERURL}
-      - SERVERPORT=${SERVERPORT}
-      - PEERS=${PEERS}
-      - INTERNAL_SUBNET=${NETWORK}
-      - ALLOWEDIPS=${NETWORK}/24
-      - PERSISTENTKEEPALIVE_PEERS=all
-      - LOG_CONFS=true
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stb_app
+    image: $IMAGE_NAME
+    ports:
+      - "127.0.0.1:${APP_PORT}:25519"
     volumes:
-      - $APP_DIR/config:/config
-      - /lib/modules:/lib/modules
-    restart: always
+      - uploads_volume:/app/server/uploads
+      - ./server/.env:/app/server/.env:ro
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
+    environment:
+      - PORT=25519
+      - MONGODB_URI=mongodb://mongodb:27017/stb
+      - JWT_SECRET=${JWT_SECRET}
+      - VITE_APP_TITLE=Stb图床
+    expose:
+      - 25519
+
+  mongodb:
+    image: mongo:6.0
+    container_name: mongodb
+    ports:
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  mongodb_data:
+  uploads_volume:
 EOF
 
     cd "$APP_DIR" || exit
+    echo -e "${YELLOW}🚀 正在构建 Docker 镜像，请稍等...${RESET}"
+    docker compose build
+    echo -e "${YELLOW}📦 镜像构建完成，启动容器...${RESET}"
     docker compose up -d
 
-    echo -e "${GREEN}✅ WireGuard 已启动${RESET}"
-    echo -e "${YELLOW}服务器地址: $SERVERURL:$SERVERPORT${RESET}"
-    echo -e "${GREEN}客户端数量: $PEERS${RESET}"
-    echo -e "${GREEN}📂 配置二维码: 查看日志${RESET}"
-    echo -e "${GREEN}📂 配置目录: $APP_DIR/config${RESET}"
+    echo -e "${GREEN}✅ Stb 图床已启动${RESET}"
+    echo -e "${YELLOW}本地访问地址: http://127.0.0.1:${APP_PORT}${RESET}"
+    echo -e "${GREEN}JWT_SECRET: ${JWT_SECRET}${RESET}"
+    echo -e "${GREEN}上传目录: $APP_DIR/uploads${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
 
 update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
+    echo -e "${YELLOW}🚀 拉取最新镜像并重建容器...${RESET}"
     docker compose pull
+    docker compose build
     docker compose up -d
-
-    echo -e "${GREEN}✅ WireGuard 已更新并重启完成${RESET}"
+    echo -e "${GREEN}✅ Stb 图床已更新并重启完成${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
@@ -103,13 +147,13 @@ uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ WireGuard 已卸载，数据已删除${RESET}"
+    echo -e "${RED}✅ Stb 图床已卸载，数据已删除${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
 
 view_logs() {
-    docker logs -f wireguard
+    docker logs -f stb_app
     read -rp "按回车返回菜单..."
     menu
 }

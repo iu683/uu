@@ -1,17 +1,16 @@
 #!/bin/bash
-# ===========================
-# TinyAuth 管理脚本 (Run 版)
-# - 直接 docker run
-# - 手动输入 bcrypt 用户
-# - 自动转义 $ 符号
-# ===========================
+# ======================================
+# MTProxy 一键管理脚本 (Docker)
+# ======================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-CONTAINER_NAME="tinyauth"
+APP_NAME="mtproxy"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -22,9 +21,9 @@ check_docker() {
 
 menu() {
     clear
-    echo -e "${GREEN}=== TinyAuth 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装/启动${RESET}"
-    echo -e "${GREEN}2) 更新/重启${RESET}"
+    echo -e "${GREEN}=== MTProxy 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载${RESET}"
     echo -e "${GREEN}4) 查看日志${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
@@ -40,73 +39,73 @@ menu() {
 }
 
 install_app() {
-    read -rp "请输入访问端口 [默认 2082]: " port
-    port=${port:-2082}
+    mkdir -p "$APP_DIR"
+    read -rp "请输入域名 [默认: cloudflare.com]: " domain
+    domain=${domain:-cloudflare.com}
 
-    read -rp "请输入 APP_URL (例如 https://tinyauth.laosu.tech): " appurl
-    appurl=${appurl:-http://127.0.0.1:$port}
-
-    read -rp "请输入 SECRET (推荐 32 位随机字符串，回车自动生成): " secret
-    secret=${secret:-$(openssl rand -hex 16)}
-
-    echo -e "${YELLOW}请输入用户配置 (格式 user:bcrypt_hash)${RESET}"
-    read -rp "用户配置: " USERS_STRING
-
-    # 转义 $
-    USERS_STRING_ESCAPED=$(echo "$USERS_STRING" | sed 's/\$/\\$/g')
-
-    # 检查容器是否存在
-    if [ "$(docker ps -aq -f name=$CONTAINER_NAME)" ]; then
-        echo -e "${YELLOW}检测到容器已存在，正在删除旧容器...${RESET}"
-        docker rm -f $CONTAINER_NAME
+    read -rp "请输入 MTProxy secret (回车自动生成随机32字符): " secret
+    if [[ -z "$secret" ]]; then
+        secret=$(openssl rand -hex 16)  # 16字节十六进制 => 32字符
+        echo "已生成随机 secret: $secret"
     fi
 
-    docker run -d \
-      --restart unless-stopped \
-      --name $CONTAINER_NAME \
-      -p $port:3000 \
-      -e SECRET="$secret" \
-      -e APP_URL="$appurl" \
-      -e USERS="$USERS_STRING_ESCAPED" \
-      ghcr.io/steveiliop56/tinyauth
+    read -rp "是否启用 IP 白名单 (ON/OFF) [默认: OFF]: " ip_white
+    ip_white=${ip_white:-OFF}
+    read -rp "HTTP 端口 [默认:8080]: " http_port
+    http_port=${http_port:-8080}
+    read -rp "HTTPS 端口 [默认:8443]: " https_port
+    https_port=${https_port:-8443}
 
-    echo -e "${GREEN}✅ TinyAuth 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: $appurl${RESET}"
-    echo -e "${GREEN}🔑 SECRET: $secret${RESET}"
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  mtproxy:
+    container_name: mtproxy
+    image: ellermister/mtproxy:latest
+    restart: always
+    environment:
+      - domain=${domain}
+      - secret=${secret}
+      - ip_white_list=${ip_white}
+    ports:
+      - "${http_port}:80"
+      - "${https_port}:443"
+EOF
 
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    IP=$(get_ip)
+    SECRET=$(docker logs --tail 50 ${NAME} 2>&1 | grep "MTProxy Secret" | awk '{print $NF}' | tail -n1)
+
+    echo -e "${GREEN}✅ MTProxy 已启动${RESET}"
+    echo -e "${GREEN}👉 Telegram 链接：${RESET}"
+    echo -e "${GREEN}https://t.me/proxy?server=$IP&port=$https_port&secret=$secret${RESET}"
+    echo -e "${GREEN}📂 数据目录: /opt/mtproxy${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
 
+
 update_app() {
-    if [ "$(docker ps -aq -f name=$CONTAINER_NAME)" ]; then
-        echo -e "${YELLOW}正在重启 TinyAuth...${RESET}"
-        docker restart $CONTAINER_NAME
-        echo -e "${GREEN}✅ TinyAuth 已重启${RESET}"
-    else
-        echo -e "${RED}容器不存在，请先安装启动${RESET}"
-    fi
+    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ MTProxy 已更新并重启完成${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
 
 uninstall_app() {
-    if [ "$(docker ps -aq -f name=$CONTAINER_NAME)" ]; then
-        docker rm -f $CONTAINER_NAME
-        echo -e "${RED}✅ TinyAuth 已卸载${RESET}"
-    else
-        echo -e "${RED}容器不存在${RESET}"
-    fi
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ MTProxy 已卸载，数据已删除${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
 
 view_logs() {
-    if [ "$(docker ps -aq -f name=$CONTAINER_NAME)" ]; then
-        docker logs -f $CONTAINER_NAME
-    else
-        echo -e "${RED}容器不存在${RESET}"
-    fi
+    docker logs -f mtproxy
     read -rp "按回车返回菜单..."
     menu
 }

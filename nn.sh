@@ -1,16 +1,16 @@
 #!/bin/bash
 # ======================================
-# NodePass Server 一键管理脚本 (host 模式)
+# IT-Tools 一键管理脚本 (端口映射模式)
 # ======================================
 
 GREEN="\033[32m"
+YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="nodepass-server"
+APP_NAME="it-tools"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.env"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -21,7 +21,7 @@ check_docker() {
 
 menu() {
     clear
-    echo -e "${GREEN}=== NodePass Server 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== IT-Tools 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载(含数据)${RESET}"
@@ -41,29 +41,25 @@ menu() {
 install_app() {
     mkdir -p "$APP_DIR"
 
-    read -rp "请输入 master URL [默认 master://:10101/api?log=debug&tls=1]: " master_url
-    MASTER_URL=${master_url:-master://:10101/api?log=debug&tls=1}
-
-    cat > "$CONFIG_FILE" <<EOF
-MASTER_URL=$MASTER_URL
-EOF
+    read -rp "请输入要绑定的端口 [默认 8080]: " port
+    port=${port:-8080}
 
     cat > "$COMPOSE_FILE" <<EOF
 
 services:
-  nodepass-server:
-    image: ghcr.io/yosebyte/nodepass:latest
-    container_name: nodepass-server
-    network_mode: host
+  it-tools:
+    image: corentinth/it-tools:latest
+    container_name: it-tools
     restart: unless-stopped
-    command: $MASTER_URL
+    ports:
+      - "127.0.0.1:${port}:80"
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    echo -e "${GREEN}✅ NodePass Server 已启动${RESET}"
-    echo -e "${GREEN}🌐 master URL: $MASTER_URL${RESET}"
+    echo -e "${GREEN}✅ IT-Tools 已启动${RESET}"
+    echo -e "${YELLOW}本地访问地址: http://127.0.0.1:${port}${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
@@ -72,7 +68,7 @@ update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ NodePass Server 已更新并重启完成${RESET}"
+    echo -e "${GREEN}✅ IT-Tools 已更新并重启完成${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
@@ -81,13 +77,13 @@ uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${GREEN}✅ NodePass Server 已卸载，数据已删除${RESET}"
+    echo -e "${RED}✅ IT-Tools 已卸载${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
 
 view_logs() {
-    docker logs -f nodepass-server
+    docker logs -f it-tools
     read -rp "按回车返回菜单..."
     menu
 }

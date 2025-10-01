@@ -15,7 +15,7 @@ CONFIG_FILE="$APP_DIR/config.env"
 
 menu() {
     clear
-    echo -e "${GREEN}===== $APP_NAME 管理菜单 =====${RESET}"
+    echo -e "${GREEN}===== Upay 管理菜单 =====${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载(含数据)${RESET}"

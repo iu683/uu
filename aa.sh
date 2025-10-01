@@ -1,110 +1,122 @@
 #!/bin/bash
-# ======================================
-# AstrBot 一键管理脚本 (端口映射模式)
-# ======================================
+# ========================================
+# Jellyfin 一键管理脚本 (Docker Compose)
+# ========================================
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
 RESET="\033[0m"
-
-APP_NAME="astrbot"
+APP_NAME="jellyfin"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/config.env"
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${RED}未检测到 Docker，请先安装 Docker${RESET}"
-        exit 1
-    fi
+function menu() {
+    clear
+    echo -e "${GREEN}=== Jellyfin 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}5) 重启${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    read -p "请选择: " choice
+    case $choice in
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) view_logs ;;
+        5) restart_app ;;
+        0) exit 0 ;;
+        *) echo "无效选择"; sleep 1; menu ;;
+    esac
 }
 
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== AstrBot 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 重启${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -rp "请选择: " choice
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) uninstall_app ;;
-            4) view_logs ;;
-            5) restart_app ;;
-            0) exit 0 ;;
-            *) echo "无效选择"; sleep 1 ;;
-        esac
-    done
-}
+function install_app() {
+    read -p "请输入 Web 端口 [默认:8096]: " input_port
+    PORT=${input_port:-8096}
 
-install_app() {
-    mkdir -p "$APP_DIR/data"
+    read -p "请输入宿主机媒体目录路径 [默认:/opt/jellyfin/media]: " input_media
+    MEDIA_DIR=${input_media:-/opt/jellyfin/media}
 
-    read -rp "请输入要绑定的主端口 [默认 6185]: " port
-    port=${port:-6185}
+    echo -e "是否启用硬件转码? (y/n) 默认 n"
+    read -p "选择: " enable_hw
+    ENABLE_HW=${enable_hw:-n}
+
+    mkdir -p "$APP_DIR"
 
     cat > "$COMPOSE_FILE" <<EOF
-services:
-  astrbot:
-    image: soulter/astrbot:latest
-    container_name: astrbot
-    restart: always
-    environment:
-      - TZ=Asia/Shanghai
-    ports:
-      - "127.0.0.1:${port}:6185"
-    volumes:
-      - $APP_DIR/data:/AstrBot/data
-    networks:
-      - astrbot_network
 
-networks:
-  astrbot_network:
-    driver: bridge
+services:
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    restart: always
+    ports:
+      - "127.0.0.1:$PORT:8096"
+      - "127.0.0.1:8910:8910"
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./config:/config
+      - ./cache:/cache
+      - $MEDIA_DIR:/media
 EOF
 
-    cd "$APP_DIR" || exit
+    if [[ "$ENABLE_HW" == "y" || "$ENABLE_HW" == "Y" ]]; then
+        cat >> "$COMPOSE_FILE" <<EOF
+    devices:
+      - /dev/dri:/dev/dri
+EOF
+    fi
+
+    echo "PORT=$PORT" > "$CONFIG_FILE"
+    echo "MEDIA_DIR=$MEDIA_DIR" >> "$CONFIG_FILE"
+    echo "ENABLE_HW=$ENABLE_HW" >> "$CONFIG_FILE"
+
+    cd "$APP_DIR"
     docker compose up -d
 
-    echo -e "${GREEN}✅ AstrBot 已启动${RESET}"
-    echo -e "${YELLOW}本地访问端口: 127.0.0.1:${port}${RESET}"
-    echo -e "${GREEN}账号/密码: astrbot/astrbot${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
-    read -rp "按回车返回菜单..."
+    echo -e "${GREEN}✅ Jellyfin 已启动${RESET}"
+    echo -e "${GREEN}🌐 Web UI 地址: http://127.0.0.1:$PORT${RESET}"
+    echo -e "${GREEN}📂 配置目录: $APP_DIR/config${RESET}"
+    echo -e "${GREEN}🎬 媒体目录: $MEDIA_DIR${RESET}"
+    [[ "$ENABLE_HW" =~ [yY] ]] && echo -e "${GREEN}⚡ 已启用硬件转码支持${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
-update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; return; }
+function update_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ AstrBot 已更新并重启完成${RESET}"
-    read -rp "按回车返回菜单..."
+    echo -e "${GREEN}✅ Jellyfin 已更新并重启完成${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
-uninstall_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+function uninstall_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ AstrBot 已卸载，数据已删除${RESET}"
-    read -rp "按回车返回菜单..."
+    echo -e "${GREEN}✅ Jellyfin 已卸载，数据已删除${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
-view_logs() {
-    docker logs -f astrbot
-    read -rp "按回车返回菜单..."
+function restart_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+    docker compose restart
+    echo -e "${GREEN}✅ Jellyfin 已重启${RESET}"
+    read -p "按回车返回菜单..."
+    menu
 }
 
-restart_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; return; }
-    docker compose restart astrbot
-    echo -e "${GREEN}✅ AstrBot 已重启完成${RESET}"
-    read -rp "按回车返回菜单..."
+function view_logs() {
+    docker logs -f jellyfin
+    read -p "按回车返回菜单..."
+    menu
 }
 
-check_docker
 menu

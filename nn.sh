@@ -1,162 +1,125 @@
 #!/bin/bash
-# ======================================
-# Stb 图床 一键管理脚本 (Docker)
-# 支持自定义端口绑定127.0.0.1
-# 自动生成 JWT_SECRET
-# ======================================
+# ========================================
+# qBittorrent-Nox 一键管理脚本 (统一 /opt 文件夹)
+# ========================================
 
+# 颜色
+RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="stb"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-ENV_FILE="$APP_DIR/.env"
-IMAGE_NAME="stb_app_image"
+SERVICE_NAME="qbittorrent"
+APP_DIR="/opt/qbittorrent"
+CONFIG_DIR="$APP_DIR/config"
+DOWNLOAD_DIR="$APP_DIR/downloads"
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${RED}未检测到 Docker，请先安装 Docker${RESET}"
-        exit 1
-    fi
+# 检查并创建目录
+mkdir -p "$CONFIG_DIR" "$DOWNLOAD_DIR"
+chown -R $(whoami):$(whoami) "$APP_DIR"
+chmod -R 755 "$APP_DIR"
+
+# 部署 qBittorrent-Nox
+install_qbittorrent() {
+    echo -e "${YELLOW}更新软件包列表...${RESET}"
+    sudo apt update
+    echo -e "${YELLOW}安装 qBittorrent-Nox...${RESET}"
+    sudo apt install -y qbittorrent-nox
+
+    echo -e "${YELLOW}创建 systemd 服务文件...${RESET}"
+    sudo tee /etc/systemd/system/qbittorrent.service > /dev/null <<EOF
+[Unit]
+Description=qBittorrent Command Line Client
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/qbittorrent-nox --webui-port=8080 --profile=$CONFIG_DIR
+User=$(whoami)
+Restart=on-failure
+WorkingDirectory=$DOWNLOAD_DIR
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    sudo systemctl daemon-reload
+    sudo systemctl start qbittorrent
+    sudo systemctl enable qbittorrent
+
+    echo -e "${GREEN}qBittorrent-Nox 安装完成并已启动!${RESET}"
+    echo -e "${CYAN}WebUI 访问地址: http://$(hostname -I | awk '{print $1}'):8080${RESET}"
+    echo -e "${YELLOW}默认用户名: admin, 默认密码: adminadmin${RESET}"
+    echo -e "${GREEN}配置目录: $CONFIG_DIR${RESET}"
+    echo -e "${GREEN}下载目录: $DOWNLOAD_DIR${RESET}"
 }
 
+# 启动服务
+start_qbittorrent() {
+    sudo systemctl start ${SERVICE_NAME}
+    echo -e "${GREEN}qBittorrent 已启动${RESET}"
+}
+
+# 停止服务
+stop_qbittorrent() {
+    sudo systemctl stop ${SERVICE_NAME}
+    echo -e "${YELLOW}qBittorrent 已停止${RESET}"
+}
+
+# 重启服务
+restart_qbittorrent() {
+    sudo systemctl restart ${SERVICE_NAME}
+    echo -e "${GREEN}qBittorrent 已重启${RESET}"
+}
+
+# 查看日志
+logs_qbittorrent() {
+    sudo journalctl -u ${SERVICE_NAME} -f
+}
+
+# 卸载服务
+uninstall_qbittorrent() {
+    sudo systemctl stop ${SERVICE_NAME}
+    sudo systemctl disable ${SERVICE_NAME}
+    sudo rm -f /etc/systemd/system/${SERVICE_NAME}.service
+    sudo systemctl daemon-reload
+    echo -e "${YELLOW}是否删除配置和下载数据？[y/N]${RESET}"
+    read -r del
+    if [[ "$del" == "y" || "$del" == "Y" ]]; then
+        rm -rf "$APP_DIR"
+        echo -e "${RED}配置和下载目录已删除${RESET}"
+    fi
+    echo -e "${GREEN}qBittorrent 已卸载${RESET}"
+}
+
+# 菜单
 menu() {
     clear
-    echo -e "${GREEN}=== Stb 图床管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    read -rp "请选择: " choice
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
-        4) view_logs ;;
+    echo -e "${CYAN}==== qBittorrent-Nox 管理菜单 ====${RESET}"
+    echo -e "${GREEN}1. 安装 & 部署 qBittorrent-Nox${RESET}"
+    echo -e "${GREEN}2. 启动 qBittorrent${RESET}"
+    echo -e "${GREEN}3. 停止 qBittorrent${RESET}"
+    echo -e "${GREEN}4. 重启 qBittorrent${RESET}"
+    echo -e "${GREEN}5. 查看日志${RESET}"
+    echo -e "${GREEN}6. 卸载 qBittorrent${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -ne "${YELLOW}请输入选项: ${RESET}"
+    read -r choice
+    case "$choice" in
+        1) install_qbittorrent ;;
+        2) start_qbittorrent ;;
+        3) stop_qbittorrent ;;
+        4) restart_qbittorrent ;;
+        5) logs_qbittorrent ;;
+        6) uninstall_qbittorrent ;;
         0) exit 0 ;;
-        *) echo "无效选择"; sleep 1; menu ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
 }
 
-install_app() {
-    mkdir -p "$APP_DIR/uploads"
-    mkdir -p "$APP_DIR/server"
-    chown -R 1000:1000 "$APP_DIR"
-    chmod -R 755 "$APP_DIR"
-
-    # 自定义端口
-    read -rp "请输入 Web 端口 [默认:25519]: " APP_PORT
-    APP_PORT=${APP_PORT:-25519}
-
-    # 随机生成 JWT_SECRET
-    JWT_SECRET=$(openssl rand -hex 32)
-
-    # 写入 .env 文件
-    cat > "$ENV_FILE" <<EOF
-JWT_SECRET=${JWT_SECRET}
-PORT=25519
-MONGODB_URI=mongodb://mongodb:27017/stb
-VITE_APP_TITLE=Stb图床
-EOF
-
-    # 生成 docker-compose.yml
-    cat > "$COMPOSE_FILE" <<EOF
-
-services:
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: stb_app
-    image: $IMAGE_NAME
-    ports:
-      - "127.0.0.1:${APP_PORT}:25519"
-    volumes:
-      - uploads_volume:/app/server/uploads
-      - ./server/.env:/app/server/.env:ro
-    depends_on:
-      mongodb:
-        condition: service_healthy
-    networks:
-      - app-network
-    restart: unless-stopped
-    environment:
-      - PORT=25519
-      - MONGODB_URI=mongodb://mongodb:27017/stb
-      - JWT_SECRET=${JWT_SECRET}
-      - VITE_APP_TITLE=Stb图床
-    expose:
-      - 25519
-
-  mongodb:
-    image: mongo:6.0
-    container_name: mongodb
-    ports:
-      - "127.0.0.1:27017:27017"
-    volumes:
-      - mongodb_data:/data/db
-    networks:
-      - app-network
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.runCommand({ ping: 1 })"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    restart: unless-stopped
-
-networks:
-  app-network:
-    driver: bridge
-
-volumes:
-  mongodb_data:
-  uploads_volume:
-EOF
-
-    cd "$APP_DIR" || exit
-    echo -e "${YELLOW}🚀 正在构建 Docker 镜像，请稍等...${RESET}"
-    docker compose build
-    echo -e "${YELLOW}📦 镜像构建完成，启动容器...${RESET}"
-    docker compose up -d
-
-    echo -e "${GREEN}✅ Stb 图床已启动${RESET}"
-    echo -e "${YELLOW}本地访问地址: http://127.0.0.1:${APP_PORT}${RESET}"
-    echo -e "${GREEN}JWT_SECRET: ${JWT_SECRET}${RESET}"
-    echo -e "${GREEN}上传目录: $APP_DIR/uploads${RESET}"
-    read -rp "按回车返回菜单..."
+# 循环菜单
+while true; do
     menu
-}
-
-update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
-    echo -e "${YELLOW}🚀 拉取最新镜像并重建容器...${RESET}"
-    docker compose pull
-    docker compose build
-    docker compose up -d
-    echo -e "${GREEN}✅ Stb 图床已更新并重启完成${RESET}"
-    read -rp "按回车返回菜单..."
-    menu
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Stb 图床已卸载，数据已删除${RESET}"
-    read -rp "按回车返回菜单..."
-    menu
-}
-
-view_logs() {
-    docker logs -f stb_app
-    read -rp "按回车返回菜单..."
-    menu
-}
-
-check_docker
-menu
+    echo -e "${YELLOW}按回车键继续...${RESET}"
+    read -r
+done

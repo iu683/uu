@@ -1,6 +1,6 @@
 #!/bin/bash
 # ======================================
-# Speedtest (Librespeed) 一键管理脚本
+# Looking-Glass Server 一键管理脚本
 # ======================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="speedtest"
+APP_NAME="looking-glass"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -21,7 +21,7 @@ check_docker() {
 
 menu() {
     clear
-    echo -e "${GREEN}=== ${APP_NAME} 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== looking-glass 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载(含数据)${RESET}"
@@ -41,20 +41,19 @@ menu() {
 install_app() {
     mkdir -p "$APP_DIR"
 
-    read -rp "请输入要绑定的端口 [默认 8999]: " port
-    port=${port:-8999}
+    read -rp "请输入 HTTP 端口 [默认 8080]: " port
+    port=${port:-8080}
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
   ${APP_NAME}:
-    image: ghcr.io/librespeed/speedtest
+    image: wikihostinc/looking-glass-server:latest
     container_name: ${APP_NAME}
-    environment:
-      - MODE=standalone
-      - WEBPORT=8999
     restart: always
+    environment:
+      - HTTP_PORT=8080
     ports:
-      - "127.0.0.1:${port}:8999"
+      - "${port}:8080"
 EOF
 
     cd "$APP_DIR" || exit
@@ -62,7 +61,7 @@ EOF
 
     echo -e "${GREEN}✅ ${APP_NAME} 已启动${RESET}"
     echo -e "${YELLOW}本地访问地址: http://127.0.0.1:${port}${RESET}"
-    echo -e "${GREEN}📂 数据目录: ${APP_DIR}${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }

@@ -1,17 +1,14 @@
 #!/bin/bash
-# ===========================
-# TinyAuth 管理脚本 (菜单版) - 最终版
-# - 只手动输入 bcrypt 用户
-# - 自动转义 $ 符号
-# - 端口绑定 127.0.0.1
-# ===========================
+# ======================================
+# MTProxy 一键管理脚本 (Docker)
+# ======================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="tinyauth"
+APP_NAME="mtproxy"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -24,10 +21,10 @@ check_docker() {
 
 menu() {
     clear
-    echo -e "${GREEN}=== TinyAuth 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== MTProxy 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}3) 卸载${RESET}"
     echo -e "${GREEN}4) 查看日志${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
     read -rp "请选择: " choice
@@ -43,45 +40,39 @@ menu() {
 
 install_app() {
     mkdir -p "$APP_DIR"
-
-    read -rp "请输入访问端口 [默认 2082]: " port
-    port=${port:-2082}
-
-    read -rp "请输入 APP_URL (例如 https://dookku.vvmn.me): " appurl
-    appurl=${appurl:-http://127.0.0.1:$port}
-
-    read -rp "请输入 SECRET (推荐 32 位随机字符串，回车自动生成): " secret
-    secret=${secret:-$(openssl rand -hex 16)}
-
-    # 强制手动输入用户配置
-    echo -e "${YELLOW}请输入用户配置 (格式 user:bcrypt_hash)${RESET}"
-    read -rp "用户配置: " USERS_STRING
-
-    # 转义 $ 符号，防止 docker-compose 解析
-    USERS_STRING_ESCAPED=$(echo "$USERS_STRING" | sed 's/\$/\\$/g')
+    read -rp "请输入域名 [默认: cloudflare.com]: " domain
+    domain=${domain:-cloudflare.com}
+    read -rp "请输入 MTProxy secret [推荐随机32+字符]: " secret
+    secret=${secret:-548593a9c0688f4f7d9d57377897d964}
+    read -rp "是否启用 IP 白名单 (ON/OFF) [默认: OFF]: " ip_white
+    ip_white=${ip_white:-OFF}
+    read -rp "HTTP 端口 [默认:8080]: " http_port
+    http_port=${http_port:-8080}
+    read -rp "HTTPS 端口 [默认:8443]: " https_port
+    https_port=${https_port:-8443}
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  tinyauth:
-    container_name: tinyauth
-    image: ghcr.io/steveiliop56/tinyauth:latest
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:$port:3000"
+  mtproxy:
+    container_name: mtproxy
+    image: ellermister/mtproxy:latest
+    restart: always
     environment:
-      - SECRET=${secret}
-      - APP_URL=${appurl}
-      - USERS="${USERS_STRING_ESCAPED}"
+      - domain=${domain}
+      - secret=${secret}
+      - ip_white_list=${ip_white}
+    ports:
+      - "${http_port}:80"
+      - "${https_port}:443"
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    echo -e "${GREEN}✅ TinyAuth 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: ${appurl}${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR${RESET}"
-    echo -e "${GREEN}🔑 SECRET: $secret${RESET}"
-
+    echo -e "${GREEN}✅ MTProxy 已启动${RESET}"
+    echo -e "${YELLOW}HTTP 端口: $http_port${RESET}"
+    echo -e "${YELLOW}HTTPS 端口: $https_port${RESET}"
+    echo -e "${GREEN}Secret: $secret${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
@@ -90,7 +81,7 @@ update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ TinyAuth 已更新并重启${RESET}"
+    echo -e "${GREEN}✅ MTProxy 已更新并重启完成${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
@@ -99,13 +90,13 @@ uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ TinyAuth 已卸载${RESET}"
+    echo -e "${RED}✅ MTProxy 已卸载，数据已删除${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
 
 view_logs() {
-    docker logs -f tinyauth
+    docker logs -f mtproxy
     read -rp "按回车返回菜单..."
     menu
 }

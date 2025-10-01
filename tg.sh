@@ -1,6 +1,6 @@
 #!/bin/bash
 # ======================================
-# SearXNG 一键管理脚本 (Docker Compose)
+# Moments 一键管理脚本 (端口映射模式)
 # ======================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="searxng"
+APP_NAME="moments"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -21,7 +21,7 @@ check_docker() {
 
 menu() {
     clear
-    echo -e "${GREEN}=== ${APP_NAME} 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== Moments 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载(含数据)${RESET}"
@@ -39,30 +39,33 @@ menu() {
 }
 
 install_app() {
-    mkdir -p "$APP_DIR/config" "$APP_DIR/data"
+    mkdir -p "$APP_DIR/data"
 
-    read -rp "请输入要绑定的 HTTP 端口 [默认 8888]: " port
-    port=${port:-8888}
+    read -rp "请输入要绑定的端口 [默认 3000]: " port
+    port=${port:-3000}
+    read -rp "请输入 JWT_KEY: " JWT_KEY
+    export JWT_KEY
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  searxng:
-    image: docker.io/searxng/searxng:latest
-    container_name: searxng
-    restart: unless-stopped
+  moments:
+    image: kingwrcy/moments:latest
+    container_name: moments
+    restart: always
+    environment:
+      PORT: 3000
+      JWT_KEY: $JWT_KEY
     ports:
-      - "127.0.0.1:${port}:8080"
+      - "127.0.0.1:${port}:3000"
     volumes:
-      - $APP_DIR/config:/etc/searxng/
-      - $APP_DIR/data:/var/cache/searxng/
+      - $APP_DIR/data:/app/data
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    echo -e "${GREEN}✅ ${APP_NAME} 已启动${RESET}"
+    echo -e "${GREEN}✅ Moments 已启动${RESET}"
     echo -e "${YELLOW}本地访问地址: http://127.0.0.1:${port}${RESET}"
-    echo -e "${GREEN}📂 配置目录: $APP_DIR/config${RESET}"
     echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
     read -rp "按回车返回菜单..."
     menu
@@ -72,7 +75,7 @@ update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ ${APP_NAME} 已更新并重启完成${RESET}"
+    echo -e "${GREEN}✅ Moments 已更新并重启完成${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
@@ -81,13 +84,13 @@ uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ ${APP_NAME} 已卸载，配置和数据已删除${RESET}"
+    echo -e "${RED}✅ Moments 已卸载，数据已删除${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
 
 view_logs() {
-    docker logs -f searxng
+    docker logs -f moments
     read -rp "按回车返回菜单..."
     menu
 }

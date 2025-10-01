@@ -1,16 +1,14 @@
 #!/bin/bash
-# ===========================
-# TinyAuth 管理脚本 (菜单版)
-# - 只手动输入 bcrypt 用户
-# - 端口绑定 127.0.0.1
-# ===========================
+# ======================================
+# ACGFaka 一键管理脚本 (端口映射模式 + MySQL + Redis)
+# ======================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="tinyauth"
+APP_NAME="acgfaka"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -23,7 +21,7 @@ check_docker() {
 
 menu() {
     clear
-    echo -e "${GREEN}=== TinyAuth 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== ACGFaka 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载(含数据)${RESET}"
@@ -41,44 +39,66 @@ menu() {
 }
 
 install_app() {
-    mkdir -p "$APP_DIR"
+    mkdir -p "$APP_DIR/acgfaka" "$APP_DIR/mysql"
 
-    read -rp "请输入访问端口 [默认 2082]: " port
-    port=${port:-2082}
+    read -rp "请输入 Web 端口 [默认 8080]: " WEB_PORT
+    WEB_PORT=${WEB_PORT:-8080}
 
-    read -rp "请输入 APP_URL (例如 https://dookku.vvmn.me): " appurl
-    appurl=${appurl:-http://127.0.0.1:$port}
+    read -rp "请输入 MySQL Root 密码: " MYSQL_ROOT_PASSWORD
+    read -rp "请输入 MySQL 用户名 [默认 acgfakauser]: " MYSQL_USER
+    MYSQL_USER=${MYSQL_USER:-acgfakauser}
+    read -rp "请输入 MySQL 用户密码: " MYSQL_PASSWORD
 
-    read -rp "请输入 SECRET (推荐 32 位随机字符串，回车自动生成): " secret
-    secret=${secret:-$(openssl rand -hex 16)}
-
-    # 强制手动输入用户配置
-    echo -e "${YELLOW}请输入用户配置 (格式 user:bcrypt_hash)${RESET}"
-    read -rp "用户配置: " USERS_STRING
-
-    # 将 USERS 用单引号包裹，避免 $ 被解析
     cat > "$COMPOSE_FILE" <<EOF
+
+
 services:
-  tinyauth:
-    container_name: tinyauth
-    image: ghcr.io/steveiliop56/tinyauth:latest
-    restart: unless-stopped
+  acgfaka:
+    image: dapiaoliang666/acgfaka
+    container_name: acgfaka
     ports:
-      - "127.0.0.1:$port:3000"
+      - "127.0.0.1:${WEB_PORT}:80"
+    depends_on:
+      - mysql
+      - redis
+    restart: always
     environment:
-      - SECRET=${secret}
-      - APP_URL=${appurl}
-      - USERS='${USERS_STRING}'
+      PHP_OPCACHE_ENABLE: 1
+      PHP_OPCACHE_MEMORY_CONSUMPTION: 128
+      PHP_OPCACHE_MAX_ACCELERATED_FILES: 10000
+      PHP_OPCACHE_REVALIDATE_FREQ: 2
+      PHP_REDIS_HOST: redis
+      PHP_REDIS_PORT: 6379
+    volumes:
+      - ./acgfaka:/var/www/html
+
+  mysql:
+    image: mysql:5.7
+    environment:
+      MYSQL_ROOT_PASSWORD: $MYSQL_ROOT_PASSWORD
+      MYSQL_DATABASE: acgfakadb
+      MYSQL_USER: $MYSQL_USER
+      MYSQL_PASSWORD: $MYSQL_PASSWORD
+    volumes:
+      - ./mysql:/var/lib/mysql
+    restart: always
+
+  redis:
+    image: redis:latest
+    restart: always
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    echo -e "${GREEN}✅ TinyAuth 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: ${appurl}${RESET}"
+    echo -e "${GREEN}✅ ACGFaka 已启动${RESET}"
+    echo -e "${GREEN}数据库地址: mysql${RESET}"
+    echo -e "${GREEN}数据库名称: acgfakadb${RESET}"
+    echo -e "${GREEN}数据库账号: $MYSQL_USER${RESET}"
+    echo -e "${GREEN}数据库密码: $MYSQL_PASSWORD${RESET}"
+    echo -e "${GREEN}访问地址: http://127.0.0.1:${WEB_PORT}${RESET}"
+    echo -e "${GREEN}后台路径: http://127.0.0.1:${WEB_PORT}/admin${RESET}"
     echo -e "${GREEN}📂 数据目录: $APP_DIR${RESET}"
-    echo -e "${GREEN}🔑 SECRET: $secret${RESET}"
-
     read -rp "按回车返回菜单..."
     menu
 }
@@ -87,7 +107,7 @@ update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ TinyAuth 已更新并重启${RESET}"
+    echo -e "${GREEN}✅ ACGFaka 已更新并重启完成${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
@@ -96,13 +116,13 @@ uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ TinyAuth 已卸载${RESET}"
+    echo -e "${RED}✅ ACGFaka 已卸载${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
 
 view_logs() {
-    docker logs -f tinyauth
+    docker logs -f acgfaka
     read -rp "按回车返回菜单..."
     menu
 }

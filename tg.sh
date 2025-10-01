@@ -1,14 +1,14 @@
 #!/bin/bash
-# ======================================
-# 迅雷容器 (xunlei) 一键管理脚本
-# ======================================
+# ===========================
+# Gopeed (高速下载器) 管理脚本
+# ===========================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="xunlei"
+APP_NAME="gopeed"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -21,7 +21,7 @@ check_docker() {
 
 menu() {
     clear
-    echo -e "${GREEN}=== 迅雷下载 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== Gopeed 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载(含数据)${RESET}"
@@ -39,32 +39,40 @@ menu() {
 }
 
 install_app() {
-    mkdir -p "$APP_DIR/configs" "$APP_DIR/downloads"
+    mkdir -p "$APP_DIR/downloads" "$APP_DIR/storage"
 
-    read -rp "请输入要绑定的端口 [默认 2345]: " port
-    port=${port:-2345}
+    read -rp "请输入访问端口 [默认 9999]: " port
+    port=${port:-9999}
+
+    read -rp "设置登录用户名 [默认 admin]: " user
+    user=${user:-admin}
+
+    read -rp "设置登录密码 [默认 123]: " pass
+    pass=${pass:-123}
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  xunlei:
-    image: cnk3x/xunlei
-    container_name: xunlei
-    privileged: true
+  gopeed:
+    image: liwei2633/gopeed
+    container_name: gopeed
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${port}:2345"
+      - "127.0.0.1:${port}:9999"
+    environment:
+      - GOPEED_USERNAME=${user}
+      - GOPEED_PASSWORD=${pass}
     volumes:
-      - $APP_DIR/configs:/xunlei/data
-      - $APP_DIR/downloads:/xunlei/downloads
+      - $APP_DIR/downloads:/app/Downloads
+      - $APP_DIR/storage:/app/storage
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    echo -e "${GREEN}✅ 迅雷容器已启动${RESET}"
+    echo -e "${GREEN}✅ Gopeed 已启动${RESET}"
     echo -e "${YELLOW}本地访问地址: http://127.0.0.1:${port}${RESET}"
-    echo -e "${GREEN}📂 配置目录: $APP_DIR/configs${RESET}"
     echo -e "${GREEN}📂 下载目录: $APP_DIR/downloads${RESET}"
+    echo -e "${GREEN}📂 存储目录: $APP_DIR/storage${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
@@ -73,7 +81,7 @@ update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ 迅雷容器已更新并重启完成${RESET}"
+    echo -e "${GREEN}✅ Gopeed 已更新并重启${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
@@ -82,13 +90,13 @@ uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 迅雷容器已卸载，数据已删除${RESET}"
+    echo -e "${RED}✅ Gopeed 已卸载，数据已删除${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
 
 view_logs() {
-    docker logs -f xunlei
+    docker logs -f gopeed
     read -rp "按回车返回菜单..."
     menu
 }

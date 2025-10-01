@@ -1,6 +1,6 @@
 #!/bin/bash
 # ======================================
-# yt-dlp-web 一键管理脚本 (端口映射模式)
+# Melody 一键管理脚本 (端口映射模式)
 # ======================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="yt-dlp-web"
+APP_NAME="melody"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -21,7 +21,7 @@ check_docker() {
 
 menu() {
     clear
-    echo -e "${GREEN}=== yt-dlp-web 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== Melody 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载(含数据)${RESET}"
@@ -39,49 +39,30 @@ menu() {
 }
 
 install_app() {
-    mkdir -p "$APP_DIR/downloads" "$APP_DIR/cache"
+    mkdir -p "$APP_DIR/melody-profile"
 
-    read -rp "请输入要绑定的端口 [默认 3000]: " port
-    port=${port:-3000}
-    read -rp "是否启用访问保护 (y/N): " protect
-    if [[ "$protect" =~ ^[Yy]$ ]]; then
-        read -rp "AUTH_SECRET (推荐随机40+字符): " AUTH_SECRET
-        read -rp "用户名: " CREDENTIAL_USERNAME
-        read -rp "密码: " CREDENTIAL_PASSWORD
-    fi
+    read -rp "请输入要绑定的端口 [默认 5566]: " port
+    port=${port:-5566}
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  yt-dlp-web:
-    image: sooros5132/yt-dlp-web:latest
-    container_name: yt-dlp-web
-    user: 1000:1000
-    environment:
-EOF
-
-    if [[ "$protect" =~ ^[Yy]$ ]]; then
-        echo "      AUTH_SECRET: \"$AUTH_SECRET\"" >> "$COMPOSE_FILE"
-        echo "      CREDENTIAL_USERNAME: \"$CREDENTIAL_USERNAME\"" >> "$COMPOSE_FILE"
-        echo "      CREDENTIAL_PASSWORD: \"$CREDENTIAL_PASSWORD\"" >> "$COMPOSE_FILE"
-    fi
-
-    cat >> "$COMPOSE_FILE" <<EOF
-    volumes:
-      - $APP_DIR/downloads:/downloads
-      - $APP_DIR/cache:/cache
-    ports:
-      - "127.0.0.1:${port}:3000"
+  melody:
+    image: foamzou/melody:latest
+    container_name: melody
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:${port}:5566"
+    volumes:
+      - $APP_DIR/melody-profile:/app/backend/.profile
+      - $APP_DIR/melody-profile:/app/melody-data
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    echo -e "${GREEN}✅ yt-dlp-web 已启动${RESET}"
+    echo -e "${GREEN}✅ Melody 已启动${RESET}"
     echo -e "${YELLOW}本地访问地址: http://127.0.0.1:${port}${RESET}"
-    echo -e "${GREEN}"用户名: " CREDENTIAL_USERNAME${RESET}"
-    echo -e "${GREEN}"密码: " CREDENTIAL_PASSWORD${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR/melody-profile${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
@@ -90,7 +71,7 @@ update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ yt-dlp-web 已更新并重启完成${RESET}"
+    echo -e "${GREEN}✅ Melody 已更新并重启完成${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
@@ -99,13 +80,13 @@ uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ yt-dlp-web 已卸载，数据已删除${RESET}"
+    echo -e "${RED}✅ Melody 已卸载，数据已删除${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
 
 view_logs() {
-    docker logs -f yt-dlp-web
+    docker logs -f melody
     read -rp "按回车返回菜单..."
     menu
 }

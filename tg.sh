@@ -52,7 +52,6 @@ EOF
 
     # 写 compose
     cat > "$COMPOSE_FILE" <<EOF
-version: "3.8"
 
 services:
   frpp-master:

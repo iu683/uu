@@ -5,7 +5,7 @@
 
 GREEN="\033[32m"
 RESET="\033[0m"
-APP_NAME="embyserver"
+APP_NAME="emby"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 CONFIG_FILE="$APP_DIR/config.env"
@@ -32,48 +32,52 @@ function menu() {
 }
 
 function install_app() {
-    read -p "请输入 Web 端口 [默认:8096]: " input_port
+    read -p "请输入 HTTP 端口 [默认:8096]: " input_port
     PORT=${input_port:-8096}
 
-    read -p "请输入媒体目录路径 [默认:/opt/emby/media]: " input_media
+    read -p "请输入 HTTPS 端口 [默认:8920]: " input_https
+    HTTPS_PORT=${input_https:-8920}
+
+    read -p "请输入宿主机媒体目录 [默认:/opt/emby/media]: " input_media
     MEDIA_DIR=${input_media:-/opt/emby/media}
 
-    read -p "是否启用硬件转码 (y/n) [默认:n]: " input_hw
-    HW_TRANSCODE=${input_hw:-n}
+    echo -e "是否启用硬件转码? (y/n) 默认 n"
+    read -p "选择: " enable_hw
+    ENABLE_HW=${enable_hw:-n}
 
-    mkdir -p "$APP_DIR/config"
-    mkdir -p "$MEDIA_DIR"
+    mkdir -p "$APP_DIR"
 
+    # 写 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
-
 services:
-  embyserver:
-    image: amilys/embyserver
-    container_name: amilys_embyserver
-    network_mode: bridge
-    environment:
-      - UID=0
-      - GID=0
-      - GIDLIST=0
-      - TZ=Asia/Shanghai
-    volumes:
-      - $APP_DIR/config:/config
-      - $MEDIA_DIR:/data
+  emby:
+    image: emby/embyserver:latest
+    container_name: emby
+    restart: unless-stopped
     ports:
       - "127.0.0.1:$PORT:8096"
-    restart: always
+      - "127.0.0.1:$HTTPS_PORT:8920"
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./config:/config
+      - $MEDIA_DIR:/mnt/share1
 EOF
 
-    if [[ "$HW_TRANSCODE" == "y" || "$HW_TRANSCODE" == "Y" ]]; then
+    if [[ "$ENABLE_HW" =~ [yY] ]]; then
         cat >> "$COMPOSE_FILE" <<EOF
     devices:
       - /dev/dri:/dev/dri
 EOF
     fi
 
-    echo "PORT=$PORT" > "$CONFIG_FILE"
-    echo "MEDIA_DIR=$MEDIA_DIR" >> "$CONFIG_FILE"
-    echo "HW_TRANSCODE=$HW_TRANSCODE" >> "$CONFIG_FILE"
+    # 保存配置
+    {
+        echo "PORT=$PORT"
+        echo "HTTPS_PORT=$HTTPS_PORT"
+        echo "MEDIA_DIR=$MEDIA_DIR"
+        echo "ENABLE_HW=$ENABLE_HW"
+    } > "$CONFIG_FILE"
 
     cd "$APP_DIR"
     docker compose up -d
@@ -82,11 +86,8 @@ EOF
     echo -e "${GREEN}🌐 Web UI 地址: http://127.0.0.1:$PORT${RESET}"
     echo -e "${GREEN}📂 配置目录: $APP_DIR/config${RESET}"
     echo -e "${GREEN}🎬 媒体目录: $MEDIA_DIR${RESET}"
-    if [[ "$HW_TRANSCODE" == "y" || "$HW_TRANSCODE" == "Y" ]]; then
-        echo -e "${GREEN}⚡ 已启用硬件转码 (/dev/dri)${RESET}"
-    else
-        echo -e "${GREEN}❌ 未启用硬件转码${RESET}"
-    fi
+    [[ "$ENABLE_HW" =~ [yY] ]] && echo -e "${GREEN}⚡ 已启用硬件转码支持${RESET}"
+
     read -p "按回车返回菜单..."
     menu
 }
@@ -118,7 +119,7 @@ function restart_app() {
 }
 
 function view_logs() {
-    docker logs -f amilys_embyserver
+    docker logs -f emby
     read -p "按回车返回菜单..."
     menu
 }

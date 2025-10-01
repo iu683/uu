@@ -1,6 +1,6 @@
 #!/bin/bash
 # ======================================
-# IT-Tools 一键管理脚本 (端口映射模式)
+# SyncTV 一键管理脚本 (端口映射模式)
 # ======================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="it-tools"
+APP_NAME="synctv"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -21,7 +21,7 @@ check_docker() {
 
 menu() {
     clear
-    echo -e "${GREEN}=== IT-Tools 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== SyncTV 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载(含数据)${RESET}"
@@ -45,21 +45,30 @@ install_app() {
     port=${port:-8080}
 
     cat > "$COMPOSE_FILE" <<EOF
-
+version: '3.3'
 services:
-  it-tools:
-    image: corentinth/it-tools:latest
-    container_name: it-tools
+  synctv:
+    image: synctvorg/synctv:latest
+    container_name: synctv
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${port}:80"
+      - "127.0.0.1:${port}:8080/tcp"
+      - "127.0.0.1:${port}:8080/udp"
+    volumes:
+      - $APP_DIR:/root/.synctv
+    environment:
+      - PUID=0
+      - PGID=0
+      - UMASK=022
+      - TZ=Asia/Shanghai
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    echo -e "${GREEN}✅ IT-Tools 已启动${RESET}"
+    echo -e "${GREEN}✅ SyncTV 已启动${RESET}"
     echo -e "${YELLOW}本地访问地址: http://127.0.0.1:${port}${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
@@ -68,7 +77,7 @@ update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ IT-Tools 已更新并重启完成${RESET}"
+    echo -e "${GREEN}✅ SyncTV 已更新并重启完成${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
@@ -77,13 +86,13 @@ uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ IT-Tools 已卸载${RESET}"
+    echo -e "${RED}✅ SyncTV 已卸载${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
 
 view_logs() {
-    docker logs -f it-tools
+    docker logs -f synctv
     read -rp "按回车返回菜单..."
     menu
 }

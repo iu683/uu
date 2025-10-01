@@ -1,6 +1,6 @@
 #!/bin/bash
 # ======================================
-# WireGuard 一键管理脚本 (LinuxServer Docker)
+# ACGFaka 一键管理脚本 (端口映射模式)
 # ======================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="wireguard"
+APP_NAME="acgfaka"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -21,10 +21,10 @@ check_docker() {
 
 menu() {
     clear
-    echo -e "${GREEN}=== WireGuard 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== ACGFaka 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载${RESET}"
+    echo -e "${GREEN}3) 卸载(含数据)${RESET}"
     echo -e "${GREEN}4) 查看日志${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
     read -rp "请选择: " choice
@@ -39,67 +39,43 @@ menu() {
 }
 
 install_app() {
-    mkdir -p "$APP_DIR/config"
-    chown -R 1000:1000 "$APP_DIR"
-    chmod -R 755 "$APP_DIR"
+    mkdir -p "$APP_DIR/acgfaka"
 
-    read -rp "请输入服务器公网 IP 或域名: " SERVERURL
-    read -rp "请输入 WireGuard 端口 [默认:51820]: " SERVERPORT
-    SERVERPORT=${SERVERPORT:-51820}
-    read -rp "要创建的客户端数量 [默认:1]: " PEERS
-    PEERS=${PEERS:-1}
-    read -rp "内部子网 [默认:10.13.13.0]: " NETWORK
-    NETWORK=${NETWORK:-10.13.13.0}
+    read -rp "请输入 Web 端口 [默认 8080]: " WEB_PORT
+    WEB_PORT=${WEB_PORT:-8080}
 
     cat > "$COMPOSE_FILE" <<EOF
 
 services:
-  wireguard:
-    container_name: wireguard
-    image: lscr.io/linuxserver/wireguard:latest
-    network_mode: host
-    cap_add:
-      - NET_ADMIN
-      - SYS_MODULE
+  acgfaka:
+    image: dapiaoliang666/acgfaka
+    ports:
+      - "127.0.0.1:${WEB_PORT}:80"
+    depends_on:
+      - redis
+    restart: always
     environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=Etc/UTC
-      - SERVERURL=${SERVERURL}
-      - SERVERPORT=${SERVERPORT}
-      - PEERS=${PEERS}
-      - INTERNAL_SUBNET=${NETWORK}
-      - ALLOWEDIPS=${NETWORK}/24
-      - PERSISTENTKEEPALIVE_PEERS=all
-      - LOG_CONFS=true
+      PHP_OPCACHE_ENABLE: 1
+      PHP_OPCACHE_MEMORY_CONSUMPTION: 128
+      PHP_OPCACHE_MAX_ACCELERATED_FILES: 10000
+      PHP_OPCACHE_REVALIDATE_FREQ: 2
+      PHP_REDIS_HOST: redis
+      PHP_REDIS_PORT: 6379
     volumes:
-      - $APP_DIR/config:/config
-      - /lib/modules:/lib/modules
+      - ./acgfaka:/var/www/html
+
+  redis:
+    image: redis:latest
     restart: always
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    echo -e "${GREEN}✅ WireGuard 已启动${RESET}"
-    echo -e "${YELLOW}服务器地址: $SERVERURL:$SERVERPORT${RESET}"
-    echo -e "${GREEN}客户端数量: $PEERS${RESET}"
-    echo -e "${GREEN}📂 配置目录: $APP_DIR/config${RESET}"
-
-    # 安装完成默认显示二维码和完整配置
-    echo -e "${YELLOW}所有客户端二维码配置: ${GREEN}"
-    docker exec -it wireguard bash -c '
-        for i in $(ls /config | grep peer_ | sed "s/peer_//"); do
-            echo "--- $i ---"
-            /app/show-peer $i
-        done
-    '
-
-    sleep 2
-    echo
-    echo -e "${YELLOW}所有客户端完整配置: ${GREEN}"
-    docker exec wireguard sh -c 'for d in /config/peer_*; do echo "# $(basename $d) "; cat $d/*.conf; echo; done'
-
+    echo -e "${GREEN}✅ ACGFaka 已启动${RESET}"
+    echo -e "${GREEN}本地访问地址: http://127.0.0.1:${WEB_PORT}${RESET}"
+    echo -e "${GREEN}后台路径: http://127.0.0.1:$WEB_PORT/admin${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
@@ -108,8 +84,7 @@ update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-
-    echo -e "${GREEN}✅ WireGuard 已更新并重启完成${RESET}"
+    echo -e "${GREEN}✅ ACGFaka 已更新并重启完成${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
@@ -118,13 +93,13 @@ uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ WireGuard 已卸载，数据已删除${RESET}"
+    echo -e "${RED}✅ ACGFaka 已卸载${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
 
 view_logs() {
-    docker logs -f wireguard
+    docker logs -f acgfaka
     read -rp "按回车返回菜单..."
     menu
 }

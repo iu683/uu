@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# QMediaSync 一键管理脚本 (端口映射模式)
+# FastSend 一键管理脚本 (端口映射模式)
 # ========================================
 
 GREEN="\033[32m"
@@ -8,14 +8,14 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="QMediaSync"
-APP_DIR="/opt/qmediasync"
+APP_NAME="FastSend"
+APP_DIR="/opt/fastsend"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 CONFIG_FILE="$APP_DIR/config.env"
 
 menu() {
     clear
-    echo -e "${GREEN}===== QMediaSync 管理菜单 =====${RESET}"
+    echo -e "${GREEN}===== FastSend 管理菜单 =====${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载(含数据)${RESET}"
@@ -33,47 +33,29 @@ menu() {
 }
 
 install_app() {
-    mkdir -p "$APP_DIR/config" "$APP_DIR/media"
+    mkdir -p "$APP_DIR"
 
-    read -rp "请输入主端口 [默认 12333]: " port_main
-    PORT_MAIN=${port_main:-12333}
-
-    read -rp "请输入 Emby http端口 [默认 8095]: " port_web
-    PORT_WEB=${port_web:-8095}
-
-    read -rp "请输入 Emby https端口 [默认 8094]: " port_api
-    PORT_API=${port_api:-8094}
+    read -rp "请输入要绑定的端口 [默认 3000]: " port
+    PORT=${port:-3000}
 
     cat > "$COMPOSE_FILE" <<EOF
-version: '3'
+
 services:
-  qmediasync:
-    image: qicfan/qmediasync:latest
-    container_name: qmediasync
-    restart: unless-stopped
+  fastsend:
+    image: shouchenicu/fastsend:0.6.0
+    container_name: fastsend
+    restart: always
     ports:
-      - "127.0.0.1:$PORT_MAIN:12333"
-      - "127.0.0.1:$PORT_WEB:8095"
-      - "127.0.0.1:$PORT_API:8094"
-    volumes:
-      - ./config:/app/config
-      - ./media:/media
-    environment:
-      - TZ=Asia/Shanghai
+      - "127.0.0.1:$PORT:3000"
 EOF
 
-    echo "PORT_MAIN=$PORT_MAIN" > "$CONFIG_FILE"
-    echo "PORT_WEB=$PORT_WEB" >> "$CONFIG_FILE"
-    echo "PORT_API=$PORT_API" >> "$CONFIG_FILE"
+    echo "PORT=$PORT" > "$CONFIG_FILE"
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     echo -e "${GREEN}✅ $APP_NAME 已启动${RESET}"
-    echo -e "${GREEN}🌐 访问地址: 127.0.0.1:$PORT_MAIN${RESET}"
-    echo -e "${GREEN}🌐 Emby http端口: $PORT_WEB${RESET}"
-    echo -e "${GREEN}🌐 Emby https端口:$PORT_API${RESET}"
-    echo -e "${GREEN}🌐 账户/密码: admin/admin123${RESET}"
+    echo -e "${YELLOW}🌐 本地访问地址: http://127.0.0.1:$PORT${RESET}"
     echo -e "${GREEN}📂 数据目录: $APP_DIR${RESET}"
     read -rp "按回车返回菜单..."
     menu
@@ -90,15 +72,15 @@ update_app() {
 
 uninstall_app() {
     cd "$APP_DIR" || { echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; }
-    docker compose down -v
+    docker compose down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ $APP_NAME 已卸载，数据已删除${RESET}"
+    echo -e "${RED}✅ $APP_NAME 已卸载${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
 
 view_logs() {
-    docker logs -f qmediasync
+    docker logs -f fastsend
     read -rp "按回车返回菜单..."
     menu
 }

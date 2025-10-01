@@ -1,6 +1,9 @@
 #!/bin/bash
 # ===========================
-# Gopeed (高速下载器) 管理脚本
+# TinyAuth 管理脚本 (优化版)
+# - 支持自动生成 bcrypt 用户配置
+# - 自动生成随机密码 (可选)
+# - 安装完成后统一显示访问信息
 # ===========================
 
 GREEN="\033[32m"
@@ -8,7 +11,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="gopeed"
+APP_NAME="tinyauth"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -19,9 +22,36 @@ check_docker() {
     fi
 }
 
+# 自动生成 bcrypt 用户配置
+generate_users() {
+    echo -e "${YELLOW}请输入用户名:${RESET}"
+    read -rp "用户名: " username
+    echo -e "${YELLOW}请输入密码 (留空自动生成):${RESET}"
+    read -rsp "密码: " password
+    echo ""
+    if [[ -z "$password" ]]; then
+        password=$(openssl rand -base64 12)
+        echo -e "${GREEN}已自动生成随机密码: $password${RESET}"
+    fi
+
+    if ! command -v htpasswd &>/dev/null; then
+        echo -e "${RED}未检测到 apache2-utils (htpasswd)，正在安装...${RESET}"
+        if command -v apt-get &>/dev/null; then
+            apt-get update -qq && apt-get install -y apache2-utils
+        elif command -v yum &>/dev/null; then
+            yum install -y httpd-tools
+        fi
+    fi
+
+    bcrypt_hash=$(htpasswd -nbB "$username" "$password" | cut -d ":" -f2)
+    USERS_STRING="${username}:${bcrypt_hash}"
+    PLAIN_USER="$username"
+    PLAIN_PASS="$password"
+}
+
 menu() {
     clear
-    echo -e "${GREEN}=== Gopeed 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== TinyAuth 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载(含数据)${RESET}"
@@ -39,40 +69,53 @@ menu() {
 }
 
 install_app() {
-    mkdir -p "$APP_DIR/downloads" "$APP_DIR/storage"
+    mkdir -p "$APP_DIR"
 
-    read -rp "请输入访问端口 [默认 9999]: " port
-    port=${port:-9999}
+    read -rp "请输入访问端口 [默认 2082]: " port
+    port=${port:-2082}
 
-    read -rp "设置登录用户名 [默认 admin]: " user
-    user=${user:-admin}
+    read -rp "请输入 APP_URL (例如 https://tinyauth.example.com): " appurl
+    appurl=${appurl:-http://127.0.0.1:$port}
 
-    read -rp "设置登录密码 [默认 123]: " pass
-    pass=${pass:-123}
+    read -rp "请输入 SECRET (推荐 32 位随机字符串，回车自动生成): " secret
+    secret=${secret:-$(openssl rand -hex 16)}
+
+    echo -e "${YELLOW}是否自动生成用户配置 (y/n)${RESET}"
+    read -rp "选择: " yn
+    if [[ "$yn" =~ ^[Yy]$ ]]; then
+        generate_users
+    else
+        echo -e "${YELLOW}请输入用户配置 (格式 user:bcrypt_hash)${RESET}"
+        read -rp "用户配置: " USERS_STRING
+    fi
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  gopeed:
-    image: liwei2633/gopeed
-    container_name: gopeed
+  tinyauth:
+    container_name: tinyauth
+    image: ghcr.io/steveiliop56/tinyauth:latest
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${port}:9999"
+      - "127.0.0.1:$port:3000"
     environment:
-      - GOPEED_USERNAME=${user}
-      - GOPEED_PASSWORD=${pass}
-    volumes:
-      - $APP_DIR/downloads:/app/Downloads
-      - $APP_DIR/storage:/app/storage
+      - SECRET=${secret}
+      - APP_URL=${appurl}
+      - USERS="${USERS_STRING}"
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    echo -e "${GREEN}✅ Gopeed 已启动${RESET}"
-    echo -e "${YELLOW}本地访问地址: http://127.0.0.1:${port}${RESET}"
-    echo -e "${GREEN}📂 下载目录: $APP_DIR/downloads${RESET}"
-    echo -e "${GREEN}📂 存储目录: $APP_DIR/storage${RESET}"
+    echo -e "${GREEN}✅ TinyAuth 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: ${appurl}${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR${RESET}"
+    echo -e "${GREEN}🔑 SECRET: $secret${RESET}"
+
+    if [[ "$yn" =~ ^[Yy]$ ]]; then
+        echo -e "${GREEN}👤 用户名: $PLAIN_USER${RESET}"
+        echo -e "${GREEN}🔒 密码: $PLAIN_PASS${RESET}"
+    fi
+
     read -rp "按回车返回菜单..."
     menu
 }
@@ -81,7 +124,7 @@ update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Gopeed 已更新并重启${RESET}"
+    echo -e "${GREEN}✅ TinyAuth 已更新并重启${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
@@ -90,13 +133,13 @@ uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Gopeed 已卸载，数据已删除${RESET}"
+    echo -e "${RED}✅ TinyAuth 已卸载${RESET}"
     read -rp "按回车返回菜单..."
     menu
 }
 
 view_logs() {
-    docker logs -f gopeed
+    docker logs -f tinyauth
     read -rp "按回车返回菜单..."
     menu
 }

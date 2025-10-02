@@ -6,9 +6,6 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-# ------------------------------
-# 工具函数
-# ------------------------------
 pause() {
     echo -ne "${YELLOW}按回车返回菜单...${RESET}"
     read
@@ -17,7 +14,7 @@ pause() {
 configure_firewall() {
     for PORT in 80 443; do
         if command -v ufw >/dev/null 2>&1; then
-            ufw allow $PORT || true
+            ufw allow $PORT/tcp || true
         elif command -v firewall-cmd >/dev/null 2>&1; then
             firewall-cmd --permanent --add-port=$PORT/tcp || true
             firewall-cmd --reload || true
@@ -26,13 +23,14 @@ configure_firewall() {
 }
 
 remove_default_server() {
-    echo -e "${YELLOW}清理系统自带的 default server 配置...${RESET}"
+    echo -e "${YELLOW}清理系统自带 default 配置...${RESET}"
     rm -f /etc/nginx/sites-enabled/default
     rm -f /etc/nginx/sites-available/default
 }
 
 ensure_nginx_conf() {
     mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/modules-enabled
+
     if [ ! -f /etc/nginx/nginx.conf ]; then
         cat > /etc/nginx/nginx.conf <<'EOF'
 user www-data;
@@ -40,9 +38,7 @@ worker_processes auto;
 pid /run/nginx.pid;
 include /etc/nginx/modules-enabled/*.conf;
 
-events {
-    worker_connections 768;
-}
+events { worker_connections 768; }
 
 http {
     sendfile on;
@@ -79,14 +75,27 @@ EOF
 
 create_default_server() {
     DEFAULT_PATH="/etc/nginx/sites-available/default_server_block"
-    [ ! -f "$DEFAULT_PATH" ] && cat > "$DEFAULT_PATH" <<EOF
+    if [ ! -f "$DEFAULT_PATH" ]; then
+        cat > "$DEFAULT_PATH" <<EOF
 server {
-    listen 80 default_server;
+    listen [::]:80 default_server;
     server_name _;
     return 403;
 }
 EOF
-    ln -sf "$DEFAULT_PATH" /etc/nginx/sites-enabled/default_server_block
+        ln -sf "$DEFAULT_PATH" /etc/nginx/sites-enabled/default_server_block
+    fi
+}
+
+fix_duplicate_default_server() {
+    DEFAULT_FILES=($(grep -rl "default_server" /etc/nginx/sites-enabled/ || true))
+    if [ ${#DEFAULT_FILES[@]} -gt 1 ]; then
+        echo -e "${YELLOW}检测到重复 default_server 配置，自动修复中...${RESET}"
+        for ((i=1; i<${#DEFAULT_FILES[@]}; i++)); do
+            rm -f "${DEFAULT_FILES[i]}"
+            echo -e "${YELLOW}已删除重复文件: ${DEFAULT_FILES[i]}${RESET}"
+        done
+    fi
 }
 
 generate_server_config() {
@@ -105,13 +114,13 @@ generate_server_config() {
 
     cat > "$CONFIG_PATH" <<EOF
 server {
-    listen 80;
+    listen [::]:80;
     server_name $DOMAIN;
     return 301 https://\$host\$request_uri;
 }
 
 server {
-    listen 443 ssl;
+    listen [::]:443 ssl;
     server_name $DOMAIN;
 
     ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
@@ -132,18 +141,22 @@ EOF
 
 check_domain_resolution() {
     DOMAIN=$1
-    VPS_IP=$(curl -s https://ipinfo.io/ip)
-    DOMAIN_IP=$(dig +short "$DOMAIN" | tail -n1)
-    if [ "$DOMAIN_IP" != "$VPS_IP" ]; then
-        echo -e "${RED}警告: 域名 $DOMAIN 解析为 $DOMAIN_IP, VPS IP 为 $VPS_IP${RESET}"
+    VPS_IP=$(curl -6 -s https://ifconfig.co)
+    DOMAIN_IP=$(dig AAAA +short "$DOMAIN" | tail -n1)
+
+    echo -e "${YELLOW}检测域名 AAAA 记录...${RESET}"
+    echo -e "  ${GREEN}VPS IPv6:   ${RESET}$VPS_IP"
+    echo -e "  ${GREEN}域名 IPv6:  ${RESET}$DOMAIN_IP"
+
+    if [ -z "$DOMAIN_IP" ]; then
+        echo -e "${RED}错误: 域名 $DOMAIN 没有 AAAA 记录！${RESET}"
+    elif [ "$DOMAIN_IP" != "$VPS_IP" ]; then
+        echo -e "${RED}警告: 域名 $DOMAIN 解析为 $DOMAIN_IP, VPS IPv6 为 $VPS_IP${RESET}"
     else
-        echo -e "${GREEN}域名解析正常${RESET}"
+        echo -e "${GREEN}域名 AAAA 记录解析正常 (IPv6)${RESET}"
     fi
 }
 
-# ------------------------------
-# 功能函数
-# ------------------------------
 install_nginx() {
     ensure_nginx_conf
     remove_default_server
@@ -152,7 +165,6 @@ install_nginx() {
     DEBIAN_FRONTEND=noninteractive apt upgrade -y \
         -o Dpkg::Options::="--force-confdef" \
         -o Dpkg::Options::="--force-confold"
-
     DEBIAN_FRONTEND=noninteractive apt install -y curl dnsutils \
         -o Dpkg::Options::="--force-confdef" \
         -o Dpkg::Options::="--force-confold"
@@ -177,7 +189,6 @@ install_nginx() {
 
     remove_default_server
     create_default_server
-
     configure_firewall
     systemctl daemon-reload
     systemctl enable --now nginx
@@ -190,6 +201,7 @@ install_nginx() {
 
     certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
     generate_server_config "$DOMAIN" "$TARGET" "$IS_WS"
+
     nginx -t && systemctl reload nginx
     systemctl enable --now certbot.timer
     echo -e "${GREEN}安装完成！访问: https://$DOMAIN${RESET}"
@@ -197,43 +209,20 @@ install_nginx() {
 }
 
 add_config() {
-    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+    fix_duplicate_default_server
+    DOMAINS=($(ls /etc/nginx/sites-available 2>/dev/null | grep -vE 'default|default_server_block' | sort))
+
     echo -ne "${GREEN}请输入域名: ${RESET}"; read DOMAIN
     check_domain_resolution "$DOMAIN"
     echo -ne "${GREEN}请输入反代目标: ${RESET}"; read TARGET
-
-    EMAIL_FILE="/etc/nginx/.cert_emails"
-    if [ -f "$EMAIL_FILE" ]; then
-        EMAILS=($(cat "$EMAIL_FILE"))
-    else
-        EMAILS=()
-    fi
-
-    if [ ${#EMAILS[@]} -gt 0 ]; then
-        echo -e "${GREEN}已有邮箱列表:${RESET}"
-        for i in "${!EMAILS[@]}"; do
-            echo -e "${GREEN}$((i+1))) ${EMAILS[$i]}${RESET}"
-        done
-        echo -ne "${GREEN}请选择邮箱编号 (或输入新邮箱): ${RESET}"; read choice
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#EMAILS[@]} ]; then
-            EMAIL="${EMAILS[$((choice-1))]}"
-        else
-            EMAIL="$choice"
-            echo "$EMAIL" >> "$EMAIL_FILE"
-            sort -u "$EMAIL_FILE" -o "$EMAIL_FILE"
-        fi
-    else
-        echo -ne "${GREEN}请输入邮箱地址: ${RESET}"; read EMAIL
-        echo "$EMAIL" > "$EMAIL_FILE"
-    fi
-
+    echo -ne "${GREEN}请输入邮箱地址: ${RESET}"; read EMAIL
     echo -ne "${GREEN}是否为 WebSocket 反代? (y/n): ${RESET}"; read IS_WS
 
     [ -f "/etc/nginx/sites-available/$DOMAIN" ] && echo -e "${YELLOW}配置已存在${RESET}" && pause && return
 
     certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
     generate_server_config "$DOMAIN" "$TARGET" "$IS_WS"
-    create_default_server
+
     nginx -t && systemctl reload nginx
     echo -e "${GREEN}添加完成！访问: https://$DOMAIN${RESET}"
     pause
@@ -241,29 +230,28 @@ add_config() {
 
 modify_config() {
     CONFIG_DIR="/etc/nginx/sites-available"
-    [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}还没有任何配置文件！${RESET}" && pause && return
+    [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}没有配置文件！${RESET}" && pause && return
 
     DOMAINS=($(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort))
-    if [ ${#DOMAINS[@]} -eq 0 ]; then
-        echo -e "${YELLOW}没有找到任何域名配置！${RESET}"
-        pause
-        return
-    fi
+    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有域名配置！${RESET}" && pause && return
 
     echo -e "${GREEN}现有配置的域名:${RESET}"
     for i in "${!DOMAINS[@]}"; do
         echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"
     done
 
-    echo -ne "${GREEN}请输入编号: ${RESET}"; read choice
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效选择${RESET}"
-        pause
-        return
+    echo -ne "${GREEN}请输入编号 (0 返回): ${RESET}"; read choice
+    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ ]]; then
+        echo -e "${YELLOW}已取消${RESET}"; return
+    fi
+    if [ "$choice" -eq 0 ]; then return; fi
+    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
+        echo -e "${RED}无效选择${RESET}"; pause; return
     fi
 
     DOMAIN="${DOMAINS[$((choice-1))]}"
     CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
+
     echo -ne "${GREEN}请输入新反代目标: ${RESET}"; read TARGET
     echo -ne "${GREEN}是否为 WebSocket 反代? (y/n): ${RESET}"; read IS_WS
     echo -ne "${GREEN}是否更新邮箱? (y/n): ${RESET}"; read c
@@ -271,8 +259,8 @@ modify_config() {
         echo -ne "${GREEN}新邮箱: ${RESET}"; read EMAIL
         certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
     fi
+
     generate_server_config "$DOMAIN" "$TARGET" "$IS_WS"
-    create_default_server
     nginx -t && systemctl reload nginx
     echo -e "${GREEN}修改完成！访问: https://$DOMAIN${RESET}"
     pause
@@ -283,22 +271,21 @@ delete_config() {
     [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}没有配置文件！${RESET}" && pause && return
 
     DOMAINS=($(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort))
-    if [ ${#DOMAINS[@]} -eq 0 ]; then
-        echo -e "${YELLOW}没有可删除的域名！${RESET}"
-        pause
-        return
-    fi
+    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有域名配置！${RESET}" && pause && return
 
     echo -e "${GREEN}可删除的域名:${RESET}"
     for i in "${!DOMAINS[@]}"; do
         echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"
     done
 
-    echo -ne "${GREEN}请选择编号: ${RESET}"; read choice
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效选择${RESET}"
-        pause
-        return
+    echo -ne "${GREEN}请选择编号 (0 返回): ${RESET}"
+    read choice
+    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ ]]; then
+        echo -e "${YELLOW}已取消${RESET}"; return
+    fi
+    if [ "$choice" -eq 0 ]; then return; fi
+    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
+        echo -e "${RED}无效选择${RESET}"; pause; return
     fi
 
     DOMAIN="${DOMAINS[$((choice-1))]}"
@@ -310,120 +297,29 @@ delete_config() {
 }
 
 test_renew() {
-    CONFIG_DIR="/etc/nginx/sites-available"
-    [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}没有配置文件${RESET}" && pause && return
-
-    DOMAINS=($(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort))
-    echo -e "${GREEN}已有配置:${RESET}"
-    for i in "${!DOMAINS[@]}"; do
-        echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"
-    done
-
-    echo -ne "${GREEN}选择编号: ${RESET}"; read choice
-    DOMAIN="${DOMAINS[$((choice-1))]}"
-    echo -e "${GREEN}正在测试 $DOMAIN 的证书续期...${RESET}"
-    certbot renew --dry-run --cert-name "$DOMAIN"
+    certbot renew --dry-run
+    echo -e "${GREEN}证书续期测试完成！${RESET}"
     pause
 }
 
 check_cert() {
-    CERT_DIR="/etc/letsencrypt/live"
-    if [ ! -d "$CERT_DIR" ]; then
-        echo "没有找到任何证书"
-        pause
-        return
-    fi
-
-    echo "现有证书的域名："
-    i=1
-    DOMAINS=($(ls "$CERT_DIR" | grep -vE 'default|default_server_block' | sort))
-    if [ ${#DOMAINS[@]} -eq 0 ]; then
-        echo "没有找到任何有效证书"
-        pause
-        return
-    fi
-
-    for DOMAIN in "${DOMAINS[@]}"; do
-        if [ -f "$CERT_DIR/$DOMAIN/fullchain.pem" ]; then
-            echo "$i) $DOMAIN"
-            i=$((i+1))
-        fi
-    done
-
-    echo -ne "请选择要查看的域名编号 (0 返回): "
-    read choice
-
-    if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
-        echo "无效输入"
-        pause
-        return
-    fi
-
-    if [ "$choice" -eq 0 ]; then
-        return
-    fi
-
-    if [ "$choice" -ge 1 ] && [ "$choice" -le ${#DOMAINS[@]} ]; then
-        SELECTED=${DOMAINS[$((choice-1))]}
-        certbot certificates --cert-name "$SELECTED"
-    else
-        echo "无效选择"
-    fi
-    pause
-}
-
-check_domains_status() {
-    echo "域名                  状态       到期时间        剩余天数"
-    echo "------------------------------------------------------------"
-
-    CERT_DIR="/etc/letsencrypt/live"
-    if [ ! -d "$CERT_DIR" ]; then
-        echo "没有找到任何证书"
-        pause
-        return
-    fi
-
-    DOMAINS=($(ls "$CERT_DIR" | grep -vE 'default|default_server_block' | sort))
-    for DOMAIN in "${DOMAINS[@]}"; do
-        CERT_PATH="$CERT_DIR/$DOMAIN/fullchain.pem"
-        if [ -f "$CERT_PATH" ]; then
-            END_DATE=$(openssl x509 -enddate -noout -in "$CERT_PATH" | cut -d= -f2)
-            END_TS=$(date -d "$END_DATE" +%s)
-            NOW_TS=$(date +%s)
-            DAYS_LEFT=$(( (END_TS - NOW_TS) / 86400 ))
-
-            if [ $DAYS_LEFT -ge 30 ]; then
-                STATUS="有效"
-            elif [ $DAYS_LEFT -ge 0 ]; then
-                STATUS="即将过期"
-            else
-                STATUS="已过期"
-            fi
-
-            printf "%-22s %-10s %-15s %d 天\n" \
-                "$DOMAIN" "$STATUS" "$(date -d "$END_DATE" +"%Y-%m-%d")" "$DAYS_LEFT"
-        fi
-    done
+    certbot certificates
     pause
 }
 
 uninstall_nginx() {
-    echo -e "${YELLOW}卸载 Nginx...${RESET}"
     systemctl stop nginx || true
-    apt purge -y nginx nginx-common nginx-core certbot python3-certbot-nginx || true
+    apt purge -y nginx certbot python3-certbot-nginx
     apt autoremove -y
     rm -rf /etc/nginx /etc/letsencrypt
-    remove_default_server
-    echo -e "${GREEN}已卸载${RESET}"
+    echo -e "${GREEN}Nginx 和 Certbot 已卸载${RESET}"
     pause
 }
 
-# ------------------------------
 # 主菜单
-# ------------------------------
 while true; do
     clear
-    echo -e "${GREEN}===== Nginx 管理脚本 =====${RESET}"
+    echo -e "${GREEN}===== Nginx IPv6 管理脚本 =====${RESET}"
     echo -e "${GREEN}1) 安装 Nginx + 证书${RESET}"
     echo -e "${GREEN}2) 添加配置${RESET}"
     echo -e "${GREEN}3) 修改配置${RESET}"
@@ -431,9 +327,8 @@ while true; do
     echo -e "${GREEN}5) 测试证书续期${RESET}"
     echo -e "${GREEN}6) 查看证书信息${RESET}"
     echo -e "${GREEN}7) 卸载 Nginx + 证书${RESET}"
-    echo -e "${GREEN}8) 查看域名证书状态${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    echo -ne "${GREEN}请选择 [0-8]: ${RESET}"
+    echo -ne "${GREEN}请选择 [0-7]: ${RESET}"
     read choice
     case $choice in
         1) install_nginx ;;
@@ -443,7 +338,6 @@ while true; do
         5) test_renew ;;
         6) check_cert ;;
         7) uninstall_nginx ;;
-        8) check_domains_status ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ; pause ;;
     esac

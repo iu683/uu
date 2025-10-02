@@ -4,10 +4,8 @@
 # ========================================
 
 GREEN="\033[32m"
-RED="\033[31m"
 RESET="\033[0m"
 YELLOW="\033[33m"
-
 APP_NAME="new-api"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
@@ -22,7 +20,7 @@ function menu() {
     echo -e "${GREEN}4) 查看日志${RESET}"
     echo -e "${GREEN}5) 重启${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    read -rp "请选择: " choice
+    read -p "请选择: " choice
     case $choice in
         1) install_app ;;
         2) update_app ;;
@@ -35,42 +33,91 @@ function menu() {
 }
 
 function install_app() {
-    mkdir -p "$APP_DIR"
+    # 读取用户配置
+    read -p "请输入 Web 端口 [默认:3000]: " input_port
+    PORT=${input_port:-3000}
 
-    read -rp "请输入 Web 端口 [默认:3000]: " input_port
-    WEB_PORT=${input_port:-3000}
+    read -p "请输入 MySQL root 密码 [默认:123456]: " input_root_pass
+    MYSQL_ROOT_PASSWORD=${input_root_pass:-123456}
 
+    read -p "请输入 MySQL 数据库名 [默认:new-api]: " input_db
+    MYSQL_DATABASE=${input_db:-new-api}
+
+    read -p "请输入 MySQL 用户名 [默认:root]: " input_user
+    MYSQL_USER=${input_user:-root}
+
+    mkdir -p "$APP_DIR"/{data,logs}
+
+    # 写 config.env
+    cat > "$CONFIG_FILE" <<EOF
+PORT=$PORT
+MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD
+MYSQL_DATABASE=$MYSQL_DATABASE
+MYSQL_USER=$MYSQL_USER
+EOF
+
+    # 写 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
 
 services:
   new-api:
-    container_name: new-api
     image: calciumion/new-api:latest
+    container_name: new-api
     restart: always
+    command: --log-dir /app/logs
     ports:
-      - "127.0.0.1:$WEB_PORT:3000"
-    environment:
-      - TZ=Asia/Shanghai
+      - "127.0.0.1:${PORT}:3000"
     volumes:
       - ./data:/data
+      - ./logs:/app/logs
+    environment:
+      - SQL_DSN=\${MYSQL_USER}:\${MYSQL_ROOT_PASSWORD}@tcp(mysql:3306)/\${MYSQL_DATABASE}
+      - REDIS_CONN_STRING=redis://redis
+      - TZ=Asia/Shanghai
+    depends_on:
+      - redis
+      - mysql
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/api/status | grep -q '\"success\": true'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  redis:
+    image: redis:latest
+    container_name: redis
+    restart: always
+
+  mysql:
+    image: mysql:8.2
+    container_name: mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: \${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: \${MYSQL_DATABASE}
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+volumes:
+  mysql_data:
 EOF
 
-    echo "WEB_PORT=$WEB_PORT" > "$CONFIG_FILE"
-
     cd "$APP_DIR"
-    docker compose up -d
+    docker compose --env-file "$CONFIG_FILE" up -d
 
     echo -e "${GREEN}✅ new-api 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Web UI 地址: http://127.0.0.1:$WEB_PORT${RESET}"
+    echo -e "${YELLOW}🌐 Web UI 地址: http://127.0.0.1:$PORT${RESET}"
     echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
+    echo -e "${GREEN}📂 日志目录: $APP_DIR/logs${RESET}"
+    echo -e "${GREEN}🗄️ MySQL 数据库: $MYSQL_DATABASE (用户: $MYSQL_USER)${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 function update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
-    docker compose pull
-    docker compose up -d
+    docker compose --env-file "$CONFIG_FILE" pull
+    docker compose --env-file "$CONFIG_FILE" up -d
     echo -e "${GREEN}✅ new-api 已更新并重启完成${RESET}"
     read -p "按回车返回菜单..."
     menu
@@ -78,16 +125,16 @@ function update_app() {
 
 function uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose down -v
+    docker compose --env-file "$CONFIG_FILE" down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ new-api 已卸载，数据已删除${RESET}"
+    echo -e "${GREEN}✅ new-api 已卸载，数据已删除${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 function restart_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
-    docker compose restart
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+    docker compose --env-file "$CONFIG_FILE" restart
     echo -e "${GREEN}✅ new-api 已重启${RESET}"
     read -p "按回车返回菜单..."
     menu

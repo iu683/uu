@@ -317,15 +317,65 @@ test_renew() {
 }
 
 check_cert() {
-    certbot certificates
+    CERT_DIR="/etc/letsencrypt/live"
+    if [ ! -d "$CERT_DIR" ]; then
+        echo "没有找到任何证书"
+        pause
+        return
+    fi
+
+    echo "现有证书的域名："
+    i=1
+    DOMAINS=()
+    for DOMAIN in $(ls "$CERT_DIR"); do
+        if [ -f "$CERT_DIR/$DOMAIN/fullchain.pem" ]; then
+            echo "$i) $DOMAIN"
+            DOMAINS+=("$DOMAIN")
+            i=$((i+1))
+        fi
+    done
+
+    if [ ${#DOMAINS[@]} -eq 0 ]; then
+        echo "没有找到任何有效证书"
+        pause
+        return
+    fi
+
+    echo -ne "请选择要查看的域名编号 (0 返回): "
+    read choice
+
+    # 如果输入为空或不是数字
+    if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+        echo "无效输入"
+        pause
+        return
+    fi
+
+    if [ "$choice" -eq 0 ]; then
+        return
+    fi
+
+    if [ "$choice" -ge 1 ] && [ "$choice" -le ${#DOMAINS[@]} ]; then
+        SELECTED=${DOMAINS[$((choice-1))]}
+        certbot certificates --cert-name "$SELECTED"
+    else
+        echo "无效选择"
+    fi
     pause
 }
 
+
 check_domains_status() {
-    echo -e "${GREEN}域名                状态       到期时间        剩余天数${RESET}"
-    echo "--------------------------------------------------------"
+    echo "域名                  状态       到期时间        剩余天数"
+    echo "------------------------------------------------------------"
+
     CERT_DIR="/etc/letsencrypt/live"
-    [ ! -d "$CERT_DIR" ] && echo -e "${YELLOW}没有证书${RESET}" && pause && return
+    if [ ! -d "$CERT_DIR" ]; then
+        echo "没有找到任何证书"
+        pause
+        return
+    fi
+
     for DOMAIN in $(ls "$CERT_DIR"); do
         CERT_PATH="$CERT_DIR/$DOMAIN/fullchain.pem"
         if [ -f "$CERT_PATH" ]; then
@@ -333,19 +383,22 @@ check_domains_status() {
             END_TS=$(date -d "$END_DATE" +%s)
             NOW_TS=$(date +%s)
             DAYS_LEFT=$(( (END_TS - NOW_TS) / 86400 ))
-            if [ $DAYS_LEFT -gt 30 ]; then
-                COLOR=$GREEN; STATUS="有效"
+
+            if [ $DAYS_LEFT -ge 30 ]; then
+                STATUS="有效"
             elif [ $DAYS_LEFT -ge 0 ]; then
-                COLOR=$YELLOW; STATUS="即将过期"
+                STATUS="即将过期"
             else
-                COLOR=$RED; STATUS="已过期"
+                STATUS="已过期"
             fi
-            printf "%-20s %-10s %-15s %s%d 天${RESET}\n" \
-                "$DOMAIN" "$STATUS" "$(date -d "$END_DATE" +"%Y-%m-%d")" "$COLOR" "$DAYS_LEFT"
+
+            printf "%-22s %-10s %-15s %d 天\n" \
+                "$DOMAIN" "$STATUS" "$(date -d "$END_DATE" +"%Y-%m-%d")" "$DAYS_LEFT"
         fi
     done
     pause
 }
+
 
 uninstall_nginx() {
     echo -e "${YELLOW}卸载 Nginx...${RESET}"

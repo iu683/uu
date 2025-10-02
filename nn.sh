@@ -22,17 +22,14 @@ configure_firewall() {
     done
 }
 
-# 删除系统自带 default 配置
 remove_default_server() {
-    echo -e "${YELLOW}清理系统自带 default 配置...${RESET}"
+    echo -e "${YELLOW}清理系统自带的 default server 配置...${RESET}"
     rm -f /etc/nginx/sites-enabled/default
     rm -f /etc/nginx/sites-available/default
 }
 
 ensure_nginx_conf() {
     mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/modules-enabled
-
-    # nginx.conf
     if [ ! -f /etc/nginx/nginx.conf ]; then
         cat > /etc/nginx/nginx.conf <<'EOF'
 user www-data;
@@ -40,7 +37,9 @@ worker_processes auto;
 pid /run/nginx.pid;
 include /etc/nginx/modules-enabled/*.conf;
 
-events { worker_connections 768; }
+events {
+    worker_connections 768;
+}
 
 http {
     sendfile on;
@@ -59,7 +58,6 @@ http {
 EOF
     fi
 
-    # mime.types
     if [ ! -f /etc/nginx/mime.types ]; then
         cat > /etc/nginx/mime.types <<'EOF'
 types {
@@ -78,27 +76,14 @@ EOF
 
 create_default_server() {
     DEFAULT_PATH="/etc/nginx/sites-available/default_server_block"
-    if [ ! -f "$DEFAULT_PATH" ]; then
-        cat > "$DEFAULT_PATH" <<EOF
+    [ ! -f "$DEFAULT_PATH" ] && cat > "$DEFAULT_PATH" <<EOF
 server {
-    listen [::]:80 default_server;
+    listen 80 default_server;
     server_name _;
     return 403;
 }
 EOF
-        ln -sf "$DEFAULT_PATH" /etc/nginx/sites-enabled/default_server_block
-    fi
-}
-
-fix_duplicate_default_server() {
-    DEFAULT_FILES=($(grep -rl "default_server" /etc/nginx/sites-enabled/ || true))
-    if [ ${#DEFAULT_FILES[@]} -gt 1 ]; then
-        echo -e "${YELLOW}检测到重复 default_server 配置，自动修复中...${RESET}"
-        for ((i=1; i<${#DEFAULT_FILES[@]}; i++)); do
-            rm -f "${DEFAULT_FILES[i]}"
-            echo -e "${YELLOW}已删除重复文件: ${DEFAULT_FILES[i]}${RESET}"
-        done
-    fi
+    ln -sf "$DEFAULT_PATH" /etc/nginx/sites-enabled/default_server_block
 }
 
 generate_server_config() {
@@ -117,13 +102,13 @@ generate_server_config() {
 
     cat > "$CONFIG_PATH" <<EOF
 server {
-    listen [::]:80;
+    listen 80;
     server_name $DOMAIN;
     return 301 https://\$host\$request_uri;
 }
 
 server {
-    listen [::]:443 ssl;
+    listen 443 ssl;
     server_name $DOMAIN;
 
     ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
@@ -144,33 +129,28 @@ EOF
 
 check_domain_resolution() {
     DOMAIN=$1
-    VPS_IP=$(curl -6 -s https://ifconfig.co)
-    DOMAIN_IP=$(dig AAAA +short "$DOMAIN" | tail -n1)
-
-    echo -e "${YELLOW}检测域名 AAAA 记录...${RESET}"
-    echo -e "  ${GREEN}VPS IPv6:   ${RESET}$VPS_IP"
-    echo -e "  ${GREEN}域名 IPv6:  ${RESET}$DOMAIN_IP"
-
-    if [ -z "$DOMAIN_IP" ]; then
-        echo -e "${RED}错误: 域名 $DOMAIN 没有 AAAA 记录！${RESET}"
-    elif [ "$DOMAIN_IP" != "$VPS_IP" ]; then
-        echo -e "${RED}警告: 域名 $DOMAIN 解析为 $DOMAIN_IP, VPS IPv6 为 $VPS_IP${RESET}"
+    VPS_IP=$(curl -s https://ipinfo.io/ip)
+    DOMAIN_IP=$(dig +short "$DOMAIN" | tail -n1)
+    if [ "$DOMAIN_IP" != "$VPS_IP" ]; then
+        echo -e "${RED}警告: 域名 $DOMAIN 解析为 $DOMAIN_IP, VPS IP 为 $VPS_IP${RESET}"
     else
-        echo -e "${GREEN}域名 AAAA 记录解析正常 (IPv6)${RESET}"
+        echo -e "${GREEN}域名解析正常${RESET}"
     fi
 }
 
+# ------------------------------
+# 功能函数
+# ------------------------------
+
 install_nginx() {
     ensure_nginx_conf
-
-    # 第一次删除系统自带 default 配置
     remove_default_server
 
-    # 系统更新 & 安装依赖
     DEBIAN_FRONTEND=noninteractive apt update
     DEBIAN_FRONTEND=noninteractive apt upgrade -y \
         -o Dpkg::Options::="--force-confdef" \
         -o Dpkg::Options::="--force-confold"
+
     DEBIAN_FRONTEND=noninteractive apt install -y curl dnsutils \
         -o Dpkg::Options::="--force-confdef" \
         -o Dpkg::Options::="--force-confold"
@@ -193,12 +173,8 @@ install_nginx() {
         }
     fi
 
-    # 第二次删除系统自带 default 配置（升级/安装可能恢复的）
     remove_default_server
-
-    # 创建自定义 default_server_block
     create_default_server
-
     configure_firewall
     systemctl daemon-reload
     systemctl enable --now nginx
@@ -211,7 +187,6 @@ install_nginx() {
 
     certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
     generate_server_config "$DOMAIN" "$TARGET" "$IS_WS"
-
     nginx -t && systemctl reload nginx
     systemctl enable --now certbot.timer
     echo -e "${GREEN}安装完成！访问: https://$DOMAIN${RESET}"
@@ -359,31 +334,52 @@ test_renew() {
 
 check_cert() {
     CERT_DIR="/etc/letsencrypt/live"
-    [ ! -d "$CERT_DIR" ] && echo "没有找到任何证书" && pause && return
-
-    DOMAINS=($(ls "$CERT_DIR" | grep -vE 'default|default_server_block' | sort))
-    [ ${#DOMAINS[@]} -eq 0 ] && echo "没有找到任何有效证书" && pause && return
+    if [ ! -d "$CERT_DIR" ]; then
+        echo "没有找到任何证书"
+        pause
+        return
+    fi
 
     echo "现有证书的域名："
     i=1
-    for DOMAIN in "${DOMAINS[@]}"; do
-        [ -f "$CERT_DIR/$DOMAIN/fullchain.pem" ] && echo "$i) $DOMAIN" && i=$((i+1))
+    DOMAINS=()
+    for DOMAIN in $(ls "$CERT_DIR"); do
+        if [ -f "$CERT_DIR/$DOMAIN/fullchain.pem" ]; then
+            echo "$i) $DOMAIN"
+            DOMAINS+=("$DOMAIN")
+            i=$((i+1))
+        fi
     done
+
+    if [ ${#DOMAINS[@]} -eq 0 ]; then
+        echo "没有找到任何有效证书"
+        pause
+        return
+    fi
 
     echo -ne "请选择要查看的域名编号 (0 返回): "
     read choice
-    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ ]]; then
-        echo -e "${YELLOW}已取消${RESET}"; return
-    fi
-    if [ "$choice" -eq 0 ]; then return; fi
-    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效选择${RESET}"; pause; return
+
+    # 如果输入为空或不是数字
+    if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+        echo "无效输入"
+        pause
+        return
     fi
 
-    SELECTED=${DOMAINS[$((choice-1))]}
-    certbot certificates --cert-name "$SELECTED"
+    if [ "$choice" -eq 0 ]; then
+        return
+    fi
+
+    if [ "$choice" -ge 1 ] && [ "$choice" -le ${#DOMAINS[@]} ]; then
+        SELECTED=${DOMAINS[$((choice-1))]}
+        certbot certificates --cert-name "$SELECTED"
+    else
+        echo "无效选择"
+    fi
     pause
 }
+
 
 check_domains_status() {
     echo "域名                  状态       到期时间        剩余天数"

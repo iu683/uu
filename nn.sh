@@ -1,14 +1,21 @@
 #!/bin/bash
+# ==========================================
+# Poste.io 一键管理脚本 (Docker)
+# ==========================================
 
-# ================== 颜色变量 ==================
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+BLUE="\033[36m"
+RESET="\033[0m"
+
+APP_NAME="posteio"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
 check_root() {
     if [ "$(id -u)" != "0" ]; then
-        echo -e "${RED}错误: 请使用root用户运行此脚本${NC}"
+        echo -e "${RED}错误: 请使用root用户运行此脚本${RESET}"
         exit 1
     fi
 }
@@ -29,21 +36,55 @@ check_docker() {
 check_port() {
     local port=$1
     if lsof -i:$port &> /dev/null; then
-        echo -e "✗ 端口 $port........ ${RED}被占用${NC}"
+        echo -e "✗ 端口 $port........ ${RED}被占用${RESET}"
     else
-        echo -e "✓ 端口 $port........ ${GREEN}可用${NC}"
+        echo -e "✓ 端口 $port........ ${GREEN}可用${RESET}"
     fi
 }
 
-create_docker_compose() {
+check_ports() {
+    echo -e "${YELLOW}=== 关键端口检查 ===${RESET}"
+    for p in 25 587 110 143 993 995 465 80 443; do
+        check_port $p
+    done
+}
+
+show_dns_info() {
     local domain=$1
+    local ip=$(curl -s ifconfig.me)
     local root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
-    local admin_email="admin@${root_domain}"
+    echo -e "\n${BLUE}================ DNS 配置参考 ================${RESET}"
+    echo -e "${GREEN}▶ A       mail      ${ip}${RESET}"
+    echo -e "${GREEN}▶ CNAME   imap      ${domain}${RESET}"
+    echo -e "${GREEN}▶ CNAME   pop       ${domain}${RESET}"
+    echo -e "${GREEN}▶ CNAME   smtp      ${domain}${RESET}"
+    echo -e "${GREEN}▶ MX      @         ${domain}${RESET}"
+    echo -e "${GREEN}▶ TXT     @         v=spf1 mx ~all${RESET}"
+    echo -e "${GREEN}▶ TXT     _dmarc    v=DMARC1; p=none; rua=mailto:admin@${root_domain}${RESET}"
+    echo -e "${BLUE}===============================================${RESET}"
+}
 
-    mkdir -p /opt/posteio
-    cd /opt/posteio || exit 1
+install_app() {
+    read -p "请输入邮箱域名 (例如: mail.example.com): " domain
+    read -p "请输入 Web HTTP 端口 [默认:80]: " web_port
+    WEB_PORT=${web_port:-80}
+    read -p "请输入 Web HTTPS 端口 [默认:443]: " https_port
+    HTTPS_PORT=${https_port:-443}
 
-    cat > docker-compose.yml << EOF
+    read -p "是否禁用 ClamAV (TRUE/FALSE) [默认:TRUE]: " clamav_input
+    DISABLE_CLAMAV=${clamav_input:-TRUE}
+
+    read -p "是否禁用 Rspamd (TRUE/FALSE) [默认:TRUE]: " rspamd_input
+    DISABLE_RSPAMD=${rspamd_input:-TRUE}
+
+    read -p "是否启用 HTTPS (ON/OFF) [默认:OFF]: " https_input
+    HTTPS=${https_input:-OFF}
+
+    mkdir -p "$APP_DIR/mail-data"
+    cd "$APP_DIR" || exit 1
+
+    # 生成 docker-compose.yml
+    cat > "$COMPOSE_FILE" <<EOF
 services:
   mailserver:
     image: analogic/poste.io
@@ -57,189 +98,108 @@ services:
       - "995:995"
       - "4190:4190"
       - "465:465"
-      - "8808:80"
-      - "8843:443"
+      - "${WEB_PORT}:80"
+      - "${HTTPS_PORT}:443"
     environment:
-      - LETSENCRYPT_EMAIL=${admin_email}
+      - LETSENCRYPT_EMAIL=admin@${domain}
       - LETSENCRYPT_HOST=${domain}
       - VIRTUAL_HOST=${domain}
-      - DISABLE_CLAMAV=TRUE
-      - DISABLE_RSPAMD=TRUE
+      - DISABLE_CLAMAV=${DISABLE_CLAMAV}
+      - DISABLE_RSPAMD=${DISABLE_RSPAMD}
       - TZ=Asia/Shanghai
-      - HTTPS=OFF
+      - HTTPS=${HTTPS}
     volumes:
       - /etc/localtime:/etc/localtime:ro
       - ./mail-data:/data
 EOF
+
+    echo -e "${BLUE}正在启动 Poste.io 服务...${RESET}"
+    docker-compose up -d
+    echo -e "${GREEN}✅ 服务已启动${RESET}"
+
+    # 显示 DNS 信息
+    show_dns_info "$domain"
+
+    # 默认管理员账号提示
+    admin_email="admin@${domain#mail.}"
+    echo -e "${YELLOW}访问 Web 邮局: https://${domain}${RESET}"
+    echo -e "${YELLOW}访问管理后台: https://${domain}/admin${RESET}"
+    echo -e "${YELLOW}默认管理员邮箱: ${admin_email}${RESET}"
+    echo -e "${GREEN} 访问地址: http://$(hostname -I | awk '{print $1}'):${WEB_PORT}${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-show_dns_info() {
-    local domain=$1
-    local ip=$(curl -s ifconfig.me)
-    local root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
-
-    echo -e "\n\033[38;5;81m────────────────────────\033[0m"
-    echo -e "${GREEN}▶ 请配置以下DNS记录：${NC}"
-    echo -e "${GREEN}▶ A       mail      ${ip}${NC}"
-    echo -e "${GREEN}▶ CNAME   imap      ${domain}${NC}"
-    echo -e "${GREEN}▶ CNAME   pop       ${domain}${NC}"
-    echo -e "${GREEN}▶ CNAME   smtp      ${domain}${NC}"
-    echo -e "${GREEN}▶ MX      @         ${domain}${NC}"
-    echo -e "${GREEN}▶ TXT     @         v=spf1 mx ~all${NC}"
-    echo -e "${GREEN}▶ TXT     _dmarc    v=DMARC1; p=none; rua=mailto:admin@${root_domain}${NC}"
-    echo -e "\033[38;5;81m────────────────────────\033[0m"
+restart_app() {
+    if [ -d "$APP_DIR" ]; then
+        cd "$APP_DIR" || exit 1
+        echo -e "${BLUE}正在重启 Poste.io 服务...${RESET}"
+        docker-compose restart
+        echo -e "${GREEN}✅ 服务已重启${RESET}"
+    else
+        echo -e "${RED}未检测到安装目录，请先安装${RESET}"
+    fi
+    read -p "按回车返回菜单..."
 }
 
-main_menu_action() {
-    local choice=$1
-    case $choice in
-        1)  # 安装
-            read -p "请输入邮箱域名 (例如: mail.example.com): " domain
-            create_docker_compose "$domain"
-            cd /opt/posteio
-            echo "正在启动服务..."
-            docker-compose up -d || { echo -e "${RED}启动失败！${NC}"; exit 1; }
-            show_dns_info "$domain"
-            local ip=$(curl -s ifconfig.me)
-
-            echo -e "\n\033[38;5;81m────────────────────────\033[0m"
-            echo -e "${GREEN}▶ 安装完成！${NC}"
-            echo -e "${GREEN}▶ 首次配置页面: https://${domain}${NC}"
-            echo -e "${GREEN}▶ 管理后台: https://${domain}/admin${NC}"
-            echo -e "${GREEN}▶ 默认管理员账号: admin@${domain#mail.}${NC}"
-            echo -e "${GREEN}▶ 访问地址(IP:8808): http://${ip}:8808${NC}"
-            echo -e "\033[38;5;81m────────────────────────\033[0m"
-            ;;
-        2)  # 更新
-            if [ -d "/opt/posteio" ]; then
-                cd /opt/posteio
-                echo "正在更新服务..."
-                docker-compose pull
-                docker-compose up -d
-                echo -e "\n\033[38;5;81m────────────────────────\033[0m"
-                echo -e "${GREEN}▶ 更新完成！${NC}"
-                echo -e "\033[38;5;81m────────────────────────\033[0m"
-            else
-                echo -e "\n${RED}未找到安装目录！${NC}"
-            fi
-            ;;
-        3)  # 卸载
-            if [ -d "/opt/posteio" ]; then
-                cd /opt/posteio
-                echo "正在卸载服务..."
-                docker-compose down
-                docker images | awk '/poste\.io/ {print $3}' | xargs -r docker rmi -f
-                cd /opt
-                rm -rf posteio
-                echo -e "\n\033[38;5;81m────────────────────────\033[0m"
-                echo -e "${GREEN}▶ 已完全卸载服务、数据和镜像！${NC}"
-                echo -e "\033[38;5;81m────────────────────────\033[0m"
-            else
-                echo -e "\n${RED}未找到安装目录！${NC}"
-            fi
-            ;;
-    esac
-
-    read -p "按回车返回菜单，或输入 q 退出: " back
-    [[ "$back" == "q" ]] && exit 0
-    initial_check
+view_logs() {
+    if [ -d "$APP_DIR" ]; then
+        cd "$APP_DIR" || exit 1
+        echo -e "${BLUE}显示 Poste.io 容器日志 (Ctrl+C 退出)...${RESET}"
+        docker-compose logs -f
+    else
+        echo -e "${RED}未检测到安装目录，请先安装${RESET}"
+    fi
+    read -p "按回车返回菜单..."
 }
 
-initial_check() {
+update_app() {
+    if [ -d "$APP_DIR" ]; then
+        cd "$APP_DIR" || exit 1
+        echo -e "${BLUE}正在更新 Poste.io 服务...${RESET}"
+        docker-compose pull
+        docker-compose up -d
+        echo -e "${GREEN}✅ 服务已更新${RESET}"
+    else
+        echo -e "${RED}未检测到安装目录，请先安装${RESET}"
+    fi
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    if [ -d "$APP_DIR" ]; then
+        cd "$APP_DIR" || exit 1
+        echo -e "${BLUE}正在卸载 Poste.io 服务...${RESET}"
+        docker-compose down
+        docker images | awk '/poste\.io/ {print $3}' | xargs -r docker rmi -f
+        rm -rf "$APP_DIR"
+        echo -e "${RED}✅ 已卸载服务及数据${RESET}"
+    else
+        echo -e "${RED}未检测到安装目录${RESET}"
+    fi
+    read -p "按回车返回菜单..."
+}
+
+menu() {
     clear
-    check_docker
-
-    # 菜单标题
-    echo -e "\033[1;36m=====  Poste.io菜单管理 =====\033[0m\n"
-
-    echo -e "\033[1;36m系统检查\033[0m"
-    echo -e "\033[38;5;81m────────────────────────\033[0m"
-
-    echo -n "✓ Telnet......... "
-    if command -v telnet &> /dev/null; then
-        echo -e "${GREEN}已安装${NC}"
-    else
-        echo -e "${RED}未安装${NC}"
-        echo "正在安装telnet..."
-        apt-get update && apt-get install -y telnet > /dev/null 2>&1
-    fi
-
-    echo -n "✓ 邮局服务....... "
-    if docker ps -a --format '{{.Names}}' | grep -wq "posteio"; then
-        echo -e "${GREEN}已安装${NC}"
-    else
-        echo -e "${RED}未安装${NC}"
-    fi
-
-    echo -e "\n\033[1;36m端口检测\033[0m"
-    echo -e "\033[38;5;81m────────────────────────\033[0m"
-
-    # 远程25端口检测
-    port=25
-    timeout=3
-    telnet_output=$(echo "quit" | timeout $timeout telnet smtp.qq.com $port 2>&1)
-    if echo "$telnet_output" | grep -q "Connected"; then
-        echo -e "✓ 端口 $port........ ${GREEN}可访问外网SMTP${NC}"
-    else
-        echo -e "✗ 端口 $port........ ${RED}不可访问外网SMTP${NC}"
-    fi
-
-    # 其他端口检查
-    for port in 587 110 143 993 995 465 80 443; do
-        check_port $port
-    done
-
-    echo -e "\n\033[1;36m操作选项\033[0m"
-    echo -e "\033[38;5;81m────────────────────────\033[0m"
-
-    local menu_options=("安装" "更新" "卸载" "重启" "查看日志" "退出")
-    local colors=($GREEN $GREEN $GREEN $GREEN $GREEN $GREEN)
-
-    for i in "${!menu_options[@]}"; do
-        printf "${colors[i]}▶ %d. %s${NC}\n" $((i+1)) "${menu_options[i]}"
-    done
-
-    echo -e "\033[38;5;81m────────────────────────\033[0m"
-    read -p "$(echo -e "\033[1;33m请输入选项 [1-6]: \033[0m")" choice
-
+    echo -e "${GREEN}=== Poste.io 邮件服务器管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 重启${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}5) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    read -p "请选择: " choice
     case $choice in
-        1|2|3)
-            main_menu_action $choice
-            ;;
-        4) # 重启
-            if [ -d "/opt/posteio" ]; then
-                cd /opt/posteio
-                echo "正在重启 Poste.io 服务..."
-                docker-compose restart
-                echo -e "${GREEN}▶ 服务已重启完成${NC}"
-            else
-                echo -e "${RED}未找到安装目录！${NC}"
-            fi
-            read -p "按回车返回菜单..." dummy
-            initial_check
-            ;;
-        5) # 查看日志
-            if [ -d "/opt/posteio" ]; then
-                cd /opt/posteio
-                echo "正在显示 Poste.io 日志，按 Ctrl+C 退出..."
-                docker-compose logs -f
-            else
-                echo -e "${RED}未找到安装目录！${NC}"
-            fi
-            read -p "按回车返回菜单..." dummy
-            initial_check
-            ;;
-        6)
-            echo -e "\n${GREEN}感谢使用，再见！${NC}"
-            exit 0
-            ;;
-        *)
-            echo -e "\n${RED}无效选项，请重新选择${NC}"
-            sleep 2
-            initial_check
-            ;;
+        1) install_app ;;
+        2) update_app ;;
+        3) restart_app ;;
+        4) view_logs ;;
+        5) uninstall_app ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
     esac
+    menu
 }
 
 check_root
-initial_check
+menu

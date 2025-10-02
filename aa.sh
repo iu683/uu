@@ -102,13 +102,13 @@ generate_server_config() {
 
     cat > "$CONFIG_PATH" <<EOF
 server {
-    listen [::]:80;
+    listen 80;
     server_name $DOMAIN;
     return 301 https://\$host\$request_uri;
 }
 
 server {
-    listen [::]:443 ssl;
+    listen 443 ssl;
     server_name $DOMAIN;
 
     ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
@@ -129,21 +129,15 @@ EOF
 
 check_domain_resolution() {
     DOMAIN=$1
-    VPS_IP=$(curl -6 -s https://ifconfig.co)
-    DOMAIN_IP=$(dig AAAA +short "$DOMAIN" | tail -n1)
-
-    echo -e "${YELLOW}检测域名 AAAA 记录...${RESET}"
-    echo -e "  ${GREEN}VPS IPv6:   ${RESET}$VPS_IP"
-    echo -e "  ${GREEN}域名 IPv6:  ${RESET}$DOMAIN_IP"
-
-    if [ -z "$DOMAIN_IP" ]; then
-        echo -e "${RED}错误: 域名 $DOMAIN 没有 AAAA 记录！${RESET}"
-    elif [ "$DOMAIN_IP" != "$VPS_IP" ]; then
-        echo -e "${RED}警告: 域名 $DOMAIN 解析为 $DOMAIN_IP, VPS IPv6 为 $VPS_IP${RESET}"
+    VPS_IP=$(curl -s https://ipinfo.io/ip)
+    DOMAIN_IP=$(dig +short "$DOMAIN" | tail -n1)
+    if [ "$DOMAIN_IP" != "$VPS_IP" ]; then
+        echo -e "${RED}警告: 域名 $DOMAIN 解析为 $DOMAIN_IP, VPS IP 为 $VPS_IP${RESET}"
     else
-        echo -e "${GREEN}域名 AAAA 记录解析正常 (IPv6)${RESET}"
+        echo -e "${GREEN}域名解析正常${RESET}"
     fi
 }
+
 # ------------------------------
 # 功能函数
 # ------------------------------
@@ -413,7 +407,7 @@ uninstall_nginx() {
 # ------------------------------
 while true; do
     clear
-    echo -e "${GREEN}===== Nginx V6 管理脚本 =====${RESET}"
+    echo -e "${GREEN}===== Nginx 管理脚本 =====${RESET}"
     echo -e "${GREEN}1) 安装 Nginx + 证书${RESET}"
     echo -e "${GREEN}2) 添加配置${RESET}"
     echo -e "${GREEN}3) 修改配置${RESET}"

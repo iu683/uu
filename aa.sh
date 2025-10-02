@@ -1,25 +1,34 @@
 #!/bin/bash
-# ========================================
-# Emby 一键管理脚本 (Docker Compose)
-# ========================================
+# ======================================
+# DDNS-GO 一键管理脚本 (端口映射模式)
+# ======================================
 
 GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
-APP_NAME="emby"
+
+APP_NAME="ddns-go"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.env"
 
-function menu() {
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${RED}未检测到 Docker，请先安装 Docker${RESET}"
+        exit 1
+    fi
+}
+
+menu() {
     clear
-    echo -e "${GREEN}=== Emby 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== DDNS-GO 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载(含数据)${RESET}"
     echo -e "${GREEN}4) 查看日志${RESET}"
     echo -e "${GREEN}5) 重启${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    read -p "请选择: " choice
+    read -rp "请选择: " choice
     case $choice in
         1) install_app ;;
         2) update_app ;;
@@ -31,102 +40,65 @@ function menu() {
     esac
 }
 
-function install_app() {
-    read -p "请输入 Web 端口 [默认:8096]: " input_port
-    PORT=${input_port:-8096}
+install_app() {
+    mkdir -p "$APP_DIR/ddns-go_data"
 
-    read -p "请输入宿主机媒体目录路径 [默认:/opt/emby/media]: " input_media
-    MEDIA_DIR=${input_media:-/opt/emby/media}
+    read -rp "请输入要绑定的端口 [默认 9876]: " port
+    port=${port:-9876}
 
-    echo -e "是否启用硬件转码? (y/n) 默认 n"
-    read -p "选择: " enable_hw
-    ENABLE_HW=${enable_hw:-n}
-    mkdir -p "$APP_DIR/config"
-    mkdir -p "$APP_DIR"
-
-    # 默认 UID/GID 1000
-    PUID=1000
-    PGID=1000
-
-    # 写 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  emby:
-    image: emby/embyserver:latest
-    container_name: emby
+  ddns-go:
+    image: jeessy/ddns-go
+    container_name: ddns-go
     restart: always
-    user: "$PUID:$PGID"
     ports:
-      - "127.0.0.1:$PORT:8096"
-      - "127.0.0.1:8920:8920"
-    environment:
-      - PUID=$PUID
-      - PGID=$PGID
-      - TZ=Asia/Shanghai
+      - "127.0.0.1:${port}:9876"
     volumes:
-      - $APP_DIR/config:/config
-      - $MEDIA_DIR:/media
+      - ./ddns-go_data:/root
 EOF
 
-    if [[ "$ENABLE_HW" =~ [yY] ]]; then
-        cat >> "$COMPOSE_FILE" <<EOF
-    devices:
-      - /dev/dri:/dev/dri
-EOF
-    fi
-
-    # 保存配置
-    {
-        echo "PORT=$PORT"
-        echo "MEDIA_DIR=$MEDIA_DIR"
-        echo "ENABLE_HW=$ENABLE_HW"
-        echo "PUID=$PUID"
-        echo "PGID=$PGID"
-    } > "$CONFIG_FILE"
-
-    cd "$APP_DIR"
+    cd "$APP_DIR" || exit
     docker compose up -d
 
-    echo -e "${GREEN}✅ Emby 已启动${RESET}"
-    echo -e "${GREEN}🌐 Web UI 地址: http://127.0.0.1:$PORT${RESET}"
-    echo -e "${GREEN}📂 配置目录: $APP_DIR/config${RESET}"
-    echo -e "${GREEN}🎬 媒体目录: $MEDIA_DIR${RESET}"
-    [[ "$ENABLE_HW" =~ [yY] ]] && echo -e "${GREEN}⚡ 已启用硬件转码支持${RESET}"
-
-    read -p "按回车返回菜单..."
+    echo -e "${GREEN}✅ DDNS-GO 已启动${RESET}"
+    echo -e "${YELLOW}本地访问地址: http://127.0.0.1:${port}${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR${RESET}"
+    read -rp "按回车返回菜单..."
     menu
 }
 
-function update_app() {
+update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Emby 已更新并重启完成${RESET}"
-    read -p "按回车返回菜单..."
+    echo -e "${GREEN}✅ DDNS-GO 已更新并重启完成${RESET}"
+    read -rp "按回车返回菜单..."
     menu
 }
 
-function uninstall_app() {
+uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${GREEN}✅ Emby 已卸载，数据已删除${RESET}"
-    read -p "按回车返回菜单..."
+    echo -e "${RED}✅ DDNS-GO 已卸载${RESET}"
+    read -rp "按回车返回菜单..."
     menu
 }
 
-function restart_app() {
+view_logs() {
+    docker logs -f ddns-go
+    read -rp "按回车返回菜单..."
+    menu
+}
+
+restart_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose restart
-    echo -e "${GREEN}✅ Emby 已重启${RESET}"
-    read -p "按回车返回菜单..."
+    echo -e "${GREEN}✅ DDNS-GO 已重启${RESET}"
+    read -rp "按回车返回菜单..."
     menu
 }
 
-function view_logs() {
-    docker logs -f emby
-    read -p "按回车返回菜单..."
-    menu
-}
-
+check_docker
 menu

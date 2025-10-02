@@ -5,6 +5,7 @@
 
 GREEN="\033[32m"
 RESET="\033[0m"
+YELLOW="\033[33m"
 APP_NAME="emby"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
@@ -12,7 +13,7 @@ CONFIG_FILE="$APP_DIR/config.env"
 
 function menu() {
     clear
-    echo -e "${GREEN}=== Emby 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== Emby(arm)管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 卸载(含数据)${RESET}"
@@ -51,7 +52,7 @@ function install_app() {
     cat > "$COMPOSE_FILE" <<EOF
 services:
   emby:
-    image: emby/embyserver:latest
+    image: emby/embyserver_arm64v8:latest
     container_name: emby
     restart: unless-stopped
     ports:
@@ -83,8 +84,9 @@ EOF
     docker compose up -d
 
     echo -e "${GREEN}✅ Emby 已启动${RESET}"
-    echo -e "${GREEN}🌐 Web UI 地址: http://127.0.0.1:$PORT${RESET}"
+    echo -e "${YELLOW}🌐 本机访问地址: http://127.0.0.1:$PORT${RESET}"
     echo -e "${GREEN}📂 配置目录: $APP_DIR/config${RESET}"
+    echo -e "${GREEN}📂 容器目录: /mnt/share1${RESET}"
     echo -e "${GREEN}🎬 媒体目录: $MEDIA_DIR${RESET}"
     [[ "$ENABLE_HW" =~ [yY] ]] && echo -e "${GREEN}⚡ 已启用硬件转码支持${RESET}"
 

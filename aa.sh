@@ -33,27 +33,44 @@ check_docker() {
     fi
 }
 
+
+
+# ==================== 端口检测 ====================
 check_port() {
     local port=$1
-    if lsof -i:$port &> /dev/null; then
-        echo -e "✗ 端口 $port........ ${RED}被占用${RESET}"
+    local timeout=3
+    nc -z -w $timeout 8.8.8.8 $port &>/dev/null
+    if [ $? -eq 0 ]; then
+        echo -e "${YELLOW}✓ 端口 $port........ ${GREEN}可访问${RESET}"
     else
-        echo -e "✓ 端口 $port........ ${GREEN}可用${RESET}"
+        echo -e "${YELLOW}✗ 端口 $port........ ${RED}不可访问${RESET}"
     fi
 }
 
-check_ports() {
-    echo -e "${YELLOW}=== 关键端口检查 ===${RESET}"
-    for p in 25 587 110 143 993 995 465 80 443; do
-        check_port $p
-    done
-}
+port_check() {
+    echo -e "${YELLOW}端口检测${RESET}"
+    # 远程 SMTP 25 端口检测
+    port=25
+    timeout=3
+    telnet_output=$(echo "quit" | timeout $timeout telnet smtp.qq.com $port 2>&1)
+    if echo "$telnet_output" | grep -q "Connected"; then
+        echo -e "${YELLOW}✓ 端口 $port........ ${GREEN}可访问外网SMTP${RESET}"
+    else
+        echo -e "${YELLOW}✗ 端口 $port........ ${RED}不可访问外网SMTP${RESET}"
+    fi
 
+    # 检测其他常用端口
+    for port in 587 110 143 993 995 465 80 443; do
+        check_port $port
+    done
+
+    read -p "按回车返回菜单..."
+}
 show_dns_info() {
     local domain=$1
     local ip=$(curl -s ifconfig.me)
     local root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
-    echo -e "\n${BLUE}================ DNS 配置参考 ================${RESET}"
+    echo -e "${YELLOW}================ DNS 配置参考 ================${RESET}"
     echo -e "${GREEN}▶ A       mail      ${ip}${RESET}"
     echo -e "${GREEN}▶ CNAME   imap      ${domain}${RESET}"
     echo -e "${GREEN}▶ CNAME   pop       ${domain}${RESET}"
@@ -71,10 +88,10 @@ install_app() {
     read -p "请输入 Web HTTPS 端口 [默认:443]: " https_port
     HTTPS_PORT=${https_port:-443}
 
-    read -p "是否禁用 ClamAV (TRUE/FALSE) [默认:TRUE]: " clamav_input
+    read -p "是否禁用反病毒 ClamAV (TRUE/FALSE) [默认:TRUE]: " clamav_input
     DISABLE_CLAMAV=${clamav_input:-TRUE}
 
-    read -p "是否禁用 Rspamd (TRUE/FALSE) [默认:TRUE]: " rspamd_input
+    read -p "是否禁用反垃圾邮件 Rspamd (TRUE/FALSE) [默认:TRUE]: " rspamd_input
     DISABLE_RSPAMD=${rspamd_input:-TRUE}
 
     read -p "是否启用 HTTPS (ON/OFF) [默认:OFF]: " https_input
@@ -125,7 +142,7 @@ EOF
     echo -e "${YELLOW}访问 Web 邮局: https://${domain}${RESET}"
     echo -e "${YELLOW}访问管理后台: https://${domain}/admin${RESET}"
     echo -e "${YELLOW}默认管理员邮箱: ${admin_email}${RESET}"
-    echo -e "${GREEN} 访问地址: http://$(hostname -I | awk '{print $1}'):${WEB_PORT}${RESET}"
+    echo -e "${GREEN}     访问地址: http://$(hostname -I | awk '{print $1}'):${WEB_PORT}${RESET}"
     read -p "按回车返回菜单..."
 }
 
@@ -181,22 +198,20 @@ uninstall_app() {
 
 menu() {
     clear
-    check_docker
-    check_ports
     echo -e "${GREEN}=== Poste.io 邮件服务器管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装/启动${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 重启${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}3) 查看日志${RESET}"
+    echo -e "${GREEN}4) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}5) 端口检测${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
     read -p "请选择: " choice
     case $choice in
         1) install_app ;;
         2) update_app ;;
-        3) restart_app ;;
-        4) view_logs ;;
-        5) uninstall_app ;;
+        3) view_logs ;;
+        4) uninstall_app ;;
+        5) port_check ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
     esac

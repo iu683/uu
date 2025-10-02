@@ -6,9 +6,6 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-# ------------------------------
-# 工具函数
-# ------------------------------
 pause() {
     echo -ne "${YELLOW}按回车返回菜单...${RESET}"
     read
@@ -105,13 +102,13 @@ generate_server_config() {
 
     cat > "$CONFIG_PATH" <<EOF
 server {
-    listen 80;
+    listen [::]:80;
     server_name $DOMAIN;
     return 301 https://\$host\$request_uri;
 }
 
 server {
-    listen 443 ssl;
+    listen [::]:443 ssl;
     server_name $DOMAIN;
 
     ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
@@ -132,18 +129,25 @@ EOF
 
 check_domain_resolution() {
     DOMAIN=$1
-    VPS_IP=$(curl -s https://ipinfo.io/ip)
-    DOMAIN_IP=$(dig +short "$DOMAIN" | tail -n1)
-    if [ "$DOMAIN_IP" != "$VPS_IP" ]; then
-        echo -e "${RED}警告: 域名 $DOMAIN 解析为 $DOMAIN_IP, VPS IP 为 $VPS_IP${RESET}"
+    VPS_IP=$(curl -6 -s https://ifconfig.co)
+    DOMAIN_IP=$(dig AAAA +short "$DOMAIN" | tail -n1)
+
+    echo -e "${YELLOW}检测域名 AAAA 记录...${RESET}"
+    echo -e "  ${GREEN}VPS IPv6:   ${RESET}$VPS_IP"
+    echo -e "  ${GREEN}域名 IPv6:  ${RESET}$DOMAIN_IP"
+
+    if [ -z "$DOMAIN_IP" ]; then
+        echo -e "${RED}错误: 域名 $DOMAIN 没有 AAAA 记录！${RESET}"
+    elif [ "$DOMAIN_IP" != "$VPS_IP" ]; then
+        echo -e "${RED}警告: 域名 $DOMAIN 解析为 $DOMAIN_IP, VPS IPv6 为 $VPS_IP${RESET}"
     else
-        echo -e "${GREEN}域名解析正常${RESET}"
+        echo -e "${GREEN}域名 AAAA 记录解析正常 (IPv6)${RESET}"
     fi
 }
-
 # ------------------------------
 # 功能函数
 # ------------------------------
+
 install_nginx() {
     ensure_nginx_conf
     remove_default_server
@@ -177,7 +181,6 @@ install_nginx() {
 
     remove_default_server
     create_default_server
-
     configure_firewall
     systemctl daemon-reload
     systemctl enable --now nginx
@@ -244,17 +247,20 @@ modify_config() {
     [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}还没有任何配置文件！${RESET}" && pause && return
 
     DOMAINS=($(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort))
-    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有找到任何域名配置！${RESET}" && pause && return
+    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有域名配置！${RESET}" && pause && return
 
     echo -e "${GREEN}现有配置的域名:${RESET}"
     for i in "${!DOMAINS[@]}"; do
         echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"
     done
 
-    echo -ne "${GREEN}请输入编号 (0 返回): ${RESET}"; read choice
-    [ "$choice" -eq 0 ] && return
-
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
+    echo -ne "${GREEN}请输入编号 (0 返回): ${RESET}"
+    read choice
+    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ ]]; then
+        echo -e "${YELLOW}已取消${RESET}"; return
+    fi
+    if [ "$choice" -eq 0 ]; then return; fi
+    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
         echo -e "${RED}无效选择${RESET}"; pause; return
     fi
 
@@ -279,17 +285,20 @@ delete_config() {
     [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}没有配置文件！${RESET}" && pause && return
 
     DOMAINS=($(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort))
-    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有可删除的域名！${RESET}" && pause && return
+    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有域名配置！${RESET}" && pause && return
 
     echo -e "${GREEN}可删除的域名:${RESET}"
     for i in "${!DOMAINS[@]}"; do
         echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"
     done
 
-    echo -ne "${GREEN}请选择编号 (0 返回): ${RESET}"; read choice
-    [ "$choice" -eq 0 ] && return
-
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
+    echo -ne "${GREEN}请选择编号 (0 返回): ${RESET}"
+    read choice
+    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ ]]; then
+        echo -e "${YELLOW}已取消${RESET}"; return
+    fi
+    if [ "$choice" -eq 0 ]; then return; fi
+    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
         echo -e "${RED}无效选择${RESET}"; pause; return
     fi
 
@@ -313,10 +322,13 @@ test_renew() {
         echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"
     done
 
-    echo -ne "${GREEN}选择编号 (0 返回): ${RESET}"; read choice
-    [ "$choice" -eq 0 ] && return
-
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
+    echo -ne "${GREEN}选择编号 (0 返回): ${RESET}"
+    read choice
+    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ ]]; then
+        echo -e "${YELLOW}已取消${RESET}"; return
+    fi
+    if [ "$choice" -eq 0 ]; then return; fi
+    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
         echo -e "${RED}无效选择${RESET}"; pause; return
     fi
 
@@ -341,14 +353,16 @@ check_cert() {
 
     echo -ne "请选择要查看的域名编号 (0 返回): "
     read choice
-    [ "$choice" -eq 0 ] && return
-
-    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#DOMAINS[@]} ]; then
-        SELECTED=${DOMAINS[$((choice-1))]}
-        certbot certificates --cert-name "$SELECTED"
-    else
-        echo "无效选择"
+    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ ]]; then
+        echo -e "${YELLOW}已取消${RESET}"; return
     fi
+    if [ "$choice" -eq 0 ]; then return; fi
+    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
+        echo -e "${RED}无效选择${RESET}"; pause; return
+    fi
+
+    SELECTED=${DOMAINS[$((choice-1))]}
+    certbot certificates --cert-name "$SELECTED"
     pause
 }
 
@@ -399,7 +413,7 @@ uninstall_nginx() {
 # ------------------------------
 while true; do
     clear
-    echo -e "${GREEN}===== Nginx 管理脚本 =====${RESET}"
+    echo -e "${GREEN}===== Nginx V6 管理脚本 =====${RESET}"
     echo -e "${GREEN}1) 安装 Nginx + 证书${RESET}"
     echo -e "${GREEN}2) 添加配置${RESET}"
     echo -e "${GREEN}3) 修改配置${RESET}"

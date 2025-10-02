@@ -5,6 +5,7 @@
 
 GREEN="\033[32m"
 RESET="\033[0m"
+YELLOW="\033[33m"
 APP_NAME="mysql"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
@@ -24,18 +25,17 @@ pause() {
 function menu() {
     clear
     echo -e "${GREEN}=== MySQL 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1.  安装启动${RESET}"
-    echo -e "${GREEN}2.  更新${RESET}"
-    echo -e "${GREEN}3.  卸载${RESET}"
-    echo -e "${GREEN}4.  查看日志${RESET}"
-    echo -e "${GREEN}5.  创建新数据库${RESET}"
-    echo -e "${GREEN}6.  创建用户并授权${RESET}"
-    echo -e "${GREEN}7.  一键创建数据库+用户+授权${RESET}"
-    echo -e "${GREEN}8.  查看数据库信息${RESET}"
-    echo -e "${GREEN}9.  备份数据库${RESET}"
+    echo -e "${GREEN} 1. 安装启动${RESET}"
+    echo -e "${GREEN} 2. 更新${RESET}"
+    echo -e "${GREEN} 3. 卸载${RESET}"
+    echo -e "${GREEN} 4. 查看日志${RESET}"
+    echo -e "${GREEN} 5. 创建新数据库${RESET}"
+    echo -e "${GREEN} 6. 创建用户并授权${RESET}"
+    echo -e "${GREEN} 7. 一键创建数据库+用户+授权${RESET}"
+    echo -e "${GREEN} 8. 查看数据库信息${RESET}"
+    echo -e "${GREEN} 9. 备份数据库${RESET}"
     echo -e "${GREEN}10. 恢复数据库${RESET}"
-    echo -e "${GREEN}0.  退出${RESET}"
-    echo -e "${GREEN}=======================${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
     read -p "请选择: " choice
     case $choice in
         1) install_app ;;
@@ -130,7 +130,7 @@ function create_database() {
 CREATE DATABASE IF NOT EXISTS \`$new_db\` CHARACTER SET $charset COLLATE ${charset}_general_ci;
 EOF
 
-    echo -e "${GREEN}✅ 数据库 $new_db 已创建 (字符集: $charset)${RESET}"
+    echo -e "${YELLOW}✅ 数据库 $new_db 已创建 (字符集: $charset)${RESET}"
     pause
     menu
 }
@@ -139,7 +139,7 @@ EOF
 function create_user() {
     source "$CONFIG_FILE"
     read -p "请输入新用户名: " new_user
-    read -p "请输入新用户密码 [留空自动生成]: " new_pass
+    read -p "请输入新用户密码: " new_pass
     new_pass=${new_pass:-$(gen_pass)}
     read -p "请输入要授权的数据库名: " grant_db
 
@@ -149,7 +149,7 @@ GRANT ALL PRIVILEGES ON \`$grant_db\`.* TO '$new_user'@'%';
 FLUSH PRIVILEGES;
 EOF
 
-    echo -e "${GREEN}✅ 用户 $new_user 已创建，并对数据库 $grant_db 授予全部权限${RESET}"
+    echo -e "${YELLOW}✅ 用户 $new_user 已创建，并对数据库 $grant_db 授予全部权限${RESET}"
     pause
     menu
 }
@@ -161,7 +161,7 @@ function create_db_user() {
     read -p "请输入字符集(默认utf8mb4): " charset
     charset=${charset:-utf8mb4}
     read -p "请输入新用户名: " new_user
-    read -p "请输入新用户密码 [留空自动生成]: " new_pass
+    read -p "请输入新用户密码: " new_pass
     new_pass=${new_pass:-$(gen_pass)}
 
     docker exec -i mysql mysql -uroot -p"$ROOT_PASSWORD" <<EOF
@@ -171,8 +171,8 @@ GRANT ALL PRIVILEGES ON \`$new_db\`.* TO '$new_user'@'%';
 FLUSH PRIVILEGES;
 EOF
 
-    echo -e "${GREEN}✅ 数据库 $new_db 已创建 (字符集: $charset)${RESET}"
-    echo -e "${GREEN}✅ 用户 $new_user 已创建，并拥有数据库 $new_db 的全部权限${RESET}"
+    echo -e "${YELLOW}✅ 数据库 $new_db 已创建 (字符集: $charset)${RESET}"
+    echo -e "${YELLOW}✅ 用户 $new_user 已创建，并拥有数据库 $new_db 的全部权限${RESET}"
     pause
     menu
 }
@@ -184,7 +184,7 @@ function backup_db() {
     read -p "请输入要备份的数据库名: " db
     BACKUP_FILE="$BACKUP_DIR/${db}_$(date +%Y%m%d%H%M%S).sql"
     docker exec -i mysql mysqldump -uroot -p"$ROOT_PASSWORD" "$db" > "$BACKUP_FILE"
-    echo -e "${GREEN}✅ 数据库 $db 已备份到 $BACKUP_FILE${RESET}"
+    echo -e "${YELLOW}✅ 数据库 $db 已备份到 $BACKUP_FILE${RESET}"
     pause
     menu
 }
@@ -196,7 +196,7 @@ function restore_db() {
     ls -1 "$BACKUP_DIR"
     read -p "请输入要恢复的备份文件名: " file
     docker exec -i mysql mysql -uroot -p"$ROOT_PASSWORD" < "$BACKUP_DIR/$file"
-    echo -e "${GREEN}✅ 数据库已从 $file 恢复${RESET}"
+    echo -e "${YELLOW}✅ 数据库已从 $file 恢复${RESET}"
     pause
     menu
 }
@@ -204,18 +204,10 @@ function restore_db() {
 # ==================== 查看信息 ====================
 function show_info() {
     source "$CONFIG_FILE"
-
-    # 获取公网 IP（用可靠免费接口）
-    HOST_IP=$(curl -s https://ifconfig.me 2>/dev/null)
-    if [[ -z "$HOST_IP" ]]; then
-        # 公网 IP 获取失败，使用局域网 IP
-        HOST_IP=$(hostname -I | awk '{print $1}')
-    fi
-
     echo -e "${GREEN}📦 数据目录: $APP_DIR/data${RESET}"
     echo -e "${GREEN}⚙️ 配置目录: $APP_DIR/config${RESET}"
-    echo -e "${GREEN}🔑 root 密码: $ROOT_PASSWORD${RESET}"
-    echo -e "${GREEN}🌐 连接地址: $HOST_IP:$PORT${RESET}"
+    echo -e "${YELLOW}🔑 root 密码: $ROOT_PASSWORD${RESET}"
+    echo -e "${YELLOW}地址: $(hostname -I | awk '{print $1}')${RESET}"
 
     # 列出已创建数据库
     echo -e "${GREEN}📂 已创建数据库:${RESET}"

@@ -207,6 +207,7 @@ function show_info() {
     echo -e "${GREEN}📦 数据目录: $APP_DIR/data${RESET}"
     echo -e "${GREEN}⚙️ 配置目录: $APP_DIR/config${RESET}"
     echo -e "${YELLOW}🔑 root 密码: $ROOT_PASSWORD${RESET}"
+    echo -e "${YELLOW}端口: $PORT ${RESET}"
     echo -e "${YELLOW}地址: $(hostname -I | awk '{print $1}')${RESET}"
 
     # 列出已创建数据库

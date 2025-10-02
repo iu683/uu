@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# One-API 一键管理脚本 (Docker Compose)
+# One-API 一键管理脚本 (Docker Compose) - 可选MySQL版 (含检测)
 # ========================================
 
 GREEN="\033[32m"
@@ -34,36 +34,71 @@ function menu() {
     esac
 }
 
+function check_mysql() {
+    echo -e "${YELLOW}🔍 正在检测 MySQL 连接...${RESET}"
+    if ! command -v mysqladmin >/dev/null 2>&1; then
+        echo -e "${YELLOW}⚠️ 未检测到 mysqladmin，正在尝试安装...${RESET}"
+        if command -v apt >/dev/null 2>&1; then
+            apt update && apt install -y mysql-client
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y mysql
+        else
+            echo -e "${RED}❌ 无法安装 mysqladmin，请手动安装 mysql-client${RESET}"
+            return 1
+        fi
+    fi
+
+    mysqladmin -h"$MYSQL_HOST" -P"$MYSQL_PORT" -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" ping --silent >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✅ MySQL 连接成功${RESET}"
+        return 0
+    else
+        echo -e "${RED}❌ 无法连接到 MySQL，请检查地址/端口/用户名/密码${RESET}"
+        return 1
+    fi
+}
+
 function install_app() {
-    mkdir -p "$APP_DIR"/{data,logs,mysql}
+    mkdir -p "$APP_DIR"/{data,logs}
 
     # 输入参数
     read -p "请输入 Web 端口 [默认:3000]: " input_port
     PORT=${input_port:-3000}
 
-    read -p "请输入 MySQL root 密码 [默认:123456]: " input_root_pass
-    MYSQL_ROOT_PASSWORD=${input_root_pass:-123456}
-
-    read -p "请输入 OneAPI 数据库名 [默认:one_api]: " input_db
-    MYSQL_DATABASE=${input_db:-one_api}
-
-    read -p "请输入 OneAPI 用户名 [默认:oneuser]: " input_user
-    MYSQL_USER=${input_user:-oneuser}
-
-    read -p "请输入 OneAPI 用户密码 [默认:password]: " input_user_pass
-    MYSQL_PASSWORD=${input_user_pass:-password}
-
     read -p "请输入 SESSION_SECRET (随机字符串, 默认随机生成): " input_secret
     SESSION_SECRET=${input_secret:-$(openssl rand -hex 16)}
+
+    echo -e "${YELLOW}是否使用外部 MySQL？(回车默认使用 SQLite)${RESET}"
+    read -p "输入 y 表示使用外部 MySQL: " use_mysql
+
+    SQL_DSN=""
+    if [[ "$use_mysql" == "y" || "$use_mysql" == "Y" ]]; then
+        read -p "请输入 MySQL 地址 [默认:127.0.0.1]: " input_host
+        MYSQL_HOST=${input_host:-127.0.0.1}
+
+        read -p "请输入 MySQL 端口 [默认:3306]: " input_port
+        MYSQL_PORT=${input_port:-3306}
+
+        read -p "请输入 MySQL 用户名 [默认:root]: " input_user
+        MYSQL_USER=${input_user:-root}
+
+        read -p "请输入 MySQL 密码 [默认:123456]: " input_pass
+        MYSQL_PASSWORD=${input_pass:-123456}
+
+        read -p "请输入 MySQL 数据库名 [默认:one_api]: " input_db
+        MYSQL_DATABASE=${input_db:-one_api}
+
+        SQL_DSN="${MYSQL_USER}:${MYSQL_PASSWORD}@tcp(${MYSQL_HOST}:${MYSQL_PORT})/${MYSQL_DATABASE}?charset=utf8mb4&parseTime=True&loc=Local"
+
+        # 检测 MySQL 是否可连
+        check_mysql || { read -p "按回车返回菜单..."; menu; }
+    fi
 
     # 写 config.env
     cat > "$CONFIG_FILE" <<EOF
 PORT=$PORT
-MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD
-MYSQL_DATABASE=$MYSQL_DATABASE
-MYSQL_USER=$MYSQL_USER
-MYSQL_PASSWORD=$MYSQL_PASSWORD
 SESSION_SECRET=$SESSION_SECRET
+SQL_DSN=$SQL_DSN
 EOF
 
     # 写 docker-compose.yml
@@ -81,30 +116,21 @@ services:
       - ./data:/data
       - ./logs:/app/logs
     environment:
-      - SQL_DSN=\${MYSQL_USER}:\${MYSQL_PASSWORD}@tcp(mysql:3306)/\${MYSQL_DATABASE}?charset=utf8mb4&parseTime=True&loc=Local
-      - REDIS_CONN_STRING=redis://redis
       - SESSION_SECRET=\${SESSION_SECRET}
+      - REDIS_CONN_STRING=redis://redis
       - TZ=Asia/Shanghai
-    depends_on:
-      - redis
-      - mysql
+EOF
+
+    if [[ -n "$SQL_DSN" ]]; then
+        echo "      - SQL_DSN=\${SQL_DSN}" >> "$COMPOSE_FILE"
+    fi
+
+    cat >> "$COMPOSE_FILE" <<EOF
 
   redis:
     image: redis:latest
     container_name: redis
     restart: always
-
-  mysql:
-    image: mysql:8.2
-    container_name: mysql
-    restart: always
-    environment:
-      MYSQL_ROOT_PASSWORD: \${MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE: \${MYSQL_DATABASE}
-      MYSQL_USER: \${MYSQL_USER}
-      MYSQL_PASSWORD: \${MYSQL_PASSWORD}
-    volumes:
-      - ./mysql:/var/lib/mysql
 EOF
 
     cd "$APP_DIR"
@@ -114,9 +140,12 @@ EOF
     echo -e "${YELLOW}🌐 Web UI 地址: http://127.0.0.1:$PORT${RESET}"
     echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
     echo -e "${GREEN}📂 日志目录: $APP_DIR/logs${RESET}"
-    echo -e "${GREEN}🗄️ 数据库: $MYSQL_DATABASE (用户: $MYSQL_USER 密码: $MYSQL_PASSWORD)${RESET}"
     echo -e "${GREEN}🔑 SESSION_SECRET: $SESSION_SECRET${RESET}"
-    echo -e "${GREEN}提示: 数据库初始化需要时间，请等待一分钟再访问${RESET}"
+    if [[ -n "$SQL_DSN" ]]; then
+        echo -e "${GREEN}🗄️ 使用外部 MySQL 数据库: $MYSQL_DATABASE (主机: $MYSQL_HOST:$MYSQL_PORT 用户: $MYSQL_USER)${RESET}"
+    else
+        echo -e "${YELLOW}📦 当前使用 SQLite 本地数据库 (文件存储在 ./data 目录)${RESET}"
+    fi
     read -p "按回车返回菜单..."
     menu
 }

@@ -1,28 +1,187 @@
 #!/bin/bash
-# ========================================
-# new-api 一键管理脚本 (Docker Compose) - 可选MySQL版 (含检测)
-# ========================================
+# ==========================================
+# Poste.io 一键管理脚本 (Docker)
+# ==========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
+BLUE="\033[36m"
 
-APP_NAME="new-api"
+APP_NAME="posteio"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.env"
 
-function menu() {
+check_root() {
+    if [ "$(id -u)" != "0" ]; then
+        echo -e "${RED}错误: 请使用root用户运行此脚本${RESET}"
+        exit 1
+    fi
+}
+
+check_docker() {
+    export PATH=$PATH:/usr/local/bin
+    if ! command -v docker &> /dev/null; then
+        echo "正在安装 Docker..."
+        curl -fsSL https://get.docker.com | sh || { echo "Docker 安装失败"; exit 1; }
+    fi
+    if ! command -v docker-compose &> /dev/null; then
+        echo "正在安装 Docker Compose..."
+        curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose || { echo "Docker Compose 下载失败"; exit 1; }
+        chmod +x /usr/local/bin/docker-compose
+    fi
+}
+
+check_port() {
+    local port=$1
+    if lsof -i:$port &> /dev/null; then
+        echo -e "✗ 端口 $port........ ${RED}被占用${RESET}"
+    else
+        echo -e "✓ 端口 $port........ ${GREEN}可用${RESET}"
+    fi
+}
+
+check_ports() {
+    echo -e "${YELLOW}=== 关键端口检查 ===${RESET}"
+    for p in 25 587 110 143 993 995 465 80 443; do
+        check_port $p
+    done
+}
+
+show_dns_info() {
+    local domain=$1
+    local ip=$(curl -s ifconfig.me)
+    local root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+    echo -e "\n${BLUE}================ DNS 配置参考 ================${RESET}"
+    echo -e "${GREEN}▶ A       mail      ${ip}${RESET}"
+    echo -e "${GREEN}▶ CNAME   imap      ${domain}${RESET}"
+    echo -e "${GREEN}▶ CNAME   pop       ${domain}${RESET}"
+    echo -e "${GREEN}▶ CNAME   smtp      ${domain}${RESET}"
+    echo -e "${GREEN}▶ MX      @         ${domain}${RESET}"
+    echo -e "${GREEN}▶ TXT     @         v=spf1 mx ~all${RESET}"
+    echo -e "${GREEN}▶ TXT     _dmarc    v=DMARC1; p=none; rua=mailto:admin@${root_domain}${RESET}"
+    echo -e "${BLUE}===============================================${RESET}"
+}
+
+install_app() {
+    read -p "请输入邮箱域名 (例如: mail.example.com): " domain
+    read -p "请输入 Web HTTP 端口 [默认:8808]: " web_port
+    WEB_PORT=${web_port:-8808}
+    read -p "请输入 Web HTTPS 端口 [默认:8843]: " https_port
+    HTTPS_PORT=${https_port:-8843}
+
+    mkdir -p "$APP_DIR/mail-data"
+    cd "$APP_DIR" || exit 1
+
+    # 生成 docker-compose.yml
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  mailserver:
+    image: analogic/poste.io
+    hostname: ${domain}
+    ports:
+      - "25:25"
+      - "110:110"
+      - "143:143"
+      - "587:587"
+      - "993:993"
+      - "995:995"
+      - "4190:4190"
+      - "465:465"
+      - "${WEB_PORT}:80"
+      - "${HTTPS_PORT}:443"
+    environment:
+      - LETSENCRYPT_EMAIL=admin@${domain}
+      - LETSENCRYPT_HOST=${domain}
+      - VIRTUAL_HOST=${domain}
+      - DISABLE_CLAMAV=TRUE
+      - DISABLE_RSPAMD=TRUE
+      - TZ=Asia/Shanghai
+      - HTTPS=OFF
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ./mail-data:/data
+EOF
+
+    echo -e "${BLUE}正在启动 Poste.io 服务...${RESET}"
+    docker-compose up -d
+    echo -e "${GREEN}✅ 服务已启动${RESET}"
+
+    # 显示 DNS 信息
+    show_dns_info "$domain"
+
+    # 默认管理员账号提示
+    admin_email="admin@${domain#mail.}"
+    echo -e "${YELLOW}访问 Web 邮局: http://${domain}:${WEB_PORT}${RESET}"
+    echo -e "${YELLOW}访问管理后台: https://${domain}:${HTTPS_PORT}/admin${RESET}"
+    echo -e "${YELLOW}默认管理员邮箱: ${admin_email}${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+    if [ -d "$APP_DIR" ]; then
+        cd "$APP_DIR" || exit 1
+        echo -e "${BLUE}正在重启 Poste.io 服务...${RESET}"
+        docker-compose restart
+        echo -e "${GREEN}✅ 服务已重启${RESET}"
+    else
+        echo -e "${RED}未检测到安装目录，请先安装${RESET}"
+    fi
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    if [ -d "$APP_DIR" ]; then
+        cd "$APP_DIR" || exit 1
+        echo -e "${BLUE}显示 Poste.io 容器日志 (Ctrl+C 退出)...${RESET}"
+        docker-compose logs -f
+    else
+        echo -e "${RED}未检测到安装目录，请先安装${RESET}"
+    fi
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+    if [ -d "$APP_DIR" ]; then
+        cd "$APP_DIR" || exit 1
+        echo -e "${BLUE}正在更新 Poste.io 服务...${RESET}"
+        docker-compose pull
+        docker-compose up -d
+        echo -e "${GREEN}✅ 服务已更新${RESET}"
+    else
+        echo -e "${RED}未检测到安装目录，请先安装${RESET}"
+    fi
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    if [ -d "$APP_DIR" ]; then
+        cd "$APP_DIR" || exit 1
+        echo -e "${BLUE}正在卸载 Poste.io 服务...${RESET}"
+        docker-compose down
+        docker images | awk '/poste\.io/ {print $3}' | xargs -r docker rmi -f
+        rm -rf "$APP_DIR"
+        echo -e "${RED}✅ 已卸载服务及数据${RESET}"
+    else
+        echo -e "${RED}未检测到安装目录${RESET}"
+    fi
+    read -p "按回车返回菜单..."
+}
+
+menu() {
     clear
-    echo -e "${GREEN}=== new-api 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
+    check_docker
+    check_ports
+    echo -e "${GREEN}=== Poste.io 邮件服务器管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装/启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 重启${RESET}"
     echo -e "${GREEN}4) 查看日志${RESET}"
     echo -e "${GREEN}5) 卸载(含数据)${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    read -rp "请选择: " choice
+    read -p "请选择: " choice
     case $choice in
         1) install_app ;;
         2) update_app ;;
@@ -30,158 +189,10 @@ function menu() {
         4) view_logs ;;
         5) uninstall_app ;;
         0) exit 0 ;;
-        *) echo "无效选择"; sleep 1; menu ;;
+        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
     esac
-}
-
-function check_mysql() {
-    echo -e "${YELLOW}🔍 正在检测 MySQL 连接...${RESET}"
-    if ! command -v mysqladmin >/dev/null 2>&1; then
-        echo -e "${YELLOW}⚠️ 未检测到 mysqladmin，正在尝试安装...${RESET}"
-        if command -v apt >/dev/null 2>&1; then
-            apt update && apt install -y mysql-client
-        elif command -v yum >/dev/null 2>&1; then
-            yum install -y mysql
-        else
-            echo -e "${RED}❌ 无法安装 mysqladmin，请手动安装 mysql-client${RESET}"
-            return 1
-        fi
-    fi
-
-    mysqladmin -h"$MYSQL_HOST" -P"$MYSQL_PORT" -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" ping --silent >/dev/null 2>&1
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}✅ MySQL 连接成功${RESET}"
-        return 0
-    else
-        echo -e "${RED}❌ 无法连接到 MySQL，请检查地址/端口/用户名/密码${RESET}"
-        return 1
-    fi
-}
-
-function install_app() {
-    mkdir -p "$APP_DIR"/{data,logs}
-
-    read -p "请输入 Web 端口 [默认:3000]: " PORT
-    PORT=${PORT:-3000}
-
-    read -p "请输入 SESSION_SECRET (随机字符串, 默认随机生成): " SESSION_SECRET
-    SESSION_SECRET=${SESSION_SECRET:-$(openssl rand -hex 16)}
-
-    echo -e "${YELLOW}是否使用外部 MySQL？(回车默认使用 SQLite)${RESET}"
-    read -p "输入 y 表示使用外部 MySQL: " use_mysql
-
-    SQL_DSN=""
-    if [[ "$use_mysql" == "y" || "$use_mysql" == "Y" ]]; then
-        read -p "请输入 MySQL 地址 [默认:127.0.0.1]: " MYSQL_HOST
-        MYSQL_HOST=${MYSQL_HOST:-127.0.0.1}
-
-        read -p "请输入 MySQL 端口 [默认:3306]: " MYSQL_PORT
-        MYSQL_PORT=${MYSQL_PORT:-3306}
-
-        read -p "请输入 MySQL 用户名 [默认:root]: " MYSQL_USER
-        MYSQL_USER=${MYSQL_USER:-root}
-
-        read -p "请输入 MySQL 密码 [默认:123456]: " MYSQL_PASSWORD
-        MYSQL_PASSWORD=${MYSQL_PASSWORD:-123456}
-
-        read -p "请输入 MySQL 数据库名 [默认:new_api]: " MYSQL_DATABASE
-        MYSQL_DATABASE=${MYSQL_DATABASE:-new_api}
-
-        SQL_DSN="${MYSQL_USER}:${MYSQL_PASSWORD}@tcp(${MYSQL_HOST}:${MYSQL_PORT})/${MYSQL_DATABASE}?charset=utf8mb4&parseTime=True&loc=Local"
-
-        # 检测 MySQL 是否可连
-        check_mysql || { read -p "按回车返回菜单..."; menu; }
-    fi
-
-    # 写 config.env
-    cat > "$CONFIG_FILE" <<EOF
-PORT=$PORT
-SESSION_SECRET=$SESSION_SECRET
-SQL_DSN=$SQL_DSN
-EOF
-
-    # 写 docker-compose.yml
-    cat > "$COMPOSE_FILE" <<EOF
-
-services:
-  new-api:
-    image: calciumion/new-api:latest
-    container_name: new-api
-    restart: always
-    command: --log-dir /app/logs
-    ports:
-      - "127.0.0.1:\${PORT}:3000"
-    volumes:
-      - ./data:/data
-      - ./logs:/app/logs
-    environment:
-      - SESSION_SECRET=\${SESSION_SECRET}
-      - REDIS_CONN_STRING=redis://redis
-      - TZ=Asia/Shanghai
-EOF
-
-    if [[ -n "$SQL_DSN" ]]; then
-        echo "      - SQL_DSN=\${SQL_DSN}" >> "$COMPOSE_FILE"
-    fi
-
-    cat >> "$COMPOSE_FILE" <<EOF
-
-  redis:
-    image: redis:latest
-    container_name: redis
-    restart: always
-EOF
-
-    cd "$APP_DIR"
-    docker compose --env-file "$CONFIG_FILE" up -d
-
-    echo -e "${GREEN}✅ new-api 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Web UI 地址: http://127.0.0.1:$PORT${RESET}"
-    echo -e "${GREEN}🔑 账号/密码: root/123456${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
-    echo -e "${GREEN}📂 日志目录: $APP_DIR/logs${RESET}"
-    echo -e "${GREEN}🔑 SESSION_SECRET: $SESSION_SECRET${RESET}"
-    echo -e "${GREEN}提示: 数据库初始化需要时间，请等待一分钟再访问${RESET}"
-    if [[ -n "$SQL_DSN" ]]; then
-        echo -e "${GREEN}🗄️ 使用外部 MySQL 数据库: $MYSQL_DATABASE (主机: $MYSQL_HOST:$MYSQL_PORT 用户: $MYSQL_USER)${RESET}"
-    else
-        echo -e "${YELLOW}📦 当前使用 SQLite 本地数据库 (文件存储在 ./data 目录)${RESET}"
-    fi
-
-    read -p "按回车返回菜单..."
     menu
 }
 
-function update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
-    docker compose --env-file "$CONFIG_FILE" pull
-    docker compose --env-file "$CONFIG_FILE" up -d
-    echo -e "${GREEN}✅ new-api 已更新并重启完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function restart_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
-    docker compose --env-file "$CONFIG_FILE" restart
-    echo -e "${GREEN}✅ new-api 已重启${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function view_logs() {
-    docker logs -f new-api
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function uninstall_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose --env-file "$CONFIG_FILE" down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ new-api 已卸载，数据已删除${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
+check_root
 menu

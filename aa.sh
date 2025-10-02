@@ -78,7 +78,7 @@ services:
     image: mysql:5.7
     restart: always
     ports:
-      - "3306:3306"   # 取消127.0.0.1绑定，可远程访问
+      - "3306:3306"   # 可远程访问
     environment:
       - MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD
       - TZ=Asia/Shanghai
@@ -100,24 +100,31 @@ EOF
     cd "$APP_DIR"
     docker compose up -d
 
-    # 等待 MySQL 启动
+    # 等待 MySQL 启动（使用 TCP 连接，避免 socket 问题）
     echo "⏳ 等待 MySQL 启动..."
-    for i in {1..20}; do
-        docker exec dnsmgr-mysql mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" &>/dev/null
+    for i in {1..30}; do
+        docker exec dnsmgr-mysql mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" -h127.0.0.1 &>/dev/null
         if [ $? -eq 0 ]; then
+            echo -e "${GREEN}MySQL 已启动${RESET}"
             break
         fi
         sleep 2
+        if [ $i -eq 30 ]; then
+            echo -e "${RED}❌ MySQL 启动超时，请检查容器日志${RESET}"
+            docker logs -f dnsmgr-mysql --tail 20
+            read -p "按回车返回菜单..."
+            menu
+        fi
     done
 
     # 创建数据库和用户
-    docker exec dnsmgr-mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
-    docker exec dnsmgr-mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "CREATE USER IF NOT EXISTS '$DB_USER'@'%' IDENTIFIED BY '$DB_PASSWORD';"
-    docker exec dnsmgr-mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'%';"
-    docker exec dnsmgr-mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "FLUSH PRIVILEGES;"
+    docker exec dnsmgr-mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -h127.0.0.1 -e "CREATE DATABASE IF NOT EXISTS \`$DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
+    docker exec dnsmgr-mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -h127.0.0.1 -e "CREATE USER IF NOT EXISTS '$DB_USER'@'%' IDENTIFIED BY '$DB_PASSWORD';"
+    docker exec dnsmgr-mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -h127.0.0.1 -e "GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'%';"
+    docker exec dnsmgr-mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -h127.0.0.1 -e "FLUSH PRIVILEGES;"
 
     # 测试用户连接
-    docker exec dnsmgr-mysql mysql -u"$DB_USER" -p"$DB_PASSWORD" -e "USE \`$DB_NAME\`;" &>/dev/null
+    docker exec dnsmgr-mysql mysql -u"$DB_USER" -p"$DB_PASSWORD" -h127.0.0.1 -e "USE \`$DB_NAME\`;" &>/dev/null
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}✅ 数据库 $DB_NAME 和用户 $DB_USER 创建成功，并可连接${RESET}"
     else
@@ -128,6 +135,7 @@ EOF
     echo -e "${GREEN}🔑 数据库连接信息如下:${RESET}"
     echo -e "${GREEN}地址: $(hostname -I | awk '{print $1}')${RESET}"
     echo -e "${GREEN}端口: 3306${RESET}"
+    echo -e "${GREEN}root密码: $MYSQL_ROOT_PASSWORD${RESET}"
     echo -e "${GREEN}数据库名: $DB_NAME${RESET}"
     echo -e "${GREEN}用户名: $DB_USER${RESET}"
     echo -e "${GREEN}密码: $DB_PASSWORD${RESET}"

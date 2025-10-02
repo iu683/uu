@@ -33,22 +33,30 @@ check_docker() {
     fi
 }
 
-
-
-# ==================== 端口检测 ====================
 check_port() {
     local port=$1
-    local timeout=3
-    nc -z -w $timeout 8.8.8.8 $port &>/dev/null
-    if [ $? -eq 0 ]; then
-        echo -e "${YELLOW}✓ 端口 $port........ ${GREEN}可访问${RESET}"
+    if lsof -i:$port &> /dev/null; then
+        echo -e "${YELLOW}✗ 端口 $port........ ${RED}被占用${RESET}"
     else
-        echo -e "${YELLOW}✗ 端口 $port........ ${RED}不可访问${RESET}"
+        echo -e "${YELLOW}✓ 端口 $port........ ${GREEN}可用${RESET}"
     fi
 }
 
+# ==================== 端口检测 ====================
 port_check() {
     echo -e "${YELLOW}端口检测${RESET}"
+    # 检测 timeout 是否安装
+    if ! command -v timeout &>/dev/null; then
+        echo -e "${YELLOW}检测到系统未安装 timeout，正在安装...${RESET}"
+        if [ -x "$(command -v apt)" ]; then
+            apt update && apt install -y coreutils
+        elif [ -x "$(command -v yum)" ]; then
+            yum install -y coreutils
+        else
+            echo -e "${RED}无法自动安装 timeout，请手动安装 coreutils${RESET}"
+            return
+        fi
+    fi
     # 远程 SMTP 25 端口检测
     port=25
     timeout=3
@@ -59,13 +67,14 @@ port_check() {
         echo -e "${YELLOW}✗ 端口 $port........ ${RED}不可访问外网SMTP${RESET}"
     fi
 
-    # 检测其他常用端口
+    # 其他常用端口检测（只看能否连通）
     for port in 587 110 143 993 995 465 80 443; do
         check_port $port
     done
 
     read -p "按回车返回菜单..."
 }
+
 show_dns_info() {
     local domain=$1
     local ip=$(curl -s ifconfig.me)

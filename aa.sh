@@ -1,181 +1,235 @@
 #!/bin/bash
 # ========================================
-# DNSMgr 一键管理脚本 (Docker Compose)
+# MySQL 一键管理脚本 (Docker Compose) - 完整安全版
 # ========================================
 
 GREEN="\033[32m"
-RED="\033[31m"
 RESET="\033[0m"
 YELLOW="\033[33m"
-
-APP_NAME="dnsmgr"
+APP_NAME="mysql"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 CONFIG_FILE="$APP_DIR/config.env"
+BACKUP_DIR="$APP_DIR/backup"
 
+# 随机密码生成函数
+gen_pass() {
+    tr -dc A-Za-z0-9 </dev/urandom | head -c 16
+}
+
+pause() {
+    read -p "按回车返回菜单..."
+}
+
+# ==================== 菜单 ====================
 function menu() {
     clear
-    echo -e "${GREEN}=== DNSMgr 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载(含数据)${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 重启${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    read -rp "请选择: " choice
+    echo -e "${GREEN}=== MySQL 管理菜单 ===${RESET}"
+    echo -e "${GREEN} 1. 安装启动${RESET}"
+    echo -e "${GREEN} 2. 更新${RESET}"
+    echo -e "${GREEN} 3. 卸载${RESET}"
+    echo -e "${GREEN} 4. 查看日志${RESET}"
+    echo -e "${GREEN} 5. 创建新数据库${RESET}"
+    echo -e "${GREEN} 6. 创建用户并授权${RESET}"
+    echo -e "${GREEN} 7. 一键创建数据库+用户+授权${RESET}"
+    echo -e "${GREEN} 8. 查看数据库信息${RESET}"
+    echo -e "${GREEN} 9. 备份数据库${RESET}"
+    echo -e "${GREEN}10. 恢复数据库${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    read -p "请选择: " choice
     case $choice in
         1) install_app ;;
         2) update_app ;;
         3) uninstall_app ;;
         4) view_logs ;;
-        5) restart_app ;;
+        5) create_database ;;
+        6) create_user ;;
+        7) create_db_user ;;
+        8) show_info ;;
+        9) backup_db ;;
+        10) restore_db ;;
         0) exit 0 ;;
         *) echo "无效选择"; sleep 1; menu ;;
     esac
 }
 
+# ==================== 安装 ====================
 function install_app() {
-    mkdir -p "$APP_DIR/mysql/conf" "$APP_DIR/mysql/data" "$APP_DIR/mysql/logs" "$APP_DIR/web"
+    read -p "请输入 MySQL 端口 [默认:3306]: " input_port
+    PORT=${input_port:-3306}
 
-    # Web端口
-    read -rp "请输入 Web 端口 [默认:8081]: " input_web
-    WEB_PORT=${input_web:-8081}
+    read -p "请输入 MySQL root 密码 [留空自动生成]: " input_pass
+    ROOT_PASSWORD=${input_pass:-$(gen_pass)}
 
-    # MySQL root 密码
-    read -rp "请输入 MySQL root 密码 [默认:123456]: " input_root
-    MYSQL_ROOT_PASSWORD=${input_root:-123456}
+    mkdir -p "$APP_DIR/data" "$APP_DIR/config" "$BACKUP_DIR"
 
-    # 数据库名
-    read -rp "请输入要创建的数据库名 [默认:dnsmgr]: " input_db
-    DB_NAME=${input_db:-dnsmgr}
-
-    # 数据库用户和密码
-    read -rp "请输入数据库用户名 [默认:dnsmgruser]: " input_user
-    DB_USER=${input_user:-dnsmgruser}
-    read -rp "请输入数据库用户密码 [默认:dnsmgrpass]: " input_user_pass
-    DB_PASSWORD=${input_user_pass:-dnsmgrpass}
-
-    # 生成docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
-
 services:
-  dnsmgr-web:
-    container_name: dnsmgr-web
-    stdin_open: true
-    tty: true
-    image: netcccyun/dnsmgr
-    depends_on:
-      - dnsmgr-mysql
-    ports:
-      - "127.0.0.1:$WEB_PORT:80"
-    volumes:
-      - $APP_DIR/web:/app/www
-    networks:
-      - dnsmgr-network
-
-  dnsmgr-mysql:
-    container_name: dnsmgr-mysql
-    image: mysql:5.7
+  mysql-db:
+    container_name: mysql
+    image: mysql:8.0
     restart: always
     ports:
-      - "3306:3306"   # 可远程访问
+      - "${PORT}:3306"
     environment:
-      - MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD
-      - TZ=Asia/Shanghai
+      MYSQL_ROOT_PASSWORD: ${ROOT_PASSWORD}
     volumes:
-      - $APP_DIR/mysql/conf/my.cnf:/etc/mysql/my.cnf
-      - $APP_DIR/mysql/logs:/logs
-      - $APP_DIR/mysql/data:/var/lib/mysql
-    networks:
-      - dnsmgr-network
-
-networks:
-  dnsmgr-network:
-    driver: bridge
+      - ./data:/var/lib/mysql
+      - ./config:/etc/mysql/conf.d
 EOF
 
-    # 保存配置
-    echo -e "WEB_PORT=$WEB_PORT\nMYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD\nDB_NAME=$DB_NAME\nDB_USER=$DB_USER\nDB_PASSWORD=$DB_PASSWORD" > "$CONFIG_FILE"
+    cat > "$CONFIG_FILE" <<EOF
+PORT=$PORT
+ROOT_PASSWORD=$ROOT_PASSWORD
+EOF
 
     cd "$APP_DIR"
     docker compose up -d
 
-    # 等待 MySQL 启动（使用 TCP 连接，避免 socket 问题）
-    echo "⏳ 等待 MySQL 启动..."
-    for i in {1..30}; do
-        docker exec dnsmgr-mysql mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" -h127.0.0.1 &>/dev/null
-        if [ $? -eq 0 ]; then
-            echo -e "${GREEN}MySQL 已启动${RESET}"
-            break
-        fi
-        sleep 2
-        if [ $i -eq 30 ]; then
-            echo -e "${RED}❌ MySQL 启动超时，请检查容器日志${RESET}"
-            docker logs -f dnsmgr-mysql --tail 20
-            read -p "按回车返回菜单..."
-            menu
-        fi
-    done
-
-    # 创建数据库和用户
-    docker exec dnsmgr-mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -h127.0.0.1 -e "CREATE DATABASE IF NOT EXISTS \`$DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
-    docker exec dnsmgr-mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -h127.0.0.1 -e "CREATE USER IF NOT EXISTS '$DB_USER'@'%' IDENTIFIED BY '$DB_PASSWORD';"
-    docker exec dnsmgr-mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -h127.0.0.1 -e "GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'%';"
-    docker exec dnsmgr-mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -h127.0.0.1 -e "FLUSH PRIVILEGES;"
-
-    # 测试用户连接
-    docker exec dnsmgr-mysql mysql -u"$DB_USER" -p"$DB_PASSWORD" -h127.0.0.1 -e "USE \`$DB_NAME\`;" &>/dev/null
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}✅ 数据库 $DB_NAME 和用户 $DB_USER 创建成功，并可连接${RESET}"
-    else
-        echo -e "${RED}❌ 数据库连接失败，请检查 MySQL 配置${RESET}"
-    fi
-
-    # 显示数据库连接信息
-    echo -e "${GREEN}🔑 数据库连接信息如下:${RESET}"
-    echo -e "${GREEN}地址: $(hostname -I | awk '{print $1}')${RESET}"
-    echo -e "${GREEN}端口: 3306${RESET}"
-    echo -e "${GREEN}root密码: $MYSQL_ROOT_PASSWORD${RESET}"
-    echo -e "${GREEN}数据库名: $DB_NAME${RESET}"
-    echo -e "${GREEN}用户名: $DB_USER${RESET}"
-    echo -e "${GREEN}密码: $DB_PASSWORD${RESET}"
-    echo -e "${YELLOW}Web UI 地址: http://127.0.0.1:$WEB_PORT${RESET}"
-    echo -e "${GREEN}数据目录: $APP_DIR${RESET}"
-
-    read -p "按回车返回菜单..."
+    echo -e "${GREEN}✅ MySQL 已启动${RESET}"
+    pause
     menu
 }
 
+# ==================== 更新 ====================
 function update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ DNSMgr 已更新并重启完成${RESET}"
-    read -p "按回车返回菜单..."
+    echo -e "${GREEN}✅ MySQL 已更新并重启完成${RESET}"
+    pause
     menu
 }
 
+# ==================== 卸载 ====================
 function uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ DNSMgr 已卸载，数据已删除${RESET}"
-    read -p "按回车返回菜单..."
+    echo -e "${GREEN}✅ MySQL 已卸载，数据已删除${RESET}"
+    pause
     menu
 }
 
+# ==================== 删除容器 ====================
+function remove_container() {
+    docker rm -f mysql
+    echo -e "${GREEN}✅ MySQL 容器已删除 (数据保留在 $APP_DIR/data)${RESET}"
+    pause
+    menu
+}
+
+# ==================== 创建数据库 ====================
+function create_database() {
+    source "$CONFIG_FILE"
+    read -p "请输入新数据库名: " new_db
+    read -p "请输入字符集(默认utf8mb4): " charset
+    charset=${charset:-utf8mb4}
+
+    docker exec -i mysql mysql -uroot -p"$ROOT_PASSWORD" <<EOF
+CREATE DATABASE IF NOT EXISTS \`$new_db\` CHARACTER SET $charset COLLATE ${charset}_general_ci;
+EOF
+
+    echo -e "${YELLOW}✅ 数据库 $new_db 已创建 (字符集: $charset)${RESET}"
+    pause
+    menu
+}
+
+# ==================== 创建用户并授权 ====================
+function create_user() {
+    source "$CONFIG_FILE"
+    read -p "请输入新用户名: " new_user
+    read -p "请输入新用户密码: " new_pass
+    new_pass=${new_pass:-$(gen_pass)}
+    read -p "请输入要授权的数据库名: " grant_db
+
+    docker exec -i mysql mysql -uroot -p"$ROOT_PASSWORD" <<EOF
+CREATE USER IF NOT EXISTS '$new_user'@'%' IDENTIFIED BY '$new_pass';
+GRANT ALL PRIVILEGES ON \`$grant_db\`.* TO '$new_user'@'%';
+FLUSH PRIVILEGES;
+EOF
+
+    echo -e "${YELLOW}✅ 用户 $new_user 已创建，并对数据库 $grant_db 授予全部权限${RESET}"
+    pause
+    menu
+}
+
+# ==================== 一键创建数据库+用户+授权 ====================
+function create_db_user() {
+    source "$CONFIG_FILE"
+    read -p "请输入新数据库名: " new_db
+    read -p "请输入字符集(默认utf8mb4): " charset
+    charset=${charset:-utf8mb4}
+    read -p "请输入新用户名: " new_user
+    read -p "请输入新用户密码: " new_pass
+    new_pass=${new_pass:-$(gen_pass)}
+
+    docker exec -i mysql mysql -uroot -p"$ROOT_PASSWORD" <<EOF
+CREATE DATABASE IF NOT EXISTS \`$new_db\` CHARACTER SET $charset COLLATE ${charset}_general_ci;
+CREATE USER IF NOT EXISTS '$new_user'@'%' IDENTIFIED BY '$new_pass';
+GRANT ALL PRIVILEGES ON \`$new_db\`.* TO '$new_user'@'%';
+FLUSH PRIVILEGES;
+EOF
+
+    echo -e "${YELLOW}✅ 数据库 $new_db 已创建 (字符集: $charset)${RESET}"
+    echo -e "${YELLOW}✅ 用户 $new_user 已创建，并拥有数据库 $new_db 的全部权限${RESET}"
+    pause
+    menu
+}
+
+# ==================== 备份数据库 ====================
+function backup_db() {
+    source "$CONFIG_FILE"
+    mkdir -p "$BACKUP_DIR"
+    read -p "请输入要备份的数据库名: " db
+    BACKUP_FILE="$BACKUP_DIR/${db}_$(date +%Y%m%d%H%M%S).sql"
+    docker exec -i mysql mysqldump -uroot -p"$ROOT_PASSWORD" "$db" > "$BACKUP_FILE"
+    echo -e "${YELLOW}✅ 数据库 $db 已备份到 $BACKUP_FILE${RESET}"
+    pause
+    menu
+}
+
+# ==================== 恢复数据库 ====================
+function restore_db() {
+    source "$CONFIG_FILE"
+    echo -e "${GREEN}备份文件列表:${RESET}"
+    ls -1 "$BACKUP_DIR"
+    read -p "请输入要恢复的备份文件名: " file
+    docker exec -i mysql mysql -uroot -p"$ROOT_PASSWORD" < "$BACKUP_DIR/$file"
+    echo -e "${YELLOW}✅ 数据库已从 $file 恢复${RESET}"
+    pause
+    menu
+}
+
+# ==================== 查看信息 ====================
+function show_info() {
+    source "$CONFIG_FILE"
+    echo -e "${GREEN}📦 数据目录: $APP_DIR/data${RESET}"
+    echo -e "${GREEN}⚙️ 配置目录: $APP_DIR/config${RESET}"
+    echo -e "${YELLOW}🔑 root 密码: $ROOT_PASSWORD${RESET}"
+    echo -e "${YELLOW}地址: $(hostname -I | awk '{print $1}')${RESET}"
+
+    # 列出已创建数据库
+    echo -e "${GREEN}📂 已创建数据库:${RESET}"
+    docker exec -i mysql mysql -uroot -p"$ROOT_PASSWORD" -e "SHOW DATABASES;" | tail -n +2
+
+    # 列出已创建用户
+    echo -e "${GREEN}👤 已创建用户:${RESET}"
+    docker exec -i mysql mysql -uroot -p"$ROOT_PASSWORD" -e "SELECT user, host FROM mysql.user;" | tail -n +2
+
+    pause
+    menu
+}
+
+
+
+
+# ==================== 查看日志 ====================
 function view_logs() {
-    docker logs -f dnsmgr-web
-    read -p "按回车返回菜单..."
+    docker logs -f mysql
+    pause
     menu
 }
 
-function restart_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
-    docker compose restart
-    echo -e "${GREEN}✅ DNSMgr 已重启完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
+# ==================== 启动菜单 ====================
 menu

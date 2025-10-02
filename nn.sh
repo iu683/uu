@@ -84,6 +84,7 @@ update_app() {
         menu
     fi
     cd "$APP_DIR"
+    git pull
     docker compose build
     docker compose up -d
     echo -e "${GREEN}✅ 已更新并重启完成${RESET}"

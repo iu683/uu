@@ -1,158 +1,105 @@
 #!/bin/bash
 # ========================================
-# vue-color-avatar 一键管理脚本 (Docker Compose)
+# 多项目 Docker Compose 管理脚本
 # ========================================
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="vue-color-avatar"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+PROJECTS_DIR="/opt"
 
-check_root() {
-    if [ "$(id -u)" != "0" ]; then
-        echo -e "${RED}请使用 root 用户运行脚本${RESET}"
+# ---------------------------
+# 选择项目
+# ---------------------------
+function select_project() {
+    clear
+    echo -e "${GREEN}=== 请选择要管理的项目 ===${RESET}"
+    projects=($(find "$PROJECTS_DIR" -maxdepth 1 -type d -exec test -f '{}/docker-compose.yml' \; -print | sort))
+
+    if [ ${#projects[@]} -eq 0 ]; then
+        echo -e "${RED}未在 $PROJECTS_DIR 下找到任何含 docker-compose.yml 的项目${RESET}"
         exit 1
     fi
-}
 
-install_docker() {
-    if ! command -v docker &> /dev/null; then
-        echo -e "${GREEN}安装 Docker...${RESET}"
-        apt update
-        apt install -y docker.io
-    fi
-    if ! docker compose version &> /dev/null; then
-        echo -e "${GREEN}安装 Docker Compose 插件...${RESET}"
-        apt install -y docker-compose-plugin
-    fi
-    if ! systemctl is-active --quiet docker; then
-        echo -e "${GREEN}启动 Docker 服务...${RESET}"
-        systemctl enable docker
-        systemctl start docker
-    fi
-}
-
-install_app() {
-    install_docker
-    mkdir -p "$APP_DIR"
-
-    read -p "请输入映射端口 [默认:3000]: " input_port
-    PORT=${input_port:-3000}
-
-    if [ -d "$APP_DIR/.git" ]; then
-        echo -e "${GREEN}检测到已有代码，更新中...${RESET}"
-        cd "$APP_DIR"
-        git pull
-    else
-        echo -e "${GREEN}克隆代码...${RESET}"
-        git clone https://github.com/Codennnn/vue-color-avatar.git "$APP_DIR"
-        cd "$APP_DIR"
-    fi
-
-    # 写 docker-compose.yml
-    cat > "$COMPOSE_FILE" <<EOF
-
-services:
-  vue-color-avatar:
-    build: .
-    image: vue-color-avatar:latest
-    container_name: vue-color-avatar
-    ports:
-      - "127.0.0.1:\${PORT}:80"
-    restart: always
-EOF
-
-    cd "$APP_DIR"
-    PORT=$PORT docker compose up -d --build
-
-    SERVER_IP=$(hostname -I | awk '{print $1}')
-    echo -e "${GREEN}✅ vue-color-avatar 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂数据目录: $APP_DIR${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-update_app() {
-    if [ ! -d "$APP_DIR" ]; then
-        echo -e "${RED}未检测到安装目录，请先安装${RESET}"
-        read -p "按回车返回菜单..."
-        menu
-    fi
-    cd "$APP_DIR"
-    git pull
-    docker compose build
-    docker compose up -d
-    echo -e "${GREEN}✅ 已更新并重启完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-restart_app() {
-    if [ ! -d "$APP_DIR" ]; then
-        echo -e "${RED}未检测到安装目录，请先安装${RESET}"
-        read -p "按回车返回菜单..."
-        menu
-    fi
-    cd "$APP_DIR"
-    docker compose restart
-    echo -e "${GREEN}✅ 服务已重启${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-view_logs() {
-    if [ ! -d "$APP_DIR" ]; then
-        echo -e "${RED}未检测到安装目录，请先安装${RESET}"
-        read -p "按回车返回菜单..."
-        menu
-    fi
-    cd "$APP_DIR"
-    echo -e "${GREEN}日志输出（Ctrl+C 退出）...${RESET}"
-    docker compose logs --tail 100 -f
-    read -p "按回车返回菜单..."
-    menu
-}
-
-uninstall_app() {
-    if [ ! -d "$APP_DIR" ]; then
-        echo -e "${RED}未检测到安装目录${RESET}"
-        read -p "按回车返回菜单..."
-        menu
-    fi
-    cd "$APP_DIR"
-    docker compose down -v --rmi all
-    cd ~
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已卸载并删除数据${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-menu() {
-    clear
-    echo -e "${GREEN}=== vue-color-avatar 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 重启服务${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 卸载${RESET}"
+    for i in "${!projects[@]}"; do
+        echo -e "${GREEN}$((i+1))) ${projects[$i]}${RESET}"
+    done
     echo -e "${GREEN}0) 退出${RESET}"
-    read -p "请选择: " choice
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) restart_app ;;
-        4) view_logs ;;
-        5) uninstall_app ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ; menu ;;
-    esac
+
+    read -p "请输入编号: " choice
+    if [[ "$choice" == "0" ]]; then
+        exit 0
+    elif [[ "$choice" =~ ^[0-9]+$ && $choice -ge 1 && $choice -le ${#projects[@]} ]]; then
+        PROJECT_DIR=${projects[$((choice-1))]}
+        COMPOSE_FILE="$PROJECT_DIR/docker-compose.yml"
+        project_menu
+    else
+        echo -e "${RED}无效选择${RESET}"
+        sleep 1
+        select_project
+    fi
 }
 
-check_root
-menu
+# ---------------------------
+# 项目管理菜单
+# ---------------------------
+function project_menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== 管理项目: $PROJECT_DIR ===${RESET}"
+        echo -e "${GREEN} 1) 启动服务${RESET}"
+        echo -e "${GREEN} 2) 停止服务${RESET}"
+        echo -e "${GREEN} 3) 重启服务${RESET}"
+        echo -e "${GREEN} 4) 查看日志${RESET}"
+        echo -e "${GREEN} 5) 查看容器状态${RESET}"
+        echo -e "${GREEN} 6) 更新容器 (拉取新镜像并重启)${RESET}"
+        echo -e "${GREEN} 7) 进入容器${RESET}"
+        echo -e "${GREEN} 8) 删除容器 (含数据卷)${RESET}"
+        echo -e "${GREEN} 9) 删除容器+镜像+数据卷${RESET}"
+        echo -e "${GREEN}10) 切换项目${RESET}"
+        echo -e "${GREEN} 0) 退出${RESET}"
+        echo
+        read -p "请选择操作 [0-10]: " choice
+        case "$choice" in
+            1) docker compose -f "$COMPOSE_FILE" up -d ;;
+            2) docker compose -f "$COMPOSE_FILE" stop ;;
+            3) docker compose -f "$COMPOSE_FILE" down && docker compose -f "$COMPOSE_FILE" up -d ;;
+            4) docker compose -f "$COMPOSE_FILE" logs -f ;;
+            5) docker compose -f "$COMPOSE_FILE" ps ;;
+            6) docker compose -f "$COMPOSE_FILE" pull && docker compose -f "$COMPOSE_FILE" up -d ;;
+            7) select_container ;;
+            8) docker compose -f "$COMPOSE_FILE" down -v ;;
+            9) docker compose -f "$COMPOSE_FILE" down --rmi all -v ;;
+            10) select_project ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}" && sleep 1 ;;
+        esac
+    done
+}
+
+# ---------------------------
+# 进入容器
+# ---------------------------
+function select_container() {
+    containers=$(docker compose -f "$COMPOSE_FILE" ps --services)
+    if [ -z "$containers" ]; then
+        echo -e "${RED}没有正在运行的容器${RESET}"
+        sleep 1
+        return
+    fi
+    echo -e "${GREEN}可进入的容器：${RESET}"
+    echo -e "${GREEN}$containers${RESET}"
+    read -p "请输入容器名: " cname
+    if [[ "$containers" == *"$cname"* ]]; then
+        docker compose -f "$COMPOSE_FILE" exec "$cname" /bin/sh || docker compose -f "$COMPOSE_FILE" exec "$cname" /bin/bash
+    else
+        echo -e "${RED}容器不存在${RESET}"
+        sleep 1
+    fi
+}
+
+# ---------------------------
+# 启动
+# ---------------------------
+select_project

@@ -11,6 +11,7 @@ RESET="\033[0m"
 APP_NAME="vue-color-avatar"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+ENV_FILE="$APP_DIR/.env"
 
 check_root() {
     if [ "$(id -u)" != "0" ]; then
@@ -53,21 +54,25 @@ install_app() {
         cd "$APP_DIR"
     fi
 
+    # 写 .env 文件
+    cat > "$ENV_FILE" <<EOF
+PORT=$PORT
+EOF
+
     # 写 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
-
 services:
   vue-color-avatar:
     build: .
     image: vue-color-avatar:latest
     container_name: vue-color-avatar
     ports:
-      - "127.0.0.1:\${PORT}:80"
+      - "\${PORT}:80"
     restart: always
 EOF
 
     cd "$APP_DIR"
-    PORT=$PORT docker compose up -d --build
+    docker compose --env-file "$ENV_FILE" up -d --build
 
     SERVER_IP=$(hostname -I | awk '{print $1}')
     echo -e "${GREEN}✅ vue-color-avatar 已启动${RESET}"
@@ -84,8 +89,9 @@ update_app() {
         menu
     fi
     cd "$APP_DIR"
-    docker compose pull 
-    docker compose up -d
+    git pull
+    docker compose --env-file "$ENV_FILE" build
+    docker compose --env-file "$ENV_FILE" up -d
     echo -e "${GREEN}✅ 已更新并重启完成${RESET}"
     read -p "按回车返回菜单..."
     menu
@@ -98,7 +104,7 @@ restart_app() {
         menu
     fi
     cd "$APP_DIR"
-    docker compose restart
+    docker compose --env-file "$ENV_FILE" restart
     echo -e "${GREEN}✅ 服务已重启${RESET}"
     read -p "按回车返回菜单..."
     menu
@@ -112,7 +118,7 @@ view_logs() {
     fi
     cd "$APP_DIR"
     echo -e "${GREEN}日志输出（Ctrl+C 退出）...${RESET}"
-    docker compose logs --tail 100 -f
+    docker compose --env-file "$ENV_FILE" logs --tail 100 -f
     read -p "按回车返回菜单..."
     menu
 }
@@ -124,7 +130,7 @@ uninstall_app() {
         menu
     fi
     cd "$APP_DIR"
-    docker compose down -v --rmi all
+    docker compose --env-file "$ENV_FILE" down -v --rmi all
     cd ~
     rm -rf "$APP_DIR"
     echo -e "${RED}✅ 已卸载并删除数据${RESET}"

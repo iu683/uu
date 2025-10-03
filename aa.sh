@@ -2,13 +2,12 @@
 # ==========================================
 # Nginx HTTPS 反代管理脚本（已有证书）
 # 支持：添加 / 修改 / 删除 / 查看
-# 菜单字体绿色，添加站点支持任意目录证书选择
+# 菜单字体绿色，添加站点显示证书域名，上传大小默认50M
 # ==========================================
 
 set -e
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
@@ -53,7 +52,9 @@ add_site() {
     else
         echo -e "${GREEN}=== 可选择证书列表 ===${RESET}"
         for i in "${!CERT_FILES[@]}"; do
-            printf "${GREEN}%d) %s${RESET}\n" $((i+1)) "${CERT_FILES[$i]}"
+            FILE_NAME=$(basename "${CERT_FILES[$i]}")
+            DOMAIN_NAME="${FILE_NAME%.*}"
+            printf "${GREEN}%d) %s${RESET}\n" $((i+1)) "$DOMAIN_NAME"
         done
         echo -e "${GREEN}0) 手动输入证书和密钥路径${RESET}"
         read -p "请选择证书编号: " cert_idx
@@ -67,7 +68,6 @@ add_site() {
                 return
             fi
             CERT_PATH="${CERT_FILES[$((cert_idx-1))]}"
-            # 默认密钥同目录同名 .key
             KEY_PATH="${CERT_PATH%.*}.key"
             if [[ ! -f "$KEY_PATH" ]]; then
                 read -p "请输入密钥路径: " KEY_PATH
@@ -76,7 +76,8 @@ add_site() {
     fi
 
     read -p "请输入反代目标地址 (例如 http://127.0.0.1:8000): " TARGET
-    read -p "请输入上传文件大小限制 (例如 50M): " UPLOAD_SIZE
+    read -p "请输入上传文件大小限制 (例如 50M，默认 50M): " UPLOAD_SIZE
+    UPLOAD_SIZE=${UPLOAD_SIZE:-50M}   # 默认值50M
 
     CONFIG_PATH="$SITES_AVAILABLE/$DOMAIN.conf"
     if [[ -f "$CONFIG_PATH" ]]; then
@@ -85,7 +86,6 @@ add_site() {
         return
     fi
 
-    # 生成 Nginx 配置
     cat > "$CONFIG_PATH" <<EOF
 server {
     listen 443 ssl http2;
@@ -221,11 +221,11 @@ view_sites() {
 # ---------------------------
 while true; do
     clear
-    echo -e "${GREEN}=== Nginx HTTPS 反代管理 ===${RESET}"
-    echo -e "${GREEN}1) 添加站点${RESET}"
-    echo -e "${GREEN}2) 修改站点${RESET}"
-    echo -e "${GREEN}3) 删除站点${RESET}"
-    echo -e "${GREEN}4) 查看现有站点${RESET}"
+    echo -e "${GREEN}=== Nginx证书反代管理 ===${RESET}"
+    echo -e "${GREEN}1) 添加配置${RESET}"
+    echo -e "${GREEN}2) 修改配置${RESET}"
+    echo -e "${GREEN}3) 删除配置${RESET}"
+    echo -e "${GREEN}4) 查看现有域名${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
     read -p "请选择操作 [0-4]: " choice
 

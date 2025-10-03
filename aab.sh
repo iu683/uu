@@ -560,6 +560,33 @@ list_sites() {
     grep -E "set_real_ip_from|real_ip_header" "$CONFIG_PATH" || echo "未配置"
     pause
 }
+# ------------------------------
+# 卸载 Nginx 与 Certbot
+# ------------------------------
+uninstall_env() {
+    read -p "确认要卸载 Nginx 与 Certbot？此操作会删除 Nginx 和 Certbot，但不会删除你自定义的配置文件。输入 yes 确认: " confirm
+    if [[ "$confirm" != "yes" ]]; then
+        echo "已取消卸载"
+        pause
+        return
+    fi
+
+    echo -e "${GREEN}停止 Nginx 服务...${RESET}"
+    systemctl stop nginx
+    systemctl disable nginx
+
+    echo -e "${GREEN}卸载 Nginx 与 Certbot...${RESET}"
+    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+        apt remove -y nginx certbot python3-certbot-nginx
+        apt autoremove -y
+    elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "rocky" || "$OS" == "almalinux" ]]; then
+        yum remove -y nginx certbot python3-certbot-nginx
+    fi
+
+    echo -e "${GREEN}卸载完成${RESET}"
+    pause
+}
+
 
 # ------------------------------
 # 主菜单
@@ -573,6 +600,7 @@ main_menu() {
         echo -e "${GREEN}3. 删除域名配置${RESET}"
         echo -e "${GREEN}4. 查看已配置域名信息${RESET}"
         echo -e "${GREEN}5. 修改已有域名配置${RESET}"
+        echo -e "${GREEN}6. 卸载Nginx${RESET}"
         echo -e "${GREEN}0. 退出${RESET}"
         read -p "请选择 [0-5]: " choice
         case $choice in
@@ -581,6 +609,7 @@ main_menu() {
             3) delete_site ;;
             4) list_sites ;;
             5) modify_site ;;
+            6) uninstall_env ;;
             0) exit 0 ;;
             *) echo "无效选项"; sleep 1 ;;
         esac

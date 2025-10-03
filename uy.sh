@@ -25,6 +25,7 @@ install_caddy() {
     else
         echo -e "${GREEN}Caddy 已安装${RESET}"
     fi
+    pause
 }
 
 uninstall_caddy() {
@@ -39,11 +40,13 @@ uninstall_caddy() {
     else
         echo -e "${RED}Caddy 未安装${RESET}"
     fi
+    pause
 }
 
 reload_caddy() {
     sudo systemctl reload caddy
     echo -e "${GREEN}Caddy 配置已重载${RESET}"
+    pause
 }
 
 add_site() {
@@ -70,7 +73,6 @@ add_site() {
 }
 
 view_sites() {
-    # 查看单个域名证书信息
     mapfile -t DOMAINS < <(grep -E '^[a-zA-Z0-9.-]+ *{' $CADDYFILE | sed 's/ {//')
     if [ ${#DOMAINS[@]} -eq 0 ]; then
         echo -e "${YELLOW}没有已配置的域名${RESET}"
@@ -99,13 +101,13 @@ view_sites() {
     CERT_FILE="$CADDY_DATA/certificates/acme-v02.api.letsencrypt.org-directory/$DOMAIN/$DOMAIN.crt"
 
     if [ -f "$CERT_FILE" ]; then
+        echo -e "${GREEN}证书路径：${RESET}${CERT_FILE}"
         echo -e "${GREEN}证书信息：${RESET}"
         openssl x509 -in "$CERT_FILE" -noout -text | awk '
             /Subject:/ || /Issuer:/ || /Not Before:/ || /Not After :/ {print}'
     else
         echo -e "${YELLOW}${DOMAIN} - 未找到证书${RESET}"
     fi
-
     pause
 }
 

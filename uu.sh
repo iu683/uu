@@ -1,146 +1,223 @@
 #!/bin/bash
 # ========================================
-# 多项目 Docker Compose 管理脚本
+# 哪吒面板 Nginx 反向代理管理脚本
 # ========================================
 
 GREEN="\033[32m"
 RED="\033[31m"
 RESET="\033[0m"
 
-PROJECTS_DIR="/opt"
+CONFIG_DIR="/etc/nginx/sites-available"
+ENABLED_DIR="/etc/nginx/sites-enabled"
 
-# ---------------------------
-# 确认操作
-# ---------------------------
-function confirm_action() {
-    read -p "确认执行此操作吗？(y/N): " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        return 0
-    else
-        echo -e "${RED}操作已取消${RESET}"
-        sleep 1
-        return 1
-    fi
+mkdir -p "$CONFIG_DIR" "$ENABLED_DIR"
+
+# ------------------------------
+# 添加或修改域名配置
+# ------------------------------
+create_or_update_domain() {
+  ACTION=$1
+  echo -e "${GREEN}====== ${ACTION}域名配置 ======${RESET}"
+  read -p "请输入你的域名（例如 dashboard.example.com）： " DOMAIN
+
+  CONFIG_PATH="$CONFIG_DIR/$DOMAIN"
+  ENABLED_PATH="$ENABLED_DIR/$DOMAIN"
+
+  # 如果是修改且已有配置，读取已有上游地址和端口
+  if [ -f "$CONFIG_PATH" ]; then
+    OLD_UPSTREAM_HOST=$(grep "upstream dashboard" -A1 "$CONFIG_PATH" | grep "server" | awk '{print $2}' | cut -d: -f1)
+    OLD_UPSTREAM_PORT=$(grep "upstream dashboard" -A1 "$CONFIG_PATH" | grep "server" | awk '{print $2}' | cut -d: -f2 | tr -d ';')
+    OLD_UPSTREAM_HOST=${OLD_UPSTREAM_HOST:-127.0.0.1}
+    OLD_UPSTREAM_PORT=${OLD_UPSTREAM_PORT:-8008}
+  else
+    OLD_UPSTREAM_HOST="127.0.0.1"
+    OLD_UPSTREAM_PORT="8008"
+  fi
+
+  # 证书获取方式
+  echo "请选择证书获取/使用方式："
+  echo "1. 使用系统已有证书文件"
+  echo "2. 返回主菜单"
+  read -p "请输入选项: " ssl_option
+
+  if [ "$ssl_option" == "1" ]; then
+    read -p "请输入已有证书文件路径: " CERT_PATH
+    read -p "请输入已有密钥文件路径: " KEY_PATH
+  elif [ "$ssl_option" == "2" ]; then
+    return
+  else
+    echo "无效的选项"
+    return
+  fi
+
+  # CDN 回源默认开启
+  echo "CDN 回源已默认开启"
+  read -p "请输入你的 CDN 回源 IP 地址段 (默认: 173.245.48.0/20): " CDN_IP_RANGE
+  CDN_IP_RANGE=${CDN_IP_RANGE:-173.245.48.0/20}
+
+  read -p "请输入 CDN 提供的私有 Header 名称 (默认: CF-Connecting-IP): " CDN_HEADER
+  CDN_HEADER=${CDN_HEADER:-CF-Connecting-IP}
+
+  REAL_IP_CONFIG="set_real_ip_from $CDN_IP_RANGE;
+  real_ip_header $CDN_HEADER;"
+  HEADER_VAR="\$http_${CDN_HEADER//-/_}"
+
+  # 上游服务地址
+  read -p "请输入上游服务地址 (默认: $OLD_UPSTREAM_HOST): " UPSTREAM_HOST
+  UPSTREAM_HOST=${UPSTREAM_HOST:-$OLD_UPSTREAM_HOST}
+
+  read -p "请输入上游服务端口 (默认: $OLD_UPSTREAM_PORT): " UPSTREAM_PORT
+  UPSTREAM_PORT=${UPSTREAM_PORT:-$OLD_UPSTREAM_PORT}
+
+  # 写入 Nginx 配置
+  cat > "$CONFIG_PATH" <<EOF
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+
+    server_name $DOMAIN;
+
+    ssl_certificate     $CERT_PATH;
+    ssl_certificate_key $KEY_PATH;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_stapling on;
+
+    underscores_in_headers on;
+    $REAL_IP_CONFIG
+
+    # gRPC
+    location ^~ /proto.NezhaService/ {
+        grpc_set_header Host \$host;
+        grpc_set_header nz-realip $HEADER_VAR;
+        grpc_read_timeout 600s;
+        grpc_send_timeout 600s;
+        grpc_socket_keepalive on;
+        client_max_body_size 10m;
+        grpc_buffer_size 4m;
+        grpc_pass grpc://dashboard;
+    }
+
+    # WebSocket
+    location ~* ^/api/v1/ws/(server|terminal|file)(.*)\$ {
+        proxy_set_header Host \$host;
+        proxy_set_header nz-realip $HEADER_VAR;
+        proxy_set_header Origin https://\$host;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_pass http://$UPSTREAM_HOST:$UPSTREAM_PORT;
+    }
+
+    # Web
+    location / {
+        proxy_set_header Host \$host;
+        proxy_set_header nz-realip $HEADER_VAR;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffer_size 128k;
+        proxy_buffers 4 256k;
+        proxy_busy_buffers_size 256k;
+        proxy_max_temp_file_size 0;
+        proxy_pass http://$UPSTREAM_HOST:$UPSTREAM_PORT;
+    }
 }
 
-# ---------------------------
-# 选择项目
-# ---------------------------
-function select_project() {
-    clear
-    echo -e "${GREEN}=== 请选择要管理的项目 ===${RESET}"
-    projects=($(find "$PROJECTS_DIR" -maxdepth 1 -type d -exec test -f '{}/docker-compose.yml' \; -print | sort))
-
-    if [ ${#projects[@]} -eq 0 ]; then
-        echo -e "${RED}未在 $PROJECTS_DIR 下找到任何含 docker-compose.yml 的项目${RESET}"
-        exit 1
-    fi
-
-    for i in "${!projects[@]}"; do
-        echo -e "${GREEN}$((i+1))) ${projects[$i]}${RESET}"
-    done
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
-
-    read -p "请输入编号: " choice
-    if [[ "$choice" == "0" ]]; then
-        main_menu
-    elif [[ "$choice" =~ ^[0-9]+$ && $choice -ge 1 && $choice -le ${#projects[@]} ]]; then
-        PROJECT_DIR=${projects[$((choice-1))]}
-        COMPOSE_FILE="$PROJECT_DIR/docker-compose.yml"
-        project_menu
-    else
-        echo -e "${RED}无效选择${RESET}"
-        sleep 1
-        select_project
-    fi
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $DOMAIN;
+    return 301 https://\$host\$request_uri;
 }
 
-# ---------------------------
-# 项目管理菜单
-# ---------------------------
-function project_menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== 管理项目: $PROJECT_DIR ===${RESET}"
-        echo -e "${GREEN}1) 启动服务${RESET}"
-        echo -e "${GREEN}2) 停止服务${RESET}"
-        echo -e "${GREEN}3) 重启服务${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看容器状态${RESET}"
-        echo -e "${GREEN}6) 更新容器 (拉取新镜像并重启)${RESET}"
-        echo -e "${GREEN}7) 进入容器${RESET}"
-        echo -e "${GREEN}8) 删除容器 (含数据卷)${RESET}"
-        echo -e "${GREEN}9) 删除容器+镜像+数据卷${RESET}"
-        echo -e "${GREEN}10) 切换项目${RESET}"
-        echo -e "${GREEN}0) 返回主菜单${RESET}"
-        echo
-        read -p "请选择操作 [0-10]: " choice
-        case "$choice" in
-            1) docker compose -f "$COMPOSE_FILE" up -d ;;
-            2) docker compose -f "$COMPOSE_FILE" stop ;;
-            3) docker compose -f "$COMPOSE_FILE" down && docker compose -f "$COMPOSE_FILE" up -d ;;
-            4) docker compose -f "$COMPOSE_FILE" logs -f ;;
-            5) docker compose -f "$COMPOSE_FILE" ps ;;
-            6) docker compose -f "$COMPOSE_FILE" pull && docker compose -f "$COMPOSE_FILE" up -d ;;
-            7) select_container ;;
-            8) 
-                if confirm_action; then
-                    docker compose -f "$COMPOSE_FILE" down -v
-                fi
-                ;;
-            9) 
-                if confirm_action; then
-                    docker compose -f "$COMPOSE_FILE" down --rmi all -v
-                fi
-                ;;
-            10) select_project ;;
-            0) main_menu ;;
-            *) echo -e "${RED}无效选择${RESET}" && sleep 1 ;;
-        esac
-    done
+upstream dashboard {
+    server $UPSTREAM_HOST:$UPSTREAM_PORT;
+    keepalive 512;
+}
+EOF
+
+  rm -f "$ENABLED_PATH"
+  ln -s "$CONFIG_PATH" "$ENABLED_PATH"
+
+  nginx -t && systemctl reload nginx
+
+  echo -e "${GREEN}域名 $DOMAIN 配置已${ACTION}完成！${RESET}"
 }
 
-# ---------------------------
-# 进入容器
-# ---------------------------
-function select_container() {
-    containers=$(docker compose -f "$COMPOSE_FILE" ps --services)
-    if [ -z "$containers" ]; then
-        echo -e "${RED}没有正在运行的容器${RESET}"
-        sleep 1
-        return
-    fi
-    echo -e "${GREEN}可进入的容器：${RESET}"
-    echo -e "${GREEN}$containers${RESET}"
-    read -p "请输入容器名: " cname
-    if [[ "$containers" == *"$cname"* ]]; then
-        docker compose -f "$COMPOSE_FILE" exec "$cname" /bin/sh || docker compose -f "$COMPOSE_FILE" exec "$cname" /bin/bash
-    else
-        echo -e "${RED}容器不存在${RESET}"
-        sleep 1
-    fi
+# ------------------------------
+# 删除域名配置
+# ------------------------------
+delete_domain() {
+  echo -e "${GREEN}=== 已配置的域名 ===${RESET}"
+  ls "$CONFIG_DIR"
+  read -p "请输入要删除的域名: " DOMAIN
+  CONFIG_PATH="$CONFIG_DIR/$DOMAIN"
+  ENABLED_PATH="$ENABLED_DIR/$DOMAIN"
+
+  if [ -f "$CONFIG_PATH" ]; then
+    rm -f "$CONFIG_PATH" "$ENABLED_PATH"
+    nginx -t && systemctl reload nginx
+    echo -e "${GREEN}已删除 $DOMAIN 配置${RESET}"
+  else
+    echo -e "${RED}未找到 $DOMAIN 配置${RESET}"
+  fi
 }
 
-# ---------------------------
+# ------------------------------
+# 查看域名信息
+# ------------------------------
+list_domains() {
+  echo -e "${GREEN}=== 已配置的域名 ===${RESET}"
+  ls "$CONFIG_DIR" || { echo "暂无配置"; read -p "回车返回..."; return; }
+  read -p "请输入要查看的域名（0 返回）: " DOMAIN
+  [ "$DOMAIN" == "0" ] && return
+
+  CONFIG_PATH="$CONFIG_DIR/$DOMAIN"
+  if [ -f "$CONFIG_PATH" ]; then
+    echo -e "\n${GREEN}====== $DOMAIN 配置详情 ======${RESET}"
+    echo "配置文件: $CONFIG_PATH"
+    echo "监听端口:"
+    grep -E "listen " "$CONFIG_PATH"
+    echo "证书:"
+    grep "ssl_certificate " "$CONFIG_PATH" | head -n1
+    grep "ssl_certificate_key " "$CONFIG_PATH" | head -n1
+    echo "上游服务:"
+    grep "proxy_pass " "$CONFIG_PATH" | head -n1
+    echo "gRPC: 已启用"
+    echo "WebSocket: 已启用"
+    echo "HTTP/2: 已启用"
+    echo "CDN 设置:"
+    grep -E "set_real_ip_from|real_ip_header" "$CONFIG_PATH" || echo "未配置"
+  else
+    echo -e "${RED}未找到 $DOMAIN 配置${RESET}"
+  fi
+  read -p "按回车返回..."
+}
+
+# ------------------------------
 # 主菜单
-# ---------------------------
-function main_menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== Docker Compose 管理器 ===${RESET}"
-        echo -e "${GREEN}1) 管理项目${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        echo
-        read -p "请选择操作 [0-1]: " choice
-        case "$choice" in
-            1) select_project ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" && sleep 1 ;;
-        esac
-    done
+# ------------------------------
+main_menu() {
+  while true; do
+    clear
+    echo -e "${GREEN}====== 哪吒反向代理管理 ======${RESET}"
+    echo -e "${GREEN}1. 添加域名配置${RESET}"
+    echo -e "${GREEN}2. 删除域名配置${RESET}"
+    echo -e "${GREEN}3. 查看已配置域名信息${RESET}"
+    echo -e "${GREEN}4. 修改已有域名配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    read -p "请选择 [0-4]: " choice
+    case $choice in
+      1) create_or_update_domain "添加" ;;
+      2) delete_domain ;;
+      3) list_domains ;;
+      4) create_or_update_domain "修改" ;;
+      0) exit 0 ;;
+      *) echo "无效选项"; sleep 1 ;;
+    esac
+  done
 }
 
-# ---------------------------
-# 启动
-# ---------------------------
 main_menu

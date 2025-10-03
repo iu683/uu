@@ -41,8 +41,8 @@ create_or_update_domain() {
   read -p "请输入选项: " ssl_option
 
   if [ "$ssl_option" == "1" ]; then
-    read -p "请输入已有证书文件路径: " CERT_PATH
-    read -p "请输入已有密钥文件路径: " KEY_PATH
+    read -p "请输入已有证书文件路径(例如 /etc/nginx/ssl/example.com.pem): " CERT_PATH
+    read -p "请输入已有密钥文件路径(例如 /etc/nginx/ssl/example.com.key): " KEY_PATH
   elif [ "$ssl_option" == "2" ]; then
     return
   else

@@ -1,22 +1,12 @@
 #!/bin/bash
 set -e
 
-# ========================
-# Caddy 管理脚本（统一目录 + 证书状态）
-# ========================
-
-CADDY_DIR="/opt/caddy"
-CADDYFILE="$CADDY_DIR/Caddyfile"
-CADDY_DATA="$CADDY_DIR/data"
+CADDYFILE="/etc/caddy/Caddyfile"
+CADDY_DATA="/var/lib/caddy/.local/share/caddy"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
-
-# 确保目录存在
-sudo mkdir -p "$CADDY_DIR" "$CADDY_DATA"
-sudo touch "$CADDYFILE"
-sudo chown $USER:$USER "$CADDYFILE"
 
 pause() {
     echo -ne "${YELLOW}按回车返回菜单...${RESET}"
@@ -32,28 +22,6 @@ install_caddy() {
         sudo apt update -q
         sudo apt install -yq caddy
         echo -e "${GREEN}Caddy 安装完成${RESET}"
-
-        # 修改 systemd 使用自定义目录
-        sudo systemctl stop caddy
-        sudo systemctl disable caddy
-        sudo tee /etc/systemd/system/caddy.service > /dev/null <<EOF
-[Unit]
-Description=Caddy
-After=network.target
-
-[Service]
-User=$USER
-Group=$USER
-ExecStart=/usr/bin/caddy run --environ --config $CADDYFILE
-ExecReload=/usr/bin/caddy reload --config $CADDYFILE
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        sudo systemctl daemon-reload
-        sudo systemctl enable --now caddy
-        echo -e "${GREEN}Caddy 已启用自定义目录 $CADDY_DIR${RESET}"
     else
         echo -e "${GREEN}Caddy 已安装${RESET}"
     fi
@@ -67,8 +35,6 @@ uninstall_caddy() {
         sudo apt autoremove -y
         sudo rm -f /etc/apt/sources.list.d/caddy-stable.list
         sudo rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-        sudo rm -f /etc/systemd/system/caddy.service
-        sudo systemctl daemon-reload
         echo -e "${GREEN}Caddy 已卸载${RESET}"
     else
         echo -e "${RED}Caddy 未安装${RESET}"
@@ -97,13 +63,14 @@ add_site() {
     SITE_CONFIG+="    reverse_proxy ${HTTP_TARGET}\n"
     SITE_CONFIG+="}\n\n"
 
-    echo -e "$SITE_CONFIG" >> "$CADDYFILE"
+    echo -e "$SITE_CONFIG" | sudo tee -a $CADDYFILE >/dev/null
     echo -e "${GREEN}站点 ${DOMAIN} 添加成功${RESET}"
 
     reload_caddy
 }
 
 view_sites() {
+    # 查看单个域名证书信息
     mapfile -t DOMAINS < <(grep -E '^[a-zA-Z0-9.-]+ *{' $CADDYFILE | sed 's/ {//')
     if [ ${#DOMAINS[@]} -eq 0 ]; then
         echo -e "${YELLOW}没有已配置的域名${RESET}"
@@ -111,7 +78,7 @@ view_sites() {
         return
     fi
 
-    echo -e "${GREEN}请选择要查看的域名编号（输入0返回菜单）:${RESET}"
+    echo -e "${GREEN}请选择要查看证书信息的域名编号（输入0返回菜单）:${RESET}"
     for i in "${!DOMAINS[@]}"; do
         echo "$((i+1))) ${DOMAINS[$i]}"
     done
@@ -129,14 +96,16 @@ view_sites() {
     fi
 
     DOMAIN="${DOMAINS[$((NUM-1))]}"
-    CERT_FILE="$CADDY_DATA/certificates/acme-v02.api.letsencrypt.org-directory/$DOMAIN.crt"
+    CERT_FILE="$CADDY_DATA/certificates/acme-v02.api.letsencrypt.org-directory/$DOMAIN/$DOMAIN.crt"
 
     if [ -f "$CERT_FILE" ]; then
-        EXPIRY=$(openssl x509 -enddate -noout -in "$CERT_FILE" | cut -d= -f2)
-        echo -e "${GREEN}${DOMAIN} 证书到期时间：${EXPIRY}${RESET}"
+        echo -e "${GREEN}证书信息：${RESET}"
+        openssl x509 -in "$CERT_FILE" -noout -text | awk '
+            /Subject:/ || /Issuer:/ || /Not Before:/ || /Not After :/ {print}'
     else
         echo -e "${YELLOW}${DOMAIN} - 未找到证书${RESET}"
     fi
+
     pause
 }
 
@@ -165,7 +134,7 @@ delete_site() {
     fi
 
     DOMAIN="${DOMAINS[$((NUM-1))]}"
-    sudo sed -i "/$DOMAIN {/,/}/d" "$CADDYFILE"
+    sudo sed -i "/$DOMAIN {/,/}/d" $CADDYFILE
     echo -e "${GREEN}域名 ${DOMAIN} 已删除${RESET}"
     reload_caddy
 }
@@ -208,9 +177,9 @@ modify_site() {
     fi
 
     NEW_CONFIG="${DOMAIN} {\n${H2C_CONFIG}    reverse_proxy ${HTTP_TARGET}\n}\n\n"
-
-    sudo sed -i "/$DOMAIN {/,/}/c\\$NEW_CONFIG" "$CADDYFILE"
+    sudo sed -i "/$DOMAIN {/,/}/c\\$NEW_CONFIG" $CADDYFILE
     echo -e "${GREEN}域名 ${DOMAIN} 配置已修改${RESET}"
+
     reload_caddy
 }
 
@@ -221,13 +190,7 @@ check_domains_status() {
     CERT_DIR="$CADDY_DATA/certificates/acme-v02.api.letsencrypt.org-directory"
     [ ! -d "$CERT_DIR" ] && echo -e "${YELLOW}没有找到任何证书${RESET}" && pause && return
 
-    DOMAINS=($(ls "$CERT_DIR" | grep -vE 'default|default_server_block' | sort))
-    if [ ${#DOMAINS[@]} -eq 0 ]; then
-        echo -e "${YELLOW}没有找到任何证书${RESET}"
-        pause
-        return
-    fi
-
+    DOMAINS=($(ls "$CERT_DIR" | sort))
     for DOMAIN in "${DOMAINS[@]}"; do
         CERT_PATH="$CERT_DIR/$DOMAIN/$DOMAIN.crt"
         if [ -f "$CERT_PATH" ]; then
@@ -246,6 +209,8 @@ check_domains_status() {
 
             printf "%-22s %-10s %-15s %d 天\n" \
                 "$DOMAIN" "$STATUS" "$(date -d "$END_DATE" +"%Y-%m-%d")" "$DAYS_LEFT"
+        else
+            printf "%-22s %-10s %-15s %-10s\n" "$DOMAIN" "未找到证书" "-" "-"
         fi
     done
     pause
@@ -258,11 +223,11 @@ menu() {
         echo -e "${GREEN}1) 安装 Caddy${RESET}"
         echo -e "${GREEN}2) 添加站点${RESET}"
         echo -e "${GREEN}3) 删除站点${RESET}"
-        echo -e "${GREEN}4) 查看站点及证书（按编号）${RESET}"
+        echo -e "${GREEN}4) 查看单个站点证书信息${RESET}"
         echo -e "${GREEN}5) 修改站点配置${RESET}"
         echo -e "${GREEN}6) 重载Caddy${RESET}"
         echo -e "${GREEN}7) 卸载Caddy${RESET}"
-        echo -e "${GREEN}8) 检查所有域名证书状态${RESET}"
+        echo -e "${GREEN}8) 查看所有域名证书状态${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -p "请选择操作[0-8]： " choice
 

@@ -1,223 +1,356 @@
 #!/bin/bash
-# =========================================
-# VPS 网络信息管理脚本（绿色菜单版 + 定时任务 + 卸载功能）
-# =========================================
+# ==========================================
+# Nginx HTTPS 反代管理脚本（已有证书）
+# 支持：添加 / 修改 / 删除 / 查看 / 安装 / 卸载
+# ==========================================
 
-# ================== 配置 ==================
-SCRIPT_PATH="$HOME/vps_network.sh"          # 当前脚本路径
-CONFIG_FILE="$HOME/.vps_tg_config"         # Telegram 配置
-OUTPUT_FILE="/tmp/vps_network_info.txt"
+set -e
 
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-RESET='\033[0m'
+GREEN="\033[32m"
+RED="\033[31m"
+RESET="\033[0m"
 
-TASK_TAG="#vps_network_task"
+SITES_AVAILABLE="/etc/nginx/sites-available"
+SITES_ENABLED="/etc/nginx/sites-enabled"
+REQUIRED_PORTS=(80 443)
 
-# ================== 下载脚本 ==================
-download_script() {
-    mkdir -p "$(dirname "$SCRIPT_PATH")"
-    curl -sSL "https://raw.githubusercontent.com/your_repo/uuw.sh" -o "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
-    echo -e "${GREEN}✅ 脚本已下载到 $SCRIPT_PATH${RESET}"
+# ---------------------------
+# 工具函数
+# ---------------------------
+pause() {
+    echo -ne "${GREEN}按回车返回菜单...${RESET}"
+    read
 }
 
-# ================== Telegram 配置 ==================
-setup_telegram() {
-    if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
+list_sites() {
+    ls "$SITES_AVAILABLE" 2>/dev/null | grep "\.conf$" | sed 's/\.conf$//'
+}
+
+nginx_reload() {
+    nginx -t && systemctl reload nginx
+}
+
+# ---------------------------
+# 系统检测
+# ---------------------------
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
     else
-        echo "第一次运行，需要配置 Telegram 参数"
-        read -rp "Bot Token: " TG_BOT_TOKEN
-        read -rp "Chat ID: " TG_CHAT_ID
-        echo "TG_BOT_TOKEN=\"$TG_BOT_TOKEN\"" > "$CONFIG_FILE"
-        echo "TG_CHAT_ID=\"$TG_CHAT_ID\"" >> "$CONFIG_FILE"
-        chmod 600 "$CONFIG_FILE"
-        echo -e "${GREEN}配置已保存到 $CONFIG_FILE${RESET}"
-        read -p "按回车继续..."
+        OS=$(uname -s)
     fi
 }
 
-modify_config() {
-    echo "修改 Telegram 配置:"
-    read -rp "新的 Bot Token: " TG_BOT_TOKEN
-    read -rp "新的 Chat ID: " TG_CHAT_ID
-    echo "TG_BOT_TOKEN=\"$TG_BOT_TOKEN\"" > "$CONFIG_FILE"
-    echo "TG_CHAT_ID=\"$TG_CHAT_ID\"" >> "$CONFIG_FILE"
-    chmod 600 "$CONFIG_FILE"
-    echo -e "${GREEN}✅ 配置已更新${RESET}"
-    read -p "按回车返回菜单..."
-}
+# ---------------------------
+# 安装 / 更新 Nginx 与 Certbot
+# ---------------------------
+configure_firewall() {
+    echo -e "${GREEN}检测并配置防火墙以开放必要端口...${RESET}"
 
-# ================== 收集网络信息 ==================
-collect_network_info() {
-    echo "收集网络信息..."
-    {
-        echo "================= VPS 网络信息 ================="
-        echo "日期: $(date)"
-        echo "主机名: $(hostname)"
-        echo ""
-        echo "=== 系统信息 ==="
-        if command -v hostnamectl >/dev/null 2>&1; then
-            hostnamectl
-        else
-            cat /etc/os-release
+    if command -v ufw >/dev/null 2>&1; then
+        ufw_status=$(ufw status | head -n 1)
+        if [[ "$ufw_status" == "Status: inactive" ]]; then
+            echo "ufw 未启用，正在启用..."
+            ufw --force enable
         fi
-        echo ""
-    } > "$OUTPUT_FILE"
-
-    echo "=== 网络接口信息 ===" >> "$OUTPUT_FILE"
-    for IFACE in $(ls /sys/class/net/); do
-        DESC="$IFACE"
-        [ "$IFACE" = "lo" ] && DESC="$IFACE (回环接口)"
-        [ "$IFACE" != "lo" ] && DESC="$IFACE (主网卡)"
-        echo "------------------------" >> "$OUTPUT_FILE"
-        echo "接口: $DESC" >> "$OUTPUT_FILE"
-
-        IPV4=$(ip -4 addr show $IFACE | awk '/inet /{print $2}')
-        [ -n "$IPV4" ] && echo "IPv4: $IPV4" >> "$OUTPUT_FILE" || echo "IPv4: 无" >> "$OUTPUT_FILE"
-
-        IPV6=$(ip -6 addr show $IFACE scope global | awk '/inet6 /{print $2}')
-        [ -n "$IPV6" ] && echo "IPv6: $IPV6" >> "$OUTPUT_FILE" || echo "IPv6: 无" >> "$OUTPUT_FILE"
-
-        LL6=$(ip -6 addr show $IFACE scope link | awk '/inet6 /{print $2}')
-        [ -n "$LL6" ] && echo "链路本地 IPv6: $LL6" >> "$OUTPUT_FILE"
-
-        MAC=$(cat /sys/class/net/$IFACE/address)
-        echo "MAC: $MAC" >> "$OUTPUT_FILE"
-    done
-    echo "------------------------" >> "$OUTPUT_FILE"
-
-    echo "" >> "$OUTPUT_FILE"
-    echo "=== 默认路由 ===" >> "$OUTPUT_FILE"
-    echo "IPv4 默认路由:" >> "$OUTPUT_FILE"
-    ip route show default >> "$OUTPUT_FILE"
-    echo "" >> "$OUTPUT_FILE"
-    echo "IPv6 默认路由:" >> "$OUTPUT_FILE"
-    ip -6 route show default >> "$OUTPUT_FILE"
-    echo "" >> "$OUTPUT_FILE"
-
-    echo "=== 网络连通性测试 ===" >> "$OUTPUT_FILE"
-    ping -c 3 8.8.8.8 >> "$OUTPUT_FILE" 2>&1
-    ping6 -c 3 google.com >> "$OUTPUT_FILE" 2>&1
-
-    GATEWAY6=$(ip -6 route | awk '/default/{print $3}')
-    if [ -n "$GATEWAY6" ]; then
-        ping6 -c 2 $GATEWAY6 >/dev/null 2>&1
-        if [ $? -eq 0 ]; then
-            echo "IPv6 网关 $GATEWAY6 可达" >> "$OUTPUT_FILE"
-        else
-            echo "⚠️ IPv6 网关 $GATEWAY6 不可达" >> "$OUTPUT_FILE"
-        fi
-    fi
-}
-
-# ================== 发送到 Telegram ==================
-send_to_telegram() {
-    if [ ! -f "$OUTPUT_FILE" ]; then
-        echo "⚠️ 文件 $OUTPUT_FILE 不存在，请先收集网络信息。"
-        read -p "按回车返回菜单..."
+        for port in "${REQUIRED_PORTS[@]}"; do
+            if ! ufw status | grep -qw "$port"; then
+                echo "允许端口 $port ..."
+                ufw allow "$port"
+            fi
+        done
         return
     fi
-    source "$CONFIG_FILE"
-    TG_MSG="📡 VPS 网络信息\`\`\`$(cat $OUTPUT_FILE)\`\`\`"
-    curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
-        -d chat_id="$TG_CHAT_ID" \
-        -d parse_mode="Markdown" \
-        -d text="$TG_MSG" >/dev/null
-    echo -e "${GREEN}✅ 信息已发送到 Telegram${RESET}"
-    rm -f "$OUTPUT_FILE"
-    read -p "按回车返回菜单..."
-}
 
-# ================== 删除临时文件 ==================
-delete_file() {
-    if [ -f "$OUTPUT_FILE" ]; then
-        rm -f "$OUTPUT_FILE"
-        echo -e "${GREEN}✅ 文件 $OUTPUT_FILE 已删除${RESET}"
-    else
-        echo "文件 $OUTPUT_FILE 不存在。"
+    if systemctl is-active --quiet firewalld; then
+        for port in "${REQUIRED_PORTS[@]}"; do
+            if ! firewall-cmd --list-ports | grep -qw "${port}/tcp"; then
+                firewall-cmd --permanent --add-port=${port}/tcp
+            fi
+        done
+        firewall-cmd --reload
+        return
     fi
-    read -p "按回车返回菜单..."
-}
 
-# ================== 定时任务管理 ==================
-setup_cron_job(){
-  echo -e "${GREEN}===== 定时任务管理 =====${RESET}"
-  echo -e "${GREEN}1) 每天发送一次 VPS 信息 (0点)${RESET}"
-  echo -e "${GREEN}2) 每周发送一次 VPS 信息 (周一 0点)${RESET}"
-  echo -e "${GREEN}3) 每月发送一次 VPS 信息 (1号 0点)${RESET}"
-  echo -e "${GREEN}4) 删除当前任务(仅本脚本相关)${RESET}"
-  echo -e "${GREEN}5) 查看当前任务${RESET}"
-  echo -e "${GREEN}6) 返回菜单${RESET}"
-  read -rp "请选择 [1-6]: " cron_choice
-
-  CRON_CMD="bash $SCRIPT_PATH --cron"
-
-  case $cron_choice in
-    1) (crontab -l 2>/dev/null | grep -v "$CRON_CMD"; echo "0 0 * * * $CRON_CMD") | crontab -
-       echo -e "${GREEN}✅ 已设置每天 0 点发送一次 VPS 信息${RESET}" ;;
-    2) (crontab -l 2>/dev/null | grep -v "$CRON_CMD"; echo "0 0 * * 1 $CRON_CMD") | crontab -
-       echo -e "${GREEN}✅ 已设置每周一 0 点发送一次 VPS 信息${RESET}" ;;
-    3) (crontab -l 2>/dev/null | grep -v "$CRON_CMD"; echo "0 0 1 * * $CRON_CMD") | crontab -
-       echo -e "${GREEN}✅ 已设置每月 1 日 0 点发送一次 VPS 信息${RESET}" ;;
-    4) crontab -l 2>/dev/null | grep -v "$CRON_CMD" | crontab -
-       echo -e "${RED}❌ 已删除本脚本相关的定时任务${RESET}" ;;
-    5) echo -e "${YELLOW}当前已配置的定时任务:${RESET}"
-       crontab -l 2>/dev/null | grep "$CRON_CMD" || echo "⚠️ 没有找到和本脚本相关的定时任务" ;;
-    6) return ;;
-    *) echo -e "${RED}无效选择${RESET}" ;;
-  esac
-  read -p "按回车返回菜单..."
-}
-
-# ================== 卸载脚本 ==================
-uninstall_script() {
-    echo -e "${YELLOW}⚠️ 即将卸载脚本及清理定时任务${RESET}"
-    read -rp "确认卸载吗？(y/N): " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        crontab -l 2>/dev/null | grep -v "bash $SCRIPT_PATH" | crontab -
-        rm -f "$SCRIPT_PATH" "$CONFIG_FILE" "$OUTPUT_FILE"
-        echo -e "${GREEN}✅ 脚本已卸载${RESET}"
-        exit 0
-    else
-        echo "取消卸载"
-        read -p "按回车返回菜单..."
+    if command -v iptables >/dev/null 2>&1; then
+        for port in "${REQUIRED_PORTS[@]}"; do
+            if ! iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
+                iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+            fi
+        done
+        if command -v netfilter-persistent >/dev/null 2>&1; then
+            netfilter-persistent save
+        elif command -v service >/dev/null 2>&1; then
+            service iptables save
+        fi
+        return
     fi
 }
 
-# ================== 菜单主函数 ==================
-menu() {
-    while true; do
-        echo ""
-        echo -e "${GREEN}===== VPS 网络管理菜单 =====${RESET}"
-        echo -e "${GREEN}1) 查看并发送网络信息到 Telegram${RESET}"
-        echo -e "${GREEN}2) 修改 Telegram 配置${RESET}"
-        echo -e "${GREEN}3) 删除临时文件${RESET}"
-        echo -e "${GREEN}4) 定时任务管理${RESET}"
-        echo -e "${GREEN}5) 卸载脚本${RESET}"
-        echo -e "${GREEN}6) 退出${RESET}"
-        read -rp "请选择操作 [1-6]: " choice
-        case $choice in
-            1) setup_telegram; collect_network_info; send_to_telegram ;;
-            2) modify_config ;;
-            3) delete_file ;;
-            4) setup_cron_job ;;
-            5) uninstall_script ;;
-            6) echo "退出脚本"; exit 0 ;;
-            *) echo -e "${RED}无效选择，请输入 1-6${RESET}"; read -p "按回车返回菜单..." ;;
-        esac
+install_nginx_certbot() {
+    detect_os
+    echo -e "${GREEN}安装/更新 Nginx 与 Certbot ...${RESET}"
+    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+        apt update
+        apt install -y nginx certbot python3-certbot-nginx
+    elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "rocky" || "$OS" == "almalinux" ]]; then
+        yum install -y epel-release
+        yum install -y nginx certbot python3-certbot-nginx
+    else
+        echo -e "${RED}无法自动安装，请手动安装 Nginx 与 Certbot${RESET}"
+        pause
+        return
+    fi
+
+    configure_firewall
+
+    mkdir -p "$SITES_AVAILABLE" "$SITES_ENABLED"
+
+    systemctl enable nginx
+    systemctl start nginx
+
+    echo -e "${GREEN}安装/更新完成！${RESET}"
+    pause
+}
+
+# ---------------------------
+# 卸载 Nginx 与 Certbot
+# ---------------------------
+uninstall_nginx_certbot() {
+    read -p "确认卸载 Nginx 与 Certbot？输入 yes 确认: " confirm
+    if [[ "$confirm" != "yes" ]]; then
+        echo "已取消"
+        pause
+        return
+    fi
+
+    echo -e "${GREEN}停止 Nginx 服务...${RESET}"
+    systemctl stop nginx
+    systemctl disable nginx
+
+    detect_os
+    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+        apt remove -y nginx certbot python3-certbot-nginx
+        apt autoremove -y
+    elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "rocky" || "$OS" == "almalinux" ]]; then
+        yum remove -y nginx certbot python3-certbot-nginx
+    fi
+
+    echo -e "${GREEN}卸载完成${RESET}"
+    pause
+}
+
+
+# ---------------------------
+# 添加站点
+# ---------------------------
+add_site() {
+    read -p "请输入域名 (例如 example.com): " DOMAIN
+    read -p "请输入证书所在目录 (例如 /etc/nginx/ssl): " CERT_DIR
+
+    if [[ ! -d "$CERT_DIR" ]]; then
+        echo -e "${RED}目录不存在${RESET}"
+        pause
+        return
+    fi
+
+    # 查找证书文件
+    CERT_FILES=($(find "$CERT_DIR" -maxdepth 1 -type f \( -name "*.crt" -o -name "*.pem" \)))
+    if [ ${#CERT_FILES[@]} -eq 0 ]; then
+        echo -e "${RED}没有找到证书文件，请手动输入路径${RESET}"
+        read -p "请输入证书路径(例如 /etc/nginx/ssl/example.com.pem): " CERT_PATH
+        read -p "请输入密钥路径(例如 /etc/nginx/ssl/example.com.key): " KEY_PATH
+    else
+        echo -e "${GREEN}=== 可选择证书列表 ===${RESET}"
+        for i in "${!CERT_FILES[@]}"; do
+            FILE_NAME=$(basename "${CERT_FILES[$i]}")
+            DOMAIN_NAME="${FILE_NAME%.*}"
+            printf "${GREEN}%d) %s${RESET}\n" $((i+1)) "$DOMAIN_NAME"
+        done
+        echo -e "${GREEN}0) 手动输入证书和密钥路径${RESET}"
+        read -p "请选择证书编号: " cert_idx
+        if [[ "$cert_idx" == "0" ]]; then
+            read -p "请输入证书路径(例如 /etc/nginx/ssl/example.com.pem): " CERT_PATH
+            read -p "请输入密钥路径(例如 /etc/nginx/ssl/example.com.key): " KEY_PATH
+        else
+            if ! [[ "$cert_idx" =~ ^[0-9]+$ ]] || [ "$cert_idx" -lt 1 ] || [ "$cert_idx" -gt "${#CERT_FILES[@]}" ]; then
+                echo -e "${RED}无效编号${RESET}"
+                pause
+                return
+            fi
+            CERT_PATH="${CERT_FILES[$((cert_idx-1))]}"
+            KEY_PATH="${CERT_PATH%.*}.key"
+            if [[ ! -f "$KEY_PATH" ]]; then
+                read -p "请输入密钥路径(例如 /etc/nginx/ssl/example.com.key): " KEY_PATH
+            fi
+        fi
+    fi
+
+    read -p "请输入反代目标地址 (例如 http://127.0.0.1:8000): " TARGET
+    read -p "请输入上传文件大小限制 (例如 50M，默认 50M): " UPLOAD_SIZE
+    UPLOAD_SIZE=${UPLOAD_SIZE:-50M}   # 默认值50M
+
+    CONFIG_PATH="$SITES_AVAILABLE/$DOMAIN.conf"
+    if [[ -f "$CONFIG_PATH" ]]; then
+        echo -e "${RED}站点已存在！${RESET}"
+        pause
+        return
+    fi
+
+    cat > "$CONFIG_PATH" <<EOF
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name $DOMAIN;
+
+    client_max_body_size $UPLOAD_SIZE;
+
+    ssl_certificate $CERT_PATH;
+    ssl_certificate_key $KEY_PATH;
+
+    location / {
+        proxy_pass $TARGET;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 86400;
+    }
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $DOMAIN;
+    return 301 https://\$host\$request_uri;
+}
+EOF
+
+    ln -sf "$CONFIG_PATH" "$SITES_ENABLED/$DOMAIN.conf"
+    nginx_reload
+    echo -e "${GREEN}站点 $DOMAIN 添加成功！${RESET}"
+    pause
+}
+
+# ---------------------------
+# 修改站点
+# ---------------------------
+modify_site() {
+    SITES=($(list_sites))
+    if [ ${#SITES[@]} -eq 0 ]; then
+        echo -e "${RED}没有可修改的站点${RESET}"
+        pause
+        return
+    fi
+
+    echo -e "${GREEN}=== 可修改站点列表 ===${RESET}"
+    for i in "${!SITES[@]}"; do
+        printf "${GREEN}%d) %s${RESET}\n" $((i+1)) "${SITES[$i]}"
     done
+    echo -e "${GREEN}0) 取消${RESET}"
+    read -p "请输入要修改的站点编号: " idx
+    if [[ "$idx" == "0" ]]; then return; fi
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#SITES[@]}" ]; then
+        echo -e "${RED}无效编号${RESET}"
+        pause
+        return
+    fi
+
+    SITE="${SITES[$((idx-1))]}"
+    CONFIG_PATH="$SITES_AVAILABLE/$SITE.conf"
+    echo -e "${GREEN}正在修改站点 $SITE 配置：${RESET}"
+
+    read -p "请输入新的证书路径 (回车保持不变): " NEW_CERT
+    read -p "请输入新的私钥路径 (回车保持不变): " NEW_KEY
+    read -p "请输入新的反代目标地址 (回车保持不变): " NEW_TARGET
+    read -p "请输入新的上传大小 (回车保持不变): " NEW_SIZE
+
+    [[ -n "$NEW_CERT" ]] && sed -i "s|ssl_certificate .*;|ssl_certificate $NEW_CERT;|" "$CONFIG_PATH"
+    [[ -n "$NEW_KEY" ]] && sed -i "s|ssl_certificate_key .*;|ssl_certificate_key $NEW_KEY;|" "$CONFIG_PATH"
+    [[ -n "$NEW_TARGET" ]] && sed -i "s|proxy_pass .*;|proxy_pass $NEW_TARGET;|" "$CONFIG_PATH"
+    [[ -n "$NEW_SIZE" ]] && sed -i "s|client_max_body_size .*;|client_max_body_size $NEW_SIZE;|" "$CONFIG_PATH"
+
+    nginx_reload
+    echo -e "${GREEN}站点 $SITE 修改成功！${RESET}"
+    pause
 }
 
-# ================== 支持 --cron 参数 ==================
-if [ "$1" == "--cron" ]; then
-    setup_telegram
-    collect_network_info
-    send_to_telegram
-    exit 0
-fi
+# ---------------------------
+# 删除站点
+# ---------------------------
+delete_site() {
+    SITES=($(list_sites))
+    if [ ${#SITES[@]} -eq 0 ]; then
+        echo -e "${RED}没有可删除的站点${RESET}"
+        pause
+        return
+    fi
 
-# ================== 启动菜单 ==================
-menu
+    echo -e "${GREEN}=== 可删除站点列表 ===${RESET}"
+    for i in "${!SITES[@]}"; do
+        printf "${GREEN}%d) %s${RESET}\n" $((i+1)) "${SITES[$i]}"
+    done
+    echo -e "${GREEN}0) 取消${RESET}"
+    read -p "请输入要删除的站点编号: " idx
+    if [[ "$idx" == "0" ]]; then return; fi
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#SITES[@]}" ]; then
+        echo -e "${RED}无效编号${RESET}"
+        pause
+        return
+    fi
+
+    SITE="${SITES[$((idx-1))]}"
+    rm -f "$SITES_AVAILABLE/$SITE.conf"
+    rm -f "$SITES_ENABLED/$SITE.conf"
+
+    nginx_reload
+    echo -e "${GREEN}站点 $SITE 删除成功！${RESET}"
+    pause
+}
+
+# ---------------------------
+# 查看站点
+# ---------------------------
+view_sites() {
+    SITES=($(list_sites))
+    if [ ${#SITES[@]} -eq 0 ]; then
+        echo -e "${RED}没有配置的站点${RESET}"
+    else
+        echo -e "${GREEN}=== 已配置站点 ===${RESET}"
+        for i in "${!SITES[@]}"; do
+            printf "${GREEN}%d) %s${RESET}\n" $((i+1)) "${SITES[$i]}"
+        done
+    fi
+    pause
+}
+
+# ---------------------------
+# 主菜单
+# ---------------------------
+while true; do
+    clear
+    echo -e "${GREEN}=== Nginx证书反代管理 ===${RESET}"
+    echo -e "${GREEN}1) 安装Nginx${RESET}"
+    echo -e "${GREEN}2) 添加站点配置${RESET}"
+    echo -e "${GREEN}3) 修改站点配置${RESET}"
+    echo -e "${GREEN}4) 删除站点配置${RESET}"
+    echo -e "${GREEN}5) 查看站点信息${RESET}"
+    echo -e "${GREEN}6) 卸载Nginx${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    read -p "请选择操作[0-6]: " choice
+
+    case "$choice" in
+        1) install_nginx_certbot ;;
+        2) add_site ;;
+        3) modify_site ;;
+        4) delete_site ;;
+        5) view_sites ;;
+        6) uninstall_nginx_certbot ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}"; pause ;;
+    esac
+done

@@ -6,9 +6,6 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-# ------------------------------
-# 工具函数
-# ------------------------------
 pause() {
     echo -ne "${YELLOW}按回车返回菜单...${RESET}"
     read
@@ -144,6 +141,7 @@ check_domain_resolution() {
 # ------------------------------
 # 功能函数
 # ------------------------------
+
 install_nginx() {
     ensure_nginx_conf
     remove_default_server
@@ -177,7 +175,6 @@ install_nginx() {
 
     remove_default_server
     create_default_server
-
     configure_firewall
     systemctl daemon-reload
     systemctl enable --now nginx
@@ -242,22 +239,25 @@ add_config() {
 modify_config() {
     CONFIG_DIR="/etc/nginx/sites-available"
     [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}还没有任何配置文件！${RESET}" && pause && return
-    DOMAINS=($(ls "$CONFIG_DIR"))
-    if [ ${#DOMAINS[@]} -eq 0 ]; then
-        echo -e "${YELLOW}没有找到任何域名配置！${RESET}"
-        pause
-        return
-    fi
+
+    DOMAINS=($(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort))
+    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有域名配置！${RESET}" && pause && return
+
     echo -e "${GREEN}现有配置的域名:${RESET}"
     for i in "${!DOMAINS[@]}"; do
         echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"
     done
-    echo -ne "${GREEN}请输入编号: ${RESET}"; read choice
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效选择${RESET}"
-        pause
-        return
+
+    echo -ne "${GREEN}请输入编号 (0 返回): ${RESET}"
+    read choice
+    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ ]]; then
+        echo -e "${YELLOW}已取消${RESET}"; return
     fi
+    if [ "$choice" -eq 0 ]; then return; fi
+    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
+        echo -e "${RED}无效选择${RESET}"; pause; return
+    fi
+
     DOMAIN="${DOMAINS[$((choice-1))]}"
     CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
     echo -ne "${GREEN}请输入新反代目标: ${RESET}"; read TARGET
@@ -277,22 +277,25 @@ modify_config() {
 delete_config() {
     CONFIG_DIR="/etc/nginx/sites-available"
     [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}没有配置文件！${RESET}" && pause && return
-    DOMAINS=($(ls "$CONFIG_DIR"))
-    if [ ${#DOMAINS[@]} -eq 0 ]; then
-        echo -e "${YELLOW}没有域名配置！${RESET}"
-        pause
-        return
-    fi
+
+    DOMAINS=($(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort))
+    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有域名配置！${RESET}" && pause && return
+
     echo -e "${GREEN}可删除的域名:${RESET}"
     for i in "${!DOMAINS[@]}"; do
         echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"
     done
-    echo -ne "${GREEN}请选择编号: ${RESET}"; read choice
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效选择${RESET}"
-        pause
-        return
+
+    echo -ne "${GREEN}请选择编号 (0 返回): ${RESET}"
+    read choice
+    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ ]]; then
+        echo -e "${YELLOW}已取消${RESET}"; return
     fi
+    if [ "$choice" -eq 0 ]; then return; fi
+    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
+        echo -e "${RED}无效选择${RESET}"; pause; return
+    fi
+
     DOMAIN="${DOMAINS[$((choice-1))]}"
     rm -f "/etc/nginx/sites-available/$DOMAIN" "/etc/nginx/sites-enabled/$DOMAIN"
     certbot delete --cert-name "$DOMAIN" -n || true
@@ -304,12 +307,25 @@ delete_config() {
 test_renew() {
     CONFIG_DIR="/etc/nginx/sites-available"
     [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}没有配置文件${RESET}" && pause && return
-    DOMAINS=($(ls "$CONFIG_DIR"))
+
+    DOMAINS=($(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort))
+    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有域名配置！${RESET}" && pause && return
+
     echo -e "${GREEN}已有配置:${RESET}"
     for i in "${!DOMAINS[@]}"; do
         echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"
     done
-    echo -ne "${GREEN}选择编号: ${RESET}"; read choice
+
+    echo -ne "${GREEN}选择编号 (0 返回): ${RESET}"
+    read choice
+    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ ]]; then
+        echo -e "${YELLOW}已取消${RESET}"; return
+    fi
+    if [ "$choice" -eq 0 ]; then return; fi
+    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
+        echo -e "${RED}无效选择${RESET}"; pause; return
+    fi
+
     DOMAIN="${DOMAINS[$((choice-1))]}"
     echo -e "${GREEN}正在测试 $DOMAIN 的证书续期...${RESET}"
     certbot renew --dry-run --cert-name "$DOMAIN"
@@ -319,49 +335,61 @@ test_renew() {
 check_cert() {
     CERT_DIR="/etc/letsencrypt/live"
     if [ ! -d "$CERT_DIR" ]; then
-        echo "没有找到任何证书"
+        echo -e "${GREEN}没有找到任何证书"
         pause
         return
     fi
 
-    echo "现有证书的域名："
+    echo -e "${GREEN}现有证书的域名：${RESET}"
     i=1
     DOMAINS=()
     for DOMAIN in $(ls "$CERT_DIR"); do
         if [ -f "$CERT_DIR/$DOMAIN/fullchain.pem" ]; then
-            echo "$i) $DOMAIN"
+            echo -e "${GREEN}$i) $DOMAIN${RESET}"
             DOMAINS+=("$DOMAIN")
             i=$((i+1))
         fi
     done
 
-    echo -ne "请选择要查看的域名编号 (0 返回): "
-    read choice
-    if [ "$choice" == "0" ]; then
-        return
-    fi
-
-    SELECTED=${DOMAINS[$((choice-1))]}
-    if [ -n "$SELECTED" ]; then
-        certbot certificates --cert-name "$SELECTED"
-    else
-        echo "无效选择"
-    fi
-    pause
-}
-
-check_domains_status() {
-    echo "域名                  状态       到期时间        剩余天数"
-    echo "------------------------------------------------------------"
-
-    CERT_DIR="/etc/letsencrypt/live"
-    if [ ! -d "$CERT_DIR" ]; then
-        echo "没有找到任何证书"
+    if [ ${#DOMAINS[@]} -eq 0 ]; then
+        echo -e "${GREEN}没有找到任何有效证书${RESET}"
         pause
         return
     fi
 
-    for DOMAIN in $(ls "$CERT_DIR"); do
+    echo -ne "${GREEN}请选择要查看的域名编号 (0 返回): ${RESET}"
+    read choice
+
+    # 如果输入为空或不是数字
+    if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+        echo -e "${GREEN}无效输入${RESET}"
+        pause
+        return
+    fi
+
+    if [ "$choice" -eq 0 ]; then
+        return
+    fi
+
+    if [ "$choice" -ge 1 ] && [ "$choice" -le ${#DOMAINS[@]} ]; then
+        SELECTED=${DOMAINS[$((choice-1))]}
+        certbot certificates --cert-name "$SELECTED"
+    else
+        echo -e "${GREEN}无效选择${RESET}"
+    fi
+    pause
+}
+
+
+check_domains_status() {
+    echo -e "${GREEN}域名                  状态       到期时间        剩余天数${RESET}"
+    echo -e "${GREEN}------------------------------------------------------------${RESET}"
+
+    CERT_DIR="/etc/letsencrypt/live"
+    [ ! -d "$CERT_DIR" ] && echo "没有找到任何证书" && pause && return
+
+    DOMAINS=($(ls "$CERT_DIR" | grep -vE 'default|default_server_block' | sort))
+    for DOMAIN in "${DOMAINS[@]}"; do
         CERT_PATH="$CERT_DIR/$DOMAIN/fullchain.pem"
         if [ -f "$CERT_PATH" ]; then
             END_DATE=$(openssl x509 -enddate -noout -in "$CERT_PATH" | cut -d= -f2)
@@ -383,7 +411,6 @@ check_domains_status() {
     done
     pause
 }
-
 
 uninstall_nginx() {
     echo -e "${YELLOW}卸载 Nginx...${RESET}"
@@ -411,7 +438,7 @@ while true; do
     echo -e "${GREEN}7) 卸载 Nginx + 证书${RESET}"
     echo -e "${GREEN}8) 查看域名证书状态${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    echo -ne "${GREEN}请选择 [0-8]: ${RESET}"
+    echo -ne "${GREEN}请选择[0-8]: ${RESET}"
     read choice
     case $choice in
         1) install_nginx ;;

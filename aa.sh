@@ -35,7 +35,7 @@ nginx_reload() {
 # ---------------------------
 add_site() {
     read -p "请输入域名 (例如 example.com): " DOMAIN
-    read -p "请输入证书所在目录 (例如 /etc/nginx/ssl/): " CERT_DIR
+    read -p "请输入证书所在目录 (例如 /etc/nginx/ssl): " CERT_DIR
 
     if [[ ! -d "$CERT_DIR" ]]; then
         echo -e "${RED}目录不存在${RESET}"
@@ -47,8 +47,8 @@ add_site() {
     CERT_FILES=($(find "$CERT_DIR" -maxdepth 1 -type f \( -name "*.crt" -o -name "*.pem" \)))
     if [ ${#CERT_FILES[@]} -eq 0 ]; then
         echo -e "${RED}没有找到证书文件，请手动输入路径${RESET}"
-        read -p "请输入证书路径: " CERT_PATH
-        read -p "请输入密钥路径: " KEY_PATH
+        read -p "请输入证书路径(例如 /etc/nginx/ssl/example.com.pem): " CERT_PATH
+        read -p "请输入密钥路径(例如 /etc/nginx/ssl/example.com.key): " KEY_PATH
     else
         echo -e "${GREEN}=== 可选择证书列表 ===${RESET}"
         for i in "${!CERT_FILES[@]}"; do
@@ -59,8 +59,8 @@ add_site() {
         echo -e "${GREEN}0) 手动输入证书和密钥路径${RESET}"
         read -p "请选择证书编号: " cert_idx
         if [[ "$cert_idx" == "0" ]]; then
-            read -p "请输入证书路径: " CERT_PATH
-            read -p "请输入密钥路径: " KEY_PATH
+            read -p "请输入证书路径(例如 /etc/nginx/ssl/example.com.pem): " CERT_PATH
+            read -p "请输入密钥路径(例如 /etc/nginx/ssl/example.com.key): " KEY_PATH
         else
             if ! [[ "$cert_idx" =~ ^[0-9]+$ ]] || [ "$cert_idx" -lt 1 ] || [ "$cert_idx" -gt "${#CERT_FILES[@]}" ]; then
                 echo -e "${RED}无效编号${RESET}"
@@ -70,7 +70,7 @@ add_site() {
             CERT_PATH="${CERT_FILES[$((cert_idx-1))]}"
             KEY_PATH="${CERT_PATH%.*}.key"
             if [[ ! -f "$KEY_PATH" ]]; then
-                read -p "请输入密钥路径: " KEY_PATH
+                read -p "请输入密钥路径(例如 /etc/nginx/ssl/example.com.key): " KEY_PATH
             fi
         fi
     fi

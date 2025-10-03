@@ -1,38 +1,162 @@
 #!/bin/bash
-# ==========================================
-# Nginx HTTPS 反代管理脚本（已有证书）
-# 支持：添加 / 修改 / 删除 / 查看
-# 菜单字体绿色，添加站点显示证书域名，上传大小默认50M
-# ==========================================
-
-set -e
+# ========================================
+# 哪吒面板 Nginx 反向代理管理脚本（完整优化版）
+# ========================================
 
 GREEN="\033[32m"
 RED="\033[31m"
 RESET="\033[0m"
 
-SITES_AVAILABLE="/etc/nginx/sites-available"
-SITES_ENABLED="/etc/nginx/sites-enabled"
+CONFIG_DIR="/etc/nginx/sites-available"
+ENABLED_DIR="/etc/nginx/sites-enabled"
 
-# ---------------------------
-# 工具函数
-# ---------------------------
+mkdir -p "$CONFIG_DIR" "$ENABLED_DIR"
+
 pause() {
-    echo -ne "${GREEN}按回车返回菜单...${RESET}"
-    read
+    read -p "按回车返回..."
 }
 
-list_sites() {
-    ls "$SITES_AVAILABLE" 2>/dev/null | grep "\.conf$" | sed 's/\.conf$//'
+# ------------------------------
+# 系统检测
+# ------------------------------
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+    else
+        OS=$(uname -s)
+    fi
 }
 
-nginx_reload() {
-    nginx -t && systemctl reload nginx
+# ------------------------------
+# 配置防火墙
+# ------------------------------
+configure_firewall() {
+    echo -e "${GREEN}检测并配置防火墙以开放必要端口...${RESET}"
+
+    if command -v ufw >/dev/null 2>&1; then
+        echo "检测到 ufw 防火墙。"
+        ufw_status=$(ufw status | head -n 1)
+        if [[ "$ufw_status" == "Status: inactive" ]]; then
+            echo "ufw 未启用，正在启用..."
+            ufw --force enable
+        fi
+        for port in "${REQUIRED_PORTS[@]}"; do
+            if ! ufw status | grep -qw "$port"; then
+                echo "允许端口 $port ..."
+                ufw allow "$port"
+            else
+                echo "端口 $port 已经开放。"
+            fi
+        done
+        return
+    fi
+
+    if systemctl is-active --quiet firewalld; then
+        echo "检测到 firewalld 防火墙。"
+        for port in "${REQUIRED_PORTS[@]}"; do
+            if ! firewall-cmd --list-ports | grep -qw "${port}/tcp"; then
+                echo "允许端口 $port ..."
+                firewall-cmd --permanent --add-port=${port}/tcp
+            else
+                echo "端口 $port 已经开放。"
+            fi
+        done
+        firewall-cmd --reload
+        return
+    fi
+
+    if command -v iptables >/dev/null 2>&1; then
+        echo "检测到 iptables 防火墙。"
+        for port in "${REQUIRED_PORTS[@]}"; do
+            if ! iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
+                echo "允许端口 $port ..."
+                iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+            else
+                echo "端口 $port 已经开放。"
+            fi
+        done
+        if command -v netfilter-persistent >/dev/null 2>&1; then
+            netfilter-persistent save
+        elif command -v service >/dev/null 2>&1; then
+            service iptables save
+        fi
+        return
+    fi
+
+    echo -e "${YELLOW}未检测到已知防火墙工具，请手动确保端口 ${REQUIRED_PORTS[*]} 已开放。${RESET}"
 }
 
-# ---------------------------
-# 添加站点
-# ---------------------------
+# ------------------------------
+# 安装 Certbot
+# ------------------------------
+install_certbot() {
+    if ! command -v certbot >/dev/null 2>&1; then
+        echo -e "${GREEN}正在安装 Certbot...${RESET}"
+        if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+            apt update
+            apt install -y certbot python3-certbot-nginx
+        elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "rocky" || "$OS" == "almalinux" ]]; then
+            yum install -y epel-release
+            yum install -y certbot python3-certbot-nginx
+        else
+            echo -e "${RED}无法自动安装 Certbot，请手动安装。${RESET}"
+            exit 1
+        fi
+        echo -e "${GREEN}Certbot 安装完成。${RESET}"
+    else
+        echo -e "${GREEN}Certbot 已经安装。${RESET}"
+    fi
+}
+
+# ------------------------------
+# 安装 Nginx
+# ------------------------------
+install_nginx() {
+    echo -e "${GREEN}安装或更新 Nginx...${RESET}"
+    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+        apt update && apt upgrade -y
+        apt install -y nginx
+    elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "rocky" || "$OS" == "almalinux" ]]; then
+        yum install -y epel-release
+        yum install -y nginx
+    else
+        echo -e "${RED}无法自动安装 Nginx，请手动安装。${RESET}"
+        exit 1
+    fi
+
+    configure_firewall
+
+    mkdir -p "$CONFIG_DIR" "$ENABLED_DIR"
+
+    systemctl start nginx
+    systemctl enable nginx
+    echo -e "${GREEN}Nginx 安装完成！${RESET}"
+}
+
+# ------------------------------
+# 初始化环境
+# ------------------------------
+init_env() {
+    detect_os
+    install_nginx
+    install_certbot
+}
+
+# ------------------------------
+# 获取当前所有域名列表
+# ------------------------------
+get_domain_list() {
+    DOMAINS=()
+    for f in "$CONFIG_DIR"/*.conf; do
+        [ -e "$f" ] || continue
+        DOMAINS+=("$(basename "$f" .conf)")
+    done
+}
+
+# ------------------------------
+# 添加域名配置
+# ------------------------------
 add_site() {
     read -p "请输入域名 (例如 example.com): " DOMAIN
     read -p "请输入证书所在目录 (例如 /etc/nginx/ssl): " CERT_DIR
@@ -58,6 +182,7 @@ add_site() {
         done
         echo -e "${GREEN}0) 手动输入证书和密钥路径${RESET}"
         read -p "请选择证书编号: " cert_idx
+
         if [[ "$cert_idx" == "0" ]]; then
             read -p "请输入证书路径(例如 /etc/nginx/ssl/example.com.pem): " CERT_PATH
             read -p "请输入密钥路径(例如 /etc/nginx/ssl/example.com.key): " KEY_PATH
@@ -75,38 +200,79 @@ add_site() {
         fi
     fi
 
-    read -p "请输入反代目标地址 (例如 http://127.0.0.1:8000): " TARGET
-    read -p "请输入上传文件大小限制 (例如 50M，默认 50M): " UPLOAD_SIZE
-    UPLOAD_SIZE=${UPLOAD_SIZE:-50M}   # 默认值50M
+    # 上游服务配置
+    read -p "请输入上游服务地址 (默认 127.0.0.1): " UPSTREAM_HOST
+    UPSTREAM_HOST=${UPSTREAM_HOST:-127.0.0.1}
+    read -p "请输入上游服务端口 (默认 8008): " UPSTREAM_PORT
+    UPSTREAM_PORT=${UPSTREAM_PORT:-8008}
 
-    CONFIG_PATH="$SITES_AVAILABLE/$DOMAIN.conf"
-    if [[ -f "$CONFIG_PATH" ]]; then
-        echo -e "${RED}站点已存在！${RESET}"
-        pause
-        return
-    fi
+    # CDN 回源设置
+    echo "CDN 回源已默认开启"
+    read -p "请输入你的 CDN 回源 IP 地址段 (默认 173.245.48.0/20): " CDN_IP_RANGE
+    CDN_IP_RANGE=${CDN_IP_RANGE:-173.245.48.0/20}
+    read -p "请输入 CDN 提供的私有 Header 名称 (默认 CF-Connecting-IP): " CDN_HEADER
+    CDN_HEADER=${CDN_HEADER:-CF-Connecting-IP}
+
+    REAL_IP_CONFIG="set_real_ip_from $CDN_IP_RANGE;
+    real_ip_header $CDN_HEADER;"
+    HEADER_VAR="\$http_${CDN_HEADER//-/_}"
+
+    # 写入 Nginx 配置
+    CONFIG_PATH="$CONFIG_DIR/$DOMAIN.conf"
+    ENABLED_PATH="$ENABLED_DIR/$DOMAIN.conf"
 
     cat > "$CONFIG_PATH" <<EOF
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
+
     server_name $DOMAIN;
 
-    client_max_body_size $UPLOAD_SIZE;
-
-    ssl_certificate $CERT_PATH;
+    ssl_certificate     $CERT_PATH;
     ssl_certificate_key $KEY_PATH;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_stapling on;
 
-    location / {
-        proxy_pass $TARGET;
-        proxy_http_version 1.1;
+    underscores_in_headers on;
+    $REAL_IP_CONFIG
+
+    # gRPC
+    location ^~ /proto.NezhaService/ {
+        grpc_set_header Host \$host;
+        grpc_set_header nz-realip $HEADER_VAR;
+        grpc_read_timeout 600s;
+        grpc_send_timeout 600s;
+        grpc_socket_keepalive on;
+        client_max_body_size 10m;
+        grpc_buffer_size 4m;
+        grpc_pass grpc://dashboard;
+    }
+
+    # WebSocket
+    location ~* ^/api/v1/ws/(server|terminal|file)(.*)\$ {
+        proxy_set_header Host \$host;
+        proxy_set_header nz-realip $HEADER_VAR;
+        proxy_set_header Origin https://\$host;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_pass http://$UPSTREAM_HOST:$UPSTREAM_PORT;
+    }
+
+    # Web
+    location / {
         proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 86400;
+        proxy_set_header nz-realip $HEADER_VAR;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffer_size 128k;
+        proxy_buffers 4 256k;
+        proxy_busy_buffers_size 256k;
+        proxy_max_temp_file_size 0;
+        proxy_pass http://$UPSTREAM_HOST:$UPSTREAM_PORT;
     }
 }
 
@@ -116,125 +282,309 @@ server {
     server_name $DOMAIN;
     return 301 https://\$host\$request_uri;
 }
+
+upstream dashboard {
+    server $UPSTREAM_HOST:$UPSTREAM_PORT;
+    keepalive 512;
+}
 EOF
 
-    ln -sf "$CONFIG_PATH" "$SITES_ENABLED/$DOMAIN.conf"
-    nginx_reload
-    echo -e "${GREEN}站点 $DOMAIN 添加成功！${RESET}"
+    # 启用配置
+    rm -f "$ENABLED_PATH"
+    ln -s "$CONFIG_PATH" "$ENABLED_DIR/"
+
+    nginx -t && systemctl reload nginx
+    echo -e "${GREEN}域名 $DOMAIN 配置完成！${RESET}"
     pause
 }
 
-# ---------------------------
-# 修改站点
-# ---------------------------
+# ------------------------------
+# 修改域名配置
+# ------------------------------
 modify_site() {
-    SITES=($(list_sites))
-    if [ ${#SITES[@]} -eq 0 ]; then
-        echo -e "${RED}没有可修改的站点${RESET}"
+    get_domain_list
+    if [ ${#DOMAINS[@]} -eq 0 ]; then
+        echo -e "${RED}暂无已配置的域名${RESET}"
         pause
         return
     fi
 
-    echo -e "${GREEN}=== 可修改站点列表 ===${RESET}"
-    for i in "${!SITES[@]}"; do
-        printf "${GREEN}%d) %s${RESET}\n" $((i+1)) "${SITES[$i]}"
+    echo -e "${GREEN}=== 已配置的域名 ===${RESET}"
+    for i in "${!DOMAINS[@]}"; do
+        echo "$((i+1)). ${DOMAINS[$i]}"
     done
-    echo -e "${GREEN}0) 取消${RESET}"
-    read -p "请输入要修改的站点编号: " idx
-    if [[ "$idx" == "0" ]]; then return; fi
-    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#SITES[@]}" ]; then
+    echo "0. 返回"
+
+    read -p "请输入要修改的域名编号: " choice
+    if [ "$choice" == "0" ]; then
+        return
+    fi
+
+    INDEX=$((choice-1))
+    if [ $INDEX -lt 0 ] || [ $INDEX -ge ${#DOMAINS[@]} ]; then
         echo -e "${RED}无效编号${RESET}"
         pause
         return
     fi
 
-    SITE="${SITES[$((idx-1))]}"
-    CONFIG_PATH="$SITES_AVAILABLE/$SITE.conf"
-    echo -e "${GREEN}正在修改站点 $SITE 配置：${RESET}"
+    DOMAIN="${DOMAINS[$INDEX]}"
+    CONFIG_PATH="$CONFIG_DIR/$DOMAIN.conf"
+    ENABLED_PATH="$ENABLED_DIR/$DOMAIN.conf"
 
-    read -p "请输入新的证书路径 (回车保持不变): " NEW_CERT
-    read -p "请输入新的私钥路径 (回车保持不变): " NEW_KEY
-    read -p "请输入新的反代目标地址 (回车保持不变): " NEW_TARGET
-    read -p "请输入新的上传大小 (回车保持不变): " NEW_SIZE
+    echo -e "${GREEN}修改域名 $DOMAIN 配置${RESET}"
 
-    [[ -n "$NEW_CERT" ]] && sed -i "s|ssl_certificate .*;|ssl_certificate $NEW_CERT;|" "$CONFIG_PATH"
-    [[ -n "$NEW_KEY" ]] && sed -i "s|ssl_certificate_key .*;|ssl_certificate_key $NEW_KEY;|" "$CONFIG_PATH"
-    [[ -n "$NEW_TARGET" ]] && sed -i "s|proxy_pass .*;|proxy_pass $NEW_TARGET;|" "$CONFIG_PATH"
-    [[ -n "$NEW_SIZE" ]] && sed -i "s|client_max_body_size .*;|client_max_body_size $NEW_SIZE;|" "$CONFIG_PATH"
-
-    nginx_reload
-    echo -e "${GREEN}站点 $SITE 修改成功！${RESET}"
-    pause
+    # 使用与 add_site 相同的证书选择逻辑
+    add_site_for_modify "$DOMAIN"
 }
 
-# ---------------------------
-# 删除站点
-# ---------------------------
-delete_site() {
-    SITES=($(list_sites))
-    if [ ${#SITES[@]} -eq 0 ]; then
-        echo -e "${RED}没有可删除的站点${RESET}"
+# 为修改复用添加流程（避免重复代码）
+add_site_for_modify() {
+    local DOMAIN="$1"
+    read -p "请输入证书所在目录 (例如 /etc/nginx/ssl): " CERT_DIR
+
+    if [[ ! -d "$CERT_DIR" ]]; then
+        echo -e "${RED}目录不存在${RESET}"
         pause
         return
     fi
 
-    echo -e "${GREEN}=== 可删除站点列表 ===${RESET}"
-    for i in "${!SITES[@]}"; do
-        printf "${GREEN}%d) %s${RESET}\n" $((i+1)) "${SITES[$i]}"
-    done
-    echo -e "${GREEN}0) 取消${RESET}"
-    read -p "请输入要删除的站点编号: " idx
-    if [[ "$idx" == "0" ]]; then return; fi
-    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#SITES[@]}" ]; then
-        echo -e "${RED}无效编号${RESET}"
-        pause
-        return
-    fi
-
-    SITE="${SITES[$((idx-1))]}"
-    rm -f "$SITES_AVAILABLE/$SITE.conf"
-    rm -f "$SITES_ENABLED/$SITE.conf"
-
-    nginx_reload
-    echo -e "${GREEN}站点 $SITE 删除成功！${RESET}"
-    pause
-}
-
-# ---------------------------
-# 查看站点
-# ---------------------------
-view_sites() {
-    SITES=($(list_sites))
-    if [ ${#SITES[@]} -eq 0 ]; then
-        echo -e "${RED}没有配置的站点${RESET}"
+    CERT_FILES=($(find "$CERT_DIR" -maxdepth 1 -type f \( -name "*.crt" -o -name "*.pem" \)))
+    if [ ${#CERT_FILES[@]} -eq 0 ]; then
+        echo -e "${RED}没有找到证书文件，请手动输入路径${RESET}"
+        read -p "请输入证书路径: " CERT_PATH
+        read -p "请输入密钥路径: " KEY_PATH
     else
-        echo -e "${GREEN}=== 已配置站点 ===${RESET}"
-        for i in "${!SITES[@]}"; do
-            printf "${GREEN}%d) %s${RESET}\n" $((i+1)) "${SITES[$i]}"
+        echo -e "${GREEN}=== 可选择证书列表 ===${RESET}"
+        for i in "${!CERT_FILES[@]}"; do
+            FILE_NAME=$(basename "${CERT_FILES[$i]}")
+            DOMAIN_NAME="${FILE_NAME%.*}"
+            printf "${GREEN}%d) %s${RESET}\n" $((i+1)) "$DOMAIN_NAME"
         done
+        echo -e "${GREEN}0) 手动输入证书和密钥路径${RESET}"
+        read -p "请选择证书编号: " cert_idx
+
+        if [[ "$cert_idx" == "0" ]]; then
+            read -p "请输入证书路径: " CERT_PATH
+            read -p "请输入密钥路径: " KEY_PATH
+        else
+            CERT_PATH="${CERT_FILES[$((cert_idx-1))]}"
+            KEY_PATH="${CERT_PATH%.*}.key"
+            if [[ ! -f "$KEY_PATH" ]]; then
+                read -p "请输入密钥路径: " KEY_PATH
+            fi
+        fi
     fi
+
+    # 上游服务地址
+    read -p "请输入上游服务地址 (默认 127.0.0.1): " UPSTREAM_HOST
+    UPSTREAM_HOST=${UPSTREAM_HOST:-127.0.0.1}
+    read -p "请输入上游服务端口 (默认 8008): " UPSTREAM_PORT
+    UPSTREAM_PORT=${UPSTREAM_PORT:-8008}
+
+    # CDN 回源设置
+    echo "CDN 回源已默认开启"
+    read -p "请输入你的 CDN 回源 IP 地址段 (默认 173.245.48.0/20): " CDN_IP_RANGE
+    CDN_IP_RANGE=${CDN_IP_RANGE:-173.245.48.0/20}
+    read -p "请输入 CDN 提供的私有 Header 名称 (默认 CF-Connecting-IP): " CDN_HEADER
+    CDN_HEADER=${CDN_HEADER:-CF-Connecting-IP}
+
+    REAL_IP_CONFIG="set_real_ip_from $CDN_IP_RANGE;
+    real_ip_header $CDN_HEADER;"
+    HEADER_VAR="\$http_${CDN_HEADER//-/_}"
+
+    # 写入 Nginx 配置
+    CONFIG_PATH="$CONFIG_DIR/$DOMAIN.conf"
+    ENABLED_PATH="$ENABLED_DIR/$DOMAIN.conf"
+
+    cat > "$CONFIG_PATH" <<EOF
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+
+    server_name $DOMAIN;
+
+    ssl_certificate     $CERT_PATH;
+    ssl_certificate_key $KEY_PATH;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_stapling on;
+
+    underscores_in_headers on;
+    $REAL_IP_CONFIG
+
+    # gRPC
+    location ^~ /proto.NezhaService/ {
+        grpc_set_header Host \$host;
+        grpc_set_header nz-realip $HEADER_VAR;
+        grpc_read_timeout 600s;
+        grpc_send_timeout 600s;
+        grpc_socket_keepalive on;
+        client_max_body_size 10m;
+        grpc_buffer_size 4m;
+        grpc_pass grpc://dashboard;
+    }
+
+    # WebSocket
+    location ~* ^/api/v1/ws/(server|terminal|file)(.*)\$ {
+        proxy_set_header Host \$host;
+        proxy_set_header nz-realip $HEADER_VAR;
+        proxy_set_header Origin https://\$host;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_pass http://$UPSTREAM_HOST:$UPSTREAM_PORT;
+    }
+
+    # Web
+    location / {
+        proxy_set_header Host \$host;
+        proxy_set_header nz-realip $HEADER_VAR;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffer_size 128k;
+        proxy_buffers 4 256k;
+        proxy_busy_buffers_size 256k;
+        proxy_max_temp_file_size 0;
+        proxy_pass http://$UPSTREAM_HOST:$UPSTREAM_PORT;
+    }
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $DOMAIN;
+    return 301 https://\$host\$request_uri;
+}
+
+upstream dashboard {
+    server $UPSTREAM_HOST:$UPSTREAM_PORT;
+    keepalive 512;
+}
+EOF
+
+    # 启用配置
+    rm -f "$ENABLED_PATH"
+    ln -s "$CONFIG_PATH" "$ENABLED_DIR/"
+
+    nginx -t && systemctl reload nginx
+    echo -e "${GREEN}域名 $DOMAIN 配置修改完成！${RESET}"
     pause
 }
 
-# ---------------------------
-# 主菜单
-# ---------------------------
-while true; do
-    clear
-    echo -e "${GREEN}=== Nginx证书反代管理 ===${RESET}"
-    echo -e "${GREEN}1) 添加配置${RESET}"
-    echo -e "${GREEN}2) 修改配置${RESET}"
-    echo -e "${GREEN}3) 删除配置${RESET}"
-    echo -e "${GREEN}4) 查看现有域名${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    read -p "请选择操作 [0-4]: " choice
+# ------------------------------
+# 删除域名配置
+# ------------------------------
+delete_site() {
+    get_domain_list
+    if [ ${#DOMAINS[@]} -eq 0 ]; then
+        echo -e "${RED}暂无已配置的域名${RESET}"
+        pause
+        return
+    fi
 
-    case "$choice" in
-        1) add_site ;;
-        2) modify_site ;;
-        3) delete_site ;;
-        4) view_sites ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}"; pause ;;
-    esac
-done
+    echo -e "${GREEN}=== 已配置的域名 ===${RESET}"
+    for i in "${!DOMAINS[@]}"; do
+        echo "$((i+1)). ${DOMAINS[$i]}"
+    done
+    echo "0. 返回"
+
+    read -p "请输入要删除的域名编号: " choice
+    if [ "$choice" == "0" ]; then
+        return
+    fi
+
+    INDEX=$((choice-1))
+    if [ $INDEX -lt 0 ] || [ $INDEX -ge ${#DOMAINS[@]} ]; then
+        echo -e "${RED}无效编号${RESET}"
+        pause
+        return
+    fi
+
+    DOMAIN="${DOMAINS[$INDEX]}"
+    CONFIG_PATH="$CONFIG_DIR/$DOMAIN.conf"
+    ENABLED_PATH="$ENABLED_DIR/$DOMAIN.conf"
+
+    rm -f "$CONFIG_PATH" "$ENABLED_PATH"
+    nginx -t && systemctl reload nginx
+    echo -e "${GREEN}已删除 $DOMAIN 配置${RESET}"
+    pause
+}
+
+# ------------------------------
+# 查看域名信息
+# ------------------------------
+list_sites() {
+    get_domain_list
+    if [ ${#DOMAINS[@]} -eq 0 ]; then
+        echo -e "${RED}暂无已配置的域名${RESET}"
+        pause
+        return
+    fi
+
+    echo -e "${GREEN}=== 已配置的域名 ===${RESET}"
+    for i in "${!DOMAINS[@]}"; do
+        echo "$((i+1)). ${DOMAINS[$i]}"
+    done
+    echo "0. 返回"
+
+    read -p "请输入要查看的域名编号: " choice
+    if [ "$choice" == "0" ]; then
+        return
+    fi
+
+    INDEX=$((choice-1))
+    if [ $INDEX -lt 0 ] || [ $INDEX -ge ${#DOMAINS[@]} ]; then
+        echo -e "${RED}无效编号${RESET}"
+        pause
+        return
+    fi
+
+    DOMAIN="${DOMAINS[$INDEX]}"
+    CONFIG_PATH="$CONFIG_DIR/$DOMAIN.conf"
+
+    echo -e "${GREEN}====== $DOMAIN 配置详情 ======${RESET}"
+    echo "配置文件: $CONFIG_PATH"
+    echo "监听端口:"
+    grep -E "listen " "$CONFIG_PATH"
+    echo "证书:"
+    grep "ssl_certificate " "$CONFIG_PATH" | head -n1
+    grep "ssl_certificate_key " "$CONFIG_PATH" | head -n1
+    echo "上游服务:"
+    grep "proxy_pass " "$CONFIG_PATH" | head -n1
+    echo "gRPC: 已启用"
+    echo "WebSocket: 已启用"
+    echo "HTTP/2: 已启用"
+    echo "CDN 设置:"
+    grep -E "set_real_ip_from|real_ip_header" "$CONFIG_PATH" || echo "未配置"
+    pause
+}
+
+# ------------------------------
+# 主菜单
+# ------------------------------
+main_menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}====== 哪吒反向代理管理 ======${RESET}"
+        echo -e "${GREEN}1. 安装Nginx${RESET}"
+        echo -e "${GREEN}2. 添加域名配置${RESET}"
+        echo -e "${GREEN}3. 删除域名配置${RESET}"
+        echo -e "${GREEN}4. 查看已配置域名信息${RESET}"
+        echo -e "${GREEN}5. 修改已有域名配置${RESET}"
+        echo -e "${GREEN}0. 退出${RESET}"
+        read -p "请选择 [0-5]: " choice
+        case $choice in
+            1) init_env ;;   
+            2) add_site ;;
+            3) delete_site ;;
+            4) list_sites ;;
+            5) modify_site ;;
+            0) exit 0 ;;
+            *) echo "无效选项"; sleep 1 ;;
+        esac
+    done
+}
+
+main_menu

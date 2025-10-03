@@ -1,396 +1,252 @@
 #!/bin/bash
 set -e
 
+# ========================
+# Caddy 管理脚本（统一目录 + IPv6兼容 + 证书状态）
+# ========================
+
+CADDY_DIR="/opt/caddy"
+CADDYFILE="$CADDY_DIR/Caddyfile"
+CADDY_DATA="$CADDY_DIR/data"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
+
+# 确保目录存在
+sudo mkdir -p "$CADDY_DIR" "$CADDY_DATA"
+sudo touch "$CADDYFILE"
+sudo chown $USER:$USER "$CADDYFILE"
 
 pause() {
     echo -ne "${YELLOW}按回车返回菜单...${RESET}"
     read
 }
 
-configure_firewall() {
-    for PORT in 80 443; do
-        if command -v ufw >/dev/null 2>&1; then
-            ufw allow $PORT || true
-        elif command -v firewall-cmd >/dev/null 2>&1; then
-            firewall-cmd --permanent --add-port=$PORT/tcp || true
-            firewall-cmd --reload || true
-        fi
-    done
-}
+install_caddy() {
+    if ! command -v caddy >/dev/null 2>&1; then
+        echo -e "${GREEN}正在安装 Caddy...${RESET}"
+        sudo apt install -yq debian-keyring debian-archive-keyring apt-transport-https curl
+        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+        sudo apt update -q
+        sudo apt install -yq caddy
+        echo -e "${GREEN}Caddy 安装完成${RESET}"
 
-remove_default_server() {
-    echo -e "${YELLOW}清理系统自带的 default server 配置...${RESET}"
-    rm -f /etc/nginx/sites-enabled/default
-    rm -f /etc/nginx/sites-available/default
-}
+        # 创建 systemd 服务
+        sudo systemctl stop caddy 2>/dev/null || true
+        sudo systemctl disable caddy 2>/dev/null || true
+        sudo tee /etc/systemd/system/caddy.service > /dev/null <<EOF
+[Unit]
+Description=Caddy
+After=network.target
 
-ensure_nginx_conf() {
-    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/modules-enabled
-    if [ ! -f /etc/nginx/nginx.conf ]; then
-        cat > /etc/nginx/nginx.conf <<'EOF'
-user www-data;
-worker_processes auto;
-pid /run/nginx.pid;
-include /etc/nginx/modules-enabled/*.conf;
+[Service]
+User=$USER
+Group=$USER
+ExecStart=/usr/bin/caddy run --environ --config $CADDYFILE
+ExecReload=/usr/bin/caddy reload --config $CADDYFILE
+Restart=on-failure
 
-events {
-    worker_connections 768;
-}
-
-http {
-    sendfile on;
-    tcp_nopush on;
-    types_hash_max_size 2048;
-    include /etc/nginx/mime.types;
-    default_type application/octet-stream;
-
-    access_log /var/log/nginx/access.log;
-    error_log /var/log/nginx/error.log;
-
-    gzip on;
-    include /etc/nginx/conf.d/*.conf;
-    include /etc/nginx/sites-enabled/*;
-}
+[Install]
+WantedBy=multi-user.target
 EOF
-    fi
-
-    if [ ! -f /etc/nginx/mime.types ]; then
-        cat > /etc/nginx/mime.types <<'EOF'
-types {
-    text/html  html htm shtml;
-    text/css   css;
-    text/xml   xml;
-    image/gif  gif;
-    image/jpeg jpeg jpg;
-    application/javascript js;
-    application/atom+xml atom;
-    application/rss+xml rss;
-}
-EOF
-    fi
-}
-
-create_default_server() {
-    DEFAULT_PATH="/etc/nginx/sites-available/default_server_block"
-    [ ! -f "$DEFAULT_PATH" ] && cat > "$DEFAULT_PATH" <<EOF
-server {
-    listen 80 default_server;
-    server_name _;
-    return 403;
-}
-EOF
-    ln -sf "$DEFAULT_PATH" /etc/nginx/sites-enabled/default_server_block
-}
-
-generate_server_config() {
-    DOMAIN=$1
-    TARGET=$2
-    IS_WS=$3
-    CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
-
-    if [ "$IS_WS" == "y" ]; then
-        WS_HEADERS="proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \"Upgrade\";"
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now caddy
+        echo -e "${GREEN}Caddy 已启用自定义目录 $CADDY_DIR${RESET}"
     else
-        WS_HEADERS=""
+        echo -e "${GREEN}Caddy 已安装${RESET}"
     fi
-
-    cat > "$CONFIG_PATH" <<EOF
-server {
-    listen 80;
-    server_name $DOMAIN;
-    return 301 https://\$host\$request_uri;
 }
 
-server {
-    listen 443 ssl;
-    server_name $DOMAIN;
-
-    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
-
-    location / {
-        proxy_pass $TARGET;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        $WS_HEADERS
-    }
-}
-EOF
-    ln -sf "$CONFIG_PATH" "/etc/nginx/sites-enabled/$DOMAIN"
-}
-
-check_domain_resolution() {
-    DOMAIN=$1
-    VPS_IP=$(curl -s https://ipinfo.io/ip)
-    DOMAIN_IP=$(dig +short "$DOMAIN" | tail -n1)
-    if [ "$DOMAIN_IP" != "$VPS_IP" ]; then
-        echo -e "${RED}警告: 域名 $DOMAIN 解析为 $DOMAIN_IP, VPS IP 为 $VPS_IP${RESET}"
+uninstall_caddy() {
+    if command -v caddy >/dev/null 2>&1; then
+        echo -e "${GREEN}正在卸载 Caddy...${RESET}"
+        sudo systemctl stop caddy
+        sudo apt remove -y caddy
+        sudo apt autoremove -y
+        sudo rm -f /etc/apt/sources.list.d/caddy-stable.list
+        sudo rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+        sudo rm -f /etc/systemd/system/caddy.service
+        sudo systemctl daemon-reload
+        echo -e "${GREEN}Caddy 已卸载${RESET}"
     else
-        echo -e "${GREEN}域名解析正常${RESET}"
+        echo -e "${RED}Caddy 未安装${RESET}"
     fi
 }
 
-# ------------------------------
-# 功能函数
-# ------------------------------
-
-install_nginx() {
-    ensure_nginx_conf
-    remove_default_server
-
-    DEBIAN_FRONTEND=noninteractive apt update
-    DEBIAN_FRONTEND=noninteractive apt upgrade -y \
-        -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confold"
-
-    DEBIAN_FRONTEND=noninteractive apt install -y curl dnsutils \
-        -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confold"
-
-    echo -e "${GREEN}开始安装 Nginx 和 Certbot...${RESET}"
-    if ! DEBIAN_FRONTEND=noninteractive apt install -y \
-        -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confold" \
-        nginx certbot python3-certbot-nginx; then
-        echo -e "${RED}安装失败，尝试自动修复...${RESET}"
-        uninstall_nginx
-        echo -e "${YELLOW}重新尝试安装...${RESET}"
-        DEBIAN_FRONTEND=noninteractive apt install -y \
-            -o Dpkg::Options::="--force-confdef" \
-            -o Dpkg::Options::="--force-confold" \
-            nginx certbot python3-certbot-nginx || {
-            echo -e "${RED}修复后安装仍然失败，请手动检查系统环境！${RESET}"
-            pause
-            return
-        }
+reload_caddy() {
+    if ! systemctl is-active --quiet caddy; then
+        echo -e "${YELLOW}Caddy 服务未启动，正在启动...${RESET}"
+        sudo systemctl start caddy
     fi
-
-    remove_default_server
-    create_default_server
-    configure_firewall
-    systemctl daemon-reload
-    systemctl enable --now nginx
-
-    echo -ne "${GREEN}请输入邮箱地址: ${RESET}"; read EMAIL
-    echo -ne "${GREEN}请输入域名: ${RESET}"; read DOMAIN
-    check_domain_resolution "$DOMAIN"
-    echo -ne "${GREEN}请输入反代目标: ${RESET}"; read TARGET
-    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n): ${RESET}"; read IS_WS
-
-    certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-    generate_server_config "$DOMAIN" "$TARGET" "$IS_WS"
-    nginx -t && systemctl reload nginx
-    systemctl enable --now certbot.timer
-    echo -e "${GREEN}安装完成！访问: https://$DOMAIN${RESET}"
-    pause
+    sudo systemctl reload caddy
+    echo -e "${GREEN}Caddy 配置已重载${RESET}"
 }
 
-add_config() {
-    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-    echo -ne "${GREEN}请输入域名: ${RESET}"; read DOMAIN
-    check_domain_resolution "$DOMAIN"
-    echo -ne "${GREEN}请输入反代目标: ${RESET}"; read TARGET
-
-    EMAIL_FILE="/etc/nginx/.cert_emails"
-    if [ -f "$EMAIL_FILE" ]; then
-        EMAILS=($(cat "$EMAIL_FILE"))
-    else
-        EMAILS=()
+# 自动处理 IPv6 地址，加方括号和引号
+format_target() {
+    local TARGET="$1"
+    if [[ "$TARGET" == *:* ]]; then
+        TARGET="\"[$TARGET]\""
     fi
-
-    if [ ${#EMAILS[@]} -gt 0 ]; then
-        echo -e "${GREEN}已有邮箱列表:${RESET}"
-        for i in "${!EMAILS[@]}"; do
-            echo -e "${GREEN}$((i+1))) ${EMAILS[$i]}${RESET}"
-        done
-        echo -ne "${GREEN}请选择邮箱编号 (或输入新邮箱): ${RESET}"; read choice
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#EMAILS[@]} ]; then
-            EMAIL="${EMAILS[$((choice-1))]}"
-        else
-            EMAIL="$choice"
-            echo "$EMAIL" >> "$EMAIL_FILE"
-            sort -u "$EMAIL_FILE" -o "$EMAIL_FILE"
-        fi
-    else
-        echo -ne "${GREEN}请输入邮箱地址: ${RESET}"; read EMAIL
-        echo "$EMAIL" > "$EMAIL_FILE"
-    fi
-
-    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n): ${RESET}"; read IS_WS
-
-    [ -f "/etc/nginx/sites-available/$DOMAIN" ] && echo -e "${YELLOW}配置已存在${RESET}" && pause && return
-
-    certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-    generate_server_config "$DOMAIN" "$TARGET" "$IS_WS"
-    create_default_server
-    nginx -t && systemctl reload nginx
-    echo -e "${GREEN}添加完成！访问: https://$DOMAIN${RESET}"
-    pause
+    echo "$TARGET"
 }
 
-modify_config() {
-    CONFIG_DIR="/etc/nginx/sites-available"
-    [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}还没有任何配置文件！${RESET}" && pause && return
+add_site() {
+    read -p "请输入域名 (example.com)： " DOMAIN
+    read -p "是否需要 h2c/gRPC 代理？(y/n)： " H2C
 
-    DOMAINS=($(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort))
-    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有域名配置！${RESET}" && pause && return
+    SITE_CONFIG="${DOMAIN} {\n"
 
-    echo -e "${GREEN}现有配置的域名:${RESET}"
-    for i in "${!DOMAINS[@]}"; do
-        echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"
-    done
-
-    echo -ne "${GREEN}请输入编号 (0 返回): ${RESET}"
-    read choice
-    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ ]]; then
-        echo -e "${YELLOW}已取消${RESET}"; return
-    fi
-    if [ "$choice" -eq 0 ]; then return; fi
-    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效选择${RESET}"; pause; return
+    if [[ "$H2C" == "y" ]]; then
+        read -p "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： " H2C_PATH
+        read -p "请输入内网目标地址 (例如 127.0.0.1:8008)： " H2C_TARGET
+        H2C_TARGET=$(format_target "$H2C_TARGET")
+        SITE_CONFIG+="    reverse_proxy ${H2C_PATH} h2c://${H2C_TARGET}\n"
     fi
 
-    DOMAIN="${DOMAINS[$((choice-1))]}"
-    CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
-    echo -ne "${GREEN}请输入新反代目标: ${RESET}"; read TARGET
-    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n): ${RESET}"; read IS_WS
-    echo -ne "${GREEN}是否更新邮箱? (y/n): ${RESET}"; read c
-    if [[ "$c" == "y" ]]; then
-        echo -ne "${GREEN}新邮箱: ${RESET}"; read EMAIL
-        certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-    fi
-    generate_server_config "$DOMAIN" "$TARGET" "$IS_WS"
-    create_default_server
-    nginx -t && systemctl reload nginx
-    echo -e "${GREEN}修改完成！访问: https://$DOMAIN${RESET}"
-    pause
+    read -p "请输入普通 HTTP 代理目标 (默认 127.0.0.1:8008)： " HTTP_TARGET
+    HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
+    HTTP_TARGET=$(format_target "$HTTP_TARGET")
+    SITE_CONFIG+="    reverse_proxy ${HTTP_TARGET}\n"
+    SITE_CONFIG+="}\n\n"
+
+    echo -e "$SITE_CONFIG" >> "$CADDYFILE"
+    echo -e "${GREEN}站点 ${DOMAIN} 添加成功${RESET}"
+
+    reload_caddy
 }
 
-delete_config() {
-    CONFIG_DIR="/etc/nginx/sites-available"
-    [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}没有配置文件！${RESET}" && pause && return
-
-    DOMAINS=($(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort))
-    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有域名配置！${RESET}" && pause && return
-
-    echo -e "${GREEN}可删除的域名:${RESET}"
-    for i in "${!DOMAINS[@]}"; do
-        echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"
-    done
-
-    echo -ne "${GREEN}请选择编号 (0 返回): ${RESET}"
-    read choice
-    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ ]]; then
-        echo -e "${YELLOW}已取消${RESET}"; return
-    fi
-    if [ "$choice" -eq 0 ]; then return; fi
-    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效选择${RESET}"; pause; return
-    fi
-
-    DOMAIN="${DOMAINS[$((choice-1))]}"
-    rm -f "/etc/nginx/sites-available/$DOMAIN" "/etc/nginx/sites-enabled/$DOMAIN"
-    certbot delete --cert-name "$DOMAIN" -n || true
-    nginx -t && systemctl reload nginx
-    echo -e "${GREEN}域名 $DOMAIN 已删除${RESET}"
-    pause
-}
-
-test_renew() {
-    CONFIG_DIR="/etc/nginx/sites-available"
-    [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}没有配置文件${RESET}" && pause && return
-
-    DOMAINS=($(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort))
-    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有域名配置！${RESET}" && pause && return
-
-    echo -e "${GREEN}已有配置:${RESET}"
-    for i in "${!DOMAINS[@]}"; do
-        echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"
-    done
-
-    echo -ne "${GREEN}选择编号 (0 返回): ${RESET}"
-    read choice
-    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ ]]; then
-        echo -e "${YELLOW}已取消${RESET}"; return
-    fi
-    if [ "$choice" -eq 0 ]; then return; fi
-    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效选择${RESET}"; pause; return
-    fi
-
-    DOMAIN="${DOMAINS[$((choice-1))]}"
-    echo -e "${GREEN}正在测试 $DOMAIN 的证书续期...${RESET}"
-    certbot renew --dry-run --cert-name "$DOMAIN"
-    pause
-}
-
-check_cert() {
-    CERT_DIR="/etc/letsencrypt/live"
-    if [ ! -d "$CERT_DIR" ]; then
-        echo -e "${GREEN}没有找到任何证书"
-        pause
-        return
-    fi
-
-    echo -e "${GREEN}现有证书的域名：${RESET}"
-    i=1
-    DOMAINS=()
-    for DOMAIN in $(ls "$CERT_DIR"); do
-        if [ -f "$CERT_DIR/$DOMAIN/fullchain.pem" ]; then
-            echo -e "${GREEN}$i) $DOMAIN${RESET}"
-            DOMAINS+=("$DOMAIN")
-            i=$((i+1))
-        fi
-    done
-
+view_sites() {
+    mapfile -t DOMAINS < <(grep -E '^[a-zA-Z0-9.-]+ *{' $CADDYFILE | sed 's/ {//')
     if [ ${#DOMAINS[@]} -eq 0 ]; then
-        echo -e "${GREEN}没有找到任何有效证书${RESET}"
+        echo -e "${YELLOW}没有已配置的域名${RESET}"
         pause
         return
     fi
 
-    echo -ne "${GREEN}请选择要查看的域名编号 (0 返回): ${RESET}"
-    read choice
+    echo -e "${GREEN}请选择要查看的域名编号（输入0返回菜单）:${RESET}"
+    for i in "${!DOMAINS[@]}"; do
+        echo "$((i+1))) ${DOMAINS[$i]}"
+    done
 
-    # 如果输入为空或不是数字
-    if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
-        echo -e "${GREEN}无效输入${RESET}"
+    read -p "输入编号： " NUM
+
+    if [[ "$NUM" == "0" ]]; then
+        return
+    fi
+
+    if ! [[ "$NUM" =~ ^[0-9]+$ ]] || [ "$NUM" -lt 1 ] || [ "$NUM" -gt ${#DOMAINS[@]} ]; then
+        echo -e "${RED}无效编号${RESET}"
         pause
         return
     fi
 
-    if [ "$choice" -eq 0 ]; then
-        return
-    fi
+    DOMAIN="${DOMAINS[$((NUM-1))]}"
+    CERT_FILE="$CADDY_DATA/certificates/acme-v02.api.letsencrypt.org-directory/$DOMAIN.crt"
 
-    if [ "$choice" -ge 1 ] && [ "$choice" -le ${#DOMAINS[@]} ]; then
-        SELECTED=${DOMAINS[$((choice-1))]}
-        certbot certificates --cert-name "$SELECTED"
+    if [ -f "$CERT_FILE" ]; then
+        EXPIRY=$(openssl x509 -enddate -noout -in "$CERT_FILE" | cut -d= -f2)
+        echo -e "${GREEN}${DOMAIN} 证书到期时间：${EXPIRY}${RESET}"
     else
-        echo -e "${GREEN}无效选择${RESET}"
+        echo -e "${YELLOW}${DOMAIN} - 未找到证书${RESET}"
     fi
     pause
 }
 
+delete_site() {
+    mapfile -t DOMAINS < <(grep -E '^[a-zA-Z0-9.-]+ *{' $CADDYFILE | sed 's/ {//')
+    if [ ${#DOMAINS[@]} -eq 0 ]; then
+        echo -e "${YELLOW}没有可删除的域名${RESET}"
+        pause
+        return
+    fi
+
+    echo -e "${GREEN}请选择要删除的域名编号（输入0返回菜单）:${RESET}"
+    for i in "${!DOMAINS[@]}"; do
+        echo "$((i+1))) ${DOMAINS[$i]}"
+    done
+    read -p "输入编号： " NUM
+
+    if [[ "$NUM" == "0" ]]; then
+        return
+    fi
+
+    if ! [[ "$NUM" =~ ^[0-9]+$ ]] || [ "$NUM" -lt 1 ] || [ "$NUM" -gt ${#DOMAINS[@]} ]; then
+        echo -e "${RED}无效编号${RESET}"
+        pause
+        return
+    fi
+
+    DOMAIN="${DOMAINS[$((NUM-1))]}"
+    sudo sed -i "/$DOMAIN {/,/}/d" "$CADDYFILE"
+    echo -e "${GREEN}域名 ${DOMAIN} 已删除${RESET}"
+    reload_caddy
+}
+
+modify_site() {
+    mapfile -t DOMAINS < <(grep -E '^[a-zA-Z0-9.-]+ *{' $CADDYFILE | sed 's/ {//')
+    if [ ${#DOMAINS[@]} -eq 0 ]; then
+        echo -e "${YELLOW}没有可修改的域名${RESET}"
+        pause
+        return
+    fi
+
+    echo -e "${GREEN}请选择要修改的域名编号（输入0返回菜单）:${RESET}"
+    for i in "${!DOMAINS[@]}"; do
+        echo "$((i+1))) ${DOMAINS[$i]}"
+    done
+    read -p "输入编号： " NUM
+
+    if [[ "$NUM" == "0" ]]; then
+        return
+    fi
+
+    if ! [[ "$NUM" =~ ^[0-9]+$ ]] || [ "$NUM" -lt 1 ] || [ "$NUM" -gt ${#DOMAINS[@]} ]; then
+        echo -e "${RED}无效编号${RESET}"
+        pause
+        return
+    fi
+
+    DOMAIN="${DOMAINS[$((NUM-1))]}"
+
+    read -p "请输入普通 HTTP 代理目标 (默认 127.0.0.1:8008)： " HTTP_TARGET
+    HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
+    HTTP_TARGET=$(format_target "$HTTP_TARGET")
+
+    read -p "是否需要 h2c/gRPC 代理？(y/n)： " H2C
+    H2C_CONFIG=""
+    if [[ "$H2C" == "y" ]]; then
+        read -p "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： " H2C_PATH
+        read -p "请输入内网目标地址 (例如 127.0.0.1:8008)： " H2C_TARGET
+        H2C_TARGET=$(format_target "$H2C_TARGET")
+        H2C_CONFIG="    reverse_proxy ${H2C_PATH} h2c://${H2C_TARGET}\n"
+    fi
+
+    NEW_CONFIG="${DOMAIN} {\n${H2C_CONFIG}    reverse_proxy ${HTTP_TARGET}\n}\n\n"
+
+    sudo sed -i "/$DOMAIN {/,/}/c\\$NEW_CONFIG" "$CADDYFILE"
+    echo -e "${GREEN}域名 ${DOMAIN} 配置已修改${RESET}"
+    reload_caddy
+}
 
 check_domains_status() {
     echo -e "${GREEN}域名                  状态       到期时间        剩余天数${RESET}"
     echo -e "${GREEN}------------------------------------------------------------${RESET}"
 
-    CERT_DIR="/etc/letsencrypt/live"
-    [ ! -d "$CERT_DIR" ] && echo "没有找到任何证书" && pause && return
+    CERT_DIR="$CADDY_DATA/certificates/acme-v02.api.letsencrypt.org-directory"
+    [ ! -d "$CERT_DIR" ] && echo -e "${YELLOW}没有找到任何证书${RESET}" && pause && return
 
     DOMAINS=($(ls "$CERT_DIR" | grep -vE 'default|default_server_block' | sort))
+    if [ ${#DOMAINS[@]} -eq 0 ]; then
+        echo -e "${YELLOW}没有找到任何证书${RESET}"
+        pause
+        return
+    fi
+
     for DOMAIN in "${DOMAINS[@]}"; do
-        CERT_PATH="$CERT_DIR/$DOMAIN/fullchain.pem"
+        CERT_PATH="$CERT_DIR/$DOMAIN/$DOMAIN.crt"
         if [ -f "$CERT_PATH" ]; then
             END_DATE=$(openssl x509 -enddate -noout -in "$CERT_PATH" | cut -d= -f2)
             END_TS=$(date -d "$END_DATE" +%s)
@@ -412,44 +268,34 @@ check_domains_status() {
     pause
 }
 
-uninstall_nginx() {
-    echo -e "${YELLOW}卸载 Nginx...${RESET}"
-    systemctl stop nginx || true
-    apt purge -y nginx nginx-common nginx-core certbot python3-certbot-nginx || true
-    apt autoremove -y
-    rm -rf /etc/nginx /etc/letsencrypt
-    remove_default_server
-    echo -e "${GREEN}已卸载${RESET}"
-    pause
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}==== Caddy 管理脚本====${RESET}"
+        echo -e "${GREEN}1) 安装 Caddy${RESET}"
+        echo -e "${GREEN}2) 添加站点${RESET}"
+        echo -e "${GREEN}3) 删除站点${RESET}"
+        echo -e "${GREEN}4) 查看站点及证书（按编号）${RESET}"
+        echo -e "${GREEN}5) 修改站点配置${RESET}"
+        echo -e "${GREEN}6) 重载Caddy${RESET}"
+        echo -e "${GREEN}7) 卸载Caddy${RESET}"
+        echo -e "${GREEN}8) 检查所有域名证书状态${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "请选择操作[0-8]： " choice
+
+        case $choice in
+            1) install_caddy ;;
+            2) add_site ;;
+            3) delete_site ;;
+            4) view_sites ;;
+            5) modify_site ;;
+            6) reload_caddy ;;
+            7) uninstall_caddy ;;
+            8) check_domains_status ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选项${RESET}"; pause ;;
+        esac
+    done
 }
 
-# ------------------------------
-# 主菜单
-# ------------------------------
-while true; do
-    clear
-    echo -e "${GREEN}===== Nginx 管理脚本 =====${RESET}"
-    echo -e "${GREEN}1) 安装 Nginx + 证书${RESET}"
-    echo -e "${GREEN}2) 添加配置${RESET}"
-    echo -e "${GREEN}3) 修改配置${RESET}"
-    echo -e "${GREEN}4) 删除配置${RESET}"
-    echo -e "${GREEN}5) 测试证书续期${RESET}"
-    echo -e "${GREEN}6) 查看证书信息${RESET}"
-    echo -e "${GREEN}7) 卸载 Nginx + 证书${RESET}"
-    echo -e "${GREEN}8) 查看域名证书状态${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -ne "${GREEN}请选择[0-8]: ${RESET}"
-    read choice
-    case $choice in
-        1) install_nginx ;;
-        2) add_config ;;
-        3) modify_config ;;
-        4) delete_config ;;
-        5) test_renew ;;
-        6) check_cert ;;
-        7) uninstall_nginx ;;
-        8) check_domains_status ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ; pause ;;
-    esac
-done
+menu

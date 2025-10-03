@@ -235,6 +235,34 @@ check_domains_status() {
     pause
 }
 
+add_site_with_cert() {
+    read -p "请输入域名 (example.com)： " DOMAIN
+    read -p "是否需要 h2c/gRPC 代理？(y/n)： " H2C
+
+    SITE_CONFIG="${DOMAIN} {\n"
+
+    # 指定证书
+    read -p "请输入证书文件路径 (.pem/.crt)： " CERT_PATH
+    read -p "请输入私钥文件路径 (.key)： " KEY_PATH
+    SITE_CONFIG+="    tls ${CERT_PATH} ${KEY_PATH}\n"
+
+    if [[ "$H2C" == "y" ]]; then
+        read -p "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： " H2C_PATH
+        read -p "请输入内网目标地址 (例如 127.0.0.1:8008)： " H2C_TARGET
+        SITE_CONFIG+="    reverse_proxy ${H2C_PATH} h2c://${H2C_TARGET}\n"
+    fi
+
+    read -p "请输入普通 HTTP 代理目标 (默认 127.0.0.1:8008)： " HTTP_TARGET
+    HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
+    SITE_CONFIG+="    reverse_proxy ${HTTP_TARGET}\n"
+    SITE_CONFIG+="}\n\n"
+
+    echo -e "$SITE_CONFIG" | sudo tee -a $CADDYFILE >/dev/null
+    echo -e "${GREEN}站点 ${DOMAIN} (自定义证书) 添加成功${RESET}"
+
+    reload_caddy
+}
+
 menu() {
     while true; do
         clear
@@ -244,11 +272,12 @@ menu() {
         echo -e "${GREEN}3) 删除站点${RESET}"
         echo -e "${GREEN}4) 查看站点证书信息${RESET}"
         echo -e "${GREEN}5) 修改站点配置${RESET}"
-        echo -e "${GREEN}6) 重载Caddy${RESET}"
-        echo -e "${GREEN}7) 卸载Caddy${RESET}"
-        echo -e "${GREEN}8) 查看所有域名证书状态${RESET}"
+        echo -e "${GREEN}6) 添加站点(自定义证书)${RESET}"
+        echo -e "${GREEN}7) 重载Caddy${RESET}"
+        echo -e "${GREEN}8) 卸载Caddy${RESET}"
+        echo -e "${GREEN}9) 查看所有域名证书状态${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
-        read -p "请选择操作[0-8]： " choice
+        read -p "请选择操作[0-9]： " choice
 
         case $choice in
             1) install_caddy ;;
@@ -256,9 +285,10 @@ menu() {
             3) delete_site ;;
             4) view_sites ;;
             5) modify_site ;;
-            6) reload_caddy ;;
-            7) uninstall_caddy ;;
-            8) check_domains_status ;;
+            6) add_site_with_cert ;;
+            7) reload_caddy ;;
+            8) uninstall_caddy ;;
+            9) check_domains_status ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效选项${RESET}"; pause ;;
         esac

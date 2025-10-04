@@ -57,18 +57,19 @@ install_app() {
 
     echo -e "${GREEN}✅ Miaospeed 容器已启动${RESET}"
     read -p "按回车返回菜单..."
+    menu
 }
 
 # 卸载容器并删除文件
 uninstall_app() {
     docker rm -f "$container_name" &>/dev/null || echo "容器 $container_name 不存在"
-    echo -e "${GREEN}✅ 已删除容器 $container_name${RESET}"
 
     if [ -d "$APP_DIR" ]; then
         rm -rf "$APP_DIR"
-        echo -e "${GREEN}✅ 已删除 $APP_DIR 下的所有文件${RESET}"
+        echo -e "${GREEN}✅ 已删除容器 $container_name${RESET}"
     fi
     read -p "按回车返回菜单..."
+    menu
 }
 
 # 启动容器
@@ -76,6 +77,7 @@ start_app() {
     docker start "$container_name" &>/dev/null || echo "容器 $container_name 不存在"
     echo -e "${GREEN}✅ 已启动容器 $container_name${RESET}"
     read -p "按回车返回菜单..."
+    menu
 }
 
 # 停止容器
@@ -83,6 +85,7 @@ stop_app() {
     docker stop "$container_name" &>/dev/null || echo "容器 $container_name 不存在"
     echo -e "${GREEN}✅ 已停止容器 $container_name${RESET}"
     read -p "按回车返回菜单..."
+    menu
 }
 
 # 重启容器
@@ -90,6 +93,7 @@ restart_app() {
     docker restart "$container_name" &>/dev/null || echo "容器 $container_name 不存在"
     echo -e "${GREEN}✅ 已重启容器 $container_name${RESET}"
     read -p "按回车返回菜单..."
+    menu
 }
 
 # 查看日志
@@ -97,6 +101,7 @@ view_logs() {
     echo -e "${GREEN}按 Ctrl+C 停止日志查看${RESET}"
     docker logs -f "$container_name"
     read -p "按回车返回菜单..."
+    menu
 }
 
 # 主菜单

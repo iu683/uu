@@ -10,7 +10,7 @@ BOLD="\033[1m"
 
 # ================== 脚本路径 ==================
 SCRIPT_PATH="/root/store.sh"
-SCRIPT_URL="https://raw.githubusercontent.com/Polarisiu/app-store/main/store.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/nn.sh"
 BIN_LINK_DIR="/usr/local/bin"
 
 # ================== 首次运行自动安装 ==================

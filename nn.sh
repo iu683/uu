@@ -21,7 +21,7 @@ fi
 
 function menu() {
     clear
-    echo -e "${GREEN}=== 哪吒面板 (Argo 版本) 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== 哪吒面板V1(Argo版本)管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装并启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 重启${RESET}"
@@ -53,18 +53,18 @@ function install_app() {
     echo -e "${YELLOW}请输入 Cloudflare Argo 配置:${RESET}"
     read -p "Argo Auth (JSON 或 token): " ARGO_AUTH
     read -p "Argo 隧道域名: " ARGO_DOMAIN
-    read -p "是否启用 gRPC 反代 (y/n，默认 n): " enable_grpc
-    if [[ "$enable_grpc" == "y" ]]; then
-        REVERSE_PROXY_MODE="grpcwebproxy"
+    read -p "是否关闭自动同步备份脚本 (y/n，默认 n): " disable_auto
+    if [[ "$disable_auto" == "y" ]]; then
+        NO_AUTO_RENEW="1"
     else
-        REVERSE_PROXY_MODE=""
+        NO_AUTO_RENEW=""
     fi
 
     # 写 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
 services:
   nezha:
-    image: fscarmen/argo-nezha
+    image: mikehand888/argo-nezha:latest
     container_name: nezha_dashboard
     restart: always
     environment:
@@ -79,8 +79,8 @@ services:
       - ARGO_DOMAIN=$ARGO_DOMAIN
 EOF
 
-    if [[ -n "$REVERSE_PROXY_MODE" ]]; then
-        echo "      - REVERSE_PROXY_MODE=$REVERSE_PROXY_MODE" >> "$COMPOSE_FILE"
+    if [[ -n "$NO_AUTO_RENEW" ]]; then
+        echo "      - NO_AUTO_RENEW=$NO_AUTO_RENEW" >> "$COMPOSE_FILE"
     fi
 
     cat >> "$COMPOSE_FILE" <<EOF
@@ -93,7 +93,9 @@ EOF
 
     echo -e "${GREEN}✅ Nezha Dashboard (Argo 版本) 已启动${RESET}"
     echo -e "${YELLOW}🌐 通过 Argo 隧道访问: https://$ARGO_DOMAIN${RESET}"
+    echo -e "${GREEN}✅ 账号/密码: admin/admin${RESET}"
     echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
+    echo -e "${GREEN}✅ 提示: 隧道生成需要时间,请等待30秒${RESET}"
     read -p "按回车返回菜单..."
     menu
 }

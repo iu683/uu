@@ -21,7 +21,7 @@ fi
 
 function menu() {
     clear
-    echo -e "${GREEN}=== 哪吒面板 (Argo 版本) 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== 哪吒面板V1(Argo版本)管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装并启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 重启${RESET}"
@@ -43,13 +43,14 @@ function menu() {
 function install_app() {
     mkdir -p "$APP_DIR/data"
 
-    echo -e "${YELLOW}请输入 GitHub 配置:${RESET}"
+    echo -e "${YELLOW}请输入 GitHub 配置 (可选，直接回车跳过):${RESET}"
     read -p "GitHub 用户名: " GH_USER
     read -p "GitHub 邮箱: " GH_EMAIL
     read -p "GitHub Token: " GH_PAT
     read -p "GitHub 仓库 (格式: 用户名/仓库名): " GH_REPO
     read -p "GitHub OAuth ClientID: " GH_CLIENTID
     read -p "GitHub OAuth ClientSecret: " GH_CLIENTSECRET
+
     echo -e "${YELLOW}请输入 Cloudflare Argo 配置:${RESET}"
     read -p "Argo Auth (JSON 或 token): " ARGO_AUTH
     read -p "Argo 隧道域名: " ARGO_DOMAIN
@@ -71,28 +72,24 @@ function install_app() {
     cat > "$COMPOSE_FILE" <<EOF
 services:
   nezha:
-    image: fscarmen/argo-nezha
+    image: mikehand888/argo-nezha:latest
     container_name: nezha_dashboard
     restart: always
     environment:
       - TZ=Asia/Shanghai
-      - GH_USER=$GH_USER
-      - GH_EMAIL=$GH_EMAIL
-      - GH_PAT=$GH_PAT
-      - GH_REPO=$GH_REPO
-      - GH_CLIENTID=$GH_CLIENTID
-      - GH_CLIENTSECRET=$GH_CLIENTSECRET
       - ARGO_AUTH=$ARGO_AUTH
       - ARGO_DOMAIN=$ARGO_DOMAIN
 EOF
 
-    if [[ -n "$REVERSE_PROXY_MODE" ]]; then
-        echo "      - REVERSE_PROXY_MODE=$REVERSE_PROXY_MODE" >> "$COMPOSE_FILE"
-    fi
-
-    if [[ -n "$NO_AUTO_RENEW" ]]; then
-        echo "      - NO_AUTO_RENEW=$NO_AUTO_RENEW" >> "$COMPOSE_FILE"
-    fi
+    # 可选变量
+    [[ -n "$GH_USER" ]] && echo "      - GH_USER=$GH_USER" >> "$COMPOSE_FILE"
+    [[ -n "$GH_EMAIL" ]] && echo "      - GH_EMAIL=$GH_EMAIL" >> "$COMPOSE_FILE"
+    [[ -n "$GH_PAT" ]] && echo "      - GH_PAT=$GH_PAT" >> "$COMPOSE_FILE"
+    [[ -n "$GH_REPO" ]] && echo "      - GH_REPO=$GH_REPO" >> "$COMPOSE_FILE"
+    [[ -n "$GH_CLIENTID" ]] && echo "      - GH_CLIENTID=$GH_CLIENTID" >> "$COMPOSE_FILE"
+    [[ -n "$GH_CLIENTSECRET" ]] && echo "      - GH_CLIENTSECRET=$GH_CLIENTSECRET" >> "$COMPOSE_FILE"
+    [[ -n "$REVERSE_PROXY_MODE" ]] && echo "      - REVERSE_PROXY_MODE=$REVERSE_PROXY_MODE" >> "$COMPOSE_FILE"
+    [[ -n "$NO_AUTO_RENEW" ]] && echo "      - NO_AUTO_RENEW=$NO_AUTO_RENEW" >> "$COMPOSE_FILE"
 
     cat >> "$COMPOSE_FILE" <<EOF
     volumes:

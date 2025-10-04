@@ -40,9 +40,13 @@ function install_app() {
     read -p "请输入 Web 端口 [默认:7001]: " input_port
     PORT=${input_port:-7001}
 
+    # 输入数据库 root 密码
+    read -p "请输入mariadb数据库 ROOT 密码 [默认:password]: " input_db_pass
+    DB_PASS=${input_db_pass:-password}
+
     # 写入 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
-
+version: '3.8'
 services:
   xboard:
     image: ghcr.io/cedar2025/xboard:latest
@@ -51,12 +55,29 @@ services:
     environment:
       - docker=true
     ports:
-      - "127.0.0.1:$PORT:7001"
+      - "$PORT:7001"
     volumes:
       - ./.env:/www/.env
     depends_on:
       - mariadb
       - redis
+
+  mariadb:
+    image: mariadb:10.11
+    container_name: mariadb
+    restart: unless-stopped
+    environment:
+      - MARIADB_ROOT_PASSWORD=$DB_PASS
+      - MARIADB_DATABASE=xboard
+    volumes:
+      - ./mariadb-data:/var/lib/mysql
+
+  redis:
+    image: redis:7.0-alpine
+    container_name: redis
+    restart: unless-stopped
+    volumes:
+      - ./redis-data:/data
 EOF
 
     # 创建空白 .env 文件

@@ -27,11 +27,11 @@ docker_check() {
     echo "正在检查 Docker 安装情况 . . ."
     if ! command -v docker &>/dev/null; then
         echo "Docker 未安装，请安装 Docker 并将当前用户加入 docker 组。"
-        exit 1
+        read -p "按回车返回菜单..." ; menu
     fi
     if ! docker info &>/dev/null; then
         echo "当前用户无权访问 Docker 或 Docker 未运行，请检查。"
-        exit 1
+        read -p "按回车返回菜单..." ; menu
     fi
     echo "Docker 已安装并可访问。"
 }
@@ -105,38 +105,39 @@ start_docker() {
         -v "$CONFIG_FILE:/app/config.yaml" \
         --network host koipy/koipy:latest
     echo -e "${GREEN}✅ Docker 容器 $container_name 已启动${RESET}"
+    read -p "按回车返回菜单..."
 }
-
 
 # 卸载容器并删除文件
 cleanup() {
-    # 停止并删除容器
     docker rm -f "$container_name" &>/dev/null || echo "容器 $container_name 不存在"
 
-    # 删除 Koipy 文件夹及配置
     if [ -d "$APP_DIR" ]; then
         rm -rf "$APP_DIR"
         echo -e "${GREEN}✅ 已卸载容器 $container_name${RESET}"
     fi
+    read -p "按回车返回菜单..."
 }
-
 
 # 停止容器
 stop_koipy() {
     docker stop "$container_name" &>/dev/null || echo "容器 $container_name 不存在"
     echo -e "${GREEN}✅ 已停止容器 $container_name${RESET}"
+    read -p "按回车返回菜单..."
 }
 
 # 启动容器
 start_koipy() {
     docker start "$container_name" &>/dev/null || echo "容器 $container_name 不存在"
     echo -e "${GREEN}✅ 已启动容器 $container_name${RESET}"
+    read -p "按回车返回菜单..."
 }
 
 # 重启容器
 restart_koipy() {
     docker restart "$container_name" &>/dev/null || echo "容器 $container_name 不存在"
     echo -e "${GREEN}✅ 已重启容器 $container_name${RESET}"
+    read -p "按回车返回菜单..."
 }
 
 # 查看日志
@@ -153,7 +154,6 @@ start_installation() {
     build_docker
     configure_bot
     start_docker
-    read -p "按回车返回菜单..."
 }
 
 # =========================

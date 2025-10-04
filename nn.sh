@@ -7,10 +7,9 @@ RED="\033[31m"
 BLUE="\033[34m"
 RESET="\033[0m"
 BOLD="\033[1m"
-
 # ================== 脚本路径 ==================
 SCRIPT_PATH="/root/store.sh"
-SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/nn.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/Polarisiu/app-store/main/store.sh"
 BIN_LINK_DIR="/usr/local/bin"
 
 # ================== 首次运行自动安装 ==================
@@ -275,9 +274,9 @@ show_category_menu() {
         printf "${YELLOW}[%02d] %-20s${RESET}\n" "$i" "${categories[$i]}"
     done
 
-    printf "${RED} [88] %-20s${RESET}\n" "更新脚本"
-    printf "${RED} [99] %-20s${RESET}\n" "卸载脚本"
-    printf "${RED} [0 ] %-20s${RESET}\n" "退出脚本"
+    printf "${BLUE}[%02d] %-20s${RESET}\n" 88 "更新脚本"
+    printf "${BLUE}[%02d] %-20s${RESET}\n" 99 "卸载脚本"
+    printf "${BLUE}[%02d] %-20s${RESET}\n" 0  "退出脚本"
 }
 
 show_app_menu() {
@@ -306,7 +305,7 @@ show_app_menu() {
         ((i++))
     done
 
-    printf "${RED}[0 ] %-25s${RESET}\n" "返回上一级"
+    printf "${RED}[%02d] %-25s${RESET}\n" 00 "返回上一级"
 }
 
 # ================== 菜单处理函数 ==================
@@ -323,7 +322,7 @@ category_menu_handler() {
         fi
 
         case "$cat_choice" in
-            0) echo -e "${RED}退出脚本！${RESET}"; exit 0 ;;
+            00) echo -e "${RED}退出脚本！${RESET}"; exit 0 ;;
             88) update_script ;;
             99) uninstall_script ;;
             *) 
@@ -351,7 +350,7 @@ app_menu_handler() {
             continue
         fi
 
-        if [[ "$app_choice" == "0" ]]; then
+        if [[ "$app_choice" == "00" ]]; then
             break
         elif [[ -n "${menu_map[$app_choice]}" ]]; then
             key="${menu_map[$app_choice]}"

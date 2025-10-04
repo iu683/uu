@@ -18,6 +18,8 @@ reset="\033[0m"
 yellow="\033[33m"
 red="\033[31m"
 cyan="\033[36m"
+BLUE="\033[34m"
+
 
 # Ctrl+C 中断保护
 trap 'echo -e "\n${red}操作已中断${reset}"; exit 1' INT
@@ -185,15 +187,15 @@ show_main_menu() {
 
     label_w=8  # 左侧标签宽度
 
-    printf "${red}%s %-*s:${yellow} %s${re}\n" "💻" $label_w "系统" "$system_name"
-    printf "${red}%s %-*s:${yellow} %s${re}\n" "🌍" $label_w "时区" "$timezone"
-    printf "${red}%s %-*s:${yellow} %s${re}\n" "🈯" $label_w "语言" "$language"
-    printf "${red}%s %-*s:${yellow} %s${re}\n" "🧩" $label_w "架构" "$cpu_arch"
-    printf "${red}%s %-*s:${yellow} %s${re}\n" "🕒" $label_w "时间" "$datetime"
+    printf "${BLUE}%s %-*s:${yellow} %s${re}\n" "💻" $label_w "系统" "$system_name"
+    printf "${BLUE}%s %-*s:${yellow} %s${re}\n" "🌍" $label_w "时区" "$timezone"
+    printf "${BLUE}%s %-*s:${yellow} %s${re}\n" "🈯" $label_w "语言" "$language"
+    printf "${BLUE}%s %-*s:${yellow} %s${re}\n" "🧩" $label_w "架构" "$cpu_arch"
+    printf "${BLUE}%s %-*s:${yellow} %s${re}\n" "🕒" $label_w "时间" "$datetime"
 
 
     # 绿色下划线
-    echo -e "${yellow}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${re}"
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${re}"
 
     # 显示菜单
     for i in "${!MAIN_MENU[@]}"; do

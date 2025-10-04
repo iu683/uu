@@ -1,187 +1,178 @@
 #!/usr/bin/env bash
+# -*- coding: utf-8 -*-
 # ========================================
-# Koipy Docker 管理脚本
+# Koipy 一键管理脚本 (Docker)
 # ========================================
 
 GREEN="\033[32m"
-RED="\033[31m"
 RESET="\033[0m"
-
-APP_DIR="/opt/koipy"
+APP_NAME="koipy"
+APP_DIR="/opt/$APP_NAME"
 CONFIG_FILE="$APP_DIR/config.yaml"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONTAINER_NAME="koipy-app"
-IMAGE_NAME="koipy/koipy:latest"
+container_name="koipy"
 
-# ---------------------------
-# 公用函数
-# ---------------------------
-pause() {
-    echo
-    read -rp "按回车键返回菜单..." key
+# 安装环境
+setup_environment() {
+    mkdir -p "$APP_DIR"
+    echo "创建了 $APP_DIR 文件夹。"
+
+    if [ ! -f "$CONFIG_FILE" ]; then
+        wget -O "$CONFIG_FILE" https://raw.githubusercontent.com/Polarisiu/app-store/refs/heads/main/config.example.yaml
+        echo "下载 config.yaml 文件。"
+    fi
 }
 
 # 检查 Docker
-check_docker() {
+docker_check() {
+    echo "正在检查 Docker 安装情况 . . ."
     if ! command -v docker &>/dev/null; then
-        echo -e "${RED}❌ 未检测到 Docker，请先安装 Docker${RESET}"
+        echo "Docker 未安装，请安装 Docker 并将当前用户加入 docker 组。"
         exit 1
     fi
-}
-
-# 检查 docker-compose
-check_compose() {
-    if command -v docker-compose &>/dev/null; then
-        COMPOSE_CMD="docker-compose"
-    elif docker compose version &>/dev/null; then
-        COMPOSE_CMD="docker compose"
-    else
-        echo -e "${RED}❌ 未检测到 docker-compose，请安装 docker-compose 插件${RESET}"
+    if ! docker info &>/dev/null; then
+        echo "当前用户无权访问 Docker 或 Docker 未运行，请检查。"
         exit 1
     fi
+    echo "Docker 已安装并可访问。"
 }
 
-# 下载并配置
-setup_environment() {
-    mkdir -p "$APP_DIR"
-    echo -e "${GREEN}📂 创建目录: $APP_DIR${RESET}"
-
-    echo -e "${GREEN}✅ 正在下载默认配置...${RESET}"
-    curl -fsSL -o "$CONFIG_FILE" \
-        https://raw.githubusercontent.com/koipy-org/koipy/master/resources/config.example.yaml
-    echo -e "${GREEN}✅ 配置文件已保存: $CONFIG_FILE${RESET}"
+# 构建 Docker 容器
+build_docker() {
+    docker rm -f "$container_name" &>/dev/null || true
+    docker pull koipy/koipy:latest
 }
 
-# 自定义配置
-customize_config() {
-    echo -e "${GREEN}⚙️ 配置参数：${RESET}"
+# 配置 bot
+configure_bot() {
+    echo "开始配置参数 . . ."
 
-    read -r -p "License: " license
-    read -r -p "Bot Token: " bot_token
-    read -r -p "API ID(回车跳过): " api_id
-    read -r -p "API Hash(回车跳过): " api_hash
-    read -r -p "代理地址(回车跳过): " proxy
-    read -r -p "HTTP Proxy(回车跳过): " http_proxy
-    read -r -p "SOCKS5 Proxy(回车跳过): " socks5_proxy
-    read -r -p "Slave ID: " slave_id
-    read -r -p "Slave Token: " slave_token
-    read -r -p "Slave Address(默认127.0.0.1:8765): " slave_address
+    read -p "请输入 License: " license
+    read -p "请输入 Bot Token: " bot_token
+    read -p "请输入 API ID: " api_id
+    read -p "请输入 API Hash: " api_hash
+    read -p "请输入代理地址(默认不使用): " proxy
+    read -p "请输入 HTTP 代理地址(默认不使用): " http_proxy
+    read -p "请输入 SOCKS5 代理地址(默认不使用): " socks5_proxy
+    read -p "请输入 Slave ID: " slave_id
+    read -p "请输入 Slave Token: " slave_token
+    read -p "请输入 Slave Address(默认127.0.0.1:8765): " slave_address
     slave_address=${slave_address:-"127.0.0.1:8765"}
-    read -r -p "Slave Path(默认/): " slave_path
+    read -p "请输入 Slave Path(默认/): " slave_path
     slave_path=${slave_path:-"/"}
-    read -r -p "Slave Comment: " slave_comment
-    read -r -p "Slave Invoker(默认1): " slave_invoker
-    slave_invoker=${slave_invoker:-"1"}
-    read -r -p "启用 Sub-Store? (true/false, 默认false): " substore_enable
+    read -p "请输入 Slave Comment: " slave_comment
+    read -p "是否启用 Sub-Store (默认false): " substore_enable
     substore_enable=${substore_enable:-"false"}
-    read -r -p "自动部署 Sub-Store? (true/false, 默认false): " substore_autoDeploy
+    read -p "是否自动部署 Sub-Store (默认false): " substore_autoDeploy
     substore_autoDeploy=${substore_autoDeploy:-"false"}
 
-    sed -i "s|license:.*|license: \"$license\"|" "$CONFIG_FILE"
-    sed -i "s|botToken:.*|botToken: \"$bot_token\"|" "$CONFIG_FILE"
-    [[ -n "$api_id" ]] && sed -i "s|apiId:.*|apiId: \"$api_id\"|" "$CONFIG_FILE"
-    [[ -n "$api_hash" ]] && sed -i "s|apiHash:.*|apiHash: \"$api_hash\"|" "$CONFIG_FILE"
-    [[ -n "$proxy" ]] && sed -i "s|proxy:.*|proxy: \"$proxy\"|" "$CONFIG_FILE"
-    [[ -n "$http_proxy" ]] && sed -i "s|httpProxy:.*|httpProxy: \"$http_proxy\"|" "$CONFIG_FILE"
-    [[ -n "$socks5_proxy" ]] && sed -i "s|socks5Proxy:.*|socks5Proxy: \"$socks5_proxy\"|" "$CONFIG_FILE"
-    sed -i "s|id:.*|id: \"$slave_id\"|" "$CONFIG_FILE"
-    sed -i "s|token:.*|token: \"$slave_token\"|" "$CONFIG_FILE"
-    sed -i "s|address:.*|address: \"$slave_address\"|" "$CONFIG_FILE"
-    sed -i "s|path:.*|path: \"$slave_path\"|" "$CONFIG_FILE"
-    sed -i "s|comment:.*|comment: \"$slave_comment\"|" "$CONFIG_FILE"
-    sed -i "s|invoker:.*|invoker: $slave_invoker|" "$CONFIG_FILE"
-    sed -i "s|subStoreEnable:.*|subStoreEnable: $substore_enable|" "$CONFIG_FILE"
-    sed -i "s|subStoreAutoDeploy:.*|subStoreAutoDeploy: $substore_autoDeploy|" "$CONFIG_FILE"
+    # 更新 config.yaml
+    sed -i.bak \
+        -e "s|^license: .*|license: $license|" \
+        -e "s|^\(  bot-token: \).*|\1$bot_token|" \
+        -e "s|^\(  api-id: \).*|\1\"$api_id\"|" \
+        -e "s|^\(  api-hash: \).*|\1$api_hash|" \
+        -e "s|^\(  proxy: \).*|\1$proxy|" \
+        -e "s|^\(  httpProxy: \).*|\1$http_proxy|" \
+        -e "s|^\(  socks5Proxy: \).*|\1$socks5_proxy|" \
+        -e "s|^\(      id: \).*|\1\"$slave_id\"|" \
+        -e "s|^\(      token: \).*|\1'$slave_token'|" \
+        -e "s|^\(      address: \).*|\1\"$slave_address\"|" \
+        -e "s|^\(      path: \).*|\1$slave_path|" \
+        -e "s|^\(      comment: \).*|\1\"$slave_comment\"|" \
+        "$CONFIG_FILE"
 
-    echo -e "${GREEN}✅ 配置文件已更新${RESET}"
-}
+    # 处理 substore
+    if grep -q "substore:" "$CONFIG_FILE"; then
+        sed -i.bak "/substore:/,/^ *[^ ]/ {
+            /^ *enable:/ s|: .*|: $substore_enable|
+            /^ *autoDeploy:/ s|: .*|: $substore_autoDeploy|
+        }" "$CONFIG_FILE"
+    else
+        cat <<EOF >> "$CONFIG_FILE"
 
-# 生成 docker-compose.yml
-generate_compose() {
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  koipy:
-    image: $IMAGE_NAME
-    container_name: $CONTAINER_NAME
-    stdin_open: true
-    tty: true
-    restart: always
-    network_mode: host
-    volumes:
-      - ./koipy/config.yaml:/app/config.yaml
+substore:
+  enable: $substore_enable
+  autoDeploy: $substore_autoDeploy
 EOF
-    echo -e "${GREEN}✅ 已生成 docker-compose.yml${RESET}"
+    fi
+
+    echo "config.yaml 已更新。"
 }
 
-# ---------------------------
-# 功能函数
-# ---------------------------
-install_start() {
-    setup_environment
-    customize_config
-    generate_compose
-    $COMPOSE_CMD up -d
-    echo -e "${GREEN}🚀 Koipy 已安装并启动${RESET}"
-    pause
+# 启动容器
+start_docker() {
+    docker run -dit --restart=no --name="$container_name" --hostname="$container_name" \
+        -v "$CONFIG_FILE:/app/config.yaml" \
+        --network host koipy/koipy:latest
+    echo -e "${GREEN}✅ Docker 容器 $container_name 已启动${RESET}"
 }
 
-update_service() {
-    echo -e "${GREEN}✅ 正在更新 Koipy 镜像...${RESET}"
-    docker pull $IMAGE_NAME
-    $COMPOSE_CMD down
-    $COMPOSE_CMD up -d
-    echo -e "${GREEN}✅ 更新完成${RESET}"
-    pause
+# 卸载容器
+cleanup() {
+    docker rm -f "$container_name" &>/dev/null || echo "容器 $container_name 不存在"
+    echo -e "${GREEN}✅ 已删除容器 $container_name${RESET}"
 }
 
-uninstall_service() {
-    echo -e "${RED} 卸载 Koipy (包含数据)...${RESET}"
-    $COMPOSE_CMD down -v
-    rm -rf "$APP_DIR" "$COMPOSE_FILE"
-    echo -e "${GREEN}✅ 已卸载${RESET}"
-    pause
+# 停止容器
+stop_koipy() {
+    docker stop "$container_name" &>/dev/null || echo "容器 $container_name 不存在"
+    echo -e "${GREEN}✅ 已停止容器 $container_name${RESET}"
 }
 
+# 启动容器
+start_koipy() {
+    docker start "$container_name" &>/dev/null || echo "容器 $container_name 不存在"
+    echo -e "${GREEN}✅ 已启动容器 $container_name${RESET}"
+}
+
+# 重启容器
+restart_koipy() {
+    docker restart "$container_name" &>/dev/null || echo "容器 $container_name 不存在"
+    echo -e "${GREEN}✅ 已重启容器 $container_name${RESET}"
+}
+
+# 查看日志
 view_logs() {
-    $COMPOSE_CMD logs -f
-    pause
+    echo -e "${GREEN}按 Ctrl+C 停止日志查看${RESET}"
+    docker logs -f "$container_name"
+    read -p "按回车返回菜单..."
 }
 
-restart_service() {
-    $COMPOSE_CMD restart
-    echo -e "${GREEN}✅ Koipy 已重启${RESET}"
-    pause
+# 安装流程
+start_installation() {
+    setup_environment
+    docker_check
+    build_docker
+    configure_bot
+    start_docker
+    read -p "按回车返回菜单..."
 }
 
-# ---------------------------
-# 菜单
-# ---------------------------
-menu() {
+# =========================
+# 主菜单
+# =========================
+function menu() {
     clear
-    echo -e "${GREEN}==== Koipy 管理脚本 ====${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载(含数据)${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 重启${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    read -r -p "请输入选项: " choice
+    echo -e "${GREEN}=== Koipy 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装 Koipy${RESET}"
+    echo -e "${GREEN}2) 卸载 Koipy${RESET}"
+    echo -e "${GREEN}3) 停止 Koipy${RESET}"
+    echo -e "${GREEN}4) 启动 Koipy${RESET}"
+    echo -e "${GREEN}5) 重启 Koipy${RESET}"
+    echo -e "${GREEN}6) 查看日志${RESET}"
+    echo -e "${GREEN}0) 退出脚本${RESET}"
+    read -p "请选择: " choice
     case $choice in
-        1) install_start ;;
-        2) update_service ;;
-        3) uninstall_service ;;
-        4) view_logs ;;
-        5) restart_service ;;
+        1) start_installation ;;
+        2) cleanup ;;
+        3) stop_koipy ;;
+        4) start_koipy ;;
+        5) restart_koipy ;;
+        6) view_logs ;;
         0) exit 0 ;;
-        *) echo -e "${RED}输入错误${RESET}"; pause ;;
+        *) echo "无效选择"; sleep 1; menu ;;
     esac
 }
 
-# ---------------------------
-# 主程序
-# ---------------------------
-check_docker
-check_compose
-while true; do
-    menu
-done
+# 启动菜单
+menu

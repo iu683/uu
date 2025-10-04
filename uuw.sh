@@ -1,356 +1,339 @@
 #!/bin/bash
-# ==========================================
-# Nginx HTTPS 反代管理脚本（已有证书）
-# 支持：添加 / 修改 / 删除 / 查看 / 安装 / 卸载
-# ==========================================
-
 set -e
 
+APP_NAME="caddy"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/Caddyfile"
+
 GREEN="\033[32m"
+YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-SITES_AVAILABLE="/etc/nginx/sites-available"
-SITES_ENABLED="/etc/nginx/sites-enabled"
-REQUIRED_PORTS=(80 443)
-
-# ---------------------------
-# 工具函数
-# ---------------------------
 pause() {
-    echo -ne "${GREEN}按回车返回菜单...${RESET}"
+    echo -ne "${YELLOW}按回车返回菜单...${RESET}"
     read
 }
 
-list_sites() {
-    ls "$SITES_AVAILABLE" 2>/dev/null | grep "\.conf$" | sed 's/\.conf$//'
-}
+# 安装并启动
+install_app() {
+    mkdir -p "$APP_DIR/site"
 
-nginx_reload() {
-    nginx -t && systemctl reload nginx
-}
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${GREEN}请输入站点信息以生成 Caddyfile${RESET}"
+        read -p "请输入域名 (example.com)： " DOMAIN
+        read -p "是否需要 h2c/gRPC 代理？(y/n)： " H2C
 
-# ---------------------------
-# 系统检测
-# ---------------------------
-detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS=$ID
-    else
-        OS=$(uname -s)
-    fi
-}
+        SITE_CONFIG="${DOMAIN} {\n"
 
-# ---------------------------
-# 安装 / 更新 Nginx 与 Certbot
-# ---------------------------
-configure_firewall() {
-    echo -e "${GREEN}检测并配置防火墙以开放必要端口...${RESET}"
-
-    if command -v ufw >/dev/null 2>&1; then
-        ufw_status=$(ufw status | head -n 1)
-        if [[ "$ufw_status" == "Status: inactive" ]]; then
-            echo "ufw 未启用，正在启用..."
-            ufw --force enable
+        if [[ "$H2C" == "y" ]]; then
+            read -p "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： " H2C_PATH
+            read -p "请输入内网目标地址 (例如 127.0.0.1:8008)： " H2C_TARGET
+            SITE_CONFIG+="    reverse_proxy ${H2C_PATH} h2c://${H2C_TARGET}\n"
         fi
-        for port in "${REQUIRED_PORTS[@]}"; do
-            if ! ufw status | grep -qw "$port"; then
-                echo "允许端口 $port ..."
-                ufw allow "$port"
-            fi
-        done
-        return
+
+        read -p "请输入普通 HTTP 代理目标 (默认 127.0.0.1:8008)： " HTTP_TARGET
+        HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
+        SITE_CONFIG+="    reverse_proxy ${HTTP_TARGET}\n"
+        SITE_CONFIG+="}\n\n"
+
+        echo -e "$SITE_CONFIG" > "$CONFIG_FILE"
     fi
 
-    if systemctl is-active --quiet firewalld; then
-        for port in "${REQUIRED_PORTS[@]}"; do
-            if ! firewall-cmd --list-ports | grep -qw "${port}/tcp"; then
-                firewall-cmd --permanent --add-port=${port}/tcp
-            fi
-        done
-        firewall-cmd --reload
-        return
-    fi
-
-    if command -v iptables >/dev/null 2>&1; then
-        for port in "${REQUIRED_PORTS[@]}"; do
-            if ! iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
-                iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
-            fi
-        done
-        if command -v netfilter-persistent >/dev/null 2>&1; then
-            netfilter-persistent save
-        elif command -v service >/dev/null 2>&1; then
-            service iptables save
-        fi
-        return
-    fi
-}
-
-install_nginx_certbot() {
-    detect_os
-    echo -e "${GREEN}安装/更新 Nginx 与 Certbot ...${RESET}"
-    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
-        apt update
-        apt install -y nginx certbot python3-certbot-nginx
-    elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "rocky" || "$OS" == "almalinux" ]]; then
-        yum install -y epel-release
-        yum install -y nginx certbot python3-certbot-nginx
-    else
-        echo -e "${RED}无法自动安装，请手动安装 Nginx 与 Certbot${RESET}"
-        pause
-        return
-    fi
-
-    configure_firewall
-
-    mkdir -p "$SITES_AVAILABLE" "$SITES_ENABLED"
-
-    systemctl enable nginx
-    systemctl start nginx
-
-    echo -e "${GREEN}安装/更新完成！${RESET}"
-    pause
-}
-
-# ---------------------------
-# 卸载 Nginx 与 Certbot
-# ---------------------------
-uninstall_nginx_certbot() {
-    read -p "确认卸载 Nginx 与 Certbot？输入 yes 确认: " confirm
-    if [[ "$confirm" != "yes" ]]; then
-        echo "已取消"
-        pause
-        return
-    fi
-
-    echo -e "${GREEN}停止 Nginx 服务...${RESET}"
-    systemctl stop nginx
-    systemctl disable nginx
-
-    detect_os
-    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
-        apt remove -y nginx certbot python3-certbot-nginx
-        apt autoremove -y
-    elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "rocky" || "$OS" == "almalinux" ]]; then
-        yum remove -y nginx certbot python3-certbot-nginx
-    fi
-
-    echo -e "${GREEN}卸载完成${RESET}"
-    pause
-}
-
-
-# ---------------------------
-# 添加站点
-# ---------------------------
-add_site() {
-    read -p "请输入域名 (例如 example.com): " DOMAIN
-    read -p "请输入证书所在目录 (例如 /etc/nginx/ssl): " CERT_DIR
-
-    if [[ ! -d "$CERT_DIR" ]]; then
-        echo -e "${RED}目录不存在${RESET}"
-        pause
-        return
-    fi
-
-    # 查找证书文件
-    CERT_FILES=($(find "$CERT_DIR" -maxdepth 1 -type f \( -name "*.crt" -o -name "*.pem" \)))
-    if [ ${#CERT_FILES[@]} -eq 0 ]; then
-        echo -e "${RED}没有找到证书文件，请手动输入路径${RESET}"
-        read -p "请输入证书路径(例如 /etc/nginx/ssl/example.com.pem): " CERT_PATH
-        read -p "请输入密钥路径(例如 /etc/nginx/ssl/example.com.key): " KEY_PATH
-    else
-        echo -e "${GREEN}=== 可选择证书列表 ===${RESET}"
-        for i in "${!CERT_FILES[@]}"; do
-            FILE_NAME=$(basename "${CERT_FILES[$i]}")
-            DOMAIN_NAME="${FILE_NAME%.*}"
-            printf "${GREEN}%d) %s${RESET}\n" $((i+1)) "$DOMAIN_NAME"
-        done
-        echo -e "${GREEN}0) 手动输入证书和密钥路径${RESET}"
-        read -p "请选择证书编号: " cert_idx
-        if [[ "$cert_idx" == "0" ]]; then
-            read -p "请输入证书路径(例如 /etc/nginx/ssl/example.com.pem): " CERT_PATH
-            read -p "请输入密钥路径(例如 /etc/nginx/ssl/example.com.key): " KEY_PATH
-        else
-            if ! [[ "$cert_idx" =~ ^[0-9]+$ ]] || [ "$cert_idx" -lt 1 ] || [ "$cert_idx" -gt "${#CERT_FILES[@]}" ]; then
-                echo -e "${RED}无效编号${RESET}"
-                pause
-                return
-            fi
-            CERT_PATH="${CERT_FILES[$((cert_idx-1))]}"
-            KEY_PATH="${CERT_PATH%.*}.key"
-            if [[ ! -f "$KEY_PATH" ]]; then
-                read -p "请输入密钥路径(例如 /etc/nginx/ssl/example.com.key): " KEY_PATH
-            fi
-        fi
-    fi
-
-    read -p "请输入反代目标地址 (例如 http://127.0.0.1:8000): " TARGET
-    read -p "请输入上传文件大小限制 (例如 50M，默认 50M): " UPLOAD_SIZE
-    UPLOAD_SIZE=${UPLOAD_SIZE:-50M}   # 默认值50M
-
-    CONFIG_PATH="$SITES_AVAILABLE/$DOMAIN.conf"
-    if [[ -f "$CONFIG_PATH" ]]; then
-        echo -e "${RED}站点已存在！${RESET}"
-        pause
-        return
-    fi
-
-    cat > "$CONFIG_PATH" <<EOF
-server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name $DOMAIN;
-
-    client_max_body_size $UPLOAD_SIZE;
-
-    ssl_certificate $CERT_PATH;
-    ssl_certificate_key $KEY_PATH;
-
-    location / {
-        proxy_pass $TARGET;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 86400;
-    }
-}
-
-server {
-    listen 80;
-    listen [::]:80;
-    server_name $DOMAIN;
-    return 301 https://\$host\$request_uri;
-}
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  caddy:
+    image: caddy:latest
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - ./site:/srv
+      - ./caddy_data:/data
+      - ./caddy_config:/config
 EOF
 
-    ln -sf "$CONFIG_PATH" "$SITES_ENABLED/$DOMAIN.conf"
-    nginx_reload
-    echo -e "${GREEN}站点 $DOMAIN 添加成功！${RESET}"
+    cd "$APP_DIR"
+    docker compose up -d
+
+    echo -e "${GREEN}✅ Caddy 已启动${RESET}"
+    echo -e "${GREEN}📂 配置文件: $CONFIG_FILE${RESET}"
+    echo -e "${GREEN}📂 证书目录: $APP_DIR/caddy_data/caddy/certificates${RESET}"
     pause
 }
 
-# ---------------------------
-# 修改站点
-# ---------------------------
-modify_site() {
-    SITES=($(list_sites))
-    if [ ${#SITES[@]} -eq 0 ]; then
-        echo -e "${RED}没有可修改的站点${RESET}"
-        pause
-        return
-    fi
-
-    echo -e "${GREEN}=== 可修改站点列表 ===${RESET}"
-    for i in "${!SITES[@]}"; do
-        printf "${GREEN}%d) %s${RESET}\n" $((i+1)) "${SITES[$i]}"
-    done
-    echo -e "${GREEN}0) 取消${RESET}"
-    read -p "请输入要修改的站点编号: " idx
-    if [[ "$idx" == "0" ]]; then return; fi
-    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#SITES[@]}" ]; then
-        echo -e "${RED}无效编号${RESET}"
-        pause
-        return
-    fi
-
-    SITE="${SITES[$((idx-1))]}"
-    CONFIG_PATH="$SITES_AVAILABLE/$SITE.conf"
-    echo -e "${GREEN}正在修改站点 $SITE 配置：${RESET}"
-
-    read -p "请输入新的证书路径 (回车保持不变): " NEW_CERT
-    read -p "请输入新的私钥路径 (回车保持不变): " NEW_KEY
-    read -p "请输入新的反代目标地址 (回车保持不变): " NEW_TARGET
-    read -p "请输入新的上传大小 (回车保持不变): " NEW_SIZE
-
-    [[ -n "$NEW_CERT" ]] && sed -i "s|ssl_certificate .*;|ssl_certificate $NEW_CERT;|" "$CONFIG_PATH"
-    [[ -n "$NEW_KEY" ]] && sed -i "s|ssl_certificate_key .*;|ssl_certificate_key $NEW_KEY;|" "$CONFIG_PATH"
-    [[ -n "$NEW_TARGET" ]] && sed -i "s|proxy_pass .*;|proxy_pass $NEW_TARGET;|" "$CONFIG_PATH"
-    [[ -n "$NEW_SIZE" ]] && sed -i "s|client_max_body_size .*;|client_max_body_size $NEW_SIZE;|" "$CONFIG_PATH"
-
-    nginx_reload
-    echo -e "${GREEN}站点 $SITE 修改成功！${RESET}"
+# 更新
+update_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; pause; return; }
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ Caddy 已更新并重启完成${RESET}"
     pause
 }
 
-# ---------------------------
-# 删除站点
-# ---------------------------
+# 重启
+restart_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; pause; return; }
+    docker compose restart
+    echo -e "${GREEN}✅ Caddy 已重启${RESET}"
+    pause
+}
+
+# 查看日志
+view_logs() {
+    docker logs -f caddy
+    pause
+}
+
+# 卸载
+uninstall_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; pause; return; }
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ Caddy 已卸载，数据已删除${RESET}"
+    pause
+}
+
+# 添加站点
+add_site() {
+    read -p "请输入域名 (example.com)： " DOMAIN
+    read -p "是否需要 h2c/gRPC 代理？(y/n)： " H2C
+
+    SITE_CONFIG="${DOMAIN} {\n"
+
+    if [[ "$H2C" == "y" ]]; then
+        read -p "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： " H2C_PATH
+        read -p "请输入内网目标地址 (例如 127.0.0.1:8008)： " H2C_TARGET
+        SITE_CONFIG+="    reverse_proxy ${H2C_PATH} h2c://${H2C_TARGET}\n"
+    fi
+
+    read -p "请输入普通 HTTP 代理目标 (默认 127.0.0.1:8008)： " HTTP_TARGET
+    HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
+    SITE_CONFIG+="    reverse_proxy ${HTTP_TARGET}\n"
+    SITE_CONFIG+="}\n\n"
+
+    echo -e "$SITE_CONFIG" >> "$CONFIG_FILE"
+    echo -e "${GREEN}站点 ${DOMAIN} 添加成功${RESET}"
+    restart_app
+}
+
+# 删除站点（同时可删除证书）
 delete_site() {
-    SITES=($(list_sites))
-    if [ ${#SITES[@]} -eq 0 ]; then
-        echo -e "${RED}没有可删除的站点${RESET}"
+    mapfile -t DOMAINS < <(grep -E '^[a-zA-Z0-9.-]+ *{' "$CONFIG_FILE" | sed 's/ {//')
+    if [ ${#DOMAINS[@]} -eq 0 ]; then
+        echo -e "${YELLOW}没有可删除的域名${RESET}"
         pause
         return
     fi
 
-    echo -e "${GREEN}=== 可删除站点列表 ===${RESET}"
-    for i in "${!SITES[@]}"; do
-        printf "${GREEN}%d) %s${RESET}\n" $((i+1)) "${SITES[$i]}"
+    echo -e "${GREEN}请选择要删除的域名编号:${RESET}"
+    for i in "${!DOMAINS[@]}"; do
+        echo "$((i+1))) ${DOMAINS[$i]}"
     done
-    echo -e "${GREEN}0) 取消${RESET}"
-    read -p "请输入要删除的站点编号: " idx
-    if [[ "$idx" == "0" ]]; then return; fi
-    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#SITES[@]}" ]; then
+    read -p "输入编号： " NUM
+    DOMAIN="${DOMAINS[$((NUM-1))]}"
+
+    # 删除 Caddyfile 中的配置
+    sed -i "/$DOMAIN {/,/}/d" "$CONFIG_FILE"
+    echo -e "${GREEN}域名 ${DOMAIN} 已从 Caddyfile 删除${RESET}"
+
+    # 删除对应证书目录
+    CERT_DIR="$APP_DIR/caddy_data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/$DOMAIN"
+    if [ -d "$CERT_DIR" ]; then
+        read -p "是否一并删除该域名证书文件？(y/n)： " DEL_CERT
+        if [[ "$DEL_CERT" == "y" ]]; then
+            rm -rf "$CERT_DIR"
+            echo -e "${GREEN}证书目录已删除：${CERT_DIR}${RESET}"
+        else
+            echo -e "${YELLOW}保留证书：${CERT_DIR}${RESET}"
+        fi
+    else
+        echo -e "${YELLOW}未找到证书目录：${CERT_DIR}${RESET}"
+    fi
+
+    restart_app
+}
+
+
+# 修改站点
+modify_site() {
+    mapfile -t DOMAINS < <(grep -E '^[a-zA-Z0-9.-]+ *{' "$CONFIG_FILE" | sed 's/ {//')
+    if [ ${#DOMAINS[@]} -eq 0 ]; then
+        echo -e "${YELLOW}没有可修改的域名${RESET}"
+        pause
+        return
+    fi
+    echo -e "${GREEN}请选择要修改的域名编号:${RESET}"
+    for i in "${!DOMAINS[@]}"; do
+        echo "$((i+1))) ${DOMAINS[$i]}"
+    done
+    read -p "输入编号： " NUM
+    DOMAIN="${DOMAINS[$((NUM-1))]}"
+
+    read -p "请输入新的 HTTP 代理目标 (默认 127.0.0.1:8008)： " HTTP_TARGET
+    HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
+    read -p "是否需要 h2c/gRPC 代理？(y/n)： " H2C
+    H2C_CONFIG=""
+    if [[ "$H2C" == "y" ]]; then
+        read -p "请输入 h2c 代理路径(例如 /proto.NezhaService/*)： " H2C_PATH
+        read -p "请输入内网目标地址(例如 127.0.0.1:8008)： " H2C_TARGET
+        H2C_CONFIG="    reverse_proxy ${H2C_PATH} h2c://${H2C_TARGET}\n"
+    fi
+    NEW_CONFIG="${DOMAIN} {\n${H2C_CONFIG}    reverse_proxy ${HTTP_TARGET}\n}\n\n"
+    sed -i "/$DOMAIN {/,/}/c\\$NEW_CONFIG" "$CONFIG_FILE"
+    echo -e "${GREEN}域名 ${DOMAIN} 配置已修改${RESET}"
+    restart_app
+}
+
+# 查看已配置域名并可查看证书信息
+view_sites() {
+    mapfile -t DOMAINS < <(grep -E '^[a-zA-Z0-9.-]+ *{' "$CONFIG_FILE" | sed 's/ {//')
+    if [ ${#DOMAINS[@]} -eq 0 ]; then
+        echo -e "${YELLOW}没有已配置的域名${RESET}"
+        pause
+        return
+    fi
+
+    echo -e "${GREEN}当前已配置的域名:${RESET}"
+    for i in "${!DOMAINS[@]}"; do
+        echo "$((i+1))) ${DOMAINS[$i]}"
+    done
+
+    read -p "输入编号查看证书信息（输入0返回菜单）： " NUM
+    if [[ "$NUM" == "0" ]]; then
+        return
+    fi
+
+    if ! [[ "$NUM" =~ ^[0-9]+$ ]] || [ "$NUM" -lt 1 ] || [ "$NUM" -gt ${#DOMAINS[@]} ]; then
         echo -e "${RED}无效编号${RESET}"
         pause
         return
     fi
 
-    SITE="${SITES[$((idx-1))]}"
-    rm -f "$SITES_AVAILABLE/$SITE.conf"
-    rm -f "$SITES_ENABLED/$SITE.conf"
+    DOMAIN="${DOMAINS[$((NUM-1))]}"
+    CERT_PATH="$APP_DIR/caddy_data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/$DOMAIN/$DOMAIN.crt"
 
-    nginx_reload
-    echo -e "${GREEN}站点 $SITE 删除成功！${RESET}"
-    pause
-}
-
-# ---------------------------
-# 查看站点
-# ---------------------------
-view_sites() {
-    SITES=($(list_sites))
-    if [ ${#SITES[@]} -eq 0 ]; then
-        echo -e "${RED}没有配置的站点${RESET}"
+    if [ -f "$CERT_PATH" ]; then
+        echo -e "${GREEN}证书路径：${RESET}${CERT_PATH}"
+        echo -e "${GREEN}证书信息：${RESET}"
+        openssl x509 -in "$CERT_PATH" -noout -text | awk '
+            /Subject:/ || /Issuer:/ || /Not Before:/ || /Not After :/ {print}'
     else
-        echo -e "${GREEN}=== 已配置站点 ===${RESET}"
-        for i in "${!SITES[@]}"; do
-            printf "${GREEN}%d) %s${RESET}\n" $((i+1)) "${SITES[$i]}"
-        done
+        echo -e "${YELLOW}${DOMAIN} - 未找到证书${RESET}"
     fi
+
     pause
 }
 
-# ---------------------------
-# 主菜单
-# ---------------------------
-while true; do
-    clear
-    echo -e "${GREEN}=== Nginx证书反代管理 ===${RESET}"
-    echo -e "${GREEN}1) 安装Nginx${RESET}"
-    echo -e "${GREEN}2) 添加站点配置${RESET}"
-    echo -e "${GREEN}3) 修改站点配置${RESET}"
-    echo -e "${GREEN}4) 删除站点配置${RESET}"
-    echo -e "${GREEN}5) 查看站点信息${RESET}"
-    echo -e "${GREEN}6) 卸载Nginx${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    read -p "请选择操作[0-6]: " choice
 
-    case "$choice" in
-        1) install_nginx_certbot ;;
-        2) add_site ;;
-        3) modify_site ;;
-        4) delete_site ;;
-        5) view_sites ;;
-        6) uninstall_nginx_certbot ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}"; pause ;;
-    esac
-done
+# 查看证书状态
+view_certs() {
+
+    CADDY_DATA="$APP_DIR/caddy_data"
+    CERT_DIR="$CADDY_DATA/caddy/certificates/acme-v02.api.letsencrypt.org-directory"
+
+    echo -e "${GREEN}域名                  状态       到期时间        剩余天数${RESET}"
+    echo -e "${GREEN}------------------------------------------------------------${RESET}"
+
+    if [ ! -d "$CERT_DIR" ]; then
+        echo -e "${YELLOW}没有找到任何证书${RESET}"
+        pause
+        return
+    fi
+
+    DOMAINS=($(ls "$CERT_DIR" | sort))
+    for DOMAIN in "${DOMAINS[@]}"; do
+        CERT_PATH="$CERT_DIR/$DOMAIN/$DOMAIN.crt"
+        if [ -f "$CERT_PATH" ]; then
+            END_DATE=$(openssl x509 -enddate -noout -in "$CERT_PATH" | cut -d= -f2)
+            END_TS=$(date -d "$END_DATE" +%s)
+            NOW_TS=$(date +%s)
+            DAYS_LEFT=$(( (END_TS - NOW_TS) / 86400 ))
+
+            if [ $DAYS_LEFT -ge 30 ]; then
+                STATUS="${GREEN}有效${RESET}"
+            elif [ $DAYS_LEFT -ge 0 ]; then
+                STATUS="${YELLOW}即将过期${RESET}"
+            else
+                STATUS="${RED}已过期${RESET}"
+            fi
+
+            printf "%-22s %-12b %-15s %d 天\n" \
+                "$DOMAIN" "$STATUS" "$(date -d "$END_DATE" +"%Y-%m-%d")" "$DAYS_LEFT"
+        else
+            printf "%-22s %-12b %-15s %-10s\n" "$DOMAIN" "${RED}未找到证书${RESET}" "-" "-"
+        fi
+    done
+    pause
+}
+
+# 添加站点（自定义证书）
+add_site_with_cert() {
+    read -p "请输入域名 (example.com)： " DOMAIN
+    read -p "是否需要 h2c/gRPC 代理？(y/n)： " H2C
+
+    # 输入证书路径
+    read -p "请输入证书文件路径 (.pem)： " CERT_PATH
+    read -p "请输入私钥文件路径 (.key)： " KEY_PATH
+
+    SITE_CONFIG="${DOMAIN} {\n"
+    SITE_CONFIG+="    tls ${CERT_PATH} ${KEY_PATH}\n"
+
+    if [[ "$H2C" == "y" ]]; then
+        read -p "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： " H2C_PATH
+        read -p "请输入内网目标地址 (例如 127.0.0.1:8008)： " H2C_TARGET
+        SITE_CONFIG+="    reverse_proxy ${H2C_PATH} h2c://${H2C_TARGET}\n"
+    fi
+
+    read -p "请输入普通 HTTP 代理目标 (默认 127.0.0.1:8008)： " HTTP_TARGET
+    HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
+    SITE_CONFIG+="    reverse_proxy ${HTTP_TARGET}\n"
+    SITE_CONFIG+="}\n\n"
+
+    echo -e "$SITE_CONFIG" >> "$CONFIG_FILE"
+    echo -e "${GREEN}站点 ${DOMAIN} (自定义证书) 添加成功${RESET}"
+
+    restart_app
+}
+
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== Caddy Docker 管理脚本 ===${RESET}"
+        echo -e "${GREEN} 1) 安装启动${RESET}"
+        echo -e "${GREEN} 2) 更新${RESET}"
+        echo -e "${GREEN} 3) 重启${RESET}"
+        echo -e "${GREEN} 4) 查看日志${RESET}"
+        echo -e "${GREEN} 5) 卸载${RESET}"
+        echo -e "${GREEN} 6) 添加站点${RESET}"
+        echo -e "${GREEN} 7) 删除站点${RESET}"
+        echo -e "${GREEN} 8) 修改站点${RESET}"
+        echo -e "${GREEN} 9) 添加站点(自定义证书)${RESET}"
+        echo -e "${GREEN}10) 查看已配置域名${RESET}"
+        echo -e "${GREEN}11) 查看证书状态${RESET}"
+        echo -e "${GREEN} 0) 退出${RESET}"
+        read -p "请选择操作[0-11]： " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) uninstall_app ;;
+            6) add_site ;;
+            7) delete_site ;;
+            8) modify_site ;;
+            9) add_site_with_cert ;;
+            10) view_sites ;;
+            11) view_certs ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选项${RESET}"; pause ;;
+        esac
+    done
+}
+
+menu

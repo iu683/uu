@@ -175,7 +175,7 @@ MAIN_MENU=(
 )
 
 # 二级菜单（编号去掉前导零，显示时格式化为两位数）
-SUB_MENU[1]="1 更新系统|2 系统信息|3 修改ROOT密码|4 配置密钥登录|5 修改SSH端口|6 修改时区|7 切换v4V6|8 开放所有端口|9 开启ROOT登录|10 更换系统源|11 DDdebian12|12 DDwindows10|13 DDNAT|14 DD飞牛|15 设置中文|16 修改主机名|17 美化命令|18 VPS重启"
+SUB_MENU[1]="1 更新系统|2 系统信息|3 修改ROOT密码|4 配置密钥登录|5 修改SSH端口|6 修改时区|7 切换v4V6|8 开放所有端口|9 开启ROOT登录|10 更换系统源|11 DDdebian12|12 DDwindows10|13 DDNAT|14 DD飞牛|15 修改语言|16 修改主机名|17 美化命令|18 VPS重启"
 SUB_MENU[2]="19 代理工具|20 FRP管理|21 BBR管理|22 TCP窗口调优|23 WARP|24 SurgeSnell|25 3XUI|26 Hysteria2|27 Reality|28 Realm|29 GOST|30 哆啦A梦转发面板|31 极光面板|32 Xboard|33 WireGuard组网|34 自定义DNS解锁|35 DDNS|36 TCP自动调优|37 一键组网|38 流量监控|39 iperf3"
 SUB_MENU[3]="40 NodeQuality脚本|41 融合怪测试|42 YABS测试|43 网络质量体检脚本|44 简单回程测试|45 完整路由检测|46 流媒体解锁|47 三网延迟测速|48 解锁Instagram音频测试|49 检查25端口开放|50 路由追踪nexttrace"
 SUB_MENU[4]="51 Docker管理|52 DockerCompose管理|53 DockerCompose备份恢复|54 Docker备份恢复"
@@ -321,7 +321,7 @@ execute_choice() {
         12) bash <(curl -fsSL https://raw.githubusercontent.com/Polarisiu/tool/main/window.sh) ;;
         13) bash <(curl -fsSL https://raw.githubusercontent.com/Polarisiu/tool/main/DDnat.sh) ;;
         14) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/ddfnos.sh) ;;
-        15) bash <(curl -fsSL https://raw.githubusercontent.com/Polarisiu/tool/main/cnzt.sh) ;;
+        15) bash <(curl -fsSL https://raw.githubusercontent.com/Polarisiu/tool/main/xgyu.sh) ;;
         16) bash <(curl -fsSL https://raw.githubusercontent.com/Polarisiu/tool/main/home.sh) ;;
         17) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/mhgl.sh) ;;
         18) sudo reboot ;;

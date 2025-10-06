@@ -134,14 +134,31 @@ else
 fi
 timezone="${timezone} (Non-systemd)"
 
-# 语言（容器里 LANG 可能为空，兜底 C.UTF-8）
-language=${LANG:-C.UTF-8}
 
 # 架构
 cpu_arch=$(uname -m)
 
 # 当前时间
 datetime=$(date "+%Y-%m-%d %H:%M:%S")
+
+# VPS 运行时间
+if [ -f /proc/uptime ]; then
+    # 取整数部分
+    uptime_seconds=$(cut -d' ' -f1 /proc/uptime | cut -d. -f1)
+    days=$((uptime_seconds/86400))
+    hours=$(( (uptime_seconds%86400)/3600 ))
+    minutes=$(( (uptime_seconds%3600)/60 ))
+    if [ "$days" -gt 0 ]; then
+        vps_uptime="${days}天 ${hours}小时 ${minutes}分钟"
+    elif [ "$hours" -gt 0 ]; then
+        vps_uptime="${hours}小时 ${minutes}分钟"
+    else
+        vps_uptime="${minutes}分钟"
+    fi
+else
+    vps_uptime=$(uptime -p 2>/dev/null || echo "未知")
+fi
+
 
 
 
@@ -196,10 +213,9 @@ show_main_menu() {
 
     printf "${BLUE}%s %-*s:${yellow} %s${re}\n" "💻" $label_w "系统" "$system_name"
     printf "${BLUE}%s %-*s:${yellow} %s${re}\n" "🌍" $label_w "时区" "$timezone"
-    printf "${BLUE}%s %-*s:${yellow} %s${re}\n" "🈯" $label_w "语言" "$language"
     printf "${BLUE}%s %-*s:${yellow} %s${re}\n" "🧩" $label_w "架构" "$cpu_arch"
     printf "${BLUE}%s %-*s:${yellow} %s${re}\n" "🕒" $label_w "时间" "$datetime"
-
+    printf "${BLUE}%s %-*s:${yellow} %s${re}\n" "🚀" $label_w "运行时间" "$vps_uptime"
 
     # 绿色下划线
     echo -e "${green}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${re}"

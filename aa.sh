@@ -184,7 +184,7 @@ SUB_MENU[5]="55 应用管理|56 面板管理|57 监控管理|58 视频下载工�
 SUB_MENU[6]="63 NGINX V4反代|64 NGINX V6反代|65 Caddy反代|66 NginxProxyManager面板|67 雷池WAF"
 SUB_MENU[7]="68 系统清理|69 系统备份恢复|70 本地备份|71 一键重装系统|72 系统组件|73 开发环境|74 添加SWAP|75 DNS管理|76 工作区管理|77 系统监控|78 防火墙管理|79 Fail2ban|80 远程备份|81 定时任务|82 集群管理"
 SUB_MENU[8]="83 科技lion|84 老王工具箱|85 一点科技|86 BBR工具箱|87 酷雪云脚本"
-SUB_MENU[9]="89 Alpine系统管理|90 甲骨文工具|91 github同步|92 NAT小鸡|93 VPSTG通知|94 脚本短链|95 网站部署|96 随机图片API|97 卸载哪吒Agent |98 卸载komariAgent|100 关闭V1SSH"
+SUB_MENU[9]="89 Alpine系统管理|90 甲骨文工具|91 github同步|92 NAT小鸡|93 VPSTG通知|94 脚本短链|95 网站部署|96 关闭V1SSH|97 卸载哪吒Agent |98 卸载komariAgent"
 SUB_MENU[10]="88 更新脚本|99 卸载工具箱"
 
 # 显示一级菜单
@@ -402,10 +402,9 @@ execute_choice() {
         93) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/toy/main/vpstg.sh) ;;
         94) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/toy/main/dl.sh) ;;
         95) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/toy/main/html.sh) ;;
-        96) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/toy/main/tuapi.sh) ;;
+        96) sed -i 's/disable_command_execute: false/disable_command_execute: true/' /opt/nezha/agent/config.yml && systemctl restart nezha-agent ;;
         97) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/app-store/main/nzagent.sh) ;;
         98) sudo systemctl stop komari-agent && sudo systemctl disable komari-agent && sudo rm -f /etc/systemd/system/komari-agent.service && sudo systemctl daemon-reload && sudo rm -rf /opt/komari /var/log/komari ;;
-        100) sed -i 's/disable_command_execute: false/disable_command_execute: true/' /opt/nezha/agent/config.yml && systemctl restart nezha-agent ;;
         88)
             echo -e "${yellow}正在更新脚本...${reset}"
             # 下载最新版本覆盖本地脚本

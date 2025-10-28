@@ -25,6 +25,7 @@ menu() {
   echo -e "${GREEN}6) 停止后台服务${RESET}"
   echo -e "${GREEN}7) 启用开机自启${RESET}"
   echo -e "${GREEN}8) 禁用开机自启${RESET}"
+  echo -e "${GREEN}9) 卸载${RESET}" 
   echo -e "${GREEN}0) 退出${RESET}"
   read -rp "$(echo -e ${GREEN}请选择: ${RESET})" choice
   case $choice in
@@ -36,10 +37,34 @@ menu() {
     6) prod_stop ;;
     7) enable_autostart ;;
     8) disable_autostart ;;
+    9) uninstall_app ;;  
     0) exit 0 ;;
     *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
   esac
 }
+
+uninstall_app() {
+  read -rp "确定要卸载 EDUKY-Monitor 吗？此操作不可逆 (y/N): " confirm
+  if [[ "$confirm" =~ ^[Yy]$ ]]; then
+    # 停止并禁用服务
+    sudo systemctl stop $APP_NAME 2>/dev/null
+    sudo systemctl disable $APP_NAME 2>/dev/null
+    sudo rm -f $SERVICE_FILE
+
+    # 删除应用目录
+    rm -rf "$APP_DIR"
+
+    # 重新加载 systemd
+    sudo systemctl daemon-reload
+
+    echo -e "${GREEN}✅ 已卸载 EDUKY-Monitor${RESET}"
+  else
+    echo -e "${YELLOW}取消卸载${RESET}"
+  fi
+  read -p "按回车返回菜单..."
+  menu
+}
+
 
 install_app() {
   mkdir -p "$APP_DIR"

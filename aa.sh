@@ -1,11 +1,13 @@
 #!/bin/bash
 # ========================================
-# QQ-Selkies 一键管理脚本 (Docker Compose)
+# EDUKY-Monitor 一键管理脚本
 # ========================================
 
-APP_NAME="QQ-selkies"
+APP_NAME="eduky-monitor"
 APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+VENV_DIR="$APP_DIR/venv"
+SERVICE_FILE="/etc/systemd/system/$APP_NAME.service"
+LOG_FILE="$APP_DIR/logs.log"
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
@@ -14,113 +16,116 @@ RESET="\033[0m"
 
 menu() {
   clear
-  echo -e "${GREEN}=== QQ-Selkies 管理菜单 ===${RESET}"
-  echo -e "${GREEN}1) 安装启动${RESET}"
-  echo -e "${GREEN}2) 更新${RESET}"
-  echo -e "${GREEN}3) 重启${RESET}"
-  echo -e "${GREEN}4) 查看日志${RESET}"
-  echo -e "${GREEN}5) 卸载(含数据)${RESET}"
+  echo -e "${GREEN}=== EDUKY-Monitor 管理菜单 ===${RESET}"
+  echo -e "${GREEN}1) 安装${RESET}"
+  echo -e "${GREEN}2) 前台开发模式${RESET}"
+  echo -e "${GREEN}3) 后台生产模式启动${RESET}"
+  echo -e "${GREEN}4) 查看后台状态${RESET}"
+  echo -e "${GREEN}5) 查看日志${RESET}"
+  echo -e "${GREEN}6) 停止后台服务${RESET}"
+  echo -e "${GREEN}7) 启用开机自启${RESET}"
+  echo -e "${GREEN}8) 禁用开机自启${RESET}"
   echo -e "${GREEN}0) 退出${RESET}"
   read -rp "$(echo -e ${GREEN}请选择: ${RESET})" choice
   case $choice in
     1) install_app ;;
-    2) update_app ;;
-    3) restart_app ;;
-    4) view_logs ;;
-    5) uninstall_app ;;
+    2) dev_mode ;;
+    3) prod_start ;;
+    4) prod_status ;;
+    5) view_logs ;;
+    6) prod_stop ;;
+    7) enable_autostart ;;
+    8) disable_autostart ;;
     0) exit 0 ;;
     *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
   esac
 }
 
 install_app() {
-  mkdir -p "$APP_DIR"/config
-
-  read -p "请输入 Web HTTP 端口 [默认:3000]: " input_http
-  HTTP_PORT=${input_http:-3000}
-
-  read -p "请输入 Web HTTPS 端口 [默认:3001]: " input_https
-  HTTPS_PORT=${input_https:-3001}
-
-  read -p "请输入 Selkies 用户名 [默认:admin]: " input_user
-  CUSTOM_USER=${input_user:-admin}
-
-  read -p "请输入 Selkies 密码 [默认:随机生成]: " input_pass
-  PASSWORD=${input_pass:-$(head -c 12 /dev/urandom | base64 | tr -dc A-Za-z0-9 | cut -c1-12)}
-
-  # 判断 /dev/dri 是否存在
-  if [ -d /dev/dri ]; then
-    DEVICES="    devices:\n      - /dev/dri:/dev/dri"
-  else
-    DEVICES=""
-    echo -e "${YELLOW}⚠️ /dev/dri 不存在，GPU 加速不可用${RESET}"
+  mkdir -p "$APP_DIR"
+  if [ ! -d "$APP_DIR/.git" ]; then
+    git clone https://github.com/eduky/EDUKY-Monitor.git "$APP_DIR"
   fi
+  cd "$APP_DIR" || exit
 
-  cat > "$COMPOSE_FILE" <<EOF
+  # 创建虚拟环境
+  python3 -m venv "$VENV_DIR"
+  source "$VENV_DIR/bin/activate"
 
-services:
-  wechat-selkies:
-    image: ghcr.io/nickrunning/wechat-selkies:latest
-    container_name: wechat-selkies
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${HTTP_PORT}:3000"
-      - "127.0.0.1:${HTTPS_PORT}:3001"
-    volumes:
-      - ./config:/config
-$DEVICES
-    environment:
-      - PUID=1000
-      - PGID=100
-      - TZ=Asia/Shanghai
-      - LC_ALL=zh_CN.UTF-8
-      - AUTO_START_WECHAT=false
-      - AUTO_START_QQ=true
-      - CUSTOM_USER=${CUSTOM_USER}
-      - PASSWORD=${PASSWORD}
-EOF
+  # 安装依赖
+  pip install --upgrade pip
+  pip install -r requirements.txt
 
-  cd "$APP_DIR"
-  docker compose up -d
-
-  echo -e "${GREEN}✅ QQ-Selkies 已启动${RESET}"
-  echo -e "${YELLOW}🌐 Web UI 地址: http://127.0.0.1:${HTTP_PORT}${RESET}"
-  echo -e "${GREEN}📂 配置目录: $APP_DIR/config${RESET}"
-  echo -e "${GREEN}👤 用户名: ${CUSTOM_USER}, 密码: ${PASSWORD}${RESET}"
+  echo -e "${GREEN}✅ 安装完成${RESET}"
+  echo -e "${YELLOW}🌐 Web UI 地址: http://localhost:5000${RESET}"
+  echo -e "${YELLOW}默认账号: admin / admin123${RESET}"
   read -p "按回车返回菜单..."
   menu
 }
 
+dev_mode() {
+  cd "$APP_DIR" || exit
+  source "$VENV_DIR/bin/activate"
+  python main.py
+}
 
-
-update_app() {
-  cd "$APP_DIR" || { echo "❌ 未检测到安装目录"; sleep 1; menu; }
-  docker compose pull
-  docker compose up -d
-  echo -e "${GREEN}✅ QQ-Selkies 已更新并重启${RESET}"
+prod_start() {
+  cd "$APP_DIR" || exit
+  source "$VENV_DIR/bin/activate"
+  nohup python main.py > "$LOG_FILE" 2>&1 &
+  echo -e "${GREEN}✅ 后台启动成功，日志: $LOG_FILE${RESET}"
   read -p "按回车返回菜单..."
   menu
 }
 
-restart_app() {
-  cd "$APP_DIR" || { echo "❌ 未检测到安装目录"; sleep 1; menu; }
-  docker compose restart
-  echo -e "${GREEN}✅ QQ-Selkies 已重启${RESET}"
+prod_status() {
+  ps aux | grep main.py | grep -v grep
   read -p "按回车返回菜单..."
   menu
 }
 
 view_logs() {
-  docker logs -f wechat-selkies
+  tail -f "$LOG_FILE"
   read -p "按回车返回菜单..."
   menu
 }
 
-uninstall_app() {
-  cd "$APP_DIR" || { echo "❌ 未检测到安装目录"; sleep 1; menu; }
-  docker compose down -v
-  rm -rf "$APP_DIR"
-  echo -e "${RED}✅ QQ-Selkies 已卸载并删除所有数据${RESET}"
+prod_stop() {
+  pkill -f "python main.py"
+  echo -e "${GREEN}✅ 已停止后台服务${RESET}"
+  read -p "按回车返回菜单..."
+  menu
+}
+
+enable_autostart() {
+  sudo bash -c "cat > $SERVICE_FILE" <<EOF
+[Unit]
+Description=EDUKY-Monitor Service
+After=network.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$APP_DIR
+ExecStart=$VENV_DIR/bin/python $APP_DIR/main.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable $APP_NAME
+  sudo systemctl start $APP_NAME
+  echo -e "${GREEN}✅ 已启用开机自启并启动服务${RESET}"
+  read -p "按回车返回菜单..."
+  menu
+}
+
+disable_autostart() {
+  sudo systemctl stop $APP_NAME
+  sudo systemctl disable $APP_NAME
+  echo -e "${GREEN}✅ 已禁用开机自启并停止服务${RESET}"
   read -p "按回车返回菜单..."
   menu
 }

@@ -1,11 +1,13 @@
 #!/bin/bash
 # ========================================
-# Super-Clipboard 一键管理脚本 (Docker Compose)
+# EDUKY-Monitor 一键管理脚本
 # ========================================
 
-APP_NAME="super-clipboard"
+APP_NAME="eduky-monitor"
 APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+VENV_DIR="$APP_DIR/venv"
+SERVICE_FILE="/etc/systemd/system/$APP_NAME.service"
+LOG_FILE="$APP_DIR/logs.log"
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
@@ -14,89 +16,168 @@ RESET="\033[0m"
 
 menu() {
   clear
-  echo -e "${GREEN}=== Super-Clipboard 管理菜单 ===${RESET}"
-  echo -e "${GREEN}1) 安装启动${RESET}"
-  echo -e "${GREEN}2) 更新${RESET}"
-  echo -e "${GREEN}3) 重启${RESET}"
-  echo -e "${GREEN}4) 查看日志${RESET}"
-  echo -e "${GREEN}5) 卸载(含数据)${RESET}"
+  echo -e "${GREEN}=== EDUKY-Monitor 管理菜单 ===${RESET}"
+  echo -e "${GREEN}1) 安装${RESET}"
+  echo -e "${GREEN}2) 前台开发模式${RESET}"
+  echo -e "${GREEN}3) 后台生产模式启动${RESET}"
+  echo -e "${GREEN}4) 查看后台状态${RESET}"
+  echo -e "${GREEN}5) 查看日志${RESET}"
+  echo -e "${GREEN}6) 停止后台服务${RESET}"
+  echo -e "${GREEN}7) 启用开机自启${RESET}"
+  echo -e "${GREEN}8) 禁用开机自启${RESET}"
+  echo -e "${GREEN}9) 卸载${RESET}" 
   echo -e "${GREEN}0) 退出${RESET}"
   read -rp "$(echo -e ${GREEN}请选择: ${RESET})" choice
   case $choice in
     1) install_app ;;
-    2) update_app ;;
-    3) restart_app ;;
-    4) view_logs ;;
-    5) uninstall_app ;;
+    2) dev_mode ;;
+    3) prod_start ;;
+    4) prod_status ;;
+    5) view_logs ;;
+    6) prod_stop ;;
+    7) enable_autostart ;;
+    8) disable_autostart ;;
+    9) uninstall_app ;;  
     0) exit 0 ;;
     *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
   esac
 }
 
+uninstall_app() {
+  read -rp "确定要卸载 EDUKY-Monitor 吗？此操作不可逆 (y/N): " confirm
+  if [[ "$confirm" =~ ^[Yy]$ ]]; then
+    # 停止并禁用服务
+    sudo systemctl stop $APP_NAME 2>/dev/null
+    sudo systemctl disable $APP_NAME 2>/dev/null
+    sudo rm -f $SERVICE_FILE
+
+    # 删除应用目录
+    rm -rf "$APP_DIR"
+
+    # 重新加载 systemd
+    sudo systemctl daemon-reload
+
+    echo -e "${GREEN}✅ 已卸载 EDUKY-Monitor${RESET}"
+  else
+    echo -e "${YELLOW}取消卸载${RESET}"
+  fi
+  read -p "按回车返回菜单..."
+  menu
+}
+
+
 install_app() {
-  mkdir -p "$APP_DIR"/storage
+  # 检查 python3 是否安装
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo -e "${RED}❌ 未检测到 Python3，请先安装 Python3${RESET}"
+    read -p "按回车退出..."
+    return
+  fi
 
-  read -p "请输入 Web 端口 [默认:5173]: " input_port
-  PORT=${input_port:-5173}
+  # 检查 python3-venv 是否安装
+  if ! python3 -m venv --help >/dev/null 2>&1; then
+    echo -e "${YELLOW}⚠️ python3-venv 未安装，正在尝试安装...${RESET}"
+    sudo apt update
+    sudo apt install -y python3-venv
+    if [ $? -ne 0 ]; then
+      echo -e "${RED}❌ 安装 python3-venv 失败，请手动安装${RESET}"
+      read -p "按回车退出..."
+      return
+    fi
+  fi
 
-  cat > "$COMPOSE_FILE" <<EOF
+  mkdir -p "$APP_DIR"
+  if [ ! -d "$APP_DIR/.git" ]; then
+    git clone https://github.com/eduky/EDUKY-Monitor.git "$APP_DIR"
+  fi
+  cd "$APP_DIR" || exit
 
-services:
-  super-clipboard:
-    image: pixia1234/super-clipboard:latest
-    container_name: super-clipboard
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${PORT}:5173"
-    environment:
-      - SUPER_CLIPBOARD_DATABASE_PATH=/app/backend/storage/clipboard.db
-      - SUPER_CLIPBOARD_FILE_STORAGE_DIR=/app/backend/storage/files
-    volumes:
-      - clipboard-data:/app/backend/storage
+  # 创建虚拟环境
+  python3 -m venv "$VENV_DIR"
+  if [ ! -f "$VENV_DIR/bin/activate" ]; then
+    echo -e "${RED}❌ 虚拟环境创建失败，请检查系统依赖${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+    return
+  fi
 
-volumes:
-  clipboard-data:
-    driver: local
-EOF
+  source "$VENV_DIR/bin/activate"
 
-  cd "$APP_DIR"
-  docker compose up -d
+  # 安装依赖
+  pip install --upgrade pip
+  pip install -r requirements.txt
 
-  echo -e "${GREEN}✅ Super-Clipboard 已启动${RESET}"
-  echo -e "${YELLOW}🌐 Web UI 地址: http://127.0.0.1:${PORT}${RESET}"
-  echo -e "${GREEN}📂 数据目录: $APP_DIR/storage${RESET}"
+  echo -e "${GREEN}✅ 安装完成${RESET}"
+  echo -e "${YELLOW}🌐 Web UI 地址: http://localhost:5000${RESET}"
+  echo -e "${YELLOW}默认账号: admin / admin123${RESET}"
   read -p "按回车返回菜单..."
   menu
 }
 
-update_app() {
-  cd "$APP_DIR" || { echo "❌ 未检测到安装目录"; sleep 1; menu; }
-  docker compose pull
-  docker compose up -d
-  echo -e "${GREEN}✅ Super-Clipboard 已更新并重启${RESET}"
+
+dev_mode() {
+  cd "$APP_DIR" || exit
+  source "$VENV_DIR/bin/activate"
+  python main.py
+}
+
+prod_start() {
+  cd "$APP_DIR" || exit
+  source "$VENV_DIR/bin/activate"
+  nohup python main.py > "$LOG_FILE" 2>&1 &
+  echo -e "${GREEN}✅ 后台启动成功，日志: $LOG_FILE${RESET}"
   read -p "按回车返回菜单..."
   menu
 }
 
-restart_app() {
-  cd "$APP_DIR" || { echo "❌ 未检测到安装目录"; sleep 1; menu; }
-  docker compose restart
-  echo -e "${GREEN}✅ Super-Clipboard 已重启${RESET}"
+prod_status() {
+  ps aux | grep main.py | grep -v grep
   read -p "按回车返回菜单..."
   menu
 }
 
 view_logs() {
-  docker logs -f super-clipboard
+  tail -f "$LOG_FILE"
   read -p "按回车返回菜单..."
   menu
 }
 
-uninstall_app() {
-  cd "$APP_DIR" || { echo "❌ 未检测到安装目录"; sleep 1; menu; }
-  docker compose down -v
-  rm -rf "$APP_DIR"
-  echo -e "${RED}✅ Super-Clipboard 已卸载并删除所有数据${RESET}"
+prod_stop() {
+  pkill -f "python main.py"
+  echo -e "${GREEN}✅ 已停止后台服务${RESET}"
+  read -p "按回车返回菜单..."
+  menu
+}
+
+enable_autostart() {
+  sudo bash -c "cat > $SERVICE_FILE" <<EOF
+[Unit]
+Description=EDUKY-Monitor Service
+After=network.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$APP_DIR
+ExecStart=$VENV_DIR/bin/python $APP_DIR/main.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable $APP_NAME
+  sudo systemctl start $APP_NAME
+  echo -e "${GREEN}✅ 已启用开机自启并启动服务${RESET}"
+  read -p "按回车返回菜单..."
+  menu
+}
+
+disable_autostart() {
+  sudo systemctl stop $APP_NAME
+  sudo systemctl disable $APP_NAME
+  echo -e "${GREEN}✅ 已禁用开机自启并停止服务${RESET}"
   read -p "按回车返回菜单..."
   menu
 }

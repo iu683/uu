@@ -1,9 +1,9 @@
 #!/bin/bash
-# ========================================
-# DPanel 一键管理脚本 (Docker Compose)
-# ========================================
+# ============================================
+# Misaka 弹幕服务器 一键部署脚本 (Docker Compose)
+# ============================================
 
-APP_NAME="dpanel"
+APP_NAME="misaka-danmu-server"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -14,7 +14,7 @@ RESET="\033[0m"
 
 menu() {
   clear
-  echo -e "${GREEN}=== DPanel 管理菜单 ===${RESET}"
+  echo -e "${GREEN}=== Misaka 弹幕服务器 管理菜单 ===${RESET}"
   echo -e "${GREEN}1) 安装启动${RESET}"
   echo -e "${GREEN}2) 更新${RESET}"
   echo -e "${GREEN}3) 重启${RESET}"
@@ -34,33 +34,64 @@ menu() {
 }
 
 install_app() {
-  mkdir -p "$APP_DIR"
+  mkdir -p "$APP_DIR/config"
 
-  read -p "请输入宿主机映射端口 [默认:8807]: " input_port
-  PORT=${input_port:-8807}
+  echo -e "${YELLOW}请输入远程 MySQL 连接信息:${RESET}"
+  read -rp "数据库主机/IP: " DB_HOST
+  read -rp "数据库端口 [默认:3306]: " DB_PORT
+  DB_PORT=${DB_PORT:-3306}
+  read -rp "数据库名 [默认:danmuapi]: " DB_NAME
+  DB_NAME=${DB_NAME:-danmuapi}
+  read -rp "数据库用户名 [默认:danmuapi]: " DB_USER
+  DB_USER=${DB_USER:-danmuapi}
+  read -rp "数据库密码: " DB_PASS
+  [ -z "$DB_PASS" ] && { echo -e "${RED}数据库密码不能为空！${RESET}"; exit 1; }
+
+  read -rp "HTTP 端口 [默认:7768]: " APP_PORT
+  APP_PORT=${APP_PORT:-7768}
 
   cat > "$COMPOSE_FILE" <<EOF
-
 services:
-  dpanel:
-    image: dpanel/dpanel:lite
-    container_name: dpanel
-    restart: always
-    ports:
-      - "127.0.0.1:${PORT}:8080"
+  danmu-app:
+    image: l429609201/misaka_danmu_server:latest
+    container_name: $APP_NAME
+    restart: unless-stopped
     environment:
-      APP_NAME: dpanel
+      - PUID=1000
+      - PGID=1000
+      - UMASK=0022
+      - TZ=Asia/Shanghai
+
+      - DANMUAPI_DATABASE__TYPE=mysql
+      - DANMUAPI_DATABASE__HOST=$DB_HOST
+      - DANMUAPI_DATABASE__PORT=$DB_PORT
+      - DANMUAPI_DATABASE__NAME=$DB_NAME
+      - DANMUAPI_DATABASE__USER=$DB_USER
+      - DANMUAPI_DATABASE__PASSWORD=$DB_PASS
+
+      - DANMUAPI_ADMIN__INITIAL_USER=admin
+
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /opt/dpanel:/dpanel
+      - ./config:/app/config
+    ports:
+      - "127.0.0.1:\${APP_PORT}:7768"
+
+    networks:
+      - misaka-net
+
+networks:
+  misaka-net:
+    driver: bridge
 EOF
 
-  cd "$APP_DIR"
+  cd "$APP_DIR" || exit
   docker compose up -d
 
-  echo -e "${GREEN}✅ DPanel 已安装并启动${RESET}"
-  echo -e "${YELLOW}🌐 Web UI 地址: http://127.0.0.1:${PORT}${RESET}"
-  read -p "按回车返回菜单..."
+  echo -e "${GREEN}✅ Misaka 弹幕服务器 已启动${RESET}"
+   echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:${APP_PORT}${RESET}"
+  echo -e "${GREEN}📂 配置目录: $APP_DIR/config${RESET}"
+  echo -e "${GREEN}👤 管理员初始用户名: admin${RESET}"
+  read -rp "按回车返回菜单..."
   menu
 }
 
@@ -68,22 +99,22 @@ update_app() {
   cd "$APP_DIR" || { echo "❌ 未检测到安装目录"; sleep 1; menu; }
   docker compose pull
   docker compose up -d
-  echo -e "${GREEN}✅ DPanel 已更新并重启${RESET}"
-  read -p "按回车返回菜单..."
+  echo -e "${GREEN}✅ 已更新并重启${RESET}"
+  read -rp "按回车返回菜单..."
   menu
 }
 
 restart_app() {
   cd "$APP_DIR" || { echo "❌ 未检测到安装目录"; sleep 1; menu; }
   docker compose restart
-  echo -e "${GREEN}✅ DPanel 已重启${RESET}"
-  read -p "按回车返回菜单..."
+  echo -e "${GREEN}✅ 已重启${RESET}"
+  read -rp "按回车返回菜单..."
   menu
 }
 
 view_logs() {
-  docker logs -f dpanel
-  read -p "按回车返回菜单..."
+  docker logs -f $APP_NAME
+  read -rp "按回车返回菜单..."
   menu
 }
 
@@ -91,8 +122,8 @@ uninstall_app() {
   cd "$APP_DIR" || { echo "❌ 未检测到安装目录"; sleep 1; menu; }
   docker compose down -v
   rm -rf "$APP_DIR"
-  echo -e "${RED}✅ DPanel 已卸载并删除所有数据${RESET}"
-  read -p "按回车返回菜单..."
+  echo -e "${RED}✅ 已卸载并删除所有数据${RESET}"
+  read -rp "按回车返回菜单..."
   menu
 }
 

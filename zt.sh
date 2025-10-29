@@ -1,183 +1,212 @@
 #!/bin/bash
-# ========================================
-# EDUKY-Monitor 一键管理脚本
-# ========================================
 
-APP_NAME="eduky-monitor"
-APP_DIR="/opt/$APP_NAME"
-VENV_DIR="$APP_DIR/venv"
-SERVICE_FILE="/etc/systemd/system/$APP_NAME.service"
-LOG_FILE="$APP_DIR/logs.log"
-
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
+APP_NAME="EDUKY-Monitor"
+PYTHON_BIN=$(which python3)
+PID_FILE=".pid"
+GREEN="\033[1;32m"
 RESET="\033[0m"
 
-menu() {
-  clear
-  echo -e "${GREEN}=== EDUKY-Monitor 管理菜单 ===${RESET}"
-  echo -e "${GREEN}1) 安装${RESET}"
-  echo -e "${GREEN}2) 前台开发模式${RESET}"
-  echo -e "${GREEN}3) 后台生产模式启动${RESET}"
-  echo -e "${GREEN}4) 查看后台状态${RESET}"
-  echo -e "${GREEN}5) 查看日志${RESET}"
-  echo -e "${GREEN}6) 停止后台服务${RESET}"
-  echo -e "${GREEN}7) 启用开机自启${RESET}"
-  echo -e "${GREEN}8) 禁用开机自启${RESET}"
-  echo -e "${GREEN}9) 卸载${RESET}" 
-  echo -e "${GREEN}0) 退出${RESET}"
-  read -rp "$(echo -e ${GREEN}请选择: ${RESET})" choice
-  case $choice in
-    1) install_app ;;
-    2) dev_mode ;;
-    3) prod_start ;;
-    4) prod_status ;;
-    5) view_logs ;;
-    6) prod_stop ;;
-    7) enable_autostart ;;
-    8) disable_autostart ;;
-    9) uninstall_app ;;  
-    0) exit 0 ;;
-    *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
-  esac
-}
+REPO_URL="https://github.com/eduky/EDUKY-Monitor.git"
+APP_DIR="EDUKY-Monitor"
+SERVICE_FILE="/etc/systemd/system/eduky-monitor.service"
+USER_NAME=$(whoami)
+WORKDIR=$(pwd)/$APP_DIR
 
-uninstall_app() {
-  read -rp "确定要卸载 EDUKY-Monitor 吗？此操作不可逆 (y/N): " confirm
-  if [[ "$confirm" =~ ^[Yy]$ ]]; then
-    # 停止并禁用服务
-    sudo systemctl stop $APP_NAME 2>/dev/null
-    sudo systemctl disable $APP_NAME 2>/dev/null
-    sudo rm -f $SERVICE_FILE
-
-    # 删除应用目录
-    rm -rf "$APP_DIR"
-
-    # 重新加载 systemd
-    sudo systemctl daemon-reload
-
-    echo -e "${GREEN}✅ 已卸载 EDUKY-Monitor${RESET}"
+# =======================
+# 克隆仓库
+# =======================
+clone_repo() {
+  if [ -d "$APP_DIR" ]; then
+    echo " 目录 $APP_DIR 已存在，跳过克隆。"
   else
-    echo -e "${YELLOW}取消卸载${RESET}"
+    echo "📥 正在克隆仓库..."
+    git clone "$REPO_URL"
   fi
-  read -p "按回车返回菜单..."
-  menu
+  cd "$APP_DIR" || exit
+  echo "✅ 已进入目录 $(pwd)"
 }
 
+# =======================
+# 检查 Python
+# =======================
+check_python() {
+  if [ -z "$PYTHON_BIN" ]; then
+    echo "❌ 未检测到 Python3，请先安装。"
+    exit 1
+  fi
+}
 
+# =======================
+# 安装依赖
+# =======================
 install_app() {
-  # 检查 python3 是否安装
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo -e "${RED}❌ 未检测到 Python3，请先安装 Python3${RESET}"
-    read -p "按回车退出..."
-    return
-  fi
-
-  # 检查 python3-venv 是否安装，如果缺少就提示用户手动安装
-  if ! python3 -m venv --help >/dev/null 2>&1; then
-    echo -e "${RED}❌ 系统缺少 python3-venv，虚拟环境无法创建！${RESET}"
-    echo -e "${YELLOW}请使用以下命令安装（根据你的 Python 版本替换）：${RESET}"
-    echo -e "${YELLOW}sudo apt update && sudo apt install python3-venv -y${RESET}"
-    read -p "安装完成后按回车继续..."
-    return
-  fi
-
-  mkdir -p "$APP_DIR"
-  if [ ! -d "$APP_DIR/.git" ]; then
-    git clone https://github.com/eduky/EDUKY-Monitor.git "$APP_DIR"
-  fi
-  cd "$APP_DIR" || exit
-
-  # 创建虚拟环境
-  python3 -m venv "$VENV_DIR"
-  if [ ! -f "$VENV_DIR/bin/activate" ]; then
-    echo -e "${RED}❌ 虚拟环境创建失败，请检查系统依赖${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-    return
-  fi
-
-  source "$VENV_DIR/bin/activate"
-
-  # 安装依赖
-  pip install --upgrade pip
+  check_python
+  echo "📦 安装依赖中..."
   pip install -r requirements.txt
-
-  echo -e "${GREEN}✅ 安装完成${RESET}"
-  echo -e "${YELLOW}🌐 Web UI 地址: http://localhost:5000${RESET}"
-  echo -e "${YELLOW}默认账号: admin / admin123${RESET}"
-  read -p "按回车返回菜单..."
-  menu
+  echo "✅ 依赖安装完成。"
 }
 
-
-
-dev_mode() {
-  cd "$APP_DIR" || exit
-  source "$VENV_DIR/bin/activate"
-  python main.py
+# =======================
+# 启动服务
+# =======================
+start_app() {
+  check_python
+  clone_repo
+  if [ -f "$PID_FILE" ] && ps -p $(cat "$PID_FILE") > /dev/null 2>&1; then
+    echo " $APP_NAME 已在运行中 (PID: $(cat $PID_FILE))"
+    return
+  fi
+  echo "🚀 启动 $APP_NAME..."
+  nohup $PYTHON_BIN main.py > app.log 2>&1 &
+  echo $! > "$PID_FILE"
+  echo "✅ 启动成功！日志文件: app.log"
+  echo "✅ 访问：http://localhost:5000"
+  echo "✅ 用户名: admin 密码: admin123 "
 }
 
-prod_start() {
-  cd "$APP_DIR" || exit
-  source "$VENV_DIR/bin/activate"
-  nohup python main.py > "$LOG_FILE" 2>&1 &
-  echo -e "${GREEN}✅ 后台启动成功，日志: $LOG_FILE${RESET}"
-  read -p "按回车返回菜单..."
-  menu
+# =======================
+# 停止服务
+# =======================
+stop_app() {
+  if [ -f "$PID_FILE" ]; then
+    PID=$(cat "$PID_FILE")
+    if ps -p $PID > /dev/null 2>&1; then
+      echo "🛑 停止 $APP_NAME (PID: $PID)"
+      kill $PID
+      rm -f "$PID_FILE"
+      echo "✅ 已停止。"
+    else
+      echo " 未检测到运行中的进程。"
+      rm -f "$PID_FILE"
+    fi
+  else
+    echo " 未发现运行记录。"
+  fi
 }
 
-prod_status() {
-  ps aux | grep main.py | grep -v grep
-  read -p "按回车返回菜单..."
-  menu
+# =======================
+# 查看状态
+# =======================
+status_app() {
+  if [ -f "$PID_FILE" ] && ps -p $(cat "$PID_FILE") > /dev/null 2>&1; then
+    echo "✅ $APP_NAME 正在运行 (PID: $(cat $PID_FILE))"
+  else
+    echo "❌ $APP_NAME 未运行。"
+  fi
 }
 
-view_logs() {
-  tail -f "$LOG_FILE"
-  read -p "按回车返回菜单..."
-  menu
+# =======================
+# 查看日志
+# =======================
+log_app() {
+  if [ -f "app.log" ]; then
+    tail -f app.log
+  else
+    echo " 暂无日志文件。"
+  fi
 }
 
-prod_stop() {
-  pkill -f "python main.py"
-  echo -e "${GREEN}✅ 已停止后台服务${RESET}"
-  read -p "按回车返回菜单..."
-  menu
+# =======================
+# 卸载
+# =======================
+uninstall_app() {
+  read -p " 确认要卸载 $APP_NAME 吗？这将删除依赖和数据！(y/N): " CONFIRM
+  if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+    stop_app
+    echo "🧹 正在清理环境..."
+    rm -rf __pycache__ app.log $PID_FILE
+    echo "✅ 已卸载。"
+  else
+    echo "取消操作。"
+  fi
 }
 
+# =======================
+# systemd 自启动管理
+# =======================
 enable_autostart() {
-  sudo bash -c "cat > $SERVICE_FILE" <<EOF
+  if [ ! -f "$SERVICE_FILE" ]; then
+    sudo bash -c "cat > $SERVICE_FILE <<EOF
 [Unit]
-Description=EDUKY-Monitor Service
+Description=$APP_NAME Service
 After=network.target
 
 [Service]
 Type=simple
-User=$USER
-WorkingDirectory=$APP_DIR
-ExecStart=$VENV_DIR/bin/python $APP_DIR/main.py
+User=$USER_NAME
+WorkingDirectory=$WORKDIR
+ExecStart=$WORKDIR/../run.sh start_app
 Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-EOF
-
-  sudo systemctl daemon-reload
-  sudo systemctl enable $APP_NAME
-  sudo systemctl start $APP_NAME
-  echo -e "${GREEN}✅ 已启用开机自启并启动服务${RESET}"
-  read -p "按回车返回菜单..."
-  menu
+EOF"
+    sudo systemctl daemon-reload
+  fi
+  sudo systemctl enable eduky-monitor
+  sudo systemctl start eduky-monitor
+  echo "✅ 已启用 systemd 自启动"
 }
 
 disable_autostart() {
-  sudo systemctl stop $APP_NAME
-  sudo systemctl disable $APP_NAME
-  echo -e "${GREEN}✅ 已禁用开机自启并停止服务${RESET}"
-  read -p "按回车返回菜单..."
-  menu
+  if [ -f "$SERVICE_FILE" ]; then
+    sudo systemctl stop eduky-monitor
+    sudo systemctl disable eduky-monitor
+    echo "✅ 已禁用 systemd 自启动"
+  else
+    echo "未检测到 systemd 服务文件"
+  fi
+}
+
+# =======================
+# 命令行参数支持
+# =======================
+if [ $# -gt 0 ]; then
+  case "$1" in
+    start_app) start_app; exit 0 ;;
+    stop_app) stop_app; exit 0 ;;
+    status_app) status_app; exit 0 ;;
+    enable_autostart) enable_autostart; exit 0 ;;
+    disable_autostart) disable_autostart; exit 0 ;;
+    *) echo "❌ 未知参数 $1"; exit 1 ;;
+  esac
+fi
+
+# =======================
+# 菜单
+# =======================
+menu() {
+  while true; do
+    clear
+    echo -e "${GREEN}=== $APP_NAME 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 克隆/进入仓库${RESET}"
+    echo -e "${GREEN}2) 安装依赖${RESET}"
+    echo -e "${GREEN}3) 启动服务${RESET}"
+    echo -e "${GREEN}4) 停止服务${RESET}"
+    echo -e "${GREEN}5) 查看状态${RESET}"
+    echo -e "${GREEN}6) 查看日志${RESET}"
+    echo -e "${GREEN}7) 卸载${RESET}"
+    echo -e "${GREEN}8) 启用 systemd 自启动${RESET}"
+    echo -e "${GREEN}9) 禁用 systemd 自启动${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    read -rp "$(echo -e ${GREEN}请选择: ${RESET})" choice
+    case "$choice" in
+      1) clone_repo ;;
+      2) install_app ;;
+      3) start_app ;;
+      4) stop_app ;;
+      5) status_app ;;
+      6) log_app ;;
+      7) uninstall_app ;;
+      8) enable_autostart ;;
+      9) disable_autostart ;;
+      0) exit 0 ;;
+      *) echo-e "{GREEN}❌ 无效选项。${RESET}" ;;
+    esac
+    echo -e "{GREEN}按回车继续${RESET}"
+    read
+  done
 }
 
 menu

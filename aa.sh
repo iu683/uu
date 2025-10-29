@@ -47,6 +47,10 @@ install_app() {
   read -rp "数据库密码: " DB_PASS
   [ -z "$DB_PASS" ] && { echo -e "${RED}数据库密码不能为空！${RESET}"; exit 1; }
 
+  echo -e "${YELLOW}请输入管理员登录信息:${RESET}"
+  read -rp "管理员用户名 [默认:admin]: " ADMIN_USER
+  ADMIN_USER=${ADMIN_USER:-admin}
+
   read -rp "HTTP 端口 [默认:7768]: " APP_PORT
   APP_PORT=${APP_PORT:-7768}
 
@@ -69,12 +73,12 @@ services:
       - DANMUAPI_DATABASE__USER=$DB_USER
       - DANMUAPI_DATABASE__PASSWORD=$DB_PASS
 
-      - DANMUAPI_ADMIN__INITIAL_USER=admin
+      - DANMUAPI_ADMIN__INITIAL_USER=$ADMIN_USER
 
     volumes:
       - ./config:/app/config
     ports:
-      - "127.0.0.1:\${APP_PORT}:7768"
+      - "127.0.0.1:${APP_PORT}:7768"
 
     networks:
       - misaka-net
@@ -88,12 +92,14 @@ EOF
   docker compose up -d
 
   echo -e "${GREEN}✅ Misaka 弹幕服务器 已启动${RESET}"
-   echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:${APP_PORT}${RESET}"
+  echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:${APP_PORT}${RESET}"
   echo -e "${GREEN}📂 配置目录: $APP_DIR/config${RESET}"
-  echo -e "${GREEN}👤 管理员初始用户名: admin${RESET}"
+  echo -e "${GREEN}👤 管理员: ${ADMIN_USER}${RESET}"
+  echo -e "${GREEN}🔑 密码: 查看日志${RESET}"
   read -rp "按回车返回菜单..."
   menu
 }
+
 
 update_app() {
   cd "$APP_DIR" || { echo "❌ 未检测到安装目录"; sleep 1; menu; }

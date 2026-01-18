@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# DecoTV 一键管理脚本 (Docker Compose)
+# Kavita 一键管理脚本 (Docker Compose)
 # ========================================
 
 GREEN="\033[32m"
@@ -8,13 +8,13 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="decotv"
+APP_NAME="kavita"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
 menu() {
     clear
-    echo -e "${GREEN}=== DecoTV 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== Kavita 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 重启${RESET}"
@@ -36,66 +36,62 @@ menu() {
 install_app() {
     mkdir -p "$APP_DIR"
 
-    read -p "请输入 Web 端口 [默认:3000]: " input_port
-    PORT=${input_port:-3000}
+    read -p "请输入 Web 端口 [默认:5000]: " input_port
+    PORT=${input_port:-5000}
 
-    read -p "请输入登录用户名 [默认:admin]: " input_user
-    USERNAME=${input_user:-admin}
+    read -p "请输入 Manga 目录路径: " MANGA_DIR
+    read -p "请输入 Comics 目录路径: " COMICS_DIR
+    read -p "请输入 Books 目录路径: " BOOKS_DIR
 
-    read -p "请输入登录密码 [默认:123456]: " input_pass
-    PASSWORD=${input_pass:-123456}
+    read -p "请输入 配置目录路径 [/opt/kavita/config]: " input_config
+    CONFIG_DIR=${input_config:-$APP_DIR/config}
+
+    read -p "请输入 时区 [Asia/Shanghai]: " input_tz
+    TZ=${input_tz:-Asia/Shanghai}
+
+    mkdir -p "$CONFIG_DIR"
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  decotv-core:
-    image: ghcr.io/decohererk/decotv:latest
-    container_name: decotv-core
-    restart: on-failure
-    ports:
-      - "127.0.0.1:${PORT}:3000"
-    environment:
-      - USERNAME=${USERNAME}
-      - PASSWORD=${PASSWORD}
-      - NEXT_PUBLIC_STORAGE_TYPE=kvrocks
-      - KVROCKS_URL=redis://decotv-kvrocks:6666
-    depends_on:
-      - decotv-kvrocks
-    networks:
-      - decotv-network
-
-  decotv-kvrocks:
-    image: apache/kvrocks
-    container_name: decotv-kvrocks
-    restart: unless-stopped
+  kavita:
+    image: jvmilazz0/kavita:latest
+    container_name: kavita
     volumes:
-      - kvrocks-data:/var/lib/kvrocks
-    networks:
-      - decotv-network
-
-networks:
-  decotv-network:
-    driver: bridge
-
-volumes:
-  kvrocks-data:
+      - \${MANGA_DIR}:/manga
+      - \${COMICS_DIR}:/comics
+      - \${BOOKS_DIR}:/books
+      - \${CONFIG_DIR}:/kavita/config
+    environment:
+      - TZ=\${TZ}
+    ports:
+      - "127.0.0.1:${PORT}:5000"
+    restart: unless-stopped
 EOF
 
     cd "$APP_DIR" || exit
+    PORT=$PORT \
+    MANGA_DIR=$MANGA_DIR \
+    COMICS_DIR=$COMICS_DIR \
+    BOOKS_DIR=$BOOKS_DIR \
+    CONFIG_DIR=$CONFIG_DIR \
+    TZ=$TZ \
     docker compose up -d
 
-    echo -e "${GREEN}✅ DecoTV 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}👤 用户名: ${USERNAME}${RESET}"
-    echo -e "${GREEN}🔑 密码: ${PASSWORD}${RESET}"
+    echo -e "${GREEN}✅ Kavita 已启动${RESET}"
+    echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:$PORT${RESET}"
+    echo -e "${GREEN}📂 Manga: $MANGA_DIR${RESET}"
+    echo -e "${GREEN}📂 Comics: $COMICS_DIR${RESET}"
+    echo -e "${GREEN}📂 Books: $BOOKS_DIR${RESET}"
+    echo -e "${GREEN}📂 Config: $CONFIG_DIR${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ DecoTV 已更新完成${RESET}"
+    echo -e "${GREEN}✅ Kavita 已更新${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
@@ -103,13 +99,13 @@ update_app() {
 restart_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose restart
-    echo -e "${GREEN}✅ DecoTV 已重启${RESET}"
+    echo -e "${GREEN}✅ Kavita 已重启${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 view_logs() {
-    docker logs -f decotv-core
+    docker logs -f kavita
     read -p "按回车返回菜单..."
     menu
 }
@@ -118,7 +114,7 @@ uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ DecoTV 已卸载（数据已删除）${RESET}"
+    echo -e "${RED}✅ Kavita 已卸载（包含配置数据）${RESET}"
     read -p "按回车返回菜单..."
     menu
 }

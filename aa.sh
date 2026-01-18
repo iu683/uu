@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Ani-RSS 一键管理脚本 (Docker Compose)
+# EasyImg 一键管理脚本 (Docker Compose)
 # ========================================
 
 GREEN="\033[32m"
@@ -8,13 +8,13 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="ani-rss"
+APP_NAME="easyimg"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
 menu() {
     clear
-    echo -e "${GREEN}=== Ani-RSS 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== EasyImg 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 重启${RESET}"
@@ -34,43 +34,34 @@ menu() {
 }
 
 install_app() {
-    mkdir -p "$APP_DIR"
+    mkdir -p "$APP_DIR"/{db,uploads}
 
-    read -p "请输入 Ani-RSS 端口 [默认:7789]: " input_port
-    PORT=${input_port:-7789}
-
-    read -p "请输入配置目录 [默认:/opt/ani-rss/config]: " input_config
-    CONFIG_DIR=${input_config:-/opt/ani-rss/config}
-
-    read -p "请输入媒体目录 [默认:/opt/webdav/Media]: " input_media
-    MEDIA_DIR=${input_media:-/opt/webdav/Media}
-
-    mkdir -p "$CONFIG_DIR"
+    read -p "请输入 Web 端口 [默认:8092]: " input_port
+    PORT=${input_port:-8092}
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  ani-rss:
-    image: wushuo894/ani-rss
-    container_name: ani-rss
-    restart: always
+  easyimg:
+    image: ghcr.io/chaos-zhu/easyimg:latest
+    container_name: easyimg
+    restart: unless-stopped
     ports:
-      - "${PORT}:7789"
+      - "127.0.0.1:${PORT}:3000"
     volumes:
-      - ${CONFIG_DIR}:/config
-      - ${MEDIA_DIR}:/Media
+      - /opt/easyimg/db:/app/db
+      - /opt/easyimg/uploads:/app/uploads
     environment:
-      - PORT=7789
-      - CONFIG=/config
-      - TZ=Asia/Shanghai
+      - NODE_ENV=production
+      - PORT=3000
 EOF
 
     cd "$APP_DIR" || exit
-    docker compose up -d
+    PORT=$PORT docker compose up -d
 
-    echo -e "${GREEN}✅ Ani-RSS 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 配置目录: ${CONFIG_DIR}${RESET}"
-    echo -e "${GREEN}📂 媒体目录: ${MEDIA_DIR}${RESET}"
+    echo -e "${GREEN}✅ EasyImg 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR/db${RESET}"
+    echo -e "${GREEN}📂 上传目录: $APP_DIR/uploads${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
@@ -79,7 +70,7 @@ update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Ani-RSS 已更新完成${RESET}"
+    echo -e "${GREEN}✅ EasyImg 已更新完成${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
@@ -87,22 +78,22 @@ update_app() {
 restart_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose restart
-    echo -e "${GREEN}✅ Ani-RSS 已重启${RESET}"
+    echo -e "${GREEN}✅ EasyImg 已重启${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 view_logs() {
-    docker logs -f ani-rss
+    docker logs -f easyimg
     read -p "按回车返回菜单..."
     menu
 }
 
 uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose down
+    docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Ani-RSS 已卸载（配置与媒体目录未删除）${RESET}"
+    echo -e "${RED}✅ EasyImg 已卸载（数据已删除）${RESET}"
     read -p "按回车返回菜单..."
     menu
 }

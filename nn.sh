@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Ani-RSS 一键管理脚本 (Docker Compose)
+# DecoTV 一键管理脚本 (Docker Compose)
 # ========================================
 
 GREEN="\033[32m"
@@ -8,13 +8,13 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="ani-rss"
+APP_NAME="decotv"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
 menu() {
     clear
-    echo -e "${GREEN}=== Ani-RSS 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== DecoTV 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 重启${RESET}"
@@ -36,41 +36,57 @@ menu() {
 install_app() {
     mkdir -p "$APP_DIR"
 
-    read -p "请输入 Ani-RSS 端口 [默认:7789]: " input_port
-    PORT=${input_port:-7789}
+    read -p "请输入 Web 端口 [默认:3000]: " input_port
+    PORT=${input_port:-3000}
 
-    read -p "请输入配置目录 [默认:/opt/ani-rss/config]: " input_config
-    CONFIG_DIR=${input_config:-/opt/ani-rss/config}
+    read -p "请输入登录用户名 [默认:admin]: " input_user
+    USERNAME=${input_user:-admin}
 
-    read -p "请输入媒体目录 [默认:/opt/ani-rss/Media]: " input_media
-    MEDIA_DIR=${input_media:-/opt/ani-rss/Media}
-
-    mkdir -p "$CONFIG_DIR"
+    read -p "请输入登录密码 [默认:123456]: " input_pass
+    PASSWORD=${input_pass:-123456}
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  ani-rss:
-    image: wushuo894/ani-rss
-    container_name: ani-rss
-    restart: always
+  decotv-core:
+    image: ghcr.io/decohererk/decotv:latest
+    container_name: decotv-core
+    restart: on-failure
     ports:
-      - "127.0.0.1:${PORT}:7789"
-    volumes:
-      - ${CONFIG_DIR}:/config
-      - ${MEDIA_DIR}:/Media
+      - "127.0.0.1:${PORT}:3000"
     environment:
-      - PORT=7789
-      - CONFIG=/config
-      - TZ=Asia/Shanghai
+      - USERNAME=${USERNAME}
+      - PASSWORD=${PASSWORD}
+      - NEXT_PUBLIC_STORAGE_TYPE=kvrocks
+      - KVROCKS_URL=redis://decotv-kvrocks:6666
+    depends_on:
+      - decotv-kvrocks
+    networks:
+      - decotv-network
+
+  decotv-kvrocks:
+    image: apache/kvrocks
+    container_name: decotv-kvrocks
+    restart: unless-stopped
+    volumes:
+      - kvrocks-data:/var/lib/kvrocks
+    networks:
+      - decotv-network
+
+networks:
+  decotv-network:
+    driver: bridge
+
+volumes:
+  kvrocks-data:
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    echo -e "${GREEN}✅ Ani-RSS 已启动${RESET}"
+    echo -e "${GREEN}✅ DecoTV 已启动${RESET}"
     echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 配置目录: ${CONFIG_DIR}${RESET}"
-    echo -e "${GREEN}📂 媒体目录: ${MEDIA_DIR}${RESET}"
+    echo -e "${GREEN}👤 用户名: ${USERNAME}${RESET}"
+    echo -e "${GREEN}🔑 密码: ${PASSWORD}${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
@@ -79,7 +95,7 @@ update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Ani-RSS 已更新完成${RESET}"
+    echo -e "${GREEN}✅ DecoTV 已更新完成${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
@@ -87,22 +103,22 @@ update_app() {
 restart_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose restart
-    echo -e "${GREEN}✅ Ani-RSS 已重启${RESET}"
+    echo -e "${GREEN}✅ DecoTV 已重启${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 view_logs() {
-    docker logs -f ani-rss
+    docker logs -f decotv-core
     read -p "按回车返回菜单..."
     menu
 }
 
 uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose down
+    docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Ani-RSS 已卸载（配置与媒体目录未删除）${RESET}"
+    echo -e "${RED}✅ DecoTV 已卸载（数据已删除）${RESET}"
     read -p "按回车返回菜单..."
     menu
 }

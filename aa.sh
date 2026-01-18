@@ -1,69 +1,110 @@
 #!/bin/bash
-# 流媒体解锁 DNS 快捷切换脚本（无检测）
+# ========================================
+# Ani-RSS 一键管理脚本 (Docker Compose)
+# ========================================
 
-# 菜单顺序
-dns_order=( "HK" "JP" "TW" "SG" "KR" "US" "UK" "DE" "RFC" "自定义" )
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-# DNS 列表
-declare -A dns_list=(
-  ["HK"]="154.83.83.83"
-  ["JP"]="45.76.215.40"
-  ["TW"]="154.83.83.86"
-  ["SG"]="149.28.158.78"
-  ["KR"]="158.247.223.218"
-  ["US"]="66.42.97.127"
-  ["UK"]="45.32.179.189"
-  ["DE"]="80.240.28.27"
-  ["RFC"]="22.22.22.22"
-  ["自定义"]="custom"
-)
+APP_NAME="ani-rss"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-# 绿色
-green="\033[32m"
-reset="\033[0m"
+menu() {
+    clear
+    echo -e "${GREEN}=== Ani-RSS 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 重启${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}5) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+    case $choice in
+        1) install_app ;;
+        2) update_app ;;
+        3) restart_app ;;
+        4) view_logs ;;
+        5) uninstall_app ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
+    esac
+}
 
-while true; do
-    echo -e "${green}请选择要使用的 DNS 区域：${reset}"
-    count=0
-    for region in "${dns_order[@]}"; do
-        ((count++))
-        if [[ $count -lt 10 ]]; then
-            printf "${green}[0%d] %-10s${reset}" "$count" "$region"
-        else
-            printf "${green}[%2d] %-10s${reset}" "$count" "$region"
-        fi
-        (( count % 2 == 0 )) && echo ""
-    done
-    echo -e "${green}[00] 退出${reset}"
+install_app() {
+    mkdir -p "$APP_DIR"
 
-    read -p "$(echo -e ${green}请输入编号:${reset}) " choice
+    read -p "请输入 Ani-RSS 端口 [默认:7789]: " input_port
+    PORT=${input_port:-7789}
 
+    read -p "请输入配置目录 [默认:/opt/ani-rss/config]: " input_config
+    CONFIG_DIR=${input_config:-/opt/ani-rss/config}
 
-    # 退出
-    if [[ "$choice" == "00" ]]; then
-        exit 0
-    fi
+    read -p "请输入媒体目录 [默认:/opt/webdav/Media]: " input_media
+    MEDIA_DIR=${input_media:-/opt/webdav/Media}
 
-    # 判断输入
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#dns_order[@]} )); then
-        region="${dns_order[$((choice-1))]}"
+    mkdir -p "$CONFIG_DIR"
 
-        # 自定义 DNS
-        if [[ "$region" == "自定义" ]]; then
-            read -p "$(echo -e ${green}请输入自定义 DNS IP 地址:${reset}) " custom_dns
-            dns_to_set="$custom_dns"
-        else
-            dns_to_set="${dns_list[$region]}"
-        fi
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  ani-rss:
+    image: wushuo894/ani-rss
+    container_name: ani-rss
+    restart: always
+    ports:
+      - "${PORT}:7789"
+    volumes:
+      - ${CONFIG_DIR}:/config
+      - ${MEDIA_DIR}:/Media
+    environment:
+      - PORT=7789
+      - CONFIG=/config
+      - TZ=Asia/Shanghai
+EOF
 
-        # 应用 DNS
-        if [[ -n "$dns_to_set" ]]; then
-            echo -e "${green}正在设置 DNS 为 $dns_to_set ($region) ...${reset}"
-            cp /etc/resolv.conf /etc/resolv.conf.bak
-            echo "nameserver $dns_to_set" > /etc/resolv.conf
-            echo -e "${green}DNS 已切换完成${reset}\n"
-        fi
-    else
-        echo -e "${green}无效选择，请重新输入。${reset}"
-    fi
-done  
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    echo -e "${GREEN}✅ Ani-RSS 已启动${RESET}"
+    echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📂 配置目录: ${CONFIG_DIR}${RESET}"
+    echo -e "${GREEN}📂 媒体目录: ${MEDIA_DIR}${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+update_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ Ani-RSS 已更新完成${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+restart_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+    docker compose restart
+    echo -e "${GREEN}✅ Ani-RSS 已重启${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+view_logs() {
+    docker logs -f ani-rss
+    read -p "按回车返回菜单..."
+    menu
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+    docker compose down
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ Ani-RSS 已卸载（配置与媒体目录未删除）${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+menu

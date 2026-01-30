@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# MHTI 一键管理脚本 (Docker Compose)
+# Nezha Dashboard 一键管理脚本 (Docker Compose)
 # ========================================
 
 GREEN="\033[32m"
@@ -8,13 +8,13 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="mhti"
+APP_NAME="nezha-dashboard"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-menu() {
+function menu() {
     clear
-    echo -e "${GREEN}=== MHTI 管理菜单 ===${RESET}"
+    echo -e "${GREEN}===哪吒V1管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 重启${RESET}"
@@ -33,77 +33,65 @@ menu() {
     esac
 }
 
-install_app() {
-    mkdir -p "$APP_DIR"
+function install_app() {
+    mkdir -p "$APP_DIR/data"
 
-    read -p "请输入 Web 端口 [默认:8000]: " input_port
-    PORT=${input_port:-8000}
+    read -p "请输入 Web 端口 [默认:8008]: " input_port
+    PORT=${input_port:-8008}
 
-    read -p "请输入 媒体库路径: " MEDIA_DIR
-    read -p "请输入 输出目录路径: " OUTPUT_DIR
-
-    mkdir -p "$APP_DIR/data" "$OUTPUT_DIR"
-
+    # 写 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  mhti:
-    image: xiyan520/mhti:latest
-    container_name: mhti
-    restart: unless-stopped
+  dashboard:
+    image: ghcr.io/nezhahq/nezha:dev 
+    container_name: nezha-dashboard
+    restart: always
     ports:
-      - "127.0.0.1:${PORT}:8000"
+      - "127.0.0.1:$PORT:8008"
     volumes:
-      - ./data:/app/data
-      - \${MEDIA_DIR}:/media:ro
-      - \${OUTPUT_DIR}:/output
-    environment:
-      - TZ=Asia/Shanghai
-      - DATA_DIR=/app/data
+      - $APP_DIR/data:/dashboard/data
 EOF
 
-    cd "$APP_DIR" || exit
-    PORT=$PORT \
-    MEDIA_DIR=$MEDIA_DIR \
-    OUTPUT_DIR=$OUTPUT_DIR \
+    cd "$APP_DIR"
     docker compose up -d
 
-    echo -e "${GREEN}✅ MHTI 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:$PORT${RESET}"
+    echo -e "${GREEN}✅ Nezha Dashboard 已启动${RESET}"
+    echo -e "${YELLOW}🌐 Web UI 地址: http://127.0.0.1:$PORT${RESET}"
+    echo -e "${YELLOW}🌐 账号/密码: admin/admin${RESET}"
     echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
-    echo -e "${GREEN}🎞 媒体目录: $MEDIA_DIR${RESET}"
-    echo -e "${GREEN}📤 输出目录: $OUTPUT_DIR${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
-update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+
+function update_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ MHTI 已更新${RESET}"
+    echo -e "${GREEN}✅ Nezha Dashboard 已更新并重启完成${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
-restart_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+function restart_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose restart
-    echo -e "${GREEN}✅ MHTI 已重启${RESET}"
+    echo -e "${GREEN}✅ Nezha Dashboard 已重启${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
-view_logs() {
-    docker logs -f mhti
+function view_logs() {
+    docker logs -f nezha-dashboard
     read -p "按回车返回菜单..."
     menu
 }
 
-uninstall_app() {
+function uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ MHTI 已卸载（包含数据）${RESET}"
+    echo -e "${RED}✅ Nezha Dashboard 已卸载，数据已删除${RESET}"
     read -p "按回车返回菜单..."
     menu
 }

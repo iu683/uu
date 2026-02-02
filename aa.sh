@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Nezha Dashboard 一键管理脚本 (Docker Compose)
+# Navlink 一键管理脚本 (Docker Compose)
 # ========================================
 
 GREEN="\033[32m"
@@ -8,13 +8,13 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="nezha-dashboard"
+APP_NAME="navlink"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-function menu() {
+menu() {
     clear
-    echo -e "${GREEN}===哪吒V1管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== Navlink 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 重启${RESET}"
@@ -33,65 +33,85 @@ function menu() {
     esac
 }
 
-function install_app() {
-    mkdir -p "$APP_DIR/data"
+install_app() {
+    mkdir -p "$APP_DIR"/{data,plugins,logs}
 
-    read -p "请输入 Web 端口 [默认:8008]: " input_port
-    PORT=${input_port:-8008}
+    read -p "请输入 Web 端口 [默认:8000]: " input_port
+    PORT=${input_port:-8000}
 
-    # 写 docker-compose.yml
+    read -p "请输入 JWT_SECRET [默认:随机生成]: " input_jwt
+    if [[ -z "$input_jwt" ]]; then
+        JWT_SECRET=$(uuidgen 2>/dev/null || date +%s%N)
+    else
+        JWT_SECRET="$input_jwt"
+    fi
+
+    read -p "请输入 默认管理员密码 [默认:admin123]: " input_admin
+    ADMIN_PASSWORD=${input_admin:-admin123}
+
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  dashboard:
-    image: ghcr.io/nezhahq/nezha:dev 
-    container_name: nezha-dashboard
-    restart: always
+  navlink:
+    image: ghcr.io/txwebroot/navlink-releases:latest
+    container_name: navlink-app
+    hostname: navlink-app
+    restart: unless-stopped
     ports:
-      - "127.0.0.1:$PORT:8008"
+      - "127.0.0.1:${PORT}:3001"
+    environment:
+      - TZ=Asia/Shanghai
+      - NODE_ENV=production
+      - JWT_SECRET=\${JWT_SECRET}
+      - DEFAULT_ADMIN_PASSWORD=\${ADMIN_PASSWORD}
     volumes:
-      - $APP_DIR/data:/dashboard/data
+      - ./data:/app/data
+      - ./plugins:/app/plugins
+      - ./logs:/app/logs
 EOF
 
-    cd "$APP_DIR"
+    cd "$APP_DIR" || exit
+    PORT="$PORT" \
+    JWT_SECRET="$JWT_SECRET" \
+    ADMIN_PASSWORD="$ADMIN_PASSWORD" \
     docker compose up -d
 
-    echo -e "${GREEN}✅ Nezha Dashboard 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Web UI 地址: http://127.0.0.1:$PORT${RESET}"
-    echo -e "${YELLOW}🌐 账号/密码: admin/admin${RESET}"
+    echo -e "${GREEN}✅ Navlink 已启动${RESET}"
+    echo -e "${YELLOW}🌐 Web 地址: http://IP:$PORT${RESET}"
+    echo -e "${GREEN}👤 用户名：admin 默认管理员密码: $ADMIN_PASSWORD${RESET}"
+    echo -e "${GREEN}🔐 JWT_SECRET: $JWT_SECRET${RESET}"
     echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
-
-function update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
+update_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Nezha Dashboard 已更新并重启完成${RESET}"
+    echo -e "${GREEN}✅ Navlink 已更新完成${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
-function restart_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
+restart_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose restart
-    echo -e "${GREEN}✅ Nezha Dashboard 已重启${RESET}"
+    echo -e "${GREEN}✅ Navlink 已重启${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
-function view_logs() {
-    docker logs -f nezha-dashboard
+view_logs() {
+    docker logs -f navlink-app
     read -p "按回车返回菜单..."
     menu
 }
 
-function uninstall_app() {
+uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Nezha Dashboard 已卸载，数据已删除${RESET}"
+    echo -e "${RED}✅ Navlink 已卸载（包含数据）${RESET}"
     read -p "按回车返回菜单..."
     menu
 }

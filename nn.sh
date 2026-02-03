@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# IYUUPlus 一键管理脚本 (Docker Compose)
+# OneImg 一键管理脚本 (Docker Compose)
 # ========================================
 
 GREEN="\033[32m"
@@ -8,8 +8,8 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="iyuuplus-dev"
-CONTAINER_NAME="IYUUPlus"
+APP_NAME="oneimg-oneimg"
+CONTAINER_NAME="oneimg"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -27,7 +27,7 @@ check_env() {
 
 menu() {
     clear
-    echo -e "${GREEN}=== IYUUPlus 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== OneImg 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 重启${RESET}"
@@ -55,30 +55,28 @@ install_app() {
 
     mkdir -p "$APP_DIR/data"
 
-    read -p "请输入 Web 端口 [默认:8780]: " input_port
-    PORT=${input_port:-8780}
+    read -p "请输入 Web 端口 [默认:8080]: " input_port
+    PORT=${input_port:-8080}
 
     cat > "$COMPOSE_FILE" <<EOF
 version: "3"
 services:
-  iyuuplus-dev:
-    stdin_open: true
-    tty: true
+  oneimg-oneimg:
     container_name: ${CONTAINER_NAME}
-    image: iyuucn/iyuuplus-dev:latest
-    restart: always
+    image: onexru/oneimg-oneimg
+    restart: unless-stopped
     ports:
-      - "${PORT}:8780"
+      - "127.0.0.1:${PORT}:8080"
     volumes:
-      - "$APP_DIR/data:/data"
+      - "$APP_DIR/data:/app/data"
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    echo -e "${GREEN}✅ IYUUPlus 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Web 地址: http://服务器IP:${PORT}${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR{iyuu,data}${RESET}"
+    echo -e "${GREEN}✅ OneImg 已启动${RESET}"
+    echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
@@ -87,7 +85,7 @@ update_app() {
     cd "$APP_DIR" || { echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ IYUUPlus 已更新完成${RESET}"
+    echo -e "${GREEN}✅ OneImg 已更新完成${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
@@ -95,7 +93,7 @@ update_app() {
 restart_app() {
     cd "$APP_DIR" || { echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; }
     docker compose restart
-    echo -e "${GREEN}✅ IYUUPlus 已重启${RESET}"
+    echo -e "${GREEN}✅ OneImg 已重启${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
@@ -110,7 +108,7 @@ uninstall_app() {
     cd "$APP_DIR" || { echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; }
     docker compose down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ IYUUPlus 已卸载（含数据）${RESET}"
+    echo -e "${RED}✅ OneImg 已卸载（含数据）${RESET}"
     read -p "按回车返回菜单..."
     menu
 }

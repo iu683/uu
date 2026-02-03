@@ -34,6 +34,8 @@ menu() {
 }
 
 install_app() {
+    install_app() {
+    # ① 先创建目录（这是你现在缺的）
     mkdir -p "$APP_DIR"/{data,plugins,logs}
 
     read -p "请输入 Web 端口 [默认:8000]: " input_port
@@ -49,6 +51,7 @@ install_app() {
     read -p "请输入 默认管理员密码 [默认:admin123]: " input_admin
     ADMIN_PASSWORD=${input_admin:-admin123}
 
+    # ② 写 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
 services:
   navlink:
@@ -63,20 +66,33 @@ services:
       - NODE_ENV=production
       - JWT_SECRET=\${JWT_SECRET}
       - DEFAULT_ADMIN_PASSWORD=\${ADMIN_PASSWORD}
+      - SKIP_LICENSE=\${SKIP_LICENSE}
     volumes:
       - ./data:/app/data
       - ./plugins:/app/plugins
       - ./logs:/app/logs
 EOF
 
+    # ③ 写 .env
+    cat > "$APP_DIR/.env" <<EOF
+JWT_SECRET=${JWT_SECRET}
+ADMIN_PASSWORD=${ADMIN_PASSWORD}
+SKIP_LICENSE=true
+EOF
+
+    chmod 600 "$APP_DIR/.env"
+
+    # ④ 再 cd + 启动
     cd "$APP_DIR" || exit
-    PORT="$PORT" \
-    JWT_SECRET="$JWT_SECRET" \
-    ADMIN_PASSWORD="$ADMIN_PASSWORD" \
     docker compose up -d
 
     echo -e "${GREEN}✅ Navlink 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Web 地址: http://IP:$PORT${RESET}"
+}
+
+
+
+    echo -e "${GREEN}✅ Navlink 已启动${RESET}"
+    echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:$PORT${RESET}"
     echo -e "${GREEN}👤 用户名：admin 默认管理员密码: $ADMIN_PASSWORD${RESET}"
     echo -e "${GREEN}🔐 JWT_SECRET: $JWT_SECRET${RESET}"
     echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"

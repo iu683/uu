@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# MiSub 一键管理脚本 (Docker Compose)
+# Navlink 一键管理脚本 (Docker Compose)
 # ========================================
 
 GREEN="\033[32m"
@@ -8,13 +8,13 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="misub"
+APP_NAME="navlink"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
 menu() {
     clear
-    echo -e "${GREEN}=== MiSub 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== Navlink 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 重启${RESET}"
@@ -34,44 +34,52 @@ menu() {
 }
 
 install_app() {
-    mkdir -p "$APP_DIR/data"
+    mkdir -p "$APP_DIR"/{data,plugins,logs}
 
-    read -p "请输入 Web 端口 [默认:8080]: " input_port
-    PORT=${input_port:-8080}
+    read -p "请输入 Web 端口 [默认:8000]: " input_port
+    PORT=${input_port:-8000}
 
-    read -p "请输入 管理员密码 [默认:123456]: " input_admin
-    ADMIN_PASSWORD=${input_admin:-123456}
+    read -p "请输入 JWT_SECRET [默认:随机生成]: " input_jwt
+    if [[ -z "$input_jwt" ]]; then
+        JWT_SECRET=$(uuidgen 2>/dev/null || date +%s%N)
+    else
+        JWT_SECRET="$input_jwt"
+    fi
 
-    read -p "请输入 Cookie Secret [默认:123456]: " input_cookie
-    COOKIE_SECRET=${input_cookie:-123456}
+    read -p "请输入 默认管理员密码 [默认:admin123]: " input_admin
+    ADMIN_PASSWORD=${input_admin:-admin123}
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  misub:
-    image: ghcr.io/imzyb/misub:latest
-    container_name: misub
+  navlink:
+    image: ghcr.io/txwebroot/navlink-releases:latest
+    container_name: navlink-app
+    hostname: navlink-app
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT}:8080"
+      - "127.0.0.1:${PORT}:3001"
     environment:
-      PORT: 8080
-      MISUB_DB_PATH: /app/data/misub.db
-      ADMIN_PASSWORD: "\${ADMIN_PASSWORD}"
-      COOKIE_SECRET: "\${COOKIE_SECRET}"
+      - TZ=Asia/Shanghai
+      - NODE_ENV=production
+      - JWT_SECRET=\${JWT_SECRET}
+      - DEFAULT_ADMIN_PASSWORD=\${ADMIN_PASSWORD}
     volumes:
       - ./data:/app/data
+      - ./plugins:/app/plugins
+      - ./logs:/app/logs
 EOF
 
     cd "$APP_DIR" || exit
-    PORT=$PORT \
+    PORT="$PORT" \
+    JWT_SECRET="$JWT_SECRET" \
     ADMIN_PASSWORD="$ADMIN_PASSWORD" \
-    COOKIE_SECRET="$COOKIE_SECRET" \
     docker compose up -d
 
-    echo -e "${GREEN}✅ MiSub 已启动${RESET}"
+    echo -e "${GREEN}✅ Navlink 已启动${RESET}"
     echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:$PORT${RESET}"
+    echo -e "${GREEN}👤 用户名：admin 默认管理员密码: $ADMIN_PASSWORD${RESET}"
+    echo -e "${GREEN}🔐 JWT_SECRET: $JWT_SECRET${RESET}"
     echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
-    echo -e "${GREEN}🔐 管理员密码: $ADMIN_PASSWORD${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
@@ -80,7 +88,7 @@ update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ MiSub 已更新${RESET}"
+    echo -e "${GREEN}✅ Navlink 已更新完成${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
@@ -88,13 +96,13 @@ update_app() {
 restart_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose restart
-    echo -e "${GREEN}✅ MiSub 已重启${RESET}"
+    echo -e "${GREEN}✅ Navlink 已重启${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 view_logs() {
-    docker logs -f misub
+    docker logs -f navlink-app
     read -p "按回车返回菜单..."
     menu
 }
@@ -103,7 +111,7 @@ uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ MiSub 已卸载（包含数据）${RESET}"
+    echo -e "${RED}✅ Navlink 已卸载（包含数据）${RESET}"
     read -p "按回车返回菜单..."
     menu
 }

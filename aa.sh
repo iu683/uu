@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Navlink 一键管理脚本 (Docker Compose)
+# EasyNode 一键管理脚本 (Docker Compose)
 # ========================================
 
 GREEN="\033[32m"
@@ -8,13 +8,13 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="navlink"
+APP_NAME="easynode"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
 menu() {
     clear
-    echo -e "${GREEN}=== Navlink 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== EasyNode 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 重启${RESET}"
@@ -34,64 +34,77 @@ menu() {
 }
 
 install_app() {
-    # ① 先创建目录（这是你现在缺的）
-    mkdir -p "$APP_DIR"/{data,plugins,logs}
+    mkdir -p "$APP_DIR"
 
-    read -p "请输入 Web 端口 [默认:8000]: " input_port
-    PORT=${input_port:-8000}
+    read -p "请输入 Web 端口 [默认:8082]: " input_port
+    PORT=${input_port:-8082}
 
-    read -p "请输入 JWT_SECRET [默认:随机生成]: " input_jwt
-    if [[ -z "$input_jwt" ]]; then
-        JWT_SECRET=$(uuidgen 2>/dev/null || date +%s%N)
-    else
-        JWT_SECRET="$input_jwt"
-    fi
+    read -p "请输入数据目录 [默认:/root/easynode/db]: " input_db
+    DB_DIR=${input_db:-/root/easynode/db}
 
-    read -p "请输入 默认管理员密码 [默认:admin123]: " input_admin
-    ADMIN_PASSWORD=${input_admin:-admin123}
+    mkdir -p "$DB_DIR"
 
-    # ② 写 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
-
 services:
-  navlink:
-    image: ghcr.io/txwebroot/navlink-releases:latest
-    container_name: navlink-app
-    hostname: navlink-app
-    restart: unless-stopped
+  easynode:
+    image: docker.cnb.cool/chaoszhu/easynode:latest
+    container_name: easynode
+    restart: always
     ports:
-      - "127.0.0.1:${PORT}:3001"
+      - "127.0.0.1:${PORT}:8082"
+    volumes:
+      - \${DB_DIR}:/easynode/app/db
     environment:
       - TZ=Asia/Shanghai
-      - NODE_ENV=production
-      - JWT_SECRET=\${JWT_SECRET}
-      - DEFAULT_ADMIN_PASSWORD=\${ADMIN_PASSWORD}
-      - SKIP_LICENSE=\${SKIP_LICENSE}
+      - DEBUG=true
+      - GUACD_HOST=easynode-guacd
+      - GUACD_PORT=4822
+    depends_on:
+      easynode-guacd:
+        condition: service_healthy
+    networks:
+      - easynode-network
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  easynode-guacd:
+    image: docker.cnb.cool/chaoszhu/docker-sync-manual/guacamole-guacd:latest_amd64
+    container_name: easynode-guacd
+    restart: always
+    expose:
+      - "4822"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "nc -z 127.0.0.1 4822"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+    networks:
+      - easynode-network
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+
+  watchtower:
+    image: docker.cnb.cool/chaoszhu/docker-sync-manual/containrrr-watchtower:latest_amd64
+    container_name: easynode-watchtower
+    restart: always
     volumes:
-      - ./data:/app/data
-      - ./plugins:/app/plugins
-      - ./logs:/app/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --schedule "0 */5 * * * *" --label-enable
+    environment:
+      - TZ=Asia/Shanghai
+
+networks:
+  easynode-network:
+    driver: bridge
 EOF
 
-    # ③ 写 .env
-    cat > "$APP_DIR/.env" <<EOF
-JWT_SECRET=${JWT_SECRET}
-ADMIN_PASSWORD=${ADMIN_PASSWORD}
-SKIP_LICENSE=true
-EOF
-
-    chmod 600 "$APP_DIR/.env"
-
-    # ④ 再 cd + 启动
     cd "$APP_DIR" || exit
-    docker compose up -d
+    PORT="$PORT" DB_DIR="$DB_DIR" docker compose up -d
 
-
-    echo -e "${GREEN}✅ Navlink 已启动${RESET}"
+    echo -e "${GREEN}✅ EasyNode 已启动${RESET}"
     echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:$PORT${RESET}"
-    echo -e "${GREEN}👤 用户名：admin 默认管理员密码: $ADMIN_PASSWORD${RESET}"
-    echo -e "${GREEN}🔐 JWT_SECRET: $JWT_SECRET${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
+    echo -e "${GREEN}📂 数据目录: $DB_DIR${RESET}"
+    echo -e "${GREEN}🔄 Watchtower: 每 5 分钟自动检查更新${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
@@ -100,7 +113,7 @@ update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Navlink 已更新完成${RESET}"
+    echo -e "${GREEN}✅ EasyNode 已更新完成${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
@@ -108,22 +121,23 @@ update_app() {
 restart_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
     docker compose restart
-    echo -e "${GREEN}✅ Navlink 已重启${RESET}"
+    echo -e "${GREEN}✅ EasyNode 已重启${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
 view_logs() {
-    docker logs -f navlink-app
+    echo -e "${YELLOW}📜 正在查看 easynode 日志 (Ctrl+C 退出)${RESET}"
+    docker logs -f easynode
     read -p "按回车返回菜单..."
     menu
 }
 
 uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose down -v
+    docker compose down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Navlink 已卸载（包含数据）${RESET}"
+    echo -e "${RED}✅ EasyNode 已卸载（数据库未删除）${RESET}"
     read -p "按回车返回菜单..."
     menu
 }

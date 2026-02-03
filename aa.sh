@@ -34,7 +34,6 @@ menu() {
 }
 
 install_app() {
-    install_app() {
     # ① 先创建目录（这是你现在缺的）
     mkdir -p "$APP_DIR"/{data,plugins,logs}
 
@@ -53,6 +52,7 @@ install_app() {
 
     # ② 写 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
+
 services:
   navlink:
     image: ghcr.io/txwebroot/navlink-releases:latest
@@ -85,10 +85,6 @@ EOF
     # ④ 再 cd + 启动
     cd "$APP_DIR" || exit
     docker compose up -d
-
-    echo -e "${GREEN}✅ Navlink 已启动${RESET}"
-}
-
 
 
     echo -e "${GREEN}✅ Navlink 已启动${RESET}"

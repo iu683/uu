@@ -1,119 +1,121 @@
 #!/bin/bash
 # ========================================
-# IYUUPlus 一键管理脚本 (Docker Compose)
+# Sub-Store 一键管理脚本 (Docker Compose)
 # ========================================
 
 GREEN="\033[32m"
+RESET="\033[0m"
 YELLOW="\033[33m"
 RED="\033[31m"
-RESET="\033[0m"
-
-APP_NAME="iyuuplus-dev"
-CONTAINER_NAME="IYUUPlus"
+APP_NAME="sub-store"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/config.env"
 
-check_env() {
-    command -v docker >/dev/null 2>&1 || {
-        echo -e "${RED}❌ 未检测到 Docker${RESET}"
-        exit 1
-    }
-
-    docker compose version >/dev/null 2>&1 || {
-        echo -e "${RED}❌ Docker Compose 不可用${RESET}"
-        exit 1
-    }
+# 随机生成 20 位密钥
+function gen_key() {
+    tr -dc 'a-z0-9' </dev/urandom | head -c20
 }
 
-menu() {
+function menu() {
     clear
-    echo -e "${GREEN}=== IYUUPlus 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== Sub-Store 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 重启${RESET}"
+    echo -e "${GREEN}3) 卸载(含数据)${RESET}"
     echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}5) 开启自动更新(cron)${RESET}"
+    echo -e "${GREEN}6) 关闭自动更新${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
     read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
     case $choice in
         1) install_app ;;
         2) update_app ;;
-        3) restart_app ;;
+        3) uninstall_app ;;
         4) view_logs ;;
-        5) uninstall_app ;;
+        5) enable_auto_update ;;
+        6) disable_auto_update ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
     esac
 }
 
-install_app() {
-    if [ -f "$COMPOSE_FILE" ]; then
-        read -p "已存在安装，是否覆盖重装？(y/N): " confirm
-        [[ "$confirm" != "y" && "$confirm" != "Y" ]] && menu
-    fi
+function install_app() {
+    read -p "请输入宿主机端口 [默认:3001]: " input_port
+    PORT=${input_port:-3001}
 
     mkdir -p "$APP_DIR/data"
 
-    read -p "请输入 Web 端口 [默认:8780]: " input_port
-    PORT=${input_port:-8780}
+    # 随机生成 SUB_STORE_FRONTEND_BACKEND_PATH
+    PATH_KEY=$(gen_key)
 
     cat > "$COMPOSE_FILE" <<EOF
-version: "3"
 services:
-  iyuuplus-dev:
+  sub-store:
+    image: xream/sub-store:http-meta
+    container_name: sub-store
+    restart: unless-stopped
+    volumes:
+      - $APP_DIR/data:/opt/app/data
+    environment:
+      - SUB_STORE_FRONTEND_BACKEND_PATH=/$PATH_KEY
+    ports:
+      - "127.0.0.1:$PORT:3001"
     stdin_open: true
     tty: true
-    container_name: ${CONTAINER_NAME}
-    image: iyuucn/iyuuplus-dev:latest
-    restart: always
-    ports:
-      - "${PORT}:8780"
-    volumes:
-      - "$APP_DIR/data:/data"
 EOF
 
-    cd "$APP_DIR" || exit
+    echo "PORT=$PORT" > "$CONFIG_FILE"
+    echo "SUB_STORE_FRONTEND_BACKEND_PATH=/$PATH_KEY" >> "$CONFIG_FILE"
+
+    cd "$APP_DIR"
     docker compose up -d
 
-    echo -e "${GREEN}✅ IYUUPlus 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Web 地址: http://服务器IP:${PORT}${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR{iyuu,data}${RESET}"
+    echo -e "${GREEN}✅ Sub-Store 已启动${RESET}"
+    echo -e "${YELLOW}🌐 本机访问地址: http://127.0.0.1:$PORT${RESET}"
+    echo -e "${YELLOW}🌐 API: http://127.0.0.1:$PORT/$PATH_KEY${RESET}"
+    echo -e "${YELLOW}🌐 密钥: $PATH_KEY${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
-update_app() {
-    cd "$APP_DIR" || { echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; }
+function update_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ IYUUPlus 已更新完成${RESET}"
+    echo -e "${GREEN}✅ Sub-Store 已更新并重启完成${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
-restart_app() {
-    cd "$APP_DIR" || { echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; }
-    docker compose restart
-    echo -e "${GREEN}✅ IYUUPlus 已重启${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-view_logs() {
-    echo -e "${YELLOW}📄 正在查看日志，Ctrl+C 返回菜单${RESET}"
-    docker logs -f ${CONTAINER_NAME}
-    menu
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || { echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; }
-    docker compose down
+function uninstall_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+    docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ IYUUPlus 已卸载（含数据）${RESET}"
+    echo -e "${GREEN}✅ Sub-Store 已卸载，数据已删除${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
-check_env
+function view_logs() {
+    docker logs -f sub-store
+    read -p "按回车返回菜单..."
+    menu
+}
+function enable_auto_update() {
+    (crontab -l 2>/dev/null; echo "0 4 * * * cd $APP_DIR && docker compose pull && docker compose up -d >/dev/null 2>&1") | crontab -
+    echo -e "${GREEN}✅ 已开启每日自动更新${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function disable_auto_update() {
+    crontab -l 2>/dev/null | grep -v "$APP_DIR" | crontab -
+    echo -e "${GREEN}✅ 已关闭自动更新${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+
 menu

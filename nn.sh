@@ -4,47 +4,31 @@ set -e
 #################################
 # 基础路径
 #################################
-
 ROOT="/root"
-LOG="/var/log/toolbox-auto-update.log"
 CONF="/etc/toolbox-update.conf"
 SCRIPT_PATH="/usr/local/bin/toolbox-manager.sh"
 
 #################################
 # 颜色
 #################################
-
 GREEN='\033[32m'
 RED='\033[31m'
 YELLOW='\033[33m'
 RESET='\033[0m'
 
 #################################
-# 日志
-#################################
-
-log() {
-    echo "[$(date '+%F %T')] $1" >>"$LOG"
-}
-
-#################################
 # 读取配置
 #################################
-
 load_conf() {
     [ -f "$CONF" ] && source "$CONF"
-
-    # 默认服务器名 = hostname
     SERVER_NAME="${SERVER_NAME:-$(hostname)}"
 }
 
 #################################
 # Telegram（可选）
 #################################
-
 tg_send() {
     load_conf
-
     [ -z "${TG_BOT_TOKEN:-}" ] && return
     [ -z "${TG_CHAT_ID:-}" ] && return
 
@@ -56,9 +40,8 @@ tg_send() {
 }
 
 #################################
-# 更新逻辑
+# 更新逻辑 + TG通知优化
 #################################
-
 update_one() {
     NAME="$1"
     FILE="$2"
@@ -69,18 +52,20 @@ update_one() {
         return
     fi
 
-    echo -e "${GREEN}更新 $NAME ...${RESET}"
-    log "更新 $NAME"
+    echo -e "${GREEN}运行 $NAME ...${RESET}"
 
+    # 删除旧文件
     rm -f "$ROOT/$FILE"
 
     TMP=$(mktemp)
 
     if curl -fsSL "$URL" -o "$TMP"; then
         chmod +x "$TMP"
-        bash "$TMP" >>"$LOG" 2>&1 && RESULT+="\n✅ $NAME" || RESULT+="\n❌ $NAME"
-    else
-        RESULT+="\n❌ $NAME"
+
+        # 自动输入0退出菜单
+        if printf "0\n" | bash "$TMP" >/dev/null 2>&1; then
+            UPDATED_LIST+=("$NAME")
+        fi
     fi
 
     rm -f "$TMP"
@@ -88,9 +73,9 @@ update_one() {
 
 run_update() {
     load_conf
+    UPDATED_LIST=()
 
-    RESULT="📦 <b>Toolbox 更新结果</b>\n🖥 ${SERVER_NAME}"
-
+    # 更新各脚本
     update_one "vps-toolbox" "vps-toolbox.sh" \
     "https://raw.githubusercontent.com/Polarisiu/vps-toolbox/main/uu.sh"
 
@@ -106,17 +91,22 @@ run_update() {
     update_one "Alpine" "Alpine.sh" \
     "https://raw.githubusercontent.com/Polarisiu/Alpinetool/main/Alpine.sh"
 
-    tg_send "$RESULT"
-
-    echo -e "${GREEN}更新完成${RESET}"
-}
+    # ⭐ Telegram 只在有更新时发送
+    if [ ${#UPDATED_LIST[@]} -gt 0 ]; then
+        MSG="🚀 脚本已更新
+    服务器: ${SERVER_NAME}
+    脚本: ${UPDATED_LIST[*]}"
+        tg_send "$MSG"
+        echo -e "${GREEN}更新完成，已发送 TG 通知${RESET}"
+    else
+        echo -e "${YELLOW}没有脚本需要更新${RESET}"
+    fi
 
 #################################
 # cron 管理
 #################################
-
 enable_cron() {
-    echo "选择频率："
+    echo "选择更新频率："
     echo "1) 每天"
     echo "2) 每周"
     echo "3) 每月"
@@ -147,12 +137,10 @@ disable_cron() {
 #################################
 # Telegram + VPS名称 设置
 #################################
-
 tg_setup() {
     read -p "Bot Token: " token
     read -p "Chat ID: " chat
     read -p "VPS 名称(回车默认 hostname): " name
-
     name="${name:-$(hostname)}"
 
     cat >"$CONF" <<EOF
@@ -165,26 +153,16 @@ EOF
 }
 
 #################################
-# 查看日志
-#################################
-
-view_log() {
-    tail -n 30 "$LOG"
-}
-
-#################################
 # 自动模式（cron用）
 #################################
-
 if [ "${1:-}" = "--auto" ]; then
     run_update
     exit
 fi
 
 #################################
-# 菜单（你要的风格）
+# 菜单循环
 #################################
-
 while true; do
     clear
     echo -e "${GREEN}=== Toolbox 管理菜单 ===${RESET}"
@@ -192,7 +170,6 @@ while true; do
     echo -e "${GREEN}2) 开启自动更新(cron)${RESET}"
     echo -e "${GREEN}3) 关闭自动更新${RESET}"
     echo -e "${GREEN}4) Telegram + VPS名称 设置(可选)${RESET}"
-    echo -e "${GREEN}5) 查看日志${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
 
     read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
@@ -202,7 +179,6 @@ while true; do
         2) enable_cron; read -p "回车继续..." ;;
         3) disable_cron; read -p "回车继续..." ;;
         4) tg_setup; read -p "回车继续..." ;;
-        5) view_log; read -p "回车继续..." ;;
         0) exit ;;
     esac
 done

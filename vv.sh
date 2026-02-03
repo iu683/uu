@@ -1,120 +1,192 @@
 #!/bin/bash
 # ========================================
-# IYUUPlus 一键管理脚本 (Docker Compose)
+# Docker 项目自动更新管理器
+# 支持：每日/每周 + Telegram 通知
 # ========================================
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="iyuuplus-dev"
-CONTAINER_NAME="IYUUPlus"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+PROJECTS_DIR="/opt"
+CONF_FILE="/etc/docker-update.conf"
+CRON_TAG="# docker-project-update"
 
-check_env() {
-    command -v docker >/dev/null 2>&1 || {
-        echo -e "${RED}❌ 未检测到 Docker${RESET}"
-        exit 1
-    }
 
-    docker compose version >/dev/null 2>&1 || {
-        echo -e "${RED}❌ Docker Compose 不可用${RESET}"
-        exit 1
-    }
+# ========================================
+# 初始化配置文件
+# ========================================
+init_conf() {
+    if [ ! -f "$CONF_FILE" ]; then
+cat > "$CONF_FILE" <<EOF
+BOT_TOKEN=""
+CHAT_ID=""
+ONLY_RUNNING=true
+EOF
+    fi
 }
 
-menu() {
+
+# ========================================
+# 选择项目
+# ========================================
+choose_project() {
+
+projects=($(find "$PROJECTS_DIR" -maxdepth 1 -type d -exec test -f '{}/docker-compose.yml' \; -print | sort))
+
+if [ ${#projects[@]} -eq 0 ]; then
+    echo -e "${RED}未找到 docker-compose 项目${RESET}"
+    sleep 1
+    return
+fi
+
+echo -e "${GREEN}=== 选择项目 ===${RESET}"
+
+for i in "${!projects[@]}"; do
+    echo -e "${GREEN}$((i+1))) $(basename "${projects[$i]}")${RESET}"
+done
+
+read -p "$(echo -e ${GREEN}请输入编号:${RESET}) " n
+
+echo "${projects[$((n-1))]}"
+}
+
+
+# ========================================
+# 选择时间（每日/每周）
+# ========================================
+choose_time() {
+
+echo
+echo -e "${GREEN}1) 每日更新${RESET}"
+echo -e "${GREEN}2) 每周更新${RESET}"
+
+read -p "$(echo -e ${GREEN}选择:${RESET}) " mode
+read -p "几点执行(0-23 默认4): " hour
+hour=${hour:-4}
+
+if [ "$mode" = "1" ]; then
+    echo "0 $hour * * *"
+else
+    echo -e "${GREEN}0=周日 1=周一 ... 6=周六${RESET}"
+    read -p "星期(默认0): " week
+    week=${week:-0}
+    echo "0 $hour * * $week"
+fi
+}
+
+
+# ========================================
+# 添加更新任务
+# ========================================
+add_update() {
+
+dir=$(choose_project)
+[ -z "$dir" ] && return
+
+name=$(basename "$dir")
+cronexp=$(choose_time)
+
+source "$CONF_FILE"
+
+cmd="cd $dir && \
+running=\$(docker compose ps -q) && \
+[ \"\$running\" != \"\" ] && \
+(docker compose pull && docker compose up -d) && STATUS=success || STATUS=fail; \
+if [ -n \"$BOT_TOKEN\" ] && [ -n \"$CHAT_ID\" ]; then \
+MSG=\"🚀 Docker 自动更新%0A主机: \$(hostname)%0A项目: $name%0A时间: \$(date '+%F %T')%0A状态: \"; \
+[ \$STATUS = success ] && \
+curl -s \"https://api.telegram.org/bot$BOT_TOKEN/sendMessage?chat_id=$CHAT_ID&text=\${MSG}✅ 成功\" >/dev/null || \
+curl -s \"https://api.telegram.org/bot$BOT_TOKEN/sendMessage?chat_id=$CHAT_ID&text=\${MSG}❌ 失败\" >/dev/null; \
+fi"
+
+(crontab -l 2>/dev/null | grep -v "$CRON_TAG-$name";
+ echo "$cronexp source $CONF_FILE && $cmd $CRON_TAG-$name") | crontab -
+
+echo -e "${GREEN}✅ 已添加 $name 自动更新 ($cronexp)${RESET}"
+read -p "回车继续..."
+}
+
+
+# ========================================
+# 删除任务
+# ========================================
+remove_update() {
+
+jobs=$(crontab -l 2>/dev/null | grep "$CRON_TAG")
+
+if [ -z "$jobs" ]; then
+    echo "没有更新任务"
+    read
+    return
+fi
+
+echo "$jobs" | nl
+read -p "删除编号: " n
+
+line=$(echo "$jobs" | sed -n "${n}p")
+
+crontab -l | grep -vF "$line" | crontab -
+
+echo -e "${RED}已删除${RESET}"
+read
+}
+
+
+# ========================================
+# 查看任务
+# ========================================
+list_update() {
+echo
+crontab -l | grep "$CRON_TAG"
+echo
+read -p "回车继续..."
+}
+
+
+# ========================================
+# 立即更新
+# ========================================
+run_now() {
+
+dir=$(choose_project)
+[ -z "$dir" ] && return
+
+cd "$dir"
+docker compose pull
+docker compose up -d
+
+echo -e "${GREEN}✅ 更新完成${RESET}"
+read -p "回车继续..."
+}
+
+
+# ========================================
+# 主菜单（完全绿色风格）
+# ========================================
+init_conf
+
+while true; do
     clear
-    echo -e "${GREEN}=== IYUUPlus 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 重启${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}      Docker 项目自动更新管理器      ${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}1) 添加项目自动更新 (每日/每周)${RESET}"
+    echo -e "${GREEN}2) 删除项目更新任务${RESET}"
+    echo -e "${GREEN}3) 查看所有更新规则${RESET}"
+    echo -e "${GREEN}4) 立即手动更新一次${RESET}"
+    echo -e "${GREEN}5) 编辑 Telegram 配置${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
+
     read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
     case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) restart_app ;;
-        4) view_logs ;;
-        5) uninstall_app ;;
+        1) add_update ;;
+        2) remove_update ;;
+        3) list_update ;;
+        4) run_now ;;
+        5) nano "$CONF_FILE" ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
+        *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
     esac
-}
-
-install_app() {
-    if [ -f "$COMPOSE_FILE" ]; then
-        read -p "已存在安装，是否覆盖重装？(y/N): " confirm
-        [[ "$confirm" != "y" && "$confirm" != "Y" ]] && menu
-    fi
-
-    mkdir -p "$APP_DIR/iyuu" "$APP_DIR/data"
-
-    read -p "请输入 Web 端口 [默认:8780]: " input_port
-    PORT=${input_port:-8780}
-
-    cat > "$COMPOSE_FILE" <<EOF
-
-services:
-  iyuuplus-dev:
-    stdin_open: true
-    tty: true
-    container_name: ${CONTAINER_NAME}
-    image: iyuucn/iyuuplus-dev:latest
-    restart: always
-    ports:
-      - "127.0.0.1:${PORT}:8780"
-    volumes:
-      - "$APP_DIR/iyuu:/iyuu"
-      - "$APP_DIR/data:/data"
-EOF
-
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    echo -e "${GREEN}✅ IYUUPlus 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR{iyuu,data}${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-update_app() {
-    cd "$APP_DIR" || { echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; }
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ IYUUPlus 已更新完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-restart_app() {
-    cd "$APP_DIR" || { echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; }
-    docker compose restart
-    echo -e "${GREEN}✅ IYUUPlus 已重启${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-view_logs() {
-    echo -e "${YELLOW}📄 正在查看日志，Ctrl+C 返回菜单${RESET}"
-    docker logs -f ${CONTAINER_NAME}
-    menu
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || { echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; }
-    docker compose down
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ IYUUPlus 已卸载（含数据）${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-check_env
-menu
+done

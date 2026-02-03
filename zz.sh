@@ -1,7 +1,11 @@
 #!/bin/bash
 # ========================================
-# Docker 项目自动更新管理器
-# 支持：每日/每周 + Telegram 通知
+# Docker 项目自动更新管理器 Pro++
+# 支持：
+#   ✅ 每日/每周更新
+#   ✅ Telegram 成功/失败通知
+#   ✅ 自定义 VPS 名称
+#   ✅ 绿色菜单
 # ========================================
 
 GREEN="\033[32m"
@@ -14,16 +18,57 @@ CRON_TAG="# docker-project-update"
 
 
 # ========================================
-# 初始化配置文件
+# 初始化配置
 # ========================================
 init_conf() {
-    if [ ! -f "$CONF_FILE" ]; then
+    [ -f "$CONF_FILE" ] && return
+
 cat > "$CONF_FILE" <<EOF
 BOT_TOKEN=""
 CHAT_ID=""
+SERVER_NAME=""
 ONLY_RUNNING=true
 EOF
-    fi
+}
+
+
+# ========================================
+# 读取配置
+# ========================================
+load_conf() {
+    source "$CONF_FILE"
+
+    # ⭐ 没填则自动使用 hostname
+    [ -z "$SERVER_NAME" ] && SERVER_NAME=$(hostname)
+}
+
+
+# ========================================
+# Telegram 发送
+# ========================================
+tg_send() {
+
+    load_conf
+
+    [ -z "$BOT_TOKEN" ] && return
+    [ -z "$CHAT_ID" ] && return
+
+    curl -s \
+    "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+    -d chat_id="$CHAT_ID" \
+    -d text="$1" \
+    -d parse_mode="HTML" >/dev/null 2>&1
+}
+
+
+# ========================================
+# 扫描项目
+# ========================================
+scan_projects() {
+    mapfile -t PROJECTS < <(
+        find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -type f -name docker-compose.yml \
+        -exec dirname {} \; | sort
+    )
 }
 
 
@@ -32,122 +77,102 @@ EOF
 # ========================================
 choose_project() {
 
-projects=()
+    scan_projects
 
-while IFS= read -r line; do
-    projects+=("$line")
-done < <(
-    find "$PROJECTS_DIR" -maxdepth 2 -type f -name "docker-compose.yml" \
-    -exec dirname {} \; | sort
-)
+    if [ ${#PROJECTS[@]} -eq 0 ]; then
+        echo -e "${RED}未找到 docker-compose 项目${RESET}"
+        sleep 2
+        return 1
+    fi
 
-if [ ${#projects[@]} -eq 0 ]; then
-    echo -e "${RED}未找到 docker-compose 项目${RESET}"
-    sleep 2
-    return
-fi
+    clear
+    echo -e "${GREEN}=== 请选择项目 ===${RESET}"
 
-echo -e "${GREEN}=== 选择项目 ===${RESET}"
+    for i in "${!PROJECTS[@]}"; do
+        echo -e "${GREEN}$((i+1))) $(basename "${PROJECTS[$i]}")${RESET}"
+    done
+    echo -e "${GREEN}0) 返回${RESET}"
 
-for i in "${!projects[@]}"; do
-    echo -e "${GREEN}$((i+1))) $(basename "${projects[$i]}")${RESET}"
-done
+    read -p "$(echo -e ${GREEN}请输入编号:${RESET}) " n
+    [[ "$n" == "0" ]] && return 1
 
-read -p "$(echo -e ${GREEN}请输入编号:${RESET}) " n
-
-echo "${projects[$((n-1))]}"
+    PROJECT_DIR="${PROJECTS[$((n-1))]}"
+    PROJECT_NAME=$(basename "$PROJECT_DIR")
 }
 
 
 # ========================================
-# 选择时间（每日/每周）
+# 选择时间
 # ========================================
 choose_time() {
 
-echo
-echo -e "${GREEN}1) 每日更新${RESET}"
-echo -e "${GREEN}2) 每周更新${RESET}"
+    echo
+    echo -e "${GREEN}1) 每日更新${RESET}"
+    echo -e "${GREEN}2) 每周更新${RESET}"
 
-read -p "$(echo -e ${GREEN}选择:${RESET}) " mode
-read -p "几点执行(0-23 默认4): " hour
-hour=${hour:-4}
+    read -p "$(echo -e ${GREEN}选择:${RESET}) " mode
+    read -p "几点执行(默认4): " hour
+    hour=${hour:-4}
 
-if [ "$mode" = "1" ]; then
-    echo "0 $hour * * *"
-else
-    echo -e "${GREEN}0=周日 1=周一 ... 6=周六${RESET}"
-    read -p "星期(默认0): " week
-    week=${week:-0}
-    echo "0 $hour * * $week"
-fi
+    if [ "$mode" = "1" ]; then
+        CRON_EXP="0 $hour * * *"
+    else
+        echo -e "${GREEN}0=周日 1=周一 ... 6=周六${RESET}"
+        read -p "星期(默认0): " week
+        week=${week:-0}
+        CRON_EXP="0 $hour * * $week"
+    fi
 }
 
 
 # ========================================
-# 添加更新任务
+# 添加更新
 # ========================================
 add_update() {
 
-dir=$(choose_project)
-[ -z "$dir" ] && return
+    choose_project || return
+    choose_time
 
-name=$(basename "$dir")
-cronexp=$(choose_time)
-
-source "$CONF_FILE"
-
-cmd="cd $dir && \
+    CMD="cd $PROJECT_DIR && \
 running=\$(docker compose ps -q) && \
 [ \"\$running\" != \"\" ] && \
-(docker compose pull && docker compose up -d) && STATUS=success || STATUS=fail; \
-if [ -n \"$BOT_TOKEN\" ] && [ -n \"$CHAT_ID\" ]; then \
-MSG=\"🚀 Docker 自动更新%0A主机: \$(hostname)%0A项目: $name%0A时间: \$(date '+%F %T')%0A状态: \"; \
+(docker compose pull && docker compose up -d && STATUS=success) || STATUS=fail; \
+SERVER=\${SERVER_NAME:-\$(hostname)}; \
+MSG=\"🚀 <b>Docker 自动更新</b>%0A服务器: \$SERVER%0A项目: $PROJECT_NAME%0A时间: \$(date '+%F %T')%0A状态: \"; \
 [ \$STATUS = success ] && \
-curl -s \"https://api.telegram.org/bot$BOT_TOKEN/sendMessage?chat_id=$CHAT_ID&text=\${MSG}✅ 成功\" >/dev/null || \
-curl -s \"https://api.telegram.org/bot$BOT_TOKEN/sendMessage?chat_id=$CHAT_ID&text=\${MSG}❌ 失败\" >/dev/null; \
-fi"
+curl -s https://api.telegram.org/bot\$BOT_TOKEN/sendMessage -d chat_id=\$CHAT_ID -d text=\"\${MSG}✅ 成功\" >/dev/null || \
+curl -s https://api.telegram.org/bot\$BOT_TOKEN/sendMessage -d chat_id=\$CHAT_ID -d text=\"\${MSG}❌ 失败\" >/dev/null"
 
-(crontab -l 2>/dev/null | grep -v "$CRON_TAG-$name";
- echo "$cronexp source $CONF_FILE && $cmd $CRON_TAG-$name") | crontab -
+    (crontab -l 2>/dev/null | grep -v "$CRON_TAG-$PROJECT_NAME";
+     echo "$CRON_EXP source $CONF_FILE && $CMD $CRON_TAG-$PROJECT_NAME") | crontab -
 
-echo -e "${GREEN}✅ 已添加 $name 自动更新 ($cronexp)${RESET}"
-read -p "回车继续..."
+    echo -e "${GREEN}✅ 已添加 $PROJECT_NAME 定时更新${RESET}"
+    read
 }
 
 
 # ========================================
-# 删除任务
+# 删除更新
 # ========================================
 remove_update() {
 
-jobs=$(crontab -l 2>/dev/null | grep "$CRON_TAG")
+    choose_project || return
 
-if [ -z "$jobs" ]; then
-    echo "没有更新任务"
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG-$PROJECT_NAME" | crontab -
+
+    echo -e "${RED}已删除 $PROJECT_NAME 更新任务${RESET}"
     read
-    return
-fi
-
-echo "$jobs" | nl
-read -p "删除编号: " n
-
-line=$(echo "$jobs" | sed -n "${n}p")
-
-crontab -l | grep -vF "$line" | crontab -
-
-echo -e "${RED}已删除${RESET}"
-read
 }
 
 
 # ========================================
-# 查看任务
+# 查看规则
 # ========================================
 list_update() {
-echo
-crontab -l | grep "$CRON_TAG"
-echo
-read -p "回车继续..."
+    echo
+    crontab -l | grep "$CRON_TAG"
+    echo
+    read
 }
 
 
@@ -156,20 +181,51 @@ read -p "回车继续..."
 # ========================================
 run_now() {
 
-dir=$(choose_project)
-[ -z "$dir" ] && return
+    choose_project || return
+    load_conf
 
-cd "$dir"
-docker compose pull
-docker compose up -d
+    cd "$PROJECT_DIR"
 
-echo -e "${GREEN}✅ 更新完成${RESET}"
-read -p "回车继续..."
+    if docker compose pull && docker compose up -d; then
+        echo -e "${GREEN}✅ 更新成功${RESET}"
+        tg_send "🚀 <b>手动更新成功</b>%0A服务器: $SERVER_NAME%0A项目: $PROJECT_NAME"
+    else
+        echo -e "${RED}❌ 更新失败${RESET}"
+        tg_send "❌ <b>手动更新失败</b>%0A服务器: $SERVER_NAME%0A项目: $PROJECT_NAME"
+    fi
+
+    read
 }
 
 
 # ========================================
-# 主菜单（完全绿色风格）
+# Telegram + 服务器名称设置
+# ========================================
+set_tg() {
+
+    load_conf
+
+    clear
+    echo -e "${GREEN}=== Telegram & 服务器设置 ===${RESET}"
+
+    read -p "BOT_TOKEN: " token
+    read -p "CHAT_ID: " chat
+    read -p "服务器名称(自定义，如 HK-01，可留空用hostname): " server
+
+cat > "$CONF_FILE" <<EOF
+BOT_TOKEN="$token"
+CHAT_ID="$chat"
+SERVER_NAME="$server"
+ONLY_RUNNING=true
+EOF
+
+    echo -e "${GREEN}✅ 保存成功${RESET}"
+    read
+}
+
+
+# ========================================
+# 主菜单（全绿）
 # ========================================
 init_conf
 
@@ -182,7 +238,7 @@ while true; do
     echo -e "${GREEN}2) 删除项目更新任务${RESET}"
     echo -e "${GREEN}3) 查看所有更新规则${RESET}"
     echo -e "${GREEN}4) 立即手动更新一次${RESET}"
-    echo -e "${GREEN}5) 编辑 Telegram 配置${RESET}"
+    echo -e "${GREEN}5) 设置 Telegram & 服务器名称${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
 
     read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
@@ -192,8 +248,7 @@ while true; do
         2) remove_update ;;
         3) list_update ;;
         4) run_now ;;
-        5) nano "$CONF_FILE" ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        5) set_tg ;;
+        0) exit ;;
     esac
 done

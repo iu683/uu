@@ -53,13 +53,13 @@ install_app() {
         [[ "$confirm" != "y" && "$confirm" != "Y" ]] && menu
     fi
 
-    mkdir -p "$APP_DIR/iyuu" "$APP_DIR/data/sessions"
-    chmod -R 777 "$APP_DIR/iyuu" "$APP_DIR/data"
+    mkdir -p "$APP_DIR/data"
 
     read -p "请输入 Web 端口 [默认:8780]: " input_port
     PORT=${input_port:-8780}
 
     cat > "$COMPOSE_FILE" <<EOF
+version: "3"
 services:
   iyuuplus-dev:
     stdin_open: true
@@ -68,24 +68,29 @@ services:
     image: iyuucn/iyuuplus-dev:latest
     restart: always
     ports:
-      - "127.0.0.1:${PORT}:8780"
+      - "${PORT}:8780"
     volumes:
-      - "$APP_DIR/iyuu:/iyuu"
       - "$APP_DIR/data:/data"
-    environment:
-      - TZ=Asia/Shanghai
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     echo -e "${GREEN}✅ IYUUPlus 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/{iyuu,data}${RESET}"
+    echo -e "${YELLOW}🌐 Web 地址: http://服务器IP:${PORT}${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR{iyuu,data}${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
 
+update_app() {
+    cd "$APP_DIR" || { echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; }
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ IYUUPlus 已更新完成${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
 
 restart_app() {
     cd "$APP_DIR" || { echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; }

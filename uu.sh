@@ -1,196 +1,199 @@
-#!/bin/bash
-# ========================================
-# Docker 项目自动更新管理器
-# 支持：每日/每周 + Telegram 通知
-# ========================================
+#!/usr/bin/env bash
+set -e
 
-GREEN="\033[32m"
-RED="\033[31m"
-RESET="\033[0m"
+#################################
+# 基础路径
+#################################
+ROOT="/root"
+LOG="/var/log/toolbox-auto-update.log"
+CONF="/etc/toolbox-update.conf"
+SCRIPT_PATH="/usr/local/bin/toolbox-manager.sh"
 
-PROJECTS_DIR="/opt"
-CONF_FILE="/etc/docker-update.conf"
-CRON_TAG="# docker-project-update"
+#################################
+# 颜色
+#################################
+GREEN='\033[32m'
+RED='\033[31m'
+YELLOW='\033[33m'
+RESET='\033[0m'
 
+#################################
+# 日志
+#################################
+log() {
+    echo "[$(date '+%F %T')] $1" >>"$LOG"
+}
 
-# ========================================
-# 初始化配置文件
-# ========================================
-init_conf() {
-    if [ ! -f "$CONF_FILE" ]; then
-cat > "$CONF_FILE" <<EOF
-BOT_TOKEN=""
-CHAT_ID=""
-ONLY_RUNNING=true
-EOF
+#################################
+# 读取配置
+#################################
+load_conf() {
+    [ -f "$CONF" ] && source "$CONF"
+    SERVER_NAME="${SERVER_NAME:-$(hostname)}"
+}
+
+#################################
+# Telegram（可选）
+#################################
+tg_send() {
+    load_conf
+    [ -z "${TG_BOT_TOKEN:-}" ] && return
+    [ -z "${TG_CHAT_ID:-}" ] && return
+
+    curl -s -X POST \
+      "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+      -d chat_id="$TG_CHAT_ID" \
+      -d text="$1" \
+      -d parse_mode="HTML" >/dev/null 2>&1 || true
+}
+
+#################################
+# 更新逻辑
+#################################
+update_one() {
+    NAME="$1"
+    FILE="$2"
+    URL="$3"
+
+    if [ ! -f "$ROOT/$FILE" ]; then
+        echo -e "${YELLOW}跳过 $NAME（未安装）${RESET}"
+        return
     fi
+
+    echo -e "${GREEN}运行 $NAME ...${RESET}"
+    log "运行 $NAME"
+
+    # 删除旧文件
+    rm -f "$ROOT/$FILE"
+
+    TMP=$(mktemp)
+
+    if curl -fsSL "$URL" -o "$TMP"; then
+        chmod +x "$TMP"
+
+        # ⭐ 自动输入0退出菜单，保证不会卡住
+        if printf "0\n" | bash "$TMP" >>"$LOG" 2>&1; then
+            RESULT+="\n✅ $NAME"
+        else
+            RESULT+="\n❌ $NAME"
+        fi
+    else
+        RESULT+="\n❌ $NAME(下载失败)"
+    fi
+
+    rm -f "$TMP"
 }
 
+run_update() {
+    load_conf
+    RESULT="📦 <b>Toolbox 更新结果</b>\n🖥 ${SERVER_NAME}"
 
-# ========================================
-# 选择项目
-# ========================================
-choose_project() {
+    update_one "vps-toolbox" "vps-toolbox.sh" \
+    "https://raw.githubusercontent.com/Polarisiu/vps-toolbox/main/uu.sh"
 
-mapfile -t projects < <(
-    find "$PROJECTS_DIR" -maxdepth 1 -type f -name "docker-compose.yml" \
-    -exec dirname {} \; | sort
-)
+    update_one "proxy" "proxy.sh" \
+    "https://raw.githubusercontent.com/Polarisiu/proxy/main/proxy.sh"
 
-if [ ${#projects[@]} -eq 0 ]; then
-    echo -e "${RED}未找到 docker-compose 项目${RESET}"
-    echo -e "${RED}请确认目录结构：/opt/项目名/docker-compose.yml${RESET}"
-    sleep 2
-    return
+    update_one "oracle" "oracle.sh" \
+    "https://raw.githubusercontent.com/Polarisiu/oracle/main/oracle.sh"
+
+    update_one "store" "store.sh" \
+    "https://raw.githubusercontent.com/Polarisiu/app-store/main/store.sh"
+
+    update_one "Alpine" "Alpine.sh" \
+    "https://raw.githubusercontent.com/Polarisiu/Alpinetool/main/Alpine.sh"
+
+    tg_send "$RESULT"
+
+    echo -e "${GREEN}更新完成${RESET}"
+}
+
+#################################
+# cron 管理
+#################################
+enable_cron() {
+    echo "选择更新频率："
+    echo "1) 每天"
+    echo "2) 每周"
+    echo "3) 每月"
+    echo "4) 每6小时"
+
+    read -p "选择: " c
+
+    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --auto" > /tmp/cron.tmp || true
+
+    case $c in
+        1) echo "0 3 * * * $SCRIPT_PATH --auto" >>/tmp/cron.tmp ;;
+        2) echo "0 3 * * 1 $SCRIPT_PATH --auto" >>/tmp/cron.tmp ;;
+        3) echo "0 3 1 * * $SCRIPT_PATH --auto" >>/tmp/cron.tmp ;;
+        4) echo "0 */6 * * * $SCRIPT_PATH --auto" >>/tmp/cron.tmp ;;
+    esac
+
+    crontab /tmp/cron.tmp
+    rm -f /tmp/cron.tmp
+
+    echo -e "${GREEN}自动更新已开启${RESET}"
+}
+
+disable_cron() {
+    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --auto" | crontab -
+    echo -e "${RED}自动更新已关闭${RESET}"
+}
+
+#################################
+# Telegram + VPS名称 设置
+#################################
+tg_setup() {
+    read -p "Bot Token: " token
+    read -p "Chat ID: " chat
+    read -p "VPS 名称(回车默认 hostname): " name
+    name="${name:-$(hostname)}"
+
+    cat >"$CONF" <<EOF
+TG_BOT_TOKEN="$token"
+TG_CHAT_ID="$chat"
+SERVER_NAME="$name"
+EOF
+
+    echo -e "${GREEN}Telegram 与 VPS 名称已保存${RESET}"
+}
+
+#################################
+# 查看日志
+#################################
+view_log() {
+    tail -n 30 "$LOG"
+}
+
+#################################
+# 自动模式（cron用）
+#################################
+if [ "${1:-}" = "--auto" ]; then
+    run_update
+    exit
 fi
 
-echo -e "${GREEN}=== 选择项目 ===${RESET}"
-
-for i in "${!projects[@]}"; do
-    echo -e "${GREEN}$((i+1))) $(basename "${projects[$i]}")${RESET}"
-done
-
-read -p "$(echo -e ${GREEN}请输入编号:${RESET}) " n
-
-echo "${projects[$((n-1))]}"
-}
-
-
-# ========================================
-# 选择时间（每日/每周）
-# ========================================
-choose_time() {
-
-echo
-echo -e "${GREEN}1) 每日更新${RESET}"
-echo -e "${GREEN}2) 每周更新${RESET}"
-
-read -p "$(echo -e ${GREEN}选择:${RESET}) " mode
-read -p "几点执行(0-23 默认4): " hour
-hour=${hour:-4}
-
-if [ "$mode" = "1" ]; then
-    echo "0 $hour * * *"
-else
-    echo -e "${GREEN}0=周日 1=周一 ... 6=周六${RESET}"
-    read -p "星期(默认0): " week
-    week=${week:-0}
-    echo "0 $hour * * $week"
-fi
-}
-
-
-# ========================================
-# 添加更新任务
-# ========================================
-add_update() {
-
-dir=$(choose_project)
-[ -z "$dir" ] && return
-
-name=$(basename "$dir")
-cronexp=$(choose_time)
-
-source "$CONF_FILE"
-
-cmd="cd $dir && \
-running=\$(docker compose ps -q) && \
-[ \"\$running\" != \"\" ] && \
-(docker compose pull && docker compose up -d) && STATUS=success || STATUS=fail; \
-if [ -n \"$BOT_TOKEN\" ] && [ -n \"$CHAT_ID\" ]; then \
-MSG=\"🚀 Docker 自动更新%0A主机: \$(hostname)%0A项目: $name%0A时间: \$(date '+%F %T')%0A状态: \"; \
-[ \$STATUS = success ] && \
-curl -s \"https://api.telegram.org/bot$BOT_TOKEN/sendMessage?chat_id=$CHAT_ID&text=\${MSG}✅ 成功\" >/dev/null || \
-curl -s \"https://api.telegram.org/bot$BOT_TOKEN/sendMessage?chat_id=$CHAT_ID&text=\${MSG}❌ 失败\" >/dev/null; \
-fi"
-
-(crontab -l 2>/dev/null | grep -v "$CRON_TAG-$name";
- echo "$cronexp source $CONF_FILE && $cmd $CRON_TAG-$name") | crontab -
-
-echo -e "${GREEN}✅ 已添加 $name 自动更新 ($cronexp)${RESET}"
-read -p "回车继续..."
-}
-
-
-# ========================================
-# 删除任务
-# ========================================
-remove_update() {
-
-jobs=$(crontab -l 2>/dev/null | grep "$CRON_TAG")
-
-if [ -z "$jobs" ]; then
-    echo "没有更新任务"
-    read
-    return
-fi
-
-echo "$jobs" | nl
-read -p "删除编号: " n
-
-line=$(echo "$jobs" | sed -n "${n}p")
-
-crontab -l | grep -vF "$line" | crontab -
-
-echo -e "${RED}已删除${RESET}"
-read
-}
-
-
-# ========================================
-# 查看任务
-# ========================================
-list_update() {
-echo
-crontab -l | grep "$CRON_TAG"
-echo
-read -p "回车继续..."
-}
-
-
-# ========================================
-# 立即更新
-# ========================================
-run_now() {
-
-dir=$(choose_project)
-[ -z "$dir" ] && return
-
-cd "$dir"
-docker compose pull
-docker compose up -d
-
-echo -e "${GREEN}✅ 更新完成${RESET}"
-read -p "回车继续..."
-}
-
-
-# ========================================
-# 主菜单（完全绿色风格）
-# ========================================
-init_conf
-
+#################################
+# 菜单循环
+#################################
 while true; do
     clear
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}      Docker 项目自动更新管理器      ${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}1) 添加项目自动更新 (每日/每周)${RESET}"
-    echo -e "${GREEN}2) 删除项目更新任务${RESET}"
-    echo -e "${GREEN}3) 查看所有更新规则${RESET}"
-    echo -e "${GREEN}4) 立即手动更新一次${RESET}"
-    echo -e "${GREEN}5) 编辑 Telegram 配置${RESET}"
+    echo -e "${GREEN}=== Toolbox 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 立即更新${RESET}"
+    echo -e "${GREEN}2) 开启自动更新(cron)${RESET}"
+    echo -e "${GREEN}3) 关闭自动更新${RESET}"
+    echo -e "${GREEN}4) Telegram + VPS名称 设置(可选)${RESET}"
+    echo -e "${GREEN}5) 查看日志${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
 
     read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
     case $choice in
-        1) add_update ;;
-        2) remove_update ;;
-        3) list_update ;;
-        4) run_now ;;
-        5) nano "$CONF_FILE" ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        1) run_update; read -p "回车继续..." ;;
+        2) enable_cron; read -p "回车继续..." ;;
+        3) disable_cron; read -p "回车继续..." ;;
+        4) tg_setup; read -p "回车继续..." ;;
+        5) view_log; read -p "回车继续..." ;;
+        0) exit ;;
     esac
 done

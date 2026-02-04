@@ -5,9 +5,11 @@ set -e
 # 基础路径
 #################################
 ROOT="/root"
-LOG="/var/log/toolbox-auto-update.log"
+SCRIPT_PATH="$ROOT/toolboxupdate.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/Polarisiu/vps-toolbox/main/toolboxupdate.sh"
 CONF="/etc/toolbox-update.conf"
-SCRIPT_PATH="/usr/local/bin/toolbox-manager.sh"
+LOG_FILE="/var/log/toolbox-update.log"
+CRON_TAG="# toolbox-auto-update"
 
 #################################
 # 颜色
@@ -18,11 +20,18 @@ YELLOW='\033[33m'
 RESET='\033[0m'
 
 #################################
-# 日志
+# 自动下载安装管理器
 #################################
-log() {
-    echo "[$(date '+%F %T')] $1" >>"$LOG"
-}
+if [ ! -f "$SCRIPT_PATH" ]; then
+    echo -e "${GREEN}🚀 管理器不存在，正在下载到 $SCRIPT_PATH ...${RESET}"
+    curl -sL "$SCRIPT_URL" -o "$SCRIPT_PATH"
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 下载失败，请检查网络或 URL${RESET}"
+        exit 1
+    fi
+    chmod +x "$SCRIPT_PATH"
+    echo -e "${GREEN}✅ 下载完成，脚本已赋权限${RESET}"
+fi
 
 #################################
 # 读取配置
@@ -33,7 +42,7 @@ load_conf() {
 }
 
 #################################
-# Telegram（可选）
+# Telegram 可选
 #################################
 tg_send() {
     load_conf
@@ -61,24 +70,14 @@ update_one() {
     fi
 
     echo -e "${GREEN}运行 $NAME ...${RESET}"
-    log "运行 $NAME"
-
-    # 删除旧文件
     rm -f "$ROOT/$FILE"
-
     TMP=$(mktemp)
 
     if curl -fsSL "$URL" -o "$TMP"; then
         chmod +x "$TMP"
-
-        # ⭐ 自动输入0退出菜单，保证不会卡住
-        if printf "0\n" | bash "$TMP" >>"$LOG" 2>&1; then
-            RESULT+="\n✅ $NAME"
-        else
-            RESULT+="\n❌ $NAME"
+        if printf "0\n" | bash "$TMP" >/dev/null 2>&1; then
+            UPDATED_LIST+=("$NAME")
         fi
-    else
-        RESULT+="\n❌ $NAME(下载失败)"
     fi
 
     rm -f "$TMP"
@@ -86,8 +85,9 @@ update_one() {
 
 run_update() {
     load_conf
-    RESULT="📦 <b>Toolbox 更新结果</b>\n🖥 ${SERVER_NAME}"
+    UPDATED_LIST=()
 
+    # 更新各脚本
     update_one "vps-toolbox" "vps-toolbox.sh" \
     "https://raw.githubusercontent.com/Polarisiu/vps-toolbox/main/uu.sh"
 
@@ -103,13 +103,19 @@ run_update() {
     update_one "Alpine" "Alpine.sh" \
     "https://raw.githubusercontent.com/Polarisiu/Alpinetool/main/Alpine.sh"
 
-    tg_send "$RESULT"
-
-    echo -e "${GREEN}更新完成${RESET}"
+    if [ ${#UPDATED_LIST[@]} -gt 0 ]; then
+        MSG="🚀 脚本已更新
+服务器: ${SERVER_NAME}
+脚本: ${UPDATED_LIST[*]}"
+        tg_send "$MSG"
+        echo -e "${GREEN}更新完成，已发送 TG 通知${RESET}"
+    else
+        echo -e "${YELLOW}没有脚本需要更新${RESET}"
+    fi
 }
 
 #################################
-# cron 管理
+# cron 管理（支持自定义）
 #################################
 enable_cron() {
     echo "选择更新频率："
@@ -117,6 +123,7 @@ enable_cron() {
     echo "2) 每周"
     echo "3) 每月"
     echo "4) 每6小时"
+    echo "5) 自定义 cron 表达式"
 
     read -p "选择: " c
 
@@ -127,11 +134,20 @@ enable_cron() {
         2) echo "0 3 * * 1 $SCRIPT_PATH --auto" >>/tmp/cron.tmp ;;
         3) echo "0 3 1 * * $SCRIPT_PATH --auto" >>/tmp/cron.tmp ;;
         4) echo "0 */6 * * * $SCRIPT_PATH --auto" >>/tmp/cron.tmp ;;
+        5)
+            echo "示例: 每30分钟 */30 * * * *"
+            read -p "请输入完整 cron 表达式: " CRON_EXP
+            echo "$CRON_EXP $SCRIPT_PATH --auto" >>/tmp/cron.tmp
+            ;;
+        *)
+            echo -e "${YELLOW}无效选项，取消操作${RESET}"
+            rm -f /tmp/cron.tmp
+            return
+            ;;
     esac
 
     crontab /tmp/cron.tmp
     rm -f /tmp/cron.tmp
-
     echo -e "${GREEN}自动更新已开启${RESET}"
 }
 
@@ -141,7 +157,7 @@ disable_cron() {
 }
 
 #################################
-# Telegram + VPS名称 设置
+# Telegram 设置
 #################################
 tg_setup() {
     read -p "Bot Token: " token
@@ -159,19 +175,34 @@ EOF
 }
 
 #################################
-# 查看日志
+# 卸载管理器函数
 #################################
-view_log() {
-    tail -n 30 "$LOG"
+uninstall_manager() {
+    echo -e "${RED}⚠️ 正在卸载管理器...${RESET}"
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+    echo -e "${GREEN}✅ 已删除所有定时任务${RESET}"
+    [ -f "$SCRIPT_PATH" ] && rm -f "$SCRIPT_PATH" && echo -e "${GREEN}✅ 已删除管理器脚本${RESET}"
+    [ -f "$LOG_FILE" ] && rm -f "$LOG_FILE" && echo -e "${GREEN}✅ 已删除日志 ${LOG_FILE}${RESET}"
+    [ -f "$CONF" ] && rm -f "$CONF" && echo -e "${GREEN}✅ 已删除配置文件 ${CONF}${RESET}"
+    echo -e "${GREEN}卸载完成${RESET}"
+    exit 0
 }
 
 #################################
-# 自动模式（cron用）
+# 自动模式（cron调用）
 #################################
 if [ "${1:-}" = "--auto" ]; then
     run_update
     exit
 fi
+
+#################################
+# 删除日志
+#################################
+delete_log() {
+    [ -f "$LOG_FILE" ] && rm -f "$LOG_FILE"
+    echo -e "${RED}日志已删除${RESET}"
+}
 
 #################################
 # 菜单循环
@@ -182,8 +213,9 @@ while true; do
     echo -e "${GREEN}1) 立即更新${RESET}"
     echo -e "${GREEN}2) 开启自动更新(cron)${RESET}"
     echo -e "${GREEN}3) 关闭自动更新${RESET}"
-    echo -e "${GREEN}4) Telegram + VPS名称 设置(可选)${RESET}"
-    echo -e "${GREEN}5) 查看日志${RESET}"
+    echo -e "${GREEN}4) 设置 Telegram & 服务器名称(可选)${RESET}"
+    echo -e "${GREEN}5) 卸载管理器${RESET}"
+    echo -e "${GREEN}6) 删除日志${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
 
     read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
@@ -193,7 +225,8 @@ while true; do
         2) enable_cron; read -p "回车继续..." ;;
         3) disable_cron; read -p "回车继续..." ;;
         4) tg_setup; read -p "回车继续..." ;;
-        5) view_log; read -p "回车继续..." ;;
+        5) uninstall_manager ;;
+        6) delete_log; read -p "回车继续..." ;;
         0) exit ;;
     esac
 done

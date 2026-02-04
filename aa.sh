@@ -1,121 +1,360 @@
 #!/bin/bash
 # ========================================
-# Sub-Store 一键管理脚本 (Docker Compose)
+# Docker 项目自动更新管理器 Pro Max
+# 新增：
+#   ✅ 一键更新全部项目
+#   ✅ 自定义 cron 表达式
 # ========================================
 
 GREEN="\033[32m"
-RESET="\033[0m"
-YELLOW="\033[33m"
 RED="\033[31m"
-APP_NAME="sub-store"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.env"
+RESET="\033[0m"
 
-# 随机生成 20 位密钥
-function gen_key() {
-    tr -dc 'a-z0-9' </dev/urandom | head -c20
+PROJECTS_DIR="/opt"
+CONF_FILE="/etc/docker-update.conf"
+CRON_TAG="# docker-project-update"
+
+
+# ========================================
+# 初始化配置
+# ========================================
+init_conf() {
+    [ -f "$CONF_FILE" ] && return
+cat > "$CONF_FILE" <<EOF
+BOT_TOKEN=""
+CHAT_ID=""
+SERVER_NAME=""
+ONLY_RUNNING=true
+EOF
 }
 
-function menu() {
+
+# ========================================
+# 读取配置
+# ========================================
+load_conf() {
+    source "$CONF_FILE"
+    [ -z "$SERVER_NAME" ] && SERVER_NAME=$(hostname)
+}
+
+
+# ========================================
+# TG 发送
+# ========================================
+tg_send() {
+    load_conf
+    [ -z "$BOT_TOKEN" ] && return
+    [ -z "$CHAT_ID" ] && return
+
+    curl -s \
+    "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+    -d chat_id="$CHAT_ID" \
+    -d text="$1" \
+    -d parse_mode="HTML" >/dev/null 2>&1
+}
+
+
+# ========================================
+# 扫描项目
+# ========================================
+scan_projects() {
+    mapfile -t PROJECTS < <(
+        find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -type f -name docker-compose.yml \
+        -exec dirname {} \; | sort
+    )
+}
+
+
+# ========================================
+# 选择项目
+# ========================================
+choose_project() {
+
+    scan_projects
+
+    if [ ${#PROJECTS[@]} -eq 0 ]; then
+        echo -e "${RED}未找到 docker-compose 项目${RESET}"
+        sleep 2
+        return 1
+    fi
+
     clear
-    echo -e "${GREEN}=== Sub-Store 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载(含数据)${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 开启自动更新(cron)${RESET}"
-    echo -e "${GREEN}6) 关闭自动更新${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
-        4) view_logs ;;
-        5) enable_auto_update ;;
-        6) disable_auto_update ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
-    esac
+    echo -e "${GREEN}=== 请选择项目 ===${RESET}"
+
+    for i in "${!PROJECTS[@]}"; do
+        echo -e "${GREEN}$((i+1))) $(basename "${PROJECTS[$i]}")${RESET}"
+    done
+    echo -e "${GREEN}0) 返回${RESET}"
+
+    read -p "$(echo -e ${GREEN}请输入编号:${RESET}) " n
+    [[ "$n" == "0" ]] && return 1
+
+    PROJECT_DIR="${PROJECTS[$((n-1))]}"
+    PROJECT_NAME=$(basename "$PROJECT_DIR")
 }
 
-function install_app() {
-    read -p "请输入宿主机端口 [默认:3001]: " input_port
-    PORT=${input_port:-3001}
 
-    mkdir -p "$APP_DIR/data"
+# ========================================
+# 时间选择（新增自定义）
+# ========================================
+choose_time() {
 
-    # 随机生成 SUB_STORE_FRONTEND_BACKEND_PATH
-    PATH_KEY=$(gen_key)
+    echo
+    echo -e "${GREEN}1) 每日更新${RESET}"
+    echo -e "${GREEN}2) 每周更新${RESET}"
+    echo -e "${GREEN}3) 自定义 cron${RESET}"
 
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  sub-store:
-    image: xream/sub-store:http-meta
-    container_name: sub-store
-    restart: unless-stopped
-    volumes:
-      - $APP_DIR/data:/opt/app/data
-    environment:
-      - SUB_STORE_FRONTEND_BACKEND_PATH=/$PATH_KEY
-    ports:
-      - "127.0.0.1:$PORT:3001"
-    stdin_open: true
-    tty: true
+    read -p "$(echo -e ${GREEN}选择:${RESET}) " mode
+
+    if [ "$mode" = "1" ]; then
+        read -p "几点执行(默认4): " hour
+        hour=${hour:-4}
+        CRON_EXP="0 $hour * * *"
+
+    elif [ "$mode" = "2" ]; then
+        read -p "几点执行(默认4): " hour
+        hour=${hour:-4}
+        echo "0=周日 1=周一 ... 6=周六"
+        read -p "星期(默认0): " week
+        week=${week:-0}
+        CRON_EXP="0 $hour * * $week"
+
+    else
+        echo "示例: */30 * * * *"
+        read -p "请输入完整 cron: " CRON_EXP
+    fi
+}
+
+
+# ========================================
+# 添加更新
+# ========================================
+add_update() {
+
+    choose_project || return
+    choose_time
+
+    CMD="cd $PROJECT_DIR && \
+running=\$(docker compose ps -q) && \
+[ \"\$running\" != \"\" ] && \
+(docker compose pull && docker compose up -d && STATUS=success) || STATUS=fail; \
+SERVER=\${SERVER_NAME:-\$(hostname)}; \
+MSG=\"🚀 <b>Docker 自动更新</b>%0A服务器: \$SERVER%0A项目: $PROJECT_NAME%0A时间: \$(date '+%F %T')%0A状态: \"; \
+[ \$STATUS = success ] && \
+curl -s https://api.telegram.org/bot\$BOT_TOKEN/sendMessage -d chat_id=\$CHAT_ID -d text=\"\${MSG}✅ 成功\" >/dev/null || \
+curl -s https://api.telegram.org/bot\$BOT_TOKEN/sendMessage -d chat_id=\$CHAT_ID -d text=\"\${MSG}❌ 失败\" >/dev/null"
+
+    (crontab -l 2>/dev/null | grep -v "$CRON_TAG-$PROJECT_NAME";
+     echo "$CRON_EXP source $CONF_FILE && $CMD $CRON_TAG-$PROJECT_NAME") | crontab -
+
+    echo -e "${GREEN}✅ 已添加 $PROJECT_NAME 定时更新 ($CRON_EXP)${RESET}"
+    read
+}
+
+
+# ========================================
+# 删除更新
+# ========================================
+remove_update() {
+
+    choose_project || return
+
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG-$PROJECT_NAME" | crontab -
+
+    echo -e "${RED}已删除 $PROJECT_NAME 更新任务${RESET}"
+    read
+}
+
+
+# ========================================
+# 查看规则
+# ========================================
+list_update() {
+    echo
+    crontab -l | grep "$CRON_TAG"
+    echo
+    read
+}
+
+
+# ========================================
+# 立即更新单项目
+# ========================================
+run_now() {
+
+    choose_project || return
+    load_conf
+
+    cd "$PROJECT_DIR"
+
+    if docker compose pull && docker compose up -d; then
+        echo -e "${GREEN}✅ 更新成功${RESET}"
+        tg_send "🚀 <b>手动更新成功</b>%0A服务器: $SERVER_NAME%0A项目: $PROJECT_NAME"
+    else
+        echo -e "${RED}❌ 更新失败${RESET}"
+        tg_send "❌ <b>手动更新失败</b>%0A服务器: $SERVER_NAME%0A项目: $PROJECT_NAME"
+    fi
+
+    read
+}
+
+
+# ========================================
+# ⭐ 一键更新全部项目（新增）
+# ========================================
+update_all() {
+
+    scan_projects
+    load_conf
+
+    for dir in "${PROJECTS[@]}"; do
+        name=$(basename "$dir")
+        cd "$dir"
+
+        if docker compose pull && docker compose up -d; then
+            tg_send "🚀 <b>全部更新成功</b>%0A服务器: $SERVER_NAME%0A项目: $name"
+            echo -e "${GREEN}✅ $name 更新成功${RESET}"
+        else
+            tg_send "❌ <b>全部更新失败</b>%0A服务器: $SERVER_NAME%0A项目: $name"
+            echo -e "${RED}❌ $name 更新失败${RESET}"
+        fi
+    done
+
+    read -p "回车继续..."
+}
+
+# ========================================
+# 自定义文件夹更新（新增）
+# ========================================
+custom_folder_update() {
+
+    read -p "请输入要更新的文件夹路径: " CUSTOM_DIR
+    [ ! -d "$CUSTOM_DIR" ] && { 
+        echo -e "${RED}❌ 文件夹不存在${RESET}"; 
+        read; 
+        return; 
+    }
+
+    # 检查 docker-compose.yml 是否存在
+    if [ ! -f "$CUSTOM_DIR/docker-compose.yml" ]; then
+        echo -e "${RED}❌ 文件夹内未找到 docker-compose.yml${RESET}"
+        read
+        return
+    fi
+
+    PROJECT_NAME=$(basename "$CUSTOM_DIR")
+    load_conf
+
+    cd "$CUSTOM_DIR"
+
+    if docker compose pull && docker compose up -d; then
+        tg_send "🚀 <b>自定义项目更新成功</b>%0A服务器: $SERVER_NAME%0A项目: $PROJECT_NAME"
+        echo -e "${GREEN}✅ $PROJECT_NAME 更新成功${RESET}"
+    else
+        tg_send "❌ <b>自定义项目更新失败</b>%0A服务器: $SERVER_NAME%0A项目: $PROJECT_NAME"
+        echo -e "${RED}❌ $PROJECT_NAME 更新失败${RESET}"
+    fi
+
+    read -p "回车继续..."
+}
+
+# ========================================
+# 自定义文件夹定时更新（新增）
+# ========================================
+add_custom_update() {
+
+    # 输入自定义路径
+    read -p "请输入要添加定时更新的文件夹路径: " CUSTOM_DIR
+    [ ! -d "$CUSTOM_DIR" ] && { 
+        echo -e "${RED}❌ 文件夹不存在${RESET}"; 
+        read; 
+        return; 
+    }
+
+    # 检查 docker-compose.yml 是否存在
+    if [ ! -f "$CUSTOM_DIR/docker-compose.yml" ]; then
+        echo -e "${RED}❌ 文件夹内未找到 docker-compose.yml${RESET}"
+        read
+        return
+    fi
+
+    PROJECT_NAME=$(basename "$CUSTOM_DIR")
+
+    # 选择时间
+    choose_time
+
+    # 定时任务命令
+    CMD="cd $CUSTOM_DIR && \
+running=\$(docker compose ps -q) && \
+[ \"\$running\" != \"\" ] && \
+(docker compose pull && docker compose up -d && STATUS=success) || STATUS=fail; \
+SERVER=\${SERVER_NAME:-\$(hostname)}; \
+MSG=\"🚀 <b>Docker 自动更新</b>%0A服务器: \$SERVER%0A项目: $PROJECT_NAME%0A时间: \$(date '+%F %T')%0A状态: \"; \
+[ \$STATUS = success ] && \
+curl -s https://api.telegram.org/bot\$BOT_TOKEN/sendMessage -d chat_id=\$CHAT_ID -d text=\"\${MSG}✅ 成功\" >/dev/null || \
+curl -s https://api.telegram.org/bot\$BOT_TOKEN/sendMessage -d chat_id=\$CHAT_ID -d text=\"\${MSG}❌ 失败\" >/dev/null"
+
+    # 添加到 crontab
+    (crontab -l 2>/dev/null | grep -v "$CRON_TAG-$PROJECT_NAME";
+     echo "$CRON_EXP source $CONF_FILE && $CMD $CRON_TAG-$PROJECT_NAME") | crontab -
+
+    echo -e "${GREEN}✅ 已添加 $PROJECT_NAME 自定义文件夹定时更新 ($CRON_EXP)${RESET}"
+    read
+}
+
+
+# ========================================
+# Telegram 设置
+# ========================================
+set_tg() {
+
+    read -p "BOT_TOKEN: " token
+    read -p "CHAT_ID: " chat
+    read -p "服务器名称(自定义，如 HK-01，可留空用hostname): " server
+
+cat > "$CONF_FILE" <<EOF
+BOT_TOKEN="$token"
+CHAT_ID="$chat"
+SERVER_NAME="$server"
+ONLY_RUNNING=true
 EOF
 
-    echo "PORT=$PORT" > "$CONFIG_FILE"
-    echo "SUB_STORE_FRONTEND_BACKEND_PATH=/$PATH_KEY" >> "$CONFIG_FILE"
-
-    cd "$APP_DIR"
-    docker compose up -d
-
-    echo -e "${GREEN}✅ Sub-Store 已启动${RESET}"
-    echo -e "${YELLOW}🌐 本机访问地址: http://127.0.0.1:$PORT${RESET}"
-    echo -e "${YELLOW}🌐 API: http://127.0.0.1:$PORT/$PATH_KEY${RESET}"
-    echo -e "${YELLOW}🌐 密钥: $PATH_KEY${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ Sub-Store 已更新并重启完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function uninstall_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${GREEN}✅ Sub-Store 已卸载，数据已删除${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function view_logs() {
-    docker logs -f sub-store
-    read -p "按回车返回菜单..."
-    menu
-}
-function enable_auto_update() {
-    (crontab -l 2>/dev/null; echo "0 4 * * * cd $APP_DIR && docker compose pull && docker compose up -d >/dev/null 2>&1") | crontab -
-    echo -e "${GREEN}✅ 已开启每日自动更新${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function disable_auto_update() {
-    crontab -l 2>/dev/null | grep -v "$APP_DIR" | crontab -
-    echo -e "${GREEN}✅ 已关闭自动更新${RESET}"
-    read -p "按回车返回菜单..."
-    menu
+    echo -e "${GREEN}保存成功${RESET}"
+    read
 }
 
 
-menu
+# ========================================
+# 主菜单
+# ========================================
+init_conf
+
+while true; do
+    clear
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}      Docker 项目自动更新管理器      ${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}1) 添加项目自动更新 (每日/每周/自定义)${RESET}"
+    echo -e "${GREEN}2) 删除项目更新任务${RESET}"
+    echo -e "${GREEN}3) 查看所有更新规则${RESET}"
+    echo -e "${GREEN}4) 立即更新单个项目${RESET}"
+    echo -e "${GREEN}5) 设置 Telegram & 服务器名称${RESET}"
+    echo -e "${GREEN}6) ⭐ 一键更新全部项目${RESET}"
+    echo -e "${GREEN}7) 自定义文件夹手动更新${RESET}"
+    echo -e "${GREEN}8) 自定义文件夹定时更新${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+    case $choice in
+        1) add_update ;;
+        2) remove_update ;;
+        3) list_update ;;
+        4) run_now ;;
+        5) set_tg ;;
+        6) update_all ;;
+        7) custom_folder_update ;; 
+        8) add_custom_update ;; 
+        0) exit ;;
+    esac
+done

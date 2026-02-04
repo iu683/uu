@@ -6,7 +6,7 @@ set -e
 #################################
 ROOT="/root"
 SCRIPT_PATH="$ROOT/toolboxupdate.sh"
-SCRIPT_URL="https://raw.githubusercontent.com/Polarisiu/vps-toolbox/main/toolboxupdate.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/uu.sh"
 CONF="/etc/toolbox-update.conf"
 LOG_FILE="/var/log/toolbox-update.log"
 CRON_TAG="# toolbox-auto-update"

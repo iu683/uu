@@ -1,27 +1,34 @@
-#!/usr/bin/env bash
-set -e
+#!/bin/bash
+# ========================================
+# Docker 自动更新管理器 Pro Max（单文件整合版）
+# 功能：
+#   ✅ 运行即安装到 /root/dockerupdate.sh 并赋权限
+#   ✅ 定时任务调用固定脚本路径 /root/dockerupdate.sh
+#   ✅ 日志 /var/log/docker-update.log
+#   ✅ Telegram 成功/失败通知
+#   ✅ 手动更新、一键更新、自定义文件夹更新
+#   ✅ 添加/删除普通项目和自定义文件夹定时任务
+#   ✅ 卸载管理器（删除脚本+定时任务）
+# 使用：
+#   手动执行管理器: ./dockerupdate.sh
+#   定时任务: /root/dockerupdate.sh /项目路径 项目名称
+# ========================================
 
-#################################
-# 基础路径
-#################################
-ROOT="/root"
-SCRIPT_PATH="$ROOT/toolboxupdate.sh"
-SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
-CONF="/etc/toolbox-update.conf"
-LOG_FILE="/var/log/toolbox-update.log"
-CRON_TAG="# toolbox-auto-update"
+SCRIPT_URL="https://raw.githubusercontent.com/Polarisiu/app-store/main/dockerupdate.sh"
+SCRIPT_PATH="/root/dockerupdate.sh"
+CRON_TAG="# docker-project-update"
 
-#################################
-# 颜色
-#################################
-GREEN='\033[32m'
-RED='\033[31m'
-YELLOW='\033[33m'
-RESET='\033[0m'
+GREEN="\033[32m"
+RED="\033[31m"
+RESET="\033[0m"
 
-#################################
+PROJECTS_DIR="/opt"
+CONF_FILE="/etc/docker-update.conf"
+LOG_FILE="/var/log/docker-update.log"
+
+# ========================================
 # 自动下载安装管理器
-#################################
+# ========================================
 if [ ! -f "$SCRIPT_PATH" ]; then
     echo -e "${GREEN}🚀 管理器不存在，正在下载到 $SCRIPT_PATH ...${RESET}"
     curl -sL "$SCRIPT_URL" -o "$SCRIPT_PATH"
@@ -33,200 +40,267 @@ if [ ! -f "$SCRIPT_PATH" ]; then
     echo -e "${GREEN}✅ 下载完成，脚本已赋权限${RESET}"
 fi
 
-#################################
-# 读取配置
-#################################
-load_conf() {
-    [ -f "$CONF" ] && source "$CONF"
-    SERVER_NAME="${SERVER_NAME:-$(hostname)}"
-}
-
-#################################
-# Telegram 可选
-#################################
-tg_send() {
-    load_conf
-    [ -z "${TG_BOT_TOKEN:-}" ] && return
-    [ -z "${TG_CHAT_ID:-}" ] && return
-
-    curl -s -X POST \
-      "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-      -d chat_id="$TG_CHAT_ID" \
-      -d text="$1" \
-      -d parse_mode="HTML" >/dev/null 2>&1 || true
-}
-
-#################################
-# 更新逻辑
-#################################
-update_one() {
-    NAME="$1"
-    FILE="$2"
-    URL="$3"
-
-    if [ ! -f "$ROOT/$FILE" ]; then
-        echo -e "${YELLOW}跳过 $NAME（未安装）${RESET}"
-        return
-    fi
-
-    echo -e "${GREEN}运行 $NAME ...${RESET}"
-    rm -f "$ROOT/$FILE"
-    TMP=$(mktemp)
-
-    if curl -fsSL "$URL" -o "$TMP"; then
-        chmod +x "$TMP"
-        if printf "0\n" | bash "$TMP" >/dev/null 2>&1; then
-            UPDATED_LIST+=("$NAME")
-        fi
-    fi
-
-    rm -f "$TMP"
-}
-
-run_update() {
-    load_conf
-    UPDATED_LIST=()
-
-    # 更新各脚本
-    update_one "vps-toolbox" "vps-toolbox.sh" \
-    "https://raw.githubusercontent.com/Polarisiu/vps-toolbox/main/uu.sh"
-
-    update_one "proxy" "proxy.sh" \
-    "https://raw.githubusercontent.com/Polarisiu/proxy/main/proxy.sh"
-
-    update_one "oracle" "oracle.sh" \
-    "https://raw.githubusercontent.com/Polarisiu/oracle/main/oracle.sh"
-
-    update_one "store" "store.sh" \
-    "https://raw.githubusercontent.com/Polarisiu/app-store/main/store.sh"
-
-    update_one "Alpine" "Alpine.sh" \
-    "https://raw.githubusercontent.com/Polarisiu/Alpinetool/main/Alpine.sh"
-
-    if [ ${#UPDATED_LIST[@]} -gt 0 ]; then
-        MSG="🚀 脚本已更新
-服务器: ${SERVER_NAME}
-脚本: ${UPDATED_LIST[*]}"
-        tg_send "$MSG"
-        echo -e "${GREEN}更新完成，已发送 TG 通知${RESET}"
-    else
-        echo -e "${YELLOW}没有脚本需要更新${RESET}"
-    fi
-}
-
-#################################
-# cron 管理（支持自定义）
-#################################
-enable_cron() {
-    echo "选择更新频率："
-    echo "1) 每天"
-    echo "2) 每周"
-    echo "3) 每月"
-    echo "4) 每6小时"
-    echo "5) 自定义 cron 表达式"
-
-    read -p "选择: " c
-
-    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --auto" > /tmp/cron.tmp || true
-
-    case $c in
-        1) echo "0 3 * * * $SCRIPT_PATH --auto" >>/tmp/cron.tmp ;;
-        2) echo "0 3 * * 1 $SCRIPT_PATH --auto" >>/tmp/cron.tmp ;;
-        3) echo "0 3 1 * * $SCRIPT_PATH --auto" >>/tmp/cron.tmp ;;
-        4) echo "0 */6 * * * $SCRIPT_PATH --auto" >>/tmp/cron.tmp ;;
-        5)
-            echo "示例: 每30分钟 */30 * * * *"
-            read -p "请输入完整 cron 表达式: " CRON_EXP
-            echo "$CRON_EXP $SCRIPT_PATH --auto" >>/tmp/cron.tmp
-            ;;
-        *)
-            echo -e "${YELLOW}无效选项，取消操作${RESET}"
-            rm -f /tmp/cron.tmp
-            return
-            ;;
-    esac
-
-    crontab /tmp/cron.tmp
-    rm -f /tmp/cron.tmp
-    echo -e "${GREEN}自动更新已开启${RESET}"
-}
-
-disable_cron() {
-    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --auto" | crontab -
-    echo -e "${RED}自动更新已关闭${RESET}"
-}
-
-#################################
-# Telegram 设置
-#################################
-tg_setup() {
-    read -p "Bot Token: " token
-    read -p "Chat ID: " chat
-    read -p "VPS 名称(回车默认 hostname): " name
-    name="${name:-$(hostname)}"
-
-    cat >"$CONF" <<EOF
-TG_BOT_TOKEN="$token"
-TG_CHAT_ID="$chat"
-SERVER_NAME="$name"
-EOF
-
-    echo -e "${GREEN}Telegram 与 VPS 名称已保存${RESET}"
-}
-
-#################################
+# ========================================
 # 卸载管理器函数
-#################################
+# ========================================
 uninstall_manager() {
     echo -e "${RED}⚠️ 正在卸载管理器...${RESET}"
     crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
-    echo -e "${GREEN}✅ 已删除所有定时任务${RESET}"
+    echo -e "${GREEN}✅ 已删除所有 Docker 定时任务${RESET}"
     [ -f "$SCRIPT_PATH" ] && rm -f "$SCRIPT_PATH" && echo -e "${GREEN}✅ 已删除管理器脚本${RESET}"
-    [ -f "$LOG_FILE" ] && rm -f "$LOG_FILE" && echo -e "${GREEN}✅ 已删除日志 ${LOG_FILE}${RESET}"
-    [ -f "$CONF" ] && rm -f "$CONF" && echo -e "${GREEN}✅ 已删除配置文件 ${CONF}${RESET}"
     echo -e "${GREEN}卸载完成${RESET}"
     exit 0
 }
 
-#################################
-# 自动模式（cron调用）
-#################################
-if [ "${1:-}" = "--auto" ]; then
-    run_update
-    exit
-fi
-
-#################################
-# 删除日志
-#################################
-delete_log() {
-    [ -f "$LOG_FILE" ] && rm -f "$LOG_FILE"
-    echo -e "${RED}日志已删除${RESET}"
+# ========================================
+# 配置与 Telegram 功能
+# ========================================
+init_conf() {
+    [ -f "$CONF_FILE" ] && return
+cat > "$CONF_FILE" <<EOF
+BOT_TOKEN=""
+CHAT_ID=""
+SERVER_NAME=""
+ONLY_RUNNING=true
+EOF
 }
 
-#################################
-# 菜单循环
-#################################
+load_conf() {
+    [ -f "$CONF_FILE" ] && source "$CONF_FILE"
+    [ -z "$SERVER_NAME" ] && SERVER_NAME=$(hostname)
+}
+
+tg_send() {
+    load_conf
+    [ -z "$BOT_TOKEN" ] && return
+    [ -z "$CHAT_ID" ] && return
+    curl -s \
+        "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        -d chat_id="$CHAT_ID" \
+        -d text="$1" \
+        -d parse_mode="HTML" >/dev/null 2>&1
+}
+
+set_tg() {
+    read -p "BOT_TOKEN: " token
+    read -p "CHAT_ID: " chat
+    read -p "服务器名称(可留空用hostname): " server
+cat > "$CONF_FILE" <<EOF
+BOT_TOKEN="$token"
+CHAT_ID="$chat"
+SERVER_NAME="$server"
+ONLY_RUNNING=true
+EOF
+    echo -e "${GREEN}保存成功${RESET}"
+    read
+}
+
+# ========================================
+# 定时任务执行逻辑
+# ========================================
+run_update() {
+    PROJECT_DIR="$1"
+    PROJECT_NAME="$2"
+    load_conf
+    SERVER=${SERVER_NAME:-$(hostname)}
+
+    [ ! -d "$PROJECT_DIR" ] && echo "$(date '+%F %T') $PROJECT_NAME 目录不存在" | tee -a "$LOG_FILE" && return
+    [ ! -f "$PROJECT_DIR/docker-compose.yml" ] && echo "$(date '+%F %T') $PROJECT_NAME docker-compose.yml 不存在" | tee -a "$LOG_FILE" && return
+
+    cd "$PROJECT_DIR" || return
+    [ ! -f "$LOG_FILE" ] && touch "$LOG_FILE"
+
+    running=$(docker compose ps -q)
+    if [ "$running" != "" ]; then
+        echo -e "${GREEN}🚀 开始更新 $PROJECT_NAME ...${RESET}"
+        if docker compose pull 2>&1 | tee -a "$LOG_FILE" && docker compose up -d 2>&1 | tee -a "$LOG_FILE"; then
+            tg_send "🚀 <b>Docker 自动更新</b>%0A服务器: $SERVER%0A项目: $PROJECT_NAME%0A时间: $(date '+%F %T')%0A状态: ✅ 成功"
+            echo "$(date '+%F %T') $PROJECT_NAME 更新成功" | tee -a "$LOG_FILE"
+        else
+            tg_send "🚀 <b>Docker 自动更新</b>%0A服务器: $SERVER%0A项目: $PROJECT_NAME%0A时间: $(date '+%F %T')%0A状态: ❌ 失败"
+            echo "$(date '+%F %T') $PROJECT_NAME 更新失败" | tee -a "$LOG_FILE"
+        fi
+        echo -e "${GREEN}✅ $PROJECT_NAME 更新完成${RESET}"
+    else
+        echo "$(date '+%F %T') $PROJECT_NAME 未运行" | tee -a "$LOG_FILE"
+    fi
+}
+
+
+# ========================================
+# 定时任务模式
+# ========================================
+if [ -n "$1" ] && [ -n "$2" ]; then
+    run_update "$1" "$2"
+    exit 0
+fi
+
+# ========================================
+# 项目扫描与选择
+# ========================================
+scan_projects() {
+    mapfile -t PROJECTS < <(
+        find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -type f -name docker-compose.yml \
+        -exec dirname {} \; | sort
+    )
+}
+
+choose_project() {
+    scan_projects
+    if [ ${#PROJECTS[@]} -eq 0 ]; then
+        echo -e "${RED}未找到 docker-compose 项目${RESET}"
+        sleep 2
+        return 1
+    fi
+    clear
+    echo -e "${GREEN}=== 请选择项目 ===${RESET}"
+    for i in "${!PROJECTS[@]}"; do
+        echo -e "${GREEN}$((i+1))) $(basename "${PROJECTS[$i]}")${RESET}"
+    done
+    echo -e "${GREEN}0) 返回${RESET}"
+    read -p "$(echo -e ${GREEN}请输入编号:${RESET}) " n
+    [[ "$n" == "0" ]] && return 1
+    PROJECT_DIR="${PROJECTS[$((n-1))]}"
+    PROJECT_NAME=$(basename "$PROJECT_DIR")
+}
+
+choose_time() {
+    echo
+    echo -e "${GREEN}1) 每日更新${RESET}"
+    echo -e "${GREEN}2) 每周更新${RESET}"
+    echo -e "${GREEN}3) 自定义 cron${RESET}"
+    read -p "$(echo -e ${GREEN}选择:${RESET}) " mode
+    if [ "$mode" = "1" ]; then
+        read -p "几点执行(默认4): " hour
+        hour=${hour:-4}
+        CRON_EXP="0 $hour * * *"
+    elif [ "$mode" = "2" ]; then
+        read -p "几点执行(默认4): " hour
+        hour=${hour:-4}
+        echo "0=周日 1=周一 ... 6=周六"
+        read -p "星期(默认0): " week
+        week=${week:-0}
+        CRON_EXP="0 $hour * * $week"
+    else
+        echo "示例: */30 * * * *"
+        read -p "请输入完整 cron: " CRON_EXP
+    fi
+}
+
+# ========================================
+# 定时任务添加/删除
+# ========================================
+add_update() {
+    choose_project || return
+    choose_time
+    (crontab -l 2>/dev/null | grep -v "$CRON_TAG-$PROJECT_NAME";
+     echo "$CRON_EXP $SCRIPT_PATH $PROJECT_DIR $PROJECT_NAME $CRON_TAG-$PROJECT_NAME") | crontab -
+    echo -e "${GREEN}✅ 已添加 $PROJECT_NAME 定时更新 ($CRON_EXP)${RESET}"
+    read
+}
+
+remove_update() {
+    choose_project || return
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG-$PROJECT_NAME" | crontab -
+    echo -e "${RED}已删除 $PROJECT_NAME 定时更新${RESET}"
+    read
+}
+
+list_update() {
+    echo
+    crontab -l | grep "$CRON_TAG"
+    echo
+    read
+}
+
+run_now() {
+    choose_project || return
+    run_update "$PROJECT_DIR" "$PROJECT_NAME"
+    read -p "回车继续..."
+}
+
+update_all() {
+    scan_projects
+    for dir in "${PROJECTS[@]}"; do
+        name=$(basename "$dir")
+        run_update "$dir" "$name"
+    done
+    read -p "回车继续..."
+}
+
+
+custom_folder_update() {
+    read -p "请输入要更新的文件夹路径: " CUSTOM_DIR
+    [ ! -d "$CUSTOM_DIR" ] && { echo -e "${RED}❌ 文件夹不存在${RESET}"; read; return; }
+    [ ! -f "$CUSTOM_DIR/docker-compose.yml" ] && { echo -e "${RED}❌ docker-compose.yml 不存在${RESET}"; read; return; }
+    PROJECT_NAME=$(basename "$CUSTOM_DIR")
+    run_update "$CUSTOM_DIR" "$PROJECT_NAME"
+    read -p "回车继续..."
+}
+
+
+add_custom_update() {
+    read -p "请输入要添加定时更新的文件夹路径: " CUSTOM_DIR
+    [ ! -d "$CUSTOM_DIR" ] && { echo -e "${RED}❌ 文件夹不存在${RESET}"; read; return; }
+    [ ! -f "$CUSTOM_DIR/docker-compose.yml" ] && { echo -e "${RED}❌ docker-compose.yml 不存在${RESET}"; read; return; }
+    PROJECT_NAME=$(basename "$CUSTOM_DIR")
+    choose_time
+    (crontab -l 2>/dev/null | grep -v "$CRON_TAG-$PROJECT_NAME";
+     echo "$CRON_EXP $SCRIPT_PATH $CUSTOM_DIR $PROJECT_NAME $CRON_TAG-$PROJECT_NAME") | crontab -
+    echo -e "${GREEN}✅ 已添加 $PROJECT_NAME 自定义文件夹定时更新 ($CRON_EXP)${RESET}"
+    read
+}
+
+remove_custom_update() {
+    read -p "请输入要删除定时更新的文件夹路径: " CUSTOM_DIR
+    [ ! -d "$CUSTOM_DIR" ] && { echo -e "${RED}❌ 文件夹不存在${RESET}"; read; return; }
+    PROJECT_NAME=$(basename "$CUSTOM_DIR")
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG-$PROJECT_NAME" | crontab -
+    echo -e "${RED}已删除 $PROJECT_NAME 自定义文件夹定时更新${RESET}"
+    read
+}
+
+delete_log() {
+    [ -f "$LOG_FILE" ] && rm -f "$LOG_FILE"
+    echo -e "${RED}✅ 日志已删除${RESET}"
+    read
+}
+
+# ========================================
+# 主菜单
+# ========================================
+init_conf
 while true; do
     clear
-    echo -e "${GREEN}=== Toolbox 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 立即更新${RESET}"
-    echo -e "${GREEN}2) 开启自动更新(cron)${RESET}"
-    echo -e "${GREEN}3) 关闭自动更新${RESET}"
-    echo -e "${GREEN}4) 设置 Telegram & 服务器名称(可选)${RESET}"
-    echo -e "${GREEN}5) 卸载管理器${RESET}"
-    echo -e "${GREEN}6) 删除日志${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}      Docker 自动更新管理器      ${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}1) 添加项目自动更新${RESET}"
+    echo -e "${GREEN}2) 删除项目更新任务${RESET}"
+    echo -e "${GREEN}3) 查看所有更新任务${RESET}"
+    echo -e "${GREEN}4) 立即更新单个项目${RESET}"
+    echo -e "${GREEN}5) 设置 Telegram & 服务器名称(可选)${RESET}"
+    echo -e "${GREEN}6) 一键更新全部项目${RESET}"
+    echo -e "${GREEN}7) 自定义文件夹手动更新${RESET}"
+    echo -e "${GREEN}8) 自定义文件夹定时更新${RESET}"
+    echo -e "${GREEN}9) 删除自定义文件夹定时更新${RESET}"
+    echo -e "${GREEN}10) 卸载管理器${RESET}"
+    echo -e "${GREEN}11) 删除日志文件${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
 
     read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
     case $choice in
-        1) run_update; read -p "回车继续..." ;;
-        2) enable_cron; read -p "回车继续..." ;;
-        3) disable_cron; read -p "回车继续..." ;;
-        4) tg_setup; read -p "回车继续..." ;;
-        5) uninstall_manager ;;
-        6) delete_log; read -p "回车继续..." ;;
-        0) exit ;;
+        1) add_update ;;
+        2) remove_update ;;
+        3) list_update ;;
+        4) run_now ;;
+        5) set_tg ;;
+        6) update_all ;;
+        7) custom_folder_update ;;
+        8) add_custom_update ;;
+        9) remove_custom_update ;;
+        10) uninstall_manager ;;
+        11) delete_log ;;
+        0) exit 0 ;;
     esac
 done

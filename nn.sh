@@ -1,186 +1,236 @@
-#!/bin/bash
-# ==========================================
-# iperf3 VPS 双向测速管理器 终极稳定版
-# 作者优化版（双向 + 自定义带宽 + 日志）
-# ==========================================
-
-APP_DIR="/opt/iperf3"
-LOGFILE="$APP_DIR/iperf3_results.log"
-SERVER_PID_FILE="$APP_DIR/iperf3_server.pid"
-
-PORT=5201
-TIME=30
-UDP_BANDWIDTH="1G"
-
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+#!/usr/bin/env bash
+set -e
 
 #################################
-init_dir() {
-    mkdir -p "$APP_DIR"
-}
+# 基础路径
+#################################
+ROOT="/root"
+SCRIPT_PATH="$ROOT/toolboxupdate.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/nn.sh"
+CONF="/etc/toolbox-update.conf"
+LOG_FILE="/var/log/toolbox-update.log"
+CRON_TAG="# toolbox-auto-update"
 
 #################################
-install_iperf3() {
-    if ! command -v iperf3 &>/dev/null; then
-        echo "正在安装 iperf3..."
-        if command -v apt &>/dev/null; then
-            apt update && apt install -y iperf3
-        elif command -v yum &>/dev/null; then
-            yum install -y iperf3
-        elif command -v apk &>/dev/null; then
-            apk add iperf3
-        else
-            echo "❌ 无法自动安装 iperf3"
-            exit 1
-        fi
+# 颜色
+#################################
+GREEN='\033[32m'
+RED='\033[31m'
+YELLOW='\033[33m'
+RESET='\033[0m'
+
+#################################
+# 自动下载安装管理器
+#################################
+if [ ! -f "$SCRIPT_PATH" ]; then
+    echo -e "${GREEN}🚀 管理器不存在，正在下载到 $SCRIPT_PATH ...${RESET}"
+    curl -sL "$SCRIPT_URL" -o "$SCRIPT_PATH"
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 下载失败，请检查网络或 URL${RESET}"
+        exit 1
     fi
+    chmod +x "$SCRIPT_PATH"
+    echo -e "${GREEN}✅ 下载完成，脚本已赋权限${RESET}"
+fi
+
+#################################
+# 读取配置
+#################################
+load_conf() {
+    [ -f "$CONF" ] && source "$CONF"
+    SERVER_NAME="${SERVER_NAME:-$(hostname)}"
 }
 
 #################################
-log_result() {
-    {
-        echo "================================"
-        echo "时间: $(date '+%F %T')"
-        echo "$1"
-        echo "================================"
-        echo ""
-    } >> "$LOGFILE"
+# Telegram 可选
+#################################
+tg_send() {
+    load_conf
+    [ -z "${TG_BOT_TOKEN:-}" ] && return
+    [ -z "${TG_CHAT_ID:-}" ] && return
+
+    curl -s -X POST \
+      "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+      -d chat_id="$TG_CHAT_ID" \
+      -d text="$1" \
+      -d parse_mode="HTML" >/dev/null 2>&1 || true
 }
 
 #################################
-parse_tcp() {
-    echo "$1" | grep receiver | tail -1 | awk '{print $(NF-1),$NF}'
-}
-
-parse_udp() {
-    LINE=$(echo "$1" | grep receiver | tail -1)
-    BW=$(echo "$LINE" | awk '{print $(NF-4),$(NF-3)}')
-    LOSS=$(echo "$LINE" | awk '{print $(NF-1)}')
-    JITTER=$(echo "$LINE" | awk '{print $(NF-2)}')
-    echo "$BW | 丢包:$LOSS | 抖动:${JITTER}ms"
-}
-
+# 更新逻辑
 #################################
-start_server() {
-    if [ -f "$SERVER_PID_FILE" ] && ps -p $(cat "$SERVER_PID_FILE") &>/dev/null; then
-        echo -e "${YELLOW}已在运行${RESET}"
+update_one() {
+    NAME="$1"
+    FILE="$2"
+    URL="$3"
+
+    if [ ! -f "$ROOT/$FILE" ]; then
+        echo -e "${YELLOW}跳过 $NAME（未安装）${RESET}"
         return
     fi
 
-    nohup iperf3 -s -i 10 -p $PORT >/dev/null 2>&1 &
-    echo $! > "$SERVER_PID_FILE"
+    echo -e "${GREEN}运行 $NAME ...${RESET}"
+    rm -f "$ROOT/$FILE"
+    TMP=$(mktemp)
 
-    echo -e "${GREEN}服务端已启动 PID=$(cat $SERVER_PID_FILE)${RESET}"
-}
-
-#################################
-stop_server() {
-    if [ -f "$SERVER_PID_FILE" ]; then
-        kill $(cat "$SERVER_PID_FILE") 2>/dev/null
-        rm -f "$SERVER_PID_FILE"
-        echo -e "${RED}服务端已停止${RESET}"
-    else
-        echo "未运行"
+    if curl -fsSL "$URL" -o "$TMP"; then
+        chmod +x "$TMP"
+        if printf "0\n" | bash "$TMP" >/dev/null 2>&1; then
+            UPDATED_LIST+=("$NAME")
+        fi
     fi
-    read
+
+    rm -f "$TMP"
+}
+
+run_update() {
+    load_conf
+    UPDATED_LIST=()
+
+    # 更新各脚本
+    update_one "vps-toolbox" "vps-toolbox.sh" \
+    "https://raw.githubusercontent.com/Polarisiu/vps-toolbox/main/uu.sh"
+
+    update_one "proxy" "proxy.sh" \
+    "https://raw.githubusercontent.com/Polarisiu/proxy/main/proxy.sh"
+
+    update_one "oracle" "oracle.sh" \
+    "https://raw.githubusercontent.com/Polarisiu/oracle/main/oracle.sh"
+
+    update_one "store" "store.sh" \
+    "https://raw.githubusercontent.com/Polarisiu/app-store/main/store.sh"
+
+    update_one "Alpine" "Alpine.sh" \
+    "https://raw.githubusercontent.com/Polarisiu/Alpinetool/main/Alpine.sh"
+
+    update_one "Github" "Github.sh" \
+    "https://raw.githubusercontent.com/Polarisiu/toy/refs/heads/main/Github.sh"
+
+
+    if [ ${#UPDATED_LIST[@]} -gt 0 ]; then
+        MSG="🚀 脚本已更新
+服务器: ${SERVER_NAME}
+脚本: ${UPDATED_LIST[*]}"
+        tg_send "$MSG"
+        echo -e "${GREEN}更新完成${RESET}"
+    else
+        echo -e "${YELLOW}没有脚本需要更新${RESET}"
+    fi
 }
 
 #################################
-run_server() {
-    IP=$(curl -s ifconfig.me || curl -s ipinfo.io/ip)
-    echo "公网IP: $IP"
-    iperf3 -s -i 10 -p $PORT
+# cron 管理（支持自定义）
+#################################
+enable_cron() {
+    echo "选择更新频率："
+    echo "1) 每天"
+    echo "2) 每周"
+    echo "3) 每月"
+    echo "4) 每6小时"
+    echo "5) 自定义 cron 表达式"
+
+    read -p "选择: " c
+
+    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --auto" > /tmp/cron.tmp || true
+
+    case $c in
+        1) echo "0 3 * * * $SCRIPT_PATH --auto" >>/tmp/cron.tmp ;;
+        2) echo "0 3 * * 1 $SCRIPT_PATH --auto" >>/tmp/cron.tmp ;;
+        3) echo "0 3 1 * * $SCRIPT_PATH --auto" >>/tmp/cron.tmp ;;
+        4) echo "0 */6 * * * $SCRIPT_PATH --auto" >>/tmp/cron.tmp ;;
+        5)
+            echo "示例: 每30分钟 */30 * * * *"
+            read -p "请输入完整 cron 表达式: " CRON_EXP
+            echo "$CRON_EXP $SCRIPT_PATH --auto" >>/tmp/cron.tmp
+            ;;
+        *)
+            echo -e "${YELLOW}无效选项，取消操作${RESET}"
+            rm -f /tmp/cron.tmp
+            return
+            ;;
+    esac
+
+    crontab /tmp/cron.tmp
+    rm -f /tmp/cron.tmp
+    echo -e "${GREEN}自动更新已开启${RESET}"
+}
+
+disable_cron() {
+    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --auto" | crontab -
+    echo -e "${RED}自动更新已关闭${RESET}"
 }
 
 #################################
-run_client_tcp() {
-    read -p "服务器 IP: " IP
-    [ -z "$IP" ] && return
+# Telegram 设置
+#################################
+tg_setup() {
+    read -p "Bot Token: " token
+    read -p "Chat ID: " chat
+    read -p "VPS 名称(回车默认 hostname): " name
+    name="${name:-$(hostname)}"
 
-    echo "===== TCP 上传 ====="
-    UP=$(iperf3 -c $IP -P 1 -t $TIME -p $PORT)
-    UP_RES=$(parse_tcp "$UP")
-    echo "上传: $UP_RES"
+    cat >"$CONF" <<EOF
+TG_BOT_TOKEN="$token"
+TG_CHAT_ID="$chat"
+SERVER_NAME="$name"
+EOF
 
-    echo "===== TCP 下载 ====="
-    DOWN=$(iperf3 -c $IP -R -P 1 -t $TIME -p $PORT)
-    DOWN_RES=$(parse_tcp "$DOWN")
-    echo "下载: $DOWN_RES"
-
-    log_result "TCP 上传:$UP_RES 下载:$DOWN_RES"
-    read
+    echo -e "${GREEN}Telegram 与 VPS 名称已保存${RESET}"
 }
 
 #################################
-run_client_udp() {
-    read -p "服务器 IP: " IP
-    [ -z "$IP" ] && return
-
-    read -p "带宽(默认 $UDP_BANDWIDTH): " BW
-    [ -n "$BW" ] && UDP_BANDWIDTH=$BW
-
-    echo "===== UDP 上传 ====="
-    UP=$(iperf3 -c $IP -u -b $UDP_BANDWIDTH -P 1 -t $TIME -p $PORT)
-    UP_RES=$(parse_udp "$UP")
-    echo "上传: $UP_RES"
-
-    echo "===== UDP 下载 ====="
-    DOWN=$(iperf3 -c $IP -u -b $UDP_BANDWIDTH -R -P 1 -t $TIME -p $PORT)
-    DOWN_RES=$(parse_udp "$DOWN")
-    echo "下载: $DOWN_RES"
-
-    log_result "UDP 上传:$UP_RES 下载:$DOWN_RES"
-    read
+# 卸载管理器函数
+#################################
+uninstall_manager() {
+    echo -e "${RED}⚠️ 正在卸载管理器...${RESET}"
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+    echo -e "${GREEN}✅ 已删除所有定时任务${RESET}"
+    [ -f "$SCRIPT_PATH" ] && rm -f "$SCRIPT_PATH" && echo -e "${GREEN}✅ 已删除管理器脚本${RESET}"
+    [ -f "$LOG_FILE" ] && rm -f "$LOG_FILE" && echo -e "${GREEN}✅ 已删除日志 ${LOG_FILE}${RESET}"
+    [ -f "$CONF" ] && rm -f "$CONF" && echo -e "${GREEN}✅ 已删除配置文件 ${CONF}${RESET}"
+    echo -e "${GREEN}卸载完成${RESET}"
+    exit 0
 }
 
+#################################
+# 自动模式（cron调用）
+#################################
+if [ "${1:-}" = "--auto" ]; then
+    run_update
+    exit
+fi
+
+#################################
+# 删除日志
 #################################
 delete_log() {
-    rm -f "$LOGFILE"
-    echo "日志已删除"
-    read
+    [ -f "$LOG_FILE" ] && rm -f "$LOG_FILE"
+    echo -e "${RED}日志已删除${RESET}"
 }
 
 #################################
-view_log() {
-    tail -f "$LOGFILE"
-}
-
+# 菜单循环
 #################################
-menu() {
+while true; do
     clear
-    echo -e "${GREEN}====== iperf3 双向测速菜单 ======${RESET}"
-    echo -e "${GREEN}1) 前台服务端${RESET}"
-    echo -e "${GREEN}2) 后台启动服务端${RESET}"
-    echo -e "${GREEN}3) 停止后台服务端${RESET}"
-    echo -e "${GREEN}4) TCP 双向测速${RESET}"
-    echo -e "${GREEN}5) UDP 双向测速(自定义带宽)${RESET}"
-    echo -e "${GREEN}6) 查看日志${RESET}"
-    echo -e "${GREEN}7) 删除日志${RESET}"
+    echo -e "${GREEN}=== Toolbox 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 立即更新${RESET}"
+    echo -e "${GREEN}2) 开启自动更新(cron)${RESET}"
+    echo -e "${GREEN}3) 关闭自动更新${RESET}"
+    echo -e "${GREEN}4) 设置 Telegram & 服务器名称(可选)${RESET}"
+    echo -e "${GREEN}5) 卸载管理器${RESET}"
+    echo -e "${GREEN}6) 删除日志${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-}
 
-#################################
-main() {
-    init_dir
-    install_iperf3
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-    while true; do
-        menu
-        read -p "选择: " c
-        case $c in
-            1) run_server ;;
-            2) start_server ;;
-            3) stop_server ;;
-            4) run_client_tcp ;;
-            5) run_client_udp ;;
-            6) view_log ;;
-            7) delete_log ;;
-            0) exit ;;
-        esac
-    done
-}
-
-main
+    case $choice in
+        1) run_update; read -p "回车继续..." ;;
+        2) enable_cron; read -p "回车继续..." ;;
+        3) disable_cron; read -p "回车继续..." ;;
+        4) tg_setup; read -p "回车继续..." ;;
+        5) uninstall_manager ;;
+        6) delete_log; read -p "回车继续..." ;;
+        0) exit ;;
+    esac
+done

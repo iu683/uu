@@ -1,139 +1,186 @@
 #!/bin/bash
-# ========================================
-# Litemark 一键管理脚本 (Docker Compose)
-# ========================================
+# ==========================================
+# iperf3 VPS 双向测速管理器 终极稳定版
+# 作者优化版（双向 + 自定义带宽 + 日志）
+# ==========================================
+
+APP_DIR="/opt/iperf3"
+LOGFILE="$APP_DIR/iperf3_results.log"
+SERVER_PID_FILE="$APP_DIR/iperf3_server.pid"
+
+PORT=5201
+TIME=30
+UDP_BANDWIDTH="1G"
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-APP_NAME="litemark"
-CONTAINER_NAME="litemark"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-
-check_env() {
-    command -v docker >/dev/null 2>&1 || {
-        echo -e "${RED}❌ 未检测到 Docker${RESET}"
-        exit 1
-    }
-
-    docker compose version >/dev/null 2>&1 || {
-        echo -e "${RED}❌ Docker Compose 不可用${RESET}"
-        exit 1
-    }
+#################################
+init_dir() {
+    mkdir -p "$APP_DIR"
 }
 
+#################################
+install_iperf3() {
+    if ! command -v iperf3 &>/dev/null; then
+        echo "正在安装 iperf3..."
+        if command -v apt &>/dev/null; then
+            apt update && apt install -y iperf3
+        elif command -v yum &>/dev/null; then
+            yum install -y iperf3
+        elif command -v apk &>/dev/null; then
+            apk add iperf3
+        else
+            echo "❌ 无法自动安装 iperf3"
+            exit 1
+        fi
+    fi
+}
+
+#################################
+log_result() {
+    {
+        echo "================================"
+        echo "时间: $(date '+%F %T')"
+        echo "$1"
+        echo "================================"
+        echo ""
+    } >> "$LOGFILE"
+}
+
+#################################
+parse_tcp() {
+    echo "$1" | grep receiver | tail -1 | awk '{print $(NF-1),$NF}'
+}
+
+parse_udp() {
+    LINE=$(echo "$1" | grep receiver | tail -1)
+    BW=$(echo "$LINE" | awk '{print $(NF-4),$(NF-3)}')
+    LOSS=$(echo "$LINE" | awk '{print $(NF-1)}')
+    JITTER=$(echo "$LINE" | awk '{print $(NF-2)}')
+    echo "$BW | 丢包:$LOSS | 抖动:${JITTER}ms"
+}
+
+#################################
+start_server() {
+    if [ -f "$SERVER_PID_FILE" ] && ps -p $(cat "$SERVER_PID_FILE") &>/dev/null; then
+        echo -e "${YELLOW}已在运行${RESET}"
+        return
+    fi
+
+    nohup iperf3 -s -i 10 -p $PORT >/dev/null 2>&1 &
+    echo $! > "$SERVER_PID_FILE"
+
+    echo -e "${GREEN}服务端已启动 PID=$(cat $SERVER_PID_FILE)${RESET}"
+}
+
+#################################
+stop_server() {
+    if [ -f "$SERVER_PID_FILE" ]; then
+        kill $(cat "$SERVER_PID_FILE") 2>/dev/null
+        rm -f "$SERVER_PID_FILE"
+        echo -e "${RED}服务端已停止${RESET}"
+    else
+        echo "未运行"
+    fi
+    read
+}
+
+#################################
+run_server() {
+    IP=$(curl -s ifconfig.me || curl -s ipinfo.io/ip)
+    echo "公网IP: $IP"
+    iperf3 -s -i 10 -p $PORT
+}
+
+#################################
+run_client_tcp() {
+    read -p "服务器 IP: " IP
+    [ -z "$IP" ] && return
+
+    echo "===== TCP 上传 ====="
+    UP=$(iperf3 -c $IP -P 1 -t $TIME -p $PORT)
+    UP_RES=$(parse_tcp "$UP")
+    echo "上传: $UP_RES"
+
+    echo "===== TCP 下载 ====="
+    DOWN=$(iperf3 -c $IP -R -P 1 -t $TIME -p $PORT)
+    DOWN_RES=$(parse_tcp "$DOWN")
+    echo "下载: $DOWN_RES"
+
+    log_result "TCP 上传:$UP_RES 下载:$DOWN_RES"
+    read
+}
+
+#################################
+run_client_udp() {
+    read -p "服务器 IP: " IP
+    [ -z "$IP" ] && return
+
+    read -p "带宽(默认 $UDP_BANDWIDTH): " BW
+    [ -n "$BW" ] && UDP_BANDWIDTH=$BW
+
+    echo "===== UDP 上传 ====="
+    UP=$(iperf3 -c $IP -u -b $UDP_BANDWIDTH -P 1 -t $TIME -p $PORT)
+    UP_RES=$(parse_udp "$UP")
+    echo "上传: $UP_RES"
+
+    echo "===== UDP 下载 ====="
+    DOWN=$(iperf3 -c $IP -u -b $UDP_BANDWIDTH -R -P 1 -t $TIME -p $PORT)
+    DOWN_RES=$(parse_udp "$DOWN")
+    echo "下载: $DOWN_RES"
+
+    log_result "UDP 上传:$UP_RES 下载:$DOWN_RES"
+    read
+}
+
+#################################
+delete_log() {
+    rm -f "$LOGFILE"
+    echo "日志已删除"
+    read
+}
+
+#################################
+view_log() {
+    tail -f "$LOGFILE"
+}
+
+#################################
 menu() {
     clear
-    echo -e "${GREEN}=== Litemark 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 重启${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}====== iperf3 双向测速菜单 ======${RESET}"
+    echo -e "${GREEN}1) 前台服务端${RESET}"
+    echo -e "${GREEN}2) 后台启动服务端${RESET}"
+    echo -e "${GREEN}3) 停止后台服务端${RESET}"
+    echo -e "${GREEN}4) TCP 双向测速${RESET}"
+    echo -e "${GREEN}5) UDP 双向测速(自定义带宽)${RESET}"
+    echo -e "${GREEN}6) 查看日志${RESET}"
+    echo -e "${GREEN}7) 删除日志${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) restart_app ;;
-        4) view_logs ;;
-        5) uninstall_app ;;
-        0) exit 0 ;;
-        *) sleep 1; menu ;;
-    esac
 }
 
-install_app() {
+#################################
+main() {
+    init_dir
+    install_iperf3
 
-    if [ -f "$COMPOSE_FILE" ]; then
-        read -p "已存在安装，是否覆盖重装？(y/N): " confirm
-        [[ "$confirm" != "y" && "$confirm" != "Y" ]] && menu
-    fi
-
-    mkdir -p "$APP_DIR/data"
-
-    read -p "Web 端口 [默认 8080]: " input_port
-    PORT=${input_port:-8080}
-
-    read -p "JWT_SECRET (留空自动生成): " JWT_SECRET
-    if [ -z "$JWT_SECRET" ]; then
-        JWT_SECRET=$(openssl rand -hex 16)
-        echo -e "${YELLOW}已自动生成 JWT_SECRET: $JWT_SECRET${RESET}"
-    fi
-
-    read -p "管理员用户名 [默认 admin]: " ADMIN_USER
-    ADMIN_USER=${ADMIN_USER:-admin}
-
-    read -p "管理员密码 [默认 admin123]: " ADMIN_PASS
-    ADMIN_PASS=${ADMIN_PASS:-admin123}
-
-    cat > "$COMPOSE_FILE" <<EOF
-
-services:
-  litemark:
-    image: topqaz/litemark:x64
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${PORT}:80"
-    volumes:
-      - "$APP_DIR/data:/app/data"
-    environment:
-      - JWT_SECRET=${JWT_SECRET}
-      - DATABASE_URL=sqlite+aiosqlite:///./data/litemark.db
-      - DEFAULT_ADMIN_USERNAME=${ADMIN_USER}
-      - DEFAULT_ADMIN_PASSWORD=${ADMIN_PASS}
-      - DEBUG=false
-      - CORS_ORIGINS=*
-EOF
-
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    echo -e "${GREEN}✅ Litemark 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
-
-    read -p "按回车返回菜单..."
-    menu
+    while true; do
+        menu
+        read -p "选择: " c
+        case $c in
+            1) run_server ;;
+            2) start_server ;;
+            3) stop_server ;;
+            4) run_client_tcp ;;
+            5) run_client_udp ;;
+            6) view_log ;;
+            7) delete_log ;;
+            0) exit ;;
+        esac
+    done
 }
 
-update_app() {
-    cd "$APP_DIR" || { sleep 1; menu; }
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ 已更新完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-restart_app() {
-    cd "$APP_DIR" || { sleep 1; menu; }
-    docker compose restart
-    echo -e "${GREEN}✅ 已重启${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-view_logs() {
-    echo -e "${YELLOW}Ctrl+C 返回菜单${RESET}"
-    docker logs -f ${CONTAINER_NAME}
-    menu
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || { sleep 1; menu; }
-    docker compose down
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已卸载（含数据）${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-check_env
-menu
+main

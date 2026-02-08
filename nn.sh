@@ -1,42 +1,161 @@
 #!/bin/bash
+# ========================================
+# MoonTVPlus 一键管理脚本 (Docker Compose)
+# 双容器版：core + kvrocks
+# ========================================
 
 GREEN="\033[32m"
+YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
+APP_NAME="moontvplus"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+
+check_env() {
+    command -v docker >/dev/null 2>&1 || {
+        echo -e "${RED}❌ 未检测到 Docker${RESET}"
+        exit 1
+    }
+
+    docker compose version >/dev/null 2>&1 || {
+        echo -e "${RED}❌ Docker Compose 不可用${RESET}"
+        exit 1
+    }
+}
+
 menu() {
     clear
-    echo -e "${GREEN}=== 网络工具菜单 ===${RESET}"
-    echo -e "${GREEN}1) 路由追踪 nexttrace${RESET}"
-    echo -e "${GREEN}2) 测速 speedtest${RESET}"
+    echo -e "${GREEN}=== MoonTVPlus 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 重启${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}5) 卸载(含数据)${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    echo
-    read -p $'\033[32m请选择操作 (0-2): \033[0m' choice
+
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
     case $choice in
-        1)
-            echo -e "${GREEN}正在运行 nexttrace 路由追踪...${RESET}"
-            curl -sL nxtrace.org/nt | bash
-            pause
-            ;;
-        2)
-            echo -e "${GREEN}正在运行 speedtest 测速...${RESET}"
-            bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/toy/main/Speedtest.sh)
-            pause
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            echo -e "${RED}无效选择，请重新输入${RESET}"
-            sleep 1
-            menu
-            ;;
+        1) install_app ;;
+        2) update_app ;;
+        3) restart_app ;;
+        4) view_logs ;;
+        5) uninstall_app ;;
+        0) exit 0 ;;
+        *) sleep 1; menu ;;
     esac
 }
 
-pause() {
-    read -p $'\033[32m按回车键返回菜单...\033[0m'
+install_app() {
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        read -p "已存在安装，是否覆盖重装？(y/N): " confirm
+        [[ "$confirm" != "y" && "$confirm" != "Y" ]] && menu
+    fi
+
+    mkdir -p "$APP_DIR/kvrocks-data"
+    mkdir -p "$APP_DIR/kvrocks"
+
+    read -p "Web 端口 [默认 3000]: " input_port
+    PORT=${input_port:-3000}
+
+    read -p "管理员用户名 [默认 admin]: " USERNAME
+    USERNAME=${USERNAME:-admin}
+
+    read -p "管理员密码 [默认 admin_password]: " PASSWORD
+    PASSWORD=${PASSWORD:-admin_password}
+
+    # ==============================
+    # 自动生成 kvrocks.conf ⭐关键修复
+    # ==============================
+    cat > "$APP_DIR/kvrocks/kvrocks.conf" <<EOF
+bind 0.0.0.0
+port 6666
+dir /data
+db-name kvrocks
+maxclients 1000
+EOF
+
+    cat > "$COMPOSE_FILE" <<EOF
+
+services:
+  moontv-core:
+    image: ghcr.io/mtvpls/moontvplus:latest
+    container_name: moontv-core
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORT}:3000"
+    environment:
+      - USERNAME=${USERNAME}
+      - PASSWORD=${PASSWORD}
+      - NEXT_PUBLIC_STORAGE_TYPE=kvrocks
+      - KVROCKS_URL=redis://moontv-kvrocks:6666
+    depends_on:
+      - moontv-kvrocks
+    networks:
+      - moontv-network
+
+  moontv-kvrocks:
+    image: apache/kvrocks:latest
+    container_name: moontv-kvrocks
+    command: ["kvrocks", "-c", "/etc/kvrocks/kvrocks.conf"]
+    restart: unless-stopped
+    volumes:
+      - "$APP_DIR/kvrocks/kvrocks.conf:/etc/kvrocks/kvrocks.conf"
+      - "$APP_DIR/kvrocks-data:/data"
+    networks:
+      - moontv-network
+
+networks:
+  moontv-network:
+    driver: bridge
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    echo -e "${GREEN}✅ MoonTVPlus 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📂 KV 数据目录: $APP_DIR/kvrocks-data${RESET}"
+
+    read -p "按回车返回菜单..."
     menu
 }
 
+
+update_app() {
+    cd "$APP_DIR" || { sleep 1; menu; }
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ 已更新完成${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+restart_app() {
+    cd "$APP_DIR" || { sleep 1; menu; }
+    docker compose restart
+    echo -e "${GREEN}✅ 已重启${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+view_logs() {
+    echo -e "${YELLOW}Ctrl+C 返回菜单${RESET}"
+    docker compose logs -f
+    menu
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || { sleep 1; menu; }
+    docker compose down
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ 已卸载（含数据）${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+check_env
 menu

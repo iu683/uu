@@ -291,7 +291,6 @@ menu(){
         9) bash <(curl -sL https://raw.githubusercontent.com/iu683/uu/main/zz.sh) ;;
         0) exit 0 ;;
     esac
-    menu
 }
 
 # =====================

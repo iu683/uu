@@ -1,165 +1,271 @@
 #!/bin/bash
-# ========================================
-# MoonTVPlus 一键管理脚本 (Docker Compose)
-# Redis 版
-# ========================================
+# =========================================================
+# VPS <-> GitHub 目录备份恢复工具 Pro（最终版稳定）
+# =========================================================
 
+BASE_DIR="/opt/github-backup"
+CONFIG_FILE="$BASE_DIR/.config"
+LOG_FILE="$BASE_DIR/run.log"
+TMP_BASE="$BASE_DIR/tmp"
+SCRIPT_PATH="$BASE_DIR/gh_tool.sh"
+BIN_DIR="/usr/local/bin"
+
+mkdir -p "$BASE_DIR" "$TMP_BASE"
+
+# ==============================
+# 颜色
+# ==============================
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-APP_NAME="moontvplus"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+# ==============================
+# 全局变量
+# ==============================
+REPO_URL=""
+BRANCH="main"
+TG_BOT_TOKEN=""
+TG_CHAT_ID=""
+BACKUP_LIST=()
 
-check_env() {
-    command -v docker >/dev/null 2>&1 || {
-        echo -e "${RED}❌ 未检测到 Docker${RESET}"
-        exit 1
-    }
-
-    docker compose version >/dev/null 2>&1 || {
-        echo -e "${RED}❌ Docker Compose 不可用${RESET}"
-        exit 1
-    }
+# ==============================
+# Telegram
+# ==============================
+send_tg(){
+    [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]] && return
+    curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
+        -d chat_id="$TG_CHAT_ID" -d text="$1" >/dev/null
 }
 
-menu() {
-    clear
-    echo -e "${GREEN}=== MoonTVPlus 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 重启${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 卸载(含数据)${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) restart_app ;;
-        4) view_logs ;;
-        5) uninstall_app ;;
-        0) exit 0 ;;
-        *) sleep 1; menu ;;
-    esac
+# ==============================
+# 配置保存/加载
+# ==============================
+save_config(){
+cat > "$CONFIG_FILE" <<EOF
+REPO_URL="$REPO_URL"
+BRANCH="$BRANCH"
+TG_BOT_TOKEN="$TG_BOT_TOKEN"
+TG_CHAT_ID="$TG_CHAT_ID"
+BACKUP_LIST="${BACKUP_LIST[*]}"
+EOF
 }
 
-install_app() {
+load_config(){
+    [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+    BACKUP_LIST=($BACKUP_LIST)
+}
 
-    if [ -f "$COMPOSE_FILE" ]; then
-        read -p "已存在安装，是否覆盖重装？(y/N): " confirm
-        [[ "$confirm" != "y" && "$confirm" != "Y" ]] && menu
+# ==============================
+# SSH Key 自动生成 + 上传 GitHub
+# ==============================
+setup_ssh(){
+    mkdir -p ~/.ssh
+    if [ ! -f ~/.ssh/id_rsa ]; then
+        ssh-keygen -t rsa -b 4096 -N "" -f ~/.ssh/id_rsa
+        echo -e "${GREEN}✅ SSH Key 已生成${RESET}"
+    fi
+    eval "$(ssh-agent -s)" >/dev/null
+    ssh-add ~/.ssh/id_rsa >/dev/null 2>&1
+    ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+    PUB_KEY_CONTENT=$(cat "$HOME/.ssh/id_rsa.pub")
+    read -p "请输入 GitHub 用户名: " GH_USER
+    read -s -p "请输入 GitHub PAT (admin:public_key 权限): " GH_TOKEN
+    echo ""
+
+    TITLE="VPS_$(date '+%Y%m%d%H%M%S')"
+
+    RESP=$(curl -s -o /dev/null -w "%{http_code}" \
+        -X POST \
+        -H "Authorization: token $GH_TOKEN" \
+        -d "{\"title\":\"$TITLE\",\"key\":\"$PUB_KEY_CONTENT\"}" \
+        https://api.github.com/user/keys)
+
+    if [ "$RESP" -eq 201 ]; then
+        echo -e "${GREEN}✅ SSH Key 已成功上传 GitHub${RESET}"
+    elif [ "$RESP" -eq 422 ]; then
+        echo -e "${YELLOW}⚠️ 公钥已存在${RESET}"
+    else
+        echo -e "${RED}❌ SSH Key 上传失败${RESET}"
+    fi
+}
+
+# ==============================
+# 初始化配置
+# ==============================
+init_config(){
+    setup_ssh
+
+    read -p "GitHub 仓库 SSH 地址: " REPO_URL
+    read -p "分支(默认 main): " BRANCH
+    BRANCH=${BRANCH:-main}
+
+    read -p "配置 Telegram 通知？(y/n): " t
+    if [[ "$t" == "y" ]]; then
+        read -p "TG BOT TOKEN: " TG_BOT_TOKEN
+        read -p "TG CHAT ID: " TG_CHAT_ID
     fi
 
-    # 创建必要目录
-    mkdir -p "$APP_DIR/data"
-    mkdir -p "$APP_DIR/redis"
+    save_config
+    echo -e "${GREEN}✅ 初始化完成${RESET}"
+    read
+}
 
-    read -p "Web 端口 [默认 3000]: " input_port
-    PORT=${input_port:-3000}
+# ==============================
+# 添加备份目录
+# ==============================
+add_dirs(){
+    load_config
+    while true; do
+        read -p "输入备份目录(回车结束): " d
+        [[ -z "$d" ]] && break
+        if [ -d "$d" ]; then
+            BACKUP_LIST+=("$d")
+        else
+            echo -e "${RED}目录不存在${RESET}"
+        fi
+    done
+    save_config
+}
 
-    read -p "管理员用户名 [默认 admin]: " USERNAME
-    USERNAME=${USERNAME:-admin}
+# ==============================
+# 查看备份目录
+# ==============================
+show_dirs(){
+    load_config
+    echo -e "${GREEN}当前备份目录:${RESET}"
+    for d in "${BACKUP_LIST[@]}"; do
+        echo "$d"
+    done
+    read
+}
 
-    read -p "管理员密码 [默认 admin_password]: " PASSWORD
-    PASSWORD=${PASSWORD:-admin_password}
+# ==============================
+# 备份核心函数
+# ==============================
+backup_now(){
+    load_config
 
-    # ==============================
-    # 自动生成 redis.conf
-    # ==============================
-    cat > "$APP_DIR/redis/redis.conf" <<EOF
-save 900 1
-save 300 10
-save 60 10000
-dir /data
-appendonly yes
-protected-mode yes
-EOF
+    TMP=$(mktemp -d -p "$TMP_BASE")
+    echo -e "${GREEN}临时目录: $TMP${RESET}"
 
-    # ==============================
-    # 生成 docker-compose.yml
-    # ==============================
-    cat > "$COMPOSE_FILE" <<EOF
+    git clone -b "$BRANCH" "$REPO_URL" "$TMP/repo" >>"$LOG_FILE" 2>&1 || {
+        echo -e "${RED}❌ Git clone 失败，检查仓库分支或 SSH Key${RESET}"
+        send_tg "❌ Git clone 失败 $(hostname)"
+        return
+    }
 
-services:
-  moontv-core:
-    image: ghcr.io/mtvpls/moontvplus:latest
-    container_name: moontv-core
-    restart: on-failure
-    ports:
-      - '${PORT}:3000'
-    environment:
-      - USERNAME=${USERNAME}
-      - PASSWORD=${PASSWORD}
-      - NEXT_PUBLIC_STORAGE_TYPE=redis
-      - REDIS_URL=redis://moontv-redis:6379
-    networks:
-      - moontv-network
-    depends_on:
-      - moontv-redis
+    > "$TMP/repo/.backup_map"
 
-  moontv-redis:
-    image: redis:alpine
-    container_name: moontv-redis
-    restart: unless-stopped
-    networks:
-      - moontv-network
-    volumes:
-      - ./data:/data
-      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
-    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    for dir in "${BACKUP_LIST[@]}"; do
+        [ ! -d "$dir" ] && echo -e "${YELLOW}⚠️ 目录不存在，跳过: $dir${RESET}" && continue
 
-networks:
-  moontv-network:
-    driver: bridge
-EOF
+        safe=$(echo -n "$dir" | md5sum | awk '{print $1}')
+        mkdir -p "$TMP/repo/$safe"
 
-    cd "$APP_DIR" || exit
-    docker compose up -d
+        echo "$dir" >> "$TMP/repo/.backup_map"
 
-    echo -e "${GREEN}✅ MoonTVPlus 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 Redis 数据目录: $APP_DIR/data${RESET}"
+        # rsync 备份
+        rsync -a --delete "$dir/" "$TMP/repo/$safe/"
 
-    read -p "按回车返回菜单..."
+        # 确保 Git commit，空目录也能提交
+        touch "$TMP/repo/$safe/.backup_marker"
+    done
+
+    cd "$TMP/repo" || return
+
+    git add -A
+    git commit -m "Backup $(date '+%F %T')" >/dev/null 2>&1 || echo -e "${YELLOW}⚠️ 没有文件变化，已使用标记强制 commit${RESET}"
+
+    git push >>"$LOG_FILE" 2>&1
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✅ 备份成功${RESET}"
+        send_tg "✅ VPS 备份成功 $(hostname)"
+    else
+        echo -e "${RED}❌ Git push 失败，请检查 SSH Key / 分支${RESET}"
+        send_tg "❌ VPS 备份失败 $(hostname)"
+    fi
+}
+
+# ==============================
+# 恢复核心函数
+# ==============================
+restore_now(){
+    load_config
+
+    TMP=$(mktemp -d -p "$TMP_BASE")
+    git clone -b "$BRANCH" "$REPO_URL" "$TMP/repo" || return
+
+    while read -r dir; do
+        safe=$(echo -n "$dir" | md5sum | awk '{print $1}')
+        mkdir -p "$dir"
+        rsync -a --delete "$TMP/repo/$safe/" "$dir/"
+    done < "$TMP/repo/.backup_map"
+
+    echo -e "${GREEN}✅ 恢复完成${RESET}"
+    send_tg "♻️ VPS恢复完成 $(hostname)"
+}
+
+# ==============================
+# 定时任务
+# ==============================
+set_cron(){
+    read -p "cron 表达式: " c
+    CMD="bash $SCRIPT_PATH backup >> $LOG_FILE 2>&1 #GHBACK"
+    (crontab -l 2>/dev/null | grep -v GHBACK; echo "$c $CMD") | crontab -
+}
+
+remove_cron(){
+    crontab -l 2>/dev/null | grep -v GHBACK | crontab -
+}
+
+# ==============================
+# 菜单
+# ==============================
+menu(){
+    clear
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}    VPS <-> GitHub 工具       ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN} 1) 初始化配置${RESET}"
+    echo -e "${GREEN} 2) 添加备份目录${RESET}"
+    echo -e "${GREEN} 3) 查看备份目录${RESET}"
+    echo -e "${GREEN} 4) 立即备份${RESET}"
+    echo -e "${GREEN} 5) 恢复到原路径${RESET}"
+    echo -e "${GREEN} 6) 设置定时任务${RESET}"
+    echo -e "${GREEN} 7) 删除定时任务${RESET}"
+    echo -e "${GREEN} 0) 退出${RESET}"
+
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read opt
+
+    case $opt in
+        1) init_config ;;
+        2) add_dirs ;;
+        3) show_dirs ;;
+        4) backup_now ;;
+        5) restore_now ;;
+        6) set_cron ;;
+        7) remove_cron ;;
+        0) exit ;;
+    esac
+
     menu
 }
 
-update_app() {
-    cd "$APP_DIR" || { sleep 1; menu; }
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ 已更新完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
+# ==============================
+# 快捷命令
+# ==============================
+ln -sf "$SCRIPT_PATH" "$BIN_DIR/s"
+ln -sf "$SCRIPT_PATH" "$BIN_DIR/S"
 
-restart_app() {
-    cd "$APP_DIR" || { sleep 1; menu; }
-    docker compose restart
-    echo -e "${GREEN}✅ 已重启${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
+# ==============================
+# cron 模式
+# ==============================
+case "$1" in
+    backup) backup_now; exit ;;
+    restore) restore_now; exit ;;
+esac
 
-view_logs() {
-    echo -e "${YELLOW}Ctrl+C 返回菜单${RESET}"
-    docker compose logs -f
-    menu
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || { sleep 1; menu; }
-    docker compose down
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已卸载（含数据）${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-check_env
 menu

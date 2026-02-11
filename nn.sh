@@ -1,110 +1,311 @@
 #!/bin/bash
-# ========================================
-# qBittorrent 一键管理脚本
-# ========================================
+# =========================================================
+# VPS <-> GitHub 目录备份恢复工具 Pro（最终版）
+# 功能：
+# ✅ 多目录备份（自定义路径）
+# ✅ 自动恢复原路径
+# ✅ SSH Key 自动生成 + 自动上传 GitHub
+# ✅ Telegram 通知
+# ✅ 定时任务 cron
+# ✅ 绿色菜单
+# ✅ 日志 + 临时目录
+# ✅ s / S 快捷启动
+# =========================================================
 
+# =============================
+# 基础路径
+# =============================
+BASE_DIR="/opt/github-backup"
+CONFIG_FILE="$BASE_DIR/.config"
+LOG_FILE="$BASE_DIR/run.log"
+TMP_BASE="$BASE_DIR/tmp"
+SCRIPT_PATH="$BASE_DIR/gh_tool.sh"
+BIN_DIR="/usr/local/bin"
+
+mkdir -p "$BASE_DIR" "$TMP_BASE"
+
+# =============================
+# 颜色
+# =============================
 GREEN="\033[32m"
-RESET="\033[0m"
 RED="\033[31m"
 YELLOW="\033[33m"
-APP_NAME="qbittorrent"
-COMPOSE_DIR="/opt/qbittorrent"
-COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yml"
+RESET="\033[0m"
 
-function get_ip() {
-    curl -s ifconfig.me || curl -s ip.sb || echo "127.0.0.1"
+# =============================
+# 全局变量
+# =============================
+REPO_URL=""
+BRANCH="main"
+TG_BOT_TOKEN=""
+TG_CHAT_ID=""
+BACKUP_LIST=()
+
+# =============================
+# Telegram
+# =============================
+send_tg(){
+    [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]] && return
+    curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
+        -d chat_id="$TG_CHAT_ID" -d text="$1" >/dev/null
 }
 
-function menu() {
-    clear
-    echo -e "${GREEN}=== qBittorrent 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载(含数据)${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 重启${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
-        4) view_logs ;;
-        5) restart_app ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
-    esac
-}
-
-function install_app() {
-    read -p "请输入 Web UI 端口 [默认:8082]: " input_port
-    WEB_PORT=${input_port:-8082}
-
-    read -p "请输入 Torrent 传输端口 [默认:6881]: " input_tport
-    TORRENT_PORT=${input_tport:-6881}
-
-    mkdir -p "$COMPOSE_DIR/config" "$COMPOSE_DIR/downloads"
-
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  qbittorrent:
-    image: linuxserver/qbittorrent
-    container_name: qbittorrent
-    restart: unless-stopped
-    ports:
-      - "${TORRENT_PORT}:${TORRENT_PORT}"
-      - "${TORRENT_PORT}:${TORRENT_PORT}/udp"
-      - "${WEB_PORT}:8080"
-    environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=Asia/Shanghai
-    volumes:
-      - ${COMPOSE_DIR}/config:/config
-      - ${COMPOSE_DIR}/downloads:/downloads
+# =============================
+# 配置保存/加载
+# =============================
+save_config(){
+cat > "$CONFIG_FILE" <<EOF
+REPO_URL="$REPO_URL"
+BRANCH="$BRANCH"
+TG_BOT_TOKEN="$TG_BOT_TOKEN"
+TG_CHAT_ID="$TG_CHAT_ID"
+BACKUP_LIST="${BACKUP_LIST[*]}"
 EOF
+}
 
-    cd "$COMPOSE_DIR"
-    docker compose up -d
-    echo -e "${GREEN}✅ qBittorrent 已启动${RESET}"
-    echo -e "${YELLOW}🌐 本机访问地址: http://$(get_ip):$WEB_PORT${RESET}"
-    echo -e "${GREEN}🌐 账号/密码:查看日志${RESET}"
-    echo -e "${GREEN}📂 配置目录: $COMPOSE_DIR/config${RESET}"
-    echo -e "${GREEN}📂 下载目录: $COMPOSE_DIR/downloads${RESET}"
-    read -p "按回车返回菜单..."
+load_config(){
+    [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+    BACKUP_LIST=($BACKUP_LIST)
+}
+
+# =============================
+# SSH Key 自动生成 + 自动上传 GitHub ⭐
+# =============================
+setup_ssh(){
+
+    mkdir -p ~/.ssh
+
+    if [ ! -f ~/.ssh/id_rsa ]; then
+        ssh-keygen -t rsa -b 4096 -N "" -f ~/.ssh/id_rsa
+        echo -e "${GREEN}✅ SSH Key 已生成${RESET}"
+    fi
+
+    eval "$(ssh-agent -s)" >/dev/null
+    ssh-add ~/.ssh/id_rsa >/dev/null 2>&1
+    ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+    PUB_KEY_CONTENT=$(cat "$HOME/.ssh/id_rsa.pub")
+
+    read -p "请输入 GitHub 用户名: " GH_USER
+    read -s -p "请输入 GitHub PAT (admin:public_key 权限): " GH_TOKEN
+    echo ""
+
+    TITLE="VPS_$(date '+%Y%m%d%H%M%S')"
+
+    RESP=$(curl -s -o /dev/null -w "%{http_code}" \
+        -X POST \
+        -H "Authorization: token $GH_TOKEN" \
+        -d "{\"title\":\"$TITLE\",\"key\":\"$PUB_KEY_CONTENT\"}" \
+        https://api.github.com/user/keys)
+
+    if [ "$RESP" -eq 201 ]; then
+        echo -e "${GREEN}✅ SSH Key 已成功上传 GitHub${RESET}"
+    elif [ "$RESP" -eq 422 ]; then
+        echo -e "${YELLOW}⚠️ 公钥已存在${RESET}"
+    else
+        echo -e "${RED}❌ SSH Key 上传失败${RESET}"
+    fi
+}
+
+# =============================
+# 初始化
+# =============================
+init_config(){
+
+    setup_ssh
+
+    read -p "GitHub 仓库 SSH 地址: " REPO_URL
+    read -p "分支(默认 main): " BRANCH
+    BRANCH=${BRANCH:-main}
+
+    read -p "配置 Telegram 通知？(y/n): " t
+    if [[ "$t" == "y" ]]; then
+        read -p "TG BOT TOKEN: " TG_BOT_TOKEN
+        read -p "TG CHAT ID: " TG_CHAT_ID
+    fi
+
+    save_config
+    echo -e "${GREEN}✅ 初始化完成${RESET}"
+    read
+}
+
+# =============================
+# 添加目录
+# =============================
+add_dirs(){
+    load_config
+
+    while true; do
+        read -p "输入备份目录(回车结束): " d
+        [[ -z "$d" ]] && break
+
+        if [ -d "$d" ]; then
+            BACKUP_LIST+=("$d")
+        else
+            echo -e "${RED}目录不存在${RESET}"
+        fi
+    done
+
+    save_config
+}
+
+# =============================
+# 查看目录
+# =============================
+show_dirs(){
+    load_config
+    echo -e "${GREEN}当前备份目录:${RESET}"
+    for d in "${BACKUP_LIST[@]}"; do
+        echo "$d"
+    done
+    read
+}
+
+# =============================
+# 备份 ⭐核心
+# =============================
+backup_now(){
+
+    load_config
+
+    # 生成临时目录
+    TMP=$(mktemp -d -p "$TMP_BASE")
+    echo -e "${GREEN}临时目录: $TMP${RESET}"
+
+    # clone 仓库
+    git clone -b "$BRANCH" "$REPO_URL" "$TMP/repo" >>"$LOG_FILE" 2>&1 || {
+        echo -e "${RED}❌ Git clone 失败，检查仓库分支或 SSH Key${RESET}"
+        send_tg "❌ Git clone 失败 $(hostname)"
+        return
+    }
+
+    > "$TMP/repo/.backup_map"
+
+    for dir in "${BACKUP_LIST[@]}"; do
+
+        # 检查目录是否存在
+        if [ ! -d "$dir" ]; then
+            echo -e "${YELLOW}⚠️ 目录不存在，跳过: $dir${RESET}"
+            send_tg "⚠️ 备份跳过不存在目录: $dir"
+            continue
+        fi
+
+        # md5 目录名安全
+        safe=$(echo -n "$dir" | md5sum | awk '{print $1}')
+        mkdir -p "$TMP/repo/$safe"
+
+        # 记录映射
+        echo "$dir" >> "$TMP/repo/.backup_map"
+
+        # 如果目录为空，自动补 .gitkeep
+        if [ -z "$(ls -A "$dir")" ]; then
+            touch "$dir/.gitkeep"
+        fi
+
+        echo -e "${GREEN}备份 $dir → $safe${RESET}"
+
+        # rsync 复制
+        rsync -a --delete "$dir/" "$TMP/repo/$safe/"
+    done
+
+    cd "$TMP/repo" || return
+
+    # git commit
+    git add -A
+    git commit -m "Backup $(date '+%F %T')" >/dev/null 2>&1 || echo -e "${YELLOW}⚠️ 没有文件变化，跳过 commit${RESET}"
+
+    # git push
+    if git push >>"$LOG_FILE" 2>&1; then
+        echo -e "${GREEN}✅ 备份成功${RESET}"
+        send_tg "✅ VPS 备份成功 $(hostname)"
+    else
+        echo -e "${RED}❌ Git push 失败，请检查 SSH Key / 分支${RESET}"
+        send_tg "❌ VPS 备份失败 $(hostname)"
+    fi
+}
+
+# =============================
+# 恢复
+# =============================
+restore_now(){
+
+    load_config
+
+    TMP=$(mktemp -d -p "$TMP_BASE")
+
+    git clone -b "$BRANCH" "$REPO_URL" "$TMP/repo" || return
+
+    while read -r dir; do
+        safe=$(echo "$dir" | sed 's#/#_#g')
+        mkdir -p "$dir"
+        rsync -a --delete "$TMP/repo/$safe/" "$dir/"
+    done < "$TMP/repo/.backup_map"
+
+    echo -e "${GREEN}✅ 恢复完成${RESET}"
+    send_tg "♻️ VPS恢复完成 $(hostname)"
+}
+
+# =============================
+# cron
+# =============================
+set_cron(){
+    read -p "cron 表达式: " c
+    CMD="bash $SCRIPT_PATH backup >> $LOG_FILE 2>&1 #GHBACK"
+    (crontab -l 2>/dev/null | grep -v GHBACK; echo "$c $CMD") | crontab -
+}
+
+remove_cron(){
+    crontab -l 2>/dev/null | grep -v GHBACK | crontab -
+}
+
+# =============================
+# 菜单 ⭐全绿
+# =============================
+menu(){
+
+    clear
+
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}    VPS <-> GitHub 工具       ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN} 1) 初始化配置${RESET}"
+    echo -e "${GREEN} 2) 添加备份目录${RESET}"
+    echo -e "${GREEN} 3) 查看备份目录${RESET}"
+    echo -e "${GREEN} 4) 立即备份${RESET}"
+    echo -e "${GREEN} 5) 恢复到原路径${RESET}"
+    echo -e "${GREEN} 6) 设置定时任务${RESET}"
+    echo -e "${GREEN} 7) 删除定时任务${RESET}"
+    echo -e "${GREEN} 0) 退出${RESET}"
+
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read opt
+
+    case $opt in
+        1) init_config ;;
+        2) add_dirs ;;
+        3) show_dirs ;;
+        4) backup_now ;;
+        5) restore_now ;;
+        6) set_cron ;;
+        7) remove_cron ;;
+        0) exit ;;
+    esac
+
     menu
 }
 
-function update_app() {
-    cd "$COMPOSE_DIR" || exit
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ qBittorrent 已更新并重启完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
+# =============================
+# 快捷命令
+# =============================
+ln -sf "$SCRIPT_PATH" "$BIN_DIR/s"
+ln -sf "$SCRIPT_PATH" "$BIN_DIR/S"
 
-function restart_app() {
-    cd "$COMPOSE_DIR" || exit
-    docker compose restart
-    echo -e "${GREEN}✅ qBittorrent 已重启${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function uninstall_app() {
-    cd "$COMPOSE_DIR" || exit
-    docker compose down -v
-    rm -rf "$COMPOSE_DIR"
-    echo -e "${GREEN}✅ qBittorrent 已卸载，数据已删除${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function view_logs() {
-    docker logs -f qbittorrent
-    read -p "按回车返回菜单..."
-    menu
-}
+# =============================
+# cron 模式
+# =============================
+case "$1" in
+    backup) backup_now; exit ;;
+    restore) restore_now; exit ;;
+esac
 
 menu

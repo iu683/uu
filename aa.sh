@@ -1,6 +1,7 @@
 #!/bin/bash
 # =========================================================
-# VPS <-> GitHub 目录备份恢复工具 Ultimate
+# VPS <-> GitHub 目录备份恢复工具 Pro（最终版）
+# 集成自动下载 + 初始化 + 定时任务
 # =========================================================
 
 BASE_DIR="/opt/github-backup"
@@ -8,6 +9,8 @@ CONFIG_FILE="$BASE_DIR/.config"
 LOG_FILE="$BASE_DIR/run.log"
 TMP_BASE="$BASE_DIR/tmp"
 SCRIPT_PATH="$BASE_DIR/gh_tool.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh" # 可替换为最新脚本地址
+BIN_DIR="/usr/local/bin"
 
 mkdir -p "$BASE_DIR" "$TMP_BASE"
 
@@ -21,14 +24,34 @@ BRANCH="main"
 TG_BOT_TOKEN=""
 TG_CHAT_ID=""
 BACKUP_LIST=()
+SERVER_NAME=""
 
 # =====================
-# Telegram
+# 自动下载主脚本
+# =====================
+download_script(){
+    if [ ! -f "$SCRIPT_PATH" ]; then
+        echo -e "${YELLOW}⚠️ 主脚本不存在，自动下载...${RESET}"
+        curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_PATH" || {
+            echo -e "${RED}❌ 下载失败${RESET}"
+            exit 1
+        }
+        chmod +x "$SCRIPT_PATH"
+        echo -e "${GREEN}✅ 主脚本已下载: $SCRIPT_PATH${RESET}"
+    fi
+}
+
+download_script
+
+# =====================
+# Telegram 消息
 # =====================
 send_tg(){
     [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]] && return
+    MSG="$1"
+    [[ -n "$SERVER_NAME" ]] && MSG="[$SERVER_NAME] $MSG"
     curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
-        -d chat_id="$TG_CHAT_ID" -d text="$1" >/dev/null
+        -d chat_id="$TG_CHAT_ID" -d text="$MSG" >/dev/null
 }
 
 # =====================
@@ -41,6 +64,7 @@ BRANCH="$BRANCH"
 TG_BOT_TOKEN="$TG_BOT_TOKEN"
 TG_CHAT_ID="$TG_CHAT_ID"
 BACKUP_LIST="${BACKUP_LIST[*]}"
+SERVER_NAME="$SERVER_NAME"
 EOF
 }
 
@@ -50,7 +74,7 @@ load_config(){
 }
 
 # =====================
-# SSH Key 自动生成并上传 GitHub
+# SSH Key 自动生成 + 上传 GitHub
 # =====================
 setup_ssh(){
     mkdir -p ~/.ssh
@@ -63,8 +87,8 @@ setup_ssh(){
     ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
 
     PUB_KEY_CONTENT=$(cat ~/.ssh/id_rsa.pub)
-    read -p "GitHub 用户名: " GH_USER
-    read -s -p "GitHub PAT (admin:public_key 权限): " GH_TOKEN
+    read -p "请输入 GitHub 用户名: " GH_USER
+    read -s -p "请输入 GitHub PAT (admin:public_key 权限): " GH_TOKEN
     echo ""
 
     TITLE="VPS_$(date '+%Y%m%d%H%M%S')"
@@ -81,7 +105,6 @@ setup_ssh(){
         echo -e "${RED}❌ SSH Key 上传失败${RESET}"
     fi
 
-    # 配置 Git identity
     git config --global user.name "$GH_USER"
     git config --global user.email "$GH_USER@example.com"
 }
@@ -94,6 +117,7 @@ init_config(){
     read -p "GitHub 仓库 SSH 地址: " REPO_URL
     read -p "分支(默认 main): " BRANCH
     BRANCH=${BRANCH:-main}
+    read -p "服务器名称 (Telegram 通知显示): " SERVER_NAME
     read -p "配置 Telegram 通知？(y/n): " t
     if [[ "$t" == "y" ]]; then
         read -p "TG BOT TOKEN: " TG_BOT_TOKEN
@@ -124,7 +148,7 @@ add_dirs(){
 }
 
 # =====================
-# 查看目录
+# 查看备份目录
 # =====================
 show_dirs(){
     load_config
@@ -136,18 +160,16 @@ show_dirs(){
 }
 
 # =====================
-# 备份
+# 执行备份
 # =====================
 backup_now(){
     load_config
-    mkdir -p "$TMP_BASE"
     TMP=$(mktemp -d -p "$TMP_BASE")
     echo -e "${GREEN}临时目录: $TMP${RESET}"
 
-    # clone 仓库
     git clone -b "$BRANCH" "$REPO_URL" "$TMP/repo" >>"$LOG_FILE" 2>&1 || {
         echo -e "${RED}❌ Git clone 失败${RESET}"
-        send_tg "❌ Git clone 失败 $(hostname)"
+        send_tg "❌ Git clone 失败"
         rm -rf "$TMP"
         return
     }
@@ -170,17 +192,17 @@ backup_now(){
     git commit -m "Backup $(date '+%F %T')" >/dev/null 2>&1 || echo -e "${YELLOW}⚠️ 没有文件变化，标记已 commit${RESET}"
     if git push origin "$BRANCH" >>"$LOG_FILE" 2>&1; then
         echo -e "${GREEN}✅ 备份成功${RESET}"
-        send_tg "✅ VPS 备份成功 $(hostname)"
+        send_tg "✅ VPS 备份成功"
     else
         echo -e "${RED}❌ Git push 失败${RESET}"
-        send_tg "❌ VPS 备份失败 $(hostname)"
+        send_tg "❌ VPS 备份失败"
     fi
 
     rm -rf "$TMP"
 }
 
 # =====================
-# 恢复
+# 恢复备份
 # =====================
 restore_now(){
     load_config
@@ -188,7 +210,7 @@ restore_now(){
     TMP=$(mktemp -d -p "$TMP_BASE")
     echo -e "${GREEN}临时目录: $TMP${RESET}"
 
-    git clone -b "$BRANCH" "$REPO_URL" "$TMP/repo" || { echo -e "${RED}❌ Git clone 失败${RESET}"; rm -rf "$TMP"; return; }
+    git clone -b "$BRANCH" "$REPO_URL" "$TMP/repo" || { echo "❌ Git clone 失败"; rm -rf "$TMP"; return; }
 
     while IFS= read -r dir; do
         [ -z "$dir" ] && continue
@@ -204,11 +226,11 @@ restore_now(){
 
     rm -rf "$TMP"
     echo -e "${GREEN}✅ 恢复完成${RESET}"
-    send_tg "♻️ VPS恢复完成 $(hostname)"
+    send_tg "♻️ VPS恢复完成"
 }
 
 # =====================
-# 定时任务
+# 设置定时任务
 # =====================
 set_cron(){
     echo -e "${GREEN}选择定时备份时间:${RESET}"
@@ -228,7 +250,7 @@ set_cron(){
         4) cron_expr="0 * * * *" ;;
         5) cron_expr="0 3 * * *" ;;
         6) cron_expr="0 0 * * 1" ;;
-        7) read -p "自定义 cron 表达式: " cron_expr ;;
+        7) read -p "请输入自定义 cron 表达式: " cron_expr ;;
         *) echo "无效选项"; read -p "按回车返回菜单..."; return ;;
     esac
 
@@ -251,7 +273,7 @@ uninstall_script(){
         remove_cron
         rm -rf "$BASE_DIR"
         echo -e "${GREEN}✅ 脚本及所有备份文件已删除${RESET}"
-        exit
+        exit 0
     fi
 }
 
@@ -283,7 +305,8 @@ menu(){
         6) set_cron ;;
         7) remove_cron ;;
         8) uninstall_script ;;
-        0) exit ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}"; read -p "按回车返回菜单..." ;;
     esac
     menu
 }

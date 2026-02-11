@@ -1,127 +1,304 @@
 #!/bin/bash
-# ========================================
-# GOST Panel 一键管理脚本 (Docker Compose)
-# ========================================
+# =========================================================
+# VPS <-> GitHub 目录备份恢复工具 Pro（最终版）
+# =========================================================
+
+BASE_DIR="/opt/github-backup"
+CONFIG_FILE="$BASE_DIR/.config"
+LOG_FILE="$BASE_DIR/run.log"
+TMP_BASE="$BASE_DIR/tmp"
+SCRIPT_PATH="$BASE_DIR/gh_tool.sh"
+BIN_DIR="/usr/local/bin"
+
+mkdir -p "$BASE_DIR" "$TMP_BASE"
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-APP_NAME="gost-panel"
-CONTAINER_NAME="gost-panel"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+REPO_URL=""
+BRANCH="main"
+TG_BOT_TOKEN=""
+TG_CHAT_ID=""
+BACKUP_LIST=()
+SERVER_NAME=""
 
-check_env() {
-    command -v docker >/dev/null 2>&1 || {
-        echo -e "${RED}❌ 未检测到 Docker${RESET}"
-        exit 1
-    }
-
-    docker compose version >/dev/null 2>&1 || {
-        echo -e "${RED}❌ Docker Compose 不可用${RESET}"
-        exit 1
-    }
+# =====================
+# Telegram
+# =====================
+send_tg(){
+    [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]] && return
+    MSG="$1"
+    [[ -n "$SERVER_NAME" ]] && MSG="[$SERVER_NAME] $MSG"
+    curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
+        -d chat_id="$TG_CHAT_ID" -d text="$MSG" >/dev/null
 }
 
-menu() {
-    clear
-    echo -e "${GREEN}=== GOST Panel 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 重启${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 卸载(含数据)${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+# =====================
+# 配置
+# =====================
+save_config(){
+cat > "$CONFIG_FILE" <<EOF
+REPO_URL="$REPO_URL"
+BRANCH="$BRANCH"
+TG_BOT_TOKEN="$TG_BOT_TOKEN"
+TG_CHAT_ID="$TG_CHAT_ID"
+BACKUP_LIST="${BACKUP_LIST[*]}"
+SERVER_NAME="$SERVER_NAME"
+EOF
+}
+
+load_config(){
+    [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+    BACKUP_LIST=($BACKUP_LIST)
+}
+
+# =====================
+# SSH Key 自动生成 + 上传 GitHub
+# =====================
+setup_ssh(){
+    mkdir -p ~/.ssh
+    if [ ! -f ~/.ssh/id_rsa ]; then
+        ssh-keygen -t rsa -b 4096 -N "" -f ~/.ssh/id_rsa
+        echo -e "${GREEN}✅ SSH Key 已生成${RESET}"
+    fi
+    eval "$(ssh-agent -s)" >/dev/null
+    ssh-add ~/.ssh/id_rsa >/dev/null 2>&1
+    ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+    PUB_KEY_CONTENT=$(cat ~/.ssh/id_rsa.pub)
+    read -p "请输入 GitHub 用户名: " GH_USER
+    read -s -p "请输入 GitHub PAT (admin:public_key 权限): " GH_TOKEN
+    echo ""
+
+    TITLE="VPS_$(date '+%Y%m%d%H%M%S')"
+    RESP=$(curl -s -o /dev/null -w "%{http_code}" \
+        -X POST -H "Authorization: token $GH_TOKEN" \
+        -d "{\"title\":\"$TITLE\",\"key\":\"$PUB_KEY_CONTENT\"}" \
+        https://api.github.com/user/keys)
+
+    if [ "$RESP" -eq 201 ]; then
+        echo -e "${GREEN}✅ SSH Key 已上传 GitHub${RESET}"
+    elif [ "$RESP" -eq 422 ]; then
+        echo -e "${YELLOW}⚠️ 公钥已存在${RESET}"
+    else
+        echo -e "${RED}❌ SSH Key 上传失败${RESET}"
+    fi
+
+    git config --global user.name "$GH_USER"
+    git config --global user.email "$GH_USER@example.com"
+}
+
+# =====================
+# 初始化配置
+# =====================
+init_config(){
+    setup_ssh
+    read -p "GitHub 仓库 SSH 地址: " REPO_URL
+    read -p "分支(默认 main): " BRANCH
+    BRANCH=${BRANCH:-main}
+    read -p "服务器名称 (Telegram 通知显示): " SERVER_NAME
+    read -p "配置 Telegram 通知？(y/n): " t
+    if [[ "$t" == "y" ]]; then
+        read -p "TG BOT TOKEN: " TG_BOT_TOKEN
+        read -p "TG CHAT ID: " TG_CHAT_ID
+    fi
+    save_config
+    echo -e "${GREEN}✅ 初始化完成${RESET}"
+    read
+}
+
+# =====================
+# 添加目录
+# =====================
+add_dirs(){
+    load_config
+    echo -e "${GREEN}输入要备份的目录，可以一次输入多个，用空格分隔:${RESET}"
+    read -p "目录: " dirs
+    for d in $dirs; do
+        if [ -d "$d" ]; then
+            BACKUP_LIST+=("$d")
+            echo -e "${GREEN}✅ 添加成功: $d${RESET}"
+        else
+            echo -e "${RED}⚠️ 目录不存在，跳过: $d${RESET}"
+        fi
+    done
+    save_config
+}
+
+# =====================
+# 查看目录
+# =====================
+show_dirs(){
+    load_config
+    echo -e "${GREEN}当前备份目录:${RESET}"
+    for d in "${BACKUP_LIST[@]}"; do
+        echo "$d"
+    done
+    read
+}
+
+# =====================
+# 备份核心
+# =====================
+backup_now(){
+    load_config
+    TMP=$(mktemp -d -p "$TMP_BASE")
+    echo -e "${GREEN}临时目录: $TMP${RESET}"
+
+    git clone -b "$BRANCH" "$REPO_URL" "$TMP/repo" >>"$LOG_FILE" 2>&1 || {
+        echo -e "${RED}❌ Git clone 失败${RESET}"
+        send_tg "❌ Git clone 失败"
+        rm -rf "$TMP"
+        return
+    }
+
+    > "$TMP/repo/.backup_map"
+
+    for dir in "${BACKUP_LIST[@]}"; do
+        [ ! -d "$dir" ] && echo -e "${YELLOW}⚠️ 目录不存在，跳过: $dir${RESET}" && continue
+        safe=$(echo -n "$dir" | md5sum | awk '{print $1}')
+        mkdir -p "$TMP/repo/$safe"
+        echo "$dir" >> "$TMP/repo/.backup_map"
+        [ -z "$(ls -A "$dir")" ] && touch "$dir/.gitkeep"
+        echo -e "${GREEN}备份 $dir → $safe${RESET}"
+        rsync -a --delete "$dir/" "$TMP/repo/$safe/"
+        echo $(date '+%F %T') > "$TMP/repo/$safe/.backup_marker"
+    done
+
+    cd "$TMP/repo" || return
+    git add -A
+    git commit -m "Backup $(date '+%F %T')" >/dev/null 2>&1 || echo -e "${YELLOW}⚠️ 没有文件变化，标记已 commit${RESET}"
+    if git push origin "$BRANCH" >>"$LOG_FILE" 2>&1; then
+        echo -e "${GREEN}✅ 备份成功${RESET}"
+        send_tg "✅ VPS 备份成功"
+    else
+        echo -e "${RED}❌ Git push 失败${RESET}"
+        send_tg "❌ VPS 备份失败"
+    fi
+
+    rm -rf "$TMP"
+}
+
+# =====================
+# 恢复
+# =====================
+restore_now(){
+    load_config
+    mkdir -p "$TMP_BASE"
+    TMP=$(mktemp -d -p "$TMP_BASE")
+    echo -e "${GREEN}临时目录: $TMP${RESET}"
+
+    # clone 仓库
+    git clone -b "$BRANCH" "$REPO_URL" "$TMP/repo" || { echo "❌ Git clone 失败"; rm -rf "$TMP"; return; }
+
+    # 读取备份映射
+    while IFS= read -r dir; do
+        [ -z "$dir" ] && continue
+        safe=$(echo -n "$dir" | md5sum | awk '{print $1}')
+        mkdir -p "$dir"
+        if [ -d "$TMP/repo/$safe" ]; then
+            rsync -a --delete "$TMP/repo/$safe/" "$dir/"
+            echo -e "${GREEN}恢复成功: $dir${RESET}"
+        else
+            echo -e "${YELLOW}⚠️ 找不到备份目录: $dir → $safe${RESET}"
+        fi
+    done < "$TMP/repo/.backup_map"
+
+    rm -rf "$TMP"
+    echo -e "${GREEN}✅ 恢复完成${RESET}"
+    send_tg "♻️ VPS恢复完成 $(hostname)"
+}
+
+# =====================
+# 定时任务
+# =====================
+set_cron(){
+    echo -e "${GREEN}选择定时备份时间:${RESET}"
+    echo -e "${GREEN}1) 每 5 分钟${RESET}"
+    echo -e "${GREEN}2) 每 10 分钟${RESET}"
+    echo -e "${GREEN}3) 每 30 分钟${RESET}"
+    echo -e "${GREEN}4) 每小时${RESET}"
+    echo -e "${GREEN}5) 每天凌晨 3 点${RESET}"
+    echo -e "${GREEN}6) 每周一凌晨 0 点${RESET}"
+    echo -e "${GREEN}7) 自定义${RESET}"
+    read -p "请输入选项 [1-7]: " choice
 
     case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) restart_app ;;
-        4) view_logs ;;
-        5) uninstall_app ;;
+        1) cron_expr="*/5 * * * *" ;;
+        2) cron_expr="*/10 * * * *" ;;
+        3) cron_expr="*/30 * * * *" ;;
+        4) cron_expr="0 * * * *" ;;
+        5) cron_expr="0 3 * * *" ;;
+        6) cron_expr="0 0 * * 1" ;;
+        7) read -p "请输入自定义 cron 表达式: " cron_expr ;;
+        *) echo "无效选项"; read -p "按回车返回菜单..."; return ;;
+    esac
+
+    CMD="export HOME=/root; export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; bash $SCRIPT_PATH backup >> $LOG_FILE 2>&1 #GHBACK"
+    (crontab -l 2>/dev/null | grep -v GHBACK; echo "$cron_expr $CMD") | crontab -
+    echo -e "${GREEN}✅ 定时任务已设置: $cron_expr${RESET}"
+}
+
+remove_cron(){
+    crontab -l 2>/dev/null | grep -v GHBACK | crontab -
+    echo -e "${GREEN}✅ 定时任务已删除${RESET}"
+}
+
+# =====================
+# 卸载脚本
+# =====================
+uninstall_script(){
+    read -p "确认卸载脚本及清理所有文件和定时任务吗？(y/N): " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        remove_cron
+        rm -rf "$BASE_DIR"
+        echo -e "${GREEN}✅ 脚本及所有备份文件已删除${RESET}"
+        exit 0
+    fi
+}
+
+# =====================
+# 菜单
+# =====================
+menu(){
+    clear
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}    VPS <-> GitHub 工具       ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN} 1) 初始化配置${RESET}"
+    echo -e "${GREEN} 2) 添加备份目录${RESET}"
+    echo -e "${GREEN} 3) 查看备份目录${RESET}"
+    echo -e "${GREEN} 4) 立即备份${RESET}"
+    echo -e "${GREEN} 5) 恢复到原路径${RESET}"
+    echo -e "${GREEN} 6) 设置定时任务${RESET}"
+    echo -e "${GREEN} 7) 删除定时任务${RESET}"
+    echo -e "${GREEN} 8) 卸载脚本${RESET}"
+    echo -e "${GREEN} 9) 更新脚本${RESET}"
+    echo -e "${GREEN} 0) 退出${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read opt
+    case $opt in
+        1) init_config ;;
+        2) add_dirs ;;
+        3) show_dirs ;;
+        4) backup_now ;;
+        5) restore_now ;;
+        6) set_cron ;;
+        7) remove_cron ;;
+        8) uninstall_script ;;
+        9) bash <(curl -sL https://raw.githubusercontent.com/iu683/uu/main/vv.sh) ;;
         0) exit 0 ;;
-        *) sleep 1; menu ;;
     esac
 }
 
-install_app() {
+# =====================
+# cron 模式
+# =====================
+case "$1" in
+    backup) backup_now; exit ;;
+    restore) restore_now; exit ;;
+esac
 
-    if [ -f "$COMPOSE_FILE" ]; then
-        read -p "已存在安装，是否覆盖重装？(y/N): " confirm
-        [[ "$confirm" != "y" && "$confirm" != "Y" ]] && menu
-    fi
-
-    mkdir -p "$APP_DIR/data"
-
-    read -p "Web 端口 [默认 8080]: " input_port
-    PORT=${input_port:-8080}
-
-    read -p "JWT_SECRET (留空自动生成更安全): " JWT_SECRET
-    if [ -z "$JWT_SECRET" ]; then
-        JWT_SECRET=$(openssl rand -hex 16)
-        echo -e "${YELLOW}已自动生成 JWT_SECRET: $JWT_SECRET${RESET}"
-    fi
-
-    cat > "$COMPOSE_FILE" <<EOF
-
-services:
-  gost-panel:
-    image: ghcr.io/alicenetworks/gost-panel:latest
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    ports:
-      - "${PORT}:8080"
-    volumes:
-      - "$APP_DIR/data:/app/data"
-    environment:
-      - JWT_SECRET=${JWT_SECRET}
-EOF
-
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    echo -e "${GREEN}✅ GOST Panel 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://服务器IP:${PORT}${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
-
-    read -p "按回车返回菜单..."
-    menu
-}
-
-update_app() {
-    cd "$APP_DIR" || { sleep 1; menu; }
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ 已更新完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-restart_app() {
-    cd "$APP_DIR" || { sleep 1; menu; }
-    docker compose restart
-    echo -e "${GREEN}✅ 已重启${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-view_logs() {
-    echo -e "${YELLOW}Ctrl+C 返回菜单${RESET}"
-    docker logs -f ${CONTAINER_NAME}
-    menu
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || { sleep 1; menu; }
-    docker compose down
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已卸载（含数据）${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-check_env
 menu

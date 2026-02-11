@@ -1,306 +1,227 @@
-#!/bin/bash
-# =========================================================
-# VPS <-> GitHub 目录备份恢复工具 Pro（最终版）
-# =========================================================
+#!/usr/bin/env bash
+# =============================================
+# VPS 管理脚本 – 多目录备份 + TG通知 + 定时任务 + 自更新
+# =============================================
 
-BASE_DIR="/opt/github-backup"
-CONFIG_FILE="$BASE_DIR/.config"
-LOG_FILE="$BASE_DIR/run.log"
-TMP_BASE="$BASE_DIR/tmp"
-SCRIPT_PATH="$BASE_DIR/gh_tool.sh"
-BIN_DIR="/usr/local/bin"
+BASE_DIR="/opt/vps_manager"
+SCRIPT_PATH="$BASE_DIR/vps_manager.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/uu.sh"
+CONFIG_FILE="$BASE_DIR/config"
+TMP_DIR="$BASE_DIR/tmp"
+mkdir -p "$BASE_DIR" "$TMP_DIR"
 
-mkdir -p "$BASE_DIR" "$TMP_BASE"
+# 配色
+GREEN="\033[32m"; YELLOW="\033[33m"; RED="\033[31m"; RESET="\033[0m"
 
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+# 默认保留天数
+KEEP_DAYS=7
 
-REPO_URL=""
-BRANCH="main"
-TG_BOT_TOKEN=""
-TG_CHAT_ID=""
-BACKUP_LIST=()
-
-# =====================
-# Telegram
-# =====================
-send_tg(){
-    [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]] && return
-    curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
-        -d chat_id="$TG_CHAT_ID" -d text="$1" >/dev/null
+# ================== 配置 ==================
+load_config(){
+    [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+    [[ -n "$KEEP_DAYS" ]] && KEEP_DAYS="$KEEP_DAYS"
 }
 
-# =====================
-# 配置
-# =====================
 save_config(){
-cat > "$CONFIG_FILE" <<EOF
-REPO_URL="$REPO_URL"
-BRANCH="$BRANCH"
-TG_BOT_TOKEN="$TG_BOT_TOKEN"
-TG_CHAT_ID="$TG_CHAT_ID"
-BACKUP_LIST="${BACKUP_LIST[*]}"
+    cat > "$CONFIG_FILE" <<EOF
+BOT_TOKEN="$BOT_TOKEN"
+CHAT_ID="$CHAT_ID"
+VPS_NAME="$VPS_NAME"
+KEEP_DAYS="$KEEP_DAYS"
 EOF
 }
 
-load_config(){
-    [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
-    BACKUP_LIST=($BACKUP_LIST)
+# ================== Telegram 发送 ==================
+send_tg_msg(){
+    local msg="$1"
+    curl -s -F chat_id="$CHAT_ID" -F text="$msg" \
+         "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" > /dev/null
 }
 
-# =====================
-# SSH Key 自动生成 + 上传 GitHub
-# =====================
-setup_ssh(){
-    mkdir -p ~/.ssh
-    if [ ! -f ~/.ssh/id_rsa ]; then
-        ssh-keygen -t rsa -b 4096 -N "" -f ~/.ssh/id_rsa
-        echo -e "${GREEN}✅ SSH Key 已生成${RESET}"
-    fi
-    eval "$(ssh-agent -s)" >/dev/null
-    ssh-add ~/.ssh/id_rsa >/dev/null 2>&1
-    ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+send_tg_file(){
+    local file="$1"
+    curl -s -F chat_id="$CHAT_ID" -F document=@"$file" \
+         "https://api.telegram.org/bot$BOT_TOKEN/sendDocument" > /dev/null
+}
 
-    PUB_KEY_CONTENT=$(cat ~/.ssh/id_rsa.pub)
-    read -p "请输入 GitHub 用户名: " GH_USER
-    read -s -p "请输入 GitHub PAT (admin:public_key 权限): " GH_TOKEN
-    echo ""
+# ================== 初始化配置 ==================
+init(){
+    read -rp "请输入 Telegram Bot Token: " BOT_TOKEN
+    read -rp "请输入 Chat ID: " CHAT_ID
+    read -rp "请输入 VPS 名称（可为空）: " VPS_NAME
+    save_config
+    echo -e "${GREEN}配置完成!${RESET}"
+}
 
-    TITLE="VPS_$(date '+%Y%m%d%H%M%S')"
-    RESP=$(curl -s -o /dev/null -w "%{http_code}" \
-        -X POST -H "Authorization: token $GH_TOKEN" \
-        -d "{\"title\":\"$TITLE\",\"key\":\"$PUB_KEY_CONTENT\"}" \
-        https://api.github.com/user/keys)
-
-    if [ "$RESP" -eq 201 ]; then
-        echo -e "${GREEN}✅ SSH Key 已上传 GitHub${RESET}"
-    elif [ "$RESP" -eq 422 ]; then
-        echo -e "${YELLOW}⚠️ 公钥已存在${RESET}"
+# ================== 设置保留天数 ==================
+set_keep_days(){
+    read -rp "请输入保留备份的天数（当前 $KEEP_DAYS 天）: " days
+    if [[ "$days" =~ ^[0-9]+$ ]]; then
+        KEEP_DAYS="$days"
+        save_config
+        echo -e "${GREEN}已将备份保留天数设置为 $KEEP_DAYS 天${RESET}"
     else
-        echo -e "${RED}❌ SSH Key 上传失败${RESET}"
+        echo -e "${RED}输入无效，请输入正整数${RESET}"
     fi
-
-    # 自动配置 Git identity
-    git config --global user.name "$GH_USER"
-    git config --global user.email "$GH_USER@example.com"
 }
 
-# =====================
-# 初始化配置
-# =====================
-init_config(){
-    setup_ssh
-    read -p "GitHub 仓库 SSH 地址: " REPO_URL
-    read -p "分支(默认 main): " BRANCH
-    BRANCH=${BRANCH:-main}
-    read -p "配置 Telegram 通知？(y/n): " t
-    if [[ "$t" == "y" ]]; then
-        read -p "TG BOT TOKEN: " TG_BOT_TOKEN
-        read -p "TG CHAT ID: " TG_CHAT_ID
-    fi
-    save_config
-    echo -e "${GREEN}✅ 初始化完成${RESET}"
-    read
-}
+# ================== 上传备份（多目录） ==================
+do_upload(){
+    echo "请输入要备份的目录，多个目录用空格分隔:"
+    read -rp "" TARGETS
 
-# =====================
-# 添加目录
-# =====================
-add_dirs(){
-    load_config
-    echo -e "${GREEN}输入要备份的目录，可以一次输入多个，用空格分隔:${RESET}"
-    read -p "目录: " dirs
-    for d in $dirs; do
-        if [ -d "$d" ]; then
-            BACKUP_LIST+=("$d")
-            echo -e "${GREEN}✅ 添加成功: $d${RESET}"
-        else
-            echo -e "${RED}⚠️ 目录不存在，跳过: $d${RESET}"
-        fi
-    done
-    save_config
-}
-
-
-# =====================
-# 查看目录
-# =====================
-show_dirs(){
-    load_config
-    echo -e "${GREEN}当前备份目录:${RESET}"
-    for d in "${BACKUP_LIST[@]}"; do
-        echo "$d"
-    done
-    read
-}
-
-# =====================
-# 备份核心
-# =====================
-backup_now(){
-    load_config
-    TMP=$(mktemp -d -p "$TMP_BASE")
-    echo -e "${GREEN}临时目录: $TMP${RESET}"
-
-    git clone -b "$BRANCH" "$REPO_URL" "$TMP/repo" >>"$LOG_FILE" 2>&1 || {
-        echo -e "${RED}❌ Git clone 失败${RESET}"
-        send_tg "❌ Git clone 失败 $(hostname)"
-        rm -rf "$TMP"
+    if [[ -z "$TARGETS" ]]; then
+        echo -e "${RED}没有输入目录${RESET}"
         return
-    }
-
-    > "$TMP/repo/.backup_map"
-
-    for dir in "${BACKUP_LIST[@]}"; do
-        [ ! -d "$dir" ] && echo -e "${YELLOW}⚠️ 目录不存在，跳过: $dir${RESET}" && continue
-        safe=$(echo -n "$dir" | md5sum | awk '{print $1}')
-        mkdir -p "$TMP/repo/$safe"
-        echo "$dir" >> "$TMP/repo/.backup_map"
-        [ -z "$(ls -A "$dir")" ] && touch "$dir/.gitkeep"
-        echo -e "${GREEN}备份 $dir → $safe${RESET}"
-        rsync -a --delete "$dir/" "$TMP/repo/$safe/"
-        echo $(date '+%F %T') > "$TMP/repo/$safe/.backup_marker"
-    done
-
-    cd "$TMP/repo" || return
-    git add -A
-    git commit -m "Backup $(date '+%F %T')" >/dev/null 2>&1 || echo -e "${YELLOW}⚠️ 没有文件变化，标记已 commit${RESET}"
-    if git push origin "$BRANCH" >>"$LOG_FILE" 2>&1; then
-        echo -e "${GREEN}✅ 备份成功${RESET}"
-        send_tg "✅ VPS 备份成功 $(hostname)"
-    else
-        echo -e "${RED}❌ Git push 失败${RESET}"
-        send_tg "❌ VPS 备份失败 $(hostname)"
     fi
 
-    # 删除临时目录
-    rm -rf "$TMP"
+    for TARGET in $TARGETS; do
+        if [[ ! -e "$TARGET" ]]; then
+            echo -e "${RED}目录不存在: $TARGET${RESET}"
+            continue
+        fi
+
+        DIRNAME=$(basename "$TARGET")
+        ZIPFILE="$TMP_DIR/${DIRNAME}_$(date +%F_%H%M%S).zip"
+
+        if [[ -d "$TARGET" ]]; then
+            zip -r "$ZIPFILE" "$TARGET" >/dev/null
+        else
+            zip "$ZIPFILE" "$TARGET" >/dev/null
+        fi
+
+        send_tg_file "$ZIPFILE"
+        send_tg_msg "📌 [$VPS_NAME] 上传完成: $DIRNAME"
+        echo -e "${GREEN}上传完成: $DIRNAME${RESET}"
+    done
+
+    # 自动清理超过 N 天的备份
+    find "$TMP_DIR" -type f -mtime +$KEEP_DAYS -name "*.zip" -exec rm -f {} \;
+    echo -e "${YELLOW}已清理超过 $KEEP_DAYS 天的旧备份${RESET}"
 }
 
-# =====================
-# 恢复
-# =====================
-restore_now(){
-    load_config
-    TMP=$(mktemp -d -p "$TMP_BASE")
-    git clone -b "$BRANCH" "$REPO_URL" "$TMP/repo" || { rm -rf "$TMP"; return; }
+# ================== 定时任务管理 ==================
+setup_cron_job(){
+    echo -e "${GREEN}===== 定时任务管理 =====${RESET}"
+    echo -e "${GREEN}1) 每天 0点${RESET}"
+    echo -e "${GREEN}2) 每周一 0点${RESET}"
+    echo -e "${GREEN}3) 每月 1号 0点${RESET}"
+    echo -e "${GREEN}4) 每5分钟${RESET}"
+    echo -e "${GREEN}5) 每10分钟${RESET}"
+    echo -e "${GREEN}6) 自定义 Cron 表达式${RESET}"
+    echo -e "${GREEN}7) 删除本脚本所有任务${RESET}"
+    echo -e "${GREEN}8) 查看当前任务${RESET}"
+    echo -e "${GREEN}0) 返回${RESET}"
+    read -rp "请选择: " choice
 
-    while read -r dir; do
-        safe=$(echo -n "$dir" | md5sum | awk '{print $1}')
-        mkdir -p "$dir"
-        rsync -a --delete "$TMP/repo/$safe/" "$dir/"
-    done < "$TMP/repo/.backup_map"
-
-    echo -e "${GREEN}✅ 恢复完成${RESET}"
-    send_tg "♻️ VPS恢复完成 $(hostname)"
-    rm -rf "$TMP"
-}
-
-# =====================
-# 设置定时任务
-# =====================
-# =====================
-# 设置定时任务
-# =====================
-set_cron(){
-    echo -e "${GREEN}选择定时备份时间:${RESET}"
-    echo -e "${GREEN}1) 每 5 分钟${RESET}"
-    echo -e "${GREEN}2) 每 10 分钟${RESET}"
-    echo -e "${GREEN}3) 每 30 分钟${RESET}"
-    echo -e "${GREEN}4) 每小时${RESET}"
-    echo -e "${GREEN}5) 每天凌晨 3 点${RESET}"
-    echo -e "${GREEN}6) 每周一凌晨 0 点${RESET}"
-    echo -e "${GREEN}7) 自定义${RESET}"
-    read -p "请输入选项 [1-7]: " choice
+    CRON_CMD="bash $SCRIPT_PATH auto_upload"
 
     case $choice in
-        1) cron_expr="*/5 * * * *" ;;
-        2) cron_expr="*/10 * * * *" ;;
-        3) cron_expr="*/30 * * * *" ;;
-        4) cron_expr="0 * * * *" ;;
-        5) cron_expr="0 3 * * *" ;;
-        6) cron_expr="0 0 * * 1" ;;
-        7) read -p "请输入自定义 cron 表达式: " cron_expr ;;
-        *) echo "无效选项"; read -p "按回车返回菜单..."; return ;;
+        1) CRON_TIME="0 0 * * *" ;;
+        2) CRON_TIME="0 0 * * 1" ;;
+        3) CRON_TIME="0 0 1 * *" ;;
+        4) CRON_TIME="*/5 * * * *" ;;
+        5) CRON_TIME="*/10 * * * *" ;;
+        6)
+            read -rp "请输入 Cron 表达式 (分 时 日 月 周): " CRON_TIME
+            ;;
+        7)
+            crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab -
+            echo -e "${GREEN}已删除所有本脚本定时任务${RESET}"
+            return
+            ;;
+        8)
+            echo -e "${YELLOW}当前定时任务:${RESET}"
+            crontab -l 2>/dev/null | grep "$SCRIPT_PATH"
+            return
+            ;;
+        0) return ;;
+        *)
+            echo -e "${RED}无效选项${RESET}"
+            return
+            ;;
     esac
 
-    # 🔑 Cron 命令：SSH + Git identity + PATH
-    CMD="export HOME=/root; \
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
-eval \$(ssh-agent -s) >/dev/null; \
-ssh-add /root/.ssh/id_rsa >/dev/null 2>&1; \
-git config user.name 'VPSBackup'; \
-git config user.email 'vps@example.com'; \
-bash $SCRIPT_PATH backup >> $LOG_FILE 2>&1 #GHBACK"
-
-    # 写入 crontab
-    (crontab -l 2>/dev/null | grep -v GHBACK; echo "$cron_expr $CMD") | crontab -
-    echo -e "${GREEN}✅ 定时任务已设置: $cron_expr${RESET}"
-}
-
-
-remove_cron(){
-    crontab -l 2>/dev/null | grep -v GHBACK | crontab -
-    echo -e "${GREEN}✅ 定时任务已删除${RESET}"
-}
-
-# =====================
-# 卸载脚本
-# =====================
-uninstall_script(){
-    read -p "确认卸载脚本及清理所有文件和定时任务吗？(y/N): " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        remove_cron
-        rm -rf "$BASE_DIR"
-        rm -f "$BIN_DIR/s" "$BIN_DIR/S"
-        echo -e "${GREEN}✅ 脚本及所有备份文件已删除${RESET}"
-        exit 0
+    if [[ -n "$CRON_TIME" ]]; then
+        crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab -
+        (crontab -l 2>/dev/null; echo "$CRON_TIME $CRON_CMD") | crontab -
+        echo -e "${GREEN}已设置定时任务:${RESET} $CRON_TIME $CRON_CMD"
     fi
 }
 
-
-# =====================
-# 菜单
-# =====================
-menu(){
-    clear
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}    VPS <-> GitHub 工具       ${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN} 1) 初始化配置${RESET}"
-    echo -e "${GREEN} 2) 添加备份目录${RESET}"
-    echo -e "${GREEN} 3) 查看备份目录${RESET}"
-    echo -e "${GREEN} 4) 立即备份${RESET}"
-    echo -e "${GREEN} 5) 恢复到原路径${RESET}"
-    echo -e "${GREEN} 6) 设置定时任务${RESET}"
-    echo -e "${GREEN} 7) 删除定时任务${RESET}"
-    echo -e "${GREEN} 8) 卸载脚本${RESET}"
-    echo -e "${GREEN} 0) 退出${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read opt
-    case $opt in
-        1) init_config ;;
-        2) add_dirs ;;
-        3) show_dirs ;;
-        4) backup_now ;;
-        5) restore_now ;;
-        6) set_cron ;;
-        7) remove_cron ;;
-        8) uninstall_script ;;
-        0) exit ;;
-    esac
-    menu
+# ================== 下载或更新脚本 ==================
+download_script(){
+    mkdir -p "$(dirname "$SCRIPT_PATH")"
+    curl -sSL "$SCRIPT_URL" -o "$SCRIPT_PATH"
+    chmod +x "$SCRIPT_PATH"
+    echo -e "${GREEN}脚本已下载/更新完成${RESET}"
 }
 
+# 自动上传入口（可指定目录参数，支持多个目录）
+auto_upload(){
+    load_config
+    DEFAULT_DIRS="$1"
+    if [[ -z "$DEFAULT_DIRS" ]]; then
+        echo -e "${RED}未指定目录参数${RESET}"
+        exit 1
+    fi
+    for DIR in $DEFAULT_DIRS; do
+        if [[ ! -e "$DIR" ]]; then
+            echo -e "${RED}目录不存在: $DIR${RESET}"
+            continue
+        fi
+        DIRNAME=$(basename "$DIR")
+        ZIPFILE="$TMP_DIR/${DIRNAME}_$(date +%F_%H%M%S).zip"
+        zip -r "$ZIPFILE" "$DIR" >/dev/null
+        send_tg_file "$ZIPFILE"
+        send_tg_msg "📌 [$VPS_NAME] 自动备份完成: $DIRNAME"
+    done
+    # 清理旧备份
+    find "$TMP_DIR" -type f -mtime +$KEEP_DAYS -name "*.zip" -exec rm -f {} \;
+}
 
-# =====================
-# cron 模式
-# =====================
-case "$1" in
-    backup) backup_now; exit ;;
-    restore) restore_now; exit ;;
-esac
+# 卸载脚本
+uninstall(){
+    read -rp "确认卸载脚本并删除所有定时任务? (y/N): " yn
+    if [[ "$yn" =~ ^[Yy]$ ]]; then
+        crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab -
+        rm -rf "$BASE_DIR"
+        echo -e "${RED}已卸载${RESET}"
+    fi
+}
 
-menu
+# ================== 主菜单 ==================
+menu(){
+    load_config
+    echo -e "${GREEN}===== VPS TG备份菜单 =====${RESET}"
+    echo -e "${GREEN}1) 上传文件/目录到Telegram${RESET}"
+    echo -e "${GREEN}2) 修改Telegram配置${RESET}"
+    echo -e "${GREEN}3) 删除临时文件${RESET}"
+    echo -e "${GREEN}4) 定时任务管理${RESET}"
+    echo -e "${GREEN}5) 设置保留备份天数 (当前: $KEEP_DAYS 天)${RESET}"
+    echo -e "${GREEN}6) 更新${RESET}"
+    echo -e "${GREEN}7) 卸载${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    read -p "$(echo -e ${GREEN}请选择: ${RESET})" choice
+
+    case $choice in
+        1) do_upload ;;
+        2) init ;;
+        3) rm -rf "$TMP_DIR"/* && echo -e "${YELLOW}已删除临时文件${RESET}" ;;
+        4) setup_cron_job ;;
+        5) set_keep_days ;;
+        6) download_script ;;
+        7) uninstall ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
+    esac
+}
+
+# ================== 执行入口 ==================
+if [[ "$1" == "auto_upload" ]]; then
+    auto_upload "$2"
+else
+    download_script   # 自动拉取最新脚本
+    menu              # 然后进入主菜单
+fi
+

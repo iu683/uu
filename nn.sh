@@ -54,7 +54,7 @@ services:
     ports:
       - "${TORRENT_PORT}:${TORRENT_PORT}"
       - "${TORRENT_PORT}:${TORRENT_PORT}/udp"
-      - "\${WEB_PORT}:8080"
+      - "${WEB_PORT}:8080"
     environment:
       - PUID=1000
       - PGID=1000
@@ -67,7 +67,7 @@ EOF
     cd "$COMPOSE_DIR"
     docker compose up -d
     echo -e "${GREEN}✅ qBittorrent 已启动${RESET}"
-    echo -e "${YELLOW}🌐 本机访问地址: http://$get_ip:$WEB_PORT${RESET}"
+    echo -e "${YELLOW}🌐 本机访问地址: http://$(get_ip):$WEB_PORT${RESET}"
     echo -e "${GREEN}🌐 账号/密码:查看日志${RESET}"
     echo -e "${GREEN}📂 配置目录: $COMPOSE_DIR/config${RESET}"
     echo -e "${GREEN}📂 下载目录: $COMPOSE_DIR/downloads${RESET}"

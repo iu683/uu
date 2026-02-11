@@ -186,18 +186,29 @@ backup_now(){
 # =====================
 restore_now(){
     load_config
+    mkdir -p "$TMP_BASE"
     TMP=$(mktemp -d -p "$TMP_BASE")
-    git clone -b "$BRANCH" "$REPO_URL" "$TMP/repo" || { rm -rf "$TMP"; return; }
+    echo -e "${GREEN}临时目录: $TMP${RESET}"
 
-    while read -r dir; do
+    # clone 仓库
+    git clone -b "$BRANCH" "$REPO_URL" "$TMP/repo" || { echo "❌ Git clone 失败"; rm -rf "$TMP"; return; }
+
+    # 读取备份映射
+    while IFS= read -r dir; do
+        [ -z "$dir" ] && continue
         safe=$(echo -n "$dir" | md5sum | awk '{print $1}')
         mkdir -p "$dir"
-        rsync -a --delete "$TMP/repo/$safe/" "$dir/"
+        if [ -d "$TMP/repo/$safe" ]; then
+            rsync -a --delete "$TMP/repo/$safe/" "$dir/"
+            echo -e "${GREEN}恢复成功: $dir${RESET}"
+        else
+            echo -e "${YELLOW}⚠️ 找不到备份目录: $dir → $safe${RESET}"
+        fi
     done < "$TMP/repo/.backup_map"
 
-    echo -e "${GREEN}✅ 恢复完成${RESET}"
-    send_tg "♻️ VPS恢复完成"
     rm -rf "$TMP"
+    echo -e "${GREEN}✅ 恢复完成${RESET}"
+    send_tg "♻️ VPS恢复完成 $(hostname)"
 }
 
 # =====================

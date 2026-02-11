@@ -1,163 +1,203 @@
 #!/bin/bash
-# ========================================
-# vue-color-avatar 一键管理脚本 (Docker Compose)
-# ========================================
+
+# ==============================
+# ⭐ GitHub 多目录备份工具（/opt 生产版 + TG + cron）
+# ==============================
+
+BASE_DIR="/opt/github-tool"
+CONFIG_FILE="$BASE_DIR/.ghupload_config"
+LOG_FILE="$BASE_DIR/github_upload.log"
+TMP_BASE="$BASE_DIR/upload_tmp"
+SCRIPT_PATH="$BASE_DIR/gh_tool.sh"
+BIN_LINK_DIR="/usr/local/bin"
+
+mkdir -p "$BASE_DIR" "$TMP_BASE"
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-APP_NAME="vue-color-avatar"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-ENV_FILE="$APP_DIR/.env"
+REPO_URL=""
+BRANCH="main"
+COMMIT_PREFIX="VPS-Backup"
 
-check_root() {
-    if [ "$(id -u)" != "0" ]; then
-        echo -e "${RED}请使用 root 用户运行脚本${RESET}"
-        exit 1
-    fi
+UPLOAD_DIRS=()
+DOWNLOAD_DIR="$BASE_DIR/restore"
+
+TG_BOT_TOKEN=""
+TG_CHAT_ID=""
+
+
+# ==============================
+# TG 通知
+# ==============================
+send_tg(){
+    [ -z "$TG_BOT_TOKEN" ] && return
+    [ -z "$TG_CHAT_ID" ] && return
+
+    curl -s -X POST \
+    "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
+    -d chat_id="$TG_CHAT_ID" \
+    -d text="$1" >/dev/null 2>&1
 }
 
-install_docker() {
-    if ! command -v docker &> /dev/null; then
-        echo -e "${GREEN}安装 Docker...${RESET}"
-        apt update
-        apt install -y docker.io
-    fi
-    if ! docker compose version &> /dev/null; then
-        echo -e "${GREEN}安装 Docker Compose 插件...${RESET}"
-        apt install -y docker-compose-plugin
-    fi
-    if ! systemctl is-active --quiet docker; then
-        echo -e "${GREEN}启动 Docker 服务...${RESET}"
-        systemctl enable docker
-        systemctl start docker
-    fi
+
+# ==============================
+# 工具函数
+# ==============================
+slug_path(){
+    echo "$1" | sed 's|^/||; s|/|_|g'
 }
 
-install_app() {
-    install_docker
-    mkdir -p "$APP_DIR"
+pause(){
+    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+}
 
-    read -p "请输入映射端口 [默认:3000]: " input_port
-    PORT=${input_port:-3000}
-
-    if [ -d "$APP_DIR/.git" ]; then
-        echo -e "${GREEN}检测到已有代码，更新中...${RESET}"
-        cd "$APP_DIR"
-        git pull
-    else
-        echo -e "${GREEN}克隆代码...${RESET}"
-        git clone https://github.com/Codennnn/vue-color-avatar.git "$APP_DIR"
-        cd "$APP_DIR"
-    fi
-
-    # 写 .env 文件
-    cat > "$ENV_FILE" <<EOF
-PORT=$PORT
+save_config(){
+cat > "$CONFIG_FILE" <<EOF
+REPO_URL="$REPO_URL"
+BRANCH="$BRANCH"
+COMMIT_PREFIX="$COMMIT_PREFIX"
+TMP_BASE="$TMP_BASE"
+DOWNLOAD_DIR="$DOWNLOAD_DIR"
+UPLOAD_DIRS="${UPLOAD_DIRS[*]}"
+TG_BOT_TOKEN="$TG_BOT_TOKEN"
+TG_CHAT_ID="$TG_CHAT_ID"
 EOF
-
-    # 写 docker-compose.yml
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  vue-color-avatar:
-    build: .
-    image: vue-color-avatar:latest
-    container_name: vue-color-avatar
-    ports:
-      - "127.0.0.1:${PORT}:80"
-    restart: always
-EOF
-
-    cd "$APP_DIR"
-    docker compose --env-file "$ENV_FILE" up -d --build
-
-    SERVER_IP=$(hostname -I | awk '{print $1}')
-    echo -e "${GREEN}✅ vue-color-avatar 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂数据目录: $APP_DIR${RESET}"
-    read -p "按回车返回菜单..."
-    menu
 }
 
-update_app() {
-    if [ ! -d "$APP_DIR" ]; then
-        echo -e "${RED}未检测到安装目录，请先安装${RESET}"
-        read -p "按回车返回菜单..."
-        menu
+load_config(){
+    [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+}
+
+
+# ==============================
+# 初始化
+# ==============================
+init_config(){
+
+echo -e "${GREEN}=== 初始化配置 ===${RESET}"
+
+read -p "GitHub SSH 仓库地址: " REPO_URL
+read -p "分支(默认 main): " BRANCH
+BRANCH=${BRANCH:-main}
+
+echo "输入需要备份的目录(空行结束)"
+UPLOAD_DIRS=()
+while true; do
+    read -p "目录: " d
+    [ -z "$d" ] && break
+    UPLOAD_DIRS+=("$d")
+done
+
+read -p "是否启用 Telegram 通知(y/n): " tg
+if [[ "$tg" == "y" ]]; then
+    read -p "Bot Token: " TG_BOT_TOKEN
+    read -p "Chat ID: " TG_CHAT_ID
+fi
+
+save_config
+echo -e "${GREEN}✅ 初始化完成${RESET}"
+pause
+}
+
+
+# ==============================
+# 上传
+# ==============================
+upload_files(){
+
+load_config
+
+TMP_DIR=$(mktemp -d -p "$TMP_BASE")
+
+git clone -b "$BRANCH" "$REPO_URL" "$TMP_DIR/repo" >>"$LOG_FILE" 2>&1 || {
+    echo -e "${RED}❌ clone失败${RESET}"
+    send_tg "❌ VPS备份失败：clone失败"
+    return
+}
+
+count=0
+
+for dir in ${UPLOAD_DIRS[@]}; do
+    if [ -d "$dir" ]; then
+        name=$(slug_path "$dir")
+        mkdir -p "$TMP_DIR/repo/$name"
+        rsync -a "$dir/" "$TMP_DIR/repo/$name/"
+        ((count++))
     fi
-    cd "$APP_DIR"
-    git pull
-    docker compose --env-file "$ENV_FILE" build
-    docker compose --env-file "$ENV_FILE" up -d
-    echo -e "${GREEN}✅ 已更新并重启完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
+done
+
+cd "$TMP_DIR/repo" || return
+
+git add -A
+git commit -m "$COMMIT_PREFIX $(date '+%F %T')" >/dev/null 2>&1 || true
+
+if git push >>"$LOG_FILE" 2>&1; then
+    echo -e "${GREEN}✅ 备份完成${RESET}"
+    send_tg "✅ VPS备份成功
+时间: $(date '+%F %T')
+目录数: $count"
+else
+    send_tg "❌ VPS备份失败：push错误"
+fi
+
 }
 
-restart_app() {
-    if [ ! -d "$APP_DIR" ]; then
-        echo -e "${RED}未检测到安装目录，请先安装${RESET}"
-        read -p "按回车返回菜单..."
-        menu
-    fi
-    cd "$APP_DIR"
-    docker compose --env-file "$ENV_FILE" restart
-    echo -e "${GREEN}✅ 服务已重启${RESET}"
-    read -p "按回车返回菜单..."
-    menu
+
+# ==============================
+# cron（自定义）
+# ==============================
+set_cron(){
+
+read -p "输入 cron 表达式: " cron_expr
+
+CRON_CMD="bash $SCRIPT_PATH upload >> $LOG_FILE 2>&1 #GHUPLOAD"
+
+(crontab -l 2>/dev/null | grep -v GHUPLOAD; echo "$cron_expr $CRON_CMD") | crontab -
+
+echo -e "${GREEN}✅ 定时任务已设置${RESET}"
+pause
 }
 
-view_logs() {
-    if [ ! -d "$APP_DIR" ]; then
-        echo -e "${RED}未检测到安装目录，请先安装${RESET}"
-        read -p "按回车返回菜单..."
-        menu
-    fi
-    cd "$APP_DIR"
-    echo -e "${GREEN}日志输出（Ctrl+C 退出）...${RESET}"
-    docker compose --env-file "$ENV_FILE" logs --tail 100 -f
-    read -p "按回车返回菜单..."
-    menu
+remove_cron(){
+crontab -l 2>/dev/null | grep -v GHUPLOAD | crontab -
+echo -e "${GREEN}✅ 已删除${RESET}"
+pause
 }
 
-uninstall_app() {
-    if [ ! -d "$APP_DIR" ]; then
-        echo -e "${RED}未检测到安装目录${RESET}"
-        read -p "按回车返回菜单..."
-        menu
-    fi
-    cd "$APP_DIR"
-    docker compose --env-file "$ENV_FILE" down -v --rmi all
-    cd ~
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已卸载并删除数据${RESET}"
-    read -p "按回车返回菜单..."
-    menu
+
+# ==============================
+# 菜单（绿色）
+# ==============================
+menu(){
+
+clear
+echo -e "${GREEN}=================================${RESET}"
+echo -e "${GREEN} GitHub VPS 自动备份工具 ${RESET}"
+echo -e "${GREEN}=================================${RESET}"
+echo -e "${GREEN}1) 初始化配置${RESET}"
+echo -e "${GREEN}2) 立即备份${RESET}"
+echo -e "${GREEN}3) 设置定时任务${RESET}"
+echo -e "${GREEN}4) 删除定时任务${RESET}"
+echo -e "${GREEN}0) 退出${RESET}"
+read -p "$(echo -e ${GREEN}请输入选项: ${RESET})" opt
+
+case $opt in
+1) init_config;;
+2) upload_files;;
+3) set_cron;;
+4) remove_cron;;
+0) exit;;
+esac
+
+menu
 }
 
-menu() {
-    clear
-    echo -e "${GREEN}=== vue-color-avatar 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 重启${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 卸载${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) restart_app ;;
-        4) view_logs ;;
-        5) uninstall_app ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ; menu ;;
-    esac
-}
 
-check_root
+case "$1" in
+upload) upload_files; exit;;
+esac
+
 menu

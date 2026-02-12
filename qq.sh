@@ -171,7 +171,6 @@ run_task() {
         # Telegram 通知修改
         send_tg "[$VPS_NAME] 任务 [$name] 同步完成 ✅ (拉取)"
     fi
-    
 }
 
 batch_run() {

@@ -136,65 +136,45 @@ delete_task() {
 }
 
 #################################
-# 压缩同步（每次生成单独压缩包）
+# 压缩同步
 #################################
 run_task() {
     direction="$1"
     num="$2"
     [[ -z "$num" ]] && read -p "编号: " num
-    num=$(echo "$num" | tr -d '\r\n')
     task=$(sed -n "${num}p" "$CONFIG_FILE")
-    [[ -z "$task" ]] && { echo -e "${RED}任务不存在${RESET}"; return; }
+    [[ -z "$task" ]] && { echo "任务不存在"; return; }
 
     IFS='|' read -r name local remote remote_path port auth secret <<< "$task"
-    ssh_opt="-p $port -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-    success=1
-    TMP_TAR="/tmp/${name}_$(date +%Y%m%d%H%M%S).tar.gz"
+    archive="/tmp/sync_task_${name}.tar.gz"
 
     if [[ "$direction" == "push" ]]; then
-        tar -czf "$TMP_TAR" -C "$(dirname "$local")" "$(basename "$local")"
+        tar -czf "$archive" -C "$(dirname "$local")" "$(basename "$local")"
 
         # 自动创建远程目录
         if [[ "$auth" == "password" ]]; then
-            sshpass -p "$secret" ssh $ssh_opt "$remote" "mkdir -p '$remote_path'"
+            sshpass -p "$secret" ssh -p $port $remote "mkdir -p $remote_path"
+            sshpass -p "$secret" rsync -avz -e "ssh -p $port" "$archive" "$remote:$remote_path/"
         else
-            ssh -i "$secret" ssh $ssh_opt "$remote" "mkdir -p '$remote_path'"
+            ssh -i "$secret" -p $port $remote "mkdir -p $remote_path"
+            rsync -avz -e "ssh -i $secret -p $port" "$archive" "$remote:$remote_path/"
         fi
-
-        dst="$remote:$remote_path/$(basename "$TMP_TAR")"
-        if [[ "$auth" == "password" ]]; then
-            sshpass -p "$secret" rsync -avz -e "ssh $ssh_opt" "$TMP_TAR" "$dst" || success=0
-        else
-            rsync -avz -e "ssh -i $secret $ssh_opt" "$TMP_TAR" "$dst" || success=0
-        fi
-
+        echo -e "${GREEN}✅ [$name] 已推送压缩包${RESET}"
     else
-        [[ -d "$local" ]] && rm -rf "$local"
-        mkdir -p "$local"
-
-        src="$remote:$remote_path/$(basename "$TMP_TAR")"
         if [[ "$auth" == "password" ]]; then
-            sshpass -p "$secret" rsync -avz -e "ssh $ssh_opt" "$src" "/tmp/" || success=0
+            sshpass -p "$secret" rsync -avz -e "ssh -p $port" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
         else
-            rsync -avz -e "ssh -i $secret $ssh_opt" "$src" "/tmp/" || success=0
+            rsync -avz -e "ssh -i $secret -p $port" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
         fi
-
-        if [[ $success -eq 1 ]]; then
-            tar -xzf "/tmp/$(basename $TMP_TAR)" -C "$local" --strip-components=1 || success=0
-            rm -f "/tmp/$(basename $TMP_TAR)"
-        fi
+        rm -rf "$local"
+        mkdir -p "$local"
+        tar -xzf "/tmp/$(basename "$archive")" -C "$(dirname "$local")"
+        rm -f "/tmp/$(basename "$archive")"
+        echo -e "${GREEN}✅ [$name] 已拉取并覆盖本地${RESET}"
     fi
 
-    if [[ -f "$TG_CONFIG" ]]; then
-        source "$TG_CONFIG"
-        if [[ $success -eq 1 ]]; then
-            send_tg "✅ [$VPS_NAME] $name 同步 $direction 成功"
-        else
-            send_tg "❌ [$VPS_NAME] $name 同步 $direction 失败"
-        fi
-    fi
-
-    [[ -f "$TMP_TAR" ]] && rm -f "$TMP_TAR"
+    source "$TG_CONFIG" 2>/dev/null || true
+    send_tg "[$VPS_NAME] 任务 [$name] 同步 $direction 完成"
 }
 
 batch_run() {

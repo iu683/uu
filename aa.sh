@@ -1,51 +1,84 @@
 #!/usr/bin/env bash
 set -e
 
+CONFIG="/etc/ssh/sshd_config"
+BACKUP="/etc/ssh/sshd_config.bak_$(date +%F_%H%M%S)"
+
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-echo -e "${GREEN}=== Akile DNS 优选 ===${RESET}"
-
-#################################
-# Root 检测
-#################################
-if [[ $EUID -ne 0 ]]; then
-  echo -e "${RED}请使用 root 运行此脚本${RESET}"
-  exit 1
-fi
-
-#################################
-# 依赖检测函数（只首次安装）
-#################################
-need_install=false
-
-check_cmd() {
-  command -v "$1" >/dev/null 2>&1 || need_install=true
+# ===== 重启 SSH =====
+restart_ssh() {
+    if command -v systemctl &>/dev/null; then
+        systemctl restart ssh 2>/dev/null || systemctl restart sshd
+    else
+        service ssh restart 2>/dev/null || service sshd restart
+    fi
+    echo -e ${GREEN}"✔ SSH 服务已重启"${RESET}
 }
 
-check_cmd curl
-check_cmd wget
-check_cmd dig
+# ===== 备份 =====
+backup_config() {
+    cp "$CONFIG" "$BACKUP"
+    echo -e ${YELLOW}"已备份 → $BACKUP"${RESET}
+}
 
-if $need_install; then
-  echo -e "${YELLOW}▶ 首次运行，安装依赖中...${RESET}"
-  apt update -y
-  apt install -y curl wget dnsutils
-else
-  echo -e "${GREEN}✔ 依赖已存在，跳过安装${RESET}"
-fi
+# ===== 开启公钥 =====
+enable_key() {
+    backup_config
 
-#################################
-# 下载并运行 akdns
-#################################
-echo -e "${YELLOW}▶ 下载 Akile DNS 优选脚本...${RESET}"
+    sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$CONFIG"
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$CONFIG"
 
-TMP_SCRIPT="/tmp/akdns.sh"
+    echo -e ${GREEN}"✔ 已开启：仅公钥登录"${RESET}
+    restart_ssh
+}
 
-wget -qO "$TMP_SCRIPT" https://raw.githubusercontent.com/akile-network/aktools/main/akdns.sh"
-chmod +x "$TMP_SCRIPT"
+# ===== 禁用公钥 =====
+disable_key() {
+    backup_config
 
-echo -e "${GREEN}▶ 启动 DNS 优选工具...${RESET}"
-bash "$TMP_SCRIPT"
+    sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication no/' "$CONFIG"
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$CONFIG"
+
+    echo -e ${YELLOW}"✔ 已切换为密码登录"${RESET}
+    restart_ssh
+}
+
+# ===== 状态 =====
+status() {
+    echo -e ${GREEN}"====== 当前 SSH 状态 ======"${RESET}
+    grep -E "PubkeyAuthentication|PasswordAuthentication" "$CONFIG"
+    echo
+}
+
+# ===== 菜单 =====
+menu() {
+    while true; do
+        clear
+
+        echo -e ${GREEN}"=================================="${RESET}
+        echo -e ${GREEN}"      SSH 公钥登录管理工具"${RESET}
+        echo -e ${GREEN}"=================================="${RESET}
+        echo -e ${GREEN}"1) 开启公钥登录（推荐）"${RESET}
+        echo -e ${GREEN}"2) 禁用公钥登录（密码登录）"${RESET}
+        echo -e ${GREEN}"3) 查看当前状态"${RESET}
+        echo -e ${GREEN}"0) 退出"${RESET}
+        echo -ne ${GREEN}"请选择操作: "${RESET}
+        read num
+
+        case $num in
+            1) enable_key ;;
+            2) disable_key ;;
+            3) status ;;
+            0) exit 0 ;;
+            *) echo -e ${RED}"无效输入"${RESET} ;;
+        esac
+
+        read -rp "回车继续..."
+    done
+}
+
+menu

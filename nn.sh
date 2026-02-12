@@ -1,425 +1,309 @@
 #!/bin/bash
-# =========================================================
-# VPS <-> GitHub 目录备份恢复工具 Pro（最终版）
-# 支持压缩备份 + 自定义备份目录 + 自动过期清理 + GitHub 上传
-# 修复 Git clone 临时目录问题，恢复到原目录
-# =========================================================
+set -e
 
-BASE_DIR="/opt/github-backup"
-CONFIG_FILE="$BASE_DIR/.config"
-LOG_FILE="$BASE_DIR/run.log"
-TMP_BASE="$BASE_DIR/tmp"
-SCRIPT_PATH="$BASE_DIR/gh_tool.sh"
-SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/nn.sh"
-
-mkdir -p "$BASE_DIR" "$TMP_BASE"
-chmod 700 "$BASE_DIR" "$TMP_BASE"
-
+#################################
+# 配置
+#################################
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-# =====================
-# 默认配置
-# =====================
-REPO_URL=""
-BRANCH="main"
-TG_BOT_TOKEN=""
-TG_CHAT_ID=""
-BACKUP_LIST=()
-SERVER_NAME=""
-ARCHIVE_FMT="tar.gz"
-KEEP_DAYS=7
-BACKUP_DIR="$BASE_DIR/backups"
-mkdir -p "$BACKUP_DIR"
+BASE_DIR="/opt/rsync_task"
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/nn.sh"
+SCRIPT_PATH="$BASE_DIR/rsync_manager.sh"
+KEY_DIR="$BASE_DIR/keys"
+LOG_DIR="$BASE_DIR/logs"
+CONFIG_FILE="$BASE_DIR/rsync_tasks.conf"
+TG_CONFIG="$BASE_DIR/.tg.conf"
+BIN_LINK_DIR="/usr/local/bin"
 
-# =====================
-# 自动下载主脚本
-# =====================
-download_script(){
-    if [ ! -f "$SCRIPT_PATH" ]; then
-        curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_PATH" || {
-            echo -e "${RED}❌ 下载失败${RESET}"
-            exit 1
-        }
-        chmod +x "$SCRIPT_PATH"
-        echo -e "${GREEN}✅ 脚本已下载: $SCRIPT_PATH${RESET}"
-    fi
+mkdir -p "$BASE_DIR" "$KEY_DIR" "$LOG_DIR"
+touch "$CONFIG_FILE"
+
+#################################
+# 安装依赖
+#################################
+install_dep() {
+    for p in rsync ssh sshpass curl tar; do
+        if ! command -v $p &>/dev/null; then
+            echo -e "${YELLOW}安装依赖: $p${RESET}"
+            DEBIAN_FRONTEND=noninteractive apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y $p >/dev/null 2>&1
+        fi
+    done
 }
-download_script
+install_dep
 
-# =====================
-# Telegram 消息
-# =====================
-send_tg(){
-    [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]] && return
-    MSG="$1"
-    [[ -n "$SERVER_NAME" ]] && MSG="[$SERVER_NAME] $MSG"
-    curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
-        -d chat_id="$TG_CHAT_ID" -d text="$MSG" >/dev/null
+#################################
+# 首次运行安装快捷命令
+#################################
+if [ ! -f "$SCRIPT_PATH" ]; then
+    echo -e "${GREEN}首次运行，下载脚本到本地...${RESET}"
+    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
+    chmod +x "$SCRIPT_PATH"
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/s"
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/S"
+    echo -e "${GREEN}✅ 快捷键已添加：s 或 S 可快速启动${RESET}"
+fi
+
+#################################
+# Telegram
+#################################
+send_tg() {
+    [[ ! -f "$TG_CONFIG" ]] && return
+    source "$TG_CONFIG"
+    curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        -d chat_id="$CHAT_ID" \
+        -d text="$1" >/dev/null 2>&1
 }
 
-# =====================
-# 配置保存/加载
-# =====================
-save_config(){
-cat > "$CONFIG_FILE" <<EOF
-REPO_URL="$REPO_URL"
-BRANCH="$BRANCH"
-TG_BOT_TOKEN="$TG_BOT_TOKEN"
-TG_CHAT_ID="$TG_CHAT_ID"
-BACKUP_LIST="${BACKUP_LIST[*]}"
-SERVER_NAME="$SERVER_NAME"
-ARCHIVE_FMT="$ARCHIVE_FMT"
-KEEP_DAYS="$KEEP_DAYS"
-BACKUP_DIR="$BACKUP_DIR"
+setup_tg() {
+    read -p "VPS名称: " VPS_NAME
+    read -p "Bot Token: " BOT_TOKEN
+    read -p "Chat ID: " CHAT_ID
+    cat > "$TG_CONFIG" <<EOF
+VPS_NAME="$VPS_NAME"
+BOT_TOKEN="$BOT_TOKEN"
+CHAT_ID="$CHAT_ID"
 EOF
+    echo -e "${GREEN}TG配置已保存${RESET}"
 }
 
-load_config(){
-    [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
-    BACKUP_LIST=($BACKUP_LIST)
-}
+#################################
+# SSH 密钥管理
+#################################
+generate_and_setup_ssh() {
+    local remote="$1"
+    local port="$2"
+    KEY_FILE="$KEY_DIR/id_rsa_rsync"
+    PUB_FILE="$KEY_FILE.pub"
 
-# =====================
-# SSH Key 自动生成 + 上传 GitHub
-# =====================
-setup_ssh(){
-    mkdir -p ~/.ssh
-    if [ ! -f ~/.ssh/id_rsa ]; then
-        ssh-keygen -t rsa -b 4096 -N "" -f ~/.ssh/id_rsa
-        echo -e "${GREEN}✅ SSH Key 已生成${RESET}"
+    if [[ ! -f "$KEY_FILE" ]]; then
+        echo -e "${YELLOW}未检测到本地 SSH 密钥，正在生成...${RESET}"
+        ssh-keygen -t rsa -b 4096 -f "$KEY_FILE" -N "" -q
+        echo -e "${GREEN}✅ 本地 SSH 密钥生成完成${RESET}"
     fi
-    eval "$(ssh-agent -s)" >/dev/null
-    ssh-add ~/.ssh/id_rsa >/dev/null 2>&1
-    ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
 
-    PUB_KEY_CONTENT=$(cat ~/.ssh/id_rsa.pub)
-    read -p "请输入 GitHub 用户名: " GH_USER
-    read -s -p "请输入 GitHub PAT (admin:public_key 权限): " GH_TOKEN
-    echo ""
+    PUBKEY_CONTENT=$(cat "$PUB_FILE")
+    ssh-keygen -f "$HOME/.ssh/known_hosts" -R "${remote#*@}" >/dev/null 2>&1
 
-    TITLE="VPS_$(date '+%Y%m%d%H%M%S')"
-    RESP=$(curl -s -o /dev/null -w "%{http_code}" \
-        -X POST -H "Authorization: token $GH_TOKEN" \
-        -d "{\"title\":\"$TITLE\",\"key\":\"$PUB_KEY_CONTENT\"}" \
-        https://api.github.com/user/keys)
+    echo -e "${YELLOW}第一次连接需要输入远程密码${RESET}"
+    ssh -p "$port" "$remote" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+    ssh -p "$port" "$remote" "grep -Fxq '$PUBKEY_CONTENT' ~/.ssh/authorized_keys || echo '$PUBKEY_CONTENT' >> ~/.ssh/authorized_keys"
 
-    if [ "$RESP" -eq 201 ]; then
-        echo -e "${GREEN}✅ SSH Key 已上传 GitHub${RESET}"
-    elif [ "$RESP" -eq 422 ]; then
-        echo -e "${YELLOW}⚠️ 公钥已存在${RESET}"
+    ssh -i "$KEY_FILE" -p "$port" "$remote" "echo 2>&1" >/dev/null 2>&1
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}✅ 公钥写入成功，可免密码登录 $remote${RESET}"
     else
-        echo -e "${RED}❌ SSH Key 上传失败${RESET}"
+        echo -e "${RED}❌ 公钥写入失败，请检查 SSH${RESET}"
     fi
-
-    git config --global user.name "$GH_USER"
-    git config --global user.email "$GH_USER@example.com"
 }
 
-# =====================
-# 初始化配置
-# =====================
-init_config(){
-    setup_ssh
-    read -p "请输入 GitHub 仓库地址 (SSH, 例如 git@github.com:USER/REPO.git): " REPO_URL
-    read -p "分支(默认 main): " BRANCH
-    BRANCH=${BRANCH:-main}
-    read -p "服务器名称 (Telegram 通知显示): " SERVER_NAME
-    read -p "配置 Telegram 通知？(y/n): " t
-    if [[ "$t" == "y" ]]; then
-        read -p "TG BOT TOKEN: " TG_BOT_TOKEN
-        read -p "TG CHAT ID: " TG_CHAT_ID
-    fi
-    save_config
-    echo -e "${GREEN}✅ 初始化完成${RESET}"
-    read -p "按回车返回菜单..."
+#################################
+# 任务管理
+#################################
+list_tasks() {
+    [[ ! -s "$CONFIG_FILE" ]] && { echo "暂无任务"; return; }
+    awk -F'|' '{printf "%d) %s  %s -> %s [%s]\n",NR,$1,$2,$3,$5}' "$CONFIG_FILE"
 }
 
-# =====================
-# 设置备份目录
-# =====================
-set_backup_dir(){
-    load_config
-    echo -e "${GREEN}当前备份目录: $BACKUP_DIR${RESET}"
-    read -p "请输入新的备份目录（留空保持当前）: " dir
-    if [ -n "$dir" ]; then
-        BACKUP_DIR="$dir"
-        mkdir -p "$BACKUP_DIR"
-        save_config
-        echo -e "${GREEN}✅ 已更新备份目录: $BACKUP_DIR${RESET}"
-    fi
-    read -p "按回车返回菜单..."
-}
+add_task() {
+    read -p "任务名称: " name
+    read -p "本地目录: " local
+    read -p "远程目录: " remote_path
+    read -p "远程用户@IP: " remote
+    read -p "端口(默认22): " port
+    port=${port:-22}
 
-# =====================
-# 设置备份参数
-# =====================
-set_backup_params(){
-    load_config
-    echo -e "${GREEN}当前压缩格式: $ARCHIVE_FMT${RESET}"
-    read -p "选择备份文件格式 (1: tar.gz, 2: zip，留空保持当前): " f
-    case $f in
-        1) ARCHIVE_FMT="tar.gz";;
-        2) ARCHIVE_FMT="zip";;
-        *) echo -e "${YELLOW}保持当前格式${RESET}";;
-    esac
-
-    echo -e "${GREEN}当前备份文件保留天数: $KEEP_DAYS${RESET}"
-    read -p "设置备份文件保留天数（留空保持当前）: " kd
-    if [ -n "$kd" ]; then
-        KEEP_DAYS="$kd"
-    fi
-
-    save_config
-    echo -e "${GREEN}✅ 备份参数已更新${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-# =====================
-# 添加备份目录
-# =====================
-add_dirs(){
-    load_config
-    echo -e "${GREEN}输入要备份的目录，可以一次输入多个，用空格分隔:${RESET}"
-    read -p "目录: " dirs
-    for d in $dirs; do
-        if [ -d "$d" ]; then
-            BACKUP_LIST+=("$d")
-            echo -e "${GREEN}✅ 添加成功: $d${RESET}"
-        else
-            echo -e "${RED}⚠️ 目录不存在，跳过: $d${RESET}"
-        fi
-    done
-    save_config
-    read -p "按回车返回菜单..."
-}
-
-# =====================
-# 查看备份目录
-# =====================
-show_dirs(){
-    load_config
-    echo -e "${GREEN}当前备份目录:${RESET}"
-    for d in "${BACKUP_LIST[@]}"; do
-        echo -e "${GREEN}$d${RESET}"
-    done
-    read -p "按回车返回菜单..."
-}
-
-# =====================
-# 执行压缩备份（保留原路径）
-# =====================
-backup_now(){
-    load_config
-    mkdir -p "$BASE_DIR" "$TMP_BASE" "$BACKUP_DIR"
-    cd "$BASE_DIR" || exit 1
-    TMP=$(mktemp -d -p "$TMP_BASE")
-    echo -e "${GREEN}临时目录: $TMP${RESET}"
-
-    for dir in "${BACKUP_LIST[@]}"; do
-        [ ! -d "$dir" ] && echo -e "${YELLOW}⚠️ 目录不存在，跳过: $dir${RESET}" && continue
-        safe=$(echo -n "$dir" | md5sum | awk '{print $1}')
-        basename=$(basename "$dir")
-        backup_name="${BACKUP_DIR}/${basename}_${safe}_$(date '+%Y%m%d%H%M%S')"
-
-        echo -e "${GREEN}备份 $dir → $backup_name.${ARCHIVE_FMT}${RESET}"
-        if [ "$ARCHIVE_FMT" == "tar.gz" ]; then
-            tar -czf "$backup_name.tar.gz" -C "/" "$(echo "$dir" | sed 's|^/||')"
-        else
-            cd / || continue
-            zip -r "$backup_name.zip" "$(echo "$dir" | sed 's|^/||')" >/dev/null
-        fi
-    done
-
-    # 删除过期备份
-    find "$BACKUP_DIR" -type f -mtime +$KEEP_DAYS -exec rm -f {} \;
-    echo -e "${YELLOW}🗑️ 已删除 $KEEP_DAYS 天前的备份${RESET}"
-
-    # Git 上传压缩文件
-    TMP_REPO="$TMP/repo"
-    git clone -b "$BRANCH" "$REPO_URL" "$TMP_REPO" >>"$LOG_FILE" 2>&1 || {
-        echo -e "${RED}❌ Git clone 失败${RESET}"
-        send_tg "❌ Git clone 失败"
-        rm -rf "$TMP"
-        return
-    }
-    cp "$BACKUP_DIR"/* "$TMP_REPO/" 2>/dev/null || true
-
-    cd "$TMP_REPO" || return
-    git add -A
-    git commit -m "Backup $(date '+%F %T')" >/dev/null 2>&1 || echo -e "${YELLOW}⚠️ 没有文件变化${RESET}"
-    if git push origin "$BRANCH" >>"$LOG_FILE" 2>&1; then
-        echo -e "${GREEN}✅ 备份成功${RESET}"
-        send_tg "✅ VPS<->GitHub 备份成功"
+    echo "认证方式: 1密码 2密钥"
+    read -p "选择: " c
+    if [[ $c == 1 ]]; then
+        read -s -p "密码: " secret; echo
+        auth="password"
     else
-        echo -e "${RED}❌ Git push 失败${RESET}"
-        send_tg "❌ VPS<->GitHub 备份失败"
+        generate_and_setup_ssh "$remote" "$port"
+        secret="$KEY_DIR/id_rsa_rsync"
+        auth="key"
     fi
 
-    rm -rf "$TMP"
+    echo "$name|$local|$remote|$remote_path|$port|$auth|$secret" >> "$CONFIG_FILE"
 }
 
-# =====================
-# 恢复备份到原目录（只恢复最新备份）
-# =====================
-restore_now(){
-    load_config
-    mkdir -p "$BASE_DIR" "$TMP_BASE"
-    cd "$BASE_DIR" || exit 1
-    TMP=$(mktemp -d -p "$TMP_BASE")
-    echo -e "${GREEN}临时目录: $TMP${RESET}"
+delete_task() {
+    read -p "编号: " n
+    sed -i "${n}d" "$CONFIG_FILE"
+}
 
-    TMP_REPO="$TMP/repo"
-    git clone -b "$BRANCH" "$REPO_URL" "$TMP_REPO" >>"$LOG_FILE" 2>&1 || {
-        echo -e "${RED}❌ Git clone 失败${RESET}"
-        send_tg "❌ Git clone 恢复失败"
-        rm -rf "$TMP"
-        return
-    }
+#################################
+# 压缩同步（每次生成单独压缩包）
+#################################
+run_task() {
+    direction="$1"
+    num="$2"
+    [[ -z "$num" ]] && read -p "编号: " num
+    task=$(sed -n "${num}p" "$CONFIG_FILE")
+    [[ -z "$task" ]] && { echo -e "${RED}❌ 任务不存在${RESET}"; return; }
 
-    for dir in "${BACKUP_LIST[@]}"; do
-        safe=$(echo -n "$dir" | md5sum | awk '{print $1}')
-        basename=$(basename "$dir")
-        # 找到最新备份文件（按时间戳排序）
-        latest_file=$(ls -1 "$TMP_REPO/${basename}_${safe}_"* 2>/dev/null | sort -r | head -n1)
-        if [ -z "$latest_file" ]; then
-            echo -e "${YELLOW}⚠️ 找不到备份: $dir${RESET}"
-            continue
+    IFS='|' read -r name local remote_name remote remote_path port auth secret <<< "$task"
+
+    [[ ! -d "$local" && "$direction" == "push" ]] && { echo -e "${RED}❌ 本地目录不存在: $local${RESET}"; return; }
+
+    tmpfile="/tmp/${name}_sync_temp_$(date +%Y%m%d%H%M%S).tar.gz"
+
+    ssh_opt="-p $port -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+    if [[ "$direction" == "push" ]]; then
+        tar -czf "$tmpfile" -C "$(dirname "$local")" "$(basename "$local")"
+        [[ ! -s "$tmpfile" ]] && { echo -e "${RED}❌ 打包失败或内容为空${RESET}"; rm -f "$tmpfile"; return; }
+
+        if [[ "$auth" == "password" ]]; then
+            sshpass -p "$secret" rsync -avz -e "ssh $ssh_opt" "$tmpfile" "$remote:$remote_path/"
+        else
+            rsync -avz -e "ssh -i $secret $ssh_opt" "$tmpfile" "$remote:$remote_path/"
         fi
 
-        echo -e "${GREEN}恢复最新备份: $latest_file → $dir${RESET}"
-        mkdir -p "$dir"
-        if [[ "$latest_file" == *.tar.gz ]]; then
-            tar -xzf "$latest_file" -C /
-        elif [[ "$latest_file" == *.zip ]]; then
-            unzip -o "$latest_file" -d /
+        rm -f "$tmpfile"
+        send_tg "✅ [$VPS_NAME] 同步成功: $name (push)"
+    else
+        remote_file="$remote:$remote_path/$(basename "$tmpfile")"
+        [[ -f "$local" ]] && rm -rf "$local"
+
+        if [[ "$auth" == "password" ]]; then
+            sshpass -p "$secret" rsync -avz -e "ssh $ssh_opt" "$remote_file" "$tmpfile"
+        else
+            rsync -avz -e "ssh -i $secret $ssh_opt" "$remote_file" "$tmpfile"
         fi
+
+        mkdir -p "$local"
+        tar -xzf "$tmpfile" -C "$(dirname "$local")"
+        rm -f "$tmpfile"
+        send_tg "✅ [$VPS_NAME] 同步成功: $name (pull)"
+    fi
+}
+
+batch_run() {
+    read -p "批量任务编号(多个逗号或 all): " nums
+    if [[ "$nums" == "all" ]]; then
+        nums=$(seq 1 $(wc -l < "$CONFIG_FILE" | tr -d '\r'))
+    fi
+    OLDIFS=$IFS
+    IFS=','
+    for n in $nums; do
+        n=$(echo "$n" | tr -d '\r\n')
+        run_task "$1" "$n"
     done
-
-    rm -rf "$TMP"
-    echo -e "${GREEN}✅ 恢复完成${RESET}"
-    send_tg "♻️ VPS<->GitHub 最新备份恢复完成"
+    IFS=$OLDIFS
 }
 
-# =====================
-# 设置 Telegram 参数
-# =====================
-set_telegram(){
-    load_config
-    echo -e "${GREEN}当前 Telegram 参数:${RESET}"
-    echo -e "${GREEN}服务器名称: $SERVER_NAME${RESET}"
-    echo -e "${GREEN}TG BOT TOKEN: $TG_BOT_TOKEN${RESET}"
-    echo -e "${GREEN}TG CHAT ID: $TG_CHAT_ID${RESET}"
-
-    read -p "输入服务器名称（留空保持当前）: " name
-    [ -n "$name" ] && SERVER_NAME="$name"
-
-    read -p "输入 TG BOT TOKEN（留空保持当前）: " token
-    [ -n "$token" ] && TG_BOT_TOKEN="$token"
-
-    read -p "输入 TG CHAT ID（留空保持当前）: " chat
-    [ -n "$chat" ] && TG_CHAT_ID="$chat"
-
-    save_config
-    echo -e "${GREEN}✅ Telegram 参数已更新${RESET}"
-    read -p "按回车返回菜单..."
-}
-# =====================
+#################################
 # 定时任务
-# =====================
-set_cron(){
-    echo -e "${GREEN}选择定时备份时间:${RESET}"
-    echo -e "${GREEN}1) 每 5 分钟${RESET}"
-    echo -e "${GREEN}2) 每 10 分钟${RESET}"
-    echo -e "${GREEN}3) 每 30 分钟${RESET}"
-    echo -e "${GREEN}4) 每小时${RESET}"
-    echo -e "${GREEN}5) 每天凌晨 3 点${RESET}"
-    echo -e "${GREEN}6) 每周一凌晨 0 点${RESET}"
-    echo -e "${GREEN}7) 自定义${RESET}"
-    read -p "请输入选项 [1-7]: " choice
-
-    case $choice in
-        1) cron_expr="*/5 * * * *" ;;
-        2) cron_expr="*/10 * * * *" ;;
-        3) cron_expr="*/30 * * * *" ;;
-        4) cron_expr="0 * * * *" ;;
-        5) cron_expr="0 3 * * *" ;;
-        6) cron_expr="0 0 * * 1" ;;
-        7) read -p "请输入自定义 cron 表达式: " cron_expr ;;
-        *) echo "无效选项"; read -p "按回车返回菜单..."; return ;;
+#################################
+schedule_task() {
+    echo -e "${GREEN}定时任务模板:${RESET}"
+    echo -e "${GREEN}1) 每天0点${RESET}"
+    echo -e "${GREEN}2) 每周一0点${RESET}"
+    echo -e "${GREEN}3) 每月1号0点${RESET}"
+    echo -e "${GREEN}4) 自定义cron${RESET}"
+    read -p "选择模板: " tmpl
+    case $tmpl in
+        1) cron="0 0 * * *" ;;
+        2) cron="0 0 * * 1" ;;
+        3) cron="0 0 1 * *" ;;
+        4) read -p "cron表达式: " cron ;;
+        *) echo -e "${RED}无效选择${RESET}"; return ;;
     esac
 
-    CMD="export HOME=/root; export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; bash $SCRIPT_PATH backup >> $LOG_FILE 2>&1 #GHBACK"
-    (crontab -l 2>/dev/null | grep -v GHBACK; echo "$cron_expr $CMD") | crontab -
-    echo -e "${GREEN}✅ 定时任务已设置: $cron_expr${RESET}"
-}
-
-remove_cron(){
-    crontab -l 2>/dev/null | grep -v GHBACK | crontab -
-    echo -e "${GREEN}✅ 定时任务已删除${RESET}"
-}
-
-# =====================
-# 卸载脚本
-# =====================
-uninstall_script(){
-    read -p "确认卸载脚本及清理所有文件和定时任务吗？(y/N): " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        remove_cron
-        rm -rf "$BASE_DIR"
-        echo -e "${GREEN}✅ 脚本及所有备份文件已删除${RESET}"
-        exit 0
+    read -p "任务编号(多个逗号或 all): " nums
+    if [[ "$nums" == "all" ]]; then
+        nums=$(seq 1 $(wc -l < "$CONFIG_FILE" | tr -d '\r'))
     fi
+    OLDIFS=$IFS
+    IFS=','
+    for n in $nums; do
+        n=$(echo "$n" | tr -d '\r\n')
+        job="$cron /bin/bash $SCRIPT_PATH auto $n >> $LOG_DIR/cron_$n.log 2>&1 # rsync_$n"
+        crontab -l 2>/dev/null | grep -v "# rsync_$n" | { cat; echo "$job"; } | crontab -
+        echo -e "${GREEN}✅ 任务编号 $n 已添加${RESET}"
+    done
+    IFS=$OLDIFS
 }
 
-# =====================
-# 菜单
-# =====================
-menu(){
+delete_schedule() {
+    read -p "删除任务编号(多个逗号或 all): " nums
+    if [[ "$nums" == "all" ]]; then
+        crontab -l 2>/dev/null | grep -v "# rsync_" | crontab -
+        echo -e "${YELLOW}✅ 已删除全部定时任务${RESET}"
+        return
+    fi
+    OLDIFS=$IFS
+    IFS=','
+    for n in $nums; do
+        n=$(echo "$n" | tr -d '\r\n')
+        crontab -l 2>/dev/null | grep -v "# rsync_$n" | crontab -
+        echo -e "${YELLOW}✅ 已删除任务编号 $n 的定时任务${RESET}"
+    done
+    IFS=$OLDIFS
+}
+
+#################################
+# 更新 & 卸载
+#################################
+update_self() {
+    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
+    chmod +x "$SCRIPT_PATH"
+    echo -e "${GREEN}已更新脚本${RESET}"
+}
+
+uninstall_self() {
+    crontab -l 2>/dev/null | grep -v "rsync_" | crontab - || true
+    rm -rf "$BASE_DIR"
+    echo -e "${RED}已卸载脚本${RESET}"
+    exit
+}
+
+#################################
+# Cron 自动运行
+#################################
+if [[ "$1" == "auto" ]]; then
+    run_task push "$2"
+    exit
+fi
+
+#################################
+# 主菜单
+#################################
+while true; do
     clear
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}    VPS<->GitHub 备份工具       ${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN} 1) 初始化配置${RESET}"
-    echo -e "${GREEN} 2) 添加备份目录${RESET}"
-    echo -e "${GREEN} 3) 查看备份目录${RESET}"
-    echo -e "${GREEN} 4) 修改备份存放目录${RESET}"
-    echo -e "${GREEN} 5) 备份参数设置（压缩格式/保留天数）${RESET}"
-    echo -e "${GREEN} 6) 修改 Telegram 参数${RESET}"
-    echo -e "${GREEN} 7) 立即备份${RESET}"
-    echo -e "${GREEN} 8) 恢复备份${RESET}"
-    echo -e "${GREEN} 9) 设置定时任务${RESET}"
-    echo -e "${GREEN}10) 删除定时任务${RESET}"
+    echo -e "${GREEN}===== Rsync 同步管理器 =====${RESET}"
+    list_tasks
+    echo
+    echo -e "${GREEN} 1) 添加同步任务${RESET}"
+    echo -e "${GREEN} 2) 删除同步任务${RESET}"
+    echo -e "${GREEN} 3) 推送同步${RESET}"
+    echo -e "${GREEN} 4) 拉取同步${RESET}"
+    echo -e "${GREEN} 5) 批量推送同步${RESET}"
+    echo -e "${GREEN} 6) 批量拉取同步${RESET}"
+    echo -e "${GREEN} 7) 添加定时任务${RESET}"
+    echo -e "${GREEN} 8) 删除定时任务${RESET}"
+    echo -e "${GREEN} 9) Telegram设置${RESET}"
+    echo -e "${GREEN}10) 更新脚本${RESET}"
     echo -e "${GREEN}11) 卸载脚本${RESET}"
     echo -e "${GREEN} 0) 退出${RESET}"
-    echo -ne "${GREEN} 请输入选项: ${RESET}"
-    read opt
-    case $opt in
-        1) init_config ;;
-        2) add_dirs ;;
-        3) show_dirs ;;
-        4) set_backup_dir ;;
-        5) set_backup_params ;;
-        6) set_telegram ;;
-        7) backup_now ;;
-        8) restore_now ;;
-        9) set_cron ;;
-        10) remove_cron ;;
-        11) uninstall_script ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}"; read -p "按回车返回菜单..." ;;
+    read -p "$(echo -e ${GREEN}请选择操作: ${RESET}) " c
+    case $c in
+        1) add_task ;;
+        2) delete_task ;;
+        3) run_task push ;;
+        4) run_task pull ;;
+        5) batch_run push ;;
+        6) batch_run pull ;;
+        7) schedule_task ;;
+        8) delete_schedule ;;
+        9) setup_tg ;;
+        10) update_self ;;
+        11) uninstall_self ;;
+        0) exit ;;
     esac
-    menu
-}
-
-# =====================
-# cron 模式
-# =====================
-case "$1" in
-    backup) backup_now; exit ;;
-    restore) restore_now; exit ;;
-esac
-
-menu
+    read -p "回车继续..."
+done

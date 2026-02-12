@@ -2,8 +2,10 @@
 set -e
 
 #################################
-# 配置
+# 环境变量 & 配置
 #################################
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
@@ -20,6 +22,12 @@ BIN_LINK_DIR="/usr/local/bin"
 
 mkdir -p "$BASE_DIR" "$KEY_DIR" "$LOG_DIR"
 touch "$CONFIG_FILE"
+#################################
+# 稳定统计任务数量（修复 all 错误核心）
+#################################
+task_count() {
+    awk 'NF{c++} END{print c+0}' "$CONFIG_FILE"
+}
 
 #################################
 # 安装依赖
@@ -36,27 +44,21 @@ install_dep() {
 install_dep
 
 #################################
-# 首次运行安装快捷命令
-#################################
-if [ ! -f "$SCRIPT_PATH" ]; then
-    echo -e "${GREEN}首次运行，下载脚本到本地...${RESET}"
-    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
-    chmod +x "$SCRIPT_PATH"
-    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/s"
-    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/S"
-    echo -e "${GREEN}✅ 快捷键已添加：s 或 S 可快速启动${RESET}"
-fi
-
-#################################
 # Telegram
 #################################
 send_tg() {
-    [[ ! -f "$TG_CONFIG" ]] && return
-    source "$TG_CONFIG"
+    [[ -f "$TG_CONFIG" ]] || return
+
+    . "$TG_CONFIG"   # ⭐ 用 . 替代 source，cron 100%兼容
+
+    msg="$1"
+
     curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
         -d chat_id="$CHAT_ID" \
-        -d text="$1" >/dev/null 2>&1
+        -d text="[$VPS_NAME] $msg" \
+        >/dev/null 2>&1
 }
+
 
 setup_tg() {
     read -p "VPS名称: " VPS_NAME
@@ -67,6 +69,7 @@ VPS_NAME="$VPS_NAME"
 BOT_TOKEN="$BOT_TOKEN"
 CHAT_ID="$CHAT_ID"
 EOF
+    chmod 600 "$TG_CONFIG"
     echo -e "${GREEN}TG配置已保存${RESET}"
 }
 
@@ -136,61 +139,66 @@ delete_task() {
 }
 
 #################################
-# 压缩同步（每次生成单独压缩包）
+# 压缩同步
 #################################
 run_task() {
     direction="$1"
     num="$2"
-    [[ -z "$num" ]] && read -p "编号: " num
-    task=$(sed -n "${num}p" "$CONFIG_FILE")
-    [[ -z "$task" ]] && { echo -e "${RED}❌ 任务不存在${RESET}"; return; }
 
-    IFS='|' read -r name local remote_name remote remote_path port auth secret <<< "$task"
+    # 手动模式下，如果没有编号就让用户输入
+    if [[ -z "$num" ]]; then
+        read -p "编号: " num
+    fi
 
-    [[ ! -d "$local" && "$direction" == "push" ]] && { echo -e "${RED}❌ 本地目录不存在: $local${RESET}"; return; }
+    task=$(sed -n "${num}p" "$CONFIG_FILE" | tr -d '\r\n')
+    if [[ -z "$task" ]]; then
+        echo "任务编号 $num 不存在" >> "$LOG_DIR/error.log"
+        send_tg "[$VPS_NAME] 任务 $num 不存在 ❌"
+        return
+    fi
 
-    tmpfile="/tmp/${name}_sync_temp_$(date +%Y%m%d%H%M%S).tar.gz"
+    IFS='|' read -r name local remote remote_path port auth secret <<< "$task"
+    archive="/tmp/sync_task_${name}.tar.gz"
 
-    ssh_opt="-p $port -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-
-    if [[ "$direction" == "push" ]]; then
-        tar -czf "$tmpfile" -C "$(dirname "$local")" "$(basename "$local")"
-        [[ ! -s "$tmpfile" ]] && { echo -e "${RED}❌ 打包失败或内容为空${RESET}"; rm -f "$tmpfile"; return; }
+        if [[ "$direction" == "push" ]]; then
+        tar -czf "$archive" -C "$(dirname "$local")" "$(basename "$local")"
 
         if [[ "$auth" == "password" ]]; then
-            sshpass -p "$secret" rsync -avz -e "ssh $ssh_opt" "$tmpfile" "$remote:$remote_path/"
+            sshpass -p "$secret" ssh -p $port $remote "mkdir -p $remote_path"
+            sshpass -p "$secret" rsync -avz -e "ssh -p $port" "$archive" "$remote:$remote_path/"
         else
-            rsync -avz -e "ssh -i $secret $ssh_opt" "$tmpfile" "$remote:$remote_path/"
+            ssh -i "$secret" -p $port $remote "mkdir -p $remote_path"
+            rsync -avz -e "ssh -i $secret -p $port" "$archive" "$remote:$remote_path/"
         fi
-
-        rm -f "$tmpfile"
-        send_tg "✅ [$VPS_NAME] 同步成功: $name (push)"
+        echo -e "${GREEN}✅ [$name] 已推送压缩包${RESET}"
+        # Telegram 通知修改
+        send_tg "$name 推送完成 ✅"
     else
-        remote_file="$remote:$remote_path/$(basename "$tmpfile")"
-        [[ -f "$local" ]] && rm -rf "$local"
-
         if [[ "$auth" == "password" ]]; then
-            sshpass -p "$secret" rsync -avz -e "ssh $ssh_opt" "$remote_file" "$tmpfile"
+            sshpass -p "$secret" rsync -avz -e "ssh -p $port" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
         else
-            rsync -avz -e "ssh -i $secret $ssh_opt" "$remote_file" "$tmpfile"
+            rsync -avz -e "ssh -i $secret -p $port" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
         fi
-
+        rm -rf "$local"
         mkdir -p "$local"
-        tar -xzf "$tmpfile" -C "$(dirname "$local")"
-        rm -f "$tmpfile"
-        send_tg "✅ [$VPS_NAME] 同步成功: $name (pull)"
+        tar -xzf "/tmp/$(basename "$archive")" -C "$(dirname "$local")"
+        rm -f "/tmp/$(basename "$archive")"
+        echo -e "${GREEN}✅ [$name] 已拉取并覆盖本地${RESET}"
+        # Telegram 通知修改
+        send_tg "$name 推送完成 ✅"
     fi
 }
 
 batch_run() {
-    read -p "批量任务编号(多个逗号或 all): " nums
+    read -p "批量任务编号(多个逗号): " nums
     if [[ "$nums" == "all" ]]; then
-        nums=$(seq 1 $(wc -l < "$CONFIG_FILE" | tr -d '\r'))
+        count=$(task_count)
+        nums=$(seq 1 $count)
     fi
     OLDIFS=$IFS
     IFS=','
     for n in $nums; do
-        n=$(echo "$n" | tr -d '\r\n')
+        n=$(echo "$n" | tr -d '\r\n ')
         run_task "$1" "$n"
     done
     IFS=$OLDIFS
@@ -214,23 +222,24 @@ schedule_task() {
         *) echo -e "${RED}无效选择${RESET}"; return ;;
     esac
 
-    read -p "任务编号(多个逗号或 all): " nums
+    read -p "任务编号(多个逗号): " nums
     if [[ "$nums" == "all" ]]; then
-        nums=$(seq 1 $(wc -l < "$CONFIG_FILE" | tr -d '\r'))
+        count=$(task_count)
+        nums=$(seq 1 $count)
     fi
     OLDIFS=$IFS
     IFS=','
     for n in $nums; do
-        n=$(echo "$n" | tr -d '\r\n')
-        job="$cron /bin/bash $SCRIPT_PATH auto $n >> $LOG_DIR/cron_$n.log 2>&1 # rsync_$n"
+        n=$(echo "$n" | tr -d '\r\n ')
+        job="$cron /bin/bash $SCRIPT_PATH auto push $n >> $LOG_DIR/cron_$n.log 2>&1 # rsync_$n"
         crontab -l 2>/dev/null | grep -v "# rsync_$n" | { cat; echo "$job"; } | crontab -
-        echo -e "${GREEN}✅ 任务编号 $n 已添加${RESET}"
+        echo -e "${GREEN}✅ 任务编号 $n 已添加定时任务${RESET}"
     done
     IFS=$OLDIFS
 }
 
 delete_schedule() {
-    read -p "删除任务编号(多个逗号或 all): " nums
+    read -p "删除任务编号(多个逗号): " nums
     if [[ "$nums" == "all" ]]; then
         crontab -l 2>/dev/null | grep -v "# rsync_" | crontab -
         echo -e "${YELLOW}✅ 已删除全部定时任务${RESET}"
@@ -239,7 +248,7 @@ delete_schedule() {
     OLDIFS=$IFS
     IFS=','
     for n in $nums; do
-        n=$(echo "$n" | tr -d '\r\n')
+        n=$(echo "$n" | tr -d '\r\n ')
         crontab -l 2>/dev/null | grep -v "# rsync_$n" | crontab -
         echo -e "${YELLOW}✅ 已删除任务编号 $n 的定时任务${RESET}"
     done
@@ -266,8 +275,20 @@ uninstall_self() {
 # Cron 自动运行
 #################################
 if [[ "$1" == "auto" ]]; then
-    run_task push "$2"
+    run_task "$2" "$3"
     exit
+fi
+
+#################################
+# 首次运行安装快捷命令
+#################################
+if [ ! -f "$SCRIPT_PATH" ]; then
+    echo -e "${GREEN}首次运行，下载脚本到本地...${RESET}"
+    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
+    chmod +x "$SCRIPT_PATH"
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/s"
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/S"
+    echo -e "${GREEN}✅ 快捷键已添加：s 或 S 可快速启动${RESET}"
 fi
 
 #################################

@@ -1,313 +1,311 @@
-#!/usr/bin/env bash
-# =============================================
-# VPS 管理脚本 – 多目录备份 + TG通知 + 定时任务 + 自更新
-# 支持大文件切割上传
-# =============================================
+#!/bin/bash
+set -e
 
-BASE_DIR="/opt/vps_manager"
-SCRIPT_PATH="$BASE_DIR/vps_manager.sh"
+#################################
+# 基础配置
+#################################
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+RESET="\033[0m"
+
 SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
-CONFIG_FILE="$BASE_DIR/config"
-TMP_DIR="$BASE_DIR/tmp"
-mkdir -p "$BASE_DIR" "$TMP_DIR"
 
-# 配色
-GREEN="\033[32m"; YELLOW="\033[33m"; RED="\033[31m"; RESET="\033[0m"
+# 统一目录到 /opt
+BASE_DIR="/opt/rsync_task"
+SCRIPT_PATH="$BASE_DIR/rsync_manager.sh"
 
-# 默认保留天数
-KEEP_DAYS=7
-# 默认压缩格式
-ARCHIVE_FORMAT="tar"
+CONFIG_FILE="$BASE_DIR/rsync_tasks.conf"
+KEY_DIR="$BASE_DIR/keys"
+LOG_DIR="$BASE_DIR/logs"
+TG_CONFIG="$BASE_DIR/.tg.conf"
+STATUS_FILE="$BASE_DIR/status.log"
 
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+mkdir -p "$KEY_DIR" "$LOG_DIR"
+touch "$CONFIG_FILE"
+touch "$STATUS_FILE"
 
-# ================== 检查依赖 ==================
-check_dependencies(){
-    for cmd in curl tar zip; do
-        if ! command -v $cmd >/dev/null 2>&1; then
-            if [[ "$cmd" == "zip" ]]; then
-                echo -e "${YELLOW}未检测到 zip，尝试自动安装...${RESET}"
-                if [[ -f /etc/debian_version ]]; then
-                    apt update && apt install -y zip
-                elif [[ -f /etc/redhat-release ]]; then
-                    yum install -y zip
-                else
-                    echo -e "${RED}无法自动识别系统，请手动安装 zip${RESET}"
-                    exit 1
-                fi
-            else
-                echo -e "${RED}未安装 $cmd，请先安装${RESET}"
-                exit 1
-            fi
+#################################
+# 首次运行自动安装到本地
+#################################
+if [[ "$0" != "$SCRIPT_PATH" ]]; then
+    echo -e "${GREEN}首次运行，自动安装到本地...${RESET}"
+    mkdir -p "$BASE_DIR"
+    curl -sL "$SCRIPT_URL" -o "$SCRIPT_PATH"
+    chmod +x "$SCRIPT_PATH"
+    exec "$SCRIPT_PATH"
+fi
+
+#################################
+# 安装依赖
+#################################
+install_dep() {
+    for p in rsync sshpass curl ssh-keygen ssh-copy-id; do
+        if ! command -v $p &>/dev/null; then
+            echo -e "${YELLOW}安装依赖: $p${RESET}"
+            DEBIAN_FRONTEND=noninteractive apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y $p >/dev/null 2>&1
         fi
     done
 }
+install_dep
 
-# ================== 配置管理 ==================
-load_config(){
-    [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
-    [[ -n "$KEEP_DAYS" ]] && KEEP_DAYS="$KEEP_DAYS"
-    [[ -n "$ARCHIVE_FORMAT" ]] && ARCHIVE_FORMAT="$ARCHIVE_FORMAT"
+#################################
+# Telegram
+#################################
+send_tg() {
+    [[ ! -f "$TG_CONFIG" ]] && return
+    source "$TG_CONFIG"
+    curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        -d chat_id="$CHAT_ID" \
+        -d text="$1" >/dev/null 2>&1
 }
 
-save_config(){
-    cat > "$CONFIG_FILE" <<EOF
-BOT_TOKEN="$BOT_TOKEN"
-CHAT_ID="$CHAT_ID"
-VPS_NAME="$VPS_NAME"
-KEEP_DAYS="$KEEP_DAYS"
-ARCHIVE_FORMAT="$ARCHIVE_FORMAT"
+setup_tg() {
+    read -p "VPS名称: " name
+    read -p "Bot Token: " token
+    read -p "Chat ID: " chatid
+
+    cat > "$TG_CONFIG" <<EOF
+BOT_TOKEN="$token"
+CHAT_ID="$chatid"
+VPS_NAME="$name"
 EOF
+
+    echo -e "${GREEN}TG配置已保存${RESET}"
 }
 
-# ================== Telegram ==================
-send_tg_msg(){
-    local msg="$1"
-    curl -s -F chat_id="$CHAT_ID" -F text="$msg" \
-         "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" > /dev/null
-}
-
-# 上传文件（支持大于50MB自动切割）
-send_tg_file(){
-    local file="$1"
-    local MAX_SIZE=$((50*1024*1024))  # 50MB限制
-
-    if [[ ! -f "$file" ]]; then
-        echo -e "${RED}文件不存在，未上传: $file${RESET}"
-        return
+#################################
+# SSH 密钥管理
+#################################
+generate_ssh_key() {
+    KEY_FILE="$KEY_DIR/id_rsa_rsync"
+    PUB_FILE="$KEY_DIR/id_rsa_rsync.pub"
+    if [[ ! -f "$KEY_FILE" ]]; then
+        echo -e "${GREEN}生成 SSH 密钥...${RESET}"
+        ssh-keygen -t rsa -b 4096 -f "$KEY_FILE" -N "" >/dev/null
+        echo -e "${GREEN}密钥已生成: $KEY_FILE${RESET}"
     fi
+}
 
-    local FILE_SIZE
-    FILE_SIZE=$(stat -c%s "$file")
+setup_ssh_key() {
+    local remote_user_host="$1"
+    local port="$2"
 
-    if (( FILE_SIZE <= MAX_SIZE )); then
-        curl -s -F chat_id="$CHAT_ID" -F document=@"$file" \
-             "https://api.telegram.org/bot$BOT_TOKEN/sendDocument" > /dev/null
-        echo -e "${GREEN}上传完成: $(basename "$file")${RESET}"
+    PUB_FILE="$KEY_DIR/id_rsa_rsync.pub"
+
+    echo -e "${GREEN}上传公钥到 $remote_user_host ...${RESET}"
+    ssh-copy-id -i "$PUB_FILE" -p "$port" "$remote_user_host" >/dev/null 2>&1
+
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}公钥上传成功，可免密码登录${RESET}"
     else
-        local BASENAME=$(basename "$file")
-        local TMP_SPLIT_DIR="$TMP_DIR/${BASENAME}_parts"
-        mkdir -p "$TMP_SPLIT_DIR"
-        split -b $MAX_SIZE "$file" "$TMP_SPLIT_DIR/${BASENAME}_part_"
-
-        # 生成合并脚本
-        local MERGE_SCRIPT="$TMP_SPLIT_DIR/merge.sh"
-        echo "#!/bin/bash" > "$MERGE_SCRIPT"
-        echo "cat ${BASENAME}_part_* > $BASENAME" >> "$MERGE_SCRIPT"
-        chmod +x "$MERGE_SCRIPT"
-
-        echo -e "${YELLOW}文件超过50MB，已切割为 $(ls $TMP_SPLIT_DIR | wc -l) 个分片${RESET}"
-
-        # 上传分片
-        for part in "$TMP_SPLIT_DIR"/*; do
-            curl -s -F chat_id="$CHAT_ID" -F document=@"$part" \
-                 "https://api.telegram.org/bot$BOT_TOKEN/sendDocument" > /dev/null
-            echo -e "${GREEN}上传完成: $(basename "$part")${RESET}"
-        done
-
-        # 上传合并脚本
-        curl -s -F chat_id="$CHAT_ID" -F document=@"$MERGE_SCRIPT" \
-             "https://api.telegram.org/bot$BOT_TOKEN/sendDocument" > /dev/null
-        echo -e "${GREEN}已上传合并脚本: merge.sh${RESET}"
+        echo -e "${RED}公钥上传失败，请手动检查${RESET}"
     fi
 }
 
-# ================== 初始化配置 ==================
-init(){
-    read -rp "请输入 Telegram Bot Token: " BOT_TOKEN
-    read -rp "请输入 Chat ID: " CHAT_ID
-    read -rp "请输入 VPS 名称（可为空）: " VPS_NAME
-    save_config
-    echo -e "${GREEN}配置完成!${RESET}"
+#################################
+# 任务列表（显示最后一次同步状态）
+#################################
+list_tasks() {
+    [[ ! -s "$CONFIG_FILE" ]] && { echo "暂无任务"; return; }
+    awk -F'|' -v status_file="$STATUS_FILE" '{
+        task_id=NR;
+        name=$1;
+        local_dir=$2;
+        remote=$3;
+        remote_path=$4;
+        opt=$6;
+        state="未同步";
+        while(getline line < status_file) {
+            split(line,a,"|");
+            if(a[1]==task_id) { state=a[2]; break; }
+        }
+        printf "%d) %s  %s -> %s [%s] (状态: %s)\n", task_id,name,local_dir,remote_path,opt,state;
+    }' "$CONFIG_FILE"
 }
 
-# ================== 设置保留天数 ==================
-set_keep_days(){
-    read -rp "请输入保留备份的天数（当前 $KEEP_DAYS 天）: " days
-    if [[ "$days" =~ ^[0-9]+$ ]]; then
-        KEEP_DAYS="$days"
-        save_config
-        echo -e "${GREEN}已将备份保留天数设置为 $KEEP_DAYS 天${RESET}"
+#################################
+# 添加任务
+#################################
+add_task() {
+    read -p "任务名称: " name
+    read -p "本地目录: " local
+    read -p "远程目录: " remote_path
+    read -p "远程用户@IP: " remote
+    read -p "端口(默认22): " port
+    port=${port:-22}
+
+    # 自动生成密钥
+    generate_ssh_key
+    # 自动上传公钥到远程
+    setup_ssh_key "$remote" "$port"
+
+    auth="key"
+    secret="$KEY_DIR/id_rsa_rsync"
+
+    read -p "rsync参数(-avz): " opt
+    opt=${opt:--avz}
+
+    echo "$name|$local|$remote|$remote_path|$port|$opt|$auth|$secret" >> "$CONFIG_FILE"
+    echo -e "${GREEN}任务已添加，使用密钥免密码登录${RESET}"
+}
+
+#################################
+# 删除任务
+#################################
+delete_task() {
+    read -p "编号: " n
+    sed -i "${n}d" "$CONFIG_FILE"
+    # 删除状态
+    sed -i "${n}d" "$STATUS_FILE"
+}
+
+#################################
+# 压缩同步
+#################################
+run_task() {
+    direction="$1"
+    num="$2"
+
+    [[ -z "$num" ]] && read -p "编号: " num
+
+    task=$(sed -n "${num}p" "$CONFIG_FILE")
+    [[ -z "$task" ]] && exit 1
+
+    IFS='|' read -r name local remote remote_path port opt auth secret <<< "$task"
+
+    archive_name="sync_temp.tar.gz"
+    ssh_opt="-p $port -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+    if [[ "$direction" == "push" ]]; then
+        tar -czf "/tmp/$archive_name" -C "$(dirname "$local")" "$(basename "$local")"
+        src="/tmp/$archive_name"
+        dst="$remote:$remote_path/$archive_name"
     else
-        echo -e "${RED}输入无效，请输入正整数${RESET}"
+        src="$remote:$remote_path/$archive_name"
+        dst="/tmp/$archive_name"
     fi
-    menu
+
+    if [[ "$auth" == "password" ]]; then
+        sshpass -p "$secret" rsync $opt -e "ssh $ssh_opt" "$src" "$dst"
+    else
+        rsync $opt -e "ssh -i $secret $ssh_opt" "$src" "$dst"
+    fi
+
+    # pull 时覆盖本地
+    if [[ "$direction" == "pull" ]]; then
+        rm -rf "$local"
+        mkdir -p "$(dirname "$local")"
+        tar -xzf "$dst" -C "$(dirname "$local")"
+        rm -f "$dst"
+    fi
+
+    [[ "$direction" == "push" ]] && rm -f "$src"
+
+    # TG通知
+    source "$TG_CONFIG" 2>/dev/null || true
+    if [[ $? -eq 0 ]]; then
+        send_tg "✅ [$VPS_NAME] 同步成功: $name ($direction)"
+        state="成功"
+    else
+        send_tg "❌ [$VPS_NAME] 同步失败: $name ($direction)"
+        state="失败"
+    fi
+
+    # 更新状态文件
+    sed -i "${num}d" "$STATUS_FILE" 2>/dev/null || true
+    echo "$num|$state" >> "$STATUS_FILE"
 }
 
-# ================== 设置压缩格式 ==================
-set_archive_format(){
-    echo -e "${GREEN}请选择压缩格式 (当前: $ARCHIVE_FORMAT)${RESET}"
-    echo -e "${GREEN}1) tar.gz（默认）${RESET}"
-    echo -e "${GREEN}2) zip${RESET}"
-    read -rp "请选择: " choice
-    case $choice in
-        2) ARCHIVE_FORMAT="zip" ;;
-        *) ARCHIVE_FORMAT="tar" ;;
-    esac
-    save_config
-    echo -e "${GREEN}已设置压缩格式为 $ARCHIVE_FORMAT${RESET}"
-    menu
-}
+#################################
+# cron模式
+#################################
+if [[ "$1" == "auto" ]]; then
+    run_task push "$2"
+    exit
+fi
 
-# ================== 上传备份 ==================
-do_upload(){
-    load_config
-    [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]] && init
+#################################
+# 定时任务管理（带常用选项）
+#################################
+schedule_task() {
+    read -p "任务编号: " n
 
-    while true; do
-        echo "请输入要备份的目录，多个目录用空格分隔 (回车返回主菜单):"
-        read -rp "" TARGETS
-        [[ -z "$TARGETS" ]] && menu && return
-
-        for TARGET in $TARGETS; do
-            if [[ ! -e "$TARGET" ]]; then
-                echo -e "${RED}目录不存在: $TARGET${RESET}"
-                continue
-            fi
-
-            DIRNAME=$(basename "$TARGET")
-            TIMESTAMP=$(date +%F_%H%M%S)
-            ZIPFILE="$TMP_DIR/${DIRNAME}_$TIMESTAMP"
-
-            if [[ "$ARCHIVE_FORMAT" == "tar" ]]; then
-                ZIPFILE="$ZIPFILE.tar.gz"
-                tar -czf "$ZIPFILE" -C "$(dirname "$TARGET")" "$DIRNAME" >/dev/null
-            else
-                ZIPFILE="$ZIPFILE.zip"
-                zip -r "$ZIPFILE" "$TARGET" >/dev/null
-            fi
-
-            send_tg_file "$ZIPFILE"
-            send_tg_msg "📌 [$VPS_NAME] 上传完成: $DIRNAME"
-        done
-    done
-}
-
-# ================== 自动上传 ==================
-auto_upload(){
-    load_config
-    [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]] && echo -e "${RED}Telegram 未配置，定时任务不会上传${RESET}" && return
-    DEFAULT_DIRS="$1"
-    [[ -z "$DEFAULT_DIRS" ]] && echo -e "${YELLOW}未指定目录参数，定时任务不会上传${RESET}" && return
-
-    for DIR in $DEFAULT_DIRS; do
-        [[ ! -e "$DIR" ]] && echo -e "${RED}目录不存在: $DIR${RESET}" && continue
-        DIRNAME=$(basename "$DIR")
-        TIMESTAMP=$(date +%F_%H%M%S)
-        ZIPFILE="$TMP_DIR/${DIRNAME}_$TIMESTAMP"
-
-        if [[ "$ARCHIVE_FORMAT" == "tar" ]]; then
-            ZIPFILE="$ZIPFILE.tar.gz"
-            tar -czf "$ZIPFILE" -C "$(dirname "$DIR")" "$DIRNAME" >/dev/null
-        else
-            ZIPFILE="$ZIPFILE.zip"
-            zip -r "$ZIPFILE" "$DIR" >/dev/null
-        fi
-
-        send_tg_file "$ZIPFILE"
-        send_tg_msg "📌 [$VPS_NAME] 自动备份完成: $DIRNAME"
-    done
-
-    # 清理旧备份
-    find "$TMP_DIR" -type f \( -name "*.tar.gz" -o -name "*.zip" \) -mtime +$KEEP_DAYS -exec rm -f {} \;
-}
-
-# ================== 定时任务管理 ==================
-setup_cron_job(){
-    CRON_DIRS_FILE="$BASE_DIR/cron_dirs"
-    echo -e "${GREEN}===== 定时任务管理 =====${RESET}"
+    echo -e "${GREEN}请选择定时任务类型:${RESET}"
     echo -e "${GREEN}1) 每天0点${RESET}"
     echo -e "${GREEN}2) 每周一0点${RESET}"
     echo -e "${GREEN}3) 每月1号0点${RESET}"
-    echo -e "${GREEN}4) 每5分钟${RESET}"
-    echo -e "${GREEN}5) 每10分钟${RESET}"
-    echo -e "${GREEN}6) 自定义Cron表达式${RESET}"
-    echo -e "${GREEN}7) 删除所有任务${RESET}"
-    echo -e "${GREEN}8) 查看任务${RESET}"
-    echo -e "${GREEN}0) 返回${RESET}"
-    read -rp "请选择: " choice
+    echo -e "${GREEN}4) 自定义 cron 表达式${RESET}"
+    read -p "选择: " type
 
-    case $choice in
-        1) CRON_TIME="0 0 * * *" ;;
-        2) CRON_TIME="0 0 * * 1" ;;
-        3) CRON_TIME="0 0 1 * *" ;;
-        4) CRON_TIME="*/5 * * * *" ;;
-        5) CRON_TIME="*/10 * * * *" ;;
-        6) read -rp "请输入 Cron 表达式 (分 时 日 月 周): " CRON_TIME ;;
-        7)
-            crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab -
-            rm -f "$CRON_DIRS_FILE"
-            echo -e "${GREEN}已删除所有任务${RESET}"
-            menu; return ;;
-        8)
-            echo -e "${YELLOW}当前任务:${RESET}"
-            crontab -l 2>/dev/null | grep "$SCRIPT_PATH"
-            read -rp "回车返回菜单..." dummy
-            menu; return ;;
-        0) menu; return ;;
-        *) echo -e "${RED}无效选项${RESET}"; menu; return ;;
+    case $type in
+        1) cron="0 0 * * *" ;;
+        2) cron="0 0 * * 1" ;;
+        3) cron="0 0 1 * *" ;;
+        4) read -p "请输入 cron 表达式: " cron ;;
+        *) echo -e "${RED}无效选择${RESET}"; return ;;
     esac
 
-    read -rp "请输入备份目录(多个用空格分隔): " BACKUP_DIRS
-    [[ -z "$BACKUP_DIRS" ]] && echo -e "${YELLOW}未输入目录，返回菜单${RESET}" && menu && return
-    echo "$BACKUP_DIRS" > "$CRON_DIRS_FILE"
+    job="$cron /usr/bin/bash $SCRIPT_PATH auto $n >> $LOG_DIR/cron_$n.log 2>&1 # rsync_$n"
 
-    CRON_CMD="bash $SCRIPT_PATH auto_upload '$BACKUP_DIRS'"
-    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab -
-    (crontab -l 2>/dev/null; echo "$CRON_TIME $CRON_CMD") | crontab -
-    echo -e "${GREEN}已设置定时任务:${RESET} $CRON_TIME $CRON_CMD"
-    menu
+    crontab -l 2>/dev/null | grep -v "# rsync_$n" | { cat; echo "$job"; } | crontab -
+    echo -e "${GREEN}定时任务已设置${RESET}"
 }
 
-# ================== 主菜单 ==================
-menu(){
-    load_config
-    echo -e "${GREEN}===== VPS TG备份菜单 =====${RESET}"
-    echo -e "${GREEN}1) 上传文件目录到Telegram${RESET}"
-    echo -e "${GREEN}2) 修改Telegram配置${RESET}"
-    echo -e "${GREEN}3) 删除临时文件${RESET}"
-    echo -e "${GREEN}4) 定时任务管理${RESET}"
-    echo -e "${GREEN}5) 设置保留备份天数(当前: $KEEP_DAYS 天)${RESET}"
-    echo -e "${GREEN}6) 查看已添加的定时备份目录${RESET}"
-    echo -e "${GREEN}7) 设置压缩格式(当前: $ARCHIVE_FORMAT)${RESET}"
-    echo -e "${GREEN}8) 更新脚本${RESET}"
-    echo -e "${GREEN}9) 卸载脚本${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    read -p "$(echo -e ${GREEN}请选择: ${RESET})" choice
+delete_schedule() {
+    read -p "编号: " n
+    crontab -l 2>/dev/null | grep -v "# rsync_$n" | crontab -
+}
 
-    case $choice in
-        1) do_upload ;;
-        2) init ;;
-        3) rm -rf "$TMP_DIR"/* && echo -e "${YELLOW}已删除临时文件${RESET}" ;;
-        4) setup_cron_job ;;
-        5) set_keep_days ;;
-        6) [[ -f "$BASE_DIR/cron_dirs" ]] && cat "$BASE_DIR/cron_dirs" || echo -e "${YELLOW}暂无定时目录${RESET}" ;;
-        7) set_archive_format ;;
-        8)
-            curl -sSL "$SCRIPT_URL" -o "$SCRIPT_PATH"
-            chmod +x "$SCRIPT_PATH"
-            echo -e "${GREEN}脚本已更新${RESET}" ;;
-        9)
-            read -rp "确认卸载脚本并删除所有定时任务? (y/N): " yn
-            if [[ "$yn" =~ ^[Yy]$ ]]; then
-                crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab -
-                rm -rf "$BASE_DIR"
-                echo -e "${RED}已卸载${RESET}"
-                exit 0
-            fi
-            ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
+#################################
+# 更新 & 卸载
+#################################
+update_self() {
+    curl -sL "$SCRIPT_URL" -o "$SCRIPT_PATH"
+    chmod +x "$SCRIPT_PATH"
+    echo "已更新"
+}
+
+uninstall_self() {
+    crontab -l 2>/dev/null | grep -v "rsync_" | crontab - || true
+    rm -rf "$BASE_DIR"
+    echo "已卸载"
+    exit
+}
+
+#################################
+# 菜单
+#################################
+while true; do
+    clear
+    echo -e "${GREEN}===== Rsync 同步管理器 =====${RESET}"
+    list_tasks
+    echo
+    echo -e "${GREEN} 1) 添加同步任务${RESET}"
+    echo -e "${GREEN} 2) 删除同步任务${RESET}"
+    echo -e "${GREEN} 3) 推送同步${RESET}"
+    echo -e "${GREEN} 4) 拉取同步${RESET}"
+    echo -e "${GREEN} 5) 添加定时任务${RESET}"
+    echo -e "${GREEN} 6) 删除定时任务${RESET}"
+    echo -e "${GREEN} 7) Telegram设置${RESET}"
+    echo -e "${GREEN} 8) 更新脚本${RESET}"
+    echo -e "${GREEN} 9) 卸载脚本${RESET}"
+    echo -e "${GREEN} 0) 退出${RESET}"
+    read -p "$(echo -e ${GREEN} 请选择操作: ${RESET}) " c
+
+    case $c in
+        1) add_task ;;
+        2) delete_task ;;
+        3) run_task push ;;
+        4) run_task pull ;;
+        5) schedule_task ;;
+        6) delete_schedule ;;
+        7) setup_tg ;;
+        8) update_self ;;
+        9) uninstall_self ;;
+        0) exit ;;
     esac
-    menu
-}
 
-# ================== 执行入口 ==================
-check_dependencies
-
-if [[ "$1" == "auto_upload" ]]; then
-    auto_upload "$2"
-else
-    [[ ! -f "$SCRIPT_PATH" ]] && curl -sSL "$SCRIPT_URL" -o "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"
-    menu
-fi
+    read -p "回车继续..."
+done

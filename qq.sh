@@ -1,10 +1,12 @@
 #!/bin/bash
-set -e
+set -o pipefail
+
 
 #################################
 # 环境变量 & 配置
 #################################
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root   # ⭐ 确保 cron 下 ~ 指向 root
 
 GREEN="\033[32m"
 RED="\033[31m"
@@ -24,6 +26,13 @@ mkdir -p "$BASE_DIR" "$KEY_DIR" "$LOG_DIR"
 touch "$CONFIG_FILE"
 
 #################################
+# 稳定统计任务数量（修复 all 错误核心）
+#################################
+task_count() {
+    awk 'NF{c++} END{print c+0}' "$CONFIG_FILE"
+}
+
+#################################
 # 安装依赖
 #################################
 install_dep() {
@@ -41,11 +50,12 @@ install_dep
 # Telegram
 #################################
 send_tg() {
-    [[ ! -f "$TG_CONFIG" ]] && return
-    source "$TG_CONFIG"
+    [[ -f "$TG_CONFIG" ]] || return
+    . "$TG_CONFIG"   # ⭐ cron 下也能读到变量
+    msg="$1"
     curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
         -d chat_id="$CHAT_ID" \
-        -d text="$1" >/dev/null 2>&1
+        -d text="[$VPS_NAME] $msg" >/dev/null 2>&1
 }
 
 setup_tg() {
@@ -67,9 +77,11 @@ EOF
 generate_and_setup_ssh() {
     local remote="$1"
     local port="$2"
+
     KEY_FILE="$KEY_DIR/id_rsa_rsync"
     PUB_FILE="$KEY_FILE.pub"
 
+    # ===== 生成密钥 =====
     if [[ ! -f "$KEY_FILE" ]]; then
         echo -e "${YELLOW}未检测到本地 SSH 密钥，正在生成...${RESET}"
         ssh-keygen -t rsa -b 4096 -f "$KEY_FILE" -N "" -q
@@ -77,19 +89,39 @@ generate_and_setup_ssh() {
     fi
 
     PUBKEY_CONTENT=$(cat "$PUB_FILE")
-    ssh-keygen -f "$HOME/.ssh/known_hosts" -R "${remote#*@}" >/dev/null 2>&1
 
     echo -e "${YELLOW}第一次连接需要输入远程密码${RESET}"
-    ssh -p "$port" "$remote" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
-    ssh -p "$port" "$remote" "grep -Fxq '$PUBKEY_CONTENT' ~/.ssh/authorized_keys || echo '$PUBKEY_CONTENT' >> ~/.ssh/authorized_keys"
 
-    ssh -i "$KEY_FILE" -p "$port" "$remote" "echo 2>&1" >/dev/null 2>&1
-    if [[ $? -eq 0 ]]; then
+    # ⭐⭐⭐ 关键：所有 ssh/known_hosts 操作必须关闭 set -e
+    set +e
+
+    # 清理旧指纹（不存在也不会退出）
+    ssh-keygen -f "$HOME/.ssh/known_hosts" -R "${remote#*@}" >/dev/null 2>&1
+
+    # 首次连接自动接受 host key
+    ssh -o StrictHostKeyChecking=no -p "$port" "$remote" \
+        "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
+
+    ssh -o StrictHostKeyChecking=no -p "$port" "$remote" \
+        "touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+
+    ssh -o StrictHostKeyChecking=no -p "$port" "$remote" \
+        "grep -Fxq '$PUBKEY_CONTENT' ~/.ssh/authorized_keys || echo '$PUBKEY_CONTENT' >> ~/.ssh/authorized_keys"
+
+    # 测试免密（失败也不能退出）
+    ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" -p "$port" "$remote" "echo ok" >/dev/null 2>&1
+    ok=$?
+
+    set -e
+    # ⭐⭐⭐ 恢复
+
+    if [[ $ok -eq 0 ]]; then
         echo -e "${GREEN}✅ 公钥写入成功，可免密码登录 $remote${RESET}"
     else
-        echo -e "${RED}❌ 公钥写入失败，请检查 SSH${RESET}"
+        echo -e "${RED}❌ 公钥写入失败，请检查 SSH 或密码是否正确${RESET}"
     fi
 }
+
 
 #################################
 # 任务管理
@@ -133,57 +165,72 @@ run_task() {
     direction="$1"
     num="$2"
 
-    # 手动模式下，如果没有编号就让用户输入
     if [[ -z "$num" ]]; then
         read -p "编号: " num
     fi
 
     task=$(sed -n "${num}p" "$CONFIG_FILE" | tr -d '\r\n')
-    [[ -z "$task" ]] && { echo -e "${RED}❌ 任务编号 $num 不存在${RESET}"; return; }
+
+    if [[ -z "$task" ]]; then
+        echo "任务编号 $num 不存在" >> "$LOG_DIR/error.log"
+        send_tg "任务 $num 不存在 ❌"
+        return 1
+    fi
 
     IFS='|' read -r name local remote remote_path port auth secret <<< "$task"
     archive="/tmp/sync_task_${name}.tar.gz"
 
-        if [[ "$direction" == "push" ]]; then
-        tar -czf "$archive" -C "$(dirname "$local")" "$(basename "$local")"
+    echo -e "${YELLOW}开始同步 [$name] ...${RESET}"
+
+    if [[ "$direction" == "push" ]]; then
+
+        tar -czf "$archive" -C "$(dirname "$local")" "$(basename "$local")" || return 1
 
         if [[ "$auth" == "password" ]]; then
             sshpass -p "$secret" ssh -p $port $remote "mkdir -p $remote_path"
-            sshpass -p "$secret" rsync -avz -e "ssh -p $port" "$archive" "$remote:$remote_path/"
+            sshpass -p "$secret" rsync -az -e "ssh -p $port" "$archive" "$remote:$remote_path/"
         else
             ssh -i "$secret" -p $port $remote "mkdir -p $remote_path"
-            rsync -avz -e "ssh -i $secret -p $port" "$archive" "$remote:$remote_path/"
+            rsync -az -e "ssh -i $secret -p $port" "$archive" "$remote:$remote_path/"
         fi
-        echo -e "${GREEN}✅ [$name] 已推送压缩包${RESET}"
-        # Telegram 通知修改
-        send_tg "[$VPS_NAME] 任务 [$name] 同步完成 ✅ (推送)"
+
+        echo -e "${GREEN}✅ [$name] 推送完成${RESET}"
+        send_tg "$name 推送完成 ✅"
+
     else
+
         if [[ "$auth" == "password" ]]; then
-            sshpass -p "$secret" rsync -avz -e "ssh -p $port" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
+            sshpass -p "$secret" rsync -az -e "ssh -p $port" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
         else
-            rsync -avz -e "ssh -i $secret -p $port" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
+            rsync -az -e "ssh -i $secret -p $port" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
         fi
+
         rm -rf "$local"
         mkdir -p "$local"
         tar -xzf "/tmp/$(basename "$archive")" -C "$(dirname "$local")"
-        rm -f "/tmp/$(basename "$archive")"
-        echo -e "${GREEN}✅ [$name] 已拉取并覆盖本地${RESET}"
-        # Telegram 通知修改
-        send_tg "[$VPS_NAME] 任务 [$name] 同步完成 ✅ (拉取)"
+
+        echo -e "${GREEN}✅ [$name] 拉取完成${RESET}"
+        send_tg "$name 拉取完成 ✅"
     fi
+
+    return 0
 }
 
+
 batch_run() {
-    read -p "批量任务编号(多个逗号或 all): " nums
+    read -p "批量任务编号(多个逗号): " nums
     if [[ "$nums" == "all" ]]; then
-        nums=$(seq 1 $(grep -cve '^\s*$' "$CONFIG_FILE"))
+        count=$(task_count)
+        nums=$(seq 1 $count)
     fi
     OLDIFS=$IFS
     IFS=','
+
     for n in $nums; do
         n=$(echo "$n" | tr -d '\r\n ')
         run_task "$1" "$n"
     done
+
     IFS=$OLDIFS
 }
 
@@ -205,10 +252,12 @@ schedule_task() {
         *) echo -e "${RED}无效选择${RESET}"; return ;;
     esac
 
-    read -p "任务编号(多个逗号或 all): " nums
+    read -p "任务编号(多个逗号): " nums
     if [[ "$nums" == "all" ]]; then
-        nums=$(seq 1 $(grep -cve '^\s*$' "$CONFIG_FILE"))
+        count=$(task_count)
+        nums=$(seq 1 $count)
     fi
+
     OLDIFS=$IFS
     IFS=','
     for n in $nums; do
@@ -221,7 +270,7 @@ schedule_task() {
 }
 
 delete_schedule() {
-    read -p "删除任务编号(多个逗号或 all): " nums
+    read -p "删除任务编号(多个逗号): " nums
     if [[ "$nums" == "all" ]]; then
         crontab -l 2>/dev/null | grep -v "# rsync_" | crontab -
         echo -e "${YELLOW}✅ 已删除全部定时任务${RESET}"
@@ -308,5 +357,5 @@ while true; do
         11) uninstall_self ;;
         0) exit ;;
     esac
-    read -p "回车继续..."
+    read -p "$(echo -e ${GREEN}按回车继续...${RESET}) "
 done

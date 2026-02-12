@@ -2,7 +2,7 @@
 # =========================================================
 # VPS <-> GitHub 目录备份恢复工具 Pro（最终版）
 # 支持压缩备份 + 自定义备份目录 + 自动过期清理 + GitHub 上传
-# 修复 Git clone 临时目录问题
+# 修复 Git clone 临时目录问题，恢复到原目录
 # =========================================================
 
 BASE_DIR="/opt/github-backup"
@@ -31,7 +31,7 @@ BACKUP_LIST=()
 SERVER_NAME=""
 ARCHIVE_FMT="tar.gz"
 KEEP_DAYS=7
-BACKUP_DIR="$BASE_DIR/backups"  # 默认备份存放目录
+BACKUP_DIR="$BASE_DIR/backups"
 mkdir -p "$BACKUP_DIR"
 
 # =====================
@@ -209,7 +209,7 @@ show_dirs(){
 }
 
 # =====================
-# 执行压缩备份
+# 执行压缩备份（保留原路径）并清理 GitHub 历史备份
 # =====================
 backup_now(){
     load_config
@@ -218,6 +218,9 @@ backup_now(){
     TMP=$(mktemp -d -p "$TMP_BASE")
     echo -e "${GREEN}临时目录: $TMP${RESET}"
 
+    # ---------------------
+    # 生成备份文件
+    # ---------------------
     for dir in "${BACKUP_LIST[@]}"; do
         [ ! -d "$dir" ] && echo -e "${YELLOW}⚠️ 目录不存在，跳过: $dir${RESET}" && continue
         safe=$(echo -n "$dir" | md5sum | awk '{print $1}')
@@ -226,18 +229,22 @@ backup_now(){
 
         echo -e "${GREEN}备份 $dir → $backup_name.${ARCHIVE_FMT}${RESET}"
         if [ "$ARCHIVE_FMT" == "tar.gz" ]; then
-            tar -czf "$backup_name.tar.gz" -C "$dir" .
+            tar -czf "$backup_name.tar.gz" -C "/" "$(echo "$dir" | sed 's|^/||')"
         else
-            cd "$dir" || continue
-            zip -r "$backup_name.zip" . >/dev/null
+            cd / || continue
+            zip -r "$backup_name.zip" "$(echo "$dir" | sed 's|^/||')" >/dev/null
         fi
     done
 
-    # 删除过期备份
+    # ---------------------
+    # 删除本地过期备份
+    # ---------------------
     find "$BACKUP_DIR" -type f -mtime +$KEEP_DAYS -exec rm -f {} \;
-    echo -e "${YELLOW}🗑️ 已删除 $KEEP_DAYS 天前的备份${RESET}"
+    echo -e "${YELLOW}🗑️ 已删除 $KEEP_DAYS 天前的本地备份${RESET}"
 
-    # Git 上传压缩文件
+    # ---------------------
+    # Git 上传并清理 GitHub 历史备份
+    # ---------------------
     TMP_REPO="$TMP/repo"
     git clone -b "$BRANCH" "$REPO_URL" "$TMP_REPO" >>"$LOG_FILE" 2>&1 || {
         echo -e "${RED}❌ Git clone 失败${RESET}"
@@ -245,13 +252,20 @@ backup_now(){
         rm -rf "$TMP"
         return
     }
-    cp "$BACKUP_DIR"/* "$TMP_REPO/" 2>/dev/null || true
 
     cd "$TMP_REPO" || return
+
+    # 删除 Git 仓库中超过 KEEP_DAYS 天的备份文件
+    find . -maxdepth 1 -type f \( -name "*.tar.gz" -o -name "*.zip" \) -mtime +$KEEP_DAYS -exec git rm -f {} \;
+
+    # 复制最新本地备份到仓库
+    cp "$BACKUP_DIR"/* . 2>/dev/null || true
+
     git add -A
     git commit -m "Backup $(date '+%F %T')" >/dev/null 2>&1 || echo -e "${YELLOW}⚠️ 没有文件变化${RESET}"
+
     if git push origin "$BRANCH" >>"$LOG_FILE" 2>&1; then
-        echo -e "${GREEN}✅ 备份成功${RESET}"
+        echo -e "${GREEN}✅ 备份成功并清理 GitHub 历史备份${RESET}"
         send_tg "✅ VPS<->GitHub 备份成功"
     else
         echo -e "${RED}❌ Git push 失败${RESET}"
@@ -262,7 +276,7 @@ backup_now(){
 }
 
 # =====================
-# 恢复备份
+# 恢复备份到原目录（只恢复最新备份）
 # =====================
 restore_now(){
     load_config
@@ -279,13 +293,22 @@ restore_now(){
         return
     }
 
-    for file in "$TMP_REPO"/*; do
-        [ ! -f "$file" ] && continue
-        echo -e "${GREEN}恢复 $file → /${RESET}"
-        if [[ "$file" == *.tar.gz ]]; then
-            tar -xzf "$file" -C "/"
-        elif [[ "$file" == *.zip ]]; then
-            unzip -o "$file" -d "/"
+    for dir in "${BACKUP_LIST[@]}"; do
+        safe=$(echo -n "$dir" | md5sum | awk '{print $1}')
+        basename=$(basename "$dir")
+        # 找到最新备份文件（按时间戳排序）
+        latest_file=$(ls -1 "$TMP_REPO/${basename}_${safe}_"* 2>/dev/null | sort -r | head -n1)
+        if [ -z "$latest_file" ]; then
+            echo -e "${YELLOW}⚠️ 找不到备份: $dir${RESET}"
+            continue
+        fi
+
+        echo -e "${GREEN}恢复最新备份: $latest_file → $dir${RESET}"
+        mkdir -p "$dir"
+        if [[ "$latest_file" == *.tar.gz ]]; then
+            tar -xzf "$latest_file" -C /
+        elif [[ "$latest_file" == *.zip ]]; then
+            unzip -o "$latest_file" -d /
         fi
     done
 
@@ -295,16 +318,39 @@ restore_now(){
 }
 
 # =====================
+# 设置 Telegram 参数
+# =====================
+set_telegram(){
+    load_config
+    echo -e "${GREEN}当前 Telegram 参数:${RESET}"
+    echo -e "${GREEN}服务器名称: $SERVER_NAME${RESET}"
+    echo -e "${GREEN}TG BOT TOKEN: $TG_BOT_TOKEN${RESET}"
+    echo -e "${GREEN}TG CHAT ID: $TG_CHAT_ID${RESET}"
+
+    read -p "输入服务器名称（留空保持当前）: " name
+    [ -n "$name" ] && SERVER_NAME="$name"
+
+    read -p "输入 TG BOT TOKEN（留空保持当前）: " token
+    [ -n "$token" ] && TG_BOT_TOKEN="$token"
+
+    read -p "输入 TG CHAT ID（留空保持当前）: " chat
+    [ -n "$chat" ] && TG_CHAT_ID="$chat"
+
+    save_config
+    echo -e "${GREEN}✅ Telegram 参数已更新${RESET}"
+    read -p "按回车返回菜单..."
+}
+# =====================
 # 定时任务
 # =====================
 set_cron(){
     echo -e "${GREEN}选择定时备份时间:${RESET}"
-    echo -e "${GREEN}1) 每 5 分钟${RESET}"
-    echo -e "${GREEN}2) 每 10 分钟${RESET}"
-    echo -e "${GREEN}3) 每 30 分钟${RESET}"
+    echo -e "${GREEN}1) 每5分钟${RESET}"
+    echo -e "${GREEN}2) 每10分钟${RESET}"
+    echo -e "${GREEN}3) 每30分钟${RESET}"
     echo -e "${GREEN}4) 每小时${RESET}"
-    echo -e "${GREEN}5) 每天凌晨 3 点${RESET}"
-    echo -e "${GREEN}6) 每周一凌晨 0 点${RESET}"
+    echo -e "${GREEN}5) 每天凌晨3点${RESET}"
+    echo -e "${GREEN}6) 每周一凌晨0点${RESET}"
     echo -e "${GREEN}7) 自定义${RESET}"
     read -p "请输入选项 [1-7]: " choice
 
@@ -343,42 +389,101 @@ uninstall_script(){
 }
 
 # =====================
-# 菜单
+# 修改 GitHub 仓库地址
+# =====================
+modify_repo_url(){
+    load_config
+    echo -e "${GREEN}当前 GitHub 仓库地址: $REPO_URL${RESET}"
+    read -p "请输入新的 GitHub 仓库地址（留空保持当前）: " url
+    if [ -n "$url" ]; then
+        REPO_URL="$url"
+        save_config
+        echo -e "${GREEN}✅ 仓库地址已更新: $REPO_URL${RESET}"
+    fi
+    read -p "按回车返回菜单..."
+}
+
+# =====================
+# 管理备份目录（添加/删除/查看）
+# =====================
+manage_backup_dirs(){
+    load_config
+    while true; do
+        echo -e "${GREEN}当前备份目录列表:${RESET}"
+        for i in "${!BACKUP_LIST[@]}"; do
+            echo "$i) ${BACKUP_LIST[$i]}"
+        done
+        echo -e "${GREEN}1) 添加目录${RESET}"
+        echo -e "${GREEN}2) 删除目录${RESET}"
+        echo -e "${GREEN}0) 返回主菜单${RESET}"
+        read -p "选择操作: " choice
+        case "$choice" in
+            1)
+                read -p "请输入要添加的目录(可空格分隔): " dirs
+                for d in $dirs; do
+                    if [ -d "$d" ]; then
+                        BACKUP_LIST+=("$d")
+                        echo -e "${GREEN}✅ 添加成功: $d${RESET}"
+                    else
+                        echo -e "${RED}⚠️ 目录不存在: $d${RESET}"
+                    fi
+                done
+                save_config
+                ;;
+            2)
+                read -p "请输入要删除的目录编号(多个用空格): " idxs
+                for idx in $idxs; do
+                    unset BACKUP_LIST[$idx]
+                done
+                BACKUP_LIST=("${BACKUP_LIST[@]}")  # 重建索引
+                save_config
+                ;;
+            0) break ;;
+            *) echo -e "${RED}无效选项${RESET}" ;;
+        esac
+    done
+}
+
+# =====================
+# 修改菜单
 # =====================
 menu(){
     clear
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}    VPS<->GitHub 备份工具       ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}1) 初始化配置${RESET}"
-    echo -e "${GREEN}2) 添加备份目录${RESET}"
-    echo -e "${GREEN}3) 查看备份目录${RESET}"
-    echo -e "${GREEN}4) 修改备份存放目录${RESET}"
-    echo -e "${GREEN}5) 备份参数设置（压缩格式/保留天数）${RESET}"
-    echo -e "${GREEN}6) 立即备份${RESET}"
-    echo -e "${GREEN}7) 恢复备份${RESET}"
-    echo -e "${GREEN}8) 设置定时任务${RESET}"
-    echo -e "${GREEN}9) 删除定时任务${RESET}"
-    echo -e "${GREEN}10) 卸载脚本${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
+    echo -e "${GREEN} 1) 初始化配置${RESET}"
+    echo -e "${GREEN} 2) 修改GitHub仓库地址${RESET}"
+    echo -e "${GREEN} 3) 管理备份目录（添加/删除/查看）${RESET}"
+    echo -e "${GREEN} 4) 修改备份存放目录${RESET}"
+    echo -e "${GREEN} 5) 备份参数设置压缩格式/保留天数）${RESET}"
+    echo -e "${GREEN} 6) 修改Telegram参数${RESET}"
+    echo -e "${GREEN} 7) 立即备份${RESET}"
+    echo -e "${GREEN} 8) 恢复备份${RESET}"
+    echo -e "${GREEN} 9) 设置定时任务${RESET}"
+    echo -e "${GREEN}10) 删除定时任务${RESET}"
+    echo -e "${GREEN}11) 卸载脚本${RESET}"
+    echo -e "${GREEN} 0) 退出${RESET}"
+    echo -ne "${GREEN} 请输入选项: ${RESET}"
     read opt
     case $opt in
         1) init_config ;;
-        2) add_dirs ;;
-        3) show_dirs ;;
+        2) modify_repo_url ;;
+        3) manage_backup_dirs ;;
         4) set_backup_dir ;;
         5) set_backup_params ;;
-        6) backup_now ;;
-        7) restore_now ;;
-        8) set_cron ;;
-        9) remove_cron ;;
-        10) uninstall_script ;;
+        6) set_telegram ;;
+        7) backup_now ;;
+        8) restore_now ;;
+        9) set_cron ;;
+        10) remove_cron ;;
+        11) uninstall_script ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}"; read -p "按回车返回菜单..." ;;
     esac
     menu
 }
+
 
 # =====================
 # cron 模式

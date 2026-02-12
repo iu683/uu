@@ -196,7 +196,7 @@ run_task() {
 
         echo -e "${GREEN}✅ [$name] 推送完成${RESET}"
         send_tg "$name 推送完成 ✅"
-
+        return 0
     else
 
         if [[ "$auth" == "password" ]]; then

@@ -1,172 +1,337 @@
 #!/bin/bash
+set -e
 
-# 颜色设置
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-RED='\033[0;31m'
-NC='\033[0m'
+#################################
+# 颜色
+#################################
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+RESET="\033[0m"
 
-clear
-echo -e "${BLUE}=================================================${NC}"
-echo -e "${BLUE}           本地系统快照恢复工具                  ${NC}"
-echo -e "${BLUE}=================================================${NC}"
-echo ""
+#################################
+# 安装目录 & 备份目录
+#################################
+BASE_DIR="/opt/vpsbackup"
+INSTALL_PATH="$BASE_DIR/vpsbackup.sh"
+BACKUP_DIR="$BASE_DIR/backups"
+TG_CONF="$BASE_DIR/.tg.conf"
+CONF_FILE="$BASE_DIR/.backup.conf"
+mkdir -p "$BACKUP_DIR"
 
-# ==============================
-# 自定义备份目录（新增功能）
-# ==============================
+#################################
+# 默认配置
+#################################
+COMPRESS="tar"
+KEEP_DAYS=7
+SERVER_NAME=$(hostname)
+BACKUP_LIST="/opt"
 
-DEFAULT_BACKUP="/backups"
+#################################
+# 读取/保存配置
+#################################
+load_conf(){
+    [ -f "$CONF_FILE" ] && source "$CONF_FILE"
+    [ -f "$TG_CONF" ] && source "$TG_CONF"
+    IFS=' ' read -r -a BACKUP_ARRAY <<< "${BACKUP_LIST:-/opt}"
+}
 
-if [ -n "$1" ]; then
-  BACKUP_DIR="$1"
-else
-  read -p "请输入备份目录(默认: $DEFAULT_BACKUP): " INPUT_DIR
-  BACKUP_DIR="${INPUT_DIR:-$DEFAULT_BACKUP}"
+save_conf(){
+cat > "$CONF_FILE" <<EOF
+COMPRESS="$COMPRESS"
+KEEP_DAYS=$KEEP_DAYS
+SERVER_NAME="$SERVER_NAME"
+BACKUP_LIST="$BACKUP_LIST"
+EOF
+}
+
+#################################
+# Telegram通知
+#################################
+tg_send(){
+    [ -z "$BOT_TOKEN" ] && return
+
+    curl -s -X POST \
+    "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+    -d chat_id="$CHAT_ID" \
+    -d text="$1" >/dev/null 2>&1
+}
+
+#################################
+# 日志
+#################################
+log(){
+    echo "$(date '+%F %T') $1" >> "$BASE_DIR/backup.log"
+}
+
+#################################
+# 清理旧备份
+#################################
+clean_old(){
+    if [ "$COMPRESS" = "tar" ]; then
+        find "$BACKUP_DIR" -name "*.tar.gz" -mtime +$KEEP_DAYS -delete 2>/dev/null
+    else
+        find "$BACKUP_DIR" -name "*.zip" -mtime +$KEEP_DAYS -delete 2>/dev/null
+    fi
+}
+
+#################################
+# 备份核心（支持批量目录）
+#################################
+backup_dirs(){
+    load_conf
+    TS=$(date +%Y%m%d%H%M%S)
+
+    dirs=("$@")
+    [ ${#dirs[@]} -eq 0 ] && dirs=("${BACKUP_ARRAY[@]}")
+
+    for p in "${dirs[@]}"; do
+        [ ! -d "$p" ] && continue
+        name=$(basename "$p")
+        rel="${p#/}"
+
+        if [ "$COMPRESS" = "tar" ]; then
+            file="${name}_${TS}.tar.gz"
+            tar -czf "$BACKUP_DIR/$file" -C / "$rel"
+        else
+            file="${name}_${TS}.zip"
+            (cd / && zip -rq "$BACKUP_DIR/$file" "$rel")
+        fi
+
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}完成: $file${RESET}"
+            log "备份成功: $file"
+            tg_send "🟢 备份成功
+服务器: $SERVER_NAME
+目录: $p
+文件: $file"
+        else
+            log "备份失败: $file"
+            tg_send "🔴 备份失败
+服务器: $SERVER_NAME
+目录: $p"
+        fi
+    done
+
+    clean_old
+}
+
+#################################
+# 创建备份
+#################################
+create_backup(){
+    read -p "目录(空格分隔默认/opt): " input
+    if [ -z "$input" ]; then
+        backup_dirs
+    else
+        IFS=' ' read -r -a arr <<< "$input"
+        backup_dirs "${arr[@]}"
+    fi
+}
+
+#################################
+# 列出备份
+#################################
+list_backups(){
+    echo -e "${YELLOW}备份列表:${RESET}"
+    ls -1 "$BACKUP_DIR" 2>/dev/null
+}
+
+#################################
+# 批量恢复
+#################################
+restore_backup(){
+    shopt -s nullglob
+    files=($(ls -1t "$BACKUP_DIR"/*.{tar.gz,zip} 2>/dev/null))
+    [ ${#files[@]} -eq 0 ] && return
+
+    for i in "${!files[@]}"; do
+        echo "$i) $(basename "${files[$i]}")"
+    done
+
+    read -p "选择编号(空格分隔多个): " input
+    IFS=' ' read -r -a choose <<< "$input"
+
+    for idx in "${choose[@]}"; do
+        f="${files[$idx]}"
+        if [[ "$f" == *.tar.gz ]]; then
+            tar -xzf "$f" -C /
+        else
+            unzip -oq "$f" -d /
+        fi
+    done
+}
+
+#################################
+# Telegram设置
+#################################
+set_tg(){
+    read -p "BOT_TOKEN: " BOT_TOKEN
+    read -p "CHAT_ID: " CHAT_ID
+    read -p "服务器名称: " SERVER_NAME
+
+cat > "$TG_CONF" <<EOF
+BOT_TOKEN="$BOT_TOKEN"
+CHAT_ID="$CHAT_ID"
+SERVER_NAME="$SERVER_NAME"
+EOF
+
+    save_conf
+}
+
+#################################
+# 压缩格式/保留天数
+#################################
+set_compress(){
+    echo "1 tar.gz"
+    echo "2 zip"
+    read -p "选择: " c
+    [ "$c" = 2 ] && COMPRESS="zip" || COMPRESS="tar"
+    save_conf
+}
+
+set_keep(){
+    read -p "保留天数: " KEEP_DAYS
+    save_conf
+}
+
+#################################
+# 设置备份目录
+#################################
+set_backup_dirs(){
+    read -p "输入要备份的目录（空格分隔）: " input
+    BACKUP_LIST="$input"
+    save_conf
+    echo -e "${GREEN}备份目录已保存${RESET}"
+}
+
+#################################
+# 定时任务管理
+#################################
+CRON_TAG="# VPSBACKUP_AUTO"
+
+list_cron(){
+    mapfile -t lines < <(crontab -l 2>/dev/null | grep "$CRON_TAG")
+    [ ${#lines[@]} -eq 0 ] && { echo -e "${YELLOW}暂无定时任务${RESET}"; return; }
+    for i in "${!lines[@]}"; do
+        cron=$(echo "${lines[$i]}" | sed "s|$INSTALL_PATH auto $CRON_TAG||")
+        echo "$i) $cron"
+    done
+}
+
+schedule_add(){
+    echo -e "${GREEN}1 每天0点${RESET}"
+    echo -e "${GREEN}2 每周一0点${RESET}"
+    echo -e "${GREEN}3 每月1号${RESET}"
+    echo -e "${GREEN}4 自定义cron${RESET}"
+
+    read -p "选择: " t
+    case $t in
+        1) cron="0 0 * * *" ;;
+        2) cron="0 0 * * 1" ;;
+        3) cron="0 0 1 * *" ;;
+        4) read -p "cron表达式: " cron ;;
+        *) return ;;
+    esac
+
+    (crontab -l 2>/dev/null; \
+     echo "$cron $INSTALL_PATH auto >> $BASE_DIR/cron.log 2>&1 $CRON_TAG") | crontab -
+    echo -e "${GREEN}添加成功，cron日志: $BASE_DIR/cron.log${RESET}"
+}
+
+schedule_del_one(){
+    mapfile -t lines < <(crontab -l 2>/dev/null | grep "$CRON_TAG")
+    [ ${#lines[@]} -eq 0 ] && return
+    list_cron
+    read -p "输入编号: " idx
+    unset 'lines[idx]'
+    (crontab -l 2>/dev/null | grep -v "$CRON_TAG"; for l in "${lines[@]}"; do echo "$l"; done) | crontab
+    echo -e "${GREEN}已删除${RESET}"
+}
+
+schedule_del_all(){
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+    echo -e "${GREEN}已清空全部定时任务${RESET}"
+}
+
+schedule_menu(){
+    while true; do
+        clear
+        echo -e "${GREEN}=== 定时任务管理 ===${RESET}"
+        echo -e "${GREEN}------------------------${RESET}"
+        list_cron
+        echo -e "${GREEN}------------------------${RESET}"
+        echo -e "${GREEN}1. 添加任务${RESET}"
+        echo -e "${GREEN}2. 删除任务${RESET}"
+        echo -e "${GREEN}3. 清空全部${RESET}"
+        echo -e "${GREEN}0. 返回${RESET}"
+        read -p "$(echo -e ${GREEN}选择: ${RESET})" c
+        case $c in
+            1) schedule_add ;;
+            2) schedule_del_one ;;
+            3) schedule_del_all ;;
+            0) break ;;
+        esac
+        read -p "按回车继续..."
+    done
+}
+
+#################################
+# 卸载
+#################################
+uninstall(){
+    schedule_del_all
+    rm -rf "$BASE_DIR"
+    rm -f /usr/local/bin/vpsbackup
+    echo -e "${GREEN}已完全卸载${RESET}"
+    exit
+}
+
+#################################
+# auto模式（cron专用）
+#################################
+if [ "$1" = "auto" ]; then
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    export HOME=/root
+    mkdir -p "$BACKUP_DIR"
+    load_conf
+    backup_dirs >> "$BASE_DIR/cron.log" 2>&1
+    exit
 fi
 
-echo -e "${GREEN}使用备份目录: $BACKUP_DIR${NC}"
+#################################
+# 菜单
+#################################
+while true; do
+    clear
+    load_conf
+    echo -e "${GREEN}=== 系统备份功能 ===${RESET}"
+    echo -e "${GREEN}------------------------${RESET}"
+    list_backups
+    echo -e "${GREEN}------------------------${RESET}"
+    echo -e "${YELLOW}格式:${COMPRESS} | 保留:${KEEP_DAYS}天| 目录:$BASE_DIR${RESET}"
+    echo -e "${GREEN}------------------------${RESET}"
+    echo -e "${GREEN}1. 创建备份${RESET}"
+    echo -e "${GREEN}2. 恢复备份${RESET}"
+    echo -e "${GREEN}3. Telegram设置${RESET}"
+    echo -e "${GREEN}4. 定时任务${RESET}"
+    echo -e "${GREEN}5. 压缩格式${RESET}"
+    echo -e "${GREEN}6. 保留天数${RESET}"
+    echo -e "${GREEN}7. 卸载${RESET}"
+    echo -e "${GREEN}8. 设置备份目录${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
 
-# ⭐ 注意：这里必须完整 if + fi
-if [ ! -d "$BACKUP_DIR" ]; then
-  echo -e "${RED}错误: 备份目录 $BACKUP_DIR 不存在!${NC}"
-  exit 1
-fi
-
-
-# 查找本地快照文件
-echo -e "${BLUE}正在查找本地系统快照...${NC}"
-SNAPSHOT_FILES=($(find $BACKUP_DIR -maxdepth 1 -type f -name "system_snapshot_*.tar.gz" | sort -r))
-
-if [ ${#SNAPSHOT_FILES[@]} -eq 0 ]; then
-  echo -e "${RED}错误: 未找到系统快照文件!${NC}"
-  exit 1
-fi
-
-# 显示可用快照列表
-echo -e "${YELLOW}可用的本地快照:${NC}"
-for i in "${!SNAPSHOT_FILES[@]}"; do
-  SNAPSHOT_PATH="${SNAPSHOT_FILES[$i]}"
-  SNAPSHOT_NAME=$(basename "$SNAPSHOT_PATH")
-  SNAPSHOT_SIZE=$(du -h "$SNAPSHOT_PATH" | cut -f1)
-  SNAPSHOT_DATE=$(date -r "$SNAPSHOT_PATH" "+%Y-%m-%d %H:%M:%S")
-  echo -e "$((i+1))) ${GREEN}$SNAPSHOT_NAME${NC} (${SNAPSHOT_SIZE}, ${SNAPSHOT_DATE})"
+    read -p "$(echo -e ${GREEN}请输入选项: ${RESET})" choice
+    case $choice in
+        1) create_backup ;;
+        2) restore_backup ;;
+        3) set_tg ;;
+        4) schedule_menu ;;
+        5) set_compress ;;
+        6) set_keep ;;
+        7) uninstall ;;
+        8) set_backup_dirs ;;
+        0) exit ;;
+    esac
+    read -p "回车继续..."
 done
-
-# 选择要恢复的快照
-read -p "请选择要恢复的快照编号 [1-${#SNAPSHOT_FILES[@]}]: " SNAPSHOT_CHOICE
-
-if ! [[ "$SNAPSHOT_CHOICE" =~ ^[0-9]+$ ]] || [ "$SNAPSHOT_CHOICE" -lt 1 ] || [ "$SNAPSHOT_CHOICE" -gt ${#SNAPSHOT_FILES[@]} ]; then
-  echo -e "${RED}错误: 无效的选择!${NC}"
-  exit 1
-fi
-
-SELECTED_SNAPSHOT="${SNAPSHOT_FILES[$((SNAPSHOT_CHOICE-1))]}"
-SNAPSHOT_NAME=$(basename "$SELECTED_SNAPSHOT")
-
-# 确认恢复
-echo -e "\n${YELLOW}准备恢复系统快照: ${GREEN}$SNAPSHOT_NAME${NC}"
-echo -e "${RED}警告: 恢复操作将把系统状态恢复到快照创建时的状态。此操作不可撤销!${NC}"
-echo -e "${RED}恢复后，快照创建时间点之后的所有更改将丢失!${NC}"
-read -p "是否继续? [y/N]: " CONFIRM
-if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-  echo -e "${YELLOW}恢复已取消.${NC}"
-  exit 0
-fi
-
-echo -e "\n${YELLOW}请选择恢复模式:${NC}"
-echo -e "1) ${GREEN}标准恢复(推荐)${NC} - 恢复所有系统文件，但保留网络配置"
-echo -e "2) ${GREEN}完全恢复${NC} - 完全恢复所有文件，包括网络配置（可能导致网络中断）"
-read -p "请选择恢复模式 [1-2]: " RESTORE_MODE
-
-if ! [[ "$RESTORE_MODE" =~ ^[1-2]$ ]]; then
-  echo -e "${RED}错误: 无效的选择!${NC}"
-  exit 1
-fi
-
-# 备份关键系统配置
-if [ "$RESTORE_MODE" -eq 1 ]; then
-  echo -e "\n${BLUE}备份当前网络和系统配置...${NC}"
-  mkdir -p /root/system_backup
-  cp /etc/fstab /root/system_backup/fstab.bak 2>/dev/null
-  cp /etc/network/interfaces /root/system_backup/interfaces.bak 2>/dev/null
-  cp -r /etc/netplan /root/system_backup/ 2>/dev/null
-  cp /etc/hostname /root/system_backup/hostname.bak 2>/dev/null
-  cp /etc/hosts /root/system_backup/hosts.bak 2>/dev/null
-  cp /etc/resolv.conf /root/system_backup/resolv.conf.bak 2>/dev/null
-fi
-
-# 停止关键服务
-echo -e "${BLUE}停止关键服务...${NC}"
-for service in nginx apache2 mysql docker; do
-  if systemctl is-active --quiet $service; then
-    echo "停止 $service 服务..."
-    systemctl stop $service 2>/dev/null
-  fi
-done
-
-# 执行恢复
-echo -e "${BLUE}正在恢复系统文件...${NC}"
-
-if [ "$RESTORE_MODE" -eq 1 ]; then
-  # 标准恢复 - 保留网络设置
-  tar -xzf "$SELECTED_SNAPSHOT" -C / \
-    --exclude="dev/*" \
-    --exclude="proc/*" \
-    --exclude="sys/*" \
-    --exclude="run/*" \
-    --exclude="tmp/*" \
-    --exclude="etc/fstab" \
-    --exclude="etc/hostname" \
-    --exclude="etc/hosts" \
-    --exclude="etc/network/*" \
-    --exclude="etc/netplan/*" \
-    --exclude="etc/resolv.conf" \
-    --exclude="backups/*"
-else
-  # 完全恢复 - 包括网络设置
-  tar -xzf "$SELECTED_SNAPSHOT" -C / \
-    --exclude="dev/*" \
-    --exclude="proc/*" \
-    --exclude="sys/*" \
-    --exclude="run/*" \
-    --exclude="tmp/*" \
-    --exclude="backups/*"
-fi
-
-RESTORE_RESULT=$?
-if [ $RESTORE_RESULT -ne 0 ]; then
-  echo -e "${RED}错误: 系统恢复失败!${NC}"
-  exit 1
-fi
-
-# 恢复网络配置(标准模式)
-if [ "$RESTORE_MODE" -eq 1 ]; then
-  echo -e "${BLUE}恢复网络配置...${NC}"
-  cp /root/system_backup/fstab.bak /etc/fstab 2>/dev/null
-  cp /root/system_backup/interfaces.bak /etc/network/interfaces 2>/dev/null
-  cp -r /root/system_backup/netplan/* /etc/netplan/ 2>/dev/null
-  cp /root/system_backup/hostname.bak /etc/hostname 2>/dev/null
-  cp /root/system_backup/hosts.bak /etc/hosts 2>/dev/null
-  cp /root/system_backup/resolv.conf.bak /etc/resolv.conf 2>/dev/null
-fi
-
-# 通知成功
-echo -e "${GREEN}系统快照恢复成功!${NC}"
-if [ "$RESTORE_MODE" -eq 1 ]; then
-  echo -e "${BLUE}已保留当前网络配置.${NC}"
-else
-  echo -e "${YELLOW}已恢复所有设置，包括网络配置.${NC}"
-fi
-
-# 提示重启
-echo -e "${YELLOW}系统需要重启以完成恢复.${NC}"
-read -p "是否立即重启系统? [y/N]: " REBOOT
-if [[ "$REBOOT" =~ ^[Yy]$ ]]; then
-  echo -e "${BLUE}系统将在5秒后重启...${NC}"
-  sleep 5
-  reboot
-else
-  echo -e "${YELLOW}请手动重启系统以完成恢复.${NC}"
-fi

@@ -127,7 +127,6 @@ backup_local() {
     tg_send "🗑️ 已清理 $RETAIN_DAYS 天以上旧备份"
 }
 
-
 # ================== 远程上传（上传目录内所有备份文件，不解压） ==================
 backup_remote_all() {
     [[ ! -d "$BACKUP_DIR" ]] && { echo -e "${RED}❌ 本地备份目录不存在: $BACKUP_DIR${RESET}"; return; }
@@ -138,8 +137,7 @@ backup_remote_all() {
     echo -e "${CYAN}📤 上传所有备份文件到远程: $REMOTE_USER@$REMOTE_IP:$REMOTE_DIR${RESET}"
 
     # 远程删除旧备份
-    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_IP" \
-        "mkdir -p \"$REMOTE_DIR\" && rm -f \"$REMOTE_DIR\"/*.tar.gz"
+    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_IP" "mkdir -p \"$REMOTE_DIR\" && rm -f \"$REMOTE_DIR\"/*.tar.gz"
 
     # 上传所有文件
     for FILE in "${FILE_LIST[@]}"; do
@@ -149,10 +147,6 @@ backup_remote_all() {
 
     echo -e "${GREEN}✅ 所有备份文件上传完成${RESET}"
 }
-
-
-
-
 
 # ================== 恢复 ==================
 restore() {
@@ -216,7 +210,6 @@ configure_settings_menu() {
         echo -e "${GREEN}6. 远程服务器用户名 (当前: $REMOTE_USER)${RESET}"
         echo -e "${GREEN}7. 远程服务器 IP (当前: $REMOTE_IP)${RESET}"
         echo -e "${GREEN}8. 远程备份目录 (当前: $REMOTE_DIR)${RESET}"
-        echo -e "${GREEN}9. 自动备份目录列表 (当前: $BACKUP_DIRS)${RESET}"
         echo -e "${GREEN}0. 返回上级菜单${RESET}"
 
         read -rp "请选择操作: " choice
@@ -229,7 +222,6 @@ configure_settings_menu() {
             6) read -rp "请输入远程服务器用户名: " input; [[ -n "$input" ]] && REMOTE_USER="$input" ;;
             7) read -rp "请输入远程服务器 IP: " input; [[ -n "$input" ]] && REMOTE_IP="$input" ;;
             8) read -rp "请输入远程备份目录: " input; [[ -n "$input" ]] && REMOTE_DIR="$input" ;;
-            9) read -rp "请输入要自动备份的目录列表（空格分隔）: " input; [[ -n "$input" ]] && BACKUP_DIRS="$input" ;;
             0) save_config; load_config; break ;;
             *) echo -e "${RED}❌ 无效选择${RESET}" ;;
         esac
@@ -328,22 +320,24 @@ if [[ "$1" == "auto" ]]; then
     load_config
     mkdir -p "$BACKUP_DIR"
 
-    for PROJECT_DIR in $BACKUP_DIRS; do
-        [[ ! -d "$PROJECT_DIR" ]] && { echo -e "${RED}❌ 目录不存在: $PROJECT_DIR${RESET}"; continue; }
+    DIRS=()
+    [[ -n "$2" ]] && IFS=' ' read -r -a DIRS <<< "$2"
+    [[ ${#DIRS[@]} -eq 0 ]] && DIRS=("$BACKUP_DIR")
 
-        # 使用固定文件名覆盖旧备份
-        BACKUP_FILE="$BACKUP_DIR/$(basename "$PROJECT_DIR")_backup.tar.gz"
-        echo -e "${CYAN}📦 自动备份 $PROJECT_DIR → $BACKUP_FILE${RESET}"
+    for PROJECT_DIR in "${DIRS[@]}"; do
+        [[ ! -d "$PROJECT_DIR" ]] && continue
+        TIMESTAMP=$(date +%F_%H-%M-%S)
+        BACKUP_FILE="$BACKUP_DIR/$(basename "$PROJECT_DIR")_backup_$TIMESTAMP.tar.gz"
         tar czf "$BACKUP_FILE" -C "$PROJECT_DIR" . >> "$LOG_FILE" 2>&1
         tg_send "自动备份完成: $(basename "$PROJECT_DIR") → $BACKUP_FILE"
     done
 
-    # 清理过期备份（可选，如果只保留最新可以注释掉）
-    # find "$BACKUP_DIR" -type f -name "*.tar.gz" -mtime +"$RETAIN_DAYS" -exec rm -f {} \;
-    # tg_send "🗑️ 自动清理 $RETAIN_DAYS 天以上旧备份"
+    find "$BACKUP_DIR" -type f -name "*.tar.gz" -mtime +"$RETAIN_DAYS" -exec rm -f {} \;
+    tg_send "🗑️ 自动清理 $RETAIN_DAYS 天以上旧备份"
 
-    # 上传远程（覆盖旧备份）
-    [[ -n "$REMOTE_USER" && -n "$REMOTE_IP" ]] && backup_remote_all
+    if [[ -n "$REMOTE_USER" && -n "$REMOTE_IP" ]]; then
+        backup_remote_all
+    fi
 
     exit 0
 fi

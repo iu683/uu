@@ -1,361 +1,375 @@
 #!/bin/bash
-set -o pipefail
+#################################
+# 首次运行安装（下载到 /opt）
+#################################
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/qq.sh"
+SCRIPT_PATH="/opt/vpsbackup/vpsbackup.sh"
 
+if [ ! -f "$SCRIPT_PATH" ]; then
+    echo -e "${GREEN}首次运行，下载脚本到本地...${RESET}"
+
+    mkdir -p /opt/vpsbackup
+
+    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL" || {
+        echo -e "${RED}下载失败${RESET}"
+        exit 1
+    }
+
+    chmod +x "$SCRIPT_PATH"
+
+    echo -e "${GREEN}安装完成: $SCRIPT_PATH${RESET}"
+
+    exec bash "$SCRIPT_PATH" "$@"
+fi
 
 #################################
-# 环境变量 & 配置
+# 颜色
 #################################
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export HOME=/root   # ⭐ 确保 cron 下 ~ 指向 root
-
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/rsync_task"
-SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/qq.sh"
-SCRIPT_PATH="$BASE_DIR/rsync_manager.sh"
-KEY_DIR="$BASE_DIR/keys"
-LOG_DIR="$BASE_DIR/logs"
-CONFIG_FILE="$BASE_DIR/rsync_tasks.conf"
-TG_CONFIG="$BASE_DIR/.tg.conf"
-BIN_LINK_DIR="/usr/local/bin"
-
-mkdir -p "$BASE_DIR" "$KEY_DIR" "$LOG_DIR"
-touch "$CONFIG_FILE"
+#################################
+# 安装目录 & 备份目录
+#################################
+BASE_DIR="/opt/vpsbackup"
+INSTALL_PATH="$BASE_DIR/vpsbackup.sh"
+BACKUP_DIR="$BASE_DIR/backups"
+TG_CONF="$BASE_DIR/.tg.conf"
+CONF_FILE="$BASE_DIR/.backup.conf"
+mkdir -p "$BACKUP_DIR"
 
 #################################
-# 稳定统计任务数量（修复 all 错误核心）
+# 默认配置
 #################################
-task_count() {
-    awk 'NF{c++} END{print c+0}' "$CONFIG_FILE"
+COMPRESS="tar"
+KEEP_DAYS=7
+SERVER_NAME=$(hostname)
+BACKUP_LIST="/opt"
+
+#################################
+# 读取/保存配置
+#################################
+load_conf(){
+    [ -f "$CONF_FILE" ] && source "$CONF_FILE"
+    [ -f "$TG_CONF" ] && source "$TG_CONF"
+    IFS=' ' read -r -a BACKUP_ARRAY <<< "${BACKUP_LIST:-/opt}"
+}
+
+save_conf(){
+cat > "$CONF_FILE" <<EOF
+COMPRESS="$COMPRESS"
+KEEP_DAYS=$KEEP_DAYS
+SERVER_NAME="$SERVER_NAME"
+BACKUP_LIST="$BACKUP_LIST"
+EOF
 }
 
 #################################
-# 安装依赖
+# Telegram通知
 #################################
-install_dep() {
-    for p in rsync ssh sshpass curl tar; do
-        if ! command -v $p &>/dev/null; then
-            echo -e "${YELLOW}安装依赖: $p${RESET}"
-            DEBIAN_FRONTEND=noninteractive apt-get update -qq
-            DEBIAN_FRONTEND=noninteractive apt-get install -y $p >/dev/null 2>&1
+tg_send(){
+    [ -z "$BOT_TOKEN" ] && return
+
+    curl -s -X POST \
+    "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+    -d chat_id="$CHAT_ID" \
+    -d text="$1" >/dev/null 2>&1
+}
+
+#################################
+# 日志
+#################################
+log(){
+    echo "$(date '+%F %T') $1" >> "$BASE_DIR/backup.log"
+}
+
+#################################
+# 清理旧备份
+#################################
+clean_old(){
+    if [ "$COMPRESS" = "tar" ]; then
+        find "$BACKUP_DIR" -name "*.tar.gz" -mtime +$KEEP_DAYS -delete 2>/dev/null
+    else
+        find "$BACKUP_DIR" -name "*.zip" -mtime +$KEEP_DAYS -delete 2>/dev/null
+    fi
+}
+
+#################################
+# 备份核心（支持批量目录）
+#################################
+backup_dirs(){
+    load_conf
+    TS=$(date +%Y%m%d%H%M%S)
+
+    dirs=("$@")
+    [ ${#dirs[@]} -eq 0 ] && dirs=("${BACKUP_ARRAY[@]}")
+
+    for p in "${dirs[@]}"; do
+        [ ! -d "$p" ] && continue
+        name=$(basename "$p")
+        rel="${p#/}"
+
+        if [ "$COMPRESS" = "tar" ]; then
+            file="${name}_${TS}.tar.gz"
+            tar -czf "$BACKUP_DIR/$file" -C / "$rel"
+        else
+            file="${name}_${TS}.zip"
+            (cd / && zip -rq "$BACKUP_DIR/$file" "$rel")
+        fi
+
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}完成: $file${RESET}"
+            log "备份成功: $file"
+            tg_send "🟢 备份成功
+服务器: $SERVER_NAME
+目录: $p
+文件: $file"
+        else
+            log "备份失败: $file"
+            tg_send "🔴 备份失败
+服务器: $SERVER_NAME
+目录: $p"
+        fi
+    done
+
+    clean_old
+}
+
+#################################
+# 创建备份
+#################################
+create_backup(){
+    read -p "目录(空格分隔，回车使用默认): " input
+    if [ -z "$input" ]; then
+        backup_dirs
+    else
+        IFS=' ' read -r -a arr <<< "$input"
+        backup_dirs "${arr[@]}"
+    fi
+}
+
+#################################
+# 列出备份
+#################################
+list_backups(){
+    echo -e "${YELLOW}备份列表:${RESET}"
+    ls -1 "$BACKUP_DIR" 2>/dev/null
+}
+
+#################################
+# 批量恢复
+#################################
+restore_backup(){
+    shopt -s nullglob
+    files=($(ls -1t "$BACKUP_DIR"/*.{tar.gz,zip} 2>/dev/null))
+    [ ${#files[@]} -eq 0 ] && return
+
+    for i in "${!files[@]}"; do
+        echo "$i) $(basename "${files[$i]}")"
+    done
+
+    read -p "选择编号(空格分隔多个): " input
+    IFS=' ' read -r -a choose <<< "$input"
+
+    for idx in "${choose[@]}"; do
+        f="${files[$idx]}"
+        if [[ "$f" == *.tar.gz ]]; then
+            tar -xzf "$f" -C /
+        else
+            unzip -oq "$f" -d /
         fi
     done
 }
-install_dep
 
 #################################
-# Telegram
+# Telegram设置
 #################################
-send_tg() {
-    [[ -f "$TG_CONFIG" ]] || return
-    . "$TG_CONFIG"   # ⭐ cron 下也能读到变量
-    msg="$1"
-    curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-        -d chat_id="$CHAT_ID" \
-        -d text="[$VPS_NAME] $msg" >/dev/null 2>&1
-}
+set_tg(){
+    read -p "BOT_TOKEN: " BOT_TOKEN
+    read -p "CHAT_ID: " CHAT_ID
+    read -p "服务器名称: " SERVER_NAME
 
-setup_tg() {
-    read -p "VPS名称: " VPS_NAME
-    read -p "Bot Token: " BOT_TOKEN
-    read -p "Chat ID: " CHAT_ID
-    cat > "$TG_CONFIG" <<EOF
-VPS_NAME="$VPS_NAME"
+cat > "$TG_CONF" <<EOF
 BOT_TOKEN="$BOT_TOKEN"
 CHAT_ID="$CHAT_ID"
+SERVER_NAME="$SERVER_NAME"
 EOF
-    chmod 600 "$TG_CONFIG"
-    echo -e "${GREEN}TG配置已保存${RESET}"
+
+    save_conf
 }
 
 #################################
-# SSH 密钥管理
+# 压缩格式/保留天数
 #################################
-generate_and_setup_ssh() {
-    local remote="$1"
-    local port="$2"
-
-    KEY_FILE="$KEY_DIR/id_rsa_rsync"
-    PUB_FILE="$KEY_FILE.pub"
-
-    # ===== 生成密钥 =====
-    if [[ ! -f "$KEY_FILE" ]]; then
-        echo -e "${YELLOW}未检测到本地 SSH 密钥，正在生成...${RESET}"
-        ssh-keygen -t rsa -b 4096 -f "$KEY_FILE" -N "" -q
-        echo -e "${GREEN}✅ 本地 SSH 密钥生成完成${RESET}"
-    fi
-
-    PUBKEY_CONTENT=$(cat "$PUB_FILE")
-
-    echo -e "${YELLOW}第一次连接需要输入远程密码${RESET}"
-
-    # ⭐⭐⭐ 关键：所有 ssh/known_hosts 操作必须关闭 set -e
-    set +e
-
-    # 清理旧指纹（不存在也不会退出）
-    ssh-keygen -f "$HOME/.ssh/known_hosts" -R "${remote#*@}" >/dev/null 2>&1
-
-    # 首次连接自动接受 host key
-    ssh -o StrictHostKeyChecking=no -p "$port" "$remote" \
-        "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
-
-    ssh -o StrictHostKeyChecking=no -p "$port" "$remote" \
-        "touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
-
-    ssh -o StrictHostKeyChecking=no -p "$port" "$remote" \
-        "grep -Fxq '$PUBKEY_CONTENT' ~/.ssh/authorized_keys || echo '$PUBKEY_CONTENT' >> ~/.ssh/authorized_keys"
-
-    # 测试免密（失败也不能退出）
-    ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" -p "$port" "$remote" "echo ok" >/dev/null 2>&1
-    ok=$?
-
-    set -e
-    # ⭐⭐⭐ 恢复
-
-    if [[ $ok -eq 0 ]]; then
-        echo -e "${GREEN}✅ 公钥写入成功，可免密码登录 $remote${RESET}"
-    else
-        echo -e "${RED}❌ 公钥写入失败，请检查 SSH 或密码是否正确${RESET}"
-    fi
-}
-
-
-#################################
-# 任务管理
-#################################
-list_tasks() {
-    [[ ! -s "$CONFIG_FILE" ]] && { echo "暂无任务"; return; }
-    awk -F'|' '{printf "%d) %s  %s -> %s [%s]\n",NR,$1,$2,$3,$5}' "$CONFIG_FILE"
-}
-
-add_task() {
-    read -p "任务名称: " name
-    read -p "本地目录: " local
-    read -p "远程目录: " remote_path
-    read -p "远程用户@IP: " remote
-    read -p "端口(默认22): " port
-    port=${port:-22}
-
-    echo "认证方式: 1密码 2密钥"
+set_compress(){
+    echo "1 tar.gz"
+    echo "2 zip"
     read -p "选择: " c
-    if [[ $c == 1 ]]; then
-        read -s -p "密码: " secret; echo
-        auth="password"
-    else
-        generate_and_setup_ssh "$remote" "$port"
-        secret="$KEY_DIR/id_rsa_rsync"
-        auth="key"
-    fi
-
-    echo "$name|$local|$remote|$remote_path|$port|$auth|$secret" >> "$CONFIG_FILE"
+    [ "$c" = 2 ] && COMPRESS="zip" || COMPRESS="tar"
+    save_conf
 }
 
-delete_task() {
-    read -p "编号: " n
-    sed -i "${n}d" "$CONFIG_FILE"
+set_keep(){
+    read -p "保留天数: " KEEP_DAYS
+    save_conf
 }
 
 #################################
-# 压缩同步
+# 设置备份目录
 #################################
-run_task() {
-    direction="$1"
-    num="$2"
-
-    if [[ -z "$num" ]]; then
-        read -p "编号: " num
-    fi
-
-    task=$(sed -n "${num}p" "$CONFIG_FILE" | tr -d '\r\n')
-
-    if [[ -z "$task" ]]; then
-        echo "任务编号 $num 不存在" >> "$LOG_DIR/error.log"
-        send_tg "任务 $num 不存在 ❌"
-        return 1
-    fi
-
-    IFS='|' read -r name local remote remote_path port auth secret <<< "$task"
-    archive="/tmp/sync_task_${name}.tar.gz"
-
-    echo -e "${YELLOW}开始同步 [$name] ...${RESET}"
-
-    if [[ "$direction" == "push" ]]; then
-
-        tar -czf "$archive" -C "$(dirname "$local")" "$(basename "$local")" || return 1
-
-        if [[ "$auth" == "password" ]]; then
-            sshpass -p "$secret" ssh -p $port $remote "mkdir -p $remote_path"
-            sshpass -p "$secret" rsync -az -e "ssh -p $port" "$archive" "$remote:$remote_path/"
-        else
-            ssh -i "$secret" -p $port $remote "mkdir -p $remote_path"
-            rsync -az -e "ssh -i $secret -p $port" "$archive" "$remote:$remote_path/"
-        fi
-
-        echo -e "${GREEN}✅ [$name] 推送完成${RESET}"
-        send_tg "$name 推送完成 ✅"
-        return 0
-    else
-
-        if [[ "$auth" == "password" ]]; then
-            sshpass -p "$secret" rsync -az -e "ssh -p $port" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
-        else
-            rsync -az -e "ssh -i $secret -p $port" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
-        fi
-
-        rm -rf "$local"
-        mkdir -p "$local"
-        tar -xzf "/tmp/$(basename "$archive")" -C "$(dirname "$local")"
-
-        echo -e "${GREEN}✅ [$name] 拉取完成${RESET}"
-        send_tg "$name 拉取完成 ✅"
-    fi
-
-    return 0
+set_backup_dirs(){
+    read -p "输入要备份的目录（空格分隔）: " input
+    BACKUP_LIST="$input"
+    save_conf
+    echo -e "${GREEN}备份目录已保存${RESET}"
 }
 
+#################################
+# 定时任务管理
+#################################
+CRON_TAG="# VPSBACKUP_AUTO"
 
-batch_run() {
-    read -p "批量任务编号(多个逗号): " nums
-    if [[ "$nums" == "all" ]]; then
-        count=$(task_count)
-        nums=$(seq 1 $count)
-    fi
-    OLDIFS=$IFS
-    IFS=','
-
-    for n in $nums; do
-        n=$(echo "$n" | tr -d '\r\n ')
-        run_task "$1" "$n"
+list_cron(){
+    mapfile -t lines < <(crontab -l 2>/dev/null | grep "$CRON_TAG")
+    [ ${#lines[@]} -eq 0 ] && { echo -e "${YELLOW}暂无定时任务${RESET}"; return; }
+    for i in "${!lines[@]}"; do
+        cron=$(echo "${lines[$i]}" | sed "s|$INSTALL_PATH auto $CRON_TAG||")
+        echo "$i) $cron"
     done
-
-    IFS=$OLDIFS
 }
 
-#################################
-# 定时任务
-#################################
-schedule_task() {
-    echo -e "${GREEN}定时任务模板:${RESET}"
-    echo -e "${GREEN}1) 每天0点${RESET}"
-    echo -e "${GREEN}2) 每周一0点${RESET}"
-    echo -e "${GREEN}3) 每月1号0点${RESET}"
-    echo -e "${GREEN}4) 自定义cron${RESET}"
-    read -p "选择模板: " tmpl
-    case $tmpl in
+schedule_add(){
+    echo -e "${GREEN}1 每天0点${RESET}"
+    echo -e "${GREEN}2 每周一0点${RESET}"
+    echo -e "${GREEN}3 每月1号${RESET}"
+    echo -e "${GREEN}4 自定义cron${RESET}"
+
+    read -p "选择: " t
+    case $t in
         1) cron="0 0 * * *" ;;
         2) cron="0 0 * * 1" ;;
         3) cron="0 0 1 * *" ;;
         4) read -p "cron表达式: " cron ;;
-        *) echo -e "${RED}无效选择${RESET}"; return ;;
+        *) return ;;
     esac
 
-    read -p "任务编号(多个逗号): " nums
-    if [[ "$nums" == "all" ]]; then
-        count=$(task_count)
-        nums=$(seq 1 $count)
+    read -p "备份目录(空格分隔, 留空使用默认): " dirs
+    if [ -n "$dirs" ]; then
+        # cron 传递目录作为参数
+        (crontab -l 2>/dev/null; \
+         echo "$cron $INSTALL_PATH auto \"$dirs\" >> $BASE_DIR/cron.log 2>&1 $CRON_TAG") | crontab -
+    else
+        # 默认
+        (crontab -l 2>/dev/null; \
+         echo "$cron $INSTALL_PATH auto >> $BASE_DIR/cron.log 2>&1 $CRON_TAG") | crontab -
     fi
 
-    OLDIFS=$IFS
-    IFS=','
-    for n in $nums; do
-        n=$(echo "$n" | tr -d '\r\n ')
-        job="$cron /bin/bash $SCRIPT_PATH auto push $n >> $LOG_DIR/cron_$n.log 2>&1 # rsync_$n"
-        crontab -l 2>/dev/null | grep -v "# rsync_$n" | { cat; echo "$job"; } | crontab -
-        echo -e "${GREEN}✅ 任务编号 $n 已添加定时任务${RESET}"
-    done
-    IFS=$OLDIFS
+    echo -e "${GREEN}添加成功，cron日志: $BASE_DIR/cron.log${RESET}"
 }
 
-delete_schedule() {
-    read -p "删除任务编号(多个逗号): " nums
-    if [[ "$nums" == "all" ]]; then
-        crontab -l 2>/dev/null | grep -v "# rsync_" | crontab -
-        echo -e "${YELLOW}✅ 已删除全部定时任务${RESET}"
-        return
-    fi
-    OLDIFS=$IFS
-    IFS=','
-    for n in $nums; do
-        n=$(echo "$n" | tr -d '\r\n ')
-        crontab -l 2>/dev/null | grep -v "# rsync_$n" | crontab -
-        echo -e "${YELLOW}✅ 已删除任务编号 $n 的定时任务${RESET}"
+
+schedule_del_one(){
+    mapfile -t lines < <(crontab -l 2>/dev/null | grep "$CRON_TAG")
+    [ ${#lines[@]} -eq 0 ] && return
+    list_cron
+    read -p "输入编号: " idx
+    unset 'lines[idx]'
+    (crontab -l 2>/dev/null | grep -v "$CRON_TAG"; for l in "${lines[@]}"; do echo "$l"; done) | crontab
+    echo -e "${GREEN}已删除${RESET}"
+}
+
+schedule_del_all(){
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+    echo -e "${GREEN}已清空全部定时任务${RESET}"
+}
+
+schedule_menu(){
+    while true; do
+        clear
+        echo -e "${GREEN}=== 定时任务管理 ===${RESET}"
+        echo -e "${GREEN}------------------------${RESET}"
+        list_cron
+        echo -e "${GREEN}------------------------${RESET}"
+        echo -e "${GREEN}1. 添加任务${RESET}"
+        echo -e "${GREEN}2. 删除任务${RESET}"
+        echo -e "${GREEN}3. 清空全部${RESET}"
+        echo -e "${GREEN}0. 返回${RESET}"
+        read -p "$(echo -e ${GREEN}选择: ${RESET})" c
+        case $c in
+            1) schedule_add ;;
+            2) schedule_del_one ;;
+            3) schedule_del_all ;;
+            0) break ;;
+        esac
+        read -p "按回车继续..."
     done
-    IFS=$OLDIFS
 }
 
 #################################
-# 更新 & 卸载
+# 卸载
 #################################
-update_self() {
-    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
-    chmod +x "$SCRIPT_PATH"
-    echo -e "${GREEN}已更新脚本${RESET}"
-}
-
-uninstall_self() {
-    crontab -l 2>/dev/null | grep -v "rsync_" | crontab - || true
+uninstall(){
+    schedule_del_all
     rm -rf "$BASE_DIR"
-    echo -e "${RED}已卸载脚本${RESET}"
+    rm -f /usr/local/bin/vpsbackup
+    echo -e "${GREEN}已完全卸载${RESET}"
     exit
 }
 
 #################################
-# Cron 自动运行
+# auto模式（cron专用）
 #################################
-if [[ "$1" == "auto" ]]; then
-    run_task "$2" "$3"
+if [ "$1" = "auto" ]; then
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    export HOME=/root
+    mkdir -p "$BACKUP_DIR"
+    load_conf
+
+    if [ "$2" ]; then
+        # 传入自定义目录
+        IFS=' ' read -r -a dirs <<< "$2"
+        backup_dirs "${dirs[@]}" >> "$BASE_DIR/cron.log" 2>&1
+    else
+        # 默认目录
+        backup_dirs >> "$BASE_DIR/cron.log" 2>&1
+    fi
     exit
 fi
 
-#################################
-# 首次运行安装快捷命令
-#################################
-if [ ! -f "$SCRIPT_PATH" ]; then
-    echo -e "${GREEN}首次运行，下载脚本到本地...${RESET}"
-    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
-    chmod +x "$SCRIPT_PATH"
-    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/s"
-    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/S"
-    echo -e "${GREEN}✅ 快捷键已添加：s 或 S 可快速启动${RESET}"
-fi
 
 #################################
-# 主菜单
+# 菜单
 #################################
 while true; do
     clear
-    echo -e "${GREEN}===== Rsync 同步管理器 =====${RESET}"
-    list_tasks
-    echo
-    echo -e "${GREEN} 1) 添加同步任务${RESET}"
-    echo -e "${GREEN} 2) 删除同步任务${RESET}"
-    echo -e "${GREEN} 3) 推送同步${RESET}"
-    echo -e "${GREEN} 4) 拉取同步${RESET}"
-    echo -e "${GREEN} 5) 批量推送同步${RESET}"
-    echo -e "${GREEN} 6) 批量拉取同步${RESET}"
-    echo -e "${GREEN} 7) 添加定时任务${RESET}"
-    echo -e "${GREEN} 8) 删除定时任务${RESET}"
-    echo -e "${GREEN} 9) Telegram设置${RESET}"
-    echo -e "${GREEN}10) 更新脚本${RESET}"
-    echo -e "${GREEN}11) 卸载脚本${RESET}"
-    echo -e "${GREEN} 0) 退出${RESET}"
-    read -p "$(echo -e ${GREEN}请选择操作: ${RESET}) " c
-    case $c in
-        1) add_task ;;
-        2) delete_task ;;
-        3) run_task push ;;
-        4) run_task pull ;;
-        5) batch_run push ;;
-        6) batch_run pull ;;
-        7) schedule_task ;;
-        8) delete_schedule ;;
-        9) setup_tg ;;
-        10) update_self ;;
-        11) uninstall_self ;;
+    load_conf
+    echo -e "${GREEN}=== 系统备份功能 ===${RESET}"
+    echo -e "${GREEN}------------------------${RESET}"
+    list_backups
+    echo -e "${GREEN}------------------------${RESET}"
+    echo -e "${YELLOW}格式:${COMPRESS} | 保留:${KEEP_DAYS}天| 目录:$BASE_DIR${RESET}"
+    echo -e "${GREEN}------------------------${RESET}"
+    echo -e "${GREEN}1. 创建备份${RESET}"
+    echo -e "${GREEN}2. 恢复备份${RESET}"
+    echo -e "${GREEN}3. Telegram设置${RESET}"
+    echo -e "${GREEN}4. 定时任务${RESET}"
+    echo -e "${GREEN}5. 压缩格式${RESET}"
+    echo -e "${GREEN}6. 保留天数${RESET}"
+    echo -e "${GREEN}7. 卸载${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+
+    read -p "$(echo -e ${GREEN}请输入选项: ${RESET})" choice
+    case $choice in
+        1) create_backup ;;
+        2) restore_backup ;;
+        3) set_tg ;;
+        4) schedule_menu ;;
+        5) set_compress ;;
+        6) set_keep ;;
+        7) uninstall ;;
         0) exit ;;
     esac
-    read -p "$(echo -e ${GREEN}按回车继续...${RESET}) "
+    read -p "回车继续..."
 done

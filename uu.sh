@@ -99,6 +99,7 @@ uninstall_rclone() {
     sudo rm -rf "$BASE_DIR"
 
     echo -e "${GREEN}Rclone 已彻底卸载完成${RESET}"
+    exit 0
     }
 
 config_rclone() { rclone config; }

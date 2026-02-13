@@ -1,5 +1,8 @@
 #!/bin/bash
 
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+
 # ================== 配色 ==================
 GREEN="\033[32m"
 CYAN="\033[36m"
@@ -9,41 +12,39 @@ RESET="\033[0m"
 
 # ================== 全局变量 ==================
 BASE_DIR="/opt/docker_backups"
+SCRIPT_DIR="$BASE_DIR/scripts"
+BACKUP_DIR="$BASE_DIR/data"
 CONFIG_FILE="$BASE_DIR/config.sh"
 LOG_FILE="$BASE_DIR/cron.log"
-SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/zz.sh"
-REMOTE_SCRIPT_PATH="$BASE_DIR/remote_script.sh"
+REMOTE_SCRIPT_PATH="$SCRIPT_DIR/remote_script.sh"
 SSH_KEY="$HOME/.ssh/id_rsa_vpsbackup"
 INSTALL_PATH="$(realpath "$0")"
 CRON_TAG="#docker_backup_cron"
 
 # 默认配置
-BACKUP_DIR_DEFAULT="$BASE_DIR"
 RETAIN_DAYS_DEFAULT=7
 TG_TOKEN_DEFAULT=""
 TG_CHAT_ID_DEFAULT=""
 SERVER_NAME_DEFAULT="$(hostname)"
 REMOTE_USER_DEFAULT=""
 REMOTE_IP_DEFAULT=""
-REMOTE_DIR_DEFAULT="$BASE_DIR"
+REMOTE_DIR_DEFAULT="$BACKUP_DIR"
 
-mkdir -p "$BASE_DIR"
+mkdir -p "$SCRIPT_DIR" "$BACKUP_DIR"
 
-# ================== 首次运行自动下载远程脚本 ==================
+# ================== 首次运行下载远程脚本 ==================
 if [[ ! -f "$REMOTE_SCRIPT_PATH" ]]; then
     echo -e "${CYAN}📥 首次运行，下载远程脚本...${RESET}"
-    mkdir -p "$(dirname "$REMOTE_SCRIPT_PATH")"
-    curl -fsSL "$SCRIPT_URL" -o "$REMOTE_SCRIPT_PATH"
+    curl -fsSL "https://raw.githubusercontent.com/iu683/uu/main/zz.sh" -o "$REMOTE_SCRIPT_PATH"
     chmod +x "$REMOTE_SCRIPT_PATH"
     echo -e "${GREEN}✅ 远程脚本已下载到 $REMOTE_SCRIPT_PATH${RESET}"
-
     exec "$REMOTE_SCRIPT_PATH"
 fi
 
 # ================== 配置加载/保存 ==================
 load_config() {
     [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
-    BACKUP_DIR=${BACKUP_DIR:-$BACKUP_DIR_DEFAULT}
+    BACKUP_DIR=${BACKUP_DIR:-$BACKUP_DIR}
     RETAIN_DAYS=${RETAIN_DAYS:-$RETAIN_DAYS_DEFAULT}
     TG_TOKEN=${TG_TOKEN:-$TG_TOKEN_DEFAULT}
     TG_CHAT_ID=${TG_CHAT_ID:-$TG_CHAT_ID_DEFAULT}
@@ -51,9 +52,6 @@ load_config() {
     REMOTE_USER=${REMOTE_USER:-$REMOTE_USER_DEFAULT}
     REMOTE_IP=${REMOTE_IP:-$REMOTE_IP_DEFAULT}
     REMOTE_DIR=${REMOTE_DIR:-$REMOTE_DIR_DEFAULT}
-
-    BOT_TOKEN="$TG_TOKEN"
-    CHAT_ID="$TG_CHAT_ID"
 }
 
 save_config() {
@@ -76,10 +74,11 @@ load_config
 # ================== Telegram通知 ==================
 tg_send() {
     local MESSAGE="$1"
-    [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]] && return
-    curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
-        -d chat_id="$CHAT_ID" \
-        -d text "[$SERVER_NAME] $MESSAGE" >/dev/null 2>&1
+    [[ -z "$TG_TOKEN" || -z "$TG_CHAT_ID" ]] && return
+    local SERVER=${SERVER_NAME:-localhost}
+    curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+        --data-urlencode "chat_id=$TG_CHAT_ID" \
+        --data-urlencode "text=[$SERVER] $MESSAGE" >/dev/null 2>&1
 }
 
 # ================== SSH密钥自动生成 ==================
@@ -125,34 +124,30 @@ backup_local() {
     done
 
     find "$BACKUP_DIR" -type f -name "*.tar.gz" -mtime +"$RETAIN_DAYS" -exec rm -f {} \;
-    echo -e "${YELLOW}🗑️ 已清理超过 $RETAIN_DAYS 天的旧备份${RESET}"
     tg_send "🗑️ 已清理 $RETAIN_DAYS 天以上旧备份"
 }
 
-# ================== 远程上传 ==================
-backup_remote() {
-    [[ ! -d "$BACKUP_DIR" ]] && { echo -e "${RED}❌ 目录不存在: $BACKUP_DIR${RESET}"; return; }
-    FILE_LIST=("$BACKUP_DIR"/*.tar.gz)
-    [[ ${#FILE_LIST[@]} -eq 0 ]] && { echo -e "${RED}❌ 没有备份文件${RESET}"; return; }
+# ================== 远程上传（只保留最新） ==================
+backup_remote_latest() {
+    [[ ! -d "$BACKUP_DIR" ]] && { echo -e "${RED}❌ 本地备份目录不存在: $BACKUP_DIR${RESET}"; return; }
 
-    mkdir -p "$BASE_DIR/tmp_upload"
-    TEMP_PACKAGE="$BASE_DIR/tmp_upload/backup_upload_$(date +%F_%H-%M-%S).tar.gz"
+    # 获取最新备份文件
+    LATEST_FILE=$(ls -t "$BACKUP_DIR"/*.tar.gz 2>/dev/null | head -n1)
+    [[ -z "$LATEST_FILE" ]] && { echo -e "${RED}❌ 找不到最新备份${RESET}"; return; }
 
-    echo -e "${CYAN}📦 打包所有备份文件...${RESET}"
-    tar czf "$TEMP_PACKAGE" -C "$BACKUP_DIR" .
+    echo -e "${CYAN}📤 上传最新备份到远程: $REMOTE_USER@$REMOTE_IP:$REMOTE_DIR${RESET}"
 
-    echo -e "${CYAN}📤 上传到远程 $REMOTE_USER@$REMOTE_IP:$REMOTE_DIR ...${RESET}"
-    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_IP" "mkdir -p \"$REMOTE_DIR\""
-    scp -i "$SSH_KEY" "$TEMP_PACKAGE" "$REMOTE_USER@$REMOTE_IP:$REMOTE_DIR/"
-
-    echo -e "${CYAN}📂 远程解压...${RESET}"
+    # 远程先删除旧备份，只保留最新
     ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_IP" \
-        "tar xzf \"$REMOTE_DIR/$(basename "$TEMP_PACKAGE")\" -C \"$REMOTE_DIR\" && rm -f \"$REMOTE_DIR/$(basename "$TEMP_PACKAGE")\""
+        "mkdir -p \"$REMOTE_DIR\" && rm -f \"$REMOTE_DIR\"/*.tar.gz"
 
-    echo -e "${GREEN}✅ 远程上传完成${RESET}"
-    tg_send "远程备份上传完成: $(basename "$TEMP_PACKAGE") 到 $REMOTE_IP"
-    rm -f "$TEMP_PACKAGE"
+    # 上传最新备份
+    scp -i "$SSH_KEY" "$LATEST_FILE" "$REMOTE_USER@$REMOTE_IP:$REMOTE_DIR/" >> "$LOG_FILE" 2>&1
+
+    # Telegram通知
+    tg_send "最新备份上传完成: $(basename "$LATEST_FILE") → $REMOTE_IP"
 }
+
 
 # ================== 恢复 ==================
 restore() {
@@ -168,10 +163,12 @@ restore() {
         echo -e "${GREEN}$((i+1)). $(basename "${FILE_LIST[$i]}")${RESET}"
     done
 
-    read -rp "请输入要恢复的序号（空格分隔，all 全选）: " SELECTION
+    read -rp "请输入要恢复的序号（空格分隔，all 全选，latest 最新备份）: " SELECTION
     BACKUP_FILES=()
     if [[ "$SELECTION" == "all" ]]; then
         BACKUP_FILES=("${FILE_LIST[@]}")
+    elif [[ "$SELECTION" == "latest" ]]; then
+        BACKUP_FILES=($(ls -t "$BACKUP_DIR"/*.tar.gz | head -n1))
     else
         for num in $SELECTION; do
             [[ $num =~ ^[0-9]+$ ]] && (( num>=1 && num<=${#FILE_LIST[@]} )) && BACKUP_FILES+=("${FILE_LIST[$((num-1))]}") || echo -e "${RED}❌ 无效序号: $num${RESET}"
@@ -201,26 +198,22 @@ restore() {
 }
 
 # ================== 配置菜单 ==================
-# ================== 配置菜单（完整） ==================
 configure_settings_menu() {
     load_config
     while true; do
         clear
         echo -e "${GREEN}=== 配置设置 ===${RESET}"
-        echo -e "${GREEN}------------------------${RESET}"
-        echo -e "${GREEN}1. Telegram Bot Token${RESET}       (当前: $TG_TOKEN)"
-        echo -e "${GREEN}2. Telegram Chat ID${RESET}         (当前: $TG_CHAT_ID)"
-        echo -e "${GREEN}3. 服务器名称${RESET}               (当前: $SERVER_NAME)"
-        echo -e "${GREEN}4. 本地备份保留天数${RESET}        (当前: $RETAIN_DAYS)"
-        echo -e "${GREEN}5. 本地备份目录${RESET}            (当前: $BACKUP_DIR)"
-        echo -e "${GREEN}6. 远程服务器用户名${RESET}         (当前: $REMOTE_USER)"
-        echo -e "${GREEN}7. 远程服务器 IP${RESET}            (当前: $REMOTE_IP)"
-        echo -e "${GREEN}8. 远程备份目录${RESET}            (当前: $REMOTE_DIR)"
+        echo -e "${GREEN}1. Telegram Bot Token (当前: $TG_TOKEN)${RESET}"
+        echo -e "${GREEN}2. Telegram Chat ID (当前: $TG_CHAT_ID)${RESET}"
+        echo -e "${GREEN}3. 服务器名称 (当前: $SERVER_NAME)${RESET}"
+        echo -e "${GREEN}4. 本地备份保留天数 (当前: $RETAIN_DAYS)${RESET}"
+        echo -e "${GREEN}5. 本地备份目录 (当前: $BACKUP_DIR)${RESET}"
+        echo -e "${GREEN}6. 远程服务器用户名 (当前: $REMOTE_USER)${RESET}"
+        echo -e "${GREEN}7. 远程服务器 IP (当前: $REMOTE_IP)${RESET}"
+        echo -e "${GREEN}8. 远程备份目录 (当前: $REMOTE_DIR)${RESET}"
         echo -e "${GREEN}0. 返回上级菜单${RESET}"
-        echo -e "${GREEN}------------------------${RESET}"
 
         read -rp "请选择操作: " choice
-
         case $choice in
             1) read -rp "请输入 Telegram Bot Token: " input; [[ -n "$input" ]] && TG_TOKEN="$input" ;;
             2) read -rp "请输入 Telegram Chat ID: " input; [[ -n "$input" ]] && TG_CHAT_ID="$input" ;;
@@ -233,7 +226,6 @@ configure_settings_menu() {
             0) save_config; load_config; break ;;
             *) echo -e "${RED}❌ 无效选择${RESET}" ;;
         esac
-
         save_config
         load_config
         read -rp "按回车继续..."
@@ -241,7 +233,7 @@ configure_settings_menu() {
 }
 
 # ================== 定时任务管理 ==================
-list_cron(){
+list_cron() {
     mapfile -t lines < <(crontab -l 2>/dev/null | grep "$CRON_TAG")
     [ ${#lines[@]} -eq 0 ] && { echo -e "${YELLOW}暂无定时任务${RESET}"; return; }
     for i in "${!lines[@]}"; do
@@ -250,7 +242,7 @@ list_cron(){
     done
 }
 
-schedule_add(){
+schedule_add() {
     echo -e "${GREEN}1. 每天0点${RESET}"
     echo -e "${GREEN}2. 每周一0点${RESET}"
     echo -e "${GREEN}3. 每月1号0点${RESET}"
@@ -264,15 +256,15 @@ schedule_add(){
         *) echo -e "${RED}❌ 无效选择${RESET}"; return ;;
     esac
 
-    read -p "备份目录(空格分隔, 留空使用默认 $BASE_DIR): " dirs
-    [[ -z "$dirs" ]] && dirs="$BASE_DIR"
+    read -p "备份目录(空格分隔, 留空使用默认 $BACKUP_DIR): " dirs
+    [[ -z "$dirs" ]] && dirs="$BACKUP_DIR"
 
     (crontab -l 2>/dev/null; \
     echo "$cron_expr /bin/bash \"$INSTALL_PATH\" auto \"$dirs\" >> \"$LOG_FILE\" 2>&1 $CRON_TAG") | crontab -
     echo -e "${GREEN}✅ 添加成功，cron 日志: $LOG_FILE${RESET}"
 }
 
-schedule_del_one(){
+schedule_del_one() {
     mapfile -t lines < <(crontab -l 2>/dev/null | grep "$CRON_TAG")
     [ ${#lines[@]} -eq 0 ] && { echo -e "${YELLOW}暂无定时任务${RESET}"; return; }
     list_cron
@@ -282,12 +274,12 @@ schedule_del_one(){
     echo -e "${GREEN}✅ 已删除${RESET}"
 }
 
-schedule_del_all(){
+schedule_del_all() {
     crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
     echo -e "${GREEN}✅ 已清空全部定时任务${RESET}"
 }
 
-schedule_menu(){
+schedule_menu() {
     while true; do
         clear
         echo -e "${GREEN}=== 定时任务管理 ===${RESET}"
@@ -322,7 +314,7 @@ uninstall() {
     exit 0
 }
 
-# ================== auto模式（cron专用） ==================
+# ================== auto模式 ==================
 if [[ "$1" == "auto" ]]; then
     export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     export HOME=/root
@@ -331,13 +323,8 @@ if [[ "$1" == "auto" ]]; then
 
     DIRS=()
     [[ -n "$2" ]] && IFS=' ' read -r -a DIRS <<< "$2"
+    [[ ${#DIRS[@]} -eq 0 ]] && DIRS=("$BACKUP_DIR")
 
-    if [[ ${#DIRS[@]} -eq 0 ]]; then
-        echo -e "${RED}❌ 没有指定备份目录，使用默认: $BACKUP_DIR${RESET}" >> "$LOG_FILE" 2>&1
-        DIRS=("$BACKUP_DIR")
-    fi
-
-    # 本地备份
     for PROJECT_DIR in "${DIRS[@]}"; do
         [[ ! -d "$PROJECT_DIR" ]] && continue
         TIMESTAMP=$(date +%F_%H-%M-%S)
@@ -346,27 +333,15 @@ if [[ "$1" == "auto" ]]; then
         tg_send "自动备份完成: $(basename "$PROJECT_DIR") → $BACKUP_FILE"
     done
 
-    # 清理旧备份
     find "$BACKUP_DIR" -type f -name "*.tar.gz" -mtime +"$RETAIN_DAYS" -exec rm -f {} \;
     tg_send "🗑️ 自动清理 $RETAIN_DAYS 天以上旧备份"
 
-    # 远程上传（如果配置了远程信息）
     if [[ -n "$REMOTE_USER" && -n "$REMOTE_IP" ]]; then
-        mkdir -p "$BASE_DIR/tmp_upload"
-        TEMP_PACKAGE="$BASE_DIR/tmp_upload/backup_upload_$(date +%F_%H-%M-%S).tar.gz"
-        tar czf "$TEMP_PACKAGE" -C "$BACKUP_DIR" . >> "$LOG_FILE" 2>&1
-
-        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_IP" "mkdir -p \"$REMOTE_DIR\""
-        scp -i "$SSH_KEY" "$TEMP_PACKAGE" "$REMOTE_USER@$REMOTE_IP:$REMOTE_DIR/" >> "$LOG_FILE" 2>&1
-        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_IP" \
-            "tar xzf \"$REMOTE_DIR/$(basename "$TEMP_PACKAGE")\" -C \"$REMOTE_DIR\" && rm -f \"$REMOTE_DIR/$(basename "$TEMP_PACKAGE")\""
-        tg_send "自动远程上传完成: $(basename "$TEMP_PACKAGE") → $REMOTE_IP"
-        rm -f "$TEMP_PACKAGE"
+        backup_remote_latest
     fi
 
     exit 0
 fi
-
 
 # ================== 主菜单 ==================
 while true; do
@@ -375,18 +350,18 @@ while true; do
     echo -e "${CYAN}=== Docker 备份管理 ===${RESET}"
     echo -e "${GREEN}1. 设置 SSH 密钥自动登录${RESET}"
     echo -e "${GREEN}2. 本地备份${RESET}"
-    echo -e "${GREEN}3. 远程上传备份${RESET}"
+    echo -e "${GREEN}3. 远程上传备份（只保留最新）${RESET}"
     echo -e "${GREEN}4. 恢复项目${RESET}"
-    echo -e "${GREEN}5. 配置设置（Telegram/服务器名/保留天数/目录）${RESET}"
+    echo -e "${GREEN}5. 配置设置（Telegram/服务器名/保留天数/目录/远程信息）${RESET}"
     echo -e "${GREEN}6. 定时任务管理${RESET}"
     echo -e "${GREEN}7. 卸载${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
 
-    read -rp "$(echo -e ${GREEN}请选择操作: ${RESET}) " CHOICE
+    read -p "$(echo -e ${GREEN}请选择操作: ${RESET})" CHOICE
     case $CHOICE in
         1) setup_ssh_key ;;
         2) backup_local ;;
-        3) backup_remote ;;
+        3) backup_remote_latest ;;
         4) restore ;;
         5) configure_settings_menu ;;
         6) schedule_menu ;;
@@ -394,5 +369,5 @@ while true; do
         0) exit 0 ;;
         *) echo -e "${RED}❌ 无效选择${RESET}" ;;
     esac
-    read -rp "$(echo -e ${GREEN}按回车继续.... ${RESET})"
+    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
 done

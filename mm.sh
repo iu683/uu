@@ -1,5 +1,26 @@
 #!/bin/bash
-set -e
+#################################
+# 首次运行安装（下载到 /opt）
+#################################
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/mm.sh"
+SCRIPT_PATH="/opt/vpsbackup/vpsbackup.sh"
+
+if [ ! -f "$SCRIPT_PATH" ]; then
+    echo -e "${GREEN}首次运行，下载脚本到本地...${RESET}"
+
+    mkdir -p /opt/vpsbackup
+
+    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL" || {
+        echo -e "${RED}下载失败${RESET}"
+        exit 1
+    }
+
+    chmod +x "$SCRIPT_PATH"
+
+    echo -e "${GREEN}安装完成: $SCRIPT_PATH${RESET}"
+
+    exec bash "$SCRIPT_PATH" "$@"
+fi
 
 #################################
 # 颜色
@@ -120,7 +141,7 @@ backup_dirs(){
 # 创建备份
 #################################
 create_backup(){
-    read -p "目录(空格分隔默认/opt): " input
+    read -p "目录(空格分隔，回车使用默认): " input
     if [ -z "$input" ]; then
         backup_dirs
     else
@@ -234,10 +255,20 @@ schedule_add(){
         *) return ;;
     esac
 
-    (crontab -l 2>/dev/null; \
-     echo "$cron $INSTALL_PATH auto >> $BASE_DIR/cron.log 2>&1 $CRON_TAG") | crontab -
+    read -p "备份目录(空格分隔, 留空使用默认): " dirs
+    if [ -n "$dirs" ]; then
+        # cron 传递目录作为参数
+        (crontab -l 2>/dev/null; \
+         echo "$cron $INSTALL_PATH auto \"$dirs\" >> $BASE_DIR/cron.log 2>&1 $CRON_TAG") | crontab -
+    else
+        # 默认
+        (crontab -l 2>/dev/null; \
+         echo "$cron $INSTALL_PATH auto >> $BASE_DIR/cron.log 2>&1 $CRON_TAG") | crontab -
+    fi
+
     echo -e "${GREEN}添加成功，cron日志: $BASE_DIR/cron.log${RESET}"
 }
+
 
 schedule_del_one(){
     mapfile -t lines < <(crontab -l 2>/dev/null | grep "$CRON_TAG")
@@ -295,9 +326,18 @@ if [ "$1" = "auto" ]; then
     export HOME=/root
     mkdir -p "$BACKUP_DIR"
     load_conf
-    backup_dirs >> "$BASE_DIR/cron.log" 2>&1
+
+    if [ "$2" ]; then
+        # 传入自定义目录
+        IFS=' ' read -r -a dirs <<< "$2"
+        backup_dirs "${dirs[@]}" >> "$BASE_DIR/cron.log" 2>&1
+    else
+        # 默认目录
+        backup_dirs >> "$BASE_DIR/cron.log" 2>&1
+    fi
     exit
 fi
+
 
 #################################
 # 菜单
@@ -318,7 +358,6 @@ while true; do
     echo -e "${GREEN}5. 压缩格式${RESET}"
     echo -e "${GREEN}6. 保留天数${RESET}"
     echo -e "${GREEN}7. 卸载${RESET}"
-    echo -e "${GREEN}8. 设置备份目录${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
 
     read -p "$(echo -e ${GREEN}请输入选项: ${RESET})" choice
@@ -330,7 +369,6 @@ while true; do
         5) set_compress ;;
         6) set_keep ;;
         7) uninstall ;;
-        8) set_backup_dirs ;;
         0) exit ;;
     esac
     read -p "回车继续..."

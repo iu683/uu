@@ -1,343 +1,172 @@
 #!/bin/bash
-set -o pipefail
 
+# 颜色设置
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+RED='\033[0;31m'
+NC='\033[0m'
 
-#################################
-# 环境变量 & 配置
-#################################
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export HOME=/root   # ⭐ 确保 cron 下 ~ 指向 root
+clear
+echo -e "${BLUE}=================================================${NC}"
+echo -e "${BLUE}           本地系统快照恢复工具                  ${NC}"
+echo -e "${BLUE}=================================================${NC}"
+echo ""
 
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+# ==============================
+# 自定义备份目录（新增功能）
+# 支持：
+# 1. 默认 /backups
+# 2. 手动输入
+# 3. 传参 ./restore.sh /data/backup
+# ==============================
 
-BASE_DIR="/opt/rsync_task"
-SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
-SCRIPT_PATH="$BASE_DIR/rsync_manager.sh"
-KEY_DIR="$BASE_DIR/keys"
-LOG_DIR="$BASE_DIR/logs"
-CONFIG_FILE="$BASE_DIR/rsync_tasks.conf"
-TG_CONFIG="$BASE_DIR/.tg.conf"
-BIN_LINK_DIR="/usr/local/bin"
+DEFAULT_BACKUP="/backups"
 
-mkdir -p "$BASE_DIR" "$KEY_DIR" "$LOG_DIR"
-touch "$CONFIG_FILE"
-
-#################################
-# 稳定统计任务数量（修复 all 错误核心）
-#################################
-task_count() {
-    awk 'NF{c++} END{print c+0}' "$CONFIG_FILE"
-}
-
-#################################
-# 安装依赖
-#################################
-install_dep() {
-    for p in rsync ssh sshpass curl tar; do
-        if ! command -v $p &>/dev/null; then
-            echo -e "${YELLOW}安装依赖: $p${RESET}"
-            DEBIAN_FRONTEND=noninteractive apt-get update -qq
-            DEBIAN_FRONTEND=noninteractive apt-get install -y $p >/dev/null 2>&1
-        fi
-    done
-}
-install_dep
-
-#################################
-# Telegram
-#################################
-send_tg() {
-    [[ -f "$TG_CONFIG" ]] || return
-    . "$TG_CONFIG"   # ⭐ cron 下也能读到变量
-    msg="$1"
-    curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-        -d chat_id="$CHAT_ID" \
-        -d text="[$VPS_NAME] $msg" >/dev/null 2>&1
-}
-
-setup_tg() {
-    read -p "VPS名称: " VPS_NAME
-    read -p "Bot Token: " BOT_TOKEN
-    read -p "Chat ID: " CHAT_ID
-    cat > "$TG_CONFIG" <<EOF
-VPS_NAME="$VPS_NAME"
-BOT_TOKEN="$BOT_TOKEN"
-CHAT_ID="$CHAT_ID"
-EOF
-    chmod 600 "$TG_CONFIG"
-    echo -e "${GREEN}TG配置已保存${RESET}"
-}
-
-#################################
-# SSH 密钥管理
-#################################
-generate_and_setup_ssh() {
-    local remote="$1"
-    local port="$2"
-
-    KEY_FILE="$HOME/.ssh/id_rsa"   # ⭐ 改默认
-    PUB_FILE="$KEY_FILE.pub"
-
-    if [[ ! -f "$KEY_FILE" ]]; then
-        echo -e "${YELLOW}生成默认 SSH 密钥...${RESET}"
-        ssh-keygen -t rsa -b 4096 -f "$KEY_FILE" -N "" -q
-    fi
-
-    echo -e "${YELLOW}第一次连接需要输入远程密码${RESET}"
-
-    set +e
-
-    ssh-keygen -f "$HOME/.ssh/known_hosts" -R "${remote#*@}" >/dev/null 2>&1
-
-    ssh -o StrictHostKeyChecking=no -p "$port" "$remote" \
-        "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
-
-    # ⭐ 安全写入 key
-    cat "$PUB_FILE" | ssh -o StrictHostKeyChecking=no -p "$port" "$remote" \
-        "grep -qxF \"$(cat $PUB_FILE)\" ~/.ssh/authorized_keys || cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
-
-    set -e
-
-    echo -e "${GREEN}✅ 公钥部署完成${RESET}"
-}
-
-
-#################################
-# 任务管理
-#################################
-list_tasks() {
-    [[ ! -s "$CONFIG_FILE" ]] && { echo "暂无任务"; return; }
-    awk -F'|' '{printf "%d) %s  %s -> %s [%s]\n",NR,$1,$2,$3,$5}' "$CONFIG_FILE"
-}
-
-add_task() {
-    read -p "任务名称: " name
-    read -p "本地目录: " local
-    read -p "远程目录: " remote_path
-    read -p "远程用户@IP: " remote
-    read -p "端口(默认22): " port
-    port=${port:-22}
-
-    echo "认证方式: 1密码 2密钥"
-    read -p "选择: " c
-    if [[ $c == 1 ]]; then
-        read -s -p "密码: " secret; echo
-        auth="password"
-    else
-        generate_and_setup_ssh "$remote" "$port"
-        secret="$KEY_DIR/id_rsa_rsync"
-        auth="key"
-    fi
-
-    echo "$name|$local|$remote|$remote_path|$port|$auth|$secret" >> "$CONFIG_FILE"
-}
-
-delete_task() {
-    read -p "编号: " n
-    sed -i "${n}d" "$CONFIG_FILE"
-}
-
-#################################
-# 压缩同步
-#################################
-run_task() {
-    direction="$1"
-    num="$2"
-
-    if [[ -z "$num" ]]; then
-        read -p "编号: " num
-    fi
-
-    task=$(sed -n "${num}p" "$CONFIG_FILE" | tr -d '\r\n')
-
-    if [[ -z "$task" ]]; then
-        echo "任务编号 $num 不存在" >> "$LOG_DIR/error.log"
-        send_tg "任务 $num 不存在 ❌"
-        return 1
-    fi
-
-    IFS='|' read -r name local remote remote_path port auth secret <<< "$task"
-    archive="/tmp/sync_task_${name}.tar.gz"
-
-    echo -e "${YELLOW}开始同步 [$name] ...${RESET}"
-
-    if [[ "$direction" == "push" ]]; then
-
-        tar -czf "$archive" -C "$(dirname "$local")" "$(basename "$local")" || return 1
-
-        if [[ "$auth" == "password" ]]; then
-            sshpass -p "$secret" ssh -p $port $remote "mkdir -p $remote_path"
-            sshpass -p "$secret" rsync -az -e "ssh -p $port" "$archive" "$remote:$remote_path/"
-        else
-            ssh -i "$secret" -p $port $remote "mkdir -p $remote_path"
-            rsync -az -e "ssh -i $secret -p $port" "$archive" "$remote:$remote_path/"
-        fi
-
-        echo -e "${GREEN}✅ [$name] 推送完成${RESET}"
-        send_tg "$name 推送完成 ✅"
-        return 0
-    else
-
-        if [[ "$auth" == "password" ]]; then
-            sshpass -p "$secret" rsync -az -e "ssh -p $port" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
-        else
-            rsync -az -e "ssh -i $secret -p $port" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
-        fi
-
-        rm -rf "$local"
-        mkdir -p "$local"
-        tar -xzf "/tmp/$(basename "$archive")" -C "$(dirname "$local")"
-
-        echo -e "${GREEN}✅ [$name] 拉取完成${RESET}"
-        send_tg "$name 拉取完成 ✅"
-    fi
-
-    return 0
-}
-
-
-batch_run() {
-    read -p "批量任务编号(多个逗号): " nums
-    if [[ "$nums" == "all" ]]; then
-        count=$(task_count)
-        nums=$(seq 1 $count)
-    fi
-    OLDIFS=$IFS
-    IFS=','
-
-    for n in $nums; do
-        n=$(echo "$n" | tr -d '\r\n ')
-        run_task "$1" "$n"
-    done
-
-    IFS=$OLDIFS
-}
-
-#################################
-# 定时任务
-#################################
-schedule_task() {
-    echo -e "${GREEN}定时任务模板:${RESET}"
-    echo -e "${GREEN}1) 每天0点${RESET}"
-    echo -e "${GREEN}2) 每周一0点${RESET}"
-    echo -e "${GREEN}3) 每月1号0点${RESET}"
-    echo -e "${GREEN}4) 自定义cron${RESET}"
-    read -p "选择模板: " tmpl
-    case $tmpl in
-        1) cron="0 0 * * *" ;;
-        2) cron="0 0 * * 1" ;;
-        3) cron="0 0 1 * *" ;;
-        4) read -p "cron表达式: " cron ;;
-        *) echo -e "${RED}无效选择${RESET}"; return ;;
-    esac
-
-    read -p "任务编号(多个逗号): " nums
-    if [[ "$nums" == "all" ]]; then
-        count=$(task_count)
-        nums=$(seq 1 $count)
-    fi
-
-    OLDIFS=$IFS
-    IFS=','
-    for n in $nums; do
-        n=$(echo "$n" | tr -d '\r\n ')
-        job="$cron /bin/bash $SCRIPT_PATH auto push $n >> $LOG_DIR/cron_$n.log 2>&1 # rsync_$n"
-        crontab -l 2>/dev/null | grep -v "# rsync_$n" | { cat; echo "$job"; } | crontab -
-        echo -e "${GREEN}✅ 任务编号 $n 已添加定时任务${RESET}"
-    done
-    IFS=$OLDIFS
-}
-
-delete_schedule() {
-    read -p "删除任务编号(多个逗号): " nums
-    if [[ "$nums" == "all" ]]; then
-        crontab -l 2>/dev/null | grep -v "# rsync_" | crontab -
-        echo -e "${YELLOW}✅ 已删除全部定时任务${RESET}"
-        return
-    fi
-    OLDIFS=$IFS
-    IFS=','
-    for n in $nums; do
-        n=$(echo "$n" | tr -d '\r\n ')
-        crontab -l 2>/dev/null | grep -v "# rsync_$n" | crontab -
-        echo -e "${YELLOW}✅ 已删除任务编号 $n 的定时任务${RESET}"
-    done
-    IFS=$OLDIFS
-}
-
-#################################
-# 更新 & 卸载
-#################################
-update_self() {
-    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
-    chmod +x "$SCRIPT_PATH"
-    echo -e "${GREEN}已更新脚本${RESET}"
-}
-
-uninstall_self() {
-    crontab -l 2>/dev/null | grep -v "rsync_" | crontab - || true
-    rm -rf "$BASE_DIR"
-    echo -e "${RED}已卸载脚本${RESET}"
-    exit
-}
-
-#################################
-# Cron 自动运行
-#################################
-if [[ "$1" == "auto" ]]; then
-    run_task "$2" "$3"
-    exit
+if [ -n "$1" ]; then
+  BACKUP_DIR="$1"
+else
+  read -p "请输入备份目录(默认: $DEFAULT_BACKUP): " INPUT_DIR
+  BACKUP_DIR="${INPUT_DIR:-$DEFAULT_BACKUP}"
 fi
 
-#################################
-# 首次运行安装快捷命令
-#################################
-if [ ! -f "$SCRIPT_PATH" ]; then
-    echo -e "${GREEN}首次运行，下载脚本到本地...${RESET}"
-    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
-    chmod +x "$SCRIPT_PATH"
-    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/s"
-    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/S"
-    echo -e "${GREEN}✅ 快捷键已添加：s 或 S 可快速启动${RESET}"
+echo -e "${GREEN}使用备份目录: $BACKUP_DIR${NC}"
+
+if [ ! -d "$BACKUP_DIR" ]; then
+
+
+# 查找本地快照文件
+echo -e "${BLUE}正在查找本地系统快照...${NC}"
+SNAPSHOT_FILES=($(find $BACKUP_DIR -maxdepth 1 -type f -name "system_snapshot_*.tar.gz" | sort -r))
+
+if [ ${#SNAPSHOT_FILES[@]} -eq 0 ]; then
+  echo -e "${RED}错误: 未找到系统快照文件!${NC}"
+  exit 1
 fi
 
-#################################
-# 主菜单
-#################################
-while true; do
-    clear
-    echo -e "${GREEN}===== Rsync 同步管理器 =====${RESET}"
-    list_tasks
-    echo
-    echo -e "${GREEN} 1) 添加同步任务${RESET}"
-    echo -e "${GREEN} 2) 删除同步任务${RESET}"
-    echo -e "${GREEN} 3) 推送同步${RESET}"
-    echo -e "${GREEN} 4) 拉取同步${RESET}"
-    echo -e "${GREEN} 5) 批量推送同步${RESET}"
-    echo -e "${GREEN} 6) 批量拉取同步${RESET}"
-    echo -e "${GREEN} 7) 添加定时任务${RESET}"
-    echo -e "${GREEN} 8) 删除定时任务${RESET}"
-    echo -e "${GREEN} 9) Telegram设置${RESET}"
-    echo -e "${GREEN}10) 更新脚本${RESET}"
-    echo -e "${GREEN}11) 卸载脚本${RESET}"
-    echo -e "${GREEN} 0) 退出${RESET}"
-    read -p "$(echo -e ${GREEN}请选择操作: ${RESET}) " c
-    case $c in
-        1) add_task ;;
-        2) delete_task ;;
-        3) run_task push ;;
-        4) run_task pull ;;
-        5) batch_run push ;;
-        6) batch_run pull ;;
-        7) schedule_task ;;
-        8) delete_schedule ;;
-        9) setup_tg ;;
-        10) update_self ;;
-        11) uninstall_self ;;
-        0) exit ;;
-    esac
-    read -p "$(echo -e ${GREEN}按回车继续...${RESET}) "
+# 显示可用快照列表
+echo -e "${YELLOW}可用的本地快照:${NC}"
+for i in "${!SNAPSHOT_FILES[@]}"; do
+  SNAPSHOT_PATH="${SNAPSHOT_FILES[$i]}"
+  SNAPSHOT_NAME=$(basename "$SNAPSHOT_PATH")
+  SNAPSHOT_SIZE=$(du -h "$SNAPSHOT_PATH" | cut -f1)
+  SNAPSHOT_DATE=$(date -r "$SNAPSHOT_PATH" "+%Y-%m-%d %H:%M:%S")
+  echo -e "$((i+1))) ${GREEN}$SNAPSHOT_NAME${NC} (${SNAPSHOT_SIZE}, ${SNAPSHOT_DATE})"
 done
+
+# 选择要恢复的快照
+read -p "请选择要恢复的快照编号 [1-${#SNAPSHOT_FILES[@]}]: " SNAPSHOT_CHOICE
+
+if ! [[ "$SNAPSHOT_CHOICE" =~ ^[0-9]+$ ]] || [ "$SNAPSHOT_CHOICE" -lt 1 ] || [ "$SNAPSHOT_CHOICE" -gt ${#SNAPSHOT_FILES[@]} ]; then
+  echo -e "${RED}错误: 无效的选择!${NC}"
+  exit 1
+fi
+
+SELECTED_SNAPSHOT="${SNAPSHOT_FILES[$((SNAPSHOT_CHOICE-1))]}"
+SNAPSHOT_NAME=$(basename "$SELECTED_SNAPSHOT")
+
+# 确认恢复
+echo -e "\n${YELLOW}准备恢复系统快照: ${GREEN}$SNAPSHOT_NAME${NC}"
+echo -e "${RED}警告: 恢复操作将把系统状态恢复到快照创建时的状态。此操作不可撤销!${NC}"
+echo -e "${RED}恢复后，快照创建时间点之后的所有更改将丢失!${NC}"
+read -p "是否继续? [y/N]: " CONFIRM
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+  echo -e "${YELLOW}恢复已取消.${NC}"
+  exit 0
+fi
+
+echo -e "\n${YELLOW}请选择恢复模式:${NC}"
+echo -e "1) ${GREEN}标准恢复(推荐)${NC} - 恢复所有系统文件，但保留网络配置"
+echo -e "2) ${GREEN}完全恢复${NC} - 完全恢复所有文件，包括网络配置（可能导致网络中断）"
+read -p "请选择恢复模式 [1-2]: " RESTORE_MODE
+
+if ! [[ "$RESTORE_MODE" =~ ^[1-2]$ ]]; then
+  echo -e "${RED}错误: 无效的选择!${NC}"
+  exit 1
+fi
+
+# 备份关键系统配置
+if [ "$RESTORE_MODE" -eq 1 ]; then
+  echo -e "\n${BLUE}备份当前网络和系统配置...${NC}"
+  mkdir -p /root/system_backup
+  cp /etc/fstab /root/system_backup/fstab.bak 2>/dev/null
+  cp /etc/network/interfaces /root/system_backup/interfaces.bak 2>/dev/null
+  cp -r /etc/netplan /root/system_backup/ 2>/dev/null
+  cp /etc/hostname /root/system_backup/hostname.bak 2>/dev/null
+  cp /etc/hosts /root/system_backup/hosts.bak 2>/dev/null
+  cp /etc/resolv.conf /root/system_backup/resolv.conf.bak 2>/dev/null
+fi
+
+# 停止关键服务
+echo -e "${BLUE}停止关键服务...${NC}"
+for service in nginx apache2 mysql docker; do
+  if systemctl is-active --quiet $service; then
+    echo "停止 $service 服务..."
+    systemctl stop $service 2>/dev/null
+  fi
+done
+
+# 执行恢复
+echo -e "${BLUE}正在恢复系统文件...${NC}"
+
+if [ "$RESTORE_MODE" -eq 1 ]; then
+  # 标准恢复 - 保留网络设置
+  tar -xzf "$SELECTED_SNAPSHOT" -C / \
+    --exclude="dev/*" \
+    --exclude="proc/*" \
+    --exclude="sys/*" \
+    --exclude="run/*" \
+    --exclude="tmp/*" \
+    --exclude="etc/fstab" \
+    --exclude="etc/hostname" \
+    --exclude="etc/hosts" \
+    --exclude="etc/network/*" \
+    --exclude="etc/netplan/*" \
+    --exclude="etc/resolv.conf" \
+    --exclude="backups/*"
+else
+  # 完全恢复 - 包括网络设置
+  tar -xzf "$SELECTED_SNAPSHOT" -C / \
+    --exclude="dev/*" \
+    --exclude="proc/*" \
+    --exclude="sys/*" \
+    --exclude="run/*" \
+    --exclude="tmp/*" \
+    --exclude="backups/*"
+fi
+
+RESTORE_RESULT=$?
+if [ $RESTORE_RESULT -ne 0 ]; then
+  echo -e "${RED}错误: 系统恢复失败!${NC}"
+  exit 1
+fi
+
+# 恢复网络配置(标准模式)
+if [ "$RESTORE_MODE" -eq 1 ]; then
+  echo -e "${BLUE}恢复网络配置...${NC}"
+  cp /root/system_backup/fstab.bak /etc/fstab 2>/dev/null
+  cp /root/system_backup/interfaces.bak /etc/network/interfaces 2>/dev/null
+  cp -r /root/system_backup/netplan/* /etc/netplan/ 2>/dev/null
+  cp /root/system_backup/hostname.bak /etc/hostname 2>/dev/null
+  cp /root/system_backup/hosts.bak /etc/hosts 2>/dev/null
+  cp /root/system_backup/resolv.conf.bak /etc/resolv.conf 2>/dev/null
+fi
+
+# 通知成功
+echo -e "${GREEN}系统快照恢复成功!${NC}"
+if [ "$RESTORE_MODE" -eq 1 ]; then
+  echo -e "${BLUE}已保留当前网络配置.${NC}"
+else
+  echo -e "${YELLOW}已恢复所有设置，包括网络配置.${NC}"
+fi
+
+# 提示重启
+echo -e "${YELLOW}系统需要重启以完成恢复.${NC}"
+read -p "是否立即重启系统? [y/N]: " REBOOT
+if [[ "$REBOOT" =~ ^[Yy]$ ]]; then
+  echo -e "${BLUE}系统将在5秒后重启...${NC}"
+  sleep 5
+  reboot
+else
+  echo -e "${YELLOW}请手动重启系统以完成恢复.${NC}"
+fi

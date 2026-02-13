@@ -308,16 +308,21 @@ configure_settings() {
 
 # ================== 卸载 ==================
 uninstall() {
-    echo -e "${YELLOW}⚠️ 确认卸载？这将删除配置和定时任务！${RESET}"
-    read -rp "输入 yes 确认: " CONFIRM
-    [[ "$CONFIRM" != "yes" ]] && { echo "取消卸载"; return; }
+    echo -e "${YELLOW}正在自动卸载...${RESET}"
 
+    # 删除配置文件
     [[ -f "$CONFIG_FILE" ]] && rm -f "$CONFIG_FILE"
+
+    # 删除远程脚本
     [[ -f "$REMOTE_SCRIPT_PATH" ]] && rm -f "$REMOTE_SCRIPT_PATH"
+
+    # 移除定时任务
     crontab -l | grep -v "$INSTALL_PATH" | crontab -
+
     echo -e "${GREEN}✅ 卸载完成，配置和脚本已删除，定时任务已移除${RESET}"
     exit 0
 }
+
 
 # ================== 自动执行备份任务 ==================
 if [[ "$1" == "auto" ]]; then

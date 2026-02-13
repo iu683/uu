@@ -8,12 +8,16 @@ RED="\033[31m"
 RESET="\033[0m"
 
 # ================== 全局变量 ==================
-CONFIG_FILE="$HOME/.docker_backup_config"
-REMOTE_SCRIPT_PATH="/opt/remote_script.sh"
-SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
 BASE_DIR="/opt/docker_backups"
-INSTALL_PATH="$(realpath "$0")"
-CRON_TAG="# VPSBACKUP_AUTO"
+CONFIG_FILE="$BASE_DIR/config.sh"
+LOG_FILE="$BASE_DIR/cron.log"
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/mm.sh"
+REMOTE_SCRIPT_PATH="$BASE_DIR/remote_script.sh"
+SSH_KEY="$BASE_DIR/id_rsa_vpsbackup"
+
+mkdir -p "$BASE_DIR"
+INSTALL_PATH="/opt/docker_backups/$(basename "$0")"
+CRON_TAG="#docker_backup_cron"
 
 # 默认配置
 BACKUP_DIR_DEFAULT="$BASE_DIR"
@@ -26,15 +30,6 @@ REMOTE_IP_DEFAULT=""
 REMOTE_DIR_DEFAULT="$BASE_DIR"
 SSH_KEY="$HOME/.ssh/id_rsa_vpsbackup"
 
-# ================== 首次运行自动下载远程脚本 ==================
-if [[ ! -f "$REMOTE_SCRIPT_PATH" ]]; then
-    echo -e "${CYAN}📥 首次运行，下载远程脚本...${RESET}"
-    mkdir -p "$(dirname "$REMOTE_SCRIPT_PATH")"
-    bash <(curl -sL "$SCRIPT_URL") > "$REMOTE_SCRIPT_PATH"
-    chmod +x "$REMOTE_SCRIPT_PATH"
-    echo -e "${GREEN}✅ 远程脚本已下载到 $REMOTE_SCRIPT_PATH${RESET}"
-fi
-
 # ================== 配置加载/保存 ==================
 load_config() {
     [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
@@ -46,6 +41,10 @@ load_config() {
     REMOTE_USER=${REMOTE_USER:-$REMOTE_USER_DEFAULT}
     REMOTE_IP=${REMOTE_IP:-$REMOTE_IP_DEFAULT}
     REMOTE_DIR=${REMOTE_DIR:-$REMOTE_DIR_DEFAULT}
+
+    # Telegram 变量统一赋值给 tg_send 使用
+    BOT_TOKEN="$TG_TOKEN"
+    CHAT_ID="$TG_CHAT_ID"
 }
 
 save_config() {
@@ -66,12 +65,12 @@ EOF
 load_config
 
 # ================== Telegram通知 ==================
-tg_notify() {
+tg_send() {
     local MESSAGE="$1"
-    [[ -z "$TG_TOKEN" || -z "$TG_CHAT_ID" ]] && return
-    curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
-        -d chat_id="$TG_CHAT_ID" \
-        -d text "[$SERVER_NAME] $MESSAGE" > /dev/null
+    [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ] && return
+    curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+        -d chat_id="$CHAT_ID" \
+        -d text "[$SERVER_NAME] $MESSAGE" >/dev/null 2>&1
 }
 
 # ================== SSH密钥自动生成并配置 ==================
@@ -95,7 +94,6 @@ backup_local() {
     for PROJECT_DIR in "${PROJECT_DIRS[@]}"; do
         [[ ! -d "$PROJECT_DIR" ]] && { echo -e "${RED}❌ 目录不存在: $PROJECT_DIR${RESET}"; continue; }
 
-        # 暂停容器
         if [[ -f "$PROJECT_DIR/docker-compose.yml" ]]; then
             echo -e "${CYAN}⏸️ 暂停容器: $PROJECT_DIR${RESET}"
             cd "$PROJECT_DIR" || continue
@@ -107,7 +105,6 @@ backup_local() {
         echo -e "${CYAN}📦 正在备份 $PROJECT_DIR → $BACKUP_FILE${RESET}"
         tar czf "$BACKUP_FILE" -C "$PROJECT_DIR" .
 
-        # 备份完成，自动启动容器
         if [[ -f "$PROJECT_DIR/docker-compose.yml" ]]; then
             echo -e "${CYAN}🚀 启动容器: $PROJECT_DIR${RESET}"
             cd "$PROJECT_DIR" || continue
@@ -115,15 +112,13 @@ backup_local() {
         fi
 
         echo -e "${GREEN}✅ 本地备份完成: $BACKUP_FILE${RESET}"
-        tg_notify "本地备份完成: $(basename "$PROJECT_DIR")"
+        tg_send "本地备份完成: $(basename "$PROJECT_DIR")"
     done
 
-    # 清理旧备份
     find "$BACKUP_DIR" -type f -name "*.tar.gz" -mtime +"$RETAIN_DAYS" -exec rm -f {} \;
     echo -e "${YELLOW}🗑️ 已清理超过 $RETAIN_DAYS 天的旧备份${RESET}"
-    tg_notify "🗑️ 已清理 $RETAIN_DAYS 天以上旧备份"
+    tg_send "🗑️ 已清理 $RETAIN_DAYS 天以上旧备份"
 }
-
 
 # ================== 远程上传 ==================
 backup_remote() {
@@ -131,9 +126,8 @@ backup_remote() {
     FILE_LIST=("$BACKUP_DIR"/*.tar.gz)
     [[ ${#FILE_LIST[@]} -eq 0 ]] && { echo -e "${RED}❌ 没有备份文件${RESET}"; return; }
 
-    mkdir -p /tmp/docker_upload
-    TIMESTAMP=$(date +%F_%H-%M-%S)
-    TEMP_PACKAGE="/tmp/docker_upload/backup_upload_$TIMESTAMP.tar.gz"
+    mkdir -p "$BASE_DIR/tmp_upload"
+    TEMP_PACKAGE="$BASE_DIR/tmp_upload/backup_upload_$(date +%F_%H-%M-%S).tar.gz"
 
     echo -e "${CYAN}📦 打包所有备份文件...${RESET}"
     tar czf "$TEMP_PACKAGE" -C "$BACKUP_DIR" .
@@ -143,10 +137,11 @@ backup_remote() {
     scp -i "$SSH_KEY" "$TEMP_PACKAGE" "$REMOTE_USER@$REMOTE_IP:$REMOTE_DIR/"
 
     echo -e "${CYAN}📂 远程解压...${RESET}"
-    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_IP" "tar xzf $REMOTE_DIR/$(basename "$TEMP_PACKAGE") -C $REMOTE_DIR && rm -f $REMOTE_DIR/$(basename "$TEMP_PACKAGE")"
+    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_IP" \
+        "tar xzf $REMOTE_DIR/$(basename "$TEMP_PACKAGE") -C $REMOTE_DIR && rm -f $REMOTE_DIR/$(basename "$TEMP_PACKAGE")"
 
     echo -e "${GREEN}✅ 远程上传完成${RESET}"
-    tg_notify "远程备份上传完成: $(basename "$TEMP_PACKAGE") 到 $REMOTE_IP"
+    tg_send "远程备份上传完成: $(basename "$TEMP_PACKAGE") 到 $REMOTE_IP"
     rm -f "$TEMP_PACKAGE"
 }
 
@@ -189,20 +184,28 @@ restore() {
             cd "$TARGET_DIR" || continue
             docker compose up -d
             echo -e "${GREEN}✅ 恢复完成: $TARGET_DIR${RESET}"
-            tg_notify "恢复完成: $BASE_NAME → $TARGET_DIR"
+            tg_send "恢复完成: $BASE_NAME → $TARGET_DIR"
         else
             echo -e "${RED}❌ docker-compose.yml 不存在，无法启动容器${RESET}"
         fi
     done
 }
-
 # ================== 定时任务管理 ==================
-list_cron(){
-    mapfile -t lines < <(crontab -l 2>/dev/null | grep "$CRON_TAG")
-    [ ${#lines[@]} -eq 0 ] && { echo -e "${YELLOW}暂无定时任务${RESET}"; return; }
-    for i in "${!lines[@]}"; do
-        cron=$(echo "${lines[$i]}" | sed "s|$INSTALL_PATH auto $CRON_TAG||")
-        echo "$i) $cron"
+schedule_menu(){
+    while true; do
+        clear
+        echo -e "${GREEN}=== 定时任务管理 ===${RESET}"
+        echo -e "${GREEN}1. 添加任务${RESET}"
+        echo -e "${GREEN}2. 删除任务${RESET}"
+        echo -e "${GREEN}3. 清空全部${RESET}"
+        echo -e "${GREEN}0. 返回${RESET}"
+        read -rp "选择: " c
+        case $c in
+            1) schedule_add ;;
+            2) schedule_del_one ;;
+            3) schedule_del_all ;;
+            0) break ;;
+        esac
     done
 }
 
@@ -219,50 +222,33 @@ schedule_add(){
         4) read -p "cron表达式: " cron ;;
         *) return ;;
     esac
+
     read -p "备份目录(空格分隔, 留空使用默认): " dirs
     if [ -n "$dirs" ]; then
-        (crontab -l 2>/dev/null; echo "$cron $INSTALL_PATH auto \"$dirs\" >> $BASE_DIR/cron.log 2>&1 $CRON_TAG") | crontab -
+        (crontab -l 2>/dev/null; \
+         echo "$cron /bin/bash $INSTALL_PATH auto \"$dirs\" >> $LOG_FILE 2>&1 $CRON_TAG") | crontab -
     else
-        (crontab -l 2>/dev/null; echo "$cron $INSTALL_PATH auto >> $BASE_DIR/cron.log 2>&1 $CRON_TAG") | crontab -
+        (crontab -l 2>/dev/null; \
+         echo "$cron /bin/bash $INSTALL_PATH auto >> $LOG_FILE 2>&1 $CRON_TAG") | crontab -
     fi
-    echo -e "${GREEN}✅ 添加成功，cron日志: $BASE_DIR/cron.log${RESET}"
+    echo -e "${GREEN}✅ 添加成功，cron日志: $LOG_FILE${RESET}"
 }
 
 schedule_del_one(){
     mapfile -t lines < <(crontab -l 2>/dev/null | grep "$CRON_TAG")
     [ ${#lines[@]} -eq 0 ] && return
-    list_cron
+    for i in "${!lines[@]}"; do
+        echo "$i) ${lines[$i]}"
+    done
     read -p "输入编号: " idx
     unset 'lines[idx]'
-    (crontab -l 2>/dev/null | grep -v "$CRON_TAG"; for l in "${lines[@]}"; do echo "$l"; done) | crontab
+    (crontab -l 2>/dev/null | grep -v "$CRON_TAG"; for l in "${lines[@]}"; do echo "$l"; done) | crontab -
     echo -e "${GREEN}✅ 已删除${RESET}"
 }
 
 schedule_del_all(){
     crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
     echo -e "${GREEN}✅ 已清空全部定时任务${RESET}"
-}
-
-schedule_menu(){
-    while true; do
-        clear
-        echo -e "${GREEN}=== 定时任务管理 ===${RESET}"
-        echo -e "${GREEN}------------------------${RESET}"
-        list_cron
-        echo -e "${GREEN}------------------------${RESET}"
-        echo -e "${GREEN}1. 添加任务${RESET}"
-        echo -e "${GREEN}2. 删除任务${RESET}"
-        echo -e "${GREEN}3. 清空全部${RESET}"
-        echo -e "${GREEN}0. 返回${RESET}"
-        read -p "$(echo -e ${GREEN}选择: ${RESET})" c
-        case $c in
-            1) schedule_add ;;
-            2) schedule_del_one ;;
-            3) schedule_del_all ;;
-            0) break ;;
-        esac
-        read -p "按回车继续..."
-    done
 }
 
 # ================== 配置设置 ==================
@@ -292,20 +278,11 @@ configure_settings() {
     [[ -n "$INPUT" ]] && REMOTE_DIR="$INPUT"
 
     save_config
+    # 重新赋值给 tg_send
+    BOT_TOKEN="$TG_TOKEN"
+    CHAT_ID="$TG_CHAT_ID"
 }
 
-# ================== 卸载 ==================
-uninstall() {
-    echo -e "${YELLOW}⚠️ 确认卸载？这将删除配置和定时任务！${RESET}"
-    read -rp "输入 yes 确认: " CONFIRM
-    [[ "$CONFIRM" != "yes" ]] && { echo "取消卸载"; return; }
-
-    [[ -f "$CONFIG_FILE" ]] && rm -f "$CONFIG_FILE"
-    [[ -f "$REMOTE_SCRIPT_PATH" ]] && rm -f "$REMOTE_SCRIPT_PATH"
-    crontab -l | grep -v "$INSTALL_PATH" | crontab -
-    echo -e "${GREEN}✅ 卸载完成，配置和脚本已删除，定时任务已移除${RESET}"
-    exit 0
-}
 
 # ================== 自动执行备份任务 ==================
 if [[ "$1" == "auto" ]]; then
@@ -326,7 +303,7 @@ while true; do
     echo -e "${GREEN}4. 恢复项目${RESET}"
     echo -e "${GREEN}5. 配置设置（保留天数/TG/服务器名/远程）${RESET}"
     echo -e "${GREEN}6. 定时任务管理${RESET}"
-    echo -e "${GREEN}7. 卸载脚本${RESET}"
+    echo -e "${GREEN}7. 卸载${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
 
     read -rp "$(echo -e ${GREEN}请选择操作: ${RESET})" CHOICE
@@ -341,5 +318,5 @@ while true; do
         0) exit 0 ;;
         *) echo -e "${RED}❌ 无效选择${RESET}" ;;
     esac
-    read -p "按回车继续..."
+    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
 done

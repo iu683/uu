@@ -127,27 +127,26 @@ backup_local() {
     tg_send "🗑️ 已清理 $RETAIN_DAYS 天以上旧备份"
 }
 
-# ================== 远程上传（只保留最新） ==================
-backup_remote_latest() {
+# ================== 远程上传（上传目录内所有备份文件，不解压） ==================
+backup_remote_all() {
     [[ ! -d "$BACKUP_DIR" ]] && { echo -e "${RED}❌ 本地备份目录不存在: $BACKUP_DIR${RESET}"; return; }
 
-    # 获取最新备份文件
-    LATEST_FILE=$(ls -t "$BACKUP_DIR"/*.tar.gz 2>/dev/null | head -n1)
-    [[ -z "$LATEST_FILE" ]] && { echo -e "${RED}❌ 找不到最新备份${RESET}"; return; }
+    FILE_LIST=("$BACKUP_DIR"/*.tar.gz)
+    [[ ${#FILE_LIST[@]} -eq 0 ]] && { echo -e "${RED}❌ 没有备份文件${RESET}"; return; }
 
-    echo -e "${CYAN}📤 上传最新备份到远程: $REMOTE_USER@$REMOTE_IP:$REMOTE_DIR${RESET}"
+    echo -e "${CYAN}📤 上传所有备份文件到远程: $REMOTE_USER@$REMOTE_IP:$REMOTE_DIR${RESET}"
 
-    # 远程先删除旧备份，只保留最新
-    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_IP" \
-        "mkdir -p \"$REMOTE_DIR\" && rm -f \"$REMOTE_DIR\"/*.tar.gz"
+    # 远程删除旧备份
+    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_IP" "mkdir -p \"$REMOTE_DIR\" && rm -f \"$REMOTE_DIR\"/*.tar.gz"
 
-    # 上传最新备份
-    scp -i "$SSH_KEY" "$LATEST_FILE" "$REMOTE_USER@$REMOTE_IP:$REMOTE_DIR/" >> "$LOG_FILE" 2>&1
+    # 上传所有文件
+    for FILE in "${FILE_LIST[@]}"; do
+        scp -i "$SSH_KEY" "$FILE" "$REMOTE_USER@$REMOTE_IP:$REMOTE_DIR/" >> "$LOG_FILE" 2>&1
+        tg_send "备份上传完成: $(basename "$FILE") → $REMOTE_IP"
+    done
 
-    # Telegram通知
-    tg_send "最新备份上传完成: $(basename "$LATEST_FILE") → $REMOTE_IP"
+    echo -e "${GREEN}✅ 所有备份文件上传完成${RESET}"
 }
-
 
 # ================== 恢复 ==================
 restore() {
@@ -337,7 +336,7 @@ if [[ "$1" == "auto" ]]; then
     tg_send "🗑️ 自动清理 $RETAIN_DAYS 天以上旧备份"
 
     if [[ -n "$REMOTE_USER" && -n "$REMOTE_IP" ]]; then
-        backup_remote_latest
+        backup_remote_all
     fi
 
     exit 0
@@ -347,10 +346,10 @@ fi
 while true; do
     load_config
     clear
-    echo -e "${CYAN}=== Docker 备份管理 ===${RESET}"
-    echo -e "${GREEN}1. 设置 SSH 密钥自动登录${RESET}"
+    echo -e "${CYAN}=== Docker compose 备份恢复管理 ===${RESET}"
+    echo -e "${GREEN}1. 设置SSH密钥自动登录${RESET}"
     echo -e "${GREEN}2. 本地备份${RESET}"
-    echo -e "${GREEN}3. 远程上传备份（只保留最新）${RESET}"
+    echo -e "${GREEN}3. 远程上传备份${RESET}"
     echo -e "${GREEN}4. 恢复项目${RESET}"
     echo -e "${GREEN}5. 配置设置（Telegram/服务器名/保留天数/目录/远程信息）${RESET}"
     echo -e "${GREEN}6. 定时任务管理${RESET}"
@@ -361,7 +360,7 @@ while true; do
     case $CHOICE in
         1) setup_ssh_key ;;
         2) backup_local ;;
-        3) backup_remote_latest ;;
+        3) backup_remote_all ;;
         4) restore ;;
         5) configure_settings_menu ;;
         6) schedule_menu ;;

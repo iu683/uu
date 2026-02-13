@@ -1,4 +1,13 @@
 #!/bin/bash
+# cron 环境 PATH
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# 加载配置
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+# 将 Telegram 配置赋值到新变量
+BOT_TOKEN="$TG_TOKEN"
+CHAT_ID="$TG_CHAT_ID"
 
 # ================== 配色 ==================
 GREEN="\033[32m"
@@ -16,6 +25,9 @@ REMOTE_SCRIPT_PATH="$BASE_DIR/remote_script.sh"
 SSH_KEY="$BASE_DIR/id_rsa_vpsbackup"
 
 mkdir -p "$BASE_DIR"
+# 脚本自身路径和cron标记
+INSTALL_PATH="/opt/docker_backups/$(basename "$0")"
+CRON_TAG="#docker_backup_cron"
 
 
 # 默认配置
@@ -72,14 +84,20 @@ EOF
 
 load_config
 
+
 # ================== Telegram通知 ==================
-tg_notify() {
+tg_send() {
     local MESSAGE="$1"
-    [[ -z "$TG_TOKEN" || -z "$TG_CHAT_ID" ]] && return
-    curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
-         -d chat_id="$TG_CHAT_ID" \
-         -d text "[$SERVER_NAME] $MESSAGE" >/dev/null 2>&1
+    [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ] && return
+
+    # 转义特殊字符，保证消息发送成功
+    curl -s -X POST \
+        "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+        -d chat_id="$CHAT_ID" \
+        -d text "$(echo "[$SERVER_NAME] $MESSAGE" | sed 's/[][&]/\\&/g')" >/dev/null 2>&1
 }
+
+
 
 # ================== SSH密钥自动生成并配置 ==================
 setup_ssh_key() {
@@ -122,13 +140,13 @@ backup_local() {
         fi
 
         echo -e "${GREEN}✅ 本地备份完成: $BACKUP_FILE${RESET}"
-        tg_notify "本地备份完成: $(basename "$PROJECT_DIR")"
+        tg_send "本地备份完成: $(basename "$PROJECT_DIR")"
     done
 
     # 清理旧备份
     find "$BACKUP_DIR" -type f -name "*.tar.gz" -mtime +"$RETAIN_DAYS" -exec rm -f {} \;
     echo -e "${YELLOW}🗑️ 已清理超过 $RETAIN_DAYS 天的旧备份${RESET}"
-    tg_notify "🗑️ 已清理 $RETAIN_DAYS 天以上旧备份"
+    tg_send "🗑️ 已清理 $RETAIN_DAYS 天以上旧备份"
 }
 
 
@@ -153,7 +171,7 @@ backup_remote() {
     ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_IP" "tar xzf $REMOTE_DIR/$(basename "$TEMP_PACKAGE") -C $REMOTE_DIR && rm -f $REMOTE_DIR/$(basename "$TEMP_PACKAGE")"
 
     echo -e "${GREEN}✅ 远程上传完成${RESET}"
-    tg_notify "远程备份上传完成: $(basename "$TEMP_PACKAGE") 到 $REMOTE_IP"
+    tg_send "远程备份上传完成: $(basename "$TEMP_PACKAGE") 到 $REMOTE_IP"
     rm -f "$TEMP_PACKAGE"
 }
 
@@ -196,7 +214,7 @@ restore() {
             cd "$TARGET_DIR" || continue
             docker compose up -d
             echo -e "${GREEN}✅ 恢复完成: $TARGET_DIR${RESET}"
-            tg_notify "恢复完成: $BASE_NAME → $TARGET_DIR"
+            tg_send  "恢复完成: $BASE_NAME → $TARGET_DIR"
         else
             echo -e "${RED}❌ docker-compose.yml 不存在，无法启动容器${RESET}"
         fi
@@ -343,7 +361,7 @@ while true; do
     echo -e "${GREEN}4. 恢复项目${RESET}"
     echo -e "${GREEN}5. 配置设置（保留天数/TG/服务器名/远程）${RESET}"
     echo -e "${GREEN}6. 定时任务管理${RESET}"
-    echo -e "${GREEN}7. 卸载脚本${RESET}"
+    echo -e "${GREEN}7. 卸载${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
 
     read -rp "$(echo -e ${GREEN}请选择操作: ${RESET})" CHOICE
@@ -358,5 +376,5 @@ while true; do
         0) exit 0 ;;
         *) echo -e "${RED}❌ 无效选择${RESET}" ;;
     esac
-    read -p "按回车继续..."
+    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
 done

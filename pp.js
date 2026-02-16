@@ -78,7 +78,7 @@
     }
 
     function getIP(){
-        return fetch("/ip")
+        return fetch("https://api.ip.sb/geoip")
             .then(r=>r.json())
             .then(d=>({
                 ip:d.ip||"",
@@ -103,6 +103,7 @@
     function init(){
         createBar();
         const el=document.getElementById("ip-val");
+        const bar=document.getElementById("ip-bar");
 
         getIP().then(res=>{
             const ip=res.ip;
@@ -114,14 +115,24 @@
             }else{
                 el.textContent=loc?`IPv6 Network · ${loc} · ${isp}`:`IPv6 Network`;
             }
+
+            // ✅ 8秒后自动隐藏
+            setTimeout(()=>{
+                bar.classList.add("ip-hide");
+            },8000);
+
         }).catch(()=>{
             el.textContent="Unable to get IP";
+
+            // 出错也8秒隐藏
+            setTimeout(()=>{
+                bar.classList.add("ip-hide");
+            },8000);
         });
 
         /* 滚动隐藏 */
         let last=0;
         window.addEventListener("scroll",()=>{
-            const bar=document.getElementById("ip-bar");
             const st=window.pageYOffset||document.documentElement.scrollTop;
             if(st>last && st>50){
                 bar.classList.add("ip-hide");

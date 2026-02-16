@@ -123,7 +123,7 @@
             el.textContent="Unable to get IP";
         });
 
-        // 8秒后淡出 + 向下滑动
+        // 5秒后淡出 + 向下滑动
         setTimeout(()=>{
             if(bar){
                 bar.style.opacity = "0";
@@ -134,7 +134,7 @@
                     }
                 }, {once:true});
             }
-        },8000);
+        },5000);
     }
 
     if(document.readyState==="loading"){

@@ -1,357 +1,277 @@
 #!/bin/bash
-# ========================================
-# Rclone 管理脚本 (全功能整合版)
-# ========================================
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
 
-# ================== 颜色 ==================
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-CYAN="\033[36m"
-RESET="\033[0m"
+#################################################
+# caadybackup - 自动安装 + 自动更新增强版
+#################################################
 
-# ================== 全局变量 ==================
-BASE_DIR="/opt/rclone_manager"
-LOG_DIR="$BASE_DIR/log"
-SCRIPT_DIR="$BASE_DIR/scripts"
-mkdir -p "$LOG_DIR" "$SCRIPT_DIR"
+#################################
+# 远程自动安装逻辑
+#################################
 
-TG_TOKEN="填入你的默认BotToken"
-TG_CHAT_ID="填入你的默认ChatID"
-VPS_NAME="未命名VPS"
+INSTALL_DIR="/opt/caadybackup"
+LOCAL_SCRIPT="$INSTALL_DIR/caadybackup.sh"
+REMOTE_URL="https://raw.githubusercontent.com/iu683/uu/main/vv.sh"
 
-REMOTE_SCRIPT_PATH="$BASE_DIR/remote_rclone.sh"
-CRON_PREFIX="# rclone_sync_task:"
+if [[ "$0" != "$LOCAL_SCRIPT" ]]; then
+    mkdir -p "$INSTALL_DIR"
 
-# ================== 首次运行下载远程脚本 ==================
-if [[ ! -f "$REMOTE_SCRIPT_PATH" ]]; then
-    echo -e "${CYAN}📥 首次运行，下载远程脚本...${RESET}"
-    curl -fsSL "https://raw.githubusercontent.com/iu683/uu/main/zz.sh" -o "$REMOTE_SCRIPT_PATH"
-    chmod +x "$REMOTE_SCRIPT_PATH"
-    echo -e "${GREEN}✅ 远程脚本已下载到 $REMOTE_SCRIPT_PATH${RESET}"
-    exec "$REMOTE_SCRIPT_PATH"
+    curl -fsSL -o "$LOCAL_SCRIPT.tmp" "$REMOTE_URL" || {
+        echo "下载失败"
+        exit 1
+    }
+
+    if [[ ! -f "$LOCAL_SCRIPT" ]] || ! cmp -s "$LOCAL_SCRIPT.tmp" "$LOCAL_SCRIPT"; then
+        mv "$LOCAL_SCRIPT.tmp" "$LOCAL_SCRIPT"
+        chmod +x "$LOCAL_SCRIPT"
+        echo "已安装/更新到最新版本"
+    else
+        rm -f "$LOCAL_SCRIPT.tmp"
+    fi
+
+    exec bash "$LOCAL_SCRIPT" "$@"
 fi
 
-# ================== 菜单 ==================
-show_menu() {
-    clear
-    echo -e "${GREEN}====== Rclone 管理菜单 ======${RESET}"
-    echo -e "${GREEN} 1. 安装 Rclone${RESET}"
-    echo -e "${GREEN} 2. 更新 Rclone${RESET}"
-    echo -e "${GREEN} 3. 配置 Rclone${RESET}"
-    echo -e "${GREEN} 4. 挂载远程存储到本地${RESET}"
-    echo -e "${GREEN} 5. 同步 本地 → 远程${RESET}"
-    echo -e "${GREEN} 6. 同步 远程 → 本地${RESET}"
-    echo -e "${GREEN} 7. 查看远程存储文件${RESET}"
-    echo -e "${GREEN} 8. 查看远程存储列表${RESET}"
-    echo -e "${GREEN} 9. 卸载挂载点${RESET}"
-    echo -e "${GREEN}10. 查看当前挂载点${RESET}"
-    echo -e "${GREEN}11. 卸载所有挂载点${RESET}"
-    echo -e "${GREEN}12. systemd 自动挂载${RESET}"
-    echo -e "${GREEN}13. 自动生成多挂载 systemd${RESET}"
-    echo -e "${GREEN}14. 定时任务管理${RESET}"
-    echo -e "${GREEN}15. 修改 TG 参数${RESET}"
-    echo -e "${GREEN} 6. 卸载 Rclone${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
+#################################
+# 颜色
+#################################
+GREEN="\033[32m"
+RED="\033[31m"
+CYAN="\033[36m"
+YELLOW="\033[33m"
+RESET="\033[0m"
+
+#################################
+# 基础路径
+#################################
+CONFIG_FILE="$INSTALL_DIR/config.sh"
+LOG_FILE="$INSTALL_DIR/backup.log"
+CRON_TAG="#caadybackup_cron"
+
+DATA_DIR_DEFAULT="$INSTALL_DIR/data"
+RETAIN_DAYS_DEFAULT=7
+SERVICE_NAME_DEFAULT="$(hostname)"
+
+mkdir -p "$INSTALL_DIR"
+
+#################################
+# 卸载
+#################################
+if [[ "$1" == "--uninstall" ]]; then
+    echo -e "${YELLOW}正在卸载...${RESET}"
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+    rm -rf "$INSTALL_DIR"
+    echo -e "${GREEN}卸载完成${RESET}"
+    exit 0
+fi
+
+#################################
+# 加载配置
+#################################
+load_config() {
+    [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+    DATA_DIR=${DATA_DIR:-$DATA_DIR_DEFAULT}
+    RETAIN_DAYS=${RETAIN_DAYS:-$RETAIN_DAYS_DEFAULT}
+    SERVICE_NAME=${SERVICE_NAME:-$SERVICE_NAME_DEFAULT}
+}
+load_config
+mkdir -p "$DATA_DIR"
+
+#################################
+# 保存配置
+#################################
+save_config() {
+cat > "$CONFIG_FILE" <<EOF
+DATA_DIR="$DATA_DIR"
+RETAIN_DAYS="$RETAIN_DAYS"
+SERVICE_NAME="$SERVICE_NAME"
+TG_TOKEN="$TG_TOKEN"
+TG_CHAT_ID="$TG_CHAT_ID"
+EOF
 }
 
-# ================== 安装/更新/卸载 ==================
-install_rclone() {
-    echo -e "${YELLOW}正在安装 Rclone...${RESET}"
-    sudo -v
-    curl https://rclone.org/install.sh | sudo bash
-    echo -e "${GREEN}Rclone 安装完成！${RESET}"
-}
-
-update_rclone() {
-    echo -e "${YELLOW}正在更新 Rclone...${RESET}"
-    sudo -v
-    curl https://rclone.org/install.sh | sudo bash
-    echo -e "${GREEN}Rclone 已更新完成！${RESET}"
-    rclone version
-}
-
-uninstall_rclone() {
-    echo -e "${YELLOW}正在卸载 Rclone...${RESET}"
-    sudo rm -f /usr/bin/rclone /usr/local/bin/rclone
-    sudo systemctl stop 'rclone-mount@*' 2>/dev/null
-    sudo systemctl disable 'rclone-mount@*' 2>/dev/null
-    sudo rm -f /etc/systemd/system/rclone-mount@*.service
-    sudo systemctl daemon-reload
-    sudo rm -f /var/run/rclone_*.pid
-    echo -e "${GREEN}Rclone 及 systemd 挂载已卸载${RESET}"
-}
-
-config_rclone() { rclone config; }
-list_remotes() { rclone listremotes; }
-
-list_files_remote() {
-    read -p "请输入远程名称: " remote
-    [ -z "$remote" ] && { echo -e "${RED}远程名称不能为空${RESET}"; return; }
-    read -p "请输入远程目录(默认 /): " remote_dir
-    remote_dir=${remote_dir:-/}
-    rclone ls "${remote}:${remote_dir}" || echo -e "${RED}访问失败，请检查权限${RESET}"
-}
-
-# ================== TG 参数 ==================
-modify_tg() {
-    read -p "请输入 TG Bot Token: " TG_TOKEN
-    read -p "请输入 TG Chat ID: " TG_CHAT_ID
-    read -p "请输入 VPS 名称: " VPS_NAME
-    [ -z "$VPS_NAME" ] && VPS_NAME="未命名VPS"
-    echo -e "${GREEN}TG 参数已更新${RESET}"
-}
-
+#################################
+# Telegram 通知
+#################################
 send_tg() {
-    local msg="$1"
-    curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-        -d chat_id="${TG_CHAT_ID}" -d text="[$VPS_NAME] $msg" >/dev/null
+    [[ -z "$TG_TOKEN" || -z "$TG_CHAT_ID" ]] && return
+    MESSAGE="[$SERVICE_NAME] $1"
+    curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+        -d chat_id="$TG_CHAT_ID" \
+        -d text="$MESSAGE" >/dev/null 2>&1
 }
 
-# ================== 挂载 ==================
-mount_remote() {
-    read -p "请输入远程名称: " remote
-    [ -z "$remote" ] && return
-    path="/mnt/$remote"
-    read -p "请输入挂载路径(默认 $path): " input_path
-    path=${input_path:-$path}
-    mkdir -p "$path"
-    if mount | grep -q "on $path type"; then
-        echo -e "${YELLOW}$remote 已挂载${RESET}"
+#################################
+# 备份
+#################################
+backup() {
+
+    if [[ ! -d "/etc/caady" ]]; then
+        echo -e "${RED}未安装 Caady${RESET}"
         return
     fi
-    log="$LOG_DIR/rclone_${remote}.log"
-    pidfile="/var/run/rclone_${remote}.pid"
-    echo -e "${YELLOW}挂载 $remote → $path${RESET}"
-    nohup rclone mount "${remote}:" "$path" --allow-other --vfs-cache-mode writes --dir-cache-time 1000h &> "$log" &
-    echo $! > "$pidfile"
-    echo -e "${GREEN}$remote 已挂载，PID: $(cat $pidfile)${RESET}"
-}
 
-unmount_remote_by_name() {
-    read -p "请输入远程名称: " remote
-    pidfile="/var/run/rclone_${remote}.pid"
-    path="/mnt/$remote"
-    if [ -f "$pidfile" ]; then
-        fusermount -u "$path" 2>/dev/null || umount "$path" 2>/dev/null
-        rm -f "$pidfile"
-        echo -e "${GREEN}已卸载 $remote${RESET}"
+    TIMESTAMP=$(date +%F_%H-%M-%S)
+    FILE="$DATA_DIR/caady_$TIMESTAMP.tar.gz"
+
+    echo -e "${CYAN}开始备份 Caady 数据...${RESET}"
+
+    tar czf "$FILE" \
+        /etc/caady \
+        /var/www/caady >> "$LOG_FILE" 2>&1
+
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}备份成功${RESET}"
+        send_tg "✅ Caady备份成功: $TIMESTAMP"
     else
-        echo -e "${RED}PID 文件不存在${RESET}"
+        echo -e "${RED}备份失败${RESET}"
+        send_tg "❌ Caady备份失败"
     fi
+
+    # 清理旧备份
+    find "$DATA_DIR" -type f -name "*.tar.gz" -mtime +"$RETAIN_DAYS" -delete
 }
 
-unmount_all() {
-    for pidfile in /var/run/rclone_*.pid; do
-        [ -f "$pidfile" ] || continue
-        remote=$(basename "$pidfile" | sed 's/rclone_//;s/\.pid//')
-        path="/mnt/$remote"
-        fusermount -u "$path" 2>/dev/null || umount "$path" 2>/dev/null
-        rm -f "$pidfile"
-        echo -e "${GREEN}已卸载 $remote${RESET}"
+#################################
+# 恢复
+#################################
+restore() {
+
+    shopt -s nullglob
+    FILE_LIST=("$DATA_DIR"/*.tar.gz)
+
+    if [[ ${#FILE_LIST[@]} -eq 0 ]]; then
+        echo -e "${RED}没有备份文件${RESET}"
+        return
+    fi
+
+    echo -e "${CYAN}备份列表:${RESET}"
+    for i in "${!FILE_LIST[@]}"; do
+        echo -e "${GREEN}$((i+1)). $(basename "${FILE_LIST[$i]}")${RESET}"
     done
+
+    read -p "输入恢复序号: " num
+    [[ ! $num =~ ^[0-9]+$ ]] && return
+
+    FILE="${FILE_LIST[$((num-1))]}"
+    [[ -z "$FILE" ]] && return
+
+    echo -e "${YELLOW}确认恢复？将覆盖当前环境 (y/n)${RESET}"
+    read confirm
+    [[ "$confirm" != "y" ]] && return
+
+    systemctl stop caady 2>/dev/null
+
+    tar xzf "$FILE" -C /
+
+    systemctl start caady
+
+    echo -e "${GREEN}恢复完成${RESET}"
+    send_tg "🔄 Caady已恢复: $(basename "$FILE")"
 }
 
-show_mounts() {
-    echo -e "${YELLOW}当前挂载点:${RESET}"
-    for pidfile in /var/run/rclone_*.pid; do
-        [ -f "$pidfile" ] || continue
-        remote=$(basename "$pidfile" | sed 's/rclone_//;s/\.pid//')
-        path="/mnt/$remote"
-        mount | grep -q "$path" && echo -e "${GREEN}$remote → $path${RESET}" || echo -e "${RED}$remote PID存在，但未挂载${RESET}"
-    done
+#################################
+# 设置 TG
+#################################
+set_tg() {
+    read -p "服务名称: " SERVICE_NAME
+    read -p "TG BOT TOKEN: " TG_TOKEN
+    read -p "TG CHAT ID: " TG_CHAT_ID
+    save_config
+    echo -e "${GREEN}TG 已启用${RESET}"
+    send_tg "✅ TG 测试成功"
 }
 
-generate_systemd_service() {
-    read -p "请输入远程名称: " remote
-    [ -z "$remote" ] && return
-    path="/mnt/$remote"
-    mkdir -p "$path"
-    service_file="/etc/systemd/system/rclone-mount@${remote}.service"
-    sudo tee "$service_file" >/dev/null <<EOF
-[Unit]
-Description=Rclone Mount ${remote}
-After=network-online.target
+#################################
+# 设置定时任务（稳定版）
+#################################
+add_cron() {
 
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/bin/rclone mount ${remote}: $path --allow-other --vfs-cache-mode writes --dir-cache-time 1000h
-ExecStop=/bin/fusermount -u $path
-Restart=always
-RestartSec=10
-StandardOutput=append:$LOG_DIR/rclone_${remote}.log
-StandardError=append:$LOG_DIR/rclone_${remote}.log
+    echo -e "${CYAN}1 每天0点${RESET}"
+    echo -e "${CYAN}2 每周一0点${RESET}"
+    echo -e "${CYAN}3 每月1号${RESET}"
+    echo -e "${CYAN}4 自定义${RESET}"
 
-[Install]
-WantedBy=multi-user.target
-EOF
-    sudo systemctl daemon-reload
-    sudo systemctl enable rclone-mount@${remote}
-    sudo systemctl start rclone-mount@${remote}
-    echo -e "${GREEN}Systemd 挂载服务已生成并启动${RESET}"
-}
-
-generate_systemd_all() {
-    for pidfile in /var/run/rclone_*.pid; do
-        [ -f "$pidfile" ] || continue
-        remote=$(basename "$pidfile" | sed 's/rclone_//;s/\.pid//')
-        path="/mnt/$remote"
-        service_file="/etc/systemd/system/rclone-mount@${remote}.service"
-        [ -f "$service_file" ] && { echo -e "${GREEN}$remote systemd 已存在，跳过${RESET}"; continue; }
-        generate_systemd_service <<<"$remote"
-    done
-    echo -e "${GREEN}所有挂载点 systemd 服务生成完成${RESET}"
-}
-
-# ================== 多目录同步 ==================
-sync_local_to_remote_multi() {
-    read -p "请输入本地目录，用空格分隔: " local_dirs
-    [ -z "$local_dirs" ] && return
-    read -p "请输入远程名称: " remote
-    [ -z "$remote" ] && return
-    read -p "请输入远程目录(默认 backup): " remote_dir
-    remote_dir=${remote_dir:-backup}
-
-    for d in $local_dirs; do
-        [ ! -d "$d" ] && { echo -e "${RED}目录不存在: $d${RESET}"; continue; }
-
-        name=$(basename "$d")
-        target="${remote}:${remote_dir}/${name}"
-
-        LOG_FILE="$LOG_DIR/rclone_sync_${name}.log"
-
-        echo -e "${YELLOW}同步 $d → $target${RESET}"
-
-        rclone sync "$d" "$target" -v -P >> "$LOG_FILE" 2>&1
-
-        RET=$?
-        if [ $RET -eq 0 ]; then
-            echo "[ $(date '+%F %T') ] 同步完成 ✅" >> "$LOG_FILE"
-            send_tg "Rclone 同步完成: $d → ${remote}:${remote_dir} ✅"
-        else
-            echo "[ $(date '+%F %T') ] 同步失败 ❌" >> "$LOG_FILE"
-            send_tg "⚠️ Rclone 同步失败: $d → ${remote}:${remote_dir} ❌"
-        fi
-    done
-}
-
-sync_remote_to_local() {
-    read -p "请输入远程名称: " remote
-    [ -z "$remote" ] && return
-    read -p "请输入本地目录: " local
-    [ -z "$local" ] && return
-    read -p "请输入远程目录(默认 backup): " remote_dir
-    remote_dir=${remote_dir:-backup}
-    rclone sync "${remote}:${remote_dir}" "$local" -v -P
-}
-
-# ================== 定时任务 ==================
-list_cron() {
-    crontab -l 2>/dev/null | grep "$CRON_PREFIX" || echo -e "${YELLOW}暂无定时任务${RESET}"
-}
-
-schedule_add() {
-    read -p "任务名: " TASK_NAME
-    read -p "本地目录(空格分隔): " LOCAL_DIR
-    read -p "远程名称: " REMOTE_NAME
-    read -p "远程目录(默认 backup): " REMOTE_DIR
-    REMOTE_DIR=${REMOTE_DIR:-backup}
-
-    echo -e "${GREEN}1. 每天0点  2. 每周一0点  3. 每月1号0点  4. 自定义 cron${RESET}"
     read -p "选择: " t
+
     case $t in
-        1) cron_expr="0 0 * * *" ;;
-        2) cron_expr="0 0 * * 1" ;;
-        3) cron_expr="0 0 1 * *" ;;
-        4) read -p "请输入自定义 cron 表达式: " cron_expr ;;
-        *) echo -e "${RED}❌ 无效选择${RESET}"; return ;;
+        1) cron="0 0 * * *" ;;
+        2) cron="0 0 * * 1" ;;
+        3) cron="0 0 1 * *" ;;
+        4) read -p "cron表达式: " cron ;;
+        *) return ;;
     esac
 
-    SCRIPT_PATH="$SCRIPT_DIR/rclone_sync_${TASK_NAME}.sh"
-    cat > "$SCRIPT_PATH" <<EOF
-#!/bin/bash
-LOG_FILE="$LOG_DIR/rclone_sync_${TASK_NAME}.log"
-send_tg() {
-    curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" -d chat_id="${TG_CHAT_ID}" -d text="\$1" >/dev/null
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/caadybackup_cron 2>/dev/null
+
+    echo "$cron /usr/bin/env bash $INSTALL_DIR/caadybackup.sh auto >> $INSTALL_DIR/cron.log 2>&1 $CRON_TAG" >> /tmp/caadybackup_cron
+
+    crontab /tmp/caadybackup_cron
+    rm -f /tmp/caadybackup_cron
+
+    echo -e "${GREEN}定时任务已设置${RESET}"
 }
-for d in $LOCAL_DIR; do
-    name=\$(basename "\$d")
-    target="${REMOTE_NAME}:${REMOTE_DIR}/\$name"
 
-    rclone sync "\$d" "\$target" -v >> "\$LOG_FILE" 2>&1
+#################################
+# 删除定时任务（稳定版）
+#################################
+remove_cron() {
 
-    RET=\$?
-    if [ \$RET -eq 0 ]; then
-        echo "[\$(date '+%F %T')] 同步完成 ✅" >> "\$LOG_FILE"
-        send_tg "Rclone 同步完成: \$d → ${REMOTE_NAME}:${REMOTE_DIR} ✅"
+    if crontab -l 2>/dev/null | grep -q "$CRON_TAG"; then
+        crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/caadybackup_cron 2>/dev/null
+        crontab /tmp/caadybackup_cron
+        rm -f /tmp/caadybackup_cron
+        echo -e "${GREEN}定时任务已删除${RESET}"
     else
-        echo "[\$(date '+%F %T')] 同步失败 ❌" >> "\$LOG_FILE"
-        send_tg "⚠️ Rclone 同步失败: \$d → ${REMOTE_NAME}:${REMOTE_DIR} ❌"
+        echo -e "${YELLOW}未发现定时任务${RESET}"
     fi
-done
-EOF
-    chmod +x "$SCRIPT_PATH"
-    (crontab -l 2>/dev/null; echo "$cron_expr $SCRIPT_PATH $CRON_PREFIX$TASK_NAME") | crontab -
-    echo -e "${GREEN}任务 $TASK_NAME 已添加${RESET}"
 }
 
-schedule_del_one() {
-    list_cron
-    read -p "删除任务名称: " TASK_NAME
-    crontab -l 2>/dev/null | grep -v "$CRON_PREFIX$TASK_NAME" | crontab -
-    rm -f "$SCRIPT_DIR/rclone_sync_${TASK_NAME}.sh"
-    echo -e "${GREEN}任务 $TASK_NAME 已删除${RESET}"
-}
+#################################
+# auto模式
+#################################
+if [[ "$1" == "auto" ]]; then
+    backup
+    exit 0
+fi
 
-schedule_del_all() {
-    read -p "确认清空所有 Rclone 定时任务? (y/N): " CONFIRM
-    [ "$CONFIRM" != "y" ] && return
-    crontab -l 2>/dev/null | grep -v "$CRON_PREFIX" | crontab -
-    rm -f "$SCRIPT_DIR/rclone_sync_*.sh"
-    echo -e "${GREEN}所有定时任务已清空${RESET}"
-}
-
-cron_task_menu() {
-    while true; do
-        echo -e "${GREEN}=== 定时任务管理 ===${RESET}"
-        list_cron
-        echo -e "${GREEN}1. 添加任务  2. 删除任务  3. 清空全部  0. 返回${RESET}"
-        read -p "选择: " c
-        case $c in
-            1) schedule_add ;;
-            2) schedule_del_one ;;
-            3) schedule_del_all ;;
-            0) break ;;
-            *) echo -e "${RED}❌ 无效选择${RESET}" ;;
-        esac
-        read -p "按回车继续..."
-    done
-}
-
-# ================== 主循环 ==================
+#################################
+# 菜单
+#################################
 while true; do
-    show_menu
-    read -p "请选择: " choice
-    case $choice in
-        1) install_rclone ;;
-        2) update_rclone ;;
-        3) config_rclone ;;
-        4) mount_remote ;;
-        5) sync_local_to_remote_multi ;;
-        6) sync_remote_to_local ;;
-        7) list_files_remote ;;
-        8) list_remotes ;;
-        9) unmount_remote_by_name ;;
-        10) show_mounts ;;
-        11) unmount_all ;;
-        12) generate_systemd_service ;;
-        13) generate_systemd_all ;;
-        14) cron_task_menu ;;
-        15) modify_tg ;;
-        16) uninstall_rclone ;;
+    clear
+    echo -e "${CYAN}==== Caady 备份系统====${RESET}"
+    echo -e "${GREEN}1. 立即备份${RESET}"
+    echo -e "${GREEN}2. 恢复备份${RESET}"
+    echo -e "${GREEN}3. 设置定时任务${RESET}"
+    echo -e "${GREEN}4. 删除定时任务${RESET}"
+    echo -e "${GREEN}5. 设置备份目录(当前: $DATA_DIR)${RESET}"
+    echo -e "${GREEN}6. 设置保留天数(当前: $RETAIN_DAYS 天)${RESET}"
+    echo -e "${GREEN}7. 设置Telegram通知${RESET}"
+    echo -e "${GREEN}8. 卸载${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+
+    read -p "$(echo -e ${GREEN}选择: ${RESET})" c
+
+    case $c in
+        1) backup ;;
+        2) restore ;;
+        3) add_cron ;;
+        4) remove_cron ;;
+        5) read -p "新目录: " DATA_DIR; mkdir -p "$DATA_DIR"; save_config ;;
+        6) read -p "保留天数: " RETAIN_DAYS; save_config ;;
+        7) set_tg ;;
+        8)
+            echo -e "${YELLOW}正在卸载...${RESET}"
+            crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+            rm -rf "$INSTALL_DIR"
+            echo -e "${GREEN}卸载完成${RESET}"
+            exit 0
+            ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
-    read -r -p "按回车继续..."
-done
+
+    read -p "$(echo -e ${GREEN}回车继续....${RESET})"
+done 

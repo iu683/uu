@@ -1,17 +1,17 @@
 #!/bin/bash
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
 
 #################################################
-# nginxbackup - 自动安装 + 自动更新增强版
+# caadybackup - 自动安装 + 自动更新增强版 (Caddy + 网站)
 #################################################
-
-VERSION="2.0.0"
 
 #################################
 # 远程自动安装逻辑
 #################################
 
-INSTALL_DIR="/opt/nginxbackup"
-LOCAL_SCRIPT="$INSTALL_DIR/nginxbackup.sh"
+INSTALL_DIR="/opt/caadybackup"
+LOCAL_SCRIPT="$INSTALL_DIR/caadybackup.sh"
 REMOTE_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
 
 if [[ "$0" != "$LOCAL_SCRIPT" ]]; then
@@ -47,13 +47,20 @@ RESET="\033[0m"
 #################################
 CONFIG_FILE="$INSTALL_DIR/config.sh"
 LOG_FILE="$INSTALL_DIR/backup.log"
-CRON_TAG="#nginxbackup_cron"
+CRON_TAG="#caadybackup_cron"
 
 DATA_DIR_DEFAULT="$INSTALL_DIR/data"
 RETAIN_DAYS_DEFAULT=7
 SERVICE_NAME_DEFAULT="$(hostname)"
 
 mkdir -p "$INSTALL_DIR"
+
+#################################
+# Caddy 配置/数据
+#################################
+CADDYFILE="/etc/caddy/Caddyfile"
+CADDY_DATA="/var/lib/caddy/.local/share/caddy"
+WWW_DIR="/var/www"
 
 #################################
 # 卸载
@@ -104,38 +111,30 @@ send_tg() {
 }
 
 #################################
-# 备份
+# 备份 Caddy 配置 + 证书 + 可执行文件
 #################################
 backup() {
-
-    if ! command -v nginx >/dev/null 2>&1; then
-        echo -e "${RED}未安装 nginx${RESET}"
-        return
-    fi
-
     TIMESTAMP=$(date +%F_%H-%M-%S)
-    FILE="$DATA_DIR/nginx_$TIMESTAMP.tar.gz"
+    FILE="$DATA_DIR/caddy_backup_$TIMESTAMP.tar.gz"
 
-    echo -e "${CYAN}检查 nginx 配置...${RESET}"
-    nginx -t >/dev/null 2>&1 || {
-        echo -e "${RED}nginx 配置错误${RESET}"
-        send_tg "❌ 备份失败（配置错误）"
-        return
-    }
+    echo -e "${CYAN}开始备份 Caddy 配置、证书及可执行文件...${RESET}"
 
-    echo -e "${CYAN}开始备份...${RESET}"
+    # 检查文件和目录
+    [[ ! -f "/usr/bin/caddy" ]] && echo -e "${RED}未找到 Caddy 可执行文件${RESET}" && return
+    [[ ! -f "$CADDYFILE" ]] && echo -e "${RED}未找到 Caddyfile${RESET}" && return
+    [[ ! -d "$CADDY_DATA" ]] && echo -e "${RED}未找到 Caddy 数据目录${RESET}" && return
 
     tar czf "$FILE" \
-        /etc/nginx \
-        /var/www \
-        /etc/letsencrypt >> "$LOG_FILE" 2>&1
+        /usr/bin/caddy \
+        "$CADDYFILE" \
+        "$CADDY_DATA" >> "$LOG_FILE" 2>&1
 
     if [[ $? -eq 0 ]]; then
-        echo -e "${GREEN}备份成功${RESET}"
-        send_tg "✅ 备份成功: $TIMESTAMP"
+        echo -e "${GREEN}备份成功：$FILE${RESET}"
+        send_tg "✅ Caddy备份成功: $TIMESTAMP"
     else
         echo -e "${RED}备份失败${RESET}"
-        send_tg "❌ 备份失败"
+        send_tg "❌ Caddy备份失败"
     fi
 
     # 清理旧备份
@@ -143,12 +142,11 @@ backup() {
 }
 
 #################################
-# 恢复
+# 恢复 Caddy 配置 + 证书 + 可执行文件
 #################################
 restore() {
-
     shopt -s nullglob
-    FILE_LIST=("$DATA_DIR"/*.tar.gz)
+    FILE_LIST=("$DATA_DIR"/caddy_backup_*.tar.gz)
 
     if [[ ${#FILE_LIST[@]} -eq 0 ]]; then
         echo -e "${RED}没有备份文件${RESET}"
@@ -166,18 +164,16 @@ restore() {
     FILE="${FILE_LIST[$((num-1))]}"
     [[ -z "$FILE" ]] && return
 
-    echo -e "${YELLOW}确认恢复？将覆盖当前环境 (y/n)${RESET}"
+    echo -e "${YELLOW}确认恢复？将覆盖 Caddy 配置、证书及可执行文件 (y/n)${RESET}"
     read confirm
     [[ "$confirm" != "y" ]] && return
 
-    systemctl stop nginx 2>/dev/null
-
+    systemctl stop caddy 2>/dev/null
     tar xzf "$FILE" -C /
-
-    nginx -t && systemctl start nginx
+    systemctl start caddy
 
     echo -e "${GREEN}恢复完成${RESET}"
-    send_tg "🔄 已恢复: $(basename "$FILE")"
+    send_tg "🔄 Caddy已恢复: $(basename "$FILE")"
 }
 
 #################################
@@ -193,17 +189,15 @@ set_tg() {
 }
 
 #################################
-# 设置定时任务（修复远程问题）
+# 设置定时任务（稳定版）
 #################################
 add_cron() {
-
     echo -e "${CYAN}1 每天0点${RESET}"
     echo -e "${CYAN}2 每周一0点${RESET}"
     echo -e "${CYAN}3 每月1号${RESET}"
     echo -e "${CYAN}4 自定义${RESET}"
 
     read -p "选择: " t
-
     case $t in
         1) cron="0 0 * * *" ;;
         2) cron="0 0 * * 1" ;;
@@ -212,26 +206,26 @@ add_cron() {
         *) return ;;
     esac
 
-    crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
-
-    (crontab -l 2>/dev/null; \
-    echo "$cron /bin/bash $LOCAL_SCRIPT auto >> $LOG_FILE 2>&1 $CRON_TAG") | crontab -
-
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/caadybackup_cron 2>/dev/null
+    echo "$cron /usr/bin/env bash $INSTALL_DIR/caadybackup.sh auto >> $INSTALL_DIR/cron.log 2>&1 $CRON_TAG" >> /tmp/caadybackup_cron
+    crontab /tmp/caadybackup_cron
+    rm -f /tmp/caadybackup_cron
     echo -e "${GREEN}定时任务已设置${RESET}"
 }
+
 #################################
 # 删除定时任务
 #################################
 remove_cron() {
-
     if crontab -l 2>/dev/null | grep -q "$CRON_TAG"; then
-        crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+        crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/caadybackup_cron 2>/dev/null
+        crontab /tmp/caadybackup_cron
+        rm -f /tmp/caadybackup_cron
         echo -e "${GREEN}定时任务已删除${RESET}"
     else
         echo -e "${YELLOW}未发现定时任务${RESET}"
     fi
 }
-
 
 #################################
 # auto模式
@@ -246,19 +240,18 @@ fi
 #################################
 while true; do
     clear
-    echo -e "${CYAN}==== Nginx 备份系统 v$VERSION ====${RESET}"
+    echo -e "${CYAN}==== Caddy+网站备份系统====${RESET}"
     echo -e "${GREEN}1. 立即备份${RESET}"
     echo -e "${GREEN}2. 恢复备份${RESET}"
     echo -e "${GREEN}3. 设置定时任务${RESET}"
     echo -e "${GREEN}4. 删除定时任务${RESET}"
-    echo -e "${GREEN}5. 设置备份目录 (当前: $DATA_DIR)${RESET}"
-    echo -e "${GREEN}6. 设置保留天数 (当前: $RETAIN_DAYS 天)${RESET}"
-    echo -e "${GREEN}7. 设置 Telegram 通知${RESET}"
+    echo -e "${GREEN}5. 设置备份目录(当前: $DATA_DIR)${RESET}"
+    echo -e "${GREEN}6. 设置保留天数(当前: $RETAIN_DAYS 天)${RESET}"
+    echo -e "${GREEN}7. 设置Telegram通知${RESET}"
     echo -e "${GREEN}8. 卸载${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
 
     read -p "$(echo -e ${GREEN}选择: ${RESET})" c
-
     case $c in
         1) backup ;;
         2) restore ;;
@@ -267,7 +260,13 @@ while true; do
         5) read -p "新目录: " DATA_DIR; mkdir -p "$DATA_DIR"; save_config ;;
         6) read -p "保留天数: " RETAIN_DAYS; save_config ;;
         7) set_tg ;;
-        8) bash "$LOCAL_SCRIPT" --uninstall ;;
+        8)
+            echo -e "${YELLOW}正在卸载...${RESET}"
+            crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+            rm -rf "$INSTALL_DIR"
+            echo -e "${GREEN}卸载完成${RESET}"
+            exit 0
+            ;;
         0) exit 0 ;;
     esac
 

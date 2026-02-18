@@ -117,7 +117,7 @@ backup() {
     TIMESTAMP=$(date +%F_%H-%M-%S)
     FILE="$DATA_DIR/caddy_backup_$TIMESTAMP.tar.gz"
 
-    echo -e "${CYAN}开始备份 Caddy 配置、证书及可执行文件...${RESET}"
+    echo -e "${CYAN}开始备份 Caddy 配置、证书...${RESET}"
 
     # 检查文件和目录
     [[ ! -f "/usr/bin/caddy" ]] && echo -e "${RED}未找到 Caddy 可执行文件${RESET}" && return
@@ -156,16 +156,16 @@ restore() {
     FILE="${FILE_LIST[$((num-1))]}"
     [[ -z "$FILE" ]] && return
 
-    echo -e "${YELLOW}确认恢复？将覆盖 Caddy 配置、证书及可执行文件 (y/n)${RESET}"
+    echo -e "${YELLOW}确认恢复？将覆盖 Caddy 配置、证书 (y/n)${RESET}"
     read confirm
     [[ "$confirm" != "y" ]] && return
 
-    # 直接恢复文件，不依赖 systemd
+    # 直接恢复文件
     tar xzf "$FILE" -C /
 
     echo -e "${GREEN}恢复完成${RESET}"
     send_tg "🔄 Caddy 已恢复: $(basename "$FILE")"
-    echo -e "${CYAN}请手动启动 Caddy: /usr/bin/caddy run --config /etc/caddy/Caddyfile${RESET}"
+
 }
 
 #################################
@@ -232,7 +232,7 @@ fi
 #################################
 while true; do
     clear
-    echo -e "${CYAN}==== Caddy+网站备份系统====${RESET}"
+    echo -e "${CYAN}==== Caddy 备份系统====${RESET}"
     echo -e "${GREEN}1. 立即备份${RESET}"
     echo -e "${GREEN}2. 恢复备份${RESET}"
     echo -e "${GREEN}3. 设置定时任务${RESET}"

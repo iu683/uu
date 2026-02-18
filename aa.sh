@@ -2,7 +2,7 @@
 set -e
 
 CADDYFILE="/etc/caddy/Caddyfile"
-CADDY_DATA="/var/lib/caddy/.local/share/caddy"
+CADDY_DATA="/root/.local/share/caddy"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
@@ -16,17 +16,44 @@ pause() {
 install_caddy() {
     if ! command -v caddy >/dev/null 2>&1; then
         echo -e "${GREEN}正在安装 Caddy...${RESET}"
-        sudo apt install -yq debian-keyring debian-archive-keyring apt-transport-https curl
+        sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
         curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
         curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
-        sudo apt update -q
-        sudo apt install -yq caddy
+        sudo apt update
+        sudo apt install -y caddy
         echo -e "${GREEN}Caddy 安装完成${RESET}"
     else
         echo -e "${GREEN}Caddy 已安装${RESET}"
     fi
+
+    # 🔥 确保 systemd 服务存在
+    if [ ! -f /etc/systemd/system/caddy.service ]; then
+        echo -e "${YELLOW}创建 systemd 服务文件...${RESET}"
+        sudo tee /etc/systemd/system/caddy.service >/dev/null <<EOF
+[Unit]
+Description=Caddy
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile
+ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile
+Restart=on-failure
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable caddy
+    sudo systemctl restart caddy
+
+    echo -e "${GREEN}Caddy 已启动 (systemd 模式)${RESET}"
     pause
 }
+
 
 uninstall_caddy() {
     if command -v caddy >/dev/null 2>&1; then
@@ -66,10 +93,17 @@ uninstall_caddy() {
 
 
 reload_caddy() {
-    sudo systemctl reload caddy
-    echo -e "${GREEN}Caddy 配置已重载${RESET}"
+    if systemctl is-active --quiet caddy; then
+        sudo systemctl reload caddy
+        echo -e "${GREEN}Caddy 配置已重载${RESET}"
+    else
+        echo -e "${YELLOW}Caddy 未运行，正在启动...${RESET}"
+        sudo systemctl start caddy
+        echo -e "${GREEN}Caddy 已启动${RESET}"
+    fi
     pause
 }
+
 
 add_site() {
     read -p "请输入域名 (example.com)： " DOMAIN

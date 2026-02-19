@@ -1,154 +1,133 @@
 #!/bin/bash
+# 万能 DNS 切换脚本（自动识别 resolved / resolv.conf）
 
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+dns_order=( "HK" "JP" "TW" "SG" "KR" "US" "UK" "DE" "RFC" "自定义" )
 
-# 检测 systemd-resolved
-use_resolved=false
-if systemctl list-unit-files 2>/dev/null | grep -q systemd-resolved; then
+declare -A dns_list=(
+  ["HK"]="154.83.83.83"
+  ["JP"]="45.76.215.40"
+  ["TW"]="154.83.83.86"
+  ["SG"]="149.28.158.78"
+  ["KR"]="158.247.223.218"
+  ["US"]="66.42.97.127"
+  ["UK"]="45.32.179.189"
+  ["DE"]="80.240.28.27"
+  ["RFC"]="22.22.22.22"
+  ["自定义"]="custom"
+)
+
+green="\033[32m"
+red="\033[31m"
+reset="\033[0m"
+
+########################################
+# 检测是否为 resolved stub 模式
+########################################
+is_resolved_mode() {
     if systemctl is-active systemd-resolved >/dev/null 2>&1; then
-        use_resolved=true
+        if [ -L /etc/resolv.conf ] && readlink /etc/resolv.conf | grep -q "stub-resolv.conf"; then
+            return 0
+        fi
     fi
-fi
-
-########################################
-# 清理并设置 systemd-resolved DNS
-########################################
-set_dns_resolved() {
-    DNS1=$1
-    DNS2=$2
-
-    echo -e "${GREEN}使用 systemd-resolved 模式${RESET}"
-
-    # 清理旧 drop-in
-    sudo rm -rf /etc/systemd/resolved.conf.d
-    sudo mkdir -p /etc/systemd/resolved.conf.d
-
-    # 清理主配置 DNS 行
-    sudo sed -i '/^DNS=/d' /etc/systemd/resolved.conf 2>/dev/null
-    sudo sed -i '/^FallbackDNS=/d' /etc/systemd/resolved.conf 2>/dev/null
-
-    # 写入新配置
-    sudo tee /etc/systemd/resolved.conf.d/custom_dns.conf > /dev/null <<EOF
-[Resolve]
-DNS=$DNS1 $DNS2
-FallbackDNS=8.8.4.4 1.0.0.1
-EOF
-
-    sudo systemctl restart systemd-resolved
-
-    echo -e "${GREEN}DNS 已强制覆盖完成${RESET}"
+    return 1
 }
 
 ########################################
-# 清理并设置 resolv.conf DNS
+# 修改 resolv.conf 文件模式
 ########################################
-set_dns_resolvconf() {
-    DNS1=$1
-    DNS2=$2
+set_resolvconf_dns() {
 
-    echo -e "${GREEN}使用 resolv.conf 模式${RESET}"
-
-    sudo chattr -i /etc/resolv.conf 2>/dev/null
-
-    # 如果是符号链接，删除
-    if [ -L /etc/resolv.conf ]; then
-        sudo rm -f /etc/resolv.conf
-    fi
-
-    # 删除旧文件
-    sudo rm -f /etc/resolv.conf
-
-    # 写入新 DNS
-    sudo tee /etc/resolv.conf > /dev/null <<EOF
-nameserver $DNS1
-nameserver $DNS2
-EOF
-
-    sudo chattr +i /etc/resolv.conf 2>/dev/null
-
-    echo -e "${GREEN}DNS 已强制覆盖并锁定${RESET}"
-}
-
-########################################
-# 恢复系统默认 DNS
-########################################
-restore_default() {
-
-    echo -e "${YELLOW}恢复系统默认 DNS...${RESET}"
-
-    sudo chattr -i /etc/resolv.conf 2>/dev/null
-    sudo rm -f /etc/resolv.conf
-
-    if $use_resolved; then
-        sudo rm -rf /etc/systemd/resolved.conf.d
-        sudo systemctl restart systemd-resolved
-        echo -e "${GREEN}已恢复 systemd-resolved 默认设置${RESET}"
+    # 检查是否锁定
+    if lsattr /etc/resolv.conf 2>/dev/null | grep -q "\-i\-"; then
+        echo -e "${green}检测到 resolv.conf 已锁定，正在解锁...${reset}"
+        chattr -i /etc/resolv.conf 2>/dev/null
+        was_locked=true
     else
-        echo -e "${GREEN}已删除手动 DNS，请重启网络服务${RESET}"
-    fi
-}
-
-########################################
-# 查看当前 DNS
-########################################
-show_dns() {
-    echo
-    echo -e "${GREEN}===== 当前 DNS 状态 =====${RESET}"
-
-    if $use_resolved; then
-        echo -e "${YELLOW}systemd-resolved 状态:${RESET}"
-        resolvectl status | grep -E "DNS Servers|Fallback DNS Servers"
+        was_locked=false
     fi
 
-    echo -e "${YELLOW}/etc/resolv.conf 内容:${RESET}"
-    cat /etc/resolv.conf 2>/dev/null
-    echo
+    cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null
+
+    echo "nameserver $1" > /etc/resolv.conf
+    echo "options timeout:2 attempts:3" >> /etc/resolv.conf
+
+    echo -e "${green}DNS 已写入 resolv.conf${reset}"
+
+    if $was_locked; then
+        echo -ne "${green}是否重新锁定 resolv.conf? (y/n):${reset}"
+        read relock
+        if [[ "$relock" == "y" ]]; then
+            chattr +i /etc/resolv.conf 2>/dev/null
+            echo -e "${green}已重新锁定${reset}"
+        fi
+    fi
+
 }
 
 ########################################
-# 菜单
+# 修改 systemd-resolved 模式
 ########################################
-menu() {
-    clear
-    echo -e "${GREEN}===  DNS 管理工具 ===${RESET}"
-    echo -e "${GREEN}1) Google DNS (8.8.8.8 / 1.1.1.1)${RESET}"
-    echo -e "${GREEN}2) 阿里云 DNS (223.5.5.5 / 183.60.83.19)${RESET}"
-    echo -e "${GREEN}3) ClawDNS (100.100.2.136 / 100.100.2.138)${RESET}"
-    echo -e "${GREEN}4) 查看当前 DNS${RESET}"
-    echo -e "${GREEN}5) 恢复系统默认${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
+set_resolved_dns() {
 
-    read -p $'\033[32m请选择: \033[0m' choice
+    interface=$(ip route | grep default | awk '{print $5}' | head -n1)
 
-    case $choice in
-        1)
-            $use_resolved && set_dns_resolved 8.8.8.8 1.1.1.1 || set_dns_resolvconf 8.8.8.8 1.1.1.1
-            ;;
-        2)
-            $use_resolved && set_dns_resolved 223.5.5.5 183.60.83.19 || set_dns_resolvconf 223.5.5.5 183.60.83.19
-            ;;
-        3)
-            $use_resolved && set_dns_resolved 100.100.2.136 100.100.2.138 || set_dns_resolvconf 100.100.2.136 100.100.2.138
-            ;;
-        4)
-            show_dns
-            ;;
-        5)
-            restore_default
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            echo -e "${RED}无效选择${RESET}"
-            ;;
-    esac
+    if [[ -z "$interface" ]]; then
+        echo -e "${red}无法检测网络接口${reset}"
+        return
+    fi
 
-    read -p $'\033[32m按回车返回菜单...\033[0m'
-    menu
+    echo -e "${green}使用 resolved 模式，接口: $interface${reset}"
+
+    resolvectl dns "$interface" "$1"
+    resolvectl flush-caches
+
+    echo -e "${green}DNS 已通过 resolvectl 应用${reset}"
 }
 
-menu
+########################################
+# 主循环
+########################################
+while true; do
+    echo -e "${green}请选择要使用的 DNS 区域：${reset}"
+    count=0
+    for region in "${dns_order[@]}"; do
+        ((count++))
+        if [[ $count -lt 10 ]]; then
+            printf "${green}[0%d] %-10s${reset}" "$count" "$region"
+        else
+            printf "${green}[%2d] %-10s${reset}" "$count" "$region"
+        fi
+        (( count % 2 == 0 )) && echo ""
+    done
+    echo -e "${green}[00] 退出${reset}"
+
+    read -p "$(echo -e ${green}请输入编号:${reset}) " choice
+
+    if [[ "$choice" == "00" ]]; then
+        exit 0
+    fi
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#dns_order[@]} )); then
+        region="${dns_order[$((choice-1))]}"
+
+        if [[ "$region" == "自定义" ]]; then
+            read -p "$(echo -e ${green}请输入 DNS IP:${reset}) " dns_to_set
+        else
+            dns_to_set="${dns_list[$region]}"
+        fi
+
+        if [[ -n "$dns_to_set" ]]; then
+            echo -e "${green}正在设置 DNS 为 $dns_to_set ($region)...${reset}"
+
+            if is_resolved_mode; then
+                set_resolved_dns "$dns_to_set"
+            else
+                set_resolvconf_dns "$dns_to_set"
+            fi
+
+            echo
+        fi
+    else
+        echo -e "${red}无效选择，请重新输入。${reset}"
+    fi
+done

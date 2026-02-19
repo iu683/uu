@@ -1,99 +1,86 @@
 #!/bin/bash
+# 多系统永久 DNS 修改脚本
 
 GREEN="\033[32m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-# 判断是否使用 systemd-resolved
-use_resolved=false
+CONFIG_DIR="/etc/systemd/resolved.conf.d"
+CONFIG_FILE="$CONFIG_DIR/custom_dns.conf"
+
+echo -e "${GREEN}=== 系统永久 DNS 配置工具 ===${RESET}"
+
+# 输入主 DNS
+read -p $'\033[32m请输入主 DNS (例如 8.8.8.8): \033[0m' MAIN_DNS
+# 输入备用 DNS
+read -p $'\033[32m请输入备用 DNS (可留空，多个用空格): \033[0m' BACKUP_DNS
+
+if [[ -z "$MAIN_DNS" ]]; then
+    echo -e "${RED}错误: 主 DNS 不能为空！${RESET}"
+    exit 1
+fi
+
+echo
+echo -e "${GREEN}即将应用以下配置：${RESET}"
+echo -e "DNS=$MAIN_DNS"
+echo -e "FallbackDNS=$BACKUP_DNS"
+read -p $'\033[32m确认继续? (y/n): \033[0m' CONFIRM
+[[ "$CONFIRM" != "y" ]] && echo -e "${RED}已取消${RESET}" && exit 0
+
+echo
+echo -e "${YELLOW}正在检测系统 DNS 管理方式...${RESET}"
+
+# 检测 systemd-resolved
 if systemctl list-unit-files 2>/dev/null | grep -q systemd-resolved; then
-    if systemctl is-active systemd-resolved >/dev/null 2>&1; then
-        use_resolved=true
+    if systemctl is-enabled systemd-resolved >/dev/null 2>&1; then
+
+        echo -e "${GREEN}检测到 systemd-resolved，清理旧 DNS 配置...${RESET}"
+
+        # 删除所有 drop-in DNS 文件
+        sudo rm -f /etc/systemd/resolved.conf.d/*.conf
+
+        # 确保目录存在
+        sudo mkdir -p /etc/systemd/resolved.conf.d
+
+        # 写入新的 drop-in
+        sudo bash -c "cat > /etc/systemd/resolved.conf.d/custom_dns.conf <<EOF
+[Resolve]
+DNS=$MAIN_DNS
+FallbackDNS=$BACKUP_DNS
+EOF"
+
+        # 清空主文件中的 DNS 行（避免叠加）
+        sudo sed -i '/^DNS=/d' /etc/systemd/resolved.conf 2>/dev/null
+        sudo sed -i '/^FallbackDNS=/d' /etc/systemd/resolved.conf 2>/dev/null
+
+        sudo systemctl restart systemd-resolved
+
+        echo -e "${GREEN}已完全覆盖旧 DNS！${RESET}"
+        echo
+        resolvectl status | grep -E 'DNS Servers|Fallback DNS Servers'
+        exit 0
     fi
 fi
 
-set_dns_resolved() {
-    DNS1=$1
-    DNS2=$2
 
-    echo -e "${GREEN}使用 systemd-resolved 模式（Ubuntu）${RESET}"
+# 如果没有 systemd-resolved
+echo -e "${YELLOW}未检测到 systemd-resolved，使用 resolv.conf 模式${RESET}"
 
-    sudo mkdir -p /etc/systemd
-    sudo cp /etc/systemd/resolved.conf /etc/systemd/resolved.conf.bak 2>/dev/null
+sudo chattr -i /etc/resolv.conf 2>/dev/null
+sudo cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null
 
-    sudo tee /etc/systemd/resolved.conf > /dev/null <<EOF
-[Resolve]
-DNS=$DNS1 $DNS2
-FallbackDNS=8.8.4.4 1.0.0.1
-EOF
+sudo bash -c "cat > /etc/resolv.conf <<EOF
+nameserver $MAIN_DNS
+$(for dns in $BACKUP_DNS; do echo nameserver $dns; done)
+EOF"
 
-    sudo systemctl restart systemd-resolved
-
-    echo -e "${GREEN}修改完成！${RESET}"
-}
-
-set_dns_resolvconf() {
-    DNS1=$1
-    DNS2=$2
-
-    echo -e "${GREEN}使用 resolv.conf 模式（Debian / VPS）${RESET}"
-
-    sudo chattr -i /etc/resolv.conf 2>/dev/null
-    sudo cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null
-
-    sudo tee /etc/resolv.conf > /dev/null <<EOF
-nameserver $DNS1
-nameserver $DNS2
-EOF
-
+read -p $'\033[32m是否锁定 resolv.conf 防止被覆盖? (y/n): \033[0m' LOCK
+if [[ "$LOCK" == "y" ]]; then
     sudo chattr +i /etc/resolv.conf 2>/dev/null
+    echo -e "${GREEN}已锁定 resolv.conf${RESET}"
+fi
 
-    echo -e "${GREEN}修改完成并已锁定！${RESET}"
-}
-
-menu() {
-    clear
-    echo -e "${GREEN}=== DNS 自动切换工具 ===${RESET}"
-    echo -e "${GREEN}1) Google DNS (8.8.8.8 / 1.1.1.1)${RESET}"
-    echo -e "${GREEN}2) 阿里云 DNS (223.5.5.5 / 183.60.83.19)${RESET}"
-    echo -e "${GREEN}3) 查看当前 DNS${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    read -p $'\033[32m请选择: \033[0m' choice
-
-    case $choice in
-        1)
-            if $use_resolved; then
-                set_dns_resolved 8.8.8.8 1.1.1.1
-            else
-                set_dns_resolvconf 8.8.8.8 1.1.1.1
-            fi
-            ;;
-        2)
-            if $use_resolved; then
-                set_dns_resolved 223.5.5.5 183.60.83.19
-            else
-                set_dns_resolvconf 223.5.5.5 183.60.83.19
-            fi
-            ;;
-        3)
-            echo
-            echo -e "${GREEN}当前 DNS:${RESET}"
-            if $use_resolved; then
-                resolvectl status | grep "DNS Servers" -A2
-            fi
-            cat /etc/resolv.conf
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            echo -e "${RED}无效选择${RESET}"
-            ;;
-    esac
-
-    echo
-    read -p $'\033[32m按回车返回菜单...\033[0m'
-    menu
-}
-
-menu
+echo
+echo -e "${GREEN}当前 DNS:${RESET}"
+cat /etc/resolv.conf

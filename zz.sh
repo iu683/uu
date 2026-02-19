@@ -1,44 +1,34 @@
 #!/bin/bash
 set -e
 
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+CONF="/etc/systemd/resolved.conf"
 
-echo -e "${YELLOW}检测系统类型...${RESET}"
+echo "正在配置 systemd-resolved DNS..."
 
-# 检测是否为 Debian/Ubuntu
-if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    if [[ "$ID" != "ubuntu" && "$ID" != "debian" ]]; then
-        echo -e "${RED}当前系统不是 Ubuntu 或 Debian，退出。${RESET}"
-        exit 1
-    fi
-else
-    echo -e "${RED}无法识别系统类型，退出。${RESET}"
-    exit 1
+# 备份原文件
+if [ ! -f ${CONF}.bak ]; then
+    sudo cp $CONF ${CONF}.bak
+    echo "已备份原配置为 ${CONF}.bak"
 fi
 
-echo -e "${GREEN}系统检测通过：$PRETTY_NAME${RESET}"
+# 写入新的 DNS 配置
+sudo sed -i '/^\[Resolve\]/,/^\[/{s/^DNS=.*/DNS=100.100.2.136 100.100.2.138/}' $CONF
+sudo sed -i '/^\[Resolve\]/,/^\[/{s/^FallbackDNS=.*/FallbackDNS=8.8.8.8 1.1.1.1/}' $CONF
 
-# 检查是否已安装
-if dpkg -s systemd-timesyncd >/dev/null 2>&1; then
-    echo -e "${GREEN}systemd-timesyncd 已安装。${RESET}"
-else
-    echo -e "${YELLOW}未检测到 systemd-timesyncd，开始安装...${RESET}"
-    apt update
-    apt install -y systemd-timesyncd
+# 如果没有 DNS 字段则追加
+if ! grep -q "^DNS=" $CONF; then
+    sudo sed -i '/^\[Resolve\]/a DNS=100.100.2.136 100.100.2.138' $CONF
 fi
 
-# 启用并启动
-echo -e "${YELLOW}启用时间同步服务...${RESET}"
-systemctl unmask systemd-timesyncd
-systemctl enable --now systemd-timesyncd
+if ! grep -q "^FallbackDNS=" $CONF; then
+    sudo sed -i '/^\[Resolve\]/a FallbackDNS=8.8.8.8 1.1.1.1' $CONF
+fi
 
-# 启用 NTP
-timedatectl set-ntp true
+# 重启服务
+sudo systemctl restart systemd-resolved
 
-echo -e "${GREEN}时间同步服务已启动！${RESET}"
-echo
-timedatectl status
+echo "DNS 配置完成，当前状态："
+resolvectl status | grep "DNS Servers" -A2
+
+echo "检查 /etc/resolv.conf 内容："
+cat /etc/resolv.conf

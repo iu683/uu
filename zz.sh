@@ -1,107 +1,148 @@
 #!/bin/bash
+# 万能 DNS 切换脚本（Ubuntu 自动关闭 resolved + 可锁定）
 
-GREEN="\033[32m"
-RED="\033[31m"
-RESET="\033[0m"
+dns_order=( "HK" "JP" "TW" "SG" "KR" "US" "UK" "DE" "RFC" "自定义" )
 
-# 判断是否使用 systemd-resolved（Ubuntu 默认）
-use_resolved=false
-if systemctl list-unit-files 2>/dev/null | grep -q systemd-resolved; then
-    if systemctl is-active systemd-resolved >/dev/null 2>&1; then
-        use_resolved=true
-    fi
-fi
+declare -A dns_list=(
+  ["HK"]="154.83.83.83"
+  ["JP"]="45.76.215.40"
+  ["TW"]="154.83.83.86"
+  ["SG"]="149.28.158.78"
+  ["KR"]="158.247.223.218"
+  ["US"]="66.42.97.127"
+  ["UK"]="45.32.179.189"
+  ["DE"]="80.240.28.27"
+  ["RFC"]="22.22.22.22"
+)
 
-set_dns_resolved() {
-    DNS1=$1
-    DNS2=$2
+green="\033[32m"
+red="\033[31m"
+reset="\033[0m"
 
-    echo -e "${GREEN}使用 systemd-resolved 模式${RESET}"
-
-    sudo mkdir -p /etc/systemd
-    sudo cp /etc/systemd/resolved.conf /etc/systemd/resolved.conf.bak 2>/dev/null
-
-    sudo tee /etc/systemd/resolved.conf > /dev/null <<EOF
-[Resolve]
-DNS=$DNS1 $DNS2
-FallbackDNS=8.8.4.4 1.0.0.1
-EOF
-
-    sudo systemctl restart systemd-resolved
-
-    echo -e "${GREEN}修改完成！${RESET}"
+########################################
+# 判断是否 Ubuntu
+########################################
+is_ubuntu() {
+    [ -f /etc/os-release ] && grep -qi ubuntu /etc/os-release
 }
 
-set_dns_resolvconf() {
-    DNS1=$1
-    DNS2=$2
+########################################
+# 判断是否启用 systemd-resolved stub
+########################################
+is_resolved_mode() {
+    systemctl is-active systemd-resolved >/dev/null 2>&1
+}
 
-    echo -e "${GREEN}使用 resolv.conf 模式（Debian / VPS）${RESET}"
+########################################
+# 修改 resolv.conf 文件模式（可锁定）
+########################################
+set_resolvconf_dns() {
+    # 解锁
+    if lsattr /etc/resolv.conf 2>/dev/null | grep -q "\-i\-"; then
+        echo -e "${green}检测到 resolv.conf 已锁定，正在解锁...${reset}"
+        sudo chattr -i /etc/resolv.conf
+    fi
 
-    sudo chattr -i /etc/resolv.conf 2>/dev/null
     sudo cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null
 
-    sudo tee /etc/resolv.conf > /dev/null <<EOF
-nameserver $DNS1
-nameserver $DNS2
-EOF
+    sudo bash -c "cat > /etc/resolv.conf <<EOF
+nameserver $1
+options timeout:2 attempts:3
+EOF"
 
-    sudo chattr +i /etc/resolv.conf 2>/dev/null
+    echo -e "${green}DNS 已写入 resolv.conf${reset}"
 
-    echo -e "${GREEN}修改完成并已锁定！${RESET}"
+    # 可选锁定
+    echo -ne "${green}是否锁定 /etc/resolv.conf 防止被覆盖? (y/n):${reset} "
+    read lock_choice
+    if [[ "$lock_choice" == "y" ]]; then
+        sudo chattr +i /etc/resolv.conf
+        echo -e "${green}/etc/resolv.conf 已锁定${reset}"
+    fi
 }
 
-menu() {
-    clear
-    echo -e "${GREEN}=== DNS 自动切换工具 ===${RESET}"
-    echo -e "${GREEN}1) Google DNS (8.8.8.8 / 1.1.1.1)${RESET}"
-    echo -e "${GREEN}2) 阿里云 DNS (223.5.5.5 / 183.60.83.19)${RESET}"
-    echo -e "${GREEN}3) ClawDNS (100.100.2.136 / 100.100.2.138)${RESET}"
-    echo -e "${GREEN}4) 查看当前 DNS${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    read -p $'\033[32m请选择: \033[0m' choice
+########################################
+# 关闭 Ubuntu resolved 并写入 resolv.conf（可锁定）
+########################################
+disable_ubuntu_resolved() {
+    echo -e "${green}检测到 Ubuntu + systemd-resolved，正在关闭...${reset}"
+    sudo systemctl stop systemd-resolved
+    sudo systemctl disable systemd-resolved
 
-    case $choice in
-        1)
-            if $use_resolved; then
-                set_dns_resolved 8.8.8.8 1.1.1.1
-            else
-                set_dns_resolvconf 8.8.8.8 1.1.1.1
-            fi
-            ;;
-        2)
-            if $use_resolved; then
-                set_dns_resolved 223.5.5.5 183.60.83.19
-            else
-                set_dns_resolvconf 223.5.5.5 183.60.83.19
-            fi
-            ;;
-        3)
-            if $use_resolved; then
-                set_dns_resolved 100.100.2.136 100.100.2.138
-            else
-                set_dns_resolvconf 100.100.2.136 100.100.2.138
-            fi
-            ;;
-        4)
-            echo
-            echo -e "${GREEN}当前 DNS:${RESET}"
-            if $use_resolved; then
-                resolvectl status | grep "DNS Servers" -A2
-            fi
-            cat /etc/resolv.conf
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            echo -e "${RED}无效选择${RESET}"
-            ;;
-    esac
+    sudo rm -f /etc/resolv.conf
 
-    echo
-    read -p $'\033[32m按回车返回菜单...\033[0m'
-    menu
+    sudo bash -c "cat > /etc/resolv.conf <<EOF
+nameserver $1
+nameserver 1.1.1.1
+options timeout:2 attempts:3
+EOF"
+
+    echo -e "${green}resolved 已关闭，DNS 已写入 /etc/resolv.conf${reset}"
+
+    # 可选锁定
+    echo -ne "${green}是否锁定 /etc/resolv.conf 防止被覆盖? (y/n):${reset} "
+    read lock_choice
+    if [[ "$lock_choice" == "y" ]]; then
+        sudo chattr +i /etc/resolv.conf
+        echo -e "${green}/etc/resolv.conf 已锁定${reset}"
+    fi
 }
 
-menu
+########################################
+# 临时 resolvectl 模式
+########################################
+set_resolved_runtime_dns() {
+    interface=$(ip route | awk '/default/ {print $5; exit}')
+    if [ -z "$interface" ]; then
+        echo -e "${red}无法检测网络接口${reset}"
+        return
+    fi
+    sudo resolvectl dns "$interface" "$1"
+    sudo resolvectl flush-caches
+    echo -e "${green}DNS 已通过 resolvectl 临时应用${reset}"
+}
+
+########################################
+# 主循环
+########################################
+while true; do
+    echo -e "${green}请选择要使用的 DNS 区域：${reset}"
+    count=0
+    for region in "${dns_order[@]}"; do
+        ((count++))
+        printf "${green}[%02d] %-10s${reset}" "$count" "$region"
+        (( count % 2 == 0 )) && echo ""
+    done
+    echo -e "${green}[00] 退出${reset}"
+
+    echo -ne "${green}请输入编号:${reset} "
+    read choice
+
+    [ "$choice" = "00" ] && exit 0
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#dns_order[@]} )); then
+        region="${dns_order[$((choice-1))]}"
+
+        if [ "$region" = "自定义" ]; then
+            echo -ne "${green}请输入 DNS IP:${reset} "
+            read dns_to_set
+        else
+            dns_to_set="${dns_list[$region]}"
+        fi
+
+        echo -e "${green}正在设置 DNS 为 $dns_to_set ($region)...${reset}"
+
+        # 核心逻辑
+        if is_ubuntu && is_resolved_mode; then
+            disable_ubuntu_resolved "$dns_to_set"
+        elif is_resolved_mode; then
+            set_resolved_runtime_dns "$dns_to_set"
+        else
+            set_resolvconf_dns "$dns_to_set"
+        fi
+
+        echo
+    else
+        echo -e "${red}无效选择，请重新输入。${reset}"
+    fi
+done

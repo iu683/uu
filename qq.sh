@@ -1,403 +1,267 @@
 #!/bin/bash
-# ========================================
-# Rclone 管理菜单 (终极安全版，支持多挂载 + 定时 + TG通知)
-# ========================================
+set -e
 
-# 颜色
+# ==========================================
+# 一键系统更新 & 常用依赖安装 & 修复 APT 源（Debian 11/12 兼容版）
+# ==========================================
+
+# 颜色定义
+RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
-PLAIN="\033[0m"
+RESET="\033[0m"
 
-# ==================== 菜单 ====================
-show_menu() {
-    clear
-    echo -e "${GREEN}====== Rclone 管理菜单 ======${PLAIN}"
-    echo -e "${GREEN} 1. 安装 Rclone${PLAIN}"
-    echo -e "${GREEN} 2. 卸载 Rclone${PLAIN}"
-    echo -e "${GREEN} 3. 配置 Rclone${PLAIN}"
-    echo -e "${GREEN} 4. 挂载远程存储到本地${PLAIN}"
-    echo -e "${GREEN} 5. 同步 本地 → 远程${PLAIN}"
-    echo -e "${GREEN} 6. 同步 远程 → 本地${PLAIN}"
-    echo -e "${GREEN} 7. 查看远程存储文件${PLAIN}"
-    echo -e "${GREEN} 8. 查看远程存储列表${PLAIN}"
-    echo -e "${GREEN} 9. 卸载挂载点${PLAIN}"
-    echo -e "${GREEN}10. 查看当前挂载点${PLAIN}"
-    echo -e "${GREEN}11. 卸载所有挂载点${PLAIN}"
-    echo -e "${GREEN}12. systemd 自动挂载${PLAIN}"
-    echo -e "${GREEN}13. 定时任务管理${PLAIN}"
-    echo -e "${GREEN}14. 更新 Rclone${PLAIN}"
-    echo -e "${GREEN}15. 自动生成多挂载 systemd${PLAIN}"
-    echo -e "${GREEN} 0. 退出${PLAIN}"
-}
+# 检查是否 root
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}❌ 请使用 root 用户运行此脚本${RESET}"
+    exit 1
+fi
 
-# ==================== 安装/更新/卸载 ====================
-install_rclone() {
-    echo -e "${YELLOW}正在安装 Rclone...${PLAIN}"
-    sudo -v
-    curl https://rclone.org/install.sh | sudo bash
-    echo -e "${GREEN}Rclone 安装完成！${PLAIN}"
-}
+# -------------------------
+# 常用依赖（新增 dnsutils, iperf3, mtr）
+# -------------------------
+deps=(curl wget git net-tools lsof tar unzip rsync pv sudo nc dnsutils iperf3 mtr)
 
-update_rclone() {
-    echo -e "${YELLOW}正在更新 Rclone 到最新版本...${PLAIN}"
-    sudo -v
-    curl https://rclone.org/install.sh | sudo bash
-    echo -e "${GREEN}Rclone 已更新完成！${PLAIN}"
-    rclone version
-}
-
-uninstall_rclone() {
-    echo -e "${YELLOW}正在卸载 Rclone...${PLAIN}"
-    sudo rm -f /usr/bin/rclone /usr/local/bin/rclone
-    sudo systemctl stop 'rclone-mount@*' 2>/dev/null
-    sudo systemctl disable 'rclone-mount@*' 2>/dev/null
-    sudo rm -f /etc/systemd/system/rclone-mount@*.service
-    sudo systemctl daemon-reload
-    sudo rm -f /var/run/rclone_*.pid
-    echo -e "${GREEN}Rclone 及 systemd 挂载已卸载${PLAIN}"
-}
-
-config_rclone() {
-    rclone config
-}
-
-list_remotes() {
-    rclone listremotes
-}
-
-list_files_remote() {
-    read -p "请输入远程名称: " remote
-    [ -z "$remote" ] && { echo -e "${RED}远程名称不能为空${PLAIN}"; return; }
-    rclone ls "${remote}:"
-}
-
-# ==================== 挂载/卸载 ====================
-mount_remote() {
-    read -p "请输入远程名称: " remote
-    [ -z "$remote" ] && { echo -e "${RED}远程名称不能为空${PLAIN}"; return; }
-
-    path="/mnt/$remote"
-    read -p "请输入挂载路径 (默认 $path): " input_path
-    path=${input_path:-$path}
-    mkdir -p "$path"
-
-    if mount | grep -q "on $path type"; then
-        echo -e "${YELLOW}$remote 已挂载在 $path${PLAIN}"
-        return
-    fi
-
-    log="/var/log/rclone_${remote}.log"
-    pidfile="/var/run/rclone_${remote}.pid"
-
-    echo -e "${YELLOW}正在挂载 $remote 到 $path${PLAIN}"
-    nohup rclone mount "${remote}:" "$path" --allow-other --vfs-cache-mode writes --dir-cache-time 1000h &> "$log" &
-    pid=$!
-    echo $pid > "$pidfile"
-    echo -e "${GREEN}$remote 已挂载到 $path，PID: $pid${PLAIN}"
-}
-
-unmount_remote_by_name() {
-    read -p "请输入远程名称: " remote
-    [ -z "$remote" ] && return
-    pidfile="/var/run/rclone_${remote}.pid"
-    path="/mnt/$remote"
-
-    if [ -f "$pidfile" ]; then
-        fusermount -u "$path" 2>/dev/null || umount "$path" 2>/dev/null
-        rm -f "$pidfile"
-        echo -e "${GREEN}已卸载远程: $remote${PLAIN}"
-    else
-        echo -e "${RED}找不到 $remote 的挂载 PID 文件${PLAIN}"
-    fi
-}
-
-unmount_all() {
-    echo -e "${YELLOW}正在卸载所有挂载点...${PLAIN}"
-    for pidfile in /var/run/rclone_*.pid; do
-        [ -f "$pidfile" ] || continue
-        remote=$(basename "$pidfile" | sed 's/rclone_//;s/\.pid//')
-        path="/mnt/$remote"
-        fusermount -u "$path" 2>/dev/null || umount "$path" 2>/dev/null
-        rm -f "$pidfile"
-        echo -e "${GREEN}已卸载 $remote${PLAIN}"
-    done
-}
-
-show_mounts() {
-    echo -e "${YELLOW}当前挂载点:${PLAIN}"
-    for pidfile in /var/run/rclone_*.pid; do
-        [ -f "$pidfile" ] || continue
-        remote=$(basename "$pidfile" | sed 's/rclone_//;s/\.pid//')
-        path="/mnt/$remote"
-        if mount | grep -q "$path"; then
-            echo -e "${GREEN}$remote → $path${PLAIN}"
+# -------------------------
+# 检查并安装依赖（兼容不同系统）
+# -------------------------
+check_and_install() {
+    local check_cmd="$1"
+    local install_cmd="$2"
+    local missing=()
+    for pkg in "${deps[@]}"; do
+        if ! eval "$check_cmd \"$pkg\"" &>/dev/null; then
+            missing+=("$pkg")
         else
-            echo -e "${RED}$remote 挂载未检测到，但 PID 文件存在${PLAIN}"
+            echo -e "${GREEN}✔ 已安装: $pkg${RESET}"
         fi
     done
-}
 
-generate_systemd_service() {
-    read -p "请输入远程名称: " remote
-    [ -z "$remote" ] && return
-
-    path="/mnt/$remote"
-    mkdir -p "$path"
-    service_file="/etc/systemd/system/rclone-mount@${remote}.service"
-
-    sudo tee "$service_file" >/dev/null <<EOF
-[Unit]
-Description=Rclone Mount ${remote}
-After=network-online.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/bin/rclone mount ${remote}: $path --allow-other --vfs-cache-mode writes --dir-cache-time 1000h
-ExecStop=/bin/fusermount -u $path
-Restart=always
-RestartSec=10
-StandardOutput=append:/var/log/rclone_${remote}.log
-StandardError=append:/var/log/rclone_${remote}.log
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    sudo systemctl daemon-reload
-    sudo systemctl enable rclone-mount@${remote}
-    sudo systemctl start rclone-mount@${remote}
-    echo -e "${GREEN}Systemd 自动挂载已生成并启动${PLAIN}"
-}
-
-# ==================== 自动生成 systemd 多挂载 ====================
-generate_systemd_all() {
-    echo -e "${YELLOW}扫描已有挂载点，生成 systemd 服务...${PLAIN}"
-    
-    # 这里扫描 /mnt 下目录或者 PID 文件
-    for pidfile in /var/run/rclone_*.pid; do
-        [ -f "$pidfile" ] || continue
-        remote=$(basename "$pidfile" | sed 's/rclone_//;s/\.pid//')
-        path="/mnt/$remote"
-        service_file="/etc/systemd/system/rclone-mount@${remote}.service"
-
-        # 如果服务文件已存在，跳过
-        [ -f "$service_file" ] && { echo -e "${GREEN}$remote 的 systemd 已存在，跳过${PLAIN}"; continue; }
-
-        sudo tee "$service_file" >/dev/null <<EOF
-[Unit]
-Description=Rclone Mount ${remote}
-After=network-online.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/bin/rclone mount ${remote}: $path --allow-other --vfs-cache-mode writes --dir-cache-time 1000h
-ExecStop=/bin/fusermount -u $path
-Restart=always
-RestartSec=10
-StandardOutput=append:/var/log/rclone_${remote}.log
-StandardError=append:/var/log/rclone_${remote}.log
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-        sudo systemctl daemon-reload
-        sudo systemctl enable rclone-mount@${remote}
-        sudo systemctl start rclone-mount@${remote}
-        echo -e "${GREEN}$remote systemd 服务已生成并启动${PLAIN}"
-    done
-
-    echo -e "${GREEN}所有挂载点 systemd 服务生成完成${PLAIN}"
-}
-
-# ==================== 多目录同步 ====================
-sync_local_to_remote_multi() {
-    read -p "请输入本地目录，用空格分隔: " local_dirs
-    [ -z "$local_dirs" ] && return
-
-    # 检查目录
-    for d in $local_dirs; do
-        [ ! -d "$d" ] && { echo -e "${RED}目录不存在: $d${PLAIN}"; return; }
-    done
-
-    read -p "请输入远程名称: " remote
-    [ -z "$remote" ] && return
-
-    read -p "请输入远程目录 (默认 backup): " remote_dir
-    remote_dir=${remote_dir:-backup}
-
-    read -p "是否启用 Telegram 通知? (y/N): " use_tg
-    if [[ "$use_tg" =~ ^[Yy]$ ]]; then
-        read -p "请输入 Bot Token: " TG_TOKEN
-        read -p "请输入 Chat ID: " TG_CHAT_ID
-        read -p "请输入 VPS 名称（自定义，用于 TG 通知）: " VPS_NAME
-        [ -z "$VPS_NAME" ] && VPS_NAME="未命名VPS"
-        send_tg() {
-            local msg="$1"
-            curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-                -d chat_id="${TG_CHAT_ID}" \
-                -d text="[$VPS_NAME] $msg"
-        }
-    else
-        send_tg() { :; }
-    fi
-
-    for d in $local_dirs; do
-        echo -e "${YELLOW}同步 $d → ${remote}:$remote_dir${PLAIN}"
-        LOG_FILE="/var/log/rclone_sync_$(basename "$d").log"
-        rclone sync "$d" "${remote}:$remote_dir" -v -P >> "$LOG_FILE" 2>&1
-        RET=$?
-        if [ "$RET" -eq 0 ]; then
-            echo "[\$(date '+%F %T')] 同步完成 ✅" >> "$LOG_FILE"
-            send_tg "Rclone 同步完成: $d → ${remote}:$remote_dir ✅"
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo -e "${YELLOW}👉 安装缺失依赖: ${missing[*]}${RESET}"
+        # Debian 系统处理 netcat
+        if [ "$OS_TYPE" = "debian" ]; then
+            apt update -y
+            for pkg in "${missing[@]}"; do
+                if [ "$pkg" = "nc" ]; then
+                    apt install -y netcat-openbsd
+                else
+                    apt install -y "$pkg"
+                fi
+            done
         else
-            echo "[\$(date '+%F %T')] 同步失败 ❌" >> "$LOG_FILE"
-            send_tg "⚠️ Rclone 同步失败: $d → ${remote}:$remote_dir ❌"
+            eval "$install_cmd \"\${missing[@]}\""
+        fi
+    fi
+}
+
+# -------------------------
+# 清理重复 Docker 源
+# -------------------------
+fix_duplicate_docker_sources() {
+    echo -e "${YELLOW}🔍 检查重复 Docker APT 源...${RESET}"
+    local docker_sources
+    docker_sources=$(grep -rl "download.docker.com" /etc/apt/sources.list.d/ 2>/dev/null || true)
+    if [ "$(echo "$docker_sources" | grep -c .)" -gt 1 ]; then
+        echo -e "${RED}⚠️ 检测到重复 Docker 源:${RESET}"
+        echo "$docker_sources"
+        for f in $docker_sources; do
+            if [[ "$f" == *"archive_uri"* ]]; then
+                rm -f "$f"
+                echo -e "${GREEN}✔ 删除多余源: $f${RESET}"
+            fi
+        done
+    else
+        echo -e "${GREEN}✔ Docker 源正常${RESET}"
+    fi
+}
+
+# -------------------------
+# 修复 sources.list（兼容 Bullseye / Bookworm）
+# -------------------------
+fix_sources_for_version() {
+    echo -e "${YELLOW}🔍 修复 sources.list 兼容性...${RESET}"
+    local version="$1"
+    local files
+    files=$(grep -rl "deb" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true)
+    for f in $files; do
+        if [[ "$version" == "bullseye" ]]; then
+            sed -i -r 's/\bnon-free(-firmware){0,3}\b/non-free/g' "$f"
+            sed -i '/deb .*bullseye-backports/s/^/##/' "$f"
+        elif [[ "$version" == "bookworm" ]]; then
+            # Bookworm 保留 non-free-firmware，但去掉重复 non-free
+            sed -i -r 's/\bnon-free non-free\b/non-free/g' "$f"
         fi
     done
+    echo -e "${GREEN}✔ sources.list 已优化${RESET}"
 }
 
-sync_remote_to_local() {
-    read -p "请输入远程名称: " remote
-    [ -z "$remote" ] && return
-    read -p "请输入本地目录: " local
-    [ -z "$local" ] && return
-    read -p "请输入远程目录 (默认 backup): " remote_dir
-    remote_dir=${remote_dir:-backup}
+# -------------------------
+# 系统更新函数
+# -------------------------
+update_system() {
+    echo -e "${GREEN}🔄 检测系统发行版并更新...${RESET}"
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        echo -e "${YELLOW}👉 当前系统: $PRETTY_NAME${RESET}"
 
-    rclone sync "${remote}:$remote_dir" "$local" -v -P
-}
-
-# ==================== 定时任务 ====================
-schedule_add() {
-    read -p "任务名(自定义): " TASK_NAME
-    [ -z "$TASK_NAME" ] && return
-    read -p "本地目录(空格分隔): " LOCAL_DIR
-    [ -z "$LOCAL_DIR" ] && return
-    read -p "远程名称: " REMOTE_NAME
-    [ -z "$REMOTE_NAME" ] && return
-    read -p "远程目录(默认 backup): " REMOTE_DIR
-    REMOTE_DIR=${REMOTE_DIR:-backup}
-    read -p "是否启用 Telegram 通知? (y/N): " use_tg
-    if [[ "$use_tg" =~ ^[Yy]$ ]]; then
-        read -p "Bot Token: " TG_TOKEN
-        read -p "Chat ID: " TG_CHAT_ID
-        read -p "VPS 名称（用于 TG 通知）: " VPS_NAME
-        [ -z "$VPS_NAME" ] && VPS_NAME="未命名VPS"
-    fi
-
-    # 定时选择
-    echo -e "${GREEN}1. 每天0点${PLAIN}"
-    echo -e "${GREEN}2. 每周一0点${PLAIN}"
-    echo -e "${GREEN}3. 每月1号0点${PLAIN}"
-    echo -e "${GREEN}4. 自定义cron${PLAIN}"
-    read -p "选择: " t
-    case $t in
-        1) cron_expr="0 0 * * *" ;;
-        2) cron_expr="0 0 * * 1" ;;
-        3) cron_expr="0 0 1 * *" ;;
-        4) read -p "请输入自定义 cron 表达式: " cron_expr ;;
-        *) echo -e "${RED}❌ 无效选择${PLAIN}"; return ;;
-    esac
-
-    SCRIPT_PATH="/opt/rclone_sync_${TASK_NAME}.sh"
-    cat > "$SCRIPT_PATH" <<EOF
-#!/bin/bash
-LOG_FILE="/var/log/rclone_sync_${TASK_NAME}.log"
-
-send_tg() {
-EOF
-    if [[ "$use_tg" =~ ^[Yy]$ ]]; then
-        echo "    local msg=\"\$1\"" >> "$SCRIPT_PATH"
-        echo "    curl -s -X POST \"https://api.telegram.org/bot${TG_TOKEN}/sendMessage\" -d chat_id=\"${TG_CHAT_ID}\" -d text=\"[${VPS_NAME}] \$msg\"" >> "$SCRIPT_PATH"
+        # 系统类型
+        if [[ "$ID" =~ debian|ubuntu ]]; then
+            OS_TYPE="debian"
+            fix_duplicate_docker_sources
+            fix_sources_for_version "$VERSION_CODENAME"
+            apt update && apt upgrade -y
+            check_and_install "dpkg -s" "apt install -y"
+        elif [[ "$ID" =~ fedora ]]; then
+            OS_TYPE="rhel"
+            dnf check-update || true
+            dnf upgrade -y
+            check_and_install "rpm -q" "dnf install -y"
+        elif [[ "$ID" =~ centos|rhel ]]; then
+            OS_TYPE="rhel"
+            yum check-update || true
+            yum upgrade -y
+            check_and_install "rpm -q" "yum install -y"
+        elif [[ "$ID" =~ alpine ]]; then
+            OS_TYPE="alpine"
+            apk update && apk upgrade
+            check_and_install "apk info -e" "apk add"
+        else
+            echo -e "${RED}❌ 暂不支持的 Linux 发行版: $ID${RESET}"
+            return 1
+        fi
     else
-        echo "    : # 不发送 TG" >> "$SCRIPT_PATH"
+        echo -e "${RED}❌ 无法检测系统发行版 (/etc/os-release 不存在)${RESET}"
+        return 1
     fi
-    cat >> "$SCRIPT_PATH" <<EOF
 
-for d in $LOCAL_DIR; do
-    echo "[\$(date '+%F %T')] 开始同步 \$d → ${REMOTE_NAME}:${REMOTE_DIR}" >> "\$LOG_FILE"
-    rclone sync "\$d" "${REMOTE_NAME}:${REMOTE_DIR}" -v >> "\$LOG_FILE" 2>&1
-    RET=\$?
-    if [ "\$RET" -eq 0 ]; then
-        echo "[\$(date '+%F %T')] 同步完成 ✅" >> "\$LOG_FILE"
-        send_tg "Rclone 同步完成: \$d → ${REMOTE_NAME}:${REMOTE_DIR} ✅"
+    echo -e "${GREEN}✅ 系统更新和依赖安装完成！${RESET}"
+}
+# -------------------------
+# 安装 NextTrace（网络路由追踪工具）
+# -------------------------
+install_nexttrace() {
+    echo -e "${YELLOW}🌐 检查并安装 NextTrace...${RESET}"
+
+    # 确保 curl 存在
+    if ! command -v curl >/dev/null 2>&1; then
+        echo -e "${RED}❌ curl 未安装，无法安装 NextTrace${RESET}"
+        return 1
+    fi
+
+    # 检测是否已安装
+    if command -v nexttrace >/dev/null 2>&1; then
+        echo -e "${GREEN}✔ NextTrace 已安装${RESET}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}👉 开始安装 NextTrace...${RESET}"
+
+    curl -sL https://nxtrace.org/nt | bash
+
+    # 验证
+    if command -v nexttrace >/dev/null 2>&1; then
+        echo -e "${GREEN}✔ NextTrace 安装成功${RESET}"
     else
-        echo "[\$(date '+%F %T')] 同步失败 ❌" >> "\$LOG_FILE"
-        send_tg "⚠️ Rclone 同步失败: \$d → ${REMOTE_NAME}:${REMOTE_DIR} ❌"
+        echo -e "${RED}❌ NextTrace 安装失败${RESET}"
     fi
-done
-EOF
-
-    chmod +x "$SCRIPT_PATH"
-    (crontab -l 2>/dev/null; echo "$cron_expr $SCRIPT_PATH $CRON_PREFIX$TASK_NAME") | crontab -
-    echo -e "${GREEN}任务 ${TASK_NAME} 已添加${PLAIN}"
 }
 
-schedule_del_one() {
-    list_cron
-    read -p "删除任务名称: " TASK_NAME
-    [ -z "$TASK_NAME" ] && return
-    crontab -l 2>/dev/null | grep -v "$CRON_PREFIX$TASK_NAME" | crontab -
-    rm -f "/opt/rclone_sync_${TASK_NAME}.sh"
-    echo -e "${GREEN}任务 ${TASK_NAME} 已删除${PLAIN}"
+# -------------------------
+# 开启 BBR（安全版）
+# -------------------------
+enable_bbr() {
+    echo -e "${YELLOW}🚀 检查并配置 TCP BBR...${RESET}"
+
+    # 检测内核是否支持 BBR
+    if ! sysctl net.ipv4.tcp_available_congestion_control | grep -q bbr; then
+        echo -e "${RED}❌ 当前内核不支持 BBR，无法开启${RESET}"
+        return 1
+    fi
+
+    # 检测是否已经开启 BBR
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control)
+    if [ "$current_cc" = "bbr" ]; then
+        echo -e "${GREEN}✔ BBR 已经开启，无需修改${RESET}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}👉 BBR 未开启，开始配置...${RESET}"
+
+    # 确保 modules.conf 文件存在
+    [ ! -f /etc/modules-load.d/modules.conf ] && touch /etc/modules-load.d/modules.conf
+
+    # 加载 bbr 模块（如果没加载）
+    if ! lsmod | grep -q bbr; then
+        echo "tcp_bbr" >> /etc/modules-load.d/modules.conf
+        modprobe tcp_bbr
+    fi
+
+    # 配置 sysctl
+    grep -qxF "net.core.default_qdisc=fq" /etc/sysctl.conf || echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    grep -qxF "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf || echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+
+    # 应用配置
+    sysctl -p
+
+    # 再次检测
+    if sysctl -n net.ipv4.tcp_congestion_control | grep -q bbr; then
+        echo -e "${GREEN}✔ BBR 已成功开启${RESET}"
+    else
+        echo -e "${RED}❌ BBR 开启失败${RESET}"
+    fi
 }
 
-schedule_del_all() {
-    read -p "确认清空所有 Rclone 定时任务? (y/N): " CONFIRM
-    [ "$CONFIRM" != "y" ] && return
-    crontab -l 2>/dev/null | grep -v "$CRON_PREFIX" | crontab -
-    rm -f /opt/rclone_sync_*.sh
-    echo -e "${GREEN}所有定时任务已清空${PLAIN}"
+# -------------------------
+# 时间同步（Debian / Ubuntu 专用）
+# -------------------------
+enable_time_sync() {
+    echo -e "${YELLOW}⏰ 配置 systemd-timesyncd 时间同步...${RESET}"
+
+    if [ ! -f /etc/os-release ]; then
+        echo -e "${RED}❌ 无法识别系统类型${RESET}"
+        return 1
+    fi
+
+    . /etc/os-release
+
+    if [[ "$ID" != "ubuntu" && "$ID" != "debian" ]]; then
+        echo -e "${RED}❌ 当前系统不是 Debian/Ubuntu，跳过时间同步配置${RESET}"
+        return 0
+    fi
+
+    echo -e "${GREEN}✔ 系统检测通过：$PRETTY_NAME${RESET}"
+
+    # 安装 systemd-timesyncd（极简系统可能没装）
+    if ! dpkg -s systemd-timesyncd >/dev/null 2>&1; then
+        echo -e "${YELLOW}📦 安装 systemd-timesyncd...${RESET}"
+        apt update
+        apt install -y systemd-timesyncd
+    else
+        echo -e "${GREEN}✔ systemd-timesyncd 已安装${RESET}"
+    fi
+
+    # 启用服务
+    systemctl unmask systemd-timesyncd || true
+    systemctl enable --now systemd-timesyncd
+
+    # 启用 NTP
+    timedatectl set-ntp true
+    systemctl restart systemd-timesyncd
+
+    # 状态检查
+    if systemctl is-active --quiet systemd-timesyncd; then
+        echo -e "${GREEN}✔ 时间同步服务已成功启动${RESET}"
+    else
+        echo -e "${RED}❌ 时间同步服务启动失败${RESET}"
+    fi
 }
 
-cron_task_menu() {
-    while true; do
-        echo -e "${GREEN}=== 定时任务管理 ===${PLAIN}"
-        echo -e "${GREEN}------------------------${PLAIN}"
-        list_cron
-        echo -e "${GREEN}------------------------${PLAIN}"
-        echo -e "${GREEN}1. 添加任务${PLAIN}"
-        echo -e "${GREEN}2. 删除任务${PLAIN}"
-        echo -e "${GREEN}3. 清空全部${PLAIN}"
-        echo -e "${GREEN}0. 返回${PLAIN}"
-        read -p "选择: " c
-        case $c in
-            1) schedule_add ;;
-            2) schedule_del_one ;;
-            3) schedule_del_all ;;
-            0) break ;;
-            *) echo -e "${RED}❌ 无效选择${PLAIN}" ;;
-        esac
-        read -p "按回车继续..."
-    done
-}
-
-# ==================== 主循环 ====================
-while true; do
-    show_menu
-    read -p "$(echo -e ${GREEN}请选择:${PLAIN})" choice
-    case $choice in
-        1) install_rclone ;;
-        2) uninstall_rclone ;;
-        3) config_rclone ;;
-        4) mount_remote ;;
-        5) sync_local_to_remote_multi ;;
-        6) sync_remote_to_local ;;
-        7) list_files_remote ;;
-        8) list_remotes ;;
-        9) unmount_remote_by_name ;;
-        10) show_mounts ;;
-        11) unmount_all ;;
-        12) generate_systemd_service ;;
-        13) cron_task_menu ;;
-        14) update_rclone ;;
-        15) generate_systemd_all ;;  
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${PLAIN}" ;;
-    esac
-    read -r -p "按回车继续..."
-done
+# -------------------------
+# 执行
+# -------------------------
+clear
+update_system
+install_nexttrace
+enable_bbr
+enable_time_sync

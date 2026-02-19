@@ -1,64 +1,76 @@
 #!/bin/bash
-set -e
+# 多系统永久 DNS 修改脚本
 
-DNS1="100.100.2.136"
-DNS2="100.100.2.138"
-FDNS1="8.8.8.8"
-FDNS2="1.1.1.1"
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+RESET="\033[0m"
 
-echo "===== DNS 自动配置脚本 ====="
-echo "正在检测系统环境..."
+CONFIG_DIR="/etc/systemd/resolved.conf.d"
+CONFIG_FILE="$CONFIG_DIR/custom_dns.conf"
 
-# 检测是否存在 systemd-resolved
+echo -e "${GREEN}=== 系统永久 DNS 配置工具 ===${RESET}"
+
+# 输入主 DNS
+read -p $'\033[32m请输入主 DNS (例如 8.8.8.8): \033[0m' MAIN_DNS
+# 输入备用 DNS
+read -p $'\033[32m请输入备用 DNS (可留空，多个用空格): \033[0m' BACKUP_DNS
+
+if [[ -z "$MAIN_DNS" ]]; then
+    echo -e "${RED}错误: 主 DNS 不能为空！${RESET}"
+    exit 1
+fi
+
+echo
+echo -e "${GREEN}即将应用以下配置：${RESET}"
+echo -e "DNS=$MAIN_DNS"
+echo -e "FallbackDNS=$BACKUP_DNS"
+read -p $'\033[32m确认继续? (y/n): \033[0m' CONFIRM
+[[ "$CONFIRM" != "y" ]] && echo -e "${RED}已取消${RESET}" && exit 0
+
+echo
+echo -e "${YELLOW}正在检测系统 DNS 管理方式...${RESET}"
+
+# 检测 systemd-resolved
 if systemctl list-unit-files 2>/dev/null | grep -q systemd-resolved; then
-    echo "检测到 systemd-resolved，使用 resolved 模式"
+    if systemctl is-enabled systemd-resolved >/dev/null 2>&1; then
 
-    mkdir -p /etc/systemd
+        echo -e "${GREEN}检测到 systemd-resolved，使用 resolved 模式${RESET}"
 
-    cp /etc/systemd/resolved.conf /etc/systemd/resolved.conf.bak 2>/dev/null || true
+        sudo mkdir -p "$CONFIG_DIR"
 
-    cat > /etc/systemd/resolved.conf <<EOF
+        sudo bash -c "cat > $CONFIG_FILE <<EOF
 [Resolve]
-DNS=$DNS1 $DNS2
-FallbackDNS=$FDNS1 $FDNS2
-EOF
+DNS=$MAIN_DNS
+FallbackDNS=$BACKUP_DNS
+EOF"
 
-    systemctl restart systemd-resolved
+        sudo systemctl restart systemd-resolved
 
-    # 确保 resolv.conf 正确链接
-    if [ -L /etc/resolv.conf ]; then
-        echo "resolv.conf 已是符号链接"
-    else
-        ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
-    fi
-
-else
-    echo "未检测到 systemd-resolved，使用 resolv.conf 模式"
-
-    cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null || true
-
-    cat > /etc/resolv.conf <<EOF
-nameserver $DNS1
-nameserver $DNS2
-nameserver $FDNS1
-nameserver $FDNS2
-EOF
-
-    echo "是否锁定 resolv.conf 防止被 DHCP 覆盖？(y/n)"
-    read LOCK
-
-    if [[ "$LOCK" == "y" || "$LOCK" == "Y" ]]; then
-        chattr +i /etc/resolv.conf 2>/dev/null || echo "锁定失败（可能不支持 chattr）"
-        echo "已锁定 /etc/resolv.conf"
+        echo -e "${GREEN}已通过 systemd-resolved 永久生效！${RESET}"
+        echo
+        resolvectl status | grep -E 'DNS Servers|Fallback DNS Servers'
+        exit 0
     fi
 fi
 
-echo
-echo "===== 当前 DNS 状态 ====="
-if command -v resolvectl >/dev/null 2>&1; then
-    resolvectl status | grep "DNS Servers" -A2 || true
+# 如果没有 systemd-resolved
+echo -e "${YELLOW}未检测到 systemd-resolved，使用 resolv.conf 模式${RESET}"
+
+sudo chattr -i /etc/resolv.conf 2>/dev/null
+sudo cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null
+
+sudo bash -c "cat > /etc/resolv.conf <<EOF
+nameserver $MAIN_DNS
+$(for dns in $BACKUP_DNS; do echo nameserver $dns; done)
+EOF"
+
+read -p $'\033[32m是否锁定 resolv.conf 防止被覆盖? (y/n): \033[0m' LOCK
+if [[ "$LOCK" == "y" ]]; then
+    sudo chattr +i /etc/resolv.conf 2>/dev/null
+    echo -e "${GREEN}已锁定 resolv.conf${RESET}"
 fi
 
 echo
+echo -e "${GREEN}当前 DNS:${RESET}"
 cat /etc/resolv.conf
-echo "===== 配置完成 ====="

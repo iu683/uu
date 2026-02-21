@@ -1,174 +1,138 @@
 #!/bin/bash
-# 永久 DNS 管理工具（带锁定 + 菜单 + 自定义）
+# ========================================
+# 代理协议一键菜单（f/F 快捷键，独立版）
+# ========================================
 
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
+RED="\033[31m"
+BLUE="\033[34m"
 RESET="\033[0m"
+BOLD="\033[1m"
+ORANGE='\033[38;5;208m'
 
-CONFIG_DIR="/etc/systemd/resolved.conf.d"
-CONFIG_FILE="$CONFIG_DIR/custom_dns.conf"
+SCRIPT_PATH="/root/proxy.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
+BIN_LINK_DIR="/usr/local/bin"
 
-########################################
-# root 检测
-########################################
-if [[ $EUID -ne 0 ]]; then
-    echo -e "${RED}请使用 root 运行此脚本${RESET}"
-    exit 1
+# =============================
+# 首次运行自动安装
+# =============================
+if [ ! -f "$SCRIPT_PATH" ]; then
+    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 安装失败，请检查网络或 URL${RESET}"
+        exit 1
+    fi
+    chmod +x "$SCRIPT_PATH"
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/f"
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/F"
+    echo -e "${GREEN}✅ 安装完成${RESET}"
+    echo -e "${GREEN}✅ 快捷键已添加：f 或 F 可快速启动${RESET}"
 fi
 
-########################################
-# 检测 systemd-resolved
-########################################
-use_resolved=false
-if systemctl is-active systemd-resolved >/dev/null 2>&1; then
-    if [ -L /etc/resolv.conf ] && readlink /etc/resolv.conf | grep -q "systemd"; then
-        use_resolved=true
-    fi
-fi
-
-########################################
-# 设置 resolved DNS
-########################################
-set_dns_resolved() {
-    DNS1=$1
-    DNS2=$2
-
-    echo -e "${GREEN}使用 systemd-resolved 模式${RESET}"
-
-    rm -rf $CONFIG_DIR
-    mkdir -p $CONFIG_DIR
-
-    cat > $CONFIG_FILE <<EOF
-[Resolve]
-DNS=$DNS1
-FallbackDNS=$DNS2
-EOF
-
-    sed -i '/^DNS=/d' /etc/systemd/resolved.conf 2>/dev/null
-    sed -i '/^FallbackDNS=/d' /etc/systemd/resolved.conf 2>/dev/null
-
-    systemctl restart systemd-resolved
-    resolvectl flush-caches
-
-    read -p $'\033[32m是否锁定 resolved 配置? (y/n): \033[0m' LOCK
-    if [[ "$LOCK" == "y" ]]; then
-        chattr +i $CONFIG_FILE 2>/dev/null
-        echo -e "${GREEN}已锁定 resolved 配置${RESET}"
-    fi
-
-    echo -e "${GREEN}DNS 已更新完成${RESET}"
-}
-
-########################################
-# 设置 resolv.conf DNS
-########################################
-set_dns_resolvconf() {
-    DNS1=$1
-    DNS2=$2
-
-    echo -e "${GREEN}使用 resolv.conf 模式${RESET}"
-
-    chattr -i /etc/resolv.conf 2>/dev/null
-    rm -f /etc/resolv.conf
-
-    cat > /etc/resolv.conf <<EOF
-nameserver $DNS1
-nameserver $DNS2
-options timeout:2 attempts:3
-EOF
-
-    read -p $'\033[32m是否锁定 resolv.conf? (y/n): \033[0m' LOCK
-    if [[ "$LOCK" == "y" ]]; then
-        chattr +i /etc/resolv.conf 2>/dev/null
-        echo -e "${GREEN}已锁定 resolv.conf${RESET}"
-    fi
-
-    echo -e "${GREEN}DNS 已更新完成${RESET}"
-}
-
-########################################
-# 恢复默认
-########################################
-restore_default() {
-
-    echo -e "${YELLOW}恢复系统默认 DNS...${RESET}"
-
-    chattr -i /etc/resolv.conf 2>/dev/null
-    rm -f /etc/resolv.conf
-    rm -rf $CONFIG_DIR
-
-    if systemctl is-active systemd-resolved >/dev/null 2>&1; then
-        ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
-        systemctl restart systemd-resolved
-        echo -e "${GREEN}已恢复 systemd-resolved 默认${RESET}"
-    else
-        echo -e "${GREEN}已删除手动 DNS，请重启网络${RESET}"
-    fi
-}
-
-########################################
-# 查看当前 DNS
-########################################
-show_dns() {
-    echo
-    echo -e "${GREEN}===== 当前 DNS 状态 =====${RESET}"
-
-    if $use_resolved; then
-        resolvectl status | grep -E "DNS Servers|Fallback DNS Servers"
-    fi
-
-    echo
-    cat /etc/resolv.conf 2>/dev/null
-    echo
-}
-
-########################################
-# 自定义 DNS
-########################################
-custom_dns() {
-    read -p $'\033[32m请输入主 DNS: \033[0m' MAIN_DNS
-    read -p $'\033[32m请输入备用 DNS (可留空，多个空格分隔): \033[0m' BACKUP_DNS
-
-    if [[ -z "$MAIN_DNS" ]]; then
-        echo -e "${RED}主 DNS 不能为空${RESET}"
-        return
-    fi
-
-    $use_resolved && set_dns_resolved "$MAIN_DNS" "$BACKUP_DNS" || set_dns_resolvconf "$MAIN_DNS" "$BACKUP_DNS"
-}
-
-########################################
-# 菜单
-########################################
-menu() {
+# =============================
+# 菜单函数
+# =============================
+show_menu() {
     clear
-    echo -e "${GREEN}=== DNS 永久管理工具 ===${RESET}"
-    echo -e "${GREEN}1) Google DNS (8.8.8.8 / 1.1.1.1)${RESET}"
-    echo -e "${GREEN}2) Cloudflare DNS (1.1.1.1 / 1.0.0.1)${RESET}"
-    echo -e "${GREEN}3) 阿里 DNS (223.5.5.5 / 223.6.6.6)${RESET}"
-    echo -e "${GREEN}4) claw (100.100.2.136 / 100.100.2.138)${RESET}"
-    echo -e "${GREEN}5) 自定义 DNS${RESET}"
-    echo -e "${GREEN}6) 恢复系统默认${RESET}"
-    echo -e "${GREEN}7) 查看当前 DNS${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-
-    read -p $'\033[32m请选择: \033[0m' choice
-
-    case $choice in
-        1) $use_resolved && set_dns_resolved 8.8.8.8 1.1.1.1 || set_dns_resolvconf 8.8.8.8 1.1.1.1 ;;
-        2) $use_resolved && set_dns_resolved 1.1.1.1 1.0.0.1 || set_dns_resolvconf 1.1.1.1 1.0.0.1 ;;
-        3) $use_resolved && set_dns_resolved 223.5.5.5 223.6.6.6 || set_dns_resolvconf 223.5.5.5 223.6.6.6 ;;
-        4) $use_resolved && set_dns_resolved 100.100.2.136 100.100.2.138 || set_dns_resolvconf 100.100.2.136 100.100.2.138 ;;
-        5) custom_dns ;;
-        6) restore_default ;;
-        7) show_dns ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}" ;;
+    echo -e "${ORANGE}======= 代理协议安装菜单 ========${RESET}"
+    echo -e "${YELLOW}[01] 老王Sing-box四合一${RESET}"
+    echo -e "${YELLOW}[02] 老王Xray-2go一键脚本${RESET}"
+    echo -e "${YELLOW}[03] mack-a八合一脚本${RESET}"
+    echo -e "${YELLOW}[04] Sing-box-yg${RESET}"
+    echo -e "${YELLOW}[05] fscarmen-ArgoX${RESET}"
+    echo -e "${YELLOW}[06] Anytls${RESET}"
+    echo -e "${YELLOW}[07] Hysteria2${RESET}"
+    echo -e "${YELLOW}[08] Tuic${RESET}"
+    echo -e "${YELLOW}[09] Reality${RESET}"
+    echo -e "${YELLOW}[10] Snell${RESET}"
+    echo -e "${YELLOW}[11] MTProto${RESET}"
+    echo -e "${YELLOW}[12] MTProxy(Docker)${RESET}"
+    echo -e "${YELLOW}[13] Shadowsocks${RESET}"
+    echo -e "${YELLOW}[14] Socks5${RESET}"
+    echo -e "${YELLOW}[15] SS+SNELL${RESET}"
+    echo -e "${YELLOW}[16] 3XUI管理${RESET}"
+    echo -e "${YELLOW}[17] S-UI面板${RESET}"
+    echo -e "${YELLOW}[18] H-UI面板${RESET}"
+    echo -e "${YELLOW}[19] GOST管理${RESET}"
+    echo -e "${YELLOW}[20] Realm管理${RESET}"
+    echo -e "${YELLOW}[21] FRP管理${RESET}"
+    echo -e "${YELLOW}[22] 哆啦A梦转发面板${RESET}"
+    echo -e "${YELLOW}[23] 极光面板${RESET}"
+    echo -e "${YELLOW}[24] Xboard${RESET}"
+    echo -e "${YELLOW}[25] WireGuard${RESET}"
+    echo -e "${YELLOW}[26] WARP${RESET}"
+    echo -e "${YELLOW}[27] BBR+TCP智能调参${RESET}"
+    echo -e "${YELLOW}[28] 自建DNS解锁服务${RESET}"
+    echo -e "${YELLOW}[29] 自定义DNS解锁${RESET}"
+    echo -e "${YELLOW}[30] 多协议代理部署${RESET}"
+    echo -e "${GREEN}[88] 更新脚本${RESET}"
+    echo -e "${GREEN}[99] 卸载脚本${RESET}"
+    echo -e "${YELLOW}[00] 退出脚本${RESET}"
+    echo -ne "${RED}请输入选项: ${RESET}"
+    read choice
+    install_protocol "$choice"
+}
+# =============================
+# 协议安装函数
+# =============================
+install_protocol() {
+    case "$1" in
+        01|1) bash <(curl -Ls https://raw.githubusercontent.com/eooce/sing-box/main/sing-box.sh) ;;
+        02|2) bash <(curl -Ls https://github.com/eooce/xray-2go/raw/main/xray_2go.sh) ;;
+        03|3) wget -P /root -N --no-check-certificate "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh" && chmod 700 /root/install.sh && /root/install.sh ;;
+        04|4) bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh) ;;
+        05|5) bash <(wget -qO- https://raw.githubusercontent.com/fscarmen/argox/main/argox.sh) ;;
+        06|6) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/anytls.sh) ;;
+        07|7) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Hysteria2.sh) ;;
+        08|8) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/tuicv5.sh) ;;
+        09|9) bash <(curl -L https://raw.githubusercontent.com/yahuisme/xray-vless-reality/main/install.sh) ;;
+        10) wget -O snell.sh --no-check-certificate https://git.io/Snell.sh && chmod +x snell.sh && ./snell.sh ;;
+        11) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/MTProto.sh) ;;
+        12) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/dkmop.sh) ;;
+        13) wget -O ss-rust.sh --no-check-certificate https://raw.githubusercontent.com/xOS/Shadowsocks-Rust/master/ss-rust.sh && chmod +x ss-rust.sh && ./ss-rust.sh ;;
+        14) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/socks5.sh) ;;
+        15) bash <(curl -L -s menu.jinqians.com) ;;
+        16) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/3xui.sh) ;;
+        17) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/s-ui.sh) ;;
+        18) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/H-UI.sh) ;;
+        19) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/gost.sh) ;;
+        20) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/realmdog.sh) ;;
+        21) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/FRP.sh) ;;
+        22) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/dlam.sh) ;;
+        23) bash <(curl -fsSL https://raw.githubusercontent.com/Aurora-Admin-Panel/deploy/main/install.sh) ;;
+        24) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Xboard.sh) ;;
+        25) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/wireguard.sh) ;;
+        26) wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh [option] [lisence/url/token] ;;
+        27) bash <(curl -sL https://raw.githubusercontent.com/yahuisme/network-optimization/main/script.sh) ;;
+        28) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/DNSsnp.sh) ;;
+        29) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/unlockdns.sh) ;;
+        30) wget -O vless-server.sh https://raw.githubusercontent.com/Chil30/vless-all-in-one/main/vless-server.sh && bash vless-server.sh ;;
+        88|088)
+            echo -e "${GREEN}🔄 更新脚本...${RESET}"
+            curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
+            chmod +x "$SCRIPT_PATH"
+            ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/F"
+            ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/f"
+            echo -e "${GREEN}✅ 更新完成! 可直接使用 F/f 启动脚本${RESET}"
+            exec "$SCRIPT_PATH"
+            ;;
+        99|099)
+            echo -e "${YELLOW}正在卸载脚本...${RESET}"
+            rm -f "$SCRIPT_PATH"
+            rm -f "$BIN_LINK_DIR/F" "$BIN_LINK_DIR/f"
+            echo -e "${GREEN}✅ 脚本已卸载${RESET}"
+            exit 0
+            ;;
+        00|0) exit 0 ;;
+        *) echo -e "${RED}无效选择，请重试${RESET}" ;;
     esac
-
-    read -p $'\033[32m按回车返回菜单...\033[0m'
-    menu
 }
 
-menu
+# =============================
+# 主循环
+# =============================
+while true; do
+    show_menu
+done

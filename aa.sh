@@ -73,6 +73,10 @@ read_submenu() {
     return 0
 }
 
+pause_return() {
+    echo
+    read -p "$(echo -e ${BLUE}按回车返回菜单...${RESET})"
+}
 # =============================
 # 一级菜单
 # =============================
@@ -85,7 +89,7 @@ main_menu() {
     echo -e "${YELLOW}[04] 转发管理类${RESET}"
     echo -e "${YELLOW}[05] 组网管理类${RESET}"
     echo -e "${YELLOW}[06] 网络优化类${RESET}"
-    echo -e "${YELLOW}[07] DNS 解锁类${RESET}"
+    echo -e "${YELLOW}[07] DNS解锁类${RESET}"
     echo -e "${GREEN}[88] 更新脚本${RESET}"
     echo -e "${GREEN}[99] 卸载脚本${RESET}"
     echo -e "${YELLOW}[00] 退出${RESET}"
@@ -100,7 +104,7 @@ main_menu() {
         05) zwpanel_menu ;;
         06) network_menu ;;
         07) dns_menu ;;
-        88) update_script ;;
+        88) update_script ; pause_return ;;
         99) uninstall_script ;;
         00) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
@@ -123,21 +127,21 @@ while true; do
     echo -e "${YELLOW}[07] MTProto${RESET}"
     echo -e "${YELLOW}[08] MTProxy(Docker)${RESET}"
     echo -e "${YELLOW}[09] Socks5${RESET}"
-    echo -e "${GREEN}[0]  返回上级${RESET}"
-    echo -e "${GREEN}[x]  退出脚本${RESET}"
+    echo -e "${GREEN}[0]  返回${RESET}"
+    echo -e "${GREEN}[x]  退出${RESET}"
 
     read_submenu || return
 
     case "$sub" in
-        01) wget -O ss-rust.sh https://raw.githubusercontent.com/xOS/Shadowsocks-Rust/master/ss-rust.sh && bash ss-rust.sh ;;
-        02) bash <(curl -L https://raw.githubusercontent.com/yahuisme/xray-vless-reality/main/install.sh) ;;
-        03) wget -O snell.sh --no-check-certificate https://git.io/Snell.sh && chmod +x snell.sh && ./snell.sh ;;
-        04) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/anytls.sh) ;;
-        05) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Hysteria2.sh) ;;
-        06) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/tuicv5.sh) ;;
-        07) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/MTProto.sh) ;;
-        08) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/dkmop.sh) ;;
-        09) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/socks5.sh) ;;
+        01) wget -O ss-rust.sh https://raw.githubusercontent.com/xOS/Shadowsocks-Rust/master/ss-rust.sh && bash ss-rust.sh ; pause_return ;;
+        02) bash <(curl -L https://raw.githubusercontent.com/yahuisme/xray-vless-reality/main/install.sh) ; pause_return ;;
+        03) wget -O snell.sh --no-check-certificate https://git.io/Snell.sh && chmod +x snell.sh && ./snell.sh ; pause_return ;;
+        04) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/anytls.sh) ; pause_return ;;
+        05) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Hysteria2.sh) ; pause_return ;;
+        06) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/tuicv5.sh) ; pause_return ;;
+        07) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/MTProto.sh) ; pause_return ;;
+        08) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/dkmop.sh) ; pause_return ;;
+        09) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/socks5.sh) ; pause_return ;;
         *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
     esac
 done
@@ -158,20 +162,20 @@ while true; do
     echo -e "${YELLOW}[06] 233boySing-box${RESET}"
     echo -e "${YELLOW}[07] SS+SNELL${RESET}"
     echo -e "${YELLOW}[08] VlessallInOne多协议代理${RESET}"
-    echo -e "${GREEN}[0]  返回上级${RESET}"
+    echo -e "${GREEN}[0]  返回${RESET}"
     echo -e "${GREEN}[x]  退出${RESET}"
 
     read_submenu || return
 
     case "$sub" in
-        01) bash <(curl -Ls https://raw.githubusercontent.com/eooce/sing-box/main/sing-box.sh) ;;
-        02) bash <(curl -Ls https://github.com/eooce/xray-2go/raw/main/xray_2go.sh) ;;
-        03) wget -O install.sh https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh && bash install.sh ;;
-        04) bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh) ;;
-        05) bash <(wget -qO- https://raw.githubusercontent.com/fscarmen/argox/main/argox.sh) ;;
-        06) bash <(wget -qO- -o- https://github.com/233boy/sing-box/raw/main/install.sh) ;;
-        07) bash <(curl -L -s menu.jinqians.com) ;;
-        08) wget -O vless-server.sh https://raw.githubusercontent.com/Chil30/vless-all-in-one/main/vless-server.sh && bash vless-server.sh ;;
+        01) bash <(curl -Ls https://raw.githubusercontent.com/eooce/sing-box/main/sing-box.sh) ; pause_return ;;
+        02) bash <(curl -Ls https://github.com/eooce/xray-2go/raw/main/xray_2go.sh) ; pause_return ;;
+        03) wget -O install.sh https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh && bash install.sh ; pause_return ;;
+        04) bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh) ; pause_return ;;
+        05) bash <(wget -qO- https://raw.githubusercontent.com/fscarmen/argox/main/argox.sh) ; pause_return ;;
+        06) bash <(wget -qO- -o- https://github.com/233boy/sing-box/raw/main/install.sh) ; pause_return ;;
+        07) bash <(curl -L -s menu.jinqians.com) ; pause_return ;;
+        08) wget -O vless-server.sh https://raw.githubusercontent.com/Chil30/vless-all-in-one/main/vless-server.sh && bash vless-server.sh ; pause_return ;;
         *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
     esac
 done
@@ -184,20 +188,20 @@ panel_menu() {
 while true; do
     clear
     echo -e "${ORANGE}====== 面板管理类 ======${RESET}"
-    echo -e "${YELLOW}[01] 3XUI${RESET}"
+    echo -e "${YELLOW}[01] 3X-UI${RESET}"
     echo -e "${YELLOW}[02] S-UI${RESET}"
     echo -e "${YELLOW}[03] H-UI${RESET}"
     echo -e "${YELLOW}[04] Xboard${RESET}"
-    echo -e "${GREEN}[0]  返回上级${RESET}"
+    echo -e "${GREEN}[0]  返回${RESET}"
     echo -e "${GREEN}[x]  退出${RESET}"
     
     read_submenu || return
 
     case "$sub" in
-        01) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/3xui.sh) ;;
-        02) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/s-ui.sh) ;;
-        03) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/H-UI.sh) ;;
-        04) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Xboard.sh) ;;
+        01) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/3xui.sh) ; pause_return ;;
+        02) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/s-ui.sh) ; pause_return ;;
+        03) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/H-UI.sh) ; pause_return ;;
+        04) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Xboard.sh) ; pause_return ;;
         0) return ;;
         *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
     esac
@@ -215,16 +219,16 @@ while true; do
     echo -e "${YELLOW}[02] GOST管理${RESET}"
     echo -e "${YELLOW}[03] 极光面板${RESET}"
     echo -e "${YELLOW}[04] 哆啦A梦转发面板${RESET}"
-    echo -e "${GREEN}[0]  返回上级${RESET}"
+    echo -e "${GREEN}[0]  返回${RESET}"
     echo -e "${GREEN}[x]  退出${RESET}"
     
     read_submenu || return
 
     case "$sub" in
-        01) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/realmdog.sh) ;;
-        02) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/gost.sh) ;;
-        03) bash <(curl -fsSL https://raw.githubusercontent.com/Aurora-Admin-Panel/deploy/main/install.sh) ;;
-        04) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/dlam.sh) ;;
+        01) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/realmdog.sh) ; pause_return ;;
+        02) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/gost.sh) ; pause_return ;;
+        03) bash <(curl -fsSL https://raw.githubusercontent.com/Aurora-Admin-Panel/deploy/main/install.sh) ; pause_return ;;
+        04) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/dlam.sh) ; pause_return ;;
         0) return ;;
         *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
     esac
@@ -242,17 +246,17 @@ while true; do
     echo -e "${YELLOW}[02] WireGuard${RESET}"
     echo -e "${YELLOW}[03] WG-Easy${RESET}"
     echo -e "${YELLOW}[04] easytier组网${RESET}"
-    echo -e "${GREEN}[0]  返回上级${RESET}"
+    echo -e "${GREEN}[0]  返回${RESET}"
     echo -e "${GREEN}[x]  退出${RESET}"
     
     read_submenu || return
   
 
     case "$sub" in
-        01) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/FRP.sh) ;;
-        02) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/wireguard.sh) ;;
-        03) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/WGEasy.sh) ;;
-        04) bash <(curl -sL https://raw.githubusercontent.com/ceocok/c.cococ/refs/heads/main/easytier.sh) ;;
+        01) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/FRP.sh) ; pause_return ;;
+        02) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/wireguard.sh) ; pause_return ;;
+        03) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/WGEasy.sh) ; pause_return ;;
+        04) bash <(curl -sL https://raw.githubusercontent.com/ceocok/c.cococ/refs/heads/main/easytier.sh) ; pause_return ;;
         0) return ;;
         *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
     esac
@@ -270,17 +274,17 @@ while true; do
     echo -e "${YELLOW}[03] WARP管理${RESET}"
     echo -e "${YELLOW}[04] BBRv3优化脚本${RESET}"
     echo -e "${YELLOW}[05] BBR+TCP调优${RESET}"
-    echo -e "${GREEN}[0]  返回上级${RESET}"
+    echo -e "${GREEN}[0]  返回${RESET}"
     echo -e "${GREEN}[x]  退出${RESET}"
     
     read_submenu || return
 
     case "$sub" in
-        01) wget --no-check-certificate -O tcpx.sh https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master/tcpx.sh && chmod +x tcpx.sh && ./tcpx.sh ;;
-        02) wget http://sh.nekoneko.cloud/tools.sh -O tools.sh && bash tools.sh ;;
-        03) wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh ;;
-        04)  bash <(curl -fsSL "https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/main/install-alias.sh?$(date +%s)") ;;
-        05) bash <(curl -sL https://raw.githubusercontent.com/yahuisme/network-optimization/main/script.sh) ;;
+        01) wget --no-check-certificate -O tcpx.sh https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master/tcpx.sh && chmod +x tcpx.sh && ./tcpx.sh ; pause_return ;;
+        02) wget http://sh.nekoneko.cloud/tools.sh -O tools.sh && bash tools.sh ; pause_return ;;
+        03) wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh ; pause_return ;;
+        04)  bash <(curl -fsSL "https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/main/install-alias.sh?$(date +%s)") ; pause_return ;;
+        05) bash <(curl -sL https://raw.githubusercontent.com/yahuisme/network-optimization/main/script.sh) ; pause_return ;;
         0) return ;;
         *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
     esac
@@ -297,16 +301,16 @@ while true; do
     echo -e "${YELLOW}[01] DDNS${RESET}"
     echo -e "${YELLOW}[02] 自建DNS解锁${RESET}"
     echo -e "${YELLOW}[03] 自定义DNS解锁${RESET}"
-    echo -e "${GREEN}[0]  返回上级${RESET}"
+    echo -e "${GREEN}[0]  返回${RESET}"
     echo -e "${GREEN}[x]  退出${RESET}"
     
     read_submenu || return
    
 
     case "$sub" in
-        01) bash <(wget -qO- https://raw.githubusercontent.com/mocchen/cssmeihua/mochen/shell/ddns.sh) ;;
-        02) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/DNSsnp.sh) ;;
-        03) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/unlockdns.sh) ;;
+        01) bash <(wget -qO- https://raw.githubusercontent.com/mocchen/cssmeihua/mochen/shell/ddns.sh) ; pause_return ;;
+        02) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/DNSsnp.sh) ; pause_return ;;
+        03) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/unlockdns.sh) ; pause_return ;;
         0) return ;;
         *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
     esac

@@ -3,10 +3,7 @@
 # 代理协议一键菜单（一级+二级分类版）
 # 二级菜单 0 返回 | x 退出 | 自动补零 | 循环菜单
 # ========================================
-if [[ $EUID -ne 0 ]]; then
-    echo -e "${RED}请使用 root 权限运行！${RESET}"
-    exit 1
-fi
+
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
@@ -19,6 +16,22 @@ SCRIPT_PATH="/root/proxy.sh"
 SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
 BIN_LINK_DIR="/usr/local/bin"
 
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}请使用 root 权限运行！${RESET}"
+    exit 1
+fi
+
+# =============================
+# 首次运行自动安装
+# =============================
+if [ ! -f "$SCRIPT_PATH" ]; then
+    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
+    chmod +x "$SCRIPT_PATH"
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/f"
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/F"
+    echo -e "${GREEN}✅ 安装完成，输入 f 或 F 启动${RESET}"
+fi
+
 # =============================
 # 自动补零
 # =============================
@@ -29,14 +42,33 @@ format_choice() {
         echo "$1"
     fi
 }
+# =============================
+# 通用菜单读取（一级用）
+# =============================
+read_mainmenu() {
+    echo -ne "${RED}请选择: ${RESET}"
+    read choice
+
+    choice=$(echo "$choice" | xargs)
+
+    [[ "$choice" =~ ^[xX]$ ]] && exit 0
+    [[ "$choice" == "0" || "$choice" == "00" ]] && exit 0
+
+    choice=$(format_choice "$choice")
+}
 
 # =============================
 # 通用二级菜单读取逻辑
 # =============================
 read_submenu() {
-    read -p "${RED}选择: ${RESET}" sub
+    echo -ne "${RED}选择: ${RESET}"
+    read sub
+
+    sub=$(echo "$sub" | xargs)
+
     [[ "$sub" =~ ^[xX]$ ]] && exit 0
-    [[ "$sub" == "0" ]] && return 1
+    [[ "$sub" == "0" || "$sub" == "00" ]] && return 1
+
     sub=$(format_choice "$sub")
     return 0
 }
@@ -47,30 +79,30 @@ read_submenu() {
 main_menu() {
     clear
     echo -e "${ORANGE}====== 代理管理中心 ======${RESET}"
-    echo -e "${YELLOW}[1] 单协议安装类${RESET}"
-    echo -e "${YELLOW}[2] 多协议安装类${RESET}"
-    echo -e "${YELLOW}[3] 面板管理类${RESET}"
-    echo -e "${YELLOW}[4] 转发管理类${RESET}"
-    echo -e "${YELLOW}[5] 组网管理类${RESET}"
-    echo -e "${YELLOW}[6] 网络优化类${RESET}"
-    echo -e "${YELLOW}[7] DNS 解锁类${RESET}"
+    echo -e "${YELLOW}[01] 单协议安装类${RESET}"
+    echo -e "${YELLOW}[02] 多协议安装类${RESET}"
+    echo -e "${YELLOW}[03] 面板管理类${RESET}"
+    echo -e "${YELLOW}[04] 转发管理类${RESET}"
+    echo -e "${YELLOW}[05] 组网管理类${RESET}"
+    echo -e "${YELLOW}[06] 网络优化类${RESET}"
+    echo -e "${YELLOW}[07] DNS 解锁类${RESET}"
     echo -e "${GREEN}[88] 更新脚本${RESET}"
     echo -e "${GREEN}[99] 卸载脚本${RESET}"
-    echo -e "${YELLOW}[0] 退出${RESET}"
-    echo -ne "${RED}请选择: ${RESET}"
-    read choice
+    echo -e "${YELLOW}[00] 退出${RESET}"
+
+    read_mainmenu
 
     case "$choice" in
-        1) protocol_menu ;;
-        2) protocols_menu ;;
-        3) panel_menu ;;
-        4) zfpanel_menu ;;
-        5) zwpanel_menu ;;
-        6) network_menu ;;
-        7) dns_menu ;;
+        01) protocol_menu ;;
+        02) protocols_menu ;;
+        03) panel_menu ;;
+        04) zfpanel_menu ;;
+        05) zwpanel_menu ;;
+        06) network_menu ;;
+        07) dns_menu ;;
         88) update_script ;;
         99) uninstall_script ;;
-        0) exit 0 ;;
+        00) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
     esac
 }
@@ -81,18 +113,18 @@ main_menu() {
 protocol_menu() {
 while true; do
     clear
-    echo -e "${BLUE}====== 单协议安装类 ======${RESET}"
-    echo -e "${GREEN}[01] Shadowsocks${RESET}"
-    echo -e "${GREEN}[02] Reality${RESET}"
-    echo -e "${GREEN}[03] Snell${RESET}"
-    echo -e "${GREEN}[04] Anytls${RESET}"
-    echo -e "${GREEN}[05] Hysteria2${RESET}"
-    echo -e "${GREEN}[06] Tuicv5${RESET}"
-    echo -e "${GREEN}[07] MTProto${RESET}"
-    echo -e "${GREEN}[08] MTProxy(Docker)${RESET}"
-    echo -e "${GREEN}[09] Socks5${RESET}"
-    echo -e "${YELLOW}[0] 返回上级${RESET}"
-    echo -e "${YELLOW}[x] 退出脚本${RESET}"
+    echo -e "${ORANGE}====== 单协议安装类 ======${RESET}"
+    echo -e "${YELLOW}[01] Shadowsocks${RESET}"
+    echo -e "${YELLOW}[02] Reality${RESET}"
+    echo -e "${YELLOW}[03] Snell${RESET}"
+    echo -e "${YELLOW}[04] Anytls${RESET}"
+    echo -e "${YELLOW}[05] Hysteria2${RESET}"
+    echo -e "${YELLOW}[06] Tuicv5${RESET}"
+    echo -e "${YELLOW}[07] MTProto${RESET}"
+    echo -e "${YELLOW}[08] MTProxy(Docker)${RESET}"
+    echo -e "${YELLOW}[09] Socks5${RESET}"
+    echo -e "${GREEN}[0]  返回上级${RESET}"
+    echo -e "${GREEN}[x]  退出脚本${RESET}"
 
     read_submenu || return
 
@@ -117,17 +149,17 @@ done
 protocols_menu() {
 while true; do
     clear
-    echo -e "${BLUE}====== 多协议安装类 ======${RESET}"
-    echo -e "${GREEN}[01] 老王Sing-box${RESET}"
-    echo -e "${GREEN}[02] 老王Xray-Argo${RESET}"
-    echo -e "${GREEN}[03] mack-a八合一${RESET}"
-    echo -e "${GREEN}[04] ygSing-box${RESET}"
-    echo -e "${GREEN}[05] fscarmen-ArgoX${RESET}"
-    echo -e "${GREEN}[06] 233boySing-box${RESET}"
-    echo -e "${GREEN}[07] SS+SNELL${RESET}"
-    echo -e "${GREEN}[08] VlessallInOne多协议代理${RESET}"
-    echo -e "${YELLOW}[0] 返回上级${RESET}"
-    echo -e "${YELLOW}[x] 退出${RESET}"
+    echo -e "${ORANGE}====== 多协议安装类 ======${RESET}"
+    echo -e "${YELLOW}[01] 老王Sing-box${RESET}"
+    echo -e "${YELLOW}[02] 老王Xray-Argo${RESET}"
+    echo -e "${YELLOW}[03] mack-a八合一${RESET}"
+    echo -e "${YELLOW}[04] ygSing-box${RESET}"
+    echo -e "${YELLOW}[05] fscarmen-ArgoX${RESET}"
+    echo -e "${YELLOW}[06] 233boySing-box${RESET}"
+    echo -e "${YELLOW}[07] SS+SNELL${RESET}"
+    echo -e "${YELLOW}[08] VlessallInOne多协议代理${RESET}"
+    echo -e "${GREEN}[0]  返回上级${RESET}"
+    echo -e "${GREEN}[x]  退出${RESET}"
 
     read_submenu || return
 
@@ -151,13 +183,13 @@ done
 panel_menu() {
 while true; do
     clear
-    echo -e "${BLUE}====== 面板管理类 ======${RESET}"
-    echo -e "${GREEN}[01] 3XUI${RESET}"
-    echo -e "${GREEN}[02] S-UI${RESET}"
-    echo -e "${GREEN}[03] H-UI${RESET}"
-    echo -e "${GREEN}[04] Xboard${RESET}"
-    echo -e "${YELLOW}[0] 返回上级${RESET}"
-    echo -e "${YELLOW}[x] 退出${RESET}"
+    echo -e "${ORANGE}====== 面板管理类 ======${RESET}"
+    echo -e "${YELLOW}[01] 3XUI${RESET}"
+    echo -e "${YELLOW}[02] S-UI${RESET}"
+    echo -e "${YELLOW}[03] H-UI${RESET}"
+    echo -e "${YELLOW}[04] Xboard${RESET}"
+    echo -e "${GREEN}[0]  返回上级${RESET}"
+    echo -e "${GREEN}[x]  退出${RESET}"
     
     read_submenu || return
 
@@ -169,6 +201,7 @@ while true; do
         0) return ;;
         *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
     esac
+done
 }
 
 # =============================
@@ -177,13 +210,13 @@ while true; do
 zfpanel_menu() {
 while true; do
     clear
-    echo -e "${BLUE}====== 转发管理类 ======${RESET}"
-    echo -e "${GREEN}[01] Realm管理${RESET}"
-    echo -e "${GREEN}[02] GOST管理${RESET}"
-    echo -e "${GREEN}[03] 极光面板${RESET}"
-    echo -e "${GREEN}[04] 哆啦A梦转发面板${RESET}"
-    echo -e "${YELLOW}[0] 返回上级${RESET}"
-    echo -e "${YELLOW}[x] 退出${RESET}"
+    echo -e "${ORANGE}====== 转发管理类 ======${RESET}"
+    echo -e "${YELLOW}[01] Realm管理${RESET}"
+    echo -e "${YELLOW}[02] GOST管理${RESET}"
+    echo -e "${YELLOW}[03] 极光面板${RESET}"
+    echo -e "${YELLOW}[04] 哆啦A梦转发面板${RESET}"
+    echo -e "${GREEN}[0]  返回上级${RESET}"
+    echo -e "${GREEN}[x]  退出${RESET}"
     
     read_submenu || return
 
@@ -195,6 +228,7 @@ while true; do
         0) return ;;
         *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
     esac
+done
 }
 
 # =============================
@@ -203,13 +237,13 @@ while true; do
 zwpanel_menu() {
 while true; do
     clear
-    echo -e "${BLUE}====== 组网管理类 ======${RESET}"
-    echo -e "${GREEN}[01] FRP管理${RESET}"
-    echo -e "${GREEN}[02] WireGuard${RESET}"
-    echo -e "${GREEN}[03] WG-Easy${RESET}"
-    echo -e "${GREEN}[04] easytier组网${RESET}"
-    echo -e "${YELLOW}[0] 返回上级${RESET}"
-    echo -e "${YELLOW}[x] 退出${RESET}"
+    echo -e "${ORANGE}====== 组网管理类 ======${RESET}"
+    echo -e "${YELLOW}[01] FRP管理${RESET}"
+    echo -e "${YELLOW}[02] WireGuard${RESET}"
+    echo -e "${YELLOW}[03] WG-Easy${RESET}"
+    echo -e "${YELLOW}[04] easytier组网${RESET}"
+    echo -e "${GREEN}[0]  返回上级${RESET}"
+    echo -e "${GREEN}[x]  退出${RESET}"
     
     read_submenu || return
   
@@ -222,6 +256,7 @@ while true; do
         0) return ;;
         *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
     esac
+done
 }
 # =============================
 # 网络优化
@@ -229,14 +264,14 @@ while true; do
 network_menu() {
 while true; do
     clear
-    echo -e "${BLUE}====== 网络优化类 ======${RESET}"
-    echo -e "${GREEN}[01] BBR管理${RESET}"
-    echo -e "${GREEN}[02] TCP窗口调优${RESET}"
-    echo -e "${GREEN}[03] WARP管理${RESET}"
-    echo -e "${GREEN}[04] BBRv3优化脚本${RESET}"
-    echo -e "${GREEN}[05] BBR+TCP调优${RESET}"
-    echo -e "${YELLOW}[0] 返回上级${RESET}"
-    echo -e "${YELLOW}[x] 退出${RESET}"
+    echo -e "${ORANGE}====== 网络优化类 ======${RESET}"
+    echo -e "${YELLOW}[01] BBR管理${RESET}"
+    echo -e "${YELLOW}[02] TCP窗口调优${RESET}"
+    echo -e "${YELLOW}[03] WARP管理${RESET}"
+    echo -e "${YELLOW}[04] BBRv3优化脚本${RESET}"
+    echo -e "${YELLOW}[05] BBR+TCP调优${RESET}"
+    echo -e "${GREEN}[0]  返回上级${RESET}"
+    echo -e "${GREEN}[x]  退出${RESET}"
     
     read_submenu || return
 
@@ -249,6 +284,7 @@ while true; do
         0) return ;;
         *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
     esac
+done
 }
 
 # =============================
@@ -257,12 +293,12 @@ while true; do
 dns_menu() {
 while true; do
     clear
-    echo -e "${BLUE}====== DNS 解锁类 ======${RESET}"
-    echo -e "${GREEN}[01] DDNS${RESET}"
-    echo -e "${GREEN}[02] 自建DNS解锁${RESET}"
-    echo -e "${GREEN}[03] 自定义DNS解锁${RESET}"
-    echo -e "${YELLOW}[0] 返回上级${RESET}"
-    echo -e "${YELLOW}[x] 退出${RESET}"
+    echo -e "${ORANGE}====== DNS 解锁类 ======${RESET}"
+    echo -e "${YELLOW}[01] DDNS${RESET}"
+    echo -e "${YELLOW}[02] 自建DNS解锁${RESET}"
+    echo -e "${YELLOW}[03] 自定义DNS解锁${RESET}"
+    echo -e "${GREEN}[0]  返回上级${RESET}"
+    echo -e "${GREEN}[x]  退出${RESET}"
     
     read_submenu || return
    
@@ -274,6 +310,7 @@ while true; do
         0) return ;;
         *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
     esac
+done
 }
 
 # =============================
@@ -290,7 +327,7 @@ update_script() {
 uninstall_script() {
     rm -f "$SCRIPT_PATH"
     rm -f "$BIN_LINK_DIR/F" "$BIN_LINK_DIR/f"
-    echo -e "${GREEN}✅ 脚本已卸载${RESET}"
+    echo -e "${RED}✅ 脚本已卸载${RESET}"
     exit 0
 }
 

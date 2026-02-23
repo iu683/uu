@@ -1,138 +1,113 @@
 #!/bin/bash
 # ========================================
-# 代理协议一键菜单（f/F 快捷键，独立版）
+# LX Sync Server 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
-BLUE="\033[34m"
 RESET="\033[0m"
-BOLD="\033[1m"
-ORANGE='\033[38;5;208m'
 
-SCRIPT_PATH="/root/proxy.sh"
-SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
-BIN_LINK_DIR="/usr/local/bin"
+APP_NAME="lxserver"
+CONTAINER_NAME="lx-sync-server"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-# =============================
-# 首次运行自动安装
-# =============================
-if [ ! -f "$SCRIPT_PATH" ]; then
-    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}❌ 安装失败，请检查网络或 URL${RESET}"
+check_env() {
+    command -v docker >/dev/null 2>&1 || {
+        echo -e "${RED}❌ 未检测到 Docker${RESET}"
         exit 1
-    fi
-    chmod +x "$SCRIPT_PATH"
-    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/f"
-    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/F"
-    echo -e "${GREEN}✅ 安装完成${RESET}"
-    echo -e "${GREEN}✅ 快捷键已添加：f 或 F 可快速启动${RESET}"
-fi
-
-# =============================
-# 菜单函数
-# =============================
-show_menu() {
-    clear
-    echo -e "${ORANGE}======= 代理协议安装菜单 ========${RESET}"
-    echo -e "${YELLOW}[01] 老王Sing-box四合一${RESET}"
-    echo -e "${YELLOW}[02] 老王Xray-2go一键脚本${RESET}"
-    echo -e "${YELLOW}[03] mack-a八合一脚本${RESET}"
-    echo -e "${YELLOW}[04] Sing-box-yg${RESET}"
-    echo -e "${YELLOW}[05] fscarmen-ArgoX${RESET}"
-    echo -e "${YELLOW}[06] Anytls${RESET}"
-    echo -e "${YELLOW}[07] Hysteria2${RESET}"
-    echo -e "${YELLOW}[08] Tuic${RESET}"
-    echo -e "${YELLOW}[09] Reality${RESET}"
-    echo -e "${YELLOW}[10] Snell${RESET}"
-    echo -e "${YELLOW}[11] MTProto${RESET}"
-    echo -e "${YELLOW}[12] MTProxy(Docker)${RESET}"
-    echo -e "${YELLOW}[13] Shadowsocks${RESET}"
-    echo -e "${YELLOW}[14] Socks5${RESET}"
-    echo -e "${YELLOW}[15] SS+SNELL${RESET}"
-    echo -e "${YELLOW}[16] 3XUI管理${RESET}"
-    echo -e "${YELLOW}[17] S-UI面板${RESET}"
-    echo -e "${YELLOW}[18] H-UI面板${RESET}"
-    echo -e "${YELLOW}[19] GOST管理${RESET}"
-    echo -e "${YELLOW}[20] Realm管理${RESET}"
-    echo -e "${YELLOW}[21] FRP管理${RESET}"
-    echo -e "${YELLOW}[22] 哆啦A梦转发面板${RESET}"
-    echo -e "${YELLOW}[23] 极光面板${RESET}"
-    echo -e "${YELLOW}[24] Xboard${RESET}"
-    echo -e "${YELLOW}[25] WireGuard${RESET}"
-    echo -e "${YELLOW}[26] WARP${RESET}"
-    echo -e "${YELLOW}[27] BBR+TCP智能调参${RESET}"
-    echo -e "${YELLOW}[28] 自建DNS解锁服务${RESET}"
-    echo -e "${YELLOW}[29] 自定义DNS解锁${RESET}"
-    echo -e "${YELLOW}[30] 多协议代理部署${RESET}"
-    echo -e "${GREEN}[88] 更新脚本${RESET}"
-    echo -e "${GREEN}[99] 卸载脚本${RESET}"
-    echo -e "${YELLOW}[00] 退出脚本${RESET}"
-    echo -ne "${RED}请输入选项: ${RESET}"
-    read choice
-    install_protocol "$choice"
+    }
 }
-# =============================
-# 协议安装函数
-# =============================
-install_protocol() {
-    case "$1" in
-        01|1) bash <(curl -Ls https://raw.githubusercontent.com/eooce/sing-box/main/sing-box.sh) ;;
-        02|2) bash <(curl -Ls https://github.com/eooce/xray-2go/raw/main/xray_2go.sh) ;;
-        03|3) wget -P /root -N --no-check-certificate "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh" && chmod 700 /root/install.sh && /root/install.sh ;;
-        04|4) bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh) ;;
-        05|5) bash <(wget -qO- https://raw.githubusercontent.com/fscarmen/argox/main/argox.sh) ;;
-        06|6) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/anytls.sh) ;;
-        07|7) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Hysteria2.sh) ;;
-        08|8) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/tuicv5.sh) ;;
-        09|9) bash <(curl -L https://raw.githubusercontent.com/yahuisme/xray-vless-reality/main/install.sh) ;;
-        10) wget -O snell.sh --no-check-certificate https://git.io/Snell.sh && chmod +x snell.sh && ./snell.sh ;;
-        11) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/MTProto.sh) ;;
-        12) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/dkmop.sh) ;;
-        13) wget -O ss-rust.sh --no-check-certificate https://raw.githubusercontent.com/xOS/Shadowsocks-Rust/master/ss-rust.sh && chmod +x ss-rust.sh && ./ss-rust.sh ;;
-        14) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/socks5.sh) ;;
-        15) bash <(curl -L -s menu.jinqians.com) ;;
-        16) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/3xui.sh) ;;
-        17) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/s-ui.sh) ;;
-        18) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/H-UI.sh) ;;
-        19) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/gost.sh) ;;
-        20) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/realmdog.sh) ;;
-        21) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/FRP.sh) ;;
-        22) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/dlam.sh) ;;
-        23) bash <(curl -fsSL https://raw.githubusercontent.com/Aurora-Admin-Panel/deploy/main/install.sh) ;;
-        24) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Xboard.sh) ;;
-        25) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/wireguard.sh) ;;
-        26) wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh [option] [lisence/url/token] ;;
-        27) bash <(curl -sL https://raw.githubusercontent.com/yahuisme/network-optimization/main/script.sh) ;;
-        28) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/DNSsnp.sh) ;;
-        29) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/unlockdns.sh) ;;
-        30) wget -O vless-server.sh https://raw.githubusercontent.com/Chil30/vless-all-in-one/main/vless-server.sh && bash vless-server.sh ;;
-        88|088)
-            echo -e "${GREEN}🔄 更新脚本...${RESET}"
-            curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
-            chmod +x "$SCRIPT_PATH"
-            ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/F"
-            ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/f"
-            echo -e "${GREEN}✅ 更新完成! 可直接使用 F/f 启动脚本${RESET}"
-            exec "$SCRIPT_PATH"
-            ;;
-        99|099)
-            echo -e "${YELLOW}正在卸载脚本...${RESET}"
-            rm -f "$SCRIPT_PATH"
-            rm -f "$BIN_LINK_DIR/F" "$BIN_LINK_DIR/f"
-            echo -e "${GREEN}✅ 脚本已卸载${RESET}"
-            exit 0
-            ;;
-        00|0) exit 0 ;;
-        *) echo -e "${RED}无效选择，请重试${RESET}" ;;
+
+menu() {
+    clear
+    echo -e "${GREEN}=== LX Sync Server 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新镜像${RESET}"
+    echo -e "${GREEN}3) 重启${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}5) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+    case $choice in
+        1) install_app ;;
+        2) update_app ;;
+        3) restart_app ;;
+        4) view_logs ;;
+        5) uninstall_app ;;
+        0) exit 0 ;;
+        *) menu ;;
     esac
 }
 
-# =============================
-# 主循环
-# =============================
-while true; do
-    show_menu
-done
+install_app() {
+
+    mkdir -p "$APP_DIR/data"
+    mkdir -p "$APP_DIR/logs"
+
+    read -p "服务端口 [默认 9527]: " input_port
+    PORT=${input_port:-9527}
+
+    cat > "$COMPOSE_FILE" <<EOF
+
+services:
+  lxserver:
+    image: ghcr.io/xcq0607/lxserver:latest
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORT}:9527"
+    volumes:
+      - "$APP_DIR/data:/server/data"
+      - "$APP_DIR/logs:/server/logs"
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    echo -e "${GREEN}✅ LX Server 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
+    echo -e "${GREEN}📂 日志目录: $APP_DIR/logs${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+update_app() {
+    cd "$APP_DIR" || { menu; }
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ 已更新完成${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+restart_app() {
+    cd "$APP_DIR" || { menu; }
+    docker compose restart
+    echo -e "${GREEN}✅ 已重启${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+view_logs() {
+    echo -e "${YELLOW}Ctrl+C 退出日志${RESET}"
+    docker logs -f ${CONTAINER_NAME}
+    menu
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || { menu; }
+    docker compose down
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ 已卸载（含数据和日志）${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+check_env
+menu

@@ -16,6 +16,7 @@ COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 SERVER_IP=$(hostname -I | awk '{print $1}')
 
 
+
 menu() {
     clear
     echo -e "${GREEN}=== WG-Easy 管理菜单 ===${RESET}"
@@ -45,24 +46,12 @@ install_app() {
 
     read -p "Web 管理端口 [默认 51821]: " web_port
     read -p "WireGuard UDP 端口 [默认 51820]: " wg_port
-    read -s -p "管理密码 (必填): " PASSWORD
-    echo
-
-    if [ -z "$PASSWORD" ]; then
-        echo -e "${RED}❌ 密码不能为空${RESET}"
-        sleep 2
-        menu
-        return
-    fi
 
     WEB_PORT=${web_port:-51821}
     WG_PORT=${wg_port:-51820}
 
-    echo -e "${YELLOW}🔐 正在生成 bcrypt 密码...${RESET}"
-
-    PASSWORD_HASH=$(docker run --rm ghcr.io/wg-easy/wg-easy:15 wgpw "$PASSWORD")
-
     cat > "$COMPOSE_FILE" <<EOF
+
 volumes:
   etc_wireguard:
 
@@ -75,10 +64,7 @@ services:
         ipv4_address: 10.42.42.42
         ipv6_address: fdcc:ad94:bacf:61a3::2a
     environment:
-      - PASSWORD_HASH=${PASSWORD_HASH}
-      - WG_DEFAULT_ADDRESS=10.8.0.x
-      - WG_DEFAULT_DNS=1.1.1.1
-      - WG_ALLOWED_IPS=0.0.0.0/0,::/0
+      - PASSWORD=${PASSWORD}
     volumes:
       - etc_wireguard:/etc/wireguard
       - /lib/modules:/lib/modules:ro
@@ -110,7 +96,7 @@ EOF
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    echo -e "${GREEN}✅ WG-Easy v15 已启动${RESET}"
+    echo -e "${GREEN}✅ WG-Easy 已启动${RESET}"
     echo -e "${YELLOW}Web UI: http://${SERVER_IP}:${WEB_PORT}${RESET}"
     echo -e "${GREEN}数据卷: etc_wireguard${RESET}"
 
@@ -132,9 +118,18 @@ restart_app() {
 }
 
 uninstall_app() {
-    cd "$APP_DIR"
-    docker compose down
-    echo -e "${YELLOW}已停止容器（数据卷未删除）${RESET}"
+
+    echo -e "${YELLOW}🛑 停止并删除容器 + 数据卷...${RESET}"
+
+    cd "$APP_DIR" 2>/dev/null || true
+    docker compose down -v 2>/dev/null
+
+    echo -e "${YELLOW}🗑 删除 $APP_DIR 目录...${RESET}"
+    rm -rf "$APP_DIR"
+
+    echo -e "${GREEN}✅ WG-Easy 已彻底卸载完成${RESET}"
+
+    sleep 2
     menu
 }
 

@@ -47,7 +47,6 @@ install_app() {
 
     read -p "Web 管理端口 [默认 51821]: " web_port
     read -p "WireGuard UDP 端口 [默认 51820]: " wg_port
-    read -p "管理密码 (必填): " PASSWORD
 
     WEB_PORT=${web_port:-51821}
     WG_PORT=${wg_port:-51820}

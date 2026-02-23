@@ -1,125 +1,336 @@
 #!/bin/bash
-# Ubuntu 静态 DNS 管理工具（关闭 systemd-resolved + resolv.conf）
 
+# 颜色
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
+RED="\033[31m"
+BLUE="\033[34m"
 RESET="\033[0m"
+BOLD="\033[1m"
+ORANGE='\033[38;5;208m'
 
-RESOLV_FILE="/etc/resolv.conf"
+# 路径变量（必须在前）
+SCRIPT_PATH="/root/proxy.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/mm.sh"
+BIN_LINK_DIR="/usr/local/bin"
 
-########################################
-# root 检测
-########################################
+# root检测
 if [[ $EUID -ne 0 ]]; then
-    echo -e "${RED}请使用 root 运行此脚本${RESET}"
+    echo -e "${RED}请使用 root 权限运行！${RESET}"
     exit 1
 fi
 
-########################################
-# 停用 systemd-resolved
-########################################
-disable_resolved() {
-    systemctl disable --now systemd-resolved 2>/dev/null
-    # 删除 stub-resolv.conf 链接
-    [ -L "$RESOLV_FILE" ] && rm -f "$RESOLV_FILE"
-}
+# 首次安装检测
+if [ ! -f "$SCRIPT_PATH" ]; then
+    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
+    chmod +x "$SCRIPT_PATH"
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/f"
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/F"
+    echo -e "${GREEN}✅ 安装完成，输入 f 或 F 启动${RESET}"
+fi"
 
-########################################
-# 设置 resolv.conf DNS
-########################################
-set_dns_resolvconf() {
-    DNS1=$1
-    DNS2=$2
-
-    echo -e "${GREEN}正在设置 DNS: $DNS1 $DNS2${RESET}"
-
-    chattr -i $RESOLV_FILE 2>/dev/null
-    rm -f $RESOLV_FILE
-
-    cat > $RESOLV_FILE <<EOF
-nameserver $DNS1
-nameserver $DNS2
-options timeout:2 attempts:3
-EOF
-
-    read -p $'\033[32m是否锁定 resolv.conf? (y/n): \033[0m' LOCK
-    if [[ "$LOCK" == "y" ]]; then
-        chattr +i $RESOLV_FILE 2>/dev/null
-        echo -e "${GREEN}已锁定 resolv.conf${RESET}"
+# =============================
+# 自动补零
+# =============================
+format_choice() {
+    if [[ "$1" =~ ^[0-9]+$ ]]; then
+        printf "%02d" "$1"
+    else
+        echo "$1"
     fi
+}
+# =============================
+# 通用菜单读取（一级用）
+# =============================
+read_mainmenu() {
+    echo -ne "${RED}请选择: ${RESET}"
+    read choice
 
-    echo -e "${GREEN}DNS 已更新完成${RESET}"
+    choice=$(echo "$choice" | xargs)
+
+    [[ "$choice" =~ ^[xX]$ ]] && exit 0
+    [[ "$choice" == "0" || "$choice" == "00" ]] && exit 0
+
+    choice=$(format_choice "$choice")
 }
 
-########################################
-# 自定义 DNS
-########################################
-custom_dns() {
-    read -p $'\033[32m请输入主 DNS: \033[0m' MAIN_DNS
-    read -p $'\033[32m请输入备用 DNS (可留空): \033[0m' BACKUP_DNS
+# =============================
+# 通用二级菜单读取逻辑
+# =============================
+read_submenu() {
+    echo -ne "${RED}选择: ${RESET}"
+    read sub
 
-    if [[ -z "$MAIN_DNS" ]]; then
-        echo -e "${RED}主 DNS 不能为空${RESET}"
-        return
-    fi
+    sub=$(echo "$sub" | xargs)
 
-    set_dns_resolvconf "$MAIN_DNS" "$BACKUP_DNS"
+    [[ "$sub" =~ ^[xX]$ ]] && exit 0
+    [[ "$sub" == "0" || "$sub" == "00" ]] && return 1
+
+    sub=$(format_choice "$sub")
+    return 0
 }
 
-########################################
-# 恢复默认
-########################################
-restore_default() {
-    echo -e "${YELLOW}恢复系统默认 DNS...${RESET}"
-    chattr -i $RESOLV_FILE 2>/dev/null
-    rm -f $RESOLV_FILE
-    echo -e "${GREEN}已删除静态 DNS，请重启网络或配置新的 DNS${RESET}"
-}
-
-########################################
-# 查看当前 DNS
-########################################
-show_dns() {
-    echo
-    echo -e "${GREEN}===== 当前 DNS 状态 =====${RESET}"
-    cat $RESOLV_FILE 2>/dev/null
-    echo
-}
-
-########################################
-# 菜单
-########################################
-menu() {
-    disable_resolved  # 每次进入菜单确保 systemd-resolved 被停用
-
+# =============================
+# 一级菜单
+# =============================
+main_menu() {
     clear
-    echo -e "${GREEN}=== Ubuntu 静态 DNS 管理工具 ===${RESET}"
-    echo -e "${GREEN}1) Google DNS (8.8.8.8 / 1.1.1.1)${RESET}"
-    echo -e "${GREEN}2) Cloudflare DNS (1.1.1.1 / 1.0.0.1)${RESET}"
-    echo -e "${GREEN}3) 阿里 DNS (223.5.5.5 / 223.6.6.6)${RESET}"
-    echo -e "${GREEN}4) claw (100.100.2.136 / 100.100.2.138)${RESET}"
-    echo -e "${GREEN}5) 自定义 DNS${RESET}"
-    echo -e "${GREEN}6) 恢复默认${RESET}"
-    echo -e "${GREEN}7) 查看当前 DNS${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
+    echo -e "${ORANGE}====== 代理管理中心 ======${RESET}"
+    echo -e "${YELLOW}[01] 单协议安装类${RESET}"
+    echo -e "${YELLOW}[02] 多协议安装类${RESET}"
+    echo -e "${YELLOW}[03] 面板管理类${RESET}"
+    echo -e "${YELLOW}[04] 转发管理类${RESET}"
+    echo -e "${YELLOW}[05] 组网管理类${RESET}"
+    echo -e "${YELLOW}[06] 网络优化类${RESET}"
+    echo -e "${YELLOW}[07] DNS 解锁类${RESET}"
+    echo -e "${GREEN}[88] 更新脚本${RESET}"
+    echo -e "${GREEN}[99] 卸载脚本${RESET}"
+    echo -e "${YELLOW}[00] 退出${RESET}"
 
-    read -p $'\033[32m请选择: \033[0m' choice
+    read_mainmenu
 
-    case $choice in
-        1) set_dns_resolvconf 8.8.8.8 1.1.1.1 ;;
-        2) set_dns_resolvconf 1.1.1.1 1.0.0.1 ;;
-        3) set_dns_resolvconf 223.5.5.5 223.6.6.6 ;;
-        4) set_dns_resolvconf 100.100.2.136 100.100.2.138 ;;
-        5) custom_dns ;;
-        6) restore_default ;;
-        7) show_dns ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}" ;;
+    case "$choice" in
+        01) protocol_menu ;;
+        02) protocols_menu ;;
+        03) panel_menu ;;
+        04) zfpanel_menu ;;
+        05) zwpanel_menu ;;
+        06) network_menu ;;
+        07) dns_menu ;;
+        88) update_script ;;
+        99) uninstall_script ;;
+        00) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
     esac
-
-    read -p $'\033[32m按回车返回菜单...\033[0m'
-    menu
 }
 
-menu
+# =============================
+# 单协议类
+# =============================
+protocol_menu() {
+while true; do
+    clear
+    echo -e "${ORANGE}====== 单协议安装类 ======${RESET}"
+    echo -e "${GREEN}[01] Shadowsocks${RESET}"
+    echo -e "${GREEN}[02] Reality${RESET}"
+    echo -e "${GREEN}[03] Snell${RESET}"
+    echo -e "${GREEN}[04] Anytls${RESET}"
+    echo -e "${GREEN}[05] Hysteria2${RESET}"
+    echo -e "${GREEN}[06] Tuicv5${RESET}"
+    echo -e "${GREEN}[07] MTProto${RESET}"
+    echo -e "${GREEN}[08] MTProxy(Docker)${RESET}"
+    echo -e "${GREEN}[09] Socks5${RESET}"
+    echo -e "${YELLOW}[0] 返回上级${RESET}"
+    echo -e "${YELLOW}[x] 退出脚本${RESET}"
+
+    read_submenu || return
+
+    case "$sub" in
+        01) wget -O ss-rust.sh https://raw.githubusercontent.com/xOS/Shadowsocks-Rust/master/ss-rust.sh && bash ss-rust.sh ;;
+        02) bash <(curl -L https://raw.githubusercontent.com/yahuisme/xray-vless-reality/main/install.sh) ;;
+        03) wget -O snell.sh --no-check-certificate https://git.io/Snell.sh && chmod +x snell.sh && ./snell.sh ;;
+        04) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/anytls.sh) ;;
+        05) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Hysteria2.sh) ;;
+        06) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/tuicv5.sh) ;;
+        07) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/MTProto.sh) ;;
+        08) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/dkmop.sh) ;;
+        09) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/socks5.sh) ;;
+        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+    esac
+done
+}
+
+# =============================
+# 多协议类
+# =============================
+protocols_menu() {
+while true; do
+    clear
+    echo -e "${ORANGE}====== 多协议安装类 ======${RESET}"
+    echo -e "${GREEN}[01] 老王Sing-box${RESET}"
+    echo -e "${GREEN}[02] 老王Xray-Argo${RESET}"
+    echo -e "${GREEN}[03] mack-a八合一${RESET}"
+    echo -e "${GREEN}[04] ygSing-box${RESET}"
+    echo -e "${GREEN}[05] fscarmen-ArgoX${RESET}"
+    echo -e "${GREEN}[06] 233boySing-box${RESET}"
+    echo -e "${GREEN}[07] SS+SNELL${RESET}"
+    echo -e "${GREEN}[08] VlessallInOne多协议代理${RESET}"
+    echo -e "${YELLOW}[0] 返回上级${RESET}"
+    echo -e "${YELLOW}[x] 退出${RESET}"
+
+    read_submenu || return
+
+    case "$sub" in
+        01) bash <(curl -Ls https://raw.githubusercontent.com/eooce/sing-box/main/sing-box.sh) ;;
+        02) bash <(curl -Ls https://github.com/eooce/xray-2go/raw/main/xray_2go.sh) ;;
+        03) wget -O install.sh https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh && bash install.sh ;;
+        04) bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh) ;;
+        05) bash <(wget -qO- https://raw.githubusercontent.com/fscarmen/argox/main/argox.sh) ;;
+        06) bash <(wget -qO- -o- https://github.com/233boy/sing-box/raw/main/install.sh) ;;
+        07) bash <(curl -L -s menu.jinqians.com) ;;
+        08) wget -O vless-server.sh https://raw.githubusercontent.com/Chil30/vless-all-in-one/main/vless-server.sh && bash vless-server.sh ;;
+        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+    esac
+done
+}
+
+# =============================
+# 二级菜单：面板类
+# =============================
+panel_menu() {
+while true; do
+    clear
+    echo -e "${ORANGE}====== 面板管理类 ======${RESET}"
+    echo -e "${GREEN}[01] 3XUI${RESET}"
+    echo -e "${GREEN}[02] S-UI${RESET}"
+    echo -e "${GREEN}[03] H-UI${RESET}"
+    echo -e "${GREEN}[04] Xboard${RESET}"
+    echo -e "${YELLOW}[0] 返回上级${RESET}"
+    echo -e "${YELLOW}[x] 退出${RESET}"
+    
+    read_submenu || return
+
+    case "$sub" in
+        01) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/3xui.sh) ;;
+        02) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/s-ui.sh) ;;
+        03) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/H-UI.sh) ;;
+        04) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Xboard.sh) ;;
+        0) return ;;
+        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+    esac
+done
+}
+
+# =============================
+# 二级菜单：转发类
+# =============================
+zfpanel_menu() {
+while true; do
+    clear
+    echo -e "${ORANGE}====== 转发管理类 ======${RESET}"
+    echo -e "${GREEN}[01] Realm管理${RESET}"
+    echo -e "${GREEN}[02] GOST管理${RESET}"
+    echo -e "${GREEN}[03] 极光面板${RESET}"
+    echo -e "${GREEN}[04] 哆啦A梦转发面板${RESET}"
+    echo -e "${YELLOW}[0] 返回上级${RESET}"
+    echo -e "${YELLOW}[x] 退出${RESET}"
+    
+    read_submenu || return
+
+    case "$sub" in
+        01) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/realmdog.sh) ;;
+        02) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/gost.sh) ;;
+        03) bash <(curl -fsSL https://raw.githubusercontent.com/Aurora-Admin-Panel/deploy/main/install.sh) ;;
+        04) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/dlam.sh) ;;
+        0) return ;;
+        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+    esac
+done
+}
+
+# =============================
+# 二级菜单：组网类
+# =============================
+zwpanel_menu() {
+while true; do
+    clear
+    echo -e "${ORANGE}====== 组网管理类 ======${RESET}"
+    echo -e "${GREEN}[01] FRP管理${RESET}"
+    echo -e "${GREEN}[02] WireGuard${RESET}"
+    echo -e "${GREEN}[03] WG-Easy${RESET}"
+    echo -e "${GREEN}[04] easytier组网${RESET}"
+    echo -e "${YELLOW}[0] 返回上级${RESET}"
+    echo -e "${YELLOW}[x] 退出${RESET}"
+    
+    read_submenu || return
+  
+
+    case "$sub" in
+        01) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/FRP.sh) ;;
+        02) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/wireguard.sh) ;;
+        03) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/WGEasy.sh) ;;
+        04) bash <(curl -sL https://raw.githubusercontent.com/ceocok/c.cococ/refs/heads/main/easytier.sh) ;;
+        0) return ;;
+        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+    esac
+done
+}
+# =============================
+# 网络优化
+# =============================
+network_menu() {
+while true; do
+    clear
+    echo -e "${ORANGE}====== 网络优化类 ======${RESET}"
+    echo -e "${GREEN}[01] BBR管理${RESET}"
+    echo -e "${GREEN}[02] TCP窗口调优${RESET}"
+    echo -e "${GREEN}[03] WARP管理${RESET}"
+    echo -e "${GREEN}[04] BBRv3优化脚本${RESET}"
+    echo -e "${GREEN}[05] BBR+TCP调优${RESET}"
+    echo -e "${YELLOW}[0] 返回上级${RESET}"
+    echo -e "${YELLOW}[x] 退出${RESET}"
+    
+    read_submenu || return
+
+    case "$sub" in
+        01) wget --no-check-certificate -O tcpx.sh https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master/tcpx.sh && chmod +x tcpx.sh && ./tcpx.sh ;;
+        02) wget http://sh.nekoneko.cloud/tools.sh -O tools.sh && bash tools.sh ;;
+        03) wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh ;;
+        04)  bash <(curl -fsSL "https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/main/install-alias.sh?$(date +%s)") ;;
+        05) bash <(curl -sL https://raw.githubusercontent.com/yahuisme/network-optimization/main/script.sh) ;;
+        0) return ;;
+        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+    esac
+done
+}
+
+# =============================
+# DNS 类
+# =============================
+dns_menu() {
+while true; do
+    clear
+    echo -e "${ORANGE}====== DNS 解锁类 ======${RESET}"
+    echo -e "${GREEN}[01] DDNS${RESET}"
+    echo -e "${GREEN}[02] 自建DNS解锁${RESET}"
+    echo -e "${GREEN}[03] 自定义DNS解锁${RESET}"
+    echo -e "${YELLOW}[0] 返回上级${RESET}"
+    echo -e "${YELLOW}[x] 退出${RESET}"
+    
+    read_submenu || return
+   
+
+    case "$sub" in
+        01) bash <(wget -qO- https://raw.githubusercontent.com/mocchen/cssmeihua/mochen/shell/ddns.sh) ;;
+        02) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/DNSsnp.sh) ;;
+        03) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/unlockdns.sh) ;;
+        0) return ;;
+        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+    esac
+done
+}
+
+# =============================
+# 更新 & 卸载
+# =============================
+update_script() {
+    echo -e "${GREEN}更新中...${RESET}"
+    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
+    chmod +x "$SCRIPT_PATH"
+    echo -e "${RED}✅ 更新完成!${RESET}"
+    exec "$SCRIPT_PATH"
+}
+
+uninstall_script() {
+    rm -f "$SCRIPT_PATH"
+    rm -f "$BIN_LINK_DIR/F" "$BIN_LINK_DIR/f"
+    echo -e "${RED}✅ 脚本已卸载${RESET}"
+    exit 0
+}
+
+# =============================
+# 主循环
+# =============================
+while true; do
+    main_menu
+done

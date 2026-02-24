@@ -1,359 +1,281 @@
 #!/bin/bash
-# ========================================
-# 代理协议一键菜单（一级+二级分类版）
-# 二级菜单 0 返回 | x 退出 | 自动补零 | 循环菜单
-# ========================================
+set -e
+
+#################################
+# 基础配置
+#################################
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
-BLUE="\033[34m"
+YELLOW="\033[33m"
 RESET="\033[0m"
-BOLD="\033[1m"
-ORANGE='\033[38;5;208m'
 
-SCRIPT_PATH="/root/proxy.sh"
 SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
-BIN_LINK_DIR="/usr/local/bin"
 
-if [[ $EUID -ne 0 ]]; then
-    echo -e "${RED}请使用 root 权限运行！${RESET}"
-    exit 1
-fi
+BASE_DIR="/root/rsync_task"
+SCRIPT_PATH="$BASE_DIR/rsync_manager.sh"
 
-# =============================
-# 首次运行自动安装
-# =============================
-if [ ! -f "$SCRIPT_PATH" ]; then
-    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
+CONFIG_FILE="$BASE_DIR/rsync_tasks.conf"
+KEY_DIR="$BASE_DIR/keys"
+LOG_DIR="$BASE_DIR/logs"
+TG_CONFIG="$BASE_DIR/.tg.conf"
+
+mkdir -p "$KEY_DIR" "$LOG_DIR"
+touch "$CONFIG_FILE"
+
+#################################
+# ⭐ 首次运行自动安装到本地
+#################################
+if [[ "$0" != "$SCRIPT_PATH" ]]; then
+    echo -e "${GREEN}首次运行，自动安装到本地...${RESET}"
+    mkdir -p "$BASE_DIR"
+    curl -sL "$SCRIPT_URL" -o "$SCRIPT_PATH"
     chmod +x "$SCRIPT_PATH"
-    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/f"
-    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/F"
-    echo -e "${GREEN}✅ 安装完成，输入 f 或 F 启动${RESET}"
+    exec "$SCRIPT_PATH"
 fi
 
-# =============================
-# 自动补零
-# =============================
-format_choice() {
-    if [[ "$1" =~ ^[0-9]+$ ]]; then
-        printf "%02d" "$1"
+#################################
+# 依赖安装
+#################################
+install_dep() {
+    for p in rsync sshpass curl; do
+        if ! command -v $p &>/dev/null; then
+            echo -e "${YELLOW}安装依赖: $p${RESET}"
+            DEBIAN_FRONTEND=noninteractive apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y $p >/dev/null 2>&1
+        fi
+    done
+}
+install_dep
+
+#################################
+# Telegram
+#################################
+send_tg() {
+    [[ ! -f "$TG_CONFIG" ]] && return
+    source "$TG_CONFIG"
+    curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        -d chat_id="$CHAT_ID" \
+        -d text="$1" >/dev/null 2>&1
+}
+
+setup_tg() {
+    read -p "VPS名称: " name
+    read -p "Bot Token: " token
+    read -p "Chat ID: " chatid
+
+    cat > "$TG_CONFIG" <<EOF
+BOT_TOKEN="$token"
+CHAT_ID="$chatid"
+VPS_NAME="$name"
+EOF
+
+    echo -e "${GREEN}TG配置已保存${RESET}"
+}
+
+#################################
+# 任务列表
+#################################
+list_tasks() {
+    [[ ! -s "$CONFIG_FILE" ]] && { echo -e "${YELLOW}暂无任务${RESET}"; return; }
+
+    awk -F'|' '{
+        printf "\033[33m%d) %s  %s -> %s [%s]\033[0m\n",
+        NR,$1,$2,$4,$6
+    }' "$CONFIG_FILE"
+}
+
+
+generate_ssh_key() {
+    read -p "远程用户@IP: " remote
+    read -p "端口(默认22): " port
+    port=${port:-22}
+
+    read -s -p "远程密码: " password
+    echo
+
+    key_name="id_rsync_$(date +%s)"
+    key_path="$KEY_DIR/$key_name"
+
+    echo -e "${YELLOW}正在生成密钥对...${RESET}"
+    ssh-keygen -t ed25519 -f "$key_path" -N "" >/dev/null
+
+    echo -e "${YELLOW}正在部署公钥到远程服务器...${RESET}"
+    sshpass -p "$password" ssh-copy-id -i "$key_path.pub" -p "$port" \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        "$remote" >/dev/null 2>&1
+
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}密钥部署失败${RESET}"
+        rm -f "$key_path"*
+        return 1
+    fi
+
+    echo -e "${GREEN}密钥生成并部署成功${RESET}"
+    echo "$key_path|$remote|$port"
+}
+#################################
+# 添加任务
+#################################
+add_task() {
+    read -p "任务名称: " name
+    read -p "本地目录: " local
+    read -p "远程目录: " remote_path
+
+    echo "认证方式:"
+    echo "1) 密码"
+    echo "2) 使用已有密钥"
+    echo "3) 自动生成并部署密钥 (推荐)"
+    read -p "选择: " c
+
+    if [[ $c == 1 ]]; then
+        read -p "远程用户@IP: " remote
+        read -p "端口(默认22): " port
+        port=${port:-22}
+        read -s -p "密码: " secret; echo
+        auth="password"
+
+    elif [[ $c == 2 ]]; then
+        read -p "远程用户@IP: " remote
+        read -p "端口(默认22): " port
+        port=${port:-22}
+        read -p "密钥路径: " secret
+        chmod 600 "$secret"
+        auth="key"
+
+    elif [[ $c == 3 ]]; then
+        result=$(generate_ssh_key)
+        [[ -z "$result" ]] && return
+        IFS='|' read -r secret remote port <<< "$result"
+        auth="key"
+
     else
-        echo "$1"
+        echo "无效选项"
+        return
+    fi
+
+    read -p "rsync参数(-avz): " opt
+    opt=${opt:--avz}
+
+    echo "$name|$local|$remote|$remote_path|$port|$opt|$auth|$secret" >> "$CONFIG_FILE"
+}
+#################################
+# 删除任务
+#################################
+delete_task() {
+    read -p "编号: " n
+    sed -i "${n}d" "$CONFIG_FILE"
+}
+
+#################################
+# 同步执行（支持cron）
+#################################
+run_task() {
+    direction="$1"
+    num="$2"
+
+    [[ -z "$num" ]] && read -p "编号: " num
+
+    task=$(sed -n "${num}p" "$CONFIG_FILE")
+    [[ -z "$task" ]] && exit 1
+
+    IFS='|' read -r name local remote remote_path port opt auth secret <<< "$task"
+
+    src="$local"
+    dst="$remote:$remote_path"
+    [[ "$direction" == "pull" ]] && { src="$dst"; dst="$local"; }
+
+    ssh_opt="-p $port -o ConnectTimeout=10 -o ServerAliveInterval=30 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+    if [[ "$auth" == "password" ]]; then
+        sshpass -p "$secret" rsync $opt -e "ssh $ssh_opt" "$src" "$dst"
+    else
+        rsync $opt -e "ssh -i $secret $ssh_opt" "$src" "$dst"
+    fi
+
+    source "$TG_CONFIG" 2>/dev/null || true
+
+    if [[ $? -eq 0 ]]; then
+        send_tg "✅ [$VPS_NAME] 同步成功: $name ($direction)"
+    else
+        send_tg "❌ [$VPS_NAME] 同步失败: $name ($direction)"
     fi
 }
-# =============================
-# 通用菜单读取（一级用）
-# =============================
-read_mainmenu() {
-    echo -ne "${RED}请选择: ${RESET}"
-    read choice
 
-    choice=$(echo "$choice" | xargs)
+#################################
+# cron模式
+#################################
+if [[ "$1" == "auto" ]]; then
+    run_task push "$2"
+    exit
+fi
 
-    [[ "$choice" =~ ^[xX]$ ]] && exit 0
-    [[ "$choice" == "0" || "$choice" == "00" ]] && exit 0
+#################################
+# 定时
+#################################
+schedule_task() {
+    read -p "任务编号: " n
+    read -p "cron表达式: " cron
 
-    choice=$(format_choice "$choice")
+    job="$cron /usr/bin/bash $SCRIPT_PATH auto $n >> $LOG_DIR/cron_$n.log 2>&1 # rsync_$n"
+
+    crontab -l 2>/dev/null | grep -v "# rsync_$n" | { cat; echo "$job"; } | crontab -
 }
 
-# =============================
-# 通用二级菜单读取逻辑
-# =============================
-read_submenu() {
-    echo -ne "${RED}选择: ${RESET}"
-    read sub
-
-    sub=$(echo "$sub" | xargs)
-
-    [[ "$sub" =~ ^[xX]$ ]] && exit 0
-    [[ "$sub" == "0" || "$sub" == "00" ]] && return 1
-
-    sub=$(format_choice "$sub")
-    return 0
+delete_schedule() {
+    read -p "编号: " n
+    crontab -l 2>/dev/null | grep -v "# rsync_$n" | crontab -
 }
 
-pause_return() {
-    echo
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-}
-# =============================
-# 一级菜单
-# =============================
-main_menu() {
-    clear
-    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
-    echo -e "${ORANGE}      代理管理中心        ${RESET}"
-    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
-    echo -e "${YELLOW}[01] 单协议安装类${RESET}"
-    echo -e "${YELLOW}[02] 多协议安装类${RESET}"
-    echo -e "${YELLOW}[03] 面板管理类${RESET}"
-    echo -e "${YELLOW}[04] 转发管理类${RESET}"
-    echo -e "${YELLOW}[05] 组网管理类${RESET}"
-    echo -e "${YELLOW}[06] 网络优化类${RESET}"
-    echo -e "${YELLOW}[07] DNS 解锁类${RESET}"
-    echo -e "${GREEN}[88] 更新脚本${RESET}"
-    echo -e "${GREEN}[99] 卸载脚本${RESET}"
-    echo -e "${YELLOW}[00] 退出${RESET}"
-
-    read_mainmenu
-
-    case "$choice" in
-        01) protocol_menu ;;
-        02) protocols_menu ;;
-        03) panel_menu ;;
-        04) zfpanel_menu ;;
-        05) zwpanel_menu ;;
-        06) network_menu ;;
-        07) dns_menu ;;
-        88) update_script ; pause_return ;;
-        99) uninstall_script ;;
-        00) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
-    esac
-}
-
-# =============================
-# 单协议类
-# =============================
-protocol_menu() {
-while true; do
-    clear
-    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
-    echo -e "${ORANGE}      单协议安装类        ${RESET}"
-    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
-    echo -e "${YELLOW}[01] Shadowsocks${RESET}"
-    echo -e "${YELLOW}[02] Reality${RESET}"
-    echo -e "${YELLOW}[03] Snell${RESET}"
-    echo -e "${YELLOW}[04] Anytls${RESET}"
-    echo -e "${YELLOW}[05] Hysteria2${RESET}"
-    echo -e "${YELLOW}[06] Tuicv5${RESET}"
-    echo -e "${YELLOW}[07] MTProto${RESET}"
-    echo -e "${YELLOW}[08] MTProxy(Docker)${RESET}"
-    echo -e "${YELLOW}[09] Socks5${RESET}"
-    echo -e "${GREEN}[0]  返回${RESET}"
-    echo -e "${GREEN}[x]  退出${RESET}"
-
-    read_submenu || return
-
-    case "$sub" in
-        01) wget -O ss-rust.sh https://raw.githubusercontent.com/xOS/Shadowsocks-Rust/master/ss-rust.sh && bash ss-rust.sh ; pause_return ;;
-        02) bash <(curl -L https://raw.githubusercontent.com/yahuisme/xray-vless-reality/main/install.sh) ; pause_return ;;
-        03) wget -O snell.sh --no-check-certificate https://git.io/Snell.sh && chmod +x snell.sh && ./snell.sh ; pause_return ;;
-        04) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/anytls.sh) ; pause_return ;;
-        05) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Hysteria2.sh) ; pause_return ;;
-        06) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/tuicv5.sh) ; pause_return ;;
-        07) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/MTProto.sh) ; pause_return ;;
-        08) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/dkmop.sh) ; pause_return ;;
-        09) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/socks5.sh) ; pause_return ;;
-        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
-    esac
-done
-}
-
-# =============================
-# 多协议类
-# =============================
-protocols_menu() {
-while true; do
-    clear
-    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
-    echo -e "${ORANGE}      多协议安装类        ${RESET}"
-    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
-    echo -e "${YELLOW}[01] 老王Sing-box${RESET}"
-    echo -e "${YELLOW}[02] 老王Xray-Argo${RESET}"
-    echo -e "${YELLOW}[03] mack-a八合一${RESET}"
-    echo -e "${YELLOW}[04] ygSing-box${RESET}"
-    echo -e "${YELLOW}[05] fscarmen-ArgoX${RESET}"
-    echo -e "${YELLOW}[06] 233boySing-box${RESET}"
-    echo -e "${YELLOW}[07] SS+SNELL${RESET}"
-    echo -e "${YELLOW}[08] VlessallInOne多协议代理${RESET}"
-    echo -e "${GREEN}[0]  返回${RESET}"
-    echo -e "${GREEN}[x]  退出${RESET}"
-
-    read_submenu || return
-
-    case "$sub" in
-        01) bash <(curl -Ls https://raw.githubusercontent.com/eooce/sing-box/main/sing-box.sh) ; pause_return ;;
-        02) bash <(curl -Ls https://github.com/eooce/xray-2go/raw/main/xray_2go.sh) ; pause_return ;;
-        03) wget -O install.sh https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh && bash install.sh ; pause_return ;;
-        04) bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh) ; pause_return ;;
-        05) bash <(wget -qO- https://raw.githubusercontent.com/fscarmen/argox/main/argox.sh) ; pause_return ;;
-        06) bash <(wget -qO- -o- https://github.com/233boy/sing-box/raw/main/install.sh) ; pause_return ;;
-        07) bash <(curl -L -s menu.jinqians.com) ; pause_return ;;
-        08) wget -O vless-server.sh https://raw.githubusercontent.com/Chil30/vless-all-in-one/main/vless-server.sh && bash vless-server.sh ; pause_return ;;
-        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
-    esac
-done
-}
-
-# =============================
-# 二级菜单：面板类
-# =============================
-panel_menu() {
-while true; do
-    clear
-    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
-    echo -e "${ORANGE}      面板管理类        ${RESET}"
-    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
-    echo -e "${YELLOW}[01] 3X-UI${RESET}"
-    echo -e "${YELLOW}[02] S-UI${RESET}"
-    echo -e "${YELLOW}[03] H-UI${RESET}"
-    echo -e "${YELLOW}[04] Xboard${RESET}"
-    echo -e "${GREEN}[0]  返回${RESET}"
-    echo -e "${GREEN}[x]  退出${RESET}"
-    
-    read_submenu || return
-
-    case "$sub" in
-        01) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/3xui.sh) ; pause_return ;;
-        02) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/s-ui.sh) ; pause_return ;;
-        03) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/H-UI.sh) ; pause_return ;;
-        04) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Xboard.sh) ; pause_return ;;
-        0) return ;;
-        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
-    esac
-done
-}
-
-# =============================
-# 二级菜单：转发类
-# =============================
-zfpanel_menu() {
-while true; do
-    clear
-    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
-    echo -e "${ORANGE}      转发管理类        ${RESET}"
-    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
-    echo -e "${YELLOW}[01] Realm管理${RESET}"
-    echo -e "${YELLOW}[02] GOST管理${RESET}"
-    echo -e "${YELLOW}[03] 极光面板${RESET}"
-    echo -e "${YELLOW}[04] 哆啦A梦转发面板${RESET}"
-    echo -e "${GREEN}[0]  返回${RESET}"
-    echo -e "${GREEN}[x]  退出${RESET}"
-    
-    read_submenu || return
-
-    case "$sub" in
-        01) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/realmdog.sh) ; pause_return ;;
-        02) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/gost.sh) ; pause_return ;;
-        03) bash <(curl -fsSL https://raw.githubusercontent.com/Aurora-Admin-Panel/deploy/main/install.sh) ; pause_return ;;
-        04) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/dlam.sh) ; pause_return ;;
-        0) return ;;
-        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
-    esac
-done
-}
-
-# =============================
-# 二级菜单：组网类
-# =============================
-zwpanel_menu() {
-while true; do
-    clear
-    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
-    echo -e "${ORANGE}      组网管理类        ${RESET}"
-    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
-    echo -e "${YELLOW}[01] FRP管理${RESET}"
-    echo -e "${YELLOW}[02] WireGuard${RESET}"
-    echo -e "${YELLOW}[03] WG-Easy${RESET}"
-    echo -e "${YELLOW}[04] easytier组网${RESET}"
-    echo -e "${GREEN}[0]  返回${RESET}"
-    echo -e "${GREEN}[x]  退出${RESET}"
-    
-    read_submenu || return
-  
-
-    case "$sub" in
-        01) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/FRP.sh) ; pause_return ;;
-        02) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/wireguard.sh) ; pause_return ;;
-        03) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/WGEasy.sh) ; pause_return ;;
-        04) bash <(curl -sL https://raw.githubusercontent.com/ceocok/c.cococ/refs/heads/main/easytier.sh) ; pause_return ;;
-        0) return ;;
-        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
-    esac
-done
-}
-# =============================
-# 网络优化
-# =============================
-network_menu() {
-while true; do
-    clear
-    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
-    echo -e "${ORANGE}      网络优化类        ${RESET}"
-    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
-    echo -e "${YELLOW}[01] BBR管理${RESET}"
-    echo -e "${YELLOW}[02] TCP窗口调优${RESET}"
-    echo -e "${YELLOW}[03] WARP管理${RESET}"
-    echo -e "${YELLOW}[04] BBRv3优化脚本${RESET}"
-    echo -e "${YELLOW}[05] BBR+TCP调优${RESET}"
-    echo -e "${GREEN}[0]  返回${RESET}"
-    echo -e "${GREEN}[x]  退出${RESET}"
-    
-    read_submenu || return
-
-    case "$sub" in
-        01) wget --no-check-certificate -O tcpx.sh https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master/tcpx.sh && chmod +x tcpx.sh && ./tcpx.sh ; pause_return ;;
-        02) wget http://sh.nekoneko.cloud/tools.sh -O tools.sh && bash tools.sh ; pause_return ;;
-        03) wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh ; pause_return ;;
-        04)  bash <(curl -fsSL "https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/main/install-alias.sh?$(date +%s)") ; pause_return ;;
-        05) bash <(curl -sL https://raw.githubusercontent.com/yahuisme/network-optimization/main/script.sh) ; pause_return ;;
-        0) return ;;
-        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
-    esac
-done
-}
-
-# =============================
-# DNS 类
-# =============================
-dns_menu() {
-while true; do
-    clear
-    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
-    echo -e "${ORANGE}      DNS 解锁类        ${RESET}"
-    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
-    echo -e "${YELLOW}[01] DDNS${RESET}"
-    echo -e "${YELLOW}[02] 自建DNS解锁${RESET}"
-    echo -e "${YELLOW}[03] 自定义DNS解锁${RESET}"
-    echo -e "${GREEN}[0]  返回${RESET}"
-    echo -e "${GREEN}[x]  退出${RESET}"
-    
-    read_submenu || return
-   
-
-    case "$sub" in
-        01) bash <(wget -qO- https://raw.githubusercontent.com/mocchen/cssmeihua/mochen/shell/ddns.sh) ; pause_return ;;
-        02) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/DNSsnp.sh) ; pause_return ;;
-        03) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/unlockdns.sh) ; pause_return ;;
-        0) return ;;
-        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
-    esac
-done
-}
-
-# =============================
+#################################
 # 更新 & 卸载
-# =============================
-update_script() {
-    echo -e "${GREEN}更新中...${RESET}"
-    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
+#################################
+update_self() {
+    curl -sL "$SCRIPT_URL" -o "$SCRIPT_PATH"
     chmod +x "$SCRIPT_PATH"
-    echo -e "${GREEN}✅ 更新完成!${RESET}"
-    exec "$SCRIPT_PATH"
+    echo "已更新"
 }
 
-uninstall_script() {
-    rm -f "$SCRIPT_PATH"
-    rm -f "$BIN_LINK_DIR/F" "$BIN_LINK_DIR/f"
-    echo -e "${RED}✅ 脚本已卸载${RESET}"
-    exit 0
+uninstall_self() {
+    crontab -l 2>/dev/null | grep -v "rsync_" | crontab - || true
+    rm -rf "$BASE_DIR"
+    echo "已卸载"
+    exit
 }
 
-# =============================
-# 主循环
-# =============================
+#################################
+# 菜单
+#################################
 while true; do
-    main_menu
+    clear
+    echo -e "${GREEN}===== Rsync 同步管理器 =====${RESET}"
+    list_tasks
+    echo
+    echo -e "${GREEN} 1) 添加同步任务${RESET}"
+    echo -e "${GREEN} 2) 删除同步任务${RESET}"
+    echo -e "${GREEN} 3) 推送同步${RESET}"
+    echo -e "${GREEN} 4) 拉取同步${RESET}"
+    echo -e "${GREEN} 5) 添加定时任务${RESET}"
+    echo -e "${GREEN} 6) 删除定时任务${RESET}"
+    echo -e "${GREEN} 7) Telegram设置${RESET}"
+    echo -e "${GREEN} 8) 更新脚本${RESET}"
+    echo -e "${GREEN} 9) 卸载脚本${RESET}"
+    echo -e "${GREEN} 0) 退出${RESET}"
+    read -p "$(echo -e ${GREEN} 请选择操作: ${RESET}) " c
+
+    case $c in
+        1) add_task ;;
+        2) delete_task ;;
+        3) run_task push ;;
+        4) run_task pull ;;
+        5) schedule_task ;;
+        6) delete_schedule ;;
+        7) setup_tg ;;
+        8) update_self ;;
+        9) uninstall_self ;;
+        0) exit ;;
+    esac
+
+    read -p "回车继续..."
 done

@@ -1,121 +1,111 @@
 #!/bin/bash
 # ==========================================
-# mtr 一键检测脚本
-# 自动安装 + 菜单模式
+# 哪吒探针 Agent 一键安装脚本
+# 自动检测并安装 unzip
+# 适配 Debian / Ubuntu / CentOS / Alma / Rocky
 # ==========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
-BLUE="\033[36m"
 RESET="\033[0m"
-ORANGE='\033[38;5;208m'
 
+INSTALL_DIR="/opt/nezha/agent"
+SERVICE_FILE="/etc/systemd/system/nezha-agent.service"
+AGENT_URL="https://v6.gh-proxy.org/https://github.com/nezhahq/agent/releases/download/v2.0.1/nezha-agent_linux_amd64.zip"
+SERVICE_URL="https://v6.gh-proxy.org/https://raw.githubusercontent.com/sistarry/toolbox/refs/heads/main/NEZHA/nezha-agent.service"
+
+echo -e "${GREEN}==== 哪吒探针 Agent 一键安装 ====${RESET}"
 
 # =============================
-# 自动检测并安装 mtr
+# 检测 root
 # =============================
-install_mtr() {
-    if command -v mtr >/dev/null 2>&1; then
-        sleep 1
-        return
-    fi
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}请使用 root 运行此脚本${RESET}"
+    exit 1
+fi
 
-    echo -e "${YELLOW}未检测到 mtr，正在自动安装...${RESET}"
-
-    if [ -f /etc/debian_version ]; then
-        apt update -y >/dev/null 2>&1
-        apt install -y mtr >/dev/null 2>&1
-    elif [ -f /etc/redhat-release ]; then
-        yum install -y mtr >/dev/null 2>&1
+# =============================
+# 自动安装 unzip
+# =============================
+if ! command -v unzip >/dev/null 2>&1; then
+    echo -e "${YELLOW}未检测到 unzip，正在安装...${RESET}"
+    
+    if command -v apt >/dev/null 2>&1; then
+        apt update -y
+        apt install unzip -y
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install unzip -y
+    elif command -v yum >/dev/null 2>&1; then
+        yum install unzip -y
     else
-        echo -e "${RED}不支持的系统，请手动安装 mtr${RESET}"
+        echo -e "${RED}无法识别包管理器，请手动安装 unzip${RESET}"
         exit 1
     fi
 
-    if command -v mtr >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ mtr 安装完成${RESET}"
-        sleep 1
-    else
-        echo -e "${RED}mtr 安装失败${RESET}"
+    if ! command -v unzip >/dev/null 2>&1; then
+        echo -e "${RED}unzip 安装失败${RESET}"
         exit 1
     fi
-}
+
+    echo -e "${GREEN}unzip 安装完成${RESET}"
+fi
 
 # =============================
-# 获取目标 IP
+# 创建目录
 # =============================
-get_target() {
-    read -p "请输入目标 IP 或域名: " TARGET
-    if [ -z "$TARGET" ]; then
-        echo -e "${RED}未输入目标${RESET}"
-        return 1
-    fi
-    return 0
-}
+echo -e "${YELLOW}创建安装目录...${RESET}"
+mkdir -p ${INSTALL_DIR}
+cd ${INSTALL_DIR} || exit
 
 # =============================
-# 实时模式
+# 下载 Agent
 # =============================
-run_live() {
-    get_target || return
-    echo -e "${GREEN}启动实时模式${RESET}"
-    mtr $TARGET
-}
+echo -e "${YELLOW}下载 Agent...${RESET}"
+wget -O nezha-agent.zip ${AGENT_URL}
 
-# =============================
-# 报告模式
-# =============================
-run_report() {
-    get_target || return
+if [ $? -ne 0 ]; then
+    echo -e "${RED}下载失败，请检查网络！${RESET}"
+    exit 1
+fi
 
-    echo -ne "${GREEN}请输入发包数量 (默认100): ${RESET}"
-    read input_count
+echo -e "${YELLOW}解压文件...${RESET}"
+unzip -o nezha-agent.zip
+rm -f nezha-agent.zip
 
-    # 如果为空，使用默认值
-    if [ -z "$input_count" ]; then
-        send_count=100
-    # 判断是否为纯数字
-    elif [[ "$input_count" =~ ^[0-9]+$ ]]; then
-        send_count="$input_count"
-    else
-        echo -e "${RED}输入无效，使用默认 100 包${RESET}"
-        send_count=100
-        sleep 1
-    fi
-
-    echo -e "${GREEN}生成报告模式 (发送 $send_count 个包)...${RESET}"
-    mtr -r -c "$send_count" "$TARGET"
-
-    read -p "按回车返回菜单..."
-}
+chmod +x ${INSTALL_DIR}/nezha-agent
 
 # =============================
-# 主菜单
+# 下载 systemd 服务
 # =============================
-menu() {
-    while true; do
-        clear
-        echo -e "${ORANGE}===================================${RESET}"
-        echo -e "${ORANGE}           MTR 网络检测工具        ${RESET}"
-        echo -e "${ORANGE}===================================${RESET}"
-        echo -e " ${GREEN}1) 实时动态检测${RESET}"
-        echo -e " ${GREEN}2) 报告模式${RESET}"
-        echo -e " ${GREEN}0) 退出${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
-        read choice
-
-        case "$choice" in
-            1) run_live ;;
-            2) run_report ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
-        esac
-    done
-}
+echo -e "${YELLOW}下载 systemd 服务文件...${RESET}"
+wget -O ${SERVICE_FILE} ${SERVICE_URL}
 
 # =============================
-# 启动时自动检测安装
+# 写入配置
 # =============================
-install_mtr
-menu
+echo -e "${GREEN}请输入哪吒面板信息${RESET}"
+read -p "请输入 client_secret(密钥): " CLIENT_SECRET
+read -p "请输入 server (例如 data.example.com:8008): " SERVER_ADDR
+
+cat > ${INSTALL_DIR}/config.yml <<EOF
+client_secret: ${CLIENT_SECRET}
+server: ${SERVER_ADDR}
+tls: true
+EOF
+
+echo -e "${GREEN}配置文件已生成${RESET}"
+
+# =============================
+# 启动服务
+# =============================
+echo -e "${YELLOW}启动服务...${RESET}"
+systemctl daemon-reload
+systemctl enable nezha-agent
+systemctl restart nezha-agent
+
+echo -e "${GREEN}=====================================${RESET}"
+echo -e "${GREEN}安装完成！${RESET}"
+echo -e "${GREEN}查看状态： systemctl status nezha-agent${RESET}"
+echo -e "${GREEN}查看日志： journalctl -u nezha-agent -f${RESET}"
+echo -e "${GREEN}=====================================${RESET}"

@@ -75,21 +75,23 @@ read_submenu() {
 
 pause_return() {
     echo
-    read -p "$(echo -e ${BLUE}按回车返回菜单...${RESET})"
+    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
 }
 # =============================
 # 一级菜单
 # =============================
 main_menu() {
     clear
-    echo -e "${ORANGE}====== 代理管理中心 ======${RESET}"
+    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
+    echo -e "${ORANGE}      代理管理中心        ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
     echo -e "${YELLOW}[01] 单协议安装类${RESET}"
     echo -e "${YELLOW}[02] 多协议安装类${RESET}"
     echo -e "${YELLOW}[03] 面板管理类${RESET}"
     echo -e "${YELLOW}[04] 转发管理类${RESET}"
     echo -e "${YELLOW}[05] 组网管理类${RESET}"
     echo -e "${YELLOW}[06] 网络优化类${RESET}"
-    echo -e "${YELLOW}[07] DNS解锁类${RESET}"
+    echo -e "${YELLOW}[07] DNS 解锁类${RESET}"
     echo -e "${GREEN}[88] 更新脚本${RESET}"
     echo -e "${GREEN}[99] 卸载脚本${RESET}"
     echo -e "${YELLOW}[00] 退出${RESET}"
@@ -117,7 +119,9 @@ main_menu() {
 protocol_menu() {
 while true; do
     clear
-    echo -e "${ORANGE}====== 单协议安装类 ======${RESET}"
+    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
+    echo -e "${ORANGE}      单协议安装类        ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
     echo -e "${YELLOW}[01] Shadowsocks${RESET}"
     echo -e "${YELLOW}[02] Reality${RESET}"
     echo -e "${YELLOW}[03] Snell${RESET}"
@@ -153,7 +157,9 @@ done
 protocols_menu() {
 while true; do
     clear
-    echo -e "${ORANGE}====== 多协议安装类 ======${RESET}"
+    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
+    echo -e "${ORANGE}      多协议安装类        ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
     echo -e "${YELLOW}[01] 老王Sing-box${RESET}"
     echo -e "${YELLOW}[02] 老王Xray-Argo${RESET}"
     echo -e "${YELLOW}[03] mack-a八合一${RESET}"
@@ -187,7 +193,9 @@ done
 panel_menu() {
 while true; do
     clear
-    echo -e "${ORANGE}====== 面板管理类 ======${RESET}"
+    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
+    echo -e "${ORANGE}      面板管理类        ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
     echo -e "${YELLOW}[01] 3X-UI${RESET}"
     echo -e "${YELLOW}[02] S-UI${RESET}"
     echo -e "${YELLOW}[03] H-UI${RESET}"
@@ -214,7 +222,9 @@ done
 zfpanel_menu() {
 while true; do
     clear
-    echo -e "${ORANGE}====== 转发管理类 ======${RESET}"
+    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
+    echo -e "${ORANGE}      转发管理类        ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
     echo -e "${YELLOW}[01] Realm管理${RESET}"
     echo -e "${YELLOW}[02] GOST管理${RESET}"
     echo -e "${YELLOW}[03] 极光面板${RESET}"
@@ -241,7 +251,9 @@ done
 zwpanel_menu() {
 while true; do
     clear
-    echo -e "${ORANGE}====== 组网管理类 ======${RESET}"
+    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
+    echo -e "${ORANGE}      组网管理类        ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
     echo -e "${YELLOW}[01] FRP管理${RESET}"
     echo -e "${YELLOW}[02] WireGuard${RESET}"
     echo -e "${YELLOW}[03] WG-Easy${RESET}"
@@ -268,7 +280,9 @@ done
 network_menu() {
 while true; do
     clear
-    echo -e "${ORANGE}====== 网络优化类 ======${RESET}"
+    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
+    echo -e "${ORANGE}      网络优化类        ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
     echo -e "${YELLOW}[01] BBR管理${RESET}"
     echo -e "${YELLOW}[02] TCP窗口调优${RESET}"
     echo -e "${YELLOW}[03] WARP管理${RESET}"
@@ -297,7 +311,9 @@ done
 dns_menu() {
 while true; do
     clear
-    echo -e "${ORANGE}====== DNS 解锁类 ======${RESET}"
+    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
+    echo -e "${ORANGE}      DNS 解锁类        ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
     echo -e "${YELLOW}[01] DDNS${RESET}"
     echo -e "${YELLOW}[02] 自建DNS解锁${RESET}"
     echo -e "${YELLOW}[03] 自定义DNS解锁${RESET}"

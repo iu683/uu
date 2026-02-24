@@ -1,143 +1,132 @@
 #!/bin/bash
-# ========================================
-# Telegram-ImageBed 一键管理脚本
-# ========================================
+# ==========================================
+# iperf3 一键测速管理脚本
+# 自动安装 + 四分测速菜单
+# ==========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
 BLUE="\033[36m"
 RESET="\033[0m"
+ORANGE='\033[38;5;208m'
 
-APP_NAME="telegram-imagebed"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+PORT=5201
+TIME=30
+PARALLEL=1
+UDP_BW="1G"
 
-# ==============================
-# 基础检测
-# ==============================
-
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
+# =============================
+# 自动检测并安装 iperf3
+# =============================
+install_iperf3() {
+    if command -v iperf3 >/dev/null 2>&1; then
+        return
     fi
 
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+    echo -e "${YELLOW}未检测到 iperf3，正在自动安装...${RESET}"
+
+    if [ -f /etc/debian_version ]; then
+        apt update -y >/dev/null 2>&1
+        apt install -y iperf3 >/dev/null 2>&1
+    elif [ -f /etc/redhat-release ]; then
+        yum install -y epel-release >/dev/null 2>&1
+        yum install -y iperf3 >/dev/null 2>&1
+    else
+        echo -e "${RED}不支持的系统，请手动安装 iperf3${RESET}"
+        exit 1
+    fi
+
+    if ! command -v iperf3 >/dev/null 2>&1; then
+        echo -e "${RED}iperf3 安装失败${RESET}"
         exit 1
     fi
 }
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+# =============================
+# 获取服务器 IP
+# =============================
+get_ip() {
+    read -p "请输入服务器 IP: " SERVER_IP
+    if [ -z "$SERVER_IP" ]; then
+        echo -e "${RED}未输入 IP${RESET}"
         return 1
     fi
+    return 0
 }
 
-# ==============================
-# 菜单
-# ==============================
+# =============================
+# 启动服务器
+# =============================
+start_server() {
+    install_iperf3
+    echo -e "${GREEN}启动 iperf3 服务器 (端口 $PORT)...${RESET}"
+    iperf3 -s -i 10 -p $PORT
+}
 
+# =============================
+# 四种测试
+# =============================
+tcp_download() {
+    install_iperf3
+    get_ip || return
+    echo -e "\n${GREEN}TCP 下载 (↓) 测试中...${RESET}"
+    iperf3 -c $SERVER_IP -R -P $PARALLEL -t $TIME -p $PORT
+    read -p "按回车返回菜单..."
+}
+
+tcp_upload() {
+    install_iperf3
+    get_ip || return
+    echo -e "\n${GREEN}TCP 上传 (↑) 测试中...${RESET}"
+    iperf3 -c $SERVER_IP -P $PARALLEL -t $TIME -p $PORT
+    read -p "按回车返回菜单..."
+}
+
+udp_download() {
+    install_iperf3
+    get_ip || return
+    echo -e "\n${GREEN}UDP 下载 (↓) 测试中...${RESET}"
+    iperf3 -c $SERVER_IP -u -b $UDP_BW -t $TIME -R -P $PARALLEL -p $PORT
+    read -p "按回车返回菜单..."
+}
+
+udp_upload() {
+    install_iperf3
+    get_ip || return
+    echo -e "\n${GREEN}UDP 上传 (↑) 测试中...${RESET}"
+    iperf3 -c $SERVER_IP -u -b $UDP_BW -t $TIME -P $PARALLEL -p $PORT
+    read -p "按回车返回菜单..."
+}
+
+# =============================
+# 主菜单
+# =============================
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Telegram-ImageBed 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${BLUE}请选择:${RESET}) " choice
+        echo -e "${ORANGE}=====================================${RESET}"
+        echo -e "${ORANGE}        iperf3 一键测速管理         ${RESET}"
+        echo -e "${ORANGE}=====================================${RESET}"
+        echo -e " ${GREEN}1) 启动 iperf3 服务器${RESET}"
+        echo -e " ${GREEN}2) TCP 下载 (↓)${RESET}"
+        echo -e " ${GREEN}3) TCP 上传 (↑)${RESET}"
+        echo -e " ${GREEN}4) UDP 下载 (↓)${RESET}"
+        echo -e " ${GREEN}5) UDP 上传 (↑)${RESET}"
+        echo -e " ${GREEN}0) 退出${RESET}"
+        echo -ne "${GREEN}请选择: ${RESET}"
+        read choice
 
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
+        case "$choice" in
+            1) start_server ;;
+            2) tcp_download ;;
+            3) tcp_upload ;;
+            4) udp_download ;;
+            5) udp_upload ;;
             0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+            *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
         esac
     done
-}
-
-# ==============================
-# 功能函数
-# ==============================
-
-install_app() {
-
-    check_docker
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-
-    mkdir -p "$APP_DIR"
-
-    read -p "请输入访问端口 [默认:18793]: " input_port
-    PORT=${input_port:-18793}
-    check_port "$PORT" || return
-
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  telegram-imagebed:
-    image: xiyan520/tg-telegram-imagebed:latest
-    container_name: telegram-imagebed
-    ports:
-      - "127.0.0.1:${PORT}:18793"
-    volumes:
-      - ./data:/app/data
-    restart: unless-stopped
-EOF
-
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    echo
-    echo -e "${GREEN}✅ Telegram-ImageBed 已启动${RESET}"
-    echo -e "${BLUE}🌐 本地访问: http://127.0.0.1:${PORT}${RESET}"
-    read -p "按回车继续..."
-}
-
-update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ 更新完成${RESET}"
-    sleep 1
-}
-
-restart_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
-    docker compose restart
-    echo -e "${GREEN}✅ 已重启${RESET}"
-    sleep 1
-}
-
-view_logs() {
-    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f telegram-imagebed
-}
-
-check_status() {
-    docker ps | grep telegram-imagebed
-    read -p "按回车继续..."
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已彻底卸载（含数据）${RESET}"
-    sleep 1
 }
 
 menu

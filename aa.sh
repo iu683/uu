@@ -1,110 +1,99 @@
 #!/bin/bash
-# ==========================================
-# 哪吒探针 Agent 一键安装脚本
-# 自动检测并安装 unzip
-# 适配 Debian / Ubuntu / CentOS / Alma / Rocky
-# ==========================================
+# ========================================
+# 开小鸡管理菜单
+# 支持永久快捷键 N/n + 自动补零 + 循环菜单
+# ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
+ORANGE='\033[38;5;208m'
 
-INSTALL_DIR="/opt/nezha/agent"
-SERVICE_FILE="/etc/systemd/system/nezha-agent.service"
-AGENT_URL="https://v6.gh-proxy.org/https://github.com/nezhahq/agent/releases/download/v2.0.1/nezha-agent_linux_amd64.zip"
-SERVICE_URL="https://v6.gh-proxy.org/https://raw.githubusercontent.com/sistarry/toolbox/refs/heads/main/NEZHA/nezha-agent.service"
+SCRIPT_PATH="/root/nat.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
+BIN_LINK_DIR="/usr/local/bin"
 
-echo -e "${GREEN}==== 哪吒探针 Agent 一键安装 ====${RESET}"
-
-# =============================
-# 检测 root
-# =============================
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}请使用 root 运行此脚本${RESET}"
-    exit 1
-fi
-
-# =============================
-# 自动安装 unzip
-# =============================
-if ! command -v unzip >/dev/null 2>&1; then
-    echo -e "${YELLOW}未检测到 unzip，正在安装...${RESET}"
-    
-    if command -v apt >/dev/null 2>&1; then
-        apt update -y
-        apt install unzip -y
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install unzip -y
-    elif command -v yum >/dev/null 2>&1; then
-        yum install unzip -y
-    else
-        echo -e "${RED}无法识别包管理器，请手动安装 unzip${RESET}"
+# ================== 首次自动安装 ==================
+if [ ! -f "$SCRIPT_PATH" ]; then
+    echo -e "${YELLOW}首次运行，正在安装...${RESET}"
+    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL" || {
+        echo -e "${RED}安装失败，请检查网络${RESET}"
         exit 1
-    fi
+    }
+    chmod +x "$SCRIPT_PATH"
 
-    if ! command -v unzip >/dev/null 2>&1; then
-        echo -e "${RED}unzip 安装失败${RESET}"
-        exit 1
-    fi
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/n"
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/N"
 
-    echo -e "${GREEN}unzip 安装完成${RESET}"
+    echo -e "${GREEN}✅ 安装完成，可使用 n 或 N 启动${RESET}"
 fi
 
-# =============================
-# 创建目录
-# =============================
-echo -e "${YELLOW}创建安装目录...${RESET}"
-mkdir -p ${INSTALL_DIR}
-cd ${INSTALL_DIR} || exit
+# ================== 菜单 ==================
+menu() {
+    clear
+    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
+    echo -e "${ORANGE}      开小鸡工具箱       ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
+    echo -e "${GREEN}[01] PVE管理${RESET}"
+    echo -e "${GREEN}[02] LXC小鸡${RESET}"
+    echo -e "${GREEN}[03] Docker小鸡${RESET}"
+    echo -e "${GREEN}[04] Incus小鸡${RESET}"
+    echo -e "${YELLOW}[88] 更新脚本${RESET}"
+    echo -e "${YELLOW}[99] 卸载脚本${RESET}"
+    echo -e "${GREEN}[00] 退出${RESET}"
+    echo -ne "${GREEN}请选择操作: ${RESET}"
 
-# =============================
-# 下载 Agent
-# =============================
-echo -e "${YELLOW}下载 Agent...${RESET}"
-wget -O nezha-agent.zip ${AGENT_URL}
+    read choice
+    choice=$(printf "%02d" "$choice" 2>/dev/null)
 
-if [ $? -ne 0 ]; then
-    echo -e "${RED}下载失败，请检查网络！${RESET}"
-    exit 1
-fi
+    case "$choice" in
+        01)
+            echo -e "${GREEN}正在运行 PVE管理...${RESET}"
+            bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/pvegl.sh)
+            ;;
+        02)
+            echo -e "${GREEN}正在运行 LXC 小鸡脚本...${RESET}"
+            bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/lxc.sh)
+            ;;
+        03)
+            echo -e "${GREEN}正在运行 Docker 小鸡脚本...${RESET}"
+            bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/dockerlxc.sh)
+            ;;
+        04)
+            echo -e "${GREEN}正在运行 Incus 小鸡脚本...${RESET}"
+            bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/incus.sh)
+            ;;
+        88)
+            echo -e "${YELLOW}🔄 正在更新脚本...${RESET}"
+            curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL" || {
+                echo -e "${RED}更新失败，请检查网络${RESET}"
+                break
+            }
+            chmod +x "$SCRIPT_PATH"
+            ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/n"
+            ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/N"
+            echo -e "${GREEN}✅ 更新完成${RESET}"
+            exec "$SCRIPT_PATH"
+            ;;
+        99)
+            rm -f "$SCRIPT_PATH" "$BIN_LINK_DIR/n" "$BIN_LINK_DIR/N"
+            echo -e "${RED}✅ 已卸载${RESET}"
+            exit 0
+            ;;
+        00)
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}无效选择，请重新输入${RESET}"
+            sleep 1
+            ;;
+    esac
 
-echo -e "${YELLOW}解压文件...${RESET}"
-unzip -o nezha-agent.zip
-rm -f nezha-agent.zip
+    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+}
 
-chmod +x ${INSTALL_DIR}/nezha-agent
-
-# =============================
-# 下载 systemd 服务
-# =============================
-echo -e "${YELLOW}下载 systemd 服务文件...${RESET}"
-wget -O ${SERVICE_FILE} ${SERVICE_URL}
-
-# =============================
-# 写入配置
-# =============================
-echo -e "${GREEN}请输入哪吒面板信息${RESET}"
-read -p "请输入 client_secret(密钥): " CLIENT_SECRET
-read -p "请输入 server (例如 data.example.com:8008): " SERVER_ADDR
-
-cat > ${INSTALL_DIR}/config.yml <<EOF
-client_secret: ${CLIENT_SECRET}
-server: ${SERVER_ADDR}
-EOF
-
-echo -e "${GREEN}配置文件已生成${RESET}"
-
-# =============================
-# 启动服务
-# =============================
-echo -e "${YELLOW}启动服务...${RESET}"
-systemctl daemon-reload
-systemctl enable nezha-agent
-systemctl restart nezha-agent
-
-echo -e "${GREEN}=====================================${RESET}"
-echo -e "${GREEN}安装完成！${RESET}"
-echo -e "${GREEN}查看状态： systemctl status nezha-agent${RESET}"
-echo -e "${GREEN}查看日志： journalctl -u nezha-agent -f${RESET}"
-echo -e "${GREEN}=====================================${RESET}"
+# ================== 主循环 ==================
+while true; do
+    menu
+done

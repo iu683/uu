@@ -1,126 +1,128 @@
 #!/bin/bash
-# ==========================================
-# 哪吒探针 Agent 一键安装脚本
-# 自动检测并安装 unzip
-# 适配 Debian / Ubuntu / CentOS / Alma / Rocky
-# ==========================================
+# =========================================
+# 企业级系统清理脚本（兼容容器 + Docker）
+# =========================================
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-INSTALL_DIR="/opt/nezha/agent"
-SERVICE_FILE="/etc/systemd/system/nezha-agent.service"
-AGENT_URL="https://v6.gh-proxy.org/https://github.com/nezhahq/agent/releases/download/v2.0.1/nezha-agent_linux_amd64.zip"
-SERVICE_URL="https://v6.gh-proxy.org/https://raw.githubusercontent.com/sistarry/toolbox/refs/heads/main/NEZHA/nezha-agent.service"
-CONFIG_URL="https://v6.gh-proxy.org/https://raw.githubusercontent.com/sistarry/toolbox/refs/heads/main/toy/config.yml"
-echo -e "${GREEN}==== 哪吒探针 Agent 一键安装 ====${RESET}"
-
-# =============================
-# 检测 root
-# =============================
+# 必须 root
 if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}请使用 root 运行此脚本${RESET}"
+    echo -e "${RED}请使用 root 运行此脚本！${RESET}"
     exit 1
 fi
 
-# =============================
-# 自动安装 unzip
-# =============================
-if ! command -v unzip >/dev/null 2>&1; then
-    echo -e "${YELLOW}未检测到 unzip，正在安装...${RESET}"
-    
-    if command -v apt >/dev/null 2>&1; then
+# 等待 apt/dnf/yum 锁
+wait_for_lock() {
+    local cmd=$1
+    local lock_file=$2
+    while fuser $lock_file >/dev/null 2>&1; do
+        echo -e "${YELLOW}等待其他 $cmd 进程完成...${RESET}"
+        sleep 2
+    done
+}
+
+# 检查容器环境
+IS_CONTAINER=0
+if systemd-detect-virt --quiet; then
+    IS_CONTAINER=1
+    echo -e "${YELLOW}检测到容器环境，跳过内核与日志清理${RESET}"
+fi
+
+# 显示磁盘空间
+echo -e "${GREEN}清理前磁盘空间:${RESET}"
+df -h /
+
+# ===============================
+# 系统清理
+# ===============================
+clean_system() {
+    if command -v apt &>/dev/null; then
+        echo -e "${GREEN}检测到 APT 系统${RESET}"
+        wait_for_lock "APT" /var/lib/dpkg/lock-frontend
         apt update -y
-        apt install unzip -y
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install unzip -y
-    elif command -v yum >/dev/null 2>&1; then
-        yum install unzip -y
+        wait_for_lock "APT" /var/lib/dpkg/lock-frontend
+        apt autoremove --purge -y
+        apt clean
+        apt autoclean
+        dpkg -l | awk '/^rc/ {print $2}' | xargs -r apt purge -y
+        if [ "$IS_CONTAINER" -eq 0 ]; then
+            # 安全删除旧内核
+            CURRENT_KERNEL=$(uname -r)
+            dpkg --list | awk '/linux-image-[0-9]/ {print $2}' | grep -v "$CURRENT_KERNEL" | xargs -r apt purge -y
+        fi
+    elif command -v yum &>/dev/null; then
+        echo -e "${GREEN}检测到 YUM 系统${RESET}"
+        wait_for_lock "YUM" /var/run/yum.pid
+        yum autoremove -y
+        yum clean all
+        if [ "$IS_CONTAINER" -eq 0 ] && command -v package-cleanup &>/dev/null; then
+            package-cleanup --oldkernels --count=2 -y
+        fi
+    elif command -v dnf &>/dev/null; then
+        echo -e "${GREEN}检测到 DNF 系统${RESET}"
+        wait_for_lock "DNF" /var/run/dnf.pid
+        dnf autoremove -y
+        dnf clean all
+        if [ "$IS_CONTAINER" -eq 0 ]; then
+            dnf remove $(dnf repoquery --installonly --latest-limit=-2 -q) -y 2>/dev/null
+        fi
+    elif command -v apk &>/dev/null; then
+        echo -e "${GREEN}检测到 APK 系统${RESET}"
+        apk cache clean
     else
-        echo -e "${RED}无法识别包管理器，请手动安装 unzip${RESET}"
+        echo -e "${RED}暂不支持你的系统！${RESET}"
         exit 1
     fi
 
-    if ! command -v unzip >/dev/null 2>&1; then
-        echo -e "${RED}unzip 安装失败${RESET}"
-        exit 1
+    # 清理日志（物理机）
+    if [ "$IS_CONTAINER" -eq 0 ] && command -v journalctl &>/dev/null; then
+        echo -e "${GREEN}清理日志（保留最近 7 天）...${RESET}"
+        journalctl --vacuum-time=7d
     fi
+}
 
-    echo -e "${GREEN}unzip 安装完成${RESET}"
-fi
+# ===============================
+# Docker 清理
+# ===============================
+clean_docker() {
+    if command -v docker &>/dev/null; then
+        echo -e "${GREEN}清理 Docker 无用数据...${RESET}"
+        docker system prune -af --volumes
+    else
+        echo -e "${YELLOW}未检测到 Docker，跳过${RESET}"
+    fi
+}
 
-# =============================
-# 创建目录
-# =============================
-echo -e "${YELLOW}创建安装目录...${RESET}"
-mkdir -p ${INSTALL_DIR}
-cd ${INSTALL_DIR} || exit
-
-# =============================
-# 下载 Agent
-# =============================
-echo -e "${YELLOW}下载 Agent...${RESET}"
-wget -O nezha-agent.zip ${AGENT_URL}
-
-if [ $? -ne 0 ]; then
-    echo -e "${RED}下载失败，请检查网络！${RESET}"
-    exit 1
-fi
-
-echo -e "${YELLOW}解压文件...${RESET}"
-unzip -o nezha-agent.zip
-rm -f nezha-agent.zip
-
-chmod +x ${INSTALL_DIR}/nezha-agent
-
-# =============================
-# 下载 systemd 服务
-# =============================
-echo -e "${YELLOW}下载 systemd 服务文件...${RESET}"
-wget -O ${SERVICE_FILE} ${SERVICE_URL}
-
-# =============================
-# 下载配置文件
-# =============================
-echo -e "${YELLOW}下载默认配置文件...${RESET}"
-wget -O ${INSTALL_DIR}/config.yml ${CONFIG_URL}
-
-if [ $? -ne 0 ]; then
-    echo -e "${RED}配置文件下载失败！${RESET}"
-    exit 1
-fi
-
-# =============================
-# 写入面板信息
-# =============================
-echo -e "${GREEN}请输入哪吒面板信息${RESET}"
-read -p "请输入 client_secret: " CLIENT_SECRET
-read -p "请输入 server (例如 data.example.com:443): " SERVER_ADDR
-
-# 替换配置
-sed -i "s|^client_secret:.*|client_secret: ${CLIENT_SECRET}|" ${INSTALL_DIR}/config.yml
-sed -i "s|^server:.*|server: ${SERVER_ADDR}|" ${INSTALL_DIR}/config.yml
-
-# 强制开启 TLS
-if grep -q "^tls:" ${INSTALL_DIR}/config.yml; then
-    sed -i "s|^tls:.*|tls: true|" ${INSTALL_DIR}/config.yml
-else
-    echo "tls: true" >> ${INSTALL_DIR}/config.yml
-fi
-
-echo -e "${GREEN}配置文件已修改完成${RESET}"
-# =============================
-# 启动服务
-# =============================
-echo -e "${YELLOW}启动服务...${RESET}"
-systemctl daemon-reload
-systemctl enable nezha-agent
-systemctl restart nezha-agent
-
-echo -e "${GREEN}=====================================${RESET}"
-echo -e "${GREEN}安装完成！${RESET}"
-echo -e "${GREEN}查看状态： systemctl status nezha-agent${RESET}"
-echo -e "${GREEN}查看日志： journalctl -u nezha-agent -f${RESET}"
-echo -e "${GREEN}=====================================${RESET}"
+# ===============================
+# 菜单
+# ===============================
+while true; do
+    echo -e "${GREEN}===== 系统清理菜单 =====${RESET}"
+    echo -e "${GREEN}1) 普通系统清理${RESET}"
+    echo -e "${GREEN}2) 系统+Docker 清理${RESET}"
+    echo -e "${GREEN}3) 查看磁盘空间${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    read -p "$(echo -e ${GREEN}选择操作: ${RESET})" choice
+    case $choice in
+        1)
+            clean_system
+            ;;
+        2)
+            clean_system
+            clean_docker
+            ;;
+        3)
+            df -h /
+            ;;
+        0)
+            echo -e "${GREEN}退出${RESET}"
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}无效选择${RESET}"
+            ;;
+    esac
+done

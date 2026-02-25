@@ -1,96 +1,227 @@
 #!/bin/bash
+# ========================================
+# CLIProxyAPI 一键管理脚本
+# 支持自定义端口 + API Key
+# ========================================
 
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
+RED="\033[31m"
+BLUE="\033[36m"
 RESET="\033[0m"
 
-# 必须 root
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}请使用 root 运行此脚本！${RESET}"
-    exit 1
-fi
+APP_NAME="cliproxyapi"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/config.yaml"
 
-clean_system() {
+REPO_URL="https://github.com/luispater/CLIProxyAPI.git"
 
-    echo -e "${GREEN}开始系统自动清理...${RESET}"
+# ==============================
+# 基础检测
+# ==============================
 
-    # 判断是否容器
-    if systemd-detect-virt --quiet; then
-        echo -e "${YELLOW}检测到容器环境，跳过内核与日志清理${RESET}"
-        IS_CONTAINER=1
-    else
-        IS_CONTAINER=0
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
     fi
 
-    # ===============================
-    # APT 系统
-    # ===============================
-    if command -v apt &>/dev/null; then
-        echo -e "${GREEN}检测到 APT 系统${RESET}"
-
-        apt update -y
-        apt autoremove --purge -y
-        apt clean
-        apt autoclean
-
-        # 清理残留 rc 包
-        dpkg -l | awk '/^rc/ {print $2}' | xargs -r apt purge -y
-
-        # 安全清理旧内核（仅物理机）
-        if [ "$IS_CONTAINER" -eq 0 ]; then
-            echo -e "${GREEN}正在安全检查旧内核...${RESET}"
-            CURRENT_KERNEL=$(uname -r)
-            dpkg --list | awk '/linux-image-[0-9]/ {print $2}' | grep -v "$CURRENT_KERNEL" | xargs -r apt purge -y
-        fi
-
-    # ===============================
-    # YUM 系统
-    # ===============================
-    elif command -v yum &>/dev/null; then
-        echo -e "${GREEN}检测到 YUM 系统${RESET}"
-
-        yum autoremove -y
-        yum clean all
-
-        if [ "$IS_CONTAINER" -eq 0 ] && command -v package-cleanup &>/dev/null; then
-            package-cleanup --oldkernels --count=2 -y
-        fi
-
-    # ===============================
-    # DNF 系统
-    # ===============================
-    elif command -v dnf &>/dev/null; then
-        echo -e "${GREEN}检测到 DNF 系统${RESET}"
-
-        dnf autoremove -y
-        dnf clean all
-
-        if [ "$IS_CONTAINER" -eq 0 ]; then
-            dnf remove $(dnf repoquery --installonly --latest-limit=-2 -q) -y 2>/dev/null
-        fi
-
-    # ===============================
-    # Alpine
-    # ===============================
-    elif command -v apk &>/dev/null; then
-        echo -e "${GREEN}检测到 APK 系统${RESET}"
-        apk cache clean
-
-    else
-        echo -e "${RED}暂不支持你的系统！${RESET}"
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
         exit 1
     fi
-
-    # ===============================
-    # 清理日志
-    # ===============================
-    if [ "$IS_CONTAINER" -eq 0 ] && command -v journalctl &>/dev/null; then
-        echo -e "${GREEN}清理日志文件（保留最近 7 天）...${RESET}"
-        journalctl --vacuum-time=7d
-    fi
-
-    echo -e "${GREEN}系统清理完成！${RESET}"
 }
 
-clean_system
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
+
+generate_key() {
+    tr -dc A-Za-z0-9 </dev/urandom | head -c 32
+}
+
+
+# 获取服务器IP
+SERVER_IP=$(hostname -I | awk '{print $1}')
+
+
+# ==============================
+# 菜单
+# ==============================
+
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== CLIProxyAPI 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ==============================
+# 功能函数
+# ==============================
+
+install_app() {
+
+    check_docker
+
+    if ! command -v git &>/dev/null; then
+        echo -e "${YELLOW}未检测到 git，正在安装...${RESET}"
+        apt install -y git 2>/dev/null || yum install -y git
+    fi
+
+    if [ -d "$APP_DIR" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+        rm -rf "$APP_DIR"
+    fi
+
+    mkdir -p /opt
+    cd /opt || exit
+
+    echo -e "${BLUE}正在克隆项目...${RESET}"
+    git clone "$REPO_URL" "$APP_NAME" || {
+        echo -e "${RED}克隆失败${RESET}"
+        return
+    }
+
+    cd "$APP_DIR" || return
+
+    read -p "$(echo -e ${GREEN}请输入监听端口 [默认:8317]: ${RESET})" input_port
+    PORT=${input_port:-8317}
+    check_port "$PORT" || return
+
+    read -p "$(echo -e ${GREEN}请输入 API Key [留空自动生成]: ${RESET})" input_key
+    if [ -z "$input_key" ]; then
+        API_KEY=$(generate_key)
+        echo -e "${BLUE}自动生成 API Key: ${API_KEY}${RESET}"
+    else
+        API_KEY="$input_key"
+    fi
+
+    read -p "$(echo -e ${GREEN}请输入 WebUI 管理密钥 [留空自动生成]: ${RESET})" input_mgt
+    if [ -z "$input_mgt" ]; then
+        MGT_KEY=$(generate_key)
+        echo -e "${BLUE}自动生成 WebUI 管理密钥: ${MGT_KEY}${RESET}"
+    else
+        MGT_KEY="$input_mgt"
+    fi
+
+    # 复制官方示例配置
+    cp config.example.yaml config.yaml
+
+    # 写入最小配置 + WebUI
+    cat > config.yaml <<EOF
+port: ${PORT}
+
+auth-dir: "~/.cli-proxy-api"
+
+request-retry: 3
+
+quota-exceeded:
+  switch-project: true
+  switch-preview-model: true
+
+api-keys:
+  - "${API_KEY}"
+
+remote-management:
+  allow-remote: true
+  secret-key: "${MGT_KEY}"
+  disable-control-panel: false
+EOF
+
+    echo -e "${BLUE}正在执行官方构建脚本...${RESET}"
+
+    # 自动选择 选项1（DockerHub镜像）
+    printf "1\n" | bash docker-build.sh
+
+    # 检查是否成功
+    if docker ps | grep -q cliproxyapi; then
+        echo -e "${GREEN}✅ CLIProxyAPI 启动成功！${RESET}"
+        show_info
+    else
+        echo -e "${RED}❌ 启动失败，请检查日志${RESET}"
+        docker compose logs --tail=50
+        return
+    fi
+
+    read -p "按回车继续..."
+}
+
+update_app() {
+    cd "$APP_DIR" || { echo "未安装"; sleep 1; return; }
+
+    git pull
+
+    printf "1\n" | bash docker-build.sh
+
+    echo -e "${GREEN}✅ CLIProxyAPI 更新完成${RESET}"
+    sleep 1
+}
+
+restart_app() {
+    cd "$APP_DIR" || { echo "未安装"; sleep 1; return; }
+    docker compose restart
+    echo -e "${GREEN}✅ CLIProxyAPI 已重启${RESET}"
+    sleep 1
+}
+
+view_logs() {
+    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
+    docker compose logs -f
+}
+
+check_status() {
+    docker ps | grep cliproxyapi
+    read -p "按回车返回..."
+}
+
+show_info() {
+    if [ -f "$CONFIG_FILE" ]; then
+        PORT=$(grep "^port:" "$CONFIG_FILE" | awk '{print $2}')
+        API_KEY=$(grep -A1 "api-keys:" "$CONFIG_FILE" | tail -n1 | sed 's/- //' | tr -d '"')
+        MGT_KEY=$(grep "secret-key:" "$CONFIG_FILE" | awk '{print $2}' | tr -d '"')
+
+        echo
+        echo -e "${GREEN}📌 访问信息:${RESET}"
+        echo -e "${BLUE}WebUI地址: http://${SERVER_IP}:${PORT}/management.html${RESET}"
+        echo -e "${BLUE}API Key: ${API_KEY}${RESET}"
+        echo -e "${BLUE}WebUI 管理密钥: ${MGT_KEY}${RESET}"
+        echo -e "${GREEN}安装目录: $APP_DIR${RESET}"
+        echo
+    else
+        echo -e "${RED}未安装${RESET}"
+    fi
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || { echo "未安装"; sleep 1; return; }
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ CLIProxyAPI 已彻底卸载（含数据）${RESET}"
+    sleep 1
+}
+
+menu

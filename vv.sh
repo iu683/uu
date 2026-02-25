@@ -1,128 +1,131 @@
 #!/bin/bash
-# =========================================
-# 企业级系统清理脚本（兼容容器 + Docker）
-# =========================================
+# ======================================
+# yt-dlp-web 一键管理脚本 (端口映射模式)
+# ======================================
 
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-# 必须 root
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}请使用 root 运行此脚本！${RESET}"
-    exit 1
-fi
+APP_NAME="yt-dlp-web"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-# 等待 apt/dnf/yum 锁
-wait_for_lock() {
-    local cmd=$1
-    local lock_file=$2
-    while fuser $lock_file >/dev/null 2>&1; do
-        echo -e "${YELLOW}等待其他 $cmd 进程完成...${RESET}"
-        sleep 2
-    done
-}
-
-# 检查容器环境
-IS_CONTAINER=0
-if systemd-detect-virt --quiet; then
-    IS_CONTAINER=1
-    echo -e "${YELLOW}检测到容器环境，跳过内核与日志清理${RESET}"
-fi
-
-# 显示磁盘空间
-echo -e "${GREEN}清理前磁盘空间:${RESET}"
-df -h /
-
-# ===============================
-# 系统清理
-# ===============================
-clean_system() {
-    if command -v apt &>/dev/null; then
-        echo -e "${GREEN}检测到 APT 系统${RESET}"
-        wait_for_lock "APT" /var/lib/dpkg/lock-frontend
-        apt update -y
-        wait_for_lock "APT" /var/lib/dpkg/lock-frontend
-        apt autoremove --purge -y
-        apt clean
-        apt autoclean
-        dpkg -l | awk '/^rc/ {print $2}' | xargs -r apt purge -y
-        if [ "$IS_CONTAINER" -eq 0 ]; then
-            # 安全删除旧内核
-            CURRENT_KERNEL=$(uname -r)
-            dpkg --list | awk '/linux-image-[0-9]/ {print $2}' | grep -v "$CURRENT_KERNEL" | xargs -r apt purge -y
-        fi
-    elif command -v yum &>/dev/null; then
-        echo -e "${GREEN}检测到 YUM 系统${RESET}"
-        wait_for_lock "YUM" /var/run/yum.pid
-        yum autoremove -y
-        yum clean all
-        if [ "$IS_CONTAINER" -eq 0 ] && command -v package-cleanup &>/dev/null; then
-            package-cleanup --oldkernels --count=2 -y
-        fi
-    elif command -v dnf &>/dev/null; then
-        echo -e "${GREEN}检测到 DNF 系统${RESET}"
-        wait_for_lock "DNF" /var/run/dnf.pid
-        dnf autoremove -y
-        dnf clean all
-        if [ "$IS_CONTAINER" -eq 0 ]; then
-            dnf remove $(dnf repoquery --installonly --latest-limit=-2 -q) -y 2>/dev/null
-        fi
-    elif command -v apk &>/dev/null; then
-        echo -e "${GREEN}检测到 APK 系统${RESET}"
-        apk cache clean
-    else
-        echo -e "${RED}暂不支持你的系统！${RESET}"
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${RED}未检测到 Docker，请先安装 Docker${RESET}"
         exit 1
     fi
-
-    # 清理日志（物理机）
-    if [ "$IS_CONTAINER" -eq 0 ] && command -v journalctl &>/dev/null; then
-        echo -e "${GREEN}清理日志（保留最近 7 天）...${RESET}"
-        journalctl --vacuum-time=7d
-    fi
 }
 
-# ===============================
-# Docker 清理
-# ===============================
-clean_docker() {
-    if command -v docker &>/dev/null; then
-        echo -e "${GREEN}清理 Docker 无用数据...${RESET}"
-        docker system prune -af --volumes
-    else
-        echo -e "${YELLOW}未检测到 Docker，跳过${RESET}"
-    fi
-}
-
-# ===============================
-# 菜单
-# ===============================
-while true; do
-    echo -e "${GREEN}===== 系统清理菜单 =====${RESET}"
-    echo -e "${GREEN}1) 普通系统清理${RESET}"
-    echo -e "${GREEN}2) 系统+Docker 清理${RESET}"
-    echo -e "${GREEN}3) 查看磁盘空间${RESET}"
+menu() {
+    clear
+    echo -e "${GREEN}=== yt-dlp-web 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    read -p "$(echo -e ${GREEN}选择操作: ${RESET})" choice
+    read -rp "$(echo -e ${GREEN}请选择: ${RESET})" choice
     case $choice in
-        1)
-            clean_system
-            ;;
-        2)
-            clean_system
-            clean_docker
-            ;;
-        3)
-            df -h /
-            ;;
-        0)
-            echo -e "${GREEN}退出${RESET}"
-            exit 0
-            ;;
-        *)
-            echo -e "${RED}无效选择${RESET}"
-            ;;
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) view_logs ;;
+        0) exit 0 ;;
+        *) echo -e "${GREEN}无效选择${RESET}"; sleep 1; menu ;;
     esac
-done
+}
+
+install_app() {
+    mkdir -p "$APP_DIR/downloads" "$APP_DIR/cache"
+
+    # 设置下载/缓存目录权限，容器用户 1000:1000 可访问
+    chown -R 1000:1000 "$APP_DIR/downloads" "$APP_DIR/cache"
+    chmod -R 755 "$APP_DIR/downloads" "$APP_DIR/cache"
+
+    read -rp "请输入要绑定的端口 [默认 3000]: " port
+    port=${port:-3000}
+    read -rp "是否启用访问保护 (y/N): " protect
+
+    ENV_FILE="$APP_DIR/.env"
+    touch "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  yt-dlp-web:
+    image: sooros5132/yt-dlp-web:latest
+    container_name: yt-dlp-web
+    user: 1000:1000
+    env_file:
+      - .env
+    volumes:
+      - $APP_DIR/downloads:/downloads
+      - $APP_DIR/cache:/cache
+    ports:
+      - "127.0.0.1:${port}:3000"
+    restart: unless-stopped
+EOF
+
+    if [[ "$protect" =~ ^[Yy]$ ]]; then
+    read -rp "AUTH_SECRET (回车自动生成随机40字符): " AUTH_SECRET
+    if [[ -z "$AUTH_SECRET" ]]; then
+        # 自动生成 40 字符随机字符串
+        AUTH_SECRET=$(head -c 30 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 40)
+        echo "已生成 AUTH_SECRET: $AUTH_SECRET"
+    fi
+
+    read -rp "用户名: " CREDENTIAL_USERNAME
+    read -rp "密码: " CREDENTIAL_PASSWORD
+
+    cat > "$ENV_FILE" <<EOF
+AUTH_SECRET=$AUTH_SECRET
+CREDENTIAL_USERNAME=$CREDENTIAL_USERNAME
+CREDENTIAL_PASSWORD=$CREDENTIAL_PASSWORD
+EOF
+fi
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    echo -e "${GREEN}✅ yt-dlp-web 已启动${RESET}"
+    echo -e "${YELLOW}本地访问地址: http://127.0.0.1:${port}${RESET}"
+
+    if [[ "$protect" =~ ^[Yy]$ ]]; then
+        echo -e "${GREEN}用户名: $CREDENTIAL_USERNAME${RESET}"
+        echo -e "${GREEN}密码: $CREDENTIAL_PASSWORD${RESET}"
+    fi
+
+    echo -e "${GREEN}📂 数据目录: /opt/yt-dlp-web/downloads${RESET}"
+    read -rp "按回车返回菜单..."
+    menu
+}
+
+update_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ yt-dlp-web 已更新并重启完成${RESET}"
+    read -rp "按回车返回菜单..."
+    menu
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ yt-dlp-web 已卸载，数据已删除${RESET}"
+    read -rp "按回车返回菜单..."
+    menu
+}
+
+view_logs() {
+    docker logs -f yt-dlp-web
+    read -rp "按回车返回菜单..."
+    menu
+}
+
+check_docker
+menu

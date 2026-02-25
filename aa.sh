@@ -1,129 +1,193 @@
 #!/bin/bash
 # ========================================
-# yt-dlp 一键管理脚本 PRO
-# 菜单字体绿色版
+# CLIProxyAPI 一键管理脚本
+# 支持自定义端口 + API Key
 # ========================================
 
-VIDEO_DIR="/opt/yt-dlp"
-URL_FILE="$VIDEO_DIR/urls.txt"
-
 GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+BLUE="\033[36m"
 RESET="\033[0m"
 
-mkdir -p "$VIDEO_DIR"
+APP_NAME="cliproxyapi"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/config.yaml"
 
-install_yt() {
-    echo -e "${GREEN}正在安装 yt-dlp...${RESET}"
-    apt update -y
-    apt install -y ffmpeg curl nano
-    curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
-    chmod a+rx /usr/local/bin/yt-dlp
-    echo -e "${GREEN}安装完成！${RESET}"
-}
+REPO_URL="https://github.com/luispater/CLIProxyAPI.git"
 
-update_yt() {
-    echo -e "${GREEN}正在更新 yt-dlp...${RESET}"
-    yt-dlp -U
-}
+# ==============================
+# 基础检测
+# ==============================
 
-uninstall_yt() {
-    rm -f /usr/local/bin/yt-dlp
-    echo -e "${GREEN}已卸载 yt-dlp${RESET}"
-}
-
-download_single() {
-    read -e -p "$(echo -e ${GREEN}请输入视频链接: ${RESET})" url
-    yt-dlp -P "$VIDEO_DIR" -f "bv*+ba/b" --merge-output-format mp4 \
-        --write-subs --sub-langs all \
-        --write-thumbnail --embed-thumbnail \
-        --write-info-json \
-        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
-        --no-overwrites --no-post-overwrites "$url"
-}
-
-download_batch() {
-    if [ ! -f "$URL_FILE" ]; then
-        echo -e "# 一行一个视频链接" > "$URL_FILE"
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
     fi
-    nano "$URL_FILE"
-    yt-dlp -P "$VIDEO_DIR" -f "bv*+ba/b" --merge-output-format mp4 \
-        --write-subs --sub-langs all \
-        --write-thumbnail --embed-thumbnail \
-        --write-info-json \
-        -a "$URL_FILE" \
-        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
-        --no-overwrites --no-post-overwrites
+
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
+    fi
 }
 
-download_custom() {
-    read -e -p "$(echo -e ${GREEN}请输入完整 yt-dlp 参数（不含 yt-dlp）: ${RESET})" custom
-    yt-dlp -P "$VIDEO_DIR" $custom \
-        --write-subs --sub-langs all \
-        --write-thumbnail --embed-thumbnail \
-        --write-info-json \
-        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
-        --no-overwrites --no-post-overwrites
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
 }
 
-download_mp3() {
-    read -e -p "$(echo -e ${GREEN}请输入视频链接: ${RESET})" url
-    yt-dlp -P "$VIDEO_DIR" -x --audio-format mp3 \
-        --write-thumbnail --embed-thumbnail \
-        --write-info-json \
-        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
-        --no-overwrites --no-post-overwrites "$url"
+generate_key() {
+    tr -dc A-Za-z0-9 </dev/urandom | head -c 32
 }
 
-delete_video() {
-    echo -e "${GREEN}当前视频目录：${RESET}"
-    ls "$VIDEO_DIR"
-    read -e -p "$(echo -e ${GREEN}请输入要删除的目录名称: ${RESET})" name
-    rm -rf "$VIDEO_DIR/$name"
-    echo -e "${GREEN}已删除${RESET}"
+
+# 获取服务器IP
+SERVER_IP=$(hostname -I | awk '{print $1}')
+
+
+# ==============================
+# 菜单
+# ==============================
+
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== CLIProxyAPI 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 查看访问信息${RESET}"
+        echo -e "${GREEN}7) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) show_info ;;
+            7) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
 }
 
-show_list() {
-    echo -e "${GREEN}已下载视频列表：${RESET}"
-    ls -td "$VIDEO_DIR"/*/ 2>/dev/null || echo -e "${GREEN}暂无视频${RESET}"
-}
+# ==============================
+# 功能函数
+# ==============================
 
-while true; do
-    clear
-    if [ -x "/usr/local/bin/yt-dlp" ]; then
-        STATUS="${GREEN}已安装${RESET}"
+install_app() {
+
+    check_docker
+
+    if [ -d "$APP_DIR" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+        rm -rf "$APP_DIR"
+    fi
+
+    mkdir -p "$APP_DIR"
+    cd /opt || exit
+
+    echo -e "${BLUE}正在克隆项目...${RESET}"
+    git clone "$REPO_URL" "$APP_NAME"
+
+    cd "$APP_DIR" || exit
+
+    read -p "请输入监听端口 [默认:8317]: " input_port
+    PORT=${input_port:-8317}
+    check_port "$PORT" || return
+
+    read -p "请输入 API Key [留空自动生成]: " input_key
+    if [ -z "$input_key" ]; then
+        API_KEY=$(generate_key)
+        echo -e "${BLUE}自动生成 API Key: ${API_KEY}${RESET}"
     else
-        STATUS="${GREEN}未安装${RESET}"
+        API_KEY="$input_key"
     fi
 
-    echo -e "${GREEN}=================================${RESET}"
-    echo -e "${GREEN}    yt-dlp 管理工具 状态: $STATUS${RESET}"
-    echo -e "${GREEN}=================================${RESET}"
-    echo -e "${GREEN} 1. 安装 yt-dlp${RESET}"
-    echo -e "${GREEN} 2. 更新 yt-dlp${RESET}"
-    echo -e "${GREEN} 3. 卸载 yt-dlp${RESET}"
-    echo -e "${GREEN} 5. 单个视频下载${RESET}"
-    echo -e "${GREEN} 6. 批量视频下载${RESET}"
-    echo -e "${GREEN} 7. 自定义参数下载${RESET}"
-    echo -e "${GREEN} 8. 下载为 MP3${RESET}"
-    echo -e "${GREEN} 9. 删除视频目录${RESET}"
-    echo -e "${GREEN}10. 查看下载列表${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    read -e -p "$(echo -e ${GREEN}请输入选项: ${RESET})" choice
+    # 写入 config.yaml
+    cat > "$CONFIG_FILE" <<EOF
+port: ${PORT}
 
-    case $choice in
-        1) install_yt ;;
-        2) update_yt ;;
-        3) uninstall_yt ;;
-        5) download_single ;;
-        6) download_batch ;;
-        7) download_custom ;;
-        8) download_mp3 ;;
-        9) delete_video ;;
-        10) show_list ;;
-        0) exit 0 ;;
-        *) echo -e "${GREEN}无效选项${RESET}" ;;
-    esac
+auth-dir: "~/.cli-proxy-api"
+
+request-retry: 3
+
+quota-exceeded:
+  switch-project: true
+  switch-preview-model: true
+
+api-keys:
+  - "${API_KEY}"
+EOF
+
+    echo -e "${BLUE}使用官方 Docker 镜像启动...${RESET}"
+
+    docker compose up -d
 
     echo
-    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-done
+    echo -e "${GREEN}✅ CLIProxyAPI 启动成功！${RESET}"
+    show_info
+    read -p "按回车继续..."
+}
+
+update_app() {
+    cd "$APP_DIR" || { echo "未安装"; sleep 1; return; }
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ CLIProxyAPI 更新完成${RESET}"
+    sleep 1
+}
+
+restart_app() {
+    cd "$APP_DIR" || { echo "未安装"; sleep 1; return; }
+    docker compose restart
+    echo -e "${GREEN}✅ CLIProxyAPI 已重启${RESET}"
+    sleep 1
+}
+
+view_logs() {
+    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
+    docker compose logs -f
+}
+
+check_status() {
+    docker ps | grep cliproxyapi
+    read -p "按回车返回..."
+}
+
+show_info() {
+    if [ -f "$CONFIG_FILE" ]; then
+        PORT=$(grep "^port:" "$CONFIG_FILE" | awk '{print $2}')
+        API_KEY=$(grep "-" "$CONFIG_FILE" | sed 's/- //' | tr -d '"')
+        echo
+        echo -e "${GREEN}📌 访问信息:${RESET}"
+        echo -e "${BLUE}地址: http://${SERVER_IP}:${PORT}/management.html${RESET}"
+        echo -e "${BLUE}API Key: ${API_KEY}${RESET}"
+        echo -e "${GREEN}安装目录: $APP_DIR${RESET}"
+        echo
+    else
+        echo -e "${RED}未安装${RESET}"
+    fi
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || { echo "未安装"; sleep 1; return; }
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ CLIProxyAPI 已彻底卸载（含数据）${RESET}"
+    sleep 1
+}
+
+menu

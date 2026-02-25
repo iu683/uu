@@ -2,50 +2,95 @@
 
 GREEN="\033[32m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-CHECK_URL="https://Hardware.Check.Place"
+# 必须 root
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}请使用 root 运行此脚本！${RESET}"
+    exit 1
+fi
 
-run_check() {
-    mode=$1
-    name=$2
+clean_system() {
 
-    echo -e "${GREEN}正在执行：${name}...${RESET}"
-    if [ -z "$mode" ]; then
-        bash <(curl -Ls "$CHECK_URL")
+    echo -e "${GREEN}开始系统自动清理...${RESET}"
+
+    # 判断是否容器
+    if systemd-detect-virt --quiet; then
+        echo -e "${YELLOW}检测到容器环境，跳过内核与日志清理${RESET}"
+        IS_CONTAINER=1
     else
-        bash <(curl -Ls "$CHECK_URL") "$mode"
+        IS_CONTAINER=0
     fi
-    pause
+
+    # ===============================
+    # APT 系统
+    # ===============================
+    if command -v apt &>/dev/null; then
+        echo -e "${GREEN}检测到 APT 系统${RESET}"
+
+        apt update -y
+        apt autoremove --purge -y
+        apt clean
+        apt autoclean
+
+        # 清理残留 rc 包
+        dpkg -l | awk '/^rc/ {print $2}' | xargs -r apt purge -y
+
+        # 安全清理旧内核（仅物理机）
+        if [ "$IS_CONTAINER" -eq 0 ]; then
+            echo -e "${GREEN}正在安全检查旧内核...${RESET}"
+            CURRENT_KERNEL=$(uname -r)
+            dpkg --list | awk '/linux-image-[0-9]/ {print $2}' | grep -v "$CURRENT_KERNEL" | xargs -r apt purge -y
+        fi
+
+    # ===============================
+    # YUM 系统
+    # ===============================
+    elif command -v yum &>/dev/null; then
+        echo -e "${GREEN}检测到 YUM 系统${RESET}"
+
+        yum autoremove -y
+        yum clean all
+
+        if [ "$IS_CONTAINER" -eq 0 ] && command -v package-cleanup &>/dev/null; then
+            package-cleanup --oldkernels --count=2 -y
+        fi
+
+    # ===============================
+    # DNF 系统
+    # ===============================
+    elif command -v dnf &>/dev/null; then
+        echo -e "${GREEN}检测到 DNF 系统${RESET}"
+
+        dnf autoremove -y
+        dnf clean all
+
+        if [ "$IS_CONTAINER" -eq 0 ]; then
+            dnf remove $(dnf repoquery --installonly --latest-limit=-2 -q) -y 2>/dev/null
+        fi
+
+    # ===============================
+    # Alpine
+    # ===============================
+    elif command -v apk &>/dev/null; then
+        echo -e "${GREEN}检测到 APK 系统${RESET}"
+        apk cache clean
+
+    else
+        echo -e "${RED}暂不支持你的系统！${RESET}"
+        exit 1
+    fi
+
+    # ===============================
+    # 清理日志
+    # ===============================
+    if [ "$IS_CONTAINER" -eq 0 ] && command -v journalctl &>/dev/null; then
+        echo -e "${GREEN}清理日志文件（保留最近 7 天）...${RESET}"
+        journalctl --vacuum-time=7d
+    fi
+
+    echo -e "${GREEN}系统清理完成！${RESET}"
 }
 
-pause() {
-    read -p $'\033[32m按回车返回菜单...\033[0m'
-    menu
-}
-
-menu() {
-    clear
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        硬件质量体检工具        ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1) 标准检测${RESET}"
-    echo -e "${GREEN} 2) 硬盘模式${RESET}"
-    echo -e "${GREEN} 3) 深度模式${RESET}"
-    echo -e "${GREEN} 0) 退出${RESET}"
-    read -p $'\033[32m 请选择: \033[0m' choice
-
-    case $choice in
-        1) run_check "" "标准检测" ;;
-        2) run_check "-D" "硬盘模式" ;;
-        3) run_check "-V" "深度模式" ;;
-        0) exit 0 ;;
-        *)
-            echo -e "${RED}输入错误，请重新选择${RESET}"
-            sleep 1
-            menu
-            ;;
-    esac
-}
-
-menu
+clean_system

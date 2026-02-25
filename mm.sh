@@ -1,136 +1,147 @@
 #!/bin/bash
-# ==========================================
-# iperf3 一键测速管理脚本
-# 启动自动检测安装 + 四分测速菜单
-# ==========================================
+# =========================================
+# 企业级系统清理脚本（兼容容器 + Docker）
+# =========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
-BLUE="\033[36m"
 RESET="\033[0m"
-ORANGE='\033[38;5;208m'
 
-PORT=5201
-TIME=30
-PARALLEL=1
-UDP_BW="1G"
 
-# =============================
-# 自动检测并安装 iperf3
-# =============================
-install_iperf3() {
-    if command -v iperf3 >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ iperf3 已安装${RESET}"
-        sleep 1
-        return
-    fi
+# 必须 root
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}请使用 root 运行此脚本！${RESET}"
+    exit 1
+fi
 
-    echo -e "${YELLOW}未检测到 iperf3，正在自动安装...${RESET}"
-
-    if [ -f /etc/debian_version ]; then
-        apt update -y >/dev/null 2>&1
-        apt install -y iperf3 >/dev/null 2>&1
-    elif [ -f /etc/redhat-release ]; then
-        yum install -y epel-release >/dev/null 2>&1
-        yum install -y iperf3 >/dev/null 2>&1
-    else
-        echo -e "${RED}不支持的系统，请手动安装 iperf3${RESET}"
-        exit 1
-    fi
-
-    if command -v iperf3 >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ iperf3 安装完成${RESET}"
-        sleep 1
-    else
-        echo -e "${RED}iperf3 安装失败${RESET}"
-        exit 1
-    fi
-}
-
-# =============================
-# 获取服务器 IP
-# =============================
-get_ip() {
-    read -p "请输入服务器 IP: " SERVER_IP
-    if [ -z "$SERVER_IP" ]; then
-        echo -e "${RED}未输入 IP${RESET}"
-        return 1
-    fi
-    return 0
-}
-
-# =============================
-# 启动服务器
-# =============================
-start_server() {
-    echo -e "${GREEN}启动 iperf3 服务器 (端口 $PORT)...${RESET}"
-    iperf3 -s -i 10 -p $PORT
-}
-
-# =============================
-# 四种测试
-# =============================
-tcp_download() {
-    get_ip || return
-    echo -e "\n${GREEN}TCP 下载 (↓) 测试中...${RESET}"
-    iperf3 -c $SERVER_IP -R -P $PARALLEL -t $TIME -p $PORT
-    read -p "按回车返回菜单..."
-}
-
-tcp_upload() {
-    get_ip || return
-    echo -e "\n${GREEN}TCP 上传 (↑) 测试中...${RESET}"
-    iperf3 -c $SERVER_IP -P $PARALLEL -t $TIME -p $PORT
-    read -p "按回车返回菜单..."
-}
-
-udp_download() {
-    get_ip || return
-    echo -e "\n${GREEN}UDP 下载 (↓) 测试中...${RESET}"
-    iperf3 -c $SERVER_IP -u -b $UDP_BW -t $TIME -R -P $PARALLEL -p $PORT
-    read -p "按回车返回菜单..."
-}
-
-udp_upload() {
-    get_ip || return
-    echo -e "\n${GREEN}UDP 上传 (↑) 测试中...${RESET}"
-    iperf3 -c $SERVER_IP -u -b $UDP_BW -t $TIME -P $PARALLEL -p $PORT
-    read -p "按回车返回菜单..."
-}
-
-# =============================
-# 主菜单
-# =============================
-menu() {
-    while true; do
-        clear
-        echo -e "${ORANGE}===================================${RESET}"
-        echo -e "${ORANGE}        iperf3 一键测速管理         ${RESET}"
-        echo -e "${ORANGE}===================================${RESET}"
-        echo -e " ${GREEN}1) 启动 iperf3 服务器${RESET}"
-        echo -e " ${GREEN}2) TCP 下载 (↓)${RESET}"
-        echo -e " ${GREEN}3) TCP 上传 (↑)${RESET}"
-        echo -e " ${GREEN}4) UDP 下载 (↓)${RESET}"
-        echo -e " ${GREEN}5) UDP 上传 (↑)${RESET}"
-        echo -e " ${GREEN}0) 退出${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
-        read choice
-
-        case "$choice" in
-            1) start_server ;;
-            2) tcp_download ;;
-            3) tcp_upload ;;
-            4) udp_download ;;
-            5) udp_upload ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
-        esac
+# 等待 apt/dnf/yum 锁
+wait_for_lock() {
+    local cmd=$1
+    local lock_file=$2
+    while fuser $lock_file >/dev/null 2>&1; do
+        echo -e "${YELLOW}等待其他 $cmd 进程完成...${RESET}"
+        sleep 2
     done
 }
 
-# ==================================
-# 启动脚本时立即检测安装
-# ==================================
-install_iperf3
-menu
+
+# 检查容器环境
+IS_CONTAINER=0
+if systemd-detect-virt --quiet; then
+    IS_CONTAINER=1
+fi
+
+
+# 显示磁盘空间
+
+# 获取根目录磁盘信息
+df -h / | tail -n +2 | while read fs size used avail usep mount; do
+    # 去掉 % 符号
+    use_percent=${usep%\%}
+
+    # 根据使用率选择颜色
+    if [ "$use_percent" -lt 60 ]; then
+        color=$GREEN
+    elif [ "$use_percent" -lt 80 ]; then
+        color=$YELLOW
+    else
+        color=$RED
+    fi
+
+    # 输出彩色提示
+    echo -e "${YELLOW}磁盘空间:${RESET} ${color}$usep${RESET} ${YELLOW}已使用 (挂载点: $mount, 总大小: $size, 可用: $avail)${RESET}"
+done
+
+
+# ===============================
+# 系统清理
+# ===============================
+clean_system() {
+    if command -v apt &>/dev/null; then
+        echo -e "${GREEN}检测到 APT 系统${RESET}"
+        wait_for_lock "APT" /var/lib/dpkg/lock-frontend
+        apt update -y
+        wait_for_lock "APT" /var/lib/dpkg/lock-frontend
+        apt autoremove --purge -y
+        apt clean
+        apt autoclean
+        dpkg -l | awk '/^rc/ {print $2}' | xargs -r apt purge -y
+        if [ "$IS_CONTAINER" -eq 0 ]; then
+            # 安全删除旧内核
+            CURRENT_KERNEL=$(uname -r)
+            dpkg --list | awk '/linux-image-[0-9]/ {print $2}' | grep -v "$CURRENT_KERNEL" | xargs -r apt purge -y
+        fi
+    elif command -v yum &>/dev/null; then
+        echo -e "${GREEN}检测到 YUM 系统${RESET}"
+        wait_for_lock "YUM" /var/run/yum.pid
+        yum autoremove -y
+        yum clean all
+        if [ "$IS_CONTAINER" -eq 0 ] && command -v package-cleanup &>/dev/null; then
+            package-cleanup --oldkernels --count=2 -y
+        fi
+    elif command -v dnf &>/dev/null; then
+        echo -e "${GREEN}检测到 DNF 系统${RESET}"
+        wait_for_lock "DNF" /var/run/dnf.pid
+        dnf autoremove -y
+        dnf clean all
+        if [ "$IS_CONTAINER" -eq 0 ]; then
+            dnf remove $(dnf repoquery --installonly --latest-limit=-2 -q) -y 2>/dev/null
+        fi
+    elif command -v apk &>/dev/null; then
+        echo -e "${GREEN}检测到 APK 系统${RESET}"
+        apk cache clean
+    else
+        echo -e "${RED}暂不支持你的系统！${RESET}"
+        exit 1
+    fi
+
+    # 清理日志（保留最近 7 天）
+    echo -e "${GREEN}清理日志文件（保留最近 7 天）...${RESET}"
+    journalctl --vacuum-time=7d
+
+    echo -e "${GREEN}系统清理完成！${RESET}"
+}
+
+# ===============================
+# Docker 清理
+# ===============================
+clean_docker() {
+    if command -v docker &>/dev/null; then
+        echo -e "${GREEN}清理 Docker 无用数据...${RESET}"
+        docker system prune -af --volumes
+    else
+        echo -e "${YELLOW}未检测到 Docker，跳过${RESET}"
+    fi
+}
+
+# ===============================
+# 菜单
+# ===============================
+while true; do
+    echo -e "${GREEN}===== 系统清理菜单 =====${RESET}"
+    echo -e "${GREEN}1) 普通系统清理${RESET}"
+    echo -e "${GREEN}2) 系统+Docker 清理${RESET}"
+    echo -e "${GREEN}3) 查看磁盘空间${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    read -p "$(echo -e ${GREEN}选择操作: ${RESET})" choice
+    case $choice in
+        1)
+            clean_system
+            ;;
+        2)
+            clean_system
+            clean_docker
+            ;;
+        3)
+            df -h /
+            ;;
+        0)
+            echo -e "${GREEN}退出${RESET}"
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}无效选择${RESET}"
+            ;;
+    esac
+done

@@ -1,16 +1,21 @@
 #!/bin/bash
 # ========================================
-# YT-DLP-WebUI 一键管理脚本
+# CLIProxyAPI 一键管理脚本
+# 支持自定义端口 + API Key
 # ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
+BLUE="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="yt-dlp-webui"
+APP_NAME="cliproxyapi"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/config.yaml"
+
+REPO_URL="https://github.com/luispater/CLIProxyAPI.git"
 
 # ==============================
 # 基础检测
@@ -35,6 +40,15 @@ check_port() {
     fi
 }
 
+generate_key() {
+    tr -dc A-Za-z0-9 </dev/urandom | head -c 32
+}
+
+
+# 获取服务器IP
+SERVER_IP=$(hostname -I | awk '{print $1}')
+
+
 # ==============================
 # 菜单
 # ==============================
@@ -42,13 +56,12 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== YT-DLP-WebUI 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== CLIProxyAPI 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}5) 卸载(含数据)${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
@@ -57,14 +70,9 @@ menu() {
             2) update_app ;;
             3) restart_app ;;
             4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
+            5) uninstall_app ;;
             0) exit 0 ;;
-            *)
-                echo -e "${RED}无效选择${RESET}"
-                sleep 1
-                continue
-                ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
         esac
     done
 }
@@ -73,101 +81,143 @@ menu() {
 # 功能函数
 # ==============================
 
-# ==============================
-# 功能函数：安装启动
-# ==============================
 install_app() {
+
     check_docker
 
-    mkdir -p "$APP_DIR/data"
-    mkdir -p "$APP_DIR/config"
+    if ! command -v git &>/dev/null; then
+        echo -e "${YELLOW}未检测到 git，正在安装...${RESET}"
+        apt install -y git 2>/dev/null || yum install -y git
+    fi
 
-    # 如果已有安装，提示是否覆盖
-    if [ -f "$COMPOSE_FILE" ]; then
+    if [ -d "$APP_DIR" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
         read confirm
         [[ "$confirm" != "y" ]] && return
+        rm -rf "$APP_DIR"
     fi
 
-    # 输入端口
-    read -p "请输入访问端口 [默认:3035]: " input_port
-    PORT=${input_port:-3035}
-    check_port "$PORT" || return
+    mkdir -p /opt
+    cd /opt || exit
 
-    # 输入用户名密码（生成 config.yml）
-    read -p "请输入登录用户名: " input_user
-    read -sp "请输入登录密码: " input_pass
-    echo
+    echo -e "${BLUE}正在克隆项目...${RESET}"
+    git clone "$REPO_URL" "$APP_NAME" || {
+        echo -e "${RED}克隆失败${RESET}"
+        return
+    }
 
-    cat > "$APP_DIR/config/config.yml" <<EOF
-require_auth: true
-username: $input_user
-password: $input_pass
+    cd "$APP_DIR" || return
+
+    read -p "$(echo -e ${GREEN}请输入 API Key [留空自动生成]: ${RESET})" input_key
+    if [ -z "$input_key" ]; then
+        API_KEY=$(generate_key)
+        echo -e "${BLUE}自动生成 API Key: ${API_KEY}${RESET}"
+    else
+        API_KEY="$input_key"
+    fi
+
+    read -p "$(echo -e ${GREEN}请输入 WebUI 管理密钥 [留空自动生成]: ${RESET})" input_mgt
+    if [ -z "$input_mgt" ]; then
+        MGT_KEY=$(generate_key)
+        echo -e "${BLUE}自动生成 WebUI 管理密钥: ${MGT_KEY}${RESET}"
+    else
+        MGT_KEY="$input_mgt"
+    fi
+
+    # 复制官方示例配置
+    cp config.example.yaml config.yaml
+
+    # 写入最小配置 + WebUI
+cat > config.yaml <<EOF
+port: 8317
+
+auth-dir: "~/.cli-proxy-api"
+
+request-retry: 3
+
+quota-exceeded:
+  switch-project: true
+  switch-preview-model: true
+
+api-keys:
+  - "${API_KEY}"
+
+remote-management:
+  allow-remote: true
+  secret-key: "${MGT_KEY}"
+  disable-control-panel: false
 EOF
-    echo -e "${GREEN}✅ config.yml 已生成并启用认证${RESET}"
 
-    # 生成 docker-compose.yml
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  yt-dlp-webui:
-    image: marcobaobao/yt-dlp-webui:latest
-    container_name: yt-dlp-webui
-    ports:
-      - "127.0.0.1:${PORT}:3033"
-    volumes:
-      - ./data:/downloads
-      - ./config:/config
-    healthcheck:
-      test: curl -f http://localhost:3033 || exit 1
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    restart: unless-stopped
-EOF
+    echo -e "${BLUE}正在执行官方构建脚本...${RESET}"
 
-    cd "$APP_DIR" || exit
-    docker compose up -d
+    # 自动选择 选项1（DockerHub镜像）
+    printf "1\n" | bash docker-build.sh
 
-    echo
-    echo -e "${GREEN}✅ YT-DLP-WebUI 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
-    read -p "按回车返回菜单..."
+    # 检查是否成功
+    if docker ps | grep cli-proxy-api; then
+        echo -e "${GREEN}✅ CLIProxyAPI 启动成功！${RESET}"
+        show_info
+    else
+        echo -e "${RED}❌ 启动失败，请检查日志${RESET}"
+        docker compose logs --tail=50
+        return
+    fi
+
+    read -p "按回车继续..."
 }
+
 update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ YT-DLP-WebUI 更新完成${RESET}"
-    read -p "按回车返回菜单..."
+    cd "$APP_DIR" || { echo "未安装"; sleep 1; return; }
+
+    git pull
+
+    printf "1\n" | bash docker-build.sh
+
+    echo -e "${GREEN}✅ CLIProxyAPI 更新完成${RESET}"
+    sleep 1
 }
 
 restart_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    cd "$APP_DIR" || { echo "未安装"; sleep 1; return; }
     docker compose restart
-    echo -e "${GREEN}✅ YT-DLP-WebUI 已重启${RESET}"
-    read -p "按回车返回菜单..."
+    echo -e "${GREEN}✅ CLIProxyAPI 已重启${RESET}"
+    sleep 1
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f yt-dlp-webui
+    docker compose logs -f
 }
 
 check_status() {
-    docker ps | grep yt-dlp-webui
-    read -p "按回车返回菜单..."
+    docker ps | grep cli-proxy-api
+    read -p "按回车返回..."
+}
+
+show_info() {
+    if [ -f "$CONFIG_FILE" ]; then
+        PORT=$(grep "^port:" "$CONFIG_FILE" | awk '{print $2}')
+        API_KEY=$(grep -A1 "api-keys:" "$CONFIG_FILE" | tail -n1 | sed 's/- //' | tr -d '"')
+        MGT_KEY=$(grep "secret-key:" "$CONFIG_FILE" | awk '{print $2}' | tr -d '"')
+
+        echo
+        echo -e "${GREEN}📌 访问信息:${RESET}"
+        echo -e "${BLUE}WebUI地址: http://${SERVER_IP}:8317/management.html${RESET}"
+        echo -e "${BLUE}API Key: ${API_KEY}${RESET}"
+        echo -e "${BLUE}WebUI 管理密钥: ${MGT_KEY}${RESET}"
+        echo -e "${GREEN}安装目录: $APP_DIR${RESET}"
+        echo
+    else
+        echo -e "${RED}未安装${RESET}"
+    fi
 }
 
 uninstall_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    cd "$APP_DIR" || { echo "未安装"; sleep 1; return; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ YT-DLP-WebUI 已彻底卸载（含数据）${RESET}"
-    read -p "按回车返回菜单..."
+    echo -e "${RED}✅ CLIProxyAPI 已彻底卸载（含数据）${RESET}"
+    sleep 1
 }
 
-# ==============================
-# 启动菜单
-# ==============================
 menu

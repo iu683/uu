@@ -1,184 +1,140 @@
 #!/bin/bash
-# ========================================
-# ClawBot 一键管理脚本（增强版）- 静态菜单版
-# ========================================
 
-# ====== 颜色定义 ======
+# ==========================================
+# OpenClaw 一键菜单管理脚本
+# ==========================================
+
+# ===== 颜色 =====
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
-BLUE="\033[36m"
+GRAY="\033[90m"
 RESET="\033[0m"
 
-# ====== 状态变量 ======
-INSTALLED=0
-TG_CONNECTED=0
+APP_NAME="OpenClaw"
+CONFIG_FILE="$HOME/.openclaw/openclaw.json"
 
-# ==============================
-# 状态检测函数
-# ==============================
-check_installed() {
-    if command -v openclaw &>/dev/null; then
-        INSTALLED=1
+# ==========================================
+# 状态检测
+# ==========================================
+
+get_install_status() {
+    if command -v openclaw >/dev/null 2>&1; then
+        echo -e "${GREEN}已安装${RESET}"
     else
-        INSTALLED=0
+        echo -e "${GRAY}未安装${RESET}"
     fi
 }
 
-check_telegram_connected() {
-    if [[ $INSTALLED -eq 1 ]] && openclaw pairing list | grep -q "telegram"; then
-        TG_CONNECTED=1
+get_running_status() {
+    if pgrep -f openclaw-gateway >/dev/null 2>&1; then
+        echo -e "${GREEN}运行中${RESET}"
     else
-        TG_CONNECTED=0
+        echo -e "${GRAY}未运行${RESET}"
     fi
 }
 
-# ==============================
-# 菜单显示函数（静态，不重复刷新状态）
-# ==============================
+
+# ==========================================
+# 菜单
+# ==========================================
+
 show_menu() {
-    local INSTALL_STATUS="${RED}未安装${RESET}"
-    [[ $INSTALLED -eq 1 ]] && INSTALL_STATUS="${GREEN}已安装${RESET}"
-
-    local TG_STATUS="${RED}未连接${RESET}"
-    [[ $TG_CONNECTED -eq 1 ]] && TG_STATUS="${GREEN}已连接${RESET}"
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ClawBot 管理菜单          ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}安装状态: $INSTALL_STATUS    Telegram: $TG_STATUS${RESET}"
-    echo -e "${GREEN}1. 安装 ClawBot${RESET}"              
-    echo -e "${GREEN}2. 连接 Telegram${RESET}"          
-    echo -e "${GREEN}3. 修改配置${RESET}"               
-    echo -e "${GREEN}4. 重启 ClawBot${RESET}"             
-    echo -e "${GREEN}5. 卸载 ClawBot${RESET}"    
-    echo -e "${GREEN}6. 暂停网关${RESET}"
-    echo -e "${GREEN}7. 启动网关${RESET}"
-    echo -e "${GREEN}8. 查看当前状态${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
+    clear
+    echo -e "${GREEN}=========================================${RESET}"
+    echo -e "${GREEN}        ${APP_NAME} 管理菜单${RESET}"
+     echo -e "${GREEN}========================================${RESET}"
+    echo -e "安装状态 : $(get_install_status)"
+    echo -e "运行状态 : $(get_running_status)"
+    echo -e "${GREEN}=========================================${RESET}"
+    echo -e "${GREEN} 1. 安装${RESET}"
+    echo -e "${GREEN} 2. 启动${RESET}"
+    echo -e "${GREEN} 3. 停止${RESET}"
+    echo -e "${GREEN} 4. 查看状态${RESET}"
+    echo -e "${GREEN} 5. TG输入连接码${RESET}"
+    echo -e "${GREEN} 6. 编辑配置文件${RESET}"
+    echo -e "${GREEN} 7. 初始化向导${RESET}"
+    echo -e "${GREEN} 8. 健康检测${RESET}"
+    echo -e "${GREEN} 9. 更新${RESET}"
+    echo -e "${GREEN}10. 卸载${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    printf "${GREEN} 请输入选项: ${RESET}"
 }
 
-# ==============================
-# 功能函数
-# ==============================
-install_clawbot() {
-    check_installed
-    if [[ $INSTALLED -eq 1 ]]; then
-        echo -e "${GREEN}ClawBot 已安装，无需重复安装${RESET}"
-        return
-    fi
-    echo -e "${GREEN}正在安装 ClawBot...${RESET}"
-    curl -fsSL https://openclaw.ai/install.sh | bash
-    echo -e "${GREEN}安装完成！${RESET}"
+# ==========================================
+# 控制函数
+# ==========================================
+
+restart_gateway() {
+    openclaw gateway stop >/dev/null 2>&1
+    sleep 1
+    openclaw gateway start
+    sleep 2
 }
 
-connect_telegram() {
-    check_installed
-    check_telegram_connected
-
-    if [[ $INSTALLED -eq 0 ]]; then
-        echo -e "${RED}ClawBot 未安装，无法连接 Telegram.${RESET}"
-        return
-    fi
-
-    if [[ $TG_CONNECTED -eq 1 ]]; then
-        echo -e "${GREEN}Telegram 已连接，无需重复连接${RESET}"
-        return
-    fi
-
-    read -p "请输入 Telegram pairing code: " code
-    echo -e "${GREEN}正在连接 Telegram...${RESET}"
-    openclaw pairing approve telegram "$code"
-    echo -e "${GREEN}已连接 Telegram！${RESET}"
-}
-
-configure_clawbot() {
-    check_installed
-    if [[ $INSTALLED -eq 0 ]]; then
-        echo -e "${RED}ClawBot 未安装，无法配置.${RESET}"
-        return
-    fi
-    echo -e "${GREEN}打开 ClawBot 配置界面...${RESET}"
-    openclaw configure
-    echo -e "${GREEN}配置完成！${RESET}"
-}
-
-restart_clawbot() {
-    check_installed
-    if [[ $INSTALLED -eq 0 ]]; then
-        echo -e "${RED}ClawBot 未安装，无法重启.${RESET}"
-        return
-    fi
-    echo -e "${GREEN}正在重启 ClawBot...${RESET}"
-    openclaw daemon restart
-    echo -e "${GREEN}ClawBot 已重启！${RESET}"
-}
-
-uninstall_clawbot() {
-    check_installed
-    if [[ $INSTALLED -eq 0 ]]; then
-        echo -e "${RED}ClawBot 未安装，无法卸载.${RESET}"
-        return
-    fi
-    echo -e "${RED}正在卸载 ClawBot...${RESET}"
-    openclaw uninstall
-    echo -e "${RED}ClawBot 已卸载！${RESET}"
-}
-
-stop_gateway() {
-    check_installed
-    if [[ $INSTALLED -eq 0 ]]; then
-        echo -e "${RED}ClawBot 未安装，无法暂停网关.${RESET}"
-    else
-        echo -e "${GREEN}正在暂停 ClawBot 网关...${RESET}"
-        clawdbot gateway stop
-        echo -e "${GREEN}网关已暂停！${RESET}"
+install_node() {
+    if command -v apt >/dev/null 2>&1; then
+        curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+        apt install -y nodejs build-essential
     fi
 }
 
-start_gateway() {
-    check_installed
-    if [[ $INSTALLED -eq 0 ]]; then
-        echo -e "${RED}ClawBot 未安装，无法启动网关.${RESET}"
-    else
-        echo -e "${GREEN}正在启动 ClawBot 网关...${RESET}"
-        clawdbot gateway
-        echo -e "${GREEN}网关已启动！${RESET}"
-    fi
+install_app() {
+    echo "正在安装 OpenClaw..."
+    install_node
+    npm install -g openclaw@latest
+    openclaw onboard --install-daemon
+    restart_gateway
+    read -p "完成，回车继续..."
+}
+
+start_app() {
+    restart_gateway
+    read -p "已启动，回车继续..."
+}
+
+stop_app() {
+    openclaw gateway stop
+    read -p "已停止，回车继续..."
 }
 
 view_status() {
-    check_installed
-    if [[ $INSTALLED -eq 0 ]]; then
-        echo -e "${RED}ClawBot 未安装，无法查看状态.${RESET}"
-    else
-        echo -e "${GREEN}当前 ClawBot 状态:${RESET}"
-        openclaw status
-    fi
+    openclaw status
+    openclaw gateway status
+    openclaw logs
+    read -p "回车继续..."
 }
 
-# ==============================
-# 主循环 - 菜单保持静态，状态仅在操作前更新
-# ==============================
-clear
+
+update_app() {
+    npm install -g openclaw@latest
+    restart_gateway
+    read -p "更新完成，回车继续..."
+}
+
+uninstall_app() {
+    openclaw uninstall
+    npm uninstall -g openclaw
+    read -p "卸载完成，回车继续..."
+}
+
+# ==========================================
+# 主循环
+# ==========================================
+
 while true; do
     show_menu
-    read -p $'\033[32m请选择: \033[0m' choice
-
-    case "$choice" in
-        1) install_clawbot ;;
-        2) connect_telegram ;;
-        3) configure_clawbot ;;
-        4) restart_clawbot ;;
-        5) uninstall_clawbot ;;
-        6) stop_gateway ;;
-        7) start_gateway ;;
-        8) view_status ;;
-        0) echo -e "${BLUE}退出${RESET}"; exit 0 ;;
-        *) echo -e "${RED}无效选项，请重新选择${RESET}" ;;
+    read choice
+    case $choice in
+        1) install_app ;;
+        2) start_app ;;
+        3) stop_app ;;
+        4) view_status ;;
+        5) read -p "TG连接码: " code && openclaw pairing approve telegram "$code" ;;
+        6) nano "$CONFIG_FILE" && restart_gateway ;;
+        7) openclaw onboard --install-daemon ;;
+        8) openclaw doctor --fix ;;
+        9) update_app ;;
+        10) uninstall_app ;;
+        0) exit ;;
     esac
-
-    # 每次操作前更新状态
-    check_installed
-    check_telegram_connected
 done

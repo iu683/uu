@@ -1,128 +1,156 @@
 #!/bin/bash
-# =========================================
-# 企业级系统清理脚本（兼容容器 + Docker）
-# =========================================
+# ========================================
+# YT-DLP-WebUI 一键管理脚本
+# ========================================
 
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-# 必须 root
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}请使用 root 运行此脚本！${RESET}"
-    exit 1
-fi
+APP_NAME="yt-dlp-webui"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-# 等待 apt/dnf/yum 锁
-wait_for_lock() {
-    local cmd=$1
-    local lock_file=$2
-    while fuser $lock_file >/dev/null 2>&1; do
-        echo -e "${YELLOW}等待其他 $cmd 进程完成...${RESET}"
-        sleep 2
+# ==============================
+# 基础检测
+# ==============================
+
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
+
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
+    fi
+}
+
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
+
+# ==============================
+# 菜单
+# ==============================
+
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== YT-DLP-WebUI 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *)
+                echo -e "${RED}无效选择${RESET}"
+                sleep 1
+                continue
+                ;;
+        esac
     done
 }
 
-# 检查容器环境
-IS_CONTAINER=0
-if systemd-detect-virt --quiet; then
-    IS_CONTAINER=1
-    echo -e "${YELLOW}检测到容器环境，跳过内核与日志清理${RESET}"
-fi
+# ==============================
+# 功能函数
+# ==============================
 
-# 显示磁盘空间
-echo -e "${GREEN}清理前磁盘空间:${RESET}"
-df -h /
+install_app() {
+    check_docker
 
-# ===============================
-# 系统清理
-# ===============================
-clean_system() {
-    if command -v apt &>/dev/null; then
-        echo -e "${GREEN}检测到 APT 系统${RESET}"
-        wait_for_lock "APT" /var/lib/dpkg/lock-frontend
-        apt update -y
-        wait_for_lock "APT" /var/lib/dpkg/lock-frontend
-        apt autoremove --purge -y
-        apt clean
-        apt autoclean
-        dpkg -l | awk '/^rc/ {print $2}' | xargs -r apt purge -y
-        if [ "$IS_CONTAINER" -eq 0 ]; then
-            # 安全删除旧内核
-            CURRENT_KERNEL=$(uname -r)
-            dpkg --list | awk '/linux-image-[0-9]/ {print $2}' | grep -v "$CURRENT_KERNEL" | xargs -r apt purge -y
-        fi
-    elif command -v yum &>/dev/null; then
-        echo -e "${GREEN}检测到 YUM 系统${RESET}"
-        wait_for_lock "YUM" /var/run/yum.pid
-        yum autoremove -y
-        yum clean all
-        if [ "$IS_CONTAINER" -eq 0 ] && command -v package-cleanup &>/dev/null; then
-            package-cleanup --oldkernels --count=2 -y
-        fi
-    elif command -v dnf &>/dev/null; then
-        echo -e "${GREEN}检测到 DNF 系统${RESET}"
-        wait_for_lock "DNF" /var/run/dnf.pid
-        dnf autoremove -y
-        dnf clean all
-        if [ "$IS_CONTAINER" -eq 0 ]; then
-            dnf remove $(dnf repoquery --installonly --latest-limit=-2 -q) -y 2>/dev/null
-        fi
-    elif command -v apk &>/dev/null; then
-        echo -e "${GREEN}检测到 APK 系统${RESET}"
-        apk cache clean
-    else
-        echo -e "${RED}暂不支持你的系统！${RESET}"
-        exit 1
+    mkdir -p "$APP_DIR/data"
+    mkdir -p "$APP_DIR/config"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
     fi
 
-    # 清理日志（物理机）
-    if [ "$IS_CONTAINER" -eq 0 ] && command -v journalctl &>/dev/null; then
-        echo -e "${GREEN}清理日志（保留最近 7 天）...${RESET}"
-        journalctl --vacuum-time=7d
-    fi
+    read -p "请输入访问端口 [默认:3035]: " input_port
+    PORT=${input_port:-3035}
+    check_port "$PORT" || return
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  yt-dlp-webui:
+    image: marcobaobao/yt-dlp-webui:latest
+    container_name: yt-dlp-webui
+    ports:
+      - "127.0.0.1:${PORT}:3033"
+    volumes:
+      - ./data:/downloads
+      - ./config:/config
+    healthcheck:
+      test: curl -f http://localhost:3033 || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    echo
+    echo -e "${GREEN}✅ YT-DLP-WebUI 已启动${RESET}"
+    echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-# ===============================
-# Docker 清理
-# ===============================
-clean_docker() {
-    if command -v docker &>/dev/null; then
-        echo -e "${GREEN}清理 Docker 无用数据...${RESET}"
-        docker system prune -af --volumes
-    else
-        echo -e "${YELLOW}未检测到 Docker，跳过${RESET}"
-    fi
+update_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ YT-DLP-WebUI 更新完成${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-# ===============================
-# 菜单
-# ===============================
-while true; do
-    echo -e "${GREEN}===== 系统清理菜单 =====${RESET}"
-    echo -e "${GREEN}1) 普通系统清理${RESET}"
-    echo -e "${GREEN}2) 系统 + Docker 清理${RESET}"
-    echo -e "${GREEN}3) 查看磁盘空间${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    read -p "${GREEN} 选择操作: ${RESET}" choice
-    case $choice in
-        1)
-            clean_system
-            ;;
-        2)
-            clean_system
-            clean_docker
-            ;;
-        3)
-            df -h /
-            ;;
-        0)
-            echo -e "${GREEN}退出${RESET}"
-            exit 0
-            ;;
-        *)
-            echo -e "${RED}无效选择${RESET}"
-            ;;
-    esac
-done
+restart_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    docker compose restart
+    echo -e "${GREEN}✅ YT-DLP-WebUI 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
+    docker logs -f yt-dlp-webui
+}
+
+check_status() {
+    docker ps | grep yt-dlp-webui
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ YT-DLP-WebUI 已彻底卸载（含数据）${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+# ==============================
+# 启动菜单
+# ==============================
+menu

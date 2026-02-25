@@ -1,208 +1,197 @@
 #!/bin/bash
-# ==========================================
-# Antigravity Manager 一键管理脚本
-# ==========================================
+# ========================================
+# ClawBot 一键管理脚本（增强版）
+# ========================================
 
+# ====== 颜色定义 ======
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
 BLUE="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="antigravity-manager"
-DATA_DIR="/opt/.antigravity_tools"
+# ====== 状态变量 ======
+INSTALLED=0
+TG_CONNECTED=0
 
 # ==============================
-# 基础检测
+# 状态检测函数
 # ==============================
-
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-}
-
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用！${RESET}"
-        return 1
-    fi
-}
-
-generate_key() {
-    tr -dc A-Za-z0-9 </dev/urandom | head -c 32
-}
-
-SERVER_IP=$(hostname -I | awk '{print $1}')
-
-# ==============================
-# 菜单
-# ==============================
-
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== Antigravity Manager 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 重启${RESET}"
-        echo -e "${GREEN}3) 更新${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) restart_app ;;
-            3) update_app ;;
-            4) view_logs ;;
-            5) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
-# ==============================
-# 功能
-# ==============================
-
-install_app() {
-
-    check_docker
-
-    if docker ps -a | grep -q "$APP_NAME"; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-        docker rm -f $APP_NAME
-    fi
-
-    read -p "$(echo -e ${GREEN}请输入运行端口 [默认8045]: ${RESET})" PORT
-    PORT=${PORT:-8045}
-    check_port "$PORT" || return
-
-    read -p "$(echo -e ${GREEN}请输入 API_KEY [留空自动生成]: ${RESET})" input_api
-    if [ -z "$input_api" ]; then
-        API_KEY=$(generate_key)
-        echo -e "${BLUE}自动生成 API_KEY: ${API_KEY}${RESET}"
+check_installed() {
+    if command -v openclaw &>/dev/null; then
+        INSTALLED=1
     else
-        API_KEY="$input_api"
+        INSTALLED=0
     fi
-
-    read -p "$(echo -e ${GREEN}请输入 Web 登录密码 [留空自动生成]: ${RESET})" input_pass
-    if [ -z "$input_pass" ]; then
-        WEB_PASS=$(generate_key)
-        echo -e "${BLUE}自动生成 Web 密码: ${WEB_PASS}${RESET}"
-    else
-        WEB_PASS="$input_pass"
-    fi
-
-    mkdir -p "$DATA_DIR"
-
-    echo -e "${BLUE}正在启动容器...${RESET}"
-
-    docker run -d \
-      --name $APP_NAME \
-      -p ${PORT}:8045 \
-      -e API_KEY=${API_KEY} \
-      -e WEB_PASSWORD=${WEB_PASS} \
-      -e ABV_MAX_BODY_SIZE=104857600 \
-      -v ${DATA_DIR}:/root/.antigravity_tools \
-      --restart unless-stopped \
-      lbjlaq/antigravity-manager:latest
-
-    sleep 2
-
-    if docker ps | grep -q "$APP_NAME"; then
-        echo -e "${GREEN}✅ Antigravity Manager 启动成功！${RESET}"
-        echo "$PORT" > /tmp/${APP_NAME}_port
-        echo "$API_KEY" > /tmp/${APP_NAME}_api
-        echo "$WEB_PASS" > /tmp/${APP_NAME}_pass
-        show_info
-    else
-        echo -e "${RED}❌ Antigravity Manager 启动失败，请查看日志${RESET}"
-        docker logs $APP_NAME
-    fi
-
-    read -p "按回车继续..."
 }
 
-restart_app() {
-    docker restart $APP_NAME
-    echo -e "${GREEN}已重启${RESET}"
-    sleep 1
+check_telegram_connected() {
+    if [[ $INSTALLED -eq 1 ]] && openclaw pairing list | grep -q "telegram"; then
+        TG_CONNECTED=1
+    else
+        TG_CONNECTED=0
+    fi
 }
 
-update_app() {
+# ==============================
+# 菜单显示函数（增加网关控制和状态查看）
+# ==============================
+show_menu() {
+    check_installed
+    check_telegram_connected
 
-    if ! docker ps -a | grep -q "$APP_NAME"; then
-        echo -e "${RED}未安装${RESET}"
-        sleep 1
+    local INSTALL_STATUS="${RED}未安装${RESET}"
+    [[ $INSTALLED -eq 1 ]] && INSTALL_STATUS="${GREEN}已安装${RESET}"
+
+    local TG_STATUS="${RED}未连接${RESET}"
+    [[ $TG_CONNECTED -eq 1 ]] && TG_STATUS="${GREEN}已连接${RESET}"
+
+    clear
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}     ClawBot 管理菜单          ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}安装状态: $INSTALL_STATUS    Telegram: $TG_STATUS${RESET}"
+    echo -e "${GREEN}1. 安装 ClawBot${RESET}"              
+    echo -e "${GREEN}2. 连接 Telegram${RESET}"          
+    echo -e "${GREEN}3. 修改配置${RESET}"               
+    echo -e "${GREEN}4. 重启 ClawBot${RESET}"             
+    echo -e "${GREEN}5. 卸载 ClawBot${RESET}"    
+    echo -e "${GREEN}6. 暂停网关${RESET}"
+    echo -e "${GREEN}7. 启动网关${RESET}"
+    echo -e "${GREEN}8. 查看当前状态${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    read -p $'\033[32m请选择: \033[0m' choice
+}
+
+# ==============================
+# 新增功能函数
+# ==============================
+stop_gateway() {
+    check_installed
+    if [[ $INSTALLED -eq 0 ]]; then
+        echo -e "${RED}ClawBot 未安装，无法暂停网关.${RESET}"
+    else
+        echo -e "${GREEN}正在暂停 ClawBot 网关...${RESET}"
+        clawdbot gateway stop
+        echo -e "${GREEN}网关已暂停！${RESET}"
+    fi
+    read -p "按回车返回菜单..."
+}
+
+start_gateway() {
+    check_installed
+    if [[ $INSTALLED -eq 0 ]]; then
+        echo -e "${RED}ClawBot 未安装，无法启动网关.${RESET}"
+    else
+        echo -e "${GREEN}正在启动 ClawBot 网关...${RESET}"
+        clawdbot gateway
+        echo -e "${GREEN}网关已启动！${RESET}"
+    fi
+    read -p "按回车返回菜单..."
+}
+
+view_status() {
+    check_installed
+    if [[ $INSTALLED -eq 0 ]]; then
+        echo -e "${RED}ClawBot 未安装，无法查看状态.${RESET}"
+    else
+        echo -e "${GREEN}当前 ClawBot 状态:${RESET}"
+        openclaw status
+    fi
+    read -p "按回车返回菜单..."
+}
+
+# ==============================
+# 功能函数
+# ==============================
+install_clawbot() {
+    echo -e "${GREEN}正在安装 ClawBot...${RESET}"
+    curl -fsSL https://openclaw.ai/install.sh | bash
+    echo -e "${GREEN}安装完成！${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+connect_telegram() {
+    check_installed
+    check_telegram_connected
+
+    if [[ $INSTALLED -eq 0 ]]; then
+        echo -e "${RED}ClawBot 未安装，无法连接 Telegram.${RESET}"
+        read -p "按回车返回菜单..."
         return
     fi
 
-    echo -e "${BLUE}正在拉取新镜像...${RESET}"
-    docker pull lbjlaq/antigravity-manager:latest || return
-
-    echo -e "${BLUE}保存当前端口...${RESET}"
-    PORT=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8045/tcp") 0).HostPort}}' $APP_NAME)
-
-    echo -e "${BLUE}保存环境变量...${RESET}"
-    API_KEY=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' $APP_NAME | grep API_KEY= | cut -d= -f2)
-    WEB_PASS=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' $APP_NAME | grep WEB_PASSWORD= | cut -d= -f2)
-
-    echo -e "${BLUE}停止并删除旧容器...${RESET}"
-    docker rm -f $APP_NAME
-
-    echo -e "${BLUE}使用新镜像重新创建容器...${RESET}"
-    docker run -d \
-      --name $APP_NAME \
-      -p ${PORT}:8045 \
-      -e API_KEY=${API_KEY} \
-      -e WEB_PASSWORD=${WEB_PASS} \
-      -e ABV_MAX_BODY_SIZE=104857600 \
-      -v ${DATA_DIR}:/root/.antigravity_tools \
-      --restart unless-stopped \
-      lbjlaq/antigravity-manager:latest
-
-    if docker ps | grep -q "$APP_NAME"; then
-        echo -e "${GREEN}✅ Antigravity Manager 更新成功，数据保留${RESET}"
-    else
-        echo -e "${RED}❌ Antigravity Manager 更新失败，请检查日志${RESET}"
+    if [[ $TG_CONNECTED -eq 1 ]]; then
+        echo -e "${GREEN}Telegram 已连接，无需重复连接${RESET}"
+        read -p "按回车返回菜单..."
+        return
     fi
 
-    sleep 2
+    read -p "请输入 Telegram pairing code: " code
+    echo -e "${GREEN}正在连接 Telegram...${RESET}"
+    openclaw pairing approve telegram "$code"
+    echo -e "${GREEN}已连接 Telegram！${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-view_logs() {
-    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f $APP_NAME
+configure_clawbot() {
+    check_installed
+    if [[ $INSTALLED -eq 0 ]]; then
+        echo -e "${RED}ClawBot 未安装，无法配置.${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    fi
+    echo -e "${GREEN}打开 ClawBot 配置界面...${RESET}"
+    openclaw configure
+    echo -e "${GREEN}配置完成！${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-show_info() {
+restart_clawbot() {
+    check_installed
+    if [[ $INSTALLED -eq 0 ]]; then
+        echo -e "${RED}ClawBot 未安装，无法重启.${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    fi
+    echo -e "${GREEN}正在重启 ClawBot...${RESET}"
+    openclaw daemon restart
+    echo -e "${GREEN}ClawBot 已重启！${RESET}"
+    read -p "按回车返回菜单..."
+}
 
-    if docker ps | grep -q "$APP_NAME"; then
-        PORT=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8045/tcp") 0).HostPort}}' $APP_NAME)
-        echo
-        echo -e "${GREEN}📌 访问信息:${RESET}"
-        echo -e "${YELLOW}访问地址: http://${SERVER_IP}:${PORT}${RESET}"
-        echo -e "${YELLOW}API_KEY: ${API_KEY}${RESET}"
-        echo -e "${YELLOW}Web登录密码: ${WEB_PASS}${RESET}"
-        echo -e "${GREEN}数据目录: ${DATA_DIR}${RESET}"
-        echo
-    else
-        echo -e "${RED}未运行${RESET}"
+uninstall_clawbot() {
+    check_installed
+    if [[ $INSTALLED -eq 0 ]]; then
+        echo -e "${RED}ClawBot 未安装，无法卸载.${RESET}"
+        read -p "按回车返回菜单..."
+        return
     fi
 
+        echo -e "${RED}正在卸载 ClawBot...${RESET}"
+        openclaw uninstall
+        echo -e "${RED}ClawBot 已卸载！${RESET}"
+    else
+        echo -e "${YELLOW}已取消卸载${RESET}"
+    fi
+    read -p "按回车返回菜单..."
 }
 
-uninstall_app() {
-    docker rm -f $APP_NAME
-    rm -rf "$DATA_DIR"
-    echo -e "${RED}Antigravity Manager 已卸载并删除数据${RESET}"
-    sleep 1
-}
-
-menu
+# ==============================
+# 主循环增加新选项
+# ==============================
+while true; do
+    show_menu
+    case "$choice" in
+        1) install_clawbot ;;
+        2) connect_telegram ;;
+        3) configure_clawbot ;;
+        4) restart_clawbot ;;
+        5) uninstall_clawbot ;;
+        6) stop_gateway ;;
+        7) start_gateway ;;
+        8) view_status ;;
+        0) echo -e "${BLUE}退出${RESET}"; exit 0 ;;
+        *) echo -e "${RED}无效选项，请重新选择${RESET}"; read -p "按回车继续..." ;;
+    esac
+done

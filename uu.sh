@@ -1,90 +1,107 @@
 #!/bin/bash
-# ==============================================
-# Docker 服务管理菜单
-# 支持: 启动 | 停止 | 重启 | 查看日志 | 查看状态 | 更新容器
-# ==============================================
+# 一键系统重装脚本（分类菜单 + 编号选择 + 二次确认）
+# 支持 Linux 全系列 + Windows 全系列
 
-# 定义项目列表
-declare -A PROJECTS=(
-    ["moviepilot"]="/opt/1panel/apps/local/moviepilot/moviepilot"
-    ["jellyfin"]="/opt/1panel/apps/jellyfin/jellyfin"
-    ["emby-amilys"]="/opt/1panel/apps/local/emby-amilys/emby-amilys"
-    ["localvertex"]="/opt/1panel/apps/local/vertex/localvertex"
-    ["autobangumi"]="/opt/1panel/apps/local/autobangumi/autobangumi"
-)
-
-# 颜色
+# 设置颜色
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
-PLAIN="\033[0m"
+RESET="\033[0m"
 
-# 显示菜单
-show_menu() {
-    echo -e "${GREEN}===== Docker 项目管理菜单 =====${PLAIN}"
-    local i=1
-    for key in "${!PROJECTS[@]}"; do
-        echo -e "${YELLOW}$i) $key${PLAIN}"
-        ((i++))
+# 下载脚本
+download_script() {
+    local type="$1"
+    if [ "$type" == "MollyLau" ]; then
+        wget --no-check-certificate -qO InstallNET.sh "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/InstallNET.sh" && chmod +x InstallNET.sh
+    else
+        curl -O "https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
+    fi
+}
+
+# 系统信息表：编号|系统名|分类|下载方式|用户名|密码|端口|重装命令
+systems=(
+"1|debian13|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 13"
+"2|debian12|Debian|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -debian 12"
+"3|debian11|Debian|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -debian 11"
+"4|debian10|Debian|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -debian 10"
+"5|ubuntu24.04|Ubuntu|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -ubuntu 24.04"
+"6|ubuntu22.04|Ubuntu|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -ubuntu 22.04"
+"7|ubuntu20.04|Ubuntu|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -ubuntu 20.04"
+"8|ubuntu18.04|Ubuntu|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -ubuntu 18.04"
+"9|rocky10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh rocky"
+"10|rocky9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh rocky 9"
+"11|alma10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh almalinux"
+"12|alma9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh almalinux 9"
+"13|oracle10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh oracle"
+"14|oracle9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh oracle 9"
+"15|fedora42|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh fedora"
+"16|fedora41|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh fedora 41"
+"17|centos10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh centos 10"
+"18|centos9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh centos 9"
+"19|alpine|其他Linux|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -alpine"
+"20|arch|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh arch"
+"21|kali|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh kali"
+"22|openeuler|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh openeuler"
+"23|opensuse|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh opensuse"
+"24|fnos|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh fnos"
+"25|windows11|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 11 -lang cn"
+"26|windows10|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 10 -lang cn"
+"27|windows7|Windows|bin456789|Administrator|123@@@|3389|bash reinstall.sh windows --iso=\"https://drive.massgrave.dev/cn_windows_7_professional_with_sp1_x64_dvd_u_677031.iso\" --image-name='Windows 7 PROFESSIONAL'"
+"28|windows2022|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2022 -lang cn"
+"29|windows2019|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2019 -lang cn"
+"30|windows2016|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2016 -lang cn"
+"31|windows11arm|Windows|bin456789|Administrator|123@@@|3389|bash reinstall.sh dd --img https://r2.hotdog.eu.org/win11-arm-with-pagefile-15g.xz"
+)
+
+while true; do
+    # 显示菜单
+    echo -e "${GREEN}=== 一键重装系统管理菜单 ===${RESET}"
+
+    last_category=""
+    for sys in "${systems[@]}"; do
+        IFS="|" read -r id name category _ _ _ _ _ <<< "$sys"
+        if [[ "$category" != "$last_category" ]]; then
+            echo -e "${GREEN}--- $category 系统 ---${RESET}"
+            last_category="$category"
+        fi
+        echo -e "${YELLOW}${id}. ${name}${RESET}"
     done
-    echo -e "${YELLOW}0) 退出${PLAIN}"
-    read -p $'\033[32m请选择项目编号: \033[0m' proj_choice
+    echo -e "${RED} 0. 退出${RESET}"
 
-    if [[ "$proj_choice" == "0" ]]; then
+    # 用户选择编号
+    read -p "$(echo -e ${GREEN}请输入选项: ${RESET})" num_choice
+
+    # 支持 0 或 00 退出
+    if [[ "$num_choice" == "0" || "$num_choice" == "00" ]]; then
         exit 0
     fi
 
-    # 获取选择的项目名称
-    local index=1
-    for key in "${!PROJECTS[@]}"; do
-        if [[ "$index" == "$proj_choice" ]]; then
-            selected_project="$key"
-            selected_path="${PROJECTS[$key]}"
+
+    found=0
+    for sys in "${systems[@]}"; do
+        IFS="|" read -r id name _ dl user pass port cmd <<< "$sys"
+        if [[ "$num_choice" == "$id" ]]; then
+            found=1
+            echo -e "${YELLOW}重装后初始用户名: ${GREEN}$user${RESET}  初始密码: ${GREEN}$pass${RESET}  远程端口: ${GREEN}$port${RESET}"
+            echo -e "${YELLOW}注意: 重装有风险，请提前备份重要数据！${RESET}"
+
+            # 二次确认
+            read -p "你确定要重装 ${name} 系统吗？(y/n): " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                download_script "$dl"
+                eval "$cmd"
+                echo -e "${GREEN}系统重装完成，正在重启...${RESET}"
+                reboot
+                break 2
+            else
+                echo -e "${YELLOW}已取消重装 ${name} 系统，返回菜单${RESET}"
+                sleep 1
+            fi
             break
         fi
-        ((index++))
     done
 
-    if [[ -z "$selected_project" ]]; then
-        echo -e "${RED}无效选择！${PLAIN}"
-        show_menu
-    else
-        show_actions
+    if [[ $found -eq 0 ]]; then
+        echo -e "${RED}无效编号，请重新选择！${RESET}"
     fi
-}
-
-# 显示操作菜单
-show_actions() {
-    echo -e "${GREEN}=== 管理 [$selected_project] ===${PLAIN}"
-    echo -e "${YELLOW}1) 启动服务${PLAIN}"
-    echo -e "${YELLOW}2) 停止服务${PLAIN}"
-    echo -e "${YELLOW}3) 重启服务${PLAIN}"
-    echo -e "${YELLOW}4) 查看日志${PLAIN}"
-    echo -e "${YELLOW}5) 查看容器状态${PLAIN}"
-    echo -e "${YELLOW}6) 更新容器${PLAIN}"
-    echo -e "${YELLOW}0) 返回上级菜单${PLAIN}"
-    read -p $'\033[32m请选择操作: \033[0m' action_choice
-
-    case "$action_choice" in
-        1) docker-compose -f "$selected_path/docker-compose.yml" up -d ;;
-        2) docker-compose -f "$selected_path/docker-compose.yml" down ;;
-        3) docker-compose -f "$selected_path/docker-compose.yml" down && docker-compose -f "$selected_path/docker-compose.yml" up -d ;;
-        4) docker-compose -f "$selected_path/docker-compose.yml" logs -f ;;
-        5) docker ps --filter "name=$selected_project" ;;
-        6) 
-           docker-compose -f "$selected_path/docker-compose.yml" pull
-           docker-compose -f "$selected_path/docker-compose.yml" up -d
-           ;;
-        0) show_menu ;;
-        *) echo -e "${RED}无效选择${PLAIN}" ;;
-    esac
-
-    echo
-    read -p "按回车返回操作菜单..." 
-    show_actions
-}
-
-# 启动
-while true; do
-    show_menu
 done

@@ -1,140 +1,149 @@
 #!/bin/bash
+# 万能 DNS 切换脚本（Ubuntu 自动关闭 resolved + 可锁定）
 
-# ==========================================
-# OpenClaw 一键菜单管理脚本
-# ==========================================
+dns_order=( "HK" "JP" "TW" "SG" "KR" "US" "UK" "DE" "RFC" "自定义" )
 
-# ===== 颜色 =====
-GREEN="\033[32m"
-YELLOW="\033[33m"
-GRAY="\033[90m"
-RESET="\033[0m"
+declare -A dns_list=(
+  ["HK"]="154.83.83.83"
+  ["JP"]="45.76.215.40"
+  ["TW"]="154.83.83.86"
+  ["SG"]="149.28.158.78"
+  ["KR"]="158.247.223.218"
+  ["US"]="66.42.97.127"
+  ["UK"]="45.32.179.189"
+  ["DE"]="80.240.28.27"
+  ["RFC"]="22.22.22.22"
+)
 
-APP_NAME="Clawbot"
-CONFIG_FILE="$HOME/.openclaw/openclaw.json"
+green="\033[32m"
+red="\033[31m"
+reset="\033[0m"
 
-# ==========================================
-# 状态检测
-# ==========================================
+########################################
+# 判断是否 Ubuntu
+########################################
+is_ubuntu() {
+    [ -f /etc/os-release ] && grep -qi ubuntu /etc/os-release
+}
 
-get_install_status() {
-    if command -v openclaw >/dev/null 2>&1; then
-        echo -e "${GREEN}已安装${RESET}"
-    else
-        echo -e "${GRAY}未安装${RESET}"
+########################################
+# 判断是否启用 systemd-resolved stub
+########################################
+is_resolved_mode() {
+    systemctl is-active systemd-resolved >/dev/null 2>&1
+}
+
+########################################
+# 修改 resolv.conf 文件模式（可锁定）
+########################################
+set_resolvconf_dns() {
+    # 解锁
+    if lsattr /etc/resolv.conf 2>/dev/null | grep -q "\-i\-"; then
+        echo -e "${green}检测到 resolv.conf 已锁定，正在解锁...${reset}"
+        sudo chattr -i /etc/resolv.conf
+    fi
+
+    sudo cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null
+
+    sudo bash -c "cat > /etc/resolv.conf <<EOF
+nameserver $1
+options timeout:2 attempts:3
+EOF"
+
+    echo -e "${green}DNS 已写入 resolv.conf${reset}"
+
+    # 可选锁定
+    echo -ne "${green}是否锁定 /etc/resolv.conf 防止被覆盖? (y/n):${reset} "
+    read lock_choice
+    if [[ "$lock_choice" == "y" ]]; then
+        sudo chattr +i /etc/resolv.conf
+        echo -e "${green}/etc/resolv.conf 已锁定${reset}"
     fi
 }
 
-get_running_status() {
-    if pgrep -f openclaw-gateway >/dev/null 2>&1; then
-        echo -e "${GREEN}运行中${RESET}"
-    else
-        echo -e "${GRAY}未运行${RESET}"
+########################################
+# 关闭 Ubuntu resolved 并写入 resolv.conf（可锁定）
+########################################
+disable_ubuntu_resolved() {
+    echo -e "${green}检测到 Ubuntu + systemd-resolved，正在关闭...${reset}"
+    sudo systemctl stop systemd-resolved
+    sudo systemctl disable systemd-resolved
+
+    sudo rm -f /etc/resolv.conf
+
+    sudo bash -c "cat > /etc/resolv.conf <<EOF
+nameserver $1
+nameserver 1.1.1.1
+options timeout:2 attempts:3
+EOF"
+
+    echo -e "${green}resolved 已关闭，DNS 已写入 /etc/resolv.conf${reset}"
+
+    # 可选锁定
+    echo -ne "${green}是否锁定 /etc/resolv.conf 防止被覆盖? (y/n):${reset} "
+    read lock_choice
+    if [[ "$lock_choice" == "y" ]]; then
+        sudo chattr +i /etc/resolv.conf
+        echo -e "${green}/etc/resolv.conf 已锁定${reset}"
     fi
 }
 
-
-# ==========================================
-# 菜单
-# ==========================================
-
-show_menu() {
-    clear
-    echo -e "${GREEN}=========================================${RESET}"
-    echo -e "${GREEN}        ${APP_NAME} 管理菜单${RESET}"
-     echo -e "${GREEN}========================================${RESET}"
-    echo -e "安装状态 : $(get_install_status)"
-    echo -e "运行状态 : $(get_running_status)"
-    echo -e "${GREEN}=========================================${RESET}"
-    echo -e "${GREEN} 1. 安装${RESET}"
-    echo -e "${GREEN} 2. 启动${RESET}"
-    echo -e "${GREEN} 3. 停止${RESET}"
-    echo -e "${GREEN} 4. 查看状态${RESET}"
-    echo -e "${GREEN} 5. TG输入连接码${RESET}"
-    echo -e "${GREEN} 6. 编辑配置文件${RESET}"
-    echo -e "${GREEN} 7. 初始化向导${RESET}"
-    echo -e "${GREEN} 8. 健康检测${RESET}"
-    echo -e "${GREEN} 9. 更新${RESET}"
-    echo -e "${GREEN}10. 卸载${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    printf "${GREEN} 请输入选项: ${RESET}"
-}
-
-# ==========================================
-# 控制函数
-# ==========================================
-
-restart_gateway() {
-    openclaw gateway stop >/dev/null 2>&1
-    sleep 1
-    openclaw gateway start
-    sleep 2
-}
-
-install_node() {
-    if command -v apt >/dev/null 2>&1; then
-        curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
-        apt install -y nodejs build-essential
+########################################
+# 临时 resolvectl 模式
+########################################
+set_resolved_runtime_dns() {
+    interface=$(ip route | awk '/default/ {print $5; exit}')
+    if [ -z "$interface" ]; then
+        echo -e "${red}无法检测网络接口${reset}"
+        return
     fi
+    sudo resolvectl dns "$interface" "$1"
+    sudo resolvectl flush-caches
+    echo -e "${green}DNS 已通过 resolvectl 临时应用${reset}"
 }
 
-install_app() {
-    echo "正在安装 OpenClaw..."
-    install_node
-    npm install -g openclaw@latest
-    openclaw onboard --install-daemon
-    restart_gateway
-    read -p "完成，回车继续..."
-}
-
-start_app() {
-    restart_gateway
-    read -p "已启动，回车继续..."
-}
-
-stop_app() {
-    openclaw gateway stop
-    read -p "已停止，回车继续..."
-}
-
-view_status() {
-    openclaw status
-    openclaw gateway status
-    openclaw logs
-    read -p "回车继续..."
-}
-
-
-update_app() {
-    npm install -g openclaw@latest
-    restart_gateway
-    read -p "更新完成，回车继续..."
-}
-
-uninstall_app() {
-    openclaw uninstall
-    npm uninstall -g openclaw
-    read -p "卸载完成，回车继续..."
-}
-
-# ==========================================
+########################################
 # 主循环
-# ==========================================
-
+########################################
 while true; do
-    show_menu
+    echo -e "${green}请选择要使用的 DNS 区域：${reset}"
+    count=0
+    for region in "${dns_order[@]}"; do
+        ((count++))
+        printf "${green}[%02d] %-10s${reset}" "$count" "$region"
+        (( count % 2 == 0 )) && echo ""
+    done
+    echo -e "${green}[0]  退出${reset}"
+
+    echo -ne "${green}请输入编号:${reset} "
     read choice
-    case $choice in
-        1) install_app ;;
-        2) start_app ;;
-        3) stop_app ;;
-        4) view_status ;;
-        5) read -p "TG连接码: " code && openclaw pairing approve telegram "$code" ;;
-        6) nano "$CONFIG_FILE" && restart_gateway ;;
-        7) openclaw onboard --install-daemon ;;
-        8) openclaw doctor --fix ;;
-        9) update_app ;;
-        10) uninstall_app ;;
-        0) exit ;;
-    esac
+
+     # 支持 0 或 00 退出
+    [[ "$choice" == "0" || "$choice" == "00" ]] && exit 0
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#dns_order[@]} )); then
+        region="${dns_order[$((choice-1))]}"
+
+        if [ "$region" = "自定义" ]; then
+            echo -ne "${green}请输入 DNS IP:${reset} "
+            read dns_to_set
+        else
+            dns_to_set="${dns_list[$region]}"
+        fi
+
+        echo -e "${green}正在设置 DNS 为 $dns_to_set ($region)...${reset}"
+
+        # 核心逻辑
+        if is_ubuntu && is_resolved_mode; then
+            disable_ubuntu_resolved "$dns_to_set"
+        elif is_resolved_mode; then
+            set_resolved_runtime_dns "$dns_to_set"
+        else
+            set_resolvconf_dns "$dns_to_set"
+        fi
+
+        echo
+    else
+        echo -e "${red}无效选择，请重新输入。${reset}"
+    fi
 done

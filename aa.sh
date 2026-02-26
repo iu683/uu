@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# AssppWeb 一键管理脚本
+# gcli2api 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="asspp"
+APP_NAME="gcli2api"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -42,7 +42,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== AssppWeb 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== gcli2api 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -76,7 +76,7 @@ menu() {
 install_app() {
     check_docker
 
-    mkdir -p "$APP_DIR/data"
+    mkdir -p "$APP_DIR/data/creds"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -84,30 +84,39 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:8080]: " input_port
-    PORT=${input_port:-8080}
+    read -p "请输入访问端口 [默认:7861]: " input_port
+    PORT=${input_port:-7861}
     check_port "$PORT" || return
+
+    read -p "请输入 API 密码: " API_PASSWORD
+    read -p "请输入 面板 密码: " PANEL_PASSWORD
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  asspp:
-    image: ghcr.io/lakr233/assppweb:latest
-    container_name: asspp
+  gcli2api:
+    image: ghcr.io/su-kaka/gcli2api:latest
+    container_name: gcli2api
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:${PORT}:8080"
-    volumes:
-      - ./data:/data
+    network_mode: host
     environment:
-      - DATA_DIR=/data
-      - PORT=8080
+      - PORT=${PORT}
+      - API_PASSWORD=${API_PASSWORD}
+      - PANEL_PASSWORD=${PANEL_PASSWORD}
+    volumes:
+      - ./data/creds:/app/creds
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \\"import sys, urllib.request, os; port=os.environ.get('PORT', '${PORT}'); req=urllib.request.Request(f'http://localhost:{port}/v1/models', headers={'Authorization': 'Bearer '+os.environ.get('API_PASSWORD','pwd')}); sys.exit(0 if urllib.request.urlopen(req, timeout=5).getcode()==200 else 1)\\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ AssppWeb 已启动${RESET}"
+    echo -e "${GREEN}✅ gcli2api 已启动${RESET}"
     echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:${PORT}${RESET}"
     echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
     read -p "按回车返回菜单..."
@@ -117,24 +126,24 @@ update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ AssppWeb 更新完成${RESET}"
+    echo -e "${GREEN}✅ gcli2api 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
     docker compose restart
-    echo -e "${GREEN}✅ AssppWeb 已重启${RESET}"
+    echo -e "${GREEN}✅ gcli2api 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f asspp
+    docker logs -f gcli2api
 }
 
 check_status() {
-    docker ps | grep asspp
+    docker ps | grep gcli2api
     read -p "按回车返回菜单..."
 }
 
@@ -142,7 +151,7 @@ uninstall_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ AssppWeb 已彻底卸载（含数据）${RESET}"
+    echo -e "${RED}✅ gcli2api 已彻底卸载（含数据）${RESET}"
     read -p "按回车返回菜单..."
 }
 

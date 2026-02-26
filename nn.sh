@@ -1,149 +1,192 @@
 #!/bin/bash
-# 万能 DNS 切换脚本（Ubuntu 自动关闭 resolved + 可锁定）
+# ========================================
+# sub2api 企业级一键管理脚本
+# ========================================
 
-dns_order=( "HK" "JP" "TW" "SG" "KR" "US" "UK" "DE" "RFC" "自定义" )
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+BLUE="\033[36m"
+RESET="\033[0m"
 
-declare -A dns_list=(
-  ["HK"]="154.83.83.83"
-  ["JP"]="45.76.215.40"
-  ["TW"]="154.83.83.86"
-  ["SG"]="149.28.158.78"
-  ["KR"]="158.247.223.218"
-  ["US"]="66.42.97.127"
-  ["UK"]="45.32.179.189"
-  ["DE"]="80.240.28.27"
-  ["RFC"]="22.22.22.22"
-)
+APP_NAME="sub2api"
+APP_DIR="/opt/sub2api-deploy"
+COMPOSE_FILE="$APP_DIR/docker-compose.local.yml"
 
-green="\033[32m"
-red="\033[31m"
-reset="\033[0m"
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}请使用 root 运行此脚本！${RESET}"
+    exit 1
+fi
 
-########################################
-# 判断是否 Ubuntu
-########################################
-is_ubuntu() {
-    [ -f /etc/os-release ] && grep -qi ubuntu /etc/os-release
-}
+SERVER_IP=$(hostname -I | awk '{print $1}')
 
-########################################
-# 判断是否启用 systemd-resolved stub
-########################################
-is_resolved_mode() {
-    systemctl is-active systemd-resolved >/dev/null 2>&1
-}
+# ==============================
+# 初始化 compose 命令（关键修复）
+# ==============================
+init_compose() {
 
-########################################
-# 修改 resolv.conf 文件模式（可锁定）
-########################################
-set_resolvconf_dns() {
-    # 解锁
-    if lsattr /etc/resolv.conf 2>/dev/null | grep -q "\-i\-"; then
-        echo -e "${green}检测到 resolv.conf 已锁定，正在解锁...${reset}"
-        sudo chattr -i /etc/resolv.conf
+    if ! command -v docker &>/dev/null; then
+        echo -e "${RED}未检测到 Docker，请先安装 Docker${RESET}"
+        exit 1
     fi
 
-    sudo cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null
-
-    sudo bash -c "cat > /etc/resolv.conf <<EOF
-nameserver $1
-options timeout:2 attempts:3
-EOF"
-
-    echo -e "${green}DNS 已写入 resolv.conf${reset}"
-
-    # 可选锁定
-    echo -ne "${green}是否锁定 /etc/resolv.conf 防止被覆盖? (y/n):${reset} "
-    read lock_choice
-    if [[ "$lock_choice" == "y" ]]; then
-        sudo chattr +i /etc/resolv.conf
-        echo -e "${green}/etc/resolv.conf 已锁定${reset}"
-    fi
-}
-
-########################################
-# 关闭 Ubuntu resolved 并写入 resolv.conf（可锁定）
-########################################
-disable_ubuntu_resolved() {
-    echo -e "${green}检测到 Ubuntu + systemd-resolved，正在关闭...${reset}"
-    sudo systemctl stop systemd-resolved
-    sudo systemctl disable systemd-resolved
-
-    sudo rm -f /etc/resolv.conf
-
-    sudo bash -c "cat > /etc/resolv.conf <<EOF
-nameserver $1
-nameserver 1.1.1.1
-options timeout:2 attempts:3
-EOF"
-
-    echo -e "${green}resolved 已关闭，DNS 已写入 /etc/resolv.conf${reset}"
-
-    # 可选锁定
-    echo -ne "${green}是否锁定 /etc/resolv.conf 防止被覆盖? (y/n):${reset} "
-    read lock_choice
-    if [[ "$lock_choice" == "y" ]]; then
-        sudo chattr +i /etc/resolv.conf
-        echo -e "${green}/etc/resolv.conf 已锁定${reset}"
-    fi
-}
-
-########################################
-# 临时 resolvectl 模式
-########################################
-set_resolved_runtime_dns() {
-    interface=$(ip route | awk '/default/ {print $5; exit}')
-    if [ -z "$interface" ]; then
-        echo -e "${red}无法检测网络接口${reset}"
-        return
-    fi
-    sudo resolvectl dns "$interface" "$1"
-    sudo resolvectl flush-caches
-    echo -e "${green}DNS 已通过 resolvectl 临时应用${reset}"
-}
-
-########################################
-# 主循环
-########################################
-while true; do
-    echo -e "${green}请选择要使用的 DNS 区域：${reset}"
-    count=0
-    for region in "${dns_order[@]}"; do
-        ((count++))
-        printf "${green}[%02d] %-10s${reset}" "$count" "$region"
-        (( count % 2 == 0 )) && echo ""
-    done
-    echo -e "${green}[0]  退出${reset}"
-
-    echo -ne "${green}请输入编号:${reset} "
-    read choice
-
-     # 支持 0 或 00 退出
-    [[ "$choice" == "0" || "$choice" == "00" ]] && exit 0
-
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#dns_order[@]} )); then
-        region="${dns_order[$((choice-1))]}"
-
-        if [ "$region" = "自定义" ]; then
-            echo -ne "${green}请输入 DNS IP:${reset} "
-            read dns_to_set
-        else
-            dns_to_set="${dns_list[$region]}"
-        fi
-
-        echo -e "${green}正在设置 DNS 为 $dns_to_set ($region)...${reset}"
-
-        # 核心逻辑
-        if is_ubuntu && is_resolved_mode; then
-            disable_ubuntu_resolved "$dns_to_set"
-        elif is_resolved_mode; then
-            set_resolved_runtime_dns "$dns_to_set"
-        else
-            set_resolvconf_dns "$dns_to_set"
-        fi
-
-        echo
+    if docker compose version &>/dev/null 2>&1; then
+        COMPOSE_CMD="docker compose"
+    elif command -v docker-compose &>/dev/null 2>&1; then
+        COMPOSE_CMD="docker-compose"
     else
-        echo -e "${red}无效选择，请重新输入。${reset}"
+        echo -e "${RED}未检测到 docker compose${RESET}"
+        exit 1
     fi
-done
+}
+
+pause(){
+    read -p "按回车返回菜单..."
+}
+
+# ==============================
+# 菜单
+# ==============================
+
+menu() {
+    while true; do
+        clear
+        echo -e "${BLUE}=== sub2api 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}7) 查看管理员密码${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            7) show_admin_password ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ==============================
+# 功能函数
+# ==============================
+
+install_app() {
+
+    init_compose
+
+    mkdir -p "$APP_DIR"
+    cd "$APP_DIR" || exit
+
+    echo -e "${GREEN}正在下载官方部署脚本...${RESET}"
+    curl -sSL https://raw.githubusercontent.com/Wei-Shaw/sub2api/main/deploy/docker-deploy.sh | bash
+
+    $COMPOSE_CMD -f docker-compose.local.yml up -d
+
+    echo
+    echo -e "${GREEN}✅ sub2api 已启动${RESET}"
+    echo -e "${GREEN}🌐 WebUI: http://${SERVER_IP}:8080${RESET}"
+    echo -e "${GREEN}🌐 账号: admin@sub2api.local${RESET}"
+    echo -e "${GREEN}🌐 密码: 7查看管理员密码${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    pause
+}
+
+update_app() {
+
+    init_compose
+    cd "$APP_DIR" || { echo "未检测到安装目录"; pause; return; }
+
+    $COMPOSE_CMD -f docker-compose.local.yml pull
+    $COMPOSE_CMD -f docker-compose.local.yml up -d --remove-orphans
+
+    echo -e "${GREEN}✅ sub2api 更新完成${RESET}"
+    pause
+}
+
+restart_app() {
+
+    init_compose
+    cd "$APP_DIR" || return
+
+    $COMPOSE_CMD -f docker-compose.local.yml restart
+
+    echo -e "${GREEN}✅ sub2api 已重启${RESET}"
+    pause
+}
+
+view_logs() {
+
+    init_compose
+    cd "$APP_DIR" || return
+
+    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
+    $COMPOSE_CMD -f docker-compose.local.yml logs -f
+}
+
+check_status() {
+
+    if docker ps --format '{{.Names}}' | grep -q "^sub2api"; then
+        echo -e "${GREEN}sub2api 服务运行中${RESET}"
+    else
+        echo -e "${RED}sub2api 服务未运行${RESET}"
+    fi
+    pause
+}
+
+show_admin_password() {
+
+    init_compose
+    cd "$APP_DIR" || return
+
+    echo -e "${BLUE}正在查找管理员密码...${RESET}"
+
+    PASSWORD=$($COMPOSE_CMD -f docker-compose.local.yml logs sub2api 2>/dev/null \
+        | grep -i "admin password" \
+        | tail -n 1 \
+        | awk -F': ' '{print $NF}')
+
+    if [ -z "$PASSWORD" ]; then
+        echo -e "${YELLOW}未找到自动生成的管理员密码${RESET}"
+    else
+        echo -e "${GREEN}🔐 管理员密码: $PASSWORD${RESET}"
+    fi
+
+    pause
+}
+
+uninstall_app() {
+
+    init_compose
+
+    echo -e "${YELLOW}正在停止并删除容器...${RESET}"
+
+    # 强制删除容器
+    docker rm -f sub2api 2>/dev/null
+
+    # compose down
+    if [ -f "$COMPOSE_FILE" ]; then
+        cd "$APP_DIR"
+        $COMPOSE_CMD -f docker-compose.local.yml down -v --remove-orphans 2>/dev/null
+    fi
+
+    # 删除网络（防残留）
+    docker network prune -f 2>/dev/null
+
+    # 删除目录
+    rm -rf "$APP_DIR"
+
+    echo -e "${GREEN}✅ sub2api 已彻底卸载${RESET}"
+    pause
+}
+
+menu

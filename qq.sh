@@ -1,88 +1,167 @@
 #!/bin/bash
-# ==============================================
-# Docker 服务管理菜单
-# 支持: 启动 | 停止 | 重启 | 查看日志 | 查看状态 | 更新容器
-# ==============================================
+# ========================================
+# gcli2api 一键管理脚本
+# ========================================
 
-# 定义项目列表
-declare -A PROJECTS=(
-    ["Moviepilot"]="/opt/1panel/apps/local/moviepilot/moviepilot"
-    ["Jellyfin"]="/opt/1panel/apps/jellyfin/jellyfin"
-    ["emby-amilys"]="/opt/1panel/apps/local/emby-amilys/emby-amilys"
-    ["Vertex"]="/opt/1panel/apps/local/vertex/localvertex"
-    ["Autobangumi"]="/opt/1panel/apps/local/autobangumi/autobangumi"
-)
-
-# 颜色
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
-ORANGE='\033[38;5;208m'
-PLAIN="\033[0m"
+RESET="\033[0m"
 
-# 显示菜单
-show_menu() {
-    echo -e "${GREEN}==== 1panel/apps 项目管理 ====${PLAIN}"
-    local i=1
-    for key in "${!PROJECTS[@]}"; do
-        echo -e "${GREEN}$i) $key${PLAIN}"
-        ((i++))
-    done
-    echo -e "${GREEN}0) 退出${PLAIN}"
-    read -p $'\033[32m请选择项目编号: \033[0m' proj_choice
+APP_NAME="gcli2api"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-    if [[ "$proj_choice" == "0" ]]; then
-        exit 0
+# ==============================
+# 基础检测
+# ==============================
+
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
     fi
 
-    # 获取选择的项目名称
-    local index=1
-    for key in "${!PROJECTS[@]}"; do
-        if [[ "$index" == "$proj_choice" ]]; then
-            selected_project="$key"
-            selected_path="${PROJECTS[$key]}"
-            break
-        fi
-        ((index++))
-    done
-
-    if [[ -z "$selected_project" ]]; then
-        echo -e "${RED}无效选择！${PLAIN}"
-        show_menu
-    else
-        show_actions
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
     fi
 }
 
-# 显示操作菜单
-show_actions() {
-    echo -e "${ORANGE}=== 管理 [$selected_project] ===${PLAIN}"
-    echo -e "${YELLOW}1) 启动服务${PLAIN}"
-    echo -e "${YELLOW}2) 停止服务${PLAIN}"
-    echo -e "${YELLOW}3) 重启服务${PLAIN}"
-    echo -e "${YELLOW}4) 查看日志${PLAIN}"
-    echo -e "${YELLOW}5) 更新容器${PLAIN}"
-    echo -e "${YELLOW}0) 返回菜单${PLAIN}"
-    read -p $'\033[32m请选择操作: \033[0m' action_choice
-
-    case "$action_choice" in
-        1) docker-compose -f "$selected_path/docker-compose.yml" up -d ;;
-        2) docker-compose -f "$selected_path/docker-compose.yml" down ;;
-        3) docker-compose -f "$selected_path/docker-compose.yml" down && docker-compose -f "$selected_path/docker-compose.yml" up -d ;;
-        4) docker-compose -f "$selected_path/docker-compose.yml" logs -f ;;
-        5) 
-           docker-compose -f "$selected_path/docker-compose.yml" pull
-           docker-compose -f "$selected_path/docker-compose.yml" up -d
-           ;;
-        0) show_menu ;;
-        *) echo -e "${RED}无效选择${PLAIN}" ;;
-    esac
-
-    read -p $'\033[32m按回车返回操作菜单...\033[0m'
-    show_actions
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
 }
 
-# 启动
-while true; do
-    show_menu
-done
+# ==============================
+# 菜单
+# ==============================
+
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== gcli2api 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *)
+                echo -e "${RED}无效选择${RESET}"
+                sleep 1
+                continue
+                ;;
+        esac
+    done
+}
+
+# ==============================
+# 功能函数
+# ==============================
+
+install_app() {
+    check_docker
+
+    mkdir -p "$APP_DIR/data/creds"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
+
+    read -p "请输入访问端口 [默认:7861]: " input_port
+    PORT=${input_port:-7861}
+    check_port "$PORT" || return
+
+    # ====== 支持随机生成密码 ======
+    read -p "请输入 API 密码 [回车自动生成]: " API_PASSWORD
+    API_PASSWORD=${API_PASSWORD:-$(openssl rand -base64 40)}
+
+    read -p "请输入面板密码 [回车自动生成]: " PANEL_PASSWORD
+    PANEL_PASSWORD=${PANEL_PASSWORD:-$(openssl rand -base64 40)}
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  gcli2api:
+    image: ghcr.io/su-kaka/gcli2api:latest
+    container_name: gcli2api
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - PORT=${PORT}
+      - API_PASSWORD=${API_PASSWORD}
+      - PANEL_PASSWORD=${PANEL_PASSWORD}
+    volumes:
+      - ./data/creds:/app/creds
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \\"import sys, urllib.request, os; port=os.environ.get('PORT', '${PORT}'); req=urllib.request.Request(f'http://localhost:{port}/v1/models', headers={'Authorization': 'Bearer '+os.environ.get('API_PASSWORD','pwd')}); sys.exit(0 if urllib.request.urlopen(req, timeout=5).getcode()==200 else 1)\\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    echo
+    echo -e "${GREEN}✅ gcli2api 已启动${RESET}"
+    echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
+    echo -e "${YELLOW}🔑 API 密码: ${API_PASSWORD}${RESET}"
+    echo -e "${YELLOW}🔑 面板密码: ${PANEL_PASSWORD}${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ gcli2api 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    docker compose restart
+    echo -e "${GREEN}✅ gcli2api 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
+    docker logs -f gcli2api
+}
+
+check_status() {
+    docker ps | grep gcli2api
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ gcli2api 已彻底卸载（含数据）${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+# ==============================
+# 启动菜单
+# ==============================
+menu

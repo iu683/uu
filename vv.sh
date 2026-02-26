@@ -1,91 +1,107 @@
 #!/bin/bash
-# ==============================================
-# Docker 服务管理菜单
-# 支持: 启动 | 停止 | 重启 | 查看日志 | 查看状态 | 更新容器
-# ==============================================
+# ==========================================
+# VPS 多格式压缩工具
+# 支持 tar.gz / tar.xz / tar.bz2 / zip / 7z
+# ==========================================
 
-# 定义项目列表
-declare -A PROJECTS=(
-    ["Moviepilot"]="/opt/1panel/apps/local/moviepilot/moviepilot"
-    ["Jellyfin"]="/opt/1panel/apps/jellyfin/jellyfin"
-    ["emby-amilys"]="/opt/1panel/apps/local/emby-amilys/emby-amilys"
-    ["Vertex"]="/opt/1panel/apps/local/vertex/localvertex"
-    ["Autobangumi"]="/opt/1panel/apps/local/autobangumi/autobangumi"
-)
-
-# 颜色
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
-ORANGE='\033[38;5;208m'
-PLAIN="\033[0m"
+BLUE="\033[36m"
+RESET="\033[0m"
 
-# 显示菜单
-show_menu() {
-    echo -e "${GREEN}===== 1panel/apps项目管理菜单 =====${PLAIN}"
-    local i=1
-    for key in "${!PROJECTS[@]}"; do
-        echo -e "${GREEN}$i) $key${PLAIN}"
-        ((i++))
-    done
-    echo -e "${GREEN}0) 退出${PLAIN}"
-    read -p $'\033[32m请选择项目编号: \033[0m' proj_choice
+# 必须 root（可选）
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${YELLOW}⚠️ 建议使用 root 运行（某些目录可能无权限）${RESET}"
+fi
 
-    if [[ "$proj_choice" == "0" ]]; then
-        exit 0
+# =============================
+# 依赖检测
+# =============================
+check_cmd() {
+    if ! command -v "$1" &>/dev/null; then
+        echo -e "${RED}❌ 未安装 $1，正在尝试安装...${RESET}"
+        apt update && apt install -y "$1" || yum install -y "$1"
     fi
+}
 
-    # 获取选择的项目名称
-    local index=1
-    for key in "${!PROJECTS[@]}"; do
-        if [[ "$index" == "$proj_choice" ]]; then
-            selected_project="$key"
-            selected_path="${PROJECTS[$key]}"
-            break
-        fi
-        ((index++))
-    done
+# =============================
+# 选择格式
+# =============================
+echo -e "${BLUE}============================${RESET}"
+echo -e "${GREEN}      VPS 压缩工具${RESET}"
+echo -e "${BLUE}============================${RESET}"
 
-    if [[ -z "$selected_project" ]]; then
-        echo -e "${RED}无效选择！${PLAIN}"
-        show_menu
+echo "1) tar.gz   (通用推荐)"
+echo "2) tar.xz   (更高压缩率)"
+echo "3) tar.bz2"
+echo "4) zip"
+echo "5) 7z"
+echo
+
+read -p "请选择压缩格式: " format_choice
+read -p "请输入要压缩的目录或文件路径: " target
+read -p "请输入输出文件名(不带后缀): " output_name
+read -p "压缩级别(1-9，默认6): " level
+read -p "是否排除某目录？(留空跳过): " exclude_path
+
+timestamp=$(date +%Y%m%d_%H%M%S)
+
+if [ -z "$level" ]; then
+    level=6
+fi
+
+# =============================
+# 开始压缩
+# =============================
+case $format_choice in
+
+1)
+    check_cmd tar
+    archive="${output_name}_${timestamp}.tar.gz"
+    echo -e "${GREEN}正在创建 tar.gz 压缩包...${RESET}"
+    if [ -n "$exclude_path" ]; then
+        tar --exclude="$exclude_path" -czvf "$archive" "$target"
     else
-        show_actions
+        tar -czvf "$archive" "$target"
     fi
-}
+    ;;
 
-# 显示操作菜单
-show_actions() {
-    echo -e "${ORANGE}=== 管理 [$selected_project] ===${PLAIN}"
-    echo -e "${YELLOW}1) 启动服务${PLAIN}"
-    echo -e "${YELLOW}2) 停止服务${PLAIN}"
-    echo -e "${YELLOW}3) 重启服务${PLAIN}"
-    echo -e "${YELLOW}4) 查看日志${PLAIN}"
-    echo -e "${YELLOW}5) 查看容器状态${PLAIN}"
-    echo -e "${YELLOW}6) 更新容器${PLAIN}"
-    echo -e "${YELLOW}0) 返回上级菜单${PLAIN}"
-    read -p $'\033[32m请选择操作: \033[0m' action_choice
+2)
+    check_cmd tar
+    archive="${output_name}_${timestamp}.tar.xz"
+    echo -e "${GREEN}正在创建 tar.xz 压缩包...${RESET}"
+    tar -I "xz -$level" -cvf "$archive" "$target"
+    ;;
 
-    case "$action_choice" in
-        1) docker-compose -f "$selected_path/docker-compose.yml" up -d ;;
-        2) docker-compose -f "$selected_path/docker-compose.yml" down ;;
-        3) docker-compose -f "$selected_path/docker-compose.yml" down && docker-compose -f "$selected_path/docker-compose.yml" up -d ;;
-        4) docker-compose -f "$selected_path/docker-compose.yml" logs -f ;;
-        5) docker ps --filter "name=$selected_project" ;;
-        6) 
-           docker-compose -f "$selected_path/docker-compose.yml" pull
-           docker-compose -f "$selected_path/docker-compose.yml" up -d
-           ;;
-        0) show_menu ;;
-        *) echo -e "${RED}无效选择${PLAIN}" ;;
-    esac
+3)
+    check_cmd tar
+    archive="${output_name}_${timestamp}.tar.bz2"
+    echo -e "${GREEN}正在创建 tar.bz2 压缩包...${RESET}"
+    tar -I "bzip2 -$level" -cvf "$archive" "$target"
+    ;;
 
-    echo
-    read -p "按回车返回操作菜单..." 
-    show_actions
-}
+4)
+    check_cmd zip
+    archive="${output_name}_${timestamp}.zip"
+    echo -e "${GREEN}正在创建 zip 压缩包...${RESET}"
+    zip -r -"$level" "$archive" "$target"
+    ;;
 
-# 启动
-while true; do
-    show_menu
-done
+5)
+    check_cmd 7z
+    archive="${output_name}_${timestamp}.7z"
+    echo -e "${GREEN}正在创建 7z 压缩包...${RESET}"
+    7z a -mx="$level" "$archive" "$target"
+    ;;
+
+*)
+    echo -e "${RED}❌ 无效选择${RESET}"
+    exit 1
+    ;;
+
+esac
+
+echo
+echo -e "${GREEN}✅ 压缩完成：${archive}${RESET}"
+echo -e "${BLUE}文件大小：$(du -sh "$archive" | awk '{print $1}')${RESET}"

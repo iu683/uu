@@ -1,183 +1,124 @@
 #!/bin/bash
-# ==========================================================
-#  Linai Enterprise VPS 多目录压缩工具
-#  支持多目录 + 多系统 + 并行压缩 + 自动依赖安装
-# ==========================================================
+# =================================================
+# VPS 一键解压工具 Pro（多系统自动适配）
+# 支持 Debian / Ubuntu / CentOS / Rocky / Alma / Fedora / Arch
+# =================================================
+
+set -e
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 BLUE="\033[36m"
 RESET="\033[0m"
 
-DEFAULT_SAVE_DIR="$(pwd)"
-CPU_CORES=$(nproc 2>/dev/null || echo 1)
+echo -e "${GREEN}====== VPS 解压工具======${RESET}"
 
-echo -e "${BLUE}============================${RESET}"
-echo -e "${GREEN}      压缩工具${RESET}"
-echo -e "${BLUE}============================${RESET}"
-
-# =============================
-# 多系统安装函数
-# =============================
-install_pkg() {
-    pkg="$1"
-
-    if command -v apt >/dev/null 2>&1; then
-        apt update -y
-        apt install -y "$pkg"
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y "$pkg"
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y "$pkg"
-    else
-        echo -e "${RED}❌ 不支持的系统包管理器${RESET}"
-        exit 1
-    fi
-}
-
-check_cmd() {
-    cmd="$1"
-
-    if command -v "$cmd" >/dev/null 2>&1; then
-        return
-    fi
-
-    echo -e "${YELLOW}安装 $cmd ...${RESET}"
-
-    case "$cmd" in
-        tar) install_pkg tar ;;
-        zip) install_pkg zip ;;
-        7z)
-            if command -v apt >/dev/null 2>&1; then
-                install_pkg p7zip-full
-            else
-                install_pkg p7zip
-                install_pkg p7zip-plugins
-            fi
-            ;;
-        xz) install_pkg xz ;;
-        bzip2) install_pkg bzip2 ;;
-        *) install_pkg "$cmd" ;;
-    esac
-
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-        echo -e "${RED}❌ $cmd 安装失败${RESET}"
-        exit 1
-    fi
-}
-
-# =============================
-# 选择格式
-# =============================
-echo -e "${GREEN}1) tar.gz (推荐)${RESET}"
-echo -e "${GREEN}2) tar.xz (高压缩)${RESET}"
-echo -e "${GREEN}3) tar.bz2${RESET}"
-echo -e "${GREEN}4) zip${RESET}"
-echo -e "${GREEN}5) 7z${RESET}"
-
-read -p $'\033[32m请选择压缩格式: \033[0m' format_choice
-
-# =============================
-# 输入多目录
-# =============================
-echo
-echo -e "${YELLOW}请输入要压缩的目录或文件路径（多个用空格分隔）:${RESET}"
-read -a source_dirs
-
-if [ ${#source_dirs[@]} -eq 0 ]; then
-    echo -e "${RED}❌ 必须输入至少一个目录${RESET}"
+# 必须 root
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}请使用 root 运行此脚本！${RESET}"
     exit 1
 fi
 
-for dir in "${source_dirs[@]}"; do
-    if [ ! -e "$dir" ]; then
-        echo -e "${RED}❌ 路径不存在: $dir${RESET}"
+# ===============================
+# 自动识别包管理器
+# ===============================
+detect_pm() {
+    if command -v apt-get &>/dev/null; then
+        PM="apt-get"
+        INSTALL="apt-get install -y"
+        UPDATE="apt-get update -y"
+    elif command -v dnf &>/dev/null; then
+        PM="dnf"
+        INSTALL="dnf install -y"
+        UPDATE="dnf makecache"
+    elif command -v yum &>/dev/null; then
+        PM="yum"
+        INSTALL="yum install -y"
+        UPDATE="yum makecache"
+    elif command -v pacman &>/dev/null; then
+        PM="pacman"
+        INSTALL="pacman -Sy --noconfirm"
+        UPDATE="pacman -Sy"
+    else
+        echo -e "${RED}❌ 不支持的系统，未找到包管理器${RESET}"
         exit 1
     fi
-done
+}
 
-# =============================
-# 保存目录
-# =============================
-read -p "保存目录(默认/root): " save_dir
-save_dir=${save_dir:-$DEFAULT_SAVE_DIR}
-mkdir -p "$save_dir"
+install_pkg() {
+    PKG=$1
+    if ! command -v "$PKG" &>/dev/null; then
+        echo -e "${YELLOW}$PKG 未安装，正在安装...${RESET}"
+        $UPDATE
+        $INSTALL "$PKG"
+    fi
+}
 
-read -p "输出文件名(不带后缀): " output_name
-read -p "压缩级别(1-9 默认6): " level
-read -p "排除目录(多个用空格 可留空): " -a exclude_dirs
+detect_pm
 
-level=${level:-6}
-timestamp=$(date +%Y%m%d_%H%M%S)
+read -rp "请输入要解压的文件路径： " FILE
 
-start_time=$(date +%s)
-
-# =============================
-# 开始压缩
-# =============================
-case $format_choice in
-
-1)
-    check_cmd tar
-    check_cmd gzip
-    archive="${save_dir}/${output_name}_${timestamp}.tar.gz"
-
-    exclude_args=()
-    for ex in "${exclude_dirs[@]}"; do
-        exclude_args+=(--exclude="$ex")
-    done
-
-    tar "${exclude_args[@]}" -I "gzip -$level" -cvf "$archive" "${source_dirs[@]}"
-    ;;
-
-2)
-    check_cmd tar
-    check_cmd xz
-    archive="${save_dir}/${output_name}_${timestamp}.tar.xz"
-
-    tar -I "xz -T$CPU_CORES -$level" -cvf "$archive" "${source_dirs[@]}"
-    ;;
-
-3)
-    check_cmd tar
-    check_cmd bzip2
-    archive="${save_dir}/${output_name}_${timestamp}.tar.bz2"
-
-    tar -I "bzip2 -$level" -cvf "$archive" "${source_dirs[@]}"
-    ;;
-
-4)
-    check_cmd zip
-    archive="${save_dir}/${output_name}_${timestamp}.zip"
-    zip -r -"$level" "$archive" "${source_dirs[@]}"
-    ;;
-
-5)
-    check_cmd 7z
-    archive="${save_dir}/${output_name}_${timestamp}.7z"
-    7z a -mx="$level" "$archive" "${source_dirs[@]}"
-    ;;
-
-*)
-    echo -e "${RED}❌ 无效选择${RESET}"
+if [[ ! -f "$FILE" ]]; then
+    echo -e "${RED}文件不存在！退出${RESET}"
     exit 1
-    ;;
+fi
+
+read -rp "请输入解压到的目标目录（默认当前目录）： " DEST
+DEST=${DEST:-$(pwd)}
+
+mkdir -p "$DEST"
+
+FILENAME=$(basename "$FILE")
+LOWER_NAME=$(echo "$FILENAME" | tr '[:upper:]' '[:lower:]')
+
+echo -e "${BLUE}正在识别文件类型...${RESET}"
+
+case "$LOWER_NAME" in
+
+    *.zip)
+        install_pkg unzip
+        echo -e "${GREEN}正在解压 ZIP 文件...${RESET}"
+        unzip -o "$FILE" -d "$DEST"
+        ;;
+
+    *.tar)
+        echo -e "${GREEN}正在解压 TAR 文件...${RESET}"
+        tar -xvf "$FILE" -C "$DEST"
+        ;;
+
+    *.tar.gz|*.tgz)
+        echo -e "${GREEN}正在解压 TAR.GZ 文件...${RESET}"
+        tar -xvzf "$FILE" -C "$DEST"
+        ;;
+
+    *.tar.bz2)
+        echo -e "${GREEN}正在解压 TAR.BZ2 文件...${RESET}"
+        tar -xvjf "$FILE" -C "$DEST"
+        ;;
+
+    *.tar.xz)
+        echo -e "${GREEN}正在解压 TAR.XZ 文件...${RESET}"
+        tar -xvJf "$FILE" -C "$DEST"
+        ;;
+
+    *.rar)
+        install_pkg unrar
+        echo -e "${GREEN}正在解压 RAR 文件...${RESET}"
+        unrar x -o+ "$FILE" "$DEST"
+        ;;
+
+    *.7z)
+        install_pkg p7zip
+        install_pkg p7zip-full 2>/dev/null || true
+        echo -e "${GREEN}正在解压 7Z 文件...${RESET}"
+        7z x "$FILE" -o"$DEST" -y
+        ;;
+
+    *)
+        echo -e "${RED}❌ 不支持的压缩格式: $FILENAME${RESET}"
+        exit 1
+        ;;
 esac
 
-echo
-
-# =============================
-# 校验
-# =============================
-if [ ! -f "$archive" ]; then
-    echo -e "${RED}❌ 压缩失败，文件未生成${RESET}"
-    exit 1
-fi
-
-end_time=$(date +%s)
-duration=$((end_time - start_time))
-
-echo -e "${GREEN}✅ 压缩完成：${archive}${RESET}"
-echo -e "${BLUE}文件大小：$(du -sh "$archive" | awk '{print $1}')${RESET}"
-echo -e "${YELLOW}耗时：${duration} 秒${RESET}"
+echo -e "${GREEN}✅ 解压完成！文件已放到: $DEST${RESET}"

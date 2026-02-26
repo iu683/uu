@@ -1,7 +1,8 @@
 #!/bin/bash
-# ========================================
-# sub2api 企业级一键管理脚本
-# ========================================
+# ==========================================================
+#  Linai Enterprise VPS 多目录压缩工具
+#  支持多目录 + 多系统 + 并行压缩 + 自动依赖安装
+# ==========================================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
@@ -9,184 +10,174 @@ RED="\033[31m"
 BLUE="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="sub2api"
-APP_DIR="/opt/sub2api-deploy"
-COMPOSE_FILE="$APP_DIR/docker-compose.local.yml"
+DEFAULT_SAVE_DIR="$(pwd)"
+CPU_CORES=$(nproc 2>/dev/null || echo 1)
 
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}请使用 root 运行此脚本！${RESET}"
+echo -e "${BLUE}============================${RESET}"
+echo -e "${GREEN}      压缩工具${RESET}"
+echo -e "${BLUE}============================${RESET}"
+
+# =============================
+# 多系统安装函数
+# =============================
+install_pkg() {
+    pkg="$1"
+
+    if command -v apt >/dev/null 2>&1; then
+        apt update -y
+        apt install -y "$pkg"
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y "$pkg"
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y "$pkg"
+    else
+        echo -e "${RED}❌ 不支持的系统包管理器${RESET}"
+        exit 1
+    fi
+}
+
+check_cmd() {
+    cmd="$1"
+
+    if command -v "$cmd" >/dev/null 2>&1; then
+        return
+    fi
+
+    echo -e "${YELLOW}安装 $cmd ...${RESET}"
+
+    case "$cmd" in
+        tar) install_pkg tar ;;
+        zip) install_pkg zip ;;
+        7z)
+            if command -v apt >/dev/null 2>&1; then
+                install_pkg p7zip-full
+            else
+                install_pkg p7zip
+                install_pkg p7zip-plugins
+            fi
+            ;;
+        xz) install_pkg xz ;;
+        bzip2) install_pkg bzip2 ;;
+        *) install_pkg "$cmd" ;;
+    esac
+
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo -e "${RED}❌ $cmd 安装失败${RESET}"
+        exit 1
+    fi
+}
+
+# =============================
+# 选择格式
+# =============================
+echo -e "${GREEN}1) tar.gz (推荐)${RESET}"
+echo -e "${GREEN}2) tar.xz (高压缩)${RESET}"
+echo -e "${GREEN}3) tar.bz2${RESET}"
+echo -e "${GREEN}4) zip${RESET}"
+echo -e "${GREEN}5) 7z${RESET}"
+
+read -p $'\033[32m请选择压缩格式: \033[0m' format_choice
+
+# =============================
+# 输入多目录
+# =============================
+echo
+echo -e "${YELLOW}请输入要压缩的目录或文件路径（多个用空格分隔）:${RESET}"
+read -a source_dirs
+
+if [ ${#source_dirs[@]} -eq 0 ]; then
+    echo -e "${RED}❌ 必须输入至少一个目录${RESET}"
     exit 1
 fi
 
-SERVER_IP=$(hostname -I | awk '{print $1}')
-
-# ==============================
-# 初始化 compose 命令（关键修复）
-# ==============================
-init_compose() {
-
-    if ! command -v docker &>/dev/null; then
-        echo -e "${RED}未检测到 Docker，请先安装 Docker${RESET}"
+for dir in "${source_dirs[@]}"; do
+    if [ ! -e "$dir" ]; then
+        echo -e "${RED}❌ 路径不存在: $dir${RESET}"
         exit 1
     fi
+done
 
-    if docker compose version &>/dev/null 2>&1; then
-        COMPOSE_CMD="docker compose"
-    elif command -v docker-compose &>/dev/null 2>&1; then
-        COMPOSE_CMD="docker-compose"
-    else
-        echo -e "${RED}未检测到 docker compose${RESET}"
-        exit 1
-    fi
-}
+# =============================
+# 保存目录
+# =============================
+read -p "保存目录(默认/root): " save_dir
+save_dir=${save_dir:-$DEFAULT_SAVE_DIR}
+mkdir -p "$save_dir"
 
-pause(){
-    read -p "按回车返回菜单..."
-}
+read -p "输出文件名(不带后缀): " output_name
+read -p "压缩级别(1-9 默认6): " level
+read -p "排除目录(多个用空格 可留空): " -a exclude_dirs
 
-# ==============================
-# 菜单
-# ==============================
+level=${level:-6}
+timestamp=$(date +%Y%m%d_%H%M%S)
 
-menu() {
-    while true; do
-        clear
-        echo -e "${BLUE}=== sub2api 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}7) 查看管理员密码${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+start_time=$(date +%s)
 
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            7) show_admin_password ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
+# =============================
+# 开始压缩
+# =============================
+case $format_choice in
+
+1)
+    check_cmd tar
+    check_cmd gzip
+    archive="${save_dir}/${output_name}_${timestamp}.tar.gz"
+
+    exclude_args=()
+    for ex in "${exclude_dirs[@]}"; do
+        exclude_args+=(--exclude="$ex")
     done
-}
 
-# ==============================
-# 功能函数
-# ==============================
+    tar "${exclude_args[@]}" -I "gzip -$level" -cvf "$archive" "${source_dirs[@]}"
+    ;;
 
-install_app() {
+2)
+    check_cmd tar
+    check_cmd xz
+    archive="${save_dir}/${output_name}_${timestamp}.tar.xz"
 
-    init_compose
+    tar -I "xz -T$CPU_CORES -$level" -cvf "$archive" "${source_dirs[@]}"
+    ;;
 
-    mkdir -p "$APP_DIR"
-    cd "$APP_DIR" || exit
+3)
+    check_cmd tar
+    check_cmd bzip2
+    archive="${save_dir}/${output_name}_${timestamp}.tar.bz2"
 
-    echo -e "${GREEN}正在下载官方部署脚本...${RESET}"
-    curl -sSL https://raw.githubusercontent.com/Wei-Shaw/sub2api/main/deploy/docker-deploy.sh | bash
+    tar -I "bzip2 -$level" -cvf "$archive" "${source_dirs[@]}"
+    ;;
 
-    $COMPOSE_CMD -f docker-compose.local.yml up -d
+4)
+    check_cmd zip
+    archive="${save_dir}/${output_name}_${timestamp}.zip"
+    zip -r -"$level" "$archive" "${source_dirs[@]}"
+    ;;
 
-    echo
-    echo -e "${GREEN}✅ sub2api 已启动${RESET}"
-    echo -e "${GREEN}🌐 WebUI: http://${SERVER_IP}:8080${RESET}"
-    echo -e "${GREEN}🌐 账号: admin@sub2api.local${RESET}"
-    echo -e "${GREEN}🌐 密码: 7查看管理员密码${RESET}"
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
-    pause
-}
+5)
+    check_cmd 7z
+    archive="${save_dir}/${output_name}_${timestamp}.7z"
+    7z a -mx="$level" "$archive" "${source_dirs[@]}"
+    ;;
 
-update_app() {
+*)
+    echo -e "${RED}❌ 无效选择${RESET}"
+    exit 1
+    ;;
+esac
 
-    init_compose
-    cd "$APP_DIR" || { echo "未检测到安装目录"; pause; return; }
+echo
 
-    $COMPOSE_CMD -f docker-compose.local.yml pull
-    $COMPOSE_CMD -f docker-compose.local.yml up -d --remove-orphans
+# =============================
+# 校验
+# =============================
+if [ ! -f "$archive" ]; then
+    echo -e "${RED}❌ 压缩失败，文件未生成${RESET}"
+    exit 1
+fi
 
-    echo -e "${GREEN}✅ sub2api 更新完成${RESET}"
-    pause
-}
+end_time=$(date +%s)
+duration=$((end_time - start_time))
 
-restart_app() {
-
-    init_compose
-    cd "$APP_DIR" || return
-
-    $COMPOSE_CMD -f docker-compose.local.yml restart
-
-    echo -e "${GREEN}✅ sub2api 已重启${RESET}"
-    pause
-}
-
-view_logs() {
-
-    init_compose
-    cd "$APP_DIR" || return
-
-    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    $COMPOSE_CMD -f docker-compose.local.yml logs -f
-}
-
-check_status() {
-
-    if docker ps --format '{{.Names}}' | grep -q "^sub2api"; then
-        echo -e "${GREEN}sub2api 服务运行中${RESET}"
-    else
-        echo -e "${RED}sub2api 服务未运行${RESET}"
-    fi
-    pause
-}
-
-show_admin_password() {
-
-    init_compose
-    cd "$APP_DIR" || return
-
-    echo -e "${BLUE}正在查找管理员密码...${RESET}"
-
-    PASSWORD=$($COMPOSE_CMD -f docker-compose.local.yml logs sub2api 2>/dev/null \
-        | grep -i "admin password" \
-        | tail -n 1 \
-        | awk -F': ' '{print $NF}')
-
-    if [ -z "$PASSWORD" ]; then
-        echo -e "${YELLOW}未找到自动生成的管理员密码${RESET}"
-    else
-        echo -e "${GREEN}🔐 管理员密码: $PASSWORD${RESET}"
-    fi
-
-    pause
-}
-
-uninstall_app() {
-
-    init_compose
-
-    echo -e "${YELLOW}正在停止并删除容器...${RESET}"
-
-    # 强制删除容器
-    docker rm -f sub2api 2>/dev/null
-
-    # compose down
-    if [ -f "$COMPOSE_FILE" ]; then
-        cd "$APP_DIR"
-        $COMPOSE_CMD -f docker-compose.local.yml down -v --remove-orphans 2>/dev/null
-    fi
-
-    # 删除网络（防残留）
-    docker network prune -f 2>/dev/null
-
-    # 删除目录
-    rm -rf "$APP_DIR"
-
-    echo -e "${GREEN}✅ sub2api 已彻底卸载${RESET}"
-    pause
-}
-
-menu
+echo -e "${GREEN}✅ 压缩完成：${archive}${RESET}"
+echo -e "${BLUE}文件大小：$(du -sh "$archive" | awk '{print $1}')${RESET}"
+echo -e "${YELLOW}耗时：${duration} 秒${RESET}"

@@ -131,37 +131,29 @@ system_name="${system_name}${container_flag}"
 # 获取当前时区（跨系统兼容）
 # ===============================
 get_timezone() {
-    local tz tz_path
+    local tz
 
-    # systemd 系统
-    if command -v timedatectl >/dev/null 2>&1; then
+    # 1. systemd
+    if command -v timedatectl &>/dev/null; then
         tz=$(timedatectl show -p TimeZone --value)
     fi
 
-    # Debian/Ubuntu 系列
-    if [[ -z "$tz" && -f /etc/timezone ]]; then
-        tz=$(cat /etc/timezone 2>/dev/null)
-    fi
+    # 2. /etc/timezone
+    [[ -z "$tz" && -f /etc/timezone ]] && tz=$(cat /etc/timezone 2>/dev/null)
 
-    # 其他系统通过 /etc/localtime
+    # 3. /etc/localtime（符号链接或直接拷贝文件）fallback
     if [[ -z "$tz" && -f /etc/localtime ]]; then
-        tz_path=$(readlink -f /etc/localtime 2>/dev/null || echo "")
-        if [[ -n "$tz_path" ]]; then
-            tz=${tz_path#*/zoneinfo/}
-        fi
+        tz=$(basename "$(readlink -f /etc/localtime 2>/dev/null)" 2>/dev/null)
     fi
 
-    # 兜底
+    # 4. 兜底
     [[ -z "$tz" ]] && tz=$(date +%Z)
 
     # UTC 偏移
     local offset=$(date +%z)
     echo "$tz (UTC$offset)"
 }
-
-# 调用
 timezone=$(get_timezone)
-
 
 # 架构
 cpu_arch=$(uname -m)

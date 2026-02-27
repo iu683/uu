@@ -125,18 +125,29 @@ else
 fi
 system_name="${system_name}${container_flag}"
 
+
+
+# ===============================
+# 获取当前时区（跨系统兼容）
+# ===============================
 # 获取时区
-if [ -f /etc/timezone ]; then
-    timezone=$(cat /etc/timezone)
-    zone_source="/etc/timezone (Non-systemd)"
-elif command -v timedatectl >/dev/null 2>&1; then
-    timezone=$(timedatectl | awk '/Time zone/ {print $3}')
-    zone_source="timedatectl (systemd)"
+if command -v timedatectl >/dev/null 2>&1; then
+    timezone=$(timedatectl show -p TimeZone --value)
 else
-    timezone=$(date +%Z)
-    zone_source="date command (Non-systemd)"
+    # fallback
+    if [ -f /etc/timezone ]; then
+        timezone=$(cat /etc/timezone)
+    elif [ -f /etc/localtime ]; then
+        tz_path=$(readlink -f /etc/localtime 2>/dev/null || echo "")
+        timezone=${tz_path#*/zoneinfo/}
+    else
+        timezone=$(date +%Z)
+    fi
 fi
-$timezone="[$zone_source]"
+
+# UTC 偏移
+utc_offset=$(date +%z)
+timezone="$timezone (UTC$utc_offset)"
 
 
 # 架构

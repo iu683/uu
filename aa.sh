@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ===============================
-# Linai ACME Pro v2
+#  ACME Pro 证书申请
 # ===============================
 
 export LANG=en_US.UTF-8
@@ -79,11 +79,11 @@ mkdir -p $SSL_DIR/$domain
 
 $ACME_HOME/acme.sh --install-cert -d $domain \
 --key-file       $SSL_DIR/$domain/private.key  \
---fullchain-file $SSL_DIR/$domain/cert.crt \
---reloadcmd "systemctl restart nginx 2>/dev/null"
+--fullchain-file $SSL_DIR/$domain/cert.crt
 
 green "证书安装完成"
 green "路径: $SSL_DIR/$domain/"
+green "如需生效请手动重载 Web 服务"
 }
 
 # ===============================
@@ -143,39 +143,128 @@ green "全部证书已尝试续期"
 }
 
 # ===============================
-# 卸载单个证书
+# 删除证书
 # ===============================
 
-remove_cert(){
-$ACME_HOME/acme.sh --list
-echo
-read -p "请输入要删除的域名: " domain
+remove_cert() {
+    # 先获取证书列表
+    certs=($($ACME_HOME/acme.sh --list | tail -n +2 | awk '{print $1}'))
 
-$ACME_HOME/acme.sh --remove -d $domain --ecc >/dev/null 2>&1
-rm -rf $SSL_DIR/$domain
+    # 判断是否有证书
+    if [ ${#certs[@]} -eq 0 ]; then
+        red "当前没有任何证书可删除"
+        return 0
+    fi
 
-green "证书 $domain 已删除"
+    # 显示证书列表 + 编号
+    green "可删除的证书列表："
+    echo "编号  域名"
+    echo "---------------------------"
+    for i in "${!certs[@]}"; do
+        printf "%-4s %s\n" "$((i+1))" "${certs[$i]}"
+    done
+
+    echo
+    read -p "请输入要删除的编号 (输入0返回菜单): " num
+
+    # 输入0直接返回
+    if [ "$num" == "0" ]; then
+        return 0
+    fi
+
+    # 校验输入是否合法
+    if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -lt 1 ] || [ "$num" -gt "${#certs[@]}" ]; then
+        red "无效编号"
+        return 0
+    fi
+
+    domain="${certs[$((num-1))]}"
+
+    # 删除 acme.sh 证书
+    $ACME_HOME/acme.sh --remove -d "$domain" --ecc >/dev/null 2>&1
+
+    # 删除本地证书目录
+    if [ -d "$SSL_DIR/$domain" ]; then
+        rm -rf "$SSL_DIR/$domain"
+    fi
+
+    green "证书 $domain 已删除"
 }
-
 # ===============================
 # 卸载 acme.sh
 # ===============================
 
 uninstall_acme(){
-read -p "确认彻底卸载 acme.sh? (y/n): " confirm
-if [[ "$confirm" == "y" ]]; then
-$ACME_HOME/acme.sh --uninstall
+
+if [ -f "$ACME_HOME/acme.sh" ]; then
+    $ACME_HOME/acme.sh --uninstall >/dev/null 2>&1
+fi
+
 rm -rf $ACME_HOME
 rm -rf $SSL_DIR
-sed -i '/acme.sh.env/d' ~/.bashrc
+
+# 只有存在才处理
+[ -f ~/.bashrc ] && sed -i '/acme.sh.env/d' ~/.bashrc
+[ -f ~/.profile ] && sed -i '/acme.sh.env/d' ~/.profile
+
 green "acme.sh 已彻底卸载"
-fi
+}
+
+# ===============================
+# 查看已申请证书
+# ===============================
+
+list_cert(){
+
+printf "%-22s %-8s %-15s %-10s\n" "域名" "状态" "到期时间" "剩余天数"
+echo "------------------------------------------------------------"
+
+# 遍历 acme.sh 列表中的所有域名
+$ACME_HOME/acme.sh --list | tail -n +2 | awk '{print $1}' | while read domain; do
+
+    CERT_FILE="$SSL_DIR/$domain/cert.crt"
+
+    if [ ! -f "$CERT_FILE" ]; then
+        status="异常"
+        expire_date="无证书"
+        remain="--"
+    else
+        # 读取真实证书到期时间
+        expire=$(openssl x509 -enddate -noout -in "$CERT_FILE" | cut -d= -f2)
+
+        # 转换为时间戳
+        expire_ts=$(date -d "$expire" +%s 2>/dev/null)
+        now_ts=$(date +%s)
+
+        if [ -n "$expire_ts" ]; then
+            remain=$(( (expire_ts - now_ts) / 86400 ))
+
+            if [ "$remain" -ge 0 ]; then
+                status="有效"
+            else
+                status="已过期"
+            fi
+
+            expire_date=$(date -d "$expire" +"%Y-%m-%d" 2>/dev/null)
+        else
+            status="异常"
+            expire_date="未知"
+            remain="--"
+        fi
+    fi
+
+    printf "%-22s %-8s %-15s %-10s\n" "$domain" "$status" "$expire_date" "$remain 天"
+
+done
+
 }
 
 # ===============================
 # 菜单
 # ===============================
 
+while true
+do
 clear
 green "==============================="
 green "     ACME申请证书工具"
@@ -185,17 +274,21 @@ green "2. 申请证书 (DNS API模式)"
 green "3. 续期全部证书"
 green "4. 查看已申请证书"
 green "5. 删除指定证书"
-green "6. 卸载 acme.sh"
+green "6. 卸载acme.sh"
 green "0. 退出"
 
-read -p "请选择: " num
+read -p $'\033[32m请选择: \033[0m' num
 
 case $num in
 1) install_dep; install_acme; standalone_issue;;
 2) install_dep; install_acme; dns_issue;;
 3) renew_all;;
-4) $ACME_HOME/acme.sh --list;;
+4) list_cert;;
 5) remove_cert;;
 6) uninstall_acme;;
 0) exit;;
+*) echo -e "${RED}无效选项${RESET}";;
 esac
+
+read -p $'\033[32m按回车返回菜单...\033[0m' temp
+done

@@ -1,95 +1,174 @@
 #!/bin/bash
-# =================================================
-# VPS 一键解压工具 Pro（无 file 依赖 + 自动安装工具）
-# =================================================
-
-set -e
+# ========================================
+# Subs-Check 一键管理脚本
+# ========================================
 
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
-BLUE="\033[36m"
+RED="\033[31m"
 RESET="\033[0m"
 
-echo -e "${GREEN}====== VPS 一键解压工具 Pro ======${RESET}"
+APP_NAME="subs-check"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-# 必须 root（避免安装时报错）
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}请使用 root 运行此脚本！${RESET}"
-    exit 1
-fi
+# ==============================
+# 基础检测
+# ==============================
 
-read -rp "请输入要解压的文件路径（例如 /opt/test.tar.gz）： " FILE
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
 
-if [[ ! -f "$FILE" ]]; then
-    echo -e "${RED}文件不存在！退出${RESET}"
-    exit 1
-fi
-
-read -rp "请输入解压到的目标目录（留空为当前目录）： " DEST
-DEST=${DEST:-$(pwd)}
-
-mkdir -p "$DEST"
-
-# 获取文件名（小写）
-FILENAME=$(basename "$FILE")
-LOWER_NAME=$(echo "$FILENAME" | tr '[:upper:]' '[:lower:]')
-
-install_pkg() {
-    PKG=$1
-    if ! command -v "$PKG" &>/dev/null; then
-        echo -e "${YELLOW}$PKG 未安装，正在安装...${RESET}"
-        apt-get update -y
-        apt-get install -y "$PKG"
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
     fi
 }
 
-echo -e "${BLUE}正在识别文件类型...${RESET}"
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
 
-case "$LOWER_NAME" in
+# ==============================
+# 菜单
+# ==============================
 
-    *.zip)
-        install_pkg unzip
-        echo -e "${GREEN}正在解压 ZIP 文件...${RESET}"
-        unzip -o "$FILE" -d "$DEST"
-        ;;
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== Subs-Check 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-    *.tar)
-        echo -e "${GREEN}正在解压 TAR 文件...${RESET}"
-        tar -xvf "$FILE" -C "$DEST"
-        ;;
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *)
+                echo -e "${RED}无效选择${RESET}"
+                sleep 1
+                continue
+                ;;
+        esac
+    done
+}
 
-    *.tar.gz|*.tgz)
-        echo -e "${GREEN}正在解压 TAR.GZ 文件...${RESET}"
-        tar -xvzf "$FILE" -C "$DEST"
-        ;;
+# ==============================
+# 功能函数
+# ==============================
 
-    *.tar.bz2)
-        echo -e "${GREEN}正在解压 TAR.BZ2 文件...${RESET}"
-        tar -xvjf "$FILE" -C "$DEST"
-        ;;
+install_app() {
+    check_docker
 
-    *.tar.xz)
-        echo -e "${GREEN}正在解压 TAR.XZ 文件...${RESET}"
-        tar -xvJf "$FILE" -C "$DEST"
-        ;;
+    mkdir -p "$APP_DIR/config"
+    mkdir -p "$APP_DIR/output"
 
-    *.rar)
-        install_pkg unrar
-        echo -e "${GREEN}正在解压 RAR 文件...${RESET}"
-        unrar x -o+ "$FILE" "$DEST"
-        ;;
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
 
-    *.7z)
-        install_pkg 7z
-        echo -e "${GREEN}正在解压 7Z 文件...${RESET}"
-        7z x "$FILE" -o"$DEST" -y
-        ;;
+    read -p "请输入 Web 端口 [默认:8299]: " input_port1
+    PORT1=${input_port1:-8299}
+    check_port "$PORT1" || return
 
-    *)
-        echo -e "${RED}❌ 不支持的压缩格式: $FILENAME${RESET}"
-        exit 1
-        ;;
-esac
+    read -p "请输入 API 端口 [默认:8199]: " input_port2
+    PORT2=${input_port2:-8199}
+    check_port "$PORT2" || return
 
-echo -e "${GREEN}✅ 解压完成！文件已放到: $DEST${RESET}"
+    read -p "请输入 API_KEY [回车自动生成]: " input_key
+
+    if [ -z "$input_key" ]; then
+        API_KEY=$(openssl rand -hex 16)
+        echo "已自动生成 API_KEY: $API_KEY"
+    else
+        API_KEY="$input_key"
+    fi
+    
+    read -p "请输入时区 [默认:Asia/Shanghai]: " input_tz
+    TZ_VALUE=${input_tz:-Asia/Shanghai}
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  subs-check:
+    image: ghcr.io/beck-8/subs-check:latest
+    container_name: subs-check
+    volumes:
+      - ./config:/app/config
+      - ./output:/app/output
+    ports:
+      - "127.0.0.1:${PORT1}:8299"
+      - "127.0.0.1:${PORT2}:8199"
+    environment:
+      - TZ=${TZ_VALUE}
+      - API_KEY=${API_KEY}
+    restart: always
+    network_mode: bridge
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    echo
+    echo -e "${GREEN}✅ Subs-Check 已启动${RESET}"
+    echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:${PORT1}${RESET}"
+    echo -e "${YELLOW}🔐 API 地址: http://127.0.0.1:${PORT2}${RESET}"
+    echo -e "${GREEN}📂 配置目录: $APP_DIR/config${RESET}"
+    echo -e "${GREEN}📂 输出目录: $APP_DIR/output${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ Subs-Check 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    docker compose restart
+    echo -e "${GREEN}✅ Subs-Check 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
+    docker logs -f subs-check
+}
+
+check_status() {
+    docker ps | grep subs-check
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ Subs-Check 已彻底卸载（含数据）${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+# ==============================
+# 启动菜单
+# ==============================
+menu

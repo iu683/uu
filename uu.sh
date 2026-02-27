@@ -1,185 +1,252 @@
 #!/bin/bash
-# ==========================================================
-#  Linai Enterprise VPS 多目录压缩工具
-#  支持多目录 + 多系统 + 并行压缩 + 自动依赖安装
-# ==========================================================
+
+# ===============================
+# Linai ACME Pro v2
+# ===============================
+
+export LANG=en_US.UTF-8
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
-BLUE="\033[36m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-DEFAULT_SAVE_DIR="$(pwd)"
-CPU_CORES=$(nproc 2>/dev/null || echo 1)
+green(){ echo -e "${GREEN}$1${RESET}"; }
+red(){ echo -e "${RED}$1${RESET}"; }
+yellow(){ echo -e "${YELLOW}$1${RESET}"; }
 
-echo -e "${BLUE}========================================${RESET}"
-echo -e "${GREEN}      Linai Enterprise 压缩工具${RESET}"
-echo -e "${BLUE}========================================${RESET}"
-echo -e "CPU 核心数: ${YELLOW}${CPU_CORES}${RESET}"
-echo
+[[ $EUID -ne 0 ]] && red "请使用 root 运行" && exit
 
-# =============================
-# 多系统安装函数
-# =============================
-install_pkg() {
-    pkg="$1"
+ACME_HOME="$HOME/.acme.sh"
+SSL_DIR="/etc/ssl/acme"
 
-    if command -v apt >/dev/null 2>&1; then
-        apt update -y
-        apt install -y "$pkg"
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y "$pkg"
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y "$pkg"
-    else
-        echo -e "${RED}❌ 不支持的系统包管理器${RESET}"
-        exit 1
-    fi
-}
+mkdir -p $SSL_DIR
 
-check_cmd() {
-    cmd="$1"
+# ===============================
+# 依赖检测
+# ===============================
 
-    if command -v "$cmd" >/dev/null 2>&1; then
-        return
-    fi
-
-    echo -e "${YELLOW}安装 $cmd ...${RESET}"
-
-    case "$cmd" in
-        tar) install_pkg tar ;;
-        zip) install_pkg zip ;;
-        7z)
-            if command -v apt >/dev/null 2>&1; then
-                install_pkg p7zip-full
-            else
-                install_pkg p7zip
-                install_pkg p7zip-plugins
-            fi
-            ;;
-        xz) install_pkg xz ;;
-        bzip2) install_pkg bzip2 ;;
-        *) install_pkg "$cmd" ;;
-    esac
-
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-        echo -e "${RED}❌ $cmd 安装失败${RESET}"
-        exit 1
-    fi
-}
-
-# =============================
-# 选择格式
-# =============================
-echo -e "${GREEN}1) tar.gz (推荐)${RESET}"
-echo -e "${GREEN}2) tar.xz (高压缩)${RESET}"
-echo -e "${GREEN}3) tar.bz2${RESET}"
-echo -e "${GREEN}4) zip${RESET}"
-echo -e "${GREEN}5) 7z${RESET}"
-
-read -p $'\033[32m请选择压缩格式: \033[0m' format_choice
-
-# =============================
-# 输入多目录
-# =============================
-echo
-echo -e "${YELLOW}请输入要压缩的目录或文件路径（多个用空格分隔）:${RESET}"
-read -a source_dirs
-
-if [ ${#source_dirs[@]} -eq 0 ]; then
-    echo -e "${RED}❌ 必须输入至少一个目录${RESET}"
-    exit 1
+install_dep(){
+if command -v apt >/dev/null 2>&1; then
+    apt update -y
+    apt install -y curl socat cron wget
+elif command -v yum >/dev/null 2>&1; then
+    yum install -y curl socat cronie wget
+elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y curl socat cronie wget
 fi
+}
 
-for dir in "${source_dirs[@]}"; do
-    if [ ! -e "$dir" ]; then
-        echo -e "${RED}❌ 路径不存在: $dir${RESET}"
-        exit 1
-    fi
-done
+# ===============================
+# 安装 acme.sh
+# ===============================
 
-# =============================
-# 保存目录
-# =============================
-read -p "保存目录(默认 当前目录): " save_dir
-save_dir=${save_dir:-$DEFAULT_SAVE_DIR}
-mkdir -p "$save_dir"
+install_acme(){
+if [ ! -f "$ACME_HOME/acme.sh" ]; then
+    read -p "请输入注册邮箱（回车自动生成）: " email
+    [ -z "$email" ] && email="$(date +%s)@gmail.com"
+    curl https://get.acme.sh | sh -s email=$email
+    green "acme.sh 安装完成"
+fi
+}
 
-read -p "输出文件名(不带后缀): " output_name
-read -p "压缩级别(1-9 默认6): " level
-read -p "排除目录(多个用空格 可留空): " -a exclude_dirs
+# ===============================
+# 停止/恢复 Web 服务
+# ===============================
 
-level=${level:-6}
-timestamp=$(date +%Y%m%d_%H%M%S)
+stop_web(){
+if systemctl is-active nginx >/dev/null 2>&1; then
+    systemctl stop nginx
+    WEB_STOP=nginx
+fi
+if systemctl is-active apache2 >/dev/null 2>&1; then
+    systemctl stop apache2
+    WEB_STOP=apache2
+fi
+}
 
-start_time=$(date +%s)
+start_web(){
+[ ! -z "$WEB_STOP" ] && systemctl start $WEB_STOP
+}
 
-# =============================
-# 开始压缩
-# =============================
-case $format_choice in
+# ===============================
+# 安装证书
+# ===============================
 
+install_cert(){
+domain=$1
+mkdir -p $SSL_DIR/$domain
+
+$ACME_HOME/acme.sh --install-cert -d $domain \
+--key-file       $SSL_DIR/$domain/private.key  \
+--fullchain-file $SSL_DIR/$domain/cert.crt
+
+green "证书安装完成"
+green "路径: $SSL_DIR/$domain/"
+green "如需生效请手动重载 Web 服务"
+}
+
+# ===============================
+# 80 端口模式
+# ===============================
+
+standalone_issue(){
+read -p "请输入域名: " domain
+stop_web
+$ACME_HOME/acme.sh --issue -d $domain --standalone -k ec-256 --server zerossl
+[ $? -eq 0 ] && install_cert $domain || red "证书申请失败"
+start_web
+}
+
+# ===============================
+# DNS 模式
+# ===============================
+
+dns_issue(){
+read -p "请输入域名: " domain
+echo "1.Cloudflare"
+echo "2.DNSPod"
+echo "3.Aliyun"
+read -p "请选择: " type
+
+case $type in
 1)
-    check_cmd tar
-    check_cmd gzip
-    archive="${save_dir}/${output_name}_${timestamp}.tar.gz"
-
-    exclude_args=()
-    for ex in "${exclude_dirs[@]}"; do
-        exclude_args+=(--exclude="$ex")
-    done
-
-    tar "${exclude_args[@]}" -I "gzip -$level" -cvf "$archive" "${source_dirs[@]}"
-    ;;
-
+read -p "CF_Key: " CF_Key
+read -p "CF_Email: " CF_Email
+export CF_Key CF_Email
+$ACME_HOME/acme.sh --issue --dns dns_cf -d $domain -k ec-256 --server zerossl
+;;
 2)
-    check_cmd tar
-    check_cmd xz
-    archive="${save_dir}/${output_name}_${timestamp}.tar.xz"
-
-    tar -I "xz -T$CPU_CORES -$level" -cvf "$archive" "${source_dirs[@]}"
-    ;;
-
+read -p "DP_Id: " DP_Id
+read -p "DP_Key: " DP_Key
+export DP_Id DP_Key
+$ACME_HOME/acme.sh --issue --dns dns_dp -d $domain -k ec-256 --server zerossl
+;;
 3)
-    check_cmd tar
-    check_cmd bzip2
-    archive="${save_dir}/${output_name}_${timestamp}.tar.bz2"
-
-    tar -I "bzip2 -$level" -cvf "$archive" "${source_dirs[@]}"
-    ;;
-
-4)
-    check_cmd zip
-    archive="${save_dir}/${output_name}_${timestamp}.zip"
-    zip -r -"$level" "$archive" "${source_dirs[@]}"
-    ;;
-
-5)
-    check_cmd 7z
-    archive="${save_dir}/${output_name}_${timestamp}.7z"
-    7z a -mx="$level" "$archive" "${source_dirs[@]}"
-    ;;
-
-*)
-    echo -e "${RED}❌ 无效选择${RESET}"
-    exit 1
-    ;;
+read -p "Ali_Key: " Ali_Key
+read -p "Ali_Secret: " Ali_Secret
+export Ali_Key Ali_Secret
+$ACME_HOME/acme.sh --issue --dns dns_ali -d $domain -k ec-256 --server zerossl
+;;
 esac
 
-echo
+[ $? -eq 0 ] && install_cert $domain || red "证书申请失败"
+}
 
-# =============================
-# 校验
-# =============================
-if [ ! -f "$archive" ]; then
-    echo -e "${RED}❌ 压缩失败，文件未生成${RESET}"
-    exit 1
+# ===============================
+# 续期
+# ===============================
+
+renew_all(){
+$ACME_HOME/acme.sh --cron -f
+green "全部证书已尝试续期"
+}
+
+# ===============================
+# 卸载单个证书
+# ===============================
+
+remove_cert(){
+$ACME_HOME/acme.sh --list
+echo
+read -p "请输入要删除的域名: " domain
+
+$ACME_HOME/acme.sh --remove -d $domain --ecc >/dev/null 2>&1
+rm -rf $SSL_DIR/$domain
+
+green "证书 $domain 已删除"
+}
+
+# ===============================
+# 卸载 acme.sh
+# ===============================
+
+uninstall_acme(){
+
+if [ -f "$ACME_HOME/acme.sh" ]; then
+    $ACME_HOME/acme.sh --uninstall >/dev/null 2>&1
 fi
 
-end_time=$(date +%s)
-duration=$((end_time - start_time))
+rm -rf $ACME_HOME
+rm -rf $SSL_DIR
 
-echo -e "${GREEN}✅ 压缩完成：${archive}${RESET}"
-echo -e "${BLUE}文件大小：$(du -sh "$archive" | awk '{print $1}')${RESET}"
-echo -e "${YELLOW}耗时：${duration} 秒${RESET}"
+# 只有存在才处理
+[ -f ~/.bashrc ] && sed -i '/acme.sh.env/d' ~/.bashrc
+[ -f ~/.profile ] && sed -i '/acme.sh.env/d' ~/.profile
+
+green "acme.sh 已彻底卸载"
+}
+
+list_cert(){
+
+printf "%-22s %-8s %-15s %-10s\n" "域名" "状态" "到期时间" "剩余天数"
+echo "------------------------------------------------------------"
+
+$ACME_HOME/acme.sh --list | tail -n +2 | awk '{print $1}' | while read domain; do
+
+    expire=$($ACME_HOME/acme.sh --info -d $domain 2>/dev/null | grep "Le_ExpireTimeStr" | cut -d"'" -f2)
+
+    if [ -n "$expire" ]; then
+        expire_date=$(date -d "$expire" +"%Y-%m-%d" 2>/dev/null)
+
+        now_ts=$(date +%s)
+        expire_ts=$(date -d "$expire" +%s 2>/dev/null)
+
+        if [ -n "$expire_ts" ]; then
+            remain=$(( (expire_ts - now_ts) / 86400 ))
+
+            if [ "$remain" -ge 0 ]; then
+                status="有效"
+            else
+                status="已过期"
+            fi
+        else
+            status="未知"
+            remain="--"
+            expire_date="未知"
+        fi
+    else
+        status="未知"
+        remain="--"
+        expire_date="未知"
+    fi
+
+    printf "%-22s %-8s %-15s %-10s\n" "$domain" "$status" "$expire_date" "$remain 天"
+
+done
+
+}
+
+# ===============================
+# 菜单
+# ===============================
+
+while true
+do
+clear
+green "==============================="
+green "     ACME申请证书工具"
+green "==============================="
+green "1. 申请证书 (80端口模式)"
+green "2. 申请证书 (DNS API模式)"
+green "3. 续期全部证书"
+green "4. 查看已申请证书"
+green "5. 删除指定证书"
+green "6. 卸载acme.sh"
+green "0. 退出"
+
+read -p $'\033[32m请选择: \033[0m' num
+
+case $num in
+1) install_dep; install_acme; standalone_issue;;
+2) install_dep; install_acme; dns_issue;;
+3) renew_all;;
+4) list_cert;;
+5) remove_cert;;
+6) uninstall_acme;;
+0) exit;;
+*) echo -e "${RED}无效选项${RESET}";;
+esac
+
+read -p $'\033[32m按回车返回菜单...\033[0m' temp
+done

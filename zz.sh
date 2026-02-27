@@ -1,146 +1,257 @@
 #!/bin/bash
-# ========================================
-# Apprise 一键管理脚本
-# ========================================
+
+# ===============================
+# Linai ACME Pro v2
+# ===============================
+
+export LANG=en_US.UTF-8
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-APP_NAME="apprise"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+green(){ echo -e "${GREEN}$1${RESET}"; }
+red(){ echo -e "${RED}$1${RESET}"; }
+yellow(){ echo -e "${YELLOW}$1${RESET}"; }
 
-# ==============================
-# 基础检测
-# ==============================
+[[ $EUID -ne 0 ]] && red "请使用 root 运行" && exit
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
+ACME_HOME="$HOME/.acme.sh"
+SSL_DIR="/etc/ssl/acme"
 
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
+mkdir -p $SSL_DIR
+
+# ===============================
+# 依赖检测
+# ===============================
+
+install_dep(){
+if command -v apt >/dev/null 2>&1; then
+    apt update -y
+    apt install -y curl socat cron wget
+elif command -v yum >/dev/null 2>&1; then
+    yum install -y curl socat cronie wget
+elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y curl socat cronie wget
+fi
 }
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
+# ===============================
+# 安装 acme.sh
+# ===============================
+
+install_acme(){
+if [ ! -f "$ACME_HOME/acme.sh" ]; then
+    read -p "请输入注册邮箱（回车自动生成）: " email
+    [ -z "$email" ] && email="$(date +%s)@gmail.com"
+    curl https://get.acme.sh | sh -s email=$email
+    green "acme.sh 安装完成"
+fi
 }
 
-# ==============================
+# ===============================
+# 停止/恢复 Web 服务
+# ===============================
+
+stop_web(){
+if systemctl is-active nginx >/dev/null 2>&1; then
+    systemctl stop nginx
+    WEB_STOP=nginx
+fi
+if systemctl is-active apache2 >/dev/null 2>&1; then
+    systemctl stop apache2
+    WEB_STOP=apache2
+fi
+}
+
+start_web(){
+[ ! -z "$WEB_STOP" ] && systemctl start $WEB_STOP
+}
+
+# ===============================
+# 安装证书
+# ===============================
+
+install_cert(){
+domain=$1
+mkdir -p $SSL_DIR/$domain
+
+$ACME_HOME/acme.sh --install-cert -d $domain \
+--key-file       $SSL_DIR/$domain/private.key  \
+--fullchain-file $SSL_DIR/$domain/cert.crt
+
+green "证书安装完成"
+green "路径: $SSL_DIR/$domain/"
+green "如需生效请手动重载 Web 服务"
+}
+
+# ===============================
+# 80 端口模式
+# ===============================
+
+standalone_issue(){
+read -p "请输入域名: " domain
+stop_web
+$ACME_HOME/acme.sh --issue -d $domain --standalone -k ec-256 --server zerossl
+[ $? -eq 0 ] && install_cert $domain || red "证书申请失败"
+start_web
+}
+
+# ===============================
+# DNS 模式
+# ===============================
+
+dns_issue(){
+read -p "请输入域名: " domain
+echo "1.Cloudflare"
+echo "2.DNSPod"
+echo "3.Aliyun"
+read -p "请选择: " type
+
+case $type in
+1)
+read -p "CF_Key: " CF_Key
+read -p "CF_Email: " CF_Email
+export CF_Key CF_Email
+$ACME_HOME/acme.sh --issue --dns dns_cf -d $domain -k ec-256 --server zerossl
+;;
+2)
+read -p "DP_Id: " DP_Id
+read -p "DP_Key: " DP_Key
+export DP_Id DP_Key
+$ACME_HOME/acme.sh --issue --dns dns_dp -d $domain -k ec-256 --server zerossl
+;;
+3)
+read -p "Ali_Key: " Ali_Key
+read -p "Ali_Secret: " Ali_Secret
+export Ali_Key Ali_Secret
+$ACME_HOME/acme.sh --issue --dns dns_ali -d $domain -k ec-256 --server zerossl
+;;
+esac
+
+[ $? -eq 0 ] && install_cert $domain || red "证书申请失败"
+}
+
+# ===============================
+# 续期
+# ===============================
+
+renew_all(){
+$ACME_HOME/acme.sh --cron -f
+green "全部证书已尝试续期"
+}
+
+# ===============================
+# 卸载单个证书
+# ===============================
+
+remove_cert(){
+$ACME_HOME/acme.sh --list
+echo
+read -p "请输入要删除的域名: " domain
+
+$ACME_HOME/acme.sh --remove -d $domain --ecc >/dev/null 2>&1
+rm -rf $SSL_DIR/$domain
+
+green "证书 $domain 已删除"
+}
+
+# ===============================
+# 卸载 acme.sh
+# ===============================
+
+uninstall_acme(){
+
+if [ -f "$ACME_HOME/acme.sh" ]; then
+    $ACME_HOME/acme.sh --uninstall >/dev/null 2>&1
+fi
+
+rm -rf $ACME_HOME
+rm -rf $SSL_DIR
+
+# 只有存在才处理
+[ -f ~/.bashrc ] && sed -i '/acme.sh.env/d' ~/.bashrc
+[ -f ~/.profile ] && sed -i '/acme.sh.env/d' ~/.profile
+
+green "acme.sh 已彻底卸载"
+}
+
+list_cert(){
+
+printf "%-22s %-8s %-15s %-10s\n" "域名" "状态" "到期时间" "剩余天数"
+echo "------------------------------------------------------------"
+
+# 遍历 acme.sh 列表中的所有域名
+$ACME_HOME/acme.sh --list | tail -n +2 | awk '{print $1}' | while read domain; do
+
+    CERT_FILE="$SSL_DIR/$domain/cert.crt"
+
+    if [ ! -f "$CERT_FILE" ]; then
+        status="异常"
+        expire_date="无证书"
+        remain="--"
+    else
+        # 读取真实证书到期时间
+        expire=$(openssl x509 -enddate -noout -in "$CERT_FILE" | cut -d= -f2)
+
+        # 转换为时间戳
+        expire_ts=$(date -d "$expire" +%s 2>/dev/null)
+        now_ts=$(date +%s)
+
+        if [ -n "$expire_ts" ]; then
+            remain=$(( (expire_ts - now_ts) / 86400 ))
+
+            if [ "$remain" -ge 0 ]; then
+                status="有效"
+            else
+                status="已过期"
+            fi
+
+            expire_date=$(date -d "$expire" +"%Y-%m-%d" 2>/dev/null)
+        else
+            status="异常"
+            expire_date="未知"
+            remain="--"
+        fi
+    fi
+
+    printf "%-22s %-8s %-15s %-10s\n" "$domain" "$status" "$expire_date" "$remain 天"
+
+done
+
+}
+
+# ===============================
 # 菜单
-# ==============================
+# ===============================
 
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== Apprise 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+while true
+do
+clear
+green "==============================="
+green "     ACME申请证书工具"
+green "==============================="
+green "1. 申请证书 (80端口模式)"
+green "2. 申请证书 (DNS API模式)"
+green "3. 续期全部证书"
+green "4. 查看已申请证书"
+green "5. 删除指定证书"
+green "6. 卸载acme.sh"
+green "0. 退出"
 
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *)
-                echo -e "${RED}无效选择${RESET}"
-                sleep 1
-                continue
-                ;;
-        esac
-    done
-}
+read -p $'\033[32m请选择: \033[0m' num
 
-# ==============================
-# 功能函数
-# ==============================
+case $num in
+1) install_dep; install_acme; standalone_issue;;
+2) install_dep; install_acme; dns_issue;;
+3) renew_all;;
+4) list_cert;;
+5) remove_cert;;
+6) uninstall_acme;;
+0) exit;;
+*) echo -e "${RED}无效选项${RESET}";;
+esac
 
-install_app() {
-    check_docker
-
-    mkdir -p "$APP_DIR"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-
-    read -p "请输入访问端口 [默认:8000]: " input_port
-    PORT=${input_port:-8000}
-    check_port "$PORT" || return
-
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  apprise:
-    container_name: apprise
-    image: caronc/apprise:latest
-    ports:
-      - "127.0.0.1:${PORT}:8000"
-    restart: always
-EOF
-
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    echo
-    echo -e "${GREEN}✅ Apprise 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:${PORT}${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ Apprise 更新完成${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-restart_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
-    docker compose restart
-    echo -e "${GREEN}✅ Apprise 已重启${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f apprise
-}
-
-check_status() {
-    docker ps | grep apprise
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
-    docker compose down
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Apprise 已彻底卸载${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-# ==============================
-# 启动菜单
-# ==============================
-menu
+read -p $'\033[32m按回车返回菜单...\033[0m' temp
+done

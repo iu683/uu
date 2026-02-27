@@ -128,25 +128,38 @@ system_name="${system_name}${container_flag}"
 
 
 # ===============================
-# 获取时区
+# 获取当前时区（跨系统兼容）
 # ===============================
-if command -v timedatectl >/dev/null 2>&1; then
-    timezone=$(timedatectl show -p TimeZone --value)
-elif [ -f /etc/timezone ]; then
-    timezone=$(cat /etc/timezone)
-elif [ -f /etc/localtime ]; then
-    tz_path=$(readlink -f /etc/localtime 2>/dev/null || echo "")
-    if [[ -n "$tz_path" ]]; then
-        timezone=${tz_path#*/zoneinfo/}
-    else
-        timezone=$(date +%Z)
+get_timezone() {
+    # 1️⃣ systemd 环境
+    if command -v timedatectl &>/dev/null; then
+        tz=$(timedatectl show -p Timezone --value)
+        [[ -n "$tz" ]] && echo "$tz" && return
     fi
-else
-    timezone=$(date +%Z)
-fi
 
-timezone="$timezone"
+    # 2️⃣ /etc/timezone 文件（Debian）
+    if [[ -f /etc/timezone ]]; then
+        tz=$(cat /etc/timezone)
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
 
+    # 3️⃣ /etc/localtime 符号链接（RedHat / CentOS）
+    if [[ -L /etc/localtime ]]; then
+        tz=$(readlink /etc/localtime | sed 's#.*/zoneinfo/##')
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 4️⃣ /etc/localtime 文件内容匹配（minimal / docker / chroot）
+    if [[ -f /etc/localtime ]]; then
+        tz=$(strings /etc/localtime 2>/dev/null | grep -E '^[A-Z][a-z]+/[A-Z][a-zA-Z_]+$' | head -n1)
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 5️⃣ 兜底
+    echo "未知"
+}
+
+timezone=$(get_timezone)
 
 # 架构
 cpu_arch=$(uname -m)

@@ -125,34 +125,22 @@ else
 fi
 system_name="${system_name}${container_flag}"
 
+
+
 # ===============================
-# 获取时区（多系统兼容）
+# 获取当前时区（跨系统兼容）
 # ===============================
 get_timezone() {
-    local tz offset
-
-    # 优先用 systemd 的 timedatectl
-    if command -v timedatectl >/dev/null 2>&1; then
-        tz=$(timedatectl | awk '/Time zone/ {print $3}')
-        offset=$(timedatectl | awk '/Time zone/ {print $5}')
-    # 如果 /etc/timezone 存在（Debian 系列）
-    elif [ -f /etc/timezone ]; then
-        tz=$(cat /etc/timezone)
-        offset=$(date +%z)
-    # 如果 /etc/localtime 存在（非 Debian 系统，如 CentOS/RHEL）
-    elif [ -f /etc/localtime ]; then
-        # 获取时区路径，比如 /usr/share/zoneinfo/Asia/Shanghai
-        tz_path=$(readlink -f /etc/localtime)
-        tz=${tz_path##*/zoneinfo/} # 去掉前缀
-        offset=$(date +%z)
+    if command -v timedatectl &>/dev/null; then
+        timedatectl show -p Timezone --value
+    elif [[ -f /etc/timezone ]]; then
+        cat /etc/timezone
+    elif [[ -L /etc/localtime ]]; then
+        readlink /etc/localtime | sed 's#.*/zoneinfo/##'
     else
-        # 最后兜底
-        tz=$(date +%Z)
-        offset=$(date +%z)
+        echo "未知"
     fi
 }
-
-# 使用
 timezone=$(get_timezone)
 
 # 架构

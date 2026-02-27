@@ -131,28 +131,34 @@ system_name="${system_name}${container_flag}"
 # 获取当前时区（跨系统兼容）
 # ===============================
 get_timezone() {
-    local tz
-
-    # 1. systemd
+    # 1️⃣ systemd 环境，屏蔽错误
     if command -v timedatectl &>/dev/null; then
-        tz=$(timedatectl show -p TimeZone --value)
+        tz=$(timedatectl show -p Timezone --value 2>/dev/null)
+        [[ -n "$tz" ]] && echo "$tz" && return
     fi
 
-    # 2. /etc/timezone
-    [[ -z "$tz" && -f /etc/timezone ]] && tz=$(cat /etc/timezone 2>/dev/null)
-
-    # 3. /etc/localtime（符号链接或直接拷贝文件）fallback
-    if [[ -z "$tz" && -f /etc/localtime ]]; then
-        tz=$(basename "$(readlink -f /etc/localtime 2>/dev/null)" 2>/dev/null)
+    # 2️⃣ /etc/timezone 文件（Debian）
+    if [[ -f /etc/timezone ]]; then
+        tz=$(cat /etc/timezone)
+        [[ -n "$tz" ]] && echo "$tz" && return
     fi
 
-    # 4. 兜底
-    [[ -z "$tz" ]] && tz=$(date +%Z)
+    # 3️⃣ /etc/localtime 符号链接（RedHat / CentOS）
+    if [[ -L /etc/localtime ]]; then
+        tz=$(readlink /etc/localtime | sed 's#.*/zoneinfo/##')
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
 
-    # UTC 偏移
-    local offset=$(date +%z)
-    echo "$tz (UTC$offset)"
+    # 4️⃣ /etc/localtime 文件内容匹配（minimal / docker / chroot）
+    if [[ -f /etc/localtime ]]; then
+        tz=$(strings /etc/localtime 2>/dev/null | grep -E '^[A-Z][a-z]+/[A-Z][a-zA-Z_]+$' | head -n1)
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 5️⃣ 兜底
+    echo "未知"
 }
+
 timezone=$(get_timezone)
 
 # 架构

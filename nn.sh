@@ -1,124 +1,175 @@
 #!/bin/bash
-# =================================================
-# VPS 一键解压工具 Pro（多系统自动适配）
-# 支持 Debian / Ubuntu / CentOS / Rocky / Alma / Fedora / Arch
-# =================================================
-
-set -e
+# ========================================
+# Subs-Check 一键管理脚本
+# ========================================
 
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
-BLUE="\033[36m"
+RED="\033[31m"
 RESET="\033[0m"
 
-echo -e "${GREEN}====== VPS 解压工具======${RESET}"
+APP_NAME="subs-check"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-# 必须 root
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}请使用 root 运行此脚本！${RESET}"
-    exit 1
-fi
+# ==============================
+# 基础检测
+# ==============================
 
-# ===============================
-# 自动识别包管理器
-# ===============================
-detect_pm() {
-    if command -v apt-get &>/dev/null; then
-        PM="apt-get"
-        INSTALL="apt-get install -y"
-        UPDATE="apt-get update -y"
-    elif command -v dnf &>/dev/null; then
-        PM="dnf"
-        INSTALL="dnf install -y"
-        UPDATE="dnf makecache"
-    elif command -v yum &>/dev/null; then
-        PM="yum"
-        INSTALL="yum install -y"
-        UPDATE="yum makecache"
-    elif command -v pacman &>/dev/null; then
-        PM="pacman"
-        INSTALL="pacman -Sy --noconfirm"
-        UPDATE="pacman -Sy"
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
+
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
+    fi
+}
+
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
+
+# ==============================
+# 菜单
+# ==============================
+
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== Subs-Check 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *)
+                echo -e "${RED}无效选择${RESET}"
+                sleep 1
+                continue
+                ;;
+        esac
+    done
+}
+
+# ==============================
+# 功能函数
+# ==============================
+
+install_app() {
+    check_docker
+
+    mkdir -p "$APP_DIR/config"
+    mkdir -p "$APP_DIR/output"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
+
+    read -p "请输入 API 端口 [默认:8299]: " input_port1
+    PORT1=${input_port1:-8299}
+    check_port "$PORT1" || return
+
+    read -p "请输入 Web 端口 [默认:8199]: " input_port2
+    PORT2=${input_port2:-8199}
+    check_port "$PORT2" || return
+
+    read -p "请输入 API_KEY [回车自动生成]: " input_key
+
+    if [ -z "$input_key" ]; then
+        API_KEY=$(openssl rand -hex 16)
+        echo "已自动生成 API_KEY: $API_KEY"
     else
-        echo -e "${RED}❌ 不支持的系统，未找到包管理器${RESET}"
-        exit 1
+        API_KEY="$input_key"
     fi
+
+    read -p "请输入时区 [默认:Asia/Shanghai]: " input_tz
+    TZ_VALUE=${input_tz:-Asia/Shanghai}
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  subs-check:
+    image: ghcr.io/beck-8/subs-check:latest
+    container_name: subs-check
+    volumes:
+      - ./config:/app/config
+      - ./output:/app/output
+    ports:
+      - "127.0.0.1:${PORT1}:8299"
+      - "127.0.0.1:${PORT2}:8199"
+    environment:
+      - TZ=${TZ_VALUE}
+      - API_KEY=${API_KEY}
+    restart: always
+    network_mode: bridge
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    echo
+    echo -e "${GREEN}✅ Subs-Check 已启动${RESET}"
+    echo -e "${YELLOW}🌐 API 地址: http://127.0.0.1:${PORT1}${RESET}"
+    echo -e "${YELLOW}🔐 Web 地址: http://127.0.0.1:${PORT2}${RESET}"
+    echo -e "${YELLOW}🔐 API_KEY: $API_KEY${RESET}"
+    echo -e "${GREEN}📂 配置目录: $APP_DIR/config${RESET}"
+    echo -e "${GREEN}📂 输出目录: $APP_DIR/output${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-install_pkg() {
-    PKG=$1
-    if ! command -v "$PKG" &>/dev/null; then
-        echo -e "${YELLOW}$PKG 未安装，正在安装...${RESET}"
-        $UPDATE
-        $INSTALL "$PKG"
-    fi
+update_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ Subs-Check 更新完成${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-detect_pm
+restart_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    docker compose restart
+    echo -e "${GREEN}✅ Subs-Check 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
 
-read -rp "请输入要解压的文件路径： " FILE
+view_logs() {
+    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
+    docker logs -f subs-check
+}
 
-if [[ ! -f "$FILE" ]]; then
-    echo -e "${RED}文件不存在！退出${RESET}"
-    exit 1
-fi
+check_status() {
+    docker ps | grep subs-check
+    read -p "按回车返回菜单..."
+}
 
-read -rp "请输入解压到的目标目录（默认当前目录）： " DEST
-DEST=${DEST:-$(pwd)}
+uninstall_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ Subs-Check 已彻底卸载（含数据）${RESET}"
+    read -p "按回车返回菜单..."
+}
 
-mkdir -p "$DEST"
-
-FILENAME=$(basename "$FILE")
-LOWER_NAME=$(echo "$FILENAME" | tr '[:upper:]' '[:lower:]')
-
-echo -e "${BLUE}正在识别文件类型...${RESET}"
-
-case "$LOWER_NAME" in
-
-    *.zip)
-        install_pkg unzip
-        echo -e "${GREEN}正在解压 ZIP 文件...${RESET}"
-        unzip -o "$FILE" -d "$DEST"
-        ;;
-
-    *.tar)
-        echo -e "${GREEN}正在解压 TAR 文件...${RESET}"
-        tar -xvf "$FILE" -C "$DEST"
-        ;;
-
-    *.tar.gz|*.tgz)
-        echo -e "${GREEN}正在解压 TAR.GZ 文件...${RESET}"
-        tar -xvzf "$FILE" -C "$DEST"
-        ;;
-
-    *.tar.bz2)
-        echo -e "${GREEN}正在解压 TAR.BZ2 文件...${RESET}"
-        tar -xvjf "$FILE" -C "$DEST"
-        ;;
-
-    *.tar.xz)
-        echo -e "${GREEN}正在解压 TAR.XZ 文件...${RESET}"
-        tar -xvJf "$FILE" -C "$DEST"
-        ;;
-
-    *.rar)
-        install_pkg unrar
-        echo -e "${GREEN}正在解压 RAR 文件...${RESET}"
-        unrar x -o+ "$FILE" "$DEST"
-        ;;
-
-    *.7z)
-        install_pkg p7zip
-        install_pkg p7zip-full 2>/dev/null || true
-        echo -e "${GREEN}正在解压 7Z 文件...${RESET}"
-        7z x "$FILE" -o"$DEST" -y
-        ;;
-
-    *)
-        echo -e "${RED}❌ 不支持的压缩格式: $FILENAME${RESET}"
-        exit 1
-        ;;
-esac
-
-echo -e "${GREEN}✅ 解压完成！文件已放到: $DEST${RESET}"
+# ==============================
+# 启动菜单
+# ==============================
+menu

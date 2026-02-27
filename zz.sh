@@ -1,117 +1,146 @@
 #!/bin/bash
-# ==========================================
-# VPS 多格式压缩工具（强制输入目录）
-# ==========================================
+# ========================================
+# Apprise 一键管理脚本
+# ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
-BLUE="\033[36m"
 RESET="\033[0m"
 
-DEFAULT_SAVE_DIR="$(pwd)"
+APP_NAME="apprise"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-echo -e "${BLUE}============================${RESET}"
-echo -e "${GREEN}      VPS 压缩工具${RESET}"
-echo -e "${BLUE}============================${RESET}"
+# ==============================
+# 基础检测
+# ==============================
 
-# =============================
-# 选择格式
-# =============================
-echo -e "${GREEN}1) tar.gz (推荐)${RESET}"
-echo -e "${GREEN}2) tar.xz (高压缩)${RESET}"
-echo -e "${GREEN}3) tar.bz2${RESET}"
-echo -e "${GREEN}4) zip${RESET}"
-echo -e "${GREEN}5) 7z${RESET}"
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
 
-read -p $'\033[32m请选择压缩格式: \033[0m' format_choice
-
-# =============================
-# 必须输入压缩目录
-# =============================
-read -p "请输入要压缩的目录或文件路径: " source_dir
-
-if [ -z "$source_dir" ]; then
-    echo -e "${RED}❌ 必须输入压缩目录${RESET}"
-    exit 1
-fi
-
-if [ ! -e "$source_dir" ]; then
-    echo -e "${RED}❌ 目录不存在${RESET}"
-    exit 1
-fi
-
-# =============================
-# 保存目录（可默认）
-# =============================
-read -p "请输入压缩文件保存目录(默认 当前目录): " save_dir
-save_dir=${save_dir:-$DEFAULT_SAVE_DIR}
-mkdir -p "$save_dir"
-
-read -p "请输入输出文件名(不带后缀): " output_name
-read -p "压缩级别(1-9 默认6): " level
-read -p "排除目录(可留空): " exclude_path
-
-level=${level:-6}
-timestamp=$(date +%Y%m%d_%H%M%S)
-
-# =============================
-# 依赖检测
-# =============================
-check_cmd() {
-    if ! command -v "$1" &>/dev/null; then
-        echo -e "${YELLOW}安装 $1 ...${RESET}"
-        apt update && apt install -y "$1" 2>/dev/null || yum install -y "$1"
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
     fi
 }
 
-# =============================
-# 开始压缩
-# =============================
-case $format_choice in
-
-1)
-    check_cmd tar
-    archive="${save_dir}/${output_name}_${timestamp}.tar.gz"
-    if [ -n "$exclude_path" ]; then
-        tar --exclude="$exclude_path" -czvf "$archive" "$source_dir"
-    else
-        tar -czvf "$archive" "$source_dir"
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
     fi
-    ;;
+}
 
-2)
-    check_cmd tar
-    archive="${save_dir}/${output_name}_${timestamp}.tar.xz"
-    tar -I "xz -$level" -cvf "$archive" "$source_dir"
-    ;;
+# ==============================
+# 菜单
+# ==============================
 
-3)
-    check_cmd tar
-    archive="${save_dir}/${output_name}_${timestamp}.tar.bz2"
-    tar -I "bzip2 -$level" -cvf "$archive" "$source_dir"
-    ;;
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== Apprise 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-4)
-    check_cmd zip
-    archive="${save_dir}/${output_name}_${timestamp}.zip"
-    cd "$(dirname "$source_dir")"
-    zip -r -"$level" "$archive" "$(basename "$source_dir")"
-    ;;
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *)
+                echo -e "${RED}无效选择${RESET}"
+                sleep 1
+                continue
+                ;;
+        esac
+    done
+}
 
-5)
-    check_cmd 7z
-    archive="${save_dir}/${output_name}_${timestamp}.7z"
-    7z a -mx="$level" "$archive" "$source_dir"
-    ;;
+# ==============================
+# 功能函数
+# ==============================
 
-*)
-    echo -e "${RED}❌ 无效选择${RESET}"
-    exit 1
-    ;;
+install_app() {
+    check_docker
 
-esac
+    mkdir -p "$APP_DIR"
 
-echo
-echo -e "${GREEN}✅ 压缩完成：${archive}${RESET}"
-echo -e "${BLUE}文件大小：$(du -sh "$archive" | awk '{print $1}')${RESET}"
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
+
+    read -p "请输入访问端口 [默认:8000]: " input_port
+    PORT=${input_port:-8000}
+    check_port "$PORT" || return
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  apprise:
+    container_name: apprise
+    image: caronc/apprise:latest
+    ports:
+      - "127.0.0.1:${PORT}:8000"
+    restart: always
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    echo
+    echo -e "${GREEN}✅ Apprise 已启动${RESET}"
+    echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:${PORT}${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ Apprise 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    docker compose restart
+    echo -e "${GREEN}✅ Apprise 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
+    docker logs -f apprise
+}
+
+check_status() {
+    docker ps | grep apprise
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    docker compose down
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ Apprise 已彻底卸载${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+# ==============================
+# 启动菜单
+# ==============================
+menu

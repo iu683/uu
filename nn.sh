@@ -1,6 +1,6 @@
 #!/bin/bash
 # ===============================
-# ACME Pro 证书申请（Let's Encrypt + IP 支持）
+# ACME Pro 证书申请（Let's Encrypt ）
 # ===============================
 export LANG=en_US.UTF-8
 
@@ -63,8 +63,9 @@ start_web(){
     [ ! -z "$WEB_STOP" ] && systemctl start $WEB_STOP
 }
 
+
 # ===============================
-# 安装证书
+# 安装证书并自动重载 Nginx（如果存在）
 # ===============================
 install_cert(){
     domain=$1
@@ -74,14 +75,18 @@ install_cert(){
         --fullchain-file $SSL_DIR/$domain/cert.crt
     green "证书安装完成"
     green "路径: $SSL_DIR/$domain/"
-    green "如需生效请手动重载 Web 服务"
+    
+    # 自动重载 nginx（存在就重载，没安装就跳过）
+    if command -v nginx >/dev/null 2>&1; then
+        systemctl is-active nginx >/dev/null 2>&1 && systemctl reload nginx && green "Nginx 已自动重载"
+    fi
 }
 
 # ===============================
-# 80 端口模式申请证书（域名或 IP）
+# 80 端口模式申请证书
 # ===============================
 standalone_issue(){
-    read -p "请输入域名或IP: " domain
+    read -p "请输入域名: " domain
     stop_web
     $ACME_HOME/acme.sh --issue -d $domain --standalone -k ec-256 --server https://acme-v02.api.letsencrypt.org/directory
     [ $? -eq 0 ] && install_cert $domain || red "证书申请失败"
@@ -120,12 +125,18 @@ dns_issue(){
     [ $? -eq 0 ] && install_cert $domain || red "证书申请失败"
 }
 
+
 # ===============================
-# 续期
+# 续期所有证书并自动重载 Nginx（如果存在）
 # ===============================
 renew_all(){
     $ACME_HOME/acme.sh --cron -f
     green "全部证书已尝试续期"
+
+    # 自动重载 nginx
+    if command -v nginx >/dev/null 2>&1; then
+        systemctl is-active nginx >/dev/null 2>&1 && systemctl reload nginx && green "Nginx 已自动重载"
+    fi
 }
 
 # ===============================
@@ -143,7 +154,7 @@ remove_cert(){
     for i in "${!certs[@]}"; do
         printf "%-4s %s\n" "$((i+1))" "${certs[$i]}"
     done
-    echo
+    
     read -p "请输入要删除的编号 (输入0返回): " num
     [ "$num" == "0" ] && return 0
     if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -lt 1 ] || [ "$num" -gt "${#certs[@]}" ]; then
@@ -161,7 +172,8 @@ remove_cert(){
 # ===============================
 uninstall_acme(){
     [ -f "$ACME_HOME/acme.sh" ] && $ACME_HOME/acme.sh --uninstall >/dev/null 2>&1
-    rm -rf $ACME_HOME $SSL_DIR
+    rm -rf $ACME_HOME
+    rm -rf etc/acme
     [ -f ~/.bashrc ] && sed -i '/acme.sh.env/d' ~/.bashrc
     [ -f ~/.profile ] && sed -i '/acme.sh.env/d' ~/.profile
     green "acme.sh 已彻底卸载"
@@ -208,7 +220,6 @@ do
     green "4. 查看已申请证书"
     green "5. 删除指定证书"
     green "6. 卸载acme.sh"
-    green "7. 直接用IP申请证书"
     green "0. 退出"
 
     read -p $'\033[32m请选择: \033[0m' num
@@ -219,7 +230,6 @@ do
         4) list_cert;;
         5) remove_cert;;
         6) uninstall_acme;;
-        7) install_dep; install_acme; standalone_issue;;
         0) exit;;
         *) echo -e "${RED}无效选项${RESET}";;
     esac

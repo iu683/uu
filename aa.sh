@@ -1,6 +1,6 @@
 #!/bin/bash
 # ===============================
-# ACME Pro 证书申请（Let's Encrypt + 支持IP）
+# ACME Pro 证书申请（Let's Encrypt ）
 # ===============================
 export LANG=en_US.UTF-8
 
@@ -81,7 +81,7 @@ install_cert(){
 # 80 端口模式申请证书
 # ===============================
 standalone_issue(){
-    read -p "请输入域名或IP: " domain
+    read -p "请输入域名: " domain
     stop_web
     $ACME_HOME/acme.sh --issue -d $domain --standalone -k ec-256 --server https://acme-v02.api.letsencrypt.org/directory
     [ $? -eq 0 ] && install_cert $domain || red "证书申请失败"
@@ -208,7 +208,6 @@ do
     green "4. 查看已申请证书"
     green "5. 删除指定证书"
     green "6. 卸载acme.sh"
-    green "7. 直接用IP申请证书"
     green "0. 退出"
 
     read -p $'\033[32m请选择: \033[0m' num
@@ -219,7 +218,6 @@ do
         4) list_cert;;
         5) remove_cert;;
         6) uninstall_acme;;
-        7) install_dep; install_acme; standalone_issue;;
         0) exit;;
         *) echo -e "${RED}无效选项${RESET}";;
     esac

@@ -1,153 +1,129 @@
 #!/bin/bash
-# ========================================
-# Pika 一键管理脚本（SQLite 版本）
-# ========================================
+# ===============================
+# ZeroClaw 高级管理菜单（支持自定义模型）
+# ===============================
+export LANG=en_US.UTF-8
 
+# 颜色定义
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
+BLUE="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="pika-sqlite"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.sqlite.yml"
-CONFIG_FILE="$APP_DIR/config.yaml"
+green() { echo -e "${GREEN}$1${RESET}"; }
+yellow() { echo -e "${YELLOW}$1${RESET}"; }
+red() { echo -e "${RED}$1${RESET}"; }
+blue() { echo -e "${BLUE}$1${RESET}"; }
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
+ZER0CLAW_DIR="/opt/ZeroClaw"
+CONFIG_FILE="$HOME/.zeroclaw/config.toml"
+
+# 检查命令是否存在
+command_exists() {
+    command -v "$1" &>/dev/null
 }
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
+# 安装 ZeroClaw + Rust + 系统依赖
+install_zeroclaw() {
+    if [ ! -d "$ZER0CLAW_DIR" ]; then
+        green "开始安装 ZeroClaw..."
+        git clone https://github.com/zeroclaw-labs/zeroclaw.git "$ZER0CLAW_DIR"
+    else
+        yellow "ZeroClaw 已经存在，跳过克隆。"
     fi
+
+    cd "$ZER0CLAW_DIR" || exit
+    green "执行 bootstrap 脚本安装 Rust 工具链和系统依赖..."
+    ./bootstrap.sh --install-rust --install-system-deps
+    green "ZeroClaw 安装完成！"
 }
 
-# 获取服务器IP
-SERVER_IP=$(hostname -I | awk '{print $1}')
+# 配置 Provider、API Key 和默认模型
+configure_provider() {
+    read -p "请输入你的 CLI API Key: " api_key
+    read -p "请输入 Provider URL（示例: custom:https://ai.eu.org/v1）: " provider
+    read -p "请输入默认模型（回车使用 gemini-3-flash-preview）: " model
+    model=${model:-gemini-3-flash-preview}   # 默认模型
 
-generate_config() {
-    read -p "请输入管理员账户名 [默认: admin]: " input_user
-    ADMIN_USER=${input_user:-admin}
-
-    read -p "请输入管理员密码 [默认: admin123]: " input_pass
-    ADMIN_PASS=${input_pass:-admin123}
-
-    read -p "请输入 JWT Secret [默认自动生成]: " input_jwt
-    JWT_SECRET=${input_jwt:-$(openssl rand -base64 32)}
-
+    mkdir -p "$(dirname "$CONFIG_FILE")"
     cat > "$CONFIG_FILE" <<EOF
-server:
-  port: ${PORT}
-auth:
-  admin_user: ${ADMIN_USER}
-  admin_pass: ${ADMIN_PASS}
-  jwt_secret: ${JWT_SECRET}
-database:
-  path: ./data/pika.sqlite
+api_key = "$api_key"
+default_provider = "$provider"
+default_model = "$model"
 EOF
-
-    echo -e "${GREEN}✅ config.yaml 文件已生成${RESET}"
+    green "配置完成，保存路径：$CONFIG_FILE"
 }
 
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== Pika (SQLite) 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
-install_app() {
-    check_docker
-    mkdir -p "$APP_DIR"
-    mkdir -p "$APP_DIR/data"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
+# 启动 ZeroClaw
+start_zeroclaw() {
+    if [ -f "$ZER0CLAW_DIR/start.sh" ]; then
+        if pgrep -f "ZeroClaw" >/dev/null 2>&1; then
+            yellow "ZeroClaw 已经在运行中"
+        else
+            green "启动 ZeroClaw..."
+            bash "$ZER0CLAW_DIR/start.sh"
+        fi
+    else
+        red "未找到启动脚本，请先安装 ZeroClaw。"
     fi
-
-    read -p "请输入访问端口 [默认:8080]: " input_port
-    PORT=${input_port:-8080}
-    check_port "$PORT" || return
-
-    # 下载 docker-compose 文件
-    curl -o "$COMPOSE_FILE" https://raw.githubusercontent.com/dushixiang/pika/main/docker-compose.sqlite.yml
-
-    # 生成配置文件
-    generate_config
-
-    cd "$APP_DIR" || exit
-    docker compose -f docker-compose.sqlite.yml up -d
-
-    echo -e "${GREEN}✅ Pika 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://${SERVER_IP}:${PORT}${RESET}"
-    echo -e "${YELLOW}🌐 账号号/密码: ${ADMIN_USER}/${ADMIN_PASS}${RESET}"
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
-    read -p "按回车返回菜单..."
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose -f docker-compose.sqlite.yml pull
-    docker compose -f docker-compose.sqlite.yml up -d
-    echo -e "${GREEN}✅ Pika 更新完成${RESET}"
-    read -p "按回车返回菜单..."
+# 停止 ZeroClaw
+stop_zeroclaw() {
+    if pgrep -f "ZeroClaw" >/dev/null 2>&1; then
+        pkill -f "ZeroClaw"
+        green "ZeroClaw 已停止。"
+    else
+        yellow "ZeroClaw 未运行。"
+    fi
 }
 
-restart_app() {
-    cd "$APP_DIR" || return
-    docker compose -f docker-compose.sqlite.yml restart
-    echo -e "${GREEN}✅ Pika 已重启${RESET}"
-    read -p "按回车返回菜单..."
+# 查看状态
+status_zeroclaw() {
+    if pgrep -f "ZeroClaw" >/dev/null 2>&1; then
+        green "ZeroClaw 正在运行中"
+    else
+        yellow "ZeroClaw 未运行"
+    fi
 }
 
-view_logs() {
-    cd "$APP_DIR" || return
-    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker compose -f docker-compose.sqlite.yml logs -f
+# 卸载 ZeroClaw（直接删除，无确认）
+uninstall_zeroclaw() {
+    if [ -d "$ZER0CLAW_DIR" ]; then
+        rm -rf "$ZER0CLAW_DIR"
+        green "ZeroClaw 已卸载！"
+    else
+        red "ZeroClaw 未安装。"
+    fi
 }
 
-check_status() {
-    cd "$APP_DIR" || return
-    docker compose -f docker-compose.sqlite.yml ps
-    read -p "按回车返回菜单..."
+# 菜单
+show_menu() {
+    clear
+    echo -e "${GREEN}======  ZeroClaw 管理菜单 ========${RESET}"
+    echo -e "${GREEN}[1] 安装 ZeroClaw（含Rust+系统依赖）${RESET}"
+    echo -e "${GREEN}[2] 配置 Provider、API Key 和默认模型${RESET}"
+    echo -e "${GREEN}[3] 启动 ZeroClaw${RESET}"
+    echo -e "${GREEN}[4] 停止 ZeroClaw${RESET}"
+    echo -e "${GREEN}[5] 查看状态${RESET}"
+    echo -e "${GREEN}[6] 卸载 ZeroClaw${RESET}"
+    echo -e "${GREEN}[0] 退出${RESET}"
+    read -r -p $'\033[32m请输入选项: \033[0m' choice
+    case "$choice" in
+        1) install_zeroclaw ;;
+        2) configure_provider ;;
+        3) start_zeroclaw ;;
+        4) stop_zeroclaw ;;
+        5) status_zeroclaw ;;
+        6) uninstall_zeroclaw ;;
+        0) exit 0 ;;
+        *) red "无效选项，请重新输入！" ;;
+    esac
+    read -p "按任意键返回菜单..." temp
 }
 
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose -f docker-compose.sqlite.yml down
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Pika 已卸载${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-menu
+# 主循环
+while true; do
+    show_menu
+done

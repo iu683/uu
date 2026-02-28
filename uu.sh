@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# ConvertX 一键管理脚本
+# Drawnix 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,10 +8,9 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="convertx"
+APP_NAME="drawnix"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-ENV_FILE="$APP_DIR/.env"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -34,7 +33,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== ConvertX 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Drawnix 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -67,36 +66,27 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:3000]: " input_port
-    PORT=${input_port:-3000}
+    read -p "请输入访问端口 [默认:7200]: " input_port
+    PORT=${input_port:-7200}
     check_port "$PORT" || return
-
-    JWT_SECRET=$(openssl rand -hex 32)
-
-    echo "JWT_SECRET=${JWT_SECRET}" > "$ENV_FILE"
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  convertx:
-    image: ghcr.io/c4illin/convertx:latest
-    container_name: convertx
-    restart: unless-stopped
+  drawnix:
+    image: pubuzhixing/drawnix:latest
+    container_name: drawnix
+    restart: always
     ports:
-      - "127.0.0.1:${PORT}:3000"
-    environment:
-      - JWT_SECRET=\${JWT_SECRET}
-      - NODE_ENV=production
-    volumes:
-      - ./data:/app/data
+      - "127.0.0.1:${PORT}:80"
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ ConvertX 已启动${RESET}"
+    echo -e "${GREEN}✅ Drawnix 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🔐 JWT_SECRET: ${JWT_SECRET}${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
     read -p "按回车返回菜单..."
 }
 
@@ -104,32 +94,31 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ ConvertX 更新完成${RESET}"
+    echo -e "${GREEN}✅ Drawnix 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart convertx
-    echo -e "${GREEN}✅ ConvertX 已重启${RESET}"
+    docker restart drawnix
+    echo -e "${GREEN}✅ Drawnix 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f convertx
+    docker logs -f drawnix
 }
 
 check_status() {
-    docker ps | grep convertx
+    docker ps | grep drawnix
     read -p "按回车返回菜单..."
 }
-
 
 uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ ConvertX ConvertX 已卸载${RESET}"
+    echo -e "${RED}✅ Drawnix 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

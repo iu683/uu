@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Pansou-Web 一键管理脚本
+# Karakeep 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,10 +8,12 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="pansou"
+APP_NAME="karakeep-app"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+ENV_FILE="$APP_DIR/.env"
 
+# 检查 Docker & Docker Compose
 check_docker() {
     if ! command -v docker &>/dev/null; then
         echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
@@ -23,6 +25,7 @@ check_docker() {
     fi
 }
 
+# 检查端口占用
 check_port() {
     if ss -tlnp | grep -q ":$1 "; then
         echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
@@ -30,10 +33,35 @@ check_port() {
     fi
 }
 
+# 生成自定义 .env 文件
+generate_env() {
+    read -p "输入 Karakeep 版本 [默认: release]: " input_version
+    KARAKEEP_VERSION=${input_version:-release}
+
+    read -p "输入 NEXTAUTH_SECRET [默认自动生成]: " input_nextauth
+    NEXTAUTH_SECRET=${input_nextauth:-$(openssl rand -base64 36)}
+
+    read -p "输入 MEILI_MASTER_KEY [默认自动生成]: " input_meili
+    MEILI_MASTER_KEY=${input_meili:-$(openssl rand -base64 36)}
+
+    read -p "输入 NEXTAUTH_URL [默认: http://localhost:$PORT]: " input_url
+    NEXTAUTH_URL=${input_url:-http://localhost:$PORT}
+
+    cat > "$ENV_FILE" <<EOF
+KARAKEEP_VERSION=$KARAKEEP_VERSION
+NEXTAUTH_SECRET=$NEXTAUTH_SECRET
+MEILI_MASTER_KEY=$MEILI_MASTER_KEY
+NEXTAUTH_URL=$NEXTAUTH_URL
+EOF
+
+    echo -e "${GREEN}✅ .env 文件已生成${RESET}"
+}
+
+# 菜单主函数
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Pansou 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Karakeep 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -56,6 +84,7 @@ menu() {
     done
 }
 
+# 安装/启动
 install_app() {
     check_docker
     mkdir -p "$APP_DIR"
@@ -66,88 +95,65 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:805]: " input_port
-    PORT=${input_port:-805}
+    read -p "请输入访问端口 [默认:3000]: " input_port
+    PORT=${input_port:-3000}
     check_port "$PORT" || return
 
-    cat > "$COMPOSE_FILE" <<EOF
+    # 下载 docker-compose.yml
+    wget -O "$COMPOSE_FILE" https://raw.githubusercontent.com/karakeep-app/karakeep/main/docker/docker-compose.yml
 
-services:
-  pansou:
-    image: ghcr.io/fish2018/pansou-web:latest
-    container_name: pansou-app
-    labels:
-      - "autoheal=true"
-    ports:
-      - "${PORT}:80"
-    environment:
-      - DOMAIN=localhost
-      - PANSOU_PORT=8888
-      - PANSOU_HOST=127.0.0.1
-      - CACHE_PATH=/app/data/cache
-      - LOG_PATH=/app/data/logs
-      - HEALTH_CHECK_INTERVAL=30
-      - HEALTH_CHECK_TIMEOUT=10
-      - HEALTH_CHECK_RETRIES=3
-    volumes:
-      - pansou-data:/app/data
-    restart: unless-stopped
-
-  autoheal:
-    image: willfarrell/autoheal:latest
-    container_name: pansou-autoheal
-    restart: always
-    environment:
-      - AUTOHEAL_CONTAINER_LABEL=autoheal
-      - AUTOHEAL_INTERVAL=30
-      - AUTOHEAL_START_PERIOD=60
-      - AUTOHEAL_DEFAULT_STOP_TIMEOUT=10
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-
-volumes:
-  pansou-data:
-    driver: local
-EOF
+    # 生成 .env 文件
+    generate_env
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ Pansou-Web 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}✅ Karakeep 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: ${NEXTAUTH_URL}${RESET}"
+    echo -e "${GREEN}✅ NEXTAUTH_SECRET: $NEXTAUTH_SECRET${RESET}"
+    echo -e "${GREEN}✅ MEILI_MASTER_KEY:$MEILI_MASTER_KEY${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
     read -p "按回车返回菜单..."
 }
 
+# 更新
 update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ 更新完成${RESET}"
+    echo -e "${GREEN}✅ Karakeep 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
+# 重启
 restart_app() {
-    docker restart pansou-app
-    echo -e "${GREEN}✅ 已重启${RESET}"
+    cd "$APP_DIR" || return
+    docker compose restart
+    echo -e "${GREEN}✅ Karakeep 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
+# 查看日志
 view_logs() {
+    cd "$APP_DIR" || return
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f pansou-app
+    docker compose logs -f
 }
 
+# 查看状态
 check_status() {
-    docker ps | grep pansou-app
+    cd "$APP_DIR" || return
+    docker compose ps
     read -p "按回车返回菜单..."
 }
 
+# 卸载
 uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Pansou-Web 已卸载${RESET}"
+    echo -e "${RED}✅ Karakeep 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

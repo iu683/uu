@@ -1,160 +1,120 @@
 #!/bin/bash
-# ========================================
-# Karakeep 一键管理脚本
-# ========================================
+# ==========================================
+# CFServer 管理脚本（绿色菜单版）
+# ==========================================
+
+set -e
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="karakeep-app"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-ENV_FILE="$APP_DIR/.env"
+green(){ echo -e "${GREEN}$1${RESET}"; }
+yellow(){ echo -e "${YELLOW}$1${RESET}"; }
+red(){ echo -e "${RED}$1${RESET}"; }
 
-# 检查 Docker & Docker Compose
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
+CF_DIR="/opt/cfserver"
+SCRIPT_NAME="cfserver.sh"
+
+# 获取服务器IP
+SERVER_IP=$(hostname -I | awk '{print $1}')
+
+install_cf() {
+    green "正在下载并安装 CFServer..."
+    curl -sS -O https://raw.githubusercontent.com/woniu336/open_shell/main/cfserver.sh
+    chmod +x ${SCRIPT_NAME}
+    ./${SCRIPT_NAME}
+    green "安装完成！"
 }
 
-# 检查端口占用
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
+uninstall_cf() {
+    yellow "停止 CFServer 服务..."
+    pkill dns-server 2>/dev/null || echo "服务未运行"
+
+    yellow "删除程序文件 ${CF_DIR} ..."
+    if [ -d "${CF_DIR}" ]; then
+        rm -rf "${CF_DIR}"
+        green "程序文件已删除"
+    else
+        red "目录 ${CF_DIR} 不存在"
     fi
+
+    yellow "删除安装脚本 ${SCRIPT_NAME} ..."
+    if [ -f "./${SCRIPT_NAME}" ]; then
+        rm -f "./${SCRIPT_NAME}"
+        green "安装脚本已删除"
+    else
+        red "安装脚本不存在"
+    fi
+
+    green "✅ CFServer 已卸载完成"
 }
 
-# 生成自定义 .env 文件
-generate_env() {
-    read -p "输入 Karakeep 版本 [默认: release]: " input_version
-    KARAKEEP_VERSION=${input_version:-release}
+reset_token() {
+    if [ ! -d "${CF_DIR}" ]; then
+        red "CFServer 未安装！"
+        return
+    fi
+    cd "${CF_DIR}"
 
-    read -p "输入 NEXTAUTH_SECRET [默认自动生成]: " input_nextauth
-    NEXTAUTH_SECRET=${input_nextauth:-$(openssl rand -base64 36)}
+    # 提示用户输入自定义 token
+    read -p "$(echo -e ${GREEN}请输入新的访问令牌（token）: ${RESET})" CUSTOM_TOKEN
 
-    read -p "输入 MEILI_MASTER_KEY [默认自动生成]: " input_meili
-    MEILI_MASTER_KEY=${input_meili:-$(openssl rand -base64 36)}
+    # 检查输入是否为空
+    if [ -z "$CUSTOM_TOKEN" ]; then
+        red "未输入 token，操作取消"
+        return
+    fi
 
-    read -p "输入 NEXTAUTH_URL [默认: http://localhost:$PORT]: " input_url
-    NEXTAUTH_URL=${input_url:-http://localhost:$PORT}
-
-    cat > "$ENV_FILE" <<EOF
-KARAKEEP_VERSION=$KARAKEEP_VERSION
-NEXTAUTH_SECRET=$NEXTAUTH_SECRET
-MEILI_MASTER_KEY=$MEILI_MASTER_KEY
-NEXTAUTH_URL=$NEXTAUTH_URL
-EOF
-
-    echo -e "${GREEN}✅ .env 文件已生成${RESET}"
+    # 执行令牌重置
+    ./dns-server -reset-token "$CUSTOM_TOKEN"
+    green "✅ 令牌已重置为：$CUSTOM_TOKEN"
 }
 
-# 菜单主函数
+start_service() {
+     cd /opt/cfserver && pkill dns-server && nohup ./dns-server > /dev/null 2>&1 &
+    green "✅ 服务启动"
+}
+
+stop_service() {
+    pkill dns-server 2>/dev/null && green "✅ 服务已停止" || red "服务未运行"
+}
+
+show_web() {
+    IP=$(get_ip)
+    green "🌐 Web 管理地址："
+    green "   http://${SERVER_IP}:8081"
+}
+
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Karakeep 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
+        echo ""
+        echo -e "${GREEN}==== CFServer 管理菜单 ====${RESET}"
+        echo -e "${GREEN}1) 安装${RESET}"
+        echo -e "${GREEN}2) 卸载${RESET}"
+        echo -e "${GREEN}3) 重置访问令牌${RESET}"
+        echo -e "${GREEN}4) 启动服务${RESET}"
+        echo -e "${GREEN}5) 停止服务${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        read -p "$(echo -e ${GREEN}请选择操作: ${RESET})" choice
+        choice=$(echo "$choice" | xargs)  # 去掉空格
 
         case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+            1) install_cf ;;
+            2) uninstall_cf ;;
+            3) reset_token ;;
+            4) start_service ;;
+            5) stop_service ;;
+            0) 
+                exit 0 ;;
+            *) red "无效选项，请重新输入" ;;
         esac
+
+        echo -e "${YELLOW}按回车继续...${RESET}"
+        read
     done
-}
-
-# 安装/启动
-install_app() {
-    check_docker
-    mkdir -p "$APP_DIR"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-
-    read -p "请输入访问端口 [默认:3000]: " input_port
-    PORT=${input_port:-3000}
-    check_port "$PORT" || return
-
-    # 下载 docker-compose.yml
-    wget -O "$COMPOSE_FILE" https://raw.githubusercontent.com/karakeep-app/karakeep/main/docker/docker-compose.yml
-
-    # 生成 .env 文件
-    generate_env
-
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    echo
-    echo -e "${GREEN}✅ Karakeep 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: ${NEXTAUTH_URL}${RESET}"
-    echo -e "${GREEN}✅ NEXTAUTH_SECRET: $NEXTAUTH_SECRET${RESET}"
-    echo -e "${GREEN}✅ MEILI_MASTER_KEY:$MEILI_MASTER_KEY${RESET}"
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-# 更新
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ Karakeep 更新完成${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-# 重启
-restart_app() {
-    cd "$APP_DIR" || return
-    docker compose restart
-    echo -e "${GREEN}✅ Karakeep 已重启${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-# 查看日志
-view_logs() {
-    cd "$APP_DIR" || return
-    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker compose logs -f
-}
-
-# 查看状态
-check_status() {
-    cd "$APP_DIR" || return
-    docker compose ps
-    read -p "按回车返回菜单..."
-}
-
-# 卸载
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Karakeep 已卸载${RESET}"
-    read -p "按回车返回菜单..."
 }
 
 menu

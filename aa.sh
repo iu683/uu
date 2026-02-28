@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Lucky v2 一键管理脚本
+# 思源笔记 Docker 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,9 +8,10 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="lucky"
+APP_NAME="siyuan"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+ENV_FILE="$APP_DIR/.env"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -23,10 +24,17 @@ check_docker() {
     fi
 }
 
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
+
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Lucky 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== 思源笔记 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -51,7 +59,7 @@ menu() {
 
 install_app() {
     check_docker
-    mkdir -p "$APP_DIR/conf"
+    mkdir -p "$APP_DIR/workspace"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -59,24 +67,43 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
+    read -p "请输入访问端口 [默认:6806]: " input_port
+    PORT=${input_port:-6806}
+    check_port "$PORT" || return
+
+    TIMEZONE=$(timedatectl show -p Timezone --value 2>/dev/null)
+    [ -z "$TIMEZONE" ] && TIMEZONE="Asia/Tokyo"
+
+    AUTH_CODE=$(openssl rand -hex 8)
+
+    echo "AuthCode=${AUTH_CODE}" > "$ENV_FILE"
+    echo "YOUR_TIME_ZONE=${TIMEZONE}" >> "$ENV_FILE"
+
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  lucky:
-    image: gdy666/lucky:v2
-    container_name: lucky
+  main:
+    image: b3log/siyuan
+    container_name: siyuan
+    command: ['--workspace=/siyuan/workspace/', '--accessAuthCode=\${AuthCode}']
+    ports:
+      - "127.0.0.1:${PORT}:6806"
     volumes:
-      - ./conf:/app/conf
-      - /var/run/docker.sock:/var/run/docker.sock
-    network_mode: host
-    restart: always
+      - ./workspace:/siyuan/workspace
+    restart: unless-stopped
+    environment:
+      - TZ=\${YOUR_TIME_ZONE}
+      - PUID=1000
+      - PGID=1000
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ Lucky 已启动${RESET}"
-    echo -e "${YELLOW}使用 host 网络模式，请查看日志确认端口${RESET}"
+    echo -e "${GREEN}✅ 思源笔记 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${YELLOW}🔐 访问认证码: ${AUTH_CODE}${RESET}"
+
     read -p "按回车返回菜单..."
 }
 
@@ -84,23 +111,23 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Lucky 更新完成${RESET}"
+    echo -e "${GREEN}✅ 思源笔记 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart lucky
-    echo -e "${GREEN}✅ Lucky 已重启${RESET}"
+    docker restart siyuan
+    echo -e "${GREEN}✅ 思源笔记 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f lucky
+    docker logs -f siyuan
 }
 
 check_status() {
-    docker ps | grep lucky
+    docker ps | grep siyuan
     read -p "按回车返回菜单..."
 }
 
@@ -108,7 +135,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Lucky 已卸载${RESET}"
+    echo -e "${RED}✅ 思源笔记 已卸载（数据已删除）${RESET}"
     read -p "按回车返回菜单..."
 }
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# 思源笔记 Docker 一键管理脚本 Pro
+# CFGuard 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,10 +8,9 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="siyuan"
+APP_NAME="cfguard"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-ENV_FILE="$APP_DIR/.env"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -31,11 +30,10 @@ check_port() {
     fi
 }
 
-
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== 思源笔记 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== CFGuard 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -60,7 +58,7 @@ menu() {
 
 install_app() {
     check_docker
-    mkdir -p "$APP_DIR/workspace"
+    mkdir -p "$APP_DIR"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -68,82 +66,57 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:6806]: " input_port
-    PORT=${input_port:-6806}
+    read -p "请输入访问端口 [默认:8081]: " input_port
+    PORT=${input_port:-8081}
     check_port "$PORT" || return
-
-    TIMEZONE=$(get_timezone)
-
-    # 认证码设置
-    read -p "请输入访问认证码 [回车自动生成]: " input_auth
-    if [ -z "$input_auth" ]; then
-        AUTH_CODE=$(openssl rand -hex 8)
-        echo -e "${YELLOW}未输入认证码，已自动生成${RESET}"
-    else
-        AUTH_CODE="$input_auth"
-    fi
-
-    echo "AuthCode=${AUTH_CODE}" > "$ENV_FILE"
-    echo "YOUR_TIME_ZONE=${TIMEZONE}" >> "$ENV_FILE"
-    echo "PORT=${PORT}" >> "$ENV_FILE"
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  main:
-    image: b3log/siyuan
-    container_name: siyuan
-    command: ['--workspace=/siyuan/workspace/', '--accessAuthCode=\${AuthCode}']
+  cfguard:
+    image: ghcr.io/agczsz/cfguard:latest
     ports:
-      - "127.0.0.1:\${PORT}:6806"
-    volumes:
-      - ./workspace:/siyuan/workspace
-    restart: unless-stopped
-    environment:
-      - PUID=1000
-      - PGID=1000
+      - "127.0.0.1:${PORT}:8081"
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ 思源笔记 已启动${RESET}"
+    echo -e "${GREEN}✅ CFGuard 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🔐 访问认证码: ${AUTH_CODE}${RESET}"
     echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
-
     read -p "按回车返回菜单..."
 }
 
 update_app() {
-    cd "$APP_DIR" || return
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ 更新完成${RESET}"
+    echo -e "${GREEN}✅ CFGuard 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart siyuan
-    echo -e "${GREEN}✅ 已重启${RESET}"
+    docker restart cfguard
+    echo -e "${GREEN}✅ CFGuard 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f siyuan
+    docker logs -f cfguard
 }
 
 check_status() {
-    docker ps | grep siyuan
+    docker ps | grep cfguard
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
-    cd "$APP_DIR" 2>/dev/null || return
+    cd "$APP_DIR" || return
     docker compose down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已卸载（数据已删除）${RESET}"
+    echo -e "${RED}✅ CFGuard 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

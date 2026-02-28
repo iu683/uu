@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Pansou 一键管理脚本
+# 思源笔记 Docker 一键管理脚本 Pro
 # ========================================
 
 GREEN="\033[32m"
@@ -8,9 +8,10 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="pansou"
+APP_NAME="siyuan"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+ENV_FILE="$APP_DIR/.env"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -30,10 +31,20 @@ check_port() {
     fi
 }
 
+get_timezone() {
+    if command -v timedatectl &>/dev/null; then
+        timedatectl show -p Timezone --value 2>/dev/null
+    elif [[ -f /etc/timezone ]]; then
+        cat /etc/timezone
+    else
+        echo "Asia/Tokyo"
+    fi
+}
+
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Pansou 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== 思源笔记 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -58,7 +69,7 @@ menu() {
 
 install_app() {
     check_docker
-    mkdir -p "$APP_DIR"
+    mkdir -p "$APP_DIR/workspace"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -66,43 +77,56 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:8888]: " input_port
-    PORT=${input_port:-8888}
+    read -p "请输入访问端口 [默认:6806]: " input_port
+    PORT=${input_port:-6806}
     check_port "$PORT" || return
+
+    TIMEZONE=$(get_timezone)
+
+    # 认证码设置
+    read -p "请输入访问认证码 [留空自动生成]: " input_auth
+    if [ -z "$input_auth" ]; then
+        AUTH_CODE=$(openssl rand -hex 8)
+        echo -e "${YELLOW}未输入认证码，已自动生成${RESET}"
+    else
+        AUTH_CODE="$input_auth"
+    fi
+
+    echo "AuthCode=${AUTH_CODE}" > "$ENV_FILE"
+    echo "YOUR_TIME_ZONE=${TIMEZONE}" >> "$ENV_FILE"
+    echo "PORT=${PORT}" >> "$ENV_FILE"
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  pansou:
-    image: ghcr.io/fish2018/pansou:latest
-    container_name: pansou
-    restart: unless-stopped
+  main:
+    image: b3log/siyuan
+    container_name: siyuan
+    command: ['--workspace=/siyuan/workspace/', '--accessAuthCode=\${AuthCode}']
     ports:
-      - "127.0.0.1:${PORT}:8888"
-    environment:
-      - PORT=8888
-      - CACHE_ENABLED=true
-      - CACHE_PATH=/app/cache
-      - CACHE_MAX_SIZE=100
-      - CACHE_TTL=60
+      - "127.0.0.1:\${PORT}:6806"
     volumes:
-      - pansou-cache:/app/cache
-
-volumes:
-  pansou-cache:
-    name: pansou-cache
+      - ./workspace:/siyuan/workspace
+    restart: unless-stopped
+    environment:
+      - TZ=\${YOUR_TIME_ZONE}
+      - PUID=1000
+      - PGID=1000
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ Pansou 已启动${RESET}"
+    echo -e "${GREEN}✅ 思源笔记 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${YELLOW}🔐 访问认证码: ${AUTH_CODE}${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+
     read -p "按回车返回菜单..."
 }
 
 update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
     echo -e "${GREEN}✅ 更新完成${RESET}"
@@ -110,26 +134,26 @@ update_app() {
 }
 
 restart_app() {
-    docker restart pansou
+    docker restart siyuan
     echo -e "${GREEN}✅ 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f pansou
+    docker logs -f siyuan
 }
 
 check_status() {
-    docker ps | grep pansou
+    docker ps | grep siyuan
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
-    cd "$APP_DIR" || return
+    cd "$APP_DIR" 2>/dev/null || return
     docker compose down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Pansou 已卸载${RESET}"
+    echo -e "${RED}✅ 已卸载（数据已删除）${RESET}"
     read -p "按回车返回菜单..."
 }
 

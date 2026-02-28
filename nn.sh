@@ -1,268 +1,146 @@
 #!/bin/bash
+# ========================================
+# Excalidraw 一键管理脚本
+# ========================================
 
-# ----------------------
-# 定义颜色
-# ----------------------
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-# ----------------------
-# 通用安装函数
-# ----------------------
-install_tool() {
-    local pkg="$1"
-    echo -e "${GREEN}正在安装 $pkg ...${RESET}"
-    if command -v apt &>/dev/null; then
-        apt update && apt install -y "$pkg"
-    elif command -v yum &>/dev/null; then
-        yum install -y "$pkg"
-    elif command -v apk &>/dev/null; then
-        apk add --no-cache "$pkg"
-    else
-        echo -e "${RED}不支持的包管理器${RESET}"
-        return 1
-    fi
-    echo -e "${GREEN}$pkg 安装完成${RESET}"
-}
+APP_NAME="excalidraw"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-# ----------------------
-# 系统检测函数
-# ----------------------
-detect_os() {
-    if [ -f /etc/os-release ]; then
-        os_name=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
-    elif command -v lsb_release &>/dev/null; then
-        os_name=$(lsb_release -i | cut -f2 | tr -d '"')
-    else
-        echo -e "${RED}无法确定操作系统类型${RESET}"
+# ==============================
+# 基础检测
+# ==============================
+
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
+
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
         exit 1
     fi
 }
 
-# ----------------------
-# 系统安装函数
-# ----------------------
-install_sys_tool() {
-    local tool="$1"
-    echo -e "${GREEN}正在安装 $tool ...${RESET}"
-
-    case "$os_name" in
-        centos|rocky)
-            yum install epel-release -y
-            yum install -y "$tool"
-            ;;
-
-        amzn)
-            amazon-linux-extras install epel -y
-            yum install -y "$tool"
-            ;;
-
-        debian|ubuntu)
-            if [[ "$tool" == "mtr" ]]; then
-                apt update && apt install -y mtr-tiny
-            else
-                apt update && apt install -y "$tool"
-            fi
-            ;;
-
-        alpine)
-            apk add --no-cache "$tool"
-            ;;
-
-        *)
-            install_tool "$tool"
-            ;;
-    esac
-
-    echo -e "${GREEN}$tool 安装完成${RESET}"
-}
-
-
-# ----------------------
-# 在 / 目录运行工具
-# ----------------------
-run_in_root() {
-    cd / || return
-    "$@"
-    cd ~ || return
-}
-
-# ----------------------
-# 显示帮助或运行工具
-# ----------------------
-run_tool() {
-    local tool="$1"
-    local mode="$2" # help / run
-    case "$mode" in
-        help)
-            echo -e "${GREEN}显示 $tool 帮助信息:${RESET}"
-            "$tool" --help
-            ;;
-        run)
-            echo -e "${GREEN}运行 $tool ...${RESET}"
-            "$tool"
-            ;;
-        *)
-            echo -e "${RED}未知模式: $mode${RESET}"
-            ;;
-    esac
-}
-
-# ----------------------
-# 判断工具是否已安装，返回状态
-# ----------------------
-check_installed() {
-    local tool="$1"
-    if command -v "$tool" &>/dev/null; then
-        return 0
-    else
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
         return 1
     fi
 }
 
-# ----------------------
-# 工具列表及支持系统
-# ----------------------
-declare -A tools
-tools=(
-    [1]="curl:curl下载工具:help:"
-    [2]="wget:wget下载工具:help:"
-    [3]="sudo:sudo 超级管理权限:help:"
-    [4]="socat:socat 通信连接:help:"
-    [5]="htop:htop 系统监控:run:"
-    [6]="iftop:iftop 网络流量监控:run:"
-    [7]="unzip:unzip 压缩解压:help:"
-    [8]="tar:tar 压缩解压:help:"
-    [9]="tmux:tmux 多路后台:run:"
-    [10]="ffmpeg:ffmpeg 视频编码直播推流:help:"
-    [11]="btop:btop 监控:run:"
-    [12]="ranger:ranger 文件管理:run_root:"
-    [13]="ncdu:ncdu 磁盘占用查看:run_root:"
-    [14]="fzf:fzf 全局搜索:run_root:"
-    [15]="vim:vim 文本编辑器:help_root:"
-    [16]="nano:nano 文本编辑器:help_root:"
-    [17]="git:git 版本控制:help_root:"
-    [20]="iperf3:iperf3 网络工具:sys:"
-    [21]="mtr:mtr 网络工具:sys:"
-)
+# ==============================
+# 菜单
+# ==============================
 
-# ----------------------
-# 显示菜单函数（菜单字体绿色，状态彩色）
-# ----------------------
-show_menu() {
-    clear
-    echo -e "${GREEN}========== 工具安装菜单 ===========${RESET}"
-    echo -e "${GREEN}系统: $os_name${RESET}"
-
-    for i in $(seq 1 21); do
-        [[ -z "${tools[$i]}" ]] && continue
-
-        IFS=":" read -r cmd name mode support_os <<< "${tools[$i]}"
-
-        if check_installed "$cmd"; then
-            status="${GREEN}✔ 已安装${RESET}"
-        else
-            status="${RED}✖ 未安装${RESET}"
-        fi
-
-        printf "${GREEN} [%02d] %-30s${RESET} %b\n" "$i" "$name" "$status"
-    done
-
-    echo -e "${GREEN} [99] 卸载已安装工具${RESET}"
-    echo -e "${GREEN} [ 0] 退出${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
-}
-
-
-# ----------------------
-# 卸载函数（支持多选）
-# ----------------------
-uninstall_tool() {
-    installed_tools=()
-    for i in $(seq 1 21); do
-        IFS=":" read -r tool mode support_os <<< "${tools[$i]}"
-        if check_installed "$tool"; then
-            installed_tools+=("$tool")
-        fi
-    done
-
-    if [ ${#installed_tools[@]} -eq 0 ]; then
-        echo -e "${RED}没有已安装的工具可卸载${RESET}"
-        return
-    fi
-
-    echo -e "${YELLOW}已安装工具:${RESET}"
-    for idx in "${!installed_tools[@]}"; do
-        echo -e "${GREEN}$((idx+1))) ${installed_tools[$idx]}${RESET}"
-    done
-
-    read -rp $'\033[32m请输入要卸载的编号（空格或逗号分隔可多选）: \033[0m' choices
-    # 替换逗号为空格
-    choices=${choices//,/ }
-    for choice in $choices; do
-        if [[ "$choice" -ge 1 && "$choice" -le ${#installed_tools[@]} ]]; then
-            tool_to_remove="${installed_tools[$((choice-1))]}"
-            echo -e "${GREEN}正在卸载 $tool_to_remove ...${RESET}"
-            if command -v apt &>/dev/null; then
-                apt remove -y "$tool_to_remove"
-            elif command -v yum &>/dev/null; then
-                yum remove -y "$tool_to_remove"
-            elif command -v apk &>/dev/null; then
-                apk del "$tool_to_remove"
-            else
-                echo -e "${RED}不支持的包管理器${RESET}"
-            fi
-            echo -e "${GREEN}$tool_to_remove 卸载完成${RESET}"
-        else
-            echo -e "${RED}无效选择: $choice${RESET}"
-        fi
-    done
-}
-
-# ----------------------
-# 主程序
-# ----------------------
-detect_os
-
-while true; do
-    show_menu
-    read -rp $'\033[32m请输入要操作的编号: \033[0m' sub_choice
-
-    # 验证输入是否为纯数字
-    if ! [[ "$sub_choice" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}无效输入，请输入数字${RESET}"
-        read -rp "按回车返回菜单..." _
-        continue
-    fi
-
-    [[ "$sub_choice" == "0" || "$sub_choice" == "00" ]] && break
-
-    if [[ "$sub_choice" == "99" ]]; then
-        uninstall_tool
-        echo -e "${GREEN}按回车返回菜单...${RESET}"
-        read -r
-        continue
-    fi
-
-    if [[ -n "${tools[$sub_choice]}" ]]; then
-        IFS=":" read -r tool mode support_os <<< "${tools[$sub_choice]}"
+menu() {
+    while true; do
         clear
-        case "$mode" in
-            help) install_tool "$tool" && run_tool "$tool" help ;;
-            run) install_tool "$tool" && run_tool "$tool" run ;;
-            run_root) install_tool "$tool" && run_in_root "$tool" ;;
-            help_root) install_tool "$tool" && run_in_root "$tool" -h ;;
-            sys) install_sys_tool "$tool" ;;
-            *) echo -e "${RED}未知模式: $mode${RESET}" ;;
+        echo -e "${GREEN}=== Excalidraw 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *)
+                echo -e "${RED}无效选择${RESET}"
+                sleep 1
+                continue
+                ;;
         esac
-        cd ~
-        echo -e "${GREEN}按回车返回菜单...${RESET}"
-        read -r
-    else
-        echo -e "${RED}无效选择: $sub_choice${RESET}"
-        echo -e "${GREEN}按回车返回菜单...${RESET}"
-        read -r
+    done
+}
+
+# ==============================
+# 功能函数
+# ==============================
+
+install_app() {
+    check_docker
+
+    mkdir -p "$APP_DIR/data"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
     fi
-done
+
+    read -p "请输入访问端口 [默认:3080]: " input_port
+    PORT=${input_port:-3080}
+    check_port "$PORT" || return
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  excalidraw:
+    image: excalidraw/excalidraw:latest
+    container_name: excalidraw
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/web
+    ports:
+      - "127.0.0.1:${PORT}:80"
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    echo
+    echo -e "${GREEN}✅ Excalidraw 已启动${RESET}"
+    echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ Excalidraw 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    docker compose restart
+    echo -e "${GREEN}✅ Excalidraw 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
+    docker logs -f excalidraw
+}
+
+check_status() {
+    docker ps | grep excalidraw
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ Excalidraw 已彻底卸载（含数据）${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+menu

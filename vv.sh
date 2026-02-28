@@ -1,129 +1,145 @@
 #!/bin/bash
-# ==========================================
-# CFServer 管理脚本（绿色菜单版）
-# ==========================================
-
-set -e
+# ========================================
+# Emby Pulse 一键管理脚本
+# ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-green(){ echo -e "${GREEN}$1${RESET}"; }
-yellow(){ echo -e "${YELLOW}$1${RESET}"; }
-red(){ echo -e "${RED}$1${RESET}"; }
+APP_NAME="emby-pulse"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_DIR="$APP_DIR/config"
 
-CF_DIR="/opt/cfserver"
-SCRIPT_NAME="cfserver.sh"
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
+    fi
+}
 
 # 获取服务器IP
 SERVER_IP=$(hostname -I | awk '{print $1}')
 
-install_cf() {
-    green "正在下载并安装 CFServer..."
-    curl -sS -O https://raw.githubusercontent.com/woniu336/open_shell/main/cfserver.sh
-    chmod +x ${SCRIPT_NAME}
-    ./${SCRIPT_NAME}
-    green "安装完成！"
-}
-
-uninstall_cf() {
-    yellow "停止 CFServer 服务..."
-    pkill dns-server 2>/dev/null || echo "服务未运行"
-
-    yellow "删除程序文件 ${CF_DIR} ..."
-    if [ -d "${CF_DIR}" ]; then
-        rm -rf "${CF_DIR}"
-        green "程序文件已删除"
-    else
-        red "目录 ${CF_DIR} 不存在"
-    fi
-
-    yellow "删除安装脚本 ${SCRIPT_NAME} ..."
-    if [ -f "./${SCRIPT_NAME}" ]; then
-        rm -f "./${SCRIPT_NAME}"
-        green "安装脚本已删除"
-    else
-        red "安装脚本不存在"
-    fi
-
-    green "✅ CFServer 已卸载完成"
-}
-
-reset_token() {
-    if [ ! -d "${CF_DIR}" ]; then
-        red "CFServer 未安装！"
-        return
-    fi
-    cd "${CF_DIR}"
-
-    # 提示用户输入自定义 token
-    read -p "$(echo -e ${GREEN}请输入新的访问令牌（token）: ${RESET})" CUSTOM_TOKEN
-
-    # 检查输入是否为空
-    if [ -z "$CUSTOM_TOKEN" ]; then
-        red "未输入 token，操作取消"
-        return
-    fi
-
-    # 执行令牌重置
-    ./dns-server -reset-token "$CUSTOM_TOKEN"
-    green "✅ 令牌已重置为：$CUSTOM_TOKEN"
-}
-
-start_service() {
-    if [ ! -d "${CF_DIR}" ]; then
-        red "CFServer 未安装！"
-        return
-    fi
-    cd "${CF_DIR}"
-    pkill dns-server 2>/dev/null
-    nohup ./dns-server > /dev/null 2>&1 &
-    sleep 2
-    green "✅ 服务已启动"
-}
-
-stop_service() {
-    pkill dns-server 2>/dev/null && green "✅ 服务已停止" || red "服务未运行"
-}
-
-show_web() {
-    IP=$(get_ip)
-    green "🌐 Web 管理地址："
-    green "   http://${SERVER_IP}:8081"
-}
-
 menu() {
     while true; do
         clear
-        echo ""
-        echo -e "${GREEN}==== CFServer 管理菜单 ====${RESET}"
-        echo -e "${GREEN}1) 安装${RESET}"
-        echo -e "${GREEN}2) 卸载${RESET}"
-        echo -e "${GREEN}3) 重置访问令牌${RESET}"
-        echo -e "${GREEN}4) 启动服务${RESET}"
-        echo -e "${GREEN}5) 停止服务${RESET}"
-        echo -e "${GREEN}6) 显示 Web 访问地址${RESET}"
+        echo -e "${GREEN}=== Emby Pulse 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择操作 [0-6]: ${RESET})" choice
-        choice=$(echo "$choice" | xargs)  # 去掉空格
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
         case $choice in
-            1) install_cf ;;
-            2) uninstall_cf ;;
-            3) reset_token ;;
-            4) start_service ;;
-            5) stop_service ;;
-            6) show_web ;;
-            0) 
-                exit 0 ;;
-            *) red "无效选项，请重新输入" ;;
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
         esac
-
-        echo -e "${YELLOW}按回车继续...${RESET}"
-        read
     done
+}
+
+install_app() {
+    check_docker
+    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$APP_DIR/static/img"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
+
+    read -p "请输入时区 [默认:Asia/Shanghai]: " input_tz
+    TZ=${input_tz:-Asia/Shanghai}
+
+    read -p "请输入 Emby 主机地址 [例如:http://192.168.31.2:8096]: " input_host
+    EMBY_HOST=${input_host:-http://192.168.31.2:8096}
+
+    read -p "请输入 Emby API Key [例如:xxxxxxxxxxxxxxxxx]: " input_key
+    EMBY_API_KEY=${input_key:-xxxxxxxxxxxxxxxxx}
+
+    # 数据库宿主机路径
+    read -p "请输入数据库宿主机路径 [例如:/volume1/docker/emby/data]: " input_db_host
+    DB_HOST_PATH=${input_db_host:-/volume1/docker/emby/data}
+
+    # 数据库容器内部路径
+    read -p "请输入数据库容器路径 [例如:/emby-data/playback_reporting.db]: " input_db_container
+    DB_CONTAINER_PATH=${input_db_container:-/emby-data/playback_reporting.db}
+
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  emby-pulse:
+    image: zeyu8023/emby-stats:latest
+    container_name: emby-pulse
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ${DB_HOST_PATH}:/emby-data
+      - ./config:/app/config
+    environment:
+      - TZ=${TZ}
+      - DB_PATH=${DB_CONTAINER_PATH}
+      - EMBY_HOST=${EMBY_HOST}
+      - EMBY_API_KEY=${EMBY_API_KEY}
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    echo
+    echo -e "${GREEN}✅ Emby Pulse 已启动${RESET}"
+    echo -e "${GREEN}✅ webui http://${SERVER_IP}:10307${RESET}"
+    echo -e "${GREEN}✅ 默认账号密码：直接使用您的Emby管理员账号和密码登录${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ Emby Pulse 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+    docker restart emby-pulse
+    echo -e "${GREEN}✅ Emby Pulse 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
+    docker logs -f emby-pulse
+}
+
+check_status() {
+    docker ps | grep emby-pulse
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ Emby Pulse 已卸载${RESET}"
+    read -p "按回车返回菜单..."
 }
 
 menu

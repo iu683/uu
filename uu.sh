@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# LangBot 一键管理脚本
+# ConvertX 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,13 +8,10 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="langbot"
+APP_NAME="convertx"
 APP_DIR="/opt/$APP_NAME"
-REPO_URL="https://github.com/langbot-app/LangBot.git"
-COMPOSE_DIR="$APP_DIR/LangBot/docker"
-
-# 获取服务器IP
-SERVER_IP=$(hostname -I | awk '{print $1}')
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+ENV_FILE="$APP_DIR/.env"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -27,10 +24,17 @@ check_docker() {
     fi
 }
 
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
+
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== LangBot 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== ConvertX 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -56,60 +60,76 @@ menu() {
 install_app() {
     check_docker
     mkdir -p "$APP_DIR"
-    cd "$APP_DIR" || exit
 
-    if [ -d "$APP_DIR/LangBot" ]; then
+    if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
         read confirm
         [[ "$confirm" != "y" ]] && return
-        rm -rf LangBot
     fi
 
-    git clone "$REPO_URL"
-    cd "$COMPOSE_DIR" || exit
+    read -p "请输入访问端口 [默认:3000]: " input_port
+    PORT=${input_port:-3000}
+    check_port "$PORT" || return
+
+    JWT_SECRET=$(openssl rand -hex 32)
+
+    echo "JWT_SECRET=${JWT_SECRET}" > "$ENV_FILE"
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  convertx:
+    image: ghcr.io/c4illin/convertx:latest
+    container_name: convertx
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORT}:3000"
+    environment:
+      - JWT_SECRET=\${JWT_SECRET}
+      - NODE_ENV=production
+    volumes:
+      - ./data:/app/data
+EOF
+
+    cd "$APP_DIR" || exit
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ LangBot 已启动${RESET}"
-    echo -e "${GREEN}✅ webui http://${SERVER_IP}:5300${RESET}"
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    echo -e "${GREEN}✅ ConvertX 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${YELLOW}🔐 JWT_SECRET: ${JWT_SECRET}${RESET}"
     read -p "按回车返回菜单..."
 }
 
 update_app() {
-    cd "$APP_DIR/LangBot" || { echo "未检测到安装目录"; sleep 1; return; }
-    git pull
-    cd docker || return
+    cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ 更新完成${RESET}"
+    echo -e "${GREEN}✅ ConvertX 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    cd "$COMPOSE_DIR" || { echo "未检测到安装"; sleep 1; return; }
-    docker compose restart
-    echo -e "${GREEN}✅ 已重启${RESET}"
+    docker restart convertx
+    echo -e "${GREEN}✅ ConvertX 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    cd "$COMPOSE_DIR" || { echo "未检测到安装"; sleep 1; return; }
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker compose logs -f
+    docker logs -f convertx
 }
 
 check_status() {
-    cd "$COMPOSE_DIR" || { echo "未检测到安装"; sleep 1; return; }
-    docker compose ps
+    docker ps | grep convertx
     read -p "按回车返回菜单..."
 }
 
+
 uninstall_app() {
-    cd "$COMPOSE_DIR" || return
+    cd "$APP_DIR" || return
     docker compose down
-    rm -rf "$APP_DIR/LangBot"
-    echo -e "${RED}✅ LangBot 已卸载${RESET}"
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ ConvertX ConvertX 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

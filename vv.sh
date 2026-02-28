@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Karakeep 一键管理脚本
+# Pika (SQLite) 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,10 +8,10 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="karakeep-app"
+APP_NAME="pika-sqlite"
 APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-ENV_FILE="$APP_DIR/.env"
+COMPOSE_FILE="$APP_DIR/docker-compose.sqlite.yml"
+CONFIG_FILE="$APP_DIR/config.yaml"
 
 # 检查 Docker & Docker Compose
 check_docker() {
@@ -33,35 +33,45 @@ check_port() {
     fi
 }
 
-# 生成自定义 .env 文件
-generate_env() {
-    read -p "输入 Karakeep 版本 [默认: release]: " input_version
-    KARAKEEP_VERSION=${input_version:-release}
+# 下载配置文件并修改 JWT Secret
+generate_config() {
+    # 下载官方配置文件
+    curl -o "$CONFIG_FILE" https://raw.githubusercontent.com/dushixiang/pika/main/config.sqlite.yaml
 
-    read -p "输入 NEXTAUTH_SECRET [默认自动生成]: " input_nextauth
-    NEXTAUTH_SECRET=${input_nextauth:-$(openssl rand -base64 36)}
+    # 修改 JWT Secret（使用 openssl 生成随机 16 字节 hex 字符串）
+    read -p "请输入 JWT Secret [默认自动生成]: " input_jwt
+    JWT_SECRET=${input_jwt:-$(openssl rand -hex 16)}
+    sed -i "s#^\s*Secret:.*#    Secret: \"$JWT_SECRET\"#" "$CONFIG_FILE"
 
-    read -p "输入 MEILI_MASTER_KEY [默认自动生成]: " input_meili
-    MEILI_MASTER_KEY=${input_meili:-$(openssl rand -base64 36)}
+    # 修改管理员密码（可留空使用默认 admin123）
+    read -s -p "请输入新的管理员密码（留空使用默认 admin123）: " ADMIN_PASS
+    echo
+    if [[ -n "$ADMIN_PASS" ]]; then
+        # 安装 htpasswd 工具（如果不存在）
+        if ! command -v htpasswd &>/dev/null; then
+            echo -e "${YELLOW}未检测到 htpasswd 工具，正在安装 apache2-utils...${RESET}"
+            if [ -f /etc/debian_version ]; then
+                apt update && apt install -y apache2-utils
+            elif [ -f /etc/redhat-release ]; then
+                yum install -y httpd-tools
+            fi
+        fi
+        # 生成 bcrypt 密码
+        BCRYPT_PASS=$(htpasswd -nBC 12 "" <<< "$ADMIN_PASS" | tr -d ':\n')
+        # 替换 admin 用户密码
+        sed -i "s#^\s*admin:.*#    admin: \"$BCRYPT_PASS\"#" "$CONFIG_FILE"
+        echo -e "${GREEN}✅ 管理员密码已更新${RESET}"
+    else
+        echo -e "${YELLOW}管理员密码保持默认 admin123${RESET}"
+    fi
 
-    read -p "输入 NEXTAUTH_URL [默认: http://127.0.0.1:$PORT]: " input_url
-    NEXTAUTH_URL=${input_url:-http://127.0.0.1:$PORT}
-
-    cat > "$ENV_FILE" <<EOF
-KARAKEEP_VERSION=$KARAKEEP_VERSION
-NEXTAUTH_SECRET=$NEXTAUTH_SECRET
-MEILI_MASTER_KEY=$MEILI_MASTER_KEY
-NEXTAUTH_URL=$NEXTAUTH_URL
-EOF
-
-    echo -e "${GREEN}✅ .env 文件已生成${RESET}"
+    echo -e "${GREEN}✅ config.yaml 已下载并修改 JWT Secret${RESET}"
 }
-
-# 菜单主函数
+# 菜单
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Karakeep 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Pika管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -88,6 +98,7 @@ menu() {
 install_app() {
     check_docker
     mkdir -p "$APP_DIR"
+    mkdir -p "$APP_DIR/data"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -95,76 +106,43 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:3030]: " input_port
-    PORT=${input_port:-3030}
+    read -p "请输入访问端口 [默认:8080]: " input_port
+    PORT=${input_port:-8080}
     check_port "$PORT" || return
 
-    # 生成 .env 文件（可自定义）
-    generate_env
+    # 下载 docker-compose 文件
+    curl -o "$COMPOSE_FILE" https://raw.githubusercontent.com/dushixiang/pika/main/docker-compose.sqlite.yml
 
-    # 动态生成 docker-compose.yml
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  web:
-    image: ghcr.io/karakeep-app/karakeep:latest
-    restart: unless-stopped
-    volumes:
-      - ./data:/data
-    ports:
-      - "127.0.0.1:${PORT}:3000"
-    env_file:
-      - .env
-    environment:
-      MEILI_ADDR: http://meilisearch:7700
-      BROWSER_WEB_URL: http://chrome:9222
-      DATA_DIR: /data
-  chrome:
-    image: gcr.io/zenika-hub/alpine-chrome:124
-    restart: unless-stopped
-    command:
-      - --no-sandbox
-      - --disable-gpu
-      - --disable-dev-shm-usage
-      - --remote-debugging-address=0.0.0.0
-      - --remote-debugging-port=9222
-      - --hide-scrollbars
-  meilisearch:
-    image: getmeili/meilisearch:v1.13.3
-    restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      MEILI_NO_ANALYTICS: "true"
-    volumes:
-      - ./meilisearch:/meili_data
-EOF
+    # 修改 docker-compose 文件端口映射
+    sed -i "s/8080:8080/${PORT}:8080/" "$COMPOSE_FILE"
+
+    # 下载并修改配置文件
+    generate_config
 
     cd "$APP_DIR" || exit
-    docker compose up -d
+    docker compose -f docker-compose.sqlite.yml up -d
 
-    echo
-    echo -e "${GREEN}✅ Karakeep 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: ${NEXTAUTH_URL}${RESET}"
-    echo -e "${GREEN}✅ NEXTAUTH_SECRET: $NEXTAUTH_SECRET${RESET}"
-    echo -e "${GREEN}✅ MEILI_MASTER_KEY:$MEILI_MASTER_KEY${RESET}"
+    echo -e "${GREEN}✅ Pika 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${YELLOW}🌐 账号/密码: admin/${ADMIN_PASS}${RESET}"
     echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
     read -p "按回车返回菜单..."
-
+}
 
 # 更新
 update_app() {
     cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ Karakeep 更新完成${RESET}"
+    docker compose -f docker-compose.sqlite.yml pull
+    docker compose -f docker-compose.sqlite.yml up -d
+    echo -e "${GREEN}✅ Pika 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 # 重启
 restart_app() {
     cd "$APP_DIR" || return
-    docker compose restart
-    echo -e "${GREEN}✅ Karakeep 已重启${RESET}"
+    docker compose -f docker-compose.sqlite.yml restart
+    echo -e "${GREEN}✅ Pika 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
@@ -172,22 +150,22 @@ restart_app() {
 view_logs() {
     cd "$APP_DIR" || return
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker compose logs -f
+    docker compose -f docker-compose.sqlite.yml logs -f
 }
 
 # 查看状态
 check_status() {
     cd "$APP_DIR" || return
-    docker compose ps
+    docker compose -f docker-compose.sqlite.yml ps
     read -p "按回车返回菜单..."
 }
 
 # 卸载
 uninstall_app() {
     cd "$APP_DIR" || return
-    docker compose down
+    docker compose -f docker-compose.sqlite.yml down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Karakeep 已卸载${RESET}"
+    echo -e "${RED}✅ Pika 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

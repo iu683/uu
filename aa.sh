@@ -1,127 +1,137 @@
 #!/bin/bash
-# ===============================
-# ZeroClaw 高级管理菜单
-# ===============================
-export LANG=en_US.UTF-8
+# ==========================================
+# CFServer 管理脚本（绿色菜单版）
+# ==========================================
 
-# 颜色定义
+set -e
+
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
-BLUE="\033[36m"
 RESET="\033[0m"
 
-green() { echo -e "${GREEN}$1${RESET}"; }
-yellow() { echo -e "${YELLOW}$1${RESET}"; }
-red() { echo -e "${RED}$1${RESET}"; }
-blue() { echo -e "${BLUE}$1${RESET}"; }
+green(){ echo -e "${GREEN}$1${RESET}"; }
+yellow(){ echo -e "${YELLOW}$1${RESET}"; }
+red(){ echo -e "${RED}$1${RESET}"; }
 
-ZER0CLAW_DIR="/opt/ZeroClaw"
-CONFIG_FILE="$HOME/.zeroclaw/config.toml"
+CF_DIR="/opt/cfserver"
+SCRIPT_NAME="cfserver.sh"
 
-# 检查命令是否存在
-command_exists() {
-    command -v "$1" &>/dev/null
-}
+# 获取服务器IP
+SERVER_IP=$(hostname -I | awk '{print $1}')
 
-# 安装 ZeroClaw + Rust + 系统依赖
-install_zeroclaw() {
-    if [ ! -d "$ZER0CLAW_DIR" ]; then
-        green "开始安装 ZeroClaw..."
-        git clone https://github.com/zeroclaw-labs/zeroclaw.git "$ZER0CLAW_DIR"
-    else
-        yellow "ZeroClaw 已经存在，跳过克隆。"
-    fi
+install_cf() {
 
-    cd "$ZER0CLAW_DIR" || exit
-    green "执行 bootstrap 脚本安装 Rust 工具链和系统依赖..."
-    ./bootstrap.sh --install-rust --install-system-deps
-    green "ZeroClaw 安装完成！"
-}
+    green "正在下载并执行部署脚本..."
+    curl -sS -O https://raw.githubusercontent.com/woniu336/open_shell/main/cfserver.sh
+    chmod +x cfserver.sh
+    ./cfserver.sh
 
-# 配置 Provider 和 API Key（支持自定义模型）
-configure_provider() {
-    read -p "请输入你的 CLI API Key: " api_key
-    read -p "请输入 Provider URL（示例: custom:https://ai.eu.org/v1）: " provider
-    read -p "请输入默认模型（回车使用 gemini-3-flash-preview）: " model
-    model=${model:-gemini-3-flash-preview}   # 如果用户没输入，使用默认值
-
-    mkdir -p "$(dirname "$CONFIG_FILE")"
-    cat > "$CONFIG_FILE" <<EOF
-api_key = "$api_key"
-default_provider = "$provider"
-default_model = "$model"
-EOF
-    green "配置完成，保存路径：$CONFIG_FILE"
-}
-
-# 启动 ZeroClaw
-start_zeroclaw() {
-    if [ -f "$ZER0CLAW_DIR/start.sh" ]; then
-        green "启动 ZeroClaw..."
-        bash "$ZER0CLAW_DIR/start.sh"
-    else
-        red "未找到启动脚本，请先安装 ZeroClaw。"
-    fi
-}
-
-# 停止 ZeroClaw
-stop_zeroclaw() {
-    if pgrep -f "ZeroClaw" >/dev/null 2>&1; then
-        pkill -f "ZeroClaw"
-        green "ZeroClaw 已停止。"
-    else
-        yellow "ZeroClaw 未运行。"
-    fi
-}
-
-# 查看状态
-status_zeroclaw() {
-    if pgrep -f "ZeroClaw" >/dev/null 2>&1; then
-        green "ZeroClaw 正在运行中"
-    else
-        yellow "ZeroClaw 未运行"
-    fi
-}
-
-# 卸载 ZeroClaw
-uninstall_zeroclaw() {
-            rm -rf "$ZER0CLAW_DIR"
-            green "ZeroClaw 已卸载！"
+    # 可选自定义重置 token
+    yellow "是否现在自定义重置访问令牌？(y/n)"
+    read -p "$(echo -e ${GREEN}请选择: ${RESET})" choice
+    if [[ "$choice" == "y" || "$choice" == "Y" ]]; then
+        cd /opt/cfserver || { red "目录不存在！"; return; }
+        read -p "$(echo -e ${GREEN}请输入新的访问令牌（留空取消）: ${RESET})" CUSTOM_TOKEN
+        if [ -n "$CUSTOM_TOKEN" ]; then
+            ./dns-server -reset-token "$CUSTOM_TOKEN"
+            green "✅ 访问令牌已重置为：$CUSTOM_TOKEN"
         else
-            yellow "取消卸载。"
+            yellow "未输入 token，跳过重置"
         fi
+    fi
+
+    # 启动服务
+    green "正在重启服务..."
+    cd /opt/cfserver || { red "目录不存在！"; return; }
+    pkill dns-server 2>/dev/null
+    nohup ./dns-server > /dev/null 2>&1 &
+    sleep 2
+    green "服务已启动！"
+
+    echo ""
+    green "🌐 Web 管理地址："
+    echo ""
+    echo "   http://${SERVER_IP}:8081"
+    echo ""
+    green "========================================"
+}
+
+uninstall_cf() {
+    yellow "停止 CFServer 服务..."
+    pkill dns-server 2>/dev/null || echo "服务未运行"
+
+    yellow "删除程序文件 ${CF_DIR} ..."
+    if [ -d "${CF_DIR}" ]; then
+        rm -rf "${CF_DIR}"
+        green "程序文件已删除"
     else
-        red "ZeroClaw 未安装。"
+        red "目录 ${CF_DIR} 不存在"
+    fi
+
+    yellow "删除安装脚本 ${SCRIPT_NAME} ..."
+    if [ -f "./${SCRIPT_NAME}" ]; then
+        rm -f "./${SCRIPT_NAME}"
+        green "安装脚本已删除"
+    else
+        red "安装脚本不存在"
+    fi
+
+    green "✅ CFServer 已卸载完成"
+}
+
+reset_token() {
+    if [ ! -d "${CF_DIR}" ]; then
+        red "CFServer 未安装！"
+        return
+    fi
+
+    cd "${CF_DIR}" || return
+    read -p "$(echo -e ${GREEN}请输入新的访问令牌（token）: ${RESET})" CUSTOM_TOKEN
+    [ -z "$CUSTOM_TOKEN" ] && { red "未输入 token，操作取消"; return; }
+
+    if [ -x "./dns-server" ]; then
+        ./dns-server -reset-token "$CUSTOM_TOKEN"
+        green "✅ 令牌已重置为：$CUSTOM_TOKEN"
+    else
+        red "dns-server 文件不存在或不可执行"
     fi
 }
 
-# 菜单
-show_menu() {
-    clear
-    echo -e "${GREEN}======  ZeroClaw 管理菜单 ========${RESET}"
-    echo -e "${GREEN}[1] 安装 ZeroClaw（含Rust+系统依赖）${RESET}"
-    echo -e "${GREEN}[2] 配置 Provider和API Key${RESET}"
-    echo -e "${GREEN}[3] 启动 ZeroClaw${RESET}"
-    echo -e "${GREEN}[4] 停止 ZeroClaw${RESET}"
-    echo -e "${GREEN}[5] 查看状态${RESET}"
-    echo -e "${GREEN}[6] 卸载 ZeroClaw${RESET}"
-    echo -e "${GREEN}[0] 退出${RESET}"
-    read -p "请输入选项: " choice
-    case "$choice" in
-        1) install_zeroclaw ;;
-        2) configure_provider ;;
-        3) start_zeroclaw ;;
-        4) stop_zeroclaw ;;
-        5) status_zeroclaw ;;
-        6) uninstall_zeroclaw ;;
-        0) exit 0 ;;
-        *) red "无效选项，请重新输入！" ;;
-    esac
-    read -p "按任意键返回菜单..." temp
+start_service() {
+    cd "${CF_DIR}" || { red "CFServer 未安装！"; return; }
+    pkill dns-server 2>/dev/null
+    nohup ./dns-server > /dev/null 2>&1 &
+    green "✅ 服务已重启"
 }
 
-# 主循环
-while true; do
-    show_menu
-done
+
+menu() {
+    while true; do
+        clear
+        echo ""
+        echo -e "${GREEN}==== CFServer 管理菜单 ====${RESET}"
+        echo -e "${GREEN}1) 安装${RESET}"
+        echo -e "${GREEN}2) 卸载${RESET}"
+        echo -e "${GREEN}3) 重置访问令牌${RESET}"
+        echo -e "${GREEN}4) 重启${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择操作: ${RESET})" choice
+        choice=$(echo "$choice" | xargs)  # 去掉空格
+
+        case $choice in
+            1) install_cf ;;
+            2) uninstall_cf ;;
+            3) reset_token ;;
+            4) start_service ;;
+            0) 
+                exit 0 ;;
+            *) red "无效选项，请重新输入" ;;
+        esac
+
+        echo -e "${YELLOW}按回车继续...${RESET}"
+        read
+    done
+}
+
+menu

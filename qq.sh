@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Drawnix 一键管理脚本
+# Pika (SQLite) 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,10 +8,12 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="drawnix"
+APP_NAME="pika-sqlite"
 APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+COMPOSE_FILE="$APP_DIR/docker-compose.sqlite.yml"
+CONFIG_FILE="$APP_DIR/config.yaml"
 
+# 检查 Docker & Docker Compose
 check_docker() {
     if ! command -v docker &>/dev/null; then
         echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
@@ -23,6 +25,7 @@ check_docker() {
     fi
 }
 
+# 检查端口占用
 check_port() {
     if ss -tlnp | grep -q ":$1 "; then
         echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
@@ -30,10 +33,26 @@ check_port() {
     fi
 }
 
+# 下载配置文件并修改 JWT Secret
+generate_config() {
+    # 下载官方配置
+    curl -o "$CONFIG_FILE" https://raw.githubusercontent.com/dushixiang/pika/main/config.sqlite.yaml
+
+    # 提示用户输入 JWT Secret
+    read -p "请输入 JWT Secret [默认自动生成 UUID]: " input_jwt
+    JWT_SECRET=${input_jwt:-$(uuidgen)}
+
+    # 替换配置文件中 App.JWT.Secret
+    sed -i "s#^\s*Secret:.*#    Secret: \"$JWT_SECRET\"#" "$CONFIG_FILE"
+
+    echo -e "${GREEN}✅ config.yaml 已下载并修改 JWT Secret${RESET}"
+}
+
+# 菜单
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Drawnix 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Pika (SQLite) 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -56,9 +75,11 @@ menu() {
     done
 }
 
+# 安装/启动
 install_app() {
     check_docker
     mkdir -p "$APP_DIR"
+    mkdir -p "$APP_DIR/data"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -66,59 +87,65 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:7200]: " input_port
-    PORT=${input_port:-7200}
+    read -p "请输入访问端口 [默认:8080]: " input_port
+    PORT=${input_port:-8080}
     check_port "$PORT" || return
 
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  drawnix:
-    image: jeven/drawnix
-    container_name: drawnix
-    restart: always
-    ports:
-      - "127.0.0.1:${PORT}:80"
-EOF
+    # 下载 docker-compose 文件
+    curl -o "$COMPOSE_FILE" https://raw.githubusercontent.com/dushixiang/pika/main/docker-compose.sqlite.yml
+
+    # 修改 docker-compose 文件端口映射
+    sed -i "s/8080:8080/${PORT}:8080/" "$COMPOSE_FILE"
+
+    # 下载并修改配置文件
+    generate_config
 
     cd "$APP_DIR" || exit
-    docker compose up -d
+    docker compose -f docker-compose.sqlite.yml up -d
 
-    echo
-    echo -e "${GREEN}✅ Drawnix 已启动${RESET}"
+    echo -e "${GREEN}✅ Pika 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
     echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
     read -p "按回车返回菜单..."
 }
 
+# 更新
 update_app() {
     cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ Drawnix 更新完成${RESET}"
+    docker compose -f docker-compose.sqlite.yml pull
+    docker compose -f docker-compose.sqlite.yml up -d
+    echo -e "${GREEN}✅ Pika 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
+# 重启
 restart_app() {
-    docker restart drawnix
-    echo -e "${GREEN}✅ Drawnix 已重启${RESET}"
+    cd "$APP_DIR" || return
+    docker compose -f docker-compose.sqlite.yml restart
+    echo -e "${GREEN}✅ Pika 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
+# 查看日志
 view_logs() {
+    cd "$APP_DIR" || return
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f drawnix
+    docker compose -f docker-compose.sqlite.yml logs -f
 }
 
+# 查看状态
 check_status() {
-    docker ps | grep drawnix
+    cd "$APP_DIR" || return
+    docker compose -f docker-compose.sqlite.yml ps
     read -p "按回车返回菜单..."
 }
 
+# 卸载
 uninstall_app() {
     cd "$APP_DIR" || return
-    docker compose down
+    docker compose -f docker-compose.sqlite.yml down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Drawnix 已卸载${RESET}"
+    echo -e "${RED}✅ Pika 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

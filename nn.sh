@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Umami 一键管理脚本
+# DUFS 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,10 +8,9 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="umami"
+APP_NAME="dufs"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-ENV_FILE="$APP_DIR/.env"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -34,7 +33,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Umami 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== DUFS 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -59,7 +58,7 @@ menu() {
 
 install_app() {
     check_docker
-    mkdir -p "$APP_DIR"
+    mkdir -p "$APP_DIR/data"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -67,58 +66,41 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:3000]: " input_port
-    PORT=${input_port:-3000}
+    read -p "请输入访问端口 [默认:5000]: " input_port
+    PORT=${input_port:-5000}
     check_port "$PORT" || return
 
-    DB_PASS=$(openssl rand -hex 12)
-    APP_SECRET=$(openssl rand -hex 32)
+    read -p "请输入本地数据目录路径 [默认:/vol1/1000/docker/dufs/dufs/data]: " data_dir
+    DATA_DIR=${data_dir:-/vol1/1000/docker/dufs/dufs/data}
+    mkdir -p "$DATA_DIR"
 
-    echo "DB_PASS=${DB_PASS}" > "$ENV_FILE"
-    echo "APP_SECRET=${APP_SECRET}" >> "$ENV_FILE"
+    # 新增：输入账号密码
+    read -p "请输入 DUFS 用户名 [默认:admin]: " username
+    USERNAME=${username:-admin}
+    read -p "请输入 DUFS 密码 [默认:123456]: " password
+    PASSWORD=${password:-123456}
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  umami:
-    image: ghcr.io/umami-software/umami:latest
-    container_name: umami
+  dufs:
+    image: sigoden/dufs:latest
+    container_name: dufs
+    command: /data -a ${USERNAME}:${PASSWORD}@/:rw
     ports:
-      - "127.0.0.1:${PORT}:3000"
-    environment:
-      DATABASE_URL: postgresql://umami:\${DB_PASS}@db:5432/umami
-      APP_SECRET: \${APP_SECRET}
-    depends_on:
-      db:
-        condition: service_healthy
-    restart: always
-    init: true
-
-  db:
-    image: postgres:15-alpine
-    container_name: umami-db
-    environment:
-      POSTGRES_DB: umami
-      POSTGRES_USER: umami
-      POSTGRES_PASSWORD: \${DB_PASS}
+      - "127.0.0.1:${PORT}:5000"
     volumes:
-      - umami-db-data:/var/lib/postgresql/data
+      - ${DATA_DIR}:/data
     restart: always
-
-volumes:
-  umami-db-data:
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ Umami 已启动${RESET}"
+    echo -e "${GREEN}✅ DUFS 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🔐 数据库名:  umami${RESET}"
-    echo -e "${YELLOW}🔐 数据库用户:umami${RESET}"
-    echo -e "${YELLOW}🔐 数据库密码:${DB_PASS}${RESET}"
-    echo -e "${YELLOW}🔐 APP_SECRET:${APP_SECRET}${RESET}"
-
+    echo -e "${YELLOW}🔑 用户名: ${USERNAME}  密码: ${PASSWORD}${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
     read -p "按回车返回菜单..."
 }
 
@@ -126,32 +108,32 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Umami 更新完成${RESET}"
+    echo -e "${GREEN}✅ DUFS 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart umami umami-db
-    echo -e "${GREEN}✅ Umami 已重启${RESET}"
+    docker restart dufs
+    echo -e "${GREEN}✅ DUFS 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f umami
+    docker logs -f dufs
 }
 
 check_status() {
-    docker ps | grep umami
+    docker ps | grep dufs
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
     cd "$APP_DIR" || return
-    docker compose down -v
+    docker compose down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Umami 已卸载（含数据库数据）${RESET}"
+    echo -e "${RED}✅ DUFS 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 
-menu
+menu 

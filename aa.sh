@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Pansou-Web 一键管理脚本
+# Lucky v2 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="pansou"
+APP_NAME="lucky"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -23,17 +23,10 @@ check_docker() {
     fi
 }
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
-
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Pansou 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Lucky 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -58,7 +51,7 @@ menu() {
 
 install_app() {
     check_docker
-    mkdir -p "$APP_DIR"
+    mkdir -p "$APP_DIR/conf"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -66,80 +59,48 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:805]: " input_port
-    PORT=${input_port:-805}
-    check_port "$PORT" || return
-
     cat > "$COMPOSE_FILE" <<EOF
-
 services:
-  pansou:
-    image: ghcr.io/fish2018/pansou-web:latest
-    container_name: pansou-app
-    labels:
-      - "autoheal=true"
-    ports:
-      - "127.0.0.1:${PORT}:80"
-    environment:
-      - DOMAIN=localhost
-      - PANSOU_PORT=8888
-      - PANSOU_HOST=127.0.0.1
-      - CACHE_PATH=/app/data/cache
-      - LOG_PATH=/app/data/logs
-      - HEALTH_CHECK_INTERVAL=30
-      - HEALTH_CHECK_TIMEOUT=10
-      - HEALTH_CHECK_RETRIES=3
+  lucky:
+    image: gdy666/lucky:v2
+    container_name: lucky
     volumes:
-      - pansou-data:/app/data
-    restart: unless-stopped
-
-  autoheal:
-    image: willfarrell/autoheal:latest
-    container_name: pansou-autoheal
-    restart: always
-    environment:
-      - AUTOHEAL_CONTAINER_LABEL=autoheal
-      - AUTOHEAL_INTERVAL=30
-      - AUTOHEAL_START_PERIOD=60
-      - AUTOHEAL_DEFAULT_STOP_TIMEOUT=10
-    volumes:
+      - ./conf:/app/conf
       - /var/run/docker.sock:/var/run/docker.sock
-
-volumes:
-  pansou-data:
-    driver: local
+    network_mode: host
+    restart: always
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ Pansou-Web 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}✅ Lucky 已启动${RESET}"
+    echo -e "${YELLOW}使用 host 网络模式，请查看日志确认端口${RESET}"
     read -p "按回车返回菜单..."
 }
 
 update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ 更新完成${RESET}"
+    echo -e "${GREEN}✅ Lucky 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart pansou-app
-    echo -e "${GREEN}✅ 已重启${RESET}"
+    docker restart lucky
+    echo -e "${GREEN}✅ Lucky 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f pansou-app
+    docker logs -f lucky
 }
 
 check_status() {
-    docker ps | grep pansou-app
+    docker ps | grep lucky
     read -p "按回车返回菜单..."
 }
 
@@ -147,7 +108,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Pansou-Web 已卸载${RESET}"
+    echo -e "${RED}✅ Lucky 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

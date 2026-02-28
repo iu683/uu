@@ -1,151 +1,122 @@
 #!/bin/bash
-# ======================================
-# ZeroClaw 一键菜单管理脚本
-# ======================================
-export LANG=en_US.UTF-8
-CARGO_BIN="$HOME/.cargo/bin"
+# ==========================================
+# CFServer 管理脚本（绿色菜单版）
+# ==========================================
 
-green() { echo -e "\033[32m$1\033[0m"; }
-yellow() { echo -e "\033[33m$1\033[0m"; }
-red() { echo -e "\033[31m$1\033[0m"; }
+set -e
 
-# 确保 cargo 在 PATH
-export PATH="$CARGO_BIN:$PATH"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-install_zeroclaw() {
-    green "克隆仓库并安装 ZeroClaw..."
-    git clone https://github.com/zeroclaw-labs/zeroclaw.git ~/zeroclaw
-    cd ~/zeroclaw || return
-    cargo build --release --locked
-    cargo install --path . --force --locked
-    green "安装完成！确保 ~/.cargo/bin 在 PATH 中"
+green(){ echo -e "${GREEN}$1${RESET}"; }
+yellow(){ echo -e "${YELLOW}$1${RESET}"; }
+red(){ echo -e "${RED}$1${RESET}"; }
+
+CF_DIR="/opt/cfserver"
+SCRIPT_NAME="cfserver.sh"
+
+# 获取服务器IP
+SERVER_IP=$(hostname -I | awk '{print $1}')
+
+install_cf() {
+    green "正在下载并安装 CFServer..."
+    curl -sS -O https://raw.githubusercontent.com/woniu336/open_shell/main/cfserver.sh
+    chmod +x ${SCRIPT_NAME}
+    ./${SCRIPT_NAME}
+    green "安装完成！"
 }
 
-update_zeroclaw() {
-    green "更新 ZeroClaw..."
-    cd ~/zeroclaw || { red "未找到 zeroclaw 目录，请先安装"; return; }
-    git pull
-    cargo build --release --locked
-    cargo install --path . --force --locked
-    green "更新完成！"
+uninstall_cf() {
+    yellow "停止 CFServer 服务..."
+    pkill dns-server 2>/dev/null || echo "服务未运行"
+
+    yellow "删除程序文件 ${CF_DIR} ..."
+    if [ -d "${CF_DIR}" ]; then
+        rm -rf "${CF_DIR}"
+        green "程序文件已删除"
+    else
+        red "目录 ${CF_DIR} 不存在"
+    fi
+
+    yellow "删除安装脚本 ${SCRIPT_NAME} ..."
+    if [ -f "./${SCRIPT_NAME}" ]; then
+        rm -f "./${SCRIPT_NAME}"
+        green "安装脚本已删除"
+    else
+        red "安装脚本不存在"
+    fi
+
+    green "✅ CFServer 已卸载完成"
 }
 
-onboard_menu() {
-    echo "选择配置方式:"
-    echo "1) 无提示快速设置"
-    echo "2) 交互式向导"
-    echo "3) 仅修复频道/允许列表"
-    read -rp "请选择: " choice
-    case $choice in
-        1)
-            read -rp "请输入 API Key: " apikey
-            read -rp "请输入 Provider (openrouter/其它): " provider
-            zeroclaw onboard --api-key "$apikey" --provider "$provider"
-            ;;
-        2) zeroclaw onboard --interactive ;;
-        3) zeroclaw onboard --channels-only ;;
-        *) red "无效选择" ;;
-    esac
+reset_token() {
+    if [ ! -d "${CF_DIR}" ]; then
+        red "CFServer 未安装！"
+        return
+    fi
+    cd "${CF_DIR}"
+
+    # 提示用户输入自定义 token
+    read -p "$(echo -e ${GREEN}请输入新的访问令牌（token）: ${RESET})" CUSTOM_TOKEN
+
+    # 检查输入是否为空
+    if [ -z "$CUSTOM_TOKEN" ]; then
+        red "未输入 token，操作取消"
+        return
+    fi
+
+    # 执行令牌重置
+    ./dns-server -reset-token "$CUSTOM_TOKEN"
+    green "✅ 令牌已重置为：$CUSTOM_TOKEN"
 }
 
-chat_menu() {
-    echo "聊天模式:"
-    echo "1) 单条消息模式"
-    echo "2) 交互模式"
-    read -rp "请选择: " choice
-    case $choice in
-        1)
-            read -rp "输入消息: " msg
-            zeroclaw agent -m "$msg"
-            ;;
-        2) zeroclaw agent ;;
-        *) red "无效选择" ;;
-    esac
+start_service() {
+    if [ ! -d "${CF_DIR}" ]; then
+        red "CFServer 未安装！"
+        return
+    fi
+    cd "${CF_DIR}"
+    pkill dns-server 2>/dev/null
+    nohup ./dns-server > /dev/null 2>&1 &
+    sleep 2
+    green "✅ 服务已启动"
 }
 
-gateway_menu() {
-    echo "启动网关:"
-    echo "1) 默认端口 8080"
-    echo "2) 随机端口"
-    read -rp "请选择: " choice
-    case $choice in
-        1) zeroclaw gateway ;;
-        2) zeroclaw gateway --port 0 ;;
-        *) red "无效选择" ;;
-    esac
+stop_service() {
+    pkill dns-server 2>/dev/null && green "✅ 服务已停止" || red "服务未运行"
 }
 
-daemon_menu() {
-    zeroclaw daemon
+show_web() {
+    IP=$(get_ip)
+    green "🌐 Web 管理地址："
+    green "   http://${SERVER_IP}:8081"
 }
 
-system_check_menu() {
-    echo "系统检查:"
-    echo "1) 查看状态"
-    echo "2) 运行系统诊断"
-    echo "3) 检查频道健康"
-    echo "4) 获取集成设置详情"
-    read -rp "请选择: " choice
-    case $choice in
-        1) zeroclaw status ;;
-        2) zeroclaw doctor ;;
-        3) zeroclaw channel doctor ;;
-        4)
-            read -rp "请输入集成名称 (如 Telegram): " integ
-            zeroclaw integrations info "$integ"
-            ;;
-        *) red "无效选择" ;;
-    esac
-}
-
-service_menu() {
-    echo "后台服务管理:"
-    echo "1) 安装服务"
-    echo "2) 查看服务状态"
-    echo "3) 启动服务"
-    echo "4) 停止服务"
-    echo "5) 卸载服务"
-    read -rp "请选择: " choice
-    case $choice in
-        1) zeroclaw service install ;;
-        2) zeroclaw service status ;;
-        3) zeroclaw service start ;;
-        4) zeroclaw service stop ;;
-        5) zeroclaw service uninstall ;;
-        *) red "无效选择" ;;
-    esac
-}
-
-main_menu() {
+menu() {
     while true; do
         echo ""
-        green "=== ZeroClaw 管理菜单 ==="
-        echo "1) 安装 / 更新 ZeroClaw"
-        echo "2) 配置 ZeroClaw"
-        echo "3) 聊天模式"
-        echo "4) 启动网关"
-        echo "5) 启动完整守护进程"
-        echo "6) 系统检查"
-        echo "7) 后台服务管理"
-        echo "0) 退出"
-        read -rp "请选择: " choice
+        echo -e "${GREEN}==== CFServer 管理菜单 ====${RESET}"
+        echo -e "${GREEN}1) 安装 CFServe${RESET}"
+        echo -e "${GREEN}2) 卸载 CFServer${RESET}"
+        echo -e "${GREEN}3) 重置访问令牌${RESET}"
+        echo -e "${GREEN}4) 启动服务${RESET}"
+        echo -e "${GREEN}5) 停止服务${RESET}"
+        echo -e "${GREEN}6) 显示Web访问地址${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择操作 [0-6]: ${RESET})" choice
         case $choice in
-            1)
-                echo "1) 安装  2) 更新"
-                read -rp "选择: " sub
-                [[ $sub == 1 ]] && install_zeroclaw
-                [[ $sub == 2 ]] && update_zeroclaw
-                ;;
-            2) onboard_menu ;;
-            3) chat_menu ;;
-            4) gateway_menu ;;
-            5) daemon_menu ;;
-            6) system_check_menu ;;
-            7) service_menu ;;
+            1) install_cf ;;
+            2) uninstall_cf ;;
+            3) reset_token ;;
+            4) start_service ;;
+            5) stop_service ;;
+            6) show_web ;;
             0) exit 0 ;;
-            *) red "无效选择" ;;
+            *) red "无效选项，请重新输入" ;;
         esac
     done
 }
 
-main_menu
+menu

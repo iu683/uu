@@ -1,248 +1,275 @@
 #!/bin/bash
-# ===============================
-# ACME Pro 证书申请（Let's Encrypt + IP 支持）
-# ===============================
-export LANG=en_US.UTF-8
 
+# ----------------------
+# 定义颜色
+# ----------------------
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-green(){ echo -e "${GREEN}$1${RESET}"; }
-red(){ echo -e "${RED}$1${RESET}"; }
-yellow(){ echo -e "${YELLOW}$1${RESET}"; }
+# ----------------------
+# 通用安装函数
+# ----------------------
+install_tool() {
+    local pkg="$1"
+    echo -e "${GREEN}正在安装 $pkg ...${RESET}"
+    if command -v apt &>/dev/null; then
+        apt update && apt install -y "$pkg"
+    elif command -v yum &>/dev/null; then
+        yum install -y "$pkg"
+    elif command -v apk &>/dev/null; then
+        apk add --no-cache "$pkg"
+    else
+        echo -e "${RED}不支持的包管理器${RESET}"
+        return 1
+    fi
+    echo -e "${GREEN}$pkg 安装完成${RESET}"
+}
 
-[[ $EUID -ne 0 ]] && red "请使用 root 运行" && exit
-
-ACME_HOME="$HOME/.acme.sh"
-SSL_DIR="/etc/acme/ssl"
-mkdir -p $SSL_DIR
-
-# ===============================
-# 依赖检测
-# ===============================
-install_dep(){
-    if command -v apt >/dev/null 2>&1; then
-        apt update -y
-        apt install -y curl socat cron wget
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y curl socat cronie wget
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y curl socat cronie wget
+# ----------------------
+# 系统检测函数
+# ----------------------
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        os_name=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+    elif command -v lsb_release &>/dev/null; then
+        os_name=$(lsb_release -i | cut -f2 | tr -d '"')
+    else
+        echo -e "${RED}无法确定操作系统类型${RESET}"
+        exit 1
     fi
 }
 
-# ===============================
-# 安装 acme.sh
-# ===============================
-install_acme(){
-    if [ ! -f "$ACME_HOME/acme.sh" ]; then
-        read -p "请输入注册邮箱（回车自动生成）: " email
-        [ -z "$email" ] && email="$(date +%s)@gmail.com"
-        curl https://get.acme.sh | sh -s email=$email
-        green "acme.sh 安装完成"
-    fi
-}
+# ----------------------
+# 系统安装函数
+# ----------------------
+install_sys_tool() {
+    local tool="$1"
+    echo -e "${GREEN}正在安装 $tool ...${RESET}"
 
-# ===============================
-# 停止/恢复 Web 服务
-# ===============================
-stop_web(){
-    if systemctl is-active nginx >/dev/null 2>&1; then
-        systemctl stop nginx
-        WEB_STOP=nginx
-    fi
-    if systemctl is-active apache2 >/dev/null 2>&1; then
-        systemctl stop apache2
-        WEB_STOP=apache2
-    fi
-}
-
-start_web(){
-    [ ! -z "$WEB_STOP" ] && systemctl start $WEB_STOP
-}
-
-# ===============================
-# 安装证书
-# ===============================
-install_cert(){
-    domain=$1
-    mkdir -p $SSL_DIR/$domain
-    $ACME_HOME/acme.sh --install-cert -d $domain \
-        --key-file       $SSL_DIR/$domain/private.key \
-        --fullchain-file $SSL_DIR/$domain/cert.crt
-    green "证书安装完成"
-    green "路径: $SSL_DIR/$domain/"
-    green "如需生效请手动重载 Web 服务"
-}
-
-# ===============================
-# 80端口模式申请域名证书
-# ===============================
-standalone_issue(){
-    read -p "请输入域名: " domain
-    stop_web
-    $ACME_HOME/acme.sh --issue -d $domain --standalone -k ec-256 \
-        --server https://acme-v02.api.letsencrypt.org/directory
-    [ $? -eq 0 ] && install_cert $domain || red "证书申请失败"
-    start_web
-}
-
-# ===============================
-# IP证书申请（short-lived）
-# ===============================
-ip_issue(){
-    read -p "请输入公网IP: " ip
-    stop_web
-    $ACME_HOME/acme.sh --issue -d $ip --standalone -k ec-256 \
-        --server https://acme-v02.api.letsencrypt.org/directory \
-        --profile short-lived
-    [ $? -eq 0 ] && install_cert $ip || red "IP证书申请失败"
-    start_web
-}
-
-# ===============================
-# DNS模式申请证书
-# ===============================
-dns_issue(){
-    read -p "请输入域名: " domain
-    echo "1.Cloudflare"
-    echo "2.DNSPod"
-    echo "3.Aliyun"
-    read -p "请选择: " type
-    case $type in
-        1)
-            read -p "CF_Key: " CF_Key
-            read -p "CF_Email: " CF_Email
-            export CF_Key CF_Email
-            $ACME_HOME/acme.sh --issue --dns dns_cf -d $domain -k ec-256 \
-                --server https://acme-v02.api.letsencrypt.org/directory
+    case "$os_name" in
+        centos|rocky)
+            yum install epel-release -y
+            yum install -y "$tool"
             ;;
-        2)
-            read -p "DP_Id: " DP_Id
-            read -p "DP_Key: " DP_Key
-            export DP_Id DP_Key
-            $ACME_HOME/acme.sh --issue --dns dns_dp -d $domain -k ec-256 \
-                --server https://acme-v02.api.letsencrypt.org/directory
+
+        amzn)
+            amazon-linux-extras install epel -y
+            yum install -y "$tool"
             ;;
-        3)
-            read -p "Ali_Key: " Ali_Key
-            read -p "Ali_Secret: " Ali_Secret
-            export Ali_Key Ali_Secret
-            $ACME_HOME/acme.sh --issue --dns dns_ali -d $domain -k ec-256 \
-                --server https://acme-v02.api.letsencrypt.org/directory
+
+        debian|ubuntu)
+            if [[ "$tool" == "mtr" ]]; then
+                apt update && apt install -y mtr-tiny
+            else
+                apt update && apt install -y "$tool"
+            fi
+            ;;
+
+        alpine)
+            apk add --no-cache "$tool"
+            ;;
+
+        *)
+            install_tool "$tool"
+            ;;
+    esac
+
+    echo -e "${GREEN}$tool 安装完成${RESET}"
+}
+
+
+# ----------------------
+# 在 / 目录运行工具
+# ----------------------
+run_in_root() {
+    cd / || return
+    "$@"
+    cd ~ || return
+}
+
+# ----------------------
+# 显示帮助或运行工具
+# ----------------------
+run_tool() {
+    local tool="$1"
+    local mode="$2" # help / run
+    case "$mode" in
+        help)
+            echo -e "${GREEN}显示 $tool 帮助信息:${RESET}"
+            "$tool" --help
+            ;;
+        run)
+            echo -e "${GREEN}运行 $tool ...${RESET}"
+            "$tool"
             ;;
         *)
-            red "无效选择"
-            return
+            echo -e "${RED}未知模式: $mode${RESET}"
             ;;
     esac
-    [ $? -eq 0 ] && install_cert $domain || red "证书申请失败"
 }
 
-# ===============================
-# 续期
-# ===============================
-renew_all(){
-    $ACME_HOME/acme.sh --cron -f
-    green "全部证书已尝试续期"
-}
-
-# ===============================
-# 删除证书
-# ===============================
-remove_cert(){
-    certs=($($ACME_HOME/acme.sh --list | tail -n +2 | awk '{print $1}'))
-    if [ ${#certs[@]} -eq 0 ]; then
-        red "当前没有任何证书可删除"
+# ----------------------
+# 判断工具是否已安装，返回状态
+# ----------------------
+check_installed() {
+    local tool="$1"
+    if command -v "$tool" &>/dev/null; then
         return 0
+    else
+        return 1
     fi
-    green "可删除的证书列表："
-    echo "编号  域名/IP"
-    echo "---------------------------"
-    for i in "${!certs[@]}"; do
-        printf "%-4s %s\n" "$((i+1))" "${certs[$i]}"
-    done
-    echo
-    read -p "请输入要删除的编号 (输入0返回): " num
-    [ "$num" == "0" ] && return 0
-    if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -lt 1 ] || [ "$num" -gt "${#certs[@]}" ]; then
-        red "无效编号"
-        return 0
-    fi
-    domain="${certs[$((num-1))]}"
-    $ACME_HOME/acme.sh --remove -d "$domain" --ecc >/dev/null 2>&1
-    [ -d "$SSL_DIR/$domain" ] && rm -rf "$SSL_DIR/$domain"
-    green "证书 $domain 已删除"
 }
 
-# ===============================
-# 卸载 acme.sh
-# ===============================
-uninstall_acme(){
-    [ -f "$ACME_HOME/acme.sh" ] && $ACME_HOME/acme.sh --uninstall >/dev/null 2>&1
-    rm -rf $ACME_HOME $SSL_DIR
-    [ -f ~/.bashrc ] && sed -i '/acme.sh.env/d' ~/.bashrc
-    [ -f ~/.profile ] && sed -i '/acme.sh.env/d' ~/.profile
-    green "acme.sh 已彻底卸载"
-}
+# ----------------------
+# 工具列表及支持系统
+# ----------------------
+declare -A tools
+tools=(
+    [1]="curl:curl下载工具:help:"
+    [2]="wget:wget下载工具:help:"
+    [3]="sudo:sudo 超级管理权限:help:"
+    [4]="socat:socat 通信连接:help:"
+    [5]="htop:htop 系统监控:run:"
+    [6]="iftop:iftop 网络流量监控:run:"
+    [7]="unzip:unzip 压缩解压:help:"
+    [8]="tar:tar 压缩解压:help:"
+    [9]="tmux:tmux 多路后台:run:"
+    [10]="ffmpeg:ffmpeg 视频编码直播推流:help:"
+    [11]="btop:btop 监控:run:"
+    [12]="ranger:ranger 文件管理:run_root:"
+    [13]="ncdu:ncdu 磁盘占用查看:run_root:"
+    [14]="fzf:fzf 全局搜索:run_root:"
+    [15]="vim:vim 文本编辑器:help_root:"
+    [16]="nano:nano 文本编辑器:help_root:"
+    [17]="git:git 版本控制:help_root:"
+    [20]="iperf3:iperf3 网络工具:sys:"
+    [21]="mtr:mtr 网络工具:sys:"
+)
 
-# ===============================
-# 查看已申请证书
-# ===============================
-list_cert(){
-    printf "%-22s %-8s %-15s %-10s\n" "域名/IP" "状态" "到期时间" "剩余天数"
-    echo "------------------------------------------------------------"
-    $ACME_HOME/acme.sh --list | tail -n +2 | awk '{print $1}' | while read domain; do
-        CERT_FILE="$SSL_DIR/$domain/cert.crt"
-        if [ ! -f "$CERT_FILE" ]; then
-            status="异常"; expire_date="无证书"; remain="--"
-        else
-            expire=$(openssl x509 -enddate -noout -in "$CERT_FILE" | cut -d= -f2)
-            expire_ts=$(date -d "$expire" +%s 2>/dev/null)
-            now_ts=$(date +%s)
-            if [ -n "$expire_ts" ]; then
-                remain=$(( (expire_ts - now_ts) / 86400 ))
-                [ "$remain" -ge 0 ] && status="有效" || status="已过期"
-                expire_date=$(date -d "$expire" +"%Y-%m-%d" 2>/dev/null)
-            else
-                status="异常"; expire_date="未知"; remain="--"
-            fi
-        fi
-        printf "%-22s %-8s %-15s %-10s\n" "$domain" "$status" "$expire_date" "$remain 天"
-    done
-}
-
-# ===============================
-# 菜单
-# ===============================
-while true
-do
+# ----------------------
+# 显示菜单函数（菜单字体绿色，状态彩色）
+# ----------------------
+show_menu() {
     clear
-    green "==============================="
-    green "     ACME申请证书工具"
-    green "==============================="
-    green "1. 申请证书 (80端口模式)"
-    green "2. 申请证书 (DNS API模式)"
-    green "3. 续期全部证书"
-    green "4. 查看已申请证书"
-    green "5. 删除指定证书"
-    green "6. IP申请证书"
-    green "7. 卸载acme.sh"
-    green "0. 退出"
+    echo -e "${GREEN}========== 工具安装菜单 ===========${RESET}"
+    echo -e "${GREEN}系统: $os_name${RESET}"
 
-    read -p $'\033[32m请选择: \033[0m' num
-    case $num in
-        1) install_dep; install_acme; standalone_issue;;
-        2) install_dep; install_acme; dns_issue;;
-        3) renew_all;;
-        4) list_cert;;
-        5) remove_cert;;
-        6) install_dep; install_acme; ip_issue;;
-        7) uninstall_acme;;
-        0) exit;;
-        *) echo -e "${RED}无效选项${RESET}";;
-    esac
-    read -p $'\033[32m按回车返回菜单...\033[0m' temp
+    term_width=$(tput cols)
+    status_width=12   # “✔ 已安装”大概宽度
+    index_width=6     # [01] 宽度
+
+    name_width=$((term_width - status_width - index_width - 2))
+
+    for i in $(seq 1 21); do
+        [[ -z "${tools[$i]}" ]] && continue
+
+        IFS=":" read -r cmd name mode support_os <<< "${tools[$i]}"
+
+        if check_installed "$cmd"; then
+            status="${GREEN}✔ 已安装${RESET}"
+        else
+            status="${RED}✖ 未安装${RESET}"
+        fi
+
+        printf "${GREEN}[%02d] %-*s${RESET} %b\n" \
+            "$i" "$name_width" "$name" "$status"
+    done
+
+    echo -e "${GREEN}[99] 卸载已安装工具${RESET}"
+    echo -e "${GREEN}[ 0] 退出${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+}
+
+
+# ----------------------
+# 卸载函数（支持多选）
+# ----------------------
+uninstall_tool() {
+    installed_tools=()
+    for i in $(seq 1 21); do
+        IFS=":" read -r tool mode support_os <<< "${tools[$i]}"
+        if check_installed "$tool"; then
+            installed_tools+=("$tool")
+        fi
+    done
+
+    if [ ${#installed_tools[@]} -eq 0 ]; then
+        echo -e "${RED}没有已安装的工具可卸载${RESET}"
+        return
+    fi
+
+    echo -e "${YELLOW}已安装工具:${RESET}"
+    for idx in "${!installed_tools[@]}"; do
+        echo -e "${GREEN}$((idx+1))) ${installed_tools[$idx]}${RESET}"
+    done
+
+    read -rp $'\033[32m请输入要卸载的编号（空格或逗号分隔可多选）: \033[0m' choices
+    # 替换逗号为空格
+    choices=${choices//,/ }
+    for choice in $choices; do
+        if [[ "$choice" -ge 1 && "$choice" -le ${#installed_tools[@]} ]]; then
+            tool_to_remove="${installed_tools[$((choice-1))]}"
+            echo -e "${GREEN}正在卸载 $tool_to_remove ...${RESET}"
+            if command -v apt &>/dev/null; then
+                apt remove -y "$tool_to_remove"
+            elif command -v yum &>/dev/null; then
+                yum remove -y "$tool_to_remove"
+            elif command -v apk &>/dev/null; then
+                apk del "$tool_to_remove"
+            else
+                echo -e "${RED}不支持的包管理器${RESET}"
+            fi
+            echo -e "${GREEN}$tool_to_remove 卸载完成${RESET}"
+        else
+            echo -e "${RED}无效选择: $choice${RESET}"
+        fi
+    done
+}
+
+# ----------------------
+# 主程序
+# ----------------------
+detect_os
+
+while true; do
+    show_menu
+    read -rp $'\033[32m请输入要操作的编号: \033[0m' sub_choice
+
+    # 验证输入是否为纯数字
+    if ! [[ "$sub_choice" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}无效输入，请输入数字${RESET}"
+        read -rp "按回车返回菜单..." _
+        continue
+    fi
+
+    [[ "$sub_choice" == "0" || "$sub_choice" == "00" ]] && break
+
+    if [[ "$sub_choice" == "99" ]]; then
+        uninstall_tool
+        echo -e "${GREEN}按回车返回菜单...${RESET}"
+        read -r
+        continue
+    fi
+
+    if [[ -n "${tools[$sub_choice]}" ]]; then
+        IFS=":" read -r tool mode support_os <<< "${tools[$sub_choice]}"
+        clear
+        case "$mode" in
+            help) install_tool "$tool" && run_tool "$tool" help ;;
+            run) install_tool "$tool" && run_tool "$tool" run ;;
+            run_root) install_tool "$tool" && run_in_root "$tool" ;;
+            help_root) install_tool "$tool" && run_in_root "$tool" -h ;;
+            sys) install_sys_tool "$tool" ;;
+            *) echo -e "${RED}未知模式: $mode${RESET}" ;;
+        esac
+        cd ~
+        echo -e "${GREEN}按回车返回菜单...${RESET}"
+        read -r
+    else
+        echo -e "${RED}无效选择: $sub_choice${RESET}"
+        echo -e "${GREEN}按回车返回菜单...${RESET}"
+        read -r
+    fi
 done

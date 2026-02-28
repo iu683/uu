@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# DUFS 一键管理脚本
+# Pika 一键管理脚本（SQLite 版本）
 # ========================================
 
 GREEN="\033[32m"
@@ -8,9 +8,10 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="dufs"
+APP_NAME="pika-sqlite"
 APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+COMPOSE_FILE="$APP_DIR/docker-compose.sqlite.yml"
+CONFIG_FILE="$APP_DIR/config.yaml"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -30,10 +31,37 @@ check_port() {
     fi
 }
 
+# 获取服务器IP
+SERVER_IP=$(hostname -I | awk '{print $1}')
+
+generate_config() {
+    read -p "请输入管理员账户名 [默认: admin]: " input_user
+    ADMIN_USER=${input_user:-admin}
+
+    read -p "请输入管理员密码 [默认: admin123]: " input_pass
+    ADMIN_PASS=${input_pass:-admin123}
+
+    read -p "请输入 JWT Secret [默认自动生成]: " input_jwt
+    JWT_SECRET=${input_jwt:-$(openssl rand -base64 32)}
+
+    cat > "$CONFIG_FILE" <<EOF
+server:
+  port: ${PORT}
+auth:
+  admin_user: ${ADMIN_USER}
+  admin_pass: ${ADMIN_PASS}
+  jwt_secret: ${JWT_SECRET}
+database:
+  path: ./data/pika.sqlite
+EOF
+
+    echo -e "${GREEN}✅ config.yaml 文件已生成${RESET}"
+}
+
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== DUFS 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Pika (SQLite) 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -58,6 +86,7 @@ menu() {
 
 install_app() {
     check_docker
+    mkdir -p "$APP_DIR"
     mkdir -p "$APP_DIR/data"
 
     if [ -f "$COMPOSE_FILE" ]; then
@@ -66,74 +95,59 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:5000]: " input_port
-    PORT=${input_port:-5000}
+    read -p "请输入访问端口 [默认:8080]: " input_port
+    PORT=${input_port:-8080}
     check_port "$PORT" || return
 
-    read -p "请输入本地数据目录路径 [默认:/vol1/1000/docker/dufs/dufs/data]: " data_dir
-    DATA_DIR=${data_dir:-/vol1/1000/docker/dufs/dufs/data}
-    mkdir -p "$DATA_DIR"
+    # 下载 docker-compose 文件
+    curl -o "$COMPOSE_FILE" https://raw.githubusercontent.com/dushixiang/pika/main/docker-compose.sqlite.yml
 
-    # 新增：输入账号密码
-    read -p "请输入 DUFS 用户名 [默认:admin]: " username
-    USERNAME=${username:-admin}
-    read -p "请输入 DUFS 密码 [默认:123456]: " password
-    PASSWORD=${password:-123456}
-
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  dufs:
-    image: sigoden/dufs:latest
-    container_name: dufs
-    command: /data -a ${USERNAME}:${PASSWORD}@/:rw
-    ports:
-      - "127.0.0.1:${PORT}:5000"
-    volumes:
-      - ${DATA_DIR}:/data
-    restart: always
-EOF
+    # 生成配置文件
+    generate_config
 
     cd "$APP_DIR" || exit
-    docker compose up -d
+    docker compose -f docker-compose.sqlite.yml up -d
 
-    echo
-    echo -e "${GREEN}✅ DUFS 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🔑 用户名: ${USERNAME}  密码: ${PASSWORD}${RESET}"
+    echo -e "${GREEN}✅ Pika 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://${SERVER_IP}:${PORT}${RESET}"
+    echo -e "${YELLOW}🌐 账号号/密码: ${ADMIN_USER}/${ADMIN_PASS}${RESET}"
     echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
     read -p "按回车返回菜单..."
 }
 
 update_app() {
     cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ DUFS 更新完成${RESET}"
+    docker compose -f docker-compose.sqlite.yml pull
+    docker compose -f docker-compose.sqlite.yml up -d
+    echo -e "${GREEN}✅ Pika 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart dufs
-    echo -e "${GREEN}✅ DUFS 已重启${RESET}"
+    cd "$APP_DIR" || return
+    docker compose -f docker-compose.sqlite.yml restart
+    echo -e "${GREEN}✅ Pika 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
+    cd "$APP_DIR" || return
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f dufs
+    docker compose -f docker-compose.sqlite.yml logs -f
 }
 
 check_status() {
-    docker ps | grep dufs
+    cd "$APP_DIR" || return
+    docker compose -f docker-compose.sqlite.yml ps
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
     cd "$APP_DIR" || return
-    docker compose down
+    docker compose -f docker-compose.sqlite.yml down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ DUFS 已卸载${RESET}"
+    echo -e "${RED}✅ Pika 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 
-menu 
+menu

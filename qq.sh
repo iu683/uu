@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Lottery 一键管理脚本
+# Umami 一键管理脚本（稳定增强版）
 # ========================================
 
 GREEN="\033[32m"
@@ -8,9 +8,10 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="lottery"
+APP_NAME="umami"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+ENV_FILE="$APP_DIR/.env"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -33,13 +34,13 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Lottery 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Umami 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
@@ -58,7 +59,7 @@ menu() {
 
 install_app() {
     check_docker
-    mkdir -p "$APP_DIR/data"
+    mkdir -p "$APP_DIR"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -66,77 +67,100 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:8888]: " input_port
-    PORT=${input_port:-8888}
+    read -p "请输入访问端口 [默认:3000]: " input_port
+    PORT=${input_port:-3000}
     check_port "$PORT" || return
 
-    read -p "请输入管理员用户名 [默认:admin]: " input_user
-    read -p "请输入管理员密码 [默认:admin]: " input_pass
+    DB_PASS=$(openssl rand -hex 12)
+    APP_SECRET=$(openssl rand -hex 32)
 
-    ADMIN_USER=${input_user:-admin}
-    ADMIN_PASS=${input_pass:-admin}
-
-    # 生成随机 SESSION_SECRET
-    SESSION_SECRET=$(openssl rand -hex 32)
+    echo "DB_PASS=${DB_PASS}" > "$ENV_FILE"
+    echo "APP_SECRET=${APP_SECRET}" >> "$ENV_FILE"
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  lottery:
-    image: superneed/lottery:latest
-    container_name: lottery
-    ports:
-      - "127.0.0.1:${PORT}:8888"
-    volumes:
-      - ./data:/app/data
+  db:
+    image: postgres:15-alpine
+    container_name: umami-db
     environment:
-      - TZ=Asia/Shanghai
-      - ADMIN_USERNAME=${ADMIN_USER}
-      - ADMIN_PASSWORD=${ADMIN_PASS}
-      - SESSION_SECRET=${SESSION_SECRET}
+      POSTGRES_DB: umami
+      POSTGRES_USER: umami
+      POSTGRES_PASSWORD: \${DB_PASS}
+    volumes:
+      - umami-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U umami"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
     restart: always
+
+  umami:
+    image: ghcr.io/umami-software/umami:latest
+    container_name: umami
+    ports:
+      - "127.0.0.1:${PORT}:3000"
+    environment:
+      DATABASE_URL: postgresql://umami:\${DB_PASS}@db:5432/umami
+      APP_SECRET: \${APP_SECRET}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: always
+    init: true
+
+volumes:
+  umami-db-data:
 EOF
 
     cd "$APP_DIR" || exit
-    docker compose up -d
+    docker compose --env-file "$ENV_FILE" up -d
+
+    echo -e "${YELLOW}⏳ 等待数据库就绪...${RESET}"
+    until docker exec umami-db pg_isready -U umami &>/dev/null; do
+        sleep 2
+    done
 
     echo
-    echo -e "${GREEN}✅ Lottery 已启动${RESET}"
+    echo -e "${GREEN}✅ Umami 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}👤 管理员账号: ${ADMIN_USER}${RESET}"
-    echo -e "${GREEN}🔑 管理员密码: ${ADMIN_PASS}${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
+    echo -e "${YELLOW}🔐 数据库名:  umami${RESET}"
+    echo -e "${YELLOW}🔐 数据库用户:umami${RESET}"
+    echo -e "${YELLOW}🔐 数据库密码:${DB_PASS}${RESET}"
+    echo -e "${YELLOW}🔐 APP_SECRET:${APP_SECRET}${RESET}"
+
     read -p "按回车返回菜单..."
 }
 
 update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ Lottery 更新完成${RESET}"
+    cd "$APP_DIR" || return
+    docker compose --env-file "$ENV_FILE" pull
+    docker compose --env-file "$ENV_FILE" up -d
+    echo -e "${GREEN}✅ Umami 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart lottery
-    echo -e "${GREEN}✅ Lottery 已重启${RESET}"
+    docker restart umami umami-db
+    echo -e "${GREEN}✅ Umami 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f lottery
+    docker logs -f umami
 }
 
 check_status() {
-    docker ps | grep lottery
+    docker ps | grep umami
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
     cd "$APP_DIR" || return
-    docker compose down -v
+    docker compose --env-file "$ENV_FILE" down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Lottery 已彻底卸载（含数据）${RESET}"
+    echo -e "${RED}✅ Umami 已卸载（含数据库数据）${RESET}"
     read -p "按回车返回菜单..."
 }
 

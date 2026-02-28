@@ -1,137 +1,124 @@
 #!/bin/bash
-# ==========================================
-# CFServer 管理脚本（绿色菜单版）
-# ==========================================
+# =================================================
+# VPS 一键解压工具 Pro（多系统自动适配）
+# 支持 Debian / Ubuntu / CentOS / Rocky / Alma / Fedora / Arch
+# =================================================
 
 set -e
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[36m"
 RESET="\033[0m"
 
-green(){ echo -e "${GREEN}$1${RESET}"; }
-yellow(){ echo -e "${YELLOW}$1${RESET}"; }
-red(){ echo -e "${RED}$1${RESET}"; }
+echo -e "${GREEN}====== VPS 解压工具======${RESET}"
 
-CF_DIR="/opt/cfserver"
-SCRIPT_NAME="cfserver.sh"
+# 必须 root
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}请使用 root 运行此脚本！${RESET}"
+    exit 1
+fi
 
-# 获取服务器IP
-SERVER_IP=$(hostname -I | awk '{print $1}')
-
-install_cf() {
-
-    green "正在下载并执行部署脚本..."
-    curl -sS -O https://raw.githubusercontent.com/woniu336/open_shell/main/cfserver.sh
-    chmod +x cfserver.sh
-    ./cfserver.sh
-
-    # 可选自定义重置 token
-    yellow "是否现在自定义重置访问令牌？(y/n)"
-    read -p "$(echo -e ${GREEN}请选择: ${RESET})" choice
-    if [[ "$choice" == "y" || "$choice" == "Y" ]]; then
-        cd /opt/cfserver || { red "目录不存在！"; return; }
-        read -p "$(echo -e ${GREEN}请输入新的访问令牌（留空取消）: ${RESET})" CUSTOM_TOKEN
-        if [ -n "$CUSTOM_TOKEN" ]; then
-            ./dns-server -reset-token "$CUSTOM_TOKEN"
-            green "✅ 访问令牌已重置为：$CUSTOM_TOKEN"
-        else
-            yellow "未输入 token，跳过重置"
-        fi
-    fi
-
-    # 启动服务
-    green "正在重启服务..."
-    cd /opt/cfserver || { red "目录不存在！"; return; }
-    pkill dns-server 2>/dev/null
-    nohup ./dns-server > /dev/null 2>&1 &
-    sleep 2
-    green "服务已启动！"
-
-    echo ""
-    green "🌐 Web 管理地址："
-    echo ""
-    echo "   http://${SERVER_IP}:8081"
-    echo ""
-    green "========================================"
-}
-
-uninstall_cf() {
-    yellow "停止 CFServer 服务..."
-    pkill dns-server 2>/dev/null || echo "服务未运行"
-
-    yellow "删除程序文件 ${CF_DIR} ..."
-    if [ -d "${CF_DIR}" ]; then
-        rm -rf "${CF_DIR}"
-        green "程序文件已删除"
+# ===============================
+# 自动识别包管理器
+# ===============================
+detect_pm() {
+    if command -v apt-get &>/dev/null; then
+        PM="apt-get"
+        INSTALL="apt-get install -y"
+        UPDATE="apt-get update -y"
+    elif command -v dnf &>/dev/null; then
+        PM="dnf"
+        INSTALL="dnf install -y"
+        UPDATE="dnf makecache"
+    elif command -v yum &>/dev/null; then
+        PM="yum"
+        INSTALL="yum install -y"
+        UPDATE="yum makecache"
+    elif command -v pacman &>/dev/null; then
+        PM="pacman"
+        INSTALL="pacman -Sy --noconfirm"
+        UPDATE="pacman -Sy"
     else
-        red "目录 ${CF_DIR} 不存在"
-    fi
-
-    yellow "删除安装脚本 ${SCRIPT_NAME} ..."
-    if [ -f "./${SCRIPT_NAME}" ]; then
-        rm -f "./${SCRIPT_NAME}"
-        green "安装脚本已删除"
-    else
-        red "安装脚本不存在"
-    fi
-
-    green "✅ CFServer 已卸载完成"
-}
-
-reset_token() {
-    if [ ! -d "${CF_DIR}" ]; then
-        red "CFServer 未安装！"
-        return
-    fi
-
-    cd "${CF_DIR}" || return
-    read -p "$(echo -e ${GREEN}请输入新的访问令牌（token）: ${RESET})" CUSTOM_TOKEN
-    [ -z "$CUSTOM_TOKEN" ] && { red "未输入 token，操作取消"; return; }
-
-    if [ -x "./dns-server" ]; then
-        ./dns-server -reset-token "$CUSTOM_TOKEN"
-        green "✅ 令牌已重置为：$CUSTOM_TOKEN"
-    else
-        red "dns-server 文件不存在或不可执行"
+        echo -e "${RED}❌ 不支持的系统，未找到包管理器${RESET}"
+        exit 1
     fi
 }
 
-start_service() {
-    cd "${CF_DIR}" || { red "CFServer 未安装！"; return; }
-    pkill dns-server 2>/dev/null
-    nohup ./dns-server > /dev/null 2>&1 &
-    green "✅ 服务已重启"
+install_pkg() {
+    PKG=$1
+    if ! command -v "$PKG" &>/dev/null; then
+        echo -e "${YELLOW}$PKG 未安装，正在安装...${RESET}"
+        $UPDATE
+        $INSTALL "$PKG"
+    fi
 }
 
+detect_pm
 
-menu() {
-    while true; do
-        clear
-        echo ""
-        echo -e "${GREEN}==== CFServer 管理菜单 ====${RESET}"
-        echo -e "${GREEN}1) 安装${RESET}"
-        echo -e "${GREEN}2) 卸载${RESET}"
-        echo -e "${GREEN}3) 重置访问令牌${RESET}"
-        echo -e "${GREEN}4) 重启${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择操作: ${RESET})" choice
-        choice=$(echo "$choice" | xargs)  # 去掉空格
+read -rp $'\033[32m请输入要解压的文件路径：\033[0m' FILE
 
-        case $choice in
-            1) install_cf ;;
-            2) uninstall_cf ;;
-            3) reset_token ;;
-            4) start_service ;;
-            0) 
-                exit 0 ;;
-            *) red "无效选项，请重新输入" ;;
-        esac
+if [[ ! -f "$FILE" ]]; then
+    echo -e "${RED}文件不存在！退出${RESET}"
+    exit 1
+fi
 
-        echo -e "${YELLOW}按回车继续...${RESET}"
-        read
-    done
-}
+read -rp "请输入解压到的目标目录（默认/root）： " DEST
+DEST=${DEST:-$(pwd)}
 
-menu
+mkdir -p "$DEST"
+
+FILENAME=$(basename "$FILE")
+LOWER_NAME=$(echo "$FILENAME" | tr '[:upper:]' '[:lower:]')
+
+echo -e "${BLUE}正在识别文件类型...${RESET}"
+
+case "$LOWER_NAME" in
+
+    *.zip)
+        install_pkg unzip
+        echo -e "${GREEN}正在解压 ZIP 文件...${RESET}"
+        unzip -o "$FILE" -d "$DEST"
+        ;;
+
+    *.tar)
+        echo -e "${GREEN}正在解压 TAR 文件...${RESET}"
+        tar -xvf "$FILE" -C "$DEST"
+        ;;
+
+    *.tar.gz|*.tgz)
+        echo -e "${GREEN}正在解压 TAR.GZ 文件...${RESET}"
+        tar -xvzf "$FILE" -C "$DEST"
+        ;;
+
+    *.tar.bz2)
+        echo -e "${GREEN}正在解压 TAR.BZ2 文件...${RESET}"
+        tar -xvjf "$FILE" -C "$DEST"
+        ;;
+
+    *.tar.xz)
+        echo -e "${GREEN}正在解压 TAR.XZ 文件...${RESET}"
+        tar -xvJf "$FILE" -C "$DEST"
+        ;;
+
+    *.rar)
+        install_pkg unrar
+        echo -e "${GREEN}正在解压 RAR 文件...${RESET}"
+        unrar x -o+ "$FILE" "$DEST"
+        ;;
+
+    *.7z)
+        install_pkg p7zip
+        install_pkg p7zip-full 2>/dev/null || true
+        echo -e "${GREEN}正在解压 7Z 文件...${RESET}"
+        7z x "$FILE" -o"$DEST" -y
+        ;;
+
+    *)
+        echo -e "${RED}❌ 不支持的压缩格式: $FILENAME${RESET}"
+        exit 1
+        ;;
+esac
+
+echo -e "${GREEN}✅ 解压完成！文件已放到: $DEST${RESET}"

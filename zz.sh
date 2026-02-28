@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Octopus 一键管理脚本
+# Pansou-Web 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="octopus"
+APP_NAME="pansou"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -33,13 +33,13 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Octopus 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Pansou 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
@@ -58,7 +58,7 @@ menu() {
 
 install_app() {
     check_docker
-    mkdir -p "$APP_DIR/data"
+    mkdir -p "$APP_DIR"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -66,30 +66,56 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:8080]: " input_port
-    PORT=${input_port:-8080}
+    read -p "请输入访问端口 [默认:805]: " input_port
+    PORT=${input_port:-805}
     check_port "$PORT" || return
 
     cat > "$COMPOSE_FILE" <<EOF
+
 services:
-  octopus:
-    image: bestrui/octopus
-    container_name: octopus
+  pansou:
+    image: ghcr.io/fish2018/pansou-web:latest
+    container_name: pansou-app
+    labels:
+      - "autoheal=true"
     ports:
-      - "127.0.0.1:${PORT}:8080"
+      - "${PORT}:80"
+    environment:
+      - DOMAIN=localhost
+      - PANSOU_PORT=8888
+      - PANSOU_HOST=127.0.0.1
+      - CACHE_PATH=/app/data/cache
+      - LOG_PATH=/app/data/logs
+      - HEALTH_CHECK_INTERVAL=30
+      - HEALTH_CHECK_TIMEOUT=10
+      - HEALTH_CHECK_RETRIES=3
     volumes:
-      - ./data:/app/data
+      - pansou-data:/app/data
     restart: unless-stopped
+
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: pansou-autoheal
+    restart: always
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      - AUTOHEAL_INTERVAL=30
+      - AUTOHEAL_START_PERIOD=60
+      - AUTOHEAL_DEFAULT_STOP_TIMEOUT=10
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  pansou-data:
+    driver: local
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ Octopus 已启动${RESET}"
+    echo -e "${GREEN}✅ Pansou-Web 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    cho -e "${YELLOW}    账号/密码: admin/admin${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
     read -p "按回车返回菜单..."
 }
 
@@ -97,31 +123,31 @@ update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Octopus 更新完成${RESET}"
+    echo -e "${GREEN}✅ 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart octopus
-    echo -e "${GREEN}✅ Octopus 已重启${RESET}"
+    docker restart pansou-app
+    echo -e "${GREEN}✅ 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f octopus
+    docker logs -f pansou-app
 }
 
 check_status() {
-    docker ps | grep octopus
+    docker ps | grep pansou-app
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
     cd "$APP_DIR" || return
-    docker compose down -v
+    docker compose down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Octopus 已彻底卸载（含数据）${RESET}"
+    echo -e "${RED}✅ Pansou-Web 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

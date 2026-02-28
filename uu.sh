@@ -1,172 +1,151 @@
 #!/bin/bash
-# ========================================
-# Pika (SQLite) 一键管理脚本
-# ========================================
+# ======================================
+# ZeroClaw 一键菜单管理脚本
+# ======================================
+export LANG=en_US.UTF-8
+CARGO_BIN="$HOME/.cargo/bin"
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-RESET="\033[0m"
+green() { echo -e "\033[32m$1\033[0m"; }
+yellow() { echo -e "\033[33m$1\033[0m"; }
+red() { echo -e "\033[31m$1\033[0m"; }
 
-APP_NAME="pika-sqlite"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.sqlite.yml"
-CONFIG_FILE="$APP_DIR/config.yaml"
+# 确保 cargo 在 PATH
+export PATH="$CARGO_BIN:$PATH"
 
-# 检查 Docker & Docker Compose
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
+install_zeroclaw() {
+    green "克隆仓库并安装 ZeroClaw..."
+    git clone https://github.com/zeroclaw-labs/zeroclaw.git ~/zeroclaw
+    cd ~/zeroclaw || return
+    cargo build --release --locked
+    cargo install --path . --force --locked
+    green "安装完成！确保 ~/.cargo/bin 在 PATH 中"
 }
 
-# 检查端口占用
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
+update_zeroclaw() {
+    green "更新 ZeroClaw..."
+    cd ~/zeroclaw || { red "未找到 zeroclaw 目录，请先安装"; return; }
+    git pull
+    cargo build --release --locked
+    cargo install --path . --force --locked
+    green "更新完成！"
 }
 
-# 下载配置文件并修改 JWT Secret
-generate_config() {
-    # 下载官方配置文件
-    curl -o "$CONFIG_FILE" https://raw.githubusercontent.com/dushixiang/pika/main/config.sqlite.yaml
-
-    # 修改 JWT Secret
-    read -p "请输入 JWT Secret [默认自动生成 UUID]: " input_jwt
-    JWT_SECRET=${input_jwt:-$(uuidgen)}
-    sed -i "s#^\s*Secret:.*#    Secret: \"$JWT_SECRET\"#" "$CONFIG_FILE"
-
-    # 修改管理员密码（可留空使用默认 admin123）
-    read -s -p "请输入新的管理员密码（留空使用默认 admin123）: " ADMIN_PASS
-    echo
-    if [[ -n "$ADMIN_PASS" ]]; then
-        # 安装 htpasswd 工具（如果不存在）
-        if ! command -v htpasswd &>/dev/null; then
-            echo -e "${YELLOW}未检测到 htpasswd 工具，正在安装 apache2-utils...${RESET}"
-            if [ -f /etc/debian_version ]; then
-                apt update && apt install -y apache2-utils
-            elif [ -f /etc/redhat-release ]; then
-                yum install -y httpd-tools
-            fi
-        fi
-        # 生成 bcrypt 密码
-        BCRYPT_PASS=$(htpasswd -nBC 12 "" <<< "$ADMIN_PASS" | tr -d ':\n')
-        # 替换 admin 用户密码
-        sed -i "s#^\s*admin:.*#    admin: \"$BCRYPT_PASS\"#" "$CONFIG_FILE"
-        echo -e "${GREEN}✅ 管理员密码已更新${RESET}"
-    else
-        echo -e "${YELLOW}管理员密码保持默认 admin123${RESET}"
-    fi
-
-    echo -e "${GREEN}✅ config.yaml 已下载并修改 JWT Secret${RESET}"
+onboard_menu() {
+    echo "选择配置方式:"
+    echo "1) 无提示快速设置"
+    echo "2) 交互式向导"
+    echo "3) 仅修复频道/允许列表"
+    read -rp "请选择: " choice
+    case $choice in
+        1)
+            read -rp "请输入 API Key: " apikey
+            read -rp "请输入 Provider (openrouter/其它): " provider
+            zeroclaw onboard --api-key "$apikey" --provider "$provider"
+            ;;
+        2) zeroclaw onboard --interactive ;;
+        3) zeroclaw onboard --channels-only ;;
+        *) red "无效选择" ;;
+    esac
 }
 
-# 菜单
-menu() {
+chat_menu() {
+    echo "聊天模式:"
+    echo "1) 单条消息模式"
+    echo "2) 交互模式"
+    read -rp "请选择: " choice
+    case $choice in
+        1)
+            read -rp "输入消息: " msg
+            zeroclaw agent -m "$msg"
+            ;;
+        2) zeroclaw agent ;;
+        *) red "无效选择" ;;
+    esac
+}
+
+gateway_menu() {
+    echo "启动网关:"
+    echo "1) 默认端口 8080"
+    echo "2) 随机端口"
+    read -rp "请选择: " choice
+    case $choice in
+        1) zeroclaw gateway ;;
+        2) zeroclaw gateway --port 0 ;;
+        *) red "无效选择" ;;
+    esac
+}
+
+daemon_menu() {
+    zeroclaw daemon
+}
+
+system_check_menu() {
+    echo "系统检查:"
+    echo "1) 查看状态"
+    echo "2) 运行系统诊断"
+    echo "3) 检查频道健康"
+    echo "4) 获取集成设置详情"
+    read -rp "请选择: " choice
+    case $choice in
+        1) zeroclaw status ;;
+        2) zeroclaw doctor ;;
+        3) zeroclaw channel doctor ;;
+        4)
+            read -rp "请输入集成名称 (如 Telegram): " integ
+            zeroclaw integrations info "$integ"
+            ;;
+        *) red "无效选择" ;;
+    esac
+}
+
+service_menu() {
+    echo "后台服务管理:"
+    echo "1) 安装服务"
+    echo "2) 查看服务状态"
+    echo "3) 启动服务"
+    echo "4) 停止服务"
+    echo "5) 卸载服务"
+    read -rp "请选择: " choice
+    case $choice in
+        1) zeroclaw service install ;;
+        2) zeroclaw service status ;;
+        3) zeroclaw service start ;;
+        4) zeroclaw service stop ;;
+        5) zeroclaw service uninstall ;;
+        *) red "无效选择" ;;
+    esac
+}
+
+main_menu() {
     while true; do
-        clear
-        echo -e "${GREEN}=== Pika (SQLite) 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
+        echo ""
+        green "=== ZeroClaw 管理菜单 ==="
+        echo "1) 安装 / 更新 ZeroClaw"
+        echo "2) 配置 ZeroClaw"
+        echo "3) 聊天模式"
+        echo "4) 启动网关"
+        echo "5) 启动完整守护进程"
+        echo "6) 系统检查"
+        echo "7) 后台服务管理"
+        echo "0) 退出"
+        read -rp "请选择: " choice
         case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
+            1)
+                echo "1) 安装  2) 更新"
+                read -rp "选择: " sub
+                [[ $sub == 1 ]] && install_zeroclaw
+                [[ $sub == 2 ]] && update_zeroclaw
+                ;;
+            2) onboard_menu ;;
+            3) chat_menu ;;
+            4) gateway_menu ;;
+            5) daemon_menu ;;
+            6) system_check_menu ;;
+            7) service_menu ;;
             0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+            *) red "无效选择" ;;
         esac
     done
 }
 
-# 安装/启动
-install_app() {
-    check_docker
-    mkdir -p "$APP_DIR"
-    mkdir -p "$APP_DIR/data"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-
-    read -p "请输入访问端口 [默认:8080]: " input_port
-    PORT=${input_port:-8080}
-    check_port "$PORT" || return
-
-    # 下载 docker-compose 文件
-    curl -o "$COMPOSE_FILE" https://raw.githubusercontent.com/dushixiang/pika/main/docker-compose.sqlite.yml
-
-    # 修改 docker-compose 文件端口映射
-    sed -i "s/8080:8080/${PORT}:8080/" "$COMPOSE_FILE"
-
-    # 下载并修改配置文件
-    generate_config
-
-    cd "$APP_DIR" || exit
-    docker compose -f docker-compose.sqlite.yml up -d
-
-    echo -e "${GREEN}✅ Pika 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-# 更新
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose -f docker-compose.sqlite.yml pull
-    docker compose -f docker-compose.sqlite.yml up -d
-    echo -e "${GREEN}✅ Pika 更新完成${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-# 重启
-restart_app() {
-    cd "$APP_DIR" || return
-    docker compose -f docker-compose.sqlite.yml restart
-    echo -e "${GREEN}✅ Pika 已重启${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-# 查看日志
-view_logs() {
-    cd "$APP_DIR" || return
-    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker compose -f docker-compose.sqlite.yml logs -f
-}
-
-# 查看状态
-check_status() {
-    cd "$APP_DIR" || return
-    docker compose -f docker-compose.sqlite.yml ps
-    read -p "按回车返回菜单..."
-}
-
-# 卸载
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose -f docker-compose.sqlite.yml down
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Pika 已卸载${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-menu
+main_menu

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# LangBot 一键管理脚本
+# Pansou-Web 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,13 +8,9 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="langbot"
+APP_NAME="pansou"
 APP_DIR="/opt/$APP_NAME"
-REPO_URL="https://github.com/langbot-app/LangBot.git"
-COMPOSE_DIR="$APP_DIR/LangBot/docker"
-
-# 获取服务器IP
-SERVER_IP=$(hostname -I | awk '{print $1}')
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -27,10 +23,17 @@ check_docker() {
     fi
 }
 
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
+
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== LangBot 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Pansou 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -56,30 +59,94 @@ menu() {
 install_app() {
     check_docker
     mkdir -p "$APP_DIR"
-    cd "$APP_DIR" || exit
 
-    if [ -d "$APP_DIR/LangBot" ]; then
+    if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
         read confirm
         [[ "$confirm" != "y" ]] && return
-        rm -rf LangBot
     fi
 
-    git clone "$REPO_URL"
-    cd "$COMPOSE_DIR" || exit
+    read -p "请输入访问端口 [默认:805]: " input_port
+    PORT=${input_port:-805}
+    check_port "$PORT" || return
+
+    echo
+    read -p "是否启用认证功能？(y/n 默认n): " enable_auth
+
+    AUTH_ENABLED=false
+    AUTH_USERS=""
+    AUTH_TOKEN_EXPIRY=24
+    AUTH_JWT_SECRET=""
+
+    if [[ "$enable_auth" == "y" ]]; then
+        AUTH_ENABLED=true
+        read -p "请输入账号密码 (格式admin:MySecretPass123 ，多个用逗号分隔): " AUTH_USERS
+        read -p "Token有效期小时 [默认24]: " expiry
+        AUTH_TOKEN_EXPIRY=${expiry:-24}
+        AUTH_JWT_SECRET=$(openssl rand -hex 32)
+    fi
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  pansou:
+    image: ghcr.io/fish2018/pansou-web:latest
+    container_name: pansou-app
+    labels:
+      - "autoheal=true"
+    ports:
+      - "127.0.0.1:${PORT}:80"
+    environment:
+      - DOMAIN=localhost
+      - PANSOU_PORT=8888
+      - PANSOU_HOST=127.0.0.1
+      - CACHE_PATH=/app/data/cache
+      - LOG_PATH=/app/data/logs
+      - HEALTH_CHECK_INTERVAL=30
+      - HEALTH_CHECK_TIMEOUT=10
+      - HEALTH_CHECK_RETRIES=3
+      - AUTH_ENABLED=${AUTH_ENABLED}
+      - AUTH_USERS=${AUTH_USERS}
+      - AUTH_TOKEN_EXPIRY=${AUTH_TOKEN_EXPIRY}
+      - AUTH_JWT_SECRET=${AUTH_JWT_SECRET}
+    volumes:
+      - pansou-data:/app/data
+    restart: unless-stopped
+
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: pansou-autoheal
+    restart: always
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      - AUTOHEAL_INTERVAL=30
+      - AUTOHEAL_START_PERIOD=60
+      - AUTOHEAL_DEFAULT_STOP_TIMEOUT=10
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  pansou-data:
+    driver: local
+EOF
+
+    cd "$APP_DIR" || exit
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ LangBot 已启动${RESET}"
-    echo -e "${GREEN}✅ webui http://${SERVER_IP}":5300${RESET}"
+    echo -e "${GREEN}✅ Pansou-Web 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
     echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+
+    if [[ "$AUTH_ENABLED" == "true" ]]; then
+        echo -e "${GREEN}🔐 已启用认证功能${RESET}"
+        echo -e "${YELLOW}账号信息: ${AUTH_USERS}${RESET}"
+    fi
+
     read -p "按回车返回菜单..."
 }
 
 update_app() {
-    cd "$APP_DIR/LangBot" || { echo "未检测到安装目录"; sleep 1; return; }
-    git pull
-    cd docker || return
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
     docker compose pull
     docker compose up -d
     echo -e "${GREEN}✅ 更新完成${RESET}"
@@ -87,29 +154,26 @@ update_app() {
 }
 
 restart_app() {
-    cd "$COMPOSE_DIR" || { echo "未检测到安装"; sleep 1; return; }
-    docker compose restart
+    docker restart pansou-app
     echo -e "${GREEN}✅ 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    cd "$COMPOSE_DIR" || { echo "未检测到安装"; sleep 1; return; }
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker compose logs -f
+    docker logs -f pansou-app
 }
 
 check_status() {
-    cd "$COMPOSE_DIR" || { echo "未检测到安装"; sleep 1; return; }
-    docker compose ps
+    docker ps | grep pansou-app
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
-    cd "$COMPOSE_DIR" || return
+    cd "$APP_DIR" || return
     docker compose down
-    rm -rf "$APP_DIR/LangBot"
-    echo -e "${RED}✅ LangBot 已卸载${RESET}"
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ Pansou-Web 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

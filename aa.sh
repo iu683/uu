@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# GostPanel 一键管理脚本
+# NodePassDash 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="gostpanel"
+APP_NAME="nodepassdash"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -26,7 +26,7 @@ check_docker() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== GostPanel 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== NodePassDash 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -51,7 +51,7 @@ menu() {
 
 install_app() {
     check_docker
-    mkdir -p "$APP_DIR/data"
+    mkdir -p "$APP_DIR/db"
     mkdir -p "$APP_DIR/logs"
 
     if [ -f "$COMPOSE_FILE" ]; then
@@ -60,40 +60,35 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入映射端口 [默认:39100]: " input_port
-    PORT=${input_port:-39100}
-
-    read -p "请输入时区 [默认:Asia/Shanghai]: " input_tz
-    TZ=${input_tz:-Asia/Shanghai}
+    read -p "请输入映射端口 [默认:3000]: " input_port
+    PORT=${input_port:-3000}
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  gostpanel:
-    image: ghcr.io/code-gopher/gostpanel:latest
-    container_name: gostpanel
+  nodepassdash:
+    image: ghcr.io/nodepassproject/nodepassdash:latest
+    container_name: nodepassdash
     ports:
-      - "127.0.0.1:${PORT}:39100"
+      - "127.0.0.1:${PORT}:3000"
     volumes:
-      - ./data:/app/data
+      - ./db:/app/db
       - ./logs:/app/logs
-    environment:
-      - GIN_MODE=release
-      - TZ=${TZ}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:39100/api/v1/health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/health"]
       interval: 30s
-      timeout: 3s
-      retries: 3
+      timeout: 10s
+      retries: 5
+      start_period: 60s
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ GostPanel 已启动${RESET}"
+    echo -e "${GREEN}✅ NodePassDash 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    echo -e "${YELLOW}🌐 账号密码: 查看日志${RESET}"
     read -p "按回车返回菜单..."
 }
 
@@ -101,23 +96,23 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ GostPanel 更新完成${RESET}"
+    echo -e "${GREEN}✅ NodePassDash 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart gostpanel
-    echo -e "${GREEN}✅ GostPanel 已重启${RESET}"
+    docker restart nodepassdash
+    echo -e "${GREEN}✅ NodePassDash 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f gostpanel
+    docker logs -f nodepassdash
 }
 
 check_status() {
-    docker ps | grep gostpanel
+    docker ps | grep nodepassdash
     read -p "按回车返回菜单..."
 }
 
@@ -125,7 +120,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ GostPanel 已卸载${RESET}"
+    echo -e "${RED}✅ NodePassDash 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

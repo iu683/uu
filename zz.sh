@@ -1,369 +1,202 @@
 #!/bin/bash
-# ==================================================
-# VPS Geo Firewall Pro v3.2 Enterprise
-# Debian / Ubuntu
-# 独立链 / IPv4+IPv6 / 端口控制 / 自动更新 / 卸载
-# ==================================================
-
-CONF="/opt/geoip/geo.conf"
-UPDATE_SCRIPT="/opt/geoip/update_geo.sh"
-
-SCRIPT_PATH="/usr/local/bin/geofirewall"
-SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/uu.sh"
+# ========================================
+# Xray Reality 一键管理脚本
+# ========================================
 
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-green(){ echo -e "${GREEN}$1${RESET}"; }
-red(){ echo -e "${RED}$1${RESET}"; }
+APP_NAME="xray-reality"
+APP_DIR="/root/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/compose.yml"
+CONFIG_FILE="$APP_DIR/config.json"
 
-[[ $(id -u) != 0 ]] && red "请使用 root 运行" && exit 1
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
+    fi
+}
 
-
-
-# ================== 检测并切换 iptables 模式 ==================
-check_iptables_mode(){
-
-    IPT_MODE=$(iptables -V 2>/dev/null)
-
-    if echo "$IPT_MODE" | grep -q "nf_tables"; then
-        echo -e "${YELLOW}检测到 nft 模式，正在切换到 legacy...${RESET}"
-
-        update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null
-        update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null
-
-        echo -e "${GREEN}已切换到 iptables-legacy${RESET}"
+generate_keys() {
+    UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
+    read -p "是否自动生成 Reality 密钥对？[Y/n]: " keygen
+    keygen=${keygen:-Y}
+    if [[ "$keygen" =~ ^[Yy]$ ]]; then
+        X25519=$(docker run --rm ghcr.io/xtls/xray-core:latest x25519)
+        PRIVATE_KEY=$(echo "$X25519" | awk 'NR==1{print $1}')
+        PUBLIC_KEY=$(echo "$X25519" | awk 'NR==2{print $1}')
     else
-        echo -e "${GREEN}当前为 legacy 模式，无需切换${RESET}"
+        read -p "请输入 PrivateKey: " PRIVATE_KEY
+        read -p "请输入 PublicKey: " PUBLIC_KEY
     fi
+    SHORT_ID=$(openssl rand -hex 8)
 }
 
-# ================== 检测并关闭 UFW ==================
-check_ufw(){
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== Xray Reality 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-    if command -v ufw >/dev/null 2>&1; then
-        UFW_STATUS=$(ufw status 2>/dev/null | head -n1)
-
-        if echo "$UFW_STATUS" | grep -qi "active"; then
-            echo -e "${YELLOW}检测到 UFW 已启用，正在关闭...${RESET}"
-            ufw disable >/dev/null 2>&1
-            echo -e "${GREEN}UFW 已关闭${RESET}"
-        else
-            echo -e "${GREEN}UFW 未启用${RESET}"
-        fi
-    fi
-}
-
-# ================== 初始化环境 ==================
-init_env(){
-
-    for pkg in ipset iptables curl iptables-persistent; do
-        if ! dpkg -s "$pkg" >/dev/null 2>&1; then
-            apt-get update -qq
-            apt-get install -y "$pkg"
-        else
-        fi
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
     done
-
-    check_iptables_mode
-    check_ufw
-
-    mkdir -p /opt/geoip
-    touch $CONF
-}
-# ================== 下载或更新脚本 ==================
-download_script(){
-    mkdir -p "$(dirname "$SCRIPT_PATH")"
-    curl -sSL "$SCRIPT_URL" -o "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
-    green "已更新"
 }
 
-# ================== 获取信息 ==================
-get_my_ip(){ hostname -I | awk '{print $1}'; }
+install_app() {
+    check_docker
+    mkdir -p "$APP_DIR"
 
-get_ssh_port(){
-    grep -i "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1
+    # 端口设置
+    read -p "请输入监听端口 [443 默认]: " PORT
+    PORT=${PORT:-443}
+
+    # 域名设置，默认 itunes.apple.com
+    read -p "请输入域名 (用于 Reality serverNames, 默认 itunes.apple.com): " DOMAIN
+    DOMAIN=${DOMAIN:-itunes.apple.com}
+
+    # 自动生成 UUID、Reality 密钥和 shortId
+    UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
+    
+    # -------------------------------
+# 生成 X25519 密钥对（修复 pbk 问题）
+X25519=$(docker run --rm ghcr.io/xtls/xray-core:latest x25519)
+PRIVATE_KEY=$(echo "$X25519" | grep "Private key" | awk '{print $3}')
+PUBLIC_KEY=$(echo "$X25519" | grep "Public key"  | awk '{print $3}')
+
+# shortId
+SHORT_ID=$(openssl rand -hex 8)
+
+# DNS 默认 8.8.8.8,1.1.1.1
+read -p "请输入 DNS（默认 8.8.8.8,1.1.1.1）: " DNS
+DNS=${DNS:-8.8.8.8,1.1.1.1}
+
+# 生成 config.json
+cat > "$CONFIG_FILE" <<EOF
+{
+  "log": { "access": "/var/log/xray/access.log", "error": "/var/log/xray/error.log", "loglevel": "warning" },
+  "dns": {
+    "servers": ["$DNS"]
+  },
+  "inbounds": [
+    {
+      "port": $PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "$UUID",
+            "flow": "xtls-rprx-vision",
+            "level": 0,
+            "email": "user@example.com",
+            "realitySettings": {
+              "privateKey": "$PRIVATE_KEY",
+              "shortIds": ["$SHORT_ID"]
+            }
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "$DOMAIN:$PORT",
+          "xver": 0,
+          "serverNames": ["$DOMAIN"],
+          "privateKey": "$PRIVATE_KEY",
+          "publicKey": "$PUBLIC_KEY"
+        }
+      }
+    }
+  ],
+  "outbounds": [{"protocol": "freedom","settings":{}}]
 }
-
-# ================== 自动更新IP库 ==================
-install_auto_update(){
-
-cat > $UPDATE_SCRIPT <<EOF
-#!/bin/bash
-CONF="/opt/geoip/geo.conf"
-source \$CONF 2>/dev/null
-[[ -z "\$COUNTRIES" ]] && exit 0
-
-for CC in \$COUNTRIES; do
-    CC_L=\$(echo \$CC | tr A-Z a-z)
-    curl -s -o /opt/geoip/\${CC_L}.zone https://www.ipdeny.com/ipblocks/data/countries/\${CC_L}.zone
-    curl -s -o /opt/geoip/\${CC_L}.ipv6.zone https://www.ipdeny.com/ipv6/ipaddresses/aggregated/\${CC_L}-aggregated.zone
-done
 EOF
 
-chmod +x $UPDATE_SCRIPT
-(crontab -l 2>/dev/null | grep -v update_geo.sh; echo "0 3 * * * $UPDATE_SCRIPT") | crontab -
+    # 生成 Docker Compose
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  xray:
+    image: ghcr.io/xtls/xray-core:latest
+    container_name: xray
+    restart: unless-stopped
+    command: ["run", "-c", "/usr/local/etc/xray/config.json"]
+    volumes:
+      - ./config.json:/usr/local/etc/xray/config.json:ro
+    ports:
+      - "$PORT:$PORT/tcp"
+EOF
 
-green "已设置每日 03:00 自动更新IP库"
-}
+    cd "$APP_DIR" || exit
+    docker compose up -d
 
-# ================== 应用规则 ==================
-apply_rules(){
+    # 生成可用 VLESS Reality 链接
+    IP=$(hostname -I | awk '{print $1}')
+    TAG=HOSTNAME=$(hostname -s | sed 's/ /_/g')
+    VLESS_LINK="vless://${UUID}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${TAG}"
 
-    source $CONF 2>/dev/null
-    [[ -z "$COUNTRIES" ]] && red "未配置规则" && return
-
-    SSH_PORT=$(get_ssh_port)
-    [[ -z "$SSH_PORT" ]] && SSH_PORT=22
-    green "检测到 SSH 端口: $SSH_PORT"
-
-    # ===== 创建主链（不存在才创建）=====
-    iptables  -L GEO_CHAIN >/dev/null 2>&1 || iptables  -N GEO_CHAIN
-    ip6tables -L GEO_CHAIN >/dev/null 2>&1 || ip6tables -N GEO_CHAIN
-
-    iptables  -C INPUT -j GEO_CHAIN 2>/dev/null || iptables  -I INPUT -j GEO_CHAIN
-    ip6tables -C INPUT -j GEO_CHAIN 2>/dev/null || ip6tables -I INPUT -j GEO_CHAIN
-
-    # ===== 基础放行规则（防重复）=====
-    iptables -C GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
-    iptables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-    ip6tables -C GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
-    ip6tables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-    MYIP=$(get_my_ip)
-    [[ -n "$MYIP" ]] && \
-    iptables -C GEO_CHAIN -s $MYIP -j ACCEPT 2>/dev/null || \
-    iptables -A GEO_CHAIN -s $MYIP -j ACCEPT
-
-    iptables -C GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT 2>/dev/null || \
-    iptables -A GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
-
-    ip6tables -C GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT 2>/dev/null || \
-    ip6tables -A GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
-
-    # ===== 白名单 =====
-    for ip in $WHITELIST; do
-        iptables  -C GEO_CHAIN -s $ip -j ACCEPT 2>/dev/null || \
-        iptables  -A GEO_CHAIN -s $ip -j ACCEPT
-
-        ip6tables -C GEO_CHAIN -s $ip -j ACCEPT 2>/dev/null || \
-        ip6tables -A GEO_CHAIN -s $ip -j ACCEPT
-    done
-
-    # ===== 国家规则 =====
-    for CC in $COUNTRIES; do
-        CC_L=$(echo $CC | tr A-Z a-z)
-
-        V4SET="geo_${CC_L}_v4"
-        V6SET="geo_${CC_L}_v6"
-
-        V4FILE="/opt/geoip/${CC_L}.zone"
-        V6FILE="/opt/geoip/${CC_L}.ipv6.zone"
-
-        # 下载IP库
-        curl -s -o $V4FILE https://www.ipdeny.com/ipblocks/data/countries/$CC_L.zone
-        curl -s -o $V6FILE https://www.ipdeny.com/ipv6/ipaddresses/aggregated/$CC_L-aggregated.zone
-
-        # 创建ipset（不删除旧数据）
-        ipset create $V4SET hash:net family inet -exist
-        ipset create $V6SET hash:net family inet6 -exist
-
-        while read -r ip; do
-            [[ -n "$ip" ]] && ipset add $V4SET "$ip" 2>/dev/null
-        done < "$V4FILE"
-
-        [[ -f "$V6FILE" ]] && while read -r ip; do
-            [[ -n "$ip" ]] && ipset add $V6SET "$ip" 2>/dev/null
-        done < "$V6FILE"
-
-        # ===== 应用iptables规则 =====
-        if [[ "$PORTS" == "all" ]]; then
-            for proto in tcp udp; do
-                if [[ "$MODE" == "block" ]]; then
-
-                    iptables  -C GEO_CHAIN -p $proto -m set --match-set $V4SET src -j DROP 2>/dev/null || \
-                    iptables  -A GEO_CHAIN -p $proto -m set --match-set $V4SET src -j DROP
-
-                    ip6tables -C GEO_CHAIN -p $proto -m set --match-set $V6SET src -j DROP 2>/dev/null || \
-                    ip6tables -A GEO_CHAIN -p $proto -m set --match-set $V6SET src -j DROP
-
-                else
-
-                    iptables  -C GEO_CHAIN -p $proto -m set ! --match-set $V4SET src -j DROP 2>/dev/null || \
-                    iptables  -A GEO_CHAIN -p $proto -m set ! --match-set $V4SET src -j DROP
-
-                    ip6tables -C GEO_CHAIN -p $proto -m set ! --match-set $V6SET src -j DROP 2>/dev/null || \
-                    ip6tables -A GEO_CHAIN -p $proto -m set ! --match-set $V6SET src -j DROP
-
-                fi
-            done
-        else
-            for p in $PORTS; do
-                for proto in tcp udp; do
-                    if [[ "$MODE" == "block" ]]; then
-
-                        iptables  -C GEO_CHAIN -p $proto --dport $p -m set --match-set $V4SET src -j DROP 2>/dev/null || \
-                        iptables  -A GEO_CHAIN -p $proto --dport $p -m set --match-set $V4SET src -j DROP
-
-                        ip6tables -C GEO_CHAIN -p $proto --dport $p -m set --match-set $V6SET src -j DROP 2>/dev/null || \
-                        ip6tables -A GEO_CHAIN -p $proto --dport $p -m set --match-set $V6SET src -j DROP
-
-                    else
-
-                        iptables  -C GEO_CHAIN -p $proto --dport $p -m set ! --match-set $V4SET src -j DROP 2>/dev/null || \
-                        iptables  -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set $V4SET src -j DROP
-
-                        ip6tables -C GEO_CHAIN -p $proto --dport $p -m set ! --match-set $V6SET src -j DROP 2>/dev/null || \
-                        ip6tables -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set $V6SET src -j DROP
-
-                    fi
-                done
-            done
-        fi
-    done
-
-    netfilter-persistent save >/dev/null 2>&1
-    green "Geo v4/v6 防火墙规则已成功应用"
-}
-
-# ================== 添加规则 ==================
-add_rule(){
-    read -p "模式 (1=封锁 2=只允许): " m
-    [[ $m == 1 ]] && MODE="block" || MODE="allow"
-    read -p "国家代码 (如 cn jp us): " COUNTRIES
-    read -p "端口 (all 或 22 80 多个空格分隔): " PORTS
-
-    echo "MODE=\"$MODE\"" > $CONF
-    echo "COUNTRIES=\"$COUNTRIES\"" >> $CONF
-    echo "PORTS=\"$PORTS\"" >> $CONF
-    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
-
-    install_auto_update
-    apply_rules
-}
-
-# ================== 白名单 ==================
-add_whitelist(){
-    read -p "输入要加入白名单IP (多个空格分隔): " ips
-    source $CONF 2>/dev/null
-    WHITELIST="$WHITELIST $ips"
-
-    echo "MODE=\"$MODE\"" > $CONF
-    echo "COUNTRIES=\"$COUNTRIES\"" >> $CONF
-    echo "PORTS=\"$PORTS\"" >> $CONF
-    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
-
-    green "白名单已更新"
-    apply_rules
-}
-
-# ================== 查看规则 ==================
-view_rules(){
-    clear
-    green "========= 当前配置 ========="
-    cat $CONF 2>/dev/null
     echo
-    iptables -L GEO_CHAIN -n --line-numbers 2>/dev/null
-    echo
-    ipset list | grep "^Name:"
+    echo -e "${GREEN}✅ Xray Reality 已启动${RESET}"
+    echo -e "${YELLOW}VLESS Reality 链接:${RESET}"
+    echo -e "${YELLOW}${VLESS_LINK}${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-
-# ================== 删除指定端口规则 ==================
-delete_rules(){
-
-    source $CONF 2>/dev/null
-    [[ -z "$PORTS" ]] && red "未检测到配置" && return
-
-    read -p "输入要删除的端口 (如 80 多个空格): " DEL_PORTS
-    [[ -z "$DEL_PORTS" ]] && red "未输入端口" && return
-
-    for p in $DEL_PORTS; do
-        for proto in tcp udp; do
-
-            # 删除 IPv4 规则
-            iptables -L GEO_CHAIN --line-numbers -n | \
-            grep "$proto" | grep "dpt:$p" | \
-            awk '{print $1}' | sort -rn | \
-            while read num; do
-                iptables -D GEO_CHAIN $num
-            done
-
-            # 删除 IPv6 规则
-            ip6tables -L GEO_CHAIN --line-numbers -n | \
-            grep "$proto" | grep "dpt:$p" | \
-            awk '{print $1}' | sort -rn | \
-            while read num; do
-                ip6tables -D GEO_CHAIN $num
-            done
-
-        done
-        green "端口 $p 规则已删除"
-    done
-
-    netfilter-persistent save >/dev/null 2>&1
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ Xray Reality 更新完成${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-# ================== 卸载 ==================
-uninstall_all(){
-
-    green "正在卸载"
-
-    # 删除规则
-    iptables -D INPUT -j GEO_CHAIN 2>/dev/null
-    ip6tables -D INPUT -j GEO_CHAIN 2>/dev/null
-    iptables -F GEO_CHAIN 2>/dev/null
-    ip6tables -F GEO_CHAIN 2>/dev/null
-    iptables -X GEO_CHAIN 2>/dev/null
-    ip6tables -X GEO_CHAIN 2>/dev/null
-
-    # 删除 ipset
-    ipset list | grep "^Name: geo_" | awk '{print $2}' | xargs -r -I {} ipset destroy {}
-
-    # 删除配置和更新脚本
-    rm -rf /opt/geoip
-
-    # 删除定时任务
-    crontab -l 2>/dev/null | grep -v update_geo.sh | crontab -
-
-    # 删除主程序
-    rm -f $SCRIPT_PATH
-
-    netfilter-persistent save >/dev/null 2>&1
-
-    green "已彻底卸载完成"
-    exit 0
-}
-# ================== 菜单 ==================
-menu(){
-clear
-echo -e "${GREEN}===== VPS国家防火墙 =====${RESET}"
-echo -e "${GREEN}1 添加规则${RESET}"
-echo -e "${GREEN}2 删除规则${RESET}"
-echo -e "${GREEN}3 查看规则${RESET}"
-echo -e "${GREEN}4 添加白名单${RESET}"
-echo -e "${GREEN}5 更新${RESET}"
-echo -e "${GREEN}6 卸载${RESET}"
-echo -e "${GREEN}0 退出${RESET}"
-read -r -p $'\033[32m请选择: \033[0m' num
-case $num in
-1) add_rule ;;
-2) delete_rules ;;
-3) view_rules ;;
-4) add_whitelist ;;
-5) download_script ;;
-6) uninstall_all ;;
-0) exit ;;
-esac
+restart_app() {
+    docker restart xray
+    echo -e "${GREEN}✅ Xray Reality 已重启${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-# ================== 主循环 ==================
-init_env
-while true; do
-    menu
-    read -r -p $'\033[32m按回车继续...\033[0m'
-done
+view_logs() {
+    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
+    docker logs -f xray
+}
+
+check_status() {
+    docker ps | grep xray
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ Xray Reality 已卸载${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+menu

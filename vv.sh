@@ -69,29 +69,48 @@ install_app() {
     check_docker
     mkdir -p "$APP_DIR"
 
-    # 端口设置
-    read -p "请输入监听端口 [443 默认]: " PORT
+    read -p "请输入监听端口 [默认 443]: " PORT
     PORT=${PORT:-443}
 
-    # 域名设置，默认 itunes.apple.com
-    read -p "请输入域名 (用于 Reality serverNames, 默认 itunes.apple.com): " DOMAIN
+    read -p "请输入伪装域名 [默认 itunes.apple.com]: " DOMAIN
     DOMAIN=${DOMAIN:-itunes.apple.com}
 
-    # 自动生成 UUID、Reality 密钥和 shortId
     UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
-    
-    # 生成 X25519 密钥对
+
     X25519=$(docker run --rm ghcr.io/xtls/xray-core:latest x25519)
-    PRIVATE_KEY=$(echo "$X25519" | awk 'NR==1{print $1}')
-    PUBLIC_KEY=$(echo "$X25519" | awk 'NR==2{print $1}')
-    
-    # 生成 shortId
+
+    PRIVATE_KEY=$(echo "$X25519" | grep "PrivateKey" | awk -F': ' '{print $2}')
+    PUBLIC_KEY=$(echo "$X25519"  | grep "Password"   | awk -F': ' '{print $2}')
+
+    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
+        echo -e "${RED}密钥生成失败${RESET}"
+        return
+    fi
+
     SHORT_ID=$(openssl rand -hex 8)
 
-    # 生成 config.json
+    read -p "请输入 DNS（逗号分隔，默认 8.8.8.8,1.1.1.1）: " DNS_INPUT
+    DNS_INPUT=${DNS_INPUT:-8.8.8.8,1.1.1.1}
+
+    # 转换为 JSON 数组格式
+    IFS=',' read -ra DNS_ARRAY <<< "$DNS_INPUT"
+
+    DNS_SERVERS="["
+    for dns in "${DNS_ARRAY[@]}"; do
+        DNS_SERVERS+="\"${dns}\","
+    done
+    DNS_SERVERS="${DNS_SERVERS%,}]"
+
     cat > "$CONFIG_FILE" <<EOF
 {
-  "log": { "access": "/var/log/xray/access.log", "error": "/var/log/xray/error.log", "loglevel": "warning" },
+  "log": {
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log",
+    "loglevel": "warning"
+  },
+  "dns": {
+    "servers": $DNS_SERVERS
+  },
   "inbounds": [
     {
       "port": $PORT,
@@ -102,11 +121,7 @@ install_app() {
             "id": "$UUID",
             "flow": "xtls-rprx-vision",
             "level": 0,
-            "email": "user@example.com",
-            "realitySettings": {
-              "privateKey": "$PRIVATE_KEY",
-              "shortIds": ["$SHORT_ID"]
-            }
+            "email": "user@example.com"
           }
         ],
         "decryption": "none"
@@ -116,30 +131,30 @@ install_app() {
         "security": "reality",
         "realitySettings": {
           "show": false,
-          "dest": "$DOMAIN:$PORT",
+          "dest": "$DOMAIN:443",
           "xver": 0,
           "serverNames": ["$DOMAIN"],
           "privateKey": "$PRIVATE_KEY",
-          "publicKey": "$PUBLIC_KEY"
+          "shortIds": ["$SHORT_ID"]
         }
       }
     }
   ],
-  "outbounds": [{"protocol": "freedom", "settings": {}}]
+  "outbounds": [
+    { "protocol": "freedom", "settings": {} }
+  ]
 }
 EOF
 
-    # 生成 Docker Compose
     cat > "$COMPOSE_FILE" <<EOF
-version: '3.8'
 services:
   xray:
     image: ghcr.io/xtls/xray-core:latest
     container_name: xray
     restart: unless-stopped
-    command: ["run", "-c", "/usr/local/etc/xray/config.json"]
+    command: ["run","-c","/etc/xray/config.json"]
     volumes:
-      - ./config.json:/usr/local/etc/xray/config.json:ro
+      - ./config.json:/etc/xray/config.json:ro
     ports:
       - "$PORT:$PORT/tcp"
 EOF
@@ -147,19 +162,16 @@ EOF
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    # 生成可用 VLESS Reality 链接
     IP=$(hostname -I | awk '{print $1}')
-    TAG=HOSTNAME=$(hostname -s | sed 's/ /_/g')
-    VLESS_LINK="vless://${UUID}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${TAG}"
+    TAG=$(hostname -s)
+
+    VLESS_LINK="vless://${UUID}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${TAG}"
 
     echo
-    echo -e "${GREEN}✅ Xray Reality 已启动${RESET}"
-    echo -e "${YELLOW}VLESS Reality 链接:${RESET}"
+    echo -e "${GREEN}✅ 安装完成${RESET}"
     echo -e "${YELLOW}${VLESS_LINK}${RESET}"
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
     read -p "按回车返回菜单..."
 }
-
 update_app() {
     cd "$APP_DIR" || return
     docker compose pull

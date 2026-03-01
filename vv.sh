@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Xray Reality 多节点管理脚本
+# Xray Socks5 多节点管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,9 +8,12 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="xray-reality"
-APP_DIR="/root/$APP_NAME"
+APP_NAME="xray-socks5"
+APP_DIR="/opt/$APP_NAME"
 
+# ========================================
+# Docker 检测
+# ========================================
 check_docker() {
     if ! command -v docker &>/dev/null; then
         echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
@@ -22,9 +25,12 @@ check_docker() {
     fi
 }
 
+# ========================================
+# 列出节点
+# ========================================
 list_nodes() {
     mkdir -p "$APP_DIR"
-    echo -e "${GREEN}=== 已有 Xray Reality 节点 ===${RESET}"
+    echo -e "${GREEN}=== 已有 Socks5 节点 ===${RESET}"
     local count=0
     for node in "$APP_DIR"/*; do
         [ -d "$node" ] || continue
@@ -34,36 +40,20 @@ list_nodes() {
     [ $count -eq 0 ] && echo -e "${YELLOW}无节点${RESET}"
 }
 
-select_node() {
-    list_nodes
-    read -r -p $'\033[32m请输入节点名称或编号: \033[0m' input
-    if [[ "$input" =~ ^[0-9]+$ ]]; then
-        NODE_NAME=$(ls -d "$APP_DIR"/* | sed -n "${input}p" | xargs basename)
-    else
-        NODE_NAME="$input"
-    fi
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-    if [ ! -d "$NODE_DIR" ]; then
-        echo -e "${RED}节点不存在！${RESET}"
-        return 1
-    fi
+# ========================================
+# 随机端口
+# ========================================
+random_port() {
+    while :; do
+        PORT=$(shuf -i 2000-65000 -n1)
+        ss -lnt | awk '{print $4}' | grep -q ":$PORT$" || break
+    done
+    echo "$PORT"
 }
 
-generate_keys() {
-    UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
-    read -p "是否自动生成 Reality 密钥对？[Y/n]: " keygen
-    keygen=${keygen:-Y}
-    if [[ "$keygen" =~ ^[Yy]$ ]]; then
-        X25519=$(docker run --rm ghcr.io/xtls/xray-core:latest x25519)
-        PRIVATE_KEY=$(echo "$X25519" | awk 'NR==1{print $1}')
-        PUBLIC_KEY=$(echo "$X25519" | awk 'NR==2{print $1}')
-    else
-        read -p "请输入 PrivateKey: " PRIVATE_KEY
-        read -p "请输入 PublicKey: " PUBLIC_KEY
-    fi
-    SHORT_ID=$(openssl rand -hex 8)
-}
-
+# ========================================
+# 创建新节点
+# ========================================
 install_node() {
     check_docker
     read -p "请输入节点名称 [node$(date +%s)]: " NODE_NAME
@@ -71,64 +61,45 @@ install_node() {
     NODE_DIR="$APP_DIR/$NODE_NAME"
     mkdir -p "$NODE_DIR"
 
-    # 随机端口
-    random_port() {
-        while :; do
-            PORT=$(shuf -i 2000-65000 -n1)
-            ss -lnt | awk '{print $4}' | grep -q ":$PORT$" || break
-        done
-        echo "$PORT"
-    }
-
     read -p "请输入监听端口 [默认随机]: " PORT
     PORT=${PORT:-$(random_port)}
-    echo -e "${YELLOW}使用端口: ${PORT}${RESET}"
+    echo -e "${YELLOW}使用端口: $PORT${RESET}"
 
-    read -p "请输入伪装域名 [默认 itunes.apple.com]: " DOMAIN
-    DOMAIN=${DOMAIN:-itunes.apple.com}
+    # 生成随机用户名函数
+    random_username() {
+        tr -dc a-z0-9 </dev/urandom | head -c6
+    }
 
-    UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
-    X25519=$(docker run --rm ghcr.io/xtls/xray-core:latest x25519)
+    # 提示用户输入，默认随机用户名
+    read -p "请输入用户名 [默认随机生成]: " USERNAME
+    USERNAME=${USERNAME:-$(random_username)}
 
-    PRIVATE_KEY=$(echo "$X25519" | grep "PrivateKey" | awk -F': ' '{print $2}')
-    PUBLIC_KEY=$(echo "$X25519"  | grep "Password"   | awk -F': ' '{print $2}')
+    echo "使用的用户名: $USERNAME"
 
-    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-        echo -e "${RED}密钥生成失败${RESET}"
-        return
+    read -p "请输入密码 [默认随机]: " PASSWORD
+    if [[ -z "$PASSWORD" ]]; then
+        PASSWORD=$(openssl rand -base64 8)
+        echo -e "${YELLOW}已生成密码: $PASSWORD${RESET}"
     fi
-
-    SHORT_ID=$(openssl rand -hex 8)
-
-    read -p "请输入 DNS（逗号分隔，默认 8.8.8.8,1.1.1.1）: " DNS_INPUT
-    DNS_INPUT=${DNS_INPUT:-8.8.8.8,1.1.1.1}
-    IFS=',' read -ra DNS_ARRAY <<< "$DNS_INPUT"
-    DNS_SERVERS="["
-    for dns in "${DNS_ARRAY[@]}"; do
-        DNS_SERVERS+="\"$dns\","
-    done
-    DNS_SERVERS="${DNS_SERVERS%,}]"
 
     CONFIG_FILE="$NODE_DIR/config.json"
     COMPOSE_FILE="$NODE_DIR/compose.yml"
 
     cat > "$CONFIG_FILE" <<EOF
 {
-  "log": { "access": "/var/log/xray/access.log", "error": "/var/log/xray/error.log", "loglevel": "warning" },
-  "dns": { "servers": $DNS_SERVERS },
+  "log": { "loglevel": "warning" },
   "inbounds": [
     {
       "port": $PORT,
-      "protocol": "vless",
-      "settings": { "clients": [{"id":"$UUID","flow":"xtls-rprx-vision","level":0,"email":"user@example.com"}], "decryption":"none" },
-      "streamSettings": {
-        "network":"tcp",
-        "security":"reality",
-        "realitySettings": {"show":false,"dest":"$DOMAIN:443","xver":0,"serverNames":["$DOMAIN"],"privateKey":"$PRIVATE_KEY","shortIds":["$SHORT_ID"]}
+      "protocol": "socks",
+      "settings": {
+        "auth": "password",
+        "accounts": [{"user": "$USERNAME","pass":"$PASSWORD"}],
+        "udp": true
       }
     }
   ],
-  "outbounds":[{"protocol":"freedom","settings":{}}]
+  "outbounds": [{"protocol":"freedom"}]
 }
 EOF
 
@@ -143,22 +114,36 @@ services:
       - ./config.json:/etc/xray/config.json:ro
     ports:
       - "$PORT:$PORT/tcp"
+      - "$PORT:$PORT/udp"
 EOF
 
-    cd "$NODE_DIR" || exit
+    cd "$NODE_DIR" || return
     docker compose up -d
 
     IP=$(hostname -I | awk '{print $1}')
-    TAG=$(hostname -s)
-    VLESS_LINK="vless://${UUID}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${TAG}"
+    SOCKS_LINK="socks://${USERNAME}:${PASSWORD}@${IP}:${PORT}"
+    TG_LINK="https://t.me/socks?server=${IP}&port=${PORT}&user=${USERNAME}&pass=${PASSWORD}"
 
     echo -e "${GREEN}✅ 节点 $NODE_NAME 已启动${RESET}"
-    echo -e "${YELLOW}$VLESS_LINK${RESET}"
+    echo -e "${YELLOW}Socks地址:${RESET} ${GREEN}$SOCKS_LINK${RESET}"
+    echo -e "${YELLOW}Telegram快链:${RESET} ${GREEN}$TG_LINK${RESET}"
     read -r -p $'\033[32m按回车返回菜单...\033[0m'
 }
 
+# ========================================
+# 节点管理菜单
+# ========================================
 node_action_menu() {
-    select_node || return
+    list_nodes
+    read -r -p $'\033[32m请输入节点名称或编号: \033[0m' input
+    if [[ "$input" =~ ^[0-9]+$ ]]; then
+        NODE_NAME=$(ls -d "$APP_DIR"/* | sed -n "${input}p" | xargs basename)
+    else
+        NODE_NAME="$input"
+    fi
+    NODE_DIR="$APP_DIR/$NODE_NAME"
+    [ -d "$NODE_DIR" ] || { echo -e "${RED}节点不存在${RESET}"; return; }
+
     while true; do
         echo -e "${GREEN}=== 节点 [$NODE_NAME] 管理 ===${RESET}"
         echo -e "${GREEN}1) 暂停${RESET}"
@@ -166,9 +151,9 @@ node_action_menu() {
         echo -e "${GREEN}3) 更新${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 卸载${RESET}"
-        echo -e "${GREEN}0) 返回主菜单${RESET}"
+        echo -e "${GREEN}0) 返回${RESET}"
         read -r -p $'\033[32m请选择操作: \033[0m' choice
-        case $choice in
+        case $choice in   
             1) docker pause "$NODE_NAME" ;;
             2) docker restart "$NODE_NAME" ;;
             3) docker compose -f "$NODE_DIR/compose.yml" pull && docker compose -f "$NODE_DIR/compose.yml" up -d ;;
@@ -180,6 +165,9 @@ node_action_menu() {
     done
 }
 
+# ========================================
+# 查看所有节点状态
+# ========================================
 show_all_status() {
     list_nodes
     echo -e "${GREEN}=== 节点状态 ===${RESET}"
@@ -194,13 +182,16 @@ show_all_status() {
     read -r -p $'\033[32m按回车返回菜单...\033[0m'
 }
 
+# ========================================
+# 批量操作节点
+# ========================================
 batch_action() {
     echo -e "${GREEN}=== 批量操作 ===${RESET}"
     echo -e "${GREEN}1) 暂停节点${RESET}"
     echo -e "${GREEN}2) 重启节点${RESET}"
     echo -e "${GREEN}3) 更新节点${RESET}"
     echo -e "${GREEN}4) 卸载节点${RESET}"
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
+    echo -e "${GREEN}0) 返回${RESET}"
     read -r -p $'\033[32m请选择操作: \033[0m' choice
 
     mkdir -p "$APP_DIR"
@@ -229,7 +220,7 @@ batch_action() {
     for NODE_NAME in "${SELECTED_NODES[@]}"; do
         NODE_DIR="$APP_DIR/$NODE_NAME"
         [ -d "$NODE_DIR" ] || continue
-        [ -f "$NODE_DIR/compose.yml" ] || { echo -e "${YELLOW}⚠ 节点 $NODE_NAME docker-compose.yml 不存在，跳过${RESET}"; continue; }
+        [ -f "$NODE_DIR/compose.yml" ] || { echo -e "${YELLOW}⚠ 节点 $NODE_NAME compose.yml 不存在，跳过${RESET}"; continue; }
         cd "$NODE_DIR" || continue
 
         case $choice in
@@ -245,11 +236,14 @@ batch_action() {
     read -r -p $'\033[32m按回车返回菜单...\033[0m'
 }
 
+# ========================================
+# 主菜单
+# ========================================
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Xray Reality 多节点管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动新节点${RESET}"
+        echo -e "${GREEN}=== Xray Socks5 多节点管理 ===${RESET}"
+        echo -e "${GREEN}1) 创建新节点${RESET}"
         echo -e "${GREEN}2) 管理已有节点${RESET}"
         echo -e "${GREEN}3) 查看所有节点状态${RESET}"
         echo -e "${GREEN}4) 批量操作节点${RESET}"
@@ -261,7 +255,7 @@ menu() {
             3) show_all_status ;;
             4) batch_action ;;
             0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
         esac
     done
 }

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Emby Pulse 一键管理脚本
+# AIClient-2 API 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,10 +8,9 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="emby-pulse"
+APP_NAME="aiclient2api"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_DIR="$APP_DIR/config"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -24,13 +23,10 @@ check_docker() {
     fi
 }
 
-# 获取服务器IP
-SERVER_IP=$(hostname -I | awk '{print $1}')
-
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Emby Pulse 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== AIClient-2 API 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -55,8 +51,7 @@ menu() {
 
 install_app() {
     check_docker
-    mkdir -p "$CONFIG_DIR"
-    mkdir -p "$APP_DIR/static/img"
+    mkdir -p "$APP_DIR/configs"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -64,43 +59,45 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入时区 [默认:Asia/Shanghai]: " input_tz
-    TZ=${input_tz:-Asia/Shanghai}
+    # 只自定义第一个主端口
+    read -p "请输入主访问端口 [默认:3180]: " input_port
+    MAIN_PORT=${input_port:-3180}
 
-    read -p "请输入 Emby 主机地址 [默认:http://192.168.31.2:8096]: " input_host
-    EMBY_HOST=${input_host:-http://192.168.31.2:8096}
+    # 扩展端口固定
+    PORT_BLOCK='
+      - "8085-8087:8085-8087"
+      - "1455:1455"
+      - "19876-19880:19876-19880"'
 
-    read -p "请输入 Emby API Key [默认:xxxxxxxxxxxxxxxxx]: " input_key
-    EMBY_API_KEY=${input_key:-xxxxxxxxxxxxxxxxx}
-
-    read -p "请输入数据库路径 [默认:/volume1/docker/emby/data/playback_reporting.db]: " input_db
-    DB_PATH=${input_db:-/volume1/docker/emby/data/playback_reporting.db}
-
-    mkdir -p "$(dirname "$DB_PATH")"
+    read -p "请输入 ARGS 参数 (可留空): " ARGS_VALUE
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  emby-pulse:
-    image: zeyu8023/emby-stats:latest
-    container_name: emby-pulse
+  aiclient-api:
+    image: justlikemaki/aiclient-2-api:latest
+    container_name: aiclient2api
     restart: unless-stopped
-    network_mode: host
+    ports:
+      - "${MAIN_PORT}:3000"${PORT_BLOCK}
     volumes:
-      - $(dirname "$DB_PATH"):/emby-data
-      - ./config:/app/config
+      - ./configs:/app/configs
     environment:
-      - TZ=${TZ}
-      - DB_PATH=${DB_PATH}
-      - EMBY_HOST=${EMBY_HOST}
-      - EMBY_API_KEY=${EMBY_API_KEY}
+      - ARGS=${ARGS_VALUE}
+    healthcheck:
+      test: ["CMD", "node", "healthcheck.js"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ Emby Pulse 已启动${RESET}"
-    echo -e "${GREEN}✅ webui http://${SERVER_IP}:10307${RESET}"
+    echo -e "${GREEN}✅ AIClient-2 API 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${MAIN_PORT}${RESET}"
+    echo -e "${YELLOW}🌐 密码: admin123 ${RESET}"
     echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
     read -p "按回车返回菜单..."
 }
@@ -109,23 +106,23 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Emby Pulse 更新完成${RESET}"
+    echo -e "${GREEN}✅ AIClient-2 API 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart emby-pulse
-    echo -e "${GREEN}✅ Emby Pulse 已重启${RESET}"
+    docker restart aiclient2api
+    echo -e "${GREEN}✅ AIClient-2 API 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f emby-pulse
+    docker logs -f aiclient2api
 }
 
 check_status() {
-    docker ps | grep emby-pulse
+    docker ps | grep aiclient2api
     read -p "按回车返回菜单..."
 }
 
@@ -133,7 +130,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Emby Pulse 已卸载${RESET}"
+    echo -e "${RED}✅ AIClient-2 API 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

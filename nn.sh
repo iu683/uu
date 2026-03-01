@@ -36,14 +36,14 @@ list_nodes() {
     for node in "$APP_DIR"/*; do
         [ -d "$node" ] || continue
         count=$((count+1))
-        echo "[$count] $(basename "$node")"
+        echo -e "${YELLOW}[$count] $(basename "$node")${RESET}"
     done
-    [ $count -eq 0 ] && echo "无节点"
+    [ $count -eq 0 ] && echo -e "${YELLOW}无节点${RESET}"
 }
 
 select_node() {
     list_nodes
-    read -p "请输入节点名称或编号: " input
+    read -r -p $'\033[32m请输入节点名称或编号: \033[0m' input
     if [[ "$input" =~ ^[0-9]+$ ]]; then
         NODE_NAME=$(ls -d "$APP_DIR"/* | sed -n "${input}p" | xargs basename)
     else
@@ -116,23 +116,23 @@ EOF
     echo -e "${GREEN}✅ 节点 ${NODE_NAME} 已启动${RESET}"
     echo -e "${YELLOW}🌐 端口: ${PORT}${RESET}"
     echo -e "${YELLOW}🔑 PSK: ${PSK}${RESET}"
-    echo -e "${YELLOW}📄 客户端配置模板: $NODE_NAME = snell, ${IP}, ${PORT}, psk=${PSK}, version=5, reuse=true, tfo=${TFO}, ecn=${ECN}${RESET}"
-    read -p "按回车返回菜单..."
+    echo -e "${YELLOW}📄 客户端配置: $NODE_NAME = snell, ${IP}, ${PORT}, psk=${PSK}, version=5, reuse=true, tfo=${TFO}, ecn=${ECN}${RESET}"
+    read -r -p $'\033[32m按回车返回菜单...\033[0m'
 }
 
 node_action_menu() {
     select_node || return
     while true; do
         echo -e "${GREEN}=== 节点 [$NODE_NAME] 管理 ===${RESET}"
-        echo -e "${GREEN}1) 启动${RESET}"
+        echo -e "${GREEN}1) 暂停${RESET}"
         echo -e "${GREEN}2) 重启${RESET}"
         echo -e "${GREEN}3) 更新${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 卸载${RESET}"
         echo -e "${GREEN}0) 返回主菜单${RESET}"
-        read -p "请选择操作: " choice
+        read -r -p $'\033[32m请选择操作: \033[0m' choice
         case $choice in
-            1) docker compose -f "$NODE_DIR/docker-compose.yml" up -d ;;
+            1) docker pause "$NODE_NAME" ;;
             2) docker restart "$NODE_NAME" ;;
             3) docker compose -f "$NODE_DIR/docker-compose.yml" pull && docker compose -f "$NODE_DIR/docker-compose.yml" up -d ;;
             4) docker logs -f "$NODE_NAME" ;;
@@ -141,6 +141,69 @@ node_action_menu() {
             *) echo -e "${RED}无效选择${RESET}" ;;
         esac
     done
+}
+
+batch_action() {
+    echo -e "${GREEN}=== 批量操作 ===${RESET}"
+    echo -e "${GREEN}1) 暂停节点${RESET}"
+    echo -e "${GREEN}2) 重启节点${RESET}"
+    echo -e "${GREEN}3) 更新节点${RESET}"
+    echo -e "${GREEN}4) 卸载节点${RESET}"
+    echo -e "${GREEN}0) 返回主菜单${RESET}"
+    read -r -p $'\033[32m请选择操作: \033[0m' choice
+    
+    mkdir -p "$APP_DIR"
+
+    # 列出节点
+    declare -A NODE_MAP
+    local count=0
+    for node in "$APP_DIR"/*; do
+        [ -d "$node" ] || continue
+        count=$((count+1))
+        NODE_NAME=$(basename "$node")
+        NODE_MAP[$count]="$NODE_NAME"
+        echo -e "${YELLOW}[$count] $NODE_NAME${RESET}"
+    done
+    [ $count -eq 0 ] && { echo -e "${YELLOW}无节点${RESET}"; read -p "按回车返回菜单..." ; return ; }
+
+    read -p "请输入要操作的节点序号（用空格分隔，或输入 all 全选）: " input_nodes
+
+    # 处理输入
+    if [[ "$input_nodes" == "all" ]]; then
+        SELECTED_NODES=("${NODE_MAP[@]}")
+    else
+        SELECTED_NODES=()
+        for i in $input_nodes; do
+            NODE=${NODE_MAP[$i]}
+            if [ -n "$NODE" ]; then
+                SELECTED_NODES+=("$NODE")
+            else
+                echo -e "${YELLOW}⚠ 序号 $i 无效，已跳过${RESET}"
+            fi
+        done
+    fi
+
+    # 执行批量操作
+    for NODE_NAME in "${SELECTED_NODES[@]}"; do
+        NODE_DIR="$APP_DIR/$NODE_NAME"
+        if [ ! -d "$NODE_DIR" ] || [ ! -f "$NODE_DIR/docker-compose.yml" ]; then
+            echo -e "${YELLOW}⚠ 跳过节点 $NODE_NAME：目录或 docker-compose.yml 不存在${RESET}"
+            continue
+        fi
+        cd "$NODE_DIR" || continue
+
+        case $choice in
+            1) docker pause "$NODE_NAME" ;;
+            2) docker restart "$NODE_NAME" ;;
+            3) docker compose pull && docker compose up -d ;;
+            4) docker compose down && rm -rf "$NODE_DIR" ;;
+            0) return ;;
+            *) echo -e "${RED}无效选择${RESET}" ; return ;;
+        esac
+        echo -e "${GREEN}✅ 节点 $NODE_NAME 操作完成${RESET}"
+    done
+
+    read -r -p $'\033[32m按回车返回菜单...\033[0m'
 }
 
 show_all_status() {
@@ -152,9 +215,9 @@ show_all_status() {
         PORT=$(grep -oP '^\s+- "\K[0-9]+(?=:)' "$node/docker-compose.yml")
         STATUS=$(docker ps --filter "name=$NODE_NAME" --format "{{.Status}}")
         [ -z "$STATUS" ] && STATUS="未启动"
-        echo -e "${GREEN}$NODE_NAME${RESET} | 端口: ${YELLOW}$PORT${RESET} | 状态: ${STATUS}"
+        echo -e "${GREEN}$NODE_NAME${RESET} | ${YELLOW}端口: ${RESET}${YELLOW}$PORT${RESET} | ${YELLOW}状态: ${STATUS}${RESET}"
     done
-    read -p "按回车返回菜单..."
+    read -r -p $'\033[32m按回车返回菜单...\033[0m'
 }
 
 menu() {
@@ -164,12 +227,14 @@ menu() {
         echo -e "${GREEN}1) 安装启动新节点${RESET}"
         echo -e "${GREEN}2) 管理已有节点${RESET}"
         echo -e "${GREEN}3) 查看所有节点状态${RESET}"
+        echo -e "${GREEN}4) 批量操作所有节点${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
-        read -p "请选择: " choice
+        read -r -p $'\033[32m请选择操作: \033[0m' choice
         case $choice in
             1) install_node ;;
             2) node_action_menu ;;
             3) show_all_status ;;
+            4) batch_action ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
         esac

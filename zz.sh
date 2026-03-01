@@ -1,120 +1,161 @@
 #!/bin/bash
-# ==========================================
-# CFServer 管理脚本（绿色菜单版）
-# ==========================================
 
-set -e
+# anytls 安装/卸载管理脚本
+# 功能：安装 anytls、修改端口或卸载
 
+# 颜色定义
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
+CYAN="\033[36m"
 RESET="\033[0m"
+RED="\033[31m"
 
-green(){ echo -e "${GREEN}$1${RESET}"; }
-yellow(){ echo -e "${YELLOW}$1${RESET}"; }
-red(){ echo -e "${RED}$1${RESET}"; }
+SERVICE_NAME="anytls"
+BINARY_NAME="anytls-server"
+BINARY_DIR="/usr/local/bin"
 
-CF_DIR="/opt/cfserver"
-SCRIPT_NAME="cfserver.sh"
+# 检查 root 权限
+if [ "$(id -u)" -ne 0 ]; then
+    echo "必须使用 root 或 sudo 运行！"
+    exit 1
+fi
 
-# 获取服务器IP
-SERVER_IP=$(hostname -I | awk '{print $1}')
-
-install_cf() {
-    green "正在下载并安装 CFServer..."
-    curl -sS -O https://raw.githubusercontent.com/woniu336/open_shell/main/cfserver.sh
-    chmod +x ${SCRIPT_NAME}
-    ./${SCRIPT_NAME}
-    green "安装完成！"
-}
-
-uninstall_cf() {
-    yellow "停止 CFServer 服务..."
-    pkill dns-server 2>/dev/null || echo "服务未运行"
-
-    yellow "删除程序文件 ${CF_DIR} ..."
-    if [ -d "${CF_DIR}" ]; then
-        rm -rf "${CF_DIR}"
-        green "程序文件已删除"
-    else
-        red "目录 ${CF_DIR} 不存在"
-    fi
-
-    yellow "删除安装脚本 ${SCRIPT_NAME} ..."
-    if [ -f "./${SCRIPT_NAME}" ]; then
-        rm -f "./${SCRIPT_NAME}"
-        green "安装脚本已删除"
-    else
-        red "安装脚本不存在"
-    fi
-
-    green "✅ CFServer 已卸载完成"
-}
-
-reset_token() {
-    if [ ! -d "${CF_DIR}" ]; then
-        red "CFServer 未安装！"
-        return
-    fi
-    cd "${CF_DIR}"
-
-    # 提示用户输入自定义 token
-    read -p "$(echo -e ${GREEN}请输入新的访问令牌（token）: ${RESET})" CUSTOM_TOKEN
-
-    # 检查输入是否为空
-    if [ -z "$CUSTOM_TOKEN" ]; then
-        red "未输入 token，操作取消"
-        return
-    fi
-
-    # 执行令牌重置
-    ./dns-server -reset-token "$CUSTOM_TOKEN"
-    green "✅ 令牌已重置为：$CUSTOM_TOKEN"
-}
-
-start_service() {
-     cd /opt/cfserver && pkill dns-server && nohup ./dns-server > /dev/null 2>&1 &
-    green "✅ 服务启动"
-}
-
-stop_service() {
-    pkill dns-server 2>/dev/null && green "✅ 服务已停止" || red "服务未运行"
-}
-
-show_web() {
-    IP=$(get_ip)
-    green "🌐 Web 管理地址："
-    green "   http://${SERVER_IP}:8081"
-}
-
-menu() {
-    while true; do
-        clear
-        echo ""
-        echo -e "${GREEN}==== CFServer 管理菜单 ====${RESET}"
-        echo -e "${GREEN}1) 安装${RESET}"
-        echo -e "${GREEN}2) 卸载${RESET}"
-        echo -e "${GREEN}3) 重置访问令牌${RESET}"
-        echo -e "${GREEN}4) 启动服务${RESET}"
-        echo -e "${GREEN}5) 停止服务${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择操作: ${RESET})" choice
-        choice=$(echo "$choice" | xargs)  # 去掉空格
-
-        case $choice in
-            1) install_cf ;;
-            2) uninstall_cf ;;
-            3) reset_token ;;
-            4) start_service ;;
-            5) stop_service ;;
-            0) 
-                exit 0 ;;
-            *) red "无效选项，请重新输入" ;;
-        esac
-
-        echo -e "${YELLOW}按回车继续...${RESET}"
-        read
+# 安装必要工具
+function install_dependencies() {
+    apt update -y >/dev/null 2>&1
+    for dep in wget curl unzip openssl; do
+        if ! command -v $dep &>/dev/null; then
+            echo "正在安装 $dep..."
+            apt install -y $dep || { echo "请手动安装 $dep"; exit 1; }
+        fi
     done
 }
+install_dependencies
 
-menu
+# 自动检测架构
+ARCH=$(uname -m)
+case $ARCH in
+    x86_64)  BINARY_ARCH="amd64" ;;
+    aarch64) BINARY_ARCH="arm64" ;;
+    armv7l)  BINARY_ARCH="armv7" ;;
+    *)       echo "不支持的架构: $ARCH"; exit 1 ;;
+esac
+
+DOWNLOAD_URL="https://github.com/anytls/anytls-go/releases/download/v0.0.8/anytls_0.0.8_linux_${BINARY_ARCH}.zip"
+ZIP_FILE="/tmp/anytls_0.0.8_linux_${BINARY_ARCH}.zip"
+
+# 获取公网 IP
+get_ip() {
+    local ip
+    ip=$(ip -o -4 addr show scope global | awk '{print $4}' | cut -d'/' -f1 | head -n1)
+    [ -z "$ip" ] && ip=$(ifconfig 2>/dev/null | grep -oP 'inet \K[\d.]+' | grep -v '127.0.0.1' | head -n1)
+    [ -z "$ip" ] && ip=$(curl -4 -s --connect-timeout 3 ifconfig.me 2>/dev/null || curl -4 -s --connect-timeout 3 icanhazip.com 2>/dev/null)
+    [ -z "$ip" ] && read -p "请输入服务器IP: " ip
+    echo "$ip"
+}
+
+# 操作完成后按回车返回菜单
+pause_return() {
+    read -p "按回车键返回菜单..." dummy
+    show_menu
+}
+
+# 显示菜单
+show_menu() {
+    clear
+    echo -e "${GREEN}==== Anytls管理菜单 ====${RESET}"
+    echo -e "${GREEN}1. 安装Anytls${RESET}"
+    echo -e "${GREEN}2. 卸载Anytls${RESET}"
+    echo -e "${GREEN}3. 修改端口${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+    case $choice in
+        1) install_anytls ;;
+        2) uninstall_anytls ;;
+        3) modify_port ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选择${RESET}" && sleep 1 && show_menu ;;
+    esac
+}
+
+# 安装 anytls
+install_anytls() {
+    read -p "请输入监听端口 [默认8443]: " PORT
+    PORT=${PORT:-8443}
+
+    echo "[1/5] 下载 anytls..."
+    wget "$DOWNLOAD_URL" -O "$ZIP_FILE" || { echo "下载失败！"; pause_return; return; }
+
+    echo "[2/5] 解压文件..."
+    unzip -o "$ZIP_FILE" -d "$BINARY_DIR" || { echo "解压失败！"; pause_return; return; }
+    chmod +x "$BINARY_DIR/$BINARY_NAME"
+    rm -f "$ZIP_FILE"
+
+    read -s -p "设置密码（留空随机生成）: " PASSWORD
+    echo
+    [ -z "$PASSWORD" ] && PASSWORD=$(openssl rand -base64 12)
+
+    echo "[3/5] 配置 systemd 服务..."
+    cat > /etc/systemd/system/$SERVICE_NAME.service <<EOF
+[Unit]
+Description=anytls Service
+After=network.target
+
+[Service]
+ExecStart=$BINARY_DIR/$BINARY_NAME -l 0.0.0.0:$PORT -p $PASSWORD
+Restart=always
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    echo "[4/5] 启动服务..."
+    systemctl daemon-reload
+    systemctl enable $SERVICE_NAME
+    systemctl restart $SERVICE_NAME
+
+    SERVER_IP=$(get_ip)
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+    echo -e "\n${GREEN}√ 安装完成！${RESET}"
+    echo -e "${GREEN}√ 端口: $PORT${RESET}"
+    echo -e "${GREEN}√ 密码: $PASSWORD${RESET}"
+    echo -e "${GREEN}V2rayN:anytls://$PASSWORD@$SERVER_IP:$PORT/?insecure=1#$HOSTNAME${GREEN}"
+    echo -e "${GREEN}Surge :$HOSTNAME = anytls, $SERVER_IP, $PORT, password=$PASSWORD, tfo=true, skip-cert-verify=true, reuse=false${GREEN}"
+
+    pause_return
+}
+
+# 卸载
+uninstall_anytls() {
+    echo "正在卸载 anytls..."
+    systemctl stop $SERVICE_NAME 2>/dev/null
+    systemctl disable $SERVICE_NAME 2>/dev/null
+    [ -f "$BINARY_DIR/$BINARY_NAME" ] && rm -f "$BINARY_DIR/$BINARY_NAME"
+    [ -f "/etc/systemd/system/$SERVICE_NAME.service" ] && rm -f "/etc/systemd/system/$SERVICE_NAME.service"
+    systemctl daemon-reload
+    echo -e "${GREEN}anytls 已完全卸载！${RESET}"
+
+    pause_return
+}
+
+# 修改端口
+modify_port() {
+    if [ ! -f "/etc/systemd/system/$SERVICE_NAME.service" ]; then
+        echo -e "${YELLOW}未检测到已安装的 anytls 服务${RESET}"
+        pause_return
+        return
+    fi
+    read -p "请输入新端口: " NEW_PORT
+    [ -z "$NEW_PORT" ] && echo "端口不能为空" && pause_return && return
+    sed -i -r "s/-l 0\.0\.0\.0:[0-9]+/-l 0.0.0.0:$NEW_PORT/" /etc/systemd/system/$SERVICE_NAME.service
+    systemctl daemon-reload
+    systemctl restart $SERVICE_NAME
+    echo -e "${GREEN}端口已修改为 $NEW_PORT 并重启服务${RESET}"
+
+    pause_return
+}
+
+# 启动菜单
+show_menu

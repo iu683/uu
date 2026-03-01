@@ -1,145 +1,222 @@
 #!/bin/bash
-# ========================================
-# Emby Pulse 一键管理脚本
-# ========================================
+# ==================================================
+# VPS 国家 IP 防火墙 Pro v3
+# 支持 Debian / Ubuntu
+# 独立 GEO_CHAIN / IPv4+IPv6 / nft兼容 / Docker安全
+# ==================================================
+
+CONF="/opt/geoip/geo.conf"
+UPDATE_SCRIPT="/opt/geoip/update_geo.sh"
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-APP_NAME="emby-pulse"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_DIR="$APP_DIR/config"
+green(){ echo -e "${GREEN}$1${RESET}"; }
+red(){ echo -e "${RED}$1${RESET}"; }
+yellow(){ echo -e "${YELLOW}$1${RESET}"; }
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+[[ $(id -u) != 0 ]] && red "请使用 root 运行" && exit 1
+
+# ================= 初始化环境 =================
+init_env(){
+    if command -v apt >/dev/null 2>&1; then
+        apt update -y >/dev/null 2>&1
+        apt install -y ipset iptables curl iptables-persistent >/dev/null 2>&1
+    else
+        red "仅支持 Debian / Ubuntu"
         exit 1
     fi
+
+    mkdir -p /opt/geoip
+    touch $CONF
 }
 
-# 获取服务器IP
-SERVER_IP=$(hostname -I | awk '{print $1}')
-
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== Emby Pulse 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
+# ================= 获取公网IP =================
+get_my_ip(){
+    $(hostname -I | awk '{print $1}')
 }
 
-install_app() {
-    check_docker
-    mkdir -p "$CONFIG_DIR"
-    mkdir -p "$APP_DIR/static/img"
+# ================= 应用规则 =================
+apply_rules(){
 
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
+    source $CONF 2>/dev/null
+
+    if [[ -z "$COUNTRIES" ]]; then
+        red "未配置国家规则"
+        return
     fi
 
-    read -p "请输入时区 [默认:Asia/Shanghai]: " input_tz
-    TZ=${input_tz:-Asia/Shanghai}
+    if iptables -V | grep -q nf_tables; then
+        BACKEND="nft"
+    else
+        BACKEND="legacy"
+    fi
+    green "iptables 后端: $BACKEND"
 
-    read -p "请输入 Emby 主机地址 [例如:http://192.168.31.2:8096]: " input_host
-    EMBY_HOST=${input_host:-http://192.168.31.2:8096}
+    # 创建独立链
+    iptables -N GEO_CHAIN 2>/dev/null
+    ip6tables -N GEO_CHAIN 2>/dev/null
 
-    read -p "请输入 Emby API Key [例如:xxxxxxxxxxxxxxxxx]: " input_key
-    EMBY_API_KEY=${input_key:-xxxxxxxxxxxxxxxxx}
+    # 挂载一次
+    iptables -C INPUT -j GEO_CHAIN 2>/dev/null || iptables -I INPUT -j GEO_CHAIN
+    ip6tables -C INPUT -j GEO_CHAIN 2>/dev/null || ip6tables -I INPUT -j GEO_CHAIN
 
-    # 数据库宿主机路径
-    read -p "请输入数据库宿主机路径 [例如:/volume1/docker/emby/data]: " input_db_host
-    DB_HOST_PATH=${input_db_host:-/volume1/docker/emby/data}
+    # 清空链
+    iptables -F GEO_CHAIN
+    ip6tables -F GEO_CHAIN
 
-    # 数据库容器内部路径
-    read -p "请输入数据库容器路径 [例如:/emby-data/playback_reporting.db]: " input_db_container
-    DB_CONTAINER_PATH=${input_db_container:-/emby-data/playback_reporting.db}
+    # 允许已建立连接
+    iptables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    ip6tables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
+    # 白名单
+    for ip in $WHITELIST; do
+        iptables -A GEO_CHAIN -s $ip -j ACCEPT
+        ip6tables -A GEO_CHAIN -s $ip -j ACCEPT 2>/dev/null
+    done
 
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  emby-pulse:
-    image: zeyu8023/emby-stats:latest
-    container_name: emby-pulse
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ${DB_HOST_PATH}:/emby-data
-      - ./config:/app/config
-    environment:
-      - TZ=${TZ}
-      - DB_PATH=${DB_CONTAINER_PATH}
-      - EMBY_HOST=${EMBY_HOST}
-      - EMBY_API_KEY=${EMBY_API_KEY}
+    # 当前IP保护
+    MYIP=$(get_my_ip)
+    [[ -n "$MYIP" ]] && iptables -A GEO_CHAIN -s $MYIP -j ACCEPT
+
+    for CC in $COUNTRIES; do
+        CC_L=$(echo $CC | tr A-Z a-z)
+
+        V4SET="geo_${CC_L}_v4"
+        V6SET="geo_${CC_L}_v6"
+
+        V4FILE="/opt/geoip/${CC_L}.zone"
+        V6FILE="/opt/geoip/${CC_L}.ipv6.zone"
+
+        curl -s -o $V4FILE https://www.ipdeny.com/ipblocks/data/countries/$CC_L.zone
+        curl -s -o $V6FILE https://www.ipdeny.com/ipv6/ipaddresses/aggregated/$CC_L-aggregated.zone
+
+        ipset create $V4SET hash:net family inet -exist
+        ipset create $V6SET hash:net family inet6 -exist
+
+        ipset flush $V4SET
+        ipset flush $V6SET
+
+        while read ip; do ipset add $V4SET $ip; done < $V4FILE
+        while read ip; do ipset add $V6SET $ip; done < $V6FILE 2>/dev/null
+
+        if [[ "$MODE" == "block" ]]; then
+            iptables -A GEO_CHAIN -m set --match-set $V4SET src -j DROP
+            ip6tables -A GEO_CHAIN -m set --match-set $V6SET src -j DROP
+        else
+            iptables -A GEO_CHAIN -m set ! --match-set $V4SET src -j DROP
+            ip6tables -A GEO_CHAIN -m set ! --match-set $V6SET src -j DROP
+        fi
+    done
+
+    netfilter-persistent save >/dev/null 2>&1
+    green "规则已成功应用（Docker安全模式）"
+}
+
+# ================= 创建更新任务 =================
+create_update(){
+cat > $UPDATE_SCRIPT <<EOF
+#!/bin/bash
+source $CONF
+for CC in \$COUNTRIES; do
+    CC_L=\$(echo \$CC | tr A-Z a-z)
+    V4SET="geo_\${CC_L}_v4"
+    V6SET="geo_\${CC_L}_v6"
+    V4FILE="/opt/geoip/\${CC_L}.zone"
+    V6FILE="/opt/geoip/\${CC_L}.ipv6.zone"
+
+    curl -s -o \$V4FILE https://www.ipdeny.com/ipblocks/data/countries/\$CC_L.zone
+    curl -s -o \$V6FILE https://www.ipdeny.com/ipv6/ipaddresses/aggregated/\$CC_L-aggregated.zone
+
+    ipset flush \$V4SET
+    ipset flush \$V6SET
+
+    while read ip; do ipset add \$V4SET \$ip; done < \$V4FILE
+    while read ip; do ipset add \$V6SET \$ip; done < \$V6FILE 2>/dev/null
+done
 EOF
 
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    echo
-    echo -e "${GREEN}✅ Emby Pulse 已启动${RESET}"
-    echo -e "${GREEN}✅ webui http://${SERVER_IP}:10307${RESET}"
-    echo -e "${GREEN}✅ 默认账号密码：直接使用您的Emby管理员账号和密码登录${RESET}"
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
-    read -p "按回车返回菜单..."
+chmod +x $UPDATE_SCRIPT
+(crontab -l 2>/dev/null | grep -v update_geo.sh; echo "0 4 * * * $UPDATE_SCRIPT") | crontab -
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ Emby Pulse 更新完成${RESET}"
-    read -p "按回车返回菜单..."
+# ================= 添加规则 =================
+add_rule(){
+    read -p "模式 (1=封锁 2=只允许): " m
+    [[ $m == 1 ]] && MODE="block" || MODE="allow"
+
+    read -p "国家代码 (如 cn jp us): " COUNTRIES
+    read -p "端口控制 (当前版本全端口控制): " tmp
+
+    echo "MODE=\"$MODE\"" > $CONF
+    echo "COUNTRIES=\"$COUNTRIES\"" >> $CONF
+    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
+
+    apply_rules
+    create_update
 }
 
-restart_app() {
-    docker restart emby-pulse
-    echo -e "${GREEN}✅ Emby Pulse 已重启${RESET}"
-    read -p "按回车返回菜单..."
+# ================= 白名单 =================
+add_whitelist(){
+    read -p "输入白名单IP (多个空格): " ips
+    source $CONF 2>/dev/null
+    WHITELIST="$WHITELIST $ips"
+    echo "WHITELIST=\"$WHITELIST\"" > $CONF
+    echo "MODE=\"$MODE\"" >> $CONF
+    echo "COUNTRIES=\"$COUNTRIES\"" >> $CONF
+    apply_rules
 }
 
-view_logs() {
-    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f emby-pulse
+# ================= 删除规则 =================
+delete_rules(){
+    iptables -D INPUT -j GEO_CHAIN 2>/dev/null
+    ip6tables -D INPUT -j GEO_CHAIN 2>/dev/null
+
+    iptables -F GEO_CHAIN 2>/dev/null
+    ip6tables -F GEO_CHAIN 2>/dev/null
+
+    iptables -X GEO_CHAIN 2>/dev/null
+    ip6tables -X GEO_CHAIN 2>/dev/null
+
+    ipset list | grep "^Name: geo_" | awk '{print $2}' | xargs -r -I {} ipset destroy {}
+
+    > $CONF
+    green "国家规则已删除"
 }
 
-check_status() {
-    docker ps | grep emby-pulse
-    read -p "按回车返回菜单..."
+# ================= 卸载 =================
+uninstall(){
+    delete_rules
+    rm -rf /opt/geoip
+    crontab -l 2>/dev/null | grep -v update_geo.sh | crontab -
+    green "已完全卸载"
 }
 
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Emby Pulse 已卸载${RESET}"
-    read -p "按回车返回菜单..."
+# ================= 菜单 =================
+menu(){
+clear
+echo -e "${GREEN}====== VPS国家防火墙 ======${RESET}"
+echo -e "${GREEN}1 添加/修改规则${RESET}"
+echo -e "${GREEN}2 添加白名单${RESET}"
+echo -e "${GREEN}3 删除规则${RESET}"
+echo -e "${GREEN}4 卸载程序${RESET}"
+echo -e "${GREEN}0 退出${RESET}"
+read -r -p $'\033[32m请选择: \033[0m' num
+
+case $num in
+1) add_rule ;;
+2) add_whitelist ;;
+3) delete_rules ;;
+4) uninstall ;;
+0) exit ;;
+esac
 }
 
-menu
+# ================= 主程序 =================
+init_env
+while true; do
+    menu
+    read -p "按回车继续..."
+done

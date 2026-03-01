@@ -1,161 +1,302 @@
 #!/bin/bash
+# ==================================================
+# VPS Geo Firewall Pro v3.2 Enterprise
+# Debian / Ubuntu
+# 独立链 / IPv4+IPv6 / 端口控制 / 自动更新 / 卸载
+# ==================================================
 
-# anytls 安装/卸载管理脚本
-# 功能：安装 anytls、修改端口或卸载
+CONF="/opt/geoip/geo.conf"
+UPDATE_SCRIPT="/opt/geoip/update_geo.sh"
 
-# 颜色定义
+SCRIPT_PATH="/usr/local/bin/geofirewall"
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/zz.sh"
+
 GREEN="\033[32m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-RESET="\033[0m"
 RED="\033[31m"
+YELLOW="\033[33m"
+RESET="\033[0m"
 
-SERVICE_NAME="anytls"
-BINARY_NAME="anytls-server"
-BINARY_DIR="/usr/local/bin"
+green(){ echo -e "${GREEN}$1${RESET}"; }
+red(){ echo -e "${RED}$1${RESET}"; }
 
-# 检查 root 权限
-if [ "$(id -u)" -ne 0 ]; then
-    echo "必须使用 root 或 sudo 运行！"
-    exit 1
-fi
+[[ $(id -u) != 0 ]] && red "请使用 root 运行" && exit 1
 
-# 安装必要工具
-function install_dependencies() {
+# ================== 初始化环境 ==================
+init_env(){
     apt update -y >/dev/null 2>&1
-    for dep in wget curl unzip openssl; do
-        if ! command -v $dep &>/dev/null; then
-            echo "正在安装 $dep..."
-            apt install -y $dep || { echo "请手动安装 $dep"; exit 1; }
-        fi
-    done
-}
-install_dependencies
-
-# 自动检测架构
-ARCH=$(uname -m)
-case $ARCH in
-    x86_64)  BINARY_ARCH="amd64" ;;
-    aarch64) BINARY_ARCH="arm64" ;;
-    armv7l)  BINARY_ARCH="armv7" ;;
-    *)       echo "不支持的架构: $ARCH"; exit 1 ;;
-esac
-
-DOWNLOAD_URL="https://github.com/anytls/anytls-go/releases/download/v0.0.8/anytls_0.0.8_linux_${BINARY_ARCH}.zip"
-ZIP_FILE="/tmp/anytls_0.0.8_linux_${BINARY_ARCH}.zip"
-
-# 获取公网 IP
-get_ip() {
-    local ip
-    ip=$(ip -o -4 addr show scope global | awk '{print $4}' | cut -d'/' -f1 | head -n1)
-    [ -z "$ip" ] && ip=$(ifconfig 2>/dev/null | grep -oP 'inet \K[\d.]+' | grep -v '127.0.0.1' | head -n1)
-    [ -z "$ip" ] && ip=$(curl -4 -s --connect-timeout 3 ifconfig.me 2>/dev/null || curl -4 -s --connect-timeout 3 icanhazip.com 2>/dev/null)
-    [ -z "$ip" ] && read -p "请输入服务器IP: " ip
-    echo "$ip"
+    apt install -y ipset iptables curl iptables-persistent >/dev/null 2>&1
+    mkdir -p /opt/geoip
+    touch $CONF
 }
 
-# 操作完成后按回车返回菜单
-pause_return() {
-    read -p "按回车键返回菜单..." dummy
-    show_menu
+# ================== 下载或更新脚本 ==================
+download_script(){
+    mkdir -p "$(dirname "$SCRIPT_PATH")"
+    curl -sSL "$SCRIPT_URL" -o "$SCRIPT_PATH"
+    chmod +x "$SCRIPT_PATH"
+    green "已更新"
 }
 
-# 显示菜单
-show_menu() {
-    clear
-    echo -e "${GREEN}==== Anytls管理菜单 ====${RESET}"
-    echo -e "${GREEN}1. 安装Anytls${RESET}"
-    echo -e "${GREEN}2. 卸载Anytls${RESET}"
-    echo -e "${GREEN}3. 修改端口${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-    case $choice in
-        1) install_anytls ;;
-        2) uninstall_anytls ;;
-        3) modify_port ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}" && sleep 1 && show_menu ;;
-    esac
+# ================== 获取信息 ==================
+get_my_ip(){ hostname -I | awk '{print $1}'; }
+
+get_ssh_port(){
+    grep -i "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1
 }
 
-# 安装 anytls
-install_anytls() {
-    read -p "请输入监听端口 [默认8443]: " PORT
-    PORT=${PORT:-8443}
+# ================== 自动更新IP库 ==================
+install_auto_update(){
 
-    echo "[1/5] 下载 anytls..."
-    wget "$DOWNLOAD_URL" -O "$ZIP_FILE" || { echo "下载失败！"; pause_return; return; }
+cat > $UPDATE_SCRIPT <<EOF
+#!/bin/bash
+CONF="/opt/geoip/geo.conf"
+source \$CONF 2>/dev/null
+[[ -z "\$COUNTRIES" ]] && exit 0
 
-    echo "[2/5] 解压文件..."
-    unzip -o "$ZIP_FILE" -d "$BINARY_DIR" || { echo "解压失败！"; pause_return; return; }
-    chmod +x "$BINARY_DIR/$BINARY_NAME"
-    rm -f "$ZIP_FILE"
-
-    read -s -p "设置密码（留空随机生成）: " PASSWORD
-    echo
-    [ -z "$PASSWORD" ] && PASSWORD=$(openssl rand -base64 12)
-
-    echo "[3/5] 配置 systemd 服务..."
-    cat > /etc/systemd/system/$SERVICE_NAME.service <<EOF
-[Unit]
-Description=anytls Service
-After=network.target
-
-[Service]
-ExecStart=$BINARY_DIR/$BINARY_NAME -l 0.0.0.0:$PORT -p $PASSWORD
-Restart=always
-User=root
-Group=root
-
-[Install]
-WantedBy=multi-user.target
+for CC in \$COUNTRIES; do
+    CC_L=\$(echo \$CC | tr A-Z a-z)
+    curl -s -o /opt/geoip/\${CC_L}.zone https://www.ipdeny.com/ipblocks/data/countries/\${CC_L}.zone
+    curl -s -o /opt/geoip/\${CC_L}.ipv6.zone https://www.ipdeny.com/ipv6/ipaddresses/aggregated/\${CC_L}-aggregated.zone
+done
 EOF
 
-    echo "[4/5] 启动服务..."
-    systemctl daemon-reload
-    systemctl enable $SERVICE_NAME
-    systemctl restart $SERVICE_NAME
+chmod +x $UPDATE_SCRIPT
+(crontab -l 2>/dev/null | grep -v update_geo.sh; echo "0 3 * * * $UPDATE_SCRIPT") | crontab -
 
-    SERVER_IP=$(get_ip)
-    HOSTNAME=$(hostname -s | sed 's/ /_/g')
-    echo -e "\n${GREEN}√ 安装完成！${RESET}"
-    echo -e "${GREEN}√ 端口: $PORT${RESET}"
-    echo -e "${GREEN}√ 密码: $PASSWORD${RESET}"
-    echo -e "${GREEN}V2rayN:anytls://$PASSWORD@$SERVER_IP:$PORT/?insecure=1#$HOSTNAME${GREEN}"
-    echo -e "${GREEN}Surge :$HOSTNAME = anytls, $SERVER_IP, $PORT, password=$PASSWORD, tfo=true, skip-cert-verify=true, reuse=false${GREEN}"
-
-    pause_return
+green "已设置每日 03:00 自动更新IP库"
 }
 
-# 卸载
-uninstall_anytls() {
-    echo "正在卸载 anytls..."
-    systemctl stop $SERVICE_NAME 2>/dev/null
-    systemctl disable $SERVICE_NAME 2>/dev/null
-    [ -f "$BINARY_DIR/$BINARY_NAME" ] && rm -f "$BINARY_DIR/$BINARY_NAME"
-    [ -f "/etc/systemd/system/$SERVICE_NAME.service" ] && rm -f "/etc/systemd/system/$SERVICE_NAME.service"
-    systemctl daemon-reload
-    echo -e "${GREEN}anytls 已完全卸载！${RESET}"
+# ================== 应用规则 ==================
+apply_rules(){
 
-    pause_return
+    source $CONF 2>/dev/null
+    [[ -z "$COUNTRIES" ]] && red "未配置规则" && return
+
+    SSH_PORT=$(get_ssh_port)
+    [[ -z "$SSH_PORT" ]] && SSH_PORT=22
+    green "检测到 SSH 端口: $SSH_PORT"
+
+    # ===== 创建主链（不存在才创建）=====
+    iptables  -L GEO_CHAIN >/dev/null 2>&1 || iptables  -N GEO_CHAIN
+    ip6tables -L GEO_CHAIN >/dev/null 2>&1 || ip6tables -N GEO_CHAIN
+
+    iptables  -C INPUT -j GEO_CHAIN 2>/dev/null || iptables  -I INPUT -j GEO_CHAIN
+    ip6tables -C INPUT -j GEO_CHAIN 2>/dev/null || ip6tables -I INPUT -j GEO_CHAIN
+
+    # ===== 基础放行规则（防重复）=====
+    iptables -C GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+    iptables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    ip6tables -C GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+    ip6tables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    MYIP=$(get_my_ip)
+    [[ -n "$MYIP" ]] && \
+    iptables -C GEO_CHAIN -s $MYIP -j ACCEPT 2>/dev/null || \
+    iptables -A GEO_CHAIN -s $MYIP -j ACCEPT
+
+    iptables -C GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT 2>/dev/null || \
+    iptables -A GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
+
+    ip6tables -C GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT 2>/dev/null || \
+    ip6tables -A GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
+
+    # ===== 白名单 =====
+    for ip in $WHITELIST; do
+        iptables  -C GEO_CHAIN -s $ip -j ACCEPT 2>/dev/null || \
+        iptables  -A GEO_CHAIN -s $ip -j ACCEPT
+
+        ip6tables -C GEO_CHAIN -s $ip -j ACCEPT 2>/dev/null || \
+        ip6tables -A GEO_CHAIN -s $ip -j ACCEPT
+    done
+
+    # ===== 国家规则 =====
+    for CC in $COUNTRIES; do
+        CC_L=$(echo $CC | tr A-Z a-z)
+
+        V4SET="geo_${CC_L}_v4"
+        V6SET="geo_${CC_L}_v6"
+
+        V4FILE="/opt/geoip/${CC_L}.zone"
+        V6FILE="/opt/geoip/${CC_L}.ipv6.zone"
+
+        # 下载IP库
+        curl -s -o $V4FILE https://www.ipdeny.com/ipblocks/data/countries/$CC_L.zone
+        curl -s -o $V6FILE https://www.ipdeny.com/ipv6/ipaddresses/aggregated/$CC_L-aggregated.zone
+
+        # 创建ipset（不删除旧数据）
+        ipset create $V4SET hash:net family inet -exist
+        ipset create $V6SET hash:net family inet6 -exist
+
+        while read -r ip; do
+            [[ -n "$ip" ]] && ipset add $V4SET "$ip" 2>/dev/null
+        done < "$V4FILE"
+
+        [[ -f "$V6FILE" ]] && while read -r ip; do
+            [[ -n "$ip" ]] && ipset add $V6SET "$ip" 2>/dev/null
+        done < "$V6FILE"
+
+        # ===== 应用iptables规则 =====
+        if [[ "$PORTS" == "all" ]]; then
+            for proto in tcp udp; do
+                if [[ "$MODE" == "block" ]]; then
+
+                    iptables  -C GEO_CHAIN -p $proto -m set --match-set $V4SET src -j DROP 2>/dev/null || \
+                    iptables  -A GEO_CHAIN -p $proto -m set --match-set $V4SET src -j DROP
+
+                    ip6tables -C GEO_CHAIN -p $proto -m set --match-set $V6SET src -j DROP 2>/dev/null || \
+                    ip6tables -A GEO_CHAIN -p $proto -m set --match-set $V6SET src -j DROP
+
+                else
+
+                    iptables  -C GEO_CHAIN -p $proto -m set ! --match-set $V4SET src -j DROP 2>/dev/null || \
+                    iptables  -A GEO_CHAIN -p $proto -m set ! --match-set $V4SET src -j DROP
+
+                    ip6tables -C GEO_CHAIN -p $proto -m set ! --match-set $V6SET src -j DROP 2>/dev/null || \
+                    ip6tables -A GEO_CHAIN -p $proto -m set ! --match-set $V6SET src -j DROP
+
+                fi
+            done
+        else
+            for p in $PORTS; do
+                for proto in tcp udp; do
+                    if [[ "$MODE" == "block" ]]; then
+
+                        iptables  -C GEO_CHAIN -p $proto --dport $p -m set --match-set $V4SET src -j DROP 2>/dev/null || \
+                        iptables  -A GEO_CHAIN -p $proto --dport $p -m set --match-set $V4SET src -j DROP
+
+                        ip6tables -C GEO_CHAIN -p $proto --dport $p -m set --match-set $V6SET src -j DROP 2>/dev/null || \
+                        ip6tables -A GEO_CHAIN -p $proto --dport $p -m set --match-set $V6SET src -j DROP
+
+                    else
+
+                        iptables  -C GEO_CHAIN -p $proto --dport $p -m set ! --match-set $V4SET src -j DROP 2>/dev/null || \
+                        iptables  -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set $V4SET src -j DROP
+
+                        ip6tables -C GEO_CHAIN -p $proto --dport $p -m set ! --match-set $V6SET src -j DROP 2>/dev/null || \
+                        ip6tables -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set $V6SET src -j DROP
+
+                    fi
+                done
+            done
+        fi
+    done
+
+    netfilter-persistent save >/dev/null 2>&1
+    green "Geo v4/v6 防火墙规则已成功应用"
 }
 
-# 修改端口
-modify_port() {
-    if [ ! -f "/etc/systemd/system/$SERVICE_NAME.service" ]; then
-        echo -e "${YELLOW}未检测到已安装的 anytls 服务${RESET}"
-        pause_return
-        return
-    fi
-    read -p "请输入新端口: " NEW_PORT
-    [ -z "$NEW_PORT" ] && echo "端口不能为空" && pause_return && return
-    sed -i -r "s/-l 0\.0\.0\.0:[0-9]+/-l 0.0.0.0:$NEW_PORT/" /etc/systemd/system/$SERVICE_NAME.service
-    systemctl daemon-reload
-    systemctl restart $SERVICE_NAME
-    echo -e "${GREEN}端口已修改为 $NEW_PORT 并重启服务${RESET}"
+# ================== 添加规则 ==================
+add_rule(){
+    read -p "模式 (1=封锁 2=只允许): " m
+    [[ $m == 1 ]] && MODE="block" || MODE="allow"
+    read -p "国家代码 (如 cn jp us): " COUNTRIES
+    read -p "端口 (all 或 22 80 多个空格分隔): " PORTS
 
-    pause_return
+    echo "MODE=\"$MODE\"" > $CONF
+    echo "COUNTRIES=\"$COUNTRIES\"" >> $CONF
+    echo "PORTS=\"$PORTS\"" >> $CONF
+    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
+
+    install_auto_update
+    apply_rules
 }
 
-# 启动菜单
-show_menu
+# ================== 白名单 ==================
+add_whitelist(){
+    read -p "输入要加入白名单IP (多个空格分隔): " ips
+    source $CONF 2>/dev/null
+    WHITELIST="$WHITELIST $ips"
+
+    echo "MODE=\"$MODE\"" > $CONF
+    echo "COUNTRIES=\"$COUNTRIES\"" >> $CONF
+    echo "PORTS=\"$PORTS\"" >> $CONF
+    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
+
+    green "白名单已更新"
+    apply_rules
+}
+
+# ================== 查看规则 ==================
+view_rules(){
+    clear
+    green "========= 当前配置 ========="
+    cat $CONF 2>/dev/null
+    echo
+    iptables -L GEO_CHAIN -n --line-numbers 2>/dev/null
+    echo
+    ipset list | grep "^Name:"
+}
+
+# ================== 删除规则 ==================
+delete_rules(){
+    iptables -D INPUT -j GEO_CHAIN 2>/dev/null
+    ip6tables -D INPUT -j GEO_CHAIN 2>/dev/null
+    iptables -F GEO_CHAIN 2>/dev/null
+    ip6tables -F GEO_CHAIN 2>/dev/null
+    iptables -X GEO_CHAIN 2>/dev/null
+    ip6tables -X GEO_CHAIN 2>/dev/null
+    ipset list | grep "^Name: geo_" | awk '{print $2}' | xargs -r -I {} ipset destroy {}
+    > $CONF
+    green "规则已删除"
+}
+
+# ================== 卸载 ==================
+uninstall_all(){
+
+    green "正在卸载"
+
+    # 删除规则
+    iptables -D INPUT -j GEO_CHAIN 2>/dev/null
+    ip6tables -D INPUT -j GEO_CHAIN 2>/dev/null
+    iptables -F GEO_CHAIN 2>/dev/null
+    ip6tables -F GEO_CHAIN 2>/dev/null
+    iptables -X GEO_CHAIN 2>/dev/null
+    ip6tables -X GEO_CHAIN 2>/dev/null
+
+    # 删除 ipset
+    ipset list | grep "^Name: geo_" | awk '{print $2}' | xargs -r -I {} ipset destroy {}
+
+    # 删除配置和更新脚本
+    rm -rf /opt/geoip
+
+    # 删除定时任务
+    crontab -l 2>/dev/null | grep -v update_geo.sh | crontab -
+
+    # 删除主程序
+    rm -f $SCRIPT_PATH
+
+    netfilter-persistent save >/dev/null 2>&1
+
+    green "已彻底卸载完成"
+    exit 0
+}
+# ================== 菜单 ==================
+menu(){
+clear
+echo -e "${GREEN}===== VPS国家防火墙 =====${RESET}"
+echo -e "${GREEN}1 添加规则${RESET}"
+echo -e "${GREEN}2 删除规则${RESET}"
+echo -e "${GREEN}3 查看规则${RESET}"
+echo -e "${GREEN}4 添加白名单${RESET}"
+echo -e "${GREEN}5 更新${RESET}"
+echo -e "${GREEN}6 卸载${RESET}"
+echo -e "${GREEN}0 退出${RESET}"
+read -r -p $'\033[32m请选择: \033[0m' num
+case $num in
+1) add_rule ;;
+2) delete_rules ;;
+3) view_rules ;;
+4) add_whitelist ;;
+5) download_script ;;
+6) uninstall_all ;;
+0) exit ;;
+esac
+}
+
+# ================== 主循环 ==================
+init_env
+while true; do
+    menu
+    read -p "按回车继续..."
+done

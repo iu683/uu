@@ -1,127 +1,156 @@
 #!/bin/bash
-# ========================================
-# NodePassDash 一键管理脚本
-# ========================================
+# ==========================================
+# VPS 国家IP防火墙 Pro
+# 支持菜单管理 / 卸载 / 白名单 / 自动更新
+# ==========================================
 
+CONF="/opt/geoip/geo.conf"
+UPDATE_SCRIPT="/opt/geoip/update_geo.sh"
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-APP_NAME="nodepassdash"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+green(){ echo -e "${GREEN}$1${RESET}"; }
+red(){ echo -e "${RED}$1${RESET}"; }
+yellow(){ echo -e "${YELLOW}$1${RESET}"; }
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
+[[ $(id -u) != 0 ]] && red "请使用 root 运行" && exit 1
+
+init_env(){
+    apt update -y >/dev/null 2>&1
+    apt install -y ipset iptables curl iptables-persistent >/dev/null 2>&1
+    mkdir -p /opt/geoip
+    touch $CONF
 }
 
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== NodePassDash 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+get_my_ip(){
+    curl -s ifconfig.me
+}
 
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
+apply_rules(){
+    source $CONF
+    iptables -F GEO_RULES 2>/dev/null
+    iptables -N GEO_RULES 2>/dev/null
+
+    # 放行白名单
+    for ip in $WHITELIST; do
+        iptables -I INPUT -s $ip -j ACCEPT
     done
+
+    # 放行当前IP
+    MYIP=$(get_my_ip)
+    iptables -I INPUT -s $MYIP -j ACCEPT
+
+    for CC in $COUNTRIES; do
+        CC_L=$(echo $CC | tr A-Z a-z)
+        SET="geo_$CC_L"
+        FILE="/opt/geoip/$CC_L.zone"
+        curl -s -o $FILE https://www.ipdeny.com/ipblocks/data/countries/$CC_L.zone
+        ipset create $SET hash:net -exist
+        ipset flush $SET
+        for ip in $(cat $FILE); do
+            ipset add $SET $ip
+        done
+
+        if [[ "$MODE" == "block" ]]; then
+            if [[ "$PORTS" == "all" ]]; then
+                iptables -I INPUT -m set --match-set $SET src -j DROP
+            else
+                for p in $PORTS; do
+                    iptables -I INPUT -p tcp --dport $p -m set --match-set $SET src -j DROP
+                done
+            fi
+        else
+            if [[ "$PORTS" == "all" ]]; then
+                iptables -I INPUT -m set ! --match-set $SET src -j DROP
+            else
+                for p in $PORTS; do
+                    iptables -I INPUT -p tcp --dport $p -m set ! --match-set $SET src -j DROP
+                done
+            fi
+        fi
+    done
+
+    netfilter-persistent save >/dev/null 2>&1
 }
 
-install_app() {
-    check_docker
-    mkdir -p "$APP_DIR/db"
-    mkdir -p "$APP_DIR/logs"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-
-    read -p "请输入映射端口 [默认:3000]: " input_port
-    PORT=${input_port:-3000}
-
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  nodepassdash:
-    image: ghcr.io/nodepassproject/nodepassdash:latest
-    container_name: nodepassdash
-    ports:
-      - "127.0.0.1:${PORT}:3000"
-    volumes:
-      - ./db:/app/db
-      - ./logs:/app/logs
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
+create_update(){
+cat > $UPDATE_SCRIPT <<EOF
+#!/bin/bash
+source $CONF
+for CC in \$COUNTRIES; do
+    CC_L=\$(echo \$CC | tr A-Z a-z)
+    FILE="/opt/geoip/\$CC_L.zone"
+    SET="geo_\$CC_L"
+    curl -s -o \$FILE https://www.ipdeny.com/ipblocks/data/countries/\$CC_L.zone
+    ipset flush \$SET
+    for ip in \$(cat \$FILE); do
+        ipset add \$SET \$ip
+    done
+done
 EOF
+chmod +x $UPDATE_SCRIPT
+(crontab -l 2>/dev/null | grep -v update_geo.sh; echo "0 4 * * * $UPDATE_SCRIPT") | crontab -
+}
 
-    cd "$APP_DIR" || exit
-    docker compose up -d
+add_rule(){
+    read -p "模式 (1=封锁 2=只允许): " m
+    [[ $m == 1 ]] && MODE="block" || MODE="allow"
+    read -p "国家代码 (如 cn jp us 多个空格分隔): " COUNTRIES
+    read -p "端口 (all 或 22 80 443): " PORTS
+    echo "MODE=\"$MODE\"" > $CONF
+    echo "COUNTRIES=\"$COUNTRIES\"" >> $CONF
+    echo "PORTS=\"$PORTS\"" >> $CONF
+    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
+    apply_rules
+    create_update
+    green "规则已应用"
+}
 
+add_whitelist(){
+    read -p "输入白名单IP (多个空格): " ips
+    WHITELIST="$WHITELIST $ips"
+    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
+    apply_rules
+    green "白名单已添加"
+}
+
+view_status(){
+    green "==== 当前配置 ===="
+    cat $CONF
     echo
-    echo -e "${GREEN}✅ NodePassDash 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🌐 账号密码: 查看日志${RESET}"
-    read -p "按回车返回菜单..."
+    iptables -L -n --line-numbers | grep DROP
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ NodePassDash 更新完成${RESET}"
-    read -p "按回车返回菜单..."
+uninstall(){
+    iptables -F
+    ipset destroy
+    rm -rf /opt/geoip
+    crontab -l 2>/dev/null | grep -v update_geo.sh | crontab -
+    green "已完全卸载"
 }
 
-restart_app() {
-    docker restart nodepassdash
-    echo -e "${GREEN}✅ NodePassDash 已重启${RESET}"
-    read -p "按回车返回菜单..."
+menu(){
+clear
+echo -e "${GREEN}====== VPS国家防火墙 ======${RESET}"
+echo -e "${GREEN}1 添加/修改规则${RESET}"
+echo -e "${GREEN}2 添加白名单${RESET}"
+echo -e "${GREEN}3 查看状态${RESET}"
+echo -e "${GREEN}4 卸载${RESET}"
+echo -e "${GREEN}0 退出${RESET}"
+read -r -p $'\033[32m请选择: \033[0m' num
+case $num in
+1) add_rule ;;
+2) add_whitelist ;;
+3) view_status ;;
+4) uninstall ;;
+0) exit ;;
+esac
 }
 
-view_logs() {
-    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f nodepassdash
-}
-
-check_status() {
-    docker ps | grep nodepassdash
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ NodePassDash 已卸载${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-menu
+init_env
+while true; do
+    menu
+    read -p "按回车继续..."
+done

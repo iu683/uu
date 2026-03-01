@@ -9,7 +9,7 @@ CONF="/opt/geoip/geo.conf"
 UPDATE_SCRIPT="/opt/geoip/update_geo.sh"
 
 SCRIPT_PATH="/usr/local/bin/geofirewall"
-SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/zz.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/uu.sh"
 
 GREEN="\033[32m"
 RED="\033[31m"
@@ -21,14 +21,58 @@ red(){ echo -e "${RED}$1${RESET}"; }
 
 [[ $(id -u) != 0 ]] && red "请使用 root 运行" && exit 1
 
+
+
+# ================== 检测并切换 iptables 模式 ==================
+check_iptables_mode(){
+
+    IPT_MODE=$(iptables -V 2>/dev/null)
+
+    if echo "$IPT_MODE" | grep -q "nf_tables"; then
+        echo -e "${YELLOW}检测到 nft 模式，正在切换到 legacy...${RESET}"
+
+        update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null
+        update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null
+
+        echo -e "${GREEN}已切换到 iptables-legacy${RESET}"
+    else
+        echo -e "${GREEN}当前为 legacy 模式，无需切换${RESET}"
+    fi
+}
+
+# ================== 检测并关闭 UFW ==================
+check_ufw(){
+
+    if command -v ufw >/dev/null 2>&1; then
+        UFW_STATUS=$(ufw status 2>/dev/null | head -n1)
+
+        if echo "$UFW_STATUS" | grep -qi "active"; then
+            echo -e "${YELLOW}检测到 UFW 已启用，正在关闭...${RESET}"
+            ufw disable >/dev/null 2>&1
+            echo -e "${GREEN}UFW 已关闭${RESET}"
+        else
+            echo -e "${GREEN}UFW 未启用${RESET}"
+        fi
+    fi
+}
+
 # ================== 初始化环境 ==================
 init_env(){
-    apt update -y >/dev/null 2>&1
-    apt install -y ipset iptables curl iptables-persistent >/dev/null 2>&1
+
+    for pkg in ipset iptables curl iptables-persistent; do
+        if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+            apt-get update -qq
+            apt-get install -y "$pkg"
+        else
+        fi
+    done
+
+    check_iptables_mode
+    check_ufw
+
     mkdir -p /opt/geoip
     touch $CONF
 }
-
 # ================== 下载或更新脚本 ==================
 download_script(){
     mkdir -p "$(dirname "$SCRIPT_PATH")"
@@ -228,17 +272,40 @@ view_rules(){
     ipset list | grep "^Name:"
 }
 
-# ================== 删除规则 ==================
+
+# ================== 删除指定端口规则 ==================
 delete_rules(){
-    iptables -D INPUT -j GEO_CHAIN 2>/dev/null
-    ip6tables -D INPUT -j GEO_CHAIN 2>/dev/null
-    iptables -F GEO_CHAIN 2>/dev/null
-    ip6tables -F GEO_CHAIN 2>/dev/null
-    iptables -X GEO_CHAIN 2>/dev/null
-    ip6tables -X GEO_CHAIN 2>/dev/null
-    ipset list | grep "^Name: geo_" | awk '{print $2}' | xargs -r -I {} ipset destroy {}
-    > $CONF
-    green "规则已删除"
+
+    source $CONF 2>/dev/null
+    [[ -z "$PORTS" ]] && red "未检测到配置" && return
+
+    read -p "输入要删除的端口 (如 80 多个空格): " DEL_PORTS
+    [[ -z "$DEL_PORTS" ]] && red "未输入端口" && return
+
+    for p in $DEL_PORTS; do
+        for proto in tcp udp; do
+
+            # 删除 IPv4 规则
+            iptables -L GEO_CHAIN --line-numbers -n | \
+            grep "$proto" | grep "dpt:$p" | \
+            awk '{print $1}' | sort -rn | \
+            while read num; do
+                iptables -D GEO_CHAIN $num
+            done
+
+            # 删除 IPv6 规则
+            ip6tables -L GEO_CHAIN --line-numbers -n | \
+            grep "$proto" | grep "dpt:$p" | \
+            awk '{print $1}' | sort -rn | \
+            while read num; do
+                ip6tables -D GEO_CHAIN $num
+            done
+
+        done
+        green "端口 $p 规则已删除"
+    done
+
+    netfilter-persistent save >/dev/null 2>&1
 }
 
 # ================== 卸载 ==================
@@ -298,5 +365,5 @@ esac
 init_env
 while true; do
     menu
-    read -p "按回车继续..."
+    read -r -p $'\033[32m按回车继续...\033[0m'
 done

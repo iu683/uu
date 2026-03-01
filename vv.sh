@@ -48,7 +48,8 @@ menu() {
         echo -e "${GREEN}3) 重启${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}6) 修改配置${RESET}"
+        echo -e "${GREEN}7) 卸载${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
@@ -58,7 +59,8 @@ menu() {
             3) restart_app ;;
             4) view_logs ;;
             5) check_status ;;
-            6) uninstall_app ;;
+            6) modify_config ;;
+            7) uninstall_app ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
         esac
@@ -69,8 +71,20 @@ install_app() {
     check_docker
     mkdir -p "$APP_DIR"
 
-    read -p "请输入监听端口 [默认 443]: " PORT
-    PORT=${PORT:-443}
+    random_port() {
+        while :; do
+            PORT=$(shuf -i 2000-65000 -n 1)
+            ss -lnt | awk '{print $4}' | grep -q ":$PORT$" || break
+        done
+        echo "$PORT"
+    }
+
+    read -p "请输入监听端口 [默认随机]: " PORT
+
+    if [[ -z "$PORT" ]]; then
+        PORT=$(random_port)
+        echo -e "已自动生成未占用端口: ${PORT}"
+    fi
 
     read -p "请输入伪装域名 [默认 itunes.apple.com]: " DOMAIN
     DOMAIN=${DOMAIN:-itunes.apple.com}
@@ -204,4 +218,94 @@ uninstall_app() {
     read -p "按回车返回菜单..."
 }
 
+modify_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${RED}未检测到配置文件，请先安装${RESET}"
+        sleep 2
+        return
+    fi
+
+    echo -e "${YELLOW}=== 修改配置 ===${RESET}"
+
+    # 当前值
+    CURRENT_PORT=$(jq '.inbounds[0].port' "$CONFIG_FILE")
+    CURRENT_DOMAIN=$(jq -r '.inbounds[0].streamSettings.realitySettings.dest' "$CONFIG_FILE" | cut -d: -f1)
+    CURRENT_UUID=$(jq -r '.inbounds[0].settings.clients[0].id' "$CONFIG_FILE")
+    CURRENT_PRIVATE=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$CONFIG_FILE")
+    CURRENT_SHORTID=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$CONFIG_FILE")
+    CURRENT_DNS=$(jq -r '.dns.servers | join(",")' "$CONFIG_FILE")
+
+    # 用户输入
+    read -p "监听端口 [$CURRENT_PORT]: " NEW_PORT
+    NEW_PORT=${NEW_PORT:-$CURRENT_PORT}
+
+    read -p "伪装域名 [$CURRENT_DOMAIN]: " NEW_DOMAIN
+    NEW_DOMAIN=${NEW_DOMAIN:-$CURRENT_DOMAIN}
+
+    read -p "是否重新生成 UUID？[y/N]: " regen_uuid
+    if [[ "$regen_uuid" =~ ^[Yy]$ ]]; then
+        NEW_UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
+    else
+        NEW_UUID="$CURRENT_UUID"
+    fi
+
+    read -p "是否重新生成 Reality 密钥？[y/N]: " regen_key
+    if [[ "$regen_key" =~ ^[Yy]$ ]]; then
+        X25519=$(docker run --rm ghcr.io/xtls/xray-core:latest x25519)
+        NEW_PRIVATE_KEY=$(echo "$X25519" | grep "PrivateKey" | awk -F': ' '{print $2}')
+        NEW_PUBLIC_KEY=$(echo "$X25519" | grep "PublicKey"  | awk -F': ' '{print $2}')
+        NEW_SHORT_ID=$(openssl rand -hex 8)
+    else
+        NEW_PRIVATE_KEY="$CURRENT_PRIVATE"
+        NEW_SHORT_ID="$CURRENT_SHORTID"
+        # 用私钥反推公钥
+        NEW_PUBLIC_KEY=$(docker run --rm ghcr.io/xtls/xray-core:latest x25519 -i "$NEW_PRIVATE_KEY" 2>/dev/null | grep "PublicKey" | awk -F': ' '{print $2}')
+    fi
+
+    read -p "DNS（逗号分隔，留空不变） [$CURRENT_DNS]: " DNS_INPUT
+    DNS_INPUT=${DNS_INPUT:-$CURRENT_DNS}
+    IFS=',' read -ra DNS_ARRAY <<< "$DNS_INPUT"
+
+    # 更新 JSON
+    TMP_FILE=$(mktemp)
+    jq \
+        --arg port "$NEW_PORT" \
+        --arg domain "$NEW_DOMAIN" \
+        --arg uuid "$NEW_UUID" \
+        --arg priv "$NEW_PRIVATE_KEY" \
+        --arg sid "$NEW_SHORT_ID" \
+        --argjson dns "$(printf '%s\n' "${DNS_ARRAY[@]}" | jq -R . | jq -s .)" \
+        '
+        .inbounds[0].port = ($port|tonumber) |
+        .inbounds[0].settings.clients[0].id = $uuid |
+        .inbounds[0].streamSettings.realitySettings.dest = "\($domain):443" |
+        .inbounds[0].streamSettings.realitySettings.serverNames = [$domain] |
+        .inbounds[0].streamSettings.realitySettings.privateKey = $priv |
+        .inbounds[0].streamSettings.realitySettings.shortIds = [$sid] |
+        .dns.servers = $dns
+        ' "$CONFIG_FILE" > "$TMP_FILE" && mv "$TMP_FILE" "$CONFIG_FILE"
+
+    # 修复权限，避免 permission denied
+    chmod 644 "$CONFIG_FILE"
+    chmod 755 "$APP_DIR"
+
+    # 更新 compose 端口
+    sed -i "s/^[[:space:]]*-[[:space:]]*[0-9]\+:[0-9]\+\/tcp/      - \"$NEW_PORT:$NEW_PORT\/tcp\"/" "$COMPOSE_FILE"
+
+    cd "$APP_DIR" || return
+    docker compose up -d --force-recreate
+
+    # 获取公网 IP
+    IP=$(curl -s https://api.ipify.org || hostname -I | awk '{print $1}')
+    TAG=$(hostname -s)
+
+    VLESS_LINK="vless://${NEW_UUID}@${IP}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${NEW_DOMAIN}&fp=chrome&pbk=${NEW_PUBLIC_KEY}&sid=${NEW_SHORT_ID}&type=tcp#${TAG}"
+
+    echo
+    echo -e "${GREEN}✅ 配置修改完成${RESET}"
+    echo -e "${YELLOW}新连接如下：${RESET}"
+    echo -e "${YELLOW}${VLESS_LINK}${RESET}"
+    echo
+    read -p "按回车返回菜单..."
+}
 menu

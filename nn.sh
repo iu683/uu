@@ -1,370 +1,179 @@
 #!/bin/bash
-# ==================================================
-# VPS Geo Firewall Pro v3.2 Enterprise
-# Debian / Ubuntu
-# 独立链 / IPv4+IPv6 / 端口控制 / 自动更新 / 卸载
-# ==================================================
-
-CONF="/opt/geoip/geo.conf"
-UPDATE_SCRIPT="/opt/geoip/update_geo.sh"
-
-SCRIPT_PATH="/usr/local/bin/geofirewall"
-SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/uu.sh"
+# ========================================
+# Snell 多节点管理脚本（彩色菜单 + 节点状态查看）
+# ========================================
 
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-green(){ echo -e "${GREEN}$1${RESET}"; }
-red(){ echo -e "${RED}$1${RESET}"; }
+APP_NAME="snell-server"
+APP_DIR="/opt/$APP_NAME"
 
-[[ $(id -u) != 0 ]] && red "请使用 root 运行" && exit 1
-
-
-
-# ================== 检测并切换 iptables 模式 ==================
-check_iptables_mode(){
-
-    IPT_MODE=$(iptables -V 2>/dev/null)
-
-    if echo "$IPT_MODE" | grep -q "nf_tables"; then
-        echo -e "${YELLOW}检测到 nft 模式，正在切换到 legacy...${RESET}"
-
-        update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null
-        update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null
-
-        echo -e "${GREEN}已切换到 iptables-legacy${RESET}"
-    else
-        echo -e "${GREEN}当前为 legacy 模式，无需切换${RESET}"
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
     fi
 }
 
-# ================== 检测并关闭 UFW ==================
-check_ufw(){
-
-    if command -v ufw >/dev/null 2>&1; then
-        UFW_STATUS=$(ufw status 2>/dev/null | head -n1)
-
-        if echo "$UFW_STATUS" | grep -qi "active"; then
-            echo -e "${YELLOW}检测到 UFW 已启用，正在关闭...${RESET}"
-            ufw disable >/dev/null 2>&1
-            echo -e "${GREEN}UFW 已关闭${RESET}"
-        else
-            echo -e "${GREEN}UFW 未启用${RESET}"
-        fi
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
     fi
 }
 
-# ================== 初始化环境 ==================
-init_env(){
-
-    echo "正在检测依赖..."
-
-    for pkg in ipset iptables curl iptables-persistent; do
-        if ! command -v $pkg >/dev/null 2>&1; then
-            echo "安装 $pkg ..."
-            apt install -y $pkg
-        fi
+list_nodes() {
+    mkdir -p "$APP_DIR"
+    echo -e "${GREEN}=== 已有 Snell 节点 ===${RESET}"
+    local count=0
+    for node in "$APP_DIR"/*; do
+        [ -d "$node" ] || continue
+        count=$((count+1))
+        echo "[$count] $(basename "$node")"
     done
-
-    check_iptables_mode
-    check_ufw
-
-    mkdir -p /opt/geoip
-    touch $CONF
-}
-# ================== 下载或更新脚本 ==================
-download_script(){
-    mkdir -p "$(dirname "$SCRIPT_PATH")"
-    curl -sSL "$SCRIPT_URL" -o "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
-    green "已更新"
+    [ $count -eq 0 ] && echo "无节点"
 }
 
-# ================== 获取信息 ==================
-get_my_ip(){ hostname -I | awk '{print $1}'; }
-
-get_ssh_port(){
-    grep -i "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1
+select_node() {
+    list_nodes
+    read -p "请输入节点名称或编号: " input
+    if [[ "$input" =~ ^[0-9]+$ ]]; then
+        NODE_NAME=$(ls -d "$APP_DIR"/* | sed -n "${input}p" | xargs basename)
+    else
+        NODE_NAME="$input"
+    fi
+    NODE_DIR="$APP_DIR/$NODE_NAME"
+    if [ ! -d "$NODE_DIR" ]; then
+        echo -e "${RED}节点不存在！${RESET}"
+        return 1
+    fi
 }
 
-# ================== 自动更新IP库 ==================
-install_auto_update(){
+install_node() {
+    check_docker
+    read -p "请输入节点名称 [node$(date +%s)]: " NODE_NAME
+    NODE_NAME=${NODE_NAME:-node$(date +%s)}
+    NODE_DIR="$APP_DIR/$NODE_NAME"
+    mkdir -p "$NODE_DIR/data"
 
-cat > $UPDATE_SCRIPT <<EOF
-#!/bin/bash
-CONF="/opt/geoip/geo.conf"
-source \$CONF 2>/dev/null
-[[ -z "\$COUNTRIES" ]] && exit 0
+    read -p "请输入监听端口 [1025-65535, 默认随机]: " input_port
+    PORT=${input_port:-$(shuf -i 1025-65535 -n1)}
+    check_port "$PORT" || return
 
-for CC in \$COUNTRIES; do
-    CC_L=\$(echo \$CC | tr A-Z a-z)
-    curl -s -o /opt/geoip/\${CC_L}.zone https://www.ipdeny.com/ipblocks/data/countries/\${CC_L}.zone
-    curl -s -o /opt/geoip/\${CC_L}.ipv6.zone https://www.ipdeny.com/ipv6/ipaddresses/aggregated/\${CC_L}-aggregated.zone
-done
+    PSK=$(tr -dc A-Za-z0-9 </dev/urandom | head -c32)
+
+    read -p "是否启用 IPv6 [true/false, 默认 false]: " ipv6
+    IPv6=${ipv6:-false}
+
+    read -p "混淆模式 [off/http, 默认 off]: " obfs
+    OBFS=${obfs:-off}
+    if [ "$OBFS" = "http" ]; then
+        read -p "请输入混淆 Host [默认 example.com]: " obfs_host
+        OBFS_HOST=${obfs_host:-example.com}
+    else
+        OBFS_HOST=""
+    fi
+
+    read -p "是否启用 TCP Fast Open [true/false, 默认 true]: " tfo
+    TFO=${tfo:-true}
+
+    read -p "请输入 DNS [默认 8.8.8.8,1.1.1.1]: " dns
+    DNS=${dns:-8.8.8.8,1.1.1.1}
+
+    ECN=true
+
+    # 生成 docker-compose.yml
+    cat > "$NODE_DIR/docker-compose.yml" <<EOF
+services:
+  ${NODE_NAME}:
+    image: 1byte/snell-server:latest
+    container_name: ${NODE_NAME}
+    restart: always
+    ports:
+      - "${PORT}:${PORT}"
+    environment:
+      PORT: "${PORT}"
+      PSK: "${PSK}"
+      IPv6: "${IPv6}"
+      OBFS: "${OBFS}"
+      OBFS_HOST: "${OBFS_HOST}"
+      TFO: "${TFO}"
+      DNS: "${DNS}"
+      ECN: "${ECN}"
 EOF
 
-chmod +x $UPDATE_SCRIPT
-(crontab -l 2>/dev/null | grep -v update_geo.sh; echo "0 3 * * * $UPDATE_SCRIPT") | crontab -
+    cd "$NODE_DIR" || return
+    docker compose up -d
 
-green "已设置每日 03:00 自动更新IP库"
+    IP=$(hostname -I | awk '{print $1}')
+    echo -e "${GREEN}✅ 节点 ${NODE_NAME} 已启动${RESET}"
+    echo -e "${YELLOW}🌐 端口: ${PORT}${RESET}"
+    echo -e "${YELLOW}🔑 PSK: ${PSK}${RESET}"
+    echo -e "${YELLOW}📄 客户端配置模板: $NODE_NAME = snell, ${IP}, ${PORT}, psk=${PSK}, version=5, reuse=true, tfo=${TFO}, ecn=${ECN}${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-# ================== 应用规则 ==================
-apply_rules(){
-
-    source $CONF 2>/dev/null
-    [[ -z "$COUNTRIES" ]] && red "未配置规则" && return
-
-    SSH_PORT=$(get_ssh_port)
-    [[ -z "$SSH_PORT" ]] && SSH_PORT=22
-    green "检测到 SSH 端口: $SSH_PORT"
-
-    # ===== 创建主链（不存在才创建）=====
-    iptables  -L GEO_CHAIN >/dev/null 2>&1 || iptables  -N GEO_CHAIN
-    ip6tables -L GEO_CHAIN >/dev/null 2>&1 || ip6tables -N GEO_CHAIN
-
-    iptables  -C INPUT -j GEO_CHAIN 2>/dev/null || iptables  -I INPUT -j GEO_CHAIN
-    ip6tables -C INPUT -j GEO_CHAIN 2>/dev/null || ip6tables -I INPUT -j GEO_CHAIN
-
-    # ===== 基础放行规则（防重复）=====
-    iptables -C GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
-    iptables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-    ip6tables -C GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
-    ip6tables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-    MYIP=$(get_my_ip)
-    [[ -n "$MYIP" ]] && \
-    iptables -C GEO_CHAIN -s $MYIP -j ACCEPT 2>/dev/null || \
-    iptables -A GEO_CHAIN -s $MYIP -j ACCEPT
-
-    iptables -C GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT 2>/dev/null || \
-    iptables -A GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
-
-    ip6tables -C GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT 2>/dev/null || \
-    ip6tables -A GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
-
-    # ===== 白名单 =====
-    for ip in $WHITELIST; do
-        iptables  -C GEO_CHAIN -s $ip -j ACCEPT 2>/dev/null || \
-        iptables  -A GEO_CHAIN -s $ip -j ACCEPT
-
-        ip6tables -C GEO_CHAIN -s $ip -j ACCEPT 2>/dev/null || \
-        ip6tables -A GEO_CHAIN -s $ip -j ACCEPT
+node_action_menu() {
+    select_node || return
+    while true; do
+        echo -e "${GREEN}=== 节点 [$NODE_NAME] 管理 ===${RESET}"
+        echo -e "${GREEN}1) 启动${RESET}"
+        echo -e "${GREEN}2) 重启${RESET}"
+        echo -e "${GREEN}3) 更新${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 卸载${RESET}"
+        echo -e "${GREEN}0) 返回主菜单${RESET}"
+        read -p "请选择操作: " choice
+        case $choice in
+            1) docker compose -f "$NODE_DIR/docker-compose.yml" up -d ;;
+            2) docker restart "$NODE_NAME" ;;
+            3) docker compose -f "$NODE_DIR/docker-compose.yml" pull && docker compose -f "$NODE_DIR/docker-compose.yml" up -d ;;
+            4) docker logs -f "$NODE_NAME" ;;
+            5) docker compose -f "$NODE_DIR/docker-compose.yml" down && rm -rf "$NODE_DIR" && return ;;
+            0) return ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
     done
+}
 
-    # ===== 国家规则 =====
-    for CC in $COUNTRIES; do
-        CC_L=$(echo $CC | tr A-Z a-z)
-
-        V4SET="geo_${CC_L}_v4"
-        V6SET="geo_${CC_L}_v6"
-
-        V4FILE="/opt/geoip/${CC_L}.zone"
-        V6FILE="/opt/geoip/${CC_L}.ipv6.zone"
-
-        # 下载IP库
-        curl -s -o $V4FILE https://www.ipdeny.com/ipblocks/data/countries/$CC_L.zone
-        curl -s -o $V6FILE https://www.ipdeny.com/ipv6/ipaddresses/aggregated/$CC_L-aggregated.zone
-
-        # 创建ipset（不删除旧数据）
-        ipset create $V4SET hash:net family inet -exist
-        ipset create $V6SET hash:net family inet6 -exist
-
-        while read -r ip; do
-            [[ -n "$ip" ]] && ipset add $V4SET "$ip" 2>/dev/null
-        done < "$V4FILE"
-
-        [[ -f "$V6FILE" ]] && while read -r ip; do
-            [[ -n "$ip" ]] && ipset add $V6SET "$ip" 2>/dev/null
-        done < "$V6FILE"
-
-        # ===== 应用iptables规则 =====
-        if [[ "$PORTS" == "all" ]]; then
-            for proto in tcp udp; do
-                if [[ "$MODE" == "block" ]]; then
-
-                    iptables  -C GEO_CHAIN -p $proto -m set --match-set $V4SET src -j DROP 2>/dev/null || \
-                    iptables  -A GEO_CHAIN -p $proto -m set --match-set $V4SET src -j DROP
-
-                    ip6tables -C GEO_CHAIN -p $proto -m set --match-set $V6SET src -j DROP 2>/dev/null || \
-                    ip6tables -A GEO_CHAIN -p $proto -m set --match-set $V6SET src -j DROP
-
-                else
-
-                    iptables  -C GEO_CHAIN -p $proto -m set ! --match-set $V4SET src -j DROP 2>/dev/null || \
-                    iptables  -A GEO_CHAIN -p $proto -m set ! --match-set $V4SET src -j DROP
-
-                    ip6tables -C GEO_CHAIN -p $proto -m set ! --match-set $V6SET src -j DROP 2>/dev/null || \
-                    ip6tables -A GEO_CHAIN -p $proto -m set ! --match-set $V6SET src -j DROP
-
-                fi
-            done
-        else
-            for p in $PORTS; do
-                for proto in tcp udp; do
-                    if [[ "$MODE" == "block" ]]; then
-
-                        iptables  -C GEO_CHAIN -p $proto --dport $p -m set --match-set $V4SET src -j DROP 2>/dev/null || \
-                        iptables  -A GEO_CHAIN -p $proto --dport $p -m set --match-set $V4SET src -j DROP
-
-                        ip6tables -C GEO_CHAIN -p $proto --dport $p -m set --match-set $V6SET src -j DROP 2>/dev/null || \
-                        ip6tables -A GEO_CHAIN -p $proto --dport $p -m set --match-set $V6SET src -j DROP
-
-                    else
-
-                        iptables  -C GEO_CHAIN -p $proto --dport $p -m set ! --match-set $V4SET src -j DROP 2>/dev/null || \
-                        iptables  -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set $V4SET src -j DROP
-
-                        ip6tables -C GEO_CHAIN -p $proto --dport $p -m set ! --match-set $V6SET src -j DROP 2>/dev/null || \
-                        ip6tables -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set $V6SET src -j DROP
-
-                    fi
-                done
-            done
-        fi
+show_all_status() {
+    list_nodes
+    echo -e "${GREEN}=== 节点状态 ===${RESET}"
+    for node in "$APP_DIR"/*; do
+        [ -d "$node" ] || continue
+        NODE_NAME=$(basename "$node")
+        PORT=$(grep -oP '^\s+- "\K[0-9]+(?=:)' "$node/docker-compose.yml")
+        STATUS=$(docker ps --filter "name=$NODE_NAME" --format "{{.Status}}")
+        [ -z "$STATUS" ] && STATUS="未启动"
+        echo -e "${GREEN}$NODE_NAME${RESET} | 端口: ${YELLOW}$PORT${RESET} | 状态: ${STATUS}"
     done
-
-    netfilter-persistent save >/dev/null 2>&1
-    green "Geo v4/v6 防火墙规则已成功应用"
+    read -p "按回车返回菜单..."
 }
 
-# ================== 添加规则 ==================
-add_rule(){
-    read -p "模式 (1=封锁 2=只允许): " m
-    [[ $m == 1 ]] && MODE="block" || MODE="allow"
-    read -p "国家代码 (如 cn jp us): " COUNTRIES
-    read -p "端口 (all 或 22 80 多个空格分隔): " PORTS
-
-    echo "MODE=\"$MODE\"" > $CONF
-    echo "COUNTRIES=\"$COUNTRIES\"" >> $CONF
-    echo "PORTS=\"$PORTS\"" >> $CONF
-    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
-
-    install_auto_update
-    apply_rules
-}
-
-# ================== 白名单 ==================
-add_whitelist(){
-    read -p "输入要加入白名单IP (多个空格分隔): " ips
-    source $CONF 2>/dev/null
-    WHITELIST="$WHITELIST $ips"
-
-    echo "MODE=\"$MODE\"" > $CONF
-    echo "COUNTRIES=\"$COUNTRIES\"" >> $CONF
-    echo "PORTS=\"$PORTS\"" >> $CONF
-    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
-
-    green "白名单已更新"
-    apply_rules
-}
-
-# ================== 查看规则 ==================
-view_rules(){
-    clear
-    green "========= 当前配置 ========="
-    cat $CONF 2>/dev/null
-    echo
-    iptables -L GEO_CHAIN -n --line-numbers 2>/dev/null
-    echo
-    ipset list | grep "^Name:"
-}
-
-
-# ================== 删除指定端口规则 ==================
-delete_rules(){
-
-    source $CONF 2>/dev/null
-    [[ -z "$PORTS" ]] && red "未检测到配置" && return
-
-    read -p "输入要删除的端口 (如 80 多个空格): " DEL_PORTS
-    [[ -z "$DEL_PORTS" ]] && red "未输入端口" && return
-
-    for p in $DEL_PORTS; do
-        for proto in tcp udp; do
-
-            # 删除 IPv4 规则
-            iptables -L GEO_CHAIN --line-numbers -n | \
-            grep "$proto" | grep "dpt:$p" | \
-            awk '{print $1}' | sort -rn | \
-            while read num; do
-                iptables -D GEO_CHAIN $num
-            done
-
-            # 删除 IPv6 规则
-            ip6tables -L GEO_CHAIN --line-numbers -n | \
-            grep "$proto" | grep "dpt:$p" | \
-            awk '{print $1}' | sort -rn | \
-            while read num; do
-                ip6tables -D GEO_CHAIN $num
-            done
-
-        done
-        green "端口 $p 规则已删除"
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== Snell 节点管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动新节点${RESET}"
+        echo -e "${GREEN}2) 管理已有节点${RESET}"
+        echo -e "${GREEN}3) 查看所有节点状态${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "请选择: " choice
+        case $choice in
+            1) install_node ;;
+            2) node_action_menu ;;
+            3) show_all_status ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
+        esac
     done
-
-    netfilter-persistent save >/dev/null 2>&1
 }
 
-# ================== 卸载 ==================
-uninstall_all(){
-
-    green "正在卸载"
-
-    # 删除规则
-    iptables -D INPUT -j GEO_CHAIN 2>/dev/null
-    ip6tables -D INPUT -j GEO_CHAIN 2>/dev/null
-    iptables -F GEO_CHAIN 2>/dev/null
-    ip6tables -F GEO_CHAIN 2>/dev/null
-    iptables -X GEO_CHAIN 2>/dev/null
-    ip6tables -X GEO_CHAIN 2>/dev/null
-
-    # 删除 ipset
-    ipset list | grep "^Name: geo_" | awk '{print $2}' | xargs -r -I {} ipset destroy {}
-
-    # 删除配置和更新脚本
-    rm -rf /opt/geoip
-
-    # 删除定时任务
-    crontab -l 2>/dev/null | grep -v update_geo.sh | crontab -
-
-    # 删除主程序
-    rm -f $SCRIPT_PATH
-
-    netfilter-persistent save >/dev/null 2>&1
-
-    green "已彻底卸载完成"
-    exit 0
-}
-# ================== 菜单 ==================
-menu(){
-clear
-echo -e "${GREEN}===== VPS国家防火墙 =====${RESET}"
-echo -e "${GREEN}1 添加规则${RESET}"
-echo -e "${GREEN}2 删除规则${RESET}"
-echo -e "${GREEN}3 查看规则${RESET}"
-echo -e "${GREEN}4 添加白名单${RESET}"
-echo -e "${GREEN}5 更新${RESET}"
-echo -e "${GREEN}6 卸载${RESET}"
-echo -e "${GREEN}0 退出${RESET}"
-read -r -p $'\033[32m请选择: \033[0m' num
-case $num in
-1) add_rule ;;
-2) delete_rules ;;
-3) view_rules ;;
-4) add_whitelist ;;
-5) download_script ;;
-6) uninstall_all ;;
-0) exit ;;
-esac
-}
-
-# ================== 主循环 ==================
-init_env
-while true; do
-    menu
-    read -r -p $'\033[32m按回车继续...\033[0m'
-done
+menu

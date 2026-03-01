@@ -48,7 +48,8 @@ menu() {
         echo -e "${GREEN}3) 重启${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}6) 修改配置${RESET}"
+        echo -e "${GREEN}7) 卸载${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
@@ -58,7 +59,8 @@ menu() {
             3) restart_app ;;
             4) view_logs ;;
             5) check_status ;;
-            6) uninstall_app ;;
+            6) modify_config ;;
+            7) uninstall_app ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
         esac
@@ -69,40 +71,60 @@ install_app() {
     check_docker
     mkdir -p "$APP_DIR"
 
-    # 端口设置
-    read -p "请输入监听端口 [443 默认]: " PORT
-    PORT=${PORT:-443}
+    random_port() {
+        while :; do
+            PORT=$(shuf -i 2000-65000 -n 1)
+            ss -lnt | awk '{print $4}' | grep -q ":$PORT$" || break
+        done
+        echo "$PORT"
+    }
 
-    # 域名设置，默认 itunes.apple.com
-    read -p "请输入域名 (用于 Reality serverNames, 默认 itunes.apple.com): " DOMAIN
+    read -p "请输入监听端口 [默认随机]: " PORT
+
+    if [[ -z "$PORT" ]]; then
+        PORT=$(random_port)
+        echo -e "已自动生成未占用端口: ${PORT}"
+    fi
+
+    read -p "请输入伪装域名 [默认 itunes.apple.com]: " DOMAIN
     DOMAIN=${DOMAIN:-itunes.apple.com}
 
-    # 自动生成 UUID
     UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
 
-    # 生成 X25519 密钥对（最新 xray-core 格式）
     X25519=$(docker run --rm ghcr.io/xtls/xray-core:latest x25519)
-    PRIVATE_KEY=$(echo "$X25519" | grep "PrivateKey" | awk -F": " '{print $2}')
-    PUBLIC_KEY=$(echo "$X25519" | grep "Password"   | awk -F": " '{print $2}')
 
-    # 检查是否成功
+    PRIVATE_KEY=$(echo "$X25519" | grep "PrivateKey" | awk -F': ' '{print $2}')
+    PUBLIC_KEY=$(echo "$X25519"  | grep "Password"   | awk -F': ' '{print $2}')
+
     if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-        echo -e "${RED}❌ 密钥生成失败，请检查 Docker 是否正常${RESET}"
+        echo -e "${RED}密钥生成失败${RESET}"
         return
     fi
 
-    # 生成 shortId
     SHORT_ID=$(openssl rand -hex 8)
 
-    # DNS 设置
-    read -p "请输入 DNS（默认 8.8.8.8,1.1.1.1）: " DNS
-    DNS=${DNS:-8.8.8.8,1.1.1.1}
+    read -p "请输入 DNS（逗号分隔，默认 8.8.8.8,1.1.1.1）: " DNS_INPUT
+    DNS_INPUT=${DNS_INPUT:-8.8.8.8,1.1.1.1}
 
-    # 生成 config.json
+    # 转换为 JSON 数组格式
+    IFS=',' read -ra DNS_ARRAY <<< "$DNS_INPUT"
+
+    DNS_SERVERS="["
+    for dns in "${DNS_ARRAY[@]}"; do
+        DNS_SERVERS+="\"${dns}\","
+    done
+    DNS_SERVERS="${DNS_SERVERS%,}]"
+
     cat > "$CONFIG_FILE" <<EOF
 {
-  "log": { "access": "/var/log/xray/access.log", "error": "/var/log/xray/error.log", "loglevel": "warning" },
-  "dns": { "servers": ["$DNS"] },
+  "log": {
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log",
+    "loglevel": "warning"
+  },
+  "dns": {
+    "servers": $DNS_SERVERS
+  },
   "inbounds": [
     {
       "port": $PORT,
@@ -113,11 +135,7 @@ install_app() {
             "id": "$UUID",
             "flow": "xtls-rprx-vision",
             "level": 0,
-            "email": "user@example.com",
-            "realitySettings": {
-              "privateKey": "$PRIVATE_KEY",
-              "shortIds": ["$SHORT_ID"]
-            }
+            "email": "user@example.com"
           }
         ],
         "decryption": "none"
@@ -127,51 +145,47 @@ install_app() {
         "security": "reality",
         "realitySettings": {
           "show": false,
-          "dest": "$DOMAIN:$PORT",
+          "dest": "$DOMAIN:443",
           "xver": 0,
           "serverNames": ["$DOMAIN"],
           "privateKey": "$PRIVATE_KEY",
-          "publicKey": "$PUBLIC_KEY"
+          "shortIds": ["$SHORT_ID"]
         }
       }
     }
   ],
-  "outbounds": [{"protocol": "freedom","settings":{}}]
+  "outbounds": [
+    { "protocol": "freedom", "settings": {} }
+  ]
 }
 EOF
 
-    # 生成 Docker Compose
     cat > "$COMPOSE_FILE" <<EOF
 services:
   xray:
     image: ghcr.io/xtls/xray-core:latest
     container_name: xray
     restart: unless-stopped
-    command: ["run", "-c", "/usr/local/etc/xray/config.json"]
+    command: ["run","-c","/etc/xray/config.json"]
     volumes:
-      - ./config.json:/usr/local/etc/xray/config.json:ro
+      - ./config.json:/etc/xray/config.json:ro
     ports:
       - "$PORT:$PORT/tcp"
-    
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    # 生成可用 VLESS Reality 链接
     IP=$(hostname -I | awk '{print $1}')
-    TAG=HOSTNAME=$(hostname -s | sed 's/ /_/g')
-    
-    VLESS_LINK="vless://${UUID}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${TAG}"
+    TAG=$(hostname -s)
+
+    VLESS_LINK="vless://${UUID}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${TAG}"
 
     echo
-    echo -e "${GREEN}✅ Xray Reality 已启动${RESET}"
-    echo -e "${YELLOW}VLESS Reality 链接:${RESET}"
+    echo -e "${GREEN}✅ 安装完成${RESET}"
     echo -e "${YELLOW}${VLESS_LINK}${RESET}"
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
     read -p "按回车返回菜单..."
 }
-
 update_app() {
     cd "$APP_DIR" || return
     docker compose pull
@@ -201,6 +215,124 @@ uninstall_app() {
     docker compose down
     rm -rf "$APP_DIR"
     echo -e "${RED}✅ Xray Reality 已卸载${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+modify_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${RED}未检测到配置文件，请先安装${RESET}"
+        sleep 2
+        return
+    fi
+
+    echo -e "${YELLOW}=== 修改配置 ===${RESET}"
+
+    # 读取当前配置
+    CURRENT_PORT=$(grep '"port"' "$CONFIG_FILE" | head -1 | awk -F': ' '{print $2}' | tr -d ',')
+    CURRENT_DOMAIN=$(grep '"dest"' "$CONFIG_FILE" | awk -F'"' '{print $4}' | cut -d':' -f1)
+
+    read -p "监听端口 [$CURRENT_PORT]: " NEW_PORT
+    NEW_PORT=${NEW_PORT:-$CURRENT_PORT}
+
+    read -p "伪装域名 [$CURRENT_DOMAIN]: " NEW_DOMAIN
+    NEW_DOMAIN=${NEW_DOMAIN:-$CURRENT_DOMAIN}
+
+    read -p "是否重新生成 UUID？[y/N]: " regen_uuid
+    if [[ "$regen_uuid" =~ ^[Yy]$ ]]; then
+        NEW_UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
+    else
+        NEW_UUID=$(grep '"id"' "$CONFIG_FILE" | awk -F'"' '{print $4}')
+    fi
+
+    read -p "是否重新生成 Reality 密钥？[y/N]: " regen_key
+    if [[ "$regen_key" =~ ^[Yy]$ ]]; then
+        X25519=$(docker run --rm ghcr.io/xtls/xray-core:latest x25519)
+        NEW_PRIVATE_KEY=$(echo "$X25519" | grep "PrivateKey" | awk -F': ' '{print $2}')
+        NEW_PUBLIC_KEY=$(echo "$X25519"  | grep "Password"   | awk -F': ' '{print $2}')
+        NEW_SHORT_ID=$(openssl rand -hex 8)
+    else
+        NEW_PRIVATE_KEY=$(grep '"privateKey"' "$CONFIG_FILE" | awk -F'"' '{print $4}')
+        NEW_PUBLIC_KEY="保持原值"
+        NEW_SHORT_ID=$(grep '"shortIds"' -A1 "$CONFIG_FILE" | tail -1 | awk -F'"' '{print $2}')
+    fi
+
+    read -p "DNS（逗号分隔，留空不变）: " DNS_INPUT
+    if [[ -n "$DNS_INPUT" ]]; then
+        IFS=',' read -ra DNS_ARRAY <<< "$DNS_INPUT"
+        DNS_SERVERS="["
+        for dns in "${DNS_ARRAY[@]}"; do
+            DNS_SERVERS+="\"${dns}\","
+        done
+        DNS_SERVERS="${DNS_SERVERS%,}]"
+    else
+        DNS_SERVERS=$(grep '"servers"' -A1 "$CONFIG_FILE" | tail -1)
+    fi
+
+    # 重新写配置
+    cat > "$CONFIG_FILE" <<EOF
+{
+  "log": {
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log",
+    "loglevel": "warning"
+  },
+  "dns": {
+    "servers": $DNS_SERVERS
+  },
+  "inbounds": [
+    {
+      "port": $NEW_PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "$NEW_UUID",
+            "flow": "xtls-rprx-vision",
+            "level": 0
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "$NEW_DOMAIN:443",
+          "xver": 0,
+          "serverNames": ["$NEW_DOMAIN"],
+          "privateKey": "$NEW_PRIVATE_KEY",
+          "shortIds": ["$NEW_SHORT_ID"]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    { "protocol": "freedom", "settings": {} }
+  ]
+}
+EOF
+
+    # 更新 compose 端口映射
+    sed -i "s/[0-9]\+:[0-9]\+\/tcp/$NEW_PORT:$NEW_PORT\/tcp/g" "$COMPOSE_FILE"
+
+    cd "$APP_DIR" || return
+    docker compose up -d --force-recreate
+
+    IP=$(hostname -I | awk '{print $1}')
+    TAG=$(hostname -s)
+
+    if [[ "$NEW_PUBLIC_KEY" != "保持原值" ]]; then
+        PBK="$NEW_PUBLIC_KEY"
+    else
+        PBK=$(grep "pbk=" <<< "$(docker logs xray 2>/dev/null)")
+    fi
+
+    echo
+    echo -e "${GREEN}✅ 配置修改完成${RESET}"
+    echo -e "${YELLOW}新端口: $NEW_PORT${RESET}"
+    echo -e "${YELLOW}新域名: $NEW_DOMAIN${RESET}"
+
     read -p "按回车返回菜单..."
 }
 

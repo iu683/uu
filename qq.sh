@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Xray Reality 一键管理脚本
+# Shadowsocks Rust 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,10 +8,12 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="xray-reality"
+APP_NAME="shadowsocks-rust"
 APP_DIR="/root/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/compose.yml"
 CONFIG_FILE="$APP_DIR/config.json"
+
+METHOD="2022-blake3-aes-256-gcm"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -24,25 +26,10 @@ check_docker() {
     fi
 }
 
-generate_keys() {
-    UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
-    read -p "是否自动生成 Reality 密钥对？[Y/n]: " keygen
-    keygen=${keygen:-Y}
-    if [[ "$keygen" =~ ^[Yy]$ ]]; then
-        X25519=$(docker run --rm ghcr.io/xtls/xray-core:latest x25519)
-        PRIVATE_KEY=$(echo "$X25519" | awk 'NR==1{print $1}')
-        PUBLIC_KEY=$(echo "$X25519" | awk 'NR==2{print $1}')
-    else
-        read -p "请输入 PrivateKey: " PRIVATE_KEY
-        read -p "请输入 PublicKey: " PUBLIC_KEY
-    fi
-    SHORT_ID=$(openssl rand -hex 8)
-}
-
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Xray Reality 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Shadowsocks Rust 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -66,132 +53,94 @@ menu() {
 }
 
 install_app() {
+
     check_docker
     mkdir -p "$APP_DIR"
 
-    read -p "请输入监听端口 [默认 443]: " PORT
-    PORT=${PORT:-443}
+    random_port() {
+        while :; do
+            PORT=$(shuf -i 2000-65000 -n 1)
+            ss -lnt | awk '{print $4}' | grep -q ":$PORT$" || break
+        done
+        echo "$PORT"
+    }
 
-    read -p "请输入伪装域名 [默认 itunes.apple.com]: " DOMAIN
-    DOMAIN=${DOMAIN:-itunes.apple.com}
+    read -p "请输入监听端口 [默认随机]: " PORT
+    [[ -z "$PORT" ]] && PORT=$(random_port)
 
-    UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
-
-    X25519=$(docker run --rm ghcr.io/xtls/xray-core:latest x25519)
-    PRIVATE_KEY=$(echo "$X25519" | grep "PrivateKey" | awk '{print $3}')
-    PUBLIC_KEY=$(echo "$X25519" | grep "PublicKey" | awk '{print $3}')
-
-    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-        echo -e "${RED}密钥生成失败${RESET}"
-        return
-    fi
-
-    SHORT_ID=$(openssl rand -hex 8)
-
-    read -p "请输入 DNS（逗号分隔，默认 8.8.8.8,1.1.1.1）: " DNS_INPUT
-    DNS_INPUT=${DNS_INPUT:-8.8.8.8,1.1.1.1}
-
-    # 转换为 JSON 数组格式
-    IFS=',' read -ra DNS_ARRAY <<< "$DNS_INPUT"
-
-    DNS_SERVERS="["
-    for dns in "${DNS_ARRAY[@]}"; do
-        DNS_SERVERS+="\"${dns}\","
-    done
-    DNS_SERVERS="${DNS_SERVERS%,}]"
+    echo -e "${YELLOW}正在生成 2022 密钥...${RESET}"
+    PASSWORD=$(openssl rand -base64 32)
 
     cat > "$CONFIG_FILE" <<EOF
 {
-  "log": {
-    "access": "/var/log/xray/access.log",
-    "error": "/var/log/xray/error.log",
-    "loglevel": "warning"
-  },
-  "dns": {
-    "servers": $DNS_SERVERS
-  },
-  "inbounds": [
-    {
-      "port": $PORT,
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          {
-            "id": "$UUID",
-            "flow": "xtls-rprx-vision",
-            "level": 0,
-            "email": "user@example.com"
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "$DOMAIN:443",
-          "xver": 0,
-          "serverNames": ["$DOMAIN"],
-          "privateKey": "$PRIVATE_KEY",
-          "shortIds": ["$SHORT_ID"]
-        }
-      }
-    }
-  ],
-  "outbounds": [
-    { "protocol": "freedom", "settings": {} }
-  ]
+    "server": "0.0.0.0",
+    "server_port": $PORT,
+    "password": "$PASSWORD",
+    "method": "$METHOD",
+    "mode": "tcp_and_udp",
+    "fast_open": true
 }
 EOF
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  xray:
-    image: ghcr.io/xtls/xray-core:latest
-    container_name: xray
+  ss:
+    image: ghcr.io/shadowsocks/ssserver-rust:latest
+    container_name: shadowsocks
     restart: unless-stopped
-    command: ["run","-c","/etc/xray/config.json"]
+    network_mode: host
+    command: ssserver -c /etc/shadowsocks/config.json
     volumes:
-      - ./config.json:/etc/xray/config.json:ro
-    ports:
-      - "$PORT:$PORT/tcp"
+      - ./config.json:/etc/shadowsocks/config.json:ro
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
+   
 
-    IP=$(hostname -I | awk '{print $1}')
-    TAG=$(hostname -s)
-
-    VLESS_LINK="vless://${UUID}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${TAG}"
-
+    IP4=$(hostname -I | awk '{print $1}')
+    IP6=$(ip -6 addr show scope global | grep inet6 | awk '{print $2}' | cut -d/ -f1 | head -n1)
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
     echo
-    echo -e "${GREEN}✅ 安装完成${RESET}"
-    echo -e "${YELLOW}${VLESS_LINK}${RESET}"
+    echo "Shadowsocks Rust 配置："
+    echo " 地址：$IPV4"
+    [[ -n "$IPV6" ]] && echo " 地址：$IPV6"
+    echo " 端口：$PORT"
+    echo " 密码：$PASSWORD"
+    echo " 加密：$METHOD"
+    echo " TFO ：true"
+    echo "————————————————————————————————————————"
+    echo "链接 [IPv4]：ss://${PASSWORD}@${IP4}:${PORT}"
+    [ -n "$IP6" ] && echo "链接 [IPv6]：ss://${PASSWORD}@[${IP6}]:${PORT}"
+    echo "—————————————————————————"
+    echo "[信息] Surge 配置："
+    echo "$HOSTNAME = ss, $IP4,$PORT, encrypt-method=$METHOD, password=$PASSWORD, tfo=true, udp-relay=true, ecn=true"
+    echo
+
     read -p "按回车返回菜单..."
 }
+
 update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Xray Reality 更新完成${RESET}"
+    echo -e "${GREEN}✅ Shadowsocks 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart xray
-    echo -e "${GREEN}✅ Xray Reality 已重启${RESET}"
+    docker restart shadowsocks
+    echo -e "${GREEN}✅ Shadowsocks 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f xray
+    docker logs -f shadowsocks
 }
 
 check_status() {
-    docker ps | grep xray
+    docker ps | grep shadowsocks
     read -p "按回车返回菜单..."
 }
 
@@ -199,7 +148,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Xray Reality 已卸载${RESET}"
+    echo -e "${RED}✅ Shadowsocks 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

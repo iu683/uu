@@ -1,22 +1,19 @@
 #!/bin/bash
 # ========================================
-# TUIC v5 多节点管理脚本（完整版）
-# Host模式 + 单节点管理 + 批量操作 + 全绿菜单
+# Sing-box AnyTLS 多节点管理脚本（Host模式 + 自签Bing证书）
 # ========================================
 
 GREEN="\033[32m"
+YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="tuic-v5"
-APP_DIR="/opt/$APP_NAME"
+APP_NAME="singbox-anytls"
+APP_DIR="/root/$APP_NAME"
 
-# =========================
-# Docker 检测
-# =========================
 check_docker() {
     if ! command -v docker &>/dev/null; then
-        echo -e "${GREEN}未检测到 Docker，正在安装...${RESET}"
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
         curl -fsSL https://get.docker.com | bash
     fi
     if ! docker compose version &>/dev/null; then
@@ -25,19 +22,13 @@ check_docker() {
     fi
 }
 
-# =========================
-# 端口检测
-# =========================
 check_port() {
-    if ss -tuln | awk '{print $5}' | grep -qE "[:.]$1$"; then
-        echo -e "${RED}端口 $1 已被占用！${RESET}"
+    if ss -tulnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
         return 1
     fi
 }
 
-# =========================
-# 列出节点
-# =========================
 list_nodes() {
     mkdir -p "$APP_DIR"
     local count=0
@@ -49,42 +40,37 @@ list_nodes() {
     [ $count -eq 0 ] && echo -e "${GREEN}无节点${RESET}"
 }
 
-# =========================
-# 选择节点
-# =========================
 select_node() {
     mkdir -p "$APP_DIR"
     local nodes=()
     local count=0
-
     for node in "$APP_DIR"/*; do
         [ -d "$node" ] || continue
         nodes+=("$(basename "$node")")
         count=$((count+1))
         echo -e "${GREEN}[$count] ${nodes[-1]}${RESET}"
     done
+    [ $count -eq 0 ] && { echo -e "${RED}无节点！${RESET}"; return 1; }
 
-    [ $count -eq 0 ] && return 1
-
-    read -p "$(echo -e ${GREEN}请输入节点名称或编号:${RESET}) " input
+    read -r -p $'\033[32m请输入节点名称或编号:\033[0m ' input
 
     if [[ "$input" =~ ^[0-9]+$ ]]; then
-        NODE_NAME="${nodes[$((input-1))]}"
+        if (( input >= 1 && input <= count )); then
+            NODE_NAME="${nodes[$((input-1))]}"
+        else
+            echo -e "${RED}编号无效！${RESET}"
+            return 1
+        fi
     else
         NODE_NAME="$input"
+        if [ ! -d "$APP_DIR/$NODE_NAME" ]; then
+            echo -e "${RED}节点不存在！${RESET}"
+            return 1
+        fi
     fi
-
     NODE_DIR="$APP_DIR/$NODE_NAME"
-
-    if [ -z "$NODE_NAME" ] || [ ! -d "$NODE_DIR" ]; then
-        echo -e "${RED}节点不存在！${RESET}"
-        return 1
-    fi
 }
 
-# =========================
-# 安装节点
-# =========================
 install_node() {
     check_docker
     read -p "请输入节点名称 [node$(date +%s)]: " NODE_NAME
@@ -93,12 +79,12 @@ install_node() {
     mkdir -p "$NODE_DIR"
 
     read -p "请输入监听端口 [默认随机]: " input_port
-    PORT=${input_port:-$(shuf -i 1025-65535 -n1)}
+    PORT=${input_port:-$(shuf -i 20000-60000 -n1)}
     check_port "$PORT" || return
 
-    UUID=$(cat /proc/sys/kernel/random/uuid)
-    PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c8)
+    PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c16)
 
+    echo -e "${YELLOW}正在生成 Bing 自签证书...${RESET}"
     openssl req -x509 -nodes -newkey rsa:2048 \
         -keyout "$NODE_DIR/server.key" \
         -out "$NODE_DIR/server.crt" \
@@ -111,28 +97,19 @@ install_node() {
   "log": { "level": "info" },
   "inbounds": [
     {
-      "type": "tuic",
+      "type": "anytls",
       "listen": "0.0.0.0",
       "listen_port": ${PORT},
-      "users": [
-        {
-          "uuid": "${UUID}",
-          "password": "${PASSWORD}"
-        }
-      ],
-      "congestion_control": "bbr",
+      "users": [{ "password": "${PASSWORD}" }],
       "tls": {
         "enabled": true,
-        "alpn": ["h3"],
         "server_name": "www.bing.com",
-        "certificate_path": "/etc/tuic/server.crt",
-        "key_path": "/etc/tuic/server.key"
+        "certificate_path": "/etc/sing-box/server.crt",
+        "key_path": "/etc/sing-box/server.key"
       }
     }
   ],
-  "outbounds": [
-    { "type": "direct" }
-  ]
+  "outbounds": [{ "type": "direct" }]
 }
 EOF
 
@@ -144,28 +121,27 @@ services:
     restart: always
     network_mode: host
     volumes:
-      - ./config.json:/etc/tuic/config.json
-      - ./server.crt:/etc/tuic/server.crt
-      - ./server.key:/etc/tuic/server.key
-    command: run -c /etc/tuic/config.json
+      - ./config.json:/etc/sing-box/config.json
+      - ./server.crt:/etc/sing-box/server.crt
+      - ./server.key:/etc/sing-box/server.key
+    command: run -c /etc/sing-box/config.json
 EOF
 
     cd "$NODE_DIR" || return
     docker compose up -d
 
-    SERVER_IP=$(curl -s ifconfig.me || hostname -I | awk '{print $1}')
+    SERVER_IP=$(hostname -I | awk '{print $1}')
 
-    echo -e "${GREEN}节点已启动${RESET}"
-    echo -e "${GREEN}tuic://${UUID}:${PASSWORD}@${SERVER_IP}:${PORT}?congestion_control=bbr&alpn=h3&sni=www.bing.com&udp_relay_mode=native&allow_insecure=1${RESET}"
+    echo -e "${GREEN}✅ 节点已启动${RESET}"
+    echo -e "${YELLOW}IP: ${SERVER_IP} 端口: ${PORT} 密码: ${PASSWORD}${RESET}"
+    echo -e "${GREEN}📄 客户端链接:${RESET}"
+    echo -e "${YELLOW}anytls://${PASSWORD}@${SERVER_IP}:${PORT}/?sni=www.bing.com&insecure=1#$HOSTNAME${RESET}"
+    echo -e "${YELLOW}Surge : $HOSTNAME = anytls, ${SERVER_IP}, ${PORT}, password=${PASSWORD}, tfo=true, skip-cert-verify=true, reuse=false"
     read -p "按回车返回菜单..."
 }
 
-# =========================
-# 单节点管理菜单
-# =========================
 node_action_menu() {
     select_node || return
-
     while true; do
         echo -e "${GREEN}=== 节点 [$NODE_NAME] 管理 ===${RESET}"
         echo -e "${GREEN}1) 暂停${RESET}"
@@ -174,9 +150,7 @@ node_action_menu() {
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 卸载${RESET}"
         echo -e "${GREEN}0) 返回${RESET}"
-
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
+        read -r -p $'\033[32m请选择操作:\033[0m ' choice
         case $choice in
             1) docker pause "$NODE_NAME" ;;
             2) docker restart "$NODE_NAME" ;;
@@ -189,33 +163,27 @@ node_action_menu() {
     done
 }
 
-# =========================
-# 批量操作
-# =========================
 batch_action() {
     echo -e "${GREEN}=== 批量操作 ===${RESET}"
-    echo -e "${GREEN}1) 暂停${RESET}"
-    echo -e "${GREEN}2) 重启${RESET}"
-    echo -e "${GREEN}3) 更新${RESET}"
-    echo -e "${GREEN}4) 卸载${RESET}"
+    echo -e "${GREEN}1) 批量暂停${RESET}"
+    echo -e "${GREEN}2) 批量重启${RESET}"
+    echo -e "${GREEN}3) 批量更新${RESET}"
+    echo -e "${GREEN}4) 批量卸载${RESET}"
     echo -e "${GREEN}0) 返回${RESET}"
-
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+    read -r -p $'\033[32m请选择操作:\033[0m ' choice
+    [[ "$choice" == "0" ]] && return
 
     declare -A NODE_MAP
-    count=0
-
+    local count=0
     for node in "$APP_DIR"/*; do
         [ -d "$node" ] || continue
         count=$((count+1))
         NODE_MAP[$count]=$(basename "$node")
         echo -e "${GREEN}[$count] ${NODE_MAP[$count]}${RESET}"
     done
+    [ $count -eq 0 ] && { echo -e "${GREEN}无节点${RESET}"; read -r -p "回车返回..."; return; }
 
-    [ $count -eq 0 ] && return
-
-    read -p "$(echo -e ${GREEN}输入序号(空格)或 all:${RESET}) " input
-
+    read -r -p $'\033[32m输入序号(空格分)或 all:\033[0m ' input
     if [[ "$input" == "all" ]]; then
         SELECTED=("${NODE_MAP[@]}")
     else
@@ -228,51 +196,40 @@ batch_action() {
     for NODE_NAME in "${SELECTED[@]}"; do
         NODE_DIR="$APP_DIR/$NODE_NAME"
         cd "$NODE_DIR" || continue
-
         case $choice in
             1) docker pause "$NODE_NAME" ;;
             2) docker restart "$NODE_NAME" ;;
             3) docker compose pull && docker compose up -d ;;
             4) docker compose down && rm -rf "$NODE_DIR" ;;
-            0) return ;;
         esac
-
         echo -e "${GREEN}已操作 $NODE_NAME${RESET}"
     done
-
-    read -p "按回车返回菜单..."
+    read -r -p "按回车返回菜单..."
 }
 
-# =========================
-# 状态查看
-# =========================
 show_all_status() {
     echo -e "${GREEN}=== 所有节点状态 ===${RESET}"
     for node in "$APP_DIR"/*; do
         [ -d "$node" ] || continue
         NODE_NAME=$(basename "$node")
+        PORT=$(grep 'listen_port' "$node/config.json" | awk -F: '{gsub(/[ ,"]/,"",$2); print $2}')
         STATUS=$(docker inspect -f '{{.State.Status}}' "$NODE_NAME" 2>/dev/null)
-        [ -z "$STATUS" ] && STATUS="未创建"
-        echo -e "${GREEN}$NODE_NAME | $STATUS${RESET}"
+        [ -z "$STATUS" ] && STATUS="未启动"
+        echo -e "${GREEN}$NODE_NAME | ${PORT:-未知端口} | $STATUS${RESET}"
     done
-    read -p "按回车返回菜单..."
+    read -r -p "按回车返回菜单..."
 }
 
-# =========================
-# 主菜单
-# =========================
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== TUIC v5 多节点管理 ===${RESET}"
+        echo -e "${GREEN}=== Sing-box AnyTLS 多节点管理 ===${RESET}"
         echo -e "${GREEN}1) 安装新节点${RESET}"
         echo -e "${GREEN}2) 单节点管理${RESET}"
         echo -e "${GREEN}3) 查看所有节点状态${RESET}"
         echo -e "${GREEN}4) 批量操作${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
-
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
+        read -r -p $'\033[32m请选择:\033[0m ' choice
         case $choice in
             1) install_node ;;
             2) node_action_menu ;;

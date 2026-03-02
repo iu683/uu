@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Shadowsocks Rust+shadow-tls 一键管理脚本
+# Snell + ShadowTLS 多节点管理（Host Docker）
 # ========================================
 
 GREEN="\033[32m"
@@ -8,12 +8,8 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="ShadowsocksRust+shadow-tls"
-APP_DIR="/root/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/compose.yml"
-CONFIG_FILE="$APP_DIR/config.json"
-
-METHOD="2022-blake3-aes-256-gcm"
+APP_NAME="Snell+ShadowTLS"
+APP_DIR="/opt/$APP_NAME"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -26,169 +22,263 @@ check_docker() {
     fi
 }
 
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== ShadowsocksRust+shadow-tls管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用！${RESET}"
+        return 1
+    fi
+}
 
+# =========================
+# 列出节点
+# =========================
+list_nodes() {
+    mkdir -p "$APP_DIR"
+    local count=0
+    for node in "$APP_DIR"/*; do
+        [ -d "$node" ] || continue
+        count=$((count+1))
+        echo -e "${GREEN}[$count] $(basename "$node")${RESET}"
+    done
+    [ $count -eq 0 ] && echo -e "${GREEN}无节点${RESET}"
+}
+
+# =========================
+# 选择节点
+# =========================
+select_node() {
+    mkdir -p "$APP_DIR"
+    local nodes=()
+    local count=0
+
+    for node in "$APP_DIR"/*; do
+        [ -d "$node" ] || continue
+        nodes+=("$(basename "$node")")
+        count=$((count+1))
+        echo -e "${GREEN}[$count] ${nodes[-1]}${RESET}"
+    done
+
+    [ $count -eq 0 ] && { echo -e "${RED}无节点！${RESET}"; return 1; }
+
+    while true; do
+        read -r -p $'\033[32m请输入节点名称或编号:\033[0m ' input
+        if [[ "$input" =~ ^[0-9]+$ ]]; then
+            if (( input >= 1 && input <= count )); then
+                NODE_NAME="${nodes[$((input-1))]}"
+                break
+            else
+                echo -e "${RED}编号无效！请重新输入${RESET}"
+            fi
+        else
+            if [ -d "$APP_DIR/$input" ]; then
+                NODE_NAME="$input"
+                break
+            else
+                echo -e "${RED}节点不存在！请重新输入${RESET}"
+            fi
+        fi
+    done
+
+    NODE_DIR="$APP_DIR/$NODE_NAME"
+}
+
+# =========================
+# 安装新节点
+# =========================
+install_node() {
+    check_docker
+    mkdir -p "$APP_DIR"
+
+    read -p "请输入节点名称 [node$(date +%s)]: " NODE_NAME
+    NODE_NAME=${NODE_NAME:-node$(date +%s)}
+    NODE_DIR="$APP_DIR/$NODE_NAME"
+    mkdir -p "$NODE_DIR"
+
+    # Snell 内部端口
+    read -p "Snell 内部端口 [20000-40000, 默认随机]: " SNELL_PORT
+    SNELL_PORT=${SNELL_PORT:-$(shuf -i20000-40000 -n1)}
+    check_port "$SNELL_PORT" || return
+
+    # ShadowTLS 外部端口
+    read -p "ShadowTLS 对外端口 [默认 443]: " TLS_PORT
+    TLS_PORT=${TLS_PORT:-443}
+    check_port "$TLS_PORT" || return
+
+    PSK=$(tr -dc A-Za-z0-9 </dev/urandom | head -c32)
+    TLS_PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c16)
+
+    read -p "TLS 伪装域名 [默认 captive.apple.com]: " TLS_HOST
+    TLS_HOST=${TLS_HOST:-captive.apple.com}
+
+    COMPOSE_FILE="$NODE_DIR/docker-compose.yml"
+
+    # 生成 docker-compose.yml
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+
+  snell:
+    image: 1byte/snell-server:latest
+    container_name: ${NODE_NAME}-snell
+    restart: always
+    network_mode: host
+    environment:
+      PORT: "${SNELL_PORT}"
+      PSK: "${PSK}"
+      IPv6: "false"
+      OBFS: "off"
+      TFO: "true"
+      ECN: "true"
+
+  shadow-tls:
+    image: ghcr.io/ihciah/shadow-tls:latest
+    container_name: ${NODE_NAME}-tls
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      MODE: server
+      V3: 1
+      LISTEN: 0.0.0.0:${TLS_PORT}
+      SERVER: 127.0.0.1:${SNELL_PORT}
+      TLS: ${TLS_HOST}:443
+      PASSWORD: ${TLS_PASSWORD}
+EOF
+
+    cd "$NODE_DIR" || exit
+    docker compose up -d
+
+    IP=$(hostname -I | awk '{print $1}')
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+    echo -e "${GREEN}✅ 节点 $NODE_NAME 已部署${RESET}"
+    echo "公网IP: $IP"
+    echo "Snell内部端口: $SNELL_PORT"
+    echo "ShadowTLS外部端口: $TLS_PORT"
+    echo "Snell PSK: $PSK"
+    echo "ShadowTLS密码: $TLS_PASSWORD"
+    echo "SNI: $TLS_HOST"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    echo -e "${YELLOW}Snell:${RESET}"
+    echo -e "${YELLOW}$HOSTNAME = snell, ${IP}, ${TLS_PORT}, psk = ${PSK}, version = 5, reuse = true, tfo = true, shadow-tls-password = ${TLS_PASSWORD}, shadow-tls-sni = ${TLS_HOST}, shadow-tls-version = 3${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+# =========================
+# 单节点管理
+# =========================
+node_action_menu() {
+    select_node || return
+    while true; do
+        echo -e "${GREEN}=== 节点 [$NODE_NAME] 管理 ===${RESET}"
+        echo -e "${GREEN}1) 暂停${RESET}"
+        echo -e "${GREEN}2) 重启${RESET}"
+        echo -e "${GREEN}3) 更新${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 卸载${RESET}"
+        echo -e "${GREEN}0) 返回${RESET}"
+        read -r -p $'\033[32m请选择操作:\033[0m ' choice
         case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+            1) docker pause "$NODE_NAME-snell" "$NODE_NAME-tls"  ;;
+            2) docker restart "$NODE_NAME-snell" "$NODE_NAME-tls" ;;
+            3) cd "$NODE_DIR" && docker compose pull && docker compose up -d ;;
+            4) docker logs -f "$NODE_NAME-snell" ;;
+            5) cd "$NODE_DIR" && docker compose down && rm -rf "$NODE_DIR"; return ;;
+            0) return ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
         esac
     done
 }
 
-install_app() {
-
-    check_docker
-    mkdir -p "$APP_DIR"
-
-    random_port() {
-        while :; do
-            PORT=$(shuf -i 2000-65000 -n 1)
-            ss -lnt | awk '{print $4}' | grep -q ":$PORT$" || break
-        done
-        echo "$PORT"
-    }
-
-    read -p "ShadowTLS 对外端口 [默认 8443]: " TLS_PORT
-    TLS_PORT=${TLS_PORT:-8443}
-
-    read -p "请输入伪装域名 SNI [默认 captive.apple.com]: " TLS_HOST
-    TLS_HOST=${TLS_HOST:-captive.apple.com}
-
-    read -p "Shadowsocks 内部监听端口 [默认随机]: " input_ss_port
-
-    if [[ -z "$input_ss_port" ]]; then
-        SS_PORT=$(shuf -i 20000-60000 -n1)
-        echo "已生成随机端口: $SS_PORT"
+# =========================
+# 批量操作
+# =========================
+batch_action() {
+    echo -e "${GREEN}=== 批量操作 ===${RESET}"
+    echo -e "${GREEN}1) 批量暂停${RESET}"
+    echo -e "${GREEN}2) 批量重启${RESET}"
+    echo -e "${GREEN}3) 批量更新${RESET}"
+    echo -e "${GREEN}4) 批量卸载${RESET}"
+    echo -e "${GREEN}0) 返回${RESET}"
+    read -r -p $'\033[32m请选择操作:\033[0m ' choice
+    [[ "$choice" == "0" ]] && return
+    declare -A NODE_MAP
+    local count=0
+    for node in "$APP_DIR"/*; do
+        [ -d "$node" ] || continue
+        count=$((count+1))
+        NODE_MAP[$count]=$(basename "$node")
+        echo -e "${GREEN}[$count] ${NODE_MAP[$count]}${RESET}"
+    done
+    [ $count -eq 0 ] && { echo -e "${YELLOW}无节点${RESET}"; read -p "按回车返回菜单..."; return; }
+    read -r -p $'\033[32m输入序号(空格)或 all:\033[0m ' input
+    if [[ "$input" == "all" ]]; then
+        SELECTED=("${NODE_MAP[@]}")
     else
-        SS_PORT=$input_ss_port
+        SELECTED=()
+        for i in $input; do
+            [ -n "${NODE_MAP[$i]}" ] && SELECTED+=("${NODE_MAP[$i]}")
+        done
     fi
-
-    echo -e "${YELLOW}生成 Shadowsocks 密钥...${RESET}"
-    SS_PASSWORD=$(openssl rand -base64 32)
-
-    echo -e "${YELLOW}生成 ShadowTLS 密码...${RESET}"
-    TLS_PASSWORD=$(openssl rand -base64 16)
-
-    METHOD="2022-blake3-aes-256-gcm"
-
-    # ================= SS 配置 =================
-    cat > "$CONFIG_FILE" <<EOF
-{
-    "server": "127.0.0.1",
-    "server_port": $SS_PORT,
-    "password": "$SS_PASSWORD",
-    "method": "$METHOD",
-    "mode": "tcp_and_udp",
-    "fast_open": true
-}
-EOF
-
-    # ================= Docker Compose =================
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  ss:
-    image: ghcr.io/shadowsocks/ssserver-rust:latest
-    container_name: shadowsocks
-    restart: unless-stopped
-    network_mode: host
-    command: ssserver -c /etc/shadowsocks/config.json
-    volumes:
-      - ./config.json:/etc/shadowsocks/config.json:ro
-
-  shadow-tls:
-    image: ghcr.io/ihciah/shadow-tls:latest
-    container_name: shadow-tls
-    restart: unless-stopped
-    network_mode: host
-    environment:
-      - MODE=server
-      - V3=1
-      - LISTEN=0.0.0.0:${TLS_PORT}
-      - SERVER=127.0.0.1:${SS_PORT}
-      - TLS=${TLS_HOST}:443
-      - PASSWORD=${TLS_PASSWORD}
-EOF
-
-    cd "$APP_DIR" || exit
-    docker compose -p "$PROJECT_NAME" down 2>/dev/null
-    docker compose up -d
-
-    IP4=$(hostname -I | awk '{print $1}')
-    HOSTNAME=$(hostname -s | sed 's/ /_/g')
-    echo
-    echo "=============================="
-    echo "Shadowsocks + ShadowTLS 已部署"
-    echo "服务器IP: $IP4"
-    echo "端口: $TLS_PORT"
-    echo "加密方式: $METHOD"
-    echo "SS密码: $SS_PASSWORD"
-    echo "ShadowTLS密码: $TLS_PASSWORD"
-    echo "SNI: $TLS_HOST"
-    echo "=============================="
-
-    # 生成 ss 链接
-    BASE=$(echo -n "${METHOD}:${SS_PASSWORD}@${IP4}:${TLS_PORT}" | base64 -w 0)
-
-    PLUGIN="shadow-tls%3Bhost%3D${TLS_HOST}%3Bpassword%3D${TLS_PASSWORD}%3Bv3%3D1"
-
-    SS_LINK="ss://${BASE}?plugin=${PLUGIN}"
-
-    echo
-    echo "ShadowTLS 专用链接："
-    echo "----------------------------------"
-    echo "$SS_LINK"
-    echo "----------------------------------"
-    echo "Surge配置:$HOSTNAME = ss, $IP4, $TLS_PORT, encrypt-method=$METHOD, password=$SS_PASSWORD, shadow-tls-password=$TLS_PASSWORD, shadow-tls-sni=$TLS_HOST, shadow-tls-version=3, tfo=true, udp-relay=true, ecn=true "
-
-    read -p "按回车返回菜单..."
-}
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ ShadowsocksRust+shadow-tls 更新完成${RESET}"
+    for NODE_NAME in "${SELECTED[@]}"; do
+        NODE_DIR="$APP_DIR/$NODE_NAME"
+        cd "$NODE_DIR" || continue
+        case $choice in
+            1) docker stop "$NODE_NAME-snell" "$NODE_NAME-tls" ;;
+            2) docker restart "$NODE_NAME-snell" "$NODE_NAME-tls" ;;
+            3) docker compose pull && docker compose up -d ;;
+            4) docker compose down && rm -rf "$NODE_DIR" ;;
+        esac
+        echo -e "${GREEN}已操作 $NODE_NAME${RESET}"
+    done
     read -p "按回车返回菜单..."
 }
 
-restart_app() {
-    docker restart shadowsocks
-    echo -e "${GREEN}✅ ShadowsocksRust+shadow-tls 已重启${RESET}"
+# =========================
+# 查看所有节点状态
+# =========================
+show_all_status() {
+    echo -e "${GREEN}=== 所有节点状态 ===${RESET}"
+    for node in "$APP_DIR"/*; do
+        [ -d "$node" ] || continue
+        NODE_NAME=$(basename "$node")
+
+        # 解析 ShadowTLS LISTEN 端口
+        TLS_PORT=$(grep 'LISTEN' "$node/docker-compose.yml" | head -n1 | awk -F: '{gsub(/ /,"",$2); print $2}')
+        [ -z "$TLS_PORT" ] && TLS_PORT="未知端口"
+
+        # 获取 Snell 容器状态
+        SNELL_STATUS=$(docker inspect -f '{{.State.Status}}' "$NODE_NAME-snell" 2>/dev/null)
+        [ -z "$SNELL_STATUS" ] && SNELL_STATUS="未启动"
+
+        # 获取 ShadowTLS 容器状态
+        TLS_STATUS=$(docker inspect -f '{{.State.Status}}' "$NODE_NAME-tls" 2>/dev/null)
+        [ -z "$TLS_STATUS" ] && TLS_STATUS="未启动"
+
+        echo -e "${GREEN}$NODE_NAME | Snell: $SNELL_STATUS | TLS: $TLS_STATUS | Port: $TLS_PORT${RESET}"
+    done
     read -p "按回车返回菜单..."
 }
 
-view_logs() {
-    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f shadowsocks
-}
-
-check_status() {
-    docker ps | grep shadowsocks
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ ShadowsocksRust+shadow-tls 已卸载${RESET}"
-    read -p "按回车返回菜单..."
+# =========================
+# 主菜单
+# =========================
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== Snell + ShadowTLS 多节点管理 ===${RESET}"
+        echo -e "${GREEN}1) 安装新节点${RESET}"
+        echo -e "${GREEN}2) 单节点管理${RESET}"
+        echo -e "${GREEN}3) 查看所有节点状态${RESET}"
+        echo -e "${GREEN}4) 批量操作${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -r -p $'\033[32m请选择:\033[0m ' choice
+        case $choice in
+            1) install_node ;;
+            2) node_action_menu ;;
+            3) show_all_status ;;
+            4) batch_action ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
 }
 
 menu

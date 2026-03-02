@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Snell 一键管理脚本（Host 模式 + 去掉 DNS）
+# TUIC v5 一键管理脚本（Host模式 + 自签Bing证书）
 # ========================================
 
 GREEN="\033[32m"
@@ -8,10 +8,11 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="snell-server"
+APP_NAME="tuic-server"
 APP_DIR="/root/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONTAINER_NAME="snell-server"
+CONFIG_FILE="$APP_DIR/config.json"
+CONTAINER_NAME="tuic-server"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -25,16 +26,18 @@ check_docker() {
 }
 
 check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
+    if ss -tulnp | grep -q ":$1 "; then
         echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
         return 1
     fi
 }
 
+SERVER_IP=$(hostname -I | awk '{print $1}')
+
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Snell 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== TUIC v5 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -59,7 +62,7 @@ menu() {
 
 install_app() {
     check_docker
-    mkdir -p "$APP_DIR/data"
+    mkdir -p "$APP_DIR"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -67,105 +70,102 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    # ===== Snell 内部端口（仅本地监听）=====
-    read -p "请输入 Snell 内部端口 [20000-40000, 默认随机]: " input_port
-
+    # 端口
+    read -p "请输入监听端口 [默认随机]: " input_port
     if [[ -z "$input_port" ]]; then
-        PORT=$(shuf -i 20000-40000 -n1)
+        PORT=$(shuf -i 1025-65535 -n1)
     else
         PORT=$input_port
     fi
 
     check_port "$PORT" || return
+    
+    # 生成 UUID 和 密码
+    UUID=$(cat /proc/sys/kernel/random/uuid)
+    PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c8)
 
-    # ===== ShadowTLS 对外端口 =====
-    read -p "请输入 ShadowTLS 对外端口 [默认 443]: " tls_input
-    TLS_PORT=${tls_input:-443}
-    check_port "$TLS_PORT" || return
+    echo -e "${YELLOW}正在生成自签证书用于 TUIC v5 ...${RESET}"
+    openssl req -x509 -nodes -newkey rsa:2048 \
+        -keyout "$APP_DIR/server.key" \
+        -out "$APP_DIR/server.crt" \
+        -days 36500 \
+        -subj "/CN=www.bing.com" \
+        -addext "subjectAltName=DNS:www.bing.com" >/dev/null 2>&1
 
-    # ===== 随机生成密钥 =====
-    PSK=$(tr -dc A-Za-z0-9 </dev/urandom | head -c32)
-    TLS_PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c16)
+    # 生成 TUIC v5 配置（正确字段 uuid）
+    cat > "$CONFIG_FILE" <<EOF
+{
+  "log": { "level": "info" },
+  "inbounds": [
+    {
+      "type": "tuic",
+      "listen": "0.0.0.0",
+      "listen_port": ${PORT},
+      "users": [
+        {
+          "uuid": "${UUID}",
+          "password": "${PASSWORD}"
+        }
+      ],
+      "congestion_control": "bbr",
+      "tls": {
+        "enabled": true,
+        "alpn": ["h3"],
+        "server_name": "www.bing.com",
+        "certificate_path": "/etc/tuic/server.crt",
+        "key_path": "/etc/tuic/server.key"
+      }
+    }
+  ],
+  "outbounds": [
+    { "type": "direct" }
+  ]
+}
+EOF
 
-    # ===== 伪装域名 =====
-    read -p "请输入 TLS 伪装域名 [默认 captive.apple.com]: " tls_host
-    TLS_HOST=${tls_host:-captive.apple.com}
-
-    # ===== 生成 docker-compose =====
+    # Docker Compose
     cat > "$COMPOSE_FILE" <<EOF
 services:
-
-  snell:
-    image: 1byte/snell-server:latest
-    container_name: snell
+  tuic-server:
+    image: ghcr.io/sagernet/sing-box:latest
+    container_name: ${CONTAINER_NAME}
     restart: always
     network_mode: host
-    environment:
-      PORT: "${PORT}"
-      PSK: "${PSK}"
-      IPv6: "false"
-      OBFS: "off"
-      TFO: "true"
-      ECN: "true"
-
-  shadow-tls:
-    image: ghcr.io/ihciah/shadow-tls:latest
-    container_name: shadow-tls
-    restart: unless-stopped
-    network_mode: host
-    environment:
-      MODE: server
-      V3: 1
-      LISTEN: 0.0.0.0:${TLS_PORT}
-      SERVER: 127.0.0.1:${PORT}
-      TLS: ${TLS_HOST}:443
-      PASSWORD: ${TLS_PASSWORD}
+    volumes:
+      - ./config.json:/etc/tuic/config.json
+      - ./server.crt:/etc/tuic/server.crt
+      - ./server.key:/etc/tuic/server.key
+    command: run -c /etc/tuic/config.json
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    # ===== 获取公网IP =====
-    IP=$(hostname -I | awk '{print $1}')
     HOSTNAME=$(hostname -s | sed 's/ /_/g')
 
     echo
-    echo -e "${GREEN}✅ Snell + ShadowTLS 已启动${RESET}"
-    echo -e "${YELLOW}🌐 公网IP: ${IP}${RESET}"
-    echo -e "${YELLOW}🌐 TLS端口: ${TLS_PORT}${RESET}"
-    echo -e "${YELLOW}🔑 Snell PSK: ${PSK}${RESET}"
-    echo -e "${YELLOW}🔑 ShadowTLS 密码: ${TLS_PASSWORD}${RESET}"
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
-
+    echo -e "${GREEN}✅ TUIC v5 节点已启动${RESET}"
+    echo -e "${YELLOW}🌐 公网 IP: ${SERVER_IP}${RESET}"
+    echo -e "${YELLOW}🔌 端口: ${PORT}${RESET}"
+    echo -e "${YELLOW}🆔 UUID: ${UUID}${RESET}"
+    echo -e "${YELLOW}🔑 密码: ${PASSWORD}${RESET}"
     echo
-    echo -e "${GREEN}====== 客户端配置示例 ======${RESET}"
-    echo -e "${YELLOW}ShadowTLS:${RESET}"
-    echo -e " 地址: ${IP}"
-    echo -e " 端口: ${TLS_PORT}"
-    echo -e " 密码: ${TLS_PASSWORD}"
-    echo -e " SNI: ${TLS_HOST}"
+    echo -e "${GREEN}📄 客户端链接:${RESET}"
+    echo -e "${YELLOW}tuic://${UUID}:${PASSWORD}@${SERVER_IP}:${PORT}?congestion_control=bbr&alpn=h3&sni=www.bing.com&udp_relay_mode=native&allow_insecure=1#${HOSTNAME}${RESET}"
     echo
-    echo -e "${YELLOW}Snell:${RESET}"
-    echo -e " PSK: ${PSK}"
-    echo -e " Version: 5"
-    echo
-    echo -e " $HOSTNAME = snell, ${IP}, ${TLS_PORT}, psk = ${PSK}, version = 5, reuse = true, tfo = true, shadow-tls-password = ${TLS_PASSWORD}, shadow-tls-sni = ${TLS_HOST}, shadow-tls-version = 3"
-
-
     read -p "按回车返回菜单..."
 }
-
 update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Snell 更新完成${RESET}"
+    echo -e "${GREEN}✅ 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
     docker restart ${CONTAINER_NAME}
-    echo -e "${GREEN}✅ Snell 已重启${RESET}"
+    echo -e "${GREEN}✅ 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
@@ -180,11 +180,10 @@ check_status() {
 }
 
 uninstall_app() {
-    cd "$APP_DIR" || return
     docker stop ${CONTAINER_NAME}
     docker rm ${CONTAINER_NAME}
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Snell 已卸载${RESET}"
+    echo -e "${RED}✅ 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

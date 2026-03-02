@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Shadowsocks Rust 一键管理脚本
+# Hysteria v2 一键管理脚本（Host 模式 + 自签证书）
 # ========================================
 
 GREEN="\033[32m"
@@ -8,12 +8,11 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="shadowsocks-rust"
+APP_NAME="hysteria"
 APP_DIR="/root/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/compose.yml"
-CONFIG_FILE="$APP_DIR/config.json"
-
-METHOD="2022-blake3-aes-256-gcm"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/hysteria.yaml"
+CONTAINER_NAME="hysteria"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -26,10 +25,31 @@ check_docker() {
     fi
 }
 
+check_port() {
+    if ss -tuln | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
+
+generate_cert() {
+    mkdir -p "$APP_DIR/cert"
+    CERT_FILE="$APP_DIR/cert/server.crt"
+    KEY_FILE="$APP_DIR/cert/server.key"
+    if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ]; then
+        echo -e "${YELLOW}正在生成自签证书...${RESET}"
+        openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+            -keyout "$KEY_FILE" \
+            -out "$CERT_FILE" \
+            -subj "/CN=localhost" \
+            -days 36500
+    fi
+}
+
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Shadowsocks Rust 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Hysteria 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -53,135 +73,106 @@ menu() {
 }
 
 install_app() {
-
     check_docker
     mkdir -p "$APP_DIR"
 
-    random_port() {
-        while :; do
-            PORT=$(shuf -i 2000-65000 -n 1)
-            ss -lnt | awk '{print $4}' | grep -q ":$PORT$" || break
-        done
-        echo "$PORT"
-    }
+    # 端口自定义 / 随机
+    read -p "请输入监听端口 [1025-65535, 默认随机]: " input_port
+    if [[ -z "$input_port" ]]; then
+        PORT=$(shuf -i 1025-65535 -n1)
+    else
+        PORT=$input_port
+    fi
+    check_port "$PORT" || return
 
-    echo
-    read -p "ShadowTLS 对外端口 [默认 443]: " TLS_PORT
-    TLS_PORT=${TLS_PORT:-443}
+    # 随机密码
+    PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c16)
 
-    read -p "请输入伪装域名 SNI [默认 captive.apple.com]: " TLS_HOST
-    TLS_HOST=${TLS_HOST:-captive.apple.com}
+    # 是否启用端口跳跃
+    read -p "是否启用端口跳跃（客户端可通过多个端口连接）[y/N]: " enable_jump
+    if [[ "$enable_jump" =~ ^[Yy]$ ]]; then
+        read -p "请输入端口范围（示例 20000-50000）: " jump_range
+        JUMP_RANGE=${jump_range:-20000-50000}
+        echo -e "${YELLOW}端口跳跃已启用，范围：$JUMP_RANGE -> $PORT${RESET}"
+        # 设置 iptables 规则（IPv4）
+        sudo iptables -t nat -A PREROUTING -i eth0 -p udp --dport $JUMP_RANGE -j REDIRECT --to-ports $PORT
+        # 设置 ip6tables 规则（IPv6）
+        sudo ip6tables -t nat -A PREROUTING -i eth0 -p udp --dport $JUMP_RANGE -j REDIRECT --to-ports $PORT
+    fi
 
-    # Shadowsocks 固定只监听本地
-    SS_PORT=8388
+    # 生成自签证书
+    generate_cert
 
-    echo -e "${YELLOW}生成 Shadowsocks 密钥...${RESET}"
-    SS_PASSWORD=$(openssl rand -base64 32)
-
-    echo -e "${YELLOW}生成 ShadowTLS 密码...${RESET}"
-    TLS_PASSWORD=$(openssl rand -base64 16)
-
-    METHOD="2022-blake3-aes-256-gcm"
-
-    # ================= SS 配置 =================
+    # 生成 hysteria.yaml
     cat > "$CONFIG_FILE" <<EOF
-{
-    "server": "127.0.0.1",
-    "server_port": $SS_PORT,
-    "password": "$SS_PASSWORD",
-    "method": "$METHOD",
-    "mode": "tcp_and_udp",
-    "fast_open": true
-}
+listen: :$PORT
+cert:
+  crt: /etc/hysteria/server.crt
+  key: /etc/hysteria/server.key
+
+auth:
+  type: password
+  password: $PASSWORD
 EOF
 
-    # ================= Docker Compose =================
+    # 生成 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  ss:
-    image: ghcr.io/shadowsocks/ssserver-rust:latest
-    container_name: shadowsocks
-    restart: unless-stopped
+  hysteria:
+    image: tobyxdd/hysteria
+    container_name: $CONTAINER_NAME
+    restart: always
     network_mode: host
-    command: ssserver -c /etc/shadowsocks/config.json
     volumes:
-      - ./config.json:/etc/shadowsocks/config.json:ro
-
-  shadow-tls:
-    image: ghcr.io/ihciah/shadow-tls:latest
-    container_name: shadow-tls
-    restart: unless-stopped
-    network_mode: host
-    environment:
-      - MODE=server
-      - V3=1
-      - LISTEN=0.0.0.0:${TLS_PORT}
-      - SERVER=127.0.0.1:${SS_PORT}
-      - TLS=${TLS_HOST}:443
-      - PASSWORD=${TLS_PASSWORD}
+      - $APP_DIR/hysteria.yaml:/etc/hysteria.yaml
+      - $APP_DIR/cert/server.crt:/etc/hysteria/server.crt
+      - $APP_DIR/cert/server.key:/etc/hysteria/server.key
+    command: ["server", "-c", "/etc/hysteria.yaml"]
 EOF
 
     cd "$APP_DIR" || exit
-    docker compose down
     docker compose up -d
 
-    IP4=$(hostname -I | awk '{print $1}')
-
+    IP=$(hostname -I | awk '{print $1}')
     echo
-    echo "=============================="
-    echo "Shadowsocks + ShadowTLS 已部署"
-    echo "服务器IP: $IP4"
-    echo "端口: $TLS_PORT"
-    echo "加密方式: $METHOD"
-    echo "SS密码: $SS_PASSWORD"
-    echo "ShadowTLS密码: $TLS_PASSWORD"
-    echo "SNI: $TLS_HOST"
-    echo "=============================="
-
-    # 生成 ss 链接
-    BASE=$(echo -n "${METHOD}:${SS_PASSWORD}@${IP4}:${TLS_PORT}" | base64 -w 0)
-
-    PLUGIN="shadow-tls%3Bhost%3D${TLS_HOST}%3Bpassword%3D${TLS_PASSWORD}%3Bv3%3D1"
-
-    SS_LINK="ss://${BASE}?plugin=${PLUGIN}"
-
-    echo
-    echo "ShadowTLS 专用链接："
-    echo "----------------------------------"
-    echo "$SS_LINK"
-    echo "----------------------------------"
-
+    echo -e "${GREEN}✅ Hysteria 已启动${RESET}"
+    echo -e "${YELLOW}🌐 服务端监听端口: ${PORT}${RESET}"
+    echo -e "${YELLOW}🔑 密码: ${PASSWORD}${RESET}"
+    echo -e "${YELLOW}🟢 端口跳跃: ${JUMP_RANGE:-未启用} -> $PORT${RESET}"
+    echo -e "${YELLOW}📄 客户端配置模板:${RESET}"
+    echo -e "${YELLOW}hysteria2://$PASSWORD@$IP:$PORT/?sni=localhost&insecure=1#hy2${RESET}"
     read -p "按回车返回菜单..."
 }
 update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Shadowsocks 更新完成${RESET}"
+    echo -e "${GREEN}✅ Hysteria 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart shadowsocks
-    echo -e "${GREEN}✅ Shadowsocks 已重启${RESET}"
+    docker restart $CONTAINER_NAME
+    echo -e "${GREEN}✅ Hysteria 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f shadowsocks
+    docker logs -f $CONTAINER_NAME
 }
 
 check_status() {
-    docker ps | grep shadowsocks
+    docker ps | grep $CONTAINER_NAME
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
     cd "$APP_DIR" || return
-    docker compose down
+    docker stop $CONTAINER_NAME
+    docker rm $CONTAINER_NAME
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Shadowsocks 已卸载${RESET}"
+    echo -e "${RED}✅ Hysteria 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

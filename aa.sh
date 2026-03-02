@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# MailAggregator_Pro 一键管理脚本（自动克隆仓库 + 自动生成密钥）
+# MailAggregator_Pro 一键管理脚本（宿主机目录绑定数据）
 # ========================================
 
 GREEN="\033[32m"
@@ -10,6 +10,7 @@ RESET="\033[0m"
 
 APP_NAME="mail-tool"
 APP_DIR="/opt/$APP_NAME"
+DATA_DIR="$APP_DIR/data"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 CONTAINER_NAME="mail-tool"
 REPO_URL="https://github.com/gblaowang-i/MailAggregator_Pro.git"
@@ -66,20 +67,22 @@ install_app() {
     check_docker
     mkdir -p "$APP_DIR"
 
-    # 克隆或更新仓库
     if [ -d "$APP_DIR/.git" ]; then
-        echo -e "${YELLOW}检测到已有仓库，执行 git pull 更新...${RESET}"
+        echo -e "检测到已有仓库，执行 git pull 更新..."
         cd "$APP_DIR" || exit
         git reset --hard
         git pull
+    elif [ -n "$(ls -A $APP_DIR)" ]; then
+        echo -e "目录 $APP_DIR 已存在但不是 Git 仓库，正在清空..."
+        rm -rf "$APP_DIR"/*
+        git clone "$REPO_URL" "$APP_DIR"
     else
-        echo -e "${GREEN}克隆仓库到 $APP_DIR ...${RESET}"
+        echo -e "克隆仓库到 $APP_DIR ..."
         git clone "$REPO_URL" "$APP_DIR"
     fi
 
     read -p "请输入访问端口 [默认:8000]: " input_port
     PORT=${input_port:-8000}
-    check_port "$PORT" || return
 
     read -p "请输入后台用户名 [默认:admin]: " username
     ADMIN_USERNAME=${username:-admin}
@@ -87,17 +90,19 @@ install_app() {
     ADMIN_PASSWORD=${password:-123456}
     echo
 
-    JWT_SECRET=$(random_string)
-    ENCRYPTION_KEY=$(random_string)
+    # 自动生成密钥
+    JWT_SECRET=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 32)
+    ENCRYPTION_KEY=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 32)
 
+    # 写 docker-compose.yml，使用命名卷
     cat > "$COMPOSE_FILE" <<EOF
 services:
   app:
     build: .
-    container_name: ${CONTAINER_NAME}
+    container_name: mail-tool
     restart: unless-stopped
     ports:
-      - "127.0.0.1${PORT}:8000"
+      - "127.0.0.1:${PORT}:8000"
     environment:
       - DATABASE_URL=sqlite+aiosqlite:///./data/mail_agg.db
       - TZ=Asia/Shanghai
@@ -110,7 +115,7 @@ services:
       - TELEGRAM_CHAT_ID=
       - WEBHOOK_URL=
     volumes:
-      - ${APP_NAME}-data:/app/data
+      - mail-tool-data:/app/data
     logging:
       driver: json-file
       options:
@@ -118,7 +123,7 @@ services:
         max-file: "3"
 
 volumes:
-  ${APP_NAME}-data:
+  mail-tool-data:
 EOF
 
     cd "$APP_DIR" || exit
@@ -128,6 +133,7 @@ EOF
     echo -e "${GREEN}✅ MailAggregator_Pro 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
     echo -e "${YELLOW}🔑 用户名: ${ADMIN_USERNAME}  密码: ${ADMIN_PASSWORD}${RESET}"
+    echo -e "${GREEN}📂 数据卷: mail-tool-data（持久化数据库）${RESET}"
     echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
     read -p "按回车返回菜单..."
 }
@@ -136,9 +142,9 @@ update_app() {
     cd "$APP_DIR" || return
     git reset --hard
     git pull
-    docker compose pull
-    docker compose up -d --build
-    echo -e "${GREEN}✅ MailAggregator_Pro 更新完成${RESET}"
+    docker compose build
+    docker compose up -d
+    echo -e "${GREEN}✅ MailAggregator_Pro 更新完成（数据保留）${RESET}"
     read -p "按回车返回菜单..."
 }
 
@@ -161,9 +167,8 @@ check_status() {
 uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ MailAggregator_Pro 已卸载${RESET}"
+    rm -rf "$APP_DIR"           # 删除安装目录和数据
+    echo -e "${RED}✅ MailAggregator_Pro 已卸载（包含数据）${RESET}"
     read -p "按回车返回菜单..."
 }
-
 menu

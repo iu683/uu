@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Shadowsocks Rust 一键管理脚本
+# Sing-box AnyTLS 一键管理脚本（Host模式 + 自签Bing证书）
 # ========================================
 
 GREEN="\033[32m"
@@ -8,12 +8,11 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="shadowsocks-rust"
+APP_NAME="singbox-anytls"
 APP_DIR="/root/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/compose.yml"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 CONFIG_FILE="$APP_DIR/config.json"
-
-METHOD="2022-blake3-aes-256-gcm"
+CONTAINER_NAME="singbox-anytls"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -26,10 +25,19 @@ check_docker() {
     fi
 }
 
+check_port() {
+    if ss -tulnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
+
+SERVER_IP=$(hostname -I | awk '{print $1}')
+
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Shadowsocks Rust 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Sing-box AnyTLS 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -53,70 +61,98 @@ menu() {
 }
 
 install_app() {
-
     check_docker
     mkdir -p "$APP_DIR"
 
-    random_port() {
-        while :; do
-            PORT=$(shuf -i 2000-65000 -n 1)
-            ss -lnt | awk '{print $4}' | grep -q ":$PORT$" || break
-        done
-        echo "$PORT"
-    }
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
 
-    read -p "请输入监听端口 [默认随机]: " PORT
-    [[ -z "$PORT" ]] && PORT=$(random_port)
+    # 端口
+    read -p "请输入监听端口 [默认随机]: " input_port
+    if [[ -z "$input_port" ]]; then
+        PORT=$(shuf -i 20000-60000 -n1)
+    else
+        PORT=$input_port
+    fi
 
-    echo -e "${YELLOW}正在生成 2022 密钥...${RESET}"
-    PASSWORD=$(openssl rand -base64 32)
+    check_port "$PORT" || return
 
+    # 生成随机密码（AnyTLS 用 password 不是 uuid）
+    PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c16)
+
+    echo -e "${YELLOW}正在生成 Bing 伪装自签证书...${RESET}"
+
+    openssl req -x509 -nodes -newkey rsa:2048 \
+    -keyout "$APP_DIR/server.key" \
+    -out "$APP_DIR/server.crt" \
+    -days 36500 \
+    -subj "/CN=www.bing.com" \
+    -addext "subjectAltName=DNS:www.bing.com" >/dev/null 2>&1
+
+    # 生成 sing-box 配置
     cat > "$CONFIG_FILE" <<EOF
 {
-    "server": "0.0.0.0",
-    "server_port": $PORT,
-    "password": "$PASSWORD",
-    "method": "$METHOD",
-    "mode": "tcp_and_udp",
-    "fast_open": true
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
+    {
+      "type": "anytls",
+      "listen": "0.0.0.0",
+      "listen_port": ${PORT},
+      "users": [
+        {
+          "password": "${PASSWORD}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "www.bing.com",
+        "certificate_path": "/etc/sing-box/server.crt",
+        "key_path": "/etc/sing-box/server.key"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct"
+    }
+  ]
 }
 EOF
 
+    # 生成 compose
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  ss:
-    image: ghcr.io/shadowsocks/ssserver-rust:latest
-    container_name: shadowsocks
-    restart: unless-stopped
+  singbox-anytls:
+    image: ghcr.io/sagernet/sing-box:latest
+    container_name: ${CONTAINER_NAME}
+    restart: always
     network_mode: host
-    command: ssserver -c /etc/shadowsocks/config.json
     volumes:
-      - ./config.json:/etc/shadowsocks/config.json:ro
+      - ./config.json:/etc/sing-box/config.json
+      - ./server.crt:/etc/sing-box/server.crt
+      - ./server.key:/etc/sing-box/server.key
+    command: run -c /etc/sing-box/config.json
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
-   
 
-    IP4=$(hostname -I | awk '{print $1}')
-    IP6=$(ip -6 addr show scope global | grep inet6 | awk '{print $2}' | cut -d/ -f1 | head -n1)
     HOSTNAME=$(hostname -s | sed 's/ /_/g')
-    echo
-    echo "Shadowsocks Rust 配置："
-    echo " 地址：$IPV4"
-    [[ -n "$IPV6" ]] && echo " 地址：$IPV6"
-    echo " 端口：$PORT"
-    echo " 密码：$PASSWORD"
-    echo " 加密：$METHOD"
-    echo " TFO ：true"
-    echo "————————————————————————————————————————"
-    echo "链接 [IPv4]：ss://${PASSWORD}@${IP4}:${PORT}"
-    [ -n "$IP6" ] && echo "链接 [IPv6]：ss://${PASSWORD}@[${IP6}]:${PORT}"
-    echo "—————————————————————————"
-    echo "[信息] Surge 配置："
-    echo "$HOSTNAME = ss, $IP4,$PORT, encrypt-method=$METHOD, password=$PASSWORD, tfo=true, udp-relay=true, ecn=true"
-    echo
 
+    echo
+    echo -e "${GREEN}✅ Sing-box AnyTLS 已启动${RESET}"
+    echo -e "${YELLOW}🌐 公网 IP: ${SERVER_IP}${RESET}"
+    echo -e "${YELLOW}🔌 端口: ${PORT}${RESET}"
+    echo -e "${YELLOW}🔑 密码: ${PASSWORD}${RESET}"
+    echo
+    echo -e "${GREEN}📄 客户端链接:${RESET}"
+    echo -e "${YELLOW}anytls://${PASSWORD}@${SERVER_IP}:${PORT}/?sni=www.bing.com&insecure=1#$HOSTNAME${RESET}"
+    echo
     read -p "按回车返回菜单..."
 }
 
@@ -124,31 +160,31 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Shadowsocks 更新完成${RESET}"
+    echo -e "${GREEN}✅ 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart shadowsocks
-    echo -e "${GREEN}✅ Shadowsocks 已重启${RESET}"
+    docker restart ${CONTAINER_NAME}
+    echo -e "${GREEN}✅ 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f shadowsocks
+    docker logs -f ${CONTAINER_NAME}
 }
 
 check_status() {
-    docker ps | grep shadowsocks
+    docker ps | grep ${CONTAINER_NAME}
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down
+    docker stop ${CONTAINER_NAME}
+    docker rm ${CONTAINER_NAME}
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Shadowsocks 已卸载${RESET}"
+    echo -e "${RED}✅ 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

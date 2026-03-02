@@ -24,6 +24,14 @@ check_docker() {
     fi
 }
 
+check_port() {
+    if ss -lnt | awk '{print $4}' | grep -q ":$1$"; then
+        echo -e "${RED}端口 $1 已被占用${RESET}"
+        return 1
+    fi
+    return 0
+}
+
 menu() {
     while true; do
         clear
@@ -54,9 +62,15 @@ install_app() {
     check_docker
     mkdir -p "$APP_DIR"
 
-    # 监听端口
-    read -p "请输入监听端口 [默认 443]: " PORT
-    PORT=${PORT:-443}
+    # 端口
+    read -p "请输入监听端口 [默认随机]: " input_port
+    if [[ -z "$input_port" ]]; then
+        PORT=$(shuf -i 1025-65535 -n1)
+    else
+        PORT=$input_port
+    fi
+
+    check_port "$PORT" || return
 
     # 域名
     read -p "请输入真实域名（必须已解析到本机IP）: " DOMAIN
@@ -70,8 +84,8 @@ install_app() {
     WS_PATH=${WS_PATH:-/ws}
 
     # TLS SNI / 伪装域名
-    read -p "请输入 TLS SNI / 伪装域名 [默认 www.bing.com]: " SNI_HOST
-    SNI_HOST=${SNI_HOST:-www.bing.com}
+    read -p "请输入 TLS SNI / 伪装域名 [默认 $DOMAIN]: " SNI_HOST
+    SNI_HOST=${SNI_HOST:-$DOMAIN}
 
     # UUID
     UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
@@ -151,35 +165,54 @@ EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
-
-    # 生成 vmess 链接
-    VMESS_JSON=$(cat <<EOL
-{
-  "v": "2",
-  "ps": "vmess-ws-tls",
-  "add": "$DOMAIN",
-  "port": "$PORT",
-  "id": "$UUID",
-  "aid": "0",
-  "net": "ws",
-  "type": "none",
-  "host": "$SNI_HOST",
-  "path": "$WS_PATH",
-  "tls": "tls"
-}
-EOL
-)
-
-    VMESS_LINK="vmess://$(echo -n "$VMESS_JSON" | base64 -w 0)"
+    
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+    # 输出 Base64 VMess 链接（使用 jq 构造 JSON）
+    VMESS_JSON=$(jq -n \
+        --arg v "2" \
+        --arg ps "$HOSTNAME" \
+        --arg add "$DOMAIN" \
+        --arg port "$PORT" \
+        --arg id "$UUID" \
+        --arg aid "0" \
+        --arg net "ws" \
+        --arg type "none" \
+        --arg host "$SNI_HOST" \
+        --arg path "$WS_PATH" \
+        --arg tls "tls" \
+        --arg sni "$SNI_HOST" \
+        --arg alpn "h2,http/1.1" \
+        --arg fp "chrome" \
+        '{
+            v: $v,
+            ps: $ps,
+            add: $add,
+            port: $port,
+            id: $id,
+            aid: $aid,
+            net: $net,
+            type: $type,
+            host: $host,
+            path: $path,
+            tls: $tls,
+            sni: $sni,
+            alpn: $alpn,
+            fp: $fp,
+        }' | base64 -w 0)
 
     echo
-    echo -e "${GREEN}✅ 安装完成${RESET}"
-    echo -e "${YELLOW}UUID: $UUID${RESET}"
-    echo -e "${YELLOW}WS Path: $WS_PATH${RESET}"
-    echo -e "${YELLOW}SNI / 伪装域名: $SNI_HOST${RESET}"
-    echo -e "${YELLOW}${VMESS_LINK}${RESET}"
+    echo -e "${GREEN}✅ VMess-WS-TLS 节点已启动${RESET}"
+    echo -e "${YELLOW}🌐 公网域名: ${DOMAIN}${RESET}"
+    echo -e "${YELLOW}🔌 端口: ${PORT}${RESET}"
+    echo -e "${YELLOW}🆔 UUID: ${UUID}${RESET}"
+    echo -e "${YELLOW}自签证书需要客户端设置跳过证书${RESET}"
+    echo
+    echo -e "${GREEN}📄 客户端 Base64 VMess 链接:${RESET}"
+    echo -e "${YELLOW}V2rayN: vmess://${VMESS_JSON}${RESET}"
+    echo -e "${YELLOW}Surge:  $HOSTNAME = vmess, ${DOMAIN}, ${PORT}, username=${UUID}, ws=true, ws-path=$WS_PATH, ws-headers=Host:"${DOMAIN}", vmess-aead=true, tls=true, sni=${DOMAIN}${RESET}"
     read -p "按回车返回菜单..."
 }
+
 update_app() {
     cd "$APP_DIR" || return
     docker compose pull
@@ -212,4 +245,5 @@ uninstall_app() {
     read -p "按回车返回菜单..."
 }
 
+# 启动菜单
 menu

@@ -1,22 +1,23 @@
 #!/bin/bash
 # ========================================
-# TUIC v5 多节点管理脚本（完整版）
-# Host模式 + 单节点管理 + 批量操作 + 全绿菜单
+# Shadowsocks Rust 多节点管理脚本（Host Docker）
 # ========================================
 
 GREEN="\033[32m"
+YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="tuic-v5"
+APP_NAME="shadowsocks-rust"
 APP_DIR="/opt/$APP_NAME"
+METHOD="2022-blake3-aes-256-gcm"
 
 # =========================
 # Docker 检测
 # =========================
 check_docker() {
     if ! command -v docker &>/dev/null; then
-        echo -e "${GREEN}未检测到 Docker，正在安装...${RESET}"
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
         curl -fsSL https://get.docker.com | bash
     fi
     if ! docker compose version &>/dev/null; then
@@ -29,7 +30,7 @@ check_docker() {
 # 端口检测
 # =========================
 check_port() {
-    if ss -tuln | awk '{print $5}' | grep -qE "[:.]$1$"; then
+    if ss -tuln | grep -q ":$1 "; then
         echo -e "${RED}端口 $1 已被占用！${RESET}"
         return 1
     fi
@@ -57,7 +58,6 @@ select_node() {
     local nodes=()
     local count=0
 
-    # 收集节点
     for node in "$APP_DIR"/*; do
         [ -d "$node" ] || continue
         nodes+=("$(basename "$node")")
@@ -67,101 +67,86 @@ select_node() {
 
     [ $count -eq 0 ] && { echo -e "${RED}无节点！${RESET}"; return 1; }
 
-    # 输入节点编号或名称
-    read -r -p $'\033[32m请输入节点名称或编号:\033[0m ' input
-
-    if [[ "$input" =~ ^[0-9]+$ ]]; then
-        if (( input >= 1 && input <= count )); then
-            NODE_NAME="${nodes[$((input-1))]}"
+    while true; do
+        read -r -p $'\033[32m请输入节点名称或编号:\033[0m ' input
+        if [[ "$input" =~ ^[0-9]+$ ]]; then
+            if (( input >= 1 && input <= count )); then
+                NODE_NAME="${nodes[$((input-1))]}"
+                break
+            else
+                echo -e "${RED}编号无效！请重新输入${RESET}"
+            fi
         else
-            echo -e "${RED}编号无效！${RESET}"
-            return 1
+            if [ -d "$APP_DIR/$input" ]; then
+                NODE_NAME="$input"
+                break
+            else
+                echo -e "${RED}节点不存在！请重新输入${RESET}"
+            fi
         fi
-    else
-        NODE_NAME="$input"
-        if [ ! -d "$APP_DIR/$NODE_NAME" ]; then
-            echo -e "${RED}节点不存在！${RESET}"
-            return 1
-        fi
-    fi
+    done
 
     NODE_DIR="$APP_DIR/$NODE_NAME"
 }
+
 # =========================
 # 安装节点
 # =========================
 install_node() {
     check_docker
+    mkdir -p "$APP_DIR"
+
     read -p "请输入节点名称 [node$(date +%s)]: " NODE_NAME
     NODE_NAME=${NODE_NAME:-node$(date +%s)}
     NODE_DIR="$APP_DIR/$NODE_NAME"
     mkdir -p "$NODE_DIR"
 
+    # 随机端口
     read -p "请输入监听端口 [默认随机]: " input_port
-    PORT=${input_port:-$(shuf -i 1025-65535 -n1)}
+    PORT=${input_port:-$(shuf -i 2000-65000 -n1)}
     check_port "$PORT" || return
 
-    UUID=$(cat /proc/sys/kernel/random/uuid)
-    PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c8)
+    PASSWORD=$(openssl rand -base64 32)
+    CONFIG_FILE="$NODE_DIR/config.json"
+    COMPOSE_FILE="$NODE_DIR/docker-compose.yml"
 
-    openssl req -x509 -nodes -newkey rsa:2048 \
-        -keyout "$NODE_DIR/server.key" \
-        -out "$NODE_DIR/server.crt" \
-        -days 36500 \
-        -subj "/CN=www.bing.com" \
-        -addext "subjectAltName=DNS:www.bing.com" >/dev/null 2>&1
-
-    cat > "$NODE_DIR/config.json" <<EOF
+    # 生成配置
+    cat > "$CONFIG_FILE" <<EOF
 {
-  "log": { "level": "info" },
-  "inbounds": [
-    {
-      "type": "tuic",
-      "listen": "0.0.0.0",
-      "listen_port": ${PORT},
-      "users": [
-        {
-          "uuid": "${UUID}",
-          "password": "${PASSWORD}"
-        }
-      ],
-      "congestion_control": "bbr",
-      "tls": {
-        "enabled": true,
-        "alpn": ["h3"],
-        "server_name": "www.bing.com",
-        "certificate_path": "/etc/tuic/server.crt",
-        "key_path": "/etc/tuic/server.key"
-      }
-    }
-  ],
-  "outbounds": [
-    { "type": "direct" }
-  ]
+    "server": "0.0.0.0",
+    "server_port": $PORT,
+    "password": "$PASSWORD",
+    "method": "$METHOD",
+    "mode": "tcp_and_udp",
+    "fast_open": true
 }
 EOF
 
-    cat > "$NODE_DIR/docker-compose.yml" <<EOF
+    # 生成 docker-compose
+    cat > "$COMPOSE_FILE" <<EOF
 services:
-  ${NODE_NAME}:
-    image: ghcr.io/sagernet/sing-box:latest
-    container_name: ${NODE_NAME}
-    restart: always
+  ss:
+    image: ghcr.io/shadowsocks/ssserver-rust:latest
+    container_name: $NODE_NAME
+    restart: unless-stopped
     network_mode: host
+    command: ssserver -c /etc/shadowsocks/config.json
     volumes:
-      - ./config.json:/etc/tuic/config.json
-      - ./server.crt:/etc/tuic/server.crt
-      - ./server.key:/etc/tuic/server.key
-    command: run -c /etc/tuic/config.json
+      - ./config.json:/etc/shadowsocks/config.json:ro
 EOF
 
-    cd "$NODE_DIR" || return
+    cd "$NODE_DIR" || exit
     docker compose up -d
 
-    SERVER_IP=$( hostname -I | awk '{print $1}')
+    IP4=$(hostname -I | awk '{print $1}')
+    IP6=$(ip -6 addr show scope global | grep inet6 | awk '{print $2}' | cut -d/ -f1 | head -n1)
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
 
-    echo -e "${GREEN}节点已启动${RESET}"
-    echo -e "${GREEN}tuic://${UUID}:${PASSWORD}@${SERVER_IP}:${PORT}?congestion_control=bbr&alpn=h3&sni=www.bing.com&udp_relay_mode=native&allow_insecure=1#$NODE_NAME${RESET}"
+    echo -e "${GREEN}✅ 节点 $NODE_NAME 已启动${RESET}"
+    echo -e "${YELLOW}IPv4: $IP4 端口: $PORT 密码: $PASSWORD${RESET}"
+    [[ -n "$IP6" ]] && echo -e "${YELLOW}IPv6: $IP6 端口: $PORT${RESET}"
+    echo -e "${YELLOW}V2rayN: ss://${METHOD}:${PASSWORD}@${IP4}:${PORT}${RESET}"
+    echo -e "${YELLOW}Surge: $HOSTNAME = ss, $IP4,$PORT, encrypt-method=$METHOD, password=$PASSWORD, tfo=true, udp-relay=true, ecn=true${RESET}"
     read -p "按回车返回菜单..."
 }
 
@@ -180,15 +165,14 @@ node_action_menu() {
         echo -e "${GREEN}5) 卸载${RESET}"
         echo -e "${GREEN}0) 返回${RESET}"
 
-        # ✅ 输入存到 choice
         read -r -p $'\033[32m请选择操作:\033[0m ' choice
 
         case $choice in
             1) docker pause "$NODE_NAME" ;;
             2) docker restart "$NODE_NAME" ;;
-            3) docker compose -f "$NODE_DIR/docker-compose.yml" pull && docker compose -f "$NODE_DIR/docker-compose.yml" up -d ;;
+            3) cd "$NODE_DIR" && docker compose pull && docker compose up -d ;;
             4) docker logs -f "$NODE_NAME" ;;
-            5) docker compose -f "$NODE_DIR/docker-compose.yml" down && rm -rf "$NODE_DIR"; return ;;
+            5) cd "$NODE_DIR" && docker compose down && rm -rf "$NODE_DIR"; return ;;
             0) return ;;
             *) echo -e "${RED}无效选择${RESET}" ;;
         esac
@@ -200,21 +184,15 @@ node_action_menu() {
 # =========================
 batch_action() {
     echo -e "${GREEN}=== 批量操作 ===${RESET}"
-    echo -e "${GREEN}1) 批量暂停${RESET}"
+    echo -e "${GREEN}1) 批量停止${RESET}"
     echo -e "${GREEN}2) 批量重启${RESET}"
     echo -e "${GREEN}3) 批量更新${RESET}"
     echo -e "${GREEN}4) 批量卸载${RESET}"
     echo -e "${GREEN}0) 返回${RESET}"
 
-    # ✅ 先读 choice
     read -r -p $'\033[32m请选择操作:\033[0m ' choice
+    [[ "$choice" == "0" ]] && return
 
-    # 立即处理 0 返回
-    if [[ "$choice" == "0" ]]; then
-        return
-    fi
-
-    # 构建节点数组
     declare -A NODE_MAP
     local count=0
     for node in "$APP_DIR"/*; do
@@ -223,12 +201,9 @@ batch_action() {
         NODE_MAP[$count]=$(basename "$node")
         echo -e "${GREEN}[$count] ${NODE_MAP[$count]}${RESET}"
     done
-
-    [ $count -eq 0 ] && { echo -e "${GREEN}无节点${RESET}"; read -r -p $'\033[32m按回车返回菜单...\033[0m'; return; }
+    [ $count -eq 0 ] && { echo -e "${YELLOW}无节点${RESET}"; read -p "按回车返回菜单..."; return; }
 
     read -r -p $'\033[32m输入序号(空格)或 all:\033[0m ' input
-
-    # 处理输入
     if [[ "$input" == "all" ]]; then
         SELECTED=("${NODE_MAP[@]}")
     else
@@ -238,42 +213,35 @@ batch_action() {
         done
     fi
 
-    # 批量执行操作
     for NODE_NAME in "${SELECTED[@]}"; do
         NODE_DIR="$APP_DIR/$NODE_NAME"
         cd "$NODE_DIR" || continue
-
         case $choice in
-            1) docker pause "$NODE_NAME" ;;
+            1) docker stop "$NODE_NAME" ;;
             2) docker restart "$NODE_NAME" ;;
             3) docker compose pull && docker compose up -d ;;
             4) docker compose down && rm -rf "$NODE_DIR" ;;
         esac
-
         echo -e "${GREEN}已操作 $NODE_NAME${RESET}"
     done
 
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
+    read -p "按回车返回菜单..."
 }
+
 # =========================
-# 状态查看
+# 查看所有节点状态
 # =========================
 show_all_status() {
     echo -e "${GREEN}=== 所有节点状态 ===${RESET}"
     for node in "$APP_DIR"/*; do
         [ -d "$node" ] || continue
         NODE_NAME=$(basename "$node")
-        
-        # 从 docker-compose.yml 读取端口
-        PORT=$(grep 'listen_port' "$node/config.json" | awk -F: '{gsub(/[ ,"]/,"",$2); print $2}')
-        
-        # 获取 Docker 状态
+        PORT=$(grep '"server_port"' "$node/config.json" | awk -F: '{gsub(/[ ,"]/,"",$2); print $2}')
         STATUS=$(docker inspect -f '{{.State.Status}}' "$NODE_NAME" 2>/dev/null)
         [ -z "$STATUS" ] && STATUS="未启动"
-
         echo -e "${GREEN}$NODE_NAME | ${PORT:-未知端口} | $STATUS${RESET}"
     done
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
+    read -p "按回车返回菜单..."
 }
 
 # =========================
@@ -282,7 +250,7 @@ show_all_status() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== TUIC v5 多节点管理 ===${RESET}"
+        echo -e "${GREEN}=== Shadowsocks Rust 多节点管理 ===${RESET}"
         echo -e "${GREEN}1) 安装新节点${RESET}"
         echo -e "${GREEN}2) 单节点管理${RESET}"
         echo -e "${GREEN}3) 查看所有节点状态${RESET}"

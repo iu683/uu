@@ -8,6 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
+CONTAINER_NAME="xray-server"
 APP_NAME="xray-vmess-ws-tls"
 APP_DIR="/root/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/compose.yml"
@@ -59,10 +60,14 @@ menu() {
 }
 
 install_app() {
+
     check_docker
     mkdir -p "$APP_DIR"
 
-    # 端口
+    CONFIG_FILE="$APP_DIR/config.json"
+    COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+
+    # ===== 端口 =====
     read -p "请输入监听端口 [默认随机]: " input_port
     if [[ -z "$input_port" ]]; then
         PORT=$(shuf -i 1025-65535 -n1)
@@ -72,44 +77,66 @@ install_app() {
 
     check_port "$PORT" || return
 
-    # 域名
+    # ===== 域名 =====
     read -p "请输入真实域名（必须已解析到本机IP）: " DOMAIN
-    if [[ -z "$DOMAIN" ]]; then
-        echo -e "${RED}域名不能为空${RESET}"
-        return
-    fi
+    [[ -z "$DOMAIN" ]] && echo "域名不能为空" && return
 
-    # WebSocket Path
+    # ===== WS Path =====
     read -p "请输入 WebSocket Path [默认 /ws]: " WS_PATH
     WS_PATH=${WS_PATH:-/ws}
 
-    # TLS SNI / 伪装域名
+    # ===== SNI =====
     read -p "请输入 TLS SNI / 伪装域名 [默认 $DOMAIN]: " SNI_HOST
     SNI_HOST=${SNI_HOST:-$DOMAIN}
 
-    # UUID
+    # ===== UUID =====
     UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
 
-    # TLS 证书
+    # ===== TLS 证书 =====
     read -p "请输入 TLS 证书目录（留空自动生成自签证书）: " CERT_DIR
+
     if [[ -z "$CERT_DIR" ]]; then
         CERT_DIR="$APP_DIR/cert"
         mkdir -p "$CERT_DIR"
-        echo -e "${YELLOW}正在生成自签 TLS 证书...${RESET}"
+        echo "正在生成自签 TLS 证书..."
+
         openssl req -x509 -nodes -newkey rsa:2048 \
             -keyout "$CERT_DIR/private.key" \
             -out "$CERT_DIR/cert.crt" \
             -subj "/CN=$DOMAIN" -days 3650
+
         chmod 644 "$CERT_DIR/private.key" "$CERT_DIR/cert.crt"
+
+        CERT_FILE="cert.crt"
+        KEY_FILE="private.key"
+        SELF_SIGNED="yes"
+
     else
-        if [[ ! -f "$CERT_DIR/cert.crt" || ! -f "$CERT_DIR/private.key" ]]; then
-            echo -e "${RED}目录下未找到 cert.crt 或 private.key${RESET}"
+
+        if [[ -f "$CERT_DIR/fullchain.pem" && -f "$CERT_DIR/privkey.pem" ]]; then
+            echo "检测到 Let's Encrypt 证书"
+            CERT_FILE="fullchain.pem"
+            KEY_FILE="privkey.pem"
+            SELF_SIGNED="no"
+
+        elif [[ -f "$CERT_DIR/cert.crt" && -f "$CERT_DIR/private.key" ]]; then
+            echo "检测到 cert.crt 证书"
+            CERT_FILE="cert.crt"
+            KEY_FILE="private.key"
+            SELF_SIGNED="no"
+
+        else
+            echo "未找到有效证书文件"
+            echo "需要以下任意一组："
+            echo "  - fullchain.pem + privkey.pem"
+            echo "  - cert.crt + private.key"
             return
         fi
-        chmod 644 "$CERT_DIR/private.key" "$CERT_DIR/cert.crt"
+
+        chmod 644 "$CERT_DIR/$KEY_FILE" "$CERT_DIR/$CERT_FILE"
     fi
 
-    # 生成 config.json
+    # ===== 生成 Xray 配置 =====
     cat > "$CONFIG_FILE" <<EOF
 {
   "log": { "loglevel": "warning" },
@@ -129,8 +156,8 @@ install_app() {
           "serverName": "$SNI_HOST",
           "certificates": [
             {
-              "certificateFile": "/etc/xray/cert/cert.crt",
-              "keyFile": "/etc/xray/cert/private.key"
+              "certificateFile": "/etc/xray/cert/${CERT_FILE}",
+              "keyFile": "/etc/xray/cert/${KEY_FILE}"
             }
           ],
           "alpn": ["h2","http/1.1"],
@@ -148,12 +175,12 @@ install_app() {
 }
 EOF
 
-    # 生成 docker-compose.yml
+    # ===== 生成 docker-compose.yml =====
     cat > "$COMPOSE_FILE" <<EOF
 services:
   xray:
     image: ghcr.io/xtls/xray-core:latest
-    container_name: vmessxray
+    container_name: xray-server
     restart: unless-stopped
     command: ["run","-c","/etc/xray/config.json"]
     volumes:
@@ -165,9 +192,10 @@ EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
-    
+
     HOSTNAME=$(hostname -s | sed 's/ /_/g')
-    # 输出 Base64 VMess 链接（使用 jq 构造 JSON）
+
+    # ===== 生成 VMess 链接 =====
     VMESS_JSON=$(jq -n \
         --arg v "2" \
         --arg ps "$HOSTNAME" \
@@ -181,7 +209,6 @@ EOF
         --arg path "$WS_PATH" \
         --arg tls "tls" \
         --arg sni "$SNI_HOST" \
-        --arg alpn "h2,http/1.1" \
         --arg fp "chrome" \
         '{
             v: $v,
@@ -196,20 +223,27 @@ EOF
             path: $path,
             tls: $tls,
             sni: $sni,
-            alpn: $alpn,
-            fp: $fp,
+            alpn: ["h2","http/1.1"],
+            fp: $fp
         }' | base64 -w 0)
 
     echo
-    echo -e "${GREEN}✅ VMess-WS-TLS 节点已启动${RESET}"
-    echo -e "${YELLOW}🌐 公网域名: ${DOMAIN}${RESET}"
-    echo -e "${YELLOW}🔌 端口: ${PORT}${RESET}"
-    echo -e "${YELLOW}🆔 UUID: ${UUID}${RESET}"
-    echo -e "${YELLOW}自签证书需要客户端设置跳过证书${RESET}"
+    echo "✅ VMess-WS-TLS 节点已启动"
+    echo "🌐 域名: $DOMAIN"
+    echo "🔌 端口: $PORT"
+    echo "🆔 UUID: $UUID"
+
+    if [[ "$SELF_SIGNED" == "yes" ]]; then
+        echo "⚠ 当前使用自签证书，客户端需要开启“跳过证书验证”"
+    else
+        echo "🔒 使用正规证书，无需跳过证书验证"
+    fi
+
     echo
-    echo -e "${GREEN}📄 客户端 Base64 VMess 链接:${RESET}"
-    echo -e "${YELLOW}V2rayN: vmess://${VMESS_JSON}${RESET}"
+    echo "📄 VMess 链接:"
+    echo "vmess://${VMESS_JSON}"
     echo -e "${YELLOW}Surge:  $HOSTNAME = vmess, ${DOMAIN}, ${PORT}, username=${UUID}, ws=true, ws-path=$WS_PATH, ws-headers=Host:"${DOMAIN}", vmess-aead=true, tls=true, sni=${DOMAIN}${RESET}"
+    echo
     read -p "按回车返回菜单..."
 }
 
@@ -222,18 +256,18 @@ update_app() {
 }
 
 restart_app() {
-    docker restart vmessxray
-    echo -e "${GREEN}✅ 已重启${RESET}"
+    docker restart ${CONTAINER_NAME}
+    echo -e "${GREEN}✅ ${CONTAINER_NAME} 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f xray
+    docker logs -f ${CONTAINER_NAME}
 }
 
 check_status() {
-    docker ps | grep vmessxray
+    docker ps | grep ${CONTAINER_NAME}
     read -p "按回车返回菜单..."
 }
 

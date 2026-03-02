@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Shadowsocks Rust 多节点管理脚本（Host Docker）
+# WUD 一键管理脚本（自动生成密码 Hash）
 # ========================================
 
 GREEN="\033[32m"
@@ -8,13 +8,11 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="shadowsocks-rust"
+APP_NAME="wud"
 APP_DIR="/opt/$APP_NAME"
-METHOD="2022-blake3-aes-256-gcm"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONTAINER_NAME="wud"
 
-# =========================
-# Docker 检测
-# =========================
 check_docker() {
     if ! command -v docker &>/dev/null; then
         echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
@@ -26,248 +24,134 @@ check_docker() {
     fi
 }
 
-# =========================
-# 端口检测
-# =========================
+install_htpasswd() {
+    if ! command -v htpasswd &>/dev/null; then
+        echo -e "${YELLOW}未检测到 htpasswd 命令，正在安装...${RESET}"
+        if [ -f /etc/debian_version ]; then
+            sudo apt update
+            sudo apt install apache2-utils -y
+        elif [ -f /etc/redhat-release ]; then
+            sudo yum install httpd-tools -y
+        else
+            echo -e "${RED}无法自动安装 htpasswd，请手动安装 apache2-utils/httpd-tools${RESET}"
+            exit 1
+        fi
+    fi
+}
+
 check_port() {
-    if ss -tuln | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用！${RESET}"
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
         return 1
     fi
 }
 
-# =========================
-# 列出节点
-# =========================
-list_nodes() {
-    mkdir -p "$APP_DIR"
-    local count=0
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        echo -e "${GREEN}[$count] $(basename "$node")${RESET}"
-    done
-    [ $count -eq 0 ] && echo -e "${GREEN}无节点${RESET}"
-}
-
-# =========================
-# 选择节点
-# =========================
-select_node() {
-    mkdir -p "$APP_DIR"
-    local nodes=()
-    local count=0
-
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        nodes+=("$(basename "$node")")
-        count=$((count+1))
-        echo -e "${GREEN}[$count] ${nodes[-1]}${RESET}"
-    done
-
-    [ $count -eq 0 ] && { echo -e "${RED}无节点！${RESET}"; return 1; }
-
-    while true; do
-        read -r -p $'\033[32m请输入节点名称或编号:\033[0m ' input
-        if [[ "$input" =~ ^[0-9]+$ ]]; then
-            if (( input >= 1 && input <= count )); then
-                NODE_NAME="${nodes[$((input-1))]}"
-                break
-            else
-                echo -e "${RED}编号无效！请重新输入${RESET}"
-            fi
-        else
-            if [ -d "$APP_DIR/$input" ]; then
-                NODE_NAME="$input"
-                break
-            else
-                echo -e "${RED}节点不存在！请重新输入${RESET}"
-            fi
-        fi
-    done
-
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-}
-
-# =========================
-# 安装节点
-# =========================
-install_node() {
-    check_docker
-    mkdir -p "$APP_DIR"
-
-    read -p "请输入节点名称 [node$(date +%s)]: " NODE_NAME
-    NODE_NAME=${NODE_NAME:-node$(date +%s)}
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-    mkdir -p "$NODE_DIR"
-
-    # 随机端口
-    read -p "请输入监听端口 [默认随机]: " input_port
-    PORT=${input_port:-$(shuf -i 2000-65000 -n1)}
-    check_port "$PORT" || return
-
-    PASSWORD=$(openssl rand -base64 32)
-    CONFIG_FILE="$NODE_DIR/config.json"
-    COMPOSE_FILE="$NODE_DIR/docker-compose.yml"
-
-    # 生成配置
-    cat > "$CONFIG_FILE" <<EOF
-{
-    "server": "0.0.0.0",
-    "server_port": $PORT,
-    "password": "$PASSWORD",
-    "method": "$METHOD",
-    "mode": "tcp_and_udp",
-    "fast_open": true
-}
-EOF
-
-    # 生成 docker-compose
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  ss:
-    image: ghcr.io/shadowsocks/ssserver-rust:latest
-    container_name: $NODE_NAME
-    restart: unless-stopped
-    network_mode: host
-    command: ssserver -c /etc/shadowsocks/config.json
-    volumes:
-      - ./config.json:/etc/shadowsocks/config.json:ro
-EOF
-
-    cd "$NODE_DIR" || exit
-    docker compose up -d
-
-    IP4=$(hostname -I | awk '{print $1}')
-    IP6=$(ip -6 addr show scope global | grep inet6 | awk '{print $2}' | cut -d/ -f1 | head -n1)
-    HOSTNAME=$(hostname -s | sed 's/ /_/g')
-
-    echo -e "${GREEN}✅ 节点 $NODE_NAME 已启动${RESET}"
-    echo -e "${YELLOW}IPv4: $IP4 端口: $PORT 密码: $PASSWORD${RESET}"
-    [[ -n "$IP6" ]] && echo -e "${YELLOW}IPv6: $IP6 端口: $PORT${RESET}"
-    echo -e "${YELLOW}V2rayN: ss://${METHOD}:${PASSWORD}@${IP4}:${PORT}${RESET}"
-    echo -e "${YELLOW}Surge: $HOSTNAME = ss, $IP4,$PORT, encrypt-method=$METHOD, password=$PASSWORD, tfo=true, udp-relay=true, ecn=true${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-# =========================
-# 单节点管理菜单
-# =========================
-node_action_menu() {
-    select_node || return
-
-    while true; do
-        echo -e "${GREEN}=== 节点 [$NODE_NAME] 管理 ===${RESET}"
-        echo -e "${GREEN}1) 暂停${RESET}"
-        echo -e "${GREEN}2) 重启${RESET}"
-        echo -e "${GREEN}3) 更新${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 卸载${RESET}"
-        echo -e "${GREEN}0) 返回${RESET}"
-
-        read -r -p $'\033[32m请选择操作:\033[0m ' choice
-
-        case $choice in
-            1) docker pause "$NODE_NAME" ;;
-            2) docker restart "$NODE_NAME" ;;
-            3) cd "$NODE_DIR" && docker compose pull && docker compose up -d ;;
-            4) docker logs -f "$NODE_NAME" ;;
-            5) cd "$NODE_DIR" && docker compose down && rm -rf "$NODE_DIR"; return ;;
-            0) return ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-    done
-}
-
-# =========================
-# 批量操作
-# =========================
-batch_action() {
-    echo -e "${GREEN}=== 批量操作 ===${RESET}"
-    echo -e "${GREEN}1) 批量停止${RESET}"
-    echo -e "${GREEN}2) 批量重启${RESET}"
-    echo -e "${GREEN}3) 批量更新${RESET}"
-    echo -e "${GREEN}4) 批量卸载${RESET}"
-    echo -e "${GREEN}0) 返回${RESET}"
-
-    read -r -p $'\033[32m请选择操作:\033[0m ' choice
-    [[ "$choice" == "0" ]] && return
-
-    declare -A NODE_MAP
-    local count=0
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        NODE_MAP[$count]=$(basename "$node")
-        echo -e "${GREEN}[$count] ${NODE_MAP[$count]}${RESET}"
-    done
-    [ $count -eq 0 ] && { echo -e "${YELLOW}无节点${RESET}"; read -p "按回车返回菜单..."; return; }
-
-    read -r -p $'\033[32m输入序号(空格)或 all:\033[0m ' input
-    if [[ "$input" == "all" ]]; then
-        SELECTED=("${NODE_MAP[@]}")
-    else
-        SELECTED=()
-        for i in $input; do
-            [ -n "${NODE_MAP[$i]}" ] && SELECTED+=("${NODE_MAP[$i]}")
-        done
-    fi
-
-    for NODE_NAME in "${SELECTED[@]}"; do
-        NODE_DIR="$APP_DIR/$NODE_NAME"
-        cd "$NODE_DIR" || continue
-        case $choice in
-            1) docker stop "$NODE_NAME" ;;
-            2) docker restart "$NODE_NAME" ;;
-            3) docker compose pull && docker compose up -d ;;
-            4) docker compose down && rm -rf "$NODE_DIR" ;;
-        esac
-        echo -e "${GREEN}已操作 $NODE_NAME${RESET}"
-    done
-
-    read -p "按回车返回菜单..."
-}
-
-# =========================
-# 查看所有节点状态
-# =========================
-show_all_status() {
-    echo -e "${GREEN}=== 所有节点状态 ===${RESET}"
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        NODE_NAME=$(basename "$node")
-        PORT=$(grep '"server_port"' "$node/config.json" | awk -F: '{gsub(/[ ,"]/,"",$2); print $2}')
-        STATUS=$(docker inspect -f '{{.State.Status}}' "$NODE_NAME" 2>/dev/null)
-        [ -z "$STATUS" ] && STATUS="未启动"
-        echo -e "${GREEN}$NODE_NAME | ${PORT:-未知端口} | $STATUS${RESET}"
-    done
-    read -p "按回车返回菜单..."
-}
-
-# =========================
-# 主菜单
-# =========================
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Shadowsocks Rust 多节点管理 ===${RESET}"
-        echo -e "${GREEN}1) 安装新节点${RESET}"
-        echo -e "${GREEN}2) 单节点管理${RESET}"
-        echo -e "${GREEN}3) 查看所有节点状态${RESET}"
-        echo -e "${GREEN}4) 批量操作${RESET}"
+        echo -e "${GREEN}=== WUD 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
-
-        read -r -p $'\033[32m请选择:\033[0m ' choice
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
         case $choice in
-            1) install_node ;;
-            2) node_action_menu ;;
-            3) show_all_status ;;
-            4) batch_action ;;
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
         esac
     done
+}
+
+install_app() {
+    check_docker
+    install_htpasswd
+    mkdir -p "$APP_DIR/data"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
+
+    read -p "请输入访问端口 [默认:3001]: " input_port
+    PORT=${input_port:-3001}
+    check_port "$PORT" || return
+
+    read -p "请输入 WUD 管理员用户名 [默认:admin]: " username
+    USERNAME=${username:-admin}
+    read -s -p "请输入 WUD 密码 [默认:123456]: " password
+    PASSWORD=${password:-123456}
+    echo
+
+    # 生成 htpasswd hash 并替换 $ 为 $$
+    HASH=$(htpasswd -nbB "$USERNAME" "$PASSWORD" | cut -d: -f2 | sed 's/\$/\$\$/g')
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  whatsupdocker:
+    image: getwud/wud
+    container_name: ${CONTAINER_NAME}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "127.0.0.1:${PORT}:3000"
+    environment:
+      - WUD_AUTH_BASIC_ADMIN_USER=${USERNAME}
+      - WUD_AUTH_BASIC_ADMIN_HASH=${HASH}
+    restart: always
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    echo
+    echo -e "${GREEN}✅ WUD 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${YELLOW}🔑 用户名: ${USERNAME}  密码: ${PASSWORD}${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ WUD 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+    docker restart ${CONTAINER_NAME}
+    echo -e "${GREEN}✅ WUD 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
+    docker logs -f ${CONTAINER_NAME}
+}
+
+check_status() {
+    docker ps | grep ${CONTAINER_NAME}
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ WUD 已卸载${RESET}"
+    read -p "按回车返回菜单..."
 }
 
 menu

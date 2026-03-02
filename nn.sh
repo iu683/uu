@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Hysteria 一键管理脚本（Host Docker + 必应自签证书 + 端口跳跃 + 伪装网址）
+# Hysteria 一键管理脚本（Host Docker + 自签证书 tls: + 端口跳跃 + 必应伪装）
 # ========================================
 
 GREEN="\033[32m"
@@ -14,11 +14,11 @@ COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 CONFIG_FILE="$APP_DIR/hysteria.yaml"
 CONTAINER_NAME="hysteria"
 
-# 全局记录端口跳跃范围
+# 端口跳跃变量
 JUMP_START=""
 JUMP_END=""
 PORT=""
-MASQ_URL="https://bing.com"  # 默认伪装网址
+MASQ_URL="https://bing.com"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -52,6 +52,7 @@ generate_cert() {
     fi
 }
 
+# 添加端口跳跃规则（循环生成每个端口）
 add_port_jump_rules() {
     if [[ -n "$JUMP_START" ]] && [[ -n "$JUMP_END" ]]; then
         echo -e "${YELLOW}添加端口跳跃规则: $JUMP_START-$JUMP_END -> $PORT${RESET}"
@@ -62,6 +63,7 @@ add_port_jump_rules() {
     fi
 }
 
+# 删除端口跳跃规则（循环删除每个端口）
 remove_port_jump_rules() {
     if [[ -n "$JUMP_START" ]] && [[ -n "$JUMP_END" ]]; then
         echo -e "${YELLOW}清理端口跳跃规则: $JUMP_START-$JUMP_END -> $PORT${RESET}"
@@ -124,11 +126,12 @@ install_app() {
     generate_cert
     add_port_jump_rules
 
-    # 生成 hysteria.yaml
+    # 生成 hysteria.yaml (Hysteria 2 tls: 版本)
     cat > "$CONFIG_FILE" <<EOF
 listen: :$PORT
+
 tls:
-  crt: /etc/hysteria/server.crt
+  cert: /etc/hysteria/server.crt
   key: /etc/hysteria/server.key
 
 auth:
@@ -172,7 +175,9 @@ EOF
     fi
     echo -e "${YELLOW}🟢 伪装网址: $MASQ_URL${RESET}"
     echo -e "${YELLOW}📄 客户端配置模板:${RESET}"
-    echo -e "${YELLOW}hysteria2://$PASSWORD@$IP:$PORT/?sni=bing.com&insecure=1#hy2${RESET}"
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+    echo -e "${YELLOW}V2rayN: hysteria2://$PASSWORD@$IP:$PORT/?sni=bing.com&insecure=1#$HOSTNAME${RESET}"
+    echo -e "${YELLOW}Surge:  $HOSTNAME = hysteria2, $IP, $PORT, password=$PASSWORD, skip-cert-verify=true, sni=www.bing.com${RESET}"
     read -p "按回车返回菜单..."
 }
 

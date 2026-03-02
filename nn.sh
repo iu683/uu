@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# VMess-WS-TLS 一键管理脚本（Docker Host 模式，兼容 sing-box 最新版本）
+# MTG 一键管理脚本（Host 模式）
 # ========================================
 
 GREEN="\033[32m"
@@ -8,13 +8,10 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="vmess-ws-tls"
+APP_NAME="mtg"
 APP_DIR="/root/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.json"
-CONTAINER_NAME="vmess-ws-tls"
-
-SERVER_IP=$(hostname -I | awk '{print $1}')
+CONTAINER_NAME="mtg"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -28,197 +25,24 @@ check_docker() {
 }
 
 check_port() {
-    if ss -tulnp | grep -q ":$1 "; then
+    if ss -tlnp | grep -q ":$1 "; then
         echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
         return 1
     fi
 }
 
-install_app() {
-    check_docker
-    mkdir -p "$APP_DIR"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-
-    # 端口
-    read -p "请输入监听端口 [默认随机]: " input_port
-    if [[ -z "$input_port" ]]; then
-        PORT=$(shuf -i 1025-65535 -n1)
-    else
-        PORT=$input_port
-    fi
-
-    check_port "$PORT" || return
-
-    # UUID
-    UUID=$(cat /proc/sys/kernel/random/uuid)
-
-    # WS Path
-    read -p "请输入 WebSocket Path [默认 /ws]: " WS_PATH
-    WS_PATH=${WS_PATH:-/ws}
-
-    # SNI / TLS Server Name
-    read -p "请输入 TLS SNI / 伪装域名 [例如 www.bing.com]: " SNI_HOST
-    SNI_HOST=${SNI_HOST:-www.bing.com}
-
-    # TLS 证书路径
-    read -p "请输入 TLS 证书路径 (示例 /root/certs/server.crt): " CERT_PATH
-    read -p "请输入 TLS 私钥路径 (示例 /root/certs/server.key): " KEY_PATH
-
-    if [[ ! -f "$CERT_PATH" || ! -f "$KEY_PATH" ]]; then
-        echo -e "${RED}证书文件或私钥文件不存在，请检查路径！${RESET}"
-        return
-    fi
-
-    # 生成 sing-box VMess-WS-TLS 配置（最新版字段）
-    cat > "$CONFIG_FILE" <<EOF
-{
-  "log": { "level": "info" },
-  "inbounds": [
-    {
-      "port": ${PORT},
-      "protocol": "vmess",
-      "settings": {
-        "clients": [
-          {
-            "id": "${UUID}",
-            "alterId": 0
-          }
-        ]
-      },
-      "streamSettings": {
-        "network": "ws",
-        "security": "tls",
-        "tlsSettings": {
-          "serverName": "${SNI_HOST}",
-          "certificates": [
-            {
-              "certificateFile": "${CERT_PATH}",
-              "keyFile": "${KEY_PATH}"
-            }
-          ]
-        },
-        "wsSettings": {
-          "path": "${WS_PATH}",
-          "headers": {
-            "Host": "${SNI_HOST}"
-          }
-        }
-      }
-    }
-  ],
-  "outbounds": [
-    { "protocol": "freedom", "settings": {} }
-  ]
-}
-EOF
-
-    # 生成 Docker Compose
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  vmess-ws-tls:
-    image: ghcr.io/sagernet/sing-box:latest
-    container_name: ${CONTAINER_NAME}
-    restart: always
-    network_mode: host
-    volumes:
-      - ./config.json:/etc/vmess/config.json
-      - ${CERT_PATH}:/etc/vmess/server.crt
-      - ${KEY_PATH}:/etc/vmess/server.key
-    command: run -c /etc/vmess/config.json
-EOF
-
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    HOSTNAME=$(hostname -s | sed 's/ /_/g')
-
-    # 输出 Base64 VMess 链接
-    VMESS_JSON=$(jq -n \
-        --arg v "2" \
-        --arg ps "$HOSTNAME" \
-        --arg add "$SERVER_IP" \
-        --arg port "$PORT" \
-        --arg id "$UUID" \
-        --arg aid "0" \
-        --arg net "ws" \
-        --arg type "none" \
-        --arg host "$SNI_HOST" \
-        --arg path "$WS_PATH" \
-        --arg tls "tls" \
-        --arg sni "$SNI_HOST" \
-        --arg alpn "h2,http/1.1" \
-        --arg fp "chrome" \
-        --arg insecure "1" \
-        '{
-            v: $v,
-            ps: $ps,
-            add: $add,
-            port: $port,
-            id: $id,
-            aid: $aid,
-            net: $net,
-            type: $type,
-            host: $host,
-            path: $path,
-            tls: $tls,
-            sni: $sni,
-            alpn: $alpn,
-            fp: $fp,
-            insecure: $insecure
-        }' | base64 -w 0)
-
-    echo
-    echo -e "${GREEN}✅ VMess-WS-TLS 节点已启动${RESET}"
-    echo -e "${YELLOW}🌐 公网 IP: ${SERVER_IP}${RESET}"
-    echo -e "${YELLOW}🔌 端口: ${PORT}${RESET}"
-    echo -e "${YELLOW}🆔 UUID: ${UUID}${RESET}"
-    echo
-    echo -e "${GREEN}📄 客户端 Base64 VMess 链接:${RESET}"
-    echo -e "${YELLOW}vmess://${VMESS_JSON}${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ 更新完成${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-restart_app() {
-    docker restart ${CONTAINER_NAME}
-    echo -e "${GREEN}✅ 已重启${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f ${CONTAINER_NAME}
-}
-
-check_status() {
-    docker ps | grep ${CONTAINER_NAME}
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-    docker stop ${CONTAINER_NAME}
-    docker rm ${CONTAINER_NAME}
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已卸载${RESET}"
-    read -p "按回车返回菜单..."
+random_port() {
+    while :; do
+        PORT=$(shuf -i 10000-65535 -n1)
+        ss -tln | grep -q ":$PORT " || break
+    done
+    echo "$PORT"
 }
 
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== VMess-WS-TLS 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== MTG 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -239,6 +63,95 @@ menu() {
             *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
         esac
     done
+}
+
+install_app() {
+    check_docker
+    mkdir -p "$APP_DIR"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
+
+    read -p "请输入监听端口 [默认随机]: " input_port
+    if [[ -z "$input_port" ]]; then
+        PORT=$(random_port)
+    else
+        PORT=$input_port
+    fi
+
+    check_port "$PORT" || return
+
+    read -p "请输入伪装域名 [默认 bing.com]: " input_domain
+    DOMAIN=${input_domain:-bing.com}
+
+    SECRET=$(docker run --rm nineseconds/mtg:master generate-secret --hex $DOMAIN)
+
+    cat > "$APP_DIR/config.toml" <<EOF
+secret = "$SECRET"
+bind-to = "0.0.0.0:${PORT}"
+EOF
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  mtg:
+    image: nineseconds/mtg:master
+    container_name: ${CONTAINER_NAME}
+    restart: always
+    network_mode: host
+    volumes:
+      - $APP_DIR/config.toml:/config.toml
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    SERVER_IP=$(hostname -I | awk '{print $1}')
+
+    echo
+    echo -e "${GREEN}✅ MTG 已启动${RESET}"
+    echo -e "${YELLOW}🌐 端口: ${PORT}${RESET}"
+    echo -e "${YELLOW}🔐 Secret: ${SECRET}${RESET}"
+    echo
+    echo -e "${GREEN}📎 Telegram 代理链接:${RESET}"
+    echo -e "${YELLOW}tg://proxy?server=${SERVER_IP}&port=${PORT}&secret=${SECRET}${RESET}"
+    echo
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ MTG 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+    docker restart ${CONTAINER_NAME}
+    echo -e "${GREEN}✅ MTG 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
+    docker logs -f ${CONTAINER_NAME}
+}
+
+check_status() {
+    docker ps | grep ${CONTAINER_NAME}
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker stop ${CONTAINER_NAME}
+    docker rm ${CONTAINER_NAME}
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ MTG 已卸载${RESET}"
+    read -p "按回车返回菜单..."
 }
 
 menu

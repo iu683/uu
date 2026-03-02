@@ -65,23 +65,37 @@ install_app() {
         echo "$PORT"
     }
 
-    read -p "请输入监听端口 [默认随机]: " PORT
-    [[ -z "$PORT" ]] && PORT=$(random_port)
+    echo
+    read -p "ShadowTLS 对外端口 [默认 443]: " TLS_PORT
+    TLS_PORT=${TLS_PORT:-443}
 
-    echo -e "${YELLOW}正在生成 2022 密钥...${RESET}"
-    PASSWORD=$(openssl rand -base64 32)
+    read -p "请输入伪装域名 SNI [默认 captive.apple.com]: " TLS_HOST
+    TLS_HOST=${TLS_HOST:-captive.apple.com}
 
+    # Shadowsocks 固定只监听本地
+    SS_PORT=8388
+
+    echo -e "${YELLOW}生成 Shadowsocks 密钥...${RESET}"
+    SS_PASSWORD=$(openssl rand -base64 32)
+
+    echo -e "${YELLOW}生成 ShadowTLS 密码...${RESET}"
+    TLS_PASSWORD=$(openssl rand -base64 16)
+
+    METHOD="2022-blake3-aes-256-gcm"
+
+    # ================= SS 配置 =================
     cat > "$CONFIG_FILE" <<EOF
 {
-    "server": "0.0.0.0",
-    "server_port": $PORT,
-    "password": "$PASSWORD",
+    "server": "127.0.0.1",
+    "server_port": $SS_PORT,
+    "password": "$SS_PASSWORD",
     "method": "$METHOD",
     "mode": "tcp_and_udp",
     "fast_open": true
 }
 EOF
 
+    # ================= Docker Compose =================
     cat > "$COMPOSE_FILE" <<EOF
 services:
   ss:
@@ -92,34 +106,53 @@ services:
     command: ssserver -c /etc/shadowsocks/config.json
     volumes:
       - ./config.json:/etc/shadowsocks/config.json:ro
+
+  shadow-tls:
+    image: ghcr.io/ihciah/shadow-tls:latest
+    container_name: shadow-tls
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - MODE=server
+      - V3=1
+      - LISTEN=0.0.0.0:${TLS_PORT}
+      - SERVER=127.0.0.1:${SS_PORT}
+      - TLS=${TLS_HOST}:443
+      - PASSWORD=${TLS_PASSWORD}
 EOF
 
     cd "$APP_DIR" || exit
+    docker compose down
     docker compose up -d
-   
 
     IP4=$(hostname -I | awk '{print $1}')
-    IP6=$(ip -6 addr show scope global | grep inet6 | awk '{print $2}' | cut -d/ -f1 | head -n1)
-    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+
     echo
-    echo "Shadowsocks Rust 配置："
-    echo " 地址：$IPV4"
-    [[ -n "$IPV6" ]] && echo " 地址：$IPV6"
-    echo " 端口：$PORT"
-    echo " 密码：$PASSWORD"
-    echo " 加密：$METHOD"
-    echo " TFO ：true"
-    echo "————————————————————————————————————————"
-    echo "链接 [IPv4]：ss:/${PASSWORD}@$IP4:$PORT"
-    [ -n "$IP6" ] && echo "链接 [IPv6]：ss://${PASSWORD}@$IP6:$PORT"
-    echo "—————————————————————————"
-    echo "[信息] Surge 配置："
-    echo "$HOSTNAME = ss, $IPV4,$PORT, encrypt-method=$METHOD, password=$PASSWORD, tfo=true, udp-relay=true, ecn=true"
+    echo "=============================="
+    echo "Shadowsocks + ShadowTLS 已部署"
+    echo "服务器IP: $IP4"
+    echo "端口: $TLS_PORT"
+    echo "加密方式: $METHOD"
+    echo "SS密码: $SS_PASSWORD"
+    echo "ShadowTLS密码: $TLS_PASSWORD"
+    echo "SNI: $TLS_HOST"
+    echo "=============================="
+
+    # 生成 ss 链接
+    BASE=$(echo -n "${METHOD}:${SS_PASSWORD}@${IP4}:${TLS_PORT}" | base64 -w 0)
+
+    PLUGIN="shadow-tls%3Bhost%3D${TLS_HOST}%3Bpassword%3D${TLS_PASSWORD}%3Bv3%3D1"
+
+    SS_LINK="ss://${BASE}?plugin=${PLUGIN}"
+
     echo
+    echo "ShadowTLS 专用链接："
+    echo "----------------------------------"
+    echo "$SS_LINK"
+    echo "----------------------------------"
 
     read -p "按回车返回菜单..."
 }
-
 update_app() {
     cd "$APP_DIR" || return
     docker compose pull

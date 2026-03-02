@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# WUD 一键管理脚本（支持密码 Hash）
+# MailAggregator_Pro 一键管理脚本（宿主机目录绑定数据）
 # ========================================
 
 GREEN="\033[32m"
@@ -8,10 +8,16 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="wud"
+APP_NAME="mail-tool"
 APP_DIR="/opt/$APP_NAME"
+DATA_DIR="$APP_DIR/data"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONTAINER_NAME="wud"
+CONTAINER_NAME="mail-tool"
+REPO_URL="https://github.com/gblaowang-i/MailAggregator_Pro.git"
+
+random_string() {
+    tr -dc A-Za-z0-9 </dev/urandom | head -c 32
+}
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -34,13 +40,13 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== WUD 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== MailAggregator_Pro 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}6) 卸载（保留数据）${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
@@ -59,72 +65,91 @@ menu() {
 
 install_app() {
     check_docker
-    mkdir -p "$APP_DIR/data"
+    mkdir -p "$DATA_DIR"
 
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
+    mkdir -p "$APP_DIR"
+
+    if [ -d "$APP_DIR/.git" ]; then
+        echo -e "检测到已有仓库，执行 git pull 更新..."
+        cd "$APP_DIR" || exit
+        git reset --hard
+        git pull
+    elif [ -n "$(ls -A $APP_DIR)" ]; then
+        echo -e "⚠️ 目录 $APP_DIR 已存在但不是 Git 仓库，正在清空..."
+        rm -rf "$APP_DIR"/*
+    git clone "$REPO_URL" "$APP_DIR"
+    else
+        echo -e "克隆仓库到 $APP_DIR ..."
+        git clone "$REPO_URL" "$APP_DIR"
     fi
 
-    read -p "请输入访问端口 [默认:3001]: " input_port
-    PORT=${input_port:-3001}
+    read -p "请输入访问端口 [默认:8000]: " input_port
+    PORT=${input_port:-8000}
     check_port "$PORT" || return
 
-    # -------------------
-    # 用户名 & 密码 Hash
-    # -------------------
-    read -p "请输入 WUD 管理员用户名 [默认:admin]: " username
-    USERNAME=${username:-admin}
-    read -s -p "请输入 WUD 密码 [默认:123456]: " password
-    PASSWORD=${password:-123456}
+    read -p "请输入后台用户名 [默认:admin]: " username
+    ADMIN_USERNAME=${username:-admin}
+    read -s -p "请输入后台密码 [默认:123456]: " password
+    ADMIN_PASSWORD=${password:-123456}
     echo
 
-    # 使用 htpasswd 生成 hash (需安装 apache2-utils 或用在线生成)
-    if ! command -v htpasswd &>/dev/null; then
-        echo -e "${YELLOW}未检测到 htpasswd 命令，请自行生成 hash 或安装 apache2-utils${RESET}"
-        read -p "请输入已生成好的密码 hash (不含用户名，$ 替换为 $$): " HASH
-    else
-        HASH=$(htpasswd -nbB "$USERNAME" "$PASSWORD" | cut -d: -f2 | sed 's/\$/\$\$/g')
-    fi
+    JWT_SECRET=$(random_string)
+    ENCRYPTION_KEY=$(random_string)
 
+    # 写 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  whatsupdocker:
-    image: getwud/wud
+  app:
+    build: .
     container_name: ${CONTAINER_NAME}
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT}:3000"
+      - "127.0.0.1:${PORT}:8000"
     environment:
-      - WUD_AUTH_BASIC_ADMIN_USER=${USERNAME}
-      - WUD_AUTH_BASIC_ADMIN_HASH=${HASH}
-    restart: always
+      - DATABASE_URL=sqlite+aiosqlite:///./data/mail_agg.db
+      - TZ=Asia/Shanghai
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - ADMIN_USERNAME=${ADMIN_USERNAME}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - JWT_SECRET=${JWT_SECRET}
+      - API_TOKEN=
+      - TELEGRAM_BOT_TOKEN=
+      - TELEGRAM_CHAT_ID=
+      - WEBHOOK_URL=
+    volumes:
+      - ${DATA_DIR}:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 EOF
 
     cd "$APP_DIR" || exit
-    docker compose up -d
+    docker compose up -d --build
 
     echo
-    echo -e "${GREEN}✅ WUD 已启动${RESET}"
+    echo -e "${GREEN}✅ MailAggregator_Pro 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🔑 用户名: ${USERNAME}  密码: ${PASSWORD}${RESET}"
+    echo -e "${YELLOW}🔑 用户名: ${ADMIN_USERNAME}  密码: ${ADMIN_PASSWORD}${RESET}"
+    echo -e "${GREEN}📂 数据目录（持久化）: $DATA_DIR${RESET}"
     echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
     read -p "按回车返回菜单..."
 }
 
 update_app() {
     cd "$APP_DIR" || return
-    docker compose pull
+    git reset --hard
+    git pull
+    docker compose build
     docker compose up -d
-    echo -e "${GREEN}✅ WUD 更新完成${RESET}"
+    echo -e "${GREEN}✅ MailAggregator_Pro 更新完成（数据保留）${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
     docker restart ${CONTAINER_NAME}
-    echo -e "${GREEN}✅ WUD 已重启${RESET}"
+    echo -e "${GREEN}✅ MailAggregator_Pro 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
@@ -141,9 +166,8 @@ check_status() {
 uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ WUD 已卸载${RESET}"
+    rm -rf "$APP_DIR"           # 删除安装目录和数据
+    echo -e "${RED}✅ MailAggregator_Pro 已卸载（包含数据）${RESET}"
     read -p "按回车返回菜单..."
 }
-
 menu

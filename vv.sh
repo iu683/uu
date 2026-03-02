@@ -57,6 +57,7 @@ select_node() {
     local nodes=()
     local count=0
 
+    # 收集节点
     for node in "$APP_DIR"/*; do
         [ -d "$node" ] || continue
         nodes+=("$(basename "$node")")
@@ -64,24 +65,28 @@ select_node() {
         echo -e "${GREEN}[$count] ${nodes[-1]}${RESET}"
     done
 
-    [ $count -eq 0 ] && return 1
+    [ $count -eq 0 ] && { echo -e "${RED}无节点！${RESET}"; return 1; }
 
-    read -p "$(echo -e ${GREEN}请输入节点名称或编号:${RESET}) " input
+    # 输入节点编号或名称
+    read -r -p $'\033[32m请输入节点名称或编号:\033[0m ' input
 
     if [[ "$input" =~ ^[0-9]+$ ]]; then
-        NODE_NAME="${nodes[$((input-1))]}"
+        if (( input >= 1 && input <= count )); then
+            NODE_NAME="${nodes[$((input-1))]}"
+        else
+            echo -e "${RED}编号无效！${RESET}"
+            return 1
+        fi
     else
         NODE_NAME="$input"
+        if [ ! -d "$APP_DIR/$NODE_NAME" ]; then
+            echo -e "${RED}节点不存在！${RESET}"
+            return 1
+        fi
     fi
 
     NODE_DIR="$APP_DIR/$NODE_NAME"
-
-    if [ -z "$NODE_NAME" ] || [ ! -d "$NODE_DIR" ]; then
-        echo -e "${RED}节点不存在！${RESET}"
-        return 1
-    fi
 }
-
 # =========================
 # 安装节点
 # =========================
@@ -153,10 +158,10 @@ EOF
     cd "$NODE_DIR" || return
     docker compose up -d
 
-    SERVER_IP=$(curl -s ifconfig.me || hostname -I | awk '{print $1}')
+    SERVER_IP=$( hostname -I | awk '{print $1}')
 
     echo -e "${GREEN}节点已启动${RESET}"
-    echo -e "${GREEN}tuic://${UUID}:${PASSWORD}@${SERVER_IP}:${PORT}?congestion_control=bbr&alpn=h3&sni=www.bing.com&udp_relay_mode=native&allow_insecure=1${RESET}"
+    echo -e "${GREEN}tuic://${UUID}:${PASSWORD}@${SERVER_IP}:${PORT}?congestion_control=bbr&alpn=h3&sni=www.bing.com&udp_relay_mode=native&allow_insecure=1#$NODE_NAME${RESET}"
     read -p "按回车返回菜单..."
 }
 
@@ -175,7 +180,8 @@ node_action_menu() {
         echo -e "${GREEN}5) 卸载${RESET}"
         echo -e "${GREEN}0) 返回${RESET}"
 
-        read -r -p $'\033[32m请输入节点名称或编号:\033[0m ' input
+        # ✅ 输入存到 choice
+        read -r -p $'\033[32m请选择操作:\033[0m ' choice
 
         case $choice in
             1) docker pause "$NODE_NAME" ;;
@@ -194,17 +200,23 @@ node_action_menu() {
 # =========================
 batch_action() {
     echo -e "${GREEN}=== 批量操作 ===${RESET}"
-    echo -e "${GREEN}1) 暂停${RESET}"
-    echo -e "${GREEN}2) 重启${RESET}"
-    echo -e "${GREEN}3) 更新${RESET}"
-    echo -e "${GREEN}4) 卸载${RESET}"
+    echo -e "${GREEN}1) 批量暂停${RESET}"
+    echo -e "${GREEN}2) 批量重启${RESET}"
+    echo -e "${GREEN}3) 批量更新${RESET}"
+    echo -e "${GREEN}4) 批量卸载${RESET}"
     echo -e "${GREEN}0) 返回${RESET}"
 
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+    # ✅ 先读 choice
+    read -r -p $'\033[32m请选择操作:\033[0m ' choice
 
+    # 立即处理 0 返回
+    if [[ "$choice" == "0" ]]; then
+        return
+    fi
+
+    # 构建节点数组
     declare -A NODE_MAP
-    count=0
-
+    local count=0
     for node in "$APP_DIR"/*; do
         [ -d "$node" ] || continue
         count=$((count+1))
@@ -212,10 +224,11 @@ batch_action() {
         echo -e "${GREEN}[$count] ${NODE_MAP[$count]}${RESET}"
     done
 
-    [ $count -eq 0 ] && return
+    [ $count -eq 0 ] && { echo -e "${GREEN}无节点${RESET}"; read -r -p $'\033[32m按回车返回菜单...\033[0m'; return; }
 
     read -r -p $'\033[32m输入序号(空格)或 all:\033[0m ' input
 
+    # 处理输入
     if [[ "$input" == "all" ]]; then
         SELECTED=("${NODE_MAP[@]}")
     else
@@ -225,6 +238,7 @@ batch_action() {
         done
     fi
 
+    # 批量执行操作
     for NODE_NAME in "${SELECTED[@]}"; do
         NODE_DIR="$APP_DIR/$NODE_NAME"
         cd "$NODE_DIR" || continue
@@ -234,15 +248,13 @@ batch_action() {
             2) docker restart "$NODE_NAME" ;;
             3) docker compose pull && docker compose up -d ;;
             4) docker compose down && rm -rf "$NODE_DIR" ;;
-            0) return ;;
         esac
 
         echo -e "${GREEN}已操作 $NODE_NAME${RESET}"
     done
 
-    read -p "按回车返回菜单..."
+    read -r -p $'\033[32m按回车返回菜单...\033[0m'
 }
-
 # =========================
 # 状态查看
 # =========================
@@ -251,11 +263,17 @@ show_all_status() {
     for node in "$APP_DIR"/*; do
         [ -d "$node" ] || continue
         NODE_NAME=$(basename "$node")
+        
+        # 从 docker-compose.yml 读取端口
+        PORT=$(grep 'listen_port' "$node/config.json" | awk -F: '{gsub(/[ ,"]/,"",$2); print $2}')
+        
+        # 获取 Docker 状态
         STATUS=$(docker inspect -f '{{.State.Status}}' "$NODE_NAME" 2>/dev/null)
-        [ -z "$STATUS" ] && STATUS="未创建"
-        echo -e "${GREEN}$NODE_NAME | $STATUS${RESET}"
+        [ -z "$STATUS" ] && STATUS="未启动"
+
+        echo -e "${GREEN}$NODE_NAME | ${PORT:-未知端口} | $STATUS${RESET}"
     done
-    read -p "按回车返回菜单..."
+    read -r -p $'\033[32m按回车返回菜单...\033[0m'
 }
 
 # =========================

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Shadowsocks Rust 一键管理脚本
+# Snell + ShadowTLS  一键管理脚本（Host 模式 + 去掉 DNS）
 # ========================================
 
 GREEN="\033[32m"
@@ -8,12 +8,10 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="shadowsocks-rust"
+APP_NAME="Snell + ShadowTLS "
 APP_DIR="/root/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/compose.yml"
-CONFIG_FILE="$APP_DIR/config.json"
-
-METHOD="2022-blake3-aes-256-gcm"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONTAINER_NAME="snell-server"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -26,10 +24,17 @@ check_docker() {
     fi
 }
 
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
+
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Shadowsocks Rust 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Snell + ShadowTLS  管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -53,59 +58,55 @@ menu() {
 }
 
 install_app() {
-
     check_docker
-    mkdir -p "$APP_DIR"
+    mkdir -p "$APP_DIR/data"
 
-    random_port() {
-        while :; do
-            PORT=$(shuf -i 2000-65000 -n 1)
-            ss -lnt | awk '{print $4}' | grep -q ":$PORT$" || break
-        done
-        echo "$PORT"
-    }
-
-    echo
-    read -p "ShadowTLS 对外端口 [默认 443]: " TLS_PORT
-    TLS_PORT=${TLS_PORT:-443}
-
-    read -p "请输入伪装域名 SNI (例如 cloudflare.com): " TLS_HOST
-    if [[ -z "$TLS_HOST" ]]; then
-        echo "必须填写 SNI 域名"
-        exit 1
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
     fi
 
-    SS_PORT=8388
+    # ===== Snell 内部端口（仅本地监听）=====
+    read -p "请输入 Snell 内部端口 [20000-40000, 默认随机]: " input_port
 
-    echo -e "${YELLOW}生成 Shadowsocks 密钥...${RESET}"
-    SS_PASSWORD=$(openssl rand -base64 32)
+    if [[ -z "$input_port" ]]; then
+        PORT=$(shuf -i 20000-40000 -n1)
+    else
+        PORT=$input_port
+    fi
 
-    echo -e "${YELLOW}生成 ShadowTLS 密码...${RESET}"
-    TLS_PASSWORD=$(openssl rand -base64 16)
+    check_port "$PORT" || return
 
-    # SS 配置（只监听本地）
-    cat > "$CONFIG_FILE" <<EOF
-{
-    "server": "127.0.0.1",
-    "server_port": $SS_PORT,
-    "password": "$SS_PASSWORD",
-    "method": "$METHOD",
-    "mode": "tcp_and_udp",
-    "fast_open": true
-}
-EOF
+    # ===== ShadowTLS 对外端口 =====
+    read -p "请输入 ShadowTLS 对外端口 [默认 443]: " tls_input
+    TLS_PORT=${tls_input:-443}
+    check_port "$TLS_PORT" || return
 
-    # Docker Compose（SS + ShadowTLS）
+    # ===== 随机生成密钥 =====
+    PSK=$(tr -dc A-Za-z0-9 </dev/urandom | head -c32)
+    TLS_PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c16)
+
+    # ===== 伪装域名 =====
+    read -p "请输入 TLS 伪装域名 [默认 captive.apple.com]: " tls_host
+    TLS_HOST=${tls_host:-captive.apple.com}
+
+    # ===== 生成 docker-compose =====
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  ss:
-    image: ghcr.io/shadowsocks/ssserver-rust:latest
-    container_name: shadowsocks
-    restart: unless-stopped
+
+  snell:
+    image: 1byte/snell-server:latest
+    container_name: snell
+    restart: always
     network_mode: host
-    command: ssserver -c /etc/shadowsocks/config.json
-    volumes:
-      - ./config.json:/etc/shadowsocks/config.json:ro
+    environment:
+      PORT: "${PORT}"
+      PSK: "${PSK}"
+      IPv6: "false"
+      OBFS: "off"
+      TFO: "true"
+      ECN: "true"
 
   shadow-tls:
     image: ghcr.io/ihciah/shadow-tls:latest
@@ -113,64 +114,65 @@ services:
     restart: unless-stopped
     network_mode: host
     environment:
-      - MODE=server
-      - LISTEN=0.0.0.0:$TLS_PORT
-      - SERVER=$TLS_HOST:443
-      - PASSWORD=$TLS_PASSWORD
+      MODE: server
+      V3: 1
+      LISTEN: 0.0.0.0:${TLS_PORT}
+      SERVER: 127.0.0.1:${PORT}
+      TLS: ${TLS_HOST}:443
+      PASSWORD: ${TLS_PASSWORD}
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    IP4=$(hostname -I | awk '{print $1}')
+    # ===== 获取公网IP =====
+    IP=$(hostname -I | awk '{print $1}')
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
 
     echo
-    echo "=============================="
-    echo "Shadowsocks + ShadowTLS 已部署"
-    echo "服务器IP: $IP4"
-    echo "端口: $TLS_PORT"
-    echo "加密方式: $METHOD"
-    echo "SS密码: $SS_PASSWORD"
-    echo "ShadowTLS密码: $TLS_PASSWORD"
-    echo "SNI: $TLS_HOST"
-    echo "=============================="
-    # 生成基础 ss 链接
-    BASE=$(echo -n "${METHOD}:${SS_PASSWORD}@${IP4}:${TLS_PORT}" | base64 -w 0)
+    echo -e "${GREEN}✅ Snell + ShadowTLS 已启动${RESET}"
+    echo -e "${YELLOW}🌐 公网IP: ${IP}${RESET}"
+    echo -e "${YELLOW}🌐 TLS端口: ${TLS_PORT}${RESET}"
+    echo -e "${YELLOW}🔑 Snell PSK: ${PSK}${RESET}"
+    echo -e "${YELLOW}🔑 ShadowTLS 密码: ${TLS_PASSWORD}${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
 
-    # plugin 参数（URL编码）
-    PLUGIN="shadow-tls%3Bhost%3D${TLS_HOST}%3Bpassword%3D${TLS_PASSWORD}"
-
-    SS_LINK="ss://${BASE}?plugin=${PLUGIN}"
-
-    echo
-    echo "ShadowTLS 专用链接："
-    echo "----------------------------------"
-    echo "$SS_LINK"
-    echo "----------------------------------"
+    echo -e "${GREEN}====== 客户端配置示例 ======${RESET}"
+    echo -e "${YELLOW}ShadowTLS:${RESET}"
+    echo -e " 地址: ${IP}"
+    echo -e " 端口: ${TLS_PORT}"
+    echo -e " 密码: ${TLS_PASSWORD}"
+    echo -e " SNI: ${TLS_HOST}"
+    echo -e "${YELLOW}Snell:${RESET}"
+    echo -e " $HOSTNAME = snell, ${IP}, ${TLS_PORT}, psk = ${PSK}, version = 5, reuse = true, tfo = true, shadow-tls-password = ${TLS_PASSWORD}, shadow-tls-sni = ${TLS_HOST}, shadow-tls-version = 3"
 
     read -p "按回车返回菜单..."
 }
+
 update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Shadowsocks 更新完成${RESET}"
+    echo -e "${GREEN}✅ Snell + ShadowTLS 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart shadowsocks
-    echo -e "${GREEN}✅ Shadowsocks 已重启${RESET}"
+    cd "$APP_DIR" || return
+    docker compose restart
+    echo -e "${GREEN}✅ Snell + ShadowTLS 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
+    cd "$APP_DIR" || return
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f shadowsocks
+    docker compose logs -f
 }
 
 check_status() {
-    docker ps | grep shadowsocks
+    cd "$APP_DIR" || return
+    docker compose ps
     read -p "按回车返回菜单..."
 }
 
@@ -178,7 +180,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Shadowsocks 已卸载${RESET}"
+    echo -e "${RED}✅ Snell + ShadowTLS  已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

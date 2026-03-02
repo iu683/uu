@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Snell + ShadowTLS 多节点管理（Host Docker）
+# MailAggregator_Pro 一键管理脚本（自动克隆仓库 + 自动生成密钥）
 # ========================================
 
 GREEN="\033[32m"
@@ -8,8 +8,15 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="Snell+ShadowTLS"
+APP_NAME="mail-tool"
 APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONTAINER_NAME="mail-tool"
+REPO_URL="https://github.com/gblaowang-i/MailAggregator_Pro.git"
+
+random_string() {
+    tr -dc A-Za-z0-9 </dev/urandom | head -c 32
+}
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -24,251 +31,139 @@ check_docker() {
 
 check_port() {
     if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用！${RESET}"
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
         return 1
     fi
 }
 
-# =========================
-# 列出节点
-# =========================
-list_nodes() {
-    mkdir -p "$APP_DIR"
-    local count=0
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        echo -e "${GREEN}[$count] $(basename "$node")${RESET}"
-    done
-    [ $count -eq 0 ] && echo -e "${GREEN}无节点${RESET}"
-}
-
-# =========================
-# 选择节点
-# =========================
-select_node() {
-    mkdir -p "$APP_DIR"
-    local nodes=()
-    local count=0
-
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        nodes+=("$(basename "$node")")
-        count=$((count+1))
-        echo -e "${GREEN}[$count] ${nodes[-1]}${RESET}"
-    done
-
-    [ $count -eq 0 ] && { echo -e "${RED}无节点！${RESET}"; return 1; }
-
-    while true; do
-        read -r -p $'\033[32m请输入节点名称或编号:\033[0m ' input
-        if [[ "$input" =~ ^[0-9]+$ ]]; then
-            if (( input >= 1 && input <= count )); then
-                NODE_NAME="${nodes[$((input-1))]}"
-                break
-            else
-                echo -e "${RED}编号无效！请重新输入${RESET}"
-            fi
-        else
-            if [ -d "$APP_DIR/$input" ]; then
-                NODE_NAME="$input"
-                break
-            else
-                echo -e "${RED}节点不存在！请重新输入${RESET}"
-            fi
-        fi
-    done
-
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-}
-
-# =========================
-# 安装新节点
-# =========================
-install_node() {
-    check_docker
-    mkdir -p "$APP_DIR"
-
-    read -p "请输入节点名称 [node$(date +%s)]: " NODE_NAME
-    NODE_NAME=${NODE_NAME:-node$(date +%s)}
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-    mkdir -p "$NODE_DIR"
-
-    # Snell 内部端口
-    read -p "Snell 内部端口 [20000-40000, 默认随机]: " SNELL_PORT
-    SNELL_PORT=${SNELL_PORT:-$(shuf -i20000-40000 -n1)}
-    check_port "$SNELL_PORT" || return
-
-    # ShadowTLS 外部端口
-    read -p "ShadowTLS 对外端口 [默认 443]: " TLS_PORT
-    TLS_PORT=${TLS_PORT:-443}
-    check_port "$TLS_PORT" || return
-
-    PSK=$(tr -dc A-Za-z0-9 </dev/urandom | head -c32)
-    TLS_PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c16)
-
-    read -p "TLS 伪装域名 [默认 captive.apple.com]: " TLS_HOST
-    TLS_HOST=${TLS_HOST:-captive.apple.com}
-
-    COMPOSE_FILE="$NODE_DIR/docker-compose.yml"
-
-    # 生成 docker-compose.yml
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-
-  snell:
-    image: 1byte/snell-server:latest
-    container_name: ${NODE_NAME}-snell
-    restart: always
-    network_mode: host
-    environment:
-      PORT: "${SNELL_PORT}"
-      PSK: "${PSK}"
-      IPv6: "false"
-      OBFS: "off"
-      TFO: "true"
-      ECN: "true"
-
-  shadow-tls:
-    image: ghcr.io/ihciah/shadow-tls:latest
-    container_name: ${NODE_NAME}-tls
-    restart: unless-stopped
-    network_mode: host
-    environment:
-      MODE: server
-      V3: 1
-      LISTEN: 0.0.0.0:${TLS_PORT}
-      SERVER: 127.0.0.1:${SNELL_PORT}
-      TLS: ${TLS_HOST}:443
-      PASSWORD: ${TLS_PASSWORD}
-EOF
-
-    cd "$NODE_DIR" || exit
-    docker compose up -d
-
-    IP=$(hostname -I | awk '{print $1}')
-    HOSTNAME=$(hostname -s | sed 's/ /_/g')
-    echo -e "${GREEN}✅ 节点 $NODE_NAME 已部署${RESET}"
-    echo "公网IP: $IP"
-    echo "Snell内部端口: $SNELL_PORT"
-    echo "ShadowTLS外部端口: $TLS_PORT"
-    echo "Snell PSK: $PSK"
-    echo "ShadowTLS密码: $TLS_PASSWORD"
-    echo "SNI: $TLS_HOST"
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
-    echo -e "${YELLOW}Snell:${RESET}"
-    echo -e "${YELLOW}$HOSTNAME = snell, ${IP}, ${TLS_PORT}, psk = ${PSK}, version = 5, reuse = true, tfo = true, shadow-tls-password = ${TLS_PASSWORD}, shadow-tls-sni = ${TLS_HOST}, shadow-tls-version = 3${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-# =========================
-# 单节点管理
-# =========================
-node_action_menu() {
-    select_node || return
-    while true; do
-        echo -e "${GREEN}=== 节点 [$NODE_NAME] 管理 ===${RESET}"
-        echo -e "${GREEN}1) 暂停${RESET}"
-        echo -e "${GREEN}2) 重启${RESET}"
-        echo -e "${GREEN}3) 更新${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 卸载${RESET}"
-        echo -e "${GREEN}0) 返回${RESET}"
-        read -r -p $'\033[32m请选择操作:\033[0m ' choice
-        case $choice in
-            1) docker pause "$NODE_NAME-snell" "$NODE_NAME-tls"  ;;
-            2) docker restart "$NODE_NAME-snell" "$NODE_NAME-tls" ;;
-            3) cd "$NODE_DIR" && docker compose pull && docker compose up -d ;;
-            4) docker logs -f "$NODE_NAME-snell" ;;
-            4) cd "$NODE_DIR" && docker compose down && rm -rf "$NODE_DIR"; return ;;
-            0) return ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-    done
-}
-
-# =========================
-# 批量操作
-# =========================
-batch_action() {
-    echo -e "${GREEN}=== 批量操作 ===${RESET}"
-    echo -e "${GREEN}1) 批量暂停${RESET}"
-    echo -e "${GREEN}2) 批量重启${RESET}"
-    echo -e "${GREEN}3) 批量更新${RESET}"
-    echo -e "${GREEN}4) 批量卸载${RESET}"
-    echo -e "${GREEN}0) 返回${RESET}"
-    read -r -p $'\033[32m请选择操作:\033[0m ' choice
-    [[ "$choice" == "0" ]] && return
-    declare -A NODE_MAP
-    local count=0
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        NODE_MAP[$count]=$(basename "$node")
-        echo -e "${GREEN}[$count] ${NODE_MAP[$count]}${RESET}"
-    done
-    [ $count -eq 0 ] && { echo -e "${YELLOW}无节点${RESET}"; read -p "按回车返回菜单..."; return; }
-    read -r -p $'\033[32m输入序号(空格)或 all:\033[0m ' input
-    if [[ "$input" == "all" ]]; then
-        SELECTED=("${NODE_MAP[@]}")
-    else
-        SELECTED=()
-        for i in $input; do
-            [ -n "${NODE_MAP[$i]}" ] && SELECTED+=("${NODE_MAP[$i]}")
-        done
-    fi
-    for NODE_NAME in "${SELECTED[@]}"; do
-        NODE_DIR="$APP_DIR/$NODE_NAME"
-        cd "$NODE_DIR" || continue
-        case $choice in
-            1) docker stop "$NODE_NAME-snell" "$NODE_NAME-tls" ;;
-            2) docker restart "$NODE_NAME-snell" "$NODE_NAME-tls" ;;
-            3) docker compose pull && docker compose up -d ;;
-            4) docker compose down && rm -rf "$NODE_DIR" ;;
-        esac
-        echo -e "${GREEN}已操作 $NODE_NAME${RESET}"
-    done
-    read -p "按回车返回菜单..."
-}
-
-# =========================
-# 查看所有节点状态
-# =========================
-show_all_status() {
-    echo -e "${GREEN}=== 所有节点状态 ===${RESET}"
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        NODE_NAME=$(basename "$node")
-        TLS_PORT=$(grep 'LISTEN=' "$node/docker-compose.yml" | cut -d: -f2 | tr -d '"')
-        STATUS=$(docker inspect -f '{{.State.Status}}' "$NODE_NAME-snell" 2>/dev/null)
-        [ -z "$STATUS" ] && STATUS="未启动"
-        echo -e "${GREEN}$NODE_NAME | ${TLS_PORT:-未知端口} | $STATUS${RESET}"
-    done
-    read -p "按回车返回菜单..."
-}
-
-# =========================
-# 主菜单
-# =========================
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Snell + ShadowTLS 多节点管理 ===${RESET}"
-        echo -e "${GREEN}1) 安装新节点${RESET}"
-        echo -e "${GREEN}2) 单节点管理${RESET}"
-        echo -e "${GREEN}3) 查看所有节点状态${RESET}"
-        echo -e "${GREEN}4) 批量操作${RESET}"
+        echo -e "${GREEN}=== MailAggregator_Pro 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
-        read -r -p $'\033[32m请选择:\033[0m ' choice
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
         case $choice in
-            1) install_node ;;
-            2) node_action_menu ;;
-            3) show_all_status ;;
-            4) batch_action ;;
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
         esac
     done
+}
+
+install_app() {
+    check_docker
+    mkdir -p "$APP_DIR"
+
+    # 克隆或更新仓库
+    if [ -d "$APP_DIR/.git" ]; then
+        echo -e "${YELLOW}检测到已有仓库，执行 git pull 更新...${RESET}"
+        cd "$APP_DIR" || exit
+        git reset --hard
+        git pull
+    else
+        echo -e "${GREEN}克隆仓库到 $APP_DIR ...${RESET}"
+        git clone "$REPO_URL" "$APP_DIR"
+    fi
+
+    read -p "请输入访问端口 [默认:8000]: " input_port
+    PORT=${input_port:-8000}
+    check_port "$PORT" || return
+
+    read -p "请输入后台用户名 [默认:admin]: " username
+    ADMIN_USERNAME=${username:-admin}
+    read -s -p "请输入后台密码 [默认:123456]: " password
+    ADMIN_PASSWORD=${password:-123456}
+    echo
+
+    JWT_SECRET=$(random_string)
+    ENCRYPTION_KEY=$(random_string)
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  app:
+    build: .
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1${PORT}:8000"
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:///./data/mail_agg.db
+      - TZ=Asia/Shanghai
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - ADMIN_USERNAME=${ADMIN_USERNAME}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - JWT_SECRET=${JWT_SECRET}
+      - API_TOKEN=
+      - TELEGRAM_BOT_TOKEN=
+      - TELEGRAM_CHAT_ID=
+      - WEBHOOK_URL=
+    volumes:
+      - ${APP_NAME}-data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  ${APP_NAME}-data:
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d --build
+
+    echo
+    echo -e "${GREEN}✅ MailAggregator_Pro 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${YELLOW}🔑 用户名: ${ADMIN_USERNAME}  密码: ${ADMIN_PASSWORD}${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+    cd "$APP_DIR" || return
+    git reset --hard
+    git pull
+    docker compose pull
+    docker compose up -d --build
+    echo -e "${GREEN}✅ MailAggregator_Pro 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+    docker restart ${CONTAINER_NAME}
+    echo -e "${GREEN}✅ MailAggregator_Pro 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
+    docker logs -f ${CONTAINER_NAME}
+}
+
+check_status() {
+    docker ps | grep ${CONTAINER_NAME}
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ MailAggregator_Pro 已卸载${RESET}"
+    read -p "按回车返回菜单..."
 }
 
 menu

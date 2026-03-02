@@ -46,7 +46,7 @@ select_node() {
     list_nodes
     read -r -p $'\033[32m请输入节点名称或编号: \033[0m' input
     if [[ "$input" =~ ^[0-9]+$ ]]; then
-        NODE_NAME=$(ls -d "$APP_DIR"/* | sed -n "${input}p" | xargs basename)
+        NODE_NAME=$(ls -d "$APP_DIR"/* 2>/dev/null | sed -n "${input}p" | xargs basename)
     else
         NODE_NAME="$input"
     fi
@@ -58,6 +58,7 @@ select_node() {
 }
 
 install_node() {
+
     check_docker
 
     read -p "请输入节点名称 [node$(date +%s)]: " NODE_NAME
@@ -79,23 +80,43 @@ install_node() {
     read -p "请输入 WebSocket Path [默认 /ws]: " WS_PATH
     WS_PATH=${WS_PATH:-/ws}
 
-    read -p "请输入 TLS SNI [默认 $DOMAIN]: " SNI_HOST
+    read -p "请输入 TLS SNI / 伪装域名 [默认 $DOMAIN]: " SNI_HOST
     SNI_HOST=${SNI_HOST:-$DOMAIN}
 
     UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
 
+    echo
+    echo -e "${GREEN}=== TLS 证书设置 ===${RESET}"
+    echo -e "${GREEN}1) 自动生成自签证书${RESET}"
+    echo -e "${GREEN}2) 使用自定义证书路径${RESET}"
+    read -p "请选择: " cert_choice
+
     CERT_DIR="$NODE_DIR/cert"
     mkdir -p "$CERT_DIR"
 
-    echo -e "${YELLOW}生成自签证书...${RESET}"
-    openssl req -x509 -nodes -newkey rsa:2048 \
-        -keyout "$CERT_DIR/private.key" \
-        -out "$CERT_DIR/cert.crt" \
-        -subj "/CN=$DOMAIN" -days 3650
+    if [ "$cert_choice" = "2" ]; then
+        read -p "请输入 cert.crt 完整路径: " CRT_PATH
+        read -p "请输入 private.key 完整路径: " KEY_PATH
+        if [[ ! -f "$CRT_PATH" || ! -f "$KEY_PATH" ]]; then
+            echo -e "${RED}证书文件不存在${RESET}"
+            return
+        fi
+        cp "$CRT_PATH" "$CERT_DIR/cert.crt"
+        cp "$KEY_PATH" "$CERT_DIR/private.key"
+    else
+        echo -e "${YELLOW}正在生成自签证书...${RESET}"
+        openssl req -x509 -nodes -newkey rsa:2048 \
+            -keyout "$CERT_DIR/private.key" \
+            -out "$CERT_DIR/cert.crt" \
+            -subj "/CN=$DOMAIN" -days 3650
+    fi
+
+    chmod 644 "$CERT_DIR"/*
 
     CONFIG_FILE="$NODE_DIR/config.json"
-    COMPOSE_FILE="$NODE_DIR/compose.yml"
+    COMPOSE_FILE="$NODE_DIR/docker-compose.yml"
 
+    # 生成 config.json
     cat > "$CONFIG_FILE" <<EOF
 {
   "log": { "loglevel": "warning" },
@@ -119,7 +140,8 @@ install_node() {
               "keyFile": "/etc/xray/cert/private.key"
             }
           ],
-          "alpn": ["h2","http/1.1"]
+          "alpn": ["h2","http/1.1"],
+          "fingerprint": "chrome"
         },
         "wsSettings": {
           "path": "$WS_PATH"
@@ -133,6 +155,7 @@ install_node() {
 }
 EOF
 
+    # 生成 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
 services:
   $NODE_NAME:
@@ -142,14 +165,16 @@ services:
     command: ["run","-c","/etc/xray/config.json"]
     volumes:
       - ./config.json:/etc/xray/config.json:ro
-      - ./cert:/etc/xray/cert:ro
+      - $CERT_DIR:/etc/xray/cert:ro
     ports:
       - "$PORT:$PORT/tcp"
 EOF
 
-    cd "$NODE_DIR" || exit
+    cd "$NODE_DIR"
     docker compose up -d
-
+    
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+    # 输出 Base64 VMess 链接（使用 jq 构造 JSON）
     VMESS_JSON=$(jq -n \
         --arg v "2" \
         --arg ps "$NODE_NAME" \
@@ -162,10 +187,24 @@ EOF
         --arg host "$SNI_HOST" \
         --arg path "$WS_PATH" \
         --arg tls "tls" \
+        --arg sni "$SNI_HOST" \
+        --arg alpn "h2,http/1.1" \
+        --arg fp "chrome" \
         '{
-            v:$v,ps:$ps,add:$add,port:$port,
-            id:$id,aid:$aid,net:$net,type:$type,
-            host:$host,path:$path,tls:$tls
+            v: $v,
+            ps: $ps,
+            add: $add,
+            port: $port,
+            id: $id,
+            aid: $aid,
+            net: $net,
+            type: $type,
+            host: $host,
+            path: $path,
+            tls: $tls,
+            sni: $sni,
+            alpn: $alpn,
+            fp: $fp,
         }' | base64 -w 0)
 
     echo
@@ -178,9 +217,11 @@ EOF
     echo "📄 V2rayN链接:"
     echo -e "${YELLOW}vmess://${VMESS_JSON}${RESET}"
     echo "📄  Surge 链接:"
-    echo -e "${YELLOW}$HOSTNAME = vmess, ${DOMAIN}, ${PORT}, username=${UUID}, ws=true, ws-path=$WS_PATH, ws-headers=Host:"${DOMAIN}", vmess-aead=true, tls=true, sni=${DOMAIN}${RESET}"
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
+    echo -e "${YELLOW}$NODE_NAME = vmess, ${DOMAIN}, ${PORT}, username=${UUID}, ws=true, ws-path=$WS_PATH, ws-headers=Host:"${DOMAIN}", vmess-aead=true, tls=true, sni=${DOMAIN}${RESET}"
+    read -p "按回车返回菜单..."
 }
+
+
 
 node_action_menu() {
     select_node || return

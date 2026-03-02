@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Hysteria v2 一键管理脚本（Host 模式 + 自签证书）
+# Hysteria 一键管理脚本（Host Docker + 必应自签证书 + 端口跳跃 + 伪装网址）
 # ========================================
 
 GREEN="\033[32m"
@@ -13,6 +13,12 @@ APP_DIR="/root/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 CONFIG_FILE="$APP_DIR/hysteria.yaml"
 CONTAINER_NAME="hysteria"
+
+# 全局记录端口跳跃范围
+JUMP_START=""
+JUMP_END=""
+PORT=""
+MASQ_URL="https://bing.com"  # 默认伪装网址
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -37,12 +43,32 @@ generate_cert() {
     CERT_FILE="$APP_DIR/cert/server.crt"
     KEY_FILE="$APP_DIR/cert/server.key"
     if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ]; then
-        echo -e "${YELLOW}正在生成自签证书...${RESET}"
+        echo -e "${YELLOW}正在生成自签证书（CN=bing.com）...${RESET}"
         openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
             -keyout "$KEY_FILE" \
             -out "$CERT_FILE" \
-            -subj "/CN=localhost" \
+            -subj "/CN=bing.com" \
             -days 36500
+    fi
+}
+
+add_port_jump_rules() {
+    if [[ -n "$JUMP_START" ]] && [[ -n "$JUMP_END" ]]; then
+        echo -e "${YELLOW}添加端口跳跃规则: $JUMP_START-$JUMP_END -> $PORT${RESET}"
+        for p in $(seq $JUMP_START $JUMP_END); do
+            iptables -t nat -A PREROUTING -i eth0 -p udp --dport $p -j REDIRECT --to-ports $PORT
+            ip6tables -t nat -A PREROUTING -i eth0 -p udp --dport $p -j REDIRECT --to-ports $PORT
+        done
+    fi
+}
+
+remove_port_jump_rules() {
+    if [[ -n "$JUMP_START" ]] && [[ -n "$JUMP_END" ]]; then
+        echo -e "${YELLOW}清理端口跳跃规则: $JUMP_START-$JUMP_END -> $PORT${RESET}"
+        for p in $(seq $JUMP_START $JUMP_END); do
+            iptables -t nat -D PREROUTING -i eth0 -p udp --dport $p -j REDIRECT --to-ports $PORT 2>/dev/null
+            ip6tables -t nat -D PREROUTING -i eth0 -p udp --dport $p -j REDIRECT --to-ports $PORT 2>/dev/null
+        done
     fi
 }
 
@@ -85,37 +111,38 @@ install_app() {
     fi
     check_port "$PORT" || return
 
-    # 随机密码
     PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c16)
 
-    # 是否启用端口跳跃
+    # 端口跳跃
     read -p "是否启用端口跳跃（客户端可通过多个端口连接）[y/N]: " enable_jump
     if [[ "$enable_jump" =~ ^[Yy]$ ]]; then
         read -p "请输入端口范围（示例 20000-50000）: " jump_range
-        JUMP_RANGE=${jump_range:-20000-50000}
-        echo -e "${YELLOW}端口跳跃已启用，范围：$JUMP_RANGE -> $PORT${RESET}"
-        # 设置 iptables 规则（IPv4）
-        sudo iptables -t nat -A PREROUTING -i eth0 -p udp --dport $JUMP_RANGE -j REDIRECT --to-ports $PORT
-        # 设置 ip6tables 规则（IPv6）
-        sudo ip6tables -t nat -A PREROUTING -i eth0 -p udp --dport $JUMP_RANGE -j REDIRECT --to-ports $PORT
+        JUMP_START=$(echo $jump_range | cut -d- -f1)
+        JUMP_END=$(echo $jump_range | cut -d- -f2)
     fi
 
-    # 生成自签证书
     generate_cert
+    add_port_jump_rules
 
     # 生成 hysteria.yaml
     cat > "$CONFIG_FILE" <<EOF
 listen: :$PORT
-cert:
+tls:
   crt: /etc/hysteria/server.crt
   key: /etc/hysteria/server.key
 
 auth:
   type: password
   password: $PASSWORD
+
+masquerade:
+  type: proxy
+  proxy:
+    url: $MASQ_URL
+    rewriteHost: true
 EOF
 
-    # 生成 docker-compose.yml
+    # docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
 services:
   hysteria:
@@ -138,11 +165,17 @@ EOF
     echo -e "${GREEN}✅ Hysteria 已启动${RESET}"
     echo -e "${YELLOW}🌐 服务端监听端口: ${PORT}${RESET}"
     echo -e "${YELLOW}🔑 密码: ${PASSWORD}${RESET}"
-    echo -e "${YELLOW}🟢 端口跳跃: ${JUMP_RANGE:-未启用} -> $PORT${RESET}"
+    if [[ -n "$JUMP_START" ]]; then
+        echo -e "${YELLOW}🟢 端口跳跃: $JUMP_START-$JUMP_END -> $PORT${RESET}"
+    else
+        echo -e "${YELLOW}🟢 端口跳跃: 未启用${RESET}"
+    fi
+    echo -e "${YELLOW}🟢 伪装网址: $MASQ_URL${RESET}"
     echo -e "${YELLOW}📄 客户端配置模板:${RESET}"
-    echo -e "${YELLOW}hysteria2://$PASSWORD@$IP:$PORT/?sni=localhost&insecure=1#hy2${RESET}"
+    echo -e "${YELLOW}hysteria2://$PASSWORD@$IP:$PORT/?sni=bing.com&insecure=1#hy2${RESET}"
     read -p "按回车返回菜单..."
 }
+
 update_app() {
     cd "$APP_DIR" || return
     docker compose pull
@@ -168,11 +201,12 @@ check_status() {
 }
 
 uninstall_app() {
+    remove_port_jump_rules
     cd "$APP_DIR" || return
     docker stop $CONTAINER_NAME
     docker rm $CONTAINER_NAME
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Hysteria 已卸载${RESET}"
+    echo -e "${RED}✅ Hysteria 已卸载并清理端口跳跃规则${RESET}"
     read -p "按回车返回菜单..."
 }
 

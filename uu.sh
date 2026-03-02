@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Snell 一键管理脚本（Host 模式 + 去掉 DNS）
+# Shadowsocks-rust 多节点管理脚本（彩色菜单 + 节点状态查看）
 # ========================================
 
 GREEN="\033[32m"
@@ -8,11 +8,10 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="snell-server"
-APP_DIR="/root/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONTAINER_NAME="snell-server"
+APP_NAME="ss-rust"
+APP_DIR="/opt/$APP_NAME"
 
+# ===== 检查 Docker =====
 check_docker() {
     if ! command -v docker &>/dev/null; then
         echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
@@ -24,6 +23,7 @@ check_docker() {
     fi
 }
 
+# ===== 检查端口 =====
 check_port() {
     if ss -tlnp | grep -q ":$1 "; then
         echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
@@ -31,137 +31,191 @@ check_port() {
     fi
 }
 
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== Snell 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+# ===== 列出节点 =====
+list_nodes() {
+    mkdir -p "$APP_DIR"
+    echo -e "${GREEN}=== 已有 Shadowsocks 节点 ===${RESET}"
+    local count=0
+    for node in "$APP_DIR"/*; do
+        [ -d "$node" ] || continue
+        count=$((count+1))
+        echo -e "${YELLOW}[$count] $(basename "$node")${RESET}"
+    done
+    [ $count -eq 0 ] && echo -e "${YELLOW}无节点${RESET}"
+}
 
+# ===== 选择节点 =====
+select_node() {
+    list_nodes
+    read -r -p $'\033[32m请输入节点名称或编号: \033[0m' input
+    if [[ "$input" =~ ^[0-9]+$ ]]; then
+        NODE_NAME=$(ls -d "$APP_DIR"/* | sed -n "${input}p" | xargs basename)
+    else
+        NODE_NAME="$input"
+    fi
+    NODE_DIR="$APP_DIR/$NODE_NAME"
+    if [ ! -d "$NODE_DIR" ]; then
+        echo -e "${RED}节点不存在！${RESET}"
+        return 1
+    fi
+}
+
+# ===== 安装节点 =====
+install_node() {
+    check_docker
+    read -p "请输入节点名称 [node$(date +%s)]: " NODE_NAME
+    NODE_NAME=${NODE_NAME:-node$(date +%s)}
+    NODE_DIR="$APP_DIR/$NODE_NAME"
+    mkdir -p "$NODE_DIR"
+
+    read -p "请输入监听端口 [1025-65535, 默认随机]: " input_port
+    PORT=${input_port:-$(shuf -i 1025-65000 -n1)}
+    check_port "$PORT" || return
+
+    METHOD="2022-blake3-aes-256-gcm"
+    PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c16)
+    # 生成 docker-compose.yml
+    cat > "$NODE_DIR/docker-compose.yml" <<EOF
+services:
+  ${NODE_NAME}:
+    image: teddysun/shadowsocks-rust
+    container_name: ${NODE_NAME}
+    restart: always
+    ports:
+      - "${PORT}:${PORT}/tcp"
+      - "${PORT}:${PORT}/udp"
+    environment:
+      - SERVER_PORT=${PORT}
+      - PASSWORD=${PASSWORD}
+      - METHOD=${METHOD}
+EOF
+
+    cd "$NODE_DIR" || return
+    docker compose up -d
+
+    IP=$( hostname -I | awk '{print $1}')
+
+    echo -e "${GREEN}✅ 节点 ${NODE_NAME} 已启动${RESET}"
+    echo -e "${YELLOW}🌐 端口: ${PORT}${RESET}"
+    echo -e "${YELLOW}🔑 密码: ${PASSWORD}${RESET}"
+    ENC=$(echo -n "${METHOD}:${PASSWORD}" | base64)
+    echo -e "${YELLOW}📄 ss:// 链接: ss://${ENC}@${IP}:${PORT}${RESET}"
+
+    read -r -p $'\033[32m按回车返回菜单...\033[0m'
+}
+
+# ===== 节点单独管理菜单 =====
+node_action_menu() {
+    select_node || return
+    while true; do
+        echo -e "${GREEN}=== 节点 [$NODE_NAME] 管理 ===${RESET}"
+        echo -e "${GREEN}1) 暂停${RESET}"
+        echo -e "${GREEN}2) 重启${RESET}"
+        echo -e "${GREEN}3) 更新镜像并重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 卸载${RESET}"
+        echo -e "${GREEN}0) 返回主菜单${RESET}"
+        read -r -p $'\033[32m请选择操作: \033[0m' choice
         case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+            1) docker pause "$NODE_NAME" ;;
+            2) docker restart "$NODE_NAME" ;;
+            3) docker compose -f "$NODE_DIR/docker-compose.yml" pull && docker compose -f "$NODE_DIR/docker-compose.yml" up -d ;;
+            4) docker logs -f "$NODE_NAME" ;;
+            5) docker compose -f "$NODE_DIR/docker-compose.yml" down && rm -rf "$NODE_DIR" && return ;;
+            0) return ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
         esac
     done
 }
 
-install_app() {
-    check_docker
-    mkdir -p "$APP_DIR/data"
+# ===== 批量操作 =====
+batch_action() {
+    echo -e "${GREEN}=== 批量操作 ===${RESET}"
+    echo -e "${GREEN}1) 暂停节点${RESET}"
+    echo -e "${GREEN}2) 重启节点${RESET}"
+    echo -e "${GREEN}3) 更新节点${RESET}"
+    echo -e "${GREEN}4) 卸载节点${RESET}"
+    echo -e "${GREEN}0) 返回主菜单${RESET}"
+    read -r -p $'\033[32m请选择操作: \033[0m' choice
 
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
+    mkdir -p "$APP_DIR"
 
-    # 端口自定义 / 随机
-    read -p "请输入监听端口 [1025-65535, 默认随机]: " input_port
-    if [[ -z "$input_port" ]]; then
-        PORT=$(shuf -i 1025-65535 -n1)
+    declare -A NODE_MAP
+    local count=0
+    for node in "$APP_DIR"/*; do
+        [ -d "$node" ] || continue
+        count=$((count+1))
+        NODE_NAME=$(basename "$node")
+        NODE_MAP[$count]="$NODE_NAME"
+        echo -e "${YELLOW}[$count] $NODE_NAME${RESET}"
+    done
+    [ $count -eq 0 ] && { echo -e "${YELLOW}无节点${RESET}"; read -r -p $'\033[32m按回车返回菜单...\033[0m' ; return ; }
+
+    read -r -p $'\033[32m请输入要操作的节点序号（用空格分隔，或输入 all 全选）: \033[0m' input_nodes
+
+    if [[ "$input_nodes" == "all" ]]; then
+        SELECTED_NODES=("${NODE_MAP[@]}")
     else
-        PORT=$input_port
-    fi
-    check_port "$PORT" || return
-
-    # 随机 32 位 PSK
-    PSK=$(tr -dc A-Za-z0-9 </dev/urandom | head -c32)
-
-    # 可选配置
-    read -p "是否启用 IPv6 [true/false, 默认 false]: " ipv6
-    IPv6=${ipv6:-false}
-
-    read -p "混淆模式 [off/http, 默认 off]: " obfs
-    OBFS=${obfs:-off}
-    if [ "$OBFS" = "http" ]; then
-        read -p "请输入混淆 Host [默认 example.com]: " obfs_host
-        OBFS_HOST=${obfs_host:-example.com}
-    else
-        OBFS_HOST=""
+        SELECTED_NODES=()
+        for i in $input_nodes; do
+            NODE=${NODE_MAP[$i]}
+            [ -n "$NODE" ] && SELECTED_NODES+=("$NODE")
+        done
     fi
 
-    read -p "是否启用 TCP Fast Open [true/false, 默认 true]: " tfo
-    TFO=${tfo:-true}
+    for NODE_NAME in "${SELECTED_NODES[@]}"; do
+        NODE_DIR="$APP_DIR/$NODE_NAME"
+        [ ! -d "$NODE_DIR" ] && continue
 
-    ECN=true   # 固定开启
+        cd "$NODE_DIR" || continue
+        case $choice in
+            1) docker pause "$NODE_NAME" ;;
+            2) docker restart "$NODE_NAME" ;;
+            3) docker compose pull && docker compose up -d ;;
+            4) docker compose down && rm -rf "$NODE_DIR" ;;
+            0) return ;;
+        esac
+        echo -e "${GREEN}✅ 节点 $NODE_NAME 操作完成${RESET}"
+    done
 
-    # 生成 Docker Compose 文件 (host 模式, 去掉 DNS)
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  snell-server:
-    image: 1byte/snell-server:latest
-    container_name: ${CONTAINER_NAME}
-    restart: always
-    network_mode: host
-    environment:
-      PORT: "${PORT}"
-      PSK: "${PSK}"
-      IPv6: "${IPv6}"
-      OBFS: "${OBFS}"
-      OBFS_HOST: "${OBFS_HOST}"
-      TFO: "${TFO}"
-      ECN: "${ECN}"
-EOF
-
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    # 输出客户端配置模板
-    IP=$(hostname -I | awk '{print $1}')
-    HOSTNAME=$(hostname -s | sed 's/ /_/g')
-    echo
-    echo -e "${GREEN}✅ Snell 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问端口: ${PORT}${RESET}"
-    echo -e "${YELLOW}🔑 PSK: ${PSK}${RESET}"
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
-    echo -e "${YELLOW}📄 客户端配置模板:${RESET}"
-    echo -e "${YELLOW} $HOSTNAME = snell, ${IP}, ${PORT}, psk=${PSK}, version=5, reuse=true, tfo=${TFO}, ecn=${ECN}${RESET} "
-    read -p "按回车返回菜单..."
+    read -r -p $'\033[32m按回车返回菜单...\033[0m'
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ Snell 更新完成${RESET}"
-    read -p "按回车返回菜单..."
+# ===== 查看所有节点状态 =====
+show_all_status() {
+    list_nodes
+    echo -e "${GREEN}=== 节点状态 ===${RESET}"
+    for node in "$APP_DIR"/*; do
+        [ -d "$node" ] || continue
+        NODE_NAME=$(basename "$node")
+        PORT=$(grep -oP 'SERVER_PORT=\K[0-9]+' "$node/docker-compose.yml")
+        STATUS=$(docker ps --filter "name=$NODE_NAME" --format "{{.Status}}")
+        [ -z "$STATUS" ] && STATUS="未启动"
+        echo -e "${GREEN}$NODE_NAME${RESET} | ${YELLOW}端口: ${PORT}${RESET} | ${YELLOW}状态: ${STATUS}${RESET}"
+    done
+    read -r -p $'\033[32m按回车返回菜单...\033[0m'
 }
 
-restart_app() {
-    docker restart ${CONTAINER_NAME}
-    echo -e "${GREEN}✅ Snell 已重启${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f ${CONTAINER_NAME}
-}
-
-check_status() {
-    docker ps | grep ${CONTAINER_NAME}
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker stop ${CONTAINER_NAME}
-    docker rm ${CONTAINER_NAME}
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Snell 已卸载${RESET}"
-    read -p "按回车返回菜单..."
+# ===== 主菜单 =====
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== Shadowsocks-rust 节点管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动新节点${RESET}"
+        echo -e "${GREEN}2) 管理已有节点${RESET}"
+        echo -e "${GREEN}3) 查看所有节点状态${RESET}"
+        echo -e "${GREEN}4) 批量操作节点${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -r -p $'\033[32m请选择操作: \033[0m' choice
+        case $choice in
+            1) install_node ;;
+            2) node_action_menu ;;
+            3) show_all_status ;;
+            4) batch_action ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
+        esac
+    done
 }
 
 menu

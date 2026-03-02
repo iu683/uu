@@ -85,6 +85,7 @@ select_node() {
     local nodes=()
     local count=0
 
+    # 收集节点
     for node in "$APP_DIR"/*; do
         [ -d "$node" ] || continue
         nodes+=("$(basename "$node")")
@@ -94,16 +95,29 @@ select_node() {
 
     [ $count -eq 0 ] && { echo -e "${RED}无节点！${RESET}"; return 1; }
 
-    read -r -p $'\033[32m请输入节点名称或编号:\033[0m ' input
+    while true; do
+        read -r -p $'\033[32m请输入节点名称或编号:\033[0m ' input
 
-    if [[ "$input" =~ ^[0-9]+$ ]]; then
-        NODE_NAME="${nodes[$((input-1))]}"
-    else
-        NODE_NAME="$input"
-    fi
+        # 输入编号
+        if [[ "$input" =~ ^[0-9]+$ ]]; then
+            if (( input >= 1 && input <= count )); then
+                NODE_NAME="${nodes[$((input-1))]}"
+                break
+            else
+                echo -e "${RED}编号无效！请重新输入${RESET}"
+            fi
+        else
+            # 输入名称
+            if [ -d "$APP_DIR/$input" ]; then
+                NODE_NAME="$input"
+                break
+            else
+                echo -e "${RED}节点不存在！请重新输入${RESET}"
+            fi
+        fi
+    done
 
     NODE_DIR="$APP_DIR/$NODE_NAME"
-    [ ! -d "$NODE_DIR" ] && { echo -e "${RED}节点不存在${RESET}"; return 1; }
 }
 
 install_node() {
@@ -173,7 +187,10 @@ EOF
 }
 
 node_action_menu() {
-    select_node || return
+    while ! select_node; do
+        echo -e "${YELLOW}请重新选择有效节点${RESET}"
+    done
+
     while true; do
         echo -e "${GREEN}=== 节点 [$NODE_NAME] 管理 ===${RESET}"
         echo -e "${GREEN}1) 重启${RESET}"
@@ -182,7 +199,7 @@ node_action_menu() {
         echo -e "${GREEN}4) 卸载${RESET}"
         echo -e "${GREEN}0) 返回${RESET}"
 
-        read -r -p $'\033[32m请选择:\033[0m ' choice
+        read -r -p $'\033[32m请选择操作:\033[0m ' choice
         case $choice in
             1) docker restart "$NODE_NAME" ;;
             2) docker compose -f "$NODE_DIR/docker-compose.yml" pull && docker compose -f "$NODE_DIR/docker-compose.yml" up -d ;;
@@ -199,12 +216,16 @@ show_all_status() {
     for node in "$APP_DIR"/*; do
         [ -d "$node" ] || continue
         NODE_NAME=$(basename "$node")
-        PORT=$(grep 'listen:' "$node/hysteria.yaml" | awk -F: '{print $2}')
+
+        # 提取 listen 端口，去掉空格和前导冒号
+        PORT=$(grep '^listen:' "$node/hysteria.yaml" | awk -F: '{gsub(/[[:space:]]/,"",$2); print $2}')
+
         STATUS=$(docker inspect -f '{{.State.Status}}' "$NODE_NAME" 2>/dev/null)
         [ -z "$STATUS" ] && STATUS="未启动"
-        echo -e "${GREEN}$NODE_NAME | $PORT | $STATUS${RESET}"
+
+        echo -e "${GREEN}$NODE_NAME | ${PORT:-未知端口} | $STATUS${RESET}"
     done
-    read -p "回车返回..."
+    read -p "按回车返回菜单..."
 }
 
 batch_action() {

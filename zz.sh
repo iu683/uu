@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# TUIC v5 一键管理脚本（Host模式 + 自签Bing证书）
+# Xray VMess WS TLS 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,11 +8,10 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="tuic-server"
+APP_NAME="xray-vmess-ws-tls"
 APP_DIR="/root/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+COMPOSE_FILE="$APP_DIR/compose.yml"
 CONFIG_FILE="$APP_DIR/config.json"
-CONTAINER_NAME="tuic-server"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -25,19 +24,10 @@ check_docker() {
     fi
 }
 
-check_port() {
-    if ss -tulnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
-
-SERVER_IP=$(hostname -I | awk '{print $1}')
-
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== TUIC v5 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Xray VMess WS TLS 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -64,95 +54,133 @@ install_app() {
     check_docker
     mkdir -p "$APP_DIR"
 
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
+    # 监听端口
+    read -p "请输入监听端口 [默认 443]: " PORT
+    PORT=${PORT:-443}
+
+    # 域名
+    read -p "请输入真实域名（必须已解析到本机IP）: " DOMAIN
+    if [[ -z "$DOMAIN" ]]; then
+        echo -e "${RED}域名不能为空${RESET}"
+        return
     fi
 
-    # 端口
-    read -p "请输入监听端口 [默认随机]: " input_port
-    if [[ -z "$input_port" ]]; then
-        PORT=$(shuf -i 1025-65535 -n1)
+    # WebSocket Path
+    read -p "请输入 WebSocket Path [默认 /ws]: " WS_PATH
+    WS_PATH=${WS_PATH:-/ws}
+
+    # TLS SNI / 伪装域名
+    read -p "请输入 TLS SNI / 伪装域名 [例如 $DOMAIN]: " SNI_HOST
+    SNI_HOST=${SNI_HOST:-$DOMAIN}
+
+    # UUID
+    UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
+
+    # TLS 证书
+    read -p "请输入 TLS 证书目录（留空自动生成自签证书）: " CERT_DIR
+    if [[ -z "$CERT_DIR" ]]; then
+        CERT_DIR="$APP_DIR/cert"
+        mkdir -p "$CERT_DIR"
+        echo -e "${YELLOW}正在生成自签 TLS 证书...${RESET}"
+        openssl req -x509 -nodes -newkey rsa:2048 \
+            -keyout "$CERT_DIR/private.key" \
+            -out "$CERT_DIR/cert.crt" \
+            -subj "/CN=$DOMAIN" -days 3650
+        chmod 644 "$CERT_DIR/private.key" "$CERT_DIR/cert.crt"
     else
-        PORT=$input_port
+        if [[ ! -f "$CERT_DIR/cert.crt" || ! -f "$CERT_DIR/private.key" ]]; then
+            echo -e "${RED}目录下未找到 cert.crt 或 private.key${RESET}"
+            return
+        fi
+        chmod 644 "$CERT_DIR/private.key" "$CERT_DIR/cert.crt"
     fi
 
-    check_port "$PORT" || return
-    
-    # 生成 UUID 和 密码
-    UUID=$(cat /proc/sys/kernel/random/uuid)
-    PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c8)
-
-    echo -e "${YELLOW}正在生成自签证书用于 TUIC v5 ...${RESET}"
-    openssl req -x509 -nodes -newkey rsa:2048 \
-        -keyout "$APP_DIR/server.key" \
-        -out "$APP_DIR/server.crt" \
-        -days 36500 \
-        -subj "/CN=www.bing.com" \
-        -addext "subjectAltName=DNS:www.bing.com" >/dev/null 2>&1
-
-    # 生成 TUIC v5 配置（正确字段 uuid）
+    # 生成 config.json
     cat > "$CONFIG_FILE" <<EOF
 {
-  "log": { "level": "info" },
+  "log": { "loglevel": "warning" },
   "inbounds": [
     {
-      "type": "tuic",
-      "listen": "0.0.0.0",
-      "listen_port": ${PORT},
-      "users": [
-        {
-          "uuid": "${UUID}",
-          "password": "${PASSWORD}"
+      "port": $PORT,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          { "id": "$UUID", "alterId": 0 }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "$SNI_HOST",
+          "certificates": [
+            {
+              "certificateFile": "/etc/xray/cert/cert.crt",
+              "keyFile": "/etc/xray/cert/private.key"
+            }
+          ],
+          "alpn": ["h2","http/1.1"],
+          "fingerprint": "chrome"
+        },
+        "wsSettings": {
+          "path": "$WS_PATH"
         }
-      ],
-      "congestion_control": "bbr",
-      "tls": {
-        "enabled": true,
-        "alpn": ["h3"],
-        "server_name": "www.bing.com",
-        "certificate_path": "/etc/tuic/server.crt",
-        "key_path": "/etc/tuic/server.key"
       }
     }
   ],
   "outbounds": [
-    { "type": "direct" }
+    { "protocol": "freedom" }
   ]
 }
 EOF
 
-    # Docker Compose
+    # 生成 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  tuic-server:
-    image: ghcr.io/sagernet/sing-box:latest
-    container_name: ${CONTAINER_NAME}
-    restart: always
-    network_mode: host
+  xray:
+    image: ghcr.io/xtls/xray-core:latest
+    container_name: xray
+    restart: unless-stopped
+    command: ["run","-c","/etc/xray/config.json"]
     volumes:
-      - ./config.json:/etc/tuic/config.json
-      - ./server.crt:/etc/tuic/server.crt
-      - ./server.key:/etc/tuic/server.key
-    command: run -c /etc/tuic/config.json
+      - ./config.json:/etc/xray/config.json:ro
+      - $CERT_DIR:/etc/xray/cert:ro
+    ports:
+      - "$PORT:$PORT/tcp"
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+    # 生成 vmess 链接（包含 serverName、alpn、fingerprint）
+VMESS_JSON=$(cat <<EOL
+{
+  "v": "2",
+  "ps": "vmess-ws-tls",
+  "add": "$DOMAIN",
+  "port": "$PORT",
+  "id": "$UUID",
+  "aid": "0",
+  "net": "ws",
+  "type": "none",
+  "host": "$SNI_HOST",
+  "path": "$WS_PATH",
+  "tls": "tls",
+  "serverName": "$SNI_HOST",
+  "alpn": ["h2","http/1.1"],
+  "fingerprint": "chrome"
+}
+EOL
+)
+
+VMESS_LINK="vmess://$(echo -n "$VMESS_JSON" | base64 -w 0)"
 
     echo
-    echo -e "${GREEN}✅ TUIC v5 节点已启动${RESET}"
-    echo -e "${YELLOW}🌐 公网 IP: ${SERVER_IP}${RESET}"
-    echo -e "${YELLOW}🔌 端口: ${PORT}${RESET}"
-    echo -e "${YELLOW}🆔 UUID: ${UUID}${RESET}"
-    echo -e "${YELLOW}🔑 密码: ${PASSWORD}${RESET}"
-    echo
-    echo -e "${GREEN}📄 客户端链接:${RESET}"
-    echo -e "${YELLOW}tuic://${UUID}:${PASSWORD}@${SERVER_IP}:${PORT}?congestion_control=bbr&alpn=h3&sni=www.bing.com&udp_relay_mode=native&allow_insecure=1#${HOSTNAME}${RESET}"
-    echo
+    echo -e "${GREEN}✅ 安装完成${RESET}"
+    echo -e "${YELLOW}UUID: $UUID${RESET}"
+    echo -e "${YELLOW}WS Path: $WS_PATH${RESET}"
+    echo -e "${YELLOW}SNI / 伪装域名: $SNI_HOST${RESET}"
+    echo -e "${YELLOW}${VMESS_LINK}${RESET}"
     read -p "按回车返回菜单..."
 }
 update_app() {
@@ -164,24 +192,24 @@ update_app() {
 }
 
 restart_app() {
-    docker restart ${CONTAINER_NAME}
+    docker restart xray
     echo -e "${GREEN}✅ 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f ${CONTAINER_NAME}
+    docker logs -f xray
 }
 
 check_status() {
-    docker ps | grep ${CONTAINER_NAME}
+    docker ps | grep xray
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
-    docker stop ${CONTAINER_NAME}
-    docker rm ${CONTAINER_NAME}
+    cd "$APP_DIR" || return
+    docker compose down
     rm -rf "$APP_DIR"
     echo -e "${RED}✅ 已卸载${RESET}"
     read -p "按回车返回菜单..."

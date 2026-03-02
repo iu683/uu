@@ -24,6 +24,14 @@ check_docker() {
     fi
 }
 
+check_port() {
+    if ss -lnt | awk '{print $4}' | grep -q ":$1$"; then
+        echo -e "${RED}端口 $1 已被占用${RESET}"
+        return 1
+    fi
+    return 0
+}
+
 menu() {
     while true; do
         clear
@@ -54,17 +62,33 @@ install_app() {
     check_docker
     mkdir -p "$APP_DIR"
 
-    read -p "请输入监听端口 [默认 443]: " PORT
-    PORT=${PORT:-443}
+    # 端口
+    read -p "请输入监听端口 [默认随机]: " input_port
+    if [[ -z "$input_port" ]]; then
+        PORT=$(shuf -i 1025-65535 -n1)
+    else
+        PORT=$input_port
+    fi
 
-    read -p "请输入域名（必须已解析到本机IP）: " DOMAIN
+    check_port "$PORT" || return
+
+    # 域名
+    read -p "请输入真实域名（必须已解析到本机IP）: " DOMAIN
     if [[ -z "$DOMAIN" ]]; then
         echo -e "${RED}域名不能为空${RESET}"
         return
     fi
 
+    # WebSocket Path
+    read -p "请输入 WebSocket Path [默认 /ws]: " WS_PATH
+    WS_PATH=${WS_PATH:-/ws}
+
+    # TLS SNI / 伪装域名
+    read -p "请输入 TLS SNI / 伪装域名 [默认 $DOMAIN]: " SNI_HOST
+    SNI_HOST=${SNI_HOST:-$DOMAIN}
+
+    # UUID
     UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
-    WSPATH="/$(openssl rand -hex 6)"
 
     # TLS 证书
     read -p "请输入 TLS 证书目录（留空自动生成自签证书）: " CERT_DIR
@@ -76,13 +100,16 @@ install_app() {
             -keyout "$CERT_DIR/private.key" \
             -out "$CERT_DIR/cert.crt" \
             -subj "/CN=$DOMAIN" -days 3650
+        chmod 644 "$CERT_DIR/private.key" "$CERT_DIR/cert.crt"
     else
         if [[ ! -f "$CERT_DIR/cert.crt" || ! -f "$CERT_DIR/private.key" ]]; then
             echo -e "${RED}目录下未找到 cert.crt 或 private.key${RESET}"
             return
         fi
+        chmod 644 "$CERT_DIR/private.key" "$CERT_DIR/cert.crt"
     fi
 
+    # 生成 config.json
     cat > "$CONFIG_FILE" <<EOF
 {
   "log": { "loglevel": "warning" },
@@ -99,15 +126,18 @@ install_app() {
         "network": "ws",
         "security": "tls",
         "tlsSettings": {
+          "serverName": "$SNI_HOST",
           "certificates": [
             {
               "certificateFile": "/etc/xray/cert/cert.crt",
               "keyFile": "/etc/xray/cert/private.key"
             }
-          ]
+          ],
+          "alpn": ["h2","http/1.1"],
+          "fingerprint": "chrome"
         },
         "wsSettings": {
-          "path": "$WSPATH"
+          "path": "$WS_PATH"
         }
       }
     }
@@ -118,11 +148,12 @@ install_app() {
 }
 EOF
 
+    # 生成 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
 services:
   xray:
     image: ghcr.io/xtls/xray-core:latest
-    container_name: xray
+    container_name: vmessxray
     restart: unless-stopped
     command: ["run","-c","/etc/xray/config.json"]
     volumes:
@@ -134,31 +165,51 @@ EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
-
-    VMESS_JSON=$(cat <<EOL
-{
-  "v": "2",
-  "ps": "vmess-ws-tls",
-  "add": "$DOMAIN",
-  "port": "$PORT",
-  "id": "$UUID",
-  "aid": "0",
-  "net": "ws",
-  "type": "none",
-  "host": "",
-  "path": "$WSPATH",
-  "tls": "tls"
-}
-EOL
-)
-
-    VMESS_LINK="vmess://$(echo -n "$VMESS_JSON" | base64 -w 0)"
+    
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+    # 输出 Base64 VMess 链接（使用 jq 构造 JSON）
+    VMESS_JSON=$(jq -n \
+        --arg v "2" \
+        --arg ps "$HOSTNAME" \
+        --arg add "$DOMAIN" \
+        --arg port "$PORT" \
+        --arg id "$UUID" \
+        --arg aid "0" \
+        --arg net "ws" \
+        --arg type "none" \
+        --arg host "$SNI_HOST" \
+        --arg path "$WS_PATH" \
+        --arg tls "tls" \
+        --arg sni "$SNI_HOST" \
+        --arg alpn "h2,http/1.1" \
+        --arg fp "chrome" \
+        '{
+            v: $v,
+            ps: $ps,
+            add: $add,
+            port: $port,
+            id: $id,
+            aid: $aid,
+            net: $net,
+            type: $type,
+            host: $host,
+            path: $path,
+            tls: $tls,
+            sni: $sni,
+            alpn: $alpn,
+            fp: $fp,
+        }' | base64 -w 0)
 
     echo
-    echo -e "${GREEN}✅ 安装完成${RESET}"
-    echo -e "${YELLOW}UUID: $UUID${RESET}"
-    echo -e "${YELLOW}WS Path: $WSPATH${RESET}"
-    echo -e "${YELLOW}${VMESS_LINK}${RESET}"
+    echo -e "${GREEN}✅ VMess-WS-TLS 节点已启动${RESET}"
+    echo -e "${YELLOW}🌐 公网域名: ${DOMAIN}${RESET}"
+    echo -e "${YELLOW}🔌 端口: ${PORT}${RESET}"
+    echo -e "${YELLOW}🆔 UUID: ${UUID}${RESET}"
+    echo -e "${YELLOW}自签证书需要客户端设置跳过证书${RESET}"
+    echo
+    echo -e "${GREEN}📄 客户端 Base64 VMess 链接:${RESET}"
+    echo -e "${YELLOW}V2rayN: vmess://${VMESS_JSON}${RESET}"
+    echo -e "${YELLOW}Surge:  $HOSTNAME = vmess, ${DOMAIN}, ${PORT}, username=${UUID}, ws=true, ws-path=$WS_PATH, ws-headers=Host:"${DOMAIN}", vmess-aead=true, tls=true, sni=${DOMAIN}${RESET}"
     read -p "按回车返回菜单..."
 }
 
@@ -171,7 +222,7 @@ update_app() {
 }
 
 restart_app() {
-    docker restart xray
+    docker restart vmessxray
     echo -e "${GREEN}✅ 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
@@ -182,7 +233,7 @@ view_logs() {
 }
 
 check_status() {
-    docker ps | grep xray
+    docker ps | grep vmessxray
     read -p "按回车返回菜单..."
 }
 
@@ -194,4 +245,5 @@ uninstall_app() {
     read -p "按回车返回菜单..."
 }
 
+# 启动菜单
 menu

@@ -54,10 +54,15 @@ install_app() {
     check_docker
     mkdir -p "$APP_DIR"
 
-    # 监听端口
-    read -p "请输入监听端口 [默认 443]: " PORT
-    PORT=${PORT:-443}
+     端口
+    read -p "请输入监听端口 [默认随机]: " input_port
+    if [[ -z "$input_port" ]]; then
+        PORT=$(shuf -i 1025-65535 -n1)
+    else
+        PORT=$input_port
+    fi
 
+    check_port "$PORT" || return
     # 域名
     read -p "请输入真实域名（必须已解析到本机IP）: " DOMAIN
     if [[ -z "$DOMAIN" ]]; then
@@ -70,14 +75,14 @@ install_app() {
     WS_PATH=${WS_PATH:-/ws}
 
     # TLS SNI / 伪装域名
-    read -p "请输入 TLS SNI / 伪装域名 [例如 $DOMAIN]: " SNI_HOST
+    read -p "请输入 TLS SNI / 伪装域名 [默认 $DOMAIN]: " SNI_HOST
     SNI_HOST=${SNI_HOST:-$DOMAIN}
 
     # UUID
     UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
 
     # TLS 证书
-    read -p "请输入 TLS 证书目录（留空自动生成自签证书）: " CERT_DIR
+    read -p "请输入 TLS 证书目录（申请的证书）: " CERT_DIR
     if [[ -z "$CERT_DIR" ]]; then
         CERT_DIR="$APP_DIR/cert"
         mkdir -p "$CERT_DIR"
@@ -152,37 +157,53 @@ EOF
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    # 生成 vmess 链接（包含 serverName、alpn、fingerprint）
-VMESS_JSON=$(cat <<EOL
-{
-  "v": "2",
-  "ps": "vmess-ws-tls",
-  "add": "$DOMAIN",
-  "port": "$PORT",
-  "id": "$UUID",
-  "aid": "0",
-  "net": "ws",
-  "type": "none",
-  "host": "$SNI_HOST",
-  "path": "$WS_PATH",
-  "tls": "tls",
-  "serverName": "$SNI_HOST",
-  "alpn": ["h2","http/1.1"],
-  "fingerprint": "chrome"
-}
-EOL
-)
+    # 输出 Base64 VMess 链接（使用 jq 构造 JSON）
+VMESS_JSON=$(jq -n \
+    --arg v "2" \
+    --arg ps "vmess-ws-tls" \
+    --arg add "$DOMAIN" \
+    --arg port "$PORT" \
+    --arg id "$UUID" \
+    --arg aid "0" \
+    --arg net "ws" \
+    --arg type "none" \
+    --arg host "$SNI_HOST" \
+    --arg path "$WS_PATH" \
+    --arg tls "tls" \
+    --arg sni "$SNI_HOST" \
+    --arg alpn "h2,http/1.1" \
+    --arg fp "chrome" \
+    --arg insecure "1" \
+    '{
+        v: $v,
+        ps: $ps,
+        add: $add,
+        port: $port,
+        id: $id,
+        aid: $aid,
+        net: $net,
+        type: $type,
+        host: $host,
+        path: $path,
+        tls: $tls,
+        sni: $sni,
+        alpn: $alpn,
+        fp: $fp,
+        insecure: $insecure
+    }' | base64 -w 0)
 
-VMESS_LINK="vmess://$(echo -n "$VMESS_JSON" | base64 -w 0)"
+echo
+echo -e "${GREEN}✅ VMess-WS-TLS 节点已启动${RESET}"
+echo -e "${YELLOW}🌐 公网 IP: ${DOMAIN}${RESET}"
+echo -e "${YELLOW}🔌 端口: ${PORT}${RESET}"
+echo -e "${YELLOW}🆔 UUID: ${UUID}${RESET}"
+echo
+echo -e "${GREEN}📄 客户端 Base64 VMess 链接:${RESET}"
+echo -e "${YELLOW}vmess://${VMESS_JSON}${RESET}"
+read -p "按回车返回菜单..."
 
-    echo
-    echo -e "${GREEN}✅ 安装完成${RESET}"
-    echo -e "${YELLOW}UUID: $UUID${RESET}"
-    echo -e "${YELLOW}WS Path: $WS_PATH${RESET}"
-    echo -e "${YELLOW}SNI / 伪装域名: $SNI_HOST${RESET}"
-    echo -e "${YELLOW}${VMESS_LINK}${RESET}"
-    read -p "按回车返回菜单..."
-}
+
+
 update_app() {
     cd "$APP_DIR" || return
     docker compose pull
@@ -190,7 +211,6 @@ update_app() {
     echo -e "${GREEN}✅ 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
-
 restart_app() {
     docker restart xray
     echo -e "${GREEN}✅ 已重启${RESET}"

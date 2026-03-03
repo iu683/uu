@@ -155,7 +155,7 @@ EOF
 services:
   ss:
     image: ghcr.io/shadowsocks/ssserver-rust:latest
-    container_name: $NODE_NAME-shadowsocks
+    container_name: $NODE_NAME-ss
     restart: unless-stopped
     network_mode: host
     command: ssserver -c /etc/shadowsocks/config.json
@@ -164,7 +164,7 @@ services:
 
   shadow-tls:
     image: ghcr.io/ihciah/shadow-tls:latest
-    container_name: $NODE_NAME-shadow-tls
+    container_name: $NODE_NAME-tls
     restart: unless-stopped
     network_mode: host
     environment:
@@ -197,24 +197,15 @@ EOF
     # 1️⃣ 生成 SS 主体 base64
     SS_BASE=$(echo -n "${METHOD}:${SS_PASSWORD}" | base64 -w 0)
 
-    # 2️⃣ 生成 shadow-tls JSON
-    SHADOWTLS_JSON=$(cat <<EOF
-    {
-      "version":"3",
-      "password":"${TLS_PASSWORD}",
-      "host":"${TLS_HOST}",
-      "port":"${SS_PORT}",
-      "address":"${IP4}"
-    }
-    EOF
-    )
 
+    # 2️⃣ 生成 shadow-tls JSON（稳定版）
+    SHADOWTLS_JSON="{\"version\":\"3\",\"password\":\"${TLS_PASSWORD}\",\"host\":\"${TLS_HOST}\"}"
  
     # 3️⃣ JSON 再 base64
     SHADOWTLS_BASE=$(echo -n "$SHADOWTLS_JSON" | base64 -w 0)
 
     # 4️⃣ 组合最终链接
-    SS_LINK="ss://${SS_BASE}@${IP4}:${TLS_PORT}?shadow-tls=${SHADOWTLS_BASE}#SS-${IP4}"
+    SS_LINK="ss://${SS_BASE}@${IP4}:${TLS_PORT}?shadow-tls=${SHADOWTLS_BASE}#$NODE_NAME"
 
     echo
     echo "SS + ShadowTLS 链接："

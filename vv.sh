@@ -63,15 +63,19 @@ install_node() {
     NODE_DIR="$APP_DIR/$NODE_NAME"
     mkdir -p "$NODE_DIR/data"
 
+    # 监听端口
     read -p "请输入监听端口 [1025-65535, 默认随机]: " input_port
     PORT=${input_port:-$(shuf -i 1025-65535 -n1)}
     check_port "$PORT" || return
 
+    # 随机 PSK
     PSK=$(tr -dc A-Za-z0-9 </dev/urandom | head -c32)
 
+    # IPv6 开关
     read -p "是否启用 IPv6 [true/false, 默认 false]: " ipv6
     IPv6=${ipv6:-false}
 
+    # 混淆
     read -p "混淆模式 [off/http, 默认 off]: " obfs
     OBFS=${obfs:-off}
     if [ "$OBFS" = "http" ]; then
@@ -81,29 +85,53 @@ install_node() {
         OBFS_HOST=""
     fi
 
+    # TCP Fast Open
     read -p "是否启用 TCP Fast Open [true/false, 默认 true]: " tfo
     TFO=${tfo:-true}
 
+    # ECN
     ECN=true
 
-    # 生成 docker-compose.yml (host 模式, 去掉 DNS)
-    cat > "$NODE_DIR/docker-compose.yml" <<EOF
-services:
-  ${NODE_NAME}:
-    image: 1byte/snell-server:latest
-    container_name: ${NODE_NAME}
-    restart: always
-    network_mode: host
-    environment:
-      PORT: "${PORT}"
-      PSK: "${PSK}"
-      IPv6: "${IPv6}"
-      OBFS: "${OBFS}"
-      OBFS_HOST: "${OBFS_HOST}"
-      TFO: "${TFO}"
-      ECN: "${ECN}"
+    # ========================
+    # 生成 snell-server.conf
+    # ========================
+    CONF_FILE="$NODE_DIR/snell-server.conf"
+    cat > "$CONF_FILE" <<EOF
+[snell-server]
+listen = 0.0.0.0:$PORT
+psk = $PSK
+tfo = $TFO
+ecn = $ECN
 EOF
 
+    # 条件写入 IPv6
+    if [[ "$IPv6" == "true" ]]; then
+        echo "listen = [::]:$PORT" >> "$CONF_FILE"
+    fi
+
+    # 条件写入 OBFS
+    if [[ "$OBFS" != "off" ]]; then
+        echo "obfs = $OBFS" >> "$CONF_FILE"
+        if [[ "$OBFS" == "http" && -n "$OBFS_HOST" ]]; then
+            echo "obfs-host = $OBFS_HOST" >> "$CONF_FILE"
+        fi
+    fi
+
+    # ========================
+    # 生成 docker-compose.yml
+    # ========================
+    cat > "$NODE_DIR/docker-compose.yml" <<EOF
+services:
+  $NODE_NAME:
+    image: 1byte/snell-server:latest
+    container_name: $NODE_NAME
+    restart: always
+    network_mode: host
+    volumes:
+      - ./snell-server.conf:/app/snell-server.conf:ro
+EOF
+
+    # 启动节点
     cd "$NODE_DIR" || return
     docker compose up -d
 
@@ -133,7 +161,14 @@ node_action_menu() {
             2) docker restart "$NODE_NAME" ;;
             3) docker compose -f "$NODE_DIR/docker-compose.yml" pull && docker compose -f "$NODE_DIR/docker-compose.yml" up -d ;;
             4) docker logs -f "$NODE_NAME" ;;
-            5) docker compose -f "$NODE_DIR/docker-compose.yml" down && rm -rf "$NODE_DIR" && return ;;
+            5)
+               echo -e "${YELLOW} 正在卸载节点 $NODE_NAME ...${RESET}"
+               cd "$APP_DIR" || cd /
+               docker compose -f "$NODE_DIR/docker-compose.yml" down
+               rm -rf "$NODE_DIR"
+               echo -e "${GREEN}✅ 节点 $NODE_NAME 已卸载${RESET}"
+               return
+               ;;
             0) return ;;
             *) echo -e "${RED}无效选择${RESET}" ;;
         esac
@@ -246,9 +281,14 @@ show_all_status() {
     for node in "$APP_DIR"/*; do
         [ -d "$node" ] || continue
         NODE_NAME=$(basename "$node")
+        CONF_FILE="$node/snell-server.conf"
 
-        # 从 environment 读取 PORT
-        PORT=$(grep 'PORT:' "$node/docker-compose.yml" | awk -F\" '{print $2}')
+        # 从配置文件读取第一个 listen 端口
+        if [ -f "$CONF_FILE" ]; then
+            PORT=$(grep -E '^listen\s*=' "$CONF_FILE" | head -n1 | awk -F: '{print $2}')
+        else
+            PORT="未知"
+        fi
 
         STATUS=$(docker ps --filter "name=$NODE_NAME" --format "{{.Status}}")
         [ -z "$STATUS" ] && STATUS="未启动"
@@ -257,6 +297,7 @@ show_all_status() {
     done
     read -r -p $'\033[32m按回车返回菜单...\033[0m'
 }
+
 menu() {
     while true; do
         clear

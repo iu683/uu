@@ -1,6 +1,7 @@
 #!/bin/bash
 # ========================================
-# MailAggregator_Pro 一键管理脚本（宿主机目录绑定数据）
+# Hysteria 一键管理脚本（Host Docker + 自签证书 + 端口跳跃 + 必应伪装）
+# 优化版：防重复规则 + 默认回车启用跳跃
 # ========================================
 
 GREEN="\033[32m"
@@ -8,16 +9,16 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="mail-tool"
-APP_DIR="/opt/$APP_NAME"
-DATA_DIR="$APP_DIR/data"
+APP_NAME="hysteria"
+APP_DIR="/root/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONTAINER_NAME="mail-tool"
-REPO_URL="https://github.com/gblaowang-i/MailAggregator_Pro.git"
+CONFIG_FILE="$APP_DIR/hysteria.yaml"
+CONTAINER_NAME="hysteria"
 
-random_string() {
-    tr -dc A-Za-z0-9 </dev/urandom | head -c 32
-}
+JUMP_START=""
+JUMP_END=""
+PORT=""
+MASQ_URL="https://bing.com"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -31,22 +32,251 @@ check_docker() {
 }
 
 check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
+    if ss -tuln | grep -q ":$1 "; then
         echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
         return 1
     fi
 }
 
+generate_cert() {
+    mkdir -p "$APP_DIR/cert"
+    CERT_FILE="$APP_DIR/cert/server.crt"
+    KEY_FILE="$APP_DIR/cert/server.key"
+    if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ]; then
+        echo -e "${YELLOW}正在生成自签证书（CN=bing.com）...${RESET}"
+        openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+            -keyout "$KEY_FILE" \
+            -out "$CERT_FILE" \
+            -subj "/CN=bing.com" \
+            -days 36500
+    fi
+}
+
+add_port_jump_rules() {
+
+    if [[ -z "$JUMP_START" || -z "$JUMP_END" ]]; then
+        return
+    fi
+
+    echo -e "${YELLOW}添加端口跳跃规则: $JUMP_START-$JUMP_END -> $PORT${RESET}"
+
+    # 获取本机主IP（不依赖外网）
+    SERVER_IP=$(hostname -I | awk '{print $1}')
+
+    if [[ -z "$SERVER_IP" ]]; then
+        echo -e "${RED}无法获取服务器IP，跳跃规则添加失败${RESET}"
+        return
+    fi
+
+    echo -e "${GREEN}服务器IP: $SERVER_IP${RESET}"
+
+    # 关闭 rp_filter（否则部分机器不转发）
+    sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1
+    sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1
+
+    # 删除旧规则（防止重复）
+    while iptables -t nat -C PREROUTING -p udp \
+        --dport $JUMP_START:$JUMP_END \
+        -j DNAT --to-destination ${SERVER_IP}:$PORT 2>/dev/null
+    do
+        iptables -t nat -D PREROUTING -p udp \
+            --dport $JUMP_START:$JUMP_END \
+            -j DNAT --to-destination ${SERVER_IP}:$PORT
+    done
+
+    # 添加新规则（插入到最前面，避免被抢）
+    iptables -t nat -I PREROUTING 1 -p udp \
+        --dport $JUMP_START:$JUMP_END \
+        -j DNAT --to-destination ${SERVER_IP}:$PORT
+
+    # 放行 FORWARD（部分系统必须）
+    iptables -C FORWARD -p udp --dport $PORT -j ACCEPT 2>/dev/null || \
+    iptables -I FORWARD -p udp --dport $PORT -j ACCEPT
+
+    echo -e "${GREEN}✅ 端口跳跃规则添加完成${RESET}"
+}
+remove_port_jump_rules() {
+
+    if [[ -z "$JUMP_START" || -z "$JUMP_END" ]]; then
+        return
+    fi
+
+    echo -e "${YELLOW}清理端口跳跃规则: $JUMP_START-$JUMP_END -> $PORT${RESET}"
+
+    SERVER_IP=$(hostname -I | awk '{print $1}')
+
+    while iptables -t nat -C PREROUTING -p udp \
+        --dport $JUMP_START:$JUMP_END \
+        -j DNAT --to-destination ${SERVER_IP}:$PORT 2>/dev/null
+    do
+        iptables -t nat -D PREROUTING -p udp \
+            --dport $JUMP_START:$JUMP_END \
+            -j DNAT --to-destination ${SERVER_IP}:$PORT
+    done
+
+    echo -e "${GREEN}✅ 跳跃规则已清理${RESET}"
+}
+
+install_app() {
+    check_docker
+    mkdir -p "$APP_DIR"
+
+    read -p "请输入监听端口 [1025-65535, 默认随机]: " input_port
+    if [[ -z "$input_port" ]]; then
+        PORT=$(shuf -i 1025-65535 -n1)
+    else
+        PORT=$input_port
+    fi
+    check_port "$PORT" || return
+
+    PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c16)
+
+    read -p "是否启用端口跳跃 [Y/n,回车默认Y]: " enable_jump
+    enable_jump=$(echo "$enable_jump" | tr -d ' ')
+    enable_jump=${enable_jump:-Y}
+
+    case "$enable_jump" in
+        Y|y)
+            while true; do
+                read -p "请输入端口范围起始端口 (10000-65535): " firstport
+                read -p "请输入端口范围末尾端口: " endport
+
+                if ! [[ "$firstport" =~ ^[0-9]+$ && "$endport" =~ ^[0-9]+$ ]]; then
+                    echo "端口必须为数字"
+                    continue
+                fi
+
+                if (( firstport < 10000 || firstport > 65535 || endport < 10000 || endport > 65535 )); then
+                    echo "端口必须在 10000-65535"
+                    continue
+                fi
+
+                if (( firstport >= endport )); then
+                    echo "起始端口必须小于结束端口"
+                    continue
+                fi
+
+                if (( PORT >= firstport && PORT <= endport )); then
+                    echo "跳跃范围不能包含监听端口 $PORT"
+                    continue
+                fi
+
+                JUMP_START=$firstport
+                JUMP_END=$endport
+                break
+            done
+            ;;
+        N|n)
+            echo "已关闭端口跳跃"
+            ;;
+        *)
+            echo "输入无效，默认启用"
+            ;;
+    esac
+
+    generate_cert
+    add_port_jump_rules
+
+    cat > "$CONFIG_FILE" <<EOF
+listen: :$PORT
+
+tls:
+  cert: /etc/hysteria/server.crt
+  key: /etc/hysteria/server.key
+
+auth:
+  type: password
+  password: $PASSWORD
+
+masquerade:
+  type: proxy
+  proxy:
+    url: $MASQ_URL
+    rewriteHost: true
+EOF
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  hysteria:
+    image: tobyxdd/hysteria
+    container_name: $CONTAINER_NAME
+    restart: always
+    network_mode: host
+    volumes:
+      - $APP_DIR/hysteria.yaml:/etc/hysteria.yaml
+      - $APP_DIR/cert/server.crt:/etc/hysteria/server.crt
+      - $APP_DIR/cert/server.key:/etc/hysteria/server.key
+    command: ["server", "-c", "/etc/hysteria.yaml"]
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    IP=$(hostname -I | awk '{print $1}')
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+
+    echo
+    echo -e "${GREEN}✅ Hysteria 已启动${RESET}"
+    echo -e "${YELLOW}🌐 服务端监听端口: ${PORT}${RESET}"
+    echo -e "${YELLOW}🔑 密码: ${PASSWORD}${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    if [[ -n "$JUMP_START" ]]; then
+        echo -e "${YELLOW}🟢 端口跳跃: $JUMP_START-$JUMP_END -> $PORT${RESET}"
+    else
+        echo -e "${YELLOW}🟢 端口跳跃: 未启用${RESET}"
+    fi
+    echo -e "${YELLOW}🟢 伪装网址: $MASQ_URL${RESET}"
+    echo -e "${YELLOW}📄 V6VPS替换IP地址为V6${RESET}"
+    echo -e "${YELLOW}📄 客户端配置模板:${RESET}"
+    echo -e "${YELLOW}V2rayN:${RESET}"
+    echo -e "${YELLOW} hysteria2://$PASSWORD@$IP:$PORT/?sni=bing.com&insecure=1#$HOSTNAME${RESET}"
+    echo -e "${YELLOW}Surge:${RESET}"
+    echo -e "${YELLOW}  $HOSTNAME = hysteria2, $IP, $PORT, password=$PASSWORD, skip-cert-verify=true, sni=www.bing.com${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+    docker restart $CONTAINER_NAME
+    echo -e "${GREEN}✅ 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    docker logs -f $CONTAINER_NAME
+}
+
+check_status() {
+    docker ps | grep $CONTAINER_NAME
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    remove_port_jump_rules
+    docker stop $CONTAINER_NAME 2>/dev/null
+    docker rm $CONTAINER_NAME 2>/dev/null
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ 已卸载${RESET}"
+    read -p "按回车返回菜单..."
+}
+
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== MailAggregator_Pro 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Hysteria 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载（保留数据）${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
@@ -58,112 +288,9 @@ menu() {
             5) check_status ;;
             6) uninstall_app ;;
             0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+            *) echo "无效选择"; sleep 1 ;;
         esac
     done
 }
 
-install_app() {
-    check_docker
-    mkdir -p "$APP_DIR"
-    mkdir -p "$DATA_DIR"
-
-    # 克隆或更新仓库
-    if [ -d "$APP_DIR/.git" ]; then
-        echo -e "${YELLOW}检测到已有仓库，执行 git pull 更新...${RESET}"
-        cd "$APP_DIR" || exit
-        git reset --hard
-        git pull
-    else
-        echo -e "${GREEN}克隆仓库到 $APP_DIR ...${RESET}"
-        git clone "$REPO_URL" "$APP_DIR"
-    fi
-
-    read -p "请输入访问端口 [默认:8000]: " input_port
-    PORT=${input_port:-8000}
-    check_port "$PORT" || return
-
-    read -p "请输入后台用户名 [默认:admin]: " username
-    ADMIN_USERNAME=${username:-admin}
-    read -s -p "请输入后台密码 [默认:123456]: " password
-    ADMIN_PASSWORD=${password:-123456}
-    echo
-
-    JWT_SECRET=$(random_string)
-    ENCRYPTION_KEY=$(random_string)
-
-    # 写 docker-compose.yml
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  app:
-    build: .
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${PORT}:8000"
-    environment:
-      - DATABASE_URL=sqlite+aiosqlite:///./data/mail_agg.db
-      - TZ=Asia/Shanghai
-      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
-      - ADMIN_USERNAME=${ADMIN_USERNAME}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
-      - JWT_SECRET=${JWT_SECRET}
-      - API_TOKEN=
-      - TELEGRAM_BOT_TOKEN=
-      - TELEGRAM_CHAT_ID=
-      - WEBHOOK_URL=
-    volumes:
-      - ${DATA_DIR}:/app/data
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-EOF
-
-    cd "$APP_DIR" || exit
-    docker compose up -d --build
-
-    echo
-    echo -e "${GREEN}✅ MailAggregator_Pro 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🔑 用户名: ${ADMIN_USERNAME}  密码: ${ADMIN_PASSWORD}${RESET}"
-    echo -e "${GREEN}📂 数据目录（持久化）: $DATA_DIR${RESET}"
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-update_app() {
-    cd "$APP_DIR" || return
-    git reset --hard
-    git pull
-    docker compose build
-    docker compose up -d
-    echo -e "${GREEN}✅ MailAggregator_Pro 更新完成（数据保留）${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-restart_app() {
-    docker restart ${CONTAINER_NAME}
-    echo -e "${GREEN}✅ MailAggregator_Pro 已重启${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f ${CONTAINER_NAME}
-}
-
-check_status() {
-    docker ps | grep ${CONTAINER_NAME}
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down
-    rm -rf "$APP_DIR"           # 删除安装目录和数据
-    echo -e "${RED}✅ MailAggregator_Pro 已卸载（包含数据）${RESET}"
-    read -p "按回车返回菜单..."
-}
 menu

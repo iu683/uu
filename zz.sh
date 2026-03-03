@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# MailAggregator_Pro 一键管理脚本（宿主机目录绑定数据）
+# Snell 一键管理脚本（Host 模式 + 去掉 DNS）
 # ========================================
 
 GREEN="\033[32m"
@@ -8,16 +8,10 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="mail-tool"
-APP_DIR="/opt/$APP_NAME"
-DATA_DIR="$APP_DIR/data"
+APP_NAME="snell-server"
+APP_DIR="/root/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONTAINER_NAME="mail-tool"
-REPO_URL="https://github.com/gblaowang-i/MailAggregator_Pro.git"
-
-random_string() {
-    tr -dc A-Za-z0-9 </dev/urandom | head -c 32
-}
+CONTAINER_NAME="snell-server"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -40,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== MailAggregator_Pro 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Snell 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -65,101 +59,112 @@ menu() {
 
 install_app() {
     check_docker
+    mkdir -p "$APP_DIR/data"
 
-    # 创建数据目录
-    mkdir -p "$DATA_DIR"
-    chmod 755 "$DATA_DIR"
-    chown $(id -u):$(id -g) "$DATA_DIR"
-
-    # 创建安装目录
-    mkdir -p "$APP_DIR"
-
-    if [ -d "$APP_DIR/.git" ]; then
-        echo -e "检测到已有仓库，执行 git pull 更新..."
-        cd "$APP_DIR" || exit
-        git reset --hard
-        git pull
-    elif [ -n "$(ls -A $APP_DIR)" ]; then
-        echo -e "目录 $APP_DIR 已存在但不是 Git 仓库，正在清空..."
-        rm -rf "$APP_DIR"/*
-        git clone "$REPO_URL" "$APP_DIR"
-    else
-        echo -e "克隆仓库到 $APP_DIR ..."
-        git clone "$REPO_URL" "$APP_DIR"
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:8000]: " input_port
-    PORT=${input_port:-8000}
+    # 监听端口
+    read -p "请输入监听端口 [1025-65535, 默认随机]: " input_port
+    PORT=${input_port:-$(shuf -i 1025-65535 -n1)}
     check_port "$PORT" || return
 
-    read -p "请输入后台用户名 [默认:admin]: " username
-    ADMIN_USERNAME=${username:-admin}
-    read -s -p "请输入后台密码 [默认:123456]: " password
-    ADMIN_PASSWORD=${password:-123456}
-    echo
+    # 随机 PSK
+    PSK=$(tr -dc A-Za-z0-9 </dev/urandom | head -c32)
 
-    JWT_SECRET=$(random_string)
-    ENCRYPTION_KEY=$(random_string)
+    # IPv6 开关
+    read -p "是否启用 IPv6 [true/false, 默认 false]: " ipv6
+    IPv6=${ipv6:-false}
 
-    # 确保 SQLite 数据库文件存在
-    DB_FILE="$DATA_DIR/mail_agg.db"
-    touch "$DB_FILE"
-    chmod 644 "$DB_FILE"
+    # 混淆
+    read -p "混淆模式 [off/http, 默认 off]: " obfs
+    OBFS=${obfs:-off}
+    if [ "$OBFS" = "http" ]; then
+        read -p "请输入混淆 Host [默认 itunes.apple.com]: " obfs_host
+        OBFS_HOST=${obfs_host:-itunes.apple.com}
+    else
+        OBFS_HOST=""
+    fi
 
-    # 写 docker-compose.yml
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  app:
-    build: .
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${PORT}:8000"
-    environment:
-      - DATABASE_URL=sqlite+aiosqlite:///${DB_FILE}
-      - TZ=Asia/Shanghai
-      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
-      - ADMIN_USERNAME=${ADMIN_USERNAME}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
-      - JWT_SECRET=${JWT_SECRET}
-      - API_TOKEN=
-      - TELEGRAM_BOT_TOKEN=
-      - TELEGRAM_CHAT_ID=
-      - WEBHOOK_URL=
-    volumes:
-      - ${DATA_DIR}:/app/data:rw
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    # TCP Fast Open
+    read -p "是否启用 TCP Fast Open [true/false, 默认 true]: " tfo
+    TFO=${tfo:-true}
+
+    # ECN
+    ECN=true
+
+    # ========================
+    # 生成 snell-server.conf
+    # ========================
+    CONF_FILE="$APP_DIR/snell-server.conf"
+    cat > "$CONF_FILE" <<EOF
+[snell-server]
+listen = 0.0.0.0:$PORT
+psk = $PSK
+tfo = $TFO
+ecn = $ECN
 EOF
 
-    cd "$APP_DIR" || exit
-    docker compose up -d --build
+    # 条件写入 IPv6
+    if [[ "$IPv6" == "true" ]]; then
+        echo "listen = [::]:$PORT" >> "$CONF_FILE"
+    fi
 
+    # 条件写入 OBFS
+    if [[ "$OBFS" != "off" ]]; then
+        echo "obfs = $OBFS" >> "$CONF_FILE"
+        if [[ "$OBFS" == "http" && -n "$OBFS_HOST" ]]; then
+            echo "obfs-host = $OBFS_HOST" >> "$CONF_FILE"
+        fi
+    fi
+
+    # ========================
+    # 生成 docker-compose.yml
+    # ========================
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  snell-server:
+    image: 1byte/snell-server:latest
+    container_name: ${CONTAINER_NAME}
+    restart: always
+    network_mode: host
+    volumes:
+      - ./snell-server.conf:/app/snell-server.conf:ro
+EOF
+
+    # 启动节点
+    cd "$APP_DIR" || return
+    docker compose up -d
+
+    # 输出客户端配置模板
+    IP=$(hostname -I | awk '{print $1}')
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
     echo
-    echo -e "${GREEN}✅ MailAggregator_Pro 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🔑 用户名: ${ADMIN_USERNAME}  密码: ${ADMIN_PASSWORD}${RESET}"
-    echo -e "${GREEN}📂 数据目录（持久化）: $DATA_DIR${RESET}"
     echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    echo -e "${GREEN}✅ Snell 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问端口: ${PORT}${RESET}"
+    echo -e "${YELLOW}🔑 PSK: ${PSK}${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    echo -e "${GREEN}📄 V6VPS替换IP地址为V6⭐${RESET}"
+    echo -e "${YELLOW}📄 客户端配置模板:${RESET}"
+    echo -e "${YELLOW} $HOSTNAME = snell, ${IP}, ${PORT}, psk=${PSK}, version=5, reuse=true, tfo=${TFO}, ecn=${ECN}${RESET} "
     read -p "按回车返回菜单..."
 }
 
 update_app() {
     cd "$APP_DIR" || return
-    git reset --hard
-    git pull
-    docker compose build
+    docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ MailAggregator_Pro 更新完成（数据保留）${RESET}"
+    echo -e "${GREEN}✅ Snell 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
     docker restart ${CONTAINER_NAME}
-    echo -e "${GREEN}✅ MailAggregator_Pro 已重启${RESET}"
+    echo -e "${GREEN}✅ Snell 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
@@ -175,9 +180,11 @@ check_status() {
 
 uninstall_app() {
     cd "$APP_DIR" || return
-    docker compose down
-    rm -rf "$APP_DIR"           # 删除安装目录和数据
-    echo -e "${RED}✅ MailAggregator_Pro 已卸载（包含数据）${RESET}"
+    docker stop ${CONTAINER_NAME}
+    docker rm ${CONTAINER_NAME}
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ Snell 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
+
 menu

@@ -63,15 +63,19 @@ install_node() {
     NODE_DIR="$APP_DIR/$NODE_NAME"
     mkdir -p "$NODE_DIR/data"
 
+    # 监听端口
     read -p "请输入监听端口 [1025-65535, 默认随机]: " input_port
     PORT=${input_port:-$(shuf -i 1025-65535 -n1)}
     check_port "$PORT" || return
 
+    # 随机 PSK
     PSK=$(tr -dc A-Za-z0-9 </dev/urandom | head -c32)
 
+    # IPv6 开关
     read -p "是否启用 IPv6 [true/false, 默认 false]: " ipv6
     IPv6=${ipv6:-false}
 
+    # 混淆
     read -p "混淆模式 [off/http, 默认 off]: " obfs
     OBFS=${obfs:-off}
     if [ "$OBFS" = "http" ]; then
@@ -81,29 +85,53 @@ install_node() {
         OBFS_HOST=""
     fi
 
+    # TCP Fast Open
     read -p "是否启用 TCP Fast Open [true/false, 默认 true]: " tfo
     TFO=${tfo:-true}
 
+    # ECN
     ECN=true
 
-    # 生成 docker-compose.yml (host 模式, 去掉 DNS)
-    cat > "$NODE_DIR/docker-compose.yml" <<EOF
-services:
-  ${NODE_NAME}:
-    image: 1byte/snell-server:latest
-    container_name: ${NODE_NAME}
-    restart: always
-    network_mode: host
-    environment:
-      PORT: "${PORT}"
-      PSK: "${PSK}"
-      IPv6: "${IPv6}"
-      OBFS: "${OBFS}"
-      OBFS_HOST: "${OBFS_HOST}"
-      TFO: "${TFO}"
-      ECN: "${ECN}"
+    # ========================
+    # 生成 snell-server.conf
+    # ========================
+    CONF_FILE="$NODE_DIR/snell-server.conf"
+    cat > "$CONF_FILE" <<EOF
+[snell-server]
+listen = 0.0.0.0:$PORT
+psk = $PSK
+tfo = $TFO
+ecn = $ECN
 EOF
 
+    # 条件写入 IPv6
+    if [[ "$IPv6" == "true" ]]; then
+        echo "listen = [::]:$PORT" >> "$CONF_FILE"
+    fi
+
+    # 条件写入 OBFS
+    if [[ "$OBFS" != "off" ]]; then
+        echo "obfs = $OBFS" >> "$CONF_FILE"
+        if [[ "$OBFS" == "http" && -n "$OBFS_HOST" ]]; then
+            echo "obfs-host = $OBFS_HOST" >> "$CONF_FILE"
+        fi
+    fi
+
+    # ========================
+    # 生成 docker-compose.yml
+    # ========================
+    cat > "$NODE_DIR/docker-compose.yml" <<EOF
+services:
+  $NODE_NAME:
+    image: 1byte/snell-server:latest
+    container_name: $NODE_NAME
+    restart: always
+    network_mode: host
+    volumes:
+      - ./snell-server.conf:/app/snell-server.conf:ro
+EOF
+
+    # 启动节点
     cd "$NODE_DIR" || return
     docker compose up -d
 
@@ -141,69 +169,6 @@ node_action_menu() {
 }
 
 batch_action() {
-    echo -e "${GREEN}=== 批量操作 ===${RESET}"
-    echo -e "${GREEN}1) 暂停节点${RESET}"
-    echo -e "${GREEN}2) 重启节点${RESET}"
-    echo -e "${GREEN}3) 更新节点${RESET}"
-    echo -e "${GREEN}4) 卸载节点${RESET}"
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
-    read -r -p $'\033[32m请选择操作: \033[0m' choice
-    
-    mkdir -p "$APP_DIR"
-
-    # 列出节点
-    declare -A NODE_MAP
-    local count=0
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        NODE_NAME=$(basename "$node")
-        NODE_MAP[$count]="$NODE_NAME"
-        echo -e "${YELLOW}[$count] $NODE_NAME${RESET}"
-    done
-    [ $count -eq 0 ] && { echo -e "${YELLOW}无节点${RESET}"; read -r -p $'\033[32m按回车返回菜单...\033[0m' ; return ; }
-
-    read -r -p $'\033[32m请输入要操作的节点序号（用空格分隔，或输入 all 全选）: \033[0m' input_nodes
-
-    # 处理输入
-    if [[ "$input_nodes" == "all" ]]; then
-        SELECTED_NODES=("${NODE_MAP[@]}")
-    else
-        SELECTED_NODES=()
-        for i in $input_nodes; do
-            NODE=${NODE_MAP[$i]}
-            if [ -n "$NODE" ]; then
-                SELECTED_NODES+=("$NODE")
-            else
-                echo -e "${YELLOW}⚠ 序号 $i 无效，已跳过${RESET}"
-            fi
-        done
-    fi
-
-    # 执行批量操作
-    for NODE_NAME in "${SELECTED_NODES[@]}"; do
-        NODE_DIR="$APP_DIR/$NODE_NAME"
-        if [ ! -d "$NODE_DIR" ] || [ ! -f "$NODE_DIR/docker-compose.yml" ]; then
-            echo -e "${YELLOW}⚠ 跳过节点 $NODE_NAME：目录或 docker-compose.yml 不存在${RESET}"
-            continue
-        fi
-        cd "$NODE_DIR" || continue
-
-        case $choice in
-            1) docker pause "$NODE_NAME" ;;
-            2) docker restart "$NODE_NAME" ;;
-            3) docker compose pull && docker compose up -d ;;
-            4) docker compose down && rm -rf "$NODE_DIR" ;;
-            0) return ;;
-            *) echo -e "${RED}无效选择${RESET}" ; return ;;
-        esac
-        echo -e "${GREEN}✅ 节点 $NODE_NAME 操作完成${RESET}"
-    done
-
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
-}
-
-show_all_status() {batch_action() {
     echo -e "${GREEN}=== 批量操作 ===${RESET}"
     echo -e "${GREEN}1) 暂停节点${RESET}"
     echo -e "${GREEN}2) 重启节点${RESET}"
@@ -303,6 +268,7 @@ show_all_status() {batch_action() {
 
     read -r -p $'\033[32m按回车返回菜单...\033[0m'
 }
+show_all_status() {
     list_nodes
     echo -e "${GREEN}=== 节点状态 ===${RESET}"
     for node in "$APP_DIR"/*; do

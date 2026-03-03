@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Snell + ShadowTLS 多节点管理脚本（Host 模式 + 彩色菜单 + 批量操作）
+# ShadowsocksRust+ShadowTLS 多节点管理（Host Docker）
 # ========================================
 
 GREEN="\033[32m"
@@ -8,9 +8,13 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="snelltls"
+APP_NAME="ShadowsocksRust+shadow-tls"
 APP_DIR="/opt/$APP_NAME"
+METHOD="2022-blake3-aes-256-gcm"
 
+# =========================
+# Docker 检测
+# =========================
 check_docker() {
     if ! command -v docker &>/dev/null; then
         echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
@@ -22,155 +26,208 @@ check_docker() {
     fi
 }
 
+# =========================
+# 端口检测
+# =========================
 check_port() {
-    if ss -tlnp | grep -q ":$1 " || ss -ulnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+    if ss -tuln | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用！${RESET}"
         return 1
     fi
 }
 
+# =========================
+# 列出节点
+# =========================
 list_nodes() {
     mkdir -p "$APP_DIR"
-    echo -e "${GREEN}=== 已有 Snell + ShadowTLS 节点 ===${RESET}"
     local count=0
     for node in "$APP_DIR"/*; do
         [ -d "$node" ] || continue
         count=$((count+1))
-        echo -e "${YELLOW}[$count] $(basename "$node")${RESET}"
+        echo -e "${GREEN}[$count] $(basename "$node")${RESET}"
     done
-    [ $count -eq 0 ] && echo -e "${YELLOW}无节点${RESET}"
+    [ $count -eq 0 ] && echo -e "${GREEN}无节点${RESET}"
 }
 
+# =========================
+# 选择节点
+# =========================
 select_node() {
-    list_nodes
-    read -r -p $'\033[32m请输入节点名称或编号: \033[0m' input
-    if [[ "$input" =~ ^[0-9]+$ ]]; then
-        NODE_NAME=$(ls -d "$APP_DIR"/* | sed -n "${input}p" | xargs basename)
-    else
-        NODE_NAME="$input"
-    fi
+    mkdir -p "$APP_DIR"
+    local nodes=()
+    local count=0
+
+    for node in "$APP_DIR"/*; do
+        [ -d "$node" ] || continue
+        nodes+=("$(basename "$node")")
+        count=$((count+1))
+        echo -e "${GREEN}[$count] ${nodes[-1]}${RESET}"
+    done
+
+    [ $count -eq 0 ] && { echo -e "${RED}无节点！${RESET}"; return 1; }
+
+    while true; do
+        read -r -p $'\033[32m请输入节点名称或编号:\033[0m ' input
+        if [[ "$input" =~ ^[0-9]+$ ]]; then
+            if (( input >= 1 && input <= count )); then
+                NODE_NAME="${nodes[$((input-1))]}"
+                break
+            else
+                echo -e "${RED}编号无效！请重新输入${RESET}"
+            fi
+        else
+            if [ -d "$APP_DIR/$input" ]; then
+                NODE_NAME="$input"
+                break
+            else
+                echo -e "${RED}节点不存在！请重新输入${RESET}"
+            fi
+        fi
+    done
+
     NODE_DIR="$APP_DIR/$NODE_NAME"
-    if [ ! -d "$NODE_DIR" ]; then
-        echo -e "${RED}节点不存在！${RESET}"
-        return 1
-    fi
 }
 
+# =========================
+# 安装新节点
+# =========================
 install_node() {
     check_docker
+    mkdir -p "$APP_DIR"
+
     read -p "请输入节点名称 [node$(date +%s)]: " NODE_NAME
     NODE_NAME=${NODE_NAME:-node$(date +%s)}
     NODE_DIR="$APP_DIR/$NODE_NAME"
-    mkdir -p "$NODE_DIR/snell-conf"
+    mkdir -p "$NODE_DIR"
 
-    # ===== Snell 架构 =====
-    echo -e "${GREEN}请选择 Snell 架构:${RESET}"
-    echo -e "1) amd64 (默认)"
-    echo -e "2) armv7l"
-    echo -e "3) 自定义 URL"
-    read -p "选择 [1/2/3, 默认 1]: " arch_choice
-    case $arch_choice in
-        2) SNELL_URL="https://dl.nssurge.com/snell/snell-server-v5.0.1-linux-armv7l.zip" ;;
-        3) read -p "请输入自定义 SNELL_URL: " custom_url
-           SNELL_URL="$custom_url" ;;
-        *) SNELL_URL="https://dl.nssurge.com/snell/snell-server-v5.0.1-linux-amd64.zip" ;;
-    esac
+    read -p "是否启用 IPv6 [true/false 默认 false]: " ipv6
+    IPv6=${ipv6:-false}
 
-    # ===== Snell 内部端口 =====
-    read -p "请输入 Snell 内部端口 [1025-65535, 默认随机]: " input_port
-    PORT=${input_port:-$(shuf -i 1025-65535 -n1)}
-    check_port "$PORT" || return
-
-    # ===== ShadowTLS 对外端口 =====
-    read -p "请输入 ShadowTLS 对外端口 [默认 8443]: " tls_input
-    TLS_PORT=${tls_input:-8443}
+    # ShadowTLS 对外端口
+    read -p "ShadowTLS 对外端口 [默认 8443]: " TLS_PORT
+    TLS_PORT=${TLS_PORT:-8443}
     check_port "$TLS_PORT" || return
 
-    # ===== PSK / ShadowTLS 密码 / TLS伪装 =====
-    read -p "请输入 Snell PSK（留空随机生成 32 位）: " input_psk
-    PSK=${input_psk:-$(tr -dc A-Za-z0-9 </dev/urandom | head -c32)}
-    TLS_PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c16)
-    read -p "请输入 TLS 伪装域名 [默认 captive.apple.com]: " tls_host
-    TLS_HOST=${tls_host:-captive.apple.com}
+    read -p "伪装域名 SNI [默认 captive.apple.com]: " TLS_HOST
+    TLS_HOST=${TLS_HOST:-captive.apple.com}
 
-    # ===== 可选配置 =====
-    read -p "是否启用 IPv6 [true/false, 默认 false]: " ipv6
-    IPv6=${ipv6:-false}
-    read -p "混淆模式 [off/http, 默认 off]: " obfs
-    OBFS=${obfs:-off}
-    [[ "$OBFS" == "http" ]] && read -p "请输入混淆 Host [默认 example.com]: " obfs_host && OBFS_HOST=${obfs_host:-example.com} || OBFS_HOST=""
-    read -p "是否启用 TCP Fast Open [true/false, 默认 true]: " tfo
-    TFO=${tfo:-true}
-    ECN=true
+    read -p "Shadowsocks 内部监听端口 [默认随机]: " input_ss_port
 
-    # ===== 生成 Snell 配置文件 =====
-if [[ "$IPv6" == "true" ]]; then
-    SNELL_LISTEN="[::]:$PORT"
-    LISTEN_ADDR="[::]:${TLS_PORT}"
-    SERVER_ADDR="[::1]:${PORT}"
-else
-    SNELL_LISTEN="0.0.0.0:$PORT"
-    LISTEN_ADDR="0.0.0.0:${TLS_PORT}"
-    SERVER_ADDR="127.0.0.1:${PORT}"
-fi
+    if [[ -z "$input_ss_port" ]]; then
+        SS_PORT=$(shuf -i 20000-60000 -n1)
+        echo "已生成随机端口: $SS_PORT"
+    else
+        SS_PORT=$input_ss_port
+    fi
 
-cat > "$NODE_DIR/snell-conf/snell.conf" <<EOF
-[snell-server]
-listen = $SNELL_LISTEN
-psk = $PSK
-ipv6 = $IPv6
-$( [[ "$OBFS" == "http" ]] && echo "obfs = http" && echo "obfs_host = $OBFS_HOST" )
+    SS_PASSWORD=$(openssl rand -base64 32)
+    TLS_PASSWORD=$(openssl rand -base64 16)
+
+    CONFIG_FILE="$NODE_DIR/config.json"
+    COMPOSE_FILE="$NODE_DIR/docker-compose.yml"
+
+    # ===== IPv6 / IPv4 地址逻辑 =====
+    if [[ "$IPv6" == "true" ]]; then
+        SS_BIND="::1"
+        LISTEN_ADDR="[::]:${TLS_PORT}"
+        SERVER_ADDR="[::1]:${SS_PORT}"
+    else
+        SS_BIND="127.0.0.1"
+        LISTEN_ADDR="0.0.0.0:${TLS_PORT}"
+        SERVER_ADDR="127.0.0.1:${SS_PORT}"
+    fi
+
+    # ================= SS 配置 =================
+    cat > "$CONFIG_FILE" <<EOF
+{
+    "server": "$SS_BIND",
+    "server_port": $SS_PORT,
+    "password": "$SS_PASSWORD",
+    "method": "$METHOD",
+    "mode": "tcp_and_udp",
+    "fast_open": true
+}
 EOF
 
-# ===== 生成 Docker Compose 文件 =====
-cat > "$NODE_DIR/docker-compose.yml" <<EOF
+    # ================= Docker Compose =================
+    cat > "$COMPOSE_FILE" <<EOF
 services:
-  snell:
-    image: accors/snell:latest
-    container_name: snell-$NODE_NAME
-    restart: always
+  ss:
+    image: ghcr.io/shadowsocks/ssserver-rust:latest
+    container_name: $NODE_NAME-shadowsocks
+    restart: unless-stopped
     network_mode: host
-    environment:
-      - SNELL_URL=${SNELL_URL}
+    command: ssserver -c /etc/shadowsocks/config.json
     volumes:
-      - ./snell-conf/snell.conf:/etc/snell-server.conf
+      - ./config.json:/etc/shadowsocks/config.json:ro
 
   shadow-tls:
     image: ghcr.io/ihciah/shadow-tls:latest
-    container_name: shadow-tls-$NODE_NAME
+    container_name: $NODE_NAME-shadow-tls
     restart: unless-stopped
     network_mode: host
     environment:
-      MODE: server
-      V3: 1
-      LISTEN: "${LISTEN_ADDR}"
-      SERVER: "${SERVER_ADDR}"
-      TLS: "${TLS_HOST}:443"
-      PASSWORD: "${TLS_PASSWORD}"
+      - MODE=server
+      - V3=1
+      - LISTEN=${LISTEN_ADDR}
+      - SERVER=${SERVER_ADDR}
+      - TLS=${TLS_HOST}:443
+      - PASSWORD=${TLS_PASSWORD}
 EOF
+
     cd "$NODE_DIR" || exit
+    docker compose down 2>/dev/null
     docker compose up -d
 
-
-    IP=$(hostname -I | awk '{print $1}')
-    echo -e "${GREEN}✅ 节点 ${NODE_NAME} 已启动${RESET}"
-    echo -e "${YELLOW}🌐 公网IP: ${IP}${RESET}"
-    echo -e "${YELLOW}🌐 ShadowTLS端口: ${TLS_PORT}${RESET}"
-    echo -e "${YELLOW}🔑 Snell PSK: ${PSK}${RESET}"
-    echo -e "${YELLOW}🔑 ShadowTLS 密码: ${TLS_PASSWORD}${RESET}"
+    IP4=$(hostname -I | awk '{print $1}')
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
     echo -e "${GREEN}📂 安装目录: $NODE_DIR${RESET}"
-    echo -e "${YELLOW}📄 V6VPS替换IP地址为V6⭐${RESET}"
-    echo -e "${GREEN}====== 客户端配置示例 ======${RESET}"
-    echo -e "${YELLOW}ShadowTLS:${RESET}"
-    echo -e "${YELLOW}地址: ${IP}${RESET}"
-    echo -e "${YELLOW}端口: ${TLS_PORT}${RESET}"
-    echo -e "${YELLOW}密码: ${TLS_PASSWORD}${RESET}"
-    echo -e "${YELLOW}SNI: ${TLS_HOST}${RESET}"
-    echo -e "${YELLOW}Snell:${RESET}${RESET}"
-    echo -e "${YELLOW}${NODE_NAME} = snell, ${IP}, ${TLS_PORT}, psk=${PSK}, version=5, tfo=${TFO}, ecn=${ECN}, shadow-tls-password=${TLS_PASSWORD}, shadow-tls-sni=${TLS_HOST}, shadow-tls-version=3${RESET}"
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
+    echo -e "${GREEN}✅ 节点 $NODE_NAME 已部署${RESET}"
+    echo "ShadowTLS 对外端口: $TLS_PORT"
+    echo "Shadowsocks 内部端口: $SS_PORT"
+    echo "SNI: $TLS_HOST"
+    echo "SS密码: $SS_PASSWORD"
+    echo "TLS密码: $TLS_PASSWORD"
+    # ===== 生成 SS + ShadowTLS v3 链接 =====
+
+    # 获取服务器IP（优先 IPv4）
+    IP4=$(hostname -I | awk '{print $1}')
+
+    # 1️⃣ 生成 SS 主体 base64
+    SS_BASE=$(echo -n "${METHOD}:${SS_PASSWORD}" | base64 -w 0)
+
+    # 2️⃣ 生成 shadow-tls JSON
+    read -r -d '' SHADOWTLS_JSON <<EOF
+    {
+      "version":"3",
+      "password":"${TLS_PASSWORD}",
+      "host":"${TLS_HOST}",
+      "port":"${SS_PORT}",
+      "address":"${IP4}"
+    }
+    EOF
+
+ 
+    # 3️⃣ JSON 再 base64
+    SHADOWTLS_BASE=$(echo -n "$SHADOWTLS_JSON" | base64 -w 0)
+
+    # 4️⃣ 组合最终链接
+    SS_LINK="ss://${SS_BASE}@${IP4}:${TLS_PORT}?shadow-tls=${SHADOWTLS_BASE}#SS-${IP4}"
+
+    echo
+    echo "SS + ShadowTLS 链接："
+    echo "----------------------------------"
+    echo -e "${YELLOW}${SS_LINK}${RESET}"
+    echo "----------------------------------"
+    echo "Surge配置:"
+    echo -e "${YELLOW}$NODE_NAME = ss, $IP4, $TLS_PORT, encrypt-method=$METHOD, password=$SS_PASSWORD, shadow-tls-password=$TLS_PASSWORD, shadow-tls-sni=$TLS_HOST, shadow-tls-version=3, tfo=true, udp-relay=true, ecn=true ${RESET}"
+    read -p "按回车返回菜单..."
 }
 
+# =========================
+# 单节点管理
+# =========================
 node_action_menu() {
     select_node || return
     while true; do
@@ -180,102 +237,148 @@ node_action_menu() {
         echo -e "${GREEN}3) 更新${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 卸载${RESET}"
-        echo -e "${GREEN}0) 返回主菜单${RESET}"
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
+        echo -e "${GREEN}0) 返回${RESET}"
+        read -r -p $'\033[32m请选择操作:\033[0m ' choice
         case $choice in
-            1) docker pause snell-$NODE_NAME shadow-tls-$NODE_NAME ;;
-            2) docker restart snell-$NODE_NAME shadow-tls-$NODE_NAME ;;
-            3) docker compose -f "$NODE_DIR/docker-compose.yml" pull && docker compose -f "$NODE_DIR/docker-compose.yml" up -d ;;
-            4) docker compose -f "$NODE_DIR/docker-compose.yml" logs -f ;;
-            5) docker compose -f "$NODE_DIR/docker-compose.yml" down && rm -rf "$NODE_DIR" && return ;;
+            1) docker pause "$NODE_NAME-ss" "$NODE_NAME-tls" ;;
+            2) docker restart "$NODE_NAME-ss" "$NODE_NAME-tls" ;;
+            3) cd "$NODE_DIR" && docker compose pull && docker compose up -d ;;
+            4) docker logs -f "$NODE_NAME-ss" ;;
+            5) cd "$NODE_DIR" && docker compose down && rm -rf "$NODE_DIR"; return ;;
             0) return ;;
             *) echo -e "${RED}无效选择${RESET}" ;;
         esac
     done
 }
 
+# =========================
+# 批量操作
+# =========================
 batch_action() {
-    echo -e "${GREEN}=== 批量操作节点 ===${RESET}"
-    echo -e "${GREEN}1) 暂停节点${RESET}"
-    echo -e "${GREEN}2) 重启节点${RESET}"
-    echo -e "${GREEN}3) 更新节点${RESET}"
-    echo -e "${GREEN}4) 卸载节点${RESET}"
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
-    read -r -p $'\033[32m请选择操作: \033[0m' choice
+    echo -e "${GREEN}=== 批量操作 ===${RESET}"
+    echo -e "${GREEN}1) 批量暂停${RESET}"
+    echo -e "${GREEN}2) 批量重启${RESET}"
+    echo -e "${GREEN}3) 批量更新${RESET}"
+    echo -e "${GREEN}4) 批量卸载${RESET}"
+    echo -e "${GREEN}0) 返回${RESET}"
 
-    mkdir -p "$APP_DIR"
+    read -r -p $'\033[32m请选择操作:\033[0m ' choice
+
+    # ===== 合法性检查 =====
+    case "$choice" in
+        1|2|3|4) ;;
+        0) return ;;
+        *)
+            echo -e "${RED}无效选择${RESET}"
+            sleep 1
+            return
+            ;;
+    esac
+
     declare -A NODE_MAP
     local count=0
+
     for node in "$APP_DIR"/*; do
         [ -d "$node" ] || continue
         count=$((count+1))
-        NODE_NAME=$(basename "$node")
-        NODE_MAP[$count]="$NODE_NAME"
-        echo -e "${YELLOW}[$count] $NODE_NAME${RESET}"
+        NODE_MAP[$count]=$(basename "$node")
+        echo -e "${GREEN}[$count] ${NODE_MAP[$count]}${RESET}"
     done
-    [ $count -eq 0 ] && { echo -e "${YELLOW}无节点${RESET}"; read -r -p $'\033[32m按回车返回菜单...\033[0m'; return; }
 
-    read -r -p $'\033[32m请输入要操作的节点序号（空格分隔，或输入 all 全选）: \033[0m' input_nodes
-    if [[ "$input_nodes" == "all" ]]; then
-        SELECTED_NODES=("${NODE_MAP[@]}")
+    if [ $count -eq 0 ]; then
+        echo -e "${YELLOW}无节点${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    fi
+
+    read -r -p $'\033[32m输入序号(空格)或 all:\033[0m ' input
+
+    if [ -z "$input" ]; then
+        echo -e "${YELLOW}未选择节点${RESET}"
+        sleep 1
+        return
+    fi
+
+    if [[ "$input" == "all" ]]; then
+        SELECTED=("${NODE_MAP[@]}")
     else
-        SELECTED_NODES=()
-        for i in $input_nodes; do
-            NODE=${NODE_MAP[$i]}
-            [ -n "$NODE" ] && SELECTED_NODES+=("$NODE") || echo -e "${YELLOW}⚠ 序号 $i 无效，已跳过${RESET}"
+        SELECTED=()
+        for i in $input; do
+            [ -n "${NODE_MAP[$i]}" ] && SELECTED+=("${NODE_MAP[$i]}")
         done
     fi
 
-    for NODE_NAME in "${SELECTED_NODES[@]}"; do
+    [ ${#SELECTED[@]} -eq 0 ] && {
+        echo -e "${YELLOW}没有有效节点${RESET}"
+        sleep 1
+        return
+    }
+
+    # ===== 执行批量操作 =====
+    for NODE_NAME in "${SELECTED[@]}"; do
         NODE_DIR="$APP_DIR/$NODE_NAME"
-        [ ! -d "$NODE_DIR" ] || [ ! -f "$NODE_DIR/docker-compose.yml" ] && { echo -e "${YELLOW}⚠ 跳过节点 $NODE_NAME：目录或 docker-compose.yml 不存在${RESET}"; continue; }
+
+        [ -d "$NODE_DIR" ] || continue
         cd "$NODE_DIR" || continue
-        case $choice in
-            1) docker pause snell-$NODE_NAME shadow-tls-$NODE_NAME ;;
-            2) docker restart snell-$NODE_NAME shadow-tls-$NODE_NAME ;;
-            3) docker compose pull && docker compose up -d ;;
-            4) docker compose down && rm -rf "$NODE_DIR" ;;
-            0) return ;;
-            *) echo -e "${RED}无效选择${RESET}" ; return ;;
+
+        case "$choice" in
+            1)
+                docker stop "$NODE_NAME-ss" "$NODE_NAME-tls" 2>/dev/null
+                ;;
+            2)
+                docker restart "$NODE_NAME-ss" "$NODE_NAME-tls" 2>/dev/null
+                ;;
+            3)
+                docker compose pull
+                docker compose up -d
+                ;;
+            4)
+                docker compose down
+                rm -rf "$NODE_DIR"
+                ;;
         esac
-        echo -e "${GREEN}✅ 节点 $NODE_NAME 操作完成${RESET}"
+
+        echo -e "${GREEN}已操作 $NODE_NAME${RESET}"
     done
 
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
+    read -p "按回车返回菜单..."
 }
-
+# =========================
+# 查看所有节点状态
+# =========================
 show_all_status() {
-    list_nodes
-    echo -e "${GREEN}=== 节点状态 ===${RESET}"
+    echo -e "${GREEN}=== 所有节点状态 ===${RESET}"
     for node in "$APP_DIR"/*; do
         [ -d "$node" ] || continue
         NODE_NAME=$(basename "$node")
-        PORT=$(grep 'listen' "$node/snell-conf/snell.conf" | awk -F: '{print $2}' | tr -d ' ')
-        TLS_PORT=$(grep 'LISTEN:' "$node/docker-compose.yml" | head -n1 | sed -E 's/.*:([0-9]+).*/\1/')
-        STATUS=$(docker ps --filter "name=snell-$NODE_NAME" --format "{{.Status}}")
+        TLS_PORT=$(grep 'LISTEN=' "$node/docker-compose.yml" | cut -d: -f2 | tr -d '"')
+        STATUS=$(docker inspect -f '{{.State.Status}}' "$NODE_NAME-ss" 2>/dev/null)
         [ -z "$STATUS" ] && STATUS="未启动"
-        echo -e "${GREEN}$NODE_NAME${RESET} | ${YELLOW}Snell端口: ${PORT}${RESET} | ${YELLOW}ShadowTLS端口: ${TLS_PORT}${RESET} | ${YELLOW}状态: ${STATUS}${RESET}"
+        echo -e "${GREEN}$NODE_NAME | ${TLS_PORT:-未知端口} | $STATUS${RESET}"
     done
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
+    read -p "按回车返回菜单..."
 }
 
+# =========================
+# 主菜单
+# =========================
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Snell + ShadowTLS 多节点管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== ShadowsocksRust+ShadowTLS 多节点管理 ===${RESET}"
         echo -e "${GREEN}1) 安装新节点${RESET}"
-        echo -e "${GREEN}2) 管理已有节点${RESET}"
-        echo -e "${GREEN}3) 批量操作节点${RESET}"
-        echo -e "${GREEN}4) 查看所有节点状态${RESET}"
+        echo -e "${GREEN}2) 单节点管理${RESET}"
+        echo -e "${GREEN}3) 查看所有节点状态${RESET}"
+        echo -e "${GREEN}4) 批量操作${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
+        read -r -p $'\033[32m请选择:\033[0m ' choice
         case $choice in
             1) install_node ;;
             2) node_action_menu ;;
-            3) batch_action ;;
-            4) show_all_status ;;
+            3) show_all_status ;;
+            4) batch_action ;;
             0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
         esac
     done
 }

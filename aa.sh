@@ -1,291 +1,470 @@
 #!/bin/bash
 # ========================================
-# Snell + ShadowTLS 多节点管理脚本（Host 模式 + 彩色菜单 + 批量操作）
+# 代理协议一键菜单（一级+二级分类版）
+# 二级菜单 0 返回 | x 退出 | 自动补零 | 循环菜单
 # ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
+BLUE="\033[34m"
 RESET="\033[0m"
+BOLD="\033[1m"
+ORANGE='\033[38;5;208m'
 
-APP_NAME="SnellShadowTLS"
-APP_DIR="/opt/$APP_NAME"
+SCRIPT_PATH="/root/proxy.sh"
+SCRIPT_URL=" https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
+BIN_LINK_DIR="/usr/local/bin"
 
-# ===== Docker 检测 =====
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
-}
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}请使用 root 权限运行！${RESET}"
+    exit 1
+fi
 
-# ===== 检查端口，循环直到可用 =====
-check_port_loop() {
-    local port=$1
-    while true; do
-        if ss -tlnp 2>/dev/null | grep -q ":$port\b"; then
-            echo -e "${RED}端口 $port 已被占用，请重新输入！${RESET}"
-            read -p "请输入新的端口: " port
-        else
-            echo $port
-            return
-        fi
-    done
-}
+# =============================
+# 首次运行自动安装
+# =============================
+if [ ! -f "$SCRIPT_PATH" ]; then
+    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
+    chmod +x "$SCRIPT_PATH"
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/f"
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/F"
+    echo -e "${GREEN}✅ 安装完成，输入 f 或 F 启动${RESET}"
+fi
 
-# ===== 列出节点 =====
-list_nodes() {
-    mkdir -p "$APP_DIR"
-    echo -e "${GREEN}=== 已有节点 ===${RESET}"
-    local count=0
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        echo -e "${YELLOW}[$count] $(basename "$node")${RESET}"
-    done
-    [ $count -eq 0 ] && echo -e "${YELLOW}无节点${RESET}"
-}
-
-# ===== 选择节点 =====
-select_node() {
-    list_nodes
-    read -r -p $'\033[32m请输入节点名称或编号: \033[0m' input
-    if [[ "$input" =~ ^[0-9]+$ ]]; then
-        NODE_NAME=$(ls -d "$APP_DIR"/* | sed -n "${input}p" | xargs basename)
+# =============================
+# 自动补零
+# =============================
+format_choice() {
+    if [[ "$1" =~ ^[0-9]+$ ]]; then
+        printf "%02d" "$1"
     else
-        NODE_NAME="$input"
-    fi
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-    if [ ! -d "$NODE_DIR" ]; then
-        echo -e "${RED}节点不存在！${RESET}"
-        return 1
+        echo "$1"
     fi
 }
+# =============================
+# 通用菜单读取（一级用）
+# =============================
+read_mainmenu() {
+    echo -ne "${RED}请选择: ${RESET}"
+    read choice
 
-# ===== 安装新节点 =====
-install_node() {
-    check_docker
-    read -p "请输入节点名称 [node$(date +%s)]: " NODE_NAME
-    NODE_NAME=${NODE_NAME:-node$(date +%s)}
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-    mkdir -p "$NODE_DIR"
+    choice=$(echo "$choice" | xargs)
 
-    # ===== Snell 内部端口 =====
-    read -p "请输入 Snell 内部端口 [20000-40000, 默认随机]: " input_port
-    input_port=${input_port:-$(shuf -i 20000-40000 -n1)}
-    PORT=$(check_port_loop "$input_port")
+    [[ "$choice" =~ ^[xX]$ ]] && exit 0
+    [[ "$choice" == "0" || "$choice" == "00" ]] && exit 0
 
-    # ===== ShadowTLS 对外端口 =====
-    read -p "请输入 ShadowTLS 对外端口 [默认 8443]: " tls_input
-    tls_input=${tls_input:-8443}
-    TLS_PORT=$(check_port_loop "$tls_input")
-
-    # ===== IPv6 开关 =====
-    read -p "是否启用 IPv6 [true/false, 默认 false]: " ipv6
-    IPv6=${ipv6:-false}
-
-    # ===== 密钥 =====
-    read -s -p "请输入 Snell PSK（留空自动生成）: " input_psk; echo
-    PSK=${input_psk:-$(tr -dc A-Za-z0-9 </dev/urandom | head -c32)}
-
-    read -s -p "请输入 ShadowTLS 密码（留空自动生成）: " input_tls; echo
-    TLS_PASSWORD=${input_tls:-$(tr -dc A-Za-z0-9 </dev/urandom | head -c16)}
-
-    read -p "请输入 TLS 伪装域名 [默认 captive.apple.com]: " tls_host
-    TLS_HOST=${tls_host:-captive.apple.com}
-
-    # ===== Snell 配置 =====
-    CONF_FILE="$NODE_DIR/snell-server.conf"
-    cat > "$CONF_FILE" <<EOF
-[snell-server]
-listen = 0.0.0.0:$PORT
-psk = $PSK
-tfo = true
-ecn = true
-EOF
-
-    [[ "$IPv6" == "true" ]] && echo "listen = [::]:$PORT" >> "$CONF_FILE"
-
-    # ===== ShadowTLS 地址 =====
-    if [[ "$IPv6" == "true" ]]; then
-        SERVER_ADDR="[::1]:${PORT}"
-        TLS_LISTEN="[::]:${TLS_PORT}"
-    else
-        SERVER_ADDR="127.0.0.1:${PORT}"
-        TLS_LISTEN="0.0.0.0:${TLS_PORT}"
-    fi
-
-    # ===== Docker Compose =====
-    COMPOSE_FILE="$NODE_DIR/docker-compose.yml"
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  snell:
-    image: 1byte/snell-server:latest
-    container_name: snell-$NODE_NAME
-    restart: always
-    network_mode: host
-    volumes:
-      - ./snell-server.conf:/app/snell-server.conf:ro
-
-  shadow-tls:
-    image: ghcr.io/ihciah/shadow-tls:latest
-    container_name: shadow-tls-$NODE_NAME
-    restart: unless-stopped
-    network_mode: host
-    environment:
-      MODE: "server"
-      V3: "1"
-      LISTEN: "${TLS_LISTEN}"
-      SERVER: "${SERVER_ADDR}"
-      TLS: "${TLS_HOST}:443"
-      PASSWORD: "${TLS_PASSWORD}"
-EOF
-
-    # ===== 启动 =====
-    cd "$NODE_DIR" || return
-    docker compose up -d
-
-    # ===== 输出客户端配置 =====
-    IP=$(hostname -I | awk '{print $1}')
-    HOSTNAME=$(hostname -s | sed 's/ /_/g')
-    echo
-    echo -e "${GREEN}📂 安装目录: $NODE_DIR${RESET}"
-    echo -e "${GREEN}✅ Snell + ShadowTLS 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Snell 内部端口: $PORT${RESET}"
-    echo -e "${YELLOW}🌐 ShadowTLS 对外端口: $TLS_PORT${RESET}"
-    echo -e "${YELLOW}🔑 Snell PSK: $PSK${RESET}"
-    echo -e "${YELLOW}🔑 ShadowTLS 密码: $TLS_PASSWORD${RESET}"
-    echo -e "${YELLOW}🌐 SNI: $TLS_HOST${RESET}"
-    echo
-    echo -e "${GREEN}📄 V6VPS替换IP地址为V6⭐${RESET}"
-    echo -e "${YELLOW}📄 客户端配置模板:${RESET}"
-    echo -e "${YELLOW}$NODE_NAME = snell, ${IP}, ${TLS_PORT}, psk = ${PSK}, version = 5, reuse = true, tfo = true, shadow-tls-password = ${TLS_PASSWORD}, shadow-tls-sni = ${TLS_HOST}, shadow-tls-version = 3${RESET}"
-    read -p "按回车返回菜单..."
+    choice=$(format_choice "$choice")
 }
 
-# ===== 节点操作菜单 =====
-node_action_menu() {
-    select_node || return
-    while true; do
-        echo -e "${GREEN}=== 节点 [$NODE_NAME] 管理 ===${RESET}"
-        echo -e "${GREEN}1) 暂停${RESET}"
-        echo -e "${GREEN}2) 重启${RESET}"
-        echo -e "${GREEN}3) 更新${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 卸载${RESET}"
-        echo -e "${GREEN}0) 返回主菜单${RESET}"
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
-        case $choice in
-            1) docker pause snell-$NODE_NAME shadow-tls-$NODE_NAME ;;
-            2) docker restart snell-$NODE_NAME shadow-tls-$NODE_NAME ;;
-            3) docker compose -f "$NODE_DIR/docker-compose.yml" pull && docker compose -f "$NODE_DIR/docker-compose.yml" up -d ;;
-            4) docker compose -f "$NODE_DIR/docker-compose.yml" logs -f ;;
-            5) docker compose -f "$NODE_DIR/docker-compose.yml" down && rm -rf "$NODE_DIR" && return ;;
-            0) return ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-    done
+# =============================
+# 通用二级菜单读取逻辑
+# =============================
+read_submenu() {
+    echo -ne "${RED}选择: ${RESET}"
+    read sub
+
+    sub=$(echo "$sub" | xargs)
+
+    [[ "$sub" =~ ^[xX]$ ]] && exit 0
+    [[ "$sub" == "0" || "$sub" == "00" ]] && return 1
+
+    sub=$(format_choice "$sub")
+    return 0
 }
 
-# ===== 批量操作 =====
-batch_action() {
-    echo -e "${GREEN}=== 批量操作节点 ===${RESET}"
-    echo -e "${GREEN}1) 暂停节点${RESET}"
-    echo -e "${GREEN}2) 重启节点${RESET}"
-    echo -e "${GREEN}3) 更新节点${RESET}"
-    echo -e "${GREEN}4) 卸载节点${RESET}"
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
+pause_return() {
+    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+}
+# =============================
+# 一级菜单
+# =============================
+main_menu() {
+    clear
+    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
+    echo -e "${ORANGE}      代理工具箱        ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
+    echo -e "${YELLOW}[01] 单协议安装类${RESET}"
+    echo -e "${YELLOW}[02] 多协议安装类${RESET}"
+    echo -e "${YELLOW}[03] 面板管理类${RESET}"
+    echo -e "${YELLOW}[04] 转发管理类${RESET}"
+    echo -e "${YELLOW}[05] 组网管理类${RESET}"
+    echo -e "${YELLOW}[06] 网络优化类${RESET}"
+    echo -e "${YELLOW}[07] DNS 解锁类${RESET}"
+    echo -e "${YELLOW}[08] Docker单协议类${RESET}"
+    echo -e "${YELLOW}[09] Docker多协议类${RESET}"
+    echo -e "${GREEN}[88] 更新脚本${RESET}"
+    echo -e "${GREEN}[99] 卸载脚本${RESET}"
+    echo -e "${YELLOW}[00] 退出${RESET}"
 
-    read -r -p $'\033[32m请选择操作: \033[0m' choice
-    [[ "$choice" == 0 ]] && return
+    read_mainmenu
 
-    mkdir -p "$APP_DIR"
-    declare -A NODE_MAP
-    local count=0
-
-    # ===== 列出节点 =====
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        NODE_NAME=$(basename "$node")
-        NODE_MAP[$count]="$NODE_NAME"
-        echo -e "${YELLOW}[$count] $NODE_NAME${RESET}"
-    done
-
-    if [ $count -eq 0 ]; then
-        echo -e "${YELLOW}无节点${RESET}"
-        read -p "按回车返回菜单..."
-        return
-    fi
-
-    # ===== 选择节点 =====
-    read -r -p $'\033[32m请输入节点序号（空格分隔，或 all 全选）: \033[0m' input_nodes
-    if [[ "$input_nodes" == "all" ]]; then
-        SELECTED_NODES=("${NODE_MAP[@]}")
-    else
-        SELECTED_NODES=()
-        for i in $input_nodes; do
-            NODE=${NODE_MAP[$i]}
-            [ -n "$NODE" ] && SELECTED_NODES+=("$NODE")
-        done
-    fi
-
-    # ===== 执行操作 =====
-    for NODE_NAME in "${SELECTED_NODES[@]}"; do
-        NODE_DIR="$APP_DIR/$NODE_NAME"
-        [ ! -f "$NODE_DIR/docker-compose.yml" ] && continue
-        cd "$NODE_DIR" || continue
-        case "$choice" in
-            1) docker pause snell-$NODE_NAME 2>/dev/null && docker pause shadow-tls-$NODE_NAME 2>/dev/null ;;
-            2) docker restart snell-$NODE_NAME 2>/dev/null && docker restart shadow-tls-$NODE_NAME 2>/dev/null ;;
-            3) docker compose pull && docker compose up -d ;;
-            4) docker compose down && rm -rf "$NODE_DIR" ;;
-        esac
-        echo -e "${GREEN}✅ 节点 $NODE_NAME 操作完成${RESET}"
-    done
-    read -p "按回车返回菜单..."
+    case "$choice" in
+        01) protocol_menu ;;
+        02) protocols_menu ;;
+        03) panel_menu ;;
+        04) zfpanel_menu ;;
+        05) zwpanel_menu ;;
+        06) network_menu ;;
+        07) dns_menu ;;
+        08) docker_menu ;;
+        09) dockers_menu ;;
+        88) update_script ; pause_return ;;
+        99) uninstall_script ;;
+        00) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+    esac
 }
 
-# ===== 查看所有节点状态 =====
-show_all_status() {
-    list_nodes
-    echo -e "${GREEN}=== 节点状态 ===${RESET}"
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        NODE_NAME=$(basename "$node")
-        PORT=$(grep 'listen' "$node/snell-server.conf" | grep -oE '[0-9]{4,5}' | head -n1)
-        TLS_PORT=$(grep 'LISTEN:' "$node/docker-compose.yml" | head -n1 | awk -F: '{print $NF}' | tr -d '"')
-        STATUS=$(docker ps --filter "name=snell-$NODE_NAME" --format "{{.Status}}")
-        [ -z "$STATUS" ] && STATUS="未启动"
-        echo -e "${GREEN}$NODE_NAME${RESET} | ${YELLOW}Snell端口: ${PORT}${RESET} | ${YELLOW}ShadowTLS端口: ${TLS_PORT}${RESET} | ${YELLOW}状态: ${STATUS}${RESET}"
-    done
-    read -p "按回车返回菜单..."
+# =============================
+# 单协议类
+# =============================
+protocol_menu() {
+while true; do
+    clear
+    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
+    echo -e "${ORANGE}      单协议安装类        ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
+    echo -e "${YELLOW}[01] Shadowsocks${RESET}"
+    echo -e "${YELLOW}[02] Reality${RESET}"
+    echo -e "${YELLOW}[03] Snell${RESET}"
+    echo -e "${YELLOW}[04] Anytls${RESET}"
+    echo -e "${YELLOW}[05] Hysteria2${RESET}"
+    echo -e "${YELLOW}[06] Tuicv5${RESET}"
+    echo -e "${YELLOW}[07] MTProto${RESET}"
+    echo -e "${YELLOW}[08] Socks5${RESET}"
+    echo -e "${GREEN}[0]  返回${RESET}"
+    echo -e "${GREEN}[x]  退出${RESET}"
+
+    read_submenu || return
+
+    case "$sub" in
+        01) wget -O ss-rust.sh https://raw.githubusercontent.com/xOS/Shadowsocks-Rust/master/ss-rust.sh && bash ss-rust.sh ; pause_return ;;
+        02) bash <(curl -L https://raw.githubusercontent.com/yahuisme/xray-vless-reality/main/install.sh) ; pause_return ;;
+        03) wget -O snell.sh --no-check-certificate https://git.io/Snell.sh && chmod +x snell.sh && ./snell.sh ; pause_return ;;
+        04) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/anytls.sh) ; pause_return ;;
+        05) wget -N --no-check-certificate https://raw.githubusercontent.com/flame1ce/hysteria2-install/main/hysteria2-install-main/hy2/hysteria.sh && bash hysteria.sh ; pause_return ;;
+        06) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/tuicv5.sh) ; pause_return ;;
+        07) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/MTProto.sh) ; pause_return ;;
+        08) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/socks5.sh) ; pause_return ;;
+        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+    esac
+done
 }
 
-# ===== 主菜单 =====
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== Snell + ShadowTLS 多节点管理 ===${RESET}"
-        echo -e "${GREEN}1) 安装新节点${RESET}"
-        echo -e "${GREEN}2) 管理已有节点${RESET}"
-        echo -e "${GREEN}3) 查看所有节点状态${RESET}"
-        echo -e "${GREEN}4) 批量操作节点${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
-        case $choice in
-            1) install_node ;;
-            2) node_action_menu ;;
-            3) show_all_status ;;
-            4) batch_action ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
-        esac
-    done
+# =============================
+# 多协议类
+# =============================
+protocols_menu() {
+while true; do
+    clear
+    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
+    echo -e "${ORANGE}      多协议安装类        ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
+    echo -e "${YELLOW}[01] 老王Sing-box${RESET}"
+    echo -e "${YELLOW}[02] 老王Xray-Argo${RESET}"
+    echo -e "${YELLOW}[03] mack-a八合一${RESET}"
+    echo -e "${YELLOW}[04] ygSing-box${RESET}"
+    echo -e "${YELLOW}[05] fscarmen-ArgoX${RESET}"
+    echo -e "${YELLOW}[06] 233boySing-box${RESET}"
+    echo -e "${YELLOW}[07] SS+SNELL${RESET}"
+    echo -e "${GREEN}[0]  返回${RESET}"
+    echo -e "${GREEN}[x]  退出${RESET}"
+
+    read_submenu || return
+
+    case "$sub" in
+        01) bash <(curl -Ls https://raw.githubusercontent.com/eooce/sing-box/main/sing-box.sh) ; pause_return ;;
+        02) bash <(curl -Ls https://github.com/eooce/xray-2go/raw/main/xray_2go.sh) ; pause_return ;;
+        03) wget -O install.sh https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh && bash install.sh ; pause_return ;;
+        04) bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh) ; pause_return ;;
+        05) bash <(wget -qO- https://raw.githubusercontent.com/fscarmen/argox/main/argox.sh) ; pause_return ;;
+        06) bash <(wget -qO- -o- https://github.com/233boy/sing-box/raw/main/install.sh) ; pause_return ;;
+        07) bash <(curl -L -s menu.jinqians.com) ; pause_return ;;
+        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+    esac
+done
 }
 
-menu
+# =============================
+# 二级菜单：面板类
+# =============================
+panel_menu() {
+while true; do
+    clear
+    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
+    echo -e "${ORANGE}      面板管理类        ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
+    echo -e "${YELLOW}[01] S-UI${RESET}"
+    echo -e "${YELLOW}[02] H-UI${RESET}"
+    echo -e "${YELLOW}[03] X-UI${RESET}"
+    echo -e "${YELLOW}[04] yg-X-UI${RESET}"
+    echo -e "${YELLOW}[05] Xboard${RESET}"
+    echo -e "${YELLOW}[06] 3X-UI${RESET}"
+    echo -e "${YELLOW}[07] 中文版-3X-UI${RESET}"
+    echo -e "${YELLOW}[08] Alpine-3X-UI${RESET}"
+    echo -e "${YELLOW}[09] Docker-3X-UI${RESET}"
+    echo -e "${GREEN}[0]  返回${RESET}"
+    echo -e "${GREEN}[x]  退出${RESET}"
+    
+    read_submenu || return
+
+    case "$sub" in
+        01) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/s-ui.sh) ; pause_return ;;
+        02) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/H-UI.sh) ; pause_return ;;
+        03) bash <(curl -Ls https://raw.githubusercontent.com/vaxilu/x-ui/master/install.sh) ; pause_return ;;
+        04) bash <(wget -qO- https://raw.githubusercontent.com/yonggekkk/x-ui-yg/main/install.sh) ; pause_return ;;
+        05) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Xboard.sh) ; pause_return ;;
+        06) bash <(curl -fsSL https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) ; pause_return ;;
+        07) bash <(curl -fsSL https://raw.githubusercontent.com/xeefei/3x-ui/master/install.sh) ; pause_return ;;
+        08) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/3xuiAlpine.sh) ; pause_return ;;
+        09) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/3xuidocker.sh) ; pause_return ;;
+        0) return ;;
+        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+    esac
+done
+}
+
+# =============================
+# 二级菜单：转发类
+# =============================
+zfpanel_menu() {
+while true; do
+    clear
+    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
+    echo -e "${ORANGE}      转发管理类        ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
+    echo -e "${YELLOW}[01] 极光面板${RESET}"
+    echo -e "${YELLOW}[02] 哆啦A梦转发面板${RESET}"
+    echo -e "${YELLOW}[03] EZGost安装${RESET}"
+    echo -e "${YELLOW}[04] GOSTPanel${RESET}"
+    echo -e "${YELLOW}[05] EZRealm安装${RESET}"
+    echo -e "${YELLOW}[06] Realm-xwPF${RESET}"
+    echo -e "${YELLOW}[07] ZelayRealm转发面板${RESET}"
+    echo -e "${YELLOW}[08] Realm转发(Web面板)${RESET}"
+    echo -e "${YELLOW}[09] NodePass${RESET}"
+    echo -e "${GREEN}[0]  返回${RESET}"
+    echo -e "${GREEN}[x]  退出${RESET}"
+    
+    read_submenu || return
+
+    case "$sub" in
+        01) bash <(curl -fsSL https://raw.githubusercontent.com/Aurora-Admin-Panel/deploy/main/install.sh) ; pause_return ;;
+        02) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/dlam.sh) ; pause_return ;;
+        03) wget --no-check-certificate -O gost.sh https://raw.githubusercontent.com/qqrrooty/EZgost/main/gost.sh && chmod +x gost.sh && ./gost.sh ; pause_return ;;
+        04) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/GOSTPanel.sh) ; pause_return ;;
+        05) wget -N https://raw.githubusercontent.com/qqrrooty/EZrealm/main/realm.sh && chmod +x realm.sh && ./realm.sh ; pause_return ;;
+        06) wget -qO- https://raw.githubusercontent.com/zywe03/realm-xwPF/main/xwPF.sh | sudo bash -s install ; pause_return ;;
+        07) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/ZelayRealm.sh) ; pause_return ;;
+        08) bash <(curl -fsSL https://raw.githubusercontent.com/hiapb/hia-realm/main/install.sh) ; pause_return ;;
+        09) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/NodePass.sh) ; pause_return ;;
+        0) return ;;
+        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+    esac
+done
+}
+
+# =============================
+# 二级菜单：组网类
+# =============================
+zwpanel_menu() {
+while true; do
+    clear
+    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
+    echo -e "${ORANGE}      组网管理类        ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
+    echo -e "${YELLOW}[01] WireGuard${RESET}"
+    echo -e "${YELLOW}[02] WG-Easy${RESET}"
+    echo -e "${YELLOW}[03] Easytier组网${RESET}"
+    echo -e "${YELLOW}[04] FRP-Panel(Web面板)${RESET}"
+    echo -e "${YELLOW}[05] FRP工具(快速部署FRP服务端/客户端)${RESET}"
+    echo -e "${YELLOW}[06] 安装frpc-manager(客户端管理)${RESET}"
+    echo -e "${GREEN}[0]  返回${RESET}"
+    echo -e "${GREEN}[x]  退出${RESET}"
+    
+    read_submenu || return
+  
+
+    case "$sub" in
+        01) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/wireguard.sh) ; pause_return ;;
+        02) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/WGEasy.sh) ; pause_return ;;
+        03) bash <(curl -sL https://raw.githubusercontent.com/ceocok/c.cococ/refs/heads/main/easytier.sh) ; pause_return ;;
+        04) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/frppanel.sh) ; pause_return ;;
+        05) bash <(curl -fsSL https://raw.githubusercontent.com/nuro-hia/nuro-frp/main/install.sh) ; pause_return ;;
+        06) bash <(curl -fsSL https://raw.githubusercontent.com/zeyu8023/frpc-manager/main/bootstrap.sh) ; pause_return ;;
+        0) return ;;
+        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+    esac
+done
+}
+# =============================
+# 网络优化
+# =============================
+network_menu() {
+while true; do
+    clear
+    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
+    echo -e "${ORANGE}      网络优化类        ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
+    echo -e "${YELLOW}[01] WARP管理${RESET}"
+    echo -e "${YELLOW}[02] TCP窗口调优${RESET}"
+    echo -e "${YELLOW}[03] BBR管理${RESET}"
+    echo -e "${YELLOW}[04] BBRv3优化脚本${RESET}"
+    echo -e "${YELLOW}[05] BBR+TCP智能调参${RESET}"
+    echo -e "${GREEN}[0]  返回${RESET}"
+    echo -e "${GREEN}[x]  退出${RESET}"
+    
+    read_submenu || return
+
+    case "$sub" in
+        01) wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh ; pause_return ;;
+        02) wget http://sh.nekoneko.cloud/tools.sh -O tools.sh && bash tools.sh ; pause_return ;;
+        03) wget --no-check-certificate -O tcpx.sh https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master/tcpx.sh && chmod +x tcpx.sh && ./tcpx.sh ; pause_return ;;
+        04)  bash <(curl -fsSL "https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/main/install-alias.sh?$(date +%s)") ; pause_return ;;
+        05) bash <(curl -sL https://raw.githubusercontent.com/yahuisme/network-optimization/main/script.sh) ; pause_return ;;
+        0) return ;;
+        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+    esac
+done
+}
+
+# =============================
+# DNS 类
+# =============================
+dns_menu() {
+while true; do
+    clear
+    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
+    echo -e "${ORANGE}      DNS 解锁类        ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
+    echo -e "${YELLOW}[01] DDNS${RESET}"
+    echo -e "${YELLOW}[02] 自建DNS解锁${RESET}"
+    echo -e "${YELLOW}[03] DnsmasqSNIproxy-One-click${RESET}"
+    echo -e "${YELLOW}[04] 自定义DNS解锁${RESET}"
+    echo -e "${GREEN}[0]  返回${RESET}"
+    echo -e "${GREEN}[x]  退出${RESET}"
+    
+    read_submenu || return
+   
+
+    case "$sub" in
+        01) bash <(wget -qO- https://raw.githubusercontent.com/mocchen/cssmeihua/mochen/shell/ddns.sh) ; pause_return ;;
+        02) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/DNSjiesuo.sh) ; pause_return ;;
+        03) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Dnsmasqsniproxy.sh) ; pause_return ;;
+        04) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/unlockdns.sh) ; pause_return ;;
+        0) return ;;
+        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+    esac
+done
+}
+
+# =============================
+# 二级菜单：Docker单协议类
+# ===========================
+docker_menu() {
+while true; do
+    clear
+    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
+    echo -e "${ORANGE}      Docker单协议类     ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
+    echo -e "${YELLOW}[01] SS2022${RESET}"
+    echo -e "${YELLOW}[02] SS2022+TLS${RESET}"
+    echo -e "${YELLOW}[03] Reality${RESET}"
+    echo -e "${YELLOW}[04] Snell${RESET}"
+    echo -e "${YELLOW}[05] Snell+TLS${RESET}"
+    echo -e "${YELLOW}[06] Vmess+WS+TLS${RESET}"
+    echo -e "${YELLOW}[07] Anytls${RESET}"
+    echo -e "${YELLOW}[08] Hysteria2${RESET}"
+    echo -e "${YELLOW}[09] Tuicv5${RESET}"
+    echo -e "${YELLOW}[10] MTProto${RESET}"
+    echo -e "${YELLOW}[11] Socks5${RESET}"
+    echo -e "${GREEN}[0]  返回${RESET}"
+    echo -e "${GREEN}[x]  退出${RESET}"
+    
+    read_submenu || return
+
+    case "$sub" in
+        01) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/SSRust2022D.sh) ; pause_return ;;
+        02) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/SSRust-tlsD.sh) ; pause_return ;;
+        03) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/Xray-RealityD.sh) ; pause_return ;;
+        04) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/snell-serverD.sh) ; pause_return ;;
+        05) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/snelltls-serverD.sh) ; pause_return ;;
+        06) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/Xray-VmesswstlsD.sh) ; pause_return ;;
+        07) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/AnyTLSD.sh) ; pause_return ;;
+        08) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/hysteria2D.sh) ; pause_return ;;
+        09) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/Singbox-TUICv5D.sh) ; pause_return ;;
+        10) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/MTProtoD.sh) ; pause_return ;;
+        11) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/Xray-Socks5D.sh) ; pause_return ;;
+        0) return ;;
+        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+    esac
+done
+}
+
+# =============================
+# 二级菜单：Docker多协议类
+# =============================
+dockers_menu() {
+while true; do
+    clear
+    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
+    echo -e "${ORANGE}      Docker多协议类     ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
+    echo -e "${YELLOW}[01] SS2022${RESET}"
+    echo -e "${YELLOW}[02] SS2022+TLS${RESET}"
+    echo -e "${YELLOW}[03] Reality${RESET}"
+    echo -e "${YELLOW}[04] Snell${RESET}"
+    echo -e "${YELLOW}[05] Snell+TLS${RESET}"
+    echo -e "${YELLOW}[06] Vmess+WS+TLS${RESET}"
+    echo -e "${YELLOW}[07] Anytls${RESET}"
+    echo -e "${YELLOW}[08] Hysteria2${RESET}"
+    echo -e "${YELLOW}[09] Tuicv5${RESET}"
+    echo -e "${YELLOW}[10] MTProto${RESET}"
+    echo -e "${YELLOW}[11] Socks5${RESET}"
+    echo -e "${GREEN}[0]  返回${RESET}"
+    echo -e "${GREEN}[x]  退出${RESET}"
+    
+    read_submenu || return
+
+    case "$sub" in
+        01) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/SSRust2022GLD.sh) ; pause_return ;;
+        02) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/SSRust-tlsGLD.sh) ; pause_return ;;
+        03) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/Xray-RealityGLD.sh) ; pause_return ;;
+        04) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/snell-serverGLD.sh) ; pause_return ;;
+        05) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/snelltls-serverGLD.sh) ; pause_return ;;
+        06) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/Xray-VmesswstlsGLD.sh) ; pause_return ;;
+        07) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/AnyTLSGLD.sh) ; pause_return ;;
+        08) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/hysteria2GLD.sh) ; pause_return ;;
+        09) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/Singbox-TUICv5GLD.sh) ; pause_return ;;
+        10) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/MTProtoGLD.sh) ; pause_return ;;
+        11) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Dockerproxy/Xray-Socks5GLD.sh) ; pause_return ;;
+        0) return ;;
+        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+    esac
+done
+}
+
+# =============================
+# 更新 & 卸载
+# =============================
+update_script() {
+    echo -e "${GREEN}更新中...${RESET}"
+    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
+    chmod +x "$SCRIPT_PATH"
+    echo -e "${GREEN}✅ 更新完成!${RESET}"
+    exec "$SCRIPT_PATH"
+}
+
+uninstall_script() {
+    rm -f "$SCRIPT_PATH"
+    rm -f "$BIN_LINK_DIR/F" "$BIN_LINK_DIR/f"
+    echo -e "${RED}✅ 脚本已卸载${RESET}"
+    exit 0
+}
+
+# =============================
+# 主循环
+# =============================
+while true; do
+    main_menu
+done

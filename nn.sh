@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Shadowsocks Rust 多节点管理脚本（Host Docker）
+# ShadowsocksRust+ShadowTLS 多节点管理（Host Docker）
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="shadowsocks-rust"
+APP_NAME="ShadowsocksRust+shadow-tls"
 APP_DIR="/opt/$APP_NAME"
 METHOD="2022-blake3-aes-256-gcm"
 
@@ -90,7 +90,7 @@ select_node() {
 }
 
 # =========================
-# 安装节点
+# 安装新节点
 # =========================
 install_node() {
     check_docker
@@ -101,79 +101,136 @@ install_node() {
     NODE_DIR="$APP_DIR/$NODE_NAME"
     mkdir -p "$NODE_DIR"
 
-    # 随机端口
-    read -p "请输入监听端口 [默认随机]: " input_port
-    PORT=${input_port:-$(shuf -i 2000-65000 -n1)}
-    check_port "$PORT" || return
+    read -p "是否启用 IPv6 [true/false 默认 false]: " ipv6
+    IPv6=${ipv6:-false}
 
-    PASSWORD=$(openssl rand -base64 32)
+    # ShadowTLS 对外端口
+    read -p "ShadowTLS 对外端口 [默认 8443]: " TLS_PORT
+    TLS_PORT=${TLS_PORT:-8443}
+    check_port "$TLS_PORT" || return
+
+    read -p "伪装域名 SNI [默认 captive.apple.com]: " TLS_HOST
+    TLS_HOST=${TLS_HOST:-captive.apple.com}
+
+    read -p "Shadowsocks 内部监听端口 [默认随机]: " input_ss_port
+
+    if [[ -z "$input_ss_port" ]]; then
+        SS_PORT=$(shuf -i 20000-60000 -n1)
+        echo "已生成随机端口: $SS_PORT"
+    else
+        SS_PORT=$input_ss_port
+    fi
+
+    SS_PASSWORD=$(openssl rand -base64 32)
+    TLS_PASSWORD=$(openssl rand -base64 16)
+
     CONFIG_FILE="$NODE_DIR/config.json"
     COMPOSE_FILE="$NODE_DIR/docker-compose.yml"
 
-    # 生成配置
+    # ===== IPv6 / IPv4 地址逻辑 =====
+    if [[ "$IPv6" == "true" ]]; then
+        SS_BIND="::1"
+        LISTEN_ADDR="[::]:${TLS_PORT}"
+        SERVER_ADDR="[::1]:${SS_PORT}"
+    else
+        SS_BIND="127.0.0.1"
+        LISTEN_ADDR="0.0.0.0:${TLS_PORT}"
+        SERVER_ADDR="127.0.0.1:${SS_PORT}"
+    fi
+
+    # ================= SS 配置 =================
     cat > "$CONFIG_FILE" <<EOF
 {
-    "server": "::",
-    "server_port": $PORT,
-    "password": "$PASSWORD",
+    "server": "$SS_BIND",
+    "server_port": $SS_PORT,
+    "password": "$SS_PASSWORD",
     "method": "$METHOD",
     "mode": "tcp_and_udp",
     "fast_open": true
 }
 EOF
 
-    # 生成 docker-compose
+    # ================= Docker Compose =================
     cat > "$COMPOSE_FILE" <<EOF
 services:
   ss:
     image: ghcr.io/shadowsocks/ssserver-rust:latest
-    container_name: $NODE_NAME
+    container_name: $NODE_NAME-shadowsocks
     restart: unless-stopped
     network_mode: host
     command: ssserver -c /etc/shadowsocks/config.json
     volumes:
       - ./config.json:/etc/shadowsocks/config.json:ro
+
+  shadow-tls:
+    image: ghcr.io/ihciah/shadow-tls:latest
+    container_name: $NODE_NAME-shadow-tls
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - MODE=server
+      - V3=1
+      - LISTEN=${LISTEN_ADDR}
+      - SERVER=${SERVER_ADDR}
+      - TLS=${TLS_HOST}:443
+      - PASSWORD=${TLS_PASSWORD}
 EOF
 
     cd "$NODE_DIR" || exit
+    docker compose down 2>/dev/null
     docker compose up -d
 
     IP4=$(hostname -I | awk '{print $1}')
-    IP6=$(ip -6 addr show scope global | grep inet6 | awk '{print $2}' | cut -d/ -f1 | head -n1)
     HOSTNAME=$(hostname -s | sed 's/ /_/g')
-    echo
     echo -e "${GREEN}📂 安装目录: $NODE_DIR${RESET}"
-    echo "Shadowsocks Rust 配置："
-    echo " 地址：$IP4"
-    [[ -n "$IP6" ]] && echo " 地址：$IP6"
-    echo " 端口：$PORT"
-    echo " 密码：$PASSWORD"
-    echo " 加密：$METHOD"
-    echo " TFO ：true"
-    # 先生成 Base64
-    BASE64_V4=$(echo -n "${METHOD}:${PASSWORD}@${IP4}:${PORT}" | base64 -w 0)
-    SS_LINK_V4="ss://${BASE64_V4}"
-    BASE64_V6=$(echo -n "${METHOD}:${PASSWORD}@[${IP6}]:${PORT}" | base64 -w 0)
-    SS_LINK_V6="ss://${BASE64_V6}"
-    echo "————————————————————————————————————————"
-    echo "链接 [IPv4]："
-    echo -e "${YELLOW}$SS_LINK_V4$HOSTNAME${RESET}"
-    echo "链接 [IPv6]："
-    echo -e "${YELLOW}$SS_LINK_V6$HOSTNAME${RESET}"
-    echo "—————————————————————————"
-     echo -e "${YELLOW}📄 V6VPS替换IP地址为V6⭐${RESET}"
-    echo "[信息] Surge 配置："
-    echo -e "${YELLOW}$NODE_NAME = ss, $IP4,$PORT, encrypt-method=$METHOD, password=$PASSWORD, tfo=true, udp-relay=true, ecn=true${RESET}"
+    echo -e "${GREEN}✅ 节点 $NODE_NAME 已部署${RESET}"
+    echo "ShadowTLS 对外端口: $TLS_PORT"
+    echo "Shadowsocks 内部端口: $SS_PORT"
+    echo "SNI: $TLS_HOST"
+    echo "SS密码: $SS_PASSWORD"
+    echo "TLS密码: $TLS_PASSWORD"
+    # ===== 生成 SS + ShadowTLS v3 链接 =====
+
+    # 获取服务器IP（优先 IPv4）
+    IP4=$(hostname -I | awk '{print $1}')
+
+    # 1️⃣ 生成 SS 主体 base64
+    SS_BASE=$(echo -n "${METHOD}:${SS_PASSWORD}" | base64 -w 0)
+
+    # 2️⃣ 生成 shadow-tls JSON
+    SHADOWTLS_JSON=$(cat <<EOF
+    {
+      "version":"3",
+      "password":"${TLS_PASSWORD}",
+      "host":"${TLS_HOST}",
+      "port":"${SS_PORT}",
+      "address":"${IP4}"
+    }
+    EOF
+    )
+
+ 
+    # 3️⃣ JSON 再 base64
+    SHADOWTLS_BASE=$(echo -n "$SHADOWTLS_JSON" | base64 -w 0)
+
+    # 4️⃣ 组合最终链接
+    SS_LINK="ss://${SS_BASE}@${IP4}:${TLS_PORT}?shadow-tls=${SHADOWTLS_BASE}#SS-${IP4}"
+
     echo
+    echo "SS + ShadowTLS 链接："
+    echo "----------------------------------"
+    echo -e "${YELLOW}${SS_LINK}${RESET}"
+    echo "----------------------------------"
+    echo "Surge配置:"
+    echo -e "${YELLOW}$NODE_NAME = ss, $IP4, $TLS_PORT, encrypt-method=$METHOD, password=$SS_PASSWORD, shadow-tls-password=$TLS_PASSWORD, shadow-tls-sni=$TLS_HOST, shadow-tls-version=3, tfo=true, udp-relay=true, ecn=true ${RESET}"
     read -p "按回车返回菜单..."
 }
 
 # =========================
-# 单节点管理菜单
+# 单节点管理
 # =========================
 node_action_menu() {
     select_node || return
-
     while true; do
         echo -e "${GREEN}=== 节点 [$NODE_NAME] 管理 ===${RESET}"
         echo -e "${GREEN}1) 暂停${RESET}"
@@ -182,14 +239,12 @@ node_action_menu() {
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 卸载${RESET}"
         echo -e "${GREEN}0) 返回${RESET}"
-
         read -r -p $'\033[32m请选择操作:\033[0m ' choice
-
         case $choice in
-            1) docker pause "$NODE_NAME" ;;
-            2) docker restart "$NODE_NAME" ;;
+            1) docker pause "$NODE_NAME-ss" "$NODE_NAME-tls" ;;
+            2) docker restart "$NODE_NAME-ss" "$NODE_NAME-tls" ;;
             3) cd "$NODE_DIR" && docker compose pull && docker compose up -d ;;
-            4) docker logs -f "$NODE_NAME" ;;
+            4) docker logs -f "$NODE_NAME-ss" ;;
             5) cd "$NODE_DIR" && docker compose down && rm -rf "$NODE_DIR"; return ;;
             0) return ;;
             *) echo -e "${RED}无效选择${RESET}" ;;
@@ -202,7 +257,7 @@ node_action_menu() {
 # =========================
 batch_action() {
     echo -e "${GREEN}=== 批量操作 ===${RESET}"
-    echo -e "${GREEN}1) 批量停止${RESET}"
+    echo -e "${GREEN}1) 批量暂停${RESET}"
     echo -e "${GREEN}2) 批量重启${RESET}"
     echo -e "${GREEN}3) 批量更新${RESET}"
     echo -e "${GREEN}4) 批量卸载${RESET}"
@@ -210,7 +265,7 @@ batch_action() {
 
     read -r -p $'\033[32m请选择操作:\033[0m ' choice
 
-    # ===== 合法性判断 =====
+    # ===== 合法性检查 =====
     case "$choice" in
         1|2|3|4) ;;
         0) return ;;
@@ -260,18 +315,28 @@ batch_action() {
         return
     }
 
-    # ===== 执行操作 =====
+    # ===== 执行批量操作 =====
     for NODE_NAME in "${SELECTED[@]}"; do
         NODE_DIR="$APP_DIR/$NODE_NAME"
 
         [ -d "$NODE_DIR" ] || continue
         cd "$NODE_DIR" || continue
 
-        case $choice in
-            1) docker stop "$NODE_NAME" 2>/dev/null ;;
-            2) docker restart "$NODE_NAME" 2>/dev/null ;;
-            3) docker compose pull && docker compose up -d ;;
-            4) docker compose down && rm -rf "$NODE_DIR" ;;
+        case "$choice" in
+            1)
+                docker stop "$NODE_NAME-ss" "$NODE_NAME-tls" 2>/dev/null
+                ;;
+            2)
+                docker restart "$NODE_NAME-ss" "$NODE_NAME-tls" 2>/dev/null
+                ;;
+            3)
+                docker compose pull
+                docker compose up -d
+                ;;
+            4)
+                docker compose down
+                rm -rf "$NODE_DIR"
+                ;;
         esac
 
         echo -e "${GREEN}已操作 $NODE_NAME${RESET}"
@@ -279,7 +344,6 @@ batch_action() {
 
     read -p "按回车返回菜单..."
 }
-
 # =========================
 # 查看所有节点状态
 # =========================
@@ -288,10 +352,10 @@ show_all_status() {
     for node in "$APP_DIR"/*; do
         [ -d "$node" ] || continue
         NODE_NAME=$(basename "$node")
-        PORT=$(grep '"server_port"' "$node/config.json" | awk -F: '{gsub(/[ ,"]/,"",$2); print $2}')
-        STATUS=$(docker inspect -f '{{.State.Status}}' "$NODE_NAME" 2>/dev/null)
+        TLS_PORT=$(grep 'LISTEN=' "$node/docker-compose.yml" | cut -d: -f2 | tr -d '"')
+        STATUS=$(docker inspect -f '{{.State.Status}}' "$NODE_NAME-ss" 2>/dev/null)
         [ -z "$STATUS" ] && STATUS="未启动"
-        echo -e "${GREEN}$NODE_NAME | ${PORT:-未知端口} | $STATUS${RESET}"
+        echo -e "${GREEN}$NODE_NAME | ${TLS_PORT:-未知端口} | $STATUS${RESET}"
     done
     read -p "按回车返回菜单..."
 }
@@ -302,15 +366,13 @@ show_all_status() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Shadowsocks Rust 多节点管理 ===${RESET}"
+        echo -e "${GREEN}=== ShadowsocksRust+ShadowTLS 多节点管理 ===${RESET}"
         echo -e "${GREEN}1) 安装新节点${RESET}"
         echo -e "${GREEN}2) 单节点管理${RESET}"
         echo -e "${GREEN}3) 查看所有节点状态${RESET}"
         echo -e "${GREEN}4) 批量操作${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
-
         read -r -p $'\033[32m请选择:\033[0m ' choice
-
         case $choice in
             1) install_node ;;
             2) node_action_menu ;;

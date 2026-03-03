@@ -1,6 +1,7 @@
 #!/bin/bash
 # ========================================
-# Snell + ShadowTLS 多节点管理脚本（Host 模式 + 彩色菜单 + 批量操作）
+# Hysteria 一键管理脚本（Host Docker + 自签证书 + 端口跳跃 + 必应伪装）
+# 优化版：防重复规则 + 默认回车启用跳跃
 # ========================================
 
 GREEN="\033[32m"
@@ -8,8 +9,16 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="snelltls"
-APP_DIR="/opt/$APP_NAME"
+APP_NAME="hysteria"
+APP_DIR="/root/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/hysteria.yaml"
+CONTAINER_NAME="hysteria"
+
+JUMP_START=""
+JUMP_END=""
+PORT=""
+MASQ_URL="https://bing.com"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -23,248 +32,226 @@ check_docker() {
 }
 
 check_port() {
-    if ss -tlnp | grep -q ":$1 " || ss -ulnp | grep -q ":$1 "; then
+    if ss -tuln | grep -q ":$1 "; then
         echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
         return 1
     fi
 }
 
-list_nodes() {
-    mkdir -p "$APP_DIR"
-    echo -e "${GREEN}=== 已有 Snell + ShadowTLS 节点 ===${RESET}"
-    local count=0
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        echo -e "${YELLOW}[$count] $(basename "$node")${RESET}"
-    done
-    [ $count -eq 0 ] && echo -e "${YELLOW}无节点${RESET}"
-}
-
-select_node() {
-    list_nodes
-    read -r -p $'\033[32m请输入节点名称或编号: \033[0m' input
-    if [[ "$input" =~ ^[0-9]+$ ]]; then
-        NODE_NAME=$(ls -d "$APP_DIR"/* | sed -n "${input}p" | xargs basename)
-    else
-        NODE_NAME="$input"
-    fi
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-    if [ ! -d "$NODE_DIR" ]; then
-        echo -e "${RED}节点不存在！${RESET}"
-        return 1
+generate_cert() {
+    mkdir -p "$APP_DIR/cert"
+    CERT_FILE="$APP_DIR/cert/server.crt"
+    KEY_FILE="$APP_DIR/cert/server.key"
+    if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ]; then
+        echo -e "${YELLOW}正在生成自签证书（CN=bing.com）...${RESET}"
+        openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+            -keyout "$KEY_FILE" \
+            -out "$CERT_FILE" \
+            -subj "/CN=bing.com" \
+            -days 36500
     fi
 }
 
-install_node() {
+add_port_jump_rules() {
+    if [[ -n "$JUMP_START" ]] && [[ -n "$JUMP_END" ]]; then
+        echo -e "${YELLOW}添加端口跳跃规则: $JUMP_START-$JUMP_END -> $PORT${RESET}"
+
+        while iptables -t nat -C PREROUTING -p udp --dport $JUMP_START:$JUMP_END -j REDIRECT --to-ports $PORT 2>/dev/null; do
+            iptables -t nat -D PREROUTING -p udp --dport $JUMP_START:$JUMP_END -j REDIRECT --to-ports $PORT
+        done
+
+        iptables -t nat -A PREROUTING -p udp \
+            --dport $JUMP_START:$JUMP_END \
+            -j REDIRECT --to-ports $PORT
+
+        echo -e "${GREEN}✅ 端口跳跃规则添加完成${RESET}"
+    fi
+}
+
+remove_port_jump_rules() {
+    if [[ -n "$JUMP_START" ]] && [[ -n "$JUMP_END" ]]; then
+        echo -e "${YELLOW}清理端口跳跃规则: $JUMP_START-$JUMP_END -> $PORT${RESET}"
+
+        while iptables -t nat -C PREROUTING -p udp --dport $JUMP_START:$JUMP_END -j REDIRECT --to-ports $PORT 2>/dev/null; do
+            iptables -t nat -D PREROUTING -p udp --dport $JUMP_START:$JUMP_END -j REDIRECT --to-ports $PORT
+        done
+
+        echo -e "${GREEN}✅ 跳跃规则已清理${RESET}"
+    fi
+}
+
+install_app() {
     check_docker
-    read -p "请输入节点名称 [node$(date +%s)]: " NODE_NAME
-    NODE_NAME=${NODE_NAME:-node$(date +%s)}
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-    mkdir -p "$NODE_DIR/snell-conf"
+    mkdir -p "$APP_DIR"
 
-    # ===== Snell 架构 =====
-    echo -e "${GREEN}请选择 Snell 架构:${RESET}"
-    echo -e "1) amd64 (默认)"
-    echo -e "2) armv7l"
-    echo -e "3) 自定义 URL"
-    read -p "选择 [1/2/3, 默认 1]: " arch_choice
-    case $arch_choice in
-        2) SNELL_URL="https://dl.nssurge.com/snell/snell-server-v5.0.1-linux-armv7l.zip" ;;
-        3) read -p "请输入自定义 SNELL_URL: " custom_url
-           SNELL_URL="$custom_url" ;;
-        *) SNELL_URL="https://dl.nssurge.com/snell/snell-server-v5.0.1-linux-amd64.zip" ;;
-    esac
-
-    # ===== Snell 内部端口 =====
-    read -p "请输入 Snell 内部端口 [1025-65535, 默认随机]: " input_port
-    PORT=${input_port:-$(shuf -i 1025-65535 -n1)}
+    read -p "请输入监听端口 [1025-65535, 默认随机]: " input_port
+    if [[ -z "$input_port" ]]; then
+        PORT=$(shuf -i 1025-65535 -n1)
+    else
+        PORT=$input_port
+    fi
     check_port "$PORT" || return
 
-    # ===== ShadowTLS 对外端口 =====
-    read -p "请输入 ShadowTLS 对外端口 [默认 8443]: " tls_input
-    TLS_PORT=${tls_input:-8443}
-    check_port "$TLS_PORT" || return
+    PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c16)
 
-    # ===== PSK / ShadowTLS 密码 / TLS伪装 =====
-    read -p "请输入 Snell PSK（留空随机生成 32 位）: " input_psk
-    PSK=${input_psk:-$(tr -dc A-Za-z0-9 </dev/urandom | head -c32)}
-    TLS_PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c16)
-    read -p "请输入 TLS 伪装域名 [默认 captive.apple.com]: " tls_host
-    TLS_HOST=${tls_host:-captive.apple.com}
+    read -p "是否启用端口跳跃 [Y/n,回车默认Y]: " enable_jump
+    enable_jump=$(echo "$enable_jump" | tr -d ' ')
+    enable_jump=${enable_jump:-Y}
 
-    # ===== 可选配置 =====
-    read -p "是否启用 IPv6 [true/false, 默认 false]: " ipv6
-    IPv6=${ipv6:-false}
-    read -p "混淆模式 [off/http, 默认 off]: " obfs
-    OBFS=${obfs:-off}
-    [[ "$OBFS" == "http" ]] && read -p "请输入混淆 Host [默认 example.com]: " obfs_host && OBFS_HOST=${obfs_host:-example.com} || OBFS_HOST=""
-    read -p "是否启用 TCP Fast Open [true/false, 默认 true]: " tfo
-    TFO=${tfo:-true}
-    ECN=true
+    case "$enable_jump" in
+        Y|y)
+            while true; do
+                read -p "请输入端口范围起始端口 (10000-65535): " firstport
+                read -p "请输入端口范围末尾端口: " endport
 
-    # ===== Snell 配置文件 =====
-    cat > "$NODE_DIR/snell-conf/snell.conf" <<EOF
-[snell-server]
-listen = $( [[ "$IPv6" == "true" ]] && echo "::0" || echo "0.0.0.0" ):$PORT
-psk = $PSK
-ipv6 = $IPv6
-$( [[ "$OBFS" == "http" ]] && echo "obfs = http" && echo "obfs_host = $OBFS_HOST" )
+                if ! [[ "$firstport" =~ ^[0-9]+$ && "$endport" =~ ^[0-9]+$ ]]; then
+                    echo "端口必须为数字"
+                    continue
+                fi
+
+                if (( firstport < 10000 || firstport > 65535 || endport < 10000 || endport > 65535 )); then
+                    echo "端口必须在 10000-65535"
+                    continue
+                fi
+
+                if (( firstport >= endport )); then
+                    echo "起始端口必须小于结束端口"
+                    continue
+                fi
+
+                if (( PORT >= firstport && PORT <= endport )); then
+                    echo "跳跃范围不能包含监听端口 $PORT"
+                    continue
+                fi
+
+                JUMP_START=$firstport
+                JUMP_END=$endport
+                break
+            done
+            ;;
+        N|n)
+            echo "已关闭端口跳跃"
+            ;;
+        *)
+            echo "输入无效，默认启用"
+            ;;
+    esac
+
+    generate_cert
+    add_port_jump_rules
+
+    cat > "$CONFIG_FILE" <<EOF
+listen: :$PORT
+
+tls:
+  cert: /etc/hysteria/server.crt
+  key: /etc/hysteria/server.key
+
+auth:
+  type: password
+  password: $PASSWORD
+
+masquerade:
+  type: proxy
+  proxy:
+    url: $MASQ_URL
+    rewriteHost: true
 EOF
 
-    # ===== Docker Compose 文件 =====
-    cat > "$NODE_DIR/docker-compose.yml" <<EOF
+    cat > "$COMPOSE_FILE" <<EOF
 services:
-  snell:
-    image: accors/snell:latest
-    container_name: snell-$NODE_NAME
+  hysteria:
+    image: tobyxdd/hysteria
+    container_name: $CONTAINER_NAME
     restart: always
     network_mode: host
-    environment:
-      - SNELL_URL=${SNELL_URL}
     volumes:
-      - ./snell-conf/snell.conf:/etc/snell-server.conf
-
-  shadow-tls:
-    image: ghcr.io/ihciah/shadow-tls:latest
-    container_name: shadow-tls-$NODE_NAME
-    restart: unless-stopped
-    network_mode: host
-    environment:
-      MODE: server
-      V3: 1
-      LISTEN: 0.0.0.0:${TLS_PORT}
-      SERVER: 127.0.0.1:${PORT}
-      TLS: ${TLS_HOST}:443
-      PASSWORD: ${TLS_PASSWORD}
+      - $APP_DIR/hysteria.yaml:/etc/hysteria.yaml
+      - $APP_DIR/cert/server.crt:/etc/hysteria/server.crt
+      - $APP_DIR/cert/server.key:/etc/hysteria/server.key
+    command: ["server", "-c", "/etc/hysteria.yaml"]
 EOF
 
-    cd "$NODE_DIR" || return
+    cd "$APP_DIR" || exit
     docker compose up -d
 
     IP=$(hostname -I | awk '{print $1}')
-    echo -e "${GREEN}✅ 节点 ${NODE_NAME} 已启动${RESET}"
-    echo -e "${YELLOW}🌐 公网IP: ${IP}${RESET}"
-    echo -e "${YELLOW}🌐 ShadowTLS端口: ${TLS_PORT}${RESET}"
-    echo -e "${YELLOW}🔑 Snell PSK: ${PSK}${RESET}"
-    echo -e "${YELLOW}🔑 ShadowTLS 密码: ${TLS_PASSWORD}${RESET}"
-    echo -e "${GREEN}📂 安装目录: $NODE_DIR${RESET}"
-    echo -e "${GREEN}====== 客户端配置示例 ======${RESET}"
-    echo -e "${YELLOW}ShadowTLS:${RESET}"
-    echo -e "${YELLOW}地址: ${IP}${RESET}"
-    echo -e "${YELLOW}端口: ${TLS_PORT}${RESET}"
-    echo -e "${YELLOW}密码: ${TLS_PASSWORD}${RESET}"
-    eecho -e "${YELLOW}SNI: ${TLS_HOST}${RESET}"
-    echo -e "${YELLOW}Snell:${RESET}${RESET}"
-    echo -e "${YELLOW}${NODE_NAME} = snell, ${IP}, ${TLS_PORT}, psk=${PSK}, version=5, tfo=${TFO}, ecn=${ECN}, shadow-tls-password=${TLS_PASSWORD}, shadow-tls-sni=${TLS_HOST}, shadow-tls-version=3${RESET}"
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
-}
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
 
-node_action_menu() {
-    select_node || return
-    while true; do
-        echo -e "${GREEN}=== 节点 [$NODE_NAME] 管理 ===${RESET}"
-        echo -e "${GREEN}1) 暂停${RESET}"
-        echo -e "${GREEN}2) 重启${RESET}"
-        echo -e "${GREEN}3) 更新${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 卸载${RESET}"
-        echo -e "${GREEN}0) 返回主菜单${RESET}"
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
-        case $choice in
-            1) docker pause snell-$NODE_NAME shadow-tls-$NODE_NAME ;;
-            2) docker restart snell-$NODE_NAME shadow-tls-$NODE_NAME ;;
-            3) docker compose -f "$NODE_DIR/docker-compose.yml" pull && docker compose -f "$NODE_DIR/docker-compose.yml" up -d ;;
-            4) docker compose -f "$NODE_DIR/docker-compose.yml" logs -f ;;
-            5) docker compose -f "$NODE_DIR/docker-compose.yml" down && rm -rf "$NODE_DIR" && return ;;
-            0) return ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-    done
-}
-
-batch_action() {
-    echo -e "${GREEN}=== 批量操作节点 ===${RESET}"
-    echo -e "${GREEN}1) 暂停节点${RESET}"
-    echo -e "${GREEN}2) 重启节点${RESET}"
-    echo -e "${GREEN}3) 更新节点${RESET}"
-    echo -e "${GREEN}4) 卸载节点${RESET}"
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
-    read -r -p $'\033[32m请选择操作: \033[0m' choice
-
-    mkdir -p "$APP_DIR"
-    declare -A NODE_MAP
-    local count=0
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        NODE_NAME=$(basename "$node")
-        NODE_MAP[$count]="$NODE_NAME"
-        echo -e "${YELLOW}[$count] $NODE_NAME${RESET}"
-    done
-    [ $count -eq 0 ] && { echo -e "${YELLOW}无节点${RESET}"; read -r -p $'\033[32m按回车返回菜单...\033[0m'; return; }
-
-    read -r -p $'\033[32m请输入要操作的节点序号（空格分隔，或输入 all 全选）: \033[0m' input_nodes
-    if [[ "$input_nodes" == "all" ]]; then
-        SELECTED_NODES=("${NODE_MAP[@]}")
+    echo
+    echo -e "${GREEN}✅ Hysteria 已启动${RESET}"
+    echo -e "${YELLOW}🌐 服务端监听端口: ${PORT}${RESET}"
+    echo -e "${YELLOW}🔑 密码: ${PASSWORD}${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    if [[ -n "$JUMP_START" ]]; then
+        echo -e "${YELLOW}🟢 端口跳跃: $JUMP_START-$JUMP_END -> $PORT${RESET}"
     else
-        SELECTED_NODES=()
-        for i in $input_nodes; do
-            NODE=${NODE_MAP[$i]}
-            [ -n "$NODE" ] && SELECTED_NODES+=("$NODE") || echo -e "${YELLOW}⚠ 序号 $i 无效，已跳过${RESET}"
-        done
+        echo -e "${YELLOW}🟢 端口跳跃: 未启用${RESET}"
     fi
-
-    for NODE_NAME in "${SELECTED_NODES[@]}"; do
-        NODE_DIR="$APP_DIR/$NODE_NAME"
-        [ ! -d "$NODE_DIR" ] || [ ! -f "$NODE_DIR/docker-compose.yml" ] && { echo -e "${YELLOW}⚠ 跳过节点 $NODE_NAME：目录或 docker-compose.yml 不存在${RESET}"; continue; }
-        cd "$NODE_DIR" || continue
-        case $choice in
-            1) docker pause snell-$NODE_NAME shadow-tls-$NODE_NAME ;;
-            2) docker restart snell-$NODE_NAME shadow-tls-$NODE_NAME ;;
-            3) docker compose pull && docker compose up -d ;;
-            4) docker compose down && rm -rf "$NODE_DIR" ;;
-            0) return ;;
-            *) echo -e "${RED}无效选择${RESET}" ; return ;;
-        esac
-        echo -e "${GREEN}✅ 节点 $NODE_NAME 操作完成${RESET}"
-    done
-
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
+    echo -e "${YELLOW}🟢 伪装网址: $MASQ_URL${RESET}"
+    echo -e "${YELLOW}📄 V6VPS替换IP地址为V6${RESET}"
+    echo -e "${YELLOW}📄 客户端配置模板:${RESET}"
+    echo -e "${YELLOW}V2rayN:{RESET}"
+    echo -e "${YELLOW} hysteria2://$PASSWORD@$IP:$PORT/?sni=bing.com&insecure=1#$HOSTNAME${RESET}"
+    echo -e "${YELLOW}Surge:{RESET}"
+    echo -e "${YELLOW}  $HOSTNAME = hysteria2, $IP, $PORT, password=$PASSWORD, skip-cert-verify=true, sni=www.bing.com${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-show_all_status() {
-    list_nodes
-    echo -e "${GREEN}=== 节点状态 ===${RESET}"
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        NODE_NAME=$(basename "$node")
-        PORT=$(grep 'listen' "$node/snell-conf/snell.conf" | awk -F: '{print $2}')
-        TLS_PORT=$(docker inspect -f '{{range .NetworkSettings.Ports}}{{.}}{{end}}' shadow-tls-$NODE_NAME 2>/dev/null || echo "$PORT")
-        STATUS=$(docker ps --filter "name=snell-$NODE_NAME" --format "{{.Status}}")
-        [ -z "$STATUS" ] && STATUS="未启动"
-        echo -e "${GREEN}$NODE_NAME${RESET} | ${YELLOW}Snell端口: ${PORT}${RESET} | ${YELLOW}ShadowTLS端口: ${TLS_PORT}${RESET} | ${YELLOW}状态: ${STATUS}${RESET}"
-    done
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+    docker restart $CONTAINER_NAME
+    echo -e "${GREEN}✅ 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    docker logs -f $CONTAINER_NAME
+}
+
+check_status() {
+    docker ps | grep $CONTAINER_NAME
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    remove_port_jump_rules
+    docker stop $CONTAINER_NAME 2>/dev/null
+    docker rm $CONTAINER_NAME 2>/dev/null
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ 已卸载${RESET}"
+    read -p "按回车返回菜单..."
 }
 
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Snell + ShadowTLS 多节点管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装新节点${RESET}"
-        echo -e "${GREEN}2) 管理已有节点${RESET}"
-        echo -e "${GREEN}3) 批量操作节点${RESET}"
-        echo -e "${GREEN}4) 查看所有节点状态${RESET}"
+        echo -e "${GREEN}=== Hysteria 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
         case $choice in
-            1) install_node ;;
-            2) node_action_menu ;;
-            3) batch_action ;;
-            4) show_all_status ;;
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
             0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
+            *) echo "无效选择"; sleep 1 ;;
         esac
     done
 }

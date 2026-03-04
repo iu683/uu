@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# 3x-ui 一键管理脚本（Host模式）
+# H UI 一键管理脚本（Host模式）
 # ========================================
 
 GREEN="\033[32m"
@@ -8,10 +8,10 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="3x-ui"
+APP_NAME="h-ui"
 APP_DIR="/root/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONTAINER_NAME="3xui_app"
+CONTAINER_NAME="h-ui"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -23,7 +23,6 @@ check_docker() {
         exit 1
     fi
 }
-
 
 get_public_ip() {
     local ip
@@ -40,10 +39,11 @@ get_public_ip() {
     echo "无法获取公网 IP 地址。"
 }
 
+
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== 3x-ui 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== H-UI 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -69,6 +69,7 @@ menu() {
 install_app() {
     check_docker
     mkdir -p "$APP_DIR"
+    mkdir -p "$APP_DIR/my_acme_dir"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -76,19 +77,29 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
+    read -p "请输入面板端口 [默认8081]: " PANEL_PORT
+    PANEL_PORT=${PANEL_PORT:-8081}
+
+    mkdir -p "$APP_DIR"/{bin,data,export,logs}
+
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  3xui:
-    image: ghcr.io/mhsanaei/3x-ui:latest
+  h-ui:
+    image: jonssonyan/h-ui
     container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
+    restart: always
     network_mode: host
-    volumes:
-      - $APP_DIR/db/:/etc/x-ui/
-      - $APP_DIR/cert/:/root/cert/
+    cap_add:
+      - NET_ADMIN
     environment:
-      XRAY_VMESS_AEAD_FORCED: "false"
-      XUI_ENABLE_FAIL2BAN: "false"
+      - TZ=Asia/Shanghai
+    volumes:
+      - $APP_DIR/bin:/h-ui/bin
+      - $APP_DIR/data:/h-ui/data
+      - $APP_DIR/export:/h-ui/export
+      - $APP_DIR/logs:/h-ui/logs
+      - $APP_DIR/my_acme_dir:/h-ui/my_acme_dir
+    command: ./h-ui -p ${PANEL_PORT}
 EOF
 
     cd "$APP_DIR" || exit
@@ -96,13 +107,15 @@ EOF
 
     SERVER_IP=$(get_public_ip)
 
-    echo -e "${GREEN}✅ 3x-ui 已启动${RESET}"
+    echo
+    echo -e "${GREEN}✅ H-UI 已启动${RESET}"
     echo -e "${YELLOW}🌐 公网 IP: ${SERVER_IP}${RESET}"
-    echo -e "${YELLOW}🔌 面板端口: ${PORT}${RESET}"
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
-    echo -e "${RED}首次登录后请修改默认用户名密码！${RESET}"
-    echo -e "${YELLOW}账号/密码:admin/admin${RESET}"
-    echo -e "${YELLOW}访问地址: http://${SERVER_IP}:2053${RESET}"
+    echo -e "${YELLOW}🔌 面板端口: ${PANEL_PORT}${RESET}"
+    echo -e "${YELLOW}📂 数据目录: $APP_DIR${RESET}"
+    echo -e "${YELLOW}📜 证书目录: $APP_DIR/my_acme_dir${RESET}"
+    echo -e "${YELLOW}✅ 登录用户名/密码: sysadmin/sysadmin${RESET}"
+    echo -e "${YELLOW}✅ 连接密码: sysadmin.sysadmin${RESET}"
+    echo -e "${YELLOW}访问地址: http://${SERVER_IP}:${PANEL_PORT}${RESET}"
     read -p "按回车返回菜单..."
 }
 
@@ -110,13 +123,13 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ 3x-ui 更新完成${RESET}"
+    echo -e "${GREEN}✅ H-UI更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
     docker restart ${CONTAINER_NAME}
-    echo -e "${GREEN}✅ 3x-ui 已重启${RESET}"
+    echo -e "${GREEN}✅ H-UI已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
@@ -133,7 +146,7 @@ check_status() {
 uninstall_app() {
     docker compose -f ${COMPOSE_FILE} down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 3x-ui 已卸载${RESET}"
+    echo -e "${RED}✅ H-UI已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

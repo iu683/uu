@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Snell 多节点管理脚本（彩色菜单 + 节点状态查看）
+# 3x-ui 一键管理脚本（Host模式）
 # ========================================
 
 GREEN="\033[32m"
@@ -8,8 +8,10 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="snell-server"
-APP_DIR="/opt/$APP_NAME"
+APP_NAME="3x-ui"
+APP_DIR="/root/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONTAINER_NAME="3xui_app"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -22,301 +24,123 @@ check_docker() {
     fi
 }
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
 
-list_nodes() {
-    mkdir -p "$APP_DIR"
-    echo -e "${GREEN}=== 已有 Snell 节点 ===${RESET}"
-    local count=0
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        echo -e "${YELLOW}[$count] $(basename "$node")${RESET}"
-    done
-    [ $count -eq 0 ] && echo -e "${YELLOW}无节点${RESET}"
-}
-
-select_node() {
-    list_nodes
-    read -r -p $'\033[32m请输入节点名称或编号: \033[0m' input
-    if [[ "$input" =~ ^[0-9]+$ ]]; then
-        NODE_NAME=$(ls -d "$APP_DIR"/* | sed -n "${input}p" | xargs basename)
-    else
-        NODE_NAME="$input"
-    fi
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-    if [ ! -d "$NODE_DIR" ]; then
-        echo -e "${RED}节点不存在！${RESET}"
-        return 1
-    fi
-}
-
-install_node() {
-    check_docker
-    read -p "请输入节点名称 [node$(date +%s)]: " NODE_NAME
-    NODE_NAME=${NODE_NAME:-node$(date +%s)}
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-    mkdir -p "$NODE_DIR/data"
-
-    # 监听端口
-    read -p "请输入监听端口 [1025-65535, 默认随机]: " input_port
-    PORT=${input_port:-$(shuf -i 1025-65535 -n1)}
-    check_port "$PORT" || return
-
-    # 随机 PSK
-    PSK=$(tr -dc A-Za-z0-9 </dev/urandom | head -c32)
-
-    # IPv6 开关
-    read -p "是否启用 IPv6 [true/false, 默认 false]: " ipv6
-    IPv6=${ipv6:-false}
-
-    # 混淆
-    read -p "混淆模式 [off/http, 默认 off]: " obfs
-    OBFS=${obfs:-off}
-    if [ "$OBFS" = "http" ]; then
-        read -p "请输入混淆 Host [默认 example.com]: " obfs_host
-        OBFS_HOST=${obfs_host:-example.com}
-    else
-        OBFS_HOST=""
-    fi
-
-    # TCP Fast Open
-    read -p "是否启用 TCP Fast Open [true/false, 默认 true]: " tfo
-    TFO=${tfo:-true}
-
-    # ECN
-    ECN=true
-
-    # ========================
-    # 生成 snell-server.conf
-    # ========================
-    CONF_FILE="$NODE_DIR/snell-server.conf"
-    cat > "$CONF_FILE" <<EOF
-[snell-server]
-listen = 0.0.0.0:$PORT
-psk = $PSK
-tfo = $TFO
-ecn = $ECN
-EOF
-
-    # 条件写入 IPv6
-    if [[ "$IPv6" == "true" ]]; then
-        echo "listen = [::]:$PORT" >> "$CONF_FILE"
-    fi
-
-    # 条件写入 OBFS
-    if [[ "$OBFS" != "off" ]]; then
-        echo "obfs = $OBFS" >> "$CONF_FILE"
-        if [[ "$OBFS" == "http" && -n "$OBFS_HOST" ]]; then
-            echo "obfs-host = $OBFS_HOST" >> "$CONF_FILE"
-        fi
-    fi
-
-    # ========================
-    # 生成 docker-compose.yml
-    # ========================
-    cat > "$NODE_DIR/docker-compose.yml" <<EOF
-services:
-  $NODE_NAME:
-    image: 1byte/snell-server:latest
-    container_name: $NODE_NAME
-    restart: always
-    network_mode: host
-    volumes:
-      - ./snell-server.conf:/app/snell-server.conf:ro
-EOF
-
-    # 启动节点
-    cd "$NODE_DIR" || return
-    docker compose up -d
-
-    IP=$(hostname -I | awk '{print $1}')
-    echo -e "${GREEN}📂 安装目录: $NODE_DIR${RESET}"
-    echo -e "${GREEN}📄 V6VPS替换IP地址为V6⭐${RESET}"
-    echo -e "${GREEN}✅ 节点 ${NODE_NAME} 已启动${RESET}"
-    echo -e "${YELLOW}🌐 端口: ${PORT}${RESET}"
-    echo -e "${YELLOW}🔑 PSK: ${PSK}${RESET}"
-    echo -e "${YELLOW}📄 客户端配置:${RESET}"
-    echo -e "${YELLOW}$NODE_NAME = snell, ${IP}, ${PORT}, psk=${PSK}, version=5, reuse=true, tfo=${TFO}, ecn=${ECN}${RESET}"
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
-}
-node_action_menu() {
-    select_node || return
-    while true; do
-        echo -e "${GREEN}=== 节点 [$NODE_NAME] 管理 ===${RESET}"
-        echo -e "${GREEN}1) 暂停${RESET}"
-        echo -e "${GREEN}2) 重启${RESET}"
-        echo -e "${GREEN}3) 更新${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 卸载${RESET}"
-        echo -e "${GREEN}0) 返回主菜单${RESET}"
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
-        case $choice in
-            1) docker pause "$NODE_NAME" ;;
-            2) docker restart "$NODE_NAME" ;;
-            3) docker compose -f "$NODE_DIR/docker-compose.yml" pull && docker compose -f "$NODE_DIR/docker-compose.yml" up -d ;;
-            4) docker logs -f "$NODE_NAME" ;;
-            5)
-               echo -e "${YELLOW} 正在卸载节点 $NODE_NAME ...${RESET}"
-               cd "$APP_DIR" || cd /
-               docker compose -f "$NODE_DIR/docker-compose.yml" down
-               rm -rf "$NODE_DIR"
-               echo -e "${GREEN}✅ 节点 $NODE_NAME 已卸载${RESET}"
-               return
-               ;;
-            0) return ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-    done
-}
-
-batch_action() {
-    echo -e "${GREEN}=== 批量操作 ===${RESET}"
-    echo -e "${GREEN}1) 暂停节点${RESET}"
-    echo -e "${GREEN}2) 重启节点${RESET}"
-    echo -e "${GREEN}3) 更新节点${RESET}"
-    echo -e "${GREEN}4) 卸载节点${RESET}"
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
-
-    read -r -p $'\033[32m请选择操作: \033[0m' choice
-
-    case "$choice" in
-        1|2|3|4) ;;
-        0) return ;;
-        *)
-            echo -e "${RED}无效选择${RESET}"
-            sleep 1
-            return
-            ;;
-    esac
-
-    mkdir -p "$APP_DIR"
-
-    declare -A NODE_MAP
-    local count=0
-
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        NODE_NAME=$(basename "$node")
-        NODE_MAP[$count]="$NODE_NAME"
-        echo -e "${YELLOW}[$count] $NODE_NAME${RESET}"
-    done
-
-    if [ $count -eq 0 ]; then
-        echo -e "${YELLOW}无节点${RESET}"
-        read -r -p $'\033[32m按回车返回菜单...\033[0m'
-        return
-    fi
-
-    read -r -p $'\033[32m请输入节点序号（空格分隔，或 all 全选）: \033[0m' input_nodes
-
-    if [ -z "$input_nodes" ]; then
-        echo -e "${YELLOW}未选择节点${RESET}"
-        sleep 1
-        return
-    fi
-
-    if [[ "$input_nodes" == "all" ]]; then
-        SELECTED_NODES=("${NODE_MAP[@]}")
-    else
-        SELECTED_NODES=()
-        for i in $input_nodes; do
-            NODE=${NODE_MAP[$i]}
-            if [ -n "$NODE" ]; then
-                SELECTED_NODES+=("$NODE")
-            else
-                echo -e "${YELLOW}⚠ 序号 $i 无效，已跳过${RESET}"
-            fi
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
-    fi
-
-    if [ ${#SELECTED_NODES[@]} -eq 0 ]; then
-        echo -e "${YELLOW}没有有效节点${RESET}"
-        sleep 1
-        return
-    fi
-
-    # ===== 执行批量操作 =====
-    for NODE_NAME in "${SELECTED_NODES[@]}"; do
-        NODE_DIR="$APP_DIR/$NODE_NAME"
-
-        if [ ! -f "$NODE_DIR/docker-compose.yml" ]; then
-            echo -e "${YELLOW}⚠ 跳过 $NODE_NAME：未找到 docker-compose.yml${RESET}"
-            continue
-        fi
-
-        cd "$NODE_DIR" || continue
-
-        case $choice in
-            1)
-                docker compose pause
-                ;;
-            2)
-                docker compose restart
-                ;;
-            3)
-                docker compose pull
-                docker compose up -d
-                ;;
-            4)
-                docker compose down
-                rm -rf "$NODE_DIR"
-                ;;
-        esac
-
-        echo -e "${GREEN}✅ 节点 $NODE_NAME 操作完成${RESET}"
     done
-
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
-}
-show_all_status() {
-    list_nodes
-    echo -e "${GREEN}=== 节点状态 ===${RESET}"
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        NODE_NAME=$(basename "$node")
-        CONF_FILE="$node/snell-server.conf"
-
-        # 从配置文件读取第一个 listen 端口
-        if [ -f "$CONF_FILE" ]; then
-            PORT=$(grep -E '^listen\s*=' "$CONF_FILE" | head -n1 | awk -F: '{print $2}')
-        else
-            PORT="未知"
-        fi
-
-        STATUS=$(docker ps --filter "name=$NODE_NAME" --format "{{.Status}}")
-        [ -z "$STATUS" ] && STATUS="未启动"
-
-        echo -e "${GREEN}$NODE_NAME${RESET} | ${YELLOW}端口: ${PORT}${RESET} | ${YELLOW}状态: ${STATUS}${RESET}"
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
     done
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
+    echo "无法获取公网 IP 地址。"
 }
 
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Snell 节点管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动新节点${RESET}"
-        echo -e "${GREEN}2) 管理已有节点${RESET}"
-        echo -e "${GREEN}3) 查看所有节点状态${RESET}"
-        echo -e "${GREEN}4) 批量操作所有节点${RESET}"
+        echo -e "${GREEN}=== 3x-ui 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
         case $choice in
-            1) install_node ;;
-            2) node_action_menu ;;
-            3) show_all_status ;;
-            4) batch_action ;;
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
             0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
         esac
     done
+}
+
+install_app() {
+    check_docker
+    mkdir -p "$APP_DIR"
+    mkdir -p "$APP_DIR/db"
+    mkdir -p "$APP_DIR/cert"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  3xui:
+    image: ghcr.io/mhsanaei/3x-ui:latest
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - $APP_DIR/db/:/etc/x-ui/
+      - $APP_DIR/cert/:/root/cert/
+    environment:
+      XRAY_VMESS_AEAD_FORCED: "false"
+      XUI_ENABLE_FAIL2BAN: "false"
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    SERVER_IP=$(get_public_ip)
+
+    echo -e "${GREEN}✅ 3x-ui 已启动${RESET}"
+    echo -e "${YELLOW}🌐 公网 IP: ${SERVER_IP}${RESET}"
+    echo -e "${YELLOW}🔌 面板端口: ${PORT}${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    echo -e "${GREEN}📂 数据存放目录: $APP_DIR/db${RESET}"
+    echo -e "${GREEN}📂 证书存放目录: $APP_DIR/cert${RESET}"
+    echo -e "${GREEN}📂 面板证书设置:/root/cert/cert.crt${RESET}"
+    echo -e "${GREEN}📂 面板证书设置:/root/cert/private.key${RESET}"
+    echo -e "${RED}首次登录后请修改默认用户名密码！${RESET}"
+    echo -e "${YELLOW}账号/密码:admin/admin${RESET}"
+    echo -e "${YELLOW}访问地址: http://${SERVER_IP}:2053${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ 3x-ui 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+    docker restart ${CONTAINER_NAME}
+    echo -e "${GREEN}✅ 3x-ui 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
+    docker logs -f ${CONTAINER_NAME}
+}
+
+check_status() {
+    docker ps | grep ${CONTAINER_NAME}
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    docker compose -f ${COMPOSE_FILE} down
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ 3x-ui 已卸载${RESET}"
+    read -p "按回车返回菜单..."
 }
 
 menu

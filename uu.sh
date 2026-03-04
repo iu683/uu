@@ -1,25 +1,36 @@
 #!/bin/bash
-# ========================================
-# Snell 多节点管理脚本（彩色菜单 + 节点状态查看）
-# ========================================
+set -e
 
+# ================== 颜色 ==================
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-APP_NAME="snell-server"
-APP_DIR="/opt/$APP_NAME"
+# ================== 变量 ==================
+SNELL_DIR="/etc/snell"
+SNELL_CONFIG="$SNELL_DIR/snell-server.conf"
+SNELL_SERVICE="/etc/systemd/system/snell.service"
+LOG_FILE="/var/log/snell_manager.log"
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
+# ================== 工具函数 ==================
+create_user() {
+    id -u snell &>/dev/null || useradd -r -s /usr/sbin/nologin snell
+}
+
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
 }
 
 check_port() {
@@ -29,287 +40,242 @@ check_port() {
     fi
 }
 
-list_nodes() {
-    mkdir -p "$APP_DIR"
-    echo -e "${GREEN}=== 已有 Snell 节点 ===${RESET}"
-    local count=0
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        echo -e "${YELLOW}[$count] $(basename "$node")${RESET}"
-    done
-    [ $count -eq 0 ] && echo -e "${YELLOW}无节点${RESET}"
+random_key() {
+    tr -dc A-Za-z0-9 </dev/urandom | head -c 16
 }
 
-select_node() {
-    list_nodes
-    read -r -p $'\033[32m请输入节点名称或编号: \033[0m' input
-    if [[ "$input" =~ ^[0-9]+$ ]]; then
-        NODE_NAME=$(ls -d "$APP_DIR"/* | sed -n "${input}p" | xargs basename)
+random_port() {
+    shuf -i 2000-65000 -n 1
+}
+
+get_system_dns() {
+    grep -E "^nameserver" /etc/resolv.conf | awk '{print $2}' | paste -sd "," -
+}
+
+pause() {
+    read -n 1 -s -r -p "按任意键返回菜单..."
+}
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+# ================== 配置 Snell ==================
+configure_snell() {
+    echo -e "${GREEN}[信息]开始配置 Snell...${RESET}"
+    mkdir -p $SNELL_DIR
+
+    # ===== 端口自定义 / 随机 =====
+    read -p "请输入端口 [1025-65535, 默认随机]: " input_port
+    if [[ -z "$input_port" ]]; then
+        port=$(shuf -i 1025-65535 -n1)
     else
-        NODE_NAME="$input"
+        port=$input_port
     fi
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-    if [ ! -d "$NODE_DIR" ]; then
-        echo -e "${RED}节点不存在！${RESET}"
-        return 1
-    fi
-}
+    check_port "$port" || return
 
-install_node() {
-    check_docker
-    read -p "请输入节点名称 [node$(date +%s)]: " NODE_NAME
-    NODE_NAME=${NODE_NAME:-node$(date +%s)}
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-    mkdir -p "$NODE_DIR/data"
+    read -p "请输入Snell密钥 (默认:随机生成): " key
+    key=${key:-$(random_key)}
 
-    # 监听端口
-    read -p "请输入监听端口 [1025-65535, 默认随机]: " input_port
-    PORT=${input_port:-$(shuf -i 1025-65535 -n1)}
-    check_port "$PORT" || return
-
-    # 随机 PSK
-    PSK=$(tr -dc A-Za-z0-9 </dev/urandom | head -c32)
-
-    # IPv6 开关
-    read -p "是否启用 IPv6 [true/false, 默认 false]: " ipv6
-    IPv6=${ipv6:-false}
-
-    # 混淆
-    read -p "混淆模式 [off/http, 默认 off]: " obfs
-    OBFS=${obfs:-off}
-    if [ "$OBFS" = "http" ]; then
-        read -p "请输入混淆 Host [默认 example.com]: " obfs_host
-        OBFS_HOST=${obfs_host:-example.com}
-    else
-        OBFS_HOST=""
-    fi
-
-    # TCP Fast Open
-    read -p "是否启用 TCP Fast Open [true/false, 默认 true]: " tfo
-    TFO=${tfo:-true}
-
-    # ECN
-    ECN=true
-
-    # ========================
-    # 生成 snell-server.conf
-    # ========================
-    CONF_FILE="$NODE_DIR/snell-server.conf"
-    cat > "$CONF_FILE" <<EOF
-[snell-server]
-listen = 0.0.0.0:$PORT
-psk = $PSK
-tfo = $TFO
-ecn = $ECN
-EOF
-
-    # 条件写入 IPv6
-    if [[ "$IPv6" == "true" ]]; then
-        echo "listen = [::]:$PORT" >> "$CONF_FILE"
-    fi
-
-    # 条件写入 OBFS
-    if [[ "$OBFS" != "off" ]]; then
-        echo "obfs = $OBFS" >> "$CONF_FILE"
-        if [[ "$OBFS" == "http" && -n "$OBFS_HOST" ]]; then
-            echo "obfs-host = $OBFS_HOST" >> "$CONF_FILE"
-        fi
-    fi
-
-    # ========================
-    # 生成 docker-compose.yml
-    # ========================
-    cat > "$NODE_DIR/docker-compose.yml" <<EOF
-services:
-  $NODE_NAME:
-    image: 1byte/snell-server:latest
-    container_name: $NODE_NAME
-    restart: always
-    network_mode: host
-    volumes:
-      - ./snell-server.conf:/app/snell-server.conf:ro
-EOF
-
-    # 启动节点
-    cd "$NODE_DIR" || return
-    docker compose up -d
-
-    IP=$(hostname -I | awk '{print $1}')
-    echo -e "${GREEN}📂 安装目录: $NODE_DIR${RESET}"
-    echo -e "${GREEN}📄 V6VPS替换IP地址为V6⭐${RESET}"
-    echo -e "${GREEN}✅ 节点 ${NODE_NAME} 已启动${RESET}"
-    echo -e "${YELLOW}🌐 端口: ${PORT}${RESET}"
-    echo -e "${YELLOW}🔑 PSK: ${PSK}${RESET}"
-    echo -e "${YELLOW}📄 客户端配置:${RESET}"
-    echo -e "${YELLOW}$NODE_NAME = snell, ${IP}, ${PORT}, psk=${PSK}, version=5, reuse=true, tfo=${TFO}, ecn=${ECN}${RESET}"
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
-}
-node_action_menu() {
-    select_node || return
-    while true; do
-        echo -e "${GREEN}=== 节点 [$NODE_NAME] 管理 ===${RESET}"
-        echo -e "${GREEN}1) 暂停${RESET}"
-        echo -e "${GREEN}2) 重启${RESET}"
-        echo -e "${GREEN}3) 更新${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 卸载${RESET}"
-        echo -e "${GREEN}0) 返回主菜单${RESET}"
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
-        case $choice in
-            1) docker pause "$NODE_NAME" ;;
-            2) docker restart "$NODE_NAME" ;;
-            3) docker compose -f "$NODE_DIR/docker-compose.yml" pull && docker compose -f "$NODE_DIR/docker-compose.yml" up -d ;;
-            4) docker logs -f "$NODE_NAME" ;;
-            5) docker compose -f "$NODE_DIR/docker-compose.yml" down && rm -rf "$NODE_DIR" && return ;;
-            0) return ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-    done
-}
-
-batch_action() {
-    echo -e "${GREEN}=== 批量操作 ===${RESET}"
-    echo -e "${GREEN}1) 暂停节点${RESET}"
-    echo -e "${GREEN}2) 重启节点${RESET}"
-    echo -e "${GREEN}3) 更新节点${RESET}"
-    echo -e "${GREEN}4) 卸载节点${RESET}"
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
-
-    read -r -p $'\033[32m请选择操作: \033[0m' choice
-
-    case "$choice" in
-        1|2|3|4) ;;
-        0) return ;;
-        *)
-            echo -e "${RED}无效选择${RESET}"
-            sleep 1
-            return
-            ;;
+    echo -e "${YELLOW}配置 OBFS：[注意] 无特殊作用不建议启用${RESET}"
+    echo "1. TLS   2. HTTP   3. 关闭"
+    read -p "(默认: 3): " obfs
+    case $obfs in
+        1) obfs="tls" ;;
+        2) obfs="http" ;;
+        *) obfs="off" ;;
     esac
 
-    mkdir -p "$APP_DIR"
+    echo -e "${YELLOW}是否开启 IPv6 解析？${RESET}"
+    echo "1. 开启   2. 关闭"
+    read -p "(默认: 2): " ipv6
+    ipv6=${ipv6:-2}
+    ipv6=$([ "$ipv6" = "1" ] && echo true || echo false)
 
-    declare -A NODE_MAP
-    local count=0
+    echo -e "${YELLOW}是否开启 TCP Fast Open？${RESET}"
+    echo "1. 开启   2. 关闭"
+    read -p "(默认: 1): " tfo
+    tfo=${tfo:-1}
+    tfo=$([ "$tfo" = "1" ] && echo true || echo false)
 
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        NODE_NAME=$(basename "$node")
-        NODE_MAP[$count]="$NODE_NAME"
-        echo -e "${YELLOW}[$count] $NODE_NAME${RESET}"
-    done
+    default_dns=$(get_system_dns)
+    [[ -z "$default_dns" ]] && default_dns="1.1.1.1,8.8.8.8"
+    read -p "请输入 DNS (默认: $default_dns): " dns
+    dns=${dns:-$default_dns}
 
-    if [ $count -eq 0 ]; then
-        echo -e "${YELLOW}无节点${RESET}"
-        read -r -p $'\033[32m按回车返回菜单...\033[0m'
-        return
-    fi
-
-    read -r -p $'\033[32m请输入节点序号（空格分隔，或 all 全选）: \033[0m' input_nodes
-
-    if [ -z "$input_nodes" ]; then
-        echo -e "${YELLOW}未选择节点${RESET}"
-        sleep 1
-        return
-    fi
-
-    if [[ "$input_nodes" == "all" ]]; then
-        SELECTED_NODES=("${NODE_MAP[@]}")
+    if [[ "$ipv6" == "true" ]]; then
+        LISTEN="::0:$port"
     else
-        SELECTED_NODES=()
-        for i in $input_nodes; do
-            NODE=${NODE_MAP[$i]}
-            if [ -n "$NODE" ]; then
-                SELECTED_NODES+=("$NODE")
-            else
-                echo -e "${YELLOW}⚠ 序号 $i 无效，已跳过${RESET}"
-            fi
-        done
+        LISTEN="0.0.0.0:$port"
+    fi
+    cat > $SNELL_CONFIG <<EOF
+[snell-server]
+listen = $LISTEN
+psk = $key
+obfs = $obfs
+ipv6 = $ipv6
+tfo = $tfo
+dns = $dns
+EOF
+
+    # 获取公网 IP
+    IP=$(get_public_ip)
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')=$(hostname -s | sed 's/ /_/g')
+
+    # 写 Surge 示例
+    cat <<EOF > $SNELL_DIR/config.txt
+$HOSTNAME = snell, $IP, $port, psk=$key, version=5, tfo=$tfo, reuse=true, ecn=true
+EOF
+
+    echo -e "${GREEN}[完成] 配置已写入 $SNELL_CONFIG${RESET}"
+    echo -e "${GREEN}====== Snell Server 配置信息 ======${RESET}"
+    echo -e "${YELLOW} IPv4 地址      : $IP${RESET}"
+    echo -e "${YELLOW} 端口           : $port${RESET}"
+    echo -e "${YELLOW} 密钥           : $key${RESET}"
+    echo -e "${YELLOW} OBFS           : $obfs${RESET}"
+    echo -e "${YELLOW} IPv6           : $ipv6${RESET}"
+    echo -e "${YELLOW} TFO            : $tfo${RESET}"
+    echo -e "${YELLOW} DNS            : $dns${RESET}"
+    echo -e "${YELLOW} 版本           : 5${RESET}"
+    echo -e "${YELLOW}---------------------------------${RESET}"
+    echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
+    echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
+    cat $SNELL_DIR/config.txt
+    echo -e "${YELLOW}---------------------------------\n${RESET}"
+}
+
+# ================== 安装 Snell ==================
+install_snell() {
+    echo -e "${GREEN}[信息] 开始安装 Snell...${RESET}"
+    create_user
+    mkdir -p $SNELL_DIR
+    cd $SNELL_DIR
+
+    ARCH=$(uname -m)
+    VERSION="v5.0.1"
+    if [[ "$ARCH" == "aarch64" ]]; then
+        SNELL_URL="https://dl.nssurge.com/snell/snell-server-${VERSION}-linux-aarch64.zip"
+    else
+        SNELL_URL="https://dl.nssurge.com/snell/snell-server-${VERSION}-linux-amd64.zip"
     fi
 
-    if [ ${#SELECTED_NODES[@]} -eq 0 ]; then
-        echo -e "${YELLOW}没有有效节点${RESET}"
-        sleep 1
+    wget -O snell.zip "$SNELL_URL"
+    unzip -o snell.zip -d $SNELL_DIR
+    rm -f snell.zip
+    chmod +x $SNELL_DIR/snell-server
+
+    configure_snell
+
+    # systemd 文件
+    cat > $SNELL_SERVICE <<EOF
+[Unit]
+Description=Snell Server
+After=network.target
+
+[Service]
+ExecStart=$SNELL_DIR/snell-server -c $SNELL_CONFIG
+Restart=on-failure
+User=snell
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable snell
+    systemctl start snell
+    echo -e "${GREEN}[完成] Snell 已安装并启动${RESET}"
+    log "Snell 已安装并启动"
+}
+
+# ================== 更新 Snell ==================
+update_snell() {
+    echo -e "${GREEN}[信息] 更新 Snell...${RESET}"
+
+    if [ ! -f "$SNELL_CONFIG" ]; then
+        echo -e "${RED}未找到配置文件，无法更新${RESET}"
         return
     fi
 
-    # ===== 执行批量操作 =====
-    for NODE_NAME in "${SELECTED_NODES[@]}"; do
-        NODE_DIR="$APP_DIR/$NODE_NAME"
+    systemctl stop snell || true
+    cd $SNELL_DIR
 
-        if [ ! -f "$NODE_DIR/docker-compose.yml" ]; then
-            echo -e "${YELLOW}⚠ 跳过 $NODE_NAME：未找到 docker-compose.yml${RESET}"
-            continue
-        fi
+    ARCH=$(uname -m)
+    VERSION="v5.0.1"
 
-        cd "$NODE_DIR" || continue
+    if [[ "$ARCH" == "aarch64" ]]; then
+        SNELL_URL="https://dl.nssurge.com/snell/snell-server-${VERSION}-linux-aarch64.zip"
+    else
+        SNELL_URL="https://dl.nssurge.com/snell/snell-server-${VERSION}-linux-amd64.zip"
+    fi
 
-        case $choice in
-            1)
-                docker compose pause
-                ;;
-            2)
-                docker compose restart
-                ;;
-            3)
-                docker compose pull
-                docker compose up -d
-                ;;
-            4)
-                docker compose down
-                rm -rf "$NODE_DIR"
-                ;;
-        esac
+    wget -O snell.zip "$SNELL_URL"
+    unzip -o snell.zip -d $SNELL_DIR
+    rm -f snell.zip
+    chmod +x $SNELL_DIR/snell-server
 
-        echo -e "${GREEN}✅ 节点 $NODE_NAME 操作完成${RESET}"
-    done
+    systemctl restart snell
 
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
-}
-show_all_status() {
-    list_nodes
-    echo -e "${GREEN}=== 节点状态 ===${RESET}"
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        NODE_NAME=$(basename "$node")
-        CONF_FILE="$node/snell-server.conf"
-
-        # 从配置文件读取第一个 listen 端口
-        if [ -f "$CONF_FILE" ]; then
-            PORT=$(grep -E '^listen\s*=' "$CONF_FILE" | head -n1 | awk -F: '{print $2}')
-        else
-            PORT="未知"
-        fi
-
-        STATUS=$(docker ps --filter "name=$NODE_NAME" --format "{{.Status}}")
-        [ -z "$STATUS" ] && STATUS="未启动"
-
-        echo -e "${GREEN}$NODE_NAME${RESET} | ${YELLOW}端口: ${PORT}${RESET} | ${YELLOW}状态: ${STATUS}${RESET}"
-    done
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
+    echo -e "${GREEN}[完成] Snell 已更新${RESET}"
+    log "Snell 已更新 "
 }
 
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== Snell 节点管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动新节点${RESET}"
-        echo -e "${GREEN}2) 管理已有节点${RESET}"
-        echo -e "${GREEN}3) 查看所有节点状态${RESET}"
-        echo -e "${GREEN}4) 批量操作所有节点${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
-        case $choice in
-            1) install_node ;;
-            2) node_action_menu ;;
-            3) show_all_status ;;
-            4) batch_action ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
-        esac
-    done
+# ================== 卸载 Snell ==================
+uninstall_snell() {
+    echo -e "${RED}[警告] 卸载 Snell...${RESET}"
+    systemctl stop snell || true
+    systemctl disable snell || true
+    rm -f $SNELL_SERVICE
+    rm -rf $SNELL_DIR
+    systemctl daemon-reload
+    echo -e "${GREEN}[完成] Snell 已卸载${RESET}"
+    log "Snell 已卸载"
 }
 
-menu
+# ================== 菜单 ==================
+show_menu() {
+    clear
+    echo -e "${GREEN}====== Snell 管理 ======${RESET}"
+    echo -e "${GREEN}1. 安装 Snell${RESET}"
+    echo -e "${GREEN}2. 更新 Snell${RESET}"
+    echo -e "${GREEN}3. 卸载 Snell${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 Snell${RESET}"
+    echo -e "${GREEN}6. 停止 Snell${RESET}"
+    echo -e "${GREEN}7. 重启 Snell${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看当前配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+}
+
+# ================== 主循环 ==================
+while true; do
+    show_menu
+    read -r -p $'\033[32m请输入选项: \033[0m' choice
+    case $choice in
+        1) install_snell; pause ;;
+        2) update_snell; pause ;;
+        3) uninstall_snell; pause ;;
+        4) configure_snell; systemctl restart snell; pause ;;
+        5) systemctl start snell; echo -e "${GREEN}[完成] Snell 已启动${RESET}"; log "Snell 启动"; pause ;;
+        6) systemctl stop snell; echo -e "${GREEN}[完成] Snell 已停止${RESET}"; log "Snell 停止"; pause ;;
+        7) systemctl restart snell; echo -e "${GREEN}[完成] Snell 已重启${RESET}"; log "Snell 重启"; pause ;;
+        8) journalctl -u snell -e --no-pager; pause ;;
+        9)
+            if [ -f "$SNELL_CONFIG" ]; then
+                echo -e "${GREEN}====== 当前 Snell 配置 ======${RESET}"
+                cat "$SNELL_CONFIG"
+                echo -e "${GREEN}====== Surge 配置示例 ======${RESET}"
+                cat "$SNELL_DIR/config.txt"
+            else
+                echo -e "${RED}配置文件不存在${RESET}"
+            fi
+            pause
+            ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效输入${RESET}"; pause ;;
+    esac
+done

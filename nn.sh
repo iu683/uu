@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# H UI 一键管理脚本（Host模式）
+# Backrest 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,10 +8,9 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="h-ui"
-APP_DIR="/root/$APP_NAME"
+APP_NAME="backrest"
+APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONTAINER_NAME="h-ui"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -24,26 +23,17 @@ check_docker() {
     fi
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。"
+check_port() {
+    if ss -tuln | grep -qE "[:.]$1\b"; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
 }
-
 
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== H-UI 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Backrest 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -68,8 +58,7 @@ menu() {
 
 install_app() {
     check_docker
-    mkdir -p "$APP_DIR"
-    mkdir -p "$APP_DIR/my_acme_dir"
+    mkdir -p "$APP_DIR/data" "$APP_DIR/config" "$APP_DIR/cache" "$APP_DIR/tmp"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -77,76 +66,106 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入面板端口 [默认8081]: " PANEL_PORT
-    PANEL_PORT=${PANEL_PORT:-8081}
+    read -p "请输入访问端口 [默认:9898]: " input_port
+    PORT=${input_port:-9898}
+    check_port "$PORT" || return
 
-    mkdir -p "$APP_DIR"/{bin,data,export,logs}
+    echo
+    echo -e "${GREEN}请输入需要备份的目录（多个用空格分隔）${RESET}"
+    echo -e "${YELLOW}示例: /root /data/apps /etc/caddy${RESET}"
+    read -p "默认:/opt → " input_backup
+
+    if [ -z "$input_backup" ]; then
+        BACKUP_DIRS="/opt"
+    else
+        BACKUP_DIRS="$input_backup"
+    fi
+
+    echo
+    read -p "请输入 rclone 配置目录 [默认:$APP_DIR/rclone]: " input_rclone
+    RCLONE_DIR=${input_rclone:-$APP_DIR/rclone}
+    mkdir -p "$RCLONE_DIR"
+
+    # 构建多目录挂载
+    VOLUME_MOUNTS=""
+    for dir in $BACKUP_DIRS; do
+        if [ ! -d "$dir" ]; then
+            echo -e "${YELLOW}目录 $dir 不存在，自动创建...${RESET}"
+            mkdir -p "$dir"
+        fi
+        name=$(basename "$dir")
+        VOLUME_MOUNTS+="      - $dir:/userdata/$name:ro"$'\n'
+    done
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  h-ui:
-    image: jonssonyan/h-ui
-    container_name: ${CONTAINER_NAME}
-    restart: always
-    network_mode: host
-    cap_add:
-      - NET_ADMIN
-    environment:
-      - TZ=Asia/Shanghai
+  backrest:
+    image: garethgeorge/backrest:latest
+    container_name: backrest
+    hostname: backrest
     volumes:
-      - $APP_DIR/bin:/h-ui/bin
-      - $APP_DIR/data:/h-ui/data
-      - $APP_DIR/export:/h-ui/export
-      - $APP_DIR/logs:/h-ui/logs
-      - $APP_DIR/my_acme_dir:/h-ui/my_acme_dir
-    command: ./h-ui -p ${PANEL_PORT}
+      - ./data:/data
+      - ./config:/config
+      - ./cache:/cache
+      - ./tmp:/tmp
+      - $RCLONE_DIR:/root/.config/rclone
+$VOLUME_MOUNTS
+    environment:
+      - BACKREST_DATA=/data
+      - BACKREST_CONFIG=/config/config.json
+      - XDG_CACHE_HOME=/cache
+      - TMPDIR=/tmp
+      - TZ=Asia/Shanghai
+    ports:
+      - "127.0.0.1:${PORT}:9898"
+    restart: unless-stopped
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    SERVER_IP=$(get_public_ip)
-
     echo
-    echo -e "${GREEN}✅ H-UI 已启动${RESET}"
-    echo -e "${YELLOW}🌐 公网 IP: ${SERVER_IP}${RESET}"
-    echo -e "${YELLOW}🔌 面板端口: ${PANEL_PORT}${RESET}"
-    echo -e "${YELLOW}📂 数据目录: $APP_DIR${RESET}"
-    echo -e "${YELLOW}📜 证书目录: $APP_DIR/my_acme_dir${RESET}"
-    echo -e "${YELLOW}✅ 登录用户名/密码: sysadmin/sysadmin${RESET}"
-    echo -e "${YELLOW}✅ 连接密码: sysadmin.sysadmin${RESET}"
-    echo -e "${YELLOW}访问地址: http://${SERVER_IP}:${PANEL_PORT}${RESET}"
+    echo -e "${GREEN}✅ Backrest 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📂 容器内备份路径统一为: /userdata${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    echo -e "${YELLOW}在Backrest中添加Source时填写: /userdata${RESET}"
     read -p "按回车返回菜单..."
 }
-
 update_app() {
     cd "$APP_DIR" || return
     docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ H-UI更新完成${RESET}"
+    docker compose up -d --remove-orphans
+    docker image prune -f
+    echo -e "${GREEN}✅ Backrest 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart ${CONTAINER_NAME}
-    echo -e "${GREEN}✅ H-UI已重启${RESET}"
+    docker restart backrest
+    echo -e "${GREEN}✅ Backrest 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f ${CONTAINER_NAME}
+    docker logs -f backrest
 }
 
 check_status() {
-    docker ps | grep ${CONTAINER_NAME}
+    if docker ps --format '{{.Names}}' | grep -q "^backrest$"; then
+        echo -e "${GREEN}Backrest 运行中${RESET}"
+    else
+        echo -e "${RED}Backrest 未运行${RESET}"
+    fi
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
-    docker compose -f ${COMPOSE_FILE} down
+    cd "$APP_DIR" || return
+    docker compose down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ H-UI已卸载${RESET}"
+    echo -e "${RED}✅ Backrest 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

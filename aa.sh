@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# 3x-ui 一键管理脚本（Host模式）
+# Backrest 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,10 +8,9 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="3x-ui"
-APP_DIR="/root/$APP_NAME"
+APP_NAME="backrest"
+APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONTAINER_NAME="3xui_app"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -24,26 +23,17 @@ check_docker() {
     fi
 }
 
-
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。"
+check_port() {
+    if ss -tuln | grep -qE "[:.]$1\b"; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
 }
 
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== 3x-ui 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Backrest 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -68,9 +58,7 @@ menu() {
 
 install_app() {
     check_docker
-    mkdir -p "$APP_DIR"
-    mkdir -p "$APP_DIR/db"
-    mkdir -p "$APP_DIR/cert"
+    mkdir -p "$APP_DIR/data" "$APP_DIR/config" "$APP_DIR/cache" "$APP_DIR/rclone"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -78,66 +66,88 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
+    read -p "请输入访问端口 [默认:9898]: " input_port
+    PORT=${input_port:-9898}
+    check_port "$PORT" || return
+
+    read -p "请输入需要备份的目录 [默认:/data/apps]: " input_backup
+    BACKUP_SOURCE=${input_backup:-/data/apps}
+
+    if [ ! -d "$BACKUP_SOURCE" ]; then
+        echo -e "${YELLOW}目录不存在，自动创建...${RESET}"
+        mkdir -p "$BACKUP_SOURCE"
+    fi
+
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  3xui:
-    image: ghcr.io/mhsanaei/3x-ui:latest
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    network_mode: host
+  backrest:
+    image: garethgeorge/backrest:latest
+    container_name: backrest
+    hostname: backrest
     volumes:
-      - $APP_DIR/db/:/etc/x-ui/
-      - $APP_DIR/cert/:/root/cert/
+      - ./data/data:/data
+      - ./data/config:/config
+      - ./data/cache:/cache
+      - /tmp:/tmp
+      - ./rclone:/root/.config/rclone
+      - ${BACKUP_SOURCE}:/apps:ro
     environment:
-      XRAY_VMESS_AEAD_FORCED: "false"
-      XUI_ENABLE_FAIL2BAN: "false"
+      - BACKREST_DATA=/data
+      - BACKREST_CONFIG=/config/config.json
+      - XDG_CACHE_HOME=/cache
+      - TMPDIR=/tmp
+      - TZ=Asia/Shanghai
+    ports:
+      - "127.0.0.1:${PORT}:9898"
+    restart: unless-stopped
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    SERVER_IP=$(get_public_ip)
 
-    echo -e "${GREEN}✅ 3x-ui 已启动${RESET}"
+    echo
+    echo -e "${GREEN}✅ Backrest 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📂 备份目录: ${BACKUP_SOURCE}${RESET}"
     echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
-    echo -e "${YELLOW}📂 数据存放目录: $APP_DIR/db${RESET}"
-    echo -e "${YELLOW}📂 证书存放目录: $APP_DIR/cert${RESET}"
-    echo -e "${YELLOW}📂 面板证书设置:/root/cert/cert.crt${RESET}"
-    echo -e "${YELLOW}📂 面板证书设置:/root/cert/private.key${RESET}"
-    echo -e "${RED}首次登录后请修改默认用户名密码！${RESET}"
-    echo -e "${YELLOW}账号/密码:admin/admin${RESET}"
-    echo -e "${YELLOW}访问地址: http://${SERVER_IP}:2053${RESET}"
     read -p "按回车返回菜单..."
 }
 
 update_app() {
     cd "$APP_DIR" || return
     docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ 3x-ui 更新完成${RESET}"
+    docker compose up -d --remove-orphans
+    docker image prune -f
+    echo -e "${GREEN}✅ Backrest 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart ${CONTAINER_NAME}
-    echo -e "${GREEN}✅ 3x-ui 已重启${RESET}"
+    docker restart backrest
+    echo -e "${GREEN}✅ Backrest 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f ${CONTAINER_NAME}
+    docker logs -f backrest
 }
 
 check_status() {
-    docker ps | grep ${CONTAINER_NAME}
+    if docker ps --format '{{.Names}}' | grep -q "^backrest$"; then
+        echo -e "${GREEN}Backrest 运行中${RESET}"
+    else
+        echo -e "${RED}Backrest 未运行${RESET}"
+    fi
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
-    docker compose -f ${COMPOSE_FILE} down
+    cd "$APP_DIR" || return
+    docker compose down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 3x-ui 已卸载${RESET}"
+    echo -e "${RED}✅ Backrest 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

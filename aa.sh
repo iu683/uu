@@ -24,12 +24,6 @@ check_docker() {
     fi
 }
 
-check_port() {
-    if ss -tulnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
 
 get_public_ip() {
     local ip
@@ -75,21 +69,14 @@ menu() {
 install_app() {
     check_docker
     mkdir -p "$APP_DIR"
+    mkdir -p "$APP_DIR/db"
+    mkdir -p "$APP_DIR/cert"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
         read confirm
         [[ "$confirm" != "y" ]] && return
     fi
-
-    read -p "请输入面板端口 [默认随机20000-40000]: " input_port
-    if [[ -z "$input_port" ]]; then
-        PORT=$(shuf -i 20000-40000 -n1)
-    else
-        PORT=$input_port
-    fi
-
-    check_port "$PORT" || return
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
@@ -98,10 +85,12 @@ services:
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
     network_mode: host
+    volumes:
+      - $APP_DIR/db/:/etc/x-ui/
+      - $APP_DIR/cert/:/root/cert/
     environment:
-      XRAY_VMESS_AEAD_FORCED: "true"
-      XUI_ENABLE_FAIL2BAN: "true"
-      PANEL_PORT: "${PORT}"
+      XRAY_VMESS_AEAD_FORCED: "false"
+      XUI_ENABLE_FAIL2BAN: "false"
 EOF
 
     cd "$APP_DIR" || exit
@@ -110,13 +99,14 @@ EOF
     SERVER_IP=$(get_public_ip)
 
     echo -e "${GREEN}✅ 3x-ui 已启动${RESET}"
-    echo -e "${YELLOW}🌐 公网 IP: ${SERVER_IP}${RESET}"
-    echo -e "${YELLOW}🔌 面板端口: ${PORT}${RESET}"
     echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
-    echo
+    echo -e "${YELLOW}📂 数据存放目录: $APP_DIR/db${RESET}"
+    echo -e "${YELLOW}📂 证书存放目录: $APP_DIR/cert${RESET}"
+    echo -e "${YELLOW}📂 面板证书设置:/root/cert/cert.crt${RESET}"
+    echo -e "${YELLOW}📂 面板证书设置:/root/cert/private.key${RESET}"
     echo -e "${RED}首次登录后请修改默认用户名密码！${RESET}"
     echo -e "${YELLOW}账号/密码:admin/admin${RESET}"
-    echo -e "${YELLOW}访问地址: http://${SERVER_IP}:${PORT}${RESET}"
+    echo -e "${YELLOW}访问地址: http://${SERVER_IP}:2053${RESET}"
     read -p "按回车返回菜单..."
 }
 
@@ -124,13 +114,13 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ 更新完成${RESET}"
+    echo -e "${GREEN}✅ 3x-ui 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
     docker restart ${CONTAINER_NAME}
-    echo -e "${GREEN}✅ 已重启${RESET}"
+    echo -e "${GREEN}✅ 3x-ui 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
@@ -147,7 +137,7 @@ check_status() {
 uninstall_app() {
     docker compose -f ${COMPOSE_FILE} down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已卸载${RESET}"
+    echo -e "${RED}✅ 3x-ui 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

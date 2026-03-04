@@ -24,6 +24,16 @@ check_docker() {
     fi
 }
 
+show_usage() {
+    echo -e "${GREEN}使用方法:${RESET}"
+    echo -e "${YELLOW}docker run 命令里加一行:${RESET}"
+    echo -e "${YELLOW}--label com.centurylinklabs.watchtower.enable=true${RESET}"
+    echo -e "${GREEN}你必须在 docker compose 需要更新的容器里加:${RESET}"
+    echo -e "${YELLOW}labels:${RESET}"
+    echo -e "${YELLOW}  - \"com.centurylinklabs.watchtower.enable=true\"${RESET}"
+    echo -e "${YELLOW}仅更新带 label 的容器${RESET}"
+}
+
 install_app() {
     check_docker
 
@@ -44,7 +54,7 @@ services:
       WATCHTOWER_LABEL_ENABLE: "true"
       WATCHTOWER_CLEANUP: "true"
       WATCHTOWER_INCLUDE_RESTARTING: "true"
-      WATCHTOWER_NOTIFICATION_URL: "telegram://${BOT_TOKEN}@telegram?chats=${CHAT_ID}"
+      WATCHTOWER_NOTIFICATION_URL: "telegram://${BOT_TOKEN}@telegram?chats=${CHAT_ID}&parseMode=Markdown"
       WATCHTOWER_NOTIFICATION_TEMPLATE: "{{range .}}{{.Time}} - {{.Level}} - {{.Message}}{{println}}{{end}}"
     command: --schedule "0 0 0 * * *"
 EOF
@@ -53,11 +63,8 @@ EOF
     docker compose up -d
 
     echo -e "${GREEN}✅ Watchtower 安装完成（每日0点检查更新）${RESET}" 
-    echo -e "${GREEN}使用方法:${RESET}"
-    echo -e "${GREEN}你必须在需要更新的容器里加:${RESET}"
-    echo -e "${YELLOW}labels:${RESET}"
-    echo -e "${YELLOW}  - "com.centurylinklabs.watchtower.enable=true"${RESET}"
-    echo -e "${YELLOW}仅更新带 label 的容器${RESET}"
+    show_usage
+     
 }
 
 update_app() {
@@ -68,9 +75,8 @@ update_app() {
 }
 
 manual_run() {
-    docker run --rm \
-        -v /var/run/docker.sock:/var/run/docker.sock \
-        ghcr.io/naiba-forks/watchtower --run-once
+    cd $APP_DIR || exit
+    docker compose run --rm watchtower --run-once
 }
 
 restart_app() {
@@ -109,7 +115,8 @@ show_menu() {
         echo -e "${GREEN}3. 手动立即更新一次${RESET}"
         echo -e "${GREEN}4. 重启 Watchtower${RESET}"
         echo -e "${GREEN}5. 查看日志${RESET}"
-        echo -e "${GREEN}6. 卸载 Watchtower${RESET}"
+        echo -e "${GREEN}6. 查看使用方法${RESET}"
+        echo -e "${GREEN}7. 卸载 Watchtower${RESET}"
         echo -e "${GREEN}0. 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
@@ -119,12 +126,12 @@ show_menu() {
             3) manual_run ;;
             4) restart_app ;;
             5) view_logs ;;
-            6) uninstall_app ;;
+            6) show_usage ;; 
+            7) uninstall_app ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效选择${RESET}" ;;
         esac
 
-        echo
         read -p "按回车返回菜单..." temp
     done
 }

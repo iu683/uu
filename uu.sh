@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# 3x-ui 一键管理脚本（Host模式）
+# Watchtower 一键管理脚本 (Compose 安全版)
 # ========================================
 
 GREEN="\033[32m"
@@ -8,142 +8,125 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="3x-ui"
-APP_DIR="/root/$APP_NAME"
+APP_NAME="watchtower"
+APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONTAINER_NAME="3xui_app"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
+        echo -e "${RED}❌ Docker 未安装${RESET}"
+        exit 1
     fi
+
     if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        echo -e "${RED}❌ Docker Compose 未安装${RESET}"
         exit 1
     fi
 }
 
+install_app() {
+    check_docker
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。"
+    mkdir -p $APP_DIR
+
+    read -p "请输入 Telegram BotToken: " BOT_TOKEN
+    read -p "请输入 Telegram ChatID: " CHAT_ID
+
+    cat > $COMPOSE_FILE <<EOF
+services:
+  watchtower:
+    image: ghcr.io/naiba-forks/watchtower
+    container_name: watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_INCLUDE_RESTARTING: "true"
+      WATCHTOWER_NOTIFICATION_URL: "telegram://${BOT_TOKEN}@telegram?chats=${CHAT_ID}"
+      WATCHTOWER_NOTIFICATION_TEMPLATE: "{{range .}}{{.Time}} - {{.Level}} - {{.Message}}{{println}}{{end}}"
+    command: --schedule "0 0 0 * * *"
+EOF
+
+    cd $APP_DIR
+    docker compose up -d
+
+    echo -e "${GREEN}✅ Watchtower 安装完成（每日0点检查更新）${RESET}" 
+    echo -e "${GREEN}使用方法:${RESET}"
+    echo -e "${YELLOW}docker run 命令里加一行:${RESET}"
+    echo -e "${YELLOW}--label com.centurylinklabs.watchtower.enable=true \${RESET}"
+    echo -e "${GREEN}你必须在docker compose需要更新的容器里加:${RESET}"
+    echo -e "${YELLOW}labels:${RESET}"
+    echo -e "${YELLOW}  - "com.centurylinklabs.watchtower.enable=true"${RESET}"
+    echo -e "${YELLOW}仅更新带 label 的容器${RESET}"
 }
 
-menu() {
+update_app() {
+    cd $APP_DIR || exit
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ Watchtower 已更新${RESET}"
+}
+
+manual_run() {
+    cd $APP_DIR || exit
+    docker compose run --rm watchtower --run-once
+}
+
+restart_app() {
+    cd $APP_DIR 2>/dev/null || {
+        echo -e "${RED}❌ 未安装 Watchtower${RESET}"
+        return
+    }
+
+    docker compose restart
+    echo -e "${GREEN}✅ Watchtower 已重启${RESET}"
+}
+
+view_logs() {
+    cd $APP_DIR 2>/dev/null || {
+        echo -e "${RED}❌ 未安装 Watchtower${RESET}"
+        return
+    }
+
+    echo -e "${YELLOW}按 Ctrl+C 退出日志查看${RESET}"
+    docker compose logs -f --tail=100
+}
+
+uninstall_app() {
+    cd $APP_DIR 2>/dev/null || exit
+    docker compose down
+    rm -rf $APP_DIR
+    echo -e "${RED}❌ Watchtower 已卸载${RESET}"
+}
+
+show_menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== 3x-ui 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
+        echo -e "${GREEN}==== Watchtower 管理菜单 ==== ${RESET}"
+        echo -e "${GREEN}1. 安装 Watchtower${RESET}"
+        echo -e "${GREEN}2. 更新 Watchtower${RESET}"
+        echo -e "${GREEN}3. 手动立即更新一次${RESET}"
+        echo -e "${GREEN}4. 重启 Watchtower${RESET}"
+        echo -e "${GREEN}5. 查看日志${RESET}"
+        echo -e "${GREEN}6. 卸载 Watchtower${RESET}"
+        echo -e "${GREEN}0. 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
         case $choice in
             1) install_app ;;
             2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
+            3) manual_run ;;
+            4) restart_app ;;
+            5) view_logs ;;
             6) uninstall_app ;;
             0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
         esac
+
+        read -p "按回车返回菜单..." temp
     done
 }
 
-install_app() {
-    check_docker
-    mkdir -p "$APP_DIR"
-    mkdir -p "$APP_DIR/db"
-    mkdir -p "$APP_DIR/cert"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-    read -p "请输入证书目录 [默认 $APP_DIR/cert]: " CERT_DIR
-    CERT_DIR=${CERT_DIR:-$APP_DIR/cert}
-    mkdir -p "$CERT_DIR"
-
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  3xui:
-    image: ghcr.io/mhsanaei/3x-ui:latest
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - $APP_DIR/db/:/etc/x-ui/
-      - $CERT_DIR/cert/:/root/cert/
-    environment:
-      XRAY_VMESS_AEAD_FORCED: "false"
-      XUI_ENABLE_FAIL2BAN: "false"
-EOF
-
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    SERVER_IP=$(get_public_ip)
-
-    echo -e "${GREEN}✅ 3x-ui 已启动${RESET}"
-    echo -e "${YELLOW}🌐 公网 IP: ${SERVER_IP}${RESET}"
-    echo -e "${YELLOW}🔌 面板端口: ${PORT}${RESET}"
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/db${RESET}"
-    echo -e "${GREEN}📂 证书目录: $CERT_DIR/cert${RESET}"
-    echo -e "${GREEN}📂 面板证书设置: 例如/root/cert/cert.crt${RESET}"
-    echo -e "${GREEN}📂 面板证书设置: 例如/root/cert/cert.crt${RESET}"
-    echo -e "${RED}首次登录后请修改默认用户名密码！${RESET}"
-    echo -e "${YELLOW}账号/密码:admin/admin${RESET}"
-    echo -e "${YELLOW}访问地址: http://${SERVER_IP}:2053${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ 3x-ui 更新完成${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-restart_app() {
-    docker restart ${CONTAINER_NAME}
-    echo -e "${GREEN}✅ 3x-ui 已重启${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f ${CONTAINER_NAME}
-}
-
-check_status() {
-    docker ps | grep ${CONTAINER_NAME}
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-    docker compose -f ${COMPOSE_FILE} down
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 3x-ui 已卸载${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-menu
+show_menu

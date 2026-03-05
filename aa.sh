@@ -269,7 +269,7 @@ uninstall_all(){
 # ================= 菜单 =================
 menu(){
 clear
-echo -e "${GREEN}===== Geo Firewall 稳定版 =====${RESET}"
+echo -e "${GREEN}===== Geo Firewall =====${RESET}"
 echo -e "${GREEN}1 添加规则${RESET}"
 echo -e "${GREEN}2 删除端口规则${RESET}"
 echo -e "${GREEN}3 添加白名单${RESET}"

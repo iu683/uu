@@ -227,6 +227,7 @@ add_whitelist(){
             iptables -I GEO_CHAIN 2 -s $ip -j ACCEPT
         fi
     done
+    apply_rules
     green "白名单已应用"
 }
 

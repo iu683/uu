@@ -89,73 +89,77 @@ update_ipset(){
 # ================== 应用规则 ==================
 apply_rules(){
     source $CONF 2>/dev/null
-    [[ -z "$COUNTRY" ]] && { red "未配置规则"; return; }
+    [[ -z "$COUNTRY" ]] && red "未配置规则" && return
 
     SSH_PORT=$(get_ssh_port)
     [[ -z "$SSH_PORT" ]] && SSH_PORT=22
-    green "默认放行 SSH端口: $SSH_PORT"
+    green "SSH端口: $SSH_PORT"
 
-    # 创建 GEO_CHAIN 链
-    iptables -N GEO_CHAIN 2>/dev/null
-    ip6tables -N GEO_CHAIN 2>/dev/null
-    iptables -F GEO_CHAIN
-    ip6tables -F GEO_CHAIN
+    # 清空 GEO_CHAIN 或创建
+    iptables -N GEO_CHAIN 2>/dev/null || iptables -F GEO_CHAIN
+    ip6tables -N GEO_CHAIN 2>/dev/null || ip6tables -F GEO_CHAIN
 
-    # INPUT 链跳转
     iptables -C INPUT -j GEO_CHAIN 2>/dev/null || iptables -I INPUT -j GEO_CHAIN
     ip6tables -C INPUT -j GEO_CHAIN 2>/dev/null || ip6tables -I INPUT -j GEO_CHAIN
 
-    # 基础规则
+    # ===== 1. 已建立连接放行 =====
     iptables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     ip6tables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
-    MYIP=$(get_my_ip)
-    [[ -n "$MYIP" ]] && iptables -A GEO_CHAIN -s $MYIP -j ACCEPT
+    # ===== 2. 白名单 =====
+    for ip in $WHITELIST; do
+        [[ -n "$ip" ]] || continue
+        if [[ $ip =~ : ]]; then
+            ip6tables -I GEO_CHAIN 2 -s $ip -j ACCEPT
+        else
+            iptables -I GEO_CHAIN 2 -s $ip -j ACCEPT
+        fi
+    done
 
+    # ===== 3. SSH端口放行 =====
     iptables -A GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
     ip6tables -A GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
 
-    # 白名单
-    for ip in $WHITELIST; do
-        [[ -n "$ip" ]] && {
-            iptables -I GEO_CHAIN 2 -s $ip -j ACCEPT
-            ip6tables -I GEO_CHAIN 2 -s $ip -j ACCEPT
-        }
-    done
-
+    # ===== 4. 下载IP库 =====
     CC_L=$(echo $COUNTRY | tr A-Z a-z)
     V4FILE="/opt/geoip/${CC_L}.zone"
     V6FILE="/opt/geoip/${CC_L}.ipv6.zone"
-
     curl -s -o $V4FILE https://www.ipdeny.com/ipblocks/data/countries/$CC_L.zone
     curl -s -o $V6FILE https://www.ipdeny.com/ipv6/ipaddresses/aggregated/$CC_L-aggregated.zone
 
-    update_ipset geo_v4 $V4FILE inet
-    update_ipset geo_v6 $V6FILE inet6
+    # ===== 5. 更新 ipset =====
+    update_ipset "geo_v4" "$V4FILE" inet
+    update_ipset "geo_v6" "$V6FILE" inet6
 
-    # 封锁/允许规则
+    # ===== 6. 应用国家封锁规则 =====
+    PORTS_LIST=()
+    if [[ "$PORTS" == "all" ]]; then
+        PORTS_LIST=("all")
+    else
+        read -ra PORTS_LIST <<< "$PORTS"
+    fi
+
     for proto in tcp udp; do
-        if [[ "$MODE" == "block" ]]; then
-            if [[ "$PORTS" == "all" ]]; then
-                iptables -A GEO_CHAIN -p $proto -m set --match-set geo_v4 src -j DROP
-                ip6tables -A GEO_CHAIN -p $proto -m set --match-set geo_v6 src -j DROP
-            else
-                for p in $PORTS; do
-                    iptables -A GEO_CHAIN -p $proto --dport $p -m set --match-set geo_v4 src -j DROP
+        for p in "${PORTS_LIST[@]}"; do
+            if [[ "$MODE" == "block" ]]; then
+                if [[ "$p" == "all" ]]; then
+                    iptables  -A GEO_CHAIN -p $proto -m set --match-set geo_v4 src -j DROP
+                    ip6tables -A GEO_CHAIN -p $proto -m set --match-set geo_v6 src -j DROP
+                else
+                    iptables  -A GEO_CHAIN -p $proto --dport $p -m set --match-set geo_v4 src -j DROP
                     ip6tables -A GEO_CHAIN -p $proto --dport $p -m set --match-set geo_v6 src -j DROP
-                done
-            fi
-        else
-            if [[ "$PORTS" == "all" ]]; then
-                iptables -A GEO_CHAIN -p $proto -m set ! --match-set geo_v4 src -j DROP
-                ip6tables -A GEO_CHAIN -p $proto -m set ! --match-set geo_v6 src -j DROP
+                fi
             else
-                for p in $PORTS; do
-                    iptables -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set geo_v4 src -j DROP
+                # 只允许模式：非本国封锁
+                if [[ "$p" == "all" ]]; then
+                    iptables  -A GEO_CHAIN -p $proto -m set ! --match-set geo_v4 src -j DROP
+                    ip6tables -A GEO_CHAIN -p $proto -m set ! --match-set geo_v6 src -j DROP
+                else
+                    iptables  -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set geo_v4 src -j DROP
                     ip6tables -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set geo_v6 src -j DROP
-                done
+                fi
             fi
-        fi
+        done
     done
 
     netfilter-persistent save >/dev/null 2>&1
@@ -174,8 +178,8 @@ add_rule(){
     case "$choice" in
         1)
             MODE="block"
-            read -p $'\033[32m国家代码(例如 cn JP us): \033[0m' COUNTRY
-            read -p $'\033[32m端口(例如 443 80 多个空格): \033[0m' PORTS
+            read -p $'\033[32m国家代码: \033[0m' COUNTRY
+            read -p $'\033[32m端口 (多个空格): \033[0m' PORTS
             ;;
         2)
             MODE="block"
@@ -216,18 +220,7 @@ add_whitelist(){
     echo "COUNTRY=\"$COUNTRY\"" >> $CONF
     echo "PORTS=\"$PORTS\"" >> $CONF
     echo "WHITELIST=\"$WHITELIST\"" >> $CONF
-
-    # 遍历每个 IP
-    for ip in $ips; do
-        if [[ $ip =~ : ]]; then
-            # IPv6
-            ip6tables -I GEO_CHAIN 2 -s $ip -j ACCEPT
-        else
-            # IPv4
-            iptables -I GEO_CHAIN 2 -s $ip -j ACCEPT
-        fi
-    done
-    green "白名单已应用"
+    apply_rules
 }
 
 delete_whitelist(){
@@ -235,17 +228,12 @@ delete_whitelist(){
     source $CONF 2>/dev/null
     for ip in $ips; do
         WHITELIST=$(echo $WHITELIST | sed -E "s/\b$ip\b//g")
-        if [[ $ip =~ : ]]; then
-            ip6tables -D GEO_CHAIN -s $ip -j ACCEPT 2>/dev/null
-        else
-            iptables -D GEO_CHAIN -s $ip -j ACCEPT 2>/dev/null
-        fi
     done
     echo "MODE=\"$MODE\"" > $CONF
     echo "COUNTRY=\"$COUNTRY\"" >> $CONF
     echo "PORTS=\"$PORTS\"" >> $CONF
     echo "WHITELIST=\"$WHITELIST\"" >> $CONF
-    green "白名单已删除"
+    apply_rules
 }
 
 # ================== 删除端口规则 ==================
@@ -308,7 +296,7 @@ menu(){
     echo -e "${GREEN}3 查看规则${RESET}"
     echo -e "${GREEN}4 添加白名单${RESET}"
     echo -e "${GREEN}5 删除白名单${RESET}"
-    echo -e "${GREEN}6 更新${RESET}"
+    echo -e "${GREEN}6 更新脚本${RESET}"
     echo -e "${GREEN}7 卸载${RESET}"
     echo -e "${GREEN}0 退出${RESET}"
     read -r -p $'\033[32m请选择: \033[0m' num

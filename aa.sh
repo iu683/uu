@@ -205,7 +205,35 @@ add_whitelist(){
     echo "PORTS=\"$PORTS\"" >> $CONF
     echo "WHITELIST=\"$WHITELIST\"" >> $CONF
 
-    apply_rules
+    # 应用规则
+    iptables -N $CHAIN 2>/dev/null
+    ip6tables -N $CHAIN 2>/dev/null
+    iptables -C INPUT -j $CHAIN 2>/dev/null || iptables -I INPUT -j $CHAIN
+    ip6tables -C INPUT -j $CHAIN 2>/dev/null || ip6tables -I INPUT -j $CHAIN
+
+    # 放行已建立连接
+    iptables -A $CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    ip6tables -A $CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    # SSH 永远允许
+    SSH_PORT=$(grep -i "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1)
+    [[ -z "$SSH_PORT" ]] && SSH_PORT=22
+    iptables -A $CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
+    ip6tables -A $CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
+
+    # 白名单按类型加入
+    for ip in $WHITELIST; do
+        if [[ $ip == *:* ]]; then
+            # IPv6
+            ip6tables -A $CHAIN -s $ip -j ACCEPT
+        else
+            # IPv4
+            iptables -A $CHAIN -s $ip -j ACCEPT
+        fi
+    done
+
+    netfilter-persistent save >/dev/null 2>&1
+    green "白名单已更新"
 }
 
 # ================= 查看 =================

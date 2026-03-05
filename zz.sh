@@ -22,13 +22,18 @@ red(){ echo -e "${RED}$1${RESET}"; }
 
 # ================== 初始化环境（只执行一次） ==================
 init_env(){
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y ipset iptables curl iptables-persistent netfilter-persistent
     mkdir -p /opt/geoip
     touch $CONF
-}
 
+    # 仅第一次安装依赖
+    if [[ ! -f /opt/geoip/.deps_installed ]]; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y ipset iptables curl iptables-persistent netfilter-persistent
+        touch /opt/geoip/.deps_installed
+        green "依赖安装完成"
+    fi
+}
 # ================== 自动更新IP库 ==================
 install_auto_update(){
 cat > $UPDATE_SCRIPT <<EOF

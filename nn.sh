@@ -1,152 +1,217 @@
 #!/bin/bash
-# ========================================
-# qBittorrent-Nox 一键管理脚本 (统一 /opt 文件夹)
-# ========================================
 
-# 颜色
-RED="\033[31m"
 GREEN="\033[32m"
+RED="\033[31m"
 YELLOW="\033[33m"
-CYAN="\033[36m"
 RESET="\033[0m"
 
-SERVICE_NAME="qbittorrent"
-APP_DIR="/opt/qbittorrent"
-CONFIG_DIR="$APP_DIR/config"
-DOWNLOAD_DIR="$APP_DIR/downloads"
+CONTAINER="openclaw"
+IMAGE="ghcr.io/1186258278/openclaw:latest"
+INSTALL_SCRIPT="https://cdn.jsdelivr.net/gh/1186258278/OpenClawChineseTranslation@main/docker-deploy.sh"
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。"
+install_openclaw(){
+
+echo -e "${GREEN}开始安装 OpenClaw...${RESET}"
+
+curl -fsSL $INSTALL_SCRIPT | bash
+
 }
 
-# 检查并创建目录
-mkdir -p "$CONFIG_DIR" "$DOWNLOAD_DIR"
-chown -R $(whoami):$(whoami) "$APP_DIR"
-chmod -R 755 "$APP_DIR"
+update_openclaw(){
 
-# 部署 qBittorrent-Nox
-install_qbittorrent() {
+echo -e "${GREEN}更新 OpenClaw...${RESET}"
 
-    echo -ne "请输入 WebUI 端口 (默认8080): "
-    read WEBUI_PORT
-    WEBUI_PORT=${WEBUI_PORT:-8080}
+docker pull $IMAGE
 
-    echo -e "${YELLOW}更新软件包列表...${RESET}"
-    sudo apt update
+docker stop $CONTAINER 2>/dev/null
+docker rm $CONTAINER 2>/dev/null
 
-    echo -e "${YELLOW}安装 qBittorrent-Nox...${RESET}"
-    sudo apt install -y qbittorrent-nox
+docker run -d --name openclaw -p 18789:18789 \
+-v openclaw-data:/root/.openclaw \
+--restart unless-stopped \
+$IMAGE \
+openclaw gateway run
 
-    # 创建目录
-    sudo mkdir -p "$CONFIG_DIR" "$DOWNLOAD_DIR"
-    sudo chown -R root:root "$APP_DIR"
-    sudo chmod -R 755 "$APP_DIR"
+echo -e "${GREEN}更新完成${RESET}"
 
-    echo -e "${YELLOW}创建 systemd 服务文件...${RESET}"
-
-sudo tee /etc/systemd/system/qbittorrent.service > /dev/null <<EOF
-[Unit]
-Description=qBittorrent Command Line Client
-After=network.target
-
-[Service]
-ExecStart=/usr/bin/qbittorrent-nox --webui-port=${WEBUI_PORT} --webui-host=127.0.0.1 --profile=$CONFIG_DIR
-User=root
-Restart=on-failure
-WorkingDirectory=$DOWNLOAD_DIR
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    sudo systemctl daemon-reload
-    sudo systemctl enable qbittorrent
-    sudo systemctl restart qbittorrent
-
-    echo -e "${GREEN}qBittorrent-Nox 安装完成并已启动!${RESET}"
-    echo -e "${YELLOW}WebUI 地址: http://127.0.0.1:${WEBUI_PORT}${RESET}"
-    echo -e "${YELLOW}默认用户名: admin${RESET}"
-    echo -e "${YELLOW}默认密码: 查看日志获取${RESET}"
-    echo -e "${GREEN}配置目录: $CONFIG_DIR${RESET}"
-    echo -e "${GREEN}下载目录: $DOWNLOAD_DIR${RESET}"
 }
 
-# 启动服务
-start_qbittorrent() {
-    sudo systemctl start ${SERVICE_NAME}
-    echo -e "${GREEN}qBittorrent 已启动${RESET}"
+restart_openclaw(){
+
+echo -e "${GREEN}重启 OpenClaw...${RESET}"
+
+docker restart $CONTAINER
+
 }
 
-# 停止服务
-stop_qbittorrent() {
-    sudo systemctl stop ${SERVICE_NAME}
-    echo -e "${YELLOW}qBittorrent 已停止${RESET}"
+logs_openclaw(){
+
+docker logs -f $CONTAINER
+
 }
 
-# 重启服务
-restart_qbittorrent() {
-    sudo systemctl restart ${SERVICE_NAME}
-    echo -e "${GREEN}qBittorrent 已重启${RESET}"
+status_openclaw(){
+
+docker exec $CONTAINER openclaw status
+
 }
 
-# 查看日志
-logs_qbittorrent() {
-    sudo journalctl -u ${SERVICE_NAME} -f
+config_openclaw(){
+
+docker exec $CONTAINER openclaw config get gateway
+
 }
 
-# 卸载服务
-uninstall_qbittorrent() {
-    sudo systemctl stop ${SERVICE_NAME}
-    sudo systemctl disable ${SERVICE_NAME}
-    sudo rm -f /etc/systemd/system/${SERVICE_NAME}.service
-    sudo systemctl daemon-reload
+shell_openclaw(){
 
-    echo -e "${YELLOW}是否删除配置和下载数据？[y/N]${RESET}"
-    read -r del
+docker exec -it $CONTAINER sh
 
-    if [[ "$del" == "y" || "$del" == "Y" ]]; then
-        rm -rf "$APP_DIR"
-        echo -e "${RED}配置和下载目录已删除${RESET}"
-    fi
-
-    echo -e "${GREEN}qBittorrent 已卸载${RESET}"
 }
 
-# 菜单
-menu() {
-    clear
-    echo -e "${GREEN}==== qBittorrent-Nox 管理菜单 ====${RESET}"
-    echo -e "${GREEN}1. 安装部署${RESET}"
-    echo -e "${GREEN}2. 启动${RESET}"
-    echo -e "${GREEN}3. 停止${RESET}"
-    echo -e "${GREEN}4. 重启${RESET}"
-    echo -e "${GREEN}5. 查看日志${RESET}"
-    echo -e "${GREEN}6. 卸载${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read -r choice
+docker_clean(){
 
-    case "$choice" in
-        1) install_qbittorrent ;;
-        2) start_qbittorrent ;;
-        3) stop_qbittorrent ;;
-        4) restart_qbittorrent ;;
-        5) logs_qbittorrent ;;
-        6) uninstall_qbittorrent ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
-    esac
+echo -e "${YELLOW}清理未使用 Docker 资源...${RESET}"
+
+docker system prune -a
+
 }
 
-# 循环菜单
-while true; do
-    menu
-    echo -e "${YELLOW}按回车键继续...${RESET}"
-    read -r
+uninstall_openclaw(){
+
+echo -e "${YELLOW}卸载 OpenClaw...${RESET}"
+
+docker stop $CONTAINER 2>/dev/null
+docker rm $CONTAINER 2>/dev/null
+docker volume rm openclaw-data 2>/dev/null
+
+echo -e "${GREEN}OpenClaw 已卸载 (数据已删除)${RESET}"
+
+}
+
+#!/bin/bash
+
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+RESET="\033[0m"
+
+CONTAINER="openclaw"
+IMAGE="ghcr.io/1186258278/openclaw:latest"
+INSTALL_SCRIPT="https://cdn.jsdelivr.net/gh/1186258278/OpenClawChineseTranslation@main/docker-deploy.sh"
+
+install_openclaw(){
+
+echo -e "${GREEN}开始安装 OpenClaw...${RESET}"
+
+bash <(curl -fsSL https://cdn.jsdelivr.net/gh/1186258278/OpenClawChineseTranslation@main/docker-deploy.sh)
+
+}
+update_openclaw(){
+
+echo -e "${GREEN}更新 OpenClaw...${RESET}"
+
+docker pull $IMAGE
+
+docker stop $CONTAINER 2>/dev/null
+docker rm $CONTAINER 2>/dev/null
+
+docker run -d --name openclaw -p 18789:18789 \
+-v openclaw-data:/root/.openclaw \
+--restart unless-stopped \
+$IMAGE \
+openclaw gateway run
+
+echo -e "${GREEN}更新完成${RESET}"
+
+}
+
+restart_openclaw(){
+
+echo -e "${GREEN}重启 OpenClaw...${RESET}"
+
+docker restart $CONTAINER
+
+}
+
+logs_openclaw(){
+
+docker logs -f $CONTAINER
+
+}
+
+status_openclaw(){
+
+docker exec $CONTAINER openclaw status
+
+}
+
+config_openclaw(){
+
+docker exec $CONTAINER openclaw config get gateway
+
+}
+
+shell_openclaw(){
+
+docker exec -it $CONTAINER sh
+
+}
+
+docker_clean(){
+
+echo -e "${YELLOW}清理未使用 Docker 资源...${RESET}"
+
+docker system prune -a
+
+}
+
+uninstall_openclaw(){
+
+echo -e "${YELLOW}卸载 OpenClaw...${RESET}"
+
+docker stop $CONTAINER 2>/dev/null
+docker rm $CONTAINER 2>/dev/null
+docker volume rm openclaw-data 2>/dev/null
+
+echo -e "${GREEN}OpenClaw 已卸载 (数据已删除)${RESET}"
+
+}
+
+while true
+do
+
+clear
+
+echo -e "${GREEN}=== OpenClaw 管理菜单 ===${RESET}"
+echo -e "${GREEN}1) 安装启动${RESET}"
+echo -e "${GREEN}2) 更新${RESET}"
+echo -e "${GREEN}3) 重启${RESET}"
+echo -e "${GREEN}4) 查看日志${RESET}"
+echo -e "${GREEN}5) 查看状态${RESET}"
+echo -e "${GREEN}6) 查看配置${RESET}"
+echo -e "${GREEN}7) 进入容器${RESET}"
+echo -e "${GREEN}8) Docker清理${RESET}"
+echo -e "${GREEN}9) 卸载(含数据)${RESET}"
+echo -e "${GREEN}0) 退出${RESET}"
+
+read -rp "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+case "$choice" in
+
+1) install_openclaw ;;
+2) update_openclaw ;;
+3) restart_openclaw ;;
+4) logs_openclaw ;;
+5) status_openclaw ;;
+6) config_openclaw ;;
+7) shell_openclaw ;;
+8) docker_clean ;;
+9) uninstall_openclaw ;;
+0) exit 0 ;;
+*) echo -e "${RED}无效选项${RESET}"
+
+esac
+
+read -n 1 -s -r -p "按任意键返回菜单..."
+
 done

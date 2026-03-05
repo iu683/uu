@@ -1,146 +1,267 @@
 #!/bin/bash
-# ========================================
-# 3x-ui 一键管理脚本（Host模式）
-# ========================================
+# ==================================================
+# VPS Geo Firewall
+# Debian / Ubuntu
+# 独立链 / IPv4+IPv6 / 端口控制 / 自动更新 / 卸载
+# ==================================================
+
+CONF="/opt/geoip/geo.conf"
+UPDATE_SCRIPT="/opt/geoip/update_geo.sh"
+SCRIPT_PATH="/usr/local/bin/geofirewall"
+SCRIPT_URL="https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/GeoFirewall.sh"
+CHAIN="GEO_CHAIN"
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="3x-ui"
-APP_DIR="/root/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONTAINER_NAME="3xui_app"
+green(){ echo -e "${GREEN}$1${RESET}"; }
+red(){ echo -e "${RED}$1${RESET}"; }
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
+[[ $(id -u) != 0 ]] && red "请使用 root 运行" && exit 1
+
+# ================== 初始化环境 ==================
+init_env(){
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y ipset iptables curl iptables-persistent netfilter-persistent
+    mkdir -p /opt/geoip
+    touch $CONF
 }
 
-
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。"
-}
-
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== 3x-ui 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
-install_app() {
-    check_docker
-    mkdir -p "$APP_DIR"
-    mkdir -p "$APP_DIR/db"
-    mkdir -p "$APP_DIR/cert"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  3xui:
-    image: ghcr.io/mhsanaei/3x-ui:latest
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - $APP_DIR/db/:/etc/x-ui/
-      - $APP_DIR/cert/:/root/cert/
-    environment:
-      XRAY_VMESS_AEAD_FORCED: "false"
-      XUI_ENABLE_FAIL2BAN: "false"
+# ================== 自动更新IP库 ==================
+install_auto_update(){
+cat > $UPDATE_SCRIPT <<EOF
+#!/bin/bash
+CONF="/opt/geoip/geo.conf"
+source \$CONF 2>/dev/null
+[[ -z "\$COUNTRY" ]] && exit 0
+for CC in \$COUNTRY; do
+    CC_L=\$(echo \$CC | tr A-Z a-z)
+    curl -s -o /opt/geoip/\${CC_L}.zone https://www.ipdeny.com/ipblocks/data/countries/\${CC_L}.zone
+    curl -s -o /opt/geoip/\${CC_L}.ipv6.zone https://www.ipdeny.com/ipv6/ipaddresses/aggregated/\${CC_L}-aggregated.zone
+done
 EOF
 
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    SERVER_IP=$(get_public_ip)
-
-    echo -e "${GREEN}✅ 3x-ui 已启动${RESET}"
-    echo -e "${YELLOW}🌐 公网 IP: ${SERVER_IP}${RESET}"
-    echo -e "${YELLOW}🔌 面板端口: ${PORT}${RESET}"
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
-    echo -e "${GREEN}📂 数据存放目录: $APP_DIR/db${RESET}"
-    echo -e "${GREEN}📂 证书存放目录: $APP_DIR/cert${RESET}"
-    echo -e "${GREEN}📂 面板证书设置:/root/cert/cert.crt${RESET}"
-    echo -e "${GREEN}📂 面板证书设置:/root/cert/private.key${RESET}"
-    echo -e "${RED}首次登录后请修改默认用户名密码！${RESET}"
-    echo -e "${YELLOW}账号/密码:admin/admin${RESET}"
-    echo -e "${YELLOW}访问地址: http://${SERVER_IP}:2053${RESET}"
-    read -p "按回车返回菜单..."
+chmod +x $UPDATE_SCRIPT
+(crontab -l 2>/dev/null | grep -v update_geo.sh; echo "0 3 * * * $UPDATE_SCRIPT") | crontab -
+green "已设置每日 03:00 自动更新IP库"
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ 3x-ui 更新完成${RESET}"
-    read -p "按回车返回菜单..."
+# ================== 原子更新 ipset ==================
+update_ipset(){
+    local SET_NAME=$1
+    local FILE=$2
+    local FAMILY=$3
+    [[ ! -s "$FILE" ]] && { red "IP库文件为空，跳过 $SET_NAME"; return 1; }
+    ipset create $SET_NAME hash:net family $FAMILY -exist
+    ipset create ${SET_NAME}_tmp hash:net family $FAMILY -exist
+    ipset flush ${SET_NAME}_tmp
+    while read -r ip; do [[ -n "$ip" ]] && ipset add ${SET_NAME}_tmp "$ip" 2>/dev/null; done < "$FILE"
+    ipset swap ${SET_NAME}_tmp $SET_NAME
+    ipset destroy ${SET_NAME}_tmp
 }
 
-restart_app() {
-    docker restart ${CONTAINER_NAME}
-    echo -e "${GREEN}✅ 3x-ui 已重启${RESET}"
-    read -p "按回车返回菜单..."
+# ================== 应用规则 ==================
+apply_rules(){
+    source $CONF 2>/dev/null
+    [[ -z "$COUNTRY" ]] && red "未配置规则" && return
+
+    SSH_PORT=$(grep -i "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1)
+    [[ -z "$SSH_PORT" ]] && SSH_PORT=22
+    green "SSH端口: $SSH_PORT"
+
+    # 创建链
+    iptables -N $CHAIN 2>/dev/null
+    ip6tables -N $CHAIN 2>/dev/null
+    iptables -C INPUT -j $CHAIN 2>/dev/null || iptables -I INPUT -j $CHAIN
+    ip6tables -C INPUT -j $CHAIN 2>/dev/null || ip6tables -I INPUT -j $CHAIN
+
+    # 清空链
+    iptables -F $CHAIN
+    ip6tables -F $CHAIN
+
+    # 放行已建立连接
+    iptables -A $CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    ip6tables -A $CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    # 白名单先放行
+    for ip in $WHITELIST; do
+        if [[ $ip == *:* ]]; then
+            ip6tables -A $CHAIN -s $ip -j ACCEPT
+        else
+            iptables -A $CHAIN -s $ip -j ACCEPT
+        fi
+    done
+
+    # SSH 永远允许
+    iptables -A $CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
+    ip6tables -A $CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
+
+    # 下载国家 IP 库并更新 ipset
+    for CC in $COUNTRY; do
+        CC_L=$(echo $CC | tr A-Z a-z)
+        V4FILE="/opt/geoip/${CC_L}.zone"
+        V6FILE="/opt/geoip/${CC_L}.ipv6.zone"
+        curl -s -o $V4FILE https://www.ipdeny.com/ipblocks/data/countries/$CC_L.zone
+        curl -s -o $V6FILE https://www.ipdeny.com/ipv6/ipaddresses/aggregated/$CC_L-aggregated.zone
+        update_ipset "geo_v4" "$V4FILE" inet
+        update_ipset "geo_v6" "$V6FILE" inet6
+
+        for proto in tcp udp; do
+            if [[ "$MODE" == "block" ]]; then
+                # 封禁端口或全部
+                if [[ "$PORTS" == "all" ]]; then
+                    iptables -A $CHAIN -p $proto -m set --match-set geo_v4 src -j DROP
+                    ip6tables -A $CHAIN -p $proto -m set --match-set geo_v6 src -j DROP
+                else
+                    for p in $PORTS; do
+                        iptables -A $CHAIN -p $proto --dport $p -m set --match-set geo_v4 src -j DROP
+                        ip6tables -A $CHAIN -p $proto --dport $p -m set --match-set geo_v6 src -j DROP
+                    done
+                fi
+            else
+                # 只允许模式
+                if [[ "$PORTS" == "all" ]]; then
+                    iptables -A $CHAIN -p $proto -m set ! --match-set geo_v4 src -j DROP
+                    ip6tables -A $CHAIN -p $proto -m set ! --match-set geo_v6 src -j DROP
+                else
+                    for p in $PORTS; do
+                        iptables -A $CHAIN -p $proto --dport $p -m set ! --match-set geo_v4 src -j DROP
+                        ip6tables -A $CHAIN -p $proto --dport $p -m set ! --match-set geo_v6 src -j DROP
+                    done
+                fi
+            fi
+        done
+    done
+
+    netfilter-persistent save >/dev/null 2>&1
+    green "规则已成功应用"
 }
 
-view_logs() {
-    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f ${CONTAINER_NAME}
+# ================== 添加规则 ==================
+add_rule(){
+    read -p $'\033[32m模式 (1=封锁 2=只允许): \033[0m' m
+    [[ $m == 1 ]] && MODE="block" || MODE="allow"
+    read -p $'\033[32m国家代码 (如 cn jp us): \033[0m' COUNTRY
+    read -p $'\033[32m端口 (all 或 22 80 多个空格分隔): \033[0m' PORTS
+
+    echo "MODE=\"$MODE\"" > $CONF
+    echo "COUNTRY=\"$COUNTRY\"" >> $CONF
+    echo "PORTS=\"$PORTS\"" >> $CONF
+    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
+
+    install_auto_update
+    apply_rules
 }
 
-check_status() {
-    docker ps | grep ${CONTAINER_NAME}
-    read -p "按回车返回菜单..."
+# ================== 添加白名单 ==================
+add_whitelist(){
+    read -p $'\033[32m输入白名单 IP (多个空格): \033[0m' ips
+    source $CONF 2>/dev/null
+    WHITELIST="$WHITELIST $ips"
+    echo "MODE=\"$MODE\"" > $CONF
+    echo "COUNTRY=\"$COUNTRY\"" >> $CONF
+    echo "PORTS=\"$PORTS\"" >> $CONF
+    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
+    apply_rules
 }
 
-uninstall_app() {
-    docker compose -f ${COMPOSE_FILE} down
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 3x-ui 已卸载${RESET}"
-    read -p "按回车返回菜单..."
+# ================== 删除端口规则 ==================
+delete_rules(){
+    source $CONF 2>/dev/null
+    [[ -z "$PORTS" ]] && red "未检测到配置" && return
+    read -p $'\033[32m输入要删除的端口 (如 80 多个空格): \033[0m' DEL_PORTS
+    [[ -z "$DEL_PORTS" ]] && red "未输入端口" && return
+    for p in $DEL_PORTS; do
+        for proto in tcp udp; do
+            iptables -L $CHAIN --line-numbers -n | grep "$proto" | grep "dpt:$p" | awk '{print $1}' | sort -rn | while read num; do iptables -D $CHAIN $num; done
+            ip6tables -L $CHAIN --line-numbers -n | grep "$proto" | grep "dpt:$p" | awk '{print $1}' | sort -rn | while read num; do ip6tables -D $CHAIN $num; done
+        done
+        green "端口 $p 规则已删除"
+    done
+    netfilter-persistent save >/dev/null 2>&1
 }
 
-menu
+# ================== 查看规则 ==================
+view_rules(){
+    clear
+    green "========= 当前配置 ========="
+    cat $CONF 2>/dev/null
+    echo
+    iptables -L $CHAIN -n --line-numbers 2>/dev/null
+    echo
+    ipset list | grep "^Name:"
+}
+
+# ================== 卸载 ==================
+uninstall_all(){
+    green "正在卸载"
+    iptables -D INPUT -j $CHAIN 2>/dev/null
+    ip6tables -D INPUT -j $CHAIN 2>/dev/null
+    iptables -F $CHAIN 2>/dev/null
+    ip6tables -F $CHAIN 2>/dev/null
+    iptables -X $CHAIN 2>/dev/null
+    ip6tables -X $CHAIN 2>/dev/null
+    ipset list | grep "^Name:" | awk '{print $2}' | xargs -r -I {} ipset destroy {}
+    rm -rf /opt/geoip
+    crontab -l 2>/dev/null | grep -v update_geo.sh | crontab -
+    rm -f $SCRIPT_PATH
+    netfilter-persistent save >/dev/null 2>&1
+    green "已彻底卸载完成"
+    exit 0
+}
+# ================== 删除白名单 ==================
+delete_whitelist(){
+    source $CONF 2>/dev/null
+    [[ -z "$WHITELIST" ]] && { red "当前白名单为空"; return; }
+    echo "当前白名单: $WHITELIST"
+    read -p $'\033[32m输入要删除的IP (多个空格分隔): \033[0m' DEL_IPS
+    [[ -z "$DEL_IPS" ]] && { red "未输入IP"; return; }
+
+    # 删除指定 IP
+    for ip in $DEL_IPS; do
+        WHITELIST=$(echo "$WHITELIST" | sed -E "s/(^| )$ip( |$)/ /g")
+    done
+
+    # 清理多余空格
+    WHITELIST=$(echo "$WHITELIST" | xargs)
+
+    # 写回配置
+    echo "MODE=\"$MODE\"" > $CONF
+    echo "COUNTRY=\"$COUNTRY\"" >> $CONF
+    echo "PORTS=\"$PORTS\"" >> $CONF
+    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
+
+    green "已删除指定白名单IP"
+    apply_rules
+}
+# ================== 菜单 ==================
+menu(){
+clear
+echo -e "${GREEN}===== VPS国家防火墙 =====${RESET}"
+echo -e "${GREEN}1 添加规则${RESET}"
+echo -e "${GREEN}2 删除规则${RESET}"
+echo -e "${GREEN}3 查看规则${RESET}"
+echo -e "${GREEN}4 添加白名单${RESET}"
+echo -e "${GREEN}5 删除白名单${RESET}"
+echo -e "${GREEN}6 卸载${RESET}"
+echo -e "${GREEN}0 退出${RESET}"
+read -r -p $'\033[32m请选择: \033[0m' num
+case $num in
+1) add_rule ;;
+2) delete_rules ;;
+3) view_rules ;;
+4) add_whitelist ;;
+5) delete_whitelist ;;
+6) uninstall_all ;;
+0) exit ;;
+esac
+}
+
+# ================== 主循环 ==================
+init_env
+while true; do
+    menu
+    read -r -p $'\033[32m按回车继续...\033[0m'
+done

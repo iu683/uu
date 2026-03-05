@@ -93,7 +93,7 @@ apply_rules(){
 
     SSH_PORT=$(get_ssh_port)
     [[ -z "$SSH_PORT" ]] && SSH_PORT=22
-    green "默认放行 SSH端口: $SSH_PORT"
+    green "默认放行SSH端口: $SSH_PORT"
 
     # 创建 GEO_CHAIN 链
     iptables -N GEO_CHAIN 2>/dev/null
@@ -174,22 +174,22 @@ add_rule(){
     case "$choice" in
         1)
             MODE="block"
-            read -p $'\033[32m国家代码(例如 cn JP us): \033[0m' COUNTRY
-            read -p $'\033[32m端口(例如 443 80 多个空格): \033[0m' PORTS
+            read -p $'\033[32m国家代码: \033[0m' COUNTRY
+            read -p $'\033[32m端口 (多个空格): \033[0m' PORTS
             ;;
         2)
             MODE="block"
-            read -p $'\033[32m国家代码: \033[0m' COUNTRY
+            read -p $'\033[32m国家代码(例如 cn us jp): \033[0m' COUNTRY
             PORTS="all"
             ;;
         3)
             MODE="allow"
-            read -p $'\033[32m国家代码: \033[0m' COUNTRY
-            read -p $'\033[32m端口 (多个空格): \033[0m' PORTS
+            read -p $'\033[32m国家代码(例如 cn us jp): \033[0m' COUNTRY
+            read -p $'\033[32m端口(例如 443 80 多个空格): \033[0m' PORTS
             ;;
         4)
             MODE="allow"
-            read -p $'\033[32m国家代码: \033[0m' COUNTRY
+            read -p $'\033[32m国家代码(例如 cn us jp): \033[0m' COUNTRY
             PORTS="all"
             ;;
         *)
@@ -216,19 +216,7 @@ add_whitelist(){
     echo "COUNTRY=\"$COUNTRY\"" >> $CONF
     echo "PORTS=\"$PORTS\"" >> $CONF
     echo "WHITELIST=\"$WHITELIST\"" >> $CONF
-
-    # 遍历每个 IP
-    for ip in $ips; do
-        if [[ $ip =~ : ]]; then
-            # IPv6
-            ip6tables -I GEO_CHAIN 2 -s $ip -j ACCEPT
-        else
-            # IPv4
-            iptables -I GEO_CHAIN 2 -s $ip -j ACCEPT
-        fi
-    done
     apply_rules
-    green "白名单已应用"
 }
 
 delete_whitelist(){
@@ -236,18 +224,12 @@ delete_whitelist(){
     source $CONF 2>/dev/null
     for ip in $ips; do
         WHITELIST=$(echo $WHITELIST | sed -E "s/\b$ip\b//g")
-        if [[ $ip =~ : ]]; then
-            ip6tables -D GEO_CHAIN -s $ip -j ACCEPT 2>/dev/null
-        else
-            iptables -D GEO_CHAIN -s $ip -j ACCEPT 2>/dev/null
-        fi
     done
     echo "MODE=\"$MODE\"" > $CONF
     echo "COUNTRY=\"$COUNTRY\"" >> $CONF
     echo "PORTS=\"$PORTS\"" >> $CONF
     echo "WHITELIST=\"$WHITELIST\"" >> $CONF
     apply_rules
-    green "白名单已删除"
 }
 
 # ================== 删除端口规则 ==================
@@ -310,7 +292,7 @@ menu(){
     echo -e "${GREEN}3 查看规则${RESET}"
     echo -e "${GREEN}4 添加白名单${RESET}"
     echo -e "${GREEN}5 删除白名单${RESET}"
-    echo -e "${GREEN}6 更新${RESET}"
+    echo -e "${GREEN}6 更新脚本${RESET}"
     echo -e "${GREEN}7 卸载${RESET}"
     echo -e "${GREEN}0 退出${RESET}"
     read -r -p $'\033[32m请选择: \033[0m' num

@@ -246,6 +246,7 @@ delete_whitelist(){
     echo "COUNTRY=\"$COUNTRY\"" >> $CONF
     echo "PORTS=\"$PORTS\"" >> $CONF
     echo "WHITELIST=\"$WHITELIST\"" >> $CONF
+    apply_rules
     green "白名单已删除"
 }
 

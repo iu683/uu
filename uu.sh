@@ -118,7 +118,7 @@ install_app() {
             name=$(basename "$path")
 
             MEDIA_VOLUMES="${MEDIA_VOLUMES}
-      - ${path}:/media/${name}"
+      - ${path}:${path}"
 
             MEDIA_PRINT="${MEDIA_PRINT}
 ${path}"
@@ -157,8 +157,7 @@ EOF
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
     echo -e "${YELLOW}🌐 账号/密码: $USERNAME/$PASSWORD${RESET}"
     echo -e "${YELLOW}📂 安装目录: $APP_DIR${RESET}"
-    echo -e "${YELLOW}📂 容器映射目录: /media${RESET}"
-    echo -e "${YELLOW}📂 媒体目录:${RESET}${MEDIA_PRINT}"
+    echo -e "${YELLOW}📂 媒体目录:${MEDIA_PRINT}${RESET}"
 
     read -p "按回车返回菜单..."
 }

@@ -1,217 +1,205 @@
 #!/bin/bash
 
+# ==========================================
+# OpenClaw 一键菜单管理脚本
+# ==========================================
+
+# ===== 颜色 =====
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
+GRAY="\033[90m"
 RESET="\033[0m"
 
-CONTAINER="openclaw"
-IMAGE="ghcr.io/1186258278/openclaw:latest"
-INSTALL_SCRIPT="https://cdn.jsdelivr.net/gh/1186258278/OpenClawChineseTranslation@main/docker-deploy.sh"
+CONFIG_FILE="$HOME/.openclaw/openclaw.json"
 
-install_openclaw(){
+# ==========================================
+# 状态检测
+# ==========================================
 
-echo -e "${GREEN}开始安装 OpenClaw...${RESET}"
-
-curl -fsSL $INSTALL_SCRIPT | bash
-
+get_install_status() {
+    if command -v openclaw >/dev/null 2>&1; then
+        echo -e "${GREEN}已安装${RESET}"
+    else
+        echo -e "${YELLOW}未安装${RESET}"
+    fi
 }
 
-update_openclaw(){
-
-echo -e "${GREEN}更新 OpenClaw...${RESET}"
-
-docker pull $IMAGE
-
-docker stop $CONTAINER 2>/dev/null
-docker rm $CONTAINER 2>/dev/null
-
-docker run -d --name openclaw -p 18789:18789 \
--v openclaw-data:/root/.openclaw \
---restart unless-stopped \
-$IMAGE \
-openclaw gateway run
-
-echo -e "${GREEN}更新完成${RESET}"
-
+get_running_status() {
+    if pgrep -f openclaw-gateway >/dev/null 2>&1; then
+        echo -e "${GREEN}运行中${RESET}"
+    else
+        echo -e "${YELLOW}未运行${RESET}"
+    fi
 }
 
-restart_openclaw(){
 
-echo -e "${GREEN}重启 OpenClaw...${RESET}"
+# ==========================================
+# 菜单
+# ==========================================
 
-docker restart $CONTAINER
-
+show_menu() {
+    clear
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}     OpenClaw管理菜单           ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${YELLOW}安装状态:${RESET} $(get_install_status)"
+    echo -e "${YELLOW}运行状态:${RESET} $(get_running_status)"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN} 1. 安装${RESET}"
+    echo -e "${GREEN} 2. 启动${RESET}"
+    echo -e "${GREEN} 3. 停止${RESET}"
+    echo -e "${GREEN} 4. 查看状态${RESET}"
+    echo -e "${GREEN} 5. 机器人连接${RESET}"
+    echo -e "${GREEN} 6. 编辑配置文件${RESET}"
+    echo -e "${GREEN} 7. 初始化向导${RESET}"
+    echo -e "${GREEN} 8. 健康检测${RESET}"
+    echo -e "${GREEN} 9. WebUI访问地址${RESET}"
+    echo -e "${GREEN}10. 更新${RESET}"
+    echo -e "${GREEN}11. 卸载${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    printf "${GREEN} 请输入选项: ${RESET}"
 }
 
-logs_openclaw(){
+# ==========================================
+# 控制函数
+# ==========================================
 
-docker logs -f $CONTAINER
-
+restart_gateway() {
+    openclaw gateway stop >/dev/null 2>&1
+    sleep 1
+    openclaw gateway start
+    sleep 2
 }
 
-status_openclaw(){
-
-docker exec $CONTAINER openclaw status
-
+install_node() {
+    if command -v apt >/dev/null 2>&1; then
+        curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+        apt install -y nodejs build-essential
+    fi
 }
 
-config_openclaw(){
-
-docker exec $CONTAINER openclaw config get gateway
-
+install_app() {
+    echo "正在安装 OpenClaw..."
+    install_node
+    npm install -g openclaw@latest
+    openclaw onboard --install-daemon
+    restart_gateway
+    read -p "完成，回车继续..."
 }
 
-shell_openclaw(){
-
-docker exec -it $CONTAINER sh
-
+start_app() {
+    restart_gateway
+    read -p "已启动，回车继续..."
 }
 
-docker_clean(){
-
-echo -e "${YELLOW}清理未使用 Docker 资源...${RESET}"
-
-docker system prune -a
-
+stop_app() {
+    openclaw gateway stop
+    read -p "已停止，回车继续..."
 }
 
-uninstall_openclaw(){
-
-echo -e "${YELLOW}卸载 OpenClaw...${RESET}"
-
-docker stop $CONTAINER 2>/dev/null
-docker rm $CONTAINER 2>/dev/null
-docker volume rm openclaw-data 2>/dev/null
-
-echo -e "${GREEN}OpenClaw 已卸载 (数据已删除)${RESET}"
-
+view_status() {
+    openclaw status
+    openclaw gateway status
+    openclaw logs
+    read -p "回车继续..."
 }
 
-#!/bin/bash
+# ==========================================
+# 机器人对接
+# ==========================================
 
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+change_tg_bot_code() {
 
-CONTAINER="openclaw"
-IMAGE="ghcr.io/1186258278/openclaw:latest"
-INSTALL_SCRIPT="https://cdn.jsdelivr.net/gh/1186258278/OpenClawChineseTranslation@main/docker-deploy.sh"
+    while true; do
+        clear
+        echo -e "${GREEN}========================================${RESET}"
+        echo -e "${GREEN}            机器人连接对接              ${RESET}"
+        echo -e "${GREEN}========================================${RESET}"
+        echo -e "${GREEN}1.Telegram 机器人对接${RESET}"
+        echo -e "${GREEN}2.飞书 (Lark) 机器人对接${RESET}"
+        echo -e "${GREEN}3.WhatsApp 机器人对接${RESET}"
+        echo -e "${GREEN}0.返回主菜单${RESET}"
+        read -p "请输入你的选择: " bot_choice
 
-install_openclaw(){
-
-echo -e "${GREEN}开始安装 OpenClaw...${RESET}"
-
-bash <(curl -fsSL https://cdn.jsdelivr.net/gh/1186258278/OpenClawChineseTranslation@main/docker-deploy.sh)
-
-}
-update_openclaw(){
-
-echo -e "${GREEN}更新 OpenClaw...${RESET}"
-
-docker pull $IMAGE
-
-docker stop $CONTAINER 2>/dev/null
-docker rm $CONTAINER 2>/dev/null
-
-docker run -d --name openclaw -p 18789:18789 \
--v openclaw-data:/root/.openclaw \
---restart unless-stopped \
-$IMAGE \
-openclaw gateway run
-
-echo -e "${GREEN}更新完成${RESET}"
-
-}
-
-restart_openclaw(){
-
-echo -e "${GREEN}重启 OpenClaw...${RESET}"
-
-docker restart $CONTAINER
-
-}
-
-logs_openclaw(){
-
-docker logs -f $CONTAINER
-
+        case $bot_choice in
+            1)
+                read -p "请输入TG机器人收到的连接码 (例如 NYA99R2F)： " code
+                [ -z "$code" ] && echo "连接码不能为空" && sleep 1 && continue
+                openclaw pairing approve telegram "$code"
+                read -p "完成，回车继续..."
+                ;;
+            2)
+                read -p "请输入飞书机器人连接码： " code
+                [ -z "$code" ] && echo "连接码不能为空" && sleep 1 && continue
+                openclaw pairing approve feishu "$code"
+                read -p "完成，回车继续..."
+                ;;
+            3)
+                read -p "请输入WhatsApp连接码： " code
+                [ -z "$code" ] && echo "连接码不能为空" && sleep 1 && continue
+                openclaw pairing approve whatsapp "$code"
+                read -p "完成，回车继续..."
+                ;;
+            0)
+                return
+                ;;
+            *)
+                echo "无效选项"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
-status_openclaw(){
+show_webui() {
+    echo -e "${GREEN}==================================${RESET}"
+    echo -e "${GREEN}OpenClaw WebUI 访问地址${RESET}"
 
-docker exec $CONTAINER openclaw status
+    local_ip="127.0.0.1"
 
+    token=$(
+        openclaw dashboard 2>/dev/null \
+        | sed -n 's/.*#token=\([a-z0-9]\+\).*/\1/p' \
+        | head -n 1
+    )
+
+    echo
+    echo -e "${GREEN}本机地址：${RESET}"
+    echo -e "${YELLOW}http://${local_ip}:18789/#token=${token}${RESET}"
+    echo
 }
 
-config_openclaw(){
-
-docker exec $CONTAINER openclaw config get gateway
-
+update_app() {
+    npm install -g openclaw@latest
+    restart_gateway
+    read -p "更新完成，回车继续..."
 }
 
-shell_openclaw(){
-
-docker exec -it $CONTAINER sh
-
+uninstall_app() {
+    openclaw uninstall
+    npm uninstall -g openclaw
+    read -p "卸载完成，回车继续..."
 }
 
-docker_clean(){
+# ==========================================
+# 主循环
+# ==========================================
 
-echo -e "${YELLOW}清理未使用 Docker 资源...${RESET}"
-
-docker system prune -a
-
-}
-
-uninstall_openclaw(){
-
-echo -e "${YELLOW}卸载 OpenClaw...${RESET}"
-
-docker stop $CONTAINER 2>/dev/null
-docker rm $CONTAINER 2>/dev/null
-docker volume rm openclaw-data 2>/dev/null
-
-echo -e "${GREEN}OpenClaw 已卸载 (数据已删除)${RESET}"
-
-}
-
-while true
-do
-
-clear
-
-echo -e "${GREEN}=== OpenClaw 管理菜单 ===${RESET}"
-echo -e "${GREEN}1) 安装启动${RESET}"
-echo -e "${GREEN}2) 更新${RESET}"
-echo -e "${GREEN}3) 重启${RESET}"
-echo -e "${GREEN}4) 查看日志${RESET}"
-echo -e "${GREEN}5) 查看状态${RESET}"
-echo -e "${GREEN}6) 查看配置${RESET}"
-echo -e "${GREEN}7) 进入容器${RESET}"
-echo -e "${GREEN}8) Docker清理${RESET}"
-echo -e "${GREEN}9) 卸载(含数据)${RESET}"
-echo -e "${GREEN}0) 退出${RESET}"
-
-read -rp "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-case "$choice" in
-
-1) install_openclaw ;;
-2) update_openclaw ;;
-3) restart_openclaw ;;
-4) logs_openclaw ;;
-5) status_openclaw ;;
-6) config_openclaw ;;
-7) shell_openclaw ;;
-8) docker_clean ;;
-9) uninstall_openclaw ;;
-0) exit 0 ;;
-*) echo -e "${RED}无效选项${RESET}"
-
-esac
-
-read -n 1 -s -r -p "按任意键返回菜单..."
-
+while true; do
+    show_menu
+    read choice
+    case $choice in
+        1) install_app ;;
+        2) start_app ;;
+        3) stop_app ;;
+        4) view_status ;;
+        5) change_tg_bot_code ;;
+        6) nano "$CONFIG_FILE" && restart_gateway ;;
+        7) openclaw onboard --install-daemon ;;
+        8) openclaw doctor --fix ;;
+        9) show_webui ;;
+        10) update_app ;;
+        11) uninstall_app ;;
+        0) exit ;;
+    esac
 done

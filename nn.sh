@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# MDC 一键管理脚本
+# AMMDS 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,29 +8,31 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="mdc"
+APP_NAME="ammds"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
 # ==============================
-# 基础检测
+# Docker检测
 # ==============================
 
 check_docker() {
+
     if ! command -v docker &>/dev/null; then
         echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
         curl -fsSL https://get.docker.com | bash
     fi
 
     if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        echo -e "${RED}未检测到 Docker Compose v2${RESET}"
         exit 1
     fi
 }
 
 check_port() {
+
     if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        echo -e "${RED}端口 $1 已被占用${RESET}"
         return 1
     fi
 }
@@ -40,9 +42,10 @@ check_port() {
 # ==============================
 
 menu() {
+
     while true; do
         clear
-        echo -e "${GREEN}=== MDC 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== AMMDS 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -50,6 +53,7 @@ menu() {
         echo -e "${GREEN}5) 查看状态${RESET}"
         echo -e "${GREEN}6) 卸载(含数据)${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
+
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
         case $choice in
@@ -76,7 +80,7 @@ install_app() {
 
     check_docker
 
-    mkdir -p "$APP_DIR"/data
+    mkdir -p "$APP_DIR"/{data,db,download}
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -84,21 +88,15 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:9208]: " input_port
-    PORT=${input_port:-9208}
+    read -p "请输入访问端口 [默认:8080]: " input_port
+    PORT=${input_port:-8080}
 
     check_port "$PORT" || return
 
-    read -p "设置登录用户名 [默认:admin]: " input_user
-    USERNAME=${input_user:-admin}
-
-    read -p "设置登录密码 [默认:admin]: " input_pass
-    PASSWORD=${input_pass:-admin}
-
     echo
     echo "请输入媒体目录（支持多个，用空格分隔）"
-    echo "例如: /mnt/av /mnt/av2"
-    echo "留空则使用默认目录: $APP_DIR/media"
+    echo "例如: /mnt/movie /mnt/tv"
+    echo "留空则使用默认: $APP_DIR/media"
     read -p "媒体目录: " MEDIA_PATHS
 
     MEDIA_VOLUMES=""
@@ -106,58 +104,62 @@ install_app() {
 
     if [ -z "$MEDIA_PATHS" ]; then
         mkdir -p "$APP_DIR/media"
-        MEDIA_VOLUMES="      - ./media:/media/media"
+        MEDIA_VOLUMES="      - ./media:/media"
         MEDIA_PRINT="$APP_DIR/media"
     else
-        INDEX=1
         for path in $MEDIA_PATHS; do
-            name=$(basename "$path")
+            mkdir -p "$path"
 
             MEDIA_VOLUMES="${MEDIA_VOLUMES}
-              - ${path}:/media/${name}"
+      - ${path}:${path}"
 
-            MEDIA_PRINT="${MEDIA_PRINT}\n${path}"
+            MEDIA_PRINT="${MEDIA_PRINT}
+${path}"
         done
     fi
 
 cat > "$COMPOSE_FILE" <<EOF
 services:
-  mdc:
-    image: mdcng/mdc:latest
-    container_name: mdc
-
-    environment:
-      - PGID=1000
-      - PUID=1000
-      - MDC_USERNAME=$USERNAME
-      - MDC_PASSWORD=$PASSWORD
-
-    volumes:
-      - ./data:/config
-$MEDIA_VOLUMES
+  ammds:
+    image: qyg2297248353/ammds:latest
+    container_name: ammds
 
     ports:
-      - 127.0.0.1:${PORT}:9208
+      - 127.0.0.1:${PORT}:80
+
+    volumes:
+      - ./data:/ammds/data
+      - ./db:/ammds/db
+      - ./download:/ammds/download
+$MEDIA_VOLUMES
+
+    environment:
+      - TZ=Asia/Shanghai
 
     restart: unless-stopped
+
+    networks:
+      - ammds-network
+
+networks:
+  ammds-network:
+    driver: bridge
 EOF
 
     cd "$APP_DIR" || exit
 
-    docker compose up -d
+    docker compose up -d || { echo -e "${RED}启动失败${RESET}"; return; }
 
     echo
-    echo -e "${GREEN}✅ MDC 已启动${RESET}"
+    echo -e "${GREEN}✅ AMMDS 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🌐 账号/密码: $USERNAME/$PASSWORD${RESET}"
+    echo -e "${YELLOW}🌐 默认账号/密码: ammds/ammds${RESET}"
     echo -e "${YELLOW}📂 安装目录: $APP_DIR${RESET}"
-    echo -e "${YELLOW}📂 容器映射目录:/media${RESET}"
     echo -e "${YELLOW}📂 媒体目录:${RESET}"
     echo -e "${YELLOW}${MEDIA_PRINT}${RESET}"
 
     read -p "按回车返回菜单..."
 }
-
 # ==============================
 # 更新
 # ==============================
@@ -169,7 +171,8 @@ update_app() {
     docker compose pull
     docker compose up -d
 
-    echo -e "${GREEN}✅ MDC 更新完成${RESET}"
+    echo -e "${GREEN}✅ 更新完成${RESET}"
+
     read -p "按回车返回菜单..."
 }
 
@@ -179,11 +182,12 @@ update_app() {
 
 restart_app() {
 
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+    cd "$APP_DIR" || return
 
     docker compose restart
 
-    echo -e "${GREEN}✅ MDC 已重启${RESET}"
+    echo -e "${GREEN}✅ 已重启${RESET}"
+
     read -p "按回车返回菜单..."
 }
 
@@ -195,7 +199,7 @@ view_logs() {
 
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
 
-    docker logs -f mdc
+    docker logs -f ammds
 }
 
 # ==============================
@@ -204,7 +208,7 @@ view_logs() {
 
 check_status() {
 
-    docker ps | grep mdc
+    docker ps | grep ammds
 
     read -p "按回车返回菜单..."
 }
@@ -221,13 +225,9 @@ uninstall_app() {
 
     rm -rf "$APP_DIR"
 
-    echo -e "${RED}✅ MDC 已彻底卸载（含数据）${RESET}"
+    echo -e "${RED}✅ AMMDS 已彻底卸载（含数据）${RESET}"
 
     read -p "按回车返回菜单..."
 }
-
-# ==============================
-# 启动菜单
-# ==============================
 
 menu

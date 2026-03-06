@@ -1,182 +1,205 @@
 #!/bin/bash
 
+# ==========================================
+# OpenClaw 一键菜单管理脚本
+# ==========================================
+
+# ===== 颜色 =====
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
+GRAY="\033[90m"
 RESET="\033[0m"
 
-install_openclaw(){
+CONFIG_FILE="$HOME/.openclaw/openclaw.json"
 
-echo -e "${GREEN}安装 Node.js 22 和 OpenClaw...${RESET}"
+# ==========================================
+# 状态检测
+# ==========================================
 
-# 更新 apt 并安装必要工具
-sudo apt-get update
-sudo apt-get install -y curl
-
-# 安装 Node.js 22（官方 NodeSource 源）
-curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-sudo apt-get install -y nodejs
-
-# 验证安装
-node -v
-npm -v
-
-# 安装 OpenClaw 汉化版（全局）
-sudo npm install -g @qingchencloud/openclaw-zh@latest
-
-echo -e "${GREEN}安装完成，OpenClaw 命令已可用${RESET}"
-
-# 安装为守护进程（后台运行，开机自启）
-openclaw onboard --install-daemon
-
-# 打开控制台
-openclaw dashboard
-
+get_install_status() {
+    if command -v openclaw >/dev/null 2>&1; then
+        echo -e "${GREEN}已安装${RESET}"
+    else
+        echo -e "${YELLOW}未安装${RESET}"
+    fi
 }
 
-enable_lan_access(){
-    echo -e "${GREEN}开启局域网访问...${RESET}"
-
-    # 绑定到局域网
-    openclaw config set gateway.bind lan
-
-    # 设置访问密码
-    read -rp "请输入网关访问密码: " token
-    openclaw config set gateway.auth.token "$token"
-
-    # 重启网关生效
-    openclaw gateway restart
-
-    echo -e "${GREEN}局域网访问已开启！请在局域网访问 http://你的IP:18789 并输入密码${RESET}"
+get_running_status() {
+    if pgrep -f openclaw-gateway >/dev/null 2>&1; then
+        echo -e "${GREEN}运行中${RESET}"
+    else
+        echo -e "${YELLOW}未运行${RESET}"
+    fi
 }
 
-update_openclaw(){
 
-echo -e "${GREEN}更新 OpenClaw...${RESET}"
+# ==========================================
+# 菜单
+# ==========================================
 
-npm update -g @qingchencloud/openclaw-zh
-
+show_menu() {
+    clear
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}     OpenClaw管理菜单           ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${YELLOW}安装状态:${RESET} $(get_install_status)"
+    echo -e "${YELLOW}运行状态:${RESET} $(get_running_status)"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN} 1. 安装${RESET}"
+    echo -e "${GREEN} 2. 启动${RESET}"
+    echo -e "${GREEN} 3. 停止${RESET}"
+    echo -e "${GREEN} 4. 查看状态${RESET}"
+    echo -e "${GREEN} 5. 机器人连接${RESET}"
+    echo -e "${GREEN} 6. 编辑配置文件${RESET}"
+    echo -e "${GREEN} 7. 初始化向导${RESET}"
+    echo -e "${GREEN} 8. 健康检测${RESET}"
+    echo -e "${GREEN} 9. WebUI访问地址${RESET}"
+    echo -e "${GREEN}10. 更新${RESET}"
+    echo -e "${GREEN}11. 卸载${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    printf "${GREEN} 请输入选项: ${RESET}"
 }
 
-start_openclaw(){
+# ==========================================
+# 控制函数
+# ==========================================
 
-openclaw gateway stop
-
+restart_gateway() {
+    openclaw gateway stop >/dev/null 2>&1
+    sleep 1
+    openclaw gateway start
+    sleep 2
 }
 
-restart_openclaw(){
-
-openclaw gateway restart
-
+install_node() {
+    if command -v apt >/dev/null 2>&1; then
+        curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+        apt install -y nodejs build-essential
+    fi
 }
 
-logs_openclaw(){
-
-journalctl --user -u openclaw-gateway
-
+install_app() {
+    echo "正在安装 OpenClaw..."
+    install_node
+    npm install -g openclaw@latest
+    openclaw onboard --install-daemon
+    restart_gateway
+    read -p "完成，回车继续..."
 }
 
-dashboard_openclaw(){
-
-openclaw dashboard
-
+start_app() {
+    restart_gateway
+    read -p "已启动，回车继续..."
 }
 
-status_openclaw(){
-
-openclaw gateway status
-
+stop_app() {
+    openclaw gateway stop
+    read -p "已停止，回车继续..."
 }
 
-doctor_openclaw(){
-
-openclaw doctor
-
+view_status() {
+    openclaw status
+    openclaw gateway status
+    openclaw logs
+    read -p "回车继续..."
 }
 
-tg_pair(){
+# ==========================================
+# 机器人对接
+# ==========================================
 
-read -p "TG连接码: " code
-openclaw pairing approve telegram "$code"
+change_tg_bot_code() {
 
+    while true; do
+        clear
+        echo -e "${GREEN}========================================${RESET}"
+        echo -e "${GREEN}            机器人连接对接              ${RESET}"
+        echo -e "${GREEN}========================================${RESET}"
+        echo -e "${GREEN}1.Telegram 机器人对接${RESET}"
+        echo -e "${GREEN}2.飞书 (Lark) 机器人对接${RESET}"
+        echo -e "${GREEN}3.WhatsApp 机器人对接${RESET}"
+        echo -e "${GREEN}0.返回主菜单${RESET}"
+        read -p "请输入你的选择: " bot_choice
+
+        case $bot_choice in
+            1)
+                read -p "请输入TG机器人收到的连接码 (例如 NYA99R2F)： " code
+                [ -z "$code" ] && echo "连接码不能为空" && sleep 1 && continue
+                openclaw pairing approve telegram "$code"
+                read -p "完成，回车继续..."
+                ;;
+            2)
+                read -p "请输入飞书机器人连接码： " code
+                [ -z "$code" ] && echo "连接码不能为空" && sleep 1 && continue
+                openclaw pairing approve feishu "$code"
+                read -p "完成，回车继续..."
+                ;;
+            3)
+                read -p "请输入WhatsApp连接码： " code
+                [ -z "$code" ] && echo "连接码不能为空" && sleep 1 && continue
+                openclaw pairing approve whatsapp "$code"
+                read -p "完成，回车继续..."
+                ;;
+            0)
+                return
+                ;;
+            *)
+                echo "无效选项"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
-skills_list(){
+show_webui() {
+    echo -e "${GREEN}==================================${RESET}"
+    echo -e "${GREEN}OpenClaw WebUI 访问地址${RESET}"
 
-openclaw skills list
+    local_ip="127.0.0.1"
 
+    token=$(
+        openclaw dashboard 2>/dev/null \
+        | sed -n 's/.*#token=\([a-z0-9]\+\).*/\1/p' \
+        | head -n 1
+    )
+
+    echo
+    echo -e "${GREEN}本机地址：${RESET}"
+    echo -e "${YELLOW}http://${local_ip}:18789/#token=${token}${RESET}"
+    echo
 }
 
-skills_install(){
-
-openclaw skills install
-
+update_app() {
+    npm install -g openclaw@latest
+    restart_gateway
+    read -p "更新完成，回车继续..."
 }
 
-config_openclaw(){
-
-openclaw config set KEY VALUE
-
+uninstall_app() {
+    openclaw uninstall
+    npm uninstall -g openclaw
+    read -p "卸载完成，回车继续..."
 }
 
-uninstall_openclaw(){
+# ==========================================
+# 主循环
+# ==========================================
 
-echo -e "${YELLOW}卸载 OpenClaw...${RESET}"
-
-npm uninstall -g @qingchencloud/openclaw-zh
-npm uninstall -g openclaw
-rm -rf ~/.openclaw
-
-echo -e "${GREEN}卸载完成${RESET}"
-
-}
-
-while true
-do
-
-clear
-
-echo -e "${GREEN}=== OpenClaw 管理菜单 ===${RESET}"
-echo -e "${GREEN} 1) 安装OpenClaw${RESET}"
-echo -e "${GREEN} 2) 开启局域网访问${RESET}"
-echo -e "${GREEN} 3) 停止网关${RESET}"
-echo -e "${GREEN} 4) 重启网关${RESET}"
-echo -e "${GREEN} 5) 查看日志${RESET}"
-echo -e "${GREEN} 6) 打开控制台${RESET}"
-echo -e "${GREEN} 7) 查看状态${RESET}"
-echo -e "${GREEN} 8) 系统诊断${RESET}"
-echo -e "${GREEN} 9) TG配对码${RESET}"
-echo -e "${GREEN}10) 查看技能${RESET}"
-echo -e "${GREEN}11) 安装技能${RESET}"
-echo -e "${GREEN}12) 修改配置${RESET}"
-echo -e "${GREEN}13) 更新OpenClaw${RESET}"
-echo -e "${GREEN}14) 卸载 OpenClaw${RESET}"
-echo -e "${GREEN} 0) 退出${RESET}"
-
-read -rp "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-case "$choice" in
-
-1) install_openclaw ;;
-2) enable_lan_access ;;
-3) start_openclaw ;;
-4) restart_openclaw ;;
-5) logs_openclaw ;;
-6) dashboard_openclaw ;;
-7) status_openclaw ;;
-8) doctor_openclaw ;;
-9) tg_pair ;;
-10) skills_list ;;
-11) skills_install ;;
-12) config_openclaw ;;
-13) update_openclaw ;;
-14) uninstall_openclaw ;;
-0) exit 0 ;;
-*) echo -e "${RED}无效选项${RESET}"
-
-esac
-
-echo
-read -n 1 -s -r -p "按任意键返回菜单..."
-
+while true; do
+    show_menu
+    read choice
+    case $choice in
+        1) install_app ;;
+        2) start_app ;;
+        3) stop_app ;;
+        4) view_status ;;
+        5) change_tg_bot_code ;; ;;
+        6) nano "$CONFIG_FILE" && restart_gateway ;;
+        7) openclaw onboard --install-daemon ;;
+        8) openclaw doctor --fix ;;
+        9) show_webui ;;
+        10) update_app ;;
+        11) uninstall_app ;;
+        0) exit ;;
+    esac
 done

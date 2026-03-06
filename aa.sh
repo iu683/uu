@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# gcli2api 一键管理脚本
+# MDC 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="gcli2api"
+APP_NAME="mdc"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -42,7 +42,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== gcli2api 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== MDC 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -63,20 +63,20 @@ menu() {
             *)
                 echo -e "${RED}无效选择${RESET}"
                 sleep 1
-                continue
                 ;;
         esac
     done
 }
 
 # ==============================
-# 功能函数
+# 安装
 # ==============================
 
 install_app() {
+
     check_docker
 
-    mkdir -p "$APP_DIR/data/creds"
+    mkdir -p "$APP_DIR"/data
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -84,85 +84,147 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:7861]: " input_port
-    PORT=${input_port:-7861}
+    read -p "请输入访问端口 [默认:9208]: " input_port
+    PORT=${input_port:-9208}
+
     check_port "$PORT" || return
 
-    # ====== 支持随机生成密码 ======
-    read -p "请输入 API 密码 [回车自动生成]: " API_PASSWORD
-    API_PASSWORD=${API_PASSWORD:-$(openssl rand -base64 20)}
+    read -p "设置登录用户名 [默认:admin]: " input_user
+    USERNAME=${input_user:-admin}
 
-    read -p "请输入面板密码 [回车自动生成]: " PANEL_PASSWORD
-    PANEL_PASSWORD=${PANEL_PASSWORD:-$(openssl rand -base64 20)}
+    read -p "设置登录密码 [默认:admin]: " input_pass
+    PASSWORD=${input_pass:-admin}
 
-    cat > "$COMPOSE_FILE" <<EOF
+    echo
+    echo "请输入媒体目录（支持多个，用空格分隔）"
+    echo "例如: /mnt/av /mnt/av2"
+    echo "留空则使用默认目录: $APP_DIR/media"
+    read -p "媒体目录: " MEDIA_PATHS
+
+    MEDIA_VOLUMES=""
+    MEDIA_PRINT=""
+
+    if [ -z "$MEDIA_PATHS" ]; then
+        mkdir -p "$APP_DIR/media"
+        MEDIA_VOLUMES="      - ./media:/media"
+        MEDIA_PRINT="$APP_DIR/media"
+    else
+        INDEX=1
+        for path in $MEDIA_PATHS; do
+            MEDIA_VOLUMES="${MEDIA_VOLUMES}
+      - ${path}:/media${INDEX}"
+            MEDIA_PRINT="${MEDIA_PRINT}\n${path}"
+            INDEX=$((INDEX+1))
+        done
+    fi
+
+cat > "$COMPOSE_FILE" <<EOF
 services:
-  gcli2api:
-    image: ghcr.io/su-kaka/gcli2api:latest
-    container_name: gcli2api
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${PORT}:${PORT}"
+  mdc:
+    image: mdcng/mdc:latest
+    container_name: mdc
+
     environment:
-      - PORT=${PORT}
-      - API_PASSWORD=${API_PASSWORD}
-      - PANEL_PASSWORD=${PANEL_PASSWORD}
+      - PGID=1000
+      - PUID=1000
+      - MDC_USERNAME=$USERNAME
+      - MDC_PASSWORD=$PASSWORD
+
     volumes:
-      - ./data/creds:/app/creds
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \\"import sys, urllib.request, os; port=os.environ.get('PORT', '${PORT}'); req=urllib.request.Request(f'http://localhost:{port}/v1/models', headers={'Authorization': 'Bearer '+os.environ.get('API_PASSWORD','pwd')}); sys.exit(0 if urllib.request.urlopen(req, timeout=5).getcode()==200 else 1)\\""]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+      - ./data:/config
+$MEDIA_VOLUMES
+
+    ports:
+      - 127.0.0.1:${PORT}:9208
+
+    restart: unless-stopped
 EOF
 
     cd "$APP_DIR" || exit
+
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ gcli2api 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Web 地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
-    echo -e "${YELLOW}🔑 API 密码: ${API_PASSWORD}${RESET}"
-    echo -e "${YELLOW}🔑 面板密码: ${PANEL_PASSWORD}${RESET}"
+    echo -e "${GREEN}✅ MDC 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${YELLOW}🌐 账号/密码: $USERNAME/$PASSWORD${RESET}"
+    echo -e "${YELLOW}📂 安装目录: $APP_DIR${RESET}"
+    echo -e "${YELLOW}📂 媒体目录:${RESET}"
+    echo -e "${YELLOW}${MEDIA_PRINT}${RESET}"
+
     read -p "按回车返回菜单..."
 }
+
+# ==============================
+# 更新
+# ==============================
 
 update_app() {
+
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ gcli2api 更新完成${RESET}"
+
+    echo -e "${GREEN}✅ MDC 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
+
+# ==============================
+# 重启
+# ==============================
 
 restart_app() {
+
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+
     docker compose restart
-    echo -e "${GREEN}✅ gcli2api 已重启${RESET}"
+
+    echo -e "${GREEN}✅ MDC 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
+
+# ==============================
+# 日志
+# ==============================
 
 view_logs() {
+
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f gcli2api
+
+    docker logs -f mdc
 }
 
+# ==============================
+# 状态
+# ==============================
+
 check_status() {
-    docker ps | grep gcli2api
+
+    docker ps | grep mdc
+
     read -p "按回车返回菜单..."
 }
 
+# ==============================
+# 卸载
+# ==============================
+
 uninstall_app() {
+
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+
     docker compose down -v
+
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ gcli2api 已彻底卸载（含数据）${RESET}"
+
+    echo -e "${RED}✅ MDC 已彻底卸载（含数据）${RESET}"
+
     read -p "按回车返回菜单..."
 }
 
 # ==============================
 # 启动菜单
 # ==============================
+
 menu

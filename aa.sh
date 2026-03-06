@@ -8,6 +8,7 @@
 GREEN="\033[32m"
 YELLOW="\033[33m"
 GRAY="\033[90m"
+RED="\033[31m"
 RESET="\033[0m"
 
 CONFIG_FILE="$HOME/.openclaw/openclaw.json"
@@ -112,14 +113,14 @@ change_tg_bot_code() {
 
     while true; do
         clear
-        echo -e "${GREEN}========================================${RESET}"
-        echo -e "${GREEN}            机器人连接对接              ${RESET}"
-        echo -e "${GREEN}========================================${RESET}"
-        echo -e "${GREEN}1.Telegram 机器人对接${RESET}"
-        echo -e "${GREEN}2.飞书 (Lark) 机器人对接${RESET}"
-        echo -e "${GREEN}3.WhatsApp 机器人对接${RESET}"
+        echo -e "${GREEN}==================================${RESET}"
+        echo -e "${GREEN}         机器人连接对接              ${RESET}"
+        echo -e "${GREEN}==================================${RESET}"
+        echo -e "${GREEN}1.Telegram  机器人对接${RESET}"
+        echo -e "${GREEN}2.飞书(Lark)机器人对接${RESET}"
+        echo -e "${GREEN}3.WhatsApp  机器人对接${RESET}"
         echo -e "${GREEN}0.返回主菜单${RESET}"
-        read -p "请输入你的选择: " bot_choice
+        read -r -p $'\033[32m请输入你的选择: \033[0m' bot_choice
 
         case $bot_choice in
             1)
@@ -144,7 +145,7 @@ change_tg_bot_code() {
                 return
                 ;;
             *)
-                echo "无效选项"
+                echo -e "${RED}无效选项${RESET}"
                 sleep 1
                 ;;
         esac
@@ -152,8 +153,14 @@ change_tg_bot_code() {
 }
 
 show_webui() {
-    echo -e "${GREEN}==================================${RESET}"
-    echo -e "${GREEN}OpenClaw WebUI 访问地址${RESET}"
+
+     if ! pgrep -f openclaw-gateway >/dev/null 2>&1; then
+        echo -e "${RED}Gateway 未运行${RESET}"
+        read -p "回车继续..."
+        return
+    fi
+    
+    echo -e "${GREEN}========OpenClaw WebUI 访问地址=============${RESET}"
 
     local_ip="127.0.0.1"
 
@@ -165,8 +172,10 @@ show_webui() {
 
     echo
     echo -e "${GREEN}本机地址：${RESET}"
+    echo
     echo -e "${YELLOW}http://${local_ip}:18789/#token=${token}${RESET}"
     echo
+    read -p "回车继续..."
 }
 
 update_app() {
@@ -193,7 +202,7 @@ while true; do
         2) start_app ;;
         3) stop_app ;;
         4) view_status ;;
-        5) change_tg_bot_code ;; ;;
+        5) change_tg_bot_code ;;
         6) nano "$CONFIG_FILE" && restart_gateway ;;
         7) openclaw onboard --install-daemon ;;
         8) openclaw doctor --fix ;;

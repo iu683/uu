@@ -1,233 +1,223 @@
-#!/bin/sh
+#!/bin/bash
 
-# ===============================
-# 颜色定义
-# ===============================
-RED='\033[0;31m'
-GREEN='\033[0;32m'
+GREEN="\033[32m"
 YELLOW="\033[33m"
-NC='\033[0m'
+RED="\033[31m"
+RESET="\033[0m"
 
-# ===============================
-# 清理 UDP 跳跃规则
-# ===============================
-remove_udp_jump() {
-    echo "清理 UDP 端口跳跃规则..."
-    SERVER_IP=$(ip -4 addr show | awk '/inet/ && $2 !~ /^127/ {split($2,a,"/"); print a[1]; exit}')
+SCRIPT_PATH="/usr/local/bin/clean-server"
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/vv.sh"
+CONFIG_FILE="/etc/clean-server.conf"
 
-    # 遍历保存的规则，安全删除
-    for rule in $(iptables-save | grep "DNAT" | grep "$SERVER_IP" | awk '{print $0}'); do
-        # 先把 -A 替换成 -D
-        del_rule=$(echo "$rule" | sed 's/^-A /-D /')
-        # 用 eval 执行，失败也不报错
-        eval iptables $del_rule 2>/dev/null || true
-    done
+# =================== Telegram ===================
+# 配置文件可选，格式：
+# TG_BOT_TOKEN="xxxx"
+# TG_CHAT_ID="xxxx"
+# SERVER_NAME="hostname"
+[ -f "$CONFIG_FILE" ] && source $CONFIG_FILE
 
-    for rule in $(iptables-save | grep "FORWARD" | grep "$SERVER_IP" | awk '{print $0}'); do
-        del_rule=$(echo "$rule" | sed 's/^-A /-D /')
-        eval iptables $del_rule 2>/dev/null || true
-    done
-
-    # 删除保存文件
-    rm -f /etc/iptables.rules
-    echo "✅ UDP 端口跳跃规则已清理"
+send_tg() {
+    [ -z "$TG_BOT_TOKEN" ] && return
+    [ -z "$TG_CHAT_ID" ] && return
+    SERVER_NAME=${SERVER_NAME:-$(hostname)}
+    MESSAGE="$1"
+    curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
+        -d chat_id="$TG_CHAT_ID" \
+        -d text="[$SERVER_NAME] $MESSAGE" >/dev/null
 }
 
-
-# ===============================
-# 卸载函数
-# ===============================
-uninstall_hy2() {
-    echo "正在卸载 Hysteria2..."
-    rc-service hysteria stop 2>/dev/null
-    rc-update del hysteria default 2>/dev/null
-    rm -f /etc/init.d/hysteria /usr/local/bin/hysteria
-    rm -rf /etc/hysteria
-    rm -f /var/log/hysteria.log /var/log/hysteria.err
-    # 删除 UDP 端口跳跃规则
-    remove_udp_jump
-    echo "卸载完成！"
-    exit 0
+set_telegram() {
+    echo -e "${GREEN}=== Telegram 设置 ===${RESET}"
+    read -p "请输入 Telegram Bot Token (留空跳过): " TG_BOT_TOKEN
+    read -p "请输入 Telegram Chat ID (留空跳过): " TG_CHAT_ID
+    read -p "请输入服务器名称 (留空使用 hostname): " SERVER_NAME
+    [ -z "$SERVER_NAME" ] && SERVER_NAME=$(hostname)
+    cat > $CONFIG_FILE <<EOF
+TG_BOT_TOKEN="$TG_BOT_TOKEN"
+TG_CHAT_ID="$TG_CHAT_ID"
+SERVER_NAME="$SERVER_NAME"
+EOF
+    echo -e "${GREEN}配置已保存${RESET}"
 }
 
-ACTION=$1
-if [ "$ACTION" = "uninstall" ]; then
-    uninstall_hy2
-fi
+# =================== 清理函数 ===================
+clean_logs() {
+    echo -e "${YELLOW}清理系统日志 /var/log...${RESET}"
+    find /var/log -type f -name "*.log" -mtime +7 -delete 2>/dev/null
+}
 
-# ===============================
-# 安装依赖
-# ===============================
-apk update && apk add curl ca-certificates openssl openrc iptables
+clean_journal() {
+    if command -v journalctl >/dev/null 2>&1; then
+        echo -e "${YELLOW}清理 systemd 日志...${RESET}"
+        journalctl --vacuum-time=7d >/dev/null 2>&1
+    else
+        echo "系统没有 journalctl"
+    fi
+}
 
-# ===============================
-# 识别架构
-# ===============================
-ARCH=$(uname -m)
-case $ARCH in
-    x86_64)  BIN_ARCH="amd64" ;;
-    aarch64) BIN_ARCH="arm64" ;;
-    armv7l)  BIN_ARCH="arm" ;;
-    *) echo "不支持的架构: $ARCH"; exit 1 ;;
-esac
-
-# ===============================
-# 下载 Hysteria2
-# ===============================
-REMOTE_VERSION=$(curl -sSL https://api.github.com/repos/apernet/hysteria/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-echo "正在获取 Hysteria2 最新版本: $REMOTE_VERSION"
-
-curl -fSL "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-$BIN_ARCH" -o /usr/local/bin/hysteria.new
-if [ $? -eq 0 ]; then
-    rc-service hysteria stop 2>/dev/null
-    mv /usr/local/bin/hysteria.new /usr/local/bin/hysteria
-    chmod +x /usr/local/bin/hysteria
-else
-    echo "下载失败"; exit 1
-fi
-
-mkdir -p /etc/hysteria
-
-# ===============================
-# 配置逻辑
-# ===============================
-if [ "$ACTION" = "update" ] && [ -f "/etc/hysteria/config.yaml" ]; then
-    echo -e "${GREEN}检测到 update 命令，保留原配置更新程序...${NC}"
-    HY_PASSWORD=$(grep 'password:' /etc/hysteria/config.yaml | awk '{print $2}')
-    HY_PORT=$(grep 'listen:' /etc/hysteria/config.yaml | cut -d':' -f3)
-else
-    echo -e "${RED}执行安装${NC}"
-    read -p "请输入 Hysteria2 端口 (默认: 57891): " HY_PORT
-    [ -z "$HY_PORT" ] && HY_PORT=57891
-
-    echo "使用端口: $HY_PORT"
-
-    # 生成证书
-    openssl req -x509 -nodes -newkey rsa:2048 \
-    -keyout /etc/hysteria/server.key \
-    -out /etc/hysteria/server.crt \
-    -subj "/CN=www.bing.com" -days 3650 2>/dev/null
-
-    # 生成密码
-    HY_PASSWORD=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 25)
-
-    # 写入配置
-    cat <<EOC > /etc/hysteria/config.yaml
-listen: :$HY_PORT
-
-tls:
-  cert: /etc/hysteria/server.crt
-  key: /etc/hysteria/server.key
-
-auth:
-  type: password
-  password: $HY_PASSWORD
-
-masquerade:
-  type: proxy
-  proxy:
-    url: https://bing.com/
-    rewriteHost: true
-EOC
-fi
-
-# ===============================
-# 服务配置
-# ===============================
-cat <<EOS > /etc/init.d/hysteria
-#!/sbin/openrc-run
-name="hysteria2"
-command="/usr/local/bin/hysteria"
-command_args="server -c /etc/hysteria/config.yaml"
-command_background=true
-pidfile="/run/\${RC_SVCNAME}.pid"
-output_log="/var/log/hysteria.log"
-error_log="/var/log/hysteria.err"
-depend() { need net; }
-EOS
-
-chmod +x /etc/init.d/hysteria
-rc-update add hysteria default 2>/dev/null
-rc-service hysteria restart
-
-# ===============================
-# UDP 端口跳跃函数
-# ===============================
-add_udp_jump() {
-    JUMP_START=$1
-    JUMP_END=$2
-
-    if [ -z "$JUMP_START" ] || [ -z "$JUMP_END" ]; then
-        echo -e "${RED}未指定端口范围，跳跃规则未添加${NC}"
+clean_docker() {
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "未安装 Docker"
         return
     fi
 
-    SERVER_IP=$(ip -4 addr show | awk '/inet/ && $2 !~ /^127/ {split($2,a,"/"); print a[1]; exit}')
-    echo -e "${YELLOW}添加 UDP 端口跳跃规则: $JUMP_START-$JUMP_END -> $HY_PORT${NC}"
+    echo -e "${YELLOW}清理 Docker 日志...${RESET}"
+    find /var/lib/docker/containers/ -name "*-json.log" -size +50M -exec truncate -s 0 {} \; 2>/dev/null
 
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1
-    sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1
+    echo -e "${YELLOW}清理未使用的镜像...${RESET}"
+    docker image prune -af >/dev/null 2>&1
 
-    # 删除旧规则
-    while iptables -t nat -C PREROUTING -p udp --dport $JUMP_START:$JUMP_END -j DNAT --to-destination ${SERVER_IP}:$HY_PORT 2>/dev/null
-    do
-        iptables -t nat -D PREROUTING -p udp --dport $JUMP_START:$JUMP_END -j DNAT --to-destination ${SERVER_IP}:$HY_PORT
-    done
+    echo -e "${YELLOW}清理未使用的卷...${RESET}"
+    docker volume prune -f >/dev/null 2>&1
 
-    # 添加新规则
-    iptables -t nat -I PREROUTING 1 -p udp --dport $JUMP_START:$JUMP_END -j DNAT --to-destination ${SERVER_IP}:$HY_PORT
+    echo -e "${YELLOW}清理未使用的网络...${RESET}"
+    docker network prune -f >/dev/null 2>&1
 
-    # 放行 FORWARD
-    iptables -C FORWARD -p udp --dport $HY_PORT -j ACCEPT 2>/dev/null || \
-    iptables -I FORWARD -p udp --dport $HY_PORT -j ACCEPT
-
-    # 保存规则
-    iptables-save > /etc/iptables.rules
-    echo -e "${GREEN}✅ UDP 端口跳跃规则添加完成并保存${NC}"
+    echo -e "${GREEN}Docker 清理完成${RESET}"
 }
 
+clean_tmp() {
+    echo -e "${YELLOW}清理 /tmp 临时文件...${RESET}"
+    find /tmp -type f -mtime +3 -delete 2>/dev/null
+}
 
-# ===============================
-# 设置开机自动恢复 iptables
-# ===============================
-cat <<'EOF' > /etc/local.d/udp_jump.start
-#!/bin/sh
-[ -f /etc/iptables.rules ] && iptables-restore < /etc/iptables.rules
-EOF
-chmod +x /etc/local.d/udp_jump.start
-rc-update add local default 2>/dev/null
+clean_cache() {
+    echo -e "${YELLOW}清理系统缓存...${RESET}"
+    command -v apt >/dev/null 2>&1 && apt clean
+    command -v apk >/dev/null 2>&1 && apk cache clean
+}
 
-# ===============================
-# 用户自定义端口跳跃
-# ===============================
-read -p "请输入 UDP 跳跃端口范围 (格式: 起始-结束, 例如 10000-20000, 不设置则跳过): " JUMP_RANGE
-if [ -n "$JUMP_RANGE" ]; then
-    JUMP_START=$(echo $JUMP_RANGE | cut -d'-' -f1)
-    JUMP_END=$(echo $JUMP_RANGE | cut -d'-' -f2)
-    add_udp_jump $JUMP_START $JUMP_END
-else
-    echo -e "${YELLOW}未设置 UDP 跳跃，跳过此步骤${NC}"
+run_all() {
+    echo -e "${GREEN}开始清理服务器...${RESET}"
+    clean_logs
+    clean_journal
+    clean_docker
+    clean_tmp
+    clean_cache
+    echo -e "${GREEN}清理完成${RESET}"
+    send_tg "服务器清理完成"
+}
+
+# =================== cron ===================
+enable_cron() {
+    echo -e "${GREEN}选择更新频率：${RESET}"
+    echo -e "${GREEN}1) 每天${RESET}"
+    echo -e "${GREEN}2) 每周${RESET}"
+    echo -e "${GREEN}3) 每月${RESET}"
+    echo -e "${GREEN}4) 每6小时${RESET}"
+    echo -e "${GREEN}5) 自定义 cron 表达式${RESET}"
+
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " c
+    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --auto" > /tmp/cron.tmp || true
+
+    case $c in
+        1) echo "0 0 * * * $SCRIPT_PATH --auto" >> /tmp/cron.tmp ;;
+        2) echo "0 0 * * 1 $SCRIPT_PATH --auto" >> /tmp/cron.tmp ;;
+        3) echo "0 0 1 * * $SCRIPT_PATH --auto" >> /tmp/cron.tmp ;;
+        4) echo "0 */6 * * * $SCRIPT_PATH --auto" >> /tmp/cron.tmp ;;
+        5)
+            echo "示例: 每30分钟 */30 * * * *"
+            read -p "请输入完整 cron 表达式: " CRON_EXP
+            echo "$CRON_EXP $SCRIPT_PATH --auto" >> /tmp/cron.tmp
+            ;;
+        *)
+            echo -e "${YELLOW}无效选项，取消操作${RESET}"
+            rm -f /tmp/cron.tmp
+            return
+            ;;
+    esac
+
+    crontab /tmp/cron.tmp
+    rm -f /tmp/cron.tmp
+    echo -e "${GREEN}自动清理已开启${RESET}"
+}
+
+disable_cron() {
+    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --auto" > /tmp/cron.tmp || true
+    crontab /tmp/cron.tmp
+    rm -f /tmp/cron.tmp
+    echo -e "${YELLOW}自动清理已关闭${RESET}"
+}
+
+show_cron() {
+    echo -e "${GREEN}当前定时任务:${RESET}"
+    crontab -l 2>/dev/null | grep "$SCRIPT_PATH --auto"
+}
+
+# =================== 脚本管理 ===================
+update_script() {
+    echo -e "${GREEN}正在更新脚本...${RESET}"
+    curl -sL $SCRIPT_URL -o $SCRIPT_PATH
+    chmod +x $SCRIPT_PATH
+    echo -e "${GREEN}更新完成${RESET}"
+}
+
+uninstall_script() {
+    echo -e "${RED}正在卸载脚本...${RESET}"
+    disable_cron
+    rm -f $SCRIPT_PATH
+    echo -e "${GREEN}卸载完成${RESET}"
+}
+
+install_script() {
+    if [ "$0" != "$SCRIPT_PATH" ]; then
+        echo -e "${GREEN}正在安装脚本...${RESET}"
+        curl -sL $SCRIPT_URL -o $SCRIPT_PATH
+        chmod +x $SCRIPT_PATH
+        echo -e "${GREEN}安装完成${RESET}"
+        echo -e "${GREEN}运行命令: clean-server${RESET}"
+        exit
+    fi
+}
+
+# =================== 菜单 ===================
+menu() {
+    clear
+    echo -e "${GREEN}=== 服务器清理工具 ===${RESET}"
+    echo -e "${GREEN} 1) 清理系统日志${RESET}"
+    echo -e "${GREEN} 2) 清理 systemd 日志${RESET}"
+    echo -e "${GREEN} 3) 清理 Docker 日志和无用资源${RESET}"
+    echo -e "${GREEN} 4) 清理 /tmp 文件${RESET}"
+    echo -e "${GREEN} 5) 清理系统缓存${RESET}"
+    echo -e "${GREEN} 6) 一键全部清理${RESET}"
+    echo -e "${GREEN} 7) 开启每日自动清理${RESET}"
+    echo -e "${GREEN} 8) 关闭自动清理${RESET}"
+    echo -e "${GREEN} 9) 查看定时任务${RESET}"
+    echo -e "${GREEN}10) 更新脚本${RESET}"
+    echo -e "${GREEN}11) 卸载脚本${RESET}"
+    echo -e "${GREEN}12) 设置 Telegram 通知${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+
+    read -r -p $'\033[32m请选择: \033[0m' choice
+}
+
+# =================== 自动模式 ===================
+if [ "$1" = "--auto" ]; then
+    run_all
+    exit
 fi
 
-# ===============================
-# 输出节点信息
-# ===============================
-SERVER_IP=$(curl -s https://api.ipify.org || echo "YOUR_SERVER_IP")
-HOSTNAME=$(hostname -s | sed 's/ /_/g')
+install_script
 
-echo "------------------------------------------------"
-echo -e "${GREEN}Hysteria2 部署成功！${NC}"
-echo "------------------------------------------------"
-
-echo -e "${GREEN}==== v2rayN / Nekobox ====${NC}"
-echo -e "${YELLOW}hysteria2://$HY_PASSWORD@$SERVER_IP:$HY_PORT/?insecure=1&sni=www.bing.com#$HOSTNAME${NC}"
-echo ""
-
-echo -e "${GREEN}==== Clash Meta ====${NC}"
-echo -e "${YELLOW}{ name: $HOSTNAME, type: hysteria2, server: $SERVER_IP, port: $HY_PORT, password: $HY_PASSWORD, sni: www.bing.com, skip-cert-verify: true }${NC}"
-echo ""
-
-echo -e "${GREEN}==== Surge ====${NC}"
-echo -e "${YELLOW}$HOSTNAME = hysteria2, $SERVER_IP, $HY_PORT, password=$HY_PASSWORD, sni=www.bing.com, skip-cert-verify=true${NC}"
-echo "------------------------------------------------"
+# =================== 主循环 ===================
+while true; do
+    menu
+    case $choice in
+        1) clean_logs ;;
+        2) clean_journal ;;
+        3) clean_docker ;;
+        4) clean_tmp ;;
+        5) clean_cache ;;
+        6) run_all ;;
+        7) enable_cron ;;
+        8) disable_cron ;;
+        9) show_cron ;;
+        10) update_script ;;
+        11) uninstall_script ;;
+        12) set_telegram ;;
+        0) exit ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
+    esac
+    echo
+    read -p "按回车返回菜单..."
+done

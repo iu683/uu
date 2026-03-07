@@ -1,334 +1,200 @@
-#!/bin/bash
-# ==================================================
-# VPS Geo Firewall (IPv4+IPv6)
-# Debian / Ubuntu
-# 独立链 / 端口控制 / 自动更新 / 白名单 / 卸载
-# ==================================================
+#!/bin/sh
 
-CONF="/opt/geoip/geo.conf"
-UPDATE_SCRIPT="/opt/geoip/update_geo.sh"
-SCRIPT_PATH="/usr/local/bin/geofirewall"
-SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+NC='\033[0m'
 
-GREEN="\033[32m"
-RED="\033[31m"
-RESET="\033[0m"
+CONF_PATH="/etc/xray/config.json"
+XRAY_BIN="/usr/local/bin/xray"
+LOG_PATH="/var/log/xray.log"
 
-green(){ echo -e "${GREEN}$1${RESET}"; }
-red(){ echo -e "${RED}$1${RESET}"; }
+# 获取架构
+ARCH=$(uname -m)
+case ${ARCH} in
+    x86_64)  X_ARCH="64" ;;
+    aarch64) X_ARCH="arm64-v8a" ;;
+    *) echo "不支持的架构"; exit 1 ;;
+esac
 
-[[ $(id -u) != 0 ]] && red "请使用 root 运行" && exit 1
-
-# ================== 初始化环境 ==================
-init_env(){
-    mkdir -p /opt/geoip
-    touch $CONF
-
-    # 仅第一次安装依赖
-    if [[ ! -f /opt/geoip/.deps_installed ]]; then
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update
-        apt-get install -y ipset iptables curl iptables-persistent netfilter-persistent
-        touch /opt/geoip/.deps_installed
-        green "依赖安装完成"
-    fi
+# 1. 清理函数
+do_cleanup() {
+    echo -e "${BLUE}正在清理旧环境...${NC}"
+    [ -f /etc/init.d/xray ] && rc-service xray stop 2>/dev/null && rc-update del xray default 2>/dev/null
+    rm -rf /etc/xray /usr/local/share/xray ${XRAY_BIN} ${LOG_PATH} /etc/init.d/xray
 }
 
-# ================== 下载或更新脚本 ==================
-download_script(){
-    mkdir -p "$(dirname "$SCRIPT_PATH")"
-    curl -sSL "$SCRIPT_URL" -o "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
-    green "脚本已更新"
+# 2. 安装依赖并下载
+download_xray() {
+    echo -e "${BLUE}安装依赖 (含 libc6-compat 兼容库)...${NC}"
+    apk update && apk add curl unzip openssl ca-certificates uuidgen tar gcompat libc6-compat > /dev/null 2>&1
+
+    echo -e "${BLUE}获取最新版本...${NC}"
+    NEW_VER=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep '"tag_name":' | head -n 1 | cut -d'"' -f4)
+    [ -z "$NEW_VER" ] && NEW_VER="v24.12.31"
+    
+    echo -e "${GREEN}下载版本: ${NEW_VER}${NC}"
+    curl -L -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${NEW_VER}/Xray-linux-${X_ARCH}.zip"
+    
+    mkdir -p /etc/xray /usr/local/share/xray /tmp/xray_tmp
+    unzip -o /tmp/xray.zip -d /tmp/xray_tmp
+    mv -f /tmp/xray_tmp/xray ${XRAY_BIN}
+    mv -f /tmp/xray_tmp/*.dat /usr/local/share/xray/
+    chmod +x ${XRAY_BIN}
+    rm -rf /tmp/xray.zip /tmp/xray_tmp
 }
 
-# ================== 获取信息 ==================
-get_my_ip(){ hostname -I | awk '{print $1}'; }
-get_ssh_port(){
-    grep -i "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1
-}
-
-# ================== 自动更新IP库 ==================
-install_auto_update(){
-cat > $UPDATE_SCRIPT <<EOF
-#!/bin/bash
-CONF="/opt/geoip/geo.conf"
-source \$CONF 2>/dev/null
-[[ -z "\$COUNTRY" ]] && exit 0
-CC_L=\$(echo \$COUNTRY | tr A-Z a-z)
-curl -s -o /opt/geoip/\${CC_L}.zone https://www.ipdeny.com/ipblocks/data/countries/\${CC_L}.zone
-curl -s -o /opt/geoip/\${CC_L}.ipv6.zone https://www.ipdeny.com/ipv6/ipaddresses/aggregated/\${CC_L}-aggregated.zone
-EOF
-
-chmod +x $UPDATE_SCRIPT
-(crontab -l 2>/dev/null | grep -v update_geo.sh; echo "0 3 * * * $UPDATE_SCRIPT") | crontab -
-green "每日 03:00 自动更新IP库"
-}
-
-# ================== 原子更新 ipset ==================
-update_ipset(){
-    local SET_NAME=$1
-    local FILE=$2
-    local FAMILY=$3
-
-    [[ ! -s "$FILE" ]] && { red "IP库文件为空 $SET_NAME"; return 1; }
-
-    ipset create $SET_NAME hash:net family $FAMILY -exist
-    ipset create ${SET_NAME}_tmp hash:net family $FAMILY -exist
-    ipset flush ${SET_NAME}_tmp
-
-    while read -r ip; do
-        [[ -n "$ip" ]] && ipset add ${SET_NAME}_tmp "$ip" 2>/dev/null
-    done < "$FILE"
-
-    ipset swap ${SET_NAME}_tmp $SET_NAME
-    ipset destroy ${SET_NAME}_tmp
-    return 0
-}
-
-# ================== 应用规则 ==================
-apply_rules(){
-    source $CONF 2>/dev/null
-    [[ -z "$COUNTRY" ]] && { red "未配置规则"; return; }
-
-    SSH_PORT=$(get_ssh_port)
-    [[ -z "$SSH_PORT" ]] && SSH_PORT=22
-    green "默认放行 SSH端口: $SSH_PORT"
-
-    # 创建 GEO_CHAIN 链
-    iptables -N GEO_CHAIN 2>/dev/null
-    ip6tables -N GEO_CHAIN 2>/dev/null
-    iptables -F GEO_CHAIN
-    ip6tables -F GEO_CHAIN
-
-    # INPUT 链跳转
-    iptables -C INPUT -j GEO_CHAIN 2>/dev/null || iptables -I INPUT -j GEO_CHAIN
-    ip6tables -C INPUT -j GEO_CHAIN 2>/dev/null || ip6tables -I INPUT -j GEO_CHAIN
-
-    # 基础规则
-    iptables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    ip6tables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-    MYIP=$(get_my_ip)
-    [[ -n "$MYIP" ]] && iptables -A GEO_CHAIN -s $MYIP -j ACCEPT
-
-    iptables -A GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
-    ip6tables -A GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
-
-    # 白名单
-    for ip in $WHITELIST; do
-        [[ -n "$ip" ]] && {
-            iptables -I GEO_CHAIN 2 -s $ip -j ACCEPT
-            ip6tables -I GEO_CHAIN 2 -s $ip -j ACCEPT
-        }
-    done
-
-    CC_L=$(echo $COUNTRY | tr A-Z a-z)
-    V4FILE="/opt/geoip/${CC_L}.zone"
-    V6FILE="/opt/geoip/${CC_L}.ipv6.zone"
-
-    curl -s -o $V4FILE https://www.ipdeny.com/ipblocks/data/countries/$CC_L.zone
-    curl -s -o $V6FILE https://www.ipdeny.com/ipv6/ipaddresses/aggregated/$CC_L-aggregated.zone
-
-    update_ipset geo_v4 $V4FILE inet
-    update_ipset geo_v6 $V6FILE inet6
-
-    # 封锁/允许规则
-    for proto in tcp udp; do
-        if [[ "$MODE" == "block" ]]; then
-            if [[ "$PORTS" == "all" ]]; then
-                iptables -A GEO_CHAIN -p $proto -m set --match-set geo_v4 src -j DROP
-                ip6tables -A GEO_CHAIN -p $proto -m set --match-set geo_v6 src -j DROP
-            else
-                for p in $PORTS; do
-                    iptables -A GEO_CHAIN -p $proto --dport $p -m set --match-set geo_v4 src -j DROP
-                    ip6tables -A GEO_CHAIN -p $proto --dport $p -m set --match-set geo_v6 src -j DROP
-                done
-            fi
-        else
-            if [[ "$PORTS" == "all" ]]; then
-                iptables -A GEO_CHAIN -p $proto -m set ! --match-set geo_v4 src -j DROP
-                ip6tables -A GEO_CHAIN -p $proto -m set ! --match-set geo_v6 src -j DROP
-            else
-                for p in $PORTS; do
-                    iptables -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set geo_v4 src -j DROP
-                    ip6tables -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set geo_v6 src -j DROP
-                done
-            fi
-        fi
-    done
-
-    netfilter-persistent save >/dev/null 2>&1
-    green "规则已成功应用"
-}
-
-# ================== 添加规则 ==================
-add_rule(){
-    echo -e "${GREEN}选择模式:${RESET}"
-    echo -e "${GREEN}1 封锁某国某端口${RESET}"
-    echo -e "${GREEN}2 封锁某国所有端口${RESET}"
-    echo -e "${GREEN}3 只允许某国某端口${RESET}"
-    echo -e "${GREEN}4 只允许某国访问整个服务器${RESET}"
-    read -p $'\033[32m选择模式(1-4): \033[0m' choice
-
-    case "$choice" in
-        1)
-            MODE="block"
-            read -p $'\033[32m国家代码(例如 cn JP us): \033[0m' COUNTRY
-            read -p $'\033[32m端口(例如 443 80 多个空格): \033[0m' PORTS
-            ;;
-        2)
-            MODE="block"
-            read -p $'\033[32m国家代码: \033[0m' COUNTRY
-            PORTS="all"
-            ;;
-        3)
-            MODE="allow"
-            read -p $'\033[32m国家代码: \033[0m' COUNTRY
-            read -p $'\033[32m端口 (多个空格): \033[0m' PORTS
-            ;;
-        4)
-            MODE="allow"
-            read -p $'\033[32m国家代码: \033[0m' COUNTRY
-            PORTS="all"
-            ;;
-        *)
-            red "无效选择"
-            return
-            ;;
-    esac
-
-    echo "MODE=\"$MODE\"" > $CONF
-    echo "COUNTRY=\"$COUNTRY\"" >> $CONF
-    echo "PORTS=\"$PORTS\"" >> $CONF
-    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
-
-    install_auto_update
-    apply_rules
-}
-
-# ================== 白名单 ==================
-add_whitelist(){
-    read -p $'\033[32m输入白名单 IP (多个空格): \033[0m' ips
-    source $CONF 2>/dev/null
-    WHITELIST="$WHITELIST $ips"
-    echo "MODE=\"$MODE\"" > $CONF
-    echo "COUNTRY=\"$COUNTRY\"" >> $CONF
-    echo "PORTS=\"$PORTS\"" >> $CONF
-    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
-
-    # 遍历每个 IP
-    for ip in $ips; do
-        if [[ $ip =~ : ]]; then
-            # IPv6
-            ip6tables -I GEO_CHAIN 2 -s $ip -j ACCEPT
-        else
-            # IPv4
-            iptables -I GEO_CHAIN 2 -s $ip -j ACCEPT
-        fi
-    done
-    apply_rules
-    green "白名单已应用"
-}
-
-delete_whitelist(){
-    read -p $'\033[32m输入要删除的白名单 IP (多个空格): \033[0m' ips
-    source $CONF 2>/dev/null
-    for ip in $ips; do
-        WHITELIST=$(echo $WHITELIST | sed -E "s/\b$ip\b//g")
-        if [[ $ip =~ : ]]; then
-            ip6tables -D GEO_CHAIN -s $ip -j ACCEPT 2>/dev/null
-        else
-            iptables -D GEO_CHAIN -s $ip -j ACCEPT 2>/dev/null
-        fi
-    done
-    echo "MODE=\"$MODE\"" > $CONF
-    echo "COUNTRY=\"$COUNTRY\"" >> $CONF
-    echo "PORTS=\"$PORTS\"" >> $CONF
-    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
-    apply_rules
-    green "白名单已删除"
-}
-
-# ================== 删除端口规则 ==================
-delete_rules(){
-    source $CONF 2>/dev/null
-    [[ -z "$PORTS" ]] && { red "未检测到配置"; return; }
-    read -p $'\033[32m输入要删除的端口 (多个空格): \033[0m' DEL_PORTS
-    [[ -z "$DEL_PORTS" ]] && { red "未输入端口"; return; }
-    for p in $DEL_PORTS; do
-        for proto in tcp udp; do
-            iptables -L GEO_CHAIN --line-numbers -n | grep "$proto" | grep "dpt:$p" | awk '{print $1}' | sort -rn | while read num; do
-                iptables -D GEO_CHAIN $num
-            done
-            ip6tables -L GEO_CHAIN --line-numbers -n | grep "$proto" | grep "dpt:$p" | awk '{print $1}' | sort -rn | while read num; do
-                ip6tables -D GEO_CHAIN $num
-            done
-        done
-        green "端口 $p 规则已删除"
-    done
-    netfilter-persistent save >/dev/null 2>&1
-}
-
-# ================== 查看规则 ==================
-view_rules(){
-    clear
-    green "========= 当前配置 ========="
-    cat $CONF 2>/dev/null
-    echo
-    iptables -L GEO_CHAIN -n --line-numbers 2>/dev/null
-    echo
-    ip6tables -L GEO_CHAIN -n --line-numbers 2>/dev/null
-    echo
-    ipset list | grep "^Name:"
-}
-
-# ================== 卸载 ==================
-uninstall_all(){
-    green "正在卸载"
-    iptables -D INPUT -j GEO_CHAIN 2>/dev/null
-    ip6tables -D INPUT -j GEO_CHAIN 2>/dev/null
-    iptables -F GEO_CHAIN 2>/dev/null
-    ip6tables -F GEO_CHAIN 2>/dev/null
-    iptables -X GEO_CHAIN 2>/dev/null
-    ip6tables -X GEO_CHAIN 2>/dev/null
-    ipset list | grep "^Name: geo_" | awk '{print $2}' | xargs -r -I {} ipset destroy {}
-    rm -rf /opt/geoip
-    crontab -l 2>/dev/null | grep -v update_geo.sh | crontab -
-    rm -f $SCRIPT_PATH
-    netfilter-persistent save >/dev/null 2>&1
-    green "已彻底卸载完成"
+# 3. 更新功能
+do_update() {
+    if [ ! -f "${XRAY_BIN}" ]; then echo -e "${RED}未安装 Xray${NC}"; exit 1; fi
+    echo -e "${BLUE}保留配置更新二进制文件...${NC}"
+    rc-service xray stop
+    download_xray
+    rc-service xray start
+    echo -e "${GREEN}更新成功！${NC}"
     exit 0
 }
 
-# ================== 菜单 ==================
-menu(){
-    clear
-    echo -e "${GREEN}===== VPS国家防火墙 =====${RESET}"
-    echo -e "${GREEN}1 添加规则${RESET}"
-    echo -e "${GREEN}2 删除端口规则${RESET}"
-    echo -e "${GREEN}3 查看规则${RESET}"
-    echo -e "${GREEN}4 添加白名单${RESET}"
-    echo -e "${GREEN}5 删除白名单${RESET}"
-    echo -e "${GREEN}6 更新${RESET}"
-    echo -e "${GREEN}7 卸载${RESET}"
-    echo -e "${GREEN}0 退出${RESET}"
-    read -r -p $'\033[32m请选择: \033[0m' num
-    case $num in
-        1) add_rule ;;
-        2) delete_rules ;;
-        3) view_rules ;;
-        4) add_whitelist ;;
-        5) delete_whitelist ;;
-        6) download_script ;;
-        7) uninstall_all ;;
-        0) exit ;;
-    esac
-}
+# 指令处理
+if [ "$1" = "uninstall" ]; then do_cleanup; echo -e "${GREEN}卸载完成${NC}"; exit 0; fi
+if [ "$1" = "update" ]; then do_update; fi
 
-# ================== 主循环 ==================
-init_env
-while true; do
-    menu
-    read -r -p $'\033[32m按回车继续...\033[0m'
-done
+# 默认安装流程
+do_cleanup
+download_xray
+
+# 4. 用户自定义参数
+echo ""
+read -p "请输入 Reality 端口 (默认: 57891): " PORT
+[ -z "$PORT" ] && PORT=57891
+
+read -p "请输入伪装域名 (默认: itunes.apple.com): " DEST_DOMAIN
+[ -z "$DEST_DOMAIN" ] && DEST_DOMAIN="itunes.apple.com"
+
+echo ""
+echo -e "${GREEN}端口: ${PORT}${NC}"
+echo -e "${GREEN}伪装域名: ${DEST_DOMAIN}${NC}"
+echo ""
+
+# 4. 密钥生成 (适配 PrivateKey 和 Password 格式)
+echo -e "${BLUE}生成 Reality 密钥对...${NC}"
+X_KEYS_ALL=$(${XRAY_BIN} x25519 2>/dev/null)
+UUID=$(${XRAY_BIN} uuid 2>/dev/null)
+
+PRIVATE_KEY=$(echo "${X_KEYS_ALL}" | grep "PrivateKey" | awk '{print $NF}')
+PUBLIC_KEY=$(echo "${X_KEYS_ALL}" | grep "Password" | awk '{print $NF}')
+[ -z "$PUBLIC_KEY" ] && PUBLIC_KEY=$(echo "${X_KEYS_ALL}" | grep "Public" | awk '{print $NF}')
+
+SHORT_ID=$(openssl rand -hex 4)
+
+if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
+    echo -e "${RED}密钥提取失败，请检查 Xray 输出环境${NC}"
+    exit 1
+fi
+
+# 5. 写入防刷流量配置
+cat << CONF > ${CONF_PATH}
+{
+    "log": { "access": "${LOG_PATH}", "loglevel": "info" },
+    "inbounds": [
+        {
+            "tag": "dokodemo-in",
+            "port": 4431,
+            "protocol": "dokodemo-door",
+            "settings": { "address": "${DEST_DOMAIN}", "port": 443, "network": "tcp" },
+            "sniffing": { "enabled": true, "destOverride": ["tls"], "routeOnly": true }
+        },
+        {
+            "listen": "0.0.0.0",
+            "port": ${PORT},
+            "protocol": "vless",
+            "settings": {
+                "clients": [{ "id": "${UUID}", "flow": "xtls-rprx-vision" }],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "dest": "127.0.0.1:4431",
+                    "serverNames": ["${DEST_DOMAIN}"],
+                    "privateKey": "${PRIVATE_KEY}",
+                    "shortIds": ["${SHORT_ID}"],
+                    "fingerprint": "random"
+                }
+            },
+            "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true }
+        }
+    ],
+    "outbounds": [
+        { "protocol": "freedom", "settings": { "domainStrategy": "UseIP" }, "tag": "direct" },
+        { "protocol": "blackhole", "tag": "block" }
+    ],
+    "routing": {
+        "rules": [
+            {
+                "type": "field",
+                "inboundTag": ["dokodemo-in"],
+                "domain": ["${DEST_DOMAIN}"],
+                "outboundTag": "direct"
+            },
+            {
+                "type": "field",
+                "inboundTag": ["dokodemo-in"],
+                "outboundTag": "block"
+            }
+        ]
+    }
+}
+CONF
+
+# 6. 服务配置
+cat << 'SERVICE' > /etc/init.d/xray
+#!/sbin/openrc-run
+description="Xray Reality"
+command="/usr/local/bin/xray"
+command_args="run -c /etc/xray/config.json"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+depend() { need net; after firewall; }
+SERVICE
+chmod +x /etc/init.d/xray
+rc-update add xray default
+rc-service xray restart
+
+# 7. 分离双栈输出
+sleep 2
+PID=$(pidof xray)
+IP4=$(curl -s4 ifconfig.me)
+IP6=$(curl -s6 ifconfig.me)
+
+echo ""
+echo -e "${GREEN}================ 安装完成 (Reality 防刷版) ===================${NC}"
+[ -n "$PID" ] && echo -e "运行状态: ${GREEN}运行中 (PID: $PID)${NC}" || echo -e "运行状态: ${RED}启动失败${NC}"
+echo -e "配置文件: ${BLUE}${CONF_PATH}${NC}"
+echo "------------------------------------------------"
+
+# IPv4 节点
+if [ -n "$IP4" ]; then
+    echo -e "${BLUE}[IPv4 节点信息]${NC}"
+    echo -e "v2RayN: vless://${UUID}@${IP4}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST_DOMAIN}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#Alpine_V4"
+    echo -e "Clash: - {name: Alpine_V4, type: vless, server: ${IP4}, port: 443, uuid: ${UUID}, udp: true, tls: true, flow: xtls-rprx-vision, servername: ${DEST_DOMAIN}, network: tcp, reality-opts: {public-key: ${PUBLIC_KEY}, short-id: ${SHORT_ID}}, client-fingerprint: random}"
+    echo ""
+fi
+
+# IPv6 节点
+if [ -n "$IP6" ]; then
+    echo -e "${BLUE}[IPv6 节点信息]${NC}"
+    echo -e "v2RayN: vless://${UUID}@[${IP6}]:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST_DOMAIN}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#Alpine_V6"
+    echo -e "Clash: - {name: Alpine_V6, type: vless, server: '${IP6}', port: 443, uuid: ${UUID}, udp: true, tls: true, flow: xtls-rprx-vision, servername: ${DEST_DOMAIN}, network: tcp, reality-opts: {public-key: ${PUBLIC_KEY}, short-id: ${SHORT_ID}}, client-fingerprint: random}"
+    echo ""
+fi
+
+echo "------------------------------------------------"
+echo -e "${GREEN}[管理维护指令]${NC}"
+echo -e "1. 实时日志 (查偷流): ${BLUE}tail -f ${LOG_PATH}${NC}"
+echo -e "2. 仅更新程序: ${BLUE}sh update${NC}"
+echo -e "3. 覆盖安装(刷密钥): ${BLUE}sh ${NC}"
+echo -e "4. 卸载服务: ${BLUE}sh uninstall${NC}"
+echo -e "${GREEN}=============================================================${NC}"

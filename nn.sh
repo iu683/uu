@@ -1,233 +1,117 @@
-#!/bin/bash
-# ========================================
-# AMMDS 一键管理脚本
-# ========================================
+#!/bin/sh
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-RESET="\033[0m"
+# 定义颜色
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m'
 
-APP_NAME="ammds"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-
-# ==============================
-# Docker检测
-# ==============================
-
-check_docker() {
-
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2${RESET}"
-        exit 1
-    fi
+# 卸载函数
+uninstall_hy2() {
+    echo "正在卸载 Hysteria2..."
+    rc-service hysteria stop 2>/dev/null
+    rc-update del hysteria default 2>/dev/null
+    rm -f /etc/init.d/hysteria /usr/local/bin/hysteria
+    rm -rf /etc/hysteria
+    rm -f /var/log/hysteria.log /var/log/hysteria.err
+    echo "卸载完成！"
+    exit 0
 }
 
-check_port() {
+# 检查参数
+ACTION=$1
 
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用${RESET}"
-        return 1
-    fi
-}
+if [ "$ACTION" = "uninstall" ]; then
+    uninstall_hy2
+fi
 
-# ==============================
-# 菜单
-# ==============================
+# 1. 环境准备
+apk update && apk add curl ca-certificates openssl openrc
 
-menu() {
+# 2. 识别架构
+ARCH=$(uname -m)
+case $ARCH in
+    x86_64)  BIN_ARCH="amd64" ;;
+    aarch64) BIN_ARCH="arm64" ;;
+    armv7l)  BIN_ARCH="arm" ;;
+    *) echo "不支持的架构: $ARCH"; exit 1 ;;
+esac
 
-    while true; do
-        clear
-        echo -e "${GREEN}=== AMMDS 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
+# 3. 版本检查与程序更新
+REMOTE_VERSION=$(curl -sSL https://api.github.com/repos/apernet/hysteria/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+echo "正在获取 Hysteria2 最新版本: $REMOTE_VERSION"
 
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+curl -fSL "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-$BIN_ARCH" -o /usr/local/bin/hysteria.new
+if [ $? -eq 0 ]; then
+    rc-service hysteria stop 2>/dev/null
+    mv /usr/local/bin/hysteria.new /usr/local/bin/hysteria
+    chmod +x /usr/local/bin/hysteria
+else
+    echo "下载失败"; exit 1
+fi
 
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *)
-                echo -e "${RED}无效选择${RESET}"
-                sleep 1
-                ;;
-        esac
-    done
-}
+# 4. 配置文件处理逻辑
+mkdir -p /etc/hysteria
 
-# ==============================
-# 安装
-# ==============================
+if [ "$ACTION" = "update" ] && [ -f "/etc/hysteria/config.yaml" ]; then
+    echo -e "${GREEN}检测到 update 命令，正在保留原配置更新...${NC}"
+    HY_PASSWORD=$(grep 'password:' /etc/hysteria/config.yaml | awk '{print $2}')
+else
+    echo -e "${RED}正在执行覆盖安装/初始化...${NC}"
+    # 生成新证书 (已通过 2>/dev/null 隐藏进度条)
+    openssl req -x509 -nodes -newkey rsa:2048 -keyout /etc/hysteria/server.key -out /etc/hysteria/server.crt -subj "/CN=www.bing.com" -days 3650 2>/dev/null
+    
+    # 生成新密码
+    HY_PASSWORD=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 25)
+    
+    # 写入新配置
+    cat << EOC > /etc/hysteria/config.yaml
+listen: :57891
+tls:
+  cert: /etc/hysteria/server.crt
+  key: /etc/hysteria/server.key
+auth:
+  type: password
+  password: $HY_PASSWORD
+masquerade:
+  type: proxy
+  proxy:
+    url: https://bing.com/
+    rewriteHost: true
+EOC
+fi
 
-install_app() {
+# 5. 服务与启动
+cat << EOS > /etc/init.d/hysteria
+#!/sbin/openrc-run
+name="hysteria2"
+command="/usr/local/bin/hysteria"
+command_args="server -c /etc/hysteria/config.yaml"
+command_background=true
+pidfile="/run/\${RC_SVCNAME}.pid"
+output_log="/var/log/hysteria.log"
+error_log="/var/log/hysteria.err"
+depend() { need net; }
+EOS
+chmod +x /etc/init.d/hysteria
+rc-update add hysteria default 2>/dev/null
+rc-service hysteria restart
 
-    check_docker
-
-    mkdir -p "$APP_DIR"/{data,db,download}
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-
-    read -p "请输入访问端口 [默认:8080]: " input_port
-    PORT=${input_port:-8080}
-
-    check_port "$PORT" || return
-
-    echo
-    echo "请输入媒体目录（支持多个，用空格分隔）"
-    echo "例如: /mnt/movie /mnt/tv"
-    echo "留空则使用默认: $APP_DIR/media"
-    read -p "媒体目录: " MEDIA_PATHS
-
-    MEDIA_VOLUMES=""
-    MEDIA_PRINT=""
-
-    if [ -z "$MEDIA_PATHS" ]; then
-        mkdir -p "$APP_DIR/media"
-        MEDIA_VOLUMES="      - ./media:/media"
-        MEDIA_PRINT="$APP_DIR/media"
-    else
-        for path in $MEDIA_PATHS; do
-            mkdir -p "$path"
-
-            MEDIA_VOLUMES="${MEDIA_VOLUMES}
-      - ${path}:${path}"
-
-            MEDIA_PRINT="${MEDIA_PRINT}
-${path}"
-        done
-    fi
-
-cat > "$COMPOSE_FILE" <<EOF
-services:
-  ammds:
-    image: qyg2297248353/ammds:latest
-    container_name: ammds
-
-    ports:
-      - 127.0.0.1:${PORT}:80
-
-    volumes:
-      - ./data:/ammds/data
-      - ./db:/ammds/db
-      - ./download:/ammds/download
-$MEDIA_VOLUMES
-
-    environment:
-      - TZ=Asia/Shanghai
-
-    restart: unless-stopped
-
-    networks:
-      - ammds-network
-
-networks:
-  ammds-network:
-    driver: bridge
-EOF
-
-    cd "$APP_DIR" || exit
-
-    docker compose up -d || { echo -e "${RED}启动失败${RESET}"; return; }
-
-    echo
-    echo -e "${GREEN}✅ AMMDS 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🌐 默认账号/密码: ammds/ammds${RESET}"
-    echo -e "${YELLOW}📂 安装目录: $APP_DIR${RESET}"
-    echo -e "${YELLOW}📂 媒体目录:${RESET}"
-    echo -e "${YELLOW}${MEDIA_PRINT}${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-# ==============================
-# 更新
-# ==============================
-
-update_app() {
-
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
-
-    docker compose pull
-    docker compose up -d
-
-    echo -e "${GREEN}✅ 更新完成${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-# ==============================
-# 重启
-# ==============================
-
-restart_app() {
-
-    cd "$APP_DIR" || return
-
-    docker compose restart
-
-    echo -e "${GREEN}✅ 已重启${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-# ==============================
-# 日志
-# ==============================
-
-view_logs() {
-
-    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-
-    docker logs -f ammds
-}
-
-# ==============================
-# 状态
-# ==============================
-
-check_status() {
-
-    docker ps | grep ammds
-
-    read -p "按回车返回菜单..."
-}
-
-# ==============================
-# 卸载
-# ==============================
-
-uninstall_app() {
-
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
-
-    docker compose down -v
-
-    rm -rf "$APP_DIR"
-
-    echo -e "${RED}✅ AMMDS 已彻底卸载（含数据）${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-menu
+# 6. 输出结果
+SERVER_IP=$(curl -s https://api.ipify.org || echo "YOUR_SERVER_IP")
+echo "------------------------------------------------"
+echo -e "${GREEN}Hysteria2 操作成功！${NC}"
+echo "------------------------------------------------"
+echo "==== 1. 通用分享链接 (v2rayN/Nekobox) ===="
+echo "hysteria2://$HY_PASSWORD@$SERVER_IP:57891/?insecure=1&sni=www.bing.com#Alpine_Hy2"
+echo ""
+echo "==== 2. Clash Meta (Mihomo) 单行格式 ===="
+echo "{ name: Alpine_Hy2, type: hysteria2, server: $SERVER_IP, port: 443, password: $HY_PASSWORD, sni: www.bing.com, skip-cert-verify: true }"
+echo ""
+echo "==== 3. Surge 5 节点格式 ===="
+echo "Alpine_Hy2 = hysteria2, $SERVER_IP, 57891, password=$HY_PASSWORD, sni=www.bing.com, skip-cert-verify=true"
+echo "------------------------------------------------"
+echo "管理命令:"
+echo "  覆盖安装: sh install_hy2.sh"
+echo "  保留配置更新: sh install_hy2.sh update"
+echo "  卸载程序: sh install_hy2.sh uninstall"
+echo "------------------------------------------------"

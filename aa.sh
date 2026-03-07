@@ -1,12 +1,16 @@
-#!/bin/sh
+、#!/bin/sh
 
-# 定义颜色
+# ===============================
+# 颜色定义
+# ===============================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW="\033[33m"
 NC='\033[0m'
 
+# ===============================
 # 卸载函数
+# ===============================
 uninstall_hy2() {
     echo "正在卸载 Hysteria2..."
     rc-service hysteria stop 2>/dev/null
@@ -14,20 +18,25 @@ uninstall_hy2() {
     rm -f /etc/init.d/hysteria /usr/local/bin/hysteria
     rm -rf /etc/hysteria
     rm -f /var/log/hysteria.log /var/log/hysteria.err
+    # 删除 UDP 端口跳跃规则
+    remove_udp_jump
     echo "卸载完成！"
     exit 0
 }
 
 ACTION=$1
-
 if [ "$ACTION" = "uninstall" ]; then
     uninstall_hy2
 fi
 
-# 1. 环境准备
-apk update && apk add curl ca-certificates openssl openrc
+# ===============================
+# 安装依赖
+# ===============================
+apk update && apk add curl ca-certificates openssl openrc iptables
 
-# 2. 识别架构
+# ===============================
+# 识别架构
+# ===============================
 ARCH=$(uname -m)
 case $ARCH in
     x86_64)  BIN_ARCH="amd64" ;;
@@ -36,12 +45,13 @@ case $ARCH in
     *) echo "不支持的架构: $ARCH"; exit 1 ;;
 esac
 
-# 3. 下载最新版本
+# ===============================
+# 下载 Hysteria2
+# ===============================
 REMOTE_VERSION=$(curl -sSL https://api.github.com/repos/apernet/hysteria/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
 echo "正在获取 Hysteria2 最新版本: $REMOTE_VERSION"
 
 curl -fSL "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-$BIN_ARCH" -o /usr/local/bin/hysteria.new
-
 if [ $? -eq 0 ]; then
     rc-service hysteria stop 2>/dev/null
     mv /usr/local/bin/hysteria.new /usr/local/bin/hysteria
@@ -55,19 +65,13 @@ mkdir -p /etc/hysteria
 # ===============================
 # 配置逻辑
 # ===============================
-
 if [ "$ACTION" = "update" ] && [ -f "/etc/hysteria/config.yaml" ]; then
-
     echo -e "${GREEN}检测到 update 命令，保留原配置更新程序...${NC}"
-
     HY_PASSWORD=$(grep 'password:' /etc/hysteria/config.yaml | awk '{print $2}')
     HY_PORT=$(grep 'listen:' /etc/hysteria/config.yaml | cut -d':' -f3)
-
 else
-
-    echo -e "${RED}执行新安装 / 覆盖安装${NC}"
-
-    read -p "请输入端口 (默认: 57891): " HY_PORT
+    echo -e "${RED}执行安装${NC}"
+    read -p "请输入 Hysteria2 端口 (默认: 57891): " HY_PORT
     [ -z "$HY_PORT" ] && HY_PORT=57891
 
     echo "使用端口: $HY_PORT"
@@ -99,13 +103,11 @@ masquerade:
     url: https://bing.com/
     rewriteHost: true
 EOC
-
 fi
 
 # ===============================
-# 服务
+# 服务配置
 # ===============================
-
 cat <<EOS > /etc/init.d/hysteria
 #!/sbin/openrc-run
 name="hysteria2"
@@ -123,9 +125,91 @@ rc-update add hysteria default 2>/dev/null
 rc-service hysteria restart
 
 # ===============================
-# 输出节点
+# UDP 端口跳跃函数
 # ===============================
+add_udp_jump() {
+    JUMP_START=$1
+    JUMP_END=$2
 
+    if [ -z "$JUMP_START" ] || [ -z "$JUMP_END" ]; then
+        echo -e "${RED}未指定端口范围，跳跃规则未添加${NC}"
+        return
+    fi
+
+    SERVER_IP=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '^127\.')
+    echo -e "${YELLOW}添加 UDP 端口跳跃规则: $JUMP_START-$JUMP_END -> $HY_PORT${NC}"
+
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+    sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1
+    sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1
+
+    # 删除旧规则
+    while iptables -t nat -C PREROUTING -p udp --dport $JUMP_START:$JUMP_END -j DNAT --to-destination ${SERVER_IP}:$HY_PORT 2>/dev/null
+    do
+        iptables -t nat -D PREROUTING -p udp --dport $JUMP_START:$JUMP_END -j DNAT --to-destination ${SERVER_IP}:$HY_PORT
+    done
+
+    # 添加新规则
+    iptables -t nat -I PREROUTING 1 -p udp --dport $JUMP_START:$JUMP_END -j DNAT --to-destination ${SERVER_IP}:$HY_PORT
+
+    # 放行 FORWARD
+    iptables -C FORWARD -p udp --dport $HY_PORT -j ACCEPT 2>/dev/null || \
+    iptables -I FORWARD -p udp --dport $HY_PORT -j ACCEPT
+
+    # 保存规则
+    iptables-save > /etc/iptables.rules
+    echo -e "${GREEN}✅ UDP 端口跳跃规则添加完成并保存${NC}"
+}
+
+# ===============================
+# 清理 UDP 跳跃规则
+# ===============================
+remove_udp_jump() {
+    if [ ! -f /etc/iptables.rules ]; then
+        return
+    fi
+
+    echo -e "${YELLOW}清理 UDP 端口跳跃规则...${NC}"
+
+    # 从保存的规则文件中删除 DNAT 和 FORWARD 相关行
+    iptables-restore < /etc/iptables.rules
+
+    # 遍历删除 PREROUTING DNAT 和 FORWARD 规则
+    iptables-save | grep -E 'PREROUTING.*DNAT|FORWARD.*dport' | while read line; do
+        rule=$(echo "$line" | sed 's/^-A /-D /')
+        iptables $rule
+    done
+
+    # 删除保存文件
+    rm -f /etc/iptables.rules
+    echo -e "${GREEN}✅ UDP 端口跳跃规则已清理${NC}"
+}
+
+# ===============================
+# 设置开机自动恢复 iptables
+# ===============================
+cat <<'EOF' > /etc/local.d/udp_jump.start
+#!/bin/sh
+[ -f /etc/iptables.rules ] && iptables-restore < /etc/iptables.rules
+EOF
+chmod +x /etc/local.d/udp_jump.start
+rc-update add local default 2>/dev/null
+
+# ===============================
+# 用户自定义端口跳跃
+# ===============================
+read -p "请输入 UDP 跳跃端口范围 (格式: 起始-结束, 例如 10000-20000, 不设置则跳过): " JUMP_RANGE
+if [ -n "$JUMP_RANGE" ]; then
+    JUMP_START=$(echo $JUMP_RANGE | cut -d'-' -f1)
+    JUMP_END=$(echo $JUMP_RANGE | cut -d'-' -f2)
+    add_udp_jump $JUMP_START $JUMP_END
+else
+    echo -e "${YELLOW}未设置 UDP 跳跃，跳过此步骤${NC}"
+fi
+
+# ===============================
+# 输出节点信息
+# ===============================
 SERVER_IP=$(curl -s https://api.ipify.org || echo "YOUR_SERVER_IP")
 HOSTNAME=$(hostname -s | sed 's/ /_/g')
 
@@ -143,5 +227,4 @@ echo ""
 
 echo -e "${GREEN}==== Surge ====${NC}"
 echo -e "${YELLOW}$HOSTNAME = hysteria2, $SERVER_IP, $HY_PORT, password=$HY_PASSWORD, sni=www.bing.com, skip-cert-verify=true${NC}"
-
 echo "------------------------------------------------"

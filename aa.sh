@@ -1,246 +1,117 @@
-#!/bin/bash
-# ===============================
-# ACME Pro 证书申请（Let's Encrypt ）
-# ===============================
-export LANG=en_US.UTF-8
+#!/bin/sh
 
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+# 定义颜色
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m'
 
-green(){ echo -e "${GREEN}$1${RESET}"; }
-red(){ echo -e "${RED}$1${RESET}"; }
-yellow(){ echo -e "${YELLOW}$1${RESET}"; }
-
-[[ $EUID -ne 0 ]] && red "请使用 root 运行" && exit
-
-ACME_HOME="$HOME/.acme.sh"
-SSL_DIR="/root/ssl"
-mkdir -p $SSL_DIR
-
-# ===============================
-# 依赖检测
-# ===============================
-install_dep(){
-    if command -v apt >/dev/null 2>&1; then
-        apt update -y
-        apt install -y curl socat cron wget
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y curl socat cronie wget
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y curl socat cronie wget
-    fi
+# 卸载函数
+uninstall_hy2() {
+    echo "正在卸载 Hysteria2..."
+    rc-service hysteria stop 2>/dev/null
+    rc-update del hysteria default 2>/dev/null
+    rm -f /etc/init.d/hysteria /usr/local/bin/hysteria
+    rm -rf /etc/hysteria
+    rm -f /var/log/hysteria.log /var/log/hysteria.err
+    echo "卸载完成！"
+    exit 0
 }
 
-# ===============================
-# 安装 acme.sh
-# ===============================
-install_acme(){
-    if [ ! -f "$ACME_HOME/acme.sh" ]; then
-        read -p "请输入注册邮箱（回车自动生成）: " email
-        [ -z "$email" ] && email="$(date +%s)@gmail.com"
-        curl https://get.acme.sh | sh -s email=$email
-        green "acme.sh 安装完成"
-    fi
-}
+# 检查参数
+ACTION=$1
 
-# ===============================
-# 停止/恢复 Web 服务
-# ===============================
-stop_web(){
-    if systemctl is-active nginx >/dev/null 2>&1; then
-        systemctl stop nginx
-        WEB_STOP=nginx
-    fi
-    if systemctl is-active apache2 >/dev/null 2>&1; then
-        systemctl stop apache2
-        WEB_STOP=apache2
-    fi
-}
+if [ "$ACTION" = "uninstall" ]; then
+    uninstall_hy2
+fi
 
-start_web(){
-    [ ! -z "$WEB_STOP" ] && systemctl start $WEB_STOP
-}
+# 1. 环境准备
+apk update && apk add curl ca-certificates openssl openrc
 
+# 2. 识别架构
+ARCH=$(uname -m)
+case $ARCH in
+    x86_64)  BIN_ARCH="amd64" ;;
+    aarch64) BIN_ARCH="arm64" ;;
+    armv7l)  BIN_ARCH="arm" ;;
+    *) echo "不支持的架构: $ARCH"; exit 1 ;;
+esac
 
-# ===============================
-# 安装证书
-# ===============================
-install_cert(){
-    domain=$1
-    mkdir -p $SSL_DIR/$domain
-    $ACME_HOME/acme.sh --install-cert -d $domain \
-        --key-file       $SSL_DIR/$domain/private.key \
-        --fullchain-file $SSL_DIR/$domain/cert.crt
-    green "证书安装完成"
-    green "路径: $SSL_DIR/$domain/"
+# 3. 版本检查与程序更新
+REMOTE_VERSION=$(curl -sSL https://api.github.com/repos/apernet/hysteria/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+echo "正在获取 Hysteria2 最新版本: $REMOTE_VERSION"
+
+curl -fSL "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-$BIN_ARCH" -o /usr/local/bin/hysteria.new
+if [ $? -eq 0 ]; then
+    rc-service hysteria stop 2>/dev/null
+    mv /usr/local/bin/hysteria.new /usr/local/bin/hysteria
+    chmod +x /usr/local/bin/hysteria
+else
+    echo "下载失败"; exit 1
+fi
+
+# 4. 配置文件处理逻辑
+mkdir -p /etc/hysteria
+
+if [ "$ACTION" = "update" ] && [ -f "/etc/hysteria/config.yaml" ]; then
+    echo -e "${GREEN}检测到 update 命令，正在保留原配置更新...${NC}"
+    HY_PASSWORD=$(grep 'password:' /etc/hysteria/config.yaml | awk '{print $2}')
+else
+    echo -e "${RED}正在执行覆盖安装/初始化...${NC}"
+    # 生成新证书 (已通过 2>/dev/null 隐藏进度条)
+    openssl req -x509 -nodes -newkey rsa:2048 -keyout /etc/hysteria/server.key -out /etc/hysteria/server.crt -subj "/CN=www.bing.com" -days 3650 2>/dev/null
     
-}
-
-# ===============================
-# 80 端口模式申请证书
-# ===============================
-standalone_issue(){
-    read -p "请输入域名: " domain
-    stop_web
-    $ACME_HOME/acme.sh --issue -d $domain --standalone -k ec-256 --server https://acme-v02.api.letsencrypt.org/directory
-    [ $? -eq 0 ] && install_cert $domain || red "证书申请失败"
-    start_web
-}
-
-# ===============================
-# DNS模式申请证书
-# ===============================
-dns_issue(){
-    read -p "请输入域名: " domain
-    echo "1.Cloudflare"
-    echo "2.DNSPod"
-    echo "3.Aliyun"
-    read -p "请选择: " type
-    case $type in
-        1)
-            read -p "CF_Key: " CF_Key
-            read -p "CF_Email: " CF_Email
-            export CF_Key CF_Email
-            $ACME_HOME/acme.sh --issue --dns dns_cf -d $domain -k ec-256 --server https://acme-v02.api.letsencrypt.org/directory
-            ;;
-        2)
-            read -p "DP_Id: " DP_Id
-            read -p "DP_Key: " DP_Key
-            export DP_Id DP_Key
-            $ACME_HOME/acme.sh --issue --dns dns_dp -d $domain -k ec-256 --server https://acme-v02.api.letsencrypt.org/directory
-            ;;
-        3)
-            read -p "Ali_Key: " Ali_Key
-            read -p "Ali_Secret: " Ali_Secret
-            export Ali_Key Ali_Secret
-            $ACME_HOME/acme.sh --issue --dns dns_ali -d $domain -k ec-256 --server https://acme-v02.api.letsencrypt.org/directory
-            ;;
-    esac
-    [ $? -eq 0 ] && install_cert $domain || red "证书申请失败"
-}
-
-
-# ===============================
-# 续期所有证书
-# ===============================
-renew_all(){
-    $ACME_HOME/acme.sh --cron -f
-    green "全部证书已尝试续期"
-}
-
-# ===============================
-# 删除证书
-# ===============================
-remove_cert(){
-    certs=($($ACME_HOME/acme.sh --list | tail -n +2 | awk '{print $1}'))
-    if [ ${#certs[@]} -eq 0 ]; then
-        red "当前没有任何证书可删除"
-        return 0
-    fi
-    green "可删除的证书列表："
-    echo "编号  域名"
-    echo "---------------------------"
-    for i in "${!certs[@]}"; do
-        printf "%-4s %s\n" "$((i+1))" "${certs[$i]}"
-    done
+    # 生成新密码
+    HY_PASSWORD=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 25)
     
-    read -p "请输入要删除的编号 (输入0返回): " num
-    [ "$num" == "0" ] && return 0
-    if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -lt 1 ] || [ "$num" -gt "${#certs[@]}" ]; then
-        red "无效编号"
-        return 0
-    fi
-    domain="${certs[$((num-1))]}"
-    $ACME_HOME/acme.sh --remove -d "$domain" --ecc >/dev/null 2>&1
-    [ -d "$SSL_DIR/$domain" ] && rm -rf "$SSL_DIR/$domain"
-    green "证书 $domain 已删除"
-}
+    # 写入新配置
+    cat << EOC > /etc/hysteria/config.yaml
+listen: :10541
+tls:
+  cert: /etc/hysteria/server.crt
+  key: /etc/hysteria/server.key
+auth:
+  type: password
+  password: $HY_PASSWORD
+masquerade:
+  type: proxy
+  proxy:
+    url: https://bing.com/
+    rewriteHost: true
+EOC
+fi
 
-# ===============================
-# 卸载 acme.sh
-# ===============================
-uninstall_acme(){
-    # 卸载 acme.sh 本身
-    [ -f "$ACME_HOME/acme.sh" ] && "$ACME_HOME/acme.sh" --uninstall >/dev/null 2>&1
-    
-    # 删除安装目录
-    [ -d "$ACME_HOME" ] && rm -rf "$ACME_HOME"
-    [ -d "/etc/acme" ] && rm -rf "/etc/acme"
+# 5. 服务与启动
+cat << EOS > /etc/init.d/hysteria
+#!/sbin/openrc-run
+name="hysteria2"
+command="/usr/local/bin/hysteria"
+command_args="server -c /etc/hysteria/config.yaml"
+command_background=true
+pidfile="/run/\${RC_SVCNAME}.pid"
+output_log="/var/log/hysteria.log"
+error_log="/var/log/hysteria.err"
+depend() { need net; }
+EOS
+chmod +x /etc/init.d/hysteria
+rc-update add hysteria default 2>/dev/null
+rc-service hysteria restart
 
-    # 删除 cron
-    crontab -l 2>/dev/null | grep -v acme.sh | crontab -
-    
-    # 清理 shell 环境变量
-    [ -f "$HOME/.bashrc" ] && sed -i '/acme.sh.env/d' "$HOME/.bashrc"
-    [ -f "$HOME/.profile" ] && sed -i '/acme.sh.env/d' "$HOME/.profile"
-    
-    green "acme.sh 已彻底卸载"
-}
-
-show_cron(){
-    echo
-    green "当前 acme.sh 自动续期任务:"
-    crontab -l | grep acme.sh || yellow "未发现自动续期任务"
-    echo
-}
-
-# ===============================
-# 查看已申请证书
-# ===============================
-list_cert(){
-    printf "%-22s %-8s %-15s %-10s\n" "域名" "状态" "到期时间" "剩余天数"
-    echo "------------------------------------------------------------"
-    $ACME_HOME/acme.sh --list | tail -n +2 | awk '{print $1}' | while read domain; do
-        CERT_FILE="$SSL_DIR/$domain/cert.crt"
-        if [ ! -f "$CERT_FILE" ]; then
-            status="异常"; expire_date="无证书"; remain="--"
-        else
-            expire=$(openssl x509 -enddate -noout -in "$CERT_FILE" | cut -d= -f2)
-            expire_ts=$(date -d "$expire" +%s 2>/dev/null)
-            now_ts=$(date +%s)
-            if [ -n "$expire_ts" ]; then
-                remain=$(( (expire_ts - now_ts) / 86400 ))
-                [ "$remain" -ge 0 ] && status="有效" || status="已过期"
-                expire_date=$(date -d "$expire" +"%Y-%m-%d" 2>/dev/null)
-            else
-                status="异常"; expire_date="未知"; remain="--"
-            fi
-        fi
-        printf "%-22s %-8s %-15s %-10s\n" "$domain" "$status" "$expire_date" "$remain 天"
-    done
-}
-
-# ===============================
-# 菜单
-# ===============================
-while true
-do
-    clear
-    green "==============================="
-    green "     ACME申请证书工具"
-    green "==============================="
-    green "1. 申请证书 (80端口模式)"
-    green "2. 申请证书 (DNS API模式)"
-    green "3. 续期全部证书"
-    green "4. 查看已申请证书"
-    green "5. 删除指定证书"
-    green "6. 查看自动续期任务"
-    green "7. 卸载acme.sh"
-    green "0. 退出"
-
-    read -p $'\033[32m请选择: \033[0m' num
-    case $num in
-        1) install_dep; install_acme; standalone_issue;;
-        2) install_dep; install_acme; dns_issue;;
-        3) renew_all;;
-        4) list_cert;;
-        5) remove_cert;;
-        6) show_cron;;
-        7) uninstall_acme;;
-        0) exit;;
-        *) echo -e "${RED}无效选项${RESET}";;
-    esac
-    read -p $'\033[32m按回车返回菜单...\033[0m' temp
-done
+# 6. 输出结果
+SERVER_IP=$(curl -s https://api.ipify.org || echo "YOUR_SERVER_IP")
+echo "------------------------------------------------"
+echo -e "${GREEN}Hysteria2 操作成功！${NC}"
+echo "------------------------------------------------"
+echo "==== 1. 通用分享链接 (v2rayN/Nekobox) ===="
+echo "hysteria2://$HY_PASSWORD@$SERVER_IP:10541/?insecure=1&sni=www.bing.com#Alpine_Hy2"
+echo ""
+echo "==== 2. Clash Meta (Mihomo) 单行格式 ===="
+echo "{ name: Alpine_Hy2, type: hysteria2, server: $SERVER_IP, port: 443, password: $HY_PASSWORD, sni: www.bing.com, skip-cert-verify: true }"
+echo ""
+echo "==== 3. Surge 5 节点格式 ===="
+echo "Alpine_Hy2 = hysteria2, $SERVER_IP, 10541, password=$HY_PASSWORD, sni=www.bing.com, skip-cert-verify=true"
+echo "------------------------------------------------"
+echo "管理命令:"
+echo "  覆盖安装: sh install_hy2.sh"
+echo "  保留配置更新: sh install_hy2.sh update"
+echo "  卸载程序: sh install_hy2.sh uninstall"
+echo "------------------------------------------------"

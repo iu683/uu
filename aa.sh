@@ -1,59 +1,62 @@
 #!/bin/bash
-# 3x-ui Alpine 管理菜单
 
-green="\033[32m"
-red="\033[31m"
-yellow="\033[33m"
-plain="\033[0m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-show_menu() {
+menu() {
     clear
-    echo -e "${green}===Alpine-3X-UI管理面板 ===${plain}"
-    echo -e " ${green}1.安装${plain}"
-    echo -e " ${green}2.卸载${plain}"
-    echo -e " ${green}3.启动${plain}"
-    echo -e " ${green}4.停止${plain}"
-    echo -e " ${green}5.重启${plain}"
-    echo -e " ${green}0.退出${plain}"
+    echo -e "${GREEN}=== 磁盘空间排查工具 ===${RESET}"
+    echo -e "${GREEN}1) 查看磁盘整体使用情况${RESET}"
+    echo -e "${GREEN}2) 查看 / 目录占用${RESET}"
+    echo -e "${GREEN}3) 查看指定目录占用${RESET}"
+    echo -e "${GREEN}4) 查找系统最大文件${RESET}"
+    echo -e "${GREEN}5) 查找大于100MB文件${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    read -r -p $'\033[32m请选择: \033[0m' choice
 }
 
-install_3xui() {
-    apk update && apk add --no-cache curl bash gzip openssl
-    bash <(curl -Ls https://raw.githubusercontent.com/StarVM-OpenSource/3x-ui-Apline/refs/heads/main/install.sh)
-    echo -e "${red}安装完成后需要执行一次x-ui菜单重启服务才能正常访问${plain}"
-
+disk_usage() {
+    echo -e "${YELLOW}磁盘整体使用情况:${RESET}"
+    df -h
 }
 
-uninstall_3xui() {
-    echo -e "${red}正在卸载 3x-ui...${plain}"
-    x-ui uninstall
+root_dir_usage() {
+    echo -e "${YELLOW}/ 目录占用:${RESET}"
+    du -h --max-depth=1 / 2>/dev/null
 }
 
-start_3xui() {
-    x-ui start
+custom_dir_usage() {
+    read -p "请输入要查看的目录: " dir
+    if [ -d "$dir" ]; then
+        du -h --max-depth=1 "$dir"
+    else
+        echo -e "${RED}目录不存在${RESET}"
+    fi
 }
 
-stop_3xui() {
-    x-ui stop
+largest_files() {
+    echo -e "${YELLOW}系统最大文件 (前20):${RESET}"
+    du -ah / 2>/dev/null | sort -rh | head -20
 }
 
-restart_3xui() {
-    x-ui restart
+big_files() {
+    echo -e "${YELLOW}大于100MB文件:${RESET}"
+    find / -type f -size +100M 2>/dev/null
 }
-
 
 while true; do
-    show_menu
-    read -p "$(echo -e ${green}请选择:${plain}) " choice
-    case "$choice" in
-        1) install_3xui ;;
-        2) uninstall_3xui ;;
-        3) start_3xui ;;
-        4) stop_3xui ;;
-        5) restart_3xui ;;
-        0) exit 0 ;;
-        *) echo -e "${red}无效选择${plain}" ;;
+    menu
+    case $choice in
+        1) disk_usage ;;
+        2) root_dir_usage ;;
+        3) custom_dir_usage ;;
+        4) largest_files ;;
+        5) big_files ;;
+        0) exit ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
-    read -p "$(echo -e ${green}按回车返回菜单...${plain})"
-
+    echo
+    read -p "按回车返回菜单..."
 done

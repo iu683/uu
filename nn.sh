@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Sing-box AnyTLS 多节点管理脚本（Host模式 + 自签证书）
+# Xray Reality 多节点管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="Singbox-AnyTLS"
+APP_NAME="xray-reality"
 APP_DIR="/root/$APP_NAME"
 
 check_docker() {
@@ -19,13 +19,6 @@ check_docker() {
     if ! docker compose version &>/dev/null; then
         echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
         exit 1
-    fi
-}
-
-check_port() {
-    if ss -tulnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
     fi
 }
 
@@ -43,48 +36,33 @@ get_public_ip() {
     done
     echo "无法获取公网 IP 地址。" && return
 }
-
 list_nodes() {
     mkdir -p "$APP_DIR"
+    echo -e "${GREEN}=== 已有 Xray-Reality 节点 ===${RESET}"
     local count=0
     for node in "$APP_DIR"/*; do
         [ -d "$node" ] || continue
         count=$((count+1))
-        echo -e "${GREEN}[$count] $(basename "$node")${RESET}"
+        echo -e "${YELLOW}[$count] $(basename "$node")${RESET}"
     done
-    [ $count -eq 0 ] && echo -e "${GREEN}无节点${RESET}"
+    [ $count -eq 0 ] && echo -e "${YELLOW}无节点${RESET}"
 }
 
 select_node() {
-    mkdir -p "$APP_DIR"
-    local nodes=()
-    local count=0
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        nodes+=("$(basename "$node")")
-        count=$((count+1))
-        echo -e "${GREEN}[$count] ${nodes[-1]}${RESET}"
-    done
-    [ $count -eq 0 ] && { echo -e "${RED}无节点！${RESET}"; return 1; }
-
-    read -r -p $'\033[32m请输入节点名称或编号:\033[0m ' input
-
+    list_nodes
+    read -r -p $'\033[32m请输入节点名称或编号: \033[0m' input
     if [[ "$input" =~ ^[0-9]+$ ]]; then
-        if (( input >= 1 && input <= count )); then
-            NODE_NAME="${nodes[$((input-1))]}"
-        else
-            echo -e "${RED}编号无效！${RESET}"
-            return 1
-        fi
+        NODE_NAME=$(ls -d "$APP_DIR"/* | sed -n "${input}p" | xargs basename)
     else
         NODE_NAME="$input"
-        if [ ! -d "$APP_DIR/$NODE_NAME" ]; then
-            echo -e "${RED}节点不存在！${RESET}"
-            return 1
-        fi
     fi
     NODE_DIR="$APP_DIR/$NODE_NAME"
+    if [ ! -d "$NODE_DIR" ]; then
+        echo -e "${RED}节点不存在！${RESET}"
+        return 1
+    fi
 }
+
 
 install_node() {
     check_docker
@@ -93,79 +71,100 @@ install_node() {
     NODE_DIR="$APP_DIR/$NODE_NAME"
     mkdir -p "$NODE_DIR"
 
-    read -p "请输入端口 [默认随机]: " input_port
-    PORT=${input_port:-$(shuf -i 20000-60000 -n1)}
-    check_port "$PORT" || return
+    # 随机端口
+    random_port() {
+        while :; do
+            PORT=$(shuf -i 2000-65000 -n1)
+            ss -lnt | awk '{print $4}' | grep -q ":$PORT$" || break
+        done
+        echo "$PORT"
+    }
 
-    read -p "请输入密码（留空将自动生成16位随机密码）: " PASSWORD
-    PASSWORD=${PASSWORD:-$(tr -dc A-Za-z0-9 </dev/urandom | head -c16)}
+    read -p "请输入监听端口 [默认随机]: " PORT
+    PORT=${PORT:-$(random_port)}
+    echo -e "${YELLOW}使用端口: ${PORT}${RESET}"
 
-    echo -e "${YELLOW}正在生成自签证书...${RESET}"
-    openssl req -x509 -nodes -newkey rsa:2048 \
-        -keyout "$NODE_DIR/server.key" \
-        -out "$NODE_DIR/server.crt" \
-        -days 36500 \
-        -subj "/CN=www.bing.com" \
-        -addext "subjectAltName=DNS:www.bing.com" >/dev/null 2>&1
+    read -p "请输入伪装域名 [默认 itunes.apple.com]: " DOMAIN
+    DOMAIN=${DOMAIN:-itunes.apple.com}
 
-    cat > "$NODE_DIR/config.json" <<EOF
+    UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
+    X25519=$(docker run --rm ghcr.io/xtls/xray-core:latest x25519)
+
+    PRIVATE_KEY=$(echo "$X25519" | grep "PrivateKey" | awk -F': ' '{print $2}')
+    PUBLIC_KEY=$(echo "$X25519"  | grep "Password"   | awk -F': ' '{print $2}')
+    SHORT_ID=$(openssl rand -hex 8)
+
+    CONFIG_FILE="$NODE_DIR/config.json"
+    COMPOSE_FILE="$NODE_DIR/compose.yml"
+
+    # 生成 config.json（去掉 DNS 配置）
+    cat > "$CONFIG_FILE" <<EOF
 {
-  "log": { "level": "info" },
+  "log": { "access": "/var/log/xray/access.log", "error": "/var/log/xray/error.log", "loglevel": "warning" },
   "inbounds": [
     {
-      "type": "anytls",
-      "listen": "::",
-      "listen_port": ${PORT},
-      "users": [{ "password": "${PASSWORD}" }],
-      "tls": {
-        "enabled": true,
-        "server_name": "www.bing.com",
-        "certificate_path": "/etc/sing-box/server.crt",
-        "key_path": "/etc/sing-box/server.key"
+      "port": $PORT,
+      "protocol": "vless",
+      "settings": { "clients": [{"id":"$UUID","flow":"xtls-rprx-vision","level":0,"email":"user@example.com"}], "decryption":"none" },
+      "streamSettings": {
+        "network":"tcp",
+        "security":"reality",
+        "realitySettings": {"show":false,"dest":"$DOMAIN:443","xver":0,"serverNames":["$DOMAIN"],"privateKey":"$PRIVATE_KEY","shortIds":["$SHORT_ID"]}
       }
     }
   ],
-  "outbounds": [{ "type": "direct" }]
+  "outbounds":[{"protocol":"freedom","settings":{}}]
 }
 EOF
 
-    cat > "$NODE_DIR/docker-compose.yml" <<EOF
+    # 生成 docker-compose.yml（host 网络模式）
+    cat > "$COMPOSE_FILE" <<EOF
 services:
-  ${NODE_NAME}:
-    image: ghcr.io/sagernet/sing-box:latest
-    container_name: ${NODE_NAME}
-    restart: always
-    network_mode: host
+  $NODE_NAME:
+    image: ghcr.io/xtls/xray-core:latest
+    container_name: $NODE_NAME
+    restart: unless-stopped
+    network_mode: "host"
+    command: ["run","-c","/etc/xray/config.json"]
     volumes:
-      - ./config.json:/etc/sing-box/config.json
-      - ./server.crt:/etc/sing-box/server.crt
-      - ./server.key:/etc/sing-box/server.key
-    command: run -c /etc/sing-box/config.json
+      - ./config.json:/etc/xray/config.json:ro
 EOF
 
-    cd "$NODE_DIR" || return
+    cd "$NODE_DIR" || exit
     docker compose up -d
 
-    SERVER_IP=$(get_public_ip)
-
+    IP=$(get_public_ip)
+    TAG=$NODE_NAME
     echo
     echo -e "${GREEN}📂 安装目录: $NODE_DIR${RESET}"
-    echo -e "${GREEN}✅ Singbox-AnyTLS 已启动${RESET}"
-    echo -e "${YELLOW}🌐 IP: ${SERVER_IP}${RESET}"
-    echo -e "${YELLOW}🔌 端口: ${PORT}${RESET}"
-    echo -e "${YELLOW}🔑 密码: ${PASSWORD}${RESET}"
+    echo -e "${GREEN}---Xray VLESS-Reality 订阅信息---${RESET}"
+    echo -e "${YELLOW}名称: ${TAG}${RESET}"
+    echo -e "${YELLOW}地址: ${IP}${RESET}"
+    echo -e "${YELLOW}端口: ${PORT}${RESET}"
+    echo -e "${YELLOW}UUID: ${UUID}${RESET}"
+    echo -e "${YELLOW}流控: xtls-rprx-vision${RESET}"
+    echo -e "${YELLOW}指纹: chrome${RESET}"
+    echo -e "${YELLOW}SNI: ${DOMAIN}${RESET}"
+    echo -e "${YELLOW}公钥: ${PUBLIC_KEY}${RESET}"
+    echo -e "${YELLOW}ShortId: ${SHORT_ID}${RESET}"
     echo
+    VLESS_LINK="vless://${UUID}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${TAG}"
     echo -e "${YELLOW}📄 V6VPS替换IP地址为V6 ★${RESET}"
-    echo -e "${YELLOW}V2rayN:${RESET}"
-    echo -e "${YELLOW}anytls://${PASSWORD}@${SERVER_IP}:${PORT}/?sni=www.bing.com&insecure=1#${NODE_NAME}${RESET}"
-    echo -e "${YELLOW}Surge :${RESET}"
-    echo -e "${YELLOW}${NODE_NAME} = anytls, ${SERVER_IP}, ${PORT}, password=${PASSWORD}, tfo=true, skip-cert-verify=true, reuse=false${RESET}"
-    echo
+    echo -e "${YELLOW}✅ $NODE_NAME 订阅链接${RESET}"
+    echo -e "${YELLOW}$VLESS_LINK${RESET}"
     cat > "$NODE_DIR/node.txt" <<EOF
-V2rayN
-anytls://${PASSWORD}@${SERVER_IP}:${PORT}/?sni=www.bing.com&insecure=1#${NODE_NAME}
-Surge
-${NODE_NAME} = anytls, ${SERVER_IP}, ${PORT}, password=${PASSWORD}, tfo=true, skip-cert-verify=true, reuse=false
+Xray VLESS-Reality 订阅信息
+名称 ${TAG}
+地址 ${IP}
+端口 ${PORT}
+UUID ${UUID}
+流控 xtls-rprx-vision
+指纹 chrome
+SNI ${DOMAIN}
+公钥 ${PUBLIC_KEY}
+ShortId ${SHORT_ID}
+订阅链接
+${VLESS_LINK}
 EOF
     read -r -p $'\033[32m按回车返回菜单...\033[0m'
 }
@@ -180,14 +179,14 @@ node_action_menu() {
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 卸载${RESET}"
         echo -e "${GREEN}6) 查看节点信息${RESET}"
-        echo -e "${GREEN}0) 返回${RESET}"
-        read -r -p $'\033[32m请选择操作:\033[0m ' choice
+        echo -e "${GREEN}0) 返回主菜单${RESET}"
+        read -r -p $'\033[32m请选择操作: \033[0m' choice
         case $choice in
             1) docker pause "$NODE_NAME" ;;
             2) docker restart "$NODE_NAME" ;;
-            3) docker compose -f "$NODE_DIR/docker-compose.yml" pull && docker compose -f "$NODE_DIR/docker-compose.yml" up -d ;;
+            3) docker compose -f "$NODE_DIR/compose.yml" pull && docker compose -f "$NODE_DIR/compose.yml" up -d ;;
             4) docker logs -f "$NODE_NAME" ;;
-            5) docker compose -f "$NODE_DIR/docker-compose.yml" down && rm -rf "$NODE_DIR"; return ;;
+            5) docker compose -f "$NODE_DIR/compose.yml" down && rm -rf "$NODE_DIR" && return ;;
             6) cat "$NODE_DIR/node.txt" ;;
             0) return ;;
             *) echo -e "${RED}无效选择${RESET}" ;;
@@ -195,80 +194,141 @@ node_action_menu() {
     done
 }
 
-batch_action() {
-    echo -e "${GREEN}=== 批量操作 ===${RESET}"
-    echo -e "${GREEN}1) 批量暂停${RESET}"
-    echo -e "${GREEN}2) 批量重启${RESET}"
-    echo -e "${GREEN}3) 批量更新${RESET}"
-    echo -e "${GREEN}4) 批量卸载${RESET}"
-    echo -e "${GREEN}0) 返回${RESET}"
-    read -r -p $'\033[32m请选择操作:\033[0m ' choice
-    [[ "$choice" == "0" ]] && return
-
-    declare -A NODE_MAP
-    local count=0
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        NODE_MAP[$count]=$(basename "$node")
-        echo -e "${GREEN}[$count] ${NODE_MAP[$count]}${RESET}"
-    done
-    [ $count -eq 0 ] && { echo -e "${GREEN}无节点${RESET}"; read -r -p "回车返回..."; return; }
-
-    read -r -p $'\033[32m请输入节点序号（空格分隔，或 all 全选）:\033[0m ' input
-    if [[ "$input" == "all" ]]; then
-        SELECTED=("${NODE_MAP[@]}")
-    else
-        SELECTED=()
-        for i in $input; do
-            [ -n "${NODE_MAP[$i]}" ] && SELECTED+=("${NODE_MAP[$i]}")
-        done
-    fi
-
-    for NODE_NAME in "${SELECTED[@]}"; do
-        NODE_DIR="$APP_DIR/$NODE_NAME"
-        cd "$NODE_DIR" || continue
-        case $choice in
-            1) docker pause "$NODE_NAME" ;;
-            2) docker restart "$NODE_NAME" ;;
-            3) docker compose pull && docker compose up -d ;;
-            4) docker compose down && rm -rf "$NODE_DIR" ;;
-        esac
-        echo -e "${GREEN}已操作 $NODE_NAME${RESET}"
-    done
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
-}
-
 show_all_status() {
-    echo -e "${GREEN}=== 所有节点状态 ===${RESET}"
+    list_nodes
+    echo -e "${GREEN}=== 节点状态 ===${RESET}"
+
     for node in "$APP_DIR"/*; do
         [ -d "$node" ] || continue
         NODE_NAME=$(basename "$node")
-        PORT=$(grep 'listen_port' "$node/config.json" | awk -F: '{gsub(/[ ,"]/,"",$2); print $2}')
+
+        # 从 config.json 读取端口
+        PORT=$(grep '"port"' "$node/config.json" | head -n1 | awk -F': ' '{print $2}' | tr -d ',')
+
         STATUS=$(docker inspect -f '{{.State.Status}}' "$NODE_NAME" 2>/dev/null)
-        [ -z "$STATUS" ] && STATUS="未启动"
-        echo -e "${GREEN}$NODE_NAME | ${PORT:-未知端口} | $STATUS${RESET}"
+
+        case "$STATUS" in
+            running) STATUS_COLOR="${GREEN}运行中${RESET}" ;;
+            paused)  STATUS_COLOR="${YELLOW}已暂停${RESET}" ;;
+            *)       STATUS_COLOR="${RED}未启动${RESET}" ;;
+        esac
+
+        echo -e "${GREEN}$NODE_NAME${RESET} | 端口: ${YELLOW}$PORT${RESET} | 状态: $STATUS_COLOR"
     done
+
     read -r -p $'\033[32m按回车返回菜单...\033[0m'
 }
 
+batch_action() {
+    echo -e "${GREEN}=== 批量操作 ===${RESET}"
+    echo -e "${GREEN}1) 暂停节点${RESET}"
+    echo -e "${GREEN}2) 重启节点${RESET}"
+    echo -e "${GREEN}3) 更新节点${RESET}"
+    echo -e "${GREEN}4) 卸载节点${RESET}"
+    echo -e "${GREEN}0) 返回主菜单${RESET}"
+
+    read -r -p $'\033[32m请选择操作: \033[0m' choice
+
+    # ===== 关键：提前拦截 =====
+    case "$choice" in
+        1|2|3|4) ;;
+        0) return ;;
+        *)
+            echo -e "${RED}无效选择${RESET}"
+            sleep 1
+            return
+            ;;
+    esac
+
+    mkdir -p "$APP_DIR"
+    declare -A NODE_MAP
+    local count=0
+
+    # ===== 列出节点 =====
+    for node in "$APP_DIR"/*; do
+        [ -d "$node" ] || continue
+        count=$((count+1))
+        NODE_NAME=$(basename "$node")
+        NODE_MAP[$count]="$NODE_NAME"
+        echo -e "${YELLOW}[$count] $NODE_NAME${RESET}"
+    done
+
+    if [ $count -eq 0 ]; then
+        echo -e "${YELLOW}无节点${RESET}"
+        read -r -p $'\033[32m按回车返回菜单...\033[0m'
+        return
+    fi
+
+    # ===== 选择节点 =====
+    read -r -p $'\033[32m请输入要操作的节点序号（用空格分隔，或输入 all 全选）: \033[0m' input_nodes
+
+    if [ -z "$input_nodes" ]; then
+        echo -e "${YELLOW}未选择节点${RESET}"
+        sleep 1
+        return
+    fi
+
+    if [[ "$input_nodes" == "all" ]]; then
+        SELECTED_NODES=("${NODE_MAP[@]}")
+    else
+        SELECTED_NODES=()
+        for i in $input_nodes; do
+            NODE=${NODE_MAP[$i]}
+            if [ -n "$NODE" ]; then
+                SELECTED_NODES+=("$NODE")
+            else
+                echo -e "${YELLOW} 序号 $i 无效，跳过${RESET}"
+            fi
+        done
+    fi
+
+    [ ${#SELECTED_NODES[@]} -eq 0 ] && {
+        echo -e "${YELLOW}没有有效节点${RESET}"
+        sleep 1
+        return
+    }
+
+    # ===== 执行操作 =====
+    for NODE_NAME in "${SELECTED_NODES[@]}"; do
+        NODE_DIR="$APP_DIR/$NODE_NAME"
+
+        [ -d "$NODE_DIR" ] || continue
+        [ -f "$NODE_DIR/compose.yml" ] || {
+            echo -e "${YELLOW} 节点 $NODE_NAME compose.yml 不存在，跳过${RESET}"
+            continue
+        }
+
+        cd "$NODE_DIR" || continue
+
+        case "$choice" in
+            1) docker pause "$NODE_NAME" 2>/dev/null ;;
+            2) docker restart "$NODE_NAME" 2>/dev/null ;;
+            3) docker compose pull && docker compose up -d ;;
+            4) docker compose down && rm -rf "$NODE_DIR" ;;
+        esac
+
+        echo -e "${GREEN}✅ 节点 $NODE_NAME 操作完成${RESET}"
+    done
+
+    read -r -p $'\033[32m按回车返回菜单...\033[0m'
+}
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Singbox-AnyTLS 多节点管理 ===${RESET}"
-        echo -e "${GREEN}1) 安装新节点${RESET}"
-        echo -e "${GREEN}2) 单节点管理${RESET}"
+        echo -e "${GREEN}=== Xray-Reality 多节点管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动新节点${RESET}"
+        echo -e "${GREEN}2) 管理已有节点${RESET}"
         echo -e "${GREEN}3) 查看所有节点状态${RESET}"
-        echo -e "${GREEN}4) 批量操作${RESET}"
+        echo -e "${GREEN}4) 批量操作节点${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
-        read -r -p $'\033[32m请选择:\033[0m ' choice
+        read -r -p $'\033[32m请选择操作: \033[0m' choice
         case $choice in
             1) install_node ;;
             2) node_action_menu ;;
             3) show_all_status ;;
             4) batch_action ;;
             0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
         esac
     done
 }

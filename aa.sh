@@ -279,7 +279,6 @@ EOF
     HOSTNAME=$(hostname -s | sed 's/ /_/g')
 
     echo
-    cat > "$NODE_INFO_FILE" <<EOF
     echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
     echo -e "${GREEN}✅ Singbox-TUICv5 节点已启动${RESET}"
     echo -e "${YELLOW}🌐 IP: ${SERVER_IP}${RESET}"
@@ -297,6 +296,10 @@ EOF
     echo -e "${YELLOW}📄 客户端链接:${RESET}"
     echo -e "${YELLOW}tuic://${UUID}:${PASSWORD}@${SERVER_IP}:${PORT}?congestion_control=bbr&alpn=h3&sni=www.bing.com&udp_relay_mode=native&allow_insecure=1#${HOSTNAME}${RESET}"
     echo
+    cat > "$NODE_INFO_FILE" <<EOF
+tuic://${UUID}:${PASSWORD}@${SERVER_IP}:${PORT}?congestion_control=bbr&alpn=h3&sni=www.bing.com&udp_relay_mode=native&allow_insecure=1#${HOSTNAME}
+EOF
+    
     read -p "按回车返回菜单..."
 }
 update_app() {
@@ -345,7 +348,7 @@ uninstall_app() {
     docker rm ${CONTAINER_NAME}
     rm -rf "$APP_DIR"
     echo -e "${RED}✅ Singbox-TUICv5 已卸载${RESET}"
-    read -p "按回车返回菜单..."
+    exit 0
 }
 
 menu

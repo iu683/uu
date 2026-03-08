@@ -1,249 +1,228 @@
-#!/bin/bash
-# ========================================
-# Xray Reality 一键管理脚本 (Host 模式 + Xray-Reality 容器名)
-# ========================================
+#!/bin/sh
 
-GREEN="\033[32m"
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
 YELLOW="\033[33m"
-RED="\033[31m"
-RESET="\033[0m"
+NC='\033[0m'
 
-APP_NAME="xray-reality"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.json"
-CONTAINER_NAME="Xray-Reality"
+CONF_PATH="/etc/xray/config.json"
+XRAY_BIN="/usr/local/bin/xray"
+LOG_PATH="/var/log/xray.log"
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
+# 获取架构
+ARCH=$(uname -m)
+case ${ARCH} in
+    x86_64)  X_ARCH="64" ;;
+    aarch64) X_ARCH="arm64-v8a" ;;
+    *) echo "不支持的架构"; exit 1 ;;
+esac
+
+# 1. 清理函数
+do_cleanup() {
+    echo -e "${BLUE}正在清理旧环境...${NC}"
+    [ -f /etc/init.d/xray ] && rc-service xray stop 2>/dev/null && rc-update del xray default 2>/dev/null
+    rm -rf /etc/xray /usr/local/share/xray ${XRAY_BIN} ${LOG_PATH} /etc/init.d/xray
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
+# 2. 安装依赖并下载
+download_xray() {
+    echo -e "${BLUE}安装依赖 (含 libc6-compat 兼容库)...${NC}"
+    apk update && apk add curl unzip openssl ca-certificates uuidgen tar gcompat libc6-compat > /dev/null 2>&1
+
+    echo -e "${BLUE}获取最新版本...${NC}"
+    NEW_VER=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep '"tag_name":' | head -n 1 | cut -d'"' -f4)
+    [ -z "$NEW_VER" ] && NEW_VER="v24.12.31"
+    
+    echo -e "${GREEN}下载版本: ${NEW_VER}${NC}"
+    curl -L -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${NEW_VER}/Xray-linux-${X_ARCH}.zip"
+    
+    mkdir -p /etc/xray /usr/local/share/xray /tmp/xray_tmp
+    unzip -o /tmp/xray.zip -d /tmp/xray_tmp
+    mv -f /tmp/xray_tmp/xray ${XRAY_BIN}
+    mv -f /tmp/xray_tmp/*.dat /usr/local/share/xray/
+    chmod +x ${XRAY_BIN}
+    rm -rf /tmp/xray.zip /tmp/xray_tmp
 }
 
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== Xray-Reality 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 查看节点信息${RESET}"
-        echo -e "${GREEN}7) 卸载${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) view_node_info ;;
-            7) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
+# 3. 更新功能
+do_update() {
+    if [ ! -f "${XRAY_BIN}" ]; then echo -e "${RED}未安装 Xray${NC}"; exit 1; fi
+    echo -e "${BLUE}保留配置更新二进制文件...${NC}"
+    rc-service xray stop
+    download_xray
+    rc-service xray start
+    echo -e "${GREEN}更新成功！${NC}"
+    exit 0
 }
 
-install_app() {
-    check_docker
-    mkdir -p "$APP_DIR"
+# 指令处理
+if [ "$1" = "uninstall" ]; then do_cleanup; echo -e "${GREEN}卸载完成${NC}"; exit 0; fi
+if [ "$1" = "update" ]; then do_update; fi
 
-    random_port() {
-        while :; do
-            PORT=$(shuf -i 2000-65000 -n 1)
-            ss -lnt | awk '{print $4}' | grep -q ":$PORT$" || break
-        done
-        echo "$PORT"
-    }
+# 默认安装流程
+do_cleanup
+download_xray
 
-    read -p "请输入监听端口 [默认随机]: " PORT
-    if [[ -z "$PORT" ]]; then
-        PORT=$(random_port)
-        echo -e "已自动生成未占用端口: ${PORT}"
-    fi
+# 4. 用户自定义参数
+echo ""
+read -p "请输入 Reality 端口 (默认: 57891): " PORT
+[ -z "$PORT" ] && PORT=57891
 
-    read -p "请输入伪装域名 [默认 itunes.apple.com]: " DOMAIN
-    DOMAIN=${DOMAIN:-itunes.apple.com}
+read -p "请输入伪装域名 (默认: itunes.apple.com): " DEST_DOMAIN
+[ -z "$DEST_DOMAIN" ] && DEST_DOMAIN="itunes.apple.com"
 
-    UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
-    X25519=$(docker run --rm ghcr.io/xtls/xray-core:latest x25519)
-    PRIVATE_KEY=$(echo "$X25519" | grep "PrivateKey" | awk -F': ' '{print $2}')
-    PUBLIC_KEY=$(echo "$X25519"  | grep "Password"   | awk -F': ' '{print $2}')
+echo ""
+echo -e "${GREEN}端口: ${PORT}${NC}"
+echo -e "${GREEN}伪装域名: ${DEST_DOMAIN}${NC}"
+echo ""
 
-    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-        echo -e "${RED}密钥生成失败${RESET}"
-        return
-    fi
+# 4. 密钥生成 (适配 PrivateKey 和 Password 格式)
+echo -e "${BLUE}生成 Reality 密钥对...${NC}"
+X_KEYS_ALL=$(${XRAY_BIN} x25519 2>/dev/null)
+UUID=$(${XRAY_BIN} uuid 2>/dev/null)
 
-    SHORT_ID=$(openssl rand -hex 8)
+PRIVATE_KEY=$(echo "${X_KEYS_ALL}" | grep "PrivateKey" | awk '{print $NF}')
+PUBLIC_KEY=$(echo "${X_KEYS_ALL}" | grep "Password" | awk '{print $NF}')
+[ -z "$PUBLIC_KEY" ] && PUBLIC_KEY=$(echo "${X_KEYS_ALL}" | grep "Public" | awk '{print $NF}')
 
-    # 生成配置文件（去掉 DNS）
-    cat > "$CONFIG_FILE" <<EOF
+SHORT_ID=$(openssl rand -hex 4)
+
+if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
+    echo -e "${RED}密钥提取失败，请检查 Xray 输出环境${NC}"
+    exit 1
+fi
+
+# 5. 写入防刷流量配置
+cat << CONF > ${CONF_PATH}
 {
-  "log": {
-    "access": "/var/log/xray/access.log",
-    "error": "/var/log/xray/error.log",
-    "loglevel": "warning"
-  },
-  "inbounds": [
-    {
-      "port": $PORT,
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          {
-            "id": "$UUID",
-            "flow": "xtls-rprx-vision",
-            "level": 0,
-            "email": "user@example.com"
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "$DOMAIN:443",
-          "xver": 0,
-          "serverNames": ["$DOMAIN"],
-          "privateKey": "$PRIVATE_KEY",
-          "shortIds": ["$SHORT_ID"]
+    "log": { "access": "${LOG_PATH}", "loglevel": "info" },
+    "inbounds": [
+        {
+            "tag": "dokodemo-in",
+            "port": 4431,
+            "protocol": "dokodemo-door",
+            "settings": { "address": "${DEST_DOMAIN}", "port": 443, "network": "tcp" },
+            "sniffing": { "enabled": true, "destOverride": ["tls"], "routeOnly": true }
+        },
+        {
+            "listen": "0.0.0.0",
+            "port": ${PORT},
+            "protocol": "vless",
+            "settings": {
+                "clients": [{ "id": "${UUID}", "flow": "xtls-rprx-vision" }],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "dest": "127.0.0.1:4431",
+                    "serverNames": ["${DEST_DOMAIN}"],
+                    "privateKey": "${PRIVATE_KEY}",
+                    "shortIds": ["${SHORT_ID}"],
+                    "fingerprint": "random"
+                }
+            },
+            "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true }
         }
-      }
+    ],
+    "outbounds": [
+        { "protocol": "freedom", "settings": { "domainStrategy": "UseIP" }, "tag": "direct" },
+        { "protocol": "blackhole", "tag": "block" }
+    ],
+    "routing": {
+        "rules": [
+            {
+                "type": "field",
+                "inboundTag": ["dokodemo-in"],
+                "domain": ["${DEST_DOMAIN}"],
+                "outboundTag": "direct"
+            },
+            {
+                "type": "field",
+                "inboundTag": ["dokodemo-in"],
+                "outboundTag": "block"
+            }
+        ]
     }
-  ],
-  "outbounds": [
-    { "protocol": "freedom", "settings": {} }
-  ]
 }
+CONF
+
+# 6. 服务配置
+cat << 'SERVICE' > /etc/init.d/xray
+#!/sbin/openrc-run
+description="Xray Reality"
+command="/usr/local/bin/xray"
+command_args="run -c /etc/xray/config.json"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+depend() { need net; after firewall; }
+SERVICE
+chmod +x /etc/init.d/xray
+rc-update add xray default
+rc-service xray restart
+
+# 7. 分离双栈输出
+sleep 2
+PID=$(pidof xray)
+IP4=$(curl -s4 ifconfig.me)
+IP6=$(curl -s6 ifconfig.me)
+HOSTNAME=$(hostname -s | sed 's/ /_/g')
+echo ""
+echo -e "${GREEN}================ 安装完成 ===================${NC}"
+[ -n "$PID" ] && echo -e "运行状态: ${GREEN}运行中 (PID: $PID)${NC}" || echo -e "运行状态: ${RED}启动失败${NC}"
+echo -e "配置文件: ${BLUE}${CONF_PATH}${NC}"
+echo "------------------------------------------------"
+
+# IPv4 节点
+if [ -n "$IP4" ]; then
+    echo -e "${BLUE}[IPv4 节点信息]${NC}"
+    echo -e "${GREEN}v2RayN:${NC}"
+    echo -e "${YELLOW}vless://${UUID}@${IP4}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST_DOMAIN}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#$HOSTNAME${NC}"
+    echo ""
+    echo -e "${GREEN}Clash: - {name: $HOSTNAME, type: vless, server: ${IP4}, port: 443, uuid: ${UUID}, udp: true, tls: true, flow: xtls-rprx-vision, servername: ${DEST_DOMAIN}, network: tcp, reality-opts: {public-key: ${PUBLIC_KEY}, short-id: ${SHORT_ID}}, client-fingerprint: random}${NC}"
+    echo ""
+fi
+
+# IPv6 节点
+if [ -n "$IP6" ]; then
+    echo -e "${BLUE}[IPv6 节点信息]${NC}"
+    echo -e "${GREEN}v2RayN:${NC}" 
+    echo -e "${YELLOW}vless://${UUID}@[${IP6}]:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST_DOMAIN}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#$HOSTNAME${NC}"
+    echo ""
+    echo -e "${GREEN}Clash: - {name: $HOSTNAME, type: vless, server: '${IP6}', port: 443, uuid: ${UUID}, udp: true, tls: true, flow: xtls-rprx-vision, servername: ${DEST_DOMAIN}, network: tcp, reality-opts: {public-key: ${PUBLIC_KEY}, short-id: ${SHORT_ID}}, client-fingerprint: random}${NC}"
+    echo ""
+fi
+
+echo "------------------------------------------------"
+# 8. 保存节点信息
+NODE_FILE="/etc/xray/node.txt"
+
+cat > ${NODE_FILE} <<EOF
+================ Xray Reality 节点信息 ================
+
+服务器: $(hostname)
+端口: ${PORT}
+伪装域名: ${DEST_DOMAIN}
+UUID: ${UUID}
+PublicKey: ${PUBLIC_KEY}
+ShortID: ${SHORT_ID}
+
+---------------- IPv4 ----------------
+vless://${UUID}@${IP4}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST_DOMAIN}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${HOSTNAME}
+
+Clash:
+- {name: $HOSTNAME, type: vless, server: ${IP4}, port: ${PORT}, uuid: ${UUID}, udp: true, tls: true, flow: xtls-rprx-vision, servername: ${DEST_DOMAIN}, network: tcp, reality-opts: {public-key: ${PUBLIC_KEY}, short-id: ${SHORT_ID}}, client-fingerprint: random}
+
+---------------- IPv6 ----------------
+vless://${UUID}@[${IP6}]:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST_DOMAIN}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${HOSTNAME}
+
+Clash:
+- {name: $HOSTNAME, type: vless, server: '${IP6}', port: ${PORT}, uuid: ${UUID}, udp: true, tls: true, flow: xtls-rprx-vision, servername: ${DEST_DOMAIN}, network: tcp, reality-opts: {public-key: ${PUBLIC_KEY}, short-id: ${SHORT_ID}}, client-fingerprint: random}
+
+=======================================================
 EOF
 
-    # 生成 compose 文件 (host 模式)
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  xray:
-    image: ghcr.io/xtls/xray-core:latest
-    container_name: Xray-Reality
-    restart: unless-stopped
-    network_mode: host
-    command: ["run","-c","/etc/xray/config.json"]
-    volumes:
-      - ./config.json:/etc/xray/config.json:ro
-EOF
-
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    IP=$(get_public_ip)
-    TAG=$(hostname -s)
-
-    VLESS_LINK="vless://${UUID}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${TAG}"
-  
-    echo
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
-    echo -e "${GREEN}---Xray VLESS-Reality 订阅信息---${RESET}"
-    echo -e "${YELLOW}名称: ${TAG}${RESET}"
-    echo -e "${YELLOW}地址: ${IP}${RESET}"
-    echo -e "${YELLOW}端口: ${PORT}${RESET}"
-    echo -e "${YELLOW}UUID: ${UUID}${RESET}"
-    echo -e "${YELLOW}流控: xtls-rprx-vision${RESET}"
-    echo -e "${YELLOW}指纹: chrome${RESET}"
-    echo -e "${YELLOW}SNI: ${DOMAIN}${RESET}"
-    echo -e "${YELLOW}公钥: ${PUBLIC_KEY}${RESET}"
-    echo -e "${YELLOW}ShortId: ${SHORT_ID}${RESET}"
-    echo
-    echo -e "${YELLOW}📄 V6VPS替换IP地址为V6 ★${RESET}"
-    echo -e "${YELLOW}✅ 订阅链接${RESET}"
-    echo -e "${YELLOW}${VLESS_LINK}${RESET}"
-    cat > "$NODE_INFO_FILE" <<EOF
-Xray VLESS-Reality 订阅信息
-名称 ${TAG}
-地址 ${IP}
-端口 ${PORT}
-UUID ${UUID}
-流控 xtls-rprx-vision
-指纹 chrome
-SNI ${DOMAIN}
-公钥 ${PUBLIC_KEY}
-ShortId ${SHORT_ID}
-订阅链接
-${VLESS_LINK}
-EOF
-    read -p "按回车返回菜单..."
-}
-
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ Xray-Reality 更新完成${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-restart_app() {
-    docker restart Xray-Reality
-    echo -e "${GREEN}✅ Xray-Reality 已重启${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f Xray-Reality
-}
-
-view_node_info() {
-
-    if [ ! -f "$NODE_INFO_FILE" ]; then
-        echo -e "${RED}未找到节点信息${RESET}"
-        read -p "按回车返回菜单..."
-        return
-    fi
-
-    echo
-    echo -e "${GREEN}=== 节点信息 ===${RESET}"
-    echo
-    cat "$NODE_INFO_FILE"
-    echo
-    read -p "按回车返回菜单..."
-}
-
-check_status() {
-    docker ps | grep Xray-Reality
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-    docker stop Xray-Reality
-    docker rm Xray-Reality
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Xray-Reality 已卸载${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-menu
+echo -e "${GREEN}节点信息已保存: ${NODE_FILE}${NC}"

@@ -1,336 +1,260 @@
-#!/bin/bash
-# ========================================
-# Xray Reality 多节点管理脚本
-# ========================================
+#!/bin/sh
 
-GREEN="\033[32m"
+# ===============================
+# 颜色定义
+# ===============================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
 YELLOW="\033[33m"
-RED="\033[31m"
-RESET="\033[0m"
+NC='\033[0m'
 
-APP_NAME="xray-reality"
-APP_DIR="/root/$APP_NAME"
+# ===============================
+# 清理 UDP 跳跃规则
+# ===============================
+remove_udp_jump() {
+    echo "清理 UDP 端口跳跃规则..."
+    SERVER_IP=$(ip -4 addr show | awk '/inet/ && $2 !~ /^127/ {split($2,a,"/"); print a[1]; exit}')
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
-}
-
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
-}
-list_nodes() {
-    mkdir -p "$APP_DIR"
-    echo -e "${GREEN}=== 已有 Xray-Reality 节点 ===${RESET}"
-    local count=0
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        echo -e "${YELLOW}[$count] $(basename "$node")${RESET}"
-    done
-    [ $count -eq 0 ] && echo -e "${YELLOW}无节点${RESET}"
-}
-
-select_node() {
-    list_nodes
-    read -r -p $'\033[32m请输入节点名称或编号: \033[0m' input
-    if [[ "$input" =~ ^[0-9]+$ ]]; then
-        NODE_NAME=$(ls -d "$APP_DIR"/* | sed -n "${input}p" | xargs basename)
-    else
-        NODE_NAME="$input"
-    fi
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-    if [ ! -d "$NODE_DIR" ]; then
-        echo -e "${RED}节点不存在！${RESET}"
-        return 1
-    fi
-}
-
-
-install_node() {
-    check_docker
-    read -p "请输入节点名称 [默认node$(date +%s)]: " NODE_NAME
-    NODE_NAME=${NODE_NAME:-node$(date +%s)}
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-    mkdir -p "$NODE_DIR"
-
-    # 随机端口
-    random_port() {
-        while :; do
-            PORT=$(shuf -i 2000-65000 -n1)
-            ss -lnt | awk '{print $4}' | grep -q ":$PORT$" || break
-        done
-        echo "$PORT"
-    }
-
-    read -p "请输入监听端口 [默认随机]: " PORT
-    PORT=${PORT:-$(random_port)}
-    echo -e "${YELLOW}使用端口: ${PORT}${RESET}"
-
-    read -p "请输入伪装域名 [默认 itunes.apple.com]: " DOMAIN
-    DOMAIN=${DOMAIN:-itunes.apple.com}
-
-    UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
-    X25519=$(docker run --rm ghcr.io/xtls/xray-core:latest x25519)
-
-    PRIVATE_KEY=$(echo "$X25519" | grep "PrivateKey" | awk -F': ' '{print $2}')
-    PUBLIC_KEY=$(echo "$X25519"  | grep "Password"   | awk -F': ' '{print $2}')
-    SHORT_ID=$(openssl rand -hex 8)
-
-    CONFIG_FILE="$NODE_DIR/config.json"
-    COMPOSE_FILE="$NODE_DIR/compose.yml"
-
-    # 生成 config.json（去掉 DNS 配置）
-    cat > "$CONFIG_FILE" <<EOF
-{
-  "log": { "access": "/var/log/xray/access.log", "error": "/var/log/xray/error.log", "loglevel": "warning" },
-  "inbounds": [
-    {
-      "port": $PORT,
-      "protocol": "vless",
-      "settings": { "clients": [{"id":"$UUID","flow":"xtls-rprx-vision","level":0,"email":"user@example.com"}], "decryption":"none" },
-      "streamSettings": {
-        "network":"tcp",
-        "security":"reality",
-        "realitySettings": {"show":false,"dest":"$DOMAIN:443","xver":0,"serverNames":["$DOMAIN"],"privateKey":"$PRIVATE_KEY","shortIds":["$SHORT_ID"]}
-      }
-    }
-  ],
-  "outbounds":[{"protocol":"freedom","settings":{}}]
-}
-EOF
-
-    # 生成 docker-compose.yml（host 网络模式）
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  $NODE_NAME:
-    image: ghcr.io/xtls/xray-core:latest
-    container_name: $NODE_NAME
-    restart: unless-stopped
-    network_mode: "host"
-    command: ["run","-c","/etc/xray/config.json"]
-    volumes:
-      - ./config.json:/etc/xray/config.json:ro
-EOF
-
-    cd "$NODE_DIR" || exit
-    docker compose up -d
-
-    IP=$(get_public_ip)
-    TAG=$NODE_NAME
-    echo
-    echo -e "${GREEN}📂 安装目录: $NODE_DIR${RESET}"
-    echo -e "${GREEN}---Xray VLESS-Reality 订阅信息---${RESET}"
-    echo -e "${YELLOW}名称: ${TAG}${RESET}"
-    echo -e "${YELLOW}地址: ${IP}${RESET}"
-    echo -e "${YELLOW}端口: ${PORT}${RESET}"
-    echo -e "${YELLOW}UUID: ${UUID}${RESET}"
-    echo -e "${YELLOW}流控: xtls-rprx-vision${RESET}"
-    echo -e "${YELLOW}指纹: chrome${RESET}"
-    echo -e "${YELLOW}SNI: ${DOMAIN}${RESET}"
-    echo -e "${YELLOW}公钥: ${PUBLIC_KEY}${RESET}"
-    echo -e "${YELLOW}ShortId: ${SHORT_ID}${RESET}"
-    echo
-    VLESS_LINK="vless://${UUID}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${TAG}"
-    echo -e "${YELLOW}📄 V6VPS替换IP地址为V6 ★${RESET}"
-    echo -e "${YELLOW}✅ $NODE_NAME 订阅链接${RESET}"
-    echo -e "${YELLOW}$VLESS_LINK${RESET}"
-    cat > "$NODE_DIR/node.txt" <<EOF
-Xray VLESS-Reality 订阅信息
-名称 ${TAG}
-地址 ${IP}
-端口 ${PORT}
-UUID ${UUID}
-流控 xtls-rprx-vision
-指纹 chrome
-SNI ${DOMAIN}
-公钥 ${PUBLIC_KEY}
-ShortId ${SHORT_ID}
-订阅链接
-${VLESS_LINK}
-EOF
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
-}
-
-node_action_menu() {
-    select_node || return
-    while true; do
-        echo -e "${GREEN}=== 节点 [$NODE_NAME] 管理 ===${RESET}"
-        echo -e "${GREEN}1) 暂停${RESET}"
-        echo -e "${GREEN}2) 重启${RESET}"
-        echo -e "${GREEN}3) 更新${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 卸载${RESET}"
-        echo -e "${GREEN}6) 查看节点信息${RESET}"
-        echo -e "${GREEN}0) 返回主菜单${RESET}"
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
-        case $choice in
-            1) docker pause "$NODE_NAME" ;;
-            2) docker restart "$NODE_NAME" ;;
-            3) docker compose -f "$NODE_DIR/compose.yml" pull && docker compose -f "$NODE_DIR/compose.yml" up -d ;;
-            4) docker logs -f "$NODE_NAME" ;;
-            5) docker compose -f "$NODE_DIR/compose.yml" down && rm -rf "$NODE_DIR" && return ;;
-            6) cat "$NODE_DIR/node.txt" ;;
-            0) return ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-    done
-}
-
-show_all_status() {
-    list_nodes
-    echo -e "${GREEN}=== 节点状态 ===${RESET}"
-
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        NODE_NAME=$(basename "$node")
-
-        # 从 config.json 读取端口
-        PORT=$(grep '"port"' "$node/config.json" | head -n1 | awk -F': ' '{print $2}' | tr -d ',')
-
-        STATUS=$(docker inspect -f '{{.State.Status}}' "$NODE_NAME" 2>/dev/null)
-
-        case "$STATUS" in
-            running) STATUS_COLOR="${GREEN}运行中${RESET}" ;;
-            paused)  STATUS_COLOR="${YELLOW}已暂停${RESET}" ;;
-            *)       STATUS_COLOR="${RED}未启动${RESET}" ;;
-        esac
-
-        echo -e "${GREEN}$NODE_NAME${RESET} | 端口: ${YELLOW}$PORT${RESET} | 状态: $STATUS_COLOR"
+    # 遍历保存的规则，安全删除
+    for rule in $(iptables-save | grep "DNAT" | grep "$SERVER_IP" | awk '{print $0}'); do
+        # 先把 -A 替换成 -D
+        del_rule=$(echo "$rule" | sed 's/^-A /-D /')
+        # 用 eval 执行，失败也不报错
+        eval iptables $del_rule 2>/dev/null || true
     done
 
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
-}
-
-batch_action() {
-    echo -e "${GREEN}=== 批量操作 ===${RESET}"
-    echo -e "${GREEN}1) 暂停节点${RESET}"
-    echo -e "${GREEN}2) 重启节点${RESET}"
-    echo -e "${GREEN}3) 更新节点${RESET}"
-    echo -e "${GREEN}4) 卸载节点${RESET}"
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
-
-    read -r -p $'\033[32m请选择操作: \033[0m' choice
-
-    # ===== 关键：提前拦截 =====
-    case "$choice" in
-        1|2|3|4) ;;
-        0) return ;;
-        *)
-            echo -e "${RED}无效选择${RESET}"
-            sleep 1
-            return
-            ;;
-    esac
-
-    mkdir -p "$APP_DIR"
-    declare -A NODE_MAP
-    local count=0
-
-    # ===== 列出节点 =====
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        NODE_NAME=$(basename "$node")
-        NODE_MAP[$count]="$NODE_NAME"
-        echo -e "${YELLOW}[$count] $NODE_NAME${RESET}"
+    for rule in $(iptables-save | grep "FORWARD" | grep "$SERVER_IP" | awk '{print $0}'); do
+        del_rule=$(echo "$rule" | sed 's/^-A /-D /')
+        eval iptables $del_rule 2>/dev/null || true
     done
 
-    if [ $count -eq 0 ]; then
-        echo -e "${YELLOW}无节点${RESET}"
-        read -r -p $'\033[32m按回车返回菜单...\033[0m'
+    # 删除保存文件
+    rm -f /etc/iptables.rules
+    echo "✅ UDP 端口跳跃规则已清理"
+}
+
+
+# ===============================
+# 卸载函数
+# ===============================
+uninstall_hy2() {
+    echo "正在卸载 Hysteria2..."
+    rc-service hysteria stop 2>/dev/null
+    rc-update del hysteria default 2>/dev/null
+    rm -f /etc/init.d/hysteria /usr/local/bin/hysteria
+    rm -rf /etc/hysteria
+    rm -f /var/log/hysteria.log /var/log/hysteria.err
+    # 删除 UDP 端口跳跃规则
+    remove_udp_jump
+    echo "卸载完成！"
+    exit 0
+}
+
+ACTION=$1
+if [ "$ACTION" = "uninstall" ]; then
+    uninstall_hy2
+fi
+
+# ===============================
+# 安装依赖
+# ===============================
+apk update && apk add curl ca-certificates openssl openrc iptables
+
+# ===============================
+# 识别架构
+# ===============================
+ARCH=$(uname -m)
+case $ARCH in
+    x86_64)  BIN_ARCH="amd64" ;;
+    aarch64) BIN_ARCH="arm64" ;;
+    armv7l)  BIN_ARCH="arm" ;;
+    *) echo "不支持的架构: $ARCH"; exit 1 ;;
+esac
+
+# ===============================
+# 下载 Hysteria2
+# ===============================
+REMOTE_VERSION=$(curl -sSL https://api.github.com/repos/apernet/hysteria/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+echo "正在获取 Hysteria2 最新版本: $REMOTE_VERSION"
+
+curl -fSL "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-$BIN_ARCH" -o /usr/local/bin/hysteria.new
+if [ $? -eq 0 ]; then
+    rc-service hysteria stop 2>/dev/null
+    mv /usr/local/bin/hysteria.new /usr/local/bin/hysteria
+    chmod +x /usr/local/bin/hysteria
+else
+    echo "下载失败"; exit 1
+fi
+
+mkdir -p /etc/hysteria
+
+# ===============================
+# 配置逻辑
+# ===============================
+if [ "$ACTION" = "update" ] && [ -f "/etc/hysteria/config.yaml" ]; then
+    echo -e "${GREEN}检测到 update 命令，保留原配置更新程序...${NC}"
+    HY_PASSWORD=$(grep 'password:' /etc/hysteria/config.yaml | awk '{print $2}')
+    HY_PORT=$(grep 'listen:' /etc/hysteria/config.yaml | cut -d':' -f3)
+else
+    echo -e "${RED}执行安装${NC}"
+    read -p "请输入 Hysteria2 端口 (默认: 57891): " HY_PORT
+    [ -z "$HY_PORT" ] && HY_PORT=57891
+
+    echo "使用端口: $HY_PORT"
+
+    # 生成证书
+    openssl req -x509 -nodes -newkey rsa:2048 \
+    -keyout /etc/hysteria/server.key \
+    -out /etc/hysteria/server.crt \
+    -subj "/CN=www.bing.com" -days 3650 2>/dev/null
+
+    # 生成密码
+    HY_PASSWORD=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 25)
+
+    # 写入配置
+    cat <<EOC > /etc/hysteria/config.yaml
+listen: :$HY_PORT
+
+tls:
+  cert: /etc/hysteria/server.crt
+  key: /etc/hysteria/server.key
+
+auth:
+  type: password
+  password: $HY_PASSWORD
+
+masquerade:
+  type: proxy
+  proxy:
+    url: https://bing.com/
+    rewriteHost: true
+EOC
+fi
+
+# ===============================
+# 服务配置
+# ===============================
+cat <<EOS > /etc/init.d/hysteria
+#!/sbin/openrc-run
+name="hysteria2"
+command="/usr/local/bin/hysteria"
+command_args="server -c /etc/hysteria/config.yaml"
+command_background=true
+pidfile="/run/\${RC_SVCNAME}.pid"
+output_log="/var/log/hysteria.log"
+error_log="/var/log/hysteria.err"
+depend() { need net; }
+EOS
+
+chmod +x /etc/init.d/hysteria
+rc-update add hysteria default 2>/dev/null
+rc-service hysteria restart
+
+# ===============================
+# UDP 端口跳跃函数
+# ===============================
+add_udp_jump() {
+    JUMP_START=$1
+    JUMP_END=$2
+
+    if [ -z "$JUMP_START" ] || [ -z "$JUMP_END" ]; then
+        echo -e "${RED}未指定端口范围，跳跃规则未添加${NC}"
         return
     fi
 
-    # ===== 选择节点 =====
-    read -r -p $'\033[32m请输入要操作的节点序号（用空格分隔，或输入 all 全选）: \033[0m' input_nodes
+    SERVER_IP=$(ip -4 addr show | awk '/inet/ && $2 !~ /^127/ {split($2,a,"/"); print a[1]; exit}')
+    echo -e "${YELLOW}添加 UDP 端口跳跃规则: $JUMP_START-$JUMP_END -> $HY_PORT${NC}"
 
-    if [ -z "$input_nodes" ]; then
-        echo -e "${YELLOW}未选择节点${RESET}"
-        sleep 1
-        return
-    fi
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+    sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1
+    sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1
 
-    if [[ "$input_nodes" == "all" ]]; then
-        SELECTED_NODES=("${NODE_MAP[@]}")
-    else
-        SELECTED_NODES=()
-        for i in $input_nodes; do
-            NODE=${NODE_MAP[$i]}
-            if [ -n "$NODE" ]; then
-                SELECTED_NODES+=("$NODE")
-            else
-                echo -e "${YELLOW} 序号 $i 无效，跳过${RESET}"
-            fi
-        done
-    fi
-
-    [ ${#SELECTED_NODES[@]} -eq 0 ] && {
-        echo -e "${YELLOW}没有有效节点${RESET}"
-        sleep 1
-        return
-    }
-
-    # ===== 执行操作 =====
-    for NODE_NAME in "${SELECTED_NODES[@]}"; do
-        NODE_DIR="$APP_DIR/$NODE_NAME"
-
-        [ -d "$NODE_DIR" ] || continue
-        [ -f "$NODE_DIR/compose.yml" ] || {
-            echo -e "${YELLOW} 节点 $NODE_NAME compose.yml 不存在，跳过${RESET}"
-            continue
-        }
-
-        cd "$NODE_DIR" || continue
-
-        case "$choice" in
-            1) docker pause "$NODE_NAME" 2>/dev/null ;;
-            2) docker restart "$NODE_NAME" 2>/dev/null ;;
-            3) docker compose pull && docker compose up -d ;;
-            4) docker compose down && rm -rf "$NODE_DIR" ;;
-        esac
-
-        echo -e "${GREEN}✅ 节点 $NODE_NAME 操作完成${RESET}"
+    # 删除旧规则
+    while iptables -t nat -C PREROUTING -p udp --dport $JUMP_START:$JUMP_END -j DNAT --to-destination ${SERVER_IP}:$HY_PORT 2>/dev/null
+    do
+        iptables -t nat -D PREROUTING -p udp --dport $JUMP_START:$JUMP_END -j DNAT --to-destination ${SERVER_IP}:$HY_PORT
     done
 
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
-}
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== Xray-Reality 多节点管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动新节点${RESET}"
-        echo -e "${GREEN}2) 管理已有节点${RESET}"
-        echo -e "${GREEN}3) 查看所有节点状态${RESET}"
-        echo -e "${GREEN}4) 批量操作节点${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
-        case $choice in
-            1) install_node ;;
-            2) node_action_menu ;;
-            3) show_all_status ;;
-            4) batch_action ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
-        esac
-    done
+    # 添加新规则
+    iptables -t nat -I PREROUTING 1 -p udp --dport $JUMP_START:$JUMP_END -j DNAT --to-destination ${SERVER_IP}:$HY_PORT
+
+    # 放行 FORWARD
+    iptables -C FORWARD -p udp --dport $HY_PORT -j ACCEPT 2>/dev/null || \
+    iptables -I FORWARD -p udp --dport $HY_PORT -j ACCEPT
+
+    # 保存规则
+    iptables-save > /etc/iptables.rules
+    echo -e "${GREEN}✅ UDP 端口跳跃规则添加完成并保存${NC}"
 }
 
-menu
+
+# ===============================
+# 设置开机自动恢复 iptables
+# ===============================
+cat <<'EOF' > /etc/local.d/udp_jump.start
+#!/bin/sh
+[ -f /etc/iptables.rules ] && iptables-restore < /etc/iptables.rules
+EOF
+chmod +x /etc/local.d/udp_jump.start
+rc-update add local default 2>/dev/null
+
+# ===============================
+# 用户自定义端口跳跃
+# ===============================
+read -p "请输入 UDP 跳跃端口范围 (格式: 起始-结束, 例如 10000-20000, 不设置则跳过): " JUMP_RANGE
+if [ -n "$JUMP_RANGE" ]; then
+    JUMP_START=$(echo $JUMP_RANGE | cut -d'-' -f1)
+    JUMP_END=$(echo $JUMP_RANGE | cut -d'-' -f2)
+    add_udp_jump $JUMP_START $JUMP_END
+else
+    echo -e "${YELLOW}未设置 UDP 跳跃，跳过此步骤${NC}"
+fi
+
+# ===============================
+# 输出节点信息
+# ===============================
+SERVER_IP=$(curl -s https://api.ipify.org || echo "YOUR_SERVER_IP")
+HOSTNAME=$(hostname -s | sed 's/ /_/g')
+
+echo "------------------------------------------------"
+echo -e "${GREEN}Hysteria2 部署成功！${NC}"
+echo "------------------------------------------------"
+
+echo -e "${GREEN}==== v2rayN / Nekobox ====${NC}"
+echo -e "${YELLOW}hysteria2://$HY_PASSWORD@$SERVER_IP:$HY_PORT/?insecure=1&sni=www.bing.com#$HOSTNAME${NC}"
+echo ""
+
+echo -e "${GREEN}==== Clash Meta ====${NC}"
+echo -e "${YELLOW}{ name: $HOSTNAME, type: hysteria2, server: $SERVER_IP, port: $HY_PORT, password: $HY_PASSWORD, sni: www.bing.com, skip-cert-verify: true }${NC}"
+echo ""
+
+echo -e "${GREEN}==== Surge ====${NC}"
+echo -e "${YELLOW}$HOSTNAME = hysteria2, $SERVER_IP, $HY_PORT, password=$HY_PASSWORD, sni=www.bing.com, skip-cert-verify=true${NC}"
+echo "------------------------------------------------"
+# ===============================
+# 保存节点信息
+# ===============================
+NODE_FILE="/etc/hysteria/node.txt"
+
+cat > $NODE_FILE <<EOF
+================ Hysteria2 节点信息 ================
+跳跃端口: ${JUMP_START:-未启用}-${JUMP_END:-未启用}
+服务器: $(hostname)
+IP: $SERVER_IP
+端口: $HY_PORT
+密码: $HY_PASSWORD
+SNI: www.bing.com
+
+---------------- v2rayN / Nekobox ----------------
+hysteria2://$HY_PASSWORD@$SERVER_IP:$HY_PORT/?insecure=1&sni=www.bing.com#$HOSTNAME
+
+---------------- Clash Meta ----------------
+{ name: $HOSTNAME, type: hysteria2, server: $SERVER_IP, port: $HY_PORT, password: $HY_PASSWORD, sni: www.bing.com, skip-cert-verify: true }
+
+---------------- Surge ----------------
+$HOSTNAME = hysteria2, $SERVER_IP, $HY_PORT, password=$HY_PASSWORD, sni=www.bing.com, skip-cert-verify=true
+
+===================================================
+EOF
+
+echo -e "${GREEN}节点信息已保存: ${NODE_FILE}${NC}"

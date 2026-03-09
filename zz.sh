@@ -22,7 +22,7 @@ get_public_ip() {
             ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
-    echo "无法获取公网 IP 地址。" && return
+    echo "无法获取公网 IP 地址。"
 }
 
 check_port () {
@@ -62,6 +62,7 @@ check_port () {
 
 get_ip() {
 IP_LIST=($(devil vhost list | awk '/^[0-9]+/ {print $1}'))
+API_URL="https://status.eooce.com/api"
 IP1=""; IP2=""; IP3=""
 AVAILABLE_IPS=()
 
@@ -144,7 +145,6 @@ fi
 
 show_link(){
     ip=$(get_public_ip)
-    purple "\nTG分享链接:\n"
     LINKS="tg://proxy?server=$ip&port=$PORT&secret=$SECRET"
     green "$LINKS\n"
     echo -e "$LINKS" > $WORKDIR/link.txt
@@ -154,7 +154,7 @@ show_link(){
 
 install(){
 purple "正在安装中,请稍等...\n"
-if [[ "$HOSTNAME" =MTP ]]; then
+if [[ "$HOSTNAME" =mtp ]]; then
     check_port
     get_ip
     download_run

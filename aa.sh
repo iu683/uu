@@ -41,8 +41,8 @@ case $ARCH in
     *)       echo "不支持的架构: $ARCH"; exit 1 ;;
 esac
 
-DOWNLOAD_URL="https://github.com/anytls/anytls-go/releases/download/v0.0.8/anytls_0.0.8_linux_${BINARY_ARCH}.zip"
-ZIP_FILE="/tmp/anytls_0.0.8_linux_${BINARY_ARCH}.zip"
+DOWNLOAD_URL="https://github.com/anytls/anytls-go/releases/download/v0.0.12/anytls_0.0.12_linux_${BINARY_ARCH}.zip"
+ZIP_FILE="/tmp/anytls_0.0.12_linux_${BINARY_ARCH}.zip"
 
 # 获取公网 IP
 get_ip() {
@@ -111,7 +111,7 @@ Description=anytls Service
 After=network.target
 
 [Service]
-ExecStart=$BINARY_DIR/$BINARY_NAME -l 0.0.0.0:$PORT -p $PASSWORD
+ExecStart=$BINARY_DIR/$BINARY_NAME -l [::]:$PORT -p $PASSWORD
 Restart=always
 User=root
 Group=root

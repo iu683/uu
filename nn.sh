@@ -1,72 +1,112 @@
 #!/bin/bash
 
-# ================== 颜色定义 ==================
-green="\033[32m"
-red="\033[31m"
-yellow="\033[33m"
-skyblue="\033[36m"
-re="\033[0m"
+# ================== 颜色 ==================
+red() { echo -e "\e[1;91m$1\033[0m"; }
+green() { echo -e "\e[1;32m$1\033[0m"; }
+yellow() { echo -e "\e[1;33m$1\033[0m"; }
+purple() { echo -e "\e[1;35m$1\033[0m"; }
 
-# ================== 工具函数 ==================
-random_port() {
-    shuf -i 2000-65000 -n 1
-}
+# ================== 基础设置 ==================
+HOSTNAME=$(hostname)
+USERNAME=$(whoami | tr '[:upper:]' '[:lower:]')
+export SECRET=${SECRET:-$(echo -n "$USERNAME+$HOSTNAME" | md5sum | head -c 32)}
+WORKDIR="$HOME/mtproto"
+mkdir -p "$WORKDIR"
 
-check_port() {
-    local port=$1
-    while [[ -n $(lsof -i :$port 2>/dev/null) ]]; do
-        echo -e "${red}${port}端口已经被其他程序占用，请更换端口重试${re}"
-        read -p "请输入端口（直接回车使用随机端口）: " port
-        [[ -z $port ]] && port=$(random_port) && echo -e "${green}使用随机端口: $port${re}"
+# 杀掉旧进程
+pgrep -x mtg > /dev/null && pkill -9 mtg >/dev/null 2>&1
+
+# ================== 获取公网 IP ==================
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
     done
-    echo $port
+    echo "无法获取公网 IP 地址。" && exit 1
 }
 
-install_lsof() {
-    if ! command -v lsof &>/dev/null; then
-        if [ -f "/etc/debian_version" ]; then
-            apt update && apt install -y lsof
-        elif [ -f "/etc/alpine-release" ]; then
-            apk add lsof
-        fi
+# ================== 端口生成 ==================
+get_port() {
+    read -rp "请输入 MTProto 代理端口(直接回车使用随机端口): " MTP_PORT
+    if [[ -z "$MTP_PORT" ]]; then
+        MTP_PORT=$(shuf -i 10000-60000 -n 1)
+        green "使用随机端口: $MTP_PORT"
     fi
 }
 
-# ================== 主菜单 ==================
+# ================== 下载 MTG ==================
+download_mtg() {
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64) arch="amd64";;
+        386) arch="386";;
+        arm) arch="arm";;
+        aarch64) arch="arm64";;
+        *) arch="amd64";;
+    esac
+
+    MTG_URL="https://github.com/whunt1/onekeymakemtg/raw/master/builds/ccbuilds/mtg-linux-$arch"
+    wget -q -O "$WORKDIR/mtg" "$MTG_URL"
+    if [[ ! -s "$WORKDIR/mtg" ]]; then
+        red "MTG 下载失败，请检查 URL 或网络"
+        exit 1
+    fi
+    chmod +x "$WORKDIR/mtg"
+}
+
+# ================== 启动 MTProto ==================
+start_mtg() {
+    nohup "$WORKDIR/mtg" run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
+    green "MTProto 已启动，端口: $MTP_PORT"
+}
+
+# ================== 生成分享链接 ==================
+show_link() {
+    ip=$(get_public_ip)
+    LINK="tg://proxy?server=$ip&port=$MTP_PORT&secret=$SECRET"
+    purple "\nTG分享链接:\n$LINK\n"
+    echo -e "$LINK" > "$WORKDIR/link.txt"
+
+    # 生成重启脚本
+    cat > "$WORKDIR/restart.sh" <<EOF
+#!/bin/bash
+pkill mtg
+cd "$WORKDIR"
+nohup ./mtg run -b 0.0.0.0:$MTP_PORT \$SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
+EOF
+    chmod +x "$WORKDIR/restart.sh"
+
+    purple "\n一键卸载命令: rm -rf $WORKDIR && pkill mtg"
+}
+
+# ================== 主流程 ==================
+install_mtproto() {
+    purple "正在安装 MTProto，请稍等..."
+    get_port
+    download_mtg
+    start_mtg
+    show_link
+}
+
+# ================== 卸载 MTProto ==================
+uninstall_mtproto() {
+    pkill mtg
+    rm -rf "$WORKDIR"
+    green "MTProto 已卸载"
+}
+
+# ================== 菜单 ==================
 while true; do
-    clear
-    echo -e "${green}==== MTProto 管理菜单 ====${re}"
-    echo -e "${green}1. 安装 MTProto${re}"
-    echo -e "${green}2. 卸载 MTProto${re}"
-    echo -e "${green}0. 退出${re}"
-    read -p "$(echo -e ${green}请选择:${re}) " choice
-
+    echo -e "\n1. 安装 MTProto"
+    echo -e "2. 卸载 MTProto"
+    echo -e "0. 退出"
+    read -rp "请选择: " choice
     case $choice in
-        1)
-            clear
-            install_lsof
-
-            read -p $'\033[1;35m请输入MTProto代理端口(直接回车使用随机端口): \033[0m' port
-            [[ -z $port ]] && port=$(random_port) && echo -e "${green}使用随机端口: $port${re}"
-            port=$(check_port $port)
-
-            PORT=$port bash <(curl -Ls https://raw.githubusercontent.com/iu683/uu/main/PROXY/zz.sh)
-            echo -e "${green}MTProto 安装完成！端口: $port${re}"
-            echo
-            read -p "按回车返回菜单..."
-            ;;
-        2)
-            clear
-            rm -rf mtp && pkill mtg
-            echo -e "${red}MTProto 已卸载${re}"
-            read -p "按回车返回菜单..."
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            echo -e "${red}无效输入！${re}"
-            sleep 1
-            ;;
+        1) install_mtproto ;;
+        2) uninstall_mtproto ;;
+        0) exit 0 ;;
+        *) yellow "无效选项" ;;
     esac
 done

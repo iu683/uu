@@ -1,168 +1,78 @@
 #!/bin/bash
 
-red() { echo -e "\e[1;91m$1\033[0m"; }
-green() { echo -e "\e[1;32m$1\033[0m"; }
-yellow() { echo -e "\e[1;33m$1\033[0m"; }
-purple() { echo -e "\e[1;35m$1\033[0m"; }
-HOSTNAME=$(hostname)
-USERNAME=$(whoami | tr '[:upper:]' '[:lower:]')
-export SECRET=${SECRET:-$(echo -n "$USERNAME+$HOSTNAME" | md5sum | head -c 32)}
-WORKDIR="$HOME/mtp" && mkdir -p "$WORKDIR"
-pgrep -x mtg > /dev/null && pkill -9 mtg >/dev/null 2>&1
+# ================== 颜色定义 ==================
+green="\033[32m"
+red="\033[31m"
+yellow="\033[33m"
+skyblue="\033[36m"
+re="\033[0m"
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。"
+# ================== 工具函数 ==================
+random_port() {
+    shuf -i 2000-65000 -n 1
 }
 
-check_port () {
-  port_list=$(devil port list)
-  tcp_ports=$(echo "$port_list" | grep -c "tcp")
-  udp_ports=$(echo "$port_list" | grep -c "udp")
-
-  if [[ $tcp_ports -lt 1 ]]; then
-      red "没有可用的TCP端口,正在调整..."
-
-      if [[ $udp_ports -ge 3 ]]; then
-          udp_port_to_delete=$(echo "$port_list" | awk '/udp/ {print $1}' | head -n 1)
-          devil port del udp $udp_port_to_delete
-          green "已删除udp端口: $udp_port_to_delete"
-      fi
-
-      while true; do
-          tcp_port=$(shuf -i 10000-65535 -n 1)
-          result=$(devil port add tcp $tcp_port 2>&1)
-          if [[ $result == *"Ok"* ]]; then
-              green "已添加TCP端口: $tcp_port"
-              tcp_port1=$tcp_port
-              break
-          else
-              yellow "端口 $tcp_port 不可用，尝试其他端口..."
-          fi
-      done
-      
-  else
-      tcp_ports=$(echo "$port_list" | awk '/tcp/ {print $1}')
-      tcp_port1=$(echo "$tcp_ports" | sed -n '1p')
-  fi
-  devil binexec on >/dev/null 2>&1
-  MTP_PORT=$tcp_port1
-  green "使用 $MTP_PORT 作为TG代理端口"
+check_port() {
+    local port=$1
+    while [[ -n $(lsof -i :$port 2>/dev/null) ]]; do
+        echo -e "${red}${port}端口已经被其他程序占用，请更换端口重试${re}"
+        read -p "请输入端口（直接回车使用随机端口）: " port
+        [[ -z $port ]] && port=$(random_port) && echo -e "${green}使用随机端口: $port${re}"
+    done
+    echo $port
 }
 
-get_ip() {
-IP_LIST=($(devil vhost list | awk '/^[0-9]+/ {print $1}'))
-API_URL="https://status.eooce.com/api"
-IP1=""; IP2=""; IP3=""
-AVAILABLE_IPS=()
-
-for ip in "${IP_LIST[@]}"; do
-    RESPONSE=$(curl -s --max-time 2 "${API_URL}/${ip}")
-    # echo "Checking IP: $ip -> API Response: $RESPONSE"
-    if [[ -n "$RESPONSE" ]] && [[ $(echo "$RESPONSE" | jq -r '.status') == "Available" ]]; then
-        AVAILABLE_IPS+=("$ip")
+install_lsof() {
+    if ! command -v lsof &>/dev/null; then
+        if [ -f "/etc/debian_version" ]; then
+            apt update && apt install -y lsof
+        elif [ -f "/etc/alpine-release" ]; then
+            apk add lsof
+        fi
     fi
+}
+
+# ================== 主菜单 ==================
+while true; do
+    clear
+    echo -e "${green}==== MTProto 管理菜单 ====${re}"
+    echo -e "${green}1. 安装 MTProto${re}"
+    echo -e "${green}2. 卸载 MTProto${re}"
+    echo -e "${green}0. 退出${re}"
+    read -p "$(echo -e ${green}请选择:${re}) " choice
+
+    case $choice in
+        1)
+            clear
+            install_lsof
+
+            read -p $'\033[1;35m请输入MTProto代理端口(直接回车使用随机端口): \033[0m' port
+            [[ -z $port ]] && port=$(random_port) && echo -e "${green}使用随机端口: $port${re}"
+            port=$(check_port $port)
+
+            PORT=$port bash <(curl -Ls https://raw.githubusercontent.com/iu683/uu/main/nn.sh)
+            echo -e "${green}MTProto 安装完成！端口: $port${re}"
+            echo
+            read -p "按回车返回菜单..."
+            ;;
+        2)
+            clear
+            read -p $'\033[1;31m确认卸载 MTProto? [y/N]: \033[0m' confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                rm -rf mtp && pkill mtg
+                echo -e "${red}MTProto 已卸载${re}"
+            else
+                echo "取消卸载"
+            fi
+            echo
+            read -p "按回车返回菜单..."
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            echo -e "${red}无效输入！${re}"
+            sleep 1
+            ;;
+    esac
 done
-
-[[ ${#AVAILABLE_IPS[@]} -ge 1 ]] && IP1=${AVAILABLE_IPS[0]}
-[[ ${#AVAILABLE_IPS[@]} -ge 2 ]] && IP2=${AVAILABLE_IPS[1]}
-[[ ${#AVAILABLE_IPS[@]} -ge 3 ]] && IP3=${AVAILABLE_IPS[2]}
-
-if [[ -z "$IP1" ]]; then
-    red "所有IP都被墙, 请更换服务器安装"
-    exit 1
-fi
-}
-
-download_run(){
-    if [ -e "${WORKDIR}/mtg" ]; then
-        cd ${WORKDIR} && chmod +x mtg
-        nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
-    else
-        mtg_url="https://github.com/eooce/test/releases/download/freebsd/mtg-freebsd-amd64"
-        wget -q -O "${WORKDIR}/mtg" "$mtg_url"
-
-        if [ -e "${WORKDIR}/mtg" ]; then
-            cd ${WORKDIR} && chmod +x mtg
-            nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
-        fi        
-    fi
-}
-
-generate_info() {
-purple "\n分享链接:\n"
-LINKS=""
-[[ -n "$IP1" ]] && LINKS+="tg://proxy?server=$IP1&port=$MTP_PORT&secret=$SECRET"
-[[ -n "$IP2" ]] && LINKS+="\n\ntg://proxy?server=$IP2&port=$MTP_PORT&secret=$SECRET"
-[[ -n "$IP3" ]] && LINKS+="\n\ntg://proxy?server=$IP3&port=$MTP_PORT&secret=$SECRET"
-
-green "$LINKS\n"
-echo -e "$LINKS" > link.txt
-
-cat > ${WORKDIR}/restart.sh <<EOF
-#!/bin/bash
-
-pkill mtg
-cd ~ && cd ${WORKDIR}
-nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
-EOF
-}
-
-download_mtg(){
-cmd=$(uname -m)
-if [ "$cmd" == "x86_64" ] || [ "$cmd" == "amd64" ] ; then
-    arch="amd64"
-elif [ "$cmd" == "386" ]; then
-    arch="386"
-elif [ "$cmd" == "arm" ]; then
-    arch="arm"
-elif [ "$cmd" == "aarch64" ]; then
-    arch="arm64"    
-else
-    arch="amd64"
-fi
-
-wget -q -O "${WORKDIR}/mtg" "https://github.com/whunt1/onekeymakemtg/raw/master/builds/ccbuilds/mtg-linux-$arch"
-
-export PORT=${PORT:-$(shuf -i 200-1000 -n 1)}
-export MTP_PORT=$(($PORT + 1)) 
-
-if [ -e "${WORKDIR}/mtg" ]; then
-    cd ${WORKDIR} && chmod +x mtg
-    nohup ./mtg run -b 0.0.0.0:$PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
-fi
-}
-
-show_link(){
-    ip=$(get_public_ip)
-    LINKS="tg://proxy?server=$ip&port=$PORT&secret=$SECRET"
-    green "$LINKS\n"
-    echo -e "$LINKS" > $WORKDIR/link.txt
-
-    purple "\n一键卸载命令: rm -rf mtp && pkill mtg"
-}
-
-install(){
-purple "正在安装中,请稍等...\n"
-if [[ "$HOSTNAME" =mtp ]]; then
-    check_port
-    get_ip
-    download_run
-    generate_info
-else
-    download_mtg
-    show_link
-fi
-}
-
-install

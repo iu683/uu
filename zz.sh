@@ -1,113 +1,168 @@
 #!/bin/bash
-# ========================================
-# Nezha Dashboard 一键管理脚本 (Docker Compose)
-# ========================================
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-RESET="\033[0m"
+red() { echo -e "\e[1;91m$1\033[0m"; }
+green() { echo -e "\e[1;32m$1\033[0m"; }
+yellow() { echo -e "\e[1;33m$1\033[0m"; }
+purple() { echo -e "\e[1;35m$1\033[0m"; }
+HOSTNAME=$(hostname)
+USERNAME=$(whoami | tr '[:upper:]' '[:lower:]')
+export SECRET=${SECRET:-$(echo -n "$USERNAME+$HOSTNAME" | md5sum | head -c 32)}
+WORKDIR="$HOME/mtp" && mkdir -p "$WORKDIR"
+pgrep -x mtg > /dev/null && pkill -9 mtg >/dev/null 2>&1
 
-APP_NAME="nezha-dashboard"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-
-function menu() {
-    clear
-    echo -e "${GREEN}===哪吒V1管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 重启${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 卸载(含数据)${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) restart_app ;;
-        4) view_logs ;;
-        5) uninstall_app ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
-    esac
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
 }
 
-function install_app() {
-    mkdir -p "$APP_DIR/data"
+check_port () {
+  port_list=$(devil port list)
+  tcp_ports=$(echo "$port_list" | grep -c "tcp")
+  udp_ports=$(echo "$port_list" | grep -c "udp")
 
-    read -p "请输入 Web 端口 [默认:8008]: " input_port
-    PORT=${input_port:-8008}
+  if [[ $tcp_ports -lt 1 ]]; then
+      red "没有可用的TCP端口,正在调整..."
 
-    # 写 docker-compose.yml
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  dashboard:
-    image: ghcr.io/nezhahq/nezha
-    container_name: nezha-dashboard
-    restart: always
-    ports:
-      - "127.0.0.1:$PORT:8008"
-    volumes:
-      - $APP_DIR/data:/dashboard/data
+      if [[ $udp_ports -ge 3 ]]; then
+          udp_port_to_delete=$(echo "$port_list" | awk '/udp/ {print $1}' | head -n 1)
+          devil port del udp $udp_port_to_delete
+          green "已删除udp端口: $udp_port_to_delete"
+      fi
+
+      while true; do
+          tcp_port=$(shuf -i 10000-65535 -n 1)
+          result=$(devil port add tcp $tcp_port 2>&1)
+          if [[ $result == *"Ok"* ]]; then
+              green "已添加TCP端口: $tcp_port"
+              tcp_port1=$tcp_port
+              break
+          else
+              yellow "端口 $tcp_port 不可用，尝试其他端口..."
+          fi
+      done
+      
+  else
+      tcp_ports=$(echo "$port_list" | awk '/tcp/ {print $1}')
+      tcp_port1=$(echo "$tcp_ports" | sed -n '1p')
+  fi
+  devil binexec on >/dev/null 2>&1
+  MTP_PORT=$tcp_port1
+  green "使用 $MTP_PORT 作为TG代理端口"
+}
+
+get_ip() {
+IP_LIST=($(devil vhost list | awk '/^[0-9]+/ {print $1}'))
+IP1=""; IP2=""; IP3=""
+AVAILABLE_IPS=()
+
+for ip in "${IP_LIST[@]}"; do
+    RESPONSE=$(curl -s --max-time 2 "${API_URL}/${ip}")
+    # echo "Checking IP: $ip -> API Response: $RESPONSE"
+    if [[ -n "$RESPONSE" ]] && [[ $(echo "$RESPONSE" | jq -r '.status') == "Available" ]]; then
+        AVAILABLE_IPS+=("$ip")
+    fi
+done
+
+[[ ${#AVAILABLE_IPS[@]} -ge 1 ]] && IP1=${AVAILABLE_IPS[0]}
+[[ ${#AVAILABLE_IPS[@]} -ge 2 ]] && IP2=${AVAILABLE_IPS[1]}
+[[ ${#AVAILABLE_IPS[@]} -ge 3 ]] && IP3=${AVAILABLE_IPS[2]}
+
+if [[ -z "$IP1" ]]; then
+    red "所有IP都被墙, 请更换服务器安装"
+    exit 1
+fi
+}
+
+download_run(){
+    if [ -e "${WORKDIR}/mtg" ]; then
+        cd ${WORKDIR} && chmod +x mtg
+        nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
+    else
+        mtg_url="https://github.com/eooce/test/releases/download/freebsd/mtg-freebsd-amd64"
+        wget -q -O "${WORKDIR}/mtg" "$mtg_url"
+
+        if [ -e "${WORKDIR}/mtg" ]; then
+            cd ${WORKDIR} && chmod +x mtg
+            nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
+        fi        
+    fi
+}
+
+generate_info() {
+purple "\n分享链接:\n"
+LINKS=""
+[[ -n "$IP1" ]] && LINKS+="tg://proxy?server=$IP1&port=$MTP_PORT&secret=$SECRET"
+[[ -n "$IP2" ]] && LINKS+="\n\ntg://proxy?server=$IP2&port=$MTP_PORT&secret=$SECRET"
+[[ -n "$IP3" ]] && LINKS+="\n\ntg://proxy?server=$IP3&port=$MTP_PORT&secret=$SECRET"
+
+green "$LINKS\n"
+echo -e "$LINKS" > link.txt
+
+cat > ${WORKDIR}/restart.sh <<EOF
+#!/bin/bash
+
+pkill mtg
+cd ~ && cd ${WORKDIR}
+nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
 EOF
-
-    cd "$APP_DIR"
-    docker compose up -d
-
-    CONFIG_FILE="$APP_DIR/data/config.yaml"
-    # 直接替换已有 language 或追加到文件末尾
-    sed -i '/^language:/d' "$CONFIG_FILE" 2>/dev/null
-    echo "language: zh_CN" >> "$CONFIG_FILE"
-
-    # 在文件末尾追加 TSDB 配置
-    cat >> "$CONFIG_FILE" <<EOF
-tsdb:
-  data_path: data/tsdb
-EOF
-    # 重启容器生效
-    docker compose restart
-
-    echo -e "${GREEN}✅ Nezha Dashboard 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Web UI 地址: http://127.0.0.1:$PORT${RESET}"
-    echo -e "${YELLOW}🌐 账号/密码: admin/admin${RESET}"
-    echo -e "${YELLOW}🌐 TSDB自动开启${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
-    read -p "按回车返回菜单..."
-    menu
 }
 
+download_mtg(){
+cmd=$(uname -m)
+if [ "$cmd" == "x86_64" ] || [ "$cmd" == "amd64" ] ; then
+    arch="amd64"
+elif [ "$cmd" == "386" ]; then
+    arch="386"
+elif [ "$cmd" == "arm" ]; then
+    arch="arm"
+elif [ "$cmd" == "aarch64" ]; then
+    arch="arm64"    
+else
+    arch="amd64"
+fi
 
-function update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ Nezha Dashboard 已更新并重启完成${RESET}"
-    read -p "按回车返回菜单..."
-    menu
+wget -q -O "${WORKDIR}/mtg" "https://github.com/whunt1/onekeymakemtg/raw/master/builds/ccbuilds/mtg-linux-$arch"
+
+export PORT=${PORT:-$(shuf -i 200-1000 -n 1)}
+export MTP_PORT=$(($PORT + 1)) 
+
+if [ -e "${WORKDIR}/mtg" ]; then
+    cd ${WORKDIR} && chmod +x mtg
+    nohup ./mtg run -b 0.0.0.0:$PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
+fi
 }
 
-function restart_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
-    docker compose restart
-    echo -e "${GREEN}✅ Nezha Dashboard 已重启${RESET}"
-    read -p "按回车返回菜单..."
-    menu
+show_link(){
+    ip=$(get_public_ip)
+    purple "\nTG分享链接:\n"
+    LINKS="tg://proxy?server=$ip&port=$PORT&secret=$SECRET"
+    green "$LINKS\n"
+    echo -e "$LINKS" > $WORKDIR/link.txt
+
+    purple "\n一键卸载命令: rm -rf mtp && pkill mtg"
 }
 
-function view_logs() {
-    docker logs -f nezha-dashboard
-    read -p "按回车返回菜单..."
-    menu
+install(){
+purple "正在安装中,请稍等...\n"
+if [[ "$HOSTNAME" =MTP ]]; then
+    check_port
+    get_ip
+    download_run
+    generate_info
+else
+    download_mtg
+    show_link
+fi
 }
 
-function uninstall_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Nezha Dashboard 已卸载，数据已删除${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-menu
+install

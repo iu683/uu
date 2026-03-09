@@ -169,27 +169,31 @@ inst_port(){
 inst_jump(){
     green "Hysteria 2 端口使用模式如下："
     echo ""
-    echo -e " ${GREEN}1.单端口（默认）${PLAIN}"
-    echo -e " ${GREEN}2.端口跳跃${PLAIN} "
+    echo -e " ${GREEN}1.单端口${PLAIN}"
+    echo -e " ${GREEN}2.端口跳跃（默认）${PLAIN}"
     echo ""
-    read -rp "请输入选项 [1-2]: " jumpInput
+
+    read -rp "请输入选项 [1-2] (默认2): " jumpInput
+    jumpInput=${jumpInput:-2}
+
     if [[ $jumpInput == 2 ]]; then
         read -p "设置范围端口的起始端口 (建议10000-65535之间)：" firstport
         read -p "设置一个范围端口的末尾端口 (建议10000-65535之间，一定要比上面起始端口大)：" endport
+
         if [[ $firstport -ge $endport ]]; then
             until [[ $firstport -le $endport ]]; do
-                if [[ $firstport -ge $endport ]]; then
-                    red "你设置的起始端口小于末尾端口，请重新输入起始和末尾端口"
-                    read -p "设置范围端口的起始端口 (建议10000-65535之间)：" firstport
-                    read -p "设置一个范围端口的末尾端口 (建议10000-65535之间，一定要比上面起始端口大)：" endport
-                fi
+                red "你设置的起始端口小于末尾端口，请重新输入起始和末尾端口"
+                read -p "设置范围端口的起始端口：" firstport
+                read -p "设置一个范围端口的末尾端口：" endport
             done
         fi
-        iptables -t nat -A PREROUTING -p udp --dport $firstport:$endport  -j DNAT --to-destination :$port
-        ip6tables -t nat -A PREROUTING -p udp --dport $firstport:$endport  -j DNAT --to-destination :$port
+
+        iptables -t nat -A PREROUTING -p udp --dport $firstport:$endport -j DNAT --to-destination :$port
+        ip6tables -t nat -A PREROUTING -p udp --dport $firstport:$endport -j DNAT --to-destination :$port
         netfilter-persistent save >/dev/null 2>&1
+
     else
-        red "将继续使用单端口模式"
+        yellow "将继续使用单端口模式"
     fi
 }
 
@@ -223,9 +227,9 @@ insthysteria(){
     fi
     ${PACKAGE_INSTALL} curl wget sudo qrencode procps iptables-persistent netfilter-persistent
 
-    wget -N https://raw.githubusercontent.com/Misaka-blog/hysteria-install/main/hy2/install_server.sh
-    bash install_server.sh
-    rm -f install_server.sh
+    wget -N https://raw.githubusercontent.com/iu683/uu/main/vv.sh
+    bash vv.sh
+    rm -f vv.sh
 
     if [[ -f "/usr/local/bin/hysteria" ]]; then
         green "Hysteria 2 安装成功！"
@@ -488,23 +492,31 @@ showconf(){
 }
 
 menu() {
-    clear 
-    echo -e " ${GREEN}=== Hysteria2 管理菜单 ===${PLAIN}"                
+while true
+do
+    clear
+    echo -e " ${GREEN}=== Hysteria2 管理菜单 ===${PLAIN}"
     echo -e " ${GREEN}1.安装Hysteria2${PLAIN}"
     echo -e " ${GREEN}2.卸载Hysteria2${PLAIN}"
     echo -e " ${GREEN}3.关闭、开启、重启 Hysteria2${PLAIN}"
     echo -e " ${GREEN}4.修改Hysteria2配置${PLAIN}"
     echo -e " ${GREEN}5.查看Hysteria2配置文件${PLAIN}"
     echo -e " ${GREEN}0.退出${PLAIN}"
-    read -rp $'\033[32m请输入选项[0-5]: \033[0m' menuInput
+
+    read -rp $'\033[32m 请输入选项: \033[0m' menuInput
+
     case $menuInput in
         1 ) insthysteria ;;
         2 ) unsthysteria ;;
         3 ) hysteriaswitch ;;
         4 ) changeconf ;;
         5 ) showconf ;;
-        * ) exit 1 ;;
+        0 ) exit 0 ;;
+        * ) red "请输入正确选项"; sleep 1 ;;
     esac
+
+    read -n 1 -s -r -p "按任意键返回菜单..."
+done
 }
 
 menu

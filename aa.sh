@@ -111,7 +111,7 @@ Description=anytls Service
 After=network.target
 
 [Service]
-ExecStart=$BINARY_DIR/$BINARY_NAME -l [::]:$PORT -p $PASSWORD
+ExecStart=$BINARY_DIR/$BINARY_NAME -l 0.0.0.0:$PORT -p $PASSWORD
 Restart=always
 User=root
 Group=root
@@ -156,6 +156,8 @@ uninstall_anytls() {
     systemctl disable $SERVICE_NAME 2>/dev/null
     [ -f "$BINARY_DIR/$BINARY_NAME" ] && rm -f "$BINARY_DIR/$BINARY_NAME"
     [ -f "/etc/systemd/system/$SERVICE_NAME.service" ] && rm -f "/etc/systemd/system/$SERVICE_NAME.service"
+    NODE_FILE="/etc/anytls/node.txt"
+    [ -f "$NODE_FILE" ] && rm -f "$NODE_FILE"
     systemctl daemon-reload
     echo -e "${GREEN}anytls 已完全卸载！${RESET}"
 
@@ -172,6 +174,7 @@ show_node_info() {
     cat "$NODE_FILE"
     pause_return
 }
+
 
 # 修改端口
 modify_port() {

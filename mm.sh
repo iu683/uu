@@ -50,15 +50,21 @@ while true; do
             [[ -z $port ]] && port=$(random_port) && echo -e "${green}使用随机端口: $port${re}"
             port=$(check_port $port)
 
-            PORT=$port bash <(curl -Ls https://raw.githubusercontent.com/iu683/uu/main/PROXY/vv.sh)
+            PORT=$port bash <(curl -Ls https://raw.githubusercontent.com/iu683/uu/main/uu.sh)
             echo -e "${green}MTProto 安装完成！端口: $port${re}"
             echo
             read -p "按回车返回菜单..."
             ;;
         2)
             clear
-            rm -rf mtp && pkill mtg
-            echo -e "${red}MTProto 已卸载${re}"
+            read -p $'\033[1;31m确认卸载 MTProto? [y/N]: \033[0m' confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                rm -rf mtp && pkill mtg
+                echo -e "${red}MTProto 已卸载${re}"
+            else
+                echo "取消卸载"
+            fi
+            echo
             read -p "按回车返回菜单..."
             ;;
         0)

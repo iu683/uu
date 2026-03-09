@@ -61,26 +61,15 @@ check_port () {
 }
 
 get_ip() {
-IP_LIST=($(devil vhost list | awk '/^[0-9]+/ {print $1}'))
-IP1=""; IP2=""; IP3=""
-AVAILABLE_IPS=()
-
-for ip in "${IP_LIST[@]}"; do
-    RESPONSE=$(curl -s --max-time 2 "${API_URL}/${ip}")
-    # echo "Checking IP: $ip -> API Response: $RESPONSE"
-    if [[ -n "$RESPONSE" ]] && [[ $(echo "$RESPONSE" | jq -r '.status') == "Available" ]]; then
-        AVAILABLE_IPS+=("$ip")
+    IP_LIST=($(devil vhost list | awk '/^[0-9]+/ {print $1}'))
+    if [[ ${#IP_LIST[@]} -ge 1 ]]; then
+        IP1=${IP_LIST[0]}
+        IP2=${IP_LIST[1]:-}
+        IP3=${IP_LIST[2]:-}
+    else
+        red "没有可用的 IP"
+        exit 1
     fi
-done
-
-[[ ${#AVAILABLE_IPS[@]} -ge 1 ]] && IP1=${AVAILABLE_IPS[0]}
-[[ ${#AVAILABLE_IPS[@]} -ge 2 ]] && IP2=${AVAILABLE_IPS[1]}
-[[ ${#AVAILABLE_IPS[@]} -ge 3 ]] && IP3=${AVAILABLE_IPS[2]}
-
-if [[ -z "$IP1" ]]; then
-    red "所有IP都被墙, 请更换服务器安装"
-    exit 1
-fi
 }
 
 download_run(){

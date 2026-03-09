@@ -170,7 +170,7 @@ inst_jump(){
     green "Hysteria 2 端口使用模式如下："
     echo ""
     echo -e " ${GREEN}1.单端口${PLAIN}"
-    echo -e " ${GREEN}2.端口跳跃（默认）${PLAIN}"
+    echo -e " ${GREEN}2.端口跳跃${PLAIN}${YELLOW}（默认)${PLAIN}"
     echo ""
 
     read -rp "请输入选项 [1-2] (默认2): " jumpInput
@@ -227,9 +227,9 @@ insthysteria(){
     fi
     ${PACKAGE_INSTALL} curl wget sudo qrencode procps iptables-persistent netfilter-persistent
 
-    wget -N https://raw.githubusercontent.com/iu683/uu/main/vv.sh
-    bash vv.sh
-    rm -f vv.sh
+    wget -N https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/AZHysteria2.sh
+    bash AZHysteria2.sh
+    rm -f AZHysteria2.sh
 
     if [[ -f "/usr/local/bin/hysteria" ]]; then
         green "Hysteria 2 安装成功！"
@@ -332,8 +332,13 @@ EOF
 }
 EOF
 
-    url="hysteria2://$auth_pwd@$last_ip:$port?insecure=1&sni=$hy_domain#$HOSTNAME"
-    echo $url > /root/hy/url.txt
+    cat > /root/hy/url.txt <<EOF
+V2rayN:
+hysteria2://$auth_pwd@$last_ip:$port?insecure=1&sni=$hy_domain#$HOSTNAME
+
+Surge:
+$HOSTNAME = hysteria2, $last_ip, $port, password=$auth_pwd, skip-cert-verify=true, sni=$hy_domain
+EOF
 
     systemctl daemon-reload
     systemctl enable hysteria-server
@@ -349,6 +354,7 @@ EOF
     red "$(cat /root/hy/hy-client.yaml)"
     yellow "Hysteria 2 客户端 JSON 配置文件 hy-client.json 内容如下，并保存到 /root/hy/hy-client.json"
     red "$(cat /root/hy/hy-client.json)"
+    yellow "V6VPS替换IP地址为V6 ★"
     if [[ -n "$firstport" && -n "$endport" ]]; then
         yellow "Hysteria 2 端口模式: 跳跃端口 $firstport-$endport -> $port"
     else
@@ -367,6 +373,7 @@ unsthysteria(){
     netfilter-persistent save >/dev/null 2>&1
 
     green "Hysteria 2 已彻底卸载完成！"
+    exit 0
 }
 
 starthysteria(){

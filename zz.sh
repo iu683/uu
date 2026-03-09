@@ -61,25 +61,6 @@ check_port () {
   green "使用 $MTP_PORT 作为TG代理端口"
 }
 
-create_service(){
-cat >/etc/systemd/system/mtg.service <<EOF
-[Unit]
-Description=MTProto Proxy
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=$WORKDIR
-ExecStart=$WORKDIR/mtg run -b 0.0.0.0:$PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable mtg
-}
 
 
 get_ip() {
@@ -124,8 +105,7 @@ cat > ${WORKDIR}/restart.sh <<EOF
 
 pkill mtg
 cd ~ && cd ${WORKDIR}
-create_service
-systemctl restart mtg
+nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
 EOF
 }
 
@@ -160,29 +140,58 @@ show_link(){
     LINKS="tg://proxy?server=$ip&port=$PORT&secret=$SECRET"
     green "$LINKS\n"
     echo -e "$LINKS" > $WORKDIR/link.txt
+
+    purple "\n一键卸载命令: rm -rf mtp && pkill mtg"
 }
 
-uninstall(){
-systemctl stop mtg 2>/dev/null
-systemctl disable mtg 2>/dev/null
-rm -f /etc/systemd/system/mtg.service
-systemctl daemon-reload
-pkill -9 mtg 2>/dev/null
-rm -rf $WORKDIR
-green "MTProto 已卸载"
+setup_systemd() {
+    SERVICE_FILE="/etc/systemd/system/mtp.service"
+
+    sudo tee $SERVICE_FILE > /dev/null <<EOF
+[Unit]
+Description=MTProto Proxy Service
+After=network.target
+
+[Service]
+Type=simple
+User=$USERNAME
+WorkingDirectory=$WORKDIR
+EnvironmentFile=$WORKDIR/env.conf
+ExecStart=$WORKDIR/mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable mtp.service
+    sudo systemctl restart mtp.service
+    green "✅ systemd 服务已创建并启动，MTProto 将开机自启"
 }
 
 install(){
-purple "正在安装..."
-if [[ "$HOSTNAME" =~ MTProto ]]; then
-    check_port
-    get_ip
-    download_run
-    generate_info
-else
-    download_mtg
-    show_link
-fi
+    purple "正在安装...\n"
+    if [[ "$HOSTNAME" =~ mtp ]]; then
+        check_port
+        get_ip
+        download_run
+        generate_info
+        # 创建环境文件
+        ENV_FILE="$WORKDIR/env.conf"
+        cat > "$ENV_FILE" <<EOF
+MTP_PORT=$MTP_PORT
+SECRET=$SECRET
+EOF
+        green "✅ 环境文件已生成: $ENV_FILE"
+    else
+        download_mtg
+        show_link
+    fi
+
+    # 自动创建 systemd 服务
+    setup_systemd
 }
 
 install

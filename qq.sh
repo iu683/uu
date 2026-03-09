@@ -1,149 +1,72 @@
 #!/bin/bash
 
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+# ================== 颜色定义 ==================
+green="\033[32m"
+red="\033[31m"
+yellow="\033[33m"
+skyblue="\033[36m"
+re="\033[0m"
 
-install_openclaw(){
-
-echo -e "${GREEN}安装 Node.js 22 和 OpenClaw...${RESET}"
-
-# 安装 nvm
-curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
-
-# 加载 nvm
-export NVM_DIR="$HOME/.nvm"
-[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-
-# 安装 Node
-nvm install 22
-nvm use 22
-
-# 安装 OpenClaw
-npm install -g @qingchencloud/openclaw-zh@latest
-
-echo -e "${GREEN}安装完成${RESET}"
-
+# ================== 工具函数 ==================
+random_port() {
+    shuf -i 2000-65000 -n 1
 }
 
-update_openclaw(){
-
-echo -e "${GREEN}更新 OpenClaw...${RESET}"
-
-npm update -g @qingchencloud/openclaw-zh
-
+check_port() {
+    local port=$1
+    while [[ -n $(lsof -i :$port 2>/dev/null) ]]; do
+        echo -e "${red}${port}端口已经被其他程序占用，请更换端口重试${re}"
+        read -p "请输入端口（直接回车使用随机端口）: " port
+        [[ -z $port ]] && port=$(random_port) && echo -e "${green}使用随机端口: $port${re}"
+    done
+    echo $port
 }
 
-start_openclaw(){
-
-openclaw gateway start
-
+install_lsof() {
+    if ! command -v lsof &>/dev/null; then
+        if [ -f "/etc/debian_version" ]; then
+            apt update && apt install -y lsof
+        elif [ -f "/etc/alpine-release" ]; then
+            apk add lsof
+        fi
+    fi
 }
 
-restart_openclaw(){
+# ================== 主菜单 ==================
+while true; do
+    clear
+    echo -e "${green}==== MTProto 管理菜单 ====${re}"
+    echo -e "${green}1. 安装 MTProto${re}"
+    echo -e "${green}2. 卸载 MTProto${re}"
+    echo -e "${green}0. 退出${re}"
+    read -p "$(echo -e ${green}请选择:${re}) " choice
 
-openclaw gateway restart
+    case $choice in
+        1)
+            clear
+            install_lsof
 
-}
+            read -p $'\033[1;35m请输入MTProto代理端口(直接回车使用随机端口): \033[0m' port
+            [[ -z $port ]] && port=$(random_port) && echo -e "${green}使用随机端口: $port${re}"
+            port=$(check_port $port)
 
-logs_openclaw(){
-
-openclaw
-
-}
-
-dashboard_openclaw(){
-
-openclaw dashboard
-
-}
-
-status_openclaw(){
-
-openclaw status
-
-}
-
-doctor_openclaw(){
-
-openclaw doctor
-
-}
-
-tg_pair(){
-
-read -p "TG连接码: " code
-openclaw pairing approve telegram "$code"
-
-}
-
-skills_list(){
-
-openclaw skills list
-
-}
-
-skills_install(){
-
-openclaw skills install
-
-}
-
-uninstall_openclaw(){
-
-echo -e "${YELLOW}卸载 OpenClaw...${RESET}"
-
-npm uninstall -g @qingchencloud/openclaw-zh
-npm uninstall -g openclaw
-rm -rf ~/.openclaw
-
-echo -e "${GREEN}卸载完成${RESET}"
-
-}
-
-while true
-do
-
-clear
-
-echo -e "${GREEN}=== OpenClaw 管理菜单 ===${RESET}"
-echo -e "${GREEN} 1) 安装OpenClaw${RESET}"
-echo -e "${GREEN} 2) 更新OpenClaw${RESET}"
-echo -e "${GREEN} 3) 启动网关${RESET}"
-echo -e "${GREEN} 4) 重启网关${RESET}"
-echo -e "${GREEN} 5) 查看日志${RESET}"
-echo -e "${GREEN} 6) 打开控制台${RESET}"
-echo -e "${GREEN} 7) 查看状态${RESET}"
-echo -e "${GREEN} 8) 系统诊断${RESET}"
-echo -e "${GREEN} 9) TG配对${RESET}"
-echo -e "${GREEN}10) 查看技能${RESET}"
-echo -e "${GREEN}11) 安装技能${RESET}"
-echo -e "${GREEN}12) 卸载 OpenClaw${RESET}"
-echo -e "${GREEN} 0) 退出${RESET}"
-
-read -rp "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-case "$choice" in
-
-1) install_openclaw ;;
-2) update_openclaw ;;
-3) start_openclaw ;;
-4) restart_openclaw ;;
-5) logs_openclaw ;;
-6) dashboard_openclaw ;;
-7) status_openclaw ;;
-8) doctor_openclaw ;;
-9) tg_pair ;;
-10) skills_list ;;
-11) skills_install ;;
-12) uninstall_openclaw ;;
-0) exit 0 ;;
-*) echo -e "${RED}无效选项${RESET}"
-
-esac
-
-echo
-read -n 1 -s -r -p "按任意键返回菜单..."
-
+            PORT=$port bash <(curl -Ls https://raw.githubusercontent.com/iu683/uu/main/PROXY/aa.sh)
+            echo -e "${green}MTProto 安装完成！端口: $port${re}"
+            echo
+            read -p "按回车返回菜单..."
+            ;;
+        2)
+            clear
+            rm -rf mtp && pkill mtg
+            echo -e "${red}MTProto 已卸载${re}"
+            read -p "按回车返回菜单..."
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            echo -e "${red}无效输入！${re}"
+            sleep 1
+            ;;
+    esac
 done

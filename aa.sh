@@ -16,8 +16,13 @@ CONFIG_S5="${WORKDIR}/config.json"
 CONFIG_3PROXY="${WORKDIR}/3proxy.cfg"
 DEFAULT_PORT=1080
 DEFAULT_USER="s5user"
+SERVICE_FILE="/etc/systemd/system/s5.service"
 
 PREFERRED_IMPLS=("s5" "3proxy" "microsocks" "ss5" "danted" "sockd")
+
+random_port() {
+  shuf -i 20000-60000 -n 1
+}
 
 ensure_workdir() {
   mkdir -p "${WORKDIR}"
@@ -243,6 +248,57 @@ urlencode() {
   fi
 }
 
+create_service() {
+
+cat > ${SERVICE_FILE} <<EOF
+[Unit]
+Description=Socks5 Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${WORKDIR}
+ExecStart=${WORKDIR}/start.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable s5
+}
+
+create_start_script() {
+
+cat > ${WORKDIR}/start.sh <<EOF
+#!/usr/bin/env bash
+source ${META_FILE}
+
+case "\$BIN_TYPE" in
+3proxy)
+    exec 3proxy ${CONFIG_3PROXY}
+    ;;
+s5)
+    exec s5 -c ${CONFIG_S5}
+    ;;
+microsocks)
+    exec microsocks -i :: -p \$PORT -u \$USERNAME -P \$PASSWORD
+    ;;
+ss5)
+    exec ss5 -u \$USERNAME:\$PASSWORD -p \$PORT
+    ;;
+*)
+    echo "unknown type"
+    exit 1
+    ;;
+esac
+EOF
+
+chmod +x ${WORKDIR}/start.sh
+}
+
 show_links() {
   local ip port user pass enc_user enc_pass enc_ip tlink socksurl
   ip="$(get_best_ip)"
@@ -258,76 +314,51 @@ show_links() {
 
   echo
   echo -e "${GREEN}安装并启动完成:${RESET}"
-  echo "socks 地址示例：${socksurl}"
-  echo "Telegram 快链：${tlink}"
+  echo -e "${YELLOW}socks地址：${socksurl}${RESET}"
+  echo -e "${YELLOW}Telegram快链：${tlink}${RESET}"
   echo
+  read -n 1 -s -r -p "按任意键返回菜单..."
 }
 
 start_by_type() {
-  local type="$1"
-  case "${type}" in
-    3proxy)
-      cfg="$(generate_3proxy_cfg "${PORT}" "${USERNAME}" "${PASSWORD}")"
-      nohup 3proxy "${cfg}" >/dev/null 2>&1 &
-      echo "$!" > "${PID_FILE}"
-      ;;
-    s5)
-      generate_s5_json "${PORT}" "${USERNAME}" "${PASSWORD}" >/dev/null
-      nohup s5 -c "${CONFIG_S5}" >/dev/null 2>&1 &
-      echo "$!" > "${PID_FILE}"
-      ;;
-    microsocks)
-      nohup microsocks -p "${PORT}" -u "${USERNAME}" -P "${PASSWORD}" >/dev/null 2>&1 &
-      echo "$!" > "${PID_FILE}"
-      ;;
-    ss5)
-      nohup ss5 -u "${USERNAME}:${PASSWORD}" -p "${PORT}" >/dev/null 2>&1 &
-      echo "$!" > "${PID_FILE}"
-      ;;
-    danted)
-      echo -e "${YELLOW}检测到 danted/sockd，脚本不会自动生成完整服务配置。请手动配置并启动 danted。${RESET}"
-      return 1
-      ;;
-    *)
-      echo -e "${RED}未知实现类型：${type}${RESET}"
-      return 1
-      ;;
-  esac
 
-  sleep 1
-  if [ -f "${PID_FILE}" ] && kill -0 "$(cat "${PID_FILE}")" >/dev/null 2>&1; then
-    echo -e "${GREEN}已启动 ${type}，PID=$(cat "${PID_FILE}")${RESET}"
+create_start_script
+create_service
+
+systemctl restart s5
+
+sleep 1
+
+if systemctl is-active --quiet s5; then
+    echo -e "${GREEN}Socks5 已启动 (systemd)${RESET}"
     show_links
-    return 0
-  else
-    echo -e "${RED}启动失败（查看日志或手动启动）。${RESET}"
-    return 1
-  fi
+else
+    echo -e "${RED}启动失败${RESET}"
+fi
 }
 
 stop_socks() {
-  if [ -f "${PID_FILE}" ]; then
-    pid="$(cat "${PID_FILE}")"
-    if kill "${pid}" >/dev/null 2>&1; then
-      echo "正在停止 PID ${pid} ..."
-      sleep 1
-      rm -f "${PID_FILE}" || true
-    fi
-  fi
-  for p in s5 3proxy microsocks ss5 danted sockd; do
-    if pgrep -x "${p}" >/dev/null 2>&1; then
-      pkill -x "${p}" || true
-    fi
-  done
+
+if systemctl list-unit-files | grep -q s5.service; then
+    systemctl stop s5
+fi
+
+rm -f "${PID_FILE}" || true
 }
 
 install_flow() {
   ensure_workdir
   echo "安装/配置 socks5（交互）"
-  prompt "监听端口" "${DEFAULT_PORT}" PORT
-  if ! [[ "${PORT}" =~ ^[0-9]+$ ]] || [ "${PORT}" -lt 1 ] || [ "${PORT}" -gt 65535 ]; then
-    echo "端口输入无效，使用默认 ${DEFAULT_PORT}"
-    PORT="${DEFAULT_PORT}"
+
+  prompt "监听端口（回车随机）" "" PORT
+
+  if [ -z "${PORT}" ]; then
+    PORT=$(random_port)
+    echo "使用随机端口: ${PORT}"
+  elif ! [[ "${PORT}" =~ ^[0-9]+$ ]] || [ "${PORT}" -lt 1 ] || [ "${PORT}" -gt 65535 ]; then
+    echo "端口输入无效，重新生成随机端口"
+    PORT=$(random_port)
+    echo "使用随机端口: ${PORT}"
   fi
   prompt "用户名" "${DEFAULT_USER}" USERNAME
   prompt "密码（留空则自动生成）" "" PASSWORD
@@ -394,12 +425,16 @@ modify_flow() {
   echo "正在重启代理以应用修改..."
   stop_socks
   start_by_type "${BIN_TYPE}" || { echo "重启失败，请检查日志"; return 1; }
-  echo -e "${GREEN}修改并重启完成。${RESET}"
+  echo -e "${GREEN}修改并重启完成${RESET}"
   return 0
 }
 
 uninstall_flow() {
   stop_socks
+  systemctl stop s5 2>/dev/null || true
+  systemctl disable s5 2>/dev/null || true
+  rm -f ${SERVICE_FILE}
+  systemctl daemon-reload
 
   if [ -n "${WORKDIR}" ] && [ -d "${WORKDIR}" ]; then
     rm -rf "${WORKDIR}"
@@ -409,33 +444,20 @@ uninstall_flow() {
   fi
 
   echo -e "${RED}卸载完成${RESET}"
-  sleep 1
   exit 0
 }
 
 status_flow() {
-  ensure_workdir
-  load_meta
-  if [ -f "${PID_FILE}" ]; then
-    pid="$(cat "${PID_FILE}")"
-    if kill -0 "${pid}" >/dev/null 2>&1; then
-      echo -e "${GREEN}socks5 正在运行，PID=${pid}${RESET}"
-    else
-      echo -e "${YELLOW}PID 文件存在但进程未运行。${RESET}"
-    fi
-  else
-    if pgrep -x s5 >/dev/null 2>&1 || pgrep -x 3proxy >/dev/null 2>&1 || pgrep -x microsocks >/dev/null 2>&1; then
-      echo -e "${GREEN}检测到 socks5 相关进程在运行（但无 PID 文件）。${RESET}"
-    else
-      echo -e "${YELLOW}未检测到 socks5 运行。${RESET}"
-    fi
-  fi
-  if [ -f "${META_FILE}" ]; then
-    echo "当前配置："
-    sed -n '1,3p' "${META_FILE}" || true
-  else
-    echo "未找到配置（meta）。"
-  fi
+
+if systemctl is-active --quiet s5; then
+    echo -e "${GREEN}socks5 正在运行${RESET}"
+else
+    echo -e "${RED}socks5 未运行${RESET}"
+fi
+
+systemctl status s5 --no-pager
+
+read -n 1 -s -r -p "按任意键返回菜单..."
 }
 
 show_config_flow() {
@@ -462,7 +484,7 @@ show_config_flow() {
   TG_LINK="https://t.me/socks?server=${IP}&port=${PORT}&user=${USERNAME}&pass=${PASSWORD}"
 
   echo -e "${GREEN}连接信息:${RESET}"
-  echo "Socks URL : ${SOCKS_URL}"
+  echo "Socks : ${SOCKS_URL}"
   echo "Telegram  : ${TG_LINK}"
   echo
 
@@ -473,17 +495,17 @@ main_menu() {
   while true; do
     clear
     echo -e "${GREEN}==== Socks5 管理菜单 ====${RESET}"
-    echo -e "${GREEN}1) 安装 socks5${RESET}"
-    echo -e "${GREEN}2) 修改 socks5 配置${RESET}"
-    echo -e "${GREEN}3) 卸载 socks5${RESET}"
-    echo -e "${GREEN}4) 状态${RESET}"
+    echo -e "${GREEN}1) 安装${RESET}"
+    echo -e "${GREEN}2) 卸载${RESET}"
+    echo -e "${GREEN}3) 修改配置${RESET}"
+    echo -e "${GREEN}4) 查看状态${RESET}"
     echo -e "${GREEN}5) 查看连接信息${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
     read -r -p "$(echo -e "${GREEN}请选择 : ${RESET}")" opt < /dev/tty || opt="5"
     case "${opt}" in
       1) install_flow ;;
-      2) modify_flow ;;
-      3) uninstall_flow ;;
+      2) uninstall_flow ;;
+      3) modify_flow ;;
       4) status_flow ;;
       5) show_config_flow ;;
       0) exit 0 ;;

@@ -1,184 +1,75 @@
 #!/bin/bash
 
-red() { echo -e "\e[1;91m$1\033[0m"; }
-green() { echo -e "\e[1;32m$1\033[0m"; }
-yellow() { echo -e "\e[1;33m$1\033[0m"; }
-purple() { echo -e "\e[1;35m$1\033[0m"; }
-HOSTNAME=$(hostname)
-USERNAME=$(whoami | tr '[:upper:]' '[:lower:]')
-export SECRET=${SECRET:-$(echo -n "$USERNAME+$HOSTNAME" | md5sum | head -c 32)}
-WORKDIR="$HOME/mtp" && mkdir -p "$WORKDIR"
-pgrep -x mtg > /dev/null && pkill -9 mtg >/dev/null 2>&1
+# ================== 颜色定义 ==================
+green="\033[32m"
+red="\033[31m"
+yellow="\033[33m"
+skyblue="\033[36m"
+re="\033[0m"
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
+# ================== 工具函数 ==================
+random_port() {
+    shuf -i 2000-65000 -n 1
+}
+
+check_port() {
+    local port=$1
+    while [[ -n $(lsof -i :$port 2>/dev/null) ]]; do
+        echo -e "${red}${port}端口已经被其他程序占用，请更换端口重试${re}"
+        read -p "请输入端口（直接回车使用随机端口）: " port
+        [[ -z $port ]] && port=$(random_port) && echo -e "${green}使用随机端口: $port${re}"
     done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。"
+    echo $port
 }
 
-
-check_port () {
-  port_list=$(devil port list)
-  tcp_ports=$(echo "$port_list" | grep -c "tcp")
-  udp_ports=$(echo "$port_list" | grep -c "udp")
-
-  if [[ $tcp_ports -lt 1 ]]; then
-      red "没有可用的TCP端口,正在调整..."
-
-      if [[ $udp_ports -ge 3 ]]; then
-          udp_port_to_delete=$(echo "$port_list" | awk '/udp/ {print $1}' | head -n 1)
-          devil port del udp $udp_port_to_delete
-          green "已删除udp端口: $udp_port_to_delete"
-      fi
-
-      while true; do
-          tcp_port=$(shuf -i 10000-65535 -n 1)
-          result=$(devil port add tcp $tcp_port 2>&1)
-          if [[ $result == *"Ok"* ]]; then
-              green "已添加TCP端口: $tcp_port"
-              tcp_port1=$tcp_port
-              break
-          else
-              yellow "端口 $tcp_port 不可用，尝试其他端口..."
-          fi
-      done
-      
-  else
-      tcp_ports=$(echo "$port_list" | awk '/tcp/ {print $1}')
-      tcp_port1=$(echo "$tcp_ports" | sed -n '1p')
-  fi
-  devil binexec on >/dev/null 2>&1
-  MTP_PORT=$tcp_port1
-  green "使用 $MTP_PORT 作为TG代理端口"
-}
-
-create_service(){
-cat >/etc/systemd/system/mtg.service <<EOF
-[Unit]
-Description=MTProto Proxy
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=$WORKDIR
-Environment=PORT=$PORT
-Environment=MTP_PORT=$MTP_PORT
-Environment=SECRET=$SECRET
-ExecStart=$WORKDIR/mtg run -b 0.0.0.0:\$PORT \$SECRET --stats-bind=127.0.0.1:\$MTP_PORT
-Restart=always
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-
-get_ip() {
-    IP_LIST=($(devil vhost list | awk '/^[0-9]+/ {print $1}'))
-    if [[ ${#IP_LIST[@]} -ge 1 ]]; then
-        IP1=${IP_LIST[0]}
-        IP2=${IP_LIST[1]:-}
-        IP3=${IP_LIST[2]:-}
-    else
-        red "没有可用的 IP，请检查 devil vhost"
-        exit 1
+install_lsof() {
+    if ! command -v lsof &>/dev/null; then
+        if [ -f "/etc/debian_version" ]; then
+            apt update && apt install -y lsof
+        elif [ -f "/etc/alpine-release" ]; then
+            apk add lsof
+        fi
     fi
 }
 
+# ================== 主菜单 ==================
+while true; do
+    clear
+    echo -e "${green}==== MTProto 管理菜单 ====${re}"
+    echo -e "${green}1. 安装 MTProto${re}"
+    echo -e "${green}2. 卸载 MTProto${re}"
+    echo -e "${green}0. 退出${re}"
+    read -p "$(echo -e ${green}请选择:${re}) " choice
 
+    case $choice in
+        1)
+            clear
+            install_lsof
 
-generate_info() {
-purple "\n分享链接:\n"
-LINKS=""
-[[ -n "$IP1" ]] && LINKS+="tg://proxy?server=$IP1&port=$MTP_PORT&secret=$SECRET"
-[[ -n "$IP2" ]] && LINKS+="\n\ntg://proxy?server=$IP2&port=$MTP_PORT&secret=$SECRET"
-[[ -n "$IP3" ]] && LINKS+="\n\ntg://proxy?server=$IP3&port=$MTP_PORT&secret=$SECRET"
+            read -p $'\033[1;35m请输入MTProto代理端口(直接回车使用随机端口): \033[0m' port
+            [[ -z $port ]] && port=$(random_port) && echo -e "${green}使用随机端口: $port${re}"
+            port=$(check_port $port)
 
-green "$LINKS\n"
-echo -e "$LINKS" > link.txt
-
-cat > ${WORKDIR}/restart.sh <<EOF
-#!/bin/bash
-
-pkill mtg
-cd ~ && cd ${WORKDIR}
-create_service
-systemctl restart mtg
-EOF
-}
-
-download_mtg(){
-cmd=$(uname -m)
-if [ "$cmd" == "x86_64" ] || [ "$cmd" == "amd64" ] ; then
-    arch="amd64"
-elif [ "$cmd" == "386" ]; then
-    arch="386"
-elif [ "$cmd" == "arm" ]; then
-    arch="arm"
-elif [ "$cmd" == "aarch64" ]; then
-    arch="arm64"    
-else
-    arch="amd64"
-fi
-
-wget -q -O "${WORKDIR}/mtg" "https://github.com/whunt1/onekeymakemtg/raw/master/builds/ccbuilds/mtg-linux-$arch"
-
-export PORT=${PORT:-$(shuf -i 200-1000 -n 1)}
-export MTP_PORT=$(($PORT + 1)) 
-
-if [ -e "${WORKDIR}/mtg" ]; then
-    cd ${WORKDIR} && chmod +x mtg
-    nohup ./mtg run -b 0.0.0.0:$PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
-fi
-}
-
-show_link(){
-    ip=$(get_public_ip)
-    purple "\nTG分享链接:\n"
-    LINKS="tg://proxy?server=$ip&port=$PORT&secret=$SECRET"
-    green "$LINKS\n"
-    echo -e "$LINKS" > $WORKDIR/link.txt
-}
-
-uninstall(){
-systemctl stop mtg 2>/dev/null
-systemctl disable mtg 2>/dev/null
-rm -f /etc/systemd/system/mtg.service
-systemctl daemon-reload
-pkill -9 mtg 2>/dev/null
-rm -rf $WORKDIR
-green "MTProto 已卸载"
-}
-
-install(){
-    purple "正在安装..."
-
-    # 先处理端口与 IP
-    check_port
-    get_ip
-
-    # 下载可执行文件
-    download_run
-
-    # 生成 systemd
-    create_service
-    systemctl daemon-reload
-    systemctl enable mtg
-    systemctl start mtg
-
-    # 生成 TG 分享链接
-    generate_info
-    show_link
-    green "安装完成，MTProto 已自启动"
-}
-install
+            PORT=$port bash <(curl -Ls https://raw.githubusercontent.com/iu683/uu/main/qq.sh)
+            echo -e "${green}MTProto 安装完成！端口: $port${re}"
+            read -p "按回车返回菜单..."
+            ;;
+        2)
+            systemctl stop mtg 2>/dev/null
+            systemctl disable mtg 2>/dev/null
+            rm -f /etc/systemd/system/mtg.service
+            systemctl daemon-reload
+            pkill -9 mtg 2>/dev/null
+            rm -rf $WORKDIR
+            green "MTProto 已卸载"
+            read -p "按回车返回菜单..."
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            echo -e "${red}无效输入！${re}"
+            sleep 1
+            ;;
+    esac
+done

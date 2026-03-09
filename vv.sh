@@ -50,18 +50,14 @@ while true; do
             [[ -z $port ]] && port=$(random_port) && echo -e "${green}使用随机端口: $port${re}"
             port=$(check_port $port)
 
-            PORT=$port bash <(curl -Ls https://raw.githubusercontent.com/iu683/uu/main/qq.sh)
+            PORT=$port bash <(curl -sL https://raw.githubusercontent.com/iu683/uu/main/mm.sh)
             echo -e "${green}MTProto 安装完成！端口: $port${re}"
             read -p "按回车返回菜单..."
             ;;
         2)
-            systemctl stop mtg 2>/dev/null
-            systemctl disable mtg 2>/dev/null
-            rm -f /etc/systemd/system/mtg.service
-            systemctl daemon-reload
-            pkill -9 mtg 2>/dev/null
-            rm -rf $WORKDIR
-            green "MTProto 已卸载"
+            clear
+            rm -rf mtp && pkill mtg
+            echo -e "${red}MTProto 已卸载${re}"
             read -p "按回车返回菜单..."
             ;;
         0)

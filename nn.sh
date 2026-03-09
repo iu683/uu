@@ -78,14 +78,14 @@ get_ip() {
 download_run(){
     if [ -e "${WORKDIR}/mtg" ]; then
         cd ${WORKDIR} && chmod +x mtg
-        nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
+        nohup ./mtg run -b 0.0.0.0:$MTP_PORT -b [::]:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
     else
         mtg_url=""
         wget -q -O "${WORKDIR}/mtg" "$mtg_url"
 
         if [ -e "${WORKDIR}/mtg" ]; then
             cd ${WORKDIR} && chmod +x mtg
-            nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
+            nohup ./mtg run -b 0.0.0.0:$MTP_PORT -b [::]:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
         fi        
     fi
 }
@@ -105,7 +105,7 @@ cat > ${WORKDIR}/restart.sh <<EOF
 
 pkill mtg
 cd ~ && cd ${WORKDIR}
-nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
+nohup ./mtg run -b 0.0.0.0:$MTP_PORT -b [::]:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
 EOF
 }
 
@@ -130,13 +130,13 @@ export MTP_PORT=$(($PORT + 1))
 
 if [ -e "${WORKDIR}/mtg" ]; then
     cd ${WORKDIR} && chmod +x mtg
-    nohup ./mtg run -b 0.0.0.0:$PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
+    nohup ./mtg run -b 0.0.0.0:$PORT -b [::]:$PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
 fi
 }
 
 show_link(){
     ip=$(get_public_ip)
-    purple "\nTG分享链接(如获取是ipv6,可自行将ipv4换成ipv6):\n"
+    purple "\nTG分享链接(VPS是ipv6,可自行将ipv4换成ipv6):\n"
     LINKS="tg://proxy?server=$ip&port=$PORT&secret=$SECRET"
     green "$LINKS\n"
     echo -e "$LINKS" > $WORKDIR/link.txt
@@ -146,7 +146,7 @@ show_link(){
 
 install(){
 purple "正在安装中,请稍等...\n"
-if [[ "$HOSTNAME" =mtp ]]; then
+if [[ "$HOSTNAME" =~ mtp ]]; then
     check_port
     get_ip
     download_run

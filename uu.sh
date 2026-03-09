@@ -25,6 +25,7 @@ get_public_ip() {
     echo "无法获取公网 IP 地址。"
 }
 
+
 check_port () {
   port_list=$(devil port list)
   tcp_ports=$(echo "$port_list" | grep -c "tcp")
@@ -60,28 +61,18 @@ check_port () {
   green "使用 $MTP_PORT 作为TG代理端口"
 }
 
+
+
 get_ip() {
-IP_LIST=($(devil vhost list | awk '/^[0-9]+/ {print $1}'))
-API_URL="https://status.eooce.com/api"
-IP1=""; IP2=""; IP3=""
-AVAILABLE_IPS=()
-
-for ip in "${IP_LIST[@]}"; do
-    RESPONSE=$(curl -s --max-time 2 "${API_URL}/${ip}")
-    # echo "Checking IP: $ip -> API Response: $RESPONSE"
-    if [[ -n "$RESPONSE" ]] && [[ $(echo "$RESPONSE" | jq -r '.status') == "Available" ]]; then
-        AVAILABLE_IPS+=("$ip")
+    IP_LIST=($(devil vhost list | awk '/^[0-9]+/ {print $1}'))
+    if [[ ${#IP_LIST[@]} -ge 1 ]]; then
+        IP1=${IP_LIST[0]}
+        IP2=${IP_LIST[1]:-}
+        IP3=${IP_LIST[2]:-}
+    else
+        red "没有可用的 IP，请检查 devil vhost"
+        exit 1
     fi
-done
-
-[[ ${#AVAILABLE_IPS[@]} -ge 1 ]] && IP1=${AVAILABLE_IPS[0]}
-[[ ${#AVAILABLE_IPS[@]} -ge 2 ]] && IP2=${AVAILABLE_IPS[1]}
-[[ ${#AVAILABLE_IPS[@]} -ge 3 ]] && IP3=${AVAILABLE_IPS[2]}
-
-if [[ -z "$IP1" ]]; then
-    red "所有IP都被墙, 请更换服务器安装"
-    exit 1
-fi
 }
 
 download_run(){
@@ -89,7 +80,7 @@ download_run(){
         cd ${WORKDIR} && chmod +x mtg
         nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
     else
-        mtg_url="https://github.com/eooce/test/releases/download/freebsd/mtg-freebsd-amd64"
+        mtg_url=""
         wget -q -O "${WORKDIR}/mtg" "$mtg_url"
 
         if [ -e "${WORKDIR}/mtg" ]; then
@@ -145,6 +136,7 @@ fi
 
 show_link(){
     ip=$(get_public_ip)
+    purple "\nTG分享链接(如获取是ipv6,可自行将ipv4换成ipv6):\n"
     LINKS="tg://proxy?server=$ip&port=$PORT&secret=$SECRET"
     green "$LINKS\n"
     echo -e "$LINKS" > $WORKDIR/link.txt
@@ -154,9 +146,8 @@ show_link(){
 
 install(){
 purple "正在安装中,请稍等...\n"
-if [[ "$HOSTNAME" =mtp ]]; then
+if [[ "$HOSTNAME" =~ mtp ]]; then
     check_port
-    get_public_ip
     get_ip
     download_run
     generate_info

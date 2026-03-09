@@ -111,7 +111,7 @@ Description=anytls Service
 After=network.target
 
 [Service]
-ExecStart=$BINARY_DIR/$BINARY_NAME -l 0.0.0.0:$PORT -p $PASSWORD
+ExecStart=$BINARY_DIR/$BINARY_NAME -l :$PORT -p $PASSWORD
 Restart=always
 User=root
 Group=root
@@ -134,17 +134,6 @@ EOF
     echo -e "${YELLOW}anytls://$PASSWORD@$SERVER_IP:$PORT/?insecure=1#$HOSTNAME${GREEN}"
     echo -e "${GREEN}Surge :${GREEN}"
     echo -e "${YELLOW}$HOSTNAME = anytls, $SERVER_IP, $PORT, password=$PASSWORD, tfo=true, skip-cert-verify=true, reuse=false${GREEN}"
-    NODE_FILE="/etc/anytls/node.txt"
-    mkdir -p $(dirname "$NODE_FILE")
-    cat > "$NODE_FILE" <<EOF
-==== anytls 节点信息 ====
-端口: $PORT
-密码: $PASSWORD
-服务器IP: $SERVER_IP
-节点名: $HOSTNAME
-V2rayN: anytls://$PASSWORD@$SERVER_IP:$PORT/?insecure=1#$HOSTNAME
-Surge: $HOSTNAME = anytls, $SERVER_IP, $PORT, password=$PASSWORD, tfo=true, skip-cert-verify=true, reuse=false
-EOF
 
     pause_return
 }
@@ -163,6 +152,36 @@ uninstall_anytls() {
 
     pause_return
 }
+
+# 显示节点信息
+show_node_info() {
+    SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
+    BINARY_FILE="$BINARY_DIR/$BINARY_NAME"
+
+    if [ ! -f "$SERVICE_FILE" ] || [ ! -f "$BINARY_FILE" ]; then
+        echo -e "${YELLOW}未检测到 anytls 服务或二进制文件${RESET}"
+        pause_return
+        return
+    fi
+
+    # 从 systemd 文件中提取端口和密码
+    PORT=$(grep -oP ':\K[0-9]+' "$SERVICE_FILE" | head -1)
+    PASSWORD=$(grep -oP '\-p \K\S+' "$SERVICE_FILE")
+    SERVER_IP=$(get_ip)
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+
+    echo -e "${GREEN}==== 当前 anytls 节点信息 ====${RESET}"
+    echo -e "${YELLOW}端口: $PORT${RESET}"
+    echo -e "${YELLOW}密码: $PASSWORD${RESET}"
+    echo -e "${YELLOW}服务器 IP: $SERVER_IP${RESET}"
+    echo -e "${GREEN}V2rayN:${GREEN}"
+    echo -e "${YELLOW}anytls://$PASSWORD@$SERVER_IP:$PORT/?insecure=1#$HOSTNAME${GREEN}"
+    echo -e "${GREEN}Surge:${GREEN}"
+    echo -e "${YELLOW}$HOSTNAME = anytls, $SERVER_IP, $PORT, password=$PASSWORD, tfo=true, skip-cert-verify=true, reuse=false${GREEN}"
+
+    pause_return
+}
+
 
 # 修改端口
 modify_port() {

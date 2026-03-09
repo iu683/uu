@@ -50,7 +50,7 @@ while true; do
             [[ -z $port ]] && port=$(random_port) && echo -e "${green}使用随机端口: $port${re}"
             port=$(check_port $port)
 
-            PORT=$port bash <(curl -Ls https://raw.githubusercontent.com/iu683/uu/main/nn.sh)
+            PORT=$port bash <(curl -Ls https://raw.githubusercontent.com/iu683/uu/main/qq.sh)
             echo -e "${green}MTProto 安装完成！端口: $port${re}"
             read -p "按回车返回菜单..."
             ;;

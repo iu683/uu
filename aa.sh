@@ -1,200 +1,139 @@
 #!/bin/bash
-# ========================================
-# Heki 多实例节点管理脚本
-# ========================================
+# =========================================
+# 企业级系统清理脚本（兼容容器 + Docker + 自动处理 GRUB）
+# =========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="heki"
-APP_BASE_DIR="/root/$APP_NAME"
+# 必须 root
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}请使用 root 运行此脚本！${RESET}"
+    exit 1
+fi
 
-mkdir -p "$APP_BASE_DIR"
+# 等待 apt/dnf/yum 锁
+wait_for_lock() {
+    local cmd=$1
+    local lock_file=$2
+    while fuser $lock_file >/dev/null 2>&1; do
+        echo -e "${YELLOW}等待其他 $cmd 进程完成...${RESET}"
+        sleep 2
+    done
+}
 
-# ==============================
-# 检查 Docker
-# ==============================
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
+# 检查容器环境
+IS_CONTAINER=0
+if systemd-detect-virt --quiet; then
+    IS_CONTAINER=1
+fi
+
+# 显示磁盘空间
+df -h / | tail -n +2 | while read fs size used avail usep mount; do
+    use_percent=${usep%\%}
+    if [ "$use_percent" -lt 60 ]; then
+        color=$GREEN
+    elif [ "$use_percent" -lt 80 ]; then
+        color=$YELLOW
+    else
+        color=$RED
     fi
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+    echo -e "${YELLOW}磁盘空间:${RESET} ${color}$usep${RESET} ${YELLOW}已使用 (挂载点: $mount, 总大小: $size, 可用: $avail)${RESET}"
+done
+
+# ===============================
+# 系统清理
+# ===============================
+clean_system() {
+    # 避免 grub-pc 弹出交互界面
+    export DEBIAN_FRONTEND=noninteractive
+
+    if command -v apt &>/dev/null; then
+        echo -e "${GREEN}检测到 APT 系统${RESET}"
+        wait_for_lock "APT" /var/lib/dpkg/lock-frontend
+        apt update -y
+        wait_for_lock "APT" /var/lib/dpkg/lock-frontend
+        apt autoremove --purge -y
+        apt clean
+        apt autoclean
+        # 删除残留配置文件
+        dpkg -l | awk '/^rc/ {print $2}' | xargs -r apt purge -y
+        if [ "$IS_CONTAINER" -eq 0 ]; then
+            # 安全删除旧内核
+            CURRENT_KERNEL=$(uname -r)
+            dpkg --list | awk '/linux-image-[0-9]/ {print $2}' | grep -v "$CURRENT_KERNEL" | xargs -r apt purge -y
+        fi
+    elif command -v yum &>/dev/null; then
+        echo -e "${GREEN}检测到 YUM 系统${RESET}"
+        wait_for_lock "YUM" /var/run/yum.pid
+        yum autoremove -y
+        yum clean all
+        if [ "$IS_CONTAINER" -eq 0 ] && command -v package-cleanup &>/dev/null; then
+            package-cleanup --oldkernels --count=2 -y
+        fi
+    elif command -v dnf &>/dev/null; then
+        echo -e "${GREEN}检测到 DNF 系统${RESET}"
+        wait_for_lock "DNF" /var/run/dnf.pid
+        dnf autoremove -y
+        dnf clean all
+        if [ "$IS_CONTAINER" -eq 0 ]; then
+            dnf remove $(dnf repoquery --installonly --latest-limit=-2 -q) -y 2>/dev/null
+        fi
+    elif command -v apk &>/dev/null; then
+        echo -e "${GREEN}检测到 APK 系统${RESET}"
+        apk cache clean
+    else
+        echo -e "${RED}暂不支持你的系统！${RESET}"
         exit 1
     fi
+
+    # 清理日志（保留最近 7 天）
+    echo -e "${GREEN}清理日志文件（保留最近 7 天）...${RESET}"
+    journalctl --vacuum-time=7d
+
+    echo -e "${GREEN}系统清理完成！${RESET}"
 }
 
-# ==============================
-# 列出实例
-# ==============================
-list_instances() {
-    echo -e "${GREEN}=== 已有实例 ===${RESET}"
-    local count=0
-    for inst in "$APP_BASE_DIR"/*; do
-        [ -d "$inst" ] || continue
-        count=$((count+1))
-        echo -e "${YELLOW}[$count] $(basename "$inst")${RESET}"
-    done
-    [ $count -eq 0 ] && echo -e "${YELLOW}无实例${RESET}"
-}
-
-# ==============================
-# 选择实例
-# ==============================
-select_instance() {
-    list_instances
-    read -r -p $'\033[32m请输入实例编号或名称: \033[0m' input
-    if [[ "$input" =~ ^[0-9]+$ ]]; then
-        INSTANCE=$(ls -d "$APP_BASE_DIR"/* | sed -n "${input}p" | xargs basename)
+# ===============================
+# Docker 清理
+# ===============================
+clean_docker() {
+    if command -v docker &>/dev/null; then
+        echo -e "${GREEN}清理 Docker 无用数据...${RESET}"
+        docker system prune -af --volumes
     else
-        INSTANCE="$input"
+        echo -e "${YELLOW}未检测到 Docker，跳过${RESET}"
     fi
-    INSTANCE_DIR="$APP_BASE_DIR/$INSTANCE"
-    [ -d "$INSTANCE_DIR" ] || { echo -e "${RED}实例不存在${RESET}"; return 1; }
-    return 0
 }
 
-# ==============================
-# 安装实例
-# ==============================
-install_instance() {
-    check_docker
-    read -p "请输入实例名称 [默认 node$(date +%s)]: " INSTANCE
-    INSTANCE=${INSTANCE:-node$(date +%s)}
-    INSTANCE_DIR="$APP_BASE_DIR/$INSTANCE"
-    mkdir -p "$INSTANCE_DIR"
-
-    read -p "请输入 Panel 类型 [默认:Xboard]: " PANEL_TYPE
-    PANEL_TYPE=${PANEL_TYPE:-Xboard}
-    read -p "请输入 Server 类型 [默认:vless]: " SERVER_TYPE
-    SERVER_TYPE=${SERVER_TYPE:-vless}
-    read -p "请输入 Node ID: " NODE_ID
-    read -p "请输入 Panel URL: " PANEL_URL
-    read -p "请输入 Panel Key: " PANEL_KEY
-
-    cat > "$INSTANCE_DIR/docker-compose.yml" <<EOF
-services:
-  heki_${INSTANCE}:
-    image: hekicore/heki:latest
-    container_name: heki_${INSTANCE}
-    restart: on-failure
-    network_mode: host
-    environment:
-      type: ${PANEL_TYPE}
-      server_type: ${SERVER_TYPE}
-      node_id: ${NODE_ID}
-      panel_url: ${PANEL_URL}
-      panel_key: ${PANEL_KEY}
-    volumes:
-      - $INSTANCE_DIR:/etc/heki/
-EOF
-
-    cd "$INSTANCE_DIR" || return
-    docker compose up -d
-    echo -e "${GREEN}✅ 实例 $INSTANCE 已启动${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-# ==============================
-# 单实例操作
-# ==============================
-instance_action() {
-    select_instance || return
-    while true; do
-        echo -e "${GREEN}=== 实例 [$INSTANCE] 管理 ===${RESET}"
-        echo -e "${GREEN}1) 启动${RESET}"
-        echo -e "${GREEN}2) 重启${RESET}"
-        echo -e "${GREEN}3) 更新${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 卸载${RESET}"
-        echo -e "${GREEN}0) 返回${RESET}"
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
-
-        cd "$INSTANCE_DIR" || break
-        case $choice in
-            1) docker compose up -d ;;
-            2) docker restart heki_${INSTANCE} ;;
-            3) docker compose pull && docker compose up -d ;;
-            4) docker logs -f heki_${INSTANCE} ;;
-            5) docker compose down && rm -rf "$INSTANCE_DIR" && break ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-    done
-}
-
-# ==============================
-# 查看所有实例状态
-# ==============================
-show_all_status() {
-    echo -e "${GREEN}=== 所有实例状态 ===${RESET}"
-    for inst in "$APP_BASE_DIR"/*; do
-        [ -d "$inst" ] || continue
-        NAME=$(basename "$inst")
-        STATUS=$(docker ps --format '{{.Names}}' | grep -q "^heki_$NAME$" && echo "运行中" || echo "已停止")
-        echo -e "${YELLOW}$NAME${RESET} | 状态: $STATUS"
-    done
-    read -p "按回车返回菜单..."
-}
-
-# ==============================
-# 批量操作实例
-# ==============================
-batch_action() {
-    list_instances
-    read -r -p $'\033[32m请输入要操作的实例编号(空格分隔，或 all 全选): \033[0m' input
-    if [[ "$input" == "all" ]]; then
-        SELECTED=($(ls -d "$APP_BASE_DIR"/* | xargs -n1 basename))
-    else
-        SELECTED=()
-        for i in $input; do
-            NODE=$(ls -d "$APP_BASE_DIR"/* | sed -n "${i}p" | xargs basename)
-            [ -n "$NODE" ] && SELECTED+=("$NODE")
-        done
-    fi
-
-    read -r -p "选择操作: 1) 启动 2) 重启 3) 更新 4) 卸载: " action
-    for INSTANCE in "${SELECTED[@]}"; do
-        INSTANCE_DIR="$APP_BASE_DIR/$INSTANCE"
-        cd "$INSTANCE_DIR" || continue
-        case "$action" in
-            1) docker compose up -d ;;
-            2) docker restart heki_${INSTANCE} ;;
-            3) docker compose pull && docker compose up -d ;;
-            4) docker compose down && rm -rf "$INSTANCE_DIR" ;;
-        esac
-        echo -e "${GREEN}✅ 实例 $INSTANCE 操作完成${RESET}"
-    done
-    read -p "按回车返回菜单..."
-}
-
-# ==============================
-# 主菜单
-# ==============================
-menu() {
-    check_docker
-    while true; do
-        clear
-        echo -e "${GREEN}=== Heki 多实例管理 ===${RESET}"
-        echo -e "${GREEN}1) 安装新实例${RESET}"
-        echo -e "${GREEN}2) 管理单个实例${RESET}"
-        echo -e "${GREEN}3) 查看所有实例状态${RESET}"
-        echo -e "${GREEN}4) 批量操作实例${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
-        case $choice in
-            1) install_instance ;;
-            2) instance_action ;;
-            3) show_all_status ;;
-            4) batch_action ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
-        esac
-    done
-}
-
-menu
+# ===============================
+# 菜单
+# ===============================
+while true; do
+    echo -e "${GREEN}===== 系统清理菜单 =====${RESET}"
+    echo -e "${GREEN}1) 系统清理${RESET}"
+    echo -e "${GREEN}2) 系统+Docker清理${RESET}"
+    echo -e "${GREEN}3) 定时自动清理${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    read -p "$(echo -e ${GREEN}选择操作: ${RESET})" choice
+    case $choice in
+        1)
+            clean_system
+            ;;
+        2)
+            clean_system
+            clean_docker
+            ;;
+        3)
+            bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/clean-server.sh)
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}无效选择${RESET}"
+            ;;
+    esac
+done

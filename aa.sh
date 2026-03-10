@@ -1,139 +1,92 @@
 #!/bin/bash
-# =========================================
-# 企业级系统清理脚本（兼容容器 + Docker + 自动处理 GRUB）
-# =========================================
+# ========================================
+# NextTrace 一键管理脚本（菜单版）
+# 首次运行自动安装
+# 支持移动 / 联通 / 电信大小包测试
+# ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-# 必须 root
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}请使用 root 运行此脚本！${RESET}"
-    exit 1
-fi
-
-# 等待 apt/dnf/yum 锁
-wait_for_lock() {
-    local cmd=$1
-    local lock_file=$2
-    while fuser $lock_file >/dev/null 2>&1; do
-        echo -e "${YELLOW}等待其他 $cmd 进程完成...${RESET}"
-        sleep 2
-    done
-}
-
-# 检查容器环境
-IS_CONTAINER=0
-if systemd-detect-virt --quiet; then
-    IS_CONTAINER=1
-fi
-
-# 显示磁盘空间
-df -h / | tail -n +2 | while read fs size used avail usep mount; do
-    use_percent=${usep%\%}
-    if [ "$use_percent" -lt 60 ]; then
-        color=$GREEN
-    elif [ "$use_percent" -lt 80 ]; then
-        color=$YELLOW
-    else
-        color=$RED
-    fi
-    echo -e "${YELLOW}磁盘空间:${RESET} ${color}$usep${RESET} ${YELLOW}已使用 (挂载点: $mount, 总大小: $size, 可用: $avail)${RESET}"
-done
-
-# ===============================
-# 系统清理
-# ===============================
-clean_system() {
-    # 避免 grub-pc 弹出交互界面
-    export DEBIAN_FRONTEND=noninteractive
-
-    if command -v apt &>/dev/null; then
-        echo -e "${GREEN}检测到 APT 系统${RESET}"
-        wait_for_lock "APT" /var/lib/dpkg/lock-frontend
-        apt update -y
-        wait_for_lock "APT" /var/lib/dpkg/lock-frontend
-        apt autoremove --purge -y
-        apt clean
-        apt autoclean
-        # 删除残留配置文件
-        dpkg -l | awk '/^rc/ {print $2}' | xargs -r apt purge -y
-        if [ "$IS_CONTAINER" -eq 0 ]; then
-            # 安全删除旧内核
-            CURRENT_KERNEL=$(uname -r)
-            dpkg --list | awk '/linux-image-[0-9]/ {print $2}' | grep -v "$CURRENT_KERNEL" | xargs -r apt purge -y
+# ==============================
+# 检查 NextTrace 是否安装
+# ==============================
+check_install() {
+    if ! command -v nexttrace >/dev/null 2>&1; then
+        echo -e "${YELLOW}NextTrace 未安装，正在安装...${RESET}"
+        curl -fsSL nxtrace.org/nt | bash
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}安装失败，请检查网络或手动安装 NextTrace${RESET}"
+            exit 1
         fi
-    elif command -v yum &>/dev/null; then
-        echo -e "${GREEN}检测到 YUM 系统${RESET}"
-        wait_for_lock "YUM" /var/run/yum.pid
-        yum autoremove -y
-        yum clean all
-        if [ "$IS_CONTAINER" -eq 0 ] && command -v package-cleanup &>/dev/null; then
-            package-cleanup --oldkernels --count=2 -y
-        fi
-    elif command -v dnf &>/dev/null; then
-        echo -e "${GREEN}检测到 DNF 系统${RESET}"
-        wait_for_lock "DNF" /var/run/dnf.pid
-        dnf autoremove -y
-        dnf clean all
-        if [ "$IS_CONTAINER" -eq 0 ]; then
-            dnf remove $(dnf repoquery --installonly --latest-limit=-2 -q) -y 2>/dev/null
-        fi
-    elif command -v apk &>/dev/null; then
-        echo -e "${GREEN}检测到 APK 系统${RESET}"
-        apk cache clean
+        echo -e "${GREEN}NextTrace 安装完成！${RESET}"
     else
-        echo -e "${RED}暂不支持你的系统！${RESET}"
-        exit 1
-    fi
-
-    # 清理日志（保留最近 7 天）
-    echo -e "${GREEN}清理日志文件（保留最近 7 天）...${RESET}"
-    journalctl --vacuum-time=7d
-
-    echo -e "${GREEN}系统清理完成！${RESET}"
-}
-
-# ===============================
-# Docker 清理
-# ===============================
-clean_docker() {
-    if command -v docker &>/dev/null; then
-        echo -e "${GREEN}清理 Docker 无用数据...${RESET}"
-        docker system prune -af --volumes
-    else
-        echo -e "${YELLOW}未检测到 Docker，跳过${RESET}"
+        echo -e "${GREEN}NextTrace 已安装${RESET}"
     fi
 }
 
-# ===============================
-# 菜单
-# ===============================
-while true; do
-    echo -e "${GREEN}===== 系统清理菜单 =====${RESET}"
-    echo -e "${GREEN}1) 系统清理${RESET}"
-    echo -e "${GREEN}2) 系统+Docker清理${RESET}"
-    echo -e "${GREEN}3) 定时自动清理${RESET}"
+# ==============================
+# 执行测试
+# 参数: $1=节点名称, $2=IP
+# ==============================
+run_test() {
+    local provider=$1
+    local ip=$2
+    echo -e "\n${YELLOW}=== 测试 ${provider} ===${RESET}"
+
+    echo "大包测试（1024K）："
+    route_big=$(nexttrace --tcp --psize 1024 "$ip" -p 80 | awk '/Hop/ {print $0}')
+    
+    echo "小包测试（12K）："
+    route_small=$(nexttrace --tcp --psize 12 "$ip" -p 80 | awk '/Hop/ {print $0}')
+
+    echo -e "\n${YELLOW}=== 路由对比 ===${RESET}"
+    diff_output=$(diff <(echo "$route_big") <(echo "$route_small"))
+    if [ -z "$diff_output" ]; then
+        echo -e "${GREEN}大小包路由一致 ✅${RESET}"
+    else
+        echo -e "${RED}大小包路由不一致 ❌${RESET}"
+        echo "$diff_output"
+    fi
+}
+
+# ==============================
+# 菜单函数
+# ==============================
+show_menu() {
+    echo -e "${GREEN}==== 大小包测试====${RESET}"
+    echo -e "${GREEN}1) 移动${RESET}"
+    echo -e "${GREEN}2) 联通${RESET}"
+    echo -e "${GREEN}3) 电信${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    read -p "$(echo -e ${GREEN}选择操作: ${RESET})" choice
+    read -rp $'\033[32m请选择测试节点: \033[0m' choice
+
     case $choice in
         1)
-            clean_system
+            run_test "深圳移动" "120.233.18.250"
             ;;
         2)
-            clean_system
-            clean_docker
+            run_test "广州联通" "157.148.58.29"
             ;;
         3)
-            bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/clean-server.sh)
+            run_test "广州电信" "14.116.225.60"
             ;;
         0)
             exit 0
             ;;
         *)
-            echo -e "${RED}无效选择${RESET}"
+            echo -e "${RED}无效选择，请重新输入${RESET}"
             ;;
     esac
+}
+
+# ==============================
+# 主程序
+# ==============================
+check_install
+
+while true; do
+    show_menu
 done

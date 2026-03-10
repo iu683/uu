@@ -100,7 +100,6 @@ install_app(){
 check_docker
 
 mkdir -p "$CONFIG_DIR"
-mkdir -p "$APP_DIR/web"
 
 read -p "请输入 Web 端口 [默认:8080]: " input_port
 PORT=${input_port:-8080}
@@ -184,8 +183,10 @@ services:
       - ./config:/app/etc
       - ./web:/app/static
     depends_on:
-      - mysql
-      - redis
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
 
   mysql:
     image: mysql:8
@@ -198,6 +199,11 @@ services:
       MYSQL_ROOT_PASSWORD: ${MYSQL_PASS}
     volumes:
       - ./mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_PASS}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   redis:
     image: redis:7
@@ -224,7 +230,7 @@ echo
 echo -e "${YELLOW}后台:${RESET}"
 echo -e "${YELLOW}http://${SERVER_IP}:${PORT}/admin${RESET}"
 echo
-echo -e "${YELLOW}安装目录:${RESET} $APP_DIR"
+echo -e "${YELLOW}安装目录: $APP_DIR${RESET}"
 
 read -p "按回车返回菜单..."
 

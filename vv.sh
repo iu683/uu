@@ -181,6 +181,7 @@ services:
       - "${PORT}:8080"
     volumes:
       - ./config:/app/etc
+      - ./web:/app/static
     depends_on:
       mysql:
         condition: service_healthy

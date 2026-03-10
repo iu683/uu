@@ -100,6 +100,7 @@ install_app(){
 check_docker
 
 mkdir -p "$CONFIG_DIR"
+mkdir -p "$APP_DIR/web"
 
 read -p "请输入 Web 端口 [默认:8080]: " input_port
 PORT=${input_port:-8080}
@@ -228,7 +229,10 @@ echo -e "${YELLOW}访问地址:${RESET}"
 echo -e "${YELLOW}http://${SERVER_IP}:${PORT}${RESET}"
 echo
 echo -e "${YELLOW}后台:${RESET}"
-echo -e "${YELLOW}http://${SERVER_IP}:${PORT}/admin${RESET}"
+echo -e "${YELLOW}http://${SERVER_IP}:${PORT}/admin/${RESET}"
+echo -e "${YELLOW}账号:admin@ppanel.dev${RESET}"
+echo -e "${YELLOW}密码:password${RESET}"
+
 echo
 echo -e "${YELLOW}安装目录: $APP_DIR${RESET}"
 

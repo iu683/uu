@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# PPanel + MySQL + Redis 一键管理脚本
+# Redis Docker 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,13 +8,12 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="ppanel"
+APP_NAME="redis"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_DIR="$APP_DIR/config"
 
 # ==============================
-# Docker 检测
+# Docker 检查
 # ==============================
 
 check_docker(){
@@ -33,8 +32,10 @@ fi
 
 check_port(){
 
-if ss -tlnp | grep -q ":$1 "; then
-echo -e "${RED}端口 $1 已被占用${RESET}"
+PORT=$1
+
+if ss -tuln | grep -q ":$PORT "; then
+echo -e "${RED}端口 $PORT 已被占用${RESET}"
 return 1
 fi
 
@@ -56,6 +57,25 @@ get_public_ip() {
 }
 
 # ==============================
+# Redis 启动检测
+# ==============================
+
+check_redis(){
+
+echo -e "${YELLOW}检测 Redis 是否启动...${RESET}"
+
+sleep 5
+
+if docker ps | grep -q redis-server; then
+echo -e "${GREEN}✅ Redis 启动成功${RESET}"
+else
+echo -e "${RED}❌ Redis 启动失败${RESET}"
+echo "查看日志: docker logs redis-server"
+fi
+
+}
+
+# ==============================
 # 菜单
 # ==============================
 
@@ -65,7 +85,7 @@ while true; do
 
 clear
 
-echo -e "${GREEN}===== PPanel 管理菜单 =====${RESET}"
+echo -e "${GREEN}====== Redis 管理菜单 ======${RESET}"
 echo -e "${GREEN}1) 安装启动${RESET}"
 echo -e "${GREEN}2) 重启${RESET}"
 echo -e "${GREEN}3) 更新${RESET}"
@@ -99,139 +119,40 @@ install_app(){
 
 check_docker
 
-mkdir -p "$CONFIG_DIR"
-mkdir -p "$APP_DIR/web"
+mkdir -p "$APP_DIR"
 
-read -p "请输入 Web 端口 [默认:8080]: " input_port
-PORT=${input_port:-8080}
+read -p "请输入 Redis 端口 [默认:6379]: " input_port
+PORT=${input_port:-6379}
 
 check_port "$PORT" || return
 
-read -p "MySQL 用户名 [默认:ppanel]: " MYSQL_USER
-MYSQL_USER=${MYSQL_USER:-ppanel}
-
-read -p "MySQL 密码 [默认:ppanel123]: " MYSQL_PASS
-MYSQL_PASS=${MYSQL_PASS:-ppanel123}
-
-read -p "Redis 密码 [默认:redis123]: " REDIS_PASS
+read -p "请输入 Redis 密码 [默认:redis123]: " REDIS_PASS
 REDIS_PASS=${REDIS_PASS:-redis123}
-
-# ======================
-# 生成配置
-# ======================
-
-SECRET=$(openssl rand -hex 16)
-
-cat > "$CONFIG_DIR/ppanel.yaml" <<EOF
-Host: 0.0.0.0
-Port: 8080
-
-TLS:
-  Enable: false
-  CertFile: ""
-  KeyFile: ""
-
-Debug: false
-
-Static:
-  Admin:
-    Enabled: true
-    Prefix: /admin
-    Path: ./static/admin
-  User:
-    Enabled: true
-    Prefix: /
-    Path: ./static/user
-
-JwtAuth:
-  AccessSecret: ${SECRET}
-  AccessExpire: 604800
-
-Logger:
-  ServiceName: ApiService
-  Mode: console
-  Encoding: plain
-  Path: logs
-  Level: info
-
-MySQL:
-  Addr: mysql:3306
-  Username: ${MYSQL_USER}
-  Password: ${MYSQL_PASS}
-  Dbname: ppanel
-  Config: charset=utf8mb4&parseTime=true&loc=Asia%2FShanghai
-
-Redis:
-  Host: redis:6379
-  Pass: ${REDIS_PASS}
-  DB: 0
-EOF
-
-# ======================
-# docker compose
-# ======================
 
 cat > "$COMPOSE_FILE" <<EOF
 services:
-
-  ppanel:
-    image: ppanel/ppanel:latest
-    container_name: ppanel
-    restart: always
-    ports:
-      - "${PORT}:8080"
-    volumes:
-      - ./config:/app/etc
-      - ./web:/app/static
-    depends_on:
-      mysql:
-        condition: service_healthy
-      redis:
-        condition: service_started
-
-  mysql:
-    image: mysql:8
-    container_name: ppanel-mysql
-    restart: always
-    environment:
-      MYSQL_DATABASE: ppanel
-      MYSQL_USER: ${MYSQL_USER}
-      MYSQL_PASSWORD: ${MYSQL_PASS}
-      MYSQL_ROOT_PASSWORD: ${MYSQL_PASS}
-    volumes:
-      - ./mysql:/var/lib/mysql
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_PASS}"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
   redis:
     image: redis:7
-    container_name: ppanel-redis
+    container_name: redis-server
     restart: always
+    ports:
+      - "${PORT}:6379"
     command: redis-server --requirepass ${REDIS_PASS}
     volumes:
-      - ./redis:/data
-
+      - ./data:/data
 EOF
 
 cd "$APP_DIR"
 
 docker compose up -d
 
-SERVER_IP=$(get_public_ip)
+check_redis
 
-
 echo
-echo -e "${GREEN}✅ PPanel 已安装完成${RESET}"
-echo -e "${YELLOW}访问地址:${RESET}"
-echo -e "${YELLOW}http://${SERVER_IP}:${PORT}${RESET}"
-echo
-echo -e "${YELLOW}后台:${RESET}"
-echo -e "${YELLOW}http://${SERVER_IP}:${PORT}/admin${RESET}"
-echo
-echo -e "${YELLOW}安装目录: $APP_DIR${RESET}"
+echo -e "${GREEN}✅ Redis 安装完成${RESET}"
+echo -e "${YELLOW}地址: ${SERVER_IP}:${PORT}${RESET}"
+echo -e "${YELLOW}密码: ${REDIS_PASS}${RESET}"
+echo -e "${YELLOW}目录: ${APP_DIR}${RESET}"
 
 read -p "按回车返回菜单..."
 
@@ -247,7 +168,7 @@ cd "$APP_DIR"
 
 docker compose restart
 
-echo -e "${GREEN}服务已重启${RESET}"
+echo -e "${GREEN}✅ Redis 已重启${RESET}"
 
 read -p "回车返回"
 
@@ -264,7 +185,7 @@ cd "$APP_DIR"
 docker compose pull
 docker compose up -d
 
-echo -e "${GREEN}更新完成${RESET}"
+echo -e "${GREEN}✅ Redis 更新完成${RESET}"
 
 read -p "回车返回"
 
@@ -276,7 +197,7 @@ read -p "回车返回"
 
 view_logs(){
 
-docker logs -f ppanel
+docker logs -f redis-server
 
 }
 
@@ -286,7 +207,7 @@ docker logs -f ppanel
 
 check_status(){
 
-docker ps | grep ppanel
+docker ps | grep redis-server
 
 read -p "回车返回"
 
@@ -304,7 +225,7 @@ docker compose down -v
 
 rm -rf "$APP_DIR"
 
-echo -e "${RED}PPanel 已彻底卸载${RESET}"
+echo -e "${RED}✅ Redis 已彻底卸载${RESET}"
 
 read -p "回车返回"
 

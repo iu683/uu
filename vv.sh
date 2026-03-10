@@ -1,17 +1,45 @@
 #!/bin/bash
+# ========================================
+# PPanel + MySQL + Redis 一键管理脚本
+# ========================================
 
-red() { echo -e "\e[1;91m$1\033[0m"; }
-green() { echo -e "\e[1;32m$1\033[0m"; }
-yellow() { echo -e "\e[1;33m$1\033[0m"; }
-purple() { echo -e "\e[1;35m$1\033[0m"; }
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-HOSTNAME=$(hostname)
-USERNAME=$(whoami | tr '[:upper:]' '[:lower:]')
-export SECRET=${SECRET:-$(echo -n "$USERNAME+$HOSTNAME" | md5sum | head -c 32)}
-WORKDIR="$HOME/mtp" && mkdir -p "$WORKDIR"
-pgrep -x mtg > /dev/null && pkill -9 mtg >/dev/null 2>&1
+APP_NAME="ppanel"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_DIR="$APP_DIR/config"
 
-# ==================== 获取公网 IP ====================
+# ==============================
+# Docker 检测
+# ==============================
+
+check_docker(){
+
+if ! command -v docker &>/dev/null; then
+echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+curl -fsSL https://get.docker.com | bash
+fi
+
+if ! docker compose version &>/dev/null; then
+echo -e "${RED}未检测到 Docker Compose v2${RESET}"
+exit 1
+fi
+
+}
+
+check_port(){
+
+if ss -tlnp | grep -q ":$1 "; then
+echo -e "${RED}端口 $1 已被占用${RESET}"
+return 1
+fi
+
+}
+
 get_public_ip() {
     local ip
     for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
@@ -27,156 +55,257 @@ get_public_ip() {
     echo "无法获取公网 IP 地址。"
 }
 
-# ==================== 检查/添加 TCP 端口 ====================
-check_port () {
-  port_list=$(devil port list)
-  tcp_ports=$(echo "$port_list" | grep -c "tcp")
-  udp_ports=$(echo "$port_list" | grep -c "udp")
+# ==============================
+# 菜单
+# ==============================
 
-  if [[ $tcp_ports -lt 1 ]]; then
-      red "没有可用的TCP端口,正在调整..."
+menu(){
 
-      if [[ $udp_ports -ge 3 ]]; then
-          udp_port_to_delete=$(echo "$port_list" | awk '/udp/ {print $1}' | head -n 1)
-          devil port del udp $udp_port_to_delete
-          green "已删除udp端口: $udp_port_to_delete"
-      fi
+while true; do
 
-      while true; do
-          tcp_port=$(shuf -i 10000-65535 -n 1)
-          result=$(devil port add tcp $tcp_port 2>&1)
-          if [[ $result == *"Ok"* ]]; then
-              green "已添加TCP端口: $tcp_port"
-              tcp_port1=$tcp_port
-              break
-          else
-              yellow "端口 $tcp_port 不可用，尝试其他端口..."
-          fi
-      done
-      
-  else
-      tcp_ports=$(echo "$port_list" | awk '/tcp/ {print $1}')
-      tcp_port1=$(echo "$tcp_ports" | sed -n '1p')
-  fi
-  devil binexec on >/dev/null 2>&1
-  MTP_PORT=$tcp_port1
-  green "使用 $MTP_PORT 作为TG代理端口"
+clear
+
+echo -e "${GREEN}===== PPanel 管理菜单 =====${RESET}"
+echo -e "${GREEN}1) 安装启动${RESET}"
+echo -e "${GREEN}2) 重启${RESET}"
+echo -e "${GREEN}3) 更新${RESET}"
+echo -e "${GREEN}4) 查看日志${RESET}"
+echo -e "${GREEN}5) 查看状态${RESET}"
+echo -e "${GREEN}6) 卸载${RESET}"
+echo -e "${GREEN}0) 退出${RESET}"
+
+read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+case $choice in
+1) install_app ;;
+2) restart_app ;;
+3) update_app ;;
+4) view_logs ;;
+5) check_status ;;
+6) uninstall_app ;;
+0) exit 0 ;;
+*) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
+esac
+
+done
+
 }
 
-# ==================== 获取 Devil Vhost IP ====================
-get_ip() {
-    IP_LIST=($(devil vhost list | awk '/^[0-9]+/ {print $1}'))
-    if [[ ${#IP_LIST[@]} -ge 1 ]]; then
-        IP1=${IP_LIST[0]}
-        IP2=${IP_LIST[1]:-}
-        IP3=${IP_LIST[2]:-}
-    else
-        red "没有可用的 IP，请检查 devil vhost"
-        exit 1
-    fi
-}
+# ==============================
+# 安装
+# ==============================
 
-# ==================== 下载并运行 mtg ====================
-download_run(){
-    if [ -e "${WORKDIR}/mtg" ]; then
-        cd ${WORKDIR} && chmod +x mtg
-        nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
-    else
-        mtg_url=""
-        wget -q -O "${WORKDIR}/mtg" "$mtg_url"
+install_app(){
 
-        if [ -e "${WORKDIR}/mtg" ]; then
-            cd ${WORKDIR} && chmod +x mtg
-            nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
-        fi        
-    fi
-}
+check_docker
 
-# ==================== 生成 TG 分享链接 ====================
-generate_info() {
-    purple "\n分享链接:\n"
-    LINKS=""
-    [[ -n "$IP1" ]] && LINKS+="tg://proxy?server=$IP1&port=$MTP_PORT&secret=$SECRET"
-    [[ -n "$IP2" ]] && LINKS+="\n\ntg://proxy?server=$IP2&port=$MTP_PORT&secret=$SECRET"
-    [[ -n "$IP3" ]] && LINKS+="\n\ntg://proxy?server=$IP3&port=$MTP_PORT&secret=$SECRET"
+mkdir -p "$CONFIG_DIR"
 
-    green "$LINKS\n"
-    echo -e "$LINKS" > $WORKDIR/link.txt
+read -p "请输入 Web 端口 [默认:8080]: " input_port
+PORT=${input_port:-8080}
 
-    cat > ${WORKDIR}/restart.sh <<EOF
-#!/bin/bash
-pkill mtg
-cd ${WORKDIR}
-nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
+check_port "$PORT" || return
+
+read -p "MySQL 用户名 [默认:ppanel]: " MYSQL_USER
+MYSQL_USER=${MYSQL_USER:-ppanel}
+
+read -p "MySQL 密码 [默认:ppanel123]: " MYSQL_PASS
+MYSQL_PASS=${MYSQL_PASS:-ppanel123}
+
+read -p "Redis 密码 [默认:redis123]: " REDIS_PASS
+REDIS_PASS=${REDIS_PASS:-redis123}
+
+# ======================
+# 生成配置
+# ======================
+
+SECRET=$(openssl rand -hex 16)
+
+cat > "$CONFIG_DIR/ppanel.yaml" <<EOF
+Host: 0.0.0.0
+Port: 8080
+
+TLS:
+  Enable: false
+  CertFile: ""
+  KeyFile: ""
+
+Debug: false
+
+Static:
+  Admin:
+    Enabled: true
+    Prefix: /admin
+    Path: ./static/admin
+  User:
+    Enabled: true
+    Prefix: /
+    Path: ./static/user
+
+JwtAuth:
+  AccessSecret: ${SECRET}
+  AccessExpire: 604800
+
+Logger:
+  ServiceName: ApiService
+  Mode: console
+  Encoding: plain
+  Path: logs
+  Level: info
+
+MySQL:
+  Addr: mysql:3306
+  Username: ${MYSQL_USER}
+  Password: ${MYSQL_PASS}
+  Dbname: ppanel
+  Config: charset=utf8mb4&parseTime=true&loc=Asia%2FShanghai
+
+Redis:
+  Host: redis:6379
+  Pass: ${REDIS_PASS}
+  DB: 0
 EOF
-}
 
-# ==================== Systemd ====================
-setup_systemd() {
-    SERVICE_FILE="/etc/systemd/system/mtp.service"
+# ======================
+# docker compose
+# ======================
 
-    sudo tee $SERVICE_FILE > /dev/null <<EOF
-[Unit]
-Description=MTProto Proxy Service
-After=network.target
+cat > "$COMPOSE_FILE" <<EOF
+services:
 
-[Service]
-Type=simple
-User=$USERNAME
-WorkingDirectory=$WORKDIR
-EnvironmentFile=$WORKDIR/env.conf
-ExecStart=$WORKDIR/mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT
-Restart=always
-RestartSec=5
+  ppanel:
+    image: ppanel/ppanel:latest
+    container_name: ppanel
+    restart: always
+    ports:
+      - "${PORT}:8080"
+    volumes:
+      - ./config:/app/etc
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
 
-[Install]
-WantedBy=multi-user.target
+  mysql:
+    image: mysql:8
+    container_name: ppanel-mysql
+    restart: always
+    environment:
+      MYSQL_DATABASE: ppanel
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASS}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASS}
+    volumes:
+      - ./mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_PASS}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    container_name: ppanel-redis
+    restart: always
+    command: redis-server --requirepass ${REDIS_PASS}
+    volumes:
+      - ./redis:/data
+
 EOF
 
-    sudo systemctl daemon-reload
-    sudo systemctl enable mtp.service
-    sudo systemctl start mtp.service
-    green "✅ systemd 服务已创建并启动，MTProto 将开机自启"
+cd "$APP_DIR"
+
+docker compose up -d
+
+SERVER_IP=$(get_public_ip)
+
+
+echo
+echo -e "${GREEN}✅ PPanel 已安装完成${RESET}"
+echo -e "${YELLOW}访问地址:${RESET}"
+echo -e "${YELLOW}http://${SERVER_IP}:${PORT}${RESET}"
+echo
+echo -e "${YELLOW}后台:${RESET}"
+echo -e "${YELLOW}http://${SERVER_IP}:${PORT}/admin${RESET}"
+echo
+echo -e "${YELLOW}安装目录: $APP_DIR${RESET}"
+
+read -p "按回车返回菜单..."
+
 }
 
-# ==================== 安装主流程 ====================
-install(){
-    read -rp "请输入自定义端口（留空使用默认随机端口）: " CUSTOM_PORT
+# ==============================
+# 重启
+# ==============================
 
-    purple "正在安装...\n"
+restart_app(){
 
-    if [[ "$HOSTNAME" =~ mtp ]]; then
-        if [[ -n "$CUSTOM_PORT" ]]; then
-            MTP_PORT=$CUSTOM_PORT
-            green "使用自定义端口: $MTP_PORT"
-        else
-            check_port
-        fi
+cd "$APP_DIR"
 
-        get_ip
-        download_run
-        generate_info
+docker compose restart
 
-        # 创建环境文件
-        ENV_FILE="$WORKDIR/env.conf"
-        cat > "$ENV_FILE" <<EOF
-MTP_PORT=$MTP_PORT
-SECRET=$SECRET
-EOF
-        green "✅ 环境文件已生成: $ENV_FILE"
-    else
-        if [[ -n "$CUSTOM_PORT" ]]; then
-            PORT=$CUSTOM_PORT
-            MTP_PORT=$(($PORT + 1))
-            green "使用自定义端口: $PORT (MTP_PORT=$MTP_PORT)"
-            download_mtg
-        else
-            download_mtg
-        fi
-    fi
+echo -e "${GREEN}服务已重启${RESET}"
 
-    # 自动创建 systemd 服务
-    setup_systemd
+read -p "回车返回"
+
 }
 
-install
+# ==============================
+# 更新
+# ==============================
+
+update_app(){
+
+cd "$APP_DIR"
+
+docker compose pull
+docker compose up -d
+
+echo -e "${GREEN}更新完成${RESET}"
+
+read -p "回车返回"
+
+}
+
+# ==============================
+# 日志
+# ==============================
+
+view_logs(){
+
+docker logs -f ppanel
+
+}
+
+# ==============================
+# 状态
+# ==============================
+
+check_status(){
+
+docker ps | grep ppanel
+
+read -p "回车返回"
+
+}
+
+# ==============================
+# 卸载
+# ==============================
+
+uninstall_app(){
+
+cd "$APP_DIR"
+
+docker compose down -v
+
+rm -rf "$APP_DIR"
+
+echo -e "${RED}PPanel 已彻底卸载${RESET}"
+
+read -p "回车返回"
+
+}
+
+menu

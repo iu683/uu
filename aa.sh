@@ -59,36 +59,29 @@ function install_app() {
     ADMIN_ACCOUNT=${input_admin:-admin@demo.com}
 
     cd "$APP_DIR" || exit
-
     if [ ! -d "$APP_DIR/.git" ]; then
-        git clone -b compose --depth 1 https://github.com/cedar2025/Xboard "$APP_DIR"
+        git clone --depth 1 https://github.com/cedar2025/Xboard "$APP_DIR"
     fi
 
-    echo -e "${GREEN}=== 启动 Redis ===${RESET}"
-    docker compose up -d redis
-
-    echo -e "${GREEN}等待 Redis 启动...${RESET}"
-    sleep 6
-
     echo -e "${GREEN}=== 初始化数据库 ===${RESET}"
-    docker compose run --rm \
+    docker compose run -it --rm \
         -e ENABLE_SQLITE=true \
-        -e ENABLE_REDIS=true \
+        -e ENABLE_REDIS=false \
         -e ADMIN_ACCOUNT="$ADMIN_ACCOUNT" \
         web php artisan xboard:install
 
-    echo -e "${GREEN}=== 启动 Xboard 服务 ===${RESET}"
+    echo -e "${GREEN}=== 启动服务 ===${RESET}"
     docker compose up -d
 
     SERVER_IP=$(get_public_ip)
 
     echo -e "${GREEN}✅ Xboard 已安装并启动${RESET}"
     echo -e "${YELLOW}🌐 管理员账号: $ADMIN_ACCOUNT${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://${SERVER_IP}:7001${RESET}"
-
+    echo -e "${YELLOW}🌐 访问地址:http://${SERVER_IP}:7001${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
+
 function update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
     git pull

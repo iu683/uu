@@ -71,9 +71,9 @@ install_instance() {
     PANEL_TYPE=${PANEL_TYPE:-xboard}
     read -p "请输入 Server 类型 [默认:vless]: " SERVER_TYPE
     SERVER_TYPE=${SERVER_TYPE:-vless}
-    read -p "请输入 Node ID: " NODE_ID
-    read -p "请输入 Panel URL: " PANEL_URL
-    read -p "请输入 Panel Key: " PANEL_KEY
+    read -p "请输入 Node ID(节点ID): " NODE_ID
+    read -p "请输入 Panel URL(面板网址): " PANEL_URL
+    read -p "请输入 Panel Key(节点密钥): " PANEL_KEY
 
     cat > "$INSTANCE_DIR/docker-compose.yml" <<EOF
 services:
@@ -104,27 +104,31 @@ EOF
 instance_action() {
     select_instance || return
     while true; do
-        echo -e "${GREEN}=== 实例 [$INSTANCE] 管理 ===${RESET}"
-        echo -e "${GREEN}1) 启动${RESET}"
-        echo -e "${GREEN}2) 重启${RESET}"
-        echo -e "${GREEN}3) 更新${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 卸载${RESET}"
-        echo -e "${GREEN}0) 返回${RESET}"
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
+    echo -e "${GREEN}=== 实例 [$INSTANCE] 管理 ===${RESET}"
+    echo -e "${GREEN}1) 启动${RESET}"
+    echo -e "${GREEN}2) 暂停${RESET}"       # 新增暂停
+    echo -e "${GREEN}3) 重启${RESET}"
+    echo -e "${GREEN}4) 更新${RESET}"
+    echo -e "${GREEN}5) 查看日志${RESET}"
+    echo -e "${GREEN}6) 卸载${RESET}"
+    echo -e "${GREEN}0) 返回${RESET}"
+    read -r -p $'\033[32m请选择操作: \033[0m' choice
 
-        cd "$INSTANCE_DIR" || break
-        case $choice in
-            1) docker compose up -d ;;
-            2) docker restart heki_${INSTANCE} ;;
-            3) docker compose pull && docker compose up -d ;;
-            4) docker logs -f heki_${INSTANCE} ;;
-            5) docker compose down && rm -rf "$INSTANCE_DIR" && break ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-    done
+    cd "$INSTANCE_DIR" || break
+    case $choice in
+        1) docker compose up -d ;;
+        2) docker stop heki_${INSTANCE} ;;       # 暂停容器
+        3) docker restart heki_${INSTANCE} ;;
+        4) docker compose pull && docker compose up -d ;;
+        5) docker logs -f heki_${INSTANCE} ;;
+        6) docker compose down && rm -rf "$INSTANCE_DIR" && break ;;
+        0) break ;;
+        *) echo -e "${RED}无效选择${RESET}" ;;
+    esac
+done
 }
+
+
 
 # ==============================
 # 查看所有实例状态
@@ -135,7 +139,7 @@ show_all_status() {
         [ -d "$inst" ] || continue
         NAME=$(basename "$inst")
         STATUS=$(docker ps --format '{{.Names}}' | grep -q "^heki_$NAME$" && echo "运行中" || echo "已停止")
-        echo -e "${YELLOW}$NAME${RESET} | 状态: $STATUS"
+        echo -e "${YELLOW}$NAME${RESET} ${YELLOW}| 状态: $STATUS${RESET}"
     done
     read -p "按回车返回菜单..."
 }
@@ -143,12 +147,9 @@ show_all_status() {
 # ==============================
 # 批量操作实例
 # ==============================
-# ==============================
-# 批量操作实例
-# ==============================
 batch_action() {
     list_instances
-    echo -e "${GREEN}0) 返回菜单${RESET}"   # 新增返回选项
+    echo -e "${GREEN}0) 返回菜单${RESET}"  
     read -r -p $'\033[32m请输入要操作的实例编号(空格分隔，或 all 全选): \033[0m' input
     [[ "$input" == "0" ]] && return    # 如果输入0，直接返回菜单
 
@@ -164,17 +165,18 @@ batch_action() {
 
     [ ${#SELECTED[@]} -eq 0 ] && { echo -e "${YELLOW}没有有效节点${RESET}"; sleep 1; return; }
 
-    read -r -p "选择操作: 1) 启动 2) 重启 3) 更新 4) 卸载 0) 返回: " action
-    [[ "$action" == "0" ]] && return   # 新增操作取消返回
+    read -r -p "选择操作: 1) 启动 2) 暂停 3) 重启 4) 更新 5) 卸载 0) 返回: " action
+    [[ "$action" == "0" ]] && return  
 
     for INSTANCE in "${SELECTED[@]}"; do
         INSTANCE_DIR="$APP_BASE_DIR/$INSTANCE"
         cd "$INSTANCE_DIR" || continue
         case "$action" in
             1) docker compose up -d ;;
-            2) docker restart heki_${INSTANCE} ;;
-            3) docker compose pull && docker compose up -d ;;
-            4) docker compose down && rm -rf "$INSTANCE_DIR" ;;
+            2) docker stop heki_${INSTANCE} ;;  
+            3) docker restart heki_${INSTANCE} ;;
+            4) docker compose pull && docker compose up -d ;;
+            5) docker compose down && rm -rf "$INSTANCE_DIR" ;;
             *) echo -e "${RED}无效操作${RESET}" ;;
         esac
         echo -e "${GREEN}✅ 实例 $INSTANCE 操作完成${RESET}"

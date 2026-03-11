@@ -1,159 +1,231 @@
 #!/bin/bash
-# ========================================
-# Navigation Docker 一键管理脚本
-# ========================================
+
+APP_DIR="/root"
+CONFIG="$APP_DIR/jcqd.json"
+SCRIPT="$APP_DIR/jcqd_run.sh"
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="navigation"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-
-# ==============================
-# 检查 Docker
-# ==============================
-check_docker(){
-  if ! command -v docker &>/dev/null; then
-    echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-    curl -fsSL https://get.docker.com | bash
-  fi
-  if ! docker compose version &>/dev/null; then
-    echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-    exit 1
-  fi
+init_config(){
+if [ ! -f "$CONFIG" ]; then
+echo '{"accounts":[],"tg":{}}' > $CONFIG
+fi
 }
 
-check_port(){
-  PORT=$1
-  if ss -tuln | grep -q ":$PORT "; then
-    echo -e "${RED}端口 $PORT 已被占用${RESET}"
-    return 1
-  fi
+pause(){
+read -rp "按回车返回菜单..."
 }
 
-check_container(){
-  sleep 5
-  if docker ps | grep -q navigation; then
-    echo -e "${GREEN}✅ Navigation 启动成功${RESET}"
-  else
-    echo -e "${RED}❌ Navigation 启动失败${RESET}"
-    echo "查看日志: docker logs navigation"
-  fi
-}
+install_run_script(){
 
-# ==============================
-# 菜单
-# ==============================
-menu(){
-while true; do
-clear
-echo -e "${GREEN}===== Navigation 管理菜单 =====${RESET}"
-echo -e "${GREEN}1) 安装启动${RESET}"
-echo -e "${GREEN}2) 重启${RESET}"
-echo -e "${GREEN}3) 更新${RESET}"
-echo -e "${GREEN}4) 查看日志${RESET}"
-echo -e "${GREEN}5) 查看状态${RESET}"
-echo -e "${GREEN}6) 卸载${RESET}"
-echo -e "${GREEN}0) 退出${RESET}"
+cat > $SCRIPT << 'EOF'
+#!/bin/bash
 
-read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-case $choice in
-1) install_app ;;
-2) restart_app ;;
-3) update_app ;;
-4) view_logs ;;
-5) check_status ;;
-6) uninstall_app ;;
-0) exit 0 ;;
-*) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
-esac
+CONFIG="/root/jcqd.json"
+
+BotToken=$(jq -r '.tg.BotToken // empty' $CONFIG)
+ChatID=$(jq -r '.tg.ChatID // empty' $CONFIG)
+
+TIME=$(date "+%Y-%m-%d %H:%M:%S")
+
+result="🚀 机场签到报告
+时间: $TIME
+"
+
+count=$(jq '.accounts | length' $CONFIG)
+
+for ((i=0;i<count;i++))
+do
+
+domain=$(jq -r ".accounts[$i].domain" $CONFIG)
+user=$(jq -r ".accounts[$i].user" $CONFIG)
+pass=$(jq -r ".accounts[$i].pass" $CONFIG)
+
+cookie=$(mktemp)
+
+login=$(curl -s -c "$cookie" \
+-H "Content-Type: application/json" \
+-X POST \
+-d "{\"email\":\"$user\",\"passwd\":\"$pass\",\"remember_me\":\"on\"}" \
+"$domain/auth/login")
+
+ret=$(echo "$login" | grep -o '"ret":[0-9]' | cut -d: -f2)
+
+if [ "$ret" != "1" ]; then
+msg="登录失败"
+else
+
+checkin=$(curl -s -b "$cookie" -X POST "$domain/user/checkin")
+
+msg=$(echo "$checkin" | sed -n 's/.*"msg":"\([^"]*\)".*/\1/p')
+msg=$(printf "%b" "$(echo "$msg" | sed 's/\\u/\\U/g')")
+msg=$(echo "$msg" | head -n1)
+
+fi
+
+result="$result
+🌐 $domain
+👤 $user
+$msg
+"
+
+rm -f "$cookie"
+
 done
-}
 
-# ==============================
-# 安装
-# ==============================
-install_app(){
-check_docker
+echo "$result"
 
-mkdir -p "$APP_DIR"
+if [ -n "$BotToken" ] && [ -n "$ChatID" ]; then
 
-read -p "请输入 Web 访问端口 [默认:8080]: " input_port
-PORT=${input_port:-8080}
+tg_msg=$(printf "%s" "$result" | sed ':a;N;$!ba;s/\n/%0A/g')
 
-check_port "$PORT" || return
+curl -s \
+"https://api.telegram.org/bot$BotToken/sendMessage?chat_id=$ChatID&text=$tg_msg" \
+> /dev/null
 
-cat > "$COMPOSE_FILE" <<EOF
-services:
-  navigation:
-    image: ghcr.io/csvkse/navigation:latest
-    container_name: navigation
-    restart: always
-    ports:
-      - "127.0.0.1:${PORT}:8080"
+fi
+
 EOF
 
-cd "$APP_DIR"
-docker compose up -d
+chmod +x $SCRIPT
 
-check_container
-
-echo
-echo -e "${GREEN}✅ Navigation 安装完成${RESET}"
-echo -e "${YELLOW}访问地址: http://127.0.0.1:${PORT}${RESET}"
-echo -e "${YELLOW}安装目录: $APP_DIR${RESET}"
-
-read -p "按回车返回菜单..."
 }
 
-# ==============================
-# 重启
-# ==============================
-restart_app(){
-cd "$APP_DIR"
-docker compose restart
-check_container
-read -p "回车返回"
+add_account(){
+
+read -rp "机场域名: " domain
+read -rp "邮箱: " user
+read -rp "密码: " pass
+
+tmp=$(mktemp)
+
+jq ".accounts += [{\"domain\":\"$domain\",\"user\":\"$user\",\"pass\":\"$pass\"}]" $CONFIG > $tmp
+
+mv $tmp $CONFIG
+
+echo -e "${GREEN}添加成功${RESET}"
+
 }
 
-# ==============================
-# 更新
-# ==============================
-update_app(){
-cd "$APP_DIR"
-docker compose pull
-docker compose up -d
-echo -e "${GREEN}✅ Navigation 更新完成${RESET}"
-read -p "回车返回"
+list_accounts(){
+
+jq -r '.accounts[] | "🌐 \(.domain) | 👤 \(.user)"' $CONFIG
+
 }
 
-# ==============================
-# 日志
-# ==============================
-view_logs(){
-docker logs -f navigation
+delete_account(){
+
+list_accounts
+
+read -rp "删除第几个: " id
+
+tmp=$(mktemp)
+
+jq "del(.accounts[$((id-1))])" $CONFIG > $tmp
+
+mv $tmp $CONFIG
+
+echo -e "${GREEN}删除成功${RESET}"
+
 }
 
-# ==============================
-# 状态
-# ==============================
-check_status(){
-docker ps | grep navigation
-read -p "回车返回"
+set_tg(){
+
+read -rp "BotToken: " token
+read -rp "ChatID: " chat
+
+tmp=$(mktemp)
+
+jq ".tg.BotToken=\"$token\" | .tg.ChatID=\"$chat\"" $CONFIG > $tmp
+
+mv $tmp $CONFIG
+
+echo -e "${GREEN}TG设置完成${RESET}"
+
 }
 
-# ==============================
-# 卸载
-# ==============================
-uninstall_app(){
-cd "$APP_DIR"
-docker compose down -v
-rm -rf "$APP_DIR"
-echo -e "${RED}✅ Navigation 已彻底卸载${RESET}"
-read -p "回车返回"
+set_cron(){
+
+echo -e "${GREEN}默认时间：每天 0 点${RESET}"
+
+read -rp "自定义cron时间(直接回车默认): " cron
+
+if [ -z "$cron" ]; then
+cron="0 0 * * *"
+fi
+
+(crontab -l 2>/dev/null | grep -v jcqd_run.sh ; echo "$cron bash $SCRIPT") | crontab -
+
+echo -e "${GREEN}定时任务已设置: $cron${RESET}"
+
 }
 
+remove_cron(){
+
+crontab -l 2>/dev/null | grep -v jcqd_run.sh | crontab -
+
+echo -e "${GREEN}定时任务已删除${RESET}"
+
+}
+
+uninstall(){
+
+remove_cron
+
+rm -f $SCRIPT
+rm -f $CONFIG
+rm -f /root/jcqd-manager.sh
+
+echo -e "${GREEN}脚本已卸载${RESET}"
+
+exit
+}
+
+menu(){
+  
+clear
+echo -e "${GREEN}===== 机场签到管理菜单 =====${RESET}"
+echo -e "${GREEN}1) 添加机场${RESET}"
+echo -e "${GREEN}2) 删除机场${RESET}"
+echo -e "${GREEN}3) 查看机场${RESET}"
+echo -e "${GREEN}4) 设置TG推送${RESET}"
+echo -e "${GREEN}5) 立即签到${RESET}"
+echo -e "${GREEN}6) 设置定时任务${RESET}"
+echo -e "${GREEN}7) 删除定时任务${RESET}"
+echo -e "${GREEN}8) 卸载脚本${RESET}"
+echo -e "${GREEN}0) 退出${RESET}"
+echo -ne "${GREEN}请选择:${RESET} "
+read num
+
+case "$num" in
+
+1) add_account ; pause ;;
+2) delete_account ; pause ;;
+3) list_accounts ; pause ;;
+4) set_tg ; pause ;;
+5) bash $SCRIPT ; pause ;;
+6) set_cron ; pause ;;
+7) remove_cron ; pause ;;
+8) uninstall ;;
+0) exit ;;
+
+esac
+
+}
+
+init_config
+
+if ! command -v jq >/dev/null 2>&1; then
+apt update -y >/dev/null 2>&1
+apt install jq -y
+fi
+
+if [ ! -f "$SCRIPT" ]; then
+install_run_script
+fi
+
+while true
+do
 menu
+done

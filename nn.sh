@@ -1,231 +1,164 @@
 #!/bin/bash
-
-APP_DIR="/root"
-CONFIG="$APP_DIR/jcqd.json"
-SCRIPT="$APP_DIR/jcqd_run.sh"
+# ========================================
+# Emby Pulse 一键管理脚本
+# ========================================
 
 GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-init_config(){
-if [ ! -f "$CONFIG" ]; then
-echo '{"accounts":[],"tg":{}}' > $CONFIG
-fi
+APP_NAME="emby-pulse"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_DIR="$APP_DIR/config"
+
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
+    fi
 }
 
-pause(){
-read -rp "按回车返回菜单..."
+# 获取服务器IP
+SERVER_IP=$(hostname -I | awk '{print $1}')
+
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== Emby Pulse 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
 }
 
-install_run_script(){
+install_app() {
+    check_docker
 
-cat > $SCRIPT << 'EOF'
-#!/bin/bash
+    # 创建目录
+    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$APP_DIR/static/img"
 
-CONFIG="/root/jcqd.json"
+    # 已安装检测
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
 
-BotToken=$(jq -r '.tg.BotToken // empty' $CONFIG)
-ChatID=$(jq -r '.tg.ChatID // empty' $CONFIG)
+    # 1️⃣ 时区
+    read -p "请输入时区 [默认:Asia/Shanghai]: " input_tz
+    TZ=${input_tz:-Asia/Shanghai}
 
-TIME=$(date "+%Y-%m-%d %H:%M:%S")
+    # 2️⃣ Emby 主机地址
+    read -p "请输入 Emby 主机地址 [例如:http://192.168.31.2:8096]: " input_host
+    EMBY_HOST=${input_host:-http://192.168.31.2:8096}
 
-result="🚀 机场签到报告
-时间: $TIME
-"
+    # 3️⃣ Emby API Key
+    read -p "请输入 Emby API Key [例如:xxxxxxxxxxxxxxxxx]: " input_key
+    EMBY_API_KEY=${input_key:-xxxxxxxxxxxxxxxxx}
 
-count=$(jq '.accounts | length' $CONFIG)
+    # 4️⃣ 可选数据库路径
+    read -p "请输入数据库宿主机路径（可选，直接回车跳过）: " input_db_host
+    DB_HOST_PATH=${input_db_host}
+    read -p "请输入数据库容器路径（可选，直接回车跳过）: " input_db_container
+    DB_CONTAINER_PATH=${input_db_container}
 
-for ((i=0;i<count;i++))
-do
+    # 5️⃣ 宿主机端口
+    read -p "请输入 Emby Pulse WebUI 宿主机端口 [默认:10307]: " input_port
+    HOST_PORT=${input_port:-10307}
+    CONTAINER_PORT=10307
 
-domain=$(jq -r ".accounts[$i].domain" $CONFIG)
-user=$(jq -r ".accounts[$i].user" $CONFIG)
-pass=$(jq -r ".accounts[$i].pass" $CONFIG)
+    # 构建 volumes 列表
+    VOLUMES="      - ./config:/app/config"  # 默认 config 挂载
+    if [ -n "$DB_HOST_PATH" ] && [ -n "$DB_CONTAINER_PATH" ]; then
+        VOLUMES="      - ${DB_HOST_PATH}:${DB_CONTAINER_PATH}
+$VOLUMES"
+    fi
 
-cookie=$(mktemp)
-
-login=$(curl -s -c "$cookie" \
--H "Content-Type: application/json" \
--X POST \
--d "{\"email\":\"$user\",\"passwd\":\"$pass\",\"remember_me\":\"on\"}" \
-"$domain/auth/login")
-
-ret=$(echo "$login" | grep -o '"ret":[0-9]' | cut -d: -f2)
-
-if [ "$ret" != "1" ]; then
-msg="登录失败"
-else
-
-checkin=$(curl -s -b "$cookie" -X POST "$domain/user/checkin")
-
-msg=$(echo "$checkin" | sed -n 's/.*"msg":"\([^"]*\)".*/\1/p')
-msg=$(printf "%b" "$(echo "$msg" | sed 's/\\u/\\U/g')")
-msg=$(echo "$msg" | head -n1)
-
-fi
-
-result="$result
-🌐 $domain
-👤 $user
-$msg
-"
-
-rm -f "$cookie"
-
-done
-
-echo "$result"
-
-if [ -n "$BotToken" ] && [ -n "$ChatID" ]; then
-
-tg_msg=$(printf "%s" "$result" | sed ':a;N;$!ba;s/\n/%0A/g')
-
-curl -s \
-"https://api.telegram.org/bot$BotToken/sendMessage?chat_id=$ChatID&text=$tg_msg" \
-> /dev/null
-
-fi
-
+    # 写入 docker-compose.yml
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  emby-pulse:
+    image: zeyu8023/emby-stats:latest
+    container_name: emby-pulse
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT}:${CONTAINER_PORT}"
+    volumes:
+$VOLUMES
+    environment:
+      - TZ="${TZ}"
+      - EMBY_HOST="${EMBY_HOST}"
+      - EMBY_API_KEY="${EMBY_API_KEY}"
 EOF
 
-chmod +x $SCRIPT
+    # 启动容器
+    cd "$APP_DIR" || exit
+    docker compose up -d
 
+    # 获取本机 IP
+    SERVER_IP=$(hostname -I | awk '{print $1}')
+
+    echo
+    echo -e "${GREEN}✅ Emby Pulse 已启动${RESET}"
+    echo -e "${GREEN}✅ WebUI: http://${SERVER_IP}:${HOST_PORT}${RESET}"
+    echo -e "${GREEN}✅ 默认账号密码: 使用您的 Emby 管理员账号登录${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-add_account(){
-
-read -rp "机场域名: " domain
-read -rp "邮箱: " user
-read -rp "密码: " pass
-
-tmp=$(mktemp)
-
-jq ".accounts += [{\"domain\":\"$domain\",\"user\":\"$user\",\"pass\":\"$pass\"}]" $CONFIG > $tmp
-
-mv $tmp $CONFIG
-
-echo -e "${GREEN}添加成功${RESET}"
-
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ Emby Pulse 更新完成${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-list_accounts(){
-
-jq -r '.accounts[] | "🌐 \(.domain) | 👤 \(.user)"' $CONFIG
-
+restart_app() {
+    docker restart emby-pulse
+    echo -e "${GREEN}✅ Emby Pulse 已重启${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-delete_account(){
-
-list_accounts
-
-read -rp "删除第几个: " id
-
-tmp=$(mktemp)
-
-jq "del(.accounts[$((id-1))])" $CONFIG > $tmp
-
-mv $tmp $CONFIG
-
-echo -e "${GREEN}删除成功${RESET}"
-
+view_logs() {
+    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
+    docker logs -f emby-pulse
 }
 
-set_tg(){
-
-read -rp "BotToken: " token
-read -rp "ChatID: " chat
-
-tmp=$(mktemp)
-
-jq ".tg.BotToken=\"$token\" | .tg.ChatID=\"$chat\"" $CONFIG > $tmp
-
-mv $tmp $CONFIG
-
-echo -e "${GREEN}TG设置完成${RESET}"
-
+check_status() {
+    docker ps | grep emby-pulse
+    read -p "按回车返回菜单..."
 }
 
-set_cron(){
-
-echo -e "${GREEN}默认时间：每天 0 点${RESET}"
-
-read -rp "自定义cron时间(直接回车默认): " cron
-
-if [ -z "$cron" ]; then
-cron="0 0 * * *"
-fi
-
-(crontab -l 2>/dev/null | grep -v jcqd_run.sh ; echo "$cron bash $SCRIPT") | crontab -
-
-echo -e "${GREEN}定时任务已设置: $cron${RESET}"
-
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ Emby Pulse 已卸载${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-remove_cron(){
-
-crontab -l 2>/dev/null | grep -v jcqd_run.sh | crontab -
-
-echo -e "${GREEN}定时任务已删除${RESET}"
-
-}
-
-uninstall(){
-
-remove_cron
-
-rm -f $SCRIPT
-rm -f $CONFIG
-rm -f /root/jcqd-manager.sh
-
-echo -e "${GREEN}脚本已卸载${RESET}"
-
-exit
-}
-
-menu(){
-  
-clear
-echo -e "${GREEN}===== 机场签到管理菜单 =====${RESET}"
-echo -e "${GREEN}1) 添加机场${RESET}"
-echo -e "${GREEN}2) 删除机场${RESET}"
-echo -e "${GREEN}3) 查看机场${RESET}"
-echo -e "${GREEN}4) 设置TG推送${RESET}"
-echo -e "${GREEN}5) 立即签到${RESET}"
-echo -e "${GREEN}6) 设置定时任务${RESET}"
-echo -e "${GREEN}7) 删除定时任务${RESET}"
-echo -e "${GREEN}8) 卸载脚本${RESET}"
-echo -e "${GREEN}0) 退出${RESET}"
-echo -ne "${GREEN}请选择:${RESET} "
-read num
-
-case "$num" in
-
-1) add_account ; pause ;;
-2) delete_account ; pause ;;
-3) list_accounts ; pause ;;
-4) set_tg ; pause ;;
-5) bash $SCRIPT ; pause ;;
-6) set_cron ; pause ;;
-7) remove_cron ; pause ;;
-8) uninstall ;;
-0) exit ;;
-
-esac
-
-}
-
-init_config
-
-if ! command -v jq >/dev/null 2>&1; then
-apt update -y >/dev/null 2>&1
-apt install jq -y
-fi
-
-if [ ! -f "$SCRIPT" ]; then
-install_run_script
-fi
-
-while true
-do
 menu
-done

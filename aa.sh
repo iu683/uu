@@ -55,47 +55,52 @@ menu() {
 
 install_app() {
     check_docker
+
+    # 创建目录
     mkdir -p "$CONFIG_DIR"
     mkdir -p "$APP_DIR/static/img"
 
+    # 已安装检测
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
         read confirm
         [[ "$confirm" != "y" ]] && return
     fi
 
+    # 1️⃣ 时区
     read -p "请输入时区 [默认:Asia/Shanghai]: " input_tz
     TZ=${input_tz:-Asia/Shanghai}
 
+    # 2️⃣ Emby 主机地址
     read -p "请输入 Emby 主机地址 [例如:http://192.168.31.2:8096]: " input_host
     EMBY_HOST=${input_host:-http://192.168.31.2:8096}
 
+    # 3️⃣ Emby API Key
     read -p "请输入 Emby API Key [例如:xxxxxxxxxxxxxxxxx]: " input_key
     EMBY_API_KEY=${input_key:-xxxxxxxxxxxxxxxxx}
 
-    # 可选数据库宿主机路径
-    read -p "请输入数据库宿主机路径（可选，直接回车跳过）: " input_db_host
+    # 4️⃣ 可选数据库路径
+    read -p "请输入数据库宿主机路径（可选，API模式可不填）: " input_db_host
     DB_HOST_PATH=${input_db_host}
-
-    # 可选数据库容器路径
-    read -p "请输入数据库容器路径（可选，直接回车跳过）: " input_db_container
+    read -p "请输入数据库容器路径（可选，API模式可不填）: " input_db_container
     DB_CONTAINER_PATH=${input_db_container}
 
-    # 自定义宿主机端口
+    # 5️⃣ 宿主机端口
     read -p "请输入 Emby Pulse WebUI 宿主机端口 [默认:10307]: " input_port
     HOST_PORT=${input_port:-10307}
-    CONTAINER_PORT=10307  # 镜像内固定端口
+    CONTAINER_PORT=10307
 
-    # 构建 volumes 部分
-    VOLUMES=""
-    [ -n "$DB_HOST_PATH" ] && [ -n "$DB_CONTAINER_PATH" ] && VOLUMES="${DB_HOST_PATH}:${DB_CONTAINER_PATH}"
-    # config 目录必须挂载
-    VOLUMES="$VOLUMES
-      - ./config:/app/config"
+    # 构建 volumes 和 environment 列表
+    VOLUMES_LIST=("      - ./config:/app/config")  # config 必挂
+    ENV_LIST=("      - TZ=${TZ}" "      - EMBY_HOST=${EMBY_HOST}" "      - EMBY_API_KEY=${EMBY_API_KEY}")
 
-    # 去掉空行
-    VOLUMES=$(echo "$VOLUMES" | sed '/^$/d')
+    # 如果用户填写了数据库路径，则挂载并设置 DB_PATH
+    if [ -n "$DB_HOST_PATH" ] && [ -n "$DB_CONTAINER_PATH" ]; then
+        VOLUMES_LIST+=("      - ${DB_HOST_PATH}:${DB_CONTAINER_PATH}")
+        ENV_LIST+=("      - DB_PATH=${DB_CONTAINER_PATH}/playback_reporting.db")
+    fi
 
+    # 写入 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
 services:
   emby-pulse:
@@ -103,23 +108,24 @@ services:
     container_name: emby-pulse
     restart: unless-stopped
     ports:
-      - "${HOST_PORT}:${CONTAINER_PORT}"
+      - "127.0.0.1:${HOST_PORT}:${CONTAINER_PORT}"
     volumes:
-$(echo "$VOLUMES" | sed 's/^/      - /')
+$(printf "%s\n" "${VOLUMES_LIST[@]}")
     environment:
-      - TZ=${TZ}
-      - EMBY_HOST=${EMBY_HOST}
-      - EMBY_API_KEY=${EMBY_API_KEY}
+$(printf "%s\n" "${ENV_LIST[@]}")
 EOF
 
+    # 启动容器
     cd "$APP_DIR" || exit
     docker compose up -d
 
+    # 获取本机 IP
     SERVER_IP=$(hostname -I | awk '{print $1}')
+
     echo
     echo -e "${GREEN}✅ Emby Pulse 已启动${RESET}"
-    echo -e "${GREEN}✅ webui http://${SERVER_IP}:${HOST_PORT}${RESET}"
-    echo -e "${GREEN}✅ 默认账号密码：直接使用您的Emby管理员账号和密码登录${RESET}"
+    echo -e "${GREEN}✅ WebUI: http://127.0.0.1:${HOST_PORT}${RESET}"
+    echo -e "${GREEN}✅ 默认账号密码: 使用您的 Emby 管理员账号登录${RESET}"
     echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
     read -p "按回车返回菜单..."
 }

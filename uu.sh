@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# ech0 一键管理脚本 (Docker Compose)
+# Emby Pulse 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,135 +8,152 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="ech0"
+APP_NAME="emby-pulse"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_DIR="$APP_DIR/config"
 
 check_docker() {
-    if ! command -v docker >/dev/null 2>&1; then
-        echo -e "${RED}Docker 未安装，请先安装 Docker${RESET}"
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
         exit 1
     fi
 }
 
+# 获取服务器IP
+SERVER_IP=$(hostname -I | awk '{print $1}')
+
 menu() {
-    clear
-    echo -e "${GREEN}=== ech0 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 重启${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 卸载${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo
+    while true; do
+        clear
+        echo -e "${GREEN}=== Emby Pulse 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-    read -rp "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) restart_app ;;
-        4) view_logs ;;
-        5) uninstall_app ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
-    esac
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
 }
 
 install_app() {
-
     check_docker
+    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$APP_DIR/static/img"
 
-    mkdir -p "$APP_DIR"
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
 
-    read -p "请输入 ech0 端口 [默认:6277]: " input_port
-    PORT=${input_port:-6277}
+    # 时区
+    read -p "请输入时区 [默认:Asia/Shanghai]: " input_tz
+    TZ=${input_tz:-Asia/Shanghai}
 
-   read -p "请输入 JWT_SECRET [默认:自动生成]: " input_secret
-   JWT_SECRET=${input_secret:-$(tr -dc A-Za-z0-9 </dev/urandom | head -c 32)}
+    # Emby 主机地址
+    read -p "请输入 Emby 主机地址 [例如:http://192.168.31.2:8096]: " input_host
+    EMBY_HOST=${input_host:-http://192.168.31.2:8096}
 
+    # Emby API Key
+    read -p "请输入 Emby API Key [例如:xxxxxxxxxxxxxxxxx]: " input_key
+    EMBY_API_KEY=${input_key:-xxxxxxxxxxxxxxxxx}
 
-    DATA_DIR=${input_data:-/opt/ech0/data}
+    # 可选数据库路径
+    read -p "请输入数据库宿主机路径（可选，直接回车跳过）: " input_db_host
+    DB_HOST_PATH=${input_db_host}
 
-    BACKUP_DIR=${input_backup:-/opt/ech0/backup}
+    read -p "请输入数据库容器路径（可选，直接回车跳过）: " input_db_container
+    DB_CONTAINER_PATH=${input_db_container}
 
-    mkdir -p "$DATA_DIR"
-    mkdir -p "$BACKUP_DIR"
+    # 自定义宿主机端口
+    read -p "请输入 Emby Pulse WebUI 宿主机端口 [默认:10307]: " input_port
+    HOST_PORT=${input_port:-10307}
+    CONTAINER_PORT=10307
 
+    # 构建 volumes
+    VOLUMES="  - ./config:/app/config"  # config 必须挂载
+    if [ -n "$DB_HOST_PATH" ] && [ -n "$DB_CONTAINER_PATH" ]; then
+        VOLUMES="  - ${DB_HOST_PATH}:${DB_CONTAINER_PATH}
+$VOLUMES"
+    fi
+
+    # 写入 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  ech0:
-    image: sn0wl1n/ech0:latest
-    container_name: ech0
-    restart: always
+  emby-pulse:
+    image: zeyu8023/emby-stats:latest
+    container_name: emby-pulse
+    restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT}:6277"
+      - "${HOST_PORT}:${CONTAINER_PORT}"
     volumes:
-      - ${DATA_DIR}:/app/data
-      - ${BACKUP_DIR}:/app/backup
+$VOLUMES
     environment:
-      - JWT_SECRET=${JWT_SECRET}
+      - TZ=${TZ}
+      - EMBY_HOST=${EMBY_HOST}
+      - EMBY_API_KEY=${EMBY_API_KEY}
 EOF
 
     cd "$APP_DIR" || exit
-
     docker compose up -d
 
+    SERVER_IP=$(hostname -I | awk '{print $1}')
     echo
-    echo -e "${GREEN}✅ ech0 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}🔑 JWT_SECRET: ${JWT_SECRET}${RESET}"
-    echo -e "${GREEN}📂 数据目录: ${DATA_DIR}${RESET}"
-    echo -e "${GREEN}📂 备份目录: ${BACKUP_DIR}${RESET}"
-
+    echo -e "${GREEN}✅ Emby Pulse 已启动${RESET}"
+    echo -e "${GREEN}✅ webui http://${SERVER_IP}:${HOST_PORT}${RESET}"
+    echo -e "${GREEN}✅ 默认账号密码：直接使用您的Emby管理员账号和密码登录${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
     read -p "按回车返回菜单..."
-    menu
 }
 
 update_app() {
-
-    cd "$APP_DIR" || { echo -e "${RED}未检测到安装目录，请先安装${RESET}"; sleep 1; menu; }
-
+    cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-
-    echo -e "${GREEN}✅ ech0 已更新${RESET}"
-
+    echo -e "${GREEN}✅ Emby Pulse 更新完成${RESET}"
     read -p "按回车返回菜单..."
-    menu
 }
 
 restart_app() {
-
-    cd "$APP_DIR" || { echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; }
-
-    docker compose restart
-
-    echo -e "${GREEN}✅ ech0 已重启${RESET}"
-
+    docker restart emby-pulse
+    echo -e "${GREEN}✅ Emby Pulse 已重启${RESET}"
     read -p "按回车返回菜单..."
-    menu
 }
 
 view_logs() {
+    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
+    docker logs -f emby-pulse
+}
 
-    docker logs -f ech0
-
+check_status() {
+    docker ps | grep emby-pulse
     read -p "按回车返回菜单..."
-    menu
 }
 
 uninstall_app() {
-
-    cd "$APP_DIR" || { echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; }
-
+    cd "$APP_DIR" || return
     docker compose down
     rm -rf "$APP_DIR"
-
-    echo -e "${RED}✅ ech0 已卸载${RESET}"
-
+    echo -e "${RED}✅ Emby Pulse 已卸载${RESET}"
     read -p "按回车返回菜单..."
-    menu
 }
 
 menu

@@ -80,9 +80,9 @@ install_app() {
     EMBY_API_KEY=${input_key:-xxxxxxxxxxxxxxxxx}
 
     # 4️⃣ 可选数据库路径
-    read -p "请输入数据库宿主机路径（可选，直接回车跳过）: " input_db_host
+    read -p "请输入数据库宿主机路径（可选，API模式可不填）: " input_db_host
     DB_HOST_PATH=${input_db_host}
-    read -p "请输入数据库容器路径（可选，直接回车跳过）: " input_db_container
+    read -p "请输入数据库容器路径（可选，API模式可不填）: " input_db_container
     DB_CONTAINER_PATH=${input_db_container}
 
     # 5️⃣ 宿主机端口
@@ -90,11 +90,14 @@ install_app() {
     HOST_PORT=${input_port:-10307}
     CONTAINER_PORT=10307
 
-    # 构建 volumes 列表
-    VOLUMES="      - ./config:/app/config"  # 默认 config 挂载
+    # 构建 volumes 和 environment 列表
+    VOLUMES_LIST=("      - ./config:/app/config")  # config 必挂
+    ENV_LIST=("      - TZ=${TZ}" "      - EMBY_HOST=${EMBY_HOST}" "      - EMBY_API_KEY=${EMBY_API_KEY}")
+
+    # 如果用户填写了数据库路径，则挂载并设置 DB_PATH
     if [ -n "$DB_HOST_PATH" ] && [ -n "$DB_CONTAINER_PATH" ]; then
-        VOLUMES="      - ${DB_HOST_PATH}:${DB_CONTAINER_PATH}
-$VOLUMES"
+        VOLUMES_LIST+=("      - ${DB_HOST_PATH}:${DB_CONTAINER_PATH}")
+        ENV_LIST+=("      - DB_PATH=${DB_CONTAINER_PATH}/playback_reporting.db")
     fi
 
     # 写入 docker-compose.yml
@@ -105,13 +108,11 @@ services:
     container_name: emby-pulse
     restart: unless-stopped
     ports:
-      - "${HOST_PORT}:${CONTAINER_PORT}"
+      - "127.0.0.1:${HOST_PORT}:${CONTAINER_PORT}"
     volumes:
-$VOLUMES
+$(printf "%s\n" "${VOLUMES_LIST[@]}")
     environment:
-      - TZ="${TZ}"
-      - EMBY_HOST="${EMBY_HOST}"
-      - EMBY_API_KEY="${EMBY_API_KEY}"
+$(printf "%s\n" "${ENV_LIST[@]}")
 EOF
 
     # 启动容器
@@ -123,7 +124,7 @@ EOF
 
     echo
     echo -e "${GREEN}✅ Emby Pulse 已启动${RESET}"
-    echo -e "${GREEN}✅ WebUI: http://${SERVER_IP}:${HOST_PORT}${RESET}"
+    echo -e "${GREEN}✅ WebUI: http://127.0.0.1:${HOST_PORT}${RESET}"
     echo -e "${GREEN}✅ 默认账号密码: 使用您的 Emby 管理员账号登录${RESET}"
     echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
     read -p "按回车返回菜单..."

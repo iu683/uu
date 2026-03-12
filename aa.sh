@@ -162,8 +162,25 @@ get_timezone() {
 timezone=$(get_timezone)
 
 # 架构
-cpu_model=$( (grep -m1 'model name' /proc/cpuinfo || sysctl -n machdep.cpu.brand_string || sysctl -n hw.model) 2>/dev/null | cut -d: -f2 )
-cpu="$(echo "$cpu_model" | xargs) ($(uname -m))"
+
+cpu_arch=$(uname -m)
+
+# 获取 CPU 型号
+cpu_model=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2)
+[ -z "$cpu_model" ] && cpu_model=$(grep -m1 "Hardware" /proc/cpuinfo 2>/dev/null | cut -d: -f2)
+[ -z "$cpu_model" ] && cpu_model=$(lscpu 2>/dev/null | grep "Model name" | cut -d: -f2)
+
+# 清理不需要的部分
+cpu_model=$(echo "$cpu_model" | sed -E \
+    -e 's/@.*GHz//g' \
+    -e 's/CPU//g' \
+    -e 's/Processor//g' \
+    -e 's/[0-9]+-Core//g' \
+    -e 's/\s+/ /g' \
+    | xargs)
+
+cpu="${cpu_model:-Unknown CPU} (${cpu_arch})"
+
 
 # 当前时间
 datetime=$(date "+%Y-%m-%d %H:%M:%S")

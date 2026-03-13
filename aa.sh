@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Music-DL 一键管理脚本
+# NodeCtl 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,9 +8,8 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="music-dl"
+APP_NAME="nodectl"
 APP_DIR="/opt/$APP_NAME"
-DATA_DIR="$APP_DIR/data"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
 check_docker() {
@@ -18,7 +17,6 @@ check_docker() {
         echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
         curl -fsSL https://get.docker.com | bash
     fi
-
     if ! docker compose version &>/dev/null; then
         echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
         exit 1
@@ -32,14 +30,10 @@ check_port() {
     fi
 }
 
-get_ip() {
-    curl -s ifconfig.me || hostname -I | awk '{print $1}'
-}
-
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Music-DL 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== NodeCtl 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -63,10 +57,9 @@ menu() {
 }
 
 install_app() {
-    check_docker
 
-    mkdir -p "$DATA_DIR"
-    chmod -R 777 "$DATA_DIR"
+    check_docker
+    mkdir -p "$APP_DIR/data"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -74,91 +67,63 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:8080]: " input_port
-    PORT=${input_port:-8080}
-
+    read -p "请输入访问端口 [默认:7878]: " input_port
+    PORT=${input_port:-7878}
     check_port "$PORT" || return
-
-    mkdir -p "$APP_DIR"
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  music-dl:
-    image: guohuiyuan/go-music-dl:latest
-    container_name: music-dl
+  nodectl:
+    image: ghcr.io/hobin66/nodectl:latest
+    container_name: nodectl
     restart: unless-stopped
     ports:
       - "127.0.0.1:${PORT}:8080"
     volumes:
-      - ${DATA_DIR}:/home/appuser/data
-    environment:
-      - TZ=Asia/Shanghai
-    command:
-      [
-        "./music-dl",
-        "web",
-        "--port","8080",
-        "--no-browser",
-        "--vg-cover",
-        "--vg-audio",
-        "--vg-lyric",
-        "--vg-export"
-      ]
+      - ./data:/app/data
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    IP=$(get_ip)
-
     echo
-    echo -e "${GREEN}✅ Music-DL 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址:${RESET}"
-    echo -e "http://127.0.0.1:${PORT}"
-    echo -e "${GREEN}📂 数据目录:${RESET} $DATA_DIR"
+    echo -e "${GREEN}✅ NodeCtl 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${YELLOW}🌐 账号/密码: admin/admin${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
 
     read -p "按回车返回菜单..."
 }
 
 update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
-
     docker compose pull
-    docker compose down
     docker compose up -d
-
-    echo -e "${GREEN}✅ 更新完成${RESET}"
+    echo -e "${GREEN}✅ NodeCtl 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart music-dl
-    echo -e "${GREEN}✅ 已重启${RESET}"
+    docker restart nodectl
+    echo -e "${GREEN}✅ NodeCtl 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f music-dl
+    docker logs -f nodectl
 }
 
 check_status() {
-    echo
-    docker ps -a | grep music-dl
-    echo
-    docker stats music-dl --no-stream
+    docker ps | grep nodectl
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
-    cd "$APP_DIR" 2>/dev/null || true
-
-    docker compose down -v 2>/dev/null
-    docker rm -f music-dl 2>/dev/null
-
+    cd "$APP_DIR" || return
+    docker compose down -v
     rm -rf "$APP_DIR"
-
-    echo -e "${RED}✅ Music-DL 已彻底卸载（含数据）${RESET}"
+    echo -e "${RED}✅ NodeCtl 已彻底卸载（含数据）${RESET}"
     read -p "按回车返回菜单..."
 }
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Translate 一键管理脚本
+# Music-DL 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,8 +8,9 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="translate"
+APP_NAME="music-dl"
 APP_DIR="/opt/$APP_NAME"
+DATA_DIR="$APP_DIR/data"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
 check_docker() {
@@ -17,6 +18,7 @@ check_docker() {
         echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
         curl -fsSL https://get.docker.com | bash
     fi
+
     if ! docker compose version &>/dev/null; then
         echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
         exit 1
@@ -30,16 +32,20 @@ check_port() {
     fi
 }
 
+get_ip() {
+    curl -s ifconfig.me || hostname -I | awk '{print $1}'
+}
+
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Translate 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Music-DL 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
@@ -58,7 +64,9 @@ menu() {
 
 install_app() {
     check_docker
-    mkdir -p "$APP_DIR"
+
+    mkdir -p "$DATA_DIR"
+    chmod -R 777 "$DATA_DIR"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -68,56 +76,89 @@ install_app() {
 
     read -p "请输入访问端口 [默认:8080]: " input_port
     PORT=${input_port:-8080}
+
     check_port "$PORT" || return
+
+    mkdir -p "$APP_DIR"
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  translate:
-    image: terobox/translate:latest
-    container_name: poixe-translate
-    restart: always
+  music-dl:
+    image: guohuiyuan/go-music-dl:latest
+    container_name: music-dl
+    restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT}:80"
+      - "127.0.0.1:${PORT}:8080"
+    volumes:
+      - ${DATA_DIR}:/home/appuser/data
+    environment:
+      - TZ=Asia/Shanghai
+    command:
+      [
+        "./music-dl",
+        "web",
+        "--port","8080",
+        "--no-browser",
+        "--vg-cover",
+        "--vg-audio",
+        "--vg-lyric",
+        "--vg-export"
+      ]
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
+    IP=$(get_ip)
+
     echo
-    echo -e "${GREEN}✅ Translate 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}✅ Music-DL 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址:${RESET}"
+    echo -e "http://127.0.0.1:${PORT}"
+    echo -e "${GREEN}📂 数据目录:${RESET} $DATA_DIR"
+
     read -p "按回车返回菜单..."
 }
 
 update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+
     docker compose pull
+    docker compose down
     docker compose up -d
-    echo -e "${GREEN}✅ Translate 更新完成${RESET}"
+
+    echo -e "${GREEN}✅ 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart poixe-translate
-    echo -e "${GREEN}✅ Translate 已重启${RESET}"
+    docker restart music-dl
+    echo -e "${GREEN}✅ 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f poixe-translate
+    docker logs -f music-dl
 }
 
 check_status() {
-    docker ps | grep poixe-translate
+    echo
+    docker ps -a | grep music-dl
+    echo
+    docker stats music-dl --no-stream
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down
+    cd "$APP_DIR" 2>/dev/null || true
+
+    docker compose down -v 2>/dev/null
+    docker rm -f music-dl 2>/dev/null
+
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Translate 已卸载${RESET}"
+
+    echo -e "${RED}✅ Music-DL 已彻底卸载（含数据）${RESET}"
     read -p "按回车返回菜单..."
 }
 

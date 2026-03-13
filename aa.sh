@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# WebSSH Gateway 一键管理脚本
+# DockerCopilot 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="websshgateway"
+APP_NAME="dockercopilot"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -17,6 +17,7 @@ check_docker() {
         echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
         curl -fsSL https://get.docker.com | bash
     fi
+
     if ! docker compose version &>/dev/null; then
         echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
         exit 1
@@ -33,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== WebSSH Gateway 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== DockerCopilot 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -59,7 +60,7 @@ menu() {
 install_app() {
 
     check_docker
-    mkdir -p "$APP_DIR"
+    mkdir -p "$APP_DIR/data"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -67,58 +68,66 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:8080]: " input_port
-    PORT=${input_port:-8080}
+    read -p "请输入访问端口 [默认:12712]: " input_port
+    PORT=${input_port:-12712}
     check_port "$PORT" || return
 
-    read -p "请输入 SECRET_KEY [默认:随机生成]: " input_key
-    SECRET_KEY=${input_key:-$(openssl rand -hex 16)}
+    DEFAULT_KEY=$(openssl rand -hex 8)
+    read -p "请输入 secretKey (不少于8位且非纯数字) [默认:${DEFAULT_KEY}]: " input_key
+    SECRET_KEY=${input_key:-$DEFAULT_KEY}
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  websshgateway:
-    image: beibeizi/websshgateway:latest
-    container_name: websshgateway
+  dockercopilot:
+    image: 0nlylty/dockercopilot:latest
+    container_name: dockercopilot
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT}:8080"
+      - "127.0.0.1:${PORT}:12712"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/data
     environment:
-      - SECRET_KEY=${SECRET_KEY}
+      - TZ=Asia/Shanghai
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - secretKey=${SECRET_KEY}
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ WebSSH Gateway 已启动${RESET}"
+    echo -e "${GREEN}✅ DockerCopilot 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}🔑 SECRET_KEY: ${SECRET_KEY}${RESET}"
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    echo -e "${GREEN}🔑 secretKey: ${SECRET_KEY}${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
 
     read -p "按回车返回菜单..."
 }
 
 update_app() {
     cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
+
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ WebSSH Gateway 更新完成${RESET}"
+
+    echo -e "${GREEN}✅ DockerCopilot 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart websshgateway
-    echo -e "${GREEN}✅ WebSSH Gateway 已重启${RESET}"
+    docker restart dockercopilot
+    echo -e "${GREEN}✅ DockerCopilot 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
     echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f websshgateway
+    docker logs -f dockercopilot
 }
 
 check_status() {
-    docker ps | grep websshgateway
+    docker ps | grep dockercopilot
     read -p "按回车返回菜单..."
 }
 
@@ -126,7 +135,8 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ WebSSH Gateway 已彻底卸载${RESET}"
+
+    echo -e "${RED}✅ DockerCopilot 已彻底卸载（含数据）${RESET}"
     read -p "按回车返回菜单..."
 }
 

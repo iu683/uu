@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Woodll Tools 一键管理脚本
+# Twikoo 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="woodll-tools"
+APP_NAME="twikoo"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Woodll Tools 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Twikoo 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -61,7 +61,6 @@ install_app() {
 
     check_docker
     mkdir -p "$APP_DIR/data"
-    mkdir -p "$APP_DIR/uploads"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -75,52 +74,49 @@ install_app() {
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  woodll-tools:
-    image: ghcr.io/likew1nd/woodll-tools:latest
-    container_name: woodll-tools
+  twikoo:
+    image: imaegoo/twikoo
+    container_name: twikoo
     restart: unless-stopped
     ports:
-      - "${PORT}:80"
+      - "127.0.0.1:${PORT}:8080"
+    environment:
+      TWIKOO_THROTTLE: 1000
     volumes:
-      - ./data:/var/www/html/data
-      - ./uploads:/var/www/html/uploads
+      - ./data:/app/data
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ Woodll Tools 已启动${RESET}"
+    echo -e "${GREEN}✅ Twikoo 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🌐 账号/密码: admin/admin123${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
 
     read -p "按回车返回菜单..."
 }
 
 update_app() {
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; return; }
-
+    cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-
-    echo -e "${GREEN}✅ Woodll Tools 更新完成${RESET}"
+    echo -e "${GREEN}✅ Twikoo 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart woodll-tools
-    echo -e "${GREEN}✅ Woodll Tools 已重启${RESET}"
+    docker restart twikoo
+    echo -e "${GREEN}✅ Twikoo 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f woodll-tools
+    docker logs -f twikoo
 }
 
 check_status() {
-    docker ps | grep woodll-tools
+    docker ps | grep twikoo
     read -p "按回车返回菜单..."
 }
 
@@ -128,8 +124,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-
-    echo -e "${RED}✅ Woodll Tools 已彻底卸载（含数据）${RESET}"
+    echo -e "${RED}✅ Twikoo 已彻底卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

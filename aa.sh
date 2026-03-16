@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Memos 一键管理脚本
+# GiftList 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="memos"
+APP_NAME="giftlist"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Memos 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== GiftList 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -68,27 +68,36 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:5230]: " input_port
-    PORT=${input_port:-5230}
+    read -p "请输入访问端口 [默认:8080]: " input_port
+    PORT=${input_port:-8080}
     check_port "$PORT" || return
+
+    read -p "请输入管理员密码 [默认:admin123]: " input_pass
+    ADMIN_PASSWORD=${input_pass:-admin123}
+
+    SESSION_SECRET=$(openssl rand -hex 16)
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  memos:
-    image: neosmemo/memos:stable
-    container_name: memos
+  giftlist:
+    image: transnull/giftlist:latest
+    container_name: giftlist
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT}:5230"
+      - "127.0.0.1:${PORT}:8080"
     volumes:
-      - ./data:/var/opt/memos
+      - ./data:/data
+    environment:
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      SESSION_SECRET: ${SESSION_SECRET}
+      DB_PATH: /data/giftlist.db
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ Memos 已启动${RESET}"
+    echo -e "${GREEN}✅ GiftList 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
     echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
 
@@ -99,22 +108,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Memos  更新完成${RESET}"
+    echo -e "${GREEN}✅ GiftList 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart memos
-    echo -e "${GREEN}✅ Memos  已重启${RESET}"
+    docker restart giftlist
+    echo -e "${GREEN}✅ GiftList 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f memos
+    docker logs -f giftlist
 }
 
 check_status() {
-    docker ps | grep memos
+    docker ps | grep giftlist
     read -p "按回车返回菜单..."
 }
 
@@ -122,7 +131,8 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Memos 已彻底卸载${RESET}"
+    echo -e "${RED}✅ GiftList 已彻底卸载${RESET}"
+    read -p "按回车返回菜单..."
 }
 
 menu

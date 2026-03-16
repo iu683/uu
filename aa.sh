@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Moe Counter 一键管理脚本
+# Memos 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="moe-counter"
+APP_NAME="memos"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Moe Counter 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Memos 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -68,30 +68,27 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:3000]: " input_port
-    PORT=${input_port:-3000}
+    read -p "请输入访问端口 [默认:5230]: " input_port
+    PORT=${input_port:-5230}
     check_port "$PORT" || return
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  moe-counter:
-    image: ghcr.io/journey-ad/moe-counter:latest
-    container_name: moe-counter
+  memos:
+    image: neosmemo/memos:stable
+    container_name: memos
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT}:3000"
+      - "127.0.0.1:${PORT}:5230"
     volumes:
-      - ./data:/app/data
-    environment:
-      - APP_PORT=3000
-      - DB_TYPE=sqlite
+      - ./data:/var/opt/memos
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ Moe Counter 已启动${RESET}"
+    echo -e "${GREEN}✅ Memos 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
     echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
 
@@ -102,20 +99,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Moe Counter 更新完成${RESET}"
+    echo -e "${GREEN}✅ Memos  更新完成${RESET}"
+    read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart moe-counter
-    echo -e "${GREEN}✅ Moe Counter 已重启${RESET}"
+    docker restart memos
+    echo -e "${GREEN}✅ Memos  已重启${RESET}"
+    read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f moe-counter
+    docker logs -f memos
 }
 
 check_status() {
-    docker ps | grep moe-counter
+    docker ps | grep memos
     read -p "按回车返回菜单..."
 }
 
@@ -123,7 +122,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Moe Counter 已彻底卸载${RESET}"
+    echo -e "${RED}✅ Memos 已彻底卸载${RESET}"
 }
 
 menu

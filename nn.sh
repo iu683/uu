@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Twikoo 一键管理脚本
+# Kula 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="twikoo"
+APP_NAME="kula"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -24,23 +24,16 @@ check_docker() {
     fi
 }
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
-
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Twikoo 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Kula 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
@@ -60,7 +53,7 @@ menu() {
 install_app() {
 
     check_docker
-    mkdir -p "$APP_DIR/data"
+    mkdir -p "$APP_DIR"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -68,31 +61,30 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:8080]: " input_port
-    PORT=${input_port:-8080}
-    check_port "$PORT" || return
+    read -p "端口 [默认:1234]: " input_port
+    PORT=${input_port:-1234}
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  twikoo:
-    image: imaegoo/twikoo
-    container_name: twikoo
+  kula:
+    image: c0m4r/kula:latest
+    container_name: kula
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:${PORT}:8080"
+    network_mode: host
+    pid: host
     environment:
-      TWIKOO_THROTTLE: 1000
+      KULA_LISTEN: 127.0.0.1
+      KULA_PORT: ${PORT}
     volumes:
-      - ./data:/app/data
+      - /proc:/proc:ro
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ Twikoo 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
+    echo -e "${GREEN}✅ Kula 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问: http://127.0.0.1:${PORT}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -101,30 +93,30 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Twikoo 更新完成${RESET}"
+    echo -e "${GREEN}✅ Kula 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart twikoo
-    echo -e "${GREEN}✅ Twikoo 已重启${RESET}"
+    docker restart kula
+    echo -e "${GREEN}✅ Kula 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f twikoo
+    docker logs -f kula
 }
 
 check_status() {
-    docker ps | grep twikoo
+    docker ps | grep kula
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
     cd "$APP_DIR" || return
-    docker compose down -v
+    docker compose down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Twikoo 已彻底卸载${RESET}"
+    echo -e "${RED}✅ Kula 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

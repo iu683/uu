@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# GiftList 一键管理脚本
+# WebDAV 一键管理脚本（支持自定义目录）
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="giftlist"
+APP_NAME="webdav"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== GiftList 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== WebDAV 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -60,7 +60,6 @@ menu() {
 install_app() {
 
     check_docker
-    mkdir -p "$APP_DIR/data"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -72,34 +71,45 @@ install_app() {
     PORT=${input_port:-8080}
     check_port "$PORT" || return
 
-    read -p "请输入管理员密码 [默认:admin123]: " input_pass
-    ADMIN_PASSWORD=${input_pass:-admin123}
+    read -p "请输入用户名 [默认:webdav]: " input_user
+    USERNAME=${input_user:-webdav}
 
-    SESSION_SECRET=$(openssl rand -hex 16)
+    read -p "请输入密码 [默认:webdav]: " input_pass
+    PASSWORD=${input_pass:-webdav}
+
+    read -p "请输入存储目录 [默认:/opt/webdav/data]: " input_path
+    DATA_DIR=${input_path:-/opt/webdav/data}
+
+    mkdir -p "$DATA_DIR"
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  giftlist:
-    image: transnull/giftlist:latest
-    container_name: giftlist
+  webdav:
+    image: apachewebdav/apachewebdav:latest
+    container_name: webdav
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT}:8080"
-    volumes:
-      - ./data:/data
+      - "127.0.0.1:${PORT}:80"
     environment:
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
-      SESSION_SECRET: ${SESSION_SECRET}
-      DB_PATH: /data/giftlist.db
+      AUTH_TYPE: Digest
+      USERNAME: ${USERNAME}
+      PASSWORD: ${PASSWORD}
+      PUID: 1000
+      PGID: 1001
+    volumes:
+      - ${DATA_DIR}:/var/lib/dav/data
 EOF
 
-    cd "$APP_DIR" || exit
+    cd "$APP_DIR" || mkdir -p "$APP_DIR" && cd "$APP_DIR"
+
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ GiftList 已启动${RESET}"
+    echo -e "${GREEN}✅ WebDAV 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
+    echo -e "${GREEN}👤 用户名: ${USERNAME}${RESET}"
+    echo -e "${GREEN}🔑 密码: ${PASSWORD}${RESET}"
+    echo -e "${GREEN}📂 存储目录: ${DATA_DIR}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -108,22 +118,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ GiftList 更新完成${RESET}"
+    echo -e "${GREEN}✅ WebDAV 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart giftlist
-    echo -e "${GREEN}✅ GiftList 已重启${RESET}"
+    docker restart webdav
+    echo -e "${GREEN}✅ WebDAV 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f giftlist
+    docker logs -f webdav
 }
 
 check_status() {
-    docker ps | grep giftlist
+    docker ps | grep webdav
     read -p "按回车返回菜单..."
 }
 
@@ -131,7 +141,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ GiftList 已彻底卸载${RESET}"
+    echo -e "${RED}⚠ WebDAV 已卸载（不会删除自定义数据目录）${RESET}"
     read -p "按回车返回菜单..."
 }
 

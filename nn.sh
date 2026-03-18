@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Kula 一键管理脚本
+# QQBot 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,9 +8,10 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="kula"
+APP_NAME="qqbot"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/config.toml"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -24,16 +25,23 @@ check_docker() {
     fi
 }
 
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
+
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Kula 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== QQBot 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}6) 卸载(含配置/数据)${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
@@ -51,9 +59,10 @@ menu() {
 }
 
 install_app() {
-
     check_docker
+
     mkdir -p "$APP_DIR"
+    mkdir -p "$APP_DIR/data"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -61,30 +70,56 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "端口 [默认:1234]: " input_port
-    PORT=${input_port:-1234}
+    # 端口
+    read -p "请输入访问端口 [默认:8080]: " input_port
+    PORT=${input_port:-8080}
+    check_port "$PORT" || return
 
+    # config.toml
+    read -p "请输入 AppID: " APPID
+    read -p "请输入 ClientSecret: " CLIENTSECRET
+    read -p "是否开启 Markdown 支持? [默认 false]: " MARKDOWN
+    MARKDOWN=${MARKDOWN:-false}
+    read -p "请输入 API Token (强密码): " API_TOKEN
+
+    cat > "$CONFIG_FILE" <<EOF
+[qqbot]
+app_id = "${APPID}"
+client_secret = "${CLIENTSECRET}"
+markdown = ${MARKDOWN}
+
+[server]
+listen_addr = ":${PORT}"
+api_token = "${API_TOKEN}"
+EOF
+
+    # docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  kula:
-    image: c0m4r/kula:latest
-    container_name: kula
-    restart: unless-stopped
-    network_mode: host
-    pid: host
-    environment:
-      KULA_LISTEN: 127.0.0.1
-      KULA_PORT: ${PORT}
+  qqbot:
+    image: ghcr.io/sky22333/qqbot
+    container_name: qqbot
+    restart: always
+    ports:
+      - "${PORT}:8080"
     volumes:
-      - /proc:/proc:ro
+      - ${CONFIG_FILE}:/root/config.toml
+      - ${APP_DIR}/data:/root/data
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
+        return
+    fi
+
     echo
-    echo -e "${GREEN}✅ Kula 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}✅ QQBot 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
+    echo -e "${GREEN}📂 配置文件: $CONFIG_FILE${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -93,30 +128,30 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Kula 更新完成${RESET}"
+    echo -e "${GREEN}✅ QQBot 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart kula
-    echo -e "${GREEN}✅ Kula 已重启${RESET}"
+    docker restart qqbot
+    echo -e "${GREEN}✅ QQBot 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f kula
+    docker logs -f qqbot
 }
 
 check_status() {
-    docker ps | grep kula
+    docker ps | grep qqbot
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
     cd "$APP_DIR" || return
-    docker compose down
+    docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Kula 已卸载${RESET}"
+    echo -e "${RED}✅ QQBot 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

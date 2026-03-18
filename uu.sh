@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# WebDAV 一键管理脚本（支持自定义目录）
+# Sublink Worker + Redis 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="webdav"
+APP_NAME="sublink-worker"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== WebDAV 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Sublink Worker 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -58,59 +58,82 @@ menu() {
 }
 
 install_app() {
-
     check_docker
-
+    mkdir -p "$APP_DIR"
+    
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
         read confirm
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:8080]: " input_port
-    PORT=${input_port:-8080}
+    # Worker 镜像
+    read -p "请输入 Worker 镜像 [默认:ghcr.io/7sageer/sublink-worker:latest]: " input_image
+    WORKER_IMAGE=${input_image:-ghcr.io/7sageer/sublink-worker:latest}
+
+    # Worker 端口
+    read -p "请输入 Worker 访问端口 [默认:8787]: " input_port
+    PORT=${input_port:-8787}
     check_port "$PORT" || return
 
-    read -p "请输入用户名 [默认:webdav]: " input_user
-    USERNAME=${input_user:-webdav}
+    # Redis 数据目录
+    read -p "请输入 Redis 数据目录 [默认:$APP_DIR/redis-data]: " input_redis
+    REDIS_DIR=${input_redis:-$APP_DIR/redis-data}
+    mkdir -p "$REDIS_DIR"
 
-    read -p "请输入密码 [默认:webdav]: " input_pass
-    PASSWORD=${input_pass:-webdav}
+    # Redis 配置文件
+    read -p "请输入 redis.conf 路径 [默认:$APP_DIR/redis.conf]: " input_conf
+    REDIS_CONF=${input_conf:-$APP_DIR/redis.conf}
+    if [ ! -f "$REDIS_CONF" ]; then
+        cat > "$REDIS_CONF" <<EOF
+bind 0.0.0.0
+protected-mode no
+dir /data
+EOF
+    fi
 
-    read -p "请输入存储目录 [默认:/opt/webdav/data]: " input_path
-    DATA_DIR=${input_path:-/opt/webdav/data}
-    
-    mkdir -p "$APP_DIR"
-    mkdir -p "$DATA_DIR"
-
+    # docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  webdav:
-    image: apachewebdav/apachewebdav:latest
-    container_name: webdav
+  worker:
+    image: ${WORKER_IMAGE}
+    container_name: worker
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT}:80"
+      - "127.0.0.1:${PORT}:8787"
     environment:
-      AUTH_TYPE: Digest
-      USERNAME: ${USERNAME}
-      PASSWORD: ${PASSWORD}
-      PUID: 1000
-      PGID: 1001
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_KEY_PREFIX: sublink
+      CONFIG_TTL_SECONDS: 2592000
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
     volumes:
-      - ${DATA_DIR}:/var/lib/dav/data
+      - ${REDIS_DIR}:/data
+      - ${REDIS_CONF}:/usr/local/etc/redis/redis.conf:ro
+    restart: unless-stopped
+
+volumes:
+  redis-data:
 EOF
 
-    cd "$APP_DIR" || mkdir -p "$APP_DIR" && cd "$APP_DIR"
-
+    cd "$APP_DIR" || exit
     docker compose up -d
 
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
+        return
+    fi
+
     echo
-    echo -e "${GREEN}✅ WebDAV 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}👤 用户名: ${USERNAME}${RESET}"
-    echo -e "${GREEN}🔑 密码: ${PASSWORD}${RESET}"
-    echo -e "${GREEN}📂 存储目录: ${DATA_DIR}${RESET}"
+    echo -e "${GREEN}✅ Sublink Worker + Redis 已启动${RESET}"
+    echo -e "${YELLOW}🌐 Worker 访问端口: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📂 Redis 数据目录: ${REDIS_DIR}${RESET}"
+    echo -e "${GREEN}📂 Redis 配置文件: ${REDIS_CONF}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -119,22 +142,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ WebDAV 更新完成${RESET}"
+    echo -e "${GREEN}✅ Sublink Worker 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart webdav
-    echo -e "${GREEN}✅ WebDAV 已重启${RESET}"
+    docker restart worker redis
+    echo -e "${GREEN}✅ Worker + Redis 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f webdav
+    docker logs -f worker
 }
 
 check_status() {
-    docker ps | grep webdav
+    docker ps | grep -E "worker|redis"
     read -p "按回车返回菜单..."
 }
 
@@ -142,7 +165,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}⚠ WebDAV 已卸载（不会删除自定义数据目录）${RESET}"
+    echo -e "${RED}✅ Sublink Worker + Redis 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

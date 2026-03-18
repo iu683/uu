@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# go-wdd 一键管理脚本
+# Outlook Email Plus 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="go-wdd"
+APP_NAME="outlook-email-plus"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== go-wdd 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Outlook Email Plus 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -58,8 +58,9 @@ menu() {
 }
 
 install_app() {
-
     check_docker
+
+    mkdir -p "$APP_DIR"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -67,41 +68,37 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    # 端口输入
-    read -p "请输入 Web 端口 [默认:5574]: " input_port1
-    PORT1=${input_port1:-5574}
-    check_port "$PORT1" || return
+    # 输入端口
+    read -p "请输入访问端口 [默认:5000]: " input_port
+    PORT=${input_port:-5000}
+    check_port "$PORT" || return
 
-    read -p "请输入 API 端口 [默认:5575]: " input_port2
-    PORT2=${input_port2:-5575}
-    check_port "$PORT2" || return
+    # 输入登录密码
+    read -p "请输入登录密码 [默认:admin123]: " input_pass
+    LOGIN_PASSWORD=${input_pass:-admin123}
 
-    # 目录输入
-    read -p "请输入数据目录 [默认:/opt/go-wdd/data]: " input_data
-    DATA_DIR=${input_data:-/opt/go-wdd/data}
+    # SECRET_KEY
+    read -p "请输入 SECRET_KEY [默认随机生成]: " input_secret
+    SECRET_KEY=${input_secret:-$(openssl rand -hex 16)}
 
-    read -p "请输入静态文件目录 [默认:/opt/go-wdd/static]: " input_static
-    STATIC_DIR=${input_static:-/opt/go-wdd/static}
-
-    # 创建目录（关键）
-    mkdir -p "$APP_DIR"
+    # 数据目录
+    read -p "请输入数据目录 [默认:$APP_DIR/data]: " input_data
+    DATA_DIR=${input_data:-$APP_DIR/data}
     mkdir -p "$DATA_DIR"
-    mkdir -p "$STATIC_DIR"
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  go-wdd:
-    image: wbyanzu/go-wdd:latest
-    container_name: go-wdd
+  outlook-email-plus:
+    image: ghcr.io/zeropointsix/outlook-email-plus:latest
+    container_name: outlook-email-plus
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT1}:5574"
-      - "127.0.0.1:${PORT2}:5575"
+      - "127.0.0.1:${PORT}:5000"
     volumes:
-      - ${STATIC_DIR}:/app/static
       - ${DATA_DIR}:/app/data
     environment:
-      TZ: Asia/Shanghai
+      SECRET_KEY: ${SECRET_KEY}
+      LOGIN_PASSWORD: ${LOGIN_PASSWORD}
 EOF
 
     cd "$APP_DIR" || exit
@@ -113,12 +110,10 @@ EOF
     fi
 
     echo
-    echo -e "${GREEN}✅ go-wdd 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Web: http://127.0.0.1:${PORT1}${RESET}"
-    echo -e "${YELLOW}🔗 API: http://127.0.0.1:${PORT2}${RESET}"
-    echo -e "${YELLOW}🔗 账号/密码: admin/123456${RESET}"
+    echo -e "${GREEN}✅ Outlook Email Plus 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}🔑 登录密码: ${LOGIN_PASSWORD}${RESET}"
     echo -e "${GREEN}📂 数据目录: ${DATA_DIR}${RESET}"
-    echo -e "${GREEN}📂 静态目录: ${STATIC_DIR}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -127,22 +122,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ go-wdd 更新完成${RESET}"
+    echo -e "${GREEN}✅ Outlook Email Plus 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart go-wdd
-    echo -e "${GREEN}✅ go-wdd 已重启${RESET}"
+    docker restart outlook-email-plus
+    echo -e "${GREEN}✅ Outlook Email Plus 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f go-wdd
+    docker logs -f outlook-email-plus
 }
 
 check_status() {
-    docker ps | grep go-wdd
+    docker ps | grep outlook-email-plus
     read -p "按回车返回菜单..."
 }
 
@@ -150,7 +145,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ go-wdd 已卸载${RESET}"
+    echo -e "${RED}✅ Outlook Email Plus 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

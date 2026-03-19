@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Outlook Email Plus 一键管理脚本
+# OpenFlare 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="outlook-email-plus"
+APP_NAME="openflare"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Outlook Email Plus 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== OpenFlare 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -58,6 +58,7 @@ menu() {
 }
 
 install_app() {
+
     check_docker
 
     mkdir -p "$APP_DIR"
@@ -68,37 +69,59 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    # 输入端口
-    read -p "请输入访问端口 [默认:5000]: " input_port
-    PORT=${input_port:-5000}
+    # 端口
+    read -p "请输入访问端口 [默认:3000]: " input_port
+    PORT=${input_port:-3000}
     check_port "$PORT" || return
 
-    # 输入登录密码
-    read -p "请输入登录密码 [默认:admin123]: " input_pass
-    LOGIN_PASSWORD=${input_pass:-admin123}
-
-    # SECRET_KEY
-    read -p "请输入 SECRET_KEY [默认随机生成]: " input_secret
-    SECRET_KEY=${input_secret:-$(openssl rand -hex 16)}
-
     # 数据目录
-    read -p "请输入数据目录 [默认:$APP_DIR/data]: " input_data
+    read -p "Postgres 数据目录 [默认:$APP_DIR/postgres]: " input_pg
+    PG_DIR=${input_pg:-$APP_DIR/postgres}
+
+    read -p "OpenFlare 数据目录 [默认:$APP_DIR/data]: " input_data
     DATA_DIR=${input_data:-$APP_DIR/data}
+
+    mkdir -p "$PG_DIR"
     mkdir -p "$DATA_DIR"
+
+    # 自动生成密码
+    DB_PASSWORD=$(openssl rand -hex 12)
+    SESSION_SECRET=$(openssl rand -hex 16)
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  outlook-email-plus:
-    image: ghcr.io/zeropointsix/outlook-email-plus:latest
-    container_name: outlook-email-plus
+  postgres:
+    image: postgres:17-alpine
+    container_name: openflare-db
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:${PORT}:5000"
-    volumes:
-      - ${DATA_DIR}:/app/data
     environment:
-      SECRET_KEY: ${SECRET_KEY}
-      LOGIN_PASSWORD: ${LOGIN_PASSWORD}
+      POSTGRES_DB: openflare
+      POSTGRES_USER: openflare
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ${PG_DIR}:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openflare -d openflare"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  openflare:
+    image: ghcr.io/rain-kl/openflare:latest
+    container_name: openflare
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${PORT}:3000"
+    environment:
+      SESSION_SECRET: ${SESSION_SECRET}
+      DSN: postgres://openflare:${DB_PASSWORD}@postgres:5432/openflare?sslmode=disable
+      GIN_MODE: release
+      LOG_LEVEL: info
+    volumes:
+      - ${DATA_DIR}:/data
 EOF
 
     cd "$APP_DIR" || exit
@@ -110,9 +133,11 @@ EOF
     fi
 
     echo
-    echo -e "${GREEN}✅ Outlook Email Plus 已启动${RESET}"
+    echo -e "${GREEN}✅ OpenFlare 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}🔑 登录密码: ${LOGIN_PASSWORD}${RESET}"
+    echo -e "${GREEN}🗄 数据库密码: ${DB_PASSWORD}${RESET}"
+    echo -e "${GREEN}🔐 SESSION_SECRET: ${SESSION_SECRET}${RESET}"
+    echo -e "${GREEN}📂 Postgres 目录: ${PG_DIR}${RESET}"
     echo -e "${GREEN}📂 数据目录: ${DATA_DIR}${RESET}"
 
     read -p "按回车返回菜单..."
@@ -122,22 +147,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Outlook Email Plus 更新完成${RESET}"
+    echo -e "${GREEN}✅ OpenFlare 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart outlook-email-plus
-    echo -e "${GREEN}✅ Outlook Email Plus 已重启${RESET}"
+    docker restart openflare openflare-db
+    echo -e "${GREEN}✅ OpenFlare 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f outlook-email-plus
+    docker logs -f openflare
 }
 
 check_status() {
-    docker ps | grep outlook-email-plus
+    docker ps | grep -E "openflare"
     read -p "按回车返回菜单..."
 }
 
@@ -145,7 +170,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Outlook Email Plus 已卸载${RESET}"
+    echo -e "${RED}✅ OpenFlare 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

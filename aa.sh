@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# OpenFlare 一键管理脚本
+# Halo 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="openflare"
+APP_NAME="halo"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== OpenFlare 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Halo 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -60,7 +60,6 @@ menu() {
 install_app() {
 
     check_docker
-
     mkdir -p "$APP_DIR"
 
     if [ -f "$COMPOSE_FILE" ]; then
@@ -70,58 +69,78 @@ install_app() {
     fi
 
     # 端口
-    read -p "请输入访问端口 [默认:3000]: " input_port
-    PORT=${input_port:-3000}
+    read -p "请输入访问端口 [默认:8090]: " input_port
+    PORT=${input_port:-8090}
     check_port "$PORT" || return
 
     # 数据目录
-    read -p "Postgres 数据目录 [默认:$APP_DIR/postgres]: " input_pg
-    PG_DIR=${input_pg:-$APP_DIR/postgres}
+    read -p "Halo 数据目录 [默认:$APP_DIR/halo2]: " input_halo
+    HALO_DIR=${input_halo:-$APP_DIR/halo2}
 
-    read -p "OpenFlare 数据目录 [默认:$APP_DIR/data]: " input_data
-    DATA_DIR=${input_data:-$APP_DIR/data}
+    read -p "数据库目录 [默认:$APP_DIR/db]: " input_db
+    DB_DIR=${input_db:-$APP_DIR/db}
 
-    mkdir -p "$PG_DIR"
-    mkdir -p "$DATA_DIR"
+    mkdir -p "$HALO_DIR"
+    mkdir -p "$DB_DIR"
 
-    # 自动生成密码
+    # 数据库密码
     DB_PASSWORD=$(openssl rand -hex 12)
-    SESSION_SECRET=$(openssl rand -hex 16)
+
+    # external-url
+    read -p "请输入外部访问地址 [默认:http://127.0.0.1:${PORT}]: " input_url
+    EXTERNAL_URL=${input_url:-http://127.0.0.1:${PORT}}
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  postgres:
-    image: postgres:17-alpine
-    container_name: openflare-db
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: openflare
-      POSTGRES_USER: openflare
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
+  halo:
+    image: registry.fit2cloud.com/halo/halo-pro:2.23
+    container_name: halo
+    restart: on-failure:3
+    depends_on:
+      halodb:
+        condition: service_healthy
+    networks:
+      - halo_network
     volumes:
-      - ${PG_DIR}:/var/lib/postgresql/data
+      - ${HALO_DIR}:/root/.halo2
+    ports:
+      - "127.0.0.1:${PORT}:8090"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U openflare -d openflare"]
+      test: ["CMD", "curl", "-f", "http://localhost:8090/actuator/health/readiness"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    environment:
+      - JVM_OPTS=-Xmx256m -Xms256m
+    command:
+      - --spring.r2dbc.url=r2dbc:pool:postgresql://halodb/halo
+      - --spring.r2dbc.username=halo
+      - --spring.r2dbc.password=${DB_PASSWORD}
+      - --spring.sql.init.platform=postgresql
+      - --halo.external-url=${EXTERNAL_URL}
+
+  halodb:
+    image: postgres:15.4
+    container_name: halo-db
+    restart: on-failure:3
+    networks:
+      - halo_network
+    volumes:
+      - ${DB_DIR}:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready"]
       interval: 10s
       timeout: 5s
       retries: 5
-
-  openflare:
-    image: ghcr.io/rain-kl/openflare:latest
-    container_name: openflare
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-    ports:
-      - "127.0.0.1:${PORT}:3000"
     environment:
-      SESSION_SECRET: ${SESSION_SECRET}
-      DSN: postgres://openflare:${DB_PASSWORD}@postgres:5432/openflare?sslmode=disable
-      GIN_MODE: release
-      LOG_LEVEL: info
-    volumes:
-      - ${DATA_DIR}:/data
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_USER=halo
+      - POSTGRES_DB=halo
+      - PGUSER=halo
+
+networks:
+  halo_network:
 EOF
 
     cd "$APP_DIR" || exit
@@ -133,12 +152,11 @@ EOF
     fi
 
     echo
-    echo -e "${GREEN}✅ OpenFlare 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}✅ Halo 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: ${EXTERNAL_URL}${RESET}"
     echo -e "${GREEN}🗄 数据库密码: ${DB_PASSWORD}${RESET}"
-    echo -e "${GREEN}🔐 SESSION_SECRET: ${SESSION_SECRET}${RESET}"
-    echo -e "${GREEN}📂 Postgres 目录: ${PG_DIR}${RESET}"
-    echo -e "${GREEN}📂 数据目录: ${DATA_DIR}${RESET}"
+    echo -e "${GREEN}📂 Halo 目录: ${HALO_DIR}${RESET}"
+    echo -e "${GREEN}📂 数据库目录: ${DB_DIR}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -147,22 +165,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ OpenFlare 更新完成${RESET}"
+    echo -e "${GREEN}✅ Halo 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart openflare openflare-db
-    echo -e "${GREEN}✅ OpenFlare 已重启${RESET}"
+    docker restart halo halo-db
+    echo -e "${GREEN}✅ Halo 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f openflare
+    docker logs -f halo
 }
 
 check_status() {
-    docker ps | grep -E "openflare"
+    docker ps | grep -E "halo"
     read -p "按回车返回菜单..."
 }
 
@@ -170,7 +188,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ OpenFlare 已卸载${RESET}"
+    echo -e "${RED}✅ Halo 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

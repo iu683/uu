@@ -1,9 +1,5 @@
 #!/bin/bash
 
-# ========= 配置 =========
-SCRIPT_PATH="/usr/local/bin/byd"
-SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
-
 # ========= 颜色 =========
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -17,29 +13,11 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# =============================
-# 自动安装自身（关键逻辑）
-# =============================
-if [[ "$0" != "$SCRIPT_PATH" ]]; then
-    echo -e "${YELLOW}正在安装 byd...${RESET}"
-
-    curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_PATH" || {
-        echo -e "${RED}下载失败${RESET}"
-        exit 1
-    }
-
-    chmod +x "$SCRIPT_PATH"
-
-    echo -e "${GREEN}安装完成！${RESET}"
-    echo -e "${GREEN}直接输入 byd 启动${RESET}"
-
-    exit 0
-fi
 
 # ========= 基础函数 =========
 pause_return() {
-    echo
-    read -p "按回车返回..." temp
+
+    read -p $'\033[32m按回车返回菜单...\033[0m' temp
 }
 
 check_net() {
@@ -50,7 +28,9 @@ check_net() {
 }
 
 normalize_input() {
-    echo "$1" | sed 's/^0*//'
+    local input
+    input=$(echo "$1" | sed 's/^0*//')
+    echo "${input:-0}"
 }
 
 run_cmd() {
@@ -79,7 +59,7 @@ update_self() {
 uninstall_self() {
     echo -e "${YELLOW}正在卸载工具箱...${RESET}"
     rm -f "$SCRIPT_PATH"
-    echo -e "${GREEN}卸载完成${RESET}"
+    echo -e "${RED}卸载完成${RESET}"
     exit 0
 }
 
@@ -100,7 +80,7 @@ while true; do
     echo -e "${YELLOW}[09] NaiveProxy${RESET}"
     echo -e "${GREEN}[10] 更新脚本${RESET}"
     echo -e "${GREEN}[11] 卸载脚本${RESET}"
-    echo -e "${GREEN}[0]  退出${RESET}"
+    echo -e "${RED}[0]  退出${RESET}"
 
     read -p $'\033[32m请输入选项: \033[0m' sub
     sub=$(normalize_input "$sub")

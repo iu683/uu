@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Halo 一键管理脚本
+# qbitwebui 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="halo"
+APP_NAME="qbitwebui"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Halo 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== qbitwebui 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -69,78 +69,40 @@ install_app() {
     fi
 
     # 端口
-    read -p "请输入访问端口 [默认:8090]: " input_port
-    PORT=${input_port:-8090}
+    read -p "请输入访问端口 [默认:3000]: " input_port
+    PORT=${input_port:-3000}
     check_port "$PORT" || return
 
     # 数据目录
-    read -p "Halo 数据目录 [默认:$APP_DIR/halo2]: " input_halo
-    HALO_DIR=${input_halo:-$APP_DIR/halo2}
+    read -p "请输入数据目录 [默认:$APP_DIR/data]: " input_data
+    DATA_DIR=${input_data:-$APP_DIR/data}
+    mkdir -p "$DATA_DIR"
 
-    read -p "数据库目录 [默认:$APP_DIR/db]: " input_db
-    DB_DIR=${input_db:-$APP_DIR/db}
+    # 下载目录
+    read -p "请输入下载目录（必须存在）: " DOWNLOAD_DIR
+    if [ ! -d "$DOWNLOAD_DIR" ]; then
+        echo -e "${RED}❌ 下载目录不存在${RESET}"
+        return
+    fi
 
-    mkdir -p "$HALO_DIR"
-    mkdir -p "$DB_DIR"
-
-    # 数据库密码
-    DB_PASSWORD=$(openssl rand -hex 12)
-
-    # external-url
-    read -p "请输入外部访问地址 [默认:http://127.0.0.1:${PORT}]: " input_url
-    EXTERNAL_URL=${input_url:-http://127.0.0.1:${PORT}}
+    # 加密密钥
+    read -p "请输入 ENCRYPTION_KEY（留空自动生成）: " input_key
+    ENCRYPTION_KEY=${input_key:-$(openssl rand -hex 32)}
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  halo:
-    image: registry.fit2cloud.com/halo/halo-pro:2.23
-    container_name: halo
-    restart: on-failure:3
-    depends_on:
-      halodb:
-        condition: service_healthy
-    networks:
-      - halo_network
-    volumes:
-      - ${HALO_DIR}:/root/.halo2
+  qbitwebui:
+    image: ghcr.io/maciejonos/qbitwebui:latest
+    container_name: qbitwebui
+    restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT}:8090"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8090/actuator/health/readiness"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    environment:
-      - JVM_OPTS=-Xmx256m -Xms256m
-    command:
-      - --spring.r2dbc.url=r2dbc:pool:postgresql://halodb/halo
-      - --spring.r2dbc.username=halo
-      - --spring.r2dbc.password=${DB_PASSWORD}
-      - --spring.sql.init.platform=postgresql
-      - --halo.external-url=${EXTERNAL_URL}
-
-  halodb:
-    image: postgres:15.4
-    container_name: halo-db
-    restart: on-failure:3
-    networks:
-      - halo_network
+      - "127.0.0.1:${PORT}:3000"
     volumes:
-      - ${DB_DIR}:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD", "pg_isready"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      - ${DATA_DIR}:/data
+      - ${DOWNLOAD_DIR}:/downloads:ro
     environment:
-      - POSTGRES_PASSWORD=${DB_PASSWORD}
-      - POSTGRES_USER=halo
-      - POSTGRES_DB=halo
-      - PGUSER=halo
-
-networks:
-  halo_network:
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      DOWNLOADS_PATH: /downloads
 EOF
 
     cd "$APP_DIR" || exit
@@ -152,11 +114,11 @@ EOF
     fi
 
     echo
-    echo -e "${GREEN}✅ Halo 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: ${EXTERNAL_URL}${RESET}"
-    echo -e "${GREEN}🗄 数据库密码: ${DB_PASSWORD}${RESET}"
-    echo -e "${GREEN}📂 Halo 目录: ${HALO_DIR}${RESET}"
-    echo -e "${GREEN}📂 数据库目录: ${DB_DIR}${RESET}"
+    echo -e "${GREEN}✅ qbitwebui 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}🔐 ENCRYPTION_KEY: ${ENCRYPTION_KEY}${RESET}"
+    echo -e "${GREEN}📂 数据目录: ${DATA_DIR}${RESET}"
+    echo -e "${GREEN}📥 下载目录: ${DOWNLOAD_DIR}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -165,22 +127,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Halo 更新完成${RESET}"
+    echo -e "${GREEN}✅ qbitwebui 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart halo halo-db
-    echo -e "${GREEN}✅ Halo 已重启${RESET}"
+    docker restart qbitwebui
+    echo -e "${GREEN}✅ qbitwebui 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f halo
+    docker logs -f qbitwebui
 }
 
 check_status() {
-    docker ps | grep -E "halo"
+    docker ps | grep qbitwebui
     read -p "按回车返回菜单..."
 }
 
@@ -188,7 +150,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Halo 已卸载${RESET}"
+    echo -e "${RED}✅ qbitwebui 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

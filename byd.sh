@@ -1,9 +1,5 @@
 #!/bin/bash
 
-# ========= 配置 =========
-SCRIPT_PATH="/usr/local/bin/byd"
-SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/byd.sh" # ← 改成你的脚本地址
-
 # ========= 颜色 =========
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -17,31 +13,11 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# =============================
-# 自动安装自身（关键逻辑）
-# =============================
-if [[ "$0" != "$SCRIPT_PATH" ]]; then
-    echo -e "${YELLOW}正在安装代理工具箱...${RESET}"
-
-    curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_PATH" || {
-        echo -e "${RED}下载失败${RESET}"
-        exit 1
-    }
-
-    chmod +x "$SCRIPT_PATH"
-
-   
-    echo -e "${GREEN}安装完成，输入 byd 快捷启动${RESET}"
-    echo -e "${GREEN}正在启动...${RESET}"
-    sleep 1
-
-    exec "$SCRIPT_PATH"   
-fi
 
 # ========= 基础函数 =========
 pause_return() {
 
-    read -p $'\033[32m按回车返回...\033[0m' temp
+    read -p $'\033[32m按回车返回菜单...\033[0m' temp
 }
 
 check_net() {
@@ -52,7 +28,9 @@ check_net() {
 }
 
 normalize_input() {
-    echo "$1" | sed 's/^0*//'
+    local input
+    input=$(echo "$1" | sed 's/^0*//')
+    echo "${input:-0}"
 }
 
 run_cmd() {

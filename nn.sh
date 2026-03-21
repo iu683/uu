@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Remio Home 一键管理脚本
+# Komga 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="remio-home"
+APP_NAME="komga"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Remio Home 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Komga 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -69,51 +69,58 @@ install_app() {
     fi
 
     # 端口
-    read -p "请输入访问端口 [默认:3000]: " input_port
-    PORT=${input_port:-3000}
+    read -p "请输入访问端口 [默认:25600]: " input_port
+    PORT=${input_port:-25600}
     check_port "$PORT" || return
 
     # 配置目录
     read -p "配置目录 [默认:$APP_DIR/config]: " input_config
     CONFIG_DIR=${input_config:-$APP_DIR/config}
 
-    # 图标目录
-    read -p "图标目录 [默认:$APP_DIR/icons]: " input_icons
-    ICON_DIR=${input_icons:-$APP_DIR/icons}
+    # 漫画目录
+    read -p "漫画数据目录 [默认:$APP_DIR/data]: " input_data
+    DATA_DIR=${input_data:-$APP_DIR/data}
 
-    # 密码
-    DEFAULT_PASS=$(openssl rand -base64 12 | tr -dc A-Za-z0-9 | head -c 12)
-    read -p "访问密码 [默认随机生成]: " input_pass
-    PASSWORD=${input_pass:-$DEFAULT_PASS}
+    if [ ! -d "$DATA_DIR" ]; then
+        echo -e "${YELLOW}目录不存在，正在创建...${RESET}"
+        mkdir -p "$DATA_DIR"
+    fi
+
+    # UID/GID 固定
+    UID_VAL=1000
+    GID_VAL=1000
 
     mkdir -p "$CONFIG_DIR"
-    mkdir -p "$ICON_DIR"
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  remio-home:
-    image: kasuie/remio-home
-    container_name: remio-home
+  komga:
+    image: gotson/komga
+    container_name: komga
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT}:3000"
+      - "127.0.0.1:${PORT}:25600"
+    volumes:
+      - ${CONFIG_DIR}:/config
+      - ${DATA_DIR}:/data
+    user: "${UID_VAL}:${GID_VAL}"
     environment:
       - TZ=Asia/Shanghai
-      - PASSWORD=${PASSWORD}
-    volumes:
-      - ${CONFIG_DIR}:/remio-home/config
-      - ${ICON_DIR}:/remio-home/public/icons
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
+        return
+    fi
+
     echo
-    echo -e "${GREEN}✅ Remio Home 已启动${RESET}"
+    echo -e "${GREEN}✅ Komga 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}🔑 登录密码: ${PASSWORD}${RESET}"
     echo -e "${GREEN}📂 配置目录: ${CONFIG_DIR}${RESET}"
-    echo -e "${GREEN}🎨 图标目录: ${ICON_DIR}${RESET}"
+    echo -e "${GREEN}📚 漫画目录: ${DATA_DIR}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -122,22 +129,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Remio Home 更新完成${RESET}"
+    echo -e "${GREEN}✅ Komga 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart remio-home
-    echo -e "${GREEN}✅ Remio Home 已重启${RESET}"
+    docker restart komga
+    echo -e "${GREEN}✅ Komga 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f remio-home
+    docker logs -f komga
 }
 
 check_status() {
-    docker ps | grep remio-home
+    docker ps | grep komga
     read -p "按回车返回菜单..."
 }
 
@@ -145,8 +152,8 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Remio Home 已卸载${RESET}"
+    echo -e "${RED}✅ Komga 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 
-menu  
+menu

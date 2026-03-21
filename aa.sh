@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# MicroWarp 一键管理脚本
+# Komga 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="microwarp"
+APP_NAME="komga"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== MicroWarp 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Komga 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -69,31 +69,46 @@ install_app() {
     fi
 
     # 端口
-    read -p "请输入 SOCKS5 端口 [默认:1080]: " input_port
-    PORT=${input_port:-1080}
+    read -p "请输入访问端口 [默认:25600]: " input_port
+    PORT=${input_port:-25600}
     check_port "$PORT" || return
 
-    # 数据目录
-    read -p "WireGuard 数据目录 [默认:$APP_DIR/data]: " input_data
+    # 配置目录
+    read -p "配置目录 [默认:$APP_DIR/config]: " input_config
+    CONFIG_DIR=${input_config:-$APP_DIR/config}
+
+    # 漫画目录
+    read -p "漫画数据目录 [默认:$APP_DIR/data]: " input_data
     DATA_DIR=${input_data:-$APP_DIR/data}
 
-    mkdir -p "$DATA_DIR"
+    if [ ! -d "$DATA_DIR" ]; then
+        echo -e "${YELLOW}目录不存在，正在创建...${RESET}"
+        mkdir -p "$DATA_DIR"
+    fi
+
+    # UID/GID 固定
+    UID_VAL=1000
+    GID_VAL=1000
+
+    mkdir -p "$CONFIG_DIR"
+
+    chown -R 1000:1000 "$CONFIG_DIR"
+    chown -R 1000:1000 "$DATA_DIR"
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  microwarp:
-    image: ghcr.io/ccbkkb/microwarp:latest
-    container_name: microwarp
-    restart: always
+  komga:
+    image: gotson/komga
+    container_name: komga
+    restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT}:1080"
-    cap_add:
-      - NET_ADMIN
-      - SYS_MODULE
-    sysctls:
-      - net.ipv4.conf.all.src_valid_mark=1
+      - "127.0.0.1:${PORT}:25600"
     volumes:
-      - ${DATA_DIR}:/etc/wireguard
+      - ${CONFIG_DIR}:/config
+      - ${DATA_DIR}:/data
+    user: "${UID_VAL}:${GID_VAL}"
+    environment:
+      - TZ=Asia/Shanghai
 EOF
 
     cd "$APP_DIR" || exit
@@ -105,9 +120,10 @@ EOF
     fi
 
     echo
-    echo -e "${GREEN}✅ MicroWarp 已启动${RESET}"
-    echo -e "${YELLOW}🌐 SOCKS5 地址: 127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 数据目录: ${DATA_DIR}${RESET}"
+    echo -e "${GREEN}✅ Komga 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📂 配置目录: ${CONFIG_DIR}${RESET}"
+    echo -e "${GREEN}📚 漫画目录: ${DATA_DIR}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -116,22 +132,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ MicroWarp 更新完成${RESET}"
+    echo -e "${GREEN}✅ Komga 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart microwarp
-    echo -e "${GREEN}✅ MicroWarp 已重启${RESET}"
+    docker restart komga
+    echo -e "${GREEN}✅ Komga 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f microwarp
+    docker logs -f komga
 }
 
 check_status() {
-    docker ps | grep microwarp
+    docker ps | grep komga
     read -p "按回车返回菜单..."
 }
 
@@ -139,7 +155,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ MicroWarp 已卸载${RESET}"
+    echo -e "${RED}✅ Komga 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

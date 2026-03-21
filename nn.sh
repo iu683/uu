@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# QQBot 一键管理脚本
+# Remio Home 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,10 +8,9 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="qqbot"
+APP_NAME="remio-home"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.toml"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -35,13 +34,13 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== QQBot 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Remio Home 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含配置/数据)${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
@@ -59,10 +58,9 @@ menu() {
 }
 
 install_app() {
-    check_docker
 
+    check_docker
     mkdir -p "$APP_DIR"
-    mkdir -p "$APP_DIR/data"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -71,55 +69,51 @@ install_app() {
     fi
 
     # 端口
-    read -p "请输入访问端口 [默认:8080]: " input_port
-    PORT=${input_port:-8080}
+    read -p "请输入访问端口 [默认:3000]: " input_port
+    PORT=${input_port:-3000}
     check_port "$PORT" || return
 
-    # config.toml
-    read -p "请输入 AppID: " APPID
-    read -p "请输入 ClientSecret: " CLIENTSECRET
-    read -p "是否开启 Markdown 支持? [默认 false]: " MARKDOWN
-    MARKDOWN=${MARKDOWN:-false}
-    read -p "请输入 API Token (强密码): " API_TOKEN
+    # 配置目录
+    read -p "配置目录 [默认:$APP_DIR/config]: " input_config
+    CONFIG_DIR=${input_config:-$APP_DIR/config}
 
-    cat > "$CONFIG_FILE" <<EOF
-[qqbot]
-app_id = "${APPID}"
-client_secret = "${CLIENTSECRET}"
-markdown = ${MARKDOWN}
+    # 图标目录
+    read -p "图标目录 [默认:$APP_DIR/icons]: " input_icons
+    ICON_DIR=${input_icons:-$APP_DIR/icons}
 
-[server]
-listen_addr = ":${PORT}"
-api_token = "${API_TOKEN}"
-EOF
+    # 密码
+    DEFAULT_PASS=$(openssl rand -base64 12 | tr -dc A-Za-z0-9 | head -c 12)
+    read -p "访问密码 [默认随机生成]: " input_pass
+    PASSWORD=${input_pass:-$DEFAULT_PASS}
 
-    # docker-compose.yml
+    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$ICON_DIR"
+
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  qqbot:
-    image: ghcr.io/sky22333/qqbot
-    container_name: qqbot
-    restart: always
+  remio-home:
+    image: kasuie/remio-home
+    container_name: remio-home
+    restart: unless-stopped
     ports:
-      - "${PORT}:8080"
+      - "127.0.0.1:${PORT}:3000"
+    environment:
+      - TZ=Asia/Shanghai
+      - PASSWORD=${PASSWORD}
     volumes:
-      - ${CONFIG_FILE}:/root/config.toml
-      - ${APP_DIR}/data:/root/data
+      - ${CONFIG_DIR}:/remio-home/config
+      - ${ICON_DIR}:/remio-home/public/icons
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
-        return
-    fi
-
     echo
-    echo -e "${GREEN}✅ QQBot 已启动${RESET}"
+    echo -e "${GREEN}✅ Remio Home 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
-    echo -e "${GREEN}📂 配置文件: $CONFIG_FILE${RESET}"
+    echo -e "${GREEN}🔑 登录密码: ${PASSWORD}${RESET}"
+    echo -e "${GREEN}📂 配置目录: ${CONFIG_DIR}${RESET}"
+    echo -e "${GREEN}🎨 图标目录: ${ICON_DIR}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -128,22 +122,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ QQBot 更新完成${RESET}"
+    echo -e "${GREEN}✅ Remio Home 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart qqbot
-    echo -e "${GREEN}✅ QQBot 已重启${RESET}"
+    docker restart remio-home
+    echo -e "${GREEN}✅ Remio Home 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f qqbot
+    docker logs -f remio-home
 }
 
 check_status() {
-    docker ps | grep qqbot
+    docker ps | grep remio-home
     read -p "按回车返回菜单..."
 }
 
@@ -151,8 +145,8 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ QQBot 已卸载${RESET}"
+    echo -e "${RED}✅ Remio Home 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 
-menu
+menu  

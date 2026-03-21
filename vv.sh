@@ -17,27 +17,6 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# =============================
-# 自动安装自身（关键逻辑）
-# =============================
-if [[ "$0" != "$SCRIPT_PATH" ]]; then
-    echo -e "${YELLOW}正在安装代理工具箱...${RESET}"
-
-    curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_PATH" || {
-        echo -e "${RED}下载失败${RESET}"
-        exit 1
-    }
-
-    chmod +x "$SCRIPT_PATH"
-
-   
-    echo -e "${GREEN}安装完成，输入 byd 快捷启动${RESET}"
-    echo -e "${GREEN}正在启动...${RESET}"
-    sleep 1
-
-    exec "$SCRIPT_PATH"   
-fi
-
 # ========= 基础函数 =========
 pause_return() {
 

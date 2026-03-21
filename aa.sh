@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Remio Home 一键管理脚本
+# MicroWarp 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="remio-home"
+APP_NAME="microwarp"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Remio Home 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== MicroWarp 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -69,34 +69,31 @@ install_app() {
     fi
 
     # 端口
-    read -p "请输入访问端口 [默认:3000]: " input_port
-    PORT=${input_port:-3000}
+    read -p "请输入 SOCKS5 端口 [默认:1080]: " input_port
+    PORT=${input_port:-1080}
     check_port "$PORT" || return
 
-    # 配置目录
-    read -p "配置目录 [默认:$APP_DIR/config]: " input_config
-    CONFIG_DIR=${input_config:-$APP_DIR/config}
+    # 数据目录
+    read -p "WireGuard 数据目录 [默认:$APP_DIR/data]: " input_data
+    DATA_DIR=${input_data:-$APP_DIR/data}
 
-    # 图标目录
-    read -p "图标目录 [默认:$APP_DIR/icons]: " input_icons
-    ICON_DIR=${input_icons:-$APP_DIR/icons}
-
-    mkdir -p "$CONFIG_DIR"
-    mkdir -p "$ICON_DIR"
+    mkdir -p "$DATA_DIR"
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  remio-home:
-    image: kasuie/remio-home
-    container_name: remio-home
-    restart: unless-stopped
+  microwarp:
+    image: ghcr.io/ccbkkb/microwarp:latest
+    container_name: microwarp
+    restart: always
     ports:
-      - "127.0.0.1:${PORT}:3000"
-    environment:
-      - TZ=Asia/Shanghai
+      - "127.0.0.1:${PORT}:1080"
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
     volumes:
-      - ${CONFIG_DIR}:/remio-home/config
-      - ${ICON_DIR}:/remio-home/public/icons
+      - ${DATA_DIR}:/etc/wireguard
 EOF
 
     cd "$APP_DIR" || exit
@@ -108,10 +105,9 @@ EOF
     fi
 
     echo
-    echo -e "${GREEN}✅ Remio Home 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 配置目录: ${CONFIG_DIR}${RESET}"
-    echo -e "${GREEN}🎨 图标目录: ${ICON_DIR}${RESET}"
+    echo -e "${GREEN}✅ MicroWarp 已启动${RESET}"
+    echo -e "${YELLOW}🌐 SOCKS5 地址: 127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📂 数据目录: ${DATA_DIR}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -120,22 +116,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Remio Home 更新完成${RESET}"
+    echo -e "${GREEN}✅ MicroWarp 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart remio-home
-    echo -e "${GREEN}✅ Remio Home 已重启${RESET}"
+    docker restart microwarp
+    echo -e "${GREEN}✅ MicroWarp 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f remio-home
+    docker logs -f microwarp
 }
 
 check_status() {
-    docker ps | grep remio-home
+    docker ps | grep microwarp
     read -p "按回车返回菜单..."
 }
 
@@ -143,8 +139,8 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Remio Home 已卸载${RESET}"
+    echo -e "${RED}✅ MicroWarp 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 
-menu  
+menu

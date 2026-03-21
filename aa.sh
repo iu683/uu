@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# vstats-server 一键管理脚本
+# Remio Home 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="vstats"
+APP_NAME="remio-home"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== vstats-server 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Remio Home 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -69,25 +69,34 @@ install_app() {
     fi
 
     # 端口
-    read -p "请输入访问端口 [默认:3001]: " input_port
-    PORT=${input_port:-3001}
+    read -p "请输入访问端口 [默认:3000]: " input_port
+    PORT=${input_port:-3000}
     check_port "$PORT" || return
 
-    # 数据目录
-    read -p "请输入数据目录 [默认:$APP_DIR/data]: " input_data
-    DATA_DIR=${input_data:-$APP_DIR/data}
-    mkdir -p "$DATA_DIR"
+    # 配置目录
+    read -p "配置目录 [默认:$APP_DIR/config]: " input_config
+    CONFIG_DIR=${input_config:-$APP_DIR/config}
+
+    # 图标目录
+    read -p "图标目录 [默认:$APP_DIR/icons]: " input_icons
+    ICON_DIR=${input_icons:-$APP_DIR/icons}
+
+    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$ICON_DIR"
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  vstats-server:
-    image: zsai001/vstats-server:latest
-    container_name: vstats-server
+  remio-home:
+    image: kasuie/remio-home
+    container_name: remio-home
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT}:3001"
+      - "127.0.0.1:${PORT}:3000"
+    environment:
+      - TZ=Asia/Shanghai
     volumes:
-      - ${DATA_DIR}:/app/data
+      - ${CONFIG_DIR}:/remio-home/config
+      - ${ICON_DIR}:/remio-home/public/icons
 EOF
 
     cd "$APP_DIR" || exit
@@ -99,9 +108,10 @@ EOF
     fi
 
     echo
-    echo -e "${GREEN}✅ vstats-server 已启动${RESET}"
+    echo -e "${GREEN}✅ Remio Home 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 数据目录: ${DATA_DIR}${RESET}"
+    echo -e "${GREEN}📂 配置目录: ${CONFIG_DIR}${RESET}"
+    echo -e "${GREEN}🎨 图标目录: ${ICON_DIR}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -110,22 +120,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ vstats-server 更新完成${RESET}"
+    echo -e "${GREEN}✅ Remio Home 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart vstats-server
-    echo -e "${GREEN}✅ vstats-server 已重启${RESET}"
+    docker restart remio-home
+    echo -e "${GREEN}✅ Remio Home 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f vstats-server
+    docker logs -f remio-home
 }
 
 check_status() {
-    docker ps | grep vstats-server
+    docker ps | grep remio-home
     read -p "按回车返回菜单..."
 }
 
@@ -133,8 +143,8 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ vstats-server 已卸载${RESET}"
+    echo -e "${RED}✅ Remio Home 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 
-menu
+menu  

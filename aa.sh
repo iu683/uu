@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# ========= 配置 =========
+SCRIPT_PATH="/usr/local/bin/byd"
+
 # ========= 颜色 =========
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -12,7 +15,6 @@ if [[ $EUID -ne 0 ]]; then
     echo -e "${RED}请使用 root 运行${RESET}"
     exit 1
 fi
-
 
 # ========= 基础函数 =========
 pause_return() {

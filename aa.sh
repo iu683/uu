@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Komga 一键管理脚本
+# Moments Blog 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,9 +8,10 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="komga"
+APP_NAME="moments-blog"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+ENV_FILE="$APP_DIR/.env"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -34,7 +35,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Komga 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Moments Blog 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -69,46 +70,82 @@ install_app() {
     fi
 
     # 端口
-    read -p "请输入访问端口 [默认:25600]: " input_port
-    PORT=${input_port:-25600}
+    read -p "请输入访问端口 [默认:3001]: " input_port
+    PORT=${input_port:-3001}
     check_port "$PORT" || return
 
-    # 配置目录
-    read -p "配置目录 [默认:$APP_DIR/config]: " input_config
-    CONFIG_DIR=${input_config:-$APP_DIR/config}
+    # 数据目录
+    DATA_DIR="$APP_DIR/data"
+    mkdir -p "$DATA_DIR"/{postgres,uploads,logs}
 
-    # 漫画目录
-    read -p "漫画数据目录 [默认:$APP_DIR/data]: " input_data
-    DATA_DIR=${input_data:-$APP_DIR/data}
+    # 随机密码
+    DB_PASSWORD=$(openssl rand -hex 16)
+    ADMIN_PASSWORD=$(openssl rand -hex 12)
+    JWT_SECRET=$(openssl rand -hex 32)
 
-    if [ ! -d "$DATA_DIR" ]; then
-        echo -e "${YELLOW}目录不存在，正在创建...${RESET}"
-        mkdir -p "$DATA_DIR"
-    fi
+    # env 文件
+    cat > "$ENV_FILE" <<EOF
+HOST_PORT=$PORT
+DB_NAME=moments
+DB_USER=moments
+DB_PASSWORD=$DB_PASSWORD
 
-    # UID/GID 固定
-    UID_VAL=1000
-    GID_VAL=1000
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=$ADMIN_PASSWORD
 
-    mkdir -p "$CONFIG_DIR"
+JWT_SECRET=$JWT_SECRET
+EOF
 
-    chown -R 1000:1000 "$CONFIG_DIR"
-    chown -R 1000:1000 "$DATA_DIR"
-
+    # compose
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  komga:
-    image: gotson/komga
-    container_name: komga
+
+  db:
+    image: postgres:15-alpine
+    container_name: moments-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: \${DB_NAME}
+      POSTGRES_USER: \${DB_USER}
+      POSTGRES_PASSWORD: \${DB_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data/pgdata
+    healthcheck:
+      test: ["CMD-SHELL","pg_isready -U \${DB_USER} -d \${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - moments-net
+
+  moments-blog:
+    image: koalalove/moments-blog:latest
+    container_name: moments-blog
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT}:25600"
+      - "\${HOST_PORT}:80"
     volumes:
-      - ${CONFIG_DIR}:/config
-      - ${DATA_DIR}:/data
-    user: "${UID_VAL}:${GID_VAL}"
+      - ./data/uploads:/data/uploads
+      - ./data/logs:/data/logs
     environment:
-      - TZ=Asia/Shanghai
+      JWT_SECRET: \${JWT_SECRET}
+      ADMIN_USERNAME: \${ADMIN_USERNAME}
+      ADMIN_PASSWORD: \${ADMIN_PASSWORD}
+      DATABASE_URL: postgresql://\${DB_USER}:\${DB_PASSWORD}@db:5432/\${DB_NAME}
+      NODE_ENV: production
+      PORT: 3001
+      UPLOAD_DIR: /data/uploads
+      INTERNAL_API_URL: http://localhost:3001
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - moments-net
+
+networks:
+  moments-net:
+    driver: bridge
 EOF
 
     cd "$APP_DIR" || exit
@@ -120,10 +157,10 @@ EOF
     fi
 
     echo
-    echo -e "${GREEN}✅ Komga 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 配置目录: ${CONFIG_DIR}${RESET}"
-    echo -e "${GREEN}📚 漫画目录: ${DATA_DIR}${RESET}"
+    echo -e "${GREEN}✅ Moments Blog 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://服务器IP:${PORT}${RESET}"
+    echo -e "${GREEN}👤 后台账号: admin${RESET}"
+    echo -e "${GREEN}🔑 后台密码: ${ADMIN_PASSWORD}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -132,22 +169,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Komga 更新完成${RESET}"
+    echo -e "${GREEN}✅ Moments Blog 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart komga
-    echo -e "${GREEN}✅ Komga 已重启${RESET}"
+    docker restart moments-blog
+    echo -e "${GREEN}✅ Moments Blog 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f komga
+    docker logs -f moments-blog
 }
 
 check_status() {
-    docker ps | grep komga
+    docker ps | grep moments-blog
     read -p "按回车返回菜单..."
 }
 
@@ -155,7 +192,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Komga 已卸载${RESET}"
+    echo -e "${RED}✅ Moments Blog 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

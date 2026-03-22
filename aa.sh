@@ -78,11 +78,23 @@ install_app() {
     DATA_DIR="$APP_DIR/data"
     mkdir -p "$DATA_DIR"/{postgres,uploads,logs}
 
-    # 随机密码
-    DB_PASSWORD=$(openssl rand -hex 16)
-    ADMIN_PASSWORD=$(openssl rand -hex 12)
-    JWT_SECRET=$(openssl rand -hex 32)
+    # 管理员用户名
+    read -p "管理员用户名 [默认:admin]: " input_admin
+    ADMIN_USERNAME=${input_admin:-admin}
 
+    # 管理员密码
+    read -p "管理员密码 [默认:随机生成]: " input_pass
+    if [ -z "$input_pass" ]; then
+    ADMIN_PASSWORD=$(openssl rand -hex 12)
+    else
+    ADMIN_PASSWORD="$input_pass"
+    fi
+
+    # 数据库密码
+    DB_PASSWORD=$(openssl rand -hex 16)
+
+    # JWT
+    JWT_SECRET=$(openssl rand -hex 32)
     # env 文件
     cat > "$ENV_FILE" <<EOF
 HOST_PORT=$PORT
@@ -90,7 +102,7 @@ DB_NAME=moments
 DB_USER=moments
 DB_PASSWORD=$DB_PASSWORD
 
-ADMIN_USERNAME=admin
+ADMIN_USERNAME=$ADMIN_USERNAME
 ADMIN_PASSWORD=$ADMIN_PASSWORD
 
 JWT_SECRET=$JWT_SECRET
@@ -124,7 +136,7 @@ services:
     container_name: moments-blog
     restart: unless-stopped
     ports:
-      - "\${HOST_PORT}:80"
+      - "127.0.0.1:${PORT}:80"
     volumes:
       - ./data/uploads:/data/uploads
       - ./data/logs:/data/logs
@@ -158,9 +170,10 @@ EOF
 
     echo
     echo -e "${GREEN}✅ Moments Blog 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://服务器IP:${PORT}${RESET}"
-    echo -e "${GREEN}👤 后台账号: admin${RESET}"
-    echo -e "${GREEN}🔑 后台密码: ${ADMIN_PASSWORD}${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${YELLOW}🌐 后台地址: http://127.0.0.1:${PORT}/admin${RESET}"
+    echo -e "${YELLOW}👤 后台账号: ${ADMIN_USERNAME}${RESET}"
+    echo -e "${YELLOW}🔑 后台密码: ${ADMIN_PASSWORD}${RESET}"
 
     read -p "按回车返回菜单..."
 }

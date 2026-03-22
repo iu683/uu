@@ -155,6 +155,8 @@ install_xray() {
 
    # 生成随机UUID和密码
     password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24)
+    GRPC_PORT=$(($PORT + 1))
+    XHTTP_PORT=$(($PORT + 2))
 
     # 关闭防火墙
     iptables -F > /dev/null 2>&1 && iptables -P INPUT ACCEPT > /dev/null 2>&1 && iptables -P FORWARD ACCEPT > /dev/null 2>&1 && iptables -P OUTPUT ACCEPT > /dev/null 2>&1
@@ -173,7 +175,7 @@ cat > "${config_dir}" << EOF
       "port": $ARGO_PORT,
       "protocol": "vless",
       "settings": {
-        "clients": [{ "id": "$UUID" }],
+        "clients": [{ "id": "$UUID", "flow": "xtls-rprx-vision" }],
         "decryption": "none",
         "fallbacks": [
           { "dest": 3001 }, { "path": "/vless-argo", "dest": 3002 },
@@ -198,7 +200,18 @@ cat > "${config_dir}" << EOF
       "settings": { "clients": [{ "id": "$UUID", "alterId": 0 }] },
       "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess-argo" } },
       "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false }
+    },
+    {
+      "listen":"::","port": $XHTTP_PORT, "protocol": "vless","settings": {"clients": [{"id": "$UUID"}],"decryption": "none"},
+      "streamSettings": {"network": "xhttp","security": "reality","realitySettings": {"target": "www.nazhumi.com:443","xver": 0,"serverNames": 
+      ["www.nazhumi.com"],"privateKey": "$private_key","shortIds": [""]}},"sniffing": {"enabled": true,"destOverride": ["http","tls","quic"]}
+    },
+    {
+      "listen":"::","port":$GRPC_PORT,"protocol":"vless","settings":{"clients":[{"id":"$UUID"}],"decryption":"none"},
+      "streamSettings":{"network":"grpc","security":"reality","realitySettings":{"dest":"www.iij.ad.jp:443","serverNames":["www.iij.ad.jp"],
+      "privateKey":"$private_key","shortIds":[""]},"grpcSettings":{"serviceName":"grpc"}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"]}
     }
+  ],
   "dns": { "servers": ["https+local://8.8.8.8/dns-query"] },
    "outbounds": [
         {
@@ -329,8 +342,6 @@ EOF
 echo ""
 while IFS= read -r line; do echo -e "${purple}$line"; done < ${work_dir}/url.txt
 base64 -w0 ${work_dir}/url.txt > ${work_dir}/sub.txt
-green "订阅二维码"
-$work_dir/qrencode "http://$IP:$PORT/$password"
 echo ""
 }
 
@@ -623,7 +634,6 @@ EOF
                     sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/xray/argo tunnel --edge-ip-version auto --config /etc/xray/tunnel.yml run 2>&1"' /etc/systemd/system/tunnel.service
                 fi
                 restart_argo
-                add_split_url
                 change_argo_domain
             elif [[ $argo_auth =~ ^[A-Z0-9a-z=]{120,250}$ ]]; then
                 if [ -f /etc/alpine-release ]; then
@@ -633,7 +643,6 @@ EOF
                     sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/xray/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token '$argo_auth' 2>&1"' /etc/systemd/system/tunnel.service
                 fi
                 restart_argo
-                add_split_url
                 change_argo_domain
             else
                 yellow "你输入的argo域名或token不匹配，请重新输入"
@@ -700,24 +709,37 @@ ArgoDomain=$get_argodomain
 
 # 更新Argo域名到订阅
 change_argo_domain() {
-    sed -i "5s/sni=[^&]*/sni=$ArgoDomain/; 5s/host=[^&]*/host=$ArgoDomain/" /etc/xray/url.txt
+
+    sed -i "s/sni=[^&]*/sni=$ArgoDomain/g; s/host=[^&]*/host=$ArgoDomain/g" /etc/xray/url.txt
+
     content=$(cat "$client_dir")
+
     vmess_urls=$(grep -o 'vmess://[^ ]*' "$client_dir")
-    vmess_prefix="vmess://"
+
     for vmess_url in $vmess_urls; do
-        encoded_vmess="${vmess_url#"$vmess_prefix"}"
-        decoded_vmess=$(echo "$encoded_vmess" | base64 --decode)
-        updated_vmess=$(echo "$decoded_vmess" | jq --arg new_domain "$ArgoDomain" '.host = $new_domain | .sni = $new_domain')
+        encoded_vmess="${vmess_url#vmess://}"
+        decoded_vmess=$(echo "$encoded_vmess" | base64 -d 2>/dev/null)
+
+        updated_vmess=$(echo "$decoded_vmess" | jq \
+        --arg new_domain "$ArgoDomain" \
+        '.host = $new_domain | .sni = $new_domain')
+
         encoded_updated_vmess=$(echo "$updated_vmess" | base64 | tr -d '\n')
-        new_vmess_url="$vmess_prefix$encoded_updated_vmess"
+
+        new_vmess_url="vmess://$encoded_updated_vmess"
+
         content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
     done
+
     echo "$content" > "$client_dir"
+
     base64 -w0 ${work_dir}/url.txt > ${work_dir}/sub.txt
 
-    while IFS= read -r line; do echo -e "${purple}$line"; done < "$client_dir"
-    
-    green "\n节点已更新,更新订阅或手动复制以上节点\n"
+    while IFS= read -r line; do
+        echo -e "${purple}$line"
+    done < "$client_dir"
+
+    green "\n节点已更新, 更新订阅或手动复制以上节点\n"
 }
 
 # 查看节点信息和订阅链接
@@ -738,10 +760,8 @@ trap 'red "已取消操作"; exit' INT
 menu() {
 while true; do
    check_xray &>/dev/null; check_xray=$?
-   check_caddy &>/dev/null; check_caddy=$?
    check_argo &>/dev/null; check_argo=$?
    check_xray_status=$(check_xray) > /dev/null 2>&1
-   check_caddy_status=$(check_caddy) > /dev/null 2>&1
    check_argo_status=$(check_argo) > /dev/null 2>&1
    clear
    echo ""
@@ -764,7 +784,6 @@ while true; do
             if [ ${check_xray} -eq 0 ]; then
                 yellow "Xray-2go 已经安装！"
             else
-                install_caddy
                 manage_packages install jq unzip iptables openssl coreutils lsof
                 install_xray
 

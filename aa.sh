@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Moments Blog 一键管理脚本
+# php-epg 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,10 +8,9 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="moments-blog"
+APP_NAME="php-epg"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-ENV_FILE="$APP_DIR/.env"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -35,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Moments Blog 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== php-epg 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -70,94 +69,33 @@ install_app() {
     fi
 
     # 端口
-    read -p "请输入访问端口 [默认:3001]: " input_port
-    PORT=${input_port:-3001}
+    read -p "请输入访问端口 [默认:5678]: " input_port
+    PORT=${input_port:-5678}
     check_port "$PORT" || return
 
     # 数据目录
-    DATA_DIR="$APP_DIR/data"
-    mkdir -p "$DATA_DIR"/{postgres,uploads,logs}
+    read -p "EPG 数据目录 [默认:$APP_DIR/data]: " input_data
+    DATA_DIR=${input_data:-$APP_DIR/data}
 
-    # 管理员用户名
-    read -p "管理员用户名 [默认:admin]: " input_admin
-    ADMIN_USERNAME=${input_admin:-admin}
+    mkdir -p "$DATA_DIR"
 
-    # 管理员密码
-    read -p "管理员密码 [默认:随机生成]: " input_pass
-    if [ -z "$input_pass" ]; then
-    ADMIN_PASSWORD=$(openssl rand -hex 12)
-    else
-    ADMIN_PASSWORD="$input_pass"
-    fi
+    # ffmpeg
+    read -p "是否启用 ffmpeg (true/false) [默认:false]: " input_ffmpeg
+    ENABLE_FFMPEG=${input_ffmpeg:-false}
 
-    # 数据库密码
-    DB_PASSWORD=$(openssl rand -hex 16)
-
-    # JWT
-    JWT_SECRET=$(openssl rand -hex 32)
-    # env 文件
-    cat > "$ENV_FILE" <<EOF
-HOST_PORT=$PORT
-DB_NAME=moments
-DB_USER=moments
-DB_PASSWORD=$DB_PASSWORD
-
-ADMIN_USERNAME=$ADMIN_USERNAME
-ADMIN_PASSWORD=$ADMIN_PASSWORD
-
-JWT_SECRET=$JWT_SECRET
-EOF
-
-    # compose
     cat > "$COMPOSE_FILE" <<EOF
 services:
-
-  db:
-    image: postgres:15-alpine
-    container_name: moments-db
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: \${DB_NAME}
-      POSTGRES_USER: \${DB_USER}
-      POSTGRES_PASSWORD: \${DB_PASSWORD}
-      PGDATA: /var/lib/postgresql/data/pgdata
-    volumes:
-      - ./data/postgres:/var/lib/postgresql/data/pgdata
-    healthcheck:
-      test: ["CMD-SHELL","pg_isready -U \${DB_USER} -d \${DB_NAME}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - moments-net
-
-  moments-blog:
-    image: koalalove/moments-blog:latest
-    container_name: moments-blog
+  php-epg:
+    image: taksss/php-epg:latest
+    container_name: php-epg
     restart: unless-stopped
     ports:
       - "127.0.0.1:${PORT}:80"
     volumes:
-      - ./data/uploads:/data/uploads
-      - ./data/logs:/data/logs
+      - ${DATA_DIR}:/htdocs/data
     environment:
-      JWT_SECRET: \${JWT_SECRET}
-      ADMIN_USERNAME: \${ADMIN_USERNAME}
-      ADMIN_PASSWORD: \${ADMIN_PASSWORD}
-      DATABASE_URL: postgresql://\${DB_USER}:\${DB_PASSWORD}@db:5432/\${DB_NAME}
-      NODE_ENV: production
-      PORT: 3001
-      UPLOAD_DIR: /data/uploads
-      INTERNAL_API_URL: http://localhost:3001
-    depends_on:
-      db:
-        condition: service_healthy
-    networks:
-      - moments-net
-
-networks:
-  moments-net:
-    driver: bridge
+      PHP_MEMORY_LIMIT: 512M
+      ENABLE_FFMPEG: ${ENABLE_FFMPEG}
 EOF
 
     cd "$APP_DIR" || exit
@@ -169,11 +107,9 @@ EOF
     fi
 
     echo
-    echo -e "${GREEN}✅ Moments Blog 已启动${RESET}"
+    echo -e "${GREEN}✅ php-epg 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🌐 后台地址: http://127.0.0.1:${PORT}/admin${RESET}"
-    echo -e "${YELLOW}👤 后台账号: ${ADMIN_USERNAME}${RESET}"
-    echo -e "${YELLOW}🔑 后台密码: ${ADMIN_PASSWORD}${RESET}"
+    echo -e "${GREEN}📂 数据目录: ${DATA_DIR}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -182,22 +118,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Moments Blog 更新完成${RESET}"
+    echo -e "${GREEN}✅ php-epg 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart moments-blog
-    echo -e "${GREEN}✅ Moments Blog 已重启${RESET}"
+    docker restart php-epg
+    echo -e "${GREEN}✅ php-epg 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f moments-blog
+    docker logs -f php-epg
 }
 
 check_status() {
-    docker ps | grep moments-blog
+    docker ps | grep php-epg
     read -p "按回车返回菜单..."
 }
 
@@ -205,7 +141,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Moments Blog 已卸载${RESET}"
+    echo -e "${RED}✅ php-epg 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

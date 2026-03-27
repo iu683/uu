@@ -4,11 +4,11 @@ TARGET="/etc/profile.d/server-motd.sh"
 
 GREEN="\033[1;32m"
 RED="\033[1;31m"
-YELLOW="\033[1;33m"
 CYAN="\033[1;36m"
+YELLOW="\033[1;33m"
 RESET="\033[0m"
 
-install_motd() {
+install_motd(){
 
 cat << 'EOF' > $TARGET
 #!/bin/bash
@@ -19,6 +19,7 @@ G='\033[1;32m'
 B='\033[1;34m'
 C='\033[1;36m'
 Y='\033[1;33m'
+O='\033[38;5;208m'
 R='\033[1;31m'
 X='\033[0m'
 
@@ -26,11 +27,23 @@ USER=$(whoami)
 HOST=$(hostname)
 OS=$(grep PRETTY_NAME /etc/os-release | cut -d '"' -f2)
 
-DATE=$(date "+%Y-%m-%d %H:%M:%S")
+DATE=$(date "+%Y年%m月%d日 %H:%M:%S")
+
+WEEK=$(date +%u)
+case $WEEK in
+1) WEEKDAY="星期一" ;;
+2) WEEKDAY="星期二" ;;
+3) WEEKDAY="星期三" ;;
+4) WEEKDAY="星期四" ;;
+5) WEEKDAY="星期五" ;;
+6) WEEKDAY="星期六" ;;
+7) WEEKDAY="星期日" ;;
+esac
+
 UPTIME=$(uptime -p | sed 's/up //')
 LOAD=$(uptime | awk -F'load average:' '{print $2}')
 
-CPU=$(top -bn1 | grep "Cpu(s)" | awk '{print 100-$8"%"}')
+CPU=$(top -bn1 | awk -F',' '/Cpu/ {print 100 - $4}' | awk '{printf "%.1f%%",$1}')
 
 MEM=$(free -h | awk '/Mem:/ {print $3 "/" $2}')
 SWAP=$(free -h | awk '/Swap:/ {print $3 "/" $2}')
@@ -39,26 +52,26 @@ DISK=$(df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}')
 DISK_P=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
 
 echo
-echo -e "${G}╔══════════════════════════════════════╗${X}"
-echo -e "${G}║        🚀 Server MOTD Dashboard     ║${X}"
-echo -e "${G}╚══════════════════════════════════════╝${X}"
+echo -e "${G}╔════════════════════════════════════════════╗${X}"
+echo -e "${G}           🚀 Server MOTD Dashboard           ${X}"
+echo -e "${G}╚════════════════════════════════════════════╝${X}"
 
-printf "👤 用户        : %s\n" "$USER"
-printf "💻 主机        : %s\n" "$HOST"
-printf "🖥️ 系统        : %s\n" "$OS"
-
-echo
-
-printf "⏰ 时间        : %s\n" "$DATE"
-printf "🆙 运行时间    : %s\n" "$UPTIME"
-printf "📊 系统负载    : %s\n" "$LOAD"
+printf "👤 用户           : %s\n" "$USER"
+printf "💻 主机           : %s\n" "$HOST"
+printf "🖥️系统           : %s\n" "$OS"
 
 echo
 
-printf "🔥 CPU使用     : %s\n" "$CPU"
-printf "💾 内存使用    : %s\n" "$MEM"
-printf "🧠 Swap使用    : %s\n" "$SWAP"
-printf "🗂️ 磁盘使用    : %s\n" "$DISK"
+printf "⏰ 时间            : %s (%s)\n" "$DATE" "$WEEKDAY"
+printf "🆙 运行时间       : %s\n" "$UPTIME"
+printf "📊 系统负载       : %s\n" "$LOAD"
+
+echo
+
+printf "🔥 CPU使用        : %s\n" "$CPU"
+printf "💾 内存使用       : %s\n" "$MEM"
+printf "🧠 Swap使用       : %s\n" "$SWAP"
+printf "🗂️磁盘使用       : %s\n" "$DISK"
 
 echo
 
@@ -69,16 +82,17 @@ D_IMG=$(docker images -q | wc -l)
 D_SIZE=$(docker system df | awk '/Images/ {print $4}')
 
 echo -e "${Y}🐳 Docker 状态${X}"
-printf "📦 容器数量    : %s\n" "$D_CONT"
-printf "🖼️ 镜像数量    : %s\n" "$D_IMG"
-printf "📦 Docker占用  : %s\n" "$D_SIZE"
+
+printf "📦 容器数量       : %s\n" "$D_CONT"
+printf "🖼️镜像数量       : %s\n" "$D_IMG"
+printf "📦 Docker占用     : %s\n" "$D_SIZE"
 
 RUN=$(docker ps --format "{{.Names}}")
 STOP=$(docker ps -a --filter status=exited --format "{{.Names}}")
 
 if [ -n "$RUN" ]; then
 echo
-echo "运行容器:"
+echo "运行容器"
 for i in $RUN; do
 echo -e " ${G}✔ $i${X}"
 done
@@ -86,7 +100,7 @@ fi
 
 if [ -n "$STOP" ]; then
 echo
-echo "停止容器:"
+echo "停止容器"
 for i in $STOP; do
 echo -e " ${R}✘ $i${X}"
 done
@@ -96,16 +110,44 @@ echo
 docker stats --no-stream --format "  {{.Name}} CPU:{{.CPUPerc}} MEM:{{.MemUsage}}"
 
 else
-
 echo -e "${R}Docker 未安装${X}"
-
 fi
 
 echo
 
-echo -e "${Y}最近登录${X}"
-last -i -n 3 | grep -v reboot | head -3
+# 最近登录记录
+echo -e "${O}🛡 最近登录记录${X}"
 
+LAST_BIN=$(which last 2>/dev/null)
+
+if [ -z "$LAST_BIN" ]; then
+
+if command -v apt >/dev/null 2>&1; then
+apt -qq update >/dev/null 2>&1
+apt -y install login >/dev/null 2>&1
+fi
+
+LAST_BIN=$(which last 2>/dev/null)
+
+fi
+
+if [ -n "$LAST_BIN" ]; then
+
+if [ ! -f /var/log/wtmp ]; then
+touch /var/log/wtmp
+chmod 664 /var/log/wtmp
+fi
+
+$LAST_BIN -i -n 3 | grep -v reboot | head -3 | while read line
+do
+echo -e "${Y}$line${X}"
+done
+
+else
+
+echo -e "${Y}系统未记录登录日志${X}"
+
+fi
 if [ "$DISK_P" -ge 70 ]; then
 echo
 echo -e "${R}⚠ 磁盘使用率 ${DISK_P}% 请清理${X}"
@@ -123,7 +165,6 @@ echo -e "${GREEN}MOTD 安装完成${RESET}"
 remove_motd(){
 
 rm -f $TARGET
-
 echo -e "${RED}MOTD 已卸载${RESET}"
 
 }
@@ -155,9 +196,9 @@ do
 
 clear
 
-echo -e "${CYAN}================================${RESET}"
-echo " MOTD 管理菜单"
-echo -e "${CYAN}================================${RESET}"
+echo -e "${CYAN}═══════════════════════════════${RESET}"
+echo "        MOTD 管理菜单"
+echo -e "${CYAN}═══════════════════════════════${RESET}"
 
 echo "1. 安装 MOTD"
 echo "2. 卸载 MOTD"
@@ -171,25 +212,11 @@ read -p "请选择: " CH
 
 case $CH in
 
-1)
-install_motd
-;;
-
-2)
-remove_motd
-;;
-
-3)
-restore_default
-;;
-
-4)
-preview
-;;
-
-0)
-exit
-;;
+1) install_motd ;;
+2) remove_motd ;;
+3) restore_default ;;
+4) preview ;;
+0) exit ;;
 
 esac
 

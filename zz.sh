@@ -29,15 +29,6 @@ OS=$(grep PRETTY_NAME /etc/os-release | cut -d '"' -f2)
 
 DATE=$(date "+%Y年%m月%d日 %H:%M:%S")
 
-WEEK=$(date +%u)
-case $WEEK in
-1) WEEKDAY="星期一" ;;
-2) WEEKDAY="星期二" ;;
-3) WEEKDAY="星期三" ;;
-4) WEEKDAY="星期四" ;;
-5) WEEKDAY="星期五" ;;
-6) WEEKDAY="星期六" ;;
-7) WEEKDAY="星期日" ;;
 esac
 
 UPTIME=$(uptime -p | sed 's/up //' \
@@ -71,7 +62,7 @@ printf "🖥️系统           : %s\n" "$OS"
 
 echo
 
-printf "⏰ 时间            : %s (%s)\n" "$DATE" "$WEEKDAY"
+printf "⏰ 时间            : %s (%s)\n" "$DATE"
 printf "🆙 运行时间       : %s\n" "$UPTIME"
 printf "📊 系统负载       : %s\n" "$LOAD"
 
@@ -143,11 +134,35 @@ touch /var/log/wtmp
 chmod 664 /var/log/wtmp
 fi
 
+echo "IP              时间"
+
 $LAST_BIN -i -n 3 | grep '^root' | grep -v reboot | while read line
 do
+
 IP=$(echo "$line" | awk '{print $3}')
-TIME=$(echo "$line" | awk '{print $4" "$5" "$6}')
-printf "${Y}root  %-15s %s${X}\n" "$IP" "$TIME"
+MONTH=$(echo "$line" | awk '{print $5}')
+DAY=$(echo "$line" | awk '{print $6}')
+TIME=$(echo "$line" | awk '{print $7}')
+
+case $MONTH in
+Jan) MONTH="01月" ;;
+Feb) MONTH="02月" ;;
+Mar) MONTH="03月" ;;
+Apr) MONTH="04月" ;;
+May) MONTH="05月" ;;
+Jun) MONTH="06月" ;;
+Jul) MONTH="07月" ;;
+Aug) MONTH="08月" ;;
+Sep) MONTH="09月" ;;
+Oct) MONTH="10月" ;;
+Nov) MONTH="11月" ;;
+Dec) MONTH="12月" ;;
+esac
+
+DATE="${MONTH}${DAY}日 ${TIME}"
+
+printf "${Y}%-15s %s${X}\n" "$IP" "$DATE"
+
 done
 
 else

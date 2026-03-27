@@ -1,373 +1,139 @@
 #!/bin/bash
 
-set -euo pipefail
+# ========= 配置 =========
+SCRIPT_PATH="/usr/local/bin/byd"
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/uu.sh" # ← 改成你的脚本地址
 
-readonly SCRIPT_VERSION="VMESS-WS-1.0"
-readonly xray_config_path="/usr/local/etc/xray/config.json"
-readonly xray_binary_path="/usr/local/bin/xray"
-readonly xray_install_script_url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+# ========= 颜色 =========
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+ORANGE='\033[38;5;208m'
+RESET='\033[0m'
 
-readonly red='\e[91m'
-readonly green='\e[92m'
-readonly yellow='\e[93m'
-readonly cyan='\e[96m'
-readonly none='\e[0m'
+# ========= root 检测 =========
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}请使用 root 运行${RESET}"
+    exit 1
+fi
 
-xray_status_info=""
-is_quiet=false
-ws_path="/"
-ws_host=""
+# =============================
+# 自动安装自身（关键逻辑）
+# =============================
+if [[ "$0" != "$SCRIPT_PATH" ]]; then
+    echo -e "${YELLOW}正在安装代理工具箱...${RESET}"
 
-error(){ echo -e "\n$red[✖] $1$none\n"; }
-info(){ echo -e "\n$yellow[!] $1$none\n"; }
-success(){ echo -e "\n$green[✔] $1$none\n"; }
+    curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_PATH" || {
+        echo -e "${RED}下载失败${RESET}"
+        exit 1
+    }
 
-spinner(){
-    local pid=$1
-    local spin='|/-\'
-    while kill -0 $pid 2>/dev/null; do
-        for i in ${spin}; do
-            printf "\r[%c] " "$i"
-            sleep .1
-        done
-    done
+    chmod +x "$SCRIPT_PATH"
+
+   
+    echo -e "${GREEN}安装完成，输入 byd 快捷启动${RESET}"
+    echo -e "${GREEN}正在启动...${RESET}"
+    sleep 1
+
+    exec "$SCRIPT_PATH"   
+fi
+
+# ========= 基础函数 =========
+pause_return() {
+
+    read -p $'\033[32m按回车返回菜单...\033[0m' temp
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
+check_net() {
+    ping -c1 github.com >/dev/null 2>&1 || {
+        echo -e "${RED}网络异常${RESET}"
+        return 1
+    }
 }
 
-is_valid_port(){
-    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+normalize_input() {
+    local input
+    input=$(echo "$1" | sed 's/^0*//')
+    echo "${input:-0}"
 }
 
-is_port_in_use(){
-    ss -tuln | grep -q ":$1 "
+run_cmd() {
+    cmd="$1"
+    check_net || return
+    eval "$cmd"
+    pause_return
 }
 
-is_valid_uuid(){
-    [[ "$1" =~ ^[0-9a-fA-F-]{36}$ ]]
-}
+# ========= 更新 =========
+update_self() {
+    echo -e "${YELLOW}正在更新脚本...${RESET}"
+    check_net || return
 
-pre_check(){
-    [[ $(id -u) != 0 ]] && error "请使用root运行" && exit 1
-
-    if ! command -v jq &>/dev/null || ! command -v curl &>/dev/null; then
-        apt update -y
-        apt install -y jq curl
-    fi
-}
-
-execute_official_script(){
-    bash <(curl -L "$xray_install_script_url") "$@" &>/dev/null &
-    spinner $!
-}
-
-check_xray_status(){
-    if [[ ! -f "$xray_binary_path" ]]; then
-        xray_status_info="Xray: 未安装"
+    curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_PATH" || {
+        echo -e "${RED}更新失败${RESET}"
         return
-    fi
+    }
 
-    local v=$($xray_binary_path version | head -n1 | awk '{print $2}')
-    if systemctl is-active --quiet xray; then
-        xray_status_info="Xray: 运行中 | $v"
-    else
-        xray_status_info="Xray: 未运行 | $v"
-    fi
+    chmod +x "$SCRIPT_PATH"
+    echo -e "${GREEN}更新完成！${RESET}"
+    pause_return
 }
 
-install_xray(){
-
-    local port uuid
-
-    while true; do
-        read -p "端口 (默认443): " port
-        [ -z "$port" ] && port=443
-
-        is_valid_port "$port" || { error "端口无效"; continue; }
-        is_port_in_use "$port" && { error "端口占用"; continue; }
-
-        break
-    done
-
-    while true; do
-        read -p "UUID (留空自动生成): " uuid
-        [ -z "$uuid" ] && uuid=$(cat /proc/sys/kernel/random/uuid)
-
-        is_valid_uuid "$uuid" && break || error "UUID格式错误"
-    done
-
-
-    read -p "WS Host (可选): " ws_host
-
-    read -p "WS Path (默认 /): " ws_path
-    [ -z "$ws_path" ] && ws_path="/"
-    [[ "$ws_path" != /* ]] && ws_path="/$ws_path"
-
-
-    run_install "$port" "$uuid"
+# ========= 卸载 =========
+uninstall_self() {
+    echo -e "${YELLOW}正在卸载工具箱...${RESET}"
+    rm -f "$SCRIPT_PATH"
+    echo -e "${RED}卸载完成${RESET}"
+    exit 0
 }
 
-write_config(){
+# ========= 菜单 =========
+while true; do
+    clear
+    echo -e "${ORANGE}╔══════════════════════╗${RESET}"
+    echo -e "${ORANGE}      代理工具箱        ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════╝${RESET}"
+    echo -e "${YELLOW}[01] Shadowsocks${RESET}"
+    echo -e "${YELLOW}[02] Reality${RESET}"
+    echo -e "${YELLOW}[03] Snell${RESET}"
+    echo -e "${YELLOW}[04] Anytls${RESET}"
+    echo -e "${YELLOW}[05] Hysteria2${RESET}"
+    echo -e "${YELLOW}[06] Tuicv5${RESET}"
+    echo -e "${YELLOW}[07] MTProto${RESET}"
+    echo -e "${YELLOW}[08] Socks5${RESET}"
+    echo -e "${YELLOW}[09] NaiveProxy${RESET}"
+    echo -e "${YELLOW}[10] Reality(Alpine)${RESET}"
+    echo -e "${YELLOW}[11] Hysteria2(Alpine)${RESET}"
+    echo -e "${YELLOW}[12] Xray-Argo${RESET}"
+    echo -e "${YELLOW}[13] F佬Sing-box${RESET}"
+    echo -e "${YELLOW}[14] vless-all-in-one${RESET}"
+    echo -e "${YELLOW}[15] Realm-xwPF${RESET}"
+    echo -e "${GREEN}[88] 更新脚本${RESET}"
+    echo -e "${GREEN}[99] 卸载脚本${RESET}"
+    echo -e "${RED}[0]  退出${RESET}"
 
-    local port=$1
-    local uuid=$2
+    read -p $'\033[32m请输入选项: \033[0m' sub
+    sub=$(normalize_input "$sub")
 
-jq -n \
---argjson port "$port" \
---arg uuid "$uuid" \
---arg ws_path "$ws_path" \
---arg ws_host "$ws_host" \
-'{
-"log":{"loglevel":"warning"},
-"inbounds":[
-{
-"listen":"0.0.0.0",
-"port":$port,
-"protocol":"vmess",
-"settings":{
-"clients":[
-{
-"id":$uuid,
-"alterId":0
-}
-]
-},
-"streamSettings":{
-"network":"ws",
-"wsSettings":{
-"path":$ws_path,
-"headers":{
-"Host":$ws_host
-}
-}
-},
-"sniffing":{
-"enabled":true,
-"destOverride":["http","tls"]
-}
-}
-],
-"outbounds":[
-{
-"protocol":"freedom",
-"settings":{
-"domainStrategy":"UseIPv4v6"
-}
-}
-]
-}' > "$xray_config_path"
-}
-
-run_install(){
-
-    local port=$1
-    local uuid=$2
-
-    info "安装 Xray..."
-    execute_official_script install
-
-    write_config "$port" "$uuid"
-
-    systemctl enable xray
-    systemctl restart xray
-
-    success "安装完成"
-
-    view_subscription_info
-}
-
-restart_xray(){
-    systemctl restart xray
-    success "Xray 已重启"
-}
-
-modify_config(){
-
-if [ ! -f "$xray_config_path" ]; then
-error "Xray 未安装"
-return
-fi
-
-info "读取当前配置..."
-
-current_port=$(jq -r '.inbounds[0].port' "$xray_config_path")
-current_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
-current_path=$(jq -r '.inbounds[0].streamSettings.wsSettings.path' "$xray_config_path")
-current_host=$(jq -r '.inbounds[0].streamSettings.wsSettings.headers.Host // ""' "$xray_config_path")
-
-echo
-echo "当前端口: $current_port"
-echo "当前UUID: $current_uuid"
-echo "当前Path: $current_path"
-echo "当前Host: $current_host"
-echo
-
-while true
-do
-read -p "新端口 (回车保持 $current_port): " port
-[ -z "$port" ] && port=$current_port
-
-is_valid_port "$port" || { error "端口无效"; continue; }
-
-if [[ "$port" != "$current_port" ]] && is_port_in_use "$port"; then
-error "端口已被占用"
-continue
-fi
-
-break
+    case "$sub" in
+        1) run_cmd "wget -O ss-rust.sh https://raw.githubusercontent.com/xOS/Shadowsocks-Rust/master/ss-rust.sh && bash ss-rust.sh" ;;
+        2) run_cmd "bash <(curl -L https://raw.githubusercontent.com/yahuisme/xray-vless-reality/main/install.sh)" ;;
+        3) run_cmd "wget -O snell.sh --no-check-certificate https://git.io/Snell.sh && chmod +x snell.sh && ./snell.sh" ;;
+        4) run_cmd "bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Anytls.sh)" ;;
+        5) run_cmd "bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/GLHysteria2.sh)" ;;
+        6) run_cmd "bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/tuicv5.sh)" ;;
+        7) run_cmd "bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/GLMTProto.sh)" ;;
+        8) run_cmd "bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Socks5.sh)" ;;
+        9) run_cmd "bash -c \"\$(curl -Ls https://raw.githubusercontent.com/dododook/NaiveProxy/refs/heads/main/install.sh?v=2)\"" ;;
+        10) run_cmd "bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/AZAPReality.sh)" ;;
+        11) run_cmd "bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/AZAPHysteria2.sh)" ;;
+        12) run_cmd "bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Xray2go.sh)" ;;
+        13) run_cmd "bash <(wget -qO- https://raw.githubusercontent.com/fscarmen/sing-box/main/sing-box.sh)" ;;
+        14) run_cmd "wget -O vless-server.sh https://raw.githubusercontent.com/Zyx0rx/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh" ;;
+        15) run_cmd "wget -qO- https://raw.githubusercontent.com/zywe03/realm-xwPF/main/xwPF.sh | sudo bash -s install" ;;
+        88) update_self ;;
+        99) uninstall_self ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+    esac
 done
-
-while true
-do
-read -p "新UUID (回车保持): " uuid
-[ -z "$uuid" ] && uuid=$current_uuid
-
-is_valid_uuid "$uuid" && break || error "UUID格式错误"
-done
-
-read -p "新WS Host (回车保持 $current_host): " new_host
-[ -z "$new_host" ] && new_host=$current_host
-
-read -p "新WS Path (回车保持 $current_path): " new_path
-[ -z "$new_path" ] && new_path=$current_path
-[[ "$new_path" != /* ]] && new_path="/$new_path"
-
-ws_host="$new_host"
-ws_path="$new_path"
-
-
-write_config "$port" "$uuid"
-
-systemctl restart xray
-
-success "配置修改完成"
-
-view_subscription_info
-}
-
-update_xray(){
-    execute_official_script install
-    restart_xray
-}
-
-uninstall_xray(){
-    execute_official_script remove --purge
-    success "已卸载"
-}
-
-view_xray_log(){
-    journalctl -u xray -f
-}
-
-view_subscription_info(){
-
-    local ip=$(get_public_ip)
-
-    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
-    local port=$(jq -r '.inbounds[0].port' "$xray_config_path")
-    local path=$(jq -r '.inbounds[0].streamSettings.wsSettings.path' "$xray_config_path")
-    local host=$(jq -r '.inbounds[0].streamSettings.wsSettings.headers.Host // ""' "$xray_config_path")
-
-vmess_json=$(cat <<EOF
-{
-"v":"2",
-"ps":"$(hostname)",
-"add":"$ip",
-"port":"$port",
-"id":"$uuid",
-"aid":"0",
-"scy":"auto",
-"net":"ws",
-"type":"none",
-"host":"$host",
-"path":"$path",
-"tls":""
-}
-EOF
-)
-
-vmess_link="vmess://$(echo -n "$vmess_json" | base64 -w0)"
-
-echo "---------------------------------------"
-echo -e "${green}VMESS WS 节点${none}"
-echo "地址: $ip"
-echo "端口: $port"
-echo "UUID: $uuid"
-echo "Host: $host"
-echo "Path: $path"
-echo
-echo "$vmess_link"
-echo "---------------------------------------"
-
-echo "$vmess_link" > ~/xray_vmess_link.txt
-}
-
-press_any_key(){
-read -n1 -s -r -p "按任意键继续..."
-}
-
-main_menu(){
-
-while true
-do
-clear
-
-check_xray_status
-
-echo "--------------------------------"
-echo "Xray VMESS WS 管理脚本"
-echo "--------------------------------"
-echo "$xray_status_info"
-echo "--------------------------------"
-echo "1. 安装"
-echo "2. 更新"
-echo "3. 重启"
-echo "4. 卸载"
-echo "5. 查看日志"
-echo "6. 修改节点配置"
-echo "7. 查看节点"
-echo "0. 退出"
-echo "--------------------------------"
-
-read -p "请选择: " choice
-
-case $choice in
-
-1) install_xray ;;
-2) update_xray ;;
-3) restart_xray ;;
-4) uninstall_xray ;;
-5) view_xray_log ;;
-6) modify_config ;;
-7) view_subscription_info ;;
-0) exit 0 ;;
-*) error "无效选项" ;;
-
-esac
-
-press_any_key
-
-done
-}
-
-main(){
-
-pre_check
-main_menu
-
-}
-
-main

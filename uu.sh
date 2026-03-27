@@ -19,6 +19,7 @@ G='\033[1;32m'
 B='\033[1;34m'
 C='\033[1;36m'
 Y='\033[1;33m'
+O='\033[38;5;208m'
 R='\033[1;31m'
 X='\033[0m'
 
@@ -26,11 +27,32 @@ USER=$(whoami)
 HOST=$(hostname)
 OS=$(grep PRETTY_NAME /etc/os-release | cut -d '"' -f2)
 
-DATE=$(date "+%Y-%m-%d %H:%M:%S")
-UPTIME=$(uptime -p | sed 's/up //')
+DATE=$(date "+%Y年%m月%d日 %H:%M:%S")
+
+WEEK=$(date +%u)
+case $WEEK in
+1) WEEKDAY="星期一" ;;
+2) WEEKDAY="星期二" ;;
+3) WEEKDAY="星期三" ;;
+4) WEEKDAY="星期四" ;;
+5) WEEKDAY="星期五" ;;
+6) WEEKDAY="星期六" ;;
+7) WEEKDAY="星期日" ;;
+esac
+
+UPTIME=$(uptime -p | sed 's/up //' \
+| sed 's/weeks/周/g' \
+| sed 's/week/周/g' \
+| sed 's/days/天/g' \
+| sed 's/day/天/g' \
+| sed 's/hours/小时/g' \
+| sed 's/hour/小时/g' \
+| sed 's/minutes/分钟/g' \
+| sed 's/minute/分钟/g')
+
 LOAD=$(uptime | awk -F'load average:' '{print $2}')
 
-CPU=$(top -bn1 | awk -F',' '/Cpu/ {print 100 - $4}' | awk '{printf "%.1f%%",$1}')
+CPU=$(awk -v FS=" " '/^cpu /{printf "%.1f%%",100-($5*100/($2+$3+$4+$5))}' /proc/stat)
 
 MEM=$(free -h | awk '/Mem:/ {print $3 "/" $2}')
 SWAP=$(free -h | awk '/Swap:/ {print $3 "/" $2}')
@@ -39,26 +61,27 @@ DISK=$(df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}')
 DISK_P=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
 
 echo
+
 echo -e "${G}╔════════════════════════════════════════════╗${X}"
-echo -e "${G}           🚀 Server MOTD Dashboard           ${X}"
+echo -e "${G}           🚀 Server Dashboard                ${X}"
 echo -e "${G}╚════════════════════════════════════════════╝${X}"
 
-printf "👤 用户           : %s\n" "$USER"
-printf "💻 主机           : %s\n" "$HOST"
-printf "🖥️ 系统           : %s\n" "$OS"
+printf "%-18s : %s\n" "👤 用户" "$USER"
+printf "%-18s : %s\n" "💻 主机" "$HOST"
+printf "%-18s : %s\n" "🖥️ 系统" "$OS"
 
 echo
 
-printf "⏰ 时间           : %s\n" "$DATE"
-printf "🆙 运行时间       : %s\n" "$UPTIME"
-printf "📊 系统负载       : %s\n" "$LOAD"
+printf "%-18s : %s (%s)\n" "⏰ 时间" "$DATE" "$WEEKDAY"
+printf "%-18s : %s\n" "🆙 运行时间" "$UPTIME"
+printf "%-18s : %s\n" "📊 系统负载" "$LOAD"
 
 echo
 
-printf "🔥 CPU使用        : %s\n" "$CPU"
-printf "💾 内存使用       : %s\n" "$MEM"
-printf "🧠 Swap使用       : %s\n" "$SWAP"
-printf "🗂️ 磁盘使用       : %s\n" "$DISK"
+printf "%-18s : %s\n" "🔥 CPU使用" "$CPU"
+printf "%-18s : %s\n" "💾 内存使用" "$MEM"
+printf "%-18s : %s\n" "🧠 Swap使用" "$SWAP"
+printf "%-18s : %s\n" "🗂️ 磁盘使用" "$DISK"
 
 echo
 
@@ -70,9 +93,10 @@ D_SIZE=$(docker system df | awk '/Images/ {print $4}')
 
 echo -e "${Y}🐳 Docker 状态${X}"
 
-printf "📦 容器数量       : %s\n" "$D_CONT"
-printf "🖼️ 镜像数量       : %s\n" "$D_IMG"
-printf "📦 Docker占用     : %s\n" "$D_SIZE"
+printf "%-18s : %s\n" "📦 容器数量" "$D_CONT"
+printf "%-18s : %s\n" "🖼️ 镜像数量" "$D_IMG"
+printf "%-18s : %s\n" "📦 Docker占用" "$D_SIZE"
+
 
 RUN=$(docker ps --format "{{.Names}}")
 STOP=$(docker ps -a --filter status=exited --format "{{.Names}}")
@@ -102,9 +126,60 @@ fi
 
 echo
 
-if command -v last >/dev/null 2>&1; then
-echo -e "${Y}🛡 最近登录${X}"
-last -i -n 3 | grep -v reboot | head -3
+echo -e "${O}🛡 最近登录记录${X}"
+
+LAST_BIN=$(which last 2>/dev/null)
+
+if [ -z "$LAST_BIN" ]; then
+if command -v apt >/dev/null 2>&1; then
+apt -qq update >/dev/null 2>&1
+apt -y install login >/dev/null 2>&1
+fi
+LAST_BIN=$(which last 2>/dev/null)
+fi
+
+if [ -n "$LAST_BIN" ]; then
+
+if [ ! -f /var/log/wtmp ]; then
+touch /var/log/wtmp
+chmod 664 /var/log/wtmp
+fi
+
+printf "%-18s %s\n" "IP地址" "登录时间"
+
+$LAST_BIN -i -n 3 | grep '^root' | grep -v reboot | while read line
+do
+
+IP=$(echo "$line" | awk '{print $3}')
+MONTH=$(echo "$line" | awk '{print $5}')
+DAY=$(echo "$line" | awk '{print $6}')
+TIME=$(echo "$line" | awk '{print $7}')
+
+case $MONTH in
+Jan) MONTH="01月" ;;
+Feb) MONTH="02月" ;;
+Mar) MONTH="03月" ;;
+Apr) MONTH="04月" ;;
+May) MONTH="05月" ;;
+Jun) MONTH="06月" ;;
+Jul) MONTH="07月" ;;
+Aug) MONTH="08月" ;;
+Sep) MONTH="09月" ;;
+Oct) MONTH="10月" ;;
+Nov) MONTH="11月" ;;
+Dec) MONTH="12月" ;;
+esac
+
+DATE="${MONTH}${DAY}日 ${TIME}"
+
+printf "${Y}%-18s %s${X}\n" "$IP" "$DATE"
+
+done
+
+else
+
+echo -e "${Y}系统未记录登录日志${X}"
+
 fi
 
 if [ "$DISK_P" -ge 70 ]; then
@@ -155,19 +230,13 @@ do
 
 clear
 
-echo -e "${CYAN}═══════════════════════════════${RESET}"
-echo "        MOTD 管理菜单"
-echo -e "${CYAN}═══════════════════════════════${RESET}"
-
-echo "1. 安装 MOTD"
-echo "2. 卸载 MOTD"
-echo "3. 恢复系统默认 MOTD"
-echo "4. 预览 MOTD"
-echo "0. 退出"
-
-echo
-
-read -p "请选择: " CH
+echo -e "${GREEN}====MOTD管理菜单====${RESET}"
+echo -e "${GREEN}1. 安装MOTD${RESET}"
+echo -e "${GREEN}2. 卸载MOTD${RESET}"
+echo -e "${GREEN}3. 恢复系统默认${RESET}"
+echo -e "${GREEN}4. 预览MOTD${RESET}"
+echo -e "${GREEN}0. 退出${RESET}"
+read -r -p $'\033[32m请选择: \033[0m' CH
 
 case $CH in
 

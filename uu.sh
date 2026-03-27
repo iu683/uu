@@ -29,16 +29,6 @@ OS=$(grep PRETTY_NAME /etc/os-release | cut -d '"' -f2)
 
 DATE=$(date "+%Y年%m月%d日 %H:%M:%S")
 
-WEEK=$(date +%u)
-case $WEEK in
-1) WEEKDAY="星期一" ;;
-2) WEEKDAY="星期二" ;;
-3) WEEKDAY="星期三" ;;
-4) WEEKDAY="星期四" ;;
-5) WEEKDAY="星期五" ;;
-6) WEEKDAY="星期六" ;;
-7) WEEKDAY="星期日" ;;
-esac
 
 UPTIME=$(uptime -p | sed 's/up //' \
 | sed 's/weeks/周/g' \
@@ -52,7 +42,7 @@ UPTIME=$(uptime -p | sed 's/up //' \
 
 LOAD=$(uptime | awk -F'load average:' '{print $2}')
 
-CPU=$(awk -v FS=" " '/^cpu /{printf "%.1f%%",100-($5*100/($2+$3+$4+$5))}' /proc/stat)
+CPU=$(top -bn1 | awk '/Cpu/ {print 100 - $8 "%"}')
 
 MEM=$(free -h | awk '/Mem:/ {print $3 "/" $2}')
 SWAP=$(free -h | awk '/Swap:/ {print $3 "/" $2}')
@@ -61,27 +51,26 @@ DISK=$(df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}')
 DISK_P=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
 
 echo
-
 echo -e "${G}╔════════════════════════════════════════════╗${X}"
 echo -e "${G}           🚀 Server Dashboard                ${X}"
 echo -e "${G}╚════════════════════════════════════════════╝${X}"
 
-printf "%-18s : %s\n" "👤 用户" "$USER"
-printf "%-18s : %s\n" "💻 主机" "$HOST"
-printf "%-18s : %s\n" "🖥️ 系统" "$OS"
+printf "👤 用户           : %s\n" "$USER"
+printf "💻 主机           : %s\n" "$HOST"
+printf "🖥️系统           : %s\n" "$OS"
 
 echo
 
-printf "%-18s : %s (%s)\n" "⏰ 时间" "$DATE" "$WEEKDAY"
-printf "%-18s : %s\n" "🆙 运行时间" "$UPTIME"
-printf "%-18s : %s\n" "📊 系统负载" "$LOAD"
+printf "⏰ 时间            : %s\n" "$DATE"
+printf "🆙 运行时间       : %s\n" "$UPTIME"
+printf "📊 系统负载       : %s\n" "$LOAD"
 
 echo
 
-printf "%-18s : %s\n" "🔥 CPU使用" "$CPU"
-printf "%-18s : %s\n" "💾 内存使用" "$MEM"
-printf "%-18s : %s\n" "🧠 Swap使用" "$SWAP"
-printf "%-18s : %s\n" "🗂️ 磁盘使用" "$DISK"
+printf "🔥 CPU使用        : %s\n" "$CPU"
+printf "💾 内存使用       : %s\n" "$MEM"
+printf "🧠 Swap使用       : %s\n" "$SWAP"
+printf "🗂️磁盘使用       : %s\n" "$DISK"
 
 echo
 
@@ -93,10 +82,9 @@ D_SIZE=$(docker system df | awk '/Images/ {print $4}')
 
 echo -e "${Y}🐳 Docker 状态${X}"
 
-printf "%-18s : %s\n" "📦 容器数量" "$D_CONT"
-printf "%-18s : %s\n" "🖼️ 镜像数量" "$D_IMG"
-printf "%-18s : %s\n" "📦 Docker占用" "$D_SIZE"
-
+printf "📦 容器数量       : %s\n" "$D_CONT"
+printf "🖼️镜像数量       : %s\n" "$D_IMG"
+printf "📦 Docker占用     : %s\n" "$D_SIZE"
 
 RUN=$(docker ps --format "{{.Names}}")
 STOP=$(docker ps -a --filter status=exited --format "{{.Names}}")
@@ -145,7 +133,7 @@ touch /var/log/wtmp
 chmod 664 /var/log/wtmp
 fi
 
-printf "%-18s %s\n" "IP地址" "登录时间"
+echo "IP              时间"
 
 $LAST_BIN -i -n 3 | grep '^root' | grep -v reboot | while read line
 do
@@ -172,7 +160,7 @@ esac
 
 DATE="${MONTH}${DAY}日 ${TIME}"
 
-printf "${Y}%-18s %s${X}\n" "$IP" "$DATE"
+printf "${Y}%-15s %s${X}\n" "$IP" "$DATE"
 
 done
 

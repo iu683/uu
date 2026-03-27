@@ -40,10 +40,19 @@ case $WEEK in
 7) WEEKDAY="星期日" ;;
 esac
 
-UPTIME=$(uptime -p | sed 's/up //')
+UPTIME=$(uptime -p | sed 's/up //' \
+| sed 's/weeks/周/g' \
+| sed 's/week/周/g' \
+| sed 's/days/天/g' \
+| sed 's/day/天/g' \
+| sed 's/hours/小时/g' \
+| sed 's/hour/小时/g' \
+| sed 's/minutes/分钟/g' \
+| sed 's/minute/分钟/g')
+
 LOAD=$(uptime | awk -F'load average:' '{print $2}')
 
-CPU=$(top -bn1 | awk -F',' '/Cpu/ {print 100 - $4}' | awk '{printf "%.1f%%",$1}')
+CPU=$(top -bn1 | awk '/Cpu/ {print 100 - $8 "%"}')
 
 MEM=$(free -h | awk '/Mem:/ {print $3 "/" $2}')
 SWAP=$(free -h | awk '/Swap:/ {print $3 "/" $2}')
@@ -53,7 +62,7 @@ DISK_P=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
 
 echo
 echo -e "${G}╔════════════════════════════════════════════╗${X}"
-echo -e "${G}           🚀 Server MOTD Dashboard           ${X}"
+echo -e "${G}           🚀 Server Dashboard                ${X}"
 echo -e "${G}╚════════════════════════════════════════════╝${X}"
 
 printf "👤 用户           : %s\n" "$USER"
@@ -115,20 +124,16 @@ fi
 
 echo
 
-# 最近登录记录
 echo -e "${O}🛡 最近登录记录${X}"
 
 LAST_BIN=$(which last 2>/dev/null)
 
 if [ -z "$LAST_BIN" ]; then
-
 if command -v apt >/dev/null 2>&1; then
 apt -qq update >/dev/null 2>&1
 apt -y install login >/dev/null 2>&1
 fi
-
 LAST_BIN=$(which last 2>/dev/null)
-
 fi
 
 if [ -n "$LAST_BIN" ]; then
@@ -138,9 +143,35 @@ touch /var/log/wtmp
 chmod 664 /var/log/wtmp
 fi
 
-$LAST_BIN -i -n 3 | grep -v reboot | head -3 | while read line
+echo "IP              时间"
+
+$LAST_BIN -i -n 3 | grep '^root' | grep -v reboot | while read line
 do
-echo -e "${Y}$line${X}"
+
+IP=$(echo "$line" | awk '{print $3}')
+MONTH=$(echo "$line" | awk '{print $5}')
+DAY=$(echo "$line" | awk '{print $6}')
+TIME=$(echo "$line" | awk '{print $7}')
+
+case $MONTH in
+Jan) MONTH="01月" ;;
+Feb) MONTH="02月" ;;
+Mar) MONTH="03月" ;;
+Apr) MONTH="04月" ;;
+May) MONTH="05月" ;;
+Jun) MONTH="06月" ;;
+Jul) MONTH="07月" ;;
+Aug) MONTH="08月" ;;
+Sep) MONTH="09月" ;;
+Oct) MONTH="10月" ;;
+Nov) MONTH="11月" ;;
+Dec) MONTH="12月" ;;
+esac
+
+DATE="${MONTH}${DAY}日 ${TIME}"
+
+printf "${Y}%-15s %s${X}\n" "$IP" "$DATE"
+
 done
 
 else
@@ -148,6 +179,7 @@ else
 echo -e "${Y}系统未记录登录日志${X}"
 
 fi
+
 if [ "$DISK_P" -ge 70 ]; then
 echo
 echo -e "${R}⚠ 磁盘使用率 ${DISK_P}% 请清理${X}"
@@ -196,19 +228,13 @@ do
 
 clear
 
-echo -e "${CYAN}═══════════════════════════════${RESET}"
-echo "        MOTD 管理菜单"
-echo -e "${CYAN}═══════════════════════════════${RESET}"
-
-echo "1. 安装 MOTD"
-echo "2. 卸载 MOTD"
-echo "3. 恢复系统默认 MOTD"
-echo "4. 预览 MOTD"
-echo "0. 退出"
-
-echo
-
-read -p "请选择: " CH
+echo -e "${GREEN}====MOTD管理菜单====${RESET}"
+echo -e "${GREEN}1. 安装MOTD${RESET}"
+echo -e "${GREEN}2. 卸载MOTD${RESET}"
+echo -e "${GREEN}3. 恢复系统默认${RESET}"
+echo -e "${GREEN}4. 预览MOTD${RESET}"
+echo -e "${GREEN}0. 退出${RESET}"
+read -r -p $'\033[32m请选择: \033[0m' CH
 
 case $CH in
 

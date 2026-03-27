@@ -29,16 +29,6 @@ OS=$(grep PRETTY_NAME /etc/os-release | cut -d '"' -f2)
 
 DATE=$(date "+%Y年%m月%d日 %H:%M:%S")
 
-WEEK=$(date +%u)
-case $WEEK in
-1) WEEKDAY="星期一" ;;
-2) WEEKDAY="星期二" ;;
-3) WEEKDAY="星期三" ;;
-4) WEEKDAY="星期四" ;;
-5) WEEKDAY="星期五" ;;
-6) WEEKDAY="星期六" ;;
-7) WEEKDAY="星期日" ;;
-esac
 
 UPTIME=$(uptime -p | sed 's/up //' \
 | sed 's/weeks/周/g' \
@@ -64,25 +54,24 @@ echo
 echo -e "${G}╔════════════════════════════════════════════╗${X}"
 echo -e "${G}           🚀 Server Dashboard                ${X}"
 echo -e "${G}╚════════════════════════════════════════════╝${X}"
-
+echo -e "${CYAN}----------------------------------------------${RESET}"
 printf "👤 用户           : %s\n" "$USER"
 printf "💻 主机           : %s\n" "$HOST"
 printf "🖥️系统           : %s\n" "$OS"
+echo -e "${CYAN}----------------------------------------------${RESET}"
 
-echo
-
-printf "⏰ 时间            : %s (%s)\n" "$DATE"
+printf "⏰ 时间            : %s\n" "$DATE"
 printf "🆙 运行时间       : %s\n" "$UPTIME"
 printf "📊 系统负载       : %s\n" "$LOAD"
 
-echo
+echo -e "${CYAN}----------------------------------------------${RESET}"
 
 printf "🔥 CPU使用        : %s\n" "$CPU"
 printf "💾 内存使用       : %s\n" "$MEM"
 printf "🧠 Swap使用       : %s\n" "$SWAP"
 printf "🗂️磁盘使用       : %s\n" "$DISK"
 
-echo
+echo -e "${CYAN}----------------------------------------------${RESET}"
 
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
 
@@ -122,8 +111,8 @@ else
 echo -e "${R}Docker 未安装${X}"
 fi
 
-echo
 
+echo -e "${CYAN}----------------------------------------------${RESET}"
 echo -e "${O}🛡 最近登录记录${X}"
 
 LAST_BIN=$(which last 2>/dev/null)

@@ -71,7 +71,7 @@ printf "🖥️系统           : %s\n" "$OS"
 
 echo
 
-printf "⏰ 时间            : %s (%s)\n" "$DATE" "$WEEKDAY"
+printf "⏰ 时间            : %s (%s)\n" "$DATE"
 printf "🆙 运行时间       : %s\n" "$UPTIME"
 printf "📊 系统负载       : %s\n" "$LOAD"
 

@@ -1,132 +1,285 @@
 #!/bin/bash
-# ========================================
-# utils.fun 一键管理脚本
-# ========================================
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-RESET="\033[0m"
+set -euo pipefail
 
-APP_NAME="utils-fun"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+readonly SCRIPT_VERSION="VMESS-WS-1.0"
+readonly xray_config_path="/usr/local/etc/xray/config.json"
+readonly xray_binary_path="/usr/local/bin/xray"
+readonly xray_install_script_url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
+readonly red='\e[91m'
+readonly green='\e[92m'
+readonly yellow='\e[93m'
+readonly cyan='\e[96m'
+readonly none='\e[0m'
 
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
-}
+xray_status_info=""
+is_quiet=false
+ws_path="/"
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
+error(){ echo -e "\n$red[✖] $1$none\n"; }
+info(){ echo -e "\n$yellow[!] $1$none\n"; }
+success(){ echo -e "\n$green[✔] $1$none\n"; }
 
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== utils.fun 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
+spinner(){
+    local pid=$1
+    local spin='|/-\'
+    while kill -0 $pid 2>/dev/null; do
+        for i in ${spin}; do
+            printf "\r[%c] " "$i"
+            sleep .1
+        done
     done
 }
 
-install_app() {
+get_public_ip(){
+    curl -s https://api.ipify.org || curl -s https://ip.sb
+}
 
-    check_docker
-    mkdir -p "$APP_DIR"
+is_valid_port(){
+    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
 
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
+is_port_in_use(){
+    ss -tuln | grep -q ":$1 "
+}
+
+is_valid_uuid(){
+    [[ "$1" =~ ^[0-9a-fA-F-]{36}$ ]]
+}
+
+pre_check(){
+    [[ $(id -u) != 0 ]] && error "请使用root运行" && exit 1
+
+    if ! command -v jq &>/dev/null || ! command -v curl &>/dev/null; then
+        apt update -y
+        apt install -y jq curl
     fi
+}
 
-    read -p "请输入访问端口 [默认:3000]: " input_port
-    PORT=${input_port:-3000}
+execute_official_script(){
+    bash <(curl -L "$xray_install_script_url") "$@" &>/dev/null &
+    spinner $!
+}
 
-    check_port "$PORT" || return
-
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  utils-fun:
-    container_name: utils-fun
-    image: licoy/utils.fun:latest
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${PORT}:3000"
-EOF
-
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}❌ 启动失败${RESET}"
+check_xray_status(){
+    if [[ ! -f "$xray_binary_path" ]]; then
+        xray_status_info="Xray: 未安装"
         return
     fi
 
-    echo
-    echo -e "${GREEN}✅ utils.fun 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-
-    read -p "按回车返回菜单..."
+    local v=$($xray_binary_path version | head -n1 | awk '{print $2}')
+    if systemctl is-active --quiet xray; then
+        xray_status_info="Xray: 运行中 | $v"
+    else
+        xray_status_info="Xray: 未运行 | $v"
+    fi
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ utils.fun 更新完成${RESET}"
-    read -p "按回车返回菜单..."
+install_xray(){
+
+    local port uuid
+
+    while true; do
+        read -p "端口 (默认443): " port
+        [ -z "$port" ] && port=443
+
+        is_valid_port "$port" || { error "端口无效"; continue; }
+        is_port_in_use "$port" && { error "端口占用"; continue; }
+
+        break
+    done
+
+    while true; do
+        read -p "UUID (留空自动生成): " uuid
+        [ -z "$uuid" ] && uuid=$(cat /proc/sys/kernel/random/uuid)
+
+        is_valid_uuid "$uuid" && break || error "UUID格式错误"
+    done
+
+    read -p "WS Path (默认 /): " ws_path
+    [ -z "$ws_path" ] && ws_path="/"
+    [[ "$ws_path" != /* ]] && ws_path="/$ws_path"
+
+    run_install "$port" "$uuid"
 }
 
-restart_app() {
-    docker restart utils-fun
-    echo -e "${GREEN}✅ utils.fun 已重启${RESET}"
-    read -p "按回车返回菜单..."
+write_config(){
+
+    local port=$1
+    local uuid=$2
+
+jq -n \
+--argjson port "$port" \
+--arg uuid "$uuid" \
+--arg ws_path "$ws_path" \
+'{
+"log":{"loglevel":"warning"},
+"inbounds":[
+{
+"listen":"0.0.0.0",
+"port":$port,
+"protocol":"vmess",
+"settings":{
+"clients":[
+{
+"id":$uuid,
+"alterId":0
+}
+]
+},
+"streamSettings":{
+"network":"ws",
+"wsSettings":{
+"path":$ws_path
+}
+},
+"sniffing":{
+"enabled":true,
+"destOverride":["http","tls"]
+}
+}
+],
+"outbounds":[
+{
+"protocol":"freedom",
+"settings":{
+"domainStrategy":"UseIPv4v6"
+}
+}
+]
+}' > "$xray_config_path"
 }
 
-view_logs() {
-    docker logs -f utils-fun
+run_install(){
+
+    local port=$1
+    local uuid=$2
+
+    info "安装 Xray..."
+    execute_official_script install
+
+    write_config "$port" "$uuid"
+
+    systemctl enable xray
+    systemctl restart xray
+
+    success "安装完成"
+
+    view_subscription_info
 }
 
-check_status() {
-    docker ps | grep utils-fun
-    read -p "按回车返回菜单..."
+restart_xray(){
+    systemctl restart xray
+    success "Xray 已重启"
 }
 
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ utils.fun 已卸载${RESET}"
-    read -p "按回车返回菜单..."
+update_xray(){
+    execute_official_script install
+    restart_xray
 }
 
-menu
+uninstall_xray(){
+    execute_official_script remove --purge
+    success "已卸载"
+}
+
+view_xray_log(){
+    journalctl -u xray -f
+}
+
+view_subscription_info(){
+
+    local ip=$(get_public_ip)
+
+    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
+    local port=$(jq -r '.inbounds[0].port' "$xray_config_path")
+    local path=$(jq -r '.inbounds[0].streamSettings.wsSettings.path' "$xray_config_path")
+
+vmess_json=$(cat <<EOF
+{
+"v":"2",
+"ps":"$(hostname)",
+"add":"$ip",
+"port":"$port",
+"id":"$uuid",
+"aid":"0",
+"scy":"auto",
+"net":"ws",
+"type":"none",
+"host":"",
+"path":"$path",
+"tls":""
+}
+EOF
+)
+
+vmess_link="vmess://$(echo -n "$vmess_json" | base64 -w0)"
+
+echo "---------------------------------------"
+echo -e "${green}VMESS WS 节点${none}"
+echo "地址: $ip"
+echo "端口: $port"
+echo "UUID: $uuid"
+echo "Path: $path"
+echo
+echo "$vmess_link"
+echo "---------------------------------------"
+
+echo "$vmess_link" > ~/xray_vmess_link.txt
+}
+
+press_any_key(){
+read -n1 -s -r -p "按任意键继续..."
+}
+
+main_menu(){
+
+while true
+do
+clear
+
+check_xray_status
+
+echo "--------------------------------"
+echo "Xray VMESS WS 管理脚本"
+echo "--------------------------------"
+echo "$xray_status_info"
+echo "--------------------------------"
+echo "1. 安装 Xray (VMESS WS)"
+echo "2. 更新 Xray"
+echo "3. 重启 Xray"
+echo "4. 卸载 Xray"
+echo "5. 查看日志"
+echo "6. 查看节点"
+echo "0. 退出"
+echo "--------------------------------"
+
+read -p "请选择: " choice
+
+case $choice in
+
+1) install_xray ;;
+2) update_xray ;;
+3) restart_xray ;;
+4) uninstall_xray ;;
+5) view_xray_log ;;
+6) view_subscription_info ;;
+0) exit 0 ;;
+*) error "无效选项" ;;
+
+esac
+
+press_any_key
+
+done
+}
+
+main(){
+
+pre_check
+main_menu
+
+}
+
+main

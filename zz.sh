@@ -15,6 +15,7 @@ cat << 'EOF' > $TARGET
 
 [ -n "$SUDO_USER" ] && exit
 
+# 颜色
 G='\033[1;32m'
 B='\033[1;34m'
 C='\033[1;36m'
@@ -23,14 +24,19 @@ O='\033[38;5;208m'
 R='\033[1;31m'
 X='\033[0m'
 
+# 终端宽度
+term_width=$(tput cols 2>/dev/null || echo 80)
+label_w=10  # 左侧标签宽度
+
+sep(){
+    printf "%${term_width}s\n" | tr " " "-"
+}
+
+# 系统信息
 USER=$(whoami)
 HOST=$(hostname)
 OS=$(grep PRETTY_NAME /etc/os-release | cut -d '"' -f2)
-
 DATE=$(date "+%Y年%m月%d日 %H:%M:%S")
-
-esac
-
 UPTIME=$(uptime -p | sed 's/up //' \
 | sed 's/weeks/周/g' \
 | sed 's/week/周/g' \
@@ -40,140 +46,116 @@ UPTIME=$(uptime -p | sed 's/up //' \
 | sed 's/hour/小时/g' \
 | sed 's/minutes/分钟/g' \
 | sed 's/minute/分钟/g')
-
-LOAD=$(uptime | awk -F'load average:' '{print $2}')
-
+LOAD=$(uptime | awk -F'load average:' '{print $2}' | sed 's/^ *//')
 CPU=$(top -bn1 | awk '/Cpu/ {print 100 - $8 "%"}')
-
 MEM=$(free -h | awk '/Mem:/ {print $3 "/" $2}')
 SWAP=$(free -h | awk '/Swap:/ {print $3 "/" $2}')
-
 DISK=$(df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}')
 DISK_P=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
 
+# 顶部标题
 echo
 echo -e "${G}╔════════════════════════════════════════════╗${X}"
 echo -e "${G}           🚀 Server Dashboard                ${X}"
 echo -e "${G}╚════════════════════════════════════════════╝${X}"
 
-printf "👤 用户           : %s\n" "$USER"
-printf "💻 主机           : %s\n" "$HOST"
-printf "🖥️系统           : %s\n" "$OS"
+sep
 
-echo
+# 系统信息
+printf "${O}%s %-*s:${Y} %s${X}\n" "👤" $label_w "用户" "$USER"
+printf "${O}%s %-*s:${Y} %s${X}\n" "💻" $label_w "主机" "$HOST"
+printf "${O}%s %-*s:${Y} %s${X}\n" "🖥️" $label_w "系统" "$OS"
 
-printf "⏰ 时间            : %s (%s)\n" "$DATE"
-printf "🆙 运行时间       : %s\n" "$UPTIME"
-printf "📊 系统负载       : %s\n" "$LOAD"
+sep
 
-echo
+# 时间与负载
+printf "${O}%s %-*s:${Y} %s${X}\n" "⏰" $label_w "时间" "$DATE"
+printf "${O}%s %-*s:${Y} %s${X}\n" "🆙" $label_w "运行时间" "$UPTIME"
+printf "${O}%s %-*s:${Y} %s${X}\n" "📊" $label_w "系统负载" "$LOAD"
 
-printf "🔥 CPU使用        : %s\n" "$CPU"
-printf "💾 内存使用       : %s\n" "$MEM"
-printf "🧠 Swap使用       : %s\n" "$SWAP"
-printf "🗂️磁盘使用       : %s\n" "$DISK"
+sep
 
-echo
+# 资源使用
+printf "${O}%s %-*s:${Y} %s${X}\n" "🔥" $label_w "CPU使用" "$CPU"
+printf "${O}%s %-*s:${Y} %s${X}\n" "💾" $label_w "内存使用" "$MEM"
+printf "${O}%s %-*s:${Y} %s${X}\n" "🧠" $label_w "Swap使用" "$SWAP"
+printf "${O}%s %-*s:${Y} %s${X}\n" "🗂️" $label_w "磁盘使用" "$DISK"
 
+sep
+
+# Docker 信息
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    D_CONT=$(docker ps -aq | wc -l)
+    D_IMG=$(docker images -q | wc -l)
+    D_SIZE=$(docker system df | awk '/Images/ {print $4}')
 
-D_CONT=$(docker ps -aq | wc -l)
-D_IMG=$(docker images -q | wc -l)
-D_SIZE=$(docker system df | awk '/Images/ {print $4}')
+    echo -e "${Y}🐳 Docker 状态${X}"
+    printf "${O}%s %-*s:${Y} %s${X}\n" "📦" $label_w "容器数量" "$D_CONT"
+    printf "${O}%s %-*s:${Y} %s${X}\n" "🖼️" $label_w "镜像数量" "$D_IMG"
+    printf "${O}%s %-*s:${Y} %s${X}\n" "📦" $label_w "Docker占用" "$D_SIZE"
 
-echo -e "${Y}🐳 Docker 状态${X}"
+    RUN=$(docker ps --format "{{.Names}}")
+    STOP=$(docker ps -a --filter status=exited --format "{{.Names}}")
 
-printf "📦 容器数量       : %s\n" "$D_CONT"
-printf "🖼️镜像数量       : %s\n" "$D_IMG"
-printf "📦 Docker占用     : %s\n" "$D_SIZE"
+    if [ -n "$RUN" ]; then
+        echo
+        echo "运行容器"
+        for i in $RUN; do
+            echo -e " ${G}✔ $i${X}"
+        done
+    fi
 
-RUN=$(docker ps --format "{{.Names}}")
-STOP=$(docker ps -a --filter status=exited --format "{{.Names}}")
+    if [ -n "$STOP" ]; then
+        echo
+        echo "停止容器"
+        for i in $STOP; do
+            echo -e " ${R}✘ $i${X}"
+        done
+    fi
 
-if [ -n "$RUN" ]; then
-echo
-echo "运行容器"
-for i in $RUN; do
-echo -e " ${G}✔ $i${X}"
-done
-fi
-
-if [ -n "$STOP" ]; then
-echo
-echo "停止容器"
-for i in $STOP; do
-echo -e " ${R}✘ $i${X}"
-done
-fi
-
-echo
-docker stats --no-stream --format "  {{.Name}} CPU:{{.CPUPerc}} MEM:{{.MemUsage}}"
-
+    echo
+    docker stats --no-stream --format "  {{.Name}} CPU:{{.CPUPerc}} MEM:{{.MemUsage}}"
 else
-echo -e "${R}Docker 未安装${X}"
+    echo -e "${R}Docker 未安装${X}"
 fi
 
-echo
+sep
 
+# 最近登录记录
 echo -e "${O}🛡 最近登录记录${X}"
-
-LAST_BIN=$(which last 2>/dev/null)
-
-if [ -z "$LAST_BIN" ]; then
-if command -v apt >/dev/null 2>&1; then
-apt -qq update >/dev/null 2>&1
-apt -y install login >/dev/null 2>&1
-fi
-LAST_BIN=$(which last 2>/dev/null)
-fi
-
+LAST_BIN=$(command -v last 2>/dev/null)
 if [ -n "$LAST_BIN" ]; then
-
-if [ ! -f /var/log/wtmp ]; then
-touch /var/log/wtmp
-chmod 664 /var/log/wtmp
-fi
-
-echo "IP              时间"
-
-$LAST_BIN -i -n 3 | grep '^root' | grep -v reboot | while read line
-do
-
-IP=$(echo "$line" | awk '{print $3}')
-MONTH=$(echo "$line" | awk '{print $5}')
-DAY=$(echo "$line" | awk '{print $6}')
-TIME=$(echo "$line" | awk '{print $7}')
-
-case $MONTH in
-Jan) MONTH="01月" ;;
-Feb) MONTH="02月" ;;
-Mar) MONTH="03月" ;;
-Apr) MONTH="04月" ;;
-May) MONTH="05月" ;;
-Jun) MONTH="06月" ;;
-Jul) MONTH="07月" ;;
-Aug) MONTH="08月" ;;
-Sep) MONTH="09月" ;;
-Oct) MONTH="10月" ;;
-Nov) MONTH="11月" ;;
-Dec) MONTH="12月" ;;
-esac
-
-DATE="${MONTH}${DAY}日 ${TIME}"
-
-printf "${Y}%-15s %s${X}\n" "$IP" "$DATE"
-
-done
-
+    printf "%-17s %s\n" "IP" "时间"
+    $LAST_BIN -i -n 3 | grep '^root' | grep -v reboot | while read line; do
+        IP=$(echo "$line" | awk '{print $3}')
+        MONTH=$(echo "$line" | awk '{print $5}')
+        DAY=$(echo "$line" | awk '{print $6}')
+        TIME=$(echo "$line" | awk '{print $7}')
+        case $MONTH in
+            Jan) MONTH="01月" ;;
+            Feb) MONTH="02月" ;;
+            Mar) MONTH="03月" ;;
+            Apr) MONTH="04月" ;;
+            May) MONTH="05月" ;;
+            Jun) MONTH="06月" ;;
+            Jul) MONTH="07月" ;;
+            Aug) MONTH="08月" ;;
+            Sep) MONTH="09月" ;;
+            Oct) MONTH="10月" ;;
+            Nov) MONTH="11月" ;;
+            Dec) MONTH="12月" ;;
+        esac
+        LOGIN_TIME="${MONTH}${DAY}日 ${TIME}"
+        printf "${Y}%-17s %s${X}\n" "$IP" "$LOGIN_TIME"
+    done
 else
-
-echo -e "${Y}系统未记录登录日志${X}"
-
+    echo -e "${Y}系统未记录登录日志${X}"
 fi
 
+# 磁盘告警
 if [ "$DISK_P" -ge 70 ]; then
-echo
-echo -e "${R}⚠ 磁盘使用率 ${DISK_P}% 请清理${X}"
+    echo
+    echo -e "${R}⚠ 磁盘使用率 ${DISK_P}% 请清理${X}"
 fi
 
 echo

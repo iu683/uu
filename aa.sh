@@ -1,259 +1,141 @@
 #!/bin/bash
-# =========================================================
-# Incus 一键管理脚本（绿色无边框版）
-# =========================================================
+# ========================================
+# PVE 容器(CT) 一键管理脚本（国内/国外自动判断）
+# Author: oneclickvirt 改
+# ========================================
 
-# 颜色定义
 RED="\033[0;31m"
 GREEN="\033[0;32m"
 YELLOW="\033[0;33m"
-PURPLE="\033[0;35m"
-SKYBLUE="\033[0;36m"
-WHITE="\033[1;37m"
+CYAN="\033[1;36m"
 RESET="\033[0m"
 
-# =========================================================
-# 工具函数
-# =========================================================
-pause(){
+# 自动判断国内外源
+check_source() {
+    if ping -c 1 -W 1 google.com >/dev/null 2>&1; then
+        echo "github"
+    else
+        echo "cdn"
+    fi
+}
+
+# 下载脚本函数
+download_scripts() {
+    SOURCE=$(check_source)
+    if [ "$SOURCE" = "github" ]; then
+        BASE_URL="https://raw.githubusercontent.com/oneclickvirt/pve/main/scripts"
+        echo -e "${GREEN}检测到国外环境，使用 GitHub 源下载${RESET}"
+    else
+        BASE_URL="https://cdn.spiritlhl.net/https://raw.githubusercontent.com/oneclickvirt/pve/main/scripts"
+        echo -e "${GREEN}检测到国内环境，使用 CDN 源下载${RESET}"
+    fi
+
+    if [ ! -f buildct.sh ]; then
+        echo -e "${YELLOW}未找到 buildct.sh，正在下载...${RESET}"
+        curl -L ${BASE_URL}/buildct.sh -o buildct.sh && chmod +x buildct.sh
+    fi
+
+    if [ ! -f pve_delete.sh ]; then
+        echo -e "${YELLOW}未找到 pve_delete.sh，正在下载...${RESET}"
+        curl -L ${BASE_URL}/pve_delete.sh -o pve_delete.sh && chmod +x pve_delete.sh
+    fi
+}
+
+# 开设容器
+create_ct() {
+    echo -e "${CYAN}请输入开设容器所需参数:${RESET}"
+    read -p "CTID(100~256): " CTID
+    read -p "密码(英文数字组合): " PASSWORD
+    read -p "CPU核数: " CPU
+    read -p "内存(MB): " MEM
+    read -p "硬盘(GB): " DISK
+    read -p "SSH端口: " SSHPORT
+    read -p "80端口: " PORT80
+    read -p "443端口: " PORT443
+    read -p "外网端口起: " STARTPORT
+    read -p "外网端口止: " ENDPORT
+    read -p "系统(如 debian11 ubuntu20): " OS
+    read -p "存储盘(如 local): " STORAGE
+    read -p "独立IPV6(默认N): " IPV6
+
+    ./buildct.sh $CTID $PASSWORD $CPU $MEM $DISK $SSHPORT ${PORT80:-0} ${PORT443:-0} $STARTPORT $ENDPORT $OS $STORAGE ${IPV6:-N}
+}
+
+# 删除指定容器
+delete_ct() {
+    read -p "请输入要删除的 CTID (可输入多个, 空格分隔): " CTIDS
+    ./pve_delete.sh $CTIDS
+}
+
+# 查看容器信息
+check_ct() {
+    read -p "请输入要查看的 CTID: " CTID
+    if [ -f ct${CTID} ]; then
+        cat ct${CTID}
+    else
+        echo -e "${RED}未找到 CTID ${CTID} 的信息文件${RESET}"
+    fi
+}
+
+# 删除所有容器
+delete_all_cts() {
+    echo -e "${RED}⚠️ 警告：此操作将删除所有容器、清空 IPv4/IPv6 NAT 规则并重置网络！${RESET}"
+    read -p "确认执行？(yes/no): " confirm
+    if [ "$confirm" = "yes" ]; then
+        echo -e "${YELLOW}正在删除所有容器...${RESET}"
+        pct list | awk 'NR>1{print $1}' | xargs -I {} sh -c 'pct stop {}; pct destroy {}'
+
+        echo -e "${YELLOW}清理容器信息文件...${RESET}"
+        rm -rf ct*
+
+        echo -e "${YELLOW}清空防火墙规则...${RESET}"
+        iptables -t nat -F
+        iptables -t filter -F
+        ip6tables -t nat -F
+        ip6tables -t filter -F
+        rm -rf /usr/local/bin/ipv6_nat_rules.sh
+
+        echo -e "${YELLOW}重启网络服务...${RESET}"
+        service networking restart
+        systemctl restart networking.service
+        systemctl restart ndpresponder.service
+
+        echo -e "${YELLOW}保存 iptables 配置...${RESET}"
+        iptables-save | awk '{if($1=="COMMIT"){delete x}}$1=="-A"?!x[$0]++:1' | iptables-restore
+        iptables-save > /etc/iptables/rules.v4
+
+        echo -e "${GREEN}✅ 所有容器和端口映射已删除，网络已重置${RESET}"
+    else
+        echo -e "${GREEN}已取消操作${RESET}"
+    fi
+}
+
+
+# 主菜单
+menu() {
+    clear
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}      PVE容器 LXC 管理菜单               ${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}1) 开设容器${RESET}"
+    echo -e "${GREEN}2) 删除指定容器${RESET}"
+    echo -e "${GREEN}3) 查看容器信息${RESET}"
+    echo -e "${GREEN}4) 删除所有容器${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    read -r -p $'\033[32m请输入选项: \033[0m' choice
+    case $choice in
+        1) create_ct ;;
+        2) delete_ct ;;
+        3) check_ct ;;
+        4) delete_all_cts ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项，请重新输入${RESET}" ;;
+    esac
     echo -e "${YELLOW}按任意键返回菜单...${RESET}"
     read -n 1
+    menu
 }
 
-check_log(){
-    for f in ./log /root/log /var/log/incus.log; do
-        if [ -f "$f" ]; then
-            grep -v -E "$(incus list -c n --format csv | paste -sd'|' -)" "$f"
-            return
-        fi
-    done
-    echo -e "${YELLOW}未找到 log 文件，请稍后再试${RESET}"
-}
-
-install_pkg(){
-    pkg=$1
-    if ! command -v $pkg >/dev/null 2>&1; then
-        echo -e "${YELLOW}正在安装依赖：$pkg${RESET}"
-        if command -v apt >/dev/null 2>&1; then
-            apt update && apt install -y $pkg
-        elif command -v yum >/dev/null 2>&1; then
-            yum install -y $pkg
-        elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y $pkg
-        elif command -v apk >/dev/null 2>&1; then
-            apk add --no-cache $pkg
-        fi
-    fi
-}
-
-# =========================================================
-# 安装和开设 Incus
-# =========================================================
-install_incus(){
-    echo -e "${YELLOW}开始进行环境检测...${RESET}"
-    install_pkg wget
-
-    output=$(bash <(wget -qO- --no-check-certificate https://raw.githubusercontent.com/oneclickvirt/incus/main/scripts/pre_check.sh))
-    echo "$output"
-
-    if echo "$output" | grep -q "本机符合作为incus母鸡的要求"; then
-        echo -e "${GREEN}你的 VPS 符合要求，可以开设 incus 容器${RESET}"
-
-        read -p $'\033[1;32m确定要安装并开设 incus 小鸡吗？ [y/n]: \033[0m' confirm
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            echo -e "${YELLOW}开始安装 Incus 主体...${RESET}"
-            sleep 1
-            curl -L https://raw.githubusercontent.com/oneclickvirt/incus/main/scripts/incus_install.sh -o incus_install.sh
-            chmod +x incus_install.sh
-            bash incus_install.sh
-
-            if command -v incus >/dev/null 2>&1; then
-                echo -e "${GREEN}Incus 已安装完成${RESET}"
-            else
-                echo -e "${RED}Incus 安装失败，请更新系统后重试${RESET}"
-                rm -f incus_install.sh
-                return
-            fi
-        fi
-    else
-        echo -e "${RED}检测未通过，无法安装 Incus${RESET}"
-    fi
-}
-       
-
-# =========================================================
-# 管理 Incus 小鸡
-# =========================================================
-manage_incus() {
-    while true; do
-        clear
-        echo -e "${GREEN}====== 管理 incus 小鸡 ======${RESET}"
-        echo -e "${GREEN}1. 查看所有小鸡状态${RESET}"
-        echo -e "${GREEN}2. 暂停所有小鸡${RESET}"
-        echo -e "${GREEN}3. 启动所有小鸡${RESET}"
-        echo -e "${GREEN}4. 暂停指定小鸡${RESET}"
-        echo -e "${GREEN}5. 启动指定小鸡${RESET}"
-        echo -e "${GREEN}6. 新增开设小鸡${RESET}"
-        echo -e "${GREEN}7. 删除指定小鸡${RESET}"
-        echo -e "${GREEN}8. 删除所有小鸡和配置${RESET}"
-        echo -e "${GREEN}9. 查看小鸡连接信息${RESET}"
-        echo -e "${GREEN}0. 返回主菜单${RESET}"
-
-        read -rp "$(echo -e ${GREEN}请选择操作: ${RESET})" sub_choice
-
-        case "$sub_choice" in
-            1)
-                incus list
-                check_log
-                pause
-                ;;
-
-            2)
-                incus stop --all
-                echo -e "${GREEN}已暂停所有小鸡${RESET}"
-                pause
-                ;;
-
-            3)
-                incus start --all
-                echo -e "${GREEN}已启动所有小鸡${RESET}"
-                pause
-                ;;
-
-            4)
-                read -rp "请输入小鸡名: " name
-                if incus stop "$name" 2>/dev/null; then
-                    echo -e "${GREEN}$name 已暂停${RESET}"
-                else
-                    echo -e "${RED}小鸡 $name 不存在${RESET}"
-                fi
-                pause
-                ;;
-
-            5)
-                read -rp "请输入小鸡名: " name
-                if incus start "$name" 2>/dev/null; then
-                    echo -e "${GREEN}$name 已启动${RESET}"
-                else
-                    echo -e "${RED}小鸡 $name 不存在${RESET}"
-                fi
-                pause
-                ;;
-
-            6)
-                install_pkg screen
-                curl -L https://github.com/oneclickvirt/incus/raw/main/scripts/add_more.sh -o add_more.sh
-                chmod +x add_more.sh
-                screen bash add_more.sh
-                check_log
-                pause
-                ;;
-
-            7)
-                read -rp "请输入要删除的小鸡名: " name
-                incus stop "$name" 2>/dev/null
-
-                if incus delete -f "$name" 2>/dev/null; then
-                    rm -rf "$name" "${name}_v6"
-                    echo -e "${GREEN}$name 已删除，并清理相关目录${RESET}"
-                else
-                    echo -e "${RED}删除失败：小鸡 $name 不存在或已删除${RESET}"
-                fi
-                pause
-                ;;
-
-            8)
-                read -rp $'\033[1;35m删除后无法恢复，确定要继续删除所有 incus 小鸡吗 [y/n]: \033[0m' confirm
-
-                if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                    incus list -c n --format csv | xargs -r -I {} incus delete -f {}
-
-                    sudo find /var/log -type f -delete
-                    sudo find /var/tmp -type f -delete
-                    sudo find /tmp -type f -delete
-                    sudo find /var/cache/apt/archives -type f -delete
-
-                    rm -f \
-                        /usr/local/bin/ssh_sh.sh \
-                        /usr/local/bin/config.sh \
-                        /usr/local/bin/ssh_bash.sh \
-                        /usr/local/bin/check-dns.sh \
-                        /root/ssh_sh.sh \
-                        /root/config.sh \
-                        /root/ssh_bash.sh \
-                        /root/buildone.sh \
-                        /root/add_more.sh \
-                        /root/build_ipv6_network.sh
-
-                    echo -e "${GREEN}已删除所有 incus 小鸡及相关文件${RESET}"
-                else
-                    echo -e "${YELLOW}已取消删除${RESET}"
-                fi
-                pause
-                ;;
-
-            9)
-                read -rp "请输入小鸡名: " name
-
-                if ! incus info "$name" &>/dev/null; then
-                    echo -e "${RED}小鸡 $name 不存在${RESET}"
-                    pause
-                    continue
-                fi
-
-                ipv4=$(incus list "$name" -c 4 --format csv)
-                server_ip=$(hostname -I | awk '{print $1}')
-
-                devices=$(incus config device show "$name")
-
-                ssh_port=$(echo "$devices" | awk '/ssh-port:/ {f=1} f && /listen:/ {split($2,a,":"); print a[3]; exit}')
-                tcp_ports=$(echo "$devices" | awk '/nattcp-ports:/ {f=1} f && /listen:/ {split($2,a,":"); print a[3]; exit}')
-                udp_ports=$(echo "$devices" | awk '/natudp-ports:/ {f=1} f && /listen:/ {split($2,a,":"); print a[3]; exit}')
-
-                echo
-                echo -e "${GREEN}====== 小鸡连接信息 ======${RESET}"
-                echo -e "小鸡名称 : ${CYAN}$name${RESET}"
-                echo -e "内网 IP  : ${CYAN}$ipv4${RESET}"
-                echo -e "SSH 连接 : ${CYAN}ssh root@$server_ip -p $ssh_port${RESET}"
-                echo -e "TCP端口段: ${CYAN}$tcp_ports${RESET}"
-                echo -e "UDP端口段: ${CYAN}$udp_ports${RESET}"
-
-                pause
-                ;;
-
-            0)
-                break
-                ;;
-
-            *)
-                echo -e "${RED}无效选项，请重新输入${RESET}"
-                pause
-                ;;
-        esac
-    done
-}
-
-
-# =========================================================
-# 主菜单
-# =========================================================
-main_menu(){
-    while true; do
-        clear
-        echo -e "${GREEN}====Incus 管理脚本======${RESET}"
-        echo -e "${GREEN}1. 开设SWAP${RESET}"
-        echo -e "${GREEN}2. 安装incus${RESET}"
-        echo -e "${GREEN}3. 管理incus小鸡${RESET}"
-        echo -e "${GREEN}0. 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择: ${RESET})" choice
-        case $choice in
-            1) curl -L https://raw.githubusercontent.com/oneclickvirt/incus/main/scripts/swap.sh -o swap.sh && chmod +x swap.sh && bash swap.sh ;;
-            2) install_incus ;;
-            3) manage_incus ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选项，请重新输入${RESET}" ; pause ;;
-        esac
-    done
-}
-
-main_menu
+# 运行
+download_scripts
+menu

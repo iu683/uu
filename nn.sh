@@ -1,245 +1,308 @@
 #!/bin/bash
+# =========================================================
+# Incus 一键管理脚本（绿色无边框版）
+# =========================================================
 
-TARGET="/etc/profile.d/server-motd.sh"
-
-GREEN="\033[1;32m"
-RED="\033[1;31m"
-CYAN="\033[1;36m"
-YELLOW="\033[1;33m"
+# 颜色定义
+RED="\033[0;31m"
+GREEN="\033[0;32m"
+YELLOW="\033[0;33m"
+PURPLE="\033[0;35m"
+SKYBLUE="\033[0;36m"
+WHITE="\033[1;37m"
 RESET="\033[0m"
 
-install_motd(){
+# =========================================================
+# 工具函数
+# =========================================================
+pause(){
+    echo -e "${YELLOW}按任意键返回菜单...${RESET}"
+    read -n 1
+}
 
-cat << 'EOF' > $TARGET
-#!/bin/bash
+check_log(){
+    for f in ./log /root/log /var/log/incus.log; do
+        if [ -f "$f" ]; then
+            grep -v -E "$(incus list -c n --format csv | paste -sd'|' -)" "$f"
+            return
+        fi
+    done
+    echo -e "${YELLOW}未找到 log 文件，请稍后再试${RESET}"
+}
 
-[ -n "$SUDO_USER" ] && exit
+install_pkg(){
+    pkg=$1
+    if ! command -v $pkg >/dev/null 2>&1; then
+        echo -e "${YELLOW}正在安装依赖：$pkg${RESET}"
+        if command -v apt >/dev/null 2>&1; then
+            apt update && apt install -y $pkg
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y $pkg
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y $pkg
+        elif command -v apk >/dev/null 2>&1; then
+            apk add --no-cache $pkg
+        fi
+    fi
+}
 
-G='\033[1;32m'
-B='\033[1;34m'
-C='\033[1;36m'
-Y='\033[1;33m'
-O='\033[38;5;208m'
-R='\033[1;31m'
-X='\033[0m'
+# =========================================================
+# 安装和开设 Incus
+# =========================================================
+install_incus(){
+    echo -e "${YELLOW}开始进行环境检测...${RESET}"
+    install_pkg wget
 
-USER=$(whoami)
-HOST=$(hostname)
-OS=$(grep PRETTY_NAME /etc/os-release | cut -d '"' -f2)
+    output=$(bash <(wget -qO- --no-check-certificate https://raw.githubusercontent.com/oneclickvirt/incus/main/scripts/pre_check.sh))
+    echo "$output"
 
-DATE=$(date "+%Y年%m月%d日 %H:%M:%S")
+    if echo "$output" | grep -q "本机符合作为incus母鸡的要求"; then
+        echo -e "${GREEN}你的 VPS 符合要求，可以开设 incus 容器${RESET}"
 
+        read -p $'\033[1;32m确定要安装并开设 incus 小鸡吗？ [y/n]: \033[0m' confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}开始安装 Incus 主体...${RESET}"
+            sleep 1
+            curl -L https://raw.githubusercontent.com/oneclickvirt/incus/main/scripts/incus_install.sh -o incus_install.sh
+            chmod +x incus_install.sh
+            bash incus_install.sh
 
-UPTIME=$(uptime -p | sed 's/up //' \
-| sed 's/weeks/周/g' \
-| sed 's/week/周/g' \
-| sed 's/days/天/g' \
-| sed 's/day/天/g' \
-| sed 's/hours/小时/g' \
-| sed 's/hour/小时/g' \
-| sed 's/minutes/分钟/g' \
-| sed 's/minute/分钟/g')
+            if command -v incus >/dev/null 2>&1; then
+                echo -e "${GREEN}Incus 已安装完成${RESET}"
+            else
+                echo -e "${RED}Incus 安装失败，请更新系统后重试${RESET}"
+                rm -f incus_install.sh
+                return
+            fi
+        fi
+    else
+        echo -e "${RED}检测未通过，无法安装 Incus${RESET}"
+    fi
+}
+       
 
-LOAD=$(uptime | awk -F'load average:' '{print $2}')
+# =========================================================
+# 管理 Incus 小鸡
+# =========================================================
+manage_incus() {
 
-CPU=$(top -bn1 | awk '/Cpu/ {print 100 - $8 "%"}')
+PASS_DIR="/root/incus_passwd"
+mkdir -p $PASS_DIR
 
-MEM=$(free -h | awk '/Mem:/ {print $3 "/" $2}')
-SWAP=$(free -h | awk '/Swap:/ {print $3 "/" $2}')
+while true; do
+    clear
+    echo -e "${GREEN}====== 管理 incus 小鸡 ======${RESET}"
+    echo -e "${GREEN} 1. 查看所有小鸡状态${RESET}"
+    echo -e "${GREEN} 2. 暂停所有小鸡${RESET}"
+    echo -e "${GREEN} 3. 启动所有小鸡${RESET}"
+    echo -e "${GREEN} 4. 暂停指定小鸡${RESET}"
+    echo -e "${GREEN} 5. 启动指定小鸡${RESET}"
+    echo -e "${GREEN} 6. 新增开设小鸡${RESET}"
+    echo -e "${GREEN} 7. 删除指定小鸡${RESET}"
+    echo -e "${GREEN} 8. 删除所有小鸡和配置${RESET}"
+    echo -e "${GREEN} 9. 查看小鸡连接信息${RESET}"
+    echo -e "${GREEN}10. 查看所有小鸡 SSH 信息${RESET}"
+    echo -e "${GREEN} 0. 返回主菜单${RESET}"
 
-DISK=$(df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}')
-DISK_P=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
+    read -rp "$(echo -e ${GREEN}请选择操作: ${RESET})" sub_choice
 
-echo
-echo -e "${G}╔════════════════════════════════════════════╗${X}"
-echo -e "${G}           🚀 Server Dashboard                ${X}"
-echo -e "${G}╚════════════════════════════════════════════╝${X}"
+    case "$sub_choice" in
 
-printf "👤 用户           : %s\n" "$USER"
-printf "💻 主机           : %s\n" "$HOST"
-printf "🖥️系统           : %s\n" "$OS"
+        1)
+            incus list
+            pause
+        ;;
 
-echo
+        2)
+            incus stop --all
+            echo -e "${GREEN}已暂停所有小鸡${RESET}"
+            pause
+        ;;
 
-printf "⏰ 时间            : %s (%s)\n" "$DATE"
-printf "🆙 运行时间       : %s\n" "$UPTIME"
-printf "📊 系统负载       : %s\n" "$LOAD"
+        3)
+            incus start --all
+            echo -e "${GREEN}已启动所有小鸡${RESET}"
+            pause
+        ;;
 
-echo
+        4)
+            read -rp "请输入小鸡名: " name
+            incus stop "$name" 2>/dev/null && \
+            echo -e "${GREEN}$name 已暂停${RESET}" || \
+            echo -e "${RED}小鸡不存在${RESET}"
+            pause
+        ;;
 
-printf "🔥 CPU使用        : %s\n" "$CPU"
-printf "💾 内存使用       : %s\n" "$MEM"
-printf "🧠 Swap使用       : %s\n" "$SWAP"
-printf "🗂️磁盘使用       : %s\n" "$DISK"
+        5)
+            read -rp "请输入小鸡名: " name
+            incus start "$name" 2>/dev/null && \
+            echo -e "${GREEN}$name 已启动${RESET}" || \
+            echo -e "${RED}小鸡不存在${RESET}"
+            pause
+        ;;
 
-echo
+        6)
 
-if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+            install_pkg screen
 
-D_CONT=$(docker ps -aq | wc -l)
-D_IMG=$(docker images -q | wc -l)
-D_SIZE=$(docker system df | awk '/Images/ {print $4}')
+            curl -L https://github.com/oneclickvirt/incus/raw/main/scripts/add_more.sh -o add_more.sh
+            chmod +x add_more.sh
 
-echo -e "${Y}🐳 Docker 状态${X}"
+            screen bash add_more.sh
 
-printf "📦 容器数量       : %s\n" "$D_CONT"
-printf "🖼️镜像数量       : %s\n" "$D_IMG"
-printf "📦 Docker占用     : %s\n" "$D_SIZE"
+            echo -e "${GREEN}正在配置 SSH 和随机密码...${RESET}"
 
-RUN=$(docker ps --format "{{.Names}}")
-STOP=$(docker ps -a --filter status=exited --format "{{.Names}}")
+            for c in $(incus list -c n --format csv); do
 
-if [ -n "$RUN" ]; then
-echo
-echo "运行容器"
-for i in $RUN; do
-echo -e " ${G}✔ $i${X}"
+                PASS=$(openssl rand -base64 8)
+
+                incus exec "$c" -- bash -c "
+                apt update >/dev/null 2>&1
+                apt install -y openssh-server >/dev/null 2>&1
+                echo root:$PASS | chpasswd
+                systemctl enable ssh >/dev/null 2>&1
+                systemctl restart ssh >/dev/null 2>&1
+                "
+
+                echo "$PASS" > $PASS_DIR/$c.pass
+
+                echo -e "${CYAN}$c 密码: $PASS${RESET}"
+
+            done
+
+            echo -e "${GREEN}SSH配置完成${RESET}"
+
+            pause
+        ;;
+
+        7)
+            read -rp "请输入要删除的小鸡名: " name
+
+            incus stop "$name" 2>/dev/null
+            if incus delete -f "$name" 2>/dev/null; then
+                rm -f $PASS_DIR/$name.pass
+                echo -e "${GREEN}$name 已删除${RESET}"
+            else
+                echo -e "${RED}小鸡不存在${RESET}"
+            fi
+
+            pause
+        ;;
+
+        8)
+
+            read -rp $'\033[1;35m确定删除所有小鸡吗 [y/n]: \033[0m' confirm
+
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+
+                incus list -c n --format csv | xargs -r -I {} incus delete -f {}
+
+                rm -rf $PASS_DIR/*
+
+                echo -e "${GREEN}所有小鸡已删除${RESET}"
+            else
+                echo -e "${YELLOW}已取消${RESET}"
+            fi
+
+            pause
+        ;;
+
+        9)
+
+            read -rp "请输入小鸡名: " name
+
+            if ! incus info "$name" &>/dev/null; then
+                echo -e "${RED}小鸡不存在${RESET}"
+                pause
+                continue
+            fi
+
+            ipv4=$(incus list "$name" -c 4 --format csv)
+            server_ip=$(hostname -I | awk '{print $1}')
+
+            devices=$(incus config device show "$name")
+
+            ssh_port=$(echo "$devices" | awk '/ssh-port:/ {f=1} f && /listen:/ {split($2,a,":"); print a[3]; exit}')
+
+            pass_file="$PASS_DIR/$name.pass"
+
+            if [ -f "$pass_file" ]; then
+                passwd=$(cat "$pass_file")
+            else
+                passwd="未知"
+            fi
+
+            echo
+            echo -e "${GREEN}====== 小鸡连接信息 ======${RESET}"
+            echo -e "小鸡名称 : ${CYAN}$name${RESET}"
+            echo -e "内网 IP  : ${CYAN}$ipv4${RESET}"
+            echo -e "SSH连接  : ${CYAN}ssh root@$server_ip -p $ssh_port${RESET}"
+            echo -e "SSH密码  : ${CYAN}$passwd${RESET}"
+
+            pause
+        ;;
+
+        10)
+
+            server_ip=$(hostname -I | awk '{print $1}')
+
+            echo
+            echo -e "${GREEN}====== 所有小鸡 SSH 信息 ======${RESET}"
+
+            for c in $(incus list -c n --format csv); do
+
+                devices=$(incus config device show "$c")
+
+                ssh_port=$(echo "$devices" | awk '/ssh-port:/ {f=1} f && /listen:/ {split($2,a,":"); print a[3]; exit}')
+
+                if [ -f "$PASS_DIR/$c.pass" ]; then
+                    passwd=$(cat "$PASS_DIR/$c.pass")
+                else
+                    passwd="未知"
+                fi
+
+                echo -e "${CYAN}$c${RESET}  ssh root@$server_ip -p $ssh_port  密码: ${YELLOW}$passwd${RESET}"
+
+            done
+
+            pause
+        ;;
+
+        0)
+            break
+        ;;
+
+        *)
+            echo -e "${RED}无效选项${RESET}"
+            pause
+        ;;
+
+    esac
+
 done
-fi
-
-if [ -n "$STOP" ]; then
-echo
-echo "停止容器"
-for i in $STOP; do
-echo -e " ${R}✘ $i${X}"
-done
-fi
-
-echo
-docker stats --no-stream --format "  {{.Name}} CPU:{{.CPUPerc}} MEM:{{.MemUsage}}"
-
-else
-echo -e "${R}Docker 未安装${X}"
-fi
-
-echo
-
-echo -e "${O}🛡 最近登录记录${X}"
-
-LAST_BIN=$(which last 2>/dev/null)
-
-if [ -z "$LAST_BIN" ]; then
-if command -v apt >/dev/null 2>&1; then
-apt -qq update >/dev/null 2>&1
-apt -y install login >/dev/null 2>&1
-fi
-LAST_BIN=$(which last 2>/dev/null)
-fi
-
-if [ -n "$LAST_BIN" ]; then
-
-if [ ! -f /var/log/wtmp ]; then
-touch /var/log/wtmp
-chmod 664 /var/log/wtmp
-fi
-
-echo "IP              时间"
-
-$LAST_BIN -i -n 3 | grep '^root' | grep -v reboot | while read line
-do
-
-IP=$(echo "$line" | awk '{print $3}')
-MONTH=$(echo "$line" | awk '{print $5}')
-DAY=$(echo "$line" | awk '{print $6}')
-TIME=$(echo "$line" | awk '{print $7}')
-
-case $MONTH in
-Jan) MONTH="01月" ;;
-Feb) MONTH="02月" ;;
-Mar) MONTH="03月" ;;
-Apr) MONTH="04月" ;;
-May) MONTH="05月" ;;
-Jun) MONTH="06月" ;;
-Jul) MONTH="07月" ;;
-Aug) MONTH="08月" ;;
-Sep) MONTH="09月" ;;
-Oct) MONTH="10月" ;;
-Nov) MONTH="11月" ;;
-Dec) MONTH="12月" ;;
-esac
-
-DATE="${MONTH}${DAY}日 ${TIME}"
-
-printf "${Y}%-15s %s${X}\n" "$IP" "$DATE"
-
-done
-
-else
-
-echo -e "${Y}系统未记录登录日志${X}"
-
-fi
-
-if [ "$DISK_P" -ge 70 ]; then
-echo
-echo -e "${R}⚠ 磁盘使用率 ${DISK_P}% 请清理${X}"
-fi
-
-echo
-EOF
-
-chmod +x $TARGET
-
-echo -e "${GREEN}MOTD 安装完成${RESET}"
-
 }
 
-remove_motd(){
 
-rm -f $TARGET
-echo -e "${RED}MOTD 已卸载${RESET}"
-
+# =========================================================
+# 主菜单
+# =========================================================
+main_menu(){
+    while true; do
+        clear
+        echo -e "${GREEN}====Incus 管理脚本======${RESET}"
+        echo -e "${GREEN}1. 开设SWAP${RESET}"
+        echo -e "${GREEN}2. 安装incus${RESET}"
+        echo -e "${GREEN}3. 管理incus小鸡${RESET}"
+        echo -e "${GREEN}0. 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择: ${RESET})" choice
+        case $choice in
+            1) curl -L https://raw.githubusercontent.com/oneclickvirt/incus/main/scripts/swap.sh -o swap.sh && chmod +x swap.sh && bash swap.sh ;;
+            2) install_incus ;;
+            3) manage_incus ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选项，请重新输入${RESET}" ; pause ;;
+        esac
+    done
 }
 
-restore_default(){
-
-rm -f $TARGET
-
-true > /etc/motd
-
-if [ -d /etc/update-motd.d ]; then
-chmod +x /etc/update-motd.d/*
-fi
-
-echo -e "${CYAN}系统 MOTD 已恢复默认${RESET}"
-
-}
-
-preview(){
-
-bash $TARGET
-
-}
-
-menu(){
-
-while true
-do
-
-clear
-
-echo -e "${GREEN}====MOTD管理菜单====${RESET}"
-echo -e "${GREEN}1. 安装MOTD${RESET}"
-echo -e "${GREEN}2. 卸载MOTD${RESET}"
-echo -e "${GREEN}3. 恢复系统默认${RESET}"
-echo -e "${GREEN}4. 预览MOTD${RESET}"
-echo -e "${GREEN}0. 退出${RESET}"
-read -r -p $'\033[32m请选择: \033[0m' CH
-
-case $CH in
-
-1) install_motd ;;
-2) remove_motd ;;
-3) restore_default ;;
-4) preview ;;
-0) exit ;;
-
-esac
-
-read -p "按回车返回菜单..."
-
-done
-
-}
-
-menu
+main_menu

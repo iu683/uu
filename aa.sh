@@ -1,344 +1,281 @@
 #!/bin/bash
 
-set -euo pipefail
+set -eo pipefail
 
-readonly SCRIPT_VERSION="VLESS-HTTPUPGRADE-1.0"
-readonly xray_config_path="/usr/local/etc/xray/config.json"
-readonly xray_binary_path="/usr/local/bin/xray"
-readonly xray_install_script_url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+readonly SCRIPT_VERSION="SINGBOX-VLESS-HTTPUPGRADE-1.1"
+readonly config_path="/etc/sing-box/config.json"
 
-readonly red='\e[91m'
-readonly green='\e[92m'
-readonly yellow='\e[93m'
-readonly cyan='\e[96m'
-readonly none='\e[0m'
+red='\e[91m'
+green='\e[92m'
+yellow='\e[93m'
+cyan='\e[96m'
+none='\e[0m'
 
-xray_status_info=""
-is_quiet=false
-ws_path="/"
+status_info=""
+ws_path=""
 ws_host=""
 
-error(){ echo -e "\n$red[✖] $1$none\n"; }
-info(){ echo -e "\n$yellow[!] $1$none\n"; }
-success(){ echo -e "\n$green[✔] $1$none\n"; }
+error(){ echo -e "\n${red}[✖] $1${none}\n"; }
+info(){ echo -e "\n${yellow}[!] $1${none}\n"; }
+success(){ echo -e "\n${green}[✔] $1${none}\n"; }
 
-spinner(){
-    local pid=$1
-    local spin='|/-\'
-    while kill -0 $pid 2>/dev/null; do
-        for i in ${spin}; do
-            printf "\r[%c] " "$i"
-            sleep .1
-        done
-    done
+generate_path(){
+ws_path="/$(tr -dc a-z0-9 </dev/urandom | head -c 8)"
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-}
+get_public_ip(){
 
-is_valid_port(){
-    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
-}
+ip=$(curl -s https://api.ipify.org)
 
-is_port_in_use(){
-    ss -tuln | grep -q ":$1 "
-}
+if [ -z "$ip" ]; then
+ip=$(curl -s https://ip.sb)
+fi
 
-is_valid_uuid(){
-    [[ "$1" =~ ^[0-9a-fA-F-]{36}$ ]]
+echo "$ip"
+
 }
 
 pre_check(){
-    [[ $(id -u) != 0 ]] && error "请使用root运行" && exit 1
 
-    if ! command -v jq &>/dev/null || ! command -v curl &>/dev/null; then
-        apt update -y
-        apt install -y jq curl
-    fi
+if [[ $(id -u) != 0 ]]; then
+error "请用root运行"
+exit 1
+fi
+
+apt update -y
+apt install -y jq curl qrencode wget uuid-runtime
+
+mkdir -p /etc/sing-box
+
 }
 
-execute_official_script(){
-    bash <(curl -L "$xray_install_script_url") "$@" &>/dev/null &
-    spinner $!
-}
+install_singbox(){
 
-check_xray_status(){
-    if [[ ! -f "$xray_binary_path" ]]; then
-        xray_status_info="Xray: 未安装"
-        return
-    fi
+if command -v sing-box >/dev/null 2>&1; then
+return
+fi
 
-    local v=$($xray_binary_path version | head -n1 | awk '{print $2}')
-    if systemctl is-active --quiet xray; then
-        xray_status_info="Xray: 运行中 | $v"
-    else
-        xray_status_info="Xray: 未运行 | $v"
-    fi
-}
+info "正在安装 sing-box..."
 
-install_xray(){
+cd /tmp
 
-    local port uuid
+wget -q https://github.com/SagerNet/sing-box/releases/download/v1.13.0/sing-box-1.13.0-linux-amd64.tar.gz
 
-    while true; do
-        read -p "端口 (默认8080): " port
-        [ -z "$port" ] && port=8080
+tar -zxf sing-box-1.13.0-linux-amd64.tar.gz
 
-        is_valid_port "$port" || { error "端口无效"; continue; }
-        is_port_in_use "$port" && { error "端口占用"; continue; }
+install -m 755 sing-box-1.13.0-linux-amd64/sing-box /usr/local/bin/sing-box
 
-        break
-    done
+rm -rf sing-box*
 
-    while true; do
-        read -p "UUID (留空自动生成): " uuid
-        [ -z "$uuid" ] && uuid=$(cat /proc/sys/kernel/random/uuid)
+cat >/etc/systemd/system/sing-box.service <<EOF
+[Unit]
+Description=Sing-box Service
+After=network.target
 
-        is_valid_uuid "$uuid" && break || error "UUID格式错误"
-    done
+[Service]
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+Restart=always
+RestartSec=5
 
-    read -p "Host (可选): " ws_host
+[Install]
+WantedBy=multi-user.target
+EOF
 
-    read -p "Path (默认 /): " ws_path
-    [ -z "$ws_path" ] && ws_path="/"
-    [[ "$ws_path" != /* ]] && ws_path="/$ws_path"
+systemctl daemon-reload
+systemctl enable sing-box
 
-    run_install "$port" "$uuid"
+success "sing-box 安装完成"
+
 }
 
 write_config(){
 
-    local port=$1
-    local uuid=$2
+port=$1
+uuid=$2
 
-jq -n \
---argjson port "$port" \
---arg uuid "$uuid" \
---arg path "$ws_path" \
---arg host "$ws_host" \
-'{
-"log":{"loglevel":"warning"},
+cat > $config_path <<EOF
+{
+"log":{
+"level":"warn"
+},
 "inbounds":[
 {
-"listen":"0.0.0.0",
-"port":$port,
-"protocol":"vless",
-"settings":{
-"clients":[
+"type":"vless",
+"listen":"::",
+"listen_port":$port,
+"users":[
 {
-"id":$uuid
+"uuid":"$uuid"
 }
 ],
-"decryption":"none"
-},
-"streamSettings":{
-"network":"httpupgrade",
-"httpupgradeSettings":{
-"path":$path,
-"host":$host
-}
-},
-"sniffing":{
-"enabled":true,
-"destOverride":["http","tls"]
+"transport":{
+"type":"httpupgrade",
+"path":"$ws_path",
+"host":"$ws_host"
 }
 }
 ],
 "outbounds":[
 {
-"protocol":"freedom",
-"settings":{
-"domainStrategy":"UseIPv4v6"
-}
+"type":"direct"
 }
 ]
-}' > "$xray_config_path"
+}
+EOF
+
 }
 
-run_install(){
+install_node(){
 
-    local port=$1
-    local uuid=$2
+read -p "端口 (默认8080): " port
 
-    info "安装 Xray..."
-    execute_official_script install
-
-    mkdir -p /usr/local/etc/xray
-
-    write_config "$port" "$uuid"
-
-    systemctl enable xray
-    systemctl restart xray
-
-    success "安装完成"
-
-    view_subscription_info
-}
-
-restart_xray(){
-    systemctl restart xray
-    success "Xray 已重启"
-}
-
-modify_config(){
-
-if [ ! -f "$xray_config_path" ]; then
-error "Xray 未安装"
-return
+if [ -z "$port" ]; then
+port=8080
 fi
 
-info "读取当前配置..."
+uuid=$(uuidgen)
 
-current_port=$(jq -r '.inbounds[0].port' "$xray_config_path")
-current_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
-current_path=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.path' "$xray_config_path")
-current_host=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.host // ""' "$xray_config_path")
+generate_path
 
-echo
-echo "当前端口: $current_port"
-echo "当前UUID: $current_uuid"
-echo "当前Path: $current_path"
-echo "当前Host: $current_host"
-echo
+read -p "Host (可选): " ws_host
 
-while true
-do
-read -p "新端口 (回车保持 $current_port): " port
-[ -z "$port" ] && port=$current_port
-
-is_valid_port "$port" || { error "端口无效"; continue; }
-
-if [[ "$port" != "$current_port" ]] && is_port_in_use "$port"; then
-error "端口已被占用"
-continue
-fi
-
-break
-done
-
-while true
-do
-read -p "新UUID (回车保持): " uuid
-[ -z "$uuid" ] && uuid=$current_uuid
-
-is_valid_uuid "$uuid" && break || error "UUID格式错误"
-done
-
-read -p "新Host (回车保持 $current_host): " new_host
-[ -z "$new_host" ] && new_host=$current_host
-
-read -p "新Path (回车保持 $current_path): " new_path
-[ -z "$new_path" ] && new_path=$current_path
-[[ "$new_path" != /* ]] && new_path="/$new_path"
-
-ws_host="$new_host"
-ws_path="$new_path"
+install_singbox
 
 write_config "$port" "$uuid"
 
-systemctl restart xray
+systemctl restart sing-box
 
-success "配置修改完成"
+success "节点部署完成"
 
-view_subscription_info
+view_node
+
 }
 
-update_xray(){
-    execute_official_script install
-    restart_xray
+restart_service(){
+
+systemctl restart sing-box
+
+success "服务已重启"
+
 }
 
-uninstall_xray(){
-    execute_official_script remove --purge
-    success "已卸载"
+view_log(){
+
+journalctl -u sing-box -f
+
 }
 
-view_xray_log(){
-    journalctl -u xray -f
+uninstall_node(){
+
+systemctl stop sing-box 2>/dev/null
+
+rm -f /usr/local/bin/sing-box
+rm -rf /etc/sing-box
+rm -f /etc/systemd/system/sing-box.service
+
+systemctl daemon-reload
+
+success "已卸载"
+
 }
 
-view_subscription_info(){
+view_node(){
 
-    local ip=$(get_public_ip)
+if [ ! -f $config_path ]; then
+error "未安装节点"
+return
+fi
 
-    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
-    local port=$(jq -r '.inbounds[0].port' "$xray_config_path")
-    local path=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.path' "$xray_config_path")
-    local host=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.host // ""' "$xray_config_path")
+ip=$(get_public_ip)
 
-vless_link="vless://$uuid@$ip:$port?type=httpupgrade&path=$path&host=$host&encryption=none#$(hostname)"
+uuid=$(jq -r '.inbounds[0].users[0].uuid' $config_path)
+port=$(jq -r '.inbounds[0].listen_port' $config_path)
+path=$(jq -r '.inbounds[0].transport.path' $config_path)
+host=$(jq -r '.inbounds[0].transport.host // ""' $config_path)
 
-echo "---------------------------------------"
-echo -e "${green}VLESS + HTTPUpgrade 节点${none}"
+link="vless://$uuid@$ip:$port?type=httpupgrade&path=$path&host=$host&encryption=none#$(hostname)"
+
+echo
+echo "--------------------------------"
+echo -e "${green}VLESS HTTPUpgrade 节点${none}"
 echo "地址: $ip"
 echo "端口: $port"
 echo "UUID: $uuid"
 echo "Host: $host"
 echo "Path: $path"
 echo
-echo "$vless_link"
-echo "---------------------------------------"
+echo "$link"
+echo "--------------------------------"
 
-echo "$vless_link" > ~/xray_vless_link.txt
+echo
+echo "二维码:"
+qrencode -t ANSIUTF8 "$link"
+echo
+
 }
 
-press_any_key(){
+press_key(){
+
 read -n1 -s -r -p "按任意键继续..."
+
 }
 
-main_menu(){
+check_status(){
+
+if systemctl is-active --quiet sing-box
+then
+status_info="sing-box: 运行中"
+else
+status_info="sing-box: 未运行"
+fi
+
+}
+
+menu(){
 
 while true
 do
+
 clear
 
-check_xray_status
+check_status
 
 echo "--------------------------------"
-echo "Xray VLESS+HTTPUpgrade 管理脚本"
+echo "Sing-box VLESS+HTTPUpgrade 管理"
 echo "--------------------------------"
-echo "$xray_status_info"
+echo "$status_info"
 echo "--------------------------------"
-echo "1. 安装"
-echo "2. 更新"
-echo "3. 重启"
-echo "4. 卸载"
-echo "5. 查看日志"
-echo "6. 修改节点配置"
-echo "7. 查看节点"
+echo "1. 安装节点"
+echo "2. 重启服务"
+echo "3. 查看节点"
+echo "4. 查看日志"
+echo "5. 卸载"
 echo "0. 退出"
 echo "--------------------------------"
 
 read -p "请选择: " choice
 
 case $choice in
-
-1) install_xray ;;
-2) update_xray ;;
-3) restart_xray ;;
-4) uninstall_xray ;;
-5) view_xray_log ;;
-6) modify_config ;;
-7) view_subscription_info ;;
-0) exit 0 ;;
+1) install_node ;;
+2) restart_service ;;
+3) view_node ;;
+4) view_log ;;
+5) uninstall_node ;;
+0) exit ;;
 *) error "无效选项" ;;
-
 esac
 
-press_any_key
+press_key
 
 done
+
 }
 
 main(){
+
 pre_check
-main_menu
+menu
+
 }
 
 main

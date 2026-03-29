@@ -1,593 +1,542 @@
 #!/bin/bash
+# VPS Toolbox
+# 功能：
+# - 一级菜单加 ▶ 标识，字体绿色
+# - 二级菜单简洁显示，输入 1~99 都可执行
+# - 快捷指令 m / M 自动创建
+# - 系统信息面板保留
+# - 彩色菜单和动态彩虹标题
+# - 完整安装/卸载逻辑
 
-# ==============================================================================
-#VLESS-Reality 一键安装管理脚本
-# ==============================================================================
+INSTALL_PATH="$HOME/vps-toolbox.sh"
+SHORTCUT_PATH="/usr/local/bin/m"
+SHORTCUT_PATH_UPPER="/usr/local/bin/M"
 
-# --- Shell 严格模式 ---
-set -euo pipefail
+# 颜色
+green="\033[32m"
+reset="\033[0m"
+yellow="\033[33m"
+red="\033[31m"
+cyan="\033[36m"
+BLUE="\033[34m"
+ORANGE='\033[38;5;208m'
 
-# --- 全局常量 ---
-readonly SCRIPT_VERSION="V-Final-2.2"
-readonly xray_config_path="/usr/local/etc/xray/config.json"
-readonly xray_binary_path="/usr/local/bin/xray"
-readonly xray_install_script_url="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
-# --- 颜色定义 ---
-readonly red='\e[91m' green='\e[92m' yellow='\e[93m'
-readonly magenta='\e[95m' cyan='\e[96m' none='\e[0m'
 
-# --- 全局变量 ---
-xray_status_info=""
-is_quiet=false
+# Ctrl+C 中断保护
+trap 'echo -e "\n${red}操作已中断${reset}"; exit 1' INT
 
-# --- 辅助函数 ---
-error() { echo -e "\n$red[✖] $1$none\n" >&2; }
-info() { [[ "$is_quiet" = false ]] && echo -e "\n$yellow[!] $1$none\n"; }
-success() { [[ "$is_quiet" = false ]] && echo -e "\n$green[✔] $1$none\n"; }
-
-spinner() {
-    local pid=$1; local spinstr='|/-\'
-    if [[ "$is_quiet" = true ]]; then
-        wait "$pid"
-        return
-    fi
-    while ps -p "$pid" > /dev/null; do
-        local temp=${spinstr#?}
-        printf " [%c]  " "$spinstr"
-        local spinstr=$temp${spinstr%"$temp"}
-        sleep 0.1
-        printf "\r"
+# 彩虹标题
+rainbow_animate() {
+    local text="$1"
+    local colors=(31 33 32 36 34 35)
+    local len=${#text}
+    for ((i=0; i<len; i++)); do
+        printf "\033[%sm%s" "${colors[$((i % ${#colors[@]}))]}" "${text:$i:1}"
+        sleep 0.002
     done
-    printf "    \r"
+    printf "${reset}\n"
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    error "无法获取公网 IP 地址。" && return 1
-}
+# 系统资源显示
+show_system_usage() {
+    local width=36
+    local content_indent="    "
 
-execute_official_script() {
-    local args="$1"
-
-    curl -Ls "$xray_install_script_url" -o /tmp/xray_install.sh
-    chmod +x /tmp/xray_install.sh
-
-    if ! bash /tmp/xray_install.sh $args; then
-        rm -f /tmp/xray_install.sh
-        return 1
-    fi
-
-    rm -f /tmp/xray_install.sh
-}
-
-# --- 改进的验证函数 ---
-is_valid_port() {
-    local port=$1
-    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
-}
-
-# 新增：检查端口是否被占用
-is_port_in_use() {
-    local port=$1
-    # 使用多种方法检查端口占用
-    if command -v ss &>/dev/null; then
-        ss -tuln 2>/dev/null | grep -q ":$port "
-    elif command -v netstat &>/dev/null; then
-        netstat -tuln 2>/dev/null | grep -q ":$port "
-    elif command -v lsof &>/dev/null; then
-        lsof -i ":$port" &>/dev/null
-    else
-        # 如果没有可用工具，尝试连接测试
-        timeout 1 bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null
-    fi
-}
-
-# 增强的UUID验证函数
-is_valid_uuid() {
-    local uuid=$1
-    # 标准UUID格式验证：8-4-4-4-12 位十六进制数字
-    [[ "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
-}
-
-is_valid_domain() {
-    local domain=$1
-    [[ "$domain" =~ ^[a-zA-Z0-9-]{1,63}(\.[a-zA-Z0-9-]{1,63})+$ ]] && [[ "$domain" != *--* ]]
-}
-
-# --- 改进的系统兼容性检查 ---
-check_system_compatibility() {
-    local os_release_file="/etc/os-release"
-    local debian_version_file="/etc/debian_version"
-    local lsb_release_file="/etc/lsb-release"
-    
-    # 检查是否为Linux系统
-    if [[ "$(uname -s)" != "Linux" ]]; then
-        error "错误: 此脚本仅支持 Linux 系统。"
-        return 1
-    fi
-    
-    # 支持的发行版列表
-    local supported_distros=("ubuntu" "debian" "kali" "raspbian" "deepin" "mint" "elementary")
-    local distro_detected=false
-    local distro_name=""
-    local distro_version=""
-    
-    # 方法1: 检查 /etc/os-release (最标准的方法)
-    if [[ -f "$os_release_file" ]]; then
-        source "$os_release_file"
-        distro_name=$(echo "$ID" | tr '[:upper:]' '[:lower:]')
-        distro_version="$VERSION_ID"
-        
-        # 检查是否为支持的发行版
-        for supported in "${supported_distros[@]}"; do
-            if [[ "$distro_name" == "$supported" ]]; then
-                distro_detected=true
-                break
-            fi
-        done
-        
-        # 检查基于Debian的发行版
-        if [[ "$distro_detected" == false && "$ID_LIKE" =~ debian|ubuntu ]]; then
-            distro_detected=true
-            distro_name="$ID_LIKE"
-        fi
-    fi
-    
-    # 方法2: 检查 /etc/debian_version (Debian系特有)
-    if [[ "$distro_detected" == false && -f "$debian_version_file" ]]; then
-        distro_detected=true
-        distro_name="debian-based"
-        distro_version=$(cat "$debian_version_file" 2>/dev/null || echo "unknown")
-    fi
-    
-    # 方法3: 检查 /etc/lsb-release (备用方法)
-    if [[ "$distro_detected" == false && -f "$lsb_release_file" ]]; then
-        source "$lsb_release_file"
-        local lsb_id=$(echo "$DISTRIB_ID" | tr '[:upper:]' '[:lower:]')
-        for supported in "${supported_distros[@]}"; do
-            if [[ "$lsb_id" == "$supported" ]]; then
-                distro_detected=true
-                distro_name="$lsb_id"
-                distro_version="$DISTRIB_RELEASE"
-                break
-            fi
-        done
-    fi
-    
-    # 方法4: 检查包管理器 (最后的检查)
-    if [[ "$distro_detected" == false ]]; then
-        if command -v apt &>/dev/null && command -v dpkg &>/dev/null; then
-            distro_detected=true
-            distro_name="debian-compatible"
-            info "检测到基于APT的包管理系统，假定为Debian兼容系统。"
-        fi
-    fi
-    
-    if [[ "$distro_detected" == false ]]; then
-        error "错误: 未检测到支持的Linux发行版。"
-        error "支持的系统: Ubuntu, Debian, Kali Linux, Raspbian, Deepin, Linux Mint, elementary OS"
-        error "当前系统信息: $(uname -a)"
-        return 1
-    fi
-    
-    # 输出检测结果
-    if [[ "$is_quiet" == false ]]; then
-        info "系统兼容性检查通过"
-        info "检测到系统: ${distro_name} ${distro_version}"
-    fi
-    
-    # 检查关键命令是否存在
-    local required_commands=("systemctl" "awk" "grep" "sed")
-    local missing_commands=()
-    
-    for cmd in "${required_commands[@]}"; do
-        if ! command -v "$cmd" &>/dev/null; then
-            missing_commands+=("$cmd")
-        fi
-    done
-    
-    if [[ ${#missing_commands[@]} -gt 0 ]]; then
-        error "错误: 缺少必要的系统命令: ${missing_commands[*]}"
-        error "请确保系统完整安装后再运行此脚本。"
-        return 1
-    fi
-    
-    return 0
-}
-
-# --- 预检查与环境设置 ---
-pre_check() {
-    [[ $(id -u) != 0 ]] && error "错误: 您必须以root用户身份运行此脚本" && exit 1
-    
-    # 使用改进的系统兼容性检查
-    if ! check_system_compatibility; then
-        exit 1
-    fi
-
-    if ! command -v jq &>/dev/null || ! command -v curl &>/dev/null; then
-        info "检测到缺失的依赖 (jq/curl)，正在尝试自动安装..."
-        (DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y jq curl) &> /dev/null &
-        spinner $!
-        if ! command -v jq &>/dev/null || ! command -v curl &>/dev/null; then
-            error "依赖 (jq/curl) 自动安装失败。请手动运行 'apt update && apt install -y jq curl' 后重试。"
-            exit 1
-        fi
-        success "依赖已成功安装。"
-    fi
-}
-
-check_xray_status() {
-    if [[ ! -f "$xray_binary_path" ]]; then xray_status_info="  Xray 状态: ${red}未安装${none}"; return; fi
-    local xray_version=$($xray_binary_path version 2>/dev/null | head -n 1 | awk '{print $2}' || echo "未知")
-    local service_status
-    if systemctl is-active --quiet xray 2>/dev/null; then service_status="${green}运行中${none}"; else service_status="${yellow}未运行${none}"; fi
-    xray_status_info="  Xray 状态: ${green}已安装${none} | ${service_status} | 版本: ${cyan}${xray_version}${none}"
-}
-
-# --- 菜单功能函数 ---
-install_xray() {
-    if [[ -f "$xray_binary_path" ]]; then
-        info "检测到 Xray 已安装。继续操作将覆盖现有配置。"
-        read -p "是否继续？[y/N]: " confirm
-        if [[ ! $confirm =~ ^[yY]$ ]]; then info "操作已取消。"; return; fi
-    fi
-    info "开始配置 Xray VLESS-Reality..."
-    local port uuid domain
-
-    while true; do
-        read -p "$(echo -e "请输入端口 [1-65535] (默认: ${cyan}443${none}): ")" port
-        [ -z "$port" ] && port=443
-        if ! is_valid_port "$port"; then
-            error "端口无效，请输入一个1-65535之间的数字。"
-            continue
-        fi
-        if is_port_in_use "$port"; then
-            error "端口 $port 已被占用，请选择其他端口。"
-            continue
-        fi
-        break
-    done
-
-    while true; do
-        read -p "$(echo -e "请输入UUID (留空将默认生成随机UUID): ")" uuid
-        if [[ -z "$uuid" ]]; then 
-            uuid=$(cat /proc/sys/kernel/random/uuid)
-            info "已为您生成随机UUID: ${cyan}${uuid}${none}"
-            break
-        elif is_valid_uuid "$uuid"; then
-            break
+    # ================== 格式化函数 ==================
+    format_size() {
+        local size_mb=${1:-0}  # 防止为空
+        if [ "$size_mb" -lt 1024 ]; then
+            echo "${size_mb}M"
         else
-            error "UUID格式无效，请输入标准UUID格式 (如: 550e8400-e29b-41d4-a716-446655440000) 或留空自动生成。"
+            awk "BEGIN{printf \"%.1fG\", $size_mb/1024}"
         fi
+    }
+
+    # ================== 获取数据 ==================
+    # 内存
+    read mem_total mem_used <<< $(LANG=C free -m | awk 'NR==2{print $2, $3}')
+    mem_total=${mem_total:-0}
+    mem_used=${mem_used:-0}
+    mem_total_fmt=$(format_size "$mem_total")
+    mem_used_fmt=$(format_size "$mem_used")
+    mem_percent=$(awk "BEGIN{if($mem_total>0){printf \"%.0f\", $mem_used*100/$mem_total}else{print 0}}")
+    mem_percent="${mem_percent}%"  # 加回百分号显示
+
+    # 磁盘
+    read disk_total_h disk_used_h disk_used_percent <<< $(df -m / | awk 'NR==2{print $2, $3, $5}')
+    disk_total_h=${disk_total_h:-0}
+    disk_used_h=${disk_used_h:-0}
+    disk_used_percent=${disk_used_percent:-0%}
+    disk_total_fmt=$(format_size "$disk_total_h")
+    disk_used_fmt=$(format_size "$disk_used_h")
+
+    # CPU
+    # 读取 /proc/stat 第一行，计算 CPU 使用率（防止空值）
+    cpu_usage=$(awk 'NR==1{usage=($2+$4)*100/($2+$4+$5); if(usage!=""){printf "%.1f", usage}else{print 0}}' /proc/stat)
+    cpu_usage="${cpu_usage}%"  # 加回百分号显示
+
+    # ================== 系统状态 ==================
+    mem_num=${mem_percent%\%}        # 去掉百分号
+    disk_num=${disk_used_percent%\%} # 去掉百分号
+    cpu_num=${cpu_usage%\%}          # 去掉百分号
+
+    max_level=0
+    for n in $mem_num $disk_num $cpu_num; do
+        if (( $(awk "BEGIN{print ($n>80)?1:0}") )); then max_level=2; fi
+        if (( $(awk "BEGIN{print ($n>60 && $n<=80)?1:0}") )) && [ "$max_level" -lt 2 ]; then max_level=1; fi
     done
 
-    while true; do
-        read -p "$(echo -e "请输入SNI域名 (默认: ${cyan}learn.microsoft.com${none}): ")" domain
-        [ -z "$domain" ] && domain="learn.microsoft.com"
-        if is_valid_domain "$domain"; then break; else error "域名格式无效，请重新输入。"; fi
-    done
-
-    run_install "$port" "$uuid" "$domain"
-}
-
-update_xray() {
-    if [[ ! -f "$xray_binary_path" ]]; then error "错误: Xray 未安装，无法执行更新。请先选择安装选项。" && return; fi
-    info "正在检查最新版本..."
-    local current_version=$($xray_binary_path version | head -n 1 | awk '{print $2}')
-    local latest_version=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r '.tag_name' | sed 's/v//' || echo "")
-    if [[ -z "$latest_version" ]]; then error "获取最新版本号失败，请检查网络或稍后再试。" && return; fi
-    info "当前版本: ${cyan}${current_version}${none}，最新版本: ${cyan}${latest_version}${none}"
-    if [[ "$current_version" == "$latest_version" ]]; then success "您的 Xray 已是最新版本，无需更新。" && return; fi
-    
-    info "发现新版本，开始更新..."
-    if ! execute_official_script "install"; then error "Xray 核心更新失败！" && return; fi
-    info "正在更新 GeoIP 和 GeoSite 数据文件..."
-    execute_official_script "install-geodata"
-
-    if ! restart_xray; then return; fi
-    success "Xray 更新成功！"
-}
-
-restart_xray() {
-    if [[ ! -f "$xray_binary_path" ]]; then error "错误: Xray 未安装，无法重启。" && return 1; fi
-    info "正在重启 Xray 服务..."
-    if ! systemctl restart xray; then
-        error "错误: Xray 服务重启失败, 请使用菜单 5 查看日志检查具体原因。"
-        return 1
-    fi
-    sleep 1
-    if ! systemctl is-active --quiet xray; then
-        error "错误: Xray 服务启动失败, 请使用菜单 5 查看日志检查具体原因。"
-        return 1
-    fi
-    success "Xray 服务已成功重启！"
-}
-
-uninstall_xray() {
-    if [[ ! -f "$xray_binary_path" ]]; then error "错误: Xray 未安装，无需卸载。" && return; fi
-    read -p "您确定要卸载 Xray 吗？这将删除所有相关文件。[Y/n]: " confirm
-    if [[ "$confirm" =~ ^[nN]$ ]]; then
-        info "卸载操作已取消。"
-        return
-    fi
-    info "正在卸载 Xray..."
-    if execute_official_script "remove --purge"; then
-        rm -f ~/xray_vless_reality_link.txt
-        success "Xray 已成功卸载。"
+    if [ "$max_level" -eq 0 ]; then
+        system_status="${green}系统状态：正常 ✔${reset}"
+    elif [ "$max_level" -eq 1 ]; then
+        system_status="${yellow}系统状态：警告 ⚠️${reset}"
     else
-        error "Xray 卸载失败！"
-        return 1
+        system_status="${red}系统状态：危险 🔥${reset}"
     fi
+
+    # ================== 输出 ==================
+    pad_string() {
+        local str="$1"
+        printf "%-${width}s" "${content_indent}${str}"
+    }
+
+    echo -e "${green}┌$(printf '─%.0s' $(seq 1 $width))┐${reset}"
+    echo -e "$(pad_string "${system_status}")"
+    echo -e "$(pad_string "${yellow}📊 内存：${mem_used_fmt}/${mem_total_fmt} (${mem_percent})${reset}")"
+    echo -e "$(pad_string "${yellow}💽 磁盘：${disk_used_fmt}/${disk_total_fmt} (${disk_used_percent})${reset}")"
+    echo -e "$(pad_string "${yellow} ⚙ CPU ：${cpu_usage}${reset}")"
+    echo -e "${green}└$(printf '─%.0s' $(seq 1 $width))┘${reset}"
 }
 
-view_xray_log() {
-    if [[ ! -f "$xray_binary_path" ]]; then error "错误: Xray 未安装，无法查看日志。" && return; fi
-    info "正在显示 Xray 实时日志... 按 Ctrl+C 退出。"
-    journalctl -u xray -f --no-pager
+# ================== 系统信息 ==================
+
+# 判断是否容器
+if [ -f /proc/1/cgroup ] && grep -qE '(docker|lxc|kubepods)' /proc/1/cgroup; then
+    container_flag=" (Container)"
+else
+    container_flag=""
+fi
+
+# 系统名称
+if [ -f /etc/os-release ]; then
+    system_name=$(grep -E '^PRETTY_NAME=' /etc/os-release | cut -d= -f2 | tr -d '"')
+else
+    system_name=$(uname -s)
+fi
+system_name="${system_name}${container_flag}"
+
+
+
+# ===============================
+# 获取当前时区（跨系统兼容）
+# ===============================
+get_timezone() {
+    # 1️⃣ systemd 环境，屏蔽错误
+    if command -v timedatectl &>/dev/null; then
+        tz=$(timedatectl show -p Timezone --value 2>/dev/null)
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 2️⃣ /etc/timezone 文件（Debian）
+    if [[ -f /etc/timezone ]]; then
+        tz=$(cat /etc/timezone)
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 3️⃣ /etc/localtime 符号链接（RedHat / CentOS）
+    if [[ -L /etc/localtime ]]; then
+        tz=$(readlink /etc/localtime | sed 's#.*/zoneinfo/##')
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 4️⃣ /etc/localtime 文件内容匹配（minimal / docker / chroot）
+    if [[ -f /etc/localtime ]]; then
+        tz=$(strings /etc/localtime 2>/dev/null | grep -E '^[A-Z][a-z]+/[A-Z][a-zA-Z_]+$' | head -n1)
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 5️⃣ 兜底
+    echo "未知"
 }
 
-modify_config() {
-    if [[ ! -f "$xray_config_path" ]]; then error "错误: Xray 未安装，无法修改配置。" && return; fi
-    info "读取当前配置..."
-    local current_port=$(jq -r '.inbounds[0].port' "$xray_config_path")
-    local current_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
-    local current_domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$xray_config_path")
-    local private_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$xray_config_path")
-    local public_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.publicKey' "$xray_config_path")
+timezone=$(get_timezone)
 
-    info "请输入新配置，直接回车则保留当前值。"
-    local port uuid domain
-    
-    while true; do
-        read -p "$(echo -e "端口 (当前: ${cyan}${current_port}${none}): ")" port
-        [ -z "$port" ] && port=$current_port
-        if ! is_valid_port "$port"; then
-            error "端口无效，请输入一个1-65535之间的数字。"
-            continue
-        fi
-        # 如果端口没有变化，跳过占用检查
-        if [[ "$port" != "$current_port" ]] && is_port_in_use "$port"; then
-            error "端口 $port 已被占用，请选择其他端口。"
-            continue
-        fi
-        break
-    done
-    
-    while true; do
-        read -p "$(echo -e "UUID (当前: ${cyan}${current_uuid}${none}): ")" uuid
-        [ -z "$uuid" ] && uuid=$current_uuid
-        if is_valid_uuid "$uuid"; then
-            break
+# 架构
+
+cpu_arch=$(uname -m)
+
+# 获取 CPU 型号
+cpu_model=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2)
+[ -z "$cpu_model" ] && cpu_model=$(grep -m1 "Hardware" /proc/cpuinfo 2>/dev/null | cut -d: -f2)
+[ -z "$cpu_model" ] && cpu_model=$(lscpu 2>/dev/null | grep "Model name" | cut -d: -f2)
+
+# 清理不需要的部分
+cpu_model=$(echo "$cpu_model" | sed -E \
+    -e 's/@.*GHz//g' \
+    -e 's/CPU//g' \
+    -e 's/Processor//g' \
+    -e 's/[0-9]+-Core//g' \
+    -e 's/\s+/ /g' \
+    | xargs)
+
+cpu="${cpu_model:-Unknown CPU} (${cpu_arch})"
+
+
+# 当前时间
+datetime=$(date "+%Y-%m-%d %H:%M:%S")
+
+# VPS 运行时间
+if [ -f /proc/uptime ]; then
+    uptime_seconds=$(cut -d' ' -f1 /proc/uptime | cut -d. -f1)
+    days=$((uptime_seconds/86400))
+    hours=$(( (uptime_seconds%86400)/3600 ))
+    minutes=$(( (uptime_seconds%3600)/60 ))
+    if [ "$days" -gt 0 ]; then
+        vps_uptime="${days}天${hours}小时${minutes}分钟"
+    elif [ "$hours" -gt 0 ]; then
+        vps_uptime="${hours}小时${minutes}分钟"
+    else
+        vps_uptime="${minutes}分钟"
+    fi
+else
+    vps_uptime=$(uptime -p 2>/dev/null | tr -d ' ' || echo "未知")
+fi
+
+
+
+# 一级菜单
+MAIN_MENU=(
+    "系统设置"
+    "网络代理"
+    "网络检测"
+    "Docker管理"
+    "应用商店"
+    "证书管理"
+    "系统管理"
+    "工具箱合集"
+    "玩具熊ʕ•ᴥ•ʔ"
+    "监控通知"
+    "备份恢复"
+    "更新卸载"
+)
+
+# 二级菜单（编号去掉前导零，显示时格式化为两位数）
+SUB_MENU[1]="1 更新系统|2 系统信息|3 修改root密码|4 root密码登录管理|5 root公钥登录管理|6 修改SSH端口|7 修改时区|8 时间同步|9 切换v4V6|10 开放所有端口|11 更换系统源|12 DDdebian12|13 DDwindows10|14 DDNAT|15 DD飞牛|16 修改语言|17 修改主机名|18 美化命令|19 VPS重启"
+SUB_MENU[2]="20 代理工具箱|21 FRP管理|22 BBRv3优化|23 WARP|24 BBR+TCP智能调参|25 Reality|26 SurgeSnell|27 Shadowsocks|28 自定义DNS解锁|29 DDNS|30 Hysteria2|31 3X-UI|32 Realm|33 GOST|34 哆啦A梦转发面板|35 easytier组网"
+SUB_MENU[3]="36 NodeQuality脚本|37 融合怪测试|38 YABS测试|39 网络质量体检脚本|40 IP质量体检脚本|41 硬盘质量体检脚本|42 三网延迟检测|43 简单回程测试|44 完整路由检测|45 流媒体解锁|46 三网延迟测速|47 检查25端口开放|48 网络工具箱"
+SUB_MENU[4]="49 Docker管理|50 DockerCompose管理|51 DockerCompose备份恢复|52 DockerCompose自动更新"
+SUB_MENU[5]="53 应用管理|54 面板管理|55 监控管理|56 yt-dlp视频下载|57 镜像加速|58 独角数卡|59 小雅全家桶|60 qbittorrent"
+SUB_MENU[6]="61 NGINXV4反代|62 NGINXV6反代|63 Caddy反代|64 NginxProxyManager面板|65 acme申请证书|66 Cloudflare证书管理|67 证书备份与恢复"
+SUB_MENU[7]="68 系统清理|69 重装系统|70 系统组件|71 开发环境|72 添加SWAP|73 DNS管理|74 工作区管理|75 系统监控|76 防火墙管理|78 Fail2ban|79 定时任务"
+SUB_MENU[8]="80 科技lion工具箱|81 老王工具箱|82 酷雪云工具箱|83 Alpine工具箱|84 甲骨文工具箱|85 开小鸡工具箱|86 国内VPS工具箱"
+SUB_MENU[9]="87 脚本短链|89 网站部署|90 ssh登录信息|91 Emby反代|92 GProxy加速|93 Akile优先DNS|94 自动机场签到|95 1panelapps管理|96 关闭V1SSH|97 卸载哪吒Agent|98 卸载komariAgent"
+SUB_MENU[10]="100 VPS信息通知|101 流量狗|102 VPS遥控器|103 TrafficCop流量监控"
+SUB_MENU[11]="104 系统快照恢复|105 本地备份|106 Rsync同步|107 远程文件目录备份|108 Rclone备份|109 压缩文件|110 解压文件"
+SUB_MENU[12]="77 自动更新|88 更新脚本|99 卸载脚本"
+
+# 显示一级菜单
+show_main_menu() {
+    clear
+    # 上边框保留彩虹效果
+    rainbow_animate "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # 标题文字改为纯黄色
+    echo -e "${yellow}       📦 VPS Toolbox工具箱 📦  ${reset}"
+
+    # 下边框保留彩虹效果
+    rainbow_animate "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # 系统信息
+    show_system_usage
+
+
+    # 当前日期时间显示在框下、菜单上
+
+    # 终端宽度（可用不用）
+    term_width=$(tput cols 2>/dev/null || echo 80)
+
+    label_w=8  # 左侧标签宽度
+
+    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "💻" $label_w "系统" "$system_name"
+    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "🌍" $label_w "时区" "$timezone"
+    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "🧩" $label_w "架构" "$cpu"
+    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "🕒" $label_w "时间" "$datetime"
+    printf "${ORANGE}%s %-*s:${ORANGE} %s${re}\n" "🚀" $label_w "在线" "$vps_uptime"
+
+    # 绿色下划线
+    echo -e "${green}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${re}"
+
+    # 显示菜单
+    for i in "${!MAIN_MENU[@]}"; do
+        if [[ $i -eq 8 ]]; then  # 第9项（索引从0开始）
+            # 符号红色，数字和点绿色，文字黄色
+            printf "${red}▶${reset} ${green}%02d.${reset} ${yellow}%s${reset}\n" "$((i+1))" "${MAIN_MENU[i]}"
         else
-            error "UUID格式无效，请输入标准UUID格式。"
-        fi
-    done
-    
-    while true; do
-        read -p "$(echo -e "SNI域名 (当前: ${cyan}${current_domain}${none}): ")" domain
-        [ -z "$domain" ] && domain=$current_domain
-        if is_valid_domain "$domain"; then break; else error "域名格式无效，请重新输入。"; fi
-    done
-
-    write_config "$port" "$uuid" "$domain" "$private_key" "$public_key"
-    if ! restart_xray; then return; fi
-
-    success "配置修改成功！"
-    view_subscription_info
-}
-
-view_subscription_info() {
-    if [ ! -f "$xray_config_path" ]; then error "错误: 配置文件不存在, 请先安装。" && return; fi
-    
-    local ip
-    if ! ip=$(get_public_ip); then return 1; fi
-
-    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
-    local port=$(jq -r '.inbounds[0].port' "$xray_config_path")
-    local domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$xray_config_path")
-    local public_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.publicKey' "$xray_config_path")
-    local shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$xray_config_path")
-    if [[ -z "$public_key" ]]; then error "配置文件中缺少公钥信息,可能是旧版配置,请重新安装以修复。" && return; fi
-
-    local display_ip=$ip && [[ $ip =~ ":" ]] && display_ip="[$ip]"
-    local link_name="$(hostname) X-reality"
-    local link_name_encoded=$(echo "$link_name" | sed 's/ /%20/g')
-    local vless_url="vless://${uuid}@${display_ip}:${port}?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=${domain}&fp=chrome&pbk=${public_key}&sid=${shortid}#${link_name_encoded}"
-
-    if [[ "$is_quiet" = true ]]; then
-        echo "${vless_url}"
-    else
-        echo "${vless_url}" > ~/xray_vless_reality_link.txt
-        echo "----------------------------------------------------------------"
-        echo -e "$green --- Xray VLESS-Reality 订阅信息 --- $none"
-        echo -e "$yellow 名称: $cyan$link_name$none"
-        echo -e "$yellow 地址: $cyan$ip$none"
-        echo -e "$yellow 端口: $cyan$port$none"
-        echo -e "$yellow UUID: $cyan$uuid$none"
-        echo -e "$yellow 流控: $cyan"xtls-rprx-vision"$none"
-        echo -e "$yellow 指纹: $cyan"chrome"$none"
-        echo -e "$yellow SNI: $cyan$domain$none"
-        echo -e "$yellow 公钥: $cyan$public_key$none"
-        echo -e "$yellow ShortId: $cyan$shortid$none"
-        echo "----------------------------------------------------------------"
-        echo -e "$green 订阅链接 (已保存到 ~/xray_vless_reality_link.txt): $none\n"; echo -e "$cyan${vless_url}${none}"
-        echo "----------------------------------------------------------------"
-    fi
-}
-
-# --- 核心逻辑函数 ---
-write_config() {
-    local port=$1 uuid=$2 domain=$3 private_key=$4 public_key=$5 shortid="20220701"
-    jq -n \
-        --argjson port "$port" \
-        --arg uuid "$uuid" \
-        --arg domain "$domain" \
-        --arg private_key "$private_key" \
-        --arg public_key "$public_key" \
-        --arg shortid "$shortid" \
-    '{
-        "log": {"loglevel": "warning"},
-        "inbounds": [{
-            "listen": "0.0.0.0",
-            "port": $port,
-            "protocol": "vless",
-            "settings": {
-                "clients": [{"id": $uuid, "flow": "xtls-rprx-vision"}],
-                "decryption": "none"
-            },
-            "streamSettings": {
-                "network": "tcp",
-                "security": "reality",
-                "realitySettings": {
-                    "show": false,
-                    "dest": ($domain + ":443"),
-                    "xver": 0,
-                    "serverNames": [$domain],
-                    "privateKey": $private_key,
-                    "publicKey": $public_key,
-                    "shortIds": [$shortid]
-                }
-            },
-            "sniffing": {
-                "enabled": true,
-                "destOverride": ["http", "tls", "quic"]
-            }
-        }],
-        "outbounds": [{
-            "protocol": "freedom",
-            "settings": {
-                "domainStrategy": "UseIPv4v6"
-            }
-        }]
-    }' > "$xray_config_path"
-}
-
-run_install() {
-    local port=$1 uuid=$2 domain=$3
-    info "正在下载并安装 Xray 核心..."
-    if ! execute_official_script "install"; then
-        error "Xray 核心安装失败！请检查网络连接。"
-        exit 1
-    fi
-
-    info "正在安装/更新 GeoIP 和 GeoSite 数据文件..."
-    if ! execute_official_script "install-geodata"; then
-        error "Geo-data 更新失败！"
-        info "这通常不影响核心功能，您可以稍后通过更新选项(2)来重试。"
-    fi
-
-    info "正在生成 Reality 密钥对..."
-
-    local key_pair
-    key_pair=$($xray_binary_path x25519 2>/dev/null)
-
-    local private_key
-    local public_key
-
-    private_key=$(echo "$key_pair" | grep -i "PrivateKey" | awk -F': ' '{print $2}')
-    public_key=$(echo "$key_pair" | grep -E "PublicKey|Password" | awk -F': ' '{print $2}')
-
-    if [[ -z "$private_key" || -z "$public_key" ]]; then
-        echo "$key_pair"
-        error "生成 Reality 密钥对失败！请检查 Xray 核心是否正常。"
-        exit 1
-    fi
-
-    info "正在写入 Xray 配置文件..."
-    write_config "$port" "$uuid" "$domain" "$private_key" "$public_key"
-
-    if ! restart_xray; then exit 1; fi
-
-    success "Xray 安装/配置成功！"
-    view_subscription_info
-}
-
-press_any_key_to_continue() {
-    echo ""
-    read -n 1 -s -r -p "按任意键返回主菜单..." || true
-}
-
-main_menu() {
-    while true; do
-        clear
-        echo -e "$cyan Xray VLESS-Reality 一键安装管理脚本$none"
-        echo "---------------------------------------------"
-        check_xray_status
-        echo -e "${xray_status_info}"
-        echo "---------------------------------------------"
-        # 修改：明确菜单项 1
-        printf "  ${green}%-2s${none} %-35s\n" "1." "安装/重装 Xray (VLESS-reality)"
-        printf "  ${cyan}%-2s${none} %-35s\n" "2." "更新 Xray"
-        printf "  ${yellow}%-2s${none} %-35s\n" "3." "重启 Xray"
-        printf "  ${red}%-2s${none} %-35s\n" "4." "卸载 Xray"
-        printf "  ${magenta}%-2s${none} %-35s\n" "5." "查看 Xray 日志"
-        printf "  ${cyan}%-2s${none} %-35s\n" "6." "修改节点配置"
-        printf "  ${green}%-2s${none} %-35s\n" "7." "查看订阅信息"
-        echo "---------------------------------------------"
-        printf "  ${yellow}%-2s${none} %-35s\n" "0." "退出脚本"
-        echo "---------------------------------------------"
-        read -p "请输入选项 [0-7]: " choice
-
-        local needs_pause=true
-        case $choice in
-            1) install_xray ;;
-            2) update_xray ;;
-            3) restart_xray ;;
-            4) uninstall_xray ;;
-            5) view_xray_log; needs_pause=false ;;
-            6) modify_config ;;
-            7) view_subscription_info ;;
-            0) success "感谢使用！"; exit 0 ;;
-            *) error "无效选项，请输入 0-7 之间的数字。" ;;
-        esac
-
-        if [ "$needs_pause" = true ]; then
-            press_any_key_to_continue
+            # 其他项保持原来的颜色（符号红色，数字绿色，文字绿色）
+            printf "${red}▶${reset} ${green}%02d. %s${reset}\n" "$((i+1))" "${MAIN_MENU[i]}"
         fi
     done
 }
 
-# --- 脚本主入口 ---
-main() {
-    pre_check
-    if [[ $# -gt 0 && "$1" == "install" ]]; then
-        shift
-        local port="" uuid="" domain=""
-        while [[ $# -gt 0 ]]; do
-            case "$1" in
-                --port) port="$2"; shift 2 ;;
-                --uuid) uuid="$2"; shift 2 ;;
-                --sni) domain="$2"; shift 2 ;;
-                --quiet|-q) is_quiet=true; shift ;;
-                *) error "未知参数: $1"; exit 1 ;;
-            esac
+
+# 显示二级菜单并选择
+show_sub_menu() {
+    local idx="$1"
+    while true; do
+        IFS='|' read -ra options <<< "${SUB_MENU[idx]}"
+        local map=()
+        echo
+        for opt in "${options[@]}"; do
+            local num="${opt%% *}"
+            local name="${opt#* }"
+            printf "${red}▶${reset} ${yellow}%02d %s${reset}\n" "$num" "$name"
+            map+=("$num")
         done
-        [[ -z "$port" ]] && port=443
-        [[ -z "$uuid" ]] && uuid=$(cat /proc/sys/kernel/random/uuid)
-        [[ -z "$domain" ]] && domain="learn.microsoft.com"
-        if ! is_valid_port "$port" || ! is_valid_domain "$domain"; then
-            error "参数无效。请检查端口或SNI域名格式。" && exit 1
+        echo -ne "${red}请输入要执行的编号${ORANGE}(0返回/X退出)${ORANGE}:${reset}"
+        read -r choice
+
+        # X/x 直接退出脚本
+        if [[ "$choice" =~ ^[xX]$ ]]; then
+            exit 0
         fi
-        if [[ -n "$uuid" ]] && ! is_valid_uuid "$uuid"; then
-            error "UUID格式无效。请提供标准UUID格式或留空自动生成。" && exit 1
+
+        # 按回车直接刷新菜单
+        if [[ -z "$choice" ]]; then
+            clear
+            continue
         fi
-        if is_port_in_use "$port"; then
-            error "端口 $port 已被占用，请选择其他端口。" && exit 1
+
+        # 输入 0 或 00 返回一级菜单
+        if [[ "$choice" == "0" || "$choice" == "00" ]]; then
+            return
         fi
-        run_install "$port" "$uuid" "$domain"
+
+        # 只允许数字输入
+        if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+            echo -e "${red}无效选项，请输入数字！${reset}"
+            sleep 1
+            clear
+            continue
+        fi
+
+        # 判断是否为有效选项
+        if [[ ! " ${map[*]} " =~ (^|[[:space:]])$choice($|[[:space:]]) ]]; then
+            echo -e "${red}无效选项${reset}"
+            sleep 1
+            clear
+            continue
+        fi
+
+        # 执行选项
+        execute_choice "$choice"
+
+        # 只有 0/99 才退出二级菜单，否则按回车刷新二级菜单
+        if [[ "$choice" != "0" && "$choice" != "99" ]]; then
+            read -rp $'\e[31m按回车刷新二级菜单...\e[0m' tmp
+            clear
+        else
+            break
+        fi
+    done
+}
+
+
+
+
+# 删除快捷指令
+remove_shortcut() {
+    if [[ $EUID -eq 0 ]]; then
+        rm -f "$SHORTCUT_PATH" "$SHORTCUT_PATH_UPPER"
     else
-        main_menu
+        sudo rm -f "$SHORTCUT_PATH" "$SHORTCUT_PATH_UPPER"
     fi
 }
 
-main "$@"
+# 执行菜单选项
+execute_choice() {
+    case "$1" in
+        1) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/update.sh) ;;
+        2) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/vpsinfo.sh) ;;
+        3) sudo passwd root ;;
+        4) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/rootmi.sh) ;;
+        5) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/rootgon.sh) ;;
+        6) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/sshdk.sh) ;;
+        7) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/time.sh) ;;
+        8) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/systemdtimesyncd.sh) ;;
+        9) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/qhwl.sh) ;;
+        10) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/open_all_ports.sh) ;;
+        11) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/huanyuan.sh) ;;
+        12) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Debian12.sh) ;;
+        13) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/window.sh) ;;
+        14) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/DDnat.sh) ;;
+        15) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/ddfnos.sh) ;;
+        16) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/xgyu.sh) ;;
+        17) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/home.sh) ;;
+        18) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/mhgl.sh) ;;
+        19) sudo reboot ;;
+        20) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/proxy.sh) ;;
+        21) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/FRP.sh) ;;
+        22) bash <(curl -fsSL "https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/main/install-alias.sh?$(date +%s)") ;;
+        23) wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh ;;
+        24) bash <(curl -sL https://raw.githubusercontent.com/yahuisme/network-optimization/main/script.sh) ;;
+        25) bash <(curl -L https://raw.githubusercontent.com/yahuisme/xray-vless-reality/main/install.sh) ;;
+        26) wget -O snell.sh --no-check-certificate https://git.io/Snell.sh && chmod +x snell.sh && ./snell.sh ;;
+        27) wget -O ss-rust.sh --no-check-certificate https://raw.githubusercontent.com/xOS/Shadowsocks-Rust/master/ss-rust.sh && chmod +x ss-rust.sh && ./ss-rust.sh ;;
+        28) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/unlockdns.sh) ;;
+        29) bash <(wget -qO- https://raw.githubusercontent.com/mocchen/cssmeihua/mochen/shell/ddns.sh) ;;
+        30) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/GLHysteria2.sh) ;;
+        31) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/3xui.sh) ;;
+        32) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Realm.sh) ;;
+        33) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/gost.sh) ;;
+        34) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/dlam.sh);;
+        35) bash <(curl -sL https://raw.githubusercontent.com/ceocok/c.cococ/refs/heads/main/easytier.sh) ;;
+        36) bash <(curl -sL https://run.NodeQuality.com) ;;
+        37) curl -L https://gitlab.com/spiritysdx/za/-/raw/main/ecs.sh -o ecs.sh && chmod +x ecs.sh && bash ecs.sh ;;
+        38) curl -sL https://yabs.sh | bash ;;
+        39) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/NetQuality.sh) ;;
+        40) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/IPQuality.sh) ;;
+        41) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/HardwareQuality.sh) ;;
+        42) bash <(curl -Ls https://Net.Check.Place) -P ;;
+        43) curl https://raw.githubusercontent.com/ludashi2020/backtrace/main/install.sh -sSf | sh ;;
+        44) bash <(curl -Ls https://Net.Check.Place) -R ;;
+        45) bash <(curl -L -s https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh) ;;
+        46) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/speed.sh) ;;
+        47) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Telnet.sh) ;;
+        48) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Networktool.sh) ;; 
+        49) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/Docker.sh) ;;
+        50) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/dockercompose.sh) ;;
+        51) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/Dockcompbauck.sh) ;;
+        52) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/dockerupdate.sh) ;;
+        53) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/Store.sh) ;;
+        54) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/panel.sh) ;;
+        55) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/jkgl.sh) ;;
+        56) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/ytdlp.sh) ;;
+        57) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/hubproxy.sh) ;;
+        58) bash <(curl -fsSL https://raw.githubusercontent.com/dujiao-next/community-projects/main/scripts/langge-dujiao-next-install/dujiao-next-install.sh) ;;
+        59) bash -c "$(curl --insecure -fsSL https://ddsrem.com/xiaoya_install.sh)" ;;
+        60) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/qbittorrent.sh) ;;
+        61) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/ngixv4.sh) ;;
+        62) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/ngixv6.sh) ;;
+        63) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Caddy.sh) ;;
+        64) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/NginxProxy.sh) ;;
+        65) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/ACMESSL.sh) ;;
+        66) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/CFSSL.sh) ;;
+        67) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/SSLbackup.sh) ;;
+        68) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/clear.sh) ;;
+        69) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/reinstall.sh) ;;
+        70) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/package.sh) ;;
+        71) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/exploitation.sh) ;;
+        72) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/WARP.sh) ;;
+        73) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/dns.sh) ;;
+        74) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/tmux.sh) ;;
+        75) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/System.sh) ;;
+        76) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/firewall.sh) ;;
+        78) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/fail2ban.sh) ;;
+        79) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/crontab.sh) ;;
+        80) bash <(curl -sL kejilion.sh) ;;
+        81) bash <(curl -fsSL ssh_tool.eooce.com) ;;
+        82) bash <(curl -sL https://cdn.kxy.ovh/kxy.sh) ;;
+        83) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/Alpine.sh) ;;
+        84) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Oracle/oracle.sh) ;;
+        85) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/NAT.sh) ;;
+        86) bash <(curl -sL https://v6.gh-proxy.org/https://raw.githubusercontent.com/sistarry/toolbox/main/CN/toolinstall.sh) ;;
+        87) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/dl.sh) ;;
+        89) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/html.sh) ;;
+		90) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/MOTD.sh) ;;
+        91) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/Embyfd.sh) ;;
+        92) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/GProxy.sh) ;;
+        93) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/AkileDNS.sh) ;;
+        94) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/JCQD.sh) ;;
+        95) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/1panelapps.sh) ;;
+        96) sed -i 's/disable_command_execute: false/disable_command_execute: true/' /opt/nezha/agent/config.yml && systemctl restart nezha-agent ;;
+        97) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/nzagent.sh) ;;
+        98) sudo systemctl stop komari-agent && sudo systemctl disable komari-agent && sudo rm -f /etc/systemd/system/komari-agent.service && sudo systemctl daemon-reload && sudo rm -rf /opt/komari /var/log/komari ;;
+        100) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/vpstg.sh) ;;
+        101) wget -O port-traffic-dog.sh https://raw.githubusercontent.com/zywe03/realm-xwPF/main/port-traffic-dog.sh && chmod +x port-traffic-dog.sh && ./port-traffic-dog.sh ;;
+        102) curl -fsSL https://raw.githubusercontent.com/MEILOI/VPS_BOT_X/main/vps_bot-x/install.sh -o install.sh && chmod +x install.sh && bash install.sh ;;
+        103) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/traffic.sh) ;;
+        104) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/restore.sh) ;;
+        105) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/beifen.sh) ;;
+        106) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/Rrsync.sh) ;;
+        107) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/Filebackup.sh) ;;
+        108) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/rclone.sh) ;;
+        109) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/yasuo.sh) ;;
+        110) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Vmessws.sh) ;;
+
+        #  自动更新脚本
+        77) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/tool/update.sh) ;; 
+        88)
+            echo -e "${yellow}正在更新脚本...${reset}"
+            # 下载最新版本覆盖本地脚本
+            curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/tool/vps-toolbox.sh -o "$INSTALL_PATH"
+            if [[ $? -ne 0 ]]; then
+                echo -e "${red}更新失败，请检查网络或GitHub地址${reset}"
+                return 1
+            fi
+            chmod +x "$INSTALL_PATH"
+            echo -e "${green}脚本已更新完成！${reset}"
+            # 重新执行最新脚本
+            exec bash "$INSTALL_PATH"
+            ;;
+
+        99) 
+            echo -e "${yellow}正在卸载工具箱...${reset}"
+
+            # 删除快捷指令
+            remove_shortcut
+ 
+            # 删除工具箱脚本
+            if [[ -f "$INSTALL_PATH" ]]; then
+            rm -f "$INSTALL_PATH"
+            echo -e "${green}工具箱脚本已删除${reset}"
+            fi
+            # 删除首次运行标记文件
+            MARK_FILE="$HOME/.vpstoolbox"
+            if [[ -f "$MARK_FILE" ]]; then
+            rm -f "$MARK_FILE"
+            fi
+           echo -e "${red}卸载完成！${reset}"
+           exit 0
+           ;;
+        0) exit 0 ;;
+        *) echo -e "${red}无效选项${reset}"; return 1 ;;
+    esac
+}
+
+
+# 主循环
+while true; do
+    show_main_menu
+    echo -ne "${red}请输入要执行的编号${ORANGE}(0退出)${ORANGE}:${reset} "
+    read -r main_choice
+
+    # X/x 直接退出脚本
+    if [[ "$main_choice" =~ ^[xX]$ ]]; then
+        exit 0
+    fi
+
+    # 按回车刷新菜单
+    if [[ -z "$main_choice" ]]; then
+        continue
+    fi
+
+    # 输入 0 退出
+    if [[ "$main_choice" == "0" ]]; then
+        exit 0
+    fi
+
+    # 只允许数字输入
+    if ! [[ "$main_choice" =~ ^[0-9]+$ ]]; then
+        echo -e "${red}无效选项，请输入数字！${reset}"
+        sleep 1
+        continue
+    fi
+
+    # 判断范围
+    if (( main_choice >= 1 && main_choice <= ${#MAIN_MENU[@]} )); then
+        show_sub_menu "$main_choice"
+    else
+        echo -e "${red}无效选项${reset}"
+        sleep 1
+    fi
+done

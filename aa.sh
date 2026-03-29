@@ -1,36 +1,44 @@
 #!/bin/bash
 
+# ==============================================================================
+#VLESS-Reality 一键安装管理脚本
+# ==============================================================================
+
+# --- Shell 严格模式 ---
 set -euo pipefail
 
-readonly SCRIPT_VERSION="VMESS-WS-1.0"
+# --- 全局常量 ---
+readonly SCRIPT_VERSION="V-Final-2.2"
 readonly xray_config_path="/usr/local/etc/xray/config.json"
 readonly xray_binary_path="/usr/local/bin/xray"
-readonly xray_install_script_url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+readonly xray_install_script_url="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
+# --- 颜色定义 ---
+readonly red='\e[91m' green='\e[92m' yellow='\e[93m'
+readonly magenta='\e[95m' cyan='\e[96m' none='\e[0m'
 
-readonly red='\e[91m'
-readonly green='\e[92m'
-readonly yellow='\e[93m'
-readonly cyan='\e[96m'
-readonly none='\e[0m'
-
+# --- 全局变量 ---
 xray_status_info=""
 is_quiet=false
-ws_path="/"
-ws_host=""
 
-error(){ echo -e "\n$red[✖] $1$none\n"; }
-info(){ echo -e "\n$yellow[!] $1$none\n"; }
-success(){ echo -e "\n$green[✔] $1$none\n"; }
+# --- 辅助函数 ---
+error() { echo -e "\n$red[✖] $1$none\n" >&2; }
+info() { [[ "$is_quiet" = false ]] && echo -e "\n$yellow[!] $1$none\n"; }
+success() { [[ "$is_quiet" = false ]] && echo -e "\n$green[✔] $1$none\n"; }
 
-spinner(){
-    local pid=$1
-    local spin='|/-\'
-    while kill -0 $pid 2>/dev/null; do
-        for i in ${spin}; do
-            printf "\r[%c] " "$i"
-            sleep .1
-        done
+spinner() {
+    local pid=$1; local spinstr='|/-\'
+    if [[ "$is_quiet" = true ]]; then
+        wait "$pid"
+        return
+    fi
+    while ps -p "$pid" > /dev/null; do
+        local temp=${spinstr#?}
+        printf " [%c]  " "$spinstr"
+        local spinstr=$temp${spinstr%"$temp"}
+        sleep 0.1
+        printf "\r"
     done
+    printf "    \r"
 }
 
 get_public_ip() {
@@ -45,331 +53,538 @@ get_public_ip() {
             ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
-    echo "无法获取公网 IP 地址。" && return
+    error "无法获取公网 IP 地址。" && return 1
 }
 
-is_valid_port(){
-    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+execute_official_script() {
+    local args="$1"
+
+    bash <(curl -L "$xray_install_script_url") $args &> /dev/null &
+    spinner $!
+
+    if ! wait $!; then
+        return 1
+    fi
 }
 
-is_port_in_use(){
-    ss -tuln | grep -q ":$1 "
+# --- 改进的验证函数 ---
+is_valid_port() {
+    local port=$1
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
 }
 
-is_valid_uuid(){
-    [[ "$1" =~ ^[0-9a-fA-F-]{36}$ ]]
+# 新增：检查端口是否被占用
+is_port_in_use() {
+    local port=$1
+    # 使用多种方法检查端口占用
+    if command -v ss &>/dev/null; then
+        ss -tuln 2>/dev/null | grep -q ":$port "
+    elif command -v netstat &>/dev/null; then
+        netstat -tuln 2>/dev/null | grep -q ":$port "
+    elif command -v lsof &>/dev/null; then
+        lsof -i ":$port" &>/dev/null
+    else
+        # 如果没有可用工具，尝试连接测试
+        timeout 1 bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null
+    fi
 }
 
-pre_check(){
-    [[ $(id -u) != 0 ]] && error "请使用root运行" && exit 1
+# 增强的UUID验证函数
+is_valid_uuid() {
+    local uuid=$1
+    # 标准UUID格式验证：8-4-4-4-12 位十六进制数字
+    [[ "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+}
+
+is_valid_domain() {
+    local domain=$1
+    [[ "$domain" =~ ^[a-zA-Z0-9-]{1,63}(\.[a-zA-Z0-9-]{1,63})+$ ]] && [[ "$domain" != *--* ]]
+}
+
+# --- 改进的系统兼容性检查 ---
+check_system_compatibility() {
+    local os_release_file="/etc/os-release"
+    local debian_version_file="/etc/debian_version"
+    local lsb_release_file="/etc/lsb-release"
+    
+    # 检查是否为Linux系统
+    if [[ "$(uname -s)" != "Linux" ]]; then
+        error "错误: 此脚本仅支持 Linux 系统。"
+        return 1
+    fi
+    
+    # 支持的发行版列表
+    local supported_distros=("ubuntu" "debian" "kali" "raspbian" "deepin" "mint" "elementary")
+    local distro_detected=false
+    local distro_name=""
+    local distro_version=""
+    
+    # 方法1: 检查 /etc/os-release (最标准的方法)
+    if [[ -f "$os_release_file" ]]; then
+        source "$os_release_file"
+        distro_name=$(echo "$ID" | tr '[:upper:]' '[:lower:]')
+        distro_version="$VERSION_ID"
+        
+        # 检查是否为支持的发行版
+        for supported in "${supported_distros[@]}"; do
+            if [[ "$distro_name" == "$supported" ]]; then
+                distro_detected=true
+                break
+            fi
+        done
+        
+        # 检查基于Debian的发行版
+        if [[ "$distro_detected" == false && "$ID_LIKE" =~ debian|ubuntu ]]; then
+            distro_detected=true
+            distro_name="$ID_LIKE"
+        fi
+    fi
+    
+    # 方法2: 检查 /etc/debian_version (Debian系特有)
+    if [[ "$distro_detected" == false && -f "$debian_version_file" ]]; then
+        distro_detected=true
+        distro_name="debian-based"
+        distro_version=$(cat "$debian_version_file" 2>/dev/null || echo "unknown")
+    fi
+    
+    # 方法3: 检查 /etc/lsb-release (备用方法)
+    if [[ "$distro_detected" == false && -f "$lsb_release_file" ]]; then
+        source "$lsb_release_file"
+        local lsb_id=$(echo "$DISTRIB_ID" | tr '[:upper:]' '[:lower:]')
+        for supported in "${supported_distros[@]}"; do
+            if [[ "$lsb_id" == "$supported" ]]; then
+                distro_detected=true
+                distro_name="$lsb_id"
+                distro_version="$DISTRIB_RELEASE"
+                break
+            fi
+        done
+    fi
+    
+    # 方法4: 检查包管理器 (最后的检查)
+    if [[ "$distro_detected" == false ]]; then
+        if command -v apt &>/dev/null && command -v dpkg &>/dev/null; then
+            distro_detected=true
+            distro_name="debian-compatible"
+            info "检测到基于APT的包管理系统，假定为Debian兼容系统。"
+        fi
+    fi
+    
+    if [[ "$distro_detected" == false ]]; then
+        error "错误: 未检测到支持的Linux发行版。"
+        error "支持的系统: Ubuntu, Debian, Kali Linux, Raspbian, Deepin, Linux Mint, elementary OS"
+        error "当前系统信息: $(uname -a)"
+        return 1
+    fi
+    
+    # 输出检测结果
+    if [[ "$is_quiet" == false ]]; then
+        info "系统兼容性检查通过"
+        info "检测到系统: ${distro_name} ${distro_version}"
+    fi
+    
+    # 检查关键命令是否存在
+    local required_commands=("systemctl" "awk" "grep" "sed")
+    local missing_commands=()
+    
+    for cmd in "${required_commands[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing_commands+=("$cmd")
+        fi
+    done
+    
+    if [[ ${#missing_commands[@]} -gt 0 ]]; then
+        error "错误: 缺少必要的系统命令: ${missing_commands[*]}"
+        error "请确保系统完整安装后再运行此脚本。"
+        return 1
+    fi
+    
+    return 0
+}
+
+# --- 预检查与环境设置 ---
+pre_check() {
+    [[ $(id -u) != 0 ]] && error "错误: 您必须以root用户身份运行此脚本" && exit 1
+    
+    # 使用改进的系统兼容性检查
+    if ! check_system_compatibility; then
+        exit 1
+    fi
 
     if ! command -v jq &>/dev/null || ! command -v curl &>/dev/null; then
-        apt update -y
-        apt install -y jq curl
+        info "检测到缺失的依赖 (jq/curl)，正在尝试自动安装..."
+        (DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y jq curl) &> /dev/null &
+        spinner $!
+        if ! command -v jq &>/dev/null || ! command -v curl &>/dev/null; then
+            error "依赖 (jq/curl) 自动安装失败。请手动运行 'apt update && apt install -y jq curl' 后重试。"
+            exit 1
+        fi
+        success "依赖已成功安装。"
     fi
 }
 
-execute_official_script(){
-    bash <(curl -L "$xray_install_script_url") "$@" &>/dev/null &
-    spinner $!
+check_xray_status() {
+    if [[ ! -f "$xray_binary_path" ]]; then xray_status_info="  Xray 状态: ${red}未安装${none}"; return; fi
+    local xray_version=$($xray_binary_path version 2>/dev/null | head -n 1 | awk '{print $2}' || echo "未知")
+    local service_status
+    if systemctl is-active --quiet xray 2>/dev/null; then service_status="${green}运行中${none}"; else service_status="${yellow}未运行${none}"; fi
+    xray_status_info="  Xray 状态: ${green}已安装${none} | ${service_status} | 版本: ${cyan}${xray_version}${none}"
 }
 
-check_xray_status(){
-    if [[ ! -f "$xray_binary_path" ]]; then
-        xray_status_info="Xray: 未安装"
-        return
+# --- 菜单功能函数 ---
+install_xray() {
+    if [[ -f "$xray_binary_path" ]]; then
+        info "检测到 Xray 已安装。继续操作将覆盖现有配置。"
+        read -p "是否继续？[y/N]: " confirm
+        if [[ ! $confirm =~ ^[yY]$ ]]; then info "操作已取消。"; return; fi
     fi
-
-    local v=$($xray_binary_path version | head -n1 | awk '{print $2}')
-    if systemctl is-active --quiet xray; then
-        xray_status_info="Xray: 运行中 | $v"
-    else
-        xray_status_info="Xray: 未运行 | $v"
-    fi
-}
-
-install_xray(){
-
-    local port uuid
+    info "开始配置 Xray VLESS-Reality..."
+    local port uuid domain
 
     while true; do
-        read -p "端口 (默认8080): " port
-        [ -z "$port" ] && port=8080
-
-        is_valid_port "$port" || { error "端口无效"; continue; }
-        is_port_in_use "$port" && { error "端口占用"; continue; }
-
+        read -p "$(echo -e "请输入端口 [1-65535] (默认: ${cyan}443${none}): ")" port
+        [ -z "$port" ] && port=443
+        if ! is_valid_port "$port"; then
+            error "端口无效，请输入一个1-65535之间的数字。"
+            continue
+        fi
+        if is_port_in_use "$port"; then
+            error "端口 $port 已被占用，请选择其他端口。"
+            continue
+        fi
         break
     done
 
     while true; do
-        read -p "UUID (留空自动生成): " uuid
-        [ -z "$uuid" ] && uuid=$(cat /proc/sys/kernel/random/uuid)
-
-        is_valid_uuid "$uuid" && break || error "UUID格式错误"
+        read -p "$(echo -e "请输入UUID (留空将默认生成随机UUID): ")" uuid
+        if [[ -z "$uuid" ]]; then 
+            uuid=$(cat /proc/sys/kernel/random/uuid)
+            info "已为您生成随机UUID: ${cyan}${uuid}${none}"
+            break
+        elif is_valid_uuid "$uuid"; then
+            break
+        else
+            error "UUID格式无效，请输入标准UUID格式 (如: 550e8400-e29b-41d4-a716-446655440000) 或留空自动生成。"
+        fi
     done
 
+    while true; do
+        read -p "$(echo -e "请输入SNI域名 (默认: ${cyan}learn.microsoft.com${none}): ")" domain
+        [ -z "$domain" ] && domain="learn.microsoft.com"
+        if is_valid_domain "$domain"; then break; else error "域名格式无效，请重新输入。"; fi
+    done
 
-    read -p "WS Host (可选): " ws_host
-
-    read -p "WS Path (默认 /): " ws_path
-    [ -z "$ws_path" ] && ws_path="/"
-    [[ "$ws_path" != /* ]] && ws_path="/$ws_path"
-
-
-    run_install "$port" "$uuid"
+    run_install "$port" "$uuid" "$domain"
 }
 
-write_config(){
-
-    local port=$1
-    local uuid=$2
-
-jq -n \
---argjson port "$port" \
---arg uuid "$uuid" \
---arg ws_path "$ws_path" \
---arg ws_host "$ws_host" \
-'{
-"log":{"loglevel":"warning"},
-"inbounds":[
-{
-"listen":"0.0.0.0",
-"port":$port,
-"protocol":"vmess",
-"settings":{
-"clients":[
-{
-"id":$uuid,
-"alterId":0
-}
-]
-},
-"streamSettings":{
-"network":"ws",
-"wsSettings":{
-"path":$ws_path,
-"headers":{
-"Host":$ws_host
-}
-}
-},
-"sniffing":{
-"enabled":true,
-"destOverride":["http","tls"]
-}
-}
-],
-"outbounds":[
-{
-"protocol":"freedom",
-"settings":{
-"domainStrategy":"UseIPv4v6"
-}
-}
-]
-}' > "$xray_config_path"
-}
-
-run_install(){
-
-    local port=$1
-    local uuid=$2
-
-    info "安装 Xray..."
-    execute_official_script install --beta
+update_xray() {
+    if [[ ! -f "$xray_binary_path" ]]; then error "错误: Xray 未安装，无法执行更新。请先选择安装选项。" && return; fi
+    info "正在检查最新版本..."
+    local current_version=$($xray_binary_path version | head -n 1 | awk '{print $2}')
+    local latest_version=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r '.tag_name' | sed 's/v//' || echo "")
+    if [[ -z "$latest_version" ]]; then error "获取最新版本号失败，请检查网络或稍后再试。" && return; fi
+    info "当前版本: ${cyan}${current_version}${none}，最新版本: ${cyan}${latest_version}${none}"
+    if [[ "$current_version" == "$latest_version" ]]; then success "您的 Xray 已是最新版本，无需更新。" && return; fi
     
-    mkdir -p /usr/local/etc/xray
+    info "发现新版本，开始更新..."
+    if ! execute_official_script "install"; then error "Xray 核心更新失败！" && return; fi
+    info "正在更新 GeoIP 和 GeoSite 数据文件..."
+    execute_official_script "install-geodata"
 
-    write_config "$port" "$uuid"
+    if ! restart_xray; then return; fi
+    success "Xray 更新成功！"
+}
 
-    systemctl enable xray
-    systemctl restart xray
+restart_xray() {
+    if [[ ! -f "$xray_binary_path" ]]; then error "错误: Xray 未安装，无法重启。" && return 1; fi
+    info "正在重启 Xray 服务..."
+    if ! systemctl restart xray; then
+        error "错误: Xray 服务重启失败, 请使用菜单 5 查看日志检查具体原因。"
+        return 1
+    fi
+    sleep 1
+    if ! systemctl is-active --quiet xray; then
+        error "错误: Xray 服务启动失败, 请使用菜单 5 查看日志检查具体原因。"
+        return 1
+    fi
+    success "Xray 服务已成功重启！"
+}
 
-    success "安装完成"
+uninstall_xray() {
+    if [[ ! -f "$xray_binary_path" ]]; then error "错误: Xray 未安装，无需卸载。" && return; fi
+    read -p "您确定要卸载 Xray 吗？这将删除所有相关文件。[Y/n]: " confirm
+    if [[ "$confirm" =~ ^[nN]$ ]]; then
+        info "卸载操作已取消。"
+        return
+    fi
+    info "正在卸载 Xray..."
+    if execute_official_script "remove --purge"; then
+        rm -f ~/xray_vless_reality_link.txt
+        success "Xray 已成功卸载。"
+    else
+        error "Xray 卸载失败！"
+        return 1
+    fi
+}
 
+view_xray_log() {
+    if [[ ! -f "$xray_binary_path" ]]; then error "错误: Xray 未安装，无法查看日志。" && return; fi
+    info "正在显示 Xray 实时日志... 按 Ctrl+C 退出。"
+    journalctl -u xray -f --no-pager
+}
+
+modify_config() {
+    if [[ ! -f "$xray_config_path" ]]; then error "错误: Xray 未安装，无法修改配置。" && return; fi
+    info "读取当前配置..."
+    local current_port=$(jq -r '.inbounds[0].port' "$xray_config_path")
+    local current_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
+    local current_domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$xray_config_path")
+    local private_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$xray_config_path")
+    local public_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.publicKey' "$xray_config_path")
+
+    info "请输入新配置，直接回车则保留当前值。"
+    local port uuid domain
+    
+    while true; do
+        read -p "$(echo -e "端口 (当前: ${cyan}${current_port}${none}): ")" port
+        [ -z "$port" ] && port=$current_port
+        if ! is_valid_port "$port"; then
+            error "端口无效，请输入一个1-65535之间的数字。"
+            continue
+        fi
+        # 如果端口没有变化，跳过占用检查
+        if [[ "$port" != "$current_port" ]] && is_port_in_use "$port"; then
+            error "端口 $port 已被占用，请选择其他端口。"
+            continue
+        fi
+        break
+    done
+    
+    while true; do
+        read -p "$(echo -e "UUID (当前: ${cyan}${current_uuid}${none}): ")" uuid
+        [ -z "$uuid" ] && uuid=$current_uuid
+        if is_valid_uuid "$uuid"; then
+            break
+        else
+            error "UUID格式无效，请输入标准UUID格式。"
+        fi
+    done
+    
+    while true; do
+        read -p "$(echo -e "SNI域名 (当前: ${cyan}${current_domain}${none}): ")" domain
+        [ -z "$domain" ] && domain=$current_domain
+        if is_valid_domain "$domain"; then break; else error "域名格式无效，请重新输入。"; fi
+    done
+
+    write_config "$port" "$uuid" "$domain" "$private_key" "$public_key"
+    if ! restart_xray; then return; fi
+
+    success "配置修改成功！"
     view_subscription_info
 }
 
-restart_xray(){
-    systemctl restart xray
-    success "Xray 已重启"
-}
-
-modify_config(){
-
-if [ ! -f "$xray_config_path" ]; then
-error "Xray 未安装"
-return
-fi
-
-info "读取当前配置..."
-
-current_port=$(jq -r '.inbounds[0].port' "$xray_config_path")
-current_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
-current_path=$(jq -r '.inbounds[0].streamSettings.wsSettings.path' "$xray_config_path")
-current_host=$(jq -r '.inbounds[0].streamSettings.wsSettings.headers.Host // ""' "$xray_config_path")
-
-echo
-echo "当前端口: $current_port"
-echo "当前UUID: $current_uuid"
-echo "当前Path: $current_path"
-echo "当前Host: $current_host"
-echo
-
-while true
-do
-read -p "新端口 (回车保持 $current_port): " port
-[ -z "$port" ] && port=$current_port
-
-is_valid_port "$port" || { error "端口无效"; continue; }
-
-if [[ "$port" != "$current_port" ]] && is_port_in_use "$port"; then
-error "端口已被占用"
-continue
-fi
-
-break
-done
-
-while true
-do
-read -p "新UUID (回车保持): " uuid
-[ -z "$uuid" ] && uuid=$current_uuid
-
-is_valid_uuid "$uuid" && break || error "UUID格式错误"
-done
-
-read -p "新WS Host (回车保持 $current_host): " new_host
-[ -z "$new_host" ] && new_host=$current_host
-
-read -p "新WS Path (回车保持 $current_path): " new_path
-[ -z "$new_path" ] && new_path=$current_path
-[[ "$new_path" != /* ]] && new_path="/$new_path"
-
-ws_host="$new_host"
-ws_path="$new_path"
-
-
-write_config "$port" "$uuid"
-
-systemctl restart xray
-
-success "配置修改完成"
-
-view_subscription_info
-}
-
-update_xray(){
-    execute_official_script install
-    restart_xray
-}
-
-uninstall_xray(){
-    execute_official_script remove --purge
-    success "已卸载"
-}
-
-view_xray_log(){
-    journalctl -u xray -f
-}
-
-view_subscription_info(){
-
-    local ip=$(get_public_ip)
+view_subscription_info() {
+    if [ ! -f "$xray_config_path" ]; then error "错误: 配置文件不存在, 请先安装。" && return; fi
+    
+    local ip
+    if ! ip=$(get_public_ip); then return 1; fi
 
     local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
     local port=$(jq -r '.inbounds[0].port' "$xray_config_path")
-    local path=$(jq -r '.inbounds[0].streamSettings.wsSettings.path' "$xray_config_path")
-    local host=$(jq -r '.inbounds[0].streamSettings.wsSettings.headers.Host // ""' "$xray_config_path")
+    local domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$xray_config_path")
+    local public_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.publicKey' "$xray_config_path")
+    local shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$xray_config_path")
+    if [[ -z "$public_key" ]]; then error "配置文件中缺少公钥信息,可能是旧版配置,请重新安装以修复。" && return; fi
 
-vmess_json=$(cat <<EOF
-{
-"v":"2",
-"ps":"$(hostname)",
-"add":"$ip",
-"port":"$port",
-"id":"$uuid",
-"aid":"0",
-"scy":"auto",
-"net":"ws",
-"type":"none",
-"host":"$host",
-"path":"$path",
-"tls":""
-}
-EOF
-)
+    local display_ip=$ip && [[ $ip =~ ":" ]] && display_ip="[$ip]"
+    local link_name="$(hostname) X-reality"
+    local link_name_encoded=$(echo "$link_name" | sed 's/ /%20/g')
+    local vless_url="vless://${uuid}@${display_ip}:${port}?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=${domain}&fp=chrome&pbk=${public_key}&sid=${shortid}#${link_name_encoded}"
 
-vmess_link="vmess://$(echo -n "$vmess_json" | base64 -w0)"
-
-echo "---------------------------------------"
-echo -e "${green}VMESS+WS 节点${none}"
-echo "地址: $ip"
-echo "端口: $port"
-echo "UUID: $uuid"
-echo "Host: $host"
-echo "Path: $path"
-echo
-echo "$vmess_link"
-echo "---------------------------------------"
-
-echo "$vmess_link" > ~/xray_vmess_link.txt
+    if [[ "$is_quiet" = true ]]; then
+        echo "${vless_url}"
+    else
+        echo "${vless_url}" > ~/xray_vless_reality_link.txt
+        echo "----------------------------------------------------------------"
+        echo -e "$green --- Xray VLESS-Reality 订阅信息 --- $none"
+        echo -e "$yellow 名称: $cyan$link_name$none"
+        echo -e "$yellow 地址: $cyan$ip$none"
+        echo -e "$yellow 端口: $cyan$port$none"
+        echo -e "$yellow UUID: $cyan$uuid$none"
+        echo -e "$yellow 流控: $cyan"xtls-rprx-vision"$none"
+        echo -e "$yellow 指纹: $cyan"chrome"$none"
+        echo -e "$yellow SNI: $cyan$domain$none"
+        echo -e "$yellow 公钥: $cyan$public_key$none"
+        echo -e "$yellow ShortId: $cyan$shortid$none"
+        echo "----------------------------------------------------------------"
+        echo -e "$green 订阅链接 (已保存到 ~/xray_vless_reality_link.txt): $none\n"; echo -e "$cyan${vless_url}${none}"
+        echo "----------------------------------------------------------------"
+    fi
 }
 
-press_any_key(){
-read -n1 -s -r -p "按任意键继续..."
+# --- 核心逻辑函数 ---
+write_config() {
+    local port=$1 uuid=$2 domain=$3 private_key=$4 public_key=$5 shortid="20220701"
+    jq -n \
+        --argjson port "$port" \
+        --arg uuid "$uuid" \
+        --arg domain "$domain" \
+        --arg private_key "$private_key" \
+        --arg public_key "$public_key" \
+        --arg shortid "$shortid" \
+    '{
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "listen": "0.0.0.0",
+            "port": $port,
+            "protocol": "vless",
+            "settings": {
+                "clients": [{"id": $uuid, "flow": "xtls-rprx-vision"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "show": false,
+                    "dest": ($domain + ":443"),
+                    "xver": 0,
+                    "serverNames": [$domain],
+                    "privateKey": $private_key,
+                    "publicKey": $public_key,
+                    "shortIds": [$shortid]
+                }
+            },
+            "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls", "quic"]
+            }
+        }],
+        "outbounds": [{
+            "protocol": "freedom",
+            "settings": {
+                "domainStrategy": "UseIPv4v6"
+            }
+        }]
+    }' > "$xray_config_path"
 }
 
-main_menu(){
+run_install() {
+    local port=$1 uuid=$2 domain=$3
+    info "正在下载并安装 Xray 核心..."
+    if ! execute_official_script "install"; then
+        error "Xray 核心安装失败！请检查网络连接。"
+        exit 1
+    fi
 
-while true
-do
-clear
+    info "正在安装/更新 GeoIP 和 GeoSite 数据文件..."
+    if ! execute_official_script "install-geodata"; then
+        error "Geo-data 更新失败！"
+        info "这通常不影响核心功能，您可以稍后通过更新选项(2)来重试。"
+    fi
 
-check_xray_status
+    info "正在生成 Reality 密钥对..."
 
-echo "--------------------------------"
-echo "Xray VMESS+WS 管理脚本"
-echo "--------------------------------"
-echo "$xray_status_info"
-echo "--------------------------------"
-echo "1. 安装"
-echo "2. 更新"
-echo "3. 重启"
-echo "4. 卸载"
-echo "5. 查看日志"
-echo "6. 修改节点配置"
-echo "7. 查看节点"
-echo "0. 退出"
-echo "--------------------------------"
+    local key_pair
+    key_pair=$($xray_binary_path x25519 2>/dev/null)
 
-read -p "请选择: " choice
+    local private_key
+    local public_key
 
-case $choice in
+    private_key=$(echo "$key_pair" | grep -i "PrivateKey" | awk -F': ' '{print $2}')
+    public_key=$(echo "$key_pair" | grep -E "PublicKey|Password" | awk -F': ' '{print $2}')
 
-1) install_xray ;;
-2) update_xray ;;
-3) restart_xray ;;
-4) uninstall_xray ;;
-5) view_xray_log ;;
-6) modify_config ;;
-7) view_subscription_info ;;
-0) exit 0 ;;
-*) error "无效选项" ;;
+    if [[ -z "$private_key" || -z "$public_key" ]]; then
+        echo "$key_pair"
+        error "生成 Reality 密钥对失败！请检查 Xray 核心是否正常。"
+        exit 1
+    fi
 
-esac
+    info "正在写入 Xray 配置文件..."
+    write_config "$port" "$uuid" "$domain" "$private_key" "$public_key"
 
-press_any_key
+    if ! restart_xray; then exit 1; fi
 
-done
+    success "Xray 安装/配置成功！"
+    view_subscription_info
 }
 
-main(){
-
-pre_check
-main_menu
-
+press_any_key_to_continue() {
+    echo ""
+    read -n 1 -s -r -p "按任意键返回主菜单..." || true
 }
 
-main
+main_menu() {
+    while true; do
+        clear
+        echo -e "$cyan Xray VLESS-Reality 一键安装管理脚本$none"
+        echo "---------------------------------------------"
+        check_xray_status
+        echo -e "${xray_status_info}"
+        echo "---------------------------------------------"
+        # 修改：明确菜单项 1
+        printf "  ${green}%-2s${none} %-35s\n" "1." "安装/重装 Xray (VLESS-reality)"
+        printf "  ${cyan}%-2s${none} %-35s\n" "2." "更新 Xray"
+        printf "  ${yellow}%-2s${none} %-35s\n" "3." "重启 Xray"
+        printf "  ${red}%-2s${none} %-35s\n" "4." "卸载 Xray"
+        printf "  ${magenta}%-2s${none} %-35s\n" "5." "查看 Xray 日志"
+        printf "  ${cyan}%-2s${none} %-35s\n" "6." "修改节点配置"
+        printf "  ${green}%-2s${none} %-35s\n" "7." "查看订阅信息"
+        echo "---------------------------------------------"
+        printf "  ${yellow}%-2s${none} %-35s\n" "0." "退出脚本"
+        echo "---------------------------------------------"
+        read -p "请输入选项 [0-7]: " choice
+
+        local needs_pause=true
+        case $choice in
+            1) install_xray ;;
+            2) update_xray ;;
+            3) restart_xray ;;
+            4) uninstall_xray ;;
+            5) view_xray_log; needs_pause=false ;;
+            6) modify_config ;;
+            7) view_subscription_info ;;
+            0) success "感谢使用！"; exit 0 ;;
+            *) error "无效选项，请输入 0-7 之间的数字。" ;;
+        esac
+
+        if [ "$needs_pause" = true ]; then
+            press_any_key_to_continue
+        fi
+    done
+}
+
+# --- 脚本主入口 ---
+main() {
+    pre_check
+    if [[ $# -gt 0 && "$1" == "install" ]]; then
+        shift
+        local port="" uuid="" domain=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --port) port="$2"; shift 2 ;;
+                --uuid) uuid="$2"; shift 2 ;;
+                --sni) domain="$2"; shift 2 ;;
+                --quiet|-q) is_quiet=true; shift ;;
+                *) error "未知参数: $1"; exit 1 ;;
+            esac
+        done
+        [[ -z "$port" ]] && port=443
+        [[ -z "$uuid" ]] && uuid=$(cat /proc/sys/kernel/random/uuid)
+        [[ -z "$domain" ]] && domain="learn.microsoft.com"
+        if ! is_valid_port "$port" || ! is_valid_domain "$domain"; then
+            error "参数无效。请检查端口或SNI域名格式。" && exit 1
+        fi
+        if [[ -n "$uuid" ]] && ! is_valid_uuid "$uuid"; then
+            error "UUID格式无效。请提供标准UUID格式或留空自动生成。" && exit 1
+        fi
+        if is_port_in_use "$port"; then
+            error "端口 $port 已被占用，请选择其他端口。" && exit 1
+        fi
+        run_install "$port" "$uuid" "$domain"
+    else
+        main_menu
+    fi
+}
+
+main "$@"

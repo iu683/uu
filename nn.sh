@@ -5,7 +5,7 @@ set -euo pipefail
 readonly SCRIPT_VERSION="VMESS-WS-1.0"
 readonly xray_config_path="/usr/local/etc/xray/config.json"
 readonly xray_binary_path="/usr/local/bin/xray"
-readonly xray_install_script_url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+readonly xray_install_script_url="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
 
 readonly red='\e[91m'
 readonly green='\e[92m'
@@ -70,9 +70,12 @@ pre_check(){
 }
 
 execute_official_script(){
-    bash <(curl -L "$xray_install_script_url") "$@" &
-    spinner $!
-    wait $!
+
+    bash <(curl -L "$xray_install_script_url") "$@" &>/dev/null &
+    local pid=$!
+
+    spinner $pid
+    wait $pid
 }
 
 check_xray_status(){
@@ -178,7 +181,6 @@ run_install(){
     local uuid=$2
 
     info "安装 Xray..."
-    execute_official_script remove
     execute_official_script install
     
     mkdir -p /usr/local/etc/xray

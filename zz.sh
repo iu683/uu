@@ -1,228 +1,376 @@
 #!/bin/bash
 
-TARGET="/etc/profile.d/server-motd.sh"
+set -euo pipefail
 
-GREEN="\033[1;32m"
-RED="\033[1;31m"
-CYAN="\033[1;36m"
-YELLOW="\033[1;33m"
-RESET="\033[0m"
+readonly SCRIPT_VERSION="VMESS-WS-1.0"
+readonly xray_config_path="/usr/local/etc/xray/config.json"
+readonly xray_binary_path="/usr/local/bin/xray"
+readonly xray_install_script_url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 
-install_motd(){
+readonly red='\e[91m'
+readonly green='\e[92m'
+readonly yellow='\e[93m'
+readonly cyan='\e[96m'
+readonly none='\e[0m'
 
-cat << 'EOF' > $TARGET
-#!/bin/bash
+xray_status_info=""
+is_quiet=false
+ws_path="/"
+ws_host=""
 
-[ -n "$SUDO_USER" ] && exit
+error(){ echo -e "\n$red[✖] $1$none\n"; }
+info(){ echo -e "\n$yellow[!] $1$none\n"; }
+success(){ echo -e "\n$green[✔] $1$none\n"; }
 
-# 颜色
-G='\033[1;32m'
-B='\033[1;34m'
-C='\033[1;36m'
-Y='\033[1;33m'
-O='\033[38;5;208m'
-R='\033[1;31m'
-X='\033[0m'
-
-# 终端宽度
-term_width=$(tput cols 2>/dev/null || echo 80)
-label_w=10  # 左侧标签宽度
-
-sep(){
-    printf "%${term_width}s\n" | tr " " "-"
-}
-
-# 系统信息
-USER=$(whoami)
-HOST=$(hostname)
-OS=$(grep PRETTY_NAME /etc/os-release | cut -d '"' -f2)
-DATE=$(date "+%Y年%m月%d日 %H:%M:%S")
-UPTIME=$(uptime -p | sed 's/up //' \
-| sed 's/weeks/周/g' \
-| sed 's/week/周/g' \
-| sed 's/days/天/g' \
-| sed 's/day/天/g' \
-| sed 's/hours/小时/g' \
-| sed 's/hour/小时/g' \
-| sed 's/minutes/分钟/g' \
-| sed 's/minute/分钟/g')
-LOAD=$(uptime | awk -F'load average:' '{print $2}' | sed 's/^ *//')
-CPU=$(top -bn1 | awk '/Cpu/ {print 100 - $8 "%"}')
-MEM=$(free -h | awk '/Mem:/ {print $3 "/" $2}')
-SWAP=$(free -h | awk '/Swap:/ {print $3 "/" $2}')
-DISK=$(df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}')
-DISK_P=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
-
-# 顶部标题
-echo
-echo -e "${G}╔════════════════════════════════════════════╗${X}"
-echo -e "${G}           🚀 Server Dashboard                ${X}"
-echo -e "${G}╚════════════════════════════════════════════╝${X}"
-
-sep
-
-# 系统信息
-printf "${O}%s %-*s:${Y} %s${X}\n" "👤" $label_w "用户" "$USER"
-printf "${O}%s %-*s:${Y} %s${X}\n" "💻" $label_w "主机" "$HOST"
-printf "${O}%s %-*s:${Y} %s${X}\n" "🖥️" $label_w "系统" "$OS"
-
-sep
-
-# 时间与负载
-printf "${O}%s %-*s:${Y} %s${X}\n" "⏰" $label_w "时间" "$DATE"
-printf "${O}%s %-*s:${Y} %s${X}\n" "🆙" $label_w "运行时间" "$UPTIME"
-printf "${O}%s %-*s:${Y} %s${X}\n" "📊" $label_w "系统负载" "$LOAD"
-
-sep
-
-# 资源使用
-printf "${O}%s %-*s:${Y} %s${X}\n" "🔥" $label_w "CPU使用" "$CPU"
-printf "${O}%s %-*s:${Y} %s${X}\n" "💾" $label_w "内存使用" "$MEM"
-printf "${O}%s %-*s:${Y} %s${X}\n" "🧠" $label_w "Swap使用" "$SWAP"
-printf "${O}%s %-*s:${Y} %s${X}\n" "🗂️" $label_w "磁盘使用" "$DISK"
-
-sep
-
-# Docker 信息
-if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-    D_CONT=$(docker ps -aq | wc -l)
-    D_IMG=$(docker images -q | wc -l)
-    D_SIZE=$(docker system df | awk '/Images/ {print $4}')
-
-    echo -e "${Y}🐳 Docker 状态${X}"
-    printf "${O}%s %-*s:${Y} %s${X}\n" "📦" $label_w "容器数量" "$D_CONT"
-    printf "${O}%s %-*s:${Y} %s${X}\n" "🖼️" $label_w "镜像数量" "$D_IMG"
-    printf "${O}%s %-*s:${Y} %s${X}\n" "📦" $label_w "Docker占用" "$D_SIZE"
-
-    RUN=$(docker ps --format "{{.Names}}")
-    STOP=$(docker ps -a --filter status=exited --format "{{.Names}}")
-
-    if [ -n "$RUN" ]; then
-        echo
-        echo "运行容器"
-        for i in $RUN; do
-            echo -e " ${G}✔ $i${X}"
+spinner(){
+    local pid=$1
+    local spin='|/-\'
+    while kill -0 $pid 2>/dev/null; do
+        for i in ${spin}; do
+            printf "\r[%c] " "$i"
+            sleep .1
         done
-    fi
-
-    if [ -n "$STOP" ]; then
-        echo
-        echo "停止容器"
-        for i in $STOP; do
-            echo -e " ${R}✘ $i${X}"
-        done
-    fi
-
-    echo
-    docker stats --no-stream --format "  {{.Name}} CPU:{{.CPUPerc}} MEM:{{.MemUsage}}"
-else
-    echo -e "${R}Docker 未安装${X}"
-fi
-
-sep
-
-# 最近登录记录
-echo -e "${O}🛡 最近登录记录${X}"
-LAST_BIN=$(command -v last 2>/dev/null)
-if [ -n "$LAST_BIN" ]; then
-    printf "%-17s %s\n" "IP" "时间"
-    $LAST_BIN -i -n 3 | grep '^root' | grep -v reboot | while read line; do
-        IP=$(echo "$line" | awk '{print $3}')
-        MONTH=$(echo "$line" | awk '{print $5}')
-        DAY=$(echo "$line" | awk '{print $6}')
-        TIME=$(echo "$line" | awk '{print $7}')
-        case $MONTH in
-            Jan) MONTH="01月" ;;
-            Feb) MONTH="02月" ;;
-            Mar) MONTH="03月" ;;
-            Apr) MONTH="04月" ;;
-            May) MONTH="05月" ;;
-            Jun) MONTH="06月" ;;
-            Jul) MONTH="07月" ;;
-            Aug) MONTH="08月" ;;
-            Sep) MONTH="09月" ;;
-            Oct) MONTH="10月" ;;
-            Nov) MONTH="11月" ;;
-            Dec) MONTH="12月" ;;
-        esac
-        LOGIN_TIME="${MONTH}${DAY}日 ${TIME}"
-        printf "${Y}%-17s %s${X}\n" "$IP" "$LOGIN_TIME"
     done
-else
-    echo -e "${Y}系统未记录登录日志${X}"
+}
+
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
+}
+
+is_valid_port(){
+    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+is_port_in_use(){
+    ss -tuln | grep -q ":$1 "
+}
+
+is_valid_uuid(){
+    [[ "$1" =~ ^[0-9a-fA-F-]{36}$ ]]
+}
+
+pre_check(){
+    [[ $(id -u) != 0 ]] && error "请使用root运行" && exit 1
+
+    if ! command -v jq &>/dev/null || ! command -v curl &>/dev/null; then
+        apt update -y
+        apt install -y jq curl
+    fi
+}
+
+execute_official_script(){
+    bash <(curl -L "$xray_install_script_url") "$@" &
+    spinner $!
+    wait $!
+}
+
+check_xray_status(){
+    if [[ ! -f "$xray_binary_path" ]]; then
+        xray_status_info="Xray: 未安装"
+        return
+    fi
+
+    local v=$($xray_binary_path version | head -n1 | awk '{print $2}')
+    if systemctl is-active --quiet xray; then
+        xray_status_info="Xray: 运行中 | $v"
+    else
+        xray_status_info="Xray: 未运行 | $v"
+    fi
+}
+
+install_xray(){
+
+    local port uuid
+
+    while true; do
+        read -p "端口 (默认8080): " port
+        [ -z "$port" ] && port=8080
+
+        is_valid_port "$port" || { error "端口无效"; continue; }
+        is_port_in_use "$port" && { error "端口占用"; continue; }
+
+        break
+    done
+
+    while true; do
+        read -p "UUID (留空自动生成): " uuid
+        [ -z "$uuid" ] && uuid=$(cat /proc/sys/kernel/random/uuid)
+
+        is_valid_uuid "$uuid" && break || error "UUID格式错误"
+    done
+
+
+    read -p "WS Host (可选): " ws_host
+
+    read -p "WS Path (默认 /): " ws_path
+    [ -z "$ws_path" ] && ws_path="/"
+    [[ "$ws_path" != /* ]] && ws_path="/$ws_path"
+
+
+    run_install "$port" "$uuid"
+}
+
+write_config(){
+
+    local port=$1
+    local uuid=$2
+
+jq -n \
+--argjson port "$port" \
+--arg uuid "$uuid" \
+--arg ws_path "$ws_path" \
+--arg ws_host "$ws_host" \
+'{
+"log":{"loglevel":"warning"},
+"inbounds":[
+{
+"listen":"0.0.0.0",
+"port":$port,
+"protocol":"vmess",
+"settings":{
+"clients":[
+{
+"id":$uuid,
+"alterId":0
+}
+]
+},
+"streamSettings":{
+"network":"ws",
+"wsSettings":{
+"path":$ws_path,
+"headers":{
+"Host":$ws_host
+}
+}
+},
+"sniffing":{
+"enabled":true,
+"destOverride":["http","tls"]
+}
+}
+],
+"outbounds":[
+{
+"protocol":"freedom",
+"settings":{
+"domainStrategy":"UseIPv4v6"
+}
+}
+]
+}' > "$xray_config_path"
+}
+
+run_install(){
+
+    local port=$1
+    local uuid=$2
+
+    info "安装 Xray..."
+    execute_official_script install
+    
+    mkdir -p /usr/local/etc/xray
+
+    write_config "$port" "$uuid"
+
+    systemctl enable xray
+    systemctl restart xray
+
+    success "安装完成"
+
+    view_subscription_info
+}
+
+restart_xray(){
+    systemctl restart xray
+    success "Xray 已重启"
+}
+
+modify_config(){
+
+if [ ! -f "$xray_config_path" ]; then
+error "Xray 未安装"
+return
 fi
 
-# 磁盘告警
-if [ "$DISK_P" -ge 70 ]; then
-    echo
-    echo -e "${R}⚠ 磁盘使用率 ${DISK_P}% 请清理${X}"
-fi
+info "读取当前配置..."
+
+current_port=$(jq -r '.inbounds[0].port' "$xray_config_path")
+current_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
+current_path=$(jq -r '.inbounds[0].streamSettings.wsSettings.path' "$xray_config_path")
+current_host=$(jq -r '.inbounds[0].streamSettings.wsSettings.headers.Host // ""' "$xray_config_path")
 
 echo
-EOF
-
-chmod +x $TARGET
-
-echo -e "${GREEN}MOTD 安装完成${RESET}"
-
-}
-
-remove_motd(){
-
-rm -f $TARGET
-echo -e "${RED}MOTD 已卸载${RESET}"
-
-}
-
-restore_default(){
-
-rm -f $TARGET
-
-true > /etc/motd
-
-if [ -d /etc/update-motd.d ]; then
-chmod +x /etc/update-motd.d/*
-fi
-
-echo -e "${CYAN}系统 MOTD 已恢复默认${RESET}"
-
-}
-
-preview(){
-
-bash $TARGET
-
-}
-
-menu(){
+echo "当前端口: $current_port"
+echo "当前UUID: $current_uuid"
+echo "当前Path: $current_path"
+echo "当前Host: $current_host"
+echo
 
 while true
 do
+read -p "新端口 (回车保持 $current_port): " port
+[ -z "$port" ] && port=$current_port
 
+is_valid_port "$port" || { error "端口无效"; continue; }
+
+if [[ "$port" != "$current_port" ]] && is_port_in_use "$port"; then
+error "端口已被占用"
+continue
+fi
+
+break
+done
+
+while true
+do
+read -p "新UUID (回车保持): " uuid
+[ -z "$uuid" ] && uuid=$current_uuid
+
+is_valid_uuid "$uuid" && break || error "UUID格式错误"
+done
+
+read -p "新WS Host (回车保持 $current_host): " new_host
+[ -z "$new_host" ] && new_host=$current_host
+
+read -p "新WS Path (回车保持 $current_path): " new_path
+[ -z "$new_path" ] && new_path=$current_path
+[[ "$new_path" != /* ]] && new_path="/$new_path"
+
+ws_host="$new_host"
+ws_path="$new_path"
+
+
+write_config "$port" "$uuid"
+
+systemctl restart xray
+
+success "配置修改完成"
+
+view_subscription_info
+}
+
+update_xray(){
+    execute_official_script install
+    restart_xray
+}
+
+uninstall_xray(){
+    execute_official_script remove --purge
+    success "已卸载"
+}
+
+view_xray_log(){
+    journalctl -u xray -f
+}
+
+view_subscription_info(){
+
+    local ip=$(get_public_ip)
+
+    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
+    local port=$(jq -r '.inbounds[0].port' "$xray_config_path")
+    local path=$(jq -r '.inbounds[0].streamSettings.wsSettings.path' "$xray_config_path")
+    local host=$(jq -r '.inbounds[0].streamSettings.wsSettings.headers.Host // ""' "$xray_config_path")
+
+vmess_json=$(cat <<EOF
+{
+"v":"2",
+"ps":"$(hostname)",
+"add":"$ip",
+"port":"$port",
+"id":"$uuid",
+"aid":"0",
+"scy":"auto",
+"net":"ws",
+"type":"none",
+"host":"$host",
+"path":"$path",
+"tls":""
+}
+EOF
+)
+
+vmess_link="vmess://$(echo -n "$vmess_json" | base64 -w0)"
+
+echo "---------------------------------------"
+echo -e "${green}VMESS+WS 节点${none}"
+echo "地址: $ip"
+echo "端口: $port"
+echo "UUID: $uuid"
+echo "Host: $host"
+echo "Path: $path"
+echo
+echo "$vmess_link"
+echo "---------------------------------------"
+
+echo "$vmess_link" > ~/xray_vmess_link.txt
+}
+
+press_any_key(){
+read -n1 -s -r -p "按任意键继续..."
+}
+
+main_menu(){
+
+while true
+do
 clear
 
-echo -e "${GREEN}====MOTD管理菜单====${RESET}"
-echo -e "${GREEN}1. 安装MOTD${RESET}"
-echo -e "${GREEN}2. 卸载MOTD${RESET}"
-echo -e "${GREEN}3. 恢复系统默认${RESET}"
-echo -e "${GREEN}4. 预览MOTD${RESET}"
-echo -e "${GREEN}0. 退出${RESET}"
-read -r -p $'\033[32m请选择: \033[0m' CH
+check_xray_status
 
-case $CH in
+echo "--------------------------------"
+echo "Xray VMESS+WS 管理脚本"
+echo "--------------------------------"
+echo "$xray_status_info"
+echo "--------------------------------"
+echo "1. 安装"
+echo "2. 更新"
+echo "3. 重启"
+echo "4. 卸载"
+echo "5. 查看日志"
+echo "6. 修改节点配置"
+echo "7. 查看节点"
+echo "0. 退出"
+echo "--------------------------------"
 
-1) install_motd ;;
-2) remove_motd ;;
-3) restore_default ;;
-4) preview ;;
-0) exit ;;
+read -p "请选择: " choice
+
+case $choice in
+
+1) install_xray ;;
+2) update_xray ;;
+3) restart_xray ;;
+4) uninstall_xray ;;
+5) view_xray_log ;;
+6) modify_config ;;
+7) view_subscription_info ;;
+0) exit 0 ;;
+*) error "无效选项" ;;
 
 esac
 
-read -p "按回车返回菜单..."
+press_any_key
 
 done
+}
+
+main(){
+
+pre_check
+main_menu
 
 }
 
-menu
+main

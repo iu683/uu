@@ -1,78 +1,93 @@
 #!/bin/bash
 
-set -o pipefail
+set -euo pipefail
 
-SCRIPT_VERSION="SINGBOX-VLESS-HTTPUPGRADE-2.0"
-CONFIG="/etc/sing-box/config.json"
+SCRIPT_VERSION="SINGBOX-VLESS-HTTPUPGRADE-1.0"
 
-red='\033[31m'
-green='\033[32m'
-yellow='\033[33m'
-cyan='\033[36m'
-none='\033[0m'
+config_path="/etc/sing-box/config.json"
+binary_path="/usr/local/bin/sing-box"
 
-ws_path=""
-ws_host=""
+red='\e[91m'
+green='\e[92m'
+yellow='\e[93m'
+cyan='\e[96m'
+none='\e[0m'
+
 status_info=""
+ws_path="/"
+ws_host=""
 
-error(){ echo -e "\n${red}[错误] $1${none}\n"; }
-info(){ echo -e "\n${yellow}[提示] $1${none}\n"; }
-success(){ echo -e "\n${green}[完成] $1${none}\n"; }
+error(){ echo -e "\n$red[✖] $1$none\n"; }
+info(){ echo -e "\n$yellow[!] $1$none\n"; }
+success(){ echo -e "\n$green[✔] $1$none\n"; }
 
-generate_path(){
-ws_path="/$(tr -dc a-z0-9 </dev/urandom | head -c 8)"
+get_public_ip(){
+
+for url in api.ipify.org ip.sb checkip.amazonaws.com
+do
+ip=$(curl -s --max-time 5 $url)
+[ -n "$ip" ] && echo "$ip" && return
+done
+
 }
 
-get_ip(){
+is_valid_port(){
+[[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
 
-ip=$(curl -s https://api.ipify.org)
+is_port_in_use(){
+ss -tuln | grep -q ":$1 "
+}
 
-if [ -z "$ip" ]; then
-ip=$(curl -s https://ip.sb)
-fi
-
-echo "$ip"
-
+is_valid_uuid(){
+[[ "$1" =~ ^[0-9a-fA-F-]{36}$ ]]
 }
 
 pre_check(){
 
-if [ "$(id -u)" != "0" ]; then
-error "请使用 root 运行"
-exit 1
-fi
+[[ $(id -u) != 0 ]] && error "请用root运行" && exit 1
 
+deps=(jq curl wget uuidgen)
+
+for cmd in "${deps[@]}"
+do
+if ! command -v $cmd >/dev/null 2>&1
+then
+info "安装依赖 $cmd"
 apt update -y
-apt install -y jq curl qrencode wget uuid-runtime
+apt install -y jq curl wget uuid-runtime
+break
+fi
+done
 
 mkdir -p /etc/sing-box
 
 }
 
-install_singbox(){
+install_core(){
 
-if command -v sing-box >/dev/null 2>&1; then
+if [ -f "$binary_path" ]; then
 return
 fi
 
-info "正在安装 sing-box..."
+info "安装 sing-box..."
 
 cd /tmp
 
-URL1="https://ghproxy.com/https://github.com/SagerNet/sing-box/releases/download/v1.13.0/sing-box-1.13.0-linux-amd64.tar.gz"
-URL2="https://github.com/SagerNet/sing-box/releases/download/v1.13.0/sing-box-1.13.0-linux-amd64.tar.gz"
+wget -O singbox.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.14.0-alpha.7/sing-box-1.14.0-alpha.7-linux-amd64.tar.gz \
+|| wget -O singbox.tar.gz https://mirror.ghproxy.com/https://github.com/SagerNet/sing-box/releases/download/v1.14.0-alpha.7/sing-box-1.14.0-alpha.7-linux-amd64.tar.gz
 
-wget -O singbox.tar.gz $URL1 || wget -O singbox.tar.gz $URL2
+tar -xzf singbox.tar.gz
 
-tar -zxf singbox.tar.gz
+cp sing-box-1.14.0-alpha.7-linux-amd64/sing-box /usr/local/bin/
 
-install -m 755 sing-box-1.13.0-linux-amd64/sing-box /usr/local/bin/sing-box
+chmod +x /usr/local/bin/sing-box
 
 rm -rf singbox.tar.gz sing-box*
 
-cat >/etc/systemd/system/sing-box.service <<EOF
+cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
-Description=Sing-box
+Description=Sing-box Service
 After=network.target
 
 [Service]
@@ -91,82 +106,111 @@ success "sing-box 安装完成"
 
 }
 
+check_status(){
+
+if [ ! -f "$binary_path" ]; then
+status_info="Sing-box: 未安装"
+return
+fi
+
+if systemctl is-active --quiet sing-box
+then
+status_info="Sing-box: 运行中"
+else
+status_info="Sing-box: 未运行"
+fi
+
+}
+
 write_config(){
 
 port=$1
 uuid=$2
 
-cat > $CONFIG <<EOF
+jq -n \
+--argjson port "$port" \
+--arg uuid "$uuid" \
+--arg path "$ws_path" \
+--arg host "$ws_host" \
+'{
+log:{level:"warn"},
+inbounds:[
 {
-"log": { "level": "warn" },
-"inbounds": [
-{
-"type": "vless",
-"listen": "::",
-"listen_port": $port,
-"users": [
-{
-"uuid": "$uuid"
+type:"vless",
+listen:"::",
+listen_port:$port,
+users:[{uuid:$uuid}],
+transport:{
+type:"httpupgrade",
+path:$path,
+host:$host
+}
 }
 ],
-"transport": {
-"type": "httpupgrade",
-"path": "$ws_path",
-"host": "$ws_host"
-}
-}
-],
-"outbounds": [
-{ "type": "direct" }
+outbounds:[
+{type:"direct"}
 ]
-}
-EOF
+}' > "$config_path"
 
 }
 
 install_node(){
 
+while true
+do
 read -p "端口 (默认8080): " port
+[ -z "$port" ] && port=8080
 
-if [ -z "$port" ]; then
-port=8080
-fi
+is_valid_port "$port" || { error "端口无效"; continue; }
 
-uuid=$(uuidgen)
+is_port_in_use "$port" && { error "端口占用"; continue; }
 
-generate_path
+break
+done
 
-read -p "Host (可选): " ws_host
+while true
+do
+read -p "UUID (留空自动生成): " uuid
+[ -z "$uuid" ] && uuid=$(uuidgen)
 
-install_singbox
+is_valid_uuid "$uuid" && break || error "UUID格式错误"
+done
+
+read -p "HTTP Host (可选): " ws_host
+
+read -p "Path (默认 /): " ws_path
+[ -z "$ws_path" ] && ws_path="/"
+[[ "$ws_path" != /* ]] && ws_path="/$ws_path"
+
+install_core
 
 write_config "$port" "$uuid"
 
 systemctl restart sing-box
 
-success "节点部署完成"
+success "安装完成"
 
 view_node
 
 }
 
-restart_service(){
+restart_core(){
 
 systemctl restart sing-box
-
-success "服务已重启"
-
-}
-
-view_log(){
-
-journalctl -u sing-box -f
+success "已重启"
 
 }
 
-uninstall_node(){
+update_core(){
 
-systemctl stop sing-box 2>/dev/null
+install_core
+restart_core
+
+}
+
+uninstall_core(){
+
+systemctl stop sing-box
 
 rm -f /usr/local/bin/sing-box
 rm -rf /etc/sing-box
@@ -178,23 +222,61 @@ success "已卸载"
 
 }
 
+view_log(){
+
+journalctl -u sing-box -f
+
+}
+
+modify_config(){
+
+[ ! -f "$config_path" ] && error "配置不存在" && return
+
+port=$(jq -r '.inbounds[0].listen_port' $config_path)
+uuid=$(jq -r '.inbounds[0].users[0].uuid' $config_path)
+path=$(jq -r '.inbounds[0].transport.path' $config_path)
+host=$(jq -r '.inbounds[0].transport.host // ""' $config_path)
+
+echo "当前配置:"
+echo "端口: $port"
+echo "UUID: $uuid"
+echo "Host: $host"
+echo "Path: $path"
+echo
+
+read -p "新端口 (回车不改): " new_port
+read -p "新UUID (回车不改): " new_uuid
+read -p "新Host (回车不改): " new_host
+read -p "新Path (回车不改): " new_path
+
+[ -n "$new_port" ] && port=$new_port
+[ -n "$new_uuid" ] && uuid=$new_uuid
+[ -n "$new_host" ] && host=$new_host
+[ -n "$new_path" ] && path=$new_path
+
+[[ "$path" != /* ]] && path="/$path"
+
+write_config "$port" "$uuid"
+
+systemctl restart sing-box
+
+success "配置已更新"
+
+view_node
+
+}
+
 view_node(){
 
-if [ ! -f "$CONFIG" ]; then
-error "节点未安装"
-return
-fi
+ip=$(get_public_ip)
 
-ip=$(get_ip)
-
-uuid=$(jq -r '.inbounds[0].users[0].uuid' $CONFIG)
-port=$(jq -r '.inbounds[0].listen_port' $CONFIG)
-path=$(jq -r '.inbounds[0].transport.path' $CONFIG)
-host=$(jq -r '.inbounds[0].transport.host // ""' $CONFIG)
+uuid=$(jq -r '.inbounds[0].users[0].uuid' $config_path)
+port=$(jq -r '.inbounds[0].listen_port' $config_path)
+path=$(jq -r '.inbounds[0].transport.path' $config_path)
+host=$(jq -r '.inbounds[0].transport.host // ""' $config_path)
 
 link="vless://$uuid@$ip:$port?type=httpupgrade&path=$path&host=$host&encryption=none#$(hostname)"
 
-echo
 echo "--------------------------------"
 echo -e "${green}VLESS HTTPUpgrade 节点${none}"
 echo "地址: $ip"
@@ -206,26 +288,10 @@ echo
 echo "$link"
 echo "--------------------------------"
 
-echo
-echo "二维码:"
-qrencode -t ANSIUTF8 "$link"
-echo
-
 }
 
-press_key(){
+press_any_key(){
 read -n1 -s -r -p "按任意键继续..."
-}
-
-check_status(){
-
-if systemctl is-active --quiet sing-box
-then
-status_info="sing-box: 运行中"
-else
-status_info="sing-box: 未运行"
-fi
-
 }
 
 menu(){
@@ -243,34 +309,43 @@ echo "--------------------------------"
 echo "$status_info"
 echo "--------------------------------"
 echo "1. 安装节点"
-echo "2. 重启服务"
-echo "3. 查看节点"
-echo "4. 查看日志"
-echo "5. 卸载"
+echo "2. 更新"
+echo "3. 重启"
+echo "4. 卸载"
+echo "5. 查看日志"
+echo "6. 查看节点"
+echo "7. 修改配置"
 echo "0. 退出"
 echo "--------------------------------"
 
 read -p "请选择: " choice
 
 case $choice in
+
 1) install_node ;;
-2) restart_service ;;
-3) view_node ;;
-4) view_log ;;
-5) uninstall_node ;;
+2) update_core ;;
+3) restart_core ;;
+4) uninstall_core ;;
+5) view_log ;;
+6) view_node ;;
+7) modify_config ;;
 0) exit ;;
+
 *) error "无效选项" ;;
+
 esac
 
-press_key
+press_any_key
 
 done
 
 }
 
 main(){
+
 pre_check
 menu
+
 }
 
 main

@@ -47,8 +47,18 @@ pre_check(){
 
 [[ $(id -u) != 0 ]] && error "请用root运行" && exit 1
 
+deps=(jq curl wget uuidgen)
+
+for cmd in "${deps[@]}"
+do
+if ! command -v $cmd >/dev/null 2>&1
+then
+info "安装依赖 $cmd"
 apt update -y
 apt install -y jq curl wget uuid-runtime
+break
+fi
+done
 
 mkdir -p /etc/sing-box
 
@@ -64,15 +74,16 @@ info "安装 sing-box..."
 
 cd /tmp
 
-wget -q https://ghproxy.com/https://github.com/SagerNet/sing-box/releases/download/v1.13.0/sing-box-1.13.0-linux-amd64.tar.gz
+wget -O singbox.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.14.0-alpha.7/sing-box-1.14.0-alpha.7-linux-amd64.tar.gz \
+|| wget -O singbox.tar.gz https://mirror.ghproxy.com/https://github.com/SagerNet/sing-box/releases/download/v1.14.0-alpha.7/sing-box-1.14.0-alpha.7-linux-amd64.tar.gz
 
-tar -xzf sing-box-1.13.0-linux-amd64.tar.gz
+tar -xzf singbox.tar.gz
 
-cp sing-box-1.13.0-linux-amd64/sing-box /usr/local/bin/
+cp sing-box-1.14.0-alpha.7-linux-amd64/sing-box /usr/local/bin/
 
 chmod +x /usr/local/bin/sing-box
 
-rm -rf sing-box*
+rm -rf singbox.tar.gz sing-box*
 
 cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
@@ -217,6 +228,48 @@ journalctl -u sing-box -f
 
 }
 
+modify_config(){
+
+[ ! -f "$config_path" ] && error "配置不存在" && return
+
+port=$(jq -r '.inbounds[0].listen_port' $config_path)
+uuid=$(jq -r '.inbounds[0].users[0].uuid' $config_path)
+path=$(jq -r '.inbounds[0].transport.path' $config_path)
+host=$(jq -r '.inbounds[0].transport.host // ""' $config_path)
+
+echo "当前配置:"
+echo "端口: $port"
+echo "UUID: $uuid"
+echo "Host: $host"
+echo "Path: $path"
+echo
+
+read -p "新端口 (回车不改): " new_port
+read -p "新UUID (回车不改): " new_uuid
+read -p "新Host (回车不改): " new_host
+read -p "新Path (回车不改): " new_path
+
+[ -n "$new_port" ] && port=$new_port
+[ -n "$new_uuid" ] && uuid=$new_uuid
+[ -n "$new_host" ] && host=$new_host
+[ -n "$new_path" ] && path=$new_path
+
+[[ "$path" != /* ]] && path="/$path"
+
+# 关键修复
+ws_host="$host"
+ws_path="$path"
+
+write_config "$port" "$uuid"
+
+systemctl restart sing-box
+
+success "配置已更新"
+
+view_node
+
+}
+
 view_node(){
 
 ip=$(get_public_ip)
@@ -265,6 +318,7 @@ echo "3. 重启"
 echo "4. 卸载"
 echo "5. 查看日志"
 echo "6. 查看节点"
+echo "7. 修改配置"
 echo "0. 退出"
 echo "--------------------------------"
 
@@ -278,6 +332,7 @@ case $choice in
 4) uninstall_core ;;
 5) view_log ;;
 6) view_node ;;
+7) modify_config ;;
 0) exit ;;
 
 *) error "无效选项" ;;

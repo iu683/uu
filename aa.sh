@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Meridian 一键管理脚本
+# LinkIt 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="meridian"
+APP_NAME="linkit"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -24,10 +24,17 @@ check_docker() {
     fi
 }
 
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
+
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Meridian 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== LinkIt 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -51,7 +58,6 @@ menu() {
 }
 
 install_app() {
-
     check_docker
     mkdir -p "$APP_DIR"
 
@@ -61,40 +67,33 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    # 主端口
-    read -p "请输入主访问端口 [默认:9090]: " input_port
-    PORT=${input_port:-9090}
+    # 端口
+    read -p "请输入访问端口 [默认:3301]: " input_port
+    PORT=${input_port:-3301}
+    check_port "$PORT" || return
 
-    # 辅助端口范围
-    read -p "请输入辅助端口范围 [默认:8001-8010]: " input_range
-    PORT_RANGE=${input_range:-8001-8010}
+    # 数据目录
+    read -p "请输入数据目录 [默认:$APP_DIR/data]: " input_data
+    DATA_DIR=${input_data:-$APP_DIR/data}
+    mkdir -p "$DATA_DIR"
 
-    # 数据卷
-    read -p "请输入数据卷名称 [默认:meridian-data]: " input_volume
-    VOLUME_NAME=${input_volume:-meridian-data}
-
-    # JWT 密钥
-    read -p "请输入 JWT 密钥 (留空自动生成): " input_jwt
-    JWT_SECRET=${input_jwt:-$(openssl rand -hex 32)}
+    # 管理员密码
+    read -p "请输入管理员密码 [默认:123123]: " input_pass
+    ADMIN_PASSWORD=${input_pass:-123123}
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  meridian:
-    container_name: meridian
-    image: ghcr.io/snnabb/meridian:latest
+  linkit:
+    image: yangzxi/linkit
+    container_name: linkit
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT}:9090"
-      - "${PORT_RANGE}:${PORT_RANGE}"
+      - "127.0.0.1:${PORT}:3301"
     volumes:
-      - ${VOLUME_NAME}:/app/data
+      - ${DATA_DIR}:/app/data
     environment:
-      - JWT_SECRET=${JWT_SECRET}
-
-volumes:
-  ${VOLUME_NAME}:
-    external: true
-    name: ${VOLUME_NAME}
+      TZ: Asia/Shanghai
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
 EOF
 
     cd "$APP_DIR" || exit
@@ -106,10 +105,11 @@ EOF
     fi
 
     echo
-    echo -e "${GREEN}✅ Meridian 已启动${RESET}"
+    echo -e "${GREEN}✅ LinkIt 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 数据卷: ${VOLUME_NAME}${RESET}"
-    echo -e "${GREEN}🔑 JWT_SECRET: ${JWT_SECRET}${RESET}"
+    echo -e "${GREEN}📂 数据目录: ${DATA_DIR}${RESET}"
+    echo -e "${GREEN}🔑 管理员账号: admin${RESET}"
+    echo -e "${GREEN}🔑 管理员密码: ${ADMIN_PASSWORD}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -118,30 +118,30 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Meridian 更新完成${RESET}"
+    echo -e "${GREEN}✅ LinkIt 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart meridian
-    echo -e "${GREEN}✅ Meridian 已重启${RESET}"
+    docker restart linkit
+    echo -e "${GREEN}✅ LinkIt 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f meridian
+    docker logs -f linkit
 }
 
 check_status() {
-    docker ps | grep meridian
+    docker ps | grep linkit
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
     cd "$APP_DIR" || return
-    docker compose down
+    docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Meridian 已卸载${RESET}"
+    echo -e "${RED}✅ LinkIt 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

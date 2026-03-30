@@ -1,155 +1,192 @@
 #!/bin/bash
-# ========================================
-# CodeG 一键管理脚本
-# ========================================
+
+APP_NAME="edict"
+APP_DIR="/opt/$APP_NAME"
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
+BLUE="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="codeg"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+loop_service="edict-loop"
+dashboard_service="edict-dashboard"
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
+pause(){
+read -p "按回车继续..."
 }
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
+install_edict(){
 
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== CodeG 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+echo -e "${YELLOW}安装依赖...${RESET}"
 
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
+apt update
+apt install -y git python3 python3-pip
 
-install_app() {
-    check_docker
-    mkdir -p "$APP_DIR"
+if [ ! -d "$APP_DIR" ]; then
+git clone https://github.com/cft0808/edict.git $APP_DIR
+fi
 
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
+cd $APP_DIR
 
-    # 端口
-    read -p "请输入访问端口 [默认:3080]: " input_port
-    PORT=${input_port:-3080}
-    check_port "$PORT" || return
+chmod +x install.sh
+./install.sh
 
-    # 项目目录
-    read -p "请输入项目目录 [默认:$APP_DIR/projects]: " input_proj
-    PROJECT_DIR=${input_proj:-$APP_DIR/projects}
-    mkdir -p "$PROJECT_DIR"
+if [ -f requirements.txt ]; then
+pip3 install -r requirements.txt
+fi
 
-    # Token
-    read -p "请输入 CODEG_TOKEN (留空自动生成): " input_token
-    CODEG_TOKEN=${input_token:-$(openssl rand -hex 16)}
+echo -e "${YELLOW}创建系统服务...${RESET}"
 
-    # 创建 volume
-    docker volume create codeg-data >/dev/null 2>&1
+cat > /etc/systemd/system/$loop_service.service <<EOF
+[Unit]
+Description=edict loop
+After=network.target
 
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  codeg:
-    container_name: codeg
-    image: ghcr.io/xintaofei/codeg:latest
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${PORT}:3080"
-    volumes:
-      - codeg-data:/data
-      - ${PROJECT_DIR}:/projects
-    environment:
-      CODEG_TOKEN: ${CODEG_TOKEN}
+[Service]
+Type=simple
+WorkingDirectory=$APP_DIR
+ExecStart=/bin/bash $APP_DIR/scripts/run_loop.sh
+Restart=always
 
-volumes:
-  codeg-data:
-    external: true
-    name: codeg-data
+[Install]
+WantedBy=multi-user.target
 EOF
 
-    cd "$APP_DIR" || exit
-    docker compose up -d
+cat > /etc/systemd/system/$dashboard_service.service <<EOF
+[Unit]
+Description=edict dashboard
+After=network.target
 
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
-        return
-    fi
+[Service]
+Type=simple
+WorkingDirectory=$APP_DIR
+ExecStart=/usr/bin/python3 $APP_DIR/dashboard/server.py
+Restart=always
 
-    echo
-    echo -e "${GREEN}✅ CodeG 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 项目目录: ${PROJECT_DIR}${RESET}"
-    echo -e "${GREEN}🔑 CODEG_TOKEN: ${CODEG_TOKEN}${RESET}"
+[Install]
+WantedBy=multi-user.target
+EOF
 
-    read -p "按回车返回菜单..."
+systemctl daemon-reload
+systemctl enable $loop_service
+systemctl enable $dashboard_service
+
+systemctl restart $loop_service
+systemctl restart $dashboard_service
+
+echo -e "${GREEN}安装完成${RESET}"
+echo -e "${GREEN}访问：http://服务器IP:7891${RESET}"
+
+pause
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ CodeG 更新完成${RESET}"
-    read -p "按回车返回菜单..."
+start_edict(){
+
+systemctl start $loop_service
+systemctl start $dashboard_service
+
+echo -e "${GREEN}服务已启动${RESET}"
+pause
 }
 
-restart_app() {
-    docker restart codeg
-    echo -e "${GREEN}✅ CodeG 已重启${RESET}"
-    read -p "按回车返回菜单..."
+stop_edict(){
+
+systemctl stop $loop_service
+systemctl stop $dashboard_service
+
+echo -e "${RED}服务已停止${RESET}"
+pause
 }
 
-view_logs() {
-    docker logs -f codeg
+restart_edict(){
+
+systemctl restart $loop_service
+systemctl restart $dashboard_service
+
+echo -e "${GREEN}服务已重启${RESET}"
+pause
 }
 
-check_status() {
-    docker ps | grep codeg
-    read -p "按回车返回菜单..."
+update_edict(){
+
+cd $APP_DIR
+
+git pull
+
+systemctl restart $loop_service
+systemctl restart $dashboard_service
+
+echo -e "${GREEN}更新完成${RESET}"
+pause
 }
 
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ CodeG 已卸载${RESET}"
-    read -p "按回车返回菜单..."
+logs_edict(){
+
+echo -e "${BLUE}查看 dashboard 日志${RESET}"
+journalctl -u $dashboard_service -f
 }
 
+uninstall_edict(){
+
+systemctl stop $loop_service
+systemctl stop $dashboard_service
+
+systemctl disable $loop_service
+systemctl disable $dashboard_service
+
+rm -f /etc/systemd/system/$loop_service.service
+rm -f /etc/systemd/system/$dashboard_service.service
+
+rm -rf $APP_DIR
+
+systemctl daemon-reload
+
+echo -e "${RED}edict 已卸载${RESET}"
+
+pause
+}
+
+menu(){
+
+clear
+
+echo -e "${GREEN}"
+echo "================================"
+echo "        edict 管理脚本"
+echo "================================"
+echo -e "${RESET}"
+
+echo "1. 安装 edict"
+echo "2. 启动 edict"
+echo "3. 停止 edict"
+echo "4. 重启 edict"
+echo "5. 查看日志"
+echo "6. 更新 edict"
+echo "7. 卸载 edict"
+echo "0. 退出"
+
+echo
+read -p "请输入选项: " num
+
+case "$num" in
+
+1) install_edict ;;
+2) start_edict ;;
+3) stop_edict ;;
+4) restart_edict ;;
+5) logs_edict ;;
+6) update_edict ;;
+7) uninstall_edict ;;
+0) exit 0 ;;
+
+*) echo "无效选项"; sleep 1 ;;
+
+esac
+
+}
+
+while true
+do
 menu
+done

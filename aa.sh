@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# MCSManager 一键管理脚本
+# CodeG 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="mcsmanager"
+APP_NAME="codeg"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -31,31 +31,16 @@ check_port() {
     fi
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
-}
-
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== MCSManager 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== CodeG 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
@@ -74,7 +59,7 @@ menu() {
 
 install_app() {
     check_docker
-    mkdir -p "$APP_DIR/web/data" "$APP_DIR/web/logs" "$APP_DIR/daemon/data" "$APP_DIR/daemon/logs"
+    mkdir -p "$APP_DIR"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -82,51 +67,56 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入 Web 访问端口 [默认:23333]: " input_web_port
-    WEB_PORT=${input_web_port:-23333}
-    check_port "$WEB_PORT" || return
+    # 端口
+    read -p "请输入访问端口 [默认:3080]: " input_port
+    PORT=${input_port:-3080}
+    check_port "$PORT" || return
 
-    read -p "请输入 Daemon 端口 [默认:24444]: " input_daemon_port
-    DAEMON_PORT=${input_daemon_port:-24444}
-    check_port "$DAEMON_PORT" || return
+    # 项目目录
+    read -p "请输入项目目录 [默认:$APP_DIR/projects]: " input_proj
+    PROJECT_DIR=${input_proj:-$APP_DIR/projects}
+    mkdir -p "$PROJECT_DIR"
+
+    # Token
+    read -p "请输入 CODEG_TOKEN (留空自动生成): " input_token
+    CODEG_TOKEN=${input_token:-$(openssl rand -hex 16)}
+
+    # 创建 volume
+    docker volume create codeg-data >/dev/null 2>&1
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  web:
-    image: githubyumao/mcsmanager-web:latest
-    container_name: mcsmanager-web
-    ports:
-      - "${WEB_PORT}:23333"
-    volumes:
-      - /etc/localtime:/etc/localtime:ro
-      - $APP_DIR/web/data:/opt/mcsmanager/web/data
-      - $APP_DIR/web/logs:/opt/mcsmanager/web/logs
-
-  daemon:
-    image: githubyumao/mcsmanager-daemon:latest
-    container_name: mcsmanager-daemon
+  codeg:
+    container_name: codeg
+    image: ghcr.io/xintaofei/codeg:latest
     restart: unless-stopped
     ports:
-      - "${DAEMON_PORT}:24444"
-    environment:
-      - MCSM_DOCKER_WORKSPACE_PATH=$APP_DIR/daemon/data/InstanceData
+      - "127.0.0.1:${PORT}:3080"
     volumes:
-      - /etc/timezone:/etc/timezone:ro
-      - /etc/localtime:/etc/localtime:ro
-      - $APP_DIR/daemon/data:/opt/mcsmanager/daemon/data
-      - $APP_DIR/daemon/logs:/opt/mcsmanager/daemon/logs
-      - /var/run/docker.sock:/var/run/docker.sock
+      - codeg-data:/data
+      - ${PROJECT_DIR}:/projects
+    environment:
+      CODEG_TOKEN: ${CODEG_TOKEN}
+
+volumes:
+  codeg-data:
+    external: true
+    name: codeg-data
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    SERVER_IP=$(get_public_ip)
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
+        return
+    fi
 
     echo
-    echo -e "${GREEN}✅ MCSManager 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Web 访问地址: http://${SERVER_IP}:${WEB_PORT}${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR${RESET}"
+    echo -e "${GREEN}✅ CodeG 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📂 项目目录: ${PROJECT_DIR}${RESET}"
+    echo -e "${GREEN}🔑 CODEG_TOKEN: ${CODEG_TOKEN}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -135,28 +125,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ MCSManager 更新完成${RESET}"
+    echo -e "${GREEN}✅ CodeG 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart mcsmanager-web mcsmanager-daemon
-    echo -e "${GREEN}✅ MCSManager 已重启${RESET}"
+    docker restart codeg
+    echo -e "${GREEN}✅ CodeG 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    echo -e "${YELLOW}选择查看日志: 1) web 2) daemon${RESET}"
-    read -p "请输入: " log_choice
-    case $log_choice in
-        1) docker logs -f mcsmanager-web ;;
-        2) docker logs -f mcsmanager-daemon ;;
-        *) echo -e "${RED}无效选择${RESET}" ;;
-    esac
+    docker logs -f codeg
 }
 
 check_status() {
-    docker ps | grep mcsmanager
+    docker ps | grep codeg
     read -p "按回车返回菜单..."
 }
 
@@ -164,7 +148,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ MCSManager 已彻底卸载${RESET}"
+    echo -e "${RED}✅ CodeG 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

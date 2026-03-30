@@ -1,190 +1,188 @@
 #!/bin/bash
-# ========================================
-# MCSManager 一键管理脚本
-# ========================================
+
+APP_NAME="edict"
+APP_DIR="/opt/$APP_NAME"
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
+BLUE="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="mcsmanager"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+loop_service="edict-loop"
+dashboard_service="edict-dashboard"
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
+pause(){
+read -p "按回车继续..."
 }
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
+install_edict(){
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
-}
+echo -e "${YELLOW}安装依赖...${RESET}"
 
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== MCSManager 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 查看密钥${RESET}"
-        echo -e "${GREEN}7) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+apt update
+apt install -y git python3 python3-pip
 
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) view_key ;;
-            7) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
+if [ ! -d "$APP_DIR" ]; then
+git clone https://github.com/cft0808/edict.git $APP_DIR
+fi
 
-install_app() {
-    check_docker
-    mkdir -p "$APP_DIR/web/data" "$APP_DIR/web/logs" "$APP_DIR/daemon/data" "$APP_DIR/daemon/logs"
+cd $APP_DIR
 
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
+chmod +x install.sh
+./install.sh
 
-    read -p "请输入 Web 访问端口 [默认:23333]: " input_web_port
-    WEB_PORT=${input_web_port:-23333}
-    check_port "$WEB_PORT" || return
+if [ -f requirements.txt ]; then
+pip3 install -r requirements.txt
+fi
 
-    read -p "请输入 Daemon 端口 [默认:24444]: " input_daemon_port
-    DAEMON_PORT=${input_daemon_port:-24444}
-    check_port "$DAEMON_PORT" || return
+echo -e "${YELLOW}创建系统服务...${RESET}"
 
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  web:
-    image: githubyumao/mcsmanager-web:latest
-    container_name: mcsmanager-web
-    ports:
-      - "${WEB_PORT}:23333"
-    volumes:
-      - /etc/localtime:/etc/localtime:ro
-      - $APP_DIR/web/data:/opt/mcsmanager/web/data
-      - $APP_DIR/web/logs:/opt/mcsmanager/web/logs
+cat > /etc/systemd/system/$loop_service.service <<EOF
+[Unit]
+Description=edict loop
+After=network.target
 
-  daemon:
-    image: githubyumao/mcsmanager-daemon:latest
-    container_name: mcsmanager-daemon
-    restart: unless-stopped
-    ports:
-      - "${DAEMON_PORT}:24444"
-    environment:
-      - MCSM_DOCKER_WORKSPACE_PATH=$APP_DIR/daemon/data/InstanceData
-    volumes:
-      - /etc/timezone:/etc/timezone:ro
-      - /etc/localtime:/etc/localtime:ro
-      - $APP_DIR/daemon/data:/opt/mcsmanager/daemon/data
-      - $APP_DIR/daemon/logs:/opt/mcsmanager/daemon/logs
-      - /var/run/docker.sock:/var/run/docker.sock
+[Service]
+Type=simple
+WorkingDirectory=$APP_DIR
+ExecStart=/bin/bash $APP_DIR/scripts/run_loop.sh
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
-    cd "$APP_DIR" || exit
-    docker compose up -d
+cat > /etc/systemd/system/$dashboard_service.service <<EOF
+[Unit]
+Description=edict dashboard
+After=network.target
 
-    SERVER_IP=$(get_public_ip)
+[Service]
+Type=simple
+WorkingDirectory=$APP_DIR
+ExecStart=/usr/bin/python3 $APP_DIR/dashboard/server.py
+Restart=always
 
-    echo
-    echo -e "${GREEN}✅ MCSManager 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Web 访问地址: http://${SERVER_IP}:${WEB_PORT}${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR${RESET}"
+[Install]
+WantedBy=multi-user.target
+EOF
 
-    read -p "按回车返回菜单..."
+systemctl daemon-reload
+systemctl enable $loop_service
+systemctl enable $dashboard_service
+
+systemctl restart $loop_service
+systemctl restart $dashboard_service
+
+echo -e "${GREEN}安装完成${RESET}"
+echo -e "${GREEN}访问：http://127.0.0.1:7891${RESET}"
+
+pause
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ MCSManager 更新完成${RESET}"
-    read -p "按回车返回菜单..."
+start_edict(){
+
+systemctl start $loop_service
+systemctl start $dashboard_service
+
+echo -e "${GREEN}服务已启动${RESET}"
+pause
 }
 
-restart_app() {
-    docker restart mcsmanager-web mcsmanager-daemon
-    echo -e "${GREEN}✅ MCSManager 已重启${RESET}"
-    read -p "按回车返回菜单..."
+stop_edict(){
+
+systemctl stop $loop_service
+systemctl stop $dashboard_service
+
+echo -e "${RED}服务已停止${RESET}"
+pause
 }
 
-view_logs() {
-    echo -e "${YELLOW}选择查看日志: 1) web 2) daemon${RESET}"
-    read -p "请输入: " log_choice
-    case $log_choice in
-        1) docker logs -f mcsmanager-web ;;
-        2) docker logs -f mcsmanager-daemon ;;
-        *) echo -e "${RED}无效选择${RESET}" ;;
-    esac
+restart_edict(){
+
+systemctl restart $loop_service
+systemctl restart $dashboard_service
+
+echo -e "${GREEN}服务已重启${RESET}"
+pause
 }
 
-check_status() {
-    docker ps | grep mcsmanager
-    read -p "按回车返回菜单..."
+update_edict(){
+
+cd $APP_DIR
+
+git pull
+
+systemctl restart $loop_service
+systemctl restart $dashboard_service
+
+echo -e "${GREEN}更新完成${RESET}"
+pause
 }
 
-view_key() {
-    CONFIG_FILE="$APP_DIR/daemon/data/Config/global.json"
+logs_edict(){
 
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${RED}未找到配置文件${RESET}"
-        read -p "按回车返回..."
-        return
-    fi
-
-    echo
-    echo -e "${GREEN}守护进程密钥:${RESET}"
-    grep key "$CONFIG_FILE"
-    echo
-
-    read -p "按回车返回菜单..."
+echo -e "${BLUE}查看 dashboard 日志${RESET}"
+journalctl -u $dashboard_service -f
 }
 
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ MCSManager 已彻底卸载${RESET}"
-    read -p "按回车返回菜单..."
+uninstall_edict(){
+
+systemctl stop $loop_service
+systemctl stop $dashboard_service
+
+systemctl disable $loop_service
+systemctl disable $dashboard_service
+
+rm -f /etc/systemd/system/$loop_service.service
+rm -f /etc/systemd/system/$dashboard_service.service
+
+rm -rf $APP_DIR
+
+systemctl daemon-reload
+
+echo -e "${RED}edict 已卸载${RESET}"
+
+pause
 }
 
+menu(){
+
+clear
+
+echo -e "${GREEN}================================${RESET}"
+echo -e "${GREEN}    三省六部 · Edict 管理        ${RESET}"
+echo -e "${GREEN}================================${RESET}"
+echo -e "${GREEN}1. 安装 edict${RESET}"
+echo -e "${GREEN}2. 启动 edict${RESET}"
+echo -e "${GREEN}3. 停止 edict${RESET}"
+echo -e "${GREEN}4. 重启 edict${RESET}"
+echo -e "${GREEN}5. 查看日志${RESET}"
+echo -e "${GREEN}6. 更新 edict${RESET}"
+echo -e "${GREEN}7. 卸载 edict${RESET}"
+echo -e "${GREEN}0. 退出${RESET}"
+
+read -r -p $'\033[32m请输入选项: \033[0m' num
+
+case "$num" in
+
+1) install_edict ;;
+2) start_edict ;;
+3) stop_edict ;;
+4) restart_edict ;;
+5) logs_edict ;;
+6) update_edict ;;
+7) uninstall_edict ;;
+0) exit 0 ;;
+
+*) echo "无效选项"; sleep 1 ;;
+
+esac
+
+}
+
+while true
+do
 menu
+done

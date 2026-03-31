@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# CallIt 一键管理脚本
+# TgToDrive 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="callit"
+APP_NAME="tgtodrive"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -24,24 +24,33 @@ check_docker() {
     fi
 }
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
 }
 
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== CallIt 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== TgToDrive 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
+
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
         case $choice in
@@ -58,8 +67,11 @@ menu() {
 }
 
 install_app() {
+
     check_docker
-    mkdir -p "$APP_DIR"
+
+    mkdir -p "$APP_DIR/db"
+    mkdir -p "$APP_DIR/downloads"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -67,54 +79,49 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    # 端口
-    read -p "请输入访问端口 [默认:3100]: " input_port
-    PORT=${input_port:-3100}
-    check_port "$PORT" || return
+    read -p "请输入 Web 管理账号 [默认:admin]: " input_user
+    USERNAME=${input_user:-admin}
 
-    # 数据目录
-    read -p "请输入数据目录 [默认:$APP_DIR/data]: " input_data
-    DATA_DIR=${input_data:-$APP_DIR/data}
-    mkdir -p "$DATA_DIR"
+    read -p "请输入 Web 管理密码 [默认:password]: " input_pass
+    PASSWORD=${input_pass:-password}
 
-    # 管理员 Token
-    read -p "请输入 ADMIN_TOKEN (留空自动生成): " input_token
-    ADMIN_TOKEN=${input_token:-$(openssl rand -hex 16)}
+    read -p "请输入 STRM 输出目录 [默认:$APP_DIR/Emby/strm]: " input_strm
+    STRM_DIR=${input_strm:-$APP_DIR/Emby/strm}
+    mkdir -p "$STRM_DIR"
+
+    read -p "请输入上传目录 [默认:$APP_DIR/Video]: " input_upload
+    UPLOAD_DIR=${input_upload:-$APP_DIR/Video}
+    mkdir -p "$UPLOAD_DIR"
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  callit:
-    container_name: callit
-    image: yangzxi/callit:latest
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${PORT}:3100"
-    volumes:
-      - ${DATA_DIR}:/app/data
+  tgtodrive-service:
+    image: walkingd/tgto123:latest
+    container_name: TgtoDrive
+    network_mode: host
     environment:
-      TZ: Asia/Shanghai
-      ADMIN_TOKEN: ${ADMIN_TOKEN}
-    cap_add:
-      - SYS_ADMIN
-    security_opt:
-      - seccomp=unconfined
-      - apparmor=unconfined
-      - systempaths=unconfined
+      - TZ=Asia/Shanghai
+      - ENV_WEB_PASSPORT=${USERNAME}
+      - ENV_WEB_PASSWORD=${PASSWORD}
+    volumes:
+      - ./db:/app/db
+      - ${STRM_DIR}:/app/strm
+      - ./downloads:/app/downloads
+      - ${UPLOAD_DIR}:/app/upload
+    restart: always
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
-        return
-    fi
+    SERVER_IP=$(get_public_ip)
 
     echo
-    echo -e "${GREEN}✅ CallIt 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 数据目录: ${DATA_DIR}${RESET}"
-    echo -e "${GREEN}🔑 ADMIN_TOKEN: ${ADMIN_TOKEN}${RESET}"
+    echo -e "${GREEN}✅ TgToDrive 已启动${RESET}"
+    echo -e "${YELLOW}🌐 WebUI: http://${SERVER_IP}:12366${RESET}"
+    echo -e "${YELLOW}🌐 账号: ${USERNAME}${RESET}"
+    echo -e "${YELLOW}🌐 密码: ${PASSWORD}${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -123,22 +130,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ CallIt 更新完成${RESET}"
+    echo -e "${GREEN}✅ TgToDrive 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart callit
-    echo -e "${GREEN}✅ CallIt 已重启${RESET}"
+    docker restart TgtoDrive
+    echo -e "${GREEN}✅ TgToDrive 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f callit
+    docker logs -f TgtoDrive
 }
 
 check_status() {
-    docker ps | grep callit
+    docker ps | grep TgtoDrive
     read -p "按回车返回菜单..."
 }
 
@@ -146,7 +153,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ CallIt 已卸载${RESET}"
+    echo -e "${RED}✅ TgToDrive 已彻底卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

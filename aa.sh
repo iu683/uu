@@ -38,6 +38,21 @@ check_port() {
     fi
 }
 
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
+}
+
 menu() {
     while true; do
         clear
@@ -82,12 +97,25 @@ install_app() {
     echo -e "${GREEN}1) Windows 11${RESET}"
     echo -e "${GREEN}2) Windows 10${RESET}"
     echo -e "${GREEN}3) Windows Server 2022${RESET}"
+    echo -e "${GREEN}4) 自定义版本${RESET}"
     read -p "请选择 [默认:1]: " sys_choice
 
     case $sys_choice in
-        2) VERSION="10" ;;
-        3) VERSION="2022" ;;
-        *) VERSION="11" ;;
+        2)
+            VERSION="10"
+            ;;
+        3)
+            VERSION="2022"
+            ;;
+        4)
+            read -p "请输入 Windows 版本号 (如: 11): " VERSION
+            if [ -z "$VERSION" ]; then
+                VERSION="11"
+            fi
+            ;;
+        *)
+           VERSION="11"
+           ;;
     esac
 
     read -p "请输入 Web 控制台端口 [默认:8006]: " input_port
@@ -143,10 +171,12 @@ EOF
     cd "$APP_DIR" || exit
     docker compose up -d
 
+    SERVER_IP=$(get_public_ip)
+
     echo
     echo -e "${GREEN}✅ Windows 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Web 控制台: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🖥 RDP: 127.0.0.1:${RDP_PORT}${RESET}"
+    echo -e "${YELLOW}🌐 Web 控制台: http://${SERVER_IP}:${PORT}${RESET}"
+    echo -e "${YELLOW}🖥 RDP: ${SERVER_IP}:${RDP_PORT}${RESET}"
     echo -e "${GREEN}👤 用户名: $USERNAME${RESET}"
     echo -e "${GREEN}🔑 密码: $PASSWORD${RESET}"
     echo -e "${GREEN}💿 系统版本: Windows $VERSION${RESET}"

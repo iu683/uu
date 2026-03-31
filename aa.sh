@@ -1,192 +1,158 @@
 #!/bin/bash
-
-APP_NAME="edict"
-APP_DIR="/opt/$APP_NAME"
+# ========================================
+# TgToDrive 一键管理脚本
+# ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
-BLUE="\033[36m"
 RESET="\033[0m"
 
-loop_service="edict-loop"
-dashboard_service="edict-dashboard"
+APP_NAME="tgtodrive"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-pause(){
-read -p "按回车继续..."
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
+
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
+    fi
 }
 
-install_edict(){
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
+}
 
-echo -e "${YELLOW}安装依赖...${RESET}"
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== TgToDrive 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
 
-apt update
-apt install -y git python3 python3-pip
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-if [ ! -d "$APP_DIR" ]; then
-git clone https://github.com/cft0808/edict.git $APP_DIR
-fi
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
 
-cd $APP_DIR
+install_app() {
 
-chmod +x install.sh
-./install.sh
+    check_docker
 
-if [ -f requirements.txt ]; then
-pip3 install -r requirements.txt
-fi
+    mkdir -p "$APP_DIR/db"
+    mkdir -p "$APP_DIR/downloads"
 
-echo -e "${YELLOW}创建系统服务...${RESET}"
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
 
-cat > /etc/systemd/system/$loop_service.service <<EOF
-[Unit]
-Description=edict loop
-After=network.target
+    read -p "请输入 Web 管理账号 [默认:admin]: " input_user
+    USERNAME=${input_user:-admin}
 
-[Service]
-Type=simple
-WorkingDirectory=$APP_DIR
-ExecStart=/bin/bash $APP_DIR/scripts/run_loop.sh
-Restart=always
+    read -p "请输入 Web 管理密码 [默认:password]: " input_pass
+    PASSWORD=${input_pass:-password}
 
-[Install]
-WantedBy=multi-user.target
+    read -p "请输入 STRM 输出目录 [默认:$APP_DIR/Emby/strm]: " input_strm
+    STRM_DIR=${input_strm:-$APP_DIR/Emby/strm}
+    mkdir -p "$STRM_DIR"
+
+    read -p "请输入上传目录 [默认:$APP_DIR/Video]: " input_upload
+    UPLOAD_DIR=${input_upload:-$APP_DIR/Video}
+    mkdir -p "$UPLOAD_DIR"
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  tgtodrive-service:
+    image: walkingd/tgto123:latest
+    container_name: TgtoDrive
+    network_mode: host
+    environment:
+      - TZ=Asia/Shanghai
+      - ENV_WEB_PASSPORT=${USERNAME}
+      - ENV_WEB_PASSWORD=${PASSWORD}
+    volumes:
+      - ./db:/app/db
+      - ${STRM_DIR}:/app/strm
+      - ./downloads:/app/downloads
+      - ${UPLOAD_DIR}:/app/upload
+    restart: always
 EOF
 
-cat > /etc/systemd/system/$dashboard_service.service <<EOF
-[Unit]
-Description=edict dashboard
-After=network.target
+    cd "$APP_DIR" || exit
+    docker compose up -d
 
-[Service]
-Type=simple
-WorkingDirectory=$APP_DIR
-ExecStart=/usr/bin/python3 $APP_DIR/dashboard/server.py
-Restart=always
+    SERVER_IP=$(get_public_ip)
 
-[Install]
-WantedBy=multi-user.target
-EOF
+    echo
+    echo -e "${GREEN}✅ TgToDrive 已启动${RESET}"
+    echo -e "${YELLOW}🌐 WebUI: http://${SERVER_IP}:8088${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR${RESET}"
 
-systemctl daemon-reload
-systemctl enable $loop_service
-systemctl enable $dashboard_service
-
-systemctl restart $loop_service
-systemctl restart $dashboard_service
-
-echo -e "${GREEN}安装完成${RESET}"
-echo -e "${GREEN}访问：http://服务器IP:7891${RESET}"
-
-pause
+    read -p "按回车返回菜单..."
 }
 
-start_edict(){
-
-systemctl start $loop_service
-systemctl start $dashboard_service
-
-echo -e "${GREEN}服务已启动${RESET}"
-pause
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ TgToDrive 更新完成${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-stop_edict(){
-
-systemctl stop $loop_service
-systemctl stop $dashboard_service
-
-echo -e "${RED}服务已停止${RESET}"
-pause
+restart_app() {
+    docker restart TgtoDrive
+    echo -e "${GREEN}✅ TgToDrive 已重启${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-restart_edict(){
-
-systemctl restart $loop_service
-systemctl restart $dashboard_service
-
-echo -e "${GREEN}服务已重启${RESET}"
-pause
+view_logs() {
+    docker logs -f TgtoDrive
 }
 
-update_edict(){
-
-cd $APP_DIR
-
-git pull
-
-systemctl restart $loop_service
-systemctl restart $dashboard_service
-
-echo -e "${GREEN}更新完成${RESET}"
-pause
+check_status() {
+    docker ps | grep TgtoDrive
+    read -p "按回车返回菜单..."
 }
 
-logs_edict(){
-
-echo -e "${BLUE}查看 dashboard 日志${RESET}"
-journalctl -u $dashboard_service -f
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ TgToDrive 已彻底卸载${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-uninstall_edict(){
-
-systemctl stop $loop_service
-systemctl stop $dashboard_service
-
-systemctl disable $loop_service
-systemctl disable $dashboard_service
-
-rm -f /etc/systemd/system/$loop_service.service
-rm -f /etc/systemd/system/$dashboard_service.service
-
-rm -rf $APP_DIR
-
-systemctl daemon-reload
-
-echo -e "${RED}edict 已卸载${RESET}"
-
-pause
-}
-
-menu(){
-
-clear
-
-echo -e "${GREEN}"
-echo "================================"
-echo "        edict 管理脚本"
-echo "================================"
-echo -e "${RESET}"
-
-echo "1. 安装 edict"
-echo "2. 启动 edict"
-echo "3. 停止 edict"
-echo "4. 重启 edict"
-echo "5. 查看日志"
-echo "6. 更新 edict"
-echo "7. 卸载 edict"
-echo "0. 退出"
-
-echo
-read -p "请输入选项: " num
-
-case "$num" in
-
-1) install_edict ;;
-2) start_edict ;;
-3) stop_edict ;;
-4) restart_edict ;;
-5) logs_edict ;;
-6) update_edict ;;
-7) uninstall_edict ;;
-0) exit 0 ;;
-
-*) echo "无效选项"; sleep 1 ;;
-
-esac
-
-}
-
-while true
-do
 menu
-done

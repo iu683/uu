@@ -1,335 +1,323 @@
 #!/bin/bash
-# ========================================
-# Xray VMess WS 多节点管理脚本（无TLS）
-# ========================================
+set -e
 
+# ==========================================
+# 一键系统更新 & 常用依赖安装 & 修复 APT 源（Debian 11/12 兼容版）
+# ==========================================
+
+# 颜色定义
+RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="xray-vmess-ws"
-APP_DIR="/root/$APP_NAME"
+# 检查是否 root
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}❌ 请使用 root 用户运行此脚本${RESET}"
+    exit 1
+fi
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
-    if ! command -v jq &>/dev/null; then
-        echo -e "${YELLOW}安装 jq...${RESET}"
-        apt update && apt install -y jq
-    fi
-}
+# -------------------------
+# 常用依赖（新增 dnsutils, iperf3, mtr）
+# -------------------------
+deps=(curl wget git net-tools lsof tar unzip rsync pv sudo nc dnsutils iperf3 mtr jq openssl)
 
-random_port() {
-    while :; do
-        PORT=$(shuf -i 2000-65000 -n1)
-        ss -lntu | grep -q ":$PORT " || break
+# -------------------------
+# 检查并安装依赖（兼容不同系统）
+# -------------------------
+check_and_install() {
+    local check_cmd="$1"
+    local install_cmd="$2"
+    local missing=()
+    for pkg in "${deps[@]}"; do
+        if ! eval "$check_cmd \"$pkg\"" &>/dev/null; then
+            missing+=("$pkg")
+        else
+            echo -e "${GREEN}✔ 已安装: $pkg${RESET}"
+        fi
     done
-    echo "$PORT"
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo -e "${YELLOW}👉 安装缺失依赖: ${missing[*]}${RESET}"
+        # Debian 系统处理 netcat
+        if [ "$OS_TYPE" = "debian" ]; then
+            apt update -y
+            # 让 iperf3 安装时自动选择 No（不启动 daemon）
+            echo "iperf3 iperf3/start_daemon boolean false" | debconf-set-selections
+            for pkg in "${missing[@]}"; do
+                if [ "$pkg" = "nc" ]; then
+                    apt install -y netcat-openbsd
+                else
+                    apt install -y "$pkg"
+                fi
+            done
+        else
+            eval "$install_cmd \"\${missing[@]}\""
+        fi
+    fi
 }
 
-list_nodes() {
-    mkdir -p "$APP_DIR"
-    echo -e "${GREEN}=== 已有 VMess 节点 ===${RESET}"
-    local count=0
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        echo -e "${YELLOW}[$count] $(basename "$node")${RESET}"
-    done
-    [ $count -eq 0 ] && echo -e "${YELLOW}无节点${RESET}"
-}
-
-select_node() {
-    list_nodes
-    read -r -p $'\033[32m请输入节点名称或编号: \033[0m' input
-    if [[ "$input" =~ ^[0-9]+$ ]]; then
-        NODE_NAME=$(ls -d "$APP_DIR"/* 2>/dev/null | sed -n "${input}p" | xargs basename)
+# -------------------------
+# 清理重复 Docker 源
+# -------------------------
+fix_duplicate_docker_sources() {
+    echo -e "${YELLOW}🔍 检查重复 Docker APT 源...${RESET}"
+    local docker_sources
+    docker_sources=$(grep -rl "download.docker.com" /etc/apt/sources.list.d/ 2>/dev/null || true)
+    if [ "$(echo "$docker_sources" | grep -c .)" -gt 1 ]; then
+        echo -e "${RED}⚠️ 检测到重复 Docker 源:${RESET}"
+        echo "$docker_sources"
+        for f in $docker_sources; do
+            if [[ "$f" == *"archive_uri"* ]]; then
+                rm -f "$f"
+                echo -e "${GREEN}✔ 删除多余源: $f${RESET}"
+            fi
+        done
     else
-        NODE_NAME="$input"
+        echo -e "${GREEN}✔ Docker 源正常${RESET}"
     fi
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-    if [ ! -d "$NODE_DIR" ]; then
-        echo -e "${RED}节点不存在！${RESET}"
+}
+
+# -------------------------
+# 修复 sources.list（兼容 Bullseye / Bookworm）
+# -------------------------
+fix_sources_for_version() {
+    echo -e "${YELLOW}🔍 修复 sources.list 兼容性...${RESET}"
+    local version="$1"
+    local files
+    files=$(grep -rl "deb" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true)
+    for f in $files; do
+        if [[ "$version" == "bullseye" ]]; then
+            sed -i -r 's/\bnon-free(-firmware){0,3}\b/non-free/g' "$f"
+            sed -i '/deb .*bullseye-backports/s/^/##/' "$f"
+        elif [[ "$version" == "bookworm" ]]; then
+            # Bookworm 保留 non-free-firmware，但去掉重复 non-free
+            sed -i -r 's/\bnon-free non-free\b/non-free/g' "$f"
+        fi
+    done
+    echo -e "${GREEN}✔ sources.list 已优化${RESET}"
+}
+
+# -------------------------
+# 系统更新函数
+# -------------------------
+update_system() {
+    echo -e "${GREEN}🔄 检测系统发行版并更新...${RESET}"
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        echo -e "${YELLOW}👉 当前系统: $PRETTY_NAME${RESET}"
+
+        # 系统类型
+        if [[ "$ID" =~ debian|ubuntu ]]; then
+            OS_TYPE="debian"
+            fix_duplicate_docker_sources
+            fix_sources_for_version "$VERSION_CODENAME"
+            apt update && apt upgrade -y
+            check_and_install "dpkg -s" "apt install -y"
+        elif [[ "$ID" =~ fedora ]]; then
+            OS_TYPE="rhel"
+            dnf check-update || true
+            dnf upgrade -y
+            check_and_install "rpm -q" "dnf install -y"
+        elif [[ "$ID" =~ centos|rhel ]]; then
+            OS_TYPE="rhel"
+            yum check-update || true
+            yum upgrade -y
+            check_and_install "rpm -q" "yum install -y"
+        elif [[ "$ID" =~ alpine ]]; then
+            OS_TYPE="alpine"
+            apk update && apk upgrade
+            check_and_install "apk info -e" "apk add"
+        else
+            echo -e "${RED}❌ 暂不支持的 Linux 发行版: $ID${RESET}"
+            return 1
+        fi
+    else
+        echo -e "${RED}❌ 无法检测系统发行版 (/etc/os-release 不存在)${RESET}"
+        return 1
+    fi
+
+    echo -e "${GREEN}✅ 系统更新和依赖安装完成！${RESET}"
+}
+# -------------------------
+# 安装并启动 cron
+# -------------------------
+install_cron() {
+    echo -e "${YELLOW}⏰ 检查并安装 cron 定时任务服务...${RESET}"
+
+    case "$OS_TYPE" in
+        debian)
+            if ! dpkg -s cron >/dev/null 2>&1; then
+                echo -e "${YELLOW}📦 安装 cron...${RESET}"
+                apt update
+                apt install -y cron
+            else
+                echo -e "${GREEN}✔ cron 已安装${RESET}"
+            fi
+            systemctl enable --now cron
+            ;;
+        rhel)
+            if ! rpm -q cronie >/dev/null 2>&1; then
+                echo -e "${YELLOW}📦 安装 cronie...${RESET}"
+                yum install -y cronie 2>/dev/null || dnf install -y cronie
+            else
+                echo -e "${GREEN}✔ cronie 已安装${RESET}"
+            fi
+            systemctl enable --now crond
+            ;;
+        alpine)
+            if ! apk info -e cronie >/dev/null 2>&1; then
+                echo -e "${YELLOW}📦 安装 cronie...${RESET}"
+                apk add cronie
+            else
+                echo -e "${GREEN}✔ cronie 已安装${RESET}"
+            fi
+            rc-update add crond
+            service crond start
+            ;;
+        *)
+            echo -e "${RED}❌ 未知系统类型，无法安装 cron${RESET}"
+            return 1
+            ;;
+    esac
+
+    # 状态检测
+    if systemctl is-active --quiet cron 2>/dev/null || systemctl is-active --quiet crond 2>/dev/null; then
+        echo -e "${GREEN}✔ cron 服务已运行${RESET}"
+    else
+        echo -e "${RED}❌ cron 服务未启动，请手动检查${RESET}"
+    fi
+}
+
+# -------------------------
+# 安装 NextTrace（网络路由追踪工具）
+# -------------------------
+install_nexttrace() {
+    echo -e "${YELLOW}🌐 检查并安装 NextTrace...${RESET}"
+
+    # 确保 curl 存在
+    if ! command -v curl >/dev/null 2>&1; then
+        echo -e "${RED}❌ curl 未安装，无法安装 NextTrace${RESET}"
+        return 1
+    fi
+
+    # 检测是否已安装
+    if command -v nexttrace >/dev/null 2>&1; then
+        echo -e "${GREEN}✔ NextTrace 已安装${RESET}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}👉 开始安装 NextTrace...${RESET}"
+
+    curl -sL https://nxtrace.org/nt | bash
+
+    # 验证
+    if command -v nexttrace >/dev/null 2>&1; then
+        echo -e "${GREEN}✔ NextTrace 安装成功${RESET}"
+    else
+        echo -e "${RED}❌ NextTrace 安装失败${RESET}"
+    fi
+}
+
+# -------------------------
+# 开启 BBR（安全版）
+# -------------------------
+enable_bbr() {
+    echo -e "${YELLOW}🚀 检查并配置 TCP BBR...${RESET}"
+
+    # 1️⃣ 尝试加载 BBR 模块
+    if ! modprobe tcp_bbr 2>/dev/null; then
+        echo -e "${RED}❌ 当前内核未编译 BBR 或不支持${RESET}"
+        return 1
+    fi
+
+    # 2️⃣ 写入模块自动加载（避免重复）
+    mkdir -p /etc/modules-load.d
+    if ! grep -qxF "tcp_bbr" /etc/modules-load.d/bbr.conf 2>/dev/null; then
+        echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
+    fi
+
+    # 3️⃣ 检查是否已经启用
+    if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
+        echo -e "${GREEN}✔ BBR 已经开启，无需修改${RESET}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}👉 BBR 未开启，开始配置...${RESET}"
+
+    # 4️⃣ 写入独立 sysctl 配置文件（更规范）
+    cat >/etc/sysctl.d/99-bbr.conf <<EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+
+    # 5️⃣ 应用配置
+    sysctl --system >/dev/null
+
+    # 6️⃣ 再次验证
+    if [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = "bbr" ]; then
+        echo -e "${GREEN}✔ BBR 已成功开启${RESET}"
+    else
+        echo -e "${RED}❌ BBR 开启失败，请检查内核配置${RESET}"
         return 1
     fi
 }
 
-install_node() {
+# -------------------------
+# 时间同步 & 设置上海时区（Debian / Ubuntu 专用）
+# -------------------------
+enable_time_sync() {
+    echo -e "${YELLOW}⏰ 配置 systemd-timesyncd 时间同步& 设置上海时区...${RESET}"
 
-    check_docker
-
-    read -p "请输入节点名称 [默认node$(date +%s)]: " NODE_NAME
-    NODE_NAME=${NODE_NAME:-node$(date +%s)}
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-    mkdir -p "$NODE_DIR"
-
-    read -p "请输入端口 [默认随机]: " PORT
-    PORT=${PORT:-$(random_port)}
-
-    if ss -lntu | grep -q ":$PORT "; then
-        echo -e "${RED}端口已被占用${RESET}"
-        return
+    if [ ! -f /etc/os-release ]; then
+        echo -e "${RED}❌ 无法识别系统类型${RESET}"
+        return 1
     fi
 
-    read -p "请输入服务器IP或域名: " DOMAIN
-    [ -z "$DOMAIN" ] && { echo -e "${RED}不能为空${RESET}"; return; }
+    . /etc/os-release
 
-    read -p "请输入 WebSocket Host (可留空): " WS_HOST
-
-    read -p "请输入 WebSocket Path [默认 /ws]: " WS_PATH
-    WS_PATH=${WS_PATH:-/ws}
-
-    UUID=$(cat /proc/sys/kernel/random/uuid)
-
-    CONFIG_FILE="$NODE_DIR/config.json"
-    COMPOSE_FILE="$NODE_DIR/docker-compose.yml"
-
-cat > "$CONFIG_FILE" <<EOF
-{
-  "log": { "loglevel": "warning" },
-  "inbounds": [
-    {
-      "port": $PORT,
-      "protocol": "vmess",
-      "settings": {
-        "clients": [
-          { "id": "$UUID", "alterId": 0 }
-        ]
-      },
-      "streamSettings": {
-        "network": "ws",
-        "security": "none",
-        "wsSettings": {
-          "path": "$WS_PATH",
-          "headers": {
-            "Host": "$WS_HOST"
-          }
-        }
-      }
-    }
-  ],
-  "outbounds": [
-    { "protocol": "freedom" }
-  ]
-}
-EOF
-
-cat > "$COMPOSE_FILE" <<EOF
-services:
-  $NODE_NAME:
-    image: ghcr.io/xtls/xray-core:latest
-    container_name: $NODE_NAME
-    restart: unless-stopped
-    command: ["run","-c","/etc/xray/config.json"]
-    volumes:
-      - ./config.json:/etc/xray/config.json:ro
-    ports:
-      - "$PORT:$PORT/tcp"
-EOF
-
-    cd "$NODE_DIR"
-    docker compose up -d
-
-VMESS_JSON=$(jq -n \
---arg v "2" \
---arg ps "$NODE_NAME" \
---arg add "$DOMAIN" \
---arg port "$PORT" \
---arg id "$UUID" \
---arg aid "0" \
---arg net "ws" \
---arg type "none" \
---arg host "$WS_HOST" \
---arg path "$WS_PATH" \
---arg tls "" \
-'{
-v:$v,
-ps:$ps,
-add:$add,
-port:$port,
-id:$id,
-aid:$aid,
-net:$net,
-type:$type,
-host:$host,
-path:$path,
-tls:$tls
-}' | base64 | tr -d '\n')
-
-echo
-echo -e "${GREEN}📂 安装目录: $NODE_DIR${RESET}"
-echo -e "${GREEN}✅ VMess-WS 节点已启动${RESET}"
-echo -e "${YELLOW}🌐 地址: ${DOMAIN}${RESET}"
-echo -e "${YELLOW}🔌 端口: ${PORT}${RESET}"
-echo -e "${YELLOW}🆔 UUID: ${UUID}${RESET}"
-echo -e "${YELLOW}🌐 Host: $WS_HOST${RESET}"
-echo -e "${YELLOW}🌐 Path: $WS_PATH${RESET}"
-
-echo
-echo -e "${YELLOW}📄 V2rayN链接:${RESET}"
-echo -e "${YELLOW}vmess://${VMESS_JSON}${RESET}"
-
-echo -e "${YELLOW}📄 Surge配置:${RESET}"
-echo -e "${YELLOW}$NODE_NAME = vmess, ${DOMAIN}, ${PORT}, username=${UUID}, ws=true, ws-path=$WS_PATH, ws-headers=Host:\"$WS_HOST\", vmess-aead=true, tls=false${RESET}"
-
-cat > "$NODE_DIR/node.txt" <<EOF
-V2rayN链接
-vmess://${VMESS_JSON}
-
-Surge配置
-$NODE_NAME = vmess, ${DOMAIN}, ${PORT}, username=${UUID}, ws=true, ws-path=$WS_PATH, ws-headers=Host:"$WS_HOST", vmess-aead=true, tls=false
-EOF
-
-read -p "按回车返回菜单..."
-}
-
-node_action_menu() {
-    select_node || return
-    while true; do
-        echo -e "${GREEN}=== 节点 [$NODE_NAME] 管理 ===${RESET}"
-        echo -e "${GREEN}1) 暂停${RESET}"
-        echo -e "${GREEN}2) 重启${RESET}"
-        echo -e "${GREEN}3) 更新${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 卸载${RESET}"
-        echo -e "${GREEN}6) 查看节点信息${RESET}"
-        echo -e "${GREEN}0) 返回主菜单${RESET}"
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
-        case $choice in
-            1) docker pause "$NODE_NAME" ;;
-            2) docker restart "$NODE_NAME" ;;
-            3) (cd "$NODE_DIR" && docker compose pull && docker compose up -d) ;;
-            4) docker logs -f "$NODE_NAME" ;;
-            5) docker compose -f "$NODE_DIR/docker-compose.yml" down && rm -rf "$NODE_DIR" && return ;;
-            6) cat "$NODE_DIR/node.txt" ;;
-            0) return ;;
-        esac
-    done
-}
-
-show_all_status() {
-    list_nodes
-    echo -e "${GREEN}=== 节点状态 ===${RESET}"
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        NODE_NAME=$(basename "$node")
-        PORT=$(grep '"port"' "$node/config.json" | head -n1 | awk -F': ' '{print $2}' | tr -d ',')
-        STATUS=$(docker inspect -f '{{.State.Status}}' "$NODE_NAME" 2>/dev/null)
-        echo "$NODE_NAME | 端口:$PORT | 状态:$STATUS"
-    done
-    read -p "按回车返回菜单..."
-}
-
-batch_action() {
-
-    mkdir -p "$APP_DIR"
-
-    NODE_LIST=()
-    local count=0
-
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        NODE_NAME=$(basename "$node")
-        NODE_LIST+=("$NODE_NAME")
-    done
-
-    if [ $count -eq 0 ]; then
-        echo -e "${YELLOW}无节点${RESET}"
-        read -p "按回车返回菜单..."
-        return
+    if [[ "$ID" != "ubuntu" && "$ID" != "debian" ]]; then
+        echo -e "${RED}❌ 当前系统不是 Debian/Ubuntu，跳过时间同步配置${RESET}"
+        return 0
     fi
 
-    echo -e "${GREEN}=== 批量管理节点 ===${RESET}"
-    echo -e "${GREEN}1) 暂停节点${RESET}"
-    echo -e "${GREEN}2) 重启节点${RESET}"
-    echo -e "${GREEN}3) 更新节点${RESET}"
-    echo -e "${GREEN}4) 卸载节点${RESET}"
-    echo -e "${GREEN}0) 返回菜单${RESET}"
-    read -r -p $'\033[32m请选择: \033[0m' action
+    echo -e "${GREEN}✔ 系统检测通过：$PRETTY_NAME${RESET}"
 
-    [[ "$action" == "0" ]] && return
-
-    echo
-    echo -e "${GREEN}节点列表:${RESET}"
-
-    count=0
-    for node in "${NODE_LIST[@]}"; do
-        count=$((count+1))
-        echo -e "${YELLOW}[$count] $node${RESET}"
-    done
-
-    echo
-    read -r -p $'\033[32m请输入节点序号（空格分隔，或输入 all）: \033[0m' input
-
-    SELECTED=()
-
-    if [[ "$input" == "all" ]]; then
-        SELECTED=("${NODE_LIST[@]}")
+    # 安装 systemd-timesyncd（极简系统可能没装）
+    if ! dpkg -s systemd-timesyncd >/dev/null 2>&1; then
+        echo -e "${YELLOW}📦 安装 systemd-timesyncd...${RESET}"
+        apt update
+        apt install -y systemd-timesyncd
     else
-        for i in $input; do
-            if [[ "$i" =~ ^[0-9]+$ ]] && [ "$i" -ge 1 ] && [ "$i" -le "${#NODE_LIST[@]}" ]; then
-                SELECTED+=("${NODE_LIST[$((i-1))]}")
-            fi
-        done
+        echo -e "${GREEN}✔ systemd-timesyncd 已安装${RESET}"
     fi
 
-    for NODE_NAME in "${SELECTED[@]}"; do
+    # 启用服务
+    systemctl unmask systemd-timesyncd || true
+    systemctl enable --now systemd-timesyncd
 
-        NODE_DIR="$APP_DIR/$NODE_NAME"
+    # 启用 NTP
+    timedatectl set-ntp true
+    systemctl restart systemd-timesyncd
 
-        case $action in
+     # 设置上海时区
+    timedatectl set-timezone Asia/Shanghai
+    echo -e "${GREEN}✔ 时区已设置为上海 (Asia/Shanghai)${RESET}"
 
-            1)
-                docker pause "$NODE_NAME"
-                ;;
-
-            2)
-                docker restart "$NODE_NAME"
-                ;;
-
-            3)
-                (cd "$NODE_DIR" && docker compose pull && docker compose up -d)
-                ;;
-
-            4)
-                (cd "$NODE_DIR" && docker compose down && rm -rf "$NODE_DIR")
-                ;;
-
-        esac
-
-        echo -e "${GREEN}完成 $NODE_NAME${RESET}"
-
-    done
-
-    read -p "按回车返回菜单..."
+    # 状态检查
+    if systemctl is-active --quiet systemd-timesyncd; then
+        echo -e "${GREEN}✔ 时间同步服务已成功启动${RESET}"
+    else
+        echo -e "${RED}❌ 时间同步服务启动失败${RESET}"
+    fi
 }
 
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== Xray VMess WS 多节点管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动新节点${RESET}"
-        echo -e "${GREEN}2) 管理已有节点${RESET}"
-        echo -e "${GREEN}3) 查看所有节点状态${RESET}"
-        echo -e "${GREEN}4) 管理所有节点${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
-        case $choice in
-            1) install_node ;;
-            2) node_action_menu ;;
-            3) show_all_status ;;
-            4) batch_action ;;
-            0) exit 0 ;;
-        esac
-    done
-}
-
-menu
+# -------------------------
+# 执行
+# -------------------------
+clear
+update_system
+install_cron
+install_nexttrace
+enable_bbr
+enable_time_sync

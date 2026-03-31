@@ -1,190 +1,161 @@
 #!/bin/bash
+# ========================================
+# Model Status 一键管理脚本
+# ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_DIR="/opt/rbot"
-SCRIPT="$APP_DIR/sh_client_bot.sh"
+APP_NAME="model-status"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
-}
-
-
-install_bot() {
-
-echo -e "${GREEN}开始安装 RBot...${RESET}"
-
-mkdir -p $APP_DIR
-cd $APP_DIR
-
-# 安装依赖
-if ! command -v java &>/dev/null; then
-    echo -e "${YELLOW}安装 Java 环境...${RESET}"
-    
-    if command -v apt &>/dev/null; then
-        apt update
-        apt install -y openjdk-11-jre wget curl
-    elif command -v yum &>/dev/null; then
-        yum install -y java-11-openjdk wget curl
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
     fi
-fi
 
-# 下载脚本
-wget -O sh_client_bot.sh https://github.com/semicons/java_oci_manage/releases/latest/download/sh_client_bot.sh
-
-chmod +x sh_client_bot.sh
-
-
-SERVER_IP=$(get_public_ip)
-echo
-echo -e "${GREEN}安装完成${RESET}"
-echo -e "${YELLOW}配置文件:$APP_DIR/client_config${RESET}"
-echo -e "${YELLOW}访问地址:https://${SERVER_IP}:9527${RESET}"
-echo -e "${YELLOW}完成配置，再选择2启动${RESET}"
-echo
-
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
+    fi
 }
 
-check_install() {
-
-if [ ! -f "$SCRIPT" ]; then
-    echo -e "${RED}RBot 未安装，请先安装${RESET}"
-    return 1
-fi
-
-cd $APP_DIR
-return 0
-}
-
-start_bot() {
-check_install || return
-bash sh_client_bot.sh
-}
-
-status_bot() {
-check_install || return
-bash sh_client_bot.sh status
-}
-
-log_bot() {
-check_install || return
-bash sh_client_bot.sh log
-}
-
-stop_bot() {
-check_install || return
-bash sh_client_bot.sh stop
-}
-
-restart_bot() {
-check_install || return
-bash sh_client_bot.sh restart
-}
-
-upgrade_bot() {
-check_install || return
-bash sh_client_bot.sh upgrade
-}
-
-uninstall_bot() {
-
-check_install || return
-
-read -rp "$(echo -e ${RED}确定卸载 RBot？[y/N]: ${RESET})" confirm
-
-if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-    bash sh_client_bot.sh uninstall
-    rm -rf $APP_DIR
-    echo -e "${GREEN}已卸载${RESET}"
-fi
-
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
 }
 
 menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== Model Status 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-clear
-
-echo -e "${GREEN}================================${RESET}"
-echo -e "${GREEN}      RBot 管理脚本${RESET}"
-echo -e "${GREEN}================================${RESET}"
-echo -e "${YELLOW}1.安装 RBot${RESET}"
-echo -e "${YELLOW}2.启动${RESET}"
-echo -e "${YELLOW}3.查看状态${RESET}"
-echo -e "${YELLOW}4.查看日志${RESET}"
-echo -e "${YELLOW}5.停止${RESET}"
-echo -e "${YELLOW}6.重启${RESET}"
-echo -e "${YELLOW}7.升级${RESET}"
-echo -e "${YELLOW}8.卸载${RESET}"
-echo -e "${YELLOW}0.退出${RESET}"
-read -rp "$(echo -e ${GREEN}请输入选项:${RESET} )" choice
-
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
 }
 
-while true
-do
+install_app() {
+    check_docker
+    mkdir -p "$APP_DIR"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
+
+    # 端口
+    read -p "请输入访问端口 [默认:3000]: " input_port
+    PORT=${input_port:-3000}
+    check_port "$PORT" || return
+
+    # 数据目录
+    read -p "请输入数据目录 [默认:$APP_DIR/data]: " input_data
+    DATA_DIR=${input_data:-$APP_DIR/data}
+    mkdir -p "$DATA_DIR"
+
+    # 管理员账号
+    read -p "请输入管理员用户名 [默认:admin]: " input_user
+    ADMIN_USER=${input_user:-admin}
+
+    # 管理员密码
+    read -p "请输入管理员密码 [默认:change-me]: " input_pass
+    ADMIN_PASS=${input_pass:-change-me}
+
+    # SESSION_SECRET
+    read -p "请输入 SESSION_SECRET (留空自动生成): " input_secret
+    SESSION_SECRET=${input_secret:-$(openssl rand -hex 16)}
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  model-status:
+    image: ghcr.io/wiziscool/model-status:latest
+    container_name: model-status
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORT}:3000"
+    volumes:
+      - ${DATA_DIR}:/app/data
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3000
+      WEB_ORIGIN: http://localhost:${PORT}
+      DATABASE_FILE: /app/data/model-status.db
+      ADMIN_BOOTSTRAP_USERNAME: ${ADMIN_USER}
+      ADMIN_BOOTSTRAP_PASSWORD: ${ADMIN_PASS}
+      SESSION_SECRET: ${SESSION_SECRET}
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
+        return
+    fi
+
+    echo
+    echo -e "${GREEN}✅ Model Status 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📂 数据目录: ${DATA_DIR}${RESET}"
+    echo -e "${GREEN}👤 管理员: ${ADMIN_USER}${RESET}"
+    echo -e "${GREEN}🔑 密码: ${ADMIN_PASS}${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ Model Status 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+    docker restart model-status
+    echo -e "${GREEN}✅ Model Status 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    docker logs -f model-status
+}
+
+check_status() {
+    docker ps | grep model-status
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ Model Status 已卸载${RESET}"
+    read -p "按回车返回菜单..."
+}
 
 menu
-
-case $choice in
-
-1)
-install_bot
-;;
-
-2)
-start_bot
-;;
-
-3)
-status_bot
-;;
-
-4)
-log_bot
-;;
-
-5)
-stop_bot
-;;
-
-6)
-restart_bot
-;;
-
-7)
-upgrade_bot
-;;
-
-8)
-uninstall_bot
-;;
-
-0)
-exit
-;;
-
-*)
-echo -e "${RED}无效选项${RESET}"
-;;
-
-esac
-
-echo
-read -rp "按回车返回菜单..." temp
-
-done

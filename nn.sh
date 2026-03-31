@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Transmission 一键管理脚本
+# Xray VMess WS 一键管理脚本（无TLS + 自定义Host）
 # ========================================
 
 GREEN="\033[32m"
@@ -8,50 +8,44 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="transmission"
+CONTAINER_NAME="xray-server"
+APP_NAME="xray-vmess-ws"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/config.json"
+NODE_INFO_FILE="$APP_DIR/node.txt"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
         echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
         curl -fsSL https://get.docker.com | bash
     fi
-
     if ! docker compose version &>/dev/null; then
         echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
         exit 1
     fi
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
+check_port() {
+    if ss -lnt | awk '{print $4}' | grep -q ":$1$"; then
+        echo -e "${RED}端口 $1 已被占用${RESET}"
+        return 1
+    fi
+    return 0
 }
-
 
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Transmission 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== xray-vmess+ws 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}6) 查看节点信息${RESET}"
+        echo -e "${GREEN}7) 卸载${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
-
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
         case $choice in
@@ -60,7 +54,8 @@ menu() {
             3) restart_app ;;
             4) view_logs ;;
             5) check_status ;;
-            6) uninstall_app ;;
+            6) view_node_info ;;
+            7) uninstall_app ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
         esac
@@ -70,85 +65,174 @@ menu() {
 install_app() {
 
     check_docker
+    mkdir -p "$APP_DIR"
 
-    mkdir -p "$APP_DIR/config"
-    mkdir -p "$APP_DIR/downloads"
-    mkdir -p "$APP_DIR/watch"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
+    read -p "请输入端口 [默认随机]: " input_port
+    if [[ -z "$input_port" ]]; then
+        PORT=$(shuf -i 1025-65535 -n1)
+    else
+        PORT=$input_port
     fi
 
-    read -p "请输入 WebUI 用户名 [默认:admin]: " input_user
-    USERNAME=${input_user:-admin}
+    check_port "$PORT" || return
 
-    read -p "请输入 WebUI 密码 [默认:admin123]: " input_pass
-    PASSWORD=${input_pass:-admin123}
+    read -p "请输入服务器IP或域名: " DOMAIN
+    if [[ -z "$DOMAIN" ]]; then
+        echo -e "${RED}不能为空${RESET}"
+        return
+    fi
 
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  transmission:
-    image: linuxserver/transmission:latest
-    container_name: transmission
-    environment:
-      - PUID=1000
-      - PGID=1000
-      - UMASK_SET=002
-      - TZ=Asia/Shanghai
-      - USER=${USERNAME}
-      - PASS=${PASSWORD}
-    volumes:
-      - ./config:/config
-      - ./downloads:/downloads
-      - ./watch:/watch
-    network_mode: host
-    restart: unless-stopped
+    read -p "请输入 WebSocket Path [默认 /ws]: " WS_PATH
+    WS_PATH=${WS_PATH:-/ws}
+
+    read -p "请输入 WebSocket Host (可留空): " WS_HOST
+
+    UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
+
+cat > "$CONFIG_FILE" <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "port": $PORT,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          { "id": "$UUID", "alterId": 0 }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "path": "$WS_PATH",
+          "headers": {
+            "Host": "$WS_HOST"
+          }
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    { "protocol": "freedom" }
+  ]
+}
 EOF
 
-    cd "$APP_DIR" || exit
-    docker compose up -d
+cat > "$COMPOSE_FILE" <<EOF
+services:
+  xray:
+    image: ghcr.io/xtls/xray-core:latest
+    container_name: xray-server
+    restart: unless-stopped
+    command: ["run","-c","/etc/xray/config.json"]
+    volumes:
+      - ./config.json:/etc/xray/config.json:ro
+    ports:
+      - "$PORT:$PORT/tcp"
+EOF
 
-    SERVER_IP=$(get_public_ip)
-    echo
-    echo -e "${GREEN}✅ Transmission 已启动${RESET}"
-    echo -e "${YELLOW}🌐 WebUI: http://${SERVER_IP}:9091${RESET}"
-    echo -e "${YELLOW}🌐 账号: ${USERNAME}${RESET}"
-    echo -e "${YELLOW}🌐 密码: ${PASSWORD}${RESET}"
-    echo -e "${GREEN}📂 下载目录: $APP_DIR/downloads${RESET}"
+cd "$APP_DIR" || exit
+docker compose up -d
 
-    read -p "按回车返回菜单..."
+HOSTNAME=$(hostname -s | sed 's/ /_/g')
+
+VMESS_JSON=$(jq -n \
+    --arg v "2" \
+    --arg ps "$HOSTNAME" \
+    --arg add "$DOMAIN" \
+    --arg port "$PORT" \
+    --arg id "$UUID" \
+    --arg aid "0" \
+    --arg net "ws" \
+    --arg type "none" \
+    --arg host "$WS_HOST" \
+    --arg path "$WS_PATH" \
+    --arg tls "" \
+    '{
+        v:$v,
+        ps:$ps,
+        add:$add,
+        port:$port,
+        id:$id,
+        aid:$aid,
+        net:$net,
+        type:$type,
+        host:$host,
+        path:$path,
+        tls:$tls
+    }' | base64 -w 0)
+
+echo
+echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+echo -e "${GREEN}✅ VMess-WS 节点已启动${RESET}"
+echo -e "${YELLOW}🌐 地址: ${DOMAIN}${RESET}"
+echo -e "${YELLOW}🔌 端口: ${PORT}${RESET}"
+echo -e "${YELLOW}🆔 UUID: ${UUID}${RESET}"
+echo
+
+echo -e "${YELLOW}📄 V2rayN链接:${RESET}"
+echo -e "${YELLOW}vmess://${VMESS_JSON}${RESET}"
+
+echo -e "${YELLOW}📄 Surge配置:${RESET}"
+echo -e "${YELLOW}$HOSTNAME = vmess, ${DOMAIN}, ${PORT}, username=${UUID}, ws=true, ws-path=$WS_PATH, ws-headers=Host:\"$WS_HOST\", vmess-aead=true, tls=false${RESET}"
+
+cat > "$NODE_INFO_FILE" <<EOF
+V2rayN链接
+vmess://${VMESS_JSON}
+
+Surge配置
+$HOSTNAME = vmess, ${DOMAIN}, ${PORT}, username=${UUID}, ws=true, ws-path=$WS_PATH, ws-headers=Host:"$WS_HOST", vmess-aead=true, tls=false
+EOF
+
+read -p "按回车返回菜单..."
 }
 
 update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Transmission 更新完成${RESET}"
+    echo -e "${GREEN}✅ 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart transmission
-    echo -e "${GREEN}✅ Transmission 已重启${RESET}"
+    docker restart ${CONTAINER_NAME}
+    echo -e "${GREEN}✅ ${CONTAINER_NAME} 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f transmission
+    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
+    docker logs -f ${CONTAINER_NAME}
+}
+
+view_node_info() {
+
+    if [ ! -f "$NODE_INFO_FILE" ]; then
+        echo -e "${RED}未找到节点信息${RESET}"
+        read -p "按回车返回菜单..."
+        return
+}
+
+    echo
+    echo -e "${GREEN}=== 节点信息 ===${RESET}"
+    echo
+    cat "$NODE_INFO_FILE"
+    echo
+    read -p "按回车返回菜单..."
 }
 
 check_status() {
-    docker ps | grep transmission
+    docker ps | grep ${CONTAINER_NAME}
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
     cd "$APP_DIR" || return
-    docker compose down -v
+    docker compose down
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Transmission 已彻底卸载${RESET}"
+    echo -e "${RED}✅ 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

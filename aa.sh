@@ -81,11 +81,14 @@ install_app() {
         echo -e "${RED}不能为空${RESET}"
         return
     fi
+    
+
+    read -p "请输入 WebSocket Host (可留空): " WS_HOST
 
     read -p "请输入 WebSocket Path [默认 /ws]: " WS_PATH
     WS_PATH=${WS_PATH:-/ws}
 
-    read -p "请输入 WebSocket Host (可留空): " WS_HOST
+
 
     UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
 
@@ -169,6 +172,8 @@ echo -e "${GREEN}✅ VMess-WS 节点已启动${RESET}"
 echo -e "${YELLOW}🌐 地址: ${DOMAIN}${RESET}"
 echo -e "${YELLOW}🔌 端口: ${PORT}${RESET}"
 echo -e "${YELLOW}🆔 UUID: ${UUID}${RESET}"
+echo -e "${YELLOW}🌐 Host: $WS_HOST${RESET}"
+echo -e "${YELLOW}🌐 path: $WS_PATH${RESET}"
 echo
 
 echo -e "${YELLOW}📄 V2rayN链接:${RESET}"
@@ -213,7 +218,7 @@ view_node_info() {
         echo -e "${RED}未找到节点信息${RESET}"
         read -p "按回车返回菜单..."
         return
-    }
+    fi
 
     echo
     echo -e "${GREEN}=== 节点信息 ===${RESET}"

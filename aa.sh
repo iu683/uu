@@ -1,42 +1,13 @@
 #!/bin/bash
-# ========================================
-# Windows Docker 一键管理脚本
-# ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="windows"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+APP_DIR="/opt/rbot"
+SCRIPT="$APP_DIR/sh_client_bot.sh"
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
-}
-
-check_kvm() {
-    if [ ! -e /dev/kvm ]; then
-        echo -e "${RED}未检测到 /dev/kvm，服务器不支持虚拟化${RESET}"
-        exit 1
-    fi
-}
-
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
 
 get_public_ip() {
     local ip
@@ -53,166 +24,167 @@ get_public_ip() {
     echo "无法获取公网 IP 地址。" && return
 }
 
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== Windows Docker 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
+install_bot() {
 
-install_app() {
+echo -e "${GREEN}开始安装 RBot...${RESET}"
 
-    check_docker
-    check_kvm
+mkdir -p $APP_DIR
+cd $APP_DIR
 
-    mkdir -p "$APP_DIR/storage"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
+# 安装依赖
+if ! command -v java &>/dev/null; then
+    echo -e "${YELLOW}安装 Java 环境...${RESET}"
+    
+    if command -v apt &>/dev/null; then
+        apt update
+        apt install -y openjdk-11-jre wget curl
+    elif command -v yum &>/dev/null; then
+        yum install -y java-11-openjdk wget curl
     fi
+fi
 
-    echo
-    echo -e "${GREEN}请选择 Windows 系统版本${RESET}"
-    echo -e "${GREEN}1) Windows 11${RESET}"
-    echo -e "${GREEN}2) Windows 10${RESET}"
-    echo -e "${GREEN}3) Windows Server 2022${RESET}"
-    echo -e "${GREEN}4) 自定义版本${RESET}"
-    read -p "请选择 [默认:1]: " sys_choice
+# 下载脚本
+wget -O sh_client_bot.sh https://github.com/semicons/java_oci_manage/releases/latest/download/sh_client_bot.sh
 
-    case $sys_choice in
-        2)
-            VERSION="10"
-            ;;
-        3)
-            VERSION="2022"
-            ;;
-        4)
-            read -p "请输入 Windows 版本号 (如: 11): " VERSION
-            if [ -z "$VERSION" ]; then
-                VERSION="11"
-            fi
-            ;;
-        *)
-           VERSION="11"
-           ;;
-    esac
+chmod +x sh_client_bot.sh
 
-    read -p "请输入 Web 控制台端口 [默认:8006]: " input_port
-    PORT=${input_port:-8006}
-    check_port "$PORT" || return
 
-    read -p "请输入 RDP 端口 [默认:3389]: " input_rdp
-    RDP_PORT=${input_rdp:-3389}
-    check_port "$RDP_PORT" || return
+SERVER_IP=$(get_public_ip)
+echo
+echo -e "${GREEN}安装完成${RESET}"
+echo -e "${YELLOW}配置文件:$APP_DIR/client_config${RESET}"
+echo -e "${YELLOW}访问地址:https://${SERVER_IP}:9527${RESET}"
+echo -e "${YELLOW}完成配置，再选择2启动${RESET}"
+echo
 
-    read -p "请输入 Windows 用户名 [默认:bill]: " input_user
-    USERNAME=${input_user:-bill}
-
-    read -p "请输入 Windows 密码 [默认:gates]: " input_pass
-    PASSWORD=${input_pass:-gates}
-
-    read -p "请输入 CPU 核心数 [默认:4]: " input_cpu
-    CPU=${input_cpu:-4}
-
-    read -p "请输入内存大小 [默认:8G]: " input_ram
-    RAM=${input_ram:-8G}
-
-    read -p "请输入磁盘大小 [默认:64G]: " input_disk
-    DISK=${input_disk:-64G}
-
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  windows:
-    image: dockurr/windows
-    container_name: windows
-    restart: unless-stopped
-    environment:
-      VERSION: "$VERSION"
-      USERNAME: "$USERNAME"
-      PASSWORD: "$PASSWORD"
-      LANGUAGE: "CN"
-      RAM_SIZE: "$RAM"
-      CPU_CORES: "$CPU"
-      DISK_SIZE: "$DISK"
-    devices:
-      - /dev/kvm
-      - /dev/net/tun
-    cap_add:
-      - NET_ADMIN
-    ports:
-      - "${PORT}:8006"
-      - "${RDP_PORT}:3389/tcp"
-      - "${RDP_PORT}:3389/udp"
-    volumes:
-      - ./storage:/storage
-EOF
-
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    SERVER_IP=$(get_public_ip)
-
-    echo
-    echo -e "${GREEN}✅ Windows 已启动${RESET}"
-    echo -e "${YELLOW}🌐 Web 控制台: http://${SERVER_IP}:${PORT}${RESET}"
-    echo -e "${YELLOW}🖥 RDP: ${SERVER_IP}:${RDP_PORT}${RESET}"
-    echo -e "${GREEN}👤 用户名: $USERNAME${RESET}"
-    echo -e "${GREEN}🔑 密码: $PASSWORD${RESET}"
-    echo -e "${GREEN}💿 系统版本: Windows $VERSION${RESET}"
-
-    read -p "按回车返回菜单..."
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ Windows 更新完成${RESET}"
-    read -p "按回车返回菜单..."
+check_install() {
+
+if [ ! -f "$SCRIPT" ]; then
+    echo -e "${RED}RBot 未安装，请先安装${RESET}"
+    return 1
+fi
+
+cd $APP_DIR
+return 0
 }
 
-restart_app() {
-    docker restart windows
-    echo -e "${GREEN}✅ Windows 已重启${RESET}"
-    read -p "按回车返回菜单..."
+start_bot() {
+check_install || return
+bash sh_client_bot.sh
 }
 
-view_logs() {
-    docker logs -f windows
+status_bot() {
+check_install || return
+bash sh_client_bot.sh status
 }
 
-check_status() {
-    docker ps | grep windows
-    read -p "按回车返回菜单..."
+log_bot() {
+check_install || return
+bash sh_client_bot.sh log
 }
 
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Windows 已彻底卸载${RESET}"
-    read -p "按回车返回菜单..."
+stop_bot() {
+check_install || return
+bash sh_client_bot.sh stop
 }
+
+restart_bot() {
+check_install || return
+bash sh_client_bot.sh restart
+}
+
+upgrade_bot() {
+check_install || return
+bash sh_client_bot.sh upgrade
+}
+
+uninstall_bot() {
+
+check_install || return
+
+read -rp "$(echo -e ${RED}确定卸载 RBot？[y/N]: ${RESET})" confirm
+
+if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+    bash sh_client_bot.sh uninstall
+    rm -rf $APP_DIR
+    echo -e "${GREEN}已卸载${RESET}"
+fi
+
+}
+
+menu() {
+
+clear
+
+echo -e "${GREEN}================================${RESET}"
+echo -e "${GREEN}      RBot 管理脚本${RESET}"
+echo -e "${GREEN}================================${RESET}"
+echo -e "${YELLOW}1.安装 RBot${RESET}"
+echo -e "${YELLOW}2.启动${RESET}"
+echo -e "${YELLOW}3.查看状态${RESET}"
+echo -e "${YELLOW}4.查看日志${RESET}"
+echo -e "${YELLOW}5.停止${RESET}"
+echo -e "${YELLOW}6.重启${RESET}"
+echo -e "${YELLOW}7.升级${RESET}"
+echo -e "${YELLOW}8.卸载${RESET}"
+echo -e "${YELLOW}0.退出${RESET}"
+read -rp "$(echo -e ${GREEN}请输入选项:${RESET} )" choice
+
+}
+
+while true
+do
 
 menu
+
+case $choice in
+
+1)
+install_bot
+;;
+
+2)
+start_bot
+;;
+
+3)
+status_bot
+;;
+
+4)
+log_bot
+;;
+
+5)
+stop_bot
+;;
+
+6)
+restart_bot
+;;
+
+7)
+upgrade_bot
+;;
+
+8)
+uninstall_bot
+;;
+
+0)
+exit
+;;
+
+*)
+echo -e "${RED}无效选项${RESET}"
+;;
+
+esac
+
+echo
+read -rp "按回车返回菜单..." temp
+
+done

@@ -1,737 +1,278 @@
-#!/usr/bin/env bash
-PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
-export PATH
+#!/bin/bash
+set -e
 
-# ────────────────────────── 颜色定义 ──────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;36m'
-CYAN='\033[0;96m'
-BOLD='\033[1m'
-PLAIN='\033[0m'
+# ==========================================================
+# VPS 全能一键优化脚本 - 最终完善版
+# ==========================================================
 
-sh_ver="2.0.0"
+# -----------------------------
+# 1. 颜色与基础变量定义
+# -----------------------------
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+CYAN="\033[36m"
+RESET="\033[0m"
+NC="\033[0m"
 
-# ────────────────────────── 通用工具函数 ──────────────────────────
-info()    { echo -e "${BLUE}[INFO]${PLAIN}  $*"; }
-ok()      { echo -e "${GREEN}[  OK]${PLAIN}  $*"; }
-warn()    { echo -e "${YELLOW}[WARN]${PLAIN}  $*"; }
-error()   { echo -e "${RED}[FAIL]${PLAIN}  $*"; }
-die()     { error "$*"; exit 1; }
+LOG_FILE="/var/log/vps_setup.log"
+TIMEZONE="Asia/Shanghai"
+BBR_MODE="optimized"
+PRIMARY_DNS_V4="8.8.8.8"
+SECONDARY_DNS_V4="1.1.1.1"
 
+# 常用工具依赖列表
+deps=(curl wget git net-tools lsof tar unzip rsync pv sudo nc dnsutils iperf3 mtr jq openssl)
 
-# ────────────────────────── Root 权限检查 ──────────────────────────
-[[ $EUID -ne 0 ]] && die "请使用 root 用户运行此脚本"
+# -----------------------------
+# 2. 基础辅助函数
+# -----------------------------
+log() {
+    echo -e "$1"
+    echo -e "$1" | sed 's/\\033\[[0-9;]*m//g' >> "$LOG_FILE"
+}
 
-# ────────────────────────── curl 自举安装 ──────────────────────────
-if ! command -v curl &>/dev/null; then
-    warn "未检测到 curl，正在自动安装..."
-    if command -v apt-get &>/dev/null; then
-        apt-get update -qq && apt-get install -y curl -qq
-    elif command -v yum &>/dev/null; then
-        yum install -y curl -q
-    fi
-    command -v curl &>/dev/null || die "curl 安装失败，请手动安装后重试"
-    ok "curl 安装完成"
-fi
-
-# ────────────────────────── 系统信息检测 ──────────────────────────
-if [[ -f /etc/os-release ]]; then
-    . /etc/os-release
-    OS=$ID
-    VER=$VERSION_ID
-elif [[ -f /etc/redhat-release ]]; then
-    OS="centos"
-    VER=$(grep -oE '[0-9]+' /etc/redhat-release | head -1)
-else
-    die "不支持的操作系统"
-fi
-
-ARCH=$(uname -m)
-[[ $ARCH == "x86_64" ]] && ARCH_NAME="amd64" || ARCH_NAME=$ARCH
-
-# ────────────────────────── 依赖检查与安装 ──────────────────────────
-check_dependencies() {
-    hr
-    info "检查系统依赖..."
-
-    if [[ "$OS" =~ centos|rhel|fedora ]]; then
-        PKG_INSTALL="yum install -y -q"
-        DEPS="ca-certificates wget curl"
-    elif [[ "$OS" =~ debian|ubuntu ]]; then
-        PKG_INSTALL="apt-get install -y -qq"
-        DEPS="ca-certificates wget curl"
-    else
-        warn "未知包管理器，跳过依赖检查"
-        return 0
-    fi
-
-    local need_install=()
-    for dep in $DEPS; do
-        local installed=0
-        if [[ "$dep" == "ca-certificates" ]]; then
-            [[ -f /etc/ssl/certs/ca-certificates.crt || -f /etc/pki/tls/certs/ca-bundle.crt ]] && installed=1
-        else
-            command -v "$dep" &>/dev/null && installed=1
-        fi
-        [[ $installed -eq 0 ]] && need_install+=("$dep")
-    done
-
-    if [[ ${#need_install[@]} -gt 0 ]]; then
-        warn "缺少依赖: ${need_install[*]}，正在安装..."
-        if [[ "$OS" =~ debian|ubuntu ]]; then
-            apt-get update -qq
-            $PKG_INSTALL "${need_install[@]}"
-            update-ca-certificates 2>/dev/null
-        else
-            $PKG_INSTALL "${need_install[@]}"
-            update-ca-trust force-enable 2>/dev/null
-        fi
-        [[ $? -eq 0 ]] && ok "依赖安装完成" || warn "部分依赖安装失败，可能影响运行"
-    else
-        ok "所有依赖已就绪"
+root_check() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "${RED}❌ 请使用 root 用户运行此脚本${RESET}"
+        exit 1
     fi
 }
 
-hr() {
-    echo -e "${GREEN}─────────────────────────────────────────────────${PLAIN}"
+detect_country() {
+    local country=$(curl -s --max-time 5 ipinfo.io/country)
+    echo "${country:-OTHER}"
 }
 
-# ────────────────────────── 虚拟化检测 ──────────────────────────
-check_virt() {
-    hr
-    info "检测虚拟化类型..."
-
-    if command -v systemd-detect-virt &>/dev/null; then
-        virt_type=$(systemd-detect-virt)
-    elif command -v virt-what &>/dev/null; then
-        virt_type=$(virt-what | head -1)
-    elif grep -q "openvz" /proc/vz/version 2>/dev/null || grep -q "openvz" /proc/cpuinfo 2>/dev/null; then
-        virt_type="openvz"
-    else
-        virt_type="unknown"
-    fi
-
-    ok "虚拟化类型: ${BOLD}${virt_type}${PLAIN}"
-
-    if [[ "$virt_type" == "openvz" ]]; then
-        echo ""
-        echo -e "${RED}  ┌─────────────────────────────────────────────────┐${PLAIN}"
-        echo -e "${RED}  │  ⚠  警告：检测到 OpenVZ 虚拟化                  │${PLAIN}"
-        echo -e "${RED}  │     OpenVZ 容器无法更换内核，无法启用 BBR        │${PLAIN}"
-        echo -e "${RED}  │     建议更换为 KVM / Xen 虚拟化的 VPS            │${PLAIN}"
-        echo -e "${RED}  └─────────────────────────────────────────────────┘${PLAIN}"
-        echo ""
-        read -rp "  是否继续（可能失败）? [y/N]: " continue_openvz
-        [[ ! "$continue_openvz" =~ ^[Yy]$ ]] && exit 1
-    fi
-}
-
-# ────────────────────────── /boot 空间检查 ──────────────────────────
-check_boot_space() {
-    hr
-    info "检查 /boot 分区空间..."
-    local boot_available
-    boot_available=$(df -m /boot 2>/dev/null | tail -1 | awk '{print $4}')
-
-    if [[ -n "$boot_available" ]]; then
-        if [[ $boot_available -lt 100 ]]; then
-            warn "/boot 空间不足（可用: ${boot_available}MB），建议清理旧内核后再继续"
-            read -rp "  是否继续? [y/N]: " continue_boot
-            [[ ! "$continue_boot" =~ ^[Yy]$ ]] && exit 1
-        else
-            ok "/boot 空间充足（可用: ${boot_available}MB）"
-        fi
-    fi
-}
-
-# ────────────────────────── 网络连通性检查 ──────────────────────────
-check_network() {
-    hr
-    info "检查网络连接..."
-
-    # 使用海外可靠节点检测
-    local test_hosts=(
-        "https://www.google.com"
-        "https://cloudflare.com"
-        "https://github.com"
-        "https://1.1.1.1"
-    )
-
-    for host in "${test_hosts[@]}"; do
-        if curl -s --connect-timeout 5 --max-time 8 "$host" > /dev/null 2>&1; then
-            ok "网络连接正常（${host}）"
-            return 0
-        fi
-    done
-
-    if ping -c 2 -W 3 8.8.8.8 > /dev/null 2>&1; then
-        warn "IP 可达但 HTTPS 访问受限，请检查防火墙/DNS"
-        return 0
-    fi
-
-    error "网络连接失败，请检查网络配置"
-    return 1
-}
-
-# ────────────────────────── CentOS EOL 源修复（改用官方 Vault）──────────────────────────
-fixCentOSRepo() {
-    [[ ! "$OS" =~ centos ]] && return
-    [[ "$VER" != "6" && "$VER" != "7" && "$VER" != "8" ]] && return
-
-    hr
-    warn "CentOS ${VER} 官方源已停服，切换到官方 Vault 源..."
-    mkdir -p /etc/yum.repos.d/backup
-    mv /etc/yum.repos.d/CentOS-*.repo /etc/yum.repos.d/backup/ 2>/dev/null
-
-    local vault_base="https://vault.centos.org"
-
-    if [[ "$VER" == "7" ]]; then
-        cat > /etc/yum.repos.d/CentOS-Vault.repo <<EOF
-[base]
-name=CentOS-7-Vault-Base
-baseurl=${vault_base}/7.9.2009/os/\$basearch/
-gpgcheck=0
-enabled=1
-
-[updates]
-name=CentOS-7-Vault-Updates
-baseurl=${vault_base}/7.9.2009/updates/\$basearch/
-gpgcheck=0
-enabled=1
-
-[extras]
-name=CentOS-7-Vault-Extras
-baseurl=${vault_base}/7.9.2009/extras/\$basearch/
-gpgcheck=0
-enabled=1
-EOF
-    elif [[ "$VER" == "6" ]]; then
-        cat > /etc/yum.repos.d/CentOS-Vault.repo <<EOF
-[base]
-name=CentOS-6-Vault-Base
-baseurl=${vault_base}/6.10/os/\$basearch/
-gpgcheck=0
-enabled=1
-
-[updates]
-name=CentOS-6-Vault-Updates
-baseurl=${vault_base}/6.10/updates/\$basearch/
-gpgcheck=0
-enabled=1
-EOF
-    elif [[ "$VER" == "8" ]]; then
-        cat > /etc/yum.repos.d/CentOS-Vault.repo <<EOF
-[baseos]
-name=CentOS-8-Vault-BaseOS
-baseurl=${vault_base}/8.5.2111/BaseOS/\$basearch/os/
-gpgcheck=0
-enabled=1
-
-[appstream]
-name=CentOS-8-Vault-AppStream
-baseurl=${vault_base}/8.5.2111/AppStream/\$basearch/os/
-gpgcheck=0
-enabled=1
-
-[extras]
-name=CentOS-8-Vault-Extras
-baseurl=${vault_base}/8.5.2111/extras/\$basearch/os/
-gpgcheck=0
-enabled=1
-EOF
-    fi
-
-    yum clean all >/dev/null 2>&1
-    ok "CentOS ${VER} Vault 源配置完成（使用官方 vault.centos.org）"
-}
-
-# ────────────────────────── BBR 状态检测 ──────────────────────────
-check_bbr_status() {
-    local cc
-    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    [[ "$cc" == "bbr" ]]
-}
-
-# ────────────────────────── 内核版本检测 ──────────────────────────
-check_kernel_native_bbr() {
-    local kver major minor
-    kver=$(uname -r | cut -d- -f1)
-    major=$(echo "$kver" | cut -d. -f1)
-    minor=$(echo "$kver" | cut -d. -f2)
-
-    if [[ $major -gt 5 ]] || [[ $major -eq 5 && $minor -ge 4 ]]; then
-        ok "内核 ${kver} 原生支持 BBR（最佳）"
-        return 0
-    elif [[ $major -eq 4 && $minor -ge 9 ]] || [[ $major -ge 5 ]]; then
-        warn "内核 ${kver} 支持 BBR（建议升级到 5.4+）"
+is_kernel_version_ge() {
+    local test_ver=$1
+    local current_ver=$(uname -r | cut -d'-' -f1)
+    if [[ "$(printf '%s\n' "$test_ver" "$current_ver" | sort -V | head -n1)" == "$test_ver" ]]; then
         return 0
     else
-        error "内核 ${kver} 不支持 BBR，需要升级内核"
         return 1
     fi
 }
 
-# ────────────────────────── 启用 BBR ──────────────────────────
-enable_bbr() {
-    hr
-    if check_bbr_status; then
-        ok "BBR 已处于启用状态，无需重复操作"
-        return 0
-    fi
-
-    check_kernel_native_bbr || { warn "请先升级内核再启用 BBR"; return 1; }
-
-    info "正在写入 BBR 配置..."
-
-    cat > /etc/sysctl.d/99-bbr.conf <<'EOF'
-# ── BBR 拥塞控制 ──
-net.core.default_qdisc         = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# ── 发送 / 接收缓冲区 ──
-net.core.rmem_max               = 33554432
-net.core.wmem_max               = 33554432
-net.ipv4.tcp_rmem               = 4096 87380 33554432
-net.ipv4.tcp_wmem               = 4096 65536 33554432
-
-# ── 连接队列 ──
-net.core.netdev_max_backlog     = 10000
-net.ipv4.tcp_max_syn_backlog    = 8192
-net.core.somaxconn              = 8192
-
-# ── TCP 快速选项 ──
-net.ipv4.tcp_fastopen           = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-EOF
-
-    sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1
-
-    if check_bbr_status; then
-        echo ""
-        echo -e "${GREEN}  ┌─────────────────────────────────────────────────┐${PLAIN}"
-        echo -e "${GREEN}  │  ✅  BBR 启用成功！网络加速已生效               │${PLAIN}"
-        echo -e "${GREEN}  └─────────────────────────────────────────────────┘${PLAIN}"
-        echo ""
-    else
-        error "BBR 启用失败，请检查内核版本是否 ≥ 4.9"
-        return 1
-    fi
-}
-
-# ────────────────────────── TCP 深度调优 ──────────────────────────
-tcp_tune() {
-    hr
-    info "正在应用 TCP 深度调优..."
-    echo ""
-    echo -e "${YELLOW}  本操作将优化以下参数：${PLAIN}"
-    echo "    • TIME_WAIT 连接回收与复用"
-    echo "    • TCP 连接保活 (keepalive)"
-    echo "    • MTU 探测 & PMTU"
-    echo "    • 本地端口范围扩展"
-    echo "    • SYN Cookie 防 SYN Flood"
-    echo "    • 连接追踪表 (nf_conntrack)"
-    echo "    • 文件描述符上限"
-    echo ""
-    read -rp "  确认写入? [y/N]: " confirm_tune
-    [[ ! "$confirm_tune" =~ ^[Yy]$ ]] && { warn "已取消"; return; }
-
-    cat > /etc/sysctl.d/99-tcp-tune.conf <<'EOF'
-
-# ── TIME_WAIT ──────────────────────────────
-# 加快 TIME_WAIT 回收（仅在 NAT 环境关闭）
-net.ipv4.tcp_tw_reuse           = 1
-# TIME_WAIT 最大数量，超出直接丢弃
-net.ipv4.tcp_max_tw_buckets     = 20000
-
-# ── 连接保活 ───────────────────────────────
-# 空闲 60s 后开始发送 keepalive 探测包
-net.ipv4.tcp_keepalive_time     = 60
-# 探测间隔 10s
-net.ipv4.tcp_keepalive_intvl    = 10
-# 最多探测 6 次无响应则断开
-net.ipv4.tcp_keepalive_probes   = 6
-
-# ── SYN 握手 ───────────────────────────────
-# SYN Cookie 防 SYN Flood
-net.ipv4.tcp_syncookies         = 1
-# SYN 重试次数
-net.ipv4.tcp_syn_retries        = 3
-net.ipv4.tcp_synack_retries     = 3
-# SYN 等待队列
-net.ipv4.tcp_max_syn_backlog    = 8192
-net.core.somaxconn              = 8192
-
-# ── 端口范围 ───────────────────────────────
-net.ipv4.ip_local_port_range    = 1024 65535
-
-# ── MTU 探测（推荐开启，减少分片）──────────
-net.ipv4.tcp_mtu_probing        = 1
-
-# ── 内存与缓冲区 ───────────────────────────
-net.core.rmem_default           = 262144
-net.core.wmem_default           = 262144
-net.core.rmem_max               = 33554432
-net.core.wmem_max               = 33554432
-net.ipv4.tcp_rmem               = 4096 87380 33554432
-net.ipv4.tcp_wmem               = 4096 65536 33554432
-net.ipv4.tcp_mem                = 786432 1048576 26777216
-
-# ── 连接队列/网卡接收队列 ──────────────────
-net.core.netdev_max_backlog     = 10000
-
-# ── TCP 选项 ───────────────────────────────
-# 启用 TCP Fast Open
-net.ipv4.tcp_fastopen           = 3
-# 关闭空闲后慢启动（提升长肥管道性能）
-net.ipv4.tcp_slow_start_after_idle = 0
-# 选择性确认（提升丢包恢复效率）
-net.ipv4.tcp_sack               = 1
-# 时间戳（配合 tw_reuse 使用）
-net.ipv4.tcp_timestamps         = 1
-# 窗口扩展（大带宽必备）
-net.ipv4.tcp_window_scaling     = 1
-# 有序 ACK
-net.ipv4.tcp_no_metrics_save    = 1
-
-# ── 连接追踪表（如有 nf_conntrack 模块）──────
-net.netfilter.nf_conntrack_max              = 1000000
-net.netfilter.nf_conntrack_tcp_timeout_established = 7200
-
-# ── 文件描述符 ─────────────────────────────
-fs.file-max                     = 1000000
-EOF
-
-    # 应用参数（忽略不支持的 nf_conntrack，模块未加载时可能报错）
-    sysctl --system 2>/dev/null | grep -v "^sysctl:" | grep -v "No such file" | grep -v "nf_conntrack" | grep "=" | head -20 || true
-    sysctl -p /etc/sysctl.d/99-tcp-tune.conf 2>/dev/null || sysctl -p /etc/sysctl.d/99-tcp-tune.conf 2>&1 | grep -v "nf_conntrack" >/dev/null
-
-    # 提升系统文件描述符限制（持久化）
-    if ! grep -q "# tcp-tune" /etc/security/limits.conf 2>/dev/null; then
-        cat >> /etc/security/limits.conf <<'EOF'
-
-# tcp-tune: 提升文件描述符限制
-* soft nofile 1000000
-* hard nofile 1000000
-root soft nofile 1000000
-root hard nofile 1000000
-EOF
-    fi
-
-    echo ""
-    echo -e "${GREEN}  ┌─────────────────────────────────────────────────┐${PLAIN}"
-    echo -e "${GREEN}  │  ✅  TCP 调优配置已写入                         │${PLAIN}"
-    echo -e "${GREEN}  │     配置文件: /etc/sysctl.d/99-tcp-tune.conf    │${PLAIN}"
-    echo -e "${GREEN}  │     无需重启，参数立即生效                       │${PLAIN}"
-    echo -e "${GREEN}  └─────────────────────────────────────────────────┘${PLAIN}"
-    echo ""
-}
-
-# ────────────────────────── Ubuntu/Debian 升级内核 ──────────────────────────
-upgrade_kernel_debian() {
-    hr
-    info "为 $OS $VER 升级内核..."
-
-    local kver major minor
-    kver=$(uname -r | cut -d- -f1)
-    major=$(echo "$kver" | cut -d. -f1)
-    minor=$(echo "$kver" | cut -d. -f2)
-
-    if [[ $major -gt 5 ]] || [[ $major -eq 5 && $minor -ge 4 ]]; then
-        ok "当前内核 ${kver} 已满足要求，直接启用 BBR"
-        enable_bbr
-        return 0
-    fi
-
-    info "使用官方镜像源更新软件包列表..."
-
-    # 恢复/使用官方源（海外 VPS 直连官方源更可靠）
-    if [[ "$OS" == "ubuntu" ]]; then
-        sed -i 's|https\?://mirrors\.[a-z0-9.]*\.[a-z]*/ubuntu|http://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list 2>/dev/null
-    elif [[ "$OS" == "debian" ]]; then
-        sed -i 's|https\?://mirrors\.[a-z0-9.]*\.[a-z]*/debian|http://deb.debian.org/debian|g' /etc/apt/sources.list 2>/dev/null
-    fi
-
-    apt-get update -qq
-
-    local DPKG_ARCH
-    DPKG_ARCH=$(dpkg --print-architecture)
-
-    if [[ "$OS" == "ubuntu" ]]; then
-        case "$VER" in
-            20.*|22.*|24.*)
-                info "安装 linux-generic（Ubuntu ${VER}）..."
-                apt-get install -y linux-generic ;;
-            18.*)
-                info "安装 HWE 内核（Ubuntu 18.04）..."
-                apt-get install -y --install-recommends linux-generic-hwe-18.04 ;;
-            *)
-                info "安装通用内核..."
-                apt-get install -y --install-recommends linux-generic-hwe-16.04 2>/dev/null || \
-                apt-get install -y linux-generic ;;
-        esac
-    elif [[ "$OS" == "debian" ]]; then
-        info "安装 linux-image-${DPKG_ARCH}..."
-        apt-get install -y linux-image-"$DPKG_ARCH"
-    fi
-
-    if [[ $? -eq 0 ]]; then
-        echo ""
-        echo -e "${GREEN}  ┌─────────────────────────────────────────────────┐${PLAIN}"
-        echo -e "${GREEN}  │  ✅  内核升级完成，请重启后再启用 BBR           │${PLAIN}"
-        echo -e "${GREEN}  └─────────────────────────────────────────────────┘${PLAIN}"
-        echo ""
-    else
-        error "内核升级失败"
-        return 1
-    fi
-}
-
-# ────────────────────────── CentOS 升级内核 ──────────────────────────
-upgrade_kernel_centos() {
-    hr
-
-    if [[ -n "$VER" && "$VER" -ge 8 ]] 2>/dev/null; then
-        echo ""
-        echo -e "${RED}  ┌─────────────────────────────────────────────────────┐${PLAIN}"
-        echo -e "${RED}  │  ⚠  不支持 CentOS ${VER}+ 内核升级                   │${PLAIN}"
-        echo -e "${RED}  │     CentOS 8+ 已停止维护，强升内核易导致系统损坏     │${PLAIN}"
-        echo -e "${YELLOW}  │                                                     │${PLAIN}"
-        echo -e "${YELLOW}  │  推荐迁移至：                                       │${PLAIN}"
-        echo -e "${GREEN}  │    ✔  Ubuntu 20.04 / 22.04 / 24.04                │${PLAIN}"
-        echo -e "${GREEN}  │    ✔  Debian 11 / 12                              │${PLAIN}"
-        echo -e "${GREEN}  │    ✔  Rocky Linux 8/9 / AlmaLinux 8/9             │${PLAIN}"
-        echo -e "${RED}  └─────────────────────────────────────────────────────┘${PLAIN}"
-        echo ""
-        read -n1 -rp "  按任意键返回..." _; return 1
-    fi
-
-    info "为 CentOS $VER 升级内核..."
-
-    local kver major minor
-    kver=$(uname -r | cut -d- -f1)
-    major=$(echo "$kver" | cut -d. -f1)
-    minor=$(echo "$kver" | cut -d. -f2)
-
-    if [[ $major -gt 5 ]] || [[ $major -eq 5 && $minor -ge 4 ]]; then
-        ok "内核 ${kver} 已支持 BBR，直接启用"
-        enable_bbr
-        return 0
-    fi
-
-    fixCentOSRepo
-
-    if [[ "$VER" == "7" ]]; then
-        grep -q "^timeout=" /etc/yum.conf || echo "timeout=60" >> /etc/yum.conf
-        grep -q "^retries=" /etc/yum.conf || echo "retries=3"  >> /etc/yum.conf
-
-        info "导入 ELRepo GPG 密钥（官方）..."
-        rpm --import https://www.elrepo.org/RPM-GPG-KEY-elrepo.org 2>/dev/null
-
-        info "安装 ELRepo 源（官方）..."
-        yum install -y https://www.elrepo.org/elrepo-release-7.el7.elrepo.noarch.rpm 2>/dev/null || \
-            { error "ELRepo 安装失败"; return 1; }
-
-        yum clean all -q
-
-        echo ""
-        echo -e "${YELLOW}  ┌─────────────────────────────────────────────────┐${PLAIN}"
-        echo -e "${YELLOW}  │  ℹ  正在下载内核（约 150-200MB），请耐心等待   │${PLAIN}"
-        echo -e "${YELLOW}  │     如长时间无进度，可按 Ctrl+C 中断重试        │${PLAIN}"
-        echo -e "${YELLOW}  └─────────────────────────────────────────────────┘${PLAIN}"
-        echo ""
-
-        local attempt=1 success=0
-        while [[ $attempt -le 3 ]]; do
-            info "尝试安装内核（第 ${attempt}/3 次）..."
-            yum --enablerepo=elrepo-kernel install -y kernel-ml kernel-ml-devel && success=1 && break
-            error "安装失败，${attempt}/3 次"; yum clean all -q; ((attempt++)); sleep 3
-        done
-
-        if [[ $success -eq 1 ]]; then
-            grub2-set-default 0
-            grub2-mkconfig -o /boot/grub2/grub.cfg
-            echo ""
-            echo -e "${GREEN}  ✅  内核升级完成，请重启后再启用 BBR${PLAIN}"
-            echo ""
-        else
-            error "内核升级失败（3 次均未成功），请手动操作或更换系统"
-            return 1
-        fi
-    else
-        error "CentOS $VER 不支持自动升级内核"
-        return 1
-    fi
-}
-
-# ────────────────────────── 清理旧内核 ──────────────────────────
-remove_old_kernels() {
-    hr
-    info "检测已安装内核..."
-
-    if [[ "$OS" =~ centos|rhel ]]; then
-        local installed_kernels kernel_count old_kernels
-        installed_kernels=$(rpm -qa | grep '^kernel-[0-9]' | sort -V)
-        kernel_count=$(echo "$installed_kernels" | wc -l)
-
-        if [[ $kernel_count -gt 2 ]]; then
-            echo ""
-            warn "发现 ${kernel_count} 个内核，将保留最新 2 个，以下内核将被删除："
-            echo "$installed_kernels" | head -n -2 | sed 's/^/    /'
-            echo ""
-            read -rp "  确认删除? [y/N]: " confirm_remove
-            if [[ "$confirm_remove" =~ ^[Yy]$ ]]; then
-                old_kernels=$(echo "$installed_kernels" | head -n -2)
-                [[ -n "$old_kernels" ]] && echo "$old_kernels" | xargs yum remove -y -q
-                ok "旧内核清理完成"
-            else
-                warn "已取消"
-            fi
-        else
-            ok "当前内核数量 ${kernel_count} 个，无需清理"
-        fi
-
-    elif [[ "$OS" =~ debian|ubuntu ]]; then
-        local current_kernel installed_kernels
-        current_kernel=$(uname -r)
-        installed_kernels=$(dpkg -l | grep 'linux-image-[0-9]' | awk '{print $2}')
-
-        echo ""
-        info "当前运行内核: ${BOLD}${current_kernel}${PLAIN}"
-        info "已安装内核列表："
-        echo "$installed_kernels" | sed 's/^/    /'
-        echo ""
-        read -rp "  清理非当前内核? [y/N]: " confirm_remove
-        if [[ "$confirm_remove" =~ ^[Yy]$ ]]; then
-            for kernel in $installed_kernels; do
-                if [[ "$kernel" != *"$current_kernel"* ]]; then
-                    info "移除: $kernel"
-                    apt-get purge -y "$kernel" -qq 2>/dev/null
+# -----------------------------
+# 3. 系统更新与依赖安装
+# -----------------------------
+update_system() {
+    log "\n${YELLOW}=============== 1. 系统更新与依赖 ===============${RESET}"
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        ID_LOWER=${ID,,}
+        if [[ "$ID_LOWER" =~ debian|ubuntu ]]; then
+            OS_TYPE="debian"
+            apt update && apt upgrade -y
+            for pkg in "${deps[@]}"; do
+                if ! dpkg -s "$pkg" &>/dev/null; then
+                    if [ "$pkg" = "nc" ]; then apt install -y netcat-openbsd; 
+                    elif [ "$pkg" = "iperf3" ]; then
+                        echo "iperf3 iperf3/start_daemon boolean false" | debconf-set-selections
+                        apt install -y iperf3
+                    else apt install -y "$pkg"; fi
                 fi
             done
-            apt-get autoremove -y -qq
-            ok "旧内核清理完成"
-        else
-            warn "已取消"
+        elif [[ "$ID_LOWER" =~ fedora|centos|rhel|rocky|almalinux ]]; then
+            OS_TYPE="rhel"
+            yum upgrade -y || dnf upgrade -y
+            for pkg in "${deps[@]}"; do
+                ! rpm -q "$pkg" &>/dev/null && yum install -y "$pkg"
+            done
+        elif [[ "$ID_LOWER" =~ alpine ]]; then
+            OS_TYPE="alpine"
+            apk update && apk upgrade
+            for pkg in "${deps[@]}"; do
+                ! apk info -e "$pkg" &>/dev/null && apk add "$pkg"
+            done
         fi
     fi
 }
 
-# ────────────────────────── 系统状态展示 ──────────────────────────
-show_status() {
-    hr
-    local bbr_status bbr_mod qdisc cc
-    check_bbr_status  && bbr_status="${GREEN}✅ 已启用${PLAIN}" || bbr_status="${RED}❌ 未启用${PLAIN}"
-    lsmod | grep -q bbr && bbr_mod="${GREEN}✅ 已加载${PLAIN}"   || bbr_mod="${RED}❌ 未加载${PLAIN}"
-    qdisc=$(sysctl -n net.core.default_qdisc        2>/dev/null || echo "未设置")
-    cc=$(sysctl -n net.ipv4.tcp_congestion_control  2>/dev/null || echo "未设置")
-
-    printf "  ${CYAN}%-18s${PLAIN} %s\n"    "操作系统:"   "$OS $VER"
-    printf "  ${CYAN}%-18s${PLAIN} %s\n"    "系统架构:"   "$ARCH"
-    printf "  ${CYAN}%-18s${PLAIN} %s\n"    "内核版本:"   "$(uname -r)"
-    printf "  ${CYAN}%-18s${PLAIN}${bbr_status}\n" "BBR 状态:"
-    printf "  ${CYAN}%-18s${PLAIN}${bbr_mod}\n"    "BBR 模块:"
-    printf "  ${CYAN}%-18s${PLAIN} %s\n"    "队列算法:"   "$qdisc"
-    printf "  ${CYAN}%-18s${PLAIN} %s\n"    "拥塞控制:"   "$cc"
-
-    # TCP 调优状态
-    if [[ -f /etc/sysctl.d/99-tcp-tune.conf ]]; then
-        printf "  ${CYAN}%-18s${PLAIN} ${GREEN}✅ 已应用${PLAIN}\n" "TCP 调优:"
+# -----------------------------
+# 4. 设置主机名为 localhost
+# -----------------------------
+configure_hostname() {
+    log "\n${YELLOW}=============== 2. 主机名配置 ===============${NC}"
+    local new_hn="localhost"
+    hostnamectl set-hostname "$new_hn"
+    
+    # 更新 /etc/hosts 确保解析正确
+    if grep -q "127.0.1.1" /etc/hosts; then
+        sed -i "s/127.0.1.1.*/127.0.1.1\t$new_hn/" /etc/hosts
     else
-        printf "  ${CYAN}%-18s${PLAIN} ${YELLOW}⬜ 未应用${PLAIN}\n" "TCP 调优:"
+        echo -e "127.0.1.1\t$new_hn" >> /etc/hosts
     fi
-    hr
+    log "${GREEN}✅ 主机名已设置为: $new_hn${NC}"
 }
 
-# ────────────────────────── 卸载 BBR / TCP 调优 ──────────────────────────
-uninstall_bbr() {
-    warn "正在卸载 BBR / TCP 调优配置..."
+# -----------------------------
+# 5. 多系统语言与字体环境 (Locale)
+# -----------------------------
+configure_locale() {
+    log "\n${YELLOW}=============== 3. 语言环境与字体设置 ===============${RESET}"
+    log "${GREEN}正在设置英文字体环境 (en_US.UTF-8)...${RESET}"
+    
+    if [[ "$OS_TYPE" == "debian" ]]; then
+        apt-get install -y locales fonts-dejavu fonts-liberation fonts-freefont-ttf
+        grep -qxF "en_US.UTF-8 UTF-8" /etc/locale.gen || echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+        locale-gen en_US.UTF-8
+        update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+        echo -e "LANG=en_US.UTF-8\nLC_ALL=en_US.UTF-8" > /etc/default/locale
+    elif [[ "$OS_TYPE" == "rhel" ]]; then
+        yum install -y langpacks-en glibc-all-langpacks fonts-dejavu-sans-fonts
+        localectl set-locale LANG=en_US.UTF-8
+    elif [[ "$OS_TYPE" == "alpine" ]]; then
+        apk add musl-locales musl-locales-lang ttf-dejavu
+        export LANG=en_US.UTF-8
+    fi
 
-    # 删除配置文件
-    rm -f /etc/sysctl.d/99-bbr.conf
-    rm -f /etc/sysctl.d/99-tcp-tune.conf
-
-    # 重新加载 sysctl
-    sysctl --system >/dev/null 2>&1
-
-    success "已恢复系统默认 TCP 参数"
-
-    # 显示当前拥塞算法
-    algo=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    info "当前拥塞控制算法: $algo"
+    export LANG=en_US.UTF-8
+    export LC_ALL=en_US.UTF-8
+    log "${GREEN}✅ 语言环境已应用完成${RESET}"
 }
 
-# ────────────────────────── 主菜单 ──────────────────────────
-show_menu() {
+# -----------------------------
+# 6. BBR 高性能动态配置 (优化版)
+# -----------------------------
+configure_bbr() {
+    log "\n${YELLOW}=============== 4. BBR 高性能配置 ===============${NC}"
+    local config_file="/etc/sysctl.d/99-bbr.conf"
+    
+    if ! is_kernel_version_ge "4.9"; then
+        log "${RED}[ERROR] 内核版本过低，无法开启BBR${NC}"
+        return 1
+    fi
+    
+    local mem_mb=$(free -m | awk '/^Mem:/{print $2}')
+    local rmem_wmem somaxconn
+    
+    # 动态计算参数 (根据内存分级)
+    if [[ $mem_mb -ge 4096 ]]; then
+        rmem_wmem=67108864  # 64MB
+        somaxconn=65535
+    elif [[ $mem_mb -ge 1024 ]]; then
+        rmem_wmem=33554432  # 32MB
+        somaxconn=32768
+    else
+        rmem_wmem=16777216  # 16MB
+        somaxconn=16384
+    fi
+    
+    cat > "$config_file" << EOF
+# --- BBR 核心 ---
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# --- 缓冲区优化 ---
+net.core.rmem_max = ${rmem_wmem}
+net.core.wmem_max = ${rmem_wmem}
+net.ipv4.tcp_rmem = 4096 87380 ${rmem_wmem}
+net.ipv4.tcp_wmem = 4096 65536 ${rmem_wmem}
+
+# --- 连接队列与积压 ---
+net.core.somaxconn = ${somaxconn}
+net.ipv4.tcp_max_syn_backlog = ${somaxconn}
+net.core.netdev_max_backlog = ${somaxconn}
+
+# --- 连接复用与超时 ---
+net.ipv4.tcp_fin_timeout = 30
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.ip_local_port_range = 10000 65535
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_mtu_probing = 1
+EOF
+    sysctl --system >/dev/null
+    log "${GREEN}✅ BBR高性能参数已应用 (内存适配: ${mem_mb}MB)${NC}"
+}
+
+# -----------------------------
+# 7. 其他基础配置 (DNS, 时间, 防火墙, Docker)
+# -----------------------------
+configure_dns() {
+    log "\n${YELLOW}=============== 5. DNS 配置 ===============${NC}"
+    if systemctl is-active --quiet systemd-resolved; then
+        mkdir -p /etc/systemd/resolved.conf.d
+        echo -e "[Resolve]\nDNS=${PRIMARY_DNS_V4} ${SECONDARY_DNS_V4}" > /etc/systemd/resolved.conf.d/99-dns.conf
+        systemctl restart systemd-resolved
+    else
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        echo -e "nameserver ${PRIMARY_DNS_V4}\nnameserver ${SECONDARY_DNS_V4}" > /etc/resolv.conf
+    fi
+    log "${GREEN}✅ DNS 已更新${NC}"
+}
+
+enable_time_sync() {
+    log "\n${YELLOW}=============== 6. 时间同步 ===============${RESET}"
+    timedatectl set-timezone "$TIMEZONE" || true
+    [[ "$OS_TYPE" == "debian" ]] && apt install -y systemd-timesyncd && systemctl enable --now systemd-timesyncd
+    log "${GREEN}✅ 时间已同步至上海${RESET}"
+}
+
+configure_firewall() {
+    log "\n${YELLOW}=============== 7. 防火墙全开 ===============${RESET}"
+    if command -v ufw >/dev/null 2>&1; then
+        ufw --force reset && ufw default allow incoming && ufw default allow outgoing && ufw enable
+    elif command -v iptables >/dev/null 2>&1; then
+        iptables -F && iptables -X && iptables -P INPUT ACCEPT && iptables -P OUTPUT ACCEPT && iptables -P FORWARD ACCEPT
+    fi
+    log "${GREEN}✅ 防火墙限制已解除${RESET}"
+}
+
+docker_install() {
+    log "\n${CYAN}=============== 8. Docker 环境安装 ===============${RESET}"
+    local country=$(detect_country)
+    if [ "$country" = "CN" ]; then
+        curl -fsSL https://get.docker.com | sh --mirror Aliyun
+        mkdir -p /etc/docker
+        cat > /etc/docker/daemon.json << EOF
+{
+  "registry-mirrors": ["https://docker.0.unsee.tech", "https://docker.1panel.live", "https://registry.dockermirror.com"]
+}
+EOF
+    else
+        curl -fsSL https://get.docker.com | sh
+    fi
+    systemctl enable --now docker
+    
+    # Docker Compose
+    local latest=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
+    local proxy=""
+    [[ "$country" == "CN" ]] && proxy="https://ghproxy.com/"
+    curl -L "${proxy}https://github.com/docker/compose/releases/download/${latest:-v2.30.0}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+    chmod +x /usr/local/bin/docker-compose
+    log "${GREEN}✅ Docker & Compose 安装完成${RESET}"
+}
+
+# -----------------------------
+# 8. 主流程与重启
+# -----------------------------
+main() {
     clear
-    show_status
-    echo -e "  ${GREEN}1.安装启用 BBR ${PLAIN}"
-    echo -e "  ${GREEN}2.TCP 深度调优${PLAIN}"
-    echo -e "  ${GREEN}3.升级内核${PLAIN}"
-    echo -e "  ${GREEN}4.清理旧内核${PLAIN}"
-    echo -e "  ${GREEN}5.删除恢复系统默认${PLAIN}"
-    echo -e "  ${GREEN}0.退出${PLAIN}"
-    read -rp "$(echo -e ${GREEN}   请输入选项: ${PLAIN})" choice
+    root_check
+    
+    update_system
+    configure_hostname
+    configure_locale
+    configure_bbr
+    configure_dns
+    enable_time_sync
+    configure_firewall
+    docker_install
 
-    case $choice in
-        1)
-            if check_kernel_native_bbr 2>/dev/null; then
-                enable_bbr
-            else
-                warn "当前内核不支持 BBR，请先选 3 或 4 升级内核"
-            fi
-            ;;
-        2)
-            tcp_tune
-            ;;
-        3)
-            if [[ "$OS" =~ debian|ubuntu ]]; then
-                check_boot_space
-                upgrade_kernel_debian
-                read -rp "  是否现在重启? [y/N]: " reboot_now
-                [[ "$reboot_now" =~ ^[Yy]$ ]] && reboot
-            else
-                error "此选项仅适用于 Ubuntu / Debian"
-            fi
-            ;;
-        4)
-            remove_old_kernels
-            ;;
-        5)
-            uninstall_bbr
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            error "无效选项"
-            ;;
-    esac
-
+    log "\n${GREEN}✨ 脚本所有任务已执行完毕！${RESET}"
+    log "${YELLOW}系统将在 5 秒后自动重启...${RESET}"
+    
+    for i in {5..1}; do
+        echo -ne "${CYAN}$i... ${RESET}"
+        sleep 1
+    done
     echo ""
-    read -n1 -rp "  按任意键继续..." _
-    echo ""
-    show_menu
+    reboot
 }
 
-# ════════════════════════════════════════════
-#   入口：预检查 → 智能判断 → 主菜单
-# ════════════════════════════════════════════
-clear
-
-echo -e "${BLUE}  ◆ 执行环境预检查...${PLAIN}"
-echo ""
-
-check_dependencies
-check_network
-check_virt
-fixCentOSRepo
-
-echo ""
-ok "预检查完成！"
-echo ""
-sleep 1
-
-
-show_menu
+main "$@"

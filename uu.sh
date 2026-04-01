@@ -95,7 +95,7 @@ check_dependencies() {
 }
 
 hr() {
-    echo -e "${GREEN}──────────────────────────────────────────────────────${PLAIN}"
+    echo -e "${GREEN}─────────────────────────────────────────────────${PLAIN}"
 }
 
 # ────────────────────────── 虚拟化检测 ──────────────────────────
@@ -655,8 +655,6 @@ uninstall_bbr() {
     # 重新加载 sysctl
     sysctl --system >/dev/null 2>&1
 
-    success "已恢复系统默认 TCP 参数"
-
     # 显示当前拥塞算法
     algo=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     info "当前拥塞控制算法: $algo"
@@ -668,13 +666,11 @@ show_menu() {
     show_status
     echo -e "  ${GREEN}1.安装启用 BBR ${PLAIN}"
     echo -e "  ${GREEN}2.TCP 深度调优${PLAIN}"
-    echo -e "  ${GREEN}3.升级内核（Ubuntu / Debian）${PLAIN}"
-    echo -e "  ${GREEN}4.升级内核（CentOS 7）${PLAIN}"
-    echo -e "  ${GREEN}5.清理旧内核${PLAIN}"
-    echo -e "  ${GREEN}6.查看当前系统状态${PLAIN}"
-    echo -e "  ${GREEN}7.删除恢复系统默认${PLAIN}"
+    echo -e "  ${GREEN}3.升级内核${PLAIN}"
+    echo -e "  ${GREEN}4.清理旧内核${PLAIN}"
+    echo -e "  ${GREEN}5.删除恢复系统默认${PLAIN}"
     echo -e "  ${GREEN}0.退出${PLAIN}"
-    read -rp "$(echo -e ${GREEN}  请输入选项: ${PLAIN})" choice
+    read -rp "$(echo -e ${GREEN}   请输入选项: ${PLAIN})" choice
 
     case $choice in
         1)
@@ -698,22 +694,9 @@ show_menu() {
             fi
             ;;
         4)
-            if [[ "$OS" =~ centos|rhel ]]; then
-                check_boot_space
-                upgrade_kernel_centos
-                read -rp "  是否现在重启? [y/N]: " reboot_now
-                [[ "$reboot_now" =~ ^[Yy]$ ]] && reboot
-            else
-                error "此选项仅适用于 CentOS / RHEL"
-            fi
-            ;;
-        5)
             remove_old_kernels
             ;;
-        6)
-            show_status
-            ;;
-        7)
+        5)
             uninstall_bbr
             ;;
         0)
@@ -748,11 +731,5 @@ ok "预检查完成！"
 echo ""
 sleep 1
 
-# 智能判断：BBR 已启用且内核达标时，直接展示状态
-if check_bbr_status && check_kernel_native_bbr >/dev/null 2>&1; then
-    show_status
-    echo -e "${GREEN}  ✅  系统状态良好，BBR 已启用，可选择进一步 TCP 调优（选项 2）${PLAIN}"
-    echo ""
-fi
 
 show_menu

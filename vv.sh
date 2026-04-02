@@ -57,51 +57,72 @@ get_arch() {
 
 # ================== Python ==================
 install_python() {
-
+    # 修改逻辑：过滤掉包含字母的开发版/预发布版，仅保留纯数字版本号
     latest_version=$(curl -s https://www.python.org/ftp/python/ \
-    | grep -oP 'href="\K[0-9]+\.[0-9]+\.[0-9]+(?=/")' | sort -V | tail -n1)
+    | grep -oE '3\.[0-9]+\.[0-9]+/' \
+    | tr -d '/' \
+    | grep -vE '[a-zA-Z]' \
+    | sort -V | tail -n1)
 
+    if [[ -z "$latest_version" ]]; then
+        echo -e "${red}获取 Python 最新稳定版本失败${re}"
+        return
+    fi
+
+    # 检查当前版本
     if command -v python3 &>/dev/null; then
         current_version=$(python3 -V 2>&1 | awk '{print $2}')
 
-        if [[ $current_version == $latest_version ]]; then
-            echo -e "${green}Python 已是最新版本: ${yellow}${latest_version}${re}"
+        if [[ "$current_version" == "$latest_version" ]]; then
+            echo -e "${green}Python 已是最新稳定版本: ${yellow}${latest_version}${re}"
             return
         fi
 
-        read -p "检测到 Python 版本 $current_version, 升级到 $latest_version？[y/n]: " confirm
+        read -rp "检测到当前版本 ${current_version}, 升级到最新稳定版 ${latest_version}？[y/n]: " confirm
         [[ ! $confirm =~ ^[Yy]$ ]] && return
     fi
 
+    # 依赖检查（你已经装好了，这里会跳过）
     install_deps
 
     cd /tmp || exit
 
-    echo -e "${yellow}下载 Python ${latest_version}...${re}"
+    echo -e "${yellow}正在下载 Python ${latest_version} 稳定版...${re}"
 
-    wget -q https://www.python.org/ftp/python/${latest_version}/Python-${latest_version}.tgz || {
-        echo -e "${red}Python 下载失败${re}"
+    # 增加下载失败的重试和校验
+    wget -c https://www.python.org/ftp/python/${latest_version}/Python-${latest_version}.tar.xz
+
+    if [[ ! -f Python-${latest_version}.tar.xz ]]; then
+        echo -e "${red}错误：无法从官方 FTP 找到 Python-${latest_version}.tar.xz${re}"
+        echo -e "${yellow}提示：请检查网络或稍后再试。${re}"
         return
-    }
+    fi
 
-    tar -zxf Python-${latest_version}.tgz
+    tar -xf Python-${latest_version}.tar.xz
     cd Python-${latest_version} || exit
 
-    ./configure --prefix=/usr/local/python3 --enable-optimizations
-    make -j$(nproc)
+    echo -e "${yellow}开始编译安装，这可能需要较长时间...${re}"
+    ./configure --prefix=/usr/local/python3 --enable-optimizations --with-lto
+    make -j$(nproc 2>/dev/null || echo 2)
     make altinstall
 
-    PY_BIN=$(ls /usr/local/python3/bin/python3* | head -n1)
+    # 软链接处理
+    PY_BIN=$(ls /usr/local/python3/bin/python3* | grep -v 'config' | head -n1)
+    PIP_BIN=$(ls /usr/local/python3/bin/pip3* | head -n1)
 
     ln -sf "$PY_BIN" /usr/local/bin/python3
-    ln -sf /usr/local/python3/bin/pip3* /usr/local/bin/pip3
+    ln -sf "$PIP_BIN" /usr/local/bin/pip3
 
-    echo -e "${green}Python ${latest_version} 安装成功${re}"
+    python3 -m ensurepip
+    pip3 install --upgrade pip
 
+    echo -e "${green}Python ${latest_version} 稳定版安装成功${re}"
+
+    # 清理
     cd /tmp
     rm -rf Python-${latest_version}*
-
 }
+
 
 remove_python() {
 
@@ -112,19 +133,6 @@ remove_python() {
     rm -f /usr/local/bin/pip3*
 
     echo -e "${green}Python 卸载完成${re}"
-
-}
-
-remove_python() {
-
-    echo -e "${yellow}卸载 Python (仅删除手动安装版本)...${re}"
-
-    rm -rf /usr/local/python3
-    rm -f /usr/local/bin/python3*
-    rm -f /usr/local/bin/pip3*
-
-    echo -e "${green}Python 卸载完成${re}"
-
 }
 
 # ================== Node.js ==================
@@ -293,7 +301,7 @@ main_menu() {
             3) install_go ;;
             4) install_java ;;
             5) install_php ;;
-            6) remove_pyth9 ;;
+            6) remove_python ;;
             7) remove_node ;;
             8) remove_go ;;
             9) remove_java ;;

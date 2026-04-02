@@ -1,439 +1,295 @@
 #!/bin/bash
-set -e
 
-# ==========================================================
-# VPS 全能一键优化脚本 - 最终完善版
-# ==========================================================
-
-# -----------------------------
-# 1. 颜色与基础变量定义
-# -----------------------------
-RED="\033[31m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
+# ================== 颜色 ==================
+green="\033[32m"
+yellow="\033[33m"
+red="\033[31m"
+skyblue="\033[36m"
+purple="\033[35m"
+re="\033[0m"
 BLUE="\033[34m"
-CYAN="\033[36m"
-RESET="\033[0m"
-NC="\033[0m"
 
-LOG_FILE="/var/log/vps_setup.log"
-TIMEZONE="Asia/Shanghai"
-BBR_MODE="optimized"
-PRIMARY_DNS_V4="8.8.8.8"
-SECONDARY_DNS_V4="1.1.1.1"
-
-# 常用工具依赖列表
-deps=(curl wget git net-tools lsof tar unzip rsync pv sudo nc dnsutils iperf3 mtr jq openssl)
-
-# -----------------------------
-# 2. 基础辅助函数
-# -----------------------------
-log() {
-    echo -e "$1"
-    echo -e "$1" | sed 's/\\033\[[0-9;]*m//g' >> "$LOG_FILE"
-}
-
-root_check() {
-    if [ "$(id -u)" -ne 0 ]; then
-        echo -e "${RED}❌ 请使用 root 用户运行此脚本${RESET}"
+# ================== 系统检测 ==================
+detect_os() {
+    OS=$(grep -o -E "Debian|Ubuntu|CentOS|Alpine|Fedora|Rocky|AlmaLinux|Amazon" /etc/os-release 2>/dev/null | head -n 1)
+    if [[ -z $OS ]]; then
+        echo -e "${red}不支持的系统！${re}"
         exit 1
-    fi
-}
-
-detect_country() {
-    local country=$(curl -s --max-time 5 ipinfo.io/country)
-    echo "${country:-OTHER}"
-}
-
-is_kernel_version_ge() {
-    local test_ver=$1
-    local current_ver=$(uname -r | cut -d'-' -f1)
-    if [[ "$(printf '%s\n' "$test_ver" "$current_ver" | sort -V | head -n1)" == "$test_ver" ]]; then
-        return 0
     else
-        return 1
+        echo -e "${green}检测到系统：${yellow}${OS}${re}"
     fi
 }
 
-# -----------------------------
-# 3. 系统更新与依赖安装
-# -----------------------------
-update_system() {
-    log "\n${YELLOW}=============== 1. 系统更新与依赖 ===============${RESET}"
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        ID_LOWER=${ID,,}
-        if [[ "$ID_LOWER" =~ debian|ubuntu ]]; then
-            OS_TYPE="debian"
-            apt update && apt upgrade -y
-            for pkg in "${deps[@]}"; do
-                if ! dpkg -s "$pkg" &>/dev/null; then
-                    if [ "$pkg" = "nc" ]; then apt install -y netcat-openbsd; 
-                    elif [ "$pkg" = "iperf3" ]; then
-                        echo "iperf3 iperf3/start_daemon boolean false" | debconf-set-selections
-                        apt install -y iperf3
-                    else apt install -y "$pkg"; fi
-                fi
-            done
-        elif [[ "$ID_LOWER" =~ fedora|centos|rhel|rocky|almalinux ]]; then
-            OS_TYPE="rhel"
-            yum upgrade -y || dnf upgrade -y
-            for pkg in "${deps[@]}"; do
-                ! rpm -q "$pkg" &>/dev/null && yum install -y "$pkg"
-            done
-        elif [[ "$ID_LOWER" =~ alpine ]]; then
-            OS_TYPE="alpine"
-            apk update && apk upgrade
-            for pkg in "${deps[@]}"; do
-                ! apk info -e "$pkg" &>/dev/null && apk add "$pkg"
-            done
-        fi
-    fi
-}
-
-# -----------------------------
-# 4. 设置主机名为 localhost
-# -----------------------------
-configure_hostname() {
-    log "\n${YELLOW}=============== 2. 主机名配置 ===============${NC}"
-    local new_hn="localhost"
-    hostnamectl set-hostname "$new_hn"
-    
-    # 更新 /etc/hosts 确保解析正确
-    if grep -q "127.0.1.1" /etc/hosts; then
-        sed -i "s/127.0.1.1.*/127.0.1.1\t$new_hn/" /etc/hosts
-    else
-        echo -e "127.0.1.1\t$new_hn" >> /etc/hosts
-    fi
-    log "${GREEN}✅ 主机名已设置为: $new_hn${NC}"
-}
-
-# -----------------------------
-# 5. 多系统语言与字体环境 (Locale)
-# -----------------------------
-configure_locale() {
-    log "\n${YELLOW}=============== 3. 语言环境与字体设置 ===============${RESET}"
-    log "${GREEN}正在设置英文字体环境 (en_US.UTF-8)...${RESET}"
-    
-    if [[ "$OS_TYPE" == "debian" ]]; then
-        apt-get install -y locales fonts-dejavu fonts-liberation fonts-freefont-ttf
-        grep -qxF "en_US.UTF-8 UTF-8" /etc/locale.gen || echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
-        locale-gen en_US.UTF-8
-        update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
-        echo -e "LANG=en_US.UTF-8\nLC_ALL=en_US.UTF-8" > /etc/default/locale
-    elif [[ "$OS_TYPE" == "rhel" ]]; then
-        yum install -y langpacks-en glibc-all-langpacks fonts-dejavu-sans-fonts
-        localectl set-locale LANG=en_US.UTF-8
-    elif [[ "$OS_TYPE" == "alpine" ]]; then
-        apk add musl-locales musl-locales-lang ttf-dejavu
-        export LANG=en_US.UTF-8
-    fi
-
-    export LANG=en_US.UTF-8
-    export LC_ALL=en_US.UTF-8
-    log "${GREEN}✅ 语言环境已应用完成${RESET}"
-}
-
-# -----------------------------
-# 6. BBR 高性能动态配置 (优化版)
-# -----------------------------
-configure_bbr() {
-    log "\n${YELLOW}=============== 4. BBR 高性能配置 ===============${NC}"
-    local config_file="/etc/sysctl.d/99-bbr.conf"
-    
-    if ! is_kernel_version_ge "4.9"; then
-        log "${RED}[ERROR] 内核版本过低，无法开启BBR${NC}"
-        return 1
-    fi
-    
-    local mem_mb=$(free -m | awk '/^Mem:/{print $2}')
-    local rmem_wmem somaxconn
-    
-    # 动态计算参数 (根据内存分级)
-    if [[ $mem_mb -ge 4096 ]]; then
-        rmem_wmem=67108864  # 64MB
-        somaxconn=65535
-    elif [[ $mem_mb -ge 1024 ]]; then
-        rmem_wmem=33554432  # 32MB
-        somaxconn=32768
-    else
-        rmem_wmem=16777216  # 16MB
-        somaxconn=16384
-    fi
-    
-    cat > "$config_file" << EOF
-# --- BBR 核心 ---
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# --- 缓冲区优化 ---
-net.core.rmem_max = ${rmem_wmem}
-net.core.wmem_max = ${rmem_wmem}
-net.ipv4.tcp_rmem = 4096 87380 ${rmem_wmem}
-net.ipv4.tcp_wmem = 4096 65536 ${rmem_wmem}
-
-# --- 连接队列与积压 ---
-net.core.somaxconn = ${somaxconn}
-net.ipv4.tcp_max_syn_backlog = ${somaxconn}
-net.core.netdev_max_backlog = ${somaxconn}
-
-# --- 连接复用与超时 ---
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.ip_local_port_range = 10000 65535
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_notsent_lowat = 16384
-net.ipv4.tcp_mtu_probing = 1
-EOF
-    sysctl --system >/dev/null
-    log "${GREEN}✅ BBR高性能参数已应用 (内存适配: ${mem_mb}MB)${NC}"
-}
-
-# -----------------------------
-# 7. 其他基础配置 (DNS, 时间, 防火墙, Docker)
-# -----------------------------
-configure_dns() {
-    log "\n${YELLOW}=============== 5. DNS 配置 ===============${NC}"
-    if systemctl is-active --quiet systemd-resolved; then
-        mkdir -p /etc/systemd/resolved.conf.d
-        echo -e "[Resolve]\nDNS=${PRIMARY_DNS_V4} ${SECONDARY_DNS_V4}" > /etc/systemd/resolved.conf.d/99-dns.conf
-        systemctl restart systemd-resolved
-    else
-        chattr -i /etc/resolv.conf 2>/dev/null || true
-        echo -e "nameserver ${PRIMARY_DNS_V4}\nnameserver ${SECONDARY_DNS_V4}" > /etc/resolv.conf
-    fi
-    log "${GREEN}✅ DNS 已更新${NC}"
-}
-
-
-install_cron() {
-    echo -e "${YELLOW}⏰ 检查并安装 cron 定时任务服务...${RESET}"
-
-    case "$OS_TYPE" in
-        debian)
-            if ! dpkg -s cron >/dev/null 2>&1; then
-                echo -e "${YELLOW}📦 安装 cron...${RESET}"
-                apt update
-                apt install -y cron
-            else
-                echo -e "${GREEN}✔ cron 已安装${RESET}"
-            fi
-            systemctl enable --now cron
+# ================== 基础依赖 ==================
+install_deps() {
+    case $OS in
+        Debian|Ubuntu)
+            apt update -y
+            apt install -y wget tar build-essential libreadline-dev libncursesw5-dev libssl-dev libsqlite3-dev tk-dev libgdbm-dev libc6-dev libbz2-dev libffi-dev zlib1g-dev curl jq software-properties-common
             ;;
-        rhel)
-            if ! rpm -q cronie >/dev/null 2>&1; then
-                echo -e "${YELLOW}📦 安装 cronie...${RESET}"
-                yum install -y cronie 2>/dev/null || dnf install -y cronie
-            else
-                echo -e "${GREEN}✔ cronie 已安装${RESET}"
-            fi
-            systemctl enable --now crond
+        CentOS)
+            yum update -y
+            yum groupinstall -y "development tools"
+            yum install -y wget tar openssl-devel bzip2-devel libffi-devel zlib-devel curl jq epel-release yum-utils
             ;;
-        alpine)
-            if ! apk info -e cronie >/dev/null 2>&1; then
-                echo -e "${YELLOW}📦 安装 cronie...${RESET}"
-                apk add cronie
-            else
-                echo -e "${GREEN}✔ cronie 已安装${RESET}"
-            fi
-            rc-update add crond
-            service crond start
+        Fedora|Rocky|AlmaLinux|Amazon)
+            dnf update -y
+            dnf groupinstall -y "development tools"
+            dnf install -y wget tar openssl-devel bzip2-devel libffi-devel zlib-devel curl jq epel-release yum-utils
             ;;
-        *)
-            echo -e "${RED}❌ 未知系统类型，无法安装 cron${RESET}"
-            return 1
+        Alpine)
+            apk update
+            apk add wget tar build-base openssl-dev bzip2-dev libffi-dev zlib-dev curl jq
             ;;
     esac
-
-    # 状态检测
-    if systemctl is-active --quiet cron 2>/dev/null || systemctl is-active --quiet crond 2>/dev/null; then
-        echo -e "${GREEN}✔ cron 服务已运行${RESET}"
-    else
-        echo -e "${RED}❌ cron 服务未启动，请手动检查${RESET}"
-    fi
 }
 
-# -------------------------
-# 安装 NextTrace（网络路由追踪工具）
-# -------------------------
-install_nexttrace() {
-    echo -e "${YELLOW}🌐 检查并安装 NextTrace...${RESET}"
-
-    # 确保 curl 存在
-    if ! command -v curl >/dev/null 2>&1; then
-        echo -e "${RED}❌ curl 未安装，无法安装 NextTrace${RESET}"
-        return 1
-    fi
-
-    # 检测是否已安装
-    if command -v nexttrace >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ NextTrace 已安装${RESET}"
-        return 0
-    fi
-
-    echo -e "${YELLOW}👉 开始安装 NextTrace...${RESET}"
-
-    curl -sL https://nxtrace.org/nt | bash
-
-    # 验证
-    if command -v nexttrace >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ NextTrace 安装成功${RESET}"
-    else
-        echo -e "${RED}❌ NextTrace 安装失败${RESET}"
-    fi
+# ================== 系统架构 ==================
+get_arch() {
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64) ARCH="amd64" ;;
+        x86) ARCH="386" ;;
+        arm64|aarch64) ARCH="arm64" ;;
+        *) echo -e "${red}不支持的架构: $arch${re}"; exit 1 ;;
+    esac
 }
 
-enable_time_sync() {
-    echo -e "${YELLOW}⏰ 配置 systemd-timesyncd 时间同步& 设置上海时区...${RESET}"
+# ================== Python ==================
+install_python() {
 
-    if [ ! -f /etc/os-release ]; then
-        echo -e "${RED}❌ 无法识别系统类型${RESET}"
-        return 1
+    latest_version=$(curl -s https://www.python.org/ftp/python/ \
+    | grep -oP '(?<=href=")[0-9.]+(?=/")' | sort -V | tail -n1)
+
+    if command -v python3 &>/dev/null; then
+        current_version=$(python3 -V 2>&1 | awk '{print $2}')
+
+        if [[ $current_version == $latest_version ]]; then
+            echo -e "${green}Python 已是最新版本: ${yellow}${latest_version}${re}"
+            return
+        fi
+
+        read -p "检测到 Python 版本 $current_version, 升级到 $latest_version？[y/n]: " confirm
+        [[ ! $confirm =~ ^[Yy]$ ]] && return
     fi
 
-    . /etc/os-release
+    install_deps
 
-    if [[ "$ID" != "ubuntu" && "$ID" != "debian" ]]; then
-        echo -e "${RED}❌ 当前系统不是 Debian/Ubuntu，跳过时间同步配置${RESET}"
-        return 0
-    fi
+    cd /tmp || exit
 
-    echo -e "${GREEN}✔ 系统检测通过：$PRETTY_NAME${RESET}"
+    echo -e "${yellow}下载 Python ${latest_version}...${re}"
 
-    # 安装 systemd-timesyncd（极简系统可能没装）
-    if ! dpkg -s systemd-timesyncd >/dev/null 2>&1; then
-        echo -e "${YELLOW}📦 安装 systemd-timesyncd...${RESET}"
-        apt update
-        apt install -y systemd-timesyncd
-    else
-        echo -e "${GREEN}✔ systemd-timesyncd 已安装${RESET}"
-    fi
+    wget -q https://www.python.org/ftp/python/${latest_version}/Python-${latest_version}.tgz || {
+        echo -e "${red}Python 下载失败${re}"
+        return
+    }
 
-    # 启用服务
-    systemctl unmask systemd-timesyncd || true
-    systemctl enable --now systemd-timesyncd
+    tar -zxf Python-${latest_version}.tgz
+    cd Python-${latest_version} || exit
 
-    # 启用 NTP
-    timedatectl set-ntp true
-    systemctl restart systemd-timesyncd
+    ./configure --prefix=/usr/local/python3 --enable-optimizations
+    make -j$(nproc)
+    make altinstall
 
-     # 设置上海时区
-    timedatectl set-timezone Asia/Shanghai
-    echo -e "${GREEN}✔ 时区已设置为上海 (Asia/Shanghai)${RESET}"
+    ln -sf /usr/local/python3/bin/python3* /usr/bin/python3
+    ln -sf /usr/local/python3/bin/pip3* /usr/bin/pip3
 
-    # 状态检查
-    if systemctl is-active --quiet systemd-timesyncd; then
-        echo -e "${GREEN}✔ 时间同步服务已成功启动${RESET}"
-    else
-        echo -e "${RED}❌ 时间同步服务启动失败${RESET}"
-    fi
+    echo -e "${green}Python ${latest_version} 安装成功${re}"
+
+    cd /tmp
+    rm -rf Python-${latest_version}*
+
 }
 
-configure_firewall() {
-    log "\n${YELLOW}=============== 7. 防火墙全开 (多系统适配版) ===============${RESET}"
-    
-    # 1. 处理 firewalld (RHEL/CentOS 系)
-    if command -v firewall-cmd >/dev/null 2>&1; then
-        log "${BLUE}[INFO] 检测到 firewalld，正在关闭并放行所有流量...${NC}"
-        systemctl stop firewalld 2>/dev/null || true
-        systemctl disable firewalld 2>/dev/null || true
-    fi
+remove_python() {
 
-    # 2. 处理 UFW (Debian/Ubuntu 系)
-    if command -v ufw >/dev/null 2>&1; then
-        log "${BLUE}[INFO] 检测到 UFW，正在重置并设为全部允许...${NC}"
-        # 先重置，再设为默认允许，最后开启确保规则写入，或直接 disable
-        ufw --force reset
-        ufw default allow incoming
-        ufw default allow outgoing
-        ufw disable
-    fi
+    echo -e "${yellow}卸载 Python (仅删除手动安装版本)...${re}"
 
-    # 3. 处理 nftables (新一代 Linux 常用)
-    if command -v nft >/dev/null 2>&1; then
-        log "${BLUE}[INFO] 检测到 nftables，正在刷新规则集...${NC}"
-        nft flush ruleset
-    fi
+    rm -rf /usr/local/python3
+    rm -f /usr/bin/python3
+    rm -f /usr/bin/pip3
 
-    # 4. 终极兜底：iptables (几乎所有系统都支持)
-    if command -v iptables >/dev/null 2>&1; then
-        log "${BLUE}[INFO] 刷新 iptables 链并设置默认策略为 ACCEPT...${NC}"
-        iptables -F
-        iptables -X
-        iptables -t nat -F
-        iptables -t nat -X
-        iptables -t mangle -F
-        iptables -t mangle -X
-        iptables -P INPUT ACCEPT
-        iptables -P FORWARD ACCEPT
-        iptables -P OUTPUT ACCEPT
-    fi
+    echo -e "${green}Python 卸载完成${re}"
 
-    # 5. IPv6 兜底 (如果存在 ip6tables)
-    if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -F
-        ip6tables -X
-        ip6tables -P INPUT ACCEPT
-        ip6tables -P FORWARD ACCEPT
-        ip6tables -P OUTPUT ACCEPT
-    fi
-
-    log "${GREEN}✅ 所有已知防火墙限制已解除${RESET}"
 }
 
-docker_install() {
-    log "\n${CYAN}=============== 8. Docker 环境安装 ===============${RESET}"
-    local country=$(detect_country)
-    if [ "$country" = "CN" ]; then
-        curl -fsSL https://get.docker.com | sh --mirror Aliyun
-        mkdir -p /etc/docker
-        cat > /etc/docker/daemon.json << EOF
-{
-  "registry-mirrors": ["https://docker.0.unsee.tech", "https://docker.1panel.live", "https://registry.dockermirror.com"]
+# ================== Node.js ==================
+install_node() {
+
+if command -v node &>/dev/null; then
+    echo -e "${yellow}Node.js 已安装: $(node -v)${re}"
+    return
+fi
+
+echo -e "${green}安装 Node.js...${re}"
+
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt install -y nodejs
+
+echo -e "${green}Node版本: $(node -v)${re}"
+echo -e "${green}NPM版本: $(npm -v)${re}"
+
 }
-EOF
-    else
-        curl -fsSL https://get.docker.com | sh
+
+remove_node() {
+    echo -e "${yellow}卸载 Node.js...${re}"
+
+    apt purge -y nodejs
+    apt autoremove -y
+
+    echo -e "${green}Node.js 卸载完成${re}"
+}
+
+# ================== Go ==================
+install_go() {
+    get_arch
+    html=$(curl -s https://go.dev/dl/)
+    latest_version=$(echo "$html" | grep -oP 'go[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+    latest_version_num=${latest_version/go/}
+
+    if command -v go &>/dev/null; then
+        current_version=$(go version | grep -oE 'go[0-9]+\.[0-9]+\.[0-9]+' | cut -c3-)
+        [[ $current_version == $latest_version_num ]] && {
+            echo -e "${green}Go 已是最新版: $current_version${re}"
+            return
+        }
+
+        read -p "检测到 Go 版本 $current_version, 升级到 $latest_version_num？[y/n]: " confirm
+        [[ ! $confirm =~ ^[Yy]$ ]] && return
+
+        remove_go
     fi
-    systemctl enable --now docker
-    
-    # Docker Compose
-    local latest=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
-    local proxy=""
-    [[ "$country" == "CN" ]] && proxy="https://ghproxy.com/"
-    curl -L "${proxy}https://github.com/docker/compose/releases/download/${latest:-v2.30.0}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-    chmod +x /usr/local/bin/docker-compose
-    log "${GREEN}✅ Docker & Compose 安装完成${RESET}"
+
+    echo -e "${yellow}下载 Go ${latest_version_num}...${re}"
+
+    wget -O /tmp/go_latest.tar.gz "https://go.dev/dl/${latest_version}.linux-${ARCH}.tar.gz" || {
+        echo -e "${red}Go 下载失败${re}"
+        return
+    }
+
+    rm -rf /usr/local/go
+    tar -C /usr/local -xzf /tmp/go_latest.tar.gz
+
+    echo "export PATH=/usr/local/go/bin:\$PATH" > /etc/profile.d/go.sh
+    source /etc/profile.d/go.sh
+    hash -r
+
+    rm -f /tmp/go_latest.tar.gz
+
+    echo -e "${green}Go 安装完成，当前版本: $(go version)${re}"
 }
 
-# -----------------------------
-# 8. 主流程与重启
-# -----------------------------
-main() {
-    clear
-    root_check
-    
-    update_system
-    configure_hostname
-    configure_locale
-    configure_bbr
-    configure_dns
-    install_cron
-    install_nexttrace
-    enable_time_sync
-    configure_firewall
-    docker_install
+remove_go() {
+    echo -e "${yellow}卸载 Go...${re}"
 
-    log "\n${GREEN}✨ 所有任务已执行完毕！${RESET}"
-    log "${YELLOW}系统将在 5 秒后自动重启...${RESET}"
-    
-    for i in {5..1}; do
-        echo -ne "${CYAN}$i... ${RESET}"
-        sleep 1
+    rm -rf /usr/local/go
+    rm -f /etc/profile.d/go.sh
+
+    hash -r
+
+    echo -e "${green}Go 卸载完成${re}"
+}
+
+# ================== Java ==================
+install_java() {
+    get_arch
+    latest_version="17.0.10"
+    if command -v java &>/dev/null; then
+        current_version=$(java -version 2>&1 | awk -F '"' '/version/ {print $2}')
+        [[ $current_version == $latest_version ]] && { echo -e "${green}Java 已是最新版: $latest_version${re}"; return; }
+        read -p "检测到 Java 版本 $current_version, 升级到 $latest_version？[y/n]: " confirm
+        [[ ! $confirm =~ ^[Yy]$ ]] && return
+        remove_java
+    fi
+    case $OS in
+        Debian|Ubuntu) apt install -y openjdk-17-jdk ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon) yum install -y java-17-openjdk java-17-openjdk-devel ;;
+        Alpine) apk add openjdk17 ;;
+    esac
+    echo -e "${green}Java 安装完成，版本: $(java -version 2>&1 | head -n1)${re}"
+}
+
+remove_java() {
+    echo -e "${yellow}卸载 Java...${re}"
+    case $OS in
+        Debian|Ubuntu) apt remove -y openjdk-* && apt autoremove -y ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon) yum remove -y java* && yum autoremove -y ;;
+        Alpine) apk del openjdk17 ;;
+    esac
+    rm -rf /usr/lib/jvm/java-* /usr/local/java /opt/java
+    echo -e "${green}Java 卸载完成${re}"
+}
+
+# ================== PHP ==================
+install_php() {
+    case $OS in
+        Debian|Ubuntu)
+            apt update -y
+            add-apt-repository -y ppa:ondrej/php
+            apt update -y
+            latest_version=$(apt-cache pkgnames | grep -oP '^php[0-9]+\.[0-9]+$' | sort -V | tail -1)
+            apt install -y $latest_version $latest_version-cli $latest_version-fpm $latest_version-mysql $latest_version-xml $latest_version-curl $latest_version-mbstring $latest_version-zip
+            ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon)
+            yum install -y epel-release yum-utils
+            yum install -y https://rpms.remirepo.net/enterprise/remi-release-7.rpm
+            yum-config-manager --enable remi-php74   # 可修改为最新支持版本
+            yum install -y php php-cli php-fpm php-mysqlnd php-xml php-mbstring php-curl php-zip
+            ;;
+        Alpine)
+            apk add --no-cache php php-cli php-fpm php-mysqli php-curl php-xml php-mbstring php-zip
+            ;;
+    esac
+    echo -e "${green}PHP 安装完成，版本: $(php -v | head -n1)${re}"
+}
+
+remove_php() {
+    echo -e "${yellow}卸载 PHP...${re}"
+    case $OS in
+        Debian|Ubuntu) apt purge -y php* && apt autoremove -y ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon) yum remove -y php* && yum autoremove -y ;;
+        Alpine) apk del php php-cli php-fpm php-mysqli php-curl php-xml php-mbstring php-zip ;;
+    esac
+    echo -e "${green}PHP 卸载完成${re}"
+}
+
+# ================== 主菜单 ==================
+main_menu() {
+    detect_os
+    while true; do
+        clear
+        echo -e "${yellow}===== 常用环境安装管理=====${re}"
+        echo -e "${green} 1.安装Python${re}"
+        echo -e "${green} 2.安装Nodejs${re}"
+        echo -e "${green} 3.安装Golang${re}"
+        echo -e "${green} 4.安装Java${re}"
+        echo -e "${green} 5.安装PHP${re}"
+        echo -e "${yellow}===== 常用环境卸载管理=====${re}"
+        echo -e "${green} 6.卸载Python${re}"
+        echo -e "${green} 7.卸载Nodejs${re}"
+        echo -e "${green} 8.卸载Golang${re}"
+        echo -e "${green} 9.卸载Java${re}"
+        echo -e "${green}10.卸载PHP${re}"
+        echo -e "${green} 0.退出${re}"
+        read -p "$(echo -e ${green} 请输入选项: ${re})" choice
+
+        case $choice in
+            1) install_python ;;
+            2) install_node ;;
+            3) install_go ;;
+            4) install_java ;;
+            5) install_php ;;
+            6) remove_pyth9 ;;
+            7) remove_node ;;
+            8) remove_go ;;
+            9) remove_java ;;
+            10) remove_php ;;
+            0) exit 0 ;;
+            *) echo -e "${yellow}无效输入！${re}"; sleep 1 ;;
+        esac
+        read -p "$(echo -e ${GREEN}按任意键返回菜单...${RESET})" dummy
     done
-    echo ""
-    reboot
 }
 
-main "$@"
+# ================== 启动菜单 ==================
+main_menu

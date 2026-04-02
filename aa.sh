@@ -307,7 +307,7 @@ EOF
         # chattr +i /etc/resolv.conf 2>/dev/null || true
     fi
     
-    log "${GREEN}✅ DNS 已更新 (IPv4: ${PRIMARY_DNS_V4}, IPv6: ${PRIMARY_DNS_V6})${NC}"
+    log "${GREEN}✅ DNS 已更新 (IPv4: ${PRIMARY_DNS_V4} ${SECONDARY_DNS_V4}, IPv6: ${PRIMARY_DNS_V6} ${SECONDARY_DNS_V6})${NC}"
 }
 
 
@@ -571,28 +571,59 @@ enable_time_sync() {
 }
 
 docker_install() {
-    log "\n${CYAN}=============== 10. Docker 环境安装 ===============${RESET}"
+    log "\n${CYAN}============ 10. Docker 环境安装 ============${RESET}"
+    
+    # 交互判断逻辑
+    if [[ "$non_interactive" = false ]]; then
+        read -p "是否安装 Docker 和 Docker Compose? [Y/n]: " -r INSTALL_DOCKER
+        # 默认为 Y，只有输入 n 或 N 时才跳过
+        [[ "$INSTALL_DOCKER" =~ ^[nN]$ ]] && { log "${YELLOW}已取消 Docker 安装${RESET}"; return 0; }
+    fi
+
     local country=$(detect_country)
+    
+    # 1. 安装 Docker 引擎
     if [ "$country" = "CN" ]; then
+        log "${BLUE}检测到环境在国内，使用阿里云镜像加速安装...${RESET}"
         curl -fsSL https://get.docker.com | sh --mirror Aliyun
+        
+        # 配置国内镜像加速器
         mkdir -p /etc/docker
         cat > /etc/docker/daemon.json << EOF
 {
-  "registry-mirrors": ["https://docker.0.unsee.tech", "https://docker.1panel.live", "https://registry.dockermirror.com"]
+  "registry-mirrors": [
+    "https://docker.0.unsee.tech",
+    "https://docker.1panel.live",
+    "https://registry.dockermirror.com",
+    "https://docker.m.daocloud.io"
+  ]
 }
 EOF
     else
+        log "${BLUE}使用官方源安装 Docker...${RESET}"
         curl -fsSL https://get.docker.com | sh
     fi
-    systemctl enable --now docker
+
+    # 启动并自启
+    systemctl enable --now docker >> "$LOG_FILE" 2>&1
     
-    # Docker Compose
+    # 2. 安装 Docker Compose
+    log "${BLUE}正在获取 Docker Compose 最新版本...${RESET}"
     local latest=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
     local proxy=""
-    [[ "$country" == "CN" ]] && proxy="https://ghproxy.com/"
-    curl -L "${proxy}https://github.com/docker/compose/releases/download/${latest:-v2.30.0}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-    chmod +x /usr/local/bin/docker-compose
-    log "${GREEN}✅ Docker & Compose 安装完成${RESET}"
+    
+    # 如果在国内，使用 ghproxy 加速下载 GitHub Release
+    [[ "$country" == "CN" ]] && proxy="https://v6.gh-proxy.org/"
+    
+    # 这里的 v2.30.0 是兜底版本号
+    local download_url="${proxy}https://github.com/docker/compose/releases/download/${latest:-v2.30.0}/docker-compose-$(uname -s)-$(uname -m)"
+    
+    if curl -L "$download_url" -o /usr/local/bin/docker-compose; then
+        chmod +x /usr/local/bin/docker-compose
+        log "${GREEN}✅ Docker & Compose 安装完成${RESET}"
+    else
+        log "${RED}❌ Docker Compose 下载失败，请检查网络${RESET}"
+    fi
 }
 
 # -----------------------------
@@ -634,13 +665,15 @@ show_vps_info() {
 
     local hostname_display="${NEW_HOSTNAME:-$(hostname)}"
     local dns_display="${PRIMARY_DNS_V4:-8.8.8.8}, ${SECONDARY_DNS_V4:-1.1.1.1}"
+    local dns_v6_display="${PRIMARY_DNS_V6:-2606:4700:4700::1111}, ${SECONDARY_DNS_V6:-2001:4860:4860::8888}"
 
     echo -e "${CYAN}================== VPS信息 ==================${NC}"
     echo -e "${YELLOW}主机名: ${hostname_display}${NC}"
     echo -e "${YELLOW}时区: ${TIMEZONE:-Asia/Shanghai}${NC}"
     echo -e "${YELLOW}Swap: ${swap_display}${NC}"
     echo -e "${YELLOW}BBR: ${bbr_display}${NC}"
-    echo -e "${YELLOW}DNS: ${dns_display}${NC}"
+    echo -e "${YELLOW}DNS (IPv4): ${dns_v4_display}${NC}"
+    echo -e "${YELLOW}DNS (IPv6): ${dns_v6_display}${NC}"
     echo -e "${YELLOW}Fail2ban: ${fail2ban_display}${NC}"
     echo -e "${YELLOW}SSH端口: ${ssh_display}${NC}"
     echo -e "${CYAN}==============================================${NC}"

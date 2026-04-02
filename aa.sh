@@ -395,48 +395,64 @@ configure_ssh() {
     fi
 }
 
+
 # -----------------------------
-# 8.5 SSH 密钥与安全深度加固
+# 8.5 SSH 密钥与安全深度加固 (修复变量并默认 N)
 # -----------------------------
 configure_ssh_security() {
     log "\n${YELLOW}=============== 8.5 SSH 密钥与安全加固 ===============${NC}"
     
-    # 交互判断：非交互模式下默认跳过，防止自动化部署时把自己锁外面
+    # 定义局部变量，防止外部变量为空导致 cp 报错
+    local ssh_conf="/etc/ssh/sshd_config"
+    local keypath="/root/.ssh/id_ed25519"
+
+    # 1. 交互判断：非交互模式下默认跳过
     if [[ "$non_interactive" = false ]]; then
-        read -p "是否配置 SSH 密钥登录并禁用密码登录? [y/N]: " -r SETUP_KEY
-        [[ ! "$SETUP_KEY" =~ ^[yY]$ ]] && { log "${BLUE}已跳过 SSH 密钥配置${NC}"; return 0; }
+        # [y/N] 表示回车默认为 No
+        read -p "是否配置 SSH 密钥登录并禁用密码登录? [y/n]: " -r SETUP_KEY
+        
+        # 只要输入的不是 y 或 Y（包括直接回车），就视为取消
+        if [[ ! "$SETUP_KEY" =~ ^[yY]$ ]]; then
+            log "${BLUE}已取消 SSH 密钥加固 (默认)${NC}"
+            return 0
+        fi
     else
         log "${BLUE}非交互模式，自动跳过 SSH 密钥加固${NC}"
         return 0
     fi
 
+    # --- 用户确认 [y] 后开始执行 ---
+    
     mkdir -p ~/.ssh
     chmod 700 ~/.ssh
 
-    # 1. 生成 Ed25519 密钥对
-    local keypath="/root/.ssh/id_ed25519"
+    # 2. 生成 Ed25519 密钥对
     log "${BLUE}正在生成密钥对: ${keypath}${NC}"
-    # 如果密钥已存在则不重复生成
     if [ ! -f "$keypath" ]; then
         ssh-keygen -t ed25519 -f "$keypath" -N "" -q
     fi
 
-    # 2. 写入公钥并设置权限
+    # 3. 写入公钥
     cat "${keypath}.pub" >> ~/.ssh/authorized_keys
     chmod 600 ~/.ssh/authorized_keys
 
-    # 3. 修改 SSH 配置文件 (使用备份机制)
-    cp "$SSH_CONF" "${SSH_CONF}.bak_security"
-    
-    log "${BLUE}正在修改 SSH 配置: 启用密钥认证，禁用密码登录...${NC}"
-    # 启用公钥登录
-    sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/g' "$SSH_CONF"
-    # 禁用 root 密码登录 (仅允许密钥)
-    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/g' "$SSH_CONF"
-    # 禁用普通密码验证
-    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/g' "$SSH_CONF"
+    # 4. 修改 SSH 配置 (使用本地变量保证 cp 正常)
+    if [[ -f "$ssh_conf" ]]; then
+        cp "$ssh_conf" "${ssh_conf}.bak_security"
+        
+        log "${BLUE}正在修改 SSH 配置: 启用密钥认证，禁用密码登录...${NC}"
+        # 强制开启密钥认证
+        sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/g' "$ssh_conf"
+        # 禁用 root 密码登录
+        sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/g' "$ssh_conf"
+        # 禁用普通密码验证
+        sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/g' "$ssh_conf"
+    else
+        log "${RED}❌ 未找到 SSH 配置文件: $ssh_conf${NC}"
+        return 1
+    fi
 
-    # 4. 语法检查并重启
+    # 5. 语法检查并重启
     if sshd -t; then
         if systemctl is-active --quiet sshd; then
             systemctl restart sshd
@@ -445,23 +461,22 @@ configure_ssh_security() {
         fi
         log "${GREEN}✅ SSH 安全加固完成${NC}"
         
-        # 打印私钥提示用户保存
         echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo -e "${RED}   重要提示：请务必保存下方的私钥内容到本地电脑！${NC}"
-        echo -e "${RED}   否则重启或断开连接后，你将无法再次进入服务器。${NC}"
+        echo -e "${RED}   由于您禁用了密码登录，丢失此私钥将导致无法再次进入服务器。${NC}"
         echo -e "${CYAN}------------------- 私钥开始 (PRIVATE KEY) -------------------${NC}"
         cat "$keypath"
         echo -e "${CYAN}-------------------- 私钥结束 (END KEY) ---------------------${NC}"
         echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         
-        # 给用户 10 秒时间看一眼
         if [[ "$non_interactive" = false ]]; then
-            read -n 1 -s -r -p "确认已复制私钥？按任意键继续执行脚本..."
+            read -n 1 -s -r -p "确认已复制私钥？按任意键继续执行..."
             echo ""
         fi
     else
         log "${RED}❌ SSH 配置语法错误，已自动回滚备份！${NC}"
-        mv "${SSH_CONF}.bak_security" "$SSH_CONF"
+        mv "${ssh_conf}.bak_security" "$ssh_conf"
+        return 1
     fi
 }
 
@@ -645,7 +660,7 @@ docker_install() {
     
     # 交互判断逻辑
     if [[ "$non_interactive" = false ]]; then
-        read -p "是否安装 Docker 和 Docker Compose? [Y/n]: " -r INSTALL_DOCKER
+        read -p "是否安装 Docker 和 Docker Compose? [y/n]: " -r INSTALL_DOCKER
         # 默认为 Y，只有输入 n 或 N 时才跳过
         [[ "$INSTALL_DOCKER" =~ ^[nN]$ ]] && { log "${YELLOW}已取消 Docker 安装${RESET}"; return 0; }
     fi
@@ -697,6 +712,43 @@ EOF
 }
 
 # -----------------------------
+# 11. 系统垃圾清理
+# -----------------------------
+clean_system() {
+    log "\n${YELLOW}=============== 11. 系统垃圾清理 ===============${NC}"
+    
+    case "$OS_TYPE" in
+        debian)
+            log "${BLUE}正在清理 Debian/Ubuntu 缓存...${NC}"
+            apt-get autoremove -y >> "$LOG_FILE" 2>&1
+            apt-get autoclean -y >> "$LOG_FILE" 2>&1
+            apt-get clean -y >> "$LOG_FILE" 2>&1
+            ;;
+        rhel)
+            log "${BLUE}正在清理 RHEL/CentOS 缓存...${NC}"
+            yum autoremove -y >> "$LOG_FILE" 2>&1
+            yum clean all >> "$LOG_FILE" 2>&1
+            ;;
+        alpine)
+            log "${BLUE}正在清理 Alpine 缓存...${NC}"
+            rm -rf /var/cache/apk/*
+            ;;
+    esac
+
+    log "${BLUE}正在清理临时文件与系统日志...${NC}"
+    # 清理日志文件 (保留目录结构，清空内容)
+    find /var/log -type f -regex '.*\.gz$\|.*\.[0-9]$活.*\.log$' -exec truncate -s 0 {} + 2>/dev/null || true
+    
+    # 清理临时目录
+    rm -rf /tmp/* /var/tmp/*
+    
+    # 清理命令历史 (可选)
+    history -c
+    
+    log "${GREEN}✅ 系统清理完成${NC}"
+}
+
+# -----------------------------
 # 显示 VPS 信息 (智能版)
 # -----------------------------
 show_vps_info() {
@@ -731,11 +783,22 @@ show_vps_info() {
     else
         bbr_display="未启用"
     fi
-
+    
+    # Docker状态检测
+    local docker_display
+    if command -v docker >/dev/null 2>&1; then
+        if systemctl is-active --quiet docker; then
+            docker_display="已启用"
+        else
+            docker_display="已安装但未启用"
+        fi
+    else
+        docker_display="未安装"
+    fi
 
     local hostname_display="${NEW_HOSTNAME:-$(hostname)}"
     local dns_v4_display="${PRIMARY_DNS_V4:-8.8.8.8}, ${SECONDARY_DNS_V4:-1.1.1.1}"
-    local dns_v6_display="${PRIMARY_DNS_V6:-2606:4700:4700::1111}, ${SECONDARY_DNS_V6:-2001:4860:4860::8888}"
+    local dns_v6_display="${PRIMARY_DNS_V6:-2606:4700:4700::1111}"
 
     echo -e "${CYAN}================== VPS信息 ==================${NC}"
     echo -e "${YELLOW}主机名: ${hostname_display}${NC}"
@@ -745,6 +808,7 @@ show_vps_info() {
     echo -e "${YELLOW}DNS (IPv4): ${dns_v4_display}${NC}"
     echo -e "${YELLOW}DNS (IPv6): ${dns_v6_display}${NC}"
     echo -e "${YELLOW}Fail2ban: ${fail2ban_display}${NC}"
+    echo -e "${YELLOW}Docker: ${docker_display}${NC}"
     echo -e "${YELLOW}SSH端口: ${ssh_display}${NC}"
     echo -e "${CYAN}==============================================${NC}"
 }
@@ -770,6 +834,7 @@ main() {
     install_nexttrace
     enable_time_sync
     docker_install
+    clean_system
 
     show_vps_info
 

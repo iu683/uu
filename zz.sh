@@ -1,376 +1,318 @@
 #!/bin/bash
 
-set -euo pipefail
+# ================== 颜色 ==================
+green="\033[32m"
+yellow="\033[33m"
+red="\033[31m"
+skyblue="\033[36m"
+purple="\033[35m"
+re="\033[0m"
+BLUE="\033[34m"
 
-readonly SCRIPT_VERSION="VMESS-WS-1.0"
-readonly xray_config_path="/usr/local/etc/xray/config.json"
-readonly xray_binary_path="/usr/local/bin/xray"
-readonly xray_install_script_url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
-
-readonly red='\e[91m'
-readonly green='\e[92m'
-readonly yellow='\e[93m'
-readonly cyan='\e[96m'
-readonly none='\e[0m'
-
-xray_status_info=""
-is_quiet=false
-ws_path="/"
-ws_host=""
-
-error(){ echo -e "\n$red[✖] $1$none\n"; }
-info(){ echo -e "\n$yellow[!] $1$none\n"; }
-success(){ echo -e "\n$green[✔] $1$none\n"; }
-
-spinner(){
-    local pid=$1
-    local spin='|/-\'
-    while kill -0 $pid 2>/dev/null; do
-        for i in ${spin}; do
-            printf "\r[%c] " "$i"
-            sleep .1
-        done
-    done
-}
-
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
-}
-
-is_valid_port(){
-    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
-}
-
-is_port_in_use(){
-    ss -tuln | grep -q ":$1 "
-}
-
-is_valid_uuid(){
-    [[ "$1" =~ ^[0-9a-fA-F-]{36}$ ]]
-}
-
-pre_check(){
-    [[ $(id -u) != 0 ]] && error "请使用root运行" && exit 1
-
-    if ! command -v jq &>/dev/null || ! command -v curl &>/dev/null; then
-        apt update -y
-        apt install -y jq curl
+# ================== 系统检测 ==================
+detect_os() {
+    OS=$(grep -o -E "Debian|Ubuntu|CentOS|Alpine|Fedora|Rocky|AlmaLinux|Amazon" /etc/os-release 2>/dev/null | head -n 1)
+    if [[ -z $OS ]]; then
+        echo -e "${red}不支持的系统！${re}"
+        exit 1
+    else
+        echo -e "${green}检测到系统：${yellow}${OS}${re}"
     fi
 }
 
-execute_official_script(){
-    bash <(curl -L "$xray_install_script_url") "$@" &
-    spinner $!
-    wait $!
+# ================== 基础依赖 ==================
+install_deps() {
+    case $OS in
+        Debian|Ubuntu)
+            apt update -y
+            apt install -y wget tar build-essential libreadline-dev libncursesw5-dev libssl-dev libsqlite3-dev tk-dev libgdbm-dev libc6-dev libbz2-dev libffi-dev zlib1g-dev curl jq software-properties-common
+            ;;
+        CentOS)
+            yum update -y
+            yum groupinstall -y "development tools"
+            yum install -y wget tar openssl-devel bzip2-devel libffi-devel zlib-devel curl jq epel-release yum-utils
+            ;;
+        Fedora|Rocky|AlmaLinux|Amazon)
+            dnf update -y
+            dnf groupinstall -y "development tools"
+            dnf install -y wget tar openssl-devel bzip2-devel libffi-devel zlib-devel curl jq epel-release yum-utils
+            ;;
+        Alpine)
+            apk update
+            apk add wget tar build-base openssl-dev bzip2-dev libffi-dev zlib-dev curl jq
+            ;;
+    esac
 }
 
-check_xray_status(){
-    if [[ ! -f "$xray_binary_path" ]]; then
-        xray_status_info="Xray: 未安装"
+# ================== 系统架构 ==================
+get_arch() {
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64) ARCH="amd64" ;;
+        x86) ARCH="386" ;;
+        arm64|aarch64) ARCH="arm64" ;;
+        *) echo -e "${red}不支持的架构: $arch${re}"; exit 1 ;;
+    esac
+}
+
+# ================== Python ==================
+install_python() {
+
+    # 过滤开发版，只获取稳定版
+    latest_version=$(curl -fsSL https://www.python.org/ftp/python/ \
+    | grep -oE '3\.[0-9]+\.[0-9]+/' \
+    | tr -d '/' \
+    | sort -V | tail -n1)
+
+    if [[ -z "$latest_version" ]]; then
+        echo -e "${red}获取 Python 最新稳定版本失败${re}"
         return
     fi
 
-    local v=$($xray_binary_path version | head -n1 | awk '{print $2}')
-    if systemctl is-active --quiet xray; then
-        xray_status_info="Xray: 运行中 | $v"
-    else
-        xray_status_info="Xray: 未运行 | $v"
+    # 当前版本检测
+    if command -v python3 &>/dev/null; then
+        current_version=$(python3 -V 2>&1 | awk '{print $2}')
+
+        if [[ "$current_version" == "$latest_version" ]]; then
+            echo -e "${green}Python 已是最新稳定版本: ${yellow}${latest_version}${re}"
+            return
+        fi
+
+        read -rp "检测到当前版本 ${current_version}, 升级到最新稳定版 ${latest_version}？[y/n]: " confirm
+        [[ ! $confirm =~ ^[Yy]$ ]] && return
     fi
+
+    install_deps
+
+    cd /tmp || exit
+
+    echo -e "${yellow}正在下载 Python ${latest_version} 稳定版...${re}"
+
+    wget -q --show-progress -c \
+    https://www.python.org/ftp/python/${latest_version}/Python-${latest_version}.tar.xz
+
+    if [[ ! -f Python-${latest_version}.tar.xz ]]; then
+        echo -e "${red}错误：无法下载 Python-${latest_version}.tar.xz${re}"
+        return
+    fi
+
+    tar -xf Python-${latest_version}.tar.xz
+    cd Python-${latest_version} || exit
+
+    echo -e "${yellow}开始编译安装，这可能需要较长时间...${re}"
+
+    ./configure --prefix=/usr/local/python3 --enable-optimizations --with-lto
+
+    make -j$(nproc 2>/dev/null || echo 2)
+
+    make altinstall
+
+    # 获取 python 与 pip
+    PY_BIN=$(find /usr/local/python3/bin -name "python3.*" -type f | sort -V | tail -n1)
+    PIP_BIN=$(find /usr/local/python3/bin -name "pip3*" -type f | head -n1)
+
+    ln -sf "$PY_BIN" /usr/local/bin/python3
+    ln -sf "$PIP_BIN" /usr/local/bin/pip3
+
+    python3 -m ensurepip --upgrade
+    python3 -m pip install --upgrade pip
+
+    echo -e "${green}Python ${latest_version} 稳定版安装成功${re}"
+
+    cd /tmp
+    rm -rf Python-${latest_version}*
+
 }
 
-install_xray(){
 
-    local port uuid
+remove_python() {
 
-    while true; do
-        read -p "端口 (默认8080): " port
-        [ -z "$port" ] && port=8080
+    echo -e "${yellow}卸载 Python (仅删除手动安装版本)...${re}"
 
-        is_valid_port "$port" || { error "端口无效"; continue; }
-        is_port_in_use "$port" && { error "端口占用"; continue; }
+    rm -rf /usr/local/python3
+    rm -f /usr/local/bin/python3*
+    rm -f /usr/local/bin/pip3*
 
-        break
-    done
-
-    while true; do
-        read -p "UUID (留空自动生成): " uuid
-        [ -z "$uuid" ] && uuid=$(cat /proc/sys/kernel/random/uuid)
-
-        is_valid_uuid "$uuid" && break || error "UUID格式错误"
-    done
-
-
-    read -p "WS Host (可选): " ws_host
-
-    read -p "WS Path (默认 /): " ws_path
-    [ -z "$ws_path" ] && ws_path="/"
-    [[ "$ws_path" != /* ]] && ws_path="/$ws_path"
-
-
-    run_install "$port" "$uuid"
+    echo -e "${green}Python 卸载完成${re}"
 }
 
-write_config(){
+# ================== Node.js ==================
+install_node() {
 
-    local port=$1
-    local uuid=$2
-
-jq -n \
---argjson port "$port" \
---arg uuid "$uuid" \
---arg ws_path "$ws_path" \
---arg ws_host "$ws_host" \
-'{
-"log":{"loglevel":"warning"},
-"inbounds":[
-{
-"listen":"0.0.0.0",
-"port":$port,
-"protocol":"vmess",
-"settings":{
-"clients":[
-{
-"id":$uuid,
-"alterId":0
-}
-]
-},
-"streamSettings":{
-"network":"ws",
-"wsSettings":{
-"path":$ws_path,
-"headers":{
-"Host":$ws_host
-}
-}
-},
-"sniffing":{
-"enabled":true,
-"destOverride":["http","tls"]
-}
-}
-],
-"outbounds":[
-{
-"protocol":"freedom",
-"settings":{
-"domainStrategy":"UseIPv4v6"
-}
-}
-]
-}' > "$xray_config_path"
-}
-
-run_install(){
-
-    local port=$1
-    local uuid=$2
-
-    info "安装 Xray..."
-    execute_official_script install
-    
-    mkdir -p /usr/local/etc/xray
-
-    write_config "$port" "$uuid"
-
-    systemctl enable xray
-    systemctl restart xray
-
-    success "安装完成"
-
-    view_subscription_info
-}
-
-restart_xray(){
-    systemctl restart xray
-    success "Xray 已重启"
-}
-
-modify_config(){
-
-if [ ! -f "$xray_config_path" ]; then
-error "Xray 未安装"
-return
+if command -v node &>/dev/null; then
+    echo -e "${yellow}Node.js 已安装: $(node -v)${re}"
+    return
 fi
 
-info "读取当前配置..."
+echo -e "${green}安装 Node.js...${re}"
 
-current_port=$(jq -r '.inbounds[0].port' "$xray_config_path")
-current_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
-current_path=$(jq -r '.inbounds[0].streamSettings.wsSettings.path' "$xray_config_path")
-current_host=$(jq -r '.inbounds[0].streamSettings.wsSettings.headers.Host // ""' "$xray_config_path")
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt install -y nodejs
 
-echo
-echo "当前端口: $current_port"
-echo "当前UUID: $current_uuid"
-echo "当前Path: $current_path"
-echo "当前Host: $current_host"
-echo
+echo -e "${green}Node版本: $(node -v)${re}"
+echo -e "${green}NPM版本: $(npm -v)${re}"
 
-while true
-do
-read -p "新端口 (回车保持 $current_port): " port
-[ -z "$port" ] && port=$current_port
-
-is_valid_port "$port" || { error "端口无效"; continue; }
-
-if [[ "$port" != "$current_port" ]] && is_port_in_use "$port"; then
-error "端口已被占用"
-continue
-fi
-
-break
-done
-
-while true
-do
-read -p "新UUID (回车保持): " uuid
-[ -z "$uuid" ] && uuid=$current_uuid
-
-is_valid_uuid "$uuid" && break || error "UUID格式错误"
-done
-
-read -p "新WS Host (回车保持 $current_host): " new_host
-[ -z "$new_host" ] && new_host=$current_host
-
-read -p "新WS Path (回车保持 $current_path): " new_path
-[ -z "$new_path" ] && new_path=$current_path
-[[ "$new_path" != /* ]] && new_path="/$new_path"
-
-ws_host="$new_host"
-ws_path="$new_path"
-
-
-write_config "$port" "$uuid"
-
-systemctl restart xray
-
-success "配置修改完成"
-
-view_subscription_info
 }
 
-update_xray(){
-    execute_official_script install
-    restart_xray
+remove_node() {
+    echo -e "${yellow}卸载 Node.js...${re}"
+
+    apt purge -y nodejs
+    apt autoremove -y
+
+    echo -e "${green}Node.js 卸载完成${re}"
 }
 
-uninstall_xray(){
-    execute_official_script remove --purge
-    success "已卸载"
+# ================== Go ==================
+install_go() {
+    get_arch
+    html=$(curl -s https://go.dev/dl/)
+    latest_version=$(echo "$html" | grep -oP 'go[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+    latest_version_num=${latest_version/go/}
+
+    if command -v go &>/dev/null; then
+        current_version=$(go version | grep -oE 'go[0-9]+\.[0-9]+\.[0-9]+' | cut -c3-)
+        [[ $current_version == $latest_version_num ]] && {
+            echo -e "${green}Go 已是最新版: $current_version${re}"
+            return
+        }
+
+        read -p "检测到 Go 版本 $current_version, 升级到 $latest_version_num？[y/n]: " confirm
+        [[ ! $confirm =~ ^[Yy]$ ]] && return
+
+        remove_go
+    fi
+
+    echo -e "${yellow}下载 Go ${latest_version_num}...${re}"
+
+    wget -O /tmp/go_latest.tar.gz "https://go.dev/dl/${latest_version}.linux-${ARCH}.tar.gz" || {
+        echo -e "${red}Go 下载失败${re}"
+        return
+    }
+
+    rm -rf /usr/local/go
+    tar -C /usr/local -xzf /tmp/go_latest.tar.gz
+
+    echo "export PATH=/usr/local/go/bin:\$PATH" > /etc/profile.d/go.sh
+    source /etc/profile.d/go.sh
+    hash -r
+
+    rm -f /tmp/go_latest.tar.gz
+
+    echo -e "${green}Go 安装完成，当前版本: $(go version)${re}"
 }
 
-view_xray_log(){
-    journalctl -u xray -f
+remove_go() {
+    echo -e "${yellow}卸载 Go...${re}"
+
+    rm -rf /usr/local/go
+    rm -f /etc/profile.d/go.sh
+
+    hash -r
+
+    echo -e "${green}Go 卸载完成${re}"
 }
 
-view_subscription_info(){
-
-    local ip=$(get_public_ip)
-
-    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
-    local port=$(jq -r '.inbounds[0].port' "$xray_config_path")
-    local path=$(jq -r '.inbounds[0].streamSettings.wsSettings.path' "$xray_config_path")
-    local host=$(jq -r '.inbounds[0].streamSettings.wsSettings.headers.Host // ""' "$xray_config_path")
-
-vmess_json=$(cat <<EOF
-{
-"v":"2",
-"ps":"$(hostname)",
-"add":"$ip",
-"port":"$port",
-"id":"$uuid",
-"aid":"0",
-"scy":"auto",
-"net":"ws",
-"type":"none",
-"host":"$host",
-"path":"$path",
-"tls":""
-}
-EOF
-)
-
-vmess_link="vmess://$(echo -n "$vmess_json" | base64 -w0)"
-
-echo "---------------------------------------"
-echo -e "${green}VMESS+WS 节点${none}"
-echo "地址: $ip"
-echo "端口: $port"
-echo "UUID: $uuid"
-echo "Host: $host"
-echo "Path: $path"
-echo
-echo "$vmess_link"
-echo "---------------------------------------"
-
-echo "$vmess_link" > ~/xray_vmess_link.txt
+# ================== Java ==================
+install_java() {
+    get_arch
+    latest_version="17.0.10"
+    if command -v java &>/dev/null; then
+        current_version=$(java -version 2>&1 | awk -F '"' '/version/ {print $2}')
+        [[ $current_version == $latest_version ]] && { echo -e "${green}Java 已是最新版: $latest_version${re}"; return; }
+        read -p "检测到 Java 版本 $current_version, 升级到 $latest_version？[y/n]: " confirm
+        [[ ! $confirm =~ ^[Yy]$ ]] && return
+        remove_java
+    fi
+    case $OS in
+        Debian|Ubuntu) apt install -y openjdk-17-jdk ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon) yum install -y java-17-openjdk java-17-openjdk-devel ;;
+        Alpine) apk add openjdk17 ;;
+    esac
+    echo -e "${green}Java 安装完成，版本: $(java -version 2>&1 | head -n1)${re}"
 }
 
-press_any_key(){
-read -n1 -s -r -p "按任意键继续..."
+remove_java() {
+    echo -e "${yellow}卸载 Java...${re}"
+    case $OS in
+        Debian|Ubuntu) apt remove -y openjdk-* && apt autoremove -y ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon) yum remove -y java* && yum autoremove -y ;;
+        Alpine) apk del openjdk17 ;;
+    esac
+    rm -rf /usr/lib/jvm/java-* /usr/local/java /opt/java
+    echo -e "${green}Java 卸载完成${re}"
 }
 
-main_menu(){
-
-while true
-do
-clear
-
-check_xray_status
-
-echo "--------------------------------"
-echo "Xray VMESS+WS 管理脚本"
-echo "--------------------------------"
-echo "$xray_status_info"
-echo "--------------------------------"
-echo "1. 安装"
-echo "2. 更新"
-echo "3. 重启"
-echo "4. 卸载"
-echo "5. 查看日志"
-echo "6. 修改节点配置"
-echo "7. 查看节点"
-echo "0. 退出"
-echo "--------------------------------"
-
-read -p "请选择: " choice
-
-case $choice in
-
-1) install_xray ;;
-2) update_xray ;;
-3) restart_xray ;;
-4) uninstall_xray ;;
-5) view_xray_log ;;
-6) modify_config ;;
-7) view_subscription_info ;;
-0) exit 0 ;;
-*) error "无效选项" ;;
-
-esac
-
-press_any_key
-
-done
+# ================== PHP ==================
+install_php() {
+    case $OS in
+        Debian|Ubuntu)
+            apt update -y
+            add-apt-repository -y ppa:ondrej/php
+            apt update -y
+            latest_version=$(apt-cache pkgnames | grep -oP '^php[0-9]+\.[0-9]+$' | sort -V | tail -1)
+            apt install -y $latest_version $latest_version-cli $latest_version-fpm $latest_version-mysql $latest_version-xml $latest_version-curl $latest_version-mbstring $latest_version-zip
+            ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon)
+            yum install -y epel-release yum-utils
+            yum install -y https://rpms.remirepo.net/enterprise/remi-release-7.rpm
+            yum-config-manager --enable remi-php74   # 可修改为最新支持版本
+            yum install -y php php-cli php-fpm php-mysqlnd php-xml php-mbstring php-curl php-zip
+            ;;
+        Alpine)
+            apk add --no-cache php php-cli php-fpm php-mysqli php-curl php-xml php-mbstring php-zip
+            ;;
+    esac
+    echo -e "${green}PHP 安装完成，版本: $(php -v | head -n1)${re}"
 }
 
-main(){
+remove_php() {
+    echo -e "${yellow}卸载 PHP...${re}"
+    case $OS in
+        Debian|Ubuntu) apt purge -y php* && apt autoremove -y ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon) yum remove -y php* && yum autoremove -y ;;
+        Alpine) apk del php php-cli php-fpm php-mysqli php-curl php-xml php-mbstring php-zip ;;
+    esac
+    echo -e "${green}PHP 卸载完成${re}"
+}
 
-pre_check
+# ================== 主菜单 ==================
+main_menu() {
+    detect_os
+    while true; do
+        clear
+        echo -e "${yellow}===== 常用环境安装管理=====${re}"
+        echo -e "${green} 1.安装Python${re}"
+        echo -e "${green} 2.安装Nodejs${re}"
+        echo -e "${green} 3.安装Golang${re}"
+        echo -e "${green} 4.安装Java${re}"
+        echo -e "${green} 5.安装PHP${re}"
+        echo -e "${yellow}===== 常用环境卸载管理=====${re}"
+        echo -e "${green} 6.卸载Python${re}"
+        echo -e "${green} 7.卸载Nodejs${re}"
+        echo -e "${green} 8.卸载Golang${re}"
+        echo -e "${green} 9.卸载Java${re}"
+        echo -e "${green}10.卸载PHP${re}"
+        echo -e "${green} 0.退出${re}"
+        read -p "$(echo -e ${green} 请输入选项: ${re})" choice
+
+        case $choice in
+            1) install_python ;;
+            2) install_node ;;
+            3) install_go ;;
+            4) install_java ;;
+            5) install_php ;;
+            6) remove_python ;;
+            7) remove_node ;;
+            8) remove_go ;;
+            9) remove_java ;;
+            10) remove_php ;;
+            0) exit 0 ;;
+            *) echo -e "${yellow}无效输入！${re}"; sleep 1 ;;
+        esac
+        read -p "$(echo -e ${GREEN}按任意键返回菜单...${RESET})" dummy
+    done
+}
+
+# ================== 启动菜单 ==================
 main_menu
-
-}
-
-main

@@ -59,7 +59,7 @@ get_arch() {
 install_python() {
 
     latest_version=$(curl -s https://www.python.org/ftp/python/ \
-    | grep -oP '(?<=href=")[0-9.]+(?=/")' | sort -V | tail -n1)
+    | grep -oP 'href="\K[0-9]+\.[0-9]+\.[0-9]+(?=/")' | sort -V | tail -n1)
 
     if command -v python3 &>/dev/null; then
         current_version=$(python3 -V 2>&1 | awk '{print $2}')
@@ -87,12 +87,14 @@ install_python() {
     tar -zxf Python-${latest_version}.tgz
     cd Python-${latest_version} || exit
 
-    ./configure --prefix=/usr/local/python3 --enable-optimizations
+    ./configure --prefix=/usr/local/python3 --enable-optimizations --with-lto
     make -j$(nproc)
     make altinstall
 
-    ln -sf /usr/local/python3/bin/python3* /usr/bin/python3
-    ln -sf /usr/local/python3/bin/pip3* /usr/bin/pip3
+    PY_BIN=$(ls /usr/local/python3/bin/python3* | head -n1)
+
+    ln -sf "$PY_BIN" /usr/local/bin/python3
+    ln -sf /usr/local/python3/bin/pip3* /usr/local/bin/pip3
 
     echo -e "${green}Python ${latest_version} 安装成功${re}"
 
@@ -106,13 +108,12 @@ remove_python() {
     echo -e "${yellow}卸载 Python (仅删除手动安装版本)...${re}"
 
     rm -rf /usr/local/python3
-    rm -f /usr/bin/python3
-    rm -f /usr/bin/pip3
+    rm -f /usr/local/bin/python3*
+    rm -f /usr/local/bin/pip3*
 
     echo -e "${green}Python 卸载完成${re}"
 
 }
-
 # ================== Node.js ==================
 install_node() {
 
@@ -279,7 +280,7 @@ main_menu() {
             3) install_go ;;
             4) install_java ;;
             5) install_php ;;
-            6) remove_pyth9 ;;
+            6) remove_python ;;
             7) remove_node ;;
             8) remove_go ;;
             9) remove_java ;;

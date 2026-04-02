@@ -58,25 +58,17 @@ get_arch() {
 # ================== Python ==================
 install_python() {
 
-    latest_version=$(curl -s https://www.python.org/ftp/python/ \
-    | grep -oE '3\.[0-9]+\.[0-9]+/' \
-    | tr -d '/' \
-    | sort -V | tail -n1)
-
-    if [[ -z "$latest_version" ]]; then
-        echo -e "${red}获取 Python 最新版本失败${re}"
-        return
-    fi
+    latest_version="3.14.3"
 
     if command -v python3 &>/dev/null; then
         current_version=$(python3 -V 2>&1 | awk '{print $2}')
 
         if [[ "$current_version" == "$latest_version" ]]; then
-            echo -e "${green}Python 已是最新版本: ${yellow}${latest_version}${re}"
+            echo -e "${green}Python 已是指定版本: ${yellow}${latest_version}${re}"
             return
         fi
 
-        read -rp "检测到 Python 版本 ${current_version}, 升级到 ${latest_version}？[y/n]: " confirm
+        read -rp "检测到当前版本 ${current_version}, 是否安装 Python ${latest_version}？[y/n]: " confirm
         [[ ! $confirm =~ ^[Yy]$ ]] && return
     fi
 
@@ -84,9 +76,10 @@ install_python() {
 
     cd /tmp || exit
 
-    echo -e "${yellow}下载 Python ${latest_version}...${re}"
+    echo -e "${yellow}正在下载 Python ${latest_version}...${re}"
 
-    wget -q https://www.python.org/ftp/python/${latest_version}/Python-${latest_version}.tar.xz
+    wget -q --show-progress -c \
+    https://www.python.org/ftp/python/${latest_version}/Python-${latest_version}.tar.xz
 
     if [[ ! -f Python-${latest_version}.tar.xz ]]; then
         echo -e "${red}Python 下载失败${re}"
@@ -96,18 +89,20 @@ install_python() {
     tar -xf Python-${latest_version}.tar.xz
     cd Python-${latest_version} || exit
 
+    echo -e "${yellow}开始编译安装...${re}"
+
     ./configure --prefix=/usr/local/python3 --enable-optimizations --with-lto
     make -j$(nproc 2>/dev/null || echo 2)
     make altinstall
 
-    PY_BIN=$(ls /usr/local/python3/bin/python3* | head -n1)
-    PIP_BIN=$(ls /usr/local/python3/bin/pip3* | head -n1)
+    PY_BIN=$(find /usr/local/python3/bin -name "python3.*" | sort -V | tail -n1)
+    PIP_BIN=$(find /usr/local/python3/bin -name "pip3*" | head -n1)
 
     ln -sf "$PY_BIN" /usr/local/bin/python3
     ln -sf "$PIP_BIN" /usr/local/bin/pip3
 
-    python3 -m ensurepip
-    pip3 install --upgrade pip
+    python3 -m ensurepip --upgrade
+    python3 -m pip install --upgrade pip
 
     echo -e "${green}Python ${latest_version} 安装成功${re}"
 
@@ -125,6 +120,7 @@ remove_python() {
 
     echo -e "${green}Python 卸载完成${re}"
 }
+
 # ================== Node.js ==================
 install_node() {
 

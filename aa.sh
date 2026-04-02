@@ -57,91 +57,58 @@ get_arch() {
 
 # ================== Python ==================
 install_python() {
-    echo -e "${yellow}正在检索最新已发布的稳定版本...${re}"
 
-    # 1. 获取初步版本列表（排除带字母的开发版），按版本号从新到旧排序
-    potential_versions=$(curl -s https://www.python.org/ftp/python/ \
-    | grep -oE '3\.[0-9]+\.[0-9]+/' \
-    | tr -d '/' \
-    | grep -vE '[a-zA-Z]' \
-    | sort -rV)
+    latest_version="3.14.3"
 
-    latest_version=""
-    
-    # 2. 核心逻辑：循环检查每个版本，直到找到第一个真正存在源码包的版本
-    for v in $potential_versions; do
-        # 使用 curl --head 检查文件是否存在 (返回 200 OK)
-        if curl -Is "https://www.python.org/ftp/python/${v}/Python-${v}.tar.xz" | grep -q "200 OK"; then
-            latest_version=$v
-            break
-        fi
-    done
-
-    if [[ -z "$latest_version" ]]; then
-        echo -e "${red}获取 Python 最新稳定版本失败，请检查网络${re}"
-        return
-    fi
-
-    # 检查当前版本
     if command -v python3 &>/dev/null; then
         current_version=$(python3 -V 2>&1 | awk '{print $2}')
 
         if [[ "$current_version" == "$latest_version" ]]; then
-            echo -e "${green}Python 已是最新稳定版本: ${yellow}${latest_version}${re}"
+            echo -e "${green}Python 已是指定版本: ${yellow}${latest_version}${re}"
             return
         fi
 
-        read -rp "检测到当前版本 ${current_version}, 升级到最新稳定版 ${latest_version}？[y/n]: " confirm
+        read -rp "检测到当前版本 ${current_version}, 是否安装 Python ${latest_version}？[y/n]: " confirm
         [[ ! $confirm =~ ^[Yy]$ ]] && return
     fi
 
-    # 依赖检查
     install_deps
 
     cd /tmp || exit
 
-    echo -e "${yellow}正在下载 Python ${latest_version} 稳定版...${re}"
+    echo -e "${yellow}正在下载 Python ${latest_version}...${re}"
 
-    # 使用 -c 支持断点续传
-    wget -c "https://www.python.org/ftp/python/${latest_version}/Python-${latest_version}.tar.xz"
+    wget -q --show-progress -c \
+    https://www.python.org/ftp/python/${latest_version}/Python-${latest_version}.tar.xz
 
-    if [[ ! -f "Python-${latest_version}.tar.xz" ]]; then
-        echo -e "${red}错误：文件 Python-${latest_version}.tar.xz 下载失败${re}"
+    if [[ ! -f Python-${latest_version}.tar.xz ]]; then
+        echo -e "${red}Python 下载失败${re}"
         return
     fi
 
-    tar -xf "Python-${latest_version}.tar.xz"
-    cd "Python-${latest_version}" || exit
+    tar -xf Python-${latest_version}.tar.xz
+    cd Python-${latest_version} || exit
 
-    echo -e "${yellow}开始编译安装 (开启优化模式，这可能需要较长时间)...${re}"
-    
-    # 配置编译选项
-    ./configure --prefix=/usr/local/python3 --enable-optimizations --with-lto
-    
-    # 编译并安装
+    echo -e "${yellow}开始编译安装...${re}"
+
+    ./configure --prefix=/usr/local/python3
     make -j$(nproc 2>/dev/null || echo 2)
     make altinstall
 
-    # 软链接处理：精确定位二进制文件，排除 python3-config 等
-    PY_BIN=$(find /usr/local/python3/bin -maxdepth 1 -executable -name "python3.[0-9]*" | grep -vE "config|m$" | sort -V | tail -n1)
-    PIP_BIN=$(find /usr/local/python3/bin -maxdepth 1 -executable -name "pip3*" | sort -V | tail -n1)
+    PY_BIN=$(find /usr/local/python3/bin -name "python3.*" | sort -V | tail -n1)
+    PIP_BIN=$(find /usr/local/python3/bin -name "pip3*" | head -n1)
 
-    if [[ -n "$PY_BIN" ]]; then
-        ln -sf "$PY_BIN" /usr/local/bin/python3
-        ln -sf "$PIP_BIN" /usr/local/bin/pip3
-    fi
+    ln -sf "$PY_BIN" /usr/local/bin/python3
+    ln -sf "$PIP_BIN" /usr/local/bin/pip3
 
-    # 更新 pip
-    /usr/local/bin/python3 -m ensurepip
-    /usr/local/bin/pip3 install --upgrade pip
+    python3 -m ensurepip --upgrade
+    python3 -m pip install --upgrade pip
 
-    echo -e "${green}Python ${latest_version} 稳定版安装成功${re}"
+    echo -e "${green}Python ${latest_version} 安装成功${re}"
 
-    # 清理
     cd /tmp
-    rm -rf "Python-${latest_version}"*
+    rm -rf Python-${latest_version}*
 }
-
 
 remove_python() {
 

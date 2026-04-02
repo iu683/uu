@@ -1,735 +1,307 @@
-#!/usr/bin/env bash
-PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
-export PATH
+#!/bin/bash
 
-# ────────────────────────── 颜色定义 ──────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;36m'
-CYAN='\033[0;96m'
-BOLD='\033[1m'
-PLAIN='\033[0m'
+# ================== 颜色 ==================
+green="\033[32m"
+yellow="\033[33m"
+red="\033[31m"
+skyblue="\033[36m"
+purple="\033[35m"
+re="\033[0m"
+BLUE="\033[34m"
 
-sh_ver="2.0.0"
-
-# ────────────────────────── 通用工具函数 ──────────────────────────
-info()    { echo -e "${BLUE}[INFO]${PLAIN}  $*"; }
-ok()      { echo -e "${GREEN}[  OK]${PLAIN}  $*"; }
-warn()    { echo -e "${YELLOW}[WARN]${PLAIN}  $*"; }
-error()   { echo -e "${RED}[FAIL]${PLAIN}  $*"; }
-die()     { error "$*"; exit 1; }
-
-
-# ────────────────────────── Root 权限检查 ──────────────────────────
-[[ $EUID -ne 0 ]] && die "请使用 root 用户运行此脚本"
-
-# ────────────────────────── curl 自举安装 ──────────────────────────
-if ! command -v curl &>/dev/null; then
-    warn "未检测到 curl，正在自动安装..."
-    if command -v apt-get &>/dev/null; then
-        apt-get update -qq && apt-get install -y curl -qq
-    elif command -v yum &>/dev/null; then
-        yum install -y curl -q
-    fi
-    command -v curl &>/dev/null || die "curl 安装失败，请手动安装后重试"
-    ok "curl 安装完成"
-fi
-
-# ────────────────────────── 系统信息检测 ──────────────────────────
-if [[ -f /etc/os-release ]]; then
-    . /etc/os-release
-    OS=$ID
-    VER=$VERSION_ID
-elif [[ -f /etc/redhat-release ]]; then
-    OS="centos"
-    VER=$(grep -oE '[0-9]+' /etc/redhat-release | head -1)
-else
-    die "不支持的操作系统"
-fi
-
-ARCH=$(uname -m)
-[[ $ARCH == "x86_64" ]] && ARCH_NAME="amd64" || ARCH_NAME=$ARCH
-
-# ────────────────────────── 依赖检查与安装 ──────────────────────────
-check_dependencies() {
-    hr
-    info "检查系统依赖..."
-
-    if [[ "$OS" =~ centos|rhel|fedora ]]; then
-        PKG_INSTALL="yum install -y -q"
-        DEPS="ca-certificates wget curl"
-    elif [[ "$OS" =~ debian|ubuntu ]]; then
-        PKG_INSTALL="apt-get install -y -qq"
-        DEPS="ca-certificates wget curl"
+# ================== 系统检测 ==================
+detect_os() {
+    OS=$(grep -o -E "Debian|Ubuntu|CentOS|Alpine|Fedora|Rocky|AlmaLinux|Amazon" /etc/os-release 2>/dev/null | head -n 1)
+    if [[ -z $OS ]]; then
+        echo -e "${red}不支持的系统！${re}"
+        exit 1
     else
-        warn "未知包管理器，跳过依赖检查"
-        return 0
-    fi
-
-    local need_install=()
-    for dep in $DEPS; do
-        local installed=0
-        if [[ "$dep" == "ca-certificates" ]]; then
-            [[ -f /etc/ssl/certs/ca-certificates.crt || -f /etc/pki/tls/certs/ca-bundle.crt ]] && installed=1
-        else
-            command -v "$dep" &>/dev/null && installed=1
-        fi
-        [[ $installed -eq 0 ]] && need_install+=("$dep")
-    done
-
-    if [[ ${#need_install[@]} -gt 0 ]]; then
-        warn "缺少依赖: ${need_install[*]}，正在安装..."
-        if [[ "$OS" =~ debian|ubuntu ]]; then
-            apt-get update -qq
-            $PKG_INSTALL "${need_install[@]}"
-            update-ca-certificates 2>/dev/null
-        else
-            $PKG_INSTALL "${need_install[@]}"
-            update-ca-trust force-enable 2>/dev/null
-        fi
-        [[ $? -eq 0 ]] && ok "依赖安装完成" || warn "部分依赖安装失败，可能影响运行"
-    else
-        ok "所有依赖已就绪"
+        echo -e "${green}检测到系统：${yellow}${OS}${re}"
     fi
 }
 
-hr() {
-    echo -e "${GREEN}─────────────────────────────────────────────────${PLAIN}"
-}
-
-# ────────────────────────── 虚拟化检测 ──────────────────────────
-check_virt() {
-    hr
-    info "检测虚拟化类型..."
-
-    if command -v systemd-detect-virt &>/dev/null; then
-        virt_type=$(systemd-detect-virt)
-    elif command -v virt-what &>/dev/null; then
-        virt_type=$(virt-what | head -1)
-    elif grep -q "openvz" /proc/vz/version 2>/dev/null || grep -q "openvz" /proc/cpuinfo 2>/dev/null; then
-        virt_type="openvz"
-    else
-        virt_type="unknown"
-    fi
-
-    ok "虚拟化类型: ${BOLD}${virt_type}${PLAIN}"
-
-    if [[ "$virt_type" == "openvz" ]]; then
-        echo ""
-        echo -e "${RED}  ┌─────────────────────────────────────────────────┐${PLAIN}"
-        echo -e "${RED}  │  ⚠  警告：检测到 OpenVZ 虚拟化                  │${PLAIN}"
-        echo -e "${RED}  │     OpenVZ 容器无法更换内核，无法启用 BBR        │${PLAIN}"
-        echo -e "${RED}  │     建议更换为 KVM / Xen 虚拟化的 VPS            │${PLAIN}"
-        echo -e "${RED}  └─────────────────────────────────────────────────┘${PLAIN}"
-        echo ""
-        read -rp "  是否继续（可能失败）? [y/N]: " continue_openvz
-        [[ ! "$continue_openvz" =~ ^[Yy]$ ]] && exit 1
-    fi
-}
-
-# ────────────────────────── /boot 空间检查 ──────────────────────────
-check_boot_space() {
-    hr
-    info "检查 /boot 分区空间..."
-    local boot_available
-    boot_available=$(df -m /boot 2>/dev/null | tail -1 | awk '{print $4}')
-
-    if [[ -n "$boot_available" ]]; then
-        if [[ $boot_available -lt 100 ]]; then
-            warn "/boot 空间不足（可用: ${boot_available}MB），建议清理旧内核后再继续"
-            read -rp "  是否继续? [y/N]: " continue_boot
-            [[ ! "$continue_boot" =~ ^[Yy]$ ]] && exit 1
-        else
-            ok "/boot 空间充足（可用: ${boot_available}MB）"
-        fi
-    fi
-}
-
-# ────────────────────────── 网络连通性检查 ──────────────────────────
-check_network() {
-    hr
-    info "检查网络连接..."
-
-    # 使用海外可靠节点检测
-    local test_hosts=(
-        "https://www.google.com"
-        "https://cloudflare.com"
-        "https://github.com"
-        "https://1.1.1.1"
-    )
-
-    for host in "${test_hosts[@]}"; do
-        if curl -s --connect-timeout 5 --max-time 8 "$host" > /dev/null 2>&1; then
-            ok "网络连接正常（${host}）"
-            return 0
-        fi
-    done
-
-    if ping -c 2 -W 3 8.8.8.8 > /dev/null 2>&1; then
-        warn "IP 可达但 HTTPS 访问受限，请检查防火墙/DNS"
-        return 0
-    fi
-
-    error "网络连接失败，请检查网络配置"
-    return 1
-}
-
-# ────────────────────────── CentOS EOL 源修复（改用官方 Vault）──────────────────────────
-fixCentOSRepo() {
-    [[ ! "$OS" =~ centos ]] && return
-    [[ "$VER" != "6" && "$VER" != "7" && "$VER" != "8" ]] && return
-
-    hr
-    warn "CentOS ${VER} 官方源已停服，切换到官方 Vault 源..."
-    mkdir -p /etc/yum.repos.d/backup
-    mv /etc/yum.repos.d/CentOS-*.repo /etc/yum.repos.d/backup/ 2>/dev/null
-
-    local vault_base="https://vault.centos.org"
-
-    if [[ "$VER" == "7" ]]; then
-        cat > /etc/yum.repos.d/CentOS-Vault.repo <<EOF
-[base]
-name=CentOS-7-Vault-Base
-baseurl=${vault_base}/7.9.2009/os/\$basearch/
-gpgcheck=0
-enabled=1
-
-[updates]
-name=CentOS-7-Vault-Updates
-baseurl=${vault_base}/7.9.2009/updates/\$basearch/
-gpgcheck=0
-enabled=1
-
-[extras]
-name=CentOS-7-Vault-Extras
-baseurl=${vault_base}/7.9.2009/extras/\$basearch/
-gpgcheck=0
-enabled=1
-EOF
-    elif [[ "$VER" == "6" ]]; then
-        cat > /etc/yum.repos.d/CentOS-Vault.repo <<EOF
-[base]
-name=CentOS-6-Vault-Base
-baseurl=${vault_base}/6.10/os/\$basearch/
-gpgcheck=0
-enabled=1
-
-[updates]
-name=CentOS-6-Vault-Updates
-baseurl=${vault_base}/6.10/updates/\$basearch/
-gpgcheck=0
-enabled=1
-EOF
-    elif [[ "$VER" == "8" ]]; then
-        cat > /etc/yum.repos.d/CentOS-Vault.repo <<EOF
-[baseos]
-name=CentOS-8-Vault-BaseOS
-baseurl=${vault_base}/8.5.2111/BaseOS/\$basearch/os/
-gpgcheck=0
-enabled=1
-
-[appstream]
-name=CentOS-8-Vault-AppStream
-baseurl=${vault_base}/8.5.2111/AppStream/\$basearch/os/
-gpgcheck=0
-enabled=1
-
-[extras]
-name=CentOS-8-Vault-Extras
-baseurl=${vault_base}/8.5.2111/extras/\$basearch/os/
-gpgcheck=0
-enabled=1
-EOF
-    fi
-
-    yum clean all >/dev/null 2>&1
-    ok "CentOS ${VER} Vault 源配置完成（使用官方 vault.centos.org）"
-}
-
-# ────────────────────────── BBR 状态检测 ──────────────────────────
-check_bbr_status() {
-    local cc
-    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    [[ "$cc" == "bbr" ]]
-}
-
-# ────────────────────────── 内核版本检测 ──────────────────────────
-check_kernel_native_bbr() {
-    local kver major minor
-    kver=$(uname -r | cut -d- -f1)
-    major=$(echo "$kver" | cut -d. -f1)
-    minor=$(echo "$kver" | cut -d. -f2)
-
-    if [[ $major -gt 5 ]] || [[ $major -eq 5 && $minor -ge 4 ]]; then
-        ok "内核 ${kver} 原生支持 BBR（最佳）"
-        return 0
-    elif [[ $major -eq 4 && $minor -ge 9 ]] || [[ $major -ge 5 ]]; then
-        warn "内核 ${kver} 支持 BBR（建议升级到 5.4+）"
-        return 0
-    else
-        error "内核 ${kver} 不支持 BBR，需要升级内核"
-        return 1
-    fi
-}
-
-# ────────────────────────── 启用 BBR ──────────────────────────
-enable_bbr() {
-    hr
-    if check_bbr_status; then
-        ok "BBR 已处于启用状态，无需重复操作"
-        return 0
-    fi
-
-    check_kernel_native_bbr || { warn "请先升级内核再启用 BBR"; return 1; }
-
-    info "正在写入 BBR 配置..."
-
-    cat > /etc/sysctl.d/99-bbr.conf <<'EOF'
-# ── BBR 拥塞控制 ──
-net.core.default_qdisc         = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# ── 发送 / 接收缓冲区 ──
-net.core.rmem_max               = 33554432
-net.core.wmem_max               = 33554432
-net.ipv4.tcp_rmem               = 4096 87380 33554432
-net.ipv4.tcp_wmem               = 4096 65536 33554432
-
-# ── 连接队列 ──
-net.core.netdev_max_backlog     = 10000
-net.ipv4.tcp_max_syn_backlog    = 8192
-net.core.somaxconn              = 8192
-
-# ── TCP 快速选项 ──
-net.ipv4.tcp_fastopen           = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-EOF
-
-    sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1
-
-    if check_bbr_status; then
-        echo ""
-        echo -e "${GREEN}  ┌─────────────────────────────────────────────────┐${PLAIN}"
-        echo -e "${GREEN}  │  ✅  BBR 启用成功！网络加速已生效               │${PLAIN}"
-        echo -e "${GREEN}  └─────────────────────────────────────────────────┘${PLAIN}"
-        echo ""
-    else
-        error "BBR 启用失败，请检查内核版本是否 ≥ 4.9"
-        return 1
-    fi
-}
-
-# ────────────────────────── TCP 深度调优 ──────────────────────────
-tcp_tune() {
-    hr
-    info "正在应用 TCP 深度调优..."
-    echo ""
-    echo -e "${YELLOW}  本操作将优化以下参数：${PLAIN}"
-    echo "    • TIME_WAIT 连接回收与复用"
-    echo "    • TCP 连接保活 (keepalive)"
-    echo "    • MTU 探测 & PMTU"
-    echo "    • 本地端口范围扩展"
-    echo "    • SYN Cookie 防 SYN Flood"
-    echo "    • 连接追踪表 (nf_conntrack)"
-    echo "    • 文件描述符上限"
-    echo ""
-    read -rp "  确认写入? [y/N]: " confirm_tune
-    [[ ! "$confirm_tune" =~ ^[Yy]$ ]] && { warn "已取消"; return; }
-
-    cat > /etc/sysctl.d/99-tcp-tune.conf <<'EOF'
-
-# ── TIME_WAIT ──────────────────────────────
-# 加快 TIME_WAIT 回收（仅在 NAT 环境关闭）
-net.ipv4.tcp_tw_reuse           = 1
-# TIME_WAIT 最大数量，超出直接丢弃
-net.ipv4.tcp_max_tw_buckets     = 20000
-
-# ── 连接保活 ───────────────────────────────
-# 空闲 60s 后开始发送 keepalive 探测包
-net.ipv4.tcp_keepalive_time     = 60
-# 探测间隔 10s
-net.ipv4.tcp_keepalive_intvl    = 10
-# 最多探测 6 次无响应则断开
-net.ipv4.tcp_keepalive_probes   = 6
-
-# ── SYN 握手 ───────────────────────────────
-# SYN Cookie 防 SYN Flood
-net.ipv4.tcp_syncookies         = 1
-# SYN 重试次数
-net.ipv4.tcp_syn_retries        = 3
-net.ipv4.tcp_synack_retries     = 3
-# SYN 等待队列
-net.ipv4.tcp_max_syn_backlog    = 8192
-net.core.somaxconn              = 8192
-
-# ── 端口范围 ───────────────────────────────
-net.ipv4.ip_local_port_range    = 1024 65535
-
-# ── MTU 探测（推荐开启，减少分片）──────────
-net.ipv4.tcp_mtu_probing        = 1
-
-# ── 内存与缓冲区 ───────────────────────────
-net.core.rmem_default           = 262144
-net.core.wmem_default           = 262144
-net.core.rmem_max               = 33554432
-net.core.wmem_max               = 33554432
-net.ipv4.tcp_rmem               = 4096 87380 33554432
-net.ipv4.tcp_wmem               = 4096 65536 33554432
-net.ipv4.tcp_mem                = 786432 1048576 26777216
-
-# ── 连接队列/网卡接收队列 ──────────────────
-net.core.netdev_max_backlog     = 10000
-
-# ── TCP 选项 ───────────────────────────────
-# 启用 TCP Fast Open
-net.ipv4.tcp_fastopen           = 3
-# 关闭空闲后慢启动（提升长肥管道性能）
-net.ipv4.tcp_slow_start_after_idle = 0
-# 选择性确认（提升丢包恢复效率）
-net.ipv4.tcp_sack               = 1
-# 时间戳（配合 tw_reuse 使用）
-net.ipv4.tcp_timestamps         = 1
-# 窗口扩展（大带宽必备）
-net.ipv4.tcp_window_scaling     = 1
-# 有序 ACK
-net.ipv4.tcp_no_metrics_save    = 1
-
-# ── 连接追踪表（如有 nf_conntrack 模块）──────
-net.netfilter.nf_conntrack_max              = 1000000
-net.netfilter.nf_conntrack_tcp_timeout_established = 7200
-
-# ── 文件描述符 ─────────────────────────────
-fs.file-max                     = 1000000
-EOF
-
-    # 应用参数（忽略不支持的 nf_conntrack，模块未加载时可能报错）
-    sysctl --system 2>/dev/null | grep -v "^sysctl:" | grep -v "No such file" | grep -v "nf_conntrack" | grep "=" | head -20 || true
-    sysctl -p /etc/sysctl.d/99-tcp-tune.conf 2>/dev/null || sysctl -p /etc/sysctl.d/99-tcp-tune.conf 2>&1 | grep -v "nf_conntrack" >/dev/null
-
-    # 提升系统文件描述符限制（持久化）
-    if ! grep -q "# tcp-tune" /etc/security/limits.conf 2>/dev/null; then
-        cat >> /etc/security/limits.conf <<'EOF'
-
-# tcp-tune: 提升文件描述符限制
-* soft nofile 1000000
-* hard nofile 1000000
-root soft nofile 1000000
-root hard nofile 1000000
-EOF
-    fi
-
-    echo ""
-    echo -e "${GREEN}  ┌─────────────────────────────────────────────────┐${PLAIN}"
-    echo -e "${GREEN}  │  ✅  TCP 调优配置已写入                         │${PLAIN}"
-    echo -e "${GREEN}  │     配置文件: /etc/sysctl.d/99-tcp-tune.conf    │${PLAIN}"
-    echo -e "${GREEN}  │     无需重启，参数立即生效                       │${PLAIN}"
-    echo -e "${GREEN}  └─────────────────────────────────────────────────┘${PLAIN}"
-    echo ""
-}
-
-# ────────────────────────── Ubuntu/Debian 升级内核 ──────────────────────────
-upgrade_kernel_debian() {
-    hr
-    info "为 $OS $VER 升级内核..."
-
-    local kver major minor
-    kver=$(uname -r | cut -d- -f1)
-    major=$(echo "$kver" | cut -d. -f1)
-    minor=$(echo "$kver" | cut -d. -f2)
-
-    if [[ $major -gt 5 ]] || [[ $major -eq 5 && $minor -ge 4 ]]; then
-        ok "当前内核 ${kver} 已满足要求，直接启用 BBR"
-        enable_bbr
-        return 0
-    fi
-
-    info "使用官方镜像源更新软件包列表..."
-
-    # 恢复/使用官方源（海外 VPS 直连官方源更可靠）
-    if [[ "$OS" == "ubuntu" ]]; then
-        sed -i 's|https\?://mirrors\.[a-z0-9.]*\.[a-z]*/ubuntu|http://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list 2>/dev/null
-    elif [[ "$OS" == "debian" ]]; then
-        sed -i 's|https\?://mirrors\.[a-z0-9.]*\.[a-z]*/debian|http://deb.debian.org/debian|g' /etc/apt/sources.list 2>/dev/null
-    fi
-
-    apt-get update -qq
-
-    local DPKG_ARCH
-    DPKG_ARCH=$(dpkg --print-architecture)
-
-    if [[ "$OS" == "ubuntu" ]]; then
-        case "$VER" in
-            20.*|22.*|24.*)
-                info "安装 linux-generic（Ubuntu ${VER}）..."
-                apt-get install -y linux-generic ;;
-            18.*)
-                info "安装 HWE 内核（Ubuntu 18.04）..."
-                apt-get install -y --install-recommends linux-generic-hwe-18.04 ;;
-            *)
-                info "安装通用内核..."
-                apt-get install -y --install-recommends linux-generic-hwe-16.04 2>/dev/null || \
-                apt-get install -y linux-generic ;;
-        esac
-    elif [[ "$OS" == "debian" ]]; then
-        info "安装 linux-image-${DPKG_ARCH}..."
-        apt-get install -y linux-image-"$DPKG_ARCH"
-    fi
-
-    if [[ $? -eq 0 ]]; then
-        echo ""
-        echo -e "${GREEN}  ┌─────────────────────────────────────────────────┐${PLAIN}"
-        echo -e "${GREEN}  │  ✅  内核升级完成，请重启后再启用 BBR           │${PLAIN}"
-        echo -e "${GREEN}  └─────────────────────────────────────────────────┘${PLAIN}"
-        echo ""
-    else
-        error "内核升级失败"
-        return 1
-    fi
-}
-
-# ────────────────────────── CentOS 升级内核 ──────────────────────────
-upgrade_kernel_centos() {
-    hr
-
-    if [[ -n "$VER" && "$VER" -ge 8 ]] 2>/dev/null; then
-        echo ""
-        echo -e "${RED}  ┌─────────────────────────────────────────────────────┐${PLAIN}"
-        echo -e "${RED}  │  ⚠  不支持 CentOS ${VER}+ 内核升级                   │${PLAIN}"
-        echo -e "${RED}  │     CentOS 8+ 已停止维护，强升内核易导致系统损坏     │${PLAIN}"
-        echo -e "${YELLOW}  │                                                     │${PLAIN}"
-        echo -e "${YELLOW}  │  推荐迁移至：                                       │${PLAIN}"
-        echo -e "${GREEN}  │    ✔  Ubuntu 20.04 / 22.04 / 24.04                │${PLAIN}"
-        echo -e "${GREEN}  │    ✔  Debian 11 / 12                              │${PLAIN}"
-        echo -e "${GREEN}  │    ✔  Rocky Linux 8/9 / AlmaLinux 8/9             │${PLAIN}"
-        echo -e "${RED}  └─────────────────────────────────────────────────────┘${PLAIN}"
-        echo ""
-        read -n1 -rp "  按任意键返回..." _; return 1
-    fi
-
-    info "为 CentOS $VER 升级内核..."
-
-    local kver major minor
-    kver=$(uname -r | cut -d- -f1)
-    major=$(echo "$kver" | cut -d. -f1)
-    minor=$(echo "$kver" | cut -d. -f2)
-
-    if [[ $major -gt 5 ]] || [[ $major -eq 5 && $minor -ge 4 ]]; then
-        ok "内核 ${kver} 已支持 BBR，直接启用"
-        enable_bbr
-        return 0
-    fi
-
-    fixCentOSRepo
-
-    if [[ "$VER" == "7" ]]; then
-        grep -q "^timeout=" /etc/yum.conf || echo "timeout=60" >> /etc/yum.conf
-        grep -q "^retries=" /etc/yum.conf || echo "retries=3"  >> /etc/yum.conf
-
-        info "导入 ELRepo GPG 密钥（官方）..."
-        rpm --import https://www.elrepo.org/RPM-GPG-KEY-elrepo.org 2>/dev/null
-
-        info "安装 ELRepo 源（官方）..."
-        yum install -y https://www.elrepo.org/elrepo-release-7.el7.elrepo.noarch.rpm 2>/dev/null || \
-            { error "ELRepo 安装失败"; return 1; }
-
-        yum clean all -q
-
-        echo ""
-        echo -e "${YELLOW}  ┌─────────────────────────────────────────────────┐${PLAIN}"
-        echo -e "${YELLOW}  │  ℹ  正在下载内核（约 150-200MB），请耐心等待   │${PLAIN}"
-        echo -e "${YELLOW}  │     如长时间无进度，可按 Ctrl+C 中断重试        │${PLAIN}"
-        echo -e "${YELLOW}  └─────────────────────────────────────────────────┘${PLAIN}"
-        echo ""
-
-        local attempt=1 success=0
-        while [[ $attempt -le 3 ]]; do
-            info "尝试安装内核（第 ${attempt}/3 次）..."
-            yum --enablerepo=elrepo-kernel install -y kernel-ml kernel-ml-devel && success=1 && break
-            error "安装失败，${attempt}/3 次"; yum clean all -q; ((attempt++)); sleep 3
-        done
-
-        if [[ $success -eq 1 ]]; then
-            grub2-set-default 0
-            grub2-mkconfig -o /boot/grub2/grub.cfg
-            echo ""
-            echo -e "${GREEN}  ✅  内核升级完成，请重启后再启用 BBR${PLAIN}"
-            echo ""
-        else
-            error "内核升级失败（3 次均未成功），请手动操作或更换系统"
-            return 1
-        fi
-    else
-        error "CentOS $VER 不支持自动升级内核"
-        return 1
-    fi
-}
-
-# ────────────────────────── 清理旧内核 ──────────────────────────
-remove_old_kernels() {
-    hr
-    info "检测已安装内核..."
-
-    if [[ "$OS" =~ centos|rhel ]]; then
-        local installed_kernels kernel_count old_kernels
-        installed_kernels=$(rpm -qa | grep '^kernel-[0-9]' | sort -V)
-        kernel_count=$(echo "$installed_kernels" | wc -l)
-
-        if [[ $kernel_count -gt 2 ]]; then
-            echo ""
-            warn "发现 ${kernel_count} 个内核，将保留最新 2 个，以下内核将被删除："
-            echo "$installed_kernels" | head -n -2 | sed 's/^/    /'
-            echo ""
-            read -rp "  确认删除? [y/N]: " confirm_remove
-            if [[ "$confirm_remove" =~ ^[Yy]$ ]]; then
-                old_kernels=$(echo "$installed_kernels" | head -n -2)
-                [[ -n "$old_kernels" ]] && echo "$old_kernels" | xargs yum remove -y -q
-                ok "旧内核清理完成"
-            else
-                warn "已取消"
-            fi
-        else
-            ok "当前内核数量 ${kernel_count} 个，无需清理"
-        fi
-
-    elif [[ "$OS" =~ debian|ubuntu ]]; then
-        local current_kernel installed_kernels
-        current_kernel=$(uname -r)
-        installed_kernels=$(dpkg -l | grep 'linux-image-[0-9]' | awk '{print $2}')
-
-        echo ""
-        info "当前运行内核: ${BOLD}${current_kernel}${PLAIN}"
-        info "已安装内核列表："
-        echo "$installed_kernels" | sed 's/^/    /'
-        echo ""
-        read -rp "  清理非当前内核? [y/N]: " confirm_remove
-        if [[ "$confirm_remove" =~ ^[Yy]$ ]]; then
-            for kernel in $installed_kernels; do
-                if [[ "$kernel" != *"$current_kernel"* ]]; then
-                    info "移除: $kernel"
-                    apt-get purge -y "$kernel" -qq 2>/dev/null
-                fi
-            done
-            apt-get autoremove -y -qq
-            ok "旧内核清理完成"
-        else
-            warn "已取消"
-        fi
-    fi
-}
-
-# ────────────────────────── 系统状态展示 ──────────────────────────
-show_status() {
-    hr
-    local bbr_status bbr_mod qdisc cc
-    check_bbr_status  && bbr_status="${GREEN}✅ 已启用${PLAIN}" || bbr_status="${RED}❌ 未启用${PLAIN}"
-    lsmod | grep -q bbr && bbr_mod="${GREEN}✅ 已加载${PLAIN}"   || bbr_mod="${RED}❌ 未加载${PLAIN}"
-    qdisc=$(sysctl -n net.core.default_qdisc        2>/dev/null || echo "未设置")
-    cc=$(sysctl -n net.ipv4.tcp_congestion_control  2>/dev/null || echo "未设置")
-
-    printf "  ${CYAN}%-18s${PLAIN} %s\n"    "操作系统:"   "$OS $VER"
-    printf "  ${CYAN}%-18s${PLAIN} %s\n"    "系统架构:"   "$ARCH"
-    printf "  ${CYAN}%-18s${PLAIN} %s\n"    "内核版本:"   "$(uname -r)"
-    printf "  ${CYAN}%-18s${PLAIN}${bbr_status}\n" "BBR 状态:"
-    printf "  ${CYAN}%-18s${PLAIN}${bbr_mod}\n"    "BBR 模块:"
-    printf "  ${CYAN}%-18s${PLAIN} %s\n"    "队列算法:"   "$qdisc"
-    printf "  ${CYAN}%-18s${PLAIN} %s\n"    "拥塞控制:"   "$cc"
-
-    # TCP 调优状态
-    if [[ -f /etc/sysctl.d/99-tcp-tune.conf ]]; then
-        printf "  ${CYAN}%-18s${PLAIN} ${GREEN}✅ 已应用${PLAIN}\n" "TCP 调优:"
-    else
-        printf "  ${CYAN}%-18s${PLAIN} ${YELLOW}⬜ 未应用${PLAIN}\n" "TCP 调优:"
-    fi
-    hr
-}
-
-# ────────────────────────── 卸载 BBR / TCP 调优 ──────────────────────────
-uninstall_bbr() {
-    warn "正在卸载 BBR / TCP 调优配置..."
-
-    # 删除配置文件
-    rm -f /etc/sysctl.d/99-bbr.conf
-    rm -f /etc/sysctl.d/99-tcp-tune.conf
-
-    # 重新加载 sysctl
-    sysctl --system >/dev/null 2>&1
-
-    # 显示当前拥塞算法
-    algo=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    info "当前拥塞控制算法: $algo"
-}
-
-# ────────────────────────── 主菜单 ──────────────────────────
-show_menu() {
-    clear
-    show_status
-    echo -e "  ${GREEN}1.安装启用 BBR ${PLAIN}"
-    echo -e "  ${GREEN}2.TCP 深度调优${PLAIN}"
-    echo -e "  ${GREEN}3.升级内核${PLAIN}"
-    echo -e "  ${GREEN}4.清理旧内核${PLAIN}"
-    echo -e "  ${GREEN}5.删除恢复系统默认${PLAIN}"
-    echo -e "  ${GREEN}0.退出${PLAIN}"
-    read -rp "$(echo -e ${GREEN}   请输入选项: ${PLAIN})" choice
-
-    case $choice in
-        1)
-            if check_kernel_native_bbr 2>/dev/null; then
-                enable_bbr
-            else
-                warn "当前内核不支持 BBR，请先选 3 或 4 升级内核"
-            fi
+# ================== 基础依赖 ==================
+install_deps() {
+    case $OS in
+        Debian|Ubuntu)
+            apt update -y
+            apt install -y wget tar build-essential libreadline-dev libncursesw5-dev libssl-dev libsqlite3-dev tk-dev libgdbm-dev libc6-dev libbz2-dev libffi-dev zlib1g-dev curl jq software-properties-common
             ;;
-        2)
-            tcp_tune
+        CentOS)
+            yum update -y
+            yum groupinstall -y "development tools"
+            yum install -y wget tar openssl-devel bzip2-devel libffi-devel zlib-devel curl jq epel-release yum-utils
             ;;
-        3)
-            if [[ "$OS" =~ debian|ubuntu ]]; then
-                check_boot_space
-                upgrade_kernel_debian
-                read -rp "  是否现在重启? [y/N]: " reboot_now
-                [[ "$reboot_now" =~ ^[Yy]$ ]] && reboot
-            else
-                error "此选项仅适用于 Ubuntu / Debian"
-            fi
+        Fedora|Rocky|AlmaLinux|Amazon)
+            dnf update -y
+            dnf groupinstall -y "development tools"
+            dnf install -y wget tar openssl-devel bzip2-devel libffi-devel zlib-devel curl jq epel-release yum-utils
             ;;
-        4)
-            remove_old_kernels
-            ;;
-        5)
-            uninstall_bbr
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            error "无效选项"
+        Alpine)
+            apk update
+            apk add wget tar build-base openssl-dev bzip2-dev libffi-dev zlib-dev curl jq
             ;;
     esac
-
-    echo ""
-    read -n1 -rp "  按任意键继续..." _
-    echo ""
-    show_menu
 }
 
-# ════════════════════════════════════════════
-#   入口：预检查 → 智能判断 → 主菜单
-# ════════════════════════════════════════════
-clear
+# ================== 系统架构 ==================
+get_arch() {
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64) ARCH="amd64" ;;
+        x86) ARCH="386" ;;
+        arm64|aarch64) ARCH="arm64" ;;
+        *) echo -e "${red}不支持的架构: $arch${re}"; exit 1 ;;
+    esac
+}
 
-echo -e "${BLUE}  ◆ 执行环境预检查...${PLAIN}"
-echo ""
+# ================== Python ==================
+install_python() {
 
-check_dependencies
-check_network
-check_virt
-fixCentOSRepo
+    latest_version=$(curl -s https://www.python.org/ftp/python/ \
+    | grep -oE '3\.[0-9]+\.[0-9]+/' \
+    | tr -d '/' \
+    | sort -V | tail -n1)
 
-echo ""
-ok "预检查完成！"
-echo ""
-sleep 1
+    if [[ -z "$latest_version" ]]; then
+        echo -e "${red}获取 Python 最新版本失败${re}"
+        return
+    fi
 
+    if command -v python3 &>/dev/null; then
+        current_version=$(python3 -V 2>&1 | awk '{print $2}')
 
-show_menu
+        if [[ "$current_version" == "$latest_version" ]]; then
+            echo -e "${green}Python 已是最新版本: ${yellow}${latest_version}${re}"
+            return
+        fi
+
+        read -rp "检测到 Python 版本 ${current_version}, 升级到 ${latest_version}？[y/n]: " confirm
+        [[ ! $confirm =~ ^[Yy]$ ]] && return
+    fi
+
+    install_deps
+
+    cd /tmp || exit
+
+    echo -e "${yellow}下载 Python ${latest_version}...${re}"
+
+    wget -q https://www.python.org/ftp/python/${latest_version}/Python-${latest_version}.tar.xz
+
+    if [[ ! -f Python-${latest_version}.tar.xz ]]; then
+        echo -e "${red}Python 下载失败${re}"
+        return
+    fi
+
+    tar -xf Python-${latest_version}.tar.xz
+    cd Python-${latest_version} || exit
+
+    ./configure --prefix=/usr/local/python3 --enable-optimizations --with-lto
+    make -j$(nproc 2>/dev/null || echo 2)
+    make altinstall
+
+    PY_BIN=$(ls /usr/local/python3/bin/python3* | head -n1)
+    PIP_BIN=$(ls /usr/local/python3/bin/pip3* | head -n1)
+
+    ln -sf "$PY_BIN" /usr/local/bin/python3
+    ln -sf "$PIP_BIN" /usr/local/bin/pip3
+
+    python3 -m ensurepip
+    pip3 install --upgrade pip
+
+    echo -e "${green}Python ${latest_version} 安装成功${re}"
+
+    cd /tmp
+    rm -rf Python-${latest_version}*
+}
+
+remove_python() {
+
+    echo -e "${yellow}卸载 Python (仅删除手动安装版本)...${re}"
+
+    rm -rf /usr/local/python3
+    rm -f /usr/local/bin/python3*
+    rm -f /usr/local/bin/pip3*
+
+    echo -e "${green}Python 卸载完成${re}"
+}
+# ================== Node.js ==================
+install_node() {
+
+if command -v node &>/dev/null; then
+    echo -e "${yellow}Node.js 已安装: $(node -v)${re}"
+    return
+fi
+
+echo -e "${green}安装 Node.js...${re}"
+
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt install -y nodejs
+
+echo -e "${green}Node版本: $(node -v)${re}"
+echo -e "${green}NPM版本: $(npm -v)${re}"
+
+}
+
+remove_node() {
+    echo -e "${yellow}卸载 Node.js...${re}"
+
+    apt purge -y nodejs
+    apt autoremove -y
+
+    echo -e "${green}Node.js 卸载完成${re}"
+}
+
+# ================== Go ==================
+install_go() {
+    get_arch
+    html=$(curl -s https://go.dev/dl/)
+    latest_version=$(echo "$html" | grep -oP 'go[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+    latest_version_num=${latest_version/go/}
+
+    if command -v go &>/dev/null; then
+        current_version=$(go version | grep -oE 'go[0-9]+\.[0-9]+\.[0-9]+' | cut -c3-)
+        [[ $current_version == $latest_version_num ]] && {
+            echo -e "${green}Go 已是最新版: $current_version${re}"
+            return
+        }
+
+        read -p "检测到 Go 版本 $current_version, 升级到 $latest_version_num？[y/n]: " confirm
+        [[ ! $confirm =~ ^[Yy]$ ]] && return
+
+        remove_go
+    fi
+
+    echo -e "${yellow}下载 Go ${latest_version_num}...${re}"
+
+    wget -O /tmp/go_latest.tar.gz "https://go.dev/dl/${latest_version}.linux-${ARCH}.tar.gz" || {
+        echo -e "${red}Go 下载失败${re}"
+        return
+    }
+
+    rm -rf /usr/local/go
+    tar -C /usr/local -xzf /tmp/go_latest.tar.gz
+
+    echo "export PATH=/usr/local/go/bin:\$PATH" > /etc/profile.d/go.sh
+    source /etc/profile.d/go.sh
+    hash -r
+
+    rm -f /tmp/go_latest.tar.gz
+
+    echo -e "${green}Go 安装完成，当前版本: $(go version)${re}"
+}
+
+remove_go() {
+    echo -e "${yellow}卸载 Go...${re}"
+
+    rm -rf /usr/local/go
+    rm -f /etc/profile.d/go.sh
+
+    hash -r
+
+    echo -e "${green}Go 卸载完成${re}"
+}
+
+# ================== Java ==================
+install_java() {
+    get_arch
+    latest_version="17.0.10"
+    if command -v java &>/dev/null; then
+        current_version=$(java -version 2>&1 | awk -F '"' '/version/ {print $2}')
+        [[ $current_version == $latest_version ]] && { echo -e "${green}Java 已是最新版: $latest_version${re}"; return; }
+        read -p "检测到 Java 版本 $current_version, 升级到 $latest_version？[y/n]: " confirm
+        [[ ! $confirm =~ ^[Yy]$ ]] && return
+        remove_java
+    fi
+    case $OS in
+        Debian|Ubuntu) apt install -y openjdk-17-jdk ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon) yum install -y java-17-openjdk java-17-openjdk-devel ;;
+        Alpine) apk add openjdk17 ;;
+    esac
+    echo -e "${green}Java 安装完成，版本: $(java -version 2>&1 | head -n1)${re}"
+}
+
+remove_java() {
+    echo -e "${yellow}卸载 Java...${re}"
+    case $OS in
+        Debian|Ubuntu) apt remove -y openjdk-* && apt autoremove -y ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon) yum remove -y java* && yum autoremove -y ;;
+        Alpine) apk del openjdk17 ;;
+    esac
+    rm -rf /usr/lib/jvm/java-* /usr/local/java /opt/java
+    echo -e "${green}Java 卸载完成${re}"
+}
+
+# ================== PHP ==================
+install_php() {
+    case $OS in
+        Debian|Ubuntu)
+            apt update -y
+            add-apt-repository -y ppa:ondrej/php
+            apt update -y
+            latest_version=$(apt-cache pkgnames | grep -oP '^php[0-9]+\.[0-9]+$' | sort -V | tail -1)
+            apt install -y $latest_version $latest_version-cli $latest_version-fpm $latest_version-mysql $latest_version-xml $latest_version-curl $latest_version-mbstring $latest_version-zip
+            ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon)
+            yum install -y epel-release yum-utils
+            yum install -y https://rpms.remirepo.net/enterprise/remi-release-7.rpm
+            yum-config-manager --enable remi-php74   # 可修改为最新支持版本
+            yum install -y php php-cli php-fpm php-mysqlnd php-xml php-mbstring php-curl php-zip
+            ;;
+        Alpine)
+            apk add --no-cache php php-cli php-fpm php-mysqli php-curl php-xml php-mbstring php-zip
+            ;;
+    esac
+    echo -e "${green}PHP 安装完成，版本: $(php -v | head -n1)${re}"
+}
+
+remove_php() {
+    echo -e "${yellow}卸载 PHP...${re}"
+    case $OS in
+        Debian|Ubuntu) apt purge -y php* && apt autoremove -y ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon) yum remove -y php* && yum autoremove -y ;;
+        Alpine) apk del php php-cli php-fpm php-mysqli php-curl php-xml php-mbstring php-zip ;;
+    esac
+    echo -e "${green}PHP 卸载完成${re}"
+}
+
+# ================== 主菜单 ==================
+main_menu() {
+    detect_os
+    while true; do
+        clear
+        echo -e "${yellow}===== 常用环境安装管理=====${re}"
+        echo -e "${green} 1.安装Python${re}"
+        echo -e "${green} 2.安装Nodejs${re}"
+        echo -e "${green} 3.安装Golang${re}"
+        echo -e "${green} 4.安装Java${re}"
+        echo -e "${green} 5.安装PHP${re}"
+        echo -e "${yellow}===== 常用环境卸载管理=====${re}"
+        echo -e "${green} 6.卸载Python${re}"
+        echo -e "${green} 7.卸载Nodejs${re}"
+        echo -e "${green} 8.卸载Golang${re}"
+        echo -e "${green} 9.卸载Java${re}"
+        echo -e "${green}10.卸载PHP${re}"
+        echo -e "${green} 0.退出${re}"
+        read -p "$(echo -e ${green} 请输入选项: ${re})" choice
+
+        case $choice in
+            1) install_python ;;
+            2) install_node ;;
+            3) install_go ;;
+            4) install_java ;;
+            5) install_php ;;
+            6) remove_python ;;
+            7) remove_node ;;
+            8) remove_go ;;
+            9) remove_java ;;
+            10) remove_php ;;
+            0) exit 0 ;;
+            *) echo -e "${yellow}无效输入！${re}"; sleep 1 ;;
+        esac
+        read -p "$(echo -e ${GREEN}按任意键返回菜单...${RESET})" dummy
+    done
+}
+
+# ================== 启动菜单 ==================
+main_menu

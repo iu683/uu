@@ -2,7 +2,7 @@
 set -e
 
 # ==========================================================
-# VPS 全能一键优化脚本 - 最终完善版
+# VPS 全能一键优化脚本 
 # ==========================================================
 
 # -----------------------------
@@ -409,7 +409,7 @@ configure_ssh_security() {
     # 1. 交互判断：非交互模式下默认跳过
     if [[ "$non_interactive" = false ]]; then
         # [y/N] 表示回车默认为 No
-        read -p "是否配置 SSH 密钥登录并禁用密码登录? [y/N]: " -r SETUP_KEY
+        read -p "是否配置 SSH 密钥登录并禁用密码登录? [y/n]: " -r SETUP_KEY
         
         # 只要输入的不是 y 或 Y（包括直接回车），就视为取消
         if [[ ! "$SETUP_KEY" =~ ^[yY]$ ]]; then
@@ -462,7 +462,7 @@ configure_ssh_security() {
         log "${GREEN}✅ SSH 安全加固完成${NC}"
         
         echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${RED}⚠️  重要提示：请务必保存下方的私钥内容到本地电脑！${NC}"
+        echo -e "${RED}   重要提示：请务必保存下方的私钥内容到本地电脑！${NC}"
         echo -e "${RED}   由于您禁用了密码登录，丢失此私钥将导致无法再次进入服务器。${NC}"
         echo -e "${CYAN}------------------- 私钥开始 (PRIVATE KEY) -------------------${NC}"
         cat "$keypath"
@@ -470,7 +470,7 @@ configure_ssh_security() {
         echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         
         if [[ "$non_interactive" = false ]]; then
-            read -n 1 -s -r -p "确认已复制私钥？按任意键继续执行脚本..."
+            read -n 1 -s -r -p "确认已复制私钥？按任意键继续执行..."
             echo ""
         fi
     else
@@ -660,7 +660,7 @@ docker_install() {
     
     # 交互判断逻辑
     if [[ "$non_interactive" = false ]]; then
-        read -p "是否安装 Docker 和 Docker Compose? [Y/n]: " -r INSTALL_DOCKER
+        read -p "是否安装 Docker 和 Docker Compose? [y/n]: " -r INSTALL_DOCKER
         # 默认为 Y，只有输入 n 或 N 时才跳过
         [[ "$INSTALL_DOCKER" =~ ^[nN]$ ]] && { log "${YELLOW}已取消 Docker 安装${RESET}"; return 0; }
     fi
@@ -712,6 +712,43 @@ EOF
 }
 
 # -----------------------------
+# 11. 系统垃圾清理
+# -----------------------------
+clean_system() {
+    log "\n${YELLOW}=============== 11. 系统垃圾清理 ============${NC}"
+    
+    case "$OS_TYPE" in
+        debian)
+            log "${BLUE}正在清理 Debian/Ubuntu 缓存...${NC}"
+            apt-get autoremove -y >> "$LOG_FILE" 2>&1
+            apt-get autoclean -y >> "$LOG_FILE" 2>&1
+            apt-get clean -y >> "$LOG_FILE" 2>&1
+            ;;
+        rhel)
+            log "${BLUE}正在清理 RHEL/CentOS 缓存...${NC}"
+            yum autoremove -y >> "$LOG_FILE" 2>&1
+            yum clean all >> "$LOG_FILE" 2>&1
+            ;;
+        alpine)
+            log "${BLUE}正在清理 Alpine 缓存...${NC}"
+            rm -rf /var/cache/apk/*
+            ;;
+    esac
+
+    log "${BLUE}正在清理临时文件与系统日志...${NC}"
+    # 清理日志文件 (保留目录结构，清空内容)
+    find /var/log -type f -regex '.*\.gz$\|.*\.[0-9]$活.*\.log$' -exec truncate -s 0 {} + 2>/dev/null || true
+    
+    # 清理临时目录
+    rm -rf /tmp/* /var/tmp/*
+    
+    # 清理命令历史 (可选)
+    history -c
+    
+    log "${GREEN}✅ 系统清理完成${NC}"
+}
+
+# -----------------------------
 # 显示 VPS 信息 (智能版)
 # -----------------------------
 show_vps_info() {
@@ -746,11 +783,22 @@ show_vps_info() {
     else
         bbr_display="未启用"
     fi
-
+    
+    # Docker状态检测
+    local docker_display
+    if command -v docker >/dev/null 2>&1; then
+        if systemctl is-active --quiet docker; then
+            docker_display="已启用"
+        else
+            docker_display="已安装但未启用"
+        fi
+    else
+        docker_display="未安装"
+    fi
 
     local hostname_display="${NEW_HOSTNAME:-$(hostname)}"
     local dns_v4_display="${PRIMARY_DNS_V4:-8.8.8.8}, ${SECONDARY_DNS_V4:-1.1.1.1}"
-    local dns_v6_display="${PRIMARY_DNS_V6:-2606:4700:4700::1111}, ${SECONDARY_DNS_V6:-2001:4860:4860::8888}"
+    local dns_v6_display="${PRIMARY_DNS_V6:-2606:4700:4700::1111}"
 
     echo -e "${CYAN}================== VPS信息 ==================${NC}"
     echo -e "${YELLOW}主机名: ${hostname_display}${NC}"
@@ -760,6 +808,7 @@ show_vps_info() {
     echo -e "${YELLOW}DNS (IPv4): ${dns_v4_display}${NC}"
     echo -e "${YELLOW}DNS (IPv6): ${dns_v6_display}${NC}"
     echo -e "${YELLOW}Fail2ban: ${fail2ban_display}${NC}"
+    echo -e "${YELLOW}Docker: ${docker_display}${NC}"
     echo -e "${YELLOW}SSH端口: ${ssh_display}${NC}"
     echo -e "${CYAN}==============================================${NC}"
 }
@@ -785,6 +834,7 @@ main() {
     install_nexttrace
     enable_time_sync
     docker_install
+    clean_system
 
     show_vps_info
 

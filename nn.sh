@@ -58,13 +58,15 @@ get_arch() {
 # ================== Python ==================
 install_python() {
 
-    latest_version=$(curl -s https://www.python.org/ftp/python/ \
-    | grep -oP 'href="\K[0-9]+\.[0-9]+\.[0-9]+(?=/")' | sort -V | tail -n1)
+    latest_version=$(curl -s https://www.python.org/downloads/ \
+    | grep -oP 'Python 3\.[0-9]+\.[0-9]+' \
+    | head -n1 \
+    | awk '{print $2}')
 
     if command -v python3 &>/dev/null; then
         current_version=$(python3 -V 2>&1 | awk '{print $2}')
 
-        if [[ $current_version == $latest_version ]]; then
+        if [[ "$current_version" == "$latest_version" ]]; then
             echo -e "${green}Python 已是最新版本: ${yellow}${latest_version}${re}"
             return
         fi
@@ -79,28 +81,30 @@ install_python() {
 
     echo -e "${yellow}下载 Python ${latest_version}...${re}"
 
-    wget -q https://www.python.org/ftp/python/${latest_version}/Python-${latest_version}.tgz || {
+    wget -q https://www.python.org/ftp/python/${latest_version}/Python-${latest_version}.tgz
+
+    if [[ ! -f Python-${latest_version}.tgz ]]; then
         echo -e "${red}Python 下载失败${re}"
         return
-    }
+    fi
 
     tar -zxf Python-${latest_version}.tgz
     cd Python-${latest_version} || exit
 
-    ./configure --prefix=/usr/local/python3 --enable-optimizations --with-lto
-    make -j$(nproc)
+    ./configure --prefix=/usr/local/python3 --enable-optimizations --with-lto --enable-shared
+    make -j$(nproc 2>/dev/null || echo 2)
     make altinstall
 
     PY_BIN=$(ls /usr/local/python3/bin/python3* | head -n1)
+    PIP_BIN=$(ls /usr/local/python3/bin/pip3* | head -n1)
 
     ln -sf "$PY_BIN" /usr/local/bin/python3
-    ln -sf /usr/local/python3/bin/pip3* /usr/local/bin/pip3
+    ln -sf "$PIP_BIN" /usr/local/bin/pip3
 
     echo -e "${green}Python ${latest_version} 安装成功${re}"
 
     cd /tmp
     rm -rf Python-${latest_version}*
-
 }
 
 remove_python() {
@@ -114,7 +118,6 @@ remove_python() {
     echo -e "${green}Python 卸载完成${re}"
 
 }
-
 # ================== Node.js ==================
 install_node() {
 
@@ -281,7 +284,7 @@ main_menu() {
             3) install_go ;;
             4) install_java ;;
             5) install_php ;;
-            6) remove_pyth9 ;;
+            6) remove_python ;;
             7) remove_node ;;
             8) remove_go ;;
             9) remove_java ;;

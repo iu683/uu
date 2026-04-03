@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Dick Helper 一键管理脚本
+# ABS Ximalaya 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="dick-helper"
+APP_NAME="abs-ximalaya"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,13 +34,13 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Dick Helper 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== ABS Ximalaya 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
@@ -58,7 +58,6 @@ menu() {
 }
 
 install_app() {
-
     check_docker
     mkdir -p "$APP_DIR"
 
@@ -68,25 +67,33 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:80]: " input_port
-    PORT=${input_port:-80}
+    # 端口
+    read -p "请输入访问端口 [默认:7814]: " input_port
+    PORT=${input_port:-7814}
     check_port "$PORT" || return
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  dick-helper:
-    image: dick-helper
-    container_name: dick-helper
+  abs-ximalaya:
+    container_name: abs-ximalaya
+    image: shanyanwcx/abs-ximalaya:latest
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT}:80"
+      - "127.0.0.1:${PORT}:7814"
+    environment:
+      TZ: Asia/Shanghai
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
+        return
+    fi
+
     echo
-    echo -e "${GREEN}✅ Dick Helper 已启动${RESET}"
+    echo -e "${GREEN}✅ ABS Ximalaya 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
 
     read -p "按回车返回菜单..."
@@ -96,22 +103,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ 更新完成${RESET}"
+    echo -e "${GREEN}✅ ABS Ximalaya 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart dick-helper
-    echo -e "${GREEN}✅ 已重启${RESET}"
+    docker restart abs-ximalaya
+    echo -e "${GREEN}✅ ABS Ximalaya 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f dick-helper
+    docker logs -f abs-ximalaya
 }
 
 check_status() {
-    docker ps | grep dick-helper
+    docker ps | grep abs-ximalaya
     read -p "按回车返回菜单..."
 }
 
@@ -119,7 +126,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已彻底卸载${RESET}"
+    echo -e "${RED}✅ ABS Ximalaya 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

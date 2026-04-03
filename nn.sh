@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # ==============================================================================
-# VLESS-Reality-xHTTP 一键安装管理脚本
+# VLESS-Reality-xHTTP 一键安装管理脚本 (信息增强版)
 # ==============================================================================
 
 # --- Shell 严格模式 ---
 set -euo pipefail
 
 # --- 全局常量 ---
-readonly SCRIPT_VERSION="V-xHTTP-2.2"
+readonly SCRIPT_VERSION="V-xHTTP-2.5"
 readonly xray_config_path="/usr/local/etc/xray/config.json"
 readonly xray_binary_path="/usr/local/bin/xray"
 readonly xray_install_script_url="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
@@ -19,19 +19,14 @@ readonly magenta='\e[95m' cyan='\e[96m' none='\e[0m'
 
 # --- 全局变量 ---
 xray_status_info=""
-is_quiet=false
 
 # --- 辅助函数 ---
 error() { echo -e "\n$red[✖] $1$none\n" >&2; }
-info() { [[ "$is_quiet" = false ]] && echo -e "\n$yellow[!] $1$none\n"; }
-success() { [[ "$is_quiet" = false ]] && echo -e "\n$green[✔] $1$none\n"; }
+info() { echo -e "\n$yellow[!] $1$none\n"; }
+success() { echo -e "\n$green[✔] $1$none\n"; }
 
 spinner() {
     local pid=$1; local spinstr='|/-\'
-    if [[ "$is_quiet" = true ]]; then
-        wait "$pid"
-        return
-    fi
     while ps -p "$pid" > /dev/null; do
         local temp=${spinstr#?}
         printf " [%c]  " "$spinstr"
@@ -44,12 +39,10 @@ spinner() {
 
 get_public_ip() {
     local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
+    for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+        ip=$(curl -4s --max-time 5 "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
     done
-    error "无法获取公网 IP 地址。" && return 1
+    return 1
 }
 
 execute_official_script() {
@@ -59,35 +52,14 @@ execute_official_script() {
     wait $! || return 1
 }
 
-is_valid_port() {
-    local port=$1
-    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
-}
-
-is_port_in_use() {
-    local port=$1
-    if command -v ss &>/dev/null; then
-        ss -tuln 2>/dev/null | grep -q ":$port "
-    else
-        timeout 1 bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null
-    fi
-}
-
-is_valid_uuid() {
-    local uuid=$1
-    [[ "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
-}
-
-is_valid_domain() {
-    local domain=$1
-    [[ "$domain" =~ ^[a-zA-Z0-9-]{1,63}(\.[a-zA-Z0-9-]{1,63})+$ ]] && [[ "$domain" != *--* ]]
-}
+is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+is_port_in_use() { ss -tuln 2>/dev/null | grep -q ":$1 " ; }
 
 pre_check() {
     [[ $(id -u) != 0 ]] && error "错误: 您必须以root用户身份运行此脚本" && exit 1
     if ! command -v jq &>/dev/null || ! command -v curl &>/dev/null || ! command -v openssl &>/dev/null; then
-        info "检测到缺失依赖 (jq/curl/openssl)，正在自动安装..."
-        (DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y jq curl openssl) &> /dev/null &
+        info "正在安装必要依赖 (jq/curl/openssl)..."
+        (apt-get update && apt-get install -y jq curl openssl) &> /dev/null &
         spinner $!
     fi
 }
@@ -95,18 +67,19 @@ pre_check() {
 check_xray_status() {
     if [[ ! -f "$xray_binary_path" ]]; then xray_status_info="  Xray 状态: ${red}未安装${none}"; return; fi
     local service_status
-    if systemctl is-active --quiet xray 2>/dev/null; then service_status="${green}运行中 (xHTTP)${none}"; else service_status="${yellow}未运行${none}"; fi
+    if systemctl is-active --quiet xray 2>/dev/null; then service_status="${green}运行中 (xHTTP)${none}"; else service_status="${yellow}未运行/启动失败${none}"; fi
     xray_status_info="  Xray 状态: ${green}已安装${none} | ${service_status}"
 }
 
 # --- 核心逻辑 ---
 write_config() {
     local port=$1 uuid=$2 domain=$3 private_key=$4 public_key=$5 shortid=${6:-}
-    local xhttp_path="/$(openssl rand -hex 4)"
+    
+    # 尝试从现有配置读取 Path，如果没有则生成新的
+    local xhttp_path=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$xray_config_path" 2>/dev/null || echo "")
+    [[ "$xhttp_path" == "null" || -z "$xhttp_path" ]] && xhttp_path="/$(openssl rand -hex 4)"
+    [[ -z "$shortid" || "$shortid" == "null" ]] && shortid=$(openssl rand -hex 8)
 
-    [[ -z "$shortid" ]] && shortid=$(openssl rand -hex 8)
-
-    # --- 新增：确保配置目录存在 ---
     mkdir -p "$(dirname "$xray_config_path")"
 
     jq -n \
@@ -116,26 +89,23 @@ write_config() {
     '{
         "log": {"loglevel": "warning"},
         "inbounds": [{
-            "listen": "0.0.0.0",
-            "port": $port,
-            "protocol": "vless",
+            "listen": "0.0.0.0", "port": $port, "protocol": "vless",
             "settings": {"clients": [{"id": $uuid}], "decryption": "none"},
             "streamSettings": {
-                "network": "xhttp",
-                "security": "reality",
+                "network": "xhttp", "security": "reality",
                 "realitySettings": {
                     "show": false, "dest": ($domain + ":443"), "xver": 0,
                     "serverNames": [$domain], "privateKey": $private_key,
                     "publicKey": $public_key, "shortIds": [$shortid]
                 },
-                "xhttpSettings": {"path": $path, "mode": "speed"}
+                "xhttpSettings": {"path": $path, "mode": "auto"}
             },
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}
         }],
         "outbounds": [{"protocol": "freedom"}]
     }' > "$xray_config_path"
 }
-# --- 菜单功能函数 ---
+
 install_xray() {
     if [[ -f "$xray_binary_path" ]]; then
         info "检测到 Xray 已安装。继续操作将覆盖现有配置。"
@@ -150,19 +120,21 @@ install_xray() {
         if is_valid_port "$port" && ! is_port_in_use "$port"; then break; else error "端口无效或被占用"; fi
     done
 
-    read -p "$(echo -e "请输入UUID (留空随机): ")" uuid
+    read -p "请输入UUID (留空随机): " uuid
     [[ -z "$uuid" ]] && uuid=$(cat /proc/sys/kernel/random/uuid)
 
-    read -p "$(echo -e "请输入SNI域名 (默认: ${cyan}learn.microsoft.com${none}): ")" domain
+    read -p "请输入SNI域名 (默认: learn.microsoft.com): " domain
     [ -z "$domain" ] && domain="learn.microsoft.com"
 
     execute_official_script "install"
+    
     local key_pair=$($xray_binary_path x25519 2>/dev/null)
-    local pri=$(echo "$key_pair" | grep "PrivateKey" | awk '{print $2}')
-    local pub=$(echo "$key_pair" | grep "PublicKey" | awk '{print $2}')
+    local pri=$(echo "$key_pair" | awk -F': ' '/PrivateKey/ {print $2}' | tr -d '[:space:]')
+    local pub=$(echo "$key_pair" | awk -F': ' '/PublicKey/ {print $2}' | tr -d '[:space:]')
 
     write_config "$port" "$uuid" "$domain" "$pri" "$pub"
-    systemctl restart xray && success "安装成功！"
+    
+    systemctl restart xray && success "安装并启动成功！"
     view_subscription_info
 }
 
@@ -175,9 +147,10 @@ modify_config() {
     local pub=$(jq -r '.inbounds[0].streamSettings.realitySettings.publicKey' "$xray_config_path")
     local sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$xray_config_path")
 
-    read -p "端口 (当前 $c_port): " n_port; [[ -z "$n_port" ]] && n_port=$c_port
-    read -p "UUID (当前 $c_uuid): " n_uuid; [[ -z "$n_uuid" ]] && n_uuid=$c_uuid
-    read -p "SNI  (当前 $c_domain): " n_domain; [[ -z "$n_domain" ]] && n_domain=$c_domain
+    echo -e "${yellow}提示：直接按回车将保留当前设定内容${none}"
+    read -p "请输入端口 (当前: $c_port): " n_port; [[ -z "$n_port" ]] && n_port=$c_port
+    read -p "请输入UUID (当前: $c_uuid): " n_uuid; [[ -z "$n_uuid" ]] && n_uuid=$c_uuid
+    read -p "请输入SNI (当前: $c_domain): " n_domain; [[ -z "$n_domain" ]] && n_domain=$c_domain
 
     write_config "$n_port" "$n_uuid" "$n_domain" "$pri" "$pub" "$sid"
     systemctl restart xray && success "配置修改成功！"
@@ -185,26 +158,43 @@ modify_config() {
 }
 
 view_subscription_info() {
-    [[ ! -f "$xray_config_path" ]] && error "配置不存在" && return
+    [[ ! -f "$xray_config_path" ]] && error "配置文件不存在。" && return 1
     local ip=$(get_public_ip || echo "127.0.0.1")
     local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
     local port=$(jq -r '.inbounds[0].port' "$xray_config_path")
-    local dom=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$xray_config_path")
-    local pub=$(jq -r '.inbounds[0].streamSettings.realitySettings.publicKey' "$xray_config_path")
-    local sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$xray_config_path")
-    local path=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$xray_config_path")
+    local domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$xray_config_path")
+    local public_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.publicKey' "$xray_config_path")
+    local shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$xray_config_path")
+    local xhttp_path=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$xray_config_path")
+    local xhttp_mode=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.mode' "$xray_config_path")
 
-    local vless_url="vless://${uuid}@${ip}:${port}?encryption=none&security=reality&type=xhttp&sni=${dom}&fp=chrome&pbk=${pub}&sid=${sid}&path=${path}#$(hostname)-xHTTP"
+    local encoded_path=$(echo -n "$xhttp_path" | sed 's/\//%2F/g')
+    local display_ip=$ip && [[ $ip =~ ":" ]] && display_ip="[$ip]"
+    local link_name="$(hostname)-XHTTP"
+    
+    local vless_url="vless://${uuid}@${display_ip}:${port}?encryption=none&security=reality&sni=${domain}&fp=chrome&pbk=${public_key}&sid=${shortid}&type=xhttp&path=${encoded_path}&mode=${xhttp_mode}#${link_name}"
 
-    echo -e "\n$green --- Xray VLESS-Reality-xHTTP 订阅信息 --- $none"
-    echo -e "$yellow UUID: $cyan$uuid$none | 端口: $cyan$port$none"
-    echo -e "$yellow Path: $cyan$path$none (Mode: speed)"
-    echo -e "$yellow 公钥: $cyan$pub$none"
-    echo -e "----------------------------------------------------------------"
-    echo -e "$green 订阅链接:$none\n$cyan$vless_url$none\n"
+    # 保存链接到文件
+    echo "${vless_url}" > ~/xray_vless_reality_link.txt
+
+    echo -e "\n$green --- Xray VLESS-Reality-XHTTP 订阅信息 --- $none"
+    echo -e "$yellow 名称: $cyan$link_name$none"
+    echo -e "$yellow 地址: $cyan$ip$none"
+    echo -e "$yellow 端口: $cyan$port$none"
+    echo -e "$yellow UUID: $cyan$uuid$none"
+    echo -e "$yellow 指纹: ${cyan}chrome${none}"
+    echo -e "$yellow SNI:  $cyan$domain$none"
+    echo -e "$yellow 公钥: $cyan$public_key$none"
+    echo -e "$yellow ShortId: $cyan$shortid$none"
+    echo "----------------------------------------------------------------"
+    echo -e "$yellow 传输协议: ${cyan}xHTTP${none}"
+    echo -e "$yellow 传输路径: ${cyan}$xhttp_path${none}"
+    echo -e "$yellow 传输模式: ${cyan}$xhttp_mode${none}"
+    echo "----------------------------------------------------------------"
+    echo -e "$green 订阅链接 (已保存到 ~/xray_vless_reality_link.txt):$none"
+    echo -e "$cyan$vless_url$none\n"
 }
 
-# --- 菜单界面 ---
 main_menu() {
     while true; do
         clear
@@ -224,7 +214,6 @@ main_menu() {
         printf "  ${yellow}%-2s${none} %-35s\n" "0." "退出脚本"
         echo "---------------------------------------------"
         read -p "请输入选项 [0-7]: " choice
-
         case $choice in
             1) install_xray ;;
             2) execute_official_script "install" && success "更新成功" ;;
@@ -234,9 +223,8 @@ main_menu() {
             6) modify_config ;;
             7) view_subscription_info ;;
             0) exit 0 ;;
-            *) error "无效选项" ;;
         esac
-        read -n 1 -s -r -p "按任意键返回主菜单..."
+        read -n 1 -s -r -p "按任意键继续..."
     done
 }
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# MongoDB 一键管理脚本
+# Audiobookshelf 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="mongo"
+APP_NAME="audiobookshelf"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,13 +34,13 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== MongoDB 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Audiobookshelf 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
@@ -58,9 +58,8 @@ menu() {
 }
 
 install_app() {
-
     check_docker
-    mkdir -p "$APP_DIR/data"
+    mkdir -p "$APP_DIR"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -68,42 +67,59 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "MongoDB 用户名 [默认:admin]: " input_user
-    DB_USER=${input_user:-admin}
-
-    read -p "MongoDB 密码 [默认:YourStrongPwd2024!]: " input_pass
-    DB_PASS=${input_pass:-YourStrongPwd2024!}
-
-    read -p "业务数据库名 [默认:myappdb]: " input_db
-    DB_NAME=${input_db:-myappdb}
-
-    read -p "MongoDB 端口 [默认:27017]: " input_port
-    PORT=${input_port:-27017}
+    # 端口
+    read -p "请输入访问端口 [默认:13378]: " input_port
+    PORT=${input_port:-13378}
     check_port "$PORT" || return
+
+    # 有声书目录
+    read -p "请输入有声书目录 [默认:$APP_DIR/audiobooks]: " input_books
+    BOOKS_DIR=${input_books:-$APP_DIR/audiobooks}
+
+    # 播客目录
+    read -p "请输入播客目录 [默认:$APP_DIR/podcasts]: " input_pod
+    POD_DIR=${input_pod:-$APP_DIR/podcasts}
+
+    # 配置目录
+    read -p "请输入配置目录 [默认:$APP_DIR/config]: " input_conf
+    CONFIG_DIR=${input_conf:-$APP_DIR/config}
+
+    # metadata目录
+    read -p "请输入 metadata 目录 [默认:$APP_DIR/metadata]: " input_meta
+    META_DIR=${input_meta:-$APP_DIR/metadata}
+
+    mkdir -p "$BOOKS_DIR" "$POD_DIR" "$CONFIG_DIR" "$META_DIR"
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  mongo:
-    image: mongo:6.0
-    container_name: mongo-dev
+  audiobookshelf:
+    container_name: audiobookshelf
+    image: ghcr.io/advplyr/audiobookshelf:latest
     restart: unless-stopped
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: ${DB_USER}
-      MONGO_INITDB_ROOT_PASSWORD: ${DB_PASS}
-      MONGO_INITDB_DATABASE: ${DB_NAME}
-    volumes:
-      - ./data:/data/db
     ports:
-      - "127.0.0.1:${PORT}:27017"
+      - "127.0.0.1:${PORT}:80"
+    volumes:
+      - ${BOOKS_DIR}:/audiobooks
+      - ${POD_DIR}:/podcasts
+      - ${CONFIG_DIR}:/config
+      - ${META_DIR}:/metadata
+    environment:
+      TZ: Asia/Shanghai
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
+        return
+    fi
+
     echo
-    echo -e "${GREEN}✅ MongoDB 已启动${RESET}"
-    echo -e "${YELLOW}📡 地址: mongodb://${DB_USER}:${DB_PASS}@127.0.0.1:${PORT}/${DB_NAME}?authSource=admin${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
+    echo -e "${GREEN}✅ Audiobookshelf 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📚 有声书目录: ${BOOKS_DIR}${RESET}"
+    echo -e "${GREEN}🎙 播客目录: ${POD_DIR}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -112,22 +128,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ MongoDB 更新完成${RESET}"
+    echo -e "${GREEN}✅ Audiobookshelf 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart mongo-dev
-    echo -e "${GREEN}✅ MongoDB 已重启${RESET}"
+    docker restart audiobookshelf
+    echo -e "${GREEN}✅ Audiobookshelf 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f mongo-dev
+    docker logs -f audiobookshelf
 }
 
 check_status() {
-    docker ps | grep mongo-dev
+    docker ps | grep audiobookshelf
     read -p "按回车返回菜单..."
 }
 
@@ -135,7 +151,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ MongoDB 已彻底卸载${RESET}"
+    echo -e "${RED}✅ Audiobookshelf 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

@@ -1,232 +1,358 @@
 #!/bin/bash
+# ========================================
+# Xray Reality XHTTP 多节点管理脚本
+# ========================================
 
-# ==============================================================================
-# VLESS-Reality-xHTTP 一键安装管理脚本
-# ==============================================================================
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-# --- Shell 严格模式 ---
-set -euo pipefail
+APP_NAME="xray-realityxhttp"
+APP_DIR="/opt/$APP_NAME"
 
-# --- 全局常量 ---
-readonly SCRIPT_VERSION="VLESS-XHTTP-2.5"
-readonly xray_config_path="/usr/local/etc/xray/config.json"
-readonly xray_binary_path="/usr/local/bin/xray"
-readonly xray_install_script_url="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
-
-# --- 颜色定义 ---
-readonly red='\e[91m' green='\e[92m' yellow='\e[93m'
-readonly magenta='\e[95m' cyan='\e[96m' none='\e[0m'
-
-# --- 全局变量 ---
-xray_status_info=""
-
-# --- 辅助函数 ---
-error() { echo -e "\n$red[✖] $1$none\n" >&2; }
-info() { echo -e "\n$yellow[!] $1$none\n"; }
-success() { echo -e "\n$green[✔] $1$none\n"; }
-
-spinner() {
-    local pid=$1; local spinstr='|/-\'
-    while ps -p "$pid" > /dev/null; do
-        local temp=${spinstr#?}
-        printf " [%c]  " "$spinstr"
-        local spinstr=$temp${spinstr%"$temp"}
-        sleep 0.1
-        printf "\r"
-    done
-    printf "    \r"
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
+    fi
 }
 
 get_public_ip() {
     local ip
-    for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-        ip=$(curl -4s --max-time 5 "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
     done
-    return 1
+    echo "无法获取公网 IP"
 }
 
-execute_official_script() {
-    local args="$1"
-    bash <(curl -L "$xray_install_script_url") $args &> /dev/null &
-    spinner $!
-    wait $! || return 1
+list_nodes() {
+    mkdir -p "$APP_DIR"
+    echo -e "${GREEN}=== 已有节点 ===${RESET}"
+    local count=0
+    for node in "$APP_DIR"/*; do
+        [ -d "$node" ] || continue
+        count=$((count+1))
+        echo -e "${YELLOW}[$count] $(basename "$node")${RESET}"
+    done
+    [ $count -eq 0 ] && echo -e "${YELLOW}无节点${RESET}"
 }
 
-is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
-is_port_in_use() { ss -tuln 2>/dev/null | grep -q ":$1 " ; }
+select_node() {
+    list_nodes
+    read -r -p $'\033[32m请输入节点名称或编号: \033[0m' input
 
-pre_check() {
-    [[ $(id -u) != 0 ]] && error "错误: 您必须以root用户身份运行此脚本" && exit 1
-    if ! command -v jq &>/dev/null || ! command -v curl &>/dev/null || ! command -v openssl &>/dev/null; then
-        info "正在安装必要依赖 (jq/curl/openssl)..."
-        (apt-get update && apt-get install -y jq curl openssl) &> /dev/null &
-        spinner $!
+    if [[ "$input" =~ ^[0-9]+$ ]]; then
+        NODE_NAME=$(ls -d "$APP_DIR"/* | sed -n "${input}p" | xargs basename)
+    else
+        NODE_NAME="$input"
+    fi
+
+    NODE_DIR="$APP_DIR/$NODE_NAME"
+
+    if [ ! -d "$NODE_DIR" ]; then
+        echo -e "${RED}节点不存在${RESET}"
+        return 1
     fi
 }
 
-check_xray_status() {
-    if [[ ! -f "$xray_binary_path" ]]; then xray_status_info="  Xray 状态: ${red}未安装${none}"; return; fi
-    local service_status
-    if systemctl is-active --quiet xray 2>/dev/null; then service_status="${green}运行中 (XHTTP)${none}"; else service_status="${yellow}未运行/启动失败${none}"; fi
-    xray_status_info="  Xray 状态: ${green}已安装${none} | ${service_status}"
+install_node() {
+
+    check_docker
+    mkdir -p "$APP_DIR"
+
+    read -p "请输入节点名称 [默认node$(date +%s)]: " NODE_NAME
+    NODE_NAME=${NODE_NAME:-node$(date +%s)}
+
+    NODE_DIR="$APP_DIR/$NODE_NAME"
+    mkdir -p "$NODE_DIR"
+
+    random_port() {
+        while :; do
+            PORT=$(shuf -i 2000-65000 -n 1)
+            ss -lnt | awk '{print $4}' | grep -q ":$PORT$" || break
+        done
+        echo "$PORT"
+    }
+
+    read -p "请输入监听端口 [默认随机]: " PORT
+    [[ -z "$PORT" ]] && PORT=$(random_port)
+
+    echo -e "${YELLOW}使用端口: ${PORT}${RESET}"
+
+    read -p "请输入伪装域名 [默认 learn.microsoft.com]: " DOMAIN
+    DOMAIN=${DOMAIN:-learn.microsoft.com}
+
+    X25519=$(docker run --rm ghcr.io/xtls/xray-core:latest x25519)
+
+    PRIVATE_KEY=$(echo "$X25519" | grep "PrivateKey" | awk -F': ' '{print $2}')
+    PUBLIC_KEY=$(echo "$X25519" | grep "PublicKey" | awk -F': ' '{print $2}')
+
+    UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
+
+    SHORT_ID=$(openssl rand -hex 8)
+
+    XHTTP_PATH="/$(openssl rand -hex 4)"
+
+    CONFIG_FILE="$NODE_DIR/config.json"
+    COMPOSE_FILE="$NODE_DIR/compose.yml"
+
+cat > "$CONFIG_FILE" <<EOF
+{
+"log": {
+"loglevel": "warning"
+},
+"inbounds": [
+{
+"port": $PORT,
+"protocol": "vless",
+"settings": {
+"clients": [
+{
+"id": "$UUID",
+"level": 0
+}
+],
+"decryption": "none"
+},
+"streamSettings": {
+"network": "xhttp",
+"security": "reality",
+"realitySettings": {
+"show": false,
+"dest": "$DOMAIN:443",
+"xver": 0,
+"serverNames": ["$DOMAIN"],
+"privateKey": "$PRIVATE_KEY",
+"shortIds": ["$SHORT_ID"]
+},
+"xhttpSettings": {
+"path": "$XHTTP_PATH",
+"mode": "auto"
+}
+},
+"sniffing": {
+"enabled": true,
+"destOverride": ["http","tls","quic"]
+}
+}
+],
+"outbounds": [
+{ "protocol": "freedom" }
+]
+}
+EOF
+
+cat > "$COMPOSE_FILE" <<EOF
+services:
+  $NODE_NAME:
+    image: ghcr.io/xtls/xray-core:latest
+    container_name: $NODE_NAME
+    restart: unless-stopped
+    network_mode: host
+    command: ["run","-c","/etc/xray/config.json"]
+    volumes:
+      - ./config.json:/etc/xray/config.json:ro
+EOF
+
+    cd "$NODE_DIR" || exit
+
+    docker compose up -d
+
+    IP=$(get_public_ip)
+
+    TAG=$NODE_NAME
+
+    ENCODED_PATH=$(echo -n "$XHTTP_PATH" | sed 's/\//%2F/g')
+
+    VLESS_LINK="vless://${UUID}@${IP}:${PORT}?encryption=none&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=xhttp&path=${ENCODED_PATH}&mode=auto#${TAG}"
+
+    echo
+    echo -e "${GREEN}--- Xray VLESS-Reality-XHTTP 订阅信息 ---${RESET}"
+
+    echo -e "${YELLOW}名称: ${TAG}${RESET}"
+    echo -e "${YELLOW}地址: ${IP}${RESET}"
+    echo -e "${YELLOW}端口: ${PORT}${RESET}"
+    echo -e "${YELLOW}UUID: ${UUID}${RESET}"
+    echo -e "${YELLOW}路径: ${XHTTP_PATH}${RESET}"
+    echo -e "${YELLOW}SNI: ${DOMAIN}${RESET}"
+    echo -e "${YELLOW}公钥: ${PUBLIC_KEY}${RESET}"
+    echo -e "${YELLOW}ShortId: ${SHORT_ID}${RESET}"
+
+    echo "------------------------------------------------"
+    echo -e "${YELLOW}V6VPS替换IP地址为V6${RESET}"
+    echo -e "${GREEN}订阅链接:${RESET}"
+    echo -e "${YELLOW}${VLESS_LINK}${RESET}"
+
+cat > "$NODE_DIR/node.txt" <<EOF
+Xray VLESS-Reality-XHTTP 订阅信息
+名称: ${TAG}
+地址: ${IP}
+端口: ${PORT}
+UUID: ${UUID}
+路径: ${XHTTP_PATH}
+SNI: ${DOMAIN}
+公钥: ${PUBLIC_KEY}
+ShortId: ${SHORT_ID}
+订阅链接:
+${VLESS_LINK}
+EOF
+
+    read -p "按回车返回菜单..."
 }
 
-# --- 核心逻辑 ---
-write_config() {
-    local port=$1 uuid=$2 domain=$3 private_key=$4 public_key=$5 shortid=${6:-}
-    
-    # 尝试从现有配置读取 Path，如果没有则生成新的
-    local xhttp_path=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$xray_config_path" 2>/dev/null || echo "")
-    [[ "$xhttp_path" == "null" || -z "$xhttp_path" ]] && xhttp_path="/$(openssl rand -hex 4)"
-    [[ -z "$shortid" || "$shortid" == "null" ]] && shortid=$(openssl rand -hex 8)
+node_action_menu() {
 
-    mkdir -p "$(dirname "$xray_config_path")"
+    select_node || return
 
-    jq -n \
-        --argjson port "$port" --arg uuid "$uuid" --arg domain "$domain" \
-        --arg private_key "$private_key" --arg public_key "$public_key" \
-        --arg shortid "$shortid" --arg path "$xhttp_path" \
-    '{
-        "log": {"loglevel": "warning"},
-        "inbounds": [{
-            "listen": "0.0.0.0", "port": $port, "protocol": "vless",
-            "settings": {"clients": [{"id": $uuid}], "decryption": "none"},
-            "streamSettings": {
-                "network": "xhttp", "security": "reality",
-                "realitySettings": {
-                    "show": false, "dest": ($domain + ":443"), "xver": 0,
-                    "serverNames": [$domain], "privateKey": $private_key,
-                    "publicKey": $public_key, "shortIds": [$shortid]
-                },
-                "xhttpSettings": {"path": $path, "mode": "auto"}
-            },
-            "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}
-        }],
-        "outbounds": [{"protocol": "freedom"}]
-    }' > "$xray_config_path"
-}
-
-install_xray() {
-    if [[ -f "$xray_binary_path" ]]; then
-        info "检测到 Xray 已安装。继续操作将覆盖现有配置。"
-        read -p "是否继续？[y/N]: " confirm
-        [[ ! $confirm =~ ^[yY]$ ]] && return
-    fi
-    
-    local port uuid domain
     while true; do
-        read -p "$(echo -e "请输入端口 [1-65535] (默认: ${cyan}443${none}): ")" port
-        [ -z "$port" ] && port=443
-        if is_valid_port "$port" && ! is_port_in_use "$port"; then break; else error "端口无效或被占用"; fi
-    done
 
-    read -p "请输入UUID (留空随机): " uuid
-    [[ -z "$uuid" ]] && uuid=$(cat /proc/sys/kernel/random/uuid)
+        echo -e "${GREEN}=== 节点 [$NODE_NAME] 管理 ===${RESET}"
+        echo -e "${GREEN}1) 暂停${RESET}"
+        echo -e "${GREEN}2) 重启${RESET}"
+        echo -e "${GREEN}3) 更新${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 卸载${RESET}"
+        echo -e "${GREEN}6) 查看节点信息${RESET}"
+        echo -e "${GREEN}0) 返回${RESET}"
 
-    read -p "请输入SNI域名 (默认: learn.microsoft.com): " domain
-    [ -z "$domain" ] && domain="learn.microsoft.com"
+        read -r -p $'\033[32m请选择操作: \033[0m' choice
 
-    execute_official_script "install"
-    
-    local key_pair=$($xray_binary_path x25519 2>/dev/null)
-    local pri=$(echo "$key_pair" | awk -F': ' '/PrivateKey/ {print $2}' | tr -d '[:space:]')
-    local pub=$(echo "$key_pair" | awk -F': ' '/PublicKey/ {print $2}' | tr -d '[:space:]')
-
-    write_config "$port" "$uuid" "$domain" "$pri" "$pub"
-    
-    systemctl restart xray && success "安装并启动成功！"
-    view_subscription_info
-}
-
-modify_config() {
-    [[ ! -f "$xray_config_path" ]] && error "未安装 Xray" && return
-    local c_port=$(jq -r '.inbounds[0].port' "$xray_config_path")
-    local c_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
-    local c_domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$xray_config_path")
-    local pri=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$xray_config_path")
-    local pub=$(jq -r '.inbounds[0].streamSettings.realitySettings.publicKey' "$xray_config_path")
-    local sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$xray_config_path")
-
-    echo -e "${yellow}提示：直接按回车将保留当前设定内容${none}"
-    read -p "请输入端口 (当前: $c_port): " n_port; [[ -z "$n_port" ]] && n_port=$c_port
-    read -p "请输入UUID (当前: $c_uuid): " n_uuid; [[ -z "$n_uuid" ]] && n_uuid=$c_uuid
-    read -p "请输入SNI (当前: $c_domain): " n_domain; [[ -z "$n_domain" ]] && n_domain=$c_domain
-
-    write_config "$n_port" "$n_uuid" "$n_domain" "$pri" "$pub" "$sid"
-    systemctl restart xray && success "配置修改成功！"
-    view_subscription_info
-}
-
-view_subscription_info() {
-    [[ ! -f "$xray_config_path" ]] && error "配置文件不存在。" && return 1
-    local ip=$(get_public_ip || echo "127.0.0.1")
-    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
-    local port=$(jq -r '.inbounds[0].port' "$xray_config_path")
-    local domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$xray_config_path")
-    local public_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.publicKey' "$xray_config_path")
-    local shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$xray_config_path")
-    local xhttp_path=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$xray_config_path")
-    local xhttp_mode=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.mode' "$xray_config_path")
-
-    local encoded_path=$(echo -n "$xhttp_path" | sed 's/\//%2F/g')
-    local display_ip=$ip && [[ $ip =~ ":" ]] && display_ip="[$ip]"
-    local link_name="$(hostname)-XHTTP"
-    
-    local vless_url="vless://${uuid}@${display_ip}:${port}?encryption=none&security=reality&sni=${domain}&fp=chrome&pbk=${public_key}&sid=${shortid}&type=xhttp&path=${encoded_path}&mode=${xhttp_mode}#${link_name}"
-
-    # 保存链接到文件
-    echo "${vless_url}" > ~/xray_vless_reality_link.txt
-
-    echo -e "\n$green --- Xray VLESS-Reality-XHTTP 订阅信息 --- $none"
-    echo -e "$yellow 名称: $cyan$link_name$none"
-    echo -e "$yellow 地址: $cyan$ip$none"
-    echo -e "$yellow 端口: $cyan$port$none"
-    echo -e "$yellow UUID: $cyan$uuid$none"
-    echo -e "$yellow 指纹: ${cyan}chrome${none}"
-    echo -e "$yellow SNI:  $cyan$domain$none"
-    echo -e "$yellow 公钥: $cyan$public_key$none"
-    echo -e "$yellow ShortId: $cyan$shortid$none"
-    echo "----------------------------------------------------------------"
-    echo -e "$yellow 传输协议: ${cyan}xhttp${none}"
-    echo -e "$yellow 传输路径: ${cyan}$xhttp_path${none}"
-    echo -e "$yellow 传输模式: ${cyan}$xhttp_mode${none}"
-    echo "----------------------------------------------------------------"
-    echo -e "$green 订阅链接 (已保存到 ~/xray_vless_reality_link.txt):$none"
-    echo -e "$cyan$vless_url$none\n"
-}
-
-main_menu() {
-    while true; do
-        clear
-        echo -e "$cyan Xray VLESS-Reality-XHTTP 安装管理$none"
-        echo "---------------------------------------------"
-        check_xray_status
-        echo -e "${xray_status_info}"
-        echo "---------------------------------------------"
-        printf "  ${green}%-2s${none} %-35s\n" "1." "安装/重装 Xray (VLESS-XHTTP)"
-        printf "  ${cyan}%-2s${none} %-35s\n" "2." "更新 Xray"
-        printf "  ${yellow}%-2s${none} %-35s\n" "3." "重启 Xray"
-        printf "  ${red}%-2s${none} %-35s\n" "4." "卸载 Xray"
-        printf "  ${magenta}%-2s${none} %-35s\n" "5." "查看 Xray 日志"
-        printf "  ${cyan}%-2s${none} %-35s\n" "6." "修改节点配置"
-        printf "  ${green}%-2s${none} %-35s\n" "7." "查看订阅信息"
-        echo "---------------------------------------------"
-        printf "  ${yellow}%-2s${none} %-35s\n" "0." "退出"
-        echo "---------------------------------------------"
-        read -p "请输入选项 [0-7]: " choice
         case $choice in
-            1) install_xray ;;
-            2) execute_official_script "install" && success "更新成功" ;;
-            3) systemctl restart xray && success "已重启" ;;
-            4) execute_official_script "remove --purge" && success "已卸载" ;;
-            5) journalctl -u xray -f ;;
-            6) modify_config ;;
-            7) view_subscription_info ;;
-            0) exit 0 ;;
+            1) docker pause "$NODE_NAME" ;;
+            2) docker restart "$NODE_NAME" ;;
+            3) docker compose -f "$NODE_DIR/compose.yml" pull && docker compose -f "$NODE_DIR/compose.yml" up -d ;;
+            4) docker logs -f "$NODE_NAME" ;;
+            5) docker compose -f "$NODE_DIR/compose.yml" down && rm -rf "$NODE_DIR" && return ;;
+            6) cat "$NODE_DIR/node.txt" ;;
+            0) return ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
         esac
-        read -n 1 -s -r -p "按任意键继续..."
     done
 }
 
-pre_check
-main_menu
+show_all_status() {
+
+    list_nodes
+
+    echo -e "${GREEN}=== 节点状态 ===${RESET}"
+
+    for node in "$APP_DIR"/*; do
+
+        [ -d "$node" ] || continue
+
+        NODE_NAME=$(basename "$node")
+
+        PORT=$(grep '"port"' "$node/config.json" | head -n1 | awk -F': ' '{print $2}' | tr -d ',')
+
+        STATUS=$(docker inspect -f '{{.State.Status}}' "$NODE_NAME" 2>/dev/null)
+
+        case "$STATUS" in
+            running) STATUS_COLOR="${GREEN}运行中${RESET}" ;;
+            paused) STATUS_COLOR="${YELLOW}已暂停${RESET}" ;;
+            *) STATUS_COLOR="${RED}未启动${RESET}" ;;
+        esac
+
+        echo -e "${GREEN}$NODE_NAME${RESET} | 端口: ${YELLOW}$PORT${RESET} | 状态: $STATUS_COLOR"
+
+    done
+
+    read -p "按回车返回菜单..."
+}
+
+batch_action() {
+
+    echo -e "${GREEN}=== 批量操作 ===${RESET}"
+    echo -e "${GREEN}1) 暂停节点${RESET}"
+    echo -e "${GREEN}2) 重启节点${RESET}"
+    echo -e "${GREEN}3) 更新节点${RESET}"
+    echo -e "${GREEN}4) 卸载节点${RESET}"
+    echo -e "${GREEN}0) 返回${RESET}"
+
+    read -r -p $'\033[32m请选择操作: \033[0m' choice
+
+    case "$choice" in
+        1|2|3|4) ;;
+        0) return ;;
+        *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ; return ;;
+    esac
+
+    mkdir -p "$APP_DIR"
+
+    declare -A NODE_MAP
+
+    local count=0
+
+    for node in "$APP_DIR"/*; do
+        [ -d "$node" ] || continue
+        count=$((count+1))
+        NODE_NAME=$(basename "$node")
+        NODE_MAP[$count]="$NODE_NAME"
+        echo -e "${YELLOW}[$count] $NODE_NAME${RESET}"
+    done
+
+    read -r -p $'\033[32m请输入节点序号（空格分隔或 all）: \033[0m' input_nodes
+
+    if [[ "$input_nodes" == "all" ]]; then
+        SELECTED_NODES=("${NODE_MAP[@]}")
+    else
+        SELECTED_NODES=()
+        for i in $input_nodes; do
+            NODE=${NODE_MAP[$i]}
+            [ -n "$NODE" ] && SELECTED_NODES+=("$NODE")
+        done
+    fi
+
+    for NODE_NAME in "${SELECTED_NODES[@]}"; do
+
+        NODE_DIR="$APP_DIR/$NODE_NAME"
+
+        cd "$NODE_DIR" || continue
+
+        case "$choice" in
+            1) docker pause "$NODE_NAME" ;;
+            2) docker restart "$NODE_NAME" ;;
+            3) docker compose pull && docker compose up -d ;;
+            4) docker compose down && rm -rf "$NODE_DIR" ;;
+        esac
+
+        echo -e "${GREEN}节点 $NODE_NAME 操作完成${RESET}"
+
+    done
+
+    read -p "按回车返回菜单..."
+}
+
+menu() {
+
+    while true; do
+
+        clear
+
+        echo -e "${GREEN}=== Xray-Reality-XHTTP 多节点管理 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动新节点${RESET}"
+        echo -e "${GREEN}2) 管理已有节点${RESET}"
+        echo -e "${GREEN}3) 查看所有节点状态${RESET}"
+        echo -e "${GREEN}4) 批量操作节点${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+
+        read -r -p $'\033[32m请选择操作: \033[0m' choice
+
+        case $choice in
+            1) install_node ;;
+            2) node_action_menu ;;
+            3) show_all_status ;;
+            4) batch_action ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
+        esac
+    done
+}
+
+menu

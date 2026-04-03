@@ -42,6 +42,7 @@ menu() {
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 查看状态${RESET}"
         echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}7) 安装中文语言包${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
@@ -52,6 +53,7 @@ menu() {
             4) view_logs ;;
             5) check_status ;;
             6) uninstall_app ;;
+            7) install_chinese ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
         esac
@@ -145,9 +147,14 @@ EOF
     echo -e "${GREEN}✅ Flarum 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
     echo -e "${YELLOW}🌐 访问地址: $DOMAIN${RESET}"
+    echo -e "${YELLOW}🌐 标题: $TITLE${RESET}"
+    echo -e "${YELLOW}🌐 MYSQLHOST: mariadb${RESET}"
+    echo -e "${YELLOW}🌐 数据库名: flarum${RESET}"
+    echo -e "${YELLOW}🌐 用户名: flarum${RESET}"
+    echo -e "${YELLOW}🌐 数据库密码: $DB_PASS${RESET}"
     echo -e "${YELLOW}🌐 账号: $ADMIN_USER${RESET}"
-    echo -e "${YELLOW}🌐 密码: $ADMIN_PASS${RESET}"
     echo -e "${YELLOW}🌐 邮箱: $ADMIN_MAIL${RESET}"
+    echo -e "${YELLOW}🌐 密码: $ADMIN_PASS${RESET}"
     echo -e "${GREEN}📂 数据目录: $APP_DIR${RESET}"
 
     read -p "按回车返回菜单..."
@@ -173,6 +180,30 @@ view_logs() {
 
 check_status() {
     docker ps | grep flarum
+    read -p "按回车返回菜单..."
+}
+
+install_chinese() {
+
+    if ! docker ps | grep -q flarum; then
+        echo -e "${RED}Flarum 未运行${RESET}"
+        read -p "按回车返回..."
+        return
+    fi
+
+    echo -e "${GREEN}正在安装简体中文语言包...${RESET}"
+
+    docker exec -it flarum sh -c "
+    cd /flarum/app &&
+    composer require flarum-lang/chinese-simplified &&
+    php flarum cache:clear
+    "
+
+    echo
+    echo -e "${GREEN}✅ 中文语言包安装完成${RESET}"
+    echo -e "${YELLOW}后台启用:${RESET}"
+    echo -e "${YELLOW}Admin → Extensions → Chinese Simplified${RESET}"
+
     read -p "按回车返回菜单..."
 }
 

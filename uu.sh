@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Croc 文件传输一键安装与使用脚本
+# DM-Gateway Python Bot 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,74 +8,110 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-# 检查系统命令
-check_command() {
-    command -v "$1" >/dev/null 2>&1 || { echo -e "${RED}请先安装 $1${RESET}"; exit 1; }
-}
+APP_NAME="dm-gateway"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-install_croc() {
-    echo -e "${GREEN}正在安装 Croc...${RESET}"
-    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        curl -s https://getcroc.schollz.com | bash
-    elif [[ "$OSTYPE" == "darwin"* ]]; then
-        brew install croc
-    else
-        echo -e "${RED}不支持的系统: $OSTYPE${RESET}"
-        exit 1
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
     fi
-    echo -e "${GREEN}Croc 安装完成!${RESET}"
-}
 
-uninstall_croc() {
-    echo -e "${YELLOW}正在卸载 Croc...${RESET}"
-    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        if command -v croc >/dev/null 2>&1; then
-            rm -f "$(command -v croc)"
-            echo -e "${GREEN}Croc 已卸载${RESET}"
-        else
-            echo -e "${RED}Croc 未安装${RESET}"
-        fi
-    elif [[ "$OSTYPE" == "darwin"* ]]; then
-        brew uninstall croc
-        echo -e "${GREEN}Croc 已卸载${RESET}"
-    else
-        echo -e "${RED}不支持的系统: $OSTYPE${RESET}"
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
         exit 1
     fi
 }
 
-send_file() {
-    read -p "请输入要发送的文件路径: " file_path
-    if [[ ! -f "$file_path" ]]; then
-        echo -e "${RED}文件不存在: $file_path${RESET}"
-        exit 1
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== DM-Gateway 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+install_app() {
+    check_docker
+    mkdir -p "$APP_DIR"
+
+    # Bot Token
+    read -p "请输入 BOT_TOKEN: " BOT_TOKEN
+    # Owner ID
+    read -p "请输入 OWNER_ID: " OWNER_ID
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  python:
+    container_name: dm-gateway
+    image: python:3.11-slim
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - OWNER_ID=${OWNER_ID}
+    command: sh -c "pip install -r requirements.txt && python bot.py"
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
+        return
     fi
-    echo -e "${GREEN}开始发送文件...${RESET}"
-    croc send "$file_path"
+
+    echo -e "${GREEN}✅ DM-Gateway Bot 已启动${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-receive_file() {
-    read -p "请输入接收代码: " code
-    echo -e "${GREEN}开始接收文件...${RESET}"
-    croc --classic "$code"
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ DM-Gateway 更新完成${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-# 主菜单
-while true; do
-    echo -e "${YELLOW}=== Croc 文件传输 ===${RESET}"
-    echo -e "${YELLOW}1) 安装 Croc${RESET}"
-    echo -e "${YELLOW}2) 卸载 Croc${RESET}"
-    echo -e "${YELLOW}3) 发送文件${RESET}"
-    echo -e "${YELLOW}4) 接收文件${RESET}"
-    echo -e "${YELLOW}0) 退出${RESET}"
-    read -r -p $'\033[32m请选择操作: \033[0m' choice
+restart_app() {
+    docker restart dm-gateway
+    echo -e "${GREEN}✅ DM-Gateway 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
 
-    case $choice in
-        1) install_croc ;;
-        2) uninstall_croc ;;
-        3) check_command croc; send_file ;;
-        4) check_command croc; receive_file ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
-    esac
-done
+view_logs() {
+    docker logs -f dm-gateway
+}
+
+check_status() {
+    docker ps | grep dm-gateway
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ DM-Gateway 已卸载${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+menu

@@ -81,27 +81,30 @@ install_app() {
     PORT=${input_port:-8080}
     check_port "$PORT" || return
 
-    read -p "请输入数据目录 [默认:$APP_DIR/data]: " input_data
-    DATA_DIR=${input_data:-$APP_DIR/data}
+    # 网站地址
+    read -p "请输入网站URL [默认:http://localhost:${PORT}]: " input_url
+    SITE_URL=${input_url:-http://localhost:${PORT}}
+
+    read -p "请输入数据目录 [默认:$APP_DIR/Typecho]: " input_data
+    DATA_DIR=${input_data:-$APP_DIR/Typecho}
 
     read -p "请输入 MySQL root 密码: " MYSQL_ROOT_PASSWORD
     read -p "请输入 Typecho 数据库密码: " MYSQL_PASSWORD
 
-    mkdir -p "$DATA_DIR/usr"
+    mkdir -p "$DATA_DIR/Typecho"
     mkdir -p "$APP_DIR/db"
 
 cat > "$COMPOSE_FILE" <<EOF
 services:
   db:
-    image: mariadb:10.6
+    image: mysql:8.0
     container_name: typecho-db
-    restart: always
+    restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
       MYSQL_DATABASE: typecho
       MYSQL_USER: typecho
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
-      TZ: Asia/Shanghai
     volumes:
       - ${APP_DIR}/db:/var/lib/mysql
 
@@ -110,12 +113,12 @@ services:
     container_name: typecho-server
     restart: always
     ports:
-      - "${PORT}:80"
+      - "127.0.0.1:${PORT}:80"
     environment:
+      TYPECHO_SITE_URL: ${SITE_URL}
       TZ: Asia/Shanghai
     volumes:
-      - ${DATA_DIR}/usr:/app/usr
-      - ${DATA_DIR}/config.inc.php:/app/config.inc.php
+      - ${DATA_DIR}:/app/usr
     depends_on:
       - db
 EOF
@@ -132,15 +135,15 @@ EOF
 
     echo
     echo -e "${GREEN}✅ Typecho 已启动${RESET}"
-    echo -e "${YELLOW}访问地址: http://${SERVER_IP}:${PORT}${RESET}"
+    echo -e "${YELLOW}访问地址: ${SITE_URL}${RESET}"
     echo
     echo -e "${GREEN}数据库信息:${RESET}"
-    echo -e "数据库地址: db"
-    echo -e "数据库名: typecho"
-    echo -e "数据库用户: typecho"
-    echo -e "数据库密码: ${MYSQL_PASSWORD}"
+    echo -e "${YELLOW}数据库地址: db${RESET}"
+    echo -e "${YELLOW}数据库名: typecho${RESET}"
+    echo -e "${YELLOW}数据库用户: typecho${RESET}"
+    echo -e "${YELLOW}数据库密码: ${MYSQL_PASSWORD}${RESET}"
     echo
-    echo -e "${GREEN}数据目录: ${DATA_DIR}${RESET}"
+    echo -e "${YELLOW}数据目录: ${DATA_DIR}${RESET}"
 
     read -p "按回车返回菜单..."
 }

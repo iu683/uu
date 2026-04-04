@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# WordPress 一键管理脚本
+# Typecho 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="wordpress"
+APP_NAME="typecho"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -44,7 +44,7 @@ get_public_ip() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== WordPress 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Typecho 管理菜单 ===${RESET}"
         echo -e "${GREEN}1. 安装启动${RESET}"
         echo -e "${GREEN}2. 更新${RESET}"
         echo -e "${GREEN}3. 重启${RESET}"
@@ -81,53 +81,41 @@ install_app() {
     PORT=${input_port:-8080}
     check_port "$PORT" || return
 
-    read -p "请输入数据目录 [默认:$APP_DIR/data]: " input_data
-    DATA_DIR=${input_data:-$APP_DIR/data}
+    read -p "请输入数据目录 [默认:$APP_DIR/Typecho]: " input_data
+    DATA_DIR=${input_data:-$APP_DIR/Typecho}
 
-    read -p "请输入数据库 root 密码: " MYSQL_ROOT_PASSWORD
-    read -p "请输入 WordPress 数据库密码: " MYSQL_PASSWORD
+    read -p "请输入 MySQL root 密码: " MYSQL_ROOT_PASSWORD
+    read -p "请输入 Typecho 数据库密码: " MYSQL_PASSWORD
 
-    mkdir -p "$DATA_DIR"
+    mkdir -p "$DATA_DIR/Typecho"
     mkdir -p "$APP_DIR/db"
-    mkdir -p "$APP_DIR/redis"
 
 cat > "$COMPOSE_FILE" <<EOF
 services:
   db:
     image: mysql:8.0
-    container_name: wordpress-db
+    container_name: typecho-db
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE: wordpress
-      MYSQL_USER: wordpress
+      MYSQL_DATABASE: typecho
+      MYSQL_USER: typecho
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
     volumes:
       - ${APP_DIR}/db:/var/lib/mysql
 
-  redis:
-    image: redis:alpine
-    container_name: wordpress-redis
-    restart: unless-stopped
-    volumes:
-      - ${APP_DIR}/redis:/data
-
-  wordpress:
-    image: wordpress:latest
-    container_name: wordpress-server
-    restart: unless-stopped
+  typecho:
+    image: joyqi/typecho:nightly-php8.2-apache
+    container_name: typecho-server
+    restart: always
     ports:
       - "${PORT}:80"
     environment:
-      WORDPRESS_DB_HOST: db
-      WORDPRESS_DB_NAME: wordpress
-      WORDPRESS_DB_USER: wordpress
-      WORDPRESS_DB_PASSWORD: ${MYSQL_PASSWORD}
+      TZ: Asia/Shanghai
     volumes:
-      - ${DATA_DIR}:/var/www/html
+      - ${DATA_DIR}:/app/usr
     depends_on:
       - db
-      - redis
 EOF
 
     cd "$APP_DIR" || exit
@@ -141,16 +129,16 @@ EOF
     SERVER_IP=$(get_public_ip)
 
     echo
-    echo -e "${GREEN}✅ WordPress 已启动${RESET}"
+    echo -e "${GREEN}✅ Typecho 已启动${RESET}"
     echo -e "${YELLOW}访问地址: http://${SERVER_IP}:${PORT}${RESET}"
     echo
     echo -e "${GREEN}数据库信息:${RESET}"
-    echo -e "数据库地址: db"
-    echo -e "数据库名: wordpress"
-    echo -e "数据库用户: wordpress"
-    echo -e "数据库密码: ${MYSQL_PASSWORD}"
+    echo -e "${YELLOW}数据库地址: db${RESET}"
+    echo -e "${YELLOW}数据库名: typecho${RESET}"
+    echo -e "${YELLOW}数据库用户: typecho${RESET}"
+    echo -e "${YELLOW}数据库密码: ${MYSQL_PASSWORD}${RESET}"
     echo
-    echo -e "${GREEN}数据目录: ${DATA_DIR}${RESET}"
+    echo -e "${YELLOW}数据目录: ${DATA_DIR}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -159,22 +147,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ wordpress更新完成${RESET}"
+    echo -e "${GREEN}✅ typecho更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart wordpress-server
-    echo -e "${GREEN}✅ wordpress已重启${RESET}"
+    docker restart typecho-server
+    echo -e "${GREEN}✅ typecho已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f wordpress-server
+    docker logs -f typecho-server
 }
 
 check_status() {
-    docker ps | grep wordpress-server
+    docker ps | grep typecho-server
     read -p "按回车返回菜单..."
 }
 
@@ -182,7 +170,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ wordpress已卸载${RESET}"
+    echo -e "${RED}✅ typecho已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

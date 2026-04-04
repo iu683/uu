@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Croc 文件传输一键安装与使用脚本（支持多文件/多目录）
+# AdGuardHome 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,107 +8,154 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-# 检查系统命令
-check_command() {
-    command -v "$1" >/dev/null 2>&1 || { echo -e "${RED}请先安装 $1${RESET}"; exit 1; }
-}
+APP_NAME="adguardhome"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-# 安装 Croc
-install_croc() {
-    echo -e "${GREEN}正在安装 Croc...${RESET}"
-    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        curl -s https://getcroc.schollz.com | bash
-    elif [[ "$OSTYPE" == "darwin"* ]]; then
-        brew install croc
-    else
-        echo -e "${RED}不支持的系统: $OSTYPE${RESET}"
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
+
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
         exit 1
     fi
-    echo -e "${GREEN}Croc 安装完成!${RESET}"
-    read -r -p "按回车返回主菜单..."
 }
 
-# 卸载 Croc
-uninstall_croc() {
-    echo -e "${YELLOW}正在卸载 Croc...${RESET}"
-    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        if command -v croc >/dev/null 2>&1; then
-            rm -f "$(command -v croc)"
-            echo -e "${GREEN}Croc 已卸载${RESET}"
-        else
-            echo -e "${RED}Croc 未安装${RESET}"
-        fi
-    elif [[ "$OSTYPE" == "darwin"* ]]; then
-        brew uninstall croc
-        echo -e "${GREEN}Croc 已卸载${RESET}"
-    else
-        echo -e "${RED}不支持的系统: $OSTYPE${RESET}"
-        exit 1
+check_port() {
+    if ss -tuln | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
     fi
-    read -r -p "按回车返回主菜单..."
 }
 
-# 发送文件/目录（支持多路径）
-send_file() {
-    echo -e "${YELLOW}请输入要发送的文件或目录路径，多个路径用空格分隔:${RESET}"
-    read -r -a paths
-    # 检查路径是否存在
-    valid_paths=()
-    for p in "${paths[@]}"; do
-        if [[ -e "$p" ]]; then
-            valid_paths+=("$p")
-        else
-            echo -e "${RED}路径不存在: $p${RESET}"
-        fi
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
     done
-    if [[ ${#valid_paths[@]} -eq 0 ]]; then
-        echo -e "${RED}没有有效路径，返回主菜单${RESET}"
-        read -r -p "按回车返回主菜单..."
-        return
-    fi
-    read -r -p "请输入接收代码（自定义或留空随机生成）: " code
-    if [[ -z "$code" ]]; then
-        echo -e "${GREEN}开始发送，自动生成 code...${RESET}"
-        croc send "${valid_paths[@]}"
-    else
-        echo -e "${GREEN}开始发送，使用 code: $code${RESET}"
-        croc send --code "$code" "${valid_paths[@]}"
-    fi
-    echo -e "${GREEN}发送完成！${RESET}"
-    read -r -p "按回车返回主菜单..."
+    echo "无法获取公网 IP 地址。" && return
 }
 
-# 接收文件/目录
-receive_file() {
-    read -r -p "请输入接收代码: " code
-    if [[ -z "$code" ]]; then
-        echo -e "${RED}接收代码不能为空${RESET}"
-        read -r -p "按回车返回主菜单..."
-        return
-    fi
-    echo -e "${GREEN}开始接收文件...${RESET}"
-    croc "$code"
-    echo -e "${GREEN}接收完成！${RESET}"
-    read -r -p "按回车返回主菜单..."
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== AdGuardHome 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
 }
 
-# 主菜单
-while true; do
-    clear
-    echo -e "${GREEN}=== Croc 文件传输 ===${RESET}"
-    echo -e "${GREEN}1. 安装 Croc${RESET}"
-    echo -e "${GREEN}2. 卸载 Croc${RESET}"
-    echo -e "${GREEN}3. 发送文件/目录（支持多路径）${RESET}"
-    echo -e "${GREEN}4. 接收文件/目录${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    read -r -p $'\033[32m请选择操作: \033[0m' choice
+install_app() {
+    check_docker
+    mkdir -p "$APP_DIR"
 
-    case $choice in
-        1) install_croc ;;
-        2) uninstall_croc ;;
-        3) check_command croc; send_file ;;
-        4) check_command croc; receive_file ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}"; read -r -p "按回车返回主菜单..." ;;
-    esac
-done
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
+
+    echo
+    echo -e "${GREEN}请输入 Web 管理端口${RESET}"
+    read -p "默认 [3000]: " input_web
+    WEB_PORT=${input_web:-3000}
+    check_port "$WEB_PORT" || return
+  
+    echo
+    read -p "请输入工作目录 [默认:$APP_DIR/workdir]: " input_work
+    WORK_DIR=${input_work:-$APP_DIR/workdir}
+
+    read -p "请输入配置目录 [默认:$APP_DIR/confdir]: " input_conf
+    CONF_DIR=${input_conf:-$APP_DIR/confdir}
+
+    mkdir -p "$WORK_DIR"
+    mkdir -p "$CONF_DIR"
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  adguardhome:
+    image: adguard/adguardhome:latest
+    container_name: adguardhome
+    restart: always
+    ports:
+      - "53:53/tcp"
+      - "53:53/udp"
+      - "${WEB_PORT}:3000/tcp"
+    volumes:
+      - ${WORK_DIR}:/opt/adguardhome/work
+      - ${CONF_DIR}:/opt/adguardhome/conf
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
+        return
+    fi
+
+    SERVER_IP=$(get_public_ip)
+
+    echo
+    echo -e "${GREEN}✅ AdGuardHome 已启动${RESET}"
+    echo -e "${YELLOW}🌐 管理地址: http://${SERVER_IP}:${WEB_PORT}${RESET}"
+    echo -e "${GREEN}📂 Work目录: ${WORK_DIR}${RESET}"
+    echo -e "${GREEN}📂 Config目录: ${CONF_DIR}${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ AdGuardHome 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+    docker restart adguardhome
+    echo -e "${GREEN}✅ AdGuardHome 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    docker logs -f adguardhome
+}
+
+check_status() {
+    docker ps | grep adguardhome
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ AdGuardHome 已卸载${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+menu

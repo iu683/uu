@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Typecho 一键管理脚本
+# Network Panel 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="typecho"
+APP_NAME="network-panel"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -31,27 +31,17 @@ check_port() {
     fi
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
-}
-
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Typecho 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1. 安装启动${RESET}"
-        echo -e "${GREEN}2. 更新${RESET}"
-        echo -e "${GREEN}3. 重启${RESET}"
-        echo -e "${GREEN}4. 查看日志${RESET}"
-        echo -e "${GREEN}5. 查看状态${RESET}"
-        echo -e "${GREEN}6. 卸载${RESET}"
-        echo -e "${GREEN}0. 退出${RESET}"
+        echo -e "${GREEN}=== 联通余量面板 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
         case $choice in
@@ -62,12 +52,12 @@ menu() {
             5) check_status ;;
             6) uninstall_app ;;
             0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
         esac
     done
 }
 
 install_app() {
-
     check_docker
     mkdir -p "$APP_DIR"
 
@@ -77,68 +67,32 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
+    # 端口
     read -p "请输入访问端口 [默认:8080]: " input_port
     PORT=${input_port:-8080}
     check_port "$PORT" || return
 
-    read -p "请输入数据目录 [默认:$APP_DIR/Typecho]: " input_data
-    DATA_DIR=${input_data:-$APP_DIR/Typecho}
-
-    read -p "请输入 MySQL root 密码: " MYSQL_ROOT_PASSWORD
-    read -p "请输入 Typecho 数据库密码: " MYSQL_PASSWORD
-
-    mkdir -p "$DATA_DIR/Typecho"
-    mkdir -p "$APP_DIR/db"
-
-cat > "$COMPOSE_FILE" <<EOF
+    cat > "$COMPOSE_FILE" <<EOF
 services:
-  db:
-    image: mysql:8.0
-    container_name: typecho-db
+  network-panel:
+    image: bingoma/network-panel:latest
+    container_name: network-panel
     restart: unless-stopped
-    environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE: typecho
-      MYSQL_USER: typecho
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
-    volumes:
-      - ${APP_DIR}/db:/var/lib/mysql
-
-  typecho:
-    image: joyqi/typecho:nightly-php8.2-apache
-    container_name: typecho-server
-    restart: always
     ports:
-      - "${PORT}:80"
-    environment:
-      TZ: Asia/Shanghai
-    volumes:
-      - ${DATA_DIR}:/app/usr
-    depends_on:
-      - db
+      - "127.0.0.1:${PORT}:80"
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     if [ $? -ne 0 ]; then
-        echo -e "${RED}❌ 启动失败${RESET}"
+        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
         return
     fi
 
-    SERVER_IP=$(get_public_ip)
-
     echo
-    echo -e "${GREEN}✅ Typecho 已启动${RESET}"
-    echo -e "${YELLOW}访问地址: http://${SERVER_IP}:${PORT}${RESET}"
-    echo
-    echo -e "${GREEN}数据库信息:${RESET}"
-    echo -e "${YELLOW}数据库地址: db${RESET}"
-    echo -e "${YELLOW}数据库名: typecho${RESET}"
-    echo -e "${YELLOW}数据库用户: typecho${RESET}"
-    echo -e "${YELLOW}数据库密码: ${MYSQL_PASSWORD}${RESET}"
-    echo
-    echo -e "${YELLOW}数据目录: ${DATA_DIR}${RESET}"
+    echo -e "${GREEN}✅ Network Panel 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -147,22 +101,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ typecho更新完成${RESET}"
+    echo -e "${GREEN}✅ Network Panel 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart typecho-server
-    echo -e "${GREEN}✅ typecho已重启${RESET}"
+    docker restart network-panel
+    echo -e "${GREEN}✅ Network Panel 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f typecho-server
+    docker logs -f network-panel
 }
 
 check_status() {
-    docker ps | grep typecho-server
+    docker ps | grep network-panel
     read -p "按回车返回菜单..."
 }
 
@@ -170,7 +124,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ typecho已卸载${RESET}"
+    echo -e "${RED}✅ Network Panel 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

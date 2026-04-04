@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Network Panel 一键管理脚本
+# Croc 文件传输一键安装与使用脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,124 +8,88 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="network-panel"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+# 检查系统命令
+check_command() {
+    command -v "$1" >/dev/null 2>&1 || { echo -e "${RED}请先安装 $1${RESET}"; exit 1; }
+}
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
+# 安装 Croc
+install_croc() {
+    echo -e "${GREEN}正在安装 Croc...${RESET}"
+    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        curl -s https://getcroc.schollz.com | bash
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+        brew install croc
+    else
+        echo -e "${RED}不支持的系统: $OSTYPE${RESET}"
+        exit 1
     fi
+    echo -e "${GREEN}Croc 安装完成!${RESET}"
+}
 
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+# 卸载 Croc
+uninstall_croc() {
+    echo -e "${YELLOW}正在卸载 Croc...${RESET}"
+    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        if command -v croc >/dev/null 2>&1; then
+            rm -f "$(command -v croc)"
+            echo -e "${GREEN}Croc 已卸载${RESET}"
+        else
+            echo -e "${RED}Croc 未安装${RESET}"
+        fi
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+        brew uninstall croc
+        echo -e "${GREEN}Croc 已卸载${RESET}"
+    else
+        echo -e "${RED}不支持的系统: $OSTYPE${RESET}"
         exit 1
     fi
 }
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
+# 发送文件/目录
+send_file() {
+    read -r -p "请输入要发送的文件或目录路径: " file_path
+    if [[ ! -e "$file_path" ]]; then
+        echo -e "${RED}路径不存在: $file_path${RESET}"
+        exit 1
+    fi
+    read -r -p "请输入接收代码（自定义或随机留空生成）: " code
+    if [[ -z "$code" ]]; then
+        echo -e "${GREEN}开始发送，自动生成 code...${RESET}"
+        croc send "$file_path"
+    else
+        echo -e "${GREEN}开始发送，使用 code: $code${RESET}"
+        croc send --code "$code" "$file_path"
     fi
 }
 
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== 联通余量面板 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
-install_app() {
-    check_docker
-    mkdir -p "$APP_DIR"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
+# 接收文件/目录
+receive_file() {
+    read -r -p "请输入接收代码: " code
+    if [[ -z "$code" ]]; then
+        echo -e "${RED}接收代码不能为空${RESET}"
+        exit 1
     fi
-
-    # 端口
-    read -p "请输入访问端口 [默认:8080]: " input_port
-    PORT=${input_port:-8080}
-    check_port "$PORT" || return
-
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  network-panel:
-    image: bingoma/network-panel:latest
-    container_name: network-panel
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${PORT}:80"
-EOF
-
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
-        return
-    fi
-
-    echo
-    echo -e "${GREEN}✅ Network Panel 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-
-    read -p "按回车返回菜单..."
+    echo -e "${GREEN}开始接收文件...${RESET}"
+    croc "$code"
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ Network Panel 更新完成${RESET}"
-    read -p "按回车返回菜单..."
-}
+# 主菜单
+while true; do
+    echo -e "${GREEN}=== Croc 文件传输 ===${RESET}"
+    echo -e "${GREEN}1. 安装 Croc${RESET}"
+    echo -e "${GREEN}2. 卸载 Croc${RESET}"
+    echo -e "${GREEN}3. 发送文件${RESET}"
+    echo -e "${GREEN}4. 接收文件${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    read -r -p $'\033[32m请选择操作: \033[0m' choice
 
-restart_app() {
-    docker restart network-panel
-    echo -e "${GREEN}✅ Network Panel 已重启${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-    docker logs -f network-panel
-}
-
-check_status() {
-    docker ps | grep network-panel
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Network Panel 已卸载${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-menu
+    case $choice in
+        1) install_croc ;;
+        2) uninstall_croc ;;
+        3) check_command croc; send_file ;;
+        4) check_command croc; receive_file ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
+    esac
+done

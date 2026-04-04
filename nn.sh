@@ -31,18 +31,33 @@ check_port() {
     fi
 }
 
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
+}
+
 menu() {
     while true; do
         clear
         echo -e "${GREEN}=== WordPress 管理菜单 ===${RESET}"
-        echo -e "1) 安装启动"
-        echo -e "2) 更新"
-        echo -e "3) 重启"
-        echo -e "4) 查看日志"
-        echo -e "5) 查看状态"
-        echo -e "6) 卸载"
-        echo -e "0) 退出"
-        read -p "请选择: " choice
+        echo -e "${GREEN}1. 安装启动${RESET}"
+        echo -e "${GREEN}2. 更新${RESET}"
+        echo -e "${GREEN}3. 重启${RESET}"
+        echo -e "${GREEN}4. 查看日志${RESET}"
+        echo -e "${GREEN}5. 查看状态${RESET}"
+        echo -e "${GREEN}6. 卸载${RESET}"
+        echo -e "${GREEN}0. 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
         case $choice in
             1) install_app ;;
@@ -77,11 +92,11 @@ install_app() {
 cat > "$COMPOSE_FILE" <<EOF
 services:
   wordpress:
-    image: wordpress:latest
+    image: library/wordpress:latest
     container_name: wordpress-server
     restart: always
     ports:
-      - "127.0.0.1:${PORT}:80"
+      - "${PORT}:80"
     volumes:
       - ${DATA_DIR}:/var/www/html
 EOF
@@ -94,9 +109,11 @@ EOF
         return
     fi
 
+    SERVER_IP=$(get_public_ip)
+
     echo
     echo -e "${GREEN}✅ WordPress 已启动${RESET}"
-    echo -e "${YELLOW}访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${YELLOW}访问地址: http://${SERVER_IP}:${PORT}${RESET}"
     echo -e "${GREEN}数据目录: ${DATA_DIR}${RESET}"
 
     read -p "按回车返回菜单..."
@@ -106,13 +123,13 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}更新完成${RESET}"
+    echo -e "${GREEN}✅ wordpress更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
     docker restart wordpress-server
-    echo -e "${GREEN}已重启${RESET}"
+    echo -e "${GREEN}✅ wordpress已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
@@ -129,7 +146,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}已卸载${RESET}"
+    echo -e "${RED}✅ wordpress已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

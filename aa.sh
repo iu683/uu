@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Typecho 一键管理脚本
+# WordPress 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="typecho"
+APP_NAME="wordpress"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,14 +34,14 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Typecho 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
+        echo -e "${GREEN}=== WordPress 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1. 安装启动${RESET}"
+        echo -e "${GREEN}2. 更新${RESET}"
+        echo -e "${GREEN}3. 重启${RESET}"
+        echo -e "${GREEN}4. 查看日志${RESET}"
+        echo -e "${GREEN}5. 查看状态${RESET}"
+        echo -e "${GREEN}6. 卸载${RESET}"
+        echo -e "${GREEN}0. 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
         case $choice in
@@ -52,7 +52,6 @@ menu() {
             5) check_status ;;
             6) uninstall_app ;;
             0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
         esac
     done
 }
@@ -67,46 +66,38 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    # 端口
     read -p "请输入访问端口 [默认:8080]: " input_port
     PORT=${input_port:-8080}
     check_port "$PORT" || return
 
-    # 数据目录
-    read -p "请输入数据目录 [默认:$APP_DIR/typecho]: " input_data
-    DATA_DIR=${input_data:-$APP_DIR/typecho}
+    read -p "请输入数据目录 [默认:$APP_DIR/data]: " input_data
+    DATA_DIR=${input_data:-$APP_DIR/data}
     mkdir -p "$DATA_DIR"
 
-    # 网站地址
-    read -p "请输入网站URL [默认:http://localhost:${PORT}]: " input_url
-    SITE_URL=${input_url:-http://localhost:${PORT}}
-
-    cat > "$COMPOSE_FILE" <<EOF
+cat > "$COMPOSE_FILE" <<EOF
 services:
-  typecho:
-    image: joyqi/typecho:nightly-php7.4-apache
-    container_name: typecho-server
+  wordpress:
+    image: library/wordpress:latest
+    container_name: wordpress-server
     restart: always
     ports:
       - "127.0.0.1:${PORT}:80"
-    environment:
-      TYPECHO_SITE_URL: ${SITE_URL}
     volumes:
-      - ${DATA_DIR}:/app/usr
+      - ${DATA_DIR}:/var/www/html
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     if [ $? -ne 0 ]; then
-        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
+        echo -e "${RED}❌ 启动失败${RESET}"
         return
     fi
 
     echo
-    echo -e "${GREEN}✅ Typecho 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: ${SITE_URL}${RESET}"
-    echo -e "${GREEN}📂 数据目录: ${DATA_DIR}${RESET}"
+    echo -e "${GREEN}✅ WordPress 已启动${RESET}"
+    echo -e "${YELLOW}访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}数据目录: ${DATA_DIR}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -115,22 +106,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Typecho 更新完成${RESET}"
+    echo -e "${GREEN}更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart typecho-server
-    echo -e "${GREEN}✅ Typecho 已重启${RESET}"
+    docker restart wordpress-server
+    echo -e "${GREEN}已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f typecho-server
+    docker logs -f wordpress-server
 }
 
 check_status() {
-    docker ps | grep typecho-server
+    docker ps | grep wordpress-server
     read -p "按回车返回菜单..."
 }
 
@@ -138,7 +129,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Typecho 已卸载${RESET}"
+    echo -e "${RED}已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

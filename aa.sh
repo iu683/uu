@@ -1,152 +1,140 @@
 #!/bin/bash
 # ========================================
-# CoreDNS 管理脚本
+# TeleRelay 一键管理脚本
+# Debian12 / Ubuntu 兼容 (自动 venv)
 # ========================================
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
 RESET="\033[0m"
+RED="\033[31m"
 
-APP_DIR="/etc/coredns"
-BIN="/usr/local/bin/coredns"
-SERVICE="/etc/systemd/system/coredns.service"
+APP_NAME="TeleRelay"
+APP_DIR="/opt/$APP_NAME"
+SERVICE_NAME="telerelay"
+VENV_DIR="$APP_DIR/venv"
 
-install_coredns() {
+function menu() {
+    clear
+    echo -e "${GREEN}=== TeleRelay 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
 
-echo -e "${GREEN}开始安装 CoreDNS...${RESET}"
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-apt update -y
-apt install -y wget jq tar dnsutils
-
-COREDNS_VERSION=$(wget -qO- https://api.github.com/repos/coredns/coredns/releases/latest | jq -r '.tag_name')
-COREDNS_N_VERSION=${COREDNS_VERSION:1}
-
-cd /tmp
-wget -q https://github.com/coredns/coredns/releases/download/${COREDNS_VERSION}/coredns_${COREDNS_N_VERSION}_linux_amd64.tgz
-
-tar zxf coredns_${COREDNS_N_VERSION}_linux_amd64.tgz
-
-chmod +x coredns
-mv coredns $BIN
-
-mkdir -p $APP_DIR
-mkdir -p /var/log/coredns
-
-cat > $APP_DIR/Corefile <<EOF
-.:8053 {
-    bind 0.0.0.0
-    forward . 1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 {
-        max_concurrent 1000
-    }
-    cache 300 {
-        prefetch 10 60s
-    }
-    errors
-    log
-    reload
+    case $choice in
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) view_logs ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
+    esac
 }
-EOF
 
-cat > $SERVICE <<EOF
+function install_app() {
+
+    echo -e "${GREEN}正在安装依赖...${RESET}"
+
+    apt update
+    apt install -y python3 python3-pip python3-venv git
+
+    mkdir -p "$APP_DIR"
+
+    if [ ! -d "$APP_DIR/.git" ]; then
+        git clone https://github.com/one-ea/TeleRelay.git "$APP_DIR"
+    fi
+
+    cd "$APP_DIR"
+
+    echo -e "${GREEN}创建 Python 虚拟环境...${RESET}"
+    python3 -m venv "$VENV_DIR"
+
+    echo -e "${GREEN}安装依赖...${RESET}"
+    $VENV_DIR/bin/pip install --upgrade pip
+    $VENV_DIR/bin/pip install -r requirements.txt
+
+    cp config.example.py config.py
+
+    echo
+    read -p "请输入 BOT TOKEN: " BOT_TOKEN
+    read -p "请输入 OWNER ID: " OWNER_ID
+
+    sed -i "s/BOT_TOKEN =.*/BOT_TOKEN = \"$BOT_TOKEN\"/" config.py
+    sed -i "s/OWNER_ID =.*/OWNER_ID = $OWNER_ID/" config.py
+
+    echo -e "${GREEN}创建 systemd 服务...${RESET}"
+
+    cat > /etc/systemd/system/$SERVICE_NAME.service <<EOF
 [Unit]
-Description=CoreDNS
+Description=TeleRelay Bot
 After=network.target
 
 [Service]
-ExecStart=$BIN -conf $APP_DIR/Corefile
+WorkingDirectory=$APP_DIR
+ExecStart=$VENV_DIR/bin/python bot.py
 Restart=always
-LimitNOFILE=1048576
+User=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable coredns
-systemctl restart coredns
+    systemctl daemon-reload
+    systemctl enable $SERVICE_NAME
+    systemctl start $SERVICE_NAME
 
-echo -e "${GREEN}CoreDNS 安装完成 ✔${RESET}"
-echo -e "${YELLOW}http://127.0.0.1:8053${RESET}"
+    echo
+    echo -e "${GREEN}✅ TeleRelay 已安装并启动${RESET}"
+    echo -e "${GREEN}⚠️ 请先在 Telegram 给机器人发送 /start${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
 }
 
-start_coredns() {
-systemctl start coredns
-echo -e "${GREEN}CoreDNS 已启动${RESET}"
+function update_app() {
+
+    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
+
+    echo -e "${GREEN}更新程序...${RESET}"
+
+    git pull
+
+    $VENV_DIR/bin/pip install -r requirements.txt
+
+    systemctl restart $SERVICE_NAME
+
+    echo -e "${GREEN}✅ TeleRelay 已更新并重启${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
 }
 
-stop_coredns() {
-systemctl stop coredns
-echo -e "${YELLOW}CoreDNS 已停止${RESET}"
+function uninstall_app() {
+
+    systemctl stop $SERVICE_NAME
+    systemctl disable $SERVICE_NAME
+
+    rm -f /etc/systemd/system/$SERVICE_NAME.service
+
+    rm -rf "$APP_DIR"
+
+    systemctl daemon-reload
+
+    echo -e "${GREEN}✅ TeleRelay 已卸载${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
 }
 
-restart_coredns() {
-systemctl restart coredns
-echo -e "${GREEN}CoreDNS 已重启${RESET}"
-}
+function view_logs() {
 
-status_coredns() {
-systemctl status coredns --no-pager
-}
+    journalctl -u $SERVICE_NAME -f
 
-test_dns() {
-
-if ! command -v dig &>/dev/null; then
-apt install dnsutils -y
-fi
-
-echo
-echo -e "${GREEN}DNS 测试:${RESET}"
-dig @127.0.0.1 -p 8053 google.com +short
-}
-
-uninstall_coredns() {
-
-echo -e "${RED}开始卸载 CoreDNS...${RESET}"
-
-systemctl stop coredns
-systemctl disable coredns
-
-rm -f $SERVICE
-rm -f $BIN
-rm -rf $APP_DIR
-rm -rf /var/log/coredns
-
-systemctl daemon-reload
-
-echo -e "${GREEN}CoreDNS 已卸载 ✔${RESET}"
-}
-
-menu() {
-
-clear
-echo -e "${GREEN}==================================${RESET}"
-echo -e "${GREEN}        CoreDNS 管理菜单          ${RESET}"
-echo -e "${GREEN}==================================${RESET}"
-echo -e "${GREEN}1.安装 CoreDNS${RESET}"
-echo -e "${GREEN}2.启动 CoreDNS${RESET}"
-echo -e "${GREEN}3.停止 CoreDNS${RESET}"
-echo -e "${GREEN}4.重启 CoreDNS${RESET}"
-echo -e "${GREEN}5.查看状态${RESET}"
-echo -e "${GREEN}6.测试 DNS${RESET}"
-echo -e "${GREEN}7.卸载 CoreDNS${RESET}"
-echo -e "${GREEN}0.退出${RESET}"
-read -rp $'\033[32m请输入选项: \033[0m' choice
-
-case $choice in
-1) install_coredns ;;
-2) start_coredns ;;
-3) stop_coredns ;;
-4) restart_coredns ;;
-5) status_coredns ;;
-6) test_dns ;;
-7) uninstall_coredns ;;
-0) exit ;;
-*) echo -e "${RED}无效选项${RESET}" ;;
-esac
-
-read -rp "按回车返回菜单..."
-menu
+    read -p "按回车返回菜单..."
+    menu
 }
 
 menu

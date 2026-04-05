@@ -35,7 +35,7 @@ mkdir -p /var/log/coredns
 
 cat > $APP_DIR/Corefile <<EOF
 .:8053 {
-    bind 127.0.0.1
+    bind 0.0.0.0
     forward . 1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 {
         max_concurrent 1000
     }
@@ -67,8 +67,7 @@ systemctl enable coredns
 systemctl restart coredns
 
 echo -e "${GREEN}CoreDNS 安装完成 ✔${RESET}"
-echo -e "${GREEN}现在可以用反代 DoH:${RESET}"
-echo "http://127.0.0.1:8053"
+echo -e "${YELLOW}http://127.0.0.1:8053${RESET}"
 }
 
 start_coredns() {
@@ -132,7 +131,7 @@ echo -e "${GREEN}5.查看状态${RESET}"
 echo -e "${GREEN}6.测试 DNS${RESET}"
 echo -e "${GREEN}7.卸载 CoreDNS${RESET}"
 echo -e "${GREEN}0.退出${RESET}"
-read -rp "请输入选项: " choice
+read -rp $'\033[32m请输入选项: \033[0m' choice
 
 case $choice in
 1) install_coredns ;;

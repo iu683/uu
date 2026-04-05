@@ -1,140 +1,184 @@
 #!/bin/bash
 # ========================================
-# TeleRelay 一键管理脚本
-# Debian12 / Ubuntu 兼容 (自动 venv)
+# 1Panel 管理脚本
 # ========================================
 
 GREEN="\033[32m"
-RESET="\033[0m"
+YELLOW="\033[33m"
 RED="\033[31m"
+CYAN="\033[36m"
+RESET="\033[0m"
 
-APP_NAME="TeleRelay"
-APP_DIR="/opt/$APP_NAME"
-SERVICE_NAME="telerelay"
-VENV_DIR="$APP_DIR/venv"
+CMD="1pctl"
 
-function menu() {
-    clear
-    echo -e "${GREEN}=== TeleRelay 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载(含数据)${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
-        4) view_logs ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
-    esac
-}
-
-function install_app() {
-
-    echo -e "${GREEN}正在安装依赖...${RESET}"
-
-    apt update
-    apt install -y python3 python3-pip python3-venv git
-
-    mkdir -p "$APP_DIR"
-
-    if [ ! -d "$APP_DIR/.git" ]; then
-        git clone https://github.com/one-ea/TeleRelay.git "$APP_DIR"
+# 检查命令
+check_cmd() {
+    if ! command -v $CMD &>/dev/null; then
+        echo -e "${RED}未检测到 1pctl，请确认 1Panel 已安装${RESET}"
+        exit 1
     fi
-
-    cd "$APP_DIR"
-
-    echo -e "${GREEN}创建 Python 虚拟环境...${RESET}"
-    python3 -m venv "$VENV_DIR"
-
-    echo -e "${GREEN}安装依赖...${RESET}"
-    $VENV_DIR/bin/pip install --upgrade pip
-    $VENV_DIR/bin/pip install -r requirements.txt
-
-    cp config.example.py config.py
-
-    echo
-    read -p "请输入 BOT TOKEN: " BOT_TOKEN
-    read -p "请输入 OWNER ID: " OWNER_ID
-
-    sed -i "s/BOT_TOKEN =.*/BOT_TOKEN = \"$BOT_TOKEN\"/" config.py
-    sed -i "s/OWNER_ID =.*/OWNER_ID = $OWNER_ID/" config.py
-
-    echo -e "${GREEN}创建 systemd 服务...${RESET}"
-
-    cat > /etc/systemd/system/$SERVICE_NAME.service <<EOF
-[Unit]
-Description=TeleRelay Bot
-After=network.target
-
-[Service]
-WorkingDirectory=$APP_DIR
-ExecStart=$VENV_DIR/bin/python bot.py
-Restart=always
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable $SERVICE_NAME
-    systemctl start $SERVICE_NAME
-
-    echo
-    echo -e "${GREEN}✅ TeleRelay 已安装并启动${RESET}"
-    echo -e "${GREEN}⚠️ 请先在 Telegram 给机器人发送 /start${RESET}"
-
-    read -p "按回车返回菜单..."
-    menu
 }
 
-function update_app() {
-
-    cd "$APP_DIR" || { echo "未检测到安装目录，请先安装"; sleep 1; menu; }
-
-    echo -e "${GREEN}更新程序...${RESET}"
-
-    git pull
-
-    $VENV_DIR/bin/pip install -r requirements.txt
-
-    systemctl restart $SERVICE_NAME
-
-    echo -e "${GREEN}✅ TeleRelay 已更新并重启${RESET}"
-
-    read -p "按回车返回菜单..."
-    menu
+pause(){
+    read -rp "按回车继续..."
 }
 
-function uninstall_app() {
+menu(){
+clear
+echo -e "${CYAN}"
+echo "======================================"
+echo "        1Panel 管理菜单"
+echo "======================================"
+echo -e "${RESET}"
 
-    systemctl stop $SERVICE_NAME
-    systemctl disable $SERVICE_NAME
+echo -e "${GREEN} 1.查看 1Panel 状态${RESET} "
+echo -e "${GREEN} 2.启动 1Panel${RESET} "
+echo -e "${GREEN} 3.停止 1Panel${RESET} "
+echo -e "${GREEN} 4.重启 1Panel${RESET} "
 
-    rm -f /etc/systemd/system/$SERVICE_NAME.service
+echo "-----------------------------"
 
-    rm -rf "$APP_DIR"
+echo -e "${GREEN} 5.修改用户名${RESET} "
+echo -e "${GREEN} 6.修改密码${RESET} "
+echo -e "${GREEN} 7.修改面板端口${RESET} "
 
-    systemctl daemon-reload
+echo "-----------------------------"
 
-    echo -e "${GREEN}✅ TeleRelay 已卸载${RESET}"
+echo -e "${GREEN} 8.取消安全入口${RESET} "
+echo -e "${GREEN} 9.取消 HTTPS 登录${RESET} "
+echo -e "${GREEN}10.取消 IP 限制${RESET} "
+echo -e "${GREEN}11.取消两步验证${RESET} "
+echo -e "${GREEN}12.取消域名绑定${RESET} "
 
-    read -p "按回车返回菜单..."
-    menu
+echo "-----------------------------"
+
+echo -e "${GREEN}13.监听 IPv4${RESET} "
+echo -e "${GREEN}14.监听 IPv6${RESET} "
+
+echo "-----------------------------"
+
+echo -e "${GREEN}15.查看版本${RESET} "
+echo -e "${GREEN}16.获取用户信息${RESET} "
+
+echo "-----------------------------"
+
+echo -e "${GREEN}17.卸载 1Panel${RESET} "
+
+echo "-----------------------------"
+
+echo -e "${GREEN}0.退出${RESET} "
+echo
 }
 
-function view_logs() {
+check_cmd
 
-    journalctl -u $SERVICE_NAME -f
-
-    read -p "按回车返回菜单..."
-    menu
-}
-
+while true
+do
 menu
+read -rp "请输入选项: " num
+
+case "$num" in
+
+1)
+$CMD status all
+pause
+;;
+
+2)
+$CMD start all
+pause
+;;
+
+3)
+$CMD stop all
+pause
+;;
+
+4)
+$CMD restart all
+pause
+;;
+
+5)
+read -rp "输入新用户名: " username
+$CMD update username "$username"
+pause
+;;
+
+6)
+read -rp "输入新密码: " password
+$CMD update password "$password"
+pause
+;;
+
+7)
+read -rp "输入新端口: " port
+$CMD update port "$port"
+pause
+;;
+
+8)
+$CMD reset entrance
+pause
+;;
+
+9)
+$CMD reset https
+pause
+;;
+
+10)
+$CMD reset ips
+pause
+;;
+
+11)
+$CMD reset mfa
+pause
+;;
+
+12)
+$CMD reset domain
+pause
+;;
+
+13)
+$CMD listen-ip ipv4
+pause
+;;
+
+14)
+$CMD listen-ip ipv6
+pause
+;;
+
+15)
+$CMD version
+pause
+;;
+
+16)
+$CMD user-info
+pause
+;;
+
+17)
+read -rp "确认卸载 1Panel？(y/n): " confirm
+if [[ "$confirm" == "y" ]]; then
+    $CMD uninstall
+fi
+pause
+;;
+
+0)
+exit
+;;
+
+*)
+echo -e "${RED}无效选项${RESET}"
+sleep 1
+;;
+
+esac
+
+done

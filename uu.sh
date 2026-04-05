@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# DM-Gateway Python Bot 一键管理脚本
+# DoH Server 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="dm-gateway"
+APP_NAME="doh-server"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -24,16 +24,23 @@ check_docker() {
     fi
 }
 
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
+
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== DM-Gateway 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== DoH Server 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
@@ -51,35 +58,47 @@ menu() {
 }
 
 install_app() {
+
     check_docker
     mkdir -p "$APP_DIR"
 
-    # Bot Token
-    read -p "请输入 BOT_TOKEN: " BOT_TOKEN
-    # Owner ID
-    read -p "请输入 OWNER_ID: " OWNER_ID
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
+
+    read -p "请输入监听端口 [默认:8054]: " input_port
+    PORT=${input_port:-8054}
+    check_port "$PORT" || return
+
+    read -p "请输入上游DNS [默认:127.0.0.1:8053]: " input_dns
+    UPSTREAM=${input_dns:-127.0.0.1:8053}
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  python:
-    container_name: dm-gateway
-    image: python:3.11-slim
+  doh-server:
+    image: m13253/dns-over-https
+    container_name: doh-server
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORT}:8053"
     environment:
-      - BOT_TOKEN=${BOT_TOKEN}
-      - OWNER_ID=${OWNER_ID}
-    command: sh -c "pip install -r requirements.txt && python bot.py"
+      - UPSTREAM_DNS_SERVER=udp:${UPSTREAM}
+      - DOH_SERVER_LISTEN=0.0.0.0:8053
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
-        return
-    fi
+    echo
+    echo -e "${GREEN}✅ DoH Server 已启动${RESET}"
+    echo -e "${YELLOW}📡 本地地址: http://127.0.0.1:${PORT}/dns-query${RESET}"
+    echo -e "${GREEN}📂 配置目录: $APP_DIR${RESET}"
+    echo
+    echo -e "${YELLOW}Nginx反代地址:${RESET}"
+    echo -e "${GREEN}https://你的域名/dns-query${RESET}"
 
-    echo -e "${GREEN}✅ DM-Gateway Bot 已启动${RESET}"
     read -p "按回车返回菜单..."
 }
 
@@ -87,22 +106,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ DM-Gateway 更新完成${RESET}"
+    echo -e "${GREEN}✅ DoH Server 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart dm-gateway
-    echo -e "${GREEN}✅ DM-Gateway 已重启${RESET}"
+    docker restart doh-server
+    echo -e "${GREEN}✅ DoH Server 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f dm-gateway
+    docker logs -f doh-server
 }
 
 check_status() {
-    docker ps | grep dm-gateway
+    docker ps | grep doh-server
     read -p "按回车返回菜单..."
 }
 
@@ -110,7 +129,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ DM-Gateway 已卸载${RESET}"
+    echo -e "${RED}✅ DoH Server 已彻底卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

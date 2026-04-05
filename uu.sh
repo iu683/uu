@@ -1,136 +1,159 @@
 #!/bin/bash
 # ========================================
-# DoH Server 一键管理脚本
+# NodeTerminal 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
 RESET="\033[0m"
+RED="\033[31m"
 
-APP_NAME="doh-server"
+APP_NAME="nodeterminal"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+ENV_FILE="$APP_DIR/.env"
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
+function menu() {
+    clear
+    echo -e "${GREEN}=== NodeTerminal 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 重启${RESET}"
+    echo -e "${GREEN}4) 配置 OIDC${RESET}"
+    echo -e "${GREEN}5) 查看日志${RESET}"
+    echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
 
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+    case $choice in
+        1) install_app ;;
+        2) update_app ;;
+        3) restart_app ;;
+        4) config_oidc ;;
+        5) view_logs ;;
+        6) uninstall_app ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
+    esac
 }
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
+function install_app() {
 
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== DoH Server 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+    read -p "请输入 Web 端口 [默认:3000]: " input_port
+    PORT=${input_port:-3000}
 
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
+    mkdir -p "$APP_DIR/users"
 
-install_app() {
-
-    check_docker
-    mkdir -p "$APP_DIR"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-
-    read -p "请输入监听端口 [默认:8054]: " input_port
-    PORT=${input_port:-8054}
-    check_port "$PORT" || return
-
-    read -p "请输入上游DNS [默认:127.0.0.1:8053]: " input_dns
-    UPSTREAM=${input_dns:-127.0.0.1:8053}
+    cat > "$ENV_FILE" <<EOF
+OIDC_ENABLED=false
+OIDC_ISSUER=
+OIDC_CLIENT_ID=
+OIDC_CLIENT_SECRET=
+OIDC_REDIRECT_URI=http://localhost:$PORT/api/oidc/callback
+OIDC_SCOPES=openid profile email
+OIDC_BUTTON_LABEL=OpenID 登录
+EOF
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  doh-server:
-    image: m13253/dns-over-https
-    container_name: doh-server
+  nodeterminal:
+    image: wmz1024/nodeterminal:latest
+    container_name: nodeterminal
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT}:8053"
+      - "127.0.0.1:$PORT:3000"
+    volumes:
+      - $APP_DIR/users:/app/users
+      - $ENV_FILE:/app/.env:ro
     environment:
-      - UPSTREAM_DNS_SERVER=udp:${UPSTREAM}
-      - DOH_SERVER_LISTEN=0.0.0.0:8053
+      - NODE_ENV=production
 EOF
 
-    cd "$APP_DIR" || exit
+    cd "$APP_DIR"
     docker compose up -d
 
-    echo
-    echo -e "${GREEN}✅ DoH Server 已启动${RESET}"
-    echo -e "${YELLOW}📡 本地地址: http://127.0.0.1:${PORT}/dns-query${RESET}"
-    echo -e "${GREEN}📂 配置目录: $APP_DIR${RESET}"
-    echo
-    echo -e "${YELLOW}Nginx反代地址:${RESET}"
-    echo -e "${GREEN}https://你的域名/dns-query${RESET}"
-
+    echo -e "${GREEN}✅ NodeTerminal 已启动${RESET}"
+    echo -e "${GREEN}🌐 Web 地址: http://127.0.0.1:$PORT${RESET}"
+    echo -e "${GREEN}📂 数据目录: $APP_DIR/users${RESET}"
     read -p "按回车返回菜单..."
+    menu
 }
 
-update_app() {
-    cd "$APP_DIR" || return
+function update_app() {
+
+    cd "$APP_DIR" || { echo "未安装"; sleep 1; menu; }
+
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ DoH Server 更新完成${RESET}"
+
+    echo -e "${GREEN}更新完成${RESET}"
     read -p "按回车返回菜单..."
+    menu
 }
 
-restart_app() {
-    docker restart doh-server
-    echo -e "${GREEN}✅ DoH Server 已重启${RESET}"
+function restart_app() {
+
+    cd "$APP_DIR" || { echo "未安装"; sleep 1; menu; }
+
+    docker compose restart
+
+    echo -e "${GREEN}重启完成${RESET}"
     read -p "按回车返回菜单..."
+    menu
 }
 
-view_logs() {
-    docker logs -f doh-server
-}
+function config_oidc() {
 
-check_status() {
-    docker ps | grep doh-server
+    cd "$APP_DIR" || { echo "未安装"; sleep 1; menu; }
+
+    read -p "是否启用 OIDC (true/false) [默认:false]: " OIDC_ENABLED
+    OIDC_ENABLED=${OIDC_ENABLED:-false}
+
+    read -p "OIDC Provider (issuer): " OIDC_ISSUER
+    read -p "OIDC Client ID: " OIDC_CLIENT_ID
+    read -p "OIDC Client Secret: " OIDC_CLIENT_SECRET
+    read -p "OIDC Redirect URI: " OIDC_REDIRECT_URI
+    read -p "OIDC Scopes [默认:openid profile email]: " OIDC_SCOPES
+    OIDC_SCOPES=${OIDC_SCOPES:-"openid profile email"}
+
+    read -p "登录按钮文字 [默认:OpenID 登录]: " OIDC_BUTTON_LABEL
+    OIDC_BUTTON_LABEL=${OIDC_BUTTON_LABEL:-"OpenID 登录"}
+
+    sed -i "s|OIDC_ENABLED=.*|OIDC_ENABLED=$OIDC_ENABLED|" "$ENV_FILE"
+    sed -i "s|OIDC_ISSUER=.*|OIDC_ISSUER=$OIDC_ISSUER|" "$ENV_FILE"
+    sed -i "s|OIDC_CLIENT_ID=.*|OIDC_CLIENT_ID=$OIDC_CLIENT_ID|" "$ENV_FILE"
+    sed -i "s|OIDC_CLIENT_SECRET=.*|OIDC_CLIENT_SECRET=$OIDC_CLIENT_SECRET|" "$ENV_FILE"
+    sed -i "s|OIDC_REDIRECT_URI=.*|OIDC_REDIRECT_URI=$OIDC_REDIRECT_URI|" "$ENV_FILE"
+    sed -i "s|OIDC_SCOPES=.*|OIDC_SCOPES=$OIDC_SCOPES|" "$ENV_FILE"
+    sed -i "s|OIDC_BUTTON_LABEL=.*|OIDC_BUTTON_LABEL=$OIDC_BUTTON_LABEL|" "$ENV_FILE"
+
+    docker compose restart
+
+    echo -e "${GREEN}OIDC 配置已更新${RESET}"
+
     read -p "按回车返回菜单..."
+    menu
 }
 
-uninstall_app() {
-    cd "$APP_DIR" || return
+function uninstall_app() {
+
+    cd "$APP_DIR" || { echo "未安装"; sleep 1; menu; }
+
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ DoH Server 已彻底卸载${RESET}"
+
+    echo -e "${GREEN}卸载完成${RESET}"
+
     read -p "按回车返回菜单..."
+    menu
+}
+
+function view_logs() {
+
+    docker logs -f nodeterminal
+
+    read -p "按回车返回菜单..."
+    menu
 }
 
 menu

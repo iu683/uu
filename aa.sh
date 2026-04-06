@@ -1,145 +1,148 @@
 #!/bin/bash
 # ========================================
-# HD-Icons 一键管理脚本
+# NodeSeek RSS Telegram Bot 一键管理脚本
+# Debian 12 / Ubuntu 兼容
+# Docker Compose 部署
 # ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
 RESET="\033[0m"
+RED="\033[31m"
 
-APP_NAME="hd-icons"
+APP_NAME="nodeseek-rss-telegram-bot"
 APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+REPO_URL="https://github.com/AI-XMLY/nodeseek-rss-telegram-bot.git"
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
+function menu() {
+    clear
+    echo -e "${GREEN}=== NodeSeek RSS Telegram Bot 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 查看日志${RESET}"
+    echo -e "${GREEN}4) 重启${RESET}"
+    echo -e "${GREEN}5) 停止${RESET}"
+    echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
 
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+    case $choice in
+        1) install_app ;;
+        2) update_app ;;
+        3) view_logs ;;
+        4) restart_app ;;
+        5) stop_app ;;
+        6) uninstall_app ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
+    esac
+}
+
+
+function check_docker() {
+    
+    if ! docker compose version >/dev/null 2>&1; then
+        echo -e "${RED}未检测到 docker compose 插件，请检查 Docker 安装${RESET}"
         exit 1
     fi
 }
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
+function install_app() {
+    echo -e "${YELLOW}开始安装 NodeSeek RSS Telegram Bot...${RESET}"
 
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== HD-Icons 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
-install_app() {
     check_docker
+
     mkdir -p "$APP_DIR"
 
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
+    if [ ! -d "$APP_DIR/.git" ]; then
+        git clone "$REPO_URL" "$APP_DIR"
+    else
+        echo -e "${YELLOW}检测到已存在项目目录，跳过克隆${RESET}"
+    fi
+
+    cd "$APP_DIR" || exit 1
+
+    if [ ! -f ".env" ]; then
+        cp .env.example .env
     fi
 
     echo
-    read -p "请输入访问端口 [默认:50560]: " input_port
-    PORT=${input_port:-50560}
-    check_port "$PORT" || return
+    echo -e "${GREEN}请填写配置${RESET}"
+    read -p "请输入 BOT_TOKEN: " BOT_TOKEN
+    read -p "请输入 BOT_OWNER_IDS(多个逗号分隔，可留空): " BOT_OWNER_IDS
+    read -p "请输入 RSS_URL [默认: https://rss.nodeseek.com/]: " RSS_URL
+    read -p "请输入轮询间隔秒数 [默认: 180]: " POLL_INTERVAL_SECONDS
+
+    RSS_URL=${RSS_URL:-https://rss.nodeseek.com/}
+    POLL_INTERVAL_SECONDS=${POLL_INTERVAL_SECONDS:-180}
+
+    sed -i "s|^BOT_TOKEN=.*|BOT_TOKEN=$BOT_TOKEN|" .env
+    sed -i "s|^BOT_OWNER_IDS=.*|BOT_OWNER_IDS=$BOT_OWNER_IDS|" .env
+    sed -i "s|^RSS_URL=.*|RSS_URL=$RSS_URL|" .env
+    sed -i "s|^POLL_INTERVAL_SECONDS=.*|POLL_INTERVAL_SECONDS=$POLL_INTERVAL_SECONDS|" .env
+
+    mkdir -p "$APP_DIR/data"
+
+    echo -e "${GREEN}启动容器...${RESET}"
+    docker compose up -d --build
 
     echo
-    read -p "请输入图标存储目录 [默认:$APP_DIR/icons]: " input_icons
-    ICON_DIR=${input_icons:-$APP_DIR/icons}
-    mkdir -p "$ICON_DIR"
+    echo -e "${GREEN}✅ 安装完成并已启动${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
 
-    echo
-    read -p "请输入站点标题 [默认:图标库]: " input_title
-    TITLE=${input_title:-图标库}
+function update_app() {
+    cd "$APP_DIR" || { echo -e "${RED}未检测到安装目录，请先安装${RESET}"; sleep 1; menu; }
 
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  hd-icons:
-    image: xushier/hd-icons:latest
-    container_name: hd-icons
-    restart: always
-    ports:
-      - "127.0.0.1:${PORT}:50560"
-    volumes:
-      - ${ICON_DIR}:/app/icons
-    environment:
-      TITLE: ${TITLE}
-EOF
+    echo -e "${GREEN}更新程序...${RESET}"
+    git pull
 
-    cd "$APP_DIR" || exit
-    docker compose up -d
+    echo -e "${GREEN}重新构建并启动容器...${RESET}"
+    docker compose up -d --build
 
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
-        return
+    echo -e "${GREEN}✅ 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function view_logs() {
+    cd "$APP_DIR" || { echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; }
+
+    docker compose logs -f
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function restart_app() {
+    cd "$APP_DIR" || { echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; }
+
+    docker compose restart
+    echo -e "${GREEN}✅ 已重启${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function stop_app() {
+    cd "$APP_DIR" || { echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; }
+
+    docker compose down
+    echo -e "${GREEN}✅ 已停止${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function uninstall_app() {
+    if [ -d "$APP_DIR" ]; then
+        cd "$APP_DIR" && docker compose down
     fi
 
-    echo
-    echo -e "${GREEN}✅ HD-Icons 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 图标目录: ${ICON_DIR}${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ HD-Icons 更新完成${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-restart_app() {
-    docker restart hd-icons
-    echo -e "${GREEN}✅ HD-Icons 已重启${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-    docker logs -f hd-icons
-}
-
-check_status() {
-    docker ps | grep hd-icons
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ HD-Icons 已卸载${RESET}"
+
+    echo -e "${GREEN}✅ 已卸载（包含数据）${RESET}"
     read -p "按回车返回菜单..."
+    menu
 }
 
 menu

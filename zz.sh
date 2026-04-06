@@ -1,177 +1,149 @@
-#!/bin/bash
-# ========================================
-# Typecho 一键管理脚本
-# ========================================
+#!/bin/sh
+set -e
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-RESET="\033[0m"
+# ================== 颜色 ==================
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+RESET='\033[0m'
 
-APP_NAME="typecho"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+info()  { echo -e "${GREEN}[INFO] $1${RESET}"; }
+warn()  { echo -e "${YELLOW}[WARN] $1${RESET}"; }
+error() { echo -e "${RED}[ERROR] $1${RESET}"; }
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
+# ================== 检测 Alpine ==================
+if [ ! -f /etc/alpine-release ]; then
+    error "该脚本仅适用于 Alpine Linux"
+    exit 1
+fi
 
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
+ALPINE_VERSION=$(cut -d. -f1-2 /etc/alpine-release)
+REPO_FILE="/etc/apk/repositories"
+ARCH="x86_64"  # 默认 x86_64，可根据实际架构修改
+
+# ================== 定义源 ==================
+OFFICIAL_MAIN="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ARCH}"
+OFFICIAL_COMMUNITY="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/community/${ARCH}"
+
+ALIYUN_MAIN="https://mirrors.aliyun.com/alpine/v${ALPINE_VERSION}/main/${ARCH}"
+ALIYUN_COMMUNITY="https://mirrors.aliyun.com/alpine/v${ALPINE_VERSION}/community/${ARCH}"
+
+TSINGHUA_MAIN="https://mirrors.tuna.tsinghua.edu.cn/alpine/v${ALPINE_VERSION}/main/${ARCH}"
+TSINGHUA_COMMUNITY="https://mirrors.tuna.tsinghua.edu.cn/alpine/v${ALPINE_VERSION}/community/${ARCH}"
+
+LATEST_MAIN="https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/${ARCH}"
+LATEST_COMMUNITY="https://dl-cdn.alpinelinux.org/alpine/latest-stable/community/${ARCH}"
+
+# ================== 函数 ==================
+backup_repo() {
+    if [ -f "$REPO_FILE" ]; then
+        cp "$REPO_FILE" "${REPO_FILE}.bak"
+        info "已备份当前源到 ${REPO_FILE}.bak"
     fi
 }
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
+restore_repo() {
+    if [ -f "${REPO_FILE}.bak" ]; then
+        cp "${REPO_FILE}.bak" "$REPO_FILE"
+        info "已还原备份源"
+    else
+        warn "没有备份源，无法还原"
     fi
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
-}
-
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== Typecho 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1. 安装启动${RESET}"
-        echo -e "${GREEN}2. 更新${RESET}"
-        echo -e "${GREEN}3. 重启${RESET}"
-        echo -e "${GREEN}4. 查看日志${RESET}"
-        echo -e "${GREEN}5. 查看状态${RESET}"
-        echo -e "${GREEN}6. 卸载${RESET}"
-        echo -e "${GREEN}0. 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-        esac
-    done
-}
-
-install_app() {
-
-    check_docker
-    mkdir -p "$APP_DIR"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-
-    read -p "请输入访问端口 [默认:8080]: " input_port
-    PORT=${input_port:-8080}
-    check_port "$PORT" || return
-
-    read -p "请输入数据目录 [默认:$APP_DIR/Typecho]: " input_data
-    DATA_DIR=${input_data:-$APP_DIR/Typecho}
-
-    read -p "请输入 MySQL root 密码: " MYSQL_ROOT_PASSWORD
-    read -p "请输入 Typecho 数据库密码: " MYSQL_PASSWORD
-
-    mkdir -p "$DATA_DIR/Typecho"
-    mkdir -p "$APP_DIR/db"
-
-cat > "$COMPOSE_FILE" <<EOF
-services:
-  db:
-    image: mysql:8.0
-    container_name: typecho-db
-    restart: unless-stopped
-    environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE: typecho
-      MYSQL_USER: typecho
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
-    volumes:
-      - ${APP_DIR}/db:/var/lib/mysql
-
- typecho:
-    image: joyqi/typecho:nightly-php7.4-apache
-    container_name: typecho-server
-    restart: always
-    ports:
-      - "${PORT}:80"
-    environment:
-      TZ: Asia/Shanghai
-    volumes:
-      - ${DATA_DIR}:/app/usr
-    depends_on:
-      - db
+switch_source() {
+    local main="$1"
+    local community="$2"
+    cat > "$REPO_FILE" <<EOF
+$main
+$community
 EOF
+    info "已切换源为 $main / $community"
+}
 
-    cd "$APP_DIR" || exit
-    docker compose up -d
+detect_latest_version() {
+    local version
+    version=$(wget -qO- https://dl-cdn.alpinelinux.org/alpine/ 2>/dev/null \
+        | grep -o 'v[0-9]\+\.[0-9]\+' \
+        | sort -V | tail -n1)
+    echo "${version:-latest-stable}"
+}
 
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}❌ 启动失败${RESET}"
-        return
+validate_repo() {
+    local url="$1"
+    if ! wget --spider -q "${url}/APKINDEX.tar.gz"; then
+        local latest_ver
+        latest_ver=$(detect_latest_version)
+        warn "检测到 ${url} 不可用，v${ALPINE_VERSION} 源不存在，已回退到 latest-stable (v${latest_ver})"
+        cat > "$REPO_FILE" <<EOF
+$LATEST_MAIN
+$LATEST_COMMUNITY
+EOF
     fi
-
-    SERVER_IP=$(get_public_ip)
-
-    echo
-    echo -e "${GREEN}✅ Typecho 已启动${RESET}"
-    echo -e "${YELLOW}访问地址: http://${SERVER_IP}:${PORT}${RESET}"
-    echo
-    echo -e "${GREEN}数据库信息:${RESET}"
-    echo -e "${YELLOW}数据库地址: db${RESET}"
-    echo -e "${YELLOW}数据库名: typecho${RESET}"
-    echo -e "${YELLOW}数据库用户: typecho${RESET}"
-    echo -e "${YELLOW}数据库密码: ${MYSQL_PASSWORD}${RESET}"
-    echo
-    echo -e "${YELLOW}数据目录: ${DATA_DIR}${RESET}"
-
-    read -p "按回车返回菜单..."
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ typecho更新完成${RESET}"
-    read -p "按回车返回菜单..."
+update_cache() {
+    info "正在更新 apk 缓存..."
+    if apk update; then
+        info "更新完成"
+    else
+        error "更新失败，请检查网络或源配置"
+    fi
 }
 
-restart_app() {
-    docker restart typecho-server
-    echo -e "${GREEN}✅ typecho已重启${RESET}"
-    read -p "按回车返回菜单..."
+show_current_repo() {
+    if [ -f "$REPO_FILE" ]; then
+        echo -e "${YELLOW}当前使用源:${RESET}"
+        cat "$REPO_FILE"
+        echo "------------------------------"
+    fi
 }
 
-view_logs() {
-    docker logs -f typecho-server
-}
+# ================== 主菜单 ==================
+while true; do
+    clear
+    echo -e "${GREEN}====== Alpine 更新源切换菜单 ======${RESET}"
+    show_current_repo
+    echo -e "${GREEN}1) 切换到阿里云源并更新缓存${RESET}"
+    echo -e "${GREEN}2) 切换到官方源并更新缓存${RESET}"
+    echo -e "${GREEN}3) 切换到清华源并更新缓存${RESET}"
+    echo -e "${GREEN}4) 备份当前源${RESET}"
+    echo -e "${GREEN}5) 还原备份源并更新缓存${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    read -rp "$(echo -e ${GREEN}请选择操作: ${RESET})" choice
 
-check_status() {
-    docker ps | grep typecho-server
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ typecho已卸载${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-menu
+    case $choice in
+        1)
+            backup_repo
+            switch_source "$ALIYUN_MAIN" "$ALIYUN_COMMUNITY"
+            validate_repo "$ALIYUN_MAIN"
+            update_cache
+            ;;
+        2)
+            backup_repo
+            switch_source "$OFFICIAL_MAIN" "$OFFICIAL_COMMUNITY"
+            validate_repo "$OFFICIAL_MAIN"
+            update_cache
+            ;;
+        3)
+            backup_repo
+            switch_source "$TSINGHUA_MAIN" "$TSINGHUA_COMMUNITY"
+            validate_repo "$TSINGHUA_MAIN"
+            update_cache
+            ;;
+        4)
+            backup_repo
+            ;;
+        5)
+            restore_repo
+            update_cache
+            ;;
+        0)
+            break
+            ;;
+        *)
+            warn "无效选择，请重新输入"
+            ;;
+    esac
+    read -rp "$(echo -e ${YELLOW}按回车返回菜单...${RESET})"
+done

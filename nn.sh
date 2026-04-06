@@ -1,47 +1,158 @@
 #!/bin/bash
+# ==========================================
+# 服务器一键重装系统工具
+# ==========================================
 
 GREEN="\033[32m"
+YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-menu() {
-    clear
-    echo -e "${GREEN}=== 1Panel 面板管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装 1Panel${RESET}"
-    echo -e "${GREEN}2) 1Panel 菜单管理${RESET}"
-    echo -e "${GREEN}3) 卸载 1Panel${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    read -p $'\033[32m请选择操作: \033[0m' choice
-    case $choice in
-        1)
-            echo -e "${GREEN}正在安装 1Panel...${RESET}"
-            bash -c "$(curl -sSL https://resource.fit2cloud.com/1panel/package/v2/quick_start.sh)"
-            pause
-            ;;
-        2)
-            echo -e "${GREEN}1Panel 菜单管理...${RESET}"
-            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/1PanelCD.sh)
-            pause
-            ;;
-        3)
-            echo -e "${GREEN}正在卸载 1Panel...${RESET}"
-            1pctl uninstall
-            pause
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            echo -e "${RED}无效选择，请重新输入${RESET}"
-            sleep 1
-            menu
-            ;;
-    esac
-}
+SCRIPT_URL="https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
 
-pause() {
-    read -p $'\033[32m按回车键返回菜单...\033[0m'
-    menu
-}
+clear
 
-menu
+virt=$(systemd-detect-virt)
+
+if [[ "$virt" == "openvz" || "$virt" == "lxc" ]]; then
+    echo -e "${RED}当前虚拟化 ($virt) 不支持重装系统${RESET}"
+    exit 1
+fi
+
+echo -e "${GREEN}"
+echo "======================================"
+echo "        一键重装系统工具"
+echo "======================================"
+echo " 1. Windows 11 Enterprise LTSC 2024"
+echo " 2. Windows 10 Enterprise LTSC 2021"
+echo " 3. Windows Server 2022"
+echo " 4. Debian 11"
+echo " 5. Debian 12"
+echo " 6. Debian 13"
+echo " 7. Ubuntu 22.04"
+echo " 8. Ubuntu 24.04"
+echo " 9. Ubuntu 25.10"
+echo "10. Alpine 3.23"
+echo " 0. 退出"
+echo "======================================"
+echo -e "${RESET}"
+
+read -p "请选择系统 [0-10]: " SYS_CHOICE
+
+if [[ "$SYS_CHOICE" == "0" ]]; then
+    echo -e "${YELLOW}已退出${RESET}"
+    exit 0
+fi
+
+read -p "请输入 root/Administrator 密码 (用于重装系统): " SYS_PASS
+
+if [[ -z "$SYS_PASS" ]]; then
+    echo -e "${RED}密码不能为空${RESET}"
+    exit 1
+fi
+
+read -p "请输入 SSH 端口 (默认 22): " SSH_PORT
+SSH_PORT=${SSH_PORT:-22}
+
+read -p "请输入 RDP 端口 (默认 3389): " RDP_PORT
+RDP_PORT=${RDP_PORT:-3389}
+
+echo
+echo -e "${YELLOW}安装配置:${RESET}"
+echo "系统密码: $SYS_PASS"
+echo "SSH端口: $SSH_PORT"
+echo "RDP端口: $RDP_PORT"
+echo
+
+read -p "确认开始重装系统？(y/N): " CONFIRM
+
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    echo -e "${RED}操作已取消${RESET}"
+    exit 0
+fi
+
+echo -e "${GREEN}下载重装脚本...${RESET}"
+
+wget -qO reinstall.sh "$SCRIPT_URL"
+
+if [[ ! -f reinstall.sh ]]; then
+    echo -e "${RED}下载失败${RESET}"
+    exit 1
+fi
+
+chmod +x reinstall.sh
+
+case $SYS_CHOICE in
+
+1)
+bash reinstall.sh windows \
+--image-name "Windows 11 Enterprise LTSC 2024" \
+--lang zh-cn \
+--password "$SYS_PASS" \
+--rdp-port "$RDP_PORT"
+;;
+
+2)
+bash reinstall.sh windows \
+--image-name "Windows 10 Enterprise LTSC 2021" \
+--lang zh-cn \
+--password "$SYS_PASS" \
+--rdp-port "$RDP_PORT"
+;;
+
+3)
+bash reinstall.sh windows \
+--image-name "Windows Server 2022" \
+--lang zh-cn \
+--password "$SYS_PASS" \
+--rdp-port "$RDP_PORT"
+;;
+
+4)
+bash reinstall.sh debian 11 \
+--password "$SYS_PASS" \
+--ssh-port "$SSH_PORT"
+;;
+
+5)
+bash reinstall.sh debian 12 \
+--password "$SYS_PASS" \
+--ssh-port "$SSH_PORT"
+;;
+
+6)
+bash reinstall.sh debian 13 \
+--password "$SYS_PASS" \
+--ssh-port "$SSH_PORT"
+;;
+
+7)
+bash reinstall.sh ubuntu 22.04 \
+--password "$SYS_PASS" \
+--ssh-port "$SSH_PORT"
+;;
+
+8)
+bash reinstall.sh ubuntu 24.04 \
+--password "$SYS_PASS" \
+--ssh-port "$SSH_PORT"
+;;
+
+9)
+bash reinstall.sh ubuntu 25.10 \
+--password "$SYS_PASS" \
+--ssh-port "$SSH_PORT"
+;;
+
+10)
+bash reinstall.sh alpine 3.23 \
+--password "$SYS_PASS" \
+--ssh-port "$SSH_PORT"
+;;
+
+*)
+echo -e "${RED}无效选项${RESET}"
+exit 1
+;;
+
+esac

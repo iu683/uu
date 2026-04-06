@@ -1,156 +1,145 @@
 #!/bin/bash
-# ==========================================
-# 服务器一键重装系统工具
-# ==========================================
+# ========================================
+# HD-Icons 一键管理脚本
+# ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-SCRIPT_URL="https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
+APP_NAME="hd-icons"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-clear
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
 
-echo -e "${GREEN}"
-echo "======================================"
-echo "        一键重装系统工具"
-echo "======================================"
-echo " 1. Windows 11 Enterprise LTSC 2024"
-echo " 2. Windows 10 Enterprise LTSC 2021"
-echo " 3. Windows Server 2022"
-echo " 4. Debian 11"
-echo " 5. Debian 12"
-echo " 6. Debian 13"
-echo " 7. Ubuntu 22.04"
-echo " 8. Ubuntu 24.04"
-echo " 9. Ubuntu 25.10"
-echo "10. Alpine 3.23"
-echo " 0. 退出"
-echo "======================================"
-echo -e "${RESET}"
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
+    fi
+}
 
-read -r -p $'\033[32m请选择系统 [0-10]: \033[0m' SYS_CHOICE
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
 
-if [[ "$SYS_CHOICE" == "0" ]]; then
-    echo -e "${YELLOW}已退出${RESET}"
-    exit 0
-fi
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== HD-Icons 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-read -p "请输入 root/Administrator 密码 (用于重装系统): " SYS_PASS
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
 
-if [[ -z "$SYS_PASS" ]]; then
-    echo -e "${RED}密码不能为空${RESET}"
-    exit 1
-fi
+install_app() {
+    check_docker
+    mkdir -p "$APP_DIR"
 
-read -p "请输入 SSH 端口 (默认 22): " SSH_PORT
-SSH_PORT=${SSH_PORT:-22}
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
 
-read -p "请输入 RDP 端口 (默认 3389): " RDP_PORT
-RDP_PORT=${RDP_PORT:-3389}
+    echo
+    read -p "请输入访问端口 [默认:50560]: " input_port
+    PORT=${input_port:-50560}
+    check_port "$PORT" || return
 
-echo
-echo -e "${YELLOW}安装配置:${RESET}"
-echo "系统密码: $SYS_PASS"
-echo "SSH端口: $SSH_PORT"
-echo "RDP端口: $RDP_PORT"
-echo
+    echo
+    read -p "请输入图标存储目录 [默认:$APP_DIR/icons]: " input_icons
+    ICON_DIR=${input_icons:-$APP_DIR/icons}
+    mkdir -p "$ICON_DIR"
 
-read -p "确认开始重装系统？(y/N): " CONFIRM
+    echo
+    read -p "请输入站点标题 [默认:图标库]: " input_title
+    TITLE=${input_title:-图标库}
 
-if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-    echo -e "${RED}操作已取消${RESET}"
-    exit 0
-fi
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  hd-icons:
+    image: xushier/hd-icons:latest
+    container_name: hd-icons
+    restart: always
+    ports:
+      - "127.0.0.1:${PORT}:50560"
+    volumes:
+      - ${ICON_DIR}:/app/icons
+    environment:
+      TITLE: ${TITLE}
+EOF
 
-echo -e "${GREEN}下载重装脚本...${RESET}"
+    cd "$APP_DIR" || exit
+    docker compose up -d
 
-wget -qO reinstall.sh "$SCRIPT_URL"
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
+        return
+    fi
 
-if [[ ! -f reinstall.sh ]]; then
-    echo -e "${RED}下载失败${RESET}"
-    exit 1
-fi
+    echo
+    echo -e "${GREEN}✅ HD-Icons 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📂 图标目录: ${ICON_DIR}${RESET}"
 
-chmod +x reinstall.sh
+    read -p "按回车返回菜单..."
+}
 
-case $SYS_CHOICE in
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ HD-Icons 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
 
-1)
-bash reinstall.sh windows \
---image-name "Windows 11 Enterprise LTSC 2024" \
---lang zh-cn \
---password "$SYS_PASS" \
---rdp-port "$RDP_PORT"
-;;
+restart_app() {
+    docker restart hd-icons
+    echo -e "${GREEN}✅ HD-Icons 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
 
-2)
-bash reinstall.sh windows \
---image-name "Windows 10 Enterprise LTSC 2021" \
---lang zh-cn \
---password "$SYS_PASS" \
---rdp-port "$RDP_PORT"
-;;
+view_logs() {
+    docker logs -f hd-icons
+}
 
-3)
-bash reinstall.sh windows \
---image-name "Windows Server 2022" \
---lang zh-cn \
---password "$SYS_PASS" \
---rdp-port "$RDP_PORT"
-;;
+check_status() {
+    docker ps | grep hd-icons
+    read -p "按回车返回菜单..."
+}
 
-4)
-bash reinstall.sh debian 11 \
---password "$SYS_PASS" \
---ssh-port "$SSH_PORT"
-;;
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ HD-Icons 已卸载${RESET}"
+    read -p "按回车返回菜单..."
+}
 
-5)
-bash reinstall.sh debian 12 \
---password "$SYS_PASS" \
---ssh-port "$SSH_PORT"
-;;
-
-6)
-bash reinstall.sh debian 13 \
---password "$SYS_PASS" \
---ssh-port "$SSH_PORT"
-;;
-
-7)
-bash reinstall.sh ubuntu 22.04 \
---password "$SYS_PASS" \
---ssh-port "$SSH_PORT"
-;;
-
-8)
-bash reinstall.sh ubuntu 24.04 \
---password "$SYS_PASS" \
---ssh-port "$SSH_PORT"
-;;
-
-9)
-bash reinstall.sh ubuntu 25.10 \
---password "$SYS_PASS" \
---ssh-port "$SSH_PORT"
-;;
-
-10)
-bash reinstall.sh alpine 3.23 \
---password "$SYS_PASS" \
---ssh-port "$SSH_PORT"
-;;
-
-*)
-echo -e "${RED}无效选项${RESET}"
-exit 1
-;;
-
-esac
-
-echo
-echo -e "${GREEN}系统安装命令已执行，5秒后自动重启...${RESET}"
-sleep 5
-reboot
+menu

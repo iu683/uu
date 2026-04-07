@@ -1,162 +1,152 @@
 #!/bin/bash
 # ========================================
-# dstatus 一键管理
-# Debian 12 / Ubuntu 兼容
-# 基于官方安装脚本
+# SubLink-Pro 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RESET="\033[0m"
 RED="\033[31m"
+RESET="\033[0m"
 
-INSTALL_DIR="/opt/dstatus"
-DEFAULT_PORT="5555"
-SERVICE_NAME="dstatus"
+APP_NAME="sublinkpro"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}请使用 root 运行此脚本${RESET}"
-    exit 1
-fi
-
-function menu() {
-    clear
-    echo -e "${GREEN}=== dstatus 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新到最新版${RESET}"
-    echo -e "${GREEN}3) 查看服务状态${RESET}"
-    echo -e "${GREEN}4) 重启服务${RESET}"
-    echo -e "${GREEN}5) 停止服务${RESET}"
-    echo -e "${GREEN}6) 卸载(保留数据)${RESET}"
-    echo -e "${GREEN}7) 完全删除(清空数据)${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) view_status ;;
-        4) restart_app ;;
-        5) stop_app ;;
-        6) uninstall_app ;;
-        7) purge_app ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
-    esac
-}
-
-function check_requirements() {
-    if ! command -v curl >/dev/null 2>&1; then
-        echo -e "${YELLOW}未检测到 curl，正在安装...${RESET}"
-        apt update
-        apt install -y curl
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
     fi
 
-    if ! command -v systemctl >/dev/null 2>&1; then
-        echo -e "${RED}当前系统不支持 systemd，无法管理 dstatus 服务${RESET}"
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
         exit 1
     fi
 }
 
-function install_app() {
-    check_requirements
-
-    echo -e "${GREEN}开始安装 dstatus...${RESET}"
-    read -p "请输入监听端口 [默认: ${DEFAULT_PORT}]: " PORT
-    PORT=${PORT:-$DEFAULT_PORT}
-
-    read -p "是否启用 watchtower(自动更新)？[Y/n]: " ENABLE_WATCHTOWER
-
-    WATCHTOWER_ARG="--enable-watchtower"
-    if [[ "$ENABLE_WATCHTOWER" == "n" || "$ENABLE_WATCHTOWER" == "N" ]]; then
-        WATCHTOWER_ARG=""
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
     fi
+}
 
-    echo -e "${GREEN}正在执行官方安装脚本...${RESET}"
-    curl -fsSL dstatus.sh | bash -s -- --port="$PORT" --install-dir="$INSTALL_DIR" $WATCHTOWER_ARG
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== SubLink-Pro 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+install_app() {
+
+    check_docker
+    mkdir -p "$APP_DIR"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
 
     echo
-    echo -e "${GREEN}✅ dstatus 安装完成${RESET}"
-    echo -e "${YELLOW}服务名: ${SERVICE_NAME}${RESET}"
-    echo -e "${YELLOW}安装目录: ${INSTALL_DIR}${RESET}"
-    echo -e "${YELLOW}访问端口: ${PORT}${RESET}"
+    read -p "请输入访问端口 [默认:8000]: " input_port
+    PORT=${input_port:-8000}
+    check_port "$PORT" || return
 
-    if [[ -n "$WATCHTOWER_ARG" ]]; then
-        echo -e "${YELLOW}Watchtower: 已启用${RESET}"
-    else
-        echo -e "${YELLOW}Watchtower: 未启用${RESET}"
+    echo
+    read -p "请输入数据库目录 [默认:$APP_DIR/db]: " input_db
+    DB_DIR=${input_db:-$APP_DIR/db}
+
+    read -p "请输入模板目录 [默认:$APP_DIR/template]: " input_template
+    TEMPLATE_DIR=${input_template:-$APP_DIR/template}
+
+    read -p "请输入日志目录 [默认:$APP_DIR/logs]: " input_logs
+    LOG_DIR=${input_logs:-$APP_DIR/logs}
+
+    mkdir -p "$DB_DIR" "$TEMPLATE_DIR" "$LOG_DIR"
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  sublinkpro:
+    image: zerodeng/sublink-pro
+    container_name: sublinkpro
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORT}:8000"
+    volumes:
+      - ${DB_DIR}:/app/db
+      - ${TEMPLATE_DIR}:/app/template
+      - ${LOG_DIR}:/app/logs
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
+        return
     fi
 
+    echo
+    echo -e "${GREEN}✅ SubLink-Pro 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${YELLOW}🌐 账号/密码: admin / 123456 ${RESET}"
+    echo -e "${GREEN}📂 DB目录: ${DB_DIR}${RESET}"
+    echo -e "${GREEN}📂 Template目录: ${TEMPLATE_DIR}${RESET}"
+    echo -e "${GREEN}📂 Logs目录: ${LOG_DIR}${RESET}"
+
     read -p "按回车返回菜单..."
-    menu
 }
 
-
-function update_app() {
-    check_requirements
-
-    echo -e "${GREEN}更新 dstatus 到最新版...${RESET}"
-    curl -fsSL dstatus.sh | bash -s -- --update
-
-    echo -e "${GREEN}✅ dstatus 已更新${RESET}"
-
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ SubLink-Pro 更新完成${RESET}"
     read -p "按回车返回菜单..."
-    menu
 }
 
-function view_status() {
-    systemctl status "$SERVICE_NAME" --no-pager
-
+restart_app() {
+    docker restart sublinkpro
+    echo -e "${GREEN}✅ SubLink-Pro 已重启${RESET}"
     read -p "按回车返回菜单..."
-    menu
 }
 
-function restart_app() {
-    systemctl restart "$SERVICE_NAME"
-
-    echo -e "${GREEN}✅ 服务已重启${RESET}"
-
-    read -p "按回车返回菜单..."
-    menu
+view_logs() {
+    docker logs -f sublinkpro
 }
 
-function stop_app() {
-    systemctl stop "$SERVICE_NAME"
-
-    echo -e "${GREEN}✅ 服务已停止${RESET}"
-
+check_status() {
+    docker ps | grep sublinkpro
     read -p "按回车返回菜单..."
-    menu
 }
 
-function uninstall_app() {
-    check_requirements
-
-    echo -e "${YELLOW}即将卸载 dstatus（保留数据）...${RESET}"
-    curl -fsSL dstatus.sh | bash -s -- --uninstall
-
-    echo -e "${GREEN}✅ dstatus 已卸载（数据保留）${RESET}"
-
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ SubLink-Pro 已卸载${RESET}"
     read -p "按回车返回菜单..."
-    menu
-}
-
-function purge_app() {
-    check_requirements
-
-    echo -e "${RED}警告：此操作将完全删除 dstatus 和所有数据！${RESET}"
-    read -p "确认继续吗？输入 yes 确认: " CONFIRM
-
-    if [ "$CONFIRM" = "yes" ]; then
-        curl -fsSL dstatus.sh | bash -s -- --uninstall --purge-data --yes
-        echo -e "${GREEN}✅ dstatus 已完全删除${RESET}"
-    else
-        echo -e "${YELLOW}已取消操作${RESET}"
-    fi
-
-    read -p "按回车返回菜单..."
-    menu
 }
 
 menu

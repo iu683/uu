@@ -1,150 +1,298 @@
 #!/bin/bash
-# 万能 DNS 切换脚本（Ubuntu 自动关闭 resolved + 可锁定）
+# ========================================
+# aMule 一键管理脚本
+# Debian 12 / Ubuntu 兼容
+# Docker Compose 部署
+# ========================================
 
-dns_order=( "HK" "JP" "TW" "SG" "KR" "US" "UK" "DE" "RFC" "NHK" "自定义" )
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RESET="\033[0m"
+RED="\033[31m"
 
-declare -A dns_list=(
-  ["HK"]="154.83.83.83"
-  ["JP"]="45.76.215.40"
-  ["TW"]="154.83.83.86"
-  ["SG"]="149.28.158.78"
-  ["KR"]="158.247.223.218"
-  ["US"]="66.42.97.127"
-  ["UK"]="45.32.179.189"
-  ["DE"]="80.240.28.27"
-  ["RFC"]="22.22.22.22"
-  ["NHK"]="151.247.88.3"
-)
+APP_NAME="amule"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-green="\033[32m"
-red="\033[31m"
-reset="\033[0m"
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}请使用 root 运行此脚本${RESET}"
+    exit 1
+fi
 
-########################################
-# 判断是否 Ubuntu
-########################################
-is_ubuntu() {
-    [ -f /etc/os-release ] && grep -qi ubuntu /etc/os-release
-}
-
-########################################
-# 判断是否启用 systemd-resolved stub
-########################################
-is_resolved_mode() {
-    systemctl is-active systemd-resolved >/dev/null 2>&1
-}
-
-########################################
-# 修改 resolv.conf 文件模式（可锁定）
-########################################
-set_resolvconf_dns() {
-    # 解锁
-    if lsattr /etc/resolv.conf 2>/dev/null | grep -q "\-i\-"; then
-        echo -e "${green}检测到 resolv.conf 已锁定，正在解锁...${reset}"
-        sudo chattr -i /etc/resolv.conf
-    fi
-
-    sudo cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null
-
-    sudo bash -c "cat > /etc/resolv.conf <<EOF
-nameserver $1
-options timeout:2 attempts:3
-EOF"
-
-    echo -e "${green}DNS 已写入 resolv.conf${reset}"
-
-    # 可选锁定
-    echo -ne "${green}是否锁定 /etc/resolv.conf 防止被覆盖? (y/n):${reset} "
-    read lock_choice
-    if [[ "$lock_choice" == "y" ]]; then
-        sudo chattr +i /etc/resolv.conf
-        echo -e "${green}/etc/resolv.conf 已锁定${reset}"
-    fi
-}
-
-########################################
-# 关闭 Ubuntu resolved 并写入 resolv.conf（可锁定）
-########################################
-disable_ubuntu_resolved() {
-    echo -e "${green}检测到 Ubuntu + systemd-resolved，正在关闭...${reset}"
-    sudo systemctl stop systemd-resolved
-    sudo systemctl disable systemd-resolved
-
-    sudo rm -f /etc/resolv.conf
-
-    sudo bash -c "cat > /etc/resolv.conf <<EOF
-nameserver $1
-nameserver 1.1.1.1
-options timeout:2 attempts:3
-EOF"
-
-    echo -e "${green}resolved 已关闭，DNS 已写入 /etc/resolv.conf${reset}"
-
-    # 可选锁定
-    echo -ne "${green}是否锁定 /etc/resolv.conf 防止被覆盖? (y/n):${reset} "
-    read lock_choice
-    if [[ "$lock_choice" == "y" ]]; then
-        sudo chattr +i /etc/resolv.conf
-        echo -e "${green}/etc/resolv.conf 已锁定${reset}"
-    fi
-}
-
-########################################
-# 临时 resolvectl 模式
-########################################
-set_resolved_runtime_dns() {
-    interface=$(ip route | awk '/default/ {print $5; exit}')
-    if [ -z "$interface" ]; then
-        echo -e "${red}无法检测网络接口${reset}"
-        return
-    fi
-    sudo resolvectl dns "$interface" "$1"
-    sudo resolvectl flush-caches
-    echo -e "${green}DNS 已通过 resolvectl 临时应用${reset}"
-}
-
-########################################
-# 主循环
-########################################
-while true; do
-    echo -e "${green}请选择要使用的 DNS 区域：${reset}"
-    count=0
-    for region in "${dns_order[@]}"; do
-        ((count++))
-        printf "${green}[%02d] %-10s${reset}" "$count" "$region"
-        (( count % 2 == 0 )) && echo ""
+get_public_ip() {
+    local ip
+    for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+        ip=$(curl -4s --max-time 5 "$url" 2>/dev/null)
+        if [[ -n "$ip" ]]; then
+            echo "$ip"
+            return 0
+        fi
     done
-    echo -e "${green}[0]  退出${reset}"
+    echo "127.0.0.1"
+}
 
-    echo -ne "${green}请输入编号:${reset} "
-    read choice
+random_password() {
+    openssl rand -hex 8
+}
 
-     # 支持 0 或 00 退出
-    [[ "$choice" == "0" || "$choice" == "00" ]] && exit 0
+menu() {
+    clear
+    echo -e "${GREEN}=== aMule 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 查看日志${RESET}"
+    echo -e "${GREEN}4) 重启${RESET}"
+    echo -e "${GREEN}5) 停止${RESET}"
+    echo -e "${GREEN}6) 编辑配置${RESET}"
+    echo -e "${GREEN}7) 查看状态${RESET}"
+    echo -e "${GREEN}8) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
 
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#dns_order[@]} )); then
-        region="${dns_order[$((choice-1))]}"
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-        if [ "$region" = "自定义" ]; then
-            echo -ne "${green}请输入 DNS IP:${reset} "
-            read dns_to_set
-        else
-            dns_to_set="${dns_list[$region]}"
-        fi
+    case $choice in
+        1) install_app ;;
+        2) update_app ;;
+        3) view_logs ;;
+        4) restart_app ;;
+        5) stop_app ;;
+        6) edit_config ;;
+        7) app_status ;;
+        8) uninstall_app ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
+    esac
+}
 
-        echo -e "${green}正在设置 DNS 为 $dns_to_set ($region)...${reset}"
-
-        # 核心逻辑
-        if is_ubuntu && is_resolved_mode; then
-            disable_ubuntu_resolved "$dns_to_set"
-        elif is_resolved_mode; then
-            set_resolved_runtime_dns "$dns_to_set"
-        else
-            set_resolvconf_dns "$dns_to_set"
-        fi
-
-        echo
-    else
-        echo -e "${red}无效选择，请重新输入。${reset}"
+check_requirements() {
+    if ! command -v docker >/dev/null 2>&1; then
+        echo -e "${RED}未检测到 Docker，请先安装 Docker${RESET}"
+        exit 1
     fi
-done
+
+    if ! docker compose version >/dev/null 2>&1; then
+        echo -e "${RED}未检测到 docker compose 插件，请检查 Docker 安装${RESET}"
+        exit 1
+    fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        apt update
+        apt install -y curl
+    fi
+
+    if ! command -v openssl >/dev/null 2>&1; then
+        apt update
+        apt install -y openssl
+    fi
+}
+
+install_app() {
+    check_requirements
+
+    mkdir -p "$APP_DIR/config" "$APP_DIR/incoming" "$APP_DIR/temp"
+    cd "$APP_DIR" || exit 1
+
+    local DEFAULT_UID DEFAULT_GID
+    DEFAULT_UID=1000
+    DEFAULT_GID=1000
+
+    read -p "请输入 PUID [默认: ${DEFAULT_UID}]: " PUID
+    read -p "请输入 PGID [默认: ${DEFAULT_GID}]: " PGID
+    read -p "请输入时区 [默认: Asia/Shanghai]: " TZ
+    read -p "请输入 GUI 密码 [留空自动生成]: " GUI_PWD
+    read -p "请输入 WebUI 密码 [留空自动生成]: " WEBUI_PWD
+    read -p "是否启用自动重启？[Y/n]: " AUTO_RESTART
+    read -p "自动重启 cron [默认: 0 6 * * *]: " AUTO_RESTART_CRON
+    read -p "是否启用自动分享？[y/N]: " AUTO_SHARE
+    read -p "自动分享目录 [默认: /incoming;/my_movies]: " AUTO_SHARE_DIRS
+    read -p "4711 WebUI 端口 [默认: 4711]: " PORT_WEB
+    read -p "4712 远程控制端口 [默认: 4712]: " PORT_REMOTE
+    read -p "4662 eD2k TCP 端口 [默认: 4662]: " PORT_ED2K_TCP
+    read -p "4665 eD2k UDP 搜索端口 [默认: 4665]: " PORT_ED2K_UDP_SEARCH
+    read -p "4672 eD2k UDP 端口 [默认: 4672]: " PORT_ED2K_UDP
+
+    PUID=${PUID:-$DEFAULT_UID}
+    PGID=${PGID:-$DEFAULT_GID}
+    TZ=${TZ:-Asia/Shanghai}
+    GUI_PWD=${GUI_PWD:-$(random_password)}
+    WEBUI_PWD=${WEBUI_PWD:-$(random_password)}
+    AUTO_RESTART_CRON=${AUTO_RESTART_CRON:-0 6 * * *}
+    AUTO_SHARE_DIRS=${AUTO_SHARE_DIRS:-/incoming;/my_movies}
+    PORT_WEB=${PORT_WEB:-4711}
+    PORT_REMOTE=${PORT_REMOTE:-4712}
+    PORT_ED2K_TCP=${PORT_ED2K_TCP:-4662}
+    PORT_ED2K_UDP_SEARCH=${PORT_ED2K_UDP_SEARCH:-4665}
+    PORT_ED2K_UDP=${PORT_ED2K_UDP:-4672}
+
+    if [[ "$AUTO_RESTART" == "n" || "$AUTO_RESTART" == "N" ]]; then
+        MOD_AUTO_RESTART_ENABLED="false"
+    else
+        MOD_AUTO_RESTART_ENABLED="true"
+    fi
+
+    if [[ "$AUTO_SHARE" == "y" || "$AUTO_SHARE" == "Y" ]]; then
+        MOD_AUTO_SHARE_ENABLED="true"
+    else
+        MOD_AUTO_SHARE_ENABLED="false"
+    fi
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  amule:
+    image: ngosang/amule
+    container_name: amule
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - GUI_PWD=${GUI_PWD}
+      - WEBUI_PWD=${WEBUI_PWD}
+      - MOD_AUTO_RESTART_ENABLED=${MOD_AUTO_RESTART_ENABLED}
+      - MOD_AUTO_RESTART_CRON=${AUTO_RESTART_CRON}
+      - MOD_AUTO_SHARE_ENABLED=${MOD_AUTO_SHARE_ENABLED}
+      - MOD_AUTO_SHARE_DIRECTORIES=${AUTO_SHARE_DIRS}
+      - MOD_FIX_KAD_GRAPH_ENABLED=true
+      - MOD_FIX_KAD_BOOTSTRAP_ENABLED=true
+    ports:
+      - "${PORT_WEB}:4711"
+      - "${PORT_REMOTE}:4712"
+      - "${PORT_ED2K_TCP}:4662"
+      - "${PORT_ED2K_UDP_SEARCH}:4665/udp"
+      - "${PORT_ED2K_UDP}:4672/udp"
+    volumes:
+      - ${APP_DIR}/config:/home/amule/.aMule
+      - ${APP_DIR}/incoming:/incoming
+      - ${APP_DIR}/temp:/temp
+    restart: unless-stopped
+EOF
+
+    docker compose up -d
+
+    SERVER_IP=$(get_public_ip)
+
+    cat > "$APP_DIR/install-info.txt" <<EOF
+访问地址: http://${SERVER_IP}:${PORT_WEB}
+GUI 密码: ${GUI_PWD}
+WebUI 密码: ${WEBUI_PWD}
+配置目录: ${APP_DIR}/config
+下载目录: ${APP_DIR}/incoming
+临时目录: ${APP_DIR}/temp
+EOF
+
+    echo
+    echo -e "${GREEN}✅ aMule 已安装并启动${RESET}"
+    echo -e "${YELLOW}访问地址: http://${SERVER_IP}:${PORT_WEB}${RESET}"
+    echo -e "${YELLOW}GUI 密码: ${GUI_PWD}${RESET}"
+    echo -e "${YELLOW}WebUI 密码: ${WEBUI_PWD}${RESET}"
+    echo -e "${YELLOW}安装信息已保存到: ${APP_DIR}/install-info.txt${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+update_app() {
+    cd "$APP_DIR" || {
+        echo -e "${RED}未检测到安装目录，请先安装${RESET}"
+        sleep 1
+        menu
+    }
+
+    docker compose pull
+    docker compose up -d
+
+    echo -e "${GREEN}✅ aMule 已更新${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+view_logs() {
+    cd "$APP_DIR" || {
+        echo -e "${RED}未检测到安装目录${RESET}"
+        sleep 1
+        menu
+    }
+
+    docker compose logs -f
+    read -p "按回车返回菜单..."
+    menu
+}
+
+restart_app() {
+    cd "$APP_DIR" || {
+        echo -e "${RED}未检测到安装目录${RESET}"
+        sleep 1
+        menu
+    }
+
+    docker compose restart
+    echo -e "${GREEN}✅ 已重启${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+stop_app() {
+    cd "$APP_DIR" || {
+        echo -e "${RED}未检测到安装目录${RESET}"
+        sleep 1
+        menu
+    }
+
+    docker compose down
+    echo -e "${GREEN}✅ 已停止${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+edit_config() {
+    cd "$APP_DIR" || {
+        echo -e "${RED}未检测到安装目录${RESET}"
+        sleep 1
+        menu
+    }
+
+    nano "$COMPOSE_FILE"
+    echo -e "${YELLOW}配置已编辑，正在重新部署...${RESET}"
+    docker compose up -d
+
+    echo -e "${GREEN}✅ 配置已生效${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+app_status() {
+    cd "$APP_DIR" || {
+        echo -e "${RED}未检测到安装目录${RESET}"
+        sleep 1
+        menu
+    }
+
+    echo -e "${GREEN}容器状态：${RESET}"
+    docker compose ps
+    echo
+    echo -e "${GREEN}端口监听：${RESET}"
+    ss -tulnp | grep -E ':4711|:4712|:4662|:4665|:4672' || true
+    echo
+    if [ -f "$APP_DIR/install-info.txt" ]; then
+        echo -e "${GREEN}安装信息：${RESET}"
+        cat "$APP_DIR/install-info.txt"
+    fi
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+uninstall_app() {
+    if [ -d "$APP_DIR" ]; then
+        cd "$APP_DIR" && docker compose down
+    fi
+
+    rm -rf "$APP_DIR"
+
+    echo -e "${GREEN}✅ aMule 已卸载（包含数据）${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+menu

@@ -1,7 +1,8 @@
 #!/bin/bash
 # ========================================
-# 1shell 一键管理
-# Docker Compose 部署
+# dstatus 一键管理
+# Debian 12 / Ubuntu 兼容
+# 基于官方安装脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -9,9 +10,9 @@ YELLOW="\033[33m"
 RESET="\033[0m"
 RED="\033[31m"
 
-APP_NAME="1shell"
-APP_DIR="/opt/$APP_NAME"
-REPO_URL="https://github.com/weidu12123/1shell.git"
+INSTALL_DIR="/opt/dstatus"
+DEFAULT_PORT="5555"
+SERVICE_NAME="dstatus"
 
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}请使用 root 运行此脚本${RESET}"
@@ -22,43 +23,27 @@ get_public_ip() {
     local ip
     for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
         for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null)
-            if [[ -n "$ip" ]]; then
-                echo "$ip"
-                return 0
-            fi
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
-
     for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
         for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null)
-            if [[ -n "$ip" ]]; then
-                echo "$ip"
-                return 0
-            fi
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
-
-    echo "127.0.0.1"
-    return 0
-}
-
-escape_sed_replacement() {
-    printf '%s' "$1" | sed 's/[&/\]/\\&/g'
+    echo "无法获取公网 IP 地址。" && return
 }
 
 function menu() {
     clear
-    echo -e "${GREEN}=== 1shell 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== Dstatus 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 查看日志${RESET}"
-    echo -e "${GREEN}4) 重启${RESET}"
-    echo -e "${GREEN}5) 停止${RESET}"
-    echo -e "${GREEN}6) 编辑配置${RESET}"
-    echo -e "${GREEN}7) 查看状态${RESET}"
-    echo -e "${GREEN}8) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}3) 查看服务状态${RESET}"
+    echo -e "${GREEN}4) 重启服务${RESET}"
+    echo -e "${GREEN}5) 停止服务${RESET}"
+    echo -e "${GREEN}6) 卸载(保留数据)${RESET}"
+    echo -e "${GREEN}7) 卸载(清空数据)${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
 
     read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
@@ -66,231 +51,128 @@ function menu() {
     case $choice in
         1) install_app ;;
         2) update_app ;;
-        3) view_logs ;;
+        3) view_status ;;
         4) restart_app ;;
         5) stop_app ;;
-        6) edit_config ;;
-        7) app_status ;;
-        8) uninstall_app ;;
+        6) uninstall_app ;;
+        7) purge_app ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
     esac
 }
 
-function check_docker() {
-    if ! command -v docker >/dev/null 2>&1; then
-        echo -e "${RED}未检测到 Docker，请先安装 Docker${RESET}"
-        exit 1
+function check_requirements() {
+    if ! command -v curl >/dev/null 2>&1; then
+        echo -e "${YELLOW}未检测到 curl，正在安装...${RESET}"
+        apt update
+        apt install -y curl
     fi
 
-    if ! docker compose version >/dev/null 2>&1; then
-        echo -e "${RED}未检测到 docker compose 插件，请检查 Docker 安装${RESET}"
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo -e "${RED}当前系统不支持 systemd，无法管理 dstatus 服务${RESET}"
         exit 1
-    fi
-
-    if ! command -v git >/dev/null 2>&1; then
-        echo -e "${RED}未检测到 git，请先安装 git${RESET}"
-        exit 1
-    fi
-
-    if ! command -v openssl >/dev/null 2>&1; then
-        echo -e "${RED}未检测到 openssl，请先安装 openssl${RESET}"
-        exit 1
-    fi
-}
-
-function set_env_value() {
-    local key="$1"
-    local value="$2"
-    local file="$3"
-    local escaped_value
-
-    escaped_value=$(escape_sed_replacement "$value")
-
-    if grep -q "^${key}=" "$file"; then
-        sed -i "s|^${key}=.*|${key}=${escaped_value}|" "$file"
-    else
-        echo "${key}=${value}" >> "$file"
     fi
 }
 
 function install_app() {
-    echo -e "${YELLOW}开始安装 1shell...${RESET}"
+    check_requirements
 
-    check_docker
+    echo -e "${GREEN}开始安装 dstatus...${RESET}"
+    read -p "请输入监听端口 [默认: ${DEFAULT_PORT}]: " PORT
+    PORT=${PORT:-$DEFAULT_PORT}
 
-    mkdir -p "$APP_DIR"
+    read -p "是否启用 watchtower(自动更新)？[Y/n]: " ENABLE_WATCHTOWER
 
-    if [ ! -d "$APP_DIR/.git" ]; then
-        git clone "$REPO_URL" "$APP_DIR"
-    else
-        echo -e "${YELLOW}检测到项目目录已存在，跳过克隆${RESET}"
+    WATCHTOWER_ARG="--enable-watchtower"
+    if [[ "$ENABLE_WATCHTOWER" == "n" || "$ENABLE_WATCHTOWER" == "N" ]]; then
+        WATCHTOWER_ARG=""
     fi
 
-    cd "$APP_DIR" || exit 1
-
-    if [ ! -f ".env" ]; then
-        cp .env.example .env
-    fi
+    echo -e "${GREEN}正在执行官方安装脚本...${RESET}"
+    curl -fsSL dstatus.sh | bash -s -- --port="$PORT" --install-dir="$INSTALL_DIR" $WATCHTOWER_ARG
 
     echo
-    echo -e "${GREEN}请填写 1shell 配置${RESET}"
-
-    read -p "OpenAI API Base [默认: https://api.openai.com/v1]: " OPENAI_API_BASE
-    read -p "OpenAI API Key: " OPENAI_API_KEY
-    read -p "OpenAI Model [默认: gpt-4o]: " OPENAI_MODEL
-    read -p "登录用户名 [默认: admin]: " APP_LOGIN_USERNAME
-    read -p "登录密码 [默认: admin]: " APP_LOGIN_PASSWORD
-    read -p "会话有效期小时 [默认: 12]: " APP_SESSION_TTL_HOURS
-
-    OPENAI_API_BASE=${OPENAI_API_BASE:-https://api.openai.com/v1}
-    OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
-    APP_LOGIN_USERNAME=${APP_LOGIN_USERNAME:-admin}
-    APP_LOGIN_PASSWORD=${APP_LOGIN_PASSWORD:-admin}
-    APP_SESSION_TTL_HOURS=${APP_SESSION_TTL_HOURS:-12}
-    PORT=${PORT:-3301}
-
-    BRIDGE_TOKEN=$(openssl rand -hex 32)
-    APP_SECRET=$(openssl rand -hex 32)
-
-    echo -e "${GREEN}已自动生成 Bridge Token${RESET}"
-    echo -e "${GREEN}已自动生成 APP_SECRET${RESET}"
-
-    set_env_value "OPENAI_API_BASE" "$OPENAI_API_BASE" ".env"
-    set_env_value "OPENAI_API_KEY" "$OPENAI_API_KEY" ".env"
-    set_env_value "OPENAI_MODEL" "$OPENAI_MODEL" ".env"
-    set_env_value "APP_LOGIN_USERNAME" "$APP_LOGIN_USERNAME" ".env"
-    set_env_value "APP_LOGIN_PASSWORD" "$APP_LOGIN_PASSWORD" ".env"
-    set_env_value "APP_SESSION_TTL_HOURS" "$APP_SESSION_TTL_HOURS" ".env"
-    set_env_value "PORT" "$PORT" ".env"
-    set_env_value "BRIDGE_TOKEN" "$BRIDGE_TOKEN" ".env"
-    set_env_value "APP_SECRET" "$APP_SECRET" ".env"
-
-    echo -e "${GREEN}启动容器...${RESET}"
-    docker compose up -d
-
     SERVER_IP=$(get_public_ip)
 
-    echo
-    echo -e "${GREEN}✅ 1shell 已安装并启动${RESET}"
+    echo -e "${GREEN}✅ dstatus 安装完成${RESET}"
+    echo -e "${YELLOW}服务名: ${SERVICE_NAME}${RESET}"
+    echo -e "${YELLOW}安装目录: ${INSTALL_DIR}${RESET}"
+    echo -e "${YELLOW}访问端口: ${PORT}${RESET}"
     echo -e "${YELLOW}访问地址: http://${SERVER_IP}:${PORT}${RESET}"
-    echo -e "${YELLOW}登录信息: ${APP_LOGIN_USERNAME} / ${APP_LOGIN_PASSWORD}${RESET}"
-    echo -e "${RED}请妥善保存登录密码和密钥信息${RESET}"
+
+    if [[ -n "$WATCHTOWER_ARG" ]]; then
+        echo -e "${YELLOW}Watchtower: 已启用${RESET}"
+    else
+        echo -e "${YELLOW}Watchtower: 未启用${RESET}"
+    fi
 
     read -p "按回车返回菜单..."
     menu
 }
+
 
 function update_app() {
-    cd "$APP_DIR" || {
-        echo -e "${RED}未检测到安装目录，请先安装${RESET}"
-        sleep 1
-        menu
-    }
+    check_requirements
 
-    echo -e "${GREEN}更新程序...${RESET}"
-    git pull
+    echo -e "${GREEN}更新 dstatus 到最新版...${RESET}"
+    curl -fsSL dstatus.sh | bash -s -- --update
 
-    echo -e "${GREEN}重新拉起容器...${RESET}"
-    docker compose up -d --build
-
-    echo -e "${GREEN}✅ 1shell 已更新${RESET}"
+    echo -e "${GREEN}✅ dstatus 已更新${RESET}"
 
     read -p "按回车返回菜单..."
     menu
 }
 
-function view_logs() {
-    cd "$APP_DIR" || {
-        echo -e "${RED}未检测到安装目录${RESET}"
-        sleep 1
-        menu
-    }
-
-    docker compose logs -f
+function view_status() {
+    systemctl status "$SERVICE_NAME" --no-pager
 
     read -p "按回车返回菜单..."
     menu
 }
 
 function restart_app() {
-    cd "$APP_DIR" || {
-        echo -e "${RED}未检测到安装目录${RESET}"
-        sleep 1
-        menu
-    }
+    systemctl restart "$SERVICE_NAME"
 
-    docker compose restart
-
-    echo -e "${GREEN}✅ 已重启${RESET}"
+    echo -e "${GREEN}✅ 服务已重启${RESET}"
 
     read -p "按回车返回菜单..."
     menu
 }
 
 function stop_app() {
-    cd "$APP_DIR" || {
-        echo -e "${RED}未检测到安装目录${RESET}"
-        sleep 1
-        menu
-    }
+    systemctl stop "$SERVICE_NAME"
 
-    docker compose down
-
-    echo -e "${GREEN}✅ 已停止${RESET}"
-
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function edit_config() {
-    cd "$APP_DIR" || {
-        echo -e "${RED}未检测到安装目录${RESET}"
-        sleep 1
-        menu
-    }
-
-    nano .env
-
-    echo -e "${YELLOW}配置已编辑，正在重启容器...${RESET}"
-    docker compose up -d --build
-
-    echo -e "${GREEN}✅ 配置已生效${RESET}"
-
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function app_status() {
-    cd "$APP_DIR" || {
-        echo -e "${RED}未检测到安装目录${RESET}"
-        sleep 1
-        menu
-    }
-
-    local port
-    port=$(grep '^PORT=' .env | cut -d= -f2)
-
-    echo -e "${GREEN}容器状态：${RESET}"
-    docker compose ps
-    echo
-    echo -e "${GREEN}端口监听：${RESET}"
-    ss -tulnp | grep -E ":${port}" || true
-    echo
-    echo -e "${GREEN}访问地址：${RESET}http://$(get_public_ip):${port}"
+    echo -e "${GREEN}✅ 服务已停止${RESET}"
 
     read -p "按回车返回菜单..."
     menu
 }
 
 function uninstall_app() {
-    if [ -d "$APP_DIR" ]; then
-        cd "$APP_DIR" && docker compose down
+    check_requirements
+
+    echo -e "${YELLOW}即将卸载 dstatus（保留数据）...${RESET}"
+    curl -fsSL dstatus.sh | bash -s -- --uninstall
+
+    echo -e "${GREEN}✅ dstatus 已卸载（数据保留）${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function purge_app() {
+    check_requirements
+
+    echo -e "${RED}警告：此操作将完全删除 dstatus 和所有数据！${RESET}"
+    read -p "确认继续吗？输入 yes 确认: " CONFIRM
+
+    if [ "$CONFIRM" = "yes" ]; then
+        curl -fsSL dstatus.sh | bash -s -- --uninstall --purge-data --yes
+        rm -rf "$INSTALL_DIR"
+        echo -e "${GREEN}✅ dstatus 已完全删除${RESET}"
+    else
+        echo -e "${YELLOW}已取消操作${RESET}"
     fi
-
-    rm -rf "$APP_DIR"
-
-    echo -e "${GREEN}✅ 1shell 已卸载（包含数据）${RESET}"
 
     read -p "按回车返回菜单..."
     menu

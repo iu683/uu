@@ -1,149 +1,208 @@
-#!/bin/sh
-set -e
+#!/bin/bash
+# ========================================
+# magic-resume 一键管理
+# Docker Compose 部署
+# ========================================
 
-# ================== 颜色 ==================
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-RED='\033[0;31m'
-RESET='\033[0m'
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RESET="\033[0m"
+RED="\033[31m"
 
-info()  { echo -e "${GREEN}[INFO] $1${RESET}"; }
-warn()  { echo -e "${YELLOW}[WARN] $1${RESET}"; }
-error() { echo -e "${RED}[ERROR] $1${RESET}"; }
+APP_NAME="magic-resume"
+APP_DIR="/opt/$APP_NAME"
+REPO_URL="https://github.com/JOYCEQL/magic-resume.git"
 
-# ================== 检测 Alpine ==================
-if [ ! -f /etc/alpine-release ]; then
-    error "该脚本仅适用于 Alpine Linux"
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}请使用 root 运行此脚本${RESET}"
     exit 1
 fi
 
-ALPINE_VERSION=$(cut -d. -f1-2 /etc/alpine-release)
-REPO_FILE="/etc/apk/repositories"
-ARCH="x86_64"  # 默认 x86_64，可根据实际架构修改
-
-# ================== 定义源 ==================
-OFFICIAL_MAIN="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ARCH}"
-OFFICIAL_COMMUNITY="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/community/${ARCH}"
-
-ALIYUN_MAIN="https://mirrors.aliyun.com/alpine/v${ALPINE_VERSION}/main/${ARCH}"
-ALIYUN_COMMUNITY="https://mirrors.aliyun.com/alpine/v${ALPINE_VERSION}/community/${ARCH}"
-
-TSINGHUA_MAIN="https://mirrors.tuna.tsinghua.edu.cn/alpine/v${ALPINE_VERSION}/main/${ARCH}"
-TSINGHUA_COMMUNITY="https://mirrors.tuna.tsinghua.edu.cn/alpine/v${ALPINE_VERSION}/community/${ARCH}"
-
-LATEST_MAIN="https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/${ARCH}"
-LATEST_COMMUNITY="https://dl-cdn.alpinelinux.org/alpine/latest-stable/community/${ARCH}"
-
-# ================== 函数 ==================
-backup_repo() {
-    if [ -f "$REPO_FILE" ]; then
-        cp "$REPO_FILE" "${REPO_FILE}.bak"
-        info "已备份当前源到 ${REPO_FILE}.bak"
-    fi
+get_public_ip() {
+    local ip
+    for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+        ip=$(curl -4s --max-time 5 "$url" 2>/dev/null)
+        if [[ -n "$ip" ]]; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    echo "127.0.0.1"
 }
 
-restore_repo() {
-    if [ -f "${REPO_FILE}.bak" ]; then
-        cp "${REPO_FILE}.bak" "$REPO_FILE"
-        info "已还原备份源"
-    else
-        warn "没有备份源，无法还原"
-    fi
-}
-
-switch_source() {
-    local main="$1"
-    local community="$2"
-    cat > "$REPO_FILE" <<EOF
-$main
-$community
-EOF
-    info "已切换源为 $main / $community"
-}
-
-detect_latest_version() {
-    local version
-    version=$(wget -qO- https://dl-cdn.alpinelinux.org/alpine/ 2>/dev/null \
-        | grep -o 'v[0-9]\+\.[0-9]\+' \
-        | sort -V | tail -n1)
-    echo "${version:-latest-stable}"
-}
-
-validate_repo() {
-    local url="$1"
-    if ! wget --spider -q "${url}/APKINDEX.tar.gz"; then
-        local latest_ver
-        latest_ver=$(detect_latest_version)
-        warn "检测到 ${url} 不可用，v${ALPINE_VERSION} 源不存在，已回退到 latest-stable (v${latest_ver})"
-        cat > "$REPO_FILE" <<EOF
-$LATEST_MAIN
-$LATEST_COMMUNITY
-EOF
-    fi
-}
-
-update_cache() {
-    info "正在更新 apk 缓存..."
-    if apk update; then
-        info "更新完成"
-    else
-        error "更新失败，请检查网络或源配置"
-    fi
-}
-
-show_current_repo() {
-    if [ -f "$REPO_FILE" ]; then
-        echo -e "${YELLOW}当前使用源:${RESET}"
-        cat "$REPO_FILE"
-        echo "------------------------------"
-    fi
-}
-
-# ================== 主菜单 ==================
-while true; do
+menu() {
     clear
-    echo -e "${GREEN}====== Alpine 更新源切换菜单 ======${RESET}"
-    show_current_repo
-    echo -e "${GREEN}1) 切换到阿里云源并更新缓存${RESET}"
-    echo -e "${GREEN}2) 切换到官方源并更新缓存${RESET}"
-    echo -e "${GREEN}3) 切换到清华源并更新缓存${RESET}"
-    echo -e "${GREEN}4) 备份当前源${RESET}"
-    echo -e "${GREEN}5) 还原备份源并更新缓存${RESET}"
+    echo -e "${GREEN}=== Magic Resume 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 查看日志${RESET}"
+    echo -e "${GREEN}4) 重启${RESET}"
+    echo -e "${GREEN}5) 停止${RESET}"
+    echo -e "${GREEN}6) 查看状态${RESET}"
+    echo -e "${GREEN}7) 卸载(含数据)${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    read -rp "$(echo -e ${GREEN}请选择操作: ${RESET})" choice
+
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
     case $choice in
-        1)
-            backup_repo
-            switch_source "$ALIYUN_MAIN" "$ALIYUN_COMMUNITY"
-            validate_repo "$ALIYUN_MAIN"
-            update_cache
-            ;;
-        2)
-            backup_repo
-            switch_source "$OFFICIAL_MAIN" "$OFFICIAL_COMMUNITY"
-            validate_repo "$OFFICIAL_MAIN"
-            update_cache
-            ;;
-        3)
-            backup_repo
-            switch_source "$TSINGHUA_MAIN" "$TSINGHUA_COMMUNITY"
-            validate_repo "$TSINGHUA_MAIN"
-            update_cache
-            ;;
-        4)
-            backup_repo
-            ;;
-        5)
-            restore_repo
-            update_cache
-            ;;
-        0)
-            break
-            ;;
-        *)
-            warn "无效选择，请重新输入"
-            ;;
+        1) install_app ;;
+        2) update_app ;;
+        3) view_logs ;;
+        4) restart_app ;;
+        5) stop_app ;;
+        6) app_status ;;
+        7) uninstall_app ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
     esac
-    read -rp "$(echo -e ${YELLOW}按回车返回菜单...${RESET})"
-done
+}
+
+check_requirements() {
+    if ! command -v docker >/dev/null 2>&1; then
+        echo -e "${RED}未检测到 Docker，请先安装 Docker${RESET}"
+        exit 1
+    fi
+
+    if ! docker compose version >/dev/null 2>&1; then
+        echo -e "${RED}未检测到 docker compose 插件，请检查 Docker 安装${RESET}"
+        exit 1
+    fi
+
+    if ! command -v git >/dev/null 2>&1; then
+        echo -e "${YELLOW}未检测到 git，正在安装...${RESET}"
+        apt update
+        apt install -y git
+    fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        echo -e "${YELLOW}未检测到 curl，正在安装...${RESET}"
+        apt update
+        apt install -y curl
+    fi
+}
+
+install_app() {
+    check_requirements
+
+    mkdir -p "$APP_DIR"
+
+    if [ ! -d "$APP_DIR/.git" ]; then
+        git clone "$REPO_URL" "$APP_DIR"
+    else
+        echo -e "${YELLOW}检测到项目目录已存在，跳过克隆${RESET}"
+    fi
+
+    cd "$APP_DIR" || exit 1
+
+    echo -e "${GREEN}启动容器...${RESET}"
+    docker compose up -d
+
+    SERVER_IP=$(get_public_ip)
+
+    cat > "$APP_DIR/install-info.txt" <<EOF
+访问地址: http://${SERVER_IP}:3000
+安装目录: ${APP_DIR}
+EOF
+
+    echo
+    echo -e "${GREEN}✅ magic-resume 已安装并启动${RESET}"
+    echo -e "${YELLOW}访问地址: http://${SERVER_IP}:3000${RESET}"
+    echo -e "${YELLOW}安装信息已保存到: ${APP_DIR}/install-info.txt${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+update_app() {
+    cd "$APP_DIR" || {
+        echo -e "${RED}未检测到安装目录，请先安装${RESET}"
+        sleep 1
+        menu
+    }
+
+    echo -e "${GREEN}拉取最新代码...${RESET}"
+    git pull
+
+    echo -e "${GREEN}重新部署容器...${RESET}"
+    docker compose up -d --build
+
+    echo -e "${GREEN}✅ magic-resume 已更新${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+view_logs() {
+    cd "$APP_DIR" || {
+        echo -e "${RED}未检测到安装目录${RESET}"
+        sleep 1
+        menu
+    }
+
+    docker compose logs -f
+    read -p "按回车返回菜单..."
+    menu
+}
+
+restart_app() {
+    cd "$APP_DIR" || {
+        echo -e "${RED}未检测到安装目录${RESET}"
+        sleep 1
+        menu
+    }
+
+    docker compose restart
+    echo -e "${GREEN}✅ 已重启${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+stop_app() {
+    cd "$APP_DIR" || {
+        echo -e "${RED}未检测到安装目录${RESET}"
+        sleep 1
+        menu
+    }
+
+    docker compose down
+    echo -e "${GREEN}✅ 已停止${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+app_status() {
+    cd "$APP_DIR" || {
+        echo -e "${RED}未检测到安装目录${RESET}"
+        sleep 1
+        menu
+    }
+
+    echo -e "${GREEN}容器状态：${RESET}"
+    docker compose ps
+    echo
+    echo -e "${GREEN}端口监听：${RESET}"
+    ss -tulnp | grep -E ':3000' || true
+    echo
+    if [ -f "$APP_DIR/install-info.txt" ]; then
+        echo -e "${GREEN}安装信息：${RESET}"
+        cat "$APP_DIR/install-info.txt"
+    fi
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+uninstall_app() {
+    if [ -d "$APP_DIR" ]; then
+        cd "$APP_DIR" && docker compose down
+    fi
+
+    rm -rf "$APP_DIR"
+
+    echo -e "${GREEN}✅ magic-resume 已卸载（包含数据）${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
+menu

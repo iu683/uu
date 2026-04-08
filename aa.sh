@@ -1,8 +1,8 @@
 #!/bin/bash
 # ========================================
-# magic-resume 一键管理脚本
-# Debian 12 / Ubuntu 兼容
-# Docker Compose 部署
+# emby-pulse 一键管理脚本
+# Debian / Ubuntu / 群晖 Docker 环境兼容
+# Docker Compose 部署（端口映射模式）
 # ========================================
 
 GREEN="\033[32m"
@@ -10,9 +10,9 @@ YELLOW="\033[33m"
 RESET="\033[0m"
 RED="\033[31m"
 
-APP_NAME="magic-resume"
+APP_NAME="emby-pulsepro"
 APP_DIR="/opt/$APP_NAME"
-REPO_URL="https://github.com/JOYCEQL/magic-resume.git"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}请使用 root 运行此脚本${RESET}"
@@ -33,14 +33,15 @@ get_public_ip() {
 
 menu() {
     clear
-    echo -e "${GREEN}=== magic-resume 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== emby-pulse pro 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 查看日志${RESET}"
     echo -e "${GREEN}4) 重启${RESET}"
     echo -e "${GREEN}5) 停止${RESET}"
-    echo -e "${GREEN}6) 查看状态${RESET}"
-    echo -e "${GREEN}7) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}6) 编辑配置${RESET}"
+    echo -e "${GREEN}7) 查看状态${RESET}"
+    echo -e "${GREEN}8) 卸载(含数据)${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
 
     read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
@@ -51,8 +52,9 @@ menu() {
         3) view_logs ;;
         4) restart_app ;;
         5) stop_app ;;
-        6) app_status ;;
-        7) uninstall_app ;;
+        6) edit_config ;;
+        7) app_status ;;
+        8) uninstall_app ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
     esac
@@ -69,12 +71,6 @@ check_requirements() {
         exit 1
     fi
 
-    if ! command -v git >/dev/null 2>&1; then
-        echo -e "${YELLOW}未检测到 git，正在安装...${RESET}"
-        apt update
-        apt install -y git
-    fi
-
     if ! command -v curl >/dev/null 2>&1; then
         echo -e "${YELLOW}未检测到 curl，正在安装...${RESET}"
         apt update
@@ -85,31 +81,64 @@ check_requirements() {
 install_app() {
     check_requirements
 
-    mkdir -p "$APP_DIR"
-
-    if [ ! -d "$APP_DIR/.git" ]; then
-        git clone "$REPO_URL" "$APP_DIR"
-    else
-        echo -e "${YELLOW}检测到项目目录已存在，跳过克隆${RESET}"
-    fi
-
+    mkdir -p "$APP_DIR/config" "$APP_DIR/data"
     cd "$APP_DIR" || exit 1
 
-    echo -e "${GREEN}启动容器...${RESET}"
+    echo -e "${GREEN}请填写 emby-pulse 配置${RESET}"
+
+    read -p "请输入时区 [默认: Asia/Shanghai]: " TZ
+    read -p "请输入 Emby 地址(如 http://192.168.31.2:8096): " EMBY_HOST
+    read -p "请输入 Emby API Key: " EMBY_API_KEY
+    read -p "请输入 Playback Reporting 数据库宿主机目录 [默认: /opt/emby/data]: " EMBY_DB_DIR
+    read -p "请输入数据库文件容器路径 [默认: /emby-data/playback_reporting.db]: " DB_PATH
+    read -p "请输入后台端口 [默认: 10307]: " PORT_ADMIN
+    read -p "请输入用户中心端口 [默认: 10308]: " PORT_USER
+
+    TZ=${TZ:-Asia/Shanghai}
+    EMBY_DB_DIR=${EMBY_DB_DIR:-/opt/emby/data}
+    DB_PATH=${DB_PATH:-/emby-data/playback_reporting.db}
+    PORT_ADMIN=${PORT_ADMIN:-10307}
+    PORT_USER=${PORT_USER:-10308}
+
+    mkdir -p "$EMBY_DB_DIR"
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  emby-pulse:
+    image: zeyu8023/embypulse-pro:latest
+    container_name: emby-pulse
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORT_ADMIN}:10307"
+      - "127.0.0.1:${PORT_USER}:10308"
+    volumes:
+      - ${EMBY_DB_DIR}:/emby-data
+      - ${APP_DIR}/config:/workspace/config
+      - ${APP_DIR}/data:/workspace/data
+    environment:
+      TZ: ${TZ}
+      DB_PATH: ${DB_PATH}
+      EMBY_HOST: ${EMBY_HOST}
+      EMBY_API_KEY: ${EMBY_API_KEY}
+EOF
+
     docker compose up -d
 
     SERVER_IP=$(get_public_ip)
 
     cat > "$APP_DIR/install-info.txt" <<EOF
-访问地址: http://${SERVER_IP}:3000
-本地访问: http://localhost:3000
-安装目录: ${APP_DIR}
+后台地址: http://127.0.0.1:${PORT_ADMIN}
+用户中心: http://127.0.0.1:${PORT_USER}
+Emby 地址: ${EMBY_HOST}
+数据库目录: ${EMBY_DB_DIR}
+配置目录: ${APP_DIR}/config
+数据目录: ${APP_DIR}/data
 EOF
 
     echo
-    echo -e "${GREEN}✅ magic-resume 已安装并启动${RESET}"
-    echo -e "${YELLOW}访问地址: http://${SERVER_IP}:3000${RESET}"
-    echo -e "${YELLOW}本地访问: http://localhost:3000${RESET}"
+    echo -e "${GREEN}✅ emby-pulse 已安装并启动${RESET}"
+    echo -e "${YELLOW}后台地址: http://127.0.0.1:${PORT_ADMIN}${RESET}"
+    echo -e "${YELLOW}用户中心: http://127.0.0.1:${PORT_USER}${RESET}"
     echo -e "${YELLOW}安装信息已保存到: ${APP_DIR}/install-info.txt${RESET}"
 
     read -p "按回车返回菜单..."
@@ -123,13 +152,10 @@ update_app() {
         menu
     }
 
-    echo -e "${GREEN}拉取最新代码...${RESET}"
-    git pull
+    docker compose pull
+    docker compose up -d
 
-    echo -e "${GREEN}重新部署容器...${RESET}"
-    docker compose up -d --build
-
-    echo -e "${GREEN}✅ magic-resume 已更新${RESET}"
+    echo -e "${GREEN}✅ emby-pulse 已更新${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
@@ -174,6 +200,22 @@ stop_app() {
     menu
 }
 
+edit_config() {
+    cd "$APP_DIR" || {
+        echo -e "${RED}未检测到安装目录${RESET}"
+        sleep 1
+        menu
+    }
+
+    nano "$COMPOSE_FILE"
+    echo -e "${YELLOW}配置已编辑，正在重新部署...${RESET}"
+    docker compose up -d
+
+    echo -e "${GREEN}✅ 配置已生效${RESET}"
+    read -p "按回车返回菜单..."
+    menu
+}
+
 app_status() {
     cd "$APP_DIR" || {
         echo -e "${RED}未检测到安装目录${RESET}"
@@ -185,7 +227,7 @@ app_status() {
     docker compose ps
     echo
     echo -e "${GREEN}端口监听：${RESET}"
-    ss -tulnp | grep -E ':3000' || true
+    ss -tulnp | grep -E ':10307|:10308' || true
     echo
     if [ -f "$APP_DIR/install-info.txt" ]; then
         echo -e "${GREEN}安装信息：${RESET}"
@@ -203,7 +245,7 @@ uninstall_app() {
 
     rm -rf "$APP_DIR"
 
-    echo -e "${GREEN}✅ magic-resume 已卸载（包含数据）${RESET}"
+    echo -e "${GREEN}✅ emby-pulse 已卸载（包含数据）${RESET}"
     read -p "按回车返回菜单..."
     menu
 }

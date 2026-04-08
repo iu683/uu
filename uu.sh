@@ -1,181 +1,147 @@
 #!/bin/bash
 # ========================================
-# dstatus 一键管理
-# Debian 12 / Ubuntu 兼容
-# 基于官方安装脚本
+# Emby-Proxy-Go 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RESET="\033[0m"
 RED="\033[31m"
+RESET="\033[0m"
 
-INSTALL_DIR="/opt/dstatus"
-DEFAULT_PORT="5555"
-SERVICE_NAME="dstatus"
+APP_NAME="emby-proxy"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}请使用 root 运行此脚本${RESET}"
-    exit 1
-fi
-
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
-}
-
-function menu() {
-    clear
-    echo -e "${GREEN}=== Dstatus 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 查看服务状态${RESET}"
-    echo -e "${GREEN}4) 重启服务${RESET}"
-    echo -e "${GREEN}5) 停止服务${RESET}"
-    echo -e "${GREEN}6) 卸载(保留数据)${RESET}"
-    echo -e "${GREEN}7) 卸载(清空数据)${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) view_status ;;
-        4) restart_app ;;
-        5) stop_app ;;
-        6) uninstall_app ;;
-        7) purge_app ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
-    esac
-}
-
-function check_requirements() {
-    if ! command -v curl >/dev/null 2>&1; then
-        echo -e "${YELLOW}未检测到 curl，正在安装...${RESET}"
-        apt update
-        apt install -y curl
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
     fi
 
-    if ! command -v systemctl >/dev/null 2>&1; then
-        echo -e "${RED}当前系统不支持 systemd，无法管理 dstatus 服务${RESET}"
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
         exit 1
     fi
 }
 
-function install_app() {
-    check_requirements
-
-    echo -e "${GREEN}开始安装 dstatus...${RESET}"
-    read -p "请输入监听端口 [默认: ${DEFAULT_PORT}]: " PORT
-    PORT=${PORT:-$DEFAULT_PORT}
-
-    read -p "是否启用 watchtower(自动更新)？[Y/n]: " ENABLE_WATCHTOWER
-
-    WATCHTOWER_ARG="--enable-watchtower"
-    if [[ "$ENABLE_WATCHTOWER" == "n" || "$ENABLE_WATCHTOWER" == "N" ]]; then
-        WATCHTOWER_ARG=""
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
     fi
+}
 
-    echo -e "${GREEN}正在执行官方安装脚本...${RESET}"
-    curl -fsSL dstatus.sh | bash -s -- --port="$PORT" --install-dir="$INSTALL_DIR" $WATCHTOWER_ARG
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== Emby-Proxy-Go 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+install_app() {
+
+    check_docker
+    mkdir -p "$APP_DIR"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
 
     echo
-    SERVER_IP=$(get_public_ip)
+    read -p "请输入监听端口 [默认:8080]: " input_port
+    PORT=${input_port:-8080}
+    check_port "$PORT" || return
 
-    echo -e "${GREEN}✅ dstatus 安装完成${RESET}"
-    echo -e "${YELLOW}服务名: ${SERVICE_NAME}${RESET}"
-    echo -e "${YELLOW}安装目录: ${INSTALL_DIR}${RESET}"
-    echo -e "${YELLOW}访问端口: ${PORT}${RESET}"
-    echo -e "${YELLOW}访问地址: http://${SERVER_IP}:${PORT}${RESET}"
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  emby-proxy:
+    image: ghcr.io/gsy-allen/emby-proxy-go:v1.2
+    container_name: emby-proxy
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORT}:8080"
+    logging:
+      driver: "local"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    environment:
+      LISTEN_ADDR: ":8080"
+      BLOCK_PRIVATE_TARGETS: "true"
+EOF
 
-    if [[ -n "$WATCHTOWER_ARG" ]]; then
-        echo -e "${YELLOW}Watchtower: 已启用${RESET}"
-    else
-        echo -e "${YELLOW}Watchtower: 未启用${RESET}"
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
+        return
     fi
 
+    echo
+    echo -e "${GREEN}✅ Emby Proxy 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${YELLOW}🌐 使用方法: https://{你的反代域名}/{emby服务器协议}/{emby服务器地址}/{emby服务器端口}${RESET}"
+    echo -e "${YELLOW}🌐 自定义Nginx配置location / {}下填写：${RESET}"
+    echo -e "${YELLOW}    proxy_buffering off;${RESET}"
+    echo -e "${YELLOW}    proxy_request_buffering off;${RESET}"
+    echo -e "${YELLOW}    proxy_max_temp_file_size 0;${RESET}"
+
+
+
     read -p "按回车返回菜单..."
-    menu
 }
 
-
-function update_app() {
-    check_requirements
-
-    echo -e "${GREEN}更新 dstatus 到最新版...${RESET}"
-    curl -fsSL dstatus.sh | bash -s -- --update
-
-    echo -e "${GREEN}✅ dstatus 已更新${RESET}"
-
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ Emby Proxy 更新完成${RESET}"
     read -p "按回车返回菜单..."
-    menu
 }
 
-function view_status() {
-    systemctl status "$SERVICE_NAME" --no-pager
-
+restart_app() {
+    docker restart emby-proxy
+    echo -e "${GREEN}✅ Emby Proxy 已重启${RESET}"
     read -p "按回车返回菜单..."
-    menu
 }
 
-function restart_app() {
-    systemctl restart "$SERVICE_NAME"
-
-    echo -e "${GREEN}✅ 服务已重启${RESET}"
-
-    read -p "按回车返回菜单..."
-    menu
+view_logs() {
+    docker logs -f emby-proxy
 }
 
-function stop_app() {
-    systemctl stop "$SERVICE_NAME"
-
-    echo -e "${GREEN}✅ 服务已停止${RESET}"
-
+check_status() {
+    docker ps | grep emby-proxy
     read -p "按回车返回菜单..."
-    menu
 }
 
-function uninstall_app() {
-    check_requirements
-
-    echo -e "${YELLOW}即将卸载 dstatus（保留数据）...${RESET}"
-    curl -fsSL dstatus.sh | bash -s -- --uninstall
-
-    echo -e "${GREEN}✅ dstatus 已卸载（数据保留）${RESET}"
-
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ Emby Proxy 已卸载${RESET}"
     read -p "按回车返回菜单..."
-    menu
-}
-
-function purge_app() {
-    check_requirements
-
-    echo -e "${RED}警告：此操作将完全删除 dstatus 和所有数据！${RESET}"
-    read -p "确认继续吗？输入 yes 确认: " CONFIRM
-
-    if [ "$CONFIRM" = "yes" ]; then
-        curl -fsSL dstatus.sh | bash -s -- --uninstall --purge-data --yes
-        rm -rf "$INSTALL_DIR"
-        echo -e "${GREEN}✅ dstatus 已完全删除${RESET}"
-    else
-        echo -e "${YELLOW}已取消操作${RESET}"
-    fi
-
-    read -p "按回车返回菜单..."
-    menu
 }
 
 menu

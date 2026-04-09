@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# PhotoPrism 一键管理脚本
+# Immich 一键管理脚本
 # Debian / Ubuntu 兼容
 # Docker Compose 部署
 # ========================================
@@ -10,7 +10,7 @@ YELLOW="\033[33m"
 RESET="\033[0m"
 RED="\033[31m"
 
-APP_NAME="photoprism"
+APP_NAME="immich"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -33,9 +33,9 @@ get_public_ip() {
 
 menu() {
     clear
-    echo -e "${GREEN}=== PhotoPrism 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== Immich 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新镜像${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 查看日志${RESET}"
     echo -e "${GREEN}4) 重启${RESET}"
     echo -e "${GREEN}5) 停止${RESET}"
@@ -84,41 +84,109 @@ install_app() {
     mkdir -p "$APP_DIR"
     cd "$APP_DIR" || exit 1
 
-    read -p "请输入访问端口 [默认: 2342]: " PORT
-    read -p "请输入管理员密码 [默认: insecure]: " ADMIN_PASSWORD
-    read -p "是否允许上传 NSFW 内容？[y/N]: " UPLOAD_NSFW
-    read -p "请输入 storage 目录 [默认: /opt/photoprism/storage]: " STORAGE_DIR
-    read -p "请输入 originals 照片目录 [默认: /opt/photoprism/Pictures]: " ORIGINALS_DIR
+    echo -e "${GREEN}请填写 Immich 配置${RESET}"
 
-    PORT=${PORT:-2342}
-    ADMIN_PASSWORD=${ADMIN_PASSWORD:-insecure}
-    STORAGE_DIR=${STORAGE_DIR:-/opt/photoprism/storage}
-    ORIGINALS_DIR=${ORIGINALS_DIR:-/opt/photoprism/Pictures}
+    read -p "PUID [默认: 0]: " PUID
+    read -p "PGID [默认: 0]: " PGID
+    read -p "时区 [默认: Asia/Shanghai]: " TZ
+    read -p "Immich 访问端口 [默认: 8080]: " IMMICH_PORT
+    read -p "Redis 映射端口 [默认: 6379]: " REDIS_PORT_MAP
+    read -p "Postgres 映射端口 [默认: 8432]: " POSTGRES_PORT_MAP
+    read -p "Postgres 主机名 [默认: postgres14]: " DB_HOSTNAME
+    read -p "Postgres 用户名 [默认: postgres]: " DB_USERNAME
+    read -p "Postgres 密码 [默认: postgres]: " DB_PASSWORD
+    read -p "Postgres 数据库名 [默认: immich]: " DB_DATABASE_NAME
+    read -p "Redis 主机名 [默认: redis]: " REDIS_HOSTNAME
+    read -p "Redis 密码 [可留空]: " REDIS_PASSWORD
+    read -p "是否禁用机器学习？[y/N]: " DISABLE_ML
+    read -p "是否禁用 Typesense？[y/N]: " DISABLE_TYPESENSE
+    read -p "是否启用 CUDA 加速？[y/N]: " CUDA_ACCELERATION
+    read -p "配置目录 [默认: /data/immich/config]: " CONFIG_DIR
+    read -p "照片目录 [默认: /data/immich/photos]: " PHOTOS_DIR
+    read -p "机器学习目录 [默认: /data/immich/machine]: " MACHINE_DIR
+    read -p "数据库目录 [默认: /data/immich/db]: " DB_DIR
 
-    if [[ "$UPLOAD_NSFW" == "y" || "$UPLOAD_NSFW" == "Y" ]]; then
-        PHOTOPRISM_UPLOAD_NSFW="true"
+    PUID=${PUID:-0}
+    PGID=${PGID:-0}
+    TZ=${TZ:-Asia/Shanghai}
+    IMMICH_PORT=${IMMICH_PORT:-8080}
+    REDIS_PORT_MAP=${REDIS_PORT_MAP:-6379}
+    POSTGRES_PORT_MAP=${POSTGRES_PORT_MAP:-8432}
+    DB_HOSTNAME=${DB_HOSTNAME:-postgres14}
+    DB_USERNAME=${DB_USERNAME:-postgres}
+    DB_PASSWORD=${DB_PASSWORD:-postgres}
+    DB_DATABASE_NAME=${DB_DATABASE_NAME:-immich}
+    REDIS_HOSTNAME=${REDIS_HOSTNAME:-redis}
+    CONFIG_DIR=${CONFIG_DIR:-/data/immich/config}
+    PHOTOS_DIR=${PHOTOS_DIR:-/data/immich/photos}
+    MACHINE_DIR=${MACHINE_DIR:-/data/immich/machine}
+    DB_DIR=${DB_DIR:-/data/immich/db}
+
+    if [[ "$DISABLE_ML" == "y" || "$DISABLE_ML" == "Y" ]]; then
+        DISABLE_MACHINE_LEARNING="true"
     else
-        PHOTOPRISM_UPLOAD_NSFW="false"
+        DISABLE_MACHINE_LEARNING="false"
     fi
 
-    mkdir -p "$STORAGE_DIR" "$ORIGINALS_DIR"
+    if [[ "$DISABLE_TYPESENSE" == "y" || "$DISABLE_TYPESENSE" == "Y" ]]; then
+        DISABLE_TYPESENSE_VAL="true"
+    else
+        DISABLE_TYPESENSE_VAL="false"
+    fi
+
+    if [[ "$CUDA_ACCELERATION" == "y" || "$CUDA_ACCELERATION" == "Y" ]]; then
+        CUDA_ACCELERATION_VAL="true"
+    else
+        CUDA_ACCELERATION_VAL="false"
+    fi
+
+    mkdir -p "$CONFIG_DIR" "$PHOTOS_DIR" "$MACHINE_DIR" "$DB_DIR"
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  photoprism:
-    container_name: photoprism
-    security_opt:
-      - seccomp=unconfined
-      - apparmor=unconfined
-    ports:
-      - "127.0.0.1:${PORT}:2342"
+  immich:
+    image: ghcr.io/imagegenius/immich:latest
+    container_name: immich
     environment:
-      - PHOTOPRISM_UPLOAD_NSFW=${PHOTOPRISM_UPLOAD_NSFW}
-      - PHOTOPRISM_ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - DB_HOSTNAME=${DB_HOSTNAME}
+      - DB_USERNAME=${DB_USERNAME}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_DATABASE_NAME=${DB_DATABASE_NAME}
+      - REDIS_HOSTNAME=${REDIS_HOSTNAME}
+      - DISABLE_MACHINE_LEARNING=${DISABLE_MACHINE_LEARNING}
+      - DISABLE_TYPESENSE=${DISABLE_TYPESENSE_VAL}
+      - DB_PORT=5432
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - CUDA_ACCELERATION=${CUDA_ACCELERATION_VAL}
     volumes:
-      - ${STORAGE_DIR}:/photoprism/storage
-      - ${ORIGINALS_DIR}:/photoprism/originals
-    image: photoprism/photoprism:latest
+      - ${CONFIG_DIR}:/config
+      - ${PHOTOS_DIR}:/photos
+      - ${MACHINE_DIR}:/config/machine-learning
+    ports:
+      - "${IMMICH_PORT}:8080"
+    restart: unless-stopped
+
+  redis:
+    image: redis
+    container_name: redis
+    ports:
+      - "${REDIS_PORT_MAP}:6379"
+
+  postgres14:
+    image: postgres:14
+    container_name: postgres14
+    environment:
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_DATABASE_NAME}
+    ports:
+      - "${POSTGRES_PORT_MAP}:5432"
+    volumes:
+      - ${DB_DIR}:/var/lib/postgresql/data
 EOF
 
     docker compose up -d
@@ -126,18 +194,23 @@ EOF
     SERVER_IP=$(get_public_ip)
 
     cat > "$APP_DIR/install-info.txt" <<EOF
-访问地址: http://127.0.0.1:${PORT}
-管理员账号: admin
-管理员密码: ${ADMIN_PASSWORD}
-Storage 目录: ${STORAGE_DIR}
-Originals 目录: ${ORIGINALS_DIR}
+Immich 地址: http://${SERVER_IP}:${IMMICH_PORT}
+本地访问: http://localhost:${IMMICH_PORT}
+Redis 端口: ${REDIS_PORT_MAP}
+Postgres 端口: ${POSTGRES_PORT_MAP}
+配置目录: ${CONFIG_DIR}
+照片目录: ${PHOTOS_DIR}
+机器学习目录: ${MACHINE_DIR}
+数据库目录: ${DB_DIR}
+数据库名称: ${DB_DATABASE_NAME}
+数据库用户: ${DB_USERNAME}
+数据库密码: ${DB_PASSWORD}
 EOF
 
     echo
-    echo -e "${GREEN}✅ PhotoPrism 已安装并启动${RESET}"
-    echo -e "${YELLOW}访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}管理员账号: admin${RESET}"
-    echo -e "${YELLOW}管理员密码: ${ADMIN_PASSWORD}${RESET}"
+    echo -e "${GREEN}✅ Immich 已安装并启动${RESET}"
+    echo -e "${YELLOW}访问地址: http://${SERVER_IP}:${IMMICH_PORT}${RESET}"
+    echo -e "${YELLOW}本地访问: http://localhost:${IMMICH_PORT}${RESET}"
     echo -e "${YELLOW}安装信息已保存到: ${APP_DIR}/install-info.txt${RESET}"
 
     read -p "按回车返回菜单..."
@@ -154,7 +227,7 @@ update_app() {
     docker compose pull
     docker compose up -d
 
-    echo -e "${GREEN}✅ PhotoPrism 已更新${RESET}"
+    echo -e "${GREEN}✅ Immich 已更新${RESET}"
     read -p "按回车返回菜单..."
     menu
 }
@@ -226,7 +299,7 @@ app_status() {
     docker compose ps
     echo
     echo -e "${GREEN}端口监听：${RESET}"
-    ss -tulnp | grep -E ':2342' || true
+    ss -tulnp | grep -E ':8080|:6379|:8432' || true
     echo
     if [ -f "$APP_DIR/install-info.txt" ]; then
         echo -e "${GREEN}安装信息：${RESET}"
@@ -244,7 +317,7 @@ uninstall_app() {
 
     rm -rf "$APP_DIR"
 
-    echo -e "${GREEN}✅ PhotoPrism 已卸载（包含数据）${RESET}"
+    echo -e "${GREEN}✅ Immich 已卸载（包含数据）${RESET}"
     read -p "按回车返回菜单..."
     menu
 }

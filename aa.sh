@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Let-Bot 一键管理脚本
+# MTLogin 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="let-bot"
+APP_NAME="mtlogin"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -27,7 +27,7 @@ check_docker() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Let-Bot 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== MTLogin 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -62,46 +62,63 @@ install_app() {
     fi
 
     echo
-    read -p "请输入 SiliconFlow API Key: " API_KEY
+    read -p "请输入用户名 USERNAME: " USERNAME
 
     echo
-    read -p "请输入 Telegram Bot Token: " BOT_TOKEN
+    read -p "请输入密码 PASSWORD: " PASSWORD
 
     echo
-    read -p "请输入 Telegram Chat ID: " CHAT_ID
+    read -p "请输入 TOTPSECRET(动态验证码): " input_totp
+    TOTPSECRET=${input_totp:-$(openssl rand -hex 10)}
 
     echo
-    read -p "请输入数据目录 [默认:$APP_DIR/data]: " input_data
-    DATA_DIR=${input_data:-$APP_DIR/data}
+    read -p "请输入 CRONTAB 定时任务 [默认:0 3 * * 1]: " input_cron
+    CRONTAB=${input_cron:-"0 3 * * 1"}
 
-    mkdir -p "$DATA_DIR"
+    echo
+    read -p "请输入 Telegram Bot Token (可留空): " TGBOT_TOKEN
+
+    echo
+    read -p "请输入 Telegram Chat ID (可留空): " TGBOT_CHAT_ID
+
+    echo
+    read -p "请输入数据库路径 [默认:$APP_DIR/auth.db]: " input_db
+    DB_PATH=${input_db:-$APP_DIR/auth.db}
+
+    mkdir -p "$(dirname "$DB_PATH")"
+    touch "$DB_PATH"
 
 cat > "$COMPOSE_FILE" <<EOF
 services:
-  let_bot:
-    image: tyer199/let_bot:v3.5
-    container_name: let_bot
-    restart: unless-stopped
-    environment:
-      - SILICON_API_KEY=${API_KEY}
-      - TG_BOT_TOKEN=${BOT_TOKEN}
-      - TG_CHAT_ID=${CHAT_ID}
-      - TZ=Asia/Shanghai
-    volumes:
-      - ${DATA_DIR}:/app/data
+    mtlogin:
+        container_name: mtlogin
+        image: ghcr.io/scjtqs2/mtlogin:edge
+        restart: unless-stopped
+        volumes:
+            - ${DB_PATH}:/data
+        environment:
+            - USERNAME=${USERNAME}
+            - PASSWORD=${PASSWORD}
+            - TOTPSECRET=${TOTPSECRET}
+            - CRONTAB=${CRONTAB}
+            - TGBOT_TOKEN=${TGBOT_TOKEN}
+            - TGBOT_CHAT_ID=${TGBOT_CHAT_ID}
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     if [ $? -ne 0 ]; then
-        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
+        echo -e "${RED}❌ 启动失败${RESET}"
         return
     fi
 
     echo
-    echo -e "${GREEN}✅ Let-Bot 已启动${RESET}"
-    echo -e "${GREEN}📂 数据目录: ${DATA_DIR}${RESET}"
+    echo -e "${GREEN}✅ MTLogin 已启动${RESET}"
+    echo -e "${GREEN}👤 用户名: ${USERNAME}${RESET}"
+    echo -e "${GREEN}🔑 密码: ${PASSWORD}${RESET}"
+    echo -e "${GREEN}🔐 TOTPSECRET: ${TOTPSECRET}${RESET}"
+    echo -e "${GREEN}📂 数据库: ${DB_PATH}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -110,22 +127,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Let-Bot 更新完成${RESET}"
+    echo -e "${GREEN}✅ MTLogin 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart let_bot
-    echo -e "${GREEN}✅ Let-Bot 已重启${RESET}"
+    docker restart mtlogin
+    echo -e "${GREEN}✅ MTLogin 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f let_bot
+    docker logs -f mtlogin
 }
 
 check_status() {
-    docker ps | grep let_bot
+    docker ps | grep mtlogin
     read -p "按回车返回菜单..."
 }
 
@@ -133,7 +150,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Let-Bot 已卸载${RESET}"
+    echo -e "${RED}✅ MTLogin 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

@@ -1,157 +1,305 @@
-#!/bin/bash
-# ========================================
-# MTLogin 一键管理脚本
-# ========================================
+#!/usr/bin/env bash
+set -e
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-RESET="\033[0m"
+#################################
+# 基础路径
+#################################
+ROOT="/root"
+SCRIPT_PATH="$ROOT/toolboxupdate.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/sistarry/toolbox/main/tool/update.sh"
+CONF="/etc/toolbox-update.conf"
+LOG_FILE="/var/log/toolbox-update.log"
+CRON_TAG="# toolbox-auto-update"
 
-APP_NAME="mtlogin"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+#################################
+# 颜色
+#################################
+GREEN='\033[32m'
+RED='\033[31m'
+YELLOW='\033[33m'
+RESET='\033[0m'
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
+#################################
+# 下载函数：失败自动重试一次
+#################################
+download_with_retry() {
+    local url="$1"
+    local output="$2"
+
+    if curl -fsSL "$url" -o "$output"; then
+        return 0
     fi
 
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+    echo -e "${YELLOW}下载失败，2 秒后重试一次...${RESET}"
+    sleep 2
+
+    if curl -fsSL "$url" -o "$output"; then
+        return 0
+    fi
+
+    return 1
+}
+
+#################################
+# 自动下载安装管理器
+#################################
+if [ ! -f "$SCRIPT_PATH" ]; then
+    if ! download_with_retry "$SCRIPT_URL" "$SCRIPT_PATH"; then
+        echo -e "${RED}❌ 安装失败，重试后仍无法下载，请检查网络或 URL${RESET}"
         exit 1
     fi
+    chmod +x "$SCRIPT_PATH"
+fi
+
+#################################
+# 读取配置
+#################################
+load_conf() {
+    [ -f "$CONF" ] && source "$CONF"
+    SERVER_NAME="${SERVER_NAME:-$(hostname)}"
 }
 
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== MTLogin 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+#################################
+# Telegram 可选
+#################################
+tg_send() {
+    load_conf
+    [ -z "${TG_BOT_TOKEN:-}" ] && return
+    [ -z "${TG_CHAT_ID:-}" ] && return
 
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
+    curl -s -X POST \
+      "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+      -d chat_id="$TG_CHAT_ID" \
+      -d text="$1" \
+      -d parse_mode="HTML" >/dev/null 2>&1 || true
 }
 
-install_app() {
+#################################
+# 更新逻辑
+#################################
+update_one() {
+    NAME="$1"
+    FILE="$2"
+    URL="$3"
 
-    check_docker
-    mkdir -p "$APP_DIR"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-
-    echo
-    read -p "请输入用户名 USERNAME: " USERNAME
-
-    echo
-    read -p "请输入密码 PASSWORD: " PASSWORD
-
-    echo
-    read -p "请输入 TOTPSECRET(动态验证码): " input_totp
-    TOTPSECRET=${input_totp:-$(openssl rand -hex 10)}
-
-    echo
-    read -p "请输入 CRONTAB 定时任务 [默认:0 3 * * 1]: " input_cron
-    CRONTAB=${input_cron:-"0 3 * * 1"}
-
-    echo
-    read -p "请输入 Telegram Bot Token (可留空): " TGBOT_TOKEN
-
-    echo
-    read -p "请输入 Telegram Chat ID (可留空): " TGBOT_CHAT_ID
-
-    echo
-    read -p "请输入数据库路径 [默认:$APP_DIR/auth.db]: " input_db
-    DB_PATH=${input_db:-$APP_DIR/auth.db}
-
-    mkdir -p "$(dirname "$DB_PATH")"
-    touch "$DB_PATH"
-
-cat > "$COMPOSE_FILE" <<EOF
-services:
-    mtlogin:
-        container_name: mtlogin
-        image: ghcr.io/scjtqs2/mtlogin:edge
-        restart: unless-stopped
-        volumes:
-            - ${DB_PATH}:/data
-        environment:
-            - USERNAME=${USERNAME}
-            - PASSWORD=${PASSWORD}
-            - TOTPSECRET=${TOTPSECRET}
-            - CRONTAB=${CRONTAB}
-            - TGBOT_TOKEN=${TGBOT_TOKEN}
-            - TGBOT_CHAT_ID=${TGBOT_CHAT_ID}
-EOF
-
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}❌ 启动失败${RESET}"
+    if [ ! -f "$ROOT/$FILE" ]; then
+        echo -e "${YELLOW}跳过 $NAME（未安装）${RESET}"
         return
     fi
 
+    echo -e "${GREEN}运行 $NAME ...${RESET}"
+    rm -f "$ROOT/$FILE"
+    TMP=$(mktemp)
+
+    if download_with_retry "$URL" "$TMP"; then
+        chmod +x "$TMP"
+        if printf "0\n" | bash "$TMP" >/dev/null 2>&1; then
+            UPDATED_LIST+=("$NAME")
+        fi
+    else
+        echo -e "${RED}$NAME 下载失败，已跳过${RESET}"
+    fi
+
+    rm -f "$TMP"
+}
+
+run_update() {
+    load_conf
+    UPDATED_LIST=()
+
+    update_one "vps-toolbox" "vps-toolbox.sh" \
+    "https://raw.githubusercontent.com/sistarry/toolbox/main/tool/install.sh"
+
+    update_one "proxy" "proxy.sh" \
+    "https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/proxy.sh"
+
+    update_one "oracle" "oracle.sh" \
+    "https://raw.githubusercontent.com/sistarry/toolbox/main/Oracle/oracle.sh"
+
+    update_one "store" "store.sh" \
+    "https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/Store.sh"
+
+    update_one "Alpine" "Alpine.sh" \
+    "https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/Alpine.sh"
+
+    update_one "panel" "panel.sh" \
+    "https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/panel.sh"
+
+    update_one "nat" "nat.sh" \
+    "https://raw.githubusercontent.com/sistarry/toolbox/main/toy/NAT.sh"
+
+    if [ ${#UPDATED_LIST[@]} -gt 0 ]; then
+        MSG="🚀 脚本已更新
+服务器: ${SERVER_NAME}
+脚本: ${UPDATED_LIST[*]}"
+        tg_send "$MSG"
+        echo -e "${GREEN}更新完成${RESET}"
+    else
+        echo -e "${YELLOW}没有脚本需要更新${RESET}"
+    fi
+}
+
+#################################
+# cron 管理（支持自定义）
+#################################
+enable_cron() {
+    echo -e "${GREEN}选择更新频率：${RESET}"
+    echo -e "${GREEN}1) 每天${RESET}"
+    echo -e "${GREEN}2) 每周${RESET}"
+    echo -e "${GREEN}3) 每月${RESET}"
+    echo -e "${GREEN}4) 每6小时${RESET}"
+    echo -e "${GREEN}5) 自定义 cron 表达式${RESET}"
+
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " c
+
+    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --auto" > /tmp/cron.tmp || true
+
+    case $c in
+        1) echo "0 0 * * * $SCRIPT_PATH --auto" >>/tmp/cron.tmp ;;
+        2) echo "0 0 * * 1 $SCRIPT_PATH --auto" >>/tmp/cron.tmp ;;
+        3) echo "0 0 1 * * $SCRIPT_PATH --auto" >>/tmp/cron.tmp ;;
+        4) echo "0 */6 * * * $SCRIPT_PATH --auto" >>/tmp/cron.tmp ;;
+        5)
+            echo "示例: 每30分钟 */30 * * * *"
+            read -p "请输入完整 cron 表达式: " CRON_EXP
+            echo "$CRON_EXP $SCRIPT_PATH --auto" >>/tmp/cron.tmp
+            ;;
+        *)
+            echo -e "${YELLOW}无效选项，取消操作${RESET}"
+            rm -f /tmp/cron.tmp
+            return
+            ;;
+    esac
+
+    crontab /tmp/cron.tmp
+    rm -f /tmp/cron.tmp
+    echo -e "${GREEN}自动更新已开启${RESET}"
+}
+
+disable_cron() {
+    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --auto" | crontab -
+    echo -e "${RED}自动更新已关闭${RESET}"
+}
+
+#################################
+# Telegram 设置
+#################################
+tg_setup() {
+    read -p "Bot Token: " token
+    read -p "Chat ID: " chat
+    read -p "VPS 名称(回车默认 hostname): " name
+    name="${name:-$(hostname)}"
+
+    cat >"$CONF" <<EOF
+TG_BOT_TOKEN="$token"
+TG_CHAT_ID="$chat"
+SERVER_NAME="$name"
+EOF
+
+    echo -e "${GREEN}Telegram 与 VPS 名称已保存${RESET}"
+}
+
+#################################
+# 卸载管理器函数
+#################################
+uninstall_manager() {
+    echo -e "${RED}正在卸载管理器...${RESET}"
+    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --auto" | crontab -
+    echo -e "${GREEN}✅ 已删除所有定时任务${RESET}"
+    [ -f "$SCRIPT_PATH" ] && rm -f "$SCRIPT_PATH" && echo -e "${GREEN}✅ 已删除管理器脚本${RESET}"
+    [ -f "$LOG_FILE" ] && rm -f "$LOG_FILE" && echo -e "${GREEN}✅ 已删除日志 ${LOG_FILE}${RESET}"
+    [ -f "$CONF" ] && rm -f "$CONF" && echo -e "${GREEN}✅ 已删除配置文件 ${CONF}${RESET}"
+    echo -e "${GREEN}卸载完成${RESET}"
+    exit 0
+}
+
+#################################
+# 自动模式（cron调用）
+#################################
+if [ "${1:-}" = "--auto" ]; then
+    run_update
+    exit
+fi
+
+#################################
+# 删除日志
+#################################
+delete_log() {
+    [ -f "$LOG_FILE" ] && rm -f "$LOG_FILE"
+    echo -e "${RED}日志已删除${RESET}"
+}
+
+#################################
+# 自更新管理器
+#################################
+self_update() {
+    load_conf
+    echo -e "${GREEN}正在更新管理器自身...${RESET}"
+
+    TMP=$(mktemp)
+
+    if ! download_with_retry "$SCRIPT_URL" "$TMP"; then
+        echo -e "${RED}下载失败，重试后仍无法完成${RESET}"
+        return
+    fi
+
+    chmod +x "$TMP"
+    mv "$TMP" "$SCRIPT_PATH"
+
+    MSG="🚀 管理器已更新
+服务器: ${SERVER_NAME}
+文件: toolboxupdate.sh"
+
+    tg_send "$MSG"
+
+    echo -e "${GREEN}更新完成，重新启动中...${RESET}"
+    exec "$SCRIPT_PATH"
+}
+
+#################################
+# 查看定时任务
+#################################
+list_cron() {
     echo
-    echo -e "${GREEN}✅ MTLogin 已启动${RESET}"
-    echo -e "${GREEN}👤 用户名: ${USERNAME}${RESET}"
-    echo -e "${GREEN}🔑 密码: ${PASSWORD}${RESET}"
-    echo -e "${GREEN}🔐 TOTPSECRET: ${TOTPSECRET}${RESET}"
-    echo -e "${GREEN}📂 数据库: ${DB_PATH}${RESET}"
+    TASKS=$(crontab -l 2>/dev/null | grep "$SCRIPT_PATH --auto" || true)
 
-    read -p "按回车返回菜单..."
+    if [ -z "$TASKS" ]; then
+        echo -e "${YELLOW}暂无自动更新任务${RESET}"
+    else
+        echo -e "${GREEN}当前自动更新任务：${RESET}"
+        echo "$TASKS"
+    fi
+
+    echo
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ MTLogin 更新完成${RESET}"
-    read -p "按回车返回菜单..."
-}
+#################################
+# 菜单循环
+#################################
+while true; do
+    clear
+    echo -e "${GREEN}=== Toolbox 自动更新管理器 ===${RESET}"
+    echo -e "${GREEN}1) 立即更新${RESET}"
+    echo -e "${GREEN}2) 开启自动更新${RESET}"
+    echo -e "${GREEN}3) 关闭自动更新${RESET}"
+    echo -e "${GREEN}4) 查看定时任务${RESET}"
+    echo -e "${GREEN}5) 设置 Telegram & 服务器名称(可选)${RESET}"
+    echo -e "${GREEN}6) 删除日志${RESET}"
+    echo -e "${GREEN}7) 更新管理器${RESET}"
+    echo -e "${GREEN}8) 卸载管理器${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
 
-restart_app() {
-    docker restart mtlogin
-    echo -e "${GREEN}✅ MTLogin 已重启${RESET}"
-    read -p "按回车返回菜单..."
-}
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-view_logs() {
-    docker logs -f mtlogin
-}
-
-check_status() {
-    docker ps | grep mtlogin
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ MTLogin 已卸载${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-menu
+    case $choice in
+        1) run_update; read -p "$(echo -e ${GREEN}回车继续...${RESET})" ;;
+        2) enable_cron; read -p "$(echo -e ${GREEN}回车继续...${RESET})" ;;
+        3) disable_cron; read -p "$(echo -e ${GREEN}回车继续...${RESET})" ;;
+        4) list_cron; read -p "$(echo -e ${GREEN}回车继续...${RESET})" ;;
+        5) tg_setup; read -p "$(echo -e ${GREEN}回车继续...${RESET})" ;;
+        6) delete_log; read -p "$(echo -e ${GREEN}回车继续...${RESET})" ;;
+        7) self_update ;;
+        8) uninstall_manager ;;
+        0) exit ;;
+    esac
+done

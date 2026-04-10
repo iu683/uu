@@ -1,316 +1,372 @@
-#!/bin/bash
-# ========================================
-# LuckyLilliaBot 一键管理脚本
-# Debian / Ubuntu 兼容
-# 基于官方 Docker 安装脚本
-# ========================================
+#!/usr/bin/env bash
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RESET="\033[0m"
-RED="\033[31m"
+set -e
 
-APP_NAME="LuckyLilliaBot"
-APP_DIR="/opt/llbot"
-INSTALL_SCRIPT_URL="https://gh-proxy.com/https://raw.githubusercontent.com/LLOneBot/LuckyLilliaBot/refs/heads/main/script/install-llbot-docker.sh"
-INSTALL_SCRIPT_NAME="llbot-docker.sh"
-COMPOSE_FILE_YML="$APP_DIR/docker-compose.yml"
-COMPOSE_FILE_YAML="$APP_DIR/docker-compose.yaml"
-DEFAULT_PORT="3080"
+PKG="@anthropic-ai/claude-code"
 
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}请使用 root 运行此脚本${RESET}"
-    exit 1
-fi
-
-get_public_ip() {
-    local ip
-    for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-        ip=$(curl -4s --max-time 5 "$url" 2>/dev/null)
-        if [[ -n "$ip" ]]; then
-            echo "$ip"
-            return 0
-        fi
-    done
-    echo "127.0.0.1"
+color() {
+  local code="$1"
+  shift
+  printf "\033[%sm%s\033[0m\n" "$code" "$*"
 }
 
-get_compose_file() {
-    if [ -f "$COMPOSE_FILE_YML" ]; then
-        echo "$COMPOSE_FILE_YML"
-    elif [ -f "$COMPOSE_FILE_YAML" ]; then
-        echo "$COMPOSE_FILE_YAML"
-    else
-        echo ""
-    fi
+green() {
+  color "32" "$*"
 }
 
-compose_cmd() {
-    if docker compose version >/dev/null 2>&1; then
-        docker compose "$@"
-    else
-        docker-compose "$@"
-    fi
+info() {
+  color "36" "[INFO] $*"
+}
+
+ok() {
+  color "32" "[OK] $*"
+}
+
+warn() {
+  color "33" "[WARN] $*"
+}
+
+err() {
+  color "31" "[ERROR] $*"
+}
+
+pause() {
+  read -rp "按回车继续..." _
+}
+
+require_sudo() {
+  if [ "$(id -u)" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
+    err "当前不是 root，且系统未安装 sudo"
+    return 1
+  fi
+}
+
+run_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+detect_os() {
+  if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_LIKE="${ID_LIKE:-}"
+  else
+    OS_ID="$(uname -s)"
+    OS_LIKE=""
+  fi
+}
+
+install_node_debian() {
+  require_sudo || return 1
+  info "检测到 Debian/Ubuntu 系统，开始安装 Node.js 20.x"
+  run_root apt update
+  run_root apt install -y curl ca-certificates gnupg
+  curl -fsSL https://deb.nodesource.com/setup_20.x | run_root bash -
+  run_root apt install -y nodejs
+}
+
+install_node_rhel() {
+  require_sudo || return 1
+  info "检测到 RHEL/CentOS/Rocky/AlmaLinux 系统，开始安装 Node.js 20.x"
+  if command -v dnf >/dev/null 2>&1; then
+    run_root dnf install -y curl
+    curl -fsSL https://rpm.nodesource.com/setup_20.x | run_root bash -
+    run_root dnf install -y nodejs
+  elif command -v yum >/dev/null 2>&1; then
+    run_root yum install -y curl
+    curl -fsSL https://rpm.nodesource.com/setup_20.x | run_root bash -
+    run_root yum install -y nodejs
+  else
+    err "未找到 dnf 或 yum"
+    return 1
+  fi
+}
+
+install_node_alpine() {
+  require_sudo || return 1
+  info "检测到 Alpine 系统，开始安装 Node.js"
+  run_root apk add nodejs npm
+}
+
+install_node_macos() {
+  if ! command -v brew >/dev/null 2>&1; then
+    err "未检测到 Homebrew，请先安装 brew"
+    return 1
+  fi
+  info "检测到 macOS，使用 Homebrew 安装 Node.js"
+  brew install node
+}
+
+install_node() {
+  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+    ok "Node.js 已安装"
+    info "Node: $(node -v)"
+    info "npm : $(npm -v)"
+    return 0
+  fi
+
+  detect_os
+
+  case "$OS_ID" in
+    ubuntu|debian)
+      install_node_debian
+      ;;
+    centos|rhel|rocky|almalinux|ol|fedora)
+      install_node_rhel
+      ;;
+    alpine)
+      install_node_alpine
+      ;;
+    macos|darwin)
+      install_node_macos
+      ;;
+    *)
+      case "$OS_LIKE" in
+        *debian*)
+          install_node_debian
+          ;;
+        *rhel*|*fedora*)
+          install_node_rhel
+          ;;
+        *)
+          if [ "$(uname -s)" = "Darwin" ]; then
+            install_node_macos
+          else
+            err "暂不支持自动安装 Node.js，系统类型: ${OS_ID:-unknown}"
+            return 1
+          fi
+          ;;
+      esac
+      ;;
+  esac
+
+  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+    ok "Node.js 安装完成"
+    info "Node: $(node -v)"
+    info "npm : $(npm -v)"
+  else
+    err "Node.js 安装后仍未检测到 node/npm"
+    return 1
+  fi
+}
+
+check_node() {
+  if ! command -v node >/dev/null 2>&1; then
+    err "未检测到 node，请先安装 Node.js"
+    return 1
+  fi
+
+  if ! command -v npm >/dev/null 2>&1; then
+    err "未检测到 npm，请先安装 npm"
+    return 1
+  fi
+
+  info "Node: $(node -v)"
+  info "npm : $(npm -v)"
+}
+
+check_claude() {
+  if command -v claude >/dev/null 2>&1; then
+    ok "Claude Code 已安装: $(claude --version 2>/dev/null || echo '已安装但版本读取失败')"
+    return 0
+  fi
+
+  warn "未检测到 claude 命令"
+  return 1
+}
+
+install_claude() {
+  check_node || return 1
+  info "开始安装 Claude Code..."
+  npm install -g "$PKG"
+  ok "安装完成"
+  check_claude || true
+}
+
+update_claude() {
+  check_node || return 1
+  info "开始更新 Claude Code..."
+  npm install -g "$PKG@latest"
+  ok "更新完成"
+  check_claude || true
+}
+
+uninstall_claude() {
+  check_node || return 1
+  info "开始卸载 Claude Code..."
+  npm uninstall -g "$PKG" || true
+  ok "卸载完成"
+}
+
+auth_claude() {
+  if ! check_claude; then
+    warn "请先安装 Claude Code"
+    return 1
+  fi
+
+  info "启动登录授权..."
+  claude auth
+}
+
+test_claude() {
+  if ! check_claude; then
+    warn "请先安装 Claude Code"
+    return 1
+  fi
+
+  info "执行快速测试..."
+  claude -p "用一句话说明当前目录适合做什么"
+}
+
+interactive_claude() {
+  if ! check_claude; then
+    warn "请先安装 Claude Code"
+    return 1
+  fi
+
+  info "进入 Claude 交互模式..."
+  claude -c
+}
+
+show_env() {
+  detect_os
+  info "环境检查"
+  echo "OS_ID    : ${OS_ID:-unknown}"
+  echo "OS_LIKE  : ${OS_LIKE:-unknown}"
+  echo "USER     : ${USER:-unknown}"
+  echo "SHELL    : ${SHELL:-unknown}"
+  echo "PATH     : $PATH"
+  echo
+
+  if command -v node >/dev/null 2>&1; then
+    echo "node     : $(node -v)"
+  else
+    echo "node     : 未安装"
+  fi
+
+  if command -v npm >/dev/null 2>&1; then
+    echo "npm      : $(npm -v)"
+    echo "npm root : $(npm root -g 2>/dev/null || echo '获取失败')"
+  else
+    echo "npm      : 未安装"
+  fi
+
+  if command -v claude >/dev/null 2>&1; then
+    echo "claude   : $(command -v claude)"
+    echo "version  : $(claude --version 2>/dev/null || echo '读取失败')"
+  else
+    echo "claude   : 未安装"
+  fi
+}
+
+fix_path_hint() {
+  warn "如果安装后仍提示 'claude: command not found'，通常是 PATH 问题。"
+  echo
+  echo "先查看 npm 全局目录："
+  echo "  npm root -g"
+  echo
+  echo "常见可执行目录："
+  echo "  ~/.npm-global/bin"
+  echo "  ~/.nvm/versions/node/<version>/bin"
+  echo "  /usr/local/bin"
+  echo
+  echo "例如加入 PATH："
+  echo '  export PATH="$HOME/.npm-global/bin:$PATH"'
+  echo
+  echo "生效命令："
+  echo "  source ~/.bashrc"
+  echo "或"
+  echo "  source ~/.zshrc"
+}
+
+install_all() {
+  install_node
+  install_claude
 }
 
 menu() {
-    clear
-    echo -e "${GREEN}=== LuckyLilliaBot 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 查看日志${RESET}"
-    echo -e "${GREEN}4) 重启${RESET}"
-    echo -e "${GREEN}5) 停止${RESET}"
-    echo -e "${GREEN}6) 编辑配置${RESET}"
-    echo -e "${GREEN}7) 设置自动登录QQ${RESET}"
-    echo -e "${GREEN}8) 查看状态${RESET}"
-    echo -e "${GREEN}9) 卸载(含数据)${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
+  clear
+  green "=================================="
+  green "   Claude Code 一键菜单管理"
+  green "=================================="
+  green "1. 一键安装 Node.js + Claude Code"
+  green "2. 仅安装 Node.js"
+  green "3. 安装 Claude Code"
+  green "4. 检查版本"
+  green "5. 登录授权"
+  green "6. 快速测试"
+  green "7. 进入交互模式"
+  green "8. 更新 Claude Code"
+  green "9. 卸载 Claude Code"
+  green "10. 查看环境信息"
+  green "11. PATH 修复提示"
+  green "0. 退出"
+  green "=================================="
+}
 
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) view_logs ;;
-        4) restart_app ;;
-        5) stop_app ;;
-        6) edit_config ;;
-        7) set_auto_login_qq ;;
-        8) app_status ;;
-        9) uninstall_app ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
+main() {
+  while true; do
+    menu
+    read -rp "请输入选项: " choice
+    case "$choice" in
+      1)
+        install_all
+        pause
+        ;;
+      2)
+        install_node
+        pause
+        ;;
+      3)
+        install_claude
+        pause
+        ;;
+      4)
+        check_claude || true
+        pause
+        ;;
+      5)
+        auth_claude || true
+        pause
+        ;;
+      6)
+        test_claude || true
+        pause
+        ;;
+      7)
+        interactive_claude || true
+        pause
+        ;;
+      8)
+        update_claude
+        pause
+        ;;
+      9)
+        uninstall_claude
+        pause
+        ;;
+      10)
+        show_env
+        pause
+        ;;
+      11)
+        fix_path_hint
+        pause
+        ;;
+      0)
+        ok "已退出"
+        exit 0
+        ;;
+      *)
+        warn "无效选项"
+        pause
+        ;;
     esac
+  done
 }
 
-check_requirements() {
-    if ! command -v curl >/dev/null 2>&1; then
-        echo -e "${YELLOW}未检测到 curl，正在安装...${RESET}"
-        apt update
-        apt install -y curl
-    fi
-
-    if ! command -v docker >/dev/null 2>&1; then
-        echo -e "${RED}未检测到 Docker，请先安装 Docker${RESET}"
-        exit 1
-    fi
-
-    if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null 2>&1; then
-        echo -e "${RED}未检测到 docker compose / docker-compose，请先安装${RESET}"
-        exit 1
-    fi
-}
-
-install_app() {
-    check_requirements
-
-    mkdir -p "$APP_DIR"
-    cd "$APP_DIR" || exit 1
-
-    echo -e "${GREEN}下载官方安装脚本...${RESET}"
-    curl -fsSL "$INSTALL_SCRIPT_URL" -o "$INSTALL_SCRIPT_NAME"
-
-    chmod u+x "./$INSTALL_SCRIPT_NAME"
-
-    echo -e "${GREEN}执行官方安装脚本...${RESET}"
-    "./$INSTALL_SCRIPT_NAME"
-
-    local compose_file
-    compose_file=$(get_compose_file)
-
-    if [ -z "$compose_file" ]; then
-        echo -e "${RED}未检测到 docker-compose.yml 或 docker-compose.yaml，请检查安装脚本是否执行成功${RESET}"
-        read -p "按回车返回菜单..."
-        menu
-        return
-    fi
-
-    echo -e "${GREEN}启动容器...${RESET}"
-    compose_cmd up -d
-
-    local SERVER_IP
-    SERVER_IP=$(get_public_ip)
-
-    cat > "$APP_DIR/install-info.txt" <<EOF
-WebUI 地址: http://${SERVER_IP}:${DEFAULT_PORT}
-本地访问: http://localhost:${DEFAULT_PORT}
-安装目录: ${APP_DIR}
-Compose 文件: ${compose_file}
-说明: 首次请按日志提示扫码登录 QQ
-EOF
-
-    echo
-    echo -e "${GREEN}✅ LuckyLilliaBot 已安装并启动${RESET}"
-    echo -e "${YELLOW}WebUI 地址: http://${SERVER_IP}:${DEFAULT_PORT}${RESET}"
-    echo -e "${YELLOW}本地访问: http://localhost:${DEFAULT_PORT}${RESET}"
-    echo -e "${YELLOW}首次请查看日志，按提示扫码登录 QQ${RESET}"
-
-    read -p "按回车返回菜单..."
-    menu
-}
-
-update_app() {
-    check_requirements
-
-    cd "$APP_DIR" || {
-        echo -e "${RED}未检测到安装目录，请先安装${RESET}"
-        sleep 1
-        menu
-    }
-
-    docker compose pull
-    docker compose up -d
-
-    echo -e "${GREEN}✅ LuckyLilliaBot 已更新${RESET}"
-
-    read -p "按回车返回菜单..."
-    menu
-}
-
-view_logs() {
-    cd "$APP_DIR" || {
-        echo -e "${RED}未检测到安装目录${RESET}"
-        sleep 1
-        menu
-    }
-
-    compose_cmd logs -f
-
-    read -p "按回车返回菜单..."
-    menu
-}
-
-restart_app() {
-    cd "$APP_DIR" || {
-        echo -e "${RED}未检测到安装目录${RESET}"
-        sleep 1
-        menu
-    }
-
-    compose_cmd restart
-
-    echo -e "${GREEN}✅ 已重启${RESET}"
-
-    read -p "按回车返回菜单..."
-    menu
-}
-
-stop_app() {
-    cd "$APP_DIR" || {
-        echo -e "${RED}未检测到安装目录${RESET}"
-        sleep 1
-        menu
-    }
-
-    compose_cmd down
-
-    echo -e "${GREEN}✅ 已停止${RESET}"
-
-    read -p "按回车返回菜单..."
-    menu
-}
-
-edit_config() {
-    cd "$APP_DIR" || {
-        echo -e "${RED}未检测到安装目录${RESET}"
-        sleep 1
-        menu
-    }
-
-    local compose_file
-    compose_file=$(get_compose_file)
-
-    if [ -z "$compose_file" ]; then
-        echo -e "${RED}未找到 compose 配置文件${RESET}"
-        sleep 1
-        menu
-    fi
-
-    nano "$compose_file"
-
-    echo -e "${YELLOW}配置已编辑，正在重新部署...${RESET}"
-    compose_cmd up -d
-
-    echo -e "${GREEN}✅ 配置已生效${RESET}"
-
-    read -p "按回车返回菜单..."
-    menu
-}
-
-set_auto_login_qq() {
-    cd "$APP_DIR" || {
-        echo -e "${RED}未检测到安装目录${RESET}"
-        sleep 1
-        menu
-    }
-
-    local compose_file
-    compose_file=$(get_compose_file)
-
-    if [ -z "$compose_file" ]; then
-        echo -e "${RED}未找到 compose 配置文件${RESET}"
-        sleep 1
-        menu
-    fi
-
-    read -p "请输入要自动登录的 QQ 号: " AUTO_LOGIN_QQ
-
-    if [[ -z "$AUTO_LOGIN_QQ" ]]; then
-        echo -e "${RED}QQ 号不能为空${RESET}"
-        sleep 1
-        menu
-    fi
-
-    if grep -q "AUTO_LOGIN_QQ=" "$compose_file"; then
-        sed -i "s|AUTO_LOGIN_QQ=.*|AUTO_LOGIN_QQ=${AUTO_LOGIN_QQ}|g" "$compose_file"
-    else
-        echo -e "${YELLOW}未检测到 AUTO_LOGIN_QQ，正在尝试插入到 environment 中...${RESET}"
-        sed -i "/pmhq:/,/^[^[:space:]]/ s/\(\s*environment:\)/\1\n      - AUTO_LOGIN_QQ=${AUTO_LOGIN_QQ}/" "$compose_file"
-    fi
-
-    echo -e "${YELLOW}正在重新部署容器...${RESET}"
-    compose_cmd up -d
-
-    echo -e "${GREEN}✅ AUTO_LOGIN_QQ 已设置为 ${AUTO_LOGIN_QQ}${RESET}"
-    echo -e "${YELLOW}提示：首次扫码登录成功后，下次启动才会自动登录${RESET}"
-
-    read -p "按回车返回菜单..."
-    menu
-}
-
-app_status() {
-    cd "$APP_DIR" || {
-        echo -e "${RED}未检测到安装目录${RESET}"
-        sleep 1
-        menu
-    }
-
-    echo -e "${GREEN}容器状态：${RESET}"
-    compose_cmd ps
-    echo
-    echo -e "${GREEN}端口监听：${RESET}"
-    ss -tulnp | grep -E ":${DEFAULT_PORT}" || true
-    echo
-    if [ -f "$APP_DIR/install-info.txt" ]; then
-        echo -e "${GREEN}安装信息：${RESET}"
-        cat "$APP_DIR/install-info.txt"
-    fi
-
-    read -p "按回车返回菜单..."
-    menu
-}
-
-uninstall_app() {
-    if [ -d "$APP_DIR" ]; then
-        cd "$APP_DIR" && compose_cmd down
-    fi
-
-    rm -rf "$APP_DIR"
-
-    echo -e "${GREEN}✅ LuckyLilliaBot 已卸载（包含数据）${RESET}"
-    read -p "按回车返回菜单..."
-    menu
-}
-
-menu
+main

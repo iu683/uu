@@ -1,399 +1,543 @@
 #!/bin/bash
-PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
-export PATH
-LANG=en_US.UTF-8
+# VPS Toolbox
+# 功能：
+# - 一级菜单加 ▶ 标识，字体绿色
+# - 二级菜单简洁显示，输入 1~99 都可执行
+# - 快捷指令 m / M 自动创建
+# - 系统信息面板保留
+# - 彩色菜单和动态彩虹标题
+# - 完整安装/卸载逻辑
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+INSTALL_PATH="$HOME/vps-toolbox.sh"
+SHORTCUT_PATH="/usr/local/bin/m"
+SHORTCUT_PATH_UPPER="/usr/local/bin/M"
 
-error_msg() { echo -e "${RED}[错误] $1${NC}"; }
-warning_msg() { echo -e "${YELLOW}[警告] $1${NC}"; }
-success_msg() { echo -e "${GREEN}[成功] $1${NC}"; }
-info_msg() { echo -e "${BLUE}[信息] $1${NC}"; }
+# 颜色
+green="\033[32m"
+reset="\033[0m"
+yellow="\033[33m"
+red="\033[31m"
+cyan="\033[36m"
+BLUE="\033[34m"
+ORANGE='\033[38;5;208m'
 
-confirm() {
-    local prompt="$1 (y/N): "
-    local answer
-    read -p "$prompt" answer </dev/tty
-    case "$answer" in [Yy]|[Yy][Ee][Ss]) return 0 ;; *) return 1 ;; esac
-}
 
-check_root() {
-    [ "$EUID" -ne 0 ] && { error_msg "请使用 root 权限运行此脚本。"; exit 1; }
-}
+# Ctrl+C 中断保护
+trap 'echo -e "\n${red}操作已中断${reset}"; exit 1' INT
 
-get_system_disk_base() {
-    local root_dev=$(df -P / | awk 'NR==2 {print $1}')
-    local boot_dev=$(df -P /boot 2>/dev/null | awk 'NR==2 {print $1}')
-    for dev in $root_dev $boot_dev; do
-        echo "$dev" | sed -e 's/[0-9]*$//' -e 's/p[0-9]*$//'
-    done | sort -u
-}
-
-is_system_disk() {
-    local dev=$1
-    local base=$(echo "$dev" | sed -e 's/[0-9]*$//' -e 's/p[0-9]*$//')
-    local sys_disks=$(get_system_disk_base)
-    for sd in $sys_disks; do
-        [[ "$base" == "$sd" ]] && return 0
+# 彩虹标题
+rainbow_animate() {
+    local text="$1"
+    local colors=(31 33 32 36 34 35)
+    local len=${#text}
+    for ((i=0; i<len; i++)); do
+        printf "\033[%sm%s" "${colors[$((i % ${#colors[@]}))]}" "${text:$i:1}"
+        sleep 0.002
     done
-    [[ "$base" =~ ^/dev/(sda|vda|xvda|hda|nvme0n1)$ ]] && return 0
-    return 1
+    printf "${reset}\n"
 }
 
-is_system_mountpoint() {
-    local mp=$1
-    case "$mp" in
-        /|/boot|/boot/*|/usr|/usr/*|/var|/var/*|/tmp|/etc|/etc/*|/root|/proc|/sys|/dev)
-            return 0 ;;
-        *)
-            return 1 ;;
+# 系统资源显示
+show_system_usage() {
+    local width=36
+    local content_indent="    "
+
+    # ================== 格式化函数 ==================
+    format_size() {
+        local size_mb=${1:-0}  # 防止为空
+        if [ "$size_mb" -lt 1024 ]; then
+            echo "${size_mb}M"
+        else
+            awk "BEGIN{printf \"%.1fG\", $size_mb/1024}"
+        fi
+    }
+
+    # ================== 获取数据 ==================
+    # 内存
+    read mem_total mem_used <<< $(LANG=C free -m | awk 'NR==2{print $2, $3}')
+    mem_total=${mem_total:-0}
+    mem_used=${mem_used:-0}
+    mem_total_fmt=$(format_size "$mem_total")
+    mem_used_fmt=$(format_size "$mem_used")
+    mem_percent=$(awk "BEGIN{if($mem_total>0){printf \"%.0f\", $mem_used*100/$mem_total}else{print 0}}")
+    mem_percent="${mem_percent}%"  # 加回百分号显示
+
+    # 磁盘
+    read disk_total_h disk_used_h disk_used_percent <<< $(df -m / | awk 'NR==2{print $2, $3, $5}')
+    disk_total_h=${disk_total_h:-0}
+    disk_used_h=${disk_used_h:-0}
+    disk_used_percent=${disk_used_percent:-0%}
+    disk_total_fmt=$(format_size "$disk_total_h")
+    disk_used_fmt=$(format_size "$disk_used_h")
+
+    # CPU
+    # 读取 /proc/stat 第一行，计算 CPU 使用率（防止空值）
+    cpu_usage=$(awk 'NR==1{usage=($2+$4)*100/($2+$4+$5); if(usage!=""){printf "%.1f", usage}else{print 0}}' /proc/stat)
+    cpu_usage="${cpu_usage}%"  # 加回百分号显示
+
+    # ================== 系统状态 ==================
+    mem_num=${mem_percent%\%}        # 去掉百分号
+    disk_num=${disk_used_percent%\%} # 去掉百分号
+    cpu_num=${cpu_usage%\%}          # 去掉百分号
+
+    max_level=0
+    for n in $mem_num $disk_num $cpu_num; do
+        if (( $(awk "BEGIN{print ($n>80)?1:0}") )); then max_level=2; fi
+        if (( $(awk "BEGIN{print ($n>60 && $n<=80)?1:0}") )) && [ "$max_level" -lt 2 ]; then max_level=1; fi
+    done
+
+    if [ "$max_level" -eq 0 ]; then
+        system_status="${green}系统状态：正常 ✔${reset}"
+    elif [ "$max_level" -eq 1 ]; then
+        system_status="${yellow}系统状态：警告 ⚠️${reset}"
+    else
+        system_status="${red}系统状态：危险 🔥${reset}"
+    fi
+
+    # ================== 输出 ==================
+    pad_string() {
+        local str="$1"
+        printf "%-${width}s" "${content_indent}${str}"
+    }
+
+    echo -e "${green}┌$(printf '─%.0s' $(seq 1 $width))┐${reset}"
+    echo -e "$(pad_string "${system_status}")"
+    echo -e "$(pad_string "${yellow}📊 内存：${mem_used_fmt}/${mem_total_fmt} (${mem_percent})${reset}")"
+    echo -e "$(pad_string "${yellow}💽 磁盘：${disk_used_fmt}/${disk_total_fmt} (${disk_used_percent})${reset}")"
+    echo -e "$(pad_string "${yellow} ⚙ CPU ：${cpu_usage}${reset}")"
+    echo -e "${green}└$(printf '─%.0s' $(seq 1 $width))┘${reset}"
+}
+
+# ================== 系统信息 ==================
+
+# 判断是否容器
+if [ -f /proc/1/cgroup ] && grep -qE '(docker|lxc|kubepods)' /proc/1/cgroup; then
+    container_flag=" (Container)"
+else
+    container_flag=""
+fi
+
+# 系统名称
+if [ -f /etc/os-release ]; then
+    system_name=$(grep -E '^PRETTY_NAME=' /etc/os-release | cut -d= -f2 | tr -d '"')
+else
+    system_name=$(uname -s)
+fi
+system_name="${system_name}${container_flag}"
+
+
+
+# ===============================
+# 获取当前时区（跨系统兼容）
+# ===============================
+get_timezone() {
+    # 1️⃣ systemd 环境，屏蔽错误
+    if command -v timedatectl &>/dev/null; then
+        tz=$(timedatectl show -p Timezone --value 2>/dev/null)
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 2️⃣ /etc/timezone 文件（Debian）
+    if [[ -f /etc/timezone ]]; then
+        tz=$(cat /etc/timezone)
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 3️⃣ /etc/localtime 符号链接（RedHat / CentOS）
+    if [[ -L /etc/localtime ]]; then
+        tz=$(readlink /etc/localtime | sed 's#.*/zoneinfo/##')
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 4️⃣ /etc/localtime 文件内容匹配（minimal / docker / chroot）
+    if [[ -f /etc/localtime ]]; then
+        tz=$(strings /etc/localtime 2>/dev/null | grep -E '^[A-Z][a-z]+/[A-Z][a-zA-Z_]+$' | head -n1)
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 5️⃣ 兜底
+    echo "未知"
+}
+
+timezone=$(get_timezone)
+
+# 架构
+
+cpu_arch=$(uname -m)
+
+# 获取 CPU 型号
+cpu_model=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2)
+[ -z "$cpu_model" ] && cpu_model=$(grep -m1 "Hardware" /proc/cpuinfo 2>/dev/null | cut -d: -f2)
+[ -z "$cpu_model" ] && cpu_model=$(lscpu 2>/dev/null | grep "Model name" | cut -d: -f2)
+
+# 清理不需要的部分
+cpu_model=$(echo "$cpu_model" | sed -E \
+    -e 's/@.*GHz//g' \
+    -e 's/CPU//g' \
+    -e 's/Processor//g' \
+    -e 's/[0-9]+-Core//g' \
+    -e 's/\s+/ /g' \
+    | xargs)
+
+cpu="${cpu_model:-Unknown CPU} (${cpu_arch})"
+
+
+# 当前时间
+datetime=$(date "+%Y-%m-%d %H:%M:%S")
+
+# VPS 运行时间
+if [ -f /proc/uptime ]; then
+    uptime_seconds=$(cut -d' ' -f1 /proc/uptime | cut -d. -f1)
+    days=$((uptime_seconds/86400))
+    hours=$(( (uptime_seconds%86400)/3600 ))
+    minutes=$(( (uptime_seconds%3600)/60 ))
+    if [ "$days" -gt 0 ]; then
+        vps_uptime="${days}天${hours}小时${minutes}分钟"
+    elif [ "$hours" -gt 0 ]; then
+        vps_uptime="${hours}小时${minutes}分钟"
+    else
+        vps_uptime="${minutes}分钟"
+    fi
+else
+    vps_uptime=$(uptime -p 2>/dev/null | tr -d ' ' || echo "未知")
+fi
+
+
+
+# 一级菜单
+MAIN_MENU=(
+    "系统设置"
+    "网络代理"
+    "网络检测"
+    "Docker管理"
+    "应用商店"
+    "证书管理"
+    "系统管理"
+    "工具箱合集"
+    "玩具熊ʕ•ᴥ•ʔ"
+    "监控通知"
+    "备份恢复"
+    "更新卸载"
+)
+
+# 二级菜单（编号去掉前导零，显示时格式化为两位数）
+SUB_MENU[1]="1 更新系统|2 系统信息|3 修改root密码|4 root密码登录管理|5 root公钥登录管理|6 修改SSH端口|7 修改时区|8 时间同步|9 切换v4V6|10 开放所有端口|11 更换系统源|12 DDdebian12|13 DDwindows10|14 DDNAT|15 DD飞牛|16 修改语言|17 修改主机名|18 一键优化|19 VPS重启"
+SUB_MENU[2]="20 代理工具箱|21 FRP管理|22 BBRv3优化|23 WARP|24 BBR+TCP智能调参|25 Reality|26 SurgeSnell|27 Shadowsocks|28 自定义DNS解锁|29 DDNS|30 Hysteria2|31 3X-UI|32 Realm|33 GOST|34 哆啦A梦转发面板|35 easytier组网"
+SUB_MENU[3]="36 NodeQuality脚本|37 融合怪测试|38 YABS测试|39 网络质量体检脚本|40 IP质量体检脚本|41 硬盘质量体检脚本|42 三网延迟检测|43 简单回程测试|44 完整路由检测|45 流媒体解锁|46 三网延迟测速|47 检查25端口开放|48 网络工具箱"
+SUB_MENU[4]="49 Docker管理|50 DockerCompose管理|51 DockerCompose备份恢复|52 DockerCompose自动更新"
+SUB_MENU[5]="53 应用管理|54 面板管理|55 监控管理|56 yt-dlp视频下载|57 镜像加速|58 独角数卡|59 小雅全家桶|60 qbittorrent"
+SUB_MENU[6]="61 NGINXV4反代|62 NGINXV6反代|63 Caddy反代|64 NginxProxyManager面板|65 acme申请证书|66 Cloudflare证书管理|67 证书备份与恢复"
+SUB_MENU[7]="68 系统清理|69 重装系统|70 系统组件|71 开发环境|72 添加SWAP|73 DNS管理|74 工作区管理|75 系统监控|76 防火墙管理|78 Fail2ban|79 定时任务"
+SUB_MENU[8]="80 科技lion工具箱|81 老王工具箱|82 酷雪云工具箱|83 Alpine工具箱|84 甲骨文工具箱|85 开小鸡工具箱|86 国内VPS工具箱"
+SUB_MENU[9]="87 脚本短链|89 网站部署|90 ssh登录信息|91 Emby反代|92 GProxy加速|93 Akile优先DNS|94 自动机场签到|95 1panelapps管理|96 关闭V1SSH|97 卸载哪吒Agent|98 卸载komariAgent"
+SUB_MENU[10]="100 VPS信息通知|101 流量狗|102 VPS遥控器|103 TrafficCop流量监控"
+SUB_MENU[11]="104 系统快照恢复|105 本地备份|106 Rsync同步|107 远程文件目录备份|108 Rclone备份|109 Croc文件传输|110 压缩文件|111 解压文件"
+SUB_MENU[12]="77 自动更新|88 更新脚本|99 卸载脚本"
+
+# 显示一级菜单
+show_main_menu() {
+    clear
+    # 上边框保留彩虹效果
+    rainbow_animate "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # 标题文字改为纯黄色
+    echo -e "${yellow}📦 VPS Toolbox工具箱${reset}${ORANGE}(快捷指令:M/m)${reset}${yellow} 📦  ${reset}"
+
+    # 下边框保留彩虹效果
+    rainbow_animate "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # 系统信息
+    show_system_usage
+
+
+    # 当前日期时间显示在框下、菜单上
+
+    # 终端宽度（可用不用）
+    term_width=$(tput cols 2>/dev/null || echo 80)
+
+    label_w=8  # 左侧标签宽度
+
+    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "💻" $label_w "系统" "$system_name"
+    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "🌍" $label_w "时区" "$timezone"
+    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "🧩" $label_w "架构" "$cpu"
+    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "🕒" $label_w "时间" "$datetime"
+    printf "${ORANGE}%s %-*s:${ORANGE} %s${re}\n" "🚀" $label_w "在线" "$vps_uptime"
+
+    # 绿色下划线
+    echo -e "${green}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${re}"
+
+    # 显示菜单
+    for i in "${!MAIN_MENU[@]}"; do
+        if [[ $i -eq 8 ]]; then  # 第9项（索引从0开始）
+            # 符号红色，数字和点绿色，文字黄色
+            printf "${red}▶${reset} ${green}%02d.${reset} ${yellow}%s${reset}\n" "$((i+1))" "${MAIN_MENU[i]}"
+        else
+            # 其他项保持原来的颜色（符号红色，数字绿色，文字绿色）
+            printf "${red}▶${reset} ${green}%02d. %s${reset}\n" "$((i+1))" "${MAIN_MENU[i]}"
+        fi
+    done
+}
+
+
+# 显示二级菜单并选择
+show_sub_menu() {
+    local idx="$1"
+    while true; do
+        IFS='|' read -ra options <<< "${SUB_MENU[idx]}"
+        local map=()
+        echo
+        for opt in "${options[@]}"; do
+            local num="${opt%% *}"
+            local name="${opt#* }"
+            printf "${red}▶${reset} ${yellow}%02d %s${reset}\n" "$num" "$name"
+            map+=("$num")
+        done
+        echo -ne "${red}请输入要执行的编号${ORANGE}(0返回/X退出)${ORANGE}:${reset}"
+        read -r choice
+
+        # X/x 直接退出脚本
+        if [[ "$choice" =~ ^[xX]$ ]]; then
+            exit 0
+        fi
+
+        # 按回车直接刷新菜单
+        if [[ -z "$choice" ]]; then
+            clear
+            continue
+        fi
+
+        # 输入 0 或 00 返回一级菜单
+        if [[ "$choice" == "0" || "$choice" == "00" ]]; then
+            return
+        fi
+
+        # 只允许数字输入
+        if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+            echo -e "${red}无效选项，请输入数字！${reset}"
+            sleep 1
+            clear
+            continue
+        fi
+
+        # 判断是否为有效选项
+        if [[ ! " ${map[*]} " =~ (^|[[:space:]])$choice($|[[:space:]]) ]]; then
+            echo -e "${red}无效选项${reset}"
+            sleep 1
+            clear
+            continue
+        fi
+
+        # 执行选项
+        execute_choice "$choice"
+
+        # 只有 0/99 才退出二级菜单，否则按回车刷新二级菜单
+        if [[ "$choice" != "0" && "$choice" != "99" ]]; then
+            read -rp $'\e[31m按回车刷新二级菜单...\e[0m' tmp
+            clear
+        else
+            break
+        fi
+    done
+}
+
+
+
+
+# 删除快捷指令
+remove_shortcut() {
+    if [[ $EUID -eq 0 ]]; then
+        rm -f "$SHORTCUT_PATH" "$SHORTCUT_PATH_UPPER"
+    else
+        sudo rm -f "$SHORTCUT_PATH" "$SHORTCUT_PATH_UPPER"
+    fi
+}
+
+# 执行菜单选项
+execute_choice() {
+    case "$1" in
+        1) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/update.sh) ;;
+        2) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/vpsinfo.sh) ;;
+        3) sudo passwd root ;;
+        4) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/rootmi.sh) ;;
+        5) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/rootgon.sh) ;;
+        6) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/sshdk.sh) ;;
+        7) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/time.sh) ;;
+        8) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/systemdtimesyncd.sh) ;;
+        9) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/qhwl.sh) ;;
+        10) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/open_all_ports.sh) ;;
+        11) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/huanyuan.sh) ;;
+        12) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Debian12.sh) ;;
+        13) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/window.sh) ;;
+        14) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/DDnat.sh) ;;
+        15) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/ddfnos.sh) ;;
+        16) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/xgyu.sh) ;;
+        17) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/home.sh) ;;
+        18) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/vpsup.sh) ;;
+        19) sudo reboot ;;
+        20) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/proxy.sh) ;;
+        21) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/FRP.sh) ;;
+        22) bash <(curl -fsSL "https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/main/install-alias.sh?$(date +%s)") ;;
+        23) wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh ;;
+        24) bash <(curl -sL https://raw.githubusercontent.com/yahuisme/network-optimization/main/script.sh) ;;
+        25) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/vlessreality.sh) ;;
+        26) wget -O snell.sh --no-check-certificate https://git.io/Snell.sh && chmod +x snell.sh && ./snell.sh ;;
+        27) wget -O ss-rust.sh --no-check-certificate https://raw.githubusercontent.com/xOS/Shadowsocks-Rust/master/ss-rust.sh && chmod +x ss-rust.sh && ./ss-rust.sh ;;
+        28) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/unlockdns.sh) ;;
+        29) bash <(wget -qO- https://raw.githubusercontent.com/mocchen/cssmeihua/mochen/shell/ddns.sh) ;;
+        30) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/GLHysteria2.sh) ;;
+        31) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/3xui.sh) ;;
+        32) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Realm.sh) ;;
+        33) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/gost.sh) ;;
+        34) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/dlam.sh);;
+        35) bash <(curl -sL https://raw.githubusercontent.com/ceocok/c.cococ/refs/heads/main/easytier.sh) ;;
+        36) bash <(curl -sL https://run.NodeQuality.com) ;;
+        37) curl -L https://gitlab.com/spiritysdx/za/-/raw/main/ecs.sh -o ecs.sh && chmod +x ecs.sh && bash ecs.sh ;;
+        38) curl -sL https://yabs.sh | bash ;;
+        39) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/NetQuality.sh) ;;
+        40) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/IPQuality.sh) ;;
+        41) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/HardwareQuality.sh) ;;
+        42) bash <(curl -Ls https://Net.Check.Place) -P ;;
+        43) curl https://raw.githubusercontent.com/ludashi2020/backtrace/main/install.sh -sSf | sh ;;
+        44) bash <(curl -Ls https://Net.Check.Place) -R ;;
+        45) bash <(curl -L -s https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh) ;;
+        46) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/speed.sh) ;;
+        47) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Telnet.sh) ;;
+        48) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Networktool.sh) ;; 
+        49) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/Docker.sh) ;;
+        50) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/dockercompose.sh) ;;
+        51) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/Dockcompbauck.sh) ;;
+        52) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/dockerupdate.sh) ;;
+        53) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/Store.sh) ;;
+        54) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/panel.sh) ;;
+        55) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/jkgl.sh) ;;
+        56) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/ytdlp.sh) ;;
+        57) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/hubproxy.sh) ;;
+        58) bash <(curl -fsSL https://raw.githubusercontent.com/dujiao-next/community-projects/main/scripts/langge-dujiao-next-install/dujiao-next-install.sh) ;;
+        59) bash -c "$(curl --insecure -fsSL https://ddsrem.com/xiaoya_install.sh)" ;;
+        60) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/qbittorrent.sh) ;;
+        61) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/ngixv4.sh) ;;
+        62) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/ngixv6.sh) ;;
+        63) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Caddy.sh) ;;
+        64) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/NginxProxy.sh) ;;
+        65) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/ACMESSL.sh) ;;
+        66) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/CFSSL.sh) ;;
+        67) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/SSLbackup.sh) ;;
+        68) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/clear.sh) ;;
+        69) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/reinstall.sh) ;;
+        70) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/package.sh) ;;
+        71) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/exploitation.sh) ;;
+        72) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/WARP.sh) ;;
+        73) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/dns.sh) ;;
+        74) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/tmux.sh) ;;
+        75) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/System.sh) ;;
+        76) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/firewall.sh) ;;
+        78) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/fail2ban.sh) ;;
+        79) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/crontab.sh) ;;
+        80) bash <(curl -sL kejilion.sh) ;;
+        81) bash <(curl -fsSL ssh_tool.eooce.com) ;;
+        82) bash <(curl -sL https://cdn.kxy.ovh/kxy.sh) ;;
+        83) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/Alpine.sh) ;;
+        84) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Oracle/oracle.sh) ;;
+        85) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/NAT.sh) ;;
+        86) bash <(curl -sL https://v6.gh-proxy.org/https://raw.githubusercontent.com/sistarry/toolbox/main/CN/toolinstall.sh) ;;
+        87) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/dl.sh) ;;
+        89) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/html.sh) ;;
+		90) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/MOTD.sh) ;;
+        91) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/Embyfd.sh) ;;
+        92) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/GProxy.sh) ;;
+        93) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/AkileDNS.sh) ;;
+        94) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/JCQD.sh) ;;
+        95) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/1panelapps.sh) ;;
+        96) sed -i 's/disable_command_execute: false/disable_command_execute: true/' /opt/nezha/agent/config.yml && systemctl restart nezha-agent ;;
+        97) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/nzagent.sh) ;;
+        98) sudo systemctl stop komari-agent && sudo systemctl disable komari-agent && sudo rm -f /etc/systemd/system/komari-agent.service && sudo systemctl daemon-reload && sudo rm -rf /opt/komari /var/log/komari ;;
+        100) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/vpstg.sh) ;;
+        101) wget -O port-traffic-dog.sh https://raw.githubusercontent.com/zywe03/realm-xwPF/main/port-traffic-dog.sh && chmod +x port-traffic-dog.sh && ./port-traffic-dog.sh ;;
+        102) curl -fsSL https://raw.githubusercontent.com/MEILOI/VPS_BOT_X/main/vps_bot-x/install.sh -o install.sh && chmod +x install.sh && bash install.sh ;;
+        103) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/traffic.sh) ;;
+        104) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/restore.sh) ;;
+        105) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/beifen.sh) ;;
+        106) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/Rrsync.sh) ;;
+        107) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/Filebackup.sh) ;;
+        108) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/rclone.sh) ;;
+        109) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Croc.sh) ;;
+        110) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/yasuo.sh) ;;
+        111) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/tarzip.sh) ;;
+
+        #  自动更新脚本
+        77) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/tool/update.sh) ;; 
+        88)
+            echo -e "${yellow}正在更新脚本...${reset}"
+            # 下载最新版本覆盖本地脚本
+            curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/tool/vps-toolbox.sh -o "$INSTALL_PATH"
+            if [[ $? -ne 0 ]]; then
+                echo -e "${red}更新失败，请检查网络或GitHub地址${reset}"
+                return 1
+            fi
+            chmod +x "$INSTALL_PATH"
+            echo -e "${green}脚本已更新完成！${reset}"
+            # 重新执行最新脚本
+            exec bash "$INSTALL_PATH"
+            ;;
+
+        99) 
+            echo -e "${yellow}正在卸载工具箱...${reset}"
+
+            # 删除快捷指令
+            remove_shortcut
+ 
+            # 删除工具箱脚本
+            if [[ -f "$INSTALL_PATH" ]]; then
+            rm -f "$INSTALL_PATH"
+            echo -e "${green}工具箱脚本已删除${reset}"
+            fi
+            # 删除首次运行标记文件
+            MARK_FILE="$HOME/.vpstoolbox"
+            if [[ -f "$MARK_FILE" ]]; then
+            rm -f "$MARK_FILE"
+            fi
+           echo -e "${red}卸载完成！${reset}"
+           exit 0
+           ;;
+        0) exit 0 ;;
+        *) echo -e "${red}无效选项${reset}"; return 1 ;;
     esac
 }
 
-get_data_disks() {
-    local sys_disks=$(get_system_disk_base)
-    for disk in $(lsblk -d -o NAME,TYPE | grep disk | awk '{print $1}'); do
-        local full_disk="/dev/$disk"
-        local base=$(echo "$full_disk" | sed -e 's/[0-9]*$//' -e 's/p[0-9]*$//')
-        local is_sys=0
-        for sd in $sys_disks; do
-            [[ "$base" == "$sd" ]] && is_sys=1 && break
-        done
-        [[ $is_sys -eq 1 ]] && continue
-        [[ "$base" =~ ^/dev/(sda|vda|xvda|hda|nvme0n1)$ ]] && continue
-        echo "$disk"
-    done
-}
 
-force_unmount_disk() {
-    local disk=$1
-    if is_system_disk "/dev/$disk"; then
-        error_msg "拒绝卸载系统盘 /dev/$disk！"
-        return 1
-    fi
-    info_msg "正在强制卸载 /dev/$disk 相关的所有挂载点..."
-    local mounts=$(mount | grep "^/dev/${disk}" | awk '{print $1}')
-    for dev in $mounts; do
-        umount "$dev" 2>/dev/null
-        if mount | grep -q "^$dev "; then
-            info_msg "普通卸载失败，使用懒卸载 (lazy)..."
-            umount -l "$dev" 2>/dev/null
-            sleep 1
-        fi
-    done
-    if mount | grep -q "^/dev/${disk}"; then
-        error_msg "无法卸载 /dev/$disk 的分区，请手动处理。"
-        return 1
-    fi
-    success_msg "卸载完成。"
-    return 0
-}
+# 主循环
+while true; do
+    show_main_menu
+    echo -ne "${red}请输入要执行的编号${ORANGE}(0退出)${ORANGE}:${reset} "
+    read -r main_choice
 
-view_disk_info() {
-    clear
-    echo -e "${CYAN}==================== 磁盘分区信息 ====================${NC}"
-    echo ""
-    echo -e "${GREEN}>>> lsblk 输出：${NC}"
-    lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE
-    echo ""
-    echo -e "${GREEN}>>> fdisk -l 输出（仅数据盘）：${NC}"
-    for disk in $(get_data_disks); do
-        fdisk -l "/dev/$disk" 2>/dev/null | head -n 20
-    done
-    echo ""
-    read -p "按回车键返回主菜单..." dummy </dev/tty
-}
-
-mount_disk() {
-    clear
-    echo -e "${CYAN}==================== 挂载磁盘向导 ====================${NC}"
-
-    local disks=($(get_data_disks))
-    if [ ${#disks[@]} -eq 0 ]; then
-        error_msg "未检测到可用数据盘。"
-        read -p "按回车键返回主菜单..." dummy </dev/tty
-        return
+    # X/x 直接退出脚本
+    if [[ "$main_choice" =~ ^[xX]$ ]]; then
+        exit 0
     fi
 
-    echo -e "${BLUE}检测到以下数据盘:${NC}"
-    local index=1
-    for disk in "${disks[@]}"; do
-        local size=$(lsblk -d -o NAME,SIZE | grep -w "$disk" | awk '{print $2}')
-        local model=$(lsblk -d -o NAME,MODEL | grep -w "$disk" | awk '{$1=""; print $0}' | sed 's/^[ \t]*//')
-        local mount_status="未挂载"
-        mount | grep -q "^/dev/$disk" && mount_status="${YELLOW}已挂载${NC}"
-        printf "  [%d] %-8s  %-10s  %-20s %b\n" "$index" "$disk" "$size" "$model" "$mount_status"
-        ((index++))
-    done
-
-    local choice
-    while true; do
-        read -p "请输入要操作的磁盘编号 (1-${#disks[@]})，输入 0 返回: " choice </dev/tty
-        [[ "$choice" == "0" ]] && return
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#disks[@]} ]; then
-            selected_disk="${disks[$((choice-1))]}"
-            break
-        else
-            warning_msg "输入无效。"
-        fi
-    done
-    info_msg "选择的磁盘: /dev/$selected_disk"
-
-    if is_system_disk "/dev/$selected_disk"; then
-        error_msg "选择的磁盘为系统盘，禁止操作！"
-        read -p "按回车键返回..." dummy </dev/tty
-        return
+    # 按回车刷新菜单
+    if [[ -z "$main_choice" ]]; then
+        continue
     fi
 
-    local mount_point=""
-    while true; do
-        read -p "请输入挂载点目录 (绝对路径，例如 /data 或 /home，输入 0 返回): " mp </dev/tty
-        [[ "$mp" == "0" ]] && return
-        if [[ "$mp" != /* ]]; then
-            warning_msg "必须是绝对路径。"
-            continue
-        fi
-        if [[ "$mp" == "/" ]]; then
-            warning_msg "不能挂载到根目录 /。"
-            continue
-        fi
-        if mountpoint -q "$mp"; then
-            warning_msg "目录 $mp 已被挂载。"
-            continue
-        fi
-        if is_system_mountpoint "$mp"; then
-            warning_msg "$mp 是系统关键目录，禁止作为挂载点。"
-            continue
-        fi
-        mount_point="$mp"
-        break
-    done
-    info_msg "挂载点: $mount_point"
-
-    if [ -d "$mount_point" ] && [ -n "$(ls -A "$mount_point" 2>/dev/null)" ]; then
-        warning_msg "目录 $mount_point 非空！"
-        echo -e "${YELLOW}当前目录内容：${NC}"
-        ls -la "$mount_point" | head -n 10
-        echo -e "${RED}如果继续挂载，该目录内的所有文件将被永久删除！${NC}"
-        if ! confirm "确定要清空 $mount_point 并继续挂载吗？"; then
-            info_msg "操作已取消。"
-            read -p "按回车键返回..." dummy </dev/tty
-            return
-        fi
-        echo -e "${RED}最后一次警告：即将清空 $mount_point 目录！${NC}"
-        if ! confirm "输入 yes 确认清空并继续 (yes/N): "; then
-            info_msg "操作已取消。"
-            read -p "按回车键返回..." dummy </dev/tty
-            return
-        fi
-        info_msg "正在清空 $mount_point ..."
-        rm -rf "$mount_point"/*
-        success_msg "目录已清空。"
+    # 输入 0 退出
+    if [[ "$main_choice" == "0" ]]; then
+        exit 0
     fi
 
-    if mount | grep -q "^/dev/$selected_disk"; then
-        warning_msg "磁盘 /dev/$selected_disk 已有分区挂载。"
-        if ! confirm "是否重新分区并格式化（将清除所有数据）？"; then
-            local part1="/dev/${selected_disk}1"
-            if [ -b "$part1" ]; then
-                info_msg "尝试挂载已有分区 $part1 到 $mount_point"
-                mkdir -p "$mount_point"
-                mount "$part1" "$mount_point" || { error_msg "挂载失败。"; return; }
-                sed -i "\|^$part1|d" /etc/fstab
-                echo "$part1    $mount_point    ext4    defaults    0 0" >> /etc/fstab
-                success_msg "挂载成功，已写入 /etc/fstab"
-                df -h | grep "$mount_point"
-                read -p "按回车键继续..." dummy </dev/tty
-                return
-            else
-                error_msg "未找到分区 $part1。"
-                read -p "按回车键返回..." dummy </dev/tty
-                return
-            fi
-        fi
-    fi
-
-    if fdisk -l "/dev/$selected_disk" 2>/dev/null | grep -qiE "NTFS|FAT"; then
-        warning_msg "检测到 Windows 分区！"
-        confirm "格式化将清除所有数据，确定继续吗？" || return
-    fi
-
-    echo -e "${RED}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${NC}"
-    echo -e "${RED}!!  警告：即将对 /dev/$selected_disk 分区并格式化  !!${NC}"
-    echo -e "${RED}!!  该磁盘上的所有数据都将被永久清除！        !!${NC}"
-    echo -e "${RED}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${NC}"
-    confirm "确定要继续吗？" || return
-
-    cp /etc/fstab /etc/fstab.bak.$(date +%Y%m%d%H%M%S)
-    info_msg "已备份 /etc/fstab"
-
-    force_unmount_disk "$selected_disk" || { read -p "按回车键返回..." dummy </dev/tty; return; }
-
-    info_msg "正在清除分区表并创建新分区..."
-    (
-    echo d; echo d; echo d; echo d
-    echo n; echo p; echo 1; echo; echo
-    echo w
-    ) | fdisk "/dev/$selected_disk" > /dev/null 2>&1
-
-    partprobe "/dev/$selected_disk" 2>/dev/null || blockdev --rereadpt "/dev/$selected_disk" 2>/dev/null
-    sleep 3
-
-    local part1="/dev/${selected_disk}1"
-    if [ ! -b "$part1" ]; then
-        info_msg "fdisk 失败，尝试 parted 创建 GPT 分区..."
-        parted -s "/dev/$selected_disk" mklabel gpt
-        parted -s "/dev/$selected_disk" mkpart primary ext4 0% 100%
-        partprobe "/dev/$selected_disk" 2>/dev/null
-        sleep 3
-        part1="/dev/${selected_disk}1"
-        [ ! -b "$part1" ] && { error_msg "分区创建失败。"; return; }
-    fi
-
-    if mount | grep -q "^$part1 "; then
-        umount -l "$part1" 2>/dev/null
+    # 只允许数字输入
+    if ! [[ "$main_choice" =~ ^[0-9]+$ ]]; then
+        echo -e "${red}无效选项，请输入数字！${reset}"
         sleep 1
+        continue
     fi
 
-    info_msg "格式化 $part1 为 ext4..."
-    mkfs.ext4 -F "$part1" || { error_msg "格式化失败。"; return; }
-
-    mkdir -p "$mount_point"
-    mount "$part1" "$mount_point" || { error_msg "挂载失败。"; return; }
-
-    sed -i "\|^$part1|d" /etc/fstab
-    echo "$part1    $mount_point    ext4    defaults    0 0" >> /etc/fstab
-
-    success_msg "磁盘挂载完成！"
-    df -h | grep "$mount_point"
-    read -p "按回车键继续..." dummy </dev/tty
-}
-
-unmount_partition() {
-    clear
-    echo -e "${CYAN}==================== 卸载分区 ====================${NC}"
-
-    echo -e "${GREEN}当前挂载的分区（仅数据盘）：${NC}"
-    mount | grep "^/dev/" | while read line; do
-        dev=$(echo "$line" | awk '{print $1}')
-        mp=$(echo "$line" | awk '{print $3}')
-        if is_system_disk "$dev" || is_system_mountpoint "$mp"; then
-            continue
-        fi
-        echo "$line" | awk '{print NR")", $1, "->", $3}' | column -t
-    done
-
-    local count=$(mount | grep "^/dev/" | while read line; do
-        dev=$(echo "$line" | awk '{print $1}')
-        mp=$(echo "$line" | awk '{print $3}')
-        is_system_disk "$dev" || is_system_mountpoint "$mp" || echo "1"
-    done | wc -l)
-    if [ "$count" -eq 0 ]; then
-        info_msg "没有可卸载的数据盘分区。"
-        read -p "按回车键返回主菜单..." dummy </dev/tty
-        return
-    fi
-
-    echo ""
-    read -p "请输入要卸载的设备名（如 /dev/vdb1）或挂载点（如 /home），输入 0 返回: " target </dev/tty
-    [[ "$target" == "0" ]] && return
-
-    local dev mp
-    if [ -b "$target" ]; then
-        dev="$target"
-        mp=$(mount | grep "^$dev " | awk '{print $3}')
-    elif [ -d "$target" ]; then
-        mp="$target"
-        dev=$(mount | grep " $mp " | awk '{print $1}')
+    # 判断范围
+    if (( main_choice >= 1 && main_choice <= ${#MAIN_MENU[@]} )); then
+        show_sub_menu "$main_choice"
     else
-        error_msg "输入无效，不是设备文件也不是目录。"
-        read -p "按回车键返回..." dummy </dev/tty
-        return
-    fi
-
-    if [ -z "$dev" ] || [ -z "$mp" ]; then
-        error_msg "未找到对应的挂载关系。"
-        read -p "按回车键返回..." dummy </dev/tty
-        return
-    fi
-
-    if is_system_disk "$dev"; then
-        error_msg "拒绝卸载系统盘 $dev！"
-        read -p "按回车键返回..." dummy </dev/tty
-        return
-    fi
-    if is_system_mountpoint "$mp"; then
-        error_msg "拒绝卸载系统关键目录 $mp！"
-        read -p "按回车键返回..." dummy </dev/tty
-        return
-    fi
-
-    info_msg "将卸载设备 $dev 从挂载点 $mp"
-    if ! confirm "确定卸载吗？"; then
-        info_msg "操作取消。"
-        read -p "按回车键返回..." dummy </dev/tty
-        return
-    fi
-
-    umount "$mp" 2>/dev/null
-    if mountpoint -q "$mp"; then
-        warning_msg "普通卸载失败，尝试强制卸载..."
-        umount -l "$mp"
+        echo -e "${red}无效选项${reset}"
         sleep 1
-        if mountpoint -q "$mp"; then
-            error_msg "卸载失败，请手动处理。"
-            read -p "按回车键返回..." dummy </dev/tty
-            return
-        fi
     fi
-
-    sed -i "\|^$dev|d" /etc/fstab
-    success_msg "卸载成功，并已从 /etc/fstab 移除条目。"
-    read -p "按回车键继续..." dummy </dev/tty
-}
-
-view_disk_usage() {
-    clear
-    echo -e "${CYAN}==================== 磁盘使用情况 ====================${NC}"
-    df -h
-    echo ""
-    read -p "按回车键返回主菜单..." dummy </dev/tty
-}
-
-show_menu() {
-    clear
-    echo -e "${CYAN}"
-    echo "=============================="
-    echo "        磁盘管理工具"
-    echo "=============================="
-    echo -e "${NC}"
-    echo -e " ${GREEN}1) 查看磁盘分区信息${NC}"
-    echo -e " ${GREEN}2) 挂载磁盘（仅数据盘）${NC}"
-    echo -e " ${GREEN}3) 卸载分区（仅数据盘）${NC}"
-    echo -e " ${GREEN}4) 查看磁盘使用情况${NC}"
-    echo -e " ${GREEN}0) 退出${NC}"
-}
-
-
-main() {
-    check_root
-    while true; do
-        show_menu
-        read -p "请输入选项: " opt </dev/tty
-        case "$opt" in
-            1) view_disk_info ;;
-            2) mount_disk ;;
-            3) unmount_partition ;;
-            4) view_disk_usage ;;
-            0) exit 0 ;;
-            *) warning_msg "无效选项，请重新输入。" ; sleep 1 ;;
-        esac
-    done
-}
-
-main
+done

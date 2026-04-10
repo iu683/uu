@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# ShadowSSH 一键管理脚本
+# Komari IP History 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="shadowssh"
+APP_NAME="komari-ip-history"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== ShadowSSH 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Komari IP History 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -68,53 +68,37 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:18111]: " input_port
-    PORT=${input_port:-18111}
+    read -p "请输入访问端口 [默认:8090]: " input_port
+    PORT=${input_port:-8090}
     check_port "$PORT" || return
+
+    read -p "请输入管理员用户名 [默认:admin]: " input_user
+    ADMIN_USER=${input_user:-admin}
+
+    read -p "请输入管理员密码 [默认:change-this-password]: " input_pass
+    ADMIN_PASS=${input_pass:-change-this-password}
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  frontend:
-    image: ceocok/shadowssh-frontend:latest
-    pull_policy: always
-    container_name: shadowssh-frontend
+  ipq:
+    image: ghcr.io/qqqasdwx/komari-ip-history:latest
+    container_name: komari-ip-history
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT}:80"
-    depends_on:
-      - backend
-    networks:
-      - shadowssh-network
-
-  backend:
-    image: ceocok/shadowssh-backend:latest
-    pull_policy: always
-    container_name: shadowssh-backend
-    restart: unless-stopped
+      - "127.0.0.1:${PORT}:8090"
     environment:
-      NODE_ENV: production
-      PORT: 3001
+      IPQ_DEFAULT_ADMIN_USERNAME: ${ADMIN_USER}
+      IPQ_DEFAULT_ADMIN_PASSWORD: ${ADMIN_PASS}
+      IPQ_DB_PATH: /data/ipq.db
     volumes:
-      - ./data:/app/data
-    networks:
-      - shadowssh-network
-
-networks:
-  shadowssh-network:
-    driver: bridge
-    name: shadowssh-network
-    enable_ipv6: true
-    ipam:
-      config:
-        - subnet: fd01::/80
-          gateway: fd01::1
+      - ./data:/data
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ ShadowSSH 已启动${RESET}"
+    echo -e "${GREEN}✅ Komari IP History 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
     echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
 
@@ -125,23 +109,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ ShadowSSH 更新完成${RESET}"
+    echo -e "${GREEN}✅ Komari IP History 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart shadowssh-frontend
-    docker restart shadowssh-backend
-    echo -e "${GREEN}✅ ShadowSSH 已重启${RESET}"
+    docker restart komari-ip-history
+    echo -e "${GREEN}✅ Komari IP History 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f shadowssh-frontend
+    docker logs -f komari-ip-history
 }
 
 check_status() {
-    docker ps | grep shadowssh
+    docker ps | grep komari-ip-history
     read -p "按回车返回菜单..."
 }
 
@@ -149,7 +132,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ ShadowSSH 已彻底卸载${RESET}"
+    echo -e "${RED}✅ Komari IP History 已彻底卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

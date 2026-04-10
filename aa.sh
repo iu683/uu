@@ -1,4 +1,8 @@
 #!/bin/bash
+# ========================================
+# 开小鸡管理菜单
+# 支持永久快捷键 N/n + 自动补零 + 循环菜单
+# ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
@@ -6,173 +10,99 @@ RED="\033[31m"
 RESET="\033[0m"
 ORANGE='\033[38;5;208m'
 
-# =============================
-# 脚本路径
-# =============================
-SCRIPT_PATH="/root/panel.sh"
-SCRIPT_URL="https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/panel.sh"
+SCRIPT_PATH="/root/nat.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/sistarry/toolbox/main/toy/NAT.sh"
 BIN_LINK_DIR="/usr/local/bin"
 
-# =============================
-# 暂停
-# =============================
-pause() {
-    read -p $'\033[32m按回车键返回菜单...\033[0m'
-}
+# ================== 首次自动安装 ==================
+if [ ! -f "$SCRIPT_PATH" ]; then
+    echo -e "${YELLOW}首次运行，正在安装...${RESET}"
+    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL" || {
+        echo -e "${RED}安装失败，请检查网络${RESET}"
+        exit 1
+    }
+    chmod +x "$SCRIPT_PATH"
 
-# =============================
-# 菜单
-# =============================
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/n"
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/N"
+
+    echo -e "${GREEN}✅ 安装完成，可使用 n 或 N 启动${RESET}"
+fi
+
+# ================== 菜单 ==================
 menu() {
     clear
-    echo -e "${ORANGE}╔══════════════════════════════╗${RESET}"
-    echo -e "${ORANGE}    面板管理菜单(快捷指令:P/p)   ${RESET}"
-    echo -e "${ORANGE}╚══════════════════════════════╝${RESET}"
-    echo -e "${GREEN}[01] 宝塔面板${RESET}"
-    echo -e "${GREEN}[02] 国际版宝塔${RESET}"
-    echo -e "${GREEN}[03] 开心版宝塔${RESET}"
-    echo -e "${GREEN}[04] 1Panel面板${RESET}"
-    echo -e "${GREEN}[05] 1Panel面板拓展应用${RESET}"
-    echo -e "${GREEN}[06] 1PanelV1开心版${RESET}"
-    echo -e "${GREEN}[07] 1PanelV2开心版${RESET}"
-    echo -e "${GREEN}[08] 耗子面板${RESET}"
-    echo -e "${GREEN}[09] PandaWiki文档${RESET}"
-    echo -e "${GREEN}[10] 雷池WAF${RESET}"
-    echo -e "${GREEN}[11] Halo博客${RESET}"
-    echo -e "${GREEN}[12] 个人主页${RESET}"
-    echo -e "${GREEN}[13] MomentsBlog${RESET}"
-    echo -e "${GREEN}[14] Flarum论坛${RESET}"
-    echo -e "${GREEN}[15] WordPress${RESET}"
-    echo -e "${GREEN}[16] WordPress(MYSQL)${RESET}"
-    echo -e "${GREEN}[17] Typecho${RESET}"
-    echo -e "${GREEN}[18] Typecho(MYSQL)${RESET}"
-    echo -e "${YELLOW}[88] 更新脚本${RESET}"
-    echo -e "${YELLOW}[99] 卸载脚本${RESET}"
-    echo -e "${GREEN}[00] 退出${RESET}"
-    echo -ne "${RED}请选择: ${RESET}"
+    echo -e "${ORANGE}╔═════════════════════════════╗${RESET}"
+    echo -e "${ORANGE}   开小鸡工具箱(快捷指令:N/n)   ${RESET}"
+    echo -e "${ORANGE}╚═════════════════════════════╝${RESET}"
+    echo -e "${YELLOW}[01] PVE管理${RESET}"
+    echo -e "${YELLOW}[02] LXC小鸡${RESET}"
+    echo -e "${YELLOW}[03] Docker小鸡${RESET}"
+    echo -e "${YELLOW}[04] Incus小鸡${RESET}"
+    echo -e "${GREEN}[88] 更新脚本${RESET}"
+    echo -e "${GREEN}[99] 卸载脚本${RESET}"
+    echo -e "${YELLOW}[00] 退出${RESET}"
+    echo -ne "${RED}请输入操作编号: ${RESET}"
+
     read choice
-    
-    case $choice in
-        1|01)
-            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/baota.sh)
-            pause
+
+    # 只允许数字
+    if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}请输入数字编号！${RESET}"
+        sleep 1
+        return
+    fi
+
+    choice=$(printf "%02d" "$choice")
+
+    case "$choice" in
+        01)
+            echo -e "${GREEN}正在运行 PVE管理...${RESET}"
+            bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/pvegl.sh)
             ;;
-        2|02)
-            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/gjbaota.sh)
-            pause
+        02)
+            echo -e "${GREEN}正在运行 LXC 小鸡脚本...${RESET}"
+            bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/lxc.sh)
             ;;
-        3|03)
-            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/kxbaota.sh)
-            pause
+        03)
+            echo -e "${GREEN}正在运行 Docker 小鸡脚本...${RESET}"
+            bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/dockerlxc.sh)
             ;;
-        4|04)
-            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/1Panel.sh)
-            pause
+        04)
+            echo -e "${GREEN}正在运行 Incus 小鸡脚本...${RESET}"
+            bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/incus.sh)
             ;;
-        5|05)
-            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/tz1panel.sh)
-            pause
-            ;;
-        6|06)
-            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/kx1Panelv1.sh)
-            pause
-            ;;
-        7|07)
-            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/kx1Panelv2.sh)
-            pause
-            ;;
-        8|08)
-            bash <(curl -sSLm 10 https://dl.acepanel.net/helper.sh)
-            pause
-            ;;
-        9|09)
-            bash -c "$(curl -fsSLk https://release.baizhi.cloud/panda-wiki/manager.sh)"
-            pause
-            ;;
-        10)
-            bash -c "$(curl -fsSLk https://waf-ce.chaitin.cn/release/latest/manager.sh)"
-            pause
-            ;;
-        11)
-            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/Halo.sh)
-            pause
-            ;;
-        12)
-            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/RemioHome.sh)
-            pause
-            ;;
-        13)
-            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/MomentsBlog.sh)
-            pause
-            ;;
-        14)
-            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/Flarum.sh)
-            pause
-            ;;
-        15)
-            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/WordPress.sh)
-            pause
-            ;;
-        16)
-            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/WordPressmysql.sh)
-            pause
-            ;;
-        17)
-            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/Typecho.sh)
-            pause
-            ;;
-        18)
-            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/Typechomysql.sh)
-            pause
-            ;;
-         
-        # =============================
-        # 更新脚本
-        # =============================
         88)
             echo -e "${YELLOW}🔄 正在更新脚本...${RESET}"
-            curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
+            curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL" || {
+                echo -e "${RED}更新失败，请检查网络${RESET}"
+                break
+            }
             chmod +x "$SCRIPT_PATH"
-            ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/p"
-            ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/P"
-            echo -e "${GREEN}✅ 脚本已更新${RESET}"
+            ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/n"
+            ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/N"
+            echo -e "${GREEN}✅ 更新完成${RESET}"
             exec "$SCRIPT_PATH"
             ;;
-
-        # =============================
-        # 卸载脚本
-        # =============================
         99)
-            echo -e "${YELLOW}正在卸载脚本...${RESET}"
-            rm -f "$BIN_LINK_DIR/p" "$BIN_LINK_DIR/P" "$SCRIPT_PATH"
-            echo -e "${RED}✅ 卸载完成${RESET}"
+            rm -f "$SCRIPT_PATH" "$BIN_LINK_DIR/n" "$BIN_LINK_DIR/N"
+            echo -e "${RED}✅ 已卸载${RESET}"
             exit 0
             ;;
-
-        00|0)
+        00)
             exit 0
             ;;
-
         *)
             echo -e "${RED}无效选择，请重新输入${RESET}"
-            pause
+            sleep 1
+            return
             ;;
     esac
 
-    menu
+    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
 }
 
-# =============================
-# 首次运行自动安装
-# =============================
-if [ ! -f "$SCRIPT_PATH" ]; then
-    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
-    chmod +x "$SCRIPT_PATH"
-    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/p"
-    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/P"
-
-    echo -e "${GREEN}✅ 安装完成${RESET}"
-    echo -e "${GREEN}✅ 快捷键：p 或 P 可快速启动${RESET}"
-fi
-
-menu
+# ================== 主循环 ==================
+while true; do
+    menu
+done

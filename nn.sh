@@ -2,7 +2,7 @@
 
 set -e
 
-PKG="@anthropic-ai/claude-code"
+PKG="@openai/codex"
 
 color() {
   local code="$1"
@@ -169,102 +169,112 @@ check_node() {
   info "npm : $(npm -v)"
 }
 
-check_claude() {
-  if command -v claude >/dev/null 2>&1; then
-    ok "Claude Code 已安装: $(claude --version 2>/dev/null || echo '已安装但版本读取失败')"
+check_codex() {
+  if command -v codex >/dev/null 2>&1; then
+    ok "Codex CLI 已安装: $(codex --version 2>/dev/null || echo '已安装但版本读取失败')"
     return 0
   fi
 
-  warn "未检测到 claude 命令"
+  warn "未检测到 codex 命令"
   return 1
 }
 
-install_claude() {
+install_codex() {
   check_node || return 1
-  info "开始安装 Claude Code..."
+  info "开始安装 Codex CLI..."
   npm install -g "$PKG"
   ok "安装完成"
-  check_claude || true
+  check_codex || true
 }
 
-update_claude() {
+update_codex() {
   check_node || return 1
-  info "开始更新 Claude Code..."
+  info "开始更新 Codex CLI..."
   npm install -g "$PKG@latest"
   ok "更新完成"
-  check_claude || true
+  check_codex || true
 }
 
-uninstall_claude() {
+uninstall_codex() {
   check_node || return 1
-  info "开始卸载 Claude Code..."
+  info "开始卸载 Codex CLI..."
   npm uninstall -g "$PKG" || true
   ok "卸载完成"
 }
 
-auth_claude() {
-  if ! check_claude; then
-    warn "请先安装 Claude Code"
+codex_login() {
+  if ! check_codex; then
+    warn "请先安装 Codex CLI"
     return 1
   fi
 
   info "启动登录授权..."
-  claude auth
+  codex login
 }
 
-test_claude() {
-  if ! check_claude; then
-    warn "请先安装 Claude Code"
+codex_login_status() {
+  if ! check_codex; then
+    warn "请先安装 Codex CLI"
     return 1
   fi
 
-  info "执行快速测试..."
-  claude -p "用一句话说明当前目录适合做什么"
+  info "检查登录状态..."
+  codex login status
 }
 
-interactive_claude() {
-  if ! check_claude; then
-    warn "请先安装 Claude Code"
+test_codex() {
+  if ! check_codex; then
+    warn "请先安装 Codex CLI"
     return 1
   fi
 
-  info "进入 Claude 交互模式..."
-  claude -c
+  info "执行 Codex 快速测试..."
+  codex exec "用一句话说明当前目录适合做什么"
+}
+
+interactive_codex() {
+  if ! check_codex; then
+    warn "请先安装 Codex CLI"
+    return 1
+  fi
+
+  info "进入 Codex 交互模式..."
+  codex
 }
 
 show_env() {
   detect_os
   info "环境检查"
-  echo "OS_ID    : ${OS_ID:-unknown}"
-  echo "OS_LIKE  : ${OS_LIKE:-unknown}"
-  echo "USER     : ${USER:-unknown}"
-  echo "SHELL    : ${SHELL:-unknown}"
-  echo "PATH     : $PATH"
+  echo "OS_ID        : ${OS_ID:-unknown}"
+  echo "OS_LIKE      : ${OS_LIKE:-unknown}"
+  echo "USER         : ${USER:-unknown}"
+  echo "SHELL        : ${SHELL:-unknown}"
+  echo "PATH         : $PATH"
   echo
 
   if command -v node >/dev/null 2>&1; then
-    echo "node     : $(node -v)"
+    echo "node         : $(node -v)"
   else
-    echo "node     : 未安装"
+    echo "node         : 未安装"
   fi
 
   if command -v npm >/dev/null 2>&1; then
-    echo "npm      : $(npm -v)"
-    echo "npm root : $(npm root -g 2>/dev/null || echo '获取失败')"
+    echo "npm          : $(npm -v)"
+    echo "npm root -g  : $(npm root -g 2>/dev/null || echo '获取失败')"
   else
-    echo "npm      : 未安装"
+    echo "npm          : 未安装"
   fi
 
-  if command -v claude >/dev/null 2>&1; then
-    echo "claude   : $(command -v claude)"
-    echo "version  : $(claude --version 2>/dev/null || echo '读取失败')"
+  if command -v codex >/dev/null 2>&1; then
+    echo "codex        : $(command -v codex)"
+    echo "version      : $(codex --version 2>/dev/null || echo '读取失败')"
   else
-    echo "claude   : 未安装"
+    echo "codex        : 未安装"
   fi
 }
 
 fix_path_hint() {
-  warn "如果安装后仍提示 'claude: command not found'，通常是 PATH 问题。"
+  warn "如果安装后仍提示 'codex: command not found'，通常是 PATH 问题。"
   echo
   echo "先查看 npm 全局目录："
   echo "  npm root -g"
@@ -285,26 +295,27 @@ fix_path_hint() {
 
 install_all() {
   install_node
-  install_claude
+  install_codex
 }
 
 menu() {
   clear
   green "=================================="
-  green "   Claude Code 一键菜单管理"
+  green "     Codex CLI 菜单管理"
   green "=================================="
-  green "1. 一键安装 Node.js + Claude Code"
-  green "2. 仅安装 Node.js"
-  green "3. 安装 Claude Code"
-  green "4. 检查版本"
-  green "5. 登录授权"
-  green "6. 快速测试"
-  green "7. 进入交互模式"
-  green "8. 更新 Claude Code"
-  green "9. 卸载 Claude Code"
-  green "10. 查看环境信息"
-  green "11. PATH 修复提示"
-  green "0. 退出"
+  green " 1. 安装 Node.js + Codex CLI"
+  green " 2. 仅安装 Node.js"
+  green " 3. 安装 Codex CLI"
+  green " 4. 检查 Codex 版本"
+  green " 5. 登录授权"
+  green " 6. 查看登录状态"
+  green " 7. Codex 快速测试"
+  green " 8. 进入 Codex 交互模式"
+  green " 9. 更新 Codex CLI"
+  green "10. 卸载 Codex CLI"
+  green "11. 查看环境信息"
+  green "12. PATH 修复提示"
+  green " 0. 退出"
   green "=================================="
 }
 
@@ -322,38 +333,42 @@ main() {
         pause
         ;;
       3)
-        install_claude
+        install_codex
         pause
         ;;
       4)
-        check_claude || true
+        check_codex || true
         pause
         ;;
       5)
-        auth_claude || true
+        codex_login || true
         pause
         ;;
       6)
-        test_claude || true
+        codex_login_status || true
         pause
         ;;
       7)
-        interactive_claude || true
+        test_codex || true
         pause
         ;;
       8)
-        update_claude
+        interactive_codex || true
         pause
         ;;
       9)
-        uninstall_claude
+        update_codex
         pause
         ;;
       10)
-        show_env
+        uninstall_codex
         pause
         ;;
       11)
+        show_env
+        pause
+        ;;
+      12)
         fix_path_hint
         pause
         ;;

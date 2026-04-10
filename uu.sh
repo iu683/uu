@@ -1,372 +1,399 @@
-#!/usr/bin/env bash
+#!/bin/bash
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
+export PATH
+LANG=en_US.UTF-8
 
-set -e
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
 
-PKG="@anthropic-ai/claude-code"
+error_msg() { echo -e "${RED}[错误] $1${NC}"; }
+warning_msg() { echo -e "${YELLOW}[警告] $1${NC}"; }
+success_msg() { echo -e "${GREEN}[成功] $1${NC}"; }
+info_msg() { echo -e "${BLUE}[信息] $1${NC}"; }
 
-color() {
-  local code="$1"
-  shift
-  printf "\033[%sm%s\033[0m\n" "$code" "$*"
+confirm() {
+    local prompt="$1 (y/N): "
+    local answer
+    read -p "$prompt" answer </dev/tty
+    case "$answer" in [Yy]|[Yy][Ee][Ss]) return 0 ;; *) return 1 ;; esac
 }
 
-green() {
-  color "32" "$*"
+check_root() {
+    [ "$EUID" -ne 0 ] && { error_msg "请使用 root 权限运行此脚本。"; exit 1; }
 }
 
-info() {
-  color "36" "[INFO] $*"
+get_system_disk_base() {
+    local root_dev=$(df -P / | awk 'NR==2 {print $1}')
+    local boot_dev=$(df -P /boot 2>/dev/null | awk 'NR==2 {print $1}')
+    for dev in $root_dev $boot_dev; do
+        echo "$dev" | sed -e 's/[0-9]*$//' -e 's/p[0-9]*$//'
+    done | sort -u
 }
 
-ok() {
-  color "32" "[OK] $*"
-}
-
-warn() {
-  color "33" "[WARN] $*"
-}
-
-err() {
-  color "31" "[ERROR] $*"
-}
-
-pause() {
-  read -rp "按回车继续..." _
-}
-
-require_sudo() {
-  if [ "$(id -u)" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
-    err "当前不是 root，且系统未安装 sudo"
+is_system_disk() {
+    local dev=$1
+    local base=$(echo "$dev" | sed -e 's/[0-9]*$//' -e 's/p[0-9]*$//')
+    local sys_disks=$(get_system_disk_base)
+    for sd in $sys_disks; do
+        [[ "$base" == "$sd" ]] && return 0
+    done
+    [[ "$base" =~ ^/dev/(sda|vda|xvda|hda|nvme0n1)$ ]] && return 0
     return 1
-  fi
 }
 
-run_root() {
-  if [ "$(id -u)" -eq 0 ]; then
-    "$@"
-  else
-    sudo "$@"
-  fi
-}
-
-detect_os() {
-  if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    OS_ID="${ID:-unknown}"
-    OS_LIKE="${ID_LIKE:-}"
-  else
-    OS_ID="$(uname -s)"
-    OS_LIKE=""
-  fi
-}
-
-install_node_debian() {
-  require_sudo || return 1
-  info "检测到 Debian/Ubuntu 系统，开始安装 Node.js 20.x"
-  run_root apt update
-  run_root apt install -y curl ca-certificates gnupg
-  curl -fsSL https://deb.nodesource.com/setup_20.x | run_root bash -
-  run_root apt install -y nodejs
-}
-
-install_node_rhel() {
-  require_sudo || return 1
-  info "检测到 RHEL/CentOS/Rocky/AlmaLinux 系统，开始安装 Node.js 20.x"
-  if command -v dnf >/dev/null 2>&1; then
-    run_root dnf install -y curl
-    curl -fsSL https://rpm.nodesource.com/setup_20.x | run_root bash -
-    run_root dnf install -y nodejs
-  elif command -v yum >/dev/null 2>&1; then
-    run_root yum install -y curl
-    curl -fsSL https://rpm.nodesource.com/setup_20.x | run_root bash -
-    run_root yum install -y nodejs
-  else
-    err "未找到 dnf 或 yum"
-    return 1
-  fi
-}
-
-install_node_alpine() {
-  require_sudo || return 1
-  info "检测到 Alpine 系统，开始安装 Node.js"
-  run_root apk add nodejs npm
-}
-
-install_node_macos() {
-  if ! command -v brew >/dev/null 2>&1; then
-    err "未检测到 Homebrew，请先安装 brew"
-    return 1
-  fi
-  info "检测到 macOS，使用 Homebrew 安装 Node.js"
-  brew install node
-}
-
-install_node() {
-  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
-    ok "Node.js 已安装"
-    info "Node: $(node -v)"
-    info "npm : $(npm -v)"
-    return 0
-  fi
-
-  detect_os
-
-  case "$OS_ID" in
-    ubuntu|debian)
-      install_node_debian
-      ;;
-    centos|rhel|rocky|almalinux|ol|fedora)
-      install_node_rhel
-      ;;
-    alpine)
-      install_node_alpine
-      ;;
-    macos|darwin)
-      install_node_macos
-      ;;
-    *)
-      case "$OS_LIKE" in
-        *debian*)
-          install_node_debian
-          ;;
-        *rhel*|*fedora*)
-          install_node_rhel
-          ;;
+is_system_mountpoint() {
+    local mp=$1
+    case "$mp" in
+        /|/boot|/boot/*|/usr|/usr/*|/var|/var/*|/tmp|/etc|/etc/*|/root|/proc|/sys|/dev)
+            return 0 ;;
         *)
-          if [ "$(uname -s)" = "Darwin" ]; then
-            install_node_macos
-          else
-            err "暂不支持自动安装 Node.js，系统类型: ${OS_ID:-unknown}"
-            return 1
-          fi
-          ;;
-      esac
-      ;;
-  esac
-
-  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
-    ok "Node.js 安装完成"
-    info "Node: $(node -v)"
-    info "npm : $(npm -v)"
-  else
-    err "Node.js 安装后仍未检测到 node/npm"
-    return 1
-  fi
+            return 1 ;;
+    esac
 }
 
-check_node() {
-  if ! command -v node >/dev/null 2>&1; then
-    err "未检测到 node，请先安装 Node.js"
-    return 1
-  fi
-
-  if ! command -v npm >/dev/null 2>&1; then
-    err "未检测到 npm，请先安装 npm"
-    return 1
-  fi
-
-  info "Node: $(node -v)"
-  info "npm : $(npm -v)"
+get_data_disks() {
+    local sys_disks=$(get_system_disk_base)
+    for disk in $(lsblk -d -o NAME,TYPE | grep disk | awk '{print $1}'); do
+        local full_disk="/dev/$disk"
+        local base=$(echo "$full_disk" | sed -e 's/[0-9]*$//' -e 's/p[0-9]*$//')
+        local is_sys=0
+        for sd in $sys_disks; do
+            [[ "$base" == "$sd" ]] && is_sys=1 && break
+        done
+        [[ $is_sys -eq 1 ]] && continue
+        [[ "$base" =~ ^/dev/(sda|vda|xvda|hda|nvme0n1)$ ]] && continue
+        echo "$disk"
+    done
 }
 
-check_claude() {
-  if command -v claude >/dev/null 2>&1; then
-    ok "Claude Code 已安装: $(claude --version 2>/dev/null || echo '已安装但版本读取失败')"
+force_unmount_disk() {
+    local disk=$1
+    if is_system_disk "/dev/$disk"; then
+        error_msg "拒绝卸载系统盘 /dev/$disk！"
+        return 1
+    fi
+    info_msg "正在强制卸载 /dev/$disk 相关的所有挂载点..."
+    local mounts=$(mount | grep "^/dev/${disk}" | awk '{print $1}')
+    for dev in $mounts; do
+        umount "$dev" 2>/dev/null
+        if mount | grep -q "^$dev "; then
+            info_msg "普通卸载失败，使用懒卸载 (lazy)..."
+            umount -l "$dev" 2>/dev/null
+            sleep 1
+        fi
+    done
+    if mount | grep -q "^/dev/${disk}"; then
+        error_msg "无法卸载 /dev/$disk 的分区，请手动处理。"
+        return 1
+    fi
+    success_msg "卸载完成。"
     return 0
-  fi
-
-  warn "未检测到 claude 命令"
-  return 1
 }
 
-install_claude() {
-  check_node || return 1
-  info "开始安装 Claude Code..."
-  npm install -g "$PKG"
-  ok "安装完成"
-  check_claude || true
+view_disk_info() {
+    clear
+    echo -e "${CYAN}==================== 磁盘分区信息 ====================${NC}"
+    echo ""
+    echo -e "${GREEN}>>> lsblk 输出：${NC}"
+    lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE
+    echo ""
+    echo -e "${GREEN}>>> fdisk -l 输出（仅数据盘）：${NC}"
+    for disk in $(get_data_disks); do
+        fdisk -l "/dev/$disk" 2>/dev/null | head -n 20
+    done
+    echo ""
+    read -p "按回车键返回主菜单..." dummy </dev/tty
 }
 
-update_claude() {
-  check_node || return 1
-  info "开始更新 Claude Code..."
-  npm install -g "$PKG@latest"
-  ok "更新完成"
-  check_claude || true
+mount_disk() {
+    clear
+    echo -e "${CYAN}==================== 挂载磁盘向导 ====================${NC}"
+
+    local disks=($(get_data_disks))
+    if [ ${#disks[@]} -eq 0 ]; then
+        error_msg "未检测到可用数据盘。"
+        read -p "按回车键返回主菜单..." dummy </dev/tty
+        return
+    fi
+
+    echo -e "${BLUE}检测到以下数据盘:${NC}"
+    local index=1
+    for disk in "${disks[@]}"; do
+        local size=$(lsblk -d -o NAME,SIZE | grep -w "$disk" | awk '{print $2}')
+        local model=$(lsblk -d -o NAME,MODEL | grep -w "$disk" | awk '{$1=""; print $0}' | sed 's/^[ \t]*//')
+        local mount_status="未挂载"
+        mount | grep -q "^/dev/$disk" && mount_status="${YELLOW}已挂载${NC}"
+        printf "  [%d] %-8s  %-10s  %-20s %b\n" "$index" "$disk" "$size" "$model" "$mount_status"
+        ((index++))
+    done
+
+    local choice
+    while true; do
+        read -p "请输入要操作的磁盘编号 (1-${#disks[@]})，输入 0 返回: " choice </dev/tty
+        [[ "$choice" == "0" ]] && return
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#disks[@]} ]; then
+            selected_disk="${disks[$((choice-1))]}"
+            break
+        else
+            warning_msg "输入无效。"
+        fi
+    done
+    info_msg "选择的磁盘: /dev/$selected_disk"
+
+    if is_system_disk "/dev/$selected_disk"; then
+        error_msg "选择的磁盘为系统盘，禁止操作！"
+        read -p "按回车键返回..." dummy </dev/tty
+        return
+    fi
+
+    local mount_point=""
+    while true; do
+        read -p "请输入挂载点目录 (绝对路径，例如 /data 或 /home，输入 0 返回): " mp </dev/tty
+        [[ "$mp" == "0" ]] && return
+        if [[ "$mp" != /* ]]; then
+            warning_msg "必须是绝对路径。"
+            continue
+        fi
+        if [[ "$mp" == "/" ]]; then
+            warning_msg "不能挂载到根目录 /。"
+            continue
+        fi
+        if mountpoint -q "$mp"; then
+            warning_msg "目录 $mp 已被挂载。"
+            continue
+        fi
+        if is_system_mountpoint "$mp"; then
+            warning_msg "$mp 是系统关键目录，禁止作为挂载点。"
+            continue
+        fi
+        mount_point="$mp"
+        break
+    done
+    info_msg "挂载点: $mount_point"
+
+    if [ -d "$mount_point" ] && [ -n "$(ls -A "$mount_point" 2>/dev/null)" ]; then
+        warning_msg "目录 $mount_point 非空！"
+        echo -e "${YELLOW}当前目录内容：${NC}"
+        ls -la "$mount_point" | head -n 10
+        echo -e "${RED}如果继续挂载，该目录内的所有文件将被永久删除！${NC}"
+        if ! confirm "确定要清空 $mount_point 并继续挂载吗？"; then
+            info_msg "操作已取消。"
+            read -p "按回车键返回..." dummy </dev/tty
+            return
+        fi
+        echo -e "${RED}最后一次警告：即将清空 $mount_point 目录！${NC}"
+        if ! confirm "输入 yes 确认清空并继续 (yes/N): "; then
+            info_msg "操作已取消。"
+            read -p "按回车键返回..." dummy </dev/tty
+            return
+        fi
+        info_msg "正在清空 $mount_point ..."
+        rm -rf "$mount_point"/*
+        success_msg "目录已清空。"
+    fi
+
+    if mount | grep -q "^/dev/$selected_disk"; then
+        warning_msg "磁盘 /dev/$selected_disk 已有分区挂载。"
+        if ! confirm "是否重新分区并格式化（将清除所有数据）？"; then
+            local part1="/dev/${selected_disk}1"
+            if [ -b "$part1" ]; then
+                info_msg "尝试挂载已有分区 $part1 到 $mount_point"
+                mkdir -p "$mount_point"
+                mount "$part1" "$mount_point" || { error_msg "挂载失败。"; return; }
+                sed -i "\|^$part1|d" /etc/fstab
+                echo "$part1    $mount_point    ext4    defaults    0 0" >> /etc/fstab
+                success_msg "挂载成功，已写入 /etc/fstab"
+                df -h | grep "$mount_point"
+                read -p "按回车键继续..." dummy </dev/tty
+                return
+            else
+                error_msg "未找到分区 $part1。"
+                read -p "按回车键返回..." dummy </dev/tty
+                return
+            fi
+        fi
+    fi
+
+    if fdisk -l "/dev/$selected_disk" 2>/dev/null | grep -qiE "NTFS|FAT"; then
+        warning_msg "检测到 Windows 分区！"
+        confirm "格式化将清除所有数据，确定继续吗？" || return
+    fi
+
+    echo -e "${RED}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${NC}"
+    echo -e "${RED}!!  警告：即将对 /dev/$selected_disk 分区并格式化  !!${NC}"
+    echo -e "${RED}!!  该磁盘上的所有数据都将被永久清除！        !!${NC}"
+    echo -e "${RED}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${NC}"
+    confirm "确定要继续吗？" || return
+
+    cp /etc/fstab /etc/fstab.bak.$(date +%Y%m%d%H%M%S)
+    info_msg "已备份 /etc/fstab"
+
+    force_unmount_disk "$selected_disk" || { read -p "按回车键返回..." dummy </dev/tty; return; }
+
+    info_msg "正在清除分区表并创建新分区..."
+    (
+    echo d; echo d; echo d; echo d
+    echo n; echo p; echo 1; echo; echo
+    echo w
+    ) | fdisk "/dev/$selected_disk" > /dev/null 2>&1
+
+    partprobe "/dev/$selected_disk" 2>/dev/null || blockdev --rereadpt "/dev/$selected_disk" 2>/dev/null
+    sleep 3
+
+    local part1="/dev/${selected_disk}1"
+    if [ ! -b "$part1" ]; then
+        info_msg "fdisk 失败，尝试 parted 创建 GPT 分区..."
+        parted -s "/dev/$selected_disk" mklabel gpt
+        parted -s "/dev/$selected_disk" mkpart primary ext4 0% 100%
+        partprobe "/dev/$selected_disk" 2>/dev/null
+        sleep 3
+        part1="/dev/${selected_disk}1"
+        [ ! -b "$part1" ] && { error_msg "分区创建失败。"; return; }
+    fi
+
+    if mount | grep -q "^$part1 "; then
+        umount -l "$part1" 2>/dev/null
+        sleep 1
+    fi
+
+    info_msg "格式化 $part1 为 ext4..."
+    mkfs.ext4 -F "$part1" || { error_msg "格式化失败。"; return; }
+
+    mkdir -p "$mount_point"
+    mount "$part1" "$mount_point" || { error_msg "挂载失败。"; return; }
+
+    sed -i "\|^$part1|d" /etc/fstab
+    echo "$part1    $mount_point    ext4    defaults    0 0" >> /etc/fstab
+
+    success_msg "磁盘挂载完成！"
+    df -h | grep "$mount_point"
+    read -p "按回车键继续..." dummy </dev/tty
 }
 
-uninstall_claude() {
-  check_node || return 1
-  info "开始卸载 Claude Code..."
-  npm uninstall -g "$PKG" || true
-  ok "卸载完成"
+unmount_partition() {
+    clear
+    echo -e "${CYAN}==================== 卸载分区 ====================${NC}"
+
+    echo -e "${GREEN}当前挂载的分区（仅数据盘）：${NC}"
+    mount | grep "^/dev/" | while read line; do
+        dev=$(echo "$line" | awk '{print $1}')
+        mp=$(echo "$line" | awk '{print $3}')
+        if is_system_disk "$dev" || is_system_mountpoint "$mp"; then
+            continue
+        fi
+        echo "$line" | awk '{print NR")", $1, "->", $3}' | column -t
+    done
+
+    local count=$(mount | grep "^/dev/" | while read line; do
+        dev=$(echo "$line" | awk '{print $1}')
+        mp=$(echo "$line" | awk '{print $3}')
+        is_system_disk "$dev" || is_system_mountpoint "$mp" || echo "1"
+    done | wc -l)
+    if [ "$count" -eq 0 ]; then
+        info_msg "没有可卸载的数据盘分区。"
+        read -p "按回车键返回主菜单..." dummy </dev/tty
+        return
+    fi
+
+    echo ""
+    read -p "请输入要卸载的设备名（如 /dev/vdb1）或挂载点（如 /home），输入 0 返回: " target </dev/tty
+    [[ "$target" == "0" ]] && return
+
+    local dev mp
+    if [ -b "$target" ]; then
+        dev="$target"
+        mp=$(mount | grep "^$dev " | awk '{print $3}')
+    elif [ -d "$target" ]; then
+        mp="$target"
+        dev=$(mount | grep " $mp " | awk '{print $1}')
+    else
+        error_msg "输入无效，不是设备文件也不是目录。"
+        read -p "按回车键返回..." dummy </dev/tty
+        return
+    fi
+
+    if [ -z "$dev" ] || [ -z "$mp" ]; then
+        error_msg "未找到对应的挂载关系。"
+        read -p "按回车键返回..." dummy </dev/tty
+        return
+    fi
+
+    if is_system_disk "$dev"; then
+        error_msg "拒绝卸载系统盘 $dev！"
+        read -p "按回车键返回..." dummy </dev/tty
+        return
+    fi
+    if is_system_mountpoint "$mp"; then
+        error_msg "拒绝卸载系统关键目录 $mp！"
+        read -p "按回车键返回..." dummy </dev/tty
+        return
+    fi
+
+    info_msg "将卸载设备 $dev 从挂载点 $mp"
+    if ! confirm "确定卸载吗？"; then
+        info_msg "操作取消。"
+        read -p "按回车键返回..." dummy </dev/tty
+        return
+    fi
+
+    umount "$mp" 2>/dev/null
+    if mountpoint -q "$mp"; then
+        warning_msg "普通卸载失败，尝试强制卸载..."
+        umount -l "$mp"
+        sleep 1
+        if mountpoint -q "$mp"; then
+            error_msg "卸载失败，请手动处理。"
+            read -p "按回车键返回..." dummy </dev/tty
+            return
+        fi
+    fi
+
+    sed -i "\|^$dev|d" /etc/fstab
+    success_msg "卸载成功，并已从 /etc/fstab 移除条目。"
+    read -p "按回车键继续..." dummy </dev/tty
 }
 
-auth_claude() {
-  if ! check_claude; then
-    warn "请先安装 Claude Code"
-    return 1
-  fi
-
-  info "启动登录授权..."
-  claude auth login
+view_disk_usage() {
+    clear
+    echo -e "${CYAN}==================== 磁盘使用情况 ====================${NC}"
+    df -h
+    echo ""
+    read -p "按回车键返回主菜单..." dummy </dev/tty
 }
 
-test_claude() {
-  if ! check_claude; then
-    warn "请先安装 Claude Code"
-    return 1
-  fi
-
-  info "执行快速测试..."
-  claude -p "用一句话说明当前目录适合做什么"
+show_menu() {
+    clear
+    echo -e "${CYAN}"
+    echo "=============================="
+    echo "        磁盘管理工具"
+    echo "=============================="
+    echo -e "${NC}"
+    echo -e " ${GREEN}1) 查看磁盘分区信息${NC}"
+    echo -e " ${GREEN}2) 挂载磁盘（仅数据盘）${NC}"
+    echo -e " ${GREEN}3) 卸载分区（仅数据盘）${NC}"
+    echo -e " ${GREEN}4) 查看磁盘使用情况${NC}"
+    echo -e " ${GREEN}0) 退出${NC}"
 }
 
-interactive_claude() {
-  if ! check_claude; then
-    warn "请先安装 Claude Code"
-    return 1
-  fi
-
-  info "进入 Claude 交互模式..."
-  claude -c
-}
-
-show_env() {
-  detect_os
-  info "环境检查"
-  echo "OS_ID    : ${OS_ID:-unknown}"
-  echo "OS_LIKE  : ${OS_LIKE:-unknown}"
-  echo "USER     : ${USER:-unknown}"
-  echo "SHELL    : ${SHELL:-unknown}"
-  echo "PATH     : $PATH"
-  echo
-
-  if command -v node >/dev/null 2>&1; then
-    echo "node     : $(node -v)"
-  else
-    echo "node     : 未安装"
-  fi
-
-  if command -v npm >/dev/null 2>&1; then
-    echo "npm      : $(npm -v)"
-    echo "npm root : $(npm root -g 2>/dev/null || echo '获取失败')"
-  else
-    echo "npm      : 未安装"
-  fi
-
-  if command -v claude >/dev/null 2>&1; then
-    echo "claude   : $(command -v claude)"
-    echo "version  : $(claude --version 2>/dev/null || echo '读取失败')"
-  else
-    echo "claude   : 未安装"
-  fi
-}
-
-fix_path_hint() {
-  warn "如果安装后仍提示 'claude: command not found'，通常是 PATH 问题。"
-  echo
-  echo "先查看 npm 全局目录："
-  echo "  npm root -g"
-  echo
-  echo "常见可执行目录："
-  echo "  ~/.npm-global/bin"
-  echo "  ~/.nvm/versions/node/<version>/bin"
-  echo "  /usr/local/bin"
-  echo
-  echo "例如加入 PATH："
-  echo '  export PATH="$HOME/.npm-global/bin:$PATH"'
-  echo
-  echo "生效命令："
-  echo "  source ~/.bashrc"
-  echo "或"
-  echo "  source ~/.zshrc"
-}
-
-install_all() {
-  install_node
-  install_claude
-}
-
-menu() {
-  clear
-  green "=================================="
-  green "   Claude Code 一键菜单管理"
-  green "=================================="
-  green "1. 一键安装 Node.js + Claude Code"
-  green "2. 仅安装 Node.js"
-  green "3. 安装 Claude Code"
-  green "4. 检查版本"
-  green "5. 登录授权"
-  green "6. 快速测试"
-  green "7. 进入交互模式"
-  green "8. 更新 Claude Code"
-  green "9. 卸载 Claude Code"
-  green "10. 查看环境信息"
-  green "11. PATH 修复提示"
-  green "0. 退出"
-  green "=================================="
-}
 
 main() {
-  while true; do
-    menu
-    read -rp "请输入选项: " choice
-    case "$choice" in
-      1)
-        install_all
-        pause
-        ;;
-      2)
-        install_node
-        pause
-        ;;
-      3)
-        install_claude
-        pause
-        ;;
-      4)
-        check_claude || true
-        pause
-        ;;
-      5)
-        auth_claude || true
-        pause
-        ;;
-      6)
-        test_claude || true
-        pause
-        ;;
-      7)
-        interactive_claude || true
-        pause
-        ;;
-      8)
-        update_claude
-        pause
-        ;;
-      9)
-        uninstall_claude
-        pause
-        ;;
-      10)
-        show_env
-        pause
-        ;;
-      11)
-        fix_path_hint
-        pause
-        ;;
-      0)
-        ok "已退出"
-        exit 0
-        ;;
-      *)
-        warn "无效选项"
-        pause
-        ;;
-    esac
-  done
+    check_root
+    while true; do
+        show_menu
+        read -p "请输入选项: " opt </dev/tty
+        case "$opt" in
+            1) view_disk_info ;;
+            2) mount_disk ;;
+            3) unmount_partition ;;
+            4) view_disk_usage ;;
+            0) exit 0 ;;
+            *) warning_msg "无效选项，请重新输入。" ; sleep 1 ;;
+        esac
+    done
 }
 
 main

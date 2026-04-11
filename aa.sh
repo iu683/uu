@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# NewsNow 一键管理脚本
+# Glash 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,9 +8,10 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="newsnow"
+APP_NAME="glash"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_DIR="$APP_DIR/config"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -31,10 +32,25 @@ check_port() {
     fi
 }
 
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
+}
+
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== NewsNow 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Glash 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -58,9 +74,8 @@ menu() {
 }
 
 install_app() {
-
     check_docker
-    mkdir -p "$APP_DIR"
+    mkdir -p "$APP_DIR" "$CONFIG_DIR"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -68,49 +83,70 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:4444]: " input_port
-    PORT=${input_port:-4444}
-    check_port "$PORT" || return
+    read -p "请输入 HTTP 代理端口 [默认:7890]: " input_http_port
+    HTTP_PORT=${input_http_port:-7890}
+    check_port "$HTTP_PORT" || return
 
-    read -p "请输入 Github Client ID : " G_CLIENT_ID
-    read -p "请输入 Github Client Secret: " G_CLIENT_SECRET
+    read -p "请输入 SOCKS5 代理端口 [默认:7891]: " input_socks_port
+    SOCKS_PORT=${input_socks_port:-7891}
+    check_port "$SOCKS_PORT" || return
 
-    JWT_SECRET=$(openssl rand -hex 16)
+    read -p "请输入 Dashboard 端口 [默认:9090]: " input_dashboard_port
+    DASHBOARD_PORT=${input_dashboard_port:-9090}
+    check_port "$DASHBOARD_PORT" || return
+
+    read -p "请输入订阅地址 SUB_URL: " SUB_URL
+    if [ -z "$SUB_URL" ]; then
+        echo -e "${RED}SUB_URL 不能为空${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    fi
+
+    read -p "请输入 Dashboard 密码 SECRET: " SECRET
+    if [ -z "$SECRET" ]; then
+        echo -e "${RED}SECRET 不能为空${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    fi
+
+    read -p "请输入订阅更新 CRON [默认:0 */6 * * *]: " input_cron
+    SUB_CRON=${input_cron:-0 */6 * * *}
+
+    read -p "是否允许局域网访问 ALLOW_LAN [默认:true]: " input_allow_lan
+    ALLOW_LAN=${input_allow_lan:-true}
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  newsnow:
-    image: ghcr.io/ourongxing/newsnow:latest
-    container_name: newsnow
-    restart: unless-stopped
+  glash:
+    image: gangz1o/glash:latest
+    container_name: glash
+    restart: always
     ports:
-      - "127.0.0.1:${PORT}:4444"
+      - '${HTTP_PORT}:7890'
+      - '${SOCKS_PORT}:7891'
+      - '127.0.0.1:${DASHBOARD_PORT}:9090'
     volumes:
-      - newsnow_data:/usr/app/.data
+      - ./config:/root/.config/mihomo
     environment:
-      HOST: 0.0.0.0
-      PORT: 4444
-      NODE_ENV: production
-      G_CLIENT_ID: ${G_CLIENT_ID}
-      G_CLIENT_SECRET: ${G_CLIENT_SECRET}
-      JWT_SECRET: ${JWT_SECRET}
-      INIT_TABLE: true
-      ENABLE_CACHE: true
-      PRODUCTHUNT_API_TOKEN:
-
-volumes:
-  newsnow_data:
-    name: newsnow_data
+      - TZ=Asia/Shanghai
+      - SUB_URL=${SUB_URL}
+      - SUB_CRON=${SUB_CRON}
+      - SECRET=${SECRET}
+      - ALLOW_LAN=${ALLOW_LAN}
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
+    SERVER_IP=$(get_public_ip)
+
     echo
-    echo -e "${GREEN}✅ NewsNow 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 数据卷: newsnow_data${RESET}"
-    echo -e "${YELLOW} 首次启动后建议把 INIT_TABLE 改为 false${RESET}"
+    echo -e "${GREEN}✅ Glash 已启动${RESET}"
+    echo -e "${YELLOW}🌐 HTTP 代理:  http://127.0.0.1:${HTTP_PORT}${RESET}"
+    echo -e "${YELLOW}🌐 SOCKS5 代理: socks5://${SERVER_IP}:${SOCKS_PORT}${RESET}"
+    echo -e "${YELLOW}⚙️ Dashboard:  http://${SERVER_IP}:${DASHBOARD_PORT}${RESET}"
+    echo -e "${YELLOW}⚙️ 密码:  ${SECRET}${RESET}"
+    echo -e "${GREEN}📂 配置目录: ${CONFIG_DIR}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -119,31 +155,30 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ NewsNow 更新完成${RESET}"
+    echo -e "${GREEN}✅ Glash 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart newsnow
-    echo -e "${GREEN}✅ NewsNow 已重启${RESET}"
+    docker restart glash
+    echo -e "${GREEN}✅ Glash 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f newsnow
+    docker logs -f glash
 }
 
 check_status() {
-    docker ps | grep newsnow
+    docker ps | grep glash
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
-    docker volume rm newsnow_data 2>/dev/null
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ NewsNow 已彻底卸载${RESET}"
+    echo -e "${RED}✅ Glash 已彻底卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

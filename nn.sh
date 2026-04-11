@@ -1,116 +1,191 @@
 #!/bin/bash
 # ========================================
-# Alpine/Ubuntu/Debian/CentOS 系统管理菜单
-# 支持永久快捷键 A/a + 自调用循环菜单
+# Emby-In-One 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
-BLUE="\033[34m"
 RESET="\033[0m"
-BOLD="\033[1m"
-ORANGE='\033[38;5;208m'
 
-# ================== 脚本路径 ==================
-SCRIPT_PATH="/root/Alpine.sh"
-SCRIPT_URL="https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/Alpine.sh"
-BIN_LINK_DIR="/usr/local/bin"
+APP_NAME="emby-in-one"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_DIR="$APP_DIR/config"
+CONFIG_FILE="$CONFIG_DIR/config.yaml"
+REPO_URL="https://github.com/ArizeSky/Emby-In-One.git"
 
-# ================== 首次运行自动安装 ==================
-if [ ! -f "$SCRIPT_PATH" ]; then
-    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}安装失败，请检查网络或 URL${RESET}"
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
+
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
         exit 1
     fi
-    chmod +x "$SCRIPT_PATH"
-
-    # 创建快捷键 A/a
-    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/A"
-    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/a"
-
-    echo -e "${GREEN}✅ 安装完成${RESET}"
-    echo -e "${GREEN}✅ 快捷键已添加：A 或 a 可快速启动${RESET}"
-fi
-
-# ================== 菜单函数 ==================
-menu() {
-    clear
-    echo -e "${ORANGE}╔════════════════════════════╗${RESET}"
-    echo -e "${ORANGE}   Alpine工具箱(快捷指令:A/a)  ${RESET}"
-    echo -e "${ORANGE}╚════════════════════════════╝${RESET}"
-    echo -e "${YELLOW}[01] 系统更新${RESET}"
-    echo -e "${YELLOW}[02] 修改SSH端口${RESET}"
-    echo -e "${YELLOW}[03] 防火墙管理${RESET}"
-    echo -e "${YELLOW}[04] Fail2Ban${RESET}"
-    echo -e "${YELLOW}[05] 更换系统源${RESET}"
-    echo -e "${YELLOW}[06] 系统清理${RESET}"
-    echo -e "${YELLOW}[07] 切换字体${RESET}"
-    echo -e "${YELLOW}[08] 修改主机名${RESET}"
-    echo -e "${YELLOW}[09] Docker管理${RESET}"
-    echo -e "${YELLOW}[10] Reality${RESET}"
-    echo -e "${YELLOW}[11] Hysteria2${RESET}"
-    echo -e "${YELLOW}[12] Xray-Argo${RESET}"
-    echo -e "${YELLOW}[13] F佬Sing-box${RESET}"
-    echo -e "${YELLOW}[14] vless-all-in-one${RESET}"
-    echo -e "${YELLOW}[15] 3X-UI面板${RESET}"
-    echo -e "${YELLOW}[16] Realm-xwPF${RESET}"
-    echo -e "${YELLOW}[17] 应用商店${RESET}"
-    echo -e "${YELLOW}[18] Emby反代${RESET}"
-    echo -e "${GREEN}[88] 更新脚本${RESET}"
-    echo -e "${GREEN}[99] 卸载脚本${RESET}"
-    echo -e "${YELLOW}[00] 退出${RESET}"
-    echo -ne "${RED}请输入操作编号: ${RESET}"
-    read choice
-    case "$choice" in
-        1) apk update && apk add --no-cache bash curl wget vim tar sudo git gzip openssl 2>/dev/null \
-              || (apt update && apt install -y curl wget vim tar sudo git gzip openssl) \
-              || (yum install -y curl wget vim tar sudo git gzip openssl) ;;
-        2) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/apsdk.sh) ;;
-        3) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/apfeew.sh) ;;
-        4) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/apFail2Ban.sh) ;;
-        5) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/aphuanyuan.sh) ;;
-        6) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/apql.sh) ;;
-        7) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/apcn.sh) ;;
-        8) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/aphome.sh) ;;
-        9) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/apdocker.sh) ;;
-        10) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/AZAPReality.sh) ;;
-        11) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/AZAPHysteria2.sh) ;;
-        12) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Xray2go.sh) ;;
-        13) bash <(wget -qO- https://raw.githubusercontent.com/fscarmen/sing-box/main/sing-box.sh) ;;
-        14) wget -O vless-server.sh https://raw.githubusercontent.com/Zyx0rx/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh ;;
-        15) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/3xuiAlpine.sh) ;;
-        16) wget -qO- https://raw.githubusercontent.com/zywe03/realm-xwPF/main/xwPF.sh | sudo bash -s install ;;
-        17) bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/Store.sh) ;;
-        18) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/EmbyAlpine.sh) ;;
-        88)
-            echo -e "${YELLOW}🔄 正在更新脚本...${RESET}"
-            curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL" || {
-                echo -e "${RED}❌ 更新失败，请检查网络${RESET}"
-                break
-            }
-            chmod +x "$SCRIPT_PATH"
-
-            # 重新确保快捷键存在
-            ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/A"
-            ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/a"
-
-            echo -e "${GREEN}✅ 脚本已更新${RESET}"
-            exec "$SCRIPT_PATH"
-            ;;
-        99) 
-            rm -f "$SCRIPT_PATH" "$BIN_LINK_DIR/A" "$BIN_LINK_DIR/a"
-            echo -e "${RED}✅ 卸载完成${RESET}"
-            exit 0 ;;
-      00|0) exit 0 ;;
-        *) echo -e "${RED}无效选择，请重新输入!${RESET}" ;;
-    esac
-    read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
 }
 
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
 
-# ================== 主循环 ==================
-while true; do
-    menu
-done
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== Emby-In-One 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含配置)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+install_app() {
+    check_docker
+    mkdir -p "$APP_DIR"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+        rm -rf "$APP_DIR"
+        mkdir -p "$APP_DIR"
+    fi
+
+    echo -e "${GREEN}开始下载 Emby-In-One...${RESET}"
+    git clone "$REPO_URL" "$APP_DIR" || {
+        echo -e "${RED}项目克隆失败，请检查网络或 Git 环境${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    }
+
+    mkdir -p "$CONFIG_DIR"
+
+    read -p "请输入服务端口 [默认:8096]: " input_port
+    PORT=${input_port:-8096}
+    check_port "$PORT" || return
+
+    read -p "请输入站点名称 [默认:Emby-In-One]: " input_name
+    SERVER_NAME=${input_name:-Emby-In-One}
+
+    read -p "请输入管理员用户名 [默认:admin]: " input_admin
+    ADMIN_USER=${input_admin:-admin}
+
+    read -p "请输入管理员密码: " ADMIN_PASS
+    if [ -z "$ADMIN_PASS" ]; then
+        echo -e "${RED}管理员密码不能为空${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    fi
+
+    cat > "$CONFIG_FILE" <<EOF
+server:
+  port: ${PORT}
+  name: "${SERVER_NAME}"
+
+admin:
+  username: "${ADMIN_USER}"
+  password: "${ADMIN_PASS}"
+
+playback:
+  mode: "proxy"
+
+timeouts:
+  api: 30000
+  global: 15000
+  login: 10000
+  healthCheck: 10000
+  healthInterval: 60000
+
+proxies: []
+upstream: []
+EOF
+
+    cd "$APP_DIR" || exit
+
+    docker compose build
+    docker compose up -d
+
+    SERVER_IP=$(get_public_ip)
+
+    echo
+    echo -e "${GREEN}✅ Emby-In-One 已启动${RESET}"
+    echo -e "${YELLOW}🌐 客户端连接地址: http://${SERVER_IP}:${PORT}${RESET}"
+    echo -e "${YELLOW}⚙️ 管理面板地址: http://${SERVER_IP}:${PORT}/admin${RESET}"
+    echo -e "${YELLOW}⚙️ 账号: ${ADMIN_USER}${RESET}"
+    echo -e "${YELLOW}⚙️ 密码: ${ADMIN_PASS}${RESET}"
+    echo -e "${GREEN}📂 配置文件位置: ${CONFIG_FILE}${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+    if [ ! -d "$APP_DIR/.git" ]; then
+        echo -e "${RED}未检测到安装目录或 Git 仓库，无法更新${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    fi
+
+    cd "$APP_DIR" || return
+    git pull
+    docker compose build
+    docker compose up -d
+
+    echo -e "${GREEN}✅ Emby-In-One 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+    cd "$APP_DIR" || return
+    docker compose restart
+    echo -e "${GREEN}✅ Emby-In-One 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    cd "$APP_DIR" || return
+    docker compose logs -f
+}
+
+check_status() {
+    cd "$APP_DIR" || return
+    docker compose ps
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    if [ ! -d "$APP_DIR" ]; then
+        echo -e "${RED}未检测到安装目录，无需卸载${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    fi
+
+    cd "$APP_DIR" || return
+    docker compose down 2>/dev/null
+    rm -rf "$APP_DIR"
+
+    echo -e "${RED}✅ Emby-In-One 已彻底卸载${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+menu

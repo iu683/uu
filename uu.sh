@@ -1,362 +1,202 @@
 #!/bin/bash
-set -o pipefail
-
-
-#################################
-# 环境变量 & 配置
-#################################
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export HOME=/root   # ⭐ 确保 cron 下 ~ 指向 root
+# ========================================
+# Emby-In-One 一键管理脚本
+# ========================================
 
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/rsync_task"
-SCRIPT_URL="https://raw.githubusercontent.com/sistarry/toolbox/main/toy/Rrsync.sh"
-SCRIPT_PATH="$BASE_DIR/rsync_manager.sh"
-KEY_DIR="$BASE_DIR/keys"
-LOG_DIR="$BASE_DIR/logs"
-CONFIG_FILE="$BASE_DIR/rsync_tasks.conf"
-TG_CONFIG="$BASE_DIR/.tg.conf"
-BIN_LINK_DIR="/usr/local/bin"
+APP_NAME="emby-in-one"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_DIR="$APP_DIR/config"
+CONFIG_FILE="$CONFIG_DIR/config.yaml"
+REPO_URL="https://github.com/ArizeSky/Emby-In-One.git"
 
-mkdir -p "$BASE_DIR" "$KEY_DIR" "$LOG_DIR"
-touch "$CONFIG_FILE"
-
-#################################
-# 稳定统计任务数量（修复 all 错误核心）
-#################################
-task_count() {
-    awk 'NF{c++} END{print c+0}' "$CONFIG_FILE"
-}
-
-#################################
-# 安装依赖
-#################################
-install_dep() {
-    for p in rsync ssh sshpass curl tar; do
-        if ! command -v $p &>/dev/null; then
-            echo -e "${YELLOW}安装依赖: $p${RESET}"
-            DEBIAN_FRONTEND=noninteractive apt-get update -qq
-            DEBIAN_FRONTEND=noninteractive apt-get install -y $p >/dev/null 2>&1
-        fi
-    done
-}
-install_dep
-
-#################################
-# Telegram
-#################################
-send_tg() {
-    [[ -f "$TG_CONFIG" ]] || return
-    . "$TG_CONFIG"   # ⭐ cron 下也能读到变量
-    msg="$1"
-    curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-        -d chat_id="$CHAT_ID" \
-        -d text="[$VPS_NAME] $msg" >/dev/null 2>&1
-}
-
-setup_tg() {
-    read -p "VPS名称: " VPS_NAME
-    read -p "Bot Token: " BOT_TOKEN
-    read -p "Chat ID: " CHAT_ID
-    cat > "$TG_CONFIG" <<EOF
-VPS_NAME="$VPS_NAME"
-BOT_TOKEN="$BOT_TOKEN"
-CHAT_ID="$CHAT_ID"
-EOF
-    chmod 600 "$TG_CONFIG"
-    echo -e "${GREEN}TG配置已保存${RESET}"
-}
-
-#################################
-# SSH 密钥管理
-#################################
-generate_and_setup_ssh() {
-    local remote="$1"
-    local port="$2"
-
-    KEY_FILE="$KEY_DIR/id_rsa_rsync"
-    PUB_FILE="$KEY_FILE.pub"
-
-    # ===== 生成密钥 =====
-    if [[ ! -f "$KEY_FILE" ]]; then
-        echo -e "${YELLOW}未检测到本地 SSH 密钥，正在生成...${RESET}"
-        ssh-keygen -t rsa -b 4096 -f "$KEY_FILE" -N "" -q
-        echo -e "${GREEN}✅ 本地 SSH 密钥生成完成${RESET}"
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
     fi
 
-    PUBKEY_CONTENT=$(cat "$PUB_FILE")
-
-    echo -e "${YELLOW}第一次连接需要输入远程密码${RESET}"
-
-    # ⭐⭐⭐ 关键：所有 ssh/known_hosts 操作必须关闭 set -e
-    set +e
-
-    # 清理旧指纹（不存在也不会退出）
-    ssh-keygen -f "$HOME/.ssh/known_hosts" -R "${remote#*@}" >/dev/null 2>&1
-
-    # 首次连接自动接受 host key
-    ssh -o StrictHostKeyChecking=no -p "$port" "$remote" \
-        "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
-
-    ssh -o StrictHostKeyChecking=no -p "$port" "$remote" \
-        "touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
-
-    ssh -o StrictHostKeyChecking=no -p "$port" "$remote" \
-        "grep -Fxq '$PUBKEY_CONTENT' ~/.ssh/authorized_keys || echo '$PUBKEY_CONTENT' >> ~/.ssh/authorized_keys"
-
-    # 测试免密（失败也不能退出）
-    ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" -p "$port" "$remote" "echo ok" >/dev/null 2>&1
-    ok=$?
-
-    set -e
-    # ⭐⭐⭐ 恢复
-
-    if [[ $ok -eq 0 ]]; then
-        echo -e "${GREEN}✅ 公钥写入成功，可免密码登录 $remote${RESET}"
-    else
-        echo -e "${RED}❌ 公钥写入失败，请检查 SSH 或密码是否正确${RESET}"
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
     fi
 }
 
-
-#################################
-# 任务管理
-#################################
-list_tasks() {
-    [[ ! -s "$CONFIG_FILE" ]] && { echo -e "${YELLOW}暂无任务${RESET}"; return; }
-    awk -F'|' -v YELLOW="$YELLOW" -v RESET="$RESET" \
-    '{printf YELLOW "%d) %s  %s -> %s [%s]" RESET "\n", NR, $1, $2, $3, $5}' "$CONFIG_FILE"
-}
-
-add_task() {
-    read -p "任务名称: " name
-    read -p "本地目录: " local
-    read -p "远程目录: " remote_path
-    read -p "远程用户@IP: " remote
-    read -p "端口(默认22): " port
-    port=${port:-22}
-
-    echo "认证方式: 1密码 2密钥"
-    read -p "选择: " c
-    if [[ $c == 1 ]]; then
-        read -s -p "密码: " secret; echo
-        auth="password"
-    else
-        generate_and_setup_ssh "$remote" "$port"
-        secret="$KEY_DIR/id_rsa_rsync"
-        auth="key"
-    fi
-
-    echo "$name|$local|$remote|$remote_path|$port|$auth|$secret" >> "$CONFIG_FILE"
-}
-
-delete_task() {
-    read -p "编号: " n
-    sed -i "${n}d" "$CONFIG_FILE"
-}
-
-#################################
-# 压缩同步
-#################################
-run_task() {
-    direction="$1"
-    num="$2"
-
-    if [[ -z "$num" ]]; then
-        read -p "编号: " num
-    fi
-
-    task=$(sed -n "${num}p" "$CONFIG_FILE" | tr -d '\r\n')
-
-    if [[ -z "$task" ]]; then
-        echo "任务编号 $num 不存在" >> "$LOG_DIR/error.log"
-        send_tg "任务 $num 不存在 ❌"
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
         return 1
     fi
-
-    IFS='|' read -r name local remote remote_path port auth secret <<< "$task"
-    archive="/tmp/sync_task_${name}.tar.gz"
-
-    echo -e "${YELLOW}开始同步 [$name] ...${RESET}"
-
-    if [[ "$direction" == "push" ]]; then
-
-        tar -czf "$archive" -C "$(dirname "$local")" "$(basename "$local")" || return 1
-
-        if [[ "$auth" == "password" ]]; then
-            sshpass -p "$secret" ssh -p $port $remote "mkdir -p $remote_path"
-            sshpass -p "$secret" rsync -az -e "ssh -p $port" "$archive" "$remote:$remote_path/"
-        else
-            ssh -i "$secret" -p $port $remote "mkdir -p $remote_path"
-            rsync -az -e "ssh -i $secret -p $port" "$archive" "$remote:$remote_path/"
-        fi
-
-        echo -e "${GREEN}✅ [$name] 推送完成${RESET}"
-        send_tg "$name 推送完成 ✅"
-        return 0
-    else
-
-        if [[ "$auth" == "password" ]]; then
-            sshpass -p "$secret" rsync -az -e "ssh -p $port" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
-        else
-            rsync -az -e "ssh -i $secret -p $port" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
-        fi
-
-        rm -rf "$local"
-        mkdir -p "$local"
-        tar -xzf "/tmp/$(basename "$archive")" -C "$(dirname "$local")"
-
-        echo -e "${GREEN}✅ [$name] 拉取完成${RESET}"
-        send_tg "$name 拉取完成 ✅"
-    fi
-
-    return 0
 }
 
-
-batch_run() {
-    read -p "批量任务编号(多个逗号): " nums
-    if [[ "$nums" == "all" ]]; then
-        count=$(task_count)
-        nums=$(seq 1 $count)
-    fi
-    OLDIFS=$IFS
-    IFS=','
-
-    for n in $nums; do
-        n=$(echo "$n" | tr -d '\r\n ')
-        run_task "$1" "$n"
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
     done
-
-    IFS=$OLDIFS
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
 }
 
-#################################
-# 定时任务
-#################################
-schedule_task() {
-    echo -e "${GREEN}定时任务模板:${RESET}"
-    echo -e "${GREEN}1) 每天0点${RESET}"
-    echo -e "${GREEN}2) 每周一0点${RESET}"
-    echo -e "${GREEN}3) 每月1号0点${RESET}"
-    echo -e "${GREEN}4) 自定义cron${RESET}"
-    read -p "选择模板: " tmpl
-    case $tmpl in
-        1) cron="0 0 * * *" ;;
-        2) cron="0 0 * * 1" ;;
-        3) cron="0 0 1 * *" ;;
-        4) read -p "cron表达式: " cron ;;
-        *) echo -e "${RED}无效选择${RESET}"; return ;;
-    esac
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== Emby-In-One 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含配置)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-    read -p "任务编号(多个逗号): " nums
-    if [[ "$nums" == "all" ]]; then
-        count=$(task_count)
-        nums=$(seq 1 $count)
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+install_app() {
+    check_docker
+    mkdir -p "$APP_DIR"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+        rm -rf "$APP_DIR"
+        mkdir -p "$APP_DIR"
     fi
 
-    OLDIFS=$IFS
-    IFS=','
-    for n in $nums; do
-        n=$(echo "$n" | tr -d '\r\n ')
-        job="$cron /bin/bash $SCRIPT_PATH auto push $n >> $LOG_DIR/cron_$n.log 2>&1 # rsync_$n"
-        crontab -l 2>/dev/null | grep -v "# rsync_$n" | { cat; echo "$job"; } | crontab -
-        echo -e "${GREEN}✅ 任务编号 $n 已添加定时任务${RESET}"
-    done
-    IFS=$OLDIFS
-}
+    echo -e "${GREEN}开始下载 Emby-In-One...${RESET}"
+    git clone "$REPO_URL" "$APP_DIR" || {
+        echo -e "${RED}项目克隆失败，请检查网络或 Git 环境${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    }
 
-delete_schedule() {
-    read -p "删除任务编号(多个逗号): " nums
-    if [[ "$nums" == "all" ]]; then
-        crontab -l 2>/dev/null | grep -v "# rsync_" | crontab -
-        echo -e "${YELLOW}✅ 已删除全部定时任务${RESET}"
+    mkdir -p "$CONFIG_DIR"
+
+    read -p "请输入站点名称 [默认:Emby-In-One]: " input_name
+    SERVER_NAME=${input_name:-Emby-In-One}
+
+    read -p "请输入管理员用户名 [默认:admin]: " input_admin
+    ADMIN_USER=${input_admin:-admin}
+
+    read -p "请输入管理员密码: " ADMIN_PASS
+    if [ -z "$ADMIN_PASS" ]; then
+        echo -e "${RED}管理员密码不能为空${RESET}"
+        read -p "按回车返回菜单..."
         return
     fi
-    OLDIFS=$IFS
-    IFS=','
-    for n in $nums; do
-        n=$(echo "$n" | tr -d '\r\n ')
-        crontab -l 2>/dev/null | grep -v "# rsync_$n" | crontab -
-        echo -e "${YELLOW}✅ 已删除任务编号 $n 的定时任务${RESET}"
-    done
-    IFS=$OLDIFS
-}
 
-#################################
-# 更新 & 卸载
-#################################
-update_self() {
-    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
-    chmod +x "$SCRIPT_PATH"
-    echo -e "${GREEN}已更新${RESET}"
-}
+    cat > "$CONFIG_FILE" <<EOF
+server:
+  port: 8096
+  name: "${SERVER_NAME}"
 
-uninstall_self() {
-    crontab -l 2>/dev/null | grep -v "rsync_" | crontab - || true
-    rm -rf "$BASE_DIR"
-    echo -e "${RED}已卸载${RESET}"
-    exit
-}
+admin:
+  username: "${ADMIN_USER}"
+  password: "${ADMIN_PASS}"
 
-#################################
-# Cron 自动运行
-#################################
-if [[ "$1" == "auto" ]]; then
-    run_task "$2" "$3"
-    exit
-fi
+playback:
+  mode: "proxy"
 
-#################################
-# 首次运行安装快捷命令
-#################################
-if [ ! -f "$SCRIPT_PATH" ]; then
-    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
-    chmod +x "$SCRIPT_PATH"
-    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/s"
-    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/S"
-    echo -e "${GREEN}✅ 安装完成${RESET}"
-    echo -e "${GREEN}✅ 快捷键已添加：s 或 S 可快速启动${RESET}"
-fi
+timeouts:
+  api: 30000
+  global: 15000
+  login: 10000
+  healthCheck: 10000
+  healthInterval: 60000
 
-#################################
-# 主菜单
-#################################
-while true; do
-    clear
-    echo -e "${GREEN}===== Rsync 同步管理器(快捷指令:S/s) =====${RESET}"
-    list_tasks
+proxies: []
+upstream: []
+EOF
+
+    cd "$APP_DIR" || exit
+
+    docker compose build
+    docker compose up -d
+
+    SERVER_IP=$(get_public_ip)
+
     echo
-    echo -e "${GREEN} 1) 添加同步任务${RESET}"
-    echo -e "${GREEN} 2) 删除同步任务${RESET}"
-    echo -e "${GREEN} 3) 推送同步${RESET}"
-    echo -e "${GREEN} 4) 拉取同步${RESET}"
-    echo -e "${GREEN} 5) 批量推送同步${RESET}"
-    echo -e "${GREEN} 6) 批量拉取同步${RESET}"
-    echo -e "${GREEN} 7) 添加定时任务${RESET}"
-    echo -e "${GREEN} 8) 删除定时任务${RESET}"
-    echo -e "${GREEN} 9) Telegram设置${RESET}"
-    echo -e "${GREEN}10) 更新${RESET}"
-    echo -e "${GREEN}11) 卸载${RESET}"
-    echo -e "${GREEN} 0) 退出${RESET}"
-    read -p "$(echo -e ${GREEN}请选择操作: ${RESET}) " c
-    case $c in
-        1) add_task ;;
-        2) delete_task ;;
-        3) run_task push ;;
-        4) run_task pull ;;
-        5) batch_run push ;;
-        6) batch_run pull ;;
-        7) schedule_task ;;
-        8) delete_schedule ;;
-        9) setup_tg ;;
-        10) update_self ;;
-        11) uninstall_self ;;
-        0) exit ;;
-    esac
-    read -p "$(echo -e ${GREEN}按回车继续...${RESET}) "
-done
+    echo -e "${GREEN}✅ Emby-In-One 已启动${RESET}"
+    echo -e "${YELLOW}🌐 客户端连接地址: http://${SERVER_IP}:${PORT}${RESET}"
+    echo -e "${YELLOW}⚙️ 管理面板地址: http://${SERVER_IP}:${PORT}/admin${RESET}"
+    echo -e "${YELLOW}⚙️ 账号: ${ADMIN_USER}${RESET}"
+    echo -e "${YELLOW}⚙️ 密码: ${ADMIN_PASS}${RESET}"
+    echo -e "${GREEN}📂 配置文件位置: ${CONFIG_FILE}${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+    if [ ! -d "$APP_DIR/.git" ]; then
+        echo -e "${RED}未检测到安装目录或 Git 仓库，无法更新${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    fi
+
+    cd "$APP_DIR" || return
+    git pull
+    docker compose build
+    docker compose up -d
+
+    echo -e "${GREEN}✅ Emby-In-One 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+    cd "$APP_DIR" || return
+    docker compose restart
+    echo -e "${GREEN}✅ Emby-In-One 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    cd "$APP_DIR" || return
+    docker compose logs -f
+}
+
+check_status() {
+    cd "$APP_DIR" || return
+    docker compose ps
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    if [ ! -d "$APP_DIR" ]; then
+        echo -e "${RED}未检测到安装目录，无需卸载${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    fi
+
+    cd "$APP_DIR" || return
+    docker compose down 2>/dev/null
+    rm -rf "$APP_DIR"
+
+    echo -e "${RED}✅ Emby-In-One 已彻底卸载${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+menu

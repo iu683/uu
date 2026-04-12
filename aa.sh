@@ -1,97 +1,152 @@
 #!/bin/bash
-# ============================================
-# 1Panel 本地应用更新脚本（安全备份 + 自动重启）
-# ============================================
+# ========================================
+# IPTV TRMAS 一键管理脚本
+# ========================================
 
-# ==============================
-# 检查并安装 unzip
-# ==============================
-check_unzip() {
-    if ! command -v unzip >/dev/null 2>&1; then
-        echo "⚠️ 未检测到 unzip，正在安装..."
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-        if [ -f /etc/debian_version ]; then
-            apt update && apt install -y unzip
-        elif [ -f /etc/redhat-release ]; then
-            yum install -y unzip || dnf install -y unzip
-        elif [ -f /etc/alpine-release ]; then
-            apk add unzip
-        else
-            echo "❌ 无法识别系统，请手动安装 unzip"
-            exit 1
-        fi
+APP_NAME="iptv-trmas"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-        echo "✅ unzip 安装完成"
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
+
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
     fi
 }
 
-check_unzip
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
 
-# ==============================
-# 基本变量
-# ==============================
-LOCAL_PATH="/opt/1panel/resource/apps/local"
-ZIP_URL="https://github.com/okxlin/appstore/archive/refs/heads/localApps.zip"
-BACKUP_DIR="/opt/1panel/resource/apps/backup_$(date +%Y%m%d_%H%M%S)"
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== IPTV TRMAS 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-# ==============================
-# 检查目录
-# ==============================
-if [ ! -d "$LOCAL_PATH" ]; then
-    echo "❌ 未检测到 1Panel 本地应用目录：$LOCAL_PATH"
-    echo "请确认 1Panel 是否已安装。"
-    exit 1
-fi
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
 
-# ==============================
-# 创建备份
-# ==============================
-echo "📦 正在备份本地应用到：$BACKUP_DIR"
-mkdir -p "$BACKUP_DIR"
-cp -rf "$LOCAL_PATH"/* "$BACKUP_DIR"/
+install_app() {
 
-# ==============================
-# 下载新版本
-# ==============================
-echo "⬇️ 正在下载最新 localApps.zip ..."
+    check_docker
+    mkdir -p "$APP_DIR"
 
-if ! wget -O "$LOCAL_PATH/localApps.zip" "$ZIP_URL"; then
-    echo "❌ 下载失败，已终止更新"
-    exit 1
-fi
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
 
-# ==============================
-# 解压前校验
-# ==============================
-if [ ! -f "$LOCAL_PATH/localApps.zip" ]; then
-    echo "❌ 未找到下载文件"
-    exit 1
-fi
+    read -p "请输入访问端口 [默认:19890]: " input_port
+    PORT=${input_port:-19890}
+    check_port "$PORT" || return
 
-echo "📂 正在解压覆盖文件..."
-unzip -o -d "$LOCAL_PATH" "$LOCAL_PATH/localApps.zip"
+    read -p "请输入管理员用户名 [默认:admin]: " input_user
+    ADMIN_USER=${input_user:-admin}
 
-# ==============================
-# 覆盖 apps
-# ==============================
-cp -rf "$LOCAL_PATH/appstore-localApps/apps/"* "$LOCAL_PATH/"
+    read -p "请输入管理员密码 [默认:随机生成]: " input_pass
+    if [ -z "$input_pass" ]; then
+        ADMIN_PASS=$(openssl rand -hex 6)
+        echo -e "${YELLOW}已生成随机密码: ${ADMIN_PASS}${RESET}"
+    else
+        ADMIN_PASS=$input_pass
+    fi
 
-# ==============================
-# 清理
-# ==============================
-rm -rf "$LOCAL_PATH/appstore-localApps" "$LOCAL_PATH/localApps.zip"
+    read -p "请输入播放 Token [默认:随机生成]: " input_token
+    if [ -z "$input_token" ]; then
+        PLAY_TOKEN=$(openssl rand -hex 8)
+        echo -e "${YELLOW}已生成 Token: ${PLAY_TOKEN}${RESET}"
+    else
+        PLAY_TOKEN=$input_token
+    fi
 
-# ==============================
-# 重启 1Panel
-# ==============================
-echo "🔄 正在重启 1Panel..."
-if command -v 1pctl >/dev/null 2>&1; then
-    1pctl restart
-    echo "✅ 1Panel 已成功重启"
-else
-    echo "⚠️ 未检测到 1pctl 命令，请确认 1Panel 是否正确安装"
-    echo "你可以手动执行：1pctl restart"
-fi
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  mqitv:
+    image: instituteiptv/iptv-trmas:latest
+    container_name: trmas_rust
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORT}:19890"
+    environment:
+      ADMIN_USER: ${ADMIN_USER}
+      ADMIN_PASS: ${ADMIN_PASS}
+      PLAY_TOKEN: ${PLAY_TOKEN}
+EOF
 
-echo "✅ 本地应用更新完成！"
-echo "🗂 已备份旧版本到：$BACKUP_DIR"
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    echo
+    echo -e "${GREEN}✅ IPTV TRMAS 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}👤 用户名: ${ADMIN_USER}${RESET}"
+    echo -e "${GREEN}🔑 密码: ${ADMIN_PASS}${RESET}"
+    echo -e "${GREEN}🎫 Token: ${PLAY_TOKEN}${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ IPTV TRMAS 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+    docker restart trmas_rust
+    echo -e "${GREEN}✅ IPTV TRMAS 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    docker logs -f trmas_rust
+}
+
+check_status() {
+    docker ps | grep trmas_rust
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ IPTV TRMAS 已彻底卸载${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+menu

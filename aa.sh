@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# IPTV TRMAS 一键管理脚本
+# VFaka 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,9 +8,11 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="iptv-trmas"
+APP_NAME="vfaka"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/config.local.toml"
+TOKENPAY_CONFIG="$APP_DIR/config/tokenpay/appsettings.json"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -24,17 +26,17 @@ check_docker() {
     fi
 }
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
+check_git() {
+    if ! command -v git &>/dev/null; then
+        echo -e "${YELLOW}未检测到 git，正在安装...${RESET}"
+        apt-get update && apt-get install -y git || yum install -y git || exit 1
     fi
 }
 
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== IPTV TRMAS 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== VFaka 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -58,94 +60,158 @@ menu() {
 }
 
 install_app() {
-
     check_docker
+    check_git
     mkdir -p "$APP_DIR"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
         read confirm
         [[ "$confirm" != "y" ]] && return
+        rm -rf "$APP_DIR"
+        mkdir -p "$APP_DIR"
     fi
 
-    read -p "请输入访问端口 [默认:19890]: " input_port
-    PORT=${input_port:-19890}
-    check_port "$PORT" || return
+    echo -e "${GREEN}开始下载 VFaka...${RESET}"
+    git clone --recursive https://github.com/Viloze/VFaka.git "$APP_DIR" || {
+        echo -e "${RED}git clone 失败，请检查网络或依赖${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    }
 
-    read -p "请输入管理员用户名 [默认:admin]: " input_user
-    ADMIN_USER=${input_user:-admin}
+    cp "$APP_DIR/config.toml" "$CONFIG_FILE"
 
-    read -p "请输入管理员密码 [默认:随机生成]: " input_pass
-    if [ -z "$input_pass" ]; then
-        ADMIN_PASS=$(openssl rand -hex 6)
-        echo -e "${YELLOW}已生成随机密码: ${ADMIN_PASS}${RESET}"
-    else
-        ADMIN_PASS=$input_pass
+    read -p "配置监听 host [默认:127.0.0.1]: " input_host
+    HOST=${input_host:-127.0.0.1}
+
+    read -p "设置 admin 用户名 [默认:admin]: " input_admin_user
+    ADMIN_USER=${input_admin_user:-admin}
+
+    read -p "设置 admin 密码: " ADMIN_PASS
+    if [ -z "$ADMIN_PASS" ]; then
+        echo -e "${RED}管理员密码不能为空${RESET}"
+        read -p "按回车返回菜单..."
+        return
     fi
 
-    read -p "请输入播放 Token [默认:随机生成]: " input_token
-    if [ -z "$input_token" ]; then
-        PLAY_TOKEN=$(openssl rand -hex 8)
-        echo -e "${YELLOW}已生成 Token: ${PLAY_TOKEN}${RESET}"
-    else
-        PLAY_TOKEN=$input_token
+    read -p "设置 JWT secret (可留空自动生成随机密钥): " INPUT_JWT_SECRET
+    JWT_SECRET=${INPUT_JWT_SECRET:-$(openssl rand -hex 32)}
+
+
+    read -p "是否配置 public_base_url (用于生产环境) [留空则不设置]: " PUBLIC_BASE_URL
+    if [ -n "$PUBLIC_BASE_URL" ]; then
+        read -p "是否配置 allowed_origins (逗号分隔) [留空使用默认]: " ALLOWED_ORIGINS
     fi
 
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  mqitv:
-    image: instituteiptv/iptv-trmas:latest
-    container_name: trmas_rust
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${PORT}:19890"
-    environment:
-      ADMIN_USER: ${ADMIN_USER}
-      ADMIN_PASS: ${ADMIN_PASS}
-      PLAY_TOKEN: ${PLAY_TOKEN}
+    cat > "$CONFIG_FILE" <<EOF
+[server]
+host = "${HOST}"
+port = 8080
 EOF
+
+    if [ -n "$PUBLIC_BASE_URL" ]; then
+        echo "public_base_url = \"${PUBLIC_BASE_URL}\"" >> "$CONFIG_FILE"
+        if [ -n "$ALLOWED_ORIGINS" ]; then
+            echo "allowed_origins = [$(echo "$ALLOWED_ORIGINS" | sed 's/, */", "/g' | sed 's/^/"/; s/$/"/')]" >> "$CONFIG_FILE"
+        fi
+    fi
+
+    cat >> "$CONFIG_FILE" <<EOF
+
+[database]
+url = "sqlite:./aff_shop.db?mode=rwc"
+
+[jwt]
+secret = "${JWT_SECRET}"
+expiration_hours = 24
+
+[admin]
+username = "${ADMIN_USER}"
+password = "${ADMIN_PASS}"
+EOF
+
+    read -p "是否配置 TokenPay (y/n) [默认:n]: " enable_tokenpay
+    if [[ "$enable_tokenpay" == "y" || "$enable_tokenpay" == "Y" ]]; then
+        cp "$APP_DIR/config/tokenpay/appsettings.json.example" "$TOKENPAY_CONFIG"
+
+        read -p "请输入 TRONGRID API KEY: " TRON_API_KEY
+        read -p "请输入 BaseCurrency [默认:CNY]: " input_base_currency
+        BASE_CURRENCY=${input_base_currency:-CNY}
+
+        read -p "是否启用动态地址 UseDynamicAddress? [true/false，默认:false]: " input_dynamic
+        USE_DYNAMIC=${input_dynamic:-false}
+
+        read -p "请输入 TRON 收款地址（多个逗号隔开）: " TRON_ADDRESSES
+        read -p "设置 ApiToken (用于 TokenPay 回调鉴权): " API_TOKEN
+        read -p "设置 TokenPay WebSiteUrl [默认:http://localhost:5000]: " input_website
+        WEB_SITE_URL=${input_website:-http://localhost:5000}
+
+        jq ".\"TRON-PRO-API-KEY\" = \"${TRON_API_KEY}\" |
+            .BaseCurrency = \"${BASE_CURRENCY}\" |
+            .UseDynamicAddress = ${USE_DYNAMIC,,} |
+            .Address.TRON = [$(echo "$TRON_ADDRESSES" | sed 's/, */","/g' | sed 's/^/"/; s/$/"/')] |
+            .ApiToken = \"${API_TOKEN}\" |
+            .WebSiteUrl = \"${WEB_SITE_URL}\"" "$TOKENPAY_CONFIG" > "$TOKENPAY_CONFIG.tmp" && mv "$TOKENPAY_CONFIG.tmp" "$TOKENPAY_CONFIG"
+    fi
+
+    mkdir -p "$APP_DIR/data/uploads"
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ IPTV TRMAS 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}👤 用户名: ${ADMIN_USER}${RESET}"
-    echo -e "${GREEN}🔑 密码: ${ADMIN_PASS}${RESET}"
-    echo -e "${GREEN}🎫 Token: ${PLAY_TOKEN}${RESET}"
+    echo -e "${GREEN}✅ VFaka 已启动${RESET}"
+    echo -e "${YELLOW}🌐 前台商城: http://127.0.0.1:8080${RESET}"
+    echo -e "${YELLOW}🌐 管理后台: http://127.0.0.1:8080/admin${RESET}"
+    echo -e "${YELLOW}🌐 管理后台: 默认管理员:admin/首次启动时控制台输出的随机密码 (请及时保存)${RESET}"
+    [ -n "$PUBLIC_BASE_URL" ] && echo -e "${YELLOW}🔗 Public URL: ${PUBLIC_BASE_URL}${RESET}"
+    echo -e "${GREEN}📂 配置文件: ${CONFIG_FILE}${RESET}"
 
     read -p "按回车返回菜单..."
 }
 
 update_app() {
+    if [ ! -d "$APP_DIR/.git" ]; then
+        echo -e "${RED}未检测到安装目录或 git 仓库，无法更新${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    fi
     cd "$APP_DIR" || return
+    git pull --recurse-submodules
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ IPTV TRMAS 更新完成${RESET}"
+    echo -e "${GREEN}✅ VFaka 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart trmas_rust
-    echo -e "${GREEN}✅ IPTV TRMAS 已重启${RESET}"
+    cd "$APP_DIR" || return
+    docker compose restart
+    echo -e "${GREEN}✅ VFaka 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f trmas_rust
+    cd "$APP_DIR" || return
+    docker compose logs -f
 }
 
 check_status() {
-    docker ps | grep trmas_rust
+    cd "$APP_DIR" || return
+    docker compose ps
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
+    if [ ! -d "$APP_DIR" ]; then
+        echo -e "${RED}未检测到安装目录，无需卸载${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    fi
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ IPTV TRMAS 已彻底卸载${RESET}"
+    echo -e "${RED}✅ VFaka 已彻底卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

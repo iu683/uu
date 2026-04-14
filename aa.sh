@@ -362,6 +362,9 @@ def project_keyboard(project_name: str) -> dict:
                 {"text": "🗑 删除容器", "callback_data": f"confirm:delete_container:{project_name}"},
             ],
             [
+                {"text": "☠️ 删除容器+文件数据", "callback_data": f"confirm:delete_all:{project_name}"},
+            ],
+            [
                 {"text": "⬅️ 项目列表", "callback_data": "menu:list"},
                 {"text": "🏠 首页", "callback_data": "menu:home"},
             ],
@@ -372,7 +375,7 @@ def project_keyboard(project_name: str) -> dict:
 def confirm_keyboard(project_name: str, action: str) -> dict:
     return {
         "inline_keyboard": [
-            [{"text": "✅ 确认删除容器", "callback_data": f"action:{action}:{project_name}"}],
+            [{"text": "✅ 确认执行", "callback_data": f"action:{action}:{project_name}"}],
             [{"text": "❌ 取消", "callback_data": f"project:{project_name}"}],
         ]
     }
@@ -385,6 +388,13 @@ def confirm_text(project_name: str, action: str) -> str:
             f"项目：{project_name}\n"
             f"动作：删除容器\n\n"
             f"这会执行 docker compose down -v。"
+        )
+    if action == "delete_all":
+        return (
+            f"危险操作确认\n\n"
+            f"项目：{project_name}\n"
+            f"动作：删除容器 + 文件数据\n\n"
+            f"这会先执行 docker compose down -v，然后删除整个项目目录。"
         )
     return "未知确认操作"
 
@@ -490,7 +500,7 @@ def docker_restart_text() -> str:
     if code != 0:
         return f"重启 Docker 失败（exit={code}）\n{out}"
     status_code, status_out = run_shell(["systemctl", "is-active", "docker"], timeout=30)
-    status = status_out.strip() if status_code == 0 else f"未知（exit={status_code}）"
+    status = localize_docker_text(status_out.strip()) if status_code == 0 else f"未知（exit={status_code}）"
     return f"Docker 已重启\n当前状态：{status}"
 
 
@@ -512,12 +522,12 @@ def home_text() -> str:
     all_code, all_out = run_shell(["sh", "-lc", "docker ps -aq | wc -l"], timeout=30)
     projects = discover_projects()
 
-    docker_line = docker_status.strip() if docker_code == 0 else "未知"
+    docker_line = localize_docker_text(docker_status.strip()) if docker_code == 0 else "未知"
     running_line = running_out.strip() if running_code == 0 else "获取失败"
     all_line = all_out.strip() if all_code == 0 else "获取失败"
 
     return (
-        "Docker 运行面板\n\n"
+        "Docker 运行面板\n"
         f"Docker 状态：{docker_line}\n"
         f"运行中的容器：{running_line}\n"
         f"全部容器：{all_line}\n"
@@ -586,6 +596,11 @@ def handle_text_command(chat_id: str, text: str) -> None:
     if cmd == "/delete":
         code, out = run_compose(project, ["down", "-v"])
         send_message(chat_id, f"[{project.name}] 删除容器完成（退出码={code}）\n{localize_docker_text(out)}", project_keyboard(project.name))
+        return
+    if cmd == "/deleteall":
+        code1, out1 = run_compose(project, ["down", "-v"])
+        code2, out2 = run_shell(["rm", "-rf", str(project.directory)])
+        send_message(chat_id, f"[{project.name}] 删除容器+文件数据完成（down={code1}, rm={code2}）\n[删除容器]\n{localize_docker_text(out1)}\n\n[删除文件数据]\n{localize_docker_text(out2)}", project_keyboard(project.name))
         return
     if cmd == "/restart":
         code, out = run_compose(project, ["restart"])
@@ -718,6 +733,10 @@ def handle_callback(callback: dict) -> None:
         elif action == "delete_container":
             code, out = run_compose(project, ["down", "-v"])
             text = f"[{project.name}] 删除容器完成（退出码={code}）\n{localize_docker_text(out)}"
+        elif action == "delete_all":
+            code1, out1 = run_compose(project, ["down", "-v"])
+            code2, out2 = run_shell(["rm", "-rf", str(project.directory)])
+            text = f"[{project.name}] 删除容器+文件数据完成（down={code1}, rm={code2}）\n[删除容器]\n{localize_docker_text(out1)}\n\n[删除文件数据]\n{localize_docker_text(out2)}"
         elif action == "restart":
             code, out = run_compose(project, ["restart"])
             text = f"[{project.name}] 重启完成（退出码={code}）\n{localize_docker_text(out)}"
@@ -871,7 +890,7 @@ EOF
 
 show_menu() {
   echo
-  echo '====== Telegram Docker 管理器 ======'
+  echo '===== Telegram Docker 管理器 ====='
   echo '1. 安装'
   echo '2. 卸载'
   echo '3. 查看状态'

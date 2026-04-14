@@ -1,219 +1,239 @@
-#!/bin/bash
-# ========================================
-# VFaka 一键管理脚本
-# ========================================
+#!/bin/sh
 
-GREEN="\033[32m"
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
 YELLOW="\033[33m"
-RED="\033[31m"
-RESET="\033[0m"
+NC='\033[0m'
 
-APP_NAME="vfaka"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.local.toml"
-TOKENPAY_CONFIG="$APP_DIR/config/tokenpay/appsettings.json"
+CONF_PATH="/etc/xray/config.json"
+XRAY_BIN="/usr/local/bin/xray"
+LOG_PATH="/var/log/xray.log"
+NODE_FILE="/etc/xray/node.txt"
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
+# 检查 root
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}请以 root 身份运行此脚本${NC}"
+    exit 1
+fi
 
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+# 获取架构
+ARCH=$(uname -m)
+case ${ARCH} in
+    x86_64)  X_ARCH="64" ;;
+    aarch64) X_ARCH="arm64-v8a" ;;
+    *) echo -e "${RED}不支持的架构: ${ARCH}${NC}"; exit 1 ;;
+esac
+
+# 清理函数
+do_cleanup() {
+    echo -e "${BLUE}正在清理旧环境...${NC}"
+    [ -f /etc/init.d/xray ] && rc-service xray stop 2>/dev/null
+    [ -f /etc/init.d/xray ] && rc-update del xray default 2>/dev/null
+    rm -rf /etc/xray /usr/local/share/xray ${XRAY_BIN} ${LOG_PATH} /etc/init.d/xray
+}
+
+# 下载 Xray
+download_xray() {
+    echo -e "${BLUE}安装依赖...${NC}"
+    apk update >/dev/null 2>&1
+    apk add curl unzip openssl ca-certificates tar gcompat libc6-compat >/dev/null 2>&1
+
+    echo -e "${BLUE}获取最新版本...${NC}"
+    NEW_VER=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep '"tag_name":' | head -n 1 | cut -d'"' -f4)
+    [ -z "$NEW_VER" ] && NEW_VER="v24.12.31"
+
+    echo -e "${GREEN}下载版本: ${NEW_VER}${NC}"
+    curl -fL -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${NEW_VER}/Xray-linux-${X_ARCH}.zip" || {
+        echo -e "${RED}Xray 下载失败${NC}"
         exit 1
-    fi
-}
-
-check_git() {
-    if ! command -v git &>/dev/null; then
-        echo -e "${YELLOW}未检测到 git，正在安装...${RESET}"
-        apt-get update && apt-get install -y git || yum install -y git || exit 1
-    fi
-}
-
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== VFaka 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
-install_app() {
-    check_docker
-    check_git
-    mkdir -p "$APP_DIR"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-        rm -rf "$APP_DIR"
-        mkdir -p "$APP_DIR"
-    fi
-
-    echo -e "${GREEN}开始下载 VFaka...${RESET}"
-    git clone --recursive https://github.com/Viloze/VFaka.git "$APP_DIR" || {
-        echo -e "${RED}git clone 失败，请检查网络或依赖${RESET}"
-        read -p "按回车返回菜单..."
-        return
     }
 
-    cp "$APP_DIR/config.toml" "$CONFIG_FILE"
+    mkdir -p /etc/xray /usr/local/share/xray /tmp/xray_tmp
+    unzip -o /tmp/xray.zip -d /tmp/xray_tmp >/dev/null 2>&1 || {
+        echo -e "${RED}解压失败${NC}"
+        exit 1
+    }
 
-    read -p "配置监听 host [默认:127.0.0.1]: " input_host
-    HOST=${input_host:-127.0.0.1}
+    mv -f /tmp/xray_tmp/xray ${XRAY_BIN}
+    mv -f /tmp/xray_tmp/*.dat /usr/local/share/xray/ 2>/dev/null
+    chmod +x ${XRAY_BIN}
+    rm -rf /tmp/xray.zip /tmp/xray_tmp
+}
 
-    read -p "配置端口 [默认:8080]: " input_port
-    PORT=${input_port:-8080}
-
-    read -p "设置 admin 用户名 [默认:admin]: " input_admin_user
-    ADMIN_USER=${input_admin_user:-admin}
-
-    read -p "设置 admin 密码: " ADMIN_PASS
-    if [ -z "$ADMIN_PASS" ]; then
-        echo -e "${RED}管理员密码不能为空${RESET}"
-        read -p "按回车返回菜单..."
-        return
+# 更新
+do_update() {
+    if [ ! -f "${XRAY_BIN}" ]; then
+        echo -e "${RED}未安装 Xray${NC}"
+        exit 1
     fi
+    echo -e "${BLUE}保留配置更新二进制文件...${NC}"
+    rc-service xray stop 2>/dev/null
+    download_xray
+    rc-service xray start 2>/dev/null
+    echo -e "${GREEN}更新成功！${NC}"
+    exit 0
+}
 
-    read -p "设置 JWT secret (可留空自动生成随机密钥): " INPUT_JWT_SECRET
-    JWT_SECRET=${INPUT_JWT_SECRET:-$(openssl rand -hex 32)}
+# 参数处理
+if [ "$1" = "uninstall" ]; then
+    do_cleanup
+    echo -e "${GREEN}卸载完成${NC}"
+    exit 0
+fi
 
+if [ "$1" = "update" ]; then
+    do_update
+fi
 
-    read -p "是否配置 public_base_url (用于生产环境) [留空则不设置]: " PUBLIC_BASE_URL
-    if [ -n "$PUBLIC_BASE_URL" ]; then
-        read -p "是否配置 allowed_origins (逗号分隔) [留空使用默认]: " ALLOWED_ORIGINS
-    fi
+# 默认安装流程
+do_cleanup
+download_xray
 
-    cat > "$CONFIG_FILE" <<EOF
-[server]
-host = "${HOST}"
-port = ${PORT}
+# 用户输入
+echo ""
+read -p "请输入 Shadowsocks 端口 (默认随机 20000-65535): " PORT
+if [ -z "$PORT" ]; then
+    PORT=$((RANDOM%45535+20000))
+    echo "使用随机端口: $PORT"
+fi
+
+case "$PORT" in
+    ''|*[!0-9]*)
+        echo -e "${RED}端口必须为数字${NC}"
+        exit 1
+        ;;
+esac
+
+if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+    echo -e "${RED}端口范围必须在 1-65535${NC}"
+    exit 1
+fi
+
+read -p "请输入加密方式 [默认: 2022-blake3-aes-256-gcm]: " METHOD
+[ -z "$METHOD" ] && METHOD="2022-blake3-aes-256-gcm"
+
+case "$METHOD" in
+    aes-128-gcm|aes-256-gcm|chacha20-poly1305|2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305)
+        ;;
+    *)
+        echo -e "${RED}不支持的加密方式: ${METHOD}${NC}"
+        exit 1
+        ;;
+esac
+
+PASSWORD=$(openssl rand -base64 16 | tr -d '\n')
+
+echo ""
+echo -e "${GREEN}端口: ${PORT}${NC}"
+echo -e "${GREEN}加密方式: ${METHOD}${NC}"
+echo -e "${GREEN}密码: ${PASSWORD}${NC}"
+echo ""
+
+# 写配置
+cat <<EOF > ${CONF_PATH}
+{
+  "log": {
+    "access": "${LOG_PATH}",
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": ${PORT},
+      "protocol": "shadowsocks",
+      "settings": {
+        "method": "${METHOD}",
+        "password": "${PASSWORD}",
+        "network": "tcp,udp"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    }
+  ]
+}
 EOF
 
-    if [ -n "$PUBLIC_BASE_URL" ]; then
-        echo "public_base_url = \"${PUBLIC_BASE_URL}\"" >> "$CONFIG_FILE"
-        if [ -n "$ALLOWED_ORIGINS" ]; then
-            echo "allowed_origins = [$(echo "$ALLOWED_ORIGINS" | sed 's/, */", "/g' | sed 's/^/"/; s/$/"/')]" >> "$CONFIG_FILE"
-        fi
-    fi
+# 服务配置
+cat << 'SERVICE' > /etc/init.d/xray
+#!/sbin/openrc-run
+description="Xray Shadowsocks"
+command="/usr/local/bin/xray"
+command_args="run -c /etc/xray/config.json"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+depend() { need net; after firewall; }
+SERVICE
 
-    cat >> "$CONFIG_FILE" <<EOF
+chmod +x /etc/init.d/xray
+rc-update add xray default >/dev/null 2>&1
+rc-service xray restart
 
-[database]
-url = "sqlite:./aff_shop.db?mode=rwc"
+sleep 2
 
-[jwt]
-secret = "${JWT_SECRET}"
-expiration_hours = 24
+PID=$(pidof xray)
+IP4=$(curl -s4 ifconfig.me)
+IP6=$(curl -s6 ifconfig.me)
+HOSTNAME=$(hostname -s | sed 's/ /_/g')
 
-[admin]
-username = "${ADMIN_USER}"
-password = "${ADMIN_PASS}"
+# 生成 ss:// 链接
+SS_BASE64=$(printf '%s' "${METHOD}:${PASSWORD}" | openssl base64 -A)
+SS_LINK4=""
+SS_LINK6=""
+
+[ -n "$IP4" ] && SS_LINK4="ss://${SS_BASE64}@${IP4}:${PORT}#${HOSTNAME}"
+[ -n "$IP6" ] && SS_LINK6="ss://${SS_BASE64}@[${IP6}]:${PORT}#${HOSTNAME}"
+
+echo ""
+echo -e "${GREEN}================ 安装完成 ===================${NC}"
+[ -n "$PID" ] && echo -e "运行状态: ${GREEN}运行中 (PID: $PID)${NC}" || echo -e "运行状态: ${RED}启动失败${NC}"
+echo -e "配置文件: ${BLUE}${CONF_PATH}${NC}"
+echo "------------------------------------------------"
+
+if [ -n "$IP4" ]; then
+    echo -e "${BLUE}[IPv4 节点信息]${NC}"
+    echo -e "${GREEN}服务器:${NC} ${IP4}"
+    echo -e "${GREEN}端口:${NC} ${PORT}"
+    echo -e "${GREEN}密码:${NC} ${PASSWORD}"
+    echo -e "${GREEN}加密:${NC} ${METHOD}"
+    echo -e "${YELLOW}${SS_LINK4}${NC}"
+    echo ""
+fi
+
+if [ -n "$IP6" ]; then
+    echo -e "${BLUE}[IPv6 节点信息]${NC}"
+    echo -e "${GREEN}服务器:${NC} ${IP6}"
+    echo -e "${GREEN}端口:${NC} ${PORT}"
+    echo -e "${GREEN}密码:${NC} ${PASSWORD}"
+    echo -e "${GREEN}加密:${NC} ${METHOD}"
+    echo -e "${YELLOW}${SS_LINK6}${NC}"
+    echo ""
+fi
+
+echo "------------------------------------------------"
+
+cat > ${NODE_FILE} <<EOF
+================ Shadowsocks 节点信息 ================
+
+服务器: $(hostname)
+端口: ${PORT}
+加密方式: ${METHOD}
+密码: ${PASSWORD}
+
+---------------- IPv4 ----------------
+服务器: ${IP4}
+ss://${SS_BASE64}@${IP4}:${PORT}#${HOSTNAME}
+
+---------------- IPv6 ----------------
+服务器: ${IP6}
+ss://${SS_BASE64}@[${IP6}]:${PORT}#${HOSTNAME}
+
+=====================================================
 EOF
 
-    read -p "是否配置 TokenPay (y/n) [默认:n]: " enable_tokenpay
-    if [[ "$enable_tokenpay" == "y" || "$enable_tokenpay" == "Y" ]]; then
-        cp "$APP_DIR/config/tokenpay/appsettings.json.example" "$TOKENPAY_CONFIG"
-
-        read -p "请输入 TRONGRID API KEY: " TRON_API_KEY
-        read -p "请输入 BaseCurrency [默认:CNY]: " input_base_currency
-        BASE_CURRENCY=${input_base_currency:-CNY}
-
-        read -p "是否启用动态地址 UseDynamicAddress? [true/false，默认:false]: " input_dynamic
-        USE_DYNAMIC=${input_dynamic:-false}
-
-        read -p "请输入 TRON 收款地址（多个逗号隔开）: " TRON_ADDRESSES
-        read -p "设置 ApiToken (用于 TokenPay 回调鉴权): " API_TOKEN
-        read -p "设置 TokenPay WebSiteUrl [默认:http://localhost:5000]: " input_website
-        WEB_SITE_URL=${input_website:-http://localhost:5000}
-
-        jq ".\"TRON-PRO-API-KEY\" = \"${TRON_API_KEY}\" |
-            .BaseCurrency = \"${BASE_CURRENCY}\" |
-            .UseDynamicAddress = ${USE_DYNAMIC,,} |
-            .Address.TRON = [$(echo "$TRON_ADDRESSES" | sed 's/, */","/g' | sed 's/^/"/; s/$/"/')] |
-            .ApiToken = \"${API_TOKEN}\" |
-            .WebSiteUrl = \"${WEB_SITE_URL}\"" "$TOKENPAY_CONFIG" > "$TOKENPAY_CONFIG.tmp" && mv "$TOKENPAY_CONFIG.tmp" "$TOKENPAY_CONFIG"
-    fi
-
-    mkdir -p "$APP_DIR/data/uploads"
-
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    echo
-    echo -e "${GREEN}✅ VFaka 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    [ -n "$PUBLIC_BASE_URL" ] && echo -e "${YELLOW}🔗 Public URL: ${PUBLIC_BASE_URL}${RESET}"
-    echo -e "${GREEN}📂 配置文件: ${CONFIG_FILE}${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-update_app() {
-    if [ ! -d "$APP_DIR/.git" ]; then
-        echo -e "${RED}未检测到安装目录或 git 仓库，无法更新${RESET}"
-        read -p "按回车返回菜单..."
-        return
-    fi
-    cd "$APP_DIR" || return
-    git pull --recurse-submodules
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ VFaka 更新完成${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-restart_app() {
-    cd "$APP_DIR" || return
-    docker compose restart
-    echo -e "${GREEN}✅ VFaka 已重启${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-    cd "$APP_DIR" || return
-    docker compose logs -f
-}
-
-check_status() {
-    cd "$APP_DIR" || return
-    docker compose ps
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-    if [ ! -d "$APP_DIR" ]; then
-        echo -e "${RED}未检测到安装目录，无需卸载${RESET}"
-        read -p "按回车返回菜单..."
-        return
-    fi
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ VFaka 已彻底卸载${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-menu
+echo -e "${GREEN}节点信息已保存: ${NODE_FILE}${NC}"

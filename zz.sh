@@ -1,312 +1,289 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
+APP_NAME='docker-fleet-node'
+INSTALL_DIR='/opt/docker-fleet-node'
+APP_FILE="$INSTALL_DIR/docker_fleet_node.py"
+ENV_FILE='/etc/docker-fleet-node.env'
+SERVICE_FILE='/etc/systemd/system/docker-fleet-node.service'
+GREEN='\033[32m'; RED='\033[31m'; YELLOW='\033[33m'; RESET='\033[0m'
+info() { echo -e "${GREEN}[信息] $*${RESET}"; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}"; }
+err() { echo -e "${RED}[错误] $*${RESET}" >&2; }
+require_root() { [[ "$(id -u)" -eq 0 ]] || { err '请用 root 运行'; exit 1; }; }
+require_debian_ubuntu() { [[ -f /etc/os-release ]] || { err '无法识别系统，只支持 Debian/Ubuntu'; exit 1; }; . /etc/os-release; case "${ID:-}" in debian|ubuntu) ;; *) [[ "${ID_LIKE:-}" == *debian* ]] || { err "只支持 Debian/Ubuntu，当前: ${PRETTY_NAME:-unknown}"; exit 1; } ;; esac; }
+install_deps() { info '安装依赖...'; apt-get update; apt-get install -y python3 curl ca-certificates; if ! command -v docker >/dev/null 2>&1; then warn '未检测到 docker。脚本不会自动安装 Docker，请先自行安装 Docker 和 docker compose 插件。'; fi; }
+write_app() { mkdir -p "$INSTALL_DIR"; cat > "$APP_FILE" <<'PYEOF'
+#!/usr/bin/env python3
+import json, os, sys, time, socket, urllib.request, urllib.parse, subprocess
+from pathlib import Path
 
-GREEN='\033[32m'
-RED='\033[31m'
-YELLOW='\033[33m'
-RESET='\033[0m'
-
-SNELL_DIR="/etc/snell"
-SNELL_CONFIG="$SNELL_DIR/snell-server.conf"
-SNELL_SERVICE="/etc/init.d/snell"
-SNELL_USER="snell"
-VERSION="v5.0.1"
-LOG_FILE="/var/log/snell-manager.log"
-
-info() { printf "${GREEN}[信息] %s${RESET}\n" "$1"; }
-warn() { printf "${YELLOW}[警告] %s${RESET}\n" "$1"; }
-err() { printf "${RED}[错误] %s${RESET}\n" "$1"; }
-
-require_root() {
-  if [ "$(id -u)" -ne 0 ]; then
-    err "请用 root 运行此脚本"
-    exit 1
-  fi
+MASTER_URL=os.environ.get('MASTER_URL','').rstrip('/')
+PAIR_CODE=os.environ.get('PAIR_CODE','')
+NODE_NAME=os.environ.get('NODE_NAME',socket.gethostname())
+PROJECTS_DIR=Path(os.environ.get('PROJECTS_DIR','/opt'))
+STATE_DIR=Path(os.environ.get('STATE_DIR','/opt/docker-fleet-node'))
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+STATE_FILE=STATE_DIR/'state.json'
+LOG_LINES=int(os.environ.get('TG_LOG_LINES','80'))
+COMPOSE_FILES=['docker-compose.yml','docker-compose.yaml','compose.yml','compose.yaml']
+CUSTOM_PROJECT_PATHS={
+    'Moviepilot':'/opt/1panel/apps/local/moviepilot/moviepilot',
+    'Jellyfin':'/opt/1panel/apps/jellyfin/jellyfin',
+    'emby-amilys':'/opt/1panel/apps/local/emby-amilys/emby-amilys',
+    'Vertex':'/opt/1panel/apps/local/vertex/localvertex',
+    'Autobangumi':'/opt/1panel/apps/local/autobangumi/autobangumi',
 }
 
-require_alpine() {
-  if [ ! -f /etc/alpine-release ]; then
-    err "这是 Alpine 专用脚本，当前系统不是 Alpine"
-    exit 1
-  fi
-}
+def req(method,url,obj=None):
+    data=None
+    if obj is not None:
+        data=json.dumps(obj).encode(); headers={'Content-Type':'application/json'}
+    else:
+        headers={}
+    r=urllib.request.Request(url,data=data,headers=headers,method=method)
+    with urllib.request.urlopen(r,timeout=90) as resp: return json.loads(resp.read().decode())
 
-install_deps() {
-  info "安装依赖..."
-  apk update
-  apk add bash wget unzip iproute2 coreutils grep sed gawk gcompat libc6-compat
-}
+def load_state():
+    if not STATE_FILE.exists(): return {}
+    try: return json.loads(STATE_FILE.read_text())
+    except Exception: return {}
 
-create_user_if_needed() {
-  if ! id -u "$SNELL_USER" >/dev/null 2>&1; then
-    addgroup -S "$SNELL_USER" >/dev/null 2>&1 || true
-    adduser -S -D -H -s /sbin/nologin -G "$SNELL_USER" "$SNELL_USER"
-  fi
-}
+def save_state(s): STATE_FILE.write_text(json.dumps(s,ensure_ascii=False,indent=2))
 
-get_arch() {
-  case "$(uname -m)" in
-    x86_64|amd64) echo "amd64" ;;
-    i386|i686) echo "i386" ;;
-    aarch64|arm64) echo "aarch64" ;;
-    armv7l|armv7) echo "armv7l" ;;
-    *) err "不支持的架构: $(uname -m)"; exit 1 ;;
-  esac
-}
+def ensure_registered():
+    st=load_state()
+    if st.get('node_id') and st.get('node_token'): return st
+    if not MASTER_URL or not PAIR_CODE:
+        print('缺少 MASTER_URL 或 PAIR_CODE',file=sys.stderr); sys.exit(1)
+    res=req('POST',MASTER_URL+'/api/register',{'pair_code':PAIR_CODE,'name':NODE_NAME})
+    st={'master_url':MASTER_URL,'node_id':res['node_id'],'node_token':res['node_token'],'name':NODE_NAME}
+    save_state(st)
+    return st
 
-get_download_url() {
-  arch="$(get_arch)"
-  echo "https://dl.nssurge.com/snell/snell-server-${VERSION}-linux-${arch}.zip"
-}
+def shell(cmd,cwd=None,timeout=300):
+    try:
+        p=subprocess.run(cmd,cwd=str(cwd) if cwd else None,text=True,capture_output=True,timeout=timeout)
+        out=((p.stdout or '')+('\n'+p.stderr if p.stderr else '')).strip() or '(无输出)'
+        return p.returncode,out
+    except subprocess.TimeoutExpired: return 124,f'命令超时（{timeout}秒）'
+    except Exception as e: return 1,f'执行失败: {e}'
 
-random_key() {
-  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16
-}
+def loc(s):
+    for a,b in {'NAMES':'名称','NAME':'名称','IMAGES':'镜像','IMAGE':'镜像','SERVICES':'服务','SERVICE':'服务','COMMAND':'命令','CREATED':'创建时间','STATUS':'状态','PORTS':'端口','Up ':'运行中 ','Exited':'已退出','Running':'运行中','Restarting':'重启中'}.items(): s=s.replace(a,b)
+    return s
 
-validate_port() {
-  case "$1" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  [ "$1" -ge 1025 ] && [ "$1" -le 65535 ]
-}
+def find_compose_file(directory: Path):
+    for f in COMPOSE_FILES:
+        candidate=directory/f
+        if candidate.exists(): return candidate
+    return None
 
-port_in_use() {
-  ss -tln 2>/dev/null | grep -q ":$1 "
-}
+def discover_projects():
+    res=[]
+    if PROJECTS_DIR.exists():
+        for d in sorted(PROJECTS_DIR.iterdir()):
+            if not d.is_dir(): continue
+            compose=find_compose_file(d)
+            if compose: res.append({'name':d.name,'dir':str(d),'compose':str(compose)})
+    for name,raw in CUSTOM_PROJECT_PATHS.items():
+        d=Path(raw)
+        if not d.exists(): continue
+        compose=find_compose_file(d)
+        if compose: res.append({'name':name,'dir':str(d),'compose':str(compose)})
+    return res
 
-get_public_ip() {
-  for url in https://api.ipify.org https://ip.sb https://checkip.amazonaws.com; do
-    ip="$(wget -qO- --timeout=5 "$url" 2>/dev/null || true)"
-    if [ -n "$ip" ]; then
-      echo "$ip"
-      return 0
-    fi
-  done
-  return 1
-}
+def project(name):
+    for p in discover_projects():
+        if p['name']==name: return p
+    return None
 
-get_system_dns() {
-  grep '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | paste -sd ',' -
-}
+def format_ports(raw_ports):
+    if not raw_ports:
+        return '无'
+    return str(raw_ports).replace(', ', '\n')
 
-write_config() {
-  mkdir -p "$SNELL_DIR"
+def compose_status_text(p, proj):
+    code,out=shell(['docker','compose','-f',p['compose'],'ps','--format','json'],cwd=Path(p['dir']))
+    head=f'项目：{proj}\n目录：{p["dir"]}\n'
+    if code!=0:
+        return head + loc(out)
+    try:
+        parsed=json.loads(out)
+        if isinstance(parsed,list):
+            rows=parsed
+        elif isinstance(parsed,dict):
+            rows=[parsed]
+        else:
+            rows=[]
+    except Exception:
+        rows=[]
+        for line in out.splitlines():
+            line=line.strip()
+            if not line:
+                continue
+            try:
+                item=json.loads(line)
+                if isinstance(item,dict):
+                    rows.append(item)
+            except Exception:
+                return head + loc(out)
+    if not rows:
+        return head + '当前没有容器'
+    blocks=[]
+    for row in rows:
+        name=row.get('Name') or row.get('Service') or '(未知容器)'
+        image=row.get('Image','-')
+        service=row.get('Service','-')
+        state=loc(row.get('State','-'))
+        status=loc(row.get('Status','-'))
+        created=loc(row.get('RunningFor', row.get('CreatedAt','-')))
+        publishers=row.get('Publishers') or []
+        if publishers:
+            ports='\n'.join(f"{x.get('URL','0.0.0.0')}:{x.get('PublishedPort')} -> {x.get('TargetPort')}/{x.get('Protocol','')}".rstrip('/') for x in publishers)
+        else:
+            ports=format_ports(row.get('Ports',''))
+        blocks.append(
+            f'【{name}】\n'
+            f'服务：{service}\n'
+            f'镜像：{image}\n'
+            f'状态：{state}\n'
+            f'详情：{status}\n'
+            f'运行：{created}\n'
+            f'端口：{ports}'
+        )
+    return head + '\n\n'.join(blocks)
 
-  printf '请输入端口 [1025-65535，留空随机]: '
-  read -r input_port
-  if [ -z "$input_port" ]; then
-    port="$(shuf -i 1025-65535 -n 1)"
-  else
-    if ! validate_port "$input_port"; then
-      err "端口无效"
-      return 1
-    fi
-    port="$input_port"
-  fi
+def compose_status_text(p, proj):
+    code,out=shell(['docker','compose','-f',p['compose'],'ps','--format','json'],cwd=Path(p['dir']))
+    head=f'项目：{proj}\n目录：{p["dir"]}\n'
+    if code!=0:
+        return head + loc(out)
+    try:
+        parsed=json.loads(out)
+        if isinstance(parsed,list):
+            rows=parsed
+        elif isinstance(parsed,dict):
+            rows=[parsed]
+        else:
+            rows=[]
+    except Exception:
+        rows=[]
+        for line in out.splitlines():
+            line=line.strip()
+            if not line:
+                continue
+            try:
+                item=json.loads(line)
+                if isinstance(item,dict):
+                    rows.append(item)
+            except Exception:
+                return head + loc(out)
+    if not rows:
+        return head + '当前没有容器'
+    blocks=[]
+    for row in rows:
+        name=row.get('Name') or row.get('Service') or '(未知容器)'
+        image=row.get('Image','-')
+        service=row.get('Service','-')
+        state=loc(row.get('State','-'))
+        status=loc(row.get('Status','-'))
+        created=loc(row.get('RunningFor', row.get('CreatedAt','-')))
+        publishers=row.get('Publishers') or []
+        if publishers:
+            ports='\n'.join(f"{x.get('URL','0.0.0.0')}:{x.get('PublishedPort')} -> {x.get('TargetPort')}/{x.get('Protocol','')}".rstrip('/') for x in publishers)
+        else:
+            ports=format_ports(row.get('Ports',''))
+        blocks.append(
+            f'【{name}】\n'
+            f'服务：{service}\n'
+            f'镜像：{image}\n'
+            f'状态：{state}\n'
+            f'详情：{status}\n'
+            f'运行：{created}\n'
+            f'端口：{ports}'
+        )
+    return head + '\n\n'.join(blocks)
 
-  if port_in_use "$port"; then
-    err "端口 $port 已被占用"
-    return 1
-  fi
+def run_task(task):
+    action=task.get('action'); proj=task.get('project')
+    if action=='home':
+        dc,ds=shell(['systemctl','is-active','docker'],timeout=30); rc,ro=shell(['sh','-lc','docker ps -q | wc -l'],timeout=30); ac,ao=shell(['sh','-lc','docker ps -aq | wc -l'],timeout=30)
+        z={'active':'运行中','inactive':'未运行','failed':'异常','activating':'启动中','deactivating':'停止中'}
+        return f'Docker 运行面板\n\n节点：{NODE_NAME}\nDocker 状态：{z.get(ds.strip(),ds.strip() or "未知")}\n运行中的容器：{ro.strip() if rc==0 else "获取失败"}\n全部容器：{ao.strip() if ac==0 else "获取失败"}\n项目数量：{len(discover_projects())}'
+    if action=='projects': return json.dumps(discover_projects(),ensure_ascii=False)
+    if action=='overview':
+        ic,io=shell(['sh','-lc','docker image ls -q | sort -u | wc -l']); rc,ro=shell(['sh','-lc','docker ps -q | wc -l']); ac,ao=shell(['sh','-lc','docker ps -aq | wc -l']); vc,vo=shell(['sh','-lc','docker volume ls -q | wc -l']); nc,no=shell(['sh','-lc',"docker network ls --format '{{.Name}}' | wc -l"]); pc,po=shell(['docker','ps','--format','{{.Names}} | {{.Image}} | {{.Status}} | {{.Ports}}'])
+        return f'Docker 概览\n\n节点：{NODE_NAME}\n运行中的容器：{ro.strip()}\n全部容器：{ao.strip()}\n镜像数量：{io.strip()}\n卷数量：{vo.strip()}\n网络数量：{no.strip()}\n\n运行中的容器：\n{loc(po) if pc==0 else po}'
+    if action=='running': c,o=shell(['docker','ps','--format','table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}']); return loc(o)
+    if action=='stats': c,o=shell(['docker','stats','--no-stream','--format','table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}']); return loc(o)
+    if action=='docker_restart': c,o=shell(['systemctl','restart','docker']); return 'Docker 已重启' if c==0 else f'Docker 重启失败\n{o}'
+    if action=='prune': a=shell(['docker','image','prune','-f'])[1]; b=shell(['docker','volume','prune','-f'])[1]; c=shell(['docker','network','prune','-f'])[1]; return f'清理完成\n\n[无用镜像]\n{loc(a)}\n\n[无用卷]\n{loc(b)}\n\n[无用网络]\n{loc(c)}'
+    p=project(proj or '')
+    if not p: return f'项目不存在：{proj}'
+    base=['docker','compose','-f',p['compose']]
+    if action=='status': return compose_status_text(p, proj)
+    if action=='up': c,o=shell(base+['up','-d'],cwd=Path(p['dir'])); return f'[{proj}] 启动完成（退出码={c}）\n{loc(o)}'
+    if action=='down': c,o=shell(base+['down'],cwd=Path(p['dir'])); return f'[{proj}] 停止完成（退出码={c}）\n{loc(o)}'
+    if action=='restart': c,o=shell(base+['restart'],cwd=Path(p['dir'])); return f'[{proj}] 重启完成（退出码={c}）\n{loc(o)}'
+    if action=='pull': c,o=shell(base+['pull'],cwd=Path(p['dir'])); return f'[{proj}] 拉取镜像完成（退出码={c}）\n{loc(o)}'
+    if action=='update':
+        c1,o1=shell(base+['pull'],cwd=Path(p['dir']))
+        if c1!=0: return f'[{proj}] 更新失败\n[拉取镜像]\n{loc(o1)}'
+        c2,o2=shell(base+['up','-d'],cwd=Path(p['dir']))
+        c3,o3=shell(['docker','image','prune','-f'])
+        return f'[{proj}] 更新并重启完成\n[拉取镜像]\n{loc(o1)}\n\n[启动服务]\n{loc(o2)}\n\n[清理无用镜像]\n{loc(o3)}'
+    if action=='logs': c,o=shell(base+['logs','--tail',str(LOG_LINES),'--no-color'],cwd=Path(p['dir']),timeout=120); return f'[{proj}] 日志\n{loc(o)}'
+    return '未知操作'
 
-  printf '请输入 PSK（留空随机生成）: '
-  read -r key
-  [ -n "$key" ] || key="$(random_key)"
+def main():
+    st=ensure_registered(); print('node registered:',st.get('node_id'))
+    while True:
+        try:
+            res=req('GET',f"{st['master_url']}/api/poll?node_id={urllib.parse.quote(st['node_id'])}&node_token={urllib.parse.quote(st['node_token'])}")
+            task=res.get('task')
+            if task:
+                text=run_task(task)
+                req('POST',st['master_url']+'/api/result',{'node_id':st['node_id'],'node_token':st['node_token'],'task_id':task['id'],'text':text})
+            else:
+                time.sleep(2)
+        except Exception as e:
+            print('node loop error:',e,file=sys.stderr); time.sleep(5)
 
-  echo 'OBFS: 1) tls  2) http  3) off'
-  printf '请选择 [默认 3]: '
-  read -r obfs_choice
-  case "$obfs_choice" in
-    1) obfs='tls' ;;
-    2) obfs='http' ;;
-    *) obfs='off' ;;
-  esac
+if __name__=='__main__': main()
 
-  echo 'IPv6 解析: 1) 开启  2) 关闭'
-  printf '请选择 [默认 2]: '
-  read -r ipv6_choice
-  case "${ipv6_choice:-2}" in
-    1) ipv6='true'; listen="::0:$port" ;;
-    *) ipv6='false'; listen="0.0.0.0:$port" ;;
-  esac
+PYEOF
+chmod 755 "$APP_FILE"; }
+write_service() { cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Docker Fleet Node
+After=network-online.target docker.service
+Wants=network-online.target
 
-  echo 'TCP Fast Open: 1) 开启  2) 关闭'
-  printf '请选择 [默认 1]: '
-  read -r tfo_choice
-  case "${tfo_choice:-1}" in
-    1) tfo='true' ;;
-    *) tfo='false' ;;
-  esac
+[Service]
+Type=simple
+EnvironmentFile=$ENV_FILE
+WorkingDirectory=$INSTALL_DIR
+ExecStart=/usr/bin/python3 $APP_FILE
+Restart=always
+RestartSec=3
 
-  default_dns="$(get_system_dns)"
-  [ -n "$default_dns" ] || default_dns='1.1.1.1,8.8.8.8'
-  printf '请输入 DNS [默认 %s]: ' "$default_dns"
-  read -r dns
-  dns="${dns:-$default_dns}"
-
-  cat > "$SNELL_CONFIG" <<EOF
-[snell-server]
-listen = $listen
-psk = $key
-obfs = $obfs
-ipv6 = $ipv6
-tfo = $tfo
-dns = $dns
+[Install]
+WantedBy=multi-user.target
 EOF
-
-  ip="$(get_public_ip || true)"
-  [ -n "$ip" ] || ip='YOUR_SERVER_IP'
-  host="$(hostname -s 2>/dev/null || echo snell)"
-  cat > "$SNELL_DIR/config.txt" <<EOF
-$host = snell, $ip, $port, psk=$key, version=5, tfo=$tfo, reuse=true, ecn=true
+}
+install_app() { require_root; require_debian_ubuntu; install_deps; read -rp '请输入主控地址（如 http://1.2.3.4:8765）: ' MASTER_URL; [[ -n "$MASTER_URL" ]] || { err '主控地址不能为空'; exit 1; }; read -rp '请输入对接码: ' PAIR_CODE; [[ -n "$PAIR_CODE" ]] || { err '对接码不能为空'; exit 1; }; read -rp '请输入节点名称（留空默认主机名）: ' NODE_NAME; NODE_NAME=${NODE_NAME:-$(hostname)}; write_app; cat > "$ENV_FILE" <<EOF
+MASTER_URL=$MASTER_URL
+PAIR_CODE=$PAIR_CODE
+NODE_NAME=$NODE_NAME
+PROJECTS_DIR=/opt
+STATE_DIR=/opt/docker-fleet-node/state
+TG_LOG_LINES=80
 EOF
-
-  chown -R "$SNELL_USER":"$SNELL_USER" "$SNELL_DIR" 2>/dev/null || chown -R "$SNELL_USER" "$SNELL_DIR"
-
-  info "配置已写入: $SNELL_CONFIG"
-  echo "---------------------------------"
-  cat "$SNELL_DIR/config.txt"
-  echo "---------------------------------"
-}
-
-write_openrc_service() {
-  cat > "$SNELL_SERVICE" <<EOF
-#!/sbin/openrc-run
-name="Snell Server"
-description="Snell Server"
-command="$SNELL_DIR/snell-server"
-command_args="-c $SNELL_CONFIG"
-command_user="$SNELL_USER"
-pidfile="/run/snell.pid"
-command_background="yes"
-start_stop_daemon_args="--make-pidfile --pidfile /run/snell.pid"
-output_log="/var/log/snell.log"
-error_log="/var/log/snell.err"
-
-depend() {
-  need net
-}
-EOF
-  chmod +x "$SNELL_SERVICE"
-  rc-update add snell default >/dev/null 2>&1 || true
-}
-
-test_binary() {
-  info "检查配置是否可启动..."
-  "$SNELL_DIR/snell-server" -c "$SNELL_CONFIG" >/tmp/snell-test.log 2>&1 &
-  test_pid=$!
-  sleep 1
-  if kill -0 "$test_pid" >/dev/null 2>&1; then
-    kill "$test_pid" >/dev/null 2>&1 || true
-    wait "$test_pid" 2>/dev/null || true
-    rm -f /tmp/snell-test.log
-    info "配置测试通过"
-  else
-    err "Snell 启动测试失败"
-    cat /tmp/snell-test.log || true
-    exit 1
-  fi
-}
-
-install_snell() {
-  install_deps
-  create_user_if_needed
-  mkdir -p "$SNELL_DIR"
-  cd "$SNELL_DIR"
-
-  url="$(get_download_url)"
-  info "下载: $url"
-  wget -O snell.zip "$url"
-  unzip -o snell.zip -d "$SNELL_DIR"
-  rm -f snell.zip
-  chmod +x "$SNELL_DIR/snell-server"
-
-  write_config
-  write_openrc_service
-  test_binary
-
-  rc-service snell restart >/dev/null 2>&1 || rc-service snell start
-  info "Snell 已安装并启动"
-}
-
-update_snell() {
-  [ -f "$SNELL_CONFIG" ] || { err "未找到现有配置，无法更新"; exit 1; }
-  cd "$SNELL_DIR"
-  rc-service snell stop >/dev/null 2>&1 || true
-
-  url="$(get_download_url)"
-  info "下载: $url"
-  wget -O snell.zip "$url"
-  unzip -o snell.zip -d "$SNELL_DIR"
-  rm -f snell.zip
-  chmod +x "$SNELL_DIR/snell-server"
-
-  rc-service snell start
-  info "Snell 已更新"
-}
-
-uninstall_snell() {
-  warn "即将卸载 Snell"
-  rc-service snell stop >/dev/null 2>&1 || true
-  rc-update del snell default >/dev/null 2>&1 || true
-  rm -f "$SNELL_SERVICE"
-  rm -rf "$SNELL_DIR"
-  info "Snell 已卸载"
-}
-
-show_config() {
-  if [ ! -f "$SNELL_CONFIG" ]; then
-    err "配置文件不存在"
-    return 1
-  fi
-  echo '====== snell-server.conf ======'
-  cat "$SNELL_CONFIG"
-  echo '====== Surge 示例 ======'
-  cat "$SNELL_DIR/config.txt" 2>/dev/null || true
-}
-
-show_menu() {
-  clear
-  echo '====== Snell Alpine 管理 ======'
-  echo '1. 安装 Snell'
-  echo '2. 更新 Snell'
-  echo '3. 卸载 Snell'
-  echo '4. 重新生成配置并重启'
-  echo '5. 启动 Snell'
-  echo '6. 停止 Snell'
-  echo '7. 重启 Snell'
-  echo '8. 查看配置'
-  echo '9. 查看日志'
-  echo '0. 退出'
-}
-
-pause() {
-  printf '按回车继续...'
-  read -r _
-}
-
-main() {
-  require_root
-  require_alpine
-
-  while true; do
-    show_menu
-    printf '请输入选项: '
-    read -r choice
-    case "$choice" in
-      1) install_snell; pause ;;
-      2) update_snell; pause ;;
-      3) uninstall_snell; pause ;;
-      4) write_config && test_binary && rc-service snell restart; pause ;;
-      5) rc-service snell start; pause ;;
-      6) rc-service snell stop; pause ;;
-      7) rc-service snell restart; pause ;;
-      8) show_config; pause ;;
-      9) tail -n 100 /var/log/snell.log 2>/dev/null || echo '暂无 /var/log/snell.log'; pause ;;
-      0) exit 0 ;;
-      *) err '无效选项'; pause ;;
-    esac
-  done
-}
-
-main "$@"
+chmod 600 "$ENV_FILE"; write_service; systemctl daemon-reload; systemctl enable --now "$APP_NAME"; info '节点安装完成'; echo "主控地址: $MASTER_URL"; echo "节点名称: $NODE_NAME"; }
+uninstall_app() { require_root; systemctl disable --now "$APP_NAME" >/dev/null 2>&1 || true; rm -f "$SERVICE_FILE" "$ENV_FILE"; systemctl daemon-reload; rm -rf "$INSTALL_DIR"; info '已卸载 docker-fleet-node'; }
+status_app() { systemctl --no-pager status "$APP_NAME" || true; [[ -f "$ENV_FILE" ]] && echo && grep -E '^(MASTER_URL|NODE_NAME)=' "$ENV_FILE" || true; }
+restart_app() { require_root; systemctl restart "$APP_NAME"; info '已重启'; }
+show_menu() { echo; echo '====== Docker Fleet 节点 ======'; echo '1. 安装'; echo '2. 卸载'; echo '3. 查看状态'; echo '4. 重启服务'; echo '0. 退出'; echo; }
+pause_return() { echo; read -rp '按回车返回菜单...' _; }
+menu_loop() { while true; do show_menu; read -rp '请输入选项: ' choice; case "$choice" in 1) install_app; pause_return ;; 2) uninstall_app; pause_return ;; 3) status_app; pause_return ;; 4) restart_app; pause_return ;; 0) exit 0 ;; *) err '无效选项'; pause_return ;; esac; done; }
+case "${1:-menu}" in install) install_app ;; uninstall) uninstall_app ;; status) status_app ;; restart) restart_app ;; menu) menu_loop ;; *) menu_loop ;; esac

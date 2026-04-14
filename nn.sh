@@ -176,7 +176,7 @@ chmod 600 "$ENV_FILE"; write_service; systemctl daemon-reload; systemctl enable 
 uninstall_app() { require_root; systemctl disable --now "$APP_NAME" >/dev/null 2>&1 || true; rm -f "$SERVICE_FILE" "$ENV_FILE"; systemctl daemon-reload; rm -rf "$INSTALL_DIR"; info '已卸载 docker-fleet-node'; }
 status_app() { systemctl --no-pager status "$APP_NAME" || true; [[ -f "$ENV_FILE" ]] && echo && grep -E '^(MASTER_URL|NODE_NAME)=' "$ENV_FILE" || true; }
 restart_app() { require_root; systemctl restart "$APP_NAME"; info '已重启'; }
-show_menu() { echo; echo '====== Docker Fleet 节点 ======'; echo '1. 安装'; echo '2. 卸载'; echo '3. 查看状态'; echo '4. 重启服务'; echo '0. 退出'; echo; }
+show_menu() { echo; echo '====== Docker Fleet 节点 ======'; echo '1. 安装'; echo '2. 卸载'; echo '3. 查看状态'; echo '4. 重启服务'; echo '0. 退出';  }
 pause_return() { echo; read -rp '按回车返回菜单...' _; }
 menu_loop() { while true; do show_menu; read -rp '请输入选项: ' choice; case "$choice" in 1) install_app; pause_return ;; 2) uninstall_app; pause_return ;; 3) status_app; pause_return ;; 4) restart_app; pause_return ;; 0) exit 0 ;; *) err '无效选项'; pause_return ;; esac; done; }
 case "${1:-menu}" in install) install_app ;; uninstall) uninstall_app ;; status) status_app ;; restart) restart_app ;; menu) menu_loop ;; *) menu_loop ;; esac

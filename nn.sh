@@ -97,6 +97,113 @@ def project(name):
         if p['name']==name: return p
     return None
 
+def format_ports(raw_ports):
+    if not raw_ports:
+        return '无'
+    return str(raw_ports).replace(', ', '\n')
+
+def compose_status_text(p, proj):
+    code,out=shell(['docker','compose','-f',p['compose'],'ps','--format','json'],cwd=Path(p['dir']))
+    head=f'项目：{proj}\n目录：{p["dir"]}\n'
+    if code!=0:
+        return head + loc(out)
+    try:
+        parsed=json.loads(out)
+        if isinstance(parsed,list):
+            rows=parsed
+        elif isinstance(parsed,dict):
+            rows=[parsed]
+        else:
+            rows=[]
+    except Exception:
+        rows=[]
+        for line in out.splitlines():
+            line=line.strip()
+            if not line:
+                continue
+            try:
+                item=json.loads(line)
+                if isinstance(item,dict):
+                    rows.append(item)
+            except Exception:
+                return head + loc(out)
+    if not rows:
+        return head + '当前没有容器'
+    blocks=[]
+    for row in rows:
+        name=row.get('Name') or row.get('Service') or '(未知容器)'
+        image=row.get('Image','-')
+        service=row.get('Service','-')
+        state=loc(row.get('State','-'))
+        status=loc(row.get('Status','-'))
+        created=loc(row.get('RunningFor', row.get('CreatedAt','-')))
+        publishers=row.get('Publishers') or []
+        if publishers:
+            ports='\n'.join(f"{x.get('URL','0.0.0.0')}:{x.get('PublishedPort')} -> {x.get('TargetPort')}/{x.get('Protocol','')}".rstrip('/') for x in publishers)
+        else:
+            ports=format_ports(row.get('Ports',''))
+        blocks.append(
+            f'【{name}】\n'
+            f'服务：{service}\n'
+            f'镜像：{image}\n'
+            f'状态：{state}\n'
+            f'详情：{status}\n'
+            f'运行：{created}\n'
+            f'端口：{ports}'
+        )
+    return head + '\n\n'.join(blocks)
+
+def compose_status_text(p, proj):
+    code,out=shell(['docker','compose','-f',p['compose'],'ps','--format','json'],cwd=Path(p['dir']))
+    head=f'项目：{proj}\n目录：{p["dir"]}\n'
+    if code!=0:
+        return head + loc(out)
+    try:
+        parsed=json.loads(out)
+        if isinstance(parsed,list):
+            rows=parsed
+        elif isinstance(parsed,dict):
+            rows=[parsed]
+        else:
+            rows=[]
+    except Exception:
+        rows=[]
+        for line in out.splitlines():
+            line=line.strip()
+            if not line:
+                continue
+            try:
+                item=json.loads(line)
+                if isinstance(item,dict):
+                    rows.append(item)
+            except Exception:
+                return head + loc(out)
+    if not rows:
+        return head + '当前没有容器'
+    blocks=[]
+    for row in rows:
+        name=row.get('Name') or row.get('Service') or '(未知容器)'
+        image=row.get('Image','-')
+        service=row.get('Service','-')
+        state=loc(row.get('State','-'))
+        status=loc(row.get('Status','-'))
+        created=loc(row.get('RunningFor', row.get('CreatedAt','-')))
+        publishers=row.get('Publishers') or []
+        if publishers:
+            ports='\n'.join(f"{x.get('URL','0.0.0.0')}:{x.get('PublishedPort')} -> {x.get('TargetPort')}/{x.get('Protocol','')}".rstrip('/') for x in publishers)
+        else:
+            ports=format_ports(row.get('Ports',''))
+        blocks.append(
+            f'【{name}】\n'
+            f'服务：{service}\n'
+            f'镜像：{image}\n'
+            f'状态：{state}\n'
+            f'详情：{status}\n'
+            f'运行：{created}\n'
+            f'端口：{ports}'
+        )
+    return head + '\n\n'.join(blocks)
+
 def run_task(task):
     action=task.get('action'); proj=task.get('project')
     if action=='home':
@@ -114,9 +221,16 @@ def run_task(task):
     p=project(proj or '')
     if not p: return f'项目不存在：{proj}'
     base=['docker','compose','-f',p['compose']]
-    if action=='status': c,o=shell(base+['ps'],cwd=Path(p['dir'])); return f'项目：{proj}\n目录：{p["dir"]}\n{loc(o)}'
+    if action=='status': return compose_status_text(p, proj)
     if action=='up': c,o=shell(base+['up','-d'],cwd=Path(p['dir'])); return f'[{proj}] 启动完成（退出码={c}）\n{loc(o)}'
     if action=='down': c,o=shell(base+['down'],cwd=Path(p['dir'])); return f'[{proj}] 停止完成（退出码={c}）\n{loc(o)}'
+    if action=='delete_container':
+        c,o=shell(base+['down','-v'],cwd=Path(p['dir']))
+        return f'[{proj}] 删除容器完成（退出码={c}）\n{loc(o)}'
+    if action=='delete_all':
+        c1,o1=shell(base+['down','-v'],cwd=Path(p['dir']))
+        c2,o2=shell(['rm','-rf',p['dir']])
+        return f'[{proj}] 删除容器+文件数据完成（down={c1}, rm={c2}）\n[删除容器]\n{loc(o1)}\n\n[删除文件数据]\n{loc(o2)}'
     if action=='restart': c,o=shell(base+['restart'],cwd=Path(p['dir'])); return f'[{proj}] 重启完成（退出码={c}）\n{loc(o)}'
     if action=='pull': c,o=shell(base+['pull'],cwd=Path(p['dir'])); return f'[{proj}] 拉取镜像完成（退出码={c}）\n{loc(o)}'
     if action=='update':
@@ -176,7 +290,7 @@ chmod 600 "$ENV_FILE"; write_service; systemctl daemon-reload; systemctl enable 
 uninstall_app() { require_root; systemctl disable --now "$APP_NAME" >/dev/null 2>&1 || true; rm -f "$SERVICE_FILE" "$ENV_FILE"; systemctl daemon-reload; rm -rf "$INSTALL_DIR"; info '已卸载 docker-fleet-node'; }
 status_app() { systemctl --no-pager status "$APP_NAME" || true; [[ -f "$ENV_FILE" ]] && echo && grep -E '^(MASTER_URL|NODE_NAME)=' "$ENV_FILE" || true; }
 restart_app() { require_root; systemctl restart "$APP_NAME"; info '已重启'; }
-show_menu() { echo; echo '====== Docker Fleet 节点 ======'; echo '1. 安装'; echo '2. 卸载'; echo '3. 查看状态'; echo '4. 重启服务'; echo '0. 退出';  }
+show_menu() { echo; echo '====== Docker Fleet 节点 ======'; echo '1. 安装'; echo '2. 卸载'; echo '3. 查看状态'; echo '4. 重启服务'; echo '0. 退出'; echo; }
 pause_return() { echo; read -rp '按回车返回菜单...' _; }
 menu_loop() { while true; do show_menu; read -rp '请输入选项: ' choice; case "$choice" in 1) install_app; pause_return ;; 2) uninstall_app; pause_return ;; 3) status_app; pause_return ;; 4) restart_app; pause_return ;; 0) exit 0 ;; *) err '无效选项'; pause_return ;; esac; done; }
 case "${1:-menu}" in install) install_app ;; uninstall) uninstall_app ;; status) status_app ;; restart) restart_app ;; menu) menu_loop ;; *) menu_loop ;; esac

@@ -12,6 +12,22 @@ err() { echo -e "${RED}[错误] $*${RESET}" >&2; }
 require_root() { [[ "$(id -u)" -eq 0 ]] || { err '请用 root 运行'; exit 1; }; }
 require_debian_ubuntu() { [[ -f /etc/os-release ]] || { err '无法识别系统，只支持 Debian/Ubuntu'; exit 1; }; . /etc/os-release; case "${ID:-}" in debian|ubuntu) ;; *) [[ "${ID_LIKE:-}" == *debian* ]] || { err "只支持 Debian/Ubuntu，当前: ${PRETTY_NAME:-unknown}"; exit 1; } ;; esac; }
 install_deps() { info '安装依赖...'; apt-get update; apt-get install -y python3 curl ca-certificates; if ! command -v docker >/dev/null 2>&1; then warn '未检测到 docker。脚本不会自动安装 Docker，请先自行安装 Docker 和 docker compose 插件。'; fi; }
+get_public_ip() {
+  local ip=''
+  for url in https://api.ipify.org https://ip.sb https://checkip.amazonaws.com; do
+    ip=$(curl -4s --max-time 5 "$url" 2>/dev/null || true)
+    [[ -n "$ip" ]] && { echo "$ip"; return; }
+    ip=$(wget -4qO- --timeout=5 "$url" 2>/dev/null || true)
+    [[ -n "$ip" ]] && { echo "$ip"; return; }
+  done
+  for url in https://api64.ipify.org https://ip.sb; do
+    ip=$(curl -6s --max-time 5 "$url" 2>/dev/null || true)
+    [[ -n "$ip" ]] && { echo "$ip"; return; }
+    ip=$(wget -6qO- --timeout=5 "$url" 2>/dev/null || true)
+    [[ -n "$ip" ]] && { echo "$ip"; return; }
+  done
+  hostname -I | awk '{print $1}'
+}
 write_app() { mkdir -p "$INSTALL_DIR" "$INSTALL_DIR/data"; cat > "$APP_FILE" <<'PYEOF'
 #!/usr/bin/env python3
 import json, os, sys, time, uuid, urllib.parse, urllib.request, subprocess, threading
@@ -60,11 +76,31 @@ def require_env():
         print('缺少环境变量: '+','.join(miss),file=sys.stderr); sys.exit(1)
 
 
+def detect_public_ip():
+    for url in ['https://api.ipify.org','https://ip.sb','https://checkip.amazonaws.com']:
+        code,out=shell(['curl','-4s','--max-time','5',url],timeout=10)
+        if code==0 and out.strip():
+            return out.strip()
+        code,out=shell(['wget','-4qO-','--timeout=5',url],timeout=10)
+        if code==0 and out.strip():
+            return out.strip()
+    for url in ['https://api64.ipify.org','https://ip.sb']:
+        code,out=shell(['curl','-6s','--max-time','5',url],timeout=10)
+        if code==0 and out.strip():
+            return out.strip()
+        code,out=shell(['wget','-6qO-','--timeout=5',url],timeout=10)
+        if code==0 and out.strip():
+            return out.strip()
+    return ''
+
+
 def get_master_url():
     if MASTER_PUBLIC_URL:
         return MASTER_PUBLIC_URL
-    code,out=shell(['sh','-lc',"hostname -I | awk '{print $1}'"],timeout=10)
-    host=(out.strip() if code==0 else '') or 'YOUR_SERVER_IP'
+    host=detect_public_ip()
+    if not host:
+        code,out=shell(['sh','-lc',"hostname -I | awk '{print $1}'"],timeout=10)
+        host=(out.strip() if code==0 else '') or 'YOUR_SERVER_IP'
     return f'http://{host}:{PORT}'
 
 def tg(method,payload=None):
@@ -133,6 +169,62 @@ def compose_project(name):
         if p['name']==name: return p
     return None
 
+def format_ports(raw_ports):
+    if not raw_ports:
+        return '无'
+    return str(raw_ports).replace(', ', '\n')
+
+def compose_status_text(p, project):
+    code,out=shell(['docker','compose','-f',p['compose'],'ps','--format','json'],cwd=Path(p['dir']))
+    head=f'项目：{project}\n目录：{p["dir"]}\n'
+    if code!=0:
+        return head + loc(out)
+    try:
+        parsed=json.loads(out)
+        if isinstance(parsed,list):
+            rows=parsed
+        elif isinstance(parsed,dict):
+            rows=[parsed]
+        else:
+            rows=[]
+    except Exception:
+        rows=[]
+        for line in out.splitlines():
+            line=line.strip()
+            if not line:
+                continue
+            try:
+                item=json.loads(line)
+                if isinstance(item,dict):
+                    rows.append(item)
+            except Exception:
+                return head + loc(out)
+    if not rows:
+        return head + '当前没有容器'
+    blocks=[]
+    for row in rows:
+        name=row.get('Name') or row.get('Service') or '(未知容器)'
+        image=row.get('Image','-')
+        service=row.get('Service','-')
+        state=loc(row.get('State','-'))
+        status=loc(row.get('Status','-'))
+        created=loc(row.get('RunningFor', row.get('CreatedAt','-')))
+        publishers=row.get('Publishers') or []
+        if publishers:
+            ports='\n'.join(f"{x.get('URL','0.0.0.0')}:{x.get('PublishedPort')} -> {x.get('TargetPort')}/{x.get('Protocol','')}".rstrip('/') for x in publishers)
+        else:
+            ports=format_ports(row.get('Ports',''))
+        blocks.append(
+            f'【{name}】\n'
+            f'服务：{service}\n'
+            f'镜像：{image}\n'
+            f'状态：{state}\n'
+            f'详情：{status}\n'
+            f'运行：{created}\n'
+            f'端口：{ports}'
+        )
+    return head + '\n\n'.join(blocks)
+
 def run_local(action,project=None):
     if action=='home':
         dc,ds=shell(['systemctl','is-active','docker'],timeout=30); rc,ro=shell(['sh','-lc','docker ps -q | wc -l'],timeout=30); ac,ao=shell(['sh','-lc','docker ps -aq | wc -l'],timeout=30)
@@ -150,7 +242,7 @@ def run_local(action,project=None):
     p=compose_project(project or '')
     if not p: return f'项目不存在：{project}'
     base=['docker','compose','-f',p['compose']]
-    if action=='status': c,o=shell(base+['ps'],cwd=Path(p['dir'])); return f'项目：{project}\n目录：{p["dir"]}\n{loc(o)}'
+    if action=='status': return compose_status_text(p, project)
     if action=='up': c,o=shell(base+['up','-d'],cwd=Path(p['dir'])); return f'[{project}] 启动完成（退出码={c}）\n{loc(o)}'
     if action=='down': c,o=shell(base+['down'],cwd=Path(p['dir'])); return f'[{project}] 停止完成（退出码={c}）\n{loc(o)}'
     if action=='restart': c,o=shell(base+['restart'],cwd=Path(p['dir'])); return f'[{project}] 重启完成（退出码={c}）\n{loc(o)}'
@@ -317,14 +409,19 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 }
-install_app() { require_root; require_debian_ubuntu; install_deps; read -rp '请输入 Telegram Bot Token: ' TG_BOT_TOKEN; [[ -n "$TG_BOT_TOKEN" ]] || { err 'Bot Token 不能为空'; exit 1; }; read -rp '请输入允许操作的 Telegram TGID: ' TG_ALLOWED_CHAT_ID; [[ -n "$TG_ALLOWED_CHAT_ID" ]] || { err 'TGID 不能为空'; exit 1; }; read -rp '请输入节点对接码（留空自动生成）: ' PAIR_CODE; PAIR_CODE=${PAIR_CODE:-$(tr -dc A-Za-z0-9 </dev/urandom | head -c 8)}; MASTER_IP=$(hostname -I | awk '{print $1}'); MASTER_PUBLIC_URL="http://${MASTER_IP}:8765"; write_app; cat > "$ENV_FILE" <<EOF
+install_app() { require_root; require_debian_ubuntu; install_deps; read -rp '请输入 Telegram Bot Token: ' TG_BOT_TOKEN; [[ -n "$TG_BOT_TOKEN" ]] || { err 'Bot Token 不能为空'; exit 1; }; read -rp '请输入允许操作的 Telegram TGID: ' TG_ALLOWED_CHAT_ID; [[ -n "$TG_ALLOWED_CHAT_ID" ]] || { err 'TGID 不能为空'; exit 1; }; read -rp '请输入主控端口（默认 8765）: ' MASTER_PORT; MASTER_PORT=${MASTER_PORT:-8765}; read -rp '请输入节点对接码（留空自动生成）: ' PAIR_CODE; PAIR_CODE=${PAIR_CODE:-$(python3 - <<'PY'
+import secrets, string
+alphabet = string.ascii_letters + string.digits
+print(''.join(secrets.choice(alphabet) for _ in range(8)))
+PY
+)}; MASTER_IP=$(get_public_ip); MASTER_PUBLIC_URL="http://${MASTER_IP}:${MASTER_PORT}"; write_app; cat > "$ENV_FILE" <<EOF
 TG_BOT_TOKEN=$TG_BOT_TOKEN
 TG_ALLOWED_CHAT_ID=$TG_ALLOWED_CHAT_ID
 PAIR_CODE=$PAIR_CODE
 DATA_DIR=/opt/docker-fleet-master/data
 PROJECTS_DIR=/opt
 MASTER_BIND=0.0.0.0
-MASTER_PORT=8765
+MASTER_PORT=$MASTER_PORT
 MASTER_PUBLIC_URL=$MASTER_PUBLIC_URL
 TG_POLL_TIMEOUT=30
 TG_LOG_LINES=80
@@ -333,7 +430,7 @@ chmod 600 "$ENV_FILE"; write_service; systemctl daemon-reload; systemctl enable 
 uninstall_app() { require_root; systemctl disable --now "$APP_NAME" >/dev/null 2>&1 || true; rm -f "$SERVICE_FILE" "$ENV_FILE"; systemctl daemon-reload; rm -rf "$INSTALL_DIR"; info '已卸载 docker-fleet-master'; }
 status_app() { systemctl --no-pager status "$APP_NAME" || true; [[ -f "$ENV_FILE" ]] && echo && grep -E '^(MASTER_PUBLIC_URL|PAIR_CODE)=' "$ENV_FILE" || true; }
 restart_app() { require_root; systemctl restart "$APP_NAME"; info '已重启'; }
-show_menu() { echo; echo '====== Docker Fleet 主控 ======'; echo '1. 安装'; echo '2. 卸载'; echo '3. 查看状态'; echo '4. 重启服务'; echo '0. 退出'; echo; }
+show_menu() { echo; echo '====== Docker Fleet 主控 ======'; echo '1. 安装'; echo '2. 卸载'; echo '3. 查看状态'; echo '4. 重启服务'; echo '0. 退出'; }
 pause_return() { echo; read -rp '按回车返回菜单...' _; }
 menu_loop() { while true; do show_menu; read -rp '请输入选项: ' choice; case "$choice" in 1) install_app; pause_return ;; 2) uninstall_app; pause_return ;; 3) status_app; pause_return ;; 4) restart_app; pause_return ;; 0) exit 0 ;; *) err '无效选项'; pause_return ;; esac; done; }
 case "${1:-menu}" in install) install_app ;; uninstall) uninstall_app ;; status) status_app ;; restart) restart_app ;; menu) menu_loop ;; *) menu_loop ;; esac

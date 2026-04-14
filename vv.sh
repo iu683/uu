@@ -12,6 +12,22 @@ err() { echo -e "${RED}[错误] $*${RESET}" >&2; }
 require_root() { [[ "$(id -u)" -eq 0 ]] || { err '请用 root 运行'; exit 1; }; }
 require_debian_ubuntu() { [[ -f /etc/os-release ]] || { err '无法识别系统，只支持 Debian/Ubuntu'; exit 1; }; . /etc/os-release; case "${ID:-}" in debian|ubuntu) ;; *) [[ "${ID_LIKE:-}" == *debian* ]] || { err "只支持 Debian/Ubuntu，当前: ${PRETTY_NAME:-unknown}"; exit 1; } ;; esac; }
 install_deps() { info '安装依赖...'; apt-get update; apt-get install -y python3 curl ca-certificates; if ! command -v docker >/dev/null 2>&1; then warn '未检测到 docker。脚本不会自动安装 Docker，请先自行安装 Docker 和 docker compose 插件。'; fi; }
+get_public_ip() {
+  local ip=''
+  for url in https://api.ipify.org https://ip.sb https://checkip.amazonaws.com; do
+    ip=$(curl -4s --max-time 5 "$url" 2>/dev/null || true)
+    [[ -n "$ip" ]] && { echo "$ip"; return; }
+    ip=$(wget -4qO- --timeout=5 "$url" 2>/dev/null || true)
+    [[ -n "$ip" ]] && { echo "$ip"; return; }
+  done
+  for url in https://api64.ipify.org https://ip.sb; do
+    ip=$(curl -6s --max-time 5 "$url" 2>/dev/null || true)
+    [[ -n "$ip" ]] && { echo "$ip"; return; }
+    ip=$(wget -6qO- --timeout=5 "$url" 2>/dev/null || true)
+    [[ -n "$ip" ]] && { echo "$ip"; return; }
+  done
+  hostname -I | awk '{print $1}'
+}
 write_app() { mkdir -p "$INSTALL_DIR" "$INSTALL_DIR/data"; cat > "$APP_FILE" <<'PYEOF'
 #!/usr/bin/env python3
 import json, os, sys, time, uuid, urllib.parse, urllib.request, subprocess, threading
@@ -53,6 +69,17 @@ def load_nodes():
 
 def save_nodes(nodes):
     NODES_FILE.write_text(json.dumps(nodes,ensure_ascii=False,indent=2))
+
+def node_status_text(node):
+    last_seen=float(node.get('last_seen',0) or 0)
+    if not last_seen:
+        return '未知'
+    diff=time.time()-last_seen
+    if diff < 90:
+        return '在线'
+    if diff < 600:
+        return '离线（刚掉线）'
+    return '离线'
 
 def require_env():
     miss=[k for k,v in [('TG_BOT_TOKEN',BOT_TOKEN),('TG_ALLOWED_CHAT_ID',ALLOWED_CHAT_ID),('PAIR_CODE',PAIR_CODE)] if not v]
@@ -261,10 +288,32 @@ def run_target(target,action,project=None):
     return wait_result(tid)
 
 def nodes_keyboard():
-    nodes=load_nodes(); rows=[[{'text':'本机','callback_data':'target:local'}]]
-    for nid,n in nodes.items(): rows.append([{'text':n.get('name',nid),'callback_data':f'target:{nid}'}])
+    nodes=load_nodes(); rows=[[{'text':'本机｜在线','callback_data':'target:local'}]]
+    for nid,n in nodes.items(): rows.append([{'text':f"{n.get('name',nid)}｜{node_status_text(n)}",'callback_data':f'target:{nid}'}])
+    rows.append([{'text':'🧩 节点管理','callback_data':'menu:node_manage'}])
     rows.append([{'text':'🔑 对接码','callback_data':'menu:pair'}])
     return {'inline_keyboard':rows}
+
+def node_manage_keyboard():
+    nodes=load_nodes(); rows=[]
+    for nid,n in nodes.items():
+        rows.append([{'text':f"{n.get('name',nid)}｜{node_status_text(n)}",'callback_data':f'node:info:{nid}'}])
+    rows.append([{'text':'⬅️ 返回','callback_data':'menu:nodes'}])
+    return {'inline_keyboard':rows}
+
+def node_detail_keyboard(node_id):
+    return {'inline_keyboard':[
+        [{'text':'🗑 删除节点','callback_data':f'node:delete:{node_id}'}],
+        [{'text':'⬅️ 节点管理','callback_data':'menu:node_manage'},{'text':'🏠 首页','callback_data':'home:local'}]
+    ]}
+
+def node_detail_text(node_id):
+    nodes=load_nodes(); n=nodes.get(node_id)
+    if not n:
+        return '节点不存在'
+    last_seen=float(n.get('last_seen',0) or 0)
+    last_seen_text=time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_seen)) if last_seen else '无'
+    return f"节点名称：{n.get('name',node_id)}\n节点 ID：{node_id}\n状态：{node_status_text(n)}\n最后心跳：{last_seen_text}"
 
 def main_keyboard(target):
     return {'inline_keyboard':[[{'text':'🖥 选择节点','callback_data':'menu:nodes'}],[{'text':'📦 项目列表','callback_data':f'menu:list:{target}'}],[{'text':'🎬 应用快捷管理','callback_data':f'menu:apps:{target}'}],[{'text':'🐳 Docker 管理','callback_data':f'menu:docker:{target}'}]]}
@@ -299,7 +348,22 @@ def handle_callback(cb):
     if chat!=str(ALLOWED_CHAT_ID): return
     answer(cid)
     if data=='menu:nodes': edit(chat,mid,'选择要管理的节点：',nodes_keyboard()); return
+    if data=='menu:node_manage': edit(chat,mid,'节点管理',node_manage_keyboard()); return
     if data=='menu:pair': edit(chat,mid,f'节点对接信息：\n主控地址：{get_master_url()}\n对接码：{PAIR_CODE}\n\n节点安装时填写主控地址和这个码。',main_keyboard(CURRENT_TARGET.get(chat,'local'))); return
+    if data.startswith('node:info:'):
+        nid=data.split(':',2)[2]
+        edit(chat,mid,node_detail_text(nid),node_detail_keyboard(nid)); return
+    if data.startswith('node:delete:'):
+        nid=data.split(':',2)[2]
+        nodes=load_nodes()
+        if nid in nodes:
+            name=nodes[nid].get('name',nid)
+            del nodes[nid]
+            save_nodes(nodes)
+            edit(chat,mid,f'已删除节点：{name}',node_manage_keyboard())
+        else:
+            edit(chat,mid,'节点不存在',node_manage_keyboard())
+        return
     if data.startswith('target:'):
         t=data.split(':',1)[1]; CURRENT_TARGET[chat]=t; edit(chat,mid,run_target(t,'home'),main_keyboard(t)); return
     if data.startswith('home:'):

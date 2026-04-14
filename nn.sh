@@ -166,7 +166,7 @@ def run_shell(cmd: List[str], cwd: Optional[Path] = None, timeout: int = 300) ->
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return 124, f"命令超时（{timeout} 秒）"
+        return 124, f"命令超时({timeout} 秒)"
     except Exception as e:
         return 1, f"执行失败: {e}"
     output = ((proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")).strip()
@@ -198,6 +198,11 @@ def localize_docker_text(text: str) -> str:
         "minutes ago": "分钟前",
         "hours ago": "小时前",
         "days ago": "天前",
+        "active": "运行中",
+        "inactive": "未运行",
+        "failed": "异常",
+        "activating": "启动中",
+        "deactivating": "停止中",
     }
     for src, dst in replacements.items():
         text = text.replace(src, dst)
@@ -250,7 +255,7 @@ def status_text(project: Project) -> str:
     code, out = run_compose(project, ["ps", "--format", "json"])
     head = f"项目: {project.name}\n目录: {project.directory}\n"
     if code != 0:
-        return head + f"状态查询失败（exit={code}）\n{localize_docker_text(out)}"
+        return head + f"状态查询失败(exit={code})\n{localize_docker_text(out)}"
 
     try:
         parsed = json.loads(out)
@@ -290,12 +295,12 @@ def status_text(project: Project) -> str:
         ) or row.get("Ports", ""))
         blocks.append(
             f"【{name}】\n"
-            f"服务：{service}\n"
-            f"镜像：{image}\n"
-            f"状态：{state}\n"
-            f"详情：{status}\n"
-            f"运行：{created}\n"
-            f"端口：{ports}"
+            f"服务:{service}\n"
+            f"镜像:{image}\n"
+            f"状态:{state}\n"
+            f"详情:{status}\n"
+            f"运行:{created}\n"
+            f"端口:{ports}"
         )
 
     return head + "\n\n".join(blocks)
@@ -324,8 +329,9 @@ def docker_manage_keyboard() -> dict:
         "inline_keyboard": [
             [{"text": "📊 Docker 概览", "callback_data": "docker:overview"}],
             [{"text": "📦 运行中的容器", "callback_data": "docker:running"}],
+            [{"text": "🧰 容器管理", "callback_data": "docker:containers"}],
             [{"text": "📈 容器占用", "callback_data": "docker:stats"}],
-            [{"text": "🔄 重启 Docker", "callback_data": "docker:restart"}],
+            [{"text": "🔄 重启 Docker", "callback_data": "confirm_global:docker_restart"}],
             [{"text": "🧹 一键清理无用镜像/卷/网络", "callback_data": "docker:prune_all"}],
             [{"text": "⬅️ 返回", "callback_data": "menu:home"}],
         ]
@@ -385,23 +391,23 @@ def confirm_text(project_name: str, action: str) -> str:
     if action == "delete_container":
         return (
             f"危险操作确认\n\n"
-            f"项目：{project_name}\n"
-            f"动作：删除容器\n\n"
-            f"这会执行 docker compose down -v。"
+            f"项目:{project_name}\n"
+            f"动作:删除容器\n\n"
+            f"这会执行 docker compose down -v --rmi all。"
         )
     if action == "delete_all":
         return (
             f"危险操作确认\n\n"
-            f"项目：{project_name}\n"
-            f"动作：删除容器 + 文件数据\n\n"
-            f"这会先执行 docker compose down -v，然后删除整个项目目录。"
+            f"项目:{project_name}\n"
+            f"动作:删除容器 + 文件数据\n\n"
+            f"这会先执行 docker compose down -v --rmi all,然后删除整个项目目录。"
         )
     return "未知确认操作"
 
 
 def help_text() -> str:
     return (
-        "可用命令：\n"
+        "可用命令:\n"
         "/start - 打开主菜单\n"
         "/list - 列出 /opt 下项目\n"
         "/status <项目> - 查看状态\n"
@@ -425,7 +431,7 @@ def send_project_list(chat_id: str) -> None:
     if not projects:
         send_message(chat_id, f"/opt 下没找到 compose 项目\n扫描目录: {PROJECTS_DIR}", main_keyboard())
         return
-    send_message(chat_id, f"找到 {len(projects)} 个项目，点按钮管理：", project_list_keyboard(projects))
+    send_message(chat_id, f"找到 {len(projects)} 个项目,点按钮管理:", project_list_keyboard(projects))
 
 
 def docker_overview_text() -> str:
@@ -438,16 +444,16 @@ def docker_overview_text() -> str:
 
     lines = [
         "Docker 概览",
-        f"运行中的容器：{running_out.strip() if running_code == 0 else '获取失败'}",
-        f"全部容器：{all_containers_out.strip() if all_containers_code == 0 else '获取失败'}",
-        f"镜像数量：{images_out.strip() if images_code == 0 else '获取失败'}",
-        f"卷数量：{volumes_out.strip() if volumes_code == 0 else '获取失败'}",
-        f"网络数量：{networks_out.strip() if networks_code == 0 else '获取失败'}",
+        f"运行中的容器:{running_out.strip() if running_code == 0 else '获取失败'}",
+        f"全部容器:{all_containers_out.strip() if all_containers_code == 0 else '获取失败'}",
+        f"镜像数量:{images_out.strip() if images_code == 0 else '获取失败'}",
+        f"卷数量:{volumes_out.strip() if volumes_code == 0 else '获取失败'}",
+        f"网络数量:{networks_out.strip() if networks_code == 0 else '获取失败'}",
     ]
 
     if ps_code != 0:
         lines.append("")
-        lines.append(f"读取运行中容器失败（exit={ps_code}）")
+        lines.append(f"读取运行中容器失败(exit={ps_code})")
         lines.append(localize_docker_text(ps_out))
         return "\n".join(lines)
 
@@ -464,7 +470,7 @@ def docker_overview_text() -> str:
         return "\n".join(lines)
 
     lines.append("")
-    lines.append("运行中的容器：")
+    lines.append("运行中的容器:")
     for row in rows:
         name = row.get("Names") or row.get("Name") or "(未知容器)"
         image = row.get("Image", "-")
@@ -472,40 +478,189 @@ def docker_overview_text() -> str:
         ports = format_ports(row.get("Ports", ""))
         lines.append(
             f"【{name}】\n"
-            f"镜像：{image}\n"
-            f"状态：{status}\n"
-            f"端口：{ports}"
+            f"镜像:{image}\n"
+            f"状态:{status}\n"
+            f"端口:{ports}"
         )
 
     return "\n\n".join(lines)
 
 
 def docker_running_text() -> str:
-    code, out = run_shell(["docker", "ps", "--format", "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"], timeout=60)
-    out = localize_docker_text(out)
-    return out if code == 0 else f"查看运行中容器失败（exit={code}）\n{out}"
+    code, out = run_shell(["docker", "ps", "--format", "{{json .}}"], timeout=60)
+    if code != 0:
+        return f"查看运行中容器失败(exit={code})\n{localize_docker_text(out)}"
+    rows = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line == "(无输出)":
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            return localize_docker_text(out)
+    if not rows:
+        return "运行中的容器\n\n无"
+    blocks = []
+    for row in rows:
+        blocks.append(
+            f"【{row.get('Names', '(未知容器)')}】\n"
+            f"镜像:{row.get('Image', '-')}\n"
+            f"状态:{localize_docker_text(row.get('Status', '-'))}\n"
+            f"端口:{format_ports(row.get('Ports', ''))}"
+        )
+    return "运行中的容器\n\n" + "\n\n".join(blocks)
+
+
+def docker_all_containers() -> List[dict]:
+    code, out = run_shell(["docker", "ps", "-a", "--format", "{{json .}}"], timeout=60)
+    if code != 0:
+        return []
+    rows = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line == "(无输出)":
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            pass
+    return rows
+
+
+def docker_containers_keyboard() -> dict:
+    rows = []
+    for row in docker_all_containers():
+        name = row.get("Names") or row.get("Name") or "(未知容器)"
+        status = localize_docker_text(row.get("Status", "-"))
+        rows.append([{"text": f"{name}|{status}", "callback_data": f"container:{name}"}])
+    if not rows:
+        rows.append([{"text": "(没有容器)", "callback_data": "menu:docker"}])
+    rows.append([{"text": "⬅️ 返回", "callback_data": "menu:docker"}])
+    return {"inline_keyboard": rows}
+
+
+def container_detail_text(name: str) -> str:
+    code, out = run_shell(["docker", "ps", "-a", "--filter", f"name=^{name}$", "--format", "{{json .}}"], timeout=60)
+    if code != 0 or not out.strip() or out.strip() == "(无输出)":
+        return f"容器不存在:{name}"
+    try:
+        row = json.loads(out.splitlines()[0])
+    except Exception:
+        return localize_docker_text(out)
+    return (
+        f"容器:{row.get('Names', name)}\n"
+        f"镜像:{row.get('Image', '-')}\n"
+        f"状态:{localize_docker_text(row.get('Status', '-'))}\n"
+        f"端口:{row.get('Ports', '无')}"
+    )
+
+
+def container_keyboard(name: str) -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "▶️ 启动", "callback_data": f"container_action:start:{name}"}, {"text": "⏹ 停止", "callback_data": f"container_action:stop:{name}"}],
+            [{"text": "🔄 重启", "callback_data": f"container_action:restart:{name}"}, {"text": "📜 日志", "callback_data": f"container_action:logs:{name}"}],
+            [{"text": "🗑 删除容器", "callback_data": f"confirm_container:remove:{name}"}],
+            [{"text": "⬅️ 容器列表", "callback_data": "docker:containers"}, {"text": "🏠 Docker 管理", "callback_data": "menu:docker"}],
+        ]
+    }
+
+
+def global_confirm_keyboard(action: str) -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "✅ 确认执行", "callback_data": f"docker:{action}"}],
+            [{"text": "❌ 取消", "callback_data": "menu:docker"}],
+        ]
+    }
+
+
+def global_confirm_text(action: str) -> str:
+    if action == "docker_restart":
+        return "危险操作确认\n\n动作:重启 Docker\n\n这会重启 Docker 服务,短时间内可能影响容器连接。"
+    return "未知确认操作"
+
+
+def container_confirm_keyboard(action: str, name: str) -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "✅ 确认执行", "callback_data": f"container_action:{action}:{name}"}],
+            [{"text": "❌ 取消", "callback_data": f"container:{name}"}],
+        ]
+    }
+
+
+def container_confirm_text(action: str, name: str) -> str:
+    if action == "remove":
+        return f"危险操作确认\n\n容器:{name}\n动作:删除容器\n\n这会执行 docker rm -f {name}。"
+    return "未知确认操作"
+
+
+def container_action_text(action: str, name: str) -> str:
+    if action == "start":
+        code, out = run_shell(["docker", "start", name], timeout=120)
+        return f"[{name}] 启动完成(退出码={code})\n{localize_docker_text(out)}"
+    if action == "stop":
+        code, out = run_shell(["docker", "stop", name], timeout=120)
+        return f"[{name}] 停止完成(退出码={code})\n{localize_docker_text(out)}"
+    if action == "restart":
+        code, out = run_shell(["docker", "restart", name], timeout=120)
+        return f"[{name}] 重启完成(退出码={code})\n{localize_docker_text(out)}"
+    if action == "logs":
+        code, out = run_shell(["docker", "logs", "--tail", str(LOG_LINES_DEFAULT), name], timeout=120)
+        return f"[{name}] 日志(退出码={code})\n{localize_docker_text(out)}"
+    if action == "remove":
+        code, out = run_shell(["docker", "rm", "-f", name], timeout=120)
+        return f"[{name}] 删除容器完成(退出码={code})\n{localize_docker_text(out)}"
+    return "未知容器操作"
 
 
 def docker_stats_text() -> str:
     code, out = run_shell([
-        "docker", "stats", "--no-stream",
-        "--format", "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}"
+        "docker", "stats", "--no-stream", "--format", "{{json .}}"
     ], timeout=120)
-    out = localize_docker_text(out)
-    return out if code == 0 else f"查看容器占用失败（exit={code}）\n{out}"
+    if code != 0:
+        return f"查看容器占用失败(exit={code})\n{localize_docker_text(out)}"
+    rows = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line == "(无输出)":
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            return localize_docker_text(out)
+    if not rows:
+        return "当前没有可显示的容器占用"
+    blocks = []
+    for row in rows:
+        blocks.append(
+            f"【{row.get('Name', '(未知容器)')}】\n"
+            f"CPU:{row.get('CPUPerc', '-')}\n"
+            f"内存:{row.get('MemUsage', '-')}\n"
+            f"内存占比:{row.get('MemPerc', '-')}\n"
+            f"网络 I/O:{row.get('NetIO', '-')}\n"
+            f"磁盘 I/O:{row.get('BlockIO', '-')}"
+        )
+    return "容器占用\n\n" + "\n\n".join(blocks)
 
 
 def docker_restart_text() -> str:
     code, out = run_shell(["systemctl", "restart", "docker"], timeout=120)
     if code != 0:
         return f"重启 Docker 失败（exit={code}）\n{out}"
+    time.sleep(3)
     status_code, status_out = run_shell(["systemctl", "is-active", "docker"], timeout=30)
-    status = status_out.strip() if status_code == 0 else f"未知（exit={status_code}）"
+    status = localize_docker_text(status_out.strip()) if status_code == 0 else f"未知（exit={status_code}）"
+    if status.strip() != "运行中":
+        detail_code, detail_out = run_shell(["systemctl", "status", "docker", "--no-pager"], timeout=60)
+        return f"Docker 重启后状态异常\n当前状态：{status}\n\n{localize_docker_text(detail_out)}"
     return f"Docker 已重启\n当前状态：{status}"
 
 
 def docker_prune_text() -> str:
-    image_code, image_out = run_shell(["docker", "image", "prune", "-f"], timeout=120)
+    image_code, image_out = run_shell(["docker", "image", "prune", "-a", "-f"], timeout=120)
     volume_code, volume_out = run_shell(["docker", "volume", "prune", "-f"], timeout=120)
     network_code, network_out = run_shell(["docker", "network", "prune", "-f"], timeout=120)
     return (
@@ -522,16 +677,16 @@ def home_text() -> str:
     all_code, all_out = run_shell(["sh", "-lc", "docker ps -aq | wc -l"], timeout=30)
     projects = discover_projects()
 
-    docker_line = docker_status.strip() if docker_code == 0 else "未知"
+    docker_line = localize_docker_text(docker_status.strip()) if docker_code == 0 else "未知"
     running_line = running_out.strip() if running_code == 0 else "获取失败"
     all_line = all_out.strip() if all_code == 0 else "获取失败"
 
     return (
-        "Docker 运行面板\n"
-        f"Docker 状态：{docker_line}\n"
-        f"运行中的容器：{running_line}\n"
-        f"全部容器：{all_line}\n"
-        f"项目数量：{len(projects)}"
+        "Docker 运行面板\n\n"
+        f"Docker 状态:{docker_line}\n"
+        f"运行中的容器:{running_line}\n"
+        f"全部容器:{all_line}\n"
+        f"项目数量:{len(projects)}"
     )
 
 
@@ -587,40 +742,40 @@ def handle_text_command(chat_id: str, text: str) -> None:
         return
     if cmd == "/up":
         code, out = run_compose(project, ["up", "-d"])
-        send_message(chat_id, f"[{project.name}] 启动完成（退出码={code}）\n{localize_docker_text(out)}", project_keyboard(project.name))
+        send_message(chat_id, f"[{project.name}] 启动完成(退出码={code})\n{localize_docker_text(out)}", project_keyboard(project.name))
         return
     if cmd == "/down":
         code, out = run_compose(project, ["down"])
-        send_message(chat_id, f"[{project.name}] 停止完成（退出码={code}）\n{localize_docker_text(out)}", project_keyboard(project.name))
+        send_message(chat_id, f"[{project.name}] 停止完成(退出码={code})\n{localize_docker_text(out)}", project_keyboard(project.name))
         return
     if cmd == "/delete":
-        code, out = run_compose(project, ["down", "-v"])
-        send_message(chat_id, f"[{project.name}] 删除容器完成（退出码={code}）\n{localize_docker_text(out)}", project_keyboard(project.name))
+        code, out = run_compose(project, ["down", "-v", "--rmi", "all"])
+        send_message(chat_id, f"[{project.name}] 删除容器完成(退出码={code})\n{localize_docker_text(out)}", project_keyboard(project.name))
         return
     if cmd == "/deleteall":
-        code1, out1 = run_compose(project, ["down", "-v"])
+        code1, out1 = run_compose(project, ["down", "-v", "--rmi", "all"])
         code2, out2 = run_shell(["rm", "-rf", str(project.directory)])
-        send_message(chat_id, f"[{project.name}] 删除容器+文件数据完成（down={code1}, rm={code2}）\n[删除容器]\n{localize_docker_text(out1)}\n\n[删除文件数据]\n{localize_docker_text(out2)}", project_keyboard(project.name))
+        send_message(chat_id, f"[{project.name}] 删除容器+文件数据完成(down={code1}, rm={code2})\n[删除容器]\n{localize_docker_text(out1)}\n\n[删除文件数据]\n{localize_docker_text(out2)}", project_keyboard(project.name))
         return
     if cmd == "/restart":
         code, out = run_compose(project, ["restart"])
-        send_message(chat_id, f"[{project.name}] 重启完成（退出码={code}）\n{localize_docker_text(out)}", project_keyboard(project.name))
+        send_message(chat_id, f"[{project.name}] 重启完成(退出码={code})\n{localize_docker_text(out)}", project_keyboard(project.name))
         return
     if cmd == "/pull":
         code, out = run_compose(project, ["pull"])
-        send_message(chat_id, f"[{project.name}] 拉取镜像完成（退出码={code}）\n{localize_docker_text(out)}", project_keyboard(project.name))
+        send_message(chat_id, f"[{project.name}] 拉取镜像完成(退出码={code})\n{localize_docker_text(out)}", project_keyboard(project.name))
         return
     if cmd == "/update":
         pull_code, pull_out = run_compose(project, ["pull"])
         if pull_code != 0:
-            send_message(chat_id, f"[{project.name}] 更新失败（退出码={pull_code}）\n[拉取镜像]\n{localize_docker_text(pull_out)}", project_keyboard(project.name))
+            send_message(chat_id, f"[{project.name}] 更新失败(退出码={pull_code})\n[拉取镜像]\n{localize_docker_text(pull_out)}", project_keyboard(project.name))
             return
         up_code, up_out = run_compose(project, ["up", "-d"])
         if up_code != 0:
-            send_message(chat_id, f"[{project.name}] 更新并重启失败（pull=0, up={up_code}）\n[拉取镜像]\n{localize_docker_text(pull_out)}\n\n[启动服务]\n{localize_docker_text(up_out)}", project_keyboard(project.name))
+            send_message(chat_id, f"[{project.name}] 更新并重启失败(pull=0, up={up_code})\n[拉取镜像]\n{localize_docker_text(pull_out)}\n\n[启动服务]\n{localize_docker_text(up_out)}", project_keyboard(project.name))
             return
-        prune_code, prune_out = run_shell(["docker", "image", "prune", "-f"], timeout=120)
-        send_message(chat_id, f"[{project.name}] 更新并重启完成（pull=0, up=0, prune={prune_code}）\n[拉取镜像]\n{localize_docker_text(pull_out)}\n\n[启动服务]\n{localize_docker_text(up_out)}\n\n[清理无用镜像]\n{localize_docker_text(prune_out)}", project_keyboard(project.name))
+        prune_code, prune_out = run_shell(["docker", "image", "prune", "-a", "-f"], timeout=120)
+        send_message(chat_id, f"[{project.name}] 更新并重启完成(pull=0, up=0, prune={prune_code})\n[拉取镜像]\n{localize_docker_text(pull_out)}\n\n[启动服务]\n{localize_docker_text(up_out)}\n\n[清理无用镜像]\n{localize_docker_text(prune_out)}", project_keyboard(project.name))
         return
     if cmd == "/logs":
         lines = LOG_LINES_DEFAULT
@@ -631,7 +786,7 @@ def handle_text_command(chat_id: str, text: str) -> None:
                 send_message(chat_id, "日志行数必须是数字", project_keyboard(project.name))
                 return
         code, out = run_compose(project, ["logs", "--tail", str(lines), "--no-color"], timeout=120)
-        send_message(chat_id, f"[{project.name}] 日志（退出码={code}）\n{localize_docker_text(out)}", project_keyboard(project.name))
+        send_message(chat_id, f"[{project.name}] 日志(退出码={code})\n{localize_docker_text(out)}", project_keyboard(project.name))
         return
 
     send_message(chat_id, "不支持的命令", main_keyboard())
@@ -678,7 +833,7 @@ def handle_callback(callback: dict) -> None:
         if not projects:
             edit_message(chat_id, message_id, f"/opt 下没找到 compose 项目\n扫描目录: {PROJECTS_DIR}", main_keyboard())
             return
-        edit_message(chat_id, message_id, f"找到 {len(projects)} 个项目，点按钮管理：", project_list_keyboard(projects))
+        edit_message(chat_id, message_id, f"找到 {len(projects)} 个项目,点按钮管理:", project_list_keyboard(projects))
         return
 
     if data.startswith("docker:"):
@@ -687,6 +842,8 @@ def handle_callback(callback: dict) -> None:
             edit_message(chat_id, message_id, docker_overview_text(), docker_manage_keyboard())
         elif data == "docker:running":
             edit_message(chat_id, message_id, docker_running_text(), docker_manage_keyboard())
+        elif data == "docker:containers":
+            edit_message(chat_id, message_id, "容器管理", docker_containers_keyboard())
         elif data == "docker:stats":
             edit_message(chat_id, message_id, docker_stats_text(), docker_manage_keyboard())
         elif data == "docker:restart":
@@ -697,6 +854,12 @@ def handle_callback(callback: dict) -> None:
             edit_message(chat_id, message_id, "未知 Docker 操作", docker_manage_keyboard())
         return
 
+    if data.startswith("confirm_global:"):
+        _, action = data.split(":", 1)
+        answer_callback(callback_id)
+        edit_message(chat_id, message_id, global_confirm_text(action), global_confirm_keyboard(action))
+        return
+
     if data.startswith("project:"):
         project_name = data.split(":", 1)[1]
         project = resolve_project(project_name)
@@ -705,6 +868,24 @@ def handle_callback(callback: dict) -> None:
             edit_message(chat_id, message_id, f"项目不存在: {project_name}", main_keyboard())
             return
         edit_message(chat_id, message_id, status_text(project), project_keyboard(project.name))
+        return
+
+    if data.startswith("confirm_container:"):
+        _, action, name = data.split(":", 2)
+        answer_callback(callback_id)
+        edit_message(chat_id, message_id, container_confirm_text(action, name), container_confirm_keyboard(action, name))
+        return
+
+    if data.startswith("container:"):
+        name = data.split(":", 1)[1]
+        answer_callback(callback_id)
+        edit_message(chat_id, message_id, container_detail_text(name), container_keyboard(name))
+        return
+
+    if data.startswith("container_action:"):
+        _, action, name = data.split(":", 2)
+        answer_callback(callback_id)
+        edit_message(chat_id, message_id, container_action_text(action, name), container_keyboard(name))
         return
 
     if data.startswith("confirm:"):
@@ -726,37 +907,37 @@ def handle_callback(callback: dict) -> None:
             text = status_text(project)
         elif action == "up":
             code, out = run_compose(project, ["up", "-d"])
-            text = f"[{project.name}] 启动完成（退出码={code}）\n{localize_docker_text(out)}"
+            text = f"[{project.name}] 启动完成(退出码={code})\n{localize_docker_text(out)}"
         elif action == "down":
             code, out = run_compose(project, ["down"])
-            text = f"[{project.name}] 停止完成（退出码={code}）\n{localize_docker_text(out)}"
+            text = f"[{project.name}] 停止完成(退出码={code})\n{localize_docker_text(out)}"
         elif action == "delete_container":
-            code, out = run_compose(project, ["down", "-v"])
-            text = f"[{project.name}] 删除容器完成（退出码={code}）\n{localize_docker_text(out)}"
+            code, out = run_compose(project, ["down", "-v", "--rmi", "all"])
+            text = f"[{project.name}] 删除容器完成(退出码={code})\n{localize_docker_text(out)}"
         elif action == "delete_all":
-            code1, out1 = run_compose(project, ["down", "-v"])
+            code1, out1 = run_compose(project, ["down", "-v", "--rmi", "all"])
             code2, out2 = run_shell(["rm", "-rf", str(project.directory)])
-            text = f"[{project.name}] 删除容器+文件数据完成（down={code1}, rm={code2}）\n[删除容器]\n{localize_docker_text(out1)}\n\n[删除文件数据]\n{localize_docker_text(out2)}"
+            text = f"[{project.name}] 删除容器+文件数据完成(down={code1}, rm={code2})\n[删除容器]\n{localize_docker_text(out1)}\n\n[删除文件数据]\n{localize_docker_text(out2)}"
         elif action == "restart":
             code, out = run_compose(project, ["restart"])
-            text = f"[{project.name}] 重启完成（退出码={code}）\n{localize_docker_text(out)}"
+            text = f"[{project.name}] 重启完成(退出码={code})\n{localize_docker_text(out)}"
         elif action == "pull":
             code, out = run_compose(project, ["pull"])
-            text = f"[{project.name}] 拉取镜像完成（退出码={code}）\n{localize_docker_text(out)}"
+            text = f"[{project.name}] 拉取镜像完成(退出码={code})\n{localize_docker_text(out)}"
         elif action == "update_restart":
             pull_code, pull_out = run_compose(project, ["pull"])
             if pull_code != 0:
-                text = f"[{project.name}] 更新失败（退出码={pull_code}）\n[拉取镜像]\n{localize_docker_text(pull_out)}"
+                text = f"[{project.name}] 更新失败(退出码={pull_code})\n[拉取镜像]\n{localize_docker_text(pull_out)}"
             else:
                 up_code, up_out = run_compose(project, ["up", "-d"])
                 if up_code != 0:
-                    text = f"[{project.name}] 更新并重启失败（pull=0, up={up_code}）\n[拉取镜像]\n{localize_docker_text(pull_out)}\n\n[启动服务]\n{localize_docker_text(up_out)}"
+                    text = f"[{project.name}] 更新并重启失败(pull=0, up={up_code})\n[拉取镜像]\n{localize_docker_text(pull_out)}\n\n[启动服务]\n{localize_docker_text(up_out)}"
                 else:
-                    prune_code, prune_out = run_shell(["docker", "image", "prune", "-f"], timeout=120)
-                    text = f"[{project.name}] 更新并重启完成（pull=0, up=0, prune={prune_code}）\n[拉取镜像]\n{localize_docker_text(pull_out)}\n\n[启动服务]\n{localize_docker_text(up_out)}\n\n[清理无用镜像]\n{localize_docker_text(prune_out)}"
+                    prune_code, prune_out = run_shell(["docker", "image", "prune", "-a", "-f"], timeout=120)
+                    text = f"[{project.name}] 更新并重启完成(pull=0, up=0, prune={prune_code})\n[拉取镜像]\n{localize_docker_text(pull_out)}\n\n[启动服务]\n{localize_docker_text(up_out)}\n\n[清理无用镜像]\n{localize_docker_text(prune_out)}"
         elif action == "logs":
             code, out = run_compose(project, ["logs", "--tail", str(LOG_LINES_DEFAULT), "--no-color"], timeout=120)
-            text = f"[{project.name}] 日志（退出码={code}）\n{localize_docker_text(out)}"
+            text = f"[{project.name}] 日志(退出码={code})\n{localize_docker_text(out)}"
         else:
             text = "不支持的动作"
         edit_message(chat_id, message_id, text, project_keyboard(project.name))

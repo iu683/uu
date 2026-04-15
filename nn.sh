@@ -36,7 +36,6 @@ install_deps() {
   info '安装依赖...'
   apt-get update
   apt-get install -y python3 curl ca-certificates
-  apt-get install -y ansilove || warn 'ansilove 安装失败或软件源无此包；IP/网络质量检测将无法生成 PNG 图片。'
   if ! command -v docker >/dev/null 2>&1; then
     warn '未检测到 docker。脚本不会自动安装 Docker，请先自行安装 Docker 和 docker compose 插件。'
   fi
@@ -50,12 +49,9 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
-import shutil
 import time
 import urllib.parse
 import urllib.request
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -115,31 +111,6 @@ def tg_api(method: str, payload: Optional[dict] = None) -> dict:
     req = urllib.request.Request(f"{API_BASE}/{method}", data=data)
     with urllib.request.urlopen(req, timeout=POLL_TIMEOUT + 15) as resp:
         return json.loads(resp.read().decode())
-
-
-def tg_multipart(method: str, fields: Dict[str, str], file_field: str, file_path: str, mime_type: str) -> dict:
-    boundary = f"----OpenClaw{uuid.uuid4().hex}"
-    body = bytearray()
-    for key, value in fields.items():
-        body.extend(f"--{boundary}\r\n".encode())
-        body.extend(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
-        body.extend(str(value).encode())
-        body.extend(b"\r\n")
-    filename = os.path.basename(file_path)
-    body.extend(f"--{boundary}\r\n".encode())
-    body.extend(f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\n'.encode())
-    body.extend(f"Content-Type: {mime_type}\r\n\r\n".encode())
-    with open(file_path, "rb") as f:
-        body.extend(f.read())
-    body.extend(b"\r\n")
-    body.extend(f"--{boundary}--\r\n".encode())
-    req = urllib.request.Request(f"{API_BASE}/{method}", data=bytes(body), headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
-    with urllib.request.urlopen(req, timeout=POLL_TIMEOUT + 30) as resp:
-        return json.loads(resp.read().decode())
-
-
-def send_photo(chat_id: str, file_path: str, caption: str = "") -> None:
-    tg_multipart("sendPhoto", {"chat_id": chat_id, "caption": caption}, "photo", file_path, "image/png")
 
 
 def split_text(text: str, limit: int = 3500) -> List[str]:
@@ -355,8 +326,6 @@ def system_manage_keyboard() -> dict:
         "inline_keyboard": [
             [{"text": "📡 系统信息", "callback_data": "system:info"}],
             [{"text": "🌐 网络信息", "callback_data": "system:network"}],
-            [{"text": "🧪 IP 质量检测", "callback_data": "system:ipcheck"}],
-            [{"text": "📶 网络质量检测", "callback_data": "system:netcheck"}],
             [{"text": "🧽 一键清理", "callback_data": "confirm_global:system_cleanup"}],
             [{"text": "⬅️ 返回", "callback_data": "menu:home"}],
         ]
@@ -398,7 +367,7 @@ def project_keyboard(project_name: str) -> dict:
         "inline_keyboard": [
             [
                 {"text": "▶️ 启动", "callback_data": f"action:up:{project_name}"},
-                {"text": "⏹ 停止", "callback_data": f"action:down:{project_name}"},
+                {"text": "⏹ 停止", "callback_data": f"action:stop:{project_name}"},
             ],
             [
                 {"text": "🔄 重启", "callback_data": f"action:restart:{project_name}"},
@@ -834,32 +803,6 @@ def system_cleanup_text() -> str:
     )
 
 
-def _run_quality_check(chat_id: str, command: str, title: str) -> str:
-    with tempfile.TemporaryDirectory(prefix="tg-quality-") as tmpdir:
-        txt_path = os.path.join(tmpdir, "output.ans")
-        png_path = os.path.join(tmpdir, "output.png")
-        code, out = run_shell(["bash", "-lc", command], timeout=300)
-        if code != 0:
-            return f"{title}失败（exit={code}）\n{localize_docker_text(out)}"
-        with open(txt_path, "w", encoding="utf-8", errors="ignore") as f:
-            f.write(out)
-        if shutil.which("ansilove") is None:
-            return f"{title}完成，但未安装 ansilove，无法生成图片。\n\n{localize_docker_text(out)}"
-        png_code, png_out = run_shell(["ansilove", txt_path, "-o", png_path], timeout=120)
-        if png_code != 0 or not os.path.exists(png_path):
-            return f"{title}完成，但图片生成失败（exit={png_code}）\n{localize_docker_text(png_out)}\n\n{localize_docker_text(out)}"
-        send_photo(chat_id, png_path, title)
-        return f"{title}已发送"
-
-
-def ip_quality_check(chat_id: str) -> str:
-    return _run_quality_check(chat_id, "bash <(curl -sL IP.Check.Place) -4", "IP质量检测")
-
-
-def net_quality_check(chat_id: str) -> str:
-    return _run_quality_check(chat_id, "bash <(curl -Ls https://Net.Check.Place) -4", "网络质量检测")
-
-
 def home_text() -> str:
     docker_code, docker_status = run_shell(["systemctl", "is-active", "docker"], timeout=30)
     running_code, running_out = run_shell(["sh", "-lc", "docker ps -q | wc -l"], timeout=30)
@@ -907,12 +850,6 @@ def handle_text_command(chat_id: str, text: str) -> None:
     if cmd == "/system":
         send_message(chat_id, "系统管理", system_manage_keyboard())
         return
-    if cmd == "/ipcheck":
-        send_message(chat_id, ip_quality_check(chat_id), system_manage_keyboard())
-        return
-    if cmd == "/netcheck":
-        send_message(chat_id, net_quality_check(chat_id), system_manage_keyboard())
-        return
     if cmd == "/docker_overview":
         send_message(chat_id, docker_overview_text(), docker_manage_keyboard())
         return
@@ -942,8 +879,8 @@ def handle_text_command(chat_id: str, text: str) -> None:
         code, out = run_compose(project, ["up", "-d"])
         send_message(chat_id, f"[{project.name}] 启动完成(退出码={code})\n{localize_docker_text(out)}", project_keyboard(project.name))
         return
-    if cmd == "/down":
-        code, out = run_compose(project, ["down"])
+    if cmd == "/stop":
+        code, out = run_compose(project, ["stop"])
         send_message(chat_id, f"[{project.name}] 停止完成(退出码={code})\n{localize_docker_text(out)}", project_keyboard(project.name))
         return
     if cmd == "/delete":
@@ -1065,10 +1002,6 @@ def handle_callback(callback: dict) -> None:
             edit_message(chat_id, message_id, network_info_text(), system_manage_keyboard())
         elif data == "system:cleanup":
             edit_message(chat_id, message_id, system_cleanup_text(), system_manage_keyboard())
-        elif data == "system:ipcheck":
-            edit_message(chat_id, message_id, ip_quality_check(chat_id), system_manage_keyboard())
-        elif data == "system:netcheck":
-            edit_message(chat_id, message_id, net_quality_check(chat_id), system_manage_keyboard())
         else:
             edit_message(chat_id, message_id, "未知系统操作", system_manage_keyboard())
         return
@@ -1127,8 +1060,8 @@ def handle_callback(callback: dict) -> None:
         elif action == "up":
             code, out = run_compose(project, ["up", "-d"])
             text = f"[{project.name}] 启动完成(退出码={code})\n{localize_docker_text(out)}"
-        elif action == "down":
-            code, out = run_compose(project, ["down"])
+        elif action == "stop":
+            code, out = run_compose(project, ["stop"])
             text = f"[{project.name}] 停止完成(退出码={code})\n{localize_docker_text(out)}"
         elif action == "delete_container":
             code, out = run_compose(project, ["down", "-v", "--rmi", "all"])

@@ -11,9 +11,19 @@ SINGBOX_CONFIG="$SINGBOX_DIR/config.json"
 STATE_FILE='/etc/anyreality-singbox.env'
 SERVICE_NAME='sing-box'
 
+LOG_FILE='/var/log/anyreality-singbox.log'
+
 info() { echo -e "${GREEN}[信息] $*${RESET}"; }
 warn() { echo -e "${YELLOW}[警告] $*${RESET}"; }
 err() { echo -e "${RED}[错误] $*${RESET}" >&2; }
+
+setup_logging() {
+  mkdir -p "$(dirname "$LOG_FILE")"
+  touch "$LOG_FILE"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+  echo
+  echo "[$(date '+%F %T %Z')] anyreality-singbox script started"
+}
 
 require_root() {
   [[ "$(id -u)" -eq 0 ]] || { err '请用 root 运行'; exit 1; }
@@ -55,32 +65,69 @@ get_public_ip() {
 }
 
 ask_config() {
-  read -rp '请输入监听端口（留空随机生成）: ' PORT
-  if [[ -z "$PORT" ]]; then
+  if [[ -f "$STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+  fi
+
+  read -rp "请输入监听端口（留空随机生成，当前 ${PORT:-未设置}）: " INPUT_PORT
+  if [[ -n "$INPUT_PORT" ]]; then
+    PORT="$INPUT_PORT"
+  elif [[ -z "${PORT:-}" ]]; then
     PORT=$(shuf -i 10000-65535 -n 1)
   fi
 
-  read -rp '请输入用户名（留空随机生成）: ' USERNAME
-  USERNAME=${USERNAME:-user-$(tr -dc 'a-z0-9' </dev/urandom | head -c 6)}
+  read -rp "请输入用户名（留空随机生成，当前 ${USERNAME:-未设置}）: " INPUT_USERNAME
+  if [[ -n "$INPUT_USERNAME" ]]; then
+    USERNAME="$INPUT_USERNAME"
+  elif [[ -z "${USERNAME:-}" ]]; then
+    USERNAME=$(python3 - <<'PY'
+import secrets, string
+alphabet = string.ascii_lowercase + string.digits
+print('user-' + ''.join(secrets.choice(alphabet) for _ in range(6)))
+PY
+)
+  fi
 
-  read -rp '请输入密码（留空随机生成）: ' PASSWORD
-  PASSWORD=${PASSWORD:-$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12)}
+  read -rp "请输入密码（留空随机生成，当前 ${PASSWORD:-未设置}）: " INPUT_PASSWORD
+  if [[ -n "$INPUT_PASSWORD" ]]; then
+    PASSWORD="$INPUT_PASSWORD"
+  elif [[ -z "${PASSWORD:-}" ]]; then
+    PASSWORD=$(python3 - <<'PY'
+import secrets, string
+alphabet = string.ascii_letters + string.digits
+print(''.join(secrets.choice(alphabet) for _ in range(12)))
+PY
+)
+  fi
 
-  read -rp '请输入伪装域名/SNI（默认 yahoo.com）: ' SERVER_NAME
-  SERVER_NAME=${SERVER_NAME:-yahoo.com}
+  read -rp "请输入伪装域名/SNI（当前 ${SERVER_NAME:-www.amazon.com}）: " INPUT_SERVER_NAME
+  SERVER_NAME=${INPUT_SERVER_NAME:-${SERVER_NAME:-www.amazon.com}}
 
-  read -rp '请输入 short_id（默认 0123456789abcdef）: ' SHORT_ID
-  SHORT_ID=${SHORT_ID:-0123456789abcdef}
+  read -rp "请输入 short_id（当前 ${SHORT_ID:-0123456789abcdef}）: " INPUT_SHORT_ID
+  SHORT_ID=${INPUT_SHORT_ID:-${SHORT_ID:-0123456789abcdef}}
 
-  read -rp '请输入节点备注（默认 anytls-reality）: ' REMARK
-  REMARK=${REMARK:-anytls-reality}
+  read -rp "请输入节点备注（当前 ${REMARK:-anytls-reality-tls}）: " INPUT_REMARK
+  REMARK=${INPUT_REMARK:-${REMARK:-anytls-reality-tls}}
 }
 
 generate_or_use_key() {
-  read -rp '请输入 Reality 私钥（留空自动生成）: ' PRIVATE_KEY
-  if [[ -n "$PRIVATE_KEY" ]]; then
+  if [[ -f "$STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+  fi
+
+  read -rp "请输入 Reality 私钥（留空保持当前）: " INPUT_PRIVATE_KEY
+
+  if [[ -n "$INPUT_PRIVATE_KEY" ]]; then
+    PRIVATE_KEY="$INPUT_PRIVATE_KEY"
     PUBLIC_KEY='请手动根据你的私钥生成公钥'
     warn '你手填了私钥，脚本无法反推公钥；查看订阅时会提醒。'
+    return
+  fi
+
+  if [[ -n "${PRIVATE_KEY:-}" && -n "${PUBLIC_KEY:-}" ]]; then
+    info '沿用现有 Reality 私钥/公钥。'
     return
   fi
 
@@ -188,6 +235,9 @@ show_subscription() {
   echo "Reality ShortID: ${SHORT_ID}"
   echo "备注: ${REMARK}"
   echo
+  echo 'QX 配置：'
+  echo "anytls=${SERVER_IP}:${PORT}, password=${PASSWORD}, over-tls=true, tls-host=${SERVER_NAME}, reality-base64-pubkey=${PUBLIC_KEY}, reality-hex-shortid=${SHORT_ID}, udp-relay=true, tag=${REMARK}"
+  echo
   echo 'sing-box 客户端示例配置：'
   cat <<EOF
 {
@@ -226,9 +276,11 @@ install_app() {
 uninstall_app() {
   require_root
   systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+  apt-get remove -y sing-box >/dev/null 2>&1 || true
+  apt-get purge -y sing-box >/dev/null 2>&1 || true
   rm -f "$SINGBOX_CONFIG" "$STATE_FILE"
-  info '已移除 sing-box 配置与状态文件。'
-  warn 'sing-box 程序本体未卸载；如需要可手动卸载。'
+  rm -rf "$SINGBOX_DIR"
+  info '已卸载 sing-box、配置文件与状态文件。'
 }
 
 status_app() {
@@ -242,12 +294,12 @@ pause_return() {
 
 show_menu() {
   echo
-  echo '====== sing-box anytls reality 管理 ======'
+  echo '====== sing-box anytls+reality 管理 ======'
   echo '1. 安装'
   echo '2. 卸载'
   echo '3. 查看状态'
-  echo '4. 查看订阅/节点信息'
-  echo '5. 自定义参数重新安装'
+  echo '4. 查看节点信息'
+  echo '5. 修改配置'
   echo '0. 退出'
   echo
 }
@@ -268,4 +320,5 @@ menu_loop() {
   done
 }
 
+setup_logging
 menu_loop

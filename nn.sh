@@ -312,6 +312,18 @@ def main_keyboard() -> dict:
             [{"text": "📦 项目列表", "callback_data": "menu:list"}],
             [{"text": "🎬 应用快捷管理", "callback_data": "menu:apps"}],
             [{"text": "🐳 Docker 管理", "callback_data": "menu:docker"}],
+            [{"text": "🖥 系统管理", "callback_data": "menu:system"}],
+        ]
+    }
+
+
+def system_manage_keyboard() -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "📡 系统信息", "callback_data": "system:info"}],
+            [{"text": "🌐 网络信息", "callback_data": "system:network"}],
+            [{"text": "🧽 一键清理", "callback_data": "confirm_global:system_cleanup"}],
+            [{"text": "⬅️ 返回", "callback_data": "menu:home"}],
         ]
     }
 
@@ -568,10 +580,12 @@ def container_keyboard(name: str) -> dict:
 
 
 def global_confirm_keyboard(action: str) -> dict:
+    confirm_callback = "system:cleanup" if action == "system_cleanup" else ("docker:restart" if action == "docker_restart" else f"docker:{action}")
+    cancel_callback = "menu:system" if action == "system_cleanup" else "menu:docker"
     return {
         "inline_keyboard": [
-            [{"text": "✅ 确认执行", "callback_data": f"docker:{action}"}],
-            [{"text": "❌ 取消", "callback_data": "menu:docker"}],
+            [{"text": "✅ 确认执行", "callback_data": confirm_callback}],
+            [{"text": "❌ 取消", "callback_data": cancel_callback}],
         ]
     }
 
@@ -579,6 +593,8 @@ def global_confirm_keyboard(action: str) -> dict:
 def global_confirm_text(action: str) -> str:
     if action == "docker_restart":
         return "危险操作确认\n\n动作:重启 Docker\n\n这会重启 Docker 服务,短时间内可能影响容器连接。"
+    if action == "system_cleanup":
+        return "危险操作确认\n\n动作:一键清理系统日志/缓存/Docker垃圾\n\n这会清理 journal 日志、软件包缓存,以及 Docker 无用镜像、卷、网络。"
     return "未知确认操作"
 
 
@@ -593,7 +609,7 @@ def container_confirm_keyboard(action: str, name: str) -> dict:
 
 def container_confirm_text(action: str, name: str) -> str:
     if action == "remove":
-        return f"危险操作确认\n\n容器:{name}\n动作:删除容器\n\n这会执行 docker rm -f {name}。"
+        return f"危险操作确认\n\n容器:{name}\n动作:删除容器+镜像\n\n这会先删除容器，再尝试删除该容器使用的镜像。"
     return "未知确认操作"
 
 
@@ -611,8 +627,14 @@ def container_action_text(action: str, name: str) -> str:
         code, out = run_shell(["docker", "logs", "--tail", str(LOG_LINES_DEFAULT), name], timeout=120)
         return f"[{name}] 日志(退出码={code})\n{localize_docker_text(out)}"
     if action == "remove":
-        code, out = run_shell(["docker", "rm", "-f", name], timeout=120)
-        return f"[{name}] 删除容器完成(退出码={code})\n{localize_docker_text(out)}"
+        inspect_code, inspect_out = run_shell(["docker", "inspect", "-f", "{{.Config.Image}}", name], timeout=30)
+        image_name = inspect_out.strip() if inspect_code == 0 else ""
+        code1, out1 = run_shell(["docker", "rm", "-f", name], timeout=120)
+        if image_name:
+            code2, out2 = run_shell(["docker", "rmi", "-f", image_name], timeout=120)
+        else:
+            code2, out2 = 0, "(未获取到镜像名)"
+        return f"[{name}] 删除容器+镜像完成（rm={code1}, rmi={code2}）\n[删除容器]\n{localize_docker_text(out1)}\n\n[删除镜像]\n{localize_docker_text(out2)}"
     return "未知容器操作"
 
 
@@ -647,16 +669,16 @@ def docker_stats_text() -> str:
 
 
 def docker_restart_text() -> str:
-    code, out = run_shell(["systemctl", "restart", "docker"], timeout=120)
+    code, out = run_shell(["systemctl", "restart", "docker.service"], timeout=120)
     if code != 0:
-        return f"重启 Docker 失败（exit={code}）\n{out}"
-    time.sleep(3)
-    status_code, status_out = run_shell(["systemctl", "is-active", "docker"], timeout=30)
-    status = localize_docker_text(status_out.strip()) if status_code == 0 else f"未知（exit={status_code}）"
+        return f"重启 Docker 失败(exit={code})\n{out}"
+    time.sleep(5)
+    status_code, status_out = run_shell(["systemctl", "is-active", "docker.service"], timeout=30)
+    status = localize_docker_text(status_out.strip()) if status_code == 0 else f"未知(exit={status_code})"
     if status.strip() != "运行中":
-        detail_code, detail_out = run_shell(["systemctl", "status", "docker", "--no-pager"], timeout=60)
-        return f"Docker 重启后状态异常\n当前状态：{status}\n\n{localize_docker_text(detail_out)}"
-    return f"Docker 已重启\n当前状态：{status}"
+        detail_code, detail_out = run_shell(["journalctl", "-u", "docker.service", "-n", "20", "--no-pager"], timeout=60)
+        return f"Docker 重启后状态异常\n当前状态:{status}\n\n最近日志:\n{localize_docker_text(detail_out)}"
+    return f"✅ Docker 已重启\n当前状态:{status}"
 
 
 def docker_prune_text() -> str:
@@ -671,6 +693,112 @@ def docker_prune_text() -> str:
     )
 
 
+def _format_bytes(num: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(num)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.2f} {unit}"
+        value /= 1024
+    return f"{num} B"
+
+
+def system_info_text() -> str:
+    hostname = run_shell(["hostname"], timeout=10)[1]
+    os_info = run_shell(["sh", "-lc", ". /etc/os-release 2>/dev/null; echo ${PRETTY_NAME:-未知系统}"], timeout=10)[1]
+    kernel = run_shell(["uname", "-r"], timeout=10)[1]
+    arch = run_shell(["uname", "-m"], timeout=10)[1]
+    cpu_model = run_shell(["sh", "-lc", "lscpu | awk -F: '/Model name/ {gsub(/^ +/,\"\",$2); print $2; exit}'"], timeout=10)[1]
+    cpu_cores = run_shell(["nproc"], timeout=10)[1]
+    mem = run_shell(["sh", "-lc", "free -h | awk '/Mem:/ {print $3 \" / \" $2}'"], timeout=10)[1]
+    swap_total = run_shell(["sh", "-lc", "free -b | awk '/Swap:/ {print $2}'"], timeout=10)[1].strip()
+    swap_used = run_shell(["sh", "-lc", "free -h | awk '/Swap:/ {print $3}'"], timeout=10)[1].strip()
+    swap_total_h = run_shell(["sh", "-lc", "free -h | awk '/Swap:/ {print $2}'"], timeout=10)[1].strip()
+    swap = "未启用" if swap_total in {"0", "0B", "0.0B", ""} or swap_total_h in {"0B", "0", "0.0B"} else f"{swap_used} / {swap_total_h}"
+    disk = run_shell(["sh", "-lc", "df -h / | awk 'NR==2 {print $3 \" / \" $2 \" (\" $5 \")\"}'"], timeout=10)[1]
+    dns = run_shell(["sh", "-lc", "grep '^nameserver' /etc/resolv.conf | awk '{print $2}' | paste -sd ',' -"], timeout=10)[1]
+    ipv4 = run_shell(["sh", "-lc", "curl -4s --max-time 5 https://api.ipify.org || wget -4qO- --timeout=5 https://api.ipify.org || true"], timeout=10)[1]
+    ipv6 = run_shell(["sh", "-lc", "curl -6s --max-time 5 https://api64.ipify.org || wget -6qO- --timeout=5 https://api64.ipify.org || true"], timeout=10)[1]
+    geo = run_shell(["sh", "-lc", "curl -4s --max-time 5 https://ipinfo.io/json || wget -4qO- --timeout=5 https://ipinfo.io/json || true"], timeout=10)[1]
+    isp = city = country = org = "未知"
+    try:
+        geo_data = json.loads(geo)
+        city = geo_data.get("city") or "未知"
+        country = geo_data.get("country") or "未知"
+        org = geo_data.get("org") or "未知"
+    except Exception:
+        pass
+    uptime = run_shell(["uptime", "-p"], timeout=10)[1]
+    uptime = (uptime.replace("up ", "")
+                    .replace(" hours", " 小时")
+                    .replace(" hour", " 小时")
+                    .replace(" minutes", " 分钟")
+                    .replace(" minute", " 分钟")
+                    .replace(" days", " 天")
+                    .replace(" day", " 天")
+                    .replace(",", ""))
+    current_time = run_shell(["date", "+%Y-%m-%d %H:%M:%S %Z"], timeout=10)[1]
+    traffic = run_shell(["python3", "-c", "import os; rx=tx=0\nfrom pathlib import Path\nfor line in Path('/proc/net/dev').read_text().splitlines()[2:]:\n    iface,data=line.split(':',1)\n    iface=iface.strip()\n    if iface=='lo':\n        continue\n    cols=data.split()\n    rx += int(cols[0]); tx += int(cols[8])\nprint(f'{rx} {tx}')"], timeout=10)[1].split()
+    total_rx = _format_bytes(int(traffic[0])) if len(traffic) == 2 else "未知"
+    total_tx = _format_bytes(int(traffic[1])) if len(traffic) == 2 else "未知"
+    congestion = run_shell(["sh", "-lc", "cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo 未知"], timeout=10)[1]
+    qdisc = run_shell(["sh", "-lc", "cat /proc/sys/net/core/default_qdisc 2>/dev/null || echo 未知"], timeout=10)[1]
+    return (
+        "📡 VPS 系统信息\n"
+        "━━━━━━━━━━\n"
+        f"主机名:{hostname}\n"
+        f"运营商:{org}\n"
+        f"地理位置:{country} {city}\n"
+        f"系统版本:{os_info}\n"
+        f"内核版本:{kernel}\n"
+        f"CPU 架构:{arch}\n"
+        f"CPU 型号:{cpu_model}\n"
+        f"CPU 核心数:{cpu_cores}\n"
+        f"物理内存:{mem}\n"
+        f"虚拟内存:{swap}\n"
+        f"硬盘占用:{disk}\n"
+        f"总接收:{total_rx}\n"
+        f"总发送:{total_tx}\n"
+        f"网络拥堵算法:{congestion} {qdisc}\n"
+        f"公网 IPv4:{ipv4 or '无'}\n"
+        f"公网 IPv6:{ipv6 or '无'}\n"
+        f"DNS 服务器:{dns or '无'}\n"
+        f"系统时间:{current_time}\n"
+        f"运行时长:{uptime}"
+    )
+
+
+def network_info_text() -> str:
+    interfaces = run_shell(["sh", "-lc", "for IFACE in $(ls /sys/class/net/); do echo \"接口: $IFACE\"; ip -4 addr show $IFACE | grep -oP 'inet \\K[\\d./]+' | sed 's/^/IPv4: /' || echo 'IPv4: 无'; ip -6 addr show $IFACE scope global | grep -oP 'inet6 \\K[0-9a-f:]+/[0-9]+' | sed 's/^/IPv6: /' || echo 'IPv6: 无'; ip -6 addr show $IFACE scope link | grep -oP 'inet6 \\K[0-9a-f:]+/[0-9]+' | sed 's/^/链路本地 IPv6: /' || true; echo \"MAC: $(cat /sys/class/net/$IFACE/address)\"; echo; done"], timeout=30)[1]
+    route4 = run_shell(["ip", "route", "show", "default"], timeout=10)[1]
+    route6 = run_shell(["ip", "-6", "route", "show", "default"], timeout=10)[1]
+    ping4 = run_shell(["ping", "-c", "2", "-W", "2", "8.8.8.8"], timeout=10)[1]
+    ping6 = run_shell(["ping6", "-c", "2", "-W", "2", "google.com"], timeout=10)[1]
+    return (
+        "🌐 VPS 网络信息\n"
+        "━━━━━━━━━━\n"
+        f"【网络接口】\n{interfaces}\n"
+        f"【默认路由】\nIPv4 默认路由:\n{route4}\n\nIPv6 默认路由:\n{route6}\n\n"
+        f"【网络连通性测试】\nIPv4 测试:\n{ping4}\n\nIPv6 测试:\n{ping6}"
+    )
+
+
+def system_cleanup_text() -> str:
+    j_code, j_out = run_shell(["journalctl", "--vacuum-time=7d"], timeout=120)
+    a_code, a_out = run_shell(["apt-get", "clean"], timeout=120)
+    i_code, i_out = run_shell(["docker", "image", "prune", "-a", "-f"], timeout=120)
+    v_code, v_out = run_shell(["docker", "volume", "prune", "-f"], timeout=120)
+    n_code, n_out = run_shell(["docker", "network", "prune", "-f"], timeout=120)
+    return (
+        "系统清理完成\n\n"
+        f"[日志清理] exit={j_code}\n{localize_docker_text(j_out)}\n\n"
+        f"[缓存清理] exit={a_code}\n{localize_docker_text(a_out)}\n\n"
+        f"[无用镜像] exit={i_code}\n{localize_docker_text(i_out)}\n\n"
+        f"[无用卷] exit={v_code}\n{localize_docker_text(v_out)}\n\n"
+        f"[无用网络] exit={n_code}\n{localize_docker_text(n_out)}"
+    )
+
+
 def home_text() -> str:
     docker_code, docker_status = run_shell(["systemctl", "is-active", "docker"], timeout=30)
     running_code, running_out = run_shell(["sh", "-lc", "docker ps -q | wc -l"], timeout=30)
@@ -682,7 +810,7 @@ def home_text() -> str:
     all_line = all_out.strip() if all_code == 0 else "获取失败"
 
     return (
-        "Docker 运行面板\n\n"
+        "Docker 运行面板\n"
         f"Docker 状态:{docker_line}\n"
         f"运行中的容器:{running_line}\n"
         f"全部容器:{all_line}\n"
@@ -714,6 +842,9 @@ def handle_text_command(chat_id: str, text: str) -> None:
         return
     if cmd == "/docker":
         send_message(chat_id, "Docker 管理", docker_manage_keyboard())
+        return
+    if cmd == "/system":
+        send_message(chat_id, "系统管理", system_manage_keyboard())
         return
     if cmd == "/docker_overview":
         send_message(chat_id, docker_overview_text(), docker_manage_keyboard())
@@ -822,6 +953,11 @@ def handle_callback(callback: dict) -> None:
         edit_message(chat_id, message_id, "Docker 管理", docker_manage_keyboard())
         return
 
+    if data == "menu:system":
+        answer_callback(callback_id)
+        edit_message(chat_id, message_id, "系统管理", system_manage_keyboard())
+        return
+
     if data == "menu:apps":
         answer_callback(callback_id)
         edit_message(chat_id, message_id, "应用快捷管理", custom_apps_keyboard())
@@ -852,6 +988,18 @@ def handle_callback(callback: dict) -> None:
             edit_message(chat_id, message_id, docker_prune_text(), docker_manage_keyboard())
         else:
             edit_message(chat_id, message_id, "未知 Docker 操作", docker_manage_keyboard())
+        return
+
+    if data.startswith("system:"):
+        answer_callback(callback_id)
+        if data == "system:info":
+            edit_message(chat_id, message_id, system_info_text(), system_manage_keyboard())
+        elif data == "system:network":
+            edit_message(chat_id, message_id, network_info_text(), system_manage_keyboard())
+        elif data == "system:cleanup":
+            edit_message(chat_id, message_id, system_cleanup_text(), system_manage_keyboard())
+        else:
+            edit_message(chat_id, message_id, "未知系统操作", system_manage_keyboard())
         return
 
     if data.startswith("confirm_global:"):

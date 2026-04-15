@@ -1,317 +1,154 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
+# ========================================
+# tg-disk 一键管理
+# ========================================
 
-GREEN='\033[32m'
-RED='\033[31m'
-YELLOW='\033[33m'
-RESET='\033[0m'
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-SINGBOX_DIR='/etc/sing-box'
-SINGBOX_CONFIG="$SINGBOX_DIR/config.json"
-STATE_FILE='/etc/anyreality-singbox.env'
-SERVICE_NAME='sing-box'
+APP_NAME="tg-disk"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+ENV_FILE="$APP_DIR/.env"
 
-LOG_FILE='/var/log/anyreality-singbox.log'
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
 
-info() { echo -e "${GREEN}[信息] $*${RESET}"; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}"; }
-err() { echo -e "${RED}[错误] $*${RESET}" >&2; }
-
-setup_logging() {
-  mkdir -p "$(dirname "$LOG_FILE")"
-  touch "$LOG_FILE"
-  exec > >(tee -a "$LOG_FILE") 2>&1
-  echo
-  echo "[$(date '+%F %T %Z')] anyreality-singbox script started"
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
+    fi
 }
 
-require_root() {
-  [[ "$(id -u)" -eq 0 ]] || { err '请用 root 运行'; exit 1; }
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
 }
 
-require_debian_ubuntu() {
-  [[ -f /etc/os-release ]] || { err '无法识别系统，只支持 Debian/Ubuntu'; exit 1; }
-  . /etc/os-release
-  case "${ID:-}" in
-    debian|ubuntu) ;;
-    *) [[ "${ID_LIKE:-}" == *debian* ]] || { err "只支持 Debian/Ubuntu，当前: ${PRETTY_NAME:-unknown}"; exit 1; } ;;
-  esac
-}
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== tg-disk 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-install_deps() {
-  info '安装依赖...'
-  apt-get update
-  apt-get install -y curl wget unzip ca-certificates uuid-runtime
-}
-
-install_singbox() {
-  if command -v sing-box >/dev/null 2>&1; then
-    info '检测到 sing-box，跳过安装。'
-    return
-  fi
-  info '安装 sing-box...'
-  bash <(curl -fsSL https://sing-box.app/install.sh)
-}
-
-get_public_ip() {
-  local ip=''
-  for url in https://api.ipify.org https://ip.sb https://checkip.amazonaws.com; do
-    ip=$(curl -4s --max-time 5 "$url" 2>/dev/null || true)
-    [[ -n "$ip" ]] && { echo "$ip"; return; }
-    ip=$(wget -4qO- --timeout=5 "$url" 2>/dev/null || true)
-    [[ -n "$ip" ]] && { echo "$ip"; return; }
-  done
-  hostname -I | awk '{print $1}'
-}
-
-ask_config() {
-  if [[ -f "$STATE_FILE" ]]; then
-    # shellcheck disable=SC1090
-    source "$STATE_FILE"
-  fi
-
-  read -rp "请输入监听端口（留空随机生成，当前 ${PORT:-未设置}）: " INPUT_PORT
-  if [[ -n "$INPUT_PORT" ]]; then
-    PORT="$INPUT_PORT"
-  elif [[ -z "${PORT:-}" ]]; then
-    PORT=$(shuf -i 10000-65535 -n 1)
-  fi
-
-  read -rp "请输入用户名（留空随机生成，当前 ${USERNAME:-未设置}）: " INPUT_USERNAME
-  if [[ -n "$INPUT_USERNAME" ]]; then
-    USERNAME="$INPUT_USERNAME"
-  elif [[ -z "${USERNAME:-}" ]]; then
-    USERNAME=$(python3 - <<'PY'
-import secrets, string
-alphabet = string.ascii_lowercase + string.digits
-print('user-' + ''.join(secrets.choice(alphabet) for _ in range(6)))
-PY
-)
-  fi
-
-  read -rp "请输入密码（留空随机生成，当前 ${PASSWORD:-未设置}）: " INPUT_PASSWORD
-  if [[ -n "$INPUT_PASSWORD" ]]; then
-    PASSWORD="$INPUT_PASSWORD"
-  elif [[ -z "${PASSWORD:-}" ]]; then
-    PASSWORD=$(python3 - <<'PY'
-import secrets, string
-alphabet = string.ascii_letters + string.digits
-print(''.join(secrets.choice(alphabet) for _ in range(12)))
-PY
-)
-  fi
-
-  read -rp "请输入伪装域名/SNI（当前 ${SERVER_NAME:-www.amazon.com}）: " INPUT_SERVER_NAME
-  SERVER_NAME=${INPUT_SERVER_NAME:-${SERVER_NAME:-www.amazon.com}}
-
-  read -rp "请输入 short_id（留空随机生成，当前 ${SHORT_ID:-未设置}）: " INPUT_SHORT_ID
-  if [[ -n "$INPUT_SHORT_ID" ]]; then
-    SHORT_ID="$INPUT_SHORT_ID"
-  elif [[ -z "${SHORT_ID:-}" ]]; then
-    SHORT_ID=$(python3 - <<'PY'
-import secrets
-print(secrets.token_hex(8))
-PY
-)
-  fi
-
-  read -rp "请输入节点备注（当前 ${REMARK:-anytls-reality-tls}）: " INPUT_REMARK
-  REMARK=${INPUT_REMARK:-${REMARK:-anytls-reality-tls}}
-}
-
-generate_or_use_key() {
-  if [[ -n "${PRIVATE_KEY:-}" && -n "${PUBLIC_KEY:-}" ]]; then
-    info '沿用现有 Reality 私钥/公钥。'
-    return
-  fi
-
-  KEY_OUT=$(sing-box generate reality-keypair)
-  PRIVATE_KEY=$(awk '/PrivateKey/ {print $2}' <<< "$KEY_OUT")
-  PUBLIC_KEY=$(awk '/PublicKey/ {print $2}' <<< "$KEY_OUT")
-}
-
-write_config() {
-  mkdir -p "$SINGBOX_DIR"
-
-  cat > "$SINGBOX_CONFIG" <<EOF
-{
-  "inbounds": [
-    {
-      "type": "anytls",
-      "listen": "::",
-      "listen_port": ${PORT},
-      "users": [
-        {
-          "name": "${USERNAME}",
-          "password": "${PASSWORD}"
-        }
-      ],
-      "padding_scheme": [
-        "stop=8",
-        "0=30-30",
-        "1=100-400",
-        "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
-        "3=9-9,500-1000",
-        "4=500-1000",
-        "5=500-1000",
-        "6=500-1000",
-        "7=500-1000"
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${SERVER_NAME}",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "${SERVER_NAME}",
-            "server_port": 443
-          },
-          "private_key": "${PRIVATE_KEY}",
-          "short_id": "${SHORT_ID}"
-        }
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct"
-    }
-  ]
-}
-EOF
-}
-
-save_state() {
-  SERVER_IP=$(get_public_ip)
-  cat > "$STATE_FILE" <<EOF
-PORT='${PORT}'
-USERNAME='${USERNAME}'
-PASSWORD='${PASSWORD}'
-SERVER_NAME='${SERVER_NAME}'
-SHORT_ID='${SHORT_ID}'
-REMARK='${REMARK}'
-PRIVATE_KEY='${PRIVATE_KEY}'
-PUBLIC_KEY='${PUBLIC_KEY}'
-SERVER_IP='${SERVER_IP}'
-EOF
-  chmod 600 "$STATE_FILE"
-}
-
-load_state() {
-  [[ -f "$STATE_FILE" ]] || { err '未找到已安装配置'; return 1; }
-  # shellcheck disable=SC1090
-  source "$STATE_FILE"
-}
-
-open_firewall() {
-  if command -v ufw >/dev/null 2>&1; then
-    ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
-  fi
-}
-
-start_service() {
-  systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
-  systemctl restart "$SERVICE_NAME"
-  systemctl --no-pager --full status "$SERVICE_NAME" || true
-}
-
-show_subscription() {
-  require_root
-  load_state || return 1
-  echo
-  info '当前节点信息'
-  echo "服务器 IP: ${SERVER_IP}"
-  echo "端口: ${PORT}"
-  echo "用户名: ${USERNAME}"
-  echo "密码: ${PASSWORD}"
-  echo "SNI: ${SERVER_NAME}"
-  echo "Reality PublicKey: ${PUBLIC_KEY}"
-  echo "Reality ShortID: ${SHORT_ID}"
-  echo "备注: ${REMARK}"
-  echo
-  echo 'QuantumultX 配置：'
-  echo "anytls=${SERVER_IP}:${PORT}, password=${PASSWORD}, over-tls=true, tls-host=${SERVER_NAME}, reality-base64-pubkey=${PUBLIC_KEY}, reality-hex-shortid=${SHORT_ID}, udp-relay=true, tag=${REMARK}"
-  echo
-  echo 'sing-box 客户端示例配置：'
-  cat <<EOF
-{
-  "type": "anytls",
-  "tag": "${REMARK}",
-  "server": "${SERVER_IP}",
-  "server_port": ${PORT},
-  "password": "${PASSWORD}",
-  "tls": {
-    "enabled": true,
-    "server_name": "${SERVER_NAME}",
-    "reality": {
-      "enabled": true,
-      "public_key": "${PUBLIC_KEY}",
-      "short_id": "${SHORT_ID}"
-    }
-  }
-}
-EOF
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
 }
 
 install_app() {
-  require_root
-  require_debian_ubuntu
-  install_deps
-  install_singbox
-  ask_config
-  generate_or_use_key
-  write_config
-  save_state
-  open_firewall
-  start_service
-  show_subscription
+
+    check_docker
+    mkdir -p "$APP_DIR"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
+
+    read -p "请输入访问端口 [默认:8080]: " input_port
+    PORT=${input_port:-8080}
+    check_port "$PORT" || return
+
+    read -p "请输入 BOT_TOKEN: " BOT_TOKEN
+    read -p "请输入 CHAT_ID: " CHAT_ID
+    read -p "请输入访问密码 [默认:yohann]: " input_pwd
+    ACCESS_PWD=${input_pwd:-yohann}
+
+    read -p "是否使用代理(留空跳过): " PROXY
+    read -p "请输入 BASE_URL(文件访问基础 URL可留空): " BASE_URL
+
+    # 写入 .env
+    cat > "$ENV_FILE" <<EOF
+PORT=${PORT}
+BOT_TOKEN=${BOT_TOKEN}
+CHAT_ID=${CHAT_ID}
+ACCESS_PWD=${ACCESS_PWD}
+PROXY=${PROXY}
+BASE_URL=${BASE_URL}
+
+DOWNLOAD_THREADS=8
+CHUNK_SIZE_MB=10
+CHUNK_CONCURRENT=4
+FILES_CONCURRENT=2
+EOF
+
+    # 写入 docker-compose.yml
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  tg-disk:
+    image: ghcr.io/yohann0617/tg-disk:master
+    container_name: tg-disk
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORT}:8080"
+    volumes:
+      - ${ENV_FILE}:/app/.env
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    echo
+    echo -e "${GREEN}✅ tg-disk 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📂 配置文件: $ENV_FILE${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ tg-disk 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+    docker restart tg-disk
+    echo -e "${GREEN}✅ tg-disk 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    docker logs -f tg-disk
+}
+
+check_status() {
+    docker ps | grep tg-disk
+    read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
-  require_root
-  systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
-  apt-get remove -y sing-box >/dev/null 2>&1 || true
-  apt-get purge -y sing-box >/dev/null 2>&1 || true
-  rm -f "$SINGBOX_CONFIG" "$STATE_FILE"
-  rm -rf "$SINGBOX_DIR"
-  info '已卸载 sing-box、配置文件与状态文件。'
+    cd "$APP_DIR" || return
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ tg-disk 已彻底卸载${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-status_app() {
-  systemctl --no-pager --full status "$SERVICE_NAME" || true
-}
-
-pause_return() {
-  echo
-  read -rp '按回车返回菜单...' _
-}
-
-show_menu() {
-  echo
-  echo '====== sing-box anytls+reality 管理 ======'
-  echo '1. 安装'
-  echo '2. 卸载'
-  echo '3. 查看状态'
-  echo '4. 查看节点信息'
-  echo '5. 修改配置'
-  echo '0. 退出'
-}
-
-menu_loop() {
-  while true; do
-    show_menu
-    read -rp '请输入选项: ' choice
-    case "$choice" in
-      1) install_app; pause_return ;;
-      2) uninstall_app; pause_return ;;
-      3) status_app; pause_return ;;
-      4) show_subscription; pause_return ;;
-      5) install_app; pause_return ;;
-      0) exit 0 ;;
-      *) err '无效选项'; pause_return ;;
-    esac
-  done
-}
-
-setup_logging
-menu_loop
+menu

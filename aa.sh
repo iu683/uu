@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Sing-box AnyReality 多节点管理（模板统一版）
+# Sing-box AnyReality 多节点管理
 # ========================================
 
 GREEN="\033[32m"
@@ -37,13 +37,13 @@ get_public_ip() {
             ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
-    echo "无法获取公网 IP 地址。" && return
+    return
 }
 
 # ===== 端口检测 =====
 check_port_loop(){
     local port=$1
-    while ss -tulnp | awk '{print $5}' | grep -wq ":$port"; do
+    while ss -tuln | grep -q ":$port "; do
         error "端口 $port 已占用"
         read -p "重新输入端口: " port
     done
@@ -65,17 +65,34 @@ list_nodes(){
 
 # ===== 选择节点 =====
 select_node(){
-    list_nodes
-    read -p "输入节点名称或编号: " input
+    mkdir -p "$APP_DIR"
+
+    mapfile -t NODE_LIST < <(find "$APP_DIR" -mindepth 1 -maxdepth 1 -type d | sort)
+
+    if [ ${#NODE_LIST[@]} -eq 0 ]; then
+        error "无节点"
+        return 1
+    fi
+
+    echo -e "${GREEN}=== 已有节点 ===${RESET}"
+    for i in "${!NODE_LIST[@]}"; do
+        echo -e "${YELLOW}[$((i+1))] $(basename "${NODE_LIST[$i]}")${RESET}"
+    done
+
+    read -r -p $'\033[32m请输入节点名称或编号: \033[0m' input
 
     if [[ "$input" =~ ^[0-9]+$ ]]; then
-        NODE_NAME=$(ls -d "$APP_DIR"/* | sed -n "${input}p" | xargs basename)
+        NODE_NAME=$(basename "${NODE_LIST[$((input-1))]}")
     else
         NODE_NAME="$input"
     fi
 
     NODE_DIR="$APP_DIR/$NODE_NAME"
-    [ ! -d "$NODE_DIR" ] && error "节点不存在" && return 1
+
+    if [ ! -d "$NODE_DIR" ]; then
+        error "节点不存在"
+        return 1
+    fi
 }
 
 # ===== 安装节点 =====
@@ -164,12 +181,18 @@ ShortID: ${SHORT_ID}
 EOF
 
     info "节点创建完成"
-    show_node_info
+    show_node_info "$NODE_NAME"
 }
 
-# ===== 查看节点信息 =====
+# ===== 查看节点信息=====
 show_node_info(){
-    select_node || return
+    if [ -n "$1" ]; then
+        NODE_NAME="$1"
+        NODE_DIR="$APP_DIR/$NODE_NAME"
+        [ ! -d "$NODE_DIR" ] && error "节点不存在" && return
+    else
+        select_node || return
+    fi
 
     clear
     info "当前节点 [$NODE_NAME]"
@@ -208,7 +231,7 @@ show_node_info(){
 }
 EOF
 
-    read -p "回车返回..."
+    read -r -p $'\033[32m按回车返回菜单...\033[0m'
 }
 
 # ===== 节点管理 =====
@@ -217,22 +240,30 @@ node_action_menu(){
 
     while true; do
         echo -e "${GREEN}=== 节点 [$NODE_NAME] 管理 ===${RESET}"
-        echo -e "${GREEN}1) 暂停${RESET}"
-        echo -e "${GREEN}2) 重启${RESET}"
-        echo -e "${GREEN}3) 更新${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 卸载${RESET}"
+        echo -e "${GREEN}1) 停止${RESET}"
+        echo -e "${GREEN}2) 启动${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 更新${RESET}"
+        echo -e "${GREEN}5) 查看日志${RESET}"
         echo -e "${GREEN}6) 查看节点信息${RESET}"
+        echo -e "${GREEN}7) 卸载${RESET}"
         echo -e "${GREEN}0) 返回主菜单${RESET}"
+
         read -r -p $'\033[32m请选择操作: \033[0m' choice
 
-        case $c in
+        case $choice in
             1) docker stop singbox-$NODE_NAME ;;
             2) docker start singbox-$NODE_NAME ;;
             3) docker restart singbox-$NODE_NAME ;;
-            4) docker logs -f singbox-$NODE_NAME ;;
-            5) docker rm -f singbox-$NODE_NAME && rm -rf "$NODE_DIR" && return ;;
-            6) show_node_info ;;
+            4)
+                docker compose -f "$NODE_DIR/docker-compose.yml" pull
+                docker compose -f "$NODE_DIR/docker-compose.yml" up -d
+                ;;
+            5) docker logs -f singbox-$NODE_NAME ;;
+            6) show_node_info "$NODE_NAME" ;;
+            7)
+               docker rm -f singbox-$NODE_NAME && rm -rf "$NODE_DIR" && return
+               ;;
             0) return ;;
         esac
     done
@@ -327,28 +358,28 @@ show_all_status(){
         [ -z "$STATUS" ] && STATUS="未运行"
         echo "$NODE_NAME | $STATUS"
     done
-    read
+    read -r -p $'\033[32m按回车返回菜单...\033[0m'
 }
 
 # ===== 主菜单 =====
 menu(){
     while true; do
         clear
-        echo -e "${GREEN}=== Sing-box 多节点管理 ===${RESET}"
+        echo -e "${GREEN}=== Sing-box AnyReality 多节点管理 ===${RESET}"
         echo -e "${GREEN}1) 安装节点${RESET}"
         echo -e "${GREEN}2) 管理节点${RESET}"
         echo -e "${GREEN}3) 查看所有节点状态${RESET}"
         echo -e "${GREEN}4) 批量操作节点${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -r -p $'\033[32m请选择操作: \033[0m' choice
-        
 
-        case $c in
+        case $choice in
             1) install_node ;;
             2) node_action_menu ;;
             3) show_all_status ;;
             4) batch_action ;;
             0) exit ;;
+            *) warn "无效选择" ;;
         esac
     done
 }

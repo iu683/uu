@@ -104,28 +104,22 @@ PY
   read -rp "请输入伪装域名/SNI（当前 ${SERVER_NAME:-www.amazon.com}）: " INPUT_SERVER_NAME
   SERVER_NAME=${INPUT_SERVER_NAME:-${SERVER_NAME:-www.amazon.com}}
 
-  read -rp "请输入 short_id（当前 ${SHORT_ID:-0123456789abcdef}）: " INPUT_SHORT_ID
-  SHORT_ID=${INPUT_SHORT_ID:-${SHORT_ID:-0123456789abcdef}}
+  read -rp "请输入 short_id（留空随机生成，当前 ${SHORT_ID:-未设置}）: " INPUT_SHORT_ID
+  if [[ -n "$INPUT_SHORT_ID" ]]; then
+    SHORT_ID="$INPUT_SHORT_ID"
+  elif [[ -z "${SHORT_ID:-}" ]]; then
+    SHORT_ID=$(python3 - <<'PY'
+import secrets
+print(secrets.token_hex(8))
+PY
+)
+  fi
 
   read -rp "请输入节点备注（当前 ${REMARK:-anytls-reality-tls}）: " INPUT_REMARK
   REMARK=${INPUT_REMARK:-${REMARK:-anytls-reality-tls}}
 }
 
 generate_or_use_key() {
-  if [[ -f "$STATE_FILE" ]]; then
-    # shellcheck disable=SC1090
-    source "$STATE_FILE"
-  fi
-
-  read -rp "请输入 Reality 私钥（留空保持当前）: " INPUT_PRIVATE_KEY
-
-  if [[ -n "$INPUT_PRIVATE_KEY" ]]; then
-    PRIVATE_KEY="$INPUT_PRIVATE_KEY"
-    PUBLIC_KEY='请手动根据你的私钥生成公钥'
-    warn '你手填了私钥，脚本无法反推公钥；查看订阅时会提醒。'
-    return
-  fi
-
   if [[ -n "${PRIVATE_KEY:-}" && -n "${PUBLIC_KEY:-}" ]]; then
     info '沿用现有 Reality 私钥/公钥。'
     return
@@ -235,7 +229,7 @@ show_subscription() {
   echo "Reality ShortID: ${SHORT_ID}"
   echo "备注: ${REMARK}"
   echo
-  echo 'QX 配置：'
+  echo 'QuantumultX 配置：'
   echo "anytls=${SERVER_IP}:${PORT}, password=${PASSWORD}, over-tls=true, tls-host=${SERVER_NAME}, reality-base64-pubkey=${PUBLIC_KEY}, reality-hex-shortid=${SHORT_ID}, udp-relay=true, tag=${REMARK}"
   echo
   echo 'sing-box 客户端示例配置：'
@@ -301,7 +295,6 @@ show_menu() {
   echo '4. 查看节点信息'
   echo '5. 修改配置'
   echo '0. 退出'
-  echo
 }
 
 menu_loop() {

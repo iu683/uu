@@ -1,270 +1,179 @@
-#!/bin/bash
-# ========================================
-# flux-panel 管理
-# ========================================
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_NAME="OpenCode Manager"
+BIN="opencode"
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="flux"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-ENV_FILE="$APP_DIR/.env"
+info(){ echo -e "${GREEN}[信息] $1${RESET}"; }
+warn(){ echo -e "${YELLOW}[警告] $1${RESET}"; }
+err(){ echo -e "${RED}[错误] $1${RESET}"; }
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
+pause(){ read -rp "按回车继续..." _; }
+
+# ==============================
+# 环境检测
+# ==============================
+check_env() {
+    info "检查 Node.js 环境..."
+
+    if ! command -v node >/dev/null 2>&1; then
+        warn "未检测到 Node.js，自动安装中..."
+        curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+        apt-get install -y nodejs
     fi
 
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+    if ! command -v npm >/dev/null 2>&1; then
+        err "npm 不存在，安装失败"
         exit 1
     fi
+
+    info "环境正常"
 }
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用！${RESET}"
-        return 1
+# ==============================
+# 安装
+# ==============================
+install_opencode() {
+    check_env
+    info "安装 OpenCode..."
+
+    npm install -g opencode-ai || {
+        err "安装失败"
+        return
+    }
+
+    info "安装完成"
+}
+
+# ==============================
+# 登录
+# ==============================
+login_opencode() {
+    if ! command -v opencode >/dev/null 2>&1; then
+        err "请先安装 OpenCode"
+        return
     fi
-    return 0
+
+    info "开始登录 Provider..."
+    opencode providers login
+}
+# ==============================
+# 登录状态
+# ==============================
+status_opencode() {
+    if ! command -v $BIN >/dev/null 2>&1; then
+        warn "未安装"
+        return
+    fi
+
+    info "当前 Provider 状态："
+
+    if opencode providers list >/dev/null 2>&1; then
+        opencode providers list
+    else
+        warn "未配置任何 Provider（未登录）"
+    fi
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
+# ==============================
+# 版本
+# ==============================
+version_opencode() {
+    echo -e "${CYAN}===== 版本信息 =====${RESET}"
+
+    if command -v opencode >/dev/null 2>&1; then
+        echo "OpenCode: $(opencode --version)"
+    else
+        echo "OpenCode: 未安装"
+    fi
+
+    echo "Node.js: $(node -v 2>/dev/null || echo 未安装)"
+    echo "npm: $(npm -v 2>/dev/null || echo 未安装)"
 }
 
+# ==============================
+# 交互模式
+# ==============================
+interactive_opencode() {
+    if command -v opencode >/dev/null 2>&1; then
+        info "进入交互模式（Ctrl+C 退出）"
+        opencode
+    else
+        err "未安装 opencode"
+    fi
+}
+
+# ==============================
+# 更新
+# ==============================
+update_opencode() {
+    info "更新 OpenCode..."
+    npm update -g opencode-ai || warn "更新失败"
+    info "完成"
+}
+
+# ==============================
+# 卸载
+# ==============================
+uninstall_opencode() {
+    warn "卸载 OpenCode..."
+
+    npm uninstall -g opencode-ai || true
+
+    info "已卸载"
+}
+
+# ==============================
+# 环境信息
+# ==============================
+env_info() {
+    echo -e "${CYAN}===== 环境信息 =====${RESET}"
+    echo "系统: $(uname -a)"
+    echo "Node: $(node -v 2>/dev/null || echo 未安装)"
+    echo "npm: $(npm -v 2>/dev/null || echo 未安装)"
+    echo "OpenCode: $(opencode --version 2>/dev/null || echo 未安装)"
+    echo "PATH: $PATH"
+}
+
+# ==============================
+# 菜单
+# ==============================
 menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== Flux 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+    clear
+    echo -e "${CYAN}==== $APP_NAME ==== ${RESET}"
+    echo "1. 安装 OpenCode"
+    echo "2. 登录"
+    echo "3. 查看登录状态"
+    echo "4. 检查版本"
+    echo "5. 进入交互模式"
+    echo "6. 更新"
+    echo "7. 卸载"
+    echo "8. 环境信息"
+    echo "0. 退出"
 
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
+    read -rp "请输入选项: " choice
 
-install_app() {
+    case $choice in
+        1) install_opencode ;;
+        2) login_opencode ;;
+        3) status_opencode ;;
+        4) version_opencode ;;
+        5) interactive_opencode ;;
+        6) update_opencode ;;
+        7) uninstall_opencode ;;
+        8) env_info ;;
+        0) exit 0 ;;
+        *) warn "无效选项" ;;
+    esac
 
-    check_docker
-    mkdir -p "$APP_DIR"
-
-    echo -e "${GREEN}=== Flux 安装 ===${RESET}"
-
-    read -p "面板端口 [默认6366]: " input_port
-    PORT=${input_port:-6366}
-    check_port "$PORT" || return
-
-    read -p "DB名称 [默认flux_db]: " DB_NAME
-    DB_NAME=${DB_NAME:-flux_db}
-
-    read -p "DB用户 [默认flux_user]: " DB_USER
-    DB_USER=${DB_USER:-flux_user}
-
-    DB_PASSWORD=$(openssl rand -hex 16)
-    JWT_SECRET=$(openssl rand -hex 32)
-
-    echo -e "${GREEN}已自动生成数据库密码和JWT密钥${RESET}"
-    echo -e "${YELLOW}DB_PASSWORD: $DB_PASSWORD${RESET}"
-    echo -e "${YELLOW}JWT_SECRET: $JWT_SECRET${RESET}"
-
-    read -p "启用IPv6? true/false [默认true]: " IPV6
-    ENABLE_IPV6=${IPV6:-true}
-
-    PANEL_LISTEN="0.0.0.0"
-
-    cat > "$ENV_FILE" <<EOF
-DB_NAME=$DB_NAME
-DB_USER=$DB_USER
-DB_PASSWORD=$DB_PASSWORD
-JWT_SECRET=$JWT_SECRET
-PANEL_PORT=$PORT
-ENABLE_IPV6=$ENABLE_IPV6
-PANEL_LISTEN=$PANEL_LISTEN
-EOF
-
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  mysql:
-    image: mysql:5.7
-    container_name: flux-mysql
-    restart: unless-stopped
-    environment:
-      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
-      MYSQL_DATABASE: ${DB_NAME}
-      MYSQL_USER: ${DB_USER}
-      MYSQL_PASSWORD: ${DB_PASSWORD}
-      TZ: Asia/Shanghai
-    volumes:
-      - mysql_data:/var/lib/mysql
-    command: >
-      --default-authentication-plugin=mysql_native_password
-      --character-set-server=utf8mb4
-      --collation-server=utf8mb4_unicode_ci
-      --max_connections=1000
-      --innodb_buffer_pool_size=256M
-    networks:
-      - flux-network
-    healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p${DB_PASSWORD} --silent"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-      start_period: 30s
-
-  node-binary-init:
-    image: 0xnetuser/node-binary:2.1.25
-    container_name: node-binary-init
-    restart: "no"
-    command: ["sh", "-c", "sleep 3"]
-    volumes:
-      - node_binary:/data/node
-
-  backend:
-    image: 0xnetuser/go-backend:2.1.25
-    container_name: go-backend
-    restart: unless-stopped
-    environment:
-      DB_HOST: mysql
-      DB_NAME: ${DB_NAME}
-      DB_USER: ${DB_USER}
-      DB_PASSWORD: ${DB_PASSWORD}
-      JWT_SECRET: ${JWT_SECRET}
-      ALLOWED_ORIGINS: \${ALLOWED_ORIGINS:-}
-      LOG_DIR: /app/logs
-      DB_RETRY: 30
-      DB_RETRY_INTERVAL: 2
-    expose:
-      - "6365"
-    volumes:
-      - backend_logs:/app/logs
-      - node_binary:/data/node
-      - /var/run/docker.sock:/var/run/docker.sock
-      - .:/data/compose
-    depends_on:
-      mysql:
-        condition: service_healthy
-      node-binary-init:
-        condition: service_completed_successfully
-    networks:
-      - flux-network
-    healthcheck:
-      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:6365/flow/test || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 20s
-
-  frontend:
-    image: 0xnetuser/nextjs-frontend:2.1.25
-    container_name: nextjs-frontend
-    restart: unless-stopped
-    ports:
-      - "\${PANEL_LISTEN:-0.0.0.0}:${PORT}:80"
-    depends_on:
-      backend:
-        condition: service_healthy
-    networks:
-      - flux-network
-
-volumes:
-  mysql_data:
-  backend_logs:
-  node_binary:
-
-networks:
-  flux-network:
-    driver: bridge
-    enable_ipv6: \${ENABLE_IPV6:-false}
-EOF
-
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    echo -e "${YELLOW}等待后端启动中...${RESET}"
-
-    # 等 backend 真正 ready（解决你 curl 6365 报错）
-    for i in {1..30}; do
-        if curl -s "http://127.0.0.1:${PORT}/flow/test" >/dev/null 2>&1; then
-            break
-        fi
-        sleep 2
-    done
-
-    SERVER_IP=$(get_public_ip)
-
-    echo -e "${GREEN}=================================${RESET}"
-    echo -e "${GREEN}✅ Flux 安装完成${RESET}"
-    echo -e "${GREEN}=================================${RESET}"
-    echo -e "${YELLOW}访问: http://${SERVER_IP}:${PORT}${RESET}"
-    echo -e "${YELLOW}用户名: admin_user${RESET}"
-    echo -e "${YELLOW}密码: 查看日志${RESET}"
-    echo -e "${YELLOW}数据目录: $APP_DIR${RESET}"
-    echo -e "${GREEN}=================================${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ Flux 更新完成${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-restart_app() {
-    cd "$APP_DIR" || return
-    docker compose restart
-    echo -e "${GREEN}✅ Flux 已重启${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-    docker logs -f go-backend
-}
-
-check_status() {
-    docker ps --filter "name=flux"
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Flux 已卸载完成${RESET}"
-    read -p "按回车返回菜单..."
+    pause
+    menu
 }
 
 menu

@@ -163,8 +163,7 @@ install_xray() {
     command -v ip6tables &> /dev/null && ip6tables -F > /dev/null 2>&1 && ip6tables -P INPUT ACCEPT > /dev/null 2>&1 && ip6tables -P FORWARD ACCEPT > /dev/null 2>&1 && ip6tables -P OUTPUT ACCEPT > /dev/null 2>&1
 
 
-
-# 生成配置文件
+   # 修改 install_xray 中的配置文件生成部分
 cat > "${config_dir}" << EOF
 {
   "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
@@ -181,12 +180,12 @@ cat > "${config_dir}" << EOF
           { "path": "/vmess-argo", "dest": 3003 }
         ]
       },
-      "streamSettings": { "network": "tcp" }
+      "streamSettings": { "network": "tcp" },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
     },
     {
       "port": 3001, "listen": "127.0.0.1", "protocol": "vless",
-      "settings": { "clients": [{ "id": "$UUID" }], "decryption": "none" },
-      "streamSettings": { "network": "tcp", "security": "none" }
+      "settings": { "clients": [{ "id": "$UUID" }], "decryption": "none" }
     },
     {
       "port": 3002, "listen": "127.0.0.1", "protocol": "vless",
@@ -751,6 +750,7 @@ while true; do
    green "5. 卸载"
    green "0. 退出"
    reading "请输入选择: " choice
+   echo ""
    case "${choice}" in
         1)  
             if [ ${check_xray} -eq 0 ]; then

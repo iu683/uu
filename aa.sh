@@ -163,8 +163,7 @@ install_xray() {
     command -v ip6tables &> /dev/null && ip6tables -F > /dev/null 2>&1 && ip6tables -P INPUT ACCEPT > /dev/null 2>&1 && ip6tables -P FORWARD ACCEPT > /dev/null 2>&1 && ip6tables -P OUTPUT ACCEPT > /dev/null 2>&1
 
 
-
-# 生成配置文件
+   #配置文件生成部分
 cat > "${config_dir}" << EOF
 {
   "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
@@ -199,17 +198,7 @@ cat > "${config_dir}" << EOF
       "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess-argo" } }
     }
   ],
-  "dns": { "servers": ["https+local://8.8.8.8/dns-query"] },
-   "outbounds": [
-        {
-            "protocol": "freedom",
-            "tag": "direct"
-        },
-        {
-            "protocol": "blackhole",
-            "tag": "block"
-        }
-    ]
+  "outbounds": [{ "protocol": "freedom", "tag": "direct" }]
 }
 EOF
 }
@@ -493,7 +482,7 @@ fi
 
 # 卸载 xray
 uninstall_xray() {
-   reading "确定要卸载 xray-2go 吗? (y/n): " choice
+   reading "确定要卸载Xray-Argo吗? (y/n): " choice
    case "${choice}" in
        y|Y)
            yellow "正在卸载 xray"

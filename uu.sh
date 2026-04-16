@@ -1,179 +1,192 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="OpenCode Manager"
-BIN="opencode"
-
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
+PORT_FILE="/etc/warp-port.conf"
+
 info(){ echo -e "${GREEN}[信息] $1${RESET}"; }
 warn(){ echo -e "${YELLOW}[警告] $1${RESET}"; }
-err(){ echo -e "${RED}[错误] $1${RESET}"; }
+error(){ echo -e "${RED}[错误] $1${RESET}"; }
 
 pause(){ read -rp "按回车继续..." _; }
 
-# ==============================
-# 环境检测
-# ==============================
-check_env() {
-    info "检查 Node.js 环境..."
-
-    if ! command -v node >/dev/null 2>&1; then
-        warn "未检测到 Node.js，自动安装中..."
-        curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-        apt-get install -y nodejs
-    fi
-
-    if ! command -v npm >/dev/null 2>&1; then
-        err "npm 不存在，安装失败"
-        exit 1
-    fi
-
-    info "环境正常"
+check_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && (( $1 > 0 && $1 < 65536 ))
 }
 
-# ==============================
-# 安装
-# ==============================
-install_opencode() {
-    check_env
-    info "安装 OpenCode..."
-
-    npm install -g opencode-ai || {
-        err "安装失败"
-        return
-    }
-
-    info "安装完成"
+is_installed() {
+    command -v warp-cli >/dev/null 2>&1
 }
 
-# ==============================
-# 登录
-# ==============================
-login_opencode() {
-    if ! command -v opencode >/dev/null 2>&1; then
-        err "请先安装 OpenCode"
+install_warp() {
+    read -rp "请输入 Socks5 端口 (如 40000): " port
+
+    if ! check_port "$port"; then
+        error "端口无效"
         return
     fi
 
-    info "开始登录 Provider..."
-    opencode providers login
+    info "安装依赖..."
+    apt update
+    apt install -y gnupg curl lsb-release
+
+    info "写入 WARP 源（新版 key）..."
+    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+    | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] \
+https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+    > /etc/apt/sources.list.d/cloudflare-client.list
+
+    apt update
+    apt install -y cloudflare-warp
+
+    info "注册账户..."
+
+    if warp-cli registration show >/dev/null 2>&1; then
+        info "已注册，跳过"
+    else
+        if warp-cli registration new --help 2>&1 | grep -q accept-tos; then
+            warp-cli registration new --accept-tos
+        else
+            warp-cli registration new
+        fi
+    fi
+
+    info "设置 Proxy 模式..."
+    warp-cli mode proxy
+
+    info "设置端口: $port"
+    warp-cli proxy port "$port"
+    echo "$port" > "$PORT_FILE"
+
+    info "设置 MASQUE 协议..."
+    warp-cli tunnel protocol set MASQUE || true
+
+    info "启动 WARP..."
+    warp-cli connect
+
+    sleep 2
+
+    info "完成 ✔"
+    echo -e "${CYAN}socks5://127.0.0.1:$port${RESET}"
+
+    show_ip
 }
-# ==============================
-# 登录状态
-# ==============================
-status_opencode() {
-    if ! command -v $BIN >/dev/null 2>&1; then
-        warn "未安装"
+
+status_warp() {
+    if ! is_installed; then
+        error "未安装 WARP"
+        return
+    fi
+    warp-cli status
+}
+
+test_proxy() {
+    if [[ ! -f "$PORT_FILE" ]]; then
+        error "未找到端口"
         return
     fi
 
-    info "当前 Provider 状态："
+    port=$(cat "$PORT_FILE")
 
-    if opencode providers list >/dev/null 2>&1; then
-        opencode providers list
-    else
-        warn "未配置任何 Provider（未登录）"
-    fi
+    info "测试代理端口: $port"
+    curl -s --proxy socks5://127.0.0.1:$port ifconfig.me \
+    && echo || error "失败"
 }
 
-# ==============================
-# 版本
-# ==============================
-version_opencode() {
-    echo -e "${CYAN}===== 版本信息 =====${RESET}"
-
-    if command -v opencode >/dev/null 2>&1; then
-        echo "OpenCode: $(opencode --version)"
-    else
-        echo "OpenCode: 未安装"
+change_port() {
+    if ! is_installed; then
+        error "未安装 WARP"
+        return
     fi
 
-    echo "Node.js: $(node -v 2>/dev/null || echo 未安装)"
-    echo "npm: $(npm -v 2>/dev/null || echo 未安装)"
-}
+    read -rp "新端口: " port
 
-# ==============================
-# 交互模式
-# ==============================
-interactive_opencode() {
-    if command -v opencode >/dev/null 2>&1; then
-        info "进入交互模式（Ctrl+C 退出）"
-        opencode
-    else
-        err "未安装 opencode"
+    if ! check_port "$port"; then
+        error "端口无效"
+        return
     fi
+
+    warp-cli proxy port "$port"
+    echo "$port" > "$PORT_FILE"
+
+    info "端口已修改 ✔"
 }
 
-# ==============================
-# 更新
-# ==============================
-update_opencode() {
-    info "更新 OpenCode..."
-    npm update -g opencode-ai || warn "更新失败"
-    info "完成"
+show_ip() {
+    if [[ ! -f "$PORT_FILE" ]]; then
+        return
+    fi
+
+    port=$(cat "$PORT_FILE")
+
+    echo -e "${CYAN}当前出口 IP:${RESET}"
+    curl -s --proxy socks5://127.0.0.1:$port https://ipinfo.io \
+    || warn "获取 IP 失败"
 }
 
-# ==============================
-# 卸载
-# ==============================
-uninstall_opencode() {
-    warn "卸载 OpenCode..."
+fix_warp() {
+    warn "尝试修复 WARP..."
 
-    npm uninstall -g opencode-ai || true
+    warp-cli disconnect || true
+    sleep 1
+    warp-cli connect || true
 
-    info "已卸载"
+    info "已尝试重连"
 }
 
-# ==============================
-# 环境信息
-# ==============================
-env_info() {
-    echo -e "${CYAN}===== 环境信息 =====${RESET}"
-    echo "系统: $(uname -a)"
-    echo "Node: $(node -v 2>/dev/null || echo 未安装)"
-    echo "npm: $(npm -v 2>/dev/null || echo 未安装)"
-    echo "OpenCode: $(opencode --version 2>/dev/null || echo 未安装)"
-    echo "PATH: $PATH"
+uninstall_warp() {
+    warn "正在卸载 WARP..."
+
+    warp-cli disconnect 2>/dev/null || true
+
+    systemctl stop warp-svc 2>/dev/null || true
+    systemctl disable warp-svc 2>/dev/null || true
+
+    apt remove -y cloudflare-warp
+    apt autoremove -y
+
+    rm -f /etc/apt/sources.list.d/cloudflare-client.list
+    rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+    rm -f "$PORT_FILE"
+
+    info "卸载完成 ✔"
 }
 
-# ==============================
-# 菜单
-# ==============================
 menu() {
     clear
-    echo -e "${CYAN}==== $APP_NAME ==== ${RESET}"
-    echo "1. 安装 OpenCode"
-    echo "2. 登录"
-    echo "3. 查看登录状态"
-    echo "4. 检查版本"
-    echo "5. 进入交互模式"
-    echo "6. 更新"
-    echo "7. 卸载"
-    echo "8. 环境信息"
-    echo "0. 退出"
+    echo -e "${GREEN}==== WARP 管理 ====${RESET}"
+    echo "1) 安装并配置"
+    echo "2) 查看状态"
+    echo "3) 测试代理"
+    echo "4) 修改端口"
+    echo "5) 查看出口 IP"
+    echo "6) 修复 WARP"
+    echo "7) 卸载 WARP"
+    echo "0) 退出"
+    read -rp "请选择: " num
 
-    read -rp "请输入选项: " choice
-
-    case $choice in
-        1) install_opencode ;;
-        2) login_opencode ;;
-        3) status_opencode ;;
-        4) version_opencode ;;
-        5) interactive_opencode ;;
-        6) update_opencode ;;
-        7) uninstall_opencode ;;
-        8) env_info ;;
+    case $num in
+        1) install_warp ;;
+        2) status_warp ;;
+        3) test_proxy ;;
+        4) change_port ;;
+        5) show_ip ;;
+        6) fix_warp ;;
+        7) uninstall_warp ;;
         0) exit 0 ;;
         *) warn "无效选项" ;;
     esac
 
     pause
-    menu
 }
 
-menu
+while true; do
+    menu
+done

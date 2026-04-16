@@ -1,131 +1,203 @@
-#!/bin/bash
-# ========================================
-# ECS Controller 一键管理脚本
-# ========================================
+#!/usr/bin/env bash
+set -euo pipefail
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="ecs-controller"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+PORT_FILE="/etc/warp-port.conf"
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
+info(){ echo -e "${GREEN}[信息] $1${RESET}"; }
+warn(){ echo -e "${YELLOW}[警告] $1${RESET}"; }
+error(){ echo -e "${RED}[错误] $1${RESET}"; }
 
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
-}
+pause(){ read -rp "按回车继续..." _; }
 
 check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
+    [[ "$1" =~ ^[0-9]+$ ]] && (( $1 > 0 && $1 < 65536 ))
 }
 
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== ECS Controller 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+is_port_used() {
+    ss -lnt | awk '{print $4}' | grep -q ":$1$"
+}
 
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
+is_installed() {
+    command -v warp-cli >/dev/null 2>&1
+}
+
+# 🎲 随机端口（自动避开占用）
+random_port() {
+    while true; do
+        port=$(shuf -i 10000-60000 -n 1)
+        if ! is_port_used "$port"; then
+            echo "$port"
+            return
+        fi
     done
 }
 
-install_app() {
+get_port_input() {
+    read -rp "请输入 Socks5 端口 (回车随机): " port
 
-    check_docker
-    mkdir -p "$APP_DIR/data"
+    if [[ -z "$port" ]]; then
+        port=$(random_port)
+        info "使用随机端口: $port"
+    else
+        if ! check_port "$port"; then
+            error "端口无效"
+            return 1
+        fi
 
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
+        if is_port_used "$port"; then
+            error "端口已被占用"
+            return 1
+        fi
+
+        info "使用自定义端口: $port"
     fi
 
-    read -p "请输入访问端口 [默认:43210]: " input_port
-    PORT=${input_port:-43210}
-    check_port "$PORT" || return
-
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  ecs-controller:
-    image: kori1c/ecs-controller:latest
-    container_name: ecs-controller
-    restart: always
-    ports:
-      - "127.0.0.1:${PORT}:80"
-    volumes:
-      - ./data:/var/www/html/data
-    environment:
-      TZ: Asia/Shanghai
-EOF
-
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    echo
-    echo -e "${GREEN}✅ ECS Controller 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
-
-    read -p "按回车返回菜单..."
+    echo "$port"
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ ECS Controller 更新完成${RESET}"
-    read -p "按回车返回菜单..."
+install_warp() {
+    port=$(get_port_input) || return
+
+    info "安装依赖..."
+    apt update
+    apt install -y gnupg curl lsb-release
+
+    info "写入 WARP 源..."
+    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+    | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] \
+https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+    > /etc/apt/sources.list.d/cloudflare-client.list
+
+    apt update
+    apt install -y cloudflare-warp
+
+    info "注册账户..."
+
+    if warp-cli registration show >/dev/null 2>&1; then
+        info "已注册，跳过"
+    else
+        if warp-cli registration new --help 2>&1 | grep -q accept-tos; then
+            warp-cli registration new --accept-tos
+        else
+            warp-cli registration new
+        fi
+    fi
+
+    info "设置 Proxy 模式..."
+    warp-cli mode proxy
+
+    warp-cli proxy port "$port"
+    echo "$port" > "$PORT_FILE"
+
+    info "设置 MASQUE 协议..."
+    warp-cli tunnel protocol set MASQUE || true
+
+    info "启动 WARP..."
+    warp-cli connect
+
+    sleep 2
+
+    info "完成 ✔"
+    echo -e "${CYAN}socks5://127.0.0.1:$port${RESET}"
 }
 
-restart_app() {
-    docker restart ecs-controller
-    echo -e "${GREEN}✅ ECS Controller 已重启${RESET}"
-    read -p "按回车返回菜单..."
+status_warp() {
+    if ! is_installed; then
+        error "未安装 WARP"
+        return
+    fi
+    warp-cli status
 }
 
-view_logs() {
-    docker logs -f ecs-controller
+test_proxy() {
+    if [[ ! -f "$PORT_FILE" ]]; then
+        error "未找到端口"
+        return
+    fi
+
+    port=$(cat "$PORT_FILE")
+
+    info "测试代理端口: $port"
+    curl -s --proxy socks5://127.0.0.1:$port ifconfig.me \
+    && echo || error "失败"
 }
 
-check_status() {
-    docker ps | grep ecs-controller
-    read -p "按回车返回菜单..."
+change_port() {
+    if ! is_installed; then
+        error "未安装 WARP"
+        return
+    fi
+
+    port=$(get_port_input) || return
+
+    warp-cli proxy port "$port"
+    echo "$port" > "$PORT_FILE"
+
+    info "端口已修改 ✔ -> $port"
 }
 
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ ECS Controller 已彻底卸载${RESET}"
-    read -p "按回车返回菜单..."
+fix_warp() {
+    warn "尝试修复 WARP..."
+
+    warp-cli disconnect || true
+    sleep 1
+    warp-cli connect || true
+
+    info "已尝试重连"
 }
 
-menu
+uninstall_warp() {
+    warn "正在卸载 WARP..."
+
+    warp-cli disconnect 2>/dev/null || true
+
+    systemctl stop warp-svc 2>/dev/null || true
+    systemctl disable warp-svc 2>/dev/null || true
+
+    apt remove -y cloudflare-warp
+    apt autoremove -y
+
+    rm -f /etc/apt/sources.list.d/cloudflare-client.list
+    rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+    rm -f "$PORT_FILE"
+
+    info "卸载完成 ✔"
+}
+
+menu() {
+    clear
+    echo -e "${GREEN}==== WARP 管理 ====${RESET}"
+    echo "1) 安装并配置"
+    echo "2) 查看状态"
+    echo "3) 测试代理"
+    echo "4) 修改端口"
+    echo "5) 修复 WARP"
+    echo "6) 卸载 WARP"
+    echo "0) 退出"
+    read -rp "请选择: " num
+
+    case $num in
+        1) install_warp ;;
+        2) status_warp ;;
+        3) test_proxy ;;
+        4) change_port ;;
+        5) fix_warp ;;
+        6) uninstall_warp ;;
+        0) exit 0 ;;
+        *) warn "无效选项" ;;
+    esac
+
+    pause
+}
+
+while true; do
+    menu
+done

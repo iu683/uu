@@ -1,7 +1,7 @@
 #!/bin/bash
 # ========================================
-# Sing-box 彻底卸载脚本
-# 支持 apt / yum / 手动 / 脚本安装
+# Docker 代理清理（仅运行容器 + 镜像）
+# 修复版：正确映射运行列表索引
 # ========================================
 
 RED="\033[31m"
@@ -9,96 +9,156 @@ GREEN="\033[32m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-echo -e "${RED}========================================${RESET}"
-echo -e "${RED}     Sing-box 彻底卸载开始执行${RESET}"
-echo -e "${RED}========================================${RESET}"
-
-# =============================
-# 1. 停服务 & 杀进程
-# =============================
-echo -e "${YELLOW}[1/6] 停止 Sing-box 服务...${RESET}"
-
-systemctl stop sing-box 2>/dev/null
-systemctl disable sing-box 2>/dev/null
-
-pkill -9 sing-box 2>/dev/null
-
-# =============================
-# 2. 卸载 apt / yum 包
-# =============================
-echo -e "${YELLOW}[2/6] 检测包管理安装...${RESET}"
-
-if command -v apt &>/dev/null && dpkg -l 2>/dev/null | grep -q sing-box; then
-    echo -e "${YELLOW}检测到 apt 安装 Sing-box${RESET}"
-    apt purge -y sing-box
-    apt autoremove -y
-
-elif command -v yum &>/dev/null && rpm -qa | grep -q sing-box; then
-    echo -e "${YELLOW}检测到 yum 安装 Sing-box${RESET}"
-    yum remove -y sing-box
-fi
-
-# =============================
-# 3. 删除二进制文件
-# =============================
-echo -e "${YELLOW}[3/6] 清理可执行文件...${RESET}"
-
-rm -f /usr/local/bin/sing-box
-rm -f /usr/bin/sing-box
-
-# =============================
-# 4. 删除配置 & 日志
-# =============================
-echo -e "${YELLOW}[4/6] 清理配置与日志...${RESET}"
-
-rm -rf /etc/sing-box
-rm -rf /usr/local/etc/sing-box
-rm -rf /var/log/sing-box
-rm -rf /opt/sing-box
-
-# =============================
-# 5. 删除 systemd 服务
-# =============================
-echo -e "${YELLOW}[5/6] 清理 systemd 服务...${RESET}"
-
-rm -f /etc/systemd/system/sing-box.service
-rm -f /etc/systemd/system/sing-box@.service
-
-systemctl daemon-reload
-
-# =============================
-# 6. Docker 清理 + 网络残留
-# =============================
-echo -e "${YELLOW}[6/6] 清理 Docker 与网络残留...${RESET}"
-
-if command -v docker &>/dev/null; then
-    docker ps -a --format "{{.Names}}" | grep -Ei 'sing-box|singbox' | xargs -r docker rm -f
-fi
-
-# 清理可能残留的 TUN / 网络接口（防止虚拟网卡残留）
-ip link show 2>/dev/null | grep -i sing-box && {
-    echo -e "${YELLOW}检测到网络接口残留（可能需手动清理）${RESET}"
+command -v docker &>/dev/null || {
+    echo -e "${RED}Docker 未安装${RESET}"
+    exit 1
 }
 
 # =============================
-# 最终检查
+# 关键词列表
 # =============================
-echo -e "${YELLOW}检查残留进程/端口...${RESET}"
-
-ps -ef | grep sing-box | grep -v grep
-
-ports=$(ss -tulnp 2>/dev/null | grep -i sing-box)
-
-if [[ -n "$ports" ]]; then
-    echo -e "${RED}仍有端口占用:${RESET}"
-    echo "$ports"
-else
-    echo -e "${GREEN}无端口残留${RESET}"
-fi
+KEYWORDS=(
+"xray"
+"sing"
+"hysteria"
+"tuic"
+"snell"
+"3xui"
+"AnyTLSD"
+"MTProto"
+"shadowsocks"
+"shadow-tls"
+"Singbox-AnyReality"
+"Singbox-AnyTLS"
+"Singbox-TUICv5"
+"Xray-Reality"
+"Xray-Realityxhttp"
+"xray-socks5"
+"xray-vmess"
+"xray-vmesstls"
+"clash"
+"mihomo"
+"warp"
+"glash"
+"conflux"
+"heki"
+"microwarp"
+"nodepassdash"
+"ppanel"
+"wg-easy"
+"wireguard"
+"gostpanel"
+"xboard"
+)
 
 # =============================
-# 完成
+# 全局运行列表（关键修复点）
 # =============================
-echo -e "${GREEN}========================================${RESET}"
-echo -e "${GREEN}✅ Sing-box 已彻底卸载完成${RESET}"
-echo -e "${GREEN}========================================${RESET}"
+map_list=()
+
+# =============================
+# 删除容器
+# =============================
+del_container() {
+    docker ps --format "{{.Names}}" | grep -Ei "$1" | xargs -r docker rm -f >/dev/null 2>&1
+}
+
+# =============================
+# 删除镜像
+# =============================
+del_image() {
+    docker images --format "{{.Repository}}:{{.Tag}} {{.ID}}" | grep -Ei "$1" | awk '{print $2}' | xargs -r docker rmi -f >/dev/null 2>&1
+}
+
+# =============================
+# 显示运行容器（重排）
+# =============================
+show_running() {
+    clear
+    echo -e "${YELLOW}====== 正在运行的代理容器 ======${RESET}"
+    echo ""
+
+    map_list=()   # 每次刷新重建
+
+    # 收集运行中的关键词
+    for k in "${KEYWORDS[@]}"; do
+        running=$(docker ps --format "{{.Names}}" | grep -Ei "$k")
+        if [[ -n "$running" ]]; then
+            map_list+=("$k")
+        fi
+    done
+
+    # 没有运行容器
+    if [[ ${#map_list[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}当前没有运行中的代理容器${RESET}"
+        echo ""
+        echo -e "${GREEN}[0] 退出${RESET}"
+        echo ""
+        return
+    fi
+
+    # 输出重排列表
+    for i in "${!map_list[@]}"; do
+        k="${map_list[$i]}"
+        running=$(docker ps --format "{{.Names}}" | grep -Ei "$k")
+
+        echo -e "${GREEN}[$((i+1))] $k${RESET}"
+        echo "$running" | sed 's/^/  🟢 /'
+        echo ""
+    done
+
+    echo -e "${RED}[a] 清理全部运行容器${RESET}"
+    echo -e "${GREEN}[0] 退出${RESET}"
+    echo ""
+}
+
+# =============================
+# 全部清理
+# =============================
+run_all() {
+    for k in "${KEYWORDS[@]}"; do
+        del_container "$k"
+        del_image "$k"
+    done
+}
+
+# =============================
+# 主循环
+# =============================
+while true; do
+    show_running
+    read -p "请选择: " choice
+    choice=$(echo "$choice" | xargs)
+
+    [[ "$choice" == "0" ]] && exit 0
+
+    # 一键清理
+    if [[ "$choice" == "a" || "$choice" == "A" ]]; then
+        echo -e "${RED}清理所有运行中的代理容器 + 镜像...${RESET}"
+        run_all
+        echo -e "${GREEN}完成${RESET}"
+        read -p "回车继续..."
+        continue
+    fi
+
+    # 数字选择（关键修复）
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+        idx=$((choice-1))
+
+        if [[ $idx -ge 0 && $idx -lt ${#map_list[@]} ]]; then
+            k="${map_list[$idx]}"
+
+            echo -e "${YELLOW}清理中: $k${RESET}"
+            del_container "$k"
+            del_image "$k"
+
+            echo -e "${GREEN}✔ 已清理 $k${RESET}"
+        else
+            echo -e "${RED}无效选项${RESET}"
+        fi
+    else
+        echo -e "${RED}输入错误${RESET}"
+    fi
+
+    read -p "回车继续..."
+done

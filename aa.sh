@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Docker 代理清理（仅运行容器列表）
+# BBR 一键卸载 & 恢复系统默认 TCP
 # ========================================
 
 RED="\033[31m"
@@ -8,141 +8,49 @@ GREEN="\033[32m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-command -v docker &>/dev/null || {
-    echo -e "${RED}Docker 未安装${RESET}"
-    exit 1
-}
-
-KEYWORDS=(
-"xray"
-"sing"
-"hysteria"
-"tuic"
-"snell"
-"3xui"
-"AnyTLSD"
-"MTProto"
-"shadowsocks"
-"shadow-tls"
-"Singbox-AnyReality"
-"Singbox-AnyTLS"
-"Singbox-TUICv5"
-"Xray-Reality"
-"Xray-Realityxhttp"
-"xray-socks5"
-"xray-vmess"
-"xray-vmesstls"
-"clash"
-"mihomo"
-"warp"
-"glash"
-"conflux"
-"heki"
-"microwarp"
-"nodepassdash"
-"ppanel"
-"wg-easy"
-"wireguard"
-"gostpanel"
-"xboard"
-)
+echo -e "${YELLOW}开始恢复系统默认 TCP 拥塞控制...${RESET}"
 
 # =============================
-# 删除容器
+# 1. 恢复 sysctl 默认配置
 # =============================
-del_container() {
-    docker ps --format "{{.Names}}" | grep -Ei "$1" | xargs -r docker rm -f >/dev/null 2>&1
-}
+SYSCTL_FILE="/etc/sysctl.conf"
+SYSCTL_DIR="/etc/sysctl.d"
 
-# =============================
-# 删除镜像
-# =============================
-del_image() {
-    docker images --format "{{.Repository}}:{{.Tag}} {{.ID}}" | grep -Ei "$1" | awk '{print $2}' | xargs -r docker rmi -f >/dev/null 2>&1
-}
+# 删除常见 BBR / TCP 优化项
+sed -i '/bbr/d' $SYSCTL_FILE 2>/dev/null
+sed -i '/tcp_congestion_control/d' $SYSCTL_FILE 2>/dev/null
+sed -i '/fq/d' $SYSCTL_FILE 2>/dev/null
+sed -i '/net.core.default_qdisc/d' $SYSCTL_FILE 2>/dev/null
 
-# =============================
-# 仅获取运行容器
-# =============================
-get_running() {
-    docker ps --format "{{.Names}}" | grep -Ei "$1"
-}
+rm -f $SYSCTL_DIR/*bbr*.conf 2>/dev/null
 
 # =============================
-# 显示运行列表
+# 2. 恢复默认 TCP 拥塞控制
 # =============================
-show_running() {
-    clear
-    echo -e "${YELLOW}====== 正在运行的代理容器 ======${RESET}"
-    echo ""
-
-    i=1
-    HAS_ANY=0
-
-    for k in "${KEYWORDS[@]}"; do
-        running=$(get_running "$k")
-
-        if [[ -n "$running" ]]; then
-            HAS_ANY=1
-            echo -e "${GREEN}[$i] $k${RESET}"
-            echo "$running" | sed 's/^/  🟢 /'
-            echo ""
-        fi
-
-        ((i++))
-    done
-
-    if [[ $HAS_ANY -eq 0 ]]; then
-        echo -e "${YELLOW}当前没有运行中的代理容器${RESET}"
-        echo ""
-    fi
-
-    echo -e "${RED}[a] 清理全部运行容器${RESET}"
-    echo -e "${GREEN}[0] 退出${RESET}"
-    echo ""
-}
+sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1
+sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1
 
 # =============================
-# 全部清理（仅运行容器）
+# 3. 写入默认配置（防止重启又回来）
 # =============================
-run_all() {
-    for k in "${KEYWORDS[@]}"; do
-        del_container "$k"
-        del_image "$k"
-    done
-}
+cat > /etc/sysctl.d/99-default-tcp.conf <<EOF
+net.ipv4.tcp_congestion_control=cubic
+net.core.default_qdisc=pfifo_fast
+EOF
+
+sysctl -p >/dev/null 2>&1
 
 # =============================
-# 主循环
+# 4. 检查当前状态
 # =============================
-while true; do
-    show_running
-    read -p "请选择: " choice
-    choice=$(echo "$choice" | xargs)
+echo ""
+echo -e "${GREEN}当前 TCP 状态：${RESET}"
+sysctl net.ipv4.tcp_congestion_control
+sysctl net.core.default_qdisc
 
-    [[ "$choice" == "0" ]] && exit 0
-
-    if [[ "$choice" == "a" || "$choice" == "A" ]]; then
-        echo -e "${RED}清理所有运行中的代理容器 + 镜像...${RESET}"
-        run_all
-        echo -e "${GREEN}完成${RESET}"
-        read -p "回车继续..."
-        continue
-    fi
-
-    if [[ "$choice" =~ ^[0-9]+$ ]]; then
-        idx=$((choice-1))
-        if [[ $idx -ge 0 && $idx -lt ${#KEYWORDS[@]} ]]; then
-            k="${KEYWORDS[$idx]}"
-            del_container "$k"
-            del_image "$k"
-            echo -e "${GREEN}✔ 已清理 $k${RESET}"
-        else
-            echo -e "${RED}无效选项${RESET}"
-        fi
-    else
-        echo -e "${RED}输入错误${RESET}"
-    fi
-
-    read -p "回车继续..."
-done
+# =============================
+# 5. 提示
+# =============================
+echo ""
+echo -e "${GREEN}✔ BBR 已卸载 / 已恢复系统默认TCP${RESET}"
+echo -e "${YELLOW}如需完全确认，可重启系统${RESET}"

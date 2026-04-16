@@ -1,7 +1,6 @@
 #!/bin/bash
 # ========================================
-# Xray + 3x-ui 彻底卸载脚本
-# 支持 apt / yum / 手动安装 / 脚本安装
+# Docker 代理清理（仅运行容器列表）
 # ========================================
 
 RED="\033[31m"
@@ -9,95 +8,141 @@ GREEN="\033[32m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-echo -e "${RED}========================================${RESET}"
-echo -e "${RED}  Xray彻底卸载开始执行${RESET}"
-echo -e "${RED}========================================${RESET}"
+command -v docker &>/dev/null || {
+    echo -e "${RED}Docker 未安装${RESET}"
+    exit 1
+}
+
+KEYWORDS=(
+"xray"
+"sing"
+"hysteria"
+"tuic"
+"snell"
+"3xui"
+"AnyTLSD"
+"MTProto"
+"shadowsocks"
+"shadow-tls"
+"Singbox-AnyReality"
+"Singbox-AnyTLS"
+"Singbox-TUICv5"
+"Xray-Reality"
+"Xray-Realityxhttp"
+"xray-socks5"
+"xray-vmess"
+"xray-vmesstls"
+"clash"
+"mihomo"
+"warp"
+"glash"
+"conflux"
+"heki"
+"microwarp"
+"nodepassdash"
+"ppanel"
+"wg-easy"
+"wireguard"
+"gostpanel"
+"xboard"
+)
 
 # =============================
-# 停服务
+# 删除容器
 # =============================
-echo -e "${YELLOW}[1/6] 停止相关服务...${RESET}"
-
-systemctl stop xray 2>/dev/null
-systemctl disable xray 2>/dev/null
-
-systemctl stop xray@* 2>/dev/null
-systemctl disable xray@* 2>/dev/null
-
-systemctl stop 3x-ui 2>/dev/null
-systemctl disable 3x-ui 2>/dev/null
-
-pkill -9 xray 2>/dev/null
+del_container() {
+    docker ps --format "{{.Names}}" | grep -Ei "$1" | xargs -r docker rm -f >/dev/null 2>&1
+}
 
 # =============================
-# 卸载 3x-ui
+# 删除镜像
 # =============================
-echo -e "${YELLOW}[2/6] 卸载 3x-ui 面板...${RESET}"
-
-if command -v x-ui &>/dev/null; then
-    x-ui uninstall 2>/dev/null
-fi
-
-rm -rf /usr/local/x-ui
-rm -rf /etc/x-ui
-rm -f /usr/local/bin/x-ui
-rm -f /etc/systemd/system/3x-ui.service
+del_image() {
+    docker images --format "{{.Repository}}:{{.Tag}} {{.ID}}" | grep -Ei "$1" | awk '{print $2}' | xargs -r docker rmi -f >/dev/null 2>&1
+}
 
 # =============================
-# apt / yum 卸载 Xray
+# 仅获取运行容器
 # =============================
-echo -e "${YELLOW}[3/6] 检测包管理安装...${RESET}"
-
-if command -v apt &>/dev/null && dpkg -l 2>/dev/null | grep -q xray; then
-    apt purge -y xray
-    apt autoremove -y
-elif command -v yum &>/dev/null && rpm -qa | grep -q xray; then
-    yum remove -y xray
-fi
+get_running() {
+    docker ps --format "{{.Names}}" | grep -Ei "$1"
+}
 
 # =============================
-# 删除核心文件
+# 显示运行列表
 # =============================
-echo -e "${YELLOW}[4/6] 清理残留文件...${RESET}"
+show_running() {
+    clear
+    echo -e "${YELLOW}====== 正在运行的代理容器 ======${RESET}"
+    echo ""
 
-rm -f /usr/local/bin/xray
-rm -f /usr/bin/xray
+    i=1
+    HAS_ANY=0
 
-rm -rf /etc/xray
-rm -rf /usr/local/etc/xray
-rm -rf /var/log/xray
+    for k in "${KEYWORDS[@]}"; do
+        running=$(get_running "$k")
 
-rm -f /etc/systemd/system/xray.service
-rm -f /etc/systemd/system/xray@.service
+        if [[ -n "$running" ]]; then
+            HAS_ANY=1
+            echo -e "${GREEN}[$i] $k${RESET}"
+            echo "$running" | sed 's/^/  🟢 /'
+            echo ""
+        fi
 
-systemctl daemon-reload
+        ((i++))
+    done
 
-# =============================
-# Docker 清理（仅相关）
-# =============================
-echo -e "${YELLOW}[5/6] 清理 Docker 相关容器...${RESET}"
+    if [[ $HAS_ANY -eq 0 ]]; then
+        echo -e "${YELLOW}当前没有运行中的代理容器${RESET}"
+        echo ""
+    fi
 
-if command -v docker &>/dev/null; then
-    docker ps -a --format "{{.Names}}" | grep -Ei 'xray|3x-ui' | xargs -r docker rm -f
-fi
-
-# =============================
-# 端口检查
-# =============================
-echo -e "${YELLOW}[6/6] 检查残留端口...${RESET}"
-
-ports=$(ss -tulnp 2>/dev/null | grep -i xray)
-
-if [[ -n "$ports" ]]; then
-    echo -e "${RED}仍有占用:${RESET}"
-    echo "$ports"
-else
-    echo -e "${GREEN}无残留端口${RESET}"
-fi
+    echo -e "${RED}[a] 清理全部运行容器${RESET}"
+    echo -e "${GREEN}[0] 退出${RESET}"
+    echo ""
+}
 
 # =============================
-# 完成
+# 全部清理（仅运行容器）
 # =============================
-echo -e "${GREEN}========================================${RESET}"
-echo -e "${GREEN}✅ Xray已彻底卸载完成${RESET}"
-echo -e "${GREEN}========================================${RESET}"
+run_all() {
+    for k in "${KEYWORDS[@]}"; do
+        del_container "$k"
+        del_image "$k"
+    done
+}
+
+# =============================
+# 主循环
+# =============================
+while true; do
+    show_running
+    read -p "请选择: " choice
+    choice=$(echo "$choice" | xargs)
+
+    [[ "$choice" == "0" ]] && exit 0
+
+    if [[ "$choice" == "a" || "$choice" == "A" ]]; then
+        echo -e "${RED}清理所有运行中的代理容器 + 镜像...${RESET}"
+        run_all
+        echo -e "${GREEN}完成${RESET}"
+        read -p "回车继续..."
+        continue
+    fi
+
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+        idx=$((choice-1))
+        if [[ $idx -ge 0 && $idx -lt ${#KEYWORDS[@]} ]]; then
+            k="${KEYWORDS[$idx]}"
+            del_container "$k"
+            del_image "$k"
+            echo -e "${GREEN}✔ 已清理 $k${RESET}"
+        else
+            echo -e "${RED}无效选项${RESET}"
+        fi
+    else
+        echo -e "${RED}输入错误${RESET}"
+    fi
+
+    read -p "回车继续..."
+done

@@ -1,163 +1,270 @@
 #!/bin/bash
 # ========================================
-# Docker 代理清理（仅运行容器 + 镜像）
-# 修复版：正确映射运行列表索引
+# flux-panel 管理
 # ========================================
 
-RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-command -v docker &>/dev/null || {
-    echo -e "${RED}Docker 未安装${RESET}"
-    exit 1
+APP_NAME="flux"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+ENV_FILE="$APP_DIR/.env"
+
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
+
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
+    fi
 }
 
-# =============================
-# 关键词列表
-# =============================
-KEYWORDS=(
-"xray"
-"sing"
-"hysteria"
-"tuic"
-"snell"
-"3xui"
-"AnyTLSD"
-"MTProto"
-"shadowsocks"
-"shadow-tls"
-"Singbox-AnyReality"
-"Singbox-AnyTLS"
-"Singbox-TUICv5"
-"Xray-Reality"
-"Xray-Realityxhttp"
-"xray-socks5"
-"xray-vmess"
-"xray-vmesstls"
-"clash"
-"mihomo"
-"warp"
-"glash"
-"conflux"
-"heki"
-"microwarp"
-"nodepassdash"
-"ppanel"
-"wg-easy"
-"wireguard"
-"gostpanel"
-"xboard"
-)
-
-# =============================
-# 全局运行列表（关键修复点）
-# =============================
-map_list=()
-
-# =============================
-# 删除容器
-# =============================
-del_container() {
-    docker ps --format "{{.Names}}" | grep -Ei "$1" | xargs -r docker rm -f >/dev/null 2>&1
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用！${RESET}"
+        return 1
+    fi
+    return 0
 }
 
-# =============================
-# 删除镜像
-# =============================
-del_image() {
-    docker images --format "{{.Repository}}:{{.Tag}} {{.ID}}" | grep -Ei "$1" | awk '{print $2}' | xargs -r docker rmi -f >/dev/null 2>&1
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
 }
 
-# =============================
-# 显示运行容器（重排）
-# =============================
-show_running() {
-    clear
-    echo -e "${GREEN}====== 正在运行的代理容器 ======${RESET}"
-    echo ""
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== Flux 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-    map_list=()   # 每次刷新重建
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
 
-    # 收集运行中的关键词
-    for k in "${KEYWORDS[@]}"; do
-        running=$(docker ps --format "{{.Names}}" | grep -Ei "$k")
-        if [[ -n "$running" ]]; then
-            map_list+=("$k")
+install_app() {
+
+    check_docker
+    mkdir -p "$APP_DIR"
+
+    echo -e "${GREEN}=== Flux 安装 ===${RESET}"
+
+    read -p "面板端口 [默认6366]: " input_port
+    PORT=${input_port:-6366}
+    check_port "$PORT" || return
+
+    read -p "DB名称 [默认flux_db]: " DB_NAME
+    DB_NAME=${DB_NAME:-flux_db}
+
+    read -p "DB用户 [默认flux_user]: " DB_USER
+    DB_USER=${DB_USER:-flux_user}
+
+    DB_PASSWORD=$(openssl rand -hex 16)
+    JWT_SECRET=$(openssl rand -hex 32)
+
+    echo -e "${GREEN}已自动生成数据库密码和JWT密钥${RESET}"
+    echo -e "${YELLOW}DB_PASSWORD: $DB_PASSWORD${RESET}"
+    echo -e "${YELLOW}JWT_SECRET: $JWT_SECRET${RESET}"
+
+    read -p "启用IPv6? true/false [默认true]: " IPV6
+    ENABLE_IPV6=${IPV6:-true}
+
+    PANEL_LISTEN="0.0.0.0"
+
+    cat > "$ENV_FILE" <<EOF
+DB_NAME=$DB_NAME
+DB_USER=$DB_USER
+DB_PASSWORD=$DB_PASSWORD
+JWT_SECRET=$JWT_SECRET
+PANEL_PORT=$PORT
+ENABLE_IPV6=$ENABLE_IPV6
+PANEL_LISTEN=$PANEL_LISTEN
+EOF
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  mysql:
+    image: mysql:5.7
+    container_name: flux-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      TZ: Asia/Shanghai
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --max_connections=1000
+      --innodb_buffer_pool_size=256M
+    networks:
+      - flux-network
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p${DB_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  node-binary-init:
+    image: 0xnetuser/node-binary:2.1.25
+    container_name: node-binary-init
+    restart: "no"
+    command: ["sh", "-c", "sleep 3"]
+    volumes:
+      - node_binary:/data/node
+
+  backend:
+    image: 0xnetuser/go-backend:2.1.25
+    container_name: go-backend
+    restart: unless-stopped
+    environment:
+      DB_HOST: mysql
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      ALLOWED_ORIGINS: \${ALLOWED_ORIGINS:-}
+      LOG_DIR: /app/logs
+      DB_RETRY: 30
+      DB_RETRY_INTERVAL: 2
+    expose:
+      - "6365"
+    volumes:
+      - backend_logs:/app/logs
+      - node_binary:/data/node
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/data/compose
+    depends_on:
+      mysql:
+        condition: service_healthy
+      node-binary-init:
+        condition: service_completed_successfully
+    networks:
+      - flux-network
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:6365/flow/test || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  frontend:
+    image: 0xnetuser/nextjs-frontend:2.1.25
+    container_name: nextjs-frontend
+    restart: unless-stopped
+    ports:
+      - "\${PANEL_LISTEN:-0.0.0.0}:${PORT}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - flux-network
+
+volumes:
+  mysql_data:
+  backend_logs:
+  node_binary:
+
+networks:
+  flux-network:
+    driver: bridge
+    enable_ipv6: \${ENABLE_IPV6:-false}
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    echo -e "${YELLOW}等待后端启动中...${RESET}"
+
+    # 等 backend 真正 ready（解决你 curl 6365 报错）
+    for i in {1..30}; do
+        if curl -s "http://127.0.0.1:${PORT}/flow/test" >/dev/null 2>&1; then
+            break
         fi
+        sleep 2
     done
 
-    # 没有运行容器
-    if [[ ${#map_list[@]} -eq 0 ]]; then
-        echo -e "${YELLOW}当前没有运行中的代理容器${RESET}"
-        echo ""
-        echo -e "${GREEN}[0] 退出${RESET}"
-        echo ""
-        return
-    fi
+    SERVER_IP=$(get_public_ip)
 
-    # 输出重排列表
-    for i in "${!map_list[@]}"; do
-        k="${map_list[$i]}"
-        running=$(docker ps --format "{{.Names}}" | grep -Ei "$k")
+    echo -e "${GREEN}=================================${RESET}"
+    echo -e "${GREEN}✅ Flux 安装完成${RESET}"
+    echo -e "${GREEN}=================================${RESET}"
+    echo -e "${YELLOW}访问: http://${SERVER_IP}:${PORT}${RESET}"
+    echo -e "${YELLOW}用户名: admin_user${RESET}"
+    echo -e "${YELLOW}密码: 查看日志${RESET}"
+    echo -e "${YELLOW}数据目录: $APP_DIR${RESET}"
+    echo -e "${GREEN}=================================${RESET}"
 
-        echo -e "${YELLOW}[$((i+1))] $k${RESET}"
-        echo "$running" | sed 's/^/  🟢 /'
-        echo ""
-    done
-
-    echo -e "${RED}[a] 清理全部运行容器${RESET}"
-    echo -e "${GREEN}[0] 退出${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-# =============================
-# 全部清理
-# =============================
-run_all() {
-    for k in "${KEYWORDS[@]}"; do
-        del_container "$k"
-        del_image "$k"
-    done
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ Flux 更新完成${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-# =============================
-# 主循环
-# =============================
-while true; do
-    show_running
-    read -p "请选择: " choice
-    choice=$(echo "$choice" | xargs)
+restart_app() {
+    cd "$APP_DIR" || return
+    docker compose restart
+    echo -e "${GREEN}✅ Flux 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
 
-    [[ "$choice" == "0" ]] && exit 0
+view_logs() {
+    docker logs -f go-backend
+}
 
-    # 一键清理
-    if [[ "$choice" == "a" || "$choice" == "A" ]]; then
-        echo -e "${RED}清理所有运行中的代理容器 + 镜像...${RESET}"
-        run_all
-        echo -e "${GREEN}完成${RESET}"
-        read -p "回车继续..."
-        continue
-    fi
+check_status() {
+    docker ps --filter "name=flux"
+    read -p "按回车返回菜单..."
+}
 
-    # 数字选择（关键修复）
-    if [[ "$choice" =~ ^[0-9]+$ ]]; then
-        idx=$((choice-1))
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ Flux 已卸载完成${RESET}"
+    read -p "按回车返回菜单..."
+}
 
-        if [[ $idx -ge 0 && $idx -lt ${#map_list[@]} ]]; then
-            k="${map_list[$idx]}"
-
-            echo -e "${YELLOW}清理中: $k${RESET}"
-            del_container "$k"
-            del_image "$k"
-
-            echo -e "${GREEN}✔ 已清理 $k${RESET}"
-        else
-            echo -e "${RED}无效选项${RESET}"
-        fi
-    else
-        echo -e "${RED}输入错误${RESET}"
-    fi
-
-    read -p "回车继续..."
-done
+menu

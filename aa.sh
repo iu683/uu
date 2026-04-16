@@ -43,19 +43,19 @@ get_port_input() {
 
     if [[ -z "$port" ]]; then
         port=$(random_port)
-        info "使用随机端口: $port"
+        info "使用随机端口: $port" >&2
     else
         if ! check_port "$port"; then
-            error "端口无效"
+            error "端口无效" >&2
             return 1
         fi
 
         if is_port_used "$port"; then
-            error "端口已被占用"
+            error "端口已被占用" >&2
             return 1
         fi
 
-        info "使用自定义端口: $port"
+        info "使用自定义端口: $port" >&2
     fi
 
     echo "$port"
@@ -175,14 +175,14 @@ uninstall_warp() {
 menu() {
     clear
     echo -e "${GREEN}==== WARP 管理 ====${RESET}"
-    echo "1) 安装并配置"
-    echo "2) 查看状态"
-    echo "3) 测试代理"
-    echo "4) 修改端口"
-    echo "5) 修复 WARP"
-    echo "6) 卸载 WARP"
-    echo "0) 退出"
-    read -rp "请选择: " num
+    echo -e "${GREEN}1) 安装并配置${RESET}"
+    echo -e "${GREEN}2) 查看状态${RESET}"
+    echo -e "${GREEN}3) 测试代理${RESET}"
+    echo -e "${GREEN}4) 修改端口${RESET}"
+    echo -e "${GREEN}5) 修复 WARP${RESET}"
+    echo -e "${GREEN}6) 卸载 WARP${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    read -rp $'\033[32m请选择: \033[0m' num
 
     case $num in
         1) install_warp ;;

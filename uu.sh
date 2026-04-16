@@ -1,371 +1,163 @@
 #!/bin/bash
 # ========================================
-# Sing-box AnyReality 多节点管理
+# Docker 代理清理（仅运行容器 + 镜像）
+# 修复版：正确映射运行列表索引
 # ========================================
 
+RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="Singbox-AnyReality"
-APP_DIR="/root/$APP_NAME"
-
-# ===== 基础函数 =====
-info(){ echo -e "${GREEN}$1${RESET}"; }
-warn(){ echo -e "${YELLOW}$1${RESET}"; }
-error(){ echo -e "${RED}$1${RESET}"; }
-
-rand_str(){ tr -dc a-z0-9 </dev/urandom | head -c ${1:-8}; }
-
-check_docker(){
-    if ! command -v docker &>/dev/null; then
-        warn "未检测到 Docker，正在安装..."
-        curl -fsSL https://get.docker.com | bash
-    fi
+command -v docker &>/dev/null || {
+    echo -e "${RED}Docker 未安装${RESET}"
+    exit 1
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    return
+# =============================
+# 关键词列表
+# =============================
+KEYWORDS=(
+"xray"
+"sing"
+"hysteria"
+"tuic"
+"snell"
+"3xui"
+"AnyTLSD"
+"MTProto"
+"shadowsocks"
+"shadow-tls"
+"Singbox-AnyReality"
+"Singbox-AnyTLS"
+"Singbox-TUICv5"
+"Xray-Reality"
+"Xray-Realityxhttp"
+"xray-socks5"
+"xray-vmess"
+"xray-vmesstls"
+"clash"
+"mihomo"
+"warp"
+"glash"
+"conflux"
+"heki"
+"microwarp"
+"nodepassdash"
+"ppanel"
+"wg-easy"
+"wireguard"
+"gostpanel"
+"xboard"
+)
+
+# =============================
+# 全局运行列表（关键修复点）
+# =============================
+map_list=()
+
+# =============================
+# 删除容器
+# =============================
+del_container() {
+    docker ps --format "{{.Names}}" | grep -Ei "$1" | xargs -r docker rm -f >/dev/null 2>&1
 }
 
-# ===== 端口检测 =====
-check_port_loop(){
-    local port=$1
-    while ss -tuln | grep -q ":$port "; do
-        error "端口 $port 已占用"
-        read -p "重新输入端口: " port
-    done
-    echo "$port"
+# =============================
+# 删除镜像
+# =============================
+del_image() {
+    docker images --format "{{.Repository}}:{{.Tag}} {{.ID}}" | grep -Ei "$1" | awk '{print $2}' | xargs -r docker rmi -f >/dev/null 2>&1
 }
 
-# ===== 列出节点 =====
-list_nodes(){
-    mkdir -p "$APP_DIR"
-    shopt -s nullglob
-    local i=1
-    echo -e "${GREEN}=== 已有节点 ===${RESET}"
-    for node in "$APP_DIR"/*; do
-        echo -e "${YELLOW}[$i] $(basename "$node")${RESET}"
-        i=$((i+1))
-    done
-    [ $i -eq 1 ] && warn "无节点"
-}
-
-# ===== 选择节点 =====
-select_node(){
-    list_nodes
-    read -p "输入节点名称或编号: " input
-
-    if [[ "$input" =~ ^[0-9]+$ ]]; then
-        NODE_NAME=$(ls -d "$APP_DIR"/* | sed -n "${input}p" | xargs basename)
-    else
-        NODE_NAME="$input"
-    fi
-
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-    [ ! -d "$NODE_DIR" ] && error "节点不存在" && return 1
-}
-
-# ===== 安装节点 =====
-install_node(){
-    check_docker
-
-    read -p "节点名称 [默认node$(date +%s)]: " NODE_NAME
-    NODE_NAME=${NODE_NAME:-node$(date +%s)}
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-    mkdir -p "$NODE_DIR"
-
-    read -p "端口(默认随机): " input_port
-    input_port=${input_port:-$(shuf -i 20000-60000 -n1)}
-    PORT=$(check_port_loop "$input_port")
-
-    USERNAME=$(rand_str 8)
-    PASSWORD=$(rand_str 16)
-
-    read -p "伪装域名(默认 www.amazon.com): " SERVER_NAME
-    SERVER_NAME=${SERVER_NAME:-www.amazon.com}
-
-    SERVER_IP=$(get_public_ip)
-
-    info "生成 Reality 密钥..."
-    KEY_PAIR=$(docker run --rm ghcr.io/sagernet/sing-box generate reality-keypair)
-
-    PRIVATE_KEY=$(echo "$KEY_PAIR" | grep PrivateKey | awk '{print $2}')
-    PUBLIC_KEY=$(echo "$KEY_PAIR" | grep PublicKey | awk '{print $2}')
-    SHORT_ID=$(openssl rand -hex 4)
-
-    # ===== 配置 =====
-    cat > "$NODE_DIR/config.json" <<EOF
-{
-  "log": {"level": "info"},
-  "inbounds": [{
-    "type": "anytls",
-    "listen": "::",
-    "listen_port": ${PORT},
-    "users": [{
-      "name": "${USERNAME}",
-      "password": "${PASSWORD}"
-    }],
-    "tls": {
-      "enabled": true,
-      "server_name": "${SERVER_NAME}",
-      "reality": {
-        "enabled": true,
-        "handshake": {
-          "server": "${SERVER_NAME}",
-          "server_port": 443
-        },
-        "private_key": "${PRIVATE_KEY}",
-        "short_id": "${SHORT_ID}"
-      }
-    }
-  }],
-  "outbounds": [{"type": "direct"}]
-}
-EOF
-
-    # ===== docker =====
-    cat > "$NODE_DIR/docker-compose.yml" <<EOF
-services:
-  singbox:
-    image: ghcr.io/sagernet/sing-box:latest
-    container_name: singbox-${NODE_NAME}
-    network_mode: host
-    restart: always
-    volumes:
-      - ./config.json:/etc/sing-box/config.json
-    command: run -c /etc/sing-box/config.json
-EOF
-
-    docker compose -f "$NODE_DIR/docker-compose.yml" up -d
-
-    # ===== 保存节点信息 =====
-    cat > "$NODE_DIR/node.txt" <<EOF
-服务器 IP: ${SERVER_IP}
-端口: ${PORT}
-用户名: ${USERNAME}
-密码: ${PASSWORD}
-SNI: ${SERVER_NAME}
-PublicKey: ${PUBLIC_KEY}
-ShortID: ${SHORT_ID}
-备注: ${NODE_NAME}
-EOF
-
-    info "节点创建完成"
-    show_node_info "$NODE_NAME"
-}
-
-# ===== 查看节点信息（已修复）=====
-show_node_info(){
-    if [ -n "$1" ]; then
-        NODE_NAME="$1"
-        NODE_DIR="$APP_DIR/$NODE_NAME"
-        [ ! -d "$NODE_DIR" ] && error "节点不存在" && return
-    else
-        select_node || return
-    fi
-
+# =============================
+# 显示运行容器（重排）
+# =============================
+show_running() {
     clear
-    info "当前节点 [$NODE_NAME]"
+    echo -e "${GREEN}====== 正在运行的代理容器 ======${RESET}"
+    echo ""
 
-    cat "$NODE_DIR/node.txt"
-    echo
+    map_list=()   # 每次刷新重建
 
-    SERVER_IP=$(grep "服务器 IP" $NODE_DIR/node.txt | awk '{print $3}')
-    PORT=$(grep "端口" $NODE_DIR/node.txt | awk '{print $2}')
-    PASSWORD=$(grep "密码" $NODE_DIR/node.txt | awk '{print $2}')
-    SERVER_NAME=$(grep "SNI" $NODE_DIR/node.txt | awk '{print $2}')
-    PUBLIC_KEY=$(grep "PublicKey" $NODE_DIR/node.txt | awk '{print $2}')
-    SHORT_ID=$(grep "ShortID" $NODE_DIR/node.txt | awk '{print $2}')
-
-    echo -e "${GREEN}QuantumultX:${RESET}"
-    echo "anytls=${SERVER_IP}:${PORT}, password=${PASSWORD}, over-tls=true, tls-host=${SERVER_NAME}, tls-verification=false, reality-base64-pubkey=${PUBLIC_KEY}, reality-hex-shortid=${SHORT_ID}, udp-relay=true, tag=${NODE_NAME}"
-    echo
-
-    echo -e "${GREEN}sing-box 客户端:${RESET}"
-    cat <<EOF
-{
-  "type": "anytls",
-  "tag": "${NODE_NAME}",
-  "server": "${SERVER_IP}",
-  "server_port": ${PORT},
-  "password": "${PASSWORD}",
-  "tls": {
-    "enabled": true,
-    "server_name": "${SERVER_NAME}",
-    "reality": {
-      "enabled": true,
-      "public_key": "${PUBLIC_KEY}",
-      "short_id": "${SHORT_ID}"
-    }
-  }
-}
-EOF
-
-    read -p "回车返回..."
-}
-
-# ===== 节点管理 =====
-node_action_menu(){
-    select_node || return
-
-    while true; do
-        echo -e "${GREEN}=== 节点 [$NODE_NAME] 管理 ===${RESET}"
-        echo -e "${GREEN}1) 停止${RESET}"
-        echo -e "${GREEN}2) 启动${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 更新${RESET}"
-        echo -e "${GREEN}5) 查看日志${RESET}"
-        echo -e "${GREEN}6) 查看节点信息${RESET}"
-        echo -e "${GREEN}7) 卸载${RESET}"
-        echo -e "${GREEN}0) 返回主菜单${RESET}"
-
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
-
-        case $choice in
-            1) docker stop singbox-$NODE_NAME ;;
-            2) docker start singbox-$NODE_NAME ;;
-            3) docker restart singbox-$NODE_NAME ;;
-            4)
-                docker compose -f "$NODE_DIR/docker-compose.yml" pull
-                docker compose -f "$NODE_DIR/docker-compose.yml" up -d
-                ;;
-            5) docker logs -f singbox-$NODE_NAME ;;
-            6) show_node_info ;;
-            7)
-                read -r -p $'\033[31m确认删除？输入 yes: \033[0m' confirm
-                [[ "$confirm" == "yes" ]] && docker rm -f singbox-$NODE_NAME && rm -rf "$NODE_DIR" && return
-                ;;
-            0) return ;;
-        esac
-    done
-}
-
-# ===== 批量操作节点 =====
-batch_action(){
-    echo -e "${GREEN}=== 批量操作节点 ===${RESET}"
-    echo -e "${GREEN}1) 停止节点${RESET}"
-    echo -e "${GREEN}2) 启动节点${RESET}"
-    echo -e "${GREEN}3) 重启节点${RESET}"
-    echo -e "${GREEN}4) 更新节点${RESET}"
-    echo -e "${GREEN}5) 卸载节点${RESET}"
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
-
-    read -r -p $'\033[32m请选择操作: \033[0m' choice
-    [[ "$choice" == "0" ]] && return
-
-    mkdir -p "$APP_DIR"
-    declare -A NODE_MAP
-    local count=0
-
-    echo -e "${GREEN}=== 节点列表 ===${RESET}"
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        NODE_NAME=$(basename "$node")
-        NODE_MAP[$count]="$NODE_NAME"
-
-        STATUS=$(docker ps --filter "name=singbox-$NODE_NAME" --format "{{.Status}}")
-        [ -z "$STATUS" ] && STATUS="未运行"
-
-        echo -e "${YELLOW}[$count] $NODE_NAME${RESET} | ${GREEN}$STATUS${RESET}"
+    # 收集运行中的关键词
+    for k in "${KEYWORDS[@]}"; do
+        running=$(docker ps --format "{{.Names}}" | grep -Ei "$k")
+        if [[ -n "$running" ]]; then
+            map_list+=("$k")
+        fi
     done
 
-    if [ $count -eq 0 ]; then
-        echo -e "${YELLOW}无节点${RESET}"
-        read -r -p $'\033[32m按回车返回菜单...\033[0m'
+    # 没有运行容器
+    if [[ ${#map_list[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}当前没有运行中的代理容器${RESET}"
+        echo ""
+        echo -e "${GREEN}[0] 退出${RESET}"
+        echo ""
         return
     fi
 
-    # ===== 选择节点 =====
-    read -r -p $'\033[32m请输入节点序号（空格分隔，或 all 全选）: \033[0m' input
+    # 输出重排列表
+    for i in "${!map_list[@]}"; do
+        k="${map_list[$i]}"
+        running=$(docker ps --format "{{.Names}}" | grep -Ei "$k")
 
-    if [[ "$input" == "all" ]]; then
-        SELECTED_NODES=("${NODE_MAP[@]}")
-    else
-        SELECTED_NODES=()
-        for i in $input; do
-            NODE=${NODE_MAP[$i]}
-            [ -n "$NODE" ] && SELECTED_NODES+=("$NODE")
-        done
+        echo -e "${YELLOW}[$((i+1))] $k${RESET}"
+        echo "$running" | sed 's/^/  🟢 /'
+        echo ""
+    done
+
+    echo -e "${RED}[a] 清理全部运行容器${RESET}"
+    echo -e "${GREEN}[0] 退出${RESET}"
+}
+
+# =============================
+# 全部清理
+# =============================
+run_all() {
+    for k in "${KEYWORDS[@]}"; do
+        del_container "$k"
+        del_image "$k"
+    done
+}
+
+# =============================
+# 主循环
+# =============================
+while true; do
+    show_running
+    read -p "请选择: " choice
+    choice=$(echo "$choice" | xargs)
+
+    [[ "$choice" == "0" ]] && exit 0
+
+    # 一键清理
+    if [[ "$choice" == "a" || "$choice" == "A" ]]; then
+        echo -e "${RED}清理所有运行中的代理容器 + 镜像...${RESET}"
+        run_all
+        echo -e "${GREEN}完成${RESET}"
+        read -p "回车继续..."
+        continue
     fi
 
-    # ===== 执行操作 =====
-    for NODE_NAME in "${SELECTED_NODES[@]}"; do
-        NODE_DIR="$APP_DIR/$NODE_NAME"
+    # 数字选择（关键修复）
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+        idx=$((choice-1))
 
-        case "$choice" in
-            1)
-                docker stop singbox-$NODE_NAME 2>/dev/null
-                ;;
-            2)
-                docker start singbox-$NODE_NAME 2>/dev/null
-                ;;
-            3)
-                docker restart singbox-$NODE_NAME 2>/dev/null
-                ;;
-            4)
-                docker compose -f "$NODE_DIR/docker-compose.yml" pull
-                docker compose -f "$NODE_DIR/docker-compose.yml" up -d
-                ;;
-            5)
-                docker rm -f singbox-$NODE_NAME 2>/dev/null
-                rm -rf "$NODE_DIR"
-                ;;
-        esac
+        if [[ $idx -ge 0 && $idx -lt ${#map_list[@]} ]]; then
+            k="${map_list[$idx]}"
 
-        echo -e "${GREEN}✅ $NODE_NAME 操作完成${RESET}"
-    done
+            echo -e "${YELLOW}清理中: $k${RESET}"
+            del_container "$k"
+            del_image "$k"
 
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
-}
+            echo -e "${GREEN}✔ 已清理 $k${RESET}"
+        else
+            echo -e "${RED}无效选项${RESET}"
+        fi
+    else
+        echo -e "${RED}输入错误${RESET}"
+    fi
 
-# ===== 状态 =====
-show_all_status(){
-    list_nodes
-    echo -e "${GREEN}=== 状态 ===${RESET}"
-    for node in "$APP_DIR"/*; do
-        NODE_NAME=$(basename "$node")
-        STATUS=$(docker ps --filter name=singbox-$NODE_NAME --format "{{.Status}}")
-        [ -z "$STATUS" ] && STATUS="未运行"
-        echo "$NODE_NAME | $STATUS"
-    done
-    read
-}
-
-# ===== 主菜单 =====
-menu(){
-    while true; do
-        clear
-        echo -e "${GREEN}=== Sing-box 多节点管理 ===${RESET}"
-        echo -e "${GREEN}1) 安装节点${RESET}"
-        echo -e "${GREEN}2) 管理节点${RESET}"
-        echo -e "${GREEN}3) 查看所有节点状态${RESET}"
-        echo -e "${GREEN}4) 批量操作节点${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
-
-        case $choice in
-            1) install_node ;;
-            2) node_action_menu ;;
-            3) show_all_status ;;
-            4) batch_action ;;
-            0) exit ;;
-            *) warn "无效选择" ;;
-        esac
-    done
-}
-
-menu
+    read -p "回车继续..."
+done

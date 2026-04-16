@@ -15,6 +15,37 @@ error(){ echo -e "${RED}[错误] $1${RESET}"; }
 
 pause(){ read -rp "按回车继续..." _; }
 
+# =============================
+# 环境检测
+# =============================
+check_systemd() {
+    if [[ "$(ps -p 1 -o comm=)" != "systemd" ]]; then
+        error "当前环境不支持 systemd（Docker/LXC/OpenVZ）"
+        error "无法使用官方 WARP 客户端"
+        return 1
+    fi
+}
+
+# =============================
+# warp-svc 保证运行
+# =============================
+ensure_warp_service() {
+    if ! systemctl is-active --quiet warp-svc; then
+        warn "warp-svc 未运行，尝试启动..."
+        systemctl daemon-reexec
+        systemctl daemon-reload
+        systemctl enable warp-svc >/dev/null 2>&1 || true
+        systemctl restart warp-svc
+        sleep 2
+    fi
+
+    if ! systemctl is-active --quiet warp-svc; then
+        error "warp-svc 启动失败"
+        journalctl -u warp-svc -n 20 --no-pager
+        return 1
+    fi
+}
+
 check_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && (( $1 > 0 && $1 < 65536 ))
 }
@@ -27,7 +58,9 @@ is_installed() {
     command -v warp-cli >/dev/null 2>&1
 }
 
-# 🎲 随机端口（自动避开占用）
+# =============================
+# 随机端口
+# =============================
 random_port() {
     while true; do
         port=$(shuf -i 10000-60000 -n 1)
@@ -61,7 +94,11 @@ get_port_input() {
     echo "$port"
 }
 
+# =============================
+# 安装
+# =============================
 install_warp() {
+    check_systemd || return
     port=$(get_port_input) || return
 
     info "安装依赖..."
@@ -79,8 +116,10 @@ https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
     apt update
     apt install -y cloudflare-warp
 
-    info "注册账户..."
+    info "启动 WARP 服务..."
+    ensure_warp_service || return
 
+    info "注册账户..."
     if warp-cli registration show >/dev/null 2>&1; then
         info "已注册，跳过"
     else
@@ -93,14 +132,13 @@ https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
 
     info "设置 Proxy 模式..."
     warp-cli mode proxy
-
     warp-cli proxy port "$port"
     echo "$port" > "$PORT_FILE"
 
     info "设置 MASQUE 协议..."
     warp-cli tunnel protocol set MASQUE || true
 
-    info "启动 WARP..."
+    info "连接 WARP..."
     warp-cli connect
 
     sleep 2
@@ -109,14 +147,44 @@ https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
     echo -e "${CYAN}socks5://127.0.0.1:$port${RESET}"
 }
 
+# =============================
+# 状态
+# =============================
 status_warp() {
     if ! is_installed; then
         error "未安装 WARP"
         return
     fi
-    warp-cli status
+
+    ensure_warp_service || return
+
+    raw=$(warp-cli status)
+
+    # 状态翻译
+    status=$(echo "$raw" | grep "Status update" | awk -F': ' '{print $2}')
+    network=$(echo "$raw" | grep "Network" | awk -F': ' '{print $2}')
+
+    case "$status" in
+        Connected) status_cn="已连接" ;;
+        Connecting) status_cn="连接中" ;;
+        Disconnected) status_cn="未连接" ;;
+        *) status_cn="$status" ;;
+    esac
+
+    case "$network" in
+        healthy) network_cn="网络正常" ;;
+        degraded) network_cn="网络异常" ;;
+        *) network_cn="$network" ;;
+    esac
+
+    echo -e "${CYAN}WARP 状态:${RESET}"
+    echo -e "  连接状态: ${GREEN}$status_cn${RESET}"
+    echo -e "  网络状态: ${GREEN}$network_cn${RESET}"
 }
 
+# =============================
+# 测试
+# =============================
 test_proxy() {
     if [[ ! -f "$PORT_FILE" ]]; then
         error "未找到端口"
@@ -126,16 +194,26 @@ test_proxy() {
     port=$(cat "$PORT_FILE")
 
     info "测试代理端口: $port"
-    curl -s --proxy socks5://127.0.0.1:$port ifconfig.me \
-    && echo || error "失败"
+
+    result=$(curl -s --max-time 10 --proxy socks5://127.0.0.1:$port ifconfig.me)
+
+    if [[ -n "$result" ]]; then
+        echo -e "${GREEN}成功 ✔${RESET} 出口IP: ${CYAN}$result${RESET}"
+    else
+        error "失败"
+    fi
 }
 
+# =============================
+# 改端口
+# =============================
 change_port() {
     if ! is_installed; then
         error "未安装 WARP"
         return
     fi
 
+    ensure_warp_service || return
     port=$(get_port_input) || return
 
     warp-cli proxy port "$port"
@@ -144,8 +222,18 @@ change_port() {
     info "端口已修改 ✔ -> $port"
 }
 
+# =============================
+# 修复
+# =============================
 fix_warp() {
+    if ! is_installed; then
+        error "未安装"
+        return
+    fi
+
     warn "尝试修复 WARP..."
+
+    ensure_warp_service || return
 
     warp-cli disconnect || true
     sleep 1
@@ -154,11 +242,13 @@ fix_warp() {
     info "已尝试重连"
 }
 
+# =============================
+# 卸载
+# =============================
 uninstall_warp() {
     warn "正在卸载 WARP..."
 
     warp-cli disconnect 2>/dev/null || true
-
     systemctl stop warp-svc 2>/dev/null || true
     systemctl disable warp-svc 2>/dev/null || true
 
@@ -172,6 +262,9 @@ uninstall_warp() {
     info "卸载完成 ✔"
 }
 
+# =============================
+# 菜单
+# =============================
 menu() {
     clear
     echo -e "${GREEN}==== WARP 管理 ====${RESET}"

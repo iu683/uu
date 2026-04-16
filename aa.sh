@@ -1,243 +1,249 @@
 #!/bin/bash
+# ========================================
+# flux-panel 管理
+# ========================================
 
-TARGET="/etc/profile.d/server-motd.sh"
-
-GREEN="\033[1;32m"
-RED="\033[1;31m"
-CYAN="\033[1;36m"
-YELLOW="\033[1;33m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-install_motd(){
+APP_NAME="flux"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+ENV_FILE="$APP_DIR/.env"
 
-cat << 'EOF' > $TARGET
-#!/bin/bash
-
-[ -n "$SUDO_USER" ] && exit
-
-G='\033[1;32m'
-B='\033[1;34m'
-C='\033[1;36m'
-Y='\033[1;33m'
-O='\033[38;5;208m'
-R='\033[1;31m'
-X='\033[0m'
-
-USER=$(whoami)
-HOST=$(hostname)
-OS=$(grep PRETTY_NAME /etc/os-release | cut -d '"' -f2)
-
-DATE=$(date "+%Y年%m月%d日 %H:%M:%S")
-
-
-UPTIME=$(uptime -p | sed 's/up //' \
-| sed 's/weeks/周/g' \
-| sed 's/week/周/g' \
-| sed 's/days/天/g' \
-| sed 's/day/天/g' \
-| sed 's/hours/小时/g' \
-| sed 's/hour/小时/g' \
-| sed 's/minutes/分钟/g' \
-| sed 's/minute/分钟/g')
-
-LOAD=$(uptime | awk -F'load average:' '{print $2}')
-
-CPU=$(top -bn1 | awk '/Cpu/ {print 100 - $8 "%"}')
-
-MEM=$(free -h | awk '/Mem:/ {print $3 "/" $2}')
-SWAP=$(free -h | awk '/Swap:/ {print $3 "/" $2}')
-
-DISK=$(df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}')
-DISK_P=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
-
-echo
-echo -e "${G}╔════════════════════════════════════════════╗${X}"
-echo -e "${G}           🚀 Server Dashboard                ${X}"
-echo -e "${G}╚════════════════════════════════════════════╝${X}"
-echo -e "${CYAN}----------------------------------------------${RESET}"
-printf "用户           : %s\n" "$USER"
-printf "主机           : %s\n" "$HOST"
-printf "系统           : %s\n" "$OS"
-echo -e "${CYAN}----------------------------------------------${RESET}"
-
-printf "当前时间       : %s\n" "$DATE"
-printf "运行时间       : %s\n" "$UPTIME"
-printf "系统负载       : %s\n" "$LOAD"
-
-echo -e "${CYAN}----------------------------------------------${RESET}"
-
-printf "CPU使用        : %s\n" "$CPU"
-printf "内存使用       : %s\n" "$MEM"
-printf "Swap使用       : %s\n" "$SWAP"
-printf "磁盘使用       : %s\n" "$DISK"
-
-echo -e "${CYAN}----------------------------------------------${RESET}"
-
-if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-
-D_CONT=$(docker ps -aq | wc -l)
-D_IMG=$(docker images -q | wc -l)
-D_SIZE=$(docker system df | awk '/Images/ {print $4}')
-
-echo -e "${Y}🐳 Docker 状态${X}"
-
-printf "容器数量       : %s\n" "$D_CONT"
-printf "镜像数量       : %s\n" "$D_IMG"
-printf "Docker占用     : %s\n" "$D_SIZE"
-
-RUN=$(docker ps --format "{{.Names}}")
-STOP=$(docker ps -a --filter status=exited --format "{{.Names}}")
-
-if [ -n "$RUN" ]; then
-echo
-echo "运行容器"
-for i in $RUN; do
-echo -e " ${G}✅ $i${X}"
-done
-fi
-
-if [ -n "$STOP" ]; then
-echo
-echo "停止容器"
-for i in $STOP; do
-echo -e " ${R}❌ $i${X}"
-done
-fi
-
-
-else
-echo -e "${R}Docker 未安装${X}"
-fi
-
-
-echo -e "${CYAN}----------------------------------------------${RESET}"
-echo -e "${O}🛡 最近登录记录${X}"
-
-LAST_BIN=$(command -v last 2>/dev/null)
-
-if [ -z "$LAST_BIN" ]; then
-    if command -v apt >/dev/null 2>&1; then
-        apt -qq update >/dev/null 2>&1
-        apt -y install wtmpdb >/dev/null 2>&1 || apt -y install util-linux >/dev/null 2>&1
-    fi
-    LAST_BIN=$(command -v last 2>/dev/null)
-fi
-
-if [ -n "$LAST_BIN" ]; then
-
-    if [ ! -f /var/log/wtmp ]; then
-        touch /var/log/wtmp
-        chmod 664 /var/log/wtmp
-        chown root:utmp /var/log/wtmp
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
     fi
 
-echo "IP               时间"
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
+    fi
+}
 
-$LAST_BIN -i -n 3 | grep '^root' | grep -v reboot | while read line
-do
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用！${RESET}"
+        return 1
+    fi
+    return 0
+}
 
-IP=$(echo "$line" | awk '{print $3}')
-MONTH=$(echo "$line" | awk '{print $5}')
-DAY=$(echo "$line" | awk '{print $6}')
-TIME=$(echo "$line" | awk '{print $7}')
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
+}
 
-case $MONTH in
-Jan) MONTH="01月" ;;
-Feb) MONTH="02月" ;;
-Mar) MONTH="03月" ;;
-Apr) MONTH="04月" ;;
-May) MONTH="05月" ;;
-Jun) MONTH="06月" ;;
-Jul) MONTH="07月" ;;
-Aug) MONTH="08月" ;;
-Sep) MONTH="09月" ;;
-Oct) MONTH="10月" ;;
-Nov) MONTH="11月" ;;
-Dec) MONTH="12月" ;;
-esac
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== Flux 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-DATE="${MONTH}${DAY}日 ${TIME}"
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
 
-printf "${Y}%-15s %s${X}\n" "$IP" "$DATE"
+install_app() {
 
-done
+    check_docker
+    mkdir -p "$APP_DIR"
 
-else
+    echo -e "${GREEN}=== Flux 安装 ===${RESET}"
 
-echo -e "${Y}系统未记录登录日志${X}"
+    read -p "面板端口 [默认6366]: " input_port
+    PORT=${input_port:-6366}
+    check_port "$PORT" || return
 
-fi
+    read -p "DB名称 [flux_db]: " DB_NAME
+    DB_NAME=${DB_NAME:-flux_db}
 
-if [ "$DISK_P" -ge 70 ]; then
-echo
-echo -e "${R}⚠ 磁盘使用率 ${DISK_P}% 请清理${X}"
-fi
+    read -p "DB用户 [flux_user]: " DB_USER
+    DB_USER=${DB_USER:-flux_user}
 
-echo
+    read -p "数据库密码: " DB_PASSWORD
+    read -p "JWT密钥: " JWT_SECRET
+
+    read -p "启用IPv6? true/false [true]: " IPV6
+    ENABLE_IPV6=${IPV6:-true}
+
+    PANEL_LISTEN="0.0.0.0"
+
+    cat > "$ENV_FILE" <<EOF
+DB_NAME=$DB_NAME
+DB_USER=$DB_USER
+DB_PASSWORD=$DB_PASSWORD
+JWT_SECRET=$JWT_SECRET
+PANEL_PORT=$PORT
+ENABLE_IPV6=$ENABLE_IPV6
+PANEL_LISTEN=$PANEL_LISTEN
 EOF
 
-chmod +x $TARGET
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  mysql:
+    image: mysql:5.7
+    container_name: flux-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      TZ: Asia/Shanghai
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --max_connections=1000
+      --innodb_buffer_pool_size=256M
+    networks:
+      - flux-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 10s
+      retries: 10
 
-echo -e "${GREEN}MOTD 安装完成${RESET}"
+  node-binary-init:
+    image: 0xnetuser/node-binary:2.1.25
+    container_name: node-binary-init
+    restart: "no"
+    volumes:
+      - node_binary:/data/node
 
+  backend:
+    image: 0xnetuser/go-backend:2.1.25
+    container_name: go-backend
+    restart: unless-stopped
+    environment:
+      DB_HOST: mysql
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      ALLOWED_ORIGINS: \${ALLOWED_ORIGINS:-}
+      LOG_DIR: /app/logs
+    expose:
+      - "6365"
+    volumes:
+      - backend_logs:/app/logs
+      - node_binary:/data/node
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/data/compose
+    depends_on:
+      mysql:
+        condition: service_healthy
+      node-binary-init:
+        condition: service_completed_successfully
+    networks:
+      - flux-network
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:6365/flow/test || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  frontend:
+    image: 0xnetuser/nextjs-frontend:2.1.25
+    container_name: nextjs-frontend
+    restart: unless-stopped
+    ports:
+      - "\${PANEL_LISTEN:-0.0.0.0}:${PORT}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - flux-network
+
+volumes:
+  mysql_data:
+  backend_logs:
+  node_binary:
+
+networks:
+  flux-network:
+    driver: bridge
+    enable_ipv6: \${ENABLE_IPV6:-false}
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    SERVER_IP=$(get_public_ip)
+
+    echo -e "${GREEN}✅ Flux 安装完成${RESET}"
+    echo -e "${YELLOW}访问: http://${SERVER_IP}${PORT}${RESET}"
+    echo -e "${YELLOW}用户名: admin_user${RESET}"
+    echo -e "${YELLOW}密码: 查看日志${RESET}"
+    echo -e "${YELLOW}数据目录: $APP_DIR${RESET}"
+
+
+    read -p "按回车返回菜单..."
 }
 
-remove_motd(){
-
-rm -f $TARGET
-echo -e "${RED}MOTD 已卸载${RESET}"
-
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅Flux 更新完成${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-restore_default(){
-
-rm -f $TARGET
-
-true > /etc/motd
-
-if [ -d /etc/update-motd.d ]; then
-chmod +x /etc/update-motd.d/*
-fi
-
-echo -e "${CYAN}系统 MOTD 已恢复默认${RESET}"
-
+restart_app() {
+    cd "$APP_DIR" || return
+    docker compose restart
+    echo -e "${GREEN}✅Flux 已重启${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-preview(){
-
-bash $TARGET
-
+view_logs() {
+    docker logs -f go-backend
 }
 
-menu(){
+check_status() {
+    docker ps --filter "name=flux"
+    read -p "按回车返回菜单..."
+}
 
-while true
-do
-
-clear
-
-echo -e "${GREEN}====MOTD管理菜单====${RESET}"
-echo -e "${GREEN}1. 安装MOTD${RESET}"
-echo -e "${GREEN}2. 卸载MOTD${RESET}"
-echo -e "${GREEN}3. 恢复系统默认${RESET}"
-echo -e "${GREEN}4. 预览MOTD${RESET}"
-echo -e "${GREEN}0. 退出${RESET}"
-read -r -p $'\033[32m请选择: \033[0m' CH
-
-case $CH in
-
-1) install_motd ;;
-2) remove_motd ;;
-3) restore_default ;;
-4) preview ;;
-0) exit ;;
-
-esac
-
-read -p "按回车返回菜单..."
-
-done
-
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅Flux 已卸载完成${RESET}"
+    read -p "按回车返回菜单..."
 }
 
 menu

@@ -1,235 +1,255 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
 
+#################################################
+# acmebackup - ACME证书备份系统（acme.sh）
+#################################################
+
+INSTALL_DIR="/opt/acmebackup"
+LOCAL_SCRIPT="$INSTALL_DIR/acmebackup.sh"
+REMOTE_URL="https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/acmebackup.sh"
+
+if [[ "$0" != "$LOCAL_SCRIPT" ]]; then
+    mkdir -p "$INSTALL_DIR"
+
+    curl -fsSL -o "$LOCAL_SCRIPT.tmp" "$REMOTE_URL" || {
+        echo "下载失败"
+        exit 1
+    }
+
+    if [[ ! -f "$LOCAL_SCRIPT" ]] || ! cmp -s "$LOCAL_SCRIPT.tmp" "$LOCAL_SCRIPT"; then
+        mv "$LOCAL_SCRIPT.tmp" "$LOCAL_SCRIPT"
+        chmod +x "$LOCAL_SCRIPT"
+        echo "已安装/更新到最新版本"
+    else
+        rm -f "$LOCAL_SCRIPT.tmp"
+    fi
+
+    exec bash "$LOCAL_SCRIPT" "$@"
+fi
+
+#################################
+# 颜色
+#################################
 GREEN="\033[32m"
 RED="\033[31m"
-YELLOW="\033[33m"
 CYAN="\033[36m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-PORT_FILE="/etc/warp-port.conf"
-CRON_JOB="0 * * * * /bin/systemctl restart warp-svc > /dev/null 2>&1"
+#################################
+# 基础路径
+#################################
+CONFIG_FILE="$INSTALL_DIR/config.sh"
+LOG_FILE="$INSTALL_DIR/backup.log"
+CRON_TAG="#acmebackup_cron"
 
-info(){ echo -e "${GREEN}[信息] $1${RESET}"; }
-warn(){ echo -e "${YELLOW}[警告] $1${RESET}"; }
-error(){ echo -e "${RED}[错误] $1${RESET}"; }
+DATA_DIR_DEFAULT="$INSTALL_DIR/data"
+RETAIN_DAYS_DEFAULT=7
+SERVICE_NAME_DEFAULT="$(hostname)"
 
-pause(){ read -rp "按回车继续..." _; }
+mkdir -p "$INSTALL_DIR"
 
-# =============================
-# 环境检测
-# =============================
-check_systemd() {
-    if [[ "$(ps -p 1 -o comm=)" != "systemd" ]]; then
-        error "当前环境不支持 systemd（Docker/LXC/OpenVZ）"
-        error "无法使用官方 WARP 客户端"
-        return 1
-    fi
+#################################
+# ACME路径
+#################################
+ACME_HOME="/root/.acme.sh"
+SSL_DIR="/root/ssl"
+
+#################################
+# 卸载
+#################################
+if [[ "$1" == "--uninstall" ]]; then
+    echo -e "${YELLOW}正在卸载...${RESET}"
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+    rm -rf "$INSTALL_DIR"
+    echo -e "${GREEN}卸载完成${RESET}"
+    exit 0
+fi
+
+#################################
+# 加载配置
+#################################
+load_config() {
+    [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+    DATA_DIR=${DATA_DIR:-$DATA_DIR_DEFAULT}
+    RETAIN_DAYS=${RETAIN_DAYS:-$RETAIN_DAYS_DEFAULT}
+    SERVICE_NAME=${SERVICE_NAME:-$SERVICE_NAME_DEFAULT}
+}
+load_config
+mkdir -p "$DATA_DIR"
+
+#################################
+# 保存配置
+#################################
+save_config() {
+cat > "$CONFIG_FILE" <<EOF
+DATA_DIR="$DATA_DIR"
+RETAIN_DAYS="$RETAIN_DAYS"
+SERVICE_NAME="$SERVICE_NAME"
+TG_TOKEN="$TG_TOKEN"
+TG_CHAT_ID="$TG_CHAT_ID"
+EOF
 }
 
-ensure_warp_service() {
-    if ! systemctl is-active --quiet warp-svc; then
-        warn "warp-svc 未运行，尝试启动..."
-        systemctl daemon-reexec
-        systemctl daemon-reload
-        systemctl enable warp-svc >/dev/null 2>&1 || true
-        systemctl restart warp-svc
-        sleep 2
-    fi
-
-    if ! systemctl is-active --quiet warp-svc; then
-        error "warp-svc 启动失败"
-        journalctl -u warp-svc -n 20 --no-pager
-        return 1
-    fi
+#################################
+# Telegram
+#################################
+send_tg() {
+    [[ -z "$TG_TOKEN" || -z "$TG_CHAT_ID" ]] && return
+    MESSAGE="[$SERVICE_NAME] $1"
+    curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+        -d chat_id="$TG_CHAT_ID" \
+        -d text="$MESSAGE" >/dev/null 2>&1
 }
 
-check_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] && (( $1 > 0 && $1 < 65536 ))
-}
+#################################
+# 备份
+#################################
+backup() {
+    TIMESTAMP=$(date +%F_%H-%M-%S)
+    FILE="$DATA_DIR/acme_backup_$TIMESTAMP.tar.gz"
 
-is_port_used() {
-    ss -lnt | awk '{print $4}' | grep -q ":$1$"
-}
+    echo -e "${CYAN}开始备份 ACME证书...${RESET}"
 
-is_installed() {
-    command -v warp-cli >/dev/null 2>&1
-}
+    [[ ! -d "$ACME_HOME" ]] && echo -e "${RED}未找到 acme.sh${RESET}" && return
+    [[ ! -d "$SSL_DIR" ]] && echo -e "${RED}未找到证书目录${RESET}" && return
 
-# =============================
-# 定时任务管理
-# =============================
-manage_cron() {
-    if ! is_installed; then
-        error "未安装 WARP，无法设置定时任务"
-        return
-    fi
+    tar czf "$FILE" \
+        "$ACME_HOME" \
+        "$SSL_DIR" >> "$LOG_FILE" 2>&1
 
-    echo -e "1) 开启每小时自动重启 warp-svc"
-    echo -e "2) 关闭自动重启"
-    read -rp "请选择: " cron_choice
-
-    case $cron_choice in
-        1)
-            (crontab -l 2>/dev/null | grep -v "restart warp-svc"; echo "$CRON_JOB") | crontab -
-            info "定时重启任务已添加 (每小时执行一次)"
-            ;;
-        2)
-            crontab -l 2>/dev/null | grep -v "restart warp-svc" | crontab -
-            info "定时重启任务已移除"
-            ;;
-        *)
-            warn "无效选项"
-            ;;
-    esac
-}
-
-# =============================
-# 核心功能 (安装/状态/测试/改端口/修复)
-# =============================
-random_port() {
-    while true; do
-        port=$(shuf -i 10000-60000 -n 1)
-        if ! is_port_used "$port"; then
-            echo "$port"
-            return
-        fi
-    done
-}
-
-get_port_input() {
-    read -rp "请输入 Socks5 端口 (回车随机): " port
-    if [[ -z "$port" ]]; then
-        port=$(random_port)
-        info "使用随机端口: $port" >&2
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}备份成功：$FILE${RESET}"
+        send_tg "✅ ACME备份成功"
     else
-        if ! check_port "$port" || is_port_used "$port"; then
-            error "端口无效或已被占用" >&2
-            return 1
-        fi
-        info "使用自定义端口: $port" >&2
-    fi
-    echo "$port"
-}
-
-install_warp() {
-    check_systemd || return
-    port=$(get_port_input) || return
-
-    info "安装依赖..."
-    apt update && apt install -y gnupg curl lsb-release
-
-    info "写入 WARP 源..."
-    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/cloudflare-client.list
-
-    apt update && apt install -y cloudflare-warp
-    ensure_warp_service || return
-
-    info "注册账户..."
-    if ! warp-cli registration show >/dev/null 2>&1; then
-        warp-cli registration new --accept-tos || warp-cli registration new
+        echo -e "${RED}备份失败${RESET}"
+        send_tg "❌ ACME备份失败"
     fi
 
-    warp-cli mode proxy
-    warp-cli proxy port "$port"
-    echo "$port" > "$PORT_FILE"
-    warp-cli tunnel protocol set MASQUE || true
-    warp-cli connect
-    
-    sleep 2
-    info "安装完成 ✅ socks5://127.0.0.1:$port"
+    find "$DATA_DIR" -type f -name "*.tar.gz" -mtime +"$RETAIN_DAYS" -delete
 }
 
-status_warp() {
-    if ! is_installed; then error "未安装 WARP"; return; fi
-    ensure_warp_service || return
-    
-    raw=$(warp-cli status)
-    status=$(echo "$raw" | grep "Status update" | awk -F': ' '{print $2}')
-    
-    # 检查是否有定时任务
-    cron_status="${RED}未开启${RESET}"
-    crontab -l 2>/dev/null | grep -q "restart warp-svc" && cron_status="${GREEN}已开启${RESET}"
+#################################
+# 恢复
+#################################
+restore() {
+    shopt -s nullglob
+    FILE_LIST=("$DATA_DIR"/*.tar.gz)
+    [[ ${#FILE_LIST[@]} -eq 0 ]] && echo -e "${RED}没有备份${RESET}" && return
 
-    echo -e "${YELLOW}WARP 状态:${RESET}"
-    echo -e "连接状态: ${GREEN}${status:-Unknown}${RESET}"
-    echo -e "定时重启: $cron_status"
+    echo -e "${CYAN}备份列表:${RESET}"
+    for i in "${!FILE_LIST[@]}"; do
+        echo -e "${GREEN}$((i+1)). $(basename "${FILE_LIST[$i]}")${RESET}"
+    done
+
+    read -p "输入序号: " num
+    FILE="${FILE_LIST[$((num-1))]}"
+
+    echo -e "${YELLOW}确认恢复？(y/n)${RESET}"
+    read confirm
+    [[ "$confirm" != "y" ]] && return
+
+    tar xzf "$FILE" -C /
+
+    # 修复权限
+    chmod -R 600 "$ACME_HOME"
+    chmod -R 600 "$SSL_DIR"
+
+    # 修复 cron
+    crontab -l | grep -q acme.sh || "$ACME_HOME/acme.sh" --install-cronjob
+
+    echo -e "${GREEN}恢复完成${RESET}"
+    send_tg "🔄 ACME 已恢复"
 }
 
-test_proxy() {
-    [[ ! -f "$PORT_FILE" ]] && { error "未找到端口配置"; return; }
-    port=$(cat "$PORT_FILE")
-    info "测试代理端口: $port"
-    result=$(curl -s --max-time 10 --proxy socks5://127.0.0.1:$port ifconfig.me || true)
-    [[ -n "$result" ]] && echo -e "${GREEN}成功 ✅${RESET} 出口IP: ${CYAN}$result${RESET}" || error "测试失败"
-}
+#################################
+# 定时任务
+#################################
+add_cron() {
+    echo -e "${CYAN}1 每天0点${RESET}"
+    echo -e "${CYAN}2 每周一0点${RESET}"
+    echo -e "${CYAN}3 每月1号${RESET}"
+    echo -e "${CYAN}4 自定义${RESET}"
 
-# =============================
-# 卸载 (含清理 Cron)
-# =============================
-uninstall_warp() {
-    warn "正在彻底卸载 WARP..."
-    
-    # 1. 停止并移除服务
-    warp-cli disconnect 2>/dev/null || true
-    systemctl stop warp-svc 2>/dev/null || true
-    systemctl disable warp-svc 2>/dev/null || true
+    read -p "选择: " t
+    case $t in
+        1) cron="0 0 * * *" ;;
+        2) cron="0 0 * * 1" ;;
+        3) cron="0 0 1 * *" ;;
+        4)
+            read -p "请输入 cron 表达式: " cron
 
-    # 2. 移除包
-    apt remove -y cloudflare-warp
-    apt autoremove -y
-
-    # 3. 清理文件
-    rm -f /etc/apt/sources.list.d/cloudflare-client.list
-    rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-    rm -f "$PORT_FILE"
-
-    # 4. 清理定时任务
-    crontab -l 2>/dev/null | grep -v "restart warp-svc" | crontab -
-    
-    info "卸载完成 ✅"
-}
-
-# =============================
-# 菜单
-# =============================
-menu() {
-    clear
-    echo -e "${GREEN}==== WARP 管理面板 ====${RESET}"
-    echo -e "1) 安装并配置"
-    echo -e "2) 查看状态"
-    echo -e "3) 测试代理"
-    echo -e "4) 修改端口"
-    echo -e "5) 修复/重连 WARP"
-    echo -e "6) 定时重启任务管理${RESET}"
-    echo -e "7) 卸载 WARP${RESET}"
-    echo -e "0) 退出"
-    echo -e "-----------------------"
-    read -rp "请选择: " num
-
-    case $num in
-        1) install_warp ;;
-        2) status_warp ;;
-        3) test_proxy ;;
-        4) 
-           if is_installed; then
-               ensure_warp_service || return
-               port=$(get_port_input) || return
-               warp-cli proxy port "$port"
-               echo "$port" > "$PORT_FILE"
-               info "端口已修改: $port"
-           else error "未安装"; fi ;;
-        5) 
-           ensure_warp_service && (warp-cli disconnect; sleep 1; warp-cli connect; info "重连完成") ;;
-        6) manage_cron ;;
-        7) uninstall_warp ;;
-        0) exit 0 ;;
-        *) warn "无效选项" ;;
+            # 简单校验（防止输错）
+            if [[ ! "$cron" =~ ^([0-9*/,-]+\s){4}[0-9*/,-]+$ ]]; then
+                echo -e "${RED}格式错误，例如: 0 */6 * * *${RESET}"
+                return
+            fi
+            ;;
+        *) return ;;
     esac
-    pause
+
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/acmebackup 2>/dev/null
+    echo "$cron bash $LOCAL_SCRIPT auto >> $INSTALL_DIR/cron.log 2>&1 $CRON_TAG" >> /tmp/acmebackup
+    crontab /tmp/acmebackup
+    rm -f /tmp/acmebackup
+
+    echo -e "${GREEN}定时任务已设置: $cron${RESET}"
 }
 
+remove_cron() {
+    crontab -l | grep -v "$CRON_TAG" | crontab -
+    echo -e "${GREEN}已删除定时任务${RESET}"
+}
+
+show_cron(){
+    echo -e "${CYAN}当前任务:${RESET}"
+    crontab -l 2>/dev/null | grep "$CRON_TAG" || echo "无"
+}
+#################################
+# auto
+#################################
+if [[ "$1" == "auto" ]]; then
+    backup
+    exit 0
+fi
+
+#################################
+# 菜单
+#################################
 while true; do
-    menu
+    clear
+    echo -e "${GREEN}==== ACME备份恢复====${RESET}"
+    echo -e "${GREEN}1. 立即备份${RESET}"
+    echo -e "${GREEN}2. 恢复备份${RESET}"
+    echo -e "${GREEN}3. 设置定时任务${RESET}"
+    echo -e "${GREEN}4. 删除定时任务${RESET}"
+    echo -e "${GREEN}5. 设置备份目录${RESET}"
+    echo -e "${GREEN}6. 设置保留天数${RESET}"
+    echo -e "${GREEN}7. 设置Telegram${RESET}"
+    echo -e "${GREEN}8. 查看定时任务${RESET}"
+    echo -e "${GREEN}9. 卸载${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+
+    read -p "选择: " c
+    case $c in
+        1) backup ;;
+        2) restore ;;
+        3) add_cron ;;
+        4) remove_cron ;;
+        5) read -p "目录: " DATA_DIR; mkdir -p "$DATA_DIR"; save_config ;;
+        6) read -p "天数: " RETAIN_DAYS; save_config ;;
+        7)
+            read -p "TG TOKEN: " TG_TOKEN
+            read -p "CHAT ID: " TG_CHAT_ID
+            save_config
+            ;;
+        8) show_cron ;;
+        9) rm -rf "$INSTALL_DIR"; exit ;;
+        0) exit ;;
+    esac
+
+    read -p "回车继续..."
 done

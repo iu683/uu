@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Whois Domain Lookup 管理
+# magnet_fix 管理
 # ========================================
 
 GREEN="\033[32m"
@@ -8,9 +8,10 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="whois-domain-lookup"
+APP_NAME="magnet_fix"
 APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+REPO_URL="https://github.com/poouo/magnet_fix.git"
+COMPOSE_DIR="$APP_DIR/magnet_fix"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -19,22 +20,30 @@ check_docker() {
     fi
 
     if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        echo -e "${RED}未检测到 Docker Compose v2${RESET}"
         exit 1
     fi
 }
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
 }
 
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Whois Domain Lookup 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== magnet_fix 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -42,7 +51,8 @@ menu() {
         echo -e "${GREEN}5) 查看状态${RESET}"
         echo -e "${GREEN}6) 卸载${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        read -rp "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
         case $choice in
             1) install_app ;;
@@ -60,84 +70,67 @@ menu() {
 install_app() {
 
     check_docker
+
     mkdir -p "$APP_DIR"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-
-    echo
-    read -p "请输入访问端口 [默认:10001]: " input_port
-    PORT=${input_port:-10001}
-    check_port "$PORT" || return
-
-    echo
-    read -p "请输入访问密码 (可空): " SITE_PASSWORD
-
-    echo
-    read -p "请输入 BASE 路径 [默认:/]: " input_base
-    BASE=${input_base:-"/"}
-
-cat > "$COMPOSE_FILE" <<EOF
-services:
-  whois-domain-lookup:
-    container_name: whois-domain-lookup
-    image: reg233/whois-domain-lookup:latest
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${PORT}:80"
-    environment:
-      SITE_PASSWORD: "${SITE_PASSWORD}"
-      BASE: "${BASE}"
-EOF
-
     cd "$APP_DIR" || exit
-    docker compose up -d
 
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}❌ 启动失败${RESET}"
-        return
+    if [ -d "$COMPOSE_DIR" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖？(y/n)${RESET}"
+        read -r confirm
+        [[ "$confirm" != "y" ]] && return
+        rm -rf "$COMPOSE_DIR"
     fi
 
-    echo
-    echo -e "${GREEN}✅ Whois Domain Lookup 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🌐 访问密码: $SITE_PASSWORD${RESET}"
+    echo -e "${GREEN}正在拉取项目...${RESET}"
+    git clone "$REPO_URL"
 
-    read -p "按回车返回菜单..."
+    cd "$COMPOSE_DIR" || exit
+
+    docker compose up -d --build
+
+    SERVER_IP=$(get_public_ip)
+
+    echo
+    echo -e "${GREEN}✅ 安装完成${RESET}"
+    echo -e "${YELLOW}🌐 搜索首页: http://${SERVER_IP}:8080${RESET}"
+    echo -e "${YELLOW}🔐 管理后台: http://${SERVER_IP}:8080/admin${RESET}"
+    echo -e "${YELLOW}🔐 默认密码: admin123${RESET}"
+
+    read -rp "按回车返回菜单..."
 }
 
 update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
+    cd "$COMPOSE_DIR" || return
+    git pull
+    docker compose up -d --build
     echo -e "${GREEN}✅ 更新完成${RESET}"
-    read -p "按回车返回菜单..."
+    read -rp "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart whois-domain-lookup
+    cd "$COMPOSE_DIR" || return
+    docker compose restart
     echo -e "${GREEN}✅ 已重启${RESET}"
-    read -p "按回车返回菜单..."
+    read -rp "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f whois-domain-lookup
+    cd "$COMPOSE_DIR" || return
+    docker compose logs -f
 }
 
 check_status() {
-    docker ps | grep whois-domain-lookup
-    read -p "按回车返回菜单..."
+    cd "$COMPOSE_DIR" || return
+    docker compose ps
+    read -rp "按回车返回菜单..."
 }
 
 uninstall_app() {
-    cd "$APP_DIR" || return
+    cd "$COMPOSE_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已卸载${RESET}"
-    read -p "按回车返回菜单..."
+    echo -e "${RED}✅ 已卸载完成${RESET}"
+    read -rp "按回车返回菜单..."
 }
 
 menu

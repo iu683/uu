@@ -8,6 +8,7 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 PORT_FILE="/etc/warp-port.conf"
+CRON_JOB="0 * * * * /bin/systemctl restart warp-svc > /dev/null 2>&1"
 
 info(){ echo -e "${GREEN}[信息] $1${RESET}"; }
 warn(){ echo -e "${YELLOW}[警告] $1${RESET}"; }
@@ -26,9 +27,6 @@ check_systemd() {
     fi
 }
 
-# =============================
-# warp-svc 保证运行
-# =============================
 ensure_warp_service() {
     if ! systemctl is-active --quiet warp-svc; then
         warn "warp-svc 未运行，尝试启动..."
@@ -59,7 +57,35 @@ is_installed() {
 }
 
 # =============================
-# 随机端口
+# 定时任务管理
+# =============================
+manage_cron() {
+    if ! is_installed; then
+        error "未安装 WARP，无法设置定时任务"
+        return
+    fi
+
+    echo -e "1) 开启每小时自动重启 warp-svc"
+    echo -e "2) 关闭自动重启"
+    read -rp "请选择: " cron_choice
+
+    case $cron_choice in
+        1)
+            (crontab -l 2>/dev/null | grep -v "restart warp-svc"; echo "$CRON_JOB") | crontab -
+            info "定时重启任务已添加 (每小时执行一次)"
+            ;;
+        2)
+            crontab -l 2>/dev/null | grep -v "restart warp-svc" | crontab -
+            info "定时重启任务已移除"
+            ;;
+        *)
+            warn "无效选项"
+            ;;
+    esac
+}
+
+# =============================
+# 核心功能 (安装/状态/测试/改端口/修复)
 # =============================
 random_port() {
     while true; do
@@ -73,206 +99,95 @@ random_port() {
 
 get_port_input() {
     read -rp "请输入 Socks5 端口 (回车随机): " port
-
     if [[ -z "$port" ]]; then
         port=$(random_port)
         info "使用随机端口: $port" >&2
     else
-        if ! check_port "$port"; then
-            error "端口无效" >&2
+        if ! check_port "$port" || is_port_used "$port"; then
+            error "端口无效或已被占用" >&2
             return 1
         fi
-
-        if is_port_used "$port"; then
-            error "端口已被占用" >&2
-            return 1
-        fi
-
         info "使用自定义端口: $port" >&2
     fi
-
     echo "$port"
 }
 
-# =============================
-# 安装
-# =============================
 install_warp() {
     check_systemd || return
     port=$(get_port_input) || return
 
     info "安装依赖..."
-    apt update
-    apt install -y gnupg curl lsb-release
+    apt update && apt install -y gnupg curl lsb-release
 
     info "写入 WARP 源..."
-    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
-    | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/cloudflare-client.list
 
-    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] \
-https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
-    > /etc/apt/sources.list.d/cloudflare-client.list
-
-    apt update
-    apt install -y cloudflare-warp
-
-    info "启动 WARP 服务..."
+    apt update && apt install -y cloudflare-warp
     ensure_warp_service || return
 
     info "注册账户..."
-    if warp-cli registration show >/dev/null 2>&1; then
-        info "已注册，跳过"
-    else
-        if warp-cli registration new --help 2>&1 | grep -q accept-tos; then
-            warp-cli registration new --accept-tos
-        else
-            warp-cli registration new
-        fi
+    if ! warp-cli registration show >/dev/null 2>&1; then
+        warp-cli registration new --accept-tos || warp-cli registration new
     fi
 
-    info "设置 Proxy 模式..."
     warp-cli mode proxy
     warp-cli proxy port "$port"
     echo "$port" > "$PORT_FILE"
-
-    info "设置 MASQUE 协议..."
     warp-cli tunnel protocol set MASQUE || true
-
-    info "连接 WARP..."
     warp-cli connect
-
+    
     sleep 2
-
-    info "完成 ✅"
-    echo -e "${CYAN}socks5://127.0.0.1:$port${RESET}"
+    info "安装完成 ✅ socks5://127.0.0.1:$port"
 }
 
-# =============================
-# 状态
-# =============================
 status_warp() {
-    if ! is_installed; then
-        error "未安装 WARP"
-        return
-    fi
-
+    if ! is_installed; then error "未安装 WARP"; return; fi
     ensure_warp_service || return
-
+    
     raw=$(warp-cli status)
-
-    # 状态翻译
     status=$(echo "$raw" | grep "Status update" | awk -F': ' '{print $2}')
-    network=$(echo "$raw" | grep "Network" | awk -F': ' '{print $2}')
-
-    case "$status" in
-        Connected) status_cn="已连接" ;;
-        Connecting) status_cn="连接中" ;;
-        Disconnected) status_cn="未连接" ;;
-        *) status_cn="$status" ;;
-    esac
-
-    case "$network" in
-        healthy) network_cn="网络正常" ;;
-        degraded) network_cn="网络异常" ;;
-        *) network_cn="$network" ;;
-    esac
+    
+    # 检查是否有定时任务
+    cron_status="${RED}未开启${RESET}"
+    crontab -l 2>/dev/null | grep -q "restart warp-svc" && cron_status="${GREEN}已开启${RESET}"
 
     echo -e "${YELLOW}WARP 状态:${RESET}"
-    echo -e "连接状态: ${GREEN}$status_cn${RESET}"
-    echo -e "网络状态: ${GREEN}$network_cn${RESET}"
+    echo -e "连接状态: ${GREEN}${status:-Unknown}${RESET}"
+    echo -e "定时重启: $cron_status"
 }
 
-# =============================
-# 测试
-# =============================
 test_proxy() {
-    if [[ ! -f "$PORT_FILE" ]]; then
-        error "未找到端口"
-        return
-    fi
-
+    [[ ! -f "$PORT_FILE" ]] && { error "未找到端口配置"; return; }
     port=$(cat "$PORT_FILE")
-
     info "测试代理端口: $port"
-
-    result=$(curl -s --max-time 10 --proxy socks5://127.0.0.1:$port ifconfig.me)
-
-    if [[ -n "$result" ]]; then
-        echo -e "${GREEN}成功 ✅${RESET} 出口IP: ${CYAN}$result${RESET}"
-    else
-        error "失败"
-    fi
+    result=$(curl -s --max-time 10 --proxy socks5://127.0.0.1:$port ifconfig.me || true)
+    [[ -n "$result" ]] && echo -e "${GREEN}成功 ✅${RESET} 出口IP: ${CYAN}$result${RESET}" || error "测试失败"
 }
 
 # =============================
-# 改端口
-# =============================
-change_port() {
-    if ! is_installed; then
-        error "未安装 WARP"
-        return
-    fi
-
-    ensure_warp_service || return
-    port=$(get_port_input) || return
-
-    warp-cli proxy port "$port"
-    echo "$port" > "$PORT_FILE"
-
-    info "端口已修改 ✅ -> $port"
-}
-
-# =============================
-# 修复
-# =============================
-fix_warp() {
-    if ! is_installed; then
-        error "未安装"
-        return
-    fi
-
-    warn "尝试修复 WARP..."
-
-    ensure_warp_service || return
-
-    warp-cli disconnect || true
-    sleep 1
-    warp-cli connect || true
-
-    info "已尝试重连"
-}
-
-CRON_JOB="0 * * * * /bin/systemctl restart warp-svc > /dev/null 2>&1"
-
-add_cron() {
-    (crontab -l 2>/dev/null | grep -vF "$CRON_JOB" ; echo "$CRON_JOB") | crontab -
-    info "已添加定时任务（每小时重启 warp-svc）"
-}
-
-remove_cron() {
-    crontab -l 2>/dev/null | grep -vF "$CRON_JOB" | crontab -
-    info "已移除 warp-svc 定时任务"
-}
-
-# =============================
-# 卸载
+# 卸载 (含清理 Cron)
 # =============================
 uninstall_warp() {
-    warn "正在卸载 WARP..."
-
+    warn "正在彻底卸载 WARP..."
+    
+    # 1. 停止并移除服务
     warp-cli disconnect 2>/dev/null || true
     systemctl stop warp-svc 2>/dev/null || true
     systemctl disable warp-svc 2>/dev/null || true
 
+    # 2. 移除包
     apt remove -y cloudflare-warp
     apt autoremove -y
 
+    # 3. 清理文件
     rm -f /etc/apt/sources.list.d/cloudflare-client.list
     rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
     rm -f "$PORT_FILE"
 
-    remove_cron
-
+    # 4. 清理定时任务
+    crontab -l 2>/dev/null | grep -v "restart warp-svc" | crontab -
+    
     info "卸载完成 ✅"
 }
 
@@ -281,39 +196,37 @@ uninstall_warp() {
 # =============================
 menu() {
     clear
-    echo -e "${GREEN}==== WARP 管理 ====${RESET}"
-    echo -e "${GREEN}1) 安装并配置${RESET}"
-    echo -e "${GREEN}2) 查看状态${RESET}"
-    echo -e "${GREEN}3) 测试代理${RESET}"
-    echo -e "${GREEN}4) 修改端口${RESET}"
-    echo -e "${GREEN}5) 修复 WARP${RESET}"
-    echo -e "${GREEN}6) 定时重启${RESET}"
-    echo -e "${GREEN}7) 卸载 WARP${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    read -rp $'\033[32m请选择: \033[0m' num
+    echo -e "${GREEN}==== WARP 管理面板 ====${RESET}"
+    echo -e "1) 安装并配置"
+    echo -e "2) 查看状态"
+    echo -e "3) 测试代理"
+    echo -e "4) 修改端口"
+    echo -e "5) 修复/重连 WARP"
+    echo -e "6) 定时重启任务管理${RESET}"
+    echo -e "7) 卸载 WARP${RESET}"
+    echo -e "0) 退出"
+    echo -e "-----------------------"
+    read -rp "请选择: " num
 
     case $num in
         1) install_warp ;;
         2) status_warp ;;
         3) test_proxy ;;
-        4) change_port ;;
-        5) fix_warp ;;
-        6)
-           echo -e "${GREEN}1) 添加 cron${RESET}"
-           echo -e "${GREEN}2) 删除 cron${RESET}"
-           read -rp $'\033[32m请选择: \033[0m' c
-
-           case $c in
-               1) add_cron ;;
-               2) remove_cron ;;
-               *) warn "无效选项" ;;
-           esac
-           ;;
+        4) 
+           if is_installed; then
+               ensure_warp_service || return
+               port=$(get_port_input) || return
+               warp-cli proxy port "$port"
+               echo "$port" > "$PORT_FILE"
+               info "端口已修改: $port"
+           else error "未安装"; fi ;;
+        5) 
+           ensure_warp_service && (warp-cli disconnect; sleep 1; warp-cli connect; info "重连完成") ;;
+        6) manage_cron ;;
         7) uninstall_warp ;;
         0) exit 0 ;;
         *) warn "无效选项" ;;
     esac
-
     pause
 }
 

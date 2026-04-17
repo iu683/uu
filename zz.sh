@@ -2,32 +2,32 @@
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/root
 
+#################################################
+# acmebackup - ACME证书备份系统（acme.sh）
+#################################################
+
 INSTALL_DIR="/opt/acmebackup"
 LOCAL_SCRIPT="$INSTALL_DIR/acmebackup.sh"
 REMOTE_URL="https://raw.githubusercontent.com/iu683/uu/main/zz.sh"
-FIRST_FLAG="$INSTALL_DIR/.installed"
 
-mkdir -p "$INSTALL_DIR"
+if [[ "$0" != "$LOCAL_SCRIPT" ]]; then
+    mkdir -p "$INSTALL_DIR"
 
-# ==============================
-# 仅首次安装
-# ==============================
-if [[ ! -f "$FIRST_FLAG" ]]; then
-
-    curl -fsSL -o "$LOCAL_SCRIPT" "$REMOTE_URL" || {
+    curl -fsSL -o "$LOCAL_SCRIPT.tmp" "$REMOTE_URL" || {
         echo "下载失败"
         exit 1
     }
 
-    chmod +x "$LOCAL_SCRIPT"
-    touch "$FIRST_FLAG"
+    if [[ ! -f "$LOCAL_SCRIPT" ]] || ! cmp -s "$LOCAL_SCRIPT.tmp" "$LOCAL_SCRIPT"; then
+        mv "$LOCAL_SCRIPT.tmp" "$LOCAL_SCRIPT"
+        chmod +x "$LOCAL_SCRIPT"
+        echo "已安装/更新到最新版本"
+    else
+        rm -f "$LOCAL_SCRIPT.tmp"
+    fi
 
+    exec bash "$LOCAL_SCRIPT" "$@"
 fi
-
-# ==============================
-# 永远执行本地脚本
-# ==============================
-exec bash "$LOCAL_SCRIPT" "$@"
 
 #################################
 # 颜色
@@ -138,7 +138,11 @@ backup() {
 restore() {
     shopt -s nullglob
     FILE_LIST=("$DATA_DIR"/*.tar.gz)
-    [[ ${#FILE_LIST[@]} -eq 0 ]] && echo -e "${RED}没有备份${RESET}" && return
+
+    if [[ ${#FILE_LIST[@]} -eq 0 ]]; then
+        echo -e "${RED}没有备份文件${RESET}"
+        return
+    fi
 
     echo -e "${CYAN}备份列表:${RESET}"
     for i in "${!FILE_LIST[@]}"; do
@@ -146,8 +150,21 @@ restore() {
     done
 
     read -p "输入序号: " num
-    if ! [[ "$num" =~ ^[0-9]+$ ]] || [[ $num -lt 1 ]] || [[ $num -gt ${#FILE_LIST[@]} ]]; then
-        echo -e "${RED}编号错误${RESET}"
+
+    if ! [[ "$num" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}输入错误${RESET}"
+        return
+    fi
+
+    if (( num < 1 || num > ${#FILE_LIST[@]} )); then
+        echo -e "${RED}序号超出范围${RESET}"
+        return
+    fi
+
+    FILE="${FILE_LIST[$((num-1))]}"
+
+    if [[ -z "$FILE" || ! -f "$FILE" ]]; then
+        echo -e "${RED}备份文件不存在${RESET}"
         return
     fi
 
@@ -155,19 +172,37 @@ restore() {
     read confirm
     [[ "$confirm" != "y" ]] && return
 
+    # =========================
+    # 解压
+    # =========================
     tar xzf "$FILE" -C /
 
-    # 修复权限
-    chmod -R 600 "$ACME_HOME"
-    chmod -R 600 "$SSL_DIR"
+    # =========================
+    # 校验
+    # =========================
+    if [[ ! -d /root/.acme.sh || ! -d /root/ssl ]]; then
+        echo -e "${RED}恢复失败：文件未正确解压${RESET}"
+        return
+    fi
 
-    # 修复 cron
-    crontab -l | grep -q acme.sh || "$ACME_HOME/acme.sh" --install-cronjob
+    # =========================
+    # 修复权限（关键）
+    # =========================
+    chmod 755 /root/.acme.sh/acme.sh 2>/dev/null
+    chmod -R 755 /root/.acme.sh 2>/dev/null
+    chmod -R 600 /root/.acme.sh/*.conf 2>/dev/null
 
-    echo -e "${GREEN}恢复完成${RESET}"
-    send_tg "🔄 ACME 已恢复"
+    chmod -R 600 /root/ssl 2>/dev/null
+
+    # =========================
+    # 恢复 cron（关键）
+    # =========================
+    if [[ -f /root/.acme.sh/acme.sh ]]; then
+        /root/.acme.sh/acme.sh --install-cronjob
+    fi
+
+    echo -e "${GREEN}恢复完成（ACME已自动恢复运行）${RESET}"
 }
-
 #################################
 # 定时任务
 #################################
@@ -229,8 +264,8 @@ while true; do
     echo -e "${GREEN}2. 恢复备份${RESET}"
     echo -e "${GREEN}3. 设置定时任务${RESET}"
     echo -e "${GREEN}4. 删除定时任务${RESET}"
-    echo -e "${GREEN}5. 设置备份目录${RESET}"
-    echo -e "${GREEN}6. 设置保留天数${RESET}"
+    echo -e "${GREEN}5. 设置备份目录(当前: $DATA_DIR)${RESET}"
+    echo -e "${GREEN}6. 设置保留天数(当前: $RETAIN_DAYS 天)${RESET}"
     echo -e "${GREEN}7. 设置Telegram${RESET}"
     echo -e "${GREEN}8. 查看定时任务${RESET}"
     echo -e "${GREEN}9. 卸载${RESET}"
@@ -242,8 +277,8 @@ while true; do
         2) restore ;;
         3) add_cron ;;
         4) remove_cron ;;
-        5) read -p "目录: " DATA_DIR; mkdir -p "$DATA_DIR"; save_config ;;
-        6) read -p "天数: " RETAIN_DAYS; save_config ;;
+        5) read -p "备份目录: " DATA_DIR; mkdir -p "$DATA_DIR"; save_config ;;
+        6) read -p "备份文件保留天数: " RETAIN_DAYS; save_config ;;
         7)
             read -p "服务器名称(默认: $(hostname)): " SERVICE_NAME
             SERVICE_NAME=${SERVICE_NAME:-$(hostname)}
@@ -256,7 +291,7 @@ while true; do
            echo -e "${YELLOW}正在卸载...${RESET}"
            crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
            rm -rf "$INSTALL_DIR"
-           echo -e "${GREEN}卸载完成${RESET}"
+           echo -e "${RED}卸载完成${RESET}"
            exit 0
            ;;
         0) exit ;;

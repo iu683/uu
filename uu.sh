@@ -138,7 +138,11 @@ backup() {
 restore() {
     shopt -s nullglob
     FILE_LIST=("$DATA_DIR"/*.tar.gz)
-    [[ ${#FILE_LIST[@]} -eq 0 ]] && echo -e "${RED}没有备份${RESET}" && return
+
+    if [[ ${#FILE_LIST[@]} -eq 0 ]]; then
+        echo -e "${RED}没有备份文件${RESET}"
+        return
+    fi
 
     echo -e "${CYAN}备份列表:${RESET}"
     for i in "${!FILE_LIST[@]}"; do
@@ -146,25 +150,59 @@ restore() {
     done
 
     read -p "输入序号: " num
+
+    if ! [[ "$num" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}输入错误${RESET}"
+        return
+    fi
+
+    if (( num < 1 || num > ${#FILE_LIST[@]} )); then
+        echo -e "${RED}序号超出范围${RESET}"
+        return
+    fi
+
     FILE="${FILE_LIST[$((num-1))]}"
+
+    if [[ -z "$FILE" || ! -f "$FILE" ]]; then
+        echo -e "${RED}备份文件不存在${RESET}"
+        return
+    fi
 
     echo -e "${YELLOW}确认恢复？(y/n)${RESET}"
     read confirm
     [[ "$confirm" != "y" ]] && return
 
+    # =========================
+    # 解压
+    # =========================
     tar xzf "$FILE" -C /
 
-    # 修复权限
-    chmod -R 600 "$ACME_HOME"
-    chmod -R 600 "$SSL_DIR"
+    # =========================
+    # 校验
+    # =========================
+    if [[ ! -d /root/.acme.sh || ! -d /root/ssl ]]; then
+        echo -e "${RED}恢复失败：文件未正确解压${RESET}"
+        return
+    fi
 
-    # 修复 cron
-    crontab -l | grep -q acme.sh || "$ACME_HOME/acme.sh" --install-cronjob
+    # =========================
+    # 修复权限（关键）
+    # =========================
+    chmod 755 /root/.acme.sh/acme.sh 2>/dev/null
+    chmod -R 755 /root/.acme.sh 2>/dev/null
+    chmod -R 600 /root/.acme.sh/*.conf 2>/dev/null
 
-    echo -e "${GREEN}恢复完成${RESET}"
-    send_tg "🔄 ACME 已恢复"
+    chmod -R 600 /root/ssl 2>/dev/null
+
+    # =========================
+    # 恢复 cron（关键）
+    # =========================
+    if [[ -f /root/.acme.sh/acme.sh ]]; then
+        /root/.acme.sh/acme.sh --install-cronjob
+    fi
+
+    echo -e "${GREEN}恢复完成（ACME已自动恢复运行）${RESET}"
 }
-
 #################################
 # 定时任务
 #################################
@@ -183,9 +221,9 @@ add_cron() {
             read -p "请输入 cron 表达式: " cron
 
             # 简单校验（防止输错）
-            if [[ ! "$cron" =~ ^([0-9*/,-]+\s){4}[0-9*/,-]+$ ]]; then
-                echo -e "${RED}格式错误，例如: 0 */6 * * *${RESET}"
-                return
+            if [[ ! "$cron" =~ ^([0-9*/,-]+[[:space:]]){4}[0-9*/,-]+$ ]]; then
+               echo -e "${RED}格式错误，例如: */2 * * * *${RESET}"
+               return
             fi
             ;;
         *) return ;;
@@ -233,7 +271,7 @@ while true; do
     echo -e "${GREEN}9. 卸载${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
 
-    read -p "选择: " c
+    read -r -p $'\033[32m选择: \033[0m' c
     case $c in
         1) backup ;;
         2) restore ;;
@@ -242,12 +280,20 @@ while true; do
         5) read -p "目录: " DATA_DIR; mkdir -p "$DATA_DIR"; save_config ;;
         6) read -p "天数: " RETAIN_DAYS; save_config ;;
         7)
+            read -p "服务器名称(默认: $(hostname)): " SERVICE_NAME
+            SERVICE_NAME=${SERVICE_NAME:-$(hostname)}
             read -p "TG TOKEN: " TG_TOKEN
             read -p "CHAT ID: " TG_CHAT_ID
             save_config
             ;;
         8) show_cron ;;
-        9) rm -rf "$INSTALL_DIR"; exit ;;
+        9)
+           echo -e "${YELLOW}正在卸载...${RESET}"
+           crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+           rm -rf "$INSTALL_DIR"
+           echo -e "${GREEN}卸载完成${RESET}"
+           exit 0
+           ;;
         0) exit ;;
     esac
 

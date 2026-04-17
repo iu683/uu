@@ -8,26 +8,26 @@ export HOME=/root
 
 INSTALL_DIR="/opt/acmebackup"
 LOCAL_SCRIPT="$INSTALL_DIR/acmebackup.sh"
-REMOTE_URL="https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/acmebackup.sh"
+REMOTE_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
 
-if [[ "$0" != "$LOCAL_SCRIPT" ]]; then
+FIRST_FLAG="/opt/acmebackup/.installed"
+
+if [[ ! -f "$FIRST_FLAG" ]]; then
+
     mkdir -p "$INSTALL_DIR"
 
-    curl -fsSL -o "$LOCAL_SCRIPT.tmp" "$REMOTE_URL" || {
+    curl -fsSL -o "$LOCAL_SCRIPT" "$REMOTE_URL" || {
         echo "下载失败"
         exit 1
     }
 
-    if [[ ! -f "$LOCAL_SCRIPT" ]] || ! cmp -s "$LOCAL_SCRIPT.tmp" "$LOCAL_SCRIPT"; then
-        mv "$LOCAL_SCRIPT.tmp" "$LOCAL_SCRIPT"
-        chmod +x "$LOCAL_SCRIPT"
-        echo "已安装/更新到最新版本"
-    else
-        rm -f "$LOCAL_SCRIPT.tmp"
-    fi
+    chmod +x "$LOCAL_SCRIPT"
 
-    exec bash "$LOCAL_SCRIPT" "$@"
+    touch "$FIRST_FLAG"
+
 fi
+
+exec bash "$LOCAL_SCRIPT" "$@"
 
 #################################
 # 颜色
@@ -183,9 +183,9 @@ add_cron() {
             read -p "请输入 cron 表达式: " cron
 
             # 简单校验（防止输错）
-            if [[ ! "$cron" =~ ^([0-9*/,-]+\s){4}[0-9*/,-]+$ ]]; then
-                echo -e "${RED}格式错误，例如: 0 */6 * * *${RESET}"
-                return
+            if [[ ! "$cron" =~ ^([0-9*/,-]+[[:space:]]){4}[0-9*/,-]+$ ]]; then
+               echo -e "${RED}格式错误，例如: */2 * * * *${RESET}"
+               return
             fi
             ;;
         *) return ;;
@@ -233,7 +233,7 @@ while true; do
     echo -e "${GREEN}9. 卸载${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
 
-    read -p "选择: " c
+    read -r -p $'\033[32m选择: \033[0m' c
     case $c in
         1) backup ;;
         2) restore ;;
@@ -242,12 +242,20 @@ while true; do
         5) read -p "目录: " DATA_DIR; mkdir -p "$DATA_DIR"; save_config ;;
         6) read -p "天数: " RETAIN_DAYS; save_config ;;
         7)
+            read -p "服务器名称(默认: $(hostname)): " SERVICE_NAME
+            SERVICE_NAME=${SERVICE_NAME:-$(hostname)}
             read -p "TG TOKEN: " TG_TOKEN
             read -p "CHAT ID: " TG_CHAT_ID
             save_config
             ;;
         8) show_cron ;;
-        9) rm -rf "$INSTALL_DIR"; exit ;;
+        9)
+           echo -e "${YELLOW}正在卸载...${RESET}"
+           crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+           rm -rf "$INSTALL_DIR"
+           echo -e "${GREEN}卸载完成${RESET}"
+           exit 0
+           ;;
         0) exit ;;
     esac
 

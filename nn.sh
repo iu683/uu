@@ -1,183 +1,384 @@
 #!/bin/bash
-# ========================================
-# Qianlian + Postgres 一键管理脚本
-# ========================================
+set -e
+export DEBIAN_FRONTEND=noninteractive
 
+# ==========================================
+# 一键系统更新 & 常用依赖安装 & 修复 APT 源（Debian 11/12 兼容版）
+# ==========================================
+
+# 颜色定义
+RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="qianlian"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+# 检查是否 root
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}❌ 请使用 root 用户运行此脚本${RESET}"
+    exit 1
+fi
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
+# -------------------------
+# 常用依赖
+# -------------------------
+deps=(curl wget git net-tools lsof tar unzip rsync pv sudo iperf3 mtr jq openssl)
 
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
+# -------------------------
+# 检查并安装依赖（兼容不同系统）
+# -------------------------
+check_and_install() {
+    local check_cmd="$1"
+    local install_cmd="$2"
+    local missing=()
+    for pkg in "${deps[@]}"; do
+        if ! eval "$check_cmd \"$pkg\"" &>/dev/null; then
+            missing+=("$pkg")
+        else
+            echo -e "${GREEN}✔ 已安装: $pkg${RESET}"
+        fi
+    done
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo -e "${YELLOW}👉 安装缺失依赖: ${missing[*]}${RESET}"
+        # Debian 系统处理 netcat
+        if [ "$OS_TYPE" = "debian" ]; then
+            # 让 iperf3 安装时自动选择 No（不启动 daemon）
+            echo "iperf3 iperf3/start_daemon boolean false" | debconf-set-selections
+            for pkg in "${missing[@]}"; do
+                if [ "$pkg" = "nc" ]; then
+                    apt install -y netcat-openbsd
+                else
+                    apt install -y "$pkg"
+                fi
+            done
+        else
+            eval "$install_cmd \"\${missing[@]}\""
+        fi
     fi
 }
 
-check_port() {
-    if ss -tlnp 2>/dev/null | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换！${RESET}"
+# -------------------------
+# 清理重复 Docker 源
+# -------------------------
+fix_duplicate_docker_sources() {
+    echo -e "${YELLOW}🔍 检查重复 Docker APT 源...${RESET}"
+    local docker_sources
+    docker_sources=$(grep -rl "download.docker.com" /etc/apt/sources.list.d/ 2>/dev/null || true)
+    if [ "$(echo "$docker_sources" | grep -c .)" -gt 1 ]; then
+        echo -e "${RED}⚠️ 检测到重复 Docker 源:${RESET}"
+        echo "$docker_sources"
+        for f in $docker_sources; do
+            if [[ "$f" == *"archive_uri"* ]]; then
+                rm -f "$f"
+                echo -e "${GREEN}✔ 删除多余源: $f${RESET}"
+            fi
+        done
+    else
+        echo -e "${GREEN}✔ Docker 源正常${RESET}"
+    fi
+}
+
+# -------------------------
+# 修复 sources.list（兼容 Bullseye / Bookworm）
+# -------------------------
+fix_sources_for_version() {
+    echo -e "${YELLOW}🔍 修复 sources.list 兼容性...${RESET}"
+    local version="$1"
+    local files
+    files=$(grep -rl "deb" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true)
+    for f in $files; do
+        if [[ "$version" == "bullseye" ]]; then
+            sed -i -r 's/\bnon-free(-firmware){0,3}\b/non-free/g' "$f"
+            sed -i '/deb .*bullseye-backports/s/^/##/' "$f"
+        elif [[ "$version" == "bookworm" ]]; then
+            # Bookworm 保留 non-free-firmware，但去掉重复 non-free
+            sed -i -r 's/\bnon-free non-free\b/non-free/g' "$f"
+        fi
+    done
+    echo -e "${GREEN}✔ sources.list 已优化${RESET}"
+}
+
+# -------------------------
+# 系统更新函数
+# -------------------------
+update_system() {
+    echo -e "${GREEN}🔄 检测系统发行版并更新...${RESET}"
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        echo -e "${YELLOW}👉 当前系统: $PRETTY_NAME${RESET}"
+
+        # 系统类型
+        if [[ "$ID" =~ debian|ubuntu ]]; then
+            OS_TYPE="debian"
+            fix_duplicate_docker_sources
+            if [[ "$ID" == "debian" ]]; then
+                fix_sources_for_version "$VERSION_CODENAME"
+            fi
+            apt update && apt upgrade -y
+            check_and_install "dpkg -s" "apt install -y"
+        elif [[ "$ID" =~ fedora ]]; then
+            OS_TYPE="rhel"
+            dnf check-update || true
+            dnf upgrade -y
+            check_and_install "rpm -q" "dnf install -y"
+        elif [[ "$ID" =~ centos|rhel ]]; then
+            OS_TYPE="rhel"
+            yum check-update || true
+            yum upgrade -y
+            check_and_install "rpm -q" "yum install -y"
+        elif [[ "$ID" =~ alpine ]]; then
+            OS_TYPE="alpine"
+            apk update && apk upgrade
+            check_and_install "apk info -e" "apk add"
+        else
+            echo -e "${RED}❌ 暂不支持的 Linux 发行版: $ID${RESET}"
+            return 1
+        fi
+    else
+        echo -e "${RED}❌ 无法检测系统发行版 (/etc/os-release 不存在)${RESET}"
+        return 1
+    fi
+
+    echo -e "${GREEN}✅ 系统更新和依赖安装完成！${RESET}"
+}
+
+
+install_netcat() {
+    echo -e "${YELLOW}🔍 检查 netcat (nc)...${RESET}"
+
+    if command -v nc >/dev/null 2>&1; then
+        echo -e "${GREEN}✔ nc 已安装${RESET}"
+        return
+    fi
+
+    echo -e "${YELLOW}👉 安装 netcat-openbsd...${RESET}"
+
+    if [ "$OS_TYPE" = "debian" ]; then
+        apt install -y netcat-openbsd
+    elif [ "$OS_TYPE" = "rhel" ]; then
+        yum install -y nc 2>/dev/null || dnf install -y nc
+    elif [ "$OS_TYPE" = "alpine" ]; then
+        apk add netcat-openbsd
+    else
+        echo -e "${RED}❌ 未知系统，无法安装 nc${RESET}"
+        return 1
+    fi
+
+    if command -v nc >/dev/null 2>&1; then
+        echo -e "${GREEN}✔ nc 安装成功${RESET}"
+    else
+        echo -e "${RED}❌ nc 安装失败${RESET}"
+    fi
+}
+
+install_dnsutils() {
+    echo -e "${YELLOW}🔍 检查 DNS 工具 (dig/nslookup)...${RESET}"
+
+    if command -v dig >/dev/null 2>&1; then
+        echo -e "${GREEN}✔ DNS 工具已安装${RESET}"
+        return
+    fi
+
+    echo -e "${YELLOW}👉 安装 DNS 工具...${RESET}"
+
+    if [ "$OS_TYPE" = "debian" ]; then
+        apt install -y bind9-dnsutils
+    elif [ "$OS_TYPE" = "rhel" ]; then
+        yum install -y bind-utils 2>/dev/null || dnf install -y bind-utils
+    elif [ "$OS_TYPE" = "alpine" ]; then
+        apk add bind-tools
+    else
+        echo -e "${RED}❌ 未知系统，无法安装 DNS 工具${RESET}"
+        return 1
+    fi
+
+    if command -v dig >/dev/null 2>&1; then
+        echo -e "${GREEN}✔ DNS 工具安装成功${RESET}"
+    else
+        echo -e "${RED}❌ DNS 工具安装失败${RESET}"
+    fi
+}
+# -------------------------
+# 安装并启动 cron
+# -------------------------
+install_cron() {
+    echo -e "${YELLOW}⏰ 检查并安装 cron 定时任务服务...${RESET}"
+
+    case "$OS_TYPE" in
+        debian)
+            if ! dpkg -s cron >/dev/null 2>&1; then
+                echo -e "${YELLOW}📦 安装 cron...${RESET}"
+                apt update
+                apt install -y cron
+            else
+                echo -e "${GREEN}✔ cron 已安装${RESET}"
+            fi
+            systemctl enable --now cron
+            ;;
+        rhel)
+            if ! rpm -q cronie >/dev/null 2>&1; then
+                echo -e "${YELLOW}📦 安装 cronie...${RESET}"
+                yum install -y cronie 2>/dev/null || dnf install -y cronie
+            else
+                echo -e "${GREEN}✔ cronie 已安装${RESET}"
+            fi
+            systemctl enable --now crond
+            ;;
+        alpine)
+            if ! apk info -e cronie >/dev/null 2>&1; then
+                echo -e "${YELLOW}📦 安装 cronie...${RESET}"
+                apk add cronie
+            else
+                echo -e "${GREEN}✔ cronie 已安装${RESET}"
+            fi
+            rc-update add crond
+            service crond start
+            ;;
+        *)
+            echo -e "${RED}❌ 未知系统类型，无法安装 cron${RESET}"
+            return 1
+            ;;
+    esac
+
+    # 状态检测
+    if systemctl is-active --quiet cron 2>/dev/null || systemctl is-active --quiet crond 2>/dev/null; then
+        echo -e "${GREEN}✔ cron 服务已运行${RESET}"
+    else
+        echo -e "${RED}❌ cron 服务未启动，请手动检查${RESET}"
+    fi
+}
+
+# -------------------------
+# 安装 NextTrace（网络路由追踪工具）
+# -------------------------
+install_nexttrace() {
+    echo -e "${YELLOW}🌐 检查并安装 NextTrace...${RESET}"
+
+    # 确保 curl 存在
+    if ! command -v curl >/dev/null 2>&1; then
+        echo -e "${RED}❌ curl 未安装，无法安装 NextTrace${RESET}"
+        return 1
+    fi
+
+    # 检测是否已安装
+    if command -v nexttrace >/dev/null 2>&1; then
+        echo -e "${GREEN}✔ NextTrace 已安装${RESET}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}👉 开始安装 NextTrace...${RESET}"
+
+    curl -sL https://nxtrace.org/nt | bash
+
+    # 验证
+    if command -v nexttrace >/dev/null 2>&1; then
+        echo -e "${GREEN}✔ NextTrace 安装成功${RESET}"
+    else
+        echo -e "${RED}❌ NextTrace 安装失败${RESET}"
+    fi
+}
+
+# -------------------------
+# 开启 BBR（安全版）
+# -------------------------
+enable_bbr() {
+    echo -e "${YELLOW}🚀 检查并配置 TCP BBR...${RESET}"
+
+    # 1️⃣ 尝试加载 BBR 模块
+    if ! modprobe tcp_bbr 2>/dev/null; then
+        echo -e "${RED}❌ 当前内核未编译 BBR 或不支持${RESET}"
+        return 1
+    fi
+
+    # 2️⃣ 写入模块自动加载（避免重复）
+    mkdir -p /etc/modules-load.d
+    if ! grep -qxF "tcp_bbr" /etc/modules-load.d/bbr.conf 2>/dev/null; then
+        echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
+    fi
+
+    # 3️⃣ 检查是否已经启用
+    if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
+        echo -e "${GREEN}✔ BBR 已经开启，无需修改${RESET}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}👉 BBR 未开启，开始配置...${RESET}"
+
+    # 4️⃣ 写入独立 sysctl 配置文件（更规范）
+    cat >/etc/sysctl.d/99-bbr.conf <<EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+
+    # 5️⃣ 应用配置
+    sysctl --system >/dev/null
+
+    # 6️⃣ 再次验证
+    if [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = "bbr" ]; then
+        echo -e "${GREEN}✔ BBR 已成功开启${RESET}"
+    else
+        echo -e "${RED}❌ BBR 开启失败，请检查内核配置${RESET}"
         return 1
     fi
 }
 
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== Qianlian 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
+# -------------------------
+# 时间同步 & 设置上海时区（Debian / Ubuntu 专用）
+# -------------------------
+enable_time_sync() {
+    echo -e "${YELLOW}⏰ 配置 systemd-timesyncd 时间同步& 设置上海时区...${RESET}"
 
-        read -rp "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
-install_app() {
-
-    check_docker
-    mkdir -p "$APP_DIR/data"
-    cd "$APP_DIR" || exit
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖？(y/n)${RESET}"
-        read -r confirm
-        [[ "$confirm" != "y" ]] && return
+    if [ ! -f /etc/os-release ]; then
+        echo -e "${RED}❌ 无法识别系统类型${RESET}"
+        return 1
     fi
 
-    read -rp "请输入访问端口 [默认:8000]: " input_port
-    PORT=${input_port:-8000}
-    check_port "$PORT" || return
+    . /etc/os-release
 
-    read -rp "请输入管理员密码 [默认:admin123]: " input_admin
-    ADMIN_PASSWORD=${input_admin:-admin123}
+    if [[ "$ID" != "ubuntu" && "$ID" != "debian" ]]; then
+        echo -e "${RED}❌ 当前系统不是 Debian/Ubuntu，跳过时间同步配置${RESET}"
+        return 0
+    fi
 
-    read -rp "请输入数据库密码 [默认:change-this-password]: " input_dbpass
-    DB_PASS=${input_dbpass:-change-this-password}
+    echo -e "${GREEN}✔ 系统检测通过：$PRETTY_NAME${RESET}"
 
-    POSTGRES_DB="bailian"
-    POSTGRES_USER="bailian"
+    # 安装 systemd-timesyncd（极简系统可能没装）
+    if ! dpkg -s systemd-timesyncd >/dev/null 2>&1; then
+        echo -e "${YELLOW}📦 安装 systemd-timesyncd...${RESET}"
+        apt update
+        apt install -y systemd-timesyncd
+    else
+        echo -e "${GREEN}✔ systemd-timesyncd 已安装${RESET}"
+    fi
 
-    SESSION_SECRET=$(openssl rand -hex 16 2>/dev/null || date +%s%N | md5sum | head -c 32)
+    # 启用服务
+    systemctl unmask systemd-timesyncd || true
+    systemctl enable --now systemd-timesyncd
 
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: bailian-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${DB_PASS}
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
+    # 启用 NTP
+    timedatectl set-ntp true
+    systemctl restart systemd-timesyncd
 
-  qianlian-proxy:
-    image: ghcr.io/yumusb/qianlian:latest
-    container_name: qianlian-proxy
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
+     # 设置上海时区
+    timedatectl set-timezone Asia/Shanghai
+    echo -e "${GREEN}✔ 时区已设置为上海 (Asia/Shanghai)${RESET}"
 
-    ports:
-      - "127.0.0.1:${PORT}:8000"
-
-    volumes:
-      - ./data:/app/data
-
-    environment:
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${DB_PASS}@postgres:5432/${POSTGRES_DB}
-      TRUST_PROXY_HEADERS: "false"
-      APP_TIMEZONE: Asia/Shanghai
-      SECURITY_PATH_PREFIX: qianlian
-
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/health || curl -f http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-
-volumes:
-  postgres-data:
-EOF
-
-    docker compose up -d
-
-    echo -e "${GREEN}✅ 安装完成${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🌐 访问密码: $ADMIN_PASSWORD${RESET}"
-    echo -e "${GREEN}📁 路径: $APP_DIR${RESET}"
-
-    read -rp "按回车返回菜单..."
+    # 状态检查
+    if systemctl is-active --quiet systemd-timesyncd; then
+        echo -e "${GREEN}✔ 时间同步服务已成功启动${RESET}"
+    else
+        echo -e "${RED}❌ 时间同步服务启动失败${RESET}"
+    fi
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ 更新完成${RESET}"
-    read -rp "按回车返回菜单..."
-}
-
-restart_app() {
-    cd "$APP_DIR" || return
-    docker compose restart
-    echo -e "${GREEN}✅ 已重启${RESET}"
-    read -rp "按回车返回菜单..."
-}
-
-view_logs() {
-    cd "$APP_DIR" || return
-    docker compose logs -f
-}
-
-check_status() {
-    cd "$APP_DIR" || return
-    docker compose ps
-    read -rp "按回车返回菜单..."
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已彻底卸载${RESET}"
-    read -rp "按回车返回菜单..."
-}
-
-menu
+# -------------------------
+# 执行
+# -------------------------
+clear
+update_system
+install_netcat
+install_dnsutils
+install_cron
+install_nexttrace
+enable_bbr
+enable_time_sync

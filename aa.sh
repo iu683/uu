@@ -1,263 +1,366 @@
 #!/bin/bash
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export HOME=/root
+# ==========================================
+# Nginx HTTPS 反代管理脚本（已有证书）
+# 支持：添加 / 修改 / 删除 / 查看 / 安装 / 卸载
+# ==========================================
 
-#################################################
-# acmebackup - ACME证书备份系统（acme.sh）
-#################################################
+set -e
 
-INSTALL_DIR="/opt/acmebackup"
-LOCAL_SCRIPT="$INSTALL_DIR/acmebackup.sh"
-REMOTE_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
-
-FIRST_FLAG="/opt/acmebackup/.installed"
-
-if [[ ! -f "$FIRST_FLAG" ]]; then
-
-    mkdir -p "$INSTALL_DIR"
-
-    curl -fsSL -o "$LOCAL_SCRIPT" "$REMOTE_URL" || {
-        echo "下载失败"
-        exit 1
-    }
-
-    chmod +x "$LOCAL_SCRIPT"
-
-    touch "$FIRST_FLAG"
-
-fi
-
-exec bash "$LOCAL_SCRIPT" "$@"
-
-#################################
-# 颜色
-#################################
 GREEN="\033[32m"
 RED="\033[31m"
-CYAN="\033[36m"
-YELLOW="\033[33m"
 RESET="\033[0m"
 
-#################################
-# 基础路径
-#################################
-CONFIG_FILE="$INSTALL_DIR/config.sh"
-LOG_FILE="$INSTALL_DIR/backup.log"
-CRON_TAG="#acmebackup_cron"
+SITES_AVAILABLE="/etc/nginx/sites-available"
+SITES_ENABLED="/etc/nginx/sites-enabled"
+REQUIRED_PORTS=(80 443)
 
-DATA_DIR_DEFAULT="$INSTALL_DIR/data"
-RETAIN_DAYS_DEFAULT=7
-SERVICE_NAME_DEFAULT="$(hostname)"
-
-mkdir -p "$INSTALL_DIR"
-
-#################################
-# ACME路径
-#################################
-ACME_HOME="/root/.acme.sh"
-SSL_DIR="/root/ssl"
-
-#################################
-# 卸载
-#################################
-if [[ "$1" == "--uninstall" ]]; then
-    echo -e "${YELLOW}正在卸载...${RESET}"
-    crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
-    rm -rf "$INSTALL_DIR"
-    echo -e "${GREEN}卸载完成${RESET}"
-    exit 0
-fi
-
-#################################
-# 加载配置
-#################################
-load_config() {
-    [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
-
-    DATA_DIR=${DATA_DIR:-$DATA_DIR_DEFAULT}
-    RETAIN_DAYS=${RETAIN_DAYS:-$RETAIN_DAYS_DEFAULT}
-    SERVICE_NAME=${SERVICE_NAME:-$SERVICE_NAME_DEFAULT}
-}
-load_config
-mkdir -p "$DATA_DIR"
-
-#################################
-# 保存配置
-#################################
-save_config() {
-cat > "$CONFIG_FILE" <<EOF
-DATA_DIR="$DATA_DIR"
-RETAIN_DAYS="$RETAIN_DAYS"
-SERVICE_NAME="$SERVICE_NAME"
-TG_TOKEN="$TG_TOKEN"
-TG_CHAT_ID="$TG_CHAT_ID"
-EOF
+# ---------------------------
+# 工具函数
+# ---------------------------
+pause() {
+    echo -ne "${GREEN}按回车返回菜单...${RESET}"
+    read
 }
 
-#################################
-# Telegram
-#################################
-send_tg() {
-    [[ -z "$TG_TOKEN" || -z "$TG_CHAT_ID" ]] && return
-    MESSAGE="[$SERVICE_NAME] $1"
-    curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
-        -d chat_id="$TG_CHAT_ID" \
-        -d text="$MESSAGE" >/dev/null 2>&1
+list_sites() {
+    ls "$SITES_AVAILABLE" 2>/dev/null | grep "\.conf$" | sed 's/\.conf$//'
 }
 
-#################################
-# 备份
-#################################
-backup() {
-    TIMESTAMP=$(date +%F_%H-%M-%S)
-    FILE="$DATA_DIR/acme_backup_$TIMESTAMP.tar.gz"
 
-    echo -e "${CYAN}开始备份 ACME证书...${RESET}"
-
-    [[ ! -d "$ACME_HOME" ]] && echo -e "${RED}未找到 acme.sh${RESET}" && return
-    [[ ! -d "$SSL_DIR" ]] && echo -e "${RED}未找到证书目录${RESET}" && return
-
-    tar czf "$FILE" \
-        "$ACME_HOME" \
-        "$SSL_DIR" >> "$LOG_FILE" 2>&1
-
-    if [[ $? -eq 0 ]]; then
-        echo -e "${GREEN}备份成功：$FILE${RESET}"
-        send_tg "✅ ACME备份成功"
+# ---------------------------
+# 系统检测
+# ---------------------------
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
     else
-        echo -e "${RED}备份失败${RESET}"
-        send_tg "❌ ACME备份失败"
+        OS=$(uname -s)
+    fi
+}
+
+# ---------------------------
+# 安装 / 更新 Nginx 与 Certbot
+# ---------------------------
+configure_firewall() {
+    echo -e "${GREEN}检测并配置防火墙以开放必要端口...${RESET}"
+
+    if command -v ufw >/dev/null 2>&1; then
+        ufw_status=$(ufw status | head -n 1)
+        if [[ "$ufw_status" == "Status: inactive" ]]; then
+            echo "ufw 未启用，正在启用..."
+            ufw --force enable
+        fi
+        for port in "${REQUIRED_PORTS[@]}"; do
+            if ! ufw status | grep -qw "$port"; then
+                echo "允许端口 $port ..."
+                ufw allow "$port"
+            fi
+        done
+        return
     fi
 
-    find "$DATA_DIR" -type f -name "*.tar.gz" -mtime +"$RETAIN_DAYS" -delete
-}
-
-#################################
-# 恢复
-#################################
-restore() {
-    shopt -s nullglob
-    FILE_LIST=("$DATA_DIR"/*.tar.gz)
-    [[ ${#FILE_LIST[@]} -eq 0 ]] && echo -e "${RED}没有备份${RESET}" && return
-
-    echo -e "${CYAN}备份列表:${RESET}"
-    for i in "${!FILE_LIST[@]}"; do
-        echo -e "${GREEN}$((i+1)). $(basename "${FILE_LIST[$i]}")${RESET}"
-    done
-
-    read -p "输入序号: " num
-    FILE="${FILE_LIST[$((num-1))]}"
-
-    echo -e "${YELLOW}确认恢复？(y/n)${RESET}"
-    read confirm
-    [[ "$confirm" != "y" ]] && return
-
-    tar xzf "$FILE" -C /
-
-    # 修复权限
-    chmod -R 600 "$ACME_HOME"
-    chmod -R 600 "$SSL_DIR"
-
-    # 修复 cron
-    crontab -l | grep -q acme.sh || "$ACME_HOME/acme.sh" --install-cronjob
-
-    echo -e "${GREEN}恢复完成${RESET}"
-    send_tg "🔄 ACME 已恢复"
-}
-
-#################################
-# 定时任务
-#################################
-add_cron() {
-    echo -e "${CYAN}1 每天0点${RESET}"
-    echo -e "${CYAN}2 每周一0点${RESET}"
-    echo -e "${CYAN}3 每月1号${RESET}"
-    echo -e "${CYAN}4 自定义${RESET}"
-
-    read -p "选择: " t
-    case $t in
-        1) cron="0 0 * * *" ;;
-        2) cron="0 0 * * 1" ;;
-        3) cron="0 0 1 * *" ;;
-        4)
-            read -p "请输入 cron 表达式: " cron
-
-            # 简单校验（防止输错）
-            if [[ ! "$cron" =~ ^([0-9*/,-]+[[:space:]]){4}[0-9*/,-]+$ ]]; then
-               echo -e "${RED}格式错误，例如: */2 * * * *${RESET}"
-               return
+    if systemctl is-active --quiet firewalld; then
+        for port in "${REQUIRED_PORTS[@]}"; do
+            if ! firewall-cmd --list-ports | grep -qw "${port}/tcp"; then
+                firewall-cmd --permanent --add-port=${port}/tcp
             fi
-            ;;
-        *) return ;;
-    esac
+        done
+        firewall-cmd --reload
+        return
+    fi
 
-    crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/acmebackup 2>/dev/null
-    echo "$cron bash $LOCAL_SCRIPT auto >> $INSTALL_DIR/cron.log 2>&1 $CRON_TAG" >> /tmp/acmebackup
-    crontab /tmp/acmebackup
-    rm -f /tmp/acmebackup
-
-    echo -e "${GREEN}定时任务已设置: $cron${RESET}"
+    if command -v iptables >/dev/null 2>&1; then
+        for port in "${REQUIRED_PORTS[@]}"; do
+            if ! iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
+                iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+            fi
+        done
+        if command -v netfilter-persistent >/dev/null 2>&1; then
+            netfilter-persistent save
+        elif command -v service >/dev/null 2>&1; then
+            service iptables save
+        fi
+        return
+    fi
 }
 
-remove_cron() {
-    crontab -l | grep -v "$CRON_TAG" | crontab -
-    echo -e "${GREEN}已删除定时任务${RESET}"
+install_nginx_certbot() {
+    detect_os
+    echo -e "${GREEN}安装/更新 Nginx 与 Certbot ...${RESET}"
+    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+        apt update
+        apt install -y nginx certbot python3-certbot-nginx
+    elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "rocky" || "$OS" == "almalinux" ]]; then
+        yum install -y epel-release
+        yum install -y nginx certbot python3-certbot-nginx
+    else
+        echo -e "${RED}无法自动安装，请手动安装 Nginx 与 Certbot${RESET}"
+        pause
+        return
+    fi
+
+    configure_firewall
+
+    mkdir -p "$SITES_AVAILABLE" "$SITES_ENABLED"
+
+    systemctl enable nginx
+    systemctl start nginx
+
+    echo -e "${GREEN}Nginx安装完成！${RESET}"
+    pause
 }
 
-show_cron(){
-    echo -e "${CYAN}当前任务:${RESET}"
-    crontab -l 2>/dev/null | grep "$CRON_TAG" || echo "无"
-}
-#################################
-# auto
-#################################
-if [[ "$1" == "auto" ]]; then
-    backup
-    exit 0
-fi
+# ---------------------------
+# 卸载 Nginx 与 Certbot
+# ---------------------------
+uninstall_nginx_certbot() {
 
-#################################
-# 菜单
-#################################
+    echo -e "${GREEN}停止 Nginx 服务...${RESET}"
+    systemctl stop nginx
+    systemctl disable nginx
+
+    detect_os
+    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+        apt remove -y nginx certbot python3-certbot-nginx
+        apt autoremove -y
+    elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "rocky" || "$OS" == "almalinux" ]]; then
+        yum remove -y nginx certbot python3-certbot-nginx
+    fi
+
+    echo -e "${GREEN}卸载完成${RESET}"
+    pause
+}
+
+
+# ---------------------------
+# 添加站点
+# ---------------------------
+add_site() {
+    read -p "请输入域名 (例如 example.com): " DOMAIN
+    read -p "请输入证书所在目录 (例如 /etc/nginx/ssl): " CERT_DIR
+
+    if [[ ! -d "$CERT_DIR" ]]; then
+        echo -e "${RED}目录不存在${RESET}"
+        pause
+        return
+    fi
+
+    # 查找证书文件
+    CERT_FILES=($(find "$CERT_DIR" -maxdepth 1 -type f \( -name "*.crt" -o -name "*.pem" \)))
+    if [ ${#CERT_FILES[@]} -eq 0 ]; then
+        echo -e "${RED}没有找到证书文件，请手动输入路径${RESET}"
+        read -p "请输入证书路径(例如 /etc/nginx/ssl/example.com.pem): " CERT_PATH
+        read -p "请输入密钥路径(例如 /etc/nginx/ssl/example.com.key): " KEY_PATH
+    else
+        echo -e "${GREEN}=== 可选择证书列表 ===${RESET}"
+        for i in "${!CERT_FILES[@]}"; do
+            FILE_NAME=$(basename "${CERT_FILES[$i]}")
+            DOMAIN_NAME="${FILE_NAME%.*}"
+            printf "${GREEN}%d) %s${RESET}\n" $((i+1)) "$DOMAIN_NAME"
+        done
+        echo -e "${GREEN}0) 手动输入证书和密钥路径${RESET}"
+        read -p "请选择证书编号: " cert_idx
+        if [[ "$cert_idx" == "0" ]]; then
+            read -p "请输入证书路径(例如 /etc/nginx/ssl/example.com.pem): " CERT_PATH
+            read -p "请输入密钥路径(例如 /etc/nginx/ssl/example.com.key): " KEY_PATH
+        else
+            if ! [[ "$cert_idx" =~ ^[0-9]+$ ]] || [ "$cert_idx" -lt 1 ] || [ "$cert_idx" -gt "${#CERT_FILES[@]}" ]; then
+                echo -e "${RED}无效编号${RESET}"
+                pause
+                return
+            fi
+            CERT_PATH="${CERT_FILES[$((cert_idx-1))]}"
+            KEY_PATH="${CERT_PATH%.*}.key"
+            if [[ ! -f "$KEY_PATH" ]]; then
+                read -p "请输入密钥路径(例如 /etc/nginx/ssl/example.com.key): " KEY_PATH
+            fi
+        fi
+    fi
+
+    read -p "请输入反代目标地址 (例如 http://127.0.0.1:8000): " TARGET
+    read -p "请输入上传文件大小限制 (例如 50M，默认 50M): " UPLOAD_SIZE
+    UPLOAD_SIZE=${UPLOAD_SIZE:-50M}   # 默认值50M
+
+    CONFIG_PATH="$SITES_AVAILABLE/$DOMAIN.conf"
+    if [[ -f "$CONFIG_PATH" ]]; then
+        echo -e "${RED}站点已存在！${RESET}"
+        pause
+        return
+    fi
+
+    cat > "$CONFIG_PATH" <<EOF
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name $DOMAIN;
+
+    client_max_body_size $UPLOAD_SIZE;
+
+    ssl_certificate $CERT_PATH;
+    ssl_certificate_key $KEY_PATH;
+
+    location / {
+        proxy_pass $TARGET;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 86400;
+    }
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $DOMAIN;
+    return 301 https://\$host\$request_uri;
+}
+EOF
+
+    ln -sf "$CONFIG_PATH" "$SITES_ENABLED/$DOMAIN.conf"
+    nginx_reload
+    echo -e "${GREEN}站点 $DOMAIN 添加成功！${RESET}"
+    pause
+}
+
+# ---------------------------
+# 修改站点
+# ---------------------------
+modify_site() {
+    SITES=($(list_sites))
+    if [ ${#SITES[@]} -eq 0 ]; then
+        echo -e "${RED}没有可修改的站点${RESET}"
+        pause
+        return
+    fi
+
+    echo -e "${GREEN}=== 可修改站点列表 ===${RESET}"
+    for i in "${!SITES[@]}"; do
+        printf "${GREEN}%d) %s${RESET}\n" $((i+1)) "${SITES[$i]}"
+    done
+    echo -e "${GREEN}0) 取消${RESET}"
+    read -p "请输入要修改的站点编号: " idx
+    if [[ "$idx" == "0" ]]; then return; fi
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#SITES[@]}" ]; then
+        echo -e "${RED}无效编号${RESET}"
+        pause
+        return
+    fi
+
+    SITE="${SITES[$((idx-1))]}"
+    CONFIG_PATH="$SITES_AVAILABLE/$SITE.conf"
+    echo -e "${GREEN}正在修改站点 $SITE 配置：${RESET}"
+
+    read -p "请输入新的证书路径 (回车保持不变): " NEW_CERT
+    read -p "请输入新的私钥路径 (回车保持不变): " NEW_KEY
+    read -p "请输入新的反代目标地址 (回车保持不变): " NEW_TARGET
+    read -p "请输入新的上传大小 (回车保持不变): " NEW_SIZE
+
+    [[ -n "$NEW_CERT" ]] && sed -i "s|ssl_certificate .*;|ssl_certificate $NEW_CERT;|" "$CONFIG_PATH"
+    [[ -n "$NEW_KEY" ]] && sed -i "s|ssl_certificate_key .*;|ssl_certificate_key $NEW_KEY;|" "$CONFIG_PATH"
+    [[ -n "$NEW_TARGET" ]] && sed -i "s|proxy_pass .*;|proxy_pass $NEW_TARGET;|" "$CONFIG_PATH"
+    [[ -n "$NEW_SIZE" ]] && sed -i "s|client_max_body_size .*;|client_max_body_size $NEW_SIZE;|" "$CONFIG_PATH"
+
+    nginx_reload
+    echo -e "${GREEN}站点 $SITE 修改成功！${RESET}"
+    pause
+}
+
+# ---------------------------
+# 删除站点
+# ---------------------------
+delete_site() {
+    SITES=($(list_sites))
+    if [ ${#SITES[@]} -eq 0 ]; then
+        echo -e "${RED}没有可删除的站点${RESET}"
+        pause
+        return
+    fi
+
+    echo -e "${GREEN}=== 可删除站点列表 ===${RESET}"
+    for i in "${!SITES[@]}"; do
+        printf "${GREEN}%d) %s${RESET}\n" $((i+1)) "${SITES[$i]}"
+    done
+    echo -e "${GREEN}0) 取消${RESET}"
+    read -p "请输入要删除的站点编号: " idx
+    if [[ "$idx" == "0" ]]; then return; fi
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#SITES[@]}" ]; then
+        echo -e "${RED}无效编号${RESET}"
+        pause
+        return
+    fi
+
+    SITE="${SITES[$((idx-1))]}"
+    rm -f "$SITES_AVAILABLE/$SITE.conf"
+    rm -f "$SITES_ENABLED/$SITE.conf"
+
+    nginx_reload
+    echo -e "${GREEN}站点 $SITE 删除成功！${RESET}"
+    pause
+}
+
+# ---------------------------
+# 查看站点
+# ---------------------------
+view_sites() {
+    SITES=($(list_sites))
+    if [ ${#SITES[@]} -eq 0 ]; then
+        echo -e "${RED}没有配置的站点${RESET}"
+    else
+        echo -e "${GREEN}=== 已配置站点 ===${RESET}"
+        for i in "${!SITES[@]}"; do
+            printf "${GREEN}%d) %s${RESET}\n" $((i+1)) "${SITES[$i]}"
+        done
+    fi
+    pause
+}
+
+nginx_reload() {
+    if ! command -v nginx >/dev/null 2>&1; then
+        echo -e "${RED}Nginx 未安装${RESET}"
+        pause
+        return
+    fi
+
+    echo -e "${GREEN}检测配置文件...${RESET}"
+    if nginx -t; then
+        systemctl reload nginx
+        echo -e "${GREEN}Nginx 重载成功！${RESET}"
+    else
+        echo -e "${RED}配置检测失败，请检查配置文件${RESET}"
+    fi
+    pause
+}
+
+# ---------------------------
+# 主菜单
+# ---------------------------
 while true; do
     clear
-    echo -e "${GREEN}==== ACME备份恢复====${RESET}"
-    echo -e "${GREEN}1. 立即备份${RESET}"
-    echo -e "${GREEN}2. 恢复备份${RESET}"
-    echo -e "${GREEN}3. 设置定时任务${RESET}"
-    echo -e "${GREEN}4. 删除定时任务${RESET}"
-    echo -e "${GREEN}5. 设置备份目录${RESET}"
-    echo -e "${GREEN}6. 设置保留天数${RESET}"
-    echo -e "${GREEN}7. 设置Telegram${RESET}"
-    echo -e "${GREEN}8. 查看定时任务${RESET}"
-    echo -e "${GREEN}9. 卸载${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}=== Cloudflare证书管理 ===${RESET}"
+    echo -e "${GREEN}1) 安装Nginx${RESET}"
+    echo -e "${GREEN}2) 添加站点配置${RESET}"
+    echo -e "${GREEN}3) 修改站点配置${RESET}"
+    echo -e "${GREEN}4) 删除站点配置${RESET}"
+    echo -e "${GREEN}5) 查看站点信息${RESET}"
+    echo -e "${GREEN}6) 卸载Nginx${RESET}"
+    echo -e "${GREEN}7) 重载Nginx${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-    read -r -p $'\033[32m选择: \033[0m' c
-    case $c in
-        1) backup ;;
-        2) restore ;;
-        3) add_cron ;;
-        4) remove_cron ;;
-        5) read -p "目录: " DATA_DIR; mkdir -p "$DATA_DIR"; save_config ;;
-        6) read -p "天数: " RETAIN_DAYS; save_config ;;
-        7)
-            read -p "服务器名称(默认: $(hostname)): " SERVICE_NAME
-            SERVICE_NAME=${SERVICE_NAME:-$(hostname)}
-            read -p "TG TOKEN: " TG_TOKEN
-            read -p "CHAT ID: " TG_CHAT_ID
-            save_config
-            ;;
-        8) show_cron ;;
-        9)
-           echo -e "${YELLOW}正在卸载...${RESET}"
-           crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
-           rm -rf "$INSTALL_DIR"
-           echo -e "${GREEN}卸载完成${RESET}"
-           exit 0
-           ;;
-        0) exit ;;
+    case "$choice" in
+        1) install_nginx_certbot ;;
+        2) add_site ;;
+        3) modify_site ;;
+        4) delete_site ;;
+        5) view_sites ;;
+        6) uninstall_nginx_certbot ;;
+        7) nginx_reload ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}"; pause ;;
     esac
-
-    read -p "回车继续..."
 done

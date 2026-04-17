@@ -242,6 +242,18 @@ fix_warp() {
     info "已尝试重连"
 }
 
+CRON_JOB="0 * * * * /bin/systemctl restart warp-svc > /dev/null 2>&1"
+
+add_cron() {
+    (crontab -l 2>/dev/null | grep -vF "$CRON_JOB" ; echo "$CRON_JOB") | crontab -
+    info "已添加定时任务（每小时重启 warp-svc）"
+}
+
+remove_cron() {
+    crontab -l 2>/dev/null | grep -vF "$CRON_JOB" | crontab -
+    info "已移除 warp-svc 定时任务"
+}
+
 # =============================
 # 卸载
 # =============================
@@ -259,6 +271,8 @@ uninstall_warp() {
     rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
     rm -f "$PORT_FILE"
 
+    remove_cron
+
     info "卸载完成 ✅"
 }
 
@@ -273,7 +287,8 @@ menu() {
     echo -e "${GREEN}3) 测试代理${RESET}"
     echo -e "${GREEN}4) 修改端口${RESET}"
     echo -e "${GREEN}5) 修复 WARP${RESET}"
-    echo -e "${GREEN}6) 卸载 WARP${RESET}"
+    echo -e "${GREEN}6) 定时重启${RESET}"
+    echo -e "${GREEN}7) 卸载 WARP${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
     read -rp $'\033[32m请选择: \033[0m' num
 
@@ -283,7 +298,20 @@ menu() {
         3) test_proxy ;;
         4) change_port ;;
         5) fix_warp ;;
-        6) uninstall_warp ;;
+        6)
+           echo -e "${GREEN}1) 添加 cron${RESET}"
+           echo -e "${GREEN}2) 删除 cron${RESET}"
+           read -rp $'\033[32m请选择: \033[0m' c
+
+           case $c in
+               1) add_cron ;;
+               2) remove_cron ;;
+               *) warn "无效选项" ;;
+           esac
+           
+           pause  
+           ;;
+        7) uninstall_warp ;;
         0) exit 0 ;;
         *) warn "无效选项" ;;
     esac

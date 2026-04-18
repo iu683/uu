@@ -87,6 +87,7 @@ services:
       CF_Zone_ID: ${CF_Zone_ID}
     volumes:
       - ${APP_DIR}/data:/root/.acme.sh
+      - ${APP_DIR}/ssl:/opt/acme/ssl
     network_mode: bridge
 EOF
 
@@ -210,7 +211,20 @@ issue_cert() {
     --ecc \
     --key-file "$SSL_DIR/$domain/key.pem" \
     --fullchain-file "$SSL_DIR/$domain/fullchain.pem" \
-    --reloadcmd "nginx -s reload"
+    --reloadcmd '
+    if command -v nginx >/dev/null 2>&1; then
+        nginx -s reload
+        echo "[ACME] nginx reloaded"
+    elif systemctl is-active nginx >/dev/null 2>&1; then
+        systemctl reload nginx
+        echo "[ACME] nginx systemctl reloaded"
+    elif docker ps | grep -q nginx; then
+        docker exec nginx nginx -s reload
+        echo "[ACME] docker nginx reloaded"
+    else
+        echo "[ACME] no nginx found, skip reload"
+    fi
+    '
 
     echo -e "${GREEN}✅ 证书申请完成${RESET}"
     read -p "按回车返回菜单..."

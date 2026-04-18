@@ -193,6 +193,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
+    crontab -l 2>/dev/null | grep -v "docker exec acme" | crontab -
     echo -e "${RED}✅ 已卸载 ACME${RESET}"
     read -p "按回车返回菜单..."
 }
@@ -280,21 +281,32 @@ cert_status() {
 
     echo -e "${GREEN}证书列表:${RESET}"
     echo "------------------------------------------------------------"
-    printf "%-25s %-12s %-10s\n" "域名" "到期时间" "剩余天数"
+    printf "%-25s %-12s %-10s\n" "域名"  "到期时间" "剩余天数"
     echo "------------------------------------------------------------"
 
-    docker exec acme --list 2>/dev/null | awk '
-    NR>1 && NF {
-        domain=$1
-        # acme list 最后一列通常是剩余天数
-        expire=$(NF-1)
-        remain=$NF
+    for dir in /opt/acme/ssl/*; do
+        [ -d "$dir" ] || continue
 
-        # 过滤掉 header 垃圾行
-        if(domain ~ /\./) {
-            printf "%-25s %-12s %-10s\n", domain, expire, remain
-        }
-    }'
+        domain=$(basename "$dir")
+        cert="$dir/fullchain.pem"
+
+        if [ ! -f "$cert" ]; then
+            continue
+        fi
+
+        expire=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2)
+        [ -z "$expire" ] && continue
+
+        expire_ts=$(date -d "$expire" +%s 2>/dev/null)
+        now_ts=$(date +%s)
+
+        remain=$(( (expire_ts - now_ts) / 86400 ))
+
+        printf "%-25s %-12s %-10s\n" \
+            "$domain" \
+            "$(date -d "$expire" +%F)" \
+            "$remain 天"
+    done
 
     echo "------------------------------------------------------------"
     read -p "按回车返回菜单..."

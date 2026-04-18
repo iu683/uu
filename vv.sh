@@ -1,355 +1,187 @@
-#!/bin/bash
-set -e
-export DEBIAN_FRONTEND=noninteractive
+#!/usr/bin/env bash
+set -euo pipefail
 
-# ==========================================
-# 一键系统更新 & 常用依赖安装 & 修复 APT 源（Debian 11/12 兼容版）
-# ==========================================
+APP_NAME="OpenCode"
+BIN="opencode"
 
-# 颜色定义
-RED="\033[31m"
 GREEN="\033[32m"
+RED="\033[31m"
 YELLOW="\033[33m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-# 检查是否 root
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}❌ 请使用 root 用户运行此脚本${RESET}"
-    exit 1
-fi
+info(){ echo -e "${GREEN}[信息] $1${RESET}"; }
+warn(){ echo -e "${YELLOW}[警告] $1${RESET}"; }
+err(){ echo -e "${RED}[错误] $1${RESET}"; }
 
-# -------------------------
-# 常用依赖（新增 dnsutils, iperf3, mtr）
-# -------------------------
-deps=(curl wget git net-tools lsof tar unzip rsync pv sudo dnsutils iperf3 mtr jq openssl)
+pause(){ read -rp "按回车继续..." _; }
 
-# -------------------------
-# 检查并安装依赖（兼容不同系统）
-# -------------------------
-check_and_install() {
-    local check_cmd="$1"
-    local install_cmd="$2"
-    local missing=()
-    for pkg in "${deps[@]}"; do
-        if ! eval "$check_cmd \"$pkg\"" &>/dev/null; then
-            missing+=("$pkg")
-        else
-            echo -e "${GREEN}✔ 已安装: $pkg${RESET}"
-        fi
-    done
+# ==============================
+# 环境检测
+# ==============================
+check_env() {
+    info "检查 Node.js 环境..."
 
-    if [ ${#missing[@]} -gt 0 ]; then
-        echo -e "${YELLOW}👉 安装缺失依赖: ${missing[*]}${RESET}"
-        # Debian 系统处理 netcat
-        if [ "$OS_TYPE" = "debian" ]; then
-            # 让 iperf3 安装时自动选择 No（不启动 daemon）
-            echo "iperf3 iperf3/start_daemon boolean false" | debconf-set-selections
-            for pkg in "${missing[@]}"; do
-                if [ "$pkg" = "nc" ]; then
-                    apt install -y netcat-openbsd
-                else
-                    apt install -y "$pkg"
-                fi
-            done
-        else
-            eval "$install_cmd \"\${missing[@]}\""
-        fi
-    fi
-}
-
-# -------------------------
-# 清理重复 Docker 源
-# -------------------------
-fix_duplicate_docker_sources() {
-    echo -e "${YELLOW}🔍 检查重复 Docker APT 源...${RESET}"
-    local docker_sources
-    docker_sources=$(grep -rl "download.docker.com" /etc/apt/sources.list.d/ 2>/dev/null || true)
-    if [ "$(echo "$docker_sources" | grep -c .)" -gt 1 ]; then
-        echo -e "${RED}⚠️ 检测到重复 Docker 源:${RESET}"
-        echo "$docker_sources"
-        for f in $docker_sources; do
-            if [[ "$f" == *"archive_uri"* ]]; then
-                rm -f "$f"
-                echo -e "${GREEN}✔ 删除多余源: $f${RESET}"
-            fi
-        done
-    else
-        echo -e "${GREEN}✔ Docker 源正常${RESET}"
-    fi
-}
-
-# -------------------------
-# 修复 sources.list（兼容 Bullseye / Bookworm）
-# -------------------------
-fix_sources_for_version() {
-    echo -e "${YELLOW}🔍 修复 sources.list 兼容性...${RESET}"
-    local version="$1"
-    local files
-    files=$(grep -rl "deb" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true)
-    for f in $files; do
-        if [[ "$version" == "bullseye" ]]; then
-            sed -i -r 's/\bnon-free(-firmware){0,3}\b/non-free/g' "$f"
-            sed -i '/deb .*bullseye-backports/s/^/##/' "$f"
-        elif [[ "$version" == "bookworm" ]]; then
-            # Bookworm 保留 non-free-firmware，但去掉重复 non-free
-            sed -i -r 's/\bnon-free non-free\b/non-free/g' "$f"
-        fi
-    done
-    echo -e "${GREEN}✔ sources.list 已优化${RESET}"
-}
-
-# -------------------------
-# 系统更新函数
-# -------------------------
-update_system() {
-    echo -e "${GREEN}🔄 检测系统发行版并更新...${RESET}"
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        echo -e "${YELLOW}👉 当前系统: $PRETTY_NAME${RESET}"
-
-        # 系统类型
-        if [[ "$ID" =~ debian|ubuntu ]]; then
-            OS_TYPE="debian"
-            fix_duplicate_docker_sources
-            if [[ "$ID" == "debian" ]]; then
-                fix_sources_for_version "$VERSION_CODENAME"
-            fi
-            apt update && apt upgrade -y
-            check_and_install "dpkg -s" "apt install -y"
-        elif [[ "$ID" =~ fedora ]]; then
-            OS_TYPE="rhel"
-            dnf check-update || true
-            dnf upgrade -y
-            check_and_install "rpm -q" "dnf install -y"
-        elif [[ "$ID" =~ centos|rhel ]]; then
-            OS_TYPE="rhel"
-            yum check-update || true
-            yum upgrade -y
-            check_and_install "rpm -q" "yum install -y"
-        elif [[ "$ID" =~ alpine ]]; then
-            OS_TYPE="alpine"
-            apk update && apk upgrade
-            check_and_install "apk info -e" "apk add"
-        else
-            echo -e "${RED}❌ 暂不支持的 Linux 发行版: $ID${RESET}"
-            return 1
-        fi
-    else
-        echo -e "${RED}❌ 无法检测系统发行版 (/etc/os-release 不存在)${RESET}"
-        return 1
+    if ! command -v node >/dev/null 2>&1; then
+        warn "未检测到 Node.js，自动安装中..."
+        curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+        apt-get install -y nodejs
     fi
 
-    echo -e "${GREEN}✅ 系统更新和依赖安装完成！${RESET}"
+    if ! command -v npm >/dev/null 2>&1; then
+        err "npm 不存在，安装失败"
+        exit 1
+    fi
+
+    info "环境正常"
 }
 
+# ==============================
+# 安装
+# ==============================
+install_opencode() {
+    check_env
+    info "安装 OpenCode..."
 
-install_netcat() {
-    echo -e "${YELLOW}🔍 检查 netcat (nc)...${RESET}"
+    npm install -g opencode-ai || {
+        err "安装失败"
+        return
+    }
 
-    if command -v nc >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ nc 已安装${RESET}"
+    info "安装完成"
+}
+
+# ==============================
+# 登录
+# ==============================
+login_opencode() {
+    if ! command -v opencode >/dev/null 2>&1; then
+        err "请先安装 OpenCode"
         return
     fi
 
-    echo -e "${YELLOW}👉 安装 netcat-openbsd...${RESET}"
-
-    if [ "$OS_TYPE" = "debian" ]; then
-        apt install -y netcat-openbsd
-    elif [ "$OS_TYPE" = "rhel" ]; then
-        yum install -y nc 2>/dev/null || dnf install -y nc
-    elif [ "$OS_TYPE" = "alpine" ]; then
-        apk add netcat-openbsd
-    else
-        echo -e "${RED}❌ 未知系统，无法安装 nc${RESET}"
-        return 1
+    info "开始登录 Provider..."
+    opencode providers login
+}
+# ==============================
+# 登录状态
+# ==============================
+status_opencode() {
+    if ! command -v $BIN >/dev/null 2>&1; then
+        warn "未安装"
+        return
     fi
 
-    if command -v nc >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ nc 安装成功${RESET}"
+    info "当前 Provider 状态："
+
+    if opencode providers list >/dev/null 2>&1; then
+        opencode providers list
     else
-        echo -e "${RED}❌ nc 安装失败${RESET}"
+        warn "未配置任何 Provider（未登录）"
     fi
 }
-# -------------------------
-# 安装并启动 cron
-# -------------------------
-install_cron() {
-    echo -e "${YELLOW}⏰ 检查并安装 cron 定时任务服务...${RESET}"
 
-    case "$OS_TYPE" in
-        debian)
-            if ! dpkg -s cron >/dev/null 2>&1; then
-                echo -e "${YELLOW}📦 安装 cron...${RESET}"
-                apt update
-                apt install -y cron
-            else
-                echo -e "${GREEN}✔ cron 已安装${RESET}"
-            fi
-            systemctl enable --now cron
-            ;;
-        rhel)
-            if ! rpm -q cronie >/dev/null 2>&1; then
-                echo -e "${YELLOW}📦 安装 cronie...${RESET}"
-                yum install -y cronie 2>/dev/null || dnf install -y cronie
-            else
-                echo -e "${GREEN}✔ cronie 已安装${RESET}"
-            fi
-            systemctl enable --now crond
-            ;;
-        alpine)
-            if ! apk info -e cronie >/dev/null 2>&1; then
-                echo -e "${YELLOW}📦 安装 cronie...${RESET}"
-                apk add cronie
-            else
-                echo -e "${GREEN}✔ cronie 已安装${RESET}"
-            fi
-            rc-update add crond
-            service crond start
-            ;;
-        *)
-            echo -e "${RED}❌ 未知系统类型，无法安装 cron${RESET}"
-            return 1
-            ;;
+# ==============================
+# 版本
+# ==============================
+version_opencode() {
+    echo -e "${CYAN}===== 版本信息 =====${RESET}"
+
+    if command -v opencode >/dev/null 2>&1; then
+        echo "OpenCode: $(opencode --version)"
+    else
+        echo "OpenCode: 未安装"
+    fi
+
+    echo "Node.js: $(node -v 2>/dev/null || echo 未安装)"
+    echo "npm: $(npm -v 2>/dev/null || echo 未安装)"
+}
+
+# ==============================
+# 交互模式
+# ==============================
+interactive_opencode() {
+    if command -v opencode >/dev/null 2>&1; then
+        info "进入交互模式（Ctrl+C 退出）"
+        opencode
+    else
+        err "未安装 opencode"
+    fi
+}
+
+# ==============================
+# 更新
+# ==============================
+update_opencode() {
+    info "更新 OpenCode..."
+    npm update -g opencode-ai || warn "更新失败"
+    info "完成"
+}
+
+# ==============================
+# 卸载
+# ==============================
+uninstall_opencode() {
+  check_node || return 1
+  info "开始卸载 OpenCode..."
+
+  npm uninstall -g opencode-ai || true
+
+  run_root rm -rf \
+    "$HOME/.opencode" \
+    "$HOME/.config/opencode" \
+    /usr/local/bin/opencode \
+    /usr/bin/opencode 2>/dev/null || true
+
+  hash -r 2>/dev/null || true
+
+  ok "卸载完成"
+}
+# ==============================
+# 环境信息
+# ==============================
+env_info() {
+    echo -e "${CYAN}===== 环境信息 =====${RESET}"
+    echo "系统: $(uname -a)"
+    echo "Node: $(node -v 2>/dev/null || echo 未安装)"
+    echo "npm: $(npm -v 2>/dev/null || echo 未安装)"
+    echo "OpenCode: $(opencode --version 2>/dev/null || echo 未安装)"
+    echo "PATH: $PATH"
+}
+
+# ==============================
+# 菜单
+# ==============================
+menu() {
+    clear
+    echo -e "${GREEN}==== $APP_NAME ==== ${RESET}"
+    echo -e "${GREEN}1. 安装 OpenCode${RESET}"
+    echo -e "${GREEN}2. 登录${RESET}"
+    echo -e "${GREEN}3. 查看登录状态${RESET}"
+    echo -e "${GREEN}4. 检查版本${RESET}"
+    echo -e "${GREEN}5. 进入交互模式${RESET}"
+    echo -e "${GREEN}6. 更新${RESET}"
+    echo -e "${GREEN}7. 卸载${RESET}"
+    echo -e "${GREEN}8. 环境信息${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+
+    read -rp "请输入选项: " choice
+
+    case $choice in
+        1) install_opencode ;;
+        2) login_opencode ;;
+        3) status_opencode ;;
+        4) version_opencode ;;
+        5) interactive_opencode ;;
+        6) update_opencode ;;
+        7) uninstall_opencode ;;
+        8) env_info ;;
+        0) exit 0 ;;
+        *) warn "无效选项" ;;
     esac
 
-    # 状态检测
-    if systemctl is-active --quiet cron 2>/dev/null || systemctl is-active --quiet crond 2>/dev/null; then
-        echo -e "${GREEN}✔ cron 服务已运行${RESET}"
-    else
-        echo -e "${RED}❌ cron 服务未启动，请手动检查${RESET}"
-    fi
+    pause
+    menu
 }
 
-# -------------------------
-# 安装 NextTrace（网络路由追踪工具）
-# -------------------------
-install_nexttrace() {
-    echo -e "${YELLOW}🌐 检查并安装 NextTrace...${RESET}"
-
-    # 确保 curl 存在
-    if ! command -v curl >/dev/null 2>&1; then
-        echo -e "${RED}❌ curl 未安装，无法安装 NextTrace${RESET}"
-        return 1
-    fi
-
-    # 检测是否已安装
-    if command -v nexttrace >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ NextTrace 已安装${RESET}"
-        return 0
-    fi
-
-    echo -e "${YELLOW}👉 开始安装 NextTrace...${RESET}"
-
-    curl -sL https://nxtrace.org/nt | bash
-
-    # 验证
-    if command -v nexttrace >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ NextTrace 安装成功${RESET}"
-    else
-        echo -e "${RED}❌ NextTrace 安装失败${RESET}"
-    fi
-}
-
-# -------------------------
-# 开启 BBR（安全版）
-# -------------------------
-enable_bbr() {
-    echo -e "${YELLOW}🚀 检查并配置 TCP BBR...${RESET}"
-
-    # 1️⃣ 尝试加载 BBR 模块
-    if ! modprobe tcp_bbr 2>/dev/null; then
-        echo -e "${RED}❌ 当前内核未编译 BBR 或不支持${RESET}"
-        return 1
-    fi
-
-    # 2️⃣ 写入模块自动加载（避免重复）
-    mkdir -p /etc/modules-load.d
-    if ! grep -qxF "tcp_bbr" /etc/modules-load.d/bbr.conf 2>/dev/null; then
-        echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
-    fi
-
-    # 3️⃣ 检查是否已经启用
-    if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
-        echo -e "${GREEN}✔ BBR 已经开启，无需修改${RESET}"
-        return 0
-    fi
-
-    echo -e "${YELLOW}👉 BBR 未开启，开始配置...${RESET}"
-
-    # 4️⃣ 写入独立 sysctl 配置文件（更规范）
-    cat >/etc/sysctl.d/99-bbr.conf <<EOF
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
-
-    # 5️⃣ 应用配置
-    sysctl --system >/dev/null
-
-    # 6️⃣ 再次验证
-    if [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = "bbr" ]; then
-        echo -e "${GREEN}✔ BBR 已成功开启${RESET}"
-    else
-        echo -e "${RED}❌ BBR 开启失败，请检查内核配置${RESET}"
-        return 1
-    fi
-}
-
-# -------------------------
-# 时间同步 & 设置上海时区（Debian / Ubuntu 专用）
-# -------------------------
-enable_time_sync() {
-    echo -e "${YELLOW}⏰ 配置 systemd-timesyncd 时间同步& 设置上海时区...${RESET}"
-
-    if [ ! -f /etc/os-release ]; then
-        echo -e "${RED}❌ 无法识别系统类型${RESET}"
-        return 1
-    fi
-
-    . /etc/os-release
-
-    if [[ "$ID" != "ubuntu" && "$ID" != "debian" ]]; then
-        echo -e "${RED}❌ 当前系统不是 Debian/Ubuntu，跳过时间同步配置${RESET}"
-        return 0
-    fi
-
-    echo -e "${GREEN}✔ 系统检测通过：$PRETTY_NAME${RESET}"
-
-    # 安装 systemd-timesyncd（极简系统可能没装）
-    if ! dpkg -s systemd-timesyncd >/dev/null 2>&1; then
-        echo -e "${YELLOW}📦 安装 systemd-timesyncd...${RESET}"
-        apt update
-        apt install -y systemd-timesyncd
-    else
-        echo -e "${GREEN}✔ systemd-timesyncd 已安装${RESET}"
-    fi
-
-    # 启用服务
-    systemctl unmask systemd-timesyncd || true
-    systemctl enable --now systemd-timesyncd
-
-    # 启用 NTP
-    timedatectl set-ntp true
-    systemctl restart systemd-timesyncd
-
-     # 设置上海时区
-    timedatectl set-timezone Asia/Shanghai
-    echo -e "${GREEN}✔ 时区已设置为上海 (Asia/Shanghai)${RESET}"
-
-    # 状态检查
-    if systemctl is-active --quiet systemd-timesyncd; then
-        echo -e "${GREEN}✔ 时间同步服务已成功启动${RESET}"
-    else
-        echo -e "${RED}❌ 时间同步服务启动失败${RESET}"
-    fi
-}
-
-# -------------------------
-# 执行
-# -------------------------
-clear
-update_system
-install_netcat
-install_cron
-install_nexttrace
-enable_bbr
-enable_time_sync
+menu

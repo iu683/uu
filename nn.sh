@@ -1,307 +1,107 @@
 #!/bin/bash
 # ========================================
-# ACME.sh 一键管理脚本
+# GOST 彻底卸载脚本
+# 支持：systemd / docker / 手动安装 / 进程 / 配置 / 端口残留
 # ========================================
 
+RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="acme"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-SSL_DIR="/opt/$APP_NAME/ssl"
-
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
-}
-
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== ACME 证书管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 卸载${RESET}"
-        echo -e "${GREEN}6) 申请证书${RESET}"
-        echo -e "${GREEN}7) 删除证书${RESET}"
-        echo -e "${GREEN}8) 查看已配置域名${RESET}"
-        echo -e "${GREEN}9) 查看证书状态${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) uninstall_app ;;
-            6) issue_cert ;;
-            7) remove_cert ;;
-            8) list_domains ;;
-            9) cert_status ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
-install_app() {
-
-    check_docker
-    mkdir -p "$APP_DIR"
-    mkdir -p "$SSL_DIR"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-
-    read -p "请输入 CF_Token: " CF_Token
-    read -p "请输入 CF_Zone_ID: " CF_Zone_ID
-    read -p "请输入 CF_Account_ID: " CF_Account_ID
-
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  acme:
-    image: neilpang/acme.sh
-    container_name: acme
-    restart: always
-    command: daemon
-    environment:
-      CF_Token: ${CF_Token}
-      CF_Account_ID: ${CF_Account_ID}
-      CF_Zone_ID: ${CF_Zone_ID}
-    volumes:
-      - ${APP_DIR}/data:/root/.acme.sh
-      - ${APP_DIR}/ssl:/opt/acme/ssl
-    network_mode: bridge
-EOF
-
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    echo -e "${GREEN}等待容器启动...${RESET}"
-    sleep 3
-
-    # =========================
-    # ① 强制 Let’s Encrypt
-    # =========================
-    docker exec acme --set-default-ca --server letsencrypt >/dev/null 2>&1
-
-    # =========================
-    # ② 随机邮箱注册
-    # =========================
-    random_email() {
-        echo "acme-$(date +%s%N | md5sum | head -c 8)@gmail.com"
-    }
-
-    email=$(random_email)
+echo -e "${RED}========================================${RESET}"
+echo -e "${RED}        GOST 彻底卸载${RESET}"
+echo -e "${RED}========================================${RESET}"
 
-    echo -e "${GREEN}注册 ACME 账户: ${email}${RESET}"
+# =============================
+# 1. 停止 systemd 服务
+# =============================
+echo -e "${YELLOW}[1/6] 停止 systemd 服务...${RESET}"
 
-    docker exec acme --register-account -m "$email" || {
-        echo -e "${YELLOW}⚠️ 账户可能已存在或已注册，跳过注册${RESET}"
-    }
+systemctl stop gost 2>/dev/null
+systemctl disable gost 2>/dev/null
 
-    # =========================
-    # ③ 更新 ACME
-    # =========================
-    docker exec acme --upgrade --auto-upgrade >/dev/null 2>&1 || true
+systemctl stop gost@* 2>/dev/null
+systemctl disable gost@* 2>/dev/null
 
-    # =========================
-    # ④ 定时任务
-    # =========================
-    (crontab -l 2>/dev/null; echo "10 0 * * * docker exec acme --cron > /dev/null") | crontab -
+rm -f /etc/systemd/system/gost.service
+rm -f /etc/systemd/system/gost@*.service
+systemctl daemon-reload 2>/dev/null
 
-    echo
-    echo -e "${GREEN}✅ ACME 初始化完成${RESET}"
-    echo -e "${GREEN}✔ CA: Let's Encrypt${RESET}"
-    echo -e "${GREEN}✔ Account: $email${RESET}"
-    echo -e "${GREEN}✔ Storage: $APP_DIR/data${RESET}"
+# =============================
+# 2. 杀掉进程
+# =============================
+echo -e "${YELLOW}[2/6] 清理运行进程...${RESET}"
 
-    read -p "按回车返回菜单..."
-}
+pkill -f gost 2>/dev/null
 
-update_app() {
+# =============================
+# 3. 删除二进制文件 & 配置
+# =============================
+echo -e "${YELLOW}[3/6] 删除程序文件...${RESET}"
 
-    echo -e "${GREEN}开始更新 ACME 容器...${RESET}"
+rm -f /usr/bin/gost
+rm -f /usr/local/bin/gost
+rm -f /bin/gost
 
-    # =========================
-    # ① 拉取最新镜像
-    # =========================
-    docker pull neilpang/acme.sh
+rm -rf /etc/gost
+rm -rf /opt/gost
+rm -rf /var/lib/gost
+rm -rf ~/.gost
 
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}❌ 镜像拉取失败${RESET}"
-        read -p "按回车返回..."
-        return
-    fi
+rm -f /etc/gost.json
+rm -f /etc/gost.yaml
+rm -f /etc/gost.yml
 
-    # =========================
-    # ② 重新创建容器（无损更新）
-    # =========================
-    cd "$APP_DIR" || return
+# =============================
+# 4. 清理启动脚本 / 环境变量
+# =============================
+echo -e "${YELLOW}[4/6] 清理环境残留...${RESET}"
 
-    docker compose up -d
+sed -i '/gost/d' ~/.bashrc 2>/dev/null
+sed -i '/gost/d' ~/.profile 2>/dev/null
+sed -i '/gost/d' /etc/profile 2>/dev/null
 
-    # =========================
-    # ③ 更新 acme.sh 程序
-    # =========================
-    docker exec acme --upgrade --auto-upgrade || {
-        echo -e "${YELLOW}⚠️ acme.sh 更新失败或已是最新${RESET}"
-    }
+# =============================
+# 5. Docker 清理（重点）
+# =============================
+echo -e "${YELLOW}[5/6] 清理 Docker GOST...${RESET}"
 
-    # =========================
-    # ④ 确认状态
-    # =========================
-    sleep 2
+if command -v docker &>/dev/null; then
 
-    if docker ps | grep -q acme; then
-        echo -e "${GREEN}✅ ACME 容器更新完成并运行中${RESET}"
-    else
-        echo -e "${RED}❌ 容器未正常运行，请检查日志${RESET}"
-    fi
+    echo -e "${YELLOW}检查 gost 容器...${RESET}"
+    docker ps -a --format '{{.ID}} {{.Names}}' | grep -Ei "gost" | awk '{print $1}' | xargs -r docker stop 2>/dev/null
+    docker ps -a --format '{{.ID}} {{.Names}}' | grep -Ei "gost" | awk '{print $1}' | xargs -r docker rm -f 2>/dev/null
 
-    read -p "按回车返回菜单..."
-}
+    echo -e "${YELLOW}检查 gost 镜像...${RESET}"
+    docker images --format '{{.Repository}} {{.ID}}' | grep -Ei "gost" | awk '{print $2}' | xargs -r docker rmi -f 2>/dev/null
 
-restart_app() {
-    docker restart acme
-    echo -e "${GREEN}✅ 已重启${RESET}"
-    read -p "按回车返回菜单..."
-}
+    echo -e "${YELLOW}检查 gost volume...${RESET}"
+    docker volume ls --format '{{.Name}}' | grep -Ei "gost" | xargs -r docker volume rm 2>/dev/null
 
-view_logs() {
-    docker logs -f acme
-}
+    echo -e "${GREEN}Docker gost 清理完成${RESET}"
 
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已卸载 ACME${RESET}"
-    read -p "按回车返回菜单..."
-}
+else
+    echo -e "${YELLOW}未检测到 Docker，跳过${RESET}"
+fi
 
-issue_cert() {
+# =============================
+# 6. 检查残留
+# =============================
+echo -e "${YELLOW}[6/6] 检查残留状态...${RESET}"
 
-    read -p "请输入域名 (如 example.com): " domain
+gost_proc=$(ps -ef | grep -Ei "gost" | grep -v grep)
 
-    echo -e "${GREEN}开始申请证书...${RESET}"
+if [[ -n "$gost_proc" ]]; then
+    echo -e "${RED}仍有进程残留:${RESET}"
+    echo "$gost_proc"
+else
+    echo -e "${GREEN}无进程残留${RESET}"
+fi
 
-    docker exec acme --issue --dns dns_cf -d "$domain" -d "*.$domain" --ecc
+# 检查端口占用（常见代理端口）
+ss -lntp 2>/dev/null | grep -Ei "gost"
 
-    mkdir -p "$SSL_DIR/$domain"
-
-    docker exec acme --install-cert -d "$domain" \
-    --ecc \
-    --key-file "$SSL_DIR/$domain/key.pem" \
-    --fullchain-file "$SSL_DIR/$domain/fullchain.pem" \
-    --reloadcmd "echo 'skip reload'"
-
-    echo -e "${GREEN}✅ 证书申请完成${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-remove_cert() {
-
-    mapfile -t domains < <(docker exec acme --list | awk 'NR>1 && NF{print $1}')
-
-    if [ ${#domains[@]} -eq 0 ]; then
-        echo -e "${YELLOW}暂无证书可删除${RESET}"
-        read -p "按回车返回菜单..."
-        return
-    fi
-
-    echo -e "${RED}选择要删除的证书:${RESET}"
-    for i in "${!domains[@]}"; do
-        echo -e "${GREEN}$((i+1))) ${domains[$i]}${RESET}"
-    done
-
-    read -p "请输入编号: " num
-
-    if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -lt 1 ] || [ "$num" -gt "${#domains[@]}" ]; then
-        echo -e "${RED}无效选择${RESET}"
-        read -p "按回车返回..."
-        return
-    fi
-
-    domain="${domains[$((num-1))]}"
-
-    echo -e "${YELLOW}正在删除: $domain${RESET}"
-
-    docker exec acme --remove -d "$domain" --ecc || true
-    rm -rf "$SSL_DIR/$domain"
-
-    echo -e "${RED}✅ 删除完成: $domain${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-list_domains() {
-    echo -e "${GREEN}正在获取证书列表...${RESET}"
-
-    mapfile -t domains < <(docker exec acme --list | awk 'NR>1 && NF{print $1}')
-
-    if [ ${#domains[@]} -eq 0 ]; then
-        echo -e "${YELLOW}暂无证书${RESET}"
-        read -p "按回车返回菜单..."
-        return
-    fi
-
-    echo -e "${GREEN}已签发证书:${RESET}"
-    for i in "${!domains[@]}"; do
-        echo -e "${GREEN}$((i+1))) ${domains[$i]}${RESET}"
-    done
-
-    read -p "按回车返回菜单..."
-}
-
-cert_status() {
-
-    if ! command -v docker >/dev/null 2>&1; then
-        echo -e "${RED}❌ 未检测到 docker${RESET}"
-        read -p "按回车返回..."
-        return
-    fi
-
-    echo -e "${GREEN}证书列表:${RESET}"
-    echo "------------------------------------------------------------"
-    printf "%-25s %-12s %-10s\n" "域名" "到期时间" "剩余天数"
-    echo "------------------------------------------------------------"
-
-    docker exec acme sh -c '
-    for d in /root/.acme.sh/*_ecc/fullchain.cer; do
-        [ -f "$d" ] || continue
-
-        domain=$(echo "$d" | sed "s#.*/##" | sed "s/_ecc.*//")
-        cert="$d"
-
-        expire=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2)
-        expire_ts=$(date -d "$expire" +%s 2>/dev/null)
-
-        now_ts=$(date +%s)
-        remain=$(( (expire_ts - now_ts) / 86400 ))
-
-        printf "%-25s %-12s %-10s\n" "$domain" "$(date -d "$expire" +%F)" "$remain 天"
-    done
-    '
-
-    echo "------------------------------------------------------------"
-    read -p "按回车返回菜单..."
-}
-
-menu
+echo -e "${GREEN}========================================${RESET}"
+echo -e "${GREEN}        GOST 已彻底卸载完成${RESET}"
+echo -e "${GREEN}========================================${RESET}"

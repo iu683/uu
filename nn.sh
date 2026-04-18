@@ -30,7 +30,7 @@ menu() {
         clear
         echo -e "${GREEN}=== ACME 证书管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新 ACME${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 卸载${RESET}"
@@ -71,8 +71,8 @@ install_app() {
     fi
 
     read -p "请输入 CF_Token: " CF_Token
-    read -p "请输入 CF_Account_ID: " CF_Account_ID
     read -p "请输入 CF_Zone_ID: " CF_Zone_ID
+    read -p "请输入 CF_Account_ID: " CF_Account_ID
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
@@ -87,6 +87,7 @@ services:
       CF_Zone_ID: ${CF_Zone_ID}
     volumes:
       - ${APP_DIR}/data:/root/.acme.sh
+      - ${APP_DIR}/ssl:/opt/acme/ssl
     network_mode: bridge
 EOF
 
@@ -105,7 +106,7 @@ EOF
     # ② 随机邮箱注册
     # =========================
     random_email() {
-        echo "acme-$(date +%s%N | md5sum | head -c 8)@example.com"
+        echo "acme-$(date +%s%N | md5sum | head -c 8)@gmail.com"
     }
 
     email=$(random_email)
@@ -198,7 +199,7 @@ uninstall_app() {
 
 issue_cert() {
 
-    read -p "请输入主域名 (如 example.com): " domain
+    read -p "请输入域名 (如 example.com): " domain
 
     echo -e "${GREEN}开始申请证书...${RESET}"
 
@@ -210,7 +211,7 @@ issue_cert() {
     --ecc \
     --key-file "$SSL_DIR/$domain/key.pem" \
     --fullchain-file "$SSL_DIR/$domain/fullchain.pem" \
-    --reloadcmd "nginx -s reload"
+    --reloadcmd "echo 'skip reload'"
 
     echo -e "${GREEN}✅ 证书申请完成${RESET}"
     read -p "按回车返回菜单..."
@@ -271,28 +272,35 @@ list_domains() {
 
 cert_status() {
 
-    mapfile -t domains < <(docker exec acme --list | awk 'NR>1 && NF{print $1}')
-
-    if [ ${#domains[@]} -eq 0 ]; then
-        echo -e "${YELLOW}暂无证书${RESET}"
+    if ! command -v docker >/dev/null 2>&1; then
+        echo -e "${RED}❌ 未检测到 docker${RESET}"
         read -p "按回车返回..."
         return
     fi
 
-    echo -e "${GREEN}选择查看证书状态:${RESET}"
-    for i in "${!domains[@]}"; do
-        echo -e "${GREEN}$((i+1))) ${domains[$i]}${RESET}"
+    echo -e "${GREEN}证书列表:${RESET}"
+    echo "------------------------------------------------------------"
+    printf "%-25s %-12s %-10s\n" "域名" "到期时间" "剩余天数"
+    echo "------------------------------------------------------------"
+
+    docker exec acme sh -c '
+    for d in /root/.acme.sh/*_ecc/fullchain.cer; do
+        [ -f "$d" ] || continue
+
+        domain=$(echo "$d" | sed "s#.*/##" | sed "s/_ecc.*//")
+        cert="$d"
+
+        expire=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2)
+        expire_ts=$(date -d "$expire" +%s 2>/dev/null)
+
+        now_ts=$(date +%s)
+        remain=$(( (expire_ts - now_ts) / 86400 ))
+
+        printf "%-25s %-12s %-10s\n" "$domain" "$(date -d "$expire" +%F)" "$remain 天"
     done
+    '
 
-    read -p "请输入编号: " num
-
-    if ! [[ "$num" =~ ^[0-9]+$ ]]; then
-        return
-    fi
-
-    domain="${domains[$((num-1))]}"
-    docker exec acme --info -d "$domain"
-
+    echo "------------------------------------------------------------"
     read -p "按回车返回菜单..."
 }
 

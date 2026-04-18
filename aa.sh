@@ -30,7 +30,7 @@ menu() {
         clear
         echo -e "${GREEN}=== ACME 证书管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新 ACME${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
         echo -e "${GREEN}4) 查看日志${RESET}"
         echo -e "${GREEN}5) 卸载${RESET}"
@@ -62,6 +62,7 @@ install_app() {
 
     check_docker
     mkdir -p "$APP_DIR"
+    mkdir -p "$SSL_DIR"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖？(y/n)${RESET}"
@@ -70,8 +71,8 @@ install_app() {
     fi
 
     read -p "请输入 CF_Token: " CF_Token
-    read -p "请输入 CF_Account_ID: " CF_Account_ID
     read -p "请输入 CF_Zone_ID: " CF_Zone_ID
+    read -p "请输入 CF_Account_ID: " CF_Account_ID
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
@@ -86,24 +87,95 @@ services:
       CF_Zone_ID: ${CF_Zone_ID}
     volumes:
       - ${APP_DIR}/data:/root/.acme.sh
+      - ${APP_DIR}/ssl:/opt/acme/ssl
     network_mode: bridge
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    docker exec acme --upgrade --auto-upgrade || true
+    echo -e "${GREEN}等待容器启动...${RESET}"
+    sleep 3
 
+    # =========================
+    # ① 强制 Let’s Encrypt
+    # =========================
+    docker exec acme --set-default-ca --server letsencrypt >/dev/null 2>&1
+
+    # =========================
+    # ② 随机邮箱注册
+    # =========================
+    random_email() {
+        echo "acme-$(date +%s%N | md5sum | head -c 8)@gmail.com"
+    }
+
+    email=$(random_email)
+
+    echo -e "${GREEN}注册 ACME 账户: ${email}${RESET}"
+
+    docker exec acme --register-account -m "$email" || {
+        echo -e "${YELLOW}⚠️ 账户可能已存在或已注册，跳过注册${RESET}"
+    }
+
+    # =========================
+    # ③ 更新 ACME
+    # =========================
+    docker exec acme --upgrade --auto-upgrade >/dev/null 2>&1 || true
+
+    # =========================
+    # ④ 定时任务
+    # =========================
     (crontab -l 2>/dev/null; echo "10 0 * * * docker exec acme --cron > /dev/null") | crontab -
 
     echo
-    echo -e "${GREEN}✅ ACME 已安装启动${RESET}"
+    echo -e "${GREEN}✅ ACME 初始化完成${RESET}"
+    echo -e "${GREEN}✔ CA: Let's Encrypt${RESET}"
+    echo -e "${GREEN}✔ Account: $email${RESET}"
+    echo -e "${GREEN}✔ Storage: $APP_DIR/data${RESET}"
+
     read -p "按回车返回菜单..."
 }
 
 update_app() {
-    docker exec acme --upgrade --auto-upgrade
-    echo -e "${GREEN}✅ ACME 更新完成${RESET}"
+
+    echo -e "${GREEN}开始更新 ACME 容器...${RESET}"
+
+    # =========================
+    # ① 拉取最新镜像
+    # =========================
+    docker pull neilpang/acme.sh
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 镜像拉取失败${RESET}"
+        read -p "按回车返回..."
+        return
+    fi
+
+    # =========================
+    # ② 重新创建容器（无损更新）
+    # =========================
+    cd "$APP_DIR" || return
+
+    docker compose up -d
+
+    # =========================
+    # ③ 更新 acme.sh 程序
+    # =========================
+    docker exec acme --upgrade --auto-upgrade || {
+        echo -e "${YELLOW}⚠️ acme.sh 更新失败或已是最新${RESET}"
+    }
+
+    # =========================
+    # ④ 确认状态
+    # =========================
+    sleep 2
+
+    if docker ps | grep -q acme; then
+        echo -e "${GREEN}✅ ACME 容器更新完成并运行中${RESET}"
+    else
+        echo -e "${RED}❌ 容器未正常运行，请检查日志${RESET}"
+    fi
+
     read -p "按回车返回菜单..."
 }
 
@@ -127,7 +199,7 @@ uninstall_app() {
 
 issue_cert() {
 
-    read -p "请输入主域名 (如 example.com): " domain
+    read -p "请输入域名 (如 example.com): " domain
 
     echo -e "${GREEN}开始申请证书...${RESET}"
 
@@ -139,30 +211,92 @@ issue_cert() {
     --ecc \
     --key-file "$SSL_DIR/$domain/key.pem" \
     --fullchain-file "$SSL_DIR/$domain/fullchain.pem" \
-    --reloadcmd "nginx -s reload"
+    --reloadcmd "echo 'skip reload'"
 
     echo -e "${GREEN}✅ 证书申请完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 remove_cert() {
-    read -p "请输入域名: " domain
+
+    mapfile -t domains < <(docker exec acme --list | awk 'NR>1 && NF{print $1}')
+
+    if [ ${#domains[@]} -eq 0 ]; then
+        echo -e "${YELLOW}暂无证书可删除${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    fi
+
+    echo -e "${RED}选择要删除的证书:${RESET}"
+    for i in "${!domains[@]}"; do
+        echo -e "${GREEN}$((i+1))) ${domains[$i]}${RESET}"
+    done
+
+    read -p "请输入编号: " num
+
+    if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -lt 1 ] || [ "$num" -gt "${#domains[@]}" ]; then
+        echo -e "${RED}无效选择${RESET}"
+        read -p "按回车返回..."
+        return
+    fi
+
+    domain="${domains[$((num-1))]}"
+
+    echo -e "${YELLOW}正在删除: $domain${RESET}"
 
     docker exec acme --remove -d "$domain" --ecc || true
     rm -rf "$SSL_DIR/$domain"
 
-    echo -e "${RED}✅ 证书已删除${RESET}"
+    echo -e "${RED}✅ 删除完成: $domain${RESET}"
     read -p "按回车返回菜单..."
 }
 
 list_domains() {
-    docker exec acme --list
+    echo -e "${GREEN}正在获取证书列表...${RESET}"
+
+    mapfile -t domains < <(docker exec acme --list | awk 'NR>1 && NF{print $1}')
+
+    if [ ${#domains[@]} -eq 0 ]; then
+        echo -e "${YELLOW}暂无证书${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    fi
+
+    echo -e "${GREEN}已签发证书:${RESET}"
+    for i in "${!domains[@]}"; do
+        echo -e "${GREEN}$((i+1))) ${domains[$i]}${RESET}"
+    done
+
     read -p "按回车返回菜单..."
 }
 
 cert_status() {
-    read -p "请输入域名: " domain
-    docker exec acme --info -d "$domain"
+
+    if ! command -v docker >/dev/null 2>&1; then
+        echo -e "${RED}❌ 未检测到 docker${RESET}"
+        read -p "按回车返回..."
+        return
+    fi
+
+    echo -e "${GREEN}证书列表:${RESET}"
+    echo "------------------------------------------------------------"
+    printf "%-25s %-12s %-10s\n" "域名" "到期时间" "剩余天数"
+    echo "------------------------------------------------------------"
+
+    docker exec acme --list 2>/dev/null | awk '
+    NR>1 && NF {
+        domain=$1
+        # acme list 最后一列通常是剩余天数
+        expire=$(NF-1)
+        remain=$NF
+
+        # 过滤掉 header 垃圾行
+        if(domain ~ /\./) {
+            printf "%-25s %-12s %-10s\n", domain, expire, remain
+        }
+    }'
+
+    echo "------------------------------------------------------------"
     read -p "按回车返回菜单..."
 }
 

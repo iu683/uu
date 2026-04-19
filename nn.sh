@@ -1,108 +1,97 @@
 #!/bin/bash
-# VPS SWAP 管理脚本 (兼容 Alpine/Debian/Ubuntu/CentOS)
+# ==========================================
+# 一键开放 VPS 所有端口 (完美支持 Alpine)
+# ⚠️ 警告：非常不安全，仅用于测试环境
+# ==========================================
 
-SWAP_FILE="/swapfile"
+# 颜色
+RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
 RESET="\033[0m"
 
-# 获取系统 ID
-if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    OS_ID="$ID"
+# 检查系统类型
+if [[ -f /etc/alpine-release ]]; then
+    OS="alpine"
+elif [[ -f /etc/debian_version ]]; then
+    OS="debian"
+elif [[ -f /etc/redhat-release ]]; then
+    OS="rhel"
 else
-    OS_ID="unknown"
+    OS="unknown"
 fi
 
-menu() {
-    clear
-    # 兼容处理：提取 Swap 总量数值
-    CUR_SWAP=$(free | awk '/Swap:/ {print $2}')
-    
-    # 将 KB 转换为人类可读格式
-    if [ -z "$CUR_SWAP" ] || [ "$CUR_SWAP" -eq 0 ]; then
-        STATUS="未启用"
-    else
-        # 简单换算成 MB 或 GB
-        if [ "$CUR_SWAP" -ge 1048576 ]; then
-            STATUS="已启用 ($(echo "scale=2; $CUR_SWAP/1048576" | bc 2>/dev/null || echo "$((CUR_SWAP/1048576))")G)"
-        else
-            STATUS="已启用 ($((CUR_SWAP/1024))M)"
-        fi
-    fi
+echo -e "${YELLOW}检测到系统类型: $OS${RESET}"
 
-    echo -e "${GREEN}====== VPS SWAP 管理 =========${RESET}"
-    echo -e "${GREEN}系统 ID: ${YELLOW}${OS_ID}${RESET}"
-    echo -e "${GREEN}当前 SWAP 状态: ${YELLOW}${STATUS}${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}1. 添加 SWAP (默认 1G)${RESET}"
-    echo -e "${GREEN}2. 删除 SWAP${RESET}"
-    echo -e "${GREEN}3. 查看详细状态${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    read -p "$(echo -e ${GREEN}请输入选项: ${RESET})" choice
-    case $choice in
-        1) add_swap ;;
-        2) del_swap ;;
-        3) view_swap ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}❌ 无效选项${RESET}"; sleep 1; menu ;;
+# --------------------------
+# 自动安装函数
+# --------------------------
+install_package() {
+    local pkg="$1"
+    case "$OS" in
+        alpine)
+            echo -e "${YELLOW}尝试安装 $pkg ...${RESET}"
+            apk add --no-cache "$pkg"
+            ;;
+        debian)
+            apt-get update && apt-get install -y "$pkg"
+            ;;
+        rhel)
+            yum install -y "$pkg"
+            ;;
     esac
 }
 
-add_swap() {
-    read -p "请输入要添加的 SWAP 大小(单位G, 默认1): " SWAP_SIZE
-    SWAP_SIZE=${SWAP_SIZE:-1}
+# --------------------------
+# 处理逻辑
+# --------------------------
 
-    # 检查是否已有 Swap 挂载，先关闭
-    swapoff "$SWAP_FILE" 2>/dev/null || true
-    [ -f "$SWAP_FILE" ] && rm -f "$SWAP_FILE"
-
-    echo -e "${YELLOW}正在创建 ${SWAP_SIZE}G 的 Swap 文件...${RESET}"
-    
-    # Alpine 适配：优先使用 dd 保证兼容性
-    if command -v fallocate >/dev/null 2>&1 && [ "$OS_ID" != "alpine" ]; then
-        fallocate -l ${SWAP_SIZE}G "$SWAP_FILE" || dd if=/dev/zero of="$SWAP_FILE" bs=1M count=$((SWAP_SIZE*1024))
+# 1. 针对 Alpine 的特殊优化处理 (优先使用 nftables 或 iptables)
+if [[ "$OS" == "alpine" ]]; then
+    # Alpine 默认通常不带 ufw，我们优先清理可能存在的 nft/iptables
+    if command -v nft >/dev/null 2>&1; then
+        echo -e "${GREEN}配置 nftables...${RESET}"
+        nft flush ruleset
+        # 设置默认策略为 ACCEPT
+        nft add table inet filter
+        nft add chain inet filter input { type filter hook input priority 0 \; policy accept \; }
+        # 确保服务启动并加入开机自启
+        rc-update add nftables default 2>/dev/null || true
+        rc-service nftables start 2>/dev/null || true
+    elif command -v iptables >/dev/null 2>&1; then
+        echo -e "${GREEN}配置 iptables...${RESET}"
+        iptables -F && iptables -X
+        iptables -P INPUT ACCEPT
+        iptables -P FORWARD ACCEPT
+        iptables -P OUTPUT ACCEPT
+        # Alpine 保存 iptables 规则
+        /etc/init.d/iptables save 2>/dev/null || true
     else
-        dd if=/dev/zero of="$SWAP_FILE" bs=1M count=$((SWAP_SIZE*1024))
+        echo -e "${YELLOW}未检测到防火墙，Alpine 默认状态通常为全开。${RESET}"
     fi
 
-    chmod 600 "$SWAP_FILE"
-    mkswap "$SWAP_FILE"
-    swapon "$SWAP_FILE"
-
-    # 写入开机启动
-    if ! grep -q "$SWAP_FILE" /etc/fstab; then
-        echo "$SWAP_FILE none swap sw 0 0" >> /etc/fstab
-    fi
-
-    echo -e "${GREEN}✅ 已成功添加 ${SWAP_SIZE}G SWAP${RESET}"
-    read -p "按回车返回菜单..." 
-    menu
-}
-
-del_swap() {
-    echo -e "${YELLOW}正在删除 SWAP...${RESET}"
-    swapoff "$SWAP_FILE" 2>/dev/null || true
-    sed -i "\|$SWAP_FILE|d" /etc/fstab
-    [ -f "$SWAP_FILE" ] && rm -f "$SWAP_FILE"
-    echo -e "${GREEN}✅ 已彻底删除 SWAP 文件并清理配置${RESET}"
-    read -p "按回车返回菜单..." 
-    menu
-}
-
-view_swap() {
-    echo -e "${GREEN}========== 系统 SWAP 详细状态 ==========${RESET}"
-    free -m
-    # 兼容 Alpine 的 swapon 输出
-    if swapon --show >/dev/null 2>&1; then
-        swapon --show
+# 2. 针对 Debian/Ubuntu 的处理 (ufw)
+elif [[ "$OS" == "debian" ]]; then
+    if command -v ufw >/dev/null 2>&1; then
+        ufw disable # 直接禁用防火墙在 Debian 上是最快开放所有端口的方法
+        echo -e "${GREEN}UFW 已禁用 (所有端口已开放)${RESET}"
     else
-        cat /proc/swaps
+        # 兜底使用 iptables
+        iptables -P INPUT ACCEPT && iptables -F
     fi
-    read -p "按回车返回菜单..." 
-    menu
-}
 
-# 运行脚本
-menu
+# 3. 针对 RHEL/CentOS 的处理 (firewalld/iptables)
+elif [[ "$OS" == "rhel" ]]; then
+    if command -v firewalld >/dev/null 2>&1; then
+        systemctl stop firewalld
+        systemctl disable firewalld
+        echo -e "${GREEN}Firewalld 已停止并禁用${RESET}"
+    else
+        iptables -P INPUT ACCEPT && iptables -F
+    fi
+fi
+
+echo -e "${GREEN}----------------------------------${RESET}"
+echo -e "${GREEN}✅ 所有端口已成功开放！${RESET}"
+echo -e "${YELLOW}请注意：由于 Alpine 采用 OpenRC，如果安装了新防火墙插件，请确保已启动服务。${RESET}"
+echo -e "${YELLOW}当前时间: $(date +'%Y年%m月%d日 %H:%M:%S')${RESET}"

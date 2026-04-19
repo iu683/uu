@@ -1,139 +1,196 @@
 #!/bin/bash
-# IPv4 / IPv6 切换脚本（完美适配 Alpine/Debian/Ubuntu/CentOS）
+set -e
 
 GREEN="\033[32m"
 RED="\033[31m"
-YELLOW="\033[33m"
 RESET="\033[0m"
+YELLOW="\033[33m"
 
-# 检查命令是否存在
-has_cmd() {
-    command -v "$1" >/dev/null 2>&1
-}
+# 识别系统和初始化管理器
+if [ -f /etc/alpine-release ]; then
+    OS="alpine"
+    INIT="openrc"
+elif [ -f /etc/debian_version ]; then
+    OS="debian"
+    INIT="systemd"
+elif [ -f /etc/redhat-release ]; then
+    OS="rhel"
+    INIT="systemd"
+else
+    OS="unknown"
+    INIT="unknown"
+fi
 
-# 获取系统类型
-get_os_type() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        echo "$ID"
-    else
-        echo "linux"
+# 通用服务管理函数
+manage_service() {
+    local action=$1 # start, stop, restart, enable
+    local service="fail2ban"
+
+    if [ "$INIT" == "systemd" ]; then
+        case $action in
+            enable) systemctl enable --now $service ;;
+            *) systemctl $action $service ;;
+        esac
+    elif [ "$INIT" == "openrc" ]; then
+        case $action in
+            enable) rc-update add $service default && rc-service $service start ;;
+            start) rc-service $service start ;;
+            stop) rc-service $service stop ;;
+            restart) rc-service $service restart ;;
+        esac
     fi
 }
 
-# 安装依赖（自动识别 sudo/apk/apt）
-install_pkg() {
-    local pkg="$1"
-    local os=$(get_os_type)
-    
-    # 针对 Alpine 的包名转换
-    [[ "$os" == "alpine" && "$pkg" == "lsb-release" ]] && pkg="catatonit" # 示例转换
+# 检查 Fail2Ban 是否运行
+check_fail2ban() {
+    local running=false
+    if [ "$INIT" == "systemd" ]; then
+        systemctl is-active --quiet fail2ban && running=true
+    elif [ "$INIT" == "openrc" ]; then
+        rc-service fail2ban status | grep -q "started" && running=true
+    fi
 
-    if has_cmd "$pkg"; then return; fi
-
-    echo -e "${YELLOW}🔧 安装依赖: $pkg${RESET}"
-    
-    # 自动判断是否使用 sudo
-    local cmd="sudo"
-    if [ "$(id -u)" -eq 0 ]; then cmd=""; fi
-
-    case "$os" in
-        ubuntu|debian) $cmd apt update && $cmd apt install -y "$pkg" ;;
-        alpine) $cmd apk add --no-cache "$pkg" ;;
-        centos|rhel|fedora) $cmd yum install -y "$pkg" || $cmd dnf install -y "$pkg" ;;
-    esac
+    if [ "$running" == false ]; then
+        echo -e "${YELLOW}Fail2Ban 未运行，正在尝试启动...${RESET}"
+        manage_service start || echo -e "${RED}启动失败，请检查是否已安装${RESET}"
+        sleep 1
+    fi
 }
 
-# 检查常用依赖
-check_deps() {
-    local deps=(curl ip ping sysctl)
-    for cmd in "${deps[@]}"; do
-        install_pkg "$cmd"
+# 安装 Fail2Ban
+install_fail2ban() {
+    echo -e "${GREEN}正在安装 Fail2Ban...${RESET}"
+    case "$OS" in
+        alpine)
+            apk update
+            apk add fail2ban curl wget
+            # Alpine 需要手动创建日志文件，否则 fail2ban 可能启动失败
+            touch /var/log/fail2ban.log
+            ;;
+        debian)
+            apt update
+            apt install -y fail2ban curl wget
+            ;;
+        rhel)
+            yum install -y epel-release
+            yum install -y fail2ban curl wget
+            ;;
+        *)
+            echo -e "${RED}不支持的操作系统${RESET}"
+            exit 1
+            ;;
+    esac
+    manage_service enable
+    sleep 1
+}
+
+# 配置 SSH 防护
+configure_ssh() {
+    case "$OS" in
+        debian) LOG_PATH="/var/log/auth.log" ;;
+        rhel)   LOG_PATH="/var/log/secure" ;;
+        alpine) LOG_PATH="/var/log/messages" ;; # Alpine 默认日志位置
+    esac
+
+    read -p $'\033[32m请输入 SSH 端口（默认22）: \033[0m' SSH_PORT
+    SSH_PORT=${SSH_PORT:-22}
+
+    read -p $'\033[32m请输入最大失败尝试次数 maxretry（默认5）: \033[0m' MAX_RETRY
+    MAX_RETRY=${MAX_RETRY:-5}
+
+    read -p $'\033[32m请输入封禁时间 bantime(秒，默认600) : \033[0m' BAN_TIME
+    BAN_TIME=${BAN_TIME:-600}
+
+    mkdir -p /etc/fail2ban/jail.d
+    cat >/etc/fail2ban/jail.d/sshd.local <<EOF
+[sshd]
+enabled = true
+port = $SSH_PORT
+filter = sshd
+logpath = $LOG_PATH
+maxretry = $MAX_RETRY
+bantime  = $BAN_TIME
+EOF
+
+    manage_service restart
+    sleep 1
+    echo -e "${GREEN}SSH 防暴力破解配置完成${RESET}"
+}
+
+# 卸载 Fail2Ban
+uninstall_fail2ban() {
+    echo -e "${GREEN}正在卸载 Fail2Ban...${RESET}"
+    manage_service stop || true
+    case "$OS" in
+        alpine) apk del fail2ban ;;
+        debian) apt remove -y fail2ban ;;
+        rhel)   yum remove -y fail2ban ;;
+    esac
+    echo -e "${GREEN}Fail2Ban 已卸载${RESET}"
+}
+
+# 菜单逻辑（保持原样，但调用适配后的函数）
+fail2ban_menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}==== SSH 防暴力破解管理菜单 ====${RESET}"
+        echo -e "${GREEN}1. 安装开启 SSH 防暴力破解${RESET}"
+        echo -e "${GREEN}2. 关闭 SSH 防暴力破解 (仅停用规则)${RESET}"
+        echo -e "${GREEN}3. 配置 SSH 防护参数${RESET}"
+        echo -e "${GREEN}4. 查看 SSH 拦截记录${RESET}"
+        echo -e "${GREEN}5. 查看防御规则列表${RESET}"
+        echo -e "${GREEN}6. 查看日志实时监控${RESET}"
+        echo -e "${GREEN}7. 卸载防御程序${RESET}"
+        echo -e "${GREEN}0. 退出${RESET}"
+        read -p $'\033[32m请输入你的选择: \033[0m' sub_choice
+
+        case $sub_choice in
+            1)
+                if ! command -v fail2ban-client >/dev/null 2>&1; then
+                    install_fail2ban
+                else
+                    manage_service start
+                fi
+                configure_ssh
+                read -p $'\033[32m按回车返回菜单...\033[0m'
+                ;;
+            2)
+                if [ -f /etc/fail2ban/jail.d/sshd.local ]; then
+                    sed -i '/enabled/s/true/false/' /etc/fail2ban/jail.d/sshd.local
+                    manage_service restart
+                    echo -e "${GREEN}SSH 防暴力破解已关闭${RESET}"
+                else
+                    echo -e "${RED}配置文件不存在${RESET}"
+                fi
+                read -p $'\033[32m按回车返回菜单...\033[0m'
+                ;;
+            3)
+                check_fail2ban && configure_ssh
+                read -p $'\033[32m按回车返回菜单...\033[0m'
+                ;;
+            4)
+                check_fail2ban
+                echo -e "${GREEN}当前被封禁的 IP 列表:${RESET}"
+                fail2ban-client status sshd | grep "Banned IP list"
+                read -p $'\033[32m按回车返回菜单...\033[0m'
+                ;;
+            5)
+                check_fail2ban
+                fail2ban-client status
+                read -p $'\033[32m按回车返回菜单...\033[0m'
+                ;;
+            6)
+                echo -e "${GREEN}实时监控 /var/log/fail2ban.log (Ctrl+C 退出)${RESET}"
+                tail -f /var/log/fail2ban.log
+                ;;
+            7)
+                uninstall_fail2ban
+                break
+                ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" && sleep 1 ;;
+        esac
     done
-    # Alpine 特供：确保有基础网络工具
-    if [ "$(get_os_type)" == "alpine" ]; then
-        install_pkg "busybox-extras"
-    fi
 }
 
-# 自动检测主网卡
-detect_iface() {
-    ip -o link show | awk -F': ' '{print $2}' | grep -v lo | head -n1
-}
-
-# 刷新 IPv6 (Alpine 深度适配)
-refresh_ipv6() {
-    local iface="$1"
-    local os=$(get_os_type)
-    echo -e "${YELLOW}🔄 刷新 IPv6 地址 (${iface})...${RESET}"
-
-    if [[ "$os" == "alpine" ]]; then
-        # Alpine 尝试重新触发 DHCPv6
-        if has_cmd udhcpc; then
-            # Alpine 默认使用 udhcpc
-            killall udhcpc 2>/dev/null || true
-            udhcpc -i "$iface" -n -q 2>/dev/null
-        fi
-        rc-service networking restart 2>/dev/null || /etc/init.d/networking restart 2>/dev/null
-        echo -e "${GREEN}✔ Alpine 网络已重载${RESET}"
-    else
-        echo -e "${YELLOW}ℹ️ 系统已尝试启用，如无 IP 请重启 VPS${RESET}"
-    fi
-}
-
-# 执行初始化检查
-check_deps
-
-# 主循环
-while true; do
-    clear
-    echo -e "${GREEN}======== IPv4/IPv6 管理 ========${RESET}"
-    echo -e "${GREEN} 1) IPv4 优先 (禁用 IPv6)${RESET}"
-    echo -e "${GREEN} 2) IPv6 优先 (启用并刷新 IPv6)${RESET}"
-    echo -e "${GREEN} 3) 查看网络状态与公网 IP${RESET}"
-    echo -e "${GREEN} 0) 退出${RESET}"
-    read -p "$(echo -e ${GREEN} 请选择:${RESET}) " choice
-
-    iface=$(detect_iface)
-
-    case $choice in
-        1)
-            sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1
-            sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1
-            echo -e "${GREEN}✅ 已禁用 IPv6${RESET}"
-            read -p "按回车返回菜单..."
-            ;;
-        2)
-            sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
-            sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
-            echo -e "${GREEN}✅ 已启用 IPv6${RESET}"
-            refresh_ipv6 "$iface"
-            read -p "按回车返回菜单..."
-            ;;
-        3)
-            echo -e "${GREEN}🌐 IPv6 状态：${RESET}"
-            dis_v6=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
-            if [ "$dis_v6" == "1" ]; then echo "状态: 已禁用"; else echo "状态: 已启用"; fi
-            
-            echo -e "${GREEN}🌐 内网 IP 列表：${RESET}"
-            ip addr show "$iface" | grep "inet" || echo "无地址"
-
-            echo -e "\n${GREEN}🔎 连通性测试：${RESET}"
-            # 通用 ping 测试
-            ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 && echo -e "IPv4: ${GREEN}正常${RESET}" || echo -e "IPv4: ${RED}失败${RESET}"
-            ping6 -c 2 -W 3 ipv6.google.com >/dev/null 2>&1 && echo -e "IPv6: ${GREEN}正常${RESET}" || echo -e "IPv6: ${RED}失败${RESET}"
-
-            echo -e "\n${GREEN}🌍 公网 IP：${RESET}"
-            if has_cmd curl; then
-                echo -n "IPv4: "
-                curl -4 -s --max-time 5 api64.ipify.org || echo "无法获取"
-                echo -n "IPv6: "
-                curl -6 -s --max-time 5 api64.ipify.org || echo "无法获取"
-            fi
-            echo ""
-            read -p "按回车返回菜单..."
-            ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}❌ 无效选项${RESET}"; sleep 1 ;;
-    esac
-done
+fail2ban_menu

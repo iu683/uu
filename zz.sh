@@ -70,21 +70,34 @@ rm -rf /tmp/* 2>/dev/null || true
 rm -rf ~/.cache/* 2>/dev/null || true
 
 # ========================================
-# 5. 内存释放 (增加权限判定)
+# 5. 内存释放 (静默权限判定)
 # ========================================
 echo -e "${YELLOW}🧠 尝试释放页面缓存...${RESET}"
 sync
-# 尝试写入，如果失败则静默跳过，不再报错
-if ! echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; then
-    echo -e "${YELLOW}ℹ️ 环境限制，跳过内存强制释放 (不影响清理效果)${RESET}"
+# 检查是否有写入权限，如果有才执行，没有则直接提示
+if [ -w /proc/sys/vm/drop_caches ]; then
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null && echo -e "${GREEN}✔ 内存释放成功${RESET}"
+else
+    echo -e "${YELLOW}🧹 当前环境不支持手动释放缓存 (通常见于 LXC/Docker)，已跳过${RESET}"
 fi
 
-
 # ========================================
-# 总结输出
+# 总结输出 (通用 printf 对齐版)
 # ========================================
 echo -e "----------------------------------"
 echo -e "${GREEN}✅ 系统清理完成！${RESET}"
 echo -e "${YELLOW}当前磁盘使用率:${RESET}"
-df -h / | awk 'NR==1 || NR==2'
+
+# 定义对齐格式：每列占 12 或 10 个字符
+fmt="%-15s %-8s %-8s %-8s %-8s %-s\n"
+
+# 输出中文表头
+printf "$fmt" "文件系统" "容量" "已用" "可用" "已用%" "挂载点"
+
+# 获取 df 数据并格式化输出
+df -h / | sed '1d' | while read -r fs size used avail per mnt; do
+    printf "$fmt" "$fs" "$size" "$used" "$avail" "$per" "$mnt"
+done
+
+echo -e "----------------------------------"
 echo -e "${YELLOW}当前时间: $(date +'%Y年%m月%d日 %H:%M:%S')${RESET}"

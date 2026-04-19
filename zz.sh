@@ -1,115 +1,170 @@
 #!/bin/bash
 # ========================================
-# Cloudflare Tunnel (cloudflared) 彻底卸载脚本
-# 支持：systemd / docker / 手动安装 / 隧道配置 / 证书 / 进程
+# DrissionPage VPS 专用全自动安装脚本
 # ========================================
 
-RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-echo -e "${RED}========================================${RESET}"
-echo -e "${RED}   Cloudflare Tunnel 彻底卸载${RESET}"
-echo -e "${RED}========================================${RESET}"
+APP_NAME="DrissionPage"
 
-# =============================
-# 1. 停止 systemd 服务
-# =============================
-echo -e "${YELLOW}[1/6] 停止 systemd 服务...${RESET}"
+check_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "${RED}✘ 请使用 root 用户或 sudo 运行此脚本${RESET}"
+        exit 1
+    fi
+}
 
-systemctl stop cloudflared 2>/dev/null
-systemctl disable cloudflared 2>/dev/null
+install_dp() {
+    echo -e "${YELLOW}▶ 正在更新系统软件包...${RESET}"
+    apt update -y
 
-systemctl stop cloudflared@* 2>/dev/null
-systemctl disable cloudflared@* 2>/dev/null
+    echo -e "${GREEN}▶ 正在安装 Python3 和 Pip...${RESET}"
+    apt install -y python3 python3-pip python3-venv
 
-rm -f /etc/systemd/system/cloudflared.service
-rm -f /etc/systemd/system/cloudflared@*.service
-systemctl daemon-reload 2>/dev/null
+    echo -e "${GREEN}▶ 正在安装 DrissionPage...${RESET}"
+    # 兼容新版系统（如 Ubuntu 24.04）的外部管理包限制
+    pip3 install -U DrissionPage --break-system-packages || pip3 install -U DrissionPage
 
-# =============================
-# 2. 杀掉进程
-# =============================
-echo -e "${YELLOW}[2/6] 清理运行进程...${RESET}"
+    echo -e "${GREEN}▶ 正在安装 Chromium 浏览器...${RESET}"
+    apt install -y chromium-browser || apt install -y chromium
 
-pkill -f cloudflared 2>/dev/null
+    echo -e "${GREEN}▶ 正在安装必要的底层依赖库 (防止报错)...${RESET}"
+    
+    # 基础依赖列表
+    deps="libnss3 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 \
+          libxcomposite1 libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 \
+          libcairo2 libxshmfence1 libglu1-mesa fonts-liberation libnss3-dev xvfb"
 
-# =============================
-# 3. 删除二进制
-# =============================
-echo -e "${YELLOW}[3/6] 删除程序文件...${RESET}"
+    # 执行安装
+    apt install -y $deps
 
-rm -f /usr/bin/cloudflared
-rm -f /usr/local/bin/cloudflared
-rm -f /bin/cloudflared
+    # 针对 libasound2 的特殊兼容性处理
+    echo -e "${YELLOW}▶ 正在处理音频依赖兼容性...${RESET}"
+    apt install -y libasound2 || apt install -y libasound2t64
 
-# =============================
-# 4. 删除配置 / 证书 / 隧道数据
-# =============================
-echo -e "${YELLOW}[4/6] 清理配置与隧道数据...${RESET}"
+    # 针对 libatk1.0-0 的特殊兼容性处理
+    apt install -y libatk1.0-0 || apt install -y libatk1.0-0t64
+    
+    echo -e "${GREEN}✔ 依赖库安装尝试完成${RESET}"
 
-rm -rf /etc/cloudflared
-rm -rf /opt/cloudflared
-rm -rf /var/lib/cloudflared
-rm -rf ~/.cloudflared
+    echo -e "${GREEN}✔ 安装环境配置完成！${RESET}"
+}
 
-# 常见隧道凭证
-rm -f ~/.cloudflared/*.json
-rm -f /etc/cloudflared/*.json
-rm -f /etc/cloudflared/*.yml
-rm -f /etc/cloudflared/*.yaml
+test_dp() {
+    echo -e "${YELLOW}▶ 正在启动自动化测试...${RESET}"
 
-# tunnel token / cert
-rm -f ~/.cloudflared/cert.pem
-rm -f ~/.cloudflared/credentials.json
+    # 创建测试脚本
+    cat > /tmp/test_dp.py <<EOF
+from DrissionPage import ChromiumPage, ChromiumOptions
+import os
+import sys
 
-# =============================
-# 5. 清理环境变量
-# =============================
-echo -e "${YELLOW}[5/6] 清理环境变量...${RESET}"
+try:
+    co = ChromiumOptions()
+    co.headless(True)  # VPS 必须开启无头模式
+    co.set_argument('--no-sandbox')  # root 用户必须开启
+    co.set_argument('--disable-dev-shm-usage')
+    co.set_argument('--disable-gpu')
 
-sed -i '/cloudflared/d' ~/.bashrc 2>/dev/null
-sed -i '/cloudflared/d' ~/.profile 2>/dev/null
-sed -i '/cloudflared/d' /etc/profile 2>/dev/null
+    # 尝试自动定位 Chromium 路径
+    paths = ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome']
+    for p in paths:
+        if os.path.exists(p):
+            co.set_browser_path(p)
+            break
 
-# =============================
-# 6. Docker 清理（重点）
-# =============================
-echo -e "${YELLOW}[6/6] 清理 Docker Cloudflare Tunnel...${RESET}"
+    print(f"正在启动浏览器...")
+    page = ChromiumPage(co)
+    page.get('https://www.baidu.com')
+    
+    title = page.title
+    print(f"成功获取页面标题: {title}")
+    
+    if "百度" in title:
+        print("测试结果: 成功")
+    else:
+        print("测试结果: 异常 (获取到的标题不正确)")
+    
+    page.quit()
+except Exception as e:
+    print(f"测试过程中出现错误: {e}")
+    sys.exit(1)
+EOF
 
-if command -v docker &>/dev/null; then
+    python3 /tmp/test_dp.py --break-system-packages 2>/dev/null || python3 /tmp/test_dp.py
+    
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✔ DrissionPage 测试通过！${RESET}"
+    else
+        echo -e "${RED}✘ 测试失败，请检查上方报错信息${RESET}"
+    fi
+}
 
-    echo -e "${YELLOW}检查 cloudflared 容器...${RESET}"
-    docker ps -a --format '{{.ID}} {{.Names}}' | grep -Ei "cloudflared|tunnel" | awk '{print $1}' | xargs -r docker stop 2>/dev/null
-    docker ps -a --format '{{.ID}} {{.Names}}' | grep -Ei "cloudflared|tunnel" | awk '{print $1}' | xargs -r docker rm -f 2>/dev/null
+uninstall_dp() {
+    echo -e "${YELLOW}▶ 正在卸载 $APP_NAME 及相关组件...${RESET}"
 
-    echo -e "${YELLOW}检查 cloudflared 镜像...${RESET}"
-    docker images --format '{{.Repository}} {{.ID}}' | grep -Ei "cloudflared|cloudflare" | awk '{print $2}' | xargs -r docker rmi -f 2>/dev/null
+    # 1. 强制杀死所有相关进程（防止文件占用导致卸载失败）
+    echo -e "${GREEN}▶ 停止所有运行中的 Chromium 进程...${RESET}"
+    pkill -9 -f chromium 2>/dev/null
+    pkill -9 -f DrissionPage 2>/dev/null
 
-    echo -e "${YELLOW}检查 tunnel volume...${RESET}"
-    docker volume ls --format '{{.Name}}' | grep -Ei "cloudflared|tunnel" | xargs -r docker volume rm 2>/dev/null
+    # 2. 卸载 Python 库（包含依赖包）
+    echo -e "${GREEN}▶ 正在卸载 Python 库...${RESET}"
+    pip3 uninstall -y DrissionPage DownloadKit DataRecorder --break-system-packages 2>/dev/null || \
+    pip3 uninstall -y DrissionPage DownloadKit DataRecorder 2>/dev/null
 
-    echo -e "${GREEN}Docker tunnel 清理完成${RESET}"
+    # 3. 卸载 APT 版本的 Chromium
+    echo -e "${GREEN}▶ 正在清理 APT 软件包...${RESET}"
+    apt purge -y chromium-browser chromium chromium-common 2>/dev/null
+    apt autoremove -y
 
-else
-    echo -e "${YELLOW}未检测到 Docker，跳过${RESET}"
-fi
+    # 4. 彻底清理 Snap 版本的 Chromium (Ubuntu 默认安装方式)
+    if command -v snap >/dev/null; then
+        echo -e "${GREEN}▶ 正在清理 Snap 软件包...${RESET}"
+        snap remove --purge chromium 2>/dev/null
+    fi
 
-# =============================
-# 最终检测
-# =============================
-echo -e "${YELLOW}检查残留状态...${RESET}"
+    # 5. 清理残留的配置文件夹和缓存
+    echo -e "${GREEN}▶ 正在清理残留配置和临时文件...${RESET}"
+    rm -rf /usr/bin/chromium
+    rm -rf /usr/bin/chromium-browser
+    rm -rf ~/.config/chromium
+    rm -rf ~/.cache/chromium
+    rm -rf /tmp/.com.google.Chrome.*
+    rm -rf /tmp/test_dp.py
 
-cf_proc=$(ps -ef | grep -Ei "cloudflared" | grep -v grep)
+    echo -e "${GREEN}✔ 卸载及深度清理完成！${RESET}"
+}
 
-if [[ -n "$cf_proc" ]]; then
-    echo -e "${RED}仍有进程残留:${RESET}"
-    echo "$cf_proc"
-else
-    echo -e "${GREEN}无 cloudflared 进程残留${RESET}"
-fi
+menu() {
+    clear
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    DrissionPage 部署管理    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装部署${RESET}"
+    echo -e "${GREEN}2. 运行环境测试${RESET}"
+    echo -e "${GREEN}3. 卸载${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    read -r -p $'\033[32m请输入选项: \033[0m' choice
 
-echo -e "${GREEN}========================================${RESET}"
-echo -e "${GREEN}   Cloudflare Tunnel 已彻底卸载完成${RESET}"
-echo -e "${GREEN}========================================${RESET}"
+    case $choice in
+        1) install_dp ;;
+        2) test_dp ;;
+        3) uninstall_dp ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
+    esac
+}
+
+# 脚本入口
+check_root
+
+while true; do
+    menu
+    echo
+    read -p "按回车继续..." confirm
+    clear
+done

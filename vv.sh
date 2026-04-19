@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# DrissionPage VPS 专用全自动安装脚本
+# DrissionPage 安装管理
 # ========================================
 
 GREEN="\033[32m"
@@ -140,6 +140,7 @@ uninstall_dp() {
 }
 
 menu() {
+    clear
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}    DrissionPage 部署管理    ${RESET}"
     echo -e "${GREEN}================================${RESET}"

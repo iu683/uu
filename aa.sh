@@ -1,101 +1,190 @@
 cat << 'EOF' > tools.sh
 #!/bin/bash
 
-# 定义颜色与格式
-BIWhite='\033[1;97m'
-BIRed='\033[1;91m'
-BIGreen='\033[1;92m'
-BIBlue='\033[1;94m'
-BIYellow='\033[1;93m'
-BIPurple='\033[1;95m'
-Cyan='\033[0;36m'
-Plain='\033[0m'
+# 颜色定义
+BGreen='\033[1;32m'
+BRed='\033[1;31m'
+BYellow='\033[1;33m'
+BBlue='\033[1;34m'
+BPurple='\033[1;35m'
+BCyan='\033[1;36m'
+White='\033[1;37m'
+NC='\033[0m'
 
-# 获取系统简单信息
-get_sys_info() {
-    IP=$(curl -s https://ipapi.co/ip)
+# 获取实时系统状态
+get_sys_status() {
+    MEM_TOTAL=$(free -m | awk '/Mem:/ {print $2}')
+    MEM_USED=$(free -m | awk '/Mem:/ {print $3}')
+    MEM_PCT=$((MEM_USED * 100 / MEM_TOTAL))
+    DISK_TOTAL=$(df -h / | awk '/\// {print $2}' | tail -n 1)
+    DISK_USED=$(df -h / | awk '/\// {print $3}' | tail -n 1)
+    DISK_PCT=$(df -h / | awk '/\// {print $5}' | tail -n 1)
+    CPU_PCT=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1"%"}')
+    OS=$(grep -w "PRETTY_NAME" /etc/os-release | cut -d '"' -f2)
+    UPTIME=$(uptime -p | sed 's/up //')
     ARCH=$(uname -m)
-    OS=$(hostnamectl | grep "Operating System" | cut -d ' ' -f3-)
 }
 
-# 绘制分割线
-draw_line() {
-    echo -e "${BIBlue}---------------------------------------------------------${Plain}"
-}
-
-show_menu() {
-    get_sys_info
+# 顶部看板
+draw_banner() {
     clear
-    echo -e "${BIPurple}┌───────────────────────────────────────────────────────┐${Plain}"
-    echo -e "${BIPurple}│${Plain}                ${BIWhite}🚀 VPS 交互式管理工具箱${Plain}               ${BIPurple}│${Plain}"
-    echo -e "${BIPurple}└───────────────────────────────────────────────────────┘${Plain}"
-    echo -e "${Cyan} 系统架构: ${BIWhite}$ARCH${Plain}  | ${Cyan}操作系统: ${BIWhite}$OS${Plain}"
-    echo -e "${Cyan} 公网地址: ${BIYellow}$IP${Plain}"
-    draw_line
+    echo -e "${BCyan}"
+    echo "  __     ______  _____   _______ ____   ____  _      "
+    echo "  \ \   / /  _ \|  __ \ /|__   __/ __ \ / __ \| |     "
+    echo "   \ \_/ /| |_) | |__) |    | | | |  | | |  | | |     "
+    echo "    \   / |  __/|  _  /     | | | |  | | |  | | |     "
+    echo "     | |  | |   | | \ \     | | | |__| | |__| | |____ "
+    echo "     |_|  |_|   |_|  \_\    |_|  \____/ \____/|______|"
+    echo -e "    ${BYellow}>> VPS 综合管理工具箱 <<${NC}"
     
-    echo -e "  ${BIGreen}1.${Plain} 更新系统        ${BIGreen}2.${Plain} 系统信息查询    ${BIGreen}3.${Plain} 系统清理"
-    echo -e "  ${BIGreen}4.${Plain} 修改主机名      ${BIGreen}5.${Plain} 修改Root密码    ${BIGreen}6.${Plain} 修改SSH端口"
-    echo -e "  ${BIGreen}7.${Plain} 开启BBR加速     ${BIGreen}8.${Plain} 设置SWAP内存    ${BIGreen}9.${Plain} 重装/重启"
-    
-    echo -e "${BIBlue} [ 网络与安全 ]${Plain}"
-    echo -e "  ${BIYellow}10.${Plain} 切换v4/v6      ${BIYellow}11.${Plain} 开放所有端口    ${BIYellow}12.${Plain} DNS 设置"
-    echo -e "  ${BIYellow}13.${Plain} 配置SSH密钥    ${BIYellow}14.${Plain} Fail2Ban防刷    ${BIYellow}15.${Plain} CF WARP"
-    echo -e "  ${BIYellow}16.${Plain} EasyTier组网   ${BIYellow}17.${Plain} Akile DNS"
-    
-    echo -e "${BIBlue} [ 测试与监控 ]${Plain}"
-    echo -e "  ${BIWhite}18.${Plain} 流媒体解锁      ${BIWhite}19.${Plain} 回程线路测试    ${BIWhite}20.${Plain} 节点测速"
-    echo -e "  ${BIWhite}21.${Plain} 卸载探针        ${BIWhite}22.${Plain} 关闭V1指令执行"
-    
-    echo -e "${BIBlue} [ 代理与转发 ]${Plain}"
-    echo -e "  ${BIPurple}23.${Plain} 3x-ui 面板     ${BIPurple}24.${Plain} Realm 转发      ${BIPurple}25.${Plain} 流量狗"
-    echo -e "  ${BIPurple}26.${Plain} VLESS AIO       ${BIPurple}27.${Plain} SS-Xray-2go     ${BIPurple}28.${Plain} Emby反代"
-    echo -e "  ${BIPurple}29.${Plain} DDNS 脚本"
-    
-    draw_line
-    echo -e "  ${BIRed}0.${Plain} 退出脚本"
+    get_sys_status
+    echo -e "${BCyan}┌──────────────────────────────────────────────────────┐${NC}"
+    echo -e " 系统状态：${BGreen}正常${NC}                                     ${BCyan}│${NC}"
+    printf " 内存占用：%-38s \n" "${MEM_USED}M / ${MEM_TOTAL}M (${MEM_PCT}%)"
+    printf " 磁盘占用：%-38s \n" "${DISK_USED} / ${DISK_TOTAL} (${DISK_PCT})"
+    printf " CPU 使用：%-38s \n" "${CPU_PCT}"
+    echo -e "${BCyan}└──────────────────────────────────────────────────────┘${NC}"
+    echo -e " 💻 系统 : ${White}$OS${NC} (${ARCH})"
+    echo -e " 🚀 在线 : ${White}$UPTIME${NC}"
+    echo -e "${BCyan}────────────────────────────────────────────────────────${NC}"
+}
+
+# 一级主菜单 - 纯文字版
+main_menu() {
+    draw_banner
+    echo -e " ${BBlue}功能分类${NC}"
+    echo ""
+    echo -e "  ${BYellow}1. 系统维护${NC}"
+    echo -e "  ${BYellow}2. 网络安全${NC}"
+    echo -e "  ${BYellow}3. 测试监控${NC}"
+    echo -e "  ${BYellow}4. 应用转发${NC}"
+    echo ""
+    echo -e "${BCyan}────────────────────────────────────────────────────────${NC}"
+    echo -e "  ${BRed}0. 退出${NC}"
     echo ""
 }
 
+# 二级菜单 - 单列竖排
+menu_system() {
+    while true; do
+        draw_banner
+        echo -e " ${BGreen}系统维护${NC}"
+        echo -e "  1. 更新系统"
+        echo -e "  2. 系统信息查询"
+        echo -e "  3. 系统清理"
+        echo -e "  4. 修改主机名"
+        echo -e "  5. 修改Root密码"
+        echo -e "  6. 修改SSH端口"
+        echo -e "  7. 设置SWAP内存"
+        echo -e "  8. 系统重启"
+        echo -e "  9. 重装系统(DD)"
+        echo -e "\n  ${BRed}0. 返回主菜单${NC}"
+        read -p " 请输入选择: " sub
+        case "$sub" in
+            1) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/vpsup.sh) ;;
+            2) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/vpsx.sh) ;;
+            3) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/vpsq.sh) ;;
+            4) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/hostname.sh) ;;
+            5) sudo passwd root ;;
+            6) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/vpssshdk.sh) ;;
+            7) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/vpsswap.sh) ;;
+            8) sudo reboot ;;
+            9) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/VPSDD.sh) ;;
+            0) break ;;
+        esac
+    done
+}
+
+menu_network() {
+    while true; do
+        draw_banner
+        echo -e " ${BYellow}网络安全${NC}"
+        echo -e "  1. 开启BBR加速"
+        echo -e "  2. 切换v4/v6优先级"
+        echo -e "  3. 开放所有端口"
+        echo -e "  4. DNS 设置"
+        echo -e "  5. AkileDNS"
+        echo -e "  6. SSH密钥登录"
+        echo -e "  7. Fail2Ban防刷"
+        echo -e "  8. CF WARP"
+        echo -e "  9. EasyTier组网"
+        echo -e "\n  ${BRed}0. 返回主菜单${NC}"
+        read -p " 请输入选择: " sub
+        case "$sub" in
+            1) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/BBR.sh) ;;
+            2) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/qhwl.sh) ;;
+            3) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/opendk.sh) ;;
+            4) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/DNS.sh) ;;
+            5) wget -qO- https://raw.githubusercontent.com/akile-network/aktools/refs/heads/main/akdns.sh | bash ;;
+            6) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/sshkey.sh) ;;
+            7) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/Fail2Ban.sh) ;;
+            8) wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh ;;
+            9) bash <(curl -sL https://raw.githubusercontent.com/ceocok/c.cococ/refs/heads/main/easytier.sh) ;;
+            0) break ;;
+        esac
+    done
+}
+
+menu_test() {
+    while true; do
+        draw_banner
+        echo -e " ${BCyan}测试监控${NC}"
+        echo -e "  1. 流媒体解锁测试"
+        echo -e "  2. 回程线路测试"
+        echo -e "  3. 节点质量测速"
+        echo -e "  4. 卸载哪吒探针"
+        echo -e "  5. 关闭哪吒V1指令执行"
+        echo -e "\n  ${BRed}0. 返回主菜单${NC}"
+        read -p " 请输入选择: " sub
+        case "$sub" in
+            1) bash <(curl -L -s https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh) ;;
+            2) curl https://raw.githubusercontent.com/ludashi2020/backtrace/main/install.sh -sSf | sh ;;
+            3) bash <(curl -sL https://run.NodeQuality.com) ;;
+            4) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/agent.sh) ;;
+            5) sed -i 's/disable_command_execute: false/disable_command_execute: true/' /opt/nezha/agent/config.yml && systemctl restart nezha-agent ;;
+            0) break ;;
+        esac
+    done
+}
+
+menu_app() {
+    while true; do
+        draw_banner
+        echo -e " ${BPurple}应用转发${NC}"
+        echo -e "  1. 3x-ui 面板"
+        echo -e "  2. Realm 转发"
+        echo -e "  3. 流量监控狗"
+        echo -e "  4. vless-all-in-one"
+        echo -e "  5. SS-Xray-2go"
+        echo -e "  6. Emby反代配置"
+        echo -e "  7. DDNS 脚本"
+        echo -e "\n  ${BRed}0. 返回主菜单${NC}"
+        read -p " 请输入选择: " sub
+        case "$sub" in
+            1) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/3xui.sh) ;;
+            2) wget -qO- https://raw.githubusercontent.com/zywe03/realm-xwPF/main/xwPF.sh | sudo bash -s install ;;
+            3) wget -O port-traffic-dog.sh https://raw.githubusercontent.com/zywe03/realm-xwPF/main/port-traffic-dog.sh && chmod +x port-traffic-dog.sh && ./port-traffic-dog.sh ;;
+            4) wget -O vless-server.sh https://raw.githubusercontent.com/Zyx0rx/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh ;;
+            5) bash <(curl -Ls https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh) ;;
+            6) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/Embyfd.sh) ;;
+            7) bash <(wget -qO- https://raw.githubusercontent.com/mocchen/cssmeihua/mochen/shell/ddns.sh) ;;
+            0) break ;;
+        esac
+    done
+}
+
+# --- 程序入口 ---
 while true; do
-    show_menu
-    echo -n -e "${BIWhite}请输入指令 [0-29]: ${Plain}"
-    read num
-    case "$num" in
-        1) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/vpsup.sh) ;;
-        2) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/vpsx.sh) ;;
-        3) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/vpsq.sh) ;;
-        4) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/hostname.sh) ;;
-        5) sudo passwd root ;;
-        6) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/vpssshdk.sh) ;;
-        7) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/BBR.sh) ;;
-        8) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/vpsswap.sh) ;;
-        9) echo -e "${BIRed}1. 重启  2. 重装系统 (DD)${Plain}"
-           read -p "选择: " sub; [[ $sub == 1 ]] && sudo reboot || bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/VPSDD.sh) ;;
-        10) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/qhwl.sh) ;;
-        11) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/opendk.sh) ;;
-        12) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/DNS.sh) ;;
-        13) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/sshkey.sh) ;;
-        14) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/Fail2Ban.sh) ;;
-        15) wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh ;;
-        16) bash <(curl -sL https://raw.githubusercontent.com/ceocok/c.cococ/refs/heads/main/easytier.sh) ;;
-        17) wget -qO- https://raw.githubusercontent.com/akile-network/aktools/refs/heads/main/akdns.sh | bash ;;
-        18) bash <(curl -L -s https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh) ;;
-        19) curl https://raw.githubusercontent.com/ludashi2020/backtrace/main/install.sh -sSf | sh ;;
-        20) bash <(curl -sL https://run.NodeQuality.com) ;;
-        21) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/agent.sh) ;;
-        22) sed -i 's/disable_command_execute: false/disable_command_execute: true/' /opt/nezha/agent/config.yml && systemctl restart nezha-agent ;;
-        23) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/3xui.sh) ;;
-        24) wget -qO- https://raw.githubusercontent.com/zywe03/realm-xwPF/main/xwPF.sh | sudo bash -s install ;;
-        25) wget -O port-traffic-dog.sh https://raw.githubusercontent.com/zywe03/realm-xwPF/main/port-traffic-dog.sh && chmod +x port-traffic-dog.sh && ./port-traffic-dog.sh ;;
-        26) wget -O vless-server.sh https://raw.githubusercontent.com/Zyx0rx/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh ;;
-        27) bash <(curl -Ls https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh) ;;
-        28) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/Embyfd.sh) ;;
-        29) bash <(wget -qO- https://raw.githubusercontent.com/mocchen/cssmeihua/mochen/shell/ddns.sh) ;;
-        0) echo -e "${BIGreen}下次再见！${Plain}"; exit 0 ;;
-        *) echo -e "${BIRed}无效输入，请重新选择${Plain}" ;;
+    main_menu
+    read -p " 请输入分类编号 [0-4]: " choice
+    case "$choice" in
+        1) menu_system ;;
+        2) menu_network ;;
+        3) menu_test ;;
+        4) menu_app ;;
+        0) exit 0 ;;
+        *) echo -e "${BRed}无效输入${NC}" && sleep 1 ;;
     esac
-    echo -e "${BIYellow}任务执行完毕。${Plain}"
-    read -p "按回车键返回主菜单..."
 done
 EOF
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# DrissionPage VPS 专用全自动安装脚本
+# DrissionPage 安装管理
 # ========================================
 
 GREEN="\033[32m"
@@ -32,10 +32,23 @@ install_dp() {
     apt install -y chromium-browser || apt install -y chromium
 
     echo -e "${GREEN}▶ 正在安装必要的底层依赖库 (防止报错)...${RESET}"
-    apt install -y libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
-        libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libgbm1 \
-        libasound2 libpango-1.0-0 libcairo2 libxshmfence1 libglu1-mesa \
-        fonts-liberation libnss3-dev xvfb
+    
+    # 基础依赖列表
+    deps="libnss3 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 \
+          libxcomposite1 libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 \
+          libcairo2 libxshmfence1 libglu1-mesa fonts-liberation libnss3-dev xvfb"
+
+    # 执行安装
+    apt install -y $deps
+
+    # 针对 libasound2 的特殊兼容性处理
+    echo -e "${YELLOW}▶ 正在处理音频依赖兼容性...${RESET}"
+    apt install -y libasound2 || apt install -y libasound2t64
+
+    # 针对 libatk1.0-0 的特殊兼容性处理
+    apt install -y libatk1.0-0 || apt install -y libatk1.0-0t64
+    
+    echo -e "${GREEN}✔ 依赖库安装尝试完成${RESET}"
 
     echo -e "${GREEN}✔ 安装环境配置完成！${RESET}"
 }
@@ -91,24 +104,51 @@ EOF
 }
 
 uninstall_dp() {
-    echo -e "${YELLOW}▶ 正在卸载 $APP_NAME...${RESET}"
-    pip3 uninstall -y DrissionPage || true
-    echo -e "${GREEN}▶ 正在删除 Chromium...${RESET}"
-    apt remove -y chromium-browser chromium || true
+    echo -e "${YELLOW}▶ 正在卸载 $APP_NAME 及相关组件...${RESET}"
+
+    # 1. 强制杀死所有相关进程（防止文件占用导致卸载失败）
+    echo -e "${GREEN}▶ 停止所有运行中的 Chromium 进程...${RESET}"
+    pkill -9 -f chromium 2>/dev/null
+    pkill -9 -f DrissionPage 2>/dev/null
+
+    # 2. 卸载 Python 库（包含依赖包）
+    echo -e "${GREEN}▶ 正在卸载 Python 库...${RESET}"
+    pip3 uninstall -y DrissionPage DownloadKit DataRecorder --break-system-packages 2>/dev/null || \
+    pip3 uninstall -y DrissionPage DownloadKit DataRecorder 2>/dev/null
+
+    # 3. 卸载 APT 版本的 Chromium
+    echo -e "${GREEN}▶ 正在清理 APT 软件包...${RESET}"
+    apt purge -y chromium-browser chromium chromium-common 2>/dev/null
     apt autoremove -y
-    echo -e "${GREEN}✔ 卸载完成${RESET}"
+
+    # 4. 彻底清理 Snap 版本的 Chromium (Ubuntu 默认安装方式)
+    if command -v snap >/dev/null; then
+        echo -e "${GREEN}▶ 正在清理 Snap 软件包...${RESET}"
+        snap remove --purge chromium 2>/dev/null
+    fi
+
+    # 5. 清理残留的配置文件夹和缓存
+    echo -e "${GREEN}▶ 正在清理残留配置和临时文件...${RESET}"
+    rm -rf /usr/bin/chromium
+    rm -rf /usr/bin/chromium-browser
+    rm -rf ~/.config/chromium
+    rm -rf ~/.cache/chromium
+    rm -rf /tmp/.com.google.Chrome.*
+    rm -rf /tmp/test_dp.py
+
+    echo -e "${GREEN}✔ 卸载及深度清理完成！${RESET}"
 }
 
 menu() {
+    clear
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    DrissionPage VPS 部署管理    ${RESET}"
+    echo -e "${GREEN}    DrissionPage 部署管理    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "1. 一键安装 (含所有依赖)"
-    echo -e "2. 运行环境测试"
-    echo -e "3. 卸载 DrissionPage"
-    echo -e "0. 退出"
-    echo -e "${GREEN}================================${RESET}"
-    read -r -p "请输入选项: " choice
+    echo -e "${GREEN}1. 安装部署${RESET}"
+    echo -e "${GREEN}2. 运行环境测试${RESET}"
+    echo -e "${GREEN}3. 卸载${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    read -r -p $'\033[32m请输入选项: \033[0m' choice
 
     case $choice in
         1) install_dp ;;

@@ -21,60 +21,63 @@ get_sys_status() {
     DISK_PCT=$(df -h / | awk '/\// {print $5}' | tail -n 1)
     CPU_PCT=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1"%"}')
     OS=$(grep -w "PRETTY_NAME" /etc/os-release | cut -d '"' -f2)
-    UPTIME=$(uptime -p | sed 's/up //')
+    # 在线时间转中文
+    UPTIME=$(uptime -p | sed 's/up //g; s/ days/天/g; s/ day/天/g; s/ hours/小时/g; s/ hour/小时/g; s/ minutes/分钟/g; s/ minute/分钟/g')
     ARCH=$(uname -m)
 }
 
-# 顶部看板 (含彩色艺术字 Logo)
+# 顶部看板
 draw_banner() {
     clear
-    # 打印炫彩 Logo
     echo -e "${BCyan}"
-    echo "  __     ______  _____   _______ ____   ____  _      "
-    echo "  \ \   / /  _ \|  __ \ /|__   __/ __ \ / __ \| |     "
-    echo "   \ \_/ /| |_) | |__) |    | | | |  | | |  | | |     "
-    echo "    \   / |  __/|  _  /     | | | |  | | |  | | |     "
-    echo "     | |  | |   | | \ \     | | | |__| | |__| | |____ "
-    echo "     |_|  |_|   |_|  \_\    |_|  \____/ \____/|______|"
-    echo -e "                 ${BYellow}>> VPS 综合管理工具箱 <<${NC}"
+    echo " _______ ____   ____  _      "
+    echo "|__   __/ __ \ / __ \| |     "
+    echo "   | | | |  | | |  | | |     "
+    echo "   | | | |  | | |  | | |     "
+    echo "   | | | |__| | |__| | |____ "
+    echo "   |_|  \____/ \____/|______|"
+    echo -e "  ${BYellow}>> VPS 综合管理工具箱 <<${NC}"
     
     get_sys_status
-    echo -e "${BCyan}┌──────────────────────────────────────────────────────┐${NC}"
-    echo -e "${BCyan}│${NC}  系统状态：${BGreen}正常 ✔${NC}                                   ${BCyan}│${NC}"
-    echo -e "${BCyan}│${NC}  📊 内存：${MEM_USED}M/${MEM_TOTAL}M (${MEM_PCT}%)                          ${BCyan}│${NC}"
-    echo -e "${BCyan}│${NC}  💽 磁盘：${DISK_USED}/${DISK_TOTAL} (${DISK_PCT})                          ${BCyan}│${NC}"
-    echo -e "${BCyan}│${NC}  ⚙ CPU ：${CPU_PCT}                                       ${BCyan}│${NC}"
-    echo -e "${BCyan}└──────────────────────────────────────────────────────┘${NC}"
+    echo -e "${BCyan}┌───────────────────────────┐${NC}"
+    echo -e " 系统状态：${BGreen}正常${NC}"                                   
+    printf " 内存占用：%-38s \n" "${MEM_USED}M / ${MEM_TOTAL}M (${MEM_PCT}%)"
+    printf " 磁盘占用：%-38s \n" "${DISK_USED} / ${DISK_TOTAL} (${DISK_PCT})"
+    printf " CPU 使用：%-38s \n" "${CPU_PCT}"
+    echo -e "${BCyan}└───────────────────────────┘${NC}"
     echo -e " 💻 系统 : ${White}$OS${NC} (${ARCH})"
     echo -e " 🚀 在线 : ${White}$UPTIME${NC}"
-    echo -e "${BCyan}────────────────────────────────────────────────────────${NC}"
+    echo -e "${BCyan}────────────────────────────${NC}"
 }
 
-# 一级主菜单
+# 一级主菜单 - 纯文字版
 main_menu() {
     draw_banner
-    echo -e " ${BBlue}【 主菜单分类 】${NC}"
+    echo -e " ${BBlue}功能分类${NC}"
     echo ""
-    echo -e "  ${BGreen}1.${NC} 🛠  系统维护 (更新/清理/密码/端口/重启)"
-    echo -e "  ${BYellow}2.${NC} 🛡  网络安全 (BBR/WARP/Fail2Ban/密钥)"
-    echo -e "  ${BCyan}3.${NC} 🔍 测试监控 (解锁/测速/线路/探针)"
-    echo -e "  ${BPurple}4.${NC} 🚀 应用转发 (3x-ui/Realm/VLESS/Emby)"
+    echo -e "  ${BYellow}1. 系统维护${NC}"
+    echo -e "  ${BYellow}2. 网络安全${NC}"
+    echo -e "  ${BYellow}3. 测试监控${NC}"
+    echo -e "  ${BYellow}4. 应用转发${NC}"
     echo ""
-    echo -e "${BCyan}────────────────────────────────────────────────────────${NC}"
-    echo -e "  ${BRed}0.${NC} 退出脚本"
+    echo -e "${BCyan}────────────────────────────${NC}"
+    echo -e "  ${BRed}0. 退出${NC}"
     echo ""
 }
 
-# --- 二级菜单函数 ---
-
+# 二级菜单 - 单列竖排
 menu_system() {
     while true; do
         draw_banner
-        echo -e " ${BGreen}【 系统维护 】${NC}"
-        printf "  %-25s %-25s\n" "1. 更新系统" "2. 系统信息查询"
-        printf "  %-25s %-25s\n" "3. 系统清理" "4. 修改主机名"
-        printf "  %-25s %-25s\n" "5. 修改Root密码" "6. 修改SSH端口"
-        printf "  %-25s %-25s\n" "7. 设置SWAP内存" "8. 系统重启"
+        echo -e " ${BGreen}系统维护${NC}"
+        echo -e "  1. 更新系统"
+        echo -e "  2. 系统信息查询"
+        echo -e "  3. 系统清理"
+        echo -e "  4. 修改主机名"
+        echo -e "  5. 修改Root密码"
+        echo -e "  6. 修改SSH端口"
+        echo -e "  7. 设置SWAP内存"
+        echo -e "  8. 系统重启"
         echo -e "  9. 重装系统(DD)"
         echo -e "\n  ${BRed}0. 返回主菜单${NC}"
         read -p " 请输入选择: " sub
@@ -96,11 +99,15 @@ menu_system() {
 menu_network() {
     while true; do
         draw_banner
-        echo -e " ${BYellow}【 网络安全 】${NC}"
-        printf "  %-25s %-25s\n" "1. 开启BBR加速" "2. 切换v4/v6优先级"
-        printf "  %-25s %-25s\n" "3. 开放所有端口" "4. DNS 设置"
-        printf "  %-25s %-25s\n" "5. AkileDNS" "6. SSH密钥登录"
-        printf "  %-25s %-25s\n" "7. Fail2Ban防刷" "8. CF WARP"
+        echo -e " ${BYellow}网络安全${NC}"
+        echo -e "  1. 开启BBR加速"
+        echo -e "  2. 切换v4/v6优先级"
+        echo -e "  3. 开放所有端口"
+        echo -e "  4. DNS 设置"
+        echo -e "  5. AkileDNS"
+        echo -e "  6. SSH密钥登录"
+        echo -e "  7. Fail2Ban防刷"
+        echo -e "  8. CF WARP"
         echo -e "  9. EasyTier组网"
         echo -e "\n  ${BRed}0. 返回主菜单${NC}"
         read -p " 请输入选择: " sub
@@ -122,9 +129,11 @@ menu_network() {
 menu_test() {
     while true; do
         draw_banner
-        echo -e " ${BCyan}【 测试监控 】${NC}"
-        printf "  %-25s %-25s\n" "1. 流媒体解锁测试" "2. 回程线路测试"
-        printf "  %-25s %-25s\n" "3. 节点质量测速" "4. 卸载哪吒探针"
+        echo -e " ${BCyan}测试监控${NC}"
+        echo -e "  1. 流媒体解锁测试"
+        echo -e "  2. 回程线路测试"
+        echo -e "  3. 节点质量测速"
+        echo -e "  4. 卸载哪吒探针"
         echo -e "  5. 关闭哪吒V1指令执行"
         echo -e "\n  ${BRed}0. 返回主菜单${NC}"
         read -p " 请输入选择: " sub
@@ -142,10 +151,13 @@ menu_test() {
 menu_app() {
     while true; do
         draw_banner
-        echo -e " ${BPurple}【 应用转发 】${NC}"
-        printf "  %-25s %-25s\n" "1. 3x-ui 面板" "2. Realm 转发"
-        printf "  %-25s %-25s\n" "3. 流量监控狗" "4. vless-all-in-one"
-        printf "  %-25s %-25s\n" "5. SS-Xray-2go" "6. Emby反代配置"
+        echo -e " ${BPurple}应用转发${NC}"
+        echo -e "  1. 3x-ui 面板"
+        echo -e "  2. Realm 转发"
+        echo -e "  3. 流量监控狗"
+        echo -e "  4. vless-all-in-one"
+        echo -e "  5. SS-Xray-2go"
+        echo -e "  6. Emby反代配置"
         echo -e "  7. DDNS 脚本"
         echo -e "\n  ${BRed}0. 返回主菜单${NC}"
         read -p " 请输入选择: " sub

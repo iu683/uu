@@ -1,107 +1,141 @@
 #!/bin/bash
 # ========================================
-# GOST 彻底卸载脚本
-# 支持：systemd / docker / 手动安装 / 进程 / 配置 / 端口残留
+# FreeGFW 一键管理脚本
 # ========================================
 
-RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-echo -e "${RED}========================================${RESET}"
-echo -e "${RED}        GOST 彻底卸载${RESET}"
-echo -e "${RED}========================================${RESET}"
+APP_NAME="freegfw"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-# =============================
-# 1. 停止 systemd 服务
-# =============================
-echo -e "${YELLOW}[1/6] 停止 systemd 服务...${RESET}"
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
 
-systemctl stop gost 2>/dev/null
-systemctl disable gost 2>/dev/null
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
+    fi
+}
 
-systemctl stop gost@* 2>/dev/null
-systemctl disable gost@* 2>/dev/null
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
+}
 
-rm -f /etc/systemd/system/gost.service
-rm -f /etc/systemd/system/gost@*.service
-systemctl daemon-reload 2>/dev/null
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== FreeGFW 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-# =============================
-# 2. 杀掉进程
-# =============================
-echo -e "${YELLOW}[2/6] 清理运行进程...${RESET}"
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
 
-pkill -f gost 2>/dev/null
+install_app() {
 
-# =============================
-# 3. 删除二进制文件 & 配置
-# =============================
-echo -e "${YELLOW}[3/6] 删除程序文件...${RESET}"
+    check_docker
+    mkdir -p "$APP_DIR"
+    mkdir -p "$APP_DIR/data"
+    chmod -R 777 /opt/freegfw/data
 
-rm -f /usr/bin/gost
-rm -f /usr/local/bin/gost
-rm -f /bin/gost
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
 
-rm -rf /etc/gost
-rm -rf /opt/gost
-rm -rf /var/lib/gost
-rm -rf ~/.gost
+    echo -e "${YELLOW}正在创建数据卷...${RESET}"
+    docker volume create freegfw >/dev/null 2>&1
 
-rm -f /etc/gost.json
-rm -f /etc/gost.yaml
-rm -f /etc/gost.yml
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  freegfw:
+    image: ghcr.io/haradakashiwa/freegfw:latest
+    container_name: freegfw
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
 
-# =============================
-# 4. 清理启动脚本 / 环境变量
-# =============================
-echo -e "${YELLOW}[4/6] 清理环境残留...${RESET}"
+EOF
 
-sed -i '/gost/d' ~/.bashrc 2>/dev/null
-sed -i '/gost/d' ~/.profile 2>/dev/null
-sed -i '/gost/d' /etc/profile 2>/dev/null
+    cd "$APP_DIR" || exit
+    docker compose up -d
 
-# =============================
-# 5. Docker 清理（重点）
-# =============================
-echo -e "${YELLOW}[5/6] 清理 Docker GOST...${RESET}"
+    SERVER_IP=$(get_public_ip)
 
-if command -v docker &>/dev/null; then
+    echo
+    echo -e "${GREEN}✅ FreeGFW 已启动${RESET}"
+    echo -e "${YELLOW}✅ 访问地址: http://${SERVER_IP}:8080${RESET}"
+    echo -e "${GREEN}📁 数据目录: $APP_DIR${RESET}"
 
-    echo -e "${YELLOW}检查 gost 容器...${RESET}"
-    docker ps -a --format '{{.ID}} {{.Names}}' | grep -Ei "gost" | awk '{print $1}' | xargs -r docker stop 2>/dev/null
-    docker ps -a --format '{{.ID}} {{.Names}}' | grep -Ei "gost" | awk '{print $1}' | xargs -r docker rm -f 2>/dev/null
+    read -p "按回车返回菜单..."
+}
 
-    echo -e "${YELLOW}检查 gost 镜像...${RESET}"
-    docker images --format '{{.Repository}} {{.ID}}' | grep -Ei "gost" | awk '{print $2}' | xargs -r docker rmi -f 2>/dev/null
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
 
-    echo -e "${YELLOW}检查 gost volume...${RESET}"
-    docker volume ls --format '{{.Name}}' | grep -Ei "gost" | xargs -r docker volume rm 2>/dev/null
+restart_app() {
+    docker restart freegfw
+    echo -e "${GREEN}✅ 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
 
-    echo -e "${GREEN}Docker gost 清理完成${RESET}"
+view_logs() {
+    docker logs -f freegfw
+}
 
-else
-    echo -e "${YELLOW}未检测到 Docker，跳过${RESET}"
-fi
+check_status() {
+    docker ps | grep freegfw
+    read -p "按回车返回菜单..."
+}
 
-# =============================
-# 6. 检查残留
-# =============================
-echo -e "${YELLOW}[6/6] 检查残留状态...${RESET}"
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down
+    docker volume rm freegfw >/dev/null 2>&1
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ 已卸载（含数据）${RESET}"
+    read -p "按回车返回菜单..."
+}
 
-gost_proc=$(ps -ef | grep -Ei "gost" | grep -v grep)
-
-if [[ -n "$gost_proc" ]]; then
-    echo -e "${RED}仍有进程残留:${RESET}"
-    echo "$gost_proc"
-else
-    echo -e "${GREEN}无进程残留${RESET}"
-fi
-
-# 检查端口占用（常见代理端口）
-ss -lntp 2>/dev/null | grep -Ei "gost"
-
-echo -e "${GREEN}========================================${RESET}"
-echo -e "${GREEN}        GOST 已彻底卸载完成${RESET}"
-echo -e "${GREEN}========================================${RESET}"
+menu

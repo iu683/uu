@@ -1,97 +1,60 @@
-#!/bin/sh
-# ==========================================
-# 哪吒监控 & Komari Agent 全自动卸载工具
-# 支持系统: Alpine (OpenRC), Debian/Ubuntu/CentOS (Systemd)
-# ==========================================
-
-NZ_BASE_PATH="/opt/nezha"
-NZ_AGENT_PATH="${NZ_BASE_PATH}/agent"
-KOMARI_PATH="/opt/komari"
+#!/bin/bash
 
 # 颜色定义
-red='\033[0;31m'
-green='\033[0;32m'
-yellow='\033[0;33m'
-plain='\033[0m'
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+RESET="\033[0m"
 
-# 输出函数
-info() { printf "${yellow}[INFO] %s${plain}\n" "$*"; }
-err() { printf "${red}[ERROR] %s${plain}\n" "$*" >&2; }
-success() { printf "${green}[SUCCESS] %s${plain}\n" "$*"; }
+# 获取操作系统 ID
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS=$ID
+else
+    OS="unknown"
+fi
 
-# 权限检查
-sudo_exec() {
-    if [ "$(id -u)" -ne 0 ]; then
-        if command -v sudo > /dev/null 2>&1; then
-            sudo "$@"
-        else
-            err "错误: 需要root权限且未找到sudo"
-            exit 1
-        fi
+# --------------------------
+# Alpine 开启 BBR 逻辑
+# --------------------------
+enable_bbr_alpine() {
+    echo -e "${YELLOW}检测到系统为 Alpine Linux，正在尝试开启 BBR+FQ...${RESET}"
+
+    # 1. 加载内核模块
+    modprobe tcp_bbr
+    echo "tcp_bbr" >> /etc/modules
+
+    # 2. 写入 sysctl 配置
+    cat > /etc/sysctl.d/bbr.conf <<EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+
+    # 3. 立即生效
+    sysctl -p /etc/sysctl.d/bbr.conf
+
+    # 4. 验证
+    if sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then
+        echo -e "${GREEN}✅ Alpine BBR 已成功开启！${RESET}"
     else
-        "$@"
+        echo -e "${RED}❌ BBR 开启失败，请检查内核版本是否支持。${RESET}"
     fi
 }
 
-# --- 1. 卸载哪吒 Agent ---
-uninstall_nezha() {
-    if [ -d "$NZ_AGENT_PATH" ]; then
-        info "正在检测并停止 哪吒-agent 服务..."
-        config_files=$(find "$NZ_AGENT_PATH" -name "config*.yml" 2>/dev/null)
-        
-        if [ -n "$config_files" ]; then
-            for config in $config_files; do
-                sudo_exec "${NZ_AGENT_PATH}/nezha-agent" service -c "$config" uninstall >/dev/null 2>&1 || true
-            done
-        fi
-
-        info "清理哪吒文件..."
-        sudo_exec rm -rf "$NZ_AGENT_PATH"
-        # 如果父目录为空则清理
-        if [ -d "$NZ_BASE_PATH" ] && [ -z "$(ls -A "$NZ_BASE_PATH" 2>/dev/null)" ]; then
-            sudo_exec rm -rf "$NZ_BASE_PATH"
-        fi
-        success "哪吒-agent 卸载完成"
-    else
-        info "未发现哪吒安装目录，跳过"
-    fi
-}
-
-# --- 2. 卸载 Komari Agent ---
-uninstall_komari() {
-    info "开始检测并停止 Komari-agent..."
-
-    # Systemd 环境 (Debian/Ubuntu/CentOS)
-    if command -v systemctl >/dev/null 2>&1; then
-        if systemctl list-unit-files | grep -q "komari-agent"; then
-            sudo_exec systemctl stop komari-agent >/dev/null 2>&1 || true
-            sudo_exec systemctl disable komari-agent >/dev/null 2>&1 || true
-            sudo_exec rm -f /etc/systemd/system/komari-agent.service
-            sudo_exec systemctl daemon-reload
-            info "Systemd: Komari 服务已清理"
-        fi
-    fi
-
-    # OpenRC 环境 (Alpine)
-    if command -v rc-service >/dev/null 2>&1; then
-        if [ -f "/etc/init.d/komari-agent" ]; then
-            sudo_exec rc-service komari-agent stop >/dev/null 2>&1 || true
-            sudo_exec rc-update del komari-agent default >/dev/null 2>&1 || true
-            sudo_exec rm -f /etc/init.d/komari-agent
-            info "OpenRC: Komari 服务已清理"
-        fi
-    fi
-
-    # 清理残留文件
-    info "清理 Komari 文件残留..."
-    sudo_exec rm -rf "$KOMARI_PATH"
-    sudo_exec rm -rf "/var/log/komari"
-    
-    success "Komari-agent 卸载完成"
-}
-
-# --- 执行流程 ---
-echo -e "${yellow}--- 自动化清理程序启动 ---${plain}"
-uninstall_nezha
-uninstall_komari
-echo -e "${green}--- 所有组件已检测并尝试清理完毕 ---${plain}"
+# --------------------------
+# 主逻辑分流
+# --------------------------
+case "$OS" in
+    alpine)
+        enable_bbr_alpine
+        ;;
+    debian|ubuntu|centos|rocky|almalinux|fedora)
+        echo -e "${GREEN}检测到系统为 $OS，正在打开标准 BBR 配置脚本...${RESET}"
+        # 调用你提供的原 BBR 脚本
+        bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/BBRTCP.sh)
+        ;;
+    *)
+        echo -e "${RED}❌ 未能识别系统类型 ($OS)，尝试运行通用脚本...${RESET}"
+        bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/BBRTCP.sh)
+        ;;
+esac

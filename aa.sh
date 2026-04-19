@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# GithubStarsManager 管理
+# Fakabot 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,9 +8,9 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="github-stars-manager"
+APP_NAME="fakabot"
 APP_DIR="/opt/$APP_NAME"
-REPO_URL="https://github.com/AmintaCCCP/GithubStarsManager.git"
+REPO_URL="https://github.com/yanguo888/fakabot.git"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -24,17 +24,10 @@ check_docker() {
     fi
 }
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用！${RESET}"
-        return 1
-    fi
-}
-
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== GithubStarsManager 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Fakabot 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装部署${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -75,14 +68,36 @@ install_app() {
 
     cd "$APP_DIR" || exit
 
-    docker compose up -d --build
+    echo -e "${GREEN}=== 基础配置 ===${RESET}"
 
-    SERVER_IP=$(get_public_ip)
+    read -p "请输入 Telegram Bot Token: " BOT_TOKEN
+    read -p "请输入你的 Telegram ID: " ADMIN_ID
+    read -p "请输入域名(可留空): " DOMAIN
+
+    # 生成 config.json
+    cat > config.json <<EOF
+{
+  "BOT_TOKEN": "${BOT_TOKEN}",
+  "ADMIN_ID": ${ADMIN_ID},
+  "DOMAIN": "${DOMAIN}",
+  "ORDER_TIMEOUT_SECONDS": 3600,
+  "PAYMENTS": {},
+  "START": {
+    "cover_url": "",
+    "title": "欢迎使用",
+    "intro": "请在 config.json 中自定义内容"
+  },
+  "SHOW_QR": true,
+  "PRODUCTS": []
+}
+EOF
+
+    docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ 安装完成${RESET}"
-    echo -e "${YELLOW}🌐 前端: http://${SERVER_IP}:8080${RESET}"
-    echo -e "${YELLOW}🌐 后端: http://${SERVER_IP}:3000${RESET}"
+    echo -e "${GREEN}✅ Fakabot 已启动${RESET}"
+    echo -e "${YELLOW}👉 请先给机器人发送 /start${RESET}"
+    echo -e "${YELLOW}👉 配置文件: /opt/$APP_NAME/config.json${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -96,7 +111,7 @@ update_app() {
 }
 
 restart_app() {
-    docker restart github-stars-manager 2>/dev/null || docker compose restart
+    docker restart fakabot 2>/dev/null || docker compose restart
     echo -e "${GREEN}✅ 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
@@ -108,7 +123,7 @@ view_logs() {
 
 check_status() {
     echo -e "${YELLOW}=== 容器状态 ===${RESET}"
-    docker ps | grep stars
+    docker ps | grep fakabot
 
     read -p "按回车返回菜单..."
 }

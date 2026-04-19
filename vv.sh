@@ -1,163 +1,122 @@
 #!/bin/bash
-# ========================================
-# Emby-TG 管理
-# ========================================
+set -e
+export DEBIAN_FRONTEND=noninteractive
 
+# 颜色定义
+RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="emby-tg"
-APP_DIR="/opt/$APP_NAME"
-REPO_URL="https://github.com/sd87671067/Emby-TG-.git"
+# 检查 root 权限
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}❌ 请使用 root 用户运行此脚本${RESET}"
+    exit 1
+fi
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
+# 获取系统发行版信息
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS_ID="$ID"
+    OS_CODENAME="$VERSION_CODENAME"
+else
+    echo -e "${RED}❌ 无法检测系统发行版 (/etc/os-release 不存在)${RESET}"
+    exit 1
+fi
 
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2${RESET}"
-        exit 1
+# ==========================================
+# 分支 A: Alpine Linux (极简安装路径)
+# ==========================================
+if [ "$OS_ID" = "alpine" ]; then
+    echo -e "${YELLOW}🚀 检测到 Alpine Linux，执行极简初始化...${RESET}"
+    
+    # 仅安装用户指定的 8 核心包 + CA 证书(确保 curl 正常)
+    apk update && apk upgrade
+    apk add --no-cache bash curl wget vim tar sudo git gzip openssl ca-certificates
+    
+    echo -e "${GREEN}✅ Alpine 初始化完成！${RESET}"
+    echo -e "${YELLOW}当前时间: $(date +'%Y年%m月%d日 %H:%M:%S')${RESET}"
+    exit 0
+fi
+
+# ==========================================
+# 分支 B: Debian/Ubuntu/RHEL (全功能路径)
+# ==========================================
+
+# --- 辅助函数：修复 Docker 源 ---
+fix_docker_sources() {
+    local sources
+    sources=$(grep -rl "download.docker.com" /etc/apt/sources.list.d/ 2>/dev/null || true)
+    if [ -n "$sources" ]; then
+        for f in $sources; do
+            [[ "$f" == *"archive_uri"* ]] && rm -f "$f" && echo -e "${GREEN}✔ 已移除冲突源: $f${RESET}"
+        done
     fi
 }
 
-
-
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== Emby-TG 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装部署${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 状态检测${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
-install_app() {
-    check_docker
-
-    if [ -d "$APP_DIR" ]; then
-        echo -e "${YELLOW}检测到已安装，是否重新安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-        rm -rf "$APP_DIR"
-    fi
-
-    git clone "$REPO_URL" "$APP_DIR" || {
-        echo -e "${RED}克隆失败${RESET}"
-        return
-    }
-
-    cd "$APP_DIR" || exit
-
-    echo -e "${GREEN}=== 开始配置 ===${RESET}"
-
-    read -p "服务器IP或域名: " SERVER_IP
-    read -p "Emby地址 (默认:http://127.0.0.1:8096): " EMBY_URL
-    EMBY_URL=${EMBY_URL:-http://127.0.0.1:8096}
-
-    read -p "Emby API Key: " EMBY_KEY
-
-    read -p "管理员TG ID: " TG_ID
-    read -p "管理员机器人Token: " ADMIN_BOT
-    read -p "用户机器人Token: " CLIENT_BOT
-
-    read -p "TG用户名(@xxx): " TG_USER
-
-    MASTER_KEY=$(openssl rand -hex 16)
-
-    cat > .env <<EOF
-APP_NAME=Emby TG 管理中心
-APP_ENV=production
-APP_PORT=18080
-APP_BASE_URL=http://${SERVER_IP}:18080
-APP_TIMEZONE=Asia/Shanghai
-APP_MASTER_KEY=${MASTER_KEY}
-APP_WEB_ADMIN_USERNAME=admin
-APP_WEB_ADMIN_PASSWORD=Admin@123456
-
-EMBY_BASE_URL=${EMBY_URL}
-EMBY_API_KEY=${EMBY_KEY}
-EMBY_SERVER_PUBLIC_URL=http://${SERVER_IP}:8096
-EMBY_TEMPLATE_USER=testone
-
-ADMIN_BOT_TOKEN=${ADMIN_BOT}
-ADMIN_CHAT_IDS=${TG_ID}
-CLIENT_BOT_TOKEN=${CLIENT_BOT}
-
-ADMIN_CONTACT_TG_USERNAME=${TG_USER}
-ADMIN_CONTACT_TG_USER_ID=${TG_ID}
+# --- 辅助函数：开启 BBR ---
+enable_bbr() {
+    echo -e "${YELLOW}🚀 检查并配置 TCP BBR...${RESET}"
+    if modprobe tcp_bbr 2>/dev/null; then
+        mkdir -p /etc/modules-load.d
+        echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
+        cat >/etc/sysctl.d/99-bbr.conf <<EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
 EOF
-
-
-    docker compose up -d --build
-
-
-    echo
-    echo -e "${GREEN}✅ 安装完成${RESET}"
-
-    read -p "按回车返回菜单..."
+        sysctl --system >/dev/null
+        echo -e "${GREEN}✔ BBR 开启成功${RESET}"
+    else
+        echo -e "${RED}⚠️ 当前内核可能不支持 BBR，跳过配置${RESET}"
+    fi
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    git pull
-    docker compose up -d --build
-    echo -e "${GREEN}✅ 更新完成${RESET}"
-    read -p "按回车返回菜单..."
-}
+echo -e "${GREEN}🔄 开始系统更新和依赖安装...${RESET}"
 
-restart_app() {
-    docker restart emby-tg-app 2>/dev/null || docker compose restart
-    echo -e "${GREEN}✅ 已重启${RESET}"
-    read -p "按回车返回菜单..."
-}
+# 1. 包管理器处理
+if [[ "$OS_ID" =~ debian|ubuntu ]]; then
+    fix_docker_sources
+    # Debian 11/12 仓库组件适配
+    if [ "$OS_ID" = "debian" ]; then
+        files=$(grep -rl "deb" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true)
+        for f in $files; do
+            if [[ "$OS_CODENAME" == "bullseye" ]]; then
+                sed -i -r 's/\bnon-free(-firmware){0,3}\b/non-free/g' "$f"
+            elif [[ "$OS_CODENAME" == "bookworm" ]]; then
+                sed -i -r 's/\bnon-free non-free\b/non-free/g' "$f"
+            fi
+        done
+    fi
+    
+    apt update && apt upgrade -y
+    apt install -y curl wget git net-tools lsof tar unzip rsync pv sudo iperf3 mtr jq openssl \
+                   netcat-openbsd bind9-dnsutils cron systemd-timesyncd vim gzip bash
+    
+    # 时区与服务
+    timedatectl set-timezone Asia/Shanghai
+    timedatectl set-ntp true
+    systemctl enable --now cron systemd-timesyncd
 
-view_logs() {
-    cd "$APP_DIR" || return
-    docker compose logs -f
-}
+elif [[ "$OS_ID" =~ fedora|centos|rhel|rocky|almalinux ]]; then
+    yum upgrade -y || dnf upgrade -y
+    yum install -y curl wget git net-tools lsof tar unzip rsync pv sudo iperf3 mtr jq openssl \
+                   nc bind-utils cronie vim gzip bash || \
+    dnf install -y curl wget git net-tools lsof tar unzip rsync pv sudo iperf3 mtr jq openssl \
+                   nc bind-utils cronie vim gzip bash
+    
+    timedatectl set-timezone Asia/Shanghai
+    systemctl enable --now crond
+fi
 
-check_status() {
-    echo -e "${YELLOW}=== 容器状态 ===${RESET}"
-    docker ps | grep emby
+# 2. 安装 NextTrace
+if ! command -v nexttrace >/dev/null 2>&1; then
+    echo -e "${YELLOW}🌐 安装网络追踪工具 NextTrace...${RESET}"
+    curl -sL https://nxtrace.org/nt | bash
+fi
 
-    echo
-    echo -e "${YELLOW}=== 端口检测 ===${RESET}"
-    ss -tlnp | grep 18080 || echo "端口未监听"
+# 3. 启用 BBR
+enable_bbr
 
-    echo
-    echo -e "${YELLOW}=== Emby 连通性 ===${RESET}"
-    curl -s --max-time 5 "$EMBY_URL" >/dev/null && echo "Emby 可访问" || echo "Emby 访问失败"
-
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已彻底卸载${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-menu
+echo -e "---"
+echo -e "${GREEN}✅ 系统初始化完成！${RESET}"
+echo -e "${YELLOW}当前时间: $(date +'%Y年%m月%d日 %H:%M:%S')${RESET}"

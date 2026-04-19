@@ -1,103 +1,192 @@
+cat << 'EOF' > tools.sh
 #!/bin/bash
 
-# ========================================
 # 颜色定义
-# ========================================
-RED="\033[31m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+BGreen='\033[1;32m'
+BRed='\033[1;31m'
+BYellow='\033[1;33m'
+BBlue='\033[1;34m'
+BPurple='\033[1;35m'
+BCyan='\033[1;36m'
+White='\033[1;37m'
+NC='\033[0m'
 
-# Root 检查
-[ "$(id -u)" -ne 0 ] && echo -e "${RED}❌ 请使用 root 运行${RESET}" && exit 1
+# 获取实时系统状态
+get_sys_status() {
+    MEM_TOTAL=$(free -m | awk '/Mem:/ {print $2}')
+    MEM_USED=$(free -m | awk '/Mem:/ {print $3}')
+    MEM_PCT=$((MEM_USED * 100 / MEM_TOTAL))
+    DISK_TOTAL=$(df -h / | awk '/\// {print $2}' | tail -n 1)
+    DISK_USED=$(df -h / | awk '/\// {print $3}' | tail -n 1)
+    DISK_PCT=$(df -h / | awk '/\// {print $5}' | tail -n 1)
+    CPU_PCT=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1"%"}')
+    OS=$(grep -w "PRETTY_NAME" /etc/os-release | cut -d '"' -f2)
+    UPTIME=$(uptime -p | sed 's/up //')
+    ARCH=$(uname -m)
+}
 
-# 系统识别
-if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    OS_ID="$ID"
-else
-    OS_ID="unknown"
-fi
+# 顶部看板
+draw_banner() {
+    clear
+    echo -e "${BCyan}"
+    echo "  __     ______  _____   _______ ____   ____  _      "
+    echo "  \ \   / /  _ \|  __ \ /|__   __/ __ \ / __ \| |     "
+    echo "   \ \_/ /| |_) | |__) |    | | | |  | | |  | | |     "
+    echo "    \   / |  __/|  _  /     | | | |  | | |  | | |     "
+    echo "     | |  | |   | | \ \     | | | |__| | |__| | |____ "
+    echo "     |_|  |_|   |_|  \_\    |_|  \____/ \____/|______|"
+    echo -e "    ${BYellow}>> VPS 综合管理工具箱 <<${NC}"
+    
+    get_sys_status
+    echo -e "${BCyan}┌──────────────────────────────────────────────────────┐${NC}"
+    echo -e "${BCyan}│${NC} 系统状态：${BGreen}正常${NC}                                     ${BCyan}│${NC}"
+    printf "${BCyan}│${NC} 内存占用：%-38s ${BCyan}│${NC}\n" "${MEM_USED}M / ${MEM_TOTAL}M (${MEM_PCT}%)"
+    printf "${BCyan}│${NC} 磁盘占用：%-38s ${BCyan}│${NC}\n" "${DISK_USED} / ${DISK_TOTAL} (${DISK_PCT})"
+    printf "${BCyan}│${NC} CPU 使用：%-38s ${BCyan}│${NC}\n" "${CPU_PCT}"
+    echo -e "${BCyan}└──────────────────────────────────────────────────────┘${NC}"
+    echo -e " 💻 系统 : ${White}$OS${NC} (${ARCH})"
+    echo -e " 🚀 在线 : ${White}$UPTIME${NC}"
+    echo -e "${BCyan}────────────────────────────────────────────────────────${NC}"
+}
 
-echo -e "${GREEN}🚀 开始执行全能系统清理...${RESET}"
+# 一级主菜单 - 纯文字版
+main_menu() {
+    draw_banner
+    echo -e " ${BBlue}功能分类${NC}"
+    echo ""
+    echo -e "  ${BYellow}1. 系统维护 (更新/清理/重启)${NC}"
+    echo -e "  ${BYellow}2. 网络安全 (BBR/WARP/密钥)${NC}"
+    echo -e "  ${BYellow}3. 测试监控 (解锁/测速/探针)${NC}"
+    echo -e "  ${BYellow}4. 应用转发 (面板/转发/DDNS)${NC}"
+    echo ""
+    echo -e "${BCyan}────────────────────────────────────────────────────────${NC}"
+    echo -e "  ${BRed}0.${NC} 退出脚本"
+    echo ""
+}
 
-# ========================================
-# 1. 软件包管理器清理
-# ========================================
-echo -e "${YELLOW}📦 清理软件包缓存...${RESET}"
-case "$OS_ID" in
-    debian|ubuntu)
-        apt-get autoremove -y >/dev/null 2>&1
-        apt-get autoclean -y >/dev/null 2>&1
-        apt-get clean -y >/dev/null 2>&1
-        dpkg -l | grep "^rc" | awk '{print $2}' | xargs -r dpkg -P >/dev/null 2>&1
-        ;;
-    centos|rhel|rocky|almalinux|fedora)
-        yum autoremove -y >/dev/null 2>&1 || dnf autoremove -y >/dev/null 2>&1
-        yum clean all >/dev/null 2>&1 || dnf clean all >/dev/null 2>&1
-        ;;
-    alpine)
-        apk cache clean >/dev/null 2>&1
-        rm -rf /var/cache/apk/*
-        ;;
-esac
+# 二级菜单 - 单列竖排
+menu_system() {
+    while true; do
+        draw_banner
+        echo -e " ${BGreen}系统维护${NC}"
+        echo -e "  1. 更新系统"
+        echo -e "  2. 系统信息查询"
+        echo -e "  3. 系统清理"
+        echo -e "  4. 修改主机名"
+        echo -e "  5. 修改Root密码"
+        echo -e "  6. 修改SSH端口"
+        echo -e "  7. 设置SWAP内存"
+        echo -e "  8. 系统重启"
+        echo -e "  9. 重装系统(DD)"
+        echo -e "\n  ${BRed}0. 返回主菜单${NC}"
+        read -p " 请输入选择: " sub
+        case "$sub" in
+            1) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/vpsup.sh) ;;
+            2) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/vpsx.sh) ;;
+            3) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/vpsq.sh) ;;
+            4) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/hostname.sh) ;;
+            5) sudo passwd root ;;
+            6) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/vpssshdk.sh) ;;
+            7) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/vpsswap.sh) ;;
+            8) sudo reboot ;;
+            9) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/VPSDD.sh) ;;
+            0) break ;;
+        esac
+    done
+}
 
-# ========================================
-# 2. 日志文件清理
-# ========================================
-echo -e "${YELLOW}📜 清理系统日志...${RESET}"
-if command -v journalctl >/dev/null 2>&1; then
-    journalctl --vacuum-time=1d >/dev/null 2>&1
-    journalctl --vacuum-size=20M >/dev/null 2>&1
-fi
+menu_network() {
+    while true; do
+        draw_banner
+        echo -e " ${BYellow}网络安全${NC}"
+        echo -e "  1. 开启BBR加速"
+        echo -e "  2. 切换v4/v6优先级"
+        echo -e "  3. 开放所有端口"
+        echo -e "  4. DNS 设置"
+        echo -e "  5. AkileDNS"
+        echo -e "  6. SSH密钥登录"
+        echo -e "  7. Fail2Ban防刷"
+        echo -e "  8. CF WARP"
+        echo -e "  9. EasyTier组网"
+        echo -e "\n  ${BRed}0. 返回主菜单${NC}"
+        read -p " 请输入选择: " sub
+        case "$sub" in
+            1) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/BBR.sh) ;;
+            2) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/qhwl.sh) ;;
+            3) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/opendk.sh) ;;
+            4) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/DNS.sh) ;;
+            5) wget -qO- https://raw.githubusercontent.com/akile-network/aktools/refs/heads/main/akdns.sh | bash ;;
+            6) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/sshkey.sh) ;;
+            7) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/Fail2Ban.sh) ;;
+            8) wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh ;;
+            9) bash <(curl -sL https://raw.githubusercontent.com/ceocok/c.cococ/refs/heads/main/easytier.sh) ;;
+            0) break ;;
+        esac
+    done
+}
 
-find /var/log -type f -name "*.log" -exec truncate -s 0 {} +
-find /var/log -type f \( -name "*.gz" -o -name "*.1" -o -name "*.old" \) -delete
+menu_test() {
+    while true; do
+        draw_banner
+        echo -e " ${BCyan}测试监控${NC}"
+        echo -e "  1. 流媒体解锁测试"
+        echo -e "  2. 回程线路测试"
+        echo -e "  3. 节点质量测速"
+        echo -e "  4. 卸载哪吒探针"
+        echo -e "  5. 关闭哪吒V1指令执行"
+        echo -e "\n  ${BRed}0. 返回主菜单${NC}"
+        read -p " 请输入选择: " sub
+        case "$sub" in
+            1) bash <(curl -L -s https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh) ;;
+            2) curl https://raw.githubusercontent.com/ludashi2020/backtrace/main/install.sh -sSf | sh ;;
+            3) bash <(curl -sL https://run.NodeQuality.com) ;;
+            4) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/agent.sh) ;;
+            5) sed -i 's/disable_command_execute: false/disable_command_execute: true/' /opt/nezha/agent/config.yml && systemctl restart nezha-agent ;;
+            0) break ;;
+        esac
+    done
+}
 
-# ========================================
-# 3. Docker 清理
-# ========================================
-if command -v docker >/dev/null 2>&1; then
-    echo -e "${YELLOW}🐳 清理 Docker 冗余数据...${RESET}"
-    docker system prune -f >/dev/null 2>&1
-fi
+menu_app() {
+    while true; do
+        draw_banner
+        echo -e " ${BPurple}应用转发${NC}"
+        echo -e "  1. 3x-ui 面板"
+        echo -e "  2. Realm 转发"
+        echo -e "  3. 流量监控狗"
+        echo -e "  4. vless-all-in-one"
+        echo -e "  5. SS-Xray-2go"
+        echo -e "  6. Emby反代配置"
+        echo -e "  7. DDNS 脚本"
+        echo -e "\n  ${BRed}0. 返回主菜单${NC}"
+        read -p " 请输入选择: " sub
+        case "$sub" in
+            1) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/3xui.sh) ;;
+            2) wget -qO- https://raw.githubusercontent.com/zywe03/realm-xwPF/main/xwPF.sh | sudo bash -s install ;;
+            3) wget -O port-traffic-dog.sh https://raw.githubusercontent.com/zywe03/realm-xwPF/main/port-traffic-dog.sh && chmod +x port-traffic-dog.sh && ./port-traffic-dog.sh ;;
+            4) wget -O vless-server.sh https://raw.githubusercontent.com/Zyx0rx/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh ;;
+            5) bash <(curl -Ls https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh) ;;
+            6) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/Embyfd.sh) ;;
+            7) bash <(wget -qO- https://raw.githubusercontent.com/mocchen/cssmeihua/mochen/shell/ddns.sh) ;;
+            0) break ;;
+        esac
+    done
+}
 
-# ========================================
-# 4. 临时文件清理
-# ========================================
-echo -e "${YELLOW}🧹 清理临时文件...${RESET}"
-rm -rf /tmp/* 2>/dev/null || true
-rm -rf ~/.cache/* 2>/dev/null || true
-
-# ========================================
-# 5. 内存释放 (静默权限判定)
-# ========================================
-echo -e "${YELLOW}🧠 尝试释放页面缓存...${RESET}"
-sync
-# 检查是否有写入权限，如果有才执行，没有则直接提示
-if [ -w /proc/sys/vm/drop_caches ]; then
-    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null && echo -e "${GREEN}✔ 内存释放成功${RESET}"
-else
-    echo -e "${YELLOW}🧹 当前环境不支持手动释放缓存 (通常见于 LXC/Docker)，已跳过${RESET}"
-fi
-
-# ========================================
-# 总结输出 (通用 printf 对齐版)
-# ========================================
-echo -e "----------------------------------"
-echo -e "${GREEN}✅ 系统清理完成！${RESET}"
-echo -e "${YELLOW}当前磁盘使用率:${RESET}"
-
-# 定义对齐格式：每列占 12 或 10 个字符
-fmt="%-15s %-8s %-8s %-8s %-8s %-s\n"
-
-# 输出中文表头
-printf "$fmt" "文件系统" "容量" "已用" "可用" "已用%" "挂载点"
-
-# 获取 df 数据并格式化输出
-df -h / | sed '1d' | while read -r fs size used avail per mnt; do
-    printf "$fmt" "$fs" "$size" "$used" "$avail" "$per" "$mnt"
+# --- 程序入口 ---
+while true; do
+    main_menu
+    read -p " 请输入分类编号 [0-4]: " choice
+    case "$choice" in
+        1) menu_system ;;
+        2) menu_network ;;
+        3) menu_test ;;
+        4) menu_app ;;
+        0) exit 0 ;;
+        *) echo -e "${BRed}无效输入${NC}" && sleep 1 ;;
+    esac
 done
+EOF
 
-echo -e "----------------------------------"
-echo -e "${YELLOW}当前时间: $(date +'%Y年%m月%d日 %H:%M:%S')${RESET}"
+chmod +x tools.sh
+./tools.sh

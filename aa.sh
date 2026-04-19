@@ -87,5 +87,6 @@ fi
 echo -e "----------------------------------"
 echo -e "${GREEN}✅ 系统清理完成！${RESET}"
 echo -e "${YELLOW}当前磁盘使用率:${RESET}"
-df -h / | awk 'NR==1 || NR==2'
+# 使用 sed 替换表头，并保留数据
+df -h / | sed '1s/Filesystem/文件系统/; 1s/Size/容量/; 1s/Used/已用/; 1s/Avail/可用/; 1s/Use%/已用%/; 1s/Mounted on/挂载点/'
 echo -e "${YELLOW}当前时间: $(date +'%Y年%m月%d日 %H:%M:%S')${RESET}"

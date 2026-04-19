@@ -1,196 +1,145 @@
 #!/bin/bash
-set -e
+# DNS 管理工具（兼容 Alpine/Debian/Ubuntu/CentOS）
 
 GREEN="\033[32m"
 RED="\033[31m"
-RESET="\033[0m"
 YELLOW="\033[33m"
+RESET="\033[0m"
 
-# 识别系统和初始化管理器
-if [ -f /etc/alpine-release ]; then
-    OS="alpine"
-    INIT="openrc"
-elif [ -f /etc/debian_version ]; then
-    OS="debian"
-    INIT="systemd"
-elif [ -f /etc/redhat-release ]; then
-    OS="rhel"
-    INIT="systemd"
-else
-    OS="unknown"
-    INIT="unknown"
+RESOLV_FILE="/etc/resolv.conf"
+
+########################################
+# 环境初始化与系统检测
+########################################
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}请使用 root 权限运行此脚本${RESET}"
+    exit 1
 fi
 
-# 通用服务管理函数
-manage_service() {
-    local action=$1 # start, stop, restart, enable
-    local service="fail2ban"
+# 识别系统
+if [ -f /etc/alpine-release ]; then
+    OS="alpine"
+else
+    OS="linux"
+fi
 
-    if [ "$INIT" == "systemd" ]; then
-        case $action in
-            enable) systemctl enable --now $service ;;
-            *) systemctl $action $service ;;
-        esac
-    elif [ "$INIT" == "openrc" ]; then
-        case $action in
-            enable) rc-update add $service default && rc-service $service start ;;
-            start) rc-service $service start ;;
-            stop) rc-service $service stop ;;
-            restart) rc-service $service restart ;;
-        esac
+# Alpine 适配：安装 chattr 所需的依赖
+prepare_deps() {
+    if [[ "$OS" == "alpine" ]]; then
+        if ! command -v chattr >/dev/null 2>&1; then
+            echo -e "${YELLOW}正在为 Alpine 安装 e2fsprogs-extra (以支持 chattr)...${RESET}"
+            apk add --no-cache e2fsprogs-extra
+        fi
     fi
 }
 
-# 检查 Fail2Ban 是否运行
-check_fail2ban() {
-    local running=false
-    if [ "$INIT" == "systemd" ]; then
-        systemctl is-active --quiet fail2ban && running=true
-    elif [ "$INIT" == "openrc" ]; then
-        rc-service fail2ban status | grep -q "started" && running=true
+########################################
+# 停用解析服务
+########################################
+disable_resolved() {
+    # 只有在使用 systemd 的系统上才处理 systemd-resolved
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl list-unit-files | grep -q "systemd-resolved"; then
+            echo -e "${YELLOW}检测到 systemd-resolved，正在停用...${RESET}"
+            systemctl disable --now systemd-resolved 2>/dev/null
+        fi
     fi
-
-    if [ "$running" == false ]; then
-        echo -e "${YELLOW}Fail2Ban 未运行，正在尝试启动...${RESET}"
-        manage_service start || echo -e "${RED}启动失败，请检查是否已安装${RESET}"
-        sleep 1
+    
+    # 删除可能是符号链接的 resolv.conf（Alpine 默认通常是普通文件，但有些环境可能是软链）
+    if [ -L "$RESOLV_FILE" ]; then
+        rm -f "$RESOLV_FILE"
     fi
 }
 
-# 安装 Fail2Ban
-install_fail2ban() {
-    echo -e "${GREEN}正在安装 Fail2Ban...${RESET}"
-    case "$OS" in
-        alpine)
-            apk update
-            apk add fail2ban curl wget
-            # Alpine 需要手动创建日志文件，否则 fail2ban 可能启动失败
-            touch /var/log/fail2ban.log
-            ;;
-        debian)
-            apt update
-            apt install -y fail2ban curl wget
-            ;;
-        rhel)
-            yum install -y epel-release
-            yum install -y fail2ban curl wget
-            ;;
-        *)
-            echo -e "${RED}不支持的操作系统${RESET}"
-            exit 1
-            ;;
-    esac
-    manage_service enable
-    sleep 1
-}
+########################################
+# 设置 resolv.conf DNS
+########################################
+set_dns_resolvconf() {
+    DNS1=$1
+    DNS2=$2
 
-# 配置 SSH 防护
-configure_ssh() {
-    case "$OS" in
-        debian) LOG_PATH="/var/log/auth.log" ;;
-        rhel)   LOG_PATH="/var/log/secure" ;;
-        alpine) LOG_PATH="/var/log/messages" ;; # Alpine 默认日志位置
-    esac
+    prepare_deps
+    disable_resolved
 
-    read -p $'\033[32m请输入 SSH 端口（默认22）: \033[0m' SSH_PORT
-    SSH_PORT=${SSH_PORT:-22}
+    echo -e "${GREEN}正在设置 DNS: $DNS1 $DNS2${RESET}"
 
-    read -p $'\033[32m请输入最大失败尝试次数 maxretry（默认5）: \033[0m' MAX_RETRY
-    MAX_RETRY=${MAX_RETRY:-5}
-
-    read -p $'\033[32m请输入封禁时间 bantime(秒，默认600) : \033[0m' BAN_TIME
-    BAN_TIME=${BAN_TIME:-600}
-
-    mkdir -p /etc/fail2ban/jail.d
-    cat >/etc/fail2ban/jail.d/sshd.local <<EOF
-[sshd]
-enabled = true
-port = $SSH_PORT
-filter = sshd
-logpath = $LOG_PATH
-maxretry = $MAX_RETRY
-bantime  = $BAN_TIME
+    # 解锁文件（如果已被锁定）
+    chattr -i $RESOLV_FILE 2>/dev/null
+    
+    # 重新创建文件
+    rm -f $RESOLV_FILE
+    cat > $RESOLV_FILE <<EOF
+nameserver $DNS1
+nameserver $DNS2
+options timeout:2 attempts:3
 EOF
 
-    manage_service restart
-    sleep 1
-    echo -e "${GREEN}SSH 防暴力破解配置完成${RESET}"
+    read -p $'\033[32m是否锁定 resolv.conf 防止被系统修改? (y/n): \033[0m' LOCK
+    if [[ "$LOCK" == "y" ]]; then
+        chattr +i $RESOLV_FILE 2>/dev/null
+        echo -e "${GREEN}已通过 chattr 锁定 resolv.conf${RESET}"
+    fi
+
+    echo -e "${GREEN}DNS 更新完成${RESET}"
 }
 
-# 卸载 Fail2Ban
-uninstall_fail2ban() {
-    echo -e "${GREEN}正在卸载 Fail2Ban...${RESET}"
-    manage_service stop || true
-    case "$OS" in
-        alpine) apk del fail2ban ;;
-        debian) apt remove -y fail2ban ;;
-        rhel)   yum remove -y fail2ban ;;
+########################################
+# 其他功能函数（保持通用性）
+########################################
+custom_dns() {
+    read -p $'\033[32m请输入主 DNS: \033[0m' MAIN_DNS
+    read -p $'\033[32m请输入备用 DNS: \033[0m' BACKUP_DNS
+    [[ -z "$MAIN_DNS" ] ] && echo -e "${RED}主 DNS 不能为空${RESET}" && return
+    set_dns_resolvconf "$MAIN_DNS" "$BACKUP_DNS"
+}
+
+restore_default() {
+    echo -e "${YELLOW}恢复系统默认 DNS...${RESET}"
+    chattr -i $RESOLV_FILE 2>/dev/null
+    rm -f $RESOLV_FILE
+    echo -e "${GREEN}已删除静态配置，系统将在重启或重连网络后重新生成${RESET}"
+}
+
+show_dns() {
+    echo -e "\n${GREEN}===== 当前 DNS 状态 ($RESOLV_FILE) =====${RESET}"
+    if [ -f "$RESOLV_FILE" ]; then
+        cat $RESOLV_FILE
+    else
+        echo "文件不存在"
+    fi
+    echo
+}
+
+menu() {
+    clear
+    echo -e "${GREEN}=== DNS 管理工具 ===${RESET}"
+    echo -e "${GREEN}1) Google DNS (8.8.8.8)${RESET}"
+    echo -e "${GREEN}2) Cloudflare DNS (1.1.1.1)${RESET}"
+    echo -e "${GREEN}3) 阿里云 DNS (223.5.5.5)${RESET}"
+    echo -e "${GREEN}4) 腾讯云 DNS (119.29.29.29)${RESET}"
+    echo -e "${GREEN}5) Claw 专用 DNS (100.100.2.136)${RESET}"
+    echo -e "${GREEN}6) IPv6 DNS (CF+Google)${RESET}"
+    echo -e "${GREEN}7) 自定义 DNS${RESET}"
+    echo -e "${GREEN}8) 恢复默认/解锁文件${RESET}"
+    echo -e "${GREEN}9) 查看当前 DNS${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+
+    read -p $'\033[32m请选择: \033[0m' choice
+    case $choice in
+        1) set_dns_resolvconf 8.8.8.8 8.8.4.4 ;;
+        2) set_dns_resolvconf 1.1.1.1 1.0.0.1 ;;
+        3) set_dns_resolvconf 223.5.5.5 223.6.6.6 ;;
+        4) set_dns_resolvconf 119.29.29.29 119.28.28.28 ;;
+        5) set_dns_resolvconf 100.100.2.136 100.100.2.138 ;;
+        6) set_dns_resolvconf 2606:4700:4700::1111 2001:4860:4860::8888 ;;
+        7) custom_dns ;;
+        8) restore_default ;;
+        9) show_dns ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选择${RESET}" ;;
     esac
-    echo -e "${GREEN}Fail2Ban 已卸载${RESET}"
+    read -p $'\033[32m按回车返回菜单...\033[0m'
+    menu
 }
 
-# 菜单逻辑（保持原样，但调用适配后的函数）
-fail2ban_menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}==== SSH 防暴力破解管理菜单 ====${RESET}"
-        echo -e "${GREEN}1. 安装开启 SSH 防暴力破解${RESET}"
-        echo -e "${GREEN}2. 关闭 SSH 防暴力破解 (仅停用规则)${RESET}"
-        echo -e "${GREEN}3. 配置 SSH 防护参数${RESET}"
-        echo -e "${GREEN}4. 查看 SSH 拦截记录${RESET}"
-        echo -e "${GREEN}5. 查看防御规则列表${RESET}"
-        echo -e "${GREEN}6. 查看日志实时监控${RESET}"
-        echo -e "${GREEN}7. 卸载防御程序${RESET}"
-        echo -e "${GREEN}0. 退出${RESET}"
-        read -p $'\033[32m请输入你的选择: \033[0m' sub_choice
-
-        case $sub_choice in
-            1)
-                if ! command -v fail2ban-client >/dev/null 2>&1; then
-                    install_fail2ban
-                else
-                    manage_service start
-                fi
-                configure_ssh
-                read -p $'\033[32m按回车返回菜单...\033[0m'
-                ;;
-            2)
-                if [ -f /etc/fail2ban/jail.d/sshd.local ]; then
-                    sed -i '/enabled/s/true/false/' /etc/fail2ban/jail.d/sshd.local
-                    manage_service restart
-                    echo -e "${GREEN}SSH 防暴力破解已关闭${RESET}"
-                else
-                    echo -e "${RED}配置文件不存在${RESET}"
-                fi
-                read -p $'\033[32m按回车返回菜单...\033[0m'
-                ;;
-            3)
-                check_fail2ban && configure_ssh
-                read -p $'\033[32m按回车返回菜单...\033[0m'
-                ;;
-            4)
-                check_fail2ban
-                echo -e "${GREEN}当前被封禁的 IP 列表:${RESET}"
-                fail2ban-client status sshd | grep "Banned IP list"
-                read -p $'\033[32m按回车返回菜单...\033[0m'
-                ;;
-            5)
-                check_fail2ban
-                fail2ban-client status
-                read -p $'\033[32m按回车返回菜单...\033[0m'
-                ;;
-            6)
-                echo -e "${GREEN}实时监控 /var/log/fail2ban.log (Ctrl+C 退出)${RESET}"
-                tail -f /var/log/fail2ban.log
-                ;;
-            7)
-                uninstall_fail2ban
-                break
-                ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择${RESET}" && sleep 1 ;;
-        esac
-    done
-}
-
-fail2ban_menu
+menu

@@ -1,13 +1,23 @@
 #!/bin/bash
-# VPS SWAP 管理脚本 (兼容 Alpine/Debian/Ubuntu/CentOS)
+# ============================================================
+# 通用 SSH 端口修改脚本 (支持 Alpine/Debian/Ubuntu/CentOS)
+# ============================================================
+set -e
 
-SWAP_FILE="/swapfile"
+# 颜色定义
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-# 获取系统 ID
+# 1. Root 检查
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}❌ 请使用 root 用户运行${RESET}"
+    exit 1
+fi
+
+# 2. 系统识别
 if [ -f /etc/os-release ]; then
     . /etc/os-release
     OS_ID="$ID"
@@ -15,97 +25,112 @@ else
     OS_ID="unknown"
 fi
 
-menu() {
-    clear
-    # 兼容处理：提取 Swap 总量数值
-    CUR_SWAP=$(free | awk '/Swap:/ {print $2}')
-    
-    # 将 KB 转换为人类可读格式
-    if [ -z "$CUR_SWAP" ] || [ "$CUR_SWAP" -eq 0 ]; then
-        STATUS="未启用"
-    else
-        # 简单换算成 MB 或 GB
-        if [ "$CUR_SWAP" -ge 1048576 ]; then
-            STATUS="已启用 ($(echo "scale=2; $CUR_SWAP/1048576" | bc 2>/dev/null || echo "$((CUR_SWAP/1048576))")G)"
-        else
-            STATUS="已启用 ($((CUR_SWAP/1024))M)"
-        fi
-    fi
-
-    echo -e "${GREEN}====== VPS SWAP 管理 =========${RESET}"
-    echo -e "${GREEN}系统 ID: ${YELLOW}${OS_ID}${RESET}"
-    echo -e "${GREEN}当前 SWAP 状态: ${YELLOW}${STATUS}${RESET}"
-    echo -e "${GREEN}==========================================${RESET}"
-    echo -e "${GREEN}1. 添加 SWAP (默认 1G)${RESET}"
-    echo -e "${GREEN}2. 删除 SWAP${RESET}"
-    echo -e "${GREEN}3. 查看详细状态${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "------------------------------------------"
-    read -p "请输入选项: " choice
-    case $choice in
-        1) add_swap ;;
-        2) del_swap ;;
-        3) view_swap ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}❌ 无效选项${RESET}"; sleep 1; menu ;;
+# 3. 基础工具自动化安装 (Alpine/Debian/RHEL)
+install_deps() {
+    echo -e "${CYAN}🔍 正在检查必要组件...${RESET}"
+    case "$OS_ID" in
+        alpine)
+            apk update
+            # Alpine 需要安装 busybox-extras 以获得更强的 netstat，安装 nc 供探测使用
+            apk add --no-cache curl bash openssh-server busybox-extras netcat-openbsd 2>/dev/null
+            ;;
+        debian|ubuntu)
+            apt-get update -y
+            apt-get install -y curl netcat-openbsd procps 2>/dev/null
+            ;;
+        centos|rhel|rocky|almalinux)
+            yum install -y curl nc 2>/dev/null
+            ;;
     esac
 }
+install_deps
 
-add_swap() {
-    read -p "请输入要添加的 SWAP 大小(单位G, 默认1): " SWAP_SIZE
-    SWAP_SIZE=${SWAP_SIZE:-1}
+# 4. 获取当前 SSH 端口
+current_port=$(grep -E '^ *Port [0-9]+' /etc/ssh/sshd_config | awk '{print $2}' | head -n 1)
+current_port=${current_port:-22}
+echo -e "${CYAN}当前 SSH 端口: ${YELLOW}$current_port${RESET}"
 
-    # 检查是否已有 Swap 挂载，先关闭
-    swapoff "$SWAP_FILE" 2>/dev/null || true
-    [ -f "$SWAP_FILE" ] && rm -f "$SWAP_FILE"
+# 5. 输入并验证新端口
+echo -e "----------------------------------"
+read -p "$(echo -e ${CYAN}请输入新的 SSH 端口号: ${RESET})" new_port
+if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -le 0 ] || [ "$new_port" -gt 65535 ]; then
+    echo -e "${RED}❌ 错误: 请输入 1-65535 的合法端口号${RESET}"
+    exit 1
+fi
 
-    echo -e "${YELLOW}正在创建 ${SWAP_SIZE}G 的 Swap 文件...${RESET}"
-    
-    # Alpine 适配：优先使用 dd 保证兼容性
-    if command -v fallocate >/dev/null 2>&1 && [ "$OS_ID" != "alpine" ]; then
-        fallocate -l ${SWAP_SIZE}G "$SWAP_FILE" || dd if=/dev/zero of="$SWAP_FILE" bs=1M count=$((SWAP_SIZE*1024))
+# 6. 备份并修改配置
+cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$(date +%Y%m%d_%H%M%S)"
+if grep -q "^Port " /etc/ssh/sshd_config; then
+    sed -i "s/^Port .*/Port $new_port/" /etc/ssh/sshd_config
+else
+    echo "Port $new_port" >> /etc/ssh/sshd_config
+fi
+
+# 7. 停用 systemd ssh.socket (如果存在)
+if command -v systemctl >/dev/null 2>&1; then
+    if systemctl list-unit-files | grep -q ssh.socket; then
+        systemctl stop ssh.socket 2>/dev/null || true
+        systemctl disable ssh.socket 2>/dev/null || true
+    fi
+fi
+
+# 8. 防火墙安全放行 (兼容 ufw/firewalld/iptables/nftables)
+echo -e "${CYAN}🛡️ 正在尝试放行新端口 $new_port...${RESET}"
+if command -v ufw >/dev/null 2>&1; then
+    ufw allow $new_port/tcp || true
+elif command -v firewall-cmd >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port=$new_port/tcp 2>/dev/null || true
+    firewall-cmd --reload 2>/dev/null || true
+elif command -v nft >/dev/null 2>&1; then
+    nft add rule inet filter input tcp dport $new_port accept 2>/dev/null || true
+elif command -v iptables >/dev/null 2>&1; then
+    iptables -I INPUT -p tcp --dport $new_port -j ACCEPT || true
+fi
+
+# 9. 重启 SSH 服务 (兼容 OpenRC 和 Systemd)
+echo -e "${CYAN}🔄 正在重启 SSH 服务...${RESET}"
+if command -v systemctl >/dev/null 2>&1; then
+    if systemctl list-units --full --all | grep -q "sshd.service"; then
+        systemctl restart sshd.service
     else
-        dd if=/dev/zero of="$SWAP_FILE" bs=1M count=$((SWAP_SIZE*1024))
+        systemctl restart ssh.service
     fi
+elif command -v rc-service >/dev/null 2>&1; then
+    # Alpine OpenRC 路径
+    rc-service sshd restart
+else
+    service sshd restart || /etc/init.d/sshd restart
+fi
 
-    chmod 600 "$SWAP_FILE"
-    mkswap "$SWAP_FILE"
-    swapon "$SWAP_FILE"
+# 10. 本地监听与远程可达性双重检测
+echo -e "${CYAN}📡 正在检测端口 $new_port 是否就绪...${RESET}"
+sleep 2
 
-    # 写入开机启动
-    if ! grep -q "$SWAP_FILE" /etc/fstab; then
-        echo "$SWAP_FILE none swap sw 0 0" >> /etc/fstab
-    fi
+# 本地检测
+if netstat -tnlp | grep -q ":$new_port "; then
+    echo -e "${GREEN}✔ 本地端口监听成功${RESET}"
+else
+    echo -e "${RED}❌ 端口 $new_port 未能在本地开启，请检查 sshd_config${RESET}"
+    exit 1
+fi
 
-    echo -e "${GREEN}✅ 已成功添加 ${SWAP_SIZE}G SWAP${RESET}"
-    read -p "按回车返回菜单..." 
-    menu
-}
+# 远程检测 (使用 Cloudflare trace 获取 IP)
+VPS_IP=$(curl -s --max-time 5 https://1.1.1.1/cdn-cgi/trace | grep ip | cut -d= -f2)
+[ -z "$VPS_IP" ] && VPS_IP=$(curl -s --max-time 5 ipinfo.io/ip)
 
-del_swap() {
-    echo -e "${YELLOW}正在删除 SWAP...${RESET}"
-    swapoff "$SWAP_FILE" 2>/dev/null || true
-    sed -i "\|$SWAP_FILE|d" /etc/fstab
-    [ -f "$SWAP_FILE" ] && rm -f "$SWAP_FILE"
-    echo -e "${GREEN}✅ 已彻底删除 SWAP 文件并清理配置${RESET}"
-    read -p "按回车返回菜单..." 
-    menu
-}
-
-view_swap() {
-    echo -e "${GREEN}========== 系统 SWAP 详细状态 ==========${RESET}"
-    free -m
-    echo "---------------------------------------"
-    # 兼容 Alpine 的 swapon 输出
-    if swapon --show >/dev/null 2>&1; then
-        swapon --show
+if [ -n "$VPS_IP" ]; then
+    echo -e "${CYAN}正在从远程探测 $VPS_IP:$new_port ...${RESET}"
+    # 使用 nc 检测
+    if nc -zv -w 5 "$VPS_IP" "$new_port" 2>/dev/null; then
+        echo -e "${GREEN}✔ 远程端口检测通过！${RESET}"
+        
+        # 只有在远程确认可达后，才建议手动关闭旧端口防火墙（此处不再自动强制删除，以防万一）
+        echo -e "${YELLOW}提示: 新端口已通，建议手动清理旧端口 $current_port 的防火墙规则${RESET}"
     else
-        cat /proc/swaps
+        echo -e "${RED}⚠ 远程检测失败！可能是服务商云控制台防火墙未放行。${RESET}"
+        echo -e "${YELLOW}警告: 请勿关闭当前窗口，尝试再开一个 SSH 窗口确认是否能连上新端口！${RESET}"
     fi
-    echo -e "${GREEN}=======================================${RESET}"
-    read -p "按回车返回菜单..." 
-    menu
-}
+fi
 
-# 运行脚本
-menu
+echo -e "----------------------------------"
+echo -e "${GREEN}✅ SSH 端口安全切换完成: $current_port -> $new_port${RESET}"

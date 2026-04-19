@@ -1,97 +1,117 @@
 #!/bin/bash
-# ==========================================
-# 一键开放 VPS 所有端口 (完美支持 Alpine)
-# ⚠️ 警告：非常不安全，仅用于测试环境
-# ==========================================
+# DNS 管理工具（兼容 Alpine/Debian/Ubuntu/CentOS）
 
-# 颜色
-RED="\033[31m"
 GREEN="\033[32m"
+RED="\033[31m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-# 检查系统类型
-if [[ -f /etc/alpine-release ]]; then
-    OS="alpine"
-elif [[ -f /etc/debian_version ]]; then
-    OS="debian"
-elif [[ -f /etc/redhat-release ]]; then
-    OS="rhel"
-else
-    OS="unknown"
+RESOLV_FILE="/etc/resolv.conf"
+
+# 环境初始化与系统检测
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}请使用 root 权限运行此脚本${RESET}"
+    exit 1
 fi
 
-echo -e "${YELLOW}检测到系统类型: $OS${RESET}"
+if [ -f /etc/alpine-release ]; then
+    OS="alpine"
+else
+    OS="linux"
+fi
 
-# --------------------------
-# 自动安装函数
-# --------------------------
-install_package() {
-    local pkg="$1"
-    case "$OS" in
-        alpine)
-            echo -e "${YELLOW}尝试安装 $pkg ...${RESET}"
-            apk add --no-cache "$pkg"
-            ;;
-        debian)
-            apt-get update && apt-get install -y "$pkg"
-            ;;
-        rhel)
-            yum install -y "$pkg"
-            ;;
-    esac
+prepare_deps() {
+    if [[ "$OS" == "alpine" ]]; then
+        if ! command -v chattr >/dev/null 2>&1; then
+            echo -e "${YELLOW}正在为 Alpine 安装 e2fsprogs-extra...${RESET}"
+            apk add --no-cache e2fsprogs-extra
+        fi
+    fi
 }
 
-# --------------------------
-# 处理逻辑
-# --------------------------
-
-# 1. 针对 Alpine 的特殊优化处理 (优先使用 nftables 或 iptables)
-if [[ "$OS" == "alpine" ]]; then
-    # Alpine 默认通常不带 ufw，我们优先清理可能存在的 nft/iptables
-    if command -v nft >/dev/null 2>&1; then
-        echo -e "${GREEN}配置 nftables...${RESET}"
-        nft flush ruleset
-        # 设置默认策略为 ACCEPT
-        nft add table inet filter
-        nft add chain inet filter input { type filter hook input priority 0 \; policy accept \; }
-        # 确保服务启动并加入开机自启
-        rc-update add nftables default 2>/dev/null || true
-        rc-service nftables start 2>/dev/null || true
-    elif command -v iptables >/dev/null 2>&1; then
-        echo -e "${GREEN}配置 iptables...${RESET}"
-        iptables -F && iptables -X
-        iptables -P INPUT ACCEPT
-        iptables -P FORWARD ACCEPT
-        iptables -P OUTPUT ACCEPT
-        # Alpine 保存 iptables 规则
-        /etc/init.d/iptables save 2>/dev/null || true
-    else
-        echo -e "${YELLOW}未检测到防火墙，Alpine 默认状态通常为全开。${RESET}"
+disable_resolved() {
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl list-unit-files | grep -q "systemd-resolved"; then
+            echo -e "${YELLOW}检测到 systemd-resolved，正在停用...${RESET}"
+            systemctl disable --now systemd-resolved 2>/dev/null
+        fi
     fi
+    [ -L "$RESOLV_FILE" ] && rm -f "$RESOLV_FILE"
+}
 
-# 2. 针对 Debian/Ubuntu 的处理 (ufw)
-elif [[ "$OS" == "debian" ]]; then
-    if command -v ufw >/dev/null 2>&1; then
-        ufw disable # 直接禁用防火墙在 Debian 上是最快开放所有端口的方法
-        echo -e "${GREEN}UFW 已禁用 (所有端口已开放)${RESET}"
-    else
-        # 兜底使用 iptables
-        iptables -P INPUT ACCEPT && iptables -F
+set_dns_resolvconf() {
+    DNS1=$1
+    DNS2=$2
+    prepare_deps
+    disable_resolved
+    echo -e "${GREEN}正在设置 DNS: $DNS1 $DNS2${RESET}"
+    chattr -i $RESOLV_FILE 2>/dev/null
+    rm -f $RESOLV_FILE
+    cat > $RESOLV_FILE <<EOF
+nameserver $DNS1
+nameserver $DNS2
+options timeout:2 attempts:3
+EOF
+    read -p "是否锁定 resolv.conf 防止被系统修改? (y/n): " LOCK
+    if [[ "$LOCK" == "y" ]]; then
+        chattr +i $RESOLV_FILE 2>/dev/null
+        echo -e "${GREEN}已通过 chattr 锁定 resolv.conf${RESET}"
     fi
+    echo -e "${GREEN}DNS 更新完成${RESET}"
+}
 
-# 3. 针对 RHEL/CentOS 的处理 (firewalld/iptables)
-elif [[ "$OS" == "rhel" ]]; then
-    if command -v firewalld >/dev/null 2>&1; then
-        systemctl stop firewalld
-        systemctl disable firewalld
-        echo -e "${GREEN}Firewalld 已停止并禁用${RESET}"
-    else
-        iptables -P INPUT ACCEPT && iptables -F
+custom_dns() {
+    read -p "请输入主 DNS: " MAIN_DNS
+    read -p "请输入备用 DNS: " BACKUP_DNS
+    # 修正后的逻辑
+    if [[ -z "$MAIN_DNS" ]]; then
+        echo -e "${RED}主 DNS 不能为空${RESET}"
+        return
     fi
-fi
+    set_dns_resolvconf "$MAIN_DNS" "$BACKUP_DNS"
+}
 
-echo -e "${GREEN}----------------------------------${RESET}"
-echo -e "${GREEN}✅ 所有端口已成功开放！${RESET}"
-echo -e "${YELLOW}请注意：由于 Alpine 采用 OpenRC，如果安装了新防火墙插件，请确保已启动服务。${RESET}"
-echo -e "${YELLOW}当前时间: $(date +'%Y年%m月%d日 %H:%M:%S')${RESET}"
+restore_default() {
+    echo -e "${YELLOW}恢复系统默认 DNS...${RESET}"
+    chattr -i $RESOLV_FILE 2>/dev/null
+    rm -f $RESOLV_FILE
+    echo -e "${GREEN}已解锁并删除静态配置${RESET}"
+}
+
+show_dns() {
+    echo -e "\n${GREEN}===== 当前 DNS 状态 =====${RESET}"
+    [ -f "$RESOLV_FILE" ] && cat $RESOLV_FILE || echo "文件不存在"
+    echo
+}
+
+menu() {
+    clear
+    echo -e "${GREEN}=== DNS 管理工具  ===${RESET}"
+    echo "${GREEN}1) Google DNS (8.8.8.8)${RESET}"
+    echo "${GREEN}2) Cloudflare DNS (1.1.1.1)${RESET}"
+    echo "${GREEN}3) 阿里云 DNS (223.5.5.5)${RESET}"
+    echo "${GREEN}4) 腾讯云 DNS (119.29.29.29)${RESET}"
+    echo "${GREEN}5) Claw 专用 DNS (100.100.2.136)${RESET}"
+    echo "${GREEN}6) IPv6 DNS (CF+Google)${RESET}"
+    echo "${GREEN}7) 自定义 DNS${RESET}"
+    echo "${GREEN}8) 恢复默认/解锁文件${RESET}"
+    echo "${GREEN}9) 查看当前 DNS${RESET}"
+    echo "${GREEN}0) 退出${RESET}"
+    read -p $'\033[32m请选择: \033[0m' choice
+    case $choice in
+        1) set_dns_resolvconf 8.8.8.8 8.8.4.4 ;;
+        2) set_dns_resolvconf 1.1.1.1 1.0.0.1 ;;
+        3) set_dns_resolvconf 223.5.5.5 223.6.6.6 ;;
+        4) set_dns_resolvconf 119.29.29.29 119.28.28.28 ;;
+        5) set_dns_resolvconf 100.100.2.136 100.100.2.138 ;;
+        6) set_dns_resolvconf 2606:4700:4700::1111 2001:4860:4860::8888 ;;
+        7) custom_dns ;;
+        8) restore_default ;;
+        9) show_dns ;;
+        0) exit 0 ;;
+    esac
+    read -p "按回车返回菜单..."
+    menu
+}
+
+menu

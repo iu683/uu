@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Grok2API 一键管理脚本（自动 .env）
+# DrissionPage VPS 专用全自动安装脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,159 +8,135 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="grok2api"
-APP_DIR="/opt/$APP_NAME"
+APP_NAME="DrissionPage"
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2${RESET}"
+check_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "${RED}✘ 请使用 root 用户或 sudo 运行此脚本${RESET}"
         exit 1
     fi
 }
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用${RESET}"
-        return 1
+install_dp() {
+    echo -e "${YELLOW}▶ 正在更新系统软件包...${RESET}"
+    apt update -y
+
+    echo -e "${GREEN}▶ 正在安装 Python3 和 Pip...${RESET}"
+    apt install -y python3 python3-pip python3-venv
+
+    echo -e "${GREEN}▶ 正在安装 DrissionPage...${RESET}"
+    # 兼容新版系统（如 Ubuntu 24.04）的外部管理包限制
+    pip3 install -U DrissionPage --break-system-packages || pip3 install -U DrissionPage
+
+    echo -e "${GREEN}▶ 正在安装 Chromium 浏览器...${RESET}"
+    apt install -y chromium-browser || apt install -y chromium
+
+    echo -e "${GREEN}▶ 正在安装必要的底层依赖库 (防止报错)...${RESET}"
+    
+    # 基础依赖列表
+    deps="libnss3 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 \
+          libxcomposite1 libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 \
+          libcairo2 libxshmfence1 libglu1-mesa fonts-liberation libnss3-dev xvfb"
+
+    # 执行安装
+    apt install -y $deps
+
+    # 针对 libasound2 的特殊兼容性处理
+    echo -e "${YELLOW}▶ 正在处理音频依赖兼容性...${RESET}"
+    apt install -y libasound2 || apt install -y libasound2t64
+
+    # 针对 libatk1.0-0 的特殊兼容性处理
+    apt install -y libatk1.0-0 || apt install -y libatk1.0-0t64
+    
+    echo -e "${GREEN}✔ 依赖库安装尝试完成${RESET}"
+
+    echo -e "${GREEN}✔ 安装环境配置完成！${RESET}"
+}
+
+test_dp() {
+    echo -e "${YELLOW}▶ 正在启动自动化测试...${RESET}"
+
+    # 创建测试脚本
+    cat > /tmp/test_dp.py <<EOF
+from DrissionPage import ChromiumPage, ChromiumOptions
+import os
+import sys
+
+try:
+    co = ChromiumOptions()
+    co.headless(True)  # VPS 必须开启无头模式
+    co.set_argument('--no-sandbox')  # root 用户必须开启
+    co.set_argument('--disable-dev-shm-usage')
+    co.set_argument('--disable-gpu')
+
+    # 尝试自动定位 Chromium 路径
+    paths = ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome']
+    for p in paths:
+        if os.path.exists(p):
+            co.set_browser_path(p)
+            break
+
+    print(f"正在启动浏览器...")
+    page = ChromiumPage(co)
+    page.get('https://www.baidu.com')
+    
+    title = page.title
+    print(f"成功获取页面标题: {title}")
+    
+    if "百度" in title:
+        print("测试结果: 成功")
+    else:
+        print("测试结果: 异常 (获取到的标题不正确)")
+    
+    page.quit()
+except Exception as e:
+    print(f"测试过程中出现错误: {e}")
+    sys.exit(1)
+EOF
+
+    python3 /tmp/test_dp.py --break-system-packages 2>/dev/null || python3 /tmp/test_dp.py
+    
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✔ DrissionPage 测试通过！${RESET}"
+    else
+        echo -e "${RED}✘ 测试失败，请检查上方报错信息${RESET}"
     fi
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
+uninstall_dp() {
+    echo -e "${YELLOW}▶ 正在卸载 $APP_NAME...${RESET}"
+    pip3 uninstall -y DrissionPage || true
+    echo -e "${GREEN}▶ 正在删除 Chromium...${RESET}"
+    apt remove -y chromium-browser chromium || true
+    apt autoremove -y
+    echo -e "${GREEN}✔ 卸载完成${RESET}"
 }
 
 menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== Grok2API 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    DrissionPage 部署管理    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装部署${RESET}"
+    echo -e "${GREEN}2. 运行环境测试${RESET}"
+    echo -e "${GREEN}3. 卸载${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    read -r -p $'\033[32m请输入选项: \033[0m' choice
 
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo "无效选择"; sleep 1 ;;
-        esac
-    done
+    case $choice in
+        1) install_dp ;;
+        2) test_dp ;;
+        3) uninstall_dp ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
+    esac
 }
 
-install_app() {
+# 脚本入口
+check_root
 
-    check_docker
-
-    if [ -d "$APP_DIR" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-        rm -rf "$APP_DIR"
-    fi
-
-    echo -e "${YELLOW}正在克隆项目...${RESET}"
-    git clone https://github.com/chenyme/grok2api "$APP_DIR"
-    cd "$APP_DIR" || exit
-
-    # 👉 端口设置
-    read -p "请输入访问端口 [默认:8000]: " input_port
-    PORT=${input_port:-8000}
-    check_port "$PORT" || return
-
-    # 👉 创建目录
-    mkdir -p data logs
-
-    # 👉 自动生成 .env
-    cat > .env <<EOF
-TZ=Asia/Shanghai
-LOG_LEVEL=INFO
-LOG_FILE_ENABLED=true
-ACCOUNT_SYNC_INTERVAL=30
-
-SERVER_HOST=0.0.0.0
-SERVER_PORT=8000
-SERVER_WORKERS=1
-
-HOST_PORT=${PORT}
-
-ACCOUNT_STORAGE=local
-
-DATA_DIR=./data
-LOG_DIR=./logs
-EOF
-
-    echo -e "${GREEN}已生成 .env 配置${RESET}"
-
-    docker compose up -d
-
-    SERVER_IP=$(get_public_ip)
-
+while true; do
+    menu
     echo
-    echo -e "${GREEN}✅ Grok2API 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://${SERVER_IP}:${PORT}${RESET}"
-    echo -e "${YELLOW}🌐 默认密码: grok2api${RESET}"
-    echo -e "${GREEN}📁 路径: $APP_DIR${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-update_app() {
-    cd "$APP_DIR" || return
-    git pull
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ 更新完成${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-restart_app() {
-    cd "$APP_DIR" || return
-    docker compose restart
-    echo -e "${GREEN}✅ 已重启${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-    cd "$APP_DIR" || return
-    docker compose logs -f
-}
-
-check_status() {
-    docker ps | grep grok2api
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已彻底卸载${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-menu
+    read -p "按回车继续..." confirm
+    clear
+done

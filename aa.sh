@@ -25,17 +25,23 @@ else
 fi
 
 # ========================================
-# 分支 1: Alpine 极简路径 (已增强时区逻辑)
+# 分支 1: Alpine 极简路径
 # ========================================
 if [ "$OS_ID" = "alpine" ]; then
     echo -e "${YELLOW}🚀 Alpine 极简更新...${RESET}"
     apk update && apk upgrade
-    # 必须安装 tzdata 才能设置时区
     apk add --no-cache bash curl wget vim tar sudo git gzip openssl openssh ca-certificates tzdata
     
     # ✅ Alpine 专用时区设置逻辑
     echo -e "${YELLOW}🌏 配置时区为 上海 (Asia/Shanghai)...${RESET}"
-    cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+    
+    # 先删除旧文件，防止 cp 或 ln 报错
+    rm -f /etc/localtime
+    
+    # 使用软链接，这是 Linux 通用标准
+    ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+    
+    # 写入配置文件
     echo "Asia/Shanghai" > /etc/timezone
     
     echo -e "${GREEN}✅ Alpine 更新完成${RESET}"
@@ -85,40 +91,94 @@ install_rhel() {
     systemctl enable --now crond || true
 }
 
+
 set_timezone() {
-    echo -e "${YELLOW}🌏 配置时区为 上海 (Asia/Shanghai)...${RESET}"
-    
-    # 尝试使用 timedatectl (现代系统)
-    if command -v timedatectl >/dev/null 2>&1; then
-        timedatectl set-timezone Asia/Shanghai || true
-        timedatectl set-ntp true || true
-        systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || true
+    echo -e "${YELLOW}⏰ 配置 systemd-timesyncd 时间同步& 设置上海时区...${RESET}"
+
+    if [ ! -f /etc/os-release ]; then
+        echo -e "${RED}❌ 无法识别系统类型${RESET}"
+        return 1
     fi
 
-    # 强制软链接 (兜底方案)
-    if [ -f /usr/share/zoneinfo/Asia/Shanghai ]; then
-        ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
-        echo "Asia/Shanghai" > /etc/timezone 2>/dev/null || true
+    . /etc/os-release
+
+    if [[ "$ID" != "ubuntu" && "$ID" != "debian" ]]; then
+        echo -e "${RED}❌ 当前系统不是 Debian/Ubuntu，跳过时间同步配置${RESET}"
+        return 0
     fi
 
-    echo -e "${GREEN}✔ 时区已设为: $(date +%Z) (Asia/Shanghai)${RESET}"
+    echo -e "${GREEN}✔ 系统检测通过：$PRETTY_NAME${RESET}"
+
+    # 安装 systemd-timesyncd（极简系统可能没装）
+    if ! dpkg -s systemd-timesyncd >/dev/null 2>&1; then
+        echo -e "${YELLOW}📦 安装 systemd-timesyncd...${RESET}"
+        apt update
+        apt install -y systemd-timesyncd
+    else
+        echo -e "${GREEN}✔ systemd-timesyncd 已安装${RESET}"
+    fi
+
+    # 启用服务
+    systemctl unmask systemd-timesyncd || true
+    systemctl enable --now systemd-timesyncd
+
+    # 启用 NTP
+    timedatectl set-ntp true
+    systemctl restart systemd-timesyncd
+
+     # 设置上海时区
+    timedatectl set-timezone Asia/Shanghai
+    echo -e "${GREEN}✔ 时区已设置为上海 (Asia/Shanghai)${RESET}"
+
+    # 状态检查
+    if systemctl is-active --quiet systemd-timesyncd; then
+        echo -e "${GREEN}✔ 时间同步服务已成功启动${RESET}"
+    else
+        echo -e "${RED}❌ 时间同步服务启动失败${RESET}"
+    fi
 }
 
 enable_bbr() {
-    echo -e "${YELLOW}🚀 启用 BBR 加速...${RESET}"
-    if modprobe tcp_bbr 2>/dev/null; then
-        mkdir -p /etc/modules-load.d
+    echo -e "${YELLOW}🚀 检查并配置 TCP BBR...${RESET}"
+
+    # 1️⃣ 尝试加载 BBR 模块
+    if ! modprobe tcp_bbr 2>/dev/null; then
+        echo -e "${RED}❌ 当前内核未编译 BBR 或不支持${RESET}"
+        return 1
+    fi
+
+    # 2️⃣ 写入模块自动加载（避免重复）
+    mkdir -p /etc/modules-load.d
+    if ! grep -qxF "tcp_bbr" /etc/modules-load.d/bbr.conf 2>/dev/null; then
         echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
-        cat >/etc/sysctl.d/99-bbr.conf <<EOF
+    fi
+
+    # 3️⃣ 检查是否已经启用
+    if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
+        echo -e "${GREEN}✔ BBR 已经开启，无需修改${RESET}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}👉 BBR 未开启，开始配置...${RESET}"
+
+    # 4️⃣ 写入独立 sysctl 配置文件（更规范）
+    cat >/etc/sysctl.d/99-bbr.conf <<EOF
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
-        sysctl --system >/dev/null
-        echo -e "${GREEN}✔ BBR 启用成功${RESET}"
+
+    # 5️⃣ 应用配置
+    sysctl --system >/dev/null
+
+    # 6️⃣ 再次验证
+    if [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = "bbr" ]; then
+        echo -e "${GREEN}✔ BBR 已成功开启${RESET}"
     else
-        echo -e "${RED}❌ 内核不支持 BBR${RESET}"
+        echo -e "${RED}❌ BBR 开启失败，请检查内核配置${RESET}"
+        return 1
     fi
 }
+
 
 install_nexttrace() {
     if command -v nexttrace >/dev/null; then

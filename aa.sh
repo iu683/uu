@@ -1,423 +1,212 @@
 #!/bin/bash
-set -e
-export DEBIAN_FRONTEND=noninteractive
+# 支持 Debian/Ubuntu, RHEL/CentOS, Alpine, openSUSE
 
-# ==========================================
-# 系统更新 & 常用依赖安装 & 修复 APT 源
-# ==========================================
+# ================== 颜色定义 ==================
+green="\033[32m"
+yellow="\033[33m"
+red="\033[31m"
+white="\033[37m"
+re="\033[0m"
 
-# 颜色定义
-RED="\033[31m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+# ================== ASCII VPS Logo ==================
+printf -- "${red}"
+printf -- " _    __ ____   _____ \n"
+printf -- "| |  / // __ \\ / ___/ \n"
+printf -- "| | / // /_/ / \\__ \\  \n"
+printf -- "| |/ // ____/ ___/ /  \n"
+printf -- "|___//_/     /____/   \n"
+printf -- "${re}"
 
-# 检查是否 root
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}❌ 请使用 root 用户运行此脚本${RESET}"
-    exit 1
-fi
+# ================== 系统检测函数 ==================
+detect_os(){
+  if [ -f /etc/os-release ]; then
+    source /etc/os-release
+    os_info=$PRETTY_NAME
+  elif command -v lsb_release >/dev/null 2>&1; then
+    os_info=$(lsb_release -ds)
+  elif [ -f /etc/debian_version ]; then
+    os_info="Debian $(cat /etc/debian_version)"
+  elif [ -f /etc/redhat-release ]; then
+    os_info=$(cat /etc/redhat-release)
+  else
+    os_info="未知系统"
+  fi
+}
 
-
-# ========================================
-# Alpine 极简路径
-# ========================================
-if [ -f /etc/os-release ]; then
-    . /etc/os-release
-fi
-
-if [ "$ID" = "alpine" ]; then
-    echo -e "${YELLOW}🚀 Alpine 极简更新...${RESET}"
-
-    apk update && apk upgrade
-
-    apk add --no-cache \
-        bash curl wget vim tar sudo git gzip \
-        openssl openssh ca-certificates tzdata
-
-    # -------------------------
-    # 时区设置
-    # -------------------------
-    TZ=${TZ:-Asia/Shanghai}
-
-    echo -e "${YELLOW}🌏 配置时区为: $TZ ...${RESET}"
-
-    # 防止不存在时报错
-    if [ -f "/usr/share/zoneinfo/$TZ" ]; then
-        ln -sf "/usr/share/zoneinfo/$TZ" /etc/localtime
-        echo "$TZ" > /etc/timezone
-        echo -e "${GREEN}✔ 时区设置完成${RESET}"
-    else
-        echo -e "${RED}❌ 时区不存在: $TZ${RESET}"
-    fi
-
-    echo -e "${GREEN}✅ Alpine 更新完成${RESET}"
-    echo -e "${YELLOW}当前时间: $(date +'%Y-%m-%d %H:%M:%S')${RESET}"
-
-    exit 0
-fi
-
-# -------------------------
-# 常用依赖
-# -------------------------
-deps=(curl wget git net-tools lsof tar unzip rsync pv sudo iperf3 mtr jq openssl)
-
-# -------------------------
-# 检查并安装依赖（兼容不同系统）
-# -------------------------
-check_and_install() {
-    local check_cmd="$1"
-    local install_cmd="$2"
-    local missing=()
+# ================== 依赖安装函数 ==================
+install_deps(){
+  if command -v apt >/dev/null 2>&1; then
+    deps=("curl" "vnstat" "lsb-release" "bc")
+    apt update -y >/dev/null 2>&1
     for pkg in "${deps[@]}"; do
-        if ! eval "$check_cmd \"$pkg\"" &>/dev/null; then
-            missing+=("$pkg")
-        else
-            echo -e "${GREEN}✔ 已安装: $pkg${RESET}"
-        fi
+      if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+        apt install -y "$pkg" >/dev/null 2>&1
+      fi
     done
-
-    if [ ${#missing[@]} -gt 0 ]; then
-        echo -e "${YELLOW}👉 安装缺失依赖: ${missing[*]}${RESET}"
-        # Debian 系统处理 netcat
-        if [ "$OS_TYPE" = "debian" ]; then
-            # 让 iperf3 安装时自动选择 No（不启动 daemon）
-            echo "iperf3 iperf3/start_daemon boolean false" | debconf-set-selections
-            for pkg in "${missing[@]}"; do
-                if [ "$pkg" = "nc" ]; then
-                    apt install -y netcat-openbsd
-                else
-                    apt install -y "$pkg"
-                fi
-            done
-        else
-            eval "$install_cmd \"\${missing[@]}\""
-        fi
-    fi
-}
-
-# -------------------------
-# 清理重复 Docker 源
-# -------------------------
-fix_duplicate_docker_sources() {
-    echo -e "${YELLOW}🔍 检查重复 Docker APT 源...${RESET}"
-    local docker_sources
-    docker_sources=$(grep -rl "download.docker.com" /etc/apt/sources.list.d/ 2>/dev/null || true)
-    if [ "$(echo "$docker_sources" | grep -c .)" -gt 1 ]; then
-        echo -e "${RED}⚠️ 检测到重复 Docker 源:${RESET}"
-        echo "$docker_sources"
-        for f in $docker_sources; do
-            if [[ "$f" == *"archive_uri"* ]]; then
-                rm -f "$f"
-                echo -e "${GREEN}✔ 删除多余源: $f${RESET}"
-            fi
-        done
-    else
-        echo -e "${GREEN}✔ Docker 源正常${RESET}"
-    fi
-}
-
-# -------------------------
-# 修复 sources.list（兼容 Bullseye / Bookworm）
-# -------------------------
-fix_sources_for_version() {
-    echo -e "${YELLOW}🔍 修复 sources.list 兼容性...${RESET}"
-    local version="$1"
-    local files
-    files=$(grep -rl "deb" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true)
-    for f in $files; do
-        if [[ "$version" == "bullseye" ]]; then
-            sed -i -r 's/\bnon-free(-firmware){0,3}\b/non-free/g' "$f"
-            sed -i '/deb .*bullseye-backports/s/^/##/' "$f"
-        elif [[ "$version" == "bookworm" ]]; then
-            # Bookworm 保留 non-free-firmware，但去掉重复 non-free
-            sed -i -r 's/\bnon-free non-free\b/non-free/g' "$f"
-        fi
+  elif command -v apk >/dev/null 2>&1; then
+    deps=("curl" "vnstat" "bc" "bash")
+    apk update >/dev/null 2>&1
+    for pkg in "${deps[@]}"; do
+      apk add "$pkg" >/dev/null 2>&1
     done
-    echo -e "${GREEN}✔ sources.list 已优化${RESET}"
+  elif command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
+    pkg_mgr=$(command -v dnf || echo "yum")
+    deps=("curl" "vnstat" "redhat-lsb-core" "bc")
+    for pkg in "${deps[@]}"; do
+      $pkg_mgr install -y "$pkg" >/dev/null 2>&1
+    done
+  fi
 }
 
-# -------------------------
-# 系统更新函数
-# -------------------------
-update_system() {
-    echo -e "${GREEN}🔄 检测系统发行版并更新...${RESET}"
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        echo -e "${YELLOW}👉 当前系统: $PRETTY_NAME${RESET}"
+# 执行初始化
+detect_os
+install_deps
 
-        # 系统类型
-        if [[ "$ID" =~ debian|ubuntu ]]; then
-            OS_TYPE="debian"
-            fix_duplicate_docker_sources
-            if [[ "$ID" == "debian" ]]; then
-                fix_sources_for_version "$VERSION_CODENAME"
-            fi
-            apt update && apt upgrade -y
-            check_and_install "dpkg -s" "apt install -y"
-        elif [[ "$ID" =~ fedora ]]; then
-            OS_TYPE="rhel"
-            dnf check-update || true
-            dnf upgrade -y
-            check_and_install "rpm -q" "dnf install -y"
-        elif [[ "$ID" =~ centos|rhel ]]; then
-            OS_TYPE="rhel"
-            yum check-update || true
-            yum upgrade -y
-            check_and_install "rpm -q" "yum install -y"
-        elif [[ "$ID" =~ alpine ]]; then
-            OS_TYPE="alpine"
-            apk update && apk upgrade
-            check_and_install "apk info -e" "apk add"
-        else
-            echo -e "${RED}❌ 暂不支持的 Linux 发行版: $ID${RESET}"
-            return 1
-        fi
-    else
-        echo -e "${RED}❌ 无法检测系统发行版 (/etc/os-release 不存在)${RESET}"
-        return 1
-    fi
+# ================== 公网IP获取 ==================
+ipv4_address=$(curl -s --max-time 5 ipv4.icanhazip.com || echo "无法获取")
+ipv6_address=$(curl -s --max-time 5 ipv6.icanhazip.com || echo "无法获取")
 
-    echo -e "${GREEN}✅ 系统更新和依赖安装完成！${RESET}"
+# ================== 格式化 bc 输出 (核心修复) ==================
+# 补全 .3 -> 0.3 的函数
+fix_number() {
+  local num=$1
+  if [[ $num == .* ]]; then echo "0$num"; elif [[ $num == -.* ]]; then echo "-0${num#*-}"; else echo "$num"; fi
 }
 
+# ================== CPU信息 ==================
+cpu_info=$(grep 'model name' /proc/cpuinfo | head -1 | sed -r 's/model name\s*:\s*//')
+[ -z "$cpu_info" ] && cpu_info=$(uname -p)
+cpu_cores=$(grep -c ^processor /proc/cpuinfo)
 
-install_netcat() {
-    echo -e "${YELLOW}🔍 检查 netcat...${RESET}"
+# ================== CPU占用率 ==================
+get_cpu_usage(){
+  local cpu1=($(head -n1 /proc/stat))
+  local idle1=${cpu1[4]}
+  local total1=0
+  for val in "${cpu1[@]:1}"; do total1=$((total1 + val)); done
+  sleep 1
+  local cpu2=($(head -n1 /proc/stat))
+  local idle2=${cpu2[4]}
+  local total2=0
+  for val in "${cpu2[@]:1}"; do total2=$((total2 + val)); done
+  local idle_diff=$((idle2 - idle1))
+  local total_diff=$((total2 - total1))
+  if [ $total_diff -eq 0 ]; then
+    echo "0.0"
+  else
+    usage=$(echo "scale=1; 100 * ($total_diff - $idle_diff) / $total_diff" | bc)
+    fix_number "$usage"
+  fi
+}
+cpu_usage_val=$(get_cpu_usage)
+cpu_usage_percent="${cpu_usage_val}%"
 
-    if command -v nc >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ nc 已安装${RESET}"
-        return
-    fi
+# ================== 内存与交换 ==================
+mem_total_k=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+mem_free_k=$(grep MemFree /proc/meminfo | awk '{print $2}')
+mem_buff_k=$(grep Buffers /proc/meminfo | awk '{print $2}')
+mem_cache_k=$(grep ^Cached /proc/meminfo | awk '{print $2}')
+mem_used_k=$((mem_total_k - mem_free_k - mem_buff_k - mem_cache_k))
 
-    echo -e "${YELLOW}👉 安装 netcat-openbsd...${RESET}"
+mem_total_gb=$(fix_number "$(echo "scale=2; $mem_total_k/1024/1024" | bc)")
+mem_used_gb=$(fix_number "$(echo "scale=2; $mem_used_k/1024/1024" | bc)")
+mem_percent_val=$(fix_number "$(echo "scale=2; $mem_used_k*100/$mem_total_k" | bc)")
+mem_info="${mem_used_gb}/${mem_total_gb} GB (${mem_percent_val}%)"
 
-    if [ "$OS_TYPE" = "debian" ]; then
-        apt install -y netcat-openbsd
-    elif [ "$OS_TYPE" = "rhel" ]; then
-        yum install -y nc 2>/dev/null || dnf install -y nc
-    elif [ "$OS_TYPE" = "alpine" ]; then
-        apk add netcat-openbsd
-    else
-        echo -e "${RED}❌ 未知系统，无法安装 nc${RESET}"
-        return 1
-    fi
+swap_total_k=$(grep SwapTotal /proc/meminfo | awk '{print $2}')
+swap_free_k=$(grep SwapFree /proc/meminfo | awk '{print $2}')
+if [ -z "$swap_total_k" ] || [ "$swap_total_k" -eq 0 ]; then
+  swap_info="未启用"
+else
+  swap_used_k=$((swap_total_k - swap_free_k))
+  swap_percent=$((swap_used_k*100/swap_total_k))
+  swap_info="$(($swap_used_k/1024))MB/$(($swap_total_k/1024))MB (${swap_percent}%)"
+fi
 
-    if command -v nc >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ nc 安装成功${RESET}"
-    else
-        echo -e "${RED}❌ nc 安装失败${RESET}"
-    fi
+# ================== 网络流量统计 ==================
+format_bytes(){
+  local bytes=${1:-0}
+  if (( $(echo "$bytes < 1024" | bc -l) )); then
+    echo "${bytes} B"
+  elif (( $(echo "$bytes < 1048576" | bc -l) )); then
+    echo "$(fix_number "$(echo "scale=2; $bytes/1024" | bc)") KB"
+  elif (( $(echo "$bytes < 1073741824" | bc -l) )); then
+    echo "$(fix_number "$(echo "scale=2; $bytes/1048576" | bc)") MB"
+  else
+    echo "$(fix_number "$(echo "scale=2; $bytes/1073741824" | bc)") GB"
+  fi
 }
 
-install_dnsutils() {
-    echo -e "${YELLOW}🔍 检查 DNS 工具(dnsutils)...${RESET}"
-
-    if command -v dig >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ DNS 工具已安装${RESET}"
-        return
-    fi
-
-    echo -e "${YELLOW}👉 安装 DNS 工具...${RESET}"
-
-    if [ "$OS_TYPE" = "debian" ]; then
-        apt install -y bind9-dnsutils
-    elif [ "$OS_TYPE" = "rhel" ]; then
-        yum install -y bind-utils 2>/dev/null || dnf install -y bind-utils
-    elif [ "$OS_TYPE" = "alpine" ]; then
-        apk add bind-tools
-    else
-        echo -e "${RED}❌ 未知系统，无法安装 DNS 工具${RESET}"
-        return 1
-    fi
-
-    if command -v dig >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ DNS 工具安装成功${RESET}"
-    else
-        echo -e "${RED}❌ DNS 工具安装失败${RESET}"
-    fi
-}
-# -------------------------
-# 安装并启动 cron
-# -------------------------
-install_cron() {
-    echo -e "${YELLOW}⏰ 检查并安装 cron 定时任务服务...${RESET}"
-
-    case "$OS_TYPE" in
-        debian)
-            if ! dpkg -s cron >/dev/null 2>&1; then
-                echo -e "${YELLOW}📦 安装 cron...${RESET}"
-                apt update
-                apt install -y cron
-            else
-                echo -e "${GREEN}✔ cron 已安装${RESET}"
-            fi
-            systemctl enable --now cron
-            ;;
-        rhel)
-            if ! rpm -q cronie >/dev/null 2>&1; then
-                echo -e "${YELLOW}📦 安装 cronie...${RESET}"
-                yum install -y cronie 2>/dev/null || dnf install -y cronie
-            else
-                echo -e "${GREEN}✔ cronie 已安装${RESET}"
-            fi
-            systemctl enable --now crond
-            ;;
-        alpine)
-            if ! apk info -e cronie >/dev/null 2>&1; then
-                echo -e "${YELLOW}📦 安装 cronie...${RESET}"
-                apk add cronie
-            else
-                echo -e "${GREEN}✔ cronie 已安装${RESET}"
-            fi
-            rc-update add crond
-            service crond start
-            ;;
-        *)
-            echo -e "${RED}❌ 未知系统类型，无法安装 cron${RESET}"
-            return 1
-            ;;
-    esac
-
-    # 状态检测
-    if systemctl is-active --quiet cron 2>/dev/null || systemctl is-active --quiet crond 2>/dev/null; then
-        echo -e "${GREEN}✔ cron 服务已运行${RESET}"
-    else
-        echo -e "${RED}❌ cron 服务未启动，请手动检查${RESET}"
-    fi
+get_net_traffic(){
+  local rx_total=0 tx_total=0
+  while read -r line; do
+    iface=$(echo "$line" | awk -F: '{print $1}' | tr -d ' ')
+    [[ "$iface" =~ ^(lo|docker|veth|br-|flannel) ]] && continue
+    rx=$(echo "$line" | awk '{print $2}')
+    tx=$(echo "$line" | awk '{print $10}')
+    rx_total=$((rx_total + rx))
+    tx_total=$((tx_total + tx))
+  done < <(tail -n +3 /proc/net/dev)
+  echo "总接收: $(format_bytes $rx_total)"
+  echo "总发送: $(format_bytes $tx_total)"
 }
 
-# -------------------------
-# 安装 NextTrace（网络路由追踪工具）
-# -------------------------
-install_nexttrace() {
-    echo -e "${YELLOW}🌐 检查并安装 NextTrace...${RESET}"
+# ================== 其他系统信息 ==================
+disk_info=$(df -h / | awk 'NR==2{printf "%s/%s (%s)", $3, $2, $5}')
+geo_data=$(curl -s --max-time 3 http://ip-api.com/json/)
+country=$(echo "$geo_data" | sed -n 's/.*"countryCode":"\([^"]*\)".*/\1/p')
+city=$(echo "$geo_data" | sed -n 's/.*"city":"\([^"]*\)".*/\1/p')
+isp_info=$(echo "$geo_data" | sed -n 's/.*"isp":"\([^"]*\)".*/\1/p')
+cpu_arch=$(uname -m)
+hostname=$(hostname)
+kernel_version=$(uname -r)
+congestion_algorithm=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+queue_algorithm=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+net_output=$(get_net_traffic)
+up_sec=$(cut -d. -f1 /proc/uptime)
+runtime="$((up_sec/86400))天 $(((up_sec%86400)/3600))时 $(((up_sec%3600)/60))分"
 
-    # 确保 curl 存在
-    if ! command -v curl >/dev/null 2>&1; then
-        echo -e "${RED}❌ curl 未安装，无法安装 NextTrace${RESET}"
-        return 1
-    fi
-
-    # 检测是否已安装
-    if command -v nexttrace >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ NextTrace 已安装${RESET}"
-        return 0
-    fi
-
-    echo -e "${YELLOW}👉 开始安装 NextTrace...${RESET}"
-
-    curl -sL https://nxtrace.org/nt | bash
-
-    # 验证
-    if command -v nexttrace >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ NextTrace 安装成功${RESET}"
-    else
-        echo -e "${RED}❌ NextTrace 安装失败${RESET}"
-    fi
+# ================== 动态颜色高亮 ==================
+get_usage_color(){
+  local val=$1
+  if [ -z "$val" ] || [ "$val" == "0" ]; then echo "$green"; return; fi
+  # 使用 bc -l 处理带小数点的比较
+  local res=$(echo "$val >= 80" | bc -l)
+  if [ "$res" -eq 1 ]; then echo "$red"
+  elif [ "$(echo "$val >= 50" | bc -l)" -eq 1 ]; then echo "$yellow"
+  else echo "$green"; fi
 }
+cpu_usage_color=$(get_usage_color "$cpu_usage_val")
+mem_usage_color=$(get_usage_color "$mem_percent_val")
 
-# -------------------------
-# 开启 BBR（安全版）
-# -------------------------
-enable_bbr() {
-    echo -e "${YELLOW}🚀 检查并配置 TCP BBR...${RESET}"
-
-    # 1️⃣ 尝试加载 BBR 模块
-    if ! modprobe tcp_bbr 2>/dev/null; then
-        echo -e "${RED}❌ 当前内核未编译 BBR 或不支持${RESET}"
-        return 1
-    fi
-
-    # 2️⃣ 写入模块自动加载（避免重复）
-    mkdir -p /etc/modules-load.d
-    if ! grep -qxF "tcp_bbr" /etc/modules-load.d/bbr.conf 2>/dev/null; then
-        echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
-    fi
-
-    # 3️⃣ 检查是否已经启用
-    if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
-        echo -e "${GREEN}✔ BBR 已经开启，无需修改${RESET}"
-        return 0
-    fi
-
-    echo -e "${YELLOW}👉 BBR 未开启，开始配置...${RESET}"
-
-    # 4️⃣ 写入独立 sysctl 配置文件（更规范）
-    cat >/etc/sysctl.d/99-bbr.conf <<EOF
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
-
-    # 5️⃣ 应用配置
-    sysctl --system >/dev/null
-
-    # 6️⃣ 再次验证
-    if [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = "bbr" ]; then
-        echo -e "${GREEN}✔ BBR 已成功开启${RESET}"
-    else
-        echo -e "${RED}❌ BBR 开启失败，请检查内核配置${RESET}"
-        return 1
-    fi
-}
-
-# -------------------------
-# 时间同步 & 设置上海时区（Debian / Ubuntu 专用）
-# -------------------------
-enable_time_sync() {
-    echo -e "${YELLOW}⏰ 配置 systemd-timesyncd 时间同步& 设置上海时区...${RESET}"
-
-    if [ ! -f /etc/os-release ]; then
-        echo -e "${RED}❌ 无法识别系统类型${RESET}"
-        return 1
-    fi
-
-    . /etc/os-release
-
-    if [[ "$ID" != "ubuntu" && "$ID" != "debian" ]]; then
-        echo -e "${RED}❌ 当前系统不是 Debian/Ubuntu，跳过时间同步配置${RESET}"
-        return 0
-    fi
-
-    echo -e "${GREEN}✔ 系统检测通过：$PRETTY_NAME${RESET}"
-
-    # 安装 systemd-timesyncd（极简系统可能没装）
-    if ! dpkg -s systemd-timesyncd >/dev/null 2>&1; then
-        echo -e "${YELLOW}📦 安装 systemd-timesyncd...${RESET}"
-        apt update
-        apt install -y systemd-timesyncd
-    else
-        echo -e "${GREEN}✔ systemd-timesyncd 已安装${RESET}"
-    fi
-
-    # 启用服务
-    systemctl unmask systemd-timesyncd || true
-    systemctl enable --now systemd-timesyncd
-
-    # 启用 NTP
-    timedatectl set-ntp true
-    systemctl restart systemd-timesyncd
-
-     # 设置上海时区
-    timedatectl set-timezone Asia/Shanghai
-    echo -e "${GREEN}✔ 时区已设置为上海 (Asia/Shanghai)${RESET}"
-
-    # 状态检查
-    if systemctl is-active --quiet systemd-timesyncd; then
-        echo -e "${GREEN}✔ 时间同步服务已成功启动${RESET}"
-    else
-        echo -e "${RED}❌ 时间同步服务启动失败${RESET}"
-    fi
-}
-
-# -------------------------
-# 执行
-# -------------------------
+# ================== 输出 ==================
 clear
-update_system
-install_netcat
-install_dnsutils
-install_cron
-install_nexttrace
-enable_bbr
-enable_time_sync
+printf -- "%b系统信息详情%b\n" "$green" "$re"
+printf -- "------------------------\n"
+printf -- "%b主机名: %b%s%b\n" "$white" "$green" "$hostname" "$re"
+printf -- "%b运营商: %b%s%b\n" "$white" "$green" "${isp_info:-未知}" "$re"
+printf -- "------------------------\n"
+printf -- "%b系统版本: %b%s%b\n" "$white" "$yellow" "$os_info" "$re"
+printf -- "%b内核版本: %b%s%b\n" "$white" "$yellow" "$kernel_version" "$re"
+printf -- "------------------------\n"
+printf -- "%bCPU架构: %b%s%b\n" "$white" "$green" "$cpu_arch" "$re"
+printf -- "%bCPU型号: %b%s%b\n" "$white" "$green" "$cpu_info" "$re"
+printf -- "%bCPU核心: %b%s%b\n" "$white" "$green" "$cpu_cores" "$re"
+printf -- "------------------------\n"
+printf -- "%bCPU占用 : %b%s%b\n" "$white" "$cpu_usage_color" "$cpu_usage_percent" "$re"
+printf -- "%b物理内存: %b%s%b\n" "$white" "$mem_usage_color" "$mem_info" "$re"
+printf -- "%b虚拟内存: %b%s%b\n" "$white" "$green" "$swap_info" "$re"
+printf -- "%b硬盘占用: %b%s%b\n" "$white" "$green" "$disk_info" "$re"
+printf -- "------------------------\n"
+printf -- "%b%s%b\n" "$green" "$net_output" "$re"
+printf -- "------------------------\n"
+printf -- "%b拥塞算法: %b%s %s%b\n" "$white" "$green" "$congestion_algorithm" "$queue_algorithm" "$re"
+printf -- "------------------------\n"
+printf -- "%bIPv4地址: %b%s%b\n" "$white" "$yellow" "$ipv4_address" "$re"
+printf -- "%bIPv6地址: %b%s%b\n" "$white" "$yellow" "$ipv6_address" "$re"
+printf -- "------------------------\n"
+printf -- "%b地理位置: %b%s %s%b\n" "$white" "$yellow" "$country" "$city" "$re"
+printf -- "%b系统时间: %b%s%b\n" "$white" "$yellow" "$(date "+%Y-%m-%d %H:%M")" "$re"
+printf -- "------------------------\n"
+printf -- "%b运行时长: %b%s%b\n" "$white" "$green" "$runtime" "$re"
+printf -- "\n"

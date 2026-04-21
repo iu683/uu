@@ -1,98 +1,103 @@
 #!/bin/bash
-set -e
+# ========================================
+# 智能时间同步脚本（自动识别容器/物理机）
+# 适配：Debian / Ubuntu / Alpine
+# ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
+BLUE="\033[36m"
 RESET="\033[0m"
 
-# 权限检查
+echo -e "${BLUE}========================================${RESET}"
+echo -e "${GREEN}      ⏰ 智能时间同步配置脚本${RESET}"
+echo -e "${BLUE}========================================${RESET}"
+
+# 1. 权限检查
 if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}请使用 root 权限运行此脚本${RESET}"
+    echo -e "${RED}❌ 请使用 root 运行${RESET}"
     exit 1
 fi
 
-# 自动识别发行版
+# 2. 系统识别
 if [ -f /etc/alpine-release ]; then
     OS="Alpine"
-elif grep -qi "ubuntu" /etc/os-release; then
-    OS="Ubuntu"
 elif [ -f /etc/debian_version ]; then
-    OS="Debian"
+    OS="Debian/Ubuntu"
 else
-    OS="Linux"
+    echo -e "${RED}❌ 暂不支持此系统${RESET}"
+    exit 1
 fi
 
-echo -e "${GREEN}=== 字体与语言环境工具 ($OS) ===${RESET}"
-echo -e "${GREEN}1) 切换到中文字体/环境 (UTF-8)${RESET}"
-echo -e "${GREEN}2) 切换到英文字体/环境 (UTF-8)${RESET}"
-echo -e "${GREEN}0) 退出${RESET}"
-read -rp "$(echo -e ${GREEN}请选择操作: ${RESET})" choice
+echo -e "${GREEN}✔ 系统检测通过：$OS${RESET}"
 
-apply_locale() {
-    local target_lang=$1
+# 3. 检测虚拟化环境 (容器无需同步)
+IS_CONTAINER=false
+if [ "$OS" == "Alpine" ]; then
+    # Alpine 下简单检测方式
+    if [ -f /.dockerenv ] || grep -qi "docker\|lxc" /proc/1/cgroup 2>/dev/null; then
+        IS_CONTAINER=true
+        VIRT_TYPE="Container"
+    fi
+else
+    # Debian/Ubuntu 使用 systemd-detect-virt
+    VIRT_TYPE=$(systemd-detect-virt)
+    if [[ "$VIRT_TYPE" == "lxc" || "$VIRT_TYPE" == "openvz" || "$VIRT_TYPE" == "docker" ]]; then
+        IS_CONTAINER=true
+    fi
+fi
+
+if [ "$IS_CONTAINER" = true ]; then
+    echo -e "${YELLOW}⚠ 检测到容器环境：$VIRT_TYPE${RESET}"
+    echo -e "${GREEN}✔ 容器时间由宿主机管理，无需配置时间同步${RESET}"
+    date
+    exit 0
+fi
+
+# 4. 执行同步逻辑
+if [ "$OS" == "Alpine" ]; then
+    # ================= Alpine 逻辑 =================
+    echo -e "${YELLOW}🔄 正在配置 Alpine 时间同步 (Chrony)...${RESET}"
+    apk add --no-cache chrony
     
-    if [[ "$OS" == "Ubuntu" || "$OS" == "Debian" ]]; then
-        echo -e "${YELLOW}正在更新 apt 并安装字体包...${RESET}"
-        apt-get update -y
-        if [[ "$target_lang" == "zh_CN.UTF-8" ]]; then
-            apt-get install -y locales fonts-wqy-microhei fonts-wqy-zenhei
-        else
-            apt-get install -y locales fonts-dejavu fonts-liberation
-        fi
+    # 强制同步一次
+    rc-update add chronyd default
+    rc-service chronyd stop >/dev/null 2>&1 || true
+    
+    echo -e "${YELLOW}🚀 正在进行首次强制对时...${RESET}"
+    chronyd -q 'server ntp.aliyun.com iburst' || true
+    
+    rc-service chronyd start
+    echo -e "${GREEN}✔ Chrony 服务已启动${RESET}"
+    date
 
-        # 配置 Locale
-        echo -e "${YELLOW}正在生成语言环境: $target_lang...${RESET}"
-        sed -i "s/^#\?\s*\($target_lang UTF-8\)/\1/" /etc/locale.gen || echo "$target_lang UTF-8" >> /etc/locale.gen
-        locale-gen "$target_lang"
-        
-        # 强制写入配置
-        update-locale LANG="$target_lang" LC_ALL="$target_lang"
-        echo "LANG=$target_lang" > /etc/default/locale
-        echo "LC_ALL=$target_lang" >> /etc/default/locale
-        
-    elif [[ "$OS" == "Alpine" ]]; then
-        echo -e "${YELLOW}正在通过 apk 安装字体包...${RESET}"
-        if [[ "$target_lang" == "zh_CN.UTF-8" ]]; then
-            # 包含 edge testing 库以获取中文支持
-            apk add --no-cache ttf-dejavu font-wqy-zenhei --repository http://dl-cdn.alpinelinux.org/alpine/edge/testing
-        else
-            apk add --no-cache ttf-dejavu
-        fi
-        
-        # Alpine 的环境变量持久化
-        echo -e "${YELLOW}正在配置环境变量...${RESET}"
-        echo "export LANG=$target_lang" > /etc/profile.d/locale.sh
-        echo "export LC_ALL=$target_lang" >> /etc/profile.d/locale.sh
-        chmod +x /etc/profile.d/locale.sh
+else
+    # ================= Debian/Ubuntu 逻辑 =================
+    echo -e "${YELLOW}🔄 检查并关闭冲突的 NTP 服务...${RESET}"
+    systemctl stop ntp chrony 2>/dev/null || true
+    systemctl disable ntp chrony 2>/dev/null || true
+
+    if ! dpkg -s systemd-timesyncd >/dev/null 2>&1; then
+        echo -e "${YELLOW}📦 安装 systemd-timesyncd...${RESET}"
+        apt update -y && apt install -y systemd-timesyncd
     fi
 
-    # 立即对当前 Shell 生效
-    export LANG="$target_lang"
-    export LC_ALL="$target_lang"
-}
+    echo -e "${YELLOW}🚀 启动时间同步服务...${RESET}"
+    systemctl unmask systemd-timesyncd >/dev/null 2>&1 || true
+    timedatectl set-ntp false
+    sleep 1
+    timedatectl set-ntp true
+    systemctl restart systemd-timesyncd
 
-case "$choice" in
-    1)
-        apply_locale "zh_CN.UTF-8"
-        echo -e "${GREEN}✅ 中文环境配置完成。${RESET}"
-        echo -e "${YELLOW}提示：如果控制台未立即变中文，请重新连接 SSH 终端。${RESET}"
-        ;;
-    2)
-        apply_locale "en_US.UTF-8"
-        echo -e "${GREEN}✅ 英文环境配置完成。${RESET}"
-        ;;
-    0)
-        exit 0
-        ;;
-    *)
-        echo -e "${RED}无效选择${RESET}"
-        exit 1
-        ;;
-esac
-
-# 打印当前状态（如果支持）
-if command -v locale &>/dev/null; then
-    echo -e "\n${YELLOW}当前系统 Locale 状态：${RESET}"
-    locale
+    sleep 2
+    if systemctl is-active --quiet systemd-timesyncd; then
+        echo -e "${GREEN}✔ 时间同步已成功启动${RESET}"
+    else
+        echo -e "${RED}❌ 启动失败，请检查日志${RESET}"
+    fi
+    echo -e "${BLUE}========== 当前状态 ==========${RESET}"
+    timedatectl status
 fi
+
+echo -e "${BLUE}==================================${RESET}"

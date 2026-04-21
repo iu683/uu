@@ -1,192 +1,142 @@
-cat << 'EOF' > tools.sh
 #!/bin/bash
 
+# ========================================
+# SSH 端口修改与检测全能脚本
+# 适配: Ubuntu, Debian, Alpine, RHEL/CentOS
+# ========================================
+
 # 颜色定义
-BGreen='\033[1;32m'
-BRed='\033[1;31m'
-BYellow='\033[1;33m'
-BBlue='\033[1;34m'
-BPurple='\033[1;35m'
-BCyan='\033[1;36m'
-White='\033[1;37m'
-NC='\033[0m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+RESET='\033[0m'
 
-# 获取实时系统状态
-get_sys_status() {
-    MEM_TOTAL=$(free -m | awk '/Mem:/ {print $2}')
-    MEM_USED=$(free -m | awk '/Mem:/ {print $3}')
-    MEM_PCT=$((MEM_USED * 100 / MEM_TOTAL))
-    DISK_TOTAL=$(df -h / | awk '/\// {print $2}' | tail -n 1)
-    DISK_USED=$(df -h / | awk '/\// {print $3}' | tail -n 1)
-    DISK_PCT=$(df -h / | awk '/\// {print $5}' | tail -n 1)
-    CPU_PCT=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1"%"}')
-    OS=$(grep -w "PRETTY_NAME" /etc/os-release | cut -d '"' -f2)
-    UPTIME=$(uptime -p | sed 's/up //')
-    ARCH=$(uname -m)
-}
+# 1. 权限与系统检查
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}错误: 请使用 root 权限运行${RESET}"
+    exit 1
+fi
 
-# 顶部看板
-draw_banner() {
-    clear
-    echo -e "${BCyan}"
-    echo "  __     ______  _____   _______ ____   ____  _      "
-    echo "  \ \   / /  _ \|  __ \ /|__   __/ __ \ / __ \| |     "
-    echo "   \ \_/ /| |_) | |__) |    | | | |  | | |  | | |     "
-    echo "    \   / |  __/|  _  /     | | | |  | | |  | | |     "
-    echo "     | |  | |   | | \ \     | | | |__| | |__| | |____ "
-    echo "     |_|  |_|   |_|  \_\    |_|  \____/ \____/|______|"
-    echo -e "    ${BYellow}>> VPS 综合管理工具箱 <<${NC}"
-    
-    get_sys_status
-    echo -e "${BCyan}┌──────────────────────────────────────────────────────┐${NC}"
-    echo -e "${BCyan}│${NC} 系统状态：${BGreen}正常${NC}                                     ${BCyan}│${NC}"
-    printf "${BCyan}│${NC} 内存占用：%-38s ${BCyan}│${NC}\n" "${MEM_USED}M / ${MEM_TOTAL}M (${MEM_PCT}%)"
-    printf "${BCyan}│${NC} 磁盘占用：%-38s ${BCyan}│${NC}\n" "${DISK_USED} / ${DISK_TOTAL} (${DISK_PCT})"
-    printf "${BCyan}│${NC} CPU 使用：%-38s ${BCyan}│${NC}\n" "${CPU_PCT}"
-    echo -e "${BCyan}└──────────────────────────────────────────────────────┘${NC}"
-    echo -e " 💻 系统 : ${White}$OS${NC} (${ARCH})"
-    echo -e " 🚀 在线 : ${White}$UPTIME${NC}"
-    echo -e "${BCyan}────────────────────────────────────────────────────────${NC}"
-}
+if [ -f /etc/alpine-release ]; then
+    OS="Alpine"
+elif grep -qi "ubuntu" /etc/os-release; then
+    OS="Ubuntu"
+elif [ -f /etc/debian_version ]; then
+    OS="Debian"
+else
+    OS="Linux"
+fi
 
-# 一级主菜单 - 纯文字版
-main_menu() {
-    draw_banner
-    echo -e " ${BBlue}功能分类${NC}"
-    echo ""
-    echo -e "  ${BYellow}1. 系统维护 (更新/清理/重启)${NC}"
-    echo -e "  ${BYellow}2. 网络安全 (BBR/WARP/密钥)${NC}"
-    echo -e "  ${BYellow}3. 测试监控 (解锁/测速/探针)${NC}"
-    echo -e "  ${BYellow}4. 应用转发 (面板/转发/DDNS)${NC}"
-    echo ""
-    echo -e "${BCyan}────────────────────────────────────────────────────────${NC}"
-    echo -e "  ${BRed}0.${NC} 退出脚本"
-    echo ""
-}
+echo -e "${GREEN}检测到系统: $OS${RESET}"
 
-# 二级菜单 - 单列竖排
-menu_system() {
-    while true; do
-        draw_banner
-        echo -e " ${BGreen}系统维护${NC}"
-        echo -e "  1. 更新系统"
-        echo -e "  2. 系统信息查询"
-        echo -e "  3. 系统清理"
-        echo -e "  4. 修改主机名"
-        echo -e "  5. 修改Root密码"
-        echo -e "  6. 修改SSH端口"
-        echo -e "  7. 设置SWAP内存"
-        echo -e "  8. 系统重启"
-        echo -e "  9. 重装系统(DD)"
-        echo -e "\n  ${BRed}0. 返回主菜单${NC}"
-        read -p " 请输入选择: " sub
-        case "$sub" in
-            1) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/vpsup.sh) ;;
-            2) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/vpsx.sh) ;;
-            3) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/vpsq.sh) ;;
-            4) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/hostname.sh) ;;
-            5) sudo passwd root ;;
-            6) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/vpssshdk.sh) ;;
-            7) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/vpsswap.sh) ;;
-            8) sudo reboot ;;
-            9) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/VPSDD.sh) ;;
-            0) break ;;
-        esac
-    done
-}
+# 2. 安装必要工具 (nc)
+echo -e "${YELLOW}检查必要工具...${RESET}"
+if ! command -v nc >/dev/null 2>&1; then
+    if [ "$OS" = "Alpine" ]; then
+        apk add --no-cache netcat-openbsd >/dev/null 2>&1
+    else
+        apt-get update -y >/dev/null 2>&1
+        apt-get install -y netcat-openbsd >/dev/null 2>&1
+    fi
+fi
 
-menu_network() {
-    while true; do
-        draw_banner
-        echo -e " ${BYellow}网络安全${NC}"
-        echo -e "  1. 开启BBR加速"
-        echo -e "  2. 切换v4/v6优先级"
-        echo -e "  3. 开放所有端口"
-        echo -e "  4. DNS 设置"
-        echo -e "  5. AkileDNS"
-        echo -e "  6. SSH密钥登录"
-        echo -e "  7. Fail2Ban防刷"
-        echo -e "  8. CF WARP"
-        echo -e "  9. EasyTier组网"
-        echo -e "\n  ${BRed}0. 返回主菜单${NC}"
-        read -p " 请输入选择: " sub
-        case "$sub" in
-            1) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/BBR.sh) ;;
-            2) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/qhwl.sh) ;;
-            3) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/opendk.sh) ;;
-            4) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/DNS.sh) ;;
-            5) wget -qO- https://raw.githubusercontent.com/akile-network/aktools/refs/heads/main/akdns.sh | bash ;;
-            6) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/sshkey.sh) ;;
-            7) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/Fail2Ban.sh) ;;
-            8) wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh ;;
-            9) bash <(curl -sL https://raw.githubusercontent.com/ceocok/c.cococ/refs/heads/main/easytier.sh) ;;
-            0) break ;;
-        esac
-    done
-}
+# 3. 获取端口信息
+current_port=$(grep -E '^ *Port [0-9]+' /etc/ssh/sshd_config | awk '{print $2}' | head -n1)
+current_port=${current_port:-22}
+echo -e "${YELLOW}当前 SSH 端口: $current_port${RESET}"
 
-menu_test() {
-    while true; do
-        draw_banner
-        echo -e " ${BCyan}测试监控${NC}"
-        echo -e "  1. 流媒体解锁测试"
-        echo -e "  2. 回程线路测试"
-        echo -e "  3. 节点质量测速"
-        echo -e "  4. 卸载哪吒探针"
-        echo -e "  5. 关闭哪吒V1指令执行"
-        echo -e "\n  ${BRed}0. 返回主菜单${NC}"
-        read -p " 请输入选择: " sub
-        case "$sub" in
-            1) bash <(curl -L -s https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh) ;;
-            2) curl https://raw.githubusercontent.com/ludashi2020/backtrace/main/install.sh -sSf | sh ;;
-            3) bash <(curl -sL https://run.NodeQuality.com) ;;
-            4) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/agent.sh) ;;
-            5) sed -i 's/disable_command_execute: false/disable_command_execute: true/' /opt/nezha/agent/config.yml && systemctl restart nezha-agent ;;
-            0) break ;;
-        esac
-    done
-}
+read -p "请输入新的 SSH 端口号: " new_port
+if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -le 0 ] || [ "$new_port" -gt 65535 ]; then
+    echo -e "${RED}错误: 端口无效！${RESET}"
+    exit 1
+fi
 
-menu_app() {
-    while true; do
-        draw_banner
-        echo -e " ${BPurple}应用转发${NC}"
-        echo -e "  1. 3x-ui 面板"
-        echo -e "  2. Realm 转发"
-        echo -e "  3. 流量监控狗"
-        echo -e "  4. vless-all-in-one"
-        echo -e "  5. SS-Xray-2go"
-        echo -e "  6. Emby反代配置"
-        echo -e "  7. DDNS 脚本"
-        echo -e "\n  ${BRed}0. 返回主菜单${NC}"
-        read -p " 请输入选择: " sub
-        case "$sub" in
-            1) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/3xui.sh) ;;
-            2) wget -qO- https://raw.githubusercontent.com/zywe03/realm-xwPF/main/xwPF.sh | sudo bash -s install ;;
-            3) wget -O port-traffic-dog.sh https://raw.githubusercontent.com/zywe03/realm-xwPF/main/port-traffic-dog.sh && chmod +x port-traffic-dog.sh && ./port-traffic-dog.sh ;;
-            4) wget -O vless-server.sh https://raw.githubusercontent.com/Zyx0rx/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh ;;
-            5) bash <(curl -Ls https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh) ;;
-            6) bash <(curl -sL https://raw.githubusercontent.com/Polarisiu/tool/main/Embyfd.sh) ;;
-            7) bash <(wget -qO- https://raw.githubusercontent.com/mocchen/cssmeihua/mochen/shell/ddns.sh) ;;
-            0) break ;;
-        esac
-    done
-}
+# 4. 备份与修改配置
+cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$(date +%Y%m%d_%H%M%S)"
+if grep -q "^Port " /etc/ssh/sshd_config; then
+    sed -i "s/^Port .*/Port $new_port/" /etc/ssh/sshd_config
+else
+    echo "Port $new_port" >> /etc/ssh/sshd_config
+fi
 
-# --- 程序入口 ---
-while true; do
-    main_menu
-    read -p " 请输入分类编号 [0-4]: " choice
-    case "$choice" in
-        1) menu_system ;;
-        2) menu_network ;;
-        3) menu_test ;;
-        4) menu_app ;;
-        0) exit 0 ;;
-        *) echo -e "${BRed}无效输入${NC}" && sleep 1 ;;
-    esac
+# 5. 放行防火墙
+echo -e "${YELLOW}正在放行防火墙端口 $new_port...${RESET}"
+if command -v ufw >/dev/null 2>&1; then
+    ufw allow "$new_port"/tcp >/dev/null 2>&1 || true
+elif command -v firewall-cmd >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port="$new_port"/tcp >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+elif command -v iptables >/dev/null 2>&1; then
+    iptables -I INPUT -p tcp --dport "$new_port" -j ACCEPT 2>/dev/null || true
+fi
+
+# 6. 重启服务 (解决 Ubuntu 常见冲突)
+echo -e "${YELLOW}正在重启 SSH 服务...${RESET}"
+# 在 Ubuntu 上，必须先停止可能接管 22 端口的 ssh.socket
+if [[ "$OS" == "Ubuntu" ]] || [[ "$OS" == "Debian" ]]; then
+    systemctl stop ssh.socket >/dev/null 2>&1 || true
+    systemctl disable ssh.socket >/dev/null 2>&1 || true
+fi
+
+restart_done=false
+for svc in ssh sshd; do
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl restart "$svc" >/dev/null 2>&1 && restart_done=true && break
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service "$svc" restart >/dev/null 2>&1 && restart_done=true && break
+    fi
 done
-EOF
 
-chmod +x tools.sh
-./tools.sh
+if [ "$restart_done" = false ]; then
+    echo -e "${RED}❌ SSH 服务重启失败！${RESET}"
+    exit 1
+fi
+
+# 7. 本地监听检测 (增加重试逻辑)
+echo -e "${YELLOW}正在检测本地监听状态...${RESET}"
+SUCCESS=false
+for i in {1..5}; do
+    sleep 2
+    if command -v ss >/dev/null 2>&1; then
+        CHECK=$(ss -tlnp | grep ":$new_port ")
+    else
+        CHECK=$(netstat -tlnp | grep ":$new_port ")
+    fi
+    
+    if [ -n "$CHECK" ]; then
+        SUCCESS=true && break
+    fi
+    echo -e "${YELLOW}等待服务绑定端口... ($i/5)${RESET}"
+done
+
+if [ "$SUCCESS" = true ]; then
+    echo -e "${GREEN}✔ 本地端口 $new_port 监听成功${RESET}"
+else
+    echo -e "${RED}❌ 本地检测失败，SSH 可能未能在新端口启动${RESET}"
+    exit 1
+fi
+
+# 8. 远程连通性检测
+echo -e "${YELLOW}正在执行远程连通性检测...${RESET}"
+# 获取外网 IP (容错处理)
+PUBLIC_IP=$(curl -sL --max-time 8 https://api.ipify.org || curl -sL --max-time 8 https://ifconfig.me || echo "")
+
+if [ -n "$PUBLIC_IP" ]; then
+    echo -e "外网 IP: $PUBLIC_IP"
+    # 使用 nc 检测，支持多系统返回特征
+    if timeout 5 nc -zv "$PUBLIC_IP" "$new_port" 2>&1 | grep -q "succeeded\|open"; then
+        echo -e "${GREEN}✔ 远程检测通过！端口 $new_port 已开放${RESET}"
+    else
+        echo -e "${RED}❌ 远程检测失败！${RESET}"
+        echo -e "${YELLOW}排查建议：${RESET}"
+        echo -e "1. 确认云服务商控制台（安全组）放行了 TCP:$new_port"
+        echo -e "2. 确认系统内防火墙状态：ufw status 或 iptables -L"
+    fi
+else
+    echo -e "${RED}⚠ 无法获取外网 IP，跳过远程检测，请手动测试连接。${RESET}"
+fi
+
+echo -e "\n${GREEN}========================================${RESET}"
+echo -e "${GREEN}  操作完成！当前 SSH 端口为: $new_port ${RESET}"
+echo -e "${YELLOW}  请务必打开新窗口测试连接，确认成功后再退出！${RESET}"
+echo -e "${GREEN}========================================${RESET}"

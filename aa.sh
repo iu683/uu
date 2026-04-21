@@ -1,627 +1,758 @@
-#!/usr/bin/env bash
-# Emby Proxy Alpine Lite - Menu Edition
-# Alpine / NAT VPS / 非标准端口 / DNS 验证 / HTTPS 上游 / 多站点共存
+#!/bin/bash
 
-set -euo pipefail
+# 输出字体颜色
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[0;33m"
+NC="\033[0m"
+GREEN_ground="\033[42;37m" # 全局绿色
+RED_ground="\033[41;37m"   # 全局红色
+Info="${GREEN}[信息]${NC}"
+Error="${RED}[错误]${NC}"
+Tip="${YELLOW}[提示]${NC}"
 
-TOOL_NAME="emby-proxy-alpine-lite"
-NGINX_MAIN="/etc/nginx/nginx.conf"
-HTTP_D="/etc/nginx/http.d"
-CONF_PREFIX="emby-lite-"
-ACME_HOME="/root/.acme.sh"
-CERT_HOME="/etc/nginx/certs"
+cop_info(){
+clear
+echo -e "${GREEN}######################################
+#      ${RED}   DDNS 管理         ${GREEN}#
+######################################${NC}"
+echo
+}
 
-need_root() {
-  [ "$(id -u)" -eq 0 ] || {
-    echo "请用 root 运行"
+# 检查系统是否为 Debian、Ubuntu 或 Alpine
+if ! grep -qiE "debian|ubuntu|alpine" /etc/os-release; then
+    echo -e "${RED}本脚本仅支持 Debian、Ubuntu 或 Alpine 系统，请在这些系统上运行。${NC}"
     exit 1
-  }
-}
+fi
 
-prompt() {
-  local var_name="$1"
-  local text="$2"
-  local default="${3:-}"
-  local value=""
-  if [ -n "$default" ]; then
-    read -r -p "$text [$default]: " value </dev/tty || true
-    value="${value:-$default}"
-  else
-    read -r -p "$text: " value </dev/tty || true
-  fi
-  printf -v "$var_name" '%s' "$value"
-}
-
-yesno() {
-  local var_name="$1"
-  local text="$2"
-  local default="${3:-y}"
-  local ans=""
-  local hint="y/N"
-  [ "$default" = "y" ] && hint="Y/n"
-  read -r -p "$text [$hint]: " ans </dev/tty || true
-  ans="${ans:-$default}"
-  case "$ans" in
-    y|Y|yes|YES) printf -v "$var_name" 'y' ;;
-    *) printf -v "$var_name" 'n' ;;
-  esac
-}
-
-strip_scheme() {
-  local s="${1:-}"
-  s="${s#http://}"
-  s="${s#https://}"
-  s="${s%%/}"
-  echo "$s"
-}
-
-sanitize_name() {
-  echo "$1" | sed 's/[^A-Za-z0-9._-]/_/g'
-}
-
-is_port() {
-  local p="${1:-}"
-  [ -n "$p" ] || return 1
-  case "$p" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  [ "$p" -ge 1 ] && [ "$p" -le 65535 ]
-}
-
-is_valid_email() {
-  local email="${1:-}"
-  [[ "$email" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]
-}
-
-ensure_deps() {
-  echo "==> 安装依赖..."
-  apk add --no-cache nginx bash curl ca-certificates openssl socat apache2-utils iproute2 >/dev/null
-}
-
-ensure_dirs() {
-  mkdir -p /run/nginx
-  mkdir -p "$HTTP_D"
-  mkdir -p /var/log/nginx
-  mkdir -p "$CERT_HOME"
-}
-
-backup_nginx_conf() {
-  [ -f "$NGINX_MAIN" ] && cp -f "$NGINX_MAIN" "${NGINX_MAIN}.bak.$(date +%s)" || true
-}
-
-install_or_init_acme_sh() {
-  local acme_email="$1"
-
-  if ! is_valid_email "$acme_email"; then
-    echo "邮箱格式不合法: $acme_email"
+# 检查是否为root用户
+if [[ $(whoami) != "root" ]]; then
+    echo -e "${Error}请以root身份执行该脚本！"
     exit 1
-  fi
-
-  if [ ! -x "${ACME_HOME}/acme.sh" ]; then
-    echo "==> 安装 acme.sh ..."
-    curl -fsSL https://get.acme.sh | sh -s email="$acme_email"
-  fi
-
-  echo "==> 设置 acme.sh 默认 CA 为 Let's Encrypt ..."
-  "${ACME_HOME}/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-
-  echo "==> 注册/更新 ACME 账户邮箱 ..."
-  "${ACME_HOME}/acme.sh" --register-account -m "$acme_email" --server letsencrypt
-}
-
-setup_dns_env() {
-  local provider="$1"
-
-  case "$provider" in
-    cloudflare)
-      prompt CF_Token "请输入 Cloudflare API Token"
-      [ -n "${CF_Token:-}" ] || { echo "CF_Token 不能为空"; exit 1; }
-      export CF_Token
-      ;;
-    aliyun)
-      prompt Ali_Key "请输入阿里云 Ali_Key"
-      prompt Ali_Secret "请输入阿里云 Ali_Secret"
-      [ -n "${Ali_Key:-}" ] || { echo "Ali_Key 不能为空"; exit 1; }
-      [ -n "${Ali_Secret:-}" ] || { echo "Ali_Secret 不能为空"; exit 1; }
-      export Ali_Key Ali_Secret
-      ;;
-    dnspod)
-      prompt DP_Id "请输入 DNSPod DP_Id"
-      prompt DP_Key "请输入 DNSPod DP_Key"
-      [ -n "${DP_Id:-}" ] || { echo "DP_Id 不能为空"; exit 1; }
-      [ -n "${DP_Key:-}" ] || { echo "DP_Key 不能为空"; exit 1; }
-      export DP_Id DP_Key
-      ;;
-    *)
-      echo "不支持的 DNS 提供商: $provider"
-      exit 1
-      ;;
-  esac
-}
-
-choose_dns_provider() {
-  echo "请选择 DNS 提供商："
-  echo "1) cloudflare"
-  echo "2) aliyun"
-  echo "3) dnspod"
-  read -r -p "输入序号: " DNS_CHOICE </dev/tty
-
-  case "$DNS_CHOICE" in
-    1) DNS_PROVIDER="cloudflare" ;;
-    2) DNS_PROVIDER="aliyun" ;;
-    3) DNS_PROVIDER="dnspod" ;;
-    *) echo "无效选择"; return 1 ;;
-  esac
-}
-
-issue_cert() {
-  local domain="$1"
-  local provider="$2"
-
-  echo "==> 申请证书: ${domain}"
-
-  case "$provider" in
-    cloudflare)
-      "${ACME_HOME}/acme.sh" --issue --dns dns_cf -d "$domain" --keylength ec-256
-      ;;
-    aliyun)
-      "${ACME_HOME}/acme.sh" --issue --dns dns_ali -d "$domain" --keylength ec-256
-      ;;
-    dnspod)
-      "${ACME_HOME}/acme.sh" --issue --dns dns_dp -d "$domain" --keylength ec-256
-      ;;
-    *)
-      echo "不支持的 DNS 提供商: $provider"
-      exit 1
-      ;;
-  esac
-}
-
-install_cert() {
-  local domain="$1"
-  local cert_dir="${CERT_HOME}/${domain}"
-  mkdir -p "$cert_dir"
-
-  echo "==> 安装证书到 ${cert_dir}"
-
-  "${ACME_HOME}/acme.sh" --install-cert -d "$domain" \
-    --ecc \
-    --fullchain-file "${cert_dir}/fullchain.cer" \
-    --key-file "${cert_dir}/private.key" \
-    --reloadcmd "rc-service nginx reload || rc-service nginx restart || true"
-}
-
-write_main_nginx_conf() {
-  echo "==> 写入轻量 nginx.conf ..."
-  cat > "$NGINX_MAIN" <<'EOF'
-user nginx;
-worker_processes 1;
-pid /run/nginx/nginx.pid;
-
-events {
-    worker_connections 512;
-    use epoll;
-    multi_accept on;
-}
-
-http {
-    include       /etc/nginx/mime.types;
-    default_type  application/octet-stream;
-
-    sendfile on;
-    tcp_nopush on;
-    tcp_nodelay on;
-
-    keepalive_timeout 15;
-    keepalive_requests 100;
-
-    client_body_timeout 10s;
-    client_header_timeout 10s;
-    send_timeout 30s;
-
-    types_hash_max_size 2048;
-    server_tokens off;
-
-    access_log off;
-    error_log /var/log/nginx/error.log warn;
-
-    include /etc/nginx/http.d/*.conf;
-}
-EOF
-}
-
-conf_path_for_site() {
-  local domain="$1"
-  local port="$2"
-  echo "${HTTP_D}/${CONF_PREFIX}$(sanitize_name "$domain")-${port}.conf"
-}
-
-write_proxy_conf() {
-  local domain="$1"
-  local listen_port="$2"
-  local upstream_host="$3"
-  local upstream_port="$4"
-  local enable_auth="$5"
-  local auth_user="$6"
-  local auth_pass="$7"
-  local skip_verify="$8"
-
-  local conf_path
-  conf_path="$(conf_path_for_site "$domain" "$listen_port")"
-  local htpasswd_file="/etc/nginx/.htpasswd-emby-lite-${listen_port}"
-  local cert_dir="${CERT_HOME}/${domain}"
-
-  if [ "$enable_auth" = "y" ]; then
-    htpasswd -bc "$htpasswd_file" "$auth_user" "$auth_pass" >/dev/null
-  fi
-
-  local auth_block=""
-  if [ "$enable_auth" = "y" ]; then
-    auth_block=$(cat <<EOF
-        auth_basic "Restricted";
-        auth_basic_user_file ${htpasswd_file};
-EOF
-)
-  fi
-
-  local ssl_verify_block=""
-  if [ "$skip_verify" = "y" ]; then
-    ssl_verify_block="        proxy_ssl_verify off;"
-  fi
-
-  cat > "$conf_path" <<EOF
-# META domain=${domain} port=${listen_port} upstream=${upstream_host}:${upstream_port} basicauth=${enable_auth}
-
-map \$http_upgrade \$connection_upgrade {
-    default upgrade;
-    ''      close;
-}
-
-server {
-    listen ${listen_port} ssl;
-    listen [::]:${listen_port} ssl;
-    server_name ${domain};
-
-    ssl_certificate     ${cert_dir}/fullchain.cer;
-    ssl_certificate_key ${cert_dir}/private.key;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 10m;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers off;
-
-    access_log off;
-    error_log /var/log/nginx/emby-lite-${listen_port}.error.log warn;
-
-    location / {
-${auth_block}
-        proxy_pass https://${upstream_host}:${upstream_port};
-        proxy_http_version 1.1;
-
-        proxy_set_header Host \$proxy_host;
-        proxy_set_header X-Forwarded-Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
-
-        proxy_set_header Range \$http_range;
-        proxy_set_header If-Range \$http_if_range;
-
-        proxy_buffering off;
-        proxy_request_buffering off;
-
-        proxy_connect_timeout 5s;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-
-        proxy_ssl_server_name on;
-${ssl_verify_block}
-
-        client_max_body_size 500m;
-    }
-}
-EOF
-
-  echo "$conf_path"
-}
-
-test_nginx() {
-  echo "==> 检查 nginx 配置..."
-  nginx -t
-}
-
-enable_start_nginx() {
-  rc-update add nginx default >/dev/null 2>&1 || true
-  rc-service nginx start >/dev/null 2>&1 || true
-}
-
-reload_nginx() {
-  echo "==> 重载 nginx ..."
-  rc-service nginx reload >/dev/null 2>&1 || rc-service nginx restart >/dev/null 2>&1 || nginx -s reload
-}
-
-site_exists() {
-  local domain="$1"
-  local port="$2"
-  local conf
-  conf="$(conf_path_for_site "$domain" "$port")"
-  [ -f "$conf" ]
-}
-
-list_sites() {
-  echo "=== 已有站点 ==="
-  local found=0
-  for f in "${HTTP_D}/${CONF_PREFIX}"*.conf; do
-    [ -e "$f" ] || continue
-    found=1
-    local meta domain port upstream
-    meta="$(grep -E '^# META ' "$f" | head -n1 || true)"
-    domain="$(echo "$meta" | sed -n 's/.*domain=\([^ ]*\).*/\1/p')"
-    port="$(echo "$meta" | sed -n 's/.*port=\([^ ]*\).*/\1/p')"
-    upstream="$(echo "$meta" | sed -n 's/.*upstream=\([^ ]*\).*/\1/p')"
-    echo "- 域名: ${domain:-未知} | 端口: ${port:-未知} | 上游: ${upstream:-未知}"
-    echo "  配置: $f"
-  done
-  [ "$found" -eq 1 ] || echo "（空）"
-  echo
-}
-
-init_system() {
-  need_root
-  ensure_deps
-  ensure_dirs
-  backup_nginx_conf
-
-  prompt ACME_EMAIL "请输入用于申请证书的合法邮箱"
-  is_valid_email "$ACME_EMAIL" || { echo "邮箱格式不合法"; return 1; }
-
-  install_or_init_acme_sh "$ACME_EMAIL"
-  write_main_nginx_conf
-  test_nginx
-  enable_start_nginx
-  reload_nginx
-
-  echo "==> 初始化完成"
-  echo
-}
-
-add_site() {
-  need_root
-  ensure_deps
-  ensure_dirs
-
-  if [ ! -x "${ACME_HOME}/acme.sh" ]; then
-    echo "未检测到 acme.sh，请先执行「初始化系统环境」"
-    return 1
-  fi
-
-  if [ ! -f "$NGINX_MAIN" ]; then
-    echo "未检测到 nginx 主配置，请先执行「初始化系统环境」"
-    return 1
-  fi
-
-  prompt DOMAIN "请输入入口域名（必须已解析到本机公网IP）"
-  DOMAIN="$(strip_scheme "$DOMAIN")"
-  [ -n "$DOMAIN" ] || { echo "域名不能为空"; return 1; }
-
-  prompt LISTEN_PORT "请输入 HTTPS 监听端口（如 2053 / 52443）" "52443"
-  is_port "$LISTEN_PORT" || { echo "端口不合法"; return 1; }
-
-  prompt UPSTREAM_HOST "请输入 HTTPS 上游主机名或IP（不要带 https://）"
-  UPSTREAM_HOST="$(strip_scheme "$UPSTREAM_HOST")"
-  [ -n "$UPSTREAM_HOST" ] || { echo "上游主机不能为空"; return 1; }
-
-  prompt UPSTREAM_PORT "请输入 HTTPS 上游端口" "443"
-  is_port "$UPSTREAM_PORT" || { echo "上游端口不合法"; return 1; }
-
-  if site_exists "$DOMAIN" "$LISTEN_PORT"; then
-    yesno OVERWRITE "检测到相同 域名+端口 配置已存在，是否覆盖" "n"
-    [ "$OVERWRITE" = "y" ] || { echo "已取消"; return 0; }
-  fi
-
-  choose_dns_provider || return 1
-  setup_dns_env "$DNS_PROVIDER"
-
-  yesno ENABLE_AUTH "是否启用 BasicAuth 额外门禁" "n"
-  AUTH_USER="emby"
-  AUTH_PASS=""
-  if [ "$ENABLE_AUTH" = "y" ]; then
-    prompt AUTH_USER "BasicAuth 用户名" "emby"
-    prompt AUTH_PASS "BasicAuth 密码"
-    [ -n "$AUTH_PASS" ] || { echo "密码不能为空"; return 1; }
-  fi
-
-  yesno SKIP_VERIFY "如上游 HTTPS 证书异常/自签，是否跳过验证" "y"
-
-  issue_cert "$DOMAIN" "$DNS_PROVIDER"
-  install_cert "$DOMAIN"
-  conf_path="$(write_proxy_conf "$DOMAIN" "$LISTEN_PORT" "$UPSTREAM_HOST" "$UPSTREAM_PORT" "$ENABLE_AUTH" "$AUTH_USER" "$AUTH_PASS" "$SKIP_VERIFY")"
-
-  echo "==> 已写入配置: $conf_path"
-  test_nginx
-  enable_start_nginx
-  reload_nginx
-
-  echo "==> 当前监听端口："
-  ss -lntp | grep -E ":${LISTEN_PORT}\b" || true
-
-  echo
-  echo "新增完成，访问地址："
-  echo "https://${DOMAIN}:${LISTEN_PORT}"
-  echo
-}
-
-remove_site() {
-  need_root
-
-  list_sites
-  prompt DOMAIN "请输入要删除的域名"
-  DOMAIN="$(strip_scheme "$DOMAIN")"
-  [ -n "$DOMAIN" ] || { echo "域名不能为空"; return 1; }
-
-  prompt LISTEN_PORT "请输入该域名对应的监听端口"
-  is_port "$LISTEN_PORT" || { echo "端口不合法"; return 1; }
-
-  local conf
-  conf="$(conf_path_for_site "$DOMAIN" "$LISTEN_PORT")"
-
-  if [ ! -f "$conf" ]; then
-    echo "未找到配置文件：$conf"
-    return 1
-  fi
-
-  yesno CONFIRM_REMOVE "确认删除该站点配置" "n"
-  [ "$CONFIRM_REMOVE" = "y" ] || { echo "已取消"; return 0; }
-
-  rm -f "$conf"
-  rm -f "/etc/nginx/.htpasswd-emby-lite-${LISTEN_PORT}" 2>/dev/null || true
-
-  yesno REMOVE_CERT "是否同时删除该域名证书目录 ${CERT_HOME}/${DOMAIN}" "n"
-  if [ "$REMOVE_CERT" = "y" ]; then
-    rm -rf "${CERT_HOME}/${DOMAIN}"
-  fi
-
-  test_nginx
-  reload_nginx
-  echo "==> 删除完成"
-  echo
-}
-
-uninstall_all() {
-  need_root
-  yesno CONFIRM "确认卸载所有站点与证书" "n"
-  [ "$CONFIRM" = "y" ] || { echo "已取消"; return 0; }
-
-  rm -f "${HTTP_D}/${CONF_PREFIX}"*.conf 2>/dev/null || true
-  rm -f /etc/nginx/.htpasswd-emby-lite-* 2>/dev/null || true
-  rm -rf "$CERT_HOME"/*
-  rm -rf "$ACME_HOME"
-
-  if ls /etc/nginx/nginx.conf.bak.* >/dev/null 2>&1; then
-    latest_bak="$(ls -1t /etc/nginx/nginx.conf.bak.* | head -n1)"
-    yesno RESTORE_MAIN "检测到 nginx.conf 备份，是否恢复最近一次备份" "y"
-    if [ "$RESTORE_MAIN" = "y" ]; then
-      cp -f "$latest_bak" /etc/nginx/nginx.conf
+fi
+
+# 检查是否安装 curl 和 GNU grep（仅 Alpine），如果没有安装，则安装它们
+check_curl() {
+    if ! command -v curl &>/dev/null; then
+        echo -e "${YELLOW}未检测到 curl，正在安装 curl...${NC}"
+
+        # 根据不同的系统类型选择安装命令
+        if grep -qiE "debian|ubuntu" /etc/os-release; then
+            apt update
+            apt install -y curl
+            if [ $? -ne 0 ]; then
+                echo -e "${RED}在 Debian/Ubuntu 上安装 curl 失败，请手动安装后重新运行脚本。${NC}"
+                exit 1
+            fi
+        elif grep -qiE "alpine" /etc/os-release; then
+            apk update
+            apk add curl
+            if [ $? -ne 0 ]; then
+                echo -e "${RED}在 Alpine 上安装 curl 失败，请手动安装后重新运行脚本。${NC}"
+                exit 1
+            fi
+        fi
     fi
-  fi
 
-  if nginx -t >/dev/null 2>&1; then
-    reload_nginx
-  else
-    rc-service nginx stop >/dev/null 2>&1 || true
-  fi
-
-  yesno REMOVE_NGINX "是否卸载 nginx 软件包（仅当本机不再需要 nginx 时选择 y）" "n"
-  if [ "$REMOVE_NGINX" = "y" ]; then
-    rc-service nginx stop >/dev/null 2>&1 || true
-    rc-update del nginx default >/dev/null 2>&1 || true
-    apk del nginx >/dev/null 2>&1 || true
-  fi
-
-  echo "==> 卸载完成"
-  echo
+    # 仅在 Alpine 系统上检查是否为 GNU 版本的 grep，如果不是，则安装 GNU grep
+    if grep -qiE "alpine" /etc/os-release; then
+        if ! grep --version 2>/dev/null | grep -q "GNU"; then
+            echo -e "${YELLOW}当前 grep 不是 GNU 版本，正在安装 GNU grep...${NC}"
+            
+            apk update
+            apk add grep
+            if [ $? -ne 0 ]; then
+                echo -e "${RED}在 Alpine 上安装 GNU grep 失败，请手动安装后重新运行脚本。${NC}"
+                exit 1
+            fi
+        else
+            echo -e "${GREEN}GNU grep 已经安装。${NC}"
+        fi
+    fi
 }
 
-# 普通反代配置
-write_common_proxy_conf() {
-  local domain="$1"
-  local listen_port="$2"
-  local upstream_host="$3"
-  local upstream_port="$4"
+# 开始安装DDNS
+install_ddns(){
+    if [ ! -f "/usr/bin/ddns" ]; then
+        curl -o /usr/bin/ddns https://raw.githubusercontent.com/mocchen/cssmeihua/mochen/shell/ddns.sh && chmod +x /usr/bin/ddns
+    fi
+    mkdir -p /etc/DDNS
+    cat <<'EOF' > /etc/DDNS/DDNS
+#!/bin/bash
 
-  local conf_path="${HTTP_D}/${CONF_PREFIX}$(sanitize_name "$domain")-${listen_port}.conf"
-  local cert_dir="${CERT_HOME}/${domain}"
+# 引入环境变量文件
+source /etc/DDNS/.config
 
-  cat > "$conf_path" <<EOF
-# META domain=${domain} port=${listen_port} upstream=http://${upstream_host}:${upstream_port}
-server {
-    listen ${listen_port} ssl;
-    listen [::]:${listen_port} ssl;
-    server_name ${domain};
+# 保存旧的 IP 地址
+Old_Public_IPv4="$Old_Public_IPv4"
+Old_Public_IPv6="$Old_Public_IPv6"
 
-    # SSL 证书
-    ssl_certificate     ${cert_dir}/fullchain.cer;
-    ssl_certificate_key ${cert_dir}/private.key;
-    ssl_session_timeout 1d;
-    ssl_protocols TLSv1.2 TLSv1.3;
+for Domain in "${Domains[@]}"; do
+    # 获取根域名（假设是二级域名，截取主域名部分）
+    Root_domain=$(echo "$Domain" | awk -F '.' '{print $(NF-1)"."$NF}')
 
-    location / {
-        # 核心反代指向
-        proxy_pass http://${upstream_host}:${upstream_port};
-        
-        # 基础头部转发
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+    # 使用Cloudflare API获取根域名的区域ID
+    Zone_id=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$Root_domain" \
+         -H "X-Auth-Email: $Email" \
+         -H "X-Auth-Key: $Api_key" \
+         -H "Content-Type: application/json" \
+         | grep -Po '(?<="id":")[^"]*' | head -1)
 
-        # 完美支持 WebSocket (如 Docker 终端/控制台)
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+    # 获取IPv4 DNS记录ID
+    DNS_IDv4=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$Zone_id/dns_records?type=A&name=$Domain" \
+         -H "X-Auth-Email: $Email" \
+         -H "X-Auth-Key: $Api_key" \
+         -H "Content-Type: application/json" \
+         | grep -Po '(?<="id":")[^"]*' | head -1)
 
-        # 缓冲区优化，防止大文件传输中断
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_read_timeout 3600s;
-    }
-}
+    # 更新IPv4 DNS记录
+    curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$Zone_id/dns_records/$DNS_IDv4" \
+         -H "X-Auth-Email: $Email" \
+         -H "X-Auth-Key: $Api_key" \
+         -H "Content-Type: application/json" \
+         --data "{\"type\":\"A\",\"name\":\"$Domain\",\"content\":\"$Public_IPv4\"}" >/dev/null 2>&1
+done
+
+# -----------------------------
+# 处理 IPv6 域名的 DNS 更新
+# -----------------------------
+if [ "$ipv6_set" = "true" ]; then
+    for Domainv6 in "${Domainsv6[@]}"; do
+        # 获取根域名（假设是二级域名，截取主域名部分）
+        Root_domainv6=$(echo "$Domainv6" | awk -F '.' '{print $(NF-1)"."$NF}')
+
+        # 使用Cloudflare API获取根域名的区域ID
+        Zone_idv6=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$Root_domainv6" \
+             -H "X-Auth-Email: $Email" \
+             -H "X-Auth-Key: $Api_key" \
+             -H "Content-Type: application/json" \
+             | grep -Po '(?<="id":")[^"]*' | head -1)
+
+        # 获取IPv6 DNS记录ID
+        DNS_IDv6=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$Zone_idv6/dns_records?type=AAAA&name=$Domainv6" \
+             -H "X-Auth-Email: $Email" \
+             -H "X-Auth-Key: $Api_key" \
+             -H "Content-Type: application/json" \
+             | grep -Po '(?<="id":")[^"]*' | head -1)
+
+        # 更新IPv6 DNS记录
+        curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$Zone_idv6/dns_records/$DNS_IDv6" \
+             -H "X-Auth-Email: $Email" \
+             -H "X-Auth-Key: $Api_key" \
+             -H "Content-Type: application/json" \
+             --data "{\"type\":\"AAAA\",\"name\":\"$Domainv6\",\"content\":\"$Public_IPv6\"}" >/dev/null 2>&1
+    done
+fi
+
+# 发送Telegram通知
+if [[ -n "$Telegram_Bot_Token" && -n "$Telegram_Chat_ID" && (("$Public_IPv4" != "$Old_Public_IPv4" && -n "$Public_IPv4") || ("$Public_IPv6" != "$Old_Public_IPv6" && -n "$Public_IPv6")) ]]; then
+    send_telegram_notification
+fi
+
+# 延迟3秒
+sleep 3
+
+# 保存当前的 IP 地址到配置文件，但只有当 IP 地址有变化时才进行更新
+if [[ -n "$Public_IPv4" && "$Public_IPv4" != "$Old_Public_IPv4" ]]; then
+    sed -i "s/^Old_Public_IPv4=.*/Old_Public_IPv4=\"$Public_IPv4\"/" /etc/DDNS/.config
+fi
+
+# 检查 IPv6 地址是否有效且发生变化
+if [[ -n "$Public_IPv6" && "$Public_IPv6" != "$Old_Public_IPv6" ]]; then
+    sed -i "s/^Old_Public_IPv6=.*/Old_Public_IPv6=\"$Public_IPv6\"/" /etc/DDNS/.config
+fi
 EOF
-  echo "$conf_path"
+    cat <<'EOF' > /etc/DDNS/.config
+# 多域名支持
+Domains=("your_domain1.com" "your_domain2.com")     # 你要解析的IPv4域名数组
+ipv6_set="setting"                                    # 开启 IPv6 解析
+Domainsv6=("your_domainv6_1.com" "your_domainv6_2.com")  # 你要解析的IPv6域名数组
+Email="your_email@gmail.com"                       # 你在 Cloudflare 注册的邮箱
+Api_key="your_api_key"                             # 你的 Cloudflare API 密钥
+
+# Telegram Bot Token 和 Chat ID
+Telegram_Bot_Token=""
+Telegram_Chat_ID=""
+
+# 获取公网IP地址
+regex_pattern='^(eth|ens|eno|esp|enp)[0-9]+'
+
+# 获取网络接口列表
+InterFace=($(ip link show | awk -F': ' '{print $2}' | grep -E "$regex_pattern" | sed "s/@.*//g"))
+
+Public_IPv4=""
+Public_IPv6=""
+Old_Public_IPv4=""
+Old_Public_IPv6=""
+ipv4Regex="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
+ipv6Regex="^([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])$"
+
+# 检查操作系统类型
+if grep -qiE "debian|ubuntu" /etc/os-release; then
+    # Debian/Ubuntu系统的IP获取方法
+    for i in "${InterFace[@]}"; do
+        # 尝试通过第一个接口获取 IPv4 地址
+        ipv4=$(curl -s4 --max-time 3 --interface "$i" ip.sb -k | grep -E -v '^(2a09|104\.28)' || true)
+
+        # 如果第一个接口的 IPv4 地址获取失败，尝试备用接口
+        if [[ -z "$ipv4" ]]; then
+            ipv4=$(curl -s4 --max-time 3 --interface "$i" https://api.ipify.org -k | grep -E -v '^(2a09|104\.28)' || true)
+        fi
+
+        # 验证获取到的 IPv4 地址是否是有效的 IP 地址
+        if [[ -n "$ipv4" && "$ipv4" =~ $ipv4Regex ]]; then
+            Public_IPv4="$ipv4"
+        fi
+
+        # 检查是否启用了 IPv6 解析
+        if [[ "$ipv6_set" == "true" ]]; then
+            # 尝试通过第一个接口获取 IPv6 地址
+            ipv6=$(curl -s6 --max-time 3 --interface "$i" ip.sb -k | grep -E -v '^(2a09|104\.28)' || true)
+
+            # 如果第一个接口的 IPv6 地址获取失败，尝试备用接口
+            if [[ -z "$ipv6" ]]; then
+                ipv6=$(curl -s6 --max-time 3 --interface "$i" https://api6.ipify.org -k | grep -E -v '^(2a09|104\.28)' || true)
+            fi
+
+            # 验证获取到的 IPv6 地址是否是有效的 IP 地址
+            if [[ -n "$ipv6" && "$ipv6" =~ $ipv6Regex ]]; then
+                Public_IPv6="$ipv6"
+            fi
+        fi
+    done
+else
+    # Alpine系统的IP获取方法
+    # 尝试获取 IPv4 地址
+    ipv4=$(curl -s4 --max-time 3 ip.sb -k | grep -E -v '^(2a09|104\.28)' || true)
+    if [[ -z "$ipv4" ]]; then
+        ipv4=$(curl -s4 --max-time 3 https://api.ipify.org -k | grep -E -v '^(2a09|104\.28)' || true)
+    fi
+
+    # 验证获取到的 IPv4 地址是否是有效的 IP 地址
+    if [[ -n "$ipv4" && "$ipv4" =~ $ipv4Regex ]]; then
+        Public_IPv4="$ipv4"
+    fi
+
+    # 检查是否启用了 IPv6 解析
+    if [[ "$ipv6_set" == "true" ]]; then
+        # 尝试获取 IPv6 地址
+        ipv6=$(curl -s6 --max-time 3 ip.sb -k | grep -E -v '^(2a09|104\.28)' || true)
+        if [[ -z "$ipv6" ]]; then
+            ipv6=$(curl -s6 --max-time 3 https://api6.ipify.org -k | grep -E -v '^(2a09|104\.28)' || true)
+        fi
+
+        # 验证获取到的 IPv6 地址是否是有效的 IP 地址
+        if [[ -n "$ipv6" && "$ipv6" =~ $ipv6Regex ]]; then
+            Public_IPv6="$ipv6"
+        fi
+    fi
+fi
+
+# 发送 Telegram 通知函数
+send_telegram_notification() {
+    local message=""
+
+    # 遍历 Domains 数组，构建域名部分
+    for domain in "${Domains[@]}"; do
+        message+="$domain "
+    done
+
+    # 添加 IPv4 更新信息
+    message+="IPv4更新 $Old_Public_IPv4 🔜 $Public_IPv4 。"
+
+    # 如果 ipv6_set 为 true，则添加 IPv6 更新信息
+    if [ "$ipv6_set" == "true" ]; then
+        # 检查 Domains 和 Domainsv6 是否相同
+        if [ "${Domains[*]}" != "${Domainsv6[*]}" ]; then
+            # 遍历 Domainsv6 数组，构建 IPv6 域名部分
+            for domainv6 in "${Domainsv6[@]}"; do
+                message+="$domainv6 "
+            done
+        fi
+
+        # 添加 IPv6 更新信息
+        message+="IPv6更新 $Old_Public_IPv6 🔜 $Public_IPv6 。"
+    fi
+
+    # 发送通知
+    curl -s -X POST "https://api.telegram.org/bot$Telegram_Bot_Token/sendMessage" \
+        -d "chat_id=$Telegram_Chat_ID" \
+        -d "text=$message"
 }
 
-add_common_site() {
-  need_root
-  
-  prompt DOMAIN "请输入反代域名"
-  DOMAIN="$(strip_scheme "$DOMAIN")"
-  
-  prompt LISTEN_PORT "请输入本机监听端口" "443"
-  is_port "$LISTEN_PORT" || { echo "端口非法"; return 1; }
-
-  prompt UP_HOST "请输入上游局域网 IP (如 127.0.0.1)" "127.0.0.1"
-  prompt UP_PORT "请输入上游服务端口" "80"
-  is_port "$UP_PORT" || { echo "上游端口非法"; return 1; }
-
-  # 证书处理 (保持原有 DNS 验证逻辑)
-  choose_dns_provider || return 1
-  setup_dns_env "$DNS_PROVIDER"
-  issue_cert "$DOMAIN" "$DNS_PROVIDER"
-  install_cert "$DOMAIN"
-
-  # 写入配置
-  conf_path="$(write_common_proxy_conf "$DOMAIN" "$LISTEN_PORT" "$UP_HOST" "$UP_PORT")"
-  
-  echo "==> 写入配置文件: $conf_path"
-  test_nginx && reload_nginx
-  echo "==> 反代创建成功！访问地址: https://${DOMAIN}:${LISTEN_PORT}"
+EOF
+    chmod +x /etc/DDNS/DDNS && chmod +x /etc/DDNS/.config
+    echo -e "${Info}DDNS 安装完成！"
+    echo
 }
 
-main_menu() {
-  need_root
-  while true; do
-    echo "=== 反代配置==="
-    echo "1) 初始化系统环境"
-    echo "2) 新增反代站点(普通)"
-    echo "3) 新增反代站点(Emby)"
-    echo "4) 删除反代站点"
-    echo "5) 查看已有站点"
-    echo "6) 卸载"
-    echo "0) 退出"
-    read -r -p "请选择: " CHOICE </dev/tty
-    case "$CHOICE" in
-      1) init_system ;;
-      2) add_common_site ;;
-      3) add_site ;;
-      4) remove_site ;;
-      5) list_sites ;;
-      6) uninstall_all ;;
-      0) exit 0 ;;
-      *) echo "无效选择"; echo ;;
+# 检查 DDNS 状态
+check_ddns_status() {
+    if grep -qiE "alpine" /etc/os-release; then
+        # 检查 cron 任务是否存在
+        if crontab -l | grep -q "/bin/bash /etc/DDNS/DDNS"; then
+            ddns_status=running
+        else
+            ddns_status=dead
+        fi
+    else
+        # 在 Debian/Ubuntu 上检查 systemd timer 状态
+        if [[ -f "/etc/systemd/system/ddns.timer" ]]; then
+            STatus=$(systemctl status ddns.timer | grep Active | awk '{print $3}' | cut -d "(" -f2 | cut -d ")" -f1)
+            if [[ $STatus =~ "waiting" || $STatus =~ "running" ]]; then
+                ddns_status=running
+            else
+                ddns_status=dead
+            fi
+        else
+            ddns_status=not_installed
+        fi
+    fi
+}
+
+# 后续操作
+go_ahead(){
+    echo -e "${Tip}选择一个选项：
+  ${GREEN}0${NC}：退出
+  ${GREEN}1${NC}：重启 DDNS
+  ${GREEN}2${NC}：停止 DDNS
+  ${GREEN}3${NC}：卸载 DDNS
+  ${GREEN}4${NC}：修改要解析的域名
+  ${GREEN}5${NC}：修改 Cloudflare Api
+  ${GREEN}6${NC}：配置 Telegram 通知
+  ${GREEN}7${NC}：更改 DDNS 运行时间
+  ${GREEN}8${NC}：查看服务运行状态
+  ${GREEN}9${NC}：测试 Telegram 通知
+  ${GREEN}0${NC}：退出" 
+    echo
+    read -p "选项: " option
+    until [[ "$option" =~ ^[0-7]$ ]]; do  # 更新有效选项范围
+        echo -e "${Error}请输入正确的数字 [0-7]"
+        echo
+        exit 1
+    done
+    case "$option" in
+        0)
+            exit 1
+        ;;
+        1)
+            restart_ddns
+        ;;
+        2)
+            stop_ddns
+        ;;
+        3)
+            if grep -qiE "alpine" /etc/os-release; then
+                stop_ddns
+                rm -rf /etc/DDNS /usr/bin/ddns
+            else
+                systemctl stop ddns.service >/dev/null 2>&1
+                systemctl stop ddns.timer >/dev/null 2>&1
+                rm -rf /etc/systemd/system/ddns.service /etc/systemd/system/ddns.timer /etc/DDNS /usr/bin/ddns
+            fi
+            echo -e "${Info}DDNS 已卸载！"
+            echo
+        ;;
+        4)
+            set_domain
+            restart_ddns
+            sleep 2
+            check_ddns_install
+        ;;
+        5)
+            set_cloudflare_api
+            if grep -qiE "alpine" /etc/os-release; then
+                restart_ddns
+                sleep 2
+            else
+                if [ ! -f "/etc/systemd/system/ddns.service" ] || [ ! -f "/etc/systemd/system/ddns.timer" ]; then
+                    run_ddns
+                    sleep 2
+                else
+                    restart_ddns
+                    sleep 2
+                fi
+            fi
+            check_ddns_install
+        ;;
+        6)
+            set_telegram_settings
+            check_ddns_install
+        ;;
+        7)
+            set_ddns_run_interval  # 调用新函数以更改 DDNS 运行时间
+            sleep 2
+            check_ddns_install
+        ;;
+        8)
+            show_service_detail
+        ;;
+        9)
+            test_tg_notification
+        ;;
     esac
-  done
 }
 
-main_menu "$@"
+# 设置Cloudflare Api
+set_cloudflare_api(){
+    echo -e "${Tip}开始配置CloudFlare API..."
+    echo
+
+    echo -e "${Tip}请输入您的Cloudflare邮箱"
+    read -rp "邮箱: " EMail
+    if [ -z "$EMail" ]; then
+        echo -e "${Error}未输入邮箱，无法执行操作！"
+        exit 1
+    else
+        EMAIL="$EMail"
+    fi
+    echo -e "${Info}你的邮箱：${RED_ground}${EMAIL}${NC}"
+    echo
+
+    echo -e "${Tip}请输入您的Cloudflare API密钥"
+    read -rp "密钥: " Api_Key
+    if [ -z "Api_Key" ]; then
+        echo -e "${Error}未输入密钥，无法执行操作！"
+        exit 1
+    else
+        API_KEY="$Api_Key"
+    fi
+    echo -e "${Info}你的密钥：${RED_ground}${API_KEY}${NC}"
+    echo
+
+    sed -i 's/^#\?Email=".*"/Email="'"${EMAIL}"'"/g' /etc/DDNS/.config
+    sed -i 's/^#\?Api_key=".*"/Api_key="'"${API_KEY}"'"/g' /etc/DDNS/.config
+}
+
+# 设置解析的域名
+set_domain() {
+    # 检查是否有IPv4
+    ipv4_check=$(curl -s ip.sb -4)
+    if [ -n "$ipv4_check" ]; then
+        echo -e "${Info}检测到IPv4地址: ${ipv4_check}"
+        echo -e "${Tip}请输入您要解析的IPv4域名（可解析多个域名，使用逗号分隔） (或按回车跳过)"
+        read -rp "IPv4域名: " Domain_input
+        if [ -z "$Domain_input" ]; then
+            echo -e "${Info}跳过IPv4域名设置。"
+        else
+            # 替换中文逗号为英文逗号
+            Domain_input="${Domain_input//，/,}"
+            IFS=',' read -ra Domains <<< "$Domain_input"
+            echo -e "${Info}你输入的IPv4域名为: ${RED_ground}${Domains[*]}${NC}"
+            echo
+            # 更新 .config 文件中的 IPv4 域名数组，保持原位置修改
+            sed -i '/^Domains=/c\Domains=('"${Domains[*]}"')' /etc/DDNS/.config
+        fi
+    else
+        echo -e "${Info}未检测到IPv4地址，跳过IPv4域名设置。"
+        echo
+    fi
+
+    # 检查是否有IPv6
+    ipv6_check=$(curl -s ip.sb -6)
+    if [ -n "$ipv6_check" ]; then
+        echo -e "${Info}检测到IPv6地址: ${ipv6_check}"
+
+        # 检查是否开启 IPv6 解析
+        while true; do
+            echo -e "${Tip}是否开启 IPv6 解析？(y/n)"
+            read -rp "选择: " enable_ipv6
+
+            if [[ "$enable_ipv6" =~ ^[Yy]$ ]]; then
+                ipv6_set="true"
+                # 更新 .config 文件中的 ipv6_set 为 true
+                sed -i 's/^#\?ipv6_set=".*"/ipv6_set="true"/g' /etc/DDNS/.config
+
+                echo -e "${Tip}请输入您要解析的IPv6域名（可解析多个域名，使用逗号分隔） (或按回车跳过)"
+                read -rp "IPv6域名: " Domainv6_input
+
+                if [ -z "$Domainv6_input" ]; then
+                    echo -e "${Info}跳过IPv6域名设置。"
+                    echo
+                else
+                    # 替换中文逗号为英文逗号
+                    Domainv6_input="${Domainv6_input//，/,}"
+                    IFS=',' read -ra Domainsv6 <<< "$Domainv6_input"
+                    echo -e "${Info}你输入的IPv6域名为: ${RED_ground}${Domainsv6[*]}${NC}"
+                    echo
+                    # 更新 .config 文件中的 IPv6 域名数组，保持原位置修改
+                    sed -i '/^Domainsv6=/c\Domainsv6=('"${Domainsv6[*]}"')' /etc/DDNS/.config
+                fi
+                break
+            elif [[ "$enable_ipv6" =~ ^[Nn]$ ]]; then
+                ipv6_set="false"
+                # 更新 .config 文件中的 ipv6_set 为 false
+                sed -i 's/^#\?ipv6_set=".*"/ipv6_set="false"/g' /etc/DDNS/.config
+                echo -e "${Info}IPv6 解析未开启，跳过 IPv6 域名设置。"
+                echo
+                break
+            else
+                echo -e "${Error}无效输入，请输入 'y' 或 'n'。"
+            fi
+        done
+    else
+        echo -e "${Info}未检测到IPv6地址，跳过IPv6域名设置。"
+        echo
+        ipv6_set="false"
+        # 更新 .config 文件中的 ipv6_set 为 false
+        sed -i 's/^#\?ipv6_set=".*"/ipv6_set="false"/g' /etc/DDNS/.config
+    fi
+}
+
+# 设置Telegram参数
+set_telegram_settings(){
+    echo -e "${Info}开始配置Telegram通知设置..."
+    echo
+
+    echo -e "${Tip}请输入您的Telegram Bot Token，如果不使用Telegram通知请直接按 Enter 跳过"
+    read -rp "Token: " Token
+    if [ -n "$Token" ]; then
+        TELEGRAM_BOT_TOKEN="$Token"
+        echo -e "${Info}你的TOKEN：${RED_ground}$TELEGRAM_BOT_TOKEN${NC}"
+        echo
+
+        echo -e "${Tip}请输入您的Telegram Chat ID，如果不使用Telegram通知请直接按 Enter 跳过"
+        read -rp "Chat ID: " Chat_ID
+        if [ -n "$Chat_ID" ]; then
+            TELEGRAM_CHAT_ID="$Chat_ID"
+            echo -e "${Info}你的Chat ID：${RED_ground}$TELEGRAM_CHAT_ID${NC}"
+            echo
+
+            sed -i 's/^#\?Telegram_Bot_Token=".*"/Telegram_Bot_Token="'"${TELEGRAM_BOT_TOKEN}"'"/g' /etc/DDNS/.config
+            sed -i 's/^#\?Telegram_Chat_ID=".*"/Telegram_Chat_ID="'"${TELEGRAM_CHAT_ID}"'"/g' /etc/DDNS/.config
+        else
+            echo -e "${Info}已跳过设置Telegram Chat ID"
+        fi
+    else
+        echo -e "${Info}已跳过设置Telegram Bot Token和Chat ID"
+        echo
+        return  # 如果没有输入 Token，则直接返回，跳过设置 Chat ID 的步骤
+    fi
+}
+
+# 运行DDNS服务
+run_ddns() {
+    if grep -qiE "alpine" /etc/os-release; then
+        # 在 Alpine Linux 上使用 cron
+        echo -e "${Info}设置 ddns 脚本每两分钟运行一次..."
+
+        # 检查 cron 任务是否已存在，防止重复添加
+        if ! crontab -l | grep -q "/bin/bash /etc/DDNS/DDNS >/dev/null 2>&1"; then
+            # 设置 cron 任务
+            (crontab -l; echo "*/2 * * * * /bin/bash /etc/DDNS/DDNS >/dev/null 2>&1") | crontab -
+            echo -e "${Info}ddns 脚本已设置为每两分钟运行一次！"
+        else
+            echo -e "${Tip}ddns 脚本的 cron 任务已存在，无需再次创建！"
+        fi
+    else
+        # 在 Debian/Ubuntu 上使用 systemd
+        service='[Unit]
+Description=ddns
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/etc/DDNS
+ExecStart=bash DDNS
+
+[Install]
+WantedBy=multi-user.target'
+
+        timer='[Unit]
+Description=ddns timer
+
+[Timer]
+OnUnitActiveSec=60s
+Unit=ddns.service
+
+[Install]
+WantedBy=multi-user.target'
+
+        if [ ! -f "/etc/systemd/system/ddns.service" ] || [ ! -f "/etc/systemd/system/ddns.timer" ]; then
+            echo -e "${Info}创建 ddns 定时任务..."
+            echo "$service" >/etc/systemd/system/ddns.service
+            echo "$timer" >/etc/systemd/system/ddns.timer
+            echo -e "${Info}ddns 定时任务已创建，每1分钟执行一次！"
+            systemctl enable --now ddns.service >/dev/null 2>&1
+            systemctl enable --now ddns.timer >/dev/null 2>&1
+        else
+            echo -e "${Tip}服务和定时器单元文件已存在，无需再次创建！"
+        fi
+    fi
+}
+
+# 更改 DDNS 服务的运行时间（单位：分钟）
+set_ddns_run_interval() {
+    read -rp "请输入新的 DDNS 运行间隔（分钟）： " interval
+
+    # 输入验证
+    if ! [[ "$interval" =~ ^[0-9]+$ ]]; then
+        echo -e "${Error}无效输入！请输入一个正整数。"
+        return 1
+    fi
+
+    if grep -qiE "alpine" /etc/os-release; then
+        # 在 Alpine Linux 上更新 cron 任务
+        echo -e "${Info}正在更新 DDNS 脚本的 cron 任务... "
+
+        # 计算 cron 表达式
+        local cron_time="*/$interval * * * * /bin/bash /etc/DDNS/DDNS >/dev/null 2>&1"
+
+        # 检查 cron 任务是否已存在，防止重复添加
+        if crontab -l | grep -q "/etc/DDNS/DDNS"; then
+            # 删除旧的 cron 任务
+            (crontab -l | grep -v "/etc/DDNS/DDNS") | crontab -
+        fi
+        # 添加新的 cron 任务
+        (crontab -l; echo "$cron_time") | crontab -
+        echo -e "${Info}DDNS 脚本已设置为每 ${interval} 分钟运行一次！"
+    else
+        # 在 Debian/Ubuntu 上更新 systemd 定时器
+        echo -e "${Info}正在更新 DDNS 定时器... "
+
+        # 停止并禁用旧的定时器
+        systemctl stop ddns.timer
+        systemctl disable ddns.timer
+
+        # 修改定时器文件，将单位设置为分钟
+        sed -i "s/OnUnitActiveSec=.*s/OnUnitActiveSec=${interval}m/" /etc/systemd/system/ddns.timer
+
+        # 重新加载 systemd 管理器配置
+        systemctl daemon-reload
+
+        # 启动并启用新的定时器
+        systemctl enable --now ddns.timer
+        echo -e "${Info}DDNS 定时器已设置为每 ${interval} 分钟运行一次！"
+    fi
+}
+
+restart_ddns() {
+    if grep -qiE "alpine" /etc/os-release; then
+        echo -e "${Info}重新启动 ddns 脚本..."
+
+        # 获取当前的 cron 任务
+        current_cron=$(crontab -l | grep "/bin/bash /etc/DDNS/DDNS" || true)
+
+        # 如果当前的 cron 任务存在，则替换
+        if [ -n "$current_cron" ]; then
+            # 删除旧的 cron 任务
+            crontab -l | grep -v "/bin/bash /etc/DDNS/DDNS" | crontab -
+
+            # 添加新的 cron 任务
+            new_cron="${current_cron} >/dev/null 2>&1"
+            (crontab -l; echo "$new_cron") | crontab -
+
+            echo -e "${Info}DDNS 已重启！"
+        else
+            echo -e "${Error}未找到现有的 cron 任务，无法重启 DDNS。"
+            read -rp "是否要添加一个新的 DDNS 任务（每 2 分钟）？[y/n] " add_cron
+            if [[ "$add_cron" == "y" || "$add_cron" == "Y" ]]; then
+                # 添加新的 cron 任务
+                new_cron="*/2 * * * * /bin/bash /etc/DDNS/DDNS >/dev/null 2>&1"
+                (crontab -l; echo "$new_cron") | crontab -
+                echo -e "${Info}已添加新的 DDNS 任务，每 2 分钟运行一次！"
+            else
+                echo -e "${Info}未添加新的 DDNS 任务。"
+                return 1  # 返回失败状态
+            fi
+        fi
+    else
+        echo -e "${Info}重启 DDNS 服务... "
+        systemctl restart ddns.service >/dev/null 2>&1
+        systemctl restart ddns.timer >/dev/null 2>&1
+        echo -e "${Info}DDNS 已重启！"
+    fi
+}
+
+# 停止DDNS服务
+stop_ddns(){
+    if grep -qiE "alpine" /etc/os-release; then
+        echo -e "${Info}停止 ddns 脚本..."
+        # 从 cron 中移除 ddns 任务
+        crontab -l | grep -v "/bin/bash /etc/DDNS/DDNS >/dev/null 2>&1" | crontab -
+        echo -e "${Info}DDNS 已停止！"
+    else
+        echo -e "${Info}停止 DDNS 服务..."
+        systemctl stop ddns.service >/dev/null 2>&1
+        systemctl stop ddns.timer >/dev/null 2>&1
+        echo -e "${Info}DDNS 已停止！"
+    fi
+}
+
+#查看详细运行状态
+show_service_detail() {
+    echo -e "${Info}--- 当前配置与状态 ---"
+    source /etc/DDNS/.config
+    echo -e "IPv4 域名: ${YELLOW}${Domains[*]}${NC}"
+    echo -e "IPv6 开启: ${YELLOW}${ipv6_set}${NC}"
+    echo -e "最后记录 IP: ${YELLOW}${Old_Public_IPv4:-未记录}${NC}"
+    
+    if grep -qiE "alpine" /etc/os-release; then
+        echo -en "Cron 任务: "
+        if crontab -l | grep -q "/etc/DDNS/DDNS"; then
+            echo -e "${GREEN}运行中 (Cron)${NC}"
+            crontab -l | grep "/etc/DDNS/DDNS"
+        else
+            echo -e "${RED}未在计划任务中${NC}"
+        fi
+    else
+        echo -en "Systemd 状态: "
+        if systemctl is-active --quiet ddns.timer; then
+            echo -e "${GREEN}活动中 (Timer)${NC}"
+            echo -e "下次运行时间: $(systemctl list-timers | grep ddns.timer | awk '{print $1,$2}')"
+        else
+            echo -e "${RED}已停止${NC}"
+        fi
+    fi
+    echo
+}
+
+#手动测试 TG 通知
+test_tg_notification() {
+    source /etc/DDNS/.config
+    if [[ -z "$Telegram_Bot_Token" || -z "$Telegram_Chat_ID" ]]; then
+        echo -e "${Error} 未配置 Telegram Token 或 Chat ID，请先执行选项 6"
+        return
+    fi
+    echo -e "${Info} 正在发送测试消息..."
+    test_msg="🔔 DDNS 脚本测试通知\n来自服务器: $(hostname)\n状态: 配置正常"
+    
+    status_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "https://api.telegram.org/bot$Telegram_Bot_Token/sendMessage" \
+        -d "chat_id=$Telegram_Chat_ID" \
+        -d "text=$test_msg")
+    
+    if [ "$status_code" -eq 200 ]; then
+        echo -e "${GREEN}[成功]${NC} 请检查你的 Telegram 消息！"
+    else
+        echo -e "${Error} 发送失败，HTTP 状态码: $status_code (请检查 Token 和 Chat ID)"
+    fi
+}
+
+# 检查是否安装DDNS
+check_ddns_install(){
+    if [ ! -f "/etc/DDNS/.config" ]; then
+        cop_info
+        echo -e "${Tip}DDNS 未安装，现在开始安装..."
+        echo
+        install_ddns
+        set_cloudflare_api
+        set_domain
+        set_telegram_settings
+        run_ddns
+        echo -e "${Info}执行 ${GREEN}ddns${NC} 可呼出菜单！"
+    else
+        cop_info
+        check_ddns_status
+        if [[ "$ddns_status" == "running" ]]; then
+            echo -e "${Info}DDNS：${GREEN}已安装${NC} 并 ${GREEN}已启动${NC}"
+        else
+            echo -e "${Tip}DDNS：${GREEN}已安装${NC} 但 ${RED}未启动${NC}"
+            echo -e "${Tip}请选择 ${GREEN}4${NC} 重新配置 Cloudflare Api 或 ${GREEN}5${NC} 配置 Telegram 通知"
+        fi
+        echo
+        go_ahead
+    fi
+}
+
+check_curl
+check_ddns_install

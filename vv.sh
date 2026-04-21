@@ -1,212 +1,448 @@
 #!/bin/bash
-# 支持 Debian/Ubuntu, RHEL/CentOS, Alpine, openSUSE
+set -e
 
-# ================== 颜色定义 ==================
-green="\033[32m"
-yellow="\033[33m"
-red="\033[31m"
-white="\033[37m"
-re="\033[0m"
+CADDYFILE="/etc/caddy/Caddyfile"
+CADDY_DATA="/var/lib/caddy/.local/share/caddy"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-# ================== ASCII VPS Logo ==================
-printf -- "${red}"
-printf -- " _    __ ____   _____ \n"
-printf -- "| |  / // __ \\ / ___/ \n"
-printf -- "| | / // /_/ / \\__ \\  \n"
-printf -- "| |/ // ____/ __/  /  \n"
-printf -- "|___//_/     /____/   \n"
-printf -- "${re}"
-
-# ================== 系统检测函数 ==================
-detect_os(){
-  if [ -f /etc/os-release ]; then
-    source /etc/os-release
-    os_info=$PRETTY_NAME
-  elif command -v lsb_release >/dev/null 2>&1; then
-    os_info=$(lsb_release -ds)
-  elif [ -f /etc/debian_version ]; then
-    os_info="Debian $(cat /etc/debian_version)"
-  elif [ -f /etc/redhat-release ]; then
-    os_info=$(cat /etc/redhat-release)
-  else
-    os_info="未知系统"
-  fi
+pause() {
+    echo -ne "${YELLOW}按回车返回菜单...${RESET}"
+    read
 }
 
-# ================== 依赖安装函数 ==================
-install_deps(){
-  if command -v apt >/dev/null 2>&1; then
-    deps=("curl" "vnstat" "lsb-release" "bc")
-    apt update -y >/dev/null 2>&1
-    for pkg in "${deps[@]}"; do
-      if ! dpkg -s "$pkg" >/dev/null 2>&1; then
-        apt install -y "$pkg" >/dev/null 2>&1
-      fi
+install_caddy() {
+    if command -v caddy >/dev/null 2>&1; then
+        echo -e "${GREEN}Caddy 已安装${RESET}"
+        pause
+        return
+    fi
+
+    if ! command -v apt >/dev/null 2>&1; then
+        echo -e "${RED}仅支持 Debian/Ubuntu 系统${RESET}"
+        pause
+        return
+    fi
+
+    echo -e "${GREEN}正在安装 Caddy...${RESET}"
+
+    sudo apt update -q
+    sudo apt install -yq debian-keyring debian-archive-keyring apt-transport-https curl
+
+    if [ ! -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]; then
+        curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | \
+        sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    fi
+
+    if [ ! -f /etc/apt/sources.list.d/caddy-stable.list ]; then
+        curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt | \
+        sudo tee /etc/apt/sources.list.d/caddy-stable.list
+    fi
+
+    sudo apt update -q
+    sudo apt install -yq caddy
+
+    sudo systemctl enable caddy
+    sudo systemctl start caddy
+
+    echo -e "${GREEN}Caddy 安装完成并已启动${RESET}"
+    pause
+}
+
+
+uninstall_caddy() {
+    if ! command -v caddy >/dev/null 2>&1; then
+        echo -e "${YELLOW}Caddy 未安装${RESET}"
+        pause
+        return
+    fi
+
+    echo -e "${GREEN}正在卸载 Caddy...${RESET}"
+
+    # 停止并禁用服务（存在就处理，不存在不报错）
+    sudo systemctl stop caddy 2>/dev/null || true
+    sudo systemctl disable caddy 2>/dev/null || true
+
+    # 使用 apt 正确卸载（包含 service / 二进制）
+    sudo apt purge -y caddy
+    sudo apt autoremove -y
+
+    # 删除 Caddy 数据和配置（这些 apt 不会删）
+    sudo rm -rf /etc/caddy
+    sudo rm -rf /var/lib/caddy
+    sudo rm -rf /var/log/caddy
+
+    # 删除 Caddy 源和 keyring（可选但推荐）
+    sudo rm -f /etc/apt/sources.list.d/caddy-stable.list
+    sudo rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+
+    # 刷新 systemd
+    sudo systemctl daemon-reload
+    sudo systemctl reset-failed
+
+    echo -e "${GREEN}Caddy 已干净卸载（可安全重新安装）${RESET}"
+    pause
+}
+
+
+
+reload_caddy() {
+    sudo systemctl reload caddy
+    echo -e "${GREEN}Caddy 配置已重载${RESET}"
+    pause
+}
+
+add_site() {
+    read -p "请输入域名 (example.com)： " DOMAIN
+    read -p "是否需要 h2c/gRPC 代理？(y/n，回车默认 n)： " H2C
+    H2C=${H2C:-n}
+    
+    SITE_CONFIG="${DOMAIN} {\n"
+
+    if [[ "$H2C" == "y" ]]; then
+        read -p "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： " H2C_PATH
+        read -p "请输入内网目标地址 (例如 127.0.0.1:8008)： " H2C_TARGET
+        SITE_CONFIG+="    reverse_proxy ${H2C_PATH} h2c://${H2C_TARGET}\n"
+    fi
+
+    read -p "请输入普通 HTTP 代理目标 (默认 127.0.0.1:8008)： " HTTP_TARGET
+    HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
+    SITE_CONFIG+="    reverse_proxy ${HTTP_TARGET}\n"
+    SITE_CONFIG+="}\n\n"
+
+    echo -e "$SITE_CONFIG" | sudo tee -a $CADDYFILE >/dev/null
+    echo -e "${GREEN}站点 ${DOMAIN} 添加成功${RESET}"
+
+    reload_caddy
+}
+
+view_sites() {
+    mapfile -t DOMAINS < <(grep -E '^[a-zA-Z0-9.-]+ *{' $CADDYFILE | sed 's/ {//')
+    if [ ${#DOMAINS[@]} -eq 0 ]; then
+        echo -e "${YELLOW}没有已配置的域名${RESET}"
+        pause
+        return
+    fi
+
+    echo -e "${GREEN}请选择要查看证书信息的域名编号（输入0返回菜单）:${RESET}"
+    for i in "${!DOMAINS[@]}"; do
+        echo "$((i+1))) ${DOMAINS[$i]}"
     done
-  elif command -v apk >/dev/null 2>&1; then
-    deps=("curl" "vnstat" "bc" "bash")
-    apk update >/dev/null 2>&1
-    for pkg in "${deps[@]}"; do
-      apk add "$pkg" >/dev/null 2>&1
+
+    read -p "输入编号： " NUM
+
+    if [[ "$NUM" == "0" ]]; then
+        return
+    fi
+
+    if ! [[ "$NUM" =~ ^[0-9]+$ ]] || [ "$NUM" -lt 1 ] || [ "$NUM" -gt ${#DOMAINS[@]} ]; then
+        echo -e "${RED}无效编号${RESET}"
+        pause
+        return
+    fi
+
+    DOMAIN="${DOMAINS[$((NUM-1))]}"
+    CERT_FILE="$CADDY_DATA/certificates/acme-v02.api.letsencrypt.org-directory/$DOMAIN/$DOMAIN.crt"
+
+    if [ -f "$CERT_FILE" ]; then
+        echo -e "${GREEN}证书路径：${RESET}${CERT_FILE}"
+        echo -e "${GREEN}证书信息：${RESET}"
+        openssl x509 -in "$CERT_FILE" -noout -text | awk '
+            /Subject:/ || /Issuer:/ || /Not Before:/ || /Not After :/ {print}'
+    else
+        echo -e "${YELLOW}${DOMAIN} - 未找到证书${RESET}"
+    fi
+    pause
+}
+
+delete_site() {
+    mapfile -t DOMAINS < <(grep -E '^[a-zA-Z0-9.-]+ *{' $CADDYFILE | sed 's/ {//')
+    if [ ${#DOMAINS[@]} -eq 0 ]; then
+        echo -e "${YELLOW}没有可删除的域名${RESET}"
+        pause
+        return
+    fi
+
+    echo -e "${GREEN}请选择要删除的域名编号（输入0返回菜单）:${RESET}"
+    for i in "${!DOMAINS[@]}"; do
+        echo "$((i+1))) ${DOMAINS[$i]}"
     done
-  elif command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
-    pkg_mgr=$(command -v dnf || echo "yum")
-    deps=("curl" "vnstat" "redhat-lsb-core" "bc")
-    for pkg in "${deps[@]}"; do
-      $pkg_mgr install -y "$pkg" >/dev/null 2>&1
+    read -p "输入编号： " NUM
+
+    if [[ "$NUM" == "0" ]]; then
+        return
+    fi
+
+    if ! [[ "$NUM" =~ ^[0-9]+$ ]] || [ "$NUM" -lt 1 ] || [ "$NUM" -gt ${#DOMAINS[@]} ]; then
+        echo -e "${RED}无效编号${RESET}"
+        pause
+        return
+    fi
+
+    DOMAIN="${DOMAINS[$((NUM-1))]}"
+    # 删除 Caddyfile 中的配置
+    sudo sed -i "/$DOMAIN {/,/}/d" $CADDYFILE
+    echo -e "${GREEN}域名 ${DOMAIN} 已从 Caddyfile 删除${RESET}"
+
+    # 检查是否有对应的证书目录
+    CERT_DIR="$CADDY_DATA/certificates/acme-v02.api.letsencrypt.org-directory/$DOMAIN"
+    if [ -d "$CERT_DIR" ]; then
+        read -p "是否一并删除该域名证书？(y/n): " DEL_CERT
+        if [[ "$DEL_CERT" == "y" ]]; then
+            sudo rm -rf "$CERT_DIR"
+            echo -e "${GREEN}已删除证书目录：${RESET}${CERT_DIR}"
+        else
+            echo -e "${YELLOW}保留证书：${RESET}${CERT_DIR}"
+        fi
+    else
+        echo -e "${YELLOW}未找到 ${DOMAIN} 的证书目录${RESET}"
+    fi
+
+    reload_caddy
+}
+
+
+modify_site() {
+    mapfile -t DOMAINS < <(grep -E '^[a-zA-Z0-9.-]+ *{' $CADDYFILE | sed 's/ {//')
+    if [ ${#DOMAINS[@]} -eq 0 ]; then
+        echo -e "${YELLOW}没有可修改的域名${RESET}"
+        pause
+        return
+    fi
+
+    echo -e "${GREEN}请选择要修改的域名编号（输入0返回菜单）:${RESET}"
+    for i in "${!DOMAINS[@]}"; do
+        echo "$((i+1))) ${DOMAINS[$i]}"
     done
-  fi
+    read -p "输入编号： " NUM
+
+    if [[ "$NUM" == "0" ]]; then
+        return
+    fi
+
+    if ! [[ "$NUM" =~ ^[0-9]+$ ]] || [ "$NUM" -lt 1 ] || [ "$NUM" -gt ${#DOMAINS[@]} ]; then
+        echo -e "${RED}无效编号${RESET}"
+        pause
+        return
+    fi
+
+    DOMAIN="${DOMAINS[$((NUM-1))]}"
+
+    read -p "请输入普通 HTTP 代理目标 (默认 127.0.0.1:8008)： " HTTP_TARGET
+    HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
+
+    read -p "是否需要 h2c/gRPC 代理？(y/n，回车默认 n)： " H2C
+    H2C=${H2C:-n}
+    H2C_CONFIG=""
+    if [[ "$H2C" == "y" ]]; then
+        read -p "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： " H2C_PATH
+        read -p "请输入内网目标地址 (例如 127.0.0.1:8008)： " H2C_TARGET
+        H2C_CONFIG="    reverse_proxy ${H2C_PATH} h2c://${H2C_TARGET}\n"
+    fi
+
+    NEW_CONFIG="${DOMAIN} {\n${H2C_CONFIG}    reverse_proxy ${HTTP_TARGET}\n}\n\n"
+    sudo sed -i "/$DOMAIN {/,/}/c\\$NEW_CONFIG" $CADDYFILE
+    echo -e "${GREEN}域名 ${DOMAIN} 配置已修改${RESET}"
+
+    reload_caddy
 }
 
-# 执行初始化
-detect_os
-install_deps
+check_domains_status() {
+    echo -e "${GREEN}域名                  状态       到期时间        剩余天数${RESET}"
+    echo -e "${GREEN}------------------------------------------------------------${RESET}"
 
-# ================== 公网IP获取 ==================
-ipv4_address=$(curl -s --max-time 5 ipv4.icanhazip.com || echo "无法获取")
-ipv6_address=$(curl -s --max-time 5 ipv6.icanhazip.com || echo "无法获取")
+    CERT_DIR="$CADDY_DATA/certificates/acme-v02.api.letsencrypt.org-directory"
+    [ ! -d "$CERT_DIR" ] && echo -e "${YELLOW}没有找到任何证书${RESET}" && pause && return
 
-# ================== 格式化 bc 输出 (核心修复) ==================
-# 补全 .3 -> 0.3 的函数
-fix_number() {
-  local num=$1
-  if [[ $num == .* ]]; then echo "0$num"; elif [[ $num == -.* ]]; then echo "-0${num#*-}"; else echo "$num"; fi
+    DOMAINS=($(ls "$CERT_DIR" | sort))
+    for DOMAIN in "${DOMAINS[@]}"; do
+        CERT_PATH="$CERT_DIR/$DOMAIN/$DOMAIN.crt"
+        if [ -f "$CERT_PATH" ]; then
+            END_DATE=$(openssl x509 -enddate -noout -in "$CERT_PATH" | cut -d= -f2)
+            END_TS=$(date -d "$END_DATE" +%s)
+            NOW_TS=$(date +%s)
+            DAYS_LEFT=$(( (END_TS - NOW_TS) / 86400 ))
+
+            if [ $DAYS_LEFT -ge 30 ]; then
+                STATUS="有效"
+            elif [ $DAYS_LEFT -ge 0 ]; then
+                STATUS="即将过期"
+            else
+                STATUS="已过期"
+            fi
+
+            printf "%-22s %-10s %-15s %d 天\n" \
+                "$DOMAIN" "$STATUS" "$(date -d "$END_DATE" +"%Y-%m-%d")" "$DAYS_LEFT"
+        else
+            printf "%-22s %-10s %-15s %-10s\n" "$DOMAIN" "未找到证书" "-" "-"
+        fi
+    done
+    pause
 }
 
-# ================== CPU信息 ==================
-cpu_info=$(grep 'model name' /proc/cpuinfo | head -1 | sed -r 's/model name\s*:\s*//')
-[ -z "$cpu_info" ] && cpu_info=$(uname -p)
-cpu_cores=$(grep -c ^processor /proc/cpuinfo)
+add_site_with_cert() {
+    read -p "请输入域名 (example.com)： " DOMAIN
+    read -p "是否需要 h2c/gRPC 代理？(y/n，回车默认 n)： " H2C
+    H2C=${H2C:-n}
 
-# ================== CPU占用率 ==================
-get_cpu_usage(){
-  local cpu1=($(head -n1 /proc/stat))
-  local idle1=${cpu1[4]}
-  local total1=0
-  for val in "${cpu1[@]:1}"; do total1=$((total1 + val)); done
-  sleep 1
-  local cpu2=($(head -n1 /proc/stat))
-  local idle2=${cpu2[4]}
-  local total2=0
-  for val in "${cpu2[@]:1}"; do total2=$((total2 + val)); done
-  local idle_diff=$((idle2 - idle1))
-  local total_diff=$((total2 - total1))
-  if [ $total_diff -eq 0 ]; then
-    echo "0.0"
-  else
-    usage=$(echo "scale=1; 100 * ($total_diff - $idle_diff) / $total_diff" | bc)
-    fix_number "$usage"
-  fi
-}
-cpu_usage_val=$(get_cpu_usage)
-cpu_usage_percent="${cpu_usage_val}%"
+    SITE_CONFIG="${DOMAIN} {\n"
 
-# ================== 内存与交换 ==================
-mem_total_k=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-mem_free_k=$(grep MemFree /proc/meminfo | awk '{print $2}')
-mem_buff_k=$(grep Buffers /proc/meminfo | awk '{print $2}')
-mem_cache_k=$(grep ^Cached /proc/meminfo | awk '{print $2}')
-mem_used_k=$((mem_total_k - mem_free_k - mem_buff_k - mem_cache_k))
+    # 指定证书
+    read -p "请输入证书文件路径 (.pem)： " CERT_PATH
+    read -p "请输入私钥文件路径 (.key)： " KEY_PATH
+    SITE_CONFIG+="    tls ${CERT_PATH} ${KEY_PATH}\n"
 
-mem_total_gb=$(fix_number "$(echo "scale=2; $mem_total_k/1024/1024" | bc)")
-mem_used_gb=$(fix_number "$(echo "scale=2; $mem_used_k/1024/1024" | bc)")
-mem_percent_val=$(fix_number "$(echo "scale=2; $mem_used_k*100/$mem_total_k" | bc)")
-mem_info="${mem_used_gb}/${mem_total_gb} GB (${mem_percent_val}%)"
+    if [[ "$H2C" == "y" ]]; then
+        read -p "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： " H2C_PATH
+        read -p "请输入内网目标地址 (例如 127.0.0.1:8008)： " H2C_TARGET
+        SITE_CONFIG+="    reverse_proxy ${H2C_PATH} h2c://${H2C_TARGET}\n"
+    fi
 
-swap_total_k=$(grep SwapTotal /proc/meminfo | awk '{print $2}')
-swap_free_k=$(grep SwapFree /proc/meminfo | awk '{print $2}')
-if [ -z "$swap_total_k" ] || [ "$swap_total_k" -eq 0 ]; then
-  swap_info="未启用"
-else
-  swap_used_k=$((swap_total_k - swap_free_k))
-  swap_percent=$((swap_used_k*100/swap_total_k))
-  swap_info="$(($swap_used_k/1024))MB/$(($swap_total_k/1024))MB (${swap_percent}%)"
-fi
+    read -p "请输入普通 HTTP 代理目标 (默认 127.0.0.1:8008)： " HTTP_TARGET
+    HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
+    SITE_CONFIG+="    reverse_proxy ${HTTP_TARGET}\n"
+    SITE_CONFIG+="}\n\n"
 
-# ================== 网络流量统计 ==================
-format_bytes(){
-  local bytes=${1:-0}
-  if (( $(echo "$bytes < 1024" | bc -l) )); then
-    echo "${bytes} B"
-  elif (( $(echo "$bytes < 1048576" | bc -l) )); then
-    echo "$(fix_number "$(echo "scale=2; $bytes/1024" | bc)") KB"
-  elif (( $(echo "$bytes < 1073741824" | bc -l) )); then
-    echo "$(fix_number "$(echo "scale=2; $bytes/1048576" | bc)") MB"
-  else
-    echo "$(fix_number "$(echo "scale=2; $bytes/1073741824" | bc)") GB"
-  fi
+    echo -e "$SITE_CONFIG" | sudo tee -a $CADDYFILE >/dev/null
+    echo -e "${GREEN}站点 ${DOMAIN} (自定义证书) 添加成功${RESET}"
+
+    reload_caddy
 }
 
-get_net_traffic(){
-  local rx_total=0 tx_total=0
-  while read -r line; do
-    iface=$(echo "$line" | awk -F: '{print $1}' | tr -d ' ')
-    [[ "$iface" =~ ^(lo|docker|veth|br-|flannel) ]] && continue
-    rx=$(echo "$line" | awk '{print $2}')
-    tx=$(echo "$line" | awk '{print $10}')
-    rx_total=$((rx_total + rx))
-    tx_total=$((tx_total + tx))
-  done < <(tail -n +3 /proc/net/dev)
-  echo "总接收: $(format_bytes $rx_total)"
-  echo "总发送: $(format_bytes $tx_total)"
+# 生成 Emby 反代配置并追加到 Caddyfile
+add_emby_site_caddy() {
+    echo -ne "${GREEN}请输入您的域名 (例: emby.example.com): ${RESET}"; read DOMAIN
+    echo -ne "${GREEN}请输入 Emby 目标地址 (例: https://emby.example.com): ${RESET}"; read TARGET
+    
+    # 提取主机名，用于判断是否是本地地址
+    local TARGET_HOST=$(echo $TARGET | awk -F[/:] '{print $4}')
+    
+    # 构造 Caddyfile 配置
+    # flush_interval -1 相当于 Nginx 的 proxy_buffering off
+    # header_up 逻辑用于隐私去 IP 和 Host 伪装
+    cat >> $CADDYFILE <<EOF
+$DOMAIN {
+    reverse_proxy $TARGET {
+        # 关闭缓冲，流媒体即时传输
+        flush_interval -1
+
+        # 头部伪装与隐私保护
+        header_up Host {upstream_hostport}
+        header_up X-Real-IP ""
+        header_up X-Forwarded-For ""
+EOF
+
+    # 如果是反代外部域名，需要开启 SNI
+    if [[ "$TARGET" == https* ]]; then
+        cat >> $CADDYFILE <<EOF
+        header_up Host $TARGET_HOST
+        transport http {
+            tls_server_name $TARGET_HOST
+        }
+EOF
+    fi
+
+    cat >> $CADDYFILE <<EOF
+    }
+
+    # 跨域支持
+    header {
+        Access-Control-Allow-Origin *
+        Access-Control-Allow-Methods "GET, POST, OPTIONS, DELETE, PUT"
+        Access-Control-Allow-Headers "X-Emby-Authorization, Content-Type, Authorization, X-Requested-With"
+    }
+}
+EOF
+
+    echo -e "${GREEN}Emby 站点 ${DOMAIN} 已添加至 Caddyfile${RESET}"
+    reload_caddy
 }
 
-# ================== 其他系统信息 ==================
-disk_info=$(df -h / | awk 'NR==2{printf "%s/%s (%s)", $3, $2, $5}')
-geo_data=$(curl -s --max-time 3 http://ip-api.com/json/)
-country=$(echo "$geo_data" | sed -n 's/.*"countryCode":"\([^"]*\)".*/\1/p')
-city=$(echo "$geo_data" | sed -n 's/.*"city":"\([^"]*\)".*/\1/p')
-isp_info=$(echo "$geo_data" | sed -n 's/.*"isp":"\([^"]*\)".*/\1/p')
-cpu_arch=$(uname -m)
-hostname=$(hostname)
-kernel_version=$(uname -r)
-congestion_algorithm=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
-queue_algorithm=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
-net_output=$(get_net_traffic)
-up_sec=$(cut -d. -f1 /proc/uptime)
-runtime="$((up_sec/86400))天 $(((up_sec%86400)/3600))时 $(((up_sec%3600)/60))分"
+# 函数：主站+推流分离版 (Caddy 重定向逻辑)
+add_emby_split_site_caddy() {
+    echo -ne "${GREEN}请输入您的域名: ${RESET}"; read DOMAIN
+    echo -ne "${GREEN}请输入 Emby 主站地址: ${RESET}"; read T_MAIN
+    echo -ne "${GREEN}请输入推流后端地址: ${RESET}"; read T_STREAM
 
-# ================== 动态颜色高亮 ==================
-get_usage_color(){
-  local val=$1
-  if [ -z "$val" ] || [ "$val" == "0" ]; then echo "$green"; return; fi
-  # 使用 bc -l 处理带小数点的比较
-  local res=$(echo "$val >= 80" | bc -l)
-  if [ "$res" -eq 1 ]; then echo "$red"
-  elif [ "$(echo "$val >= 50" | bc -l)" -eq 1 ]; then echo "$yellow"
-  else echo "$green"; fi
+    local STREAM_HOST=$(echo $T_STREAM | awk -F[/:] '{print $4}')
+
+    cat >> $CADDYFILE <<EOF
+$DOMAIN {
+    # 推流重定向路径 /s1/
+    handle_path /s1/* {
+        reverse_proxy $T_STREAM {
+            flush_interval -1
+            header_up Host $STREAM_HOST
+            header_up X-Real-IP ""
+            header_up X-Forwarded-For ""
+        }
+    }
+
+    # 主站逻辑
+    handle {
+        reverse_proxy $T_MAIN {
+            flush_interval -1
+            header_up Host {upstream_hostport}
+            header_up X-Real-IP ""
+            header_up X-Forwarded-For ""
+        }
+    }
 }
-cpu_usage_color=$(get_usage_color "$cpu_usage_val")
-mem_usage_color=$(get_usage_color "$mem_percent_val")
+EOF
+    echo -e "${GREEN}主站+推流分离站点已添加${RESET}"
+    reload_caddy
+}
 
-# ================== 输出 ==================
-clear
-printf -- "%b系统信息详情%b\n" "$green" "$re"
-printf -- "------------------------\n"
-printf -- "%b主机名: %b%s%b\n" "$white" "$green" "$hostname" "$re"
-printf -- "%b运营商: %b%s%b\n" "$white" "$green" "${isp_info:-未知}" "$re"
-printf -- "------------------------\n"
-printf -- "%b系统版本: %b%s%b\n" "$white" "$yellow" "$os_info" "$re"
-printf -- "%b内核版本: %b%s%b\n" "$white" "$yellow" "$kernel_version" "$re"
-printf -- "------------------------\n"
-printf -- "%bCPU架构: %b%s%b\n" "$white" "$green" "$cpu_arch" "$re"
-printf -- "%bCPU型号: %b%s%b\n" "$white" "$green" "$cpu_info" "$re"
-printf -- "%bCPU核心: %b%s%b\n" "$white" "$green" "$cpu_cores" "$re"
-printf -- "------------------------\n"
-printf -- "%bCPU占用: %b%s%b\n" "$white" "$cpu_usage_color" "$cpu_usage_percent" "$re"
-printf -- "%b物理内存: %b%s%b\n" "$white" "$mem_usage_color" "$mem_info" "$re"
-printf -- "%b虚拟内存: %b%s%b\n" "$white" "$green" "$swap_info" "$re"
-printf -- "%b硬盘占用: %b%s%b\n" "$white" "$green" "$disk_info" "$re"
-printf -- "------------------------\n"
-printf -- "%b%s%b\n" "$green" "$net_output" "$re"
-printf -- "------------------------\n"
-printf -- "%b拥塞算法: %b%s %s%b\n" "$white" "$green" "$congestion_algorithm" "$queue_algorithm" "$re"
-printf -- "------------------------\n"
-printf -- "%bIPv4地址: %b%s%b\n" "$white" "$yellow" "$ipv4_address" "$re"
-printf -- "%bIPv6地址: %b%s%b\n" "$white" "$yellow" "$ipv6_address" "$re"
-printf -- "------------------------\n"
-printf -- "%b地理位置: %b%s %s%b\n" "$white" "$yellow" "$country" "$city" "$re"
-printf -- "%b系统时间: %b%s%b\n" "$white" "$yellow" "$(date "+%Y-%m-%d %H:%M")" "$re"
-printf -- "------------------------\n"
-printf -- "%b运行时长: %b%s%b\n" "$white" "$green" "$runtime" "$re"
-printf -- "\n"
+emby_proxy_menu() {
+    clear
+    echo -e "${GREEN}==== Emby 反代管理 ====${RESET}"
+    echo -e "${GREEN}1) 普通反代${RESET}"
+    echo -e "${GREEN}2) 主站 + 推流重定向${RESET}"
+    echo -e "${GREEN}0) 返回主菜单${RESET}"
+    read -p "请选择操作 [0-2]: " emby_choice
+
+    case $emby_choice in
+        1) add_emby_site_caddy ;;
+        2) add_emby_split_site_caddy ;;
+        0) return ;;
+        *) echo -e "${RED}无效选项${RESET}"; pause ;;
+    esac
+}
+
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}==== Caddy 管理====${RESET}"
+        echo -e "${GREEN} 1) 安装Caddy${RESET}"
+        echo -e "${GREEN} 2) 添加站点${RESET}"
+        echo -e "${GREEN} 3) 删除站点${RESET}"
+        echo -e "${GREEN} 4) 查看站点证书信息${RESET}"
+        echo -e "${GREEN} 5) 修改站点配置${RESET}"
+        echo -e "${GREEN} 6) 添加站点(自定义证书)${RESET}"
+        echo -e "${GREEN} 7) 重载Caddy${RESET}"
+        echo -e "${GREEN} 8) 卸载Caddy${RESET}"
+        echo -e "${GREEN} 9) 查看所有域名证书状态${RESET}"
+        echo -e "${GREEN}10) Emby反代${RESET}"
+        echo -e "${GREEN} 0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN} 请选择操作[0-10]：${RESET}) " choice
+
+        case $choice in
+            1) install_caddy ;;
+            2) add_site ;;
+            3) delete_site ;;
+            4) view_sites ;;
+            5) modify_site ;;
+            6) add_site_with_cert ;;
+            7) reload_caddy ;;
+            8) uninstall_caddy ;;
+            9) check_domains_status ;;
+            10) emby_proxy_menu ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选项${RESET}"; pause ;;
+        esac
+    done
+}
+
+menu

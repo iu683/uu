@@ -1,162 +1,506 @@
 #!/bin/bash
 
-# ========================================
-# SSH 端口修改与双栈检测全能脚本
-# 适配: Ubuntu, Debian, Alpine, RHEL/CentOS
-# 支持: IPv4 / IPv6 远程连通性检测
-# ========================================
-
-# 颜色定义
+# 定义颜色变量
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
+YELLOW='\033[0;33m'
 RED='\033[0;31m'
+CYAN='\033[0;36m'
+ORANGE='\033[38;5;214m'
 RESET='\033[0m'
 
-# 1. 权限与系统检查
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}错误: 请使用 root 权限运行${RESET}"
-    exit 1
-fi
+# 工作目录定义 (用于 Argo 等模块)
+work_dir="/etc/argo" 
 
-if [ -f /etc/alpine-release ]; then
-    OS="Alpine"
-elif grep -qi "ubuntu" /etc/os-release; then
-    OS="Ubuntu"
-elif [ -f /etc/debian_version ]; then
-    OS="Debian"
-else
-    OS="Linux"
-fi
+status_check() {
+    echo -e "${ORANGE}╔══════════════════════════╗${RESET}"
+    echo -e "${ORANGE}       核心状态检测          ${RESET}"
+    echo -e "${ORANGE}╚══════════════════════════╝${RESET}"
+    echo ""
 
-echo -e "${GREEN}检测到系统: $OS${RESET}"
+    format_status() {
+        case "$1" in
+            active) echo -e "${GREEN}运行中${RESET}" ;;
+            inactive|failed) echo -e "${YELLOW}未运行${RESET}" ;;
+            *) echo -e "${RED}未安装${RESET}" ;;
+        esac
+    }
 
-# 2. 安装必要工具 (nc)
-echo -e "${YELLOW}检查必要工具...${RESET}"
-if ! command -v nc >/dev/null 2>&1; then
-    if [ "$OS" = "Alpine" ]; then
-        apk add --no-cache netcat-openbsd >/dev/null 2>&1
-    else
-        apt-get update -y >/dev/null 2>&1
-        apt-get install -y netcat-openbsd >/dev/null 2>&1
-    fi
-fi
+    get_ports() {
+        ss -tulnp 2>/dev/null | grep -E "$1" | awk '{print $5}' | awk -F: '{print $NF}' | sort -u
+    }
 
-# 3. 获取端口信息
-current_port=$(grep -E '^ *Port [0-9]+' /etc/ssh/sshd_config | awk '{print $2}' | head -n1)
-current_port=${current_port:-22}
-echo -e "${YELLOW}当前 SSH 端口: $current_port${RESET}"
-
-read -p "请输入新的 SSH 端口号: " new_port
-if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -le 0 ] || [ "$new_port" -gt 65535 ]; then
-    echo -e "${RED}错误: 端口无效！${RESET}"
-    exit 1
-fi
-
-# 4. 备份与修改配置
-cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$(date +%Y%m%d_%H%M%S)"
-if grep -q "^Port " /etc/ssh/sshd_config; then
-    sed -i "s/^Port .*/Port $new_port/" /etc/ssh/sshd_config
-else
-    echo "Port $new_port" >> /etc/ssh/sshd_config
-fi
-
-# 5. 放行防火墙 (UFW/Firewalld/Iptables)
-echo -e "${YELLOW}正在放行防火墙端口 $new_port...${RESET}"
-if command -v ufw >/dev/null 2>&1; then
-    # UFW 默认同时处理 v4 和 v6
-    ufw allow "$new_port"/tcp >/dev/null 2>&1 || true
-elif command -v firewall-cmd >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port="$new_port"/tcp >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
-elif command -v iptables >/dev/null 2>&1; then
-    iptables -I INPUT -p tcp --dport "$new_port" -j ACCEPT 2>/dev/null || true
-    if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -I INPUT -p tcp --dport "$new_port" -j ACCEPT 2>/dev/null || true
-    fi
-fi
-
-# 6. 重启服务 (解决 Ubuntu/Debian Socket 冲突)
-echo -e "${YELLOW}正在重启 SSH 服务...${RESET}"
-if [[ "$OS" == "Ubuntu" ]] || [[ "$OS" == "Debian" ]]; then
-    systemctl stop ssh.socket >/dev/null 2>&1 || true
-    systemctl disable ssh.socket >/dev/null 2>&1 || true
-fi
-
-restart_done=false
-for svc in ssh sshd; do
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl restart "$svc" >/dev/null 2>&1 && restart_done=true && break
-    elif command -v rc-service >/dev/null 2>&1; then
-        rc-service "$svc" restart >/dev/null 2>&1 && restart_done=true && break
-    fi
-done
-
-if [ "$restart_done" = false ]; then
-    echo -e "${RED}❌ SSH 服务重启失败！${RESET}"
-    exit 1
-fi
-
-# 7. 本地监听检测
-echo -e "${YELLOW}正在检测本地监听状态...${RESET}"
-SUCCESS=false
-for i in {1..5}; do
-    sleep 2
-    if command -v ss >/dev/null 2>&1; then
-        CHECK=$(ss -tlnp | grep ":$new_port ")
-    else
-        CHECK=$(netstat -tlnp | grep ":$new_port ")
-    fi
-    if [ -n "$CHECK" ]; then SUCCESS=true && break; fi
-    echo -e "${YELLOW}等待服务绑定端口... ($i/5)${RESET}"
-done
-
-if [ "$SUCCESS" = true ]; then
-    echo -e "${GREEN}✔ 本地端口 $new_port 监听成功${RESET}"
-else
-    echo -e "${RED}❌ 本地检测失败，请手动执行 'ss -tlnp | grep :$new_port' 确认${RESET}"
-    exit 1
-fi
-
-# 8. 远程连通性检测 (兼容 v4/v6)
-echo -e "${YELLOW}正在执行远程连通性检测...${RESET}"
-
-# 探测 IP (优先获取 IPv6，其次 IPv4)
-IP_V6=$(curl -6 -sL --max-time 5 https://6.ipw.cn || echo "")
-IP_V4=$(curl -4 -sL --max-time 5 https://4.ipw.cn || curl -sL --max-time 5 https://api.ipify.org || echo "")
-
-test_remote() {
-    local ip=$1
-    local mode=$2
-    if [ -n "$ip" ]; then
-        echo -en "检测 $mode 地址 $ip ... "
-        # IPv6 检测需加 -6 参数
-        local nc_cmd="nc -zv"
-        [[ "$mode" == "IPv6" ]] && nc_cmd="nc -6 -zv"
-        
-        if timeout 6 $nc_cmd "$ip" "$new_port" 2>&1 | grep -q "succeeded\|open"; then
-            echo -e "${GREEN}✔ 通畅${RESET}"
-            return 0
+    # =============================
+    # Xray
+    # =============================
+    echo -e "${YELLOW}▶ Xray${RESET}"
+    if command -v xray &>/dev/null || pgrep -f xray &>/dev/null; then
+        status=$(systemctl is-active xray 2>/dev/null)
+        [[ "$status" != "active" && $(pgrep -f xray) ]] && status="active"
+        echo -e "状态: $(format_status "$status")"
+        if command -v xray &>/dev/null; then
+            ver=$(xray version 2>/dev/null | head -n1 | awk '{print $2}')
         else
-            echo -e "${RED}✘ 失败${RESET}"
-            return 1
+            ver=$(ps -ef | grep xray | grep -v grep | grep -oE 'v[0-9.]+' | head -n1)
+        fi
+        echo -e "版本: ${ver:-运行中(内置)}"
+        ports=$(get_ports xray)
+        [[ -n "$ports" ]] && echo -e "端口: $(echo $ports | tr ' ' ', ')" || echo -e "${YELLOW}端口: 无${RESET}"
+    else
+        echo -e "状态: ${RED}未安装${RESET}"
+    fi
+    echo ""
+
+    # =============================
+    # Sing-box
+    # =============================
+    echo -e "${YELLOW}▶ Sing-box${RESET}"
+    if command -v sing-box &>/dev/null || pgrep -f sing-box &>/dev/null; then
+        status=$(systemctl is-active sing-box 2>/dev/null)
+        [[ "$status" != "active" && $(pgrep -f sing-box) ]] && status="active"
+        echo -e "状态: $(format_status "$status")"
+        if command -v sing-box &>/dev/null; then
+            ver=$(sing-box version 2>/dev/null | head -n1 | awk '{print $3}')
+        else
+            ver=$(ps -ef | grep sing-box | grep -v grep | grep -oE 'v[0-9.]+' | head -n1)
+        fi
+        echo -e "版本: ${ver:-运行中(内置)}"
+        ports=$(get_ports sing-box)
+        [[ -n "$ports" ]] && echo -e "端口: $(echo $ports | tr ' ' ', ')" || echo -e "${YELLOW}端口: 无${RESET}"
+    else
+        echo -e "状态: ${RED}未安装${RESET}"
+    fi
+    echo ""
+
+    # =============================
+    # Mihomo (Clash Meta)
+    # =============================
+    echo -e "${YELLOW}▶ Mihomo/Clash${RESET}"
+    mihomo_found=0
+    mi_ports=""
+    if command -v docker &>/dev/null; then
+        mi_containers=$(docker ps -a --format "{{.Names}}" | grep -iE "mihomo|clash")
+    fi
+    if command -v mihomo &>/dev/null || pgrep -iE "mihomo|clash" &>/dev/null || [[ -n "$mi_containers" ]]; then
+        mihomo_found=1
+        status=$(systemctl is-active mihomo 2>/dev/null || systemctl is-active clash 2>/dev/null)
+        if [[ "$status" != "active" ]]; then
+            if pgrep -iE "mihomo|clash" &>/dev/null; then status="active"
+            elif [[ -n "$mi_containers" ]]; then
+                for name in $mi_containers; do
+                    [[ $(docker inspect -f '{{.State.Status}}' "$name") == "running" ]] && status="active" && break
+                done
+            fi
+        fi
+        echo -e "状态: $(format_status "$status")"
+        local raw_ver=""
+        if command -v mihomo &>/dev/null; then
+            raw_ver=$(mihomo -v 2>/dev/null)
+        elif [[ -n "$mi_containers" ]]; then
+            first_c=$(echo "$mi_containers" | head -n1)
+            raw_ver=$(docker exec "$first_c" mihomo -v 2>/dev/null)
+        fi
+        if [[ -n "$raw_ver" ]]; then
+            ver_num=$(echo "$raw_ver" | grep -iE "Mihomo|Clash" | awk '{print $3}' | head -n1)
+            [[ "$raw_ver" == *"gvisor"* ]] && ver_num="${ver_num} (gVisor)"
+            echo -e "版本: ${ver_num:-未知}"
+        else
+            echo -e "版本: 运行中(内置)"
+        fi
+        mi_ports=$(get_ports mihomo; get_ports clash)
+        if [[ -n "$mi_containers" ]]; then
+            d_ports=$(docker container inspect $(echo "$mi_containers") --format '{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostPort}} {{end}}{{end}}' | tr -s ' ' '\n' | grep -v '^$')
+            mi_ports="$mi_ports $d_ports"
+        fi
+        final_mi_ports=$(echo $mi_ports | tr ' ' '\n' | sort -un | tr '\n' ',' | sed 's/,$//')
+        [[ -n "$final_mi_ports" ]] && echo -e "端口: ${GREEN}${final_mi_ports}${RESET}" || echo -e "端口: ${YELLOW}无${RESET}"
+        if [[ -n "$mi_containers" ]]; then
+            for name in $mi_containers; do
+                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
+                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
+                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
+            done
+        fi
+    else
+        echo -e "状态: ${RED}未安装${RESET}"
+    fi
+    echo ""
+
+    # =============================
+    # Realm
+    # =============================
+    echo -e "${YELLOW}▶ Realm${RESET}"
+    realm_containers=""
+    if command -v docker &>/dev/null; then
+        realm_containers=$(docker ps -a --format "{{.Names}}" | grep -i "realm")
+    fi
+    if command -v realm &>/dev/null || pgrep -f realm &>/dev/null || [[ -n "$realm_containers" ]]; then
+        status=$(systemctl is-active realm 2>/dev/null)
+        if [[ "$status" != "active" ]]; then
+            if pgrep -f realm &>/dev/null; then status="active"
+            elif [[ -n "$realm_containers" ]]; then
+                for name in $realm_containers; do
+                    [[ $(docker inspect -f '{{.State.Status}}' "$name") == "running" ]] && status="active" && break
+                done
+            fi
+        fi
+        echo -e "状态: $(format_status "$status")"
+        if command -v realm &>/dev/null; then
+            ver=$(realm --version 2>/dev/null | awk '{print $2}')
+        elif [[ -n "$realm_containers" ]]; then
+            first_c=$(echo "$realm_containers" | head -n1)
+            ver=$(docker exec "$first_c" realm --version 2>/dev/null | awk '{print $2}')
+        fi
+        echo -e "版本: ${ver:-运行中(内置)}"
+        ports=$(get_ports realm)
+        [[ -n "$ports" ]] && echo -e "端口: $(echo $ports | tr ' ' ', ')" || echo -e "${YELLOW}端口: 无${RESET}"
+        if [[ -n "$realm_containers" ]]; then
+            for name in $realm_containers; do
+                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
+                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
+                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
+            done
+        fi
+    else
+        echo -e "状态: ${RED}未安装${RESET}"
+    fi
+    echo ""
+
+    # =============================
+    # Gost
+    # =============================
+    echo -e "${YELLOW}▶ Gost${RESET}"
+    gost_containers=""
+    if command -v docker &>/dev/null; then
+        gost_containers=$(docker ps -a --format "{{.Names}}" | grep -i "gost")
+    fi
+    if command -v gost &>/dev/null || pgrep -f gost &>/dev/null || [[ -n "$gost_containers" ]]; then
+        status="inactive"
+        if systemctl is-active gost &>/dev/null; then status="active"
+        elif pgrep -f gost &>/dev/null; then status="active"
+        elif [[ -n "$gost_containers" ]]; then
+            for name in $gost_containers; do
+                [[ $(docker inspect -f '{{.State.Status}}' "$name") == "running" ]] && status="active" && break
+            done
+        fi
+        echo -e "状态: $(format_status "$status")"
+        ver=""
+        if command -v gost &>/dev/null; then
+            ver=$(gost -V 2>&1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+        fi
+        if [[ -z "$ver" && -n "$gost_containers" ]]; then
+            first_c=$(echo "$gost_containers" | head -n1)
+            ver=$(docker exec "$first_c" gost -V 2>&1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+            [[ -z "$ver" ]] && ver=$(docker exec "$first_c" /bin/gost -V 2>&1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+        fi
+        echo -e "版本: ${ver:-运行中(内置)}"
+        ports=$(get_ports gost)
+        if [[ -n "$gost_containers" ]]; then
+            d_ports=$(docker container inspect $gost_containers --format '{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostPort}} {{end}}{{end}}' | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ',' | sed 's/^,//;s/,$//')
+            if [[ -n "$d_ports" ]]; then
+                [[ -n "$ports" ]] && ports="${ports},${d_ports}" || ports="$d_ports"
+            fi
+        fi
+        final_ports=$(echo "$ports" | tr ' ' '\n' | tr ',' '\n' | sed '/^$/d' | sort -u | tr '\n' ',' | sed 's/,$//')
+        [[ -n "$final_ports" ]] && echo -e "端口: ${CYAN}${final_ports}${RESET}" || echo -e "${YELLOW}端口: 无${RESET}"
+        if [[ -n "$gost_containers" ]]; then
+            for name in $gost_containers; do
+                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
+                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
+                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
+            done
+        fi
+    else
+        echo -e "状态: ${RED}未安装${RESET}"
+    fi
+    echo ""
+
+    # =============================
+    # FRP (frpc/frps)
+    # =============================
+    echo -e "${YELLOW}▶ FRP${RESET}"
+    frp_containers=""
+    if command -v docker &>/dev/null; then
+        frp_containers=$(docker ps -a --format "{{.Names}}" | grep -i "frp")
+    fi
+    if command -v frpc &>/dev/null || command -v frps &>/dev/null || pgrep -x frpc &>/dev/null || pgrep -x frps &>/dev/null || [[ -n "$frp_containers" ]]; then
+        status=$(systemctl is-active frpc 2>/dev/null || systemctl is-active frps 2>/dev/null)
+        if [[ "$status" != "active" ]]; then
+            if pgrep -x frpc &>/dev/null || pgrep -x frps &>/dev/null; then status="active"
+            elif [[ -n "$frp_containers" ]]; then
+                for name in $frp_containers; do
+                    [[ $(docker inspect -f '{{.State.Status}}' "$name") == "running" ]] && status="active" && break
+                done
+            fi
+        fi
+        echo -e "状态: $(format_status "$status")"
+        if command -v frpc &>/dev/null; then ver=$(frpc -v 2>/dev/null)
+        elif command -v frps &>/dev/null; then ver=$(frps -v 2>/dev/null)
+        elif [[ -n "$frp_containers" ]]; then
+            first_c=$(echo "$frp_containers" | head -n1)
+            ver=$(docker exec "$first_c" frpc -v 2>/dev/null || docker exec "$first_c" frps -v 2>/dev/null)
+        fi
+        echo -e "版本: ${ver:-运行中(内置)}"
+        ports=$( (get_ports frpc; get_ports frps) | sort -u )
+        [[ -n "$ports" ]] && echo -e "端口: $(echo $ports | tr ' ' ', ')" || echo -e "${YELLOW}端口: 无${RESET}"
+        if [[ -n "$frp_containers" ]]; then
+            for name in $frp_containers; do
+                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
+                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
+                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
+            done
+        fi
+    else
+        echo -e "状态: ${RED}未安装${RESET}"
+    fi
+    echo ""
+
+    # =============================
+    # Nginx
+    # =============================
+    echo -e "${YELLOW}▶ Nginx${RESET}"
+    nginx_found=0
+    all_ports=""
+    if command -v nginx &>/dev/null; then
+        nginx_found=1
+        status=$(systemctl is-active nginx 2>/dev/null)
+        [[ "$status" != "active" ]] && pgrep -x nginx &>/dev/null && status="active"
+        echo -e "状态: $(format_status "$status")"
+        ver=$(nginx -v 2>&1 | awk -F/ '{print $2}')
+        echo -e "版本: ${ver:-内置}"
+        all_ports=$(get_ports nginx)
+    fi
+    if command -v docker &>/dev/null; then
+        nginx_containers=$(docker ps -a --format "{{.Names}}" | grep -iE "nginx|npm")
+        if [[ -n "$nginx_containers" ]]; then
+            [[ $nginx_found -eq 0 ]] && echo -e "状态: ${GREEN}Docker 运行中${RESET}"
+            nginx_found=1
+            for name in $nginx_containers; do
+                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
+                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
+                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
+                d_ports=$(docker container inspect "$name" --format '{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostPort}} {{end}}{{end}}' | tr -s ' ' '\n' | grep -v '^$')
+                all_ports="$all_ports $d_ports"
+            done
         fi
     fi
-    return 2
+    if [[ $nginx_found -eq 1 ]]; then
+        final_ports=$(echo $all_ports | tr ' ' '\n' | grep -v '^$' | sort -un | tr '\n' ',' | sed 's/,$//')
+        [[ -n "$final_ports" ]] && echo -e "端口: ${GREEN}${final_ports}${RESET}" || echo -e "端口: ${YELLOW}未发现映射端口${RESET}"
+    else
+        echo -e "状态: ${RED}未安装${RESET}"
+    fi
+    echo ""
+
+    # =============================
+    # Caddy
+    # =============================
+    echo -e "${YELLOW}▶ Caddy${RESET}"
+    caddy_containers=""
+    if command -v docker &>/dev/null; then
+        caddy_containers=$(docker ps -a --format "{{.Names}}" | grep -i "caddy")
+    fi
+    if command -v caddy &>/dev/null || pgrep -x caddy &>/dev/null || [[ -n "$caddy_containers" ]]; then
+        status=$(systemctl is-active caddy 2>/dev/null)
+        if [[ "$status" != "active" ]]; then
+            if pgrep -x caddy &>/dev/null; then status="active"
+            elif [[ -n "$caddy_containers" ]]; then
+                for name in $caddy_containers; do
+                    [[ $(docker inspect -f '{{.State.Status}}' "$name") == "running" ]] && status="active" && break
+                done
+            fi
+        fi
+        echo -e "状态: $(format_status "$status")"
+        if command -v caddy &>/dev/null; then
+            ver=$(caddy version 2>/dev/null | awk '{print $1}')
+        elif [[ -n "$caddy_containers" ]]; then
+            first_c=$(echo "$caddy_containers" | head -n1)
+            ver=$(docker exec "$first_c" caddy version 2>/dev/null | awk '{print $1}')
+        fi
+        echo -e "版本: ${ver:-运行中(内置)}"
+        ports=$(get_ports caddy)
+        [[ -n "$ports" ]] && echo -e "端口: $(echo $ports | tr ' ' ', ')" || echo -e "${YELLOW}端口: 无${RESET}"
+        if [[ -n "$caddy_containers" ]]; then
+            for name in $caddy_containers; do
+                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
+                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
+                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
+            done
+        fi
+    else
+        echo -e "状态: ${RED}未安装${RESET}"
+    fi
+    echo ""
+
+    # =============================
+    # ACME
+    # =============================
+    echo -e "${YELLOW}▶ ACME${RESET}"
+    if command -v acme.sh &>/dev/null || [[ -f ~/.acme.sh/acme.sh ]] || (command -v docker &>/dev/null && docker ps -a --format '{{.Names}}' | grep -qi "acme"); then
+        if command -v acme.sh &>/dev/null || [[ -f ~/.acme.sh/acme.sh ]]; then echo -e "状态: ${GREEN}已安装${RESET}"
+        else echo -e "状态: ${GREEN}已安装(Docker)${RESET}"; fi
+        if command -v acme.sh &>/dev/null; then ver=$(acme.sh --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+        elif [[ -f ~/.acme.sh/acme.sh ]]; then ver=$(~/.acme.sh/acme.sh --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+        elif command -v docker &>/dev/null; then
+            container_id=$(docker ps -a --format "{{.Names}}" | grep -i "acme" | head -n1)
+            ver=$(docker exec "$container_id" acme.sh --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+        fi
+        echo -e "版本: ${ver:-内置}"
+    else
+        echo -e "状态: ${RED}未安装${RESET}"
+    fi
+    echo ""
+
+    # =============================
+    # CF WARP
+    # =============================
+    echo -e "${YELLOW}▶ Cloudflare WARP${RESET}"
+    warp_found=0
+    if command -v warp-cli &>/dev/null; then
+        warp_found=1
+        if warp-cli status 2>/dev/null | grep -qi 'Connected'; then echo -e "状态: ${GREEN}已连接${RESET}"
+        else echo -e "状态: ${YELLOW}已安装(未连接)${RESET}"; fi
+    fi
+    if command -v warp-go &>/dev/null || command -v warpgo &>/dev/null; then warp_found=1; echo -e "状态: ${GREEN}WarpGo已安装${RESET}"; fi
+    if systemctl list-unit-files 2>/dev/null | grep -q warp-go; then
+        warp_found=1
+        if systemctl is-active warp-go &>/dev/null; then echo -e "状态: ${GREEN}WarpGo服务运行中${RESET}"
+        else echo -e "状态: ${YELLOW}WarpGo已安装(未运行)${RESET}"; fi
+    fi
+    if command -v wgcf &>/dev/null || ip a 2>/dev/null | grep -q 'wgcf'; then warp_found=1; echo -e "状态: ${GREEN}WGCF已安装${RESET}"; fi
+    if systemctl list-unit-files 2>/dev/null | grep -q warp-svc; then
+        warp_found=1
+        if systemctl is-active warp-svc &>/dev/null; then echo -e "状态: ${GREEN}服务运行中${RESET}"
+        else echo -e "状态: ${YELLOW}服务已安装${RESET}"; fi
+    fi
+    if command -v warp &>/dev/null; then
+        warp_found=1
+        if warp status 2>/dev/null | grep -q "WARP 网络接口已开启"; then echo -e "状态: ${GREEN}已开启${RESET}"
+        else echo -e "状态: ${YELLOW}已安装${RESET}"; fi
+    fi
+    if command -v docker &>/dev/null; then
+        warp_containers=$(docker ps -a --format "{{.Names}}" | grep -i "warp")
+        if [[ -n "$warp_containers" ]]; then
+            warp_found=1
+            for name in $warp_containers; do
+                raw_status=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null)
+                [[ "$raw_status" == "running" ]] && c_status="active" || c_status="$raw_status"
+                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_status")"
+            done
+        fi
+    fi
+    if [[ $warp_found -eq 0 ]]; then echo -e "状态: ${RED}未安装${RESET}"
+    else
+        trace=$(curl -s --max-time 2 https://www.cloudflare.com/cdn-cgi/trace)
+        if echo "$trace" | grep -q "warp=on"; then echo -e "模式: ${GREEN}WARP中${RESET}"
+        elif echo "$trace" | grep -q "warp=plus"; then echo -e "模式: ${GREEN}WARP+${RESET}"
+        else echo -e "模式: ${YELLOW}普通网络${RESET}"; fi
+    fi
+    echo ""
+
+    # =============================
+    # CF Tunnel (Argo)
+    # =============================
+    local argo_path="${work_dir}/argo"
+    echo -e "${YELLOW}▶ Cloudflare Tunnel${RESET}"
+    cf_containers=""
+    if command -v docker &>/dev/null; then
+        cf_containers=$(docker ps -a --format "{{.Names}}" | grep -iE "cloudflared|tunnel|argo")
+    fi
+    if [[ -f "$argo_path" ]] || command -v cloudflared &>/dev/null || pgrep -f "argo|cloudflared" &>/dev/null || [[ -n "$cf_containers" ]]; then
+        status=$(systemctl is-active cloudflared 2>/dev/null || systemctl is-active argo 2>/dev/null)
+        if [[ "$status" != "active" ]]; then
+            if pgrep -f "$argo_path" &>/dev/null || pgrep -f "cloudflared" &>/dev/null; then status="active"
+            elif [[ -n "$cf_containers" ]]; then
+                for name in $cf_containers; do
+                    [[ $(docker inspect -f '{{.State.Status}}' "$name") == "running" ]] && status="active" && break
+                done
+            fi
+        fi
+        echo -e "状态: $(format_status "$status")"
+        if [[ -f "$argo_path" ]]; then ver=$("$argo_path" --version 2>/dev/null | awk '{print $3}')
+        elif command -v cloudflared &>/dev/null; then ver=$(cloudflared --version 2>/dev/null | awk '{print $3}')
+        elif [[ -n "$cf_containers" ]]; then
+            first_c=$(echo "$cf_containers" | head -n1)
+            ver=$(docker exec "$first_c" cloudflared --version 2>/dev/null | awk '{print $3}')
+        fi
+        echo -e "版本: ${ver:-运行中(内置)}"
+        if [[ -n "$cf_containers" ]]; then
+            for name in $cf_containers; do
+                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
+                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
+                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
+            done
+        fi
+    else
+        echo -e "状态: ${RED}未安装${RESET}"
+    fi
+    echo ""
+
+    # =============================
+    # Docker
+    # =============================
+    echo -e "${YELLOW}▶ Docker${RESET}"
+    if command -v docker &>/dev/null; then
+        containers=$(docker ps --format "{{.Names}}" | grep -Ei 'xray|sing|hysteria|tuic|snell|3xui_app|AnyTLSD|MTProto|shadowsocks|sshadow-tls|shadow-tls|Singbox-AnyReality|Singbox-AnyTLS|Singbox-TUICv5|Xray-Reality|Xray-Realityxhttp|xray-socks5|xray-vmess|xray-vmesstls|clash|mihomo|warp|glash|conflux|heki|microwarp|nodepassdash|ppanel|wg-easy|wireguard|gostpanel|vite-frontend|xboard|xtrafficdash|lumina-client|freegfw|Mihomo')
+        if [[ -n "$containers" ]]; then
+            echo -e "状态: ${GREEN}运行中${RESET}"
+            echo -e "${YELLOW}容器:${RESET} $(echo "$containers" | tr '\n' ' ')"
+        else echo -e "状态: ${GREEN}已安装${RESET}"; fi
+    else echo -e "状态: ${RED}未安装${RESET}"; fi
+    echo ""
+
+    # =============================
+    # BBR
+    # =============================
+    echo -e "${YELLOW}▶ BBR${RESET}"
+    actual_cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
+    if [[ "$actual_cc" == "bbr" ]]; then echo -e "状态: ${GREEN}已启用 BBR${RESET}"
+    else echo -e "状态: ${RED}未启用 BBR${RESET}"; fi
+    echo ""
+
+    # =============================
+    # 网络出口
+    # =============================
+    echo -e "${YELLOW}▶ 网络出口${RESET}"
+    ipv4=$(curl -4 -s --max-time 3 ip.sb 2>/dev/null || curl -4 -s --max-time 3 ifconfig.me 2>/dev/null)
+    ipv6=$(curl -6 -s --max-time 3 ip.sb 2>/dev/null)
+    get_country_cn() {
+        local ip="$1"
+        local res=$(curl -s --max-time 3 "http://ip-api.com/json/$ip?lang=zh-CN")
+        local name=$(echo "$res" | grep -oP '"country":"\K[^"]+')
+        echo "${name:-未知}"
+    }
+    if [[ -n "$ipv4" ]]; then
+        country4=$(get_country_cn "$ipv4")
+        echo -e "IPv4: ${GREEN}$ipv4${RESET}         国家: ${GREEN}$country4${RESET}"
+    else echo -e "IPv4: ${RED}获取失败${RESET}"; fi
+    if [[ -n "$ipv6" ]]; then
+        country6=$(get_country_cn "$ipv6")
+        echo -e "IPv6: ${GREEN}$ipv6${RESET}  国家: ${GREEN}$country6${RESET}"
+    fi
+    echo ""
+
+    # =============================
+    # DNS 检测
+    # =============================
+    echo -e "${YELLOW}▶ DNS 信息${RESET}"
+    dns_all=$(grep "nameserver" /etc/resolv.conf | awk '{print $2}')
+    dns_v4=$(echo "$dns_all" | grep -v ":" | tr '\n' ' ')
+    dns_v6=$(echo "$dns_all" | grep ":" | tr '\n' ' ')
+    if [[ -n "$dns_v4" ]]; then
+        echo -e "DNSv4: ${CYAN}${dns_v4}${RESET}"
+        test_v4=$(first_dns=$(echo $dns_v4 | awk '{print $1}'); dig +short +time=1 +tries=1 google.com @$first_dns >/dev/null 2>&1 && echo "ok" || echo "fail")
+        if [[ "$test_v4" == "ok" ]]; then echo -e "解析: ${GREEN}IPv4 正常${RESET}"
+        else echo -e "解析: ${RED}IPv4 失败或超时${RESET}"; fi
+    else echo -e "DNSv4: ${RED}无${RESET}"; fi
+    if [[ -n "$dns_v6" ]]; then
+        echo -e "DNSv6: ${CYAN}${dns_v6}${RESET}"
+        test_v6=$(first_dns6=$(echo $dns_v6 | awk '{print $1}'); dig +short +time=1 +tries=1 google.com AAAA @$first_dns6 >/dev/null 2>&1 && echo "ok" || echo "fail")
+        if [[ "$test_v6" == "ok" ]]; then echo -e "解析: ${GREEN}IPv6 正常${RESET}"
+        else echo -e "解析: ${RED}IPv6 失败或超时${RESET}"; fi
+    fi
+    echo ""
 }
 
-V4_RES=$(test_remote "$IP_V4" "IPv4")
-V6_RES=$(test_remote "$IP_V6" "IPv6")
-
-if [[ $V4_RES -ne 0 && $V6_RES -ne 0 ]]; then
-    echo -e "\n${RED}❌ 远程检测全部失败！${RESET}"
-    echo -e "${YELLOW}请检查：${RESET}"
-    echo -e "1. 云服务商后台安全组是否放行了 TCP:$new_port (需分别检查 v4/v6 规则)"
-    echo -e "2. 某些地区运营商可能屏蔽了非标准端口"
-else
-    echo -e "\n${GREEN}✔ 远程连通性检测通过！${RESET}"
-fi
-
-echo -e "\n${GREEN}========================================${RESET}"
-echo -e "${GREEN}  操作完成！当前 SSH 端口为: $new_port ${RESET}"
-echo -e "${YELLOW}  请务必打开新窗口测试连接，确认成功后再退出！${RESET}"
-echo -e "${GREEN}========================================${RESET}"
+# 运行检测
+status_check

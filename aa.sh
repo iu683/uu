@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ===============================
-# SSH 一键安全加固脚本 (Key-Only)
+# SSH 管理菜单脚本
 # ===============================
 
 # 颜色
@@ -12,56 +12,77 @@ RESET='\033[0m'
 
 SSH_CONF="/etc/ssh/sshd_config"
 
-# 权限检查
-if [[ $EUID -ne 0 ]]; then
-   echo -e "${RED}错误: 必须以 root 权限运行此脚本${RESET}"
-   exit 1
-fi
+# ===============================
+# 函数：配置密钥登录
+# ===============================
+setup_ssh_key() {
+    echo -e "${YELLOW}Step 1: 生成 SSH 密钥并配置公钥登录${RESET}"
+    mkdir -p ~/.ssh
+    chmod 700 ~/.ssh
 
-echo -e "${YELLOW}开始执行 SSH 一键加固任务...${RESET}"
+    read -p "请输入密钥保存路径（默认 /root/.ssh/id_ed25519）: " keypath
+    keypath=${keypath:-/root/.ssh/id_ed25519}
 
-# 1. 配置密钥登录
-echo -e "\n${YELLOW}[1/3] 正在生成密钥对并配置公钥登录...${RESET}"
-mkdir -p ~/.ssh
-chmod 700 ~/.ssh
+    ssh-keygen -t ed25519 -f "$keypath"
 
-# 默认生成 Ed25519 密钥
-KEY_PATH="/root/.ssh/id_ed25519"
-if [ ! -f "$KEY_PATH" ]; then
-    ssh-keygen -t ed25519 -f "$KEY_PATH" -N ""
-else
-    echo -e "${GREEN}检测到现有密钥，跳过生成步骤${RESET}"
-fi
+    cat "${keypath}.pub" >> ~/.ssh/authorized_keys
+    chmod 600 ~/.ssh/authorized_keys
 
-# 将公钥加入信任列表
-cat "${KEY_PATH}.pub" >> ~/.ssh/authorized_keys
-chmod 600 ~/.ssh/authorized_keys
+    sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/g' "$SSH_CONF"
 
-# 2. 修改配置 (禁用密码，允许密钥)
-echo -e "${YELLOW}[2/3] 正在修改 sshd_config 禁用密码登录...${RESET}"
-[ -f "$SSH_CONF" ] && cp "$SSH_CONF" "${SSH_CONF}.bak"
+    echo -e "${GREEN}密钥登录配置完成${RESET}"
+    echo "公钥路径: ${keypath}.pub"
+    echo "私钥路径: ${keypath}"
+    echo -e "\n${GREEN}================== Key ==================${RESET}"
+    cat "$keypath"
+    echo -e "${GREEN}===========================================${RESET}"
+}
 
-# 确保配置生效
-sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/g' "$SSH_CONF"
-sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/g' "$SSH_CONF"
-sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/g' "$SSH_CONF"
+# ===============================
+# 函数：禁用 root 密码登录
+# ===============================
+disable_root_password() {
+    echo -e "${YELLOW}Step 2: 禁用 root 密码登录${RESET}"
 
-# 3. 重启 SSH 服务
-echo -e "${YELLOW}[3/3] 正在重启 SSH 服务...${RESET}"
+    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/g' "$SSH_CONF"
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/g' "$SSH_CONF"
 
-if command -v systemctl &>/dev/null; then
-    systemctl restart sshd || systemctl restart ssh
-elif command -v rc-service &>/dev/null; then
-    rc-service sshd restart || rc-service ssh restart
-else
-    service sshd restart || service ssh restart
-fi
+    echo -e "${GREEN}root 密码登录已禁用${RESET}"
+}
 
-echo -e "\n${GREEN}========================================${RESET}"
-echo -e "${GREEN}所有操作已完成！${RESET}"
-echo -e "请务必${RED}不要立即断开当前连接${RESET}！"
-echo -e "请开启一个新终端尝试使用密钥登录。"
-echo -e "私钥位置: ${YELLOW}${KEY_PATH}${RESET}"
-echo -e "公钥内容: "
-cat "${KEY_PATH}.pub"
-echo -e "${GREEN}========================================${RESET}"
+# ===============================
+# 函数：重启 SSH 服务
+# ===============================
+restart_ssh() {
+    echo -e "${YELLOW}Step 3: 重启 SSH 服务${RESET}"
+
+    if systemctl status sshd &>/dev/null; then
+        systemctl restart sshd
+    elif systemctl status ssh &>/dev/null; then
+        systemctl restart ssh
+    else
+        service sshd restart
+    fi
+
+    echo -e "${GREEN}SSH 服务已重启，操作完成！${RESET}"
+}
+
+# ===============================
+# 菜单循环
+# ===============================
+while true; do
+    echo -e "${GREEN}==== SSH 管理菜单 ====${RESET}"
+    echo -e "${GREEN}1) 配置SSH密钥登录${RESET}"
+    echo -e "${GREEN}2) 禁用root密码登录${RESET}"
+    echo -e "${GREEN}3) 重启SSH服务${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    read -p "$(echo -e ${GREEN}请选择操作:${RESET}) " choice
+
+    case $choice in
+        1) setup_ssh_key ;;
+        2) disable_root_password ;;
+        3) restart_ssh ;;
+        0) break ;;
+        *) echo -e "${RED}无效选择，请重新输入${RESET}" ;;
+    esac
+done

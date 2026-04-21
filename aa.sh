@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # ========================================
-# SSH 端口修改与检测
+# SSH 端口修改与双栈检测全能脚本
 # 适配: Ubuntu, Debian, Alpine, RHEL/CentOS
+# 支持: IPv4 / IPv6 远程连通性检测
 # ========================================
 
 # 颜色定义
@@ -59,20 +60,23 @@ else
     echo "Port $new_port" >> /etc/ssh/sshd_config
 fi
 
-# 5. 放行防火墙
+# 5. 放行防火墙 (UFW/Firewalld/Iptables)
 echo -e "${YELLOW}正在放行防火墙端口 $new_port...${RESET}"
 if command -v ufw >/dev/null 2>&1; then
+    # UFW 默认同时处理 v4 和 v6
     ufw allow "$new_port"/tcp >/dev/null 2>&1 || true
 elif command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --permanent --add-port="$new_port"/tcp >/dev/null 2>&1 || true
     firewall-cmd --reload >/dev/null 2>&1 || true
 elif command -v iptables >/dev/null 2>&1; then
     iptables -I INPUT -p tcp --dport "$new_port" -j ACCEPT 2>/dev/null || true
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -I INPUT -p tcp --dport "$new_port" -j ACCEPT 2>/dev/null || true
+    fi
 fi
 
-# 6. 重启服务 (解决 Ubuntu 常见冲突)
+# 6. 重启服务 (解决 Ubuntu/Debian Socket 冲突)
 echo -e "${YELLOW}正在重启 SSH 服务...${RESET}"
-# 在 Ubuntu 上，必须先停止可能接管 22 端口的 ssh.socket
 if [[ "$OS" == "Ubuntu" ]] || [[ "$OS" == "Debian" ]]; then
     systemctl stop ssh.socket >/dev/null 2>&1 || true
     systemctl disable ssh.socket >/dev/null 2>&1 || true
@@ -92,7 +96,7 @@ if [ "$restart_done" = false ]; then
     exit 1
 fi
 
-# 7. 本地监听检测 (增加重试逻辑)
+# 7. 本地监听检测
 echo -e "${YELLOW}正在检测本地监听状态...${RESET}"
 SUCCESS=false
 for i in {1..5}; do
@@ -102,41 +106,57 @@ for i in {1..5}; do
     else
         CHECK=$(netstat -tlnp | grep ":$new_port ")
     fi
-    
-    if [ -n "$CHECK" ]; then
-        SUCCESS=true && break
-    fi
+    if [ -n "$CHECK" ]; then SUCCESS=true && break; fi
     echo -e "${YELLOW}等待服务绑定端口... ($i/5)${RESET}"
 done
 
 if [ "$SUCCESS" = true ]; then
     echo -e "${GREEN}✔ 本地端口 $new_port 监听成功${RESET}"
 else
-    echo -e "${RED}❌ 本地检测失败，SSH 可能未能在新端口启动${RESET}"
+    echo -e "${RED}❌ 本地检测失败，请手动执行 'ss -tlnp | grep :$new_port' 确认${RESET}"
     exit 1
 fi
 
-# 8. 远程连通性检测
+# 8. 远程连通性检测 (兼容 v4/v6)
 echo -e "${YELLOW}正在执行远程连通性检测...${RESET}"
-# 获取外网 IP (容错处理)
-PUBLIC_IP=$(curl -sL --max-time 8 https://api.ipify.org || curl -sL --max-time 8 https://ifconfig.me || echo "")
 
-if [ -n "$PUBLIC_IP" ]; then
-    echo -e "外网 IP: $PUBLIC_IP"
-    # 使用 nc 检测，支持多系统返回特征
-    if timeout 5 nc -zv "$PUBLIC_IP" "$new_port" 2>&1 | grep -q "succeeded\|open"; then
-        echo -e "${GREEN}✔ 远程检测通过！端口 $new_port 已开放${RESET}"
-    else
-        echo -e "${RED}❌ 远程检测失败！${RESET}"
-        echo -e "${YELLOW}排查建议：${RESET}"
-        echo -e "1. 确认云服务商控制台（安全组）放行了 TCP:$new_port"
-        echo -e "2. 确认系统内防火墙状态：ufw status 或 iptables -L"
+# 探测 IP (优先获取 IPv6，其次 IPv4)
+IP_V6=$(curl -6 -sL --max-time 5 https://6.ipw.cn || echo "")
+IP_V4=$(curl -4 -sL --max-time 5 https://4.ipw.cn || curl -sL --max-time 5 https://api.ipify.org || echo "")
+
+test_remote() {
+    local ip=$1
+    local mode=$2
+    if [ -n "$ip" ]; then
+        echo -en "检测 $mode 地址 $ip ... "
+        # IPv6 检测需加 -6 参数
+        local nc_cmd="nc -zv"
+        [[ "$mode" == "IPv6" ]] && nc_cmd="nc -6 -zv"
+        
+        if timeout 6 $nc_cmd "$ip" "$new_port" 2>&1 | grep -q "succeeded\|open"; then
+            echo -e "${GREEN}✔ 通畅${RESET}"
+            return 0
+        else
+            echo -e "${RED}✘ 失败${RESET}"
+            return 1
+        fi
     fi
+    return 2
+}
+
+V4_RES=$(test_remote "$IP_V4" "IPv4")
+V6_RES=$(test_remote "$IP_V6" "IPv6")
+
+if [[ $V4_RES -ne 0 && $V6_RES -ne 0 ]]; then
+    echo -e "\n${RED}❌ 远程检测全部失败！${RESET}"
+    echo -e "${YELLOW}请检查：${RESET}"
+    echo -e "1. 云服务商后台安全组是否放行了 TCP:$new_port (需分别检查 v4/v6 规则)"
+    echo -e "2. 某些地区运营商可能屏蔽了非标准端口"
 else
-    echo -e "${RED}⚠ 无法获取外网 IP，跳过远程检测，请手动测试连接。${RESET}"
+    echo -e "\n${GREEN}✔ 远程连通性检测通过！${RESET}"
 fi
 
-echo -e "\n${GREEN}=============================================${RESET}"
+echo -e "\n${GREEN}========================================${RESET}"
 echo -e "${GREEN}  操作完成！当前 SSH 端口为: $new_port ${RESET}"
 echo -e "${YELLOW}  请务必打开新窗口测试连接，确认成功后再退出！${RESET}"
-echo -e "${GREEN}===============================================${RESET}"
+echo -e "${GREEN}========================================${RESET}"

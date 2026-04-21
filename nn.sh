@@ -1,753 +1,97 @@
-#!/bin/bash
-set -e
+#!/bin/sh
+# ==========================================
+# 哪吒监控 & Komari Agent 全自动卸载工具
+# 支持系统: Alpine (OpenRC), Debian/Ubuntu/CentOS (Systemd)
+# ==========================================
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-RESET="\033[0m"
+NZ_BASE_PATH="/opt/nezha"
+NZ_AGENT_PATH="${NZ_BASE_PATH}/agent"
+KOMARI_PATH="/opt/komari/agent"
 
-generate_random_email() {
-    RAND_STR=$(tr -dc a-z0-9 </dev/urandom | head -c 10)
-    echo "${RAND_STR}@gmail.com"
-}
+# 颜色定义
+red='\033[0;31m'
+green='\033[0;32m'
+yellow='\033[0;33m'
+plain='\033[0m'
 
-validate_email() {
-    [[ "$1" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
-}
+# 输出函数
+info() { printf "${yellow}[INFO] %s${plain}\n" "$*"; }
+err() { printf "${red}[ERROR] %s${plain}\n" "$*" >&2; }
+success() { printf "${green}[SUCCESS] %s${plain}\n" "$*"; }
 
-pause() {
-    echo -ne "${YELLOW}按回车返回菜单...${RESET}"
-    read
-}
-
-configure_firewall() {
-    for PORT in 80 443; do
-        if command -v ufw >/dev/null 2>&1; then
-            ufw allow $PORT || true
-        elif command -v firewall-cmd >/dev/null 2>&1; then
-            firewall-cmd --permanent --add-port=$PORT/tcp || true
-            firewall-cmd --reload || true
+# 权限检查
+sudo_exec() {
+    if [ "$(id -u)" -ne 0 ]; then
+        if command -v sudo > /dev/null 2>&1; then
+            sudo "$@"
+        else
+            err "错误: 需要root权限且未找到sudo"
+            exit 1
         fi
-    done
-}
-
-remove_default_server() {
-    echo -e "${YELLOW}清理系统自带的 default server 配置...${RESET}"
-    rm -f /etc/nginx/sites-enabled/default
-    rm -f /etc/nginx/sites-available/default
-}
-
-ensure_nginx_conf() {
-    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/modules-enabled
-    if [ ! -f /etc/nginx/nginx.conf ]; then
-        cat > /etc/nginx/nginx.conf <<'EOF'
-user www-data;
-worker_processes auto;
-pid /run/nginx.pid;
-include /etc/nginx/modules-enabled/*.conf;
-
-events {
-    worker_connections 768;
-}
-
-http {
-    sendfile on;
-    tcp_nopush on;
-    types_hash_max_size 2048;
-    include /etc/nginx/mime.types;
-    default_type application/octet-stream;
-
-    access_log /var/log/nginx/access.log;
-    error_log /var/log/nginx/error.log;
-
-    gzip on;
-    include /etc/nginx/conf.d/*.conf;
-    include /etc/nginx/sites-enabled/*;
-}
-EOF
-    fi
-
-    if [ ! -f /etc/nginx/mime.types ]; then
-        cat > /etc/nginx/mime.types <<'EOF'
-types {
-    text/html  html htm shtml;
-    text/css   css;
-    text/xml   xml;
-    image/gif  gif;
-    image/jpeg jpeg jpg;
-    application/javascript js;
-    application/atom+xml atom;
-    application/rss+xml rss;
-}
-EOF
-    fi
-}
-
-create_default_server() {
-    DEFAULT_PATH="/etc/nginx/sites-available/default_server_block"
-    [ ! -f "$DEFAULT_PATH" ] && cat > "$DEFAULT_PATH" <<EOF
-server {
-    listen 80 default_server;
-    server_name _;
-    return 403;
-}
-EOF
-    ln -sf "$DEFAULT_PATH" /etc/nginx/sites-enabled/default_server_block
-}
-
-generate_server_config() {
-    DOMAIN=$1
-    TARGET=$2
-    IS_WS=$3
-    MAX_SIZE=$4
-    CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
-
-    MAX_SIZE=${MAX_SIZE:-200M}
-
-    if [ "$IS_WS" == "y" ]; then
-        WS_HEADERS="proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \"Upgrade\";"
     else
-        WS_HEADERS=""
-    fi
-
-    cat > "$CONFIG_PATH" <<EOF
-server {
-    listen 80;
-    server_name $DOMAIN;
-    return 301 https://\$host\$request_uri;
-}
-
-server {
-    listen 443 ssl;
-    server_name $DOMAIN;
-
-    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
-
-    location / {
-        client_max_body_size $MAX_SIZE;
-
-        proxy_pass $TARGET;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        $WS_HEADERS
-    }
-}
-EOF
-    ln -sf "$CONFIG_PATH" "/etc/nginx/sites-enabled/$DOMAIN"
-}
-
-check_domain_resolution() {
-    DOMAIN=$1
-    VPS_IP=$(curl -s https://ipinfo.io/ip)
-    DOMAIN_IP=$(dig +short "$DOMAIN" | tail -n1)
-    if [ "$DOMAIN_IP" != "$VPS_IP" ]; then
-        echo -e "${RED}警告: 域名 $DOMAIN 解析为 $DOMAIN_IP, VPS IP 为 $VPS_IP${RESET}"
-    else
-        echo -e "${GREEN}域名解析正常${RESET}"
+        "$@"
     fi
 }
 
-# ------------------------------
-# 功能函数
-# ------------------------------
-
-install_nginx() {
-    ensure_nginx_conf
-    remove_default_server
-
-    DEBIAN_FRONTEND=noninteractive apt update
-    DEBIAN_FRONTEND=noninteractive apt upgrade -y \
-        -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confold"
-
-    DEBIAN_FRONTEND=noninteractive apt install -y curl dnsutils \
-        -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confold"
-
-    echo -e "${GREEN}开始安装 Nginx 和 Certbot...${RESET}"
-    if ! DEBIAN_FRONTEND=noninteractive apt install -y \
-        -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confold" \
-        nginx certbot python3-certbot-nginx; then
-        echo -e "${RED}安装失败，尝试自动修复...${RESET}"
-        uninstall_nginx
-        echo -e "${YELLOW}重新尝试安装...${RESET}"
-        DEBIAN_FRONTEND=noninteractive apt install -y \
-            -o Dpkg::Options::="--force-confdef" \
-            -o Dpkg::Options::="--force-confold" \
-            nginx certbot python3-certbot-nginx || {
-            echo -e "${RED}修复后安装仍然失败，请手动检查系统环境！${RESET}"
-            pause
-            return
-        }
-    fi
-
-    remove_default_server
-    create_default_server
-    configure_firewall
-    systemctl daemon-reload
-    systemctl enable --now nginx
-    echo
-    echo -ne "${YELLOW}是否现在配置反向代理并申请证书？(Y/n,默认Y): ${RESET}"
-    read CONFIRM
-
-    # 默认 Y
-    CONFIRM=${CONFIRM:-Y}
-
-    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-        echo -e "${RED}已取消配置退出${RESET}"
-        exit 0
-    fi
-
-    EMAIL_FILE="/etc/nginx/.cert_emails"
-    # 如果已有邮箱记录，默认使用第一个
-    if [ -f "$EMAIL_FILE" ] && [ -s "$EMAIL_FILE" ]; then
-        DEFAULT_EMAIL=$(head -n1 "$EMAIL_FILE")
-    else
-        DEFAULT_EMAIL=$(generate_random_email)
-    fi
-
-    echo -ne "${GREEN}请输入邮箱地址 (回车自动生成: ${DEFAULT_EMAIL}): ${RESET}"
-    read EMAIL
-    EMAIL=${EMAIL:-$DEFAULT_EMAIL}
-
-    if ! validate_email "$EMAIL"; then
-        echo -e "${RED}邮箱格式不正确${RESET}"
-        pause
-        return
-    fi
-
-    echo -e "${GREEN}使用邮箱: ${EMAIL}${RESET}"
-
-    # 保存邮箱
-    echo "$EMAIL" >> "$EMAIL_FILE"
-    sort -u "$EMAIL_FILE" -o "$EMAIL_FILE"
-    echo -ne "${GREEN}请输入域名: ${RESET}"; read DOMAIN
-    check_domain_resolution "$DOMAIN"
-    echo -ne "${GREEN}请输入反代目标: ${RESET}"; read TARGET
-    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n，默认 y): ${RESET}"; read IS_WS
-    IS_WS=${IS_WS:-y}
-
-    echo -ne "${GREEN}请输入最大上传大小 (默认 200M): ${RESET}"
-    read MAX_SIZE
-    MAX_SIZE=${MAX_SIZE:-200M}
-
-    certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-    generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE"
-    nginx -t && systemctl reload nginx
-    systemctl enable --now certbot.timer
-    echo -e "${GREEN}安装完成！访问: https://$DOMAIN${RESET}"
-    pause
-}
-
-add_config() {
-    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-
-    echo -ne "${GREEN}请输入域名: ${RESET}"
-    read DOMAIN
-    check_domain_resolution "$DOMAIN"
-
-    echo -ne "${GREEN}请输入反代目标(例如http://127.0.0.1:5788): ${RESET}"
-    read TARGET
-
-    EMAIL_FILE="/etc/nginx/.cert_emails"
-    # 如果已有邮箱记录，默认使用第一个
-    if [ -f "$EMAIL_FILE" ] && [ -s "$EMAIL_FILE" ]; then
-        DEFAULT_EMAIL=$(head -n1 "$EMAIL_FILE")
-    else
-        DEFAULT_EMAIL=$(generate_random_email)
-    fi
-
-    echo -ne "${GREEN}请输入邮箱地址 (回车自动生成: ${DEFAULT_EMAIL}): ${RESET}"
-    read EMAIL
-    EMAIL=${EMAIL:-$DEFAULT_EMAIL}
-
-    if ! validate_email "$EMAIL"; then
-        echo -e "${RED}邮箱格式不正确${RESET}"
-        pause
-        return
-    fi
-
-    echo -e "${GREEN}使用邮箱: ${EMAIL}${RESET}"
-
-    echo "$EMAIL" >> "$EMAIL_FILE"
-    sort -u "$EMAIL_FILE" -o "$EMAIL_FILE"
-
-    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n，回车默认 y): ${RESET}"
-    read IS_WS
-    IS_WS=${IS_WS:-y}
-
-    echo -ne "${GREEN}请输入最大上传大小 (默认 200M): ${RESET}"
-    read MAX_SIZE
-    MAX_SIZE=${MAX_SIZE:-200M}
-
-    if [ -f "/etc/nginx/sites-available/$DOMAIN" ]; then
-        echo -e "${YELLOW}配置已存在${RESET}"
-        pause
-        return
-    fi
-
-    certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-
-    generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE"
-    create_default_server
-
-    nginx -t && systemctl reload nginx
-
-    echo -e "${GREEN}添加完成！访问: https://$DOMAIN${RESET}"
-    pause
-}
-
-modify_config() {
-    CONFIG_DIR="/etc/nginx/sites-available"
-    [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}还没有任何配置文件！${RESET}" && pause && return
-
-    DOMAINS=($(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort))
-    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有域名配置！${RESET}" && pause && return
-
-    echo -e "${GREEN}现有配置的域名:${RESET}"
-    for i in "${!DOMAINS[@]}"; do
-        echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"
-    done
-
-    echo -ne "${GREEN}请输入编号 (0 返回): ${RESET}"
-    read choice
-    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ ]]; then
-        echo -e "${YELLOW}已取消${RESET}"; return
-    fi
-    if [ "$choice" -eq 0 ]; then return; fi
-    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效选择${RESET}"; pause; return
-    fi
-
-    DOMAIN="${DOMAINS[$((choice-1))]}"
-    CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
-    echo -ne "${GREEN}请输入新反代目标(例如http://127.0.0.1:5788): ${RESET}"; read TARGET
-    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n，回车默认 y): ${RESET}"; read IS_WS
-    IS_WS=${IS_WS:-y}
-    echo -ne "${GREEN}请输入最大上传大小 (默认 200M): ${RESET}"
-    read MAX_SIZE
-    MAX_SIZE=${MAX_SIZE:-200M}
-    echo -ne "${GREEN}是否更新邮箱? (y/n，回车默认 n): ${RESET}"
-    read c
-    c=${c:-n}
-
-    if [[ "$c" == "y" ]]; then
-        DEFAULT_EMAIL=$(generate_random_email)
-        echo -ne "${GREEN}请输入新邮箱 (回车默认: ${DEFAULT_EMAIL}): ${RESET}"
-        read EMAIL
-        EMAIL=${EMAIL:-$DEFAULT_EMAIL}
-
-        if ! validate_email "$EMAIL"; then
-            echo -e "${RED}邮箱格式不正确${RESET}"
-            pause
-            return
-        fi
-
-        echo -e "${GREEN}使用邮箱: ${EMAIL}${RESET}"
-
-        certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-    fi
-    generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE"
-    create_default_server
-    nginx -t && systemctl reload nginx
-    echo -e "${GREEN}修改完成！访问: https://$DOMAIN${RESET}"
-    pause
-}
-
-delete_config() {
-    CONFIG_DIR="/etc/nginx/sites-available"
-    [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}没有配置文件！${RESET}" && pause && return
-
-    DOMAINS=($(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort))
-    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有域名配置！${RESET}" && pause && return
-
-    echo -e "${GREEN}可删除的域名:${RESET}"
-    for i in "${!DOMAINS[@]}"; do
-        echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"
-    done
-
-    echo -ne "${GREEN}请选择编号 (0 返回): ${RESET}"
-    read choice
-    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ ]]; then
-        echo -e "${YELLOW}已取消${RESET}"; return
-    fi
-    if [ "$choice" -eq 0 ]; then return; fi
-    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效选择${RESET}"; pause; return
-    fi
-
-    DOMAIN="${DOMAINS[$((choice-1))]}"
-
-    # 删除配置文件
-    rm -f "/etc/nginx/sites-available/$DOMAIN" "/etc/nginx/sites-enabled/$DOMAIN"
-
-    # 询问是否删除证书
-    echo -ne "${YELLOW}是否同时删除证书 $DOMAIN ? (y/N): ${RESET}"
-    read del_cert
-    if [[ "$del_cert" =~ ^[Yy]$ ]]; then
-        certbot delete --cert-name "$DOMAIN" || true
-        echo -e "${GREEN}证书已删除${RESET}"
-    else
-        echo -e "${YELLOW}证书保留${RESET}"
-    fi
-
-    # 检查并重载 Nginx
-    if nginx -t; then
-        systemctl reload nginx
-        echo -e "${GREEN}域名 $DOMAIN 已删除${RESET}"
-    else
-        echo -e "${RED}Nginx 配置测试失败，请检查！${RESET}"
-    fi
-    pause
-}
-
-
-test_renew() {
-    CONFIG_DIR="/etc/nginx/sites-available"
-    [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}没有配置文件${RESET}" && pause && return
-
-    DOMAINS=($(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort))
-    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有域名配置！${RESET}" && pause && return
-
-    echo -e "${GREEN}已有配置:${RESET}"
-    for i in "${!DOMAINS[@]}"; do
-        echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"
-    done
-
-    echo -ne "${GREEN}选择编号 (0 返回): ${RESET}"
-    read choice
-    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ ]]; then
-        echo -e "${YELLOW}已取消${RESET}"; return
-    fi
-    if [ "$choice" -eq 0 ]; then return; fi
-    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效选择${RESET}"; pause; return
-    fi
-
-    DOMAIN="${DOMAINS[$((choice-1))]}"
-    echo -e "${GREEN}正在测试 $DOMAIN 的证书续期...${RESET}"
-    certbot renew --dry-run --cert-name "$DOMAIN"
-    pause
-}
-
-check_cert() {
-    CERT_DIR="/etc/letsencrypt/live"
-    if [ ! -d "$CERT_DIR" ]; then
-        echo -e "${GREEN}没有找到任何证书"
-        pause
-        return
-    fi
-
-    echo -e "${GREEN}现有证书的域名：${RESET}"
-    i=1
-    DOMAINS=()
-    for DOMAIN in $(ls "$CERT_DIR"); do
-        if [ -f "$CERT_DIR/$DOMAIN/fullchain.pem" ]; then
-            echo -e "${GREEN}$i) $DOMAIN${RESET}"
-            DOMAINS+=("$DOMAIN")
-            i=$((i+1))
-        fi
-    done
-
-    if [ ${#DOMAINS[@]} -eq 0 ]; then
-        echo -e "${GREEN}没有找到任何有效证书${RESET}"
-        pause
-        return
-    fi
-
-    echo -ne "${GREEN}请选择要查看的域名编号 (0 返回): ${RESET}"
-    read choice
-
-    # 如果输入为空或不是数字
-    if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
-        echo -e "${GREEN}无效输入${RESET}"
-        pause
-        return
-    fi
-
-    if [ "$choice" -eq 0 ]; then
-        return
-    fi
-
-    if [ "$choice" -ge 1 ] && [ "$choice" -le ${#DOMAINS[@]} ]; then
-        SELECTED=${DOMAINS[$((choice-1))]}
-        certbot certificates --cert-name "$SELECTED"
-    else
-        echo -e "${GREEN}无效选择${RESET}"
-    fi
-    pause
-}
-
-
-check_domains_status() {
-    echo -e "${GREEN}域名                  状态       到期时间        剩余天数${RESET}"
-    echo -e "${GREEN}------------------------------------------------------------${RESET}"
-
-    CERT_DIR="/etc/letsencrypt/live"
-    [ ! -d "$CERT_DIR" ] && echo -e "${GREEN}没有找到任何证书${RESET}" && pause && return
-
-    DOMAINS=($(ls "$CERT_DIR" | grep -vE 'default|default_server_block' | sort))
-    for DOMAIN in "${DOMAINS[@]}"; do
-        CERT_PATH="$CERT_DIR/$DOMAIN/fullchain.pem"
-        if [ -f "$CERT_PATH" ]; then
-            END_DATE=$(openssl x509 -enddate -noout -in "$CERT_PATH" | cut -d= -f2)
-            END_TS=$(date -d "$END_DATE" +%s)
-            NOW_TS=$(date +%s)
-            DAYS_LEFT=$(( (END_TS - NOW_TS) / 86400 ))
-
-            if [ $DAYS_LEFT -ge 30 ]; then
-                STATUS="有效"
-            elif [ $DAYS_LEFT -ge 0 ]; then
-                STATUS="即将过期"
-            else
-                STATUS="已过期"
-            fi
-
-            printf "%-22s %-10s %-15s %d 天\n" \
-                "$DOMAIN" "$STATUS" "$(date -d "$END_DATE" +"%Y-%m-%d")" "$DAYS_LEFT"
-        fi
-    done
-    pause
-}
-
-uninstall_nginx() {
-    echo -e "${YELLOW}卸载 Nginx...${RESET}"
-    systemctl stop nginx || true
-    apt purge -y nginx nginx-common nginx-core certbot python3-certbot-nginx || true
-    apt autoremove -y
-    rm -rf /etc/nginx /etc/letsencrypt
-    remove_default_server
-    echo -e "${GREEN}已卸载${RESET}"
-    pause
-}
-
-
-# 函数：生成普通 Emby 配置
-generate_emby_normal_conf() {
-    local DOMAIN=$1
-    local TARGET=$2
-    local CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
-    local TARGET_HOST=$(echo $TARGET | awk -F[/:] '{print $4}')
-
-    cat > "$CONFIG_PATH" <<EOF
-server {
-    listen 80;
-    server_name $DOMAIN;
-    return 301 https://\$host\$request_uri;
-}
-
-server {
-    listen 443 ssl http2;
-    server_name $DOMAIN;
-
-    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
-
-    client_max_body_size 5000M;
-
-    location / {
-        # 自动允许当前域名跨域
-        add_header 'Access-Control-Allow-Origin' '*' always;
-        add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS, DELETE, PUT' always;
-        add_header 'Access-Control-Allow-Headers' 'X-Emby-Authorization, Content-Type, Authorization, X-Requested-With' always;
-        if (\$request_method = 'OPTIONS') { return 204; }
-
-        proxy_pass $TARGET;
-        proxy_ssl_server_name on;
-        proxy_set_header Host $TARGET_HOST;
-        proxy_pass_request_headers on;
-
-        # ❗ 隐私去 IP
-        proxy_set_header X-Real-IP "";
-        proxy_set_header X-Forwarded-For "";
-        proxy_set_header CF-Connecting-IP "";
-        proxy_set_header X-Forwarded-Proto https;
-
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+# --- 1. 卸载哪吒 Agent ---
+uninstall_nezha() {
+    if [ -d "$NZ_AGENT_PATH" ]; then
+        info "正在检测并停止 哪吒-agent 服务..."
+        config_files=$(find "$NZ_AGENT_PATH" -name "config*.yml" 2>/dev/null)
         
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_max_temp_file_size 0;
+        if [ -n "$config_files" ]; then
+            for config in $config_files; do
+                sudo_exec "${NZ_AGENT_PATH}/nezha-agent" service -c "$config" uninstall >/dev/null 2>&1 || true
+            done
+        fi
 
-        proxy_read_timeout 86400;
-        proxy_send_timeout 86400;
-    }
-}
-EOF
-    ln -sf "$CONFIG_PATH" "/etc/nginx/sites-enabled/$DOMAIN"
-}
-
-# 函数：生成主站+推流分离配置
-generate_emby_stream_conf() {
-    local DOMAIN=$1
-    local T_MAIN=$2
-    local T_STREAM=$3
-    local CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
-    local MAIN_HOST=$(echo $T_MAIN | awk -F[/:] '{print $4}')
-    local STREAM_HOST=$(echo $T_STREAM | awk -F[/:] '{print $4}')
-
-    cat > "$CONFIG_PATH" <<EOF
-server {
-    listen 80;
-    server_name $DOMAIN;
-    return 301 https://\$host\$request_uri;
+        info "清理哪吒文件..."
+        sudo_exec rm -rf "$NZ_AGENT_PATH"
+        # 如果父目录为空则清理
+        if [ -d "$NZ_BASE_PATH" ] && [ -z "$(ls -A "$NZ_BASE_PATH" 2>/dev/null)" ]; then
+            sudo_exec rm -rf "$NZ_BASE_PATH"
+        fi
+        success "哪吒-agent 卸载完成"
+    else
+        info "未发现哪吒安装目录，跳过"
+    fi
 }
 
-server {
-    listen 443 ssl http2;
-    server_name $DOMAIN;
+# --- 2. 卸载 Komari Agent ---
+uninstall_komari() {
+    info "开始检测并停止 Komari-agent..."
 
-    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+    # Systemd 环境 (Debian/Ubuntu/CentOS)
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl list-unit-files | grep -q "komari-agent"; then
+            sudo_exec systemctl stop komari-agent >/dev/null 2>&1 || true
+            sudo_exec systemctl disable komari-agent >/dev/null 2>&1 || true
+            sudo_exec rm -f /etc/systemd/system/komari-agent.service
+            sudo_exec systemctl daemon-reload
+            info "Systemd: Komari 服务已清理"
+        fi
+    fi
 
-    client_max_body_size 5000M;
+    # OpenRC 环境 (Alpine)
+    if command -v rc-service >/dev/null 2>&1; then
+        if [ -f "/etc/init.d/komari-agent" ]; then
+            sudo_exec rc-service komari-agent stop >/dev/null 2>&1 || true
+            sudo_exec rc-update del komari-agent default >/dev/null 2>&1 || true
+            sudo_exec rm -f /etc/init.d/komari-agent
+            info "OpenRC: Komari 服务已清理"
+        fi
+    fi
 
-    location / {
-        proxy_pass $T_MAIN;
-        proxy_ssl_server_name on;
-        proxy_set_header Host $MAIN_HOST;
-        proxy_pass_request_headers on;
-
-        proxy_set_header X-Real-IP "";
-        proxy_set_header X-Forwarded-For "";
-        proxy_set_header CF-Connecting-IP "";
-        proxy_set_header X-Forwarded-Proto https;
-
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_max_temp_file_size 0;
-
-        proxy_read_timeout 86400;
-        proxy_send_timeout 86400;
-
-        proxy_redirect $T_STREAM/ /s1/;
-        proxy_redirect $T_STREAM /s1/;
-    }
-
-    location /s1/ {
-        rewrite ^/s1(/.*)$ \$1 break;
-        proxy_pass $T_STREAM;
-        proxy_ssl_server_name on;
-        proxy_set_header Host $STREAM_HOST;
-        proxy_pass_request_headers on;
-
-        proxy_set_header X-Real-IP "";
-        proxy_set_header X-Forwarded-For "";
-        proxy_set_header CF-Connecting-IP "";
-        proxy_set_header X-Forwarded-Proto https;
-
-        proxy_http_version 1.1;
-        proxy_set_header Connection "";
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_max_temp_file_size 0;
-
-        proxy_set_header Range \$http_range;
-        proxy_set_header If-Range \$http_if_range;
-
-        proxy_read_timeout 86400;
-        proxy_send_timeout 86400;
-    }
-}
-EOF
-    ln -sf "$CONFIG_PATH" "/etc/nginx/sites-enabled/$DOMAIN"
+    # 清理残留文件
+    info "清理 Komari 文件残留..."
+    sudo_exec rm -rf "$KOMARI_PATH"
+    sudo_exec rm -rf "/var/log/komari"
+    
+    success "Komari-agent 卸载完成"
 }
 
-
-emby_menu() {
-    clear
-    echo -e "${GREEN}===== Emby 反向代理专项配置 =====${RESET}"
-    echo -e "${GREEN}1) 普通反代 ${RESET}"
-    echo -e "${GREEN}2) 主站+推流路径重定向${RESET}"
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
-    echo -ne "${GREEN}请选择 [0-2]: ${RESET}"
-    read emby_choice
-
-    case $emby_choice in
-        1)
-            echo -ne "${GREEN}请输入您的域名: ${RESET}"; read DOMAIN
-            check_domain_resolution "$DOMAIN"
-            echo -ne "${GREEN}请输入 Emby 地址 (例: https://emby.com): ${RESET}"; read TARGET
-            
-            EMAIL=$(generate_random_email)
-            certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-            
-            generate_emby_normal_conf "$DOMAIN" "$TARGET"
-            nginx -t && systemctl reload nginx
-            
-            echo -e "${GREEN}========================================${RESET}"
-            echo -e "${GREEN}✅ 普通模式配置成功!${RESET}"
-            echo -e "${GREEN}🌐 访问地址: https://$DOMAIN${RESET}"
-            echo -e "${GREEN}========================================${RESET}"
-            pause
-            ;;
-        2)
-            echo -ne "${GREEN}请输入您的域名: ${RESET}"; read DOMAIN
-            check_domain_resolution "$DOMAIN"
-            echo -ne "${GREEN}请输入 Emby 主站地址: ${RESET}"; read T_MAIN
-            echo -ne "${GREEN}请输入推流后端地址: ${RESET}"; read T_STREAM
-            
-            EMAIL=$(generate_random_email)
-            certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-            
-            generate_emby_stream_conf "$DOMAIN" "$T_MAIN" "$T_STREAM"
-            nginx -t && systemctl reload nginx
-            
-            echo -e "${GREEN}========================================${RESET}"
-            echo -e "${GREEN}✅ 分流重定向模式配置成功!${RESET}"
-            echo -e "${GREEN}🌐 主站访问地址: https://$DOMAIN${RESET}"
-            echo -e "${GREEN}🚀 推流重定向路径: https://$DOMAIN/s1/${RESET}"
-            echo -e "${YELLOW}提示: 所有发往 $T_STREAM 的请求已自动劫持至 /s1/${RESET}"
-            echo -e "${GREEN}========================================${RESET}"
-            pause
-            ;;
-        0) return ;;
-        *) echo -e "${RED}无效输入!${RESET}"; sleep 1; emby_menu ;;
-    esac
-}
-# ------------------------------
-# 主菜单
-# ------------------------------
-while true; do
-    clear
-    echo -e "${GREEN}===== Nginx 管理脚本 =====${RESET}"
-    echo -e "${GREEN} 1) 安装Nginx证书${RESET}"
-    echo -e "${GREEN} 2) 添加配置${RESET}"
-    echo -e "${GREEN} 3) 修改配置${RESET}"
-    echo -e "${GREEN} 4) 删除配置${RESET}"
-    echo -e "${GREEN} 5) 测试证书续期${RESET}"
-    echo -e "${GREEN} 6) 查看证书信息${RESET}"
-    echo -e "${GREEN} 7) 卸载Nginx证书${RESET}"
-    echo -e "${GREEN} 8) 查看域名证书状态${RESET}"
-    echo -e "${GREEN} 9) Emby反代配置${RESET}"
-    echo -e "${GREEN}10) 重载Nginx配置${RESET}"
-    echo -e "${GREEN} 0) 退出${RESET}"
-    echo -ne "${GREEN} 请选择[0-10]:${RESET}"
-    read choice
-    case $choice in
-        1) install_nginx ;;
-        2) add_config ;;
-        3) modify_config ;;
-        4) delete_config ;;
-        5) test_renew ;;
-        6) check_cert ;;
-        7) uninstall_nginx ;;
-        8) check_domains_status ;;
-        9) emby_menu ;;
-        10) nginx -t && systemctl reload nginx && echo -e "${GREEN}Nginx 配置已重载成功${RESET}" || echo -e "${RED}配置检查失败，请修复后重试${RESET}"; pause ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ; pause ;;
-    esac
-done
+# --- 执行流程 ---
+echo -e "${yellow}--- 自动化清理程序启动 ---${plain}"
+uninstall_nezha
+uninstall_komari
+echo -e "${green}--- 所有组件已检测并尝试清理完毕 ---${plain}"

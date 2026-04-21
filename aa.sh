@@ -1,103 +1,142 @@
 #!/bin/bash
+
 # ========================================
-# 智能时间同步脚本（自动识别容器/物理机）
-# 适配：Debian / Ubuntu / Alpine
+# SSH 端口修改与检测
+# 适配: Ubuntu, Debian, Alpine, RHEL/CentOS
 # ========================================
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-BLUE="\033[36m"
-RESET="\033[0m"
+# 颜色定义
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+RESET='\033[0m'
 
-echo -e "${BLUE}========================================${RESET}"
-echo -e "${GREEN}      ⏰ 智能时间同步配置脚本${RESET}"
-echo -e "${BLUE}========================================${RESET}"
-
-# 1. 权限检查
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}❌ 请使用 root 运行${RESET}"
+# 1. 权限与系统检查
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}错误: 请使用 root 权限运行${RESET}"
     exit 1
 fi
 
-# 2. 系统识别
 if [ -f /etc/alpine-release ]; then
     OS="Alpine"
+elif grep -qi "ubuntu" /etc/os-release; then
+    OS="Ubuntu"
 elif [ -f /etc/debian_version ]; then
-    OS="Debian/Ubuntu"
+    OS="Debian"
 else
-    echo -e "${RED}❌ 暂不支持此系统${RESET}"
+    OS="Linux"
+fi
+
+echo -e "${GREEN}检测到系统: $OS${RESET}"
+
+# 2. 安装必要工具 (nc)
+echo -e "${YELLOW}检查必要工具...${RESET}"
+if ! command -v nc >/dev/null 2>&1; then
+    if [ "$OS" = "Alpine" ]; then
+        apk add --no-cache netcat-openbsd >/dev/null 2>&1
+    else
+        apt-get update -y >/dev/null 2>&1
+        apt-get install -y netcat-openbsd >/dev/null 2>&1
+    fi
+fi
+
+# 3. 获取端口信息
+current_port=$(grep -E '^ *Port [0-9]+' /etc/ssh/sshd_config | awk '{print $2}' | head -n1)
+current_port=${current_port:-22}
+echo -e "${YELLOW}当前 SSH 端口: $current_port${RESET}"
+
+read -p "请输入新的 SSH 端口号: " new_port
+if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -le 0 ] || [ "$new_port" -gt 65535 ]; then
+    echo -e "${RED}错误: 端口无效！${RESET}"
     exit 1
 fi
 
-echo -e "${GREEN}✔ 系统检测通过：$OS${RESET}"
-
-# 3. 检测虚拟化环境 (容器无需同步)
-IS_CONTAINER=false
-if [ "$OS" == "Alpine" ]; then
-    # Alpine 下简单检测方式
-    if [ -f /.dockerenv ] || grep -qi "docker\|lxc" /proc/1/cgroup 2>/dev/null; then
-        IS_CONTAINER=true
-        VIRT_TYPE="Container"
-    fi
+# 4. 备份与修改配置
+cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$(date +%Y%m%d_%H%M%S)"
+if grep -q "^Port " /etc/ssh/sshd_config; then
+    sed -i "s/^Port .*/Port $new_port/" /etc/ssh/sshd_config
 else
-    # Debian/Ubuntu 使用 systemd-detect-virt
-    VIRT_TYPE=$(systemd-detect-virt)
-    if [[ "$VIRT_TYPE" == "lxc" || "$VIRT_TYPE" == "openvz" || "$VIRT_TYPE" == "docker" ]]; then
-        IS_CONTAINER=true
-    fi
+    echo "Port $new_port" >> /etc/ssh/sshd_config
 fi
 
-if [ "$IS_CONTAINER" = true ]; then
-    echo -e "${YELLOW}⚠ 检测到容器环境：$VIRT_TYPE${RESET}"
-    echo -e "${GREEN}✔ 容器时间由宿主机管理，无需配置时间同步${RESET}"
-    date
-    exit 0
+# 5. 放行防火墙
+echo -e "${YELLOW}正在放行防火墙端口 $new_port...${RESET}"
+if command -v ufw >/dev/null 2>&1; then
+    ufw allow "$new_port"/tcp >/dev/null 2>&1 || true
+elif command -v firewall-cmd >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port="$new_port"/tcp >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+elif command -v iptables >/dev/null 2>&1; then
+    iptables -I INPUT -p tcp --dport "$new_port" -j ACCEPT 2>/dev/null || true
 fi
 
-# 4. 执行同步逻辑
-if [ "$OS" == "Alpine" ]; then
-    # ================= Alpine 逻辑 =================
-    echo -e "${YELLOW}🔄 正在配置 Alpine 时间同步 (Chrony)...${RESET}"
-    apk add --no-cache chrony
-    
-    # 强制同步一次
-    rc-update add chronyd default
-    rc-service chronyd stop >/dev/null 2>&1 || true
-    
-    echo -e "${YELLOW}🚀 正在进行首次强制对时...${RESET}"
-    chronyd -q 'server ntp.aliyun.com iburst' || true
-    
-    rc-service chronyd start
-    echo -e "${GREEN}✔ Chrony 服务已启动${RESET}"
-    date
+# 6. 重启服务 (解决 Ubuntu 常见冲突)
+echo -e "${YELLOW}正在重启 SSH 服务...${RESET}"
+# 在 Ubuntu 上，必须先停止可能接管 22 端口的 ssh.socket
+if [[ "$OS" == "Ubuntu" ]] || [[ "$OS" == "Debian" ]]; then
+    systemctl stop ssh.socket >/dev/null 2>&1 || true
+    systemctl disable ssh.socket >/dev/null 2>&1 || true
+fi
 
-else
-    # ================= Debian/Ubuntu 逻辑 =================
-    echo -e "${YELLOW}🔄 检查并关闭冲突的 NTP 服务...${RESET}"
-    systemctl stop ntp chrony 2>/dev/null || true
-    systemctl disable ntp chrony 2>/dev/null || true
-
-    if ! dpkg -s systemd-timesyncd >/dev/null 2>&1; then
-        echo -e "${YELLOW}📦 安装 systemd-timesyncd...${RESET}"
-        apt update -y && apt install -y systemd-timesyncd
+restart_done=false
+for svc in ssh sshd; do
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl restart "$svc" >/dev/null 2>&1 && restart_done=true && break
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service "$svc" restart >/dev/null 2>&1 && restart_done=true && break
     fi
+done
 
-    echo -e "${YELLOW}🚀 启动时间同步服务...${RESET}"
-    systemctl unmask systemd-timesyncd >/dev/null 2>&1 || true
-    timedatectl set-ntp false
-    sleep 1
-    timedatectl set-ntp true
-    systemctl restart systemd-timesyncd
+if [ "$restart_done" = false ]; then
+    echo -e "${RED}❌ SSH 服务重启失败！${RESET}"
+    exit 1
+fi
 
+# 7. 本地监听检测 (增加重试逻辑)
+echo -e "${YELLOW}正在检测本地监听状态...${RESET}"
+SUCCESS=false
+for i in {1..5}; do
     sleep 2
-    if systemctl is-active --quiet systemd-timesyncd; then
-        echo -e "${GREEN}✔ 时间同步已成功启动${RESET}"
+    if command -v ss >/dev/null 2>&1; then
+        CHECK=$(ss -tlnp | grep ":$new_port ")
     else
-        echo -e "${RED}❌ 启动失败，请检查日志${RESET}"
+        CHECK=$(netstat -tlnp | grep ":$new_port ")
     fi
-    echo -e "${BLUE}========== 当前状态 ==========${RESET}"
-    timedatectl status
+    
+    if [ -n "$CHECK" ]; then
+        SUCCESS=true && break
+    fi
+    echo -e "${YELLOW}等待服务绑定端口... ($i/5)${RESET}"
+done
+
+if [ "$SUCCESS" = true ]; then
+    echo -e "${GREEN}✔ 本地端口 $new_port 监听成功${RESET}"
+else
+    echo -e "${RED}❌ 本地检测失败，SSH 可能未能在新端口启动${RESET}"
+    exit 1
 fi
 
-echo -e "${BLUE}==================================${RESET}"
+# 8. 远程连通性检测
+echo -e "${YELLOW}正在执行远程连通性检测...${RESET}"
+# 获取外网 IP (容错处理)
+PUBLIC_IP=$(curl -sL --max-time 8 https://api.ipify.org || curl -sL --max-time 8 https://ifconfig.me || echo "")
+
+if [ -n "$PUBLIC_IP" ]; then
+    echo -e "外网 IP: $PUBLIC_IP"
+    # 使用 nc 检测，支持多系统返回特征
+    if timeout 5 nc -zv "$PUBLIC_IP" "$new_port" 2>&1 | grep -q "succeeded\|open"; then
+        echo -e "${GREEN}✔ 远程检测通过！端口 $new_port 已开放${RESET}"
+    else
+        echo -e "${RED}❌ 远程检测失败！${RESET}"
+        echo -e "${YELLOW}排查建议：${RESET}"
+        echo -e "1. 确认云服务商控制台（安全组）放行了 TCP:$new_port"
+        echo -e "2. 确认系统内防火墙状态：ufw status 或 iptables -L"
+    fi
+else
+    echo -e "${RED}⚠ 无法获取外网 IP，跳过远程检测，请手动测试连接。${RESET}"
+fi
+
+echo -e "\n${GREEN}=============================================${RESET}"
+echo -e "${GREEN}  操作完成！当前 SSH 端口为: $new_port ${RESET}"
+echo -e "${YELLOW}  请务必打开新窗口测试连接，确认成功后再退出！${RESET}"
+echo -e "${GREEN}===============================================${RESET}"

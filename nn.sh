@@ -1,62 +1,68 @@
 #!/bin/bash
 
-# 定义配置文件路径
-CONFIG_FILE="/opt/lxdapi/configs/config.yaml"
+GREEN="\033[32m"
+RED="\033[31m"
+RESET="\033[0m"
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # 无颜色
+LXD_INSTALL="https://raw.githubusercontent.com/xkatld/lxdapi-web-server/refs/heads/main-stable/Shell/lxd_install.sh"
+API_INSTALL="https://raw.githubusercontent.com/xkatld/lxdapi-web-server/refs/heads/main-stable/Shell/lxdapi_install.sh"
+API_UPDATE="https://raw.githubusercontent.com/xkatld/lxdapi-web-server/refs/heads/main-stable/Shell/lxdapi_update.sh"
+STORAGE_POOL="https://raw.githubusercontent.com/xkatld/lxdapi-web-server/refs/heads/main-stable/Shell/storage_pool.sh"
+IMAGE_IMPORT="https://raw.githubusercontent.com/xkatld/lxdapi-web-server/refs/heads/main-stable/Shell/image_import.sh"
+IMAGE_ADD="https://raw.githubusercontent.com/xkatld/zjmf-lxd-server/refs/heads/main/install/lxdimages.sh"
+IMAGE_XX="https://raw.githubusercontent.com/sistarry/toolbox/main/toy/LXDAPIX.sh"
 
-# 获取公网 IP 的函数
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://checkip.amazonaws.com" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "127.0.0.1"
+run() {
+    url=$1
+    name=$2
+    echo -e "${GREEN}正在执行：${name}...${RESET}"
+    bash <(curl -Ls "$url")
+    pause
 }
 
-# 增强型提取函数：专门提取 admin 块下的字段
-get_admin_val() {
-    local key=$1
-    # 查找 admin: 之后的内容，直到找到目标 key
-    sed -n '/admin:/,/plugins:/p' "$CONFIG_FILE" | grep "$key:" | awk -F': ' '{print $2}' | tr -d '"' | tr -d "'" | xargs
+pause() {
+    read -p $'\033[32m按回车返回菜单...\033[0m'
+    menu
 }
 
-# 提取 YAML 字段的辅助函数 (简单正则提取)
-get_yaml_val() {
-    local key=$1
-    # 匹配 key: value 格式，去掉引号和多余空格
-    grep "$key:" "$CONFIG_FILE" | head -n 1 | awk -F': ' '{print $2}' | tr -d '"' | tr -d "'" | xargs
+show_ip() {
+    echo -e "${GREEN}当前公网网卡信息：${RESET}"
+    ip ad
+    pause
 }
 
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo -e "${RED}错误: 配置文件 $CONFIG_FILE 不存在！${NC}"
-    exit 1
-fi
+menu() {
+    clear
+    echo -e "${GREEN}=================================${RESET}"
+    echo -e "${GREEN}        LXDAPI 管理工具         ${RESET}"
+    echo -e "${GREEN}=================================${RESET}"
+    echo -e "${GREEN} 1) 安装 LXD${RESET}"
+    echo -e "${GREEN} 2) 部署 LXDAPI${RESET}"
+    echo -e "${GREEN} 3) 更新 LXDAPI${RESET}"
+    echo -e "${GREEN} 4) 管理存储池${RESET}"
+    echo -e "${GREEN} 5) 管理镜像${RESET}"
+    echo -e "${GREEN} 6) 新增镜像${RESET}"
+    echo -e "${GREEN} 7) 查看公网网卡${RESET}"
+    echo -e "${GREEN} 8) LXDAPI面板信息${RESET}"
+    echo -e "${GREEN} 0) 退出${RESET}"
+    read -p $'\033[32m 请选择: \033[0m' choice
 
-# 开始提取信息
-SERVER_IP=$(get_public_ip)
-PORT=$(get_yaml_val "port")
-API_HASH=$(get_yaml_val "api_hash")
-USER=$(get_admin_val "username")
-PASS=$(get_admin_val "password")
-TLS_ENABLED=$(get_yaml_val "enabled")
+    case $choice in
+        1) run "$LXD_INSTALL" "安装 LXD" ;;
+        2) run "$API_INSTALL" "部署 LXDAPI" ;;
+        3) run "$API_UPDATE" "更新 LXDAPI" ;;
+        4) run "$STORAGE_POOL" "存储池管理" ;;
+        5) run "$IMAGE_IMPORT" "镜像管理" ;;
+        6) run "$IMAGE_ADD" "新增镜像" ;;
+        7) show_ip ;;
+        8) run "$IMAGE_XX" "面板信息" ;;
+        0) exit 0 ;;
+        *)
+            echo -e "${RED}输入错误，请重新选择${RESET}"
+            sleep 1
+            menu
+            ;;
+    esac
+}
 
-# 协议判断
-PROTOCOL="http"
-[[ "$TLS_ENABLED" == "true" ]] && PROTOCOL="https"
-
-echo -e "${YELLOW}================ LXDAPI 管理信息 ==================${NC}"
-echo -e "${GREEN}管理面板地址:${NC} ${PROTOCOL}://${SERVER_IP}:${PORT}/admin/login"
-echo -e "${GREEN}管理员账号:${NC}   ${USER}"
-echo -e "${GREEN}管理员密码:${NC}   ${PASS}"
-echo -e "--------------------------------------------------"
-echo -e "${GREEN}系统 API 密钥:${NC} ${API_HASH}"
-echo -e "${GREEN}数据存储目录:${NC} /opt/lxdapi"
-echo -e "${GREEN}文档财务对接地址:${NC} https://github.com/xkatld/lxdapi-web-server/wiki"
-echo -e "${YELLOW}===================================================${NC}"
+menu

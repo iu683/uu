@@ -72,38 +72,22 @@ if command -v docker >/dev/null 2>&1; then
     echo -e "${Y}🐳 Docker 容器数量: $D_CONT${X}"
 fi
 
-echo -e "${O}🛡 最近登录记录 (TOP 3)${X}"
+echo -e "${O}🛡 最近登录记录${X}"
 
-if [ ! -f /var/log/wtmp ] || [ ! -s /var/log/wtmp ]; then
-    echo -e "  ${Y}系统暂无登录记录${X}"
+# 检查 wtmp 是否存在，不存在则 BusyBox last 会报错
+if [ ! -f /var/log/wtmp ]; then
+    echo "系统暂无登录记录"
 else
-    # 打印中文表头
-    printf "  ${C}%-10s %-16s %s${X}\n" "用户名" "来源IP/终端" "登录时间"
-    
-    # 获取记录并处理
-    # head -n 3 限制显示条数
-    last | grep -vE "reboot|wtmp|begins|^$" | head -n 3 | while read -r line
+    # BusyBox last 不支持参数，我们手动截取前 3 行
+    # 并通过 awk 简单过滤输出
+    last | grep -v "reboot" | grep -v "wtmp" | head -n 3 | while read line
     do
-        [ -z "$line" ] && continue
-
+        # BusyBox 的输出格式：root  pts/0  192.168.1.100  Wed Apr 22 10:00
         USER_NAME=$(echo "$line" | awk '{print $1}')
         IP_ADDR=$(echo "$line" | awk '{print $3}')
+        LOGIN_TIME=$(echo "$line" | awk '{print $4,$5,$6,$7}')
         
-        # 提取时间并尝试汉化月份
-        # 原始格式通常是: Wed Apr 22 10:00
-        MONTH=$(echo "$line" | awk '{print $5}')
-        DAY=$(echo "$line" | awk '{print $6}')
-        TIME=$(echo "$line" | awk '{print $7}')
-        
-        case $MONTH in
-            Jan) MONTH="01月" ;; Feb) MONTH="02月" ;; Mar) MONTH="03月" ;;
-            Apr) MONTH="04月" ;; May) MONTH="05月" ;; Jun) MONTH="06月" ;;
-            Jul) MONTH="07月" ;; Aug) MONTH="08月" ;; Sep) MONTH="09月" ;;
-            Oct) MONTH="10月" ;; Nov) MONTH="11月" ;; Dec) MONTH="12月" ;;
-        esac
-
-        # 格式化输出
-        printf "  %-11s %-16s %s\n" "$USER_NAME" "$IP_ADDR" "${MONTH}${DAY}日 ${TIME}"
+        printf "${Y}%-10s %-15s %s${X}\n" "$USER_NAME" "$IP_ADDR" "$LOGIN_TIME"
     done
 fi
 
@@ -134,12 +118,12 @@ menu(){
     while true; do
         clear
         echo -e "${GREEN}==== MOTD 管理菜单 ====${RESET}"
-        echo -e "1. 安装 MOTD"
-        echo -e "2. 卸载 MOTD"
-        echo -e "3. 恢复默认"
-        echo -e "4. 预览"
-        echo -e "0. 退出"
-        read -p "选择: " CH
+        echo -e "${GREEN}1. 安装 MOTD${RESET}"
+        echo -e "${GREEN}2. 卸载 MOTD${RESET}"
+        echo -e "${GREEN}3. 恢复默认${RESET}"
+        echo -e "${GREEN}4. 预览${RESET}"
+        echo -e "${GREEN}0. 退出${RESET}"
+        read -r -p $'\033[32m请选择: \033[0m' CH
         case $CH in
             1) install_motd ;;
             2) remove_motd ;;

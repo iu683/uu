@@ -1,138 +1,150 @@
-#!/bin/bash
+#!/bin/sh
+# ====================================================
+# Alpine Linux Snell V5 专用管理脚本 (支持自定义配置)
+# ====================================================
+set -e
 
-TARGET="/etc/profile.d/server-motd.sh"
-
-GREEN="\033[1;32m"
-RED="\033[1;31m"
-CYAN="\033[1;36m"
-YELLOW="\033[1;33m"
+# ================== 颜色 ==================
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-install_motd(){
+# ================== 变量 ==================
+SNELL_DIR="/etc/snell"
+SNELL_CONFIG="$SNELL_DIR/snell-server.conf"
+SNELL_INIT="/etc/init.d/snell"
+SNELL_BIN="$SNELL_DIR/snell-server"
 
-# 如果是 Alpine，先准备环境
-if [ -f /etc/alpine-release ]; then
-    echo -e "${YELLOW}检测到 Alpine 系统，正在配置环境...${RESET}"
-    apk add --no-cache util-linux bash coreutils 2>/dev/null
-    touch /var/log/wtmp
-fi
+# ================== 工具函数 ==================
 
-cat << 'EOF' > $TARGET
-#!/bin/bash
+install_glibc() {
+    if [ ! -f "/usr/glibc-compat/lib/ld-linux-x86-64.so.2" ]; then
+        echo -e "${GREEN}[信息] 安装 glibc 兼容层...${RESET}"
+        apk add --no-cache wget ca-certificates
+        wget -q -O /etc/apk/keys/sgerrand.rsa.pub https://alpine-pkgs.sgerrand.com/sgerrand.rsa.pub
+        wget -t 3 -T 10 https://github.com/sgerrand/alpine-pkg-glibc/releases/download/2.35-r1/glibc-2.35-r1.apk
+        apk add --force-overwrite glibc-2.35-r1.apk
+        rm -f glibc-2.35-r1.apk
+    fi
+    mkdir -p /lib64
+    ln -sf /usr/glibc-compat/lib/ld-linux-x86-64.so.2 /lib/ld-linux-x86-64.so.2
+    ln -sf /usr/glibc-compat/lib/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
+}
 
-# 忽略 sudo 切换时的显示
-[ -n "$SUDO_USER" ] && exit
+check_deps() {
+    echo -e "${GREEN}[信息] 检查依赖...${RESET}"
+    apk add --no-cache wget unzip curl gcompat libstdc++ upx
+    [ "$(uname -m)" = "x86_64" ] && install_glibc
+}
 
-G='\033[1;32m'
-B='\033[1;34m'
-C='\033[1;36m'
-Y='\033[1;33m'
-O='\033[38;5;208m'
-R='\033[1;31m'
-X='\033[0m'
+get_public_ip() {
+    curl -4s --max-time 5 https://api.ipify.org || curl -4s --max-time 5 https://ip.sb || echo "YOUR_IP"
+}
 
-USER=$(whoami)
-HOST=$(hostname)
-[ -f /etc/os-release ] && OS=$(grep PRETTY_NAME /etc/os-release | cut -d '"' -f2) || OS="Linux"
+# ================== 安装与自定义配置 ==================
+install_snell() {
+    check_deps
+    mkdir -p $SNELL_DIR
+    cd $SNELL_DIR
 
-DATE=$(date "+%Y-%m-%d %H:%M:%S")
-UPTIME=$(uptime | awk -F', ' '{print $1}' | sed 's/.*up //')
-LOAD=$(uptime | awk -F'load average:' '{print $2}')
+    # 1. 自定义配置交互
+    echo -e "\n${YELLOW}--- 自定义配置 (直接回车使用默认值) ---${RESET}"
+    
+    read -p "请输入监听端口 [默认随机]: " input_port
+    PORT=${input_port:-$(shuf -i 10000-60000 -n 1)}
+    
+    read -p "请输入 PSK 密钥 [默认随机]: " input_psk
+    PSK=${input_psk:-$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16)}
+    
+    read -p "是否开启 IPv6? (true/false) [默认 false]: " input_ipv6
+    IPV6=${input_ipv6:-false}
 
-# 兼容性处理 CPU 使用率 (Alpine/Debian 通用)
-CPU=$(top -bn1 | grep "CPU" | head -n 1 | awk '{print $2 + $4"%"}')
-[ -z "$CPU" ] && CPU=$(top -bn1 | awk '/Cpu/ {print 100 - $8 "%"}')
+    read -p "请输入 DNS [默认 1.1.1.1,8.8.8.8]: " input_dns
+    DNS=${input_dns:-"1.1.1.1,8.8.8.8"}
 
-MEM=$(free -h | awk '/Mem:/ {print $3 "/" $2}')
-SWAP=$(free -h | awk '/Swap:/ {print $3 "/" $2}')
+    # 2. 下载与脱壳
+    ARCH=$(uname -m)
+    [ "$ARCH" = "x86_64" ] && ARCH_LABEL="amd64"
+    [ "$ARCH" = "aarch64" ] && ARCH_LABEL="aarch64"
 
-DISK=$(df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}')
-DISK_P=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
+    echo -e "${GREEN}\n[1/2] 下载并解压 Snell v5.0.1...${RESET}"
+    curl -L --retry 3 -o snell.zip "https://dl.nssurge.com/snell/snell-server-v5.0.1-linux-${ARCH_LABEL}.zip"
+    unzip -o snell.zip && rm -f snell.zip
 
-echo -e "${G}╔════════════════════════════════════════════╗${X}"
-echo -e "${G}           🚀 Server Dashboard                ${X}"
-echo -e "${G}╚════════════════════════════════════════════╝${X}"
-echo -e "${C}----------------------------------------------${X}"
-printf "用户           : %s\n" "$USER"
-printf "主机           : %s\n" "$HOST"
-printf "系统           : %s\n" "$OS"
-echo -e "${C}----------------------------------------------${X}"
-printf "当前时间       : %s\n" "$DATE"
-printf "运行时间       : %s\n" "$UPTIME"
-printf "系统负载       : %s\n" "$LOAD"
-echo -e "${C}----------------------------------------------${X}"
-printf "CPU使用        : %s\n" "$CPU"
-printf "内存使用       : %s\n" "$MEM"
-printf "磁盘使用       : %s\n" "$DISK"
-echo -e "${C}----------------------------------------------${X}"
+    echo -e "${YELLOW}[2/2] 执行 UPX 脱壳处理...${RESET}"
+    chmod +x snell-server
+    upx -d snell-server >/dev/null 2>&1 || true
 
-# Docker 部分
-if command -v docker >/dev/null 2>&1; then
-    D_CONT=$(docker ps -aq | wc -l)
-    echo -e "${Y}🐳 Docker 容器数量: $D_CONT${X}"
-fi
-
-echo -e "${O}🛡 最近登录记录${X}"
-
-# 检查 wtmp 是否存在，不存在则 BusyBox last 会报错
-if [ ! -f /var/log/wtmp ]; then
-    echo "系统暂无登录记录"
-else
-    # BusyBox last 不支持参数，我们手动截取前 3 行
-    # 并通过 awk 简单过滤输出
-    last | grep -v "reboot" | grep -v "wtmp" | head -n 3 | while read line
-    do
-        # BusyBox 的输出格式：root  pts/0  192.168.1.100  Wed Apr 22 10:00
-        USER_NAME=$(echo "$line" | awk '{print $1}')
-        IP_ADDR=$(echo "$line" | awk '{print $3}')
-        LOGIN_TIME=$(echo "$line" | awk '{print $4,$5,$6,$7}')
-        
-        printf "${Y}%-10s %-15s %s${X}\n" "$USER_NAME" "$IP_ADDR" "$LOGIN_TIME"
-    done
-fi
-
-[ "$DISK_P" -ge 80 ] && echo -e "${R}⚠ 磁盘空间不足: ${DISK_P}%${X}"
-echo
+    # 3. 写入配置
+    cat > $SNELL_CONFIG <<EOF
+[snell-server]
+listen = 0.0.0.0:$PORT
+psk = $PSK
+ipv6 = $IPV6
+tfo = true
+dns = $DNS
 EOF
 
-chmod +x $TARGET
-echo -e "${GREEN}MOTD 安装完成!${RESET}"
+    # 4. 创建服务
+    cat > $SNELL_INIT <<EOF
+#!/sbin/openrc-run
+name="snell-server"
+command="$SNELL_BIN"
+command_args="-c $SNELL_CONFIG"
+command_background="yes"
+pidfile="/run/snell.pid"
+command_user="root"
+depend() {
+    need net
+    after firewall
+}
+EOF
+    chmod +x $SNELL_INIT
+    rc-update add snell default
+    rc-service snell restart
+
+    # 5. 完成输出
+    IP=$(get_public_ip)
+    echo -e "\n${GREEN}====================================${RESET}"
+    echo -e "${GREEN}安装完成！${RESET}"
+    echo -e "${YELLOW}端口: $PORT${RESET}"
+    echo -e "${YELLOW}PSK:  $PSK${RESET}"
+    echo -e "${YELLOW}Surge 配置行:${RESET}"
+    echo -e "$(hostname) = snell, $IP, $PORT, psk=$PSK, version=5, tfo=true"
+    echo -e "${GREEN}====================================${RESET}"
+    
+    sleep 2
+    pgrep snell-server >/dev/null && echo -e "${GREEN}服务状态: 正在运行${RESET}" || echo -e "${RED}服务状态: 启动失败${RESET}"
 }
 
-remove_motd(){
-    rm -f $TARGET
-    echo -e "${RED}MOTD 已卸载${RESET}"
+# ================== 菜单系统 ==================
+show_menu() {
+    clear
+    echo -e "${GREEN}====== Snell Alpine 管理 (支持自定义) ======${RESET}"
+    echo "1. 安装 / 重装 (会提示自定义配置)"
+    echo "2. 启动服务"
+    echo "3. 停止服务"
+    echo "4. 查看当前配置"
+    echo "5. 卸载"
+    echo "0. 退出"
 }
 
-restore_default(){
-    rm -f $TARGET
-    [ -f /etc/motd ] && true > /etc/motd
-    echo -e "${CYAN}系统 MOTD 已恢复默认${RESET}"
-}
-
-preview(){
-    bash $TARGET
-}
-
-menu(){
-    while true; do
-        clear
-        echo -e "${GREEN}==== MOTD 管理菜单 ====${RESET}"
-        echo -e "${GREEN}1. 安装 MOTD${RESET}"
-        echo -e "${GREEN}2. 卸载 MOTD${RESET}"
-        echo -e "${GREEN}3. 恢复默认${RESET}"
-        echo -e "${GREEN}4. 预览${RESET}"
-        echo -e "${GREEN}0. 退出${RESET}"
-        read -r -p $'\033[32m请选择: \033[0m' CH
-        case $CH in
-            1) install_motd ;;
-            2) remove_motd ;;
-            3) restore_default ;;
-            4) preview ;;
-            0) exit ;;
-        esac
-        read -p "按回车继续..." temp
-    done
-}
-
-menu
+while true; do
+    show_menu
+    read -p "选项: " choice
+    case $choice in
+        1) install_snell; read -p "按回车继续...";;
+        2) rc-service snell start; read -p "按回车继续...";;
+        3) rc-service snell stop; read -p "按回车继续...";;
+        4) 
+           [ -f "$SNELL_CONFIG" ] && { echo -e "${YELLOW}--- 当前配置 ---${RESET}"; cat "$SNELL_CONFIG"; } || echo "配置文件不存在"
+           read -p "按回车继续...";;
+        5) 
+           rc-service snell stop || true
+           rc-update del snell || true
+           rm -rf $SNELL_DIR $SNELL_INIT
+           echo "已卸载"; read -p "按回车继续...";;
+        0) exit 0 ;;
+    esac
+done

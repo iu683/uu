@@ -1,150 +1,103 @@
-#!/bin/sh
-# ====================================================
-# Alpine Linux Snell V5 专用管理脚本 (支持自定义配置)
-# ====================================================
+#!/bin/bash
 set -e
 
-# ================== 颜色 ==================
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-# ================== 变量 ==================
-SNELL_DIR="/etc/snell"
-SNELL_CONFIG="$SNELL_DIR/snell-server.conf"
-SNELL_INIT="/etc/init.d/snell"
-SNELL_BIN="$SNELL_DIR/snell-server"
+# 权限检查
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}请使用 root 权限运行此脚本${RESET}"
+    exit 1
+fi
 
-# ================== 工具函数 ==================
+# 自动识别发行版
+if [ -f /etc/alpine-release ]; then
+    OS="Alpine"
+elif grep -qi "ubuntu" /etc/os-release; then
+    OS="Ubuntu"
+elif [ -f /etc/debian_version ]; then
+    OS="Debian"
+else
+    OS="Linux"
+fi
 
-install_glibc() {
-    if [ ! -f "/usr/glibc-compat/lib/ld-linux-x86-64.so.2" ]; then
-        echo -e "${GREEN}[信息] 安装 glibc 兼容层...${RESET}"
-        apk add --no-cache wget ca-certificates
-        wget -q -O /etc/apk/keys/sgerrand.rsa.pub https://alpine-pkgs.sgerrand.com/sgerrand.rsa.pub
-        wget -t 3 -T 10 https://github.com/sgerrand/alpine-pkg-glibc/releases/download/2.35-r1/glibc-2.35-r1.apk
-        apk add --force-overwrite glibc-2.35-r1.apk
-        rm -f glibc-2.35-r1.apk
+echo -e "${GREEN}=== 字体与语言环境工具 ($OS) ===${RESET}"
+echo -e "${GREEN}1) 切换到中文字体${RESET}"
+echo -e "${GREEN}2) 切换到英文字体${RESET}"
+echo -e "${GREEN}0) 退出${RESET}"
+read -rp "$(echo -e ${GREEN}请选择操作: ${RESET})" choice
+
+apply_locale() {
+    local target_lang=$1
+    
+    if [[ "$OS" == "Ubuntu" || "$OS" == "Debian" ]]; then
+        echo -e "${YELLOW}正在更新 apt 并安装字体包...${RESET}"
+        apt-get update -y
+        if [[ "$target_lang" == "zh_CN.UTF-8" ]]; then
+            apt-get install -y locales fonts-wqy-microhei fonts-wqy-zenhei
+        else
+            apt-get install -y locales fonts-dejavu fonts-liberation
+        fi
+
+        # 配置 Locale
+        echo -e "${YELLOW}正在生成语言环境: $target_lang...${RESET}"
+        sed -i "s/^#\?\s*\($target_lang UTF-8\)/\1/" /etc/locale.gen || echo "$target_lang UTF-8" >> /etc/locale.gen
+        locale-gen "$target_lang"
+        
+        # 强制写入配置
+        update-locale LANG="$target_lang" LC_ALL="$target_lang"
+        echo "LANG=$target_lang" > /etc/default/locale
+        echo "LC_ALL=$target_lang" >> /etc/default/locale
+        
+    elif [[ "$OS" == "Alpine" ]]; then
+        echo -e "${YELLOW}正在配置 Alpine 语言环境...${RESET}"
+        
+        # 1. 安装 musl-locales (核心步骤)
+        # musl-locales 提供了对 zh_CN 等环境的支持
+        apk add --no-cache musl-locales musl-locales-lang
+
+        # 2. 安装字体
+        if [[ "$target_lang" == "zh_CN.UTF-8" ]]; then
+            # font-wqy-zenhei 位于 testing 仓库
+            apk add --no-cache ttf-dejavu font-wqy-zenhei --repository http://dl-cdn.alpinelinux.org/alpine/edge/testing
+        else
+            apk add --no-cache ttf-dejavu
+        fi
+        
+        # 3. 强制持久化环境变量
+        # 对于 Alpine，写入 /etc/profile 是最保险的
+        sed -i '/export LANG=/d' /etc/profile
+        sed -i '/export LC_ALL=/d' /etc/profile
+        echo "export LANG=$target_lang" >> /etc/profile
+        echo "export LC_ALL=$target_lang" >> /etc/profile
+        
+        # 针对当前连接立即生效
+        source /etc/profile
     fi
-    mkdir -p /lib64
-    ln -sf /usr/glibc-compat/lib/ld-linux-x86-64.so.2 /lib/ld-linux-x86-64.so.2
-    ln -sf /usr/glibc-compat/lib/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
+
+    # 立即对当前 Shell 生效
+    export LANG="$target_lang"
+    export LC_ALL="$target_lang"
 }
 
-check_deps() {
-    echo -e "${GREEN}[信息] 检查依赖...${RESET}"
-    apk add --no-cache wget unzip curl gcompat libstdc++ upx
-    [ "$(uname -m)" = "x86_64" ] && install_glibc
-}
-
-get_public_ip() {
-    curl -4s --max-time 5 https://api.ipify.org || curl -4s --max-time 5 https://ip.sb || echo "YOUR_IP"
-}
-
-# ================== 安装与自定义配置 ==================
-install_snell() {
-    check_deps
-    mkdir -p $SNELL_DIR
-    cd $SNELL_DIR
-
-    # 1. 自定义配置交互
-    echo -e "\n${YELLOW}--- 自定义配置 (直接回车使用默认值) ---${RESET}"
-    
-    read -p "请输入监听端口 [默认随机]: " input_port
-    PORT=${input_port:-$(shuf -i 10000-60000 -n 1)}
-    
-    read -p "请输入 PSK 密钥 [默认随机]: " input_psk
-    PSK=${input_psk:-$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16)}
-    
-    read -p "是否开启 IPv6? (true/false) [默认 false]: " input_ipv6
-    IPV6=${input_ipv6:-false}
-
-    read -p "请输入 DNS [默认 1.1.1.1,8.8.8.8]: " input_dns
-    DNS=${input_dns:-"1.1.1.1,8.8.8.8"}
-
-    # 2. 下载与脱壳
-    ARCH=$(uname -m)
-    [ "$ARCH" = "x86_64" ] && ARCH_LABEL="amd64"
-    [ "$ARCH" = "aarch64" ] && ARCH_LABEL="aarch64"
-
-    echo -e "${GREEN}\n[1/2] 下载并解压 Snell v5.0.1...${RESET}"
-    curl -L --retry 3 -o snell.zip "https://dl.nssurge.com/snell/snell-server-v5.0.1-linux-${ARCH_LABEL}.zip"
-    unzip -o snell.zip && rm -f snell.zip
-
-    echo -e "${YELLOW}[2/2] 执行 UPX 脱壳处理...${RESET}"
-    chmod +x snell-server
-    upx -d snell-server >/dev/null 2>&1 || true
-
-    # 3. 写入配置
-    cat > $SNELL_CONFIG <<EOF
-[snell-server]
-listen = 0.0.0.0:$PORT
-psk = $PSK
-ipv6 = $IPV6
-tfo = true
-dns = $DNS
-EOF
-
-    # 4. 创建服务
-    cat > $SNELL_INIT <<EOF
-#!/sbin/openrc-run
-name="snell-server"
-command="$SNELL_BIN"
-command_args="-c $SNELL_CONFIG"
-command_background="yes"
-pidfile="/run/snell.pid"
-command_user="root"
-depend() {
-    need net
-    after firewall
-}
-EOF
-    chmod +x $SNELL_INIT
-    rc-update add snell default
-    rc-service snell restart
-
-    # 5. 完成输出
-    IP=$(get_public_ip)
-    echo -e "\n${GREEN}====================================${RESET}"
-    echo -e "${GREEN}安装完成！${RESET}"
-    echo -e "${YELLOW}端口: $PORT${RESET}"
-    echo -e "${YELLOW}PSK:  $PSK${RESET}"
-    echo -e "${YELLOW}Surge 配置行:${RESET}"
-    echo -e "$(hostname) = snell, $IP, $PORT, psk=$PSK, version=5, tfo=true"
-    echo -e "${GREEN}====================================${RESET}"
-    
-    sleep 2
-    pgrep snell-server >/dev/null && echo -e "${GREEN}服务状态: 正在运行${RESET}" || echo -e "${RED}服务状态: 启动失败${RESET}"
-}
-
-# ================== 菜单系统 ==================
-show_menu() {
-    clear
-    echo -e "${GREEN}====== Snell Alpine 管理 (支持自定义) ======${RESET}"
-    echo "1. 安装 / 重装 (会提示自定义配置)"
-    echo "2. 启动服务"
-    echo "3. 停止服务"
-    echo "4. 查看当前配置"
-    echo "5. 卸载"
-    echo "0. 退出"
-}
-
-while true; do
-    show_menu
-    read -p "选项: " choice
-    case $choice in
-        1) install_snell; read -p "按回车继续...";;
-        2) rc-service snell start; read -p "按回车继续...";;
-        3) rc-service snell stop; read -p "按回车继续...";;
-        4) 
-           [ -f "$SNELL_CONFIG" ] && { echo -e "${YELLOW}--- 当前配置 ---${RESET}"; cat "$SNELL_CONFIG"; } || echo "配置文件不存在"
-           read -p "按回车继续...";;
-        5) 
-           rc-service snell stop || true
-           rc-update del snell || true
-           rm -rf $SNELL_DIR $SNELL_INIT
-           echo "已卸载"; read -p "按回车继续...";;
-        0) exit 0 ;;
-    esac
-done
+case "$choice" in
+    1)
+        apply_locale "zh_CN.UTF-8"
+        echo -e "${GREEN}✅ 中文环境配置完成。${RESET}"
+        echo -e "${YELLOW}提示：如果控制台未立即变中文，请重新连接 SSH 终端。${RESET}"
+        ;;
+    2)
+        apply_locale "en_US.UTF-8"
+        echo -e "${GREEN}✅ 英文环境配置完成。${RESET}"
+        echo -e "${YELLOW}提示：如果控制台未立即变中文，请重新连接 SSH 终端。${RESET}"
+        ;;
+    0)
+        exit 0
+        ;;
+    *)
+        echo -e "${RED}无效选择${RESET}"
+        exit 1
+        ;;
+esac

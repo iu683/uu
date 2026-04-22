@@ -1,127 +1,132 @@
 #!/bin/bash
+# ========================================
+# netcup-monitor 一键管理脚本
+# ========================================
 
-TARGET="/etc/profile.d/server-motd.sh"
-
-GREEN="\033[1;32m"
-RED="\033[1;31m"
-CYAN="\033[1;36m"
-YELLOW="\033[1;33m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-install_motd(){
+APP_NAME="netcup-monitor"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-# 如果是 Alpine，先准备环境
-if [ -f /etc/alpine-release ]; then
-    echo -e "${YELLOW}检测到 Alpine 系统，正在配置环境...${RESET}"
-    apk add --no-cache util-linux bash coreutils 2>/dev/null
-    touch /var/log/wtmp
-fi
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
 
-cat << 'EOF' > $TARGET
-#!/bin/bash
-
-# 忽略 sudo 切换时的显示
-[ -n "$SUDO_USER" ] && exit
-
-G='\033[1;32m'
-B='\033[1;34m'
-C='\033[1;36m'
-Y='\033[1;33m'
-O='\033[38;5;208m'
-R='\033[1;31m'
-X='\033[0m'
-
-USER=$(whoami)
-HOST=$(hostname)
-[ -f /etc/os-release ] && OS=$(grep PRETTY_NAME /etc/os-release | cut -d '"' -f2) || OS="Linux"
-
-DATE=$(date "+%Y-%m-%d %H:%M:%S")
-UPTIME=$(uptime | awk -F', ' '{print $1}' | sed 's/.*up //')
-LOAD=$(uptime | awk -F'load average:' '{print $2}')
-
-# 兼容性处理 CPU 使用率 (Alpine/Debian 通用)
-CPU=$(top -bn1 | grep "CPU" | head -n 1 | awk '{print $2 + $4"%"}')
-[ -z "$CPU" ] && CPU=$(top -bn1 | awk '/Cpu/ {print 100 - $8 "%"}')
-
-MEM=$(free -h | awk '/Mem:/ {print $3 "/" $2}')
-SWAP=$(free -h | awk '/Swap:/ {print $3 "/" $2}')
-
-DISK=$(df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}')
-DISK_P=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
-
-echo -e "${G}╔════════════════════════════════════════════╗${X}"
-echo -e "${G}           🚀 Server Dashboard                ${X}"
-echo -e "${G}╚════════════════════════════════════════════╝${X}"
-echo -e "${C}----------------------------------------------${X}"
-printf "用户           : %s\n" "$USER"
-printf "主机           : %s\n" "$HOST"
-printf "系统           : %s\n" "$OS"
-echo -e "${C}----------------------------------------------${X}"
-printf "当前时间       : %s\n" "$DATE"
-printf "运行时间       : %s\n" "$UPTIME"
-printf "系统负载       : %s\n" "$LOAD"
-echo -e "${C}----------------------------------------------${X}"
-printf "CPU使用        : %s\n" "$CPU"
-printf "内存使用       : %s\n" "$MEM"
-printf "磁盘使用       : %s\n" "$DISK"
-echo -e "${C}----------------------------------------------${X}"
-
-# Docker 部分
-if command -v docker >/dev/null 2>&1; then
-    D_CONT=$(docker ps -aq | wc -l)
-    echo -e "${Y}🐳 Docker 容器数量: $D_CONT${X}"
-fi
-
-# 登录记录逻辑 (针对 Alpine 优化)
-echo -e "${O}🛡 最近登录记录${X}"
-if command -v last >/dev/null 2>&1; then
-    last -i -n 3 | grep -E 'root|pts|tty' | grep -v "reboot" | head -n 3
-else
-    echo "未发现 last 命令，无法显示登录记录"
-fi
-
-[ "$DISK_P" -ge 80 ] && echo -e "${R}⚠ 磁盘空间不足: ${DISK_P}%${X}"
-echo
-EOF
-
-chmod +x $TARGET
-echo -e "${GREEN}MOTD 安装完成!${RESET}"
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2${RESET}"
+        exit 1
+    fi
 }
 
-remove_motd(){
-    rm -f $TARGET
-    echo -e "${RED}MOTD 已卸载${RESET}"
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用！${RESET}"
+        return 1
+    fi
 }
 
-restore_default(){
-    rm -f $TARGET
-    [ -f /etc/motd ] && true > /etc/motd
-    echo -e "${CYAN}系统 MOTD 已恢复默认${RESET}"
-}
-
-preview(){
-    bash $TARGET
-}
-
-menu(){
+menu() {
     while true; do
         clear
-        echo -e "${GREEN}==== MOTD 管理菜单 ====${RESET}"
-        echo -e "1. 安装 MOTD"
-        echo -e "2. 卸载 MOTD"
-        echo -e "3. 恢复默认"
-        echo -e "4. 预览"
-        echo -e "0. 退出"
-        read -p "选择: " CH
-        case $CH in
-            1) install_motd ;;
-            2) remove_motd ;;
-            3) restore_default ;;
-            4) preview ;;
-            0) exit ;;
+        echo -e "${GREEN}=== netcup-monitor 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
         esac
-        read -p "按回车继续..." temp
     done
+}
+
+install_app() {
+
+    check_docker
+    mkdir -p "$APP_DIR/data"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
+
+    read -p "请输入访问端口 [默认:5000]: " input_port
+    PORT=${input_port:-5000}
+    check_port "$PORT" || return
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  netcup-monitor:
+    image: ghcr.io/agonie0v0/netcup-monitor:latest
+    container_name: netcup-monitor
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORT}:5000"
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/app/data
+      - /etc/localtime:/etc/localtime:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+EOF
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    echo
+    echo -e "${GREEN}✅ 启动成功${RESET}"
+    echo -e "${YELLOW}🌐 访问: http://127.0.0.1:${PORT}${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+    docker restart netcup-monitor
+    echo -e "${GREEN}✅ 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    docker logs -f netcup-monitor
+}
+
+check_status() {
+    docker ps | grep netcup
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ 已卸载${RESET}"
+    read -p "按回车返回菜单..."
 }
 
 menu

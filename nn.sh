@@ -1,138 +1,62 @@
 #!/bin/bash
 
-TARGET="/etc/profile.d/server-motd.sh"
+# 定义配置文件路径
+CONFIG_FILE="/opt/lxdapi/configs/config.yaml"
 
-GREEN="\033[1;32m"
-RED="\033[1;31m"
-CYAN="\033[1;36m"
-YELLOW="\033[1;33m"
-RESET="\033[0m"
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # 无颜色
 
-install_motd(){
-
-# 如果是 Alpine，先准备环境
-if [ -f /etc/alpine-release ]; then
-    echo -e "${YELLOW}检测到 Alpine 系统，正在配置环境...${RESET}"
-    apk add --no-cache util-linux bash coreutils 2>/dev/null
-    touch /var/log/wtmp
-fi
-
-cat << 'EOF' > $TARGET
-#!/bin/bash
-
-# 忽略 sudo 切换时的显示
-[ -n "$SUDO_USER" ] && exit
-
-G='\033[1;32m'
-B='\033[1;34m'
-C='\033[1;36m'
-Y='\033[1;33m'
-O='\033[38;5;208m'
-R='\033[1;31m'
-X='\033[0m'
-
-USER=$(whoami)
-HOST=$(hostname)
-[ -f /etc/os-release ] && OS=$(grep PRETTY_NAME /etc/os-release | cut -d '"' -f2) || OS="Linux"
-
-DATE=$(date "+%Y-%m-%d %H:%M:%S")
-UPTIME=$(uptime | awk -F', ' '{print $1}' | sed 's/.*up //')
-LOAD=$(uptime | awk -F'load average:' '{print $2}')
-
-# 兼容性处理 CPU 使用率 (Alpine/Debian 通用)
-CPU=$(top -bn1 | grep "CPU" | head -n 1 | awk '{print $2 + $4"%"}')
-[ -z "$CPU" ] && CPU=$(top -bn1 | awk '/Cpu/ {print 100 - $8 "%"}')
-
-MEM=$(free -h | awk '/Mem:/ {print $3 "/" $2}')
-SWAP=$(free -h | awk '/Swap:/ {print $3 "/" $2}')
-
-DISK=$(df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}')
-DISK_P=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
-
-echo -e "${G}╔════════════════════════════════════════════╗${X}"
-echo -e "${G}           🚀 Server Dashboard                ${X}"
-echo -e "${G}╚════════════════════════════════════════════╝${X}"
-echo -e "${C}----------------------------------------------${X}"
-printf "用户           : %s\n" "$USER"
-printf "主机           : %s\n" "$HOST"
-printf "系统           : %s\n" "$OS"
-echo -e "${C}----------------------------------------------${X}"
-printf "当前时间       : %s\n" "$DATE"
-printf "运行时间       : %s\n" "$UPTIME"
-printf "系统负载       : %s\n" "$LOAD"
-echo -e "${C}----------------------------------------------${X}"
-printf "CPU使用        : %s\n" "$CPU"
-printf "内存使用       : %s\n" "$MEM"
-printf "磁盘使用       : %s\n" "$DISK"
-echo -e "${C}----------------------------------------------${X}"
-
-# Docker 部分
-if command -v docker >/dev/null 2>&1; then
-    D_CONT=$(docker ps -aq | wc -l)
-    echo -e "${Y}🐳 Docker 容器数量: $D_CONT${X}"
-fi
-
-echo -e "${O}🛡 最近登录记录${X}"
-
-# 检查 wtmp 是否存在，不存在则 BusyBox last 会报错
-if [ ! -f /var/log/wtmp ]; then
-    echo "系统暂无登录记录"
-else
-    # BusyBox last 不支持参数，我们手动截取前 3 行
-    # 并通过 awk 简单过滤输出
-    last | grep -v "reboot" | grep -v "wtmp" | head -n 3 | while read line
-    do
-        # BusyBox 的输出格式：root  pts/0  192.168.1.100  Wed Apr 22 10:00
-        USER_NAME=$(echo "$line" | awk '{print $1}')
-        IP_ADDR=$(echo "$line" | awk '{print $3}')
-        LOGIN_TIME=$(echo "$line" | awk '{print $4,$5,$6,$7}')
-        
-        printf "${Y}%-10s %-15s %s${X}\n" "$USER_NAME" "$IP_ADDR" "$LOGIN_TIME"
+# 获取公网 IP 的函数
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://checkip.amazonaws.com" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
     done
+    echo "127.0.0.1"
+}
+
+# 增强型提取函数：专门提取 admin 块下的字段
+get_admin_val() {
+    local key=$1
+    # 查找 admin: 之后的内容，直到找到目标 key
+    sed -n '/admin:/,/plugins:/p' "$CONFIG_FILE" | grep "$key:" | awk -F': ' '{print $2}' | tr -d '"' | tr -d "'" | xargs
+}
+
+# 提取 YAML 字段的辅助函数 (简单正则提取)
+get_yaml_val() {
+    local key=$1
+    # 匹配 key: value 格式，去掉引号和多余空格
+    grep "$key:" "$CONFIG_FILE" | head -n 1 | awk -F': ' '{print $2}' | tr -d '"' | tr -d "'" | xargs
+}
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo -e "${RED}错误: 配置文件 $CONFIG_FILE 不存在！${NC}"
+    exit 1
 fi
 
-[ "$DISK_P" -ge 80 ] && echo -e "${R}⚠ 磁盘空间不足: ${DISK_P}%${X}"
-echo
-EOF
+# 开始提取信息
+SERVER_IP=$(get_public_ip)
+PORT=$(get_yaml_val "port")
+API_HASH=$(get_yaml_val "api_hash")
+USER=$(get_admin_val "username")
+PASS=$(get_admin_val "password")
+TLS_ENABLED=$(get_yaml_val "enabled")
 
-chmod +x $TARGET
-echo -e "${GREEN}MOTD 安装完成!${RESET}"
-}
+# 协议判断
+PROTOCOL="http"
+[[ "$TLS_ENABLED" == "true" ]] && PROTOCOL="https"
 
-remove_motd(){
-    rm -f $TARGET
-    echo -e "${RED}MOTD 已卸载${RESET}"
-}
-
-restore_default(){
-    rm -f $TARGET
-    [ -f /etc/motd ] && true > /etc/motd
-    echo -e "${CYAN}系统 MOTD 已恢复默认${RESET}"
-}
-
-preview(){
-    bash $TARGET
-}
-
-menu(){
-    while true; do
-        clear
-        echo -e "${GREEN}==== MOTD 管理菜单 ====${RESET}"
-        echo -e "1. 安装 MOTD"
-        echo -e "2. 卸载 MOTD"
-        echo -e "3. 恢复默认"
-        echo -e "4. 预览"
-        echo -e "0. 退出"
-        read -p "选择: " CH
-        case $CH in
-            1) install_motd ;;
-            2) remove_motd ;;
-            3) restore_default ;;
-            4) preview ;;
-            0) exit ;;
-        esac
-        read -p "按回车继续..." temp
-    done
-}
-
-menu
+echo -e "${YELLOW}================ LXDAPI 管理信息 ==================${NC}"
+echo -e "${GREEN}管理面板地址:${NC} ${PROTOCOL}://${SERVER_IP}:${PORT}/admin/login"
+echo -e "${GREEN}管理员账号:${NC}   ${USER}"
+echo -e "${GREEN}管理员密码:${NC}   ${PASS}"
+echo -e "--------------------------------------------------"
+echo -e "${GREEN}系统 API 密钥:${NC} ${API_HASH}"
+echo -e "${GREEN}数据存储目录:${NC} /opt/lxdapi"
+echo -e "${GREEN}文档财务对接地址:${NC} https://github.com/xkatld/lxdapi-web-server/wiki"
+echo -e "${YELLOW}===================================================${NC}"

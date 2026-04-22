@@ -1,224 +1,176 @@
 #!/bin/bash
 
-GREEN="\033[32m"
-RED="\033[31m"
-RESET="\033[0m"
-YELLOW="\033[33m"
+# ====================================================
+# 配置信息
+# ====================================================
+TARGET="/etc/profile.d/server-motd.sh"
 
-# 识别系统和初始化管理器
-if [ -f /etc/alpine-release ]; then
-    OS="alpine"
-    INIT="openrc"
-elif [ -f /etc/debian_version ]; then
-    OS="debian"
-    INIT="systemd"
-elif [ -f /etc/redhat-release ]; then
-    OS="rhel"
-    INIT="systemd"
+GREEN="\033[1;32m"
+RED="\033[1;31m"
+CYAN="\033[1;36m"
+YELLOW="\033[1;33m"
+RESET="\033[0m"
+
+# ====================================================
+# 安装函数
+# ====================================================
+install_motd(){
+    echo -e "${CYAN}正在检查系统环境...${RESET}"
+
+    # 1. 自动适配包管理器并安装必要依赖
+    if [ -f /etc/alpine-release ]; then
+        echo -e "${YELLOW}检测到 Alpine Linux, 正在配置依赖...${RESET}"
+        apk add --no-cache util-linux bash coreutils 2>/dev/null
+        [ ! -f /var/log/wtmp ] && touch /var/log/wtmp
+    elif command -v apt >/dev/null 2>&1; then
+        echo -e "${YELLOW}检测到 Debian/Ubuntu, 正在检查依赖...${RESET}"
+        if ! command -v last >/dev/null 2>&1; then
+            apt update && apt install -y util-linux
+        fi
+        [ ! -f /var/log/wtmp ] && touch /var/log/wtmp && chown root:utmp /var/log/wtmp && chmod 664 /var/log/wtmp
+    fi
+
+    # 2. 写入 MOTD 脚本
+    cat << 'EOF' > $TARGET
+#!/bin/bash
+
+# 忽略 sudo 切换时的显示
+[ -n "$SUDO_USER" ] && exit
+
+G='\033[1;32m'
+B='\033[1;34m'
+C='\033[1;36m'
+Y='\033[1;33m'
+O='\033[38;5;208m'
+R='\033[1;31m'
+X='\033[0m'
+
+# 获取基础信息
+USER=$(whoami)
+HOST=$(hostname)
+[ -f /etc/os-release ] && OS=$(grep PRETTY_NAME /etc/os-release | cut -d '"' -f2) || OS="Linux"
+DATE=$(date "+%Y年%m月%d日 %H:%M:%S")
+
+# 兼容性处理 Uptime (适配 BusyBox 和 GNU)
+UPTIME_RAW=$(uptime)
+if [[ "$UPTIME_RAW" == *"up"* ]]; then
+    UPTIME=$(echo "$UPTIME_RAW" | sed 's/.*up \([^,]*\),.*/\1/' | sed 's/days/天/g' | sed 's/day/天/g' | sed 's/min/分钟/g')
 else
-    OS="unknown"
-    INIT="unknown"
+    UPTIME="未知"
 fi
 
-# 通用服务管理函数
-manage_service() {
-    local action=$1 # start, stop, restart, enable
-    local service="fail2ban"
+LOAD=$(uptime | awk -F'load average:' '{print $2}')
 
-    # 关键修复：确保运行时目录存在，解决 Socket 报错
-    mkdir -p /var/run/fail2ban
+# 兼容性处理 CPU 使用率 (适配 Alpine/Debian)
+CPU_IDLE=$(top -bn1 | grep -i "cpu" | head -n 1 | awk -F'id,' '{print $1}' | awk '{print $NF}' | tr -d '%')
+if [ -z "$CPU_IDLE" ]; then
+    CPU_USAGE=$(top -bn1 | awk '/Cpu/ {print 100 - $8 "%"}')
+else
+    CPU_USAGE=$(echo "100 - $CPU_IDLE" | bc 2>/dev/null || awk "BEGIN {print 100 - $CPU_IDLE}")"%"
+fi
 
-    if [ "$INIT" == "systemd" ]; then
-        case $action in
-            enable) systemctl enable --now $service ;;
-            *) systemctl $action $service ;;
-        esac
-    elif [ "$INIT" == "openrc" ]; then
-        case $action in
-            enable) rc-update add $service default && rc-service $service start ;;
-            start) rc-service $service start ;;
-            stop) rc-service $service stop ;;
-            restart) rc-service $service restart ;;
-        esac
-    fi
-}
+# 内存与磁盘
+MEM=$(free -h | awk '/Mem:/ {print $3 "/" $2}')
+DISK=$(df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}')
+DISK_P=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
 
-# 检查 Fail2Ban 是否运行
-check_fail2ban() {
-    local running=false
-    if [ "$INIT" == "systemd" ]; then
-        systemctl is-active --quiet fail2ban && running=true
-    elif [ "$INIT" == "openrc" ]; then
-        rc-service fail2ban status | grep -q "started" && running=true
-    fi
+echo
+echo -e "${G}╔════════════════════════════════════════════╗${X}"
+echo -e "${G}           🚀 Server Dashboard                ${X}"
+echo -e "${G}╚════════════════════════════════════════════╝${X}"
+echo -e "${C}----------------------------------------------${X}"
+printf "用户           : %s\n" "$USER"
+printf "主机           : %s\n" "$HOST"
+printf "系统           : %s\n" "$OS"
+echo -e "${C}----------------------------------------------${X}"
+printf "当前时间       : %s\n" "$DATE"
+printf "运行时间       : %s\n" "$UPTIME"
+printf "系统负载       : %s\n" "$LOAD"
+echo -e "${C}----------------------------------------------${X}"
+printf "CPU使用        : %s\n" "$CPU_USAGE"
+printf "内存使用       : %s\n" "$MEM"
+printf "磁盘使用       : %s\n" "$DISK"
+echo -e "${C}----------------------------------------------${X}"
 
-    if [ "$running" == false ]; then
-        echo -e "${YELLOW}Fail2Ban 未运行，正在尝试启动...${RESET}"
-        manage_service start || echo -e "${RED}启动失败，请检查是否已安装${RESET}"
-        sleep 2
-        # 再次确认 Socket 是否生成
-        if [ ! -S /var/run/fail2ban/fail2ban.sock ]; then
-            return 1
+# Docker 状态监测
+if command -v docker >/dev/null 2>&1; then
+    D_CONT=$(docker ps -q | wc -l)
+    D_RUNNING=$(docker ps --format "{{.Names}}")
+    echo -e "${Y}🐳 Docker 正在运行容器 ($D_CONT):${X}"
+    for i in $D_RUNNING; do echo -e "  ${G}●${X} $i"; done
+    echo -e "${C}----------------------------------------------${X}"
+fi
+
+# 登录记录逻辑
+echo -e "${O}🛡 最近登录记录 (TOP 3)${X}"
+if command -v last >/dev/null 2>&1; then
+    # 适配不同版本的 last 输出
+    last -i -n 3 | grep -vE 'reboot|wtmp|begins' | head -n 3 | while read line; do
+        if [ -n "$line" ]; then
+            IP=$(echo "$line" | awk '{print $3}')
+            TIME=$(echo "$line" | awk '{print $4,$5,$6}')
+            printf " ${Y}%-15s${X} %s\n" "$IP" "$TIME"
         fi
-    fi
-    return 0
-}
+    done
+else
+    echo "  暂无记录或工具未安装"
+fi
 
-# 安装 Fail2Ban
-install_fail2ban() {
-    echo -e "${GREEN}正在安装 Fail2Ban...${RESET}"
-    case "$OS" in
-        alpine)
-            apk update
-            apk add fail2ban curl wget
-            touch /var/log/fail2ban.log
-            ;;
-        debian)
-            apt update
-            apt install -y fail2ban curl wget
-            ;;
-        rhel)
-            yum install -y epel-release
-            yum install -y fail2ban curl wget
-            ;;
-        *)
-            echo -e "${RED}不支持的操作系统${RESET}"
-            exit 1
-            ;;
-    esac
-    manage_service enable
-    sleep 1
-}
-
-# 配置 SSH 防护
-configure_ssh() {
-    local BACKEND="auto"
-    case "$OS" in
-        debian) 
-            LOG_PATH="/var/log/auth.log" 
-            # 修复 Ubuntu/Debian 无日志文件导致崩溃的问题
-            if [ ! -f "/var/log/auth.log" ]; then
-                BACKEND="systemd"
-            fi
-            ;;
-        rhel)   LOG_PATH="/var/log/secure" ;;
-        alpine) LOG_PATH="/var/log/messages" ;;
-    esac
-
-    # 如果是非 systemd 模式，确保日志文件存在
-    if [ "$BACKEND" != "systemd" ] && [ -n "$LOG_PATH" ] && [ ! -f "$LOG_PATH" ]; then
-        touch "$LOG_PATH"
-    fi
-
-    read -p $'\033[32m请输入 SSH 端口（默认22）: \033[0m' SSH_PORT
-    SSH_PORT=${SSH_PORT:-22}
-
-    read -p $'\033[32m请输入最大失败尝试次数 maxretry（默认5）: \033[0m' MAX_RETRY
-    MAX_RETRY=${MAX_RETRY:-5}
-
-    read -p $'\033[32m请输入封禁时间 bantime(秒，默认600) : \033[0m' BAN_TIME
-    BAN_TIME=${BAN_TIME:-600}
-
-    mkdir -p /etc/fail2ban/jail.d
-    # 动态生成配置，根据系统选择 backend
-    cat >/etc/fail2ban/jail.d/sshd.local <<EOF
-[sshd]
-enabled = true
-port = $SSH_PORT
-filter = sshd
-$( [ "$BACKEND" != "systemd" ] && echo "logpath = $LOG_PATH" )
-backend = $BACKEND
-maxretry = $MAX_RETRY
-bantime  = $BAN_TIME
+# 磁盘报警
+if [ "$DISK_P" -ge 80 ]; then
+    echo -e "\n${R}⚠ 警告: 磁盘空间占用过高 (${DISK_P}%)${X}"
+fi
+echo
 EOF
 
-    manage_service restart
-    sleep 1
-    echo -e "${GREEN}SSH 防暴力破解配置完成${RESET}"
+    chmod +x $TARGET
+    echo -e "${GREEN}MOTD 安装成功！请重新登录或输入 'bash $TARGET' 查看效果。${RESET}"
 }
 
-# 卸载 Fail2Ban
-uninstall_fail2ban() {
-    echo -e "${GREEN}正在卸载 Fail2Ban...${RESET}"
-    manage_service stop || true
-    case "$OS" in
-        alpine) apk del fail2ban ;;
-        debian) apt remove -y fail2ban ;;
-        rhel)   yum remove -y fail2ban ;;
-    esac
-    rm -rf /etc/fail2ban
-    echo -e "${GREEN}Fail2Ban 已卸载${RESET}"
+# ====================================================
+# 卸载与恢复函数
+# ====================================================
+remove_motd(){
+    rm -f $TARGET
+    echo -e "${RED}MOTD 已卸载${RESET}"
 }
 
-# 菜单逻辑
-fail2ban_menu() {
+restore_default(){
+    rm -f $TARGET
+    [ -f /etc/motd ] && true > /etc/motd
+    if [ -d /etc/update-motd.d ]; then
+        chmod +x /etc/update-motd.d/*
+    fi
+    echo -e "${CYAN}系统 MOTD 已恢复默认${RESET}"
+}
+
+preview(){
+    [ -f $TARGET ] && bash $TARGET || echo -e "${RED}请先安装 MOTD${RESET}"
+}
+
+# ====================================================
+# 主菜单
+# ====================================================
+menu(){
     while true; do
         clear
-        echo -e "${GREEN}==== SSH 防暴力破解管理菜单 ====${RESET}"
-        echo -e "${GREEN}1. 安装开启 SSH 防暴力破解${RESET}"
-        echo -e "${GREEN}2. 关闭 SSH 防暴力破解 (仅停用规则)${RESET}"
-        echo -e "${GREEN}3. 配置 SSH 防护参数${RESET}"
-        echo -e "${GREEN}4. 查看 SSH 拦截记录${RESET}"
-        echo -e "${GREEN}5. 查看防御规则列表${RESET}"
-        echo -e "${GREEN}6. 查看日志实时监控${RESET}"
-        echo -e "${GREEN}7. 卸载防御程序${RESET}"
-        echo -e "${GREEN}0. 退出${RESET}"
-        read -p $'\033[32m请输入你的选择: \033[0m' sub_choice
-
-        case $sub_choice in
-            1)
-                if ! command -v fail2ban-client >/dev/null 2>&1; then
-                    install_fail2ban
-                else
-                    manage_service start
-                fi
-                configure_ssh
-                read -p $'\033[32m按回车返回菜单...\033[0m'
-                ;;
-            2)
-                if [ -f /etc/fail2ban/jail.d/sshd.local ]; then
-                    sed -i '/enabled/s/true/false/' /etc/fail2ban/jail.d/sshd.local
-                    manage_service restart
-                    echo -e "${GREEN}SSH 防暴力破解已关闭${RESET}"
-                else
-                    echo -e "${RED}配置文件不存在${RESET}"
-                fi
-                read -p $'\033[32m按回车返回菜单...\033[0m'
-                ;;
-            3)
-                check_fail2ban && configure_ssh
-                read -p $'\033[32m按回车返回菜单...\033[0m'
-                ;;
-            4)
-                if check_fail2ban; then
-                    echo -e "${GREEN}当前被封禁的 IP 列表:${RESET}"
-                    fail2ban-client status sshd | grep "Banned IP list"
-                else
-                    echo -e "${RED}Fail2Ban 服务异常，无法读取记录${RESET}"
-                fi
-                read -p $'\033[32m按回车返回菜单...\033[0m'
-                ;;
-            5)
-                if check_fail2ban; then
-                    fail2ban-client status
-                else
-                    echo -e "${RED}Fail2Ban 服务异常${RESET}"
-                fi
-                read -p $'\033[32m按回车返回菜单...\033[0m'
-                ;;
-            6)
-                echo -e "${GREEN}实时监控 /var/log/fail2ban.log (Ctrl+C 退出)${RESET}"
-                tail -f /var/log/fail2ban.log
-                ;;
-            7)
-                uninstall_fail2ban
-                read -p $'\033[32m按回车退出管理程序...\033[0m'
-                break
-                ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择${RESET}" && sleep 1 ;;
+        echo -e "${GREEN}==== MOTD 管理菜单====${RESET}"
+        echo -e "1. 安装"
+        echo -e "2. 卸载"
+        echo -e "3. 恢复系统默认设置"
+        echo -e "4. 立即预览效果"
+        echo -e "0. 退出"
+        read -r -p "请输入数字选择: " CH
+        case $CH in
+            1) install_motd ;;
+            2) remove_motd ;;
+            3) restore_default ;;
+            4) preview ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效输入${RESET}" ;;
         esac
+        read -n 1 -s -r -p "按回车键返回菜单..."
     done
 }
 
-fail2ban_menu
+menu

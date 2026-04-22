@@ -1,132 +1,54 @@
 #!/bin/bash
-# ========================================
-# netcup-monitor 一键管理脚本
-# ========================================
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-RESET="\033[0m"
+# 定义配置文件路径
+CONFIG_FILE="/opt/lxdapi/configs/config.yaml"
 
-APP_NAME="netcup-monitor"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # 无颜色
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2${RESET}"
-        exit 1
-    fi
-}
-
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用！${RESET}"
-        return 1
-    fi
-}
-
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== netcup-monitor 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
+# 获取公网 IP 的函数
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://checkip.amazonaws.com" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
     done
+    echo "127.0.0.1"
 }
 
-install_app() {
-
-    check_docker
-    mkdir -p "$APP_DIR/data"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-
-    read -p "请输入访问端口 [默认:5000]: " input_port
-    PORT=${input_port:-5000}
-    check_port "$PORT" || return
-
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  netcup-monitor:
-    image: ghcr.io/agonie0v0/netcup-monitor:latest
-    container_name: netcup-monitor
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${PORT}:5000"
-    environment:
-      TZ: Asia/Shanghai
-    volumes:
-      - ./data:/app/data
-      - /etc/localtime:/etc/localtime:ro
-      - /var/run/docker.sock:/var/run/docker.sock
-EOF
-
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    echo
-    echo -e "${GREEN}✅ 启动成功${RESET}"
-    echo -e "${YELLOW}🌐 访问: http://127.0.0.1:${PORT}${RESET}"
-
-    read -p "按回车返回菜单..."
+# 提取 YAML 字段的辅助函数 (简单正则提取)
+get_yaml_val() {
+    local key=$1
+    # 匹配 key: value 格式，去掉引号和多余空格
+    grep "$key:" "$CONFIG_FILE" | head -n 1 | awk -F': ' '{print $2}' | tr -d '"' | tr -d "'" | xargs
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ 更新完成${RESET}"
-    read -p "按回车返回菜单..."
-}
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo -e "${RED}错误: 配置文件 $CONFIG_FILE 不存在！${NC}"
+    exit 1
+fi
 
-restart_app() {
-    docker restart netcup-monitor
-    echo -e "${GREEN}✅ 已重启${RESET}"
-    read -p "按回车返回菜单..."
-}
+# 开始提取信息
+SERVER_IP=$(get_public_ip)
+PORT=$(get_yaml_val "port")
+API_HASH=$(get_yaml_val "api_hash")
+USER=$(get_yaml_val "username")
+PASS=$(get_yaml_val "password")
+TLS_ENABLED=$(get_yaml_val "enabled")
 
-view_logs() {
-    docker logs -f netcup-monitor
-}
+# 协议判断
+PROTOCOL="http"
+[[ "$TLS_ENABLED" == "true" ]] && PROTOCOL="https"
 
-check_status() {
-    docker ps | grep netcup
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已卸载${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-menu
+echo -e "${YELLOW}================ LXDAPI 管理信息 ==================${NC}"
+echo -e "${GREEN}管理面板地址:${NC} ${PROTOCOL}://${SERVER_IP}:${PORT}/admin/login"
+echo -e "${GREEN}管理员账号:${NC}   ${USER}"
+echo -e "${GREEN}管理员密码:${NC}   ${PASS}"
+echo -e "--------------------------------------------------"
+echo -e "${GREEN}系统 API 密钥:${NC} ${API_HASH}"
+echo -e "${GREEN}数据存储目录:${NC} /opt/lxdapi"
+echo -e "${YELLOW}===================================================${NC}"

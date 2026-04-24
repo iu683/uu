@@ -1,99 +1,108 @@
 #!/bin/bash
-# ========================================
-# NextTrace 管理
-# 支持移动 / 联通 / 电信 单独或一键全测
-# ========================================
+# 一键系统重装脚本（分类菜单 + 编号选择 + 二次确认）
+# 支持 Linux 全系列 + Windows 全系列
 
+# 设置颜色
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-# 节点配置：名称 IP
-NODES=(
-    "移动 120.233.18.250"
-    "联通 157.148.58.29"
-    "电信 14.116.225.60"
+# 下载脚本
+download_script() {
+    local type="$1"
+    if [ "$type" == "MollyLau" ]; then
+        wget --no-check-certificate -qO InstallNET.sh "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/InstallNET.sh" && chmod +x InstallNET.sh
+    else
+        curl -O "https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
+    fi
+}
+
+# 系统信息表：编号|系统名|分类|下载方式|用户名|密码|端口|重装命令
+systems=(
+"1|debian13|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 13"
+"2|debian12|Debian|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -debian 12"
+"3|debian11|Debian|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -debian 11"
+"4|debian10|Debian|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -debian 10"
+"5|ubuntu26.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 26.04"
+"6|ubuntu24.04|Ubuntu|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -ubuntu 24.04"
+"7|ubuntu22.04|Ubuntu|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -ubuntu 22.04"
+"8|ubuntu20.04|Ubuntu|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -ubuntu 20.04"
+"9|ubuntu18.04|Ubuntu|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -ubuntu 18.04"
+"10|rocky10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh rocky"
+"11|rocky9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh rocky 9"
+"12|alma10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh almalinux"
+"13|alma9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh almalinux 9"
+"14|oracle10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh oracle"
+"15|oracle9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh oracle 9"
+"16|fedora42|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh fedora"
+"17|fedora41|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh fedora 41"
+"18|centos10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh centos 10"
+"19|centos9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh centos 9"
+"20|alpine|其他Linux|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -alpine"
+"21|arch|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh arch"
+"22|kali|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh kali"
+"23|openeuler|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh openeuler"
+"24|opensuse|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh opensuse"
+"25|fnos|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh fnos"
+"26|windows11|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 11 -lang cn"
+"27|windows10|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 10 -lang cn"
+"28|windows7|Windows|bin456789|Administrator|123@@@|3389|bash reinstall.sh windows --iso=\"https://drive.massgrave.dev/cn_windows_7_professional_with_sp1_x64_dvd_u_677031.iso\" --image-name='Windows 7 PROFESSIONAL'"
+"29|windows2022|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2022 -lang cn"
+"30|windows2019|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2019 -lang cn"
+"31|windows2016|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2016 -lang cn"
+"32|windows11arm|Windows|bin456789|Administrator|123@@@|3389|bash reinstall.sh dd --img https://r2.hotdog.eu.org/win11-arm-with-pagefile-15g.xz"
 )
 
-# ==============================
-# 检查 NextTrace 是否安装
-# ==============================
-check_install() {
-    if ! command -v nexttrace >/dev/null 2>&1; then
-        echo -e "${YELLOW}正在安装 NextTrace...${RESET}"
-        curl -fsSL nxtrace.org/nt | bash >/dev/null 2>&1
-        if [ $? -ne 0 ]; then
-            echo -e "${RED}NextTrace 安装失败，请检查网络或手动安装${RESET}"
-            exit 1
-        fi
-    fi
-}
-
-# ==============================
-# 执行单项测试逻辑
-# ==============================
-do_trace() {
-    local provider=$1
-    local ip=$2
-    
-    echo -e "\n${YELLOW}>>> 正在测试: ${provider} (${ip})${RESET}"
-    
-    # 执行大包并提取路径（去重处理）
-    route_big=$(nexttrace --tcp --psize 1024 "$ip" -p 80 2>/dev/null | awk '/Hop/ {print $0}')
-    # 执行小包
-    route_small=$(nexttrace --tcp --psize 12 "$ip" -p 80 2>/dev/null | awk '/Hop/ {print $0}')
-
-    if [ -z "$route_big" ]; then
-        echo -e "${RED}[错误] 无法获取路由数据，请检查网络${RESET}"
-        return
-    fi
-
-    # 对比结果
-    diff_output=$(diff <(echo "$route_big") <(echo "$route_small"))
-    if [ -z "$diff_output" ]; then
-        echo -e "${GREEN}[结果] 大小包路由一致 ✅${RESET}"
-    else
-        echo -e "${RED}[结果] 发现路由差异❌${RESET}"
-        echo "$diff_output"
-    fi
-}
-
-# ==============================
-# 菜单函数
-# ==============================
-show_menu() {
-    clear
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}      大小包测试      ${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}1) 移动${RESET}"
-    echo -e "${GREEN}2) 联通${RESET}"
-    echo -e "${GREEN}3) 电信${RESET}"
-    echo -e "${GREEN}4) 一键测试三网${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    read -rp $'\033[32m请选择测试节点: \033[0m' choice
-
-    case $choice in
-        1) do_trace "移动" "120.233.18.250" ;;
-        2) do_trace "联通" "157.148.58.29" ;;
-        3) do_trace "电信" "14.116.225.60" ;;
-        4)
-            for node in "${NODES[@]}"; do
-                do_trace $node
-                echo -e "${YELLOW}------------------------------${RESET}"
-            done
-            ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}" ;;
-    esac
-    
-    read -rp $'\n\033[33m按回车返回菜单...\033[0m'
-}
-
-# 主程序
-check_install
 while true; do
-    show_menu
+    # 显示菜单
+    echo -e "${GREEN}=== 一键重装系统管理菜单 ===${RESET}"
+
+    last_category=""
+    for sys in "${systems[@]}"; do
+        IFS="|" read -r id name category _ _ _ _ _ <<< "$sys"
+        if [[ "$category" != "$last_category" ]]; then
+            echo -e "${GREEN}--- $category 系统 ---${RESET}"
+            last_category="$category"
+        fi
+        echo -e "${YELLOW}${id}. ${name}${RESET}"
+    done
+    echo -e "${RED} 0. 退出${RESET}"
+
+    # 用户选择编号
+    read -p "$(echo -e ${GREEN}请输入选项: ${RESET})" num_choice
+
+    # 支持 0 或 00 退出
+    if [[ "$num_choice" == "0" || "$num_choice" == "00" ]]; then
+        exit 0
+    fi
+
+
+    found=0
+    for sys in "${systems[@]}"; do
+        IFS="|" read -r id name _ dl user pass port cmd <<< "$sys"
+        if [[ "$num_choice" == "$id" ]]; then
+            found=1
+            echo -e "${YELLOW}重装后初始用户名: ${GREEN}$user${RESET}  初始密码: ${GREEN}$pass${RESET}  远程端口: ${GREEN}$port${RESET}"
+            echo -e "${YELLOW}注意: 重装有风险，请提前备份重要数据！${RESET}"
+
+            # 二次确认
+            read -p "你确定要重装 ${name} 系统吗？(y/n): " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                download_script "$dl"
+                eval "$cmd"
+                echo -e "${GREEN}系统重装完成，正在重启...${RESET}"
+                reboot
+                break 2
+            else
+                echo -e "${YELLOW}已取消重装 ${name} 系统，返回菜单${RESET}"
+                sleep 1
+            fi
+            break
+        fi
+    done
+
+    if [[ $found -eq 0 ]]; then
+        echo -e "${RED}无效编号，请重新选择！${RESET}"
+    fi
 done

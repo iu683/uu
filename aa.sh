@@ -7,13 +7,13 @@ YELLOW='\033[33m'
 RESET='\033[0m'
 
 SNELL_DIR="/etc/snell"
-SNELL_BIN="$SNELL_DIR/snell-server"
+SNELL_BIN="/usr/local/bin/snell-server-v5"
 SNELL_CONF="$SNELL_DIR/snell-server.conf"
 SNELL_INFO="$SNELL_DIR/client.conf"
 SNELL_SERVICE="/etc/init.d/snell"
 SNELL_USER="snell"
 SNELL_GROUP="snell"
-VERSION="v5.0.1"
+VERSION="${VERSION:-5.0.1}"
 
 info() { printf "${GREEN}[信息] %s${RESET}\n" "$1"; }
 warn() { printf "${YELLOW}[警告] %s${RESET}\n" "$1"; }
@@ -36,7 +36,7 @@ require_alpine() {
 install_deps() {
   info "安装依赖..."
   apk update
-  apk add bash wget unzip iproute2 coreutils grep sed gawk
+  apk add --no-cache bash wget curl unzip iproute2 coreutils grep sed gawk upx
 }
 
 ensure_user_group() {
@@ -49,7 +49,6 @@ ensure_user_group() {
 get_arch() {
   case "$(uname -m)" in
     x86_64|amd64) echo "amd64" ;;
-    i386|i686) echo "i386" ;;
     aarch64|arm64) echo "aarch64" ;;
     armv7l|armv7) echo "armv7l" ;;
     *)
@@ -59,9 +58,28 @@ get_arch() {
   esac
 }
 
-get_download_url() {
+download_snell() {
+  local arch url tmp
   arch="$(get_arch)"
-  echo "https://dl.nssurge.com/snell/snell-server-${VERSION}-linux-${arch}.zip"
+  url="https://dl.nssurge.com/snell/snell-server-v${VERSION}-linux-${arch}.zip"
+  tmp="$(mktemp -d)"
+
+  info "下载: $url"
+  if ! curl -sLo "$tmp/snell.zip" --connect-timeout 60 "$url"; then
+    rm -rf "$tmp"
+    err "下载失败"
+    return 1
+  fi
+
+  unzip -oq "$tmp/snell.zip" -d "$tmp/"
+  install -m 755 "$tmp/snell-server" "$SNELL_BIN"
+
+  if command -v upx >/dev/null 2>&1; then
+    upx -d "$SNELL_BIN" >/dev/null 2>&1 || true
+  fi
+
+  rm -rf "$tmp"
+  info "Snell v${VERSION} 已安装到 $SNELL_BIN"
 }
 
 random_key() {
@@ -80,12 +98,12 @@ port_in_use() {
 }
 
 get_public_ip() {
+  local ip
   for url in https://api.ipify.org https://ip.sb https://checkip.amazonaws.com; do
-    ip="$(wget -qO- --timeout=5 "$url" 2>/dev/null || true)"
-    if [ -n "$ip" ]; then
-      echo "$ip"
-      return 0
-    fi
+    ip="$(curl -4s --max-time 5 "$url" 2>/dev/null || true)"
+    [ -n "$ip" ] && { echo "$ip"; return; }
+    ip="$(wget -4qO- --timeout=5 "$url" 2>/dev/null || true)"
+    [ -n "$ip" ] && { echo "$ip"; return; }
   done
   echo "YOUR_SERVER_IP"
 }
@@ -94,23 +112,11 @@ get_system_dns() {
   grep '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | paste -sd ',' -
 }
 
-download_snell() {
-  mkdir -p "$SNELL_DIR"
-  cd "$SNELL_DIR"
-
-  url="$(get_download_url)"
-  info "下载: $url"
-  wget -O snell.zip "$url"
-  unzip -o snell.zip -d "$SNELL_DIR"
-  rm -f snell.zip
-  chmod +x "$SNELL_BIN"
-}
-
-write_openrc_service() {
+write_service() {
   cat > "$SNELL_SERVICE" <<EOF
 #!/sbin/openrc-run
-name="Snell Server"
-description="Snell Server"
+name="Snell Server v5"
+description="Snell Server v5"
 command="$SNELL_BIN"
 command_args="-c $SNELL_CONF"
 command_user="$SNELL_USER"
@@ -134,31 +140,31 @@ write_config() {
   printf '请输入端口 [1025-65535，留空随机]: '
   read -r input_port
   if [ -z "$input_port" ]; then
-    port="$(shuf -i 1025-65535 -n 1)"
+    PORT="$(shuf -i 1025-65535 -n 1)"
   else
-    if ! validate_port "$input_port"; then
+    validate_port "$input_port" || {
       err "端口无效"
       return 1
-    fi
-    port="$input_port"
+    }
+    PORT="$input_port"
   fi
 
-  if port_in_use "$port"; then
-    err "端口 $port 已被占用"
+  if port_in_use "$PORT"; then
+    err "端口 $PORT 已被占用"
     return 1
   fi
 
   printf '请输入 PSK（留空随机生成）: '
-  read -r key
-  [ -n "$key" ] || key="$(random_key)"
+  read -r PSK
+  [ -n "$PSK" ] || PSK="$(random_key)"
 
   echo 'OBFS: 1) off  2) http  3) tls'
   printf '请选择 [默认 1]: '
   read -r obfs_choice
   case "${obfs_choice:-1}" in
-    2) obfs='http' ;;
-    3) obfs='tls' ;;
-    *) obfs='off' ;;
+    2) OBFS='http' ;;
+    3) OBFS='tls' ;;
+    *) OBFS='off' ;;
   esac
 
   echo 'IPv6: 1) 关闭  2) 开启'
@@ -166,12 +172,12 @@ write_config() {
   read -r ipv6_choice
   case "${ipv6_choice:-1}" in
     2)
-      ipv6='true'
-      listen="[::]:$port"
+      IPV6='true'
+      LISTEN="::0:$PORT"
       ;;
     *)
-      ipv6='false'
-      listen="0.0.0.0:$port"
+      IPV6='false'
+      LISTEN="0.0.0.0:$PORT"
       ;;
   esac
 
@@ -179,30 +185,30 @@ write_config() {
   printf '请选择 [默认 1]: '
   read -r tfo_choice
   case "${tfo_choice:-1}" in
-    2) tfo='false' ;;
-    *) tfo='true' ;;
+    2) TFO='false' ;;
+    *) TFO='true' ;;
   esac
 
-  default_dns="$(get_system_dns)"
-  [ -n "$default_dns" ] || default_dns='1.1.1.1,8.8.8.8'
-  printf '请输入 DNS [默认 %s]: ' "$default_dns"
-  read -r dns
-  dns="${dns:-$default_dns}"
+  DEFAULT_DNS="$(get_system_dns)"
+  [ -n "$DEFAULT_DNS" ] || DEFAULT_DNS='1.1.1.1,8.8.8.8'
+  printf '请输入 DNS [默认 %s]: ' "$DEFAULT_DNS"
+  read -r DNS
+  DNS="${DNS:-$DEFAULT_DNS}"
 
   cat > "$SNELL_CONF" <<EOF
 [snell-server]
-listen = $listen
-psk = $key
-ipv6 = $ipv6
-tfo = $tfo
-obfs = $obfs
-dns = $dns
+listen = $LISTEN
+psk = $PSK
+ipv6 = $IPV6
+tfo = $TFO
+obfs = $OBFS
+dns = $DNS
 EOF
 
-  server_ip="$(get_public_ip)"
-  hostname_short="$(hostname -s 2>/dev/null || echo snell)"
+  SERVER_IP="$(get_public_ip)"
+  HOSTNAME_SHORT="$(hostname -s 2>/dev/null || echo snell)"
   cat > "$SNELL_INFO" <<EOF
-$hostname_short = snell, $server_ip, $port, psk=$key, version=5, reuse=true, tfo=$tfo
+$HOSTNAME_SHORT = snell, $SERVER_IP, $PORT, psk=$PSK, version=5, reuse=true, tfo=$TFO
 EOF
 
   chown -R "$SNELL_USER:$SNELL_GROUP" "$SNELL_DIR" 2>/dev/null || chown -R "$SNELL_USER" "$SNELL_DIR"
@@ -218,17 +224,17 @@ EOF
 test_config() {
   info "检查配置是否可启动..."
   "$SNELL_BIN" -c "$SNELL_CONF" >/tmp/snell-test.log 2>&1 &
-  test_pid=$!
+  TEST_PID=$!
   sleep 1
-  if kill -0 "$test_pid" >/dev/null 2>&1; then
-    kill "$test_pid" >/dev/null 2>&1 || true
-    wait "$test_pid" 2>/dev/null || true
+  if kill -0 "$TEST_PID" >/dev/null 2>&1; then
+    kill "$TEST_PID" >/dev/null 2>&1 || true
+    wait "$TEST_PID" 2>/dev/null || true
     rm -f /tmp/snell-test.log
     info "配置测试通过"
   else
     err "Snell 启动测试失败"
     cat /tmp/snell-test.log || true
-    exit 1
+    return 1
   fi
 }
 
@@ -237,8 +243,8 @@ install_snell() {
   ensure_user_group
   download_snell
   write_config
-  write_openrc_service
-  test_config
+  write_service
+  test_config || return 1
   rc-service snell restart >/dev/null 2>&1 || rc-service snell start
   info "Snell 已安装并启动"
 }
@@ -246,19 +252,23 @@ install_snell() {
 update_snell() {
   [ -f "$SNELL_CONF" ] || {
     err "未找到已有配置，无法更新"
-    exit 1
+    return 1
   }
-
-  cd "$SNELL_DIR"
-  rc-service snell stop >/dev/null 2>&1 || true
-  url="$(get_download_url)"
-  info "下载: $url"
-  wget -O snell.zip "$url"
-  unzip -o snell.zip -d "$SNELL_DIR"
-  rm -f snell.zip
-  chmod +x "$SNELL_BIN"
-  rc-service snell start
+  install_deps
+  download_snell
+  rc-service snell restart >/dev/null 2>&1 || rc-service snell start
   info "Snell 已更新"
+}
+
+modify_config() {
+  [ -x "$SNELL_BIN" ] || {
+    err "Snell 尚未安装"
+    return 1
+  }
+  write_config
+  test_config || return 1
+  rc-service snell restart >/dev/null 2>&1 || rc-service snell start
+  info "配置已更新并重启"
 }
 
 uninstall_snell() {
@@ -266,6 +276,7 @@ uninstall_snell() {
   rc-service snell stop >/dev/null 2>&1 || true
   rc-update del snell default >/dev/null 2>&1 || true
   rm -f "$SNELL_SERVICE"
+  rm -f "$SNELL_BIN"
   rm -rf "$SNELL_DIR"
   info "Snell 已卸载"
 }
@@ -317,7 +328,6 @@ pause_wait() {
 main() {
   require_root
   require_alpine
-
   while true; do
     show_menu
     printf '请输入选项: '
@@ -325,7 +335,7 @@ main() {
     case "$choice" in
       1) install_snell; pause_wait ;;
       2) update_snell; pause_wait ;;
-      3) write_config && test_config && rc-service snell restart; pause_wait ;;
+      3) modify_config; pause_wait ;;
       4) rc-service snell start; pause_wait ;;
       5) rc-service snell stop; pause_wait ;;
       6) rc-service snell restart; pause_wait ;;

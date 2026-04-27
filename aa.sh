@@ -1,172 +1,303 @@
-#!/bin/bash
-# ========================================
-# ForwardX 一键管理脚本
-# ========================================
+#!/usr/bin/env bash
+# Remnawave 一键安装脚本（最终线性版）
+# Debian / Ubuntu
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RESET="\033[0m"
-RED="\033[31m"
+set -uo pipefail
 
-APP_NAME="forwardx"
-APP_DIR="/opt/$APP_NAME"
-SERVICE_NAME="forwardx"
+INSTALL_DIR="/opt/remnawave"
+CERT_DIR="/etc/nginx/ssl/remnawave"
+NGINX_SITE="/etc/nginx/sites-available/remnawave.conf"
+NGINX_ENABLED="/etc/nginx/sites-enabled/remnawave.conf"
+SYSCTL_FILE="/etc/sysctl.d/99-remnawave.conf"
 
-REPO="https://github.com/your-username/forwardx.git"
+info()  { printf '\033[1;32m[INFO]\033[0m %s\n' "$*"; }
+warn()  { printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
+die()   { printf '\033[1;31m[ERR ]\033[0m %s\n' "$*" >&2; exit 1; }
+chk()   { [[ "${1:-1}" -eq 0 ]] || die "${2:-命令失败}"; }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
-}
+# ─── 环境检查 ───────────────────────────────────────────────
+[[ "${EUID:-1}" -eq 0 ]] || die "请使用 root 运行本脚本"
+command -v apt-get >/dev/null 2>&1 || die "仅支持 Debian / Ubuntu"
 
-function menu() {
-    clear
-    echo -e "${GREEN}=== ForwardX 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 重启${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 查看状态${RESET}"
-    echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
+# ─── 用户输入 ───────────────────────────────────────────────
+read -rp "请输入【面板域名】（例如 panel.example.com）: " MAIN_DOMAIN
+[[ -n "${MAIN_DOMAIN:-}" ]] || die "面板域名不能为空"
 
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+read -rp "请输入【订阅域名】（留空则与面板相同）: " SUB_DOMAIN
+SUB_DOMAIN="${SUB_DOMAIN:-$MAIN_DOMAIN}"
 
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) restart_app ;;
-        4) view_logs ;;
-        5) check_status ;;
-        6) uninstall_app ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
-    esac
-}
+read -rp "请输入【证书邮箱】（例如 admin@example.com）: " EMAIL
+[[ -n "${EMAIL:-}" ]] || die "证书邮箱不能为空"
 
-function install_app() {
+echo
+echo "面板域名: $MAIN_DOMAIN"
+echo "订阅域名: $SUB_DOMAIN"
+echo "证书邮箱: $EMAIL"
+echo
 
-    echo -e "${GREEN}正在检查/安装 Docker...${RESET}"
+# ─── Step 1: 安装依赖 ────────────────────────────────────────
+info "[1/9] 安装基础依赖..."
+apt-get update -y
+chk $? "apt-get update 失败"
 
-    if ! command -v docker &>/dev/null; then
-        apt update
-        apt install -y curl
-        curl -fsSL https://get.docker.com | bash
-    fi
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  curl socat cron openssl ca-certificates gnupg \
+  lsb-release nginx ufw git iproute2 iptables
+chk $? "安装基础依赖失败"
 
-    mkdir -p "$APP_DIR"
+# ─── Step 2: 安装 Docker ─────────────────────────────────────
+info "[2/9] 检查 Docker..."
+if ! command -v docker >/dev/null 2>&1; then
+  info "未检测到 Docker，开始安装..."
+  curl -fsSL https://get.docker.com | sh
+  chk $? "Docker 安装失败"
+else
+  info "Docker 已安装，跳过。"
+fi
 
-    if [ ! -d "$APP_DIR/.git" ]; then
-        echo -e "${GREEN}克隆项目...${RESET}"
-        git clone "$REPO" "$APP_DIR"
-    fi
+systemctl enable docker >/dev/null 2>&1 || true
 
-    cd "$APP_DIR" || exit
+if ! docker compose version >/dev/null 2>&1; then
+  apt-get install -y docker-compose-plugin
+  chk $? "Docker Compose 插件安装失败"
+fi
 
-    echo
-    echo -e "${GREEN}生成配置文件...${RESET}"
+# ─── Step 3: 内核网络参数 ────────────────────────────────────
+info "[3/9] 修复内核网络参数..."
+modprobe br_netfilter >/dev/null 2>&1 || true
 
-    read -p "请输入 JWT_SECRET (留空自动生成): " JWT_SECRET
-    read -p "请输入 ADMIN_PASSWORD (留空默认 admin123): " ADMIN_PASSWORD
-
-    [ -z "$JWT_SECRET" ] && JWT_SECRET=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 32)
-    [ -z "$ADMIN_PASSWORD" ] && ADMIN_PASSWORD="admin123"
-
-    cat > .env <<EOF
-SQLITE_PATH=/data/forwardx.db
-JWT_SECRET=$JWT_SECRET
-NODE_ENV=production
-PORT=3000
-ADMIN_PASSWORD=$ADMIN_PASSWORD
+tee "$SYSCTL_FILE" >/dev/null <<'EOF'
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+net.bridge.bridge-nf-call-iptables=1
+net.bridge.bridge-nf-call-ip6tables=1
+vm.overcommit_memory=1
 EOF
 
-    echo -e "${GREEN}配置生成完成${RESET}"
-    echo -e "JWT_SECRET=$JWT_SECRET"
-    echo -e "ADMIN_PASSWORD=$ADMIN_PASSWORD"
+sysctl --system >/dev/null 2>&1 || true
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 || true
+iptables -P FORWARD ACCEPT >/dev/null 2>&1 || true
+ip6tables -P FORWARD ACCEPT >/dev/null 2>&1 || true
 
-    echo -e "${GREEN}启动服务...${RESET}"
-    docker compose up -d
+# ─── Step 4: 修复 Docker 网络链 ──────────────────────────────
+info "[4/9] 修复 Docker 网络链..."
+systemctl stop docker.socket  >/dev/null 2>&1 || true
+systemctl stop docker.service >/dev/null 2>&1 || true
+rm -f /var/lib/docker/network/files/local-kv.db >/dev/null 2>&1 || true
+ip link set docker0 down >/dev/null 2>&1 || true
+ip link delete docker0 type bridge >/dev/null 2>&1 || true
 
-    SERVER_IP=$(get_public_ip)
+iptables -t nat    -N DOCKER         >/dev/null 2>&1 || true
+iptables -t filter -N DOCKER-USER    >/dev/null 2>&1 || true
+iptables -t filter -N DOCKER-FORWARD >/dev/null 2>&1 || true
+iptables -t filter -C FORWARD -j DOCKER-USER    >/dev/null 2>&1 \
+  || iptables -t filter -I FORWARD 1 -j DOCKER-USER    >/dev/null 2>&1 || true
+iptables -t filter -C FORWARD -j DOCKER-FORWARD >/dev/null 2>&1 \
+  || iptables -t filter -A FORWARD -j DOCKER-FORWARD   >/dev/null 2>&1 || true
+iptables -t filter -C DOCKER-USER -j RETURN >/dev/null 2>&1 \
+  || iptables -t filter -A DOCKER-USER -j RETURN       >/dev/null 2>&1 || true
 
-    echo
-    echo -e "${GREEN}✅ ForwardX 已启动${RESET}"
-    echo -e "${YELLOW}访问: http://${SERVER_IP}:3000${RESET}"
-    echo -e "${YELLOW}账号: admin${RESET}"
-    echo -e "${YELLOW}密码: $ADMIN_PASSWORD${RESET}"
+systemctl start docker.socket  >/dev/null 2>&1 || true
+systemctl start docker.service
+chk $? "Docker 启动失败"
+sleep 4
 
-    read -p "按回车返回菜单..."
-    menu
+# ─── Step 5: 下载配置文件 ────────────────────────────────────
+info "[5/9] 准备 Remnawave 配置..."
+mkdir -p "$INSTALL_DIR"
+chk $? "无法创建目录 $INSTALL_DIR"
+cd "$INSTALL_DIR" || die "无法进入目录 $INSTALL_DIR"
+
+info "  下载 docker-compose.yml..."
+curl -fL --connect-timeout 30 --max-time 120 \
+  "https://raw.githubusercontent.com/remnawave/backend/refs/heads/main/docker-compose-prod.yml" \
+  -o docker-compose.yml
+chk $? "下载 docker-compose.yml 失败"
+[[ -s docker-compose.yml ]] || die "docker-compose.yml 文件为空"
+info "  docker-compose.yml 下载成功。"
+
+info "  下载 .env.sample..."
+curl -fL --connect-timeout 30 --max-time 120 \
+  "https://raw.githubusercontent.com/remnawave/backend/refs/heads/main/.env.sample" \
+  -o .env.download
+chk $? "下载 .env.sample 失败"
+[[ -s .env.download ]] || die ".env.sample 文件为空"
+info "  .env.sample 下载成功。"
+
+# 备份旧 .env，使用全新 .env
+[[ -f .env ]] && cp -a .env ".env.bak.$(date +%Y%m%d%H%M%S)" || true
+mv .env.download .env
+chk $? "重命名 .env 失败"
+
+# ─── Step 6: 端口 & 环境变量 ─────────────────────────────────
+info "[6/9] 配置端口与环境变量..."
+
+APP_PORT=3000
+DB_PORT=6767
+
+if ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${APP_PORT}$" 2>/dev/null; then
+  APP_PORT=3100
+  warn "端口 3000 已占用，改用 3100"
+fi
+if ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${DB_PORT}$" 2>/dev/null; then
+  DB_PORT=6868
+  warn "端口 6767 已占用，改用 6868"
+fi
+
+sed -i -E "s|127\.0\.0\.1:3000-3001:3000-3001|127.0.0.1:${APP_PORT}-3001:3000-3001|g" docker-compose.yml
+sed -i -E "s|127\.0\.0\.1:3000:3000|127.0.0.1:${APP_PORT}:3000|g"                     docker-compose.yml
+sed -i -E "s|127\.0\.0\.1:6767:5432|127.0.0.1:${DB_PORT}:5432|g"                      docker-compose.yml
+
+DB_PASS="$(openssl rand -hex 24)"
+
+_kv() {
+  local key="$1" val="$2"
+  if grep -qE "^${key}=" .env 2>/dev/null; then
+    sed -i "s|^${key}=.*|${key}=${val}|" .env
+  else
+    printf '%s=%s\n' "$key" "$val" >> .env
+  fi
 }
 
-function update_app() {
+_kv FRONT_END_DOMAIN       "$MAIN_DOMAIN"
+_kv PANEL_DOMAIN           "$MAIN_DOMAIN"
+_kv SUB_PUBLIC_DOMAIN      "${SUB_DOMAIN}/api/sub"
+_kv JWT_AUTH_SECRET        "$(openssl rand -hex 64)"
+_kv JWT_API_TOKENS_SECRET  "$(openssl rand -hex 64)"
+_kv METRICS_PASS           "$(openssl rand -hex 32)"
+_kv WEBHOOK_SECRET_HEADER  "$(openssl rand -hex 64)"
+_kv POSTGRES_PASSWORD      "$DB_PASS"
 
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+if grep -qE '^DATABASE_URL=' .env 2>/dev/null; then
+  sed -i "s|^\(DATABASE_URL=\"postgresql://postgres:\)[^@]*\(@.*\)|\1${DB_PASS}\2|" .env
+else
+  printf 'DATABASE_URL="postgresql://postgres:%s@remnawave-db:5432/postgres"\n' "$DB_PASS" >> .env
+fi
 
-    echo -e "${GREEN}更新程序...${RESET}"
+info "环境变量写入完成。"
 
-    git pull
+# ─── Step 7: 启动容器 ────────────────────────────────────────
+info "[7/9] 启动 Remnawave 容器..."
+docker compose down --remove-orphans >/dev/null 2>&1 || true
+docker rm -f remnawave remnawave-db remnawave-redis >/dev/null 2>&1 || true
 
-    echo -e "${GREEN}重新构建镜像...${RESET}"
-    docker compose up -d --build
+docker compose up -d
+if [[ $? -ne 0 ]]; then
+  warn "首次启动失败，重启 Docker 后重试..."
+  systemctl restart docker
+  sleep 5
+  docker compose up -d
+  chk $? "Remnawave 容器启动失败"
+fi
 
-    echo -e "${GREEN}✅ ForwardX 已更新并重启${RESET}"
+info "等待容器就绪 (25秒)..."
+sleep 25
 
-    read -p "按回车返回菜单..."
-    menu
+for cname in remnawave remnawave-db remnawave-redis; do
+  docker ps --filter "name=^${cname}$" --filter "status=running" \
+    --format '{{.Names}}' 2>/dev/null | grep -qx "$cname" \
+    || { docker compose logs --tail=80 "$cname" 2>/dev/null || true; die "${cname} 容器未运行"; }
+done
+
+info "所有容器运行正常。"
+
+# ─── Step 8: 证书 & Nginx ────────────────────────────────────
+info "[8/9] 申请 SSL 证书..."
+if [[ ! -x /root/.acme.sh/acme.sh ]]; then
+  curl https://get.acme.sh | sh -s email="$EMAIL"
+  chk $? "acme.sh 安装失败"
+fi
+ACME=/root/.acme.sh/acme.sh
+[[ -x "$ACME" ]] || die "acme.sh 不可用"
+
+mkdir -p "$CERT_DIR"
+systemctl stop nginx >/dev/null 2>&1 || true
+
+"$ACME" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+"$ACME" --register-account -m "$EMAIL"        >/dev/null 2>&1 || true
+
+DARGS=("-d" "$MAIN_DOMAIN")
+[[ "$SUB_DOMAIN" != "$MAIN_DOMAIN" ]] && DARGS+=("-d" "$SUB_DOMAIN")
+
+"$ACME" --issue --standalone "${DARGS[@]}" --keylength ec-256 --force
+chk $? "证书申请失败（请确认域名 DNS 已解析到本机 IP 且 80 端口已放行）"
+
+"$ACME" --install-cert -d "$MAIN_DOMAIN" --ecc \
+  --fullchain-file "$CERT_DIR/fullchain.cer" \
+  --key-file       "$CERT_DIR/privkey.key"
+chk $? "证书安装失败"
+
+[[ -f "$CERT_DIR/fullchain.cer" ]] || die "缺少 fullchain.cer"
+[[ -f "$CERT_DIR/privkey.key"   ]] || die "缺少 privkey.key"
+info "证书申请成功。"
+
+info "写入 Nginx 配置..."
+cat > "$NGINX_SITE" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $MAIN_DOMAIN $SUB_DOMAIN;
+    return 301 https://\$host\$request_uri;
 }
 
-function restart_app() {
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name $MAIN_DOMAIN $SUB_DOMAIN;
 
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+    ssl_certificate     $CERT_DIR/fullchain.cer;
+    ssl_certificate_key $CERT_DIR/privkey.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
 
-    echo -e "${GREEN}正在重启...${RESET}"
-    docker compose restart
-
-    echo -e "${GREEN}✅ 已重启${RESET}"
-
-    read -p "按回车返回菜单..."
-    menu
+    location / {
+        proxy_http_version 1.1;
+        proxy_pass         http://127.0.0.1:${APP_PORT};
+        proxy_set_header   Host              \$host;
+        proxy_set_header   X-Real-IP         \$remote_addr;
+        proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+        proxy_set_header   X-Forwarded-Host  \$host;
+        proxy_set_header   X-Forwarded-Port  \$server_port;
+        proxy_set_header   Upgrade           \$http_upgrade;
+        proxy_set_header   Connection        "upgrade";
+        proxy_read_timeout 300;
+        proxy_send_timeout 300;
+    }
 }
+EOF
+chk $? "写入 Nginx 配置失败"
 
-function view_logs() {
+rm -f /etc/nginx/sites-enabled/default
+ln -sf "$NGINX_SITE" "$NGINX_ENABLED"
 
-    docker logs -f forwardx
+nginx -t
+chk $? "Nginx 配置测试失败"
 
-    read -p "按回车返回菜单..."
-    menu
-}
+systemctl enable nginx >/dev/null 2>&1 || true
+systemctl restart nginx
+chk $? "Nginx 启动失败"
+info "Nginx 启动成功。"
 
-function check_status() {
+# ─── Step 9: 防火墙 ──────────────────────────────────────────
+info "[9/9] 防火墙..."
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+  ufw allow 80/tcp  >/dev/null 2>&1 || true
+  ufw allow 443/tcp >/dev/null 2>&1 || true
+  info "已放行 80/443。"
+else
+  warn "UFW 未启用，跳过。"
+fi
 
-    echo -e "${GREEN}容器状态：${RESET}"
-    docker ps | grep forwardx
-
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function uninstall_app() {
-
-    cd "$APP_DIR" || return
-
-    docker compose down -v
-    rm -rf "$APP_DIR"
-
-    echo -e "${GREEN}✅ ForwardX 已卸载${RESET}"
-
-    read -p "按回车返回菜单..."
-    menu
-}
-
-menu
+# ─── 完成 ────────────────────────────────────────────────────
+echo
+echo "=========================================="
+echo " ✅ 安装完成"
+echo " 面板地址: https://$MAIN_DOMAIN"
+echo " 订阅地址: https://$SUB_DOMAIN/api/sub"
+echo " 本地端口: 127.0.0.1:${APP_PORT}"
+echo " 安装目录: $INSTALL_DIR"
+echo "=========================================="

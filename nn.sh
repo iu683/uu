@@ -1,104 +1,135 @@
 #!/bin/bash
 # ========================================
-# NextTrace 一键管理脚本（菜单版）
-# 首次运行自动安装
-# 支持移动 / 联通 / 电信大小包测试
+# ForwardX 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
 RESET="\033[0m"
+RED="\033[31m"
 
-# ==============================
-# 检查 NextTrace 是否安装
-# ==============================
-check_install() {
-    if ! command -v nexttrace >/dev/null 2>&1; then
-        # 静默安装 NextTrace
-        curl -fsSL nxtrace.org/nt | bash >/dev/null 2>&1
-        if [ $? -ne 0 ]; then
-            echo -e "${RED}NextTrace 安装失败，请检查网络或手动安装${RESET}"
-            exit 1
-        fi
-    fi
-}
+APP_NAME="forwardx"
+APP_DIR="/opt/$APP_NAME"
+SERVICE_NAME="forwardx"
 
-# ==============================
-# 执行测试
-# 参数: $1=节点名称, $2=IP
-# ==============================
-run_test() {
-    local provider=$1
-    local ip=$2
-    echo -e "\n${YELLOW}=== 测试 ${provider} ===${RESET}"
+REPO="https://github.com/your-username/forwardx.git"
 
-    echo "大包测试（1024K）："
-    route_big=$(nexttrace --tcp --psize 1024 "$ip" -p 80 | awk '/Hop/ {print $0}')
-    
-    echo "小包测试（12K）："
-    route_small=$(nexttrace --tcp --psize 12 "$ip" -p 80 | awk '/Hop/ {print $0}')
-
-    echo -e "\n${YELLOW}=== 路由对比 ===${RESET}"
-    diff_output=$(diff <(echo "$route_big") <(echo "$route_small"))
-    if [ -z "$diff_output" ]; then
-        echo -e "${GREEN}大小包路由一致 ✅${RESET}"
-    else
-        echo -e "${RED}大小包路由不一致 ❌${RESET}"
-        echo "$diff_output"
-    fi
-    read -rp $'\n\033[33m按回车返回菜单...\033[0m'
-}
-
-# ==============================
-# 全部测试
-# ==============================
-run_all_tests() {
-    run_test "深圳移动" "120.233.18.250" <<< ""
-    run_test "广州联通" "157.148.58.29" <<< ""
-    run_test "广州电信" "14.116.225.60" <<< ""
-}
-
-# ==============================
-# 菜单函数
-# ==============================
-show_menu() {
+function menu() {
     clear
-    echo -e "${GREEN}==== 大小包测试====${RESET}"
-    echo -e "${GREEN}1) 移动${RESET}"
-    echo -e "${GREEN}2) 联通${RESET}"
-    echo -e "${GREEN}3) 电信${RESET}"
-    echo -e "${GREEN}4) 全测${RESET}"
+    echo -e "${GREEN}=== ForwardX 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 查看日志${RESET}"
+    echo -e "${GREEN}4) 卸载(含数据)${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    read -rp $'\033[32m请选择测试节点: \033[0m' choice
+
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
     case $choice in
-        1)
-            run_test "深圳移动" "120.233.18.250"
-            ;;
-        2)
-            run_test "广州联通" "157.148.58.29"
-            ;;
-        3)
-            run_test "广州电信" "14.116.225.60"
-            ;;
-        4)
-            run_all_tests
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            echo -e "${RED}无效选择，请重新输入${RESET}"
-            ;;
+        1) install_app ;;
+        2) update_app ;;
+        3) view_logs ;;
+        4) uninstall_app ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
     esac
 }
 
-# ==============================
-# 主程序
-# ==============================
-check_install
+function install_app() {
 
-while true; do
-    show_menu
-done
+    echo -e "${GREEN}正在检查/安装 Docker...${RESET}"
+
+    if ! command -v docker &>/dev/null; then
+        apt update
+        apt install -y curl
+        curl -fsSL https://get.docker.com | bash
+    fi
+
+    mkdir -p "$APP_DIR"
+
+    if [ ! -d "$APP_DIR/.git" ]; then
+        echo -e "${GREEN}克隆项目...${RESET}"
+        git clone "$REPO" "$APP_DIR"
+    fi
+
+    cd "$APP_DIR" || exit
+
+    echo
+    echo -e "${GREEN}生成配置文件...${RESET}"
+
+    read -p "请输入 JWT_SECRET (留空自动生成): " JWT_SECRET
+    read -p "请输入 ADMIN_PASSWORD (留空默认 admin123): " ADMIN_PASSWORD
+
+    # 默认值处理
+    [ -z "$JWT_SECRET" ] && JWT_SECRET=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 32)
+    [ -z "$ADMIN_PASSWORD" ] && ADMIN_PASSWORD="admin123"
+
+    # 生成 .env
+    cat > .env <<EOF
+# ==================== 数据库配置 ====================
+SQLITE_PATH=/data/forwardx.db
+
+# ==================== 安全配置 ====================
+JWT_SECRET=$JWT_SECRET
+
+# ==================== 应用配置 ====================
+NODE_ENV=production
+PORT=3000
+
+# ==================== 默认管理员账户 ====================
+ADMIN_PASSWORD=$ADMIN_PASSWORD
+EOF
+
+    echo -e "${GREEN}配置生成完成${RESET}"
+    echo -e "JWT_SECRET=$JWT_SECRET"
+    echo -e "ADMIN_PASSWORD=$ADMIN_PASSWORD"
+
+    echo -e "${GREEN}启动服务...${RESET}"
+    docker compose up -d
+
+    echo
+    echo -e "${GREEN}✅ ForwardX 已启动${RESET}"
+    echo -e "${YELLOW}访问: http://localhost:3000${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function update_app() {
+
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+
+    echo -e "${GREEN}更新程序...${RESET}"
+
+    git pull
+    docker compose pull
+    docker compose up -d
+
+    echo -e "${GREEN}✅ ForwardX 已更新${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function uninstall_app() {
+
+    cd "$APP_DIR" || return
+
+    docker compose down -v
+    rm -rf "$APP_DIR"
+
+    echo -e "${GREEN}✅ ForwardX 已卸载${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function view_logs() {
+
+    docker logs -f forwardx
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+menu

@@ -1,129 +1,172 @@
 #!/bin/bash
 # ========================================
-# homedir 一键管理脚本
+# ForwardX 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
 RESET="\033[0m"
+RED="\033[31m"
 
-APP_NAME="homedir"
+APP_NAME="forwardx"
 APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+SERVICE_NAME="forwardx"
 
-check_docker() {
+REPO="https://github.com/your-username/forwardx.git"
+
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
+}
+
+function menu() {
+    clear
+    echo -e "${GREEN}=== ForwardX 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 重启${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}5) 查看状态${RESET}"
+    echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+    case $choice in
+        1) install_app ;;
+        2) update_app ;;
+        3) restart_app ;;
+        4) view_logs ;;
+        5) check_status ;;
+        6) uninstall_app ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
+    esac
+}
+
+function install_app() {
+
+    echo -e "${GREEN}正在检查/安装 Docker...${RESET}"
+
     if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        apt update
+        apt install -y curl
         curl -fsSL https://get.docker.com | bash
     fi
 
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2${RESET}"
-        exit 1
+    mkdir -p "$APP_DIR"
+
+    if [ ! -d "$APP_DIR/.git" ]; then
+        echo -e "${GREEN}克隆项目...${RESET}"
+        git clone "$REPO" "$APP_DIR"
     fi
-}
-
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用！${RESET}"
-        return 1
-    fi
-}
-
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== homedir 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
-install_app() {
-
-    check_docker
-
-    mkdir -p "$APP_DIR/data"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-
-    read -p "请输入访问端口 [默认:4027]: " input_port
-    PORT=${input_port:-4027}
-    check_port "$PORT" || return
-
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  homedir:
-    image: 52lxcloud/homedir:latest
-    container_name: homedir
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${PORT}:4027"
-    volumes:
-      - ./data:/app/data
-EOF
 
     cd "$APP_DIR" || exit
-    docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ homedir 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问: http://127.0.0.1:${PORT}/dash${RESET}"
+    echo -e "${GREEN}生成配置文件...${RESET}"
 
-    read -p "按回车返回菜单..."
-}
+    read -p "请输入 JWT_SECRET (留空自动生成): " JWT_SECRET
+    read -p "请输入 ADMIN_PASSWORD (留空默认 admin123): " ADMIN_PASSWORD
 
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
+    [ -z "$JWT_SECRET" ] && JWT_SECRET=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 32)
+    [ -z "$ADMIN_PASSWORD" ] && ADMIN_PASSWORD="admin123"
+
+    cat > .env <<EOF
+SQLITE_PATH=/data/forwardx.db
+JWT_SECRET=$JWT_SECRET
+NODE_ENV=production
+PORT=3000
+ADMIN_PASSWORD=$ADMIN_PASSWORD
+EOF
+
+    echo -e "${GREEN}配置生成完成${RESET}"
+    echo -e "JWT_SECRET=$JWT_SECRET"
+    echo -e "ADMIN_PASSWORD=$ADMIN_PASSWORD"
+
+    echo -e "${GREEN}启动服务...${RESET}"
     docker compose up -d
-    echo -e "${GREEN}✅ 更新完成${RESET}"
+
+    SERVER_IP=$(get_public_ip)
+
+    echo
+    echo -e "${GREEN}✅ ForwardX 已启动${RESET}"
+    echo -e "${YELLOW}访问: http://${SERVER_IP}:3000${RESET}"
+    echo -e "${YELLOW}账号: admin${RESET}"
+    echo -e "${YELLOW}密码: $ADMIN_PASSWORD${RESET}"
+
     read -p "按回车返回菜单..."
+    menu
 }
 
-restart_app() {
-    docker restart homedir
+function update_app() {
+
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+
+    echo -e "${GREEN}更新程序...${RESET}"
+
+    git pull
+
+    echo -e "${GREEN}重新构建镜像...${RESET}"
+    docker compose up -d --build
+
+    echo -e "${GREEN}✅ ForwardX 已更新并重启${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function restart_app() {
+
+    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+
+    echo -e "${GREEN}正在重启...${RESET}"
+    docker compose restart
+
     echo -e "${GREEN}✅ 已重启${RESET}"
+
     read -p "按回车返回菜单..."
+    menu
 }
 
-view_logs() {
-    docker logs -f homedir
-}
+function view_logs() {
 
-check_status() {
-    docker ps | grep homedir
+    docker logs -f forwardx
+
     read -p "按回车返回菜单..."
+    menu
 }
 
-uninstall_app() {
+function check_status() {
+
+    echo -e "${GREEN}容器状态：${RESET}"
+    docker ps | grep forwardx
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function uninstall_app() {
+
     cd "$APP_DIR" || return
+
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已卸载${RESET}"
+
+    echo -e "${GREEN}✅ ForwardX 已卸载${RESET}"
+
     read -p "按回车返回菜单..."
+    menu
 }
 
 menu

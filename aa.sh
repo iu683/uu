@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# new-api 一键管理脚本
+# EPUSDT 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="new-api"
+APP_NAME="epusdt"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -31,10 +31,25 @@ check_port() {
     fi
 }
 
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
+}
+
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== new-api 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== EPUSDT 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -60,10 +75,7 @@ menu() {
 install_app() {
 
     check_docker
-
     mkdir -p "$APP_DIR/data"
-    mkdir -p "$APP_DIR/logs"
-    mkdir -p "$APP_DIR/pg_data"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -71,75 +83,51 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:3000]: " input_port
-    PORT=${input_port:-3000}
+    read -p "请输入访问端口 [默认:8000]: " input_port
+    PORT=${input_port:-8000}
     check_port "$PORT" || return
 
-    read -p "Postgres密码 [默认:StrongPass123!]: " input_pg
-    PG_PASS=${input_pg:-StrongPass123!}
+    # 自动生成基础 .env
+    cat > "$APP_DIR/data/.env" <<EOF
+# =========================
+# EPUSDT 基础配置
+# =========================
+APP_PORT=8000
+APP_ENV=production
+APP_DEBUG=false
 
-    read -p "Redis密码 [默认:StrongRedis123!]: " input_rd
-    REDIS_PASS=${input_rd:-StrongRedis123!}
+# ⚠️ 必改
+MERCHANT_ID=your_merchant_id
+API_KEY=your_api_key
 
-    NODE_NAME="node-$(openssl rand -hex 3)"
+# 回调地址
+NOTIFY_URL=http://你的域名/notify
+RETURN_URL=http://你的域名/return
+EOF
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  new-api:
-    image: calciumion/new-api:latest
-    container_name: new-api
+  epusdt:
+    image: gmwallet/epusdt:latest
+    container_name: epusdt
     restart: always
-    command: --log-dir /app/logs
     ports:
-      - "127.0.0.0.1:${PORT}:3000"
+      - "${PORT}:8000"
+    environment:
+      EPUSDT_CONFIG: /data/.env
     volumes:
       - ./data:/data
-      - ./logs:/app/logs
-    environment:
-      - SQL_DSN=postgresql://root:${PG_PASS}@postgres:5432/new-api
-      - REDIS_CONN_STRING=redis://:${REDIS_PASS}@redis:6379
-      - TZ=Asia/Shanghai
-      - ERROR_LOG_ENABLED=true
-      - BATCH_UPDATE_ENABLED=true
-      - NODE_NAME=${NODE_NAME}
-    depends_on:
-      - redis
-      - postgres
-    networks:
-      - new-api-network
-
-  redis:
-    image: redis:latest
-    container_name: redis
-    restart: always
-    command: ["redis-server", "--requirepass", "${REDIS_PASS}"]
-    networks:
-      - new-api-network
-
-  postgres:
-    image: postgres:15
-    container_name: postgres
-    restart: always
-    environment:
-      POSTGRES_USER: root
-      POSTGRES_PASSWORD: ${PG_PASS}
-      POSTGRES_DB: new-api
-    volumes:
-      - ./pg_data:/var/lib/postgresql/data
-    networks:
-      - new-api-network
-
-networks:
-  new-api-network:
-    driver: bridge
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
+    SERVER_IP=$(get_public_ip)
+
     echo
-    echo -e "${GREEN}✅ new-api 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}✅ EPUSDT 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问: http://${SERVER_IP}:${PORT}${RESET}"
+    echo -e "${RED}⚠️ 请立即编辑 /opt/epusdt/data/.env 配置支付参数${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -153,17 +141,17 @@ update_app() {
 }
 
 restart_app() {
-    docker restart new-api
+    docker restart epusdt
     echo -e "${GREEN}✅ 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f new-api
+    docker logs -f epusdt
 }
 
 check_status() {
-    docker ps | grep new-api
+    docker ps | grep epusdt
     read -p "按回车返回菜单..."
 }
 

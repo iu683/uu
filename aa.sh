@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# EPUSDT 一键管理脚本
+# one-api 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="epusdt"
+APP_NAME="one-api"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -31,25 +31,10 @@ check_port() {
     fi
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
-}
-
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== EPUSDT 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== one-api 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -75,7 +60,10 @@ menu() {
 install_app() {
 
     check_docker
-    mkdir -p "$APP_DIR/data"
+
+    mkdir -p "$APP_DIR/data/mysql"
+    mkdir -p "$APP_DIR/data/oneapi"
+    mkdir -p "$APP_DIR/logs"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -83,51 +71,69 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:8000]: " input_port
-    PORT=${input_port:-8000}
+    read -p "请输入访问端口 [默认:3000]: " input_port
+    PORT=${input_port:-3000}
     check_port "$PORT" || return
 
-    # 自动生成基础 .env
-    cat > "$APP_DIR/data/.env" <<EOF
-# =========================
-# EPUSDT 基础配置
-# =========================
-APP_PORT=8000
-APP_ENV=production
-APP_DEBUG=false
+    read -p "MySQL root密码 [默认:StrongRoot123!]: " input_root
+    MYSQL_ROOT_PASS=${input_root:-StrongRoot123!}
 
-# ⚠️ 必改
-MERCHANT_ID=your_merchant_id
-API_KEY=your_api_key
+    read -p "MySQL 用户密码 [默认:StrongUser123!]: " input_user
+    MYSQL_USER_PASS=${input_user:-StrongUser123!}
 
-# 回调地址
-NOTIFY_URL=http://你的域名/notify
-RETURN_URL=http://你的域名/return
-EOF
+    read -p "Redis密码 [默认:StrongRedis123!]: " input_rd
+    REDIS_PASS=${input_rd:-StrongRedis123!}
+
+    SESSION_SECRET=$(openssl rand -hex 16)
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  epusdt:
-    image: gmwallet/epusdt:latest
-    container_name: epusdt
+  one-api:
+    image: justsong/one-api:latest
+    container_name: one-api
     restart: always
+    command: --log-dir /app/logs
     ports:
-      - "${PORT}:8000"
-    environment:
-      EPUSDT_CONFIG: /data/.env
+      - "127.0.0.1:${PORT}:3000"
     volumes:
-      - ./data:/data
+      - ./data/oneapi:/data
+      - ./logs:/app/logs
+    environment:
+      - SQL_DSN=oneapi:${MYSQL_USER_PASS}@tcp(db:3306)/one-api
+      - REDIS_CONN_STRING=redis://:${REDIS_PASS}@redis:6379
+      - SESSION_SECRET=${SESSION_SECRET}
+      - TZ=Asia/Shanghai
+    depends_on:
+      - redis
+      - db
+
+  redis:
+    image: redis:latest
+    container_name: redis
+    restart: always
+    command: ["redis-server", "--requirepass", "${REDIS_PASS}"]
+
+  db:
+    image: mysql:8.2.0
+    container_name: mysql
+    restart: always
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+    environment:
+      TZ: Asia/Shanghai
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASS}
+      MYSQL_USER: oneapi
+      MYSQL_PASSWORD: ${MYSQL_USER_PASS}
+      MYSQL_DATABASE: one-api
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    SERVER_IP=$(get_public_ip)
-
     echo
-    echo -e "${GREEN}✅ EPUSDT 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问: http://${SERVER_IP}:${PORT}${RESET}"
-    echo -e "${RED}⚠️ 请立即编辑 /opt/epusdt/data/.env 配置支付参数${RESET}"
+    echo -e "${GREEN}✅ one-api 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${YELLOW}📂 数据目录: $APP_DIR${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -141,17 +147,17 @@ update_app() {
 }
 
 restart_app() {
-    docker restart epusdt
+    docker restart one-api
     echo -e "${GREEN}✅ 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f epusdt
+    docker logs -f one-api
 }
 
 check_status() {
-    docker ps | grep epusdt
+    docker ps | grep one-api
     read -p "按回车返回菜单..."
 }
 

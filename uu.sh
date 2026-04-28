@@ -1,18 +1,35 @@
 #!/bin/bash
 # ========================================
-# ForwardX 一键管理脚本
+# EPUSDT 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RESET="\033[0m"
 RED="\033[31m"
+RESET="\033[0m"
 
-APP_NAME="forwardx"
+APP_NAME="epusdt"
 APP_DIR="/opt/$APP_NAME"
-SERVICE_NAME="forwardx"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-REPO="https://github.com/poouo/Forwardx.git"
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
+
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
+    fi
+}
+
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
 
 get_public_ip() {
     local ip
@@ -29,144 +46,103 @@ get_public_ip() {
     echo "无法获取公网 IP 地址。" && return
 }
 
-function menu() {
-    clear
-    echo -e "${GREEN}=== ForwardX 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 重启${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 查看状态${RESET}"
-    echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== EPUSDT 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) restart_app ;;
-        4) view_logs ;;
-        5) check_status ;;
-        6) uninstall_app ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
-    esac
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
 }
 
-function install_app() {
+install_app() {
 
-    echo -e "${GREEN}正在检查/安装 Docker...${RESET}"
+    check_docker
+    mkdir -p "$APP_DIR/data"
 
-    if ! command -v docker &>/dev/null; then
-        apt update
-        apt install -y curl
-        curl -fsSL https://get.docker.com | bash
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
     fi
 
-    mkdir -p "$APP_DIR"
+    read -p "请输入访问端口 [默认:8000]: " input_port
+    PORT=${input_port:-8000}
+    check_port "$PORT" || return
 
-    if [ ! -d "$APP_DIR/.git" ]; then
-        echo -e "${GREEN}克隆项目...${RESET}"
-        git clone "$REPO" "$APP_DIR"
-    fi
-
-    cd "$APP_DIR" || exit
-
-    echo
-    echo -e "${GREEN}生成配置文件...${RESET}"
-
-    read -p "请输入 JWT_SECRET (留空自动生成): " JWT_SECRET
-    read -p "请输入 ADMIN_PASSWORD (留空默认 admin123): " ADMIN_PASSWORD
-
-    [ -z "$JWT_SECRET" ] && JWT_SECRET=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 32)
-    [ -z "$ADMIN_PASSWORD" ] && ADMIN_PASSWORD="admin123"
-
-    cat > .env <<EOF
-SQLITE_PATH=/data/forwardx.db
-JWT_SECRET=$JWT_SECRET
-NODE_ENV=production
-PORT=3000
-ADMIN_PASSWORD=$ADMIN_PASSWORD
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  epusdt:
+    image: gmwallet/epusdt:latest
+    container_name: epusdt
+    restart: always
+    ports:
+      - "${PORT}:8000"
+    environment:
+      EPUSDT_CONFIG: /data/.env
+    volumes:
+      - ./data:/data
 EOF
 
-    echo -e "${GREEN}配置生成完成${RESET}"
-    echo -e "JWT_SECRET=$JWT_SECRET"
-    echo -e "ADMIN_PASSWORD=$ADMIN_PASSWORD"
-
-    echo -e "${GREEN}启动服务...${RESET}"
+    cd "$APP_DIR" || exit
     docker compose up -d
 
     SERVER_IP=$(get_public_ip)
 
     echo
-    echo -e "${GREEN}✅ ForwardX 已启动${RESET}"
-    echo -e "${YELLOW}访问: http://${SERVER_IP}:3000${RESET}"
-    echo -e "${YELLOW}账号: admin${RESET}"
-    echo -e "${YELLOW}密码: $ADMIN_PASSWORD${RESET}"
+    echo -e "${GREEN}✅ EPUSDT 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问: http://${SERVER_IP}:${PORT}${RESET}"
+    echo -e "${YELLOW}📂 数据目录: $APP_DIR${RESET}"
 
     read -p "按回车返回菜单..."
-    menu
 }
 
-function update_app() {
-
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-
-    echo -e "${GREEN}更新程序...${RESET}"
-
-    git pull
-
-    echo -e "${GREEN}重新构建镜像...${RESET}"
-    docker compose up -d --build
-
-    echo -e "${GREEN}✅ ForwardX 已更新并重启${RESET}"
-
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function restart_app() {
-
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
-
-    echo -e "${GREEN}正在重启...${RESET}"
-    docker compose restart
-
-    echo -e "${GREEN}✅ 已重启${RESET}"
-
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function view_logs() {
-
-    docker logs -f forwardx-panel
-
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function check_status() {
-
-    echo -e "${GREEN}容器状态：${RESET}"
-    docker ps | grep forwardx
-
-    read -p "按回车返回菜单..."
-    menu
-}
-
-function uninstall_app() {
-
+update_app() {
     cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ 更新完成${RESET}"
+    read -p "按回车返回菜单..."
+}
 
+restart_app() {
+    docker restart epusdt
+    echo -e "${GREEN}✅ 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    docker logs -f epusdt
+}
+
+check_status() {
+    docker ps | grep epusdt
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-
-    echo -e "${GREEN}✅ ForwardX 已卸载${RESET}"
-
+    echo -e "${RED}✅ 已彻底卸载${RESET}"
     read -p "按回车返回菜单..."
-    menu
 }
 
 menu

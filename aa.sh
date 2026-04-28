@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# jiguang-navigation 一键管理脚本
+# qbit-bot 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,11 +8,9 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="jiguang-navigation"
+APP_NAME="qbit-bot"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-
-REPO="https://github.com/sxt2204/jiguang-navigation.git"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -26,25 +24,10 @@ check_docker() {
     fi
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
-}
-
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== navigation 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== qbit-bot 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -72,59 +55,67 @@ install_app() {
     check_docker
     mkdir -p "$APP_DIR"
 
-    if [ -d "$APP_DIR/.git" ]; then
+    if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
         read confirm
         [[ "$confirm" != "y" ]] && return
-        rm -rf "$APP_DIR"
     fi
 
-    echo -e "${GREEN}克隆项目...${RESET}"
-    git clone "$REPO" "$APP_DIR"
+    echo -e "${GREEN}=== 配置 qbit-bot ===${RESET}"
+
+    read -p "请输入 qBittorrent 地址 [默认:http://127.0.0.1:8080]: " input_host
+    QB_HOST=${input_host:-http://127.0.0.1:8080}
+
+    read -p "请输入 qbit 用户名: " QB_USER
+    read -p "请输入 qbit 密码: " QB_PASS
+    read -p "请输入 Telegram Bot Token: " TG_TOKEN
+    read -p "请输入 Telegram 用户ID: " TG_USER_ID
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  qbit-bot:
+    image: gblaowang12138/my_qbit_bot:latest
+    container_name: my-qbit-bot
+    restart: unless-stopped
+    network_mode: "host"
+    environment:
+      QB_HOST: ${QB_HOST}
+      QB_USER: ${QB_USER}
+      QB_PASS: ${QB_PASS}
+      TG_TOKEN: ${TG_TOKEN}
+      TG_USER_ID: ${TG_USER_ID}
+EOF
 
     cd "$APP_DIR" || exit
-
-    echo -e "${GREEN}构建并启动服务...${RESET}"
-    docker compose up -d --build
-
-    SERVER_IP=$(get_public_ip)
+    docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://${SERVER_IP}:2266${RESET}"
-    echo -e "${YELLOW}🌐 账号/密码: admin/123456${RESET}"
+    echo -e "${GREEN}✅ qbit-bot 已启动${RESET}"
+    echo -e "${YELLOW}👉 请先给机器人发送 /start${RESET}"
 
     read -p "按回车返回菜单..."
 }
 
 update_app() {
     cd "$APP_DIR" || return
-
-    echo -e "${GREEN}更新程序...${RESET}"
-
-    git pull
-    docker compose up -d --build
-
+    docker compose pull
+    docker compose up -d
     echo -e "${GREEN}✅ 更新完成${RESET}"
-
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    cd "$APP_DIR" || return
-    docker compose restart
+    docker restart my-qbit-bot
     echo -e "${GREEN}✅ 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    cd "$APP_DIR" || return
-    docker compose logs -f
+    docker logs -f my-qbit-bot
 }
 
 check_status() {
-    cd "$APP_DIR" || return
-    docker compose ps
+    docker ps | grep qbit-bot
     read -p "按回车返回菜单..."
 }
 
@@ -132,7 +123,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已卸载${RESET}"
+    echo -e "${RED}✅ 已彻底卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

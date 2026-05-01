@@ -34,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== NodeGet 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== NodeGet(PostgreSQL) 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -61,7 +61,8 @@ install_app() {
 
     check_docker
 
-    mkdir -p "$APP_DIR/data/sqlite"
+    mkdir -p "$APP_DIR/data/postgres"
+    mkdir -p "$APP_DIR/data/config"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -82,34 +83,41 @@ install_app() {
         echo "$UUID" > "$UUID_FILE"
     fi
 
-    # 只在不存在时创建 config
-    if [ ! -f "$APP_DIR/data/config.toml" ]; then
-        cat > "$APP_DIR/data/config.toml" <<EOF
-[server]
-port = ${PORT}
-
-[log]
-level = "info"
-EOF
-    fi
-
     cat > "$COMPOSE_FILE" <<EOF
 services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: nodeget-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: nodeget
+      POSTGRES_USER: nodeget
+      POSTGRES_PASSWORD: nodeget
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nodeget -d nodeget"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   nodeget:
     image: genshinmc/nodeget:latest
     container_name: nodeget
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       NODEGET_CONFIG_FROM_ENV: "true"
       NODEGET_PORT: "${PORT}"
       NODEGET_SERVER_UUID: "${UUID}"
       NODEGET_LOG_FILTER: "info"
-      NODEGET_DATABASE_URL: "sqlite:///var/lib/nodeget/nodeget.db?mode=rwc"
+      NODEGET_DATABASE_URL: "postgres://nodeget:nodeget@postgres:5432/nodeget"
     ports:
-      - "127.0.0.1:${PORT}:${PORT}"
+      - "${PORT}:${PORT}"
     volumes:
-      - ./data/config.toml:/etc/nodeget/config.toml
-      - ./data/sqlite:/var/lib/nodeget
+      - ./data/config:/etc/nodeget
 EOF
 
     cd "$APP_DIR" || exit
@@ -117,18 +125,21 @@ EOF
 
     echo -e "${YELLOW}⏳ 等待系统初始化（获取 Token）...${RESET}"
 
-    # 循环等待日志出现
-    for i in {1..15}; do
-        LOGS=$(docker logs nodeget 2>&1)
+    timeout=60
+    elapsed=0
 
-        SUPERTOKEN=$(echo "$LOGS" | grep "Super Token:" | awk -F'Super Token: ' '{print $2}')
-        ROOTPASS=$(echo "$LOGS" | grep "Root Password:" | awk -F'Root Password: ' '{print $2}')
+    while [ $elapsed -lt $timeout ]; do
+        LOGS=$(docker logs nodeget --tail 50 2>&1)
+
+        SUPERTOKEN=$(echo "$LOGS" | grep -oP 'Super Token:\s*\K.*')
+        ROOTPASS=$(echo "$LOGS" | grep -oP 'Root Password:\s*\K.*')
 
         if [[ -n "$SUPERTOKEN" && -n "$ROOTPASS" ]]; then
             break
         fi
 
         sleep 2
+        elapsed=$((elapsed + 2))
     done
 
     echo
@@ -138,13 +149,13 @@ EOF
     echo -e "${YELLOW}🌐 主控地址: wss://127.0.0.1:${PORT}${RESET}"
 
     if [[ -n "$SUPERTOKEN" ]]; then
-        echo -e "${GREEN}🔑 SuperToken:${RESET} ${SUPERTOKEN}"
+        echo -e "${YELLOW}🔑 Token:${RESET} ${SUPERTOKEN}"
     else
-        echo -e "${RED}❌ 未获取到 SuperToken（可查看日志）${RESET}"
+        echo -e "${RED}❌ 未获取到Token（可查看日志）${RESET}"
     fi
 
     if [[ -n "$ROOTPASS" ]]; then
-        echo -e "${GREEN}🔐 Root密码:${RESET} ${ROOTPASS}"
+        echo -e "${YELLOW}🔐 Root密码:${RESET} ${ROOTPASS}"
     else
         echo -e "${RED}❌ 未获取到 Root密码${RESET}"
     fi
@@ -160,7 +171,7 @@ RootPassword:
 ${ROOTPASS}
 EOF
 
-    echo -e "${GREEN}📄 已保存到: $APP_DIR/token.txt${RESET}"
+    echo -e "${YELLOW}📄 已保存到: $APP_DIR/token.txt${RESET}"
 
     read -p "按回车返回菜单..."
 }

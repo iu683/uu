@@ -34,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== nodeget 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== NodeGet 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -61,7 +61,7 @@ install_app() {
 
     check_docker
 
-    mkdir -p "$APP_DIR/data"
+    mkdir -p "$APP_DIR/data/sqlite"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -73,16 +73,25 @@ install_app() {
     PORT=${input_port:-3000}
     check_port "$PORT" || return
 
-    UUID=$(cat /proc/sys/kernel/random/uuid)
+    UUID_FILE="$APP_DIR/uuid"
 
-    # 生成基础配置（避免空文件报错）
-    cat > "$APP_DIR/data/config.toml" <<EOF
+    if [ -f "$UUID_FILE" ]; then
+        UUID=$(cat "$UUID_FILE")
+    else
+        UUID=$(cat /proc/sys/kernel/random/uuid)
+        echo "$UUID" > "$UUID_FILE"
+    fi
+
+    # 只在不存在时创建 config
+    if [ ! -f "$APP_DIR/data/config.toml" ]; then
+        cat > "$APP_DIR/data/config.toml" <<EOF
 [server]
 port = ${PORT}
 
 [log]
 level = "info"
 EOF
+    fi
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
@@ -99,17 +108,59 @@ services:
     ports:
       - "127.0.0.1:${PORT}:${PORT}"
     volumes:
-      - ./data/config.toml:/etc/nodeget/config.toml
-      - ./data:/var/lib/nodeget
+      - ./data/config:/etc/nodeget
+      - ./data/sqlite:/var/lib/nodeget
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
+    echo -e "${YELLOW}⏳ 等待系统初始化（获取 Token）...${RESET}"
+
+    # 循环等待日志出现
+    for i in {1..15}; do
+        LOGS=$(docker logs nodeget 2>&1)
+
+        SUPERTOKEN=$(echo "$LOGS" | grep "Super Token:" | awk -F'Super Token: ' '{print $2}')
+        ROOTPASS=$(echo "$LOGS" | grep "Root Password:" | awk -F'Root Password: ' '{print $2}')
+
+        if [[ -n "$SUPERTOKEN" && -n "$ROOTPASS" ]]; then
+            break
+        fi
+
+        sleep 2
+    done
+
     echo
     echo -e "${GREEN}✅ nodeget 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🌐 UUID: ${UUID}${RESET}"
+    echo -e "${YELLOW}🆔 UUID: ${UUID}${RESET}"
+    echo -e "${YELLOW}🌐 主控地址: wss://127.0.0.1:${PORT}${RESET}"
+
+    if [[ -n "$SUPERTOKEN" ]]; then
+        echo -e "${GREEN}🔑 SuperToken:${RESET} ${SUPERTOKEN}"
+    else
+        echo -e "${RED}❌ 未获取到 SuperToken（可查看日志）${RESET}"
+    fi
+
+    if [[ -n "$ROOTPASS" ]]; then
+        echo -e "${GREEN}🔐 Root密码:${RESET} ${ROOTPASS}"
+    else
+        echo -e "${RED}❌ 未获取到 Root密码${RESET}"
+    fi
+
+    cat > "$APP_DIR/token.txt" <<EOF
+访问地址: http://127.0.0.1:${PORT}
+UUID: ${UUID}
+
+SuperToken:
+${SUPERTOKEN}
+
+RootPassword:
+${ROOTPASS}
+EOF
+
+    echo -e "${GREEN}📄 已保存到: $APP_DIR/token.txt${RESET}"
 
     read -p "按回车返回菜单..."
 }

@@ -1,150 +1,148 @@
-#!/usr/bin/env bash
-# ==========================================
-# Remnawave 一键管理脚本
-# ==========================================
+#!/bin/bash
+# ========================================
+# nodeget 一键管理脚本
+# ========================================
 
-set -uo pipefail
-
-INSTALL_DIR="/opt/remnawave"
-
-GREEN="\033[1;32m"
-YELLOW="\033[1;33m"
-RED="\033[1;31m"
-CYAN="\033[1;36m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-info() { echo -e "${GREEN}[INFO]${RESET} $*"; }
-warn() { echo -e "${YELLOW}[WARN]${RESET} $*"; }
-err()  { echo -e "${RED}[ERR ]${RESET} $*"; }
+APP_NAME="nodeget"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-pause() { read -rp "$(echo -e ${CYAN}按回车继续...${RESET})"; }
-
-# ==============================
-# 安装
-# ==============================
-install_remnawave() {
-
-    if [[ -d "$INSTALL_DIR" ]]; then
-        warn "检测到已安装，跳过安装"
-        return
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
     fi
 
-    info "开始安装 Remnawave..."
-
-    
-    bash <(curl -sL https://raw.githubusercontent.com/iu683/uu/main/aa.sh)
-
-
-    info "安装完成"
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
+    fi
 }
 
-# ==============================
-# 启动
-# ==============================
-start_service() {
-    cd "$INSTALL_DIR" || { err "未安装"; return; }
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
+
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== nodeget 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+install_app() {
+
+    check_docker
+
+    mkdir -p "$APP_DIR/data"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
+
+    read -p "请输入访问端口 [默认:3000]: " input_port
+    PORT=${input_port:-3000}
+    check_port "$PORT" || return
+
+    UUID=$(cat /proc/sys/kernel/random/uuid)
+
+    # 生成基础配置（避免空文件报错）
+    cat > "$APP_DIR/data/config.toml" <<EOF
+[server]
+port = ${PORT}
+
+[log]
+level = "info"
+EOF
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  nodeget:
+    image: genshinmc/nodeget:latest
+    container_name: nodeget
+    restart: unless-stopped
+    environment:
+      NODEGET_CONFIG_FROM_ENV: "true"
+      NODEGET_PORT: "${PORT}"
+      NODEGET_SERVER_UUID: "${UUID}"
+      NODEGET_LOG_FILTER: "info"
+      NODEGET_DATABASE_URL: "sqlite:///var/lib/nodeget/nodeget.db?mode=rwc"
+    ports:
+      - "127.0.0.1:${PORT}:${PORT}"
+    volumes:
+      - ./data/config.toml:/etc/nodeget/config.toml
+      - ./data:/var/lib/nodeget
+EOF
+
+    cd "$APP_DIR" || exit
     docker compose up -d
-    info "已启动"
+
+    echo
+    echo -e "${GREEN}✅ nodeget 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${YELLOW}🌐 UUID: ${UUID}${RESET}"
+
+    read -p "按回车返回菜单..."
 }
 
-# ==============================
-# 停止
-# ==============================
-stop_service() {
-    cd "$INSTALL_DIR" || { err "未安装"; return; }
-    docker compose down
-    info "已停止"
-}
-
-# ==============================
-# 重启
-# ==============================
-restart_service() {
-    cd "$INSTALL_DIR" || { err "未安装"; return; }
-    docker compose restart
-    info "已重启"
-}
-
-# ==============================
-# 日志
-# ==============================
-logs_service() {
-    cd "$INSTALL_DIR" || { err "未安装"; return; }
-    docker compose logs -f
-}
-
-# ==============================
-# 状态
-# ==============================
-status_service() {
-    cd "$INSTALL_DIR" || { err "未安装"; return; }
-    docker compose ps
-}
-
-# ==============================
-# 更新
-# ==============================
-update_service() {
-    cd "$INSTALL_DIR" || { err "未安装"; return; }
+update_app() {
+    cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    info "更新完成"
+    echo -e "${GREEN}✅ 更新完成${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-# ==============================
-# 卸载
-# ==============================
-uninstall_remnawave() {
-
-    warn "将删除所有数据！"
-    read -rp "确认卸载？(y/N): " confirm
-
-    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
-
-    cd "$INSTALL_DIR" 2>/dev/null && docker compose down -v
-
-    rm -rf "$INSTALL_DIR"
-    rm -f /etc/nginx/sites-enabled/remnawave.conf
-    rm -f /etc/nginx/sites-available/remnawave.conf
-
-    systemctl restart nginx 2>/dev/null
-
-    info "已彻底卸载"
+restart_app() {
+    docker restart nodeget
+    echo -e "${GREEN}✅ 已重启${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-# ==============================
-# 菜单
-# ==============================
-menu() {
-    clear
-    echo -e "${GREEN}===Remnawave 管理菜单===${RESET}"
-    echo -e "${CYAN}1.安装${RESET}"
-    echo -e "${CYAN}2.启动${RESET}"
-    echo -e "${CYAN}3.停止${RESET}"
-    echo -e "${CYAN}4.重启${RESET}"
-    echo -e "${CYAN}5.日志${RESET}"
-    echo -e "${CYAN}6.状态${RESET}"
-    echo -e "${CYAN}7.更新${RESET}"
-    echo -e "${CYAN}8.卸载${RESET}"
-    echo -e "${CYAN}0.退出${RESET}"
+view_logs() {
+    docker logs -f nodeget
 }
 
-while true; do
-    menu
-    read -rp "$(echo -e ${CYAN}请选择操作: ${RESET})" num
+check_status() {
+    docker ps | grep nodeget
+    read -p "按回车返回菜单..."
+}
 
-    case "$num" in
-        1) install_remnawave ;;
-        2) start_service ;;
-        3) stop_service ;;
-        4) restart_service ;;
-        5) logs_service ;;
-        6) status_service ;;
-        7) update_service ;;
-        8) uninstall_remnawave ;;
-        0) exit 0 ;;
-        *) warn "无效选项" ;;
-    esac
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ 已彻底卸载${RESET}"
+    read -p "按回车返回菜单..."
+}
 
-    pause
-done
+menu

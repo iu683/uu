@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# EPUSDT 一键管理脚本
+# nodeget 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="epusdt"
+APP_NAME="nodeget"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -31,25 +31,10 @@ check_port() {
     fi
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
-}
-
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== EPUSDT 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== nodeget 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -75,6 +60,7 @@ menu() {
 install_app() {
 
     check_docker
+
     mkdir -p "$APP_DIR/data"
 
     if [ -f "$COMPOSE_FILE" ]; then
@@ -83,33 +69,39 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:8000]: " input_port
-    PORT=${input_port:-8000}
+    read -p "请输入访问端口 [默认:3000]: " input_port
+    PORT=${input_port:-3000}
     check_port "$PORT" || return
+
+    UUID=$(cat /proc/sys/kernel/random/uuid)
+
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  epusdt:
-    image: gmwallet/epusdt:latest
-    container_name: epusdt
-    restart: always
-    ports:
-      - "${PORT}:8000"
+  nodeget:
+    image: genshinmc/nodeget:latest
+    container_name: nodeget
+    restart: unless-stopped
     environment:
-      EPUSDT_CONFIG: /data/.env
+      NODEGET_CONFIG_FROM_ENV: "true"
+      NODEGET_PORT: "${PORT}"
+      NODEGET_SERVER_UUID: "${UUID}"
+      NODEGET_LOG_FILTER: "info"
+      NODEGET_DATABASE_URL: "sqlite:///var/lib/nodeget/nodeget.db?mode=rwc"
+    ports:
+      - "127.0.0.1:${PORT}:${PORT}"
     volumes:
-      - ./data:/data
+      - ./data/config.toml:/etc/nodeget/config.toml
+      - ./data:/var/lib/nodeget
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    SERVER_IP=$(get_public_ip)
-
     echo
-    echo -e "${GREEN}✅ EPUSDT 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问: http://${SERVER_IP}:${PORT}${RESET}"
-    echo -e "${YELLOW}📂 数据目录: $APP_DIR${RESET}"
+    echo -e "${GREEN}✅ nodeget 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${YELLOW}🌐 UUID: ${UUID}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -123,17 +115,17 @@ update_app() {
 }
 
 restart_app() {
-    docker restart epusdt
+    docker restart nodeget
     echo -e "${GREEN}✅ 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f epusdt
+    docker logs -f nodeget
 }
 
 check_status() {
-    docker ps | grep epusdt
+    docker ps | grep nodeget
     read -p "按回车返回菜单..."
 }
 

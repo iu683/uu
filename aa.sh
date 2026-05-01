@@ -1,151 +1,85 @@
 #!/bin/bash
 
-# 定义颜色
-re="\033[0m"
-red="\033[1;91m"
-green="\e[1;32m"
-yellow="\e[1;33m"
-purple="\e[1;35m"
-skyblue="\e[1;36m"
-red() { echo -e "\e[1;91m$1\033[0m"; }
-green() { echo -e "\e[1;32m$1\033[0m"; }
-yellow() { echo -e "\e[1;33m$1\033[0m"; }
-purple() { echo -e "\e[1;35m$1\033[0m"; }
-skyblue() { echo -e "\e[1;36m$1\033[0m"; }
-reading() { read -p "$(red "$1")" "$2"; }
+# ==============================================================================
+#VLESS-Reality 一键安装管理脚本
+# ==============================================================================
 
-# 定义常量
-server_name="xray"
-work_dir="/etc/xray"
-config_dir="${work_dir}/config.json"
-client_dir="${work_dir}/url.txt"
-outbound_env_file="${work_dir}/outbound.env"
-# 定义环境变量
-export UUID=${UUID:-$(cat /proc/sys/kernel/random/uuid)}
-export PORT=${PORT:-$(shuf -i 1000-60000 -n 1)}
-export ARGO_PORT=${ARGO_PORT:-'8080'}
-export CFIP=${CFIP:-'ip.sb'} 
-export CFPORT=${CFPORT:-'443'}
-export OUTBOUND_MODE=${OUTBOUND_MODE:-'direct'}
-export SOCKS5_HOST=${SOCKS5_HOST:-''}
-export SOCKS5_PORT=${SOCKS5_PORT:-'1080'}
-export SOCKS5_USER=${SOCKS5_USER:-''}
-export SOCKS5_PASS=${SOCKS5_PASS:-''}
+# --- Shell 严格模式 ---
+set -euo pipefail
 
-# 检查是否为root下运行
-[[ $EUID -ne 0 ]] && red "请在root用户下运行脚本" && exit 1
+# --- 全局常量 ---
+readonly SCRIPT_VERSION="V-Final-2.2"
+readonly xray_config_path="/usr/local/etc/xray/config.json"
+readonly xray_binary_path="/usr/local/bin/xray"
+readonly xray_install_script_url="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
+readonly xray_outbound_env_path="/usr/local/etc/xray/outbound.env"
+# --- 颜色定义 ---
+readonly red='\e[91m' green='\e[92m' yellow='\e[93m'
+readonly magenta='\e[95m' cyan='\e[96m' none='\e[0m'
 
-# 检查 xray 是否已安装
-check_xray() {
-if [ -f "${work_dir}/${server_name}" ]; then
-    if [ -f /etc/alpine-release ]; then
-        rc-service xray status | grep -q "started" && green "running" && return 0 || yellow "not running" && return 1
-    else 
-        [ "$(systemctl is-active xray)" = "active" ] && green "running" && return 0 || yellow "not running" && return 1
+# --- 全局变量 ---
+xray_status_info=""
+is_quiet=false
+OUTBOUND_MODE="direct"
+SOCKS5_HOST=""
+SOCKS5_PORT="1080"
+SOCKS5_USER=""
+SOCKS5_PASS=""
+
+# --- 辅助函数 ---
+error() { echo -e "\n$red[✖] $1$none\n" >&2; }
+info() { [[ "$is_quiet" = false ]] && echo -e "\n$yellow[!] $1$none\n"; }
+success() { [[ "$is_quiet" = false ]] && echo -e "\n$green[✔] $1$none\n"; }
+
+spinner() {
+    local pid=$1; local spinstr='|/-\'
+    if [[ "$is_quiet" = true ]]; then
+        wait "$pid"
+        return
     fi
-else
-    red "not installed"
-    return 2
-fi
+    while ps -p "$pid" > /dev/null; do
+        local temp=${spinstr#?}
+        printf " [%c]  " "$spinstr"
+        local spinstr=$temp${spinstr%"$temp"}
+        sleep 0.1
+        printf "\r"
+    done
+    printf "    \r"
 }
 
-# 检查 argo 是否已安装
-check_argo() {
-if [ -f "${work_dir}/argo" ]; then
-    if [ -f /etc/alpine-release ]; then
-        rc-service tunnel status | grep -q "started" && green "running" && return 0 || yellow "not running" && return 1
-    else 
-        [ "$(systemctl is-active tunnel)" = "active" ] && green "running" && return 0 || yellow "not running" && return 1
-    fi
-else
-    red "not installed"
-    return 2
-fi
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    error "无法获取公网 IP 地址。" && return 1
 }
 
+execute_official_script() {
+    local args="$1"
 
-#根据系统类型安装、卸载依赖
-manage_packages() {
-    if [ $# -lt 2 ]; then
-        red "Unspecified package name or action" 
+    bash <(curl -L "$xray_install_script_url") $args &> /dev/null &
+    spinner $!
+
+    if ! wait $!; then
         return 1
     fi
-
-    action=$1
-    shift
-
-    for package in "$@"; do
-        if [ "$action" == "install" ]; then
-            if command -v "$package" &>/dev/null; then
-                green "${package} already installed"
-                continue
-            fi
-            yellow "正在安装 ${package}..."
-            if command -v apt &>/dev/null; then
-                DEBIAN_FRONTEND=noninteractive apt install -y "$package"
-            elif command -v dnf &>/dev/null; then
-                dnf install -y "$package"
-            elif command -v yum &>/dev/null; then
-                yum install -y "$package"
-            elif command -v apk &>/dev/null; then
-                apk update
-                apk add "$package"
-            else
-                red "Unknown system!"
-                return 1
-            fi
-        elif [ "$action" == "uninstall" ]; then
-            if ! command -v "$package" &>/dev/null; then
-                yellow "${package} is not installed"
-                continue
-            fi
-            yellow "正在卸载 ${package}..."
-            if command -v apt &>/dev/null; then
-                apt remove -y "$package" && apt autoremove -y
-            elif command -v dnf &>/dev/null; then
-                dnf remove -y "$package" && dnf autoremove -y
-            elif command -v yum &>/dev/null; then
-                yum remove -y "$package" && yum autoremove -y
-            elif command -v apk &>/dev/null; then
-                apk del "$package"
-            else
-                red "Unknown system!"
-                return 1
-            fi
-        else
-            red "Unknown action: $action"
-            return 1
-        fi
-    done
-
-    return 0
 }
-
-# 获取ip
-get_realip() {
-  ip=$(curl -s --max-time 2 ipv4.ip.sb)
-  if [ -z "$ip" ]; then
-      ipv6=$(curl -s --max-time 2 ipv6.ip.sb)
-      echo "[$ipv6]"
-  else
-      if echo "$(curl -s http://ipinfo.io/org)" | grep -qE 'Cloudflare|UnReal|AEZA|Andrei'; then
-          ipv6=$(curl -s --max-time 2 ipv6.ip.sb)
-          echo "[$ipv6]"
-      else
-          echo "$ip"
-      fi
-  fi
-}
-
-HOSTNAME=$(hostname -s | sed 's/ /_/g')
 
 load_outbound_env() {
-    [ -f "$outbound_env_file" ] && source "$outbound_env_file"
+    [[ -f "$xray_outbound_env_path" ]] && source "$xray_outbound_env_path"
 }
 
 save_outbound_env() {
-    mkdir -p "$work_dir"
-    cat > "$outbound_env_file" <<EOF
+    mkdir -p "$(dirname "$xray_outbound_env_path")"
+    cat > "$xray_outbound_env_path" <<EOF
 OUTBOUND_MODE='$OUTBOUND_MODE'
 SOCKS5_HOST='$SOCKS5_HOST'
 SOCKS5_PORT='$SOCKS5_PORT'
@@ -154,154 +88,614 @@ SOCKS5_PASS='$SOCKS5_PASS'
 EOF
 }
 
-load_outbound_env
-
 build_outbounds_json() {
-    if [ "$OUTBOUND_MODE" = "socks5" ]; then
-        if [ -z "$SOCKS5_HOST" ]; then
-            red "OUTBOUND_MODE=socks5 时必须设置 SOCKS5_HOST"
-            exit 1
-        fi
-
-        if [ -n "$SOCKS5_USER" ] || [ -n "$SOCKS5_PASS" ]; then
-            cat <<EOF
-[
-  {
-    "protocol": "socks",
-    "tag": "proxy",
-    "settings": {
-      "servers": [
-        {
-          "address": "$SOCKS5_HOST",
-          "port": $SOCKS5_PORT,
-          "users": [
-            {
-              "user": "$SOCKS5_USER",
-              "pass": "$SOCKS5_PASS"
-            }
-          ]
-        }
-      ]
-    }
-  },
-  {
-    "protocol": "freedom",
-    "tag": "direct"
-  }
-]
-EOF
+    if [[ "$OUTBOUND_MODE" == "socks5" ]]; then
+        if [[ -n "$SOCKS5_USER" || -n "$SOCKS5_PASS" ]]; then
+            jq -n \
+                --arg host "$SOCKS5_HOST" \
+                --argjson port "$SOCKS5_PORT" \
+                --arg user "$SOCKS5_USER" \
+                --arg pass "$SOCKS5_PASS" \
+                '[
+                    {
+                        "protocol": "socks",
+                        "settings": {
+                            "servers": [
+                                {
+                                    "address": $host,
+                                    "port": $port,
+                                    "users": [
+                                        {
+                                            "user": $user,
+                                            "pass": $pass
+                                        }
+                                    ]
+                                }
+                            ]
+                        },
+                        "tag": "proxy"
+                    },
+                    {
+                        "protocol": "freedom",
+                        "settings": {
+                            "domainStrategy": "UseIPv4v6"
+                        },
+                        "tag": "direct"
+                    }
+                ]'
         else
-            cat <<EOF
-[
-  {
-    "protocol": "socks",
-    "tag": "proxy",
-    "settings": {
-      "servers": [
-        {
-          "address": "$SOCKS5_HOST",
-          "port": $SOCKS5_PORT
-        }
-      ]
-    }
-  },
-  {
-    "protocol": "freedom",
-    "tag": "direct"
-  }
-]
-EOF
+            jq -n \
+                --arg host "$SOCKS5_HOST" \
+                --argjson port "$SOCKS5_PORT" \
+                '[
+                    {
+                        "protocol": "socks",
+                        "settings": {
+                            "servers": [
+                                {
+                                    "address": $host,
+                                    "port": $port
+                                }
+                            ]
+                        },
+                        "tag": "proxy"
+                    },
+                    {
+                        "protocol": "freedom",
+                        "settings": {
+                            "domainStrategy": "UseIPv4v6"
+                        },
+                        "tag": "direct"
+                    }
+                ]'
         fi
     else
-        cat <<EOF
-[
-  {
-    "protocol": "freedom",
-    "tag": "direct"
-  }
-]
-EOF
+        jq -n '[
+            {
+                "protocol": "freedom",
+                "settings": {
+                    "domainStrategy": "UseIPv4v6"
+                },
+                "tag": "direct"
+            }
+        ]'
     fi
 }
 
 build_routing_json() {
-    if [ "$OUTBOUND_MODE" = "socks5" ]; then
-        cat <<EOF
-,
-  "routing": {
-    "domainStrategy": "AsIs",
-    "rules": [
-      {
-        "type": "field",
-        "network": "tcp,udp",
-        "outboundTag": "proxy"
-      }
-    ]
-  }
-EOF
+    if [[ "$OUTBOUND_MODE" == "socks5" ]]; then
+        jq -n '{
+            "domainStrategy": "AsIs",
+            "rules": [
+                {
+                    "type": "field",
+                    "network": "tcp,udp",
+                    "outboundTag": "proxy"
+                }
+            ]
+        }'
+    else
+        echo 'null'
     fi
 }
 
-rebuild_xray_config() {
-    if [ ! -d "$work_dir" ]; then
-        red "Xray 尚未安装"
+# --- 改进的验证函数 ---
+is_valid_port() {
+    local port=$1
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
+# 新增：检查端口是否被占用
+is_port_in_use() {
+    local port=$1
+    # 使用多种方法检查端口占用
+    if command -v ss &>/dev/null; then
+        ss -tuln 2>/dev/null | grep -q ":$port "
+    elif command -v netstat &>/dev/null; then
+        netstat -tuln 2>/dev/null | grep -q ":$port "
+    elif command -v lsof &>/dev/null; then
+        lsof -i ":$port" &>/dev/null
+    else
+        # 如果没有可用工具，尝试连接测试
+        timeout 1 bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null
+    fi
+}
+
+# 增强的UUID验证函数
+is_valid_uuid() {
+    local uuid=$1
+    # 标准UUID格式验证：8-4-4-4-12 位十六进制数字
+    [[ "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+}
+
+is_valid_domain() {
+    local domain=$1
+    [[ "$domain" =~ ^[a-zA-Z0-9-]{1,63}(\.[a-zA-Z0-9-]{1,63})+$ ]] && [[ "$domain" != *--* ]]
+}
+
+# --- 改进的系统兼容性检查 ---
+check_system_compatibility() {
+    local os_release_file="/etc/os-release"
+    local debian_version_file="/etc/debian_version"
+    local lsb_release_file="/etc/lsb-release"
+    
+    # 检查是否为Linux系统
+    if [[ "$(uname -s)" != "Linux" ]]; then
+        error "错误: 此脚本仅支持 Linux 系统。"
         return 1
     fi
+    
+    # 支持的发行版列表
+    local supported_distros=("ubuntu" "debian" "kali" "raspbian" "deepin" "mint" "elementary")
+    local distro_detected=false
+    local distro_name=""
+    local distro_version=""
+    
+    # 方法1: 检查 /etc/os-release (最标准的方法)
+    if [[ -f "$os_release_file" ]]; then
+        source "$os_release_file"
+        distro_name=$(echo "$ID" | tr '[:upper:]' '[:lower:]')
+        distro_version="$VERSION_ID"
+        
+        # 检查是否为支持的发行版
+        for supported in "${supported_distros[@]}"; do
+            if [[ "$distro_name" == "$supported" ]]; then
+                distro_detected=true
+                break
+            fi
+        done
+        
+        # 检查基于Debian的发行版
+        if [[ "$distro_detected" == false && "$ID_LIKE" =~ debian|ubuntu ]]; then
+            distro_detected=true
+            distro_name="$ID_LIKE"
+        fi
+    fi
+    
+    # 方法2: 检查 /etc/debian_version (Debian系特有)
+    if [[ "$distro_detected" == false && -f "$debian_version_file" ]]; then
+        distro_detected=true
+        distro_name="debian-based"
+        distro_version=$(cat "$debian_version_file" 2>/dev/null || echo "unknown")
+    fi
+    
+    # 方法3: 检查 /etc/lsb-release (备用方法)
+    if [[ "$distro_detected" == false && -f "$lsb_release_file" ]]; then
+        source "$lsb_release_file"
+        local lsb_id=$(echo "$DISTRIB_ID" | tr '[:upper:]' '[:lower:]')
+        for supported in "${supported_distros[@]}"; do
+            if [[ "$lsb_id" == "$supported" ]]; then
+                distro_detected=true
+                distro_name="$lsb_id"
+                distro_version="$DISTRIB_RELEASE"
+                break
+            fi
+        done
+    fi
+    
+    # 方法4: 检查包管理器 (最后的检查)
+    if [[ "$distro_detected" == false ]]; then
+        if command -v apt &>/dev/null && command -v dpkg &>/dev/null; then
+            distro_detected=true
+            distro_name="debian-compatible"
+            info "检测到基于APT的包管理系统，假定为Debian兼容系统。"
+        fi
+    fi
+    
+    if [[ "$distro_detected" == false ]]; then
+        error "错误: 未检测到支持的Linux发行版。"
+        error "支持的系统: Ubuntu, Debian, Kali Linux, Raspbian, Deepin, Linux Mint, elementary OS"
+        error "当前系统信息: $(uname -a)"
+        return 1
+    fi
+    
+    # 输出检测结果
+    if [[ "$is_quiet" == false ]]; then
+        info "系统兼容性检查通过"
+        info "检测到系统: ${distro_name} ${distro_version}"
+    fi
+    
+    # 检查关键命令是否存在
+    local required_commands=("systemctl" "awk" "grep" "sed")
+    local missing_commands=()
+    
+    for cmd in "${required_commands[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing_commands+=("$cmd")
+        fi
+    done
+    
+    if [[ ${#missing_commands[@]} -gt 0 ]]; then
+        error "错误: 缺少必要的系统命令: ${missing_commands[*]}"
+        error "请确保系统完整安装后再运行此脚本。"
+        return 1
+    fi
+    
+    return 0
+}
 
+# --- 预检查与环境设置 ---
+pre_check() {
+    [[ $(id -u) != 0 ]] && error "错误: 您必须以root用户身份运行此脚本" && exit 1
+    
+    # 使用改进的系统兼容性检查
+    if ! check_system_compatibility; then
+        exit 1
+    fi
+
+    if ! command -v jq &>/dev/null || ! command -v curl &>/dev/null; then
+        info "检测到缺失的依赖 (jq/curl)，正在尝试自动安装..."
+        (DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y jq curl) &> /dev/null &
+        spinner $!
+        if ! command -v jq &>/dev/null || ! command -v curl &>/dev/null; then
+            error "依赖 (jq/curl) 自动安装失败。请手动运行 'apt update && apt install -y jq curl' 后重试。"
+            exit 1
+        fi
+        success "依赖已成功安装。"
+    fi
+}
+
+check_xray_status() {
+    if [[ ! -f "$xray_binary_path" ]]; then xray_status_info="  Xray 状态: ${red}未安装${none}"; return; fi
+    load_outbound_env
+    local xray_version=$($xray_binary_path version 2>/dev/null | head -n 1 | awk '{print $2}' || echo "未知")
+    local service_status
+    local outbound_info
+    if [[ "$OUTBOUND_MODE" == "socks5" ]]; then
+        outbound_info=" | 出口: ${cyan}SOCKS5 ${SOCKS5_HOST}:${SOCKS5_PORT}${none}"
+    else
+        outbound_info=" | 出口: ${cyan}直连${none}"
+    fi
+    if systemctl is-active --quiet xray 2>/dev/null; then service_status="${green}运行中${none}"; else service_status="${yellow}未运行${none}"; fi
+    xray_status_info="  Xray 状态: ${green}已安装${none} | ${service_status}${none}${outbound_info}"
+}
+
+# --- 菜单功能函数 ---
+install_xray() {
+    if [[ -f "$xray_binary_path" ]]; then
+        info "检测到 Xray 已安装。继续操作将覆盖现有配置。"
+        read -p "是否继续？[y/N]: " confirm
+        if [[ ! $confirm =~ ^[yY]$ ]]; then info "操作已取消。"; return; fi
+    fi
+    info "开始配置 Xray VLESS-Reality..."
+    local port uuid domain
+
+    while true; do
+        read -p "$(echo -e "请输入端口 [1-65535] (默认: ${cyan}443${none}): ")" port
+        [ -z "$port" ] && port=443
+        if ! is_valid_port "$port"; then
+            error "端口无效，请输入一个1-65535之间的数字。"
+            continue
+        fi
+        if is_port_in_use "$port"; then
+            error "端口 $port 已被占用，请选择其他端口。"
+            continue
+        fi
+        break
+    done
+
+    while true; do
+        read -p "$(echo -e "请输入UUID (留空将默认生成随机UUID): ")" uuid
+        if [[ -z "$uuid" ]]; then 
+            uuid=$(cat /proc/sys/kernel/random/uuid)
+            info "已为您生成随机UUID: ${cyan}${uuid}${none}"
+            break
+        elif is_valid_uuid "$uuid"; then
+            break
+        else
+            error "UUID格式无效，请输入标准UUID格式 (如: 550e8400-e29b-41d4-a716-446655440000) 或留空自动生成。"
+        fi
+    done
+
+    while true; do
+        read -p "$(echo -e "请输入SNI域名 (默认: ${cyan}www.amazon.com${none}): ")" domain
+        [ -z "$domain" ] && domain="www.amazon.com"
+        if is_valid_domain "$domain"; then break; else error "域名格式无效，请重新输入。"; fi
+    done
+
+    run_install "$port" "$uuid" "$domain"
+}
+
+update_xray() {
+    if [[ ! -f "$xray_binary_path" ]]; then error "错误: Xray 未安装，无法执行更新。请先选择安装选项。" && return; fi
+    info "正在检查最新版本..."
+    local current_version=$($xray_binary_path version | head -n 1 | awk '{print $2}')
+    local latest_version=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r '.tag_name' | sed 's/v//' || echo "")
+    if [[ -z "$latest_version" ]]; then error "获取最新版本号失败，请检查网络或稍后再试。" && return; fi
+    info "当前版本: ${cyan}${current_version}${none}，最新版本: ${cyan}${latest_version}${none}"
+    if [[ "$current_version" == "$latest_version" ]]; then success "您的 Xray 已是最新版本，无需更新。" && return; fi
+    
+    info "发现新版本，开始更新..."
+    if ! execute_official_script "install"; then error "Xray 核心更新失败！" && return; fi
+    info "正在更新 GeoIP 和 GeoSite 数据文件..."
+    execute_official_script "install-geodata"
+
+    if ! restart_xray; then return; fi
+    success "Xray 更新成功！"
+}
+
+restart_xray() {
+    if [[ ! -f "$xray_binary_path" ]]; then error "错误: Xray 未安装，无法重启。" && return 1; fi
+    info "正在重启 Xray 服务..."
+    if ! systemctl restart xray; then
+        error "错误: Xray 服务重启失败, 请使用菜单 5 查看日志检查具体原因。"
+        return 1
+    fi
+    sleep 1
+    if ! systemctl is-active --quiet xray; then
+        error "错误: Xray 服务启动失败, 请使用菜单 5 查看日志检查具体原因。"
+        return 1
+    fi
+    success "Xray 服务已成功重启！"
+}
+
+uninstall_xray() {
+    if [[ ! -f "$xray_binary_path" ]]; then error "错误: Xray 未安装，无需卸载。" && return; fi
+    read -p "您确定要卸载 Xray 吗？这将删除所有相关文件。[Y/n]: " confirm
+    if [[ "$confirm" =~ ^[nN]$ ]]; then
+        info "卸载操作已取消。"
+        return
+    fi
+    info "正在卸载 Xray..."
+    if execute_official_script "remove --purge"; then
+        rm -f ~/xray_vless_reality_link.txt
+        success "Xray 已成功卸载。"
+    else
+        error "Xray 卸载失败！"
+        return 1
+    fi
+}
+
+view_xray_log() {
+    if [[ ! -f "$xray_binary_path" ]]; then error "错误: Xray 未安装，无法查看日志。" && return; fi
+    info "正在显示 Xray 实时日志... 按 Ctrl+C 退出。"
+    journalctl -u xray -f --no-pager
+}
+
+modify_config() {
+    if [[ ! -f "$xray_config_path" ]]; then error "错误: Xray 未安装，无法修改配置。" && return; fi
+    info "读取当前配置..."
+    local current_port=$(jq -r '.inbounds[0].port' "$xray_config_path")
+    local current_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
+    local current_domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$xray_config_path")
+    local private_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$xray_config_path")
+    local public_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.publicKey' "$xray_config_path")
+    local shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$xray_config_path")
+
+    info "请输入新配置，直接回车则保留当前值。"
+    local port uuid domain
+    
+    while true; do
+        read -p "$(echo -e "端口 (当前: ${cyan}${current_port}${none}): ")" port
+        [ -z "$port" ] && port=$current_port
+        if ! is_valid_port "$port"; then
+            error "端口无效，请输入一个1-65535之间的数字。"
+            continue
+        fi
+        # 如果端口没有变化，跳过占用检查
+        if [[ "$port" != "$current_port" ]] && is_port_in_use "$port"; then
+            error "端口 $port 已被占用，请选择其他端口。"
+            continue
+        fi
+        break
+    done
+    
+    while true; do
+        read -p "$(echo -e "UUID (当前: ${cyan}${current_uuid}${none}): ")" uuid
+        [ -z "$uuid" ] && uuid=$current_uuid
+        if is_valid_uuid "$uuid"; then
+            break
+        else
+            error "UUID格式无效，请输入标准UUID格式。"
+        fi
+    done
+    
+    while true; do
+        read -p "$(echo -e "SNI域名 (当前: ${cyan}${current_domain}${none}): ")" domain
+        [ -z "$domain" ] && domain=$current_domain
+        if is_valid_domain "$domain"; then break; else error "域名格式无效，请重新输入。"; fi
+    done
+
+    write_config "$port" "$uuid" "$domain" "$private_key" "$public_key" "$shortid"
+    if ! restart_xray; then return; fi
+
+    success "配置修改成功！"
+    view_subscription_info
+}
+
+view_subscription_info() {
+    if [ ! -f "$xray_config_path" ]; then error "错误: 配置文件不存在, 请先安装。" && return; fi
+    load_outbound_env
+    
+    local ip
+    if ! ip=$(get_public_ip); then return 1; fi
+
+    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
+    local port=$(jq -r '.inbounds[0].port' "$xray_config_path")
+    local domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$xray_config_path")
+    local public_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.publicKey' "$xray_config_path")
+    local shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$xray_config_path")
+    if [[ -z "$public_key" ]]; then error "配置文件中缺少公钥信息,可能是旧版配置,请重新安装以修复。" && return; fi
+
+    local display_ip=$ip && [[ $ip =~ ":" ]] && display_ip="[$ip]"
+    local link_name="$(hostname) X-reality"
+    local link_name_encoded=$(echo "$link_name" | sed 's/ /%20/g')
+    local vless_url="vless://${uuid}@${display_ip}:${port}?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=${domain}&fp=chrome&pbk=${public_key}&sid=${shortid}#${link_name_encoded}"
+
+    if [[ "$is_quiet" = true ]]; then
+        echo "${vless_url}"
+    else
+        echo "${vless_url}" > ~/xray_vless_reality_link.txt
+        echo "----------------------------------------------------------------"
+        echo -e "$green --- Xray VLESS-Reality 订阅信息 --- $none"
+        echo -e "$yellow 名称: $cyan$link_name$none"
+        echo -e "$yellow 地址: $cyan$ip$none"
+        echo -e "$yellow 端口: $cyan$port$none"
+        echo -e "$yellow UUID: $cyan$uuid$none"
+        echo -e "$yellow 流控: $cyan"xtls-rprx-vision"$none"
+        echo -e "$yellow 指纹: $cyan"chrome"$none"
+        echo -e "$yellow SNI: $cyan$domain$none"
+        echo -e "$yellow 公钥: $cyan$public_key$none"
+        echo -e "$yellow ShortId: $cyan$shortid$none"
+        if [[ "$OUTBOUND_MODE" == "socks5" ]]; then
+            echo -e "$yellow 出口: $cyanSOCKS5 ${SOCKS5_HOST}:${SOCKS5_PORT}$none"
+        else
+            echo -e "$yellow 出口: $cyan直连$none"
+        fi
+        echo "----------------------------------------------------------------"
+        echo -e "$yellow V6VPS替换IP地址为V6$none"
+        echo -e "$green 订阅链接 (已保存到 ~/xray_vless_reality_link.txt): $none\n"; echo -e "$cyan${vless_url}${none}"
+        echo "----------------------------------------------------------------"
+    fi
+}
+
+# --- 核心逻辑函数 ---
+write_config() {
+    local port=$1 uuid=$2 domain=$3 private_key=$4 public_key=$5 shortid=${6:-}
+
+    if [[ -z "$shortid" ]]; then
+        shortid=$(openssl rand -hex 8)
+    fi
+
+    local outbounds_json routing_json
     outbounds_json=$(build_outbounds_json)
     routing_json=$(build_routing_json)
 
-    cat > "${config_dir}" << EOF
-{
-  "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
-  "inbounds": [
-    {
-      "port": $ARGO_PORT,
-      "protocol": "vless",
-      "settings": {
-        "clients": [{ "id": "$UUID" }],
-        "decryption": "none",
-        "fallbacks": [
-          { "dest": 3001 }, 
-          { "path": "/vless-argo", "dest": 3002 },
-          { "path": "/vmess-argo", "dest": 3003 }
-        ]
-      },
-      "streamSettings": { "network": "tcp" },
-      "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
-    },
-    {
-      "port": 3001, "listen": "127.0.0.1", "protocol": "vless",
-      "settings": { "clients": [{ "id": "$UUID" }], "decryption": "none" }
-    },
-    {
-      "port": 3002, "listen": "127.0.0.1", "protocol": "vless",
-      "settings": { "clients": [{ "id": "$UUID" }], "decryption": "none" },
-      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vless-argo" } }
-    },
-    {
-      "port": 3003, "listen": "127.0.0.1", "protocol": "vmess",
-      "settings": { "clients": [{ "id": "$UUID" }] },
-      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess-argo" } }
-    }
-  ],
-  "outbounds": $outbounds_json$routing_json
+    if [[ "$routing_json" == "null" ]]; then
+        jq -n \
+            --argjson port "$port" \
+            --arg uuid "$uuid" \
+            --arg domain "$domain" \
+            --arg private_key "$private_key" \
+            --arg public_key "$public_key" \
+            --arg shortid "$shortid" \
+            --argjson outbounds "$outbounds_json" \
+        '{
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "0.0.0.0",
+                "port": $port,
+                "protocol": "vless",
+                "settings": {
+                    "clients": [{"id": $uuid, "flow": "xtls-rprx-vision"}],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "reality",
+                    "realitySettings": {
+                        "show": false,
+                        "dest": ($domain + ":443"),
+                        "xver": 0,
+                        "serverNames": [$domain],
+                        "privateKey": $private_key,
+                        "publicKey": $public_key,
+                        "shortIds": [$shortid]
+                    }
+                },
+                "sniffing": {
+                    "enabled": true,
+                    "destOverride": ["http", "tls", "quic"]
+                }
+            }],
+            "outbounds": $outbounds
+        }' > "$xray_config_path"
+    else
+        jq -n \
+            --argjson port "$port" \
+            --arg uuid "$uuid" \
+            --arg domain "$domain" \
+            --arg private_key "$private_key" \
+            --arg public_key "$public_key" \
+            --arg shortid "$shortid" \
+            --argjson outbounds "$outbounds_json" \
+            --argjson routing "$routing_json" \
+        '{
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "0.0.0.0",
+                "port": $port,
+                "protocol": "vless",
+                "settings": {
+                    "clients": [{"id": $uuid, "flow": "xtls-rprx-vision"}],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "reality",
+                    "realitySettings": {
+                        "show": false,
+                        "dest": ($domain + ":443"),
+                        "xver": 0,
+                        "serverNames": [$domain],
+                        "privateKey": $private_key,
+                        "publicKey": $public_key,
+                        "shortIds": [$shortid]
+                    }
+                },
+                "sniffing": {
+                    "enabled": true,
+                    "destOverride": ["http", "tls", "quic"]
+                }
+            }],
+            "outbounds": $outbounds,
+            "routing": $routing
+        }' > "$xray_config_path"
+    fi
 }
-EOF
+
+run_install() {
+    local port=$1 uuid=$2 domain=$3
+    info "正在下载并安装 Xray 核心..."
+    if ! execute_official_script "install"; then
+        error "Xray 核心安装失败！请检查网络连接。"
+        exit 1
+    fi
+
+    info "正在安装/更新 GeoIP 和 GeoSite 数据文件..."
+    if ! execute_official_script "install-geodata"; then
+        error "Geo-data 更新失败！"
+        info "这通常不影响核心功能，您可以稍后通过更新选项(2)来重试。"
+    fi
+
+    info "正在生成 Reality 密钥对..."
+
+    local key_pair
+    key_pair=$($xray_binary_path x25519 2>/dev/null)
+
+    local private_key
+    local public_key
+
+    private_key=$(echo "$key_pair" | grep -i "PrivateKey" | awk -F': ' '{print $2}')
+    public_key=$(echo "$key_pair" | grep -E "PublicKey|Password" | awk -F': ' '{print $2}')
+
+    if [[ -z "$private_key" || -z "$public_key" ]]; then
+        echo "$key_pair"
+        error "生成 Reality 密钥对失败！请检查 Xray 核心是否正常。"
+        exit 1
+    fi
+
+    info "正在写入 Xray 配置文件..."
+    write_config "$port" "$uuid" "$domain" "$private_key" "$public_key"
+
+    if ! restart_xray; then exit 1; fi
+
+    success "Xray 安装/配置成功！"
+    view_subscription_info
 }
 
 configure_socks5_outbound() {
-    if [ ! -f "$config_dir" ]; then
-        yellow "请先安装 Xray"
-        return 1
-    fi
+    if [[ ! -f "$xray_config_path" ]]; then error "错误: Xray 未安装，无法设置出口。" && return; fi
+    load_outbound_env
 
-    clear
-    green "=== 出口模式设置 ==="
-    green "1. 直连"
-    green "2. 自定义 SOCKS5"
-    purple "0. 返回主菜单"
-    reading "请输入选择: " outbound_choice
+    echo "---------------------------------------------"
+    echo -e "$green 出口模式设置$none"
+    echo "---------------------------------------------"
+    printf "  ${green}%-2s${none} %-35s\n" "1." "直连"
+    printf "  ${cyan}%-2s${none} %-35s\n" "2." "自定义 SOCKS5"
+    printf "  ${yellow}%-2s${none} %-35s\n" "0." "返回主菜单"
+    echo "---------------------------------------------"
+    read -p "请输入选项 [0-2]: " outbound_choice
 
     case "$outbound_choice" in
         1)
@@ -311,717 +705,143 @@ configure_socks5_outbound() {
             SOCKS5_USER=""
             SOCKS5_PASS=""
             save_outbound_env
-            rebuild_xray_config || return 1
-            restart_xray
-            green "已切换为直连出口"
+            modify_outbound_in_current_config
+            restart_xray || return 1
+            success "已切换为直连出口。"
             ;;
         2)
-            reading "请输入 SOCKS5 地址: " custom_socks5_host
-            [ -z "$custom_socks5_host" ] && red "SOCKS5 地址不能为空" && return 1
-
-            reading "请输入 SOCKS5 端口(默认 1080): " custom_socks5_port
-            custom_socks5_port=${custom_socks5_port:-1080}
-            if ! [[ "$custom_socks5_port" =~ ^[0-9]+$ ]] || [ "$custom_socks5_port" -lt 1 ] || [ "$custom_socks5_port" -gt 65535 ]; then
-                red "端口格式不正确"
+            local custom_socks5_host custom_socks5_port custom_socks5_user custom_socks5_pass
+            read -p "请输入 SOCKS5 地址: " custom_socks5_host
+            if [[ -z "$custom_socks5_host" ]]; then
+                error "SOCKS5 地址不能为空。"
                 return 1
             fi
 
-            reading "请输入 SOCKS5 用户名(可留空): " custom_socks5_user
-            reading "请输入 SOCKS5 密码(可留空): " custom_socks5_pass
+            read -p "请输入 SOCKS5 端口 (默认: 1080): " custom_socks5_port
+            [[ -z "$custom_socks5_port" ]] && custom_socks5_port=1080
+            if ! is_valid_port "$custom_socks5_port"; then
+                error "端口无效，请输入一个1-65535之间的数字。"
+                return 1
+            fi
+
+            read -p "请输入 SOCKS5 用户名 (可留空): " custom_socks5_user
+            read -p "请输入 SOCKS5 密码 (可留空): " custom_socks5_pass
 
             OUTBOUND_MODE="socks5"
             SOCKS5_HOST="$custom_socks5_host"
             SOCKS5_PORT="$custom_socks5_port"
             SOCKS5_USER="$custom_socks5_user"
             SOCKS5_PASS="$custom_socks5_pass"
-
             save_outbound_env
-            rebuild_xray_config || return 1
-            restart_xray
-            green "已切换为 SOCKS5 出口: ${SOCKS5_HOST}:${SOCKS5_PORT}"
+            modify_outbound_in_current_config
+            restart_xray || return 1
+            success "已切换为 SOCKS5 出口: ${SOCKS5_HOST}:${SOCKS5_PORT}"
             ;;
         0)
             return 0
             ;;
         *)
-            red "无效的选项！"
+            error "无效选项，请输入 0-2 之间的数字。"
             return 1
             ;;
     esac
 }
 
-# 下载并安装 xray,cloudflared
-install_xray() {
-    clear
-    purple "正在安装Xray-2go中，请稍等..."
-    ARCH_RAW=$(uname -m)
-    case "${ARCH_RAW}" in
-        'x86_64') ARCH='amd64'; ARCH_ARG='64' ;;
-        'x86' | 'i686' | 'i386') ARCH='386'; ARCH_ARG='32' ;;
-        'aarch64' | 'arm64') ARCH='arm64'; ARCH_ARG='arm64-v8a' ;;
-        'armv7l') ARCH='armv7'; ARCH_ARG='arm32-v7a' ;;
-        's390x') ARCH='s390x' ;;
-        *) red "不支持的架构: ${ARCH_RAW}"; exit 1 ;;
-    esac
-
-    # 下载xray,cloudflared
-    [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 777 "${work_dir}"
-    curl -sLo "${work_dir}/${server_name}.zip" "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${ARCH_ARG}.zip"
-    curl -sLo "${work_dir}/qrencode" "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}"
-    curl -sLo "${work_dir}/argo" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}"
-    unzip "${work_dir}/${server_name}.zip" -d "${work_dir}/" > /dev/null 2>&1 && chmod +x ${work_dir}/${server_name} ${work_dir}/argo ${work_dir}/qrencode
-    rm -rf "${work_dir}/${server_name}.zip" "${work_dir}/geosite.dat" "${work_dir}/geoip.dat" "${work_dir}/README.md" "${work_dir}/LICENSE" 
-
-   # 生成随机UUID和密码
-    password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24)
-
-    # 关闭防火墙
-    iptables -F > /dev/null 2>&1 && iptables -P INPUT ACCEPT > /dev/null 2>&1 && iptables -P FORWARD ACCEPT > /dev/null 2>&1 && iptables -P OUTPUT ACCEPT > /dev/null 2>&1
-    command -v ip6tables &> /dev/null && ip6tables -F > /dev/null 2>&1 && ip6tables -P INPUT ACCEPT > /dev/null 2>&1 && ip6tables -P FORWARD ACCEPT > /dev/null 2>&1 && ip6tables -P OUTPUT ACCEPT > /dev/null 2>&1
-
-    outbounds_json=$(build_outbounds_json)
-    routing_json=$(build_routing_json)
-
-   #配置文件生成部分
-cat > "${config_dir}" << EOF
-{
-  "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
-  "inbounds": [
-    {
-      "port": $ARGO_PORT,
-      "protocol": "vless",
-      "settings": {
-        "clients": [{ "id": "$UUID" }],
-        "decryption": "none",
-        "fallbacks": [
-          { "dest": 3001 }, 
-          { "path": "/vless-argo", "dest": 3002 },
-          { "path": "/vmess-argo", "dest": 3003 }
-        ]
-      },
-      "streamSettings": { "network": "tcp" },
-      "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
-    },
-    {
-      "port": 3001, "listen": "127.0.0.1", "protocol": "vless",
-      "settings": { "clients": [{ "id": "$UUID" }], "decryption": "none" }
-    },
-    {
-      "port": 3002, "listen": "127.0.0.1", "protocol": "vless",
-      "settings": { "clients": [{ "id": "$UUID" }], "decryption": "none" },
-      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vless-argo" } }
-    },
-    {
-      "port": 3003, "listen": "127.0.0.1", "protocol": "vmess",
-      "settings": { "clients": [{ "id": "$UUID" }] },
-      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess-argo" } }
-    }
-  ],
-  "outbounds": $outbounds_json$routing_json
-}
-EOF
-}
-# debian/ubuntu/centos 守护进程
-main_systemd_services() {
-    cat > /etc/systemd/system/xray.service << EOF
-[Unit]
-Description=Xray Service
-Documentation=https://github.com/XTLS/Xray-core
-After=network.target nss-lookup.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-NoNewPrivileges=yes
-ExecStart=$work_dir/xray run -c $config_dir
-Restart=on-failure
-RestartPreventExitStatus=23
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    cat > /etc/systemd/system/tunnel.service << EOF
-[Unit]
-Description=Cloudflare Tunnel
-After=network.target
-
-[Service]
-Type=simple
-NoNewPrivileges=yes
-TimeoutStartSec=0
-ExecStart=/etc/xray/argo tunnel --url http://localhost:$ARGO_PORT --no-autoupdate --edge-ip-version auto --protocol http2
-StandardOutput=append:/etc/xray/argo.log
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-
-EOF
-    if [ -f /etc/centos-release ]; then
-        yum install -y chrony
-        systemctl start chronyd
-        systemctl enable chronyd
-        chronyc -a makestep
-        yum update -y ca-certificates
-        bash -c 'echo "0 0" > /proc/sys/net/ipv4/ping_group_range'
+modify_outbound_in_current_config() {
+    if [[ ! -f "$xray_config_path" ]]; then
+        return 1
     fi
-    bash -c 'echo "0 0" > /proc/sys/net/ipv4/ping_group_range'
-    systemctl daemon-reload
-    systemctl enable xray
-    systemctl is-active --quiet xray || systemctl start xray
-    systemctl enable tunnel
-    systemctl start tunnel
-    systemctl is-active --quiet tunnel || systemctl start xray
-}
-# 适配alpine 守护进程
-alpine_openrc_services() {
-    cat > /etc/init.d/xray << 'EOF'
-#!/sbin/openrc-run
 
-description="Xray service"
-command="/etc/xray/xray"
-command_args="run -c /etc/xray/config.json"
-command_background=true
-pidfile="/var/run/xray.pid"
-EOF
+    local port uuid domain private_key public_key shortid
+    port=$(jq -r '.inbounds[0].port' "$xray_config_path")
+    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
+    domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$xray_config_path")
+    private_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$xray_config_path")
+    public_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.publicKey' "$xray_config_path")
+    shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$xray_config_path")
 
-    cat > /etc/init.d/tunnel << 'EOF'
-#!/sbin/openrc-run
-
-description="Cloudflare Tunnel"
-command="/bin/sh"
-command_args="-c '/etc/xray/argo tunnel --url http://localhost:8080 --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/xray/argo.log 2>&1'"
-command_background=true
-pidfile="/var/run/tunnel.pid"
-EOF
-
-    chmod +x /etc/init.d/xray
-    chmod +x /etc/init.d/tunnel
-
-    rc-update add xray default
-    rc-update add tunnel default
-
+    write_config "$port" "$uuid" "$domain" "$private_key" "$public_key" "$shortid"
 }
 
-
-get_info() {  
-  clear
-  IP=$(get_realip)
-
-  isp=$(hostname -s | sed 's/ /_/g')
-
-  if [ -f "${work_dir}/argo.log" ]; then
-      for i in {1..5}; do
-          purple "第 $i 次尝试获取ArgoDoamin中..."
-          argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
-          [ -n "$argodomain" ] && break
-          sleep 2
-      done
-  else
-      restart_argo
-      sleep 6
-      argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
-  fi
-
-  green "\nArgoDomain：${purple}$argodomain${re}\n"
-  if [ "$OUTBOUND_MODE" = "socks5" ]; then
-      green "出口模式：${purple}SOCKS5${re}"
-      green "SOCKS5：${purple}${SOCKS5_HOST}:${SOCKS5_PORT}${re}\n"
-  else
-      green "出口模式：${purple}直连${re}\n"
-  fi
-
-  cat > ${work_dir}/url.txt <<EOF
-
-vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#$HOSTNAME
-
-vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${isp}\", \"add\": \"${CFIP}\", \"port\": \"${CFPORT}\", \"id\": \"${UUID}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"chrome\"}" | base64 -w0)
-
-EOF
-echo ""
-while IFS= read -r line; do echo -e "${purple}$line"; done < ${work_dir}/url.txt
-base64 -w0 ${work_dir}/url.txt > ${work_dir}/sub.txt
-echo ""
-}
-
-# 启动 xray
-start_xray() {
-if [ ${check_xray} -eq 1 ]; then
-    yellow "\n正在启动 ${server_name} 服务\n" 
-    if [ -f /etc/alpine-release ]; then
-        rc-service xray start
-    else
-        systemctl daemon-reload
-        systemctl start "${server_name}"
-    fi
-   if [ $? -eq 0 ]; then
-       green "${server_name} 服务已成功启动\n"
-   else
-       red "${server_name} 服务启动失败\n"
-   fi
-elif [ ${check_xray} -eq 0 ]; then
-    yellow "xray 正在运行\n"
-    sleep 1
-    menu
-else
-    yellow "xray 尚未安装!\n"
-    sleep 1
-    menu
-fi
-}
-
-# 停止 xray
-stop_xray() {
-if [ ${check_xray} -eq 0 ]; then
-   yellow "\n正在停止 ${server_name} 服务\n"
-    if [ -f /etc/alpine-release ]; then
-        rc-service xray stop
-    else
-        systemctl stop "${server_name}"
-    fi
-   if [ $? -eq 0 ]; then
-       green "${server_name} 服务已成功停止\n"
-   else
-       red "${server_name} 服务停止失败\n"
-   fi
-
-elif [ ${check_xray} -eq 1 ]; then
-    yellow "xray 未运行\n"
-    sleep 1
-    menu
-else
-    yellow "xray 尚未安装！\n"
-    sleep 1
-    menu
-fi
-}
-
-# 重启 xray
-restart_xray() {
-if [ ${check_xray} -eq 0 ]; then
-   yellow "\n正在重启 ${server_name} 服务\n"
-    if [ -f /etc/alpine-release ]; then
-        rc-service ${server_name} restart
-    else
-        systemctl daemon-reload
-        systemctl restart "${server_name}"
-    fi
-    if [ $? -eq 0 ]; then
-        green "${server_name} 服务已成功重启\n"
-    else
-        red "${server_name} 服务重启失败\n"
-    fi
-elif [ ${check_xray} -eq 1 ]; then
-    yellow "xray 未运行\n"
-    sleep 1
-    menu
-else
-    yellow "xray 尚未安装！\n"
-    sleep 1
-    menu
-fi
-}
-
-# 启动 argo
-start_argo() {
-if [ ${check_argo} -eq 1 ]; then
-    yellow "\n正在启动 Argo 服务\n"
-    if [ -f /etc/alpine-release ]; then
-        rc-service tunnel start
-    else
-        systemctl daemon-reload
-        systemctl start tunnel
-    fi
-    if [ $? -eq 0 ]; then
-        green "Argo 服务已成功重启\n"
-    else
-        red "Argo 服务重启失败\n"
-    fi
-elif [ ${check_argo} -eq 0 ]; then
-    green "Argo 服务正在运行\n"
-    sleep 1
-    menu
-else
-    yellow "Argo 尚未安装！\n"
-    sleep 1
-    menu
-fi
-}
-
-# 停止 argo
-stop_argo() {
-if [ ${check_argo} -eq 0 ]; then
-    yellow "\n正在停止 Argo 服务\n"
-    if [ -f /etc/alpine-release ]; then
-        rc-service stop start
-    else
-        systemctl daemon-reload
-        systemctl stop tunnel
-    fi
-    if [ $? -eq 0 ]; then
-        green "Argo 服务已成功停止\n"
-    else
-        red "Argo 服务停止失败\n"
-    fi
-elif [ ${check_argo} -eq 1 ]; then
-    yellow "Argo 服务未运行\n"
-    sleep 1
-    menu
-else
-    yellow "Argo 尚未安装！\n"
-    sleep 1
-    menu
-fi
-}
-
-# 重启 argo
-restart_argo() {
-if [ ${check_argo} -eq 0 ]; then
-    yellow "\n正在重启 Argo 服务\n"
-    rm /etc/xray/argo.log 2>/dev/null
-    if [ -f /etc/alpine-release ]; then
-        rc-service tunnel restart
-    else
-        systemctl daemon-reload
-        systemctl restart tunnel
-    fi
-    if [ $? -eq 0 ]; then
-        green "Argo 服务已成功重启\n"
-    else
-        red "Argo 服务重启失败\n"
-    fi
-elif [ ${check_argo} -eq 1 ]; then
-    yellow "Argo 服务未运行\n"
-    sleep 1
-    menu
-else
-    yellow "Argo 尚未安装！\n"
-    sleep 1
-    menu
-fi
-}
-
-
-
-# 卸载 xray
-uninstall_xray() {
-   reading "确定要卸载Xray-Argo吗? (y/n): " choice
-   case "${choice}" in
-       y|Y)
-           yellow "正在卸载 xray"
-           if [ -f /etc/alpine-release ]; then
-                rc-service xray stop
-                rc-service tunnel stop
-                rm /etc/init.d/xray /etc/init.d/tunnel
-                rc-update del xray default
-                rc-update del tunnel default
-           else
-                # 停止 xray和 argo 服务
-                systemctl stop "${server_name}"
-                systemctl stop tunnel
-                # 禁用 xray 服务
-                systemctl disable "${server_name}"
-                systemctl disable tunnel
-
-                # 重新加载 systemd
-                systemctl daemon-reload || true
-            fi
-           # 删除配置文件和日志
-           rm -rf "${work_dir}" || true
-	       rm -rf /etc/systemd/system/xray.service /etc/systemd/system/tunnel.service 2>/dev/null
-           rm -f /usr/bin/2go	
-
-            green "\n卸载完成\n"
-           ;;
-       *)
-           purple "已取消卸载操作\n"
-           ;;
-   esac
-}
-
-# 创建快捷指令
-create_shortcut() {
-  cat > "$work_dir/2go.sh" << EOF
-#!/usr/bin/env bash
-
-bash <(curl -sL https://raw.githubusercontent.com/iu683/uu/main/aa.sh) \$1
-EOF
-  chmod +x "$work_dir/2go.sh"
-  ln -sf "$work_dir/2go.sh" /usr/bin/2go
-  if [ -s /usr/bin/2go ]; then
-    green "\n快捷指令 2go 创建成功\n"
-  else
-    red "\n快捷指令创建失败\n"
-  fi
-}
-
-# 适配alpine运行argo报错用户组和dns的问题
-change_hosts() {
-    sh -c 'echo "0 0" > /proc/sys/net/ipv4/ping_group_range'
-    sed -i '1s/.*/127.0.0.1   localhost/' /etc/hosts
-    sed -i '2s/.*/::1         localhost/' /etc/hosts
-}
-
-# xray 管理
-manage_xray() {
-    green "1. 启动xray服务"
-    skyblue "-------------------"
-    green "2. 停止xray服务"
-    skyblue "-------------------"
-    green "3. 重启xray服务"
-    skyblue "-------------------"
-    purple "0. 返回主菜单"
-    skyblue "------------"
-    reading "\n请输入选择: " choice
-    case "${choice}" in
-        1) start_xray ;;  
-        2) stop_xray ;;
-        3) restart_xray ;;
-        0) menu ;;
-        *) red "无效的选项！" ;;
-    esac
-}
-
-# Argo 管理
-manage_argo() {
-if [ ${check_argo} -eq 2 ]; then
-    yellow "Argo 尚未安装！"
-    sleep 1
-    menu
-else
-    clear
+press_any_key_to_continue() {
     echo ""
-    green "1. 启动Argo服务"
-    skyblue "------------"
-    green "2. 停止Argo服务"
-    skyblue "------------"
-    green "3. 添加Argo固定隧道"
-    skyblue "----------------"
-    green "4. 切换回Argo临时隧道"
-    skyblue "------------------"
-    green "5. 重新获取Argo临时域名"
-    skyblue "-------------------"
-    purple "0. 返回主菜单"
-    skyblue "-----------"
-    reading "\n请输入选择: " choice
-    case "${choice}" in
-        1)  start_argo ;;
-        2)  stop_argo ;; 
-        3)
-            clear
-            yellow "\n固定隧道可为json或token，固定隧道端口为8080，自行在cf后台设置\n\njson在f佬维护的站点里获取，获取地址：${purple}https://fscarmen.cloudflare.now.cc${re}\n"
-            reading "\n请输入你的argo域名: " argo_domain
-            green "你的Argo域名为：$argo_domain"
-            ArgoDomain=$argo_domain
-            reading "\n请输入你的argo密钥(token或json): " argo_auth
-            if [[ $argo_auth =~ TunnelSecret ]]; then
-                echo $argo_auth > ${work_dir}/tunnel.json
-                cat > ${work_dir}/tunnel.yml << EOF
-tunnel: $(cut -d\" -f12 <<< "$argo_auth")
-credentials-file: ${work_dir}/tunnel.json
-protocol: http2
-                                           
-ingress:
-  - hostname: $ArgoDomain
-    service: http://localhost:8080
-    originRequest:
-      noTLSVerify: true
-  - service: http_status:404
-EOF
-                if [ -f /etc/alpine-release ]; then
-                    sed -i '/^command_args=/c\command_args="-c '\''/etc/xray/argo tunnel --edge-ip-version auto --config /etc/xray/tunnel.yml run 2>&1'\''"' /etc/init.d/tunnel
-                else
-                    sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/xray/argo tunnel --edge-ip-version auto --config /etc/xray/tunnel.yml run 2>&1"' /etc/systemd/system/tunnel.service
-                fi
-                restart_argo
-                change_argo_domain
-            elif [[ $argo_auth =~ ^[A-Z0-9a-z=]{120,250}$ ]]; then
-                if [ -f /etc/alpine-release ]; then
-                    sed -i "/^command_args=/c\command_args=\"-c '/etc/xray/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token $argo_auth 2>&1'\"" /etc/init.d/tunnel
-                else
-
-                    sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/xray/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token '$argo_auth' 2>&1"' /etc/systemd/system/tunnel.service
-                fi
-                restart_argo
-                change_argo_domain
-            else
-                yellow "你输入的argo域名或token不匹配，请重新输入"
-                manage_argo            
-            fi
-            ;; 
-        4)
-            clear
-            if [ -f /etc/alpine-release ]; then
-                alpine_openrc_services
-            else
-                main_systemd_services
-            fi
-            get_quick_tunnel
-            change_argo_domain 
-            ;; 
-
-        5)  
-            if [ -f /etc/alpine-release ]; then
-                if grep -Fq -- '--url http://localhost:8080' /etc/init.d/tunnel; then
-                    get_quick_tunnel
-                    change_argo_domain 
-                else
-                    yellow "当前使用固定隧道，无法获取临时隧道"
-                    sleep 2
-                    menu
-                fi
-            else
-                if grep -q 'ExecStart=.*--url http://localhost:8080' /etc/systemd/system/tunnel.service; then
-                    get_quick_tunnel
-                    change_argo_domain 
-                else
-                    yellow "当前使用固定隧道，无法获取临时隧道"
-                    sleep 2
-                    menu
-                fi
-            fi 
-            ;; 
-        0)  menu ;; 
-        *)  red "无效的选项！" ;;
-    esac
-fi
+    read -n 1 -s -r -p "按任意键返回主菜单..." || true
 }
 
-# 获取argo临时隧道
-get_quick_tunnel() {
-restart_argo
-yellow "获取临时argo域名中，请稍等...\n"
-sleep 3
-if [ -f /etc/xray/argo.log ]; then
-  for i in {1..5}; do
-      get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' /etc/xray/argo.log)
-      [ -n "$get_argodomain" ] && break
-      sleep 2
-  done
-else
-  restart_argo
-  sleep 6
-  get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' /etc/xray/argo.log)
-fi
-green "ArgoDomain：${purple}$get_argodomain${re}\n"
-ArgoDomain=$get_argodomain
-}
+main_menu() {
+    while true; do
+        clear
+        echo -e "$cyan Xray VLESS-Reality 安装管理$none"
+        echo "---------------------------------------------"
+        check_xray_status
+        echo -e "${xray_status_info}"
+        echo "---------------------------------------------"
+        # 修改：明确菜单项 1
+        printf "  ${green}%-2s${none} %-35s\n" "1." "安装/重装 Xray (VLESS-reality)"
+        printf "  ${cyan}%-2s${none} %-35s\n" "2." "更新 Xray"
+        printf "  ${yellow}%-2s${none} %-35s\n" "3." "重启 Xray"
+        printf "  ${red}%-2s${none} %-35s\n" "4." "卸载 Xray"
+        printf "  ${magenta}%-2s${none} %-35s\n" "5." "查看 Xray 日志"
+        printf "  ${cyan}%-2s${none} %-35s\n" "6." "修改节点配置"
+        printf "  ${green}%-2s${none} %-35s\n" "7." "查看订阅信息"
+        printf "  ${yellow}%-2s${none} %-35s\n" "8." "设置 SOCKS5 出口"
+        echo "---------------------------------------------"
+        printf "  ${yellow}%-2s${none} %-35s\n" "0." "退出脚本"
+        echo "---------------------------------------------"
+        read -p "请输入选项 [0-8]: " choice
 
-# 更新Argo域名到订阅
-change_argo_domain() {
+        local needs_pause=true
+        case $choice in
+            1) install_xray ;;
+            2) update_xray ;;
+            3) restart_xray ;;
+            4) uninstall_xray ;;
+            5) view_xray_log; needs_pause=false ;;
+            6) modify_config ;;
+            7) view_subscription_info ;;
+            8) configure_socks5_outbound ;;
+            0) success "感谢使用！"; exit 0 ;;
+            *) error "无效选项，请输入 0-8 之间的数字。" ;;
+        esac
 
-    sed -i "s/sni=[^&]*/sni=$ArgoDomain/g; s/host=[^&]*/host=$ArgoDomain/g" /etc/xray/url.txt
-
-    content=$(cat "$client_dir")
-
-    vmess_urls=$(grep -o 'vmess://[^ ]*' "$client_dir")
-
-    for vmess_url in $vmess_urls; do
-        encoded_vmess="${vmess_url#vmess://}"
-        decoded_vmess=$(echo "$encoded_vmess" | base64 -d 2>/dev/null)
-
-        updated_vmess=$(echo "$decoded_vmess" | jq \
-        --arg new_domain "$ArgoDomain" \
-        '.host = $new_domain | .sni = $new_domain')
-
-        encoded_updated_vmess=$(echo "$updated_vmess" | base64 | tr -d '\n')
-
-        new_vmess_url="vmess://$encoded_updated_vmess"
-
-        content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
+        if [ "$needs_pause" = true ]; then
+            press_any_key_to_continue
+        fi
     done
-
-    echo "$content" > "$client_dir"
-
-    base64 -w0 ${work_dir}/url.txt > ${work_dir}/sub.txt
-
-    while IFS= read -r line; do
-        echo -e "${purple}$line"
-    done < "$client_dir"
-
-    green "\n节点已更新, 复制以上节点\n"
 }
 
-# 查看节点信息和订阅链接
-check_nodes() {
-if [ ${check_xray} -eq 0 ]; then
-    while IFS= read -r line; do purple "${purple}$line"; done < ${work_dir}/url.txt
-    if [ "$OUTBOUND_MODE" = "socks5" ]; then
-        green "\n当前出口模式：SOCKS5 ${SOCKS5_HOST}:${SOCKS5_PORT}\n"
+# --- 脚本主入口 ---
+main() {
+    pre_check
+    load_outbound_env
+    if [[ $# -gt 0 && "$1" == "install" ]]; then
+        shift
+        local port="" uuid="" domain=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --port) port="$2"; shift 2 ;;
+                --uuid) uuid="$2"; shift 2 ;;
+                --sni) domain="$2"; shift 2 ;;
+                --quiet|-q) is_quiet=true; shift ;;
+                *) error "未知参数: $1"; exit 1 ;;
+            esac
+        done
+        [[ -z "$port" ]] && port=443
+        [[ -z "$uuid" ]] && uuid=$(cat /proc/sys/kernel/random/uuid)
+        [[ -z "$domain" ]] && domain="learn.microsoft.com"
+        if ! is_valid_port "$port" || ! is_valid_domain "$domain"; then
+            error "参数无效。请检查端口或SNI域名格式。" && exit 1
+        fi
+        if [[ -n "$uuid" ]] && ! is_valid_uuid "$uuid"; then
+            error "UUID格式无效。请提供标准UUID格式或留空自动生成。" && exit 1
+        fi
+        if is_port_in_use "$port"; then
+            error "端口 $port 已被占用，请选择其他端口。" && exit 1
+        fi
+        run_install "$port" "$uuid" "$domain"
     else
-        green "\n当前出口模式：直连\n"
+        main_menu
     fi
-else 
-    yellow "Xray-2go 尚未安装或未运行,请先安装或启动Xray-2go"
-    sleep 1
-    menu
-fi
 }
 
-# 捕获 Ctrl+C 信号
-trap 'red "已取消操作"; exit' INT
-
-# 主菜单
-menu() {
-while true; do
-   check_xray &>/dev/null; check_xray=$?
-   check_argo &>/dev/null; check_argo=$?
-   check_xray_status=$(check_xray) > /dev/null 2>&1
-   check_argo_status=$(check_argo) > /dev/null 2>&1
-   clear
-   green "=== Xray-Argo安装管理 ==="
-   yellow " Xray 状态: ${check_xray_status}"
-   yellow " Argo 状态: ${check_argo_status}"
-   if [ "$OUTBOUND_MODE" = "socks5" ]; then
-       yellow " 出口模式: SOCKS5 (${SOCKS5_HOST}:${SOCKS5_PORT})"
-   else
-       yellow " 出口模式: direct"
-   fi
-   green "1. 安装"
-   green "2. Xray管理"
-   green "3. Argo隧道管理"
-   green "4. 查看节点信息"
-   green "5. 设置出口模式"
-   green "6. 卸载"
-   green "0. 退出"
-   reading "请输入选择: " choice
-   case "${choice}" in
-        1)  
-            if [ ${check_xray} -eq 0 ]; then
-                yellow "Xray-2go 已经安装！"
-            else
-                manage_packages install jq unzip iptables openssl coreutils lsof
-                install_xray
-
-                if [ -x "$(command -v systemctl)" ]; then
-                    main_systemd_services
-                elif [ -x "$(command -v rc-update)" ]; then
-                    alpine_openrc_services
-                    change_hosts
-                    rc-service xray restart
-                    rc-service tunnel restart
-                else
-                    echo "Unsupported init system"
-                    exit 1 
-                fi
-
-                sleep 3
-                save_outbound_env
-                get_info
-                create_shortcut
-            fi
-           ;;
-        2) manage_xray ;;
-        3) manage_argo ;;
-        4) check_nodes ;;
-        5) configure_socks5_outbound ;;
-        6) uninstall_xray ;;
-        0) exit 0 ;;
-        *) red "无效的选项，请输入 0 到 9" ;; 
-   esac
-   read -n 1 -s -r -p $'\033[1;91m按任意键继续...\033[0m'
-done
-}
-menu
+main "$@"

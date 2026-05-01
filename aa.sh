@@ -1,212 +1,110 @@
-#!/bin/bash
-# ========================================
-# nodeget 一键管理脚本
-# ========================================
+#!/bin/sh
+# ==========================================
+# 哪吒监控 & Komari Agent & NodeGet Agent 全自动卸载工具
+# 支持系统: Alpine (OpenRC), Debian/Ubuntu/CentOS (Systemd)
+# ==========================================
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-RESET="\033[0m"
+NZ_BASE_PATH="/opt/nezha"
+NZ_AGENT_PATH="${NZ_BASE_PATH}/agent"
+KOMARI_PATH="/opt/komari/agent"
 
-APP_NAME="nodeget"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+# 颜色定义
+red='\033[0;31m'
+green='\033[0;32m'
+yellow='\033[0;33m'
+plain='\033[0m'
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
+# 输出函数
+info() { printf "${yellow}[INFO] %s${plain}\n" "$*"; }
+err() { printf "${red}[ERROR] %s${plain}\n" "$*" >&2; }
+success() { printf "${green}[SUCCESS] %s${plain}\n" "$*"; }
 
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
-}
-
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
-
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== NodeGet 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
-install_app() {
-
-    check_docker
-
-    mkdir -p "$APP_DIR/data/postgres"
-    mkdir -p "$APP_DIR/data/config"
-    mkdir -p "$APP_DIR/data/nodeget"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-
-    read -p "请输入访问端口 [默认:3000]: " input_port
-    PORT=${input_port:-3000}
-    check_port "$PORT" || return
-
-    UUID_FILE="$APP_DIR/uuid"
-
-    if [ -f "$UUID_FILE" ]; then
-        UUID=$(cat "$UUID_FILE")
+# 权限检查
+sudo_exec() {
+    if [ "$(id -u)" -ne 0 ]; then
+        if command -v sudo > /dev/null 2>&1; then
+            sudo "$@"
+        else
+            err "错误: 需要root权限且未找到sudo"
+            exit 1
+        fi
     else
-        UUID=$(cat /proc/sys/kernel/random/uuid)
-        echo "$UUID" > "$UUID_FILE"
+        "$@"
     fi
+}
 
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  postgres:
-    image: postgres:17-alpine
-    container_name: nodeget-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: nodeget
-      POSTGRES_USER: nodeget
-      POSTGRES_PASSWORD: nodeget
-    volumes:
-      - ./data/postgres:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U nodeget -d nodeget"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-
-  nodeget:
-    image: genshinmc/nodeget:latest
-    container_name: nodeget
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      NODEGET_CONFIG_FROM_ENV: "true"
-      NODEGET_PORT: "${PORT}"
-      NODEGET_SERVER_UUID: "${UUID}"
-      NODEGET_LOG_FILTER: "info"
-      NODEGET_DATABASE_URL: "postgres://nodeget:nodeget@postgres:5432/nodeget"
-    ports:
-      - "${PORT}:${PORT}"
-    volumes:
-      - ./data/config:/etc/nodeget
-      - ./data/nodeget:/var/lib/nodeget
-EOF
-
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    echo -e "${YELLOW}⏳ 等待系统初始化（获取 Token）...${RESET}"
-
-    timeout=60
-    elapsed=0
-
-    while [ $elapsed -lt $timeout ]; do
-        LOGS=$(docker logs nodeget --tail 50 2>&1)
-
-        SUPERTOKEN=$(echo "$LOGS" | grep -oP 'Super Token:\s*\K.*')
-        ROOTPASS=$(echo "$LOGS" | grep -oP 'Root Password:\s*\K.*')
-
-        if [[ -n "$SUPERTOKEN" && -n "$ROOTPASS" ]]; then
-            break
+# --- 1. 卸载哪吒 Agent ---
+uninstall_nezha() {
+    if [ -d "$NZ_AGENT_PATH" ]; then
+        info "正在检测并停止 哪吒-agent 服务..."
+        config_files=$(find "$NZ_AGENT_PATH" -name "config*.yml" 2>/dev/null)
+        
+        if [ -n "$config_files" ]; then
+            for config in $config_files; do
+                sudo_exec "${NZ_AGENT_PATH}/nezha-agent" service -c "$config" uninstall >/dev/null 2>&1 || true
+            done
         fi
 
-        sleep 2
-        elapsed=$((elapsed + 2))
-    done
-
-    echo
-    echo -e "${GREEN}✅ nodeget 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🆔 UUID: ${UUID}${RESET}"
-    echo -e "${YELLOW}🌐 主控地址: wss://127.0.0.1:${PORT}${RESET}"
-
-    if [[ -n "$SUPERTOKEN" ]]; then
-        echo -e "${YELLOW}🔑 Token:${RESET} ${SUPERTOKEN}"
+        info "清理哪吒文件..."
+        sudo_exec rm -rf "$NZ_AGENT_PATH"
+        if [ -d "$NZ_BASE_PATH" ] && [ -z "$(ls -A "$NZ_BASE_PATH" 2>/dev/null)" ]; then
+            sudo_exec rm -rf "$NZ_BASE_PATH"
+        fi
+        success "哪吒-agent 卸载完成"
     else
-        echo -e "${RED}❌ 未获取到Token（可查看日志）${RESET}"
+        info "未发现哪吒安装目录，跳过"
+    fi
+}
+
+# --- 2. 卸载 Komari Agent ---
+uninstall_komari() {
+    info "开始检测并停止 Komari-agent..."
+
+    # Systemd
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl list-unit-files | grep -q "komari-agent"; then
+            sudo_exec systemctl stop komari-agent >/dev/null 2>&1 || true
+            sudo_exec systemctl disable komari-agent >/dev/null 2>&1 || true
+            sudo_exec rm -f /etc/systemd/system/komari-agent.service
+            sudo_exec systemctl daemon-reload
+            info "Systemd: Komari 服务已清理"
+        fi
     fi
 
-    if [[ -n "$ROOTPASS" ]]; then
-        echo -e "${YELLOW}🔐 Root密码:${RESET} ${ROOTPASS}"
-    else
-        echo -e "${RED}❌ 未获取到 Root密码${RESET}"
+    # OpenRC
+    if command -v rc-service >/dev/null 2>&1; then
+        if [ -f "/etc/init.d/komari-agent" ]; then
+            sudo_exec rc-service komari-agent stop >/dev/null 2>&1 || true
+            sudo_exec rc-update del komari-agent default >/dev/null 2>&1 || true
+            sudo_exec rm -f /etc/init.d/komari-agent
+            info "OpenRC: Komari 服务已清理"
+        fi
     fi
 
-    cat > "$APP_DIR/token.txt" <<EOF
-访问地址: http://127.0.0.1:${PORT}
-UUID: ${UUID}
-
-SuperToken:
-${SUPERTOKEN}
-
-RootPassword:
-${ROOTPASS}
-EOF
-
-    echo -e "${YELLOW}📄 已保存到: $APP_DIR/token.txt${RESET}"
-
-    read -p "按回车返回菜单..."
+    info "清理 Komari 文件残留..."
+    sudo_exec rm -rf "$KOMARI_PATH"
+    
+    success "Komari-agent 卸载完成"
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ 更新完成${RESET}"
-    read -p "按回车返回菜单..."
+# --- 3. 卸载 NodeGet Agent ---
+uninstall_nodeget() {
+    info "开始卸载 NodeGet Agent..."
+
+    if command -v curl >/dev/null 2>&1; then
+        sudo_exec bash -c "$(curl -sL https://install.nodeget.com)" uninstall-agent >/dev/null 2>&1 \
+            && success "NodeGet Agent 卸载完成" \
+            || info "NodeGet Agent 可能未安装或已卸载"
+    else
+        err "未检测到 curl，无法执行 NodeGet 卸载"
+    fi
 }
 
-restart_app() {
-    docker restart nodeget
-    echo -e "${GREEN}✅ 已重启${RESET}"
-    read -p "按回车返回菜单..."
-}
+# --- 执行流程 ---
+echo -e "${yellow}--- 自动化清理程序启动 ---${plain}"
 
-view_logs() {
-    docker logs -f nodeget
-}
+uninstall_nezha
+uninstall_komari
+uninstall_nodeget
 
-check_status() {
-    docker ps | grep nodeget
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已彻底卸载${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-menu
+echo -e "${yellow}--- 所有组件已检测清理完毕 ---${plain}"

@@ -26,9 +26,15 @@ install_jboard() {
 update_jboard() {
     echo -e "${CYAN}>>> 开始更新 J-Board...${RESET}"
 
-    cd $APP_DIR || { echo -e "${RED}目录不存在，请先安装${RESET}"; return; }
-
     bash <(curl -fsSL https://raw.githubusercontent.com/JetSprow/J-Board/main/scripts/upgrade-jboard-panel.sh)
+
+    echo -e "${GREEN}>>> 更新完成${RESET}"
+}
+
+update_agent() {
+    echo -e "${CYAN}>>> 开始更新 jboard-agent...${RESET}"
+
+    bash <(curl -fsSL https://raw.githubusercontent.com/JetSprow/J-Board/main/scripts/upgrade-jboard-agent.sh)
 
     echo -e "${GREEN}>>> 更新完成${RESET}"
 }
@@ -54,20 +60,19 @@ uninstall_jboard() {
 
     rm -rf $APP_DIR
 
-    echo -e "${GREEN}>>> 已彻底卸载（目录已删除）${RESET}"
+    echo -e "${GREEN}>>> 已彻底卸载${RESET}"
 }
 
 menu() {
     clear
-    echo -e "${GREEN}"
-    echo "======================================"
-    echo "        J-Board 管理"
-    echo "======================================"
-    echo -e "${RESET}"
+    echo -e "${GREEN}==================================${RESET}"
+    echo -e "${GREEN}        J-Board 管理${RESET}"
+    echo -e "${GREEN}==================================${RESET}"
     echo -e "${GREEN}1.安装 J-Board${RESET}"
     echo -e "${GREEN}2.更新 J-Board${RESET}"
     echo -e "${GREEN}3.查看日志${RESET}"
     echo -e "${GREEN}4.卸载 J-Board${RESET}"
+    echo -e "${GREEN}5.更新 jboard-agent${RESET}"
     echo -e "${GREEN}0.退出${RESET}"
     read -p "$(echo -e ${GREEN}请输入菜单编号:${RESET} )" choice
 
@@ -76,6 +81,7 @@ menu() {
         2) update_jboard ;;
         3) logs_jboard ;;
         4) uninstall_jboard ;;
+        5) update_agent ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

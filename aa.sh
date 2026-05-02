@@ -425,9 +425,56 @@ view_subscription_info() {
 }
 
 configure_custom_socks5_outbound() {
-    if [[ ! -f "$xray_config_path" ]]; then error "错误: Xray 未安装，无法配置自定义 Socks5 出口。" && return; fi
+    if [[ ! -f "$xray_config_path" ]]; then error "错误: Xray 未安装，无法配置出口模式。" && return; fi
 
-    info "配置自定义 Socks5 出口，直接回车可取消。"
+    local mode current_protocol tmp_file
+    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$xray_config_path" 2>/dev/null || echo "freedom")
+
+    echo "---------------------------------------------"
+    echo "请选择出口模式："
+    if [[ "$current_protocol" == "socks" ]]; then
+        echo "当前模式: Socks5"
+    else
+        echo "当前模式: 直连"
+    fi
+    echo "1) 直连"
+    echo "2) Socks5"
+    echo "0) 取消"
+    echo "---------------------------------------------"
+
+    read -p "请输入选项 [0-2]: " mode
+    case "$mode" in
+        1)
+            tmp_file=$(mktemp)
+            jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$xray_config_path" > "$tmp_file"
+            if ! jq empty "$tmp_file" >/dev/null 2>&1; then
+                rm -f "$tmp_file"
+                error "生成的直连配置无效。"
+                return 1
+            fi
+            cp "$xray_config_path" "${xray_config_path}.bak.$(date +%s)"
+            mv "$tmp_file" "$xray_config_path"
+            chmod 644 "$xray_config_path" 2>/dev/null || true
+            if ! restart_xray; then
+                error "切换到直连失败。"
+                return 1
+            fi
+            success "已切换为直连出口！"
+            return
+            ;;
+        2)
+            ;;
+        0|"")
+            info "已取消配置。"
+            return
+            ;;
+        *)
+            error "无效选项，请输入 0-2 之间的数字。"
+            return 1
+            ;;
+    esac
+
+    info "配置自定义 Socks5 出口。"
 
     local socks_host socks_port socks_user socks_pass
 
@@ -452,7 +499,6 @@ configure_custom_socks5_outbound() {
         socks_pass=""
     fi
 
-    local tmp_file
     tmp_file=$(mktemp)
 
     if [[ -n "$socks_user" ]]; then
@@ -505,10 +551,21 @@ configure_custom_socks5_outbound() {
             ' "$xray_config_path" > "$tmp_file"
     fi
 
-    mv "$tmp_file" "$xray_config_path"
+    if ! jq empty "$tmp_file" >/dev/null 2>&1; then
+        rm -f "$tmp_file"
+        error "生成的 Socks5 配置无效，请检查输入后重试。"
+        return 1
+    fi
 
-    if ! restart_xray; then return; fi
-    success "自定义 Socks5 出口已配置成功！"
+    cp "$xray_config_path" "${xray_config_path}.bak.$(date +%s)"
+    mv "$tmp_file" "$xray_config_path"
+    chmod 644 "$xray_config_path" 2>/dev/null || true
+
+    if ! restart_xray; then
+        error "Xray 重启失败，当前配置可能与系统环境不兼容。"
+        return 1
+    fi
+    success "已切换为 Socks5 出口！"
 }
 
 # --- 核心逻辑函数 ---

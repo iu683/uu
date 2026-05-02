@@ -1,743 +1,243 @@
-#!/bin/bash
-
-# ==============================================================================
-#VLESS-Reality 一键安装管理脚本
-# ==============================================================================
-
-# --- Shell 严格模式 ---
+#!/usr/bin/env bash
 set -euo pipefail
 
-# --- 全局常量 ---
-readonly SCRIPT_VERSION="V-Final-2.2"
-readonly xray_config_path="/usr/local/etc/xray/config.json"
-readonly xray_binary_path="/usr/local/bin/xray"
-readonly xray_install_script_url="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
-# --- 颜色定义 ---
-readonly red='\e[91m' green='\e[92m' yellow='\e[93m'
-readonly magenta='\e[95m' cyan='\e[96m' none='\e[0m'
+CFG="/etc/snell-v5"
+BIN="/usr/local/bin/snell-server-v5"
+SERVICE="snell-v5"
+DEFAULT_VERSION="5.0.1"
 
-# --- 全局变量 ---
-xray_status_info=""
-is_quiet=false
+red='\033[31m'
+green='\033[32m'
+yellow='\033[33m'
+cyan='\033[36m'
+reset='\033[0m'
 
-# --- 辅助函数 ---
-error() { echo -e "\n$red[✖] $1$none\n" >&2; }
-info() { [[ "$is_quiet" = false ]] && echo -e "\n$yellow[!] $1$none\n"; }
-success() { [[ "$is_quiet" = false ]] && echo -e "\n$green[✔] $1$none\n"; }
+info() { echo -e "${yellow}[!]${reset} $*"; }
+ok() { echo -e "${green}[✔]${reset} $*"; }
+err() { echo -e "${red}[✘]${reset} $*" >&2; }
 
-spinner() {
-    local pid=$1; local spinstr='|/-\'
-    if [[ "$is_quiet" = true ]]; then
-        wait "$pid"
-        return
-    fi
-    while ps -p "$pid" > /dev/null; do
-        local temp=${spinstr#?}
-        printf " [%c]  " "$spinstr"
-        local spinstr=$temp${spinstr%"$temp"}
-        sleep 0.1
-        printf "\r"
-    done
-    printf "    \r"
+require_root() {
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    err "请以 root 身份运行"
+    exit 1
+  fi
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    error "无法获取公网 IP 地址。" && return 1
+detect_distro() {
+  if [[ -f /etc/alpine-release ]]; then
+    DISTRO="alpine"
+  elif [[ -f /etc/redhat-release ]]; then
+    DISTRO="centos"
+  elif [[ -f /etc/lsb-release ]] && grep -q "Ubuntu" /etc/lsb-release; then
+    DISTRO="ubuntu"
+  elif [[ -f /etc/os-release ]] && grep -q "Ubuntu" /etc/os-release; then
+    DISTRO="ubuntu"
+  else
+    DISTRO="debian"
+  fi
 }
 
-execute_official_script() {
-    local args="$1"
-
-    bash <(curl -L "$xray_install_script_url") $args &> /dev/null &
-    spinner $!
-
-    if ! wait $!; then
-        return 1
-    fi
+check_cmd() {
+  command -v "$1" >/dev/null 2>&1
 }
 
-# --- 改进的验证函数 ---
-is_valid_port() {
-    local port=$1
-    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+map_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "aarch64" ;;
+    armv7l|armv7) echo "armv7l" ;;
+    *) return 1 ;;
+  esac
 }
 
-# 新增：检查端口是否被占用
-is_port_in_use() {
-    local port=$1
-    # 使用多种方法检查端口占用
-    if command -v ss &>/dev/null; then
-        ss -tuln 2>/dev/null | grep -q ":$port "
-    elif command -v netstat &>/dev/null; then
-        netstat -tuln 2>/dev/null | grep -q ":$port "
-    elif command -v lsof &>/dev/null; then
-        lsof -i ":$port" &>/dev/null
-    else
-        # 如果没有可用工具，尝试连接测试
-        timeout 1 bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null
-    fi
+listen_addr() {
+  if ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'; then
+    echo "::"
+  else
+    echo "0.0.0.0"
+  fi
 }
 
-# 增强的UUID验证函数
-is_valid_uuid() {
-    local uuid=$1
-    # 标准UUID格式验证：8-4-4-4-12 位十六进制数字
-    [[ "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+fmt_hostport() {
+  local host="$1" port="$2"
+  if [[ "$host" == *:* ]]; then
+    printf '[%s]:%s' "$host" "$port"
+  else
+    printf '%s:%s' "$host" "$port"
+  fi
 }
 
-is_valid_domain() {
-    local domain=$1
-    [[ "$domain" =~ ^[a-zA-Z0-9-]{1,63}(\.[a-zA-Z0-9-]{1,63})+$ ]] && [[ "$domain" != *--* ]]
+ensure_deps() {
+  detect_distro
+  case "$DISTRO" in
+    alpine)
+      apk add --no-cache curl unzip openssl >/dev/null
+      if ! check_cmd upx; then apk add --no-cache upx >/dev/null || true; fi
+      ;;
+    debian|ubuntu)
+      apt-get update -qq >/dev/null
+      apt-get install -y -qq curl unzip openssl >/dev/null
+      ;;
+    centos)
+      yum install -y -q curl unzip openssl >/dev/null
+      ;;
+  esac
 }
 
-# --- 改进的系统兼容性检查 ---
-check_system_compatibility() {
-    local os_release_file="/etc/os-release"
-    local debian_version_file="/etc/debian_version"
-    local lsb_release_file="/etc/lsb-release"
-    
-    # 检查是否为Linux系统
-    if [[ "$(uname -s)" != "Linux" ]]; then
-        error "错误: 此脚本仅支持 Linux 系统。"
-        return 1
-    fi
-    
-    # 支持的发行版列表
-    local supported_distros=("ubuntu" "debian" "kali" "raspbian" "deepin" "mint" "elementary")
-    local distro_detected=false
-    local distro_name=""
-    local distro_version=""
-    
-    # 方法1: 检查 /etc/os-release (最标准的方法)
-    if [[ -f "$os_release_file" ]]; then
-        source "$os_release_file"
-        distro_name=$(echo "$ID" | tr '[:upper:]' '[:lower:]')
-        distro_version="$VERSION_ID"
-        
-        # 检查是否为支持的发行版
-        for supported in "${supported_distros[@]}"; do
-            if [[ "$distro_name" == "$supported" ]]; then
-                distro_detected=true
-                break
-            fi
-        done
-        
-        # 检查基于Debian的发行版
-        if [[ "$distro_detected" == false && "$ID_LIKE" =~ debian|ubuntu ]]; then
-            distro_detected=true
-            distro_name="$ID_LIKE"
-        fi
-    fi
-    
-    # 方法2: 检查 /etc/debian_version (Debian系特有)
-    if [[ "$distro_detected" == false && -f "$debian_version_file" ]]; then
-        distro_detected=true
-        distro_name="debian-based"
-        distro_version=$(cat "$debian_version_file" 2>/dev/null || echo "unknown")
-    fi
-    
-    # 方法3: 检查 /etc/lsb-release (备用方法)
-    if [[ "$distro_detected" == false && -f "$lsb_release_file" ]]; then
-        source "$lsb_release_file"
-        local lsb_id=$(echo "$DISTRIB_ID" | tr '[:upper:]' '[:lower:]')
-        for supported in "${supported_distros[@]}"; do
-            if [[ "$lsb_id" == "$supported" ]]; then
-                distro_detected=true
-                distro_name="$lsb_id"
-                distro_version="$DISTRIB_RELEASE"
-                break
-            fi
-        done
-    fi
-    
-    # 方法4: 检查包管理器 (最后的检查)
-    if [[ "$distro_detected" == false ]]; then
-        if command -v apt &>/dev/null && command -v dpkg &>/dev/null; then
-            distro_detected=true
-            distro_name="debian-compatible"
-            info "检测到基于APT的包管理系统，假定为Debian兼容系统。"
-        fi
-    fi
-    
-    if [[ "$distro_detected" == false ]]; then
-        error "错误: 未检测到支持的Linux发行版。"
-        error "支持的系统: Ubuntu, Debian, Kali Linux, Raspbian, Deepin, Linux Mint, elementary OS"
-        error "当前系统信息: $(uname -a)"
-        return 1
-    fi
-    
-    # 输出检测结果
-    if [[ "$is_quiet" == false ]]; then
-        info "系统兼容性检查通过"
-        info "检测到系统: ${distro_name} ${distro_version}"
-    fi
-    
-    # 检查关键命令是否存在
-    local required_commands=("systemctl" "awk" "grep" "sed")
-    local missing_commands=()
-    
-    for cmd in "${required_commands[@]}"; do
-        if ! command -v "$cmd" &>/dev/null; then
-            missing_commands+=("$cmd")
-        fi
-    done
-    
-    if [[ ${#missing_commands[@]} -gt 0 ]]; then
-        error "错误: 缺少必要的系统命令: ${missing_commands[*]}"
-        error "请确保系统完整安装后再运行此脚本。"
-        return 1
-    fi
-    
-    return 0
+get_latest_version() {
+  local page
+  page=$(curl -sL --connect-timeout 5 --max-time 10 "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell.md" 2>/dev/null || true)
+  echo "$page" | grep -oE '^##[[:space:]]+v?[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | sed -E 's/^##[[:space:]]+v?//' || true
 }
 
-# --- 预检查与环境设置 ---
-pre_check() {
-    [[ $(id -u) != 0 ]] && error "错误: 您必须以root用户身份运行此脚本" && exit 1
-    
-    # 使用改进的系统兼容性检查
-    if ! check_system_compatibility; then
-        exit 1
-    fi
+install_snell_v5() {
+  local version="${1:-}"
+  local arch tmp url
+  arch=$(map_arch) || { err "不支持的架构: $(uname -m)"; return 1; }
 
-    if ! command -v jq &>/dev/null || ! command -v curl &>/dev/null; then
-        info "检测到缺失的依赖 (jq/curl)，正在尝试自动安装..."
-        (DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y jq curl) &> /dev/null &
-        spinner $!
-        if ! command -v jq &>/dev/null || ! command -v curl &>/dev/null; then
-            error "依赖 (jq/curl) 自动安装失败。请手动运行 'apt update && apt install -y jq curl' 后重试。"
-            exit 1
-        fi
-        success "依赖已成功安装。"
-    fi
+  if [[ -z "$version" ]]; then
+    version=$(get_latest_version)
+  fi
+  [[ -z "$version" ]] && version="$DEFAULT_VERSION"
+
+  tmp=$(mktemp -d)
+  url="https://dl.nssurge.com/snell/snell-server-v${version}-linux-${arch}.zip"
+  info "下载 Snell v5 v${version}..."
+  curl -fsSL --connect-timeout 60 "$url" -o "$tmp/snell.zip"
+  unzip -oq "$tmp/snell.zip" -d "$tmp/"
+  install -m 755 "$tmp/snell-server" "$BIN"
+
+  if [[ "${DISTRO:-}" == "alpine" ]] && check_cmd upx; then
+    upx -d "$BIN" >/dev/null 2>&1 || true
+  fi
+
+  rm -rf "$tmp"
+  ok "Snell v5 已安装到 $BIN"
 }
 
-check_xray_status() {
-    if [[ ! -f "$xray_binary_path" ]]; then xray_status_info="  Xray 状态: ${red}未安装${none}"; return; fi
-    local xray_version=$($xray_binary_path version 2>/dev/null | head -n 1 | awk '{print $2}' || echo "未知")
-    local service_status
-    if systemctl is-active --quiet xray 2>/dev/null; then service_status="${green}运行中${none}"; else service_status="${yellow}未运行${none}"; fi
-    xray_status_info="  Xray 状态: ${green}已安装${none} | ${service_status}${none}"
+gen_config() {
+  local psk="$1" port="$2" version="${3:-5}"
+  mkdir -p "$CFG"
+
+  local host ipv6_enabled
+  host=$(listen_addr)
+  ipv6_enabled="false"
+  [[ "$host" == "::" ]] && ipv6_enabled="true"
+
+  cat > "$CFG/snell-v5.conf" <<EOF
+[snell-server]
+listen = $(fmt_hostport "$host" "$port")
+psk = $psk
+version = $version
+ipv6 = $ipv6_enabled
+obfs = off
+EOF
+
+  chmod 600 "$CFG/snell-v5.conf"
+  ok "配置已生成: $CFG/snell-v5.conf"
 }
 
-# --- 菜单功能函数 ---
-install_xray() {
-    if [[ -f "$xray_binary_path" ]]; then
-        info "检测到 Xray 已安装。继续操作将覆盖现有配置。"
-        read -p "是否继续？[y/N]: " confirm
-        if [[ ! $confirm =~ ^[yY]$ ]]; then info "操作已取消。"; return; fi
-    fi
-    info "开始配置 Xray VLESS-Reality..."
-    local port uuid domain
+create_service() {
+  cat > "/etc/systemd/system/${SERVICE}.service" <<EOF
+[Unit]
+Description=Snell v5 Service
+After=network.target nss-lookup.target
+Wants=network.target
 
-    while true; do
-        read -p "$(echo -e "请输入端口 [1-65535] (默认: ${cyan}443${none}): ")" port
-        [ -z "$port" ] && port=443
-        if ! is_valid_port "$port"; then
-            error "端口无效，请输入一个1-65535之间的数字。"
-            continue
-        fi
-        if is_port_in_use "$port"; then
-            error "端口 $port 已被占用，请选择其他端口。"
-            continue
-        fi
-        break
-    done
+[Service]
+Type=simple
+ExecStart=${BIN} -c ${CFG}/snell-v5.conf
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=51200
 
-    while true; do
-        read -p "$(echo -e "请输入UUID (留空将默认生成随机UUID): ")" uuid
-        if [[ -z "$uuid" ]]; then 
-            uuid=$(cat /proc/sys/kernel/random/uuid)
-            info "已为您生成随机UUID: ${cyan}${uuid}${none}"
-            break
-        elif is_valid_uuid "$uuid"; then
-            break
-        else
-            error "UUID格式无效，请输入标准UUID格式 (如: 550e8400-e29b-41d4-a716-446655440000) 或留空自动生成。"
-        fi
-    done
+[Install]
+WantedBy=multi-user.target
+EOF
 
-    while true; do
-        read -p "$(echo -e "请输入SNI域名 (默认: ${cyan}www.amazon.com${none}): ")" domain
-        [ -z "$domain" ] && domain="www.amazon.com"
-        if is_valid_domain "$domain"; then break; else error "域名格式无效，请重新输入。"; fi
-    done
-
-    run_install "$port" "$uuid" "$domain"
+  systemctl daemon-reload
+  systemctl enable "$SERVICE" >/dev/null
+  ok "systemd 服务已创建: ${SERVICE}"
 }
 
-update_xray() {
-    if [[ ! -f "$xray_binary_path" ]]; then error "错误: Xray 未安装，无法执行更新。请先选择安装选项。" && return; fi
-    info "正在检查最新版本..."
-    local current_version=$($xray_binary_path version | head -n 1 | awk '{print $2}')
-    local latest_version=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r '.tag_name' | sed 's/v//' || echo "")
-    if [[ -z "$latest_version" ]]; then error "获取最新版本号失败，请检查网络或稍后再试。" && return; fi
-    info "当前版本: ${cyan}${current_version}${none}，最新版本: ${cyan}${latest_version}${none}"
-    if [[ "$current_version" == "$latest_version" ]]; then success "您的 Xray 已是最新版本，无需更新。" && return; fi
-    
-    info "发现新版本，开始更新..."
-    if ! execute_official_script "install"; then error "Xray 核心更新失败！" && return; fi
-    info "正在更新 GeoIP 和 GeoSite 数据文件..."
-    execute_official_script "install-geodata"
-
-    if ! restart_xray; then return; fi
-    success "Xray 更新成功！"
+restart_service() {
+  systemctl restart "$SERVICE"
+  systemctl --no-pager --full status "$SERVICE" | sed -n '1,20p'
 }
 
-restart_xray() {
-    if [[ ! -f "$xray_binary_path" ]]; then error "错误: Xray 未安装，无法重启。" && return 1; fi
-    info "正在重启 Xray 服务..."
-    if ! systemctl restart xray; then
-        error "错误: Xray 服务重启失败, 请使用菜单 5 查看日志检查具体原因。"
-        return 1
-    fi
-    sleep 1
-    if ! systemctl is-active --quiet xray; then
-        error "错误: Xray 服务启动失败, 请使用菜单 5 查看日志检查具体原因。"
-        return 1
-    fi
-    success "Xray 服务已成功重启！"
+show_info() {
+  local ip
+  ip=$(curl -4s --max-time 5 https://api.ipify.org 2>/dev/null || true)
+  [[ -z "$ip" ]] && ip=$(curl -6s --max-time 5 https://api64.ipify.org 2>/dev/null || true)
+
+  echo "----------------------------------------"
+  echo "配置文件: $CFG/snell-v5.conf"
+  echo "二进制:   $BIN"
+  [[ -n "$ip" ]] && echo "服务器IP: $ip"
+  echo "服务名:   $SERVICE"
+  echo "----------------------------------------"
+  [[ -f "$CFG/snell-v5.conf" ]] && cat "$CFG/snell-v5.conf"
+  echo "----------------------------------------"
 }
 
-uninstall_xray() {
-    if [[ ! -f "$xray_binary_path" ]]; then error "错误: Xray 未安装，无需卸载。" && return; fi
-    read -p "您确定要卸载 Xray 吗？这将删除所有相关文件。[Y/n]: " confirm
-    if [[ "$confirm" =~ ^[nN]$ ]]; then
-        info "卸载操作已取消。"
-        return
-    fi
-    info "正在卸载 Xray..."
-    if execute_official_script "remove --purge"; then
-        rm -f ~/xray_vless_reality_link.txt
-        success "Xray 已成功卸载。"
-    else
-        error "Xray 卸载失败！"
-        return 1
-    fi
+uninstall_all() {
+  systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/${SERVICE}.service"
+  systemctl daemon-reload || true
+  rm -f "$BIN"
+  rm -rf "$CFG"
+  ok "Snell v5 已卸载"
 }
 
-view_xray_log() {
-    if [[ ! -f "$xray_binary_path" ]]; then error "错误: Xray 未安装，无法查看日志。" && return; fi
-    info "正在显示 Xray 实时日志... 按 Ctrl+C 退出。"
-    journalctl -u xray -f --no-pager
+interactive_install() {
+  local port psk version
+  read -rp "请输入监听端口 [默认 443]: " port
+  port=${port:-443}
+  if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    err "端口无效"
+    return 1
+  fi
+
+  read -rp "请输入 PSK（留空自动生成）: " psk
+  [[ -z "$psk" ]] && psk=$(openssl rand -base64 32 | tr -d '\n')
+
+  read -rp "请输入 Snell 协议版本 [默认 5]: " version
+  version=${version:-5}
+
+  ensure_deps
+  install_snell_v5
+  gen_config "$psk" "$port" "$version"
+  create_service
+  restart_service
+  show_info
 }
 
-modify_config() {
-    if [[ ! -f "$xray_config_path" ]]; then error "错误: Xray 未安装，无法修改配置。" && return; fi
-    info "读取当前配置..."
-    local current_port=$(jq -r '.inbounds[0].port' "$xray_config_path")
-    local current_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
-    local current_domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$xray_config_path")
-    local private_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$xray_config_path")
-    local public_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.publicKey' "$xray_config_path")
-    local shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$xray_config_path")
-
-    info "请输入新配置，直接回车则保留当前值。"
-    local port uuid domain
-    
-    while true; do
-        read -p "$(echo -e "端口 (当前: ${cyan}${current_port}${none}): ")" port
-        [ -z "$port" ] && port=$current_port
-        if ! is_valid_port "$port"; then
-            error "端口无效，请输入一个1-65535之间的数字。"
-            continue
-        fi
-        # 如果端口没有变化，跳过占用检查
-        if [[ "$port" != "$current_port" ]] && is_port_in_use "$port"; then
-            error "端口 $port 已被占用，请选择其他端口。"
-            continue
-        fi
-        break
-    done
-    
-    while true; do
-        read -p "$(echo -e "UUID (当前: ${cyan}${current_uuid}${none}): ")" uuid
-        [ -z "$uuid" ] && uuid=$current_uuid
-        if is_valid_uuid "$uuid"; then
-            break
-        else
-            error "UUID格式无效，请输入标准UUID格式。"
-        fi
-    done
-    
-    while true; do
-        read -p "$(echo -e "SNI域名 (当前: ${cyan}${current_domain}${none}): ")" domain
-        [ -z "$domain" ] && domain=$current_domain
-        if is_valid_domain "$domain"; then break; else error "域名格式无效，请重新输入。"; fi
-    done
-
-    write_config "$port" "$uuid" "$domain" "$private_key" "$public_key" "$shortid"
-    if ! restart_xray; then return; fi
-
-    success "配置修改成功！"
-    view_subscription_info
-}
-
-view_subscription_info() {
-    if [ ! -f "$xray_config_path" ]; then error "错误: 配置文件不存在, 请先安装。" && return; fi
-    
-    local ip
-    if ! ip=$(get_public_ip); then return 1; fi
-
-    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$xray_config_path")
-    local port=$(jq -r '.inbounds[0].port' "$xray_config_path")
-    local domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$xray_config_path")
-    local public_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.publicKey' "$xray_config_path")
-    local shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$xray_config_path")
-    if [[ -z "$public_key" ]]; then error "配置文件中缺少公钥信息,可能是旧版配置,请重新安装以修复。" && return; fi
-
-    local display_ip=$ip && [[ $ip =~ ":" ]] && display_ip="[$ip]"
-    local link_name="$(hostname) X-reality"
-    local link_name_encoded=$(echo "$link_name" | sed 's/ /%20/g')
-    local vless_url="vless://${uuid}@${display_ip}:${port}?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=${domain}&fp=chrome&pbk=${public_key}&sid=${shortid}#${link_name_encoded}"
-
-    if [[ "$is_quiet" = true ]]; then
-        echo "${vless_url}"
-    else
-        echo "${vless_url}" > ~/xray_vless_reality_link.txt
-        echo "----------------------------------------------------------------"
-        echo -e "$green --- Xray VLESS-Reality 订阅信息 --- $none"
-        echo -e "$yellow 名称: $cyan$link_name$none"
-        echo -e "$yellow 地址: $cyan$ip$none"
-        echo -e "$yellow 端口: $cyan$port$none"
-        echo -e "$yellow UUID: $cyan$uuid$none"
-        echo -e "$yellow 流控: $cyan"xtls-rprx-vision"$none"
-        echo -e "$yellow 指纹: $cyan"chrome"$none"
-        echo -e "$yellow SNI: $cyan$domain$none"
-        echo -e "$yellow 公钥: $cyan$public_key$none"
-        echo -e "$yellow ShortId: $cyan$shortid$none"
-        echo "----------------------------------------------------------------"
-        echo -e "$yellow V6VPS替换IP地址为V6$none"
-        echo -e "$green 订阅链接 (已保存到 ~/xray_vless_reality_link.txt): $none\n"; echo -e "$cyan${vless_url}${none}"
-        echo "----------------------------------------------------------------"
-    fi
-}
-
-configure_custom_socks5_outbound() {
-    if [[ ! -f "$xray_config_path" ]]; then error "错误: Xray 未安装，无法配置出口模式。" && return; fi
-
-    local mode current_protocol tmp_file
-    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$xray_config_path" 2>/dev/null || echo "freedom")
-
-    echo "---------------------------------------------"
-    echo "请选择出口模式："
-    if [[ "$current_protocol" == "socks" ]]; then
-        echo "当前模式: Socks5"
-    else
-        echo "当前模式: 直连"
-    fi
-    echo "1) 直连"
-    echo "2) Socks5"
-    echo "0) 取消"
-    echo "---------------------------------------------"
-
-    read -p "请输入选项 [0-2]: " mode
-    case "$mode" in
-        1)
-            tmp_file=$(mktemp)
-            jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$xray_config_path" > "$tmp_file"
-            if ! jq empty "$tmp_file" >/dev/null 2>&1; then
-                rm -f "$tmp_file"
-                error "生成的直连配置无效。"
-                return 1
-            fi
-            cp "$xray_config_path" "${xray_config_path}.bak.$(date +%s)"
-            mv "$tmp_file" "$xray_config_path"
-            chmod 644 "$xray_config_path" 2>/dev/null || true
-            if ! restart_xray; then
-                error "切换到直连失败。"
-                return 1
-            fi
-            success "已切换为直连出口！"
-            return
-            ;;
-        2)
-            ;;
-        0|"")
-            info "已取消配置。"
-            return
-            ;;
-        *)
-            error "无效选项，请输入 0-2 之间的数字。"
-            return 1
-            ;;
+menu() {
+  while true; do
+    clear
+    echo "Snell v5 "
+    echo "----------------------------------------"
+    echo "1) 安装 / 重装 Snell v5"
+    echo "2) 查看配置"
+    echo "3) 重启服务"
+    echo "4) 卸载"
+    echo "0) 退出"
+    echo "----------------------------------------"
+    read -rp "请输入选项 [0-4]: " choice
+    case "$choice" in
+      1) interactive_install ; read -n 1 -s -r -p "按任意键继续..." ;;
+      2) show_info ; read -n 1 -s -r -p "按任意键继续..." ;;
+      3) restart_service ; read -n 1 -s -r -p "按任意键继续..." ;;
+      4) uninstall_all ; read -n 1 -s -r -p "按任意键继续..." ;;
+      0) exit 0 ;;
+      *) err "无效选项"; sleep 1 ;;
     esac
-
-    info "配置自定义 Socks5 出口。"
-
-    local socks_host socks_port socks_user socks_pass
-
-    read -p "请输入 Socks5 服务器地址/IP: " socks_host
-    [[ -z "$socks_host" ]] && info "已取消配置。" && return
-
-    while true; do
-        read -p "请输入 Socks5 端口 (默认: 1080): " socks_port
-        [[ -z "$socks_port" ]] && socks_port=1080
-        if is_valid_port "$socks_port"; then
-            break
-        else
-            error "端口无效，请输入一个1-65535之间的数字。"
-        fi
-    done
-
-    read -p "请输入 Socks5 用户名 (可留空): " socks_user
-    if [[ -n "$socks_user" ]]; then
-        read -s -p "请输入 Socks5 密码: " socks_pass
-        echo
-    else
-        socks_pass=""
-    fi
-
-    tmp_file=$(mktemp)
-
-    if [[ -n "$socks_user" ]]; then
-        jq \
-            --arg host "$socks_host" \
-            --argjson port "$socks_port" \
-            --arg user "$socks_user" \
-            --arg pass "$socks_pass" \
-            '
-            .outbounds = [
-              {
-                "protocol": "socks",
-                "tag": "custom-socks5-out",
-                "settings": {
-                  "servers": [
-                    {
-                      "address": $host,
-                      "port": $port,
-                      "users": [
-                        {
-                          "user": $user,
-                          "pass": $pass
-                        }
-                      ]
-                    }
-                  ]
-                }
-              }
-            ]
-            ' "$xray_config_path" > "$tmp_file"
-    else
-        jq \
-            --arg host "$socks_host" \
-            --argjson port "$socks_port" \
-            '
-            .outbounds = [
-              {
-                "protocol": "socks",
-                "tag": "custom-socks5-out",
-                "settings": {
-                  "servers": [
-                    {
-                      "address": $host,
-                      "port": $port
-                    }
-                  ]
-                }
-              }
-            ]
-            ' "$xray_config_path" > "$tmp_file"
-    fi
-
-    if ! jq empty "$tmp_file" >/dev/null 2>&1; then
-        rm -f "$tmp_file"
-        error "生成的 Socks5 配置无效，请检查输入后重试。"
-        return 1
-    fi
-
-    cp "$xray_config_path" "${xray_config_path}.bak.$(date +%s)"
-    mv "$tmp_file" "$xray_config_path"
-    chmod 644 "$xray_config_path" 2>/dev/null || true
-
-    if ! restart_xray; then
-        error "Xray 重启失败，当前配置可能与系统环境不兼容。"
-        return 1
-    fi
-    success "已切换为 Socks5 出口！"
+  done
 }
 
-# --- 核心逻辑函数 ---
-write_config() {
-    local port=$1 uuid=$2 domain=$3 private_key=$4 public_key=$5 shortid=${6:-}
-
-    if [[ -z "$shortid" ]]; then
-        shortid=$(openssl rand -hex 8)
-    fi
-
-    jq -n \
-        --argjson port "$port" \
-        --arg uuid "$uuid" \
-        --arg domain "$domain" \
-        --arg private_key "$private_key" \
-        --arg public_key "$public_key" \
-        --arg shortid "$shortid" \
-    '{
-        "log": {"loglevel": "warning"},
-        "inbounds": [{
-            "listen": "0.0.0.0",
-            "port": $port,
-            "protocol": "vless",
-            "settings": {
-                "clients": [{"id": $uuid, "flow": "xtls-rprx-vision"}],
-                "decryption": "none"
-            },
-            "streamSettings": {
-                "network": "tcp",
-                "security": "reality",
-                "realitySettings": {
-                    "show": false,
-                    "dest": ($domain + ":443"),
-                    "xver": 0,
-                    "serverNames": [$domain],
-                    "privateKey": $private_key,
-                    "publicKey": $public_key,
-                    "shortIds": [$shortid]
-                }
-            },
-            "sniffing": {
-                "enabled": true,
-                "destOverride": ["http", "tls", "quic"]
-            }
-        }],
-        "outbounds": [{
-            "protocol": "freedom",
-            "settings": {
-                "domainStrategy": "UseIPv4v6"
-            }
-        }]
-    }' > "$xray_config_path"
-}
-
-run_install() {
-    local port=$1 uuid=$2 domain=$3
-    info "正在下载并安装 Xray 核心..."
-    if ! execute_official_script "install"; then
-        error "Xray 核心安装失败！请检查网络连接。"
-        exit 1
-    fi
-
-    info "正在安装/更新 GeoIP 和 GeoSite 数据文件..."
-    if ! execute_official_script "install-geodata"; then
-        error "Geo-data 更新失败！"
-        info "这通常不影响核心功能，您可以稍后通过更新选项(2)来重试。"
-    fi
-
-    info "正在生成 Reality 密钥对..."
-
-    local key_pair
-    key_pair=$($xray_binary_path x25519 2>/dev/null)
-
-    local private_key
-    local public_key
-
-    private_key=$(echo "$key_pair" | grep -i "PrivateKey" | awk -F': ' '{print $2}')
-    public_key=$(echo "$key_pair" | grep -E "PublicKey|Password" | awk -F': ' '{print $2}')
-
-    if [[ -z "$private_key" || -z "$public_key" ]]; then
-        echo "$key_pair"
-        error "生成 Reality 密钥对失败！请检查 Xray 核心是否正常。"
-        exit 1
-    fi
-
-    info "正在写入 Xray 配置文件..."
-    write_config "$port" "$uuid" "$domain" "$private_key" "$public_key"
-
-    if ! restart_xray; then exit 1; fi
-
-    success "Xray 安装/配置成功！"
-    view_subscription_info
-}
-
-press_any_key_to_continue() {
-    echo ""
-    read -n 1 -s -r -p "按任意键返回主菜单..." || true
-}
-
-main_menu() {
-    while true; do
-        clear
-        echo -e "$cyan Xray VLESS-Reality 安装管理$none"
-        echo "---------------------------------------------"
-        check_xray_status
-        echo -e "${xray_status_info}"
-        echo "---------------------------------------------"
-        # 修改：明确菜单项 1
-        printf "  ${green}%-2s${none} %-35s\n" "1." "安装/重装 Xray (VLESS-reality)"
-        printf "  ${cyan}%-2s${none} %-35s\n" "2." "更新 Xray"
-        printf "  ${yellow}%-2s${none} %-35s\n" "3." "重启 Xray"
-        printf "  ${red}%-2s${none} %-35s\n" "4." "卸载 Xray"
-        printf "  ${magenta}%-2s${none} %-35s\n" "5." "查看 Xray 日志"
-        printf "  ${cyan}%-2s${none} %-35s\n" "6." "修改节点配置"
-        printf "  ${green}%-2s${none} %-35s\n" "7." "查看订阅信息"
-        printf "  ${yellow}%-2s${none} %-35s\n" "8." "自定义 Socks5 出口"
-        echo "---------------------------------------------"
-        printf "  ${yellow}%-2s${none} %-35s\n" "0." "退出脚本"
-        echo "---------------------------------------------"
-        read -p "请输入选项 [0-8]: " choice
-
-        local needs_pause=true
-        case $choice in
-            1) install_xray ;;
-            2) update_xray ;;
-            3) restart_xray ;;
-            4) uninstall_xray ;;
-            5) view_xray_log; needs_pause=false ;;
-            6) modify_config ;;
-            7) view_subscription_info ;;
-            8) configure_custom_socks5_outbound ;;
-            0) success "感谢使用！"; exit 0 ;;
-            *) error "无效选项，请输入 0-8 之间的数字。" ;;
-        esac
-
-        if [ "$needs_pause" = true ]; then
-            press_any_key_to_continue
-        fi
-    done
-}
-
-# --- 脚本主入口 ---
 main() {
-    pre_check
-    if [[ $# -gt 0 && "$1" == "install" ]]; then
-        shift
-        local port="" uuid="" domain=""
-        while [[ $# -gt 0 ]]; do
-            case "$1" in
-                --port) port="$2"; shift 2 ;;
-                --uuid) uuid="$2"; shift 2 ;;
-                --sni) domain="$2"; shift 2 ;;
-                --quiet|-q) is_quiet=true; shift ;;
-                *) error "未知参数: $1"; exit 1 ;;
-            esac
-        done
-        [[ -z "$port" ]] && port=443
-        [[ -z "$uuid" ]] && uuid=$(cat /proc/sys/kernel/random/uuid)
-        [[ -z "$domain" ]] && domain="learn.microsoft.com"
-        if ! is_valid_port "$port" || ! is_valid_domain "$domain"; then
-            error "参数无效。请检查端口或SNI域名格式。" && exit 1
-        fi
-        if [[ -n "$uuid" ]] && ! is_valid_uuid "$uuid"; then
-            error "UUID格式无效。请提供标准UUID格式或留空自动生成。" && exit 1
-        fi
-        if is_port_in_use "$port"; then
-            error "端口 $port 已被占用，请选择其他端口。" && exit 1
-        fi
-        run_install "$port" "$uuid" "$domain"
-    else
-        main_menu
-    fi
+  require_root
+  menu
 }
 
 main "$@"

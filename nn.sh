@@ -28,7 +28,29 @@ update_jboard() {
 
     cd $APP_DIR || { echo -e "${RED}目录不存在，请先安装${RESET}"; return; }
 
-    bash <(curl -fsSL https://raw.githubusercontent.com/JetSprow/J-Board/main/scripts/upgrade-jboard-panel.sh)
+    if [ -d ".git" ]; then
+        echo -e "${CYAN}>>> 拉取最新代码...${RESET}"
+        git pull --ff-only || { echo -e "${RED}git pull 失败${RESET}"; return; }
+
+        echo -e "${CYAN}>>> 构建镜像...${RESET}"
+        docker compose build init app || { echo -e "${RED}构建失败${RESET}"; return; }
+
+        echo -e "${CYAN}>>> 更新数据库...${RESET}"
+        docker compose --profile setup run --rm init sh -lc 'npm run db:push' || {
+            echo -e "${RED}数据库更新失败${RESET}"
+            return
+        }
+
+        echo -e "${CYAN}>>> 启动服务...${RESET}"
+        docker compose up -d app || { echo -e "${RED}启动失败${RESET}"; return; }
+
+        echo -e "${GREEN}>>> 更新完成 ✅${RESET}"
+}
+
+update_agent() {
+    echo -e "${CYAN}>>> 开始更新 jboard-agent...${RESET}"
+
+    bash <(curl -fsSL https://raw.githubusercontent.com/JetSprow/J-Board/main/scripts/upgrade-jboard-agent.sh)
 
     echo -e "${GREEN}>>> 更新完成${RESET}"
 }
@@ -66,6 +88,7 @@ menu() {
     echo -e "${GREEN}2.更新 J-Board${RESET}"
     echo -e "${GREEN}3.查看日志${RESET}"
     echo -e "${GREEN}4.卸载 J-Board${RESET}"
+    echo -e "${GREEN}5.更新 jboard-agent${RESET}"
     echo -e "${GREEN}0.退出${RESET}"
     read -p "$(echo -e ${GREEN}请输入菜单编号:${RESET} )" choice
 
@@ -74,6 +97,7 @@ menu() {
         2) update_jboard ;;
         3) logs_jboard ;;
         4) uninstall_jboard ;;
+        5) update_agent ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

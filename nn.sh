@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Zephyr SSH 一键管理脚本
+# TGState 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,8 +8,10 @@ YELLOW="\033[33m"
 RESET="\033[0m"
 RED="\033[31m"
 
-APP_NAME="zephyr-ssh"
+APP_NAME="tgstate"
 APP_DIR="/opt/$APP_NAME"
+
+REPO="https://github.com/buyi06/tgstate-rust.git"
 
 get_public_ip() {
     local ip
@@ -23,7 +25,7 @@ get_public_ip() {
 
 menu() {
     clear
-    echo -e "${GREEN}=== Zephyr SSH 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== TGState 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 重启${RESET}"
@@ -56,15 +58,52 @@ install_app() {
         curl -fsSL https://get.docker.com | bash
     fi
 
-    mkdir -p "$APP_DIR/zephyr-data"
+    mkdir -p "$APP_DIR"
     cd "$APP_DIR" || exit
+
+    if [ ! -d ".git" ]; then
+        echo -e "${GREEN}克隆项目...${RESET}"
+        git clone "$REPO" .
+    fi
+
+    echo -e "${GREEN}修复 Dockerfile（升级 Rust）...${RESET}"
+
+cat > Dockerfile <<'EOF'
+# ---------- builder ----------
+FROM rust:latest AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+RUN cargo build --release
+RUN rm -rf src
+
+COPY . .
+RUN cargo build --release
+
+# ---------- runtime ----------
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /build/target/release/tgstate /app/tgstate
+
+EXPOSE 8000
+
+CMD ["./tgstate"]
+EOF
 
     echo -e "${GREEN}配置端口...${RESET}"
 
-    read -p "请输入访问端口 [默认:3000]: " PORT
-    [ -z "$PORT" ] && PORT=3000
+    read -p "请输入访问端口 [默认:8000]: " PORT
+    [ -z "$PORT" ] && PORT=8000
 
-    # 检查端口是否占用
+    # 检查端口占用
     if ss -tuln | grep -q ":$PORT "; then
         echo -e "${RED}端口 $PORT 已被占用！${RESET}"
         read -p "按回车返回菜单..."
@@ -72,40 +111,28 @@ install_app() {
         return
     fi
 
-    read -p "请输入访问域名(例如 https://ssh.example.com): " DOMAIN
-
-    ENCRYPTION_KEY=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 32)
-
-    SERVER_IP=$(get_public_ip)
-    [ -z "$DOMAIN" ] && DOMAIN="http://127.0.0.1:${PORT}"
-
-    cat > ./zephyr-data/.env <<EOF
-ENCRYPTION_KEY=$ENCRYPTION_KEY
-PUBLIC_ORIGIN=$DOMAIN
-PORT=3000
-EOF
-
     cat > docker-compose.yml <<EOF
 services:
-  zephyr-ssh:
-    container_name: zephyr-ssh
-    env_file:
-      - ./zephyr-data/.env
+  tgstate:
+    build: .
     ports:
-      - 127.0.0.1:${PORT}:3000
+      - "127.0.0.1:${PORT}:8000"
     volumes:
-      - ./zephyr-data:/app/data
+      - tgstate_data:/app/data
     restart: unless-stopped
-    image: ghcr.io/lanlan13-14/zephyr-ssh:latest
+
+volumes:
+  tgstate_data:
 EOF
 
-    echo -e "${GREEN}启动服务...${RESET}"
-    docker compose up -d
+    echo -e "${GREEN}构建并启动（首次会较慢）...${RESET}"
+    docker compose up -d --build
+
+    SERVER_IP=$(get_public_ip)
 
     echo
-    echo -e "${GREEN}✅ Zephyr SSH 已启动${RESET}"
-    echo -e "${YELLOW}访问地址: $DOMAIN${RESET}"
-    echo -e "${YELLOW}密钥: $ENCRYPTION_KEY${RESET}"
+    echo -e "${GREEN}✅ TGState 已启动${RESET}"
+    echo -e "${YELLOW}访问: http://127.0.0.1:${PORT}${RESET}"
 
     read -p "按回车返回菜单..."
     menu
@@ -115,9 +142,11 @@ update_app() {
 
     cd "$APP_DIR" || { echo "未安装"; sleep 1; menu; }
 
-    echo -e "${GREEN}拉取最新镜像...${RESET}"
-    docker compose pull
-    docker compose up -d
+    echo -e "${GREEN}拉取更新...${RESET}"
+    git pull
+
+    echo -e "${GREEN}重新构建...${RESET}"
+    docker compose up -d --build
 
     echo -e "${GREEN}✅ 更新完成${RESET}"
 
@@ -149,7 +178,7 @@ view_logs() {
 check_status() {
 
     echo -e "${GREEN}容器状态：${RESET}"
-    docker ps | grep zephyr-ssh
+    docker ps | grep tgstate
 
     read -p "按回车返回菜单..."
     menu

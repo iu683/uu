@@ -1,200 +1,174 @@
 #!/bin/bash
 # ========================================
-# TGState 一键管理脚本
+# TGTLDR 一键管理脚本（官方模板版）
 # ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RESET="\033[0m"
 RED="\033[31m"
+RESET="\033[0m"
 
-APP_NAME="tgstate"
+APP_NAME="tgtldr"
 APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-REPO="https://github.com/buyi06/tgstate-rust.git"
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "0.0.0.0"
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
+    fi
 }
 
 menu() {
-    clear
-    echo -e "${GREEN}=== TGState 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 重启${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 查看状态${RESET}"
-    echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) restart_app ;;
-        4) view_logs ;;
-        5) check_status ;;
-        6) uninstall_app ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
-    esac
+    while true; do
+        clear
+        echo -e "${GREEN}=== TGTLDR 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
 }
 
 install_app() {
 
-    echo -e "${GREEN}检查 Docker...${RESET}"
-
-    if ! command -v docker &>/dev/null; then
-        apt update
-        apt install -y curl
-        curl -fsSL https://get.docker.com | bash
-    fi
+    check_docker
 
     mkdir -p "$APP_DIR"
     cd "$APP_DIR" || exit
 
-    if [ ! -d ".git" ]; then
-        echo -e "${GREEN}克隆项目...${RESET}"
-        git clone "$REPO" .
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
     fi
 
-    echo -e "${GREEN}修复 Dockerfile（升级 Rust）...${RESET}"
+    read -p "请输入访问端口 [默认:3000]: " input_port
+    PORT=${input_port:-3000}
 
-cat > Dockerfile <<'EOF'
-# ---------- builder ----------
-FROM rust:latest AS builder
+    read -p "请输入绑定地址 [默认:127.0.0.1]: " input_bind
+    BIND=${input_bind:-127.0.0.1}
 
-WORKDIR /build
+    read -p "请输入访问地址(带 http/https) [默认:http://localhost:${PORT}]: " input_origin
+    WEB_ORIGIN=${input_origin:-http://localhost:${PORT}}
 
-RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+    read -p "请输入 PostgreSQL 密码 [默认:postgres]: " input_dbpass
+    DB_PASS=${input_dbpass:-postgres}
 
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release
-RUN rm -rf src
+    MASTER_KEY=$(openssl rand -hex 32)
 
-COPY . .
-RUN cargo build --release
-
-# ---------- runtime ----------
-FROM debian:bookworm-slim
-
-RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-COPY --from=builder /build/target/release/tgstate /app/tgstate
-
-EXPOSE 8000
-
-CMD ["./tgstate"]
+    # 生成 .env
+    cat > .env <<EOF
+TGTLDR_MASTER_KEY=${MASTER_KEY}
+TGTLDR_HOST_BIND=${BIND}
+TGTLDR_HOST_WEB_PORT=${PORT}
+TGTLDR_WEB_ORIGIN=${WEB_ORIGIN}
+TGTLDR_IMAGE_NAMESPACE=fr0der1c
+TGTLDR_IMAGE_TAG=latest
 EOF
 
-    echo -e "${GREEN}配置端口...${RESET}"
-
-    read -p "请输入访问端口 [默认:8000]: " PORT
-    [ -z "$PORT" ] && PORT=8000
-
-    # 检查端口占用
-    if ss -tuln | grep -q ":$PORT "; then
-        echo -e "${RED}端口 $PORT 已被占用！${RESET}"
-        read -p "按回车返回菜单..."
-        menu
-        return
-    fi
-
-    cat > docker-compose.yml <<EOF
+    # 生成 docker-compose.yml
+    cat > "$COMPOSE_FILE" <<'EOF'
 services:
-  tgstate:
-    build: .
-    ports:
-      - "127.0.0.1:${PORT}:8000"
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: tgtldr
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
     volumes:
-      - tgstate_data:/app/data
-    restart: unless-stopped
+      - postgres-data:/var/lib/postgresql/data
+
+  app:
+    image: ${TGTLDR_IMAGE_NAMESPACE:-fr0der1c}/tgtldr-app:${TGTLDR_IMAGE_TAG:-latest}
+    environment:
+      TGTLDR_DATABASE_URL: postgres://postgres:postgres@postgres:5432/tgtldr?sslmode=disable
+      TGTLDR_MASTER_KEY: ${TGTLDR_MASTER_KEY:-}
+      TGTLDR_MASTER_KEY_FILE: /var/lib/tgtldr/master.key
+      TGTLDR_WEB_ORIGIN: http://localhost:${TGTLDR_HOST_WEB_PORT:-3000}
+      TGTLDR_HTTP_ADDR: :8080
+    depends_on:
+      - postgres
+    volumes:
+      - app-data:/var/lib/tgtldr
+
+  web:
+    image: ${TGTLDR_IMAGE_NAMESPACE:-fr0der1c}/tgtldr-web:${TGTLDR_IMAGE_TAG:-latest}
+    environment:
+      TGTLDR_INTERNAL_API_BASE_URL: http://app:8080
+    depends_on:
+      - app
+    ports:
+      - "${TGTLDR_HOST_BIND:-127.0.0.1}:${TGTLDR_HOST_WEB_PORT:-3000}:3000"
 
 volumes:
-  tgstate_data:
+  app-data:
+  postgres-data:
 EOF
 
-    echo -e "${GREEN}构建并启动（首次会较慢）...${RESET}"
-    docker compose up -d --build
-
-    SERVER_IP=$(get_public_ip)
+    docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ TGState 已启动${RESET}"
-    echo -e "${YELLOW}访问: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}✅ TGTLDR 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: ${WEB_ORIGIN}${RESET}"
+    echo -e "${YELLOW}🔑 MASTER_KEY:$MASTER_KEY${RESET}"
+    echo -e "${YELLOW}📂 数据目录: $APP_DIR${RESET}"
 
     read -p "按回车返回菜单..."
-    menu
 }
 
 update_app() {
-
-    cd "$APP_DIR" || { echo "未安装"; sleep 1; menu; }
-
-    echo -e "${GREEN}拉取更新...${RESET}"
-    git pull
-
-    echo -e "${GREEN}重新构建...${RESET}"
-    docker compose up -d --build
-
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
     echo -e "${GREEN}✅ 更新完成${RESET}"
-
     read -p "按回车返回菜单..."
-    menu
 }
 
 restart_app() {
-
-    cd "$APP_DIR" || { echo "未安装"; sleep 1; menu; }
-
+    cd "$APP_DIR" || return
     docker compose restart
-
     echo -e "${GREEN}✅ 已重启${RESET}"
-
     read -p "按回车返回菜单..."
-    menu
 }
 
 view_logs() {
-
     cd "$APP_DIR" || return
     docker compose logs -f
-
-    read -p "按回车返回菜单..."
-    menu
 }
 
 check_status() {
-
-    echo -e "${GREEN}容器状态：${RESET}"
-    docker ps | grep tgstate
-
+    docker ps | grep tgtldr
     read -p "按回车返回菜单..."
-    menu
 }
 
 uninstall_app() {
-
     cd "$APP_DIR" || return
-
     docker compose down -v
     rm -rf "$APP_DIR"
-
-    echo -e "${GREEN}✅ 已卸载${RESET}"
-
+    echo -e "${RED}✅ 已彻底卸载${RESET}"
     read -p "按回车返回菜单..."
-    menu
 }
 
 menu

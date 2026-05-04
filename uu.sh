@@ -1,110 +1,173 @@
 #!/bin/bash
 # ========================================
-# J-Board 一键管理脚本
+# TGState (本地构建版) 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
-CYAN="\033[1;36m"
 RESET="\033[0m"
+RED="\033[31m"
 
-APP_NAME="jboard"
-APP_DIR="/opt/jboard"
+APP_NAME="tgstate"
+APP_DIR="/opt/$APP_NAME"
 
-install_jboard() {
-    echo -e "${CYAN}>>> 开始安装 J-Board...${RESET}"
+REPO="https://github.com/Polarisiu/tgState.git"
 
-    mkdir -p $APP_DIR
-    cd $APP_DIR || exit
-
-    bash <(curl -fsSL https://raw.githubusercontent.com/JetSprow/J-Board/main/scripts/install-jboard-panel.sh)
-
-    echo -e "${GREEN}>>> 安装完成${RESET}"
-}
-
-update_jboard() {
-    echo -e "${CYAN}>>> 开始更新 J-Board...${RESET}"
-
-    cd $APP_DIR || { echo -e "${RED}目录不存在，请先安装${RESET}"; return; }
-
-
-    echo -e "${CYAN}>>> 拉取最新代码...${RESET}"
-    git pull --ff-only || { echo -e "${RED}git pull 失败${RESET}"; return; }
-
-    echo -e "${CYAN}>>> 构建镜像...${RESET}"
-    docker compose build init app || { echo -e "${RED}构建失败${RESET}"; return; }
-
-    echo -e "${CYAN}>>> 更新数据库...${RESET}"
-    docker compose --profile setup run --rm init sh -lc 'npm run db:push' || {
-        echo -e "${RED}数据库更新失败${RESET}"
-        return
-    }
-
-    echo -e "${CYAN}>>> 启动服务...${RESET}"
-    docker compose up -d app || { echo -e "${RED}启动失败${RESET}"; return; }
-
-    echo -e "${GREEN}>>> 更新完成 ✅${RESET}"
-}
-
-update_agent() {
-    echo -e "${CYAN}>>> 开始更新 jboard-agent...${RESET}"
-
-    bash <(curl -fsSL https://raw.githubusercontent.com/JetSprow/J-Board/main/scripts/upgrade-jboard-agent.sh)
-
-    echo -e "${GREEN}>>> 更新完成${RESET}"
-}
-
-logs_jboard() {
-    echo -e "${CYAN}>>> 查看日志 (Ctrl+C 退出)...${RESET}"
-
-    cd $APP_DIR || { echo -e "${RED}目录不存在${RESET}"; return; }
-
-    docker compose logs -f app
-}
-
-uninstall_jboard() {
-    echo -e "${CYAN}>>> 正在卸载 J-Board...${RESET}"
-
-    if [ -f "$APP_DIR/docker-compose.yml" ]; then
-        cd $APP_DIR || exit
-        docker compose down -v
-        echo -e "${GREEN}>>> 容器已停止并删除${RESET}"
-    else
-        echo -e "${YELLOW}未检测到 docker-compose.yml，跳过容器清理${RESET}"
-    fi
-
-    rm -rf $APP_DIR
-
-    echo -e "${GREEN}>>> 已彻底卸载${RESET}"
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "0.0.0.0"
 }
 
 menu() {
     clear
-    echo -e "${GREEN}==================================${RESET}"
-    echo -e "${GREEN}        J-Board 管理${RESET}"
-    echo -e "${GREEN}==================================${RESET}"
-    echo -e "${GREEN}1.安装 J-Board${RESET}"
-    echo -e "${GREEN}2.更新 J-Board${RESET}"
-    echo -e "${GREEN}3.查看日志${RESET}"
-    echo -e "${GREEN}4.卸载 J-Board${RESET}"
-    echo -e "${GREEN}5.更新 jboard-agent${RESET}"
-    echo -e "${GREEN}0.退出${RESET}"
-    read -p "$(echo -e ${GREEN}请输入菜单编号:${RESET} )" choice
+    echo -e "${GREEN}=== TGState 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 重启${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}5) 查看状态${RESET}"
+    echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
     case $choice in
-        1) install_jboard ;;
-        2) update_jboard ;;
-        3) logs_jboard ;;
-        4) uninstall_jboard ;;
-        5) update_agent ;;
+        1) install_app ;;
+        2) update_app ;;
+        3) restart_app ;;
+        4) view_logs ;;
+        5) check_status ;;
+        6) uninstall_app ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
+        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
     esac
 }
 
-while true; do
-    menu
+install_app() {
+
+    echo -e "${GREEN}检查 Docker...${RESET}"
+
+    if ! command -v docker &>/dev/null; then
+        apt update
+        apt install -y curl
+        curl -fsSL https://get.docker.com | bash
+    fi
+
+    mkdir -p "$APP_DIR"
+    cd "$APP_DIR" || exit
+
+    if [ ! -d ".git" ]; then
+        echo -e "${GREEN}克隆项目...${RESET}"
+        git clone "$REPO" .
+    fi
+
+    echo -e "${GREEN}配置参数...${RESET}"
+
+    # 👉 端口
+    read -p "请输入端口 [默认:8000]: " PORT
+    [ -z "$PORT" ] && PORT=8000
+
+    # 👉 检查端口占用
+    if ss -tuln | grep -q ":$PORT "; then
+        echo -e "${RED}端口 $PORT 已被占用！${RESET}"
+        read -p "按回车返回菜单..."
+        menu
+        return
+    fi
+
+    # 👉 BASE_URL（重点）
+    read -p "请输入 BASE_URL (如 https://example.com): " BASE_URL
+
+    SERVER_IP=$(get_public_ip)
+
+    # 👉 自动兜底
+    if [ -z "$BASE_URL" ]; then
+        BASE_URL="http://127.0.0.1:${PORT}"
+        echo -e "${YELLOW}未填写，自动使用: $BASE_URL${RESET}"
+    fi
+
+    cat > docker-compose.yml <<EOF
+services:
+  tgstate:
+    build: .
+    container_name: tgstate
+    ports:
+      - "127.0.0.1:${PORT}:8000"
+    volumes:
+      - tgstate_data:/app/data
+    restart: unless-stopped
+    environment:
+      - BASE_URL=$BASE_URL
+      - LOG_LEVEL=info
+
+volumes:
+  tgstate_data:
+EOF
+
+    echo -e "${GREEN}开始构建...${RESET}"
+    docker compose up -d --build
+
     echo
-    read -p "$(echo -e ${CYAN}按回车返回菜单...${RESET})"
-done
+    echo -e "${GREEN}✅ TGState 已启动${RESET}"
+    echo -e "${YELLOW}访问地址: $BASE_URL${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
+}
+update_app() {
+
+    cd "$APP_DIR" || { echo "未安装"; sleep 1; menu; }
+
+    echo -e "${GREEN}拉取更新...${RESET}"
+    git pull
+
+    echo -e "${GREEN}重新构建...${RESET}"
+    docker compose up -d --build
+
+    echo -e "${GREEN}✅ 更新完成${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+restart_app() {
+
+    cd "$APP_DIR" || return
+    docker compose restart
+
+    echo -e "${GREEN}✅ 已重启${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+view_logs() {
+    cd "$APP_DIR" || return
+    docker compose logs -f
+}
+
+check_status() {
+    docker ps | grep tgstate
+    read -p "回车返回..."
+    menu
+}
+
+uninstall_app() {
+
+    cd "$APP_DIR" || return
+
+    docker compose down -v
+    rm -rf "$APP_DIR"
+
+    echo -e "${GREEN}✅ 已卸载${RESET}"
+
+    read -p "回车返回..."
+    menu
+}
+
+menu

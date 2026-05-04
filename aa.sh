@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# GPT-Image-Linux 一键管理脚本
+# TGState 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,16 +8,15 @@ YELLOW="\033[33m"
 RESET="\033[0m"
 RED="\033[31m"
 
-APP_NAME="gpt-image"
+APP_NAME="tgstate"
 APP_DIR="/opt/$APP_NAME"
-SERVICE_NAME="gpt-image"
 
-REPO="https://github.com/Z1rconium/gpt-image-linux.git"
+REPO="https://github.com/buyi06/tgstate-rust.git"
 
 get_public_ip() {
     local ip
     for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+        for url in "https://api.ipify.org" "https://ip.sb"; do
             ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
@@ -26,7 +25,7 @@ get_public_ip() {
 
 menu() {
     clear
-    echo -e "${GREEN}=== GPT-Image 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== TGState 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 重启${RESET}"
@@ -60,51 +59,48 @@ install_app() {
     fi
 
     mkdir -p "$APP_DIR"
-
-    if [ ! -d "$APP_DIR/.git" ]; then
-        echo -e "${GREEN}克隆项目...${RESET}"
-        git clone "$REPO" "$APP_DIR"
-    fi
-
     cd "$APP_DIR" || exit
 
-    echo
-    echo -e "${GREEN}配置 .env${RESET}"
+    if [ ! -d ".git" ]; then
+        echo -e "${GREEN}克隆项目...${RESET}"
+        git clone "$REPO" .
+    fi
 
-    read -p "API URL (默认 https://api.openai.com): " API_URL
-    read -p "API KEY (必填): " API_KEY
-    read -p "访问密码 ACCESS_KEY (可留空): " ACCESS_KEY
+    echo -e "${GREEN}配置端口...${RESET}"
 
-    [ -z "$API_URL" ] && API_URL="https://api.openai.com"
+    read -p "请输入访问端口 [默认:8000]: " PORT
+    [ -z "$PORT" ] && PORT=8000
 
-    cat > .env <<EOF
-DEFAULT_API_URL=$API_URL
-DEFAULT_API_KEY=$API_KEY
-DEFAULT_API_PATH=/v1/images/generations
-DEFAULT_RESPONSES_MODEL=gpt-4.1
+    # 检查端口占用
+    if ss -tuln | grep -q ":$PORT "; then
+        echo -e "${RED}端口 $PORT 已被占用！${RESET}"
+        read -p "按回车返回菜单..."
+        menu
+        return
+    fi
 
-ACCESS_KEY=$ACCESS_KEY
-IP_ALLOWLIST=
+    cat > docker-compose.yml <<EOF
+services:
+  tgstate:
+    build: .
+    ports:
+      - "127.0.0.1:${PORT}:8000"
+    volumes:
+      - tgstate_data:/app/data
+    restart: unless-stopped
 
-TRUST_PROXY_HEADERS=false
-MAX_FILE_SIZE_MB=50
-
-IMAGES_DIR=./images
-DATA_DIR=./data
-
-PYTHON_BASE_IMAGE=python:3.11-slim
+volumes:
+  tgstate_data:
 EOF
 
-    echo -e "${GREEN}启动服务...${RESET}"
+    echo -e "${GREEN}构建并启动（首次会较慢）...${RESET}"
     docker compose up -d --build
 
     SERVER_IP=$(get_public_ip)
 
     echo
-    echo -e "${GREEN}✅ GPT-Image 已启动${RESET}"
-    echo -e "${YELLOW}访问: http://${SERVER_IP}:3000${RESET}"
-
-    [ -n "$ACCESS_KEY" ] && echo -e "${YELLOW}访问密码: $ACCESS_KEY${RESET}"
+    echo -e "${GREEN}✅ TGState 已启动${RESET}"
+    echo -e "${YELLOW}访问: http://127.0.0.1:${PORT}${RESET}"
 
     read -p "按回车返回菜单..."
     menu
@@ -112,9 +108,9 @@ EOF
 
 update_app() {
 
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+    cd "$APP_DIR" || { echo "未安装"; sleep 1; menu; }
 
-    echo -e "${GREEN}更新代码...${RESET}"
+    echo -e "${GREEN}拉取更新...${RESET}"
     git pull
 
     echo -e "${GREEN}重新构建...${RESET}"
@@ -128,7 +124,7 @@ update_app() {
 
 restart_app() {
 
-    cd "$APP_DIR" || { echo "未检测到安装目录"; sleep 1; menu; }
+    cd "$APP_DIR" || { echo "未安装"; sleep 1; menu; }
 
     docker compose restart
 
@@ -140,6 +136,7 @@ restart_app() {
 
 view_logs() {
 
+    cd "$APP_DIR" || return
     docker compose logs -f
 
     read -p "按回车返回菜单..."
@@ -149,7 +146,7 @@ view_logs() {
 check_status() {
 
     echo -e "${GREEN}容器状态：${RESET}"
-    docker ps | grep gpt-image
+    docker ps | grep tgstate
 
     read -p "按回车返回菜单..."
     menu

@@ -1,156 +1,157 @@
 #!/bin/bash
 # ========================================
-# Remio Home 一键管理脚本
+# qBittorrent-TGBot 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
 RESET="\033[0m"
+RED="\033[31m"
 
-APP_NAME="remio-home"
+APP_NAME="qbittorrent-tgbot"
 APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
-}
-
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
+REPO="https://github.com/Polarisiu/qBittorrent-TGBot.git"
 
 menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== Remio Home 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+    clear
+    echo -e "${GREEN}=== qBittorrent-TGBot 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 重启${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}5) 查看状态${RESET}"
+    echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
 
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+    case $choice in
+        1) install_app ;;
+        2) update_app ;;
+        3) restart_app ;;
+        4) view_logs ;;
+        5) check_status ;;
+        6) uninstall_app ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
+    esac
 }
 
 install_app() {
 
-    check_docker
-    mkdir -p "$APP_DIR"
+    echo -e "${GREEN}检查 Docker...${RESET}"
 
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
+    if ! command -v docker &>/dev/null; then
+        apt update
+        apt install -y curl
+        curl -fsSL https://get.docker.com | bash
     fi
 
-    # 端口
-    read -p "请输入访问端口 [默认:3000]: " input_port
-    PORT=${input_port:-3000}
-    check_port "$PORT" || return
+    mkdir -p "$APP_DIR"
+    cd "$APP_DIR" || exit
 
-    # 配置目录
-    read -p "配置目录 [默认:$APP_DIR/config]: " input_config
-    CONFIG_DIR=${input_config:-$APP_DIR/config}
+    if [ ! -d ".git" ]; then
+        echo -e "${GREEN}克隆项目...${RESET}"
+        git clone "$REPO" .
+    fi
 
-    # 图标目录
-    read -p "图标目录 [默认:$APP_DIR/icons]: " input_icons
-    ICON_DIR=${input_icons:-$APP_DIR/icons}
+    echo -e "${GREEN}配置 .env${RESET}"
 
-    # 密码
-    DEFAULT_PASS=$(openssl rand -base64 12 | tr -dc A-Za-z0-9 | head -c 12)
-    read -p "访问密码 [默认随机生成]: " input_pass
-    PASSWORD=${input_pass:-$DEFAULT_PASS}
+    read -p "请输入 BOT_TOKEN: " BOT_TOKEN
+    read -p "请输入TGID: " ALLOWED_USER_IDS
 
-    mkdir -p "$CONFIG_DIR"
-    mkdir -p "$ICON_DIR"
+    read -p "qBittorrent 地址 [默认:http://127.0.0.1:8080]: " QB_URL
+    read -p "qB 用户名 [默认:admin]: " QB_USER
+    read -p "qB 密码 [默认:adminadmin]: " QB_PASS
 
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  remio-home:
-    image: kasuie/remio-home
-    container_name: remio-home
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${PORT}:3000"
-    environment:
-      - TZ=Asia/Shanghai
-      - PASSWORD=${PASSWORD}
-    volumes:
-      - ${CONFIG_DIR}:/remio-home/config
-      - ${ICON_DIR}:/remio-home/public/icons
+    read -p "下载目录 [默认:/data/downloads]: " SAVE_PATH
+
+    [ -z "$QB_URL" ] && QB_URL="http://127.0.0.1:8080"
+    [ -z "$QB_USER" ] && QB_USER="admin"
+    [ -z "$QB_PASS" ] && QB_PASS="adminadmin"
+    [ -z "$SAVE_PATH" ] && SAVE_PATH="/data/downloads"
+
+    cat > .env <<EOF
+BOT_TOKEN=$BOT_TOKEN
+ALLOWED_USER_IDS=$ALLOWED_USER_IDS
+
+QB_URL=$QB_URL
+QB_USER=$QB_USER
+QB_PASS=$QB_PASS
+
+DEFAULT_SAVE_PATH=$SAVE_PATH
+PRESET_DIRS=影视:$SAVE_PATH/movies,音乐:$SAVE_PATH/music,软件:$SAVE_PATH/apps
+POLL_INTERVAL=20
 EOF
 
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    chmod -R 777 "$CONFIG_DIR"
-    chmod -R 777 "$ICON_DIR"
+    echo -e "${GREEN}启动服务...${RESET}"
+    docker compose up -d --build
 
     echo
-    echo -e "${GREEN}✅ Remio Home 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🌐 配置地址: http://127.0.0.1:${PORT}/config${RESET}"
-    echo -e "${YELLOW}🔑 登录密码: ${PASSWORD}${RESET}"
-    echo -e "${YELLOW}📂 配置目录: ${CONFIG_DIR}${RESET}"
-    echo -e "${YELLOW}🎨 图标目录: ${ICON_DIR}${RESET}"
+    echo -e "${GREEN}✅ qBittorrent-TGBot 已启动${RESET}"
+    echo -e "${YELLOW}Bot 已连接 Telegram，请发送 /start 测试${RESET}"
 
     read -p "按回车返回菜单..."
+    menu
 }
 
 update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ Remio Home 更新完成${RESET}"
+
+    cd "$APP_DIR" || { echo "未安装"; sleep 1; menu; }
+
+    echo -e "${GREEN}拉取更新...${RESET}"
+    git pull
+
+    echo -e "${GREEN}重新构建...${RESET}"
+    docker compose up -d --build
+
+    echo -e "${GREEN}✅ 更新完成${RESET}"
+
     read -p "按回车返回菜单..."
+    menu
 }
 
 restart_app() {
-    docker restart remio-home
-    echo -e "${GREEN}✅ Remio Home 已重启${RESET}"
+
+    cd "$APP_DIR" || return
+    docker compose restart
+
+    echo -e "${GREEN}✅ 已重启${RESET}"
+
     read -p "按回车返回菜单..."
+    menu
 }
 
 view_logs() {
-    docker logs -f remio-home
+
+    cd "$APP_DIR" || return
+    docker compose logs -f
+
+    read -p "按回车返回菜单..."
+    menu
 }
 
 check_status() {
-    docker ps | grep remio-home
+
+    echo -e "${GREEN}容器状态：${RESET}"
+    docker ps | grep qbittorrent-tgbot
+
     read -p "按回车返回菜单..."
+    menu
 }
 
 uninstall_app() {
+
     cd "$APP_DIR" || return
+
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Remio Home 已卸载${RESET}"
+
+    echo -e "${GREEN}✅ 已卸载${RESET}"
+
     read -p "按回车返回菜单..."
+    menu
 }
 
-menu  
+menu

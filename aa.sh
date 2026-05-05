@@ -1,192 +1,156 @@
 #!/bin/bash
 # ========================================
-# NodeGet-Board 一键管理脚本
+# Remio Home 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RESET="\033[0m"
 RED="\033[31m"
+RESET="\033[0m"
 
-APP_NAME="nodeget-board"
+APP_NAME="remio-home"
 APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-REPO="https://github.com/NodeSeekDev/NodeGet-board.git"
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "0.0.0.0"
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
+    fi
+}
+
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
 }
 
 menu() {
-    clear
-    echo -e "${GREEN}=== NodeGet-Board 管理菜单 ===${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 重启${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 查看状态${RESET}"
-    echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
+    while true; do
+        clear
+        echo -e "${GREEN}=== Remio Home 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) restart_app ;;
-        4) view_logs ;;
-        5) check_status ;;
-        6) uninstall_app ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
-    esac
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
 }
 
 install_app() {
 
-    echo -e "${GREEN}检查 Docker...${RESET}"
-
-    if ! command -v docker &>/dev/null; then
-        apt update
-        apt install -y curl
-        curl -fsSL https://get.docker.com | bash
-    fi
-
+    check_docker
     mkdir -p "$APP_DIR"
-    cd "$APP_DIR" || exit
 
-    if [ -d ".git" ]; then
+    if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
         read confirm
         [[ "$confirm" != "y" ]] && return
-        rm -rf "$APP_DIR"
-        mkdir -p "$APP_DIR"
-        cd "$APP_DIR" || exit
     fi
 
-    echo -e "${GREEN}克隆项目...${RESET}"
-    git clone "$REPO" .
+    # 端口
+    read -p "请输入访问端口 [默认:3000]: " input_port
+    PORT=${input_port:-3000}
+    check_port "$PORT" || return
 
-    echo -e "${GREEN}配置端口...${RESET}"
+    # 配置目录
+    read -p "配置目录 [默认:$APP_DIR/config]: " input_config
+    CONFIG_DIR=${input_config:-$APP_DIR/config}
 
-    read -p "请输入访问端口 [默认:8080]: " PORT
-    [ -z "$PORT" ] && PORT=8080
+    # 图标目录
+    read -p "图标目录 [默认:$APP_DIR/icons]: " input_icons
+    ICON_DIR=${input_icons:-$APP_DIR/icons}
 
-    if ss -tuln | grep -q ":$PORT "; then
-        echo -e "${RED}端口 $PORT 已被占用！${RESET}"
-        read -p "按回车返回菜单..."
-        menu
-        return
-    fi
+    # 密码
+    DEFAULT_PASS=$(openssl rand -base64 12 | tr -dc A-Za-z0-9 | head -c 12)
+    read -p "访问密码 [默认随机生成]: " input_pass
+    PASSWORD=${input_pass:-$DEFAULT_PASS}
 
-    cat > Dockerfile <<'EOF'
-FROM node:22-alpine AS builder
-WORKDIR /app
+    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$ICON_DIR"
 
-RUN npm install -g pnpm && \
-    pnpm config set registry https://registry.npmmirror.com
-
-COPY package.json pnpm-lock.yaml* ./
-RUN pnpm install --frozen-lockfile
-
-COPY . .
-RUN pnpm build
-
-FROM nginx:alpine
-COPY --from=builder /app/dist /usr/share/nginx/html
-
-RUN sed -i 's/index  index.html index.htm;/index  index.html index.htm;\n        try_files $uri $uri\/ \/index.html;/g' /etc/nginx/conf.d/default.conf
-
-EXPOSE 80
-CMD ["nginx", "-g", "daemon off;"]
-EOF
-
-    cat > docker-compose.yml <<EOF
+    cat > "$COMPOSE_FILE" <<EOF
 services:
-  nodeget-board:
-    build: .
-    container_name: nodeget-board
-    ports:
-      - "127.0.0.1:${PORT}:80"
+  remio-home:
+    image: kasuie/remio-home
+    container_name: remio-home
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORT}:3000"
+    environment:
+      - TZ=Asia/Shanghai
+      - PASSWORD=${PASSWORD}
+    volumes:
+      - ${CONFIG_DIR}:/remio-home/config
+      - ${ICON_DIR}:/remio-home/public/icons
 EOF
 
-    echo -e "${GREEN}开始构建（首次较慢）...${RESET}"
-    docker compose up -d --build
+    cd "$APP_DIR" || exit
+    docker compose up -d
 
-    SERVER_IP=$(get_public_ip)
+    chmod -R 777 "$CONFIG_DIR"
+    chmod -R 777 "$ICON_DIR"
 
     echo
-    echo -e "${GREEN}✅ NodeGet-Board 已启动${RESET}"
-    echo -e "${YELLOW}访问: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}✅ Remio Home 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${YELLOW}🌐 配置地址: http://127.0.0.1:${PORT}/config${RESET}"
+    echo -e "${YELLOW}🔑 登录密码: ${PASSWORD}${RESET}"
+    echo -e "${YELLOW}📂 配置目录: ${CONFIG_DIR}${RESET}"
+    echo -e "${YELLOW}🎨 图标目录: ${ICON_DIR}${RESET}"
 
     read -p "按回车返回菜单..."
-    menu
 }
 
 update_app() {
-
-    cd "$APP_DIR" || { echo "未安装"; sleep 1; menu; }
-
-    echo -e "${GREEN}拉取更新...${RESET}"
-    git pull
-
-    echo -e "${GREEN}重新构建...${RESET}"
-    docker compose up -d --build
-
-    echo -e "${GREEN}✅ 更新完成${RESET}"
-
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ Remio Home 更新完成${RESET}"
     read -p "按回车返回菜单..."
-    menu
 }
 
 restart_app() {
-
-    cd "$APP_DIR" || { echo "未安装"; sleep 1; menu; }
-
-    docker compose restart
-
-    echo -e "${GREEN}✅ 已重启${RESET}"
-
+    docker restart remio-home
+    echo -e "${GREEN}✅ Remio Home 已重启${RESET}"
     read -p "按回车返回菜单..."
-    menu
 }
 
 view_logs() {
-
-    cd "$APP_DIR" || return
-    docker compose logs -f
-
-    read -p "按回车返回菜单..."
-    menu
+    docker logs -f remio-home
 }
 
 check_status() {
-
-    echo -e "${GREEN}容器状态：${RESET}"
-    docker ps | grep nodeget-board
-
+    docker ps | grep remio-home
     read -p "按回车返回菜单..."
-    menu
 }
 
 uninstall_app() {
-
     cd "$APP_DIR" || return
-
     docker compose down -v
     rm -rf "$APP_DIR"
-
-    echo -e "${GREEN}✅ 已卸载${RESET}"
-
+    echo -e "${RED}✅ Remio Home 已卸载${RESET}"
     read -p "按回车返回菜单..."
-    menu
 }
 
-menu
+menu  

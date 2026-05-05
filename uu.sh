@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# TGState (本地构建版) 一键管理脚本
+# NodeGet-Board 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,10 +8,10 @@ YELLOW="\033[33m"
 RESET="\033[0m"
 RED="\033[31m"
 
-APP_NAME="tgstate"
+APP_NAME="nodeget-board"
 APP_DIR="/opt/$APP_NAME"
 
-REPO="https://github.com/Polarisiu/tgState.git"
+REPO="https://github.com/NodeSeekDev/NodeGet-board.git"
 
 get_public_ip() {
     local ip
@@ -25,7 +25,7 @@ get_public_ip() {
 
 menu() {
     clear
-    echo -e "${GREEN}=== TGState 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== NodeGet-Board 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
     echo -e "${GREEN}3) 重启${RESET}"
@@ -61,18 +61,23 @@ install_app() {
     mkdir -p "$APP_DIR"
     cd "$APP_DIR" || exit
 
-    if [ ! -d ".git" ]; then
-        echo -e "${GREEN}克隆项目...${RESET}"
-        git clone "$REPO" .
+    if [ -d ".git" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+        rm -rf "$APP_DIR"
+        mkdir -p "$APP_DIR"
+        cd "$APP_DIR" || exit
     fi
 
-    echo -e "${GREEN}配置参数...${RESET}"
+    echo -e "${GREEN}克隆项目...${RESET}"
+    git clone "$REPO" .
 
-    # 👉 端口
-    read -p "请输入端口 [默认:8000]: " PORT
-    [ -z "$PORT" ] && PORT=8000
+    echo -e "${GREEN}配置端口...${RESET}"
 
-    # 👉 检查端口占用
+    read -p "请输入访问端口 [默认:8080]: " PORT
+    [ -z "$PORT" ] && PORT=8080
+
     if ss -tuln | grep -q ":$PORT "; then
         echo -e "${RED}端口 $PORT 已被占用！${RESET}"
         read -p "按回车返回菜单..."
@@ -80,45 +85,57 @@ install_app() {
         return
     fi
 
-    # 👉 BASE_URL（重点）
-    read -p "请输入 BASE_URL (如 https://example.com): " BASE_URL
+    cat > Dockerfile <<'EOF'
+FROM node:22-alpine AS builder
+WORKDIR /app
 
-    SERVER_IP=$(get_public_ip)
+# 👉 提高内存
+ENV NODE_OPTIONS="--max_old_space_size=1024"
 
-    # 👉 自动兜底
-    if [ -z "$BASE_URL" ]; then
-        BASE_URL="http://127.0.0.1:${PORT}"
-        echo -e "${YELLOW}未填写，自动使用: $BASE_URL${RESET}"
-    fi
+RUN npm install -g pnpm && \
+    pnpm config set registry https://registry.npmmirror.com
+
+COPY package.json pnpm-lock.yaml* ./
+RUN pnpm install --frozen-lockfile
+
+COPY . .
+
+# 👉 单线程 + 无类型检查
+RUN pnpm build-only
+
+# ===== 运行 =====
+FROM nginx:alpine
+
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+RUN sed -i 's/index  index.html index.htm;/index  index.html index.htm;\n        try_files $uri $uri\/ \/index.html;/g' /etc/nginx/conf.d/default.conf
+
+CMD ["nginx", "-g", "daemon off;"]
+EOF
 
     cat > docker-compose.yml <<EOF
 services:
-  tgstate:
+  nodeget-board:
     build: .
-    container_name: tgstate
+    container_name: nodeget-board
     ports:
-      - "127.0.0.1:${PORT}:8000"
-    volumes:
-      - tgstate_data:/app/data
+      - "127.0.0.1:${PORT}:80"
     restart: unless-stopped
-    environment:
-      - BASE_URL=$BASE_URL
-      - LOG_LEVEL=info
-
-volumes:
-  tgstate_data:
 EOF
 
-    echo -e "${GREEN}开始构建...${RESET}"
+    echo -e "${GREEN}开始构建（首次较慢）...${RESET}"
     docker compose up -d --build
 
+    SERVER_IP=$(get_public_ip)
+
     echo
-    echo -e "${GREEN}✅ TGState 已启动${RESET}"
-    echo -e "${YELLOW}访问地址: $BASE_URL${RESET}"
+    echo -e "${GREEN}✅ NodeGet-Board 已启动${RESET}"
+    echo -e "${YELLOW}访问: http://127.0.0.1:${PORT}${RESET}"
 
     read -p "按回车返回菜单..."
     menu
 }
+
 update_app() {
 
     cd "$APP_DIR" || { echo "未安装"; sleep 1; menu; }
@@ -137,7 +154,8 @@ update_app() {
 
 restart_app() {
 
-    cd "$APP_DIR" || return
+    cd "$APP_DIR" || { echo "未安装"; sleep 1; menu; }
+
     docker compose restart
 
     echo -e "${GREEN}✅ 已重启${RESET}"
@@ -147,13 +165,20 @@ restart_app() {
 }
 
 view_logs() {
+
     cd "$APP_DIR" || return
     docker compose logs -f
+
+    read -p "按回车返回菜单..."
+    menu
 }
 
 check_status() {
-    docker ps | grep tgstate
-    read -p "回车返回..."
+
+    echo -e "${GREEN}容器状态：${RESET}"
+    docker ps | grep nodeget-board
+
+    read -p "按回车返回菜单..."
     menu
 }
 
@@ -166,7 +191,7 @@ uninstall_app() {
 
     echo -e "${GREEN}✅ 已卸载${RESET}"
 
-    read -p "回车返回..."
+    read -p "按回车返回菜单..."
     menu
 }
 

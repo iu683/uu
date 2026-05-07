@@ -73,6 +73,9 @@ install_app() {
 
     JWT=$(openssl rand -hex 32)
 
+    read -p "请输入访问地址 [默认:http://127.0.0.1:${PORT}]: " input_host
+    BASE_URL=${input_host:-http://127.0.0.1:${PORT}}
+
     cat > "$COMPOSE_FILE" <<EOF
 services:
   server:
@@ -82,9 +85,9 @@ services:
     ports:
       - "127.0.0.1:${PORT}:52345"
     environment:
-      UPTIME_APP_API_BASE_URL: http://127.0.0.1:${PORT}/api/v1
-      UPTIME_APP_CLIENT_HOST: http://127.0.0.1:${PORT}
-      CLIENT_HOST: http://127.0.0.1:${PORT}
+      UPTIME_APP_API_BASE_URL: ${BASE_URL}/api/v1
+      UPTIME_APP_CLIENT_HOST: ${BASE_URL}
+      CLIENT_HOST: ${BASE_URL}
       DB_CONNECTION_STRING: mongodb://mongodb:27017/uptime_db
       JWT_SECRET: ${JWT}
     depends_on:

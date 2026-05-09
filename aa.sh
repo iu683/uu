@@ -1,134 +1,156 @@
 #!/bin/bash
-# ============================================
-# Komari 管理脚本（菜单版）
-# 功能: 安装/更新/卸载/日志
-# ============================================
 
-set -e
+# ========================================
+# Sun Panel 一键管理脚本 Alpine兼容版
+# ========================================
 
 GREEN="\033[32m"
-RED="\033[31m"
 RESET="\033[0m"
+YELLOW="\033[33m"
+RED="\033[31m"
 
-COMPOSE_FILE="/opt/komari/docker-compose.yml"
-DATA_DIR="/opt/komari/data"
-CONTAINER_NAME="komari"
-PORT=25774
+APP_NAME="sun-panel"
+COMPOSE_DIR="/opt/sun-panel"
+COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yml"
+DEFAULT_PORT=3002
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。"
-}
+# 自动识别 compose
+if docker compose version >/dev/null 2>&1; then
+    DOCKER_COMPOSE="docker compose"
+elif command -v docker-compose >/dev/null 2>&1; then
+    DOCKER_COMPOSE="docker-compose"
+else
+    echo -e "${RED}未安装 Docker Compose${RESET}"
+    echo -e "${YELLOW}正在自动安装...${RESET}"
 
+    apk add docker-cli-compose >/dev/null 2>&1
 
-menu() {
+    if docker compose version >/dev/null 2>&1; then
+        DOCKER_COMPOSE="docker compose"
+    else
+        echo -e "${RED}安装失败${RESET}"
+        exit 1
+    fi
+fi
+
+function menu() {
     clear
-    echo -e "${GREEN}=== Komari 管理菜单 ===${RESET}"
+    echo -e "${GREEN}=== Sun Panel 管理菜单 ===${RESET}"
     echo -e "${GREEN}1) 安装启动${RESET}"
     echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 卸载${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 重启${RESET}"
+    echo -e "${GREEN}3) 重启${RESET}"
+    echo -e "${GREEN}4) 卸载(含数据)${RESET}"
+    echo -e "${GREEN}5) 查看日志${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+    read -p "请选择: " choice
+
     case $choice in
-        1) install_komari ;;
-        2) update_komari ;;
-        3) uninstall_komari ;;
-        4) view_logs ;;
-        5) restart_komari ;;
+        1) install_app ;;
+        2) update_app ;;
+        3) restart_app ;;
+        4) uninstall_app ;;
+        5) view_logs ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选择！${RESET}" && sleep 1 && menu ;;
+        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
     esac
 }
 
-restart_komari() {
-    echo -e "${GREEN}=== 重启 Komari ===${RESET}"
-    docker compose -f "$COMPOSE_FILE" restart
-    echo -e "${GREEN}✅ Komari 已重启${RESET}"
-    read -p "按回车返回菜单..." && menu
-}
+function install_app() {
 
+    read -p "请输入 Web 端口 [默认:${DEFAULT_PORT}]: " input_port
+    PORT=${input_port:-$DEFAULT_PORT}
 
-install_komari() {
-    echo -e "${GREEN}=== 开始安装 Komari ===${RESET}"
-
-    mkdir -p "$DATA_DIR"
-
-    read -p "请输入管理员用户名 (默认: admin): " ADMIN_USERNAME
-    ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
-
-    read -p "请输入管理员密码 (默认: admin123): " ADMIN_PASSWORD
-    ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
-
-    # Cloudflared 默认启用 true
-    KOMARI_ENABLE_CLOUDFLARED="true"
-    echo -e "${GREEN}Cloudflared 已默认启用${RESET}"
-    read -p "请输入 Cloudflared Token: " KOMARI_CLOUDFLARED_TOKEN
+    mkdir -p "$COMPOSE_DIR/conf"
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  komari:
-    image: ghcr.io/komari-monitor/komari:latest
-    container_name: $CONTAINER_NAME
-    ports:
-      - "127.0.0.1:${PORT}:${PORT}"
-    volumes:
-      - $DATA_DIR:/app/data
-    environment:
-      ADMIN_USERNAME: "$ADMIN_USERNAME"
-      ADMIN_PASSWORD: "$ADMIN_PASSWORD"
-      KOMARI_ENABLE_CLOUDFLARED: "$KOMARI_ENABLE_CLOUDFLARED"
-      KOMARI_CLOUDFLARED_TOKEN: "$KOMARI_CLOUDFLARED_TOKEN"
-      PORT: "$PORT"
+  sun-panel:
+    image: hslr/sun-panel:latest
+    container_name: sun-panel
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORT}:3002"
+    volumes:
+      - ${COMPOSE_DIR}/conf:/app/conf
+      - /var/run/docker.sock:/var/run/docker.sock
 EOF
 
-    docker compose -f "$COMPOSE_FILE" up -d
+    cd "$COMPOSE_DIR" || exit
 
-    SERVER_IP=$(get_public_ip)
+    $DOCKER_COMPOSE pull
+    $DOCKER_COMPOSE up -d
 
-    echo -e "${GREEN}✅ 部署完成！访问地址: http://127.0.0.1:$PORT${RESET}"
-    echo -e "${GREEN}用户名: $ADMIN_USERNAME  密码: $ADMIN_PASSWORD${RESET}"
-    echo -e "${GREEN}📂 数据目录: /opt/komari${RESET}"
-    read -p "按回车返回菜单..." && menu
-}
+    sleep 3
 
-update_komari() {
-    echo -e "${GREEN}=== 更新 Komari ===${RESET}"
-    docker compose -f "$COMPOSE_FILE" pull
-    docker compose -f "$COMPOSE_FILE" up -d
-    echo -e "${GREEN}✅ 更新完成！${RESET}"
-    read -p "按回车返回菜单..." && menu
-}
-
-uninstall_komari() {
-    echo -e "${RED}即将卸载 Komari，并删除相关数据！${RESET}"
-    read -p "确认卸载? (y/N): " confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        docker compose -f "$COMPOSE_FILE" down -v
-        rm -rf "/opt/komari"
-        echo -e "${GREEN}✅ 卸载完成${RESET}"
+    if docker ps | grep -q sun-panel; then
+        echo -e "${GREEN}✅ ${APP_NAME} 已启动${RESET}"
+        echo -e "${YELLOW}🌐 本机访问地址: http://127.0.0.1:${PORT}${RESET}"
+        echo -e "${GREEN}账号: admin@sun.cc${RESET}"
+        echo -e "${GREEN}密码: 12345678${RESET}"
+        echo -e "${GREEN}📂 配置目录: $COMPOSE_DIR/conf${RESET}"
     else
-        echo -e "${GREEN}已取消${RESET}"
+        echo -e "${RED}❌ 启动失败${RESET}"
+        docker logs sun-panel
     fi
-    read -p "按回车返回菜单..." && menu
+
+    read -p "按回车返回菜单..."
+    menu
 }
 
-view_logs() {
-    echo -e "${GREEN}=== 查看 Komari 日志 ===${RESET}"
-    docker logs -f $CONTAINER_NAME
-    read -p "按回车返回菜单..." && menu
+function update_app() {
+
+    cd "$COMPOSE_DIR" || {
+        echo -e "${RED}未安装${RESET}"
+        sleep 1
+        menu
+    }
+
+    $DOCKER_COMPOSE pull
+    $DOCKER_COMPOSE up -d
+
+    echo -e "${GREEN}✅ 更新完成${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function restart_app() {
+
+    cd "$COMPOSE_DIR" || {
+        echo -e "${RED}未安装${RESET}"
+        sleep 1
+        menu
+    }
+
+    $DOCKER_COMPOSE restart
+
+    echo -e "${GREEN}✅ 重启完成${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function uninstall_app() {
+
+    cd "$COMPOSE_DIR" || {
+        echo -e "${RED}未安装${RESET}"
+        sleep 1
+        menu
+    }
+
+    $DOCKER_COMPOSE down -v
+
+    rm -rf "$COMPOSE_DIR"
+
+    echo -e "${GREEN}✅ 已卸载${RESET}"
+
+    read -p "按回车返回菜单..."
+    menu
+}
+
+function view_logs() {
+    docker logs -f sun-panel
 }
 
 menu

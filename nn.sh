@@ -1,149 +1,136 @@
 #!/bin/bash
-# ========================================
-# Checkmate 一键管理脚本
-# ========================================
+# ============================================
+# Komari 管理脚本（菜单版）
+# 功能: 安装/更新/卸载/日志
+# ============================================
+
+set -e
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="checkmate"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+COMPOSE_FILE="/opt/komari/docker-compose.yml"
+DATA_DIR="/opt/komari/data"
+CONTAINER_NAME="komari"
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。"
 }
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
 
 menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== Checkmate 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-        esac
-    done
+    clear
+    echo -e "${GREEN}=== Komari 管理菜单 ===${RESET}"
+    echo -e "${GREEN}1) 安装启动${RESET}"
+    echo -e "${GREEN}2) 更新${RESET}"
+    echo -e "${GREEN}3) 卸载${RESET}"
+    echo -e "${GREEN}4) 查看日志${RESET}"
+    echo -e "${GREEN}5) 重启${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+    case $choice in
+        1) install_komari ;;
+        2) update_komari ;;
+        3) uninstall_komari ;;
+        4) view_logs ;;
+        5) restart_komari ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选择！${RESET}" && sleep 1 && menu ;;
+    esac
 }
 
-install_app() {
+restart_komari() {
+    echo -e "${GREEN}=== 重启 Komari ===${RESET}"
+    docker compose -f "$COMPOSE_FILE" restart
+    echo -e "${GREEN}✅ Komari 已重启${RESET}"
+    read -p "按回车返回菜单..." && menu
+}
 
-    check_docker
-    mkdir -p "$APP_DIR/data/mongo"
 
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
+install_komari() {
+    echo -e "${GREEN}=== 开始安装 Komari ===${RESET}"
 
-    read -p "请输入访问端口 [默认:52345]: " input_port
-    PORT=${input_port:-52345}
-    check_port "$PORT" || return
+    mkdir -p "$DATA_DIR"
 
-    JWT=$(openssl rand -hex 32)
+    read -p "请输入 Komari 端口 (默认: 25774): " PORT
+    PORT=${PORT:-25774}
 
-    read -p "请输入访问地址 [例如:https:up.com]: " input_host
-    BASE_URL=${input_host:-http://127.0.0.1:${PORT}}
+    read -p "请输入管理员用户名 (默认: admin): " ADMIN_USERNAME
+    ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+
+    read -p "请输入管理员密码 (默认: admin123): " ADMIN_PASSWORD
+    ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
+
+    # Cloudflared 默认启用 true
+    KOMARI_ENABLE_CLOUDFLARED="true"
+    echo -e "${GREEN}Cloudflared 已默认启用${RESET}"
+    read -p "请输入 Cloudflared Token: " KOMARI_CLOUDFLARED_TOKEN
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  server:
-    image: ghcr.io/bluewave-labs/checkmate-backend-mono:latest
-    container_name: checkmate
-    restart: always
+  komari:
+    image: ghcr.io/komari-monitor/komari:latest
+    container_name: $CONTAINER_NAME
     ports:
-      - "127.0.0.1:${PORT}:52345"
-    environment:
-      UPTIME_APP_API_BASE_URL: ${BASE_URL}/api/v1
-      UPTIME_APP_CLIENT_HOST: ${BASE_URL}
-      CLIENT_HOST: ${BASE_URL}
-      DB_CONNECTION_STRING: mongodb://mongodb:27017/uptime_db
-      JWT_SECRET: ${JWT}
-    depends_on:
-      - mongodb
-
-  mongodb:
-    image: ghcr.io/bluewave-labs/checkmate-mongo:latest
-    container_name: checkmate-mongo
-    restart: always
-    command: ["mongod", "--quiet", "--bind_ip_all"]
+      - "127.0.0.1:${PORT}:25774"
     volumes:
-      - ./data/mongo:/data/db
+      - $DATA_DIR:/app/data
+    environment:
+      ADMIN_USERNAME: "$ADMIN_USERNAME"
+      ADMIN_PASSWORD: "$ADMIN_PASSWORD"
+      KOMARI_ENABLE_CLOUDFLARED: "$KOMARI_ENABLE_CLOUDFLARED"
+      KOMARI_CLOUDFLARED_TOKEN: "$KOMARI_CLOUDFLARED_TOKEN"
+      PORT: "$PORT"
+    restart: unless-stopped
 EOF
 
-    cd "$APP_DIR" || exit
-    docker compose up -d
+    docker compose -f "$COMPOSE_FILE" up -d
 
-    echo
-    echo -e "${GREEN}✅ Checkmate 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🌐 访问: $BASE_URL${RESET}"
-    echo -e "${GREEN}📂 数据目录: $APP_DIR/data${RESET}"
-    echo -e "${YELLOW}🔑 JWT_SECRET: ${JWT}${RESET}"
+    SERVER_IP=$(get_public_ip)
 
-    read -p "按回车返回菜单..."
+    echo -e "${GREEN}✅ 部署完成！访问地址: http://127.0.0.1:$PORT${RESET}"
+    echo -e "${GREEN}用户名: $ADMIN_USERNAME  密码: $ADMIN_PASSWORD${RESET}"
+    echo -e "${GREEN}📂 数据目录: /opt/komari${RESET}"
+    read -p "按回车返回菜单..." && menu
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ 更新完成${RESET}"
-    read -p "按回车返回菜单..."
+update_komari() {
+    echo -e "${GREEN}=== 更新 Komari ===${RESET}"
+    docker compose -f "$COMPOSE_FILE" pull
+    docker compose -f "$COMPOSE_FILE" up -d
+    echo -e "${GREEN}✅ 更新完成！${RESET}"
+    read -p "按回车返回菜单..." && menu
 }
 
-restart_app() {
-    docker restart checkmate checkmate-mongo
-    echo -e "${GREEN}✅ 已重启${RESET}"
-    read -p "按回车返回菜单..."
+uninstall_komari() {
+    echo -e "${RED}即将卸载 Komari，并删除相关数据！${RESET}"
+    read -p "确认卸载? (y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        docker compose -f "$COMPOSE_FILE" down -v
+        rm -rf "/opt/komari"
+        echo -e "${GREEN}✅ 卸载完成${RESET}"
+    else
+        echo -e "${GREEN}已取消${RESET}"
+    fi
+    read -p "按回车返回菜单..." && menu
 }
 
 view_logs() {
-    docker logs -f checkmate
-}
-
-check_status() {
-    docker ps | grep checkmate
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已彻底卸载${RESET}"
-    read -p "按回车返回菜单..."
+    echo -e "${GREEN}=== 查看 Komari 日志 ===${RESET}"
+    docker logs -f $CONTAINER_NAME
+    read -p "按回车返回菜单..." && menu
 }
 
 menu

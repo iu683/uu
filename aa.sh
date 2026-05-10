@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# SUI Traffic Reset 一键管理脚本
+# LiteGist 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="sui-traffic-reset"
+APP_NAME="litegist"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,7 +34,8 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== SUI Traffic Reset 管理菜单 ===${RESET}"
+
+        echo -e "${GREEN}=== LiteGist 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -62,7 +63,7 @@ install_app() {
 
     check_docker
 
-    mkdir -p "$APP_DIR"
+    mkdir -p "$APP_DIR/data"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -70,69 +71,80 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入 Web 管理端口 [默认:8787]: " input_port
-    PORT=${input_port:-8787}
+    read -p "请输入访问端口 [默认:3382]: " input_port
+    PORT=${input_port:-3382}
     check_port "$PORT" || return
 
-    read -p "请输入 s-ui 数据库目录 [默认:/usr/local/s-ui/db]: " input_db
-    SUI_DB_DIR=${input_db:-/usr/local/s-ui/db}
+    read -p "请输入管理员用户名 [默认:admin]: " input_user
+    ADMIN_USER=${input_user:-admin}
 
-    if [ ! -f "$SUI_DB_DIR/s-ui.db" ]; then
-        echo -e "${RED}❌ 未检测到 s-ui.db:${RESET} $SUI_DB_DIR/s-ui.db"
-        read -p "按回车返回菜单..."
-        return
+    read -p "请输入管理员密码 [默认:随机生成]: " input_pass
+
+    if [ -z "$input_pass" ]; then
+        ADMIN_PASS=$(openssl rand -hex 8)
+    else
+        ADMIN_PASS="$input_pass"
     fi
 
-    ADMIN_PASSWORD=$(openssl rand -hex 12)
+    read -p "请输入 API_KEY [默认:随机生成]: " input_key
+
+    if [ -z "$input_key" ]; then
+        API_KEY=$(openssl rand -hex 16)
+    else
+        API_KEY="$input_key"
+    fi
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  sui-traffic-reset:
-    image: ghcr.io/oldwangnewbe/sui-traffic-reset:latest
-    container_name: sui-traffic-reset
+  litegist:
+    image: lockcp/litegist:latest
+    container_name: litegist
     restart: unless-stopped
 
-    environment:
-      SUI_DB: /data/s-ui.db
-      CHECK_INTERVAL: 60
-      TZ: Asia/Shanghai
-      RESET_ADMIN_USER: admin
-      RESET_ADMIN_PASSWORD: ${ADMIN_PASSWORD}
-      RESET_WEB_PORT: 8080
-
     ports:
-      - "127.0.0.1:${PORT}:8080"
+      - "127.0.0.1:${PORT}:3382"
 
     volumes:
-      - ${SUI_DB_DIR}:/data
+      - ./data:/app/data
+
+    environment:
+      PORT: 3382
+      ADMIN_USERNAME: ${ADMIN_USER}
+      ADMIN_PASSWORD: ${ADMIN_PASS}
+      API_KEY: ${API_KEY}
 EOF
 
     cd "$APP_DIR" || exit
 
     docker compose up -d
 
-    echo
-    echo -e "${GREEN}✅ SUI Traffic Reset 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址:${RESET} http://127.0.0.1:${PORT}"
-    echo -e "${GREEN}👤 用户名:${RESET} admin"
-    echo -e "${GREEN}🔑 密码:${RESET} ${ADMIN_PASSWORD}"
-
     cat > "$APP_DIR/account.txt" <<EOF
-访问地址: http://127.0.0.1:${PORT}
+访问地址:
+http://127.0.0.1:${PORT}
 
-用户名:
-admin
+管理员账号:
+${ADMIN_USER}
 
-密码:
-${ADMIN_PASSWORD}
+管理员密码:
+${ADMIN_PASS}
+
+API_KEY:
+${API_KEY}
 EOF
 
-    echo -e "${GREEN}📄 已保存账号信息:${RESET} $APP_DIR/account.txt"
+    echo
+    echo -e "${GREEN}✅ LiteGist 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址:${RESET} http://127.0.0.1:${PORT}"
+    echo -e "${GREEN}👤 用户名:${RESET} ${ADMIN_USER}"
+    echo -e "${GREEN}🔑 密码:${RESET} ${ADMIN_PASS}"
+    echo -e "${GREEN}🗝 API_KEY:${RESET} ${API_KEY}"
+    echo -e "${GREEN}📄 已保存到:${RESET} $APP_DIR/account.txt"
 
     read -p "按回车返回菜单..."
 }
 
 update_app() {
+
     cd "$APP_DIR" || return
 
     docker compose pull
@@ -144,7 +156,8 @@ update_app() {
 }
 
 restart_app() {
-    docker restart sui-traffic-reset
+
+    docker restart litegist
 
     echo -e "${GREEN}✅ 已重启${RESET}"
 
@@ -152,16 +165,18 @@ restart_app() {
 }
 
 view_logs() {
-    docker logs -f sui-traffic-reset
+    docker logs -f litegist
 }
 
 check_status() {
-    docker ps | grep sui-traffic-reset
+
+    docker ps | grep litegist
 
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
+
     cd "$APP_DIR" || return
 
     docker compose down -v

@@ -1,190 +1,137 @@
 #!/bin/bash
 # ========================================
-# LiteGist 一键管理脚本
+# Sing-box + S-UI 彻底卸载脚本
+# 支持 apt / yum / 手动 / 脚本安装
 # ========================================
 
+RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="litegist"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+echo -e "${RED}========================================${RESET}"
+echo -e "${RED}   Sing-box彻底卸载开始执行${RESET}"
+echo -e "${RED}========================================${RESET}"
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
+# 必须 root
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}请使用 root 身份运行此脚本${RESET}"
+    exit 1
+fi
 
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
-}
+# =============================
+# 1. 停止服务 & 杀进程
+# =============================
+echo -e "${YELLOW}[1/7] 停止服务与进程...${RESET}"
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
+# Sing-box
+systemctl stop sing-box 2>/dev/null
+systemctl disable sing-box 2>/dev/null
 
-menu() {
-    while true; do
-        clear
+# S-UI
+systemctl stop s-ui 2>/dev/null
+systemctl disable s-ui 2>/dev/null
 
-        echo -e "${GREEN}=== LiteGist 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
+# 杀进程
+pkill -9 sing-box 2>/dev/null
+pkill -9 s-ui 2>/dev/null
 
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+# =============================
+# 2. 卸载 apt / yum 包
+# =============================
+echo -e "${YELLOW}[2/7] 检测包管理安装...${RESET}"
 
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
-        esac
-    done
-}
+if command -v apt &>/dev/null && dpkg -l 2>/dev/null | grep -q sing-box; then
+    echo -e "${YELLOW}检测到 apt 安装 Sing-box${RESET}"
+    apt purge -y sing-box
+    apt autoremove -y
 
-install_app() {
+elif command -v yum &>/dev/null && rpm -qa | grep -q sing-box; then
+    echo -e "${YELLOW}检测到 yum 安装 Sing-box${RESET}"
+    yum remove -y sing-box
+fi
 
-    check_docker
+# =============================
+# 3. 删除可执行文件
+# =============================
+echo -e "${YELLOW}[3/7] 清理可执行文件...${RESET}"
 
-    mkdir -p "$APP_DIR/data"
+# Sing-box
+rm -f /usr/local/bin/sing-box
+rm -f /usr/bin/sing-box
 
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
+# S-UI
+rm -f /usr/bin/s-ui
 
-    read -p "请输入访问端口 [默认:3382]: " input_port
-    PORT=${input_port:-3382}
-    check_port "$PORT" || return
+# =============================
+# 4. 删除配置 & 数据 & 日志
+# =============================
+echo -e "${YELLOW}[4/7] 清理配置与日志...${RESET}"
 
-    read -p "请输入管理员用户名 [默认:admin]: " input_user
-    ADMIN_USER=${input_user:-admin}
+# Sing-box
+rm -rf /etc/sing-box
+rm -rf /usr/local/etc/sing-box
+rm -rf /var/log/sing-box
+rm -rf /opt/sing-box
 
-    read -p "请输入管理员密码 [默认:随机生成]: " input_pass
+# S-UI
+rm -rf /usr/local/s-ui
+rm -rf /etc/s-ui
+rm -rf /var/log/s-ui
 
-    if [ -z "$input_pass" ]; then
-        ADMIN_PASS=$(openssl rand -hex 8)
-    else
-        ADMIN_PASS="$input_pass"
-    fi
+# =============================
+# 5. 删除 systemd 服务
+# =============================
+echo -e "${YELLOW}[5/7] 清理 systemd 服务...${RESET}"
 
-    read -p "请输入 API_KEY [默认:随机生成]: " input_key
+# Sing-box
+rm -f /etc/systemd/system/sing-box.service
+rm -f /etc/systemd/system/sing-box@.service
 
-    if [ -z "$input_key" ]; then
-        API_KEY=$(openssl rand -hex 16)
-    else
-        API_KEY="$input_key"
-    fi
+# S-UI
+rm -f /etc/systemd/system/s-ui.service
 
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  litegist:
-    image: lockcp/litegist:latest
-    container_name: litegist
-    restart: unless-stopped
+systemctl daemon-reload
+systemctl reset-failed
 
-    ports:
-      - "127.0.0.1:${PORT}:3382"
+# =============================
+# 6. Docker 清理
+# =============================
+echo -e "${YELLOW}[6/7] 清理 Docker 残留...${RESET}"
 
-    volumes:
-      - ./data:/app/data
+if command -v docker &>/dev/null; then
+    docker ps -a --format "{{.Names}}" | \
+    grep -Ei 'sing-box|singbox|s-ui|sui' | \
+    xargs -r docker rm -f
+fi
 
-    environment:
-      PORT: 3382
-      ADMIN_USERNAME: ${ADMIN_USER}
-      ADMIN_PASSWORD: ${ADMIN_PASS}
-      API_KEY: ${API_KEY}
-EOF
+# =============================
+# 7. 网络接口 & 残留检查
+# =============================
+echo -e "${YELLOW}[7/7] 检查残留...${RESET}"
 
-    cd "$APP_DIR" || exit
+# 检查虚拟网卡
+ip link show 2>/dev/null | grep -iE 'sing|tun'
 
-    docker compose up -d
+# 检查进程
+echo -e "${YELLOW}检查进程:${RESET}"
+ps -ef | grep -E 'sing-box|s-ui' | grep -v grep
 
-    cat > "$APP_DIR/account.txt" <<EOF
-访问地址:
-http://127.0.0.1:${PORT}
+# 检查端口
+echo -e "${YELLOW}检查端口:${RESET}"
 
-管理员账号:
-${ADMIN_USER}
+ports=$(ss -tulnp 2>/dev/null | grep -Ei 'sing-box|s-ui')
 
-管理员密码:
-${ADMIN_PASS}
+if [[ -n "$ports" ]]; then
+    echo -e "${RED}仍有端口占用:${RESET}"
+    echo "$ports"
+else
+    echo -e "${GREEN}无端口残留${RESET}"
+fi
 
-API_KEY:
-${API_KEY}
-EOF
-
-    echo
-    echo -e "${GREEN}✅ LiteGist 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址:${RESET} http://127.0.0.1:${PORT}"
-    echo -e "${GREEN}👤 用户名:${RESET} ${ADMIN_USER}"
-    echo -e "${GREEN}🔑 密码:${RESET} ${ADMIN_PASS}"
-    echo -e "${GREEN}🗝 API_KEY:${RESET} ${API_KEY}"
-    echo -e "${GREEN}📄 已保存到:${RESET} $APP_DIR/account.txt"
-
-    read -p "按回车返回菜单..."
-}
-
-update_app() {
-
-    cd "$APP_DIR" || return
-
-    docker compose pull
-    docker compose up -d
-
-    echo -e "${GREEN}✅ 更新完成${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-restart_app() {
-
-    docker restart litegist
-
-    echo -e "${GREEN}✅ 已重启${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-    docker logs -f litegist
-}
-
-check_status() {
-
-    docker ps | grep litegist
-
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-
-    cd "$APP_DIR" || return
-
-    docker compose down -v
-    rm -rf "$APP_DIR"
-
-    echo -e "${RED}✅ 已彻底卸载${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-menu
+# =============================
+# 完成
+# =============================
+echo -e "${GREEN}========================================${RESET}"
+echo -e "${GREEN}✅ Sing-box 已彻底卸载完成${RESET}"
+echo -e "${GREEN}========================================${RESET}"

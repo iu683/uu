@@ -1,137 +1,249 @@
 #!/bin/bash
 # ========================================
-# Sing-box + S-UI 彻底卸载脚本
-# 支持 apt / yum / 手动 / 脚本安装
+# TGuard 一键管理脚本
 # ========================================
 
-RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-echo -e "${RED}========================================${RESET}"
-echo -e "${RED}   Sing-box彻底卸载开始执行${RESET}"
-echo -e "${RED}========================================${RESET}"
+APP_NAME="tguard"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/config.toml"
 
-# 必须 root
-if [[ $EUID -ne 0 ]]; then
-    echo -e "${RED}请使用 root 身份运行此脚本${RESET}"
-    exit 1
-fi
+check_docker() {
 
-# =============================
-# 1. 停止服务 & 杀进程
-# =============================
-echo -e "${YELLOW}[1/7] 停止服务与进程...${RESET}"
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
 
-# Sing-box
-systemctl stop sing-box 2>/dev/null
-systemctl disable sing-box 2>/dev/null
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2${RESET}"
+        exit 1
+    fi
+}
 
-# S-UI
-systemctl stop s-ui 2>/dev/null
-systemctl disable s-ui 2>/dev/null
+check_port() {
 
-# 杀进程
-pkill -9 sing-box 2>/dev/null
-pkill -9 s-ui 2>/dev/null
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用${RESET}"
+        return 1
+    fi
+}
 
-# =============================
-# 2. 卸载 apt / yum 包
-# =============================
-echo -e "${YELLOW}[2/7] 检测包管理安装...${RESET}"
+menu() {
 
-if command -v apt &>/dev/null && dpkg -l 2>/dev/null | grep -q sing-box; then
-    echo -e "${YELLOW}检测到 apt 安装 Sing-box${RESET}"
-    apt purge -y sing-box
-    apt autoremove -y
+    while true; do
 
-elif command -v yum &>/dev/null && rpm -qa | grep -q sing-box; then
-    echo -e "${YELLOW}检测到 yum 安装 Sing-box${RESET}"
-    yum remove -y sing-box
-fi
+        clear
 
-# =============================
-# 3. 删除可执行文件
-# =============================
-echo -e "${YELLOW}[3/7] 清理可执行文件...${RESET}"
+        echo -e "${GREEN}=== TGuard 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
 
-# Sing-box
-rm -f /usr/local/bin/sing-box
-rm -f /usr/bin/sing-box
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-# S-UI
-rm -f /usr/bin/s-ui
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
 
-# =============================
-# 4. 删除配置 & 数据 & 日志
-# =============================
-echo -e "${YELLOW}[4/7] 清理配置与日志...${RESET}"
+install_app() {
 
-# Sing-box
-rm -rf /etc/sing-box
-rm -rf /usr/local/etc/sing-box
-rm -rf /var/log/sing-box
-rm -rf /opt/sing-box
+    check_docker
 
-# S-UI
-rm -rf /usr/local/s-ui
-rm -rf /etc/s-ui
-rm -rf /var/log/s-ui
+    mkdir -p "$APP_DIR/data"
 
-# =============================
-# 5. 删除 systemd 服务
-# =============================
-echo -e "${YELLOW}[5/7] 清理 systemd 服务...${RESET}"
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
 
-# Sing-box
-rm -f /etc/systemd/system/sing-box.service
-rm -f /etc/systemd/system/sing-box@.service
 
-# S-UI
-rm -f /etc/systemd/system/s-ui.service
+    read -p "请输入 Telegram Bot Token: " BOT_TOKEN
 
-systemctl daemon-reload
-systemctl reset-failed
+    read -p "请输入管理员 TG ID: " ADMIN_ID
 
-# =============================
-# 6. Docker 清理
-# =============================
-echo -e "${YELLOW}[6/7] 清理 Docker 残留...${RESET}"
+    read -p "请输入域名 [例如:https://tg.example.com]: " BASE_URL
 
-if command -v docker &>/dev/null; then
-    docker ps -a --format "{{.Names}}" | \
-    grep -Ei 'sing-box|singbox|s-ui|sui' | \
-    xargs -r docker rm -f
-fi
+    read -p "请输入 Turnstile Site Key: " TURNSTILE_SITE_KEY
 
-# =============================
-# 7. 网络接口 & 残留检查
-# =============================
-echo -e "${YELLOW}[7/7] 检查残留...${RESET}"
+    read -p "请输入 Turnstile Secret Key: " TURNSTILE_SECRET_KEY
 
-# 检查虚拟网卡
-ip link show 2>/dev/null | grep -iE 'sing|tun'
+    POSTGRES_PASSWORD=$(openssl rand -hex 12)
+    API_KEY=$(openssl rand -hex 16)
 
-# 检查进程
-echo -e "${YELLOW}检查进程:${RESET}"
-ps -ef | grep -E 'sing-box|s-ui' | grep -v grep
+    cat > "$CONFIG_FILE" <<EOF
+[bot]
+token = "$BOT_TOKEN"
+verification_timeout = 300
+verification_button_text = "🔐 开始验证"
+admin_ids = [$ADMIN_ID]
 
-# 检查端口
-echo -e "${YELLOW}检查端口:${RESET}"
+[database]
+host = "postgres"
+port = 5432
+name = "tguard"
+user = "postgres"
+password = "$POSTGRES_PASSWORD"
+min_size = 1
+max_size = 10
 
-ports=$(ss -tulnp 2>/dev/null | grep -Ei 'sing-box|s-ui')
+[captcha]
+provider = "turnstile"
+expire_minutes = 10
+timeout_seconds = 30
 
-if [[ -n "$ports" ]]; then
-    echo -e "${RED}仍有端口占用:${RESET}"
-    echo "$ports"
-else
-    echo -e "${GREEN}无端口残留${RESET}"
-fi
+[captcha.turnstile]
+site_key = "$TURNSTILE_SITE_KEY"
+secret_key = "$TURNSTILE_SECRET_KEY"
 
-# =============================
-# 完成
-# =============================
-echo -e "${GREEN}========================================${RESET}"
-echo -e "${GREEN}✅ Sing-box 已彻底卸载完成${RESET}"
-echo -e "${GREEN}========================================${RESET}"
+[api]
+host = "0.0.0.0"
+port = 8000
+base_url = "$BASE_URL"
+enable = true
+api_key = "$API_KEY"
+EOF
+
+    cat > "$COMPOSE_FILE" <<EOF
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tguard-postgres
+    environment:
+      POSTGRES_DB: tguard
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: $POSTGRES_PASSWORD
+    volumes:
+      - ./data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  bot:
+    image: ghcr.io/sidecloudgroup/tguard:latest
+    container_name: tguard-bot
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - PYTHONPATH=/app
+    volumes:
+      - ./config.toml:/app/config.toml
+    command: python -m src.bot.main
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD-SHELL", "python -c \"import sys; sys.exit(0)\"" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  api:
+    image: ghcr.io/sidecloudgroup/tguard:latest
+    container_name: tguard-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "17985:8000"
+    environment:
+      - PYTHONPATH=/app
+    volumes:
+      - ./config.toml:/app/config.toml
+    command: python -m src.api.main
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)\"" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+EOF
+
+    cd "$APP_DIR" || exit
+
+    docker compose up -d
+
+    echo
+    echo -e "${GREEN}✅ TGuard 已启动${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    echo -e "${GREEN}🔑 API KEY: $API_KEY${RESET}"
+    echo -e "${GREEN}🗄 PostgreSQL 密码: $POSTGRES_PASSWORD${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+
+    cd "$APP_DIR" || return
+
+    docker compose pull
+    docker compose up -d
+
+    echo -e "${GREEN}✅ 更新完成${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+
+    cd "$APP_DIR" || return
+
+    docker compose restart
+
+    echo -e "${GREEN}✅ 已重启${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+
+    cd "$APP_DIR" || return
+
+    docker compose logs -f
+}
+
+check_status() {
+
+    docker ps | grep tguard
+
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+
+    cd "$APP_DIR" || return
+
+    docker compose down -v
+
+    rm -rf "$APP_DIR"
+
+    echo -e "${RED}✅ TGuard 已彻底卸载${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+menu

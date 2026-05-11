@@ -8,39 +8,49 @@ C='\033[0;36m' # 青
 R='\033[0;31m' # 红
 NC='\033[0m'    # 无色
 
-# 检查 Docker 状态
-if ! docker info > /dev/null 2>&1; then
-    echo -e "${R}错误: Docker 未运行。${NC}"
-    exit 1
-fi
-
 clear
-echo -e "${B}================================================================================${NC}"
-echo -e "${Y}          🚀 Docker 容器资源占用 (按内存排序)${NC}"
-echo -e "${B}================================================================================${NC}"
+echo -e "${B}========================================${NC}"
+echo -e "${Y}       🚀 Docker 运行监控${NC}"
+echo -e "${B}========================================${NC}"
 
-# 1. 获取基础数据并处理
-# 使用 docker stats 获取数据，用 " | " 作为分隔符以便 column 处理
-raw_data=$(docker stats --no-stream --format "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}")
-
-# 2. 构建带磁盘空间的临时数据
-processed_data=""
-while IFS='|' read -r name cpu mem; do
-    # 获取磁盘占用：只提取第一部分大小，不带任何空格或括号
-    # 使用 docker inspect 辅助确保获取该容器的真实 RW 层大小
-    disk=$(docker ps -s --filter "name=^/${name}$" --format "{{.Size}}" | awk '{print $1}')
+# 获取并处理数据 (按内存排序)
+docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" | sort -k3 -hr | while IFS=$'\t' read -r name cpu mem net; do
     
-    # 拼接一行数据
-    processed_data+="${name}|${cpu}|${mem}|${disk}\n"
-done <<< "$raw_data"
+    # 1. 获取运行时间并汉化
+    raw_status=$(docker ps -a --filter "name=^/${name}$" --format "{{.Status}}")
+    
+    # 汉化处理
+    uptime=$(echo "$raw_status" | \
+        sed 's/Up /运行 /' | \
+        sed 's/Exited/已停止/' | \
+        sed 's/seconds/秒/' | \
+        sed 's/second/秒/' | \
+        sed 's/minutes/分钟/' | \
+        sed 's/minute/分钟/' | \
+        sed 's/hours/小时/' | \
+        sed 's/hour/小时/' | \
+        sed 's/days/天/' | \
+        sed 's/day/天/' | \
+        sed 's/weeks/周/' | \
+        sed 's/week/周/' | \
+        sed 's/months/月/' | \
+        sed 's/month/月/' | \
+        sed 's/about //' | \
+        sed 's/ago/前/')
+    
+    # 2. 颜色逻辑：CPU 超过 50% 变红
+    cpu_val=$(echo $cpu | cut -d'.' -f1 | tr -d '%')
+    if [[ "$cpu_val" =~ ^[0-9]+$ ]] && [ "$cpu_val" -gt 50 ]; then 
+        CPU_COLOR=$R; 
+    else 
+        CPU_COLOR=$G; 
+    fi
 
-# 3. 打印表头并使用 column 自动对齐
-# 先输出表头，再通过 sort 排序，最后通过 column 对齐
-(
-echo -e "${C}容器名称|CPU占用|内存使用|磁盘空间(RW层)${NC}"
-echo -e "${processed_data}" | sort -t'|' -k3 -hr
-) | column -t -s '|'
-
-echo -e "${B}--------------------------------------------------------------------------------${NC}"
-echo -e "${G}总计占用:${NC} $(docker system df | grep 'Containers' | awk '{print $4}')"
-echo -e "${B}================================================================================${NC}"
+    # 3. 手机端纵向块状输出
+    echo -e "${C}◈ 容器: ${NC}${Y}${name}${NC}"
+    echo -e "  ├─ ${G}CPU 占用: ${NC}${CPU_COLOR}${cpu}${NC}"
+    echo -e "  ├─ ${G}内存使用: ${NC}${mem}"
+    echo -e "  ├─ ${G}网络 I/O: ${NC}${net}"
+    echo -e "  └─ ${G}运行状态: ${NC}${Y}${uptime}${NC}"
+    echo -e "${B}----------------------------------------${NC}"
+done

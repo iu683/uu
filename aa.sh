@@ -1,59 +1,171 @@
 #!/bin/bash
+# ========================================
+# MiaomiaowuX 一键管理脚本
+# ========================================
 
-# 颜色定义
-G='\033[0;32m' # 绿
-B='\033[0;34m' # 蓝
-Y='\033[1;33m' # 黄
-C='\033[0;36m' # 青
-R='\033[0;31m' # 红
-NC='\033[0m'    # 无色
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-clear
-echo -e "${B}========================================${NC}"
-echo -e "${Y}       🚀 Docker 运行监控${NC}"
-echo -e "${B}========================================${NC}"
+APP_NAME="miaomiaowux"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-# 获取并处理数据 (按内存排序)
-docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" | sort -k3 -hr | while IFS=$'\t' read -r name cpu mem net; do
-    
-    # 1. 获取运行时间并深度汉化
-    raw_status=$(docker ps -a --filter "name=^/${name}$" --format "{{.Status}}")
-    
-    # 汉化引擎：包含时间、单位、状态
-    uptime=$(echo "$raw_status" | \
-        sed 's/Up /运行 /' | \
-        sed 's/Exited/已停止/' | \
-        sed 's/(healthy)/(健康)/' | \
-        sed 's/(unhealthy)/(非健康)/' | \
-        sed 's/(starting)/(启动中)/' | \
-        sed 's/seconds/秒/' | \
-        sed 's/second/秒/' | \
-        sed 's/minutes/分钟/' | \
-        sed 's/minute/分钟/' | \
-        sed 's/hours/小时/' | \
-        sed 's/hour/小时/' | \
-        sed 's/days/天/' | \
-        sed 's/day/天/' | \
-        sed 's/weeks/周/' | \
-        sed 's/week/周/' | \
-        sed 's/months/月/' | \
-        sed 's/month/月/' | \
-        sed 's/about //' | \
-        sed 's/ago/前/')
-    
-    # 2. 颜色逻辑：CPU 超过 50% 变红
-    cpu_val=$(echo $cpu | cut -d'.' -f1 | tr -d '%')
-    if [[ "$cpu_val" =~ ^[0-9]+$ ]] && [ "$cpu_val" -gt 50 ]; then 
-        CPU_COLOR=$R; 
-    else 
-        CPU_COLOR=$G; 
+check_docker() {
+
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
     fi
 
-    # 3. 手机端纵向块状输出
-    echo -e "${C}◈ 容器: ${NC}${Y}${name}${NC}"
-    echo -e "  ├─ ${G}CPU 占用: ${NC}${CPU_COLOR}${cpu}${NC}"
-    echo -e "  ├─ ${G}内存使用: ${NC}${mem}"
-    echo -e "  ├─ ${G}网络 I/O: ${NC}${net}"
-    echo -e "  └─ ${G}运行状态: ${NC}${Y}${uptime}${NC}"
-    echo -e "${B}----------------------------------------${NC}"
-done
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
+    fi
+}
+
+check_port() {
+
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
+
+menu() {
+
+    while true; do
+
+        clear
+
+        echo -e "${GREEN}=== MiaomiaowuX 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
+        esac
+    done
+}
+
+install_app() {
+
+    check_docker
+
+    mkdir -p "$APP_DIR/data"
+    mkdir -p "$APP_DIR/rule_templates"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
+
+    read -p "请输入访问端口 [默认:12889]: " input_port
+    PORT=${input_port:-12889}
+    check_port "$PORT" || return
+
+    read -p "请输入日志等级 [默认:info]: " input_log
+    LOG_LEVEL=${input_log:-info}
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  miaomiaowu:
+    image: ghcr.io/iluobei/miaomiaowuX:latest
+    container_name: miaomiaowuX
+    restart: unless-stopped
+    user: root
+
+    environment:
+      PORT: ${PORT}
+      DATABASE_PATH: /app/data/mmwx.db
+      LOG_LEVEL: ${LOG_LEVEL}
+
+    ports:
+      - "127.0.0.1:${PORT}:${PORT}"
+
+    volumes:
+      - ./data:/app/data
+      - ./rule_templates:/app/rule_templates
+
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:${PORT}/"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+EOF
+
+    cd "$APP_DIR" || exit
+
+    docker compose up -d
+
+    echo
+    echo -e "${GREEN}✅ MiaomiaowuX 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址:${RESET} http://127.0.0.1:${PORT}"
+    echo -e "${GREEN}📂 数据目录:${RESET} $APP_DIR/data"
+    echo -e "${GREEN}📂 规则目录:${RESET} $APP_DIR/rule_templates"
+
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+
+    cd "$APP_DIR" || return
+
+    docker compose pull
+    docker compose up -d
+
+    echo -e "${GREEN}✅ 更新完成${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+
+    docker restart miaomiaowuX
+
+    echo -e "${GREEN}✅ 已重启${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    docker logs -f miaomiaowuX
+}
+
+check_status() {
+
+    docker ps | grep miaomiaowuX
+
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+
+    cd "$APP_DIR" || return
+
+    docker compose down -v
+    rm -rf "$APP_DIR"
+
+    echo -e "${RED}✅ 已彻底卸载${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+menu

@@ -80,21 +80,19 @@ install_app() {
     PORT=${input_port:-12889}
     check_port "$PORT" || return
 
-    read -p "请输入日志等级 [默认:info]: " input_log
-    LOG_LEVEL=${input_log:-info}
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
   miaomiaowu:
-    image: ghcr.io/iluobei/miaomiaowuX:latest
-    container_name: miaomiaowuX
+    image: ghcr.io/iluobei/miaomiaowux:latest
+    container_name: miaomiaowux
     restart: unless-stopped
     user: root
 
     environment:
       PORT: ${PORT}
       DATABASE_PATH: /app/data/mmwx.db
-      LOG_LEVEL: ${LOG_LEVEL}
+      LOG_LEVEL: info
 
     ports:
       - "127.0.0.1:${PORT}:${PORT}"
@@ -118,8 +116,8 @@ EOF
     echo
     echo -e "${GREEN}✅ MiaomiaowuX 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址:${RESET} http://127.0.0.1:${PORT}"
-    echo -e "${GREEN}📂 数据目录:${RESET} $APP_DIR/data"
-    echo -e "${GREEN}📂 规则目录:${RESET} $APP_DIR/rule_templates"
+    echo -e "${YELLOW}📂 数据目录:${RESET} $APP_DIR/data"
+    echo -e "${YELLOW}📂 规则目录:${RESET} $APP_DIR/rule_templates"
 
     read -p "按回车返回菜单..."
 }
@@ -138,7 +136,7 @@ update_app() {
 
 restart_app() {
 
-    docker restart miaomiaowuX
+    docker restart miaomiaowux
 
     echo -e "${GREEN}✅ 已重启${RESET}"
 
@@ -146,12 +144,12 @@ restart_app() {
 }
 
 view_logs() {
-    docker logs -f miaomiaowuX
+    docker logs -f miaomiaowux
 }
 
 check_status() {
 
-    docker ps | grep miaomiaowuX
+    docker ps | grep miaomiaowux
 
     read -p "按回车返回菜单..."
 }

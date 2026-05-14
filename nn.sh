@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# MiaomiaowuX 一键管理脚本
+# Fast Note Sync Service 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="miaomiaowux"
+APP_NAME="fast-note-sync-service"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -39,7 +39,7 @@ menu() {
 
         clear
 
-        echo -e "${GREEN}=== MiaomiaowuX 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Fast Note Sync Service 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -67,8 +67,8 @@ install_app() {
 
     check_docker
 
-    mkdir -p "$APP_DIR/data"
-    mkdir -p "$APP_DIR/rule_templates"
+    mkdir -p "$APP_DIR/storage"
+    mkdir -p "$APP_DIR/config"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -76,39 +76,40 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:12889]: " input_port
-    PORT=${input_port:-12889}
-    check_port "$PORT" || return
+    read -p "请输入服务端口 [默认:9000]: " input_port
+    PORT=${input_port:-9000}
 
-    read -p "请输入日志等级 [默认:info]: " input_log
-    LOG_LEVEL=${input_log:-info}
+    check_port "$PORT" || return
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  miaomiaowu:
-    image: ghcr.io/iluobei/miaomiaowux:latest
-    container_name: miaomiaowux
-    restart: unless-stopped
-    user: root
+  fast-note-sync-service:
+    image: haierkeys/fast-note-sync-service:latest
+    container_name: fast-note-sync-service
 
-    environment:
-      PORT: ${PORT}
-      DATABASE_PATH: /app/data/mmwx.db
-      LOG_LEVEL: ${LOG_LEVEL}
+    restart: unless-stopped
 
     ports:
-      - "127.0.0.1:${PORT}:${PORT}"
+      - "${PORT}:9000"
 
     volumes:
-      - ./data:/app/data
-      - ./rule_templates:/app/rule_templates
+      - ./storage:/fast-note-sync/storage
+      - ./config:/fast-note-sync/config
+
+    environment:
+      TZ: Asia/Tokyo
 
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:${PORT}/"]
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
       interval: 30s
-      timeout: 3s
-      start_period: 5s
+      timeout: 10s
       retries: 3
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 EOF
 
     cd "$APP_DIR" || exit
@@ -116,10 +117,11 @@ EOF
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ MiaomiaowuX 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址:${RESET} http://127.0.0.1:${PORT}"
-    echo -e "${GREEN}📂 数据目录:${RESET} $APP_DIR/data"
-    echo -e "${GREEN}📂 规则目录:${RESET} $APP_DIR/rule_templates"
+    echo -e "${GREEN}✅ Fast Note Sync Service 已启动${RESET}"
+    echo -e "${YELLOW}🌐 REST API:${RESET} http://127.0.0.1:${PORT}"
+    echo -e "${YELLOW}🔌 WebSocket:${RESET} ws://127.0.0.1:${PORT}/api/user/sync"
+    echo -e "${YELLOW}📂 数据目录:${RESET} $APP_DIR/storage"
+    echo -e "${YELLOW}⚙️ 配置目录:${RESET} $APP_DIR/config"
 
     read -p "按回车返回菜单..."
 }
@@ -138,7 +140,7 @@ update_app() {
 
 restart_app() {
 
-    docker restart miaomiaowuX
+    docker restart fast-note-sync-service
 
     echo -e "${GREEN}✅ 已重启${RESET}"
 
@@ -146,12 +148,13 @@ restart_app() {
 }
 
 view_logs() {
-    docker logs -f miaomiaowuX
+
+    docker logs -f fast-note-sync-service
 }
 
 check_status() {
 
-    docker ps | grep miaomiaowuX
+    docker ps | grep fast-note-sync-service
 
     read -p "按回车返回菜单..."
 }
@@ -161,6 +164,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
 
     docker compose down -v
+
     rm -rf "$APP_DIR"
 
     echo -e "${RED}✅ 已彻底卸载${RESET}"

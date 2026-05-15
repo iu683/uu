@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# MiaomiaowuX 一键管理脚本
+# ShellCrash 一键安装脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,164 +8,39 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="miaomiaowux"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+INSTALL_URL="https://v6.gh-proxy.org/https://raw.githubusercontent.com/juewuy/ShellCrash/master/install.sh"
 
-check_docker() {
+echo -e "${GREEN}========================================${RESET}"
+echo -e "${GREEN}      ShellCrash 开始安装${RESET}"
+echo -e "${GREEN}========================================${RESET}"
 
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
+# 检测 curl
+if ! command -v curl &>/dev/null; then
+    echo -e "${YELLOW}未检测到 curl，正在安装...${RESET}"
 
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+    if command -v apt-get &>/dev/null; then
+        apt-get update -y && apt-get install -y curl
+    elif command -v yum &>/dev/null; then
+        yum install -y curl
+    elif command -v apk &>/dev/null; then
+        apk add curl
+    else
+        echo -e "${RED}无法自动安装 curl，请手动安装${RESET}"
         exit 1
     fi
-}
+fi
 
-check_port() {
+echo -e "${GREEN}正在下载安装脚本...${RESET}"
 
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
+if bash -c "$(curl -fsSL $INSTALL_URL)"; then
+    source /etc/profile &>/dev/null
 
-menu() {
-
-    while true; do
-
-        clear
-
-        echo -e "${GREEN}=== MiaomiaowuX 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
-        esac
-    done
-}
-
-install_app() {
-
-    check_docker
-
-    mkdir -p "$APP_DIR/data"
-    mkdir -p "$APP_DIR/rule_templates"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-
-    read -p "请输入访问端口 [默认:12889]: " input_port
-    PORT=${input_port:-12889}
-    check_port "$PORT" || return
-
-    JWT_SECRET=$(openssl rand -hex 32)
-
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  miaomiaowu:
-    image: iluobei/miaomiaowux:latest
-    container_name: miaomiaowux
-    restart: unless-stopped
-    user: root
-
-    environment:
-      PORT: ${PORT}
-      DATABASE_PATH: /app/data/mmwx.db
-      LOG_LEVEL: info
-      JWT_SECRET: ${JWT_SECRET}
-
-    ports:
-      - "127.0.0.1:${PORT}:${PORT}"
-
-    volumes:
-      - ./data:/app/data
-      - ./rule_templates:/app/rule_templates
-
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:${PORT}/"]
-      interval: 30s
-      timeout: 3s
-      start_period: 5s
-      retries: 3
-EOF
-
-    cd "$APP_DIR" || exit
-
-    docker compose up -d
-
-    echo
-    echo -e "${GREEN}✅ MiaomiaowuX 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址:${RESET} http://127.0.0.1:${PORT}"
-    echo -e "${YELLOW}📂 数据目录:${RESET} $APP_DIR/data"
-    echo -e "${YELLOW}📂 规则目录:${RESET} $APP_DIR/rule_templates"
-
-    read -p "按回车返回菜单..."
-}
-
-update_app() {
-
-    cd "$APP_DIR" || return
-
-    docker compose pull
-    docker compose up -d
-
-    echo -e "${GREEN}✅ 更新完成${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-restart_app() {
-
-    docker restart miaomiaowux
-
-    echo -e "${GREEN}✅ 已重启${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-    docker logs -f miaomiaowux
-}
-
-check_status() {
-
-    docker ps | grep miaomiaowux
-
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-
-    cd "$APP_DIR" || return
-
-    docker compose down -v
-    rm -rf "$APP_DIR"
-
-    echo -e "${RED}✅ 已彻底卸载${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-menu
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}      ShellCrash 安装完成${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
+else
+    echo -e "${RED}========================================${RESET}"
+    echo -e "${RED}      ShellCrash 安装失败${RESET}"
+    echo -e "${RED}========================================${RESET}"
+    exit 1
+fi

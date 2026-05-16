@@ -1,39 +1,57 @@
 #!/bin/bash
 
 GREEN="\033[32m"
+ORANGE='\033[38;5;208m'
 YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
 menu() {
     clear
-    echo -e "${GREEN}=== 1Panelv1开心版管理菜单 ===${RESET}"
-    echo -e "${YELLOW}授权证书获取地址: https://1panel.sb"
-    echo -e "${GREEN}1) 安装${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 管理${RESET}"
-    echo -e "${GREEN}3) 卸载${RESET}"
+    echo -e "${ORANGE}=== 监控管理菜单 ===${RESET}"
+    echo -e "${YELLOW}1) NodeGet监控安装${RESET}"
+    echo -e "${YELLOW}2) 哪吒监控安装${RESET}"
+    echo -e "${YELLOW}3) Komari监控安装${RESET}"
+    echo -e "${YELLOW}4) 哪吒关闭SSH${RESET}"
+    echo -e "${YELLOW}5) 哪吒Agent管理${RESET}"
+    echo -e "${YELLOW}6) KomariAgent管理${RESET}"
+    echo -e "${YELLOW}7) NodeGetAgent管理${RESET}"
     echo -e "${GREEN}0) 退出${RESET}"
     read -p $'\033[32m请选择操作: \033[0m' choice
     case $choice in
         1)
-            echo -e "${GREEN}正在安装部署 1Panel v1 开心版...${RESET}"
-            curl -sSL https://resource.1panel.sb/1panel/package/quick_start.sh -o quick_start.sh && bash quick_start.sh
+            echo -e "${GREEN}正在安装 NodeGet 监控...${RESET}"
+            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/NodeGetgl.sh)
             pause
             ;;
         2)
-            echo -e "${GREEN}正在更新...${RESET}"
-            curl https://resource.1panel.sb/1panel/package/update.sh | bash
+            echo -e "${GREEN}正在安装哪吒监控...${RESET}"
+            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/aznezha.sh)
             pause
             ;;
         3)
-            echo -e "${GREEN}正在打开菜单管理...${RESET}"
-            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/1PanelCD.sh)
+            echo -e "${GREEN}正在安装 Komari 监控...${RESET}"
+            bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/komarigl.sh)
             pause
             ;;
         4)
-            echo -e "${GREEN}正在卸载 1Panel v1 开心版...${RESET}"
-            1pctl uninstall
+            echo -e "${GREEN} 哪吒关闭SSH ...${RESET}"
+            bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/nezhassh.sh)
+            pause
+            ;;
+        5)
+            echo -e "${GREEN}正在安装哪吒 Agent管理...${RESET}"
+            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/NezhaAgent.sh)
+            pause
+            ;;
+        6)
+            echo -e "${GREEN}正在安装 Komari Agent管理...${RESET}"
+            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/KomariAgent.sh)
+            pause
+            ;;
+        7)
+            echo -e "${GREEN}正在安装 NodeGet Agent管理...${RESET}"
+            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/NodeGetAgent.sh)
             pause
             ;;
         0)

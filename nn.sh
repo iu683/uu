@@ -1,43 +1,29 @@
 #!/bin/bash
-# ========================================
-# ShellCrash 一键安装脚本
-# ========================================
 
+# ================== 颜色定义 ==================
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-URL="https://v6.gh-proxy.org"
+# ================== 脚本路径 ==================
+SCRIPT_PATH="/root/vps-toolbox.sh"
+SCRIPT_URL="https://v6.gh-proxy.org/https://raw.githubusercontent.com/sistarry/toolbox/main/tool/vps-toolbox.sh"
+BIN_LINK_DIR="/usr/local/bin"
 
-echo -e "${GREEN}========================================${RESET}"
-echo -e "${GREEN}      ShellCrash 开始安装${RESET}"
-echo -e "${GREEN}========================================${RESET}"
-
-# 检测 curl
-if ! command -v curl &>/dev/null; then
-    echo -e "${YELLOW}未检测到 curl，正在安装...${RESET}"
-
-    if command -v apt-get &>/dev/null; then
-        apt-get update -y && apt-get install -y curl
-    elif command -v yum &>/dev/null; then
-        yum install -y curl
-    elif command -v apk &>/dev/null; then
-        apk add curl
-    else
-        echo -e "${RED}无法自动安装 curl，请手动安装${RESET}"
+# ================== 首次运行自动安装 ==================
+if [ ! -f "$SCRIPT_PATH" ]; then
+    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 安装失败，请检查网络或 URL${RESET}"
         exit 1
     fi
+    chmod +x "$SCRIPT_PATH"
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/m"
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/M"
+    echo -e "${GREEN}✅ 安装完成${RESET}"
+    echo -e "${GREEN}✅ 你可以输入 ${RED}m${RESET}${GREEN} 或 ${RED}M${RESET}${GREEN} 运行 Toolbox 工具箱${RESET}"
 fi
 
-# 开始安装
-echo -e "${GREEN}正在下载安装脚本...${RESET}"
-
-bash -c "$(curl -kfsSl $URL/install.sh)"
-
-# 加载环境变量
-source /etc/profile &>/dev/null
-
-echo -e "${GREEN}========================================${RESET}"
-echo -e "${GREEN}      ShellCrash 安装完成${RESET}"
-echo -e "${GREEN}========================================${RESET}"
+# ================== 执行脚本 ==================
+exec "$SCRIPT_PATH"

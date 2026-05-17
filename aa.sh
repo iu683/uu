@@ -1,7 +1,6 @@
 #!/bin/bash
 # ========================================
-# Renewlet 一键管理脚本
-# 官方 .env + compose 完整版
+# Lumina Theme 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -9,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="renewlet"
+APP_NAME="lumina-theme"
 APP_DIR="/opt/$APP_NAME"
 
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
@@ -43,7 +42,7 @@ menu() {
         clear
 
         echo -e "${GREEN}========================================${RESET}"
-        echo -e "${GREEN}          Renewlet 管理菜单${RESET}"
+        echo -e "${GREEN}         Lumina Theme 管理菜单${RESET}"
         echo -e "${GREEN}========================================${RESET}"
 
         echo -e "${GREEN}1) 安装启动${RESET}"
@@ -75,7 +74,7 @@ install_app() {
 
     check_docker
 
-    mkdir -p "$APP_DIR/data"
+    mkdir -p "$APP_DIR"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -83,115 +82,49 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:3000]: " input_port
-    PORT=${input_port:-3000}
-    check_port "$PORT" || return
+    read -p "请输入哪吒面板地址 [默认:127.0.0.1]: " input_host
+    NEZHA_HOST=${input_host:-127.0.0.1}
 
-    read -p "请输入站点 URL [默认:http://127.0.0.1:${PORT}]: " input_url
-    APP_URL=${input_url:-http://127.0.0.1:${PORT}}
+    read -p "请输入哪吒 RPC 端口 [默认:8008]: " input_nezha_port
+    NEZHA_PORT=${input_nezha_port:-8008}
 
-    TZ_VALUE=${input_tz:-Asia/Shanghai}
+    read -p "请输入 Lumina 访问端口 [默认:3000]: " input_lumina_port
+    LUMINA_PORT=${input_lumina_port:-3000}
 
-    RENEWLET_IMAGE=${input_image:-zhiyingzzhou/renewlet:latest}
+    check_port "$LUMINA_PORT" || return
 
-    PB_ENCRYPTION_KEY=$(openssl rand -hex 16)
-    CRON_SECRET=$(openssl rand -hex 16)
+    read -p "请输入 Dashboard 用户名 [默认:admin]: " input_user
+    LUMINA_DASHBOARD_USERNAME=${input_user:-admin}
+
+    read -p "请输入 Dashboard 密码 [默认:admin123]: " input_pass
+    LUMINA_DASHBOARD_PASSWORD=${input_pass:-admin123}
 
     cat > "$ENV_FILE" <<EOF
-# ------------------------------------------------------------
-# Renewlet Docker 配置
-# ------------------------------------------------------------
+NEZHA_HOST=${NEZHA_HOST}
+NEZHA_PORT=${NEZHA_PORT}
 
-PORT="${PORT}"
+LUMINA_PORT=${LUMINA_PORT}
 
-RENEWLET_IMAGE="${RENEWLET_IMAGE}"
-
-GOMEMLIMIT="128MiB"
-MEM_LIMIT="256m"
-
-TZ="${TZ_VALUE}"
-
-APP_URL="${APP_URL}"
-
-PB_ENCRYPTION_KEY="${PB_ENCRYPTION_KEY}"
-
-CRON_SECRET="${CRON_SECRET}"
-
-# SMTP 配置（可选）
-# SMTP_HOST="smtp.example.com"
-# SMTP_PORT="587"
-# SMTP_USER="smtp-user"
-# SMTP_PASSWORD="smtp-password"
-# SMTP_FROM="Renewlet <noreply@example.com>"
-# SMTP_TLS="false"
-
-# 自动备份（可选）
-# BACKUPS_CRON="0 3 * * *"
-# BACKUPS_CRON_MAX_KEEP="7"
-
-NOTIFICATION_SCHEDULER_ENABLED="true"
-NOTIFICATION_SCHEDULER_CRON="* * * * *"
-
-NOTIFICATION_CRON_WINDOW_MINUTES="2"
-
-NOTIFICATION_MAX_RETRIES="3"
-
-NOTIFICATION_STALE_SENDING_MINUTES="15"
+LUMINA_DASHBOARD_USERNAME=${LUMINA_DASHBOARD_USERNAME}
+LUMINA_DASHBOARD_PASSWORD=${LUMINA_DASHBOARD_PASSWORD}
 EOF
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  web:
-    image: \${RENEWLET_IMAGE:-zhiyingzzhou/renewlet:latest}
-    container_name: renewlet
-
-    environment:
-      GOMEMLIMIT: \${GOMEMLIMIT:-128MiB}
-
-      TZ: \${TZ:-Asia/Shanghai}
-
-      APP_URL: \${APP_URL:-http://localhost:3000}
-
-      PB_ENCRYPTION_KEY: \${PB_ENCRYPTION_KEY:-}
-
-      SMTP_HOST: \${SMTP_HOST:-}
-      SMTP_PORT: \${SMTP_PORT:-587}
-      SMTP_USER: \${SMTP_USER:-}
-      SMTP_PASSWORD: \${SMTP_PASSWORD:-}
-      SMTP_FROM: \${SMTP_FROM:-}
-      SMTP_TLS: \${SMTP_TLS:-false}
-
-      BACKUPS_CRON: \${BACKUPS_CRON:-}
-      BACKUPS_CRON_MAX_KEEP: \${BACKUPS_CRON_MAX_KEEP:-3}
-
-      NOTIFICATION_SCHEDULER_ENABLED: \${NOTIFICATION_SCHEDULER_ENABLED:-true}
-
-      CRON_SECRET: \${CRON_SECRET:-}
-
-      NOTIFICATION_SCHEDULER_CRON: "\${NOTIFICATION_SCHEDULER_CRON:-* * * * *}"
-
-      NOTIFICATION_CRON_WINDOW_MINUTES: \${NOTIFICATION_CRON_WINDOW_MINUTES:-2}
-
-      NOTIFICATION_MAX_RETRIES: \${NOTIFICATION_MAX_RETRIES:-3}
-
-      NOTIFICATION_STALE_SENDING_MINUTES: \${NOTIFICATION_STALE_SENDING_MINUTES:-15}
-
-    volumes:
-      - ./data:/pb_data
-
-    ports:
-      - "127.0.0.1:\${PORT:-3000}:3000"
-
-    healthcheck:
-      test: ["CMD", "/renewlet", "healthcheck"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
-
-    mem_limit: \${MEM_LIMIT:-256m}
+  lumina:
+    image: ghcr.io/cytusc/lumina-theme:latest
+    container_name: lumina-theme
 
     restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:\${LUMINA_PORT}:80"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    env_file:
+      - .env
 EOF
 
     cd "$APP_DIR" || exit
@@ -199,22 +132,11 @@ EOF
     docker compose up -d
 
     echo
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}✅ Renewlet 安装完成${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
-
-    echo -e "${YELLOW}🌐 访问地址:${RESET} http://127.0.0.1:${PORT}"
-    echo -e "${GREEN}📂 数据目录:${RESET} $APP_DIR/data"
-
-    echo
-    echo -e "${GREEN}🔑 PB_ENCRYPTION_KEY:${RESET}"
-    echo "${PB_ENCRYPTION_KEY}"
-
-    echo
-    echo -e "${GREEN}🔑 CRON_SECRET:${RESET}"
-    echo "${CRON_SECRET}"
-
-    echo
+    echo -e "${GREEN}✅ Lumina Theme 安装完成${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${LUMINA_PORT}${RESET}"
+    echo -e "${YELLOW}📡 哪吒地址: ${NEZHA_HOST}:${NEZHA_PORT}${RESET}"
+    echo -e "${YELLOW}👤 Dashboard 用户名: ${LUMINA_DASHBOARD_USERNAME}${RESET}"
+    echo -e "${YELLOW}🔐 Dashboard 密码: ${LUMINA_DASHBOARD_PASSWORD}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -226,28 +148,28 @@ update_app() {
     docker compose pull
     docker compose up -d
 
-    echo -e "${GREEN}✅ Renewlet 更新完成${RESET}"
+    echo -e "${GREEN}✅ Lumina Theme 更新完成${RESET}"
 
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
 
-    docker restart renewlet
+    docker restart lumina-theme
 
-    echo -e "${GREEN}✅ Renewlet 已重启${RESET}"
+    echo -e "${GREEN}✅ Lumina Theme 已重启${RESET}"
 
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
 
-    docker logs -f renewlet
+    docker logs -f lumina-theme
 }
 
 check_status() {
 
-    docker ps --filter "name=renewlet"
+    docker ps --filter "name=lumina-theme"
 
     read -p "按回车返回菜单..."
 }
@@ -261,7 +183,7 @@ uninstall_app() {
 
     rm -rf "$APP_DIR"
 
-    echo -e "${RED}✅ Renewlet 已彻底卸载${RESET}"
+    echo -e "${RED}✅ Lumina Theme 已彻底卸载${RESET}"
 
     read -p "按回车返回菜单..."
 }

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# VPS AI 工具与 Agent 自动化检测脚本 
+# VPS AI 工具与 Agent 自动化检测脚本
 # ==========================================
 
 # 颜色定义
@@ -11,9 +11,9 @@ Y='\033[1;33m'   # 黄色 (Yellow)
 B='\033[0;34m'   # 蓝色 (Blue)
 NC='\033[0m'     # 无颜色 (No Color)
 
-echo -e "${B}========================================${NC}"
-echo -e "${B}                 AI工具检测            ${NC}"
-echo -e "${B}========================================${NC}"
+echo -e "${G}========================================${NC}"
+echo -e "${G}            AI 工具检测           ${NC}"
+echo -e "${G}========================================${NC}"
 
 # 树状格式化输出函数
 print_result() {
@@ -47,15 +47,21 @@ print_result() {
     echo -e "${B}----------------------------------------${NC}"
 }
 
-# 安全获取命令版本的函数，防止命令阻塞
+# 升级后的安全获取命令版本函数（解决非交互命令下的捕获空值 Bug）
 get_version() {
     local cmd=$1
     local args=$2
+    local raw_out=""
+    
     if command -v timeout &> /dev/null; then
-        timeout 2s $cmd $args 2>&1 | head -n 1
+        # 允许命令在 2 秒内自然执行完毕并捕获全部输出，避免 head 提前截断导致管道破裂
+        raw_out=$(timeout 2s $cmd $args 2>&1)
     else
-        $cmd $args 2>&1 | head -n 1
+        raw_out=$($cmd $args 2>&1)
     fi
+    
+    # 从捕获的输出中提取第一行非空行
+    echo "$raw_out" | grep -v '^$' | head -n 1
 }
 
 # 检查 Docker 容器状态的辅助函数
@@ -78,7 +84,7 @@ check_docker_container() {
 if command -v claude &> /dev/null; then
     loc=$(which claude)
     ver=$(get_version "claude" "--version")
-    if pgrep -f "claude" > /dev/null; then status="运行中 (Running)"; else status="已安装/闲置 (Idle)"; fi
+    if pgrep -f "claude" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
 else
     loc="未安装"; ver=""; status=""
 fi
@@ -88,7 +94,7 @@ print_result "Claude Code" "$loc" "$ver" "$status"
 if command -v codex &> /dev/null; then
     loc=$(which codex)
     ver=$(get_version "codex" "--version")
-    if pgrep -f "codex" > /dev/null; then status="运行中 (Running)"; else status="已安装/闲置 (Idle)"; fi
+    if pgrep -f "codex" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
 else
     loc="未安装"; ver=""; status=""
 fi
@@ -98,7 +104,7 @@ print_result "Codex CLI (OpenAI)" "$loc" "$ver" "$status"
 if command -v gemini &> /dev/null; then
     loc=$(which gemini)
     ver=$(get_version "gemini" "--version")
-    if pgrep -f "gemini" > /dev/null; then status="运行中 (Running)"; else status="已安装/闲置 (Idle)"; fi
+    if pgrep -f "gemini" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
 else
     loc="未安装"; ver=""; status=""
 fi
@@ -108,11 +114,11 @@ print_result "Gemini CLI" "$loc" "$ver" "$status"
 if command -v opencode &> /dev/null; then
     loc=$(which opencode)
     ver=$(get_version "opencode" "--version")
-    if pgrep -f "opencode" > /dev/null; then status="运行中 (Running)"; else status="已安装/闲置 (Idle)"; fi
+    if pgrep -f "opencode" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
 elif command -v open-code &> /dev/null; then
     loc=$(which open-code)
     ver=$(get_version "open-code" "--version")
-    if pgrep -f "open-code" > /dev/null; then status="运行中 (Running)"; else status="已安装/闲置 (Idle)"; fi
+    if pgrep -f "open-code" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
 else
     loc="未安装"; ver=""; status=""
 fi
@@ -128,11 +134,11 @@ if [ -n "$docker_res" ]; then
 elif command -v openclaw &> /dev/null || command -v clawdbot &> /dev/null; then
     loc=$(which openclaw 2>/dev/null || which clawdbot)
     ver=$(get_version "$loc" "--version")
-    if pgrep -f "openclaw\|clawdbot" > /dev/null; then status="运行中 (Running)"; else status="已安装/闲置 (Idle)"; fi
+    if pgrep -f "openclaw\|clawdbot" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
 elif command -v pip &> /dev/null && pip show openclaw &> /dev/null; then
     loc="Python Pip Package"
     ver=$(pip show openclaw | grep -i "^Version:" | cut -d' ' -f2)
-    if pgrep -f "openclaw" > /dev/null; then status="运行中 (Running)"; else status="已安装/闲置 (Idle)"; fi
+    if pgrep -f "openclaw" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
 else
     loc="未安装"; ver=""; status=""
 fi
@@ -148,7 +154,7 @@ if [ -n "$docker_res" ]; then
 elif command -v hermes &> /dev/null || command -v hermes-agent &> /dev/null; then
     loc=$(which hermes 2>/dev/null || which hermes-agent)
     ver=$(get_version "$loc" "--version")
-    if pgrep -f "hermes" > /dev/null; then status="运行中 (Running)"; else status="已安装/闲置 (Idle)"; fi
+    if pgrep -f "hermes" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
 elif command -v npm &> /dev/null && npm list -g --depth=0 hermes-agent &> /dev/null; then
     loc="NPM Global Module"
     ver=$(npm list -g --depth=0 hermes-agent | grep hermes-agent | awk -F@ '{print $2}')

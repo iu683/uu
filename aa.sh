@@ -1,601 +1,264 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# ========================================
+# Let Bot 一键管理脚本
+# ========================================
 
-set -e
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-PKG="@openai/codex"
+APP_NAME="let-bot"
+APP_DIR="/opt/$APP_NAME"
 
-color() {
-  local code="$1"
-  shift
-  printf "\033[%sm%s\033[0m\n" "$code" "$*"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+ENV_FILE="$APP_DIR/.env"
+
+check_docker() {
+
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
+
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2${RESET}"
+        exit 1
+    fi
 }
 
-green() {
-  color "32" "$*"
-}
+check_port() {
 
-info() {
-  color "36" "[INFO] $*"
-}
-
-ok() {
-  color "32" "[OK] $*"
-}
-
-warn() {
-  color "33" "[WARN] $*"
-}
-
-err() {
-  color "31" "[ERROR] $*"
-}
-
-pause() {
-  read -rp "按回车继续..." _
-}
-
-require_sudo() {
-  if [ "$(id -u)" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
-    err "当前不是 root，且系统未安装 sudo"
-    return 1
-  fi
-}
-
-run_root() {
-  if [ "$(id -u)" -eq 0 ]; then
-    "$@"
-  else
-    sudo "$@"
-  fi
-}
-
-detect_os() {
-  if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    OS_ID="${ID:-unknown}"
-    OS_LIKE="${ID_LIKE:-}"
-  else
-    OS_ID="$(uname -s)"
-    OS_LIKE=""
-  fi
-}
-
-install_node_debian() {
-  require_sudo || return 1
-  info "检测到 Debian/Ubuntu 系统，开始安装 Node.js 20.x"
-  run_root apt update
-  run_root apt install -y curl ca-certificates gnupg
-  curl -fsSL https://deb.nodesource.com/setup_20.x | run_root bash -
-  run_root apt install -y nodejs
-}
-
-install_node_rhel() {
-  require_sudo || return 1
-  info "检测到 RHEL/CentOS/Rocky/AlmaLinux 系统，开始安装 Node.js 20.x"
-  if command -v dnf >/dev/null 2>&1; then
-    run_root dnf install -y curl
-    curl -fsSL https://rpm.nodesource.com/setup_20.x | run_root bash -
-    run_root dnf install -y nodejs
-  elif command -v yum >/dev/null 2>&1; then
-    run_root yum install -y curl
-    curl -fsSL https://rpm.nodesource.com/setup_20.x | run_root bash -
-    run_root yum install -y nodejs
-  else
-    err "未找到 dnf 或 yum"
-    return 1
-  fi
-}
-
-install_node_alpine() {
-  require_sudo || return 1
-  info "检测到 Alpine 系统，开始安装 Node.js"
-  run_root apk add nodejs npm
-}
-
-install_node_macos() {
-  if ! command -v brew >/dev/null 2>&1; then
-    err "未检测到 Homebrew，请先安装 brew"
-    return 1
-  fi
-  info "检测到 macOS，使用 Homebrew 安装 Node.js"
-  brew install node
-}
-
-install_node() {
-  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
-    ok "Node.js 已安装"
-    info "Node: $(node -v)"
-    info "npm : $(npm -v)"
-    return 0
-  fi
-
-  detect_os
-
-  case "$OS_ID" in
-    ubuntu|debian)
-      install_node_debian
-      ;;
-    centos|rhel|rocky|almalinux|ol|fedora)
-      install_node_rhel
-      ;;
-    alpine)
-      install_node_alpine
-      ;;
-    macos|darwin)
-      install_node_macos
-      ;;
-    *)
-      case "$OS_LIKE" in
-        *debian*)
-          install_node_debian
-          ;;
-        *rhel*|*fedora*)
-          install_node_rhel
-          ;;
-        *)
-          if [ "$(uname -s)" = "Darwin" ]; then
-            install_node_macos
-          else
-            err "暂不支持自动安装 Node.js，系统类型: ${OS_ID:-unknown}"
-            return 1
-          fi
-          ;;
-      esac
-      ;;
-  esac
-
-  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
-    ok "Node.js 安装完成"
-    info "Node: $(node -v)"
-    info "npm : $(npm -v)"
-  else
-    err "Node.js 安装后仍未检测到 node/npm"
-    return 1
-  fi
-}
-
-check_node() {
-  if ! command -v node >/dev/null 2>&1; then
-    err "未检测到 node，请先安装 Node.js"
-    return 1
-  fi
-
-  if ! command -v npm >/dev/null 2>&1; then
-    err "未检测到 npm，请先安装 npm"
-    return 1
-  fi
-
-  info "Node: $(node -v)"
-  info "npm : $(npm -v)"
-}
-
-check_codex() {
-  if command -v codex >/dev/null 2>&1; then
-    ok "Codex CLI 已安装: $(codex --version 2>/dev/null || echo '已安装但版本读取失败')"
-    return 0
-  fi
-
-  warn "未检测到 codex 命令"
-  return 1
-}
-
-install_codex() {
-  check_node || return 1
-  info "开始安装 Codex CLI..."
-  npm install -g "$PKG"
-  ok "安装完成"
-  check_codex || true
-}
-
-update_codex() {
-  check_node || return 1
-  info "开始更新 Codex CLI..."
-  npm install -g "$PKG@latest"
-  ok "更新完成"
-  check_codex || true
-}
-
-uninstall_codex() {
-  check_node || return 1
-  info "开始卸载 Codex CLI..."
-
-  npm uninstall -g "$PKG" || true
-
-  run_root rm -rf \
-    "$HOME/.codex" \
-    "$HOME/.config/codex" \
-    /usr/local/bin/codex \
-    /usr/bin/codex 2>/dev/null || true
-
-  hash -r 2>/dev/null || true
-
-  ok "卸载完成"
-}
-
-codex_login() {
-  if ! check_codex; then
-    warn "请先安装 Codex CLI"
-    return 1
-  fi
-
-  info "启动登录授权..."
-  codex login
-}
-
-codex_login_status() {
-  if ! check_codex; then
-    warn "请先安装 Codex CLI"
-    return 1
-  fi
-
-  info "检查登录状态..."
-  codex login status
-}
-
-test_codex() {
-  if ! check_codex; then
-    warn "请先安装 Codex CLI"
-    return 1
-  fi
-
-  info "执行 Codex 快速测试..."
-  codex exec "用一句话说明当前目录适合做什么"
-}
-
-interactive_codex() {
-  if ! check_codex; then
-    warn "请先安装 Codex CLI"
-    return 1
-  fi
-
-  info "进入 Codex 交互模式..."
-  codex
-}
-
-show_env() {
-  detect_os
-  info "环境检查"
-  echo "OS_ID        : ${OS_ID:-unknown}"
-  echo "OS_LIKE      : ${OS_LIKE:-unknown}"
-  echo "USER         : ${USER:-unknown}"
-  echo "SHELL        : ${SHELL:-unknown}"
-  echo "PATH         : $PATH"
-  echo
-
-  if command -v node >/dev/null 2>&1; then
-    echo "node         : $(node -v)"
-  else
-    echo "node         : 未安装"
-  fi
-
-  if command -v npm >/dev/null 2>&1; then
-    echo "npm          : $(npm -v)"
-    echo "npm root -g  : $(npm root -g 2>/dev/null || echo '获取失败')"
-  else
-    echo "npm          : 未安装"
-  fi
-
-  if command -v codex >/dev/null 2>&1; then
-    echo "codex        : $(command -v codex)"
-    echo "version      : $(codex --version 2>/dev/null || echo '读取失败')"
-  else
-    echo "codex        : 未安装"
-  fi
-
-  if command -v bwrap >/dev/null 2>&1; then
-    echo "bubblewrap   : $(bwrap --version 2>/dev/null | head -n1 || echo '已安装但版本读取失败')"
-  else
-    echo "bubblewrap   : 未安装"
-  fi
-}
-
-fix_path_hint() {
-  warn "如果安装后仍提示 'codex: command not found'，通常是 PATH 问题。"
-  echo
-  echo "先查看 npm 全局目录："
-  echo "  npm root -g"
-  echo
-  echo "常见可执行目录："
-  echo "  ~/.npm-global/bin"
-  echo "  ~/.nvm/versions/node/<version>/bin"
-  echo "  /usr/local/bin"
-  echo
-  echo "例如加入 PATH："
-  echo '  export PATH="$HOME/.npm-global/bin:$PATH"'
-  echo
-  echo "生效命令："
-  echo "  source ~/.bashrc"
-  echo "或"
-  echo "  source ~/.zshrc"
-}
-
-check_bwrap() {
-  if command -v bwrap >/dev/null 2>&1; then
-    ok "bubblewrap 已安装: $(bwrap --version 2>/dev/null | head -n1 || echo '版本读取失败')"
-    return 0
-  fi
-  warn "未检测到 bubblewrap (bwrap)"
-  return 1
-}
-
-install_bwrap_debian() {
-  require_sudo || return 1
-  info "使用 apt 安装 bubblewrap"
-  run_root apt update
-  run_root apt install -y bubblewrap
-}
-
-install_bwrap_rhel() {
-  require_sudo || return 1
-  info "使用 dnf/yum 安装 bubblewrap"
-  if command -v dnf >/dev/null 2>&1; then
-    run_root dnf install -y bubblewrap
-  elif command -v yum >/dev/null 2>&1; then
-    run_root yum install -y bubblewrap
-  else
-    err "未找到 dnf 或 yum"
-    return 1
-  fi
-}
-
-install_bwrap_alpine() {
-  require_sudo || return 1
-  info "使用 apk 安装 bubblewrap"
-  run_root apk add bubblewrap
-}
-
-install_bwrap_macos() {
-  if ! command -v brew >/dev/null 2>&1; then
-    err "未检测到 Homebrew，请先安装 brew"
-    return 1
-  fi
-  info "使用 brew 安装 bubblewrap"
-  brew install bubblewrap
-}
-
-install_bwrap() {
-  if check_bwrap; then
-    return 0
-  fi
-
-  detect_os
-
-  case "$OS_ID" in
-    ubuntu|debian)
-      install_bwrap_debian
-      ;;
-    centos|rhel|rocky|almalinux|ol|fedora)
-      install_bwrap_rhel
-      ;;
-    alpine)
-      install_bwrap_alpine
-      ;;
-    macos|darwin)
-      install_bwrap_macos
-      ;;
-    *)
-      case "$OS_LIKE" in
-        *debian*)
-          install_bwrap_debian
-          ;;
-        *rhel*|*fedora*)
-          install_bwrap_rhel
-          ;;
-        *)
-          if [ "$(uname -s)" = "Darwin" ]; then
-            install_bwrap_macos
-          else
-            err "暂不支持自动安装 bubblewrap，系统类型: ${OS_ID:-unknown}"
-            return 1
-          fi
-          ;;
-      esac
-      ;;
-  esac
-
-  if check_bwrap; then
-    ok "bubblewrap 安装完成"
-  else
-    err "bubblewrap 安装失败"
-    return 1
-  fi
-}
-
-# ==================================
-#卸载 bubblewrap 
-# ==================================
-uninstall_bwrap_debian() {
-  require_sudo || return 1
-  info "使用 apt 卸载 bubblewrap"
-  run_root apt remove -y bubblewrap
-}
-
-uninstall_bwrap_rhel() {
-  require_sudo || return 1
-  info "使用 dnf/yum 卸载 bubblewrap"
-  if command -v dnf >/dev/null 2>&1; then
-    run_root dnf remove -y bubblewrap
-  elif command -v yum >/dev/null 2>&1; then
-    run_root yum remove -y bubblewrap
-  else
-    err "未找到 dnf 或 yum"
-    return 1
-  fi
-}
-
-uninstall_bwrap_alpine() {
-  require_sudo || return 1
-  info "使用 apk 卸载 bubblewrap"
-  run_root apk del bubblewrap
-}
-
-uninstall_bwrap_macos() {
-  if ! command -v brew >/dev/null 2>&1; then
-    err "未检测到 Homebrew"
-    return 1
-  fi
-  info "使用 brew 卸载 bubblewrap"
-  brew uninstall bubblewrap
-}
-
-uninstall_bwrap() {
-  if ! command -v bwrap >/dev/null 2>&1; then
-    ok "bubblewrap 未安装，无需卸载"
-    return 0
-  fi
-
-  detect_os
-
-  case "$OS_ID" in
-    ubuntu|debian)
-      uninstall_bwrap_debian
-      ;;
-    centos|rhel|rocky|almalinux|ol|fedora)
-      uninstall_bwrap_rhel
-      ;;
-    alpine)
-      uninstall_bwrap_alpine
-      ;;
-    macos|darwin)
-      uninstall_bwrap_macos
-      ;;
-    *)
-      case "$OS_LIKE" in
-        *debian*)
-          uninstall_bwrap_debian
-          ;;
-        *rhel*|*fedora*)
-          uninstall_bwrap_rhel
-          ;;
-        *)
-          if [ "$(uname -s)" = "Darwin" ]; then
-            uninstall_bwrap_macos
-          else
-            err "暂不支持自动卸载 bubblewrap，系统类型: ${OS_ID:-unknown}"
-            return 1
-          fi
-          ;;
-      esac
-      ;;
-  esac
-
-  hash -r 2>/dev/null || true
-
-  if ! command -v bwrap >/dev/null 2>&1; then
-    ok "bubblewrap 卸载完成"
-  else
-    err "bubblewrap 卸载失败"
-    return 1
-  fi
-}
-
-
-install_all() {
-  install_node
-  install_codex
-  install_bwrap
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用${RESET}"
+        return 1
+    fi
 }
 
 menu() {
-  clear
-  green "=================================="
-  green "     Codex CLI 菜单管理"
-  green "=================================="
-  green " 1. 安装 Node.js + Codex CLI + bubblewrap"
-  green " 2. 仅安装 Node.js"
-  green " 3. 安装 Codex CLI"
-  green " 4. 检查 Codex 版本"
-  green " 5. 登录授权"
-  green " 6. 查看登录状态"
-  green " 7. Codex 快速测试"
-  green " 8. 进入 Codex 交互模式"
-  green " 9. 更新 Codex CLI"
-  green "10. 卸载 Codex CLI"
-  green "11. 查看环境信息"
-  green "12. PATH 修复提示"
-  green "13. 安装 bubblewrap (bwrap)"
-  green "14. 检查 bubblewrap"
-  green "15. 卸载 bubblewrap"
-  green " 0. 退出"
-  green "=================================="
+
+    while true; do
+
+        clear
+        echo -e "${GREEN}=====Let Bot 管理菜单=====${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
 }
 
-main() {
-  while true; do
-    menu
-    printf "\033[32m请输入选项: \033[0m"
-    read -r choice
-    case "$choice" in
-      1)
-        install_all
-        pause
-        ;;
-      2)
-        install_node
-        pause
-        ;;
-      3)
-        install_codex
-        pause
-        ;;
-      4)
-        check_codex || true
-        pause
-        ;;
-      5)
-        codex_login || true
-        pause
-        ;;
-      6)
-        codex_login_status || true
-        pause
-        ;;
-      7)
-        test_codex || true
-        pause
-        ;;
-      8)
-        interactive_codex || true
-        pause
-        ;;
-      9)
-        update_codex
-        pause
-        ;;
-      10)
-        uninstall_codex
-        pause
-        ;;
-      11)
-        show_env
-        pause
-        ;;
-      12)
-        fix_path_hint
-        pause
-        ;;
-      13)
-        install_bwrap
-        pause
-        ;;
-      14)
-        check_bwrap || true
-        pause
-        ;;
-	  15)
-        uninstall_bwrap  
-        pause
-        ;;
-      0)
-        ok "已退出"
-        exit 0
-        ;;
-      *)
-        warn "无效选项"
-        pause
-        ;;
-    esac
-  done
+install_app() {
+
+    check_docker
+
+    mkdir -p "$APP_DIR/data"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
+
+    read -p "请输入后台访问端口 [默认:2918]: " input_port
+    ADMIN_PORT=${input_port:-2918}
+
+    check_port "$ADMIN_PORT" || return
+
+    read -p "请输入后台用户名 [默认:admin]: " input_user
+    ADMIN_USERNAME=${input_user:-admin}
+
+    read -p "请输入后台密码 [默认:admin123]: " input_pass
+    ADMIN_PASSWORD=${input_pass:-admin123}
+
+    read -p "请输入 AI_BASE_URL [默认:https://api.siliconflow.cn/v1]: " input_ai_url
+    AI_BASE_URL=${input_ai_url:-https://api.siliconflow.cn/v1}
+
+    read -p "请输入 AI_MODEL [默认:Qwen/Qwen2.5-7B-Instruct]: " input_ai_model
+    AI_MODEL=${input_ai_model:-Qwen/Qwen2.5-7B-Instruct}
+
+    cat > "$ENV_FILE" <<EOF
+TZ=Asia/Shanghai
+
+AI_BASE_URL=${AI_BASE_URL}
+
+AI_MODEL=${AI_MODEL}
+
+AI_MODEL_FALLBACKS=Qwen/Qwen3-8B
+
+AI_TIMEOUT=45
+
+AI_MAX_RETRIES=0
+
+AI_CONTENT_LIMIT=8000
+
+SCAN_INTERVAL_MIN=90
+
+SCAN_INTERVAL_MAX=180
+
+BLOCKED_SLEEP_SECONDS=1800
+
+TG_PARSE_MODE=MarkdownV2
+
+TG_DISABLE_WEB_PREVIEW=true
+
+ADMIN_USERNAME=${ADMIN_USERNAME}
+
+ADMIN_PASSWORD=${ADMIN_PASSWORD}
+
+ADMIN_HOST=127.0.0.1
+
+ADMIN_PORT=${ADMIN_PORT}
+EOF
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  let_bot:
+    image: tyer199/let_bot:v3.16
+    container_name: let_bot_engine
+
+    restart: always
+
+    environment:
+      TZ: \${TZ:-UTC}
+
+      AI_BASE_URL: \${AI_BASE_URL:-https://api.siliconflow.cn/v1}
+
+      AI_MODEL: \${AI_MODEL:-Qwen/Qwen2.5-7B-Instruct}
+
+      AI_MODEL_FALLBACKS: \${AI_MODEL_FALLBACKS:-Qwen/Qwen3-8B}
+
+      AI_TIMEOUT: \${AI_TIMEOUT:-45}
+
+      AI_MAX_RETRIES: \${AI_MAX_RETRIES:-0}
+
+      AI_CONTENT_LIMIT: \${AI_CONTENT_LIMIT:-8000}
+
+      SCAN_INTERVAL_MIN: \${SCAN_INTERVAL_MIN:-90}
+
+      SCAN_INTERVAL_MAX: \${SCAN_INTERVAL_MAX:-180}
+
+      BLOCKED_SLEEP_SECONDS: \${BLOCKED_SLEEP_SECONDS:-1800}
+
+      TG_PARSE_MODE: \${TG_PARSE_MODE:-MarkdownV2}
+
+      TG_DISABLE_WEB_PREVIEW: \${TG_DISABLE_WEB_PREVIEW:-true}
+
+    volumes:
+      - ./data:/app/data
+
+    logging:
+      driver: json-file
+
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  let_admin:
+    image: tyer199/let_bot:v3.16
+    container_name: let_bot_admin
+
+    restart: always
+
+    command:
+      ["python", "-m", "uvicorn", "admin_app:app", "--host", "0.0.0.0", "--port", "2918"]
+
+    environment:
+      TZ: \${TZ:-UTC}
+
+      ADMIN_USERNAME: \${ADMIN_USERNAME:-}
+
+      ADMIN_PASSWORD: \${ADMIN_PASSWORD:-}
+
+    volumes:
+      - ./data:/app/data
+
+    ports:
+      - "\${ADMIN_HOST:-127.0.0.1}:\${ADMIN_PORT:-2918}:2918"
+EOF
+
+    cd "$APP_DIR" || exit
+
+    docker compose up -d
+
+    echo
+    echo -e "${GREEN}✅ Let Bot 安装完成${RESET}"
+
+    echo -e "${YELLOW}🌐 后台地址: http://127.0.0.1:${ADMIN_PORT}${RESET}"
+
+    echo -e "${YELLOW}👤 后台用户名: ${ADMIN_USERNAME}${RESET}"
+
+    echo -e "${YELLOW}🔐 后台密码: ${ADMIN_PASSWORD}${RESET}"
+
+    echo -e "${YELLOW}🤖 AI_MODEL: ${AI_MODEL}${RESET}"
+
+    echo -e "${YELLOW}📂 数据目录: $APP_DIR/data${RESET}"
+
+
+    read -p "按回车返回菜单..."
 }
 
-main
+update_app() {
+
+    cd "$APP_DIR" || return
+
+    docker compose pull
+    docker compose up -d
+
+    echo -e "${GREEN}✅ Let Bot 更新完成${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+
+    docker restart let_bot_engine
+    docker restart let_bot_admin
+
+    echo -e "${GREEN}✅ Let Bot 已重启${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+
+    docker logs -f let_bot_engine
+}
+
+check_status() {
+
+    docker ps --filter "name=let_bot"
+
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+
+
+    cd "$APP_DIR" || return
+
+    docker compose down -v
+
+    rm -rf "$APP_DIR"
+
+    echo -e "${RED}✅ Let Bot 已彻底卸载${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+menu

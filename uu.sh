@@ -1,193 +1,163 @@
 #!/bin/bash
-# ========================================
-# Hermes WebUI 一键管理脚本
-# 直接使用官方镜像版
-# ========================================
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-RESET="\033[0m"
+# ==========================================
+# VPS AI 工具与 Agent 自动化检测脚本 
+# ==========================================
 
-APP_NAME="hermes-webui"
-APP_DIR="/opt/$APP_NAME"
+# 颜色定义
+G='\033[0;32m'   # 绿色 (Green)
+R='\033[0;31m'   # 红色 (Red)
+Y='\033[1;33m'   # 黄色 (Yellow)
+B='\033[0;34m'   # 蓝色 (Blue)
+NC='\033[0m'     # 无颜色 (No Color)
 
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-ENV_FILE="$APP_DIR/.env"
+echo -e "${G}========================================${NC}"
+echo -e "${G}                 AI工具检测            ${NC}"
+echo -e "${G}========================================${NC}"
 
-check_docker() {
+# 树状格式化输出函数
+print_result() {
+    local name=$1
+    local location=$2
+    local version=$3
+    local status=$4
 
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
+    # 头部：工具名称
+    echo -e "${B}◈ 工具: ${NC}${Y}${name}${NC}"
+
+    if [ "$location" == "未安装" ]; then
+        # 未安装直接精简输出
+        echo -e "  └─ ${R}安装状态: 未安装${NC}"
+    else
+        # 已安装时的树状输出
+        echo -e "  ├─ ${G}安装路径: ${NC}${location}"
+        
+        # 处理版本号为空的情况并去除多余空白字符
+        version=$(echo "$version" | xargs)
+        echo -e "  ├─ ${G}当前版本: ${NC}${version:-未知}"
+        
+        # 状态着色逻辑
+        if [[ "$status" =~ "运行中" ]]; then
+            local STATUS_COLOR="${G}"
+        else
+            local STATUS_COLOR="${Y}"
+        fi
+        echo -e "  └─ ${G}活跃状态: ${NC}${STATUS_COLOR}${status}${NC}"
     fi
+    echo -e "${B}----------------------------------------${NC}"
+}
 
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2${RESET}"
-        exit 1
+# 安全获取命令版本的函数，防止命令阻塞
+get_version() {
+    local cmd=$1
+    local args=$2
+    if command -v timeout &> /dev/null; then
+        timeout 2s $cmd $args 2>&1 | head -n 1
+    else
+        $cmd $args 2>&1 | head -n 1
     fi
 }
 
-check_port() {
-
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用${RESET}"
-        return 1
+# 检查 Docker 容器状态的辅助函数
+check_docker_container() {
+    local keyword=$1
+    if command -v docker &> /dev/null && systemctl is-active --quiet docker; then
+        # 寻找匹配的、处于运行状态的容器
+        local container_info=$(docker ps --format "{{.ID}} [{{.Names}}] ({{.Image}})" | grep -i "$keyword" | head -n 1)
+        if [ -n "$container_info" ]; then
+            echo "$container_info"
+        fi
     fi
 }
 
-menu() {
+# ==========================================
+# 工具检测核心逻辑
+# ==========================================
 
-    while true; do
+# 1. Claude Code 检测
+if command -v claude &> /dev/null; then
+    loc=$(which claude)
+    ver=$(get_version "claude" "--version")
+    if pgrep -f "claude" > /dev/null; then status="运行中 (Running)"; else status="已安装/闲置 (Idle)"; fi
+else
+    loc="未安装"; ver=""; status=""
+fi
+print_result "Claude Code" "$loc" "$ver" "$status"
 
-        clear
-        echo -e "${GREEN}====Hermes WebUI 管理菜单====${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+# 2. Codex CLI 检测
+if command -v codex &> /dev/null; then
+    loc=$(which codex)
+    ver=$(get_version "codex" "--version")
+    if pgrep -f "codex" > /dev/null; then status="运行中 (Running)"; else status="已安装/闲置 (Idle)"; fi
+else
+    loc="未安装"; ver=""; status=""
+fi
+print_result "Codex CLI (OpenAI)" "$loc" "$ver" "$status"
 
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
+# 3. Gemini CLI 检测
+if command -v gemini &> /dev/null; then
+    loc=$(which gemini)
+    ver=$(get_version "gemini" "--version")
+    if pgrep -f "gemini" > /dev/null; then status="运行中 (Running)"; else status="已安装/闲置 (Idle)"; fi
+else
+    loc="未安装"; ver=""; status=""
+fi
+print_result "Gemini CLI" "$loc" "$ver" "$status"
 
-install_app() {
+# 4. OpenCode 检测
+if command -v opencode &> /dev/null; then
+    loc=$(which opencode)
+    ver=$(get_version "opencode" "--version")
+    if pgrep -f "opencode" > /dev/null; then status="运行中 (Running)"; else status="已安装/闲置 (Idle)"; fi
+elif command -v open-code &> /dev/null; then
+    loc=$(which open-code)
+    ver=$(get_version "open-code" "--version")
+    if pgrep -f "open-code" > /dev/null; then status="运行中 (Running)"; else status="已安装/闲置 (Idle)"; fi
+else
+    loc="未安装"; ver=""; status=""
+fi
+print_result "OpenCode" "$loc" "$ver" "$status"
 
-    check_docker
+# 5. OpenClaw 检测 (加入 Docker 联动)
+docker_res=$(check_docker_container "openclaw\|clawdbot")
 
-    mkdir -p "$APP_DIR"
+if [ -n "$docker_res" ]; then
+    loc="Docker Container ($docker_res)"
+    ver="Docker Managed"
+    status="运行中 (Running)"
+elif command -v openclaw &> /dev/null || command -v clawdbot &> /dev/null; then
+    loc=$(which openclaw 2>/dev/null || which clawdbot)
+    ver=$(get_version "$loc" "--version")
+    if pgrep -f "openclaw\|clawdbot" > /dev/null; then status="运行中 (Running)"; else status="已安装/闲置 (Idle)"; fi
+elif command -v pip &> /dev/null && pip show openclaw &> /dev/null; then
+    loc="Python Pip Package"
+    ver=$(pip show openclaw | grep -i "^Version:" | cut -d' ' -f2)
+    if pgrep -f "openclaw" > /dev/null; then status="运行中 (Running)"; else status="已安装/闲置 (Idle)"; fi
+else
+    loc="未安装"; ver=""; status=""
+fi
+print_result "OpenClaw" "$loc" "$ver" "$status"
 
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
+# 6. Hermes Agent 检测 (加入 Docker 联动)
+docker_res=$(check_docker_container "hermes")
 
-    read -p "请输入访问端口 [默认:8787]: " input_port
-    PORT=${input_port:-8787}
-    check_port "$PORT" || return
-
-    read -p "请输入 WebUI 登录密码 [默认:admin123]: " input_pass
-    WEB_PASSWORD=${input_pass:-admin123}
-
-    read -p "请输入工作目录 [默认:$HOME/workspace]: " input_workspace
-    WORKSPACE_DIR=${input_workspace:-$HOME/workspace}
-
-    mkdir -p "$WORKSPACE_DIR"
-    mkdir -p "$HOME/.hermes"
-
-    cat > "$ENV_FILE" <<EOF
-UID=$(id -u)
-GID=$(id -g)
-
-HERMES_HOME=$HOME/.hermes
-HERMES_WORKSPACE=$WORKSPACE_DIR
-
-HERMES_WEBUI_PASSWORD=$WEB_PASSWORD
-
-HERMES_SKIP_CHMOD=1
-EOF
-
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  hermes-webui:
-    image: ghcr.io/nesquena/hermes-webui:latest
-    container_name: hermes-webui
-
-    ports:
-      - "127.0.0.1:${PORT}:8787"
-
-    volumes:
-      - \${HERMES_HOME:-\${HOME}/.hermes}:/home/hermeswebui/.hermes
-      - \${HERMES_WORKSPACE:-\${HOME}/workspace}:/workspace
-
-    environment:
-      - WANTED_UID=\${UID:-1000}
-      - WANTED_GID=\${GID:-1000}
-
-      - HERMES_WEBUI_HOST=0.0.0.0
-      - HERMES_WEBUI_PORT=\${PORT}
-
-      - HERMES_WEBUI_STATE_DIR=/home/hermeswebui/.hermes/webui
-
-      - HERMES_WEBUI_PASSWORD=\${HERMES_WEBUI_PASSWORD}
-
-      - HERMES_SKIP_CHMOD=1
-
-    restart: unless-stopped
-EOF
-
-    cd "$APP_DIR" || exit
-
-    docker compose up -d
-
-    echo
-    echo -e "${GREEN}✅ Hermes WebUI 安装完成${RESET}${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}🔐 登录密码: ${WEB_PASSWORD}${RESET}"
-    echo -e "${GREEN}📂 Hermes 数据目录: $HOME/.hermes${RESET}"
-    echo -e "${GREEN}📂 工作目录: $WORKSPACE_DIR${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-update_app() {
-
-    cd "$APP_DIR" || return
-
-    docker compose pull
-    docker compose up -d
-
-    echo -e "${GREEN}✅ Hermes WebUI 更新完成${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-restart_app() {
-
-    docker restart hermes-webui
-
-    echo -e "${GREEN}✅ Hermes WebUI 已重启${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-
-    docker logs -f hermes-webui
-}
-
-check_status() {
-
-    docker ps --filter "name=hermes-webui"
-
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-
-    cd "$APP_DIR" || return
-
-    docker compose down -v
-
-    rm -rf "$APP_DIR"
-
-    echo -e "${RED}✅ Hermes WebUI 已彻底卸载${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-menu
+if [ -n "$docker_res" ]; then
+    loc="Docker Container ($docker_res)"
+    ver="Docker Managed"
+    status="运行中 (Running)"
+elif command -v hermes &> /dev/null || command -v hermes-agent &> /dev/null; then
+    loc=$(which hermes 2>/dev/null || which hermes-agent)
+    ver=$(get_version "$loc" "--version")
+    if pgrep -f "hermes" > /dev/null; then status="运行中 (Running)"; else status="已安装/闲置 (Idle)"; fi
+elif command -v npm &> /dev/null && npm list -g --depth=0 hermes-agent &> /dev/null; then
+    loc="NPM Global Module"
+    ver=$(npm list -g --depth=0 hermes-agent | grep hermes-agent | awk -F@ '{print $2}')
+    status="已安装 (可通过 npm 启动)"
+elif command -v pip &> /dev/null && pip show hermes-agent &> /dev/null; then
+    loc="Python Pip Package"
+    ver=$(pip show hermes-agent | grep -i "^Version:" | cut -d' ' -f2)
+    status="已安装 (可通过 python 运行)"
+else
+    loc="未安装"; ver=""; status=""
+fi
+print_result "Hermes Agent" "$loc" "$ver" "$status"

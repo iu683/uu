@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# VPS AI 工具与 Agent 自动化检测脚本 (Docker增强版)
+# VPS AI 工具与 Agent 自动化检测脚本 
 # ==========================================
 
 # 颜色定义
@@ -11,9 +11,9 @@ Y='\033[1;33m'   # 黄色 (Yellow)
 B='\033[0;34m'   # 蓝色 (Blue)
 NC='\033[0m'     # 无颜色 (No Color)
 
-echo -e "${B}==================================================${NC}"
-echo -e "${B}       AI 命令行工具 / Agent 环境检测           ${NC}"
-echo -e "${B}==================================================${NC}"
+echo -e "${B}========================================${NC}"
+echo -e "${B}                 AI工具检测            ${NC}"
+echo -e "${B}========================================${NC}"
 
 # 树状格式化输出函数
 print_result() {
@@ -32,7 +32,7 @@ print_result() {
         # 已安装时的树状输出
         echo -e "  ├─ ${G}安装路径: ${NC}${location}"
         
-        # 处理版本号为空的情况
+        # 处理版本号为空的情况并去除多余空白字符
         version=$(echo "$version" | xargs)
         echo -e "  ├─ ${G}当前版本: ${NC}${version:-未知}"
         
@@ -59,13 +59,12 @@ get_version() {
 }
 
 # 检查 Docker 容器状态的辅助函数
-# 参数: $1=关键词(用于容器名或镜像名过滤)
 check_docker_container() {
     local keyword=$1
     if command -v docker &> /dev/null && systemctl is-active --quiet docker; then
         # 寻找匹配的、处于运行状态的容器
         local container_info=$(docker ps --format "{{.ID}} [{{.Names}}] ({{.Image}})" | grep -i "$keyword" | head -n 1)
-        if [ -not -z "$container_info" ]; then
+        if [ -n "$container_info" ]; then
             echo "$container_info"
         fi
     fi
@@ -122,7 +121,7 @@ print_result "OpenCode" "$loc" "$ver" "$status"
 # 5. OpenClaw 检测 (加入 Docker 联动)
 docker_res=$(check_docker_container "openclaw\|clawdbot")
 
-if [ ! -z "$docker_res" ]; then
+if [ -n "$docker_res" ]; then
     loc="Docker Container ($docker_res)"
     ver="Docker Managed"
     status="运行中 (Running)"
@@ -142,7 +141,7 @@ print_result "OpenClaw" "$loc" "$ver" "$status"
 # 6. Hermes Agent 检测 (加入 Docker 联动)
 docker_res=$(check_docker_container "hermes")
 
-if [ ! -z "$docker_res" ]; then
+if [ -n "$docker_res" ]; then
     loc="Docker Container ($docker_res)"
     ver="Docker Managed"
     status="运行中 (Running)"

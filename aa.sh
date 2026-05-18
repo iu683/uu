@@ -2,7 +2,7 @@
 
 set -e
 
-PKG="@anthropic-ai/claude-code"
+PKG="@openai/codex"
 
 color() {
   local code="$1"
@@ -169,121 +169,128 @@ check_node() {
   info "npm : $(npm -v)"
 }
 
-check_claude() {
-  if command -v claude >/dev/null 2>&1; then
-    ok "Claude Code 已安装: $(claude --version 2>/dev/null || echo '已安装但版本读取失败')"
+check_codex() {
+  if command -v codex >/dev/null 2>&1; then
+    ok "Codex CLI 已安装: $(codex --version 2>/dev/null || echo '已安装但版本读取失败')"
     return 0
   fi
 
-  warn "未检测到 claude 命令"
+  warn "未检测到 codex 命令"
   return 1
 }
 
-install_claude() {
+install_codex() {
   check_node || return 1
-  info "开始安装 Claude Code..."
+  info "开始安装 Codex CLI..."
   npm install -g "$PKG"
   ok "安装完成"
-  check_claude || true
+  check_codex || true
 }
 
-update_claude() {
+update_codex() {
   check_node || return 1
-  info "开始更新 Claude Code..."
+  info "开始更新 Codex CLI..."
   npm install -g "$PKG@latest"
   ok "更新完成"
-  check_claude || true
+  check_codex || true
 }
 
-uninstall_claude() {
+uninstall_codex() {
   check_node || return 1
-  info "开始卸载 Claude Code..."
+  info "开始卸载 Codex CLI..."
 
   npm uninstall -g "$PKG" || true
 
-  # 强制删除所有相关内容
-  run_root rm -rf "$HOME/.claude" 2>/dev/null || true
-  run_root rm -f /usr/local/bin/claude /usr/bin/claude 2>/dev/null || true
+  run_root rm -rf \
+    "$HOME/.codex" \
+    "$HOME/.config/codex" \
+    /usr/local/bin/codex \
+    /usr/bin/codex 2>/dev/null || true
 
   hash -r 2>/dev/null || true
 
   ok "卸载完成"
 }
 
-auth_status() {
-  if ! check_claude; then
-    warn "请先安装 Claude Code"
-    return 1
-  fi
-
-  info "检查登录状态..."
-  claude auth status
-}
-
-
-auth_claude() {
-  if ! check_claude; then
-    warn "请先安装 Claude Code"
+codex_login() {
+  if ! check_codex; then
+    warn "请先安装 Codex CLI"
     return 1
   fi
 
   info "启动登录授权..."
-  claude auth login
+  codex login
 }
 
-test_claude() {
-  if ! check_claude; then
-    warn "请先安装 Claude Code"
+codex_login_status() {
+  if ! check_codex; then
+    warn "请先安装 Codex CLI"
     return 1
   fi
 
-  info "执行快速测试..."
-  claude -p "用一句话说明当前目录适合做什么"
+  info "检查登录状态..."
+  codex login status
 }
 
-interactive_claude() {
-  if ! check_claude; then
-    warn "请先安装 Claude Code"
+test_codex() {
+  if ! check_codex; then
+    warn "请先安装 Codex CLI"
     return 1
   fi
 
-  info "进入 Claude 交互模式..."
-  claude -c
+  info "执行 Codex 快速测试..."
+  codex exec "用一句话说明当前目录适合做什么"
+}
+
+interactive_codex() {
+  if ! check_codex; then
+    warn "请先安装 Codex CLI"
+    return 1
+  fi
+
+  info "进入 Codex 交互模式..."
+  codex
 }
 
 show_env() {
   detect_os
   info "环境检查"
-  echo "OS_ID    : ${OS_ID:-unknown}"
-  echo "OS_LIKE  : ${OS_LIKE:-unknown}"
-  echo "USER     : ${USER:-unknown}"
-  echo "SHELL    : ${SHELL:-unknown}"
-  echo "PATH     : $PATH"
+  echo "OS_ID        : ${OS_ID:-unknown}"
+  echo "OS_LIKE      : ${OS_LIKE:-unknown}"
+  echo "USER         : ${USER:-unknown}"
+  echo "SHELL        : ${SHELL:-unknown}"
+  echo "PATH         : $PATH"
   echo
 
   if command -v node >/dev/null 2>&1; then
-    echo "node     : $(node -v)"
+    echo "node         : $(node -v)"
   else
-    echo "node     : 未安装"
+    echo "node         : 未安装"
   fi
 
   if command -v npm >/dev/null 2>&1; then
-    echo "npm      : $(npm -v)"
-    echo "npm root : $(npm root -g 2>/dev/null || echo '获取失败')"
+    echo "npm          : $(npm -v)"
+    echo "npm root -g  : $(npm root -g 2>/dev/null || echo '获取失败')"
   else
-    echo "npm      : 未安装"
+    echo "npm          : 未安装"
   fi
 
-  if command -v claude >/dev/null 2>&1; then
-    echo "claude   : $(command -v claude)"
-    echo "version  : $(claude --version 2>/dev/null || echo '读取失败')"
+  if command -v codex >/dev/null 2>&1; then
+    echo "codex        : $(command -v codex)"
+    echo "version      : $(codex --version 2>/dev/null || echo '读取失败')"
   else
-    echo "claude   : 未安装"
+    echo "codex        : 未安装"
+  fi
+
+  if command -v bwrap >/dev/null 2>&1; then
+    echo "bubblewrap   : $(bwrap --version 2>/dev/null | head -n1 || echo '已安装但版本读取失败')"
+  else
+    echo "bubblewrap   : 未安装"
   fi
 }
 
 fix_path_hint() {
-  warn "如果安装后仍提示 'claude: command not found'，通常是 PATH 问题。"
+  warn "如果安装后仍提示 'codex: command not found'，通常是 PATH 问题。"
   echo
   echo "先查看 npm 全局目录："
   echo "  npm root -g"
@@ -302,27 +309,213 @@ fix_path_hint() {
   echo "  source ~/.zshrc"
 }
 
+check_bwrap() {
+  if command -v bwrap >/dev/null 2>&1; then
+    ok "bubblewrap 已安装: $(bwrap --version 2>/dev/null | head -n1 || echo '版本读取失败')"
+    return 0
+  fi
+  warn "未检测到 bubblewrap (bwrap)"
+  return 1
+}
+
+install_bwrap_debian() {
+  require_sudo || return 1
+  info "使用 apt 安装 bubblewrap"
+  run_root apt update
+  run_root apt install -y bubblewrap
+}
+
+install_bwrap_rhel() {
+  require_sudo || return 1
+  info "使用 dnf/yum 安装 bubblewrap"
+  if command -v dnf >/dev/null 2>&1; then
+    run_root dnf install -y bubblewrap
+  elif command -v yum >/dev/null 2>&1; then
+    run_root yum install -y bubblewrap
+  else
+    err "未找到 dnf 或 yum"
+    return 1
+  fi
+}
+
+install_bwrap_alpine() {
+  require_sudo || return 1
+  info "使用 apk 安装 bubblewrap"
+  run_root apk add bubblewrap
+}
+
+install_bwrap_macos() {
+  if ! command -v brew >/dev/null 2>&1; then
+    err "未检测到 Homebrew，请先安装 brew"
+    return 1
+  fi
+  info "使用 brew 安装 bubblewrap"
+  brew install bubblewrap
+}
+
+install_bwrap() {
+  if check_bwrap; then
+    return 0
+  fi
+
+  detect_os
+
+  case "$OS_ID" in
+    ubuntu|debian)
+      install_bwrap_debian
+      ;;
+    centos|rhel|rocky|almalinux|ol|fedora)
+      install_bwrap_rhel
+      ;;
+    alpine)
+      install_bwrap_alpine
+      ;;
+    macos|darwin)
+      install_bwrap_macos
+      ;;
+    *)
+      case "$OS_LIKE" in
+        *debian*)
+          install_bwrap_debian
+          ;;
+        *rhel*|*fedora*)
+          install_bwrap_rhel
+          ;;
+        *)
+          if [ "$(uname -s)" = "Darwin" ]; then
+            install_bwrap_macos
+          else
+            err "暂不支持自动安装 bubblewrap，系统类型: ${OS_ID:-unknown}"
+            return 1
+          fi
+          ;;
+      esac
+      ;;
+  esac
+
+  if check_bwrap; then
+    ok "bubblewrap 安装完成"
+  else
+    err "bubblewrap 安装失败"
+    return 1
+  fi
+}
+
+# ==================================
+#卸载 bubblewrap 
+# ==================================
+uninstall_bwrap_debian() {
+  require_sudo || return 1
+  info "使用 apt 卸载 bubblewrap"
+  run_root apt remove -y bubblewrap
+}
+
+uninstall_bwrap_rhel() {
+  require_sudo || return 1
+  info "使用 dnf/yum 卸载 bubblewrap"
+  if command -v dnf >/dev/null 2>&1; then
+    run_root dnf remove -y bubblewrap
+  elif command -v yum >/dev/null 2>&1; then
+    run_root yum remove -y bubblewrap
+  else
+    err "未找到 dnf 或 yum"
+    return 1
+  fi
+}
+
+uninstall_bwrap_alpine() {
+  require_sudo || return 1
+  info "使用 apk 卸载 bubblewrap"
+  run_root apk del bubblewrap
+}
+
+uninstall_bwrap_macos() {
+  if ! command -v brew >/dev/null 2>&1; then
+    err "未检测到 Homebrew"
+    return 1
+  fi
+  info "使用 brew 卸载 bubblewrap"
+  brew uninstall bubblewrap
+}
+
+uninstall_bwrap() {
+  if ! command -v bwrap >/dev/null 2>&1; then
+    ok "bubblewrap 未安装，无需卸载"
+    return 0
+  fi
+
+  detect_os
+
+  case "$OS_ID" in
+    ubuntu|debian)
+      uninstall_bwrap_debian
+      ;;
+    centos|rhel|rocky|almalinux|ol|fedora)
+      uninstall_bwrap_rhel
+      ;;
+    alpine)
+      uninstall_bwrap_alpine
+      ;;
+    macos|darwin)
+      uninstall_bwrap_macos
+      ;;
+    *)
+      case "$OS_LIKE" in
+        *debian*)
+          uninstall_bwrap_debian
+          ;;
+        *rhel*|*fedora*)
+          uninstall_bwrap_rhel
+          ;;
+        *)
+          if [ "$(uname -s)" = "Darwin" ]; then
+            uninstall_bwrap_macos
+          else
+            err "暂不支持自动卸载 bubblewrap，系统类型: ${OS_ID:-unknown}"
+            return 1
+          fi
+          ;;
+      esac
+      ;;
+  esac
+
+  hash -r 2>/dev/null || true
+
+  if ! command -v bwrap >/dev/null 2>&1; then
+    ok "bubblewrap 卸载完成"
+  else
+    err "bubblewrap 卸载失败"
+    return 1
+  fi
+}
+
+
 install_all() {
   install_node
-  install_claude
+  install_codex
+  install_bwrap
 }
 
 menu() {
   clear
   green "=================================="
-  green "   Claude Code 菜单管理"
+  green "     Codex CLI 菜单管理"
   green "=================================="
-  green " 1. 安装Node.js + Claude Code"
-  green " 2. 查看登录状态"
-  green " 3. 安装Claude Code"
-  green " 4. 检查版本"
+  green " 1. 安装 Node.js + Codex CLI + bubblewrap"
+  green " 2. 仅安装 Node.js"
+  green " 3. 安装 Codex CLI"
+  green " 4. 检查 Codex 版本"
   green " 5. 登录授权"
-  green " 6. 快速测试"
-  green " 7. 进入交互模式"
-  green " 8. 更新 Claude Code"
-  green " 9. 卸载 Claude Code"
-  green "10. 查看环境信息"
-  green "11. PATH 修复提示"
+  green " 6. 查看登录状态"
+  green " 7. Codex 快速测试"
+  green " 8. 进入 Codex 交互模式"
+  green " 9. 更新 Codex CLI"
+  green "10. 卸载 Codex CLI"
+  green "11. 查看环境信息"
+  green "12. PATH 修复提示"
+  green "13. 安装 bubblewrap (bwrap)"
+  green "14. 检查 bubblewrap"
+  green "15. 卸载 bubblewrap"
   green " 0. 退出"
   green "=================================="
 }
@@ -338,43 +531,59 @@ main() {
         pause
         ;;
       2)
-        auth_status || true
+        install_node
         pause
         ;;
       3)
-        install_claude
+        install_codex
         pause
         ;;
       4)
-        check_claude || true
+        check_codex || true
         pause
         ;;
       5)
-        auth_claude || true
+        codex_login || true
         pause
         ;;
       6)
-        test_claude || true
+        codex_login_status || true
         pause
         ;;
       7)
-        interactive_claude || true
+        test_codex || true
         pause
         ;;
       8)
-        update_claude
+        interactive_codex || true
         pause
         ;;
       9)
-        uninstall_claude
+        update_codex
         pause
         ;;
       10)
-        show_env
+        uninstall_codex
         pause
         ;;
       11)
+        show_env
+        pause
+        ;;
+      12)
         fix_path_hint
+        pause
+        ;;
+      13)
+        install_bwrap
+        pause
+        ;;
+      14)
+        check_bwrap || true
+        pause
+        ;;
+	  15)
+        uninstall_bwrap  
         pause
         ;;
       0)

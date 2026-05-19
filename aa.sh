@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Mimo2API 一键管理脚本
+# EmbyPulse Pro 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,10 +8,9 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="mimo2api"
+APP_NAME="embypulse-pro"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.json"
 
 check_docker() {
 
@@ -40,7 +39,7 @@ menu() {
 
         clear
 
-        echo -e "${GREEN}=== Mimo2API 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== EmbyPulse Pro 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -48,6 +47,7 @@ menu() {
         echo -e "${GREEN}5) 查看状态${RESET}"
         echo -e "${GREEN}6) 卸载(含数据)${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
+
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
         case $choice in
@@ -67,7 +67,8 @@ install_app() {
 
     check_docker
 
-    mkdir -p "$APP_DIR"
+    mkdir -p "$APP_DIR/config"
+    mkdir -p "$APP_DIR/data"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -75,41 +76,40 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入服务端口 [默认:8080]: " input_port
-    PORT=${input_port:-8080}
+    read -p "请输入管理端口 [默认:10307]: " input_admin_port
+    ADMIN_PORT=${input_admin_port:-10307}
 
-    check_port "$PORT" || return
+    check_port "$ADMIN_PORT" || return
 
-    if [ ! -f "$CONFIG_FILE" ]; then
+    read -p "请输入用户端口 [默认:10308]: " input_user_port
+    USER_PORT=${input_user_port:-10308}
 
-cat > "$CONFIG_FILE" <<EOF
-{
-  "api_keys": "sk-mimo",
-  "mimo_accounts": [
-    {
-      "service_token": "YOUR_SERVICE_TOKEN",
-      "user_id": "YOUR_USER_ID",
-      "xiaomichatbot_ph": "YOUR_XIAOMICHATBOT_PH"
-    }
-  ]
-}
-EOF
-
-    fi
+    check_port "$USER_PORT" || return
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  mimo2api:
-    image: ghcr.io/fly143/mimo2api:latest
-    container_name: mimo2api
+  embypulse-pro:
+    image: ghcr.io/amlkiller/emby-pulse:latest
+    container_name: embypulse-pro
 
     restart: unless-stopped
 
     ports:
-      - "127.0.0.1:${PORT}:8080"
+      - "127.0.0.1:${ADMIN_PORT}:10307"
+      - "127.0.0.1:${USER_PORT}:10308"
 
     volumes:
-      - ./config.json:/app/config.json
+      - ./config:/workspace/config
+      - ./data:/workspace/data
+
+    environment:
+      - TZ=Asia/Shanghai
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 EOF
 
     cd "$APP_DIR" || exit
@@ -117,9 +117,11 @@ EOF
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ Mimo2API 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}⚙️ 配置文件: $CONFIG_FILE${RESET}"
+    echo -e "${GREEN}✅ EmbyPulse Pro 已启动${RESET}"
+    echo -e "${YELLOW}🌐 管理端:${RESET} http://127.0.0.1:${ADMIN_PORT}"
+    echo -e "${YELLOW}👤 用户端:${RESET} http://127.0.0.1:${USER_PORT}"
+    echo -e "${YELLOW}⚙️ 配置目录:${RESET} $APP_DIR/config"
+    echo -e "${YELLOW}📂 数据目录:${RESET} $APP_DIR/data"
 
     read -p "按回车返回菜单..."
 }
@@ -138,7 +140,7 @@ update_app() {
 
 restart_app() {
 
-    docker restart mimo2api
+    docker restart embypulse-pro
 
     echo -e "${GREEN}✅ 已重启${RESET}"
 
@@ -147,12 +149,12 @@ restart_app() {
 
 view_logs() {
 
-    docker logs -f mimo2api
+    docker logs -f embypulse-pro
 }
 
 check_status() {
 
-    docker ps | grep mimo2api
+    docker ps | grep embypulse-pro
 
     read -p "按回车返回菜单..."
 }

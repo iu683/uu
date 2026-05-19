@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# S-UI 一键管理脚本
+# S-UI HostNetwork 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -25,14 +25,6 @@ check_docker() {
     fi
 }
 
-check_port() {
-
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
-
 get_public_ip() {
     local ip
     for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
@@ -47,6 +39,7 @@ get_public_ip() {
     done
     echo "无法获取公网 IP 地址。" && return
 }
+
 
 menu() {
 
@@ -91,65 +84,46 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入面板端口 [默认:2095]: " input_panel_port
-    PANEL_PORT=${input_panel_port:-2095}
-
-    check_port "$PANEL_PORT" || return
-
-    read -p "请输入节点端口 [默认:2096]: " input_node_port
-    NODE_PORT=${input_node_port:-2096}
-
-    check_port "$NODE_PORT" || return
-
     cat > "$COMPOSE_FILE" <<EOF
 services:
   s-ui:
-    image: alireza7/s-ui
-    container_name: s-ui
-    hostname: "s-ui"
-
-    volumes:
-      - "./db:/app/db"
-      - "./cert:/app/cert"
+    stdin_open: true
 
     tty: true
 
+    network_mode: host
+
+    volumes:
+      - ./db:/app/db
+      - ./cert:/app/cert
+
+    container_name: s-ui
+
     restart: unless-stopped
 
-    ports:
-      - "${PANEL_PORT}:2095"
-      - "${NODE_PORT}:2096"
-
-    networks:
-      - s-ui
-
-    entrypoint: "./entrypoint.sh"
+    image: alireza0/s-ui:latest
 
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
-
-networks:
-  s-ui:
-    driver: bridge
 EOF
 
     cd "$APP_DIR" || exit
 
     docker compose up -d
-
     SERVER_IP=$(get_public_ip)
 
     echo
     echo -e "${GREEN}✅ S-UI 已启动${RESET}"
     echo -e "${YELLOW}🌐 面板地址: http://${SERVER_IP}:${PANEL_PORT}${RESET}"
-    echo -e "${YELLOW}🔌 节点端口: ${NODE_PORT}${RESET}"
+    echo -e "${YELLOW}🔌 订阅地址: http://${SERVER_IP}:${NODE_PORT}${RESET}"
     echo -e "${YELLOW}📂 数据目录: $APP_DIR/db${RESET}"
     echo -e "${YELLOW}🔐 证书目录: $APP_DIR/cert${RESET}"
     echo -e "${YELLOW}🔒 面板证书设置: /app/cert/cert.crt${RESET}"
     echo -e "${YELLOW}📂 面板证书设置: /app/cert/private.key${RESET}"
+
 
     read -p "按回车返回菜单..."
 }

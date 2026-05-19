@@ -1,169 +1,177 @@
 #!/bin/bash
+# ========================================
+# S-UI HostNetwork 一键管理脚本
+# ========================================
 
-# ==========================================
-# VPS AI 工具与 Agent 自动化检测脚本
-# ==========================================
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-# 颜色定义
-G='\033[0;32m'   # 绿色 (Green)
-R='\033[0;31m'   # 红色 (Red)
-Y='\033[1;33m'   # 黄色 (Yellow)
-B='\033[0;34m'   # 蓝色 (Blue)
-NC='\033[0m'     # 无颜色 (No Color)
+APP_NAME="s-ui"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-echo -e "${G}========================================${NC}"
-echo -e "${G}            AI 工具检测           ${NC}"
-echo -e "${G}========================================${NC}"
+check_docker() {
 
-# 树状格式化输出函数
-print_result() {
-    local name=$1
-    local location=$2
-    local version=$3
-    local status=$4
-
-    # 头部：工具名称
-    echo -e "${B}◈ 工具: ${NC}${Y}${name}${NC}"
-
-    if [ "$location" == "未安装" ]; then
-        # 未安装直接精简输出
-        echo -e "  └─ ${R}安装状态: 未安装${NC}"
-    else
-        # 已安装时的树状输出
-        echo -e "  ├─ ${G}安装路径: ${NC}${location}"
-        
-        # 处理版本号为空的情况并去除多余空白字符
-        version=$(echo "$version" | xargs)
-        echo -e "  ├─ ${G}当前版本: ${NC}${version:-未知}"
-        
-        # 状态着色逻辑
-        if [[ "$status" =~ "运行中" ]]; then
-            local STATUS_COLOR="${G}"
-        else
-            local STATUS_COLOR="${Y}"
-        fi
-        echo -e "  └─ ${G}活跃状态: ${NC}${STATUS_COLOR}${status}${NC}"
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
     fi
-    echo -e "${B}----------------------------------------${NC}"
-}
 
-# 升级后的安全获取命令版本函数（解决非交互命令下的捕获空值 Bug）
-get_version() {
-    local cmd=$1
-    local args=$2
-    local raw_out=""
-    
-    if command -v timeout &> /dev/null; then
-        # 允许命令在 2 秒内自然执行完毕并捕获全部输出，避免 head 提前截断导致管道破裂
-        raw_out=$(timeout 2s $cmd $args 2>&1)
-    else
-        raw_out=$($cmd $args 2>&1)
-    fi
-    
-    # 从捕获的输出中提取第一行非空行
-    echo "$raw_out" | grep -v '^$' | head -n 1
-}
-
-# 检查 Docker 容器状态的辅助函数
-check_docker_container() {
-    local keyword=$1
-    if command -v docker &> /dev/null && systemctl is-active --quiet docker; then
-        # 寻找匹配的、处于运行状态的容器
-        local container_info=$(docker ps --format "{{.ID}} [{{.Names}}] ({{.Image}})" | grep -i "$keyword" | head -n 1)
-        if [ -n "$container_info" ]; then
-            echo "$container_info"
-        fi
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
     fi
 }
 
-# ==========================================
-# 工具检测核心逻辑
-# ==========================================
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
+}
 
-# 1. Claude Code 检测
-if command -v claude &> /dev/null; then
-    loc=$(which claude)
-    ver=$(get_version "claude" "--version")
-    if pgrep -f "claude" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
-else
-    loc="未安装"; ver=""; status=""
-fi
-print_result "Claude Code" "$loc" "$ver" "$status"
 
-# 2. Codex CLI 检测
-if command -v codex &> /dev/null; then
-    loc=$(which codex)
-    ver=$(get_version "codex" "--version")
-    if pgrep -f "codex" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
-else
-    loc="未安装"; ver=""; status=""
-fi
-print_result "Codex CLI (OpenAI)" "$loc" "$ver" "$status"
+menu() {
 
-# 3. Gemini CLI 检测
-if command -v gemini &> /dev/null; then
-    loc=$(which gemini)
-    ver=$(/usr/bin/gemini --version 2>&1 | grep -E '[0-9]+\.[0-9]' | head -n 1)
-    if pgrep -f "gemini" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
-else
-    loc="未安装"; ver=""; status=""
-fi
-print_result "Gemini CLI" "$loc" "$ver" "$status"
+    while true; do
 
-# 4. OpenCode 检测
-if command -v opencode &> /dev/null; then
-    loc=$(which opencode)
-    ver=$(get_version "opencode" "--version")
-    if pgrep -f "opencode" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
-elif command -v open-code &> /dev/null; then
-    loc=$(which open-code)
-    ver=$(get_version "open-code" "--version")
-    if pgrep -f "open-code" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
-else
-    loc="未安装"; ver=""; status=""
-fi
-print_result "OpenCode" "$loc" "$ver" "$status"
+        clear
 
-# 5. OpenClaw 检测 (加入 Docker 联动)
-docker_res=$(check_docker_container "openclaw\|clawdbot")
+        echo -e "${GREEN}=== S-UI 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
 
-if [ -n "$docker_res" ]; then
-    loc="Docker Container ($docker_res)"
-    ver="Docker Managed"
-    status="运行中 (Running)"
-elif command -v openclaw &> /dev/null || command -v clawdbot &> /dev/null; then
-    loc=$(which openclaw 2>/dev/null || which clawdbot)
-    ver=$(get_version "$loc" "--version")
-    if pgrep -f "openclaw\|clawdbot" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
-elif command -v pip &> /dev/null && pip show openclaw &> /dev/null; then
-    loc="Python Pip Package"
-    ver=$(pip show openclaw | grep -i "^Version:" | cut -d' ' -f2)
-    if pgrep -f "openclaw" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
-else
-    loc="未安装"; ver=""; status=""
-fi
-print_result "OpenClaw" "$loc" "$ver" "$status"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-# 6. Hermes Agent 检测 (加入 Docker 联动)
-docker_res=$(check_docker_container "hermes")
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
+        esac
+    done
+}
 
-if [ -n "$docker_res" ]; then
-    loc="Docker Container ($docker_res)"
-    ver="Docker Managed"
-    status="运行中 (Running)"
-elif command -v hermes &> /dev/null || command -v hermes-agent &> /dev/null; then
-    loc=$(which hermes 2>/dev/null || which hermes-agent)
-    ver=$(get_version "$loc" "--version")
-    if pgrep -f "hermes" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
-elif command -v npm &> /dev/null && npm list -g --depth=0 hermes-agent &> /dev/null; then
-    loc="NPM Global Module"
-    ver=$(npm list -g --depth=0 hermes-agent | grep hermes-agent | awk -F@ '{print $2}')
-    status="已安装 (可通过 npm 启动)"
-elif command -v pip &> /dev/null && pip show hermes-agent &> /dev/null; then
-    loc="Python Pip Package"
-    ver=$(pip show hermes-agent | grep -i "^Version:" | cut -d' ' -f2)
-    status="已安装 (可通过 python 运行)"
-else
-    loc="未安装"; ver=""; status=""
-fi
-print_result "Hermes Agent" "$loc" "$ver" "$status"
+install_app() {
+
+    check_docker
+
+    mkdir -p "$APP_DIR/db"
+    mkdir -p "$APP_DIR/cert"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  s-ui:
+    stdin_open: true
+
+    tty: true
+
+    network_mode: host
+
+    volumes:
+      - ./db:/app/db
+      - ./cert:/app/cert
+
+    container_name: s-ui
+
+    restart: unless-stopped
+
+    image: alireza7/s-ui:latest
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+EOF
+
+    cd "$APP_DIR" || exit
+
+    docker compose up -d
+    SERVER_IP=$(get_public_ip)
+
+    echo
+    echo -e "${GREEN}✅ S-UI 已启动${RESET}"
+    echo -e "${YELLOW}🌐 面板地址: http://${SERVER_IP}:2095${RESET}"
+    echo -e "${YELLOW}🔌 订阅地址: http://${SERVER_IP}:2096${RESET}"
+    echo -e "${YELLOW}📂 数据目录: $APP_DIR/db${RESET}"
+    echo -e "${YELLOW}🔐 证书目录: $APP_DIR/cert${RESET}"
+    echo -e "${YELLOW}🔒 面板证书设置: /app/cert/cert.crt${RESET}"
+    echo -e "${YELLOW}📂 面板证书设置: /app/cert/private.key${RESET}"
+
+
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+
+    cd "$APP_DIR" || return
+
+    docker compose pull
+    docker compose up -d
+
+    echo -e "${GREEN}✅ 更新完成${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+
+    docker restart s-ui
+
+    echo -e "${GREEN}✅ 已重启${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+
+    docker logs -f s-ui
+}
+
+check_status() {
+
+    docker ps | grep s-ui
+
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+
+    cd "$APP_DIR" || return
+
+    docker compose down -v
+
+    rm -rf "$APP_DIR"
+
+    echo -e "${RED}✅ 已彻底卸载${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+menu

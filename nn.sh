@@ -1,182 +1,201 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-APP_NAME="OpenCode"
-BIN="opencode"
+#!/bin/bash
+# ========================================
+# S-UI 一键管理脚本
+# ========================================
 
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
-CYAN="\033[36m"
+RED="\033[31m"
 RESET="\033[0m"
 
-info(){ echo -e "${GREEN}[信息] $1${RESET}"; }
-warn(){ echo -e "${YELLOW}[警告] $1${RESET}"; }
-err(){ echo -e "${RED}[错误] $1${RESET}"; }
+APP_NAME="s-ui"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-pause(){ read -rp "按回车继续..." _; }
+check_docker() {
 
-# ==============================
-# 环境检测
-# ==============================
-check_env() {
-    info "检查 Node.js 环境..."
-
-    if ! command -v node >/dev/null 2>&1; then
-        warn "未检测到 Node.js，自动安装中..."
-        curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-        apt-get install -y nodejs
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
     fi
 
-    if ! command -v npm >/dev/null 2>&1; then
-        err "npm 不存在，安装失败"
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
         exit 1
     fi
-
-    info "环境正常"
 }
 
-# ==============================
-# 安装
-# ==============================
-install_opencode() {
-    check_env
-    info "安装 OpenCode..."
+check_port() {
 
-    npm install -g opencode-ai || {
-        err "安装失败"
-        return
-    }
-
-    info "安装完成"
-}
-
-# ==============================
-# 登录
-# ==============================
-login_opencode() {
-    if ! command -v opencode >/dev/null 2>&1; then
-        err "请先安装 OpenCode"
-        return
-    fi
-
-    info "开始登录 Provider..."
-    opencode providers login
-}
-# ==============================
-# 登录状态
-# ==============================
-status_opencode() {
-    if ! command -v $BIN >/dev/null 2>&1; then
-        warn "未安装"
-        return
-    fi
-
-    info "当前 Provider 状态："
-
-    if opencode providers list >/dev/null 2>&1; then
-        opencode providers list
-    else
-        warn "未配置任何 Provider（未登录）"
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
     fi
 }
 
-# ==============================
-# 版本
-# ==============================
-version_opencode() {
-    echo -e "${CYAN}===== 版本信息 =====${RESET}"
-
-    if command -v opencode >/dev/null 2>&1; then
-        echo "OpenCode: $(opencode --version)"
-    else
-        echo "OpenCode: 未安装"
-    fi
-
-    echo "Node.js: $(node -v 2>/dev/null || echo 未安装)"
-    echo "npm: $(npm -v 2>/dev/null || echo 未安装)"
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
 }
 
-# ==============================
-# 交互模式
-# ==============================
-interactive_opencode() {
-    if command -v opencode >/dev/null 2>&1; then
-        info "进入交互模式（Ctrl+C 退出）"
-        opencode
-    else
-        err "未安装 opencode"
-    fi
-}
-
-# ==============================
-# 更新
-# ==============================
-update_opencode() {
-    info "更新 OpenCode..."
-    npm update -g opencode-ai || warn "更新失败"
-    info "完成"
-}
-
-# ==============================
-# 卸载
-# ==============================
-uninstall_opencode() {
-    warn "卸载 OpenCode..."
-
-    npm uninstall -g opencode-ai || true
-    rm -rf /root/.cache/opencode
-    rm -rf /root/.config/opencode
-
-    info "已卸载"
-}
-
-# ==============================
-# 环境信息
-# ==============================
-env_info() {
-    echo -e "${CYAN}===== 环境信息 =====${RESET}"
-    echo "系统: $(uname -a)"
-    echo "Node: $(node -v 2>/dev/null || echo 未安装)"
-    echo "npm: $(npm -v 2>/dev/null || echo 未安装)"
-    echo "OpenCode: $(opencode --version 2>/dev/null || echo 未安装)"
-    echo "PATH: $PATH"
-}
-
-# ==============================
-# 菜单
-# ==============================
 menu() {
-    clear
-    echo -e "${GREEN}==== $APP_NAME ==== ${RESET}"
-    echo -e "${GREEN}1. 安装 OpenCode${RESET}"
-    echo -e "${GREEN}2. 登录${RESET}"
-    echo -e "${GREEN}3. 查看登录状态${RESET}"
-    echo -e "${GREEN}4. 检查版本${RESET}"
-    echo -e "${GREEN}5. 进入交互模式${RESET}"
-    echo -e "${GREEN}6. 更新${RESET}"
-    echo -e "${GREEN}7. 卸载${RESET}"
-    echo -e "${GREEN}8. 环境信息${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
 
-    printf "${GREEN}请输入选项: ${RESET}"
-    read -r choice
+    while true; do
 
-    case $choice in
-        1) install_opencode ;;
-        2) login_opencode ;;
-        3) status_opencode ;;
-        4) version_opencode ;;
-        5) interactive_opencode ;;
-        6) update_opencode ;;
-        7) uninstall_opencode ;;
-        8) env_info ;;
-        0) exit 0 ;;
-        *) warn "无效选项" ;;
-    esac
+        clear
 
-    pause
-    menu
+        echo -e "${GREEN}=== S-UI 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
+        esac
+    done
+}
+
+install_app() {
+
+    check_docker
+
+    mkdir -p "$APP_DIR/db"
+    mkdir -p "$APP_DIR/cert"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
+
+    read -p "请输入面板端口 [默认:2095]: " input_panel_port
+    PANEL_PORT=${input_panel_port:-2095}
+
+    check_port "$PANEL_PORT" || return
+
+    read -p "请输入节点端口 [默认:2096]: " input_node_port
+    NODE_PORT=${input_node_port:-2096}
+
+    check_port "$NODE_PORT" || return
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  s-ui:
+    image: alireza7/s-ui
+    container_name: s-ui
+    hostname: "s-ui"
+
+    volumes:
+      - "./db:/app/db"
+      - "./cert:/app/cert"
+
+    tty: true
+
+    restart: unless-stopped
+
+    ports:
+      - "${PANEL_PORT}:2095"
+      - "${NODE_PORT}:2096"
+
+    networks:
+      - s-ui
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  s-ui:
+    driver: bridge
+EOF
+
+    cd "$APP_DIR" || exit
+
+    docker compose up -d
+
+    SERVER_IP=$(get_public_ip)
+
+    echo
+    echo -e "${GREEN}✅ S-UI 已启动${RESET}"
+    echo -e "${YELLOW}🌐 面板地址: http://${SERVER_IP}:${PANEL_PORT}${RESET}"
+    echo -e "${YELLOW}🔌 节点端口: ${NODE_PORT}${RESET}"
+    echo -e "${YELLOW}📂 数据目录: $APP_DIR/db${RESET}"
+    echo -e "${YELLOW}🔐 证书目录: $APP_DIR/cert${RESET}"
+    echo -e "${YELLOW}🔒 面板证书设置: /app/cert/cert.crt${RESET}"
+    echo -e "${YELLOW}📂 面板证书设置: /app/cert/private.key${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+
+    cd "$APP_DIR" || return
+
+    docker compose pull
+    docker compose up -d
+
+    echo -e "${GREEN}✅ 更新完成${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+
+    docker restart s-ui
+
+    echo -e "${GREEN}✅ 已重启${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+
+    docker logs -f s-ui
+}
+
+check_status() {
+
+    docker ps | grep s-ui
+
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+
+    cd "$APP_DIR" || return
+
+    docker compose down -v
+
+    rm -rf "$APP_DIR"
+
+    echo -e "${RED}✅ 已彻底卸载${RESET}"
+
+    read -p "按回车返回菜单..."
 }
 
 menu

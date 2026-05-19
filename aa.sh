@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Alicdt Manager 一键管理脚本
+# S-UI 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,10 +8,9 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="alicdt-manager"
+APP_NAME="s-ui"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-ENV_FILE="$APP_DIR/.env"
 
 check_docker() {
 
@@ -34,9 +33,19 @@ check_port() {
     fi
 }
 
-generate_secret() {
-
-    cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 48
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
 }
 
 menu() {
@@ -45,7 +54,7 @@ menu() {
 
         clear
 
-        echo -e "${GREEN}=== Alicdt Manager 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== S-UI 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -73,7 +82,8 @@ install_app() {
 
     check_docker
 
-    mkdir -p "$APP_DIR/data"
+    mkdir -p "$APP_DIR/db"
+    mkdir -p "$APP_DIR/cert"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -81,54 +91,65 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入服务端口 [默认:8000]: " input_port
-    PORT=${input_port:-8000}
+    read -p "请输入面板端口 [默认:2095]: " input_panel_port
+    PANEL_PORT=${input_panel_port:-2095}
 
-    check_port "$PORT" || return
+    check_port "$PANEL_PORT" || return
 
-    SECRET_KEY=$(generate_secret)
+    read -p "请输入节点端口 [默认:2096]: " input_node_port
+    NODE_PORT=${input_node_port:-2096}
 
-    cat > "$ENV_FILE" <<EOF
-SECRET_KEY=${SECRET_KEY}
-EOF
+    check_port "$NODE_PORT" || return
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  alicdt-manager:
-    image: ghcr.io/lillinlin/alicdt-manager:latest
-    container_name: alicdt-manager
-
-    restart: always
-
-    ports:
-      - "127.0.0.1:${PORT}:8000"
+  s-ui:
+    image: alireza7/s-ui
+    container_name: s-ui
+    hostname: "s-ui"
 
     volumes:
-      - ./data:/app/data
+      - "./db:/app/db"
+      - "./cert:/app/cert"
 
-    env_file:
-      - .env
+    tty: true
 
-    environment:
-      - TZ=Asia/Shanghai
+    restart: unless-stopped
+
+    ports:
+      - "${PANEL_PORT}:2095"
+      - "${NODE_PORT}:2096"
+
+    networks:
+      - s-ui
+
+    entrypoint: "./entrypoint.sh"
 
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
+
+networks:
+  s-ui:
+    driver: bridge
 EOF
 
     cd "$APP_DIR" || exit
 
     docker compose up -d
 
+    SERVER_IP=$(get_public_ip)
+
     echo
-    echo -e "${GREEN}✅ Alicdt Manager 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🔑 SECRET_KEY: ${SECRET_KEY}${RESET}"
-    echo -e "${YELLOW}📂 数据目录: $APP_DIR/data${RESET}"
-    echo -e "${YELLOW}⚙️ 环境文件: $ENV_FILE${RESET}"
+    echo -e "${GREEN}✅ S-UI 已启动${RESET}"
+    echo -e "${YELLOW}🌐 面板地址: http://${SERVER_IP}:${PANEL_PORT}${RESET}"
+    echo -e "${YELLOW}🔌 节点端口: ${NODE_PORT}${RESET}"
+    echo -e "${YELLOW}📂 数据目录: $APP_DIR/db${RESET}"
+    echo -e "${YELLOW}🔐 证书目录: $APP_DIR/cert${RESET}"
+    echo -e "${YELLOW}🔒 面板证书设置: /app/cert/cert.crt${RESET}"
+    echo -e "${YELLOW}📂 面板证书设置: /app/cert/private.key${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -147,7 +168,7 @@ update_app() {
 
 restart_app() {
 
-    docker restart alicdt-manager
+    docker restart s-ui
 
     echo -e "${GREEN}✅ 已重启${RESET}"
 
@@ -156,12 +177,12 @@ restart_app() {
 
 view_logs() {
 
-    docker logs -f alicdt-manager
+    docker logs -f s-ui
 }
 
 check_status() {
 
-    docker ps | grep alicdt-manager
+    docker ps | grep s-ui
 
     read -p "按回车返回菜单..."
 }

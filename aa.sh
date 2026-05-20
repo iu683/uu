@@ -1,152 +1,201 @@
 #!/bin/bash
-# 万能 DNS 切换脚本（Ubuntu 自动关闭 resolved + 可锁定）
+# ========================================
+# S-UI 一键管理脚本
+# ========================================
 
-dns_order=( "HK" "JP" "TW" "SG" "KR" "US" "UK" "DE" "SB" "RFC" "NHK" "HKG" "自定义" )
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-declare -A dns_list=(
-  ["HK"]="154.83.83.83"
-  ["JP"]="45.76.215.40"
-  ["TW"]="154.83.83.86"
-  ["SG"]="149.28.158.78"
-  ["KR"]="158.247.223.218"
-  ["US"]="66.42.97.127"
-  ["UK"]="45.32.179.189"
-  ["DE"]="80.240.28.27"
-  ["SB"]="6.6.6.6"
-  ["RFC"]="22.22.22.22"
-  ["NHK"]="151.247.88.3"
-  ["HKG"]="155.117.188.188"
-)
+APP_NAME="s-ui"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-green="\033[32m"
-red="\033[31m"
-reset="\033[0m"
+check_docker() {
 
-########################################
-# 判断是否 Ubuntu
-########################################
-is_ubuntu() {
-    [ -f /etc/os-release ] && grep -qi ubuntu /etc/os-release
-}
-
-########################################
-# 判断是否启用 systemd-resolved stub
-########################################
-is_resolved_mode() {
-    systemctl is-active systemd-resolved >/dev/null 2>&1
-}
-
-########################################
-# 修改 resolv.conf 文件模式（可锁定）
-########################################
-set_resolvconf_dns() {
-    # 解锁
-    if lsattr /etc/resolv.conf 2>/dev/null | grep -q "\-i\-"; then
-        echo -e "${green}检测到 resolv.conf 已锁定，正在解锁...${reset}"
-        sudo chattr -i /etc/resolv.conf
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
     fi
 
-    sudo cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null
-
-    sudo bash -c "cat > /etc/resolv.conf <<EOF
-nameserver $1
-options timeout:2 attempts:3
-EOF"
-
-    echo -e "${green}DNS 已写入 resolv.conf${reset}"
-
-    # 可选锁定
-    echo -ne "${green}是否锁定 /etc/resolv.conf 防止被覆盖? (y/n):${reset} "
-    read lock_choice
-    if [[ "$lock_choice" == "y" ]]; then
-        sudo chattr +i /etc/resolv.conf
-        echo -e "${green}/etc/resolv.conf 已锁定${reset}"
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
     fi
 }
 
-########################################
-# 关闭 Ubuntu resolved 并写入 resolv.conf（可锁定）
-########################################
-disable_ubuntu_resolved() {
-    echo -e "${green}检测到 Ubuntu + systemd-resolved，正在关闭...${reset}"
-    sudo systemctl stop systemd-resolved
-    sudo systemctl disable systemd-resolved
+check_port() {
 
-    sudo rm -f /etc/resolv.conf
-
-    sudo bash -c "cat > /etc/resolv.conf <<EOF
-nameserver $1
-nameserver 1.1.1.1
-options timeout:2 attempts:3
-EOF"
-
-    echo -e "${green}resolved 已关闭，DNS 已写入 /etc/resolv.conf${reset}"
-
-    # 可选锁定
-    echo -ne "${green}是否锁定 /etc/resolv.conf 防止被覆盖? (y/n):${reset} "
-    read lock_choice
-    if [[ "$lock_choice" == "y" ]]; then
-        sudo chattr +i /etc/resolv.conf
-        echo -e "${green}/etc/resolv.conf 已锁定${reset}"
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
     fi
 }
 
-########################################
-# 临时 resolvectl 模式
-########################################
-set_resolved_runtime_dns() {
-    interface=$(ip route | awk '/default/ {print $5; exit}')
-    if [ -z "$interface" ]; then
-        echo -e "${red}无法检测网络接口${reset}"
-        return
-    fi
-    sudo resolvectl dns "$interface" "$1"
-    sudo resolvectl flush-caches
-    echo -e "${green}DNS 已通过 resolvectl 临时应用${reset}"
-}
-
-########################################
-# 主循环
-########################################
-while true; do
-    echo -e "${green}请选择要使用的 DNS 区域：${reset}"
-    count=0
-    for region in "${dns_order[@]}"; do
-        ((count++))
-        printf "${green}[%02d] %-10s${reset}" "$count" "$region"
-        (( count % 2 == 0 )) && echo ""
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
     done
-    echo -e "${green}[0]  退出${reset}"
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
+}
 
-    echo -ne "${green}请输入编号:${reset} "
-    read choice
+menu() {
 
-     # 支持 0 或 00 退出
-    [[ "$choice" == "0" || "$choice" == "00" ]] && exit 0
+    while true; do
 
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#dns_order[@]} )); then
-        region="${dns_order[$((choice-1))]}"
+        clear
 
-        if [ "$region" = "自定义" ]; then
-            echo -ne "${green}请输入 DNS IP:${reset} "
-            read dns_to_set
-        else
-            dns_to_set="${dns_list[$region]}"
-        fi
+        echo -e "${GREEN}=== S-UI 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
 
-        echo -e "${green}正在设置 DNS 为 $dns_to_set ($region)...${reset}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-        # 核心逻辑
-        if is_ubuntu && is_resolved_mode; then
-            disable_ubuntu_resolved "$dns_to_set"
-        elif is_resolved_mode; then
-            set_resolved_runtime_dns "$dns_to_set"
-        else
-            set_resolvconf_dns "$dns_to_set"
-        fi
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
+        esac
+    done
+}
 
-        echo
-    else
-        echo -e "${red}无效选择，请重新输入。${reset}"
+install_app() {
+
+    check_docker
+
+    mkdir -p "$APP_DIR/db"
+    mkdir -p "$APP_DIR/cert"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
     fi
-done
+
+    read -p "请输入面板端口 [默认:2095]: " input_panel_port
+    PANEL_PORT=${input_panel_port:-2095}
+
+    check_port "$PANEL_PORT" || return
+
+    read -p "请输入订阅端口 [默认:2096]: " input_node_port
+    NODE_PORT=${input_node_port:-2096}
+
+    check_port "$NODE_PORT" || return
+
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  s-ui:
+    image: alireza7/s-ui
+    container_name: s-ui
+    hostname: "s-ui"
+
+    volumes:
+      - "./db:/app/db"
+      - "./cert:/app/cert"
+
+    tty: true
+
+    restart: unless-stopped
+
+    ports:
+      - "${PANEL_PORT}:2095"
+      - "${NODE_PORT}:2096"
+
+    networks:
+      - s-ui
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  s-ui:
+    driver: bridge
+EOF
+
+    cd "$APP_DIR" || exit
+
+    docker compose up -d
+
+    SERVER_IP=$(get_public_ip)
+
+    echo
+    echo -e "${GREEN}✅ S-UI 已启动${RESET}"
+    echo -e "${YELLOW}🌐 面板地址: http://${SERVER_IP}:${PANEL_PORT}/app/${RESET}"
+    echo -e "${YELLOW}🔌 节点端口: ${NODE_PORT}${RESET}"
+    echo -e "${YELLOW}📂 数据目录: $APP_DIR/db${RESET}"
+    echo -e "${YELLOW}🔐 证书目录: $APP_DIR/cert${RESET}"
+    echo -e "${YELLOW}🔒 面板证书设置: /app/cert/cert.crt${RESET}"
+    echo -e "${YELLOW}📂 面板证书设置: /app/cert/private.key${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+update_app() {
+
+    cd "$APP_DIR" || return
+
+    docker compose pull
+    docker compose up -d
+
+    echo -e "${GREEN}✅ 更新完成${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+restart_app() {
+
+    docker restart s-ui
+
+    echo -e "${GREEN}✅ 已重启${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+
+    docker logs -f s-ui
+}
+
+check_status() {
+
+    docker ps | grep s-ui
+
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+
+    cd "$APP_DIR" || return
+
+    docker compose down -v
+
+    rm -rf "$APP_DIR"
+
+    echo -e "${RED}✅ 已彻底卸载${RESET}"
+
+    read -p "按回车返回菜单..."
+}
+
+menu

@@ -40,7 +40,6 @@ get_public_ip() {
     echo "无法获取公网 IP 地址。" && return
 }
 
-
 menu() {
 
     while true; do
@@ -113,17 +112,17 @@ EOF
     cd "$APP_DIR" || exit
 
     docker compose up -d
+
     SERVER_IP=$(get_public_ip)
 
     echo
     echo -e "${GREEN}✅ S-UI 已启动${RESET}"
-    echo -e "${YELLOW}🌐 面板地址: http://${SERVER_IP}:2095${RESET}"
+    echo -e "${YELLOW}🌐 面板地址: http://${SERVER_IP}:2095/app/${RESET}"
     echo -e "${YELLOW}🔌 订阅地址: http://${SERVER_IP}:2096${RESET}"
     echo -e "${YELLOW}📂 数据目录: $APP_DIR/db${RESET}"
     echo -e "${YELLOW}🔐 证书目录: $APP_DIR/cert${RESET}"
     echo -e "${YELLOW}🔒 面板证书设置: /app/cert/cert.crt${RESET}"
     echo -e "${YELLOW}📂 面板证书设置: /app/cert/private.key${RESET}"
-
 
     read -p "按回车返回菜单..."
 }

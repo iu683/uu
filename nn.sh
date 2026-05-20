@@ -1,29 +1,17 @@
 #!/bin/bash
-# ========================================
-# S-UI HostNetwork 一键管理脚本
-# ========================================
+
+# =========================================
+# S-UI
+# =========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
+BLUE="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="s-ui"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-
-check_docker() {
-
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
-}
+CONTAINER_NAME="s-ui"
+IMAGE_NAME="alireza7/s-ui:latest"
 
 get_public_ip() {
     local ip
@@ -40,78 +28,45 @@ get_public_ip() {
     echo "无法获取公网 IP 地址。" && return
 }
 
-menu() {
-
-    while true; do
-
-        clear
-
-        echo -e "${GREEN}=== S-UI 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
-        esac
-    done
-}
-
-install_app() {
-
-    check_docker
-
-    mkdir -p "$APP_DIR/db"
-    mkdir -p "$APP_DIR/cert"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
+install_docker() {
+    if command -v docker >/dev/null 2>&1; then
+        echo -e "${GREEN}[✓] Docker 已安装${RESET}"
+        return
     fi
 
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  s-ui:
-    stdin_open: true
+    echo -e "${YELLOW}[+] 正在安装 Docker...${RESET}"
+    curl -fsSL https://get.docker.com | bash
 
-    tty: true
+    systemctl enable docker
+    systemctl start docker
 
-    network_mode: host
+    echo -e "${GREEN}[✓] Docker 安装完成${RESET}"
+}
 
-    volumes:
-      - ./db:/app/db
-      - ./cert:/app/cert
+install_sui() {
+    echo -e "${YELLOW}[+] 创建目录...${RESET}"
 
-    container_name: s-ui
+    mkdir -p /etc/s-ui
+    mkdir -p /usr/local/s-ui
 
-    restart: unless-stopped
+    echo -e "${YELLOW}[+] 拉取镜像...${RESET}"
+    docker pull ${IMAGE_NAME}
 
-    image: alireza0/s-ui:latest
+    echo -e "${YELLOW}[+] 删除旧容器...${RESET}"
+    docker rm -f ${CONTAINER_NAME} >/dev/null 2>&1
 
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-EOF
+    echo -e "${YELLOW}[+] 启动 S-UI...${RESET}"
 
-    cd "$APP_DIR" || exit
+    docker run -d \
+      --name ${CONTAINER_NAME} \
+      --restart unless-stopped \
+      --network host \
+      -e TZ=Asia/Tokyo \
+      -v /etc/s-ui:/etc/s-ui \
+      -v /usr/local/s-ui:/usr/local/s-ui \
+      ${IMAGE_NAME}
 
-    docker compose up -d
+    echo -e "${GREEN}[✓] S-UI 安装完成${RESET}"
 
     SERVER_IP=$(get_public_ip)
 
@@ -119,58 +74,104 @@ EOF
     echo -e "${GREEN}✅ S-UI 已启动${RESET}"
     echo -e "${YELLOW}🌐 面板地址: http://${SERVER_IP}:2095/app/${RESET}"
     echo -e "${YELLOW}🔌 订阅地址: http://${SERVER_IP}:2096${RESET}"
-    echo -e "${YELLOW}📂 数据目录: $APP_DIR/db${RESET}"
-    echo -e "${YELLOW}🔐 证书目录: $APP_DIR/cert${RESET}"
-    echo -e "${YELLOW}🔒 面板证书设置: /app/cert/cert.crt${RESET}"
-    echo -e "${YELLOW}📂 面板证书设置: /app/cert/private.key${RESET}"
-
-    read -p "按回车返回菜单..."
 }
 
-update_app() {
-
-    cd "$APP_DIR" || return
-
-    docker compose pull
-    docker compose up -d
-
-    echo -e "${GREEN}✅ 更新完成${RESET}"
-
-    read -p "按回车返回菜单..."
+start_sui() {
+    docker start ${CONTAINER_NAME}
+    echo -e "${GREEN}[✓] S-UI 已启动${RESET}"
 }
 
-restart_app() {
-
-    docker restart s-ui
-
-    echo -e "${GREEN}✅ 已重启${RESET}"
-
-    read -p "按回车返回菜单..."
+stop_sui() {
+    docker stop ${CONTAINER_NAME}
+    echo -e "${YELLOW}[✓] S-UI 已停止${RESET}"
 }
 
-view_logs() {
-
-    docker logs -f s-ui
+restart_sui() {
+    docker restart ${CONTAINER_NAME}
+    echo -e "${GREEN}[✓] S-UI 已重启${RESET}"
 }
 
-check_status() {
-
-    docker ps | grep s-ui
-
-    read -p "按回车返回菜单..."
+status_sui() {
+    docker ps -a | grep ${CONTAINER_NAME}
 }
 
-uninstall_app() {
+logs_sui() {
+    docker logs -f ${CONTAINER_NAME}
+}
 
-    cd "$APP_DIR" || return
+update_sui() {
+    echo -e "${YELLOW}[+] 更新镜像...${RESET}"
 
-    docker compose down -v
+    docker pull ${IMAGE_NAME}
 
-    rm -rf "$APP_DIR"
+    docker rm -f ${CONTAINER_NAME}
 
-    echo -e "${RED}✅ 已彻底卸载${RESET}"
+    docker run -d \
+      --name ${CONTAINER_NAME} \
+      --restart unless-stopped \
+      --network host \
+      -e TZ=Asia/Tokyo \
+      -v /etc/s-ui:/etc/s-ui \
+      -v /usr/local/s-ui:/usr/local/s-ui \
+      ${IMAGE_NAME}
 
-    read -p "按回车返回菜单..."
+    echo -e "${GREEN}[✓] 更新完成${RESET}"
+}
+
+uninstall_sui() {
+    read -p "确认卸载 S-UI？(y/n): " confirm
+
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        docker rm -f ${CONTAINER_NAME}
+
+        echo -e "${GREEN}[✓] 已卸载 S-UI${RESET}"
+    fi
+}
+
+
+menu() {
+    clear
+    echo -e "${GREEN}==== S-UI  管理菜单====${RESET}"
+    echo -e "${GREEN}1. 安装启动${RESET}"
+    echo -e "${GREEN}2. 重启${RESET}"
+    echo -e "${GREEN}3. 查看状态${RESET}"
+    echo -e "${GREEN}4. 查看日志${RESET}"
+    echo -e "${GREEN}5  更新${RESET}"
+    echo -e "${GREEN}6. 卸载${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}""
+    read -p "请输入选项: " num
+
+    case "$num" in
+        1)
+            install_docker
+            install_sui
+            ;;
+        2)
+            restart_sui
+            ;;
+        3)
+            status_sui
+            ;;
+        4)
+            logs_sui
+            ;;
+        5)
+            update_sui
+            ;;
+        6)
+            uninstall_sui
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}[×] 无效选项${RESET}"
+            ;;
+    esac
+
+    echo
+    read -p "按回车继续..."
+    menu
 }
 
 menu

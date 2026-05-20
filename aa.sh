@@ -98,25 +98,27 @@ install_app() {
     cat > "$COMPOSE_FILE" <<EOF
 services:
   s-ui:
-    image: alireza7/s-ui:latest
-    container_name: s-ui
-    hostname: s-ui
+    stdin_open: true
 
-    network_mode: host
+    tty: true
+
+    container_name: s-ui
 
     restart: unless-stopped
 
-    tty: true
+    network_mode: host
 
     volumes:
       - ./db:/app/db
       - ./cert:/app/cert
 
+    image: alireza7/s-ui:latest
+
     logging:
-      driver: json-file
+      driver: "json-file"
       options:
-        max-size: 10m
-        max-file: 3
+        max-size: "10m"
+        max-file: "3"
 EOF
 
     cd "$APP_DIR" || exit
@@ -198,20 +200,9 @@ view_logs() {
 
 check_status() {
 
-    clear
 
-    echo -e "${GREEN}========== 容器状态 ==========${RESET}"
     docker ps -a | grep s-ui
 
-    echo
-    echo -e "${GREEN}========== 端口监听 ==========${RESET}"
-    ss -tulnp | grep -E "2095|2096|s-ui|sing-box"
-
-    echo
-    echo -e "${GREEN}========== 资源占用 ==========${RESET}"
-    docker stats --no-stream s-ui 2>/dev/null
-
-    echo
 
     read -p "按回车返回菜单..."
 }

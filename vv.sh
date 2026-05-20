@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# nodeget 一键管理脚本
+# S-UI 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,11 +8,12 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="nodeget"
+APP_NAME="s-ui"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
 check_docker() {
+
     if ! command -v docker &>/dev/null; then
         echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
         curl -fsSL https://get.docker.com | bash
@@ -25,16 +26,35 @@ check_docker() {
 }
 
 check_port() {
+
     if ss -tlnp | grep -q ":$1 "; then
         echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
         return 1
     fi
 }
 
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
+}
+
 menu() {
+
     while true; do
+
         clear
-        echo -e "${GREEN}=== NodeGet 管理菜单 ===${RESET}"
+
+        echo -e "${GREEN}=== S-UI 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -42,6 +62,7 @@ menu() {
         echo -e "${GREEN}5) 查看状态${RESET}"
         echo -e "${GREEN}6) 卸载(含数据)${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
+
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
         case $choice in
@@ -52,7 +73,7 @@ menu() {
             5) check_status ;;
             6) uninstall_app ;;
             0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
         esac
     done
 }
@@ -61,7 +82,8 @@ install_app() {
 
     check_docker
 
-    mkdir -p "$APP_DIR/data/sqlite"
+    mkdir -p "$APP_DIR/db"
+    mkdir -p "$APP_DIR/cert"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -69,130 +91,112 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:3000]: " input_port
-    PORT=${input_port:-3000}
-    check_port "$PORT" || return
+    read -p "请输入面板端口 [默认:2095]: " input_panel_port
+    PANEL_PORT=${input_panel_port:-2095}
 
-    UUID_FILE="$APP_DIR/uuid"
+    check_port "$PANEL_PORT" || return
 
-    if [ -f "$UUID_FILE" ]; then
-        UUID=$(cat "$UUID_FILE")
-    else
-        UUID=$(cat /proc/sys/kernel/random/uuid)
-        echo "$UUID" > "$UUID_FILE"
-    fi
+    read -p "请输入订阅端口 [默认:2096]: " input_node_port
+    NODE_PORT=${input_node_port:-2096}
 
-    # 只在不存在时创建 config
-    if [ ! -f "$APP_DIR/data/config.toml" ]; then
-        cat > "$APP_DIR/data/config.toml" <<EOF
-[server]
-port = ${PORT}
-
-[log]
-level = "info"
-EOF
-    fi
+    check_port "$NODE_PORT" || return
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  nodeget:
-    image: genshinmc/nodeget:latest
-    container_name: nodeget
-    restart: unless-stopped
-    environment:
-      NODEGET_CONFIG_FROM_ENV: "true"
-      NODEGET_PORT: "${PORT}"
-      NODEGET_SERVER_UUID: "${UUID}"
-      NODEGET_LOG_FILTER: "info"
-      NODEGET_DATABASE_URL: "sqlite:///var/lib/nodeget/nodeget.db?mode=rwc"
-    ports:
-      - "127.0.0.1:${PORT}:${PORT}"
+  s-ui:
+    image: alireza7/s-ui
+    container_name: s-ui
+    hostname: "s-ui"
+
     volumes:
-      - ./data/config:/etc/nodeget
-      - ./data/sqlite:/var/lib/nodeget
+      - "./db:/app/db"
+      - "./cert:/app/cert"
+
+    tty: true
+
+    restart: unless-stopped
+
+    ports:
+      - "${PANEL_PORT}:2095"
+      - "${NODE_PORT}:2096"
+
+    networks:
+      - s-ui
+
+    entrypoint: "./entrypoint.sh"
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  s-ui:
+    driver: bridge
 EOF
 
     cd "$APP_DIR" || exit
+
     docker compose up -d
 
-    echo -e "${YELLOW}⏳ 等待系统初始化（获取 Token）...${RESET}"
-
-    # 循环等待日志出现
-    for i in {1..15}; do
-        LOGS=$(docker logs nodeget 2>&1)
-
-        SUPERTOKEN=$(echo "$LOGS" | grep "Super Token:" | awk -F'Super Token: ' '{print $2}')
-        ROOTPASS=$(echo "$LOGS" | grep "Root Password:" | awk -F'Root Password: ' '{print $2}')
-
-        if [[ -n "$SUPERTOKEN" && -n "$ROOTPASS" ]]; then
-            break
-        fi
-
-        sleep 2
-    done
+    SERVER_IP=$(get_public_ip)
 
     echo
-    echo -e "${GREEN}✅ nodeget 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🆔 UUID: ${UUID}${RESET}"
-    echo -e "${YELLOW}🌐 主控地址: wss://127.0.0.1:${PORT}${RESET}"
-
-    if [[ -n "$SUPERTOKEN" ]]; then
-        echo -e "${GREEN}🔑 SuperToken:${RESET} ${SUPERTOKEN}"
-    else
-        echo -e "${RED}❌ 未获取到 SuperToken（可查看日志）${RESET}"
-    fi
-
-    if [[ -n "$ROOTPASS" ]]; then
-        echo -e "${GREEN}🔐 Root密码:${RESET} ${ROOTPASS}"
-    else
-        echo -e "${RED}❌ 未获取到 Root密码${RESET}"
-    fi
-
-    cat > "$APP_DIR/token.txt" <<EOF
-访问地址: http://127.0.0.1:${PORT}
-UUID: ${UUID}
-
-SuperToken:
-${SUPERTOKEN}
-
-RootPassword:
-${ROOTPASS}
-EOF
-
-    echo -e "${GREEN}📄 已保存到: $APP_DIR/token.txt${RESET}"
+    echo -e "${GREEN}✅ S-UI 已启动${RESET}"
+    echo -e "${YELLOW}🌐 面板地址: http://${SERVER_IP}:${PANEL_PORT}/app/${RESET}"
+    echo -e "${YELLOW}🔌 节点端口: ${NODE_PORT}${RESET}"
+    echo -e "${YELLOW}📂 数据目录: $APP_DIR/db${RESET}"
+    echo -e "${YELLOW}🔐 证书目录: $APP_DIR/cert${RESET}"
+    echo -e "${YELLOW}🔒 面板证书设置: /app/cert/cert.crt${RESET}"
+    echo -e "${YELLOW}📂 面板证书设置: /app/cert/private.key${RESET}"
 
     read -p "按回车返回菜单..."
 }
 
 update_app() {
+
     cd "$APP_DIR" || return
+
     docker compose pull
     docker compose up -d
+
     echo -e "${GREEN}✅ 更新完成${RESET}"
+
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart nodeget
+
+    docker restart s-ui
+
     echo -e "${GREEN}✅ 已重启${RESET}"
+
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f nodeget
+
+    docker logs -f s-ui
 }
 
 check_status() {
-    docker ps | grep nodeget
+
+    docker ps | grep s-ui
+
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
+
     cd "$APP_DIR" || return
+
     docker compose down -v
+
     rm -rf "$APP_DIR"
+
     echo -e "${RED}✅ 已彻底卸载${RESET}"
+
     read -p "按回车返回菜单..."
 }
 

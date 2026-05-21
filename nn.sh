@@ -1,8 +1,8 @@
 #!/bin/bash
-
-# =========================================
-# S-UI
-# =========================================
+# ========================================
+# IPQuality Proxy 临时检测脚本
+# 每次输入节点 → 自动测试 → 自动删除容器
+# ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
@@ -10,168 +10,101 @@ RED="\033[31m"
 BLUE="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="s-ui"
-IMAGE_NAME="alireza7/s-ui:latest"
+IMAGE="registry.gitlab.com/mr-potato/ipquality-proxy:latest"
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
+# ========================================
+# 检测 Docker
+# ========================================
+
+check_docker() {
+
+    if ! command -v docker &>/dev/null; then
+
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+
+        curl -fsSL https://get.docker.com | bash
+
+        systemctl enable docker
+        systemctl start docker
+    fi
 }
 
-install_docker() {
-    if command -v docker >/dev/null 2>&1; then
-        echo -e "${GREEN}[✓] Docker 已安装${RESET}"
+# ========================================
+# 拉取镜像
+# ========================================
+
+pull_image() {
+
+    echo -e "${GREEN}正在更新镜像...${RESET}"
+
+    docker pull "$IMAGE"
+}
+
+# ========================================
+# 开始检测
+# ========================================
+
+run_test() {
+
+    clear
+
+    echo -e "${GREEN}=== 订阅节点检测 ===${RESET}"
+    echo
+    echo -e "${YELLOW}支持协议:${RESET}"
+    echo -e "VLESS / VMess / Trojan / SS / SOCKS / WireGuard / Hysteria2"
+    echo
+
+    read -p "请输入节点链接: " PROXY_URL
+
+    if [ -z "$PROXY_URL" ]; then
+
+        echo -e "${RED}节点不能为空${RESET}"
+        sleep 2
         return
     fi
 
-    echo -e "${YELLOW}[+] 正在安装 Docker...${RESET}"
-    curl -fsSL https://get.docker.com | bash
+    echo
+    echo -e "${GREEN}开始检测，请稍候...${RESET}"
+    echo
 
-    systemctl enable docker
-    systemctl start docker
-
-    echo -e "${GREEN}[✓] Docker 安装完成${RESET}"
-}
-
-install_sui() {
-    echo -e "${YELLOW}[+] 创建目录...${RESET}"
-
-    mkdir -p /etc/s-ui
-    mkdir -p /usr/local/s-ui
-
-    echo -e "${YELLOW}[+] 拉取镜像...${RESET}"
-    docker pull ${IMAGE_NAME}
-
-    echo -e "${YELLOW}[+] 删除旧容器...${RESET}"
-    docker rm -f ${CONTAINER_NAME} >/dev/null 2>&1
-
-    echo -e "${YELLOW}[+] 启动 S-UI...${RESET}"
-
-    docker run -d \
-      --name ${CONTAINER_NAME} \
-      --restart unless-stopped \
-      --network host \
-      -e TZ=Asia/Tokyo \
-      -v /etc/s-ui:/etc/s-ui \
-      -v /usr/local/s-ui:/usr/local/s-ui \
-      ${IMAGE_NAME}
-
-    echo -e "${GREEN}[✓] S-UI 安装完成${RESET}"
-
-    SERVER_IP=$(get_public_ip)
+    docker run --rm -it \
+        --name ipquality-proxy-test \
+        --network host \
+        -e PROXY_URL="$PROXY_URL" \
+        "$IMAGE" -f
 
     echo
-    echo -e "${GREEN}✅ S-UI 已启动${RESET}"
-    echo -e "${YELLOW}🌐 面板地址: http://${SERVER_IP}:2095/app/${RESET}"
-    echo -e "${YELLOW}🔌 订阅地址: http://${SERVER_IP}:2096${RESET}"
+    echo -e "${GREEN}检测结束，已自动删除${RESET}"
+    echo
+
+    read -p "按回车继续..."
 }
 
-start_sui() {
-    docker start ${CONTAINER_NAME}
-    echo -e "${GREEN}[✓] S-UI 已启动${RESET}"
-}
-
-stop_sui() {
-    docker stop ${CONTAINER_NAME}
-    echo -e "${YELLOW}[✓] S-UI 已停止${RESET}"
-}
-
-restart_sui() {
-    docker restart ${CONTAINER_NAME}
-    echo -e "${GREEN}[✓] S-UI 已重启${RESET}"
-}
-
-status_sui() {
-    docker ps -a | grep ${CONTAINER_NAME}
-}
-
-logs_sui() {
-    docker logs -f ${CONTAINER_NAME}
-}
-
-update_sui() {
-    echo -e "${YELLOW}[+] 更新镜像...${RESET}"
-
-    docker pull ${IMAGE_NAME}
-
-    docker rm -f ${CONTAINER_NAME}
-
-    docker run -d \
-      --name ${CONTAINER_NAME} \
-      --restart unless-stopped \
-      --network host \
-      -e TZ=Asia/Tokyo \
-      -v /etc/s-ui:/etc/s-ui \
-      -v /usr/local/s-ui:/usr/local/s-ui \
-      ${IMAGE_NAME}
-
-    echo -e "${GREEN}[✓] 更新完成${RESET}"
-}
-
-uninstall_sui() {
-    read -p "确认卸载 S-UI？(y/n): " confirm
-
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        docker rm -f ${CONTAINER_NAME}
-
-        echo -e "${GREEN}[✓] 已卸载 S-UI${RESET}"
-    fi
-}
-
+# ========================================
+# 主菜单
+# ========================================
 
 menu() {
-    clear
-    echo -e "${GREEN}==== S-UI  管理菜单====${RESET}"
-    echo -e "${GREEN}1. 安装启动${RESET}"
-    echo -e "${GREEN}2. 重启${RESET}"
-    echo -e "${GREEN}3. 查看状态${RESET}"
-    echo -e "${GREEN}4. 查看日志${RESET}"
-    echo -e "${GREEN}5  更新${RESET}"
-    echo -e "${GREEN}6. 卸载${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}""
-    read -p "请输入选项: " num
 
-    case "$num" in
-        1)
-            install_docker
-            install_sui
-            ;;
-        2)
-            restart_sui
-            ;;
-        3)
-            status_sui
-            ;;
-        4)
-            logs_sui
-            ;;
-        5)
-            update_sui
-            ;;
-        6)
-            uninstall_sui
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            echo -e "${RED}[×] 无效选项${RESET}"
-            ;;
-    esac
+    check_docker
 
-    echo
-    read -p "按回车继续..."
-    menu
+    while true; do
+
+        clear
+
+        echo -e "${GREEN}=== 订阅节点检测菜单 ===${RESET}"
+        echo -e "${GREEN}1) 开始检测${RESET}"
+        echo -e "${GREEN}2) 更新检测${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) run_test ;;
+            2) pull_image ; read -p "按回车继续..." ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
+        esac
+    done
 }
 
 menu

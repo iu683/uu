@@ -1,228 +1,110 @@
 #!/bin/bash
 # ========================================
-# S-UI 一键管理脚本（Host 网络版）
+# IPQuality Proxy 临时检测脚本
+# 每次输入节点 → 自动测试 → 自动删除容器
 # ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
+BLUE="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="s-ui"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+IMAGE="registry.gitlab.com/mr-potato/ipquality-proxy:latest"
 
-check_root() {
-
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}请使用 root 权限运行${RESET}"
-        exit 1
-    fi
-}
+# ========================================
+# 检测 Docker
+# ========================================
 
 check_docker() {
 
     if ! command -v docker &>/dev/null; then
+
         echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+
         curl -fsSL https://get.docker.com | bash
-    fi
 
-    systemctl enable docker --now &>/dev/null
-
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2${RESET}"
-        exit 1
+        systemctl enable docker
+        systemctl start docker
     fi
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
+# ========================================
+# 拉取镜像
+# ========================================
+
+pull_image() {
+
+    echo -e "${GREEN}正在更新镜像...${RESET}"
+
+    docker pull "$IMAGE"
 }
 
+# ========================================
+# 开始检测
+# ========================================
+
+run_test() {
+
+    clear
+
+    echo -e "${GREEN}=== IPQuality Proxy 临时检测 ===${RESET}"
+    echo
+    echo -e "${YELLOW}支持协议:${RESET}"
+    echo -e "VLESS / VMess / Trojan / SS / SOCKS / WireGuard / Hysteria2"
+    echo
+
+    read -p "请输入节点链接: " PROXY_URL
+
+    if [ -z "$PROXY_URL" ]; then
+
+        echo -e "${RED}节点不能为空${RESET}"
+        sleep 2
+        return
+    fi
+
+    echo
+    echo -e "${GREEN}开始检测，请稍候...${RESET}"
+    echo
+
+    docker run --rm -it \
+        --name ipquality-proxy-test \
+        --network host \
+        -e PROXY_URL="$PROXY_URL" \
+        "$IMAGE" -f -p
+
+    echo
+    echo -e "${GREEN}检测结束，容器已自动删除${RESET}"
+    echo
+
+    read -p "按回车继续..."
+}
+
+# ========================================
+# 主菜单
+# ========================================
 
 menu() {
+
+    check_docker
 
     while true; do
 
         clear
-        echo -e "${GREEN}=== S-UI 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 停止${RESET}"
-        echo -e "${GREEN}5) 查看日志${RESET}"
-        echo -e "${GREEN}6) 查看状态${RESET}"
-        echo -e "${GREEN}7) 卸载(含数据)${RESET}"
+
+        echo -e "${GREEN}=== IPQuality Proxy 临时检测菜单 ===${RESET}"
+        echo -e "${GREEN}1) 开始检测${RESET}"
+        echo -e "${GREEN}2) 更新镜像${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
         case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) stop_app ;;
-            5) view_logs ;;
-            6) check_status ;;
-            7) uninstall_app ;;
+            1) run_test ;;
+            2) pull_image ; read -p "按回车继续..." ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
         esac
     done
-}
-
-install_app() {
-
-    check_root
-    check_docker
-
-    mkdir -p "$APP_DIR/db"
-    mkdir -p "$APP_DIR/cert"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read -r confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  s-ui:
-    stdin_open: true
-
-    tty: true
-
-    container_name: s-ui
-
-    restart: unless-stopped
-
-    network_mode: host
-
-    volumes:
-      - ./db:/app/db
-      - ./cert:/app/cert
-
-    image: alireza7/s-ui:latest
-
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-EOF
-
-    cd "$APP_DIR" || exit
-
-    docker compose pull
-    docker compose up -d
-
-    SERVER_IP=$(get_public_ip)
-
-
-    echo
-    echo -e "${GREEN}✅ S-UI 已启动${RESET}"
-    echo -e "${YELLOW}🌐 面板地址: http://${SERVER_IP}:2095/app/${RESET}"
-    echo -e "${YELLOW}🔌 订阅地址: http://${SERVER_IP}:2096${RESET}"
-    echo -e "${YELLOW}📂 数据目录: $APP_DIR/db${RESET}"
-    echo -e "${YELLOW}🔐 证书目录: $APP_DIR/cert${RESET}"
-    echo -e "${YELLOW}🔒 面板证书设置: /app/cert/cert.crt${RESET}"
-    echo -e "${YELLOW}📂 面板证书设置: /app/cert/private.key${RESET}"
-  
-
-    read -p "按回车返回菜单..."
-}
-
-update_app() {
-
-    if [ ! -f "$COMPOSE_FILE" ]; then
-        echo -e "${RED}未安装 S-UI${RESET}"
-        sleep 2
-        return
-    fi
-
-    cd "$APP_DIR" || return
-
-    docker compose pull
-    docker compose down
-    docker compose up -d
-
-    echo
-    echo -e "${GREEN}✅ 更新完成${RESET}"
-    echo
-
-    read -p "按回车返回菜单..."
-}
-
-restart_app() {
-
-    if ! docker ps -a | grep -q "s-ui"; then
-        echo -e "${RED}容器不存在${RESET}"
-        sleep 2
-        return
-    fi
-
-    docker restart s-ui
-
-    echo
-    echo -e "${GREEN}✅ 已重启${RESET}"
-    echo
-
-    read -p "按回车返回菜单..."
-}
-
-stop_app() {
-
-    cd "$APP_DIR" || return
-
-    docker compose down
-
-    echo
-    echo -e "${YELLOW}✅ 已停止${RESET}"
-    echo
-
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-
-    docker logs -f --tail=100 s-ui
-}
-
-check_status() {
-
-
-    docker ps -a | grep s-ui
-
-
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-
-    cd "$APP_DIR" || return
-
-    docker compose down -v
-
-    docker rm -f s-ui 2>/dev/null
-    docker rmi alireza7/s-ui:latest 2>/dev/null
-
-    rm -rf "$APP_DIR"
-
-    echo
-    echo -e "${RED}✅ 已彻底卸载${RESET}"
-    echo
-
-    read -p "按回车返回菜单..."
 }
 
 menu

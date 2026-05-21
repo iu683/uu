@@ -1,110 +1,71 @@
 #!/bin/bash
-# ========================================
-# IPQuality Proxy 临时检测脚本
-# 每次输入节点 → 自动测试 → 自动删除容器
-# ========================================
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
-BLUE="\033[36m"
 RESET="\033[0m"
 
-IMAGE="registry.gitlab.com/mr-potato/ipquality-proxy:latest"
+CHECK_URL="https://IP.Check.Place"
 
-# ========================================
-# 检测 Docker
-# ========================================
+run_check() {
+    mode=$1
+    name=$2
 
-check_docker() {
+    echo -e "${GREEN}正在执行：${name}...${RESET}"
 
-    if ! command -v docker &>/dev/null; then
+    case "$mode" in
+        socks5)
+            read -p "请输入 SOCKS5 (如 socks5://127.0.0.1:21080): " proxy
+            bash <(curl -Ls "$CHECK_URL") -x $proxy
+            ;;
+        http)
+            read -p "请输入 HTTP (如 http://127.0.0.1:21080): " proxy
+            bash <(curl -Ls "$CHECK_URL") -x $proxy
+            ;;
+        "")
+            bash <(curl -Ls "$CHECK_URL")
+            ;;
+        -4|-6)
+            bash <(curl -Ls "$CHECK_URL") "$mode"
+            ;;
+    esac
 
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-
-        curl -fsSL https://get.docker.com | bash
-
-        systemctl enable docker
-        systemctl start docker
-    fi
+    pause
 }
 
-# ========================================
-# 拉取镜像
-# ========================================
-
-pull_image() {
-
-    echo -e "${GREEN}正在更新镜像...${RESET}"
-
-    docker pull "$IMAGE"
+pause() {
+    read -p $'\033[32m按回车返回菜单...\033[0m'
+    menu
 }
-
-# ========================================
-# 开始检测
-# ========================================
-
-run_test() {
-
-    clear
-
-    echo -e "${GREEN}=== IPQuality Proxy 临时检测 ===${RESET}"
-    echo
-    echo -e "${YELLOW}支持协议:${RESET}"
-    echo -e "VLESS / VMess / Trojan / SS / SOCKS / WireGuard / Hysteria2"
-    echo
-
-    read -p "请输入节点链接: " PROXY_URL
-
-    if [ -z "$PROXY_URL" ]; then
-
-        echo -e "${RED}节点不能为空${RESET}"
-        sleep 2
-        return
-    fi
-
-    echo
-    echo -e "${GREEN}开始检测，请稍候...${RESET}"
-    echo
-
-    docker run --rm -it \
-        --name ipquality-proxy-test \
-        --network host \
-        -e PROXY_URL="$PROXY_URL" \
-        "$IMAGE" -f -p
-
-    echo
-    echo -e "${GREEN}检测结束，容器已自动删除${RESET}"
-    echo
-
-    read -p "按回车继续..."
-}
-
-# ========================================
-# 主菜单
-# ========================================
 
 menu() {
+    clear
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}        IP 质量体检工具        ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN} 1) 双栈检测${RESET}"
+    echo -e "${GREEN} 2) 仅 IPv4${RESET}"
+    echo -e "${GREEN} 3) 仅 IPv6${RESET}"
+    echo -e "${GREEN} 4) SOCKS5${RESET}"
+    echo -e "${GREEN} 5) HTTP${RESET}"
+    echo -e "${GREEN} 6) 节点检测${RESET}"
+    echo -e "${GREEN} 0) 退出${RESET}"
 
-    check_docker
+    read -p $'\033[32m 请选择: \033[0m' choice
 
-    while true; do
-
-        clear
-
-        echo -e "${GREEN}=== IPQuality Proxy 临时检测菜单 ===${RESET}"
-        echo -e "${GREEN}1) 开始检测${RESET}"
-        echo -e "${GREEN}2) 更新镜像${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) run_test ;;
-            2) pull_image ; read -p "按回车继续..." ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
-        esac
-    done
+    case $choice in
+        1) run_check "" "双栈检测" ;;
+        2) run_check -4 "IPv4 检测" ;;
+        3) run_check -6 "IPv6 检测" ;;
+        4) run_check socks5 "SOCKS5 代理检测" ;;
+        5) run_check http "HTTP 代理检测" ;;
+        6) bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/toy/ipqualitys.sh) ;;
+        0) exit 0 ;;
+        *)
+            echo -e "${RED}输入错误，请重新选择${RESET}"
+            sleep 1
+            menu
+            ;;
+    esac
 }
 
 menu

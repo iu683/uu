@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# TG-WatchBot 一键管理脚本
+# Rhex 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,8 +8,13 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="tg-watchbot"
+APP_NAME="Rhex"
 APP_DIR="/opt/$APP_NAME"
+
+generate_secret() {
+
+    openssl rand -hex 32
+}
 
 check_docker() {
 
@@ -24,13 +29,21 @@ check_docker() {
     fi
 }
 
+check_port() {
+
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
+
 menu() {
 
     while true; do
 
         clear
 
-        echo -e "${GREEN}=== TG-WatchBot 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Rhex 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -66,32 +79,59 @@ install_app() {
         rm -rf "$APP_DIR"
     fi
 
+
+    echo
+    read -p "管理员用户名 [默认:admin]: " input_admin_user
+    ADMIN_USER=${input_admin_user:-admin}
+
+    read -p "管理员密码 [默认:ChangeMe_123456]: " input_admin_pass
+    ADMIN_PASS=${input_admin_pass:-ChangeMe_123456}
+
+    read -p "管理员邮箱 [默认:admin@rhex.im]: " input_admin_email
+    ADMIN_EMAIL=${input_admin_email:-admin@rhex.im}
+
+    read -p "管理员昵称 [默认:秦始皇]: " input_admin_nick
+    ADMIN_NICK=${input_admin_nick:-秦始皇}
+
+    SESSION_SECRET=$(generate_secret)
+    CAPTCHA_SECRET_KEY=$(generate_secret)
+
     cd /opt || exit
 
-    git clone https://github.com/GongyiChuren/tg-watchbot.git "$APP_NAME"
+    git clone https://github.com/GongyiChuren/Rhex.git
 
     cd "$APP_DIR" || exit
 
     cp .env.example .env
 
-    cp config.example.yaml config.yaml
+    sed -i "s#^DATABASE_URL=.*#DATABASE_URL=\"postgresql://postgres:postgres@postgres:5432/bbs?schema=public\"#g" .env
 
-    touch tg-watchbot.sqlite3
-    touch tg-watchbot.log
+    sed -i "s#^REDIS_URL=.*#REDIS_URL=\"redis://redis:6379\"#g" .env
 
-    docker compose up -d --build
+    sed -i "s#^SESSION_SECRET=.*#SESSION_SECRET=\"${SESSION_SECRET}\"#g" .env
+
+    sed -i "s#^CAPTCHA_SECRET_KEY=.*#CAPTCHA_SECRET_KEY=\"${CAPTCHA_SECRET_KEY}\"#g" .env
+
+    sed -i "s#^SEED_ADMIN_USERNAME=.*#SEED_ADMIN_USERNAME=\"${ADMIN_USER}\"#g" .env
+
+    sed -i "s#^SEED_ADMIN_PASSWORD=.*#SEED_ADMIN_PASSWORD=\"${ADMIN_PASS}\"#g" .env
+
+    sed -i "s#^SEED_ADMIN_EMAIL=.*#SEED_ADMIN_EMAIL=\"${ADMIN_EMAIL}\"#g" .env
+
+    sed -i "s#^SEED_ADMIN_NICKNAME=.*#SEED_ADMIN_NICKNAME=\"${ADMIN_NICK}\"#g" .env
+
+    sed -i "s#^TZ=.*#TZ=\"Asia/Shanghai\"#g" .env
+
+
+    docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ TG-WatchBot 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:8765${RESET}"
+    echo -e "${GREEN}✅ Rhex 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:3000${RESET}"
+    echo -e "${YELLOW}👤 管理员: ${ADMIN_USER}${RESET}"
+    echo -e "${YELLOW}🔑 管理密码: ${ADMIN_PASS}${RESET}"
+    echo -e "${YELLOW}📧 管理邮箱: ${ADMIN_EMAIL}${RESET}"
     echo -e "${YELLOW}📂 安装目录: $APP_DIR${RESET}"
-    echo -e "${YELLOW}⚙️ 配置文件: $APP_DIR/config.yaml${RESET}"
-    echo -e "${YELLOW}🔐 环境文件: $APP_DIR/.env${RESET}"
-
-    echo
-    echo -e "${GREEN}建议先编辑配置后重启:${RESET}"
-    echo -e "nano $APP_DIR/.env"
-    echo -e "nano $APP_DIR/config.yaml"
 
     read -p "按回车返回菜单..."
 }
@@ -102,7 +142,9 @@ update_app() {
 
     git pull
 
-    docker compose up -d --build
+    docker compose pull
+
+    docker compose up -d
 
     echo -e "${GREEN}✅ 更新完成${RESET}"
 

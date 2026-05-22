@@ -1,92 +1,257 @@
 #!/bin/bash
 # ========================================
-# Rhex 备份恢复脚本
+# DeepSeek 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
+RED="\033[31m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-APP_DIR="/opt/Rhex"
-BACKUP_DIR="/opt/Rhexbackups"
+ARCH=""
 
-mkdir -p "$BACKUP_DIR"
-
-cd "$APP_DIR" || exit 1
-
-backup() {
-    echo -e "${GREEN}开始数据库备份...${RESET}"
-
-    docker compose --profile backup run --rm postgres-backup
-
-    echo -e "${GREEN}开始文件备份...${RESET}"
-
-    FILE_NAME="rhex-files-$(date +%Y%m%d-%H%M%S).tar.gz"
-
-    tar -czf "$BACKUP_DIR/$FILE_NAME" \
-        uploads \
-        addons \
-        .env \
-        docker-compose.yml
-
-    echo
-    echo -e "${GREEN}备份完成${RESET}"
-    echo -e "${GREEN}文件:${RESET} $BACKUP_DIR/$FILE_NAME"
+# ========================================
+# 检查 root
+# ========================================
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}请使用 root 用户运行${RESET}"
+        exit 1
+    fi
 }
 
-restore() {
-    echo -e "${GREEN}可用备份:${RESET}"
-    echo
+# ========================================
+# 安装依赖
+# ========================================
+install_deps() {
 
-    ls "$BACKUP_DIR"
+    if command -v apt &>/dev/null; then
+        apt update -y
+        apt install -y curl wget ca-certificates
+    elif command -v yum &>/dev/null; then
+        yum install -y curl wget ca-certificates
+    fi
+}
 
-    echo
-    read -rp "请输入要恢复的文件备份名: " FILE
+# ========================================
+# 检测架构
+# ========================================
+detect_arch() {
 
-    if [ ! -f "$BACKUP_DIR/$FILE" ]; then
-        echo -e "${RED}备份文件不存在${RESET}"
+    case "$(uname -m)" in
+        x86_64|amd64)
+            ARCH="x64"
+            ;;
+        aarch64|arm64)
+            ARCH="arm64"
+            ;;
+        *)
+            echo -e "${RED}不支持的架构: $(uname -m)${RESET}"
+            exit 1
+            ;;
+    esac
+}
+
+# ========================================
+# 检测是否安装
+# ========================================
+is_installed() {
+    command -v deepseek &>/dev/null
+}
+
+# ========================================
+# 安装
+# ========================================
+install_app() {
+
+    install_deps
+    detect_arch
+
+    if is_installed; then
+        echo -e "${YELLOW}DeepSeek 已安装${RESET}"
+        deepseek --version
         return
     fi
 
-    echo
-    read -rp "确认恢复？会覆盖现有文件！(y/N): " CONFIRM
+    cd /tmp || exit
 
-    if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
-        echo -e "${YELLOW}已取消${RESET}"
+    FILE_NAME="deepseek-linux-${ARCH}"
+
+    echo -e "${GREEN}正在下载 DeepSeek...${RESET}"
+
+    curl -fsSL -o "${FILE_NAME}" \
+        "https://github.com/Hmbown/deepseek-tui/releases/latest/download/${FILE_NAME}"
+
+    if [[ ! -f "${FILE_NAME}" ]]; then
+        echo -e "${RED}下载失败${RESET}"
         return
     fi
 
-    echo -e "${GREEN}恢复文件中...${RESET}"
+    chmod +x "${FILE_NAME}"
 
-    tar -xzf "$BACKUP_DIR/$FILE" -C "$APP_DIR"
+    echo -e "${GREEN}正在下载 SHA256 文件...${RESET}"
 
-    echo -e "${GREEN}恢复完成${RESET}"
+    curl -fsSL -O \
+        https://github.com/Hmbown/deepseek-tui/releases/latest/download/deepseek-artifacts-sha256.txt
+
+    echo -e "${GREEN}开始校验 SHA256...${RESET}"
+
+    sha256sum -c deepseek-artifacts-sha256.txt --ignore-missing
+
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}SHA256 校验失败${RESET}"
+        rm -f "${FILE_NAME}"
+        return
+    fi
+
+    mv "${FILE_NAME}" /usr/local/bin/deepseek
+
+    chmod +x /usr/local/bin/deepseek
+
+    echo -e "${GREEN}安装成功${RESET}"
+
+    deepseek --version
+}
+# ========================================
+# 卸载
+# ========================================
+uninstall_app() {
+
+    if ! is_installed; then
+        echo -e "${YELLOW}DeepSeek 未安装${RESET}"
+        return
+    fi
+
+    echo -e "${RED}正在卸载 DeepSeek...${RESET}"
+
+    rm -f /usr/local/bin/deepseek
+
+    echo -e "${GREEN}卸载完成${RESET}"
 }
 
-while true; do
+# ========================================
+# 更新
+# ========================================
+update_app() {
+
+    echo -e "${GREEN}正在更新 DeepSeek...${RESET}"
+
+    deepseek update
+}
+
+# ========================================
+# 启动
+# ========================================
+start_app() {
+
+    if ! is_installed; then
+        echo -e "${RED}请先安装 DeepSeek${RESET}"
+        return
+    fi
+
+    deepseek
+}
+
+# ========================================
+# 配置 API
+# ========================================
+set_auth() {
+
+    if ! is_installed; then
+        echo -e "${RED}请先安装 DeepSeek${RESET}"
+        return
+    fi
+
+    deepseek auth set --provider deepseek
+}
+
+# ========================================
+# Doctor
+# ========================================
+doctor_app() {
+
+    if ! is_installed; then
+        echo -e "${RED}请先安装 DeepSeek${RESET}"
+        return
+    fi
+
+    deepseek doctor
+}
+
+# ========================================
+# 查看版本
+# ========================================
+show_version() {
+
+    if is_installed; then
+        deepseek --version
+    else
+        echo -e "${YELLOW}未安装${RESET}"
+    fi
+}
+
+# ========================================
+# 菜单
+# ========================================
+menu() {
+
     clear
-    echo -e "${GREEN}==== Rhex 备份恢复管理====${RESET}"
-    echo -e "${GREEN}1. 备份${RESET}"
-    echo -e "${GREEN}2. 恢复${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    read -rp "$(echo -e "${GREEN}请输入选项: ${RESET}")" CHOICE
 
-    case $CHOICE in
+    echo -e "${GREEN}==================================${RESET}"
+    echo -e "${GREEN}      DeepSeek-TUI 管理菜单${RESET}"
+    echo -e "${GREEN}==================================${RESET}"
+    echo -e "${GREEN}1. 安装 DeepSeek-TUI${RESET}"
+    echo -e "${GREEN}2. 卸载 DeepSeek-TUI${RESET}"
+    echo -e "${GREEN}3. 更新 DeepSeek-TUI${RESET}"
+    echo -e "${GREEN}4. 启动 DeepSeek TUI${RESET}"
+    echo -e "${GREEN}5. 配置 API Key${RESET}"
+    echo -e "${GREEN}6. Doctor 检查${RESET}"
+    echo -e "${GREEN}7. 查看版本${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read CHOICE
+
+    case "$CHOICE" in
         1)
-            backup
-            read -rp "按回车继续..."
+            install_app
             ;;
         2)
-            restore
-            read -rp "按回车继续..."
+            uninstall_app
+            ;;
+        3)
+            update_app
+            ;;
+        4)
+            start_app
+            ;;
+        5)
+            set_auth
+            ;;
+        6)
+            doctor_app
+            ;;
+        7)
+            show_version
             ;;
         0)
             exit 0
             ;;
         *)
             echo -e "${RED}无效选项${RESET}"
-            sleep 1
             ;;
     esac
+
+    echo
+    read -n 1 -s -r -p "按任意键返回菜单..."
+}
+
+# ========================================
+# 主程序
+# ========================================
+check_root
+
+while true; do
+    menu
 done

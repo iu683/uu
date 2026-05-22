@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# CPA Usage Keeper 一键管理脚本
+# Dockup 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,9 +8,10 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="cpa-usage-keeper"
+APP_NAME="dockup"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+ENV_FILE="$APP_DIR/.env"
 
 check_docker() {
 
@@ -25,21 +26,13 @@ check_docker() {
     fi
 }
 
-check_port() {
-
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
-
 menu() {
 
     while true; do
 
         clear
 
-        echo -e "${GREEN}=== CPA Usage Keeper 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Dockup 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -67,7 +60,7 @@ install_app() {
 
     check_docker
 
-    mkdir -p "$APP_DIR/keeper"
+    mkdir -p "$APP_DIR"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -75,41 +68,51 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入 Web 端口 [默认:8080]: " input_port
-    PORT=${input_port:-8080}
-
-    check_port "$PORT" || return
+    echo
+    read -p "请输入 Telegram Bot Token: " TG_BOT_TOKEN
+    read -p "请输入 Telegram Chat ID: " TG_CHAT_ID
 
     echo
-    read -p "请输入 CPA_BASE_URL [默认:http://cli-proxy-api:8317]: " input_base_url
-    CPA_BASE_URL=${input_base_url:-http://cli-proxy-api:8317}
+    read -p "请输入检查间隔 [默认:12h]: " input_interval
+    CHECK_INTERVAL=${input_interval:-12h}
 
-    read -p "请输入 CPA_MANAGEMENT_KEY: " CPA_MANAGEMENT_KEY
+    read -p "是否自动清理旧镜像? (true/false) [默认:true]: " input_cleanup
+    CLEANUP=${input_cleanup:-true}
 
-    read -p "请输入登录密码 LOGIN_PASSWORD: " LOGIN_PASSWORD
+    read -p "首次启动发送测试消息? (true/false) [默认:true]: " input_test
+    SETUP_TEST_MESSAGE=${input_test:-true}
+
+    cat > "$ENV_FILE" <<EOF
+TZ=Asia/Shanghai
+TG_BOT_TOKEN=${TG_BOT_TOKEN}
+TG_CHAT_ID=${TG_CHAT_ID}
+CHECK_INTERVAL=${CHECK_INTERVAL}
+CLEANUP=${CLEANUP}
+SETUP_TEST_MESSAGE=${SETUP_TEST_MESSAGE}
+EOF
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  cpa-usage-keeper:
-    image: ghcr.io/willxup/cpa-usage-keeper:latest
+  dockup:
+    image: ghcr.io/shuijiao1/dockup:latest
 
-    container_name: cpa-usage-keeper
+    container_name: dockup
 
     restart: unless-stopped
 
-    ports:
-      - "127.0.0.1:${PORT}:8080"
-
     environment:
-      TZ: Asia/Shanghai
-      CPA_BASE_URL: ${CPA_BASE_URL}
-      CPA_MANAGEMENT_KEY: ${CPA_MANAGEMENT_KEY}
-      REDIS_QUEUE_ADDR: cli-proxy-api:8317
-      AUTH_ENABLED: true
-      LOGIN_PASSWORD: ${LOGIN_PASSWORD}
+      TZ: \${TZ:-Asia/Shanghai}
+      TG_BOT_TOKEN: \${TG_BOT_TOKEN}
+      TG_CHAT_ID: \${TG_CHAT_ID}
+      CHECK_INTERVAL: \${CHECK_INTERVAL:-12h}
+      CLEANUP: \${CLEANUP:-true}
+      SETUP_TEST_MESSAGE: \${SETUP_TEST_MESSAGE:-true}
 
     volumes:
-      - ./keeper:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    env_file:
+      - .env
 
     logging:
       driver: "json-file"
@@ -123,10 +126,11 @@ EOF
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ CPA Usage Keeper 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址:${RESET} http://127.0.0.1:${PORT}"
-    echo -e "${YELLOW}🔗 CPA API:${RESET} ${CPA_BASE_URL}"
-    echo -e "${YELLOW}📂 数据目录:${RESET} $APP_DIR/keeper"
+    echo -e "${GREEN}✅ Dockup 已启动${RESET}"
+    echo -e "${YELLOW}📨 TG Chat ID: ${TG_CHAT_ID}${RESET}"
+    echo -e "${YELLOW}⏱️ 检查间隔: ${CHECK_INTERVAL}${RESET}"
+    echo -e "${YELLOW}🧹 自动清理: ${CLEANUP}${RESET}"
+    echo -e "${YELLOW}📂 安装目录: $APP_DIR${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -146,7 +150,7 @@ update_app() {
 
 restart_app() {
 
-    docker restart cpa-usage-keeper
+    docker restart dockup
 
     echo -e "${GREEN}✅ 已重启${RESET}"
 
@@ -155,12 +159,12 @@ restart_app() {
 
 view_logs() {
 
-    docker logs -f cpa-usage-keeper
+    docker logs -f dockup
 }
 
 check_status() {
 
-    docker ps | grep cpa-usage-keeper
+    docker ps | grep dockup
 
     read -p "按回车返回菜单..."
 }

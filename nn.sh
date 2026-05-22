@@ -1,194 +1,254 @@
 #!/bin/bash
 # ========================================
-# Rhex 一键管理脚本
+# DeepSeek 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="Rhex"
-APP_DIR="/opt/$APP_NAME"
+ARCH=""
 
-generate_secret() {
-
-    openssl rand -hex 32
-}
-
-check_docker() {
-
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+# ========================================
+# 检查 root
+# ========================================
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}请使用 root 用户运行${RESET}"
         exit 1
     fi
 }
 
-check_port() {
+# ========================================
+# 安装依赖
+# ========================================
+install_deps() {
 
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
+    if command -v apt &>/dev/null; then
+        apt update -y
+        apt install -y curl wget ca-certificates
+    elif command -v yum &>/dev/null; then
+        yum install -y curl wget ca-certificates
     fi
 }
 
-menu() {
+# ========================================
+# 检测架构
+# ========================================
+detect_arch() {
 
-    while true; do
-
-        clear
-
-        echo -e "${GREEN}=== Rhex 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
-        esac
-    done
+    case "$(uname -m)" in
+        x86_64|amd64)
+            ARCH="x64"
+            ;;
+        aarch64|arm64)
+            ARCH="arm64"
+            ;;
+        *)
+            echo -e "${RED}不支持的架构: $(uname -m)${RESET}"
+            exit 1
+            ;;
+    esac
 }
 
+# ========================================
+# 检测是否安装
+# ========================================
+is_installed() {
+    command -v deepseek &>/dev/null
+}
+
+# ========================================
+# 安装
+# ========================================
 install_app() {
 
-    check_docker
+    install_deps
+    detect_arch
 
-    if [ -d "$APP_DIR" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-
-        rm -rf "$APP_DIR"
+    if is_installed; then
+        echo -e "${YELLOW}DeepSeek 已安装${RESET}"
+        deepseek --version
+        return
     fi
 
+    echo -e "${GREEN}正在下载 DeepSeek...${RESET}"
 
-    echo
-    read -p "管理员用户名 [默认:admin]: " input_admin_user
-    ADMIN_USER=${input_admin_user:-admin}
+    cd /tmp || exit
 
-    read -p "管理员密码 [默认:ChangeMe_123456]: " input_admin_pass
-    ADMIN_PASS=${input_admin_pass:-ChangeMe_123456}
+    curl -fsSL -o deepseek \
+        "https://github.com/Hmbown/deepseek-tui/releases/latest/download/deepseek-linux-${ARCH}"
 
-    read -p "管理员邮箱 [默认:admin@rhex.im]: " input_admin_email
-    ADMIN_EMAIL=${input_admin_email:-admin@rhex.im}
+    if [[ ! -f deepseek ]]; then
+        echo -e "${RED}下载失败${RESET}"
+        return
+    fi
 
-    read -p "管理员昵称 [默认:秦始皇]: " input_admin_nick
-    ADMIN_NICK=${input_admin_nick:-秦始皇}
+    chmod +x deepseek
 
-    SESSION_SECRET=$(generate_secret)
-    CAPTCHA_SECRET_KEY=$(generate_secret)
+    echo -e "${GREEN}正在下载 SHA256 文件...${RESET}"
 
-    cd /opt || exit
+    curl -fsSL -O \
+        https://github.com/Hmbown/deepseek-tui/releases/latest/download/deepseek-artifacts-sha256.txt
 
-    git clone https://github.com/lovedevpanda/Rhex.git
+    echo -e "${GREEN}开始校验 SHA256...${RESET}"
 
-    cd "$APP_DIR" || exit
+    sha256sum -c deepseek-artifacts-sha256.txt --ignore-missing
 
-    cp .env.example .env
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}SHA256 校验失败${RESET}"
+        rm -f deepseek
+        return
+    fi
 
-    sed -i "s#^DATABASE_URL=.*#DATABASE_URL=\"postgresql://postgres:postgres@postgres:5432/bbs?schema=public\"#g" .env
+    mv deepseek /usr/local/bin/
 
-    sed -i "s#^REDIS_URL=.*#REDIS_URL=\"redis://redis:6379\"#g" .env
+    echo -e "${GREEN}安装完成${RESET}"
 
-    sed -i "s#^SESSION_SECRET=.*#SESSION_SECRET=\"${SESSION_SECRET}\"#g" .env
-
-    sed -i "s#^CAPTCHA_SECRET_KEY=.*#CAPTCHA_SECRET_KEY=\"${CAPTCHA_SECRET_KEY}\"#g" .env
-
-    sed -i "s#^SEED_ADMIN_USERNAME=.*#SEED_ADMIN_USERNAME=\"${ADMIN_USER}\"#g" .env
-
-    sed -i "s#^SEED_ADMIN_PASSWORD=.*#SEED_ADMIN_PASSWORD=\"${ADMIN_PASS}\"#g" .env
-
-    sed -i "s#^SEED_ADMIN_EMAIL=.*#SEED_ADMIN_EMAIL=\"${ADMIN_EMAIL}\"#g" .env
-
-    sed -i "s#^SEED_ADMIN_NICKNAME=.*#SEED_ADMIN_NICKNAME=\"${ADMIN_NICK}\"#g" .env
-
-    sed -i "s#^TZ=.*#TZ=\"Asia/Shanghai\"#g" .env
-
-
-    docker compose up -d
-
-    echo
-    echo -e "${GREEN}✅ Rhex 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:3000${RESET}"
-    echo -e "${YELLOW}👤 管理员: ${ADMIN_USER}${RESET}"
-    echo -e "${YELLOW}🔑 管理密码: ${ADMIN_PASS}${RESET}"
-    echo -e "${YELLOW}📧 管理邮箱: ${ADMIN_EMAIL}${RESET}"
-    echo -e "${YELLOW}📂 安装目录: $APP_DIR${RESET}"
-
-    read -p "按回车返回菜单..."
+    deepseek --version
 }
 
-update_app() {
-
-    cd "$APP_DIR" || return
-
-    git pull
-
-    docker compose pull
-
-    docker compose up -d
-
-    echo -e "${GREEN}✅ 更新完成${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-restart_app() {
-
-    cd "$APP_DIR" || return
-
-    docker compose restart
-
-    echo -e "${GREEN}✅ 已重启${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-
-    cd "$APP_DIR" || return
-
-    docker compose logs -f
-}
-
-check_status() {
-
-    cd "$APP_DIR" || return
-
-    docker compose ps
-
-    read -p "按回车返回菜单..."
-}
-
+# ========================================
+# 卸载
+# ========================================
 uninstall_app() {
 
-    cd "$APP_DIR" || return
+    if ! is_installed; then
+        echo -e "${YELLOW}DeepSeek 未安装${RESET}"
+        return
+    fi
 
-    docker compose down -v
+    echo -e "${RED}正在卸载 DeepSeek...${RESET}"
 
-    rm -rf "$APP_DIR"
+    rm -f /usr/local/bin/deepseek
 
-    echo -e "${RED}✅ 已彻底卸载${RESET}"
-
-    read -p "按回车返回菜单..."
+    echo -e "${GREEN}卸载完成${RESET}"
 }
 
-menu
+# ========================================
+# 更新
+# ========================================
+update_app() {
+
+    echo -e "${GREEN}正在更新 DeepSeek...${RESET}"
+
+    deepseek update
+}
+
+# ========================================
+# 启动
+# ========================================
+start_app() {
+
+    if ! is_installed; then
+        echo -e "${RED}请先安装 DeepSeek${RESET}"
+        return
+    fi
+
+    deepseek
+}
+
+# ========================================
+# 配置 API
+# ========================================
+set_auth() {
+
+    if ! is_installed; then
+        echo -e "${RED}请先安装 DeepSeek${RESET}"
+        return
+    fi
+
+    deepseek auth set --provider deepseek
+}
+
+# ========================================
+# Doctor
+# ========================================
+doctor_app() {
+
+    if ! is_installed; then
+        echo -e "${RED}请先安装 DeepSeek${RESET}"
+        return
+    fi
+
+    deepseek doctor
+}
+
+# ========================================
+# 查看版本
+# ========================================
+show_version() {
+
+    if is_installed; then
+        deepseek --version
+    else
+        echo -e "${YELLOW}未安装${RESET}"
+    fi
+}
+
+# ========================================
+# 菜单
+# ========================================
+menu() {
+
+    clear
+
+    echo -e "${GREEN}==================================${RESET}"
+    echo -e "${GREEN}      DeepSeek-TUI 管理菜单${RESET}"
+    echo -e "${GREEN}==================================${RESET}"
+    echo -e "${GREEN}1. 安装 DeepSeek-TUI${RESET}"
+    echo -e "${GREEN}2. 卸载 DeepSeek-TUI${RESET}"
+    echo -e "${GREEN}3. 更新 DeepSeek-TUI${RESET}"
+    echo -e "${GREEN}4. 启动 DeepSeek TUI${RESET}"
+    echo -e "${GREEN}5. 配置 API Key${RESET}"
+    echo -e "${GREEN}6. Doctor 检查${RESET}"
+    echo -e "${GREEN}7. 查看版本${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read CHOICE
+
+    case "$CHOICE" in
+        1)
+            install_app
+            ;;
+        2)
+            uninstall_app
+            ;;
+        3)
+            update_app
+            ;;
+        4)
+            start_app
+            ;;
+        5)
+            set_auth
+            ;;
+        6)
+            doctor_app
+            ;;
+        7)
+            show_version
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}无效选项${RESET}"
+            ;;
+    esac
+
+    echo
+    read -n 1 -s -r -p "按任意键返回菜单..."
+}
+
+# ========================================
+# 主程序
+# ========================================
+check_root
+
+while true; do
+    menu
+done

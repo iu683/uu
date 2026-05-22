@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Xboard 一键管理脚本
+# Rhex 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,9 +8,13 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="Xboard"
+APP_NAME="Rhex"
 APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/compose.yaml"
+
+generate_secret() {
+
+    openssl rand -hex 32
+}
 
 check_docker() {
 
@@ -25,19 +29,12 @@ check_docker() {
     fi
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
+check_port() {
+
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
 }
 
 menu() {
@@ -46,7 +43,7 @@ menu() {
 
         clear
 
-        echo -e "${GREEN}=== Xboard 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Rhex 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -74,44 +71,66 @@ install_app() {
 
     check_docker
 
-    mkdir -p "$APP_DIR"
+    if [ -d "$APP_DIR" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
 
-    if [ ! -d "$APP_DIR/.git" ]; then
-
-        echo -e "${GREEN}开始克隆 Xboard...${RESET}"
-
-        git clone https://github.com/cedar2025/Xboard.git "$APP_DIR"
+        rm -rf "$APP_DIR"
     fi
+
+
+    echo
+    read -p "管理员用户名 [默认:admin]: " input_admin_user
+    ADMIN_USER=${input_admin_user:-admin}
+
+    read -p "管理员密码 [默认:ChangeMe_123456]: " input_admin_pass
+    ADMIN_PASS=${input_admin_pass:-ChangeMe_123456}
+
+    read -p "管理员邮箱 [默认:admin@rhex.im]: " input_admin_email
+    ADMIN_EMAIL=${input_admin_email:-admin@rhex.im}
+
+    read -p "管理员昵称 [默认:秦始皇]: " input_admin_nick
+    ADMIN_NICK=${input_admin_nick:-秦始皇}
+
+    SESSION_SECRET=$(generate_secret)
+    CAPTCHA_SECRET_KEY=$(generate_secret)
+
+    cd /opt || exit
+
+    git clone https://github.com/lovedevpanda/Rhex.git
 
     cd "$APP_DIR" || exit
 
-    cp compose.sample.yaml compose.yaml
+    cp .env.example .env
 
-    echo
-    read -p "请输入管理员邮箱 [默认:admin@demo.com]: " ADMIN_EMAIL
+    sed -i "s#^DATABASE_URL=.*#DATABASE_URL=\"postgresql://postgres:postgres@postgres:5432/bbs?schema=public\"#g" .env
 
-    ADMIN_EMAIL=${ADMIN_EMAIL:-admin@demo.com}
+    sed -i "s#^REDIS_URL=.*#REDIS_URL=\"redis://redis:6379\"#g" .env
 
-    echo
-    echo -e "${GREEN}开始安装数据库...${RESET}"
+    sed -i "s#^SESSION_SECRET=.*#SESSION_SECRET=\"${SESSION_SECRET}\"#g" .env
 
-    docker compose run -it --rm \
-        -e ENABLE_SQLITE=true \
-        -e ENABLE_REDIS=true \
-        -e ADMIN_ACCOUNT="$ADMIN_EMAIL" \
-        xboard php artisan xboard:install
+    sed -i "s#^CAPTCHA_SECRET_KEY=.*#CAPTCHA_SECRET_KEY=\"${CAPTCHA_SECRET_KEY}\"#g" .env
 
-    echo
-    echo -e "${GREEN}启动 Xboard...${RESET}"
+    sed -i "s#^SEED_ADMIN_USERNAME=.*#SEED_ADMIN_USERNAME=\"${ADMIN_USER}\"#g" .env
+
+    sed -i "s#^SEED_ADMIN_PASSWORD=.*#SEED_ADMIN_PASSWORD=\"${ADMIN_PASS}\"#g" .env
+
+    sed -i "s#^SEED_ADMIN_EMAIL=.*#SEED_ADMIN_EMAIL=\"${ADMIN_EMAIL}\"#g" .env
+
+    sed -i "s#^SEED_ADMIN_NICKNAME=.*#SEED_ADMIN_NICKNAME=\"${ADMIN_NICK}\"#g" .env
+
+    sed -i "s#^TZ=.*#TZ=\"Asia/Shanghai\"#g" .env
+
 
     docker compose up -d
 
-    SERVER_IP=$(get_public_ip)
-
     echo
-    echo -e "${GREEN}✅ Xboard 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://${SERVER_IP}:7001${RESET}"
-    echo -e "${YELLOW}⚠️ 请保存安装显示的后台账号密码${RESET}"
+    echo -e "${GREEN}✅ Rhex 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:3000${RESET}"
+    echo -e "${YELLOW}👤 管理员: ${ADMIN_USER}${RESET}"
+    echo -e "${YELLOW}🔑 管理密码: ${ADMIN_PASS}${RESET}"
+    echo -e "${YELLOW}📧 管理邮箱: ${ADMIN_EMAIL}${RESET}"
     echo -e "${YELLOW}📂 安装目录: $APP_DIR${RESET}"
 
     read -p "按回车返回菜单..."
@@ -124,6 +143,7 @@ update_app() {
     git pull
 
     docker compose pull
+
     docker compose up -d
 
     echo -e "${GREEN}✅ 更新完成${RESET}"

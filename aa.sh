@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Dockup 一键管理脚本
+# RayNews 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="dockup"
+APP_NAME="raynews"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 ENV_FILE="$APP_DIR/.env"
@@ -26,13 +26,21 @@ check_docker() {
     fi
 }
 
+check_port() {
+
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
+
 menu() {
 
     while true; do
 
         clear
 
-        echo -e "${GREEN}=== Dockup 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== RayNews 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -60,7 +68,7 @@ install_app() {
 
     check_docker
 
-    mkdir -p "$APP_DIR"
+    mkdir -p "$APP_DIR/data"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -68,51 +76,58 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    echo
-    read -p "请输入 Telegram Bot Token: " TG_BOT_TOKEN
-    read -p "请输入 Telegram Chat ID: " TG_CHAT_ID
+    read -p "请输入 Web 端口 [默认:8090]: " input_port
+    PORT=${input_port:-8090}
+
+    check_port "$PORT" || return
 
     echo
-    read -p "请输入检查间隔 [默认:12h]: " input_interval
-    CHECK_INTERVAL=${input_interval:-12h}
+    read -p "请输入 TELEGRAM_CHANNEL: " TELEGRAM_CHANNEL
 
-    read -p "是否自动清理旧镜像? (true/false) [默认:true]: " input_cleanup
-    CLEANUP=${input_cleanup:-true}
+    echo
+    read -p "是否启用代理？(y/n): " enable_proxy
 
-    read -p "首次启动发送测试消息? (true/false) [默认:true]: " input_test
-    SETUP_TEST_MESSAGE=${input_test:-true}
+    if [[ "$enable_proxy" == "y" ]]; then
+        read -p "HTTP_PROXY: " HTTP_PROXY
+        read -p "HTTPS_PROXY [留空默认同 HTTP_PROXY]: " HTTPS_PROXY
+        HTTPS_PROXY=${HTTPS_PROXY:-$HTTP_PROXY}
+        read -p "NO_PROXY [默认:localhost,127.0.0.1]: " input_no_proxy
+        NO_PROXY=${input_no_proxy:-localhost,127.0.0.1}
+    fi
 
     cat > "$ENV_FILE" <<EOF
+TELEGRAM_CHANNEL=${TELEGRAM_CHANNEL}
+HTTP_PROXY=${HTTP_PROXY}
+HTTPS_PROXY=${HTTPS_PROXY}
+NO_PROXY=${NO_PROXY:-localhost,127.0.0.1}
 TZ=Asia/Shanghai
-TG_BOT_TOKEN=${TG_BOT_TOKEN}
-TG_CHAT_ID=${TG_CHAT_ID}
-CHECK_INTERVAL=${CHECK_INTERVAL}
-CLEANUP=${CLEANUP}
-SETUP_TEST_MESSAGE=${SETUP_TEST_MESSAGE}
 EOF
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  dockup:
-    image: ghcr.io/shuijiao1/dockup:latest
+  raynews:
+    image: ghcr.io/rayyume/raynews:latest
 
-    container_name: dockup
+    container_name: raynews
 
-    restart: unless-stopped
-
-    environment:
-      TZ: \${TZ:-Asia/Shanghai}
-      TG_BOT_TOKEN: \${TG_BOT_TOKEN}
-      TG_CHAT_ID: \${TG_CHAT_ID}
-      CHECK_INTERVAL: \${CHECK_INTERVAL:-12h}
-      CLEANUP: \${CLEANUP:-true}
-      SETUP_TEST_MESSAGE: \${SETUP_TEST_MESSAGE:-true}
+    ports:
+      - "127.0.0.1:${PORT}:80"
 
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/app/data
+
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=Asia/Shanghai
+      - TELEGRAM_CHANNEL=\${TELEGRAM_CHANNEL}
+      - HTTP_PROXY=\${HTTP_PROXY:-}
+      - HTTPS_PROXY=\${HTTPS_PROXY:-}
+      - NO_PROXY=\${NO_PROXY:-localhost,127.0.0.1}
 
     env_file:
       - .env
+
+    restart: unless-stopped
 
     logging:
       driver: "json-file"
@@ -126,11 +141,16 @@ EOF
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ Dockup 已启动${RESET}"
-    echo -e "${YELLOW}📨 TG Chat ID: ${TG_CHAT_ID}${RESET}"
-    echo -e "${YELLOW}⏱️ 检查间隔: ${CHECK_INTERVAL}${RESET}"
-    echo -e "${YELLOW}🧹 自动清理: ${CLEANUP}${RESET}"
-    echo -e "${YELLOW}📂 安装目录: $APP_DIR${RESET}"
+    echo -e "${GREEN}✅ RayNews 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${YELLOW}🌐 手动刷新API: http://127.0.0.1:${PORT}/refresh${RESET}"
+    echo -e "${YELLOW}🌐 数据API: http://127.0.0.1:${PORT}/news.json${RESET}"
+    echo -e "${YELLOW}📢 Telegram Channel: ${TELEGRAM_CHANNEL}${RESET}"
+    echo -e "${YELLOW}📂 数据目录: $APP_DIR/data${RESET}"
+
+    if [[ -n "$HTTP_PROXY" ]]; then
+        echo -e "${GREEN}✅ 已启用代理${RESET}"
+    fi
 
     read -p "按回车返回菜单..."
 }
@@ -140,7 +160,6 @@ update_app() {
     cd "$APP_DIR" || return
 
     docker compose pull
-
     docker compose up -d
 
     echo -e "${GREEN}✅ 更新完成${RESET}"
@@ -150,7 +169,7 @@ update_app() {
 
 restart_app() {
 
-    docker restart dockup
+    docker restart raynews
 
     echo -e "${GREEN}✅ 已重启${RESET}"
 
@@ -159,12 +178,12 @@ restart_app() {
 
 view_logs() {
 
-    docker logs -f dockup
+    docker logs -f raynews
 }
 
 check_status() {
 
-    docker ps | grep dockup
+    docker ps | grep raynews
 
     read -p "按回车返回菜单..."
 }
@@ -174,7 +193,6 @@ uninstall_app() {
     cd "$APP_DIR" || return
 
     docker compose down -v
-
     rm -rf "$APP_DIR"
 
     echo -e "${RED}✅ 已彻底卸载${RESET}"

@@ -31,7 +31,7 @@ menu() {
 
         clear
 
-        echo -e "${GREEN}=== Telegram Music Bot 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=====Telegram Music Bot 管理菜单=====${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -65,7 +65,7 @@ install_app() {
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
+        read -r confirm
         [[ "$confirm" != "y" ]] && return
     fi
 
@@ -84,11 +84,12 @@ install_app() {
 ${BOT_TOKEN}
 EOF
 
-    chmod 600 "$APP_DIR/secrets/telegram-bot-token"
+    # 修复权限问题
+    chmod 644 "$APP_DIR/secrets/telegram-bot-token"
 
     cat > "$APP_DIR/config/config.yaml" <<EOF
-bot_token_file: ./secrets/telegram-bot-token
-download_dir: ./data/downloads
+bot_token_file: /run/secrets/telegram-bot-token
+download_dir: /app/data/downloads
 max_results: ${MAX_RESULTS}
 http_timeout_seconds: 20
 http_max_retries: 2
@@ -106,7 +107,6 @@ EOF
 services:
   music-bot:
     image: ghcr.io/skylush/telegram-music-bot:latest
-
     container_name: telegram-music-bot
 
     environment:
@@ -121,7 +121,7 @@ services:
     restart: unless-stopped
 
     logging:
-      driver: "json-file"
+      driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
@@ -129,13 +129,14 @@ EOF
 
     cd "$APP_DIR" || exit
 
-    docker compose up -d
+    docker compose up -d --force-recreate
 
     echo
     echo -e "${GREEN}✅ Telegram Music Bot 已启动${RESET}"
     echo -e "${YELLOW}🎵 音乐 API: ${SOURCE_API}${RESET}"
     echo -e "${YELLOW}📂 下载目录: $APP_DIR/data/downloads${RESET}"
     echo -e "${YELLOW}⚙️ 配置文件: $APP_DIR/config/config.yaml${RESET}"
+    echo
 
     read -p "按回车返回菜单..."
 }
@@ -145,8 +146,9 @@ update_app() {
     cd "$APP_DIR" || return
 
     docker compose pull
-    docker compose up -d
+    docker compose up -d --force-recreate
 
+    echo
     echo -e "${GREEN}✅ 更新完成${RESET}"
 
     read -p "按回车返回菜单..."
@@ -154,8 +156,11 @@ update_app() {
 
 restart_app() {
 
-    docker restart telegram-music-bot
+    cd "$APP_DIR" || return
 
+    docker compose restart
+
+    echo
     echo -e "${GREEN}✅ 已重启${RESET}"
 
     read -p "按回车返回菜单..."
@@ -168,18 +173,20 @@ view_logs() {
 
 check_status() {
 
-    docker ps | grep telegram-music-bot
+    docker ps -a | grep telegram-music-bot
 
+    
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
 
-    cd "$APP_DIR" || return
+    cd "$APP_DIR" 2>/dev/null || true
 
-    docker compose down -v
+    docker compose down -v 2>/dev/null
     rm -rf "$APP_DIR"
 
+    echo
     echo -e "${RED}✅ 已彻底卸载${RESET}"
 
     read -p "按回车返回菜单..."

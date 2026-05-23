@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Telegram Music Bot 一键管理脚本
+# Chain-Subconverter 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="telegram-music-bot"
+APP_NAME="chain-subconverter"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -25,15 +25,21 @@ check_docker() {
     fi
 }
 
+check_port() {
+
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
+
 menu() {
 
     while true; do
 
         clear
 
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} Telegram Music Bot 管理菜单${RESET}"
-        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}=== Chain-Subconverter 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -41,7 +47,6 @@ menu() {
         echo -e "${GREEN}5) 查看状态${RESET}"
         echo -e "${GREEN}6) 卸载(含数据)${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
-        echo
 
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
@@ -62,84 +67,96 @@ install_app() {
 
     check_docker
 
-    mkdir -p "$APP_DIR/config"
-    mkdir -p "$APP_DIR/secrets"
-    mkdir -p "$APP_DIR/data/downloads"
+    mkdir -p "$APP_DIR"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read -r confirm
+        read confirm
         [[ "$confirm" != "y" ]] && return
     fi
 
-    echo
-    read -p "请输入 Telegram Bot Token: " BOT_TOKEN
+    read -p "请输入 Web 端口 [默认:11200]: " input_port
+    PORT=${input_port:-11200}
+
+    check_port "$PORT" || return
 
     echo
-    read -p "请输入音乐 API 地址 [默认:https://music-api.gdstudio.xyz/api.php]: " input_api
-    SOURCE_API=${input_api:-https://music-api.gdstudio.xyz/api.php}
-
-    echo
-    read -p "最大搜索结果 [默认:5]: " input_results
-    MAX_RESULTS=${input_results:-5}
-
-    cat > "$APP_DIR/secrets/telegram-bot-token" <<EOF
-${BOT_TOKEN}
-EOF
-
-    # 修复权限问题
-    chmod 644 "$APP_DIR/secrets/telegram-bot-token"
-
-    cat > "$APP_DIR/config/config.yaml" <<EOF
-bot_token_file: /run/secrets/telegram-bot-token
-download_dir: /app/data/downloads
-max_results: ${MAX_RESULTS}
-http_timeout_seconds: 20
-http_max_retries: 2
-log_level: info
-
-source_api_base_url: ${SOURCE_API}
-
-source_order:
-  - netease
-  - kuwo
-  - joox
-EOF
+    read -p "请输入模板 URL [默认 OpenClash 模板]: " input_template
+    TEMPLATE_URL=${input_template:-https://raw.githubusercontent.com/Aethersailor/Custom_OpenClash_Rules/refs/heads/main/cfg/Custom_Clash.ini}
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  music-bot:
-    image: ghcr.io/skylush/telegram-music-bot:latest
-    container_name: telegram-music-bot
+  subconverter:
+    image: ghcr.io/slackworker/subconverter:integration-chain-subconverter
 
-    environment:
-      CONFIG_FILE: /app/config/config.yaml
-      BOT_TOKEN_FILE: /run/secrets/telegram-bot-token
-
-    volumes:
-      - ./config/config.yaml:/app/config/config.yaml:ro
-      - ./secrets/telegram-bot-token:/run/secrets/telegram-bot-token:ro
-      - ./data/downloads:/app/data/downloads
+    networks:
+      - subconverter-backend
 
     restart: unless-stopped
 
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:25500/version || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  app:
+    image: ghcr.io/slackworker/chain-subconverter:latest
+
+    depends_on:
+      subconverter:
+        condition: service_healthy
+
+    environment:
+      CHAIN_SUBCONVERTER_HTTP_ADDRESS: :11200
+      CHAIN_SUBCONVERTER_TRUSTED_PROXY_CIDRS: "172.16.0.0/12"
+      CHAIN_SUBCONVERTER_SUBCONVERTER_FACING_BASE_URL: http://app:11200
+      CHAIN_SUBCONVERTER_DEFAULT_TEMPLATE_URL: ${TEMPLATE_URL}
+      CHAIN_SUBCONVERTER_DEFAULT_TEMPLATE_FETCH_CACHE_TTL: 5m
+      CHAIN_SUBCONVERTER_SUBCONVERTER_UPSTREAM_BASE_URL: http://subconverter:25500/sub?
+      CHAIN_SUBCONVERTER_SHORT_LINK_DB_PATH: /data/short-links.sqlite3
+      CHAIN_SUBCONVERTER_SHORT_LINK_CAPACITY: 1000
+
+    networks:
+      - subconverter-backend
+
+    ports:
+      - "127.0.0.1:${PORT}:11200"
+
+    volumes:
+      - short-link-data:/data
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:11200/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
     logging:
-      driver: json-file
+      driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  short-link-data:
+
+networks:
+  subconverter-backend:
 EOF
 
     cd "$APP_DIR" || exit
 
-    docker compose up -d --force-recreate
+    docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ Telegram Music Bot 已启动${RESET}"
-    echo -e "${YELLOW}🎵 音乐 API: ${SOURCE_API}${RESET}"
-    echo -e "${YELLOW}📂 下载目录: $APP_DIR/data/downloads${RESET}"
-    echo -e "${YELLOW}⚙️ 配置文件: $APP_DIR/config/config.yaml${RESET}"
-    echo
+    echo -e "${GREEN}✅ Chain-Subconverter 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${YELLOW}📂 数据目录: $APP_DIR${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -149,9 +166,8 @@ update_app() {
     cd "$APP_DIR" || return
 
     docker compose pull
-    docker compose up -d --force-recreate
+    docker compose up -d
 
-    echo
     echo -e "${GREEN}✅ 更新完成${RESET}"
 
     read -p "按回车返回菜单..."
@@ -163,7 +179,6 @@ restart_app() {
 
     docker compose restart
 
-    echo
     echo -e "${GREEN}✅ 已重启${RESET}"
 
     read -p "按回车返回菜单..."
@@ -171,26 +186,27 @@ restart_app() {
 
 view_logs() {
 
-    docker logs -f telegram-music-bot
+    cd "$APP_DIR" || return
+
+    docker compose logs -f
 }
 
 check_status() {
 
+    cd "$APP_DIR" || return
 
-    docker ps -a | grep telegram-music-bot
+    docker compose ps
 
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
 
+    cd "$APP_DIR" || return
 
-    cd "$APP_DIR" 2>/dev/null || true
-
-    docker compose down -v 2>/dev/null
+    docker compose down -v
     rm -rf "$APP_DIR"
 
-    echo
     echo -e "${RED}✅ 已彻底卸载${RESET}"
 
     read -p "按回车返回菜单..."

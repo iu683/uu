@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# RayNews 一键管理脚本
+# Telegram Music Bot 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,10 +8,9 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="raynews"
+APP_NAME="telegram-music-bot"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-ENV_FILE="$APP_DIR/.env"
 
 check_docker() {
 
@@ -26,21 +25,13 @@ check_docker() {
     fi
 }
 
-check_port() {
-
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
-
 menu() {
 
     while true; do
 
         clear
 
-        echo -e "${GREEN}=== RayNews 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Telegram Music Bot 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -68,7 +59,9 @@ install_app() {
 
     check_docker
 
-    mkdir -p "$APP_DIR/data"
+    mkdir -p "$APP_DIR/config"
+    mkdir -p "$APP_DIR/secrets"
+    mkdir -p "$APP_DIR/data/downloads"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -76,56 +69,54 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入 Web 端口 [默认:8090]: " input_port
-    PORT=${input_port:-8090}
-
-    check_port "$PORT" || return
+    echo
+    read -p "请输入 Telegram Bot Token: " BOT_TOKEN
 
     echo
-    read -p "请输入 TELEGRAM_CHANNEL: " TELEGRAM_CHANNEL
+    read -p "请输入音乐 API 地址 [默认:https://music-api.gdstudio.xyz/api.php]: " input_api
+    SOURCE_API=${input_api:-https://music-api.gdstudio.xyz/api.php}
 
     echo
-    read -p "是否启用代理？(y/n): " enable_proxy
+    read -p "最大搜索结果 [默认:5]: " input_results
+    MAX_RESULTS=${input_results:-5}
 
-    if [[ "$enable_proxy" == "y" ]]; then
-        read -p "HTTP_PROXY: " HTTP_PROXY
-        read -p "HTTPS_PROXY [留空默认同 HTTP_PROXY]: " HTTPS_PROXY
-        HTTPS_PROXY=${HTTPS_PROXY:-$HTTP_PROXY}
-        read -p "NO_PROXY [默认:localhost,127.0.0.1]: " input_no_proxy
-        NO_PROXY=${input_no_proxy:-localhost,127.0.0.1}
-    fi
+    cat > "$APP_DIR/secrets/telegram-bot-token" <<EOF
+${BOT_TOKEN}
+EOF
 
-    cat > "$ENV_FILE" <<EOF
-TELEGRAM_CHANNEL=${TELEGRAM_CHANNEL}
-HTTP_PROXY=${HTTP_PROXY}
-HTTPS_PROXY=${HTTPS_PROXY}
-NO_PROXY=${NO_PROXY:-localhost,127.0.0.1}
-TZ=Asia/Shanghai
+    chmod 600 "$APP_DIR/secrets/telegram-bot-token"
+
+    cat > "$APP_DIR/config/config.yaml" <<EOF
+bot_token_file: ./secrets/telegram-bot-token
+download_dir: ./data/downloads
+max_results: ${MAX_RESULTS}
+http_timeout_seconds: 20
+http_max_retries: 2
+log_level: info
+
+source_api_base_url: ${SOURCE_API}
+
+source_order:
+  - netease
+  - kuwo
+  - joox
 EOF
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  raynews:
-    image: ghcr.io/rayyume/raynews:latest
+  music-bot:
+    image: ghcr.io/skylush/telegram-music-bot:latest
 
-    container_name: raynews
-
-    ports:
-      - "127.0.0.1:${PORT}:80"
-
-    volumes:
-      - ./data:/app/data
+    container_name: telegram-music-bot
 
     environment:
-      - PYTHONUNBUFFERED=1
-      - TZ=Asia/Shanghai
-      - TELEGRAM_CHANNEL=\${TELEGRAM_CHANNEL}
-      - HTTP_PROXY=\${HTTP_PROXY:-}
-      - HTTPS_PROXY=\${HTTPS_PROXY:-}
-      - NO_PROXY=\${NO_PROXY:-localhost,127.0.0.1}
+      CONFIG_FILE: /app/config/config.yaml
+      BOT_TOKEN_FILE: /run/secrets/telegram-bot-token
 
-    env_file:
-      - .env
+    volumes:
+      - ./config/config.yaml:/app/config/config.yaml:ro
+      - ./secrets/telegram-bot-token:/run/secrets/telegram-bot-token:ro
+      - ./data/downloads:/app/data/downloads
 
     restart: unless-stopped
 
@@ -141,16 +132,10 @@ EOF
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ RayNews 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}🌐 手动刷新API: http://127.0.0.1:${PORT}/refresh${RESET}"
-    echo -e "${YELLOW}🌐 数据API: http://127.0.0.1:${PORT}/news.json${RESET}"
-    echo -e "${YELLOW}📢 Telegram Channel: ${TELEGRAM_CHANNEL}${RESET}"
-    echo -e "${YELLOW}📂 数据目录: $APP_DIR/data${RESET}"
-
-    if [[ -n "$HTTP_PROXY" ]]; then
-        echo -e "${GREEN}✅ 已启用代理${RESET}"
-    fi
+    echo -e "${GREEN}✅ Telegram Music Bot 已启动${RESET}"
+    echo -e "${YELLOW}🎵 音乐 API: ${SOURCE_API}${RESET}"
+    echo -e "${YELLOW}📂 下载目录: $APP_DIR/data/downloads${RESET}"
+    echo -e "${YELLOW}⚙️ 配置文件: $APP_DIR/config/config.yaml${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -169,7 +154,7 @@ update_app() {
 
 restart_app() {
 
-    docker restart raynews
+    docker restart telegram-music-bot
 
     echo -e "${GREEN}✅ 已重启${RESET}"
 
@@ -178,12 +163,12 @@ restart_app() {
 
 view_logs() {
 
-    docker logs -f raynews
+    docker logs -f telegram-music-bot
 }
 
 check_status() {
 
-    docker ps | grep raynews
+    docker ps | grep telegram-music-bot
 
     read -p "按回车返回菜单..."
 }

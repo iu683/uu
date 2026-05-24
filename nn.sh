@@ -1,215 +1,172 @@
-#!/bin/bash
-# ========================================
-# Chain-Subconverter 一键管理脚本
-# ========================================
+cat > /root/install-ssh-login-tg-alert.sh <<'INSTALL_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-RESET="\033[0m"
+GREEN='\033[32m'
+RED='\033[31m'
+YELLOW='\033[33m'
+CYAN='\033[36m'
+RESET='\033[0m'
 
-APP_NAME="chain-subconverter"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+SCRIPT_PATH="/usr/local/bin/ssh-login-alert.sh"
+ENV_FILE="/root/.tg-ssh-alert.env"
+PAM_FILE="/etc/pam.d/sshd"
+PAM_LINE="session optional pam_exec.so seteuid ${SCRIPT_PATH}"
 
-check_docker() {
-
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
-}
-
-check_port() {
-
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
+ok(){ echo -e "${GREEN}$*${RESET}"; }
+warn(){ echo -e "${YELLOW}$*${RESET}"; }
+err(){ echo -e "${RED}$*${RESET}"; }
+info(){ echo -e "${CYAN}$*${RESET}"; }
 
 menu() {
-
-    while true; do
-
-        clear
-
-        echo -e "${GREEN}=== Chain-Subconverter 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
-        esac
-    done
+clear
+echo -e "${GREEN}"
+echo "=================================="
+echo " SSH 登录 Telegram 通知管理"
+echo "=================================="
+echo "1. 安装 / 修改配置"
+echo "2. 卸载（保留配置）"
+echo "3. 彻底卸载"
+echo "0. 退出"
+echo "=================================="
+echo -e "${RESET}"
+echo -ne "${GREEN}请输入选项: ${RESET}"
+read -r CHOICE
 }
 
-install_app() {
+[ "$(id -u)" -eq 0 ] || { err "请使用 root"; exit 1; }
 
-    check_docker
+uninstall_common() {
+    grep -Fq "$SCRIPT_PATH" "$PAM_FILE" 2>/dev/null && \
+    sed -i "\#${SCRIPT_PATH}#d" "$PAM_FILE" && \
+    ok "已移除 PAM"
 
-    mkdir -p "$APP_DIR"
+    [ -f "$SCRIPT_PATH" ] && rm -f "$SCRIPT_PATH" && ok "已删除通知脚本"
+}
 
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
+install_alert() {
 
-    read -p "请输入 Web 端口 [默认:11200]: " input_port
-    PORT=${input_port:-11200}
+echo
+echo -ne "${GREEN}Telegram Bot Token: ${RESET}"
+read -r TG_BOT_TOKEN
 
-    check_port "$PORT" || return
+echo -ne "${GREEN}Telegram Chat ID: ${RESET}"
+read -r TG_CHAT_ID
 
-    echo
-    read -p "请输入模板 URL [默认 OpenClash 模板]: " input_template
-    TEMPLATE_URL=${input_template:-https://raw.githubusercontent.com/Aethersailor/Custom_OpenClash_Rules/refs/heads/main/cfg/Custom_Clash.ini}
+echo -ne "${GREEN}服务器公网IP（留空自动检测）: ${RESET}"
+read -r SERVER_PUBLIC_IP
 
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  subconverter:
-    image: ghcr.io/slackworker/subconverter:integration-chain-subconverter
+echo -ne "${GREEN}主机显示名称（留空默认hostname）: ${RESET}"
+read -r CUSTOM_HOSTNAME
 
-    networks:
-      - subconverter-backend
+[ -n "$TG_BOT_TOKEN" ] || { err "Token不能为空"; exit 1; }
+[ -n "$TG_CHAT_ID" ] || { err "ChatID不能为空"; exit 1; }
 
-    restart: unless-stopped
+if command -v apt >/dev/null; then
+    apt update && apt install -y curl
+elif command -v dnf >/dev/null; then
+    dnf install -y curl
+elif command -v yum >/dev/null; then
+    yum install -y curl
+fi
 
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:25500/version || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-
-  app:
-    image: ghcr.io/slackworker/chain-subconverter:latest
-
-    depends_on:
-      subconverter:
-        condition: service_healthy
-
-    environment:
-      CHAIN_SUBCONVERTER_HTTP_ADDRESS: :11200
-      CHAIN_SUBCONVERTER_TRUSTED_PROXY_CIDRS: "172.16.0.0/12"
-      CHAIN_SUBCONVERTER_SUBCONVERTER_FACING_BASE_URL: http://app:11200
-      CHAIN_SUBCONVERTER_DEFAULT_TEMPLATE_URL: ${TEMPLATE_URL}
-      CHAIN_SUBCONVERTER_DEFAULT_TEMPLATE_FETCH_CACHE_TTL: 5m
-      CHAIN_SUBCONVERTER_SUBCONVERTER_UPSTREAM_BASE_URL: http://subconverter:25500/sub?
-      CHAIN_SUBCONVERTER_SHORT_LINK_DB_PATH: /data/short-links.sqlite3
-      CHAIN_SUBCONVERTER_SHORT_LINK_CAPACITY: 1000
-
-    networks:
-      - subconverter-backend
-
-    ports:
-      - "127.0.0.1:${PORT}:11200"
-
-    volumes:
-      - short-link-data:/data
-
-    restart: unless-stopped
-
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:11200/healthz || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 5s
-
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-volumes:
-  short-link-data:
-
-networks:
-  subconverter-backend:
+cat > "$ENV_FILE" <<EOF
+TG_BOT_TOKEN="${TG_BOT_TOKEN}"
+TG_CHAT_ID="${TG_CHAT_ID}"
+SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP}"
+CUSTOM_HOSTNAME="${CUSTOM_HOSTNAME}"
 EOF
 
-    cd "$APP_DIR" || exit
+chmod 600 "$ENV_FILE"
 
-    docker compose up -d
+cat > "$SCRIPT_PATH" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
 
-    echo
-    echo -e "${GREEN}✅ Chain-Subconverter 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}📂 数据目录: $APP_DIR${RESET}"
+ENV_FILE="/root/.tg-ssh-alert.env"
+[ -f "$ENV_FILE" ] || exit 0
+source "$ENV_FILE"
 
-    read -p "按回车返回菜单..."
+[ "${PAM_TYPE:-}" = "open_session" ] || exit 0
+
+USER_NAME="${PAM_USER:-unknown}"
+REMOTE_HOST="${PAM_RHOST:-unknown}"
+TTY_NAME="${PAM_TTY:-unknown}"
+
+if [ -n "${CUSTOM_HOSTNAME:-}" ]; then
+    SERVER_HOSTNAME="$CUSTOM_HOSTNAME"
+else
+    SERVER_HOSTNAME="$(hostname -f 2>/dev/null || hostname)"
+fi
+
+if [ -n "${SERVER_PUBLIC_IP:-}" ]; then
+    SERVER_IP="$SERVER_PUBLIC_IP"
+else
+    SERVER_IP="$(curl -4 -fsS https://api.ipify.org 2>/dev/null || echo unknown)"
+fi
+
+LOGIN_TIME="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+MESSAGE="🔐 SSH 登录通知
+
+主机: ${SERVER_HOSTNAME}
+公网IP: ${SERVER_IP}
+用户: ${USER_NAME}
+来源IP: ${REMOTE_HOST}
+终端: ${TTY_NAME}
+时间: ${LOGIN_TIME}"
+
+curl -fsS \
+-X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+-d "chat_id=${TG_CHAT_ID}" \
+--data-urlencode "text=${MESSAGE}" \
+>/dev/null 2>&1 || true
+EOF
+
+chmod 700 "$SCRIPT_PATH"
+
+grep -Fq "$SCRIPT_PATH" "$PAM_FILE" || {
+    echo "$PAM_LINE" >> "$PAM_FILE"
+    ok "PAM 已接入"
 }
 
-update_app() {
+TEST_HOST="${CUSTOM_HOSTNAME:-$(hostname)}"
 
-    cd "$APP_DIR" || return
+curl -fsS \
+-X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+-d "chat_id=${TG_CHAT_ID}" \
+--data-urlencode "text=✅ SSH通知安装成功
 
-    docker compose pull
-    docker compose up -d
+主机: ${TEST_HOST}
+时间: $(date '+%F %T')" >/dev/null && \
+ok "测试消息发送成功"
 
-    echo -e "${GREEN}✅ 更新完成${RESET}"
-
-    read -p "按回车返回菜单..."
+ok "安装完成"
 }
 
-restart_app() {
-
-    cd "$APP_DIR" || return
-
-    docker compose restart
-
-    echo -e "${GREEN}✅ 已重启${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-
-    cd "$APP_DIR" || return
-
-    docker compose logs -f
-}
-
-check_status() {
-
-    cd "$APP_DIR" || return
-
-    docker compose ps
-
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-
-    cd "$APP_DIR" || return
-
-    docker compose down -v
-    rm -rf "$APP_DIR"
-
-    echo -e "${RED}✅ 已彻底卸载${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
+while true; do
 menu
+case "$CHOICE" in
+1) install_alert ;;
+2)
+    uninstall_common
+    warn "配置文件保留：$ENV_FILE"
+    ;;
+3)
+    uninstall_common
+    rm -f "$ENV_FILE"
+    ok "已彻底卸载"
+    ;;
+0) exit 0 ;;
+*) err "无效选项" ;;
+esac
+
+echo
+echo -ne "${GREEN}按回车返回菜单...${RESET}"
+read -r
+done
+
+INSTALL_EOF
+
+chmod +x /root/install-ssh-login-tg-alert.sh
+bash /root/install-ssh-login-tg-alert.sh

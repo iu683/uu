@@ -1,172 +1,254 @@
-cat > /root/install-ssh-login-tg-alert.sh <<'INSTALL_EOF'
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
+# ========================================
+# Sing-box AnyReality 管理
+# ========================================
 
-GREEN='\033[32m'
-RED='\033[31m'
-YELLOW='\033[33m'
-CYAN='\033[36m'
-RESET='\033[0m'
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-SCRIPT_PATH="/usr/local/bin/ssh-login-alert.sh"
-ENV_FILE="/root/.tg-ssh-alert.env"
-PAM_FILE="/etc/pam.d/sshd"
-PAM_LINE="session optional pam_exec.so seteuid ${SCRIPT_PATH}"
+APP_NAME="Singbox-AnyReality"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/config.json"
+CONTAINER_NAME="Singbox-AnyReality"
+NODE_INFO_FILE="$APP_DIR/node.txt"
 
-ok(){ echo -e "${GREEN}$*${RESET}"; }
-warn(){ echo -e "${YELLOW}$*${RESET}"; }
-err(){ echo -e "${RED}$*${RESET}"; }
-info(){ echo -e "${CYAN}$*${RESET}"; }
+info() { echo -e "${GREEN}$1${RESET}"; }
+warn() { echo -e "${YELLOW}$1${RESET}"; }
+error() { echo -e "${RED}$1${RESET}"; }
+
+rand_str() {
+    tr -dc a-z0-9 </dev/urandom | head -c ${1:-8}
+}
+
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        warn "未检测到 Docker，正在安装..."
+        curl -fsSL https://get.docker.com | bash
+    fi
+}
+
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
+}
+
 
 menu() {
-clear
-echo -e "${GREEN}"
-echo "=================================="
-echo " SSH 登录 Telegram 通知管理"
-echo "=================================="
-echo "1. 安装 / 修改配置"
-echo "2. 卸载（保留配置）"
-echo "3. 彻底卸载"
-echo "0. 退出"
-echo "=================================="
-echo -e "${RESET}"
-echo -ne "${GREEN}请输入选项: ${RESET}"
-read -r CHOICE
+    while true; do
+        clear
+        echo -e "${GREEN}==================================${RESET}"
+        echo -e "${GREEN}     AnyReality 管理菜单            ${RESET}"
+        echo -e "${GREEN}==================================${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看节点信息${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install ;;
+            2) update ;;
+            3) restart ;;
+            4) logs ;;
+            5) show_node_info ;;
+            6) uninstall ;;
+            0) exit ;;
+            *) error "无效选择"; sleep 1 ;;
+        esac
+    done
 }
 
-[ "$(id -u)" -eq 0 ] || { err "请使用 root"; exit 1; }
+install() {
+    check_docker
+    mkdir -p "$APP_DIR"
 
-uninstall_common() {
-    grep -Fq "$SCRIPT_PATH" "$PAM_FILE" 2>/dev/null && \
-    sed -i "\#${SCRIPT_PATH}#d" "$PAM_FILE" && \
-    ok "已移除 PAM"
+    read -p "端口(默认随机): " PORT
+    PORT=${PORT:-$(shuf -i 20000-60000 -n1)}
 
-    [ -f "$SCRIPT_PATH" ] && rm -f "$SCRIPT_PATH" && ok "已删除通知脚本"
+    USERNAME=$(rand_str 8)
+    PASSWORD=$(rand_str 16)
+
+    
+    read -p "伪装域名(默认: www.amazon.com): " SERVER_NAME
+    SERVER_NAME=${SERVER_NAME:-www.amazon.com}
+
+    REMARK=$(hostname)
+    SERVER_IP=$(get_public_ip)
+
+    warn "生成 Reality 密钥..."
+    KEY_PAIR=$(docker run --rm ghcr.io/sagernet/sing-box generate reality-keypair)
+
+    PRIVATE_KEY=$(echo "$KEY_PAIR" | grep PrivateKey | awk '{print $2}')
+    PUBLIC_KEY=$(echo "$KEY_PAIR" | grep PublicKey | awk '{print $2}')
+    SHORT_ID=$(openssl rand -hex 4)
+
+    cat > "$CONFIG_FILE" <<EOF
+{
+  "log": {"level": "info"},
+  "inbounds": [
+    {
+      "type": "anytls",
+      "listen": "::",
+      "listen_port": ${PORT},
+      "users": [
+        {
+          "name": "${USERNAME}",
+          "password": "${PASSWORD}"
+        }
+      ],
+      "padding_scheme": [
+        "stop=8",
+        "0=30-30",
+        "1=100-400",
+        "2=400-500,c,500-1000,c,500-1000,c,500-1000",
+        "3=9-9,500-1000",
+        "4=500-1000",
+        "5=500-1000",
+        "6=500-1000",
+        "7=500-1000"
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${SERVER_NAME}",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "${SERVER_NAME}",
+            "server_port": 443
+          },
+          "private_key": "${PRIVATE_KEY}",
+          "short_id": "${SHORT_ID}"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {"type": "direct"}
+  ]
 }
-
-install_alert() {
-
-echo
-echo -ne "${GREEN}Telegram Bot Token: ${RESET}"
-read -r TG_BOT_TOKEN
-
-echo -ne "${GREEN}Telegram Chat ID: ${RESET}"
-read -r TG_CHAT_ID
-
-echo -ne "${GREEN}服务器公网IP（留空自动检测）: ${RESET}"
-read -r SERVER_PUBLIC_IP
-
-echo -ne "${GREEN}主机显示名称（留空默认hostname）: ${RESET}"
-read -r CUSTOM_HOSTNAME
-
-[ -n "$TG_BOT_TOKEN" ] || { err "Token不能为空"; exit 1; }
-[ -n "$TG_CHAT_ID" ] || { err "ChatID不能为空"; exit 1; }
-
-if command -v apt >/dev/null; then
-    apt update && apt install -y curl
-elif command -v dnf >/dev/null; then
-    dnf install -y curl
-elif command -v yum >/dev/null; then
-    yum install -y curl
-fi
-
-cat > "$ENV_FILE" <<EOF
-TG_BOT_TOKEN="${TG_BOT_TOKEN}"
-TG_CHAT_ID="${TG_CHAT_ID}"
-SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP}"
-CUSTOM_HOSTNAME="${CUSTOM_HOSTNAME}"
 EOF
 
-chmod 600 "$ENV_FILE"
-
-cat > "$SCRIPT_PATH" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-ENV_FILE="/root/.tg-ssh-alert.env"
-[ -f "$ENV_FILE" ] || exit 0
-source "$ENV_FILE"
-
-[ "${PAM_TYPE:-}" = "open_session" ] || exit 0
-
-USER_NAME="${PAM_USER:-unknown}"
-REMOTE_HOST="${PAM_RHOST:-unknown}"
-TTY_NAME="${PAM_TTY:-unknown}"
-
-if [ -n "${CUSTOM_HOSTNAME:-}" ]; then
-    SERVER_HOSTNAME="$CUSTOM_HOSTNAME"
-else
-    SERVER_HOSTNAME="$(hostname -f 2>/dev/null || hostname)"
-fi
-
-if [ -n "${SERVER_PUBLIC_IP:-}" ]; then
-    SERVER_IP="$SERVER_PUBLIC_IP"
-else
-    SERVER_IP="$(curl -4 -fsS https://api.ipify.org 2>/dev/null || echo unknown)"
-fi
-
-LOGIN_TIME="$(date '+%Y-%m-%d %H:%M:%S %Z')"
-
-MESSAGE="🔐 SSH 登录通知
-
-主机: ${SERVER_HOSTNAME}
-公网IP: ${SERVER_IP}
-用户: ${USER_NAME}
-来源IP: ${REMOTE_HOST}
-终端: ${TTY_NAME}
-时间: ${LOGIN_TIME}"
-
-curl -fsS \
--X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
--d "chat_id=${TG_CHAT_ID}" \
---data-urlencode "text=${MESSAGE}" \
->/dev/null 2>&1 || true
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  singbox:
+    image: ghcr.io/sagernet/sing-box:latest
+    container_name: ${CONTAINER_NAME}
+    network_mode: host
+    restart: always
+    volumes:
+      - ./config.json:/etc/sing-box/config.json
+    command: run -c /etc/sing-box/config.json
 EOF
 
-chmod 700 "$SCRIPT_PATH"
+    cd "$APP_DIR"
+    docker compose up -d
 
-grep -Fq "$SCRIPT_PATH" "$PAM_FILE" || {
-    echo "$PAM_LINE" >> "$PAM_FILE"
-    ok "PAM 已接入"
+    cat > "$NODE_INFO_FILE" <<EOF
+服务器 IP: ${SERVER_IP}
+端口: ${PORT}
+用户名: ${USERNAME}
+密码: ${PASSWORD}
+SNI: ${SERVER_NAME}
+PublicKey: ${PUBLIC_KEY}
+ShortID: ${SHORT_ID}
+备注: ${REMARK}
+安装目录: ${APP_DIR}
+V6VPS替换IP地址为V6
+EOF
+
+    info "安装完成"
+    show_node_info
 }
 
-TEST_HOST="${CUSTOM_HOSTNAME:-$(hostname)}"
+show_node_info() {
+  clear
+  info '当前节点信息'
 
-curl -fsS \
--X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
--d "chat_id=${TG_CHAT_ID}" \
---data-urlencode "text=✅ SSH通知安装成功
+  if [ ! -f "$NODE_INFO_FILE" ]; then
+      error "未找到节点信息"
+      read
+      return
+  fi
 
-主机: ${TEST_HOST}
-时间: $(date '+%F %T')" >/dev/null && \
-ok "测试消息发送成功"
+  # 读取信息
+  SERVER_IP=$(grep "服务器 IP" $NODE_INFO_FILE | awk '{print $3}')
+  PORT=$(grep "端口" $NODE_INFO_FILE | awk '{print $2}')
+  PASSWORD=$(grep "密码" $NODE_INFO_FILE | awk '{print $2}')
+  SERVER_NAME=$(grep "SNI" $NODE_INFO_FILE | awk '{print $2}')
+  PUBLIC_KEY=$(grep "PublicKey" $NODE_INFO_FILE | awk '{print $2}')
+  SHORT_ID=$(grep "ShortID" $NODE_INFO_FILE | awk '{print $2}')
+  REMARK=$(grep "备注" $NODE_INFO_FILE | awk '{print $2}')
 
-ok "安装完成"
+  cat "$NODE_INFO_FILE"
+  echo
+
+  echo 'v2rayN配置：'
+  echo "anytls://${PASSWORD}@${SERVER_IP}:${PORT}?security=reality&sni=${SERVER_NAME}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${REMARK}"
+  echo
+
+  echo 'sing-box 客户端示例配置：'
+  cat <<EOF
+{
+  "type": "anytls",
+  "tag": "${REMARK}",
+  "server": "${SERVER_IP}",
+  "server_port": ${PORT},
+  "password": "${PASSWORD}",
+  "tls": {
+    "enabled": true,
+    "server_name": "${SERVER_NAME}",
+    "reality": {
+      "enabled": true,
+      "public_key": "${PUBLIC_KEY}",
+      "short_id": "${SHORT_ID}"
+    }
+  }
+}
+EOF
+
+  echo
+  read -p "按回车返回菜单..."
 }
 
-while true; do
+update() {
+    cd "$APP_DIR"
+    docker compose pull
+    docker compose up -d
+    info "更新完成"
+    read -p "按回车返回菜单..."
+}
+
+restart() {
+    docker restart ${CONTAINER_NAME}
+    info "已重启"
+    read -p "按回车返回菜单..."
+}
+
+logs() {
+    docker logs -f ${CONTAINER_NAME}
+}
+
+uninstall() {
+    docker rm -f ${CONTAINER_NAME}
+    rm -rf "$APP_DIR"
+    warn "已卸载"
+    read -p "按回车返回菜单..."
+}
+
 menu
-case "$CHOICE" in
-1) install_alert ;;
-2)
-    uninstall_common
-    warn "配置文件保留：$ENV_FILE"
-    ;;
-3)
-    uninstall_common
-    rm -f "$ENV_FILE"
-    ok "已彻底卸载"
-    ;;
-0) exit 0 ;;
-*) err "无效选项" ;;
-esac
-
-echo
-echo -ne "${GREEN}按回车返回菜单...${RESET}"
-read -r
-done
-
-INSTALL_EOF
-
-chmod +x /root/install-ssh-login-tg-alert.sh
-bash /root/install-ssh-login-tg-alert.sh

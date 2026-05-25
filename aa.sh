@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Xray VLESS HTTPUpgrade 一键管理脚本（无TLS + 自定义Host）
+# Xray VMess WS 一键管理脚本（无TLS + 自定义Host）
 # ========================================
 
 GREEN="\033[32m"
@@ -8,8 +8,8 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-CONTAINER_NAME="xray-vless"
-APP_NAME="xray-vless-httpupgrade"
+CONTAINER_NAME="xray-vmess"
+APP_NAME="xray-vmess-ws"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 CONFIG_FILE="$APP_DIR/config.json"
@@ -20,7 +20,6 @@ check_docker() {
         echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
         curl -fsSL https://get.docker.com | bash
     fi
-
     if ! docker compose version &>/dev/null; then
         echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
         exit 1
@@ -35,10 +34,25 @@ check_port() {
     return 0
 }
 
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
+}
+
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== Xray VLESS + HTTPUpgrade 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== xray-vmess+ws 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -47,7 +61,6 @@ menu() {
         echo -e "${GREEN}6) 查看节点信息${RESET}"
         echo -e "${GREEN}7) 卸载${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
-
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
         case $choice in
@@ -77,51 +90,43 @@ install_app() {
     fi
 
     check_port "$PORT" || return
+    
 
-    read -p "请输入服务器IP或域名: " DOMAIN
-    if [[ -z "$DOMAIN" ]]; then
-        echo -e "${RED}不能为空${RESET}"
-        return
-    fi
+    read -p "请输入 WebSocket Host (可留空): " WS_HOST
 
-    read -p "请输入 HTTP Host (可留空): " HTTP_HOST
+    read -p "请输入 WebSocket Path [默认 /ws]: " WS_PATH
+    WS_PATH=${WS_PATH:-/ws}
 
-    read -p "请输入 HTTPUpgrade Path [默认 /]: " HTTP_PATH
-    HTTP_PATH=${HTTP_PATH:-/}
+
 
     UUID=$(docker run --rm ghcr.io/xtls/xray-core:latest uuid)
 
 cat > "$CONFIG_FILE" <<EOF
 {
-  "log": {
-    "loglevel": "warning"
-  },
+  "log": { "loglevel": "warning" },
   "inbounds": [
     {
       "port": $PORT,
-      "protocol": "vless",
+      "protocol": "vmess",
       "settings": {
         "clients": [
-          {
-            "id": "$UUID"
-          }
-        ],
-        "decryption": "none"
+          { "id": "$UUID", "alterId": 0 }
+        ]
       },
       "streamSettings": {
-        "network": "httpupgrade",
+        "network": "ws",
         "security": "none",
-        "httpupgradeSettings": {
-          "path": "$HTTP_PATH",
-          "host": "$HTTP_HOST"
+        "wsSettings": {
+          "path": "$WS_PATH",
+          "headers": {
+            "Host": "$WS_HOST"
+          }
         }
       }
     }
   ],
   "outbounds": [
-    {
-      "protocol": "freedom"
-    }
+    { "protocol": "freedom" }
   ]
 }
 EOF
@@ -139,39 +144,63 @@ services:
       - "$PORT:$PORT/tcp"
 EOF
 
-    cd "$APP_DIR" || exit
-    docker compose up -d
+cd "$APP_DIR" || exit
+docker compose up -d
 
-    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+HOSTNAME=$(hostname -s | sed 's/ /_/g')
+IP=$(get_public_ip)
 
-    VLESS_LINK="vless://${UUID}@${DOMAIN}:${PORT}?encryption=none&security=none&type=httpupgrade&host=${HTTP_HOST}&path=${HTTP_PATH}#${HOSTNAME}"
+VMESS_JSON=$(jq -n \
+    --arg v "2" \
+    --arg ps "$HOSTNAME" \
+    --arg add "$IP" \
+    --arg port "$PORT" \
+    --arg id "$UUID" \
+    --arg aid "0" \
+    --arg net "ws" \
+    --arg type "none" \
+    --arg host "$WS_HOST" \
+    --arg path "$WS_PATH" \
+    --arg tls "" \
+    '{
+        v:$v,
+        ps:$ps,
+        add:$add,
+        port:$port,
+        id:$id,
+        aid:$aid,
+        net:$net,
+        type:$type,
+        host:$host,
+        path:$path,
+        tls:$tls
+    }' | base64 -w 0)
 
-    echo
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
-    echo -e "${GREEN}✅ VLESS + HTTPUpgrade 节点已启动${RESET}"
-    echo -e "${YELLOW}🌐 地址: ${DOMAIN}${RESET}"
-    echo -e "${YELLOW}🔌 端口: ${PORT}${RESET}"
-    echo -e "${YELLOW}🆔 UUID: ${UUID}${RESET}"
-    echo -e "${YELLOW}🌐 Host: ${HTTP_HOST}${RESET}"
-    echo -e "${YELLOW}📂 Path: ${HTTP_PATH}${RESET}"
-    echo
+echo
+echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+echo -e "${GREEN}✅ VMess-WS 节点已启动${RESET}"
+echo -e "${YELLOW}🌐 地址: ${IP}${RESET}"
+echo -e "${YELLOW}🔌 端口: ${PORT}${RESET}"
+echo -e "${YELLOW}🆔 UUID: ${UUID}${RESET}"
+echo -e "${YELLOW}🌐 Host: $WS_HOST${RESET}"
+echo -e "${YELLOW}🌐 path: $WS_PATH${RESET}"
+echo
 
-    echo -e "${YELLOW}📄 VLESS链接:${RESET}"
-    echo -e "${YELLOW}${VLESS_LINK}${RESET}"
-    echo
+echo -e "${YELLOW}📄 V2rayN链接:${RESET}"
+echo -e "${YELLOW}vmess://${VMESS_JSON}${RESET}"
 
-    echo -e "${YELLOW}📄 Surge配置:${RESET}"
-    echo -e "${YELLOW}${HOSTNAME} = vless, ${DOMAIN}, ${PORT}, username=${UUID}, http-upgrade=true, http-upgrade-path=${HTTP_PATH}, http-upgrade-headers=Host:\"${HTTP_HOST}\", tls=false${RESET}"
+echo -e "${YELLOW}📄 Surge配置:${RESET}"
+echo -e "${YELLOW}$HOSTNAME = vmess, ${IP}, ${PORT}, username=${UUID}, ws=true, ws-path=$WS_PATH, ws-headers=Host:\"$WS_HOST\", vmess-aead=true, tls=false${RESET}"
 
 cat > "$NODE_INFO_FILE" <<EOF
-VLESS链接
-${VLESS_LINK}
+V2rayN链接
+vmess://${VMESS_JSON}
 
 Surge配置
-${HOSTNAME} = vless, ${DOMAIN}, ${PORT}, username=${UUID}, http-upgrade=true, http-upgrade-path=${HTTP_PATH}, http-upgrade-headers=Host:"${HTTP_HOST}", tls=false
+$HOSTNAME = vmess, ${IP}, ${PORT}, username=${UUID}, ws=true, ws-path=$WS_PATH, ws-headers=Host:"$WS_HOST", vmess-aead=true, tls=false
 EOF
 
-    read -p "按回车返回菜单..."
+read -p "按回车返回菜单..."
 }
 
 update_app() {

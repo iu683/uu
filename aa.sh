@@ -1,340 +1,400 @@
-#!/usr/bin/env bash
+#!/bin/bash
+
 set -euo pipefail
 
-GREEN='\033[32m'
-RED='\033[31m'
-YELLOW='\033[33m'
-RESET='\033[0m'
+SCRIPT_VERSION="SINGBOX-VLESS-HTTPUPGRADE-1.0"
 
-SINGBOX_DIR='/etc/sing-box'
-SINGBOX_CONFIG="$SINGBOX_DIR/config.json"
-STATE_FILE='/etc/anyreality-singbox.env'
-SERVICE_NAME='sing-box'
+config_path="/etc/sing-box/config.json"
+binary_path="/usr/local/bin/sing-box"
 
-LOG_FILE='/var/log/anyreality-singbox.log'
+red='\e[91m'
+green='\e[92m'
+yellow='\e[93m'
+cyan='\e[96m'
+none='\e[0m'
 
-info() { echo -e "${GREEN}[信息] $*${RESET}"; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}"; }
-err() { echo -e "${RED}[错误] $*${RESET}" >&2; }
+status_info=""
+ws_path="/"
+ws_host=""
 
-setup_logging() {
-  mkdir -p "$(dirname "$LOG_FILE")"
-  touch "$LOG_FILE"
-  exec > >(tee -a "$LOG_FILE") 2>&1
+error(){ echo -e "\n$red[✖] $1$none\n"; }
+info(){ echo -e "\n$yellow[!] $1$none\n"; }
+success(){ echo -e "\n$green[✔] $1$none\n"; }
+
+get_public_ip(){
+
+for url in api.ipify.org ip.sb checkip.amazonaws.com
+do
+ip=$(curl -s --max-time 5 $url)
+[ -n "$ip" ] && echo "$ip" && return
+done
+
 }
 
-require_root() {
-  [[ "$(id -u)" -eq 0 ]] || { err '请用 root 运行'; exit 1; }
+is_valid_port(){
+[[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
-require_debian_ubuntu() {
-  [[ -f /etc/os-release ]] || { err '无法识别系统，只支持 Debian/Ubuntu'; exit 1; }
-  . /etc/os-release
-  case "${ID:-}" in
-    debian|ubuntu) ;;
-    *) [[ "${ID_LIKE:-}" == *debian* ]] || { err "只支持 Debian/Ubuntu，当前: ${PRETTY_NAME:-unknown}"; exit 1; } ;;
-  esac
+is_port_in_use(){
+ss -tuln | grep -q ":$1 "
 }
 
-install_deps() {
-  info '检查依赖...'
-
-  local pkgs=(
-    curl
-    wget
-    unzip
-    ca-certificates
-    uuid-runtime
-    python3
-  )
-
-  local need_install=()
-
-  for pkg in "${pkgs[@]}"; do
-    if ! dpkg -s "$pkg" >/dev/null 2>&1; then
-      need_install+=("$pkg")
-    fi
-  done
-
-  if [[ ${#need_install[@]} -eq 0 ]]; then
-    info '依赖已满足，跳过安装。'
-    return
-  fi
-
-  info "安装缺失依赖: ${need_install[*]}"
-  apt-get update
-  apt-get install -y "${need_install[@]}"
+is_valid_uuid(){
+[[ "$1" =~ ^[0-9a-fA-F-]{36}$ ]]
 }
 
-install_singbox() {
-  if command -v sing-box >/dev/null 2>&1; then
-    info '检测到 sing-box，跳过安装。'
-    return
-  fi
-  info '安装 sing-box...'
-  bash <(curl -fsSL https://sing-box.app/install.sh)
+pre_check(){
+
+[[ $(id -u) != 0 ]] && error "请用root运行" && exit 1
+
+deps=(jq curl wget uuidgen)
+
+for cmd in "${deps[@]}"
+do
+if ! command -v $cmd >/dev/null 2>&1
+then
+info "安装依赖 $cmd"
+apt update -y
+apt install -y jq curl wget uuid-runtime
+break
+fi
+done
+
+mkdir -p /etc/sing-box
+
 }
 
-get_public_ip() {
-  local ip=''
-  for url in https://api.ipify.org https://ip.sb https://checkip.amazonaws.com; do
-    ip=$(curl -4s --max-time 5 "$url" 2>/dev/null || true)
-    [[ -n "$ip" ]] && { echo "$ip"; return; }
-    ip=$(wget -4qO- --timeout=5 "$url" 2>/dev/null || true)
-    [[ -n "$ip" ]] && { echo "$ip"; return; }
-  done
-  hostname -I | awk '{print $1}'
+install_core(){
+
+info "安装/更新 sing-box 最新版..."
+
+arch=$(uname -m)
+
+case "$arch" in
+x86_64|amd64)
+    sb_arch="amd64"
+    ;;
+aarch64|arm64)
+    sb_arch="arm64"
+    ;;
+armv7l)
+    sb_arch="armv7"
+    ;;
+*)
+    error "不支持架构: $arch"
+    exit 1
+    ;;
+esac
+
+cd /tmp
+
+# 获取最新稳定版版本号
+latest_version=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+    | jq -r '.tag_name')
+
+[ -z "$latest_version" ] && {
+    error "获取最新版失败"
+    exit 1
 }
 
-ask_config() {
-  if [[ -f "$STATE_FILE" ]]; then
-    # shellcheck disable=SC1090
-    source "$STATE_FILE"
-  fi
+info "最新版本: $latest_version"
 
-  read -rp "请输入监听端口（留空随机生成，当前 ${PORT:-未设置}）: " INPUT_PORT
-  if [[ -n "$INPUT_PORT" ]]; then
-    PORT="$INPUT_PORT"
-  elif [[ -z "${PORT:-}" ]]; then
-    PORT=$(shuf -i 10000-65535 -n 1)
-  fi
+file_name="sing-box-${latest_version#v}-linux-${sb_arch}.tar.gz"
+download_url="https://github.com/SagerNet/sing-box/releases/download/${latest_version}/${file_name}"
 
-  read -rp "请输入用户名（留空随机生成，当前 ${USERNAME:-未设置}）: " INPUT_USERNAME
-  if [[ -n "$INPUT_USERNAME" ]]; then
-    USERNAME="$INPUT_USERNAME"
-  elif [[ -z "${USERNAME:-}" ]]; then
-    USERNAME=$(python3 - <<'PY'
-import secrets, string
-alphabet = string.ascii_lowercase + string.digits
-print('user-' + ''.join(secrets.choice(alphabet) for _ in range(6)))
-PY
-)
-  fi
+info "下载: $file_name"
 
-  read -rp "请输入密码（留空随机生成，当前 ${PASSWORD:-未设置}）: " INPUT_PASSWORD
-  if [[ -n "$INPUT_PASSWORD" ]]; then
-    PASSWORD="$INPUT_PASSWORD"
-  elif [[ -z "${PASSWORD:-}" ]]; then
-    PASSWORD=$(python3 - <<'PY'
-import secrets, string
-alphabet = string.ascii_letters + string.digits
-print(''.join(secrets.choice(alphabet) for _ in range(12)))
-PY
-)
-  fi
+wget -O singbox.tar.gz "$download_url" \
+|| wget -O singbox.tar.gz \
+"https://mirror.ghproxy.com/${download_url}"
 
-  read -rp "请输入伪装域名/SNI（当前 ${SERVER_NAME:-www.amazon.com}）: " INPUT_SERVER_NAME
-  SERVER_NAME=${INPUT_SERVER_NAME:-${SERVER_NAME:-www.amazon.com}}
+rm -rf sing-box*
 
-  read -rp "请输入 short_id（留空随机生成，当前 ${SHORT_ID:-未设置}）: " INPUT_SHORT_ID
-  if [[ -n "$INPUT_SHORT_ID" ]]; then
-    SHORT_ID="$INPUT_SHORT_ID"
-  elif [[ -z "${SHORT_ID:-}" ]]; then
-    SHORT_ID=$(python3 - <<'PY'
-import secrets
-print(secrets.token_hex(8))
-PY
-)
-  fi
+tar -xzf singbox.tar.gz
 
-  read -rp "请输入节点备注（当前 ${REMARK:-anytls-reality-tls}）: " INPUT_REMARK
-  REMARK=${INPUT_REMARK:-${REMARK:-anytls-reality-tls}}
+# 自动寻找解压目录
+dir=$(find . -maxdepth 1 -type d -name "sing-box*" | head -n1)
+
+[ -z "$dir" ] && {
+    error "解压失败"
+    exit 1
 }
 
-generate_or_use_key() {
-  if [[ -n "${PRIVATE_KEY:-}" && -n "${PUBLIC_KEY:-}" ]]; then
-    info '沿用现有 Reality 私钥/公钥。'
-    return
-  fi
+install -m 755 "$dir/sing-box" /usr/local/bin/sing-box
 
-  KEY_OUT=$(sing-box generate reality-keypair)
-  PRIVATE_KEY=$(awk '/PrivateKey/ {print $2}' <<< "$KEY_OUT")
-  PUBLIC_KEY=$(awk '/PublicKey/ {print $2}' <<< "$KEY_OUT")
+rm -rf singbox.tar.gz "$dir"
+
+# systemd
+cat > /etc/systemd/system/sing-box.service <<EOF
+[Unit]
+Description=Sing-box Service
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable sing-box >/dev/null 2>&1
+
+success "sing-box ${latest_version} 安装/更新完成"
+
 }
 
-write_config() {
-  mkdir -p "$SINGBOX_DIR"
+check_status(){
 
-  cat > "$SINGBOX_CONFIG" <<EOF
+if [ ! -f "$binary_path" ]; then
+status_info="Sing-box: 未安装"
+return
+fi
+
+if systemctl is-active --quiet sing-box
+then
+status_info="Sing-box: 运行中"
+else
+status_info="Sing-box: 未运行"
+fi
+
+}
+
+write_config(){
+
+port=$1
+uuid=$2
+
+jq -n \
+--argjson port "$port" \
+--arg uuid "$uuid" \
+--arg path "$ws_path" \
+--arg host "$ws_host" \
+'{
+log:{level:"warn"},
+inbounds:[
 {
-  "inbounds": [
-    {
-      "type": "anytls",
-      "listen": "::",
-      "listen_port": ${PORT},
-      "users": [
-        {
-          "name": "${USERNAME}",
-          "password": "${PASSWORD}"
-        }
-      ],
-      "padding_scheme": [
-        "stop=8",
-        "0=30-30",
-        "1=100-400",
-        "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
-        "3=9-9,500-1000",
-        "4=500-1000",
-        "5=500-1000",
-        "6=500-1000",
-        "7=500-1000"
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${SERVER_NAME}",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "${SERVER_NAME}",
-            "server_port": 443
-          },
-          "private_key": "${PRIVATE_KEY}",
-          "short_id": "${SHORT_ID}"
-        }
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct"
-    }
-  ]
+type:"vless",
+listen:"::",
+listen_port:$port,
+users:[{uuid:$uuid}],
+transport:{
+type:"httpupgrade",
+path:$path,
+host:$host
 }
-EOF
+}
+],
+outbounds:[
+{type:"direct"}
+]
+}' > "$config_path"
+
 }
 
-save_state() {
-  SERVER_IP=$(get_public_ip)
-  cat > "$STATE_FILE" <<EOF
-PORT='${PORT}'
-USERNAME='${USERNAME}'
-PASSWORD='${PASSWORD}'
-SERVER_NAME='${SERVER_NAME}'
-SHORT_ID='${SHORT_ID}'
-REMARK='${REMARK}'
-PRIVATE_KEY='${PRIVATE_KEY}'
-PUBLIC_KEY='${PUBLIC_KEY}'
-SERVER_IP='${SERVER_IP}'
-EOF
-  chmod 600 "$STATE_FILE"
+install_node(){
+
+while true
+do
+read -p "端口 (默认8080): " port
+[ -z "$port" ] && port=8080
+
+is_valid_port "$port" || { error "端口无效"; continue; }
+
+is_port_in_use "$port" && { error "端口占用"; continue; }
+
+break
+done
+
+while true
+do
+read -p "UUID (留空自动生成): " uuid
+[ -z "$uuid" ] && uuid=$(uuidgen)
+
+is_valid_uuid "$uuid" && break || error "UUID格式错误"
+done
+
+read -p "HTTP Host (可选): " ws_host
+
+read -p "Path (默认 /): " ws_path
+[ -z "$ws_path" ] && ws_path="/"
+[[ "$ws_path" != /* ]] && ws_path="/$ws_path"
+
+install_core
+
+write_config "$port" "$uuid"
+
+systemctl restart sing-box
+
+success "安装完成"
+
+view_node
+
 }
 
-load_state() {
-  [[ -f "$STATE_FILE" ]] || { err '未找到已安装配置'; return 1; }
-  # shellcheck disable=SC1090
-  source "$STATE_FILE"
+restart_core(){
+
+systemctl restart sing-box
+success "已重启"
+
 }
 
-open_firewall() {
-  if command -v ufw >/dev/null 2>&1; then
-    ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
-  fi
+update_core(){
+
+rm -f /usr/local/bin/sing-box
+
+install_core
+systemctl restart sing-box
+
+success "已更新到最新版"
+
 }
 
-start_service() {
-  systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
-  systemctl restart "$SERVICE_NAME"
-  systemctl --no-pager --full status "$SERVICE_NAME" || true
+uninstall_core(){
+
+systemctl stop sing-box
+
+rm -f /usr/local/bin/sing-box
+rm -rf /etc/sing-box
+rm -f /etc/systemd/system/sing-box.service
+
+systemctl daemon-reload
+
+success "已卸载"
+
 }
 
-show_subscription() {
-  require_root
-  load_state || return 1
-  echo
-  info '当前节点信息'
-  echo "服务器 IP: ${SERVER_IP}"
-  echo "端口: ${PORT}"
-  echo "用户名: ${USERNAME}"
-  echo "密码: ${PASSWORD}"
-  echo "SNI: ${SERVER_NAME}"
-  echo "Reality PublicKey: ${PUBLIC_KEY}"
-  echo "Reality ShortID: ${SHORT_ID}"
-  echo "Fingerprint: chrome"
-  echo "备注: ${REMARK}"
-  echo
-  echo 'v2rayN配置：'
-  echo "anytls://${PASSWORD}@${SERVER_IP}:${PORT}?security=reality&sni=${SERVER_NAME}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${REMARK}"
-  echo
-  echo 'sing-box 客户端示例配置：'
-  cat <<EOF
-{
-  "type": "anytls",
-  "tag": "${REMARK}",
-  "server": "${SERVER_IP}",
-  "server_port": ${PORT},
-  "password": "${PASSWORD}",
-  "tls": {
-    "enabled": true,
-    "server_name": "${SERVER_NAME}",
-    "reality": {
-      "enabled": true,
-      "public_key": "${PUBLIC_KEY}",
-      "short_id": "${SHORT_ID}"
-    }
-  }
-}
-EOF
+view_log(){
+
+journalctl -u sing-box -f
+
 }
 
-install_app() {
-  require_root
-  require_debian_ubuntu
-  install_deps
-  install_singbox
-  ask_config
-  generate_or_use_key
-  write_config
-  save_state
-  open_firewall
-  start_service
-  show_subscription
+modify_config(){
+
+[ ! -f "$config_path" ] && error "配置不存在" && return
+
+port=$(jq -r '.inbounds[0].listen_port' $config_path)
+uuid=$(jq -r '.inbounds[0].users[0].uuid' $config_path)
+path=$(jq -r '.inbounds[0].transport.path' $config_path)
+host=$(jq -r '.inbounds[0].transport.host // ""' $config_path)
+
+echo "当前配置:"
+echo "端口: $port"
+echo "UUID: $uuid"
+echo "Host: $host"
+echo "Path: $path"
+echo
+
+read -p "新端口 (回车不改): " new_port
+read -p "新UUID (回车不改): " new_uuid
+read -p "新Host (回车不改): " new_host
+read -p "新Path (回车不改): " new_path
+
+[ -n "$new_port" ] && port=$new_port
+[ -n "$new_uuid" ] && uuid=$new_uuid
+[ -n "$new_host" ] && host=$new_host
+[ -n "$new_path" ] && path=$new_path
+
+[[ "$path" != /* ]] && path="/$path"
+
+# 关键修复
+ws_host="$host"
+ws_path="$path"
+
+write_config "$port" "$uuid"
+
+systemctl restart sing-box
+
+success "配置已更新"
+
+view_node
+
 }
 
-uninstall_app() {
-  require_root
-  systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
-  apt-get remove -y sing-box >/dev/null 2>&1 || true
-  apt-get purge -y sing-box >/dev/null 2>&1 || true
-  rm -f "$SINGBOX_CONFIG" "$STATE_FILE"
-  rm -rf "$SINGBOX_DIR"
-  info '已卸载 sing-box、配置文件与状态文件。'
+view_node(){
+
+ip=$(get_public_ip)
+
+uuid=$(jq -r '.inbounds[0].users[0].uuid' $config_path)
+port=$(jq -r '.inbounds[0].listen_port' $config_path)
+path=$(jq -r '.inbounds[0].transport.path' $config_path)
+host=$(jq -r '.inbounds[0].transport.host // ""' $config_path)
+
+link="vless://$uuid@$ip:$port?type=httpupgrade&path=$path&host=$host&encryption=none#$(hostname)"
+
+echo "--------------------------------"
+echo -e "${green}VLESS HTTPUpgrade 节点${none}"
+echo "地址: $ip"
+echo "端口: $port"
+echo "UUID: $uuid"
+echo "Host: $host"
+echo "Path: $path"
+echo
+echo "$link"
+echo "--------------------------------"
+
 }
 
-status_app() {
-  systemctl --no-pager --full status "$SERVICE_NAME" || true
+press_any_key(){
+read -n1 -s -r -p "按任意键继续..."
 }
 
-pause_return() {
-  echo
-  read -rp '按回车返回菜单...' _
+menu(){
+
+while true
+do
+
+clear
+
+check_status
+
+echo "--------------------------------"
+echo "Sing-box VLESS+HTTPUpgrade 管理"
+echo "--------------------------------"
+echo "$status_info"
+echo "--------------------------------"
+echo "1. 安装节点"
+echo "2. 更新"
+echo "3. 重启"
+echo "4. 卸载"
+echo "5. 查看日志"
+echo "6. 修改配置"
+echo "7. 查看节点"
+echo "0. 退出"
+echo "--------------------------------"
+
+read -p "请选择: " choice
+
+case $choice in
+
+1) install_node ;;
+2) update_core ;;
+3) restart_core ;;
+4) uninstall_core ;;
+5) view_log ;;
+6) modify_config ;;
+7) view_node ;;
+0) exit ;;
+
+*) error "无效选项" ;;
+
+esac
+
+press_any_key
+
+done
+
 }
 
-show_menu() {
-  clear
-  echo '====== sing-box anytls+reality 管理 ======'
-  echo '1. 安装'
-  echo '2. 卸载'
-  echo '3. 查看状态'
-  echo '4. 查看节点信息'
-  echo '5. 修改配置'
-  echo '0. 退出'
+main(){
+
+pre_check
+menu
+
 }
 
-menu_loop() {
-  while true; do
-    show_menu
-    read -rp '请输入选项: ' choice
-    case "$choice" in
-      1) install_app; pause_return ;;
-      2) uninstall_app; pause_return ;;
-      3) status_app; pause_return ;;
-      4) show_subscription; pause_return ;;
-      5) install_app; pause_return ;;
-      0) exit 0 ;;
-      *) err '无效选项'; pause_return ;;
-    esac
-  done
-}
-
-setup_logging
-menu_loop
+main

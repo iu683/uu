@@ -1,350 +1,353 @@
 #!/bin/bash
-# ========================================
-# Xray VMess WS 多节点管理脚本（无TLS）
-# ========================================
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-RESET="\033[0m"
+# ================== 颜色 ==================
+green="\033[32m"
+yellow="\033[33m"
+red="\033[31m"
+skyblue="\033[36m"
+purple="\033[35m"
+re="\033[0m"
+BLUE="\033[34m"
 
-APP_NAME="xray-vmess-ws"
-APP_DIR="/root/$APP_NAME"
-
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+# ================== 系统检测 ==================
+detect_os() {
+    OS=$(grep -o -E "Debian|Ubuntu|CentOS|Alpine|Fedora|Rocky|AlmaLinux|Amazon" /etc/os-release 2>/dev/null | head -n 1)
+    if [[ -z $OS ]]; then
+        echo -e "${red}不支持的系统！${re}"
         exit 1
-    fi
-    if ! command -v jq &>/dev/null; then
-        echo -e "${YELLOW}安装 jq...${RESET}"
-        apt update && apt install -y jq
-    fi
-}
-
-random_port() {
-    while :; do
-        PORT=$(shuf -i 2000-65000 -n1)
-        ss -lntu | grep -q ":$PORT " || break
-    done
-    echo "$PORT"
-}
-
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
-}
-
-list_nodes() {
-    mkdir -p "$APP_DIR"
-    echo -e "${GREEN}=== 已有 VMess 节点 ===${RESET}"
-    local count=0
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        echo -e "${YELLOW}[$count] $(basename "$node")${RESET}"
-    done
-    [ $count -eq 0 ] && echo -e "${YELLOW}无节点${RESET}"
-}
-
-select_node() {
-    list_nodes
-    read -r -p $'\033[32m请输入节点名称或编号: \033[0m' input
-    if [[ "$input" =~ ^[0-9]+$ ]]; then
-        NODE_NAME=$(ls -d "$APP_DIR"/* 2>/dev/null | sed -n "${input}p" | xargs basename)
     else
-        NODE_NAME="$input"
+        echo -e "${green}检测到系统：${yellow}${OS}${re}"
     fi
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-    if [ ! -d "$NODE_DIR" ]; then
-        echo -e "${RED}节点不存在！${RESET}"
+}
+
+# ================== 基础依赖 ==================
+install_deps() {
+    case $OS in
+        Debian|Ubuntu)
+            apt update -y
+            apt install -y wget tar build-essential libreadline-dev libncursesw5-dev libssl-dev libsqlite3-dev tk-dev libgdbm-dev libc6-dev libbz2-dev libffi-dev zlib1g-dev curl jq software-properties-common
+            ;;
+        CentOS)
+            yum update -y
+            yum groupinstall -y "development tools"
+            yum install -y wget tar openssl-devel bzip2-devel libffi-devel zlib-devel curl jq epel-release yum-utils
+            ;;
+        Fedora|Rocky|AlmaLinux|Amazon)
+            dnf update -y
+            dnf groupinstall -y "development tools"
+            dnf install -y wget tar openssl-devel bzip2-devel libffi-devel zlib-devel curl jq epel-release yum-utils
+            ;;
+        Alpine)
+            apk update
+            apk add wget tar build-base openssl-dev bzip2-dev libffi-dev zlib-dev curl jq
+            ;;
+    esac
+}
+
+# ================== 系统架构 ==================
+get_arch() {
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64) ARCH="amd64" ;;
+        x86) ARCH="386" ;;
+        arm64|aarch64) ARCH="arm64" ;;
+        *) echo -e "${red}不支持的架构: $arch${re}"; exit 1 ;;
+    esac
+}
+
+# ================== Python ==================
+install_python() {
+
+    latest_version="3.14.3"
+
+    if command -v python3 &>/dev/null; then
+        current_version=$(python3 -V 2>&1 | awk '{print $2}')
+
+        if [[ "$current_version" == "$latest_version" ]]; then
+            echo -e "${green}Python 已是指定版本: ${yellow}${latest_version}${re}"
+            return
+        fi
+
+        read -rp "检测到当前版本 ${current_version}, 是否安装 Python ${latest_version}？[y/n]: " confirm
+        [[ ! $confirm =~ ^[Yy]$ ]] && return
+    fi
+
+    install_deps
+
+    cd /tmp || exit
+
+    echo -e "${yellow}正在下载 Python ${latest_version}...${re}"
+
+    wget -q --show-progress -c \
+    https://www.python.org/ftp/python/${latest_version}/Python-${latest_version}.tar.xz
+
+    if [[ ! -f Python-${latest_version}.tar.xz ]]; then
+        echo -e "${red}Python 下载失败${re}"
+        return
+    fi
+
+    tar -xf Python-${latest_version}.tar.xz
+    cd Python-${latest_version} || exit
+
+    echo -e "${yellow}开始编译安装...${re}"
+
+    ./configure --prefix=/usr/local/python3
+    make -j$(nproc 2>/dev/null || echo 2)
+    make altinstall
+
+    PY_BIN=$(find /usr/local/python3/bin -name "python3.*" | sort -V | tail -n1)
+    PIP_BIN=$(find /usr/local/python3/bin -name "pip3*" | head -n1)
+
+    ln -sf "$PY_BIN" /usr/local/bin/python3
+    ln -sf "$PIP_BIN" /usr/local/bin/pip3
+
+    python3 -m ensurepip --upgrade
+    python3 -m pip install --upgrade pip
+
+    echo -e "${green}Python ${latest_version} 安装成功${re}"
+
+    cd /tmp
+    rm -rf Python-${latest_version}*
+}
+
+remove_python() {
+
+    echo -e "${yellow}卸载 Python (仅删除手动安装版本)...${re}"
+
+    rm -rf /usr/local/python3
+    rm -f /usr/local/bin/python3*
+    rm -f /usr/local/bin/pip3*
+
+    echo -e "${green}Python 卸载完成${re}"
+}
+
+# ================== Node.js ==================
+install_node() {
+
+if command -v node &>/dev/null; then
+    echo -e "${yellow}Node.js 已安装: $(node -v)${re}"
+    return
+fi
+
+echo -e "${green}安装 Node.js...${re}"
+
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt install -y nodejs
+
+echo -e "${green}Node版本: $(node -v)${re}"
+echo -e "${green}NPM版本: $(npm -v)${re}"
+
+}
+
+remove_node() {
+    echo -e "${yellow}卸载 Node.js...${re}"
+
+    apt purge -y nodejs
+    apt autoremove -y
+
+    echo -e "${green}Node.js 卸载完成${re}"
+}
+
+# ================== Go ==================
+install_go() {
+    get_arch
+    html=$(curl -s https://go.dev/dl/)
+    latest_version=$(echo "$html" | grep -oP 'go[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+    latest_version_num=${latest_version/go/}
+
+    if command -v go &>/dev/null; then
+        current_version=$(go version | grep -oE 'go[0-9]+\.[0-9]+\.[0-9]+' | cut -c3-)
+        [[ $current_version == $latest_version_num ]] && {
+            echo -e "${green}Go 已是最新版: $current_version${re}"
+            return
+        }
+
+        read -p "检测到 Go 版本 $current_version, 升级到 $latest_version_num？[y/n]: " confirm
+        [[ ! $confirm =~ ^[Yy]$ ]] && return
+
+        remove_go
+    fi
+
+    echo -e "${yellow}下载 Go ${latest_version_num}...${re}"
+
+    wget -O /tmp/go_latest.tar.gz "https://go.dev/dl/${latest_version}.linux-${ARCH}.tar.gz" || {
+        echo -e "${red}Go 下载失败${re}"
+        return
+    }
+
+    rm -rf /usr/local/go
+    tar -C /usr/local -xzf /tmp/go_latest.tar.gz
+
+    echo "export PATH=/usr/local/go/bin:\$PATH" > /etc/profile.d/go.sh
+    source /etc/profile.d/go.sh
+    hash -r
+
+    rm -f /tmp/go_latest.tar.gz
+
+    echo -e "${green}Go 安装完成，当前版本: $(go version)${re}"
+}
+
+remove_go() {
+    echo -e "${yellow}卸载 Go...${re}"
+
+    rm -rf /usr/local/go
+    rm -f /etc/profile.d/go.sh
+
+    hash -r
+
+    echo -e "${green}Go 卸载完成${re}"
+}
+
+# ================== Java 21 ==================
+install_java() {
+    if command -v java >/dev/null 2>&1; then
+        current_version=$(java -version 2>&1 | awk -F '"' '/version/ {print $2}')
+        echo -e "${yellow}检测到已安装 Java: ${current_version}${re}"
+        read -p "是否重新安装 Java21？ [y/N]: " confirm
+        [[ ! $confirm =~ ^[Yy]$ ]] && return
+        remove_java
+    fi
+
+    echo -e "${yellow}安装 Java21...${re}"
+
+    case $OS in
+        Debian|Ubuntu)
+            apt update -y
+
+            # Debian12(Bookworm)
+            if grep -qi "bookworm" /etc/os-release; then
+                echo -e "${yellow}检测到 Debian12，使用 Temurin21 安装...${re}"
+
+                apt install -y wget gpg ca-certificates
+
+                mkdir -p /etc/apt/keyrings
+
+                wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public \
+                | gpg --dearmor -o /etc/apt/keyrings/adoptium.gpg
+
+                echo "deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb bookworm main" \
+                > /etc/apt/sources.list.d/adoptium.list
+
+                apt update -y
+                apt install -y temurin-21-jdk
+
+            # Debian13+
+            else
+                apt install -y openjdk-21-jdk
+            fi
+        ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon)
+            yum install -y java-21-openjdk java-21-openjdk-devel
+        ;;
+        Alpine)
+            apk add openjdk21
+        ;;
+        *)
+            echo -e "${red}暂不支持该系统${re}"
+            return 1
+        ;;
+    esac
+
+    if command -v java >/dev/null 2>&1; then
+        echo -e "${green}Java 安装完成${re}"
+        java -version
+    else
+        echo -e "${red}Java 安装失败${re}"
         return 1
     fi
 }
 
-install_node() {
+remove_java() {
+    echo -e "${yellow}卸载 Java...${re}"
 
-    check_docker
+    case $OS in
+        Debian|Ubuntu)
+            apt remove -y 'openjdk-*' 'temurin-*' 2>/dev/null
+            apt autoremove -y
+            rm -f /etc/apt/sources.list.d/adoptium.list
+            rm -f /etc/apt/keyrings/adoptium.gpg
+        ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon)
+            yum remove -y java* && yum autoremove -y
+        ;;
+        Alpine)
+            apk del openjdk21
+        ;;
+    esac
 
-    read -p "请输入节点名称 [默认node$(date +%s)]: " NODE_NAME
-    NODE_NAME=${NODE_NAME:-node$(date +%s)}
-    NODE_DIR="$APP_DIR/$NODE_NAME"
-    mkdir -p "$NODE_DIR"
-
-    read -p "请输入端口 [默认随机]: " PORT
-    PORT=${PORT:-$(random_port)}
-
-    if ss -lntu | grep -q ":$PORT "; then
-        echo -e "${RED}端口已被占用${RESET}"
-        return
-    fi
-
-
-    read -p "请输入 WebSocket Host (可留空): " WS_HOST
-
-    read -p "请输入 WebSocket Path [默认 /ws]: " WS_PATH
-    WS_PATH=${WS_PATH:-/ws}
-
-    UUID=$(cat /proc/sys/kernel/random/uuid)
-
-    CONFIG_FILE="$NODE_DIR/config.json"
-    COMPOSE_FILE="$NODE_DIR/docker-compose.yml"
-
-cat > "$CONFIG_FILE" <<EOF
-{
-  "log": { "loglevel": "warning" },
-  "inbounds": [
-    {
-      "port": $PORT,
-      "protocol": "vmess",
-      "settings": {
-        "clients": [
-          { "id": "$UUID", "alterId": 0 }
-        ]
-      },
-      "streamSettings": {
-        "network": "ws",
-        "security": "none",
-        "wsSettings": {
-          "path": "$WS_PATH",
-          "headers": {
-            "Host": "$WS_HOST"
-          }
-        }
-      }
-    }
-  ],
-  "outbounds": [
-    { "protocol": "freedom" }
-  ]
+    rm -rf /usr/lib/jvm /usr/local/java /opt/java
+    echo -e "${green}Java 卸载完成${re}"
 }
-EOF
-
-cat > "$COMPOSE_FILE" <<EOF
-services:
-  $NODE_NAME:
-    image: ghcr.io/xtls/xray-core:latest
-    container_name: $NODE_NAME
-    restart: unless-stopped
-    command: ["run","-c","/etc/xray/config.json"]
-    volumes:
-      - ./config.json:/etc/xray/config.json:ro
-    ports:
-      - "$PORT:$PORT/tcp"
-EOF
-
-    cd "$NODE_DIR"
-    docker compose up -d
-
-    IP=$(get_public_ip)
-
-VMESS_JSON=$(jq -n \
---arg v "2" \
---arg ps "$NODE_NAME" \
---arg add "$IP" \
---arg port "$PORT" \
---arg id "$UUID" \
---arg aid "0" \
---arg net "ws" \
---arg type "none" \
---arg host "$WS_HOST" \
---arg path "$WS_PATH" \
---arg tls "" \
-'{
-v:$v,
-ps:$ps,
-add:$add,
-port:$port,
-id:$id,
-aid:$aid,
-net:$net,
-type:$type,
-host:$host,
-path:$path,
-tls:$tls
-}' | base64 | tr -d '\n')
-
-echo
-echo -e "${GREEN}📂 安装目录: $NODE_DIR${RESET}"
-echo -e "${GREEN}✅ VMess-WS 节点已启动${RESET}"
-echo -e "${YELLOW}🌐 地址: ${IP}${RESET}"
-echo -e "${YELLOW}🔌 端口: ${PORT}${RESET}"
-echo -e "${YELLOW}🆔 UUID: ${UUID}${RESET}"
-echo -e "${YELLOW}🌐 Host: $WS_HOST${RESET}"
-echo -e "${YELLOW}🌐 Path: $WS_PATH${RESET}"
-
-echo
-echo -e "${YELLOW}📄 V2rayN链接:${RESET}"
-echo -e "${YELLOW}vmess://${VMESS_JSON}${RESET}"
-
-echo -e "${YELLOW}📄 Surge配置:${RESET}"
-echo -e "${YELLOW}$NODE_NAME = vmess, ${IP}, ${PORT}, username=${UUID}, ws=true, ws-path=$WS_PATH, ws-headers=Host:\"$WS_HOST\", vmess-aead=true, tls=false${RESET}"
-
-cat > "$NODE_DIR/node.txt" <<EOF
-V2rayN链接
-vmess://${VMESS_JSON}
-
-Surge配置
-$NODE_NAME = vmess, ${IP}, ${PORT}, username=${UUID}, ws=true, ws-path=$WS_PATH, ws-headers=Host:"$WS_HOST", vmess-aead=true, tls=false
-EOF
-
-read -r -p $'\033[32m按回车返回菜单...\033[0m'
+# ================== PHP ==================
+install_php() {
+    case $OS in
+        Debian|Ubuntu)
+            apt update -y
+            add-apt-repository -y ppa:ondrej/php
+            apt update -y
+            latest_version=$(apt-cache pkgnames | grep -oP '^php[0-9]+\.[0-9]+$' | sort -V | tail -1)
+            apt install -y $latest_version $latest_version-cli $latest_version-fpm $latest_version-mysql $latest_version-xml $latest_version-curl $latest_version-mbstring $latest_version-zip
+            ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon)
+            yum install -y epel-release yum-utils
+            yum install -y https://rpms.remirepo.net/enterprise/remi-release-7.rpm
+            yum-config-manager --enable remi-php74   # 可修改为最新支持版本
+            yum install -y php php-cli php-fpm php-mysqlnd php-xml php-mbstring php-curl php-zip
+            ;;
+        Alpine)
+            apk add --no-cache php php-cli php-fpm php-mysqli php-curl php-xml php-mbstring php-zip
+            ;;
+    esac
+    echo -e "${green}PHP 安装完成，版本: $(php -v | head -n1)${re}"
 }
 
-node_action_menu() {
-    select_node || return
-    while true; do
-        echo -e "${GREEN}=== 节点 [$NODE_NAME] 管理 ===${RESET}"
-        echo -e "${GREEN}1) 暂停${RESET}"
-        echo -e "${GREEN}2) 重启${RESET}"
-        echo -e "${GREEN}3) 更新${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 卸载${RESET}"
-        echo -e "${GREEN}6) 查看节点信息${RESET}"
-        echo -e "${GREEN}0) 返回主菜单${RESET}"
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
-        case $choice in
-            1) docker pause "$NODE_NAME" ;;
-            2) docker restart "$NODE_NAME" ;;
-            3) (cd "$NODE_DIR" && docker compose pull && docker compose up -d) ;;
-            4) docker logs -f "$NODE_NAME" ;;
-            5) docker compose -f "$NODE_DIR/docker-compose.yml" down && rm -rf "$NODE_DIR" && return ;;
-            6) cat "$NODE_DIR/node.txt" ;;
-            0) return ;;
-        esac
-    done
+remove_php() {
+    echo -e "${yellow}卸载 PHP...${re}"
+    case $OS in
+        Debian|Ubuntu) apt purge -y php* && apt autoremove -y ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon) yum remove -y php* && yum autoremove -y ;;
+        Alpine) apk del php php-cli php-fpm php-mysqli php-curl php-xml php-mbstring php-zip ;;
+    esac
+    echo -e "${green}PHP 卸载完成${re}"
 }
 
-show_all_status() {
-    list_nodes
-    echo -e "${GREEN}=== 节点状态 ===${RESET}"
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        NODE_NAME=$(basename "$node")
-        PORT=$(grep '"port"' "$node/config.json" | head -n1 | awk -F': ' '{print $2}' | tr -d ',')
-        STATUS=$(docker inspect -f '{{.State.Status}}' "$NODE_NAME" 2>/dev/null)
-        echo -e "${GREEN}$NODE_NAME | 端口:$PORT | 状态:$STATUS${RESET}"
-    done
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
-}
-
-batch_action() {
-
-    mkdir -p "$APP_DIR"
-
-    NODE_LIST=()
-    local count=0
-
-    for node in "$APP_DIR"/*; do
-        [ -d "$node" ] || continue
-        count=$((count+1))
-        NODE_NAME=$(basename "$node")
-        NODE_LIST+=("$NODE_NAME")
-    done
-
-    if [ $count -eq 0 ]; then
-        echo -e "${YELLOW}无节点${RESET}"
-        read -r -p $'\033[32m按回车返回菜单...\033[0m'
-        return
-    fi
-
-    echo -e "${GREEN}=== 批量管理节点 ===${RESET}"
-    echo -e "${GREEN}1) 暂停节点${RESET}"
-    echo -e "${GREEN}2) 重启节点${RESET}"
-    echo -e "${GREEN}3) 更新节点${RESET}"
-    echo -e "${GREEN}4) 卸载节点${RESET}"
-    echo -e "${GREEN}0) 返回菜单${RESET}"
-    read -r -p $'\033[32m请选择: \033[0m' action
-
-    [[ "$action" == "0" ]] && return
-
-    echo
-    echo -e "${GREEN}节点列表:${RESET}"
-
-    count=0
-    for node in "${NODE_LIST[@]}"; do
-        count=$((count+1))
-        echo -e "${YELLOW}[$count] $node${RESET}"
-    done
-
-    echo
-    read -r -p $'\033[32m请输入节点序号（空格分隔，或输入 all）: \033[0m' input
-
-    SELECTED=()
-
-    if [[ "$input" == "all" ]]; then
-        SELECTED=("${NODE_LIST[@]}")
-    else
-        for i in $input; do
-            if [[ "$i" =~ ^[0-9]+$ ]] && [ "$i" -ge 1 ] && [ "$i" -le "${#NODE_LIST[@]}" ]; then
-                SELECTED+=("${NODE_LIST[$((i-1))]}")
-            fi
-        done
-    fi
-
-    for NODE_NAME in "${SELECTED[@]}"; do
-
-        NODE_DIR="$APP_DIR/$NODE_NAME"
-
-        case $action in
-
-            1)
-                docker pause "$NODE_NAME"
-                ;;
-
-            2)
-                docker restart "$NODE_NAME"
-                ;;
-
-            3)
-                (cd "$NODE_DIR" && docker compose pull && docker compose up -d)
-                ;;
-
-            4)
-                (cd "$NODE_DIR" && docker compose down && rm -rf "$NODE_DIR")
-                ;;
-
-        esac
-
-        echo -e "${GREEN}完成 $NODE_NAME${RESET}"
-
-    done
-
-    read -r -p $'\033[32m按回车返回菜单...\033[0m'
-}
-
-menu() {
+# ================== 主菜单 ==================
+main_menu() {
+    detect_os
     while true; do
         clear
-        echo -e "${GREEN}=== Xray-VMess+WS 多节点管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动新节点${RESET}"
-        echo -e "${GREEN}2) 管理已有节点${RESET}"
-        echo -e "${GREEN}3) 查看所有节点状态${RESET}"
-        echo -e "${GREEN}4) 管理所有节点${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -r -p $'\033[32m请选择操作: \033[0m' choice
+        echo -e "${yellow}===== 常用环境安装管理=====${re}"
+        echo -e "${green} 1.安装Python${re}"
+        echo -e "${green} 2.安装Nodejs${re}"
+        echo -e "${green} 3.安装Golang${re}"
+        echo -e "${green} 4.安装Java${re}"
+        echo -e "${green} 5.安装PHP${re}"
+        echo -e "${yellow}===== 常用环境卸载管理=====${re}"
+        echo -e "${green} 6.卸载Python${re}"
+        echo -e "${green} 7.卸载Nodejs${re}"
+        echo -e "${green} 8.卸载Golang${re}"
+        echo -e "${green} 9.卸载Java${re}"
+        echo -e "${green}10.卸载PHP${re}"
+        echo -e "${green} 0.退出${re}"
+        read -p "$(echo -e ${green} 请输入选项: ${re})" choice
+
         case $choice in
-            1) install_node ;;
-            2) node_action_menu ;;
-            3) show_all_status ;;
-            4) batch_action ;;
+            1) install_python ;;
+            2) install_node ;;
+            3) install_go ;;
+            4) install_java ;;
+            5) install_php ;;
+            6) remove_python ;;
+            7) remove_node ;;
+            8) remove_go ;;
+            9) remove_java ;;
+            10) remove_php ;;
             0) exit 0 ;;
+            *) echo -e "${yellow}无效输入！${re}"; sleep 1 ;;
         esac
+        read -p "$(echo -e ${GREEN}按任意键返回菜单...${RESET})" dummy
     done
 }
 
-menu
+# ================== 启动菜单 ==================
+main_menu

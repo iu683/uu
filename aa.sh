@@ -1,620 +1,331 @@
-#!/usr/bin/env bash
-set -e
+#!/bin/bash
 
-#################################
-# 基础信息
-#################################
-APP="naive"
-ROOT="/naive"
-COMPOSE="$ROOT/docker-compose.yml"
-CONFIG="$ROOT/config/naive.json"
-INFO="$ROOT/config/info.conf"
+# ================== 颜色 ==================
+green="\033[32m"
+yellow="\033[33m"
+red="\033[31m"
+skyblue="\033[36m"
+purple="\033[35m"
+re="\033[0m"
+BLUE="\033[34m"
 
-#################################
-# 颜色
-#################################
-GREEN='\033[32m'
-RED='\033[31m'
-YELLOW='\033[33m'
-CYAN='\033[36m'
-RESET='\033[0m'
-
-#################################
-# Docker检查
-#################################
-check_docker() {
-
-    if ! command -v docker >/dev/null 2>&1; then
-        echo -e "${YELLOW}正在安装 Docker...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-
-    if ! docker compose version >/dev/null 2>&1; then
-        echo -e "${RED}Docker Compose 不存在${RESET}"
+# ================== 系统检测 ==================
+detect_os() {
+    OS=$(grep -o -E "Debian|Ubuntu|CentOS|Alpine|Fedora|Rocky|AlmaLinux|Amazon" /etc/os-release 2>/dev/null | head -n 1)
+    if [[ -z $OS ]]; then
+        echo -e "${red}不支持的系统！${re}"
         exit 1
+    else
+        echo -e "${green}检测到系统：${yellow}${OS}${re}"
     fi
 }
 
-#################################
-# 安装
-#################################
-install_naive() {
+# ================== 基础依赖 ==================
+install_deps() {
+    case $OS in
+        Debian|Ubuntu)
+            apt update -y
+            apt install -y wget tar build-essential libreadline-dev libncursesw5-dev libssl-dev libsqlite3-dev tk-dev libgdbm-dev libc6-dev libbz2-dev libffi-dev zlib1g-dev curl jq software-properties-common
+            ;;
+        CentOS)
+            yum update -y
+            yum groupinstall -y "development tools"
+            yum install -y wget tar openssl-devel bzip2-devel libffi-devel zlib-devel curl jq epel-release yum-utils
+            ;;
+        Fedora|Rocky|AlmaLinux|Amazon)
+            dnf update -y
+            dnf groupinstall -y "development tools"
+            dnf install -y wget tar openssl-devel bzip2-devel libffi-devel zlib-devel curl jq epel-release yum-utils
+            ;;
+        Alpine)
+            apk update
+            apk add wget tar build-base openssl-dev bzip2-dev libffi-dev zlib-dev curl jq
+            ;;
+    esac
+}
 
-    check_docker
+# ================== 系统架构 ==================
+get_arch() {
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64) ARCH="amd64" ;;
+        x86) ARCH="386" ;;
+        arm64|aarch64) ARCH="arm64" ;;
+        *) echo -e "${red}不支持的架构: $arch${re}"; exit 1 ;;
+    esac
+}
 
-    mkdir -p $ROOT/{config,html,data}
+# ================== Python ==================
+install_python() {
 
-    echo -e "${GREEN}请输入配置信息${RESET}"
+    latest_version="3.14.3"
 
-    read -rp "域名: " DOMAIN
-    read -rp "邮箱: " EMAIL
-    read -rp "用户名: " USER
-    read -rsp "密码: " PASS
-    echo
-    read -rp "端口 [443]: " PORT
-    PORT=${PORT:-443}
-    read -rp "节点名 [DE]: " NODE
-    NODE=${NODE:-DE}
+    if command -v python3 &>/dev/null; then
+        current_version=$(python3 -V 2>&1 | awk '{print $2}')
 
-    AUTH=$(printf "%s:%s" "$USER" "$PASS" | base64 -w0)
+        if [[ "$current_version" == "$latest_version" ]]; then
+            echo -e "${green}Python 已是指定版本: ${yellow}${latest_version}${re}"
+            return
+        fi
 
-    cat > "$INFO" <<EOF
-DOMAIN="$DOMAIN"
-EMAIL="$EMAIL"
-USER="$USER"
-PASS="$PASS"
-PORT="$PORT"
-NODE="$NODE"
-EOF
+        read -rp "检测到当前版本 ${current_version}, 是否安装 Python ${latest_version}？[y/n]: " confirm
+        [[ ! $confirm =~ ^[Yy]$ ]] && return
+    fi
 
-cat > "$COMPOSE" <<EOF
-services:
-  naive:
-    container_name: naive
-    image: jonssonyan/naive
-    restart: always
-    network_mode: host
-    volumes:
-      - /naive/config:/naive/config
-      - /naive/html:/naive/html
-      - /naive/data:/naive/data
-    command: ./naive run --config /naive/config/naive.json
-EOF
+    install_deps
 
-cat > "$CONFIG" <<EOF
-{
-  "admin": {
-    "disabled": true
-  },
-  "logging": {
-    "sink": {
-      "writer": {
-        "output": "stderr"
-      }
-    }
-  },
-  "storage": {
-    "module": "file_system",
-    "root": "/naive/data/file_system"
-  },
-  "apps": {
-    "http": {
-      "servers": {
-        "srv0": {
-          "listen": [
-            ":$PORT"
-          ],
-          "routes": [
-            {
-              "handle": [
-                {
-                  "handler": "subroute",
-                  "routes": [
-                    {
-                      "handle": [
-                        {
-                          "handler": "forward_proxy",
-                          "auth_credentials": [
-                            "$AUTH"
-                          ],
-                          "hide_ip": true,
-                          "hide_via": true,
-                          "probe_resistance": {}
-                        }
-                      ]
-                    },
-                    {
-                      "match": [
-                        {
-                          "host": [
-                            "$DOMAIN"
-                          ]
-                        }
-                      ],
-                      "handle": [
-                        {
-                          "handler": "file_server",
-                          "root": "/naive/html",
-                          "index_names": [
-                            "index.html"
-                          ]
-                        }
-                      ],
-                      "terminal": true
-                    }
-                  ]
-                }
-              ]
-            }
-          ],
-          "automatic_https": {
-            "disable": true
-          }
+    cd /tmp || exit
+
+    echo -e "${yellow}正在下载 Python ${latest_version}...${re}"
+
+    wget -q --show-progress -c \
+    https://www.python.org/ftp/python/${latest_version}/Python-${latest_version}.tar.xz
+
+    if [[ ! -f Python-${latest_version}.tar.xz ]]; then
+        echo -e "${red}Python 下载失败${re}"
+        return
+    fi
+
+    tar -xf Python-${latest_version}.tar.xz
+    cd Python-${latest_version} || exit
+
+    echo -e "${yellow}开始编译安装...${re}"
+
+    ./configure --prefix=/usr/local/python3
+    make -j$(nproc 2>/dev/null || echo 2)
+    make altinstall
+
+    PY_BIN=$(find /usr/local/python3/bin -name "python3.*" | sort -V | tail -n1)
+    PIP_BIN=$(find /usr/local/python3/bin -name "pip3*" | head -n1)
+
+    ln -sf "$PY_BIN" /usr/local/bin/python3
+    ln -sf "$PIP_BIN" /usr/local/bin/pip3
+
+    python3 -m ensurepip --upgrade
+    python3 -m pip install --upgrade pip
+
+    echo -e "${green}Python ${latest_version} 安装成功${re}"
+
+    cd /tmp
+    rm -rf Python-${latest_version}*
+}
+
+remove_python() {
+
+    echo -e "${yellow}卸载 Python (仅删除手动安装版本)...${re}"
+
+    rm -rf /usr/local/python3
+    rm -f /usr/local/bin/python3*
+    rm -f /usr/local/bin/pip3*
+
+    echo -e "${green}Python 卸载完成${re}"
+}
+
+# ================== Node.js ==================
+install_node() {
+
+if command -v node &>/dev/null; then
+    echo -e "${yellow}Node.js 已安装: $(node -v)${re}"
+    return
+fi
+
+echo -e "${green}安装 Node.js...${re}"
+
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt install -y nodejs
+
+echo -e "${green}Node版本: $(node -v)${re}"
+echo -e "${green}NPM版本: $(npm -v)${re}"
+
+}
+
+remove_node() {
+    echo -e "${yellow}卸载 Node.js...${re}"
+
+    apt purge -y nodejs
+    apt autoremove -y
+
+    echo -e "${green}Node.js 卸载完成${re}"
+}
+
+# ================== Go ==================
+install_go() {
+    get_arch
+    html=$(curl -s https://go.dev/dl/)
+    latest_version=$(echo "$html" | grep -oP 'go[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+    latest_version_num=${latest_version/go/}
+
+    if command -v go &>/dev/null; then
+        current_version=$(go version | grep -oE 'go[0-9]+\.[0-9]+\.[0-9]+' | cut -c3-)
+        [[ $current_version == $latest_version_num ]] && {
+            echo -e "${green}Go 已是最新版: $current_version${re}"
+            return
         }
-      }
-    },
-    "tls": {
-      "certificates": {
-        "automate": [
-          "$DOMAIN"
-        ]
-      },
-      "automation": {
-        "policies": [
-          {
-            "issuers": [
-              {
-                "module": "acme",
-                "email": "$EMAIL"
-              }
-            ]
-          }
-        ]
-      }
-    }
-  }
-}
-EOF
 
-cat > "$ROOT/html/index.html" <<'EOF'
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Global Infrastructure Group</title>
-  <meta name="description"
-        content="Global Infrastructure Group edge delivery platform." />
-  <meta name="theme-color" content="#0f172a" />
+        read -p "检测到 Go 版本 $current_version, 升级到 $latest_version_num？[y/n]: " confirm
+        [[ ! $confirm =~ ^[Yy]$ ]] && return
 
-  <link rel="icon"
-        href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22><rect width=%2264%22 height=%2264%22 rx=%2216%22 fill=%22%230ea5e9%22/></svg>">
+        remove_go
+    fi
 
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect"
-        href="https://fonts.gstatic.com"
-        crossorigin>
+    echo -e "${yellow}下载 Go ${latest_version_num}...${re}"
 
-  <link rel="stylesheet"
-        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap">
-
-  <style>
-    :root{
-      --text-main:#f8fafc;
-      --text-soft:rgba(248,250,252,.72);
-      --card-bg:rgba(255,255,255,.12);
-      --card-border:rgba(255,255,255,.18);
-      --success:#86efac;
-      --shadow:0 24px 70px rgba(15,23,42,.25);
+    wget -O /tmp/go_latest.tar.gz "https://go.dev/dl/${latest_version}.linux-${ARCH}.tar.gz" || {
+        echo -e "${red}Go 下载失败${re}"
+        return
     }
 
-    *{box-sizing:border-box}
+    rm -rf /usr/local/go
+    tar -C /usr/local -xzf /tmp/go_latest.tar.gz
 
-    body{
-      min-height:100vh;
-      margin:0;
-      font-family:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-      color:var(--text-main);
-      background:
-      linear-gradient(rgba(15,23,42,.72),rgba(15,23,42,.72)),
-      url("https://images.unsplash.com/photo-1451187580459-43490279c0fa?auto=format&fit=crop&w=1600&q=80");
-      background-size:cover;
-      background-position:center;
-      background-attachment:fixed;
-    }
+    echo "export PATH=/usr/local/go/bin:\$PATH" > /etc/profile.d/go.sh
+    source /etc/profile.d/go.sh
+    hash -r
 
-    .page{
-      max-width:1180px;
-      margin:auto;
-      padding:28px;
-    }
+    rm -f /tmp/go_latest.tar.gz
 
-    .nav-bar{
-      display:flex;
-      justify-content:space-between;
-      align-items:center;
-      padding:14px 18px;
-      border-radius:999px;
-      border:1px solid var(--card-border);
-      background:rgba(15,23,42,.3);
-      backdrop-filter:blur(18px);
-      box-shadow:var(--shadow);
-    }
-
-    .brand{
-      display:flex;
-      align-items:center;
-      gap:10px;
-      font-weight:700;
-    }
-
-    .brand-mark{
-      width:30px;
-      height:30px;
-      border-radius:10px;
-      background:linear-gradient(135deg,#67e8f9,#3b82f6);
-    }
-
-    .status-pill{
-      display:flex;
-      align-items:center;
-      gap:8px;
-      padding:8px 12px;
-      border-radius:999px;
-      background:rgba(134,239,172,.12);
-      border:1px solid rgba(134,239,172,.24);
-    }
-
-    .status-dot{
-      width:8px;
-      height:8px;
-      border-radius:50%;
-      background:var(--success);
-    }
-
-    .hero{
-      display:grid;
-      grid-template-columns:1fr 420px;
-      gap:44px;
-      align-items:center;
-      padding:110px 0 72px;
-    }
-
-    h1{
-      margin:0;
-      font-size:clamp(42px,7vw,78px);
-      line-height:.98;
-      letter-spacing:-.065em;
-    }
-
-    .hero-copy{
-      color:var(--text-soft);
-      font-size:20px;
-      line-height:1.7;
-      margin-top:24px;
-    }
-
-    .panel,
-    .item{
-      background:var(--card-bg);
-      border:1px solid var(--card-border);
-      backdrop-filter:blur(22px);
-      box-shadow:var(--shadow);
-    }
-
-    .panel{
-      padding:24px;
-      border-radius:30px;
-    }
-
-    .metric{
-      margin-top:18px;
-      padding:22px;
-      border-radius:22px;
-      background:rgba(255,255,255,.08);
-    }
-
-    .metric-label{
-      color:var(--text-soft);
-      font-size:14px;
-    }
-
-    .metric-value{
-      margin-top:8px;
-      font-size:22px;
-      font-weight:700;
-    }
-
-    .features{
-      display:grid;
-      grid-template-columns:repeat(3,1fr);
-      gap:18px;
-      margin:12px 0 72px;
-    }
-
-    .item{
-      padding:26px;
-      border-radius:26px;
-    }
-
-    .item p{
-      color:var(--text-soft);
-      line-height:1.7;
-    }
-
-    footer{
-      padding:24px 0 8px;
-      color:rgba(248,250,252,.56);
-      font-size:13px;
-      display:flex;
-      justify-content:space-between;
-    }
-
-    @media(max-width:900px){
-      .hero{grid-template-columns:1fr}
-      .features{grid-template-columns:1fr}
-    }
-  </style>
-</head>
-
-<body>
-
-<div class="page">
-
-<header class="nav-bar">
-  <div class="brand">
-    <span class="brand-mark"></span>
-    <span>Global Infrastructure Group</span>
-  </div>
-
-  <div class="status-pill">
-    <span class="status-dot"></span>
-    Operational
-  </div>
-</header>
-
-<section class="hero">
-
-<div>
-  <h1>分布式边缘网络</h1>
-
-  <p class="hero-copy">
-    为全球用户提供高速、稳定的静态资源调度服务。
-    通过智能路径优化、缓存策略与区域化接入能力，
-    持续提升内容访问体验。
-  </p>
-</div>
-
-<aside class="panel">
-
-<h2>Realtime Metrics</h2>
-
-<div class="metric">
-  <div class="metric-label">Average Response</div>
-  <div class="metric-value">28ms</div>
-</div>
-
-<div class="metric">
-  <div class="metric-label">Cache Hit Ratio</div>
-  <div class="metric-value">96.4%</div>
-</div>
-
-<div class="metric">
-  <div class="metric-label">Regional Capacity</div>
-  <div class="metric-value">82%</div>
-</div>
-
-</aside>
-
-</section>
-
-<section class="features">
-
-<article class="item">
-<h3>低延迟响应</h3>
-<p>基于多区域接入与缓存命中策略，减少重复回源并提升资源加载速度。</p>
-</article>
-
-<article class="item">
-<h3>高可用架构</h3>
-<p>采用多节点冗余与健康检查机制，在异常情况下自动切换。</p>
-</article>
-
-<article class="item">
-<h3>自动化调度</h3>
-<p>持续分析链路质量与区域容量，动态优化访问路径。</p>
-</article>
-
-</section>
-
-<footer>
-<span>© 2026 Global Infrastructure Group.</span>
-<span>Node Status: Operational</span>
-</footer>
-
-</div>
-
-</body>
-</html>
-EOF
-
-    docker compose -f "$COMPOSE" up -d
-
-    echo
-    echo -e "${GREEN}安装完成${RESET}"
-    echo
-
-    show_info
+    echo -e "${green}Go 安装完成，当前版本: $(go version)${re}"
 }
 
-#################################
-# 连接信息
-#################################
-show_info() {
+remove_go() {
+    echo -e "${yellow}卸载 Go...${re}"
 
-    if [ -f "$INFO" ]; then
+    rm -rf /usr/local/go
+    rm -f /etc/profile.d/go.sh
 
-        source "$INFO"
+    hash -r
 
-        echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-        echo -e "${GREEN}      NaiveProxy 连接信息${RESET}"
-        echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    echo -e "${green}Go 卸载完成${re}"
+}
 
-        echo -e "${CYAN}域名:${RESET} $DOMAIN"
-        echo -e "${CYAN}端口:${RESET} $PORT"
-        echo -e "${CYAN}用户名:${RESET} $USER"
-        echo -e "${CYAN}密码:${RESET} $PASS"
-        echo -e "${CYAN}节点:${RESET} $NODE"
+# ================== Java ==================
+install_java() {
+    if command -v java >/dev/null 2>&1; then
+        current_version=$(java -version 2>&1 | awk -F '"' '/version/ {print $2}')
+        echo -e "${yellow}检测到已安装 Java: ${current_version}${re}"
+        read -p "是否重新安装 Java21？ [y/N]: " confirm
+        [[ ! $confirm =~ ^[Yy]$ ]] && return
+        remove_java
+    fi
 
-        echo
-        echo -e "${GREEN}naive+https://$USER:$PASS@$DOMAIN:$PORT#$NODE${RESET}"
-        echo
+    echo -e "${yellow}安装 Java21...${re}"
 
-        echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    case $OS in
+        Debian|Ubuntu)
+            apt update -y
+            apt install -y openjdk-21-jdk
+        ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon)
+            yum install -y java-21-openjdk java-21-openjdk-devel
+        ;;
+        Alpine)
+            apk add openjdk21
+        ;;
+        *)
+            echo -e "${red}暂不支持该系统${re}"
+            return 1
+        ;;
+    esac
 
+    if command -v java >/dev/null 2>&1; then
+        echo -e "${green}Java 安装完成${re}"
+        java -version
     else
-        echo -e "${RED}未找到连接信息${RESET}"
+        echo -e "${red}Java 安装失败${re}"
+        return 1
     fi
 }
 
-#################################
-# 卸载
-#################################
-uninstall_naive() {
+remove_java() {
+    echo -e "${yellow}卸载 Java...${re}"
 
-    docker compose -f "$COMPOSE" down 2>/dev/null || true
-    rm -rf "$ROOT"
+    case $OS in
+        Debian|Ubuntu)
+            apt remove -y 'openjdk-*' 2>/dev/null
+            apt autoremove -y
+        ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon)
+            yum remove -y java* && yum autoremove -y
+        ;;
+        Alpine)
+            apk del openjdk21
+        ;;
+    esac
 
-    echo -e "${GREEN}已卸载 NaiveProxy${RESET}"
+    rm -rf /usr/lib/jvm /usr/local/java /opt/java
+    echo -e "${green}Java 卸载完成${re}"
 }
 
-#################################
-# 查看配置
-#################################
-view_config() {
-
-    if [ -f "$CONFIG" ]; then
-        cat "$CONFIG"
-    else
-        echo -e "${RED}配置不存在${RESET}"
-    fi
+# ================== PHP ==================
+install_php() {
+    case $OS in
+        Debian|Ubuntu)
+            apt update -y
+            add-apt-repository -y ppa:ondrej/php
+            apt update -y
+            latest_version=$(apt-cache pkgnames | grep -oP '^php[0-9]+\.[0-9]+$' | sort -V | tail -1)
+            apt install -y $latest_version $latest_version-cli $latest_version-fpm $latest_version-mysql $latest_version-xml $latest_version-curl $latest_version-mbstring $latest_version-zip
+            ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon)
+            yum install -y epel-release yum-utils
+            yum install -y https://rpms.remirepo.net/enterprise/remi-release-7.rpm
+            yum-config-manager --enable remi-php74   # 可修改为最新支持版本
+            yum install -y php php-cli php-fpm php-mysqlnd php-xml php-mbstring php-curl php-zip
+            ;;
+        Alpine)
+            apk add --no-cache php php-cli php-fpm php-mysqli php-curl php-xml php-mbstring php-zip
+            ;;
+    esac
+    echo -e "${green}PHP 安装完成，版本: $(php -v | head -n1)${re}"
 }
 
-#################################
-# 重启
-#################################
-restart_naive() {
-
-    docker restart naive
-    echo -e "${GREEN}已重启${RESET}"
+remove_php() {
+    echo -e "${yellow}卸载 PHP...${re}"
+    case $OS in
+        Debian|Ubuntu) apt purge -y php* && apt autoremove -y ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon) yum remove -y php* && yum autoremove -y ;;
+        Alpine) apk del php php-cli php-fpm php-mysqli php-curl php-xml php-mbstring php-zip ;;
+    esac
+    echo -e "${green}PHP 卸载完成${re}"
 }
 
-#################################
-# 停止
-#################################
-stop_naive() {
+# ================== 主菜单 ==================
+main_menu() {
+    detect_os
+    while true; do
+        clear
+        echo -e "${yellow}===== 常用环境安装管理=====${re}"
+        echo -e "${green} 1.安装Python${re}"
+        echo -e "${green} 2.安装Nodejs${re}"
+        echo -e "${green} 3.安装Golang${re}"
+        echo -e "${green} 4.安装Java${re}"
+        echo -e "${green} 5.安装PHP${re}"
+        echo -e "${yellow}===== 常用环境卸载管理=====${re}"
+        echo -e "${green} 6.卸载Python${re}"
+        echo -e "${green} 7.卸载Nodejs${re}"
+        echo -e "${green} 8.卸载Golang${re}"
+        echo -e "${green} 9.卸载Java${re}"
+        echo -e "${green}10.卸载PHP${re}"
+        echo -e "${green} 0.退出${re}"
+        read -p "$(echo -e ${green} 请输入选项: ${re})" choice
 
-    docker stop naive
-    echo -e "${GREEN}已停止${RESET}"
+        case $choice in
+            1) install_python ;;
+            2) install_node ;;
+            3) install_go ;;
+            4) install_java ;;
+            5) install_php ;;
+            6) remove_python ;;
+            7) remove_node ;;
+            8) remove_go ;;
+            9) remove_java ;;
+            10) remove_php ;;
+            0) exit 0 ;;
+            *) echo -e "${yellow}无效输入！${re}"; sleep 1 ;;
+        esac
+        read -p "$(echo -e ${GREEN}按任意键返回菜单...${RESET})" dummy
+    done
 }
 
-#################################
-# 状态
-#################################
-status_naive() {
-
-    docker ps -a | grep naive || true
-}
-
-#################################
-# 日志
-#################################
-logs_naive() {
-
-    docker logs -f naive
-}
-
-#################################
-# 更新
-#################################
-update_naive() {
-
-    echo -e "${GREEN}更新镜像中...${RESET}"
-
-    docker pull jonssonyan/naive
-    docker compose -f "$COMPOSE" up -d
-
-    echo -e "${GREEN}更新完成${RESET}"
-}
-
-#################################
-# 菜单
-#################################
-menu() {
-
-while true
-do
-clear
-
-echo -e "${GREEN}"
-echo "================================="
-echo "      NaiveProxy 管理菜单"
-echo "================================="
-echo "1. 安装 NaiveProxy"
-echo "2. 卸载 NaiveProxy"
-echo "3. 查看配置"
-echo "4. 重启服务"
-echo "5. 停止服务"
-echo "6. 查看状态"
-echo "7. 查看日志"
-echo "8. 更新镜像"
-echo "9. 连接信息"
-echo "0. 退出"
-echo "================================="
-echo -ne "请选择: "
-echo -e "${RESET}"
-
-read num
-
-case "$num" in
-1)
-    install_naive
-    ;;
-2)
-    uninstall_naive
-    ;;
-3)
-    view_config
-    ;;
-4)
-    restart_naive
-    ;;
-5)
-    stop_naive
-    ;;
-6)
-    status_naive
-    ;;
-7)
-    logs_naive
-    ;;
-8)
-    update_naive
-    ;;
-9)
-    show_info
-    ;;
-0)
-    exit 0
-    ;;
-*)
-    echo -e "${RED}输入错误${RESET}"
-    ;;
-esac
-
-echo
-read -n 1 -s -r -p "按任意键返回..."
-done
-}
-
-menu
+# ================== 启动菜单 ==================
+main_menu

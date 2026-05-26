@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# Xray VLESS-Reality 管理脚本 
+# Xray VLESS-Reality 管理脚本
 # =========================================================
 
 set -Eeuo pipefail
@@ -15,7 +15,7 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 # ================== 基础变量 ==================
-readonly SCRIPT_VERSION="8.2"
+readonly SCRIPT_VERSION="1.0"
 
 readonly XRAY_CONFIG="/usr/local/etc/xray/config.json"
 readonly XRAY_BINARY="/usr/local/bin/xray"
@@ -46,7 +46,6 @@ error() {
 }
 
 pause() {
-    # 加上 || true 防止管道运行时 read 返回非0状态码触发 set -e 导致脚本秒退
     read -n 1 -s -r -p "按任意键返回菜单..." || true
     echo
 }
@@ -93,23 +92,34 @@ get_public_ip() {
     return 1
 }
 
-# ================== 检查端口 ==================
+# ================== 检查端口占用 ==================
 check_port() {
     local port="$1"
 
     if ss -tuln | awk '{print $5}' | grep -qE "[:.]${port}$"; then
-        error "端口 ${port} 已被占用"
-        return 1
+        return 1  # 被占用
     fi
 
-    return 0
+    return 0  # 没用占用
 }
 
-# ================== 验证端口 ==================
+# ================== 验证端口格式 ==================
 is_valid_port() {
     [[ "$1" =~ ^[0-9]+$ ]] \
         && [[ "$1" -ge 1 ]] \
         && [[ "$1" -le 65535 ]]
+}
+
+# ================== 获取可用随机端口 ==================
+get_random_port() {
+    local rand_port
+    while true; do
+        rand_port=$((RANDOM % 55536 + 10000))
+        if check_port "$rand_port"; then
+            echo "$rand_port"
+            return 0
+        fi
+    done
 }
 
 # ================== UUID验证 ==================
@@ -126,7 +136,7 @@ is_valid_domain() {
 download_install_script() {
     local file="$TMP_DIR/install.sh"
 
-    info "下载 Xray 安装脚本..."
+    info " Xray..."
 
     if ! curl -fsSL "$INSTALL_SCRIPT_URL" -o "$file"; then
         error "下载 Xray 安装脚本失败"
@@ -149,7 +159,6 @@ get_xray_status() {
 # ================== 获取版本 ==================
 get_xray_version() {
     if [[ -x "$XRAY_BINARY" ]]; then
-        # 仅过滤出包含 Xray 纯版本号的第一行，并只拿第二个参数
         "$XRAY_BINARY" version 2>/dev/null \
             | grep -i "Xray" \
             | head -n 1 \
@@ -335,13 +344,21 @@ show_current_config() {
         return
     fi
 
-    local ip uuid port domain shortid public_key
+    local ip uuid port domain shortid public_key outbound_mode
     ip=$(get_public_ip || echo "未知")
     uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
     port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
     domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
     shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
     public_key=$(get_public_key)
+    
+    local current_protocol
+    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$XRAY_CONFIG" 2>/dev/null || echo "freedom")
+    if [[ "$current_protocol" == "socks" ]]; then
+        outbound_mode="Socks5 链式代理"
+    else
+        outbound_mode="直连 (Freedom)"
+    fi
 
     echo -e "${GREEN}====== 当前配置 ======${RESET}"
     echo -e "${YELLOW}IP地址      : ${ip}${RESET}"
@@ -350,6 +367,7 @@ show_current_config() {
     echo -e "${YELLOW}SNI         : ${domain}${RESET}"
     echo -e "${YELLOW}PublicKey   : ${public_key}${RESET}"
     echo -e "${YELLOW}ShortID     : ${shortid}${RESET}"
+    echo -e "${YELLOW}出口模式    : ${outbound_mode}${RESET}"
     echo
 
     if [[ -f /root/xray_vless_reality.txt ]]; then
@@ -364,10 +382,17 @@ configure_xray() {
     local port uuid domain
 
     while true; do
-        read -rp "请输入端口 (默认:443): " input_port
-        port=${input_port:-443}
-        if is_valid_port "$port"; then
-            check_port "$port" || continue
+        read -rp "请输入端口 (直接回车随机分配端口): " input_port
+        if [[ -z "$input_port" ]]; then
+            port=$(get_random_port)
+            info "已为您随机分配未被占用端口: $port"
+            break
+        elif is_valid_port "$input_port"; then
+            if ! check_port "$input_port"; then
+                error "端口 ${input_port} 已被占用，请重新输入。"
+                continue
+            fi
+            port="$input_port"
             break
         else
             error "端口无效"
@@ -407,6 +432,154 @@ configure_xray() {
     generate_link
     restart_xray
     show_current_config
+}
+
+# ================== 配置自定义Socks5出口 ==================
+configure_custom_socks5_outbound() {
+    if [[ ! -f "$XRAY_CONFIG" ]]; then 
+        error "错误: Xray 未安装，无法配置出口模式。"
+        return
+    fi
+
+    local mode current_protocol tmp_file
+    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$XRAY_CONFIG" 2>/dev/null || echo "freedom")
+
+    echo "---------------------------------------------"
+    echo "请选择出口模式："
+    if [[ "$current_protocol" == "socks" ]]; then
+        echo -e "当前模式: ${YELLOW}Socks5${RESET}"
+    else
+        echo -e "当前模式: ${GREEN}直连${RESET}"
+    fi
+    echo "1) 直连出口"
+    echo "2) Socks5 出口"
+    echo "0) 取消"
+    echo "---------------------------------------------"
+
+    read -rp "请输入选项 [0-2]: " mode || true
+    case "$mode" in
+        1)
+            tmp_file=$(mktemp)
+            jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$XRAY_CONFIG" > "$tmp_file"
+            if ! jq empty "$tmp_file" >/dev/null 2>&1; then
+                rm -f "$tmp_file"
+                error "生成的直连配置无效。"
+                return 1
+            fi
+            cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
+            mv "$tmp_file" "$XRAY_CONFIG"
+            chmod 644 "$XRAY_CONFIG" 2>/dev/null || true
+            if ! restart_xray; then
+                error "切换到直连失败。"
+                return 1
+            fi
+            info "已成功切换为直连出口！"
+            return
+            ;;
+        2)
+            ;;
+        0|"")
+            info "已取消配置。"
+            return
+            ;;
+        *)
+            error "无效选项，请输入 0-2 之间的数字。"
+            return 1
+            ;;
+    esac
+
+    info "配置自定义 Socks5 出口代理..."
+
+    local socks_host socks_port socks_user socks_pass
+
+    read -rp "请输入 Socks5 服务器地址/IP: " socks_host || true
+    [[ -z "$socks_host" ]] && info "已取消配置。" && return
+
+    while true; do
+        read -rp "请输入 Socks5 端口 (默认: 1080): " socks_port || true
+        [[ -z "$socks_port" ]] && socks_port=1080
+        if is_valid_port "$socks_port"; then
+            break
+        else
+            error "端口无效，请输入一个1-65535之间的数字。"
+        fi
+    done
+
+    read -rp "请输入 Socks5 用户名 (若无密码认证请直接留空回车): " socks_user || true
+    if [[ -n "$socks_user" ]]; then
+        read -rs -p "请输入 Socks5 密码: " socks_pass || true
+        echo
+    else
+        socks_pass=""
+    fi
+
+    tmp_file=$(mktemp)
+
+    if [[ -n "$socks_user" ]]; then
+        jq \
+            --arg host "$socks_host" \
+            --argjson port "$socks_port" \
+            --arg user "$socks_user" \
+            --arg pass "$socks_pass" \
+            '
+            .outbounds = [
+              {
+                "protocol": "socks",
+                "tag": "custom-socks5-out",
+                "settings": {
+                  "servers": [
+                    {
+                      "address": $host,
+                      "port": $port,
+                      "users": [
+                        {
+                          "user": $user,
+                          "pass": $pass
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            ]
+            ' "$XRAY_CONFIG" > "$tmp_file"
+    else
+        jq \
+            --arg host "$socks_host" \
+            --argjson port "$socks_port" \
+            '
+            .outbounds = [
+              {
+                "protocol": "socks",
+                "tag": "custom-socks5-out",
+                "settings": {
+                  "servers": [
+                    {
+                      "address": $host,
+                      "port": $port
+                    }
+                  ]
+                }
+              }
+            ]
+            ' "$XRAY_CONFIG" > "$tmp_file"
+    fi
+
+    if ! jq empty "$tmp_file" >/dev/null 2>&1; then
+        rm -f "$tmp_file"
+        error "生成的 Socks5 配置无效，请检查输入后重试。"
+        return 1
+    fi
+
+    cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
+    mv "$tmp_file" "$XRAY_CONFIG"
+    chmod 644 "$XRAY_CONFIG" 2>/dev/null || true
+
+    if ! restart_xray; then
+        error "Xray 重启失败，当前配置可能与系统环境不兼容。"
+        return 1
+    fi
+    info "已成功切换为 Socks5 出口！"
 }
 
 # ================== 安装 ==================
@@ -452,15 +625,28 @@ modify_config() {
     local port uuid domain
 
     while true; do
-        read -rp "请输入新端口 [当前:${old_port}]: " input_port
-        port=${input_port:-$old_port}
-        if is_valid_port "$port"; then
-            if [[ "$port" != "$old_port" ]]; then
-                check_port "$port" || continue
+        read -rp "请输入新端口 [当前:${old_port}, 回车不修改]: " input_port
+        
+        # 核心修改：如果为空，直接保持 old_port 
+        if [[ -z "$input_port" ]]; then
+            port="$old_port"
+            break
+        # 进阶支持：显式输入 rand 或 rand 触发随机分配
+        elif [[ "${input_port,,}" == "rand" ]]; then
+            port=$(get_random_port)
+            info "已为您重分配随机端口: $port"
+            break
+        elif is_valid_port "$input_port"; then
+            if [[ "$input_port" != "$old_port" ]]; then
+                if ! check_port "$input_port"; then
+                    error "端口 ${input_port} 已被占用，请更换。"
+                    continue
+                fi
             fi
+            port="$input_port"
             break
         else
-            error "端口无效"
+            error "端口无效，请输入 1-65535 之间的数字。"
         fi
     done
 
@@ -496,8 +682,6 @@ modify_config() {
 # ================== 卸载 ==================
 uninstall_xray() {
     warn "即将卸载 Xray"
-    read -rp "确认卸载？[y/N]: " confirm
-    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
 
     systemctl stop xray 2>/dev/null || true
     local install_script
@@ -506,6 +690,80 @@ uninstall_xray() {
     bash "$install_script" remove --purge
     rm -f /root/xray_vless_reality.txt
     info "Xray 已卸载"
+}
+
+# ================== SNI 优选 ==================
+select_best_sni() {
+
+    info "开始优选 SNI 延迟测试"
+
+    local SNIS=(
+    amd.com
+    apps.mzstatic.com
+    aws.com
+    azure.microsoft.com
+    beacon.gtv-pub.com
+    bing.com
+    catalog.gamepass.com
+    cdn.bizibly.com
+    cdn-dynmedia-1.microsoft.com
+    devblogs.microsoft.com
+    fpinit.itunes.apple.com
+    go.microsoft.com
+    gray-config-prod.api.arc-cdn.net
+    gray.video-player.arcpublishing.com
+    images.nvidia.com
+    r.bing.com
+    services.digitaleast.mobi
+    snap.licdn.com
+    statici.icloud.com
+    tag.demandbase.com
+    tag-logger.demandbase.com
+    ts1.tc.mm.bing.net
+    ts2.tc.mm.bing.net
+    vs.aws.amazon.com
+    www.apple.com
+    www.icloud.com
+    www.microsoft.com
+    www.oracle.com
+    www.xbox.com
+    www.xilinx.com
+    xp.apple.com
+    )
+
+    BEST_SNI=""
+    BEST_TIME=999999
+
+    for sni in "${SNIS[@]}"; do
+
+        start=$(date +%s%N)
+
+        timeout 3 openssl s_client \
+            -connect ${sni}:443 \
+            -servername ${sni} \
+            -brief </dev/null >/dev/null 2>&1
+
+        if [ $? -eq 0 ]; then
+            end=$(date +%s%N)
+            cost=$(( (end - start) / 1000000 ))
+
+            echo "[SNI] $sni -> ${cost}ms"
+
+            if [ $cost -lt $BEST_TIME ]; then
+                BEST_TIME=$cost
+                BEST_SNI=$sni
+            fi
+        fi
+    done
+
+    if [ -n "$BEST_SNI" ]; then
+        info "最优 SNI: $BEST_SNI (${BEST_TIME}ms)"
+        echo "$BEST_SNI"
+        return 0
+    else
+        warn "未找到可用 SNI"
+        return 1
+    fi
 }
 
 # ================== 菜单 ==================
@@ -521,22 +779,24 @@ show_menu() {
     fi
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      Xray Reality 管理面板      ${RESET}"
+    echo -e "${GREEN}  Xray Vless+Reality 管理面板      ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "状态   : $status"
     echo -e "版本   : ${YELLOW}${version}${RESET}"
     echo -e "端口   : ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Xray Reality${RESET}"
-    echo -e "${GREEN}2. 更新 Xray${RESET}"
-    echo -e "${GREEN}3. 卸载 Xray${RESET}"
-    echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 Xray${RESET}"
-    echo -e "${GREEN}6. 停止 Xray${RESET}"
-    echo -e "${GREEN}7. 重启 Xray${RESET}"
-    echo -e "${GREEN}8. 查看日志${RESET}"
-    echo -e "${GREEN}9. 查看当前配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN} 1. 安装 Xray Reality${RESET}"
+    echo -e "${GREEN} 2. 更新 Xray${RESET}"
+    echo -e "${GREEN} 3. 卸载 Xray${RESET}"
+    echo -e "${GREEN} 4. 修改配置${RESET}"
+    echo -e "${GREEN} 5. 启动 Xray${RESET}"
+    echo -e "${GREEN} 6. 停止 Xray${RESET}"
+    echo -e "${GREEN} 7. 重启 Xray${RESET}"
+    echo -e "${GREEN} 8. 查看日志${RESET}"
+    echo -e "${GREEN} 9. 查看当前配置${RESET}"
+    echo -e "${GREEN}10. 配置Socks5出口${RESET}"
+    echo -e "${GREEN}11. SNI域名优选${RESET}"
+    echo -e "${GREEN} 0. 退出{RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -585,10 +845,8 @@ main() {
         show_menu
         
         local choice=""
-        # 使用清除尾随换行及错误忽略，确保不破环交互读取
         read -r -p $'\033[32m请输入选项: \033[0m' choice || true
         
-        # 用户直接敲回车时，跳过当前循环，防止触发错误退回
         [[ -z "$choice" ]] && continue
 
         case "$choice" in
@@ -601,6 +859,8 @@ main() {
             7) restart_xray; pause ;;
             8) journalctl -u xray -e --no-pager || true; pause ;;
             9) show_current_config; pause ;;
+            10) configure_custom_socks5_outbound; pause ;;
+            11) select_best_sni; pause ;;
             0) exit 0 ;;
             *) error "无效输入"; pause ;;
         esac

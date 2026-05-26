@@ -65,9 +65,9 @@ configure_snell() {
     echo -e "${GREEN}[信息]开始配置 Snell...${RESET}"
 
     # ===== 端口自定义 / 随机 =====
-    read -p "请输入端口 [1025-65535, 默认随机]: " input_port
+    read -p "请输入端口 (默认:随机生成): " input_port
     if [[ -z "$input_port" ]]; then
-        port=$(shuf -i 1025-65535 -n1)
+        port=$(shuf -i 20-65535 -n1)
     else
         port=$input_port
     fi
@@ -123,7 +123,7 @@ EOF
 
     # 写 Surge 示例
     cat <<EOF > $SNELL_DIR/config.txt
-$HOSTNAME = snell, $IP, $port, psk=$key, version=5, tfo=$tfo, reuse=true, ecn=true
+$HOSTNAME-Snell = snell, $IP, $port, psk=$key, version=5, tfo=$tfo, reuse=true, ecn=true
 EOF
 
     echo -e "${GREEN}[完成] 配置已写入 $SNELL_CONFIG${RESET}"
@@ -243,7 +243,7 @@ EOF
     HOSTNAME=$(hostname -s | sed 's/ /_/g')
 
     cat > "$SNELL_DIR/config.txt" <<EOF
-$HOSTNAME = snell, $IP, $port, psk=$key, version=5, tfo=$tfo, reuse=true, ecn=true
+$HOSTNAME-Snell = snell, $IP, $port, psk=$key, version=5, tfo=$tfo, reuse=true, ecn=true
 EOF
 
     echo -e "${GREEN}[完成] 配置已保存${RESET}"
@@ -255,7 +255,7 @@ EOF
     echo -e "${YELLOW} IPv6           : $ipv6${RESET}"
     echo -e "${YELLOW} TFO            : $tfo${RESET}"
     echo -e "${YELLOW} DNS            : $dns${RESET}"
-    echo -e "${YELLOW} 版本           : ${VERSION:-v5}${RESET}"
+    echo -e "${YELLOW} 版本           : ${VERSION:-v4}${RESET}"
     echo -e "${YELLOW}---------------------------------${RESET}"
     echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
     echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
@@ -271,7 +271,7 @@ install_snell() {
     cd $SNELL_DIR
 
     ARCH=$(uname -m)
-    VERSION="v5.0.1"
+    VERSION="v4.1.1"
     if [[ "$ARCH" == "aarch64" ]]; then
         SNELL_URL="https://dl.nssurge.com/snell/snell-server-${VERSION}-linux-aarch64.zip"
     else
@@ -367,9 +367,17 @@ show_menu() {
 
     # ===== 版本 =====
     VERSION_SHOW="未安装"
+
     if [ -x "$SNELL_DIR/snell-server" ]; then
-        VERSION_SHOW=$("$SNELL_DIR/snell-server" --v 2>/dev/null | head -n1)
-        [ -z "$VERSION_SHOW" ] && VERSION_SHOW="已安装"
+        # 尝试读取 Snell 版本
+        VERSION_SHOW=$("$SNELL_DIR/snell-server" -v 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')
+
+        # 如果没读到，再尝试 --version
+        [ -z "$VERSION_SHOW" ] && \
+        VERSION_SHOW=$("$SNELL_DIR/snell-server" --version 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')
+  
+        # 最后兜底
+        [ -z "$VERSION_SHOW" ] && VERSION_SHOW="未知版本"
     fi
 
     # ===== 端口 =====
@@ -384,18 +392,18 @@ show_menu() {
     echo -e "状态   : $STATUS"
     echo -e "版本   : ${YELLOW}$VERSION_SHOW${RESET}"
     echo -e "端口   : ${YELLOW}$PORT_SHOW${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 
-    echo -e "${GREEN}1.${RESET} 安装 Snell"
-    echo -e "${GREEN}2.${RESET} 更新 Snell"
-    echo -e "${GREEN}3.${RESET} 卸载 Snell"
-    echo -e "${GREEN}4.${RESET} 修改配置"
-    echo -e "${GREEN}5.${RESET} 启动 Snell"
-    echo -e "${GREEN}6.${RESET} 停止 Snell"
-    echo -e "${GREEN}7.${RESET} 重启 Snell"
-    echo -e "${GREEN}8.${RESET} 查看日志"
-    echo -e "${GREEN}9.${RESET} 查看当前配置"
-    echo -e "${GREEN}0.${RESET} 退出"
+    echo -e "${GREEN}1. 安装 Snell${RESET}"
+    echo -e "${GREEN}2. 更新 Snell${RESET}"
+    echo -e "${GREEN}3. 卸载 Snell${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 Snell${RESET}"
+    echo -e "${GREEN}6. 停止 Snell${RESET}"
+    echo -e "${GREEN}7. 重启 Snell${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看当前配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
 
     echo -e "${GREEN}================================${RESET}"
 }

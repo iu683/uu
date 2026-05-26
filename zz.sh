@@ -1,241 +1,523 @@
 #!/bin/bash
+set -euo pipefail
 
-# ==========================================
-# Mosdns-x 一键管理脚本
-# ==========================================
+# =========================================================
+# Shadowsocks-Rust 管理脚本
+# 模板风格: Snell
+# 加密方式: 2022-blake3-aes-256-gcm
+# =========================================================
 
-set +e
+# ================== 颜色 ==================
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+RESET="\033[0m"
 
-# 颜色
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+# ================== 基础变量 ==================
+SCRIPT_VERSION="5.0"
 
-# 配置
-MOSDNS_BINARY="/usr/local/bin/mosdns-x"
-MOSDNS_CONFIG_DIR="/etc/mosdns-x"
-MOSDNS_CONFIG_FILE="/etc/mosdns-x/config.yaml"
-MOSDNS_LOG_DIR="/var/log/mosdns-x"
-MOSDNS_LOG_FILE="/var/log/mosdns-x/mosdns-x.log"
-MOSDNS_SERVICE_FILE="/etc/systemd/system/mosdns.service"
-MOSDNS_LOGROTATE_FILE="/etc/logrotate.d/mosdns-x"
-MOSDNS_USER="mosdns"
-MOSDNS_GROUP="mosdns"
-RESOLV_CONF_BACKUP="/etc/resolv.conf.mosdns-backup"
+SS_DIR="/etc/ss-rust"
+SS_CONFIG="${SS_DIR}/config.json"
 
-GITHUB_REPO="pmkol/mosdns-x"
-GITHUB_API_URL="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+SS_SERVICE="/etc/systemd/system/ss-rust.service"
 
-# ==========================================
-# 输出函数
-# ==========================================
+BINARY_PATH="/usr/local/bin/ssserver"
 
-log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+LOG_FILE="/var/log/ss-rust-manager.log"
+
+RUN_USER="ss-rust"
+
+METHOD="2022-blake3-aes-256-gcm"
+
+KEY_BYTES=32
+
+TMP_DIR=$(mktemp -d -t ss-rust.XXXXXX)
+
+# ================== cleanup ==================
+cleanup() {
+    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
 }
 
-log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
-}
+trap cleanup EXIT INT TERM
 
-log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-# ==========================================
-# 基础函数
-# ==========================================
-
-check_root() {
-    [[ $EUID -ne 0 ]] && {
-        log_error "请使用 root 权限运行"
-        exit 1
-    }
+# ================== 日志 ==================
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
 }
 
 pause() {
+    read -n 1 -s -r -p "按任意键返回菜单..."
     echo
-    read -rp "$(echo -e ${GREEN}按回车返回菜单...${NC})"
 }
 
-get_architecture() {
-    case $(uname -m) in
-        x86_64) echo "amd64" ;;
-        aarch64) echo "arm64" ;;
-        armv7l) echo "arm" ;;
-        *) echo "unsupported" ;;
+# ================== 创建用户 ==================
+create_user() {
+    id -u "$RUN_USER" &>/dev/null || \
+        useradd -r -s /usr/sbin/nologin "$RUN_USER"
+}
+
+# ================== 获取公网IP ==================
+get_public_ip() {
+
+    local ip
+
+    for cmd in \
+        "curl -4fsSL --max-time 5" \
+        "wget -4qO- --timeout=5"; do
+
+        for url in \
+            "https://api.ipify.org" \
+            "https://ip.sb" \
+            "https://checkip.amazonaws.com"; do
+
+            ip=$($cmd "$url" 2>/dev/null) && \
+            [[ -n "$ip" ]] && \
+            echo "$ip" && return
+        done
+    done
+
+    for cmd in \
+        "curl -6fsSL --max-time 5" \
+        "wget -6qO- --timeout=5"; do
+
+        for url in \
+            "https://api64.ipify.org" \
+            "https://ipv6.ip.sb"; do
+
+            ip=$($cmd "$url" 2>/dev/null) && \
+            [[ -n "$ip" ]] && \
+            echo "[$ip]" && return
+        done
+    done
+
+    echo "无法获取公网IP"
+}
+
+# ================== 检查端口 ==================
+check_port() {
+
+    if ss -tulnH "( sport = :$1 )" | grep -q .; then
+        echo -e "${RED}端口 $1 已被占用${RESET}"
+        return 1
+    fi
+}
+
+# ================== 随机密码 ==================
+random_key() {
+    openssl rand -base64 "$KEY_BYTES" | tr -d '\n'
+}
+
+# ================== 随机端口 ==================
+random_port() {
+    shuf -i 2000-65000 -n 1
+}
+
+# ================== 获取系统DNS ==================
+get_system_dns() {
+
+    grep -E '^nameserver' /etc/resolv.conf \
+        | awk '{print $2}' \
+        | paste -sd "," -
+}
+
+# ================== 验证密码 ==================
+validate_password() {
+
+    local password="$1"
+
+    if ! echo "$password" | base64 -d >/dev/null 2>&1; then
+        echo -e "${RED}密码不是合法 Base64${RESET}"
+        return 1
+    fi
+
+    local decoded_len
+
+    decoded_len=$(echo "$password" | base64 -d 2>/dev/null | wc -c)
+
+    if [[ "$decoded_len" -ne "$KEY_BYTES" ]]; then
+        echo -e "${RED}密码必须为 ${KEY_BYTES} 字节${RESET}"
+        return 1
+    fi
+}
+
+# ================== 检测架构 ==================
+detect_arch() {
+
+    case "$(uname -m)" in
+
+        x86_64)
+            echo "x86_64-unknown-linux-gnu"
+            ;;
+
+        aarch64)
+            echo "aarch64-unknown-linux-gnu"
+            ;;
+
+        armv7l)
+            echo "armv7-unknown-linux-gnueabihf"
+            ;;
+
+        *)
+            echo -e "${RED}不支持架构: $(uname -m)${RESET}"
+            exit 1
+            ;;
     esac
 }
 
+# ================== 获取最新版本 ==================
 get_latest_version() {
-    curl -s "$GITHUB_API_URL" | grep -o '"tag_name": "[^"]*' | grep -o '[^"]*$' || echo "v25.10.08"
+
+    curl -fsSL \
+        "https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest" \
+        | grep tag_name \
+        | cut -d '"' -f4 \
+        | sed 's/v//'
 }
 
-get_current_version() {
-    if [[ -f "$MOSDNS_BINARY" ]]; then
-        $MOSDNS_BINARY version 2>/dev/null | grep -o 'v[0-9.]*' | head -1
-    else
-        echo "未安装"
-    fi
+# ================== 写配置 ==================
+write_config() {
+
+    local port="$1"
+    local password="$2"
+    local dns="$3"
+
+    mkdir -p "$SS_DIR"
+
+    DNS_JSON=$(echo "$dns" | awk -F',' '{
+        for(i=1;i<=NF;i++){
+            gsub(/^[ \t]+|[ \t]+$/, "", $i)
+            printf "%s\"%s\"", (i>1?",":""), $i
+        }
+    }')
+
+    cat > "$SS_CONFIG" <<EOF
+{
+    "server": "::",
+    "server_port": $port,
+    "password": "$password",
+    "method": "$METHOD",
+    "fast_open": true,
+    "mode": "tcp_and_udp",
+    "timeout": 300,
+    "no_delay": true,
+    "ipv6_first": false,
+    "nameserver": [
+        $DNS_JSON
+    ]
 }
-
-# ==========================================
-# 安装依赖
-# ==========================================
-
-check_dependencies() {
-    log_info "安装依赖..."
-
-    apt update
-
-    apt install -y \
-        curl \
-        wget \
-        unzip \
-        dnsutils \
-        tar \
-        systemd \
-        ca-certificates \
-        iproute2
-
-    log_success "依赖安装完成"
-}
-
-# ==========================================
-# 创建用户和目录
-# ==========================================
-
-setup_user_and_dirs() {
-
-    mkdir -p "$MOSDNS_CONFIG_DIR"
-    mkdir -p "$MOSDNS_LOG_DIR"
-
-    if ! id "$MOSDNS_USER" &>/dev/null; then
-        useradd -r -s /usr/sbin/nologin "$MOSDNS_USER"
-    fi
-
-    chown -R root:root "$MOSDNS_CONFIG_DIR"
-    chown -R root:root "$MOSDNS_LOG_DIR"
-
-    chmod 755 "$MOSDNS_CONFIG_DIR"
-    chmod 755 "$MOSDNS_LOG_DIR"
-}
-
-# ==========================================
-# 下载并安装
-# ==========================================
-
-install_mosdns_x() {
-
-    local version=$1
-    local arch
-    arch=$(get_architecture)
-
-    [[ "$arch" == "unsupported" ]] && {
-        log_error "不支持当前架构"
-        exit 1
-    }
-
-    local url="https://github.com/${GITHUB_REPO}/releases/download/${version}/mosdns-linux-${arch}.zip"
-
-    local temp_dir
-    temp_dir=$(mktemp -d)
-
-    cd "$temp_dir"
-
-    log_info "下载 Mosdns-x ${version}..."
-
-    wget -q --show-progress -O mosdns.zip "$url"
-
-    unzip -q mosdns.zip
-
-    install -m 755 mosdns "$MOSDNS_BINARY"
-
-    rm -rf "$temp_dir"
-
-    log_success "安装完成"
-}
-
-# ==========================================
-# 配置文件
-# ==========================================
-
-create_config() {
-
-cat > "$MOSDNS_CONFIG_FILE" << 'EOF'
-log:
-  level: info
-  file: /var/log/mosdns-x/mosdns-x.log
-
-plugins:
-  - tag: cache
-    type: cache
-    args:
-      size: 1024
-      lazy_cache_ttl: 1800
-
-  - tag: forward_all
-    type: fast_forward
-    args:
-      upstream:
-        - addr: "udp://223.5.5.5"
-        - addr: "tls://dns.alidns.com"
-
-        - addr: "udp://119.29.29.29"
-        - addr: "tls://dot.pub"
-
-        - addr: "udp://1.1.1.1"
-        - addr: "tls://cloudflare-dns.com"
-
-        - addr: "udp://8.8.8.8"
-        - addr: "tls://dns.google"
-
-  - tag: main
-    type: sequence
-    args:
-      exec:
-        - cache
-        - forward_all
-
-servers:
-  - exec: main
-    listeners:
-      - addr: :53
-        protocol: udp
-      - addr: :53
-        protocol: tcp
 EOF
 
-    chmod 644 "$MOSDNS_CONFIG_FILE"
-
-    log_success "配置文件创建完成"
+    chmod 600 "$SS_CONFIG"
+    chown -R ${RUN_USER}:${RUN_USER} "$SS_DIR"
 }
 
-# ==========================================
-# systemd 服务
-# ==========================================
+# ================== 生成链接 ==================
+generate_links() {
 
-create_service() {
+    local port="$1"
+    local password="$2"
 
-cat > "$MOSDNS_SERVICE_FILE" << EOF
+    IP=$(get_public_ip)
+
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+
+    ENCODED=$(echo -n "${METHOD}:${password}" | base64 -w 0)
+
+    # ===== SS Link =====
+    cat > "${SS_DIR}/ss.txt" <<EOF
+ss://${ENCODED}@${IP}:${port}#${HOSTNAME}-SS2022
+EOF
+
+    # ===== Surge =====
+    cat > "${SS_DIR}/surge.txt" <<EOF
+localhost = ss, ${IP}, ${port}, encrypt-method=${METHOD}, password=${password}, tfo=true, udp-relay=true, ecn=true
+EOF
+}
+
+# ================== 安装配置 ==================
+configure_ss() {
+
+    echo -e "${GREEN}[信息]开始配置 Shadowsocks-Rust...${RESET}"
+
+    # ===== 端口 =====
+    while true; do
+
+        read -p "请输入端口 (默认:随机生成): " input_port
+
+        if [[ -z "$input_port" ]]; then
+            port=$(random_port)
+        else
+            port="$input_port"
+        fi
+
+        if [[ "$port" =~ ^[0-9]+$ ]] \
+            && [[ "$port" -ge 1 ]] \
+            && [[ "$port" -le 65535 ]]; then
+
+            check_port "$port" || continue
+            break
+        else
+            echo -e "${RED}端口无效${RESET}"
+        fi
+    done
+
+    # ===== 密码 =====
+    read -p "请输入密码 (默认:随机生成): " input_password
+
+    if [[ -z "$input_password" ]]; then
+
+        password=$(random_key)
+
+    else
+
+        validate_password "$input_password" || return
+
+        password="$input_password"
+    fi
+
+    # ===== DNS =====
+    default_dns=$(get_system_dns)
+    [[ -z "$default_dns" ]] && \
+    default_dns="1.1.1.1,8.8.8.8"
+
+    read -p "请输入 DNS (默认:$default_dns): " dns
+    dns=${dns:-$default_dns}
+
+    write_config "$port" "$password" "$dns"
+    generate_links "$port" "$password"
+
+    IP=$(get_public_ip)
+
+    echo -e "${GREEN}[完成] 配置已保存${RESET}"
+
+    echo -e "${GREEN}====== Shadowsocks 配置 ======${RESET}"
+
+    echo -e "${YELLOW} IP地址        : ${IP}${RESET}"
+
+    echo -e "${YELLOW} 端口          : ${port}${RESET}"
+
+    echo -e "${YELLOW} 密码          : ${password}${RESET}"
+
+    echo -e "${YELLOW} 加密          : ${METHOD}${RESET}"
+    echo -e "${YELLOW} DNS           : ${dns}${RESET}"
+
+    echo -e "${YELLOW}---------------------------------${RESET}"
+     echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
+
+    echo -e "${YELLOW}[信息] SS链接：${RESET}"
+
+    cat "${SS_DIR}/ss.txt"
+
+    echo
+
+    echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
+
+    cat "${SS_DIR}/surge.txt"
+
+    echo -e "${YELLOW}---------------------------------${RESET}"
+}
+
+# ================== 修改配置 ==================
+modify_ss() {
+
+    echo -e "${GREEN}[信息]开始修改 Shadowsocks 配置...${RESET}"
+
+    if [[ ! -f "$SS_CONFIG" ]]; then
+        echo -e "${RED}配置文件不存在${RESET}"
+        return
+    fi
+
+    old_port=$(grep server_port "$SS_CONFIG" | grep -o '[0-9]\+')
+
+    old_password=$(grep password "$SS_CONFIG" \
+        | cut -d '"' -f4)
+    
+    old_dns=$(awk '
+    /"nameserver"/ {flag=1; next}
+    flag && /\]/ {flag=0}
+    flag {
+        gsub(/[",[:space:]]/, "")
+        if(length) print
+    }' "$SS_CONFIG" | paste -sd "," -)
+
+    echo -e "${YELLOW}当前端口 : ${old_port}${RESET}"
+
+    echo -e "${YELLOW}当前密码 : ${old_password}${RESET}"
+
+    echo
+
+    # ===== 新端口 =====
+    while true; do
+
+        read -p "请输入新端口 [当前:${old_port}]: " input_port
+
+        port=${input_port:-$old_port}
+
+        if [[ "$port" =~ ^[0-9]+$ ]] \
+            && [[ "$port" -ge 1 ]] \
+            && [[ "$port" -le 65535 ]]; then
+
+            if [[ "$port" != "$old_port" ]]; then
+                check_port "$port" || continue
+            fi
+
+            break
+        else
+            echo -e "${RED}端口无效${RESET}"
+        fi
+    done
+
+    # ===== 密码 =====
+    echo
+    echo "1. 保持当前密码"
+    echo "2. 手动输入密码"
+    echo "3. 自动生成密码"
+
+    read -p "请选择 [默认:1]: " pwd_mode
+
+    case $pwd_mode in
+
+        2)
+
+            while true; do
+
+                read -p "请输入 Base64 密码: " input_password
+
+                validate_password "$input_password" && break
+            done
+
+            password="$input_password"
+            ;;
+
+        3)
+
+            password=$(random_key)
+
+            echo -e "${GREEN}已生成新密码${RESET}"
+            ;;
+
+        *)
+
+            password="$old_password"
+            ;;
+    esac
+
+    # ===== DNS =====
+    default_dns=$(get_system_dns)
+    [[ -z "$default_dns" ]] && \
+    default_dns="1.1.1.1,8.8.8.8"
+
+    default_dns=${old_dns:-$default_dns}
+
+    echo
+    read -p "请输入 DNS [当前:$default_dns]: " dns
+    dns=${dns:-$default_dns}
+
+    cp "$SS_CONFIG" \
+        "${SS_CONFIG}.bak.$(date +%s)"
+
+    write_config "$port" "$password" "$dns"
+
+    generate_links "$port" "$password"
+
+    systemctl restart ss-rust
+
+    IP=$(get_public_ip)
+
+    echo -e "${GREEN}[完成] 配置修改成功${RESET}"
+
+    echo
+
+    echo -e "${GREEN}====== Shadowsocks 配置 ======${RESET}"
+
+    echo -e "${YELLOW} IP地址        : ${IP}${RESET}"
+
+    echo -e "${YELLOW} 端口          : ${port}${RESET}"
+
+    echo -e "${YELLOW} 密码          : ${password}${RESET}"
+
+    echo -e "${YELLOW} 加密          : ${METHOD}${RESET}"
+    echo -e "${YELLOW} DNS           : ${dns}${RESET}"
+
+    echo
+    echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
+
+    echo -e "${YELLOW}[信息] SS链接：${RESET}"
+
+    cat "${SS_DIR}/ss.txt"
+
+    echo
+
+    echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
+
+    cat "${SS_DIR}/surge.txt"
+
+    echo
+
+    log "Shadowsocks 配置已修改"
+}
+
+# ================== 安装 ==================
+install_ss() {
+
+    echo -e "${GREEN}[信息] 开始安装 Shadowsocks-Rust...${RESET}"
+
+    create_user
+
+    mkdir -p "$SS_DIR"
+
+    cd "$TMP_DIR"
+
+    VERSION=$(get_latest_version)
+
+    ARCH=$(detect_arch)
+
+    URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${VERSION}/shadowsocks-v${VERSION}.${ARCH}.tar.xz"
+
+    wget -O ss.tar.xz "$URL"
+
+    tar -xf ss.tar.xz
+
+    install -m 755 ssserver "$BINARY_PATH"
+
+    echo "$VERSION" > "${SS_DIR}/version.txt"
+
+    configure_ss
+
+    # ===== systemd =====
+    cat > "$SS_SERVICE" <<EOF
 [Unit]
-Description=mosdns-x DNS Server
-After=network.target
+Description=Shadowsocks Rust Server
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
-Group=root
-ExecStart=$MOSDNS_BINARY start --as-service -c $MOSDNS_CONFIG_FILE
-Restart=always
+
+User=${RUN_USER}
+Group=${RUN_USER}
+
+ExecStart=${BINARY_PATH} -c ${SS_CONFIG}
+
+Restart=on-failure
 RestartSec=3
+
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+NoNewPrivileges=true
+
+PrivateTmp=true
+
+ProtectSystem=strict
+ProtectHome=true
+
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
@@ -243,346 +525,224 @@ EOF
 
     systemctl daemon-reload
 
-    log_success "服务创建完成"
+    systemctl enable ss-rust
+
+    systemctl restart ss-rust
+
+    echo -e "${GREEN}[完成] Shadowsocks-Rust 已安装并启动${RESET}"
+
+    log "Shadowsocks-Rust 已安装"
 }
 
-# ==========================================
-# logrotate
-# ==========================================
+# ================== 更新 ==================
+update_ss() {
 
-create_logrotate() {
+    echo -e "${GREEN}[信息] 更新 Shadowsocks-Rust...${RESET}"
 
-cat > "$MOSDNS_LOGROTATE_FILE" << EOF
-$MOSDNS_LOG_FILE {
-    daily
-    rotate 7
-    compress
-    missingok
-    notifempty
-    copytruncate
-}
-EOF
-
-    log_success "日志轮转配置完成"
-}
-
-# ==========================================
-# DNS 配置
-# ==========================================
-
-configure_dns() {
-
-    if [[ -f /etc/resolv.conf && ! -f "$RESOLV_CONF_BACKUP" ]]; then
-        cp /etc/resolv.conf "$RESOLV_CONF_BACKUP"
-    fi
-
-    chattr -i /etc/resolv.conf 2>/dev/null || true
-
-    cat > /etc/resolv.conf << EOF
-nameserver 127.0.0.1
-EOF
-
-    chattr +i /etc/resolv.conf 2>/dev/null || true
-
-    log_success "系统 DNS 已设置为 127.0.0.1"
-}
-
-restore_dns() {
-
-    chattr -i /etc/resolv.conf 2>/dev/null || true
-
-    if [[ -f "$RESOLV_CONF_BACKUP" ]]; then
-        cp "$RESOLV_CONF_BACKUP" /etc/resolv.conf
-    else
-        cat > /etc/resolv.conf << EOF
-nameserver 8.8.8.8
-nameserver 1.1.1.1
-EOF
-    fi
-
-    log_success "DNS 已恢复"
-}
-
-# ==========================================
-# 服务管理
-# ==========================================
-
-start_service() {
-    systemctl enable mosdns >/dev/null 2>&1
-    systemctl restart mosdns
-    log_success "服务已启动"
-}
-
-stop_service() {
-    systemctl stop mosdns
-    log_success "服务已停止"
-}
-
-restart_service() {
-    systemctl restart mosdns
-    log_success "服务已重启"
-}
-
-# ==========================================
-# 安装
-# ==========================================
-
-install_all() {
-
-    check_dependencies
-
-    setup_user_and_dirs
-
-    local version
-    version=$(get_latest_version)
-
-    install_mosdns_x "$version"
-
-    create_config
-
-    create_service
-
-    create_logrotate
-
-    start_service
-
-    configure_dns
-
-    log_success "Mosdns-x 安装完成"
-}
-
-# ==========================================
-# 更新
-# ==========================================
-
-update_mosdns() {
-
-    local latest
-    latest=$(get_latest_version)
-
-    log_info "更新到版本: $latest"
-
-    systemctl stop mosdns || true
-
-    install_mosdns_x "$latest"
-
-    systemctl restart mosdns
-
-    log_success "更新完成"
-}
-
-# ==========================================
-# 卸载
-# ==========================================
-
-uninstall_mosdns() {
-
-    systemctl stop mosdns 2>/dev/null || true
-    systemctl disable mosdns 2>/dev/null || true
-
-    restore_dns
-
-    rm -f "$MOSDNS_BINARY"
-    rm -f "$MOSDNS_SERVICE_FILE"
-    rm -f "$MOSDNS_LOGROTATE_FILE"
-
-    read -rp "是否删除配置文件？(y/N): " confirm
-
-    if [[ $confirm =~ ^[Yy]$ ]]; then
-        rm -rf "$MOSDNS_CONFIG_DIR"
-        rm -rf "$MOSDNS_LOG_DIR"
-    fi
-
-    systemctl daemon-reload
-
-    log_success "卸载完成"
-}
-
-# ==========================================
-# 测试 DNS
-# ==========================================
-
-test_dns() {
-
-    domains=(
-        google.com
-        github.com
-        cloudflare.com
-        baidu.com
-    )
-
-    for domain in "${domains[@]}"; do
-
-        echo -ne "${CYAN}测试 ${domain} ... ${NC}"
-
-        if nslookup "$domain" 127.0.0.1 >/dev/null 2>&1; then
-            echo -e "${GREEN}成功${NC}"
-        else
-            echo -e "${RED}失败${NC}"
-        fi
-    done
-}
-
-# ==========================================
-# 查看状态
-# ==========================================
-
-show_status() {
-
-    clear
-
-    echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}        Mosdns-x 状态信息${NC}"
-    echo -e "${GREEN}========================================${NC}"
-
-    echo -e "当前版本: ${CYAN}$(get_current_version)${NC}"
-
-    echo -e "服务状态: ${CYAN}$(systemctl is-active mosdns 2>/dev/null || echo 未运行)${NC}"
-
-    if ss -tuln | grep -q ":53 "; then
-        echo -e "53端口状态: ${GREEN}监听中${NC}"
-    else
-        echo -e "53端口状态: ${RED}未监听${NC}"
-    fi
-
-    echo -e "配置文件: ${CYAN}$MOSDNS_CONFIG_FILE${NC}"
-
-    echo -e "日志文件: ${CYAN}$MOSDNS_LOG_FILE${NC}"
-}
-
-# ==========================================
-# 查看日志
-# ==========================================
-
-show_logs() {
-    journalctl -u mosdns -n 30 --no-pager
-}
-
-# ==========================================
-# 菜单
-# ==========================================
-
-menu() {
-
-while true
-do
-    clear
-
-    echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}        Mosdns-x 管理菜单${NC}"
-    echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN} 1. 安装 Mosdns-x${NC}"
-    echo -e "${GREEN} 2. 更新 Mosdns-x${NC}"
-    echo -e "${GREEN} 3. 卸载 Mosdns-x${NC}"
-    echo -e "${GREEN} 4. 启动服务${NC}"
-    echo -e "${GREEN} 5. 停止服务${NC}"
-    echo -e "${GREEN} 6. 重启服务${NC}"
-    echo -e "${GREEN} 7. 查看状态${NC}"
-    echo -e "${GREEN} 8. 查看日志${NC}"
-    echo -e "${GREEN} 9. 测试 DNS${NC}"
-    echo -e "${GREEN}10. 恢复系统 DNS${NC}"
-    echo -e "${GREEN} 0. 退出${NC}"
-    echo -ne "${GREEN}请输入选项: ${NC}"
-    read -r choice
-
-    case $choice in
-        1)
-            install_all
-            pause
-            ;;
-        2)
-            update_mosdns
-            pause
-            ;;
-        3)
-            uninstall_mosdns
-            pause
-            ;;
-        4)
-            start_service
-            pause
-            ;;
-        5)
-            stop_service
-            pause
-            ;;
-        6)
-            restart_service
-            pause
-            ;;
-        7)
-            show_status
-            pause
-            ;;
-        8)
-            show_logs
-            pause
-            ;;
-        9)
-            test_dns
-            pause
-            ;;
-        10)
-            restore_dns
-            pause
-            ;;
-        0)
-            clear
-            exit 0
-            ;;
-        *)
-            log_error "无效选项"
-            sleep 1
-            ;;
-    esac
-
-done
-}
-# ==========================================
-# 主函数
-# ==========================================
-
-main() {
-
-    check_root || exit 1
-
-    if [[ $# -eq 0 ]]; then
-        menu
+    if [[ ! -f "$SS_CONFIG" ]]; then
+        echo -e "${RED}未找到配置文件${RESET}"
         return
     fi
 
-    case "$1" in
-        install)
-            install_all
-            ;;
-        update)
-            update_mosdns
-            ;;
-        uninstall)
-            uninstall_mosdns
-            ;;
-        start)
-            start_service
-            ;;
-        stop)
-            stop_service
-            ;;
-        restart)
-            restart_service
-            ;;
-        status)
-            show_status
-            ;;
-        logs)
-            show_logs
-            ;;
-        test)
-            test_dns
-            ;;
-        *)
-            menu
-            ;;
-    esac
+    systemctl stop ss-rust || true
+
+    cd "$TMP_DIR"
+
+    VERSION=$(get_latest_version)
+
+    ARCH=$(detect_arch)
+
+    URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${VERSION}/shadowsocks-v${VERSION}.${ARCH}.tar.xz"
+
+    wget -O ss.tar.xz "$URL"
+
+    tar -xf ss.tar.xz
+
+    install -m 755 ssserver "$BINARY_PATH"
+
+    echo "$VERSION" > "${SS_DIR}/version.txt"
+
+    systemctl restart ss-rust
+
+    echo -e "${GREEN}[完成] Shadowsocks-Rust 已更新${RESET}"
+
+    log "Shadowsocks-Rust 已更新"
 }
 
-main "$@"
+# ================== 卸载 ==================
+uninstall_ss() {
+
+    echo -e "${RED}[警告] 卸载 Shadowsocks-Rust...${RESET}"
+
+    systemctl stop ss-rust || true
+
+    systemctl disable ss-rust || true
+
+    rm -f "$SS_SERVICE"
+
+    rm -rf "$SS_DIR"
+
+    rm -f "$BINARY_PATH"
+
+    systemctl daemon-reload
+
+    echo -e "${GREEN}[完成] Shadowsocks-Rust 已卸载${RESET}"
+
+    log "Shadowsocks-Rust 已卸载"
+}
+
+# ================== 菜单 ==================
+show_menu() {
+
+    clear
+
+    if systemctl is-active --quiet ss-rust; then
+        STATUS="${GREEN}● 运行中${RESET}"
+    else
+        STATUS="${RED}● 未运行${RESET}"
+    fi
+
+    VERSION_SHOW="未安装"
+
+    if [[ -f "${SS_DIR}/version.txt" ]]; then
+        VERSION_SHOW="v$(cat "${SS_DIR}/version.txt")"
+    fi
+
+    PORT_SHOW="-"
+
+    if [[ -f "$SS_CONFIG" ]]; then
+        PORT_SHOW=$(grep server_port "$SS_CONFIG" \
+            | grep -o '[0-9]\+')
+    fi
+
+    echo -e "${GREEN}================================${RESET}"
+
+    echo -e "${GREEN}   Shadowsocks-Rust 管理面板        ${RESET}"
+
+    echo -e "${GREEN}================================${RESET}"
+
+    echo -e "状态   : $STATUS"
+
+    echo -e "版本   : ${YELLOW}${VERSION_SHOW}${RESET}"
+
+    echo -e "端口   : ${YELLOW}${PORT_SHOW}${RESET}"
+
+    echo -e "${GREEN}================================${RESET}"
+
+    echo -e "${GREEN}1. 安装 Shadowsocks-Rust${RESET}"
+
+    echo -e "${GREEN}2. 更新 Shadowsocks-Rust${RESET}"
+
+    echo -e "${GREEN}3. 卸载 Shadowsocks-Rust${RESET}"
+
+    echo -e "${GREEN}4. 修改配置${RESET}"
+
+    echo -e "${GREEN}5. 启动 Shadowsocks-Rust${RESET}"
+
+    echo -e "${GREEN}6. 停止 Shadowsocks-Rust${RESET}"
+
+    echo -e "${GREEN}7. 重启 Shadowsocks-Rust${RESET}"
+
+    echo -e "${GREEN}8. 查看日志${RESET}"
+
+    echo -e "${GREEN}9. 查看当前配置${RESET}"
+
+    echo -e "${GREEN}0. 退出${RESET}"
+
+    echo -e "${GREEN}================================${RESET}"
+}
+
+# ================== 主循环 ==================
+while true; do
+
+    show_menu
+
+    read -r -p $'\033[32m请输入选项: \033[0m' choice
+
+    case $choice in
+
+        1)
+            install_ss
+            pause
+            ;;
+
+        2)
+            update_ss
+            pause
+            ;;
+
+        3)
+            uninstall_ss
+            pause
+            ;;
+
+        4)
+            modify_ss
+            pause
+            ;;
+
+        5)
+            systemctl start ss-rust
+            echo -e "${GREEN}[完成] Shadowsocks 已启动${RESET}"
+            log "Shadowsocks 启动"
+            pause
+            ;;
+
+        6)
+            systemctl stop ss-rust
+            echo -e "${GREEN}[完成] Shadowsocks 已停止${RESET}"
+            log "Shadowsocks 停止"
+            pause
+            ;;
+
+        7)
+            systemctl restart ss-rust
+            echo -e "${GREEN}[完成] Shadowsocks 已重启${RESET}"
+            log "Shadowsocks 重启"
+            pause
+            ;;
+
+        8)
+            journalctl -u ss-rust -e --no-pager
+            pause
+            ;;
+
+        9)
+
+            if [[ -f "$SS_CONFIG" ]]; then
+
+                echo -e "${GREEN}====== 当前配置 ======${RESET}"
+
+                cat "$SS_CONFIG"
+
+                echo
+
+                echo -e "${GREEN}====== SS链接 ======${RESET}"
+
+                cat "${SS_DIR}/ss.txt"
+
+                echo
+
+                echo -e "${GREEN}====== Surge 配置 ======${RESET}"
+
+                cat "${SS_DIR}/surge.txt"
+
+            else
+
+                echo -e "${RED}配置文件不存在${RESET}"
+
+            fi
+
+            pause
+            ;;
+
+        0)
+            exit 0
+            ;;
+
+        *)
+            echo -e "${RED}无效输入${RESET}"
+            pause
+            ;;
+    esac
+done

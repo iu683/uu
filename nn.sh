@@ -65,9 +65,9 @@ configure_snell() {
     echo -e "${GREEN}[信息]开始配置 Snell...${RESET}"
 
     # ===== 端口自定义 / 随机 =====
-    read -p "请输入端口 [1025-65535, 默认随机]: " input_port
+    read -p "请输入端口 (默认:随机生成): " input_port
     if [[ -z "$input_port" ]]; then
-        port=$(shuf -i 1025-65535 -n1)
+        port=$(shuf -i 20-65535 -n1)
     else
         port=$input_port
     fi
@@ -123,7 +123,7 @@ EOF
 
     # 写 Surge 示例
     cat <<EOF > $SNELL_DIR/config.txt
-$HOSTNAME = snell, $IP, $port, psk=$key, version=5, tfo=$tfo, reuse=true, ecn=true
+$HOSTNAME-Snell = snell, $IP, $port, psk=$key, version=5, tfo=$tfo, reuse=true, ecn=true
 EOF
 
     echo -e "${GREEN}[完成] 配置已写入 $SNELL_CONFIG${RESET}"
@@ -135,7 +135,7 @@ EOF
     echo -e "${YELLOW} IPv6           : $ipv6${RESET}"
     echo -e "${YELLOW} TFO            : $tfo${RESET}"
     echo -e "${YELLOW} DNS            : $dns${RESET}"
-    echo -e "${YELLOW} 版本           : ${VERSION}${RESET}"
+    echo -e "${YELLOW} 版本           : ${VERSION:-v5}${RESET}"
     echo -e "${YELLOW}---------------------------------${RESET}"
     echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
     echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
@@ -243,7 +243,7 @@ EOF
     HOSTNAME=$(hostname -s | sed 's/ /_/g')
 
     cat > "$SNELL_DIR/config.txt" <<EOF
-$HOSTNAME = snell, $IP, $port, psk=$key, version=5, tfo=$tfo, reuse=true, ecn=true
+$HOSTNAME-Snell = snell, $IP, $port, psk=$key, version=5, tfo=$tfo, reuse=true, ecn=true
 EOF
 
     echo -e "${GREEN}[完成] 配置已保存${RESET}"
@@ -255,9 +255,12 @@ EOF
     echo -e "${YELLOW} IPv6           : $ipv6${RESET}"
     echo -e "${YELLOW} TFO            : $tfo${RESET}"
     echo -e "${YELLOW} DNS            : $dns${RESET}"
-    echo -e "${YELLOW} 版本           : ${VERSION:-v5}${RESET}"
+    echo -e "${YELLOW} 版本           : ${VERSION:-v4}${RESET}"
     echo -e "${YELLOW}---------------------------------${RESET}"
+    echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
+    echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
     cat "$SNELL_DIR/config.txt"
+    echo -e "${YELLOW}---------------------------------\n${RESET}"
 }
 
 # ================== 安装 Snell ==================
@@ -268,7 +271,7 @@ install_snell() {
     cd $SNELL_DIR
 
     ARCH=$(uname -m)
-    VERSION="v5.0.1"
+    VERSION="v4.1.1"
     if [[ "$ARCH" == "aarch64" ]]; then
         SNELL_URL="https://dl.nssurge.com/snell/snell-server-${VERSION}-linux-aarch64.zip"
     else
@@ -354,7 +357,35 @@ uninstall_snell() {
 # ================== 菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}====== Snell 管理 ======${RESET}"
+
+    # ===== 运行状态 =====
+    if systemctl is-active --quiet snell; then
+        STATUS="${GREEN}● 运行中${RESET}"
+    else
+        STATUS="${RED}● 未运行${RESET}"
+    fi
+
+    # ===== 版本 =====
+    VERSION_SHOW="未安装"
+    if [ -x "$SNELL_DIR/snell-server" ]; then
+        VERSION_SHOW=$("$SNELL_DIR/snell-server" --v 2>/dev/null | head -n1)
+        [ -z "$VERSION_SHOW" ] && VERSION_SHOW="已安装"
+    fi
+
+    # ===== 端口 =====
+    PORT_SHOW="-"
+    if [ -f "$SNELL_CONFIG" ]; then
+        PORT_SHOW=$(grep '^listen' "$SNELL_CONFIG" | awk -F: '{print $NF}')
+    fi
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}         Snell 管理面板         ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "状态   : $STATUS"
+    echo -e "版本   : ${YELLOW}$VERSION_SHOW${RESET}"
+    echo -e "端口   : ${YELLOW}$PORT_SHOW${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+
     echo -e "${GREEN}1. 安装 Snell${RESET}"
     echo -e "${GREEN}2. 更新 Snell${RESET}"
     echo -e "${GREEN}3. 卸载 Snell${RESET}"
@@ -365,6 +396,8 @@ show_menu() {
     echo -e "${GREEN}8. 查看日志${RESET}"
     echo -e "${GREEN}9. 查看当前配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
+
+    echo -e "${GREEN}================================${RESET}"
 }
 
 # ================== 主循环 ==================
@@ -384,7 +417,7 @@ while true; do
             if [ -f "$SNELL_CONFIG" ]; then
                 echo -e "${GREEN}====== 当前 Snell 配置 ======${RESET}"
                 cat "$SNELL_CONFIG"
-                echo -e "${GREEN}====== Surge 配置示例 ======${RESET}"
+                echo -e "${GREEN}====== Surge 配置 ======${RESET}"
                 cat "$SNELL_DIR/config.txt"
             else
                 echo -e "${RED}配置文件不存在${RESET}"

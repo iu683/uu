@@ -1,400 +1,603 @@
 #!/bin/bash
-set -e
+set -euo pipefail
+
+# =========================================================
+# Shadowsocks-Rust 管理脚本
+# 模板风格: Snell
+# 加密方式: 2022-blake3-aes-256-gcm
+# =========================================================
 
 # ================== 颜色 ==================
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
+BLUE="\033[34m"
 RESET="\033[0m"
 
-# ================== 变量 ==================
-SNELL_DIR="/etc/snell"
-SNELL_CONFIG="$SNELL_DIR/snell-server.conf"
-SNELL_SERVICE="/etc/systemd/system/snell.service"
-LOG_FILE="/var/log/snell_manager.log"
+# ================== 基础变量 ==================
+SCRIPT_VERSION="5.0"
 
-# ================== 工具函数 ==================
-create_user() {
-    id -u snell &>/dev/null || useradd -r -s /usr/sbin/nologin snell
+SS_DIR="/etc/ss-rust"
+SS_CONFIG="${SS_DIR}/config.json"
+
+SS_SERVICE="/etc/systemd/system/ss-rust.service"
+
+BINARY_PATH="/usr/local/bin/ssserver"
+
+LOG_FILE="/var/log/ss-rust-manager.log"
+
+RUN_USER="ss-rust"
+
+METHOD="2022-blake3-aes-256-gcm"
+
+KEY_BYTES=32
+
+TMP_DIR=$(mktemp -d -t ss-rust.XXXXXX)
+
+# ================== cleanup ==================
+cleanup() {
+    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
-}
+trap cleanup EXIT INT TERM
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
-
-random_key() {
-    tr -dc A-Za-z0-9 </dev/urandom | head -c 16
-}
-
-random_port() {
-    shuf -i 2000-65000 -n 1
-}
-
-get_system_dns() {
-    grep -E "^nameserver" /etc/resolv.conf | awk '{print $2}' | paste -sd "," -
-}
-
-pause() {
-    read -n 1 -s -r -p "按任意键返回菜单..."
-}
-
+# ================== 日志 ==================
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
 }
 
-# ================== 配置 Snell ==================
-configure_snell() {
-    echo -e "${GREEN}[信息]开始配置 Snell...${RESET}"
-
-    # ===== 端口自定义 / 随机 =====
-    read -p "请输入端口 (默认:随机生成): " input_port
-    if [[ -z "$input_port" ]]; then
-        port=$(shuf -i 20-65535 -n1)
-    else
-        port=$input_port
-    fi
-    check_port "$port" || return
-
-    read -p "请输入Snell密钥 (默认:随机生成): " key
-    key=${key:-$(random_key)}
-
-    echo -e "${YELLOW}配置 OBFS：[注意] 无特殊作用不建议启用${RESET}"
-    echo "1. TLS   2. HTTP   3. 关闭"
-    read -p "(默认: 3): " obfs
-    case $obfs in
-        1) obfs="tls" ;;
-        2) obfs="http" ;;
-        *) obfs="off" ;;
-    esac
-
-    echo -e "${YELLOW}是否开启 IPv6 解析？${RESET}"
-    echo "1. 开启   2. 关闭"
-    read -p "(默认: 2): " ipv6
-    ipv6=${ipv6:-2}
-    ipv6=$([ "$ipv6" = "1" ] && echo true || echo false)
-
-    echo -e "${YELLOW}是否开启 TCP Fast Open？${RESET}"
-    echo "1. 开启   2. 关闭"
-    read -p "(默认: 1): " tfo
-    tfo=${tfo:-1}
-    tfo=$([ "$tfo" = "1" ] && echo true || echo false)
-
-    default_dns=$(get_system_dns)
-    [[ -z "$default_dns" ]] && default_dns="1.1.1.1,8.8.8.8"
-    read -p "请输入 DNS (默认: $default_dns): " dns
-    dns=${dns:-$default_dns}
-
-    if [[ "$ipv6" == "true" ]]; then
-        LISTEN="::0:$port"
-    else
-        LISTEN="0.0.0.0:$port"
-    fi
-    cat > $SNELL_CONFIG <<EOF
-[snell-server]
-listen = $LISTEN
-psk = $key
-obfs = $obfs
-ipv6 = $ipv6
-tfo = $tfo
-dns = $dns
-EOF
-
-    # 获取公网 IP
-    IP=$(get_public_ip)
-    HOSTNAME=$(hostname -s | sed 's/ /_/g')
-
-    # 写 Surge 示例
-    cat <<EOF > $SNELL_DIR/config.txt
-$HOSTNAME-Snell = snell, $IP, $port, psk=$key, version=5, tfo=$tfo, reuse=true, ecn=true
-EOF
-
-    echo -e "${GREEN}[完成] 配置已写入 $SNELL_CONFIG${RESET}"
-    echo -e "${GREEN}====== Snell Server 配置信息 ======${RESET}"
-    echo -e "${YELLOW} IPv4 地址      : $IP${RESET}"
-    echo -e "${YELLOW} 端口           : $port${RESET}"
-    echo -e "${YELLOW} 密钥           : $key${RESET}"
-    echo -e "${YELLOW} OBFS           : $obfs${RESET}"
-    echo -e "${YELLOW} IPv6           : $ipv6${RESET}"
-    echo -e "${YELLOW} TFO            : $tfo${RESET}"
-    echo -e "${YELLOW} DNS            : $dns${RESET}"
-    echo -e "${YELLOW} 版本           : ${VERSION:-v5}${RESET}"
-    echo -e "${YELLOW}---------------------------------${RESET}"
-    echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
-    echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
-    cat $SNELL_DIR/config.txt
-    echo -e "${YELLOW}---------------------------------\n${RESET}"
+pause() {
+    read -n 1 -s -r -p "按任意键返回菜单..."
+    echo
 }
 
-# ================== 修改配置 Snell ==================
-configures_snell() {
-    echo -e "${GREEN}[信息]开始修改配置 Snell...${RESET}"
+# ================== 创建用户 ==================
+create_user() {
+    id -u "$RUN_USER" &>/dev/null || \
+        useradd -r -s /usr/sbin/nologin "$RUN_USER"
+}
 
-    # ===== 读取旧配置 =====
-    if [[ -f "$SNELL_CONFIG" ]]; then
-        old_listen=$(grep '^listen' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
-        old_port=$(echo "$old_listen" | awk -F: '{print $NF}')
-        old_key=$(grep '^psk' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
-        old_obfs=$(grep '^obfs' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
-        old_ipv6=$(grep '^ipv6' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
-        old_tfo=$(grep '^tfo' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
-        old_dns=$(grep '^dns' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
+# ================== 获取公网IP ==================
+get_public_ip() {
+
+    local ip
+
+    for cmd in \
+        "curl -4fsSL --max-time 5" \
+        "wget -4qO- --timeout=5"; do
+
+        for url in \
+            "https://api.ipify.org" \
+            "https://ip.sb" \
+            "https://checkip.amazonaws.com"; do
+
+            ip=$($cmd "$url" 2>/dev/null) && \
+            [[ -n "$ip" ]] && \
+            echo "$ip" && return
+        done
+    done
+
+    for cmd in \
+        "curl -6fsSL --max-time 5" \
+        "wget -6qO- --timeout=5"; do
+
+        for url in \
+            "https://api64.ipify.org" \
+            "https://ipv6.ip.sb"; do
+
+            ip=$($cmd "$url" 2>/dev/null) && \
+            [[ -n "$ip" ]] && \
+            echo "[$ip]" && return
+        done
+    done
+
+    echo "无法获取公网IP"
+}
+
+# ================== 检查端口 ==================
+check_port() {
+
+    if ss -tulnH "( sport = :$1 )" | grep -q .; then
+        echo -e "${RED}端口 $1 已被占用${RESET}"
+        return 1
+    fi
+}
+
+# ================== 随机密码 ==================
+random_key() {
+    openssl rand -base64 "$KEY_BYTES" | tr -d '\n'
+}
+
+# ================== 随机端口 ==================
+random_port() {
+    shuf -i 2000-65000 -n 1
+}
+
+# ================== 验证密码 ==================
+validate_password() {
+
+    local password="$1"
+
+    if ! echo "$password" | base64 -d >/dev/null 2>&1; then
+        echo -e "${RED}密码不是合法 Base64${RESET}"
+        return 1
     fi
 
-    # ===== 默认值 =====
-    default_port=${old_port:-$(random_port)}
-    default_key=${old_key:-$(random_key)}
-    default_obfs=${old_obfs:-off}
-    default_ipv6=${old_ipv6:-false}
-    default_tfo=${old_tfo:-true}
+    local decoded_len
 
-    default_dns=$(get_system_dns)
-    [[ -z "$default_dns" ]] && default_dns="1.1.1.1,8.8.8.8"
-    default_dns=${old_dns:-$default_dns}
+    decoded_len=$(echo "$password" | base64 -d 2>/dev/null | wc -c)
+
+    if [[ "$decoded_len" -ne "$KEY_BYTES" ]]; then
+        echo -e "${RED}密码必须为 ${KEY_BYTES} 字节${RESET}"
+        return 1
+    fi
+}
+
+# ================== 检测架构 ==================
+detect_arch() {
+
+    case "$(uname -m)" in
+
+        x86_64)
+            echo "x86_64-unknown-linux-gnu"
+            ;;
+
+        aarch64)
+            echo "aarch64-unknown-linux-gnu"
+            ;;
+
+        armv7l)
+            echo "armv7-unknown-linux-gnueabihf"
+            ;;
+
+        *)
+            echo -e "${RED}不支持架构: $(uname -m)${RESET}"
+            exit 1
+            ;;
+    esac
+}
+
+# ================== 获取最新版本 ==================
+get_latest_version() {
+
+    curl -fsSL \
+        "https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest" \
+        | grep tag_name \
+        | cut -d '"' -f4 \
+        | sed 's/v//'
+}
+
+# ================== 写配置 ==================
+write_config() {
+
+    local port="$1"
+    local password="$2"
+
+    mkdir -p "$SS_DIR"
+
+    cat > "$SS_CONFIG" <<EOF
+{
+    "server": "::",
+    "server_port": $port,
+    "password": "$password",
+    "method": "$METHOD",
+    "fast_open": true,
+    "mode": "tcp_and_udp",
+    "timeout": 300,
+    "no_delay": true,
+    "ipv6_first": false
+}
+EOF
+
+    chmod 600 "$SS_CONFIG"
+    chown -R ${RUN_USER}:${RUN_USER} "$SS_DIR"
+}
+
+# ================== 生成链接 ==================
+generate_links() {
+
+    local port="$1"
+    local password="$2"
+
+    IP=$(get_public_ip)
+
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+
+    ENCODED=$(echo -n "${METHOD}:${password}" | base64 -w 0)
+
+    # ===== SS Link =====
+    cat > "${SS_DIR}/ss.txt" <<EOF
+ss://${ENCODED}@${IP}:${port}#${HOSTNAME}-SS2022
+EOF
+
+    # ===== Surge =====
+    cat > "${SS_DIR}/surge.txt" <<EOF
+localhost = ss, ${IP}, ${port}, encrypt-method=${METHOD}, password=${password}, tfo=true, udp-relay=true, ecn=true
+EOF
+}
+
+# ================== 安装配置 ==================
+configure_ss() {
+
+    echo -e "${GREEN}[信息]开始配置 Shadowsocks-Rust...${RESET}"
 
     # ===== 端口 =====
-    read -p "请输入端口 [当前:$default_port]: " input_port
-    port=${input_port:-$default_port}
+    while true; do
 
-    if [[ "$port" != "$old_port" ]]; then
-        check_port "$port" || return
-    fi
+        read -p "请输入端口 (默认:随机生成): " input_port
 
-    # ===== 密钥 =====
-    read -p "请输入Snell密钥 [当前:$default_key]: " key
-    key=${key:-$default_key}
+        if [[ -z "$input_port" ]]; then
+            port=$(random_port)
+        else
+            port="$input_port"
+        fi
 
-    # ===== OBFS =====
-    echo -e "${YELLOW}配置 OBFS：[注意] 无特殊作用不建议启用${RESET}"
-    echo "1. TLS   2. HTTP   3. 关闭"
-    echo -e "${YELLOW}当前: $default_obfs${RESET}"
-    read -p "(默认保留当前): " obfs_choice
+        if [[ "$port" =~ ^[0-9]+$ ]] \
+            && [[ "$port" -ge 1 ]] \
+            && [[ "$port" -le 65535 ]]; then
 
-    case $obfs_choice in
-        1) obfs="tls" ;;
-        2) obfs="http" ;;
-        3) obfs="off" ;;
-        *) obfs="$default_obfs" ;;
-    esac
+            check_port "$port" || continue
+            break
+        else
+            echo -e "${RED}端口无效${RESET}"
+        fi
+    done
 
-    # ===== IPv6 =====
-    echo -e "${YELLOW}是否开启 IPv6 解析？${RESET}"
-    echo "1. 开启   2. 关闭"
-    echo -e "${YELLOW}当前: $default_ipv6${RESET}"
-    read -p "(默认保留当前): " ipv6_choice
-    case $ipv6_choice in
-        1) ipv6=true ;;
-        2) ipv6=false ;;
-        *) ipv6=$default_ipv6 ;;
-    esac
+    # ===== 密码 =====
+    read -p "请输入密码 (默认:随机生成): " input_password
 
-    # ===== TFO =====
-    echo -e "${YELLOW}是否开启 TCP Fast Open？${RESET}"
-    echo "1. 开启   2. 关闭"
-    echo -e "${YELLOW}当前: $default_tfo${RESET}"
-    read -p "(默认保留当前): " tfo_choice
-    case $tfo_choice in
-        1) tfo=true ;;
-        2) tfo=false ;;
-        *) tfo=$default_tfo ;;
-    esac
+    if [[ -z "$input_password" ]]; then
 
-    # ===== DNS =====
-    read -p "请输入 DNS [当前:$default_dns]: " dns
-    dns=${dns:-$default_dns}
+        password=$(random_key)
 
-    # ===== listen =====
-    if [[ "$ipv6" == "true" ]]; then
-        LISTEN="::0:$port"
     else
-        LISTEN="0.0.0.0:$port"
+
+        validate_password "$input_password" || return
+
+        password="$input_password"
     fi
 
-    # ===== 写配置 =====
-    cat > "$SNELL_CONFIG" <<EOF
-[snell-server]
-listen = $LISTEN
-psk = $key
-obfs = $obfs
-ipv6 = $ipv6
-tfo = $tfo
-dns = $dns
-EOF
+    write_config "$port" "$password"
 
-    # ===== 获取公网IP =====
+    generate_links "$port" "$password"
+
     IP=$(get_public_ip)
-    HOSTNAME=$(hostname -s | sed 's/ /_/g')
-
-    cat > "$SNELL_DIR/config.txt" <<EOF
-$HOSTNAME-Snell = snell, $IP, $port, psk=$key, version=5, tfo=$tfo, reuse=true, ecn=true
-EOF
 
     echo -e "${GREEN}[完成] 配置已保存${RESET}"
-    echo -e "${GREEN}====== Snell Server 配置信息 ======${RESET}"
-    echo -e "${YELLOW} IPv4 地址      : $IP${RESET}"
-    echo -e "${YELLOW} 端口           : $port${RESET}"
-    echo -e "${YELLOW} 密钥           : $key${RESET}"
-    echo -e "${YELLOW} OBFS           : $obfs${RESET}"
-    echo -e "${YELLOW} IPv6           : $ipv6${RESET}"
-    echo -e "${YELLOW} TFO            : $tfo${RESET}"
-    echo -e "${YELLOW} DNS            : $dns${RESET}"
-    echo -e "${YELLOW} 版本           : ${VERSION:-v4}${RESET}"
+
+    echo -e "${GREEN}====== Shadowsocks 配置 ======${RESET}"
+
+    echo -e "${YELLOW} IP地址        : ${IP}${RESET}"
+
+    echo -e "${YELLOW} 端口          : ${port}${RESET}"
+
+    echo -e "${YELLOW} 密码          : ${password}${RESET}"
+
+    echo -e "${YELLOW} 加密          : ${METHOD}${RESET}"
+
     echo -e "${YELLOW}---------------------------------${RESET}"
-    echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
+
+    echo -e "${YELLOW}[信息] SS链接：${RESET}"
+
+    cat "${SS_DIR}/ss.txt"
+
+    echo
+
     echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
-    cat "$SNELL_DIR/config.txt"
-    echo -e "${YELLOW}---------------------------------\n${RESET}"
+
+    cat "${SS_DIR}/surge.txt"
+
+    echo -e "${YELLOW}---------------------------------${RESET}"
 }
 
-# ================== 安装 Snell ==================
-install_snell() {
-    echo -e "${GREEN}[信息] 开始安装 Snell...${RESET}"
-    create_user
-    mkdir -p $SNELL_DIR
-    cd $SNELL_DIR
+# ================== 修改配置 ==================
+modify_ss() {
 
-    ARCH=$(uname -m)
-    VERSION="v4.1.1"
-    if [[ "$ARCH" == "aarch64" ]]; then
-        SNELL_URL="https://dl.nssurge.com/snell/snell-server-${VERSION}-linux-aarch64.zip"
-    else
-        SNELL_URL="https://dl.nssurge.com/snell/snell-server-${VERSION}-linux-amd64.zip"
+    echo -e "${GREEN}[信息]开始修改 Shadowsocks 配置...${RESET}"
+
+    if [[ ! -f "$SS_CONFIG" ]]; then
+        echo -e "${RED}配置文件不存在${RESET}"
+        return
     fi
 
-    wget -O snell.zip "$SNELL_URL"
-    unzip -o snell.zip -d $SNELL_DIR
-    rm -f snell.zip
-    chmod +x $SNELL_DIR/snell-server
+    old_port=$(grep server_port "$SS_CONFIG" | grep -o '[0-9]\+')
 
-    configure_snell
+    old_password=$(grep password "$SS_CONFIG" \
+        | cut -d '"' -f4)
 
-    # systemd 文件
-    cat > $SNELL_SERVICE <<EOF
+    echo -e "${YELLOW}当前端口 : ${old_port}${RESET}"
+
+    echo -e "${YELLOW}当前密码 : ${old_password}${RESET}"
+
+    echo
+
+    # ===== 新端口 =====
+    while true; do
+
+        read -p "请输入新端口 [当前:${old_port}]: " input_port
+
+        port=${input_port:-$old_port}
+
+        if [[ "$port" =~ ^[0-9]+$ ]] \
+            && [[ "$port" -ge 1 ]] \
+            && [[ "$port" -le 65535 ]]; then
+
+            if [[ "$port" != "$old_port" ]]; then
+                check_port "$port" || continue
+            fi
+
+            break
+        else
+            echo -e "${RED}端口无效${RESET}"
+        fi
+    done
+
+    # ===== 密码 =====
+    echo
+    echo "1. 保持当前密码"
+    echo "2. 手动输入密码"
+    echo "3. 自动生成密码"
+
+    read -p "请选择 [默认:1]: " pwd_mode
+
+    case $pwd_mode in
+
+        2)
+
+            while true; do
+
+                read -p "请输入 Base64 密码: " input_password
+
+                validate_password "$input_password" && break
+            done
+
+            password="$input_password"
+            ;;
+
+        3)
+
+            password=$(random_key)
+
+            echo -e "${GREEN}已生成新密码${RESET}"
+            ;;
+
+        *)
+
+            password="$old_password"
+            ;;
+    esac
+
+    cp "$SS_CONFIG" \
+        "${SS_CONFIG}.bak.$(date +%s)"
+
+    write_config "$port" "$password"
+
+    generate_links "$port" "$password"
+
+    systemctl restart ss-rust
+
+    IP=$(get_public_ip)
+
+    echo -e "${GREEN}[完成] 配置修改成功${RESET}"
+
+    echo
+
+    echo -e "${GREEN}====== Shadowsocks 配置 ======${RESET}"
+
+    echo -e "${YELLOW} IP地址        : ${IP}${RESET}"
+
+    echo -e "${YELLOW} 端口          : ${port}${RESET}"
+
+    echo -e "${YELLOW} 密码          : ${password}${RESET}"
+
+    echo -e "${YELLOW} 加密          : ${METHOD}${RESET}"
+
+    echo
+
+    echo -e "${YELLOW}[信息] SS链接：${RESET}"
+
+    cat "${SS_DIR}/ss.txt"
+
+    echo
+
+    echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
+
+    cat "${SS_DIR}/surge.txt"
+
+    echo
+
+    log "Shadowsocks 配置已修改"
+}
+
+# ================== 安装 ==================
+install_ss() {
+
+    echo -e "${GREEN}[信息] 开始安装 Shadowsocks-Rust...${RESET}"
+
+    create_user
+
+    mkdir -p "$SS_DIR"
+
+    cd "$TMP_DIR"
+
+    VERSION=$(get_latest_version)
+
+    ARCH=$(detect_arch)
+
+    URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${VERSION}/shadowsocks-v${VERSION}.${ARCH}.tar.xz"
+
+    wget -O ss.tar.xz "$URL"
+
+    tar -xf ss.tar.xz
+
+    install -m 755 ssserver "$BINARY_PATH"
+
+    echo "$VERSION" > "${SS_DIR}/version.txt"
+
+    configure_ss
+
+    # ===== systemd =====
+    cat > "$SS_SERVICE" <<EOF
 [Unit]
-Description=Snell Server
-After=network.target
+Description=Shadowsocks Rust Server
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-ExecStart=$SNELL_DIR/snell-server -c $SNELL_CONFIG
+Type=simple
+
+User=${RUN_USER}
+Group=${RUN_USER}
+
+ExecStart=${BINARY_PATH} -c ${SS_CONFIG}
+
 Restart=on-failure
-User=snell
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+RestartSec=3
+
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
 NoNewPrivileges=true
+
+PrivateTmp=true
+
+ProtectSystem=strict
+ProtectHome=true
+
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable snell
-    systemctl start snell
-    echo -e "${GREEN}[完成] Snell 已安装并启动${RESET}"
-    log "Snell 已安装并启动"
+
+    systemctl enable ss-rust
+
+    systemctl restart ss-rust
+
+    echo -e "${GREEN}[完成] Shadowsocks-Rust 已安装并启动${RESET}"
+
+    log "Shadowsocks-Rust 已安装"
 }
 
-# ================== 更新 Snell ==================
-update_snell() {
-    echo -e "${GREEN}[信息] 更新 Snell...${RESET}"
+# ================== 更新 ==================
+update_ss() {
 
-    if [ ! -f "$SNELL_CONFIG" ]; then
-        echo -e "${RED}未找到配置文件，无法更新${RESET}"
+    echo -e "${GREEN}[信息] 更新 Shadowsocks-Rust...${RESET}"
+
+    if [[ ! -f "$SS_CONFIG" ]]; then
+        echo -e "${RED}未找到配置文件${RESET}"
         return
     fi
 
-    systemctl stop snell || true
-    cd $SNELL_DIR
+    systemctl stop ss-rust || true
 
-    ARCH=$(uname -m)
-    VERSION="v5.0.1"
+    cd "$TMP_DIR"
 
-    if [[ "$ARCH" == "aarch64" ]]; then
-        SNELL_URL="https://dl.nssurge.com/snell/snell-server-${VERSION}-linux-aarch64.zip"
-    else
-        SNELL_URL="https://dl.nssurge.com/snell/snell-server-${VERSION}-linux-amd64.zip"
-    fi
+    VERSION=$(get_latest_version)
 
-    wget -O snell.zip "$SNELL_URL"
-    unzip -o snell.zip -d $SNELL_DIR
-    rm -f snell.zip
-    chmod +x $SNELL_DIR/snell-server
+    ARCH=$(detect_arch)
 
-    systemctl restart snell
+    URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${VERSION}/shadowsocks-v${VERSION}.${ARCH}.tar.xz"
 
-    echo -e "${GREEN}[完成] Snell 已更新${RESET}"
-    log "Snell 已更新 "
+    wget -O ss.tar.xz "$URL"
+
+    tar -xf ss.tar.xz
+
+    install -m 755 ssserver "$BINARY_PATH"
+
+    echo "$VERSION" > "${SS_DIR}/version.txt"
+
+    systemctl restart ss-rust
+
+    echo -e "${GREEN}[完成] Shadowsocks-Rust 已更新${RESET}"
+
+    log "Shadowsocks-Rust 已更新"
 }
 
-# ================== 卸载 Snell ==================
-uninstall_snell() {
-    echo -e "${RED}[警告] 卸载 Snell...${RESET}"
-    systemctl stop snell || true
-    systemctl disable snell || true
-    rm -f $SNELL_SERVICE
-    rm -rf $SNELL_DIR
+# ================== 卸载 ==================
+uninstall_ss() {
+
+    echo -e "${RED}[警告] 卸载 Shadowsocks-Rust...${RESET}"
+
+    systemctl stop ss-rust || true
+
+    systemctl disable ss-rust || true
+
+    rm -f "$SS_SERVICE"
+
+    rm -rf "$SS_DIR"
+
+    rm -f "$BINARY_PATH"
+
     systemctl daemon-reload
-    echo -e "${GREEN}[完成] Snell 已卸载${RESET}"
-    log "Snell 已卸载"
+
+    echo -e "${GREEN}[完成] Shadowsocks-Rust 已卸载${RESET}"
+
+    log "Shadowsocks-Rust 已卸载"
 }
 
 # ================== 菜单 ==================
 show_menu() {
+
     clear
 
-    # ===== 运行状态 =====
-    if systemctl is-active --quiet snell; then
+    if systemctl is-active --quiet ss-rust; then
         STATUS="${GREEN}● 运行中${RESET}"
     else
         STATUS="${RED}● 未运行${RESET}"
     fi
 
-    # ===== 版本 =====
     VERSION_SHOW="未安装"
-    if [ -x "$SNELL_DIR/snell-server" ]; then
-        VERSION_SHOW=$("$SNELL_DIR/snell-server" --v 2>/dev/null | head -n1)
-        [ -z "$VERSION_SHOW" ] && VERSION_SHOW="已安装"
+
+    if [[ -f "${SS_DIR}/version.txt" ]]; then
+        VERSION_SHOW="v$(cat "${SS_DIR}/version.txt")"
     fi
 
-    # ===== 端口 =====
     PORT_SHOW="-"
-    if [ -f "$SNELL_CONFIG" ]; then
-        PORT_SHOW=$(grep '^listen' "$SNELL_CONFIG" | awk -F: '{print $NF}')
+
+    if [[ -f "$SS_CONFIG" ]]; then
+        PORT_SHOW=$(grep server_port "$SS_CONFIG" \
+            | grep -o '[0-9]\+')
     fi
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}         Snell 管理面板         ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "状态   : $STATUS"
-    echo -e "版本   : ${YELLOW}$VERSION_SHOW${RESET}"
-    echo -e "端口   : ${YELLOW}$PORT_SHOW${RESET}"
+
+    echo -e "${GREEN}   Shadowsocks-Rust 管理面板        ${RESET}"
+
     echo -e "${GREEN}================================${RESET}"
 
-    echo -e "${GREEN}1. 安装 Snell${RESET}"
-    echo -e "${GREEN}2. 更新 Snell${RESET}"
-    echo -e "${GREEN}3. 卸载 Snell${RESET}"
+    echo -e "状态   : $STATUS"
+
+    echo -e "版本   : ${YELLOW}${VERSION_SHOW}${RESET}"
+
+    echo -e "端口   : ${YELLOW}${PORT_SHOW}${RESET}"
+
+    echo -e "${GREEN}================================${RESET}"
+
+    echo -e "${GREEN}1. 安装 Shadowsocks-Rust${RESET}"
+
+    echo -e "${GREEN}2. 更新 Shadowsocks-Rust${RESET}"
+
+    echo -e "${GREEN}3. 卸载 Shadowsocks-Rust${RESET}"
+
     echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 Snell${RESET}"
-    echo -e "${GREEN}6. 停止 Snell${RESET}"
-    echo -e "${GREEN}7. 重启 Snell${RESET}"
+
+    echo -e "${GREEN}5. 启动 Shadowsocks-Rust${RESET}"
+
+    echo -e "${GREEN}6. 停止 Shadowsocks-Rust${RESET}"
+
+    echo -e "${GREEN}7. 重启 Shadowsocks-Rust${RESET}"
+
     echo -e "${GREEN}8. 查看日志${RESET}"
+
     echo -e "${GREEN}9. 查看当前配置${RESET}"
+
     echo -e "${GREEN}0. 退出${RESET}"
 
     echo -e "${GREEN}================================${RESET}"
@@ -402,29 +605,95 @@ show_menu() {
 
 # ================== 主循环 ==================
 while true; do
+
     show_menu
+
     read -r -p $'\033[32m请输入选项: \033[0m' choice
+
     case $choice in
-        1) install_snell; pause ;;
-        2) update_snell; pause ;;
-        3) uninstall_snell; pause ;;
-        4) configures_snell; systemctl restart snell; pause ;;
-        5) systemctl start snell; echo -e "${GREEN}[完成] Snell 已启动${RESET}"; log "Snell 启动"; pause ;;
-        6) systemctl stop snell; echo -e "${GREEN}[完成] Snell 已停止${RESET}"; log "Snell 停止"; pause ;;
-        7) systemctl restart snell; echo -e "${GREEN}[完成] Snell 已重启${RESET}"; log "Snell 重启"; pause ;;
-        8) journalctl -u snell -e --no-pager; pause ;;
-        9)
-            if [ -f "$SNELL_CONFIG" ]; then
-                echo -e "${GREEN}====== 当前 Snell 配置 ======${RESET}"
-                cat "$SNELL_CONFIG"
-                echo -e "${GREEN}====== Surge 配置 ======${RESET}"
-                cat "$SNELL_DIR/config.txt"
-            else
-                echo -e "${RED}配置文件不存在${RESET}"
-            fi
+
+        1)
+            install_ss
             pause
             ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效输入${RESET}"; pause ;;
+
+        2)
+            update_ss
+            pause
+            ;;
+
+        3)
+            uninstall_ss
+            pause
+            ;;
+
+        4)
+            modify_ss
+            pause
+            ;;
+
+        5)
+            systemctl start ss-rust
+            echo -e "${GREEN}[完成] Shadowsocks 已启动${RESET}"
+            log "Shadowsocks 启动"
+            pause
+            ;;
+
+        6)
+            systemctl stop ss-rust
+            echo -e "${GREEN}[完成] Shadowsocks 已停止${RESET}"
+            log "Shadowsocks 停止"
+            pause
+            ;;
+
+        7)
+            systemctl restart ss-rust
+            echo -e "${GREEN}[完成] Shadowsocks 已重启${RESET}"
+            log "Shadowsocks 重启"
+            pause
+            ;;
+
+        8)
+            journalctl -u ss-rust -e --no-pager
+            pause
+            ;;
+
+        9)
+
+            if [[ -f "$SS_CONFIG" ]]; then
+
+                echo -e "${GREEN}====== 当前配置 ======${RESET}"
+
+                cat "$SS_CONFIG"
+
+                echo
+
+                echo -e "${GREEN}====== SS链接 ======${RESET}"
+
+                cat "${SS_DIR}/ss.txt"
+
+                echo
+
+                echo -e "${GREEN}====== Surge 配置 ======${RESET}"
+
+                cat "${SS_DIR}/surge.txt"
+
+            else
+
+                echo -e "${RED}配置文件不存在${RESET}"
+
+            fi
+
+            pause
+            ;;
+
+        0)
+            exit 0
+            ;;
+
+        *)
+            echo -e "${RED}无效输入${RESET}"
+            pause
+            ;;
     esac
 done

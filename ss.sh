@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 #
-# Hysteria 2 终极一体化管理面板 (集成官方原生安装内核)
+# Hysteria 2 终极一体化管理面板
 # SPDX-License-Identifier: MIT
 #
 
 # =========================================================
 # 1. 核心控制与全局环境初始化
 # =========================================================
-# 移除了严苛的 -u 限制，改用常规的安全报错捕捉
 set -Eop pipefail
 export LANG=en_US.UTF-8
 
@@ -121,7 +120,6 @@ install_software() {
 is_user_exists() { id "$1" > /dev/null 2>&1; }
 
 check_environment() {
-  # 判定系统
   if [[ "x$(uname)" == "xLinux" ]]; then
     OPERATING_SYSTEM=linux
   else
@@ -129,7 +127,6 @@ check_environment() {
     exit 95
   fi
 
-  # 判定架构
   case "$(uname -m)" in
     'i386' | 'i686') ARCHITECTURE='386' ;;
     'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
@@ -139,7 +136,6 @@ check_environment() {
     *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
   esac
 
-  # 基础命令依赖补充
   has_command curl || install_software curl
   has_command grep || install_software grep
   has_command jq || install_software jq
@@ -149,7 +145,14 @@ check_environment() {
 
 get_installed_version() {
   if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
-    "$EXECUTABLE_INSTALL_PATH" version 2>/dev/null | head -n 1 | awk '{print $3}' || echo "未知"
+    # 兼容多种格式输出，精准提取 vX.X.X
+    local version_out
+    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null || "$EXECUTABLE_INSTALL_PATH" -v 2>/dev/null || echo "")
+    if [[ -n "$version_out" ]]; then
+      echo "$version_out" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "未知格式"
+    else
+      echo "未知版本"
+    fi
   else
     echo "未安装"
   fi
@@ -181,7 +184,6 @@ download_hysteria() {
   return 0
 }
 
-# ================== 模板生成 ==================
 tpl_hysteria_server_service_base() {
   local _config_name="$1"
   cat << EOF
@@ -209,11 +211,20 @@ EOF
 # 3. 面板辅助网络与配置扩展函数
 # =========================================================
 get_public_ip() {
-  local ip
-  ip=$(curl -s4m5 ip.sb -k || curl -s6m5 ip.sb -k || echo "")
-  [[ -z "$ip" ]] && ip=$(curl -s4m5 https://api.ipify.org || curl -s6m5 https://api.ipify.org || echo "未知")
-  echo "$ip"
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    error "无法获取公网 IP 地址。" && return 1
 }
+
 
 check_port() {
   local port="$1"
@@ -256,7 +267,7 @@ get_current_port_display() {
 }
 
 # =========================================================
-# 4. 面板核心交互逻辑 (安装 / 证书 / 端口群)
+# 4. 面板核心交互逻辑 (证书 / 端口群)
 # =========================================================
 inst_cert() {
   echo "---------------------------------------------"
@@ -346,7 +357,7 @@ inst_port() {
   echo "---------------------------------------------"
   echo -e "Hysteria 2 端口群使用模式："
   echo -e " 1) 单端口模式"
-  echo -e " 2) 端口跳跃模式 (IPTables 转发端口群) ${YELLOW}（默认)${RESET}"
+  echo -e " 2) 端口跳跃模式 ${YELLOW}（默认)${RESET}"
   echo "---------------------------------------------"
   local jumpInput
   read -rp "请选择端口模式 [1-2] (默认2): " jumpInput
@@ -376,7 +387,6 @@ write_and_show_config() {
   local HOSTNAME=$(hostname -s | sed 's/ /_/g')
   local vps_ip=$(get_public_ip)
 
-  # 写入服务端配置
   cat << EOF > /etc/hysteria/config.yaml
 listen: :$port
 
@@ -408,7 +418,6 @@ EOF
 
   mkdir -p "$HY_DIR"
   
-  # 写入客户端核心配置
   cat << EOF > "$HY_DIR/hy-client.yaml"
 server: $last_ip:$last_port
 auth: $auth_pwd
@@ -429,9 +438,10 @@ transport:
 EOF
 
   cat << EOF > "$HY_DIR/url.txt"
-V2rayN / Necro / Hiddify:
+V2rayN配置:
 hysteria2://$auth_pwd@$last_ip:$port?insecure=1&sni=$hy_domain#$HOSTNAME
-Surge / Shadowrocket:
+
+Surge配置:
 $HOSTNAME = hysteria2, $last_ip, $port, password=$auth_pwd, skip-cert-verify=true, sni=$hy_domain
 EOF
 
@@ -448,7 +458,7 @@ EOF
 }
 
 # =========================================================
-# 5. 主流程控制模块
+# 5. 主流程控制模块与更新功能
 # =========================================================
 insthysteria() {
   check_environment
@@ -460,7 +470,6 @@ insthysteria() {
     return 1
   fi
   
-  # 执行二进制文件的原生安全下载与安装
   local _tmpfile=$(mktemp)
   if ! download_hysteria "$latest_version" "$_tmpfile"; then
     rm -f "$_tmpfile" && return 1
@@ -474,7 +483,6 @@ insthysteria() {
   fi
   rm -f "$_tmpfile"
 
-  # 原生初始化 Systemd 用户组与运行参数环境
   HYSTERIA_USER="hysteria"
   HYSTERIA_HOME_DIR="/var/lib/hysteria"
   if ! is_user_exists "$HYSTERIA_USER"; then
@@ -483,11 +491,9 @@ insthysteria() {
     echo "成功"
   fi
 
-  # 原生安装 systemd 配置文件
   install_content -Dm644 "$(tpl_hysteria_server_service_base 'config')" "$SYSTEMD_SERVICES_DIR/hysteria-server.service" "1"
   install_content -Dm644 "$(tpl_hysteria_server_service_base '%i')" "$SYSTEMD_SERVICES_DIR/hysteria-server@.service" "1"
 
-  # 初始化面板自定义交互变量
   firstport="" && endport=""
   inst_cert || return 1
   inst_port
@@ -501,10 +507,57 @@ insthysteria() {
   write_and_show_config
 }
 
+update_hysteria() {
+  if [[ ! -f "$HY_BINARY" ]]; then
+    error "当前系统未安装 Hysteria 2，无法执行更新。"
+    return 1
+  fi
+
+  info "正在检查新版本..."
+  local current_version=$(get_installed_version)
+  local latest_version=$(get_latest_version)
+
+  if [[ -z "$latest_version" ]]; then
+    error "无法连接到 GitHub API 获取最新版本，请稍后再试。"
+    return 1
+  fi
+
+  info "当前安装版本: ${YELLOW}${current_version}${RESET}"
+  info "官方最新版本: ${GREEN}${latest_version}${RESET}"
+
+  if [[ "$current_version" == "$latest_version" ]]; then
+    info "您当前已经是最新版本，无需更新。"
+    return 0
+  fi
+
+  warn "检测到新版本，即将开始平滑更新 (你的配置与端口规则不会改变)..."
+  
+  local _tmpfile=$(mktemp)
+  if ! download_hysteria "$latest_version" "$_tmpfile"; then
+    rm -f "$_tmpfile" && return 1
+  fi
+
+  echo -ne "正在覆盖二进制核心文件 ... "
+  if install -Dm755 "$_tmpfile" "$EXECUTABLE_INSTALL_PATH"; then
+    echo "成功"
+  else
+    rm -f "$_tmpfile" && error "覆盖核心失败" && return 1
+  fi
+  rm -f "$_tmpfile"
+
+  info "正在重启 Hysteria 2 服务以应用更新..."
+  systemctl daemon-reload
+  systemctl restart hysteria-server >/dev/null 2>&1 || true
+
+  if systemctl is-active --quiet hysteria-server 2>/dev/null; then
+    info "Hysteria 2 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
+  else
+    error "核心更新成功，但服务重启失败，请运行 'systemctl status hysteria-server' 检查错误。"
+  fi
+}
+
 unsthysteria() {
   warn "即将从当前系统中彻底卸载 Hysteria 2"
-  read -rp "确认卸载吗？[y/N]: " confirm
-  [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
 
   systemctl stop hysteria-server >/dev/null 2>&1 || true
   systemctl disable hysteria-server >/dev/null 2>&1 || true
@@ -573,7 +626,7 @@ showconf() {
     error "未找到客户端配置文件。"
     return
   fi
-  echo -e "${GREEN}====== 客户端 YAML 配置 (hy-client.yaml) ======${RESET}"
+  echo -e "${GREEN}====== 客户端 YAML 配置 ======${RESET}"
   cat "$HY_DIR/hy-client.yaml"
   echo
   echo -e "${GREEN}====== 节点分享链接 ======${RESET}"
@@ -602,12 +655,14 @@ menu() {
     echo -e "端口   : ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 安装 Hysteria 2${RESET}"
-    echo -e "${GREEN}2. 卸载 Hysteria 2${RESET}"
-    echo -e "${GREEN}3. 启动 Hysteria 2${RESET}"
-    echo -e "${GREEN}4. 关闭 Hysteria 2${RESET}"
-    echo -e "${GREEN}5. 重启 Hysteria 2${RESET}"
-    echo -e "${GREEN}6. 修改配置 (端口/证书/密码/伪装)${RESET}"
-    echo -e "${GREEN}7. 查看配置文件与链接${RESET}"
+    echo -e "${GREEN}2. 更新 Hysteria 2${RESET}"
+    echo -e "${GREEN}3. 卸载 Hysteria 2${RESET}"
+    echo -e "${GREEN}4. 启动 Hysteria 2${RESET}"
+    echo -e "${GREEN}5. 关闭 Hysteria 2${RESET}"
+    echo -e "${GREEN}6. 重启 Hysteria 2${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 修改配置 (端口/证书/密码/伪装)${RESET}"
+    echo -e "${GREEN}9. 查看配置文件与链接${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
 
@@ -617,12 +672,14 @@ menu() {
 
     case "$choice" in
       1) insthysteria; pause ;;
-      2) unsthysteria; pause ;;
-      3) systemctl start hysteria-server && info "服务已成功启动！"; pause ;;
-      4) systemctl stop hysteria-server && info "服务已成功停止！"; pause ;;
-      5) systemctl restart hysteria-server && info "服务已成功重启！"; pause ;;
-      6) changeconf; pause ;;
-      7) showconf; pause ;;
+      2) update_hysteria; pause ;;
+      3) unsthysteria; pause ;;
+      4) systemctl start hysteria-server && info "服务已成功启动！"; pause ;;
+      5) systemctl stop hysteria-server && info "服务已成功停止！"; pause ;;
+      6) systemctl restart hysteria-server && info "服务已成功重启！"; pause ;;
+      7) journalctl -u hysteria-server.service -n 50 --no-pager; pause ;;
+      8) changeconf; pause ;;
+      9) showconf; pause ;;
       0) exit 0 ;;
       *) error "无效输入，请重新选择。"; sleep 1 ;;
     esac

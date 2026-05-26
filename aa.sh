@@ -113,6 +113,14 @@ random_port() {
     shuf -i 2000-65000 -n 1
 }
 
+# ================== 获取系统DNS ==================
+get_system_dns() {
+
+    grep -E '^nameserver' /etc/resolv.conf \
+        | awk '{print $2}' \
+        | paste -sd "," -
+}
+
 # ================== 验证密码 ==================
 validate_password() {
 
@@ -172,24 +180,35 @@ write_config() {
 
     local port="$1"
     local password="$2"
+    local dns="$3"
 
     mkdir -p "$SS_DIR"
 
+    DNS_JSON=$(echo "$dns" | awk -F',' '{
+        for(i=1;i<=NF;i++){
+            gsub(/^[ \t]+|[ \t]+$/, "", $i)
+            printf "%s\"%s\"", (i>1?",":""), $i
+        }
+    }')
+
     cat > "$SS_CONFIG" <<EOF
 {
-    "server": ["::", "0.0.0.0"],
-    "server_port": ${port},
-    "password": "${password}",
-    "method": "${METHOD}",
+    "server": "::",
+    "server_port": $port,
+    "password": "$password",
+    "method": "$METHOD",
     "fast_open": true,
     "mode": "tcp_and_udp",
     "timeout": 300,
-    "no_delay": true
+    "no_delay": true,
+    "ipv6_first": false,
+    "nameserver": [
+        $DNS_JSON
+    ]
 }
 EOF
 
     chmod 600 "$SS_CONFIG"
-
     chown -R ${RUN_USER}:${RUN_USER} "$SS_DIR"
 }
 
@@ -259,7 +278,15 @@ configure_ss() {
 
     write_config "$port" "$password"
 
-    generate_links "$port" "$password"
+    # ===== DNS =====
+    default_dns=$(get_system_dns)
+    [[ -z "$default_dns" ]] && \
+    default_dns="1.1.1.1,8.8.8.8"
+
+    read -p "请输入 DNS (默认:$default_dns): " dns
+    dns=${dns:-$default_dns}
+
+    write_config "$port" "$password" "$dns"
 
     IP=$(get_public_ip)
 
@@ -274,8 +301,10 @@ configure_ss() {
     echo -e "${YELLOW} 密码          : ${password}${RESET}"
 
     echo -e "${YELLOW} 加密          : ${METHOD}${RESET}"
+    echo -e "${YELLOW} DNS           : ${dns}${RESET}"
 
     echo -e "${YELLOW}---------------------------------${RESET}"
+     echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
 
     echo -e "${YELLOW}[信息] SS链接：${RESET}"
 
@@ -304,6 +333,11 @@ modify_ss() {
 
     old_password=$(grep password "$SS_CONFIG" \
         | cut -d '"' -f4)
+    
+    old_dns=$(grep nameserver -A5 "$SS_CONFIG" \
+        | grep -oE '"[^"]+"' \
+        | tr -d '"' \
+        | paste -sd "," -)
 
     echo -e "${YELLOW}当前端口 : ${old_port}${RESET}"
 
@@ -367,10 +401,21 @@ modify_ss() {
             ;;
     esac
 
+    # ===== DNS =====
+    default_dns=$(get_system_dns)
+    [[ -z "$default_dns" ]] && \
+    default_dns="1.1.1.1,8.8.8.8"
+
+    default_dns=${old_dns:-$default_dns}
+
+    echo
+    read -p "请输入 DNS [当前:$default_dns]: " dns
+    dns=${dns:-$default_dns}
+
     cp "$SS_CONFIG" \
         "${SS_CONFIG}.bak.$(date +%s)"
 
-    write_config "$port" "$password"
+    write_config "$port" "$password" "$dns"
 
     generate_links "$port" "$password"
 
@@ -391,8 +436,10 @@ modify_ss() {
     echo -e "${YELLOW} 密码          : ${password}${RESET}"
 
     echo -e "${YELLOW} 加密          : ${METHOD}${RESET}"
+    echo -e "${YELLOW} DNS           : ${dns}${RESET}"
 
     echo
+    echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
 
     echo -e "${YELLOW}[信息] SS链接：${RESET}"
 

@@ -276,8 +276,6 @@ configure_ss() {
         password="$input_password"
     fi
 
-    write_config "$port" "$password"
-
     # ===== DNS =====
     default_dns=$(get_system_dns)
     [[ -z "$default_dns" ]] && \
@@ -287,6 +285,7 @@ configure_ss() {
     dns=${dns:-$default_dns}
 
     write_config "$port" "$password" "$dns"
+    generate_links "$port" "$password"
 
     IP=$(get_public_ip)
 
@@ -334,10 +333,13 @@ modify_ss() {
     old_password=$(grep password "$SS_CONFIG" \
         | cut -d '"' -f4)
     
-    old_dns=$(grep nameserver -A5 "$SS_CONFIG" \
-        | grep -oE '"[^"]+"' \
-        | tr -d '"' \
-        | paste -sd "," -)
+    old_dns=$(awk '
+    /"nameserver"/ {flag=1; next}
+    flag && /\]/ {flag=0; exit}
+    flag {
+        gsub(/^[ \t"]+|[ \t",]+$/, "")
+        if ($0 != "") print
+    }' "$SS_CONFIG" | paste -sd ',' -)
 
     echo -e "${YELLOW}当前端口 : ${old_port}${RESET}"
 

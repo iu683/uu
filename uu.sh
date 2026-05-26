@@ -1,38 +1,31 @@
 #!/bin/bash
-set -euo pipefail
 
 # =========================================================
-# Shadowsocks-Rust 管理脚本
-# 模板风格: Snell
-# 加密方式: 2022-blake3-aes-256-gcm
+# Xray VLESS-Reality 管理脚本
+# Version: 7.1
 # =========================================================
+
+set -Eeuo pipefail
 
 # ================== 颜色 ==================
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 BLUE="\033[34m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
 # ================== 基础变量 ==================
-SCRIPT_VERSION="5.0"
+readonly SCRIPT_VERSION="7.1"
 
-SS_DIR="/etc/ss-rust"
-SS_CONFIG="${SS_DIR}/config.json"
+readonly XRAY_CONFIG="/usr/local/etc/xray/config.json"
+readonly XRAY_BINARY="/usr/local/bin/xray"
 
-SS_SERVICE="/etc/systemd/system/ss-rust.service"
+readonly XRAY_PUBLIC_KEY_FILE="/usr/local/etc/xray/public.key"
 
-BINARY_PATH="/usr/local/bin/ssserver"
+readonly INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
 
-LOG_FILE="/var/log/ss-rust-manager.log"
-
-RUN_USER="ss-rust"
-
-METHOD="2022-blake3-aes-256-gcm"
-
-KEY_BYTES=32
-
-TMP_DIR=$(mktemp -d -t ss-rust.XXXXXX)
+TMP_DIR=$(mktemp -d -t xray.XXXXXX)
 
 # ================== cleanup ==================
 cleanup() {
@@ -42,19 +35,21 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ================== 日志 ==================
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+info() {
+    echo -e "${GREEN}[信息] $*${RESET}"
+}
+
+warn() {
+    echo -e "${YELLOW}[警告] $*${RESET}"
+}
+
+error() {
+    echo -e "${RED}[错误] $*${RESET}"
 }
 
 pause() {
     read -n 1 -s -r -p "按任意键返回菜单..."
     echo
-}
-
-# ================== 创建用户 ==================
-create_user() {
-    id -u "$RUN_USER" &>/dev/null || \
-        useradd -r -s /usr/sbin/nologin "$RUN_USER"
 }
 
 # ================== 获取公网IP ==================
@@ -71,9 +66,12 @@ get_public_ip() {
             "https://ip.sb" \
             "https://checkip.amazonaws.com"; do
 
-            ip=$($cmd "$url" 2>/dev/null) && \
-            [[ -n "$ip" ]] && \
-            echo "$ip" && return
+            ip=$($cmd "$url" 2>/dev/null || true)
+
+            if [[ -n "${ip:-}" ]]; then
+                echo "$ip"
+                return 0
+            fi
         done
     done
 
@@ -85,506 +83,640 @@ get_public_ip() {
             "https://api64.ipify.org" \
             "https://ipv6.ip.sb"; do
 
-            ip=$($cmd "$url" 2>/dev/null) && \
-            [[ -n "$ip" ]] && \
-            echo "[$ip]" && return
+            ip=$($cmd "$url" 2>/dev/null || true)
+
+            if [[ -n "${ip:-}" ]]; then
+                echo "$ip"
+                return 0
+            fi
         done
     done
 
-    echo "无法获取公网IP"
+    return 1
 }
 
 # ================== 检查端口 ==================
 check_port() {
 
-    if ss -tulnH "( sport = :$1 )" | grep -q .; then
-        echo -e "${RED}端口 $1 已被占用${RESET}"
-        return 1
-    fi
-}
+    local port="$1"
 
-# ================== 随机密码 ==================
-random_key() {
-    openssl rand -base64 "$KEY_BYTES" | tr -d '\n'
-}
+    if ss -tuln | awk '{print $5}' | grep -qE "[:.]${port}$"; then
 
-# ================== 随机端口 ==================
-random_port() {
-    shuf -i 2000-65000 -n 1
-}
+        error "端口 ${port} 已被占用"
 
-# ================== 获取系统DNS ==================
-get_system_dns() {
-
-    grep -E '^nameserver' /etc/resolv.conf \
-        | awk '{print $2}' \
-        | paste -sd "," -
-}
-
-# ================== 验证密码 ==================
-validate_password() {
-
-    local password="$1"
-
-    if ! echo "$password" | base64 -d >/dev/null 2>&1; then
-        echo -e "${RED}密码不是合法 Base64${RESET}"
         return 1
     fi
 
-    local decoded_len
+    return 0
+}
 
-    decoded_len=$(echo "$password" | base64 -d 2>/dev/null | wc -c)
+# ================== 验证端口 ==================
+is_valid_port() {
 
-    if [[ "$decoded_len" -ne "$KEY_BYTES" ]]; then
-        echo -e "${RED}密码必须为 ${KEY_BYTES} 字节${RESET}"
+    [[ "$1" =~ ^[0-9]+$ ]] \
+        && [[ "$1" -ge 1 ]] \
+        && [[ "$1" -le 65535 ]]
+}
+
+# ================== UUID验证 ==================
+is_valid_uuid() {
+
+    [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]
+}
+
+# ================== 域名验证 ==================
+is_valid_domain() {
+
+    [[ "$1" =~ ^([a-zA-Z0-9](-?[a-zA-Z0-9])*\.)+[A-Za-z]{2,}$ ]]
+}
+
+# ================== 下载脚本 ==================
+download_install_script() {
+
+    local file="$TMP_DIR/install.sh"
+
+    echo -e "${GREEN}[信息] 下载 Xray 安装脚本...${RESET}" >&2
+
+    if ! curl -fsSL "$INSTALL_SCRIPT_URL" -o "$file"; then
+
+        echo -e "${RED}[错误] 下载 Xray 安装脚本失败${RESET}" >&2
+
         return 1
+    fi
+
+    chmod +x "$file"
+
+    echo "$file"
+}
+
+# ================== 获取Xray状态 ==================
+get_xray_status() {
+
+    if systemctl is-active --quiet xray; then
+        echo -e "${GREEN}● 运行中${RESET}"
+    else
+        echo -e "${RED}● 未运行${RESET}"
     fi
 }
 
-# ================== 检测架构 ==================
-detect_arch() {
+# ================== 获取版本 ==================
+get_xray_version() {
 
-    case "$(uname -m)" in
+    if [[ -x "$XRAY_BINARY" ]]; then
 
-        x86_64)
-            echo "x86_64-unknown-linux-gnu"
-            ;;
+        "$XRAY_BINARY" version 2>/dev/null \
+            | head -n 1 \
+            | awk '{print $2}'
 
-        aarch64)
-            echo "aarch64-unknown-linux-gnu"
-            ;;
-
-        armv7l)
-            echo "armv7-unknown-linux-gnueabihf"
-            ;;
-
-        *)
-            echo -e "${RED}不支持架构: $(uname -m)${RESET}"
-            exit 1
-            ;;
-    esac
+    else
+        echo "未安装"
+    fi
 }
 
-# ================== 获取最新版本 ==================
-get_latest_version() {
+# ================== 检测IPv6 ==================
+get_listen_ip() {
 
-    curl -fsSL \
-        "https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest" \
-        | grep tag_name \
-        | cut -d '"' -f4 \
-        | sed 's/v//'
+    if sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null \
+        | grep -q '= 1'; then
+
+        echo "0.0.0.0"
+
+    else
+        echo "::"
+    fi
+}
+
+# ================== 测试配置 ==================
+test_config() {
+
+    if "$XRAY_BINARY" run -test -config "$XRAY_CONFIG"; then
+
+        info "Xray 配置测试通过"
+
+        return 0
+    fi
+
+    error "Xray 配置测试失败"
+
+    return 1
+}
+
+# ================== 重启服务 ==================
+restart_xray() {
+
+    systemctl restart xray
+
+    sleep 1
+
+    if systemctl is-active --quiet xray; then
+
+        info "Xray 启动成功"
+
+        return 0
+    fi
+
+    error "Xray 启动失败"
+
+    journalctl -u xray -n 20 --no-pager
+
+    return 1
 }
 
 # ================== 写配置 ==================
 write_config() {
 
     local port="$1"
-    local password="$2"
-    local dns="$3"
+    local uuid="$2"
+    local domain="$3"
+    local private_key="$4"
+    local shortid="$5"
 
-    mkdir -p "$SS_DIR"
+    local listen_ip
+    listen_ip=$(get_listen_ip)
 
-    DNS_JSON=$(echo "$dns" | awk -F',' '{
-        for(i=1;i<=NF;i++){
-            gsub(/^[ \t]+|[ \t]+$/, "", $i)
-            printf "%s\"%s\"", (i>1?",":""), $i
-        }
-    }')
+    mkdir -p /usr/local/etc/xray
 
-    cat > "$SS_CONFIG" <<EOF
+    cat > "$XRAY_CONFIG" <<EOF
 {
-    "server": "::",
-    "server_port": $port,
-    "password": "$password",
-    "method": "$METHOD",
-    "fast_open": true,
-    "mode": "tcp_and_udp",
-    "timeout": 300,
-    "no_delay": true,
-    "ipv6_first": false,
-    "nameserver": [
-        $DNS_JSON
+    "log": {
+        "loglevel": "warning"
+    },
+    "inbounds": [
+        {
+            "listen": "${listen_ip}",
+            "port": ${port},
+            "protocol": "vless",
+            "settings": {
+                "clients": [
+                    {
+                        "id": "${uuid}",
+                        "flow": "xtls-rprx-vision"
+                    }
+                ],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "show": false,
+                    "dest": "${domain}:443",
+                    "xver": 0,
+                    "serverNames": [
+                        "${domain}"
+                    ],
+                    "privateKey": "${private_key}",
+                    "shortIds": [
+                        "${shortid}"
+                    ]
+                }
+            },
+            "sniffing": {
+                "enabled": true,
+                "destOverride": [
+                    "http",
+                    "tls",
+                    "quic"
+                ]
+            }
+        }
+    ],
+    "outbounds": [
+        {
+            "protocol": "freedom",
+            "settings": {
+                "domainStrategy": "UseIPv4v6"
+            }
+        }
     ]
 }
 EOF
-
-    chmod 600 "$SS_CONFIG"
-    chown -R ${RUN_USER}:${RUN_USER} "$SS_DIR"
 }
 
-# ================== 生成链接 ==================
-generate_links() {
+# ================== 生成 Reality 密钥 ==================
+generate_reality_keys() {
 
-    local port="$1"
-    local password="$2"
+    local key_pair
+    key_pair=$("$XRAY_BINARY" x25519)
 
-    IP=$(get_public_ip)
+    local private_key
+    private_key=$(echo "$key_pair" \
+        | sed -n 's/Private key: //p')
 
-    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+    local public_key
+    public_key=$(echo "$key_pair" \
+        | sed -n 's/Public key: //p')
 
-    ENCODED=$(echo -n "${METHOD}:${password}" | base64 -w 0)
+    if [[ -z "${private_key:-}" || -z "${public_key:-}" ]]; then
 
-    # ===== SS Link =====
-    cat > "${SS_DIR}/ss.txt" <<EOF
-ss://${ENCODED}@${IP}:${port}#${HOSTNAME}-SS2022
+        error "Reality 密钥生成失败"
+
+        echo "$key_pair"
+
+        return 1
+    fi
+
+    echo "$public_key" > "$XRAY_PUBLIC_KEY_FILE"
+
+    chmod 600 "$XRAY_PUBLIC_KEY_FILE"
+
+    echo "${private_key}|${public_key}"
+}
+
+# ================== 获取 PublicKey ==================
+get_public_key() {
+
+    if [[ -f "$XRAY_PUBLIC_KEY_FILE" ]]; then
+        cat "$XRAY_PUBLIC_KEY_FILE"
+    fi
+}
+
+# ================== 生成订阅 ==================
+generate_link() {
+
+    local ip
+
+    if ! ip=$(get_public_ip); then
+
+        error "获取公网 IP 失败"
+
+        return 1
+    fi
+
+    local uuid
+    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG")
+
+    local port
+    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG")
+
+    local domain
+    domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG")
+
+    local shortid
+    shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG")
+
+    local public_key
+    public_key=$(get_public_key)
+
+    if [[ -z "${public_key:-}" ]]; then
+
+        error "读取 PublicKey 失败"
+
+        return 1
+    fi
+
+    local display_ip="$ip"
+
+    [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
+
+    local hostname
+    hostname=$(hostname -s | tr ' ' '_')
+
+    cat > /root/xray_vless_reality.txt <<EOF
+vless://${uuid}@${display_ip}:${port}?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=${domain}&fp=chrome&pbk=${public_key}&sid=${shortid}&spx=%2F#${hostname}-Reality
 EOF
+}
 
-    # ===== Surge =====
-    cat > "${SS_DIR}/surge.txt" <<EOF
-localhost = ss, ${IP}, ${port}, encrypt-method=${METHOD}, password=${password}, tfo=true, udp-relay=true, ecn=true
-EOF
+# ================== 显示配置 ==================
+show_current_config() {
+
+    if [[ ! -f "$XRAY_CONFIG" ]]; then
+
+        error "配置文件不存在"
+
+        return
+    fi
+
+    local ip
+    ip=$(get_public_ip || echo "未知")
+
+    local uuid
+    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG")
+
+    local port
+    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG")
+
+    local domain
+    domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG")
+
+    local shortid
+    shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG")
+
+    local public_key
+    public_key=$(get_public_key)
+
+    echo -e "${GREEN}====== 当前配置 ======${RESET}"
+
+    echo -e "${YELLOW}IP地址      : ${ip}${RESET}"
+
+    echo -e "${YELLOW}端口        : ${port}${RESET}"
+
+    echo -e "${YELLOW}UUID        : ${uuid}${RESET}"
+
+    echo -e "${YELLOW}SNI         : ${domain}${RESET}"
+
+    echo -e "${YELLOW}PublicKey   : ${public_key}${RESET}"
+
+    echo -e "${YELLOW}ShortID     : ${shortid}${RESET}"
+
+    echo
+
+    if [[ -f /root/xray_vless_reality.txt ]]; then
+
+        echo -e "${GREEN}====== VLESS 链接 ======${RESET}"
+
+        cat /root/xray_vless_reality.txt
+    fi
 }
 
 # ================== 安装配置 ==================
-configure_ss() {
+configure_xray() {
 
-    echo -e "${GREEN}[信息]开始配置 Shadowsocks-Rust...${RESET}"
+    info "开始配置 Xray Reality..."
+
+    local port
+    local uuid
+    local domain
 
     # ===== 端口 =====
     while true; do
 
-        read -p "请输入端口 (默认:随机生成): " input_port
+        read -rp "请输入端口 (默认:443): " input_port
 
-        if [[ -z "$input_port" ]]; then
-            port=$(random_port)
-        else
-            port="$input_port"
-        fi
+        port=${input_port:-443}
 
-        if [[ "$port" =~ ^[0-9]+$ ]] \
-            && [[ "$port" -ge 1 ]] \
-            && [[ "$port" -le 65535 ]]; then
+        if is_valid_port "$port"; then
 
             check_port "$port" || continue
+
             break
+
         else
-            echo -e "${RED}端口无效${RESET}"
+            error "端口无效"
         fi
     done
 
-    # ===== 密码 =====
-    read -p "请输入密码 (默认:随机生成): " input_password
+    # ===== UUID =====
+    while true; do
 
-    if [[ -z "$input_password" ]]; then
+        read -rp "请输入UUID (默认:自动生成): " input_uuid
 
-        password=$(random_key)
+        if [[ -z "${input_uuid:-}" ]]; then
 
-    else
+            uuid=$(cat /proc/sys/kernel/random/uuid)
 
-        validate_password "$input_password" || return
+            break
 
-        password="$input_password"
+        elif is_valid_uuid "$input_uuid"; then
+
+            uuid="$input_uuid"
+
+            break
+
+        else
+            error "UUID 格式无效"
+        fi
+    done
+
+    # ===== 域名 =====
+    while true; do
+
+        read -rp "请输入SNI域名 (默认:www.cloudflare.com): " input_domain
+
+        domain=${input_domain:-www.cloudflare.com}
+
+        if is_valid_domain "$domain"; then
+            break
+        else
+            error "域名格式无效"
+        fi
+    done
+
+    info "生成 Reality 密钥..."
+
+    local keys
+    keys=$(generate_reality_keys) || return 1
+
+    local private_key
+    private_key=$(echo "$keys" | cut -d '|' -f1)
+
+    local short_id
+    short_id=$(openssl rand -hex 4)
+
+    write_config \
+        "$port" \
+        "$uuid" \
+        "$domain" \
+        "$private_key" \
+        "$short_id"
+
+    if ! test_config; then
+        return 1
     fi
 
-    # ===== DNS =====
-    default_dns=$(get_system_dns)
-    [[ -z "$default_dns" ]] && \
-    default_dns="1.1.1.1,8.8.8.8"
+    generate_link
 
-    read -p "请输入 DNS (默认:$default_dns): " dns
-    dns=${dns:-$default_dns}
+    restart_xray
 
-    write_config "$port" "$password" "$dns"
+    show_current_config
+}
 
-    IP=$(get_public_ip)
+# ================== 安装 ==================
+install_xray() {
 
-    echo -e "${GREEN}[完成] 配置已保存${RESET}"
+    info "开始安装 Xray..."
 
-    echo -e "${GREEN}====== Shadowsocks 配置 ======${RESET}"
+    local install_script
+    install_script=$(download_install_script) || return 1
 
-    echo -e "${YELLOW} IP地址        : ${IP}${RESET}"
+    bash "$install_script" install
 
-    echo -e "${YELLOW} 端口          : ${port}${RESET}"
+    bash "$install_script" install-geodata
 
-    echo -e "${YELLOW} 密码          : ${password}${RESET}"
+    systemctl enable xray
 
-    echo -e "${YELLOW} 加密          : ${METHOD}${RESET}"
-    echo -e "${YELLOW} DNS           : ${dns}${RESET}"
+    configure_xray
 
-    echo -e "${YELLOW}---------------------------------${RESET}"
-     echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
+    info "Xray 已安装完成"
+}
 
-    echo -e "${YELLOW}[信息] SS链接：${RESET}"
+# ================== 更新 ==================
+update_xray() {
 
-    cat "${SS_DIR}/ss.txt"
+    info "更新 Xray..."
 
-    echo
+    local install_script
+    install_script=$(download_install_script) || return 1
 
-    echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
+    bash "$install_script" install
 
-    cat "${SS_DIR}/surge.txt"
+    bash "$install_script" install-geodata
 
-    echo -e "${YELLOW}---------------------------------${RESET}"
+    restart_xray
 }
 
 # ================== 修改配置 ==================
-modify_ss() {
+modify_config() {
 
-    echo -e "${GREEN}[信息]开始修改 Shadowsocks 配置...${RESET}"
+    if [[ ! -f "$XRAY_CONFIG" ]]; then
 
-    if [[ ! -f "$SS_CONFIG" ]]; then
-        echo -e "${RED}配置文件不存在${RESET}"
-        return
+        error "配置文件不存在"
+
+        return 1
     fi
 
-    old_port=$(grep server_port "$SS_CONFIG" | grep -o '[0-9]\+')
+    local old_port
+    old_port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG")
 
-    old_password=$(grep password "$SS_CONFIG" \
-        | cut -d '"' -f4)
-    
-    old_dns=$(grep nameserver -A5 "$SS_CONFIG" \
-        | grep -oE '"[^"]+"' \
-        | tr -d '"' \
-        | paste -sd "," -)
+    local old_uuid
+    old_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG")
+
+    local old_domain
+    old_domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG")
+
+    local private_key
+    private_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$XRAY_CONFIG")
+
+    local shortid
+    shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG")
+
+    echo -e "${GREEN}[信息] 开始修改配置...${RESET}"
 
     echo -e "${YELLOW}当前端口 : ${old_port}${RESET}"
 
-    echo -e "${YELLOW}当前密码 : ${old_password}${RESET}"
+    echo -e "${YELLOW}当前UUID : ${old_uuid}${RESET}"
+
+    echo -e "${YELLOW}当前SNI  : ${old_domain}${RESET}"
 
     echo
 
-    # ===== 新端口 =====
+    local port
+    local uuid
+    local domain
+
+    # ===== 端口 =====
     while true; do
 
-        read -p "请输入新端口 [当前:${old_port}]: " input_port
+        read -rp "请输入新端口 [当前:${old_port}]: " input_port
 
         port=${input_port:-$old_port}
 
-        if [[ "$port" =~ ^[0-9]+$ ]] \
-            && [[ "$port" -ge 1 ]] \
-            && [[ "$port" -le 65535 ]]; then
+        if is_valid_port "$port"; then
 
             if [[ "$port" != "$old_port" ]]; then
                 check_port "$port" || continue
             fi
 
             break
+
         else
-            echo -e "${RED}端口无效${RESET}"
+            error "端口无效"
         fi
     done
 
-    # ===== 密码 =====
-    echo
-    echo "1. 保持当前密码"
-    echo "2. 手动输入密码"
-    echo "3. 自动生成密码"
+    # ===== UUID =====
+    while true; do
 
-    read -p "请选择 [默认:1]: " pwd_mode
+        read -rp "请输入UUID [当前:${old_uuid}]: " input_uuid
 
-    case $pwd_mode in
+        uuid=${input_uuid:-$old_uuid}
 
-        2)
+        if is_valid_uuid "$uuid"; then
+            break
+        else
+            error "UUID 格式无效"
+        fi
+    done
 
-            while true; do
+    # ===== 域名 =====
+    while true; do
 
-                read -p "请输入 Base64 密码: " input_password
+        read -rp "请输入SNI域名 [当前:${old_domain}]: " input_domain
 
-                validate_password "$input_password" && break
-            done
+        domain=${input_domain:-$old_domain}
 
-            password="$input_password"
-            ;;
+        if is_valid_domain "$domain"; then
+            break
+        else
+            error "域名格式无效"
+        fi
+    done
 
-        3)
+    local backup_file
+    backup_file="${XRAY_CONFIG}.bak.$(date +%s)"
 
-            password=$(random_key)
+    cp "$XRAY_CONFIG" "$backup_file"
 
-            echo -e "${GREEN}已生成新密码${RESET}"
-            ;;
+    write_config \
+        "$port" \
+        "$uuid" \
+        "$domain" \
+        "$private_key" \
+        "$shortid"
 
-        *)
+    if ! test_config; then
 
-            password="$old_password"
-            ;;
-    esac
+        warn "恢复旧配置..."
 
-    # ===== DNS =====
-    default_dns=$(get_system_dns)
-    [[ -z "$default_dns" ]] && \
-    default_dns="1.1.1.1,8.8.8.8"
+        mv "$backup_file" "$XRAY_CONFIG"
 
-    default_dns=${old_dns:-$default_dns}
+        return 1
+    fi
 
-    echo
-    read -p "请输入 DNS [当前:$default_dns]: " dns
-    dns=${dns:-$default_dns}
+    generate_link
 
-    cp "$SS_CONFIG" \
-        "${SS_CONFIG}.bak.$(date +%s)"
+    restart_xray
 
-    write_config "$port" "$password" "$dns"
-
-    generate_links "$port" "$password"
-
-    systemctl restart ss-rust
-
-    IP=$(get_public_ip)
-
-    echo -e "${GREEN}[完成] 配置修改成功${RESET}"
-
-    echo
-
-    echo -e "${GREEN}====== Shadowsocks 配置 ======${RESET}"
-
-    echo -e "${YELLOW} IP地址        : ${IP}${RESET}"
-
-    echo -e "${YELLOW} 端口          : ${port}${RESET}"
-
-    echo -e "${YELLOW} 密码          : ${password}${RESET}"
-
-    echo -e "${YELLOW} 加密          : ${METHOD}${RESET}"
-    echo -e "${YELLOW} DNS           : ${dns}${RESET}"
-
-    echo
-    echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
-
-    echo -e "${YELLOW}[信息] SS链接：${RESET}"
-
-    cat "${SS_DIR}/ss.txt"
-
-    echo
-
-    echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
-
-    cat "${SS_DIR}/surge.txt"
-
-    echo
-
-    log "Shadowsocks 配置已修改"
+    info "配置修改成功"
 }
 
-# ================== 安装 ==================
-install_ss() {
+# ================== 修复 systemd 用户 ==================
+fix_systemd_user() {
 
-    echo -e "${GREEN}[信息] 开始安装 Shadowsocks-Rust...${RESET}"
+    local service_file="/etc/systemd/system/xray.service"
 
-    create_user
-
-    mkdir -p "$SS_DIR"
-
-    cd "$TMP_DIR"
-
-    VERSION=$(get_latest_version)
-
-    ARCH=$(detect_arch)
-
-    URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${VERSION}/shadowsocks-v${VERSION}.${ARCH}.tar.xz"
-
-    wget -O ss.tar.xz "$URL"
-
-    tar -xf ss.tar.xz
-
-    install -m 755 ssserver "$BINARY_PATH"
-
-    echo "$VERSION" > "${SS_DIR}/version.txt"
-
-    configure_ss
-
-    # ===== systemd =====
-    cat > "$SS_SERVICE" <<EOF
-[Unit]
-Description=Shadowsocks Rust Server
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-
-User=${RUN_USER}
-Group=${RUN_USER}
-
-ExecStart=${BINARY_PATH} -c ${SS_CONFIG}
-
-Restart=on-failure
-RestartSec=3
-
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-
-NoNewPrivileges=true
-
-PrivateTmp=true
-
-ProtectSystem=strict
-ProtectHome=true
-
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-
-    systemctl enable ss-rust
-
-    systemctl restart ss-rust
-
-    echo -e "${GREEN}[完成] Shadowsocks-Rust 已安装并启动${RESET}"
-
-    log "Shadowsocks-Rust 已安装"
-}
-
-# ================== 更新 ==================
-update_ss() {
-
-    echo -e "${GREEN}[信息] 更新 Shadowsocks-Rust...${RESET}"
-
-    if [[ ! -f "$SS_CONFIG" ]]; then
-        echo -e "${RED}未找到配置文件${RESET}"
+    if [[ ! -f "$service_file" ]]; then
         return
     fi
 
-    systemctl stop ss-rust || true
+    if grep -q '^User=nobody' "$service_file"; then
 
-    cd "$TMP_DIR"
+        warn "修复 xray.service 用户..."
 
-    VERSION=$(get_latest_version)
+        if ! id xray &>/dev/null; then
 
-    ARCH=$(detect_arch)
+            useradd -r -s /usr/sbin/nologin xray || true
+        fi
 
-    URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${VERSION}/shadowsocks-v${VERSION}.${ARCH}.tar.xz"
+        sed -i 's/^User=nobody/User=xray/' "$service_file"
 
-    wget -O ss.tar.xz "$URL"
+        chown -R xray:xray /usr/local/etc/xray || true
 
-    tar -xf ss.tar.xz
-
-    install -m 755 ssserver "$BINARY_PATH"
-
-    echo "$VERSION" > "${SS_DIR}/version.txt"
-
-    systemctl restart ss-rust
-
-    echo -e "${GREEN}[完成] Shadowsocks-Rust 已更新${RESET}"
-
-    log "Shadowsocks-Rust 已更新"
+        systemctl daemon-reload
+    fi
 }
 
 # ================== 卸载 ==================
-uninstall_ss() {
+uninstall_xray() {
 
-    echo -e "${RED}[警告] 卸载 Shadowsocks-Rust...${RESET}"
+    warn "即将卸载 Xray"
 
-    systemctl stop ss-rust || true
+    read -rp "确认卸载？[y/N]: " confirm
 
-    systemctl disable ss-rust || true
+    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
 
-    rm -f "$SS_SERVICE"
+    systemctl stop xray || true
 
-    rm -rf "$SS_DIR"
+    local install_script
+    install_script=$(download_install_script) || return 1
 
-    rm -f "$BINARY_PATH"
+    bash "$install_script" remove --purge
 
-    systemctl daemon-reload
+    rm -f /root/xray_vless_reality.txt
 
-    echo -e "${GREEN}[完成] Shadowsocks-Rust 已卸载${RESET}"
+    rm -f "$XRAY_PUBLIC_KEY_FILE"
 
-    log "Shadowsocks-Rust 已卸载"
+    info "Xray 已卸载"
 }
 
 # ================== 菜单 ==================
@@ -592,52 +724,45 @@ show_menu() {
 
     clear
 
-    if systemctl is-active --quiet ss-rust; then
-        STATUS="${GREEN}● 运行中${RESET}"
-    else
-        STATUS="${RED}● 未运行${RESET}"
-    fi
+    local status
+    status=$(get_xray_status)
 
-    VERSION_SHOW="未安装"
+    local version
+    version=$(get_xray_version)
 
-    if [[ -f "${SS_DIR}/version.txt" ]]; then
-        VERSION_SHOW="v$(cat "${SS_DIR}/version.txt")"
-    fi
+    local port_show="-"
 
-    PORT_SHOW="-"
-
-    if [[ -f "$SS_CONFIG" ]]; then
-        PORT_SHOW=$(grep server_port "$SS_CONFIG" \
-            | grep -o '[0-9]\+')
+    if [[ -f "$XRAY_CONFIG" ]]; then
+        port_show=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG")
     fi
 
     echo -e "${GREEN}================================${RESET}"
 
-    echo -e "${GREEN}   Shadowsocks-Rust 管理面板        ${RESET}"
+    echo -e "${GREEN}    Xray Reality 管理面板 v${SCRIPT_VERSION}    ${RESET}"
 
     echo -e "${GREEN}================================${RESET}"
 
-    echo -e "状态   : $STATUS"
+    echo -e "状态   : $status"
 
-    echo -e "版本   : ${YELLOW}${VERSION_SHOW}${RESET}"
+    echo -e "版本   : ${YELLOW}${version}${RESET}"
 
-    echo -e "端口   : ${YELLOW}${PORT_SHOW}${RESET}"
+    echo -e "端口   : ${YELLOW}${port_show}${RESET}"
 
     echo -e "${GREEN}================================${RESET}"
 
-    echo -e "${GREEN}1. 安装 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}1. 安装 Xray Reality${RESET}"
 
-    echo -e "${GREEN}2. 更新 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}2. 更新 Xray${RESET}"
 
-    echo -e "${GREEN}3. 卸载 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}3. 卸载 Xray${RESET}"
 
     echo -e "${GREEN}4. 修改配置${RESET}"
 
-    echo -e "${GREEN}5. 启动 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}5. 启动 Xray${RESET}"
 
-    echo -e "${GREEN}6. 停止 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}6. 停止 Xray${RESET}"
 
-    echo -e "${GREEN}7. 重启 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}7. 重启 Xray${RESET}"
 
     echo -e "${GREEN}8. 查看日志${RESET}"
 
@@ -648,97 +773,177 @@ show_menu() {
     echo -e "${GREEN}================================${RESET}"
 }
 
+# ================== 安装依赖 ==================
+install_dependencies() {
+
+    if command -v apt >/dev/null 2>&1; then
+
+        apt update
+
+        apt install -y \
+            jq \
+            curl \
+            wget \
+            openssl \
+            ca-certificates \
+            iproute2
+
+    elif command -v dnf >/dev/null 2>&1; then
+
+        dnf install -y \
+            jq \
+            curl \
+            wget \
+            openssl \
+            ca-certificates \
+            iproute
+
+    elif command -v yum >/dev/null 2>&1; then
+
+        yum install -y \
+            epel-release
+
+        yum install -y \
+            jq \
+            curl \
+            wget \
+            openssl \
+            ca-certificates \
+            iproute
+
+    elif command -v apk >/dev/null 2>&1; then
+
+        apk add \
+            jq \
+            curl \
+            wget \
+            openssl \
+            ca-certificates \
+            iproute2
+
+    else
+
+        error "不支持当前系统"
+
+        exit 1
+    fi
+}
+
+# ================== 依赖检查 ==================
+pre_check() {
+
+    if [[ $(id -u) -ne 0 ]]; then
+
+        error "请使用 root 用户运行"
+
+        exit 1
+    fi
+
+    local deps=(
+        jq
+        curl
+        wget
+        openssl
+        ss
+    )
+
+    local missing=0
+
+    for cmd in "${deps[@]}"; do
+
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+
+            missing=1
+
+            break
+        fi
+    done
+
+    if [[ "$missing" -eq 1 ]]; then
+
+        info "安装依赖..."
+
+        install_dependencies
+    fi
+}
+
 # ================== 主循环 ==================
-while true; do
+main() {
 
-    show_menu
+    pre_check
 
-    read -r -p $'\033[32m请输入选项: \033[0m' choice
+    fix_systemd_user
 
-    case $choice in
+    while true; do
 
-        1)
-            install_ss
-            pause
-            ;;
+        show_menu
 
-        2)
-            update_ss
-            pause
-            ;;
+        read -r -p $'\033[32m请输入选项: \033[0m' choice
 
-        3)
-            uninstall_ss
-            pause
-            ;;
+        case "$choice" in
 
-        4)
-            modify_ss
-            pause
-            ;;
+            1)
+                install_xray
+                pause
+                ;;
 
-        5)
-            systemctl start ss-rust
-            echo -e "${GREEN}[完成] Shadowsocks 已启动${RESET}"
-            log "Shadowsocks 启动"
-            pause
-            ;;
+            2)
+                update_xray
+                pause
+                ;;
 
-        6)
-            systemctl stop ss-rust
-            echo -e "${GREEN}[完成] Shadowsocks 已停止${RESET}"
-            log "Shadowsocks 停止"
-            pause
-            ;;
+            3)
+                uninstall_xray
+                pause
+                ;;
 
-        7)
-            systemctl restart ss-rust
-            echo -e "${GREEN}[完成] Shadowsocks 已重启${RESET}"
-            log "Shadowsocks 重启"
-            pause
-            ;;
+            4)
+                modify_config
+                pause
+                ;;
 
-        8)
-            journalctl -u ss-rust -e --no-pager
-            pause
-            ;;
+            5)
+                systemctl start xray
 
-        9)
+                restart_xray
 
-            if [[ -f "$SS_CONFIG" ]]; then
+                pause
+                ;;
 
-                echo -e "${GREEN}====== 当前配置 ======${RESET}"
+            6)
+                systemctl stop xray
 
-                cat "$SS_CONFIG"
+                info "Xray 已停止"
 
-                echo
+                pause
+                ;;
 
-                echo -e "${GREEN}====== SS链接 ======${RESET}"
+            7)
+                restart_xray
 
-                cat "${SS_DIR}/ss.txt"
+                pause
+                ;;
 
-                echo
+            8)
+                journalctl -u xray -e --no-pager
+                pause
+                ;;
 
-                echo -e "${GREEN}====== Surge 配置 ======${RESET}"
+            9)
+                show_current_config
+                pause
+                ;;
 
-                cat "${SS_DIR}/surge.txt"
+            0)
+                exit 0
+                ;;
 
-            else
+            *)
+                error "无效输入"
+                pause
+                ;;
+        esac
+    done
+}
 
-                echo -e "${RED}配置文件不存在${RESET}"
-
-            fi
-
-            pause
-            ;;
-
-        0)
-            exit 0
-            ;;
-
-        *)
-            echo -e "${RED}无效输入${RESET}"
-            pause
-            ;;
-    esac
-done
+main "$@"

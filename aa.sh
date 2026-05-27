@@ -3,10 +3,10 @@
 # ==============================================================================
 # Linux TCP/IP & BBR & TFO 智能优化脚本
 #
-# 版本: 3.1.6 
+# 版本: 1.0 
 # ==============================================================================
 
-SCRIPT_VERSION="3.1.6"
+SCRIPT_VERSION="1.0"
 
 set -euo pipefail
 
@@ -246,7 +246,7 @@ uninstall_optimizations() {
         sysctl --system >/dev/null 2>&1 || true
         echo -e "${GREEN}✅ 卸载完成，系统控制流已恢复至全局默认状态。${NC}\n"
     else
-        echo -e "${YELLOW}💡 提示: 未检测到由本脚本生成的配置文件，无需卸载。${NC}\n"
+        echo -e "${YELLOW}💡 提示: 未检测到生成的配置文件，无需卸载。${NC}\n"
     fi
     
     # 挂起等待回车
@@ -261,16 +261,16 @@ menu() {
         clear
         get_status_text
         
-        echo -e "${GREEN}======================================================${NC}"
-        echo -e "${GREEN}     BBR+TCP智能调参     ${NC}"
-        echo -e "${GREEN}======================================================${NC}"
-        echo -e "${GREEN}  🚀 BBR状态看板 : ${BBR_STATUS}"
-        echo -e "${GREEN}  📂    配置状态 : ${CONF_STATUS}"
-        echo -e "${GREEN}------------------------------------------------------${NC}"
+        echo -e "${GREEN}====================================${NC}"
+        echo -e "${GREEN}    BBR+TCP智能调参              ${NC}"
+        echo -e "${GREEN}====================================${NC}"
+        echo -e "${GREEN} 🚀 BBR状态看板 : ${BBR_STATUS}"
+        echo -e "${GREEN} 📂    配置状态 : ${CONF_STATUS}"
+        echo -e "${GREEN}====================================${NC}"
         echo -e "${GREEN}  1. 网络优化${NC}"
         echo -e "${GREEN}  2. 卸载优化${NC}"
         echo -e "${GREEN}  0. 退出${NC}"
-        echo -e "${GREEN}======================================================${NC}"
+        echo -e "${GREEN}====================================${NC}"
         
         echo -ne "${GREEN}请输入选项: ${NC}"
         read -r choice

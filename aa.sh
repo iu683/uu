@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Dockge 一键管理脚本
+# EasyTier 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="dockge"
+APP_NAME="easytier"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -25,21 +25,13 @@ check_docker() {
     fi
 }
 
-check_port() {
-
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
-
 menu() {
 
     while true; do
 
         clear
 
-        echo -e "${GREEN}=== Dockge 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== EasyTier 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -67,60 +59,69 @@ install_app() {
 
     check_docker
 
-    mkdir -p "$APP_DIR/data"
+    mkdir -p /etc/easytier
+    mkdir -p "$APP_DIR"
 
     if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
+        echo -ne "${YELLOW}检测到已安装，是否覆盖安装？(y/n): ${RESET}"
+        read -r confirm
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入 Web 端口 [默认:5001]: " input_port
-    PORT=${input_port:-5001}
+    echo
 
-    check_port "$PORT" || return
+    read -p "请输入服务器地址: " SERVER_ADDR
+    read -p "请输入网络名称 Network Name: " NETWORK_NAME
+    read -p "请输入网络密码 Network Secret: " NETWORK_SECRET
+    read -p "请输入端口 [默认:11010]: " input_port
 
-    read -p "请输入 Stacks 目录 [默认:/opt/stacks]: " input_stack
-    STACK_DIR=${input_stack:-/opt/stacks}
-
-    mkdir -p "$STACK_DIR"
+    SERVER_ADDR=$(echo "$SERVER_ADDR" | xargs)
+    NETWORK_NAME=$(echo "$NETWORK_NAME" | xargs)
+    NETWORK_SECRET=$(echo "$NETWORK_SECRET" | xargs)
+    PORT=${input_port:-11010}
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  dockge:
-    image: louislam/dockge:1
-
-    container_name: dockge
-
-    restart: unless-stopped
-
-    ports:
-      - "127.0.0.1:${PORT}:5001"
+  easytier:
+    image: easytier/easytier:latest
+    pull_policy: always
+    container_name: easytier
+    hostname: easytier
+    restart: always
+    privileged: true
+    network_mode: host
 
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ./data:/app/data
-      - ${STACK_DIR}:${STACK_DIR}
+      - /etc/easytier:/root
 
     environment:
-      - DOCKGE_STACKS_DIR=${STACK_DIR}
+      - TZ=Asia/Shanghai
+
+    command: >
+      -i ${SERVER_ADDR}
+      --network-name "${NETWORK_NAME}"
+      --network-secret "${NETWORK_SECRET}"
+      -e tcp://${SERVER_ADDR}:${PORT}
+      -l tcp://${SERVER_ADDR}:${PORT}
 
     logging:
-      driver: "json-file"
+      driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
 EOF
+
 
     cd "$APP_DIR" || exit
 
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ Dockge 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址:${RESET} http://127.0.0.1:${PORT}"
-    echo -e "${YELLOW}📂 Stacks目录:${RESET} ${STACK_DIR}"
-    echo -e "${YELLOW}📁 数据目录:${RESET} $APP_DIR/data"
+    echo -e "${GREEN}✅ EasyTier 已启动${RESET}"
+    echo -e "${YELLOW}🌐 网络名称: ${NETWORK_NAME}${RESET}"
+    echo -e "${YELLOW}🌐 网络密码: ${NETWORK_SECRET}${RESET}"
+    echo -e "${YELLOW}📡 服务器: ${SERVER_ADDR}:${PORT}${RESET}"
+    echo -e "${YELLOW}📂 配置目录: /etc/easytier${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -139,7 +140,7 @@ update_app() {
 
 restart_app() {
 
-    docker restart dockge
+    docker restart easytier
 
     echo -e "${GREEN}✅ 已重启${RESET}"
 
@@ -148,12 +149,12 @@ restart_app() {
 
 view_logs() {
 
-    docker logs -f dockge
+    docker logs -f easytier
 }
 
 check_status() {
 
-    docker ps | grep dockge
+    docker ps | grep easytier
 
     read -p "按回车返回菜单..."
 }
@@ -164,8 +165,9 @@ uninstall_app() {
 
     docker compose down -v
     rm -rf "$APP_DIR"
+    rm -rf /etc/easytier
 
-    echo -e "${RED}✅ 已彻底卸载${RESET}"
+    echo -e "${RED}✅ 已卸载${RESET}"
 
     read -p "按回车返回菜单..."
 }

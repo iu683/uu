@@ -3,9 +3,10 @@
 # ==============================================================================
 # Linux TCP/IP & BBR & TFO 智能优化脚本
 #
+# 版本: 3.1.6 
 # ==============================================================================
 
-SCRIPT_VERSION="3.1.3"
+SCRIPT_VERSION="3.1.6"
 
 set -euo pipefail
 
@@ -27,18 +28,65 @@ check_root() {
     fi
 }
 
-# --- 获取系统信息与动态参数 ---
+# --- BBR 与 架构兼容性硬检测 ---
+check_bbr_support() {
+    # 1. 检测容器虚拟化架构 (OpenVZ / LXC 判定)
+    local virt_type="unknown"
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        virt_type=$(systemd-detect-virt)
+    elif [ -f /proc/user_beancounters ]; then
+        virt_type="openvz"
+    elif grep -qi container /proc/1/environ 2>/dev/null; then
+        virt_type="lxc"
+    fi
+
+    if [[ "$virt_type" == "openvz" || "$virt_type" == "lxc" ]]; then
+        echo -e "${RED}❌ 错误: 当前 VPS 架构为 [${virt_type^^}] 容器/NAT小鸡。${NC}"
+        echo -e "${YELLOW}💡 原因: 该架构与宿主机共享内核，非独立内核，无法自主应用 BBR 拥塞控制与 FQ 队列。${NC}"
+        exit 1
+    fi
+
+    # 2. 内核版本前置过滤
+    local kernel_version major minor
+    kernel_version=$(uname -r | cut -d. -f1,2)
+    major=$(echo "$kernel_version" | cut -d. -f1)
+    minor=$(echo "$kernel_version" | cut -d. -f2)
+    
+    local has_bbr_mod=0
+    if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q "bbr"; then
+        has_bbr_mod=1
+    elif modprobe -n tcp_bbr >/dev/null 2>&1; then
+        has_bbr_mod=1
+    fi
+
+    if [ "$major" -lt 4 ] || { [ "$major" -eq 4 ] && [ "$minor" -lt 9 ]; }; then
+        if [ "$has_bbr_mod" -ne 1 ]; then
+            echo -e "${RED}❌ 错误: 当前系统内核版本为 $(uname -r)，低于官方要求的 4.9 最低限制，且无可用 BBR 模块。${NC}"
+            exit 1
+        fi
+    fi
+
+    # 3. 核心参数修改权限沙箱预检 (终极防线)
+    if ! sysctl -w net.ipv4.tcp_congestion_control=$(sysctl -n net.ipv4.tcp_congestion_control) >/dev/null 2>&1; then
+        echo -e "${RED}❌ 错误: 检测到系统内核网络参数文件为 [只读] 状态或无修改权限。${NC}"
+        echo -e "${YELLOW}💡 原因: 这通常发生在某些受限的环境（如部分 NAT 共享小鸡或特殊安全策略容器中）。${NC}"
+        exit 1
+    fi
+}
+
+# --- 获取系统信息与动态参数 (针对小内存 UDP 深度调优) ---
 get_system_info() {
     TOTAL_MEM=$(free -m | awk '/^Mem:/{print $2}' | tr -d '\r')
     
     if [ "$TOTAL_MEM" -le 512 ]; then
-        VM_TIER="入门级(≤512MB)"
+        VM_TIER="入门微型小鸡(≤512MB RAM)"
         RMEM_MAX="16777216"   
         WMEM_MAX="16777216"
         TCP_MEM_MAX="16777216"
-        SOMAXCONN="4096"
+        SOMAXCONN="2048"       
         FILE_MAX="65535"
-        CONNTRACK_MAX="65536"
+        CONNTRACK_MAX="32768"
+        UDP_MEM_CONF="1152 1536 2304"
     elif [ "$TOTAL_MEM" -le 1024 ]; then
         VM_TIER="基础级(1GB)"
         RMEM_MAX="33554432"   
@@ -47,6 +95,7 @@ get_system_info() {
         SOMAXCONN="16384"
         FILE_MAX="524288"
         CONNTRACK_MAX="262144"
+        UDP_MEM_CONF="16384 32768 65536"
     elif [ "$TOTAL_MEM" -le 4096 ]; then
         VM_TIER="进阶级(2GB-4GB)"
         RMEM_MAX="67108864"   
@@ -55,6 +104,7 @@ get_system_info() {
         SOMAXCONN="32768"
         FILE_MAX="1048576"
         CONNTRACK_MAX="524288"
+        UDP_MEM_CONF="65536 131072 262144"
     else
         VM_TIER="专业级(>4GB)"
         RMEM_MAX="134217728"  
@@ -63,6 +113,7 @@ get_system_info() {
         SOMAXCONN="65535"
         FILE_MAX="2097152"
         CONNTRACK_MAX="1048576"
+        UDP_MEM_CONF="262144 524288 1048576"
     fi
 }
 
@@ -92,7 +143,7 @@ get_status_text() {
     if [ "$cc" == "bbr" ]; then
         BBR_STATUS="${YELLOW}已启用 (${qdisc})${NC}"
     else
-        BBR_STATUS="${RED}未启用 (${cc})${NC}"
+        BBR_STATUS="${RED}微调未启用 (${cc})${NC}"
     fi
 
     if [ -f "$CONF_FILE" ]; then
@@ -120,8 +171,8 @@ apply_optimizations() {
 # ==========================================================
 EOF
 
-    # 1. BBR 与 队列算法 (更改为默认固定 fq)
-    add_conf "net.core.default_qdisc" "fq" "FQ 队列算法 (BBR 官方推荐最佳拍档)"
+    # 1. BBR 与 队列算法 (默认固定 fq)
+    add_conf "net.core.default_qdisc" "fq" "FQ 队列算法"
     add_conf "net.ipv4.tcp_congestion_control" "bbr" "开启 BBR 拥塞控制"
     add_conf "net.ipv4.tcp_slow_start_after_idle" "0" "关闭空闲慢启动"
 
@@ -137,7 +188,7 @@ EOF
     add_conf "net.ipv4.tcp_wmem" "4096 65536 $TCP_MEM_MAX" "TCP 写缓存"
     add_conf "net.ipv4.udp_rmem_min" "16384" "UDP 读缓存下限"
     add_conf "net.ipv4.udp_wmem_min" "16384" "UDP 写缓存下限"
-    add_conf "net.ipv4.udp_mem" "262144 524288 1048576" "系统 UDP 内存页限制"
+    add_conf "net.ipv4.udp_mem" "$UDP_MEM_CONF" "系统 UDP 内存页全局限制"
 
     # 4. 连接与队列上限
     add_conf "net.core.somaxconn" "$SOMAXCONN" "最大监听队列"
@@ -148,20 +199,20 @@ EOF
     # 5. TIME_WAIT 与 端口复用
     add_conf "net.ipv4.tcp_tw_reuse" "1" "开启 TIME_WAIT 复用"
     add_conf "net.ipv4.tcp_timestamps" "1" "开启时间戳"
-    add_conf "net.ipv4.tcp_fin_timeout" "20" "缩短 FIN_WAIT 时间"
-    add_conf "net.ipv4.ip_local_port_range" "1024 65535" "扩大本地端口范围"
+    add_conf "net.ipv4.tcp_fin_timeout" "30" "缩短 FIN_WAIT 时间"
+    add_conf "net.ipv4.ip_local_port_range" "10000 65535" "扩大本地端口范围"
     add_conf "net.ipv4.tcp_max_tw_buckets" "500000" "允许更多 TIME_WAIT socket"
 
     # 6. TCP Keepalive
-    add_conf "net.ipv4.tcp_keepalive_time" "300" "TCP 保活时间"
+    add_conf "net.ipv4.tcp_keepalive_time" "600" "TCP 保活时间"
     add_conf "net.ipv4.tcp_keepalive_intvl" "15" "探测间隔"
     add_conf "net.ipv4.tcp_keepalive_probes" "3" "探测次数"
 
     # 7. 连接跟踪 (Conntrack)
     if lsmod | grep -q "nf_conntrack"; then
         add_conf "net.netfilter.nf_conntrack_max" "$CONNTRACK_MAX" "最大连接跟踪数"
-        add_conf "net.netfilter.nf_conntrack_tcp_timeout_established" "3600" "连接跟踪超时"
-        add_conf "net.netfilter.nf_conntrack_tcp_timeout_time_wait" "60" "减少 TIME_WAIT 跟踪时间"
+        add_conf "net.netfilter.nf_conntrack_tcp_timeout_established" "7200" "连接跟踪超时"
+        add_conf "net.netfilter.nf_conntrack_tcp_timeout_time_wait" "120" "减少 TIME_WAIT 跟踪时间"
     fi
 
     # 8. 其他安全与链路调优
@@ -177,7 +228,12 @@ EOF
         sysctl -p "$CONF_FILE" >/dev/null 2>&1 || true
     fi
 
-    echo -e "${GREEN}✅ 高级网络优化配置应用成功！(默认 FQ 队列算法与 TCP Fast Open 已生效)${NC}"
+    echo -e "${GREEN}✅ 高级网络优化配置应用成功！${NC}\n"
+    
+    # 挂起等待回车
+    echo -ne "${GREEN}"
+    read -r -p "按回车键返回主菜单..." dummy
+    echo -ne "${NC}"
 }
 
 # --- 功能 2：卸载优化恢复默认 ---
@@ -188,26 +244,32 @@ uninstall_optimizations() {
         echo -e "${GREEN}✅ 已删除优化配置文件: ${CONF_FILE}${NC}"
         echo -e "${CYAN}>>> 重新校准并加载系统默认网络参数...${NC}"
         sysctl --system >/dev/null 2>&1 || true
-        echo -e "${GREEN}✅ 卸载完成，系统控制流已恢复至全局默认状态。${NC}"
+        echo -e "${GREEN}✅ 卸载完成，系统控制流已恢复至全局默认状态。${NC}\n"
     else
-        echo -e "${YELLOW}💡 提示: 未检测到由本脚本生成的配置文件，无需卸载。${NC}"
+        echo -e "${YELLOW}💡 提示: 未检测到由本脚本生成的配置文件，无需卸载。${NC}\n"
     fi
+    
+    # 挂起等待回车
+    echo -ne "${GREEN}"
+    read -r -p "按回车键返回主菜单..." dummy
+    echo -ne "${NC}"
 }
 
 # --- 交互菜单 ---
 menu() {
     while true; do
+        clear
         get_status_text
         
         echo -e "${GREEN}======================================================${NC}"
         echo -e "${GREEN}     BBR+TCP智能调参     ${NC}"
         echo -e "${GREEN}======================================================${NC}"
         echo -e "${GREEN}  🚀 BBR状态看板 : ${BBR_STATUS}"
-        echo -e "${GREEN}  📂     配置状态 : ${CONF_STATUS}"
+        echo -e "${GREEN}  📂    配置状态 : ${CONF_STATUS}"
         echo -e "${GREEN}------------------------------------------------------${NC}"
-        echo -e "${GREEN}  1. 一键网络优化${NC}"
-        echo -e "${GREEN}  2. 还原卸载优化${NC}"
-        echo -e "${GREEN}  3. 退出${NC}"
+        echo -e "${GREEN}  1. 网络优化${NC}"
+        echo -e "${GREEN}  2. 卸载优化${NC}"
+        echo -e "${GREEN}  0. 退出${NC}"
         echo -e "${GREEN}======================================================${NC}"
         
         echo -ne "${GREEN}请输入选项: ${NC}"
@@ -220,12 +282,12 @@ menu() {
             2)
                 uninstall_optimizations
                 ;;
-            3)
-                echo -e "${GREEN}感谢使用，再见！${NC}"
+            0)
                 exit 0
                 ;;
             *)
-                echo -e "${RED}❌ 输入错误，请输入数字 1-3。${NC}"
+                echo -e "${RED}❌ 输入错误，3秒后自动返回重试...${NC}"
+                sleep 3
                 ;;
         esac
     done
@@ -234,6 +296,7 @@ menu() {
 # --- 主入口 ---
 main() {
     check_root
+    check_bbr_support
     menu
 }
 

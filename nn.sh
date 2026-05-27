@@ -3,10 +3,10 @@
 # ==============================================================================
 # Linux TCP/IP & BBR & TFO 智能优化脚本
 #
-# 版本: 3.1.5 
+# 版本: 3.1.6 
 # ==============================================================================
 
-SCRIPT_VERSION="3.1.5"
+SCRIPT_VERSION="3.1.6"
 
 set -euo pipefail
 
@@ -86,7 +86,6 @@ get_system_info() {
         SOMAXCONN="2048"       
         FILE_MAX="65535"
         CONNTRACK_MAX="32768"
-        # 【特调】专为微型 VPS 缩减的 UDP 内存页大小，规避 Hysteria2 高并发 OOM 风险
         UDP_MEM_CONF="1152 1536 2304"
     elif [ "$TOTAL_MEM" -le 1024 ]; then
         VM_TIER="基础级(1GB)"
@@ -144,7 +143,7 @@ get_status_text() {
     if [ "$cc" == "bbr" ]; then
         BBR_STATUS="${YELLOW}已启用 (${qdisc})${NC}"
     else
-        BBR_STATUS="${RED}未启用 (${cc})${NC}"
+        BBR_STATUS="${RED}微调未启用 (${cc})${NC}"
     fi
 
     if [ -f "$CONF_FILE" ]; then
@@ -172,7 +171,7 @@ apply_optimizations() {
 # ==========================================================
 EOF
 
-    # 1. BBR 与 队列算法 (硬编码默认固定 fq)
+    # 1. BBR 与 队列算法 (默认固定 fq)
     add_conf "net.core.default_qdisc" "fq" "FQ 队列算法"
     add_conf "net.ipv4.tcp_congestion_control" "bbr" "开启 BBR 拥塞控制"
     add_conf "net.ipv4.tcp_slow_start_after_idle" "0" "关闭空闲慢启动"
@@ -229,7 +228,12 @@ EOF
         sysctl -p "$CONF_FILE" >/dev/null 2>&1 || true
     fi
 
-    echo -e "${GREEN}✅ 高级网络优化配置应用成功！${NC}"
+    echo -e "${GREEN}✅ 高级网络优化配置应用成功！${NC}\n"
+    
+    # 挂起等待回车
+    echo -ne "${GREEN}"
+    read -r -p "按回车键返回主菜单..." dummy
+    echo -ne "${NC}"
 }
 
 # --- 功能 2：卸载优化恢复默认 ---
@@ -240,27 +244,33 @@ uninstall_optimizations() {
         echo -e "${GREEN}✅ 已删除优化配置文件: ${CONF_FILE}${NC}"
         echo -e "${CYAN}>>> 重新校准并加载系统默认网络参数...${NC}"
         sysctl --system >/dev/null 2>&1 || true
-        echo -e "${GREEN}✅ 卸载完成，系统控制流已恢复至全局默认状态。${NC}"
+        echo -e "${GREEN}✅ 卸载完成，系统控制流已恢复至全局默认状态。${NC}\n"
     else
-        echo -e "${YELLOW}💡 提示: 未检测到由本脚本生成的配置文件，无需卸载。${NC}"
+        echo -e "${YELLOW}💡 提示: 未检测到生成的配置文件，无需卸载。${NC}\n"
     fi
+    
+    # 挂起等待回车
+    echo -ne "${GREEN}"
+    read -r -p "按回车键返回主菜单..." dummy
+    echo -ne "${NC}"
 }
 
 # --- 交互菜单 ---
 menu() {
     while true; do
+        clear
         get_status_text
         
-        echo -e "${GREEN}======================================================${NC}"
-        echo -e "${GREEN}     BBR+TCP智能调参     ${NC}"
-        echo -e "${GREEN}======================================================${NC}"
+        echo -e "${GREEN}==================================${NC}"
+        echo -e "${GREEN}     BBR+TCP智能调参              ${NC}"
+        echo -e "${GREEN}==================================${NC}"
         echo -e "${GREEN}  🚀 BBR状态看板 : ${BBR_STATUS}"
         echo -e "${GREEN}  📂    配置状态 : ${CONF_STATUS}"
-        echo -e "${GREEN}------------------------------------------------------${NC}"
+        echo -e "${GREEN}==================================${NC}"
         echo -e "${GREEN}  1. 网络优化${NC}"
         echo -e "${GREEN}  2. 卸载优化${NC}"
         echo -e "${GREEN}  0. 退出${NC}"
-        echo -e "${GREEN}======================================================${NC}"
+        echo -e "${GREEN}==================================${NC}"
         
         echo -ne "${GREEN}请输入选项: ${NC}"
         read -r choice
@@ -276,7 +286,8 @@ menu() {
                 exit 0
                 ;;
             *)
-                echo -e "${RED}❌ 输入错误，请重新输入。${NC}"
+                echo -e "${RED}❌ 输入错误，3秒后自动返回重试...${NC}"
+                sleep 3
                 ;;
         esac
     done
@@ -285,7 +296,7 @@ menu() {
 # --- 主入口 ---
 main() {
     check_root
-    check_bbr_support  # 运行前对虚拟化(LXC/OpenVZ)与内核读写权限进行硬卡关
+    check_bbr_support
     menu
 }
 

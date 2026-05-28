@@ -60,7 +60,7 @@ check_vps_port() {
     local port=$1
     while [[ -n $(lsof -i :$port 2>/dev/null) ]]; do
         red_echo "${port} 端口已经被其他程序占用，请更换端口重试。"
-        read -p "请输入新端口（直接回车使用随机端口）: " port
+        read -p "请输入新端口（回车使用随机端口）: " port
         [[ -z $port ]] && port=$(random_port) && green_echo "使用随机端口: $port"
     done
     echo "$port"
@@ -115,12 +115,10 @@ set_cron() {
 }
 
 remove_cron() {
-    if check_cron_status; then
-        # 移除包含 restart.sh 的整行本地定时任务
-        crontab -l 2>/dev/null | grep -v "restart.sh" | crontab -
-    fi
+    # 【核心修改】去掉 if check 判断，直接强制过滤！
+    # 这样不管你的路径是 /root/mtp 还是 ~/mtp，只要有 restart.sh 统统杀掉
+    crontab -l 2>/dev/null | grep -v "restart.sh" | crontab -
 }
-
 # ================== 核心控制服务 ==================
 start_proxy() {
     if pgrep -x mtg >/dev/null; then
@@ -160,7 +158,6 @@ show_config() {
     else
         purple_echo "\n==== 当前 MTProto 连接配置 ===="
         cat "$WORKDIR/link.txt"
-        echo "================================"
     fi
 }
 
@@ -222,7 +219,7 @@ core_install() {
         green_echo "$LINKS\n"
         echo -e "$LINKS" > "${WORKDIR}/link.txt"
         
-        read -p "是否同时将代理加入开机自启（Crontab）？[Y/n]: " choice_cron
+        read -p "是否同时将MTProto加入开机自启（Crontab）？[回车默认加入,Y/n]: " choice_cron
         case "$choice_cron" in
             [nN][oO]|[nN]) remove_cron ;;
             *) set_cron ;;
@@ -242,29 +239,30 @@ while true; do
     
     # 获取自启状态
     if check_cron_status; then
-        cron_display="${GREEN}开机自启[已开启]${RESET}"
+        cron_display="${GREEN}已开启${RESET}"
     else
-        cron_display="${RED}开机自启[已关闭]${RESET}"
+        cron_display="${RED}已关闭${RESET}"
     fi
 
     port_display=$(get_running_port)
 
     # 打印精美面板样式
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        MTProto Proxy 管理面板      ${RESET}"
+    echo -e "${GREEN}     MTProto Proxy 管理面板      ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} ${status_display}  (${cron_display})"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_display}${RESET}"
+    echo -e "${GREEN}状态     :${RESET} ${status_display}"
+    echo -e "${GREEN}端口     :${RESET} ${YELLOW}${port_display}${RESET}"
+    echo -e "${GREEN}开机自启 :${RESET} ${cron_display}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1.${RESET} 安装 MTProto Proxy"
-    echo -e "${GREEN}2.${RESET} 修改配置"
-    echo -e "${GREEN}3.${RESET} 卸载 MTProto Proxy"
-    echo -e "${GREEN}4.${RESET} 启动 MTProto Proxy"
-    echo -e "${GREEN}5.${RESET} 停止 MTProto Proxy"
-    echo -e "${GREEN}6.${RESET} 重启 MTProto Proxy"
-    echo -e "${GREEN}7.${RESET} 查看日志"
-    echo -e "${GREEN}8.${RESET} 查看连接配置"
-    echo -e "${GREEN}0.${RESET} 退出"
+    echo -e "${GREEN}1. 安装 MTProto${RESET}"
+    echo -e "${GREEN}2. 修改配置${RESET}"
+    echo -e "${GREEN}3. 卸载 MTProto${RESET}"
+    echo -e "${GREEN}4. 启动 MTProto${RESET}"
+    echo -e "${GREEN}5. 停止 MTProto${RESET}"
+    echo -e "${GREEN}6. 重启 MTProto${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看连接配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     read -p "$(echo -e ${GREEN}请选择:${RESET} )" choice
 
@@ -286,7 +284,6 @@ while true; do
             if [ -f "$LOG_FILE" ]; then
                 purple_echo "=== 正在查看最新 50 行运行日志 ==="
                 tail -n 50 "$LOG_FILE"
-                echo "=================================="
             else
                 yellow_echo "暂无日志文件。"
             fi

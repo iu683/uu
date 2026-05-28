@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Telegram MTProto Proxy 高级管理面板 (防封阻断修正版)
+# Telegram mtg (Go版 FakeTLS) 高级管理面板
 # SPDX-License-Identifier: MIT
 #
 # =========================================================
@@ -10,11 +10,14 @@ set -Eop pipefail
 export LANG=en_US.UTF-8
 
 # 基础目录与硬编码配置
-WORKDIR="${HOME:-/root}/mtprotoproxy"
+WORKDIR="${HOME:-/root}/mtg_proxy"
 readonly META_FILE="${WORKDIR}/meta.env"
-readonly CONFIG_FILE="${WORKDIR}/config_local.py"
-readonly SERVICE_FILE="/etc/systemd/system/mtproto.service"
-readonly REPO_URL="https://github.com/alexbers/mtprotoproxy.git"
+readonly SERVICE_FILE="/etc/systemd/system/mtg.service"
+readonly BIN_PATH="/usr/local/bin/mtg"
+readonly DOWNLOAD_URL="https://raw.githubusercontent.com/whunt1/onekeymakemtg/master/builds/mtg-linux-amd64"
+
+# 默认伪装域名
+DEFAULT_DOMAIN="itunes.apple.com"
 
 # 终端颜色代码
 GREEN="\033[32m"
@@ -49,14 +52,6 @@ random_port() {
   shuf -i 20000-60000 -n 1
 }
 
-random_user() {
-  echo "tg_$(tr -dc 'a-z0-9' </dev/urandom | head -c 6)"
-}
-
-random_secret() {
-  openssl rand -hex 16 2>/dev/null || tr -dc 'a-f0-9' </dev/urandom | head -c 32
-}
-
 get_best_ip() {
   local ip
   for svc in "https://icanhazip.com" "https://ifconfig.me" "https://ipinfo.io/ip" "https://4.ipw.cn"; do
@@ -71,59 +66,42 @@ get_best_ip() {
 }
 
 # =========================================================
-# 3. 依赖自动安装与进程洗牌环境
+# 3. 依赖包自动安装与组件同步
 # =========================================================
 install_dependencies() {
-  info "正在检查并安装编译与运行所需的系统依赖..."
+  info "正在安装必要的系统依赖组件 (psmisc, curl, wget)..."
   if has_command apt-get; then
-    apt-get update -y
-    apt-get install -y git python3 python3-pip curl build-essential libssl-dev zlib1g-dev
-  elif has_command dnf; then
-    dnf install -y git python3 python3-pip curl openssl-devel zlib-devel
+    apt-get update -y && apt-get install -y psmisc curl wget
   elif has_command yum; then
-    yum install -y git python3 python3-pip curl openssl-devel zlib-devel
+    yum install -y psmisc curl wget
   else
-    warn "未找到主流包管理器，请确保 git, python3, openssl 依赖已手动装妥。"
+    warn "未能通过主流包管理器同步依赖，请确保系统已安装 wget 和 psmisc。"
   fi
 
-  info "正在安装 Python 高性能加密与异步网络库加速依赖..."
-  # 兼容较新系统禁用了全局 pip 的限制 (--break-system-packages)
-  pip3 install cryptography uvloop --break-system-packages >/dev/null 2>&1 || \
-  pip install cryptography uvloop >/dev/null 2>&1 || \
-  warn "Python 加密依赖未能全自动同步，若连接缓慢，请手动执行: pip3 install cryptography"
+  if [ ! -f "${BIN_PATH}" ]; then
+    info "正在从源码仓库同步编译好的 mtg-linux-amd64 核心二进制..."
+    wget -O "${BIN_PATH}" --no-check-certificate "${DOWNLOAD_URL}"
+    chmod +x "${BIN_PATH}"
+    info "mtg 核心主程序部署成功！位置: ${BIN_PATH}"
+  fi
 }
 
 # =========================================================
-# 4. 核心配置文件与守护进程服务生成
+# 4. 守护进程服务生成与元数据持久化
 # =========================================================
-generate_mtproto_config() {
-  # 构建合法的 Python 字典配置格式
-  # 锁死国内畅通无阻的合规微软 TLS 域名，彻底拒绝代理程序回滚降级到被强力阻断的 google.com
-  cat << EOF > "${CONFIG_FILE}"
-# -*- coding: utf-8 -*-
-PORT = ${PORT}
-
-USERS = {
-    "${USERNAME}": "${SECRET}"
-}
-
-TLS_DOMAIN = "azure.microsoft.com"
-EOF
-  chmod 600 "${CONFIG_FILE}"
-}
-
 create_service() {
+  # 统一采用标准的 systemd 替代容易丢进程的 nohup 挂载方式
   cat << EOF > "${SERVICE_FILE}"
 [Unit]
-Description=MTProto Proxy Service
+Description=mtg Go-Version Telegram MTProto Proxy
 After=network.target network-online.target
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=${WORKDIR}
-ExecStart=/usr/bin/python3 ${WORKDIR}/mtprotoproxy.py
-Restart=on-failure
+ExecStart=${BIN_PATH} run -b 0.0.0.0:${PORT} --cloak-port=${PORT} ${SECRET}
+Restart=always
 RestartSec=5
 
 [Install]
@@ -132,15 +110,15 @@ EOF
 
   if has_command systemctl; then
     systemctl daemon-reload
-    systemctl enable mtproto >/dev/null 2>&1 || true
+    systemctl enable mtg >/dev/null 2>&1 || true
   fi
 }
 
 save_meta() {
   cat << EOF > "${META_FILE}"
 PORT='${PORT}'
-USERNAME='${USERNAME}'
 SECRET='${SECRET}'
+DOMAIN='${DOMAIN}'
 EOF
   chmod 600 "${META_FILE}"
 }
@@ -151,94 +129,85 @@ load_meta() {
     source "${META_FILE}"
   else
     PORT=""
-    USERNAME=""
     SECRET=""
+    DOMAIN=""
   fi
 }
 
 # =========================================================
-# 5. 主流程控制模块（安装、修改、卸载、连接查看）
+# 5. 主流程控制模块（安装、修改、卸载、状态管理）
 # =========================================================
 kill_residual_processes() {
-  # 核心修复：清理老旧手动运行产生的孤儿死锁进程，防止端口无法绑定
   if has_command systemctl; then
-    systemctl stop mtproto >/dev/null 2>&1 || true
+    systemctl stop mtg >/dev/null 2>&1 || true
   fi
-  pkill -f "mtprotoproxy.py" || true
+  killall mtg >/dev/null 2>&1 || true
 }
 
 write_and_start_service() {
+  ensure_workdir
   kill_residual_processes
   save_meta
-  generate_mtproto_config
   create_service
 
   if has_command systemctl; then
-    systemctl restart mtproto >/dev/null 2>&1 || true
+    systemctl restart mtg >/dev/null 2>&1 || true
     sleep 1.5
-    if systemctl is-active --quiet mtproto 2>/dev/null; then
-      info "MTProto 服务核心参数应用成功，守护进程已被优雅唤醒！"
+    if systemctl is-active --quiet mtg 2>/dev/null; then
+      info "mtg (FakeTLS) 服务核心参数应用成功，服务已成功拉起！"
     else
-      error "MTProto 服务启动异常，请前往选项 7 查看错误堆栈。"
+      error "mtg 服务未能启动，可能是端口被占用，请前往选项 7 查看系统日志。"
     fi
   else
-    python3 "${WORKDIR}/mtprotoproxy.py" >/dev/null 2>&1 &
-    info "非 systemd 托管模式，进程已强制挂载到后台进程池中。"
+    nohup ${BIN_PATH} run -b 0.0.0.0:${PORT} --cloak-port=${PORT} ${SECRET} >> "${WORKDIR}/mtg.log" 2>&1 &
+    info "非 systemd 环境，已通过 nohup 挂载至后台运行。"
   fi
   showconf
 }
 
-inst_mtproto() {
-  if [ -d "${WORKDIR}" ] && [ -f "${WORKDIR}/mtprotoproxy.py" ]; then
-    warn "检测到当前目录已存在项目源码，将跳过拉取，直接进入重新配置流。"
-  else
-    install_dependencies
-    info "正在拉取 MTProto 官方源码镜像库..."
-    mkdir -p "$(dirname "${WORKDIR}")"
-    git clone "${REPO_URL}" "${WORKDIR}"
-  fi
+ensure_workdir() {
+  mkdir -p "${WORKDIR}"
+  chmod 700 "${WORKDIR}"
+}
 
-  cd "${WORKDIR}" || exit 1
+inst_mtg() {
+  install_dependencies
+  ensure_workdir
 
-  if [ -f "config.py" ] && [ ! -f "config.py.bak" ]; then
-    cp config.py config.py.bak
-  fi
-
-  local rand_user rand_secret rand_port
-  rand_user="$(random_user)"
-  rand_secret="$(random_secret)"
-  rand_port=443
+  local rand_port rand_domain
+  rand_port=443 # 强烈推荐 443
+  rand_domain="${DEFAULT_DOMAIN}"
 
   echo "---------------------------------------------"
-  read -rp "👉 请输入监听端口 (默认推荐: ${rand_port}): " input_port
+  read -rp "👉 请输入代理监听端口 (默认推荐: ${rand_port}): " input_port
   PORT=${input_port:-$rand_port}
   if ! [[ "${PORT}" =~ ^[0-9]+$ ]] || [ "${PORT}" -lt 1 ] || [ "${PORT}" -gt 65535 ]; then
-    warn "端口输入无效，已自动回退为默认端口: ${rand_port}"
+    warn "端口输入无效，已自动回归默认端口: ${rand_port}"
     PORT="${rand_port}"
   fi
 
-  read -rp "👉 请设置用户名 (默认随机: ${rand_user}): " input_user
-  USERNAME=${input_user:-$rand_user}
+  read -rp "👉 请设置 FakeTLS 伪装域名 (默认: ${rand_domain}): " input_domain
+  DOMAIN=${input_domain:-$rand_domain}
 
-  read -rp "👉 请设置32位16进制密钥 (默认随机: ${rand_secret}): " input_secret
-  SECRET=${input_secret:-$rand_secret}
+  info "正在通过 mtg 生成基于 [${DOMAIN}] 的防封锁 FakeTLS 高级密钥..."
+  SECRET=$(${BIN_PATH} generate-secret -c "${DOMAIN}" tls)
 
   write_and_start_service
 }
 
 changeconf() {
   load_meta
-  if [ ! -d "${WORKDIR}" ] || [ ! -f "${CONFIG_FILE}" ]; then
-    error "未找到现有安装根源，请先执行选项 1 进行全自动构建。"
+  if [ ! -f "${BIN_PATH}" ]; then
+    error "系统未找到 mtg 主程序，请先执行选项 1 进行全新部署。"
     return 1
   fi
 
   clear
-  echo -e "${GREEN}====== 修改 MTProto 核心配置 ======${RESET}"
+  echo -e "${GREEN}====== 修改 mtg (FakeTLS) 核心配置 ======${RESET}"
   echo "提示：直接敲回车将保持原有配置不变"
   echo "---------------------------------------------"
 
-  local input_port input_user input_secret
+  local input_port input_domain
   
   read -rp "👉 请输入新的监听端口 [当前: ${PORT:-443}]: " input_port
   if [ -n "$input_port" ]; then
@@ -249,50 +218,52 @@ changeconf() {
     fi
   fi
 
-  read -rp "👉 请设置新的用户名 [当前: ${USERNAME:-unset}]: " input_user
-  USERNAME=${input_user:-$USERNAME}
-
-  read -rp "👉 请设置新的32位密钥 [当前: ${SECRET:-unset}]: " input_secret
-  SECRET=${input_secret:-$SECRET}
+  read -rp "👉 请设置新的伪装域名 [当前: ${DOMAIN:-itunes.apple.com}]: " input_domain
+  if [ -n "$input_domain" ]; then
+    DOMAIN="${input_domain}"
+    info "域名已变更，正在为您重新构建专用 FakeTLS 密钥对..."
+    SECRET=$(${BIN_PATH} generate-secret -c "${DOMAIN}" tls)
+  fi
 
   write_and_start_service
 }
 
-uninstall_mtproto() {
-  warn "即将从当前系统中彻底全盘卸载并清理 MTProto 代理环境..."
+uninstall_mtg() {
+  warn "即将从当前系统中彻底卸载并清理 mtg (Go版) 代理服务..."
   kill_residual_processes
 
   if has_command systemctl; then
-    systemctl disable mtproto >/dev/null 2>&1 || true
+    systemctl disable mtg >/dev/null 2>&1 || true
     if [ -f "${SERVICE_FILE}" ]; then rm -f "${SERVICE_FILE}"; fi
     systemctl daemon-reload
   fi
 
+  rm -f "${BIN_PATH}"
   rm -rf "${WORKDIR}"
-  info "卸载流已执行完毕，全套底层依赖已被无痕抹除！"
+  info "卸载流执行完毕，全套核心二进制与元数据已被无痕抹除！"
 }
 
 showconf() {
   load_meta
   if [ -z "${PORT}" ]; then
-    error "未找到合法的元配置持久化文件，请确认服务初始化正常。"
+    error "未找到持久化配置元文件，请确认代理已成功安装。"
     return 1
   fi
 
   local ip tg_link tg_quick_link
   ip="$(get_best_ip)"
 
-  # 拼装标准 Telegram 内置一键快链
+  # mtg 生成的密钥对已经自带防封的 FakeTLS 前缀，可直接无缝拼装直连链接
   tg_link="tg://proxy?server=${ip}&port=${PORT}&secret=${SECRET}"
   tg_quick_link="https://t.me/proxy?server=${ip}&port=${PORT}&secret=${SECRET}"
 
-  echo -e "${GREEN}====== MTProto 节点分享链接 ====== ${RESET}"
+  echo -e "${GREEN}====== mtg (FakeTLS) 节点分享链接 ======${RESET}"
   echo -e "${YELLOW}● 服务器IP :${RESET} ${ip}"
-  echo -e "${YELLOW}● 端口     :${RESET} ${PORT}"
-  echo -e "${YELLOW}● 用户名   :${RESET} ${USERNAME}"
-  echo -e "${YELLOW}● 密钥     :${RESET} ${SECRET}"
+  echo -e "${YELLOW}● 监听端口 :${RESET} ${PORT}"
+  echo -e "${YELLOW}● 伪装域名 :${RESET} ${DOMAIN}"
+  echo -e "${YELLOW}● 伪装密钥 :${RESET} ${SECRET}"
   echo "---------------------------------------------"
-  echo -e "${GREEN}Telegram 专属一键直连快链 (发给TG好友直接点):${RESET}"
+  echo -e "${GREEN}Telegram 专属防封锁直连快链 (发给TG好友直接点):${RESET}"
   echo -e "${CYAN}${tg_link}${RESET}"
   echo
   echo -e "${GREEN}外部浏览器跳转快链:${RESET}"
@@ -311,10 +282,10 @@ menu() {
     load_meta
     
     local status_display
-    if has_command systemctl && systemctl is-active --quiet mtproto 2>/dev/null; then
-      status_display="${GREEN}● 运行中${RESET}"
+    if has_command systemctl && systemctl is-active --quiet mtg 2>/dev/null; then
+      status_display="${GREEN}● 运行中 (Systemd)${RESET}"
     else
-      if pkill -0 -f "mtprotoproxy.py" >/dev/null 2>&1; then
+      if pkill -0 -f "mtg run" >/dev/null 2>&1; then
         status_display="${GREEN}● 运行中 (Pidmode)${RESET}"
       else
         status_display="${RED}● 未运行${RESET}"
@@ -322,16 +293,16 @@ menu() {
     fi
 
     local port_display="${PORT:- -}"
-    local user_display="${USERNAME:- -}"
+    local domain_display="${DOMAIN:- -}"
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        MTProto Proxy 管理面板      ${RESET}"
+    echo -e "${GREEN}        mtg (FakeTLS) 管理面板       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} ${status_display}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_display}${RESET}"
-    echo -e "${GREEN}用户   :${RESET} ${CYAN}${user_display}${RESET}"
+    echo -e "${GREEN}伪装   :${RESET} ${CYAN}${domain_display}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 MTProto Proxy${RESET}"
+    echo -e "${GREEN}1. 安装 mtg (FakeTLS)${RESET}"
     echo -e "${GREEN}2. 修改配置参数${RESET}"
     echo -e "${GREEN}3. 彻底卸载服务${RESET}"
     echo -e "${GREEN}4. 启动代理服务${RESET}"
@@ -347,38 +318,41 @@ menu() {
     [[ -z "$choice" ]] && continue
 
     case "$choice" in
-      1) inst_mtproto; pause ;;
+      1) inst_mtg; pause ;;
       2) changeconf; pause ;;
-      3) uninstall_mtproto; pause ;;
+      3) uninstall_mtg; pause ;;
       4)
         if has_command systemctl; then
-          systemctl start mtproto && info "服务已唤醒启动！"
+          systemctl start mtg && info "服务已唤醒启动！"
         else
-          pkill -f "mtprotoproxy.py" || true
-          python3 "${WORKDIR}/mtprotoproxy.py" >/dev/null 2>&1 &
-          info "进程已脱管挂载至后台！"
+          nohup ${BIN_PATH} run -b 0.0.0.0:${PORT} --cloak-port=${PORT} ${SECRET} >> "${WORKDIR}/mtg.log" 2>&1 &
+          info "进程已重新挂载至后台！"
         fi
         pause ;;
       5)
         kill_residual_processes
-        info "后台所有代理进程已全部挂断阻断！"
+        info "所有 mtg 代理进程均已强制挂断终止！"
         pause ;;
       6)
         write_and_start_service
         pause ;;
       7)
         if has_command systemctl; then
-          echo -e "${YELLOW}提示: 出现日志流后，按下 Ctrl + C 即可退出日志追踪查看状态。${RESET}"
+          echo -e "${YELLOW}提示: 出现日志流后，按下 Ctrl + C 即可退出日志追踪状态。${RESET}"
           sleep 1
-          journalctl -u mtproto.service -n 50 -f
+          journalctl -u mtg.service -n 50 -f
         else
-          warn "非标准 systemd 架构环境，无法调用统一日志管理工具。"
-          pause
+          if [ -f "${WORKDIR}/mtg.log" ]; then
+            tail -n 50 -f "${WORKDIR}/mtg.log"
+          else
+            warn "未找到系统托管日志文件。"
+            pause
+          fi
         fi
         ;;
       8) showconf; pause ;;
       0) exit 0 ;;
-      *) error "输入了非标准行内指令，请重新进行确认。"; sleep 1 ;;
+      *) error "输入了无效的行内指令，请重新进行确认。"; sleep 1 ;;
     esac
   done
 }

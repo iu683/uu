@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Sing-box (NaiveProxy) 管理面板 
+# Sing-box (AnyTLS + Reality) 核心控制面板
 # SPDX-License-Identifier: MIT
 #
 # =========================================================
@@ -13,6 +13,7 @@ export LANG=en_US.UTF-8
 readonly SB_CONFIG="/etc/sing-box/config.json"
 readonly SB_BINARY="/usr/local/bin/sing-box"
 readonly SB_DIR="/root/sb_node"
+readonly STATE_FILE="/etc/anyreality-singbox.env"
 EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
 SYSTEMD_SERVICES_DIR="/etc/systemd/system"
 CONFIG_DIR="/etc/sing-box"
@@ -20,12 +21,12 @@ REPO_URL="https://github.com/SagerNet/sing-box"
 API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
 CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
 
-# 自动检测环境变量
+# 自动检测环境与动态变量池
 PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
 OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
 ARCHITECTURE="${ARCHITECTURE:-}"
 
-# 终端颜色代码
+# 终端规范颜色代码
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
@@ -129,6 +130,7 @@ check_environment() {
   has_command grep || install_software grep
   has_command jq || install_software jq
   has_command tar || install_software tar
+  has_command python3 || install_software python3
 }
 
 get_installed_version() {
@@ -168,12 +170,21 @@ download_singbox() {
   
   local _download_url="$REPO_URL/releases/download/$_version/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE.tar.gz"
   
-  info "正在下载官方 Sing-box 核心组件: $_download_url ..."
+  info "正在自 GitHub 下载官方 Sing-box 核心组件: $_download_url ..."
   if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
-    error "核心下载失败！请检查您的网络连接。"
+    error "从 GitHub 下载核心失败！请检查您的网络连接。"
     return 11
   fi
   return 0
+}
+
+get_public_ip() {
+  local ip=''
+  for url in https://api.ipify.org https://ip.sb https://checkip.amazonaws.com; do
+    ip=$(curl -4s --max-time 5 "$url" 2>/dev/null || true)
+    [[ -n "$ip" ]] && { echo "$ip"; return; }
+  done
+  hostname -I | awk '{print $1}'
 }
 
 tpl_singbox_server_service_base() {
@@ -198,7 +209,7 @@ EOF
 }
 
 # =========================================================
-# 3. 面板辅助网络与配置扩展函数
+# 3. 面板辅助网络与状态扩展函数
 # =========================================================
 get_sb_status() {
   if has_command systemctl && systemctl is-active --quiet sing-box 2>/dev/null; then
@@ -212,19 +223,22 @@ get_sb_status() {
   fi
 }
 
-get_current_domain_display() {
+get_current_port_display() {
   if [[ -f "$SB_CONFIG" ]]; then
-    local domain
-    domain=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || echo "")
-    echo "${domain:- -}"
+    local port
+    port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "")
+    echo "${port:- -}"
   else echo "-"; fi
 }
 
-# 随机字符串生成函数
-generate_random_string() {
-  local length=$1
-  # 使用 tr 过滤出纯字母与数字，防止特殊符号断开 JSON
-  LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c "$length" || true
+generate_or_use_key() {
+  if [[ -n "${PRIVATE_KEY:-}" && -n "${PUBLIC_KEY:-}" ]]; then
+    return
+  fi
+  local key_out
+  key_out=$("$EXECUTABLE_INSTALL_PATH" generate reality-keypair 2>/dev/null || echo "")
+  PRIVATE_KEY=$(awk '/PrivateKey/ {print $2}' <<< "$key_out")
+  PUBLIC_KEY=$(awk '/PublicKey/ {print $2}' <<< "$key_out")
 }
 
 # =========================================================
@@ -235,27 +249,39 @@ write_and_show_config() {
 
   cat << EOF > "$SB_CONFIG"
 {
-  "log": {
-    "level": "info"
-  },
   "inbounds": [
     {
-      "type": "naive",
-      "tag": "naive-in",
+      "type": "anytls",
       "listen": "::",
-      "listen_port": 443,
+      "listen_port": ${PORT},
       "users": [
         {
-          "username": "${sb_username}",
-          "password": "${sb_password}"
+          "name": "${USERNAME}",
+          "password": "${PASSWORD}"
         }
+      ],
+      "padding_scheme": [
+        "stop=8",
+        "0=30-30",
+        "1=100-400",
+        "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
+        "3=9-9,500-1000",
+        "4=500-1000",
+        "5=500-1000",
+        "6=500-1000",
+        "7=500-1000"
       ],
       "tls": {
         "enabled": true,
-        "server_name": "${sb_domain}",
-        "acme": {
-          "domain": ["${sb_domain}"],
-          "email": "${sb_email}"
+        "server_name": "${SERVER_NAME}",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "${SERVER_NAME}",
+            "server_port": 443
+          },
+          "private_key": "${PRIVATE_KEY}",
+          "short_id": "${SHORT_ID}"
         }
       }
     }
@@ -269,31 +295,26 @@ write_and_show_config() {
 }
 EOF
 
-  mkdir -p "$SB_DIR"
-  
-  local encoded_node_name=$(curl -s -o /dev/null -w %{url_effective} --url-query "x=${sb_node_name}" "" | sed 's/^.*x=//')
-  local share_link="naive://${sb_username}:${sb_password}@${sb_domain}:443#${sb_node_name}"
-
-  cat << EOF > "$SB_DIR/url.txt"
-Flowz / Shadowrocket 订阅分享链接:
-${share_link}
+  SERVER_IP=$(get_public_ip)
+  cat << EOF > "$STATE_FILE"
+PORT='${PORT}'
+USERNAME='${USERNAME}'
+PASSWORD='${PASSWORD}'
+SERVER_NAME='${SERVER_NAME}'
+SHORT_ID='${SHORT_ID}'
+REMARK='${REMARK}'
+PRIVATE_KEY='${PRIVATE_KEY}'
+PUBLIC_KEY='${PUBLIC_KEY}'
+SERVER_IP='${SERVER_IP}'
 EOF
-
-  cat << EOF > "$SB_DIR/meta.env"
-sb_domain="${sb_domain}"
-sb_email="${sb_email}"
-sb_username="${sb_username}"
-sb_password="${sb_password}"
-sb_node_name="${sb_node_name}"
-EOF
+  chmod 600 "$STATE_FILE"
 
   if has_command systemctl; then
     systemctl daemon-reload
     systemctl enable sing-box >/dev/null 2>&1 || true
     systemctl restart sing-box >/dev/null 2>&1 || true
-    
     if systemctl is-active --quiet sing-box 2>/dev/null; then
-      info "Sing-box 服务配置并启动成功！"
+      info "Sing-box (AnyTLS) 服务配置并启动成功！"
     else
       error "Sing-box 服务启动失败，请运行 'journalctl -u sing-box -f' 查看错误日志。"
     fi
@@ -302,63 +323,146 @@ EOF
     "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
     info "非 systemd 环境，程序已挂载至后台 Pid 进程池中运行。"
   fi
+  
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
+  fi
+
   showconf
 }
 
 # =========================================================
 # 5. 主流程控制模块与更新功能
 # =========================================================
+
+# 流程一：纯净首次安装
 inst_singbox() {
   check_environment
   
-  info "🧹 正在释放 80 和 443 端口以防冲突..."
-  systemctl stop caddy nginx apache2 sing-box 2>/dev/null || true
-
-  info "获取官方最新发布版本中..."
-  local latest_version=$(get_latest_version)
-  
-  local _tmpfile_tar=$(mktemp)
-  if ! download_singbox "$latest_version" "$_tmpfile_tar"; then
-    rm -f "$_tmpfile_tar" && return 1
+  if [[ -f "$SB_CONFIG" ]]; then
+    warn "系统检测到已存在配置。如果是要修改配置，请在菜单中选择选项 4。"
+    read -rp "是否执意重新安装？(旧配置将被覆盖) [y/N]: " CONFIRM_REINST
+    [[ "$CONFIRM_REINST" != "y" && "$CONFIRM_REINST" != "Y" ]] && return 0
   fi
 
-  echo -ne "正在解压并安装二进制可执行文件 ... "
-  local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
-  tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
-  
-  local _ver_num="${latest_version#v}"
-  if install -Dm755 "$_tmpdir_extract/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE/sing-box" "$EXECUTABLE_INSTALL_PATH"; then
-    echo "成功"
+  info "🧹 正在清理前置依赖并准备下载..."
+  if ! command -v sing-box >/dev/null 2>&1; then
+    info "获取 GitHub 官方最新发布版本中..."
+    local latest_version=$(get_latest_version)
+    
+    local _tmpfile_tar=$(mktemp)
+    if ! download_singbox "$latest_version" "$_tmpfile_tar"; then
+      rm -f "$_tmpfile_tar" && return 1
+    fi
+
+    echo -ne "正在从解压并安装二进制可执行文件 ... "
+    local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
+    tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
+    
+    local _ver_num="${latest_version#v}"
+    if install -Dm755 "$_tmpdir_extract/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE/sing-box" "$EXECUTABLE_INSTALL_PATH"; then
+      echo "成功"
+    else
+      rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "安装失败" && return 1
+    fi
+    rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
   else
-    rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "安装失败" && return 1
+    info "系统已存在 sing-box 核心组件，跳过基础安装。"
   fi
-  rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
 
-  if has_command systemctl; then
+  if has_command systemctl && [[ ! -f "$SYSTEMD_SERVICES_DIR/sing-box.service" ]]; then
     install_content -Dm644 "$(tpl_singbox_server_service_base)" "$SYSTEMD_SERVICES_DIR/sing-box.service" "1"
   fi
 
-  # 生成随机默认参数
-  local rand_user=$(generate_random_string 8)
-  local rand_pass=$(generate_random_string 16)
-  local rand_email="$(generate_random_string 10)@gmail.com"
+  # 全新随机默认值
+  local rand_port=$(shuf -i 10000-65535 -n 1)
+  local rand_user=$(python3 -c "import secrets, string; print('user-' + ''.join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(6)))")
+  local rand_pass=$(python3 -c "import secrets, string; print(''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12)))")
+  local rand_sid=$(python3 -c "import secrets; print(secrets.token_hex(8))")
 
   echo "---------------------------------------------"
-  read -rp "👉 请输入解析好的域名 (例如: naive.example.com): " sb_domain
-  [[ -z "$sb_domain" ]] && error "域名不能为空！" && return 1
+  read -rp "👉 请输入监听端口 (默认随机: ${rand_port}): " INPUT_PORT
+  PORT=${INPUT_PORT:-$rand_port}
 
-  read -rp "👉 请输入你的邮箱 (默认随机: ${rand_email}): " sb_email
-  sb_email=${sb_email:-"$rand_email"}
+  read -rp "👉 请输入用户名 (默认随机: ${rand_user}): " INPUT_USERNAME
+  USERNAME=${INPUT_USERNAME:-$rand_user}
 
-  read -rp "👉 请设置 NaiveProxy 用户名 (默认随机: ${rand_user}): " sb_username
-  sb_username=${sb_username:-"$rand_user"}
+  read -rp "👉 请输入密码 (默认随机: ${rand_pass}): " INPUT_PASSWORD
+  PASSWORD=${INPUT_PASSWORD:-$rand_pass}
 
-  read -rp "👉 请设置 NaiveProxy 密码 (默认随机: ${rand_pass}): " sb_password
-  sb_password=${sb_password:-"$rand_pass"}
+  read -rp "👉 请输入伪装域名/SNI (默认: www.amazon.com): " INPUT_SERVER_NAME
+  SERVER_NAME=${INPUT_SERVER_NAME:-www.amazon.com}
 
-  read -rp "👉 请给这个节点起个名字 (默认: NaiveProxy): " sb_node_name
-  sb_node_name=${sb_node_name:-"NaiveProxy"}
+  read -rp "👉 请输入 Reality short_id (默认随机: ${rand_sid}): " INPUT_SHORT_ID
+  SHORT_ID=${INPUT_SHORT_ID:-$rand_sid}
 
+  read -rp "👉 请输入节点备注名称 (默认: anytls-reality-tls): " INPUT_REMARK
+  REMARK=${INPUT_REMARK:-anytls-reality-tls}
+
+  PRIVATE_KEY=""
+  PUBLIC_KEY=""
+  generate_or_use_key
+  write_and_show_config
+}
+
+# 流程二：修改已有配置（核心重构部分：回车保持不变）
+modify_config() {
+  if [[ ! -f "$SB_CONFIG" ]]; then
+    error "未找到正在运行的配置文件，请先选择选项 1 安装节点。"
+    return 1
+  fi
+
+  info "正在读取现有节点配置..."
+  # 优先从标准 JSON 配置文件使用 jq 精准提炼
+  local current_port=$(jq -r '.inbounds[0].listen_port // empty' "$SB_CONFIG" 2>/dev/null)
+  local current_user=$(jq -r '.inbounds[0].users[0].name // empty' "$SB_CONFIG" 2>/dev/null)
+  local current_pass=$(jq -r '.inbounds[0].users[0].password // empty' "$SB_CONFIG" 2>/dev/null)
+  local current_sni=$(jq -r '.inbounds[0].tls.server_name // empty' "$SB_CONFIG" 2>/dev/null)
+  local current_sid=$(jq -r '.inbounds[0].tls.reality.short_id // empty' "$SB_CONFIG" 2>/dev/null)
+  
+  # 密钥及备注辅助读取
+  local current_private_key=$(jq -r '.inbounds[0].tls.reality.private_key // empty' "$SB_CONFIG" 2>/dev/null)
+  local current_remark=""
+  local current_public_key=""
+  if [[ -f "$STATE_FILE" ]]; then
+    current_remark=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 || true)
+    current_public_key=$(grep -E "^PUBLIC_KEY=" "$STATE_FILE" | cut -d"'" -f2 || true)
+  fi
+
+  echo "---------------------------------------------"
+  echo -e "${YELLOW}提示：直接敲回车(Enter)将保持括号内的当前值不变${RESET}"
+  echo "---------------------------------------------"
+
+  read -rp "👉 修改监听端口 (当前: ${current_port}): " INPUT_PORT
+  PORT=${INPUT_PORT:-$current_port}
+
+  read -rp "👉 修改用户名 (当前: ${current_user}): " INPUT_USERNAME
+  USERNAME=${INPUT_USERNAME:-$current_user}
+
+  read -rp "👉 修改密码 (当前: ${current_pass}): " INPUT_PASSWORD
+  PASSWORD=${INPUT_PASSWORD:-$current_pass}
+
+  read -rp "👉 修改伪装域名/SNI (当前: ${current_sni}): " INPUT_SERVER_NAME
+  SERVER_NAME=${INPUT_SERVER_NAME:-$current_sni}
+
+  read -rp "👉 修改 Reality short_id (当前: ${current_sid}): " INPUT_SHORT_ID
+  SHORT_ID=${INPUT_SHORT_ID:-$current_sid}
+
+  read -rp "👉 修改节点备注名称 (当前: ${current_remark:-anytls-reality-tls}): " INPUT_REMARK
+  REMARK=${INPUT_REMARK:-${current_remark:-anytls-reality-tls}}
+
+  # 继承原有密钥
+  PRIVATE_KEY="$current_private_key"
+  PUBLIC_KEY="$current_public_key"
+
+  # 如果修改了伪装域名，则重置密钥对使之匹配
+  if [[ "$SERVER_NAME" != "$current_sni" ]]; then
+    warn "由于伪装域名改变，系统将自动重新生成相配对的 Reality 密钥..."
+    PRIVATE_KEY=""
+    PUBLIC_KEY=""
+  fi
+
+  generate_or_use_key
   write_and_show_config
 }
 
@@ -416,13 +520,6 @@ update_singbox() {
 }
 
 uninstall_singbox() {
-  warn "即将从当前系统中彻底卸载 Sing-box (NaiveProxy)"
-  read -rp "确定要彻底卸载吗？[y/N]: " confirm
-  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-    info "已取消卸载。"
-    return 0
-  fi
-
   if has_command systemctl; then
     systemctl stop sing-box >/dev/null 2>&1 || true
     systemctl disable sing-box >/dev/null 2>&1 || true
@@ -433,60 +530,36 @@ uninstall_singbox() {
   fi
   
   remove_file "$EXECUTABLE_INSTALL_PATH"
-  rm -rf /etc/sing-box "$SB_DIR"
+  rm -f "$SB_CONFIG" "$STATE_FILE"
+  rm -rf "$CONFIG_DIR" "$SB_DIR"
 
-  info "Sing-box 已彻底从您的系统中移除！"
-}
-
-changeconf() {
-  if [[ ! -f "$SB_CONFIG" ]]; then
-    error "配置文件不存在，请先安装 Sing-box"
-    return 1
-  fi
-
-  if [[ -f "$SB_DIR/meta.env" ]]; then
-    source "$SB_DIR/meta.env"
-  else
-    sb_domain=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG")
-    sb_email=$(jq -r '.inbounds[0].tls.acme.email' "$SB_CONFIG")
-    sb_username=$(jq -r '.inbounds[0].users[0].username' "$SB_CONFIG")
-    sb_password=$(jq -r '.inbounds[0].users[0].password' "$SB_CONFIG")
-    sb_node_name="NaiveProxy"
-  fi
-
-  clear
-  echo -e "${GREEN}====== 修改 Sing-box Naive 配置 ======${RESET}"
-  echo "提示：直接敲回车将保持原有配置不变"
-  echo "---------------------------------------------"
-  
-  local input_domain input_email input_user input_pass input_name
-
-  read -rp "👉 请输入解析好的域名 [当前: ${sb_domain}]: " input_domain
-  sb_domain=${input_domain:-$sb_domain}
-
-  read -rp "👉 请输入你的邮箱 [当前: ${sb_email}]: " input_email
-  sb_email=${input_email:-$sb_email}
-
-  read -rp "👉 请设置 NaiveProxy 用户名 [当前: ${sb_username}]: " input_user
-  sb_username=${input_user:-$sb_username}
-
-  read -rp "👉 请设置 NaiveProxy 密码 [当前: ${sb_password}]: " input_pass
-  sb_password=${input_pass:-$sb_password}
-
-  read -rp "👉 请给这个节点起个名字 [当前: ${sb_node_name}]: " input_name
-  sb_node_name=${input_name:-$sb_node_name}
-
-  write_and_show_config
-  info "配置修改并应用成功！"
+  info "已卸载 Sing-box、配置文件与状态文件。"
 }
 
 showconf() {
-  if [[ ! -d "$SB_DIR" || ! -f "$SB_DIR/url.txt" ]]; then
-    error "未找到分享链接配置文件。"
-    return
+  if [[ ! -f "$STATE_FILE" ]]; then
+    error "未找到任何安装配置底座，请先安装节点。"
+    return 1
   fi
-  echo -e "${GREEN}====== 节点分享链接 ======${RESET}"
-  cat "$SB_DIR/url.txt"
+  source "$STATE_FILE"
+
+  local encoded_remark=$(jq -rn --arg x "$REMARK" '$x|@uri')
+  local v2rayn_link="anytls://${PASSWORD}@${SERVER_IP}:${PORT}?security=reality&sni=${SERVER_NAME}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${encoded_remark}"
+
+  echo -e "${GREEN}====== AnyTLS+Reality 节点配置信息 ======${RESET}"
+  echo -e "${BLUE}服务器公网 IP :${RESET} ${SERVER_IP}"
+  echo -e "${BLUE}服务监听端口   :${RESET} ${PORT}"
+  echo -e "${BLUE}认证用户名     :${RESET} ${USERNAME}"
+  echo -e "${BLUE}认证通信密码   :${RESET} ${PASSWORD}"
+  echo -e "${BLUE}伪装域名 (SNI) :${RESET} ${SERVER_NAME}"
+  echo -e "${BLUE}Reality 公钥   :${RESET} ${PUBLIC_KEY}"
+  echo -e "${BLUE}Reality 目标ID :${RESET} ${SHORT_ID}"
+  echo -e "${BLUE}客户端指纹模式 :${RESET} chrome"
+  echo -e "${BLUE}节点自定义备注 :${RESET} ${REMARK}"
+  echo "---------------------------------------------"
+  echo -e "${GREEN}👉 v2rayN 分享链接:${RESET}"
+  echo -e "${CYAN}${v2rayn_link}${RESET}"
+  echo "---------------------------------------------"
   echo
 }
 
@@ -501,22 +574,22 @@ menu() {
     clear
     local status=$(get_sb_status)
     local version=$(get_installed_version)
-    local domain_show=$(get_current_domain_display)
+    local port_show=$(get_current_port_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    Sing-box NaiveProxy 面板    ${RESET}"
+    echo -e "${GREEN} Sing-box AnyTLS + Reality 面板  ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}域名   :${RESET} ${YELLOW}${domain_show}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Sing-box (Naive)${RESET}"
-    echo -e "${GREEN}2. 更新 Sing-box 核心${RESET}"
-    echo -e "${GREEN}3. 卸载 Sing-box (Naive)${RESET}"
-    echo -e "${GREEN}4. 修改节点配置${RESET}"
-    echo -e "${GREEN}5. 启动 Sing-box${RESET}"
-    echo -e "${GREEN}6. 停止 Sing-box${RESET}"
-    echo -e "${GREEN}7. 重启 Sing-box${RESET}"
+    echo -e "${GREEN}1. 安装 AnyReality${RESET}"
+    echo -e "${GREEN}2. 更新 AnyReality${RESET}"
+    echo -e "${GREEN}3. 卸载 AnyReality${RESET}"
+    echo -e "${GREEN}4. 修改已有配置${RESET}"
+    echo -e "${GREEN}5. 启动 AnyReality${RESET}"
+    echo -e "${GREEN}6. 停止 AnyReality${RESET}"
+    echo -e "${GREEN}7. 重启 AnyReality${RESET}"
     echo -e "${GREEN}8. 查看日志${RESET}"
     echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
@@ -527,10 +600,10 @@ menu() {
     [[ -z "$choice" ]] && continue
 
     case "$choice" in
-      1) inst_box=inst_singbox; $inst_box; pause ;;
+      1) inst_singbox; pause ;;
       2) update_singbox; pause ;;
       3) uninstall_singbox; pause ;;
-      4) changeconf; pause ;;
+      4) modify_config; pause ;;
       5) 
         if has_command systemctl; then
           systemctl start sing-box && info "服务已成功启动！"

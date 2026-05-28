@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =========================================================
-# AnyTLS 安装/卸载管理脚本 (自动更新与管道全兼容精修版)
+# Tuic v5 安装/卸载管理脚本
 # =========================================================
 
 # ================== 颜色定义 ==================
@@ -15,18 +15,11 @@ RESET="\033[0m"
 
 # ================== 基础变量 ==================
 SCRIPT_VERSION="1.4"
-SERVICE_NAME="anytls"
-BINARY_NAME="anytls-server"
-BINARY_DIR="/usr/local/bin"
-BINARY_PATH="${BINARY_DIR}/${BINARY_NAME}"
-
-ANYTLS_DIR="/etc/anytls"
-ANYTLS_CONFIG="${ANYTLS_DIR}/config.env"
-ANYTLS_SERVICE="/etc/systemd/system/${SERVICE_NAME}.service"
-LOG_FILE="/var/log/anytls-manager.log"
-RUN_USER="anytls"
-
-TMP_DIR=$(mktemp -d -t anytls.XXXXXX)
+SERVICE_NAME="tuic"
+TUIC_DIR="/etc/tuic"
+CONFIG="$TUIC_DIR/config.json"
+BINARY_PATH="/usr/local/bin/tuic-server"
+SERVICE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 # ================== Root 检查 ==================
 if [ "$(id -u)" -ne 0 ]; then
@@ -34,253 +27,166 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# ================== 清理 ==================
-cleanup() {
-    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
-}
-trap cleanup EXIT INT TERM
-
-# ================== 日志 ==================
-log() {
-    echo "$(date '+%F %T') - $1" >> "$LOG_FILE"
-}
-
+# ================== 暂停返回 ==================
 pause() {
     read -n1 -s -r -p "按任意键返回菜单..." < /dev/tty
     echo
 }
 
-# ================== 用户 ==================
-create_user() {
-    id -u "$RUN_USER" &>/dev/null || \
-        useradd -r -s /usr/sbin/nologin "$RUN_USER"
-}
-
-# ================== 公网IP ==================
-get_public_ip() {
-    local ip
-    for cmd in "curl -4fsSL --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in \
-            "https://api.ipify.org" \
-            "https://ip.sb" \
-            "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && {
-                echo "$ip"
-                return
-            }
-        done
+# ================== 检查依赖 ==================
+install_packages() {
+    local pkgs=(jq curl openssl wget)
+    local to_install=()
+    for p in "${pkgs[@]}"; do
+        command -v "$p" &>/dev/null || to_install+=("$p")
     done
-
-    for cmd in "curl -6fsSL --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in \
-            "https://api64.ipify.org" \
-            "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && {
-                echo "[$ip]"
-                return
-            }
-        done
-    done
-
-    echo "无法获取公网IP"
-}
-
-# ================== 依赖 ==================
-check_deps() {
-    install_pkg() {
-        if command -v apt >/dev/null 2>&1; then
-            apt update -y
-            apt install -y "$@"
-        elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y "$@"
-        elif command -v yum >/dev/null 2>&1; then
-            yum install -y "$@"
-        elif command -v apk >/dev/null 2>&1; then
-            apk add --no-cache "$@"
+    
+    if [ ${#to_install[@]} -gt 0 ]; then
+        if command -v apt &>/dev/null; then
+            apt-get update -y && apt-get install -y "${to_install[@]}"
+        elif command -v dnf &>/dev/null; then
+            dnf install -y "${to_install[@]}"
+        elif command -v yum &>/dev/null; then
+            yum install -y "${to_install[@]}"
+        elif command -v apk &>/dev/null; then
+            apk add --no-cache "${to_install[@]}"
+        else
+            echo -e "${YELLOW}暂不支持的系统组件管理器${RESET}"
+            exit 1
         fi
-    }
-
-    command -v curl >/dev/null || install_pkg curl
-    command -v wget >/dev/null || install_pkg wget
-    command -v unzip >/dev/null || install_pkg unzip
-    command -v ss >/dev/null || install_pkg iproute2
-}
-
-# ================== 端口 ==================
-check_port() {
-    if ss -tulnH "( sport = :$1 )" | grep -q . || return 0; then
-        echo -e "${RED}端口 $1 已占用${RESET}"
-        return 1
     fi
 }
 
-random_port() {
-    shuf -i 10000-65000 -n1
-}
-
-random_password() {
-    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c16 || true
-}
-
-# ================== 架构 ==================
+# ================== 检测架构 ==================
 detect_arch() {
     case "$(uname -m)" in
-        x86_64) echo amd64 ;;
-        aarch64) echo arm64 ;;
-        armv7l) echo armv7 ;;
-        *)
+        x86_64) echo "x86_64-unknown-linux-gnu" ;;
+        aarch64) echo "aarch64-unknown-linux-gnu" ;;
+        armv7l) echo "armv7-unknown-linux-gnueabi" ;;
+        i686) echo "i686-unknown-linux-gnu" ;;
+        *) 
             echo -e "${RED}不支持架构 $(uname -m)${RESET}"
-            exit 1
+            exit 1 
             ;;
     esac
 }
 
 # ================== 自动获取 GitHub 最新版本号 ==================
 get_latest_version() {
-    local latest_release
-    latest_release=$(curl -fsSL --max-time 5 "https://api.github.com/repos/anytls/anytls-go/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
-    if [[ -z "$latest_release" ]]; then
-        latest_release=$(curl -fsSLI --max-time 5 "https://github.com/anytls/anytls-go/releases/latest" 2>/dev/null | grep -i 'location:' | sed -E 's/.*\/v?([^/\r\n]+).*/\1/')
+    local latest_release raw_tag
+    raw_tag=$(curl -fsSL --max-time 5 "https://api.github.com/repos/EAimTY/tuic/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    if [[ -z "$raw_tag" ]]; then
+        raw_tag=$(curl -fsSLI --max-time 5 "https://github.com/EAimTY/tuic/releases/latest" 2>/dev/null | grep -i 'location:' | sed -E 's/.*\/([^/\r\n]+).*/\1/')
     fi
-    echo "${latest_release:-0.0.12}"
+    # 过滤可能存在的前缀，确保提取出纯净版本号 (例如 1.0.0)
+    latest_release=$(echo "$raw_tag" | sed -E 's/^tuic-server-//' | sed -E 's/^v//')
+    echo "${latest_release:-1.0.0}"
 }
 
-# ================== 配置 ==================
-write_config() {
-    mkdir -p "$ANYTLS_DIR"
-    cat > "$ANYTLS_CONFIG" <<EOF
-ANYTLS_PORT=$1
-ANYTLS_PASSWORD=$2
-EOF
-    chmod 600 "$ANYTLS_CONFIG"
-    chown -R ${RUN_USER}:${RUN_USER} "$ANYTLS_DIR"
+# ================== 随机生成器 ==================
+random_port() {
+    shuf -i 10000-65000 -n 1
 }
 
-# ================== 输出节点 ==================
-output_node_links() {
-    local ip
-    ip=$(get_public_ip)
-
-    local hostname
-    hostname=$(hostname -s | sed 's/ /_/g')
-
-    echo -e "${GREEN}====== AnyTLS 节点信息 ======${RESET}"
-    echo -e "${YELLOW}IP      : ${ip}${RESET}"
-    echo -e "${YELLOW}端口    : $1${RESET}"
-    echo -e "${YELLOW}密码    : $2${RESET}"
-    echo -e "${GREEN}---------------------------${RESET}"
-    echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
-    echo -e "${YELLOW}[信息] V2rayN 链接：${RESET}"
-    echo -e "${CYAN}anytls://$2@$ip:$1/?insecure=1#$hostname${RESET}"
-    echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
-    echo -e "${CYAN}$hostname = anytls, $ip, $1, password=$2, tfo=true, skip-cert-verify=true, reuse=false${RESET}"
-    echo -e "${YELLOW}---------------------------------${RESET}"
+random_password() {
+    LC_ALL=C tr -dc 'a-zA-Z0-9' </dev/urandom 2>/dev/null | head -c 12 || true
 }
 
-# ================== 安装 ==================
-install_ss() {
-    echo -e "${GREEN}[信息] 开始安装 AnyTLS...${RESET}"
+# ================== 下载并安装 Tuic ==================
+install_tuic() {
+    echo -e "${GREEN}[信息] 开始安装 Tuic V5 (EAimTY 分支)...${RESET}"
+    install_packages
+    mkdir -p "$TUIC_DIR"
 
-    check_deps
-    create_user
-    mkdir -p "$ANYTLS_DIR"
-
-    local arch
+    local arch version url
     arch=$(detect_arch)
-
-    echo -e "${GREEN}[信息] 正在获取 AnyTLS 最新版本...${RESET}"
-    local version
+    
+    echo -e "${GREEN}[信息] 正在动态获取 Tuic 最新版本...${RESET}"
     version=$(get_latest_version)
     echo -e "${GREEN}[信息] 检测到最新版本为: v${version}${RESET}"
+    
+    # 🌟 完美对齐你的专属高速下载格式
+    url="https://github.com/EAimTY/tuic/releases/download/tuic-server-${version}/tuic-server-${version}-${arch}"
 
-    local url="https://github.com/anytls/anytls-go/releases/download/v${version}/anytls_${version}_linux_${arch}.zip"
-
-    cd "$TMP_DIR"
-    wget "$url" -O anytls.zip
-    unzip -o anytls.zip -d "$TMP_DIR"
-
-    local real_binary_path
-    real_binary_path=$(find "$TMP_DIR" -type f -name "$BINARY_NAME" | head -n 1)
-    if [[ -z "$real_binary_path" ]]; then
-        echo -e "${RED}[错误] 压缩包内未找到可执行程序 ${BINARY_NAME}${RESET}"
-        return 1
+    echo -e "${GREEN}[信息] 开始下载 Tuic 服务端到 /usr/local/bin ...${RESET}"
+    if ! wget -O "$BINARY_PATH" -q "$url"; then
+        echo -e "${YELLOW}[警告] wget 下载失败，尝试切换到 curl...${RESET}"
+        curl -fsSL -o "$BINARY_PATH" "$url" || { echo -e "${RED}[错误] 核心程序下载失败，请检查网络${RESET}"; return 1; }
     fi
+    chmod +x "$BINARY_PATH"
+    echo "$version" > "${TUIC_DIR}/version.txt"
 
-    install -m755 "$real_binary_path" "$BINARY_PATH"
-    echo "$version" > "${ANYTLS_DIR}/version.txt"
+    echo -e "${GREEN}[信息] 正在自签发本地证书...${RESET}"
+    openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+        -keyout "${TUIC_DIR}/server.key" -out "${TUIC_DIR}/server.crt" -subj "/CN=www.bing.com" -days 36500 &>/dev/null
 
     local port input_port
     while true; do
-        read -p "请输入监听端口 (默认随机): " input_port < /dev/tty
+        read -p "请输入监听端口 (10000-65000，默认随机): " input_port < /dev/tty
         port=${input_port:-$(random_port)}
-
-        if [[ "$port" =~ ^[0-9]+$ ]] &&
-            [ "$port" -ge 1 ] &&
-            [ "$port" -le 65535 ]; then
-
-            check_port "$port" || continue
+        if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
             break
         fi
-
         echo -e "${RED}端口无效${RESET}"
     done
 
-    local input_password password
-    read -p "请输入密码 (默认随机): " input_password < /dev/tty
-    password=${input_password:-$(random_password)}
+    local password uuid
+    password=$(random_password)
+    uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "00000000-0000-0000-0000-000000000000")
 
-    write_config "$port" "$password"
+    cat > "$CONFIG" <<EOF
+{
+  "server": "[::]:$port",
+  "users": {
+    "$uuid": "$password"
+  },
+  "certificate": "$TUIC_DIR/server.crt",
+  "private_key": "$TUIC_DIR/server.key",
+  "congestion_control": "bbr",
+  "alpn": ["h3"],
+  "udp_relay_ipv6": true,
+  "dual_stack": true,
+  "log_level": "warn"
+}
+EOF
 
-    cat > "$ANYTLS_SERVICE" <<EOF
+    cat > "$SERVICE" <<EOF
 [Unit]
-Description=AnyTLS Service
-After=network-online.target
-Wants=network-online.target
+Description=Tuic Service
+After=network.target nss-lookup.target
 
 [Service]
-Type=simple
-User=${RUN_USER}
-Group=${RUN_USER}
-EnvironmentFile=${ANYTLS_CONFIG}
-ExecStart=${BINARY_PATH} -l :\${ANYTLS_PORT} -p \${ANYTLS_PASSWORD}
-Restart=always
-RestartSec=3
-
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=true
+WorkingDirectory=$TUIC_DIR
+ExecStart=$BINARY_PATH -c $CONFIG
+Restart=on-failure
+User=root
+LimitNOFILE=infinity
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME"
-    systemctl restart "$SERVICE_NAME"
+    systemctl enable --now tuic &>/dev/null
+    systemctl restart tuic
 
-    if ! systemctl is-active --quiet "$SERVICE_NAME"; then
-        echo -e "${RED}AnyTLS 启动失败${RESET}"
-        journalctl -u "$SERVICE_NAME" -n20 --no-pager
-        return 1
+    if systemctl is-active --quiet tuic; then
+        echo -e "${GREEN}[完成] Tuic V5 安装并启动成功${RESET}"
+        show_info
+    else
+        echo -e "${RED}[错误] Tuic 服务启动失败${RESET}"
     fi
-
-    echo -e "${GREEN}[完成] AnyTLS 安装成功${RESET}"
-    output_node_links "$port" "$password"
-    log "安装成功"
 }
 
-# ================== 更新 AnyTLS 主程序 ==================
-update_ss() {
-    if [[ ! -f "${ANYTLS_DIR}/version.txt" || ! -f "$ANYTLS_CONFIG" ]]; then
-        echo -e "${RED}[错误] 未检测到已安装的 AnyTLS 服务，请先执行安装。${RESET}"
+# ================== 更新 Tuic 主程序 ==================
+update_tuic() {
+    if [[ ! -f "$BINARY_PATH" || ! -f "$CONFIG" ]]; then
+        echo -e "${RED}[错误] 未检测到已安装的 Tuic 服务，请先执行安装。${RESET}"
         return 1
     fi
 
-    local current_version
-    current_version=$(cat "${ANYTLS_DIR}/version.txt")
+    local current_version="未知"
+    [[ -f "${TUIC_DIR}/version.txt" ]] && current_version=$(cat "${TUIC_DIR}/version.txt")
     
     echo -e "${GREEN}[信息] 正在获取最新版本...${RESET}"
     local latest_version
@@ -300,109 +206,117 @@ update_ss() {
     echo -e "${GREEN}[信息] 开始升级主程序到 v${latest_version}...${RESET}"
     local arch
     arch=$(detect_arch)
-    local url="https://github.com/anytls/anytls-go/releases/download/v${latest_version}/anytls_${latest_version}_linux_${arch}.zip"
+    local url="https://github.com/EAimTY/tuic/releases/download/tuic-server-${latest_version}/tuic-server-${latest_version}-${arch}"
 
-    cd "$TMP_DIR"
-    wget "$url" -O anytls.zip || { echo -e "${RED}下载失败${RESET}"; return 1; }
-    unzip -o anytls.zip -d "$TMP_DIR"
-
-    local real_binary_path
-    real_binary_path=$(find "$TMP_DIR" -type f -name "$BINARY_NAME" | head -n 1)
-    if [[ -z "$real_binary_path" ]]; then
-        echo -e "${RED}[错误] 压缩包内未找到可执行程序 ${BINARY_NAME}${RESET}"
-        return 1
+    if ! wget -O "${BINARY_PATH}.tmp" -q "$url"; then
+        echo -e "${YELLOW}[警告] wget 下载失败，尝试切换到 curl...${RESET}"
+        curl -fsSL -o "${BINARY_PATH}.tmp" "$url" || { echo -e "${RED}[错误] 下载失败${RESET}"; return 1; }
     fi
 
-    systemctl stop "$SERVICE_NAME" || true
-    install -m755 "$real_binary_path" "$BINARY_PATH"
-    echo "$latest_version" > "${ANYTLS_DIR}/version.txt"
-    systemctl start "$SERVICE_NAME"
+    systemctl stop tuic || true
+    mv -f "${BINARY_PATH}.tmp" "$BINARY_PATH"
+    chmod +x "$BINARY_PATH"
+    echo "$latest_version" > "${TUIC_DIR}/version.txt"
+    systemctl start tuic
 
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        echo -e "${GREEN}[完成] AnyTLS 成功升级至 v${latest_version}!${RESET}"
-        log "升级成功至 v${latest_version}"
+    if systemctl is-active --quiet tuic; then
+        echo -e "${GREEN}[完成] Tuic 成功升级至 v${latest_version}!${RESET}"
     else
         echo -e "${RED}[错误] 升级后服务启动失败，请检查日志。${RESET}"
     fi
 }
 
-# ================== 修改配置 ==================
-modify_ss() {
-    [[ -f "$ANYTLS_CONFIG" ]] || {
-        echo -e "${RED}配置不存在${RESET}"
-        return
-    }
-
-    source "$ANYTLS_CONFIG"
-
-    echo "当前端口: $ANYTLS_PORT"
-    echo "当前密码: $ANYTLS_PASSWORD"
-
-    local port password
-
-    read -p "新端口 [当前:${ANYTLS_PORT}]: " port < /dev/tty
-    port=${port:-$ANYTLS_PORT}
-
-    if [[ "$port" != "$ANYTLS_PORT" ]]; then
-        check_port "$port" || return 1
+# ================== 修改端口 ==================
+change_port() {
+    if [[ ! -f "$CONFIG" ]]; then
+        echo -e "${RED}[错误] 配置文件不存在，请先安装。${RESET}"
+        return 1
     fi
 
-    read -p "新密码 [默认保持]: " password < /dev/tty
-    password=${password:-$ANYTLS_PASSWORD}
+    local new_port input_port
+    while true; do
+        read -p "请输入新端口 (10000-65000，默认随机): " input_port < /dev/tty
+        new_port=${input_port:-$(random_port)}
+        if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
+            break
+        fi
+        echo -e "${RED}端口无效${RESET}"
+    done
 
-    write_config "$port" "$password"
-    systemctl restart "$SERVICE_NAME"
-
+    local tmp_json
+    tmp_json=$(jq ".server=\"[::]:$new_port\"" "$CONFIG")
+    echo "$tmp_json" > "$CONFIG"
+    
+    systemctl restart tuic
     echo -e "${GREEN}修改成功${RESET}"
-    output_node_links "$port" "$password"
+    show_info
 }
 
 # ================== 卸载 ==================
-uninstall_ss() {
-    systemctl stop "$SERVICE_NAME" || true
-    systemctl disable "$SERVICE_NAME" || true
-
-    rm -f "$ANYTLS_SERVICE"
+uninstall_tuic() {
+    systemctl stop tuic || true
+    systemctl disable tuic || true
+    rm -f "$SERVICE"
     rm -f "$BINARY_PATH"
-    rm -rf "$ANYTLS_DIR"
-
-    id -u "$RUN_USER" &>/dev/null && userdel "$RUN_USER" || true
-
+    rm -rf "$TUIC_DIR"
     systemctl daemon-reload
     echo -e "${GREEN}卸载完成${RESET}"
+}
+
+# ================== 显示节点信息 ==================
+show_info() {
+    if [[ ! -f "$CONFIG" ]]; then
+        echo -e "${RED}[错误] 配置不存在${RESET}"
+        return 1
+    fi
+
+    local public_ip uuid password port hostname
+    public_ip=$(curl -fsSL --max-time 5 https://api.ipify.org || echo "无法获取公网IP")
+    uuid=$(jq -r '.users | keys[0]' "$CONFIG")
+    password=$(jq -r '.users[]' "$CONFIG")
+    port=$(jq -r '.server' "$CONFIG" | sed -E 's/.*:([0-9]+)$/\1/')
+    hostname=$(hostname -s | sed 's/ /_/g')
+
+    echo -e "\n${GREEN}====== Tuic v5 节点信息 ======${RESET}"
+    echo -e "${YELLOW}IP      : ${public_ip}${RESET}"
+    echo -e "${YELLOW}端口    : ${port}${RESET}"
+    echo -e "${YELLOW}UUID    : ${uuid}${RESET}"
+    echo -e "${GREEN}---------------------------${RESET}"
+    echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
+    echo -e "${YELLOW}[信息] V2rayN / NekoBox 链接：${RESET}"
+    echo -e "${CYAN}tuic://$uuid:$password@$public_ip:$port?congestion_control=bbr&alpn=h3&sni=www.bing.com&udp_relay_mode=native&allow_insecure=1#$hostname-tuicv5${RESET}"
+    echo -e "${YELLOW}提示：如果节点无法连接，请确保客户端允许跳过证书验证设为 true${RESET}"
+    echo -e "${GREEN}---------------------------------${RESET}"
 }
 
 # ================== 菜单 ==================
 show_menu() {
     clear
     local status
-    systemctl is-active --quiet "$SERVICE_NAME" &&
+    systemctl is-active --quiet tuic &&
         status="${GREEN}●运行中${RESET}" ||
         status="${RED}●未运行${RESET}"
 
     local version="未安装"
-    [[ -f "${ANYTLS_DIR}/version.txt" ]] &&
-        version="v$(cat "${ANYTLS_DIR}/version.txt")"
+    [[ -f "${TUIC_DIR}/version.txt" ]] && version="v$(cat "${TUIC_DIR}/version.txt")"
 
     local port="-"
-    [[ -f "$ANYTLS_CONFIG" ]] &&
-        source "$ANYTLS_CONFIG" &&
-        port=$ANYTLS_PORT
+    [[ -f "$CONFIG" ]] && port=$(jq -r '.server' "$CONFIG" | sed -E 's/.*:([0-9]+)$/\1/')
 
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}      AnyTLS 管理面板          ${RESET}"
+    echo -e "${GREEN}      TuicV5 管理面板${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}版本 :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port}${RESET}"
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}1. 安装 AnyTLS${RESET}"
-    echo -e "${GREEN}2. 更新 AnyTLS${RESET}"
-    echo -e "${GREEN}3. 卸载 AnyTLS${RESET}"
+    echo -e "${GREEN}1. 安装 Tuic V5${RESET}"
+    echo -e "${GREEN}2. 更新 Tuic V5${RESET}"
+    echo -e "${GREEN}3. 卸载 Tuic V5${RESET}"
     echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 AnyTLS${RESET}"
-    echo -e "${GREEN}6. 停止 AnyTLS${RESET}"
-    echo -e "${GREEN}7. 重启 AnyTLS${RESET}"
+    echo -e "${GREEN}5. 启动 Tuic V5${RESET}"
+    echo -e "${GREEN}6. 停止 Tuic V5${RESET}"
+    echo -e "${GREEN}7. 重启 Tuic V5${RESET}"
     echo -e "${GREEN}8. 查看日志${RESET}"
     echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
@@ -418,21 +332,15 @@ while true; do
     set -e
 
     case $choice in
-        1) install_ss; pause ;;
-        2) update_ss; pause ;;
-        3) uninstall_ss; pause ;;
-        4) modify_ss; pause ;;
-        5) systemctl start "$SERVICE_NAME"; echo -e "${GREEN}[完成] AnyTLS 已启动${RESET}"; pause ;;
-        6) systemctl stop "$SERVICE_NAME"; echo -e "${GREEN}[完成] AnyTLS 已停止${RESET}"; pause ;;
-        7) systemctl restart "$SERVICE_NAME"; echo -e "${GREEN}[完成] AnyTLS 已重启${RESET}"; pause ;;
-        8) journalctl -u "$SERVICE_NAME" -e --no-pager; pause ;;
-        9)
-            [[ -f "$ANYTLS_CONFIG" ]] && {
-                source "$ANYTLS_CONFIG"
-                output_node_links "$ANYTLS_PORT" "$ANYTLS_PASSWORD"
-            }
-            pause
-            ;;
+        1) install_tuic; pause ;;
+        2) update_tuic; pause ;;
+        3) uninstall_tuic; pause ;;
+        4) change_port; pause ;;
+        5) systemctl start tuic; echo -e "${GREEN}[完成] Tuic 已启动${RESET}"; pause ;;
+        6) systemctl stop tuic; echo -e "${GREEN}[完成] Tuic 已停止${RESET}"; pause ;;
+        7) systemctl restart tuic; echo -e "${GREEN}[完成] Tuic 已重启${RESET}"; pause ;;
+        8) journalctl -u tuic -e --no-pager; pause ;;
+        9) show_info; pause ;;
         0) exit 0 ;;
         *)
             echo -e "${RED}无效输入${RESET}"

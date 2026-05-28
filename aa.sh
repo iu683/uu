@@ -74,8 +74,13 @@ install_content() {
   echo "$_content" > "$_tmpfile"
   if [[ -z "$_overwrite" && -e "$_destination" ]]; then
     echo -e "已存在"
-  elif install "$_install_flags" "$_tmpfile" "$_destination"; then
-    echo -e "完成"
+  else
+    mkdir -p "$(dirname "$_destination")"
+    if install "$_install_flags" "$_tmpfile" "$_destination"; then
+      echo -e "完成"
+    else
+      echo -e "失败"
+    fi
   fi
   rm -f "$_tmpfile"
 }
@@ -151,6 +156,7 @@ get_latest_version() {
   local _tmpfile=$(mktemp)
   if ! curl -sS -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases" -o "$_tmpfile"; then
     rm -f "$_tmpfile"
+    echo "v1.12.3"
     return
   fi
   local _tag_name=$(jq -r '[.[] | select(.prerelease==false and .draft==false)][0].tag_name' "$_tmpfile" 2>/dev/null || echo "")
@@ -161,6 +167,21 @@ get_latest_version() {
   else
     echo "v1.12.3"
   fi
+}
+
+download_singbox() {
+  local version="$1"
+  local dest_file="$2"
+  local ver_num="${version#v}"
+  local filename="sing-box-${ver_num}-${OPERATING_SYSTEM}-${ARCHITECTURE}.tar.gz"
+  local download_url="${REPO_URL}/releases/download/${version}/${filename}"
+
+  info "正在下载 Sing-box ${version} (${ARCHITECTURE}) ..."
+  if ! curl -sS "$download_url" -o "$dest_file"; then
+    error "下载失败，请检查网络连接或 GitHub 连通性。"
+    return 1
+  fi
+  return 0
 }
 
 get_public_ip() {
@@ -228,6 +249,7 @@ write_and_show_config() {
     headers_json="{\"Host\": \"${WSHOST}\"}"
   fi
 
+  # 【已修复】彻底移除 "alter_id": 0 废弃字段
   cat << EOF > "$SB_CONFIG"
 {
   "inbounds": [
@@ -238,8 +260,7 @@ write_and_show_config() {
       "listen_port": ${PORT},
       "users": [
         {
-          "uuid": "${UUID}",
-          "alter_id": 0
+          "uuid": "${UUID}"
         }
       ],
       "transport": {
@@ -309,7 +330,6 @@ inst_singbox() {
 
   info "🧹 正在清理前置依赖并准备下载..."
   if ! command -v sing-box >/dev/null 2>&1; then
-    info "获取 GitHub 官方最新发布版本中..."
     local latest_version=$(get_latest_version)
     
     local _tmpfile_tar=$(mktemp)
@@ -322,7 +342,9 @@ inst_singbox() {
     tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
     
     local _ver_num="${latest_version#v}"
-    if install -Dm755 "$_tmpdir_extract/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE/sing-box" "$EXECUTABLE_INSTALL_PATH"; then
+    local _extracted_binary=$(find "$_tmpdir_extract" -type f -name "sing-box" | head -n 1)
+    
+    if [[ -n "$_extracted_binary" ]] && install -Dm755 "$_extracted_binary" "$EXECUTABLE_INSTALL_PATH"; then
       echo "成功"
     else
       rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "安装失败" && return 1
@@ -362,7 +384,7 @@ inst_singbox() {
   write_and_show_config
 }
 
-# 流程二：修改配置（读取当前配置，回车保持不变）
+# 流程二：修改配置
 modify_config() {
   if [[ ! -f "$SB_CONFIG" ]]; then
     error "未找到正在运行的配置文件，请先选择选项 1 安装节点。"
@@ -380,7 +402,6 @@ modify_config() {
     current_remark=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 || true)
   fi
 
-  # 如果之前的备注失效或为空，生成一份备用默认备注
   local hostname_str=$(hostname 2>/dev/null || echo "linux")
   local fallback_remark="${hostname_str}-vmessws"
 
@@ -398,7 +419,6 @@ modify_config() {
   WSPATH=${INPUT_WSPATH:-$current_path}
 
   read -rp "👉 修改 WebSocket Host 伪装域名 (当前: ${current_host:-未配置/留空}): " INPUT_WSHOST
-  # 特殊处理：如果原配置为空且用户直接敲回车，输入变量可能接收为空
   if [[ -z "$INPUT_WSHOST" ]]; then
     WSHOST="$current_host"
   else
@@ -440,8 +460,8 @@ update_singbox() {
   local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
   tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
   
-  local _ver_num="${latest_version#v}"
-  if install -Dm755 "$_tmpdir_extract/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE/sing-box" "$EXECUTABLE_INSTALL_PATH"; then
+  local _extracted_binary=$(find "$_tmpdir_extract" -type f -name "sing-box" | head -n 1)
+  if [[ -n "$_extracted_binary" ]] && install -Dm755 "$_extracted_binary" "$EXECUTABLE_INSTALL_PATH"; then
     echo "成功"
   else
     rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "覆盖核心失败" && return 1
@@ -488,7 +508,7 @@ showconf() {
   fi
   source "$STATE_FILE"
 
-  # 构造标准 v2rayN VMess 分享二维码 JSON
+  # 【已修复】确保客户端生成的 VMess 链接中 aid (alterId) 保持为 0 即可，Sing-box 端不接收该字段
   local vmess_json_str
   vmess_json_str=$(cat << EOF
 {
@@ -520,7 +540,7 @@ EOF
   echo -e "${GREEN}WebSocket Host :${RESET} ${WSHOST:-未配置(留空)}"
   echo -e "${GREEN}节点自定义备注 :${RESET} ${REMARK}"
   echo "---------------------------------------------"
-  echo -e "${GREEN}👉 v2rayN  分享链接:${RESET}"
+  echo -e "${GREEN}👉 v2rayN   分享链接:${RESET}"
   echo -e "${YELLOW}${v2rayn_link}${RESET}"
   echo "---------------------------------------------"
   echo
@@ -540,7 +560,7 @@ menu() {
     local port_show=$(get_current_port_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    Sing-box VMess + WS 面板    ${RESET}"
+    echo -e "${GREEN}     Sing-box VMess + WS 面板    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"

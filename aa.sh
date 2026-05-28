@@ -1,18 +1,42 @@
 #!/bin/bash
 
-# 颜色定义
-red() { echo -e "\e[1;91m$1\033[0m"; }
-green() { echo -e "\e[1;32m$1\033[0m"; }
-yellow() { echo -e "\e[1;33m$1\033[0m"; }
-purple() { echo -e "\e[1;35m$1\033[0m"; }
+# ================== 颜色定义 ==================
+GREEN="\033[1;32m"
+RED="\033[1;31m"
+YELLOW="\033[1;33m"
+PURPLE="\033[1;35m"
+SKYBLUE="\033[1;36m"
+RESET="\033[0m"
 
-# 基础变量初始化
+# ================== 基础环境变量 ==================
 HOSTNAME=$(hostname)
 USERNAME=$(whoami | tr '[:upper:]' '[:lower:]')
-WORKDIR="$HOME/mtp"
 export SECRET=${SECRET:-$(echo -n "$USERNAME+$HOSTNAME" | md5sum | head -c 32)}
+WORKDIR="$HOME/mtp"
+# 【已修改】改为开机后等待 30 秒再执行重启脚本，防止网卡未准备就绪
+CRON_CMD="@reboot sleep 30 && /bin/bash $WORKDIR/restart.sh >/dev/null 2>&1"
+LOG_FILE="$WORKDIR/mtg.log"
 
-# 获取公网 IP
+# ================== 工具函数 ==================
+red_echo() { echo -e "${RED}$1${RESET}"; }
+green_echo() { echo -e "${GREEN}$1${RESET}"; }
+yellow_echo() { echo -e "${YELLOW}$1${RESET}"; }
+purple_echo() { echo -e "${PURPLE}$1${RESET}"; }
+
+# 获取正在运行的端口
+get_running_port() {
+    local pid=$(pgrep -x mtg)
+    if [[ -n "$pid" ]]; then
+        # 尝试从进程参数中抓取绑定的端口
+        local port=$(ps -p "$pid" -o args= | grep -oE '0\.0\.0\.0:[0-9]+' | cut -d':' -f2)
+        # 如果找不到，尝试从预留文件读取
+        [[ -z "$port" && -f "$WORKDIR/port.txt" ]] && port=$(cat "$WORKDIR/port.txt")
+        echo "${port:-未知}"
+    else
+        echo "无"
+    fi
+}
+
 get_public_ip() {
     local ip
     for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
@@ -21,153 +45,257 @@ get_public_ip() {
         done
     done
     for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
+        for url in "https://ip6.n0at.com" "https://ip.sb"; do
             ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
-    echo "127.0.0.1"
+    echo "无法获取公网 IP"
 }
 
-# 架构检测
-get_arch() {
-    local cmd=$(uname -m)
-    if [ "$cmd" == "x86_64" ] || [ "$cmd" == "amd64" ] ; then
-        echo "amd64"
-    elif [ "$cmd" == "386" ]; then
-        echo "386"
-    elif [ "$cmd" == "arm" ]; then
-        echo "arm"
-    elif [ "$cmd" == "aarch64" ]; then
-        echo "arm64"    
+random_port() {
+    shuf -i 2000-65000 -n 1
+}
+
+check_vps_port() {
+    local port=$1
+    while [[ -n $(lsof -i :$port 2>/dev/null) ]]; do
+        red_echo "${port} 端口已经被其他程序占用，请更换端口重试。"
+        read -p "请输入新端口（直接回车使用随机端口）: " port
+        [[ -z $port ]] && port=$(random_port) && green_echo "使用随机端口: $port"
+    done
+    echo "$port"
+}
+
+check_devil_port () {
+    port_list=$(devil port list)
+    tcp_ports=$(echo "$port_list" | grep -c "tcp")
+    udp_ports=$(echo "$port_list" | grep -c "udp")
+
+    if [[ $tcp_ports -lt 1 ]]; then
+        yellow_echo "没有可用的 TCP 端口，正在尝试自动调整..."
+        if [[ $udp_ports -ge 3 ]]; then
+            udp_port_to_delete=$(echo "$port_list" | awk '/udp/ {print $1}' | head -n 1)
+            devil port del udp "$udp_port_to_delete" >/dev/null 2>&1
+        fi
+
+        while true; do
+            local rand_p=$(shuf -i 10000-65535 -n 1)
+            result=$(devil port add tcp "$rand_p" 2>&1)
+            if [[ $result == *"Ok"* ]]; then
+                MTP_PORT=$rand_p
+                break
+            fi
+        done
     else
-        echo "amd64"
+        MTP_PORT=$(echo "$port_list" | awk '/tcp/ {print $1}' | sed -n '1p')
+    fi
+    devil binexec on >/dev/null 2>&1
+}
+
+install_lsof() {
+    if ! command -v lsof &>/dev/null; then
+        if [ -f "/etc/debian_version" ]; then
+            apt update && apt install -y lsof
+        elif [ -f "/etc/alpine-release" ]; then
+            apk add lsof
+        fi
     fi
 }
 
-# 核心安装逻辑
-install_mtg() {
+# ================== Crontab 管理 ==================
+check_cron_status() {
+    # 用更稳健的方式检查 restart.sh 是否已存在于 crontab 中
+    crontab -l 2>/dev/null | grep -q "restart.sh"
+}
+
+set_cron() {
+    if ! check_cron_status; then
+        (crontab -l 2>/dev/null; echo "$CRON_CMD") | crontab -
+    fi
+}
+
+remove_cron() {
+    if check_cron_status; then
+        # 移除包含 restart.sh 的整行本地定时任务
+        crontab -l 2>/dev/null | grep -v "restart.sh" | crontab -
+    fi
+}
+
+# ================== 核心控制服务 ==================
+start_proxy() {
+    if pgrep -x mtg >/dev/null; then
+        yellow_echo "MTProto Proxy 已经在运行中。"
+        return 0
+    fi
+    
+    if [ ! -f "$WORKDIR/mtg" ]; then
+        red_echo "未检测到安装文件，请先选择 1 安装。"
+        return 1
+    fi
+
+    local port=$(cat "$WORKDIR/port.txt" 2>/dev/null)
+    if [[ -z "$port" || "$port" == "无" ]]; then
+        red_echo "未检测到配置端口，请重新安装或修改配置。"
+        return 1
+    fi
+
+    cd "$WORKDIR" || return
+    nohup ./mtg run -b 0.0.0.0:$port "$SECRET" --stats-bind=127.0.0.1:$((port + 1)) >> "$LOG_FILE" 2>&1 &
+    green_echo "MTProto Proxy 启动成功！"
+}
+
+stop_proxy() {
+    if pgrep -x mtg >/dev/null; then
+        pkill -9 mtg >/dev/null 2>&1
+        clear
+        green_echo "MTProto Proxy 已成功停止。"
+    else
+        yellow_echo "MTProto Proxy 本就处于停止状态。"
+    fi
+}
+
+show_config() {
+    if [ ! -f "$WORKDIR/link.txt" ]; then
+        red_echo "未找到连接配置，请确保已成功安装。"
+    else
+        purple_echo "\n==== 当前 MTProto 连接配置 ===="
+        cat "$WORKDIR/link.txt"
+        echo "================================"
+    fi
+}
+
+# ================== 安装与配置修改 ==================
+download_and_run_mtg() {
+    local arch="amd64"
+    cmd=$(uname -m)
+    if [ "$cmd" == "386" ]; then arch="386"; fi
+    if [ "$cmd" == "arm" ]; then arch="arm"; fi
+    if [ "$cmd" == "aarch64" ]; then arch="arm64"; fi
+
     mkdir -p "$WORKDIR"
     pkill -9 mtg >/dev/null 2>&1
-    
-    purple "正在开始安装 MTProto 代理..."
 
-    # 端口选择
-    read -p "请输入你想使用的端口 (默认随机 10000-60000): " input_port
-    MTP_PORT=${input_port:-$(shuf -i 10000-60000 -n 1)}
-    echo "$MTP_PORT" > "$WORKDIR/.port"
-    
-    SERVER_IP=$(get_public_ip)
-    arch=$(get_arch)
-    
-    # 下载对应架构的 mtg
+    yellow_echo "正在下载 mtg 核心组件..."
     wget -q -O "${WORKDIR}/mtg" "https://github.com/whunt1/onekeymakemtg/raw/master/builds/ccbuilds/mtg-linux-$arch"
+    
     if [ ! -s "${WORKDIR}/mtg" ]; then
-        red "下载代理文件失败，请检查网络是否能访问 GitHub！"
-        exit 1
+        red_echo "下载核心失败，请检查网络！"
+        return 1
     fi
+    
     chmod +x "${WORKDIR}/mtg"
+    echo "$MTP_PORT" > "$WORKDIR/port.txt"
+    cd "$WORKDIR" || return
 
-    # === 自启服务配置 ===
-    if [ "$EUID" -eq 0 ]; then
-        # 1. Root 用户：使用标准系统 systemd 服务托管，最稳妥
-        cat > /etc/systemd/system/mtg.service <<EOF
-[Unit]
-Description=MTProto Go Proxy
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=$WORKDIR
-ExecStart=${WORKDIR}/mtg run -b 0.0.0.0:${MTP_PORT} ${SECRET} --stats-bind=127.0.0.1:${MTP_PORT}
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl enable mtg >/dev/null 2>&1
-        systemctl start mtg
-        green "已成功创建 Systemd 守护服务，配置开机自启！"
-    else
-        # 2. 非 Root 用户：降级采用 nohup 后台 + crontab 定时检查拉起
-        nohup "${WORKDIR}/mtg" run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$MTP_PORT >/dev/null 2>&1 &
-        
-        cat > "${WORKDIR}/keepalive.sh" <<EOF
+    # 运行服务并重定向日志
+    nohup ./mtg run -b 0.0.0.0:$MTP_PORT "$SECRET" --stats-bind=127.0.0.1:$((MTP_PORT + 1)) >> "$LOG_FILE" 2>&1 &
+    
+    # 创建守护/重启脚本
+    cat > "${WORKDIR}/restart.sh" <<EOF
 #!/bin/bash
-if ! pgrep -x "mtg" > /dev/null; then
-    nohup ${WORKDIR}/mtg run -b 0.0.0.0:${MTP_PORT} ${SECRET} --stats-bind=127.0.0.1:${MTP_PORT} >/dev/null 2>&1 &
-fi
+pkill -9 mtg >/dev/null 2>&1
+cd ${WORKDIR}
+nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$((MTP_PORT + 1)) >> ${LOG_FILE} 2>&1 &
 EOF
-        chmod +x "${WORKDIR}/keepalive.sh"
-        # 写入定时任务，每2分钟检查一次是否在线，并配置重启自启
-        (crontab -l 2>/dev/null | grep -v "keepalive.sh"; echo "*/2 * * * * ${WORKDIR}/keepalive.sh") | crontab -
-        (crontab -l 2>/dev/null | grep -v "@reboot"; echo "@reboot ${WORKDIR}/keepalive.sh") | crontab -
-        green "当前为非Root用户，已通过 Crontab 定时器配置开机自启与掉线保活！"
-    fi
-
-    # 保存连接信息到文件
-    LINKS="tg://proxy?server=${SERVER_IP}&port=${MTP_PORT}&secret=${SECRET}"
-    echo "$LINKS" > "${WORKDIR}/link.txt"
-    
-    show_info
+    chmod +x "${WORKDIR}/restart.sh"
+    return 0
 }
 
-# 显示配置信息
-show_info() {
-    if [ ! -f "${WORKDIR}/link.txt" ]; then
-        red "未发现安装记录或代理未运行。"
-        return
-    fi
-    purple "\n========== TG 代理分享链接 =========="
-    green "$(cat ${WORKDIR}/link.txt)"
-    purple "====================================="
-    if [ "$EUID" -eq 0 ]; then
-        yellow "提示: 代理运行在 Systemd 守护下，遭遇系统重启、崩溃时会自动拉起。"
+core_install() {
+    purple_echo "正在配置 MTProto 代理端口...\n"
+    
+    if [[ "$HOSTNAME" =~ mtp ]] || command -v devil &>/dev/null; then
+        check_devil_port
+        IP_LIST=($(devil vhost list | awk '/^[0-9]+/ {print $1}'))
+        IP1=${IP_LIST[0]:-$(get_public_ip)}
     else
-        yellow "提示: 代理运行在 Cron 守护下，遭遇系统重启后 2 分钟内会自动拉起。"
+        install_lsof
+        read -p "请输入 MTProto 代理端口 (回车使用随机端口): " user_port
+        [[ -z $user_port ]] && user_port=$(random_port)
+        MTP_PORT=$(check_vps_port "$user_port")
+        IP1=$(get_public_ip)
+    fi
+
+    if download_and_run_mtg; then
+        purple_echo "\n🎉 MTProto 安装/修改成功！"
+        LINKS="tg://proxy?server=$IP1&port=$MTP_PORT&secret=$SECRET"
+        green_echo "$LINKS\n"
+        echo -e "$LINKS" > "${WORKDIR}/link.txt"
+        
+        read -p "是否同时将代理加入开机自启（Crontab）？[Y/n]: " choice_cron
+        case "$choice_cron" in
+            [nN][oO]|[nN]) remove_cron ;;
+            *) set_cron ;;
+        esac
     fi
 }
 
-# 卸载逻辑
-uninstall_mtg() {
-    purple "正在卸载 MTProto 代理并清理自启任务..."
-    pkill -9 mtg >/dev/null 2>&1
-    
-    # 清理对应的自启服务/定时任务
-    if [ "$EUID" -eq 0 ]; then
-        systemctl stop mtg >/dev/null 2>&1
-        systemctl disable mtg >/dev/null 2>&1
-        rm -f /etc/systemd/system/mtg.service
-        systemctl daemon-reload
-    else
-        crontab -l 2>/dev/null | grep -v "keepalive.sh" | crontab -
-    fi
-    
-    rm -rf "$WORKDIR"
-    green "卸载完成！所有相关文件及自启配置已清除干净。"
-}
-
-# 交互菜单
-menu() {
+# ================== 主菜单循环 ==================
+while true; do
     clear
-    purple "========================================="
-    purple "     MTProto (mtg) 一键安装/管理脚本      "
-    purple "========================================="
-    echo -e " 1. \e[1;32m安装 MTProto 代理 (配置开机自启)\033[0m"
-    echo -e " 2. \e[1;31m完整卸载代理 (清理文件及自启配置)\033[0m"
-    echo -e " 3. \e[1;36m查看当前代理连接链接\033[0m"
-    echo -e " 4. 退出脚本"
-    purple "========================================="
-    read -p "请输入数字选择功能 [1-4]: " num
-    case "$num" in
-        1) install_mtg ;;
-        2) uninstall_mtg ;;
-        3) show_info ;;
-        4) exit 0 ;;
-        *) red "输入错误，请输入正确数字！"; sleep 2; menu ;;
-    esac
-}
+    # 状态与端口动态获取
+    if pgrep -x mtg >/dev/null; then
+        status_display="${GREEN}正在运行${RESET}"
+    else
+        status_display="${RED}已停止${RESET}"
+    fi
+    
+    # 获取自启状态
+    if check_cron_status; then
+        cron_display="${GREEN}开机自启[已开启]${RESET}"
+    else
+        cron_display="${RED}开机自启[已关闭]${RESET}"
+    fi
 
-# 进入菜单
-menu
+    port_display=$(get_running_port)
+
+    # 打印精美面板样式
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}        MTProto Proxy 管理面板      ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} ${status_display}  (${cron_display})"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_display}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1.${RESET} 安装 MTProto Proxy"
+    echo -e "${GREEN}2.${RESET} 修改配置"
+    echo -e "${GREEN}3.${RESET} 卸载 MTProto Proxy"
+    echo -e "${GREEN}4.${RESET} 启动 MTProto Proxy"
+    echo -e "${GREEN}5.${RESET} 停止 MTProto Proxy"
+    echo -e "${GREEN}6.${RESET} 重启 MTProto Proxy"
+    echo -e "${GREEN}7.${RESET} 查看日志"
+    echo -e "${GREEN}8.${RESET} 查看连接配置"
+    echo -e "${GREEN}0.${RESET} 退出"
+    echo -e "${GREEN}================================${RESET}"
+    read -p "$(echo -e ${GREEN}请选择:${RESET} )" choice
+
+    case $choice in
+        1|2)
+            clear; core_install; read -p "按回车返回菜单..." ;;
+        3)
+            clear
+            stop_proxy; remove_cron; rm -rf "$WORKDIR"
+            clear; red_echo "MTProto 已彻底从系统中卸载！"; read -p "按回车返回菜单..." ;;
+        4)
+            clear; start_proxy; read -p "按回车返回菜单..." ;;
+        5)
+            clear; stop_proxy; read -p "按回车返回菜单..." ;;
+        6)
+            clear; stop_proxy; sleep 1; start_proxy; read -p "按回车返回菜单..." ;;
+        7)
+            clear
+            if [ -f "$LOG_FILE" ]; then
+                purple_echo "=== 正在查看最新 50 行运行日志 ==="
+                tail -n 50 "$LOG_FILE"
+                echo "=================================="
+            else
+                yellow_echo "暂无日志文件。"
+            fi
+            read -p "按回车返回菜单..." ;;
+        8)
+            clear; show_config; read -p "按回车返回菜单..." ;;
+        0)
+            exit 0 ;;
+        *)
+            red_echo "无效输入！" ; sleep 1 ;;
+    esac
+done

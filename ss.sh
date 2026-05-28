@@ -14,7 +14,7 @@ Tip="${YELLOW}[提示]${NC}"
 cop_info(){
 clear
 echo -e "${GREEN}######################################
-            DDNS 管理        
+      DDNS 管理(快捷指令:ddns)        
 ######################################${NC}"
 echo
 }
@@ -65,7 +65,7 @@ check_curl() {
 # 返回菜单公共函数
 back_to_menu() {
     echo
-    read -rp "按 [回车键] 返回主菜单..."
+    read -rp "按回车键返回菜单..."
 }
 
 # 开始安装DDNS
@@ -148,19 +148,37 @@ if [ "$ipv6_set" = "true" ]; then
 fi
 
 send_telegram_notification() {
-    local message=""
-    for domain in "${Domains[@]}"; do message+="$domain "; done
-    message+="IPv4更新 $Old_Public_IPv4 🔜 $Public_IPv4 。"
+    # 格式化当前时间
+    local current_time=$(date "+%Y-%m-%d %H:%M:%S")
+    
+    # 组装消息头部
+    local message="🚀 <b>Cloudflare DDNS IP 变动提示</b>\n\n"
 
-    if [ "$ipv6_set" == "true" ]; then
-        if [ "${Domains[*]}" != "${Domainsv6[*]}" ]; then
-            for domainv6 in "${Domainsv6[@]}"; do message+="$domainv6 "; done
-        fi
-        message+="IPv6更新 $Old_Public_IPv6 🔜 $Public_IPv6 。"
+    # IPv4 部分
+    if [[ -n "$Public_IPv4" && "$Public_IPv4" != "$Old_Public_IPv4" ]]; then
+        message+="📌 <b>IPv4 域名:</b>\n"
+        for domain in "${Domains[@]}"; do
+            message+="<code>$domain</code>\n"
+        done
+        message+="🔄 <b>最新 IP:</b> <code>$Public_IPv4</code>\n\n"
     fi
 
+    # IPv6 部分
+    if [[ "$ipv6_set" == "true" && -n "$Public_IPv6" && "$Public_IPv6" != "$Old_Public_IPv6" ]]; then
+        message+="📌 <b>IPv6 域名:</b>\n"
+        for domainv6 in "${Domainsv6[@]}"; do
+            message+="<code>$domainv6</code>\n"
+        done
+        message+="🔄 <b>最新 IP:</b> <code>$Public_IPv6</code>\n\n"
+    fi
+
+    # 消息尾部
+    message+="⏰ <b>检查时间:</b> $current_time"
+
+    # 发送请求
     curl -s -X POST "https://api.telegram.org/bot$Telegram_Bot_Token/sendMessage" \
         -d "chat_id=$Telegram_Chat_ID" \
+        -d "parse_mode=HTML" \
         -d "text=$message"
 }
 
@@ -321,7 +339,7 @@ go_ahead(){
                     rm -rf /etc/systemd/system/ddns.service /etc/systemd/system/ddns.timer /etc/DDNS /usr/bin/ddns
                 fi
                 echo -e "${Info}DDNS 已卸载！"
-                back_to_menu
+                exit 0
             ;;
             4)
                 set_domain
@@ -365,7 +383,7 @@ set_cloudflare_api(){
     echo -e "${Info}你的邮箱：${RED_ground}${EMail}${NC}"
     echo
 
-    read -rp "请输入您的Cloudflare API(GlobalAPIKey)密钥: " Api_Key
+    read -rp "请输入您的Cloudflare(Global API Key)密钥: " Api_Key
     if [ -z "$Api_Key" ]; then
         echo -e "${Error}未输入密钥，操作取消。"
         return 1
@@ -377,13 +395,13 @@ set_cloudflare_api(){
     sed -i "s|^Api_key=.*|Api_key=\"${Api_Key}\"|g" /etc/DDNS/.config
 }
 
-# 设置解析的域名
+
 # 设置解析的域名
 set_domain() {
     ipv4_check=$(curl -s -4 ip.sb || true)
     if [ -n "$ipv4_check" ]; then
         echo -e "${Info}检测到IPv4地址: ${ipv4_check}"
-        read -rp "请输入IPv4域名（例如:dns4.888.xyz，回车跳过）: " Domain_input
+        read -rp "请输入IPv4域名（例如:v4.888.xyz，回车跳过）: " Domain_input
         if [ -n "$Domain_input" ]; then
             Domain_input="${Domain_input//，/,}"
             IFS=',' read -ra Domains_arr <<< "$Domain_input"
@@ -398,15 +416,15 @@ set_domain() {
     ipv6_check=$(curl -s -6 ip.sb || true)
     if [ -n "$ipv6_check" ]; then
         echo -e "${Info}检测到IPv6地址: ${ipv6_check}"
-        read -rp "是否开启 IPv6 解析？(y/n): " enable_ipv6
+        read -rp "是否开启 IPv6 解析？(y/n，回车跳过): " enable_ipv6
         if [[ "$enable_ipv6" =~ ^[Yy]$ ]]; then
             sed -i 's/^ipv6_set=.*/ipv6_set="true"/g' /etc/DDNS/.config
-            read -rp "请输入IPv6域名（例如:dns6.888.xyz，回车跳过）: " Domainv6_input
+            read -rp "请输入IPv6域名（例如:v6.888.xyz，回车跳过）: " Domainv6_input
             if [ -n "$Domainv6_input" ]; then
                 Domainv6_input="${Domainv6_input//，/,}"
                 IFS=',' read -ra Domainsv6_arr <<< "$Domainv6_input"
-                local formatted_domains_v6="" # 修复：把 - 改为 _
-                for d in "${Domainsv6_arr[@]}"; do formatted_domains_v6+="\"$d\" "; done # 修复：把 - 改为 _
+                local formatted_domains_v6="" 
+                for d in "${Domainsv6_arr[@]}"; do formatted_domains_v6+="\"$d\" "; done 
                 sed -i "s|^Domainsv6=.*|Domainsv6=($formatted_domains_v6)|" /etc/DDNS/.config
                 echo -e "${Info}已保存IPv6域名: ${RED_ground}${Domainsv6_arr[*]}${NC}"
             fi
@@ -523,7 +541,7 @@ show_service_detail() {
     if grep -qiE "alpine" /etc/os-release; then
         echo -en "Cron 任务: "
         if crontab -l | grep -q "/etc/DDNS/DDNS"; then
-            echo -e "${GREEN}运行中 (Cron)${NC}"
+            echo -e "${GREEN}运行中${NC}"
             crontab -l | grep "/etc/DDNS/DDNS"
         else
             echo -e "${RED}未在计划任务中${NC}"
@@ -531,8 +549,7 @@ show_service_detail() {
     else
         echo -en "Systemd 状态: "
         if systemctl is-active --quiet ddns.timer; then
-            echo -e "${GREEN}活动中 (Timer)${NC}"
-            echo -e "下次运行时间: $(systemctl list-timers | grep ddns.timer | awk '{print $1,$2}')"
+            echo -e "${GREEN}运行中${NC}"
         else
             echo -e "${RED}已停止${NC}"
         fi

@@ -1,18 +1,31 @@
 #!/usr/bin/env bash
-# ====================================================================
-# NaiveProxy 官方原生双进程架构 (Caddy + Naive) 一体化安装与管理面板
+#
+# Sing-box (NaiveProxy) 管理面板 
 # SPDX-License-Identifier: MIT
-# ====================================================================
+#
+# =========================================================
+# 1. 核心控制与全局环境初始化
+# =========================================================
 set -Eop pipefail
 export LANG=en_US.UTF-8
 
-# 核心路径 hardcoded 规范
-NAIVE_VERSION="122.0.6261.94-1"
-NAIVE_CONFIG_DIR="/etc/naive"
-CADDY_CONFIG_DIR="/etc/caddy"
-CADDY_CONFIG_FILE="/etc/caddy/Caddyfile"
-WEB_WWW_DIR="/var/www/html"
+# 基础目录与硬编码配置
+readonly SB_CONFIG="/etc/sing-box/config.json"
+readonly SB_BINARY="/usr/local/bin/sing-box"
+readonly SB_DIR="/root/sb_node"
+EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
+SYSTEMD_SERVICES_DIR="/etc/systemd/system"
+CONFIG_DIR="/etc/sing-box"
+REPO_URL="https://github.com/SagerNet/sing-box"
+API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
+CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
 
+# 自动检测环境变量
+PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
+OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
+ARCHITECTURE="${ARCHITECTURE:-}"
+
+# 终端颜色代码
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
@@ -20,214 +33,537 @@ BLUE="\033[34m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
+# =========================================================
+# 2. 官方原生底层工具函数
+# =========================================================
+has_command() {
+  local _command=$1
+  type -P "$_command" > /dev/null 2>&1
+}
+
+curl() {
+  command curl "${CURL_FLAGS[@]}" "$@"
+}
+
+mktemp() {
+  command mktemp "$@" "sbservinst.XXXXXXXXXX"
+}
+
 info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
 warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
 error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
 pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
 
-generate_random_password() {
-    dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-12
+systemctl() {
+  if ! has_command systemctl; then
+    warn "当前系统不支持 systemd，忽略守护进程操作: systemctl $*"
+    return 0
+  fi
+  command systemctl "$@"
+}
+
+install_content() {
+  local _install_flags="$1"
+  local _content="$2"
+  local _destination="$3"
+  local _overwrite="$4"
+  local _tmpfile="$(mktemp)"
+
+  echo -ne "安装 $_destination ... "
+  echo "$_content" > "$_tmpfile"
+  if [[ -z "$_overwrite" && -e "$_destination" ]]; then
+    echo -e "已存在"
+  elif install "$_install_flags" "$_tmpfile" "$_destination"; then
+    echo -e "完成"
+  fi
+  rm -f "$_tmpfile"
+}
+
+remove_file() {
+  local _target="$1"
+  echo -ne "移除 $_target ... "
+  if rm -f "$_target"; then
+    echo -e "完成"
+  fi
+}
+
+detect_package_manager() {
+  [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
+  has_command apt && PACKAGE_MANAGEMENT_INSTALL='apt -y --no-install-recommends install' && return 0
+  has_command dnf && PACKAGE_MANAGEMENT_INSTALL='dnf -y install' && return 0
+  has_command yum && PACKAGE_MANAGEMENT_INSTALL='yum -y install' && return 0
+  has_command apk && PACKAGE_MANAGEMENT_INSTALL='apk add --no-cache' && return 0
+  return 1
+}
+
+install_software() {
+  local _package_name="$1"
+  if ! detect_package_manager; then
+    error "未检测到支持的包管理器，请手动安装 $_package_name"
+    exit 65
+  fi
+  echo "正在安装缺失的依赖 '$_package_name' ... "
+  if $PACKAGE_MANAGEMENT_INSTALL "$_package_name" >/dev/null 2>&1; then
+    echo "依赖安装成功"
+  else
+    error "无法通过包管理器安装 '$_package_name'，请手动安装。"
+    exit 65
+  fi
 }
 
 check_environment() {
-    [[ $EUID -ne 0 ]] && { error "请切换至 root 用户运行此脚本"; exit 1; }
-    apt update -y >/dev/null 2>&1
-    apt install -y libnss3 xz-utils curl wget vim libcap2-bin >/dev/null 2>&1
-    
-    ARCH=$(uname -m)
-    if [[ "$ARCH" == "x86_64" ]]; then
-        ARCH_TAG="amd64"
-        NAIVE_ARCH="linux-x64"
-    elif [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
-        ARCH_TAG="arm64"
-        NAIVE_ARCH="linux-arm64"
-    else
-        error "❌ 不支持的系统架构：$ARCH"; exit 1
-    fi
+  if [[ "x$(uname)" == "xLinux" ]]; then
+    OPERATING_SYSTEM=linux
+  else
+    error "本脚本仅支持 Linux 系统。"
+    exit 95
+  fi
+
+  case "$(uname -m)" in
+    'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
+    'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
+    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
+  esac
+
+  has_command curl || install_software curl
+  has_command grep || install_software grep
+  has_command jq || install_software jq
+  has_command tar || install_software tar
 }
 
-get_service_status() {
-    if systemctl is-active --quiet "$1" 2>/dev/null; then
-        echo -e "${GREEN}运行中${RESET}"
+get_installed_version() {
+  if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
+    local version_out
+    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null || echo "")
+    if [[ -n "$version_out" ]]; then
+      echo "$version_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' | head -n 1 || echo "未知格式"
     else
-        echo -e "${RED}未运行${RESET}"
+      echo "未知版本"
     fi
+  else
+    echo "未安装"
+  fi
 }
 
-get_current_domain_port() {
-    if [[ -f "$CADDY_CONFIG_FILE" ]]; then
-        local line
-        line=$(grep -oE '^[^{[:space:]]+' "$CADDY_CONFIG_FILE" | head -n 1 || echo "")
-        echo -e "${YELLOW}${line}${RESET}"
-    else
-        echo -e "${RED}未配置${RESET}"
-    fi
+get_latest_version() {
+  local _tmpfile=$(mktemp)
+  if ! curl -sS -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases" -o "$_tmpfile"; then
+    rm -f "$_tmpfile"
+    return
+  fi
+  # 剔除预览版，抓取最新的稳定版本号
+  local _tag_name=$(jq -r '[.[] | select(.prerelease==false and .draft==false)][0].tag_name' "$_tmpfile" 2>/dev/null || echo "")
+  rm -f "$_tmpfile"
+  
+  if [[ -n "$_tag_name" ]]; then
+    echo "${_tag_name##*\/}"
+  else
+    echo "v1.12.3" # 保底稳定版
+  fi
 }
 
-install_naive_official() {
-    check_environment
-    info "正在下载官方 NaiveProxy 核心程序..."
-    local naive_url="https://github.com/klzgrad/naiveproxy/releases/download/v${NAIVE_VERSION}/naiveproxy-v${NAIVE_VERSION}-${NAIVE_ARCH}.tar.xz"
-    local dir_name="naiveproxy-v${NAIVE_VERSION}-${NAIVE_ARCH}"
-    
-    cd /root
-    wget -q --show-progress -O naive_server.tar.xz "$naive_url"
-    tar -xf naive_server.tar.xz
-    chmod +x "${dir_name}/naive"
-    cp "${dir_name}/naive" /usr/local/bin/
-    rm -rf naive_server.tar.xz "$dir_name"
+download_singbox() {
+  local _version="$1"
+  local _destination="$2"
+  local _ver_num="${_version#v}"
+  
+  # 拼接官方标准的压缩包下载链接
+  local _download_url="$REPO_URL/releases/download/$_version/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE.tar.gz"
+  
+  info "正在下载官方 Sing-box 核心组件: $_download_url ..."
+  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
+    error "核心下载失败！请检查您的网络连接。"
+    return 11
+  fi
+  return 0
+}
 
-    info "正在下载集成 ForwardProxy 插件的定制版 Caddy 内核..."
-    local caddy_url="https://github.com/passeway/naiveproxy/releases/latest/download/caddy-linux-${ARCH_TAG}"
-    wget -q --show-progress -O /usr/bin/caddy "$caddy_url"
-    chmod +x /usr/bin/caddy
-    setcap cap_net_bind_service=+ep /usr/bin/caddy
+tpl_singbox_server_service_base() {
+  cat << EOF
+[Unit]
+Description=sing-box service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target network-online.target
 
-    echo "------------------------------------------------"
-    read -rp "1. 请输入您的解析域名 (例如 vvcxa.vfz.dpdns.org): " DOMAIN
-    [[ -z "$DOMAIN" ]] && { error "域名不能为空！"; return 1; }
-    read -rp "2. 请输入对外客户端连接端口 [默认 443]: " PORT
-    PORT=${PORT:-443}
-    read -rp "3. 请输入验证用户名 [默认 admin]: " USERNAME
-    USERNAME=${USERNAME:-"admin"}
-    read -rp "4. 请输入验证密码 [留空随机生成强密码]: " PASSWORD
-    PASSWORD=${PASSWORD:-$(generate_random_password)}
-    echo "------------------------------------------------"
+[Service]
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+ExecStart=$EXECUTABLE_INSTALL_PATH run -c $SB_CONFIG
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=infinity
 
-    # 建立经典 Nginx 样式伪装网站
-    mkdir -p "$WEB_WWW_DIR"
-    echo "<h1>Welcome to nginx!</h1>" > "${WEB_WWW_DIR}/index.html"
+[Install]
+WantedBy=multi-user.target
+EOF
+}
 
-    # 注入 Naive 内部监听配置
-    mkdir -p "$NAIVE_CONFIG_DIR"
-    cat << EOF > "$NAIVE_CONFIG_DIR/config.json"
+# =========================================================
+# 3. 面板辅助网络与配置扩展函数
+# =========================================================
+get_sb_status() {
+  if has_command systemctl && systemctl is-active --quiet sing-box 2>/dev/null; then
+    echo -e "${GREEN}● 运行中${RESET}"
+  else
+    if pgrep -f "$EXECUTABLE_INSTALL_PATH run" >/dev/null 2>&1; then
+      echo -e "${GREEN}● 运行中 (Pidmode)${RESET}"
+    else
+      echo -e "${RED}● 未运行${RESET}"
+    fi
+  fi
+}
+
+get_current_domain_display() {
+  if [[ -f "$SB_CONFIG" ]]; then
+    local domain
+    domain=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || echo "")
+    echo "${domain:- -}"
+  else echo "-"; fi
+}
+
+# =========================================================
+# 4. 面板核心交互与配置文件处理
+# =========================================================
+write_and_show_config() {
+  mkdir -p "$CONFIG_DIR"
+
+  # 直接利用内联 Shell 变量安全写入 JSON，免去脆弱的 sed 替换逻辑
+  cat << EOF > "$SB_CONFIG"
 {
-  "listen": "https://127.0.0.1:8080",
-  "padding": true
-}
-EOF
-
-    # 注入 Caddyfile 规则
-    mkdir -p "$CADDY_CONFIG_DIR"
-    local caddy_listen="$DOMAIN"
-    [[ "$PORT" != "443" ]] && caddy_listen="$DOMAIN:$PORT"
-
-    cat << EOF > "$CADDY_CONFIG_FILE"
-$caddy_listen {
-    tls admin@gmail.com {
-        protocols tls1.3
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
+    {
+      "type": "naive",
+      "tag": "naive-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [
+        {
+          "username": "${sb_username}",
+          "password": "${sb_password}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${sb_domain}",
+        "acme": {
+          "domain": ["${sb_domain}"],
+          "email": "${sb_email}"
+        }
+      }
     }
-    forward_proxy {
-        basic_auth $USERNAME $PASSWORD
-        hide_ip
-        hide_via
-        probe_resistance
-        upstream https://127.0.0.1:8080
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
     }
-    root * $WEB_WWW_DIR
-    file_server
+  ]
 }
 EOF
 
-    # 注册 SystemD 守护文件
-    cat << 'EOF' > /etc/systemd/system/naive.service
-[Unit]
-Description=NaiveProxy Server Service
-After=network-online.target
+  # 生成客户端配置备份与分享链接
+  mkdir -p "$SB_DIR"
+  
+  # 对节点名进行简易防冲突处理
+  local encoded_node_name=$(curl -s -o /dev/null -w %{url_effective} --url-query "x=${sb_node_name}" "" | sed 's/^.*x=//')
+  local share_link="http2://${sb_username}:${sb_password}@${sb_domain}:443#${encoded_node_name}"
 
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/local/bin/naive /etc/naive/config.json
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
+  cat << EOF > "$SB_DIR/url.txt"
+Flowz / Shadowrocket 订阅分享链接:
+${share_link}
 EOF
 
-    cat << 'EOF' > /etc/systemd/system/caddy.service
-[Unit]
-Description=Caddy ForwardProxy Gateway
-After=network-online.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile
-ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --force
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
+  # 保存当前输入参数供日后“不修改回车”读取
+  cat << EOF > "$SB_DIR/meta.env"
+sb_domain="${sb_domain}"
+sb_email="${sb_email}"
+sb_username="${sb_username}"
+sb_password="${sb_password}"
+sb_node_name="${sb_node_name}"
 EOF
 
+  # 控制权移交及运行守护
+  if has_command systemctl; then
     systemctl daemon-reload
-    systemctl enable naive caddy
-    systemctl restart naive caddy
-
-    info "🎉 官方解耦双进程版架构安装成功！"
-    echo -e "分享链接:\n${CYAN}naive://${USERNAME}:${PASSWORD}@${DOMAIN}:${PORT}?padding=true#Native-Official${RESET}"
-}
-
-uninstall_all() {
-    systemctl stop naive caddy >/dev/null 2>&1 || true
-    systemctl disable naive caddy >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/naive.service /etc/systemd/system/caddy.service
-    systemctl daemon-reload
-    rm -f /usr/local/bin/naive /usr/bin/caddy
-    rm -rf "$NAIVE_CONFIG_DIR" "$CADDY_CONFIG_DIR" "$WEB_WWW_DIR"
-    info "解耦版 NaiveProxy 及其环境已彻底从您的 VPS 中卸载清理！"
-}
-
-show_client_config() {
-    if [[ -f "$CADDY_CONFIG_FILE" ]]; then
-        echo -e "${GREEN}====== 核心联动的 Caddy 路由规则 ======${RESET}"
-        cat "$CADDY_CONFIG_FILE"
-        echo "------------------------------------------------"
-        warn "提示: 请直接在本地 v2rayN/小火箭/NekoBox 中新建本地 Naive/HTTP 节点"
-        warn "对照上述配置中提取出的 域名、端口、用户名(basic_auth)和密码 进行绑定"
-    else
-        error "未检测到有效的 Caddyfile 配置文件，请先执行安装！"
-    fi
-}
-
-# =========================================================
-# 面板无限循环主菜单
-# =========================================================
-while true; do
-    clear
-    echo -e "${GREEN}==================================================${RESET}"
-    echo -e "${GREEN}      NaiveProxy (官方解耦原生版) 综合管理面板     ${RESET}"
-    echo -e "${GREEN}==================================================${RESET}"
-    echo -e "${GREEN}1. Naive 核心进程状态  :${RESET} $(get_service_status naive)"
-    echo -e "${GREEN}2. Caddy 证书网关状态  :${RESET} $(get_service_status caddy)"
-    echo -e "${GREEN}3. 当前服务端连接入口  :${RESET} $(get_current_domain_port)"
-    echo -e "${GREEN}==================================================${RESET}"
-    echo -e "  ${CYAN}1. 干净安装 NaiveProxy 官方原生系统${RESET}"
-    echo -e "  ${CYAN}2. 启动所有双进程服务${RESET}"
-    echo -e "  ${CYAN}3. 停止所有双进程服务${RESET}"
-    echo -e "  ${CYAN}4. 一键重启双进程系统 (重新热加载配置/证书)${RESET}"
-    echo -e "  ${CYAN}5. 查看 Caddy 前端网关实时日志 (排查网络流向)${RESET}"
-    echo -e "  ${CYAN}6. 查看 Naive 后端核心真实日志 (排查握手解密)${RESET}"
-    echo -e "  ${CYAN}7. 调取核心配置参数与排查向导${RESET}"
-    echo -e "  ${RED}8. 彻底卸载清理 NaiveProxy 系统${RESET}"
-    echo -e "  ${YELLOW}0. 退出管理控制台${RESET}"
-    echo -e "${GREEN}==================================================${RESET}"
+    systemctl enable sing-box >/dev/null 2>&1 || true
+    systemctl restart sing-box >/dev/null 2>&1 || true
     
-    read -r -p "请输入对应的业务操作代号 [0-8]: " opt || true
-    case "$opt" in
-        1) install_naive_official; pause ;;
-        2) systemctl start naive caddy; info "双服务挂载指令已激活！"; sleep 1 ;;
-        3) systemctl stop naive caddy; warn "服务已全部离线！"; sleep 1 ;;
-        4) systemctl restart naive caddy; info "双子系统已执行全局热重启！"; sleep 1 ;;
-        5) echo -e "${GREEN}正在对接 Caddy 系统流日志 (Ctrl+C 挂断)...${RESET}"; journalctl -u caddy.service -f -n 50 --no-pager || true; pause ;;
-        6) echo -e "${GREEN}正在对接 Naive 核心环流日志 (Ctrl+C 挂断)...${RESET}"; journalctl -u naive.service -f -n 50 --no-pager || true; pause ;;
-        7) show_client_config; pause ;;
-        8) read -r -p "确认要彻底清空服务器上该节点的一切数据吗？(y/n): " confirm
-           [[ "$confirm" == "y" || "$confirm" == "Y" ]] && uninstall_all; pause ;;
-        0) exit 0 ;;
-        *) error "选项无效，请输入 0 至 8 之间的数字！"; sleep 1 ;;
+    if systemctl is-active --quiet sing-box 2>/dev/null; then
+      info "Sing-box 服务配置并启动成功！"
+    else
+      error "Sing-box 服务启动失败，请运行 'journalctl -u sing-box -f' 查看错误日志。"
+    fi
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+    "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
+    info "非 systemd 环境，程序已挂载至后台 Pid 进程池中运行。"
+  fi
+  showconf
+}
+
+# =========================================================
+# 5. 主流程控制模块与更新功能
+# =========================================================
+inst_singbox() {
+  check_environment
+  
+  info "🧹 正在释放 80 和 443 端口以防冲突..."
+  systemctl stop caddy nginx apache2 sing-box 2>/dev/null || true
+
+  info "获取官方最新发布版本中..."
+  local latest_version=$(get_latest_version)
+  
+  local _tmpfile_tar=$(mktemp)
+  if ! download_singbox "$latest_version" "$_tmpfile_tar"; then
+    rm -f "$_tmpfile_tar" && return 1
+  fi
+
+  echo -ne "正在解压并安装二进制可执行文件 ... "
+  local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
+  tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
+  
+  local _ver_num="${latest_version#v}"
+  if install -Dm755 "$_tmpdir_extract/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE/sing-box" "$EXECUTABLE_INSTALL_PATH"; then
+    echo "成功"
+  else
+    rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "安装失败" && return 1
+  fi
+  rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
+
+  if has_command systemctl; then
+    install_content -Dm644 "$(tpl_singbox_server_service_base)" "$SYSTEMD_SERVICES_DIR/sing-box.service" "1"
+  fi
+
+  echo "---------------------------------------------"
+  read -rp "👉 请输入解析好的域名 (例如: naive.example.com): " sb_domain
+  [[ -z "$sb_domain" ]] && error "域名不能为空！" && return 1
+
+  read -rp "👉 请输入你的邮箱 (用于 ACME 自动申请证书): " sb_email
+  [[ -z "$sb_email" ]] && error "邮箱不能为空！" && return 1
+
+  read -rp "👉 请设置 NaiveProxy 用户名 (默认: user123): " sb_username
+  sb_username=${sb_username:-"user123"}
+
+  read -rp "👉 请设置 NaiveProxy 密码 (默认: pass123): " sb_password
+  sb_password=${sb_password:-"pass123"}
+
+  read -rp "👉 请给这个节点起个名字 (默认: NaiveProxy): " sb_node_name
+  sb_node_name=${sb_node_name:-"NaiveProxy"}
+
+  write_and_show_config
+}
+
+update_singbox() {
+  if [[ ! -f "$SB_BINARY" ]]; then
+    error "当前系统未安装 Sing-box，无法执行更新。"
+    return 1
+  fi
+
+  info "正在检查新版本..."
+  local current_version=$(get_installed_version)
+  local latest_version=$(get_latest_version)
+
+  info "当前安装版本: ${YELLOW}${current_version}${RESET}"
+  info "官方最新版本: ${GREEN}${latest_version}${RESET}"
+
+  if [[ "$current_version" == *"$latest_version"* || "$latest_version" == *"$current_version"* ]]; then
+    info "您当前已经是最新版本，无需更新。"
+    return 0
+  fi
+
+  warn "检测到新版本，即将开始平滑更新 (你的节点配置不会改变)..."
+  
+  local _tmpfile_tar=$(mktemp)
+  if ! download_singbox "$latest_version" "$_tmpfile_tar"; then
+    rm -f "$_tmpfile_tar" && return 1
+  fi
+
+  echo -ne "正在覆盖二进制核心文件 ... "
+  local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
+  tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
+  
+  local _ver_num="${latest_version#v}"
+  if install -Dm755 "$_tmpdir_extract/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE/sing-box" "$EXECUTABLE_INSTALL_PATH"; then
+    echo "成功"
+  else
+    rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "覆盖核心失败" && return 1
+  fi
+  rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
+
+  info "正在重启 Sing-box 服务以应用更新..."
+  if has_command systemctl; then
+    systemctl daemon-reload
+    systemctl restart sing-box >/dev/null 2>&1 || true
+    if systemctl is-active --quiet sing-box 2>/dev/null; then
+      info "Sing-box 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
+    else
+      error "核心更新成功，但服务重启失败，请运行 'journalctl -u sing-box -f' 检查错误。"
+    fi
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+    "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
+    info "Sing-box 核心已更新并于后台重启运行。"
+  fi
+}
+
+uninstall_singbox() {
+  warn "即将从当前系统中彻底卸载 Sing-box (NaiveProxy)"
+  read -rp "确定要彻底卸载吗？[y/N]: " confirm
+  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+    info "已取消卸载。"
+    return 0
+  fi
+
+  if has_command systemctl; then
+    systemctl stop sing-box >/dev/null 2>&1 || true
+    systemctl disable sing-box >/dev/null 2>&1 || true
+    remove_file "$SYSTEMD_SERVICES_DIR/sing-box.service"
+    systemctl daemon-reload
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+  fi
+  
+  remove_file "$EXECUTABLE_INSTALL_PATH"
+  rm -rf /etc/sing-box "$SB_DIR"
+
+  info "Sing-box 已彻底从您的系统中移除！"
+}
+
+changeconf() {
+  if [[ ! -f "$SB_CONFIG" ]]; then
+    error "配置文件不存在，请先安装 Sing-box"
+    return 1
+  fi
+
+  # 载入上次保存的配置元数据
+  if [[ -f "$SB_DIR/meta.env" ]]; then
+    source "$SB_DIR/meta.env"
+  else
+    sb_domain=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG")
+    sb_email=$(jq -r '.inbounds[0].tls.acme.email' "$SB_CONFIG")
+    sb_username=$(jq -r '.inbounds[0].users[0].username' "$SB_CONFIG")
+    sb_password=$(jq -r '.inbounds[0].users[0].password' "$SB_CONFIG")
+    sb_node_name="NaiveProxy"
+  fi
+
+  clear
+  echo -e "${GREEN}====== 修改 Sing-box Naive 配置 ======${RESET}"
+  echo "提示：直接敲回车将保持原有配置不变"
+  echo "---------------------------------------------"
+  
+  local input_domain input_email input_user input_pass input_name
+
+  read -rp "👉 请输入解析好的域名 [当前: ${sb_domain}]: " input_domain
+  sb_domain=${input_domain:-$sb_domain}
+
+  read -rp "👉 请输入你的邮箱 [当前: ${sb_email}]: " input_email
+  sb_email=${input_email:-$sb_email}
+
+  read -rp "👉 请设置 NaiveProxy 用户名 [当前: ${sb_username}]: " input_user
+  sb_username=${input_user:-$sb_username}
+
+  read -rp "👉 请设置 NaiveProxy 密码 [当前: ${sb_password}]: " input_pass
+  sb_password=${input_pass:-$sb_password}
+
+  read -rp "👉 请给这个节点起个名字 [当前: ${sb_node_name}]: " input_name
+  sb_node_name=${input_name:-$sb_node_name}
+
+  write_and_show_config
+  info "配置修改并应用成功！"
+}
+
+showconf() {
+  if [[ ! -d "$SB_DIR" || ! -f "$SB_DIR/url.txt" ]]; then
+    error "未找到分享链接配置文件。"
+    return
+  fi
+  echo -e "${GREEN}====== 节点分享链接 ======${RESET}"
+  cat "$SB_DIR/url.txt"
+  echo
+}
+
+# =========================================================
+# 6. 面板主菜单
+# =========================================================
+menu() {
+  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
+  check_environment
+
+  while true; do
+    clear
+    local status=$(get_sb_status)
+    local version=$(get_installed_version)
+    local domain_show=$(get_current_domain_display)
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    Sing-box NaiveProxy 面板    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $status"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}域名   :${RESET} ${YELLOW}${domain_show}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装 Sing-box (Naive)${RESET}"
+    echo -e "${GREEN}2. 更新 Sing-box 核心${RESET}"
+    echo -e "${GREEN}3. 卸载 Sing-box (Naive)${RESET}"
+    echo -e "${GREEN}4. 修改节点配置${RESET}"
+    echo -e "${GREEN}5. 启动 Sing-box${RESET}"
+    echo -e "${GREEN}6. 停止 Sing-box${RESET}"
+    echo -e "${GREEN}7. 重启 Sing-box${RESET}"
+    echo -e "${GREEN}8. 查看申请证书日志${RESET}"
+    echo -e "${GREEN}9. 查看节点分享链接${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+
+    local choice=""
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+    [[ -z "$choice" ]] && continue
+
+    case "$choice" in
+      1) inst_box=inst_singbox; $inst_box; pause ;;
+      2) update_singbox; pause ;;
+      3) uninstall_singbox; pause ;;
+      4) changeconf; pause ;;
+      5) 
+        if has_command systemctl; then
+          systemctl start sing-box && info "服务已成功启动！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+          "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
+          info "进程已在后台启动！"
+        fi
+        pause ;;
+      6) 
+        if has_command systemctl; then
+          systemctl stop sing-box && info "服务已成功停止！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台进程已终止！"
+        fi
+        pause ;;
+      7) 
+        if has_command systemctl; then
+          systemctl restart sing-box && info "服务已成功重启！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+          "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
+          info "后台进程已重启！"
+        fi
+        pause ;;
+      8) 
+        if has_command systemctl; then
+          journalctl -u sing-box.service -n 50 --no-pager
+        else
+          warn "当前环境不支持 systemd 集中日志管理。"
+        fi
+        pause ;;
+      9) showconf; pause ;;
+      0) exit 0 ;;
+      *) error "无效输入，请重新选择。"; sleep 1 ;;
     esac
-done
+  done
+}
+
+menu "$@"

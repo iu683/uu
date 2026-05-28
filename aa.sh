@@ -1,32 +1,12 @@
-#!/usr/bin/env bash
-#
-# Sing-box (VMess + WS) 核心控制面板
-# SPDX-License-Identifier: MIT
-#
+#!/bin/bash
+
 # =========================================================
-# 1. 核心控制与全局环境初始化
+# Xray VLESS-HTTPUpgrade 管理脚本
 # =========================================================
-set -Eop pipefail
-export LANG=en_US.UTF-8
 
-# 基础目录与硬编码配置
-readonly SB_CONFIG="/etc/sing-box/config.json"
-readonly SB_BINARY="/usr/local/bin/sing-box"
-readonly SB_DIR="/root/sb_node"
-readonly STATE_FILE="/etc/vmessws-singbox.env"
-EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
-SYSTEMD_SERVICES_DIR="/etc/systemd/system"
-CONFIG_DIR="/etc/sing-box"
-REPO_URL="https://github.com/SagerNet/sing-box"
-API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
-CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
+set -Eeuo pipefail
 
-# 自动检测环境与动态变量池
-PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
-OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
-ARCHITECTURE="${ARCHITECTURE:-}"
-
-# 终端规范颜色代码
+# ================== 颜色 ==================
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
@@ -34,596 +14,588 @@ BLUE="\033[34m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-# =========================================================
-# 2. 官方原生底层工具函数
-# =========================================================
-has_command() {
-  local _command=$1
-  type -P "$_command" > /dev/null 2>&1
+# ================== 基础变量 ==================
+readonly SCRIPT_VERSION="1.2"
+
+readonly XRAY_CONFIG="/usr/local/etc/xray/config.json"
+readonly XRAY_BINARY="/usr/local/bin/xray"
+
+readonly INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
+
+TMP_DIR=$(mktemp -d -t xray.XXXXXX)
+
+# ================== cleanup ==================
+cleanup() {
+    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
 }
 
-curl() {
-  command curl "${CURL_FLAGS[@]}" "$@"
+trap cleanup EXIT INT TERM
+
+# ================== 日志 ==================
+info() {
+    echo -e "${GREEN}[信息] $*${RESET}" >&2
 }
 
-mktemp() {
-  command mktemp "$@" "sbservinst.XXXXXXXXXX"
+warn() {
+    echo -e "${YELLOW}[警告] $*${RESET}" >&2
 }
 
-info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
-error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
-pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
-
-systemctl() {
-  if ! has_command systemctl; then
-    warn "当前系统不支持 systemd，忽略守护进程操作: systemctl $*"
-    return 0
-  fi
-  command systemctl "$@"
+error() {
+    echo -e "${RED}[错误] $*${RESET}" >&2
 }
 
-install_content() {
-  local _install_flags="$1"
-  local _content="$2"
-  local _destination="$3"
-  local _overwrite="$4"
-  local _tmpfile="$(mktemp)"
-
-  echo -ne "安装 $_destination ... "
-  echo "$_content" > "$_tmpfile"
-  if [[ -z "$_overwrite" && -e "$_destination" ]]; then
-    echo -e "已存在"
-  else
-    mkdir -p "$(dirname "$_destination")"
-    if install "$_install_flags" "$_tmpfile" "$_destination"; then
-      echo -e "完成"
-    else
-      echo -e "失败"
-    fi
-  fi
-  rm -f "$_tmpfile"
+pause() {
+    read -n 1 -s -r -p "按任意键返回菜单..." || true
+    echo
 }
 
-remove_file() {
-  local _target="$1"
-  echo -ne "移除 $_target ... "
-  if rm -f "$_target"; then
-    echo -e "完成"
-  fi
-}
-
-detect_package_manager() {
-  [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
-  has_command apt && PACKAGE_MANAGEMENT_INSTALL='apt -y --no-install-recommends install' && return 0
-  has_command dnf && PACKAGE_MANAGEMENT_INSTALL='dnf -y install' && return 0
-  has_command yum && PACKAGE_MANAGEMENT_INSTALL='yum -y install' && return 0
-  has_command apk && PACKAGE_MANAGEMENT_INSTALL='apk add --no-cache' && return 0
-  return 1
-}
-
-install_software() {
-  local _package_name="$1"
-  if ! detect_package_manager; then
-    error "未检测到支持的包管理器，请手动安装 $_package_name"
-    exit 65
-  fi
-  echo "正在安装缺失的依赖 '$_package_name' ... "
-  if $PACKAGE_MANAGEMENT_INSTALL "$_package_name" >/dev/null 2>&1; then
-    echo "依赖安装成功"
-  else
-    error "无法通过包管理器安装 '$_package_name'，请手动安装。"
-    exit 65
-  fi
-}
-
-check_environment() {
-  if [[ "x$(uname)" == "xLinux" ]]; then
-    OPERATING_SYSTEM=linux
-  else
-    error "本脚本仅支持 Linux 系统。"
-    exit 95
-  fi
-
-  case "$(uname -m)" in
-    'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
-    'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
-    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
-  esac
-
-  has_command curl || install_software curl
-  has_command grep || install_software grep
-  has_command jq || install_software jq
-  has_command tar || install_software tar
-  has_command python3 || install_software python3
-}
-
-get_installed_version() {
-  if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
-    local version_out
-    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null || echo "")
-    if [[ -n "$version_out" ]]; then
-      echo "$version_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' | head -n 1 || echo "未知格式"
-    else
-      echo "未知版本"
-    fi
-  else
-    echo "未安装"
-  fi
-}
-
-get_latest_version() {
-  local _tmpfile=$(mktemp)
-  if ! curl -sS -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases" -o "$_tmpfile"; then
-    rm -f "$_tmpfile"
-    echo "v1.12.3"
-    return
-  fi
-  local _tag_name=$(jq -r '[.[] | select(.prerelease==false and .draft==false)][0].tag_name' "$_tmpfile" 2>/dev/null || echo "")
-  rm -f "$_tmpfile"
-  
-  if [[ -n "$_tag_name" ]]; then
-    echo "${_tag_name##*\/}"
-  else
-    echo "v1.12.3"
-  fi
-}
-
-download_singbox() {
-  local version="$1"
-  local dest_file="$2"
-  local ver_num="${version#v}"
-  local filename="sing-box-${ver_num}-${OPERATING_SYSTEM}-${ARCHITECTURE}.tar.gz"
-  local download_url="${REPO_URL}/releases/download/${version}/${filename}"
-
-  info "正在下载 Sing-box ${version} (${ARCHITECTURE}) ..."
-  if ! curl -sS "$download_url" -o "$dest_file"; then
-    error "下载失败，请检查网络连接或 GitHub 连通性。"
-    return 1
-  fi
-  return 0
-}
-
+# ================== 获取公网IP ==================
 get_public_ip() {
-  local ip=''
-  for url in https://api.ipify.org https://ip.sb https://checkip.amazonaws.com; do
-    ip=$(curl -4s --max-time 5 "$url" 2>/dev/null || true)
-    [[ -n "$ip" ]] && { echo "$ip"; return; }
-  done
-  hostname -I | awk '{print $1}'
+    local ip
+
+    for cmd in \
+        "curl -4fsSL --max-time 5" \
+        "wget -4qO- --timeout=5"; do
+
+        for url in \
+            "https://api.ipify.org" \
+            "https://ip.sb" \
+            "https://checkip.amazonaws.com"; do
+
+            ip=$($cmd "$url" 2>/dev/null || true)
+
+            if [[ -n "${ip:-}" ]]; then
+                echo "$ip"
+                return 0
+            fi
+        done
+    done
+
+    for cmd in \
+        "curl -6fsSL --max-time 5" \
+        "wget -6qO- --timeout=5"; do
+
+        for url in \
+            "https://api.ipify.org" \
+            "https://ipv6.ip.sb"; do
+
+            ip=$($cmd "$url" 2>/dev/null || true)
+
+            if [[ -n "${ip:-}" ]]; then
+                echo "$ip"
+                return 0
+            fi
+        done
+    done
+
+    return 1
 }
 
-tpl_singbox_server_service_base() {
-  cat << EOF
-[Unit]
-Description=sing-box service
-Documentation=https://sing-box.sagernet.org
-After=network.target nss-lookup.target network-online.target
+# ================== 检查端口占用 ==================
+check_port() {
+    local port="$1"
 
-[Service]
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-ExecStart=$EXECUTABLE_INSTALL_PATH run -c $SB_CONFIG
-ExecReload=/bin/kill -HUP \$MAINPID
-Restart=on-failure
-RestartSec=10s
-LimitNOFILE=infinity
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-# =========================================================
-# 3. 面板辅助网络与状态扩展函数
-# =========================================================
-get_sb_status() {
-  if has_command systemctl && systemctl is-active --quiet sing-box 2>/dev/null; then
-    echo -e "${GREEN}● 运行中${RESET}"
-  else
-    if pgrep -f "$EXECUTABLE_INSTALL_PATH run" >/dev/null 2>&1; then
-      echo -e "${GREEN}● 运行中 (Pidmode)${RESET}"
-    else
-      echo -e "${RED}● 未运行${RESET}"
+    if ss -tuln | awk '{print $5}' | grep -qE "[:.]${port}$"; then
+        return 1  # 被占用
     fi
-  fi
+
+    return 0  # 没有占用
 }
 
-get_current_port_display() {
-  if [[ -f "$SB_CONFIG" ]]; then
-    local port
-    port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "")
-    echo "${port:- -}"
-  else echo "-"; fi
+# ================== 验证端口格式 ==================
+is_valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] \
+        && [[ "$1" -ge 1 ]] \
+        && [[ "$1" -le 65535 ]]
 }
 
-# =========================================================
-# 4. 面板核心交互与配置文件处理
-# =========================================================
-write_and_show_config() {
-  mkdir -p "$CONFIG_DIR"
+# ================== 获取可用随机端口 ==================
+get_random_port() {
+    local rand_port
+    while true; do
+        rand_port=$((RANDOM % 55536 + 10000))
+        if check_port "$rand_port"; then
+            echo "$rand_port"
+            return 0
+        fi
+    done
+}
 
-  # 根据 host 变量是否为空构建 headers 里的 Host 项
-  local headers_json="{}"
-  if [[ -n "${WSHOST}" ]]; then
-    headers_json="{\"Host\": \"${WSHOST}\"}"
-  fi
+# ================== UUID验证 ==================
+is_valid_uuid() {
+    [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]
+}
 
-  # 【已修复】彻底移除 "alter_id": 0 废弃字段
-  cat << EOF > "$SB_CONFIG"
+# ================== 路径/宿主格式校验 ==================
+is_valid_path() {
+    [[ "$1" =~ ^\/[a-zA-Z0-9_\/\-\%]*$ ]]
+}
+
+is_valid_host() {
+    [[ -z "$1" ]] || [[ "$1" =~ ^([a-zA-Z0-9](-?[a-zA-Z0-9])*\.)+[A-Za-z]{2,}$ ]]
+}
+
+# ================== 下载官方安装脚本 ==================
+download_install_script() {
+    local file="$TMP_DIR/install.sh"
+
+    info "正在下载 Xray 安装脚本..."
+
+    if ! curl -fsSL "$INSTALL_SCRIPT_URL" -o "$file"; then
+        error "下载 Xray 安装脚本失败"
+        return 1
+    fi
+
+    chmod +x "$file"
+    echo "$file"
+}
+
+# ================== 获取Xray状态 ==================
+get_xray_status() {
+    if systemctl is-active --quiet xray 2>/dev/null; then
+        echo -e "${GREEN}● 运行中${RESET}"
+    else
+        echo -e "${RED}● 未运行${RESET}"
+    fi
+}
+
+# ================== 获取版本 ==================
+get_xray_version() {
+    if [[ -x "$XRAY_BINARY" ]]; then
+        "$XRAY_BINARY" version 2>/dev/null \
+            | grep -i "Xray" \
+            | head -n 1 \
+            | awk '{print $2}' || echo "未知"
+    else
+        echo "未安装"
+    fi
+}
+
+# ================== 获取监听地址 ==================
+get_listen_ip() {
+    if sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null \
+        | grep -q '= 1'; then
+        echo "0.0.0.0"
+    else
+        echo "::"
+    fi
+}
+
+# ================== 测试配置 ==================
+test_config() {
+    if "$XRAY_BINARY" run -test -config "$XRAY_CONFIG"; then
+        info "配置检查无误 (Configuration OK)"
+        return 0
+    fi
+
+    error "配置测试失败"
+    return 1
+}
+
+# ================== 重启服务 ==================
+restart_xray() {
+    systemctl restart xray 2>/dev/null || true
+    sleep 1
+
+    if systemctl is-active --quiet xray 2>/dev/null; then
+        info "Xray 启动成功"
+        return 0
+    fi
+
+    error "Xray 启动失败"
+    journalctl -u xray -n 20 --no-pager || true
+    return 1
+}
+
+# ================== 写配置 ==================
+write_config() {
+    local port="$1"
+    local uuid="$2"
+    local path="$3"
+    local host="$4"
+
+    local listen_ip
+    listen_ip=$(get_listen_ip)
+
+    mkdir -p /usr/local/etc/xray
+
+    cat > "$XRAY_CONFIG" <<EOF
 {
+  "log": {
+    "loglevel": "warning"
+  },
   "inbounds": [
     {
-      "type": "vmess",
-      "tag": "vmess-in",
-      "listen": "::",
-      "listen_port": ${PORT},
-      "users": [
-        {
-          "uuid": "${UUID}"
+      "listen": "${listen_ip}",
+      "port": ${port},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${uuid}"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "httpupgrade",
+        "security": "none",
+        "httpupgradeSettings": {
+          "path": "${path}",
+          "host": "${host}"
         }
-      ],
-      "transport": {
-        "type": "ws",
-        "path": "${WSPATH}",
-        "headers": ${headers_json},
-        "max_early_data": 2048,
-        "early_data_header_name": "Sec-WebSocket-Protocol"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
       }
     }
   ],
   "outbounds": [
     {
-      "type": "direct",
-      "tag": "direct"
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIPv4v6"
+      }
     }
   ]
 }
 EOF
+}
 
-  SERVER_IP=$(get_public_ip)
-  cat << EOF > "$STATE_FILE"
-PORT='${PORT}'
-UUID='${UUID}'
-WSPATH='${WSPATH}'
-WSHOST='${WSHOST}'
-REMARK='${REMARK}'
-SERVER_IP='${SERVER_IP}'
+# ================== 生成订阅 ==================
+generate_link() {
+    local ip
+    if ! ip=$(get_public_ip); then
+        error "获取公网 IP 失败"
+        return 1
+    fi
+
+    local uuid port path host
+    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null || echo "error")
+    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "80")
+    path=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.path' "$XRAY_CONFIG" 2>/dev/null || echo "/download")
+    host=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.host // ""' "$XRAY_CONFIG" 2>/dev/null || echo "")
+
+    local display_ip="$ip"
+    [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
+
+    local hostname
+    hostname=$(hostname -s 2>/dev/null | tr ' ' '_')
+    [[ -z "$hostname" ]] && hostname="Xray"
+
+    local encoded_path
+    encoded_path=$(echo -n "$path" | sed 's/\//%2F/g')
+
+    cat > /root/xray_vless_httpupgrade.txt <<EOF
+vless://${uuid}@${display_ip}:${port}?encryption=none&security=none&type=httpupgrade&path=${encoded_path}&host=${host}#${hostname}-HTTPUpgrade
 EOF
-  chmod 600 "$STATE_FILE"
-
-  if has_command systemctl; then
-    systemctl daemon-reload
-    systemctl enable sing-box >/dev/null 2>&1 || true
-    systemctl restart sing-box >/dev/null 2>&1 || true
-    if systemctl is-active --quiet sing-box 2>/dev/null; then
-      info "Sing-box (VMess+WS) 服务配置并启动成功！"
-    else
-      error "Sing-box 服务启动失败，请运行 'journalctl -u sing-box -f' 查看错误日志。"
-    fi
-  else
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-    "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
-    info "非 systemd 环境，程序已挂载至后台 Pid 进程池中运行。"
-  fi
-  
-  if command -v ufw >/dev/null 2>&1; then
-    ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
-  fi
-
-  showconf
 }
 
-# =========================================================
-# 5. 主流程控制模块与更新功能
-# =========================================================
-
-# 流程一：首次全新安装
-inst_singbox() {
-  check_environment
-  
-  if [[ -f "$SB_CONFIG" ]]; then
-    warn "系统检测到已存在配置。如果是要修改配置，请在菜单中选择选项 4。"
-    read -rp "是否执意重新安装？(旧配置将被覆盖) [y/N]: " CONFIRM_REINST
-    [[ "$CONFIRM_REINST" != "y" && "$CONFIRM_REINST" != "Y" ]] && return 0
-  fi
-
-  info "🧹 正在清理前置依赖并准备下载..."
-  if ! command -v sing-box >/dev/null 2>&1; then
-    local latest_version=$(get_latest_version)
-    
-    local _tmpfile_tar=$(mktemp)
-    if ! download_singbox "$latest_version" "$_tmpfile_tar"; then
-      rm -f "$_tmpfile_tar" && return 1
+# ================== 显示配置 ==================
+show_current_config() {
+    if [[ ! -f "$XRAY_CONFIG" ]]; then
+        error "配置文件不存在"
+        return
     fi
 
-    echo -ne "正在从解压并安装二进制可执行文件 ... "
-    local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
-    tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
-    
-    local _ver_num="${latest_version#v}"
-    local _extracted_binary=$(find "$_tmpdir_extract" -type f -name "sing-box" | head -n 1)
-    
-    if [[ -n "$_extracted_binary" ]] && install -Dm755 "$_extracted_binary" "$EXECUTABLE_INSTALL_PATH"; then
-      echo "成功"
-    else
-      rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "安装失败" && return 1
+    local ip uuid port path host
+    ip=$(get_public_ip || echo "未知")
+    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
+    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
+    path=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.path' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
+    host=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.host // "无"' "$XRAY_CONFIG" 2>/dev/null || echo "无")
+
+    echo -e "${GREEN}====== 当前配置 ======${RESET}"
+    echo -e "${YELLOW}IP地址        : ${ip}${RESET}"
+    echo -e "${YELLOW}端口          : ${port}${RESET}"
+    echo -e "${YELLOW}UUID          : ${uuid}${RESET}"
+    echo -e "${YELLOW}路径 (Path)   : ${path}${RESET}"
+    echo -e "${YELLOW}伪装域名(Host): ${host}${RESET}"
+    echo
+
+    if [[ -f /root/xray_vless_httpupgrade.txt ]]; then
+        echo -e "${GREEN}====== VLESS 链接 ======${RESET}"
+        cat /root/xray_vless_httpupgrade.txt
     fi
-    rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
-  else
-    info "系统已存在 sing-box 核心组件，跳过基础安装。"
-  fi
-
-  if has_command systemctl && [[ ! -f "$SYSTEMD_SERVICES_DIR/sing-box.service" ]]; then
-    install_content -Dm644 "$(tpl_singbox_server_service_base)" "$SYSTEMD_SERVICES_DIR/sing-box.service" "1"
-  fi
-
-  # 自动生成 VMess 专属随机默认值与动态备注
-  local hostname_str=$(hostname 2>/dev/null || echo "linux")
-  local rand_port=$(shuf -i 10000-65535 -n 1)
-  local rand_uuid=$(python3 -c "import uuid; print(uuid.uuid4())")
-  local rand_path="/$(python3 -c "import secrets; print(secrets.token_hex(4))")"
-  local default_remark="${hostname_str}-vmessws"
-
-  echo "---------------------------------------------"
-  read -rp "👉 请输入监听端口 (默认随机: ${rand_port}): " INPUT_PORT
-  PORT=${INPUT_PORT:-$rand_port}
-
-  read -rp "👉 请输入 VMess UUID (默认随机: ${rand_uuid}): " INPUT_UUID
-  UUID=${INPUT_UUID:-$rand_uuid}
-
-  read -rp "👉 请输入 WebSocket 路径 (默认随机: ${rand_path}): " INPUT_WSPATH
-  WSPATH=${INPUT_WSPATH:-$rand_path}
-
-  read -rp "👉 请输入 WebSocket Host 伪装域名 (默认留空): " INPUT_WSHOST
-  WSHOST=${INPUT_WSHOST:-""}
-
-  read -rp "👉 请输入节点备注名称 (默认: ${default_remark}): " INPUT_REMARK
-  REMARK=${INPUT_REMARK:-$default_remark}
-
-  write_and_show_config
 }
 
-# 流程二：修改配置
+# ================== 配置 Xray ==================
+configure_xray() {
+    info "开始配置 Xray HTTPUpgrade..."
+    local port uuid path host
+
+    while true; do
+        read -rp "请输入端口 (直接回车随机分配端口): " input_port
+        if [[ -z "$input_port" ]]; then
+            port=$(get_random_port)
+            info "已为您随机分配未被占用端口: $port"
+            break
+        elif is_valid_port "$input_port"; then
+            if ! check_port "$input_port"; then
+                error "端口 ${input_port} 已被占用，请重新输入。"
+                continue
+            fi
+            port="$input_port"
+            break
+        else
+            error "端口无效"
+        fi
+    done
+
+    while true; do
+        read -rp "请输入UUID (默认:自动生成): " input_uuid
+        if [[ -z "${input_uuid:-}" ]]; then
+            uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "7415d2b8-1454-4da8-963b-4663e8322851")
+            break
+        elif is_valid_uuid "$input_uuid"; then
+            uuid="$input_uuid"
+            break
+        else
+            error "UUID 格式无效"
+        fi
+    done
+
+    while true; do
+        read -rp "请输入 HTTPUpgrade 路径 (必须以/开头，默认: /download): " input_path
+        path=${input_path:-/download}
+        if is_valid_path "$path"; then
+            break
+        else
+            error "路径格式无效，必须以 '/' 开头且不包含特殊字符"
+        fi
+    done
+
+    while true; do
+        read -rp "请输入伪装Host域名 (可直接回车留空): " input_host
+        host=${input_host:-}
+        if is_valid_host "$host"; then
+            break
+        else
+            error "域名格式无效"
+        fi
+    done
+
+    write_config "$port" "$uuid" "$path" "$host"
+    test_config || return 1
+    generate_link
+    restart_xray
+    show_current_config
+}
+
+# ================== 安装 ==================
+install_xray() {
+    info "开始安装 Xray..."
+    local install_script
+    install_script=$(download_install_script) || return 1
+
+    bash "$install_script" install
+    bash "$install_script" install-geodata
+    systemctl enable xray 2>/dev/null || true
+    configure_xray
+    info "Xray 已安装完成"
+}
+
+# ================== 更新 ==================
+update_xray() {
+    info "更新 Xray..."
+    local install_script
+    install_script=$(download_install_script) || return 1
+
+    bash "$install_script" install
+    bash "$install_script" install-geodata
+    restart_xray
+}
+
+# ================== 修改配置 ==================
 modify_config() {
-  if [[ ! -f "$SB_CONFIG" ]]; then
-    error "未找到正在运行的配置文件，请先选择选项 1 安装节点。"
-    return 1
-  fi
-
-  info "正在读取现有 VMess 节点配置..."
-  local current_port=$(jq -r '.inbounds[0].listen_port // empty' "$SB_CONFIG" 2>/dev/null)
-  local current_uuid=$(jq -r '.inbounds[0].users[0].uuid // empty' "$SB_CONFIG" 2>/dev/null)
-  local current_path=$(jq -r '.inbounds[0].transport.path // empty' "$SB_CONFIG" 2>/dev/null)
-  local current_host=$(jq -r '.inbounds[0].transport.headers.Host // empty' "$SB_CONFIG" 2>/dev/null)
-  
-  local current_remark=""
-  if [[ -f "$STATE_FILE" ]]; then
-    current_remark=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 || true)
-  fi
-
-  local hostname_str=$(hostname 2>/dev/null || echo "linux")
-  local fallback_remark="${hostname_str}-vmessws"
-
-  echo "---------------------------------------------"
-  echo -e "${YELLOW}提示：直接敲回车(Enter)将保持括号内的当前值不变${RESET}"
-  echo "---------------------------------------------"
-
-  read -rp "👉 修改监听端口 (当前: ${current_port}): " INPUT_PORT
-  PORT=${INPUT_PORT:-$current_port}
-
-  read -rp "👉 修改 VMess UUID (当前: ${current_uuid}): " INPUT_UUID
-  UUID=${INPUT_UUID:-$current_uuid}
-
-  read -rp "👉 修改 WebSocket 路径 (当前: ${current_path}): " INPUT_WSPATH
-  WSPATH=${INPUT_WSPATH:-$current_path}
-
-  read -rp "👉 修改 WebSocket Host 伪装域名 (当前: ${current_host:-未配置/留空}): " INPUT_WSHOST
-  if [[ -z "$INPUT_WSHOST" ]]; then
-    WSHOST="$current_host"
-  else
-    WSHOST="$INPUT_WSHOST"
-  fi
-
-  read -rp "👉 修改节点备注名称 (当前: ${current_remark:-$fallback_remark}): " INPUT_REMARK
-  REMARK=${INPUT_REMARK:-${current_remark:-$fallback_remark}}
-
-  write_and_show_config
-}
-
-update_singbox() {
-  if [[ ! -f "$SB_BINARY" ]]; then
-    error "当前系统未安装 Sing-box，无法执行更新。"
-    return 1
-  fi
-
-  info "正在检查新版本..."
-  local current_version=$(get_installed_version)
-  local latest_version=$(get_latest_version)
-
-  info "当前安装版本: ${YELLOW}${current_version}${RESET}"
-  info "官方最新版本: ${GREEN}${latest_version}${RESET}"
-
-  if [[ "$current_version" == *"$latest_version"* || "$latest_version" == *"$current_version"* ]]; then
-    info "您当前已经是最新版本，无需更新。"
-    return 0
-  fi
-
-  warn "检测到新版本，即将开始平滑更新 (你的节点配置不会改变)..."
-  
-  local _tmpfile_tar=$(mktemp)
-  if ! download_singbox "$latest_version" "$_tmpfile_tar"; then
-    rm -f "$_tmpfile_tar" && return 1
-  fi
-
-  echo -ne "正在覆盖二进制核心文件 ... "
-  local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
-  tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
-  
-  local _extracted_binary=$(find "$_tmpdir_extract" -type f -name "sing-box" | head -n 1)
-  if [[ -n "$_extracted_binary" ]] && install -Dm755 "$_extracted_binary" "$EXECUTABLE_INSTALL_PATH"; then
-    echo "成功"
-  else
-    rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "覆盖核心失败" && return 1
-  fi
-  rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
-
-  info "正在重启 Sing-box 服务以应用更新..."
-  if has_command systemctl; then
-    systemctl daemon-reload
-    systemctl restart sing-box >/dev/null 2>&1 || true
-    if systemctl is-active --quiet sing-box 2>/dev/null; then
-      info "Sing-box 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
-    else
-      error "核心更新成功，但服务重启失败，请运行 'journalctl -u sing-box -f' 检查错误。"
+    if [[ ! -f "$XRAY_CONFIG" ]]; then
+        error "配置文件不存在"
+        return 1
     fi
-  else
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-    "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
-    info "Sing-box 核心已更新并于后台重启运行。"
-  fi
+
+    local old_port old_uuid old_path old_host
+    old_port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "80")
+    old_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null || echo "")
+    old_path=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.path' "$XRAY_CONFIG" 2>/dev/null || echo "/download")
+    old_host=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.host // ""' "$XRAY_CONFIG" 2>/dev/null || echo "")
+
+    local port uuid path host
+
+    while true; do
+        read -rp "请输入新端口 [当前:${old_port}, 回车不修改]: " input_port
+        if [[ -z "$input_port" ]]; then
+            port="$old_port"
+            break
+        elif [[ "${input_port,,}" == "rand" ]]; then
+            port=$(get_random_port)
+            info "已为您重分配随机端口: $port"
+            break
+        elif is_valid_port "$input_port"; then
+            if [[ "$input_port" != "$old_port" ]]; then
+                if ! check_port "$input_port"; then
+                    error "端口 ${input_port} 已被占用，请更换。"
+                    continue
+                fi
+            fi
+            port="$input_port"
+            break
+        else
+            error "端口无效，请输入 1-65535 之间的数字。"
+        fi
+    done
+
+    while true; do
+        read -rp "请输入UUID [当前:${old_uuid}]: " input_uuid
+        uuid=${input_uuid:-$old_uuid}
+        if is_valid_uuid "$uuid"; then
+            break
+        else
+            error "UUID 格式无效"
+        fi
+    done
+
+    while true; do
+        read -rp "请输入HTTPUpgrade 路径 [当前:${old_path}]: " input_path
+        path=${input_path:-$old_path}
+        if is_valid_path "$path"; then
+            break
+        else
+            error "路径格式无效"
+        fi
+    done
+
+    while true; do
+        read -rp "请输入伪装Host域名 [当前:${old_host:-无}]: " input_host
+        host=${input_host:-$old_host}
+        if is_valid_host "$host"; then
+            break
+        else
+            error "域名格式无效"
+        fi
+    done
+
+    cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
+
+    write_config "$port" "$uuid" "$path" "$host"
+    test_config || return 1
+    generate_link
+    restart_xray
+    info "配置修改成功"
 }
 
-uninstall_singbox() {
-  if has_command systemctl; then
-    systemctl stop sing-box >/dev/null 2>&1 || true
-    systemctl disable sing-box >/dev/null 2>&1 || true
-    remove_file "$SYSTEMD_SERVICES_DIR/sing-box.service"
-    systemctl daemon-reload
-  else
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-  fi
-  
-  remove_file "$EXECUTABLE_INSTALL_PATH"
-  rm -f "$SB_CONFIG" "$STATE_FILE"
-  rm -rf "$CONFIG_DIR" "$SB_DIR"
+# ================== 卸载 ==================
+uninstall_xray() {
+    warn "即将卸载 Xray"
 
-  info "已卸载 Sing-box、配置文件与状态文件。"
+    systemctl stop xray 2>/dev/null || true
+    local install_script
+    install_script=$(download_install_script) || return 1
+
+    bash "$install_script" remove --purge
+    rm -f /root/xray_vless_httpupgrade.txt
+    info "Xray 已卸载"
 }
 
-showconf() {
-  if [[ ! -f "$STATE_FILE" ]]; then
-    error "未找到任何安装配置底座，请先安装节点。"
-    return 1
-  fi
-  source "$STATE_FILE"
-
-  # 【已修复】确保客户端生成的 VMess 链接中 aid (alterId) 保持为 0 即可，Sing-box 端不接收该字段
-  local vmess_json_str
-  vmess_json_str=$(cat << EOF
-{
-  "v": "2",
-  "ps": "${REMARK}",
-  "add": "${SERVER_IP}",
-  "port": ${PORT},
-  "id": "${UUID}",
-  "aid": 0,
-  "scy": "auto",
-  "net": "ws",
-  "type": "none",
-  "host": "${WSHOST}",
-  "path": "${WSPATH}",
-  "tls": "none",
-  "sni": "",
-  "alpn": ""
-}
-EOF
-)
-  local v2rayn_link="vmess://$(echo -n "$vmess_json_str" | base64 -w 0 2>/dev/null || echo -n "$vmess_json_str" | base64)"
-
-  echo -e "${GREEN}====== VMess + WebSocket 节点配置信息 ======${RESET}"
-  echo -e "${GREEN}服务器公网 IP :${RESET} ${SERVER_IP}"
-  echo -e "${GREEN}服务监听端口   :${RESET} ${PORT}"
-  echo -e "${GREEN}VMess 用户UUID :${RESET} ${UUID}"
-  echo -e "${GREEN}传输协议类型   :${RESET} ws (WebSocket)"
-  echo -e "${GREEN}WebSocket 路径 :${RESET} ${WSPATH}"
-  echo -e "${GREEN}WebSocket Host :${RESET} ${WSHOST:-未配置(留空)}"
-  echo -e "${GREEN}节点自定义备注 :${RESET} ${REMARK}"
-  echo "---------------------------------------------"
-  echo -e "${GREEN}👉 v2rayN   分享链接:${RESET}"
-  echo -e "${YELLOW}${v2rayn_link}${RESET}"
-  echo "---------------------------------------------"
-  echo
-}
-
-# =========================================================
-# 6. 面板主菜单
-# =========================================================
-menu() {
-  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
-  check_environment
-
-  while true; do
+# ================== 菜单 ==================
+show_menu() {
     clear
-    local status=$(get_sb_status)
-    local version=$(get_installed_version)
-    local port_show=$(get_current_port_display)
+    local status version port_show
+    status=$(get_xray_status)
+    version=$(get_xray_version)
+    port_show="-"
+
+    if [[ -f "$XRAY_CONFIG" ]]; then
+        port_show=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "-")
+    fi
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     Sing-box VMess + WS 面板    ${RESET}"
+    echo -e "${GREEN}  Xray Vless+HTTPUpgrade 面板   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 VMess + WS${RESET}"
-    echo -e "${GREEN}2. 更新 VMess + WS${RESET}"
-    echo -e "${GREEN}3. 卸载 VMess + WS${RESET}"
-    echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 VMess + WS${RESET}"
-    echo -e "${GREEN}6. 停止 VMess + WS${RESET}"
-    echo -e "${GREEN}7. 重启 VMess + WS${RESET}"
-    echo -e "${GREEN}8. 查看日志${RESET}"
-    echo -e "${GREEN}9. 查看节点配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN} 1. 安装 Xray Vless+HTTPUpgrade${RESET}"
+    echo -e "${GREEN} 2. 更新 Xray${RESET}"
+    echo -e "${GREEN} 3. 卸载 Xray${RESET}"
+    echo -e "${GREEN} 4. 修改配置${RESET}"
+    echo -e "${GREEN} 5. 启动 Xray${RESET}"
+    echo -e "${GREEN} 6. 停止 Xray${RESET}"
+    echo -e "${GREEN} 7. 重启 Xray${RESET}"
+    echo -e "${GREEN} 8. 查看日志${RESET}"
+    echo -e "${GREEN} 9. 查看节点配置${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
-
-    local choice=""
-    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
-    [[ -z "$choice" ]] && continue
-
-    case "$choice" in
-      1) inst_singbox; pause ;;
-      2) update_singbox; pause ;;
-      3) uninstall_singbox; pause ;;
-      4) modify_config; pause ;;
-      5) 
-        if has_command systemctl; then
-          systemctl start sing-box && info "服务已成功启动！"
-        else
-          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-          "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
-          info "进程已在后台启动！"
-        fi
-        pause ;;
-      6) 
-        if has_command systemctl; then
-          systemctl stop sing-box && info "服务已成功停止！"
-        else
-          pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台进程已终止！"
-        fi
-        pause ;;
-      7) 
-        if has_command systemctl; then
-          systemctl restart sing-box && info "服务已成功重启！"
-        else
-          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-          "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
-          info "后台进程已重启！"
-        fi
-        pause ;;
-      8) 
-        if has_command systemctl; then
-          journalctl -u sing-box.service -n 50 --no-pager
-        else
-          warn "当前环境不支持 systemd 集中日志管理。"
-        fi
-        pause ;;
-      9) showconf; pause ;;
-      0) exit 0 ;;
-      *) error "无效输入，请重新选择。"; sleep 1 ;;
-    esac
-  done
 }
 
-menu "$@"
+# ================== 安装依赖 ==================
+install_dependencies() {
+    if command -v apt &>/dev/null; then
+        apt update && apt install -y jq curl wget openssl ca-certificates iproute2 coreutils || true
+    elif command -v dnf &>/dev/null; then
+        dnf install -y jq curl wget openssl ca-certificates iproute2 coreutils
+    elif command -v yum &>/dev/null; then
+        yum install -y jq curl wget openssl ca-certificates iproute2 coreutils
+    else
+        error "未知的包管理器，请手动安装所需的依赖: jq, curl, wget, openssl"
+        exit 1
+    fi
+}
+
+# ================== 依赖检查 ==================
+pre_check() {
+    if [[ $(id -u) -ne 0 ]]; then
+        error "请使用 root 用户运行"
+        exit 1
+    fi
+
+    local deps=(jq curl wget openssl ss timeout)
+    local missing=0
+
+    for cmd in "${deps[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing=1
+            break
+        fi
+    done
+
+    if [[ "$missing" -eq 1 ]]; then
+        info "检测到缺失依赖，正在安装..."
+        install_dependencies
+    fi
+}
+
+# ================== 主循环 ==================
+main() {
+    pre_check
+
+    while true; do
+        show_menu
+        
+        local choice=""
+        read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+        
+        [[ -z "$choice" ]] && continue
+
+        case "$choice" in
+            1) install_xray; pause ;;
+            2) update_xray; pause ;;
+            3) uninstall_xray; pause ;;
+            4) modify_config; pause ;;
+            5) systemctl start xray &>/dev/null || true; restart_xray; pause ;;
+            6) systemctl stop xray &>/dev/null || true; info "Xray 已停止"; pause ;;
+            7) restart_xray; pause ;;
+            8) journalctl -u xray -e --no-pager || true; pause ;;
+            9) show_current_config; pause ;;
+            0) exit 0 ;;
+            *) error "无效输入"; pause ;;
+        esac
+    done
+}
+
+main "$@"

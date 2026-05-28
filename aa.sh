@@ -151,14 +151,13 @@ get_latest_version() {
     rm -f "$_tmpfile"
     return
   fi
-  # 剔除预览版，抓取最新的稳定版本号
   local _tag_name=$(jq -r '[.[] | select(.prerelease==false and .draft==false)][0].tag_name' "$_tmpfile" 2>/dev/null || echo "")
   rm -f "$_tmpfile"
   
   if [[ -n "$_tag_name" ]]; then
     echo "${_tag_name##*\/}"
   else
-    echo "v1.12.3" # 保底稳定版
+    echo "v1.12.3"
   fi
 }
 
@@ -167,7 +166,6 @@ download_singbox() {
   local _destination="$2"
   local _ver_num="${_version#v}"
   
-  # 拼接官方标准的压缩包下载链接
   local _download_url="$REPO_URL/releases/download/$_version/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE.tar.gz"
   
   info "正在下载官方 Sing-box 核心组件: $_download_url ..."
@@ -222,13 +220,18 @@ get_current_domain_display() {
   else echo "-"; fi
 }
 
+# 随机字符串生成函数
+generate_random_string() {
+  local length=$1
+  LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c "$length" || true
+}
+
 # =========================================================
 # 4. 面板核心交互与配置文件处理
 # =========================================================
 write_and_show_config() {
   mkdir -p "$CONFIG_DIR"
 
-  # 直接利用内联 Shell 变量安全写入 JSON，免去脆弱的 sed 替换逻辑
   cat << EOF > "$SB_CONFIG"
 {
   "log": {
@@ -265,19 +268,17 @@ write_and_show_config() {
 }
 EOF
 
-  # 生成客户端配置备份与分享链接
   mkdir -p "$SB_DIR"
   
-  # 对节点名进行简易防冲突处理
-  local encoded_node_name=$(curl -s -o /dev/null -w %{url_effective} --url-query "x=${sb_node_name}" "" | sed 's/^.*x=//')
-  local share_link="http2://${sb_username}:${sb_password}@${sb_domain}:443#${encoded_node_name}"
+  # 彻底解决旧版本 curl 报错，使用完美的 jq 自带编码器
+  local encoded_node_name=$(jq -rn --arg x "$sb_node_name" '$x|@uri')
+  local share_link="naive+https://${sb_username}:${sb_password}@${sb_domain}:443#${sb_node_name}"
 
   cat << EOF > "$SB_DIR/url.txt"
-Flowz / Shadowrocket 订阅分享链接:
+V2rayN 配置分享链接:
 ${share_link}
 EOF
 
-  # 保存当前输入参数供日后“不修改回车”读取
   cat << EOF > "$SB_DIR/meta.env"
 sb_domain="${sb_domain}"
 sb_email="${sb_email}"
@@ -286,7 +287,6 @@ sb_password="${sb_password}"
 sb_node_name="${sb_node_name}"
 EOF
 
-  # 控制权移交及运行守护
   if has_command systemctl; then
     systemctl daemon-reload
     systemctl enable sing-box >/dev/null 2>&1 || true
@@ -338,18 +338,22 @@ inst_singbox() {
     install_content -Dm644 "$(tpl_singbox_server_service_base)" "$SYSTEMD_SERVICES_DIR/sing-box.service" "1"
   fi
 
+  local rand_user=$(generate_random_string 8)
+  local rand_pass=$(generate_random_string 16)
+  local rand_email="$(generate_random_string 10)@gmail.com"
+
   echo "---------------------------------------------"
   read -rp "👉 请输入解析好的域名 (例如: naive.example.com): " sb_domain
   [[ -z "$sb_domain" ]] && error "域名不能为空！" && return 1
 
-  read -rp "👉 请输入你的邮箱 (用于 ACME 自动申请证书): " sb_email
-  [[ -z "$sb_email" ]] && error "邮箱不能为空！" && return 1
+  read -rp "👉 请输入你的邮箱 (默认随机: ${rand_email}): " sb_email
+  sb_email=${sb_email:-"$rand_email"}
 
-  read -rp "👉 请设置 NaiveProxy 用户名 (默认: user123): " sb_username
-  sb_username=${sb_username:-"user123"}
+  read -rp "👉 请设置 NaiveProxy 用户名 (默认随机: ${rand_user}): " sb_username
+  sb_username=${sb_username:-"$rand_user"}
 
-  read -rp "👉 请设置 NaiveProxy 密码 (默认: pass123): " sb_password
-  sb_password=${sb_password:-"pass123"}
+  read -rp "👉 请设置 NaiveProxy 密码 (默认随机: ${rand_pass}): " sb_password
+  sb_password=${sb_password:-"$rand_pass"}
 
   read -rp "👉 请给这个节点起个名字 (默认: NaiveProxy): " sb_node_name
   sb_node_name=${sb_node_name:-"NaiveProxy"}
@@ -412,11 +416,6 @@ update_singbox() {
 
 uninstall_singbox() {
   warn "即将从当前系统中彻底卸载 Sing-box (NaiveProxy)"
-  read -rp "确定要彻底卸载吗？[y/N]: " confirm
-  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-    info "已取消卸载。"
-    return 0
-  fi
 
   if has_command systemctl; then
     systemctl stop sing-box >/dev/null 2>&1 || true
@@ -426,7 +425,7 @@ uninstall_singbox() {
   else
     pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
   fi
-  
+
   remove_file "$EXECUTABLE_INSTALL_PATH"
   rm -rf /etc/sing-box "$SB_DIR"
 
@@ -439,7 +438,6 @@ changeconf() {
     return 1
   fi
 
-  # 载入上次保存的配置元数据
   if [[ -f "$SB_DIR/meta.env" ]]; then
     source "$SB_DIR/meta.env"
   else
@@ -513,8 +511,8 @@ menu() {
     echo -e "${GREEN}5. 启动 Sing-box${RESET}"
     echo -e "${GREEN}6. 停止 Sing-box${RESET}"
     echo -e "${GREEN}7. 重启 Sing-box${RESET}"
-    echo -e "${GREEN}8. 查看申请证书日志${RESET}"
-    echo -e "${GREEN}9. 查看节点分享链接${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
 

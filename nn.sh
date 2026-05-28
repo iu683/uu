@@ -169,14 +169,10 @@ get_latest_version() {
   fi
 }
 
-# 【修复】实现缺失的下载核心函数
 download_singbox() {
   local version="$1"
   local dest_file="$2"
-  # 去掉版本号前缀 v
   local ver_num="${version#v}"
-  # 拼接 GitHub Release 规则文件名
-  # 示例: sing-box-1.12.3-linux-amd64.tar.gz
   local filename="sing-box-${ver_num}-${OPERATING_SYSTEM}-${ARCHITECTURE}.tar.gz"
   local download_url="${REPO_URL}/releases/download/${version}/${filename}"
 
@@ -253,6 +249,7 @@ write_and_show_config() {
     headers_json="{\"Host\": \"${WSHOST}\"}"
   fi
 
+  # 【已修复】彻底移除 "alter_id": 0 废弃字段
   cat << EOF > "$SB_CONFIG"
 {
   "inbounds": [
@@ -263,8 +260,7 @@ write_and_show_config() {
       "listen_port": ${PORT},
       "users": [
         {
-          "uuid": "${UUID}",
-          "alter_id": 0
+          "uuid": "${UUID}"
         }
       ],
       "transport": {
@@ -346,7 +342,6 @@ inst_singbox() {
     tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
     
     local _ver_num="${latest_version#v}"
-    # 使用 find 动态查找到解压目录中的二进制文件，避免因版本号不对齐导致找不到路径
     local _extracted_binary=$(find "$_tmpdir_extract" -type f -name "sing-box" | head -n 1)
     
     if [[ -n "$_extracted_binary" ]] && install -Dm755 "$_extracted_binary" "$EXECUTABLE_INSTALL_PATH"; then
@@ -432,7 +427,6 @@ modify_config() {
 
   read -rp "👉 修改节点备注名称 (当前: ${current_remark:-$fallback_remark}): " INPUT_REMARK
   REMARK=${INPUT_REMARK:-${current_remark:-$fallback_remark}}
-
   write_and_show_config
 }
 
@@ -513,6 +507,7 @@ showconf() {
   fi
   source "$STATE_FILE"
 
+  # 【已修复】确保客户端生成的 VMess 链接中 aid (alterId) 保持为 0 即可，Sing-box 端不接收该字段
   local vmess_json_str
   vmess_json_str=$(cat << EOF
 {
@@ -536,7 +531,7 @@ EOF
   local v2rayn_link="vmess://$(echo -n "$vmess_json_str" | base64 -w 0 2>/dev/null || echo -n "$vmess_json_str" | base64)"
 
   echo -e "${GREEN}====== VMess + WebSocket 节点配置信息 ======${RESET}"
-  echo -e "${GREEN}服务器公网 IP :${RESET} ${SERVER_IP}"
+  echo -e "${GREEN}服务器公网 IP  :${RESET} ${SERVER_IP}"
   echo -e "${GREEN}服务监听端口   :${RESET} ${PORT}"
   echo -e "${GREEN}VMess 用户UUID :${RESET} ${UUID}"
   echo -e "${GREEN}传输协议类型   :${RESET} ws (WebSocket)"
@@ -546,8 +541,10 @@ EOF
   echo "---------------------------------------------"
   echo -e "${GREEN}👉 v2rayN   分享链接:${RESET}"
   echo -e "${YELLOW}${v2rayn_link}${RESET}"
-  echo "---------------------------------------------"
   echo
+  echo -e "${GREEN}👉 Surge   分享链接:${RESET}"
+  echo -e "${YELLOW}$fallback_remark = vmess, $SERVER_IP, $PORT, username=$UUID, ws=true, ws-path=$WSPATH, vmess-aead=true${RESET}"
+  echo "---------------------------------------------"
 }
 
 # =========================================================

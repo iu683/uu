@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Tuic 管理面板
+# NaiveProxy 一键管理面板 (支持远程 HTML 伪装本地化)
 # SPDX-License-Identifier: MIT
 #
 # =========================================================
@@ -10,16 +10,16 @@ set -Eop pipefail
 export LANG=en_US.UTF-8
 
 # 基础目录与硬编码配置
-readonly TUIC_CONFIG="/etc/tuic/server.json"
-readonly BINARY_PATH="/usr/local/bin/tuic-server"
-readonly TUIC_DIR="/root/tuic"
-CONFIG_DIR="/etc/tuic"
+readonly CADDY_CONFIG="/etc/caddy/Caddyfile"
+readonly CADDY_BINARY="/usr/local/bin/caddy"
+readonly NAIVE_DIR="/root/naive"
+readonly WEB_WWW_DIR="/var/www/html"
+EXECUTABLE_INSTALL_PATH="/usr/local/bin/caddy"
 SYSTEMD_SERVICES_DIR="/etc/systemd/system"
-REPO_URL="https://github.com/EAimTY/tuic"
-API_BASE_URL="https://api.github.com/repos/EAimTY/tuic"
+CONFIG_DIR="/etc/caddy"
 CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
 
-# 自动检测环境依赖变量
+# 自动检测环境变量
 PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
 OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
 ARCHITECTURE="${ARCHITECTURE:-}"
@@ -29,10 +29,11 @@ GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 BLUE="\033[34m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
 # =========================================================
-# 2. 系统底层工具函数
+# 2. 底层工具函数
 # =========================================================
 has_command() {
   local _command=$1
@@ -44,7 +45,7 @@ curl() {
 }
 
 mktemp() {
-  command mktemp "$@" "tuicinst.XXXXXXXXXX"
+  command mktemp "$@" "naiveinst.XXXXXXXXXX"
 }
 
 info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
@@ -58,10 +59,35 @@ generate_random_password() {
 
 systemctl() {
   if ! has_command systemctl; then
-    warn "忽略 systemd 命令: systemctl $@"
-    return
+    warn "当前系统不支持 systemd，忽略守护进程操作: systemctl $*"
+    return 0
   fi
   command systemctl "$@"
+}
+
+install_content() {
+  local _install_flags="$1"
+  local _content="$2"
+  local _destination="$3"
+  local _overwrite="$4"
+  local _tmpfile="$(mktemp)"
+
+  echo -ne "安装 $_destination ... "
+  echo "$_content" > "$_tmpfile"
+  if [[ -z "$_overwrite" && -e "$_destination" ]]; then
+    echo -e "已存在"
+  elif install "$_install_flags" "$_tmpfile" "$_destination"; then
+    echo -e "完成"
+  fi
+  rm -f "$_tmpfile"
+}
+
+remove_file() {
+  local _target="$1"
+  echo -ne "移除 $_target ... "
+  if rm -f "$_target"; then
+    echo -e "完成"
+  fi
 }
 
 detect_package_manager() {
@@ -69,6 +95,7 @@ detect_package_manager() {
   has_command apt && PACKAGE_MANAGEMENT_INSTALL='apt -y --no-install-recommends install' && return 0
   has_command dnf && PACKAGE_MANAGEMENT_INSTALL='dnf -y install' && return 0
   has_command yum && PACKAGE_MANAGEMENT_INSTALL='yum -y install' && return 0
+  has_command apk && PACKAGE_MANAGEMENT_INSTALL='apk add --no-cache' && return 0
   return 1
 }
 
@@ -78,42 +105,39 @@ install_software() {
     error "未检测到支持的包管理器，请手动安装 $_package_name"
     exit 65
   fi
+  echo "正在安装缺失的依赖 '$_package_name' ... "
   if $PACKAGE_MANAGEMENT_INSTALL "$_package_name" >/dev/null 2>&1; then
-    return 0
+    echo "依赖安装成功"
   else
-    return 1
+    error "无法通过包管理器安装 '$_package_name'，请手动安装。"
+    exit 65
   fi
-}
-
-install_packages() {
-  has_command curl || install_software curl
-  has_command wget || install_software wget
-  has_command grep || install_software grep
-  has_command jq || install_software jq
-  has_command openssl || install_software openssl
-  has_command iptables || install_software iptables
-}
-
-detect_arch() {
-  case "$(uname -m)" in
-    'x86_64' | 'amd64') echo "x86_64-unknown-linux-gnu" ;;
-    'aarch64' | 'arm64') echo "aarch64-unknown-linux-gnu" ;;
-    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
-  esac
 }
 
 check_environment() {
-  if [[ "x$(uname)" != "xLinux" ]]; then
+  if [[ "x$(uname)" == "xLinux" ]]; then
+    OPERATING_SYSTEM=linux
+  else
     error "本脚本仅支持 Linux 系统。"
     exit 95
   fi
-  install_packages
+
+  case "$(uname -m)" in
+    'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
+    'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
+    *) error "NaiveProxy (Caddy) 暂不支持或未编译当前架构: $(uname -a)"; exit 8 ;;
+  esac
+
+  has_command curl || install_software curl
+  has_command grep || install_software grep
+  has_command jq || install_software jq
+  has_command tar || install_software tar
 }
 
 get_installed_version() {
-  if [[ -f "$BINARY_PATH" ]]; then
+  if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
     local version_out
-    version_out=$("$BINARY_PATH" -v 2>/dev/null || "$BINARY_PATH" --version 2>/dev/null || echo "")
+    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null | head -n 1 || echo "")
     if [[ -n "$version_out" ]]; then
       echo "$version_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "未知格式"
     else
@@ -124,82 +148,54 @@ get_installed_version() {
   fi
 }
 
-get_latest_version() {
-  local _tmpfile=$(mktemp)
-  if ! curl -sS -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases" -o "$_tmpfile"; then
-    echo ""
-    rm -f "$_tmpfile"
+download_caddy_naive() {
+  local _destination="$1"
+  local _latest_tag
+  _latest_tag=$(curl -sS -H 'Accept: application/vnd.github.v3+json' "https://api.github.com/repos/klzgrad/naiveproxy/releases/latest" | jq -r '.tag_name' 2>/dev/null || echo "")
+  
+  if [[ -z "$_latest_tag" ]]; then
+    error "无法获取 NaiveProxy 最新版本号"
     return 1
   fi
-  local _raw_tag=$(jq -r '[.[] | select(.prerelease==false and (.assets[].name | contains("tuic-server")))] | first | .tag_name' "$_tmpfile")
-  echo "$_raw_tag"
-  rm -f "$_tmpfile"
+
+  local _download_url="https://github.com/klzgrad/naiveproxy/releases/download/${_latest_tag}/naiveproxy-${_latest_tag}-linux-x64.tar.xz"
+  if [[ "$ARCHITECTURE" == "arm64" ]]; then
+    _download_url="https://github.com/klzgrad/naiveproxy/releases/download/${_latest_tag}/naiveproxy-${_latest_tag}-linux-arm64.tar.xz"
+  fi
+  
+  info "正在下载集成 Naive 插件的 Caddy 核心组件: $_download_url ..."
+  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
+    error "核心下载失败！请检查您的网络连接。"
+    return 11
+  fi
+  return 0
+}
+
+tpl_caddy_server_service() {
+  cat << EOF
+[Unit]
+Description=Caddy Server with NaiveProxy
+After=network.target network-online.target
+Requires=network-online.target
+
+[Service]
+Type=notify
+ExecStart=$EXECUTABLE_INSTALL_PATH run --environ --config ${CADDY_CONFIG}
+ExecReload=$EXECUTABLE_INSTALL_PATH reload --config ${CADDY_CONFIG} --force
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+LimitNPROC=512
+PrivateTmp=true
+ProtectSystem=full
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+EOF
 }
 
 # =========================================================
-# 3. iptables 规则持久化与转发控制模块
-# =========================================================
-ensure_iptables_persistent() {
-  if has_command dpkg; then
-    if ! dpkg -s iptables-persistent >/dev/null 2>&1; then
-      info "正在安装 iptables-persistent 以确保重启后规则不丢失..."
-      echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
-      echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
-      install_software iptables-persistent || warn "安装持久化工具失败，规则可能在重启后失效"
-    fi
-  elif has_command rpm; then
-    if ! rpm -q iptables-services >/dev/null 2>&1; then
-      info "正在安装 iptables-services 以确保重启后规则不丢失..."
-      install_software iptables-services && systemctl enable iptables ip6tables && systemctl start iptables ip6tables || true
-    fi
-  fi
-}
-
-save_iptables_rules() {
-  ensure_iptables_persistent
-  if has_command iptables-save; then
-    if [[ -d /etc/iptables ]]; then
-      iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-      ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-    elif [[ -f /etc/sysconfig/iptables ]]; then
-      iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
-      ip6tables-save > /etc/sysconfig/ip6tables 2>/dev/null || true
-    fi
-  fi
-}
-
-clear_old_iptables() {
-  if [[ -f "${CONFIG_DIR}/hopping.txt" && -f "${CONFIG_DIR}/main_port.txt" ]]; then
-    local old_hop=$(cat "${CONFIG_DIR}/hopping.txt")
-    local old_port=$(cat "${CONFIG_DIR}/main_port.txt")
-    local old_start=${old_hop%-*}
-    local old_end=${old_hop#*-}
-
-    if [[ -n "$old_start" && -n "$old_end" && -n "$old_port" ]]; then
-      iptables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
-      ip6tables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
-    fi
-  fi
-}
-
-apply_new_iptables() {
-  clear_old_iptables
-  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
-    local hop_val=$(cat "${CONFIG_DIR}/hopping.txt")
-    local start_p=${hop_val%-*}
-    local end_p=${hop_val#*-}
-    
-    info "正在应用 iptables 转发规则: UDP $start_p-$end_p => 主端口 $port"
-    iptables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port"
-    ip6tables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
-    
-    echo "$port" > "${CONFIG_DIR}/main_port.txt"
-    save_iptables_rules
-  fi
-}
-
-# =========================================================
-# 4. 网络诊断与配置管理辅助
+# 3. 网络与配置扩展辅助函数
 # =========================================================
 get_public_ip() {
     local ip
@@ -208,17 +204,12 @@ get_public_ip() {
             ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
     error "无法获取公网 IP 地址。" && return 1
 }
 
 check_port() {
   local port="$1"
-  if ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
+  if ss -tunlp 2>/dev/null | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
     return 1
   fi
   return 0
@@ -226,438 +217,281 @@ check_port() {
 
 is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
 
-get_random_port() {
-  local rand_port
-  while true; do
-    rand_port=$(shuf -i 2000-65535 -n 1)
-    if check_port "$rand_port"; then
-      echo "$rand_port" && return 0
-    fi
-  done
-}
-
-get_tuic_status() {
-  if systemctl is-active --quiet tuic-server 2>/dev/null; then
+get_caddy_status() {
+  if has_command systemctl && systemctl is-active --quiet caddy 2>/dev/null; then
     echo -e "${GREEN}● 运行中${RESET}"
   else
-    echo -e "${RED}● 未运行${RESET}"
+    if pgrep -f "$EXECUTABLE_INSTALL_PATH run" >/dev/null 2>&1; then
+      echo -e "${GREEN}● 运行中 (Pidmode)${RESET}"
+    else
+      echo -e "${RED}● 未运行${RESET}"
+    fi
   fi
 }
 
 get_current_port_display() {
-  if [[ -f "$TUIC_CONFIG" ]]; then
-    local main_port jump_range="无"
-    main_port=$(jq -r '.server' "$TUIC_CONFIG" 2>/dev/null | awk -F':' '{print $NF}' || echo "")
-    [[ -z "$main_port" || "$main_port" == "null" ]] && main_port=$(jq -r '.port' "$TUIC_CONFIG" 2>/dev/null || echo "")
-    [[ -f "${CONFIG_DIR}/hopping.txt" ]] && jump_range=$(cat "${CONFIG_DIR}/hopping.txt")
-    
-    if [[ "$jump_range" != "无" ]]; then
-      echo "${main_port} [${jump_range}]"
-    else
-      echo "${main_port:- -}"
-    fi
+  if [[ -f "$CADDY_CONFIG" ]]; then
+    local main_port
+    main_port=$(grep -oE ':[0-9]+' "$CADDY_CONFIG" | head -n 1 | tr -d ':' || echo "")
+    echo "${main_port:-443}"
   else echo "-"; fi
 }
 
 # =========================================================
-# 5. 面板节点配置生成核心逻辑 (已经过对齐重构)
+# 4. 交互输入与配置写入
 # =========================================================
-inst_cert() {
-  # 【修复核心1】只要进入证书环节，无条件前置初始化目录
-  mkdir -p /etc/tuic
-
-  echo "---------------------------------------------"
-  echo -e "Tuic 协议证书申请方式如下："
-  echo -e " 1) 必应自签证书 ${YELLOW}（默认）${RESET}"
-  echo -e " 2) Acme 脚本自动申请 (需放行 80 端口)"
-  echo -e " 3) 自定义证书路径"
-  echo "---------------------------------------------"
-  local certInput
-  read -rp "请输入选项 [1-3] (直接回车默认自签): " certInput
-  certInput=${certInput:-1}
-
-  # 【修复核心2】标准化全局隔离路径，打破外部目录权限壁垒
-  cert_path="/etc/tuic/cert.crt"
-  key_path="/etc/tuic/private.key"
-
-  if [[ $certInput == 2 ]]; then
-    if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
-      warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。请确保已暂时关闭 Web 服务。"
-    fi
-
-    if [[ -f /etc/tuic/cert.crt && -f /etc/tuic/private.key && -s /etc/tuic/cert.crt && -s /etc/tuic/private.key && -f /etc/tuic/ca.log ]]; then
-      tuic_domain=$(cat /etc/tuic/ca.log)
-      info "检测到已有域名 [${tuic_domain}] 的安全区证书，正在复用..."
-    else
-      local vps_ip=$(get_public_ip)
-      read -rp "请输入需要申请证书的域名: " domain
-      [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
-      
-      info "正在检查并安装 Acme.sh 依赖..."
-      local acme_cmd="/root/.acme.sh/acme.sh"
-      if [[ ! -f "$acme_cmd" ]]; then
-        curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
-      fi
-      
-      "$acme_cmd" --set-default-ca --server letsencrypt
-      
-      info "正在向 Let's Encrypt 申请证书..."
-      if [[ "$vps_ip" =~ ":" ]]; then
-        "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
-      else
-        "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
-      fi
-      
-      # 直接下发分发指令，安全安装到内部高特权隔离路径中
-      if "$acme_cmd" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc; then
-        echo "$domain" > /etc/tuic/ca.log
-        tuic_domain=$domain
-        info "Acme 证书申请并成功分发至安全沙箱！"
-      else
-        error "Acme 证书申请失败，自动切换回自签模式。"
-        certInput=1
-      fi
-    fi
-  elif [[ $certInput == 3 ]]; then
-    local user_cert user_key
-    read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
-    read -rp "请输入密钥文件 (privkey.pem/key) 的路径: " user_key
-    read -rp "请输入证书对应的域名: " tuic_domain
-    
-    if [[ -f "$user_cert" && -f "$user_key" ]]; then
-      # 深度同名复制解耦，规避父级家目录 Permission Denied
-      cp -f "$user_cert" "$cert_path"
-      cp -f "$user_key" "$key_path"
-      info "自定义证书已成功同步解耦至内部安全区。"
-    else
-      error "找不到输入的证书文件，自动降级回自签模式。"
-      certInput=1
-    fi
-  fi
-
-  if [[ $certInput == 1 ]]; then
-    info "将使用必应自签证书作为 Tuic 的节点证书"
-    openssl ecparam -genkey -name prime256v1 -out "$key_path"
-    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
-    tuic_domain="www.bing.com"
-  fi
-
-  # 强力锁紧证书本身的文件权限
-  chmod 644 "$cert_path"
-  chmod 600 "$key_path"
-}
-
 inst_port() {
-  local default_port=""
-  if [[ -f "$TUIC_CONFIG" ]]; then
-    default_port=$(jq -r '.server' "$TUIC_CONFIG" 2>/dev/null | awk -F':' '{print $NF}' || echo "")
-    [[ -z "$default_port" || "$default_port" == "null" ]] && default_port=$(jq -r '.port' "$TUIC_CONFIG" 2>/dev/null || echo "")
-  fi
+  local default_port="443"
+  [[ -f "$CADDY_CONFIG" ]] && default_port=$(grep -oE ':[0-9]+' "$CADDY_CONFIG" | head -n 1 | tr -d ':' || echo "443")
 
-  local prompt_msg="设置 Tuic 服务端监听主端口 [1-65535] (回车随机分配): "
-  [[ -n "$default_port" ]] && prompt_msg="设置 Tuic 服务端监听主端口 [当前: ${default_port}, 回车不修改]: "
-
+  local prompt_msg="设置 NaiveProxy 监听端口 [默认: 443, 回车确认]: "
   while true; do
     read -rp "$prompt_msg" port
-    if [[ -z "$port" ]]; then
-      if [[ -n "$default_port" ]]; then port="$default_port" && break
-      else
-        port=$(get_random_port)
-        info "已为您随机分配未被占用端口: $port" && break
-      fi
-    elif is_valid_port "$port"; then
+    port=${port:-$default_port}
+    if is_valid_port "$port"; then
       if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
         error "端口 ${port} 已被其它程序占用，请更换。" && continue
       fi
       break
     else error "请输入有效的端口数字 (1-65535)"; fi
   done
+}
 
-  echo "---------------------------------------------"
-  echo -e "Tuic 端口群使用模式 ："
-  echo -e " 1) 单端口模式"
-  echo -e " 2) 端口跳跃模式 ${YELLOW}（默认)${RESET}"
-  echo "---------------------------------------------"
-  local jumpInput
-  read -rp "请选择端口模式 [1-2] (默认2): " jumpInput
-  jumpInput=${jumpInput:-2}
-
-  clear_old_iptables
-
-  if [[ $jumpInput == 2 ]]; then
-    while true; do
-      read -rp "设置外部跳跃起始端口 (建议10000-65535): " firstport
-      read -rp "设置外部跳跃末尾端口 (必须大于起始端口): " endport
-      if is_valid_port "$firstport" && is_valid_port "$endport" && [[ $firstport -lt $endport ]]; then break
-      else error "输入无效，起始端口必须小于末尾端口，请重新输入。"; fi
-    done
-    mkdir -p "$CONFIG_DIR"
-    echo "$firstport-$endport" > "${CONFIG_DIR}/hopping.txt"
+download_custom_html() {
+  local html_url="https://raw.githubusercontent.com/sistarry/toolbox/refs/heads/main/toy/nahtml.html"
+  mkdir -p "$WEB_WWW_DIR"
+  info "正在拉取指定的伪装网页源码..."
+  if curl -sS "$html_url" -o "$WEB_WWW_DIR/index.html"; then
+    info "伪装网页已成功下载并缓存至本地目录: $WEB_WWW_DIR/index.html"
   else
-    rm -f "${CONFIG_DIR}/hopping.txt" "${CONFIG_DIR}/main_port.txt"
-    info "将继续使用单端口模式"
+    warn "远程伪装网页下载失败，自动生成一个基础伪装页面占位。"
+    echo "<h1>Welcome to nginx!</h1>" > "$WEB_WWW_DIR/index.html"
   fi
 }
 
 write_and_show_config() {
-  local HOSTNAME=$(hostname -s | sed 's/ /_/g')
-  local vps_ip=$(get_public_ip)
-  local last_ip="$vps_ip"
-  [[ "$vps_ip" =~ ":" ]] && last_ip="[$vps_ip]"
+  local hostname=$(hostname -s | sed 's/ /_/g')
+  local ip=$(get_public_ip)
 
-  # 自动判定证书校验逻辑
-  local is_insecure="0"
-  local skip_cert="false"
-  if [[ "$tuic_domain" == "www.bing.com" ]]; then
-    is_insecure="1"
-    skip_cert="true"
-  fi
+  # 先拉取指定的 HTML 源码到本地
+  download_custom_html
 
-  cat << EOF > /etc/tuic/server.json
-{
-  "server": "[::]:$port",
-  "certificate": "$cert_path",
-  "private_key": "$key_path",
-  "users": {
-    "$auth_uuid": "$auth_pwd"
-  },
-  "congestion_control": "bbr",
-  "alpn": ["h3"],
-  "log_level": "info"
+  # 1. 写入服务端 Caddyfile 配置
+  cat << EOF > "$CADDY_CONFIG"
+:$port {
+    # 开启 TLS 并自动申请证书
+    tls $sb_email {
+        protocols tls1.3
+    }
+    
+    # 转发代理（Naive 核心逻辑）
+    forward_proxy {
+        basic_auth $auth_user $auth_pwd
+        hide_ip
+        hide_via
+        probe_resistance
+    }
+    
+    # 伪装站设置（直接渲染刚刚下载的本地 HTML 网页，抗沙箱嗅探能力极强）
+    root * $WEB_WWW_DIR
+    file_server
 }
 EOF
 
-  apply_new_iptables
-
-  mkdir -p "$TUIC_DIR"
-  
-  local hopping_param=""
-  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
-    hopping_param="&mport=$(cat "${CONFIG_DIR}/hopping.txt")"
+  # 修正域名绑定格式
+  if [[ "$port" == "443" ]]; then
+      sed -i "s|:$port|$sb_domain|g" "$CADDY_CONFIG"
+  else
+      sed -i "s|:$port|$sb_domain:$port|g" "$CADDY_CONFIG"
   fi
 
-  cat << EOF > "$TUIC_DIR/url.txt"
-V2rayN 链接:
-tuic://$auth_uuid:$auth_pwd@$last_ip:$port?alpn=h3&congestion_control=bbr&sni=$tuic_domain&allow_insecure=${is_insecure}${hopping_param}#$HOSTNAME-tuicv5
-
-Surge 配置:
-$HOSTNAME-tuicv5 = tuic-v5, $last_ip, $port, password=$auth_pwd, uuid=$auth_uuid, ecn=true, skip-cert-verify=${skip_cert}, sni=$tuic_domain
-
-Clash Meta / Mihomo 格式备忘:
-- name: $HOSTNAME-tuic
-  type: tuic
-  server: $vps_ip
-  port: $port
-  uuid: $auth_uuid
-  password: $auth_pwd
-  alpn: [h3]
-  sni: $tuic_domain
-  skip-cert-verify: ${skip_cert}
+  mkdir -p "$NAIVE_DIR"
+  
+  # 2. 写入通用客户端 config.json 备份
+  cat << EOF > "$NAIVE_DIR/config.json"
+{
+  "listen": "socks://127.0.0.1:1080",
+  "proxy": "https://$auth_user:$auth_pwd@$sb_domain:$port"
+}
 EOF
 
-  systemctl daemon-reload
-  systemctl enable tuic-server >/dev/null 2>&1 || true
-  systemctl restart tuic-server >/dev/null 2>&1 || true
+  # 3. 固化持久化节点数据
+  cat << EOF > "$NAIVE_DIR/url.txt"
+====== NaiveProxy 节点信息 ======
+域名    : ${sb_domain}
+端口    : $port
+用户名  : $auth_user
+密码    : $auth_pwd
+---------------------------
+[信息] 客户端通用标准分享格式 (如 v2rayN / SagerNet)：
+naive://$auth_user:$auth_pwd@$sb_domain:$port?padding=true#$hostname-Naive
+---------------------------------
+EOF
 
-  if systemctl is-active --quiet tuic-server 2>/dev/null; then
-    info "Tuic 服务配置并启动成功！"
+  # 4. 守护进程分支运行
+  if has_command systemctl; then
+    systemctl daemon-reload
+    systemctl enable caddy >/dev/null 2>&1 || true
+    systemctl restart caddy >/dev/null 2>&1 || true
+    
+    if systemctl is-active --quiet caddy 2>/dev/null; then
+      info "NaiveProxy (Caddy) 服务配置并启动成功！"
+    else
+      error "Caddy 服务启动失败，请运行 'systemctl status caddy' 查看日志。"
+    fi
   else
-    error "Tuic 服务启动失败，请运行 'systemctl status tuic-server' 查看日志。"
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+    "$EXECUTABLE_INSTALL_PATH" run --environ --config $CADDY_CONFIG >/dev/null 2>&1 &
+    info "非 systemd 环境，程序已挂载至后台 Pid 进程池中运行。"
   fi
+  
   showconf
 }
+
 # =========================================================
-# 6. 安装、更新与卸载核心流控
+# 5. 主流程功能控制模块
 # =========================================================
-install_tuic() {
-  echo -e "${GREEN}[信息] 开始安装 Tuic V5 ...${RESET}"
+instsingbox() {
   check_environment
-  mkdir -p "$TUIC_DIR"
+  
+  mkdir -p /etc/caddy
 
-  local arch raw_tag pure_version url
-  arch=$(detect_arch)
-  
-  echo -e "${GREEN}[信息] 正在动态获取 Tuic 最新版本...${RESET}"
-  raw_tag=$(get_latest_version)
-  
-  if [[ -z "$raw_tag" || "$raw_tag" == "null" ]]; then
-    echo -e "${RED}[错误] 无法获取最新版本号，请检查网络设置。${RESET}"
-    return 1
+  local _tmparchive=$(mktemp)
+  if ! download_caddy_naive "$_tmparchive"; then
+    rm -f "$_tmparchive" && return 1
   fi
-  
-  pure_version=${raw_tag#tuic-server-}
-  echo -e "${GREEN}[信息] 检测到最新版本 Tag 为: ${raw_tag} (版本号: v${pure_version})${RESET}"
-  
-  url="https://github.com/EAimTY/tuic/releases/download/${raw_tag}/tuic-server-${pure_version}-${arch}"
 
-  echo -e "${GREEN}[信息] 开始下载 Tuic 服务端到 /usr/local/bin ...${RESET}"
-  echo -e "${BLUE}[下载路径] ${url}${RESET}"
+  echo -ne "正在解压并安装二进制可执行文件 ... "
+  local _tmpdir=$(mktemp -d)
+  tar -xf "$_tmparchive" -C "$_tmpdir"
   
-  if ! wget -O "$BINARY_PATH" -q "$url"; then
-    echo -e "${YELLOW}[警告] wget 下载失败，尝试切换到 curl...${RESET}"
-    curl -fsSL -o "$BINARY_PATH" "$url" || { echo -e "${RED}[错误] 核心程序下载失败，请检查网络${RESET}"; return 1; }
+  if install -Dm755 "$_tmpdir"/naiveproxy-*/caddy "$EXECUTABLE_INSTALL_PATH"; then
+    echo "成功"
+  else
+    rm -rf "$_tmparchive" "$_tmpdir" && error "安装失败" && return 1
   fi
-  
-  chmod +x "$BINARY_PATH"
-  echo -e "${GREEN}[信息] Tuic 核心下载并安装成功。${RESET}"
+  rm -rf "$_tmparchive" "$_tmpdir"
 
-  mkdir -p "$CONFIG_DIR"
-  cat << EOF > "$SYSTEMD_SERVICES_DIR/tuic-server.service"
-[Unit]
-Description=Tuic Server Service
-After=network.target
+  if has_command systemctl; then
+    install_content -Dm644 "$(tpl_caddy_server_service)" "$SYSTEMD_SERVICES_DIR/caddy.service" "1"
+  fi
 
-[Service]
-Type=simple
-ExecStart=$BINARY_PATH --config $TUIC_CONFIG
-Restart=always
-RestartSec=5
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+  echo "---------------------------------------------"
+  echo -e "配置 NaiveProxy 所需的公网可解析域名："
+  read -rp "请输入你的域名 (例如: naive.example.com): " sb_domain
+  [[ -z $sb_domain ]] && error "必须绑定域名才能自动化申请 TLS 证书！" && return 1
 
-[Install]
-WantedBy=multi-user.target
-EOF
+  read -rp "请输入用于申请证书的邮箱 (回车随机生成): " sb_email
+  sb_email=${sb_email:-"$(date +%s%N | md5sum | cut -c 1-8)@gmail.com"}
 
-  inst_cert || return 1
   inst_port
   
-  read -rp "设置 Tuic 验证 UUID (回车自动分配随机 UUID): " auth_uuid
-  auth_uuid=${auth_uuid:-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "12345678-1234-1234-1234-123456781234")}
-  
-  read -rp "设置 Tuic 验证密码 (回车自动分配随机密码): " auth_pwd
+  read -rp "设置 Naive 验证用户名 (回车默认: admin): " auth_user
+  auth_user=${auth_user:-"admin"}
+
+  read -rp "设置 Naive 验证密码 (直接回车将自动分配强随机密码): " auth_pwd
   auth_pwd=${auth_pwd:-$(generate_random_password)}
 
   write_and_show_config
 }
 
-update_tuic() {
-  if [[ ! -f "$BINARY_PATH" ]]; then
-    error "当前系统未安装 Tuic，无法执行更新。"
+update_singbox() {
+  if [[ ! -f "$CADDY_BINARY" ]]; then
+    error "当前系统未安装 NaiveProxy 内核，无法执行更新。"
     return 1
   fi
 
-  info "正在检查新版本..."
-  local current_version=$(get_installed_version)
-  local raw_tag=$(get_latest_version)
-
-  if [[ -z "$raw_tag" || "$raw_tag" == "null" ]]; then
-    error "无法连接到 GitHub API 获取最新版本，请稍后再试。"
-    return 1
-  fi
-
-  local pure_version=${raw_tag#tuic-server-}
-  info "当前安装版本: ${YELLOW}${current_version}${RESET}"
-  info "官方最新版本: ${GREEN}${pure_version}${RESET}"
-
-  if [[ "$current_version" == "$pure_version" ]]; then
-    info "您当前已经是最新版本，无需更新。"
-    return 0
-  fi
-
-  warn "检测到新版本，即将开始平滑更新 (原有防火墙转发及配置不受损)..."
+  warn "即将开始平滑更新 (你的配置与运行数据不会改变)..."
   
-  local arch=$(detect_arch)
-  local url="https://github.com/EAimTY/tuic/releases/download/${raw_tag}/tuic-server-${pure_version}-${arch}"
-  local _tmpfile=$(mktemp)
-
-  if ! curl -fsSL -o "$_tmpfile" "$url"; then
-    error "下载核心失败！"
-    rm -f "$_tmpfile" && return 1
+  local _tmparchive=$(mktemp)
+  if ! download_caddy_naive "$_tmparchive"; then
+    rm -f "$_tmparchive" && return 1
   fi
 
-  systemctl stop tuic-server >/dev/null 2>&1 || true
-  if cp "$_tmpfile" "$BINARY_PATH" && chmod +x "$BINARY_PATH"; then
-    info "核心覆盖成功！"
+  echo -ne "正在覆盖二进制核心文件 ... "
+  local _tmpdir=$(mktemp -d)
+  tar -xf "$_tmparchive" -C "$_tmpdir"
+  if install -Dm755 "$_tmpdir"/naiveproxy-*/caddy "$EXECUTABLE_INSTALL_PATH"; then
+    echo "成功"
   else
-    error "覆盖核心失败"
-    rm -f "$_tmpfile" && return 1
+    rm -rf "$_tmparchive" "$_tmpdir" && error "覆盖核心失败" && return 1
   fi
-  rm -f "$_tmpfile"
+  rm -rf "$_tmparchive" "$_tmpdir"
 
-  info "正在重启 Tuic 服务..."
-  systemctl restart tuic-server >/dev/null 2>&1 || true
-
-  if systemctl is-active --quiet tuic-server 2>/dev/null; then
-    info "Tuic 已成功更新至 ${GREEN}v${pure_version}${RESET}！"
+  info "正在重启服务以应用更新..."
+  if has_command systemctl; then
+    systemctl daemon-reload
+    systemctl restart caddy >/dev/null 2>&1 || true
+    info "NaiveProxy 内核已成功平滑更新！"
   else
-    error "核心更新成功，但服务重启失败，请检查日志。"
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+    "$EXECUTABLE_INSTALL_PATH" run --environ --config "$CADDY_CONFIG" >/dev/null 2>&1 &
+    info "内核已更新并于后台重启运行。"
   fi
 }
 
-unsttuic() {
-  warn "即将从当前系统中彻底卸载 Tuic 并清理防火墙转发规则"
+unstsingbox() {
+  warn "即将从当前系统中彻底卸载 NaiveProxy (Caddy)"
 
-  clear_old_iptables
-  save_iptables_rules
+  if has_command systemctl; then
+    systemctl stop caddy >/dev/null 2>&1 || true
+    systemctl disable caddy >/dev/null 2>&1 || true
+    remove_file "$SYSTEMD_SERVICES_DIR/caddy.service"
+    systemctl daemon-reload
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+  fi
+  
+  remove_file "$EXECUTABLE_INSTALL_PATH"
+  rm -rf /etc/caddy "$NAIVE_DIR" "$WEB_WWW_DIR"
 
-  systemctl stop tuic-server >/dev/null 2>&1 || true
-  systemctl disable tuic-server >/dev/null 2>&1 || true
-  
-  rm -f "$BINARY_PATH"
-  rm -f "$SYSTEMD_SERVICES_DIR/tuic-server.service"
-  
-  systemctl daemon-reload
-  rm -rf /etc/tuic "$TUIC_DIR"
-  
-  info "Tuic 已彻底卸载"
+  info "NaiveProxy 已彻底从您的系统中移除！"
 }
 
 changeconf() {
-  if [[ ! -f "$TUIC_CONFIG" ]]; then
-    error "配置文件不存在，请先安装 Tuic"
+  if [[ ! -f "$CADDY_CONFIG" ]]; then
+    error "配置文件不存在，请先安装 NaiveProxy"
     return 1
   fi
 
-  local old_uuid=$(jq -r '.users | keys[0]' "$TUIC_CONFIG" 2>/dev/null || echo "")
-  local old_pwd=$(jq -r ".users.\"$old_uuid\"" "$TUIC_CONFIG" 2>/dev/null || echo "")
-  local old_cert=$(jq -r '.certificate' "$TUIC_CONFIG" 2>/dev/null || echo "")
-  local old_key=$(jq -r '.private_key' "$TUIC_CONFIG" 2>/dev/null || echo "")
-  local old_sni="www.bing.com"
-  [[ -f "$TUIC_DIR/url.txt" ]] && old_sni=$(grep -E '^\s*sni:' "$TUIC_DIR/url.txt" | awk '{print $2}' | tr -d '"'\' || true)
-
   clear
-  echo -e "${GREEN}====== 修改 Tuic 配置 ======${RESET}"
-  echo "提示：直接敲回车将保持原有配置不变"
+  echo -e "${GREEN}====== 修改 NaiveProxy 配置 ======${RESET}"
+  echo "提示：重新配置需要填入完整参数"
   echo "---------------------------------------------"
   
+  read -rp "请输入你的解析域名: " sb_domain
+  [[ -z $sb_domain ]] && error "域名不能为空！" && return 1
+
+  read -rp "请输入申请证书的邮箱: " sb_email
+  sb_email=${sb_email:-"admin@gmail.com"}
+
   inst_port 
 
-  local auth_uuid
-  read -rp "设置 Tuic 验证 UUID [当前: ${old_uuid}, 回车不修改]: " auth_uuid
-  auth_uuid=${auth_uuid:-$old_uuid}
+  read -rp "设置 Naive 验证用户名: " auth_user
+  auth_user=${auth_user:-"admin"}
 
-  local auth_pwd
-  read -rp "设置 Tuic 验证密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
-  auth_pwd=${auth_pwd:-$old_pwd}
-
-  local cert_path key_path tuic_domain
-  echo "---------------------------------------------"
-  read -rp "是否需要修改证书？[y/N] (直接回车默认不修改): " change_cert_flag
-  if [[ "$change_cert_flag" == "y" || "$change_cert_flag" == "Y" ]]; then
-    inst_cert || return 1
-  else
-    cert_path="$old_cert"
-    key_path="$old_key"
-    tuic_domain="$old_sni"
-  fi
+  read -rp "设置 Naive 验证密码: " auth_pwd
+  [[ -z $auth_pwd ]] && auth_pwd=$(generate_random_password)
 
   write_and_show_config
-  info "配置与防火墙转发修改成功！"
+  info "配置修改并应用成功！"
 }
 
 showconf() {
-  if [[ ! -d "$TUIC_DIR" ]]; then
-    error "未找到节点配置文件。"
+  if [[ ! -f "$CADDY_CONFIG" ]]; then
+    error "未找到 Caddyfile 配置文件，请确保已成功部署节点。"
     return
   fi
-  echo -e "${GREEN}====== 节点分享与配置信息 ======${RESET}"
-  cat "$TUIC_DIR/url.txt"
-  echo
+
+  if [[ -f "$NAIVE_DIR/url.txt" ]]; then
+     cat "$NAIVE_DIR/url.txt"
+  else
+     error "持久化配置缓存不存在。"
+  fi
 }
 
 # =========================================================
-# 7. 面板交互菜单
+# 6. 面板主菜单循环
 # =========================================================
 menu() {
   [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
@@ -665,24 +499,24 @@ menu() {
 
   while true; do
     clear
-    local status=$(get_tuic_status)
+    local status=$(get_caddy_status)
     local version=$(get_installed_version)
     local port_show=$(get_current_port_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       Tuic v5 管理面板         ${RESET}"
+    echo -e "${GREEN}      NaiveProxy 面板           ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Tuic${RESET}"
-    echo -e "${GREEN}2. 更新 Tuic${RESET}"
-    echo -e "${GREEN}3. 卸载 Tuic${RESET}"
+    echo -e "${GREEN}1. 安装 NaiveProxy${RESET}"
+    echo -e "${GREEN}2. 更新 NaiveProxy${RESET}"
+    echo -e "${GREEN}3. 卸载 NaiveProxy${RESET}"
     echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 Tuic${RESET}"
-    echo -e "${GREEN}6. 停止 Tuic${RESET}"
-    echo -e "${GREEN}7. 重启 Tuic${RESET}"
+    echo -e "${GREEN}5. 启动 NaiveProxy${RESET}"
+    echo -e "${GREEN}6. 停止 NaiveProxy${RESET}"
+    echo -e "${GREEN}7. 重启 NaiveProxy${RESET}"
     echo -e "${GREEN}8. 查看日志${RESET}"
     echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
@@ -693,14 +527,42 @@ menu() {
     [[ -z "$choice" ]] && continue
 
     case "$choice" in
-      1) install_tuic; pause ;;
-      2) update_tuic; pause ;;
-      3) rm -f "${CONFIG_DIR}/hopping.txt" "${CONFIG_DIR}/main_port.txt" 2>/dev/null; unsttuic; pause ;;
+      1) instsingbox; pause ;;
+      2) update_singbox; pause ;;
+      3) unstsingbox; pause ;;
       4) changeconf; pause ;;
-      5) systemctl start tuic-server && info "服务已成功启动！"; pause ;;
-      6) systemctl stop tuic-server && info "服务已成功停止！"; pause ;;
-      7) systemctl restart tuic-server && info "服务已成功重启！"; pause ;;
-      8) journalctl -u tuic-server.service -n 50 --no-pager; pause ;;
+      5) 
+        if has_command systemctl; then
+          systemctl start caddy && info "服务已成功启动！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+          "$EXECUTABLE_INSTALL_PATH" run --environ --config "$CADDY_CONFIG" >/dev/null 2>&1 &
+          info "进程已在后台启动！"
+        fi
+        pause ;;
+      6) 
+        if has_command systemctl; then
+          systemctl stop caddy && info "服务已成功停止！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台进程已终止！"
+        fi
+        pause ;;
+      7) 
+        if has_command systemctl; then
+          systemctl restart caddy && info "服务已成功重启！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+          "$EXECUTABLE_INSTALL_PATH" run --environ --config "$CADDY_CONFIG" >/dev/null 2>&1 &
+          info "后台进程已重启！"
+        fi
+        pause ;;
+      8) 
+        if has_command systemctl; then
+          journalctl -u caddy.service -n 50 --no-pager
+        else
+          warn "当前环境不支持 systemd 集中日志管理。"
+        fi
+        pause ;;
       9) showconf; pause ;;
       0) exit 0 ;;
       *) error "无效输入，请重新选择。"; sleep 1 ;;

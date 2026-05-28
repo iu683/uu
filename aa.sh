@@ -14,6 +14,7 @@ readonly XRAY_CONFIG="/usr/local/etc/xray/config.json"
 readonly XRAY_BINARY="/usr/local/bin/xray"
 readonly STATE_FILE="/root/xray_reality_info.txt"
 readonly LINK_FILE="/root/xray_vless_reality_link.txt"
+readonly XRAY_PUBLIC_KEY_FILE="/usr/local/etc/xray/public.key"
 XRAY_INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
 SYSTEMD_SERVICES_DIR="/etc/systemd/system"
 CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
@@ -159,37 +160,60 @@ generate_uuid() {
   fi
 }
 
-# 生成 REALITY 密钥对
+# ================== 生成 Reality 密钥 ==================
 generate_reality_keys() {
-  if [ ! -f "$XRAY_BINARY" ]; then
-    error "Xray 未安装，无法生成 REALITY 密钥对"
-    return 1
-  fi
-  local keypair
-  keypair=$($XRAY_BINARY x25519 2>/dev/null || true)
-  if [ -z "$keypair" ]; then
-    error "生成 REALITY 密钥失败"
-    return 1
-  fi
-  local pk=$(echo "$keypair" | grep "Private key:" | awk '{print $3}')
-  local pub=$(echo "$keypair" | grep "Public key:" | awk '{print $3}')
-  echo "${pk}|${pub}"
+    info "正在生成 Reality 密钥..."
+    local key_pair
+
+    if ! key_pair=$(timeout 10 "$XRAY_BINARY" x25519 2>/dev/null); then
+        error "Reality 密钥生成失败"
+        return 1
+    fi
+
+    local private_key
+    private_key=$(echo "$key_pair" \
+        | grep -i "Private" \
+        | awk -F ': ' '{print $2}' \
+        | tr -d '\r ')
+
+    local public_key
+    public_key=$(echo "$key_pair" \
+        | grep -i "Public" \
+        | awk -F ': ' '{print $2}' \
+        | tr -d '\r ')
+
+    if [[ -z "${private_key:-}" || -z "${public_key:-}" ]]; then
+        error "生成的密钥对无效或为空"
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$XRAY_PUBLIC_KEY_FILE")"
+    echo "$public_key" > "$XRAY_PUBLIC_KEY_FILE"
+    echo "${private_key}|${public_key}"
+}
+
+# ================== 获取 PublicKey ==================
+get_public_key() {
+    [[ -f "$XRAY_PUBLIC_KEY_FILE" ]] && cat "$XRAY_PUBLIC_KEY_FILE"
 }
 
 # =========================================================
 # 4. 面板核心交互与配置文件处理
 # =========================================================
 write_and_show_config() {
-  # 彻底重写状态底座
   rm -f "$STATE_FILE"
 
+  # 为 xhttp 动态生成随机复杂路径，防止被批量探测特征
+  local rand_path="/$(openssl rand -hex 4 2>/dev/null || echo "xhttp")$(shuf -i 1000-9999 -n 1)"
+
+  # 严格套用官方推荐的 Inbound 原生字段规范进行组合
   jq -n \
     --argjson port "$PORT" \
     --arg uuid "$UUID" \
-    --arg dest "$DEST" \
-    --arg serverName "$SERVER_NAME" \
+    --arg target "$DEST" \
     --arg privateKey "$PRIVATE_KEY" \
     --arg shortId "$SHORT_ID" \
+    --arg path "$rand_path" \
   '{
     "log": {"loglevel": "warning"},
     "inbounds": [{
@@ -205,17 +229,21 @@ write_and_show_config() {
         "security": "reality",
         "realitySettings": {
           "show": false,
-          "dest": ($dest + ":443"),
-          "serverNames": [$serverName],
+          "target": ($target + ":443"),
+          "serverNames": [$target],
           "privateKey": $privateKey,
           "shortIds": [$shortId]
         },
         "xhttpSettings": {
-          "mode": "packet-streamed",
-          "extra": {
-            "scVary": true
-          }
+          "host": "",
+          "path": $path,
+          "mode": "auto"
         }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "metadataOnly": false
       }
     }],
     "outbounds": [{
@@ -235,21 +263,27 @@ UUID='${UUID}'
 REMARK='${REMARK}'
 SERVER_IP='${SERVER_IP}'
 DEST='${DEST}'
-SERVER_NAME='${SERVER_NAME}'
+SERVER_NAME='${DEST}'
 PRIVATE_KEY='${PRIVATE_KEY}'
 PUBLIC_KEY='${PUBLIC_KEY}'
 SHORT_ID='${SHORT_ID}'
+XHTTP_PATH='${rand_path}'
 EOF
 
-  # 强制清除旧的残留进程，避免端口占用导致死锁
   pkill -f "$XRAY_BINARY run" || true
+
+  # 擦除会导致 systemd 警告的 User=nobody 减权策略
+  local service_file="/etc/systemd/system/xray.service"
+  if [[ -f "$service_file" ]]; then
+    sed -i '/User=nobody/d' "$service_file" 2>/dev/null || true
+  fi
 
   if has_command systemctl; then
     systemctl daemon-reload
     systemctl enable xray >/dev/null 2>&1 || true
     systemctl restart xray >/dev/null 2>&1 || true
     if systemctl is-active --quiet xray 2>/dev/null; then
-      info "Xray (VLESS-REALITY-xhttp) 服务配置并启动成功！"
+      info "Xray (VLESS-REALITY-xhttp) 核心组件部署并拉起成功！"
     else
       error "Xray 服务启动失败，请运行 'journalctl -u xray -f' 查看错误日志。"
     fi
@@ -288,7 +322,8 @@ inst_singbox() {
   fi
 
   # 生成 REALITY 依赖对
-  local keys=$(generate_reality_keys)
+  local keys
+  keys=$(generate_reality_keys)
   if [ -z "$keys" ]; then return 1; fi
   PRIVATE_KEY=$(echo "$keys" | cut -d'|' -f1)
   PUBLIC_KEY=$(echo "$keys" | cut -d'|' -f2)
@@ -398,8 +433,8 @@ uninstall_singbox() {
   fi
   
   if execute_official_script "remove --purge"; then
-    rm -f "$LINK_FILE" "$STATE_FILE" "$XRAY_CONFIG"
-    info "已完全卸载 Xray、配置文件与状态文件。"
+    rm -f "$LINK_FILE" "$STATE_FILE" "$XRAY_CONFIG" "$XRAY_PUBLIC_KEY_FILE"
+    info "已完全卸载 Xray、配置文件、公钥文件与状态文件。"
   else
     error "Xray 卸载失败！"
   fi
@@ -417,21 +452,24 @@ showconf() {
   local dest=$(grep -E "^DEST=" "$STATE_FILE" | cut -d"'" -f2)
   local pubkey=$(grep -E "^PUBLIC_KEY=" "$STATE_FILE" | cut -d"'" -f2)
   local sid=$(grep -E "^SHORT_ID=" "$STATE_FILE" | cut -d"'" -f2)
+  local xpath=$(grep -E "^XHTTP_PATH=" "$STATE_FILE" | cut -d"'" -f2 || echo "/xhttp")
   local current_remark=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 || echo "VLESS-REALITY")
 
   local encoded_remark=$(jq -rn --arg x "$current_remark" '$x|@uri')
+  local encoded_path=$(jq -rn --arg x "$xpath" '$x|@uri')
   local address_for_url=$server_ip
   if [[ $server_ip == *":"* ]]; then address_for_url="[${server_ip}]"; fi
 
-  # 依据最新 Xray 规范拼装 VLESS + REALITY + xhttp 分享链接
-  local vless_link="vless://${uuid}@${address_for_url}:${port}?security=reality&sni=${dest}&pbk=${pubkey}&sid=${sid}&fp=chrome&type=xhttp&mode=packet-streamed&extra=%7B%22scVary%22%3Atrue%7D#${encoded_remark}"
+  # 依据最新 Xray 规范拼装 VLESS + REALITY + xhttp(mode=auto) 分享链接
+  local vless_link="vless://${uuid}@${address_for_url}:${port}?security=reality&sni=${dest}&pbk=${pubkey}&sid=${sid}&fp=chrome&type=xhttp&mode=auto&path=${encoded_path}#${encoded_remark}"
   echo "$vless_link" > "$LINK_FILE"
 
   echo -e "${GREEN}====== VLESS-REALITY-xhttp 节点配置信息 ======${RESET}"
   echo -e "${GREEN}服务器公网 IP   :${RESET} ${server_ip}"
   echo -e "${GREEN}服务监听端口     :${RESET} ${port}"
   echo -e "${GREEN}用户 UUID        :${RESET} ${uuid}"
-  echo -e "${GREEN}传输层/安全协议  :${RESET} xhttp (packet-streamed) + REALITY"
+  echo -e "${GREEN}传输层/安全协议  :${RESET} xhttp (mode: auto) + REALITY"
+  echo -e "${GREEN}XHTTP 混淆路径   :${RESET} ${xpath}"
   echo -e "${GREEN}REALITY 伪装目标 :${RESET} ${dest}:443"
   echo -e "${GREEN}REALITY 公钥     :${RESET} ${pubkey}"
   echo -e "${GREEN}REALITY 短 ID    :${RESET} ${sid}"

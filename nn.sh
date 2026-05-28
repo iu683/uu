@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =========================================================
-# AnyTLS 安装/卸载管理脚本 (管道全兼容全绿 UI 版)
+# AnyTLS 安装/卸载管理脚本 (自动更新与管道全兼容精修版)
 # =========================================================
 
 # ================== 颜色定义 ==================
@@ -14,7 +14,7 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 # ================== 基础变量 ==================
-SCRIPT_VERSION="1.3"
+SCRIPT_VERSION="1.4"
 SERVICE_NAME="anytls"
 BINARY_NAME="anytls-server"
 BINARY_DIR="/usr/local/bin"
@@ -135,6 +135,16 @@ detect_arch() {
     esac
 }
 
+# ================== 自动获取 GitHub 最新版本号 ==================
+get_latest_version() {
+    local latest_release
+    latest_release=$(curl -fsSL --max-time 5 "https://api.github.com/repos/anytls/anytls-go/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
+    if [[ -z "$latest_release" ]]; then
+        latest_release=$(curl -fsSLI --max-time 5 "https://github.com/anytls/anytls-go/releases/latest" 2>/dev/null | grep -i 'location:' | sed -E 's/.*\/v?([^/\r\n]+).*/\1/')
+    fi
+    echo "${latest_release:-0.0.12}"
+}
+
 # ================== 配置 ==================
 write_config() {
     mkdir -p "$ANYTLS_DIR"
@@ -159,10 +169,12 @@ output_node_links() {
     echo -e "${YELLOW}端口    : $1${RESET}"
     echo -e "${YELLOW}密码    : $2${RESET}"
     echo -e "${GREEN}---------------------------${RESET}"
-
+    echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
+    echo -e "${YELLOW}[信息] V2rayN 链接：${RESET}"
     echo -e "${CYAN}anytls://$2@$ip:$1/?insecure=1#$hostname${RESET}"
-    echo
+    echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
     echo -e "${CYAN}$hostname = anytls, $ip, $1, password=$2, tfo=true, skip-cert-verify=true, reuse=false${RESET}"
+    echo -e "${YELLOW}---------------------------------${RESET}"
 }
 
 # ================== 安装 ==================
@@ -176,11 +188,14 @@ install_ss() {
     local arch
     arch=$(detect_arch)
 
-    local version="0.0.12"
+    echo -e "${GREEN}[信息] 正在获取 AnyTLS 最新版本...${RESET}"
+    local version
+    version=$(get_latest_version)
+    echo -e "${GREEN}[信息] 检测到最新版本为: v${version}${RESET}"
+
     local url="https://github.com/anytls/anytls-go/releases/download/v${version}/anytls_${version}_linux_${arch}.zip"
 
     cd "$TMP_DIR"
-
     wget "$url" -O anytls.zip
     unzip -o anytls.zip -d "$TMP_DIR"
 
@@ -257,6 +272,60 @@ EOF
     log "安装成功"
 }
 
+# ================== 更新 AnyTLS 主程序 ==================
+update_ss() {
+    if [[ ! -f "${ANYTLS_DIR}/version.txt" || ! -f "$ANYTLS_CONFIG" ]]; then
+        echo -e "${RED}[错误] 未检测到已安装的 AnyTLS 服务，请先执行安装。${RESET}"
+        return 1
+    fi
+
+    local current_version
+    current_version=$(cat "${ANYTLS_DIR}/version.txt")
+    
+    echo -e "${GREEN}[信息] 正在获取最新版本...${RESET}"
+    local latest_version
+    latest_version=$(get_latest_version)
+
+    echo -e "${GREEN}当前版本: v${current_version}${RESET}"
+    echo -e "${GREEN}最新版本: v${latest_version}${RESET}"
+
+    if [[ "$current_version" == "$latest_version" ]]; then
+        read -p "当前已是最新版本，是否仍要重新下载覆盖？[y/N]: " remode < /dev/tty
+        if [[ ! "$remode" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}已取消更新。${RESET}"
+            return 0
+        fi
+    fi
+
+    echo -e "${GREEN}[信息] 开始升级主程序到 v${latest_version}...${RESET}"
+    local arch
+    arch=$(detect_arch)
+    local url="https://github.com/anytls/anytls-go/releases/download/v${latest_version}/anytls_${latest_version}_linux_${arch}.zip"
+
+    cd "$TMP_DIR"
+    wget "$url" -O anytls.zip || { echo -e "${RED}下载失败${RESET}"; return 1; }
+    unzip -o anytls.zip -d "$TMP_DIR"
+
+    local real_binary_path
+    real_binary_path=$(find "$TMP_DIR" -type f -name "$BINARY_NAME" | head -n 1)
+    if [[ -z "$real_binary_path" ]]; then
+        echo -e "${RED}[错误] 压缩包内未找到可执行程序 ${BINARY_NAME}${RESET}"
+        return 1
+    fi
+
+    systemctl stop "$SERVICE_NAME" || true
+    install -m755 "$real_binary_path" "$BINARY_PATH"
+    echo "$latest_version" > "${ANYTLS_DIR}/version.txt"
+    systemctl start "$SERVICE_NAME"
+
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        echo -e "${GREEN}[完成] AnyTLS 成功升级至 v${latest_version}!${RESET}"
+        log "升级成功至 v${latest_version}"
+    else
+        echo -e "${RED}[错误] 升级后服务启动失败，请检查日志。${RESET}"
+    fi
+}
+
 # ================== 修改配置 ==================
 modify_ss() {
     [[ -f "$ANYTLS_CONFIG" ]] || {
@@ -320,22 +389,22 @@ show_menu() {
         source "$ANYTLS_CONFIG" &&
         port=$ANYTLS_PORT
 
-    # 🌟 这里的菜单选项、头部和底部边框全部渲染为纯绿色
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}AnyTLS 管理面板 v${SCRIPT_VERSION}${RESET}"
+    echo -e "${GREEN}      AnyTLS 管理面板          ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}版本 :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port}${RESET}"
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}1. 安装${RESET}"
-    echo -e "${GREEN}2. 卸载${RESET}"
-    echo -e "${GREEN}3. 修改配置${RESET}"
-    echo -e "${GREEN}4. 启动${RESET}"
-    echo -e "${GREEN}5. 停止${RESET}"
-    echo -e "${GREEN}6. 重启${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看节点${RESET}"
+    echo -e "${GREEN}1. 安装 AnyTLS${RESET}"
+    echo -e "${GREEN}2. 更新 AnyTLS${RESET}"
+    echo -e "${GREEN}3. 卸载 AnyTLS${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 AnyTLS${RESET}"
+    echo -e "${GREEN}6. 停止 AnyTLS${RESET}"
+    echo -e "${GREEN}7. 重启 AnyTLS${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}==============================${RESET}"
 }
@@ -345,19 +414,19 @@ while true; do
     show_menu
 
     set +e
-    # 🌟 输入选项的提示符也改为了统一的高亮绿色
     read -r -p $'\033[32m请输入选项: \033[0m' choice < /dev/tty
     set -e
 
     case $choice in
         1) install_ss; pause ;;
-        2) uninstall_ss; pause ;;
-        3) modify_ss; pause ;;
-        4) systemctl start "$SERVICE_NAME"; pause ;;
-        5) systemctl stop "$SERVICE_NAME"; pause ;;
-        6) systemctl restart "$SERVICE_NAME"; pause ;;
-        7) journalctl -u "$SERVICE_NAME" -e --no-pager; pause ;;
-        8)
+        2) update_ss; pause ;;
+        3) uninstall_ss; pause ;;
+        4) modify_ss; pause ;;
+        5) systemctl start "$SERVICE_NAME"; echo -e "${GREEN}[完成] AnyTLS 已启动${RESET}"; pause ;;
+        6) systemctl stop "$SERVICE_NAME"; echo -e "${GREEN}[完成] AnyTLS 已停止${RESET}"; pause ;;
+        7) systemctl restart "$SERVICE_NAME"; echo -e "${GREEN}[完成] AnyTLS 已重启${RESET}"; pause ;;
+        8) journalctl -u "$SERVICE_NAME" -e --no-pager; pause ;;
+        9)
             [[ -f "$ANYTLS_CONFIG" ]] && {
                 source "$ANYTLS_CONFIG"
                 output_node_links "$ANYTLS_PORT" "$ANYTLS_PASSWORD"

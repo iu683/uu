@@ -1,12 +1,29 @@
-#!/bin/bash
-
+#!/usr/bin/env bash
+#
+# Xray (VLESS-Encryption) 核心控制面板
+# SPDX-License-Identifier: MIT
+#
 # =========================================================
-# Xray VLESS-HTTPUpgrade 管理脚本
+# 1. 核心控制与全局环境初始化
 # =========================================================
+set -Eop pipefail
+export LANG=en_US.UTF-8
 
-set -Eeuo pipefail
+# 基础目录与硬编码配置
+readonly XRAY_CONFIG="/usr/local/etc/xray/config.json"
+readonly XRAY_BINARY="/usr/local/bin/xray"
+readonly STATE_FILE="/root/xray_encryption_info.txt"
+readonly LINK_FILE="/root/xray_vless_encryption_link.txt"
+XRAY_INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
+SYSTEMD_SERVICES_DIR="/etc/systemd/system"
+CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
 
-# ================== 颜色 ==================
+# 自动检测环境与动态变量池
+PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
+OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
+ARCHITECTURE="${ARCHITECTURE:-}"
+
+# 终端规范颜色代码
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
@@ -14,617 +31,506 @@ BLUE="\033[34m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-# ================== 基础变量 ==================
-readonly SCRIPT_VERSION="1.0"
-
-readonly XRAY_CONFIG="/usr/local/etc/xray/config.json"
-readonly XRAY_BINARY="/usr/local/bin/xray"
-
-readonly INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
-
-TMP_DIR=$(mktemp -d -t xray.XXXXXX)
-
-# ================== cleanup ==================
-cleanup() {
-    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+# =========================================================
+# 2. 官方原生底层工具函数
+# =========================================================
+has_command() {
+  local _command=$1
+  type -P "$_command" > /dev/null 2>&1
 }
 
-trap cleanup EXIT INT TERM
-
-# ================== 日志 ==================
-info() {
-    echo -e "${GREEN}[信息] $*${RESET}" >&2
+curl() {
+  command curl "${CURL_FLAGS[@]}" "$@"
 }
 
-warn() {
-    echo -e "${YELLOW}[警告] $*${RESET}" >&2
+mktemp() {
+  command mktemp "$@" "xrayservinst.XXXXXXXXXX"
 }
 
-error() {
-    echo -e "${RED}[错误] $*${RESET}" >&2
+info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
+error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
+pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
+
+systemctl() {
+  if ! has_command systemctl; then
+    warn "当前系统不支持 systemd，忽略守护进程操作: systemctl $*"
+    return 0
+  fi
+  command systemctl "$@"
 }
 
-pause() {
-    read -n 1 -s -r -p "按任意键返回菜单..." || true
-    echo
+detect_package_manager() {
+  [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
+  has_command apt && PACKAGE_MANAGEMENT_INSTALL='apt -y --no-install-recommends install' && return 0
+  has_command dnf && PACKAGE_MANAGEMENT_INSTALL='dnf -y install' && return 0
+  has_command yum && PACKAGE_MANAGEMENT_INSTALL='yum -y install' && return 0
+  return 1
 }
 
-# ================== 获取公网IP ==================
+install_software() {
+  local _package_name="$1"
+  if ! detect_package_manager; then
+    error "未检测到支持的包管理器，请手动安装 $_package_name"
+    exit 65
+  fi
+  echo "正在安装缺失的依赖 '$_package_name' ... "
+  if $PACKAGE_MANAGEMENT_INSTALL "$_package_name" >/dev/null 2>&1; then
+    echo "依赖安装成功"
+  else
+    error "无法通过包管理器安装 '$_package_name'，请手动安装。"
+    exit 65
+  fi
+}
+
+check_environment() {
+  if [[ "x$(uname)" == "xLinux" ]]; then
+    OPERATING_SYSTEM=linux
+  else
+    error "本脚本仅支持 Linux 系统。"
+    exit 95
+  fi
+
+  has_command curl || install_software curl
+  has_command grep || install_software grep
+  has_command jq || install_software jq
+}
+
+get_installed_version() {
+  if [[ -f "$XRAY_BINARY" ]]; then
+    local version_out
+    version_out=$("$XRAY_BINARY" version 2>/dev/null | head -n 1 || echo "")
+    if [[ -n "$version_out" ]]; then
+      echo "$version_out" | awk '{print $2}' || echo "未知"
+    else
+      echo "未知版本"
+    fi
+  else
+    echo "未安装"
+  fi
+}
+
+check_xray_version() {
+  if [ ! -f "$XRAY_BINARY" ]; then return 1; fi
+  if ! $XRAY_BINARY help 2>/dev/null | grep -q "vlessenc"; then return 1; fi
+  return 0
+}
+
+execute_official_script() {
+  local args="$*"
+  info "Xray ($args)..."
+  if ! bash <(curl -Ls "$XRAY_INSTALL_SCRIPT_URL") $args; then
+    error "官方安装脚本执行失败！"
+    return 1
+  fi
+}
+
 get_public_ip() {
-    local ip
-
-    for cmd in \
-        "curl -4fsSL --max-time 5" \
-        "wget -4qO- --timeout=5"; do
-
-        for url in \
-            "https://api.ipify.org" \
-            "https://ip.sb" \
-            "https://checkip.amazonaws.com"; do
-
-            ip=$($cmd "$url" 2>/dev/null || true)
-
-            if [[ -n "${ip:-}" ]]; then
-                echo "$ip"
-                return 0
-            fi
-        done
-    done
-
-    for cmd in \
-        "curl -6fsSL --max-time 5" \
-        "wget -6qO- --timeout=5"; do
-
-        for url in \
-            "https://api.ipify.org" \
-            "https://ipv6.ip.sb"; do
-
-            ip=$($cmd "$url" 2>/dev/null || true)
-
-            if [[ -n "${ip:-}" ]]; then
-                echo "$ip"
-                return 0
-            fi
-        done
-    done
-
-    return 1
+  local ip=''
+  for url in https://api.ipify.org https://ip.sb https://checkip.amazonaws.com; do
+    ip=$(curl -4s --max-time 5 "$url" 2>/dev/null || true)
+    [[ -n "$ip" ]] && { echo "$ip"; return; }
+  done
+  hostname -I | awk '{print $1}'
 }
 
-# ================== 检查端口占用 ==================
-check_port() {
-    local port="$1"
+# =========================================================
+# 3. 面板辅助网络与状态扩展函数
+# =========================================================
+get_sb_status() {
+  if has_command systemctl && systemctl is-active --quiet xray 2>/dev/null; then
+    echo -e "${GREEN}● 运行中${RESET}"
+  else
+    if pgrep -f "$XRAY_BINARY run" >/dev/null 2>&1; then
+      echo -e "${GREEN}● 运行中 (Pidmode)${RESET}"
+    else
+      echo -e "${RED}● 未运行${RESET}"
+    fi
+  fi
+}
 
-    if ss -tuln | awk '{print $5}' | grep -qE "[:.]${port}$"; then
-        return 1  # 被占用
+get_current_port_display() {
+  if [[ -f "$XRAY_CONFIG" ]]; then
+    local port
+    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "")
+    echo "${port:- -}"
+  else echo "-"; fi
+}
+
+generate_uuid() {
+  if [ -f "$XRAY_BINARY" ] && [ -x "$XRAY_BINARY" ]; then
+    $XRAY_BINARY uuid
+  else
+    cat /proc/sys/kernel/random/uuid
+  fi
+}
+
+generate_vless_encryption_config() {
+  local vlessenc_output
+  vlessenc_output=$($XRAY_BINARY vlessenc 2>/dev/null || true)
+  if [ -z "$vlessenc_output" ]; then
+    error "生成 VLESS Encryption 配置失败"
+    return 1
+  fi
+
+  local decryption_config=""
+  local encryption_config=""
+  local in_mlkem_section=false
+
+  set +e
+  while IFS= read -r line; do
+    if [[ "$line" == *"Authentication: ML-KEM-768, Post-Quantum"* ]]; then
+      in_mlkem_section=true
+      continue
     fi
 
-    return 0  # 没有占用
-}
-
-# ================== 验证端口格式 ==================
-is_valid_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] \
-        && [[ "$1" -ge 1 ]] \
-        && [[ "$1" -le 65535 ]]
-}
-
-# ================== 获取可用随机端口 ==================
-get_random_port() {
-    local rand_port
-    while true; do
-        rand_port=$((RANDOM % 55536 + 10000))
-        if check_port "$rand_port"; then
-            echo "$rand_port"
-            return 0
+    if [ "$in_mlkem_section" = true ]; then
+      if [[ "$line" == *'"decryption":'* ]]; then
+        decryption_config=$(echo "$line" | sed 's/.*"decryption": "\([^"]*\)".*/\1/')
+      elif [[ "$line" == *'"encryption":'* ]]; then
+        if echo "$line" | grep -q '.*"encryption": "[^"]*"'; then
+          encryption_config=$(echo "$line" | sed 's/.*"encryption": "\([^"]*\)".*/\1/')
+        else
+          encryption_config=$(echo "$line" | sed 's/.*"encryption": "\([^"]*\).*/\1/')
+          read -r next_line
+          encryption_config="${encryption_config}${next_line}"
+          encryption_config=$(echo "$encryption_config" | tr -d '"' | tr -d '[:space:]')
         fi
-    done
-}
-
-# ================== 获取随机路径 ==================
-get_random_path() {
-    # 生成一个 6 位的随机字母数字字符串
-    local rand_str
-    rand_str=$(head /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 6 2>/dev/null || echo "path$(date +%s | cut -c 8-10)")
-    echo "/xray_${rand_str}"
-}
-
-# ================== UUID验证 ==================
-is_valid_uuid() {
-    [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]
-}
-
-# ================== 路径/宿主格式校验 ==================
-is_valid_path() {
-    [[ "$1" =~ ^\/[a-zA-Z0-9_\/-]*$ ]]
-}
-
-is_valid_host() {
-    [[ -z "$1" ]] || [[ "$1" =~ ^([a-zA-Z0-9](-?[a-zA-Z0-9])*\.)+[A-Za-z]{2,}$ ]]
-}
-
-# ================== 下载官方安装脚本 ==================
-download_install_script() {
-    local file="$TMP_DIR/install.sh"
-
-    info "Xray..."
-
-    if ! curl -fsSL "$INSTALL_SCRIPT_URL" -o "$file"; then
-        error "下载 Xray 安装脚本失败"
-        return 1
+        break
+      fi
     fi
+  done <<< "$vlessenc_output"
+  set -e
 
-    chmod +x "$file"
-    echo "$file"
-}
-
-# ================== 获取Xray状态 ==================
-get_xray_status() {
-    if systemctl is-active --quiet xray 2>/dev/null; then
-        echo -e "${GREEN}● 运行中${RESET}"
-    else
-        echo -e "${RED}● 未运行${RESET}"
-    fi
-}
-
-# ================== 获取版本 ==================
-get_xray_version() {
-    if [[ -x "$XRAY_BINARY" ]]; then
-        "$XRAY_BINARY" version 2>/dev/null \
-            | grep -i "Xray" \
-            | head -n 1 \
-            | awk '{print $2}' || echo "未知"
-    else
-        echo "未安装"
-    fi
-}
-
-# ================== 获取监听地址 ==================
-get_listen_ip() {
-    if sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null \
-        | grep -q '= 1'; then
-        echo "0.0.0.0"
-    else
-        echo "::"
-    fi
-}
-
-# ================== 测试配置 ==================
-test_config() {
-    if "$XRAY_BINARY" run -test -config "$XRAY_CONFIG"; then
-        info "配置检查无误 (Configuration OK)"
-        return 0
-    fi
-
-    error "配置测试失败"
+  if [ -z "$decryption_config" ] || [ -z "$encryption_config" ]; then
+    error "无法解析 VLESS Encryption 配置。"
     return 1
+  fi
+
+  echo "${decryption_config}|${encryption_config}"
 }
 
-# ================== 重启服务 ==================
-restart_xray() {
-    systemctl restart xray 2>/dev/null || true
-    sleep 1
+# =========================================================
+# 4. 面板核心交互与配置文件处理
+# =========================================================
+write_and_show_config() {
+  # 彻底重写状态底座
+  rm -f "$STATE_FILE"
+  echo "$ENCRYPTION" > "$STATE_FILE"
 
-    if systemctl is-active --quiet xray 2>/dev/null; then
-        info "Xray 启动成功"
-        return 0
-    fi
-
-    error "Xray 启动失败"
-    journalctl -u xray -n 20 --no-pager || true
-    return 1
-}
-
-# ================== 写配置 ==================
-write_config() {
-    local port="$1"
-    local uuid="$2"
-    local path="$3"
-    local host="$4"
-
-    local listen_ip
-    listen_ip=$(get_listen_ip)
-
-    mkdir -p /usr/local/etc/xray
-
-    cat > "$XRAY_CONFIG" <<EOF
-{
-  "log": {
-    "loglevel": "warning"
-  },
-  "inbounds": [
-    {
-      "listen": "${listen_ip}",
-      "port": ${port},
+  jq -n \
+    --argjson port "$PORT" \
+    --arg uuid "$UUID" \
+    --arg decryption "$DECRYPTION" \
+    --arg flow "xtls-rprx-vision" \
+  '{
+    "log": {"loglevel": "warning"},
+    "inbounds": [{
+      "listen": "::",
+      "port": $port,
       "protocol": "vless",
       "settings": {
-        "clients": [
-          {
-            "id": "${uuid}"
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "httpupgrade",
-        "security": "none",
-        "httpupgradeSettings": {
-          "path": "${path}",
-          "host": "${host}"
-        }
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": [
-          "http",
-          "tls",
-          "quic"
-        ]
+        "clients": [{"id": $uuid, "flow": $flow}],
+        "decryption": $decryption
       }
-    }
-  ],
-  "outbounds": [
-    {
+    }],
+    "outbounds": [{
       "protocol": "freedom",
       "settings": {
         "domainStrategy": "UseIPv4v6"
       }
-    }
-  ]
-}
+    }]
+  }' > "$XRAY_CONFIG"
+
+  chmod 644 "$XRAY_CONFIG"
+  
+  SERVER_IP=$(get_public_ip)
+  cat << EOF >> "$STATE_FILE"
+PORT='${PORT}'
+UUID='${UUID}'
+REMARK='${REMARK}'
+SERVER_IP='${SERVER_IP}'
 EOF
-}
 
-# ================== 生成订阅 ==================
-generate_link() {
-    local ip
-    if ! ip=$(get_public_ip); then
-        error "获取公网 IP 失败"
-        return 1
-    fi
+  # 强制清除旧的残留进程，避免端口占用导致死锁
+  pkill -f "$XRAY_BINARY run" || true
 
-    local uuid port path host
-    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null || echo "error")
-    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "80")
-    path=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.path' "$XRAY_CONFIG" 2>/dev/null || echo "/download")
-    host=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.host // ""' "$XRAY_CONFIG" 2>/dev/null || echo "")
-
-    local display_ip="$ip"
-    [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
-
-    local hostname
-    hostname=$(hostname -s 2>/dev/null | tr ' ' '_')
-    [[ -z "$hostname" ]] && hostname="Xray"
-
-    local encoded_path
-    encoded_path=$(echo -n "$path" | sed 's/\//%2F/g')
-
-    cat > /root/xray_vless_httpupgrade.txt <<EOF
-vless://${uuid}@${display_ip}:${port}?encryption=none&security=none&type=httpupgrade&path=${encoded_path}&host=${host}#${hostname}-HTTPUpgrade
-EOF
-}
-
-# ================== 显示配置 ==================
-show_current_config() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then
-        error "配置文件不存在"
-        return
-    fi
-
-    local ip uuid port path host
-    ip=$(get_public_ip || echo "未知")
-    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
-    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
-    path=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.path' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
-    host=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.host // "无"' "$XRAY_CONFIG" 2>/dev/null || echo "无")
-
-    echo -e "${GREEN}====== 当前配置 ======${RESET}"
-    echo -e "${YELLOW}IP地址        : ${ip}${RESET}"
-    echo -e "${YELLOW}端口          : ${port}${RESET}"
-    echo -e "${YELLOW}UUID          : ${uuid}${RESET}"
-    echo -e "${YELLOW}路径 (Path)   : ${path}${RESET}"
-    echo -e "${YELLOW}伪装域名(Host): ${host}${RESET}"
-    echo
-
-    if [[ -f /root/xray_vless_httpupgrade.txt ]]; then
-        echo -e "${GREEN}====== VLESS 链接 ======${RESET}"
-        cat /root/xray_vless_httpupgrade.txt
-    fi
-}
-
-# ================== 配置 Xray ==================
-configure_xray() {
-    info "开始配置 Xray HTTPUpgrade..."
-    local port uuid path host input_path input_host input_uuid input_port
-
-    while true; do
-        read -rp "请输入端口 (直接回车随机分配端口): " input_port
-        input_port=$(echo "${input_port}" | tr -d '\r\n[:space:]')
-        if [[ -z "$input_port" ]]; then
-            port=$(get_random_port)
-            info "已为您随机分配未被占用端口: $port"
-            break
-        elif is_valid_port "$input_port"; then
-            if ! check_port "$input_port"; then
-                error "端口 ${input_port} 已被占用，请重新输入。"
-                continue
-            fi
-            port="$input_port"
-            break
-        else
-            error "端口无效"
-        fi
-    done
-
-    while true; do
-        read -rp "请输入UUID (默认:自动生成): " input_uuid
-        input_uuid=$(echo "${input_uuid}" | tr -d '\r\n[:space:]')
-        if [[ -z "${input_uuid}" ]]; then
-            uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "7415d2b8-1454-4da8-963b-4663e8322851")
-            break
-        elif is_valid_uuid "$input_uuid"; then
-            uuid="$input_uuid"
-            break
-        else
-            error "UUID 格式无效"
-        fi
-    done
-
-    while true; do
-        read -rp "请输入 HTTPUpgrade 路径 (直接回车默认随机生成): " input_path
-        input_path=$(echo "${input_path}" | tr -d '\r\n[:space:]')
-        
-        if [[ -z "$input_path" ]]; then
-            path=$(get_random_path)
-            info "已为您随机生成路径: $path"
-            break
-        elif is_valid_path "$input_path"; then
-            path="$input_path"
-            break
-        else
-            error "路径格式无效，必须以 '/' 开头且不包含特殊字符"
-        fi
-    done
-
-    while true; do
-        read -rp "请输入伪装Host域名 (可直接回车留空): " input_host
-        input_host=$(echo "${input_host}" | tr -d '\r\n[:space:]')
-        host=${input_host:-}
-        if is_valid_host "$host"; then
-            break
-        else
-            error "域名格式无效"
-        fi
-    done
-
-    write_config "$port" "$uuid" "$path" "$host"
-    test_config || return 1
-    generate_link
-    restart_xray
-    show_current_config
-}
-
-# ================== 安装 ==================
-install_xray() {
-    info "开始安装 Xray..."
-    local install_script
-    install_script=$(download_install_script) || return 1
-
-    bash "$install_script" install
-    bash "$install_script" install-geodata
-    systemctl enable xray 2>/dev/null || true
-    configure_xray
-    info "Xray 已安装完成"
-}
-
-# ================== 更新 ==================
-update_xray() {
-    info "更新 Xray..."
-    local install_script
-    install_script=$(download_install_script) || return 1
-
-    bash "$install_script" install
-    bash "$install_script" install-geodata
-    restart_xray
-}
-
-# ================== 修改配置 ==================
-modify_config() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then
-        error "配置文件不存在"
-        return 1
-    fi
-
-    local old_port old_uuid old_path old_host
-    old_port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "80")
-    old_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null || echo "")
-    old_path=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.path' "$XRAY_CONFIG" 2>/dev/null || echo "/download")
-    old_host=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.host // ""' "$XRAY_CONFIG" 2>/dev/null || echo "")
-
-    local port uuid path host input_port input_uuid input_path input_host
-
-    while true; do
-        read -rp "请输入新端口 [当前:${old_port}, 回车不修改]: " input_port
-        input_port=$(echo "${input_port}" | tr -d '\r\n[:space:]')
-        if [[ -z "$input_port" ]]; then
-            port="$old_port"
-            break
-        elif [[ "${input_port,,}" == "rand" ]]; then
-            port=$(get_random_port)
-            info "已为您重分配随机端口: $port"
-            break
-        elif is_valid_port "$input_port"; then
-            if [[ "$input_port" != "$old_port" ]]; then
-                if ! check_port "$input_port"; then
-                    error "端口 ${input_port} 已被占用，请更换。"
-                    continue
-                fi
-            fi
-            port="$input_port"
-            break
-        else
-            error "端口无效，请输入 1-65535 之间的数字。"
-        fi
-    done
-
-    while true; do
-        read -rp "请输入UUID [当前:${old_uuid}]: " input_uuid
-        input_uuid=$(echo "${input_uuid}" | tr -d '\r\n[:space:]')
-        uuid=${input_uuid:-$old_uuid}
-        if is_valid_uuid "$uuid"; then
-            break
-        else
-            error "UUID 格式无效"
-        fi
-    done
-
-    while true; do
-        read -rp "请输入HTTPUpgrade 路径 [当前:${old_path}, 回车不修改, 输入'rand'重新随机生成]: " input_path
-        input_path=$(echo "${input_path}" | tr -d '\r\n[:space:]')
-        
-        if [[ -z "$input_path" ]]; then
-            path="$old_path"
-            break
-        elif [[ "${input_path,,}" == "rand" ]]; then
-            path=$(get_random_path)
-            info "已重新随机生成路径: $path"
-            break
-        elif is_valid_path "$input_path"; then
-            path="$input_path"
-            break
-        else
-            error "路径格式无效"
-        fi
-    done
-
-    while true; do
-        read -rp "请输入伪装Host域名 [当前:${old_host:-无}]: " input_host
-        input_host=$(echo "${input_host}" | tr -d '\r\n[:space:]')
-        host=${input_host:-$old_host}
-        if is_valid_host "$host"; then
-            break
-        else
-            error "域名格式无效"
-        fi
-    done
-
-    cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
-
-    write_config "$port" "$uuid" "$path" "$host"
-    test_config || return 1
-    generate_link
-    restart_xray
-    info "配置修改成功"
-}
-
-# ================== 卸载 ==================
-uninstall_xray() {
-    warn "即将卸载 Xray"
-
-    systemctl stop xray 2>/dev/null || true
-    local install_script
-    install_script=$(download_install_script) || return 1
-
-    bash "$install_script" remove --purge
-    rm -f /root/xray_vless_httpupgrade.txt
-    info "Xray 已卸载"
-}
-
-# ================== 菜单 ==================
-show_menu() {
-    clear
-    local status version port_show
-    status=$(get_xray_status)
-    version=$(get_xray_version)
-    port_show="-"
-
-    if [[ -f "$XRAY_CONFIG" ]]; then
-        port_show=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "-")
-    fi
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}  Xray Vless+HTTPUpgrade 面板   ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "状态   : $status"
-    echo -e "版本   : ${YELLOW}${version}${RESET}"
-    echo -e "端口   : ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 Xray Vless+HTTPUpgrade${RESET}"
-    echo -e "${GREEN} 2. 更新 Xray${RESET}"
-    echo -e "${GREEN} 3. 卸载 Xray${RESET}"
-    echo -e "${GREEN} 4. 修改配置${RESET}"
-    echo -e "${GREEN} 5. 启动 Xray${RESET}"
-    echo -e "${GREEN} 6. 停止 Xray${RESET}"
-    echo -e "${GREEN} 7. 重启 Xray${RESET}"
-    echo -e "${GREEN} 8. 查看日志${RESET}"
-    echo -e "${GREEN} 9. 查看节点配置${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-}
-
-# ================== 安装依赖 ==================
-install_dependencies() {
-    if command -v apt &>/dev/null; then
-        apt update && apt install -y jq curl wget openssl ca-certificates iproute2 coreutils || true
-    elif command -v dnf &>/dev/null; then
-        dnf install -y jq curl wget openssl ca-certificates iproute2 coreutils
-    elif command -v yum &>/dev/null; then
-        yum install -y jq curl wget openssl ca-certificates iproute2 coreutils
+  if has_command systemctl; then
+    systemctl daemon-reload
+    systemctl enable xray >/dev/null 2>&1 || true
+    systemctl restart xray >/dev/null 2>&1 || true
+    if systemctl is-active --quiet xray 2>/dev/null; then
+      info "Xray (VLESS-Encryption) 服务配置并启动成功！"
     else
-        error "未知的包管理器，请手动安装所需的依赖: jq, curl, wget, openssl"
-        exit 1
+      error "Xray 服务启动失败，请运行 'journalctl -u xray -f' 查看错误日志。"
     fi
+  else
+    "$XRAY_BINARY" run -c "$XRAY_CONFIG" >/dev/null 2>&1 &
+    info "非 systemd 环境，程序已挂载至后台 Pid 进程池中运行。"
+  fi
+
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
+  fi
+
+  showconf
 }
 
-# ================== 依赖检查 ==================
-pre_check() {
-    if [[ $(id -u) -ne 0 ]]; then
-        error "请使用 root 用户运行"
-        exit 1
+# =========================================================
+# 5. 主流程控制模块与更新功能
+# =========================================================
+
+inst_singbox() {
+  check_environment
+  
+  if [[ -f "$XRAY_CONFIG" ]]; then
+    warn "系统检测到已存在配置。如果是要修改配置，请在菜单中选择选项 4。"
+    read -rp "是否执意重新安装？(旧配置将被覆盖) [y/N]: " CONFIRM_REINST
+    [[ "$CONFIRM_REINST" != "y" && "$CONFIRM_REINST" != "Y" ]] && return 0
+  fi
+
+  info "🧹 正在清理前置依赖并准备下载..."
+  if ! command -v xray >/dev/null 2>&1; then
+    if ! execute_official_script "install"; then
+      error "Xray 核心安装失败！请检查网络连接。"
+      return 1
     fi
+  else
+    info "系统已存在 xray 核心组件，跳过基础安装。"
+  fi
 
-    local deps=(jq curl wget openssl ss timeout)
-    local missing=0
+  if ! check_xray_version; then
+    error "当前 Xray 核心不支持 VLESS Encryption，正在强制拉取最新版..."
+    execute_official_script "install"
+  fi
 
-    for cmd in "${deps[@]}"; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            missing=1
-            break
+  local encryption_info=$(generate_vless_encryption_config)
+  if [ -z "$encryption_info" ]; then return 1; fi
+
+  DECRYPTION=$(echo "$encryption_info" | cut -d'|' -f1)
+  ENCRYPTION=$(echo "$encryption_info" | cut -d'|' -f2)
+
+  # 全新随机默认值（默认高强度随机端口）
+  local rand_port=$(shuf -i 10000-65535 -n 1)
+  local rand_uuid=$(generate_uuid)
+  local hostname_str=$(hostname 2>/dev/null || echo "linux")
+  local default_remark="${hostname_str}-VLESS-E"
+
+  echo "---------------------------------------------"
+  read -rp "👉 请输入监听端口 (默认随机: ${rand_port}): " INPUT_PORT
+  PORT=${INPUT_PORT:-$rand_port}
+
+  read -rp "👉 请输入UUID (默认随机: ${rand_uuid}): " INPUT_UUID
+  UUID=${INPUT_UUID:-$rand_uuid}
+
+  read -rp "👉 请输入节点备注名称 (默认: ${default_remark}): " INPUT_REMARK
+  REMARK=${INPUT_REMARK:-$default_remark}
+
+  write_and_show_config
+}
+
+modify_config() {
+  if [[ ! -f "$XRAY_CONFIG" ]]; then
+    error "未找到正在运行的配置文件，请先选择选项 1 安装节点。"
+    return 1
+  fi
+
+  info "正在读取现有节点配置与密钥..."
+  
+  # 精准从当前运行的 config.json 中抓取原有密钥，确保绝不更改
+  local current_port=$(jq -r '.inbounds[0].port // empty' "$XRAY_CONFIG" 2>/dev/null)
+  local current_uuid=$(jq -r '.inbounds[0].settings.clients[0].id // empty' "$XRAY_CONFIG" 2>/dev/null)
+  local current_decryption=$(jq -r '.inbounds[0].settings.decryption // empty' "$XRAY_CONFIG" 2>/dev/null)
+  local current_encryption=$(head -n 1 "$STATE_FILE" 2>/dev/null || echo "")
+
+  if [[ -z "$current_decryption" || -z "$current_encryption" ]]; then
+    error "未能成功读取原有的加解密密钥，为防不通，已停止修改。请先通过选项 1 重新安装。"
+    return 1
+  fi
+
+  local current_remark=""
+  if [[ -f "$STATE_FILE" ]]; then
+    current_remark=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 || true)
+  fi
+
+  echo "---------------------------------------------"
+  echo -e "${YELLOW}提示：直接敲回车(Enter)将保持括号内的当前值不变${RESET}"
+  echo "---------------------------------------------"
+
+  read -rp "👉 修改监听端口 (当前: ${current_port}): " INPUT_PORT
+  PORT=${INPUT_PORT:-$current_port}
+
+  read -rp "👉 修改UUID (当前: ${current_uuid}): " INPUT_UUID
+  UUID=${INPUT_UUID:-$current_uuid}
+
+  read -rp "👉 修改节点备注名称 (当前: ${current_remark:-VLESS-E}): " INPUT_REMARK
+  REMARK=${INPUT_REMARK:-${current_remark:-VLESS-E}}
+
+  # 把旧密钥原封不动地继承下来，拒绝重新生成
+  DECRYPTION="$current_decryption"
+  ENCRYPTION="$current_encryption"
+
+  write_and_show_config
+}
+
+update_singbox() {
+  if [[ ! -f "$XRAY_BINARY" ]]; then
+    error "当前系统未安装 Xray，无法执行更新。"
+    return 1
+  fi
+
+  warn "即将开始平滑更新..."
+  if ! execute_official_script "install"; then
+    error "Xray 核心更新失败！"
+    return 1
+  fi
+
+  info "正在重启 Xray 服务以应用更新..."
+  if has_command systemctl; then
+    systemctl daemon-reload
+    systemctl restart xray >/dev/null 2>&1 || true
+    if systemctl is-active --quiet xray 2>/dev/null; then
+      info "Xray 已成功平滑更新！"
+    else
+      error "核心更新成功，但服务重启失败。"
+    fi
+  else
+    pkill -f "$XRAY_BINARY run" || true
+    "$XRAY_BINARY" run -c "$XRAY_CONFIG" >/dev/null 2>&1 &
+    info "Xray 核心已更新并于后台重启运行。"
+  fi
+}
+
+uninstall_singbox() {
+  if has_command systemctl; then
+    systemctl stop xray >/dev/null 2>&1 || true
+    systemctl disable xray >/dev/null 2>&1 || true
+  else
+    pkill -f "$XRAY_BINARY run" || true
+  fi
+  
+  if execute_official_script "remove --purge"; then
+    rm -f "$LINK_FILE" "$STATE_FILE" "$XRAY_CONFIG"
+    info "已完全卸载 Xray、配置文件与状态文件。"
+  else
+    error "Xray 卸载失败！"
+  fi
+}
+
+showconf() {
+  if [[ ! -f "$XRAY_CONFIG" ]]; then
+    error "未找到任何安装配置底座，请先安装节点。"
+    return 1
+  fi
+
+  local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG")
+  local port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG")
+  local encryption=$(head -n 1 "$STATE_FILE" 2>/dev/null)
+  local server_ip=$(get_public_ip)
+  
+  local current_remark="VLESS-E"
+  if [[ -f "$STATE_FILE" ]]; then
+    current_remark=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 || echo "VLESS-E")
+  fi
+
+  local encoded_remark=$(jq -rn --arg x "$current_remark" '$x|@uri')
+  local address_for_url=$server_ip
+  if [[ $server_ip == *":"* ]]; then address_for_url="[${server_ip}]"; fi
+
+  local vless_link="vless://${uuid}@${address_for_url}:${port}?encryption=${encryption}&flow=xtls-rprx-vision&type=tcp&security=none#${encoded_remark}"
+  echo "$vless_link" > "$LINK_FILE"
+
+  echo -e "${GREEN}====== VLESS-Encryption 节点配置信息 ======${RESET}"
+  echo -e "${GREEN}服务器公网 IP :${RESET} ${server_ip}"
+  echo -e "${GREEN}服务监听端口   :${RESET} ${port}"
+  echo -e "${GREEN}用户 UUID      :${RESET} ${uuid}"
+  echo -e "${GREEN}协议与加密     :${RESET} VLESS Encryption (native + 0-RTT + ML-KEM-768)"
+  echo -e "${GREEN}推荐底层流控   :${RESET} xtls-rprx-vision"
+  echo -e "${GREEN}节点自定义备注 :${RESET} ${current_remark}"
+  echo "---------------------------------------------"
+  echo -e "${GREEN}👉 V2rayN  分享链接 (已存至 $LINK_FILE):${RESET}"
+  echo -e "${YELLOW}${vless_link}${RESET}"
+  echo "---------------------------------------------"
+}
+
+# =========================================================
+# 6. 面板主菜单
+# =========================================================
+menu() {
+  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
+  check_environment
+
+  while true; do
+    clear
+    local status=$(get_sb_status)
+    local version=$(get_installed_version)
+    local port_show=$(get_current_port_display)
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    Xray VLESS-Encryption 面板   ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $status"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装 VLESS-Encryption${RESET}" 
+    echo -e "${GREEN}2. 更新 VLESS-Encryption${RESET}"
+    echo -e "${GREEN}3. 卸载 VLESS-Encryption${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 VLESS-Encryption${RESET}"
+    echo -e "${GREEN}6. 停止 VLESS-Encryption${RESET}"
+    echo -e "${GREEN}7. 重启 VLESS-Encryption${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+
+    local choice=""
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+    [[ -z "$choice" ]] && continue
+
+    case "$choice" in
+      1) inst_singbox; pause ;;
+      2) update_singbox; pause ;;
+      3) uninstall_singbox; pause ;;
+      4) modify_config; pause ;;
+      5) 
+        if has_command systemctl; then
+          systemctl start xray && info "服务已成功启动！"
+        else
+          pkill -f "$XRAY_BINARY run" || true
+          "$XRAY_BINARY" run -c "$XRAY_CONFIG" >/dev/null 2>&1 &
+          info "进程已在后台启动！"
         fi
-    done
-
-    if [[ "$missing" -eq 1 ]]; then
-        info "检测到缺失依赖，正在安装..."
-        install_dependencies
-    fi
+        pause ;;
+      6) 
+        if has_command systemctl; then
+          systemctl stop xray && info "服务已成功停止！"
+        else
+          pkill -f "$XRAY_BINARY run" && info "后台进程已终止！"
+        fi
+        pause ;;
+      7) 
+        if has_command systemctl; then
+          systemctl restart xray && info "服务已成功重启！"
+        else
+          pkill -f "$XRAY_BINARY run" || true
+          "$XRAY_BINARY" run -c "$XRAY_CONFIG" >/dev/null 2>&1 &
+          info "后台进程已重启！"
+        fi
+        pause ;;
+      8) 
+        if has_command systemctl; then
+          journalctl -u xray.service -n 50 --no-pager
+        else
+          warn "当前环境不支持 systemd 集中日志管理。"
+        fi
+        pause ;;
+      9) showconf; pause ;;
+      0) exit 0 ;;
+      *) error "无效输入，请重新选择。"; sleep 1 ;;
+    esac
+  done
 }
 
-# ================== 主循环 ==================
-main() {
-    pre_check
-
-    while true; do
-        show_menu
-        
-        local choice=""
-        read -r -p $'\033[32m请输入选项: \033[0m' choice || true
-        
-        [[ -z "$choice" ]] && continue
-
-        case "$choice" in
-            1) install_xray; pause ;;
-            2) update_xray; pause ;;
-            3) uninstall_xray; pause ;;
-            4) modify_config; pause ;;
-            5) systemctl start xray &>/dev/null || true; restart_xray; pause ;;
-            6) systemctl stop xray &>/dev/null || true; info "Xray 已停止"; pause ;;
-            7) restart_xray; pause ;;
-            8) journalctl -u xray -e --no-pager || true; pause ;;
-            9) show_current_config; pause ;;
-            0) exit 0 ;;
-            *) error "无效输入"; pause ;;
-        esac
-    done
-}
-
-main "$@"
+menu "$@"

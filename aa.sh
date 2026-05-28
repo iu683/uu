@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Sing-box (AnyTLS + Reality) 核心控制面板
+# Sing-box (VMess + WS) 核心控制面板
 # SPDX-License-Identifier: MIT
 #
 # =========================================================
@@ -13,7 +13,7 @@ export LANG=en_US.UTF-8
 readonly SB_CONFIG="/etc/sing-box/config.json"
 readonly SB_BINARY="/usr/local/bin/sing-box"
 readonly SB_DIR="/root/sb_node"
-readonly STATE_FILE="/etc/anyreality-singbox.env"
+readonly STATE_FILE="/etc/vmessws-singbox.env"
 EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
 SYSTEMD_SERVICES_DIR="/etc/systemd/system"
 CONFIG_DIR="/etc/sing-box"
@@ -163,21 +163,6 @@ get_latest_version() {
   fi
 }
 
-download_singbox() {
-  local _version="$1"
-  local _destination="$2"
-  local _ver_num="${_version#v}"
-  
-  local _download_url="$REPO_URL/releases/download/$_version/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE.tar.gz"
-  
-  info "正在自 GitHub 下载官方 Sing-box 核心组件: $_download_url ..."
-  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
-    error "从 GitHub 下载核心失败！请检查您的网络连接。"
-    return 11
-  fi
-  return 0
-}
-
 get_public_ip() {
   local ip=''
   for url in https://api.ipify.org https://ip.sb https://checkip.amazonaws.com; do
@@ -231,58 +216,38 @@ get_current_port_display() {
   else echo "-"; fi
 }
 
-generate_or_use_key() {
-  if [[ -n "${PRIVATE_KEY:-}" && -n "${PUBLIC_KEY:-}" ]]; then
-    return
-  fi
-  local key_out
-  key_out=$("$EXECUTABLE_INSTALL_PATH" generate reality-keypair 2>/dev/null || echo "")
-  PRIVATE_KEY=$(awk '/PrivateKey/ {print $2}' <<< "$key_out")
-  PUBLIC_KEY=$(awk '/PublicKey/ {print $2}' <<< "$key_out")
-}
-
 # =========================================================
 # 4. 面板核心交互与配置文件处理
 # =========================================================
 write_and_show_config() {
   mkdir -p "$CONFIG_DIR"
 
+  # 根据 host 变量是否为空构建 headers 里的 Host 项
+  local headers_json="{}"
+  if [[ -n "${WSHOST}" ]]; then
+    headers_json="{\"Host\": \"${WSHOST}\"}"
+  fi
+
   cat << EOF > "$SB_CONFIG"
 {
   "inbounds": [
     {
-      "type": "anytls",
+      "type": "vmess",
+      "tag": "vmess-in",
       "listen": "::",
       "listen_port": ${PORT},
       "users": [
         {
-          "name": "${USERNAME}",
-          "password": "${PASSWORD}"
+          "uuid": "${UUID}",
+          "alter_id": 0
         }
       ],
-      "padding_scheme": [
-        "stop=8",
-        "0=30-30",
-        "1=100-400",
-        "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
-        "3=9-9,500-1000",
-        "4=500-1000",
-        "5=500-1000",
-        "6=500-1000",
-        "7=500-1000"
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${SERVER_NAME}",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "${SERVER_NAME}",
-            "server_port": 443
-          },
-          "private_key": "${PRIVATE_KEY}",
-          "short_id": "${SHORT_ID}"
-        }
+      "transport": {
+        "type": "ws",
+        "path": "${WSPATH}",
+        "headers": ${headers_json},
+        "max_early_data": 2048,
+        "early_data_header_name": "Sec-WebSocket-Protocol"
       }
     }
   ],
@@ -298,13 +263,10 @@ EOF
   SERVER_IP=$(get_public_ip)
   cat << EOF > "$STATE_FILE"
 PORT='${PORT}'
-USERNAME='${USERNAME}'
-PASSWORD='${PASSWORD}'
-SERVER_NAME='${SERVER_NAME}'
-SHORT_ID='${SHORT_ID}'
+UUID='${UUID}'
+WSPATH='${WSPATH}'
+WSHOST='${WSHOST}'
 REMARK='${REMARK}'
-PRIVATE_KEY='${PRIVATE_KEY}'
-PUBLIC_KEY='${PUBLIC_KEY}'
 SERVER_IP='${SERVER_IP}'
 EOF
   chmod 600 "$STATE_FILE"
@@ -314,7 +276,7 @@ EOF
     systemctl enable sing-box >/dev/null 2>&1 || true
     systemctl restart sing-box >/dev/null 2>&1 || true
     if systemctl is-active --quiet sing-box 2>/dev/null; then
-      info "Sing-box (AnyTLS) 服务配置并启动成功！"
+      info "Sing-box (VMess+WS) 服务配置并启动成功！"
     else
       error "Sing-box 服务启动失败，请运行 'journalctl -u sing-box -f' 查看错误日志。"
     fi
@@ -334,14 +296,18 @@ EOF
 # =========================================================
 # 5. 主流程控制模块与更新功能
 # =========================================================
+
+# 流程一：首次全新安装
 inst_singbox() {
   check_environment
   
-  info "🧹 正在释放冲突端口并清理前置依赖..."
-  if [[ -f "$STATE_FILE" ]]; then
-    source "$STATE_FILE"
+  if [[ -f "$SB_CONFIG" ]]; then
+    warn "系统检测到已存在配置。如果是要修改配置，请在菜单中选择选项 4。"
+    read -rp "是否执意重新安装？(旧配置将被覆盖) [y/N]: " CONFIRM_REINST
+    [[ "$CONFIRM_REINST" != "y" && "$CONFIRM_REINST" != "Y" ]] && return 0
   fi
 
+  info "🧹 正在清理前置依赖并准备下载..."
   if ! command -v sing-box >/dev/null 2>&1; then
     info "获取 GitHub 官方最新发布版本中..."
     local latest_version=$(get_latest_version)
@@ -370,31 +336,78 @@ inst_singbox() {
     install_content -Dm644 "$(tpl_singbox_server_service_base)" "$SYSTEMD_SERVICES_DIR/sing-box.service" "1"
   fi
 
+  # 自动生成 VMess 专属随机默认值与动态备注
+  local hostname_str=$(hostname 2>/dev/null || echo "linux")
   local rand_port=$(shuf -i 10000-65535 -n 1)
-  local rand_user=$(python3 -c "import secrets, string; print('user-' + ''.join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(6)))")
-  local rand_pass=$(python3 -c "import secrets, string; print(''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12)))")
-  local rand_sid=$(python3 -c "import secrets; print(secrets.token_hex(8))")
+  local rand_uuid=$(python3 -c "import uuid; print(uuid.uuid4())")
+  local rand_path="/$(python3 -c "import secrets; print(secrets.token_hex(4))")"
+  local default_remark="${hostname_str}-vmessws"
 
   echo "---------------------------------------------"
-  read -rp "👉 请输入监听端口 (默认随机: ${PORT:-$rand_port}): " INPUT_PORT
-  PORT=${INPUT_PORT:-${PORT:-$rand_port}}
+  read -rp "👉 请输入监听端口 (默认随机: ${rand_port}): " INPUT_PORT
+  PORT=${INPUT_PORT:-$rand_port}
 
-  read -rp "👉 请输入用户名 (默认随机: ${USERNAME:-$rand_user}): " INPUT_USERNAME
-  USERNAME=${INPUT_USERNAME:-${USERNAME:-$rand_user}}
+  read -rp "👉 请输入 VMess UUID (默认随机: ${rand_uuid}): " INPUT_UUID
+  UUID=${INPUT_UUID:-$rand_uuid}
 
-  read -rp "👉 请输入密码 (默认随机: ${PASSWORD:-$rand_pass}): " INPUT_PASSWORD
-  PASSWORD=${INPUT_PASSWORD:-${PASSWORD:-$rand_pass}}
+  read -rp "👉 请输入 WebSocket 路径 (默认随机: ${rand_path}): " INPUT_WSPATH
+  WSPATH=${INPUT_WSPATH:-$rand_path}
 
-  read -rp "👉 请输入伪装域名/SNI (默认: ${SERVER_NAME:-www.amazon.com}): " INPUT_SERVER_NAME
-  SERVER_NAME=${INPUT_SERVER_NAME:-${SERVER_NAME:-www.amazon.com}}
+  read -rp "👉 请输入 WebSocket Host 伪装域名 (默认留空): " INPUT_WSHOST
+  WSHOST=${INPUT_WSHOST:-""}
 
-  read -rp "👉 请输入 Reality short_id (默认随机: ${SHORT_ID:-$rand_sid}): " INPUT_SHORT_ID
-  SHORT_ID=${INPUT_SHORT_ID:-${SHORT_ID:-$rand_sid}}
+  read -rp "👉 请输入节点备注名称 (默认: ${default_remark}): " INPUT_REMARK
+  REMARK=${INPUT_REMARK:-$default_remark}
 
-  read -rp "👉 请输入节点备注名称 (默认: ${REMARK:-anytls-reality-tls}): " INPUT_REMARK
-  REMARK=${INPUT_REMARK:-${REMARK:-anytls-reality-tls}}
+  write_and_show_config
+}
 
-  generate_or_use_key
+# 流程二：修改配置（读取当前配置，回车保持不变）
+modify_config() {
+  if [[ ! -f "$SB_CONFIG" ]]; then
+    error "未找到正在运行的配置文件，请先选择选项 1 安装节点。"
+    return 1
+  fi
+
+  info "正在读取现有 VMess 节点配置..."
+  local current_port=$(jq -r '.inbounds[0].listen_port // empty' "$SB_CONFIG" 2>/dev/null)
+  local current_uuid=$(jq -r '.inbounds[0].users[0].uuid // empty' "$SB_CONFIG" 2>/dev/null)
+  local current_path=$(jq -r '.inbounds[0].transport.path // empty' "$SB_CONFIG" 2>/dev/null)
+  local current_host=$(jq -r '.inbounds[0].transport.headers.Host // empty' "$SB_CONFIG" 2>/dev/null)
+  
+  local current_remark=""
+  if [[ -f "$STATE_FILE" ]]; then
+    current_remark=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 || true)
+  fi
+
+  # 如果之前的备注失效或为空，生成一份备用默认备注
+  local hostname_str=$(hostname 2>/dev/null || echo "linux")
+  local fallback_remark="${hostname_str}-vmessws"
+
+  echo "---------------------------------------------"
+  echo -e "${YELLOW}提示：直接敲回车(Enter)将保持括号内的当前值不变${RESET}"
+  echo "---------------------------------------------"
+
+  read -rp "👉 修改监听端口 (当前: ${current_port}): " INPUT_PORT
+  PORT=${INPUT_PORT:-$current_port}
+
+  read -rp "👉 修改 VMess UUID (当前: ${current_uuid}): " INPUT_UUID
+  UUID=${INPUT_UUID:-$current_uuid}
+
+  read -rp "👉 修改 WebSocket 路径 (当前: ${current_path}): " INPUT_WSPATH
+  WSPATH=${INPUT_WSPATH:-$current_path}
+
+  read -rp "👉 修改 WebSocket Host 伪装域名 (当前: ${current_host:-未配置/留空}): " INPUT_WSHOST
+  # 特殊处理：如果原配置为空且用户直接敲回车，输入变量可能接收为空
+  if [[ -z "$INPUT_WSHOST" ]]; then
+    WSHOST="$current_host"
+  else
+    WSHOST="$INPUT_WSHOST"
+  fi
+
+  read -rp "👉 修改节点备注名称 (当前: ${current_remark:-$fallback_remark}): " INPUT_REMARK
+  REMARK=${INPUT_REMARK:-${current_remark:-$fallback_remark}}
+
   write_and_show_config
 }
 
@@ -475,42 +488,41 @@ showconf() {
   fi
   source "$STATE_FILE"
 
-  local encoded_remark=$(jq -rn --arg x "$REMARK" '$x|@uri')
-  local v2rayn_link="anytls://${PASSWORD}@${SERVER_IP}:${PORT}?security=reality&sni=${SERVER_NAME}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${encoded_remark}"
-
-  echo -e "\n${GREEN}====== AnyTLS+Reality 节点配置信息 ======${RESET}"
-  echo -e "${BLUE}服务器公网 IP :${RESET} ${SERVER_IP}"
-  echo -e "${BLUE}服务监听端口   :${RESET} ${PORT}"
-  echo -e "${BLUE}认证用户名     :${RESET} ${USERNAME}"
-  echo -e "${BLUE}认证通信密码   :${RESET} ${PASSWORD}"
-  echo -e "${BLUE}伪装域名 (SNI) :${RESET} ${SERVER_NAME}"
-  echo -e "${BLUE}Reality 公钥   :${RESET} ${PUBLIC_KEY}"
-  echo -e "${BLUE}Reality 目标ID :${RESET} ${SHORT_ID}"
-  echo -e "${BLUE}客户端指纹模式 :${RESET} chrome"
-  echo -e "${BLUE}节点自定义备注 :${RESET} ${REMARK}"
-  echo "---------------------------------------------"
-  echo -e "${GREEN}👉 v2rayN / Xray 核心通用分享链接:${RESET}"
-  echo -e "${CYAN}${v2rayn_link}${RESET}"
-  echo "---------------------------------------------"
-  echo -e "${GREEN}👉 Sing-box 客户端 Outbound 配置片段:${RESET}"
-  cat <<EOF
+  # 构造标准 v2rayN VMess 分享二维码 JSON
+  local vmess_json_str
+  vmess_json_str=$(cat << EOF
 {
-  "type": "anytls",
-  "tag": "${REMARK}",
-  "server": "${SERVER_IP}",
-  "server_port": ${PORT},
-  "password": "${PASSWORD}",
-  "tls": {
-    "enabled": true,
-    "server_name": "${SERVER_NAME}",
-    "reality": {
-      "enabled": true,
-      "public_key": "${PUBLIC_KEY}",
-      "short_id": "${SHORT_ID}"
-    }
-  }
+  "v": "2",
+  "ps": "${REMARK}",
+  "add": "${SERVER_IP}",
+  "port": ${PORT},
+  "id": "${UUID}",
+  "aid": 0,
+  "scy": "auto",
+  "net": "ws",
+  "type": "none",
+  "host": "${WSHOST}",
+  "path": "${WSPATH}",
+  "tls": "none",
+  "sni": "",
+  "alpn": ""
 }
 EOF
+)
+  local v2rayn_link="vmess://$(echo -n "$vmess_json_str" | base64 -w 0 2>/dev/null || echo -n "$vmess_json_str" | base64)"
+
+  echo -e "${GREEN}====== VMess + WebSocket 节点配置信息 ======${RESET}"
+  echo -e "${GREEN}服务器公网 IP :${RESET} ${SERVER_IP}"
+  echo -e "${GREEN}服务监听端口   :${RESET} ${PORT}"
+  echo -e "${GREEN}VMess 用户UUID :${RESET} ${UUID}"
+  echo -e "${GREEN}传输协议类型   :${RESET} ws (WebSocket)"
+  echo -e "${GREEN}WebSocket 路径 :${RESET} ${WSPATH}"
+  echo -e "${GREEN}WebSocket Host :${RESET} ${WSHOST:-未配置(留空)}"
+  echo -e "${GREEN}节点自定义备注 :${RESET} ${REMARK}"
+  echo "---------------------------------------------"
+  echo -e "${GREEN}👉 v2rayN  分享链接:${RESET}"
+  echo -e "${YELLOW}${v2rayn_link}${RESET}"
+  echo "---------------------------------------------"
   echo
 }
 
@@ -528,19 +540,19 @@ menu() {
     local port_show=$(get_current_port_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    Sing-box AnyTLS + Reality 面板  ${RESET}"
+    echo -e "${GREEN}    Sing-box VMess + WS 面板    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 AnyReality${RESET}"
-    echo -e "${GREEN}2. 更新 AnyReality${RESET}"
-    echo -e "${GREEN}3. 卸载 AnyReality${RESET}"
+    echo -e "${GREEN}1. 安装 VMess + WS${RESET}"
+    echo -e "${GREEN}2. 更新 VMess + WS${RESET}"
+    echo -e "${GREEN}3. 卸载 VMess + WS${RESET}"
     echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 AnyReality${RESET}"
-    echo -e "${GREEN}6. 停止 AnyReality${RESET}"
-    echo -e "${GREEN}7. 重启 AnyReality${RESET}"
+    echo -e "${GREEN}5. 启动 VMess + WS${RESET}"
+    echo -e "${GREEN}6. 停止 VMess + WS${RESET}"
+    echo -e "${GREEN}7. 重启 VMess + WS${RESET}"
     echo -e "${GREEN}8. 查看日志${RESET}"
     echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
@@ -554,7 +566,7 @@ menu() {
       1) inst_singbox; pause ;;
       2) update_singbox; pause ;;
       3) uninstall_singbox; pause ;;
-      4) inst_singbox; pause ;;
+      4) modify_config; pause ;;
       5) 
         if has_command systemctl; then
           systemctl start sing-box && info "服务已成功启动！"

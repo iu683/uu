@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Tuic 管理面板 (iptables 端口跳跃修复版)
+# Tuic 管理面板 (iptables 端口跳跃与官方后缀完美对齐版)
 # SPDX-License-Identifier: MIT
 #
 # =========================================================
@@ -11,16 +11,15 @@ export LANG=en_US.UTF-8
 
 # 基础目录与硬编码配置
 readonly TUIC_CONFIG="/etc/tuic/server.json"
-readonly TUIC_BINARY="/usr/local/bin/tuic-server"
+readonly BINARY_PATH="/usr/local/bin/tuic-server"
 readonly TUIC_DIR="/root/tuic"
-EXECUTABLE_INSTALL_PATH="/usr/local/bin/tuic-server"
-SYSTEMD_SERVICES_DIR="/etc/systemd/system"
 CONFIG_DIR="/etc/tuic"
+SYSTEMD_SERVICES_DIR="/etc/systemd/system"
 REPO_URL="https://github.com/EAimTY/tuic"
 API_BASE_URL="https://api.github.com/repos/EAimTY/tuic"
 CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
 
-# 自动检测环境变量
+# 自动检测环境依赖变量
 PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
 OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
 ARCHITECTURE="${ARCHITECTURE:-}"
@@ -30,11 +29,10 @@ GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 BLUE="\033[34m"
-CYAN="\033[36m"
 RESET="\033[0m"
 
 # =========================================================
-# 2. 官方原生底层工具函数
+# 2. 系统底层工具函数
 # =========================================================
 has_command() {
   local _command=$1
@@ -66,31 +64,6 @@ systemctl() {
   command systemctl "$@"
 }
 
-install_content() {
-  local _install_flags="$1"
-  local _content="$2"
-  local _destination="$3"
-  local _overwrite="$4"
-  local _tmpfile="$(mktemp)"
-
-  echo -ne "安装 $_destination ... "
-  echo "$_content" > "$_tmpfile"
-  if [[ -z "$_overwrite" && -e "$_destination" ]]; then
-    echo -e "已存在"
-  elif install "$_install_flags" "$_tmpfile" "$_destination"; then
-    echo -e "完成"
-  fi
-  rm -f "$_tmpfile"
-}
-
-remove_file() {
-  local _target="$1"
-  echo -ne "移除 $_target ... "
-  if rm -f "$_target"; then
-    echo -e "完成"
-  fi
-}
-
 detect_package_manager() {
   [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
   has_command apt && PACKAGE_MANAGEMENT_INSTALL='apt -y --no-install-recommends install' && return 0
@@ -112,31 +85,36 @@ install_software() {
   fi
 }
 
-check_environment() {
-  if [[ "x$(uname)" == "xLinux" ]]; then
-    OPERATING_SYSTEM=linux
-  else
-    error "本脚本仅支持 Linux 系统。"
-    exit 95
-  fi
-
-  case "$(uname -m)" in
-    'x86_64' | 'amd64') ARCHITECTURE='x86_64' ;;
-    'aarch64' | 'arm64') ARCHITECTURE='aarch64' ;;
-    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
-  esac
-
+install_packages() {
   has_command curl || install_software curl
+  has_command wget || install_software wget
   has_command grep || install_software grep
   has_command jq || install_software jq
   has_command openssl || install_software openssl
   has_command iptables || install_software iptables
 }
 
+# 🌟 修复：精准对齐 EAimTY 官方编译的 target 架构全称后缀
+detect_arch() {
+  case "$(uname -m)" in
+    'x86_64' | 'amd64') echo "x86_64-unknown-linux-gnu" ;;
+    'aarch64' | 'arm64') echo "aarch64-unknown-linux-gnu" ;;
+    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
+  esac
+}
+
+check_environment() {
+  if [[ "x$(uname)" != "xLinux" ]]; then
+    error "本脚本仅支持 Linux 系统。"
+    exit 95
+  fi
+  install_packages
+}
+
 get_installed_version() {
-  if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
+  if [[ -f "$BINARY_PATH" ]]; then
     local version_out
-    version_out=$("$EXECUTABLE_INSTALL_PATH" -v 2>/dev/null || "$EXECUTABLE_INSTALL_PATH" --version 2>/dev/null || echo "")
+    version_out=$("$BINARY_PATH" -v 2>/dev/null || "$BINARY_PATH" --version 2>/dev/null || echo "")
     if [[ -n "$version_out" ]]; then
       echo "$version_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "未知格式"
     else
@@ -147,35 +125,16 @@ get_installed_version() {
   fi
 }
 
-# 🌟 修复：精准保留 GitHub 原始完整的 tag_name 字段
 get_latest_version() {
   local _tmpfile=$(mktemp)
   if ! curl -sS -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases" -o "$_tmpfile"; then
     echo ""
     rm -f "$_tmpfile"
-    return
+    return 1
   fi
-  # 获取包含 tuic-server 资源的最新正式发布版的原始 tag 名
   local _raw_tag=$(jq -r '[.[] | select(.prerelease==false and (.assets[].name | contains("tuic-server")))] | first | .tag_name' "$_tmpfile")
   echo "$_raw_tag"
   rm -f "$_tmpfile"
-}
-
-# 🌟 修复：根据完整的 tag 名，动态解出纯版本号并正确拼装二进制下载链接
-download_tuic() {
-  local _raw_tag="$1"
-  local _destination="$2"
-  
-  # 如果 tag 带有 tuic-server- 前缀，解出纯版本号；如果没有（如直接是 1.0.0），则纯版本号就是 tag 本身
-  local _pure_ver=${_raw_tag#tuic-server-}
-  
-  local _download_url="$REPO_URL/releases/download/$_raw_tag/tuic-server-$_pure_ver-$ARCHITECTURE-$OPERATING_SYSTEM"
-  info "正在下载官方 Tuic 核心组件: $_download_url ..."
-  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
-    error "核心下载失败！请检查您的网络连接。"
-    return 11
-  fi
-  return 0
 }
 
 tpl_tuic_server_service() {
@@ -186,7 +145,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$EXECUTABLE_INSTALL_PATH --config $TUIC_CONFIG
+ExecStart=$BINARY_PATH --config $TUIC_CONFIG
 Restart=always
 RestartSec=5
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
@@ -198,7 +157,7 @@ EOF
 }
 
 # =========================================================
-# 3. iptables 规则持久化与控制模块
+# 3. iptables 规则持久化与转发控制模块
 # =========================================================
 ensure_iptables_persistent() {
   if has_command dpkg; then
@@ -206,7 +165,7 @@ ensure_iptables_persistent() {
       info "正在安装 iptables-persistent 以确保重启后规则不丢失..."
       echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
       echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
-      install_software iptables-persistent || log "安装持久化工具失败，规则可能在重启后失效"
+      install_software iptables-persistent || warn "安装持久化工具失败，规则可能在重启后失效"
     fi
   elif has_command rpm; then
     if ! rpm -q iptables-services >/dev/null 2>&1; then
@@ -260,7 +219,7 @@ apply_new_iptables() {
 }
 
 # =========================================================
-# 4. 面板辅助网络与配置扩展函数
+# 4. 网络诊断与配置管理辅助
 # =========================================================
 get_public_ip() {
     local ip
@@ -320,7 +279,7 @@ get_current_port_display() {
 }
 
 # =========================================================
-# 5. 面板交互与配置生成逻辑
+# 5. 面板节点配置生成核心逻辑
 # =========================================================
 inst_cert() {
   echo "---------------------------------------------"
@@ -494,33 +453,58 @@ EOF
 }
 
 # =========================================================
-# 6. 主流程控制模块与更新功能
+# 6. 安装、更新与卸载核心流控
 # =========================================================
-insttuic() {
+install_tuic() {
+  echo -e "${GREEN}[信息] 开始安装 Tuic V5 (EAimTY 分支)...${RESET}"
   check_environment
+  mkdir -p "$TUIC_DIR"
+
+  local arch raw_tag pure_version url
+  arch=$(detect_arch)
   
-  info "获取官方最新发布版本中..."
-  local latest_version=$(get_latest_version)
-  if [[ -z "$latest_version" ]]; then
-    error "无法获取最新版本号，请检查网络设置。"
+  echo -e "${GREEN}[信息] 正在动态获取 Tuic 最新版本...${RESET}"
+  raw_tag=$(get_latest_version)
+  
+  if [[ -z "$raw_tag" || "$raw_tag" == "null" ]]; then
+    echo -e "${RED}[错误] 无法获取最新版本号，请检查网络设置。${RESET}"
     return 1
   fi
   
-  local _tmpfile=$(mktemp)
-  if ! download_tuic "$latest_version" "$_tmpfile"; then
-    rm -f "$_tmpfile" && return 1
-  fi
+  pure_version=${raw_tag#tuic-server-}
+  echo -e "${GREEN}[信息] 检测到最新版本 Tag 为: ${raw_tag} (版本号: v${pure_version})${RESET}"
+  
+  # 🌟 修复：完美吻合 tuic-server-1.0.0-x86_64-unknown-linux-gnu 这种官方完整拓展名
+  url="https://github.com/EAimTY/tuic/releases/download/${raw_tag}/tuic-server-${pure_version}-${arch}"
 
-  echo -ne "正在安装二进制可执行文件 ... "
-  if install -Dm755 "$_tmpfile" "$EXECUTABLE_INSTALL_PATH"; then
-    echo "成功"
-  else
-    rm -f "$_tmpfile" && error "安装失败" && return 1
+  echo -e "${GREEN}[信息] 开始下载 Tuic 服务端到 /usr/local/bin ...${RESET}"
+  echo -e "${BLUE}[下载路径] ${url}${RESET}"
+  
+  if ! wget -O "$BINARY_PATH" -q "$url"; then
+    echo -e "${YELLOW}[警告] wget 下载失败，尝试切换到 curl...${RESET}"
+    curl -fsSL -o "$BINARY_PATH" "$url" || { echo -e "${RED}[错误] 核心程序下载失败，请检查网络${RESET}"; return 1; }
   fi
-  rm -f "$_tmpfile"
+  
+  chmod +x "$BINARY_PATH"
+  echo -e "${GREEN}[信息] Tuic 核心下载并安装成功。${RESET}"
 
   mkdir -p "$CONFIG_DIR"
-  install_content -Dm644 "$(tpl_tuic_server_service)" "$SYSTEMD_SERVICES_DIR/tuic-server.service" "1"
+  cat << EOF > "$SYSTEMD_SERVICES_DIR/tuic-server.service"
+[Unit]
+Description=Tuic Server Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$BINARY_PATH --config $TUIC_CONFIG
+Restart=always
+RestartSec=5
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target
+EOF
 
   inst_cert || return 1
   inst_port
@@ -535,50 +519,56 @@ insttuic() {
 }
 
 update_tuic() {
-  if [[ ! -f "$TUIC_BINARY" ]]; then
+  if [[ ! -f "$BINARY_PATH" ]]; then
     error "当前系统未安装 Tuic，无法执行更新。"
     return 1
   fi
 
   info "正在检查新版本..."
   local current_version=$(get_installed_version)
-  local latest_version=$(get_latest_version)
+  local raw_tag=$(get_latest_version)
 
-  if [[ -z "$latest_version" ]]; then
+  if [[ -z "$raw_tag" || "$raw_tag" == "null" ]]; then
     error "无法连接到 GitHub API 获取最新版本，请稍后再试。"
     return 1
   fi
 
+  local pure_version=${raw_tag#tuic-server-}
   info "当前安装版本: ${YELLOW}${current_version}${RESET}"
-  info "官方最新版本: ${GREEN}${latest_version}${RESET}"
+  info "官方最新版本: ${GREEN}${pure_version}${RESET}"
 
-  if [[ "$current_version" == "$latest_version" ]]; then
+  if [[ "$current_version" == "$pure_version" ]]; then
     info "您当前已经是最新版本，无需更新。"
     return 0
   fi
 
-  warn "检测到新版本，即将开始平滑更新 (原有防火墙转发及配置不会受损)..."
+  warn "检测到新版本，即将开始平滑更新 (原有防火墙转发及配置不受损)..."
   
+  local arch=$(detect_arch)
+  local url="https://github.com/EAimTY/tuic/releases/download/${raw_tag}/tuic-server-${pure_version}-${arch}"
   local _tmpfile=$(mktemp)
-  if ! download_tuic "$latest_version" "$_tmpfile"; then
+
+  if ! curl -fsSL -o "$_tmpfile" "$url"; then
+    error "下载核心失败！"
     rm -f "$_tmpfile" && return 1
   fi
 
-  echo -ne "正在覆盖二进制核心文件 ... "
-  if install -Dm755 "$_tmpfile" "$EXECUTABLE_INSTALL_PATH"; then
-    echo "成功"
+  systemctl stop tuic-server >/dev/null 2>&1 || true
+  if cp "$_tmpfile" "$BINARY_PATH" && chmod +x "$BINARY_PATH"; then
+    info "核心覆盖成功！"
   else
-    rm -f "$_tmpfile" && error "覆盖核心失败" && return 1
+    error "覆盖核心失败"
+    rm -f "$_tmpfile" && return 1
   fi
   rm -f "$_tmpfile"
 
-  info "正在重启 Tuic 服务以应用更新..."
+  info "正在重启 Tuic 服务..."
   systemctl restart tuic-server >/dev/null 2>&1 || true
 
   if systemctl is-active --quiet tuic-server 2>/dev/null; then
-    info "Tuic 已成功平滑更新至至 ${GREEN}${latest_version}${RESET}！"
+    info "Tuic 已成功更新至 ${GREEN}v${pure_version}${RESET}！"
   else
-    error "核心更新成功，但服务重启失败，请运行 'systemctl status tuic-server' 检查错误。"
+    error "核心更新成功，但服务重启失败，请检查日志。"
   fi
 }
 
@@ -591,13 +581,13 @@ unsttuic() {
   systemctl stop tuic-server >/dev/null 2>&1 || true
   systemctl disable tuic-server >/dev/null 2>&1 || true
   
-  remove_file "$EXECUTABLE_INSTALL_PATH"
-  remove_file "$SYSTEMD_SERVICES_DIR/tuic-server.service"
+  rm -f "$BINARY_PATH"
+  rm -f "$SYSTEMD_SERVICES_DIR/tuic-server.service"
   
   systemctl daemon-reload
   rm -rf /etc/tuic "$TUIC_DIR"
   
-  info "Tuic 已彻底从您的系统中移除，防火墙规则已恢复！"
+  info "Tuic 已彻底卸载，防火墙转发规则已全部恢复干净！"
 }
 
 changeconf() {
@@ -654,7 +644,7 @@ showconf() {
 }
 
 # =========================================================
-# 7. 面板主菜单
+# 7. 面板交互菜单
 # =========================================================
 menu() {
   [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
@@ -690,9 +680,9 @@ menu() {
     [[ -z "$choice" ]] && continue
 
     case "$choice" in
-      1) insttuic; pause ;;
+      1) install_tuic; pause ;;
       2) update_tuic; pause ;;
-      3) unsthysteria; rm -f "${CONFIG_DIR}/hopping.txt" "${CONFIG_DIR}/main_port.txt" 2>/dev/null; unsttuic; pause ;;
+      3) rm -f "${CONFIG_DIR}/hopping.txt" "${CONFIG_DIR}/main_port.txt" 2>/dev/null; unsttuic; pause ;;
       4) changeconf; pause ;;
       5) systemctl start tuic-server && info "服务已成功启动！"; pause ;;
       6) systemctl stop tuic-server && info "服务已成功停止！"; pause ;;

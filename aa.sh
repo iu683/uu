@@ -148,48 +148,42 @@ if [ "$ipv6_set" = "true" ]; then
 fi
 
 send_telegram_notification() {
-    # 格式化当前时间
-    local current_time=$(date "+%Y-%m-%d %H:%M:%S")
-    
-    # 组装消息头部
-    local message="🚀 <b>Cloudflare DDNS 动态公网 IP 变动提示</b>\n\n"
+    local current_time
+    current_time=$(date "+%Y-%m-%d %H:%M:%S")
 
-    # IPv4 部分
+    local message=""
+    message+=$'🚀 <b>Cloudflare DDNS IP 变动提示</b>\n\n'
+
+    # IPv4
     if [[ -n "$Public_IPv4" && "$Public_IPv4" != "$Old_Public_IPv4" ]]; then
-        message+="📌 <b>[IPv4 域名解析更新]</b>\n"
-        local count=${#Domains[@]}
-        for ((i=0; i<count; i++)); do
-            if [ $i -eq $((count-1)) ]; then
-                message+=" └─ <code>${Domains[i]}</code>\n"
-            else
-                message+=" ├─ <code>${Domains[i]}</code>\n"
-            fi
+        message+=$'📌 <b>IPv4 域名</b>\n'
+
+        for domain in "${Domains[@]}"; do
+            message+="<code>${domain}</code>"$'\n'
         done
-        message+=" ⚡ 🔄 <b>$Public_IPv4</b>\n\n"
+
+        message+="🔄 <b>最新 IPv4:</b> <code>${Public_IPv4}</code>"$'\n\n'
     fi
 
-    # IPv6 部分
+    # IPv6
     if [[ "$ipv6_set" == "true" && -n "$Public_IPv6" && "$Public_IPv6" != "$Old_Public_IPv6" ]]; then
-        message+="📌 <b>[IPv6 域名解析更新]</b>\n"
-        local countv6=${#Domainsv6[@]}
-        for ((i=0; i<countv6; i++)); do
-            if [ $i -eq $((countv6-1)) ]; then
-                message+=" └─ <code>${Domainsv6[i]}</code>\n"
-            else
-                message+=" ├─ <code>${Domainsv6[i]}</code>\n"
-            fi
+        message+=$'📌 <b>IPv6 域名</b>\n'
+
+        for domainv6 in "${Domainsv6[@]}"; do
+            message+="<code>${domainv6}</code>"$'\n'
         done
-        message+=" ⚡ 🔄 <b>$Public_IPv6</b>\n\n"
+
+        message+="🔄 <b>最新 IPv6:</b> <code>${Public_IPv6}</code>"$'\n\n'
     fi
 
-    # 消息尾部
-    message+="⏰ <b>检查时间:</b> $current_time"
+    message+="⏰ <b>检查时间:</b> ${current_time}"
 
-    # 发送请求
-    curl -s -X POST "https://api.telegram.org/bot$Telegram_Bot_Token/sendMessage" \
-        -d "chat_id=$Telegram_Chat_ID" \
-        -d "parse_mode=HTML" \
-        -d "text=$message"
+    curl -s --max-time 15 \
+        -X POST "https://api.telegram.org/bot${Telegram_Bot_Token}/sendMessage" \
+        --data-urlencode "chat_id=${Telegram_Chat_ID}" \
+        --data-urlencode "parse_mode=HTML" \
+        --data-urlencode "text=${message}" \
+        >/dev/null 2>&1
 }
 
 if [[ -n "$Telegram_Bot_Token" && -n "$Telegram_Chat_ID" && ( ("$Public_IPv4" != "$Old_Public_IPv4" && -n "$Public_IPv4") || ("$Public_IPv6" != "$Old_Public_IPv6" && -n "$Public_IPv6") ) ]]; then
@@ -426,7 +420,7 @@ set_domain() {
     ipv6_check=$(curl -s -6 ip.sb || true)
     if [ -n "$ipv6_check" ]; then
         echo -e "${Info}检测到IPv6地址: ${ipv6_check}"
-        read -rp "是否开启 IPv6 解析？(y/n): " enable_ipv6
+        read -rp "是否开启 IPv6 解析？(y/n，回车跳过): " enable_ipv6
         if [[ "$enable_ipv6" =~ ^[Yy]$ ]]; then
             sed -i 's/^ipv6_set=.*/ipv6_set="true"/g' /etc/DDNS/.config
             read -rp "请输入IPv6域名（例如:v6.888.xyz，回车跳过）: " Domainv6_input

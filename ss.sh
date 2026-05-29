@@ -356,6 +356,16 @@ uninstall_ss() {
     echo -e "${GREEN}卸载完成${RESET}"
 }
 
+# ================== 查看服务管理日志 (强制固定路径，避开 unbound 错误) ==================
+view_manager_log() {
+    if [ -f "/var/log/anytls-manager.log" ]; then
+        echo -e "${YELLOW}====== 最近 50 条服务管理日志 ======${RESET}"
+        tail -n 50 "/var/log/anytls-manager.log"
+    else
+        echo -e "${YELLOW}暂无服务管理日志记录。${RESET}"
+    fi
+}
+
 # ================== 菜单 ==================
 show_menu() {
     clear
@@ -388,7 +398,7 @@ show_menu() {
     echo -e "${GREEN}5. 启动 AnyTLS${RESET}"
     echo -e "${GREEN}6. 停止 AnyTLS${RESET}"
     echo -e "${GREEN}7. 重启 AnyTLS${RESET}"
-    echo -e "${GREEN}8. 查看状态${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
     echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}==============================${RESET}"
@@ -410,7 +420,7 @@ while true; do
         5) rc-service "$SERVICE_NAME" start; echo -e "${GREEN}[完成] AnyTLS 已启动${RESET}"; pause ;;
         6) rc-service "$SERVICE_NAME" stop; echo -e "${GREEN}[完成] AnyTLS 已停止${RESET}"; pause ;;
         7) rc-service "$SERVICE_NAME" restart; echo -e "${GREEN}[完成] AnyTLS 已重启${RESET}"; pause ;;
-        8) rc-service "$SERVICE_NAME" status; pause ;
+        8) view_manager_log; pause ;;
         9)
             if [[ -f "$ANYTLS_CONFIG" ]]; then
                 # 去掉 local 关键字，安全读取并传递给函数

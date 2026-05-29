@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# Hysteria 2 管理脚本 
+# Hysteria 2 管理脚本
 # =========================================================
 
 set -Eeuo pipefail
@@ -21,8 +21,7 @@ readonly HY_NODE_FILE="${HY_DIR}/node.txt"
 
 # ================== 工具函数 ==================
 info() { echo -e "${GREEN}[信息] $*${RESET}"; }
-warn() { echo -e "${GREEN}[警告] $*${RESET}"; }
-error() { echo -e "${GREEN}[错误] $*${RESET}"; }
+error() { echo -e "${RED}[错误] $*${RESET}"; }
 pause() { echo; echo -ne "${GREEN}按任意键返回菜单...${RESET}"; read -n 1 -s; echo; }
 
 get_status() {
@@ -31,70 +30,78 @@ get_status() {
     else echo -e "${RED}● 未运行${RESET}"; fi
 }
 
+# 🛠 修复：精准匹配 Hysteria 2 的版本号
 get_version() {
-    [[ -x "$HY_BIN" ]] && "$HY_BIN" version 2>/dev/null | head -n 1 | awk '{print $3}' || echo "未安装"
+    if [[ -x "$HY_BIN" ]]; then
+        # Hysteria 2 version 输出通常为 "hysteria version v2.x.x (commit...)"
+        # 这里使用 sed 提取第一个以 'v' 开头的版本号
+        "$HY_BIN" version 2>/dev/null | head -n 1 | grep -oE "v[0-9]+\.[0-9]+\.[0-9]+" || echo "未知"
+    else
+        echo "未安装"
+    fi
+}
+
+get_jump_ports() {
+    local ports=$(iptables-save -t nat | grep "PREROUTING" | grep "DNAT" | grep -oE "[0-9]+:[0-9]+" | head -n 1)
+    [[ -z "$ports" ]] && echo -e "${YELLOW}未配置${RESET}" || echo -e "${YELLOW}${ports}${RESET}"
 }
 
 get_public_ip() {
     curl -4fsSL --max-time 5 https://api.ipify.org || echo "YOUR_SERVER_IP"
 }
 
-# ================== 核心功能 ==================
-
-# 端口跳跃规则管理
+# ================== UDP 跳跃逻辑管理 ==================
 manage_udp_jump() {
-    local action=$1 # add/remove
+    local action=$1
     local start=${2:-""}
     local end=${3:-""}
     local target_port=${4:-""}
-    
     local server_ip=$(ip -4 addr show | awk '/inet/ && $2 !~ /^127/ {split($2,a,"/"); print a[1]; exit}')
 
-    if [ "$action" == "remove" ]; then
-        for rule in $(iptables-save | grep "DNAT" | grep "$server_ip" | awk '{print $0}'); do
-            del_rule=$(echo "$rule" | sed 's/^-A /-D /')
-            eval iptables -t nat $del_rule 2>/dev/null || true
-        done
-        rm -f /etc/iptables.rules /etc/local.d/udp_jump.start
-    elif [ "$action" == "add" ]; then
+    # 🛠 强化：清理所有相关的 DNAT 规则
+    for rule in $(iptables-save | grep "DNAT" | grep "$server_ip" | awk '{print $0}'); do
+        del_rule=$(echo "$rule" | sed 's/^-A /-D /')
+        eval iptables -t nat $del_rule 2>/dev/null || true
+    done
+
+    if [ "$action" == "add" ]; then
         sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-        iptables -t nat -I PREROUTING 1 -p udp --dport "$start:$end" -j DNAT --to-destination "${server_ip}:$target_port"
+        iptables -t nat -I PREROUTING 1 -p udp --dport "${start}:${end}" -j DNAT --to-destination "${server_ip}:${target_port}"
         iptables -I FORWARD 1 -p udp --dport "$target_port" -j ACCEPT 2>/dev/null || true
         iptables-save > /etc/iptables.rules
         echo -e "#!/bin/sh\n[ -f /etc/iptables.rules ] && iptables-restore < /etc/iptables.rules" > /etc/local.d/udp_jump.start
         chmod +x /etc/local.d/udp_jump.start
         rc-update add local default >/dev/null 2>&1
+    elif [ "$action" == "remove" ]; then
+        rm -f /etc/iptables.rules /etc/local.d/udp_jump.start
     fi
 }
 
-# 安装/更新
+# ================== 核心操作 ==================
 install_hy2() {
-    local type=$1 # 1:install, 2:update
-    info "正在安装依赖与内核..."
+    local mode=$1 # 1:安装, 2:更新, 3:修改配置
     apk update && apk add curl ca-certificates openssl openrc iptables jq > /dev/null 2>&1
-
-    local arch=$(uname -m)
-    case $arch in
-        x86_64) local bin_arch="amd64" ;;
-        aarch64) local bin_arch="arm64" ;;
-        *) error "不支持的架构: $arch"; return 1 ;;
-    esac
-
+    local arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
     local ver=$(curl -sSL https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r .tag_name)
-    info "正在下载 Hysteria 2 $ver..."
-    curl -fSL "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-$bin_arch" -o "${HY_BIN}.new"
+    
+    info "正在处理 Hysteria 2 $ver..."
+    curl -fSL "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-$arch" -o "${HY_BIN}.new"
     chmod +x "${HY_BIN}.new"
     rc-service hysteria stop 2>/dev/null || true
     mv "${HY_BIN}.new" "$HY_BIN"
 
-    if [ "$type" == "1" ] || [[ ! -f "$HY_CONFIG" ]]; then
+    if [ "$mode" == "2" ] && [[ -f "$HY_CONFIG" ]]; then
+        info "更新完成，正在恢复运行..."
+    else
         mkdir -p "$HY_DIR"
-        echo -ne "${GREEN}请输入监听端口 (回车随机): ${RESET}"; read port; [[ -z "$port" ]] && port=$((RANDOM % 45535 + 20000))
+        read -rp "$(echo -e ${GREEN}"请输入主监听端口 (默认随机): "${RESET})" main_port
+        main_port=${main_port:-$((RANDOM % 45535 + 20000))}
         local pass=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20)
+        
         openssl req -x509 -nodes -newkey rsa:2048 -keyout "${HY_DIR}/server.key" -out "${HY_DIR}/server.crt" -subj "/CN=www.bing.com" -days 3650 >/dev/null 2>&1
         
         cat <<EOF > "$HY_CONFIG"
-listen: :$port
+listen: :$main_port
 tls:
   cert: ${HY_DIR}/server.crt
   key: ${HY_DIR}/server.key
@@ -107,9 +114,17 @@ masquerade:
     url: https://bing.com/
     rewriteHost: true
 EOF
+        echo -e "${YELLOW}是否配置 UDP 端口跳跃? (直接回车跳过)${RESET}"
+        read -rp "$(echo -e ${GREEN}"设置起始端口: "${RESET})" firstport
+        if [[ -n "$firstport" ]]; then
+            read -rp "$(echo -e ${GREEN}"设置末尾端口: "${RESET})" endport
+            if [[ "$endport" -gt "$firstport" ]]; then
+                manage_udp_jump "add" "$firstport" "$endport" "$main_port"
+            fi
+        fi
     fi
 
-    # 写入服务控制
+    # 生成服务文件
     cat <<EOF > /etc/init.d/hysteria
 #!/sbin/openrc-run
 name="hysteria2"
@@ -125,36 +140,22 @@ EOF
     rc-update add hysteria default >/dev/null 2>&1
     rc-service hysteria restart
 
-    # 生成节点信息
     local ip=$(get_public_ip)
-    local pass=$(grep 'password:' "$HY_CONFIG" | awk '{print $2}')
-    local port=$(grep 'listen:' "$HY_CONFIG" | cut -d':' -f3)
-    echo "hysteria2://$pass@$ip:$port/?insecure=1&sni=www.bing.com#$(hostname)" > "$HY_NODE_FILE"
-    info "Hysteria 2 操作成功！"
-}
+    local p=$(grep 'listen:' "$HY_CONFIG" | cut -d':' -f3)
+    local pw=$(grep 'password:' "$HY_CONFIG" | awk '{print $2}')
+    local link="hysteria2://$pw@$ip:$p/?insecure=1&sni=www.bing.com#$(hostname)"
+    echo "$link" > "$HY_NODE_FILE"
 
-# 修改配置
-modify_config() {
-    if [[ ! -f "$HY_CONFIG" ]]; then error "未检测到配置，请先安装"; return; fi
-    local curr_port=$(grep 'listen:' "$HY_CONFIG" | cut -d':' -f3)
-    local curr_pass=$(grep 'password:' "$HY_CONFIG" | awk '{print $2}')
-    
-    echo -ne "${GREEN}新端口 (回车保持 $curr_port): ${RESET}"; read n_port; n_port=${n_port:-$curr_port}
-    echo -ne "${GREEN}新密码 (回车保持 $curr_pass): ${RESET}"; read n_pass; n_pass=${n_pass:-$curr_pass}
-    
-    sed -i "s/listen: :.*/listen: :$n_port/" "$HY_CONFIG"
-    sed -i "s/password: .*/password: $n_pass/" "$HY_CONFIG"
-    
-    rc-service hysteria restart
-    local ip=$(get_public_ip)
-    echo "hysteria2://$n_pass@$ip:$n_port/?insecure=1&sni=www.bing.com#$(hostname)" > "$HY_NODE_FILE"
-    info "配置已更新并重启服务！"
+    echo -e "\n${GREEN}================ Hysteria 2 节点信息 ==================${RESET}"
+    echo -e "${YELLOW}${link}${RESET}"
+    echo -e "${GREEN}======================================================${RESET}"
 }
 
 # ================== 菜单系统 ==================
 while true; do
     status=$(get_status)
     version=$(get_version)
+    jump_show=$(get_jump_ports)
     port_show="-"
     [[ -f "$HY_CONFIG" ]] && port_show=$(grep 'listen:' "$HY_CONFIG" | cut -d':' -f3)
 
@@ -165,6 +166,7 @@ while true; do
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}跳跃   :${RESET} $jump_show"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 安装 Hysteria 2${RESET}"
     echo -e "${GREEN}2. 更新 Hysteria 2${RESET}"
@@ -178,7 +180,7 @@ while true; do
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
 
-    echo -ne "${GREEN}请输入选项: ${RESET}"; read choice
+    read -rp "$(echo -e ${GREEN}"请输入选项: "${RESET})" choice
     case $choice in
         1) install_hy2 1; pause ;;
         2) install_hy2 2; pause ;;
@@ -186,14 +188,14 @@ while true; do
             rc-service hysteria stop 2>/dev/null || true
             rc-update del hysteria default 2>/dev/null || true
             manage_udp_jump "remove"
-            rm -rf "$HY_DIR" "$HY_BIN" /etc/init.d/hysteria "$HY_LOG"
-            info "已彻底卸载"; pause ;;
-        4) modify_config; pause ;;
+            rm -rf "$HY_DIR" "$HY_BIN" /etc/init.d/hysteria "$HY_LOG" "$HY_NODE_FILE"
+            info "已卸载程序并清空所有防火墙规则"; pause ;;
+        4) install_hy2 3; pause ;;
         5) rc-service hysteria start; pause ;;
         6) rc-service hysteria stop; pause ;;
         7) rc-service hysteria restart; pause ;;
-        8) [[ -f "$HY_LOG" ]] && tail -f "$HY_LOG" || error "日志不存在"; pause ;;
-        9) [[ -f "$HY_NODE_FILE" ]] && info "节点链接: ${YELLOW}$(cat "$HY_NODE_FILE")${RESET}" || error "无配置信息"; pause ;;
+        8) [[ -f "$HY_LOG" ]] && tail -f "$HY_LOG" || error "无日志"; pause ;;
+        9) [[ -f "$HY_NODE_FILE" ]] && info "节点链接:\n${YELLOW}$(cat "$HY_NODE_FILE")${RESET}" || error "无配置"; pause ;;
         0) exit 0 ;;
         *) error "无效选项"; sleep 1 ;;
     esac

@@ -9,7 +9,7 @@ export LANG=en_US.UTF-8
 # =========================================================
 # 1. 核心控制与全局环境初始化
 # =========================================================
-readonly SINGBOX_VERSION="1.0"
+readonly SINGBOX_VERSION="1.12.0"
 readonly BINARY_PATH="/usr/local/bin/sing-box"
 readonly TUIC_CONFIG="/etc/sing-box/config.json"
 readonly TUIC_DIR="/root/tuicV5"
@@ -379,10 +379,10 @@ EOF
   cat << EOF > "$TUIC_DIR/url.txt"
 V6VPS 请自行替换 IP 地址为 V6
 V2rayN 链接:
-tuic://$auth_uuid:$auth_pwd@$last_ip:$port?alpn=h3&congestion_control=bbr&sni=$tuic_domain&allow_insecure=${is_insecure}${hopping_param}#$HOSTNAME-singbox-tuic
+tuic://$auth_uuid:$auth_pwd@$last_ip:$port?alpn=h3&congestion_control=bbr&sni=$tuic_domain&allow_insecure=${is_insecure}${hopping_param}#$HOSTNAME-tuicv5
 
 Surge 配置:
-$HOSTNAME-tuic = tuic-v5, $last_ip, $port, password=$auth_pwd, uuid=$auth_uuid, ecn=true, skip-cert-verify=${skip_cert}, sni=$tuic_domain
+$HOSTNAME-tuicv5 = tuic-v5, $last_ip, $port, password=$auth_pwd, uuid=$auth_uuid, ecn=true, skip-cert-verify=${skip_cert}, sni=$tuic_domain
 EOF
 
   rc-service sing-box restart
@@ -507,7 +507,7 @@ update_tuic() {
     error "当前系统未检测到核心，无法执行覆盖升级。"
     return 1
   fi
-  info "检测到已有环境，正在执行纯净原地覆盖核心升级..."
+  info "检测到已有环境，正在执行纯净原地覆盖核心升级（不破坏任何节点配置）..."
   if download_core; then
     rc-service sing-box start
     info "sing-box 核心纯净升级覆盖成功，服务已安全启动！"
@@ -517,7 +517,7 @@ update_tuic() {
 }
 
 unsttuic() {
-  warn "即将卸载..."
+  warn "即将从当前 Alpine 系统中清洗干净并下线服务驱动..."
   clear_old_iptables
 
   rc-service sing-box stop || true

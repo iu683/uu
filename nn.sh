@@ -1,298 +1,437 @@
 #!/bin/bash
+set -euo pipefail
+
+# =========================================================
+# AnyTLS 一键部署脚本 (Alpine Linux 专属版)
+# =========================================================
 
 # ================== 颜色定义 ==================
-GREEN="\033[1;32m"
-RED="\033[1;31m"
-YELLOW="\033[1;33m"
-PURPLE="\033[1;35m"
-SKYBLUE="\033[1;36m"
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-# ================== 基础环境变量 ==================
-HOSTNAME=$(hostname)
-USERNAME=$(whoami | tr '[:upper:]' '[:lower:]')
-export SECRET=${SECRET:-$(echo -n "$USERNAME+$HOSTNAME" | md5sum | head -c 32)}
-WORKDIR="$HOME/mtp"
-# 【已修改】改为开机后等待 30 秒再执行重启脚本，防止网卡未准备就绪
-CRON_CMD="@reboot sleep 30 && /bin/bash $WORKDIR/restart.sh >/dev/null 2>&1"
-LOG_FILE="$WORKDIR/mtg.log"
+# ================== 基础变量 ==================
+SCRIPT_VERSION="1.0"
+SERVICE_NAME="anytls"
+BINARY_NAME="anytls-server"
+BINARY_DIR="/usr/local/bin"
+BINARY_PATH="${BINARY_DIR}/${BINARY_NAME}"
 
-# ================== 工具函数 ==================
-red_echo() { echo -e "${RED}$1${RESET}"; }
-green_echo() { echo -e "${GREEN}$1${RESET}"; }
-yellow_echo() { echo -e "${YELLOW}$1${RESET}"; }
-purple_echo() { echo -e "${PURPLE}$1${RESET}"; }
+ANYTLS_DIR="/etc/anytls"
+ANYTLS_CONFIG="${ANYTLS_DIR}/config.env"
+ANYTLS_SERVICE="/etc/init.d/${SERVICE_NAME}"
+LOG_FILE="/var/log/anytls-manager.log"
+RUN_USER="anytls"
 
-# 获取正在运行的端口
-get_running_port() {
-    local pid=$(pgrep -x mtg)
-    if [[ -n "$pid" ]]; then
-        # 尝试从进程参数中抓取绑定的端口
-        local port=$(ps -p "$pid" -o args= | grep -oE '0\.0\.0\.0:[0-9]+' | cut -d':' -f2)
-        # 如果找不到，尝试从预留文件读取
-        [[ -z "$port" && -f "$WORKDIR/port.txt" ]] && port=$(cat "$WORKDIR/port.txt")
-        echo "${port:-未知}"
-    else
-        echo "无"
-    fi
+TMP_DIR=$(mktemp -d -t anytls.XXXXXX)
+
+# ================== Root 检查 ==================
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}[错误] 请使用 root 运行${RESET}"
+    exit 1
+fi
+
+# ================== 清理 ==================
+cleanup() {
+    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT INT TERM
+
+# ================== 日志 ==================
+log() {
+    echo "$(date '+%F %T') - $1" >> "$LOG_FILE"
 }
 
+pause() {
+    read -n1 -s -r -p "按任意键返回菜单..." < /dev/tty
+    echo
+}
+
+# ================== 用户 ==================
+create_user() {
+    id "$RUN_USER" &>/dev/null || \
+        adduser -S -D -H -s /sbin/nologin "$RUN_USER"
+}
+
+# ================== 公网IP ==================
 get_public_ip() {
     local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+    for cmd in "curl -4fsSL --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in \
+            "https://api.ipify.org" \
+            "https://ip.sb" \
+            "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && {
+                echo "$ip"
+                return
+            }
         done
     done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://ip6.n0at.com" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+
+    for cmd in "curl -6fsSL --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in \
+            "https://api64.ipify.org" \
+            "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && {
+                echo "[$ip]"
+                return
+            }
         done
     done
-    echo "无法获取公网 IP"
+
+    echo "无法获取公网IP"
+}
+
+# ================== 依赖 ==================
+check_deps() {
+    # Alpine 换源与更新依赖
+    apk add --no-cache curl wget unzip iproute2 bash
+}
+
+# ================== 端口 ==================
+check_port() {
+    if ss -tulnH "( sport = :$1 )" | grep -q . || return 0; then
+        echo -e "${RED}端口 $1 已占用${RESET}"
+        return 1
+    fi
 }
 
 random_port() {
-    shuf -i 2000-65000 -n 1
+    # Alpine BusyBox 没有 shuf，用 awk 替代
+    awk 'BEGIN{srand(); print int(rand()*(65000-10000+1))+10000}'
 }
 
-check_vps_port() {
-    local port=$1
-    while [[ -n $(lsof -i :$port 2>/dev/null) ]]; do
-        red_echo "${port} 端口已经被其他程序占用，请更换端口重试。"
-        read -p "请输入新端口（回车使用随机端口）: " port
-        [[ -z $port ]] && port=$(random_port) && green_echo "使用随机端口: $port"
-    done
-    echo "$port"
+random_password() {
+    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c16 || true
 }
 
-check_devil_port () {
-    port_list=$(devil port list)
-    tcp_ports=$(echo "$port_list" | grep -c "tcp")
-    udp_ports=$(echo "$port_list" | grep -c "udp")
+# ================== 架构 ==================
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64) echo amd64 ;;
+        aarch64) echo arm64 ;;
+        armv7l) echo armv7 ;;
+        *)
+            echo -e "${RED}不支持架构 $(uname -m)${RESET}"
+            exit 1
+            ;;
+    esac
+}
 
-    if [[ $tcp_ports -lt 1 ]]; then
-        yellow_echo "没有可用的 TCP 端口，正在尝试自动调整..."
-        if [[ $udp_ports -ge 3 ]]; then
-            udp_port_to_delete=$(echo "$port_list" | awk '/udp/ {print $1}' | head -n 1)
-            devil port del udp "$udp_port_to_delete" >/dev/null 2>&1
-        fi
-
-        while true; do
-            local rand_p=$(shuf -i 10000-65535 -n 1)
-            result=$(devil port add tcp "$rand_p" 2>&1)
-            if [[ $result == *"Ok"* ]]; then
-                MTP_PORT=$rand_p
-                break
-            fi
-        done
-    else
-        MTP_PORT=$(echo "$port_list" | awk '/tcp/ {print $1}' | sed -n '1p')
+# ================== 自动获取 GitHub 最新版本号 ==================
+get_latest_version() {
+    local latest_release
+    latest_release=$(curl -fsSL --max-time 5 "https://api.github.com/repos/anytls/anytls-go/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
+    if [[ -z "$latest_release" ]]; then
+        latest_release=$(curl -fsSLI --max-time 5 "https://github.com/anytls/anytls-go/releases/latest" 2>/dev/null | grep -i 'location:' | sed -E 's/.*\/v?([^/\r\n]+).*/\1/')
     fi
-    devil binexec on >/dev/null 2>&1
+    echo "${latest_release:-0.0.12}"
 }
 
-install_lsof() {
-    if ! command -v lsof &>/dev/null; then
-        if [ -f "/etc/debian_version" ]; then
-            apt update && apt install -y lsof
-        elif [ -f "/etc/alpine-release" ]; then
-            apk add lsof
-        fi
-    fi
-}
-
-# ================== Crontab 管理 ==================
-check_cron_status() {
-    # 用更稳健的方式检查 restart.sh 是否已存在于 crontab 中
-    crontab -l 2>/dev/null | grep -q "restart.sh"
-}
-
-set_cron() {
-    if ! check_cron_status; then
-        (crontab -l 2>/dev/null; echo "$CRON_CMD") | crontab -
-    fi
-}
-
-remove_cron() {
-    # 【核心修改】去掉 if check 判断，直接强制过滤！
-    # 这样不管你的路径是 /root/mtp 还是 ~/mtp，只要有 restart.sh 统统杀掉
-    crontab -l 2>/dev/null | grep -v "restart.sh" | crontab -
-}
-# ================== 核心控制服务 ==================
-start_proxy() {
-    if pgrep -x mtg >/dev/null; then
-        yellow_echo "MTProto Proxy 已经在运行中。"
-        return 0
-    fi
-    
-    if [ ! -f "$WORKDIR/mtg" ]; then
-        red_echo "未检测到安装文件，请先选择 1 安装。"
-        return 1
-    fi
-
-    local port=$(cat "$WORKDIR/port.txt" 2>/dev/null)
-    if [[ -z "$port" || "$port" == "无" ]]; then
-        red_echo "未检测到配置端口，请重新安装或修改配置。"
-        return 1
-    fi
-
-    cd "$WORKDIR" || return
-    nohup ./mtg run -b 0.0.0.0:$port "$SECRET" --stats-bind=127.0.0.1:$((port + 1)) >> "$LOG_FILE" 2>&1 &
-    green_echo "MTProto Proxy 启动成功！"
-}
-
-stop_proxy() {
-    if pgrep -x mtg >/dev/null; then
-        pkill -9 mtg >/dev/null 2>&1
-        clear
-        green_echo "MTProto Proxy 已成功停止。"
-    else
-        yellow_echo "MTProto Proxy 本就处于停止状态。"
-    fi
-}
-
-show_config() {
-    if [ ! -f "$WORKDIR/link.txt" ]; then
-        red_echo "未找到连接配置，请确保已成功安装。"
-    else
-        purple_echo "==== 当前 MTProto 连接配置 ===="
-        cat "$WORKDIR/link.txt"
-    fi
-}
-
-# ================== 安装与配置修改 ==================
-download_and_run_mtg() {
-    local arch="amd64"
-    cmd=$(uname -m)
-    if [ "$cmd" == "386" ]; then arch="386"; fi
-    if [ "$cmd" == "arm" ]; then arch="arm"; fi
-    if [ "$cmd" == "aarch64" ]; then arch="arm64"; fi
-
-    mkdir -p "$WORKDIR"
-    pkill -9 mtg >/dev/null 2>&1
-
-    yellow_echo "正在下载 mtg 核心组件..."
-    wget -q -O "${WORKDIR}/mtg" "https://github.com/whunt1/onekeymakemtg/raw/master/builds/ccbuilds/mtg-linux-$arch"
-    
-    if [ ! -s "${WORKDIR}/mtg" ]; then
-        red_echo "下载核心失败，请检查网络！"
-        return 1
-    fi
-    
-    chmod +x "${WORKDIR}/mtg"
-    echo "$MTP_PORT" > "$WORKDIR/port.txt"
-    cd "$WORKDIR" || return
-
-    # 运行服务并重定向日志
-    nohup ./mtg run -b 0.0.0.0:$MTP_PORT "$SECRET" --stats-bind=127.0.0.1:$((MTP_PORT + 1)) >> "$LOG_FILE" 2>&1 &
-    
-    # 创建守护/重启脚本
-    cat > "${WORKDIR}/restart.sh" <<EOF
-#!/bin/bash
-pkill -9 mtg >/dev/null 2>&1
-cd ${WORKDIR}
-nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$((MTP_PORT + 1)) >> ${LOG_FILE} 2>&1 &
+# ================== 配置 ==================
+write_config() {
+    mkdir -p "$ANYTLS_DIR"
+    cat > "$ANYTLS_CONFIG" <<EOF
+ANYTLS_PORT=$1
+ANYTLS_PASSWORD=$2
 EOF
-    chmod +x "${WORKDIR}/restart.sh"
-    return 0
+    chmod 600 "$ANYTLS_CONFIG"
+    chown -R ${RUN_USER}:${RUN_USER} "$ANYTLS_DIR"
 }
 
-core_install() {
-    purple_echo "正在配置 MTProto 代理端口...\n"
+# ================== 输出节点 ==================
+output_node_links() {
+    local ip
+    ip=$(get_public_ip)
+
+    local hostname
+    hostname=$(hostname | cut -d. -f1 | sed 's/ /_/g')
+
+    echo -e "${GREEN}====== AnyTLS 节点信息 ======${RESET}"
+    echo -e "${YELLOW}IP      : ${ip}${RESET}"
+    echo -e "${YELLOW}端口    : $1${RESET}"
+    echo -e "${YELLOW}密码    : $2${RESET}"
+    echo -e "${GREEN}---------------------------${RESET}"
+    echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
+    echo -e "${YELLOW}[信息] V2rayN 链接：${RESET}"
+    echo -e "${CYAN}anytls://$2@$ip:$1/?insecure=1#$hostname-Anytls${RESET}"
+    echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
+    echo -e "${CYAN}$hostname-Anytls = anytls, $ip, $1, password=$2, tfo=true, skip-cert-verify=true, reuse=false${RESET}"
+    echo -e "${YELLOW}---------------------------------${RESET}"
+}
+
+# ================== 安装 ==================
+install_ss() {
+    echo -e "${GREEN}[信息] 开始安装 AnyTLS...${RESET}"
+
+    check_deps
+    create_user
+    mkdir -p "$ANYTLS_DIR"
+
+    local arch
+    arch=$(detect_arch)
+
+    echo -e "${GREEN}[信息] 正在获取 AnyTLS 最新版本...${RESET}"
+    local version
+    version=$(get_latest_version)
+    echo -e "${GREEN}[信息] 检测到最新版本为: v${version}${RESET}"
+
+    local url="https://github.com/anytls/anytls-go/releases/download/v${version}/anytls_${version}_linux_${arch}.zip"
+
+    cd "$TMP_DIR"
+    wget "$url" -O anytls.zip
+    unzip -o anytls.zip -d "$TMP_DIR"
+
+    local real_binary_path
+    real_binary_path=$(find "$TMP_DIR" -type f -name "$BINARY_NAME" | head -n 1)
+    if [[ -z "$real_binary_path" ]]; then
+        echo -e "${RED}[错误] 压缩包内未找到可执行程序 ${BINARY_NAME}${RESET}"
+        return 1
+    fi
+
+    install -m755 "$real_binary_path" "$BINARY_PATH"
+    echo "$version" > "${ANYTLS_DIR}/version.txt"
+
+    local port input_port
+    while true; do
+        read -p "请输入监听端口 (默认随机): " input_port < /dev/tty
+        port=${input_port:-$(random_port)}
+
+        if [[ "$port" =~ ^[0-9]+$ ]] &&
+            [ "$port" -ge 1 ] &&
+            [ "$port" -le 65535 ]; then
+
+            check_port "$port" || continue
+            break
+        fi
+
+        echo -e "${RED}端口无效${RESET}"
+    done
+
+    local input_password password
+    read -p "请输入密码 (默认随机): " input_password < /dev/tty
+    password=${input_password:-$(random_password)}
+
+    write_config "$port" "$password"
+
+    # 生成 Alpine OpenRC 服务脚本
+    cat > "$ANYTLS_SERVICE" <<'EOF'
+#!/sbin/openrc-run
+
+description="AnyTLS Service"
+cfgfile="/etc/anytls/config.env"
+command="/usr/local/bin/anytls-server"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    if [ ! -f "$cfgfile" ]; then
+        eerror "Configuration file $cfgfile missing!"
+        return 1
+    fi
+    . "$cfgfile"
+    command_args="-l :${ANYTLS_PORT} -p ${ANYTLS_PASSWORD}"
     
-    if [[ "$HOSTNAME" =~ mtp ]] || command -v devil &>/dev/null; then
-        check_devil_port
-        IP_LIST=($(devil vhost list | awk '/^[0-9]+/ {print $1}'))
-        IP1=${IP_LIST[0]:-$(get_public_ip)}
-    else
-        install_lsof
-        read -p "请输入 MTProto 代理端口 (回车使用随机端口): " user_port
-        [[ -z $user_port ]] && user_port=$(random_port)
-        MTP_PORT=$(check_vps_port "$user_port")
-        IP1=$(get_public_ip)
+    # OpenRC 运行参数与权限控制
+    command_background="yes"
+    pidfile="/run/${RC_SVCNAME}.pid"
+    command_user="anytls:anytls"
+    
+    # 允许非 root 绑定低端口 (Alpine 适用)
+    capabilities="cap_net_bind_service=ep"
+}
+EOF
+    chmod +x "$ANYTLS_SERVICE"
+
+    rc-update add "$SERVICE_NAME" default
+    rc-service "$SERVICE_NAME" restart
+
+    if ! rc-service "$SERVICE_NAME" status | grep -q "started"; then
+        echo -e "${RED}AnyTLS 启动失败${RESET}"
+        return 1
     fi
 
-    if download_and_run_mtg; then
-        purple_echo "\n🎉 MTProto 安装/修改成功！"
-        LINKS="tg://proxy?server=$IP1&port=$MTP_PORT&secret=$SECRET"
-        green_echo "$LINKS\n"
-        echo -e "$LINKS" > "${WORKDIR}/link.txt"
-        
-        read -p "是否同时将MTProto加入开机自启（Crontab）？[回车默认加入,Y/n]: " choice_cron
-        case "$choice_cron" in
-            [nN][oO]|[nN]) remove_cron ;;
-            *) set_cron ;;
-        esac
+    echo -e "${GREEN}[完成] AnyTLS 安装成功${RESET}"
+    output_node_links "$port" "$password"
+    log "安装成功"
+}
+
+# ================== 更新 AnyTLS 主程序 ==================
+update_ss() {
+    if [[ ! -f "${ANYTLS_DIR}/version.txt" || ! -f "$ANYTLS_CONFIG" ]]; then
+        echo -e "${RED}[错误] 未检测到已安装的 AnyTLS 服务，请先执行安装。${RESET}"
+        return 1
+    fi
+
+    local current_version
+    current_version=$(cat "${ANYTLS_DIR}/version.txt")
+    
+    echo -e "${GREEN}[信息] 正在获取最新版本...${RESET}"
+    local latest_version
+    latest_version=$(get_latest_version)
+
+    echo -e "${GREEN}当前版本: v${current_version}${RESET}"
+    echo -e "${GREEN}最新版本: v${latest_version}${RESET}"
+
+    if [[ "$current_version" == "$latest_version" ]]; then
+        read -p "当前已是最新版本，是否仍要重新下载覆盖？[y/N]: " remode < /dev/tty
+        if [[ ! "$remode" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}已取消更新。${RESET}"
+            return 0
+        fi
+    fi
+
+    echo -e "${GREEN}[信息] 开始升级主程序到 v${latest_version}...${RESET}"
+    local arch
+    arch=$(detect_arch)
+    local url="https://github.com/anytls/anytls-go/releases/download/v${latest_version}/anytls_${latest_version}_linux_${arch}.zip"
+
+    cd "$TMP_DIR"
+    wget "$url" -O anytls.zip || { echo -e "${RED}下载失败${RESET}"; return 1; }
+    unzip -o anytls.zip -d "$TMP_DIR"
+
+    local real_binary_path
+    real_binary_path=$(find "$TMP_DIR" -type f -name "$BINARY_NAME" | head -n 1)
+    if [[ -z "$real_binary_path" ]]; then
+        echo -e "${RED}[错误] 压缩包内未找到可执行程序 ${BINARY_NAME}${RESET}"
+        return 1
+    fi
+
+    rc-service "$SERVICE_NAME" stop || true
+    install -m755 "$real_binary_path" "$BINARY_PATH"
+    echo "$latest_version" > "${ANYTLS_DIR}/version.txt"
+    rc-service "$SERVICE_NAME" start
+
+    if rc-service "$SERVICE_NAME" status | grep -q "started"; then
+        echo -e "${GREEN}[完成] AnyTLS 成功升级至 v${latest_version}!${RESET}"
+        log "升级成功至 v${latest_version}"
+    else
+        echo -e "${RED}[错误] 升级后服务启动失败，请检查日志。${RESET}"
     fi
 }
 
-# ================== 主菜单循环 ==================
-while true; do
+# ================== 修改配置 ==================
+modify_ss() {
+    [[ -f "$ANYTLS_CONFIG" ]] || {
+        echo -e "${RED}配置不存在${RESET}"
+        return
+    }
+
+    # 读取旧配置
+    ANYTLS_PORT=$(grep 'ANYTLS_PORT=' "$ANYTLS_CONFIG" | cut -d= -f2)
+    ANYTLS_PASSWORD=$(grep 'ANYTLS_PASSWORD=' "$ANYTLS_CONFIG" | cut -d= -f2)
+
+    echo "当前端口: $ANYTLS_PORT"
+    echo "当前密码: $ANYTLS_PASSWORD"
+
+    local port password
+
+    read -p "新端口 [当前:${ANYTLS_PORT}]: " port < /dev/tty
+    port=${port:-$ANYTLS_PORT}
+
+    if [[ "$port" != "$ANYTLS_PORT" ]]; then
+        check_port "$port" || return 1
+    fi
+
+    read -p "新密码 [默认保持]: " password < /dev/tty
+    password=${password:-$ANYTLS_PASSWORD}
+
+    write_config "$port" "$password"
+    rc-service "$SERVICE_NAME" restart
+
+    echo -e "${GREEN}修改成功${RESET}"
+    output_node_links "$port" "$password"
+}
+
+# ================== 卸载 ==================
+uninstall_ss() {
+    rc-service "$SERVICE_NAME" stop || true
+    rc-update del "$SERVICE_NAME" default || true
+
+    rm -f "$ANYTLS_SERVICE"
+    rm -f "$BINARY_PATH"
+    rm -rf "$ANYTLS_DIR"
+
+    # Alpine 删除用户
+    deluser "$RUN_USER" &>/dev/null || true
+
+    echo -e "${GREEN}卸载完成${RESET}"
+}
+
+# ================== 菜单 ==================
+show_menu() {
     clear
-    # 状态与端口动态获取
-    if pgrep -x mtg >/dev/null; then
-        status_display="${GREEN}正在运行${RESET}"
+    local status
+    if rc-service "$SERVICE_NAME" status 2>/dev/null | grep -q "started"; then
+        status="${GREEN}●运行中${RESET}"
     else
-        status_display="${RED}已停止${RESET}"
-    fi
-    
-    # 获取自启状态
-    if check_cron_status; then
-        cron_display="${GREEN}已开启${RESET}"
-    else
-        cron_display="${RED}已关闭${RESET}"
+        status="${RED}●未运行${RESET}"
     fi
 
-    port_display=$(get_running_port)
+    local version="未安装"
+    [[ -f "${ANYTLS_DIR}/version.txt" ]] &&
+        version="v$(cat "${ANYTLS_DIR}/version.txt")"
 
-    # 打印精美面板样式
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     MTProto Proxy 管理面板      ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态     :${RESET} ${status_display}"
-    echo -e "${GREEN}端口     :${RESET} ${YELLOW}${port_display}${RESET}"
-    echo -e "${GREEN}开机自启 :${RESET} ${cron_display}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 MTProto${RESET}"
-    echo -e "${GREEN}2. 修改配置${RESET}"
-    echo -e "${GREEN}3. 卸载 MTProto${RESET}"
-    echo -e "${GREEN}4. 启动 MTProto${RESET}"
-    echo -e "${GREEN}5. 停止 MTProto${RESET}"
-    echo -e "${GREEN}6. 重启 MTProto${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看连接配置${RESET}"
+    local port="-"
+    [[ -f "$ANYTLS_CONFIG" ]] &&
+        port=$(grep 'ANYTLS_PORT=' "$ANYTLS_CONFIG" | cut -d= -f2)
+
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}    AnyTLS 管理面板 (Alpine)   ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}版本 :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port}${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}1. 安装 AnyTLS${RESET}"
+    echo -e "${GREEN}2. 更新 AnyTLS${RESET}"
+    echo -e "${GREEN}3. 卸载 AnyTLS${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 AnyTLS${RESET}"
+    echo -e "${GREEN}6. 停止 AnyTLS${RESET}"
+    echo -e "${GREEN}7. 重启 AnyTLS${RESET}"
+    echo -e "${GREEN}8. 查看运行状态${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    read -p "$(echo -e ${GREEN}请选择:${RESET} )" choice
+    echo -e "${GREEN}==============================${RESET}"
+}
+
+# ================== 主循环 ==================
+while true; do
+    show_menu
+
+    set +e
+    read -r -p $'\033[32m请输入选项: \033[0m' choice < /dev/tty
+    set -e
 
     case $choice in
-        1|2)
-            clear; core_install; read -p "按回车返回菜单..." ;;
-        3)
-            clear
-            stop_proxy; remove_cron; rm -rf "$WORKDIR"
-            clear; red_echo "MTProto 已彻底从系统中卸载！"; read -p "按回车返回菜单..." ;;
-        4)
-            clear; start_proxy; read -p "按回车返回菜单..." ;;
-        5)
-            clear; stop_proxy; read -p "按回车返回菜单..." ;;
-        6)
-            clear; stop_proxy; sleep 1; start_proxy; read -p "按回车返回菜单..." ;;
-        7)
-            clear
-            if [ -f "$LOG_FILE" ]; then
-                purple_echo "=== 正在查看最新 50 行运行日志 ==="
-                tail -n 50 "$LOG_FILE"
-            else
-                yellow_echo "暂无日志文件。"
-            fi
-            read -p "按回车返回菜单..." ;;
-        8)
-            clear; show_config; read -p "按回车返回菜单..." ;;
-        0)
-            exit 0 ;;
+        1) install_ss; pause ;;
+        2) update_ss; pause ;;
+        3) uninstall_ss; pause ;;
+        4) modify_ss; pause ;;
+        5) rc-service "$SERVICE_NAME" start; echo -e "${GREEN}[完成] AnyTLS 已启动${RESET}"; pause ;;
+        6) rc-service "$SERVICE_NAME" stop; echo -e "${GREEN}[完成] AnyTLS 已停止${RESET}"; pause ;;
+        7) rc-service "$SERVICE_NAME" restart; echo -e "${GREEN}[完成] AnyTLS 已重启${RESET}"; pause ;;
+        8) rc-service "$SERVICE_NAME" status; pause ;;
+        9)
+            [[ -f "$ANYTLS_CONFIG" ]] && {
+                local p_port p_pass
+                p_port=$(grep 'ANYTLS_PORT=' "$ANYTLS_CONFIG" | cut -d= -f2)
+                p_pass=$(grep 'ANYTLS_PASSWORD=' "$ANYTLS_CONFIG" | cut -d= -f2)
+                output_node_links "$p_port" "$p_pass"
+            }
+            pause
+            ;;
+        0) exit 0 ;;
         *)
-            red_echo "无效输入！" ; sleep 1 ;;
+            echo -e "${RED}无效输入${RESET}"
+            pause
+            ;;
     esac
 done

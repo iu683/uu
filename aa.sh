@@ -1,68 +1,51 @@
-#!/usr/bin/env bash
-set -e
-
-# =========================================
-# 小皮面板 XP 一键安装脚本
-# =========================================
+#!/bin/bash
 
 GREEN="\033[32m"
 RED="\033[31m"
-YELLOW="\033[33m"
-BLUE="\033[36m"
 RESET="\033[0m"
 
-info() { echo -e "${BLUE}[信息]${RESET} $1"; }
-ok() { echo -e "${GREEN}[完成]${RESET} $1"; }
-warn() { echo -e "${YELLOW}[提示]${RESET} $1"; }
-err() { echo -e "${RED}[错误]${RESET} $1"; }
+SCRIPT_URL="https://update.samwaf.com/latest/install_samwaf.sh"
 
-# ================= root 检查 =================
-if [[ $EUID -ne 0 ]]; then
-    err "请使用 root 或 sudo 运行"
-    exit 1
-fi
+install_samwaf() {
+    echo -e "${GREEN}正在安装 SamWaf 网站防火墙...${RESET}"
+    curl -sSO $SCRIPT_URL
+    bash install_samwaf.sh install
+    pause
+}
 
-# ================= 安装依赖 =================
-info "安装依赖..."
+uninstall_samwaf() {
+    echo -e "${GREEN}正在卸载 SamWaf 网站防火墙...${RESET}"
+    curl -sSO $SCRIPT_URL
+    bash install_samwaf.sh uninstall
+    pause
+}
 
-if command -v apt >/dev/null 2>&1; then
-    apt update
-    apt install -y curl wget ca-certificates
-elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y curl wget ca-certificates
-elif command -v yum >/dev/null 2>&1; then
-    yum install -y curl wget ca-certificates
-fi
+pause() {
+    read -p $'\033[32m按回车返回菜单...\033[0m'
+    menu
+}
 
-ok "依赖安装完成"
+menu() {
+    clear
+    echo -e "${GREEN}=================================${RESET}"
+    echo -e "${GREEN}      SamWaf 网站防火墙管理     ${RESET}"
+    echo -e "${GREEN}=================================${RESET}"
+    echo -e "${GREEN} 1) 安装 SamWaf${RESET}"
+    echo -e "${GREEN} 2) 卸载 SamWaf${RESET}"
+    echo -e "${GREEN} 0) 退出${RESET}"
+    echo
+    read -p $'\033[32m 请选择: \033[0m' choice
 
-# ================= 下载脚本 =================
-info "下载安装小皮面板..."
+    case $choice in
+        1) install_samwaf ;;
+        2) uninstall_samwaf ;;
+        0) exit 0 ;;
+        *)
+            echo -e "${RED}输入错误，请重新选择${RESET}"
+            sleep 1
+            menu
+            ;;
+    esac
+}
 
-if command -v curl >/dev/null 2>&1; then
-    curl -fsSL \
-        https://dl.xp.cn/dl/xp/install.sh \
-        -o /tmp/xp_install.sh
-else
-    wget -qO \
-        /tmp/xp_install.sh \
-        https://dl.xp.cn/dl/xp/install.sh
-fi
-
-chmod +x /tmp/xp_install.sh
-
-# ================= 开始安装 =================
-info "开始安装小皮面板..."
-
-set +e
-bash /tmp/xp_install.sh
-INSTALL_EXIT=$?
-set -e
-
-
-echo
-if [[ $INSTALL_EXIT -eq 0 ]]; then
-    ok "安装脚本执行完成！"
-else
-    warn "安装脚本返回异常（退出码: $INSTALL_EXIT）"
-fi
+menu

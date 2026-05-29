@@ -77,11 +77,13 @@ check_environment() {
 
 get_installed_version() {
   if [[ -f "$BINARY_PATH" ]]; then
-    "$BINARY_PATH" version 2>/dev/null | head -n1 || echo "未知版本"
+    # 提取纯粹的版本数字，不带多余的 sing-box version 字符串
+    "$BINARY_PATH" version 2>/dev/null | head -n1 | awk '{print $3}' || echo "未知版本"
   else
     echo "未安装"
   fi
 }
+
 
 clear_old_iptables() {
   if [[ -f "${CONFIG_DIR}/hopping.txt" && -f "${CONFIG_DIR}/main_port.txt" ]]; then
@@ -182,6 +184,8 @@ get_current_port_display() {
     fi
   else echo "-"; fi
 }
+
+
 
 # =========================================================
 # 5. 面板节点配置生成核心逻辑
@@ -390,17 +394,6 @@ tuic://$auth_uuid:$auth_pwd@$last_ip:$port?alpn=h3&congestion_control=bbr&sni=$t
 
 Surge 配置:
 $HOSTNAME-tuic = tuic-v5, $last_ip, $port, password=$auth_pwd, uuid=$auth_uuid, ecn=true, skip-cert-verify=${skip_cert}, sni=$tuic_domain
-
-Clash Meta / Mihomo 格式备忘:
-- name: $HOSTNAME-tuic
-  type: tuic
-  server: $vps_ip
-  port: $port
-  uuid: $auth_uuid
-  password: $auth_pwd
-  alpn: [h3]
-  sni: $tuic_domain
-  skip-cert-verify: ${skip_cert}
 EOF
 
   rc-service sing-box restart
@@ -462,6 +455,28 @@ EOF
   rc-update add sing-box default >/dev/null 2>&1 || true
 }
 
+download_core() {
+  local arch url
+  arch=$(detect_arch)
+  url=$(printf 'https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz' "$SINGBOX_VERSION" "$SINGBOX_VERSION" "$arch")
+  
+  info "正在下载官方核心 sing-box v$SINGBOX_VERSION..."
+  cd "$TMP_DIR"
+  if ! wget -O sing-box.tar.gz -q "$url"; then
+    curl -fsSL -o sing-box.tar.gz "$url" || { error "下载核心文件失败"; return 1; }
+  fi
+  
+  tar -xzf sing-box.tar.gz -C "$TMP_DIR"
+  local extracted=$(find "$TMP_DIR" -type f -name sing-box | head -n 1)
+  [[ -n "$extracted" ]] || { error "解压目标核心错误"; return 1; }
+  
+  # 如果正在运行，先暂退核心保证覆盖成功
+  rc-service sing-box stop >/dev/null 2>&1 || true
+  install -m 755 "$extracted" "$BINARY_PATH"
+  info "sing-box 核心释放完毕。"
+  return 0
+}
+
 install_tuic() {
   echo -e "${GREEN}[信息] 开始在 Alpine 下部署 sing-box TUIC V5 ...${RESET}"
   check_environment
@@ -501,11 +516,16 @@ install_tuic() {
 
 update_tuic() {
   if [[ ! -f "$BINARY_PATH" ]]; then
-    error "当前系统未安装 sing-box，无法执行更新。"
+    error "当前系统未检测到核心，无法执行覆盖升级。"
     return 1
   fi
-  warn "即将执行核心重构覆盖与更新..."
-  install_tuic
+  info "检测到已有环境，正在执行纯净原地覆盖核心升级（不破坏任何节点配置）..."
+  if download_core; then
+    rc-service sing-box start
+    info "sing-box 核心纯净升级覆盖成功，服务已安全启动！"
+  else
+    error "核心升级遭遇未预期中断。"
+  fi
 }
 
 unsttuic() {
@@ -573,8 +593,10 @@ showconf() {
   echo
 }
 
+
+
 # =========================================================
-# 7. 面板交互菜单 (完美复刻目标高档 UI 样式)
+# 7. 面板交互菜单 
 # =========================================================
 menu() {
   while true; do

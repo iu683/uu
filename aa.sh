@@ -27,6 +27,27 @@ warn() { echo -e "${GREEN}[警告] $*${RESET}"; }
 error() { echo -e "${GREEN}[错误] $*${RESET}"; }
 pause() { echo; echo -ne "${GREEN}按任意键返回菜单...${RESET}"; read -n 1 -s; echo; }
 
+# 校验端口是否合法
+is_valid_port() {
+    local port=$1
+    if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# 重启服务并检查结果
+restart_xray() {
+    rc-service xray restart >/dev/null 2>&1 || true
+    sleep 1
+    if rc-service xray status 2>/dev/null | grep -q "started"; then
+        return 0
+    else
+        return 1
+    fi
+}
+
 # 状态获取
 get_xray_status() {
     if rc-service xray status 2>/dev/null | grep -q "started"; then
@@ -34,9 +55,12 @@ get_xray_status() {
     else echo -e "${RED}● 未运行${RESET}"; fi
 }
 
-# 版本获取
 get_xray_version() {
-    [[ -x "$X_BIN" ]] && "$X_BIN" version 2>/dev/null | head -n 1 | awk '{print $2}' || echo "未安装"
+    if [[ -x "$X_BIN" ]]; then
+        "$X_BIN" version 2>/dev/null | head -n 1 | awk '{print $2}'
+    else
+        echo "未安装"
+    fi
 }
 
 # 公网IP获取
@@ -106,40 +130,69 @@ select_best_sni() {
     fi
 }
 
-# ================== Socks5 出口配置 ==================
-config_socks5() {
-    if [[ ! -f "$X_CONFIG" ]]; then error "请先安装 Xray"; return; fi
-    echo -e "${GREEN}--- Socks5 出口配置 ---${RESET}"
-    echo -e "${GREEN}1. 启用 Socks5 出口${RESET}"
-    echo -e "${GREEN}2. 还原 Freedom 直连出口${RESET}"
-    echo -e "${GREEN}0. 返回${RESET}"
-    echo -ne "${GREEN}请选择: ${RESET}"; read s_opt
+# ================== 出口模式配置 (严谨版) ==================
+configure_custom_socks5_outbound() {
+    if [[ ! -f "$X_CONFIG" ]]; then 
+        error "错误: Xray 未安装，无法配置出口模式。"
+        return
+    fi
 
-    case $s_opt in
+    local mode current_protocol tmp_file
+    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$X_CONFIG" 2>/dev/null || echo "freedom")
+
+    echo -e "${GREEN}---------------------------------------------${RESET}"
+    echo -ne "${GREEN}请选择出口模式：${RESET}"
+    [[ "$current_protocol" == "socks" ]] && echo -e "${YELLOW} (当前: Socks5)${RESET}" || echo -e "${GREEN} (当前: 直连)${RESET}"
+    echo -e "${GREEN}1) 直连出口${RESET}"
+    echo -e "${GREEN}2) Socks5 出口${RESET}"
+    echo -e "${GREEN}0) 取消${RESET}"
+    echo -e "${GREEN}---------------------------------------------${RESET}"
+
+    echo -ne "${GREEN}请输入选项 [0-2]: ${RESET}"; read mode
+    case "$mode" in
         1)
-            echo -ne "${GREEN}Socks5 服务器地址: ${RESET}"; read s_addr
-            echo -ne "${GREEN}Socks5 服务器端口: ${RESET}"; read s_port
-            echo -ne "${GREEN}用户名 (无则直接回车): ${RESET}"; read s_user
-            echo -ne "${GREEN}密码 (无则直接回车): ${RESET}"; read s_pass
-            
-            if [[ -n "$s_user" ]]; then
-                new_outbound=$(jq -n --arg h "$s_addr" --argjson p "$s_port" --arg u "$s_user" --arg pw "$s_pass" \
-                '{"protocol":"socks","settings":{"servers":[{"address":$h,"port":$p,"users":[{"user":$u,"pass":$pw}]}]}}')
-            else
-                new_outbound=$(jq -n --arg h "$s_addr" --argjson p "$s_port" \
-                '{"protocol":"socks","settings":{"servers":[{"address":$h,"port":$p}]}}')
-            fi
-            ;;
-        2)
-            new_outbound='{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}'
-            ;;
-        *) return ;;
+            tmp_file=$(mktemp)
+            jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$X_CONFIG" > "$tmp_file"
+            cp "$X_CONFIG" "${X_CONFIG}.bak.$(date +%s)"
+            mv "$tmp_file" "$X_CONFIG"
+            restart_xray && info "已成功切换为直连出口！" || error "切换失败。"
+            return ;;
+        2) ;;
+        *) info "已取消配置。"; return ;;
     esac
 
-    tmp_cfg=$(mktemp)
-    jq --argjson obj "$new_outbound" '.outbounds = [$obj]' "$X_CONFIG" > "$tmp_cfg" && mv "$tmp_cfg" "$X_CONFIG"
-    rc-service xray restart
-    info "Socks5 出口模式更新成功！"
+    info "配置自定义 Socks5 出口代理..."
+    local s_host s_port s_user s_pass
+    echo -ne "${GREEN}请输入 Socks5 服务器地址/IP: ${RESET}"; read s_host
+    [[ -z "$s_host" ]] && return
+
+    while true; do
+        echo -ne "${GREEN}请输入 Socks5 端口 (默认: 1080): ${RESET}"; read s_port
+        [[ -z "$s_port" ]] && s_port=1080
+        is_valid_port "$s_port" && break || error "端口无效，请输入 1-65535 之间的数字。"
+    done
+
+    echo -ne "${GREEN}请输入 Socks5 用户名 (无则回车): ${RESET}"; read s_user
+    if [[ -n "$s_user" ]]; then
+        echo -ne "${GREEN}请输入 Socks5 密码: ${RESET}"; read -s s_pass; echo
+    else
+        s_pass=""
+    fi
+
+    tmp_file=$(mktemp)
+    if [[ -n "$s_user" ]]; then
+        jq --arg host "$s_host" --argjson port "$s_port" --arg user "$s_user" --arg pass "$s_pass" \
+            '.outbounds = [{"protocol": "socks", "tag": "custom-out", "settings": {"servers": [{"address": $host, "port": $port, "users": [{"user": $user, "pass": $pass}]}]}}]' \
+            "$X_CONFIG" > "$tmp_file"
+    else
+        jq --arg host "$s_host" --argjson port "$s_port" \
+            '.outbounds = [{"protocol": "socks", "tag": "custom-out", "settings": {"servers": [{"address": $host, "port": $port}]}}]' \
+            "$X_CONFIG" > "$tmp_file"
+    fi
+
+    cp "$X_CONFIG" "${X_CONFIG}.bak.$(date +%s)"
+    mv "$tmp_file" "$X_CONFIG"
+    restart_xray && info "已成功切换为 Socks5 出口！" || error "重启失败，请检查 Socks5 信息。"
 }
 
 # 4. 修改配置
@@ -268,8 +321,8 @@ while true; do
         6) rc-service xray stop; pause ;;
         7) rc-service xray restart; pause ;;
         8) [[ -f "$X_LOG" ]] && tail -f "$X_LOG" || error "暂无日志"; pause ;;
-        9) [[ -f "$X_LINK" ]] && (echo -e "${GREEN}$(cat "$X_LINK")${RESET}") || error "无配置"; pause ;;
-        10) config_socks5; pause ;;
+        9) [[ -f "$X_LINK" ]] && (echo -e "${YELLOW}$(cat "$X_LINK")${RESET}") || error "无配置"; pause ;;
+        10) configure_custom_socks5_outbound; pause ;;
         11) select_best_sni; pause ;;
         0) exit 0 ;;
         *) error "无效选项"; sleep 1 ;;

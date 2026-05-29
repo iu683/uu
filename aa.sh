@@ -1,209 +1,91 @@
 #!/bin/bash
-set -e
 
-# =========================================================
-# Fail2Ban 一键部署脚本 (Alpine Linux)
-# =========================================================
-
-GREEN="\033[32m"
+# ========================================
+# 系统清理 一键部署脚本 (Alpine Linux)
+# ========================================
+# ========================================
+# 颜色定义
+# ========================================
 RED="\033[31m"
+GREEN="\033[32m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-LOG_PATH="/var/log/auth.log"
+# Root 检查
+[ "$(id -u)" -ne 0 ] && echo -e "${RED}❌ 请使用 root 运行${RESET}" && exit 1
 
-info() { echo -e "${GREEN}[INFO] $1${RESET}"; }
-warn() { echo -e "${YELLOW}[WARN] $1${RESET}"; }
-error() { echo -e "${RED}[ERROR] $1${RESET}"; }
-
-# -------------------------
-# 检查系统
-# -------------------------
-if [[ ! -f /etc/alpine-release ]]; then
-    echo -e "${RED}❌ 本脚本仅适用于 Alpine Linux${RESET}"
-    exit 1
+# 系统识别
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS_ID="$ID"
+else
+    OS_ID="unknown"
 fi
 
-# -------------------------
-# 安装 Fail2Ban
-# -------------------------
-install_fail2ban() {
-    info "更新 apk 索引并安装 fail2ban 和 rsyslog..."
-    apk update
-    apk add --no-cache fail2ban rsyslog openssh
+echo -e "${GREEN}🚀 开始执行全能系统清理...${RESET}"
 
-    rc-update add rsyslog
-    service rsyslog start
+# ========================================
+# 1. 软件包管理器清理
+# ========================================
+echo -e "${YELLOW}📦 清理软件包缓存...${RESET}"
+case "$OS_ID" in
+    debian|ubuntu)
+        apt-get autoremove -y >/dev/null 2>&1
+        apt-get autoclean -y >/dev/null 2>&1
+        apt-get clean -y >/dev/null 2>&1
+        dpkg -l | grep "^rc" | awk '{print $2}' | xargs -r dpkg -P >/dev/null 2>&1
+        ;;
+    centos|rhel|rocky|almalinux|fedora)
+        yum autoremove -y >/dev/null 2>&1 || dnf autoremove -y >/dev/null 2>&1
+        yum clean all >/dev/null 2>&1 || dnf clean all >/dev/null 2>&1
+        ;;
+    alpine)
+        apk cache clean >/dev/null 2>&1
+        rm -rf /var/cache/apk/*
+        ;;
+esac
 
-    rc-update add sshd
-    service sshd start
+# ========================================
+# 2. 日志文件清理
+# ========================================
+echo -e "${YELLOW}📜 清理系统日志...${RESET}"
+if command -v journalctl >/dev/null 2>&1; then
+    journalctl --vacuum-time=1d >/dev/null 2>&1
+    journalctl --vacuum-size=20M >/dev/null 2>&1
+fi
 
-    rc-update add fail2ban
-    service fail2ban start
+find /var/log -type f -name "*.log" -exec truncate -s 0 {} +
+find /var/log -type f \( -name "*.gz" -o -name "*.1" -o -name "*.old" \) -delete
 
-    # 确保日志文件存在
-    [[ ! -f "$LOG_PATH" ]] && touch "$LOG_PATH" && chmod 600 "$LOG_PATH"
+# ========================================
+# 3. Docker 清理
+# ========================================
+if command -v docker >/dev/null 2>&1; then
+    echo -e "${YELLOW}🐳 清理 Docker 冗余数据...${RESET}"
+    docker system prune -f >/dev/null 2>&1
+fi
 
-    # 配置 SSH 输出日志
-    if ! grep -q "^SyslogFacility AUTH" /etc/ssh/sshd_config; then
-        echo "SyslogFacility AUTH" >> /etc/ssh/sshd_config
-        echo "LogLevel INFO" >> /etc/ssh/sshd_config
-        service sshd restart
-    fi
+# ========================================
+# 4. 临时文件清理
+# ========================================
+echo -e "${YELLOW}🧹 清理临时文件...${RESET}"
+rm -rf /tmp/* 2>/dev/null || true
+rm -rf ~/.cache/* 2>/dev/null || true
 
-    # 创建兼容 Alpine 的 filter
-    mkdir -p /etc/fail2ban/filter.d
-    cat >/etc/fail2ban/filter.d/sshd-alpine.conf <<'EOF'
-[Definition]
-failregex = ^.*Failed password for .* from <HOST> port .* ssh2$
-ignoreregex =
-EOF
+# ========================================
+# 5. 内存释放 (静默权限判定)
+# ========================================
+echo -e "${YELLOW}🧠 尝试释放页面缓存...${RESET}"
+sync
+# 检查是否有写入权限，如果有才执行，没有则直接提示
+if [ -w /proc/sys/vm/drop_caches ]; then
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null && echo -e "${GREEN}✔ 内存释放成功${RESET}"
+else
+    echo -e "${YELLOW}🧹 当前环境不支持手动释放缓存 (通常见于 LXC/Docker)，已跳过${RESET}"
+fi
 
-    info "✅ Fail2Ban 已安装并启动"
-}
-
-# -------------------------
-# 配置 SSH 防护
-# -------------------------
-configure_ssh() {
-    read -p $'\033[32m请输入 SSH 端口（默认22）: \033[0m' SSH_PORT
-    SSH_PORT=${SSH_PORT:-22}
-
-    read -p $'\033[32m请输入最大失败尝试次数 maxretry（默认5）: \033[0m' MAX_RETRY
-    MAX_RETRY=${MAX_RETRY:-5}
-
-    read -p $'\033[32m请输入封禁时间 bantime(秒，默认600): \033[0m' BAN_TIME
-    BAN_TIME=${BAN_TIME:-600}
-
-    mkdir -p /etc/fail2ban/jail.d
-    cat >/etc/fail2ban/jail.d/sshd.local <<EOF
-[sshd]
-enabled = true
-port = $SSH_PORT
-filter = sshd-alpine
-logpath = $LOG_PATH
-maxretry = $MAX_RETRY
-bantime  = $BAN_TIME
-EOF
-
-    service fail2ban restart
-    info "✅ SSH 防暴力破解配置完成"
-    read -p $'\033[32m按回车返回菜单...\033[0m'
-}
-
-# -------------------------
-# 卸载 Fail2Ban
-# -------------------------
-uninstall_fail2ban() {
-    info "正在卸载 Fail2Ban..."
-    service fail2ban stop || true
-    apk del fail2ban rsyslog
-    [[ -f /etc/ssh/sshd_config ]] && sed -i '/SyslogFacility AUTH/d;/LogLevel INFO/d' /etc/ssh/sshd_config
-    info "✅ Fail2Ban 已卸载"
-    read -p $'\033[32m按回车返回菜单...\033[0m'
-}
-
-# -------------------------
-# 查看被封禁 IP
-# -------------------------
-view_banned() {
-    if command -v fail2ban-client &>/dev/null; then
-        BANNED=$(fail2ban-client status sshd 2>/dev/null | grep 'Banned IP list' | cut -d: -f2)
-        echo -e "${GREEN}当前被封禁的 IP:${RESET} ${BANNED:-无}"
-    else
-        echo -e "${RED}Fail2Ban 未安装或未启动${RESET}"
-    fi
-    read -p $'\033[32m按回车返回菜单...\033[0m'
-}
-
-# -------------------------
-# 查看规则列表
-# -------------------------
-view_jails() {
-    if command -v fail2ban-client &>/dev/null; then
-        JAILS=$(fail2ban-client status 2>/dev/null | grep 'Jail list' | cut -d: -f2)
-        echo -e "${GREEN}当前防御规则列表:${RESET} ${JAILS:-无}"
-    else
-        echo -e "${RED}Fail2Ban 未安装或未启动${RESET}"
-    fi
-    read -p $'\033[32m按回车返回菜单...\033[0m'
-}
-
-# -------------------------
-# 日志实时监控
-# -------------------------
-monitor_log() {
-    if [[ -f "$LOG_PATH" ]]; then
-        echo -e "${GREEN}进入日志实时监控，按 Ctrl+C 返回菜单${RESET}"
-        trap 'echo -e "\n${GREEN}已退出日志监控${RESET}"' SIGINT
-        tail -n 20 -f "$LOG_PATH" || true
-        trap - SIGINT
-    else
-        echo -e "${RED}日志文件不存在${RESET}"
-        read -p $'\033[32m按回车返回菜单...\033[0m'
-    fi
-}
-
-# -------------------------
-# 关闭 Fail2Ban 防护
-# -------------------------
-disable_fail2ban() {
-    if ! command -v fail2ban-client >/dev/null 2>&1; then
-        echo -e "${RED}Fail2Ban 未安装${RESET}"
-    else
-        warn "正在关闭 Fail2Ban 防护..."
-        service fail2ban stop
-        echo -e "${YELLOW}✅ Fail2Ban 防护已关闭${RESET}"
-    fi
-    read -p $'\033[32m按回车返回菜单...\033[0m'
-}
-
-# -------------------------
-# 菜单
-# -------------------------
-while true; do
-    clear
-    echo -e "${GREEN}===SSH 防暴力破解管理菜单===${RESET}"
-    echo -e "${GREEN}1. 安装开启SSH防暴力破解${RESET}"
-    echo -e "${GREEN}2. 关闭SSH防暴力破解${RESET}"
-    echo -e "${GREEN}3. 配置SSH防护参数${RESET}"
-    echo -e "${GREEN}4. 查看SSH拦截记录${RESET}"
-    echo -e "${GREEN}5. 查看防御规则列表${RESET}"
-    echo -e "${GREEN}6. 查看日志实时监控${RESET}"
-    echo -e "${GREEN}7. 卸载防御程序${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    read -p $'\033[32m请输入你的选择: \033[0m' choice
-
-    case "$choice" in
-        1)
-            install_fail2ban
-            configure_ssh
-            ;;
-        2)
-            disable_fail2ban
-            ;;
-        3)
-            configure_ssh
-            ;;
-        4)
-            view_banned
-            ;;
-        5)
-            view_jails
-            ;;
-        6)
-            monitor_log
-            read -p $'\033[32m按回车返回菜单...\033[0m'
-            ;;
-        7)
-            uninstall_fail2ban
-            ;;
-        0)
-            break
-            ;;
-        *)
-            echo -e "${RED}无效选择，请重新输入${RESET}"
-            sleep 1
-            ;;
-    esac
-done
+# ========================================
+# 总结输出
+# ========================================
+echo -e "${GREEN}----------------------------------${RESET}"
+echo -e "${GREEN}✅ 系统清理完成！${RESET}"

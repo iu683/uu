@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =========================================================
-# AnyTLS 一键部署脚本 (Alpine Linux)
+# AnyTLS 一键部署脚本
 # =========================================================
 
 # ================== 颜色定义 ==================
@@ -14,7 +14,7 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 # ================== 基础变量 ==================
-SCRIPT_VERSION="1.3"
+SCRIPT_VERSION="1.0"
 SERVICE_NAME="anytls"
 BINARY_NAME="anytls-server"
 BINARY_DIR="/usr/local/bin"
@@ -22,7 +22,7 @@ BINARY_PATH="${BINARY_DIR}/${BINARY_NAME}"
 
 ANYTLS_DIR="/etc/anytls"
 ANYTLS_CONFIG="${ANYTLS_DIR}/config.env"
-ANYTLS_SERVICE="/etc/init.d/${SERVICE_NAME}"
+ANYTLS_SERVICE="/etc/systemd/system/${SERVICE_NAME}.service"
 LOG_FILE="/var/log/anytls-manager.log"
 RUN_USER="anytls"
 
@@ -50,13 +50,10 @@ pause() {
     echo
 }
 
-# ================== 用户与组创建 ==================
+# ================== 用户 ==================
 create_user() {
-    getent group "$RUN_USER" &>/dev/null || \
-        addgroup -S "$RUN_USER"
-
-    id "$RUN_USER" &>/dev/null || \
-        adduser -S -D -H -G "$RUN_USER" -s /sbin/nologin "$RUN_USER"
+    id -u "$RUN_USER" &>/dev/null || \
+        useradd -r -s /usr/sbin/nologin "$RUN_USER"
 }
 
 # ================== 公网IP ==================
@@ -90,7 +87,23 @@ get_public_ip() {
 
 # ================== 依赖 ==================
 check_deps() {
-    apk add --no-cache curl wget unzip iproute2 bash
+    install_pkg() {
+        if command -v apt >/dev/null 2>&1; then
+            apt update -y
+            apt install -y "$@"
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y "$@"
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y "$@"
+        elif command -v apk >/dev/null 2>&1; then
+            apk add --no-cache "$@"
+        fi
+    }
+
+    command -v curl >/dev/null || install_pkg curl
+    command -v wget >/dev/null || install_pkg wget
+    command -v unzip >/dev/null || install_pkg unzip
+    command -v ss >/dev/null || install_pkg iproute2
 }
 
 # ================== 端口 ==================
@@ -102,7 +115,7 @@ check_port() {
 }
 
 random_port() {
-    awk 'BEGIN{srand(); print int(rand()*(65000-10000+1))+10000}'
+    shuf -i 10000-65000 -n1
 }
 
 random_password() {
@@ -143,24 +156,24 @@ EOF
     chown -R ${RUN_USER}:${RUN_USER} "$ANYTLS_DIR"
 }
 
-# ================== 输出节点 (修复 local 问题) ==================
+# ================== 输出节点 ==================
 output_node_links() {
-    local ip port_num pwd_str hostname
-    port_num=$1
-    pwd_str=$2
+    local ip
     ip=$(get_public_ip)
-    hostname=$(hostname | cut -d. -f1 | sed 's/ /_/g')
+
+    local hostname
+    hostname=$(hostname -s | sed 's/ /_/g')
 
     echo -e "${GREEN}====== AnyTLS 节点信息 ======${RESET}"
     echo -e "${YELLOW}IP      : ${ip}${RESET}"
-    echo -e "${YELLOW}端口    : ${port_num}${RESET}"
-    echo -e "${YELLOW}密码    : ${pwd_str}${RESET}"
+    echo -e "${YELLOW}端口    : $1${RESET}"
+    echo -e "${YELLOW}密码    : $2${RESET}"
     echo -e "${GREEN}---------------------------${RESET}"
     echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
     echo -e "${YELLOW}[信息] V2rayN 链接：${RESET}"
-    echo -e "${CYAN}anytls://${pwd_str}@${ip}:${port_num}/?insecure=1#${hostname}-Anytls${RESET}"
+    echo -e "${CYAN}anytls://$2@$ip:$1/?insecure=1#$hostname-Anytls${RESET}"
     echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
-    echo -e "${CYAN}${hostname}-Anytls = anytls, ${ip}, ${port_num}, password=${pwd_str}, tfo=true, skip-cert-verify=true, reuse=false${RESET}"
+    echo -e "${CYAN}$hostname-Anytls = anytls, $ip, $1, password=$2, tfo=true, skip-cert-verify=true, reuse=false${RESET}"
     echo -e "${YELLOW}---------------------------------${RESET}"
 }
 
@@ -218,43 +231,39 @@ install_ss() {
 
     write_config "$port" "$password"
 
-    cat > "$ANYTLS_SERVICE" <<'EOF'
-#!/sbin/openrc-run
+    cat > "$ANYTLS_SERVICE" <<EOF
+[Unit]
+Description=AnyTLS Service
+After=network-online.target
+Wants=network-online.target
 
-description="AnyTLS Service"
-cfgfile="/etc/anytls/config.env"
-command="/usr/local/bin/anytls-server"
+[Service]
+Type=simple
+User=${RUN_USER}
+Group=${RUN_USER}
+EnvironmentFile=${ANYTLS_CONFIG}
+ExecStart=${BINARY_PATH} -l :\${ANYTLS_PORT} -p \${ANYTLS_PASSWORD}
+Restart=always
+RestartSec=3
 
-depend() {
-    need net
-    after firewall
-}
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
 
-start_pre() {
-    if [ ! -f "$cfgfile" ]; then
-        eerror "Configuration file $cfgfile missing!"
-        return 1
-    fi
-    . "$cfgfile"
-    command_args="-l :${ANYTLS_PORT} -p ${ANYTLS_PASSWORD}"
-    
-    command_background="yes"
-    pidfile="/run/${RC_SVCNAME}.pid"
-    
-    if [ "${ANYTLS_PORT}" -lt 1024 ]; then
-        command_user="root:root"
-    else
-        command_user="anytls:anytls"
-    fi
-}
+[Install]
+WantedBy=multi-user.target
 EOF
-    chmod +x "$ANYTLS_SERVICE"
 
-    rc-update add "$SERVICE_NAME" default
-    rc-service "$SERVICE_NAME" restart
+    systemctl daemon-reload
+    systemctl enable "$SERVICE_NAME"
+    systemctl restart "$SERVICE_NAME"
 
-    if ! rc-service "$SERVICE_NAME" status | grep -q "started"; then
+    if ! systemctl is-active --quiet "$SERVICE_NAME"; then
         echo -e "${RED}AnyTLS 启动失败${RESET}"
+        journalctl -u "$SERVICE_NAME" -n20 --no-pager
         return 1
     fi
 
@@ -263,7 +272,7 @@ EOF
     log "安装成功"
 }
 
-# ================== 更新 AnyTLS 主程序 (移除二次确认) ==================
+# ================== 更新 AnyTLS 主程序 ==================
 update_ss() {
     if [[ ! -f "${ANYTLS_DIR}/version.txt" || ! -f "$ANYTLS_CONFIG" ]]; then
         echo -e "${RED}[错误] 未检测到已安装的 AnyTLS 服务，请先执行安装。${RESET}"
@@ -279,6 +288,10 @@ update_ss() {
 
     echo -e "${GREEN}当前版本: v${current_version}${RESET}"
     echo -e "${GREEN}最新版本: v${latest_version}${RESET}"
+
+    if [[ "$current_version" == "$latest_version" ]]; then
+        echo -e "${YELLOW}[提示] 当前已是最新版本，将直接重新下载覆盖...${RESET}"
+    fi
 
     echo -e "${GREEN}[信息] 开始升级主程序到 v${latest_version}...${RESET}"
     local arch
@@ -296,12 +309,12 @@ update_ss() {
         return 1
     fi
 
-    rc-service "$SERVICE_NAME" stop || true
+    systemctl stop "$SERVICE_NAME" || true
     install -m755 "$real_binary_path" "$BINARY_PATH"
     echo "$latest_version" > "${ANYTLS_DIR}/version.txt"
-    rc-service "$SERVICE_NAME" start
+    systemctl start "$SERVICE_NAME"
 
-    if rc-service "$SERVICE_NAME" status | grep -q "started"; then
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
         echo -e "${GREEN}[完成] AnyTLS 成功升级至 v${latest_version}!${RESET}"
         log "升级成功至 v${latest_version}"
     else
@@ -316,8 +329,7 @@ modify_ss() {
         return
     }
 
-    ANYTLS_PORT=$(grep 'ANYTLS_PORT=' "$ANYTLS_CONFIG" | cut -d= -f2)
-    ANYTLS_PASSWORD=$(grep 'ANYTLS_PASSWORD=' "$ANYTLS_CONFIG" | cut -d= -f2)
+    source "$ANYTLS_CONFIG"
 
     echo "当前端口: $ANYTLS_PORT"
     echo "当前密码: $ANYTLS_PASSWORD"
@@ -335,7 +347,7 @@ modify_ss() {
     password=${password:-$ANYTLS_PASSWORD}
 
     write_config "$port" "$password"
-    rc-service "$SERVICE_NAME" restart
+    systemctl restart "$SERVICE_NAME"
 
     echo -e "${GREEN}修改成功${RESET}"
     output_node_links "$port" "$password"
@@ -343,16 +355,16 @@ modify_ss() {
 
 # ================== 卸载 ==================
 uninstall_ss() {
-    rc-service "$SERVICE_NAME" stop || true
-    rc-update del "$SERVICE_NAME" default || true
+    systemctl stop "$SERVICE_NAME" || true
+    systemctl disable "$SERVICE_NAME" || true
 
     rm -f "$ANYTLS_SERVICE"
     rm -f "$BINARY_PATH"
     rm -rf "$ANYTLS_DIR"
 
-    deluser "$RUN_USER" &>/dev/null || true
-    delgroup "$RUN_USER" &>/dev/null || true
+    id -u "$RUN_USER" &>/dev/null && userdel "$RUN_USER" || true
 
+    systemctl daemon-reload
     echo -e "${GREEN}卸载完成${RESET}"
 }
 
@@ -360,11 +372,9 @@ uninstall_ss() {
 show_menu() {
     clear
     local status
-    if rc-service "$SERVICE_NAME" status 2>/dev/null | grep -q "started"; then
-        status="${GREEN}●运行中${RESET}"
-    else
+    systemctl is-active --quiet "$SERVICE_NAME" &&
+        status="${GREEN}●运行中${RESET}" ||
         status="${RED}●未运行${RESET}"
-    fi
 
     local version="未安装"
     [[ -f "${ANYTLS_DIR}/version.txt" ]] &&
@@ -372,10 +382,11 @@ show_menu() {
 
     local port="-"
     [[ -f "$ANYTLS_CONFIG" ]] &&
-        port=$(grep 'ANYTLS_PORT=' "$ANYTLS_CONFIG" | cut -d= -f2)
+        source "$ANYTLS_CONFIG" &&
+        port=$ANYTLS_PORT
 
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}    AnyTLS 管理面板   ${RESET}"
+    echo -e "${GREEN}      AnyTLS 管理面板          ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}版本 :${RESET} ${YELLOW}${version}${RESET}"
@@ -388,7 +399,7 @@ show_menu() {
     echo -e "${GREEN}5. 启动 AnyTLS${RESET}"
     echo -e "${GREEN}6. 停止 AnyTLS${RESET}"
     echo -e "${GREEN}7. 重启 AnyTLS${RESET}"
-    echo -e "${GREEN}8. 查看状态${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
     echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}==============================${RESET}"
@@ -407,28 +418,15 @@ while true; do
         2) update_ss; pause ;;
         3) uninstall_ss; pause ;;
         4) modify_ss; pause ;;
-        5) rc-service "$SERVICE_NAME" start; echo -e "${GREEN}[完成] AnyTLS 已启动${RESET}"; pause ;;
-        6) rc-service "$SERVICE_NAME" stop; echo -e "${GREEN}[完成] AnyTLS 已停止${RESET}"; pause ;;
-        7) rc-service "$SERVICE_NAME" restart; echo -e "${GREEN}[完成] AnyTLS 已重启${RESET}"; pause ;;
-        8) # 确保日志文件存在防止 tail 报错
-            touch "$APP_LOG"
-            echo -e "${YELLOW}[提示] 正在实时查看运行日志，按 Ctrl + C 退出...${RESET}"
-            echo -e "${BLUE}--------------------------------------------------${RESET}"
-            set +e
-            tail -n 50 -f "$APP_LOG"
-            set -e
-            echo -e "\n${BLUE}--------------------------------------------------${RESET}"
-            pause 
-            ;;
+        5) systemctl start "$SERVICE_NAME"; echo -e "${GREEN}[完成] AnyTLS 已启动${RESET}"; pause ;;
+        6) systemctl stop "$SERVICE_NAME"; echo -e "${GREEN}[完成] AnyTLS 已停止${RESET}"; pause ;;
+        7) systemctl restart "$SERVICE_NAME"; echo -e "${GREEN}[完成] AnyTLS 已重启${RESET}"; pause ;;
+        8) journalctl -u "$SERVICE_NAME" -e --no-pager; pause ;;
         9)
-            if [[ -f "$ANYTLS_CONFIG" ]]; then
-                # 去掉 local 关键字，安全读取并传递给函数
-                c_port=$(grep 'ANYTLS_PORT=' "$ANYTLS_CONFIG" | cut -d= -f2)
-                c_pass=$(grep 'ANYTLS_PASSWORD=' "$ANYTLS_CONFIG" | cut -d= -f2)
-                output_node_links "$c_port" "$c_pass"
-            else
-                echo -e "${RED}[错误] 配置文件不存在，请先安装。${RESET}"
-            fi
+            [[ -f "$ANYTLS_CONFIG" ]] && {
+                source "$ANYTLS_CONFIG"
+                output_node_links "$ANYTLS_PORT" "$ANYTLS_PASSWORD"
+            }
             pause
             ;;
         0) exit 0 ;;

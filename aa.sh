@@ -1,278 +1,879 @@
-#!/bin/sh
-# =========================================
-#  Docker 一键部署脚本 (Alpine Linux)
-# =========================================
+#!/usr/bin/env bash
+#
+# Xray-Argo 终极一体化管理面板
+# SPDX-License-Identifier: MIT
+#
 
-set -e
+# =========================================================
+# 1. 核心控制与全局环境初始化
+# =========================================================
+set -Eop pipefail
+export LANG=en_US.UTF-8
 
-# ================== 颜色 ==================
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-BOLD="\033[1m"
+# 核心常量定义
+readonly SERVER_NAME="xray"
+readonly WORK_DIR="/etc/xray"
+readonly CONFIG_DIR="${WORK_DIR}/config.json"
+readonly CLIENT_DIR="${WORK_DIR}/url.txt"
+readonly OUTBOUND_ENV_FILE="${WORK_DIR}/outbound.env"
+
+# 动态环境变量初始化
+export UUID=${UUID:-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "00000000-0000-0000-0000-000000000000")}
+export PORT=${PORT:-$(shuf -i 1000-60000 -n 1 2>/dev/null || echo "4433") }
+export ARGO_PORT=${ARGO_PORT:-'8080'}
+export CFIP=${CFIP:-'ip.sb'} 
+export CFPORT=${CFPORT:-'443'}
+export OUTBOUND_MODE=${OUTBOUND_MODE:-'direct'}
+export SOCKS5_HOST=${SOCKS5_HOST:-''}
+export SOCKS5_PORT=${SOCKS5_PORT:-'1080'}
+export SOCKS5_USER=${SOCKS5_USER:-''}
+export SOCKS5_PASS=${SOCKS5_PASS:-''}
+
+# 终端高亮颜色定义
+RE="\033[0m"
+RED="\033[1;91m"
+GREEN="\033[1;32m"
+YELLOW="\033[1;33m"
+PURPLE="\033[1;35m"
+SKYBLUE="\033[1;36m"
+CYAN="\033[1;36m"
 RESET="\033[0m"
 
-info() { echo -e "${GREEN}[INFO] $1${RESET}"; }
-warn() { echo -e "${YELLOW}[WARN] $1${RESET}"; }
-error() { echo -e "${RED}[ERROR] $1${RESET}"; }
+# 核心日志输出快捷工具
+red() { echo -e "${RED}$*${RE}" >&2; }
+green() { echo -e "${GREEN}$*${RE}" >&2; }
+yellow() { echo -e "${YELLOW}$*${RE}" >&2; }
+purple() { echo -e "${PURPLE}$*${RE}" >&2; }
+skyblue() { echo -e "${SKYBLUE}$*${RE}" >&2; }
+reading() { read -rp "$(echo -e "${GREEN}$1${RE}")" "$2"; }
+pause() { read -n 1 -s -r -p "$(echo -e "${RED}按任意键继续...${RE}")" || true; echo; }
 
-pause() {
-    read -p "$(echo -e ${GREEN}按回车键返回菜单...${RESET})" dummy
-}
+# 权限隔离自检
+[[ $EUID -ne 0 ]] && { red "请在 root 用户下运行此脚本！"; exit 1; }
 
-root_use() {
-    if [ "$(id -u)" -ne 0 ]; then
-        error "请使用 root 用户运行此脚本"
-        exit 1
+# =========================================================
+# 2. 底层运行状态自检模块
+# =========================================================
+is_alpine() { [[ -f /etc/alpine-release ]]; }
+
+check_xray() {
+  if [[ -f "${WORK_DIR}/${SERVER_NAME}" ]]; then
+    if is_alpine; then
+      rc-service xray status 2>/dev/null | grep -q "started" && return 0 || return 1
+    else 
+      [[ "$(systemctl is-active xray 2>/dev/null)" = "active" ]] && return 0 || return 1
     fi
+  else
+    return 2
+  fi
 }
 
-# ================== Docker 功能 ==================
-install_docker() {
-    info "更新 apk 源..."
-    apk update
-    apk upgrade
-
-    info "安装 Docker..."
-    apk add docker py3-pip curl
-
-    info "安装 Docker Compose V2..."
-    COMPOSE_LATEST=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
-    curl -L "https://github.com/docker/compose/releases/download/v$COMPOSE_LATEST/docker-compose-linux-x86_64" -o /usr/local/bin/docker-compose
-    chmod +x /usr/local/bin/docker-compose
-
-    info "设置 Docker 开机自启..."
-    rc-update add docker boot
-
-    info "启动 Docker 服务..."
-    service docker start
-
-    info "验证安装..."
-    docker version
-    docker-compose version
-    pause
+check_argo() {
+  if [[ -f "${WORK_DIR}/argo" ]]; then
+    if is_alpine; then
+      rc-service tunnel status 2>/dev/null | grep -q "started" && return 0 || return 1
+    else 
+      [[ "$(systemctl is-active tunnel 2>/dev/null)" = "active" ]] && return 0 || return 1
+    fi
+  else
+    return 2
+  fi
 }
 
-update_docker() {
-    info "更新 apk 源..."
-    apk update
-    apk upgrade
-
-    info "更新 Docker..."
-    apk add --upgrade docker
-
-    info "更新 Docker Compose V2..."
-    COMPOSE_LATEST=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
-    curl -L "https://github.com/docker/compose/releases/download/v$COMPOSE_LATEST/docker-compose-linux-x86_64" -o /usr/local/bin/docker-compose
-    chmod +x /usr/local/bin/docker-compose
-
-    info "重启 Docker 服务..."
-    service docker restart
-
-    info "更新完成"
-    docker version
-    docker-compose version
-    pause
+get_xray_status_msg() {
+  local status_code
+  check_xray && status_code=$? || status_code=$?
+  case "$status_code" in
+    0) echo -e "${GREEN}● 运行中${RE}" ;;
+    1) echo -e "${YELLOW}● 未运行${RE}" ;;
+    *) echo -e "${RED}● 未安装${RE}" ;;
+  esac
 }
 
-uninstall_docker() {
-    info "停止 Docker 服务..."
-    service docker stop || true
-
-    info "卸载 Docker 和 Docker Compose..."
-    apk del docker py3-pip
-    rm -f /usr/local/bin/docker-compose
-
-    info "移除开机自启..."
-    rc-update del docker
-
-    info "卸载完成"
-    pause
+get_argo_status_msg() {
+  local status_code
+  check_argo && status_code=$? || status_code=$?
+  case "$status_code" in
+    0) echo -e "${GREEN}● 运行中${RE}" ;;
+    1) echo -e "${YELLOW}● 未运行${RE}" ;;
+    *) echo -e "${RED}● 未安装${RE}" ;;
+  esac
 }
 
-restart_docker() {
-    info "重启 Docker 服务..."
-    service docker restart
-    pause
+# =========================================================
+# 3. 系统适配与高级包管理器驱动
+# =========================================================
+manage_packages() {
+  [[ $# -lt 2 ]] && { red "未指定包名或动作"; return 1; }
+  local action="$1" && shift
+
+  for package in "$@"; do
+    if [[ "$action" == "install" ]]; then
+      command -v "$package" &>/dev/null && { green "${package} 已存在，跳过安装"; continue; }
+      yellow "正在安装依赖工具: ${package}..."
+      if command -v apt &>/dev/null; then
+        DEBIAN_FRONTEND=noninteractive apt install -y "$package"
+      elif command -v dnf &>/dev/null; then
+        dnf install -y "$package"
+      elif command -v yum &>/dev/null; then
+        yum install -y "$package"
+      elif command -v apk &>/dev/null; then
+        apk update && apk add "$package"
+      else
+        red "未知的系统组件，请手动安装 ${package}" && return 1
+      fi
+    elif [[ "$action" == "uninstall" ]]; then
+      ! command -v "$package" &>/dev/null && { yellow "${package} 未安装，无需处理"; continue; }
+      yellow "正在卸载 ${package}..."
+      if command -v apt &>/dev/null; then
+        apt remove -y "$package" && apt autoremove -y
+      elif command -v dnf &>/dev/null; then
+        dnf remove -y "$package" && dnf autoremove -y
+      elif command -v yum &>/dev/null; then
+        yum remove -y "$package" && yum autoremove -y
+      elif command -v apk &>/dev/null; then
+        apk del "$package"
+      fi
+    fi
+  done
 }
 
-check_status() {
-    if service docker status >/dev/null 2>&1; then
-        info "Docker 服务正在运行"
+get_realip() {
+  local ip ipv6
+  ip=$(curl -s --max-time 2 ipv4.ip.sb || echo "")
+  if [[ -z "$ip" ]]; then
+    ipv6=$(curl -s --max-time 2 ipv6.ip.sb || echo "")
+    echo "[$ipv6]"
+  else
+    if curl -s http://ipinfo.io/org | grep -qE 'Cloudflare|UnReal|AEZA|Andrei'; then
+      ipv6=$(curl -s --max-time 2 ipv6.ip.sb || echo "")
+      echo "[$ipv6]"
     else
-        warn "Docker 服务未运行"
+      echo "$ip"
     fi
-    pause
+  fi
 }
 
-# ================== 容器管理 ==================
-container_menu() {
-    echo -e "${GREEN}===== 容器管理 =====${RESET}"
-    echo -e "${GREEN}1) 查看所有容器${RESET}"
-    echo -e "${GREEN}2) 启动容器${RESET}"
-    echo -e "${GREEN}3) 停止容器${RESET}"
-    echo -e "${GREEN}4) 删除容器${RESET}"
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
-    read -p "$(echo -e ${GREEN}请选择: ${RESET})" c_choice
-    case $c_choice in
-        1)
-            docker ps -a
-            pause
-            ;;
-        2)
-            read -p "容器名称/ID: " cid
-            [ -n "$cid" ] && docker start "$cid" && info "容器 $cid 已启动" || warn "容器名称或ID不能为空"
-            pause
-            ;;
-        3)
-            read -p "容器名称/ID: " cid
-            [ -n "$cid" ] && docker stop "$cid" && info "容器 $cid 已停止" || warn "容器名称或ID不能为空"
-            pause
-            ;;
-        4)
-            read -p "容器名称/ID: " cid
-            if [ -n "$cid" ]; then
-                [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)" = "true" ] && docker stop "$cid"
-                docker rm "$cid"
-                info "容器 $cid 已删除"
-            else
-                warn "容器名称或ID不能为空"
-            fi
-            pause
-            ;;
-        0) return ;;
-        *) warn "无效选项"; pause ;;
-    esac
-    container_menu
+HOSTNAME=$(hostname -s | sed 's/ /_/g' || echo "Xray_Node")
+
+# =========================================================
+# 4. 出口核心环境控制与配置引擎
+# =========================================================
+load_outbound_env() {
+  [[ -f "$OUTBOUND_ENV_FILE" ]] && source "$OUTBOUND_ENV_FILE"
 }
 
-# ================== 镜像管理 ==================
-image_menu() {
-    echo -e "${GREEN}===== 镜像管理 =====${RESET}"
-    echo -e "${GREEN}1) 查看镜像列表${RESET}"
-    echo -e "${GREEN}2) 拉取镜像${RESET}"
-    echo -e "${GREEN}3) 删除镜像${RESET}"
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
-    read -p "请选择: " i_choice
-    case $i_choice in
-        1) docker images; pause ;;
-        2) read -p "镜像名称: " img; docker pull "$img"; pause ;;
-        3) read -p "镜像名称/ID: " img; docker rmi "$img"; pause ;;
-        0) return ;;
-        *) warn "无效选项"; pause ;;
-    esac
-    image_menu
+save_outbound_env() {
+  mkdir -p "$WORK_DIR"
+  cat <<EOF > "$OUTBOUND_ENV_FILE"
+OUTBOUND_MODE='$OUTBOUND_MODE'
+SOCKS5_HOST='$SOCKS5_HOST'
+SOCKS5_PORT='$SOCKS5_PORT'
+SOCKS5_USER='$SOCKS5_USER'
+SOCKS5_PASS='$SOCKS5_PASS'
+EOF
 }
 
-# ================== 卷管理 ==================
-volume_menu() {
-    echo -e "${GREEN}===== 卷管理 =====${RESET}"
-    echo -e "${GREEN}1) 查看卷列表${RESET}"
-    echo -e "${GREEN}2) 删除卷${RESET}"
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
-    read -p "请选择: " v_choice
-    case $v_choice in
-        1) docker volume ls; pause ;;
-        2) read -p "卷名称: " vol; docker volume rm "$vol"; pause ;;
-        0) return ;;
-        *) warn "无效选项"; pause ;;
-    esac
-    volume_menu
+load_outbound_env
+
+build_outbounds_json() {
+  if [[ "$OUTBOUND_MODE" = "socks5" ]]; then
+    [[ -z "$SOCKS5_HOST" ]] && { red "OUTBOUND_MODE=socks5 时必须设置 SOCKS5_HOST"; exit 1; }
+    if [[ -n "$SOCKS5_USER" ]] || [[ -n "$SOCKS5_PASS" ]]; then
+      cat <<EOF
+[
+  {
+    "protocol": "socks",
+    "tag": "proxy",
+    "settings": {
+      "servers": [
+        {
+          "address": "$SOCKS5_HOST",
+          "port": $SOCKS5_PORT,
+          "users": [
+            {
+              "user": "$SOCKS5_USER",
+              "pass": "$SOCKS5_PASS"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "protocol": "freedom",
+    "tag": "direct"
+  }
+]
+EOF
+    else
+      cat <<EOF
+[
+  {
+    "protocol": "socks",
+    "tag": "proxy",
+    "settings": {
+      "servers": [
+        {
+          "address": "$SOCKS5_HOST",
+          "port": $SOCKS5_PORT
+        }
+      ]
+    }
+  },
+  {
+    "protocol": "freedom",
+    "tag": "direct"
+  }
+]
+EOF
+    fi
+  else
+    cat <<EOF
+[
+  {
+    "protocol": "freedom",
+    "tag": "direct"
+  }
+]
+EOF
+  fi
 }
 
-# ================== IPv6 开关 ==================
-ipv6_menu() {
-    while true; do
-        IPV6_STATUS=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)
-        CURRENT_STATUS=$([ "$IPV6_STATUS" -eq 0 ] && echo "启用" || echo "禁用")
-        echo -e "${GREEN}===== IPv6 设置 =====${RESET}"
-        echo -e "${YELLOW}当前 IPv6 状态: $CURRENT_STATUS${RESET}"
-        echo -e "${GREEN}1) 启用 IPv6${RESET}"
-        echo -e "${GREEN}2) 禁用 IPv6${RESET}"
-        echo -e "${GREEN}0) 返回主菜单${RESET}"
-        read -p "请选择: " ip_choice
-        case $ip_choice in
-            1) echo 0 > /proc/sys/net/ipv6/conf/all/disable_ipv6
-               grep -q "^net.ipv6.conf.all.disable_ipv6" /etc/sysctl.conf || echo "net.ipv6.conf.all.disable_ipv6 = 0" >> /etc/sysctl.conf
-               sysctl -p >/dev/null 2>&1 || true
-               info "IPv6 已启用"; pause ;;
-            2) echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6
-               grep -q "^net.ipv6.conf.all.disable_ipv6" /etc/sysctl.conf || echo "net.ipv6.conf.all.disable_ipv6 = 1" >> /etc/sysctl.conf
-               sysctl -p >/dev/null 2>&1 || true
-               info "IPv6 已禁用"; pause ;;
-            0) break ;;
-            *) warn "无效选项" ;;
-        esac
+build_routing_json() {
+  if [[ "$OUTBOUND_MODE" = "socks5" ]]; then
+    cat <<EOF
+,
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "network": "tcp,udp",
+        "outboundTag": "proxy"
+      }
+    ]
+  }
+EOF
+  fi
+}
+
+rebuild_xray_config() {
+  [[ ! -d "$WORK_DIR" ]] && { red "Xray 尚未安装"; return 1; }
+  local outbounds_json=$(build_outbounds_json)
+  local routing_json=$(build_routing_json)
+
+  cat <<EOF > "${CONFIG_DIR}"
+{
+  "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
+  "inbounds": [
+    {
+      "port": $ARGO_PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": [{ "id": "$UUID" }],
+        "decryption": "none",
+        "fallbacks": [
+          { "dest": 3001 }, 
+          { "path": "/vless-argo", "dest": 3002 },
+          { "path": "/vmess-argo", "dest": 3003 }
+        ]
+      },
+      "streamSettings": { "network": "tcp" },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
+    },
+    {
+      "port": 3001, "listen": "127.0.0.1", "protocol": "vless",
+      "settings": { "clients": [{ "id": "$UUID" }], "decryption": "none" }
+    },
+    {
+      "port": 3002, "listen": "127.0.0.1", "protocol": "vless",
+      "settings": { "clients": [{ "id": "$UUID" }], "decryption": "none" },
+      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vless-argo" } }
+    },
+    {
+      "port": 3003, "listen": "127.0.0.1", "protocol": "vmess",
+      "settings": { "clients": [{ "id": "$UUID" }] },
+      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess-argo" } }
+    }
+  ],
+  "outbounds": $outbounds_json$routing_json
+}
+EOF
+}
+
+configure_socks5_outbound() {
+  [[ ! -f "$CONFIG_DIR" ]] && { yellow "请先安装 Xray"; return 1; }
+
+  clear
+  green "================================="
+  green "         出口模式设置            "
+  green "================================="
+  green " 1. 直连节点出口"
+  green " 2. 自定义SOCKS5"
+  purple " 0. 返回主菜单"
+  green "================================="
+  local outbound_choice
+  reading "请输入选择 [0-2]: " outbound_choice
+
+  case "$outbound_choice" in
+    1)
+      OUTBOUND_MODE="direct"
+      SOCKS5_HOST=""
+      SOCKS5_PORT="1080"
+      SOCKS5_USER=""
+      SOCKS5_PASS=""
+      save_outbound_env
+      rebuild_xray_config || return 1
+      restart_xray
+      green "已成功切换为：直连本地出口机制"
+      ;;
+    2)
+      reading "请输入 SOCKS5 远程地址: " custom_socks5_host
+      [[ -z "$custom_socks5_host" ]] && { red "错误：SOCKS5 地址不能为空"; return 1; }
+
+      reading "请输入 SOCKS5 端口(默认 1080): " custom_socks5_port
+      custom_socks5_port=${custom_socks5_port:-1080}
+      if ! [[ "$custom_socks5_port" =~ ^[0-9]+$ ]] || [ "$custom_socks5_port" -lt 1 ] || [ "$custom_socks5_port" -gt 65535 ]; then
+        red "错误：非法的端口范围" && return 1
+      fi
+
+      reading "请输入 SOCKS5 用户名(留空跳过): " custom_socks5_user
+      reading "请输入 SOCKS5 验证密码(留空跳过): " custom_socks5_pass
+
+      OUTBOUND_MODE="socks5"
+      SOCKS5_HOST="$custom_socks5_host"
+      SOCKS5_PORT="$custom_socks5_port"
+      SOCKS5_USER="$custom_socks5_user"
+      SOCKS5_PASS="$custom_socks5_pass"
+
+      save_outbound_env
+      rebuild_xray_config || return 1
+      restart_xray
+      green "成功挂载 SOCKS5 出口隧道: ${SOCKS5_HOST}:${SOCKS5_PORT}"
+      ;;
+    0) return 0 ;;
+    *) red "无效的选项！" ;;
+  esac
+}
+
+# =========================================================
+# 5. 组件安装与系统服务治理引擎
+# =========================================================
+install_xray() {
+  clear
+  purple "正在部署高端智能化 Xray-Argo 双栈系统，请稍候..."
+  
+  local ARCH_RAW=$(uname -m)
+  local ARCH ARCH_ARG
+  case "${ARCH_RAW}" in
+    'x86_64') ARCH='amd64'; ARCH_ARG='64' ;;
+    'x86' | 'i686' | 'i386') ARCH='386'; ARCH_ARG='32' ;;
+    'aarch64' | 'arm64') ARCH='arm64'; ARCH_ARG='arm64-v8a' ;;
+    'armv7l') ARCH='armv7'; ARCH_ARG='arm32-v7a' ;;
+    's390x') ARCH='s390x' ;;
+    *) red "本系统不支持当前服务器架构: ${ARCH_RAW}"; exit 1 ;;
+  esac
+
+  mkdir -p "${WORK_DIR}" && chmod 755 "${WORK_DIR}"
+  curl -sLo "${WORK_DIR}/${SERVER_NAME}.zip" "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${ARCH_ARG}.zip"
+  curl -sLo "${WORK_DIR}/argo" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}"
+  
+  unzip -q -o "${WORK_DIR}/${SERVER_NAME}.zip" -d "${WORK_DIR}/" || true
+  chmod +x "${WORK_DIR}/${SERVER_NAME}" "${WORK_DIR}/argo"
+  rm -rf "${WORK_DIR}/${SERVER_NAME}.zip" "${WORK_DIR}/geosite.dat" "${WORK_DIR}/geoip.dat" "${WORK_DIR}/README.md" "${WORK_DIR}/LICENSE" 
+
+  iptables -F >/dev/null 2>&1 || true
+  iptables -P INPUT ACCEPT >/dev/null 2>&1 || true
+  iptables -P FORWARD ACCEPT >/dev/null 2>&1 || true
+  iptables -P OUTPUT ACCEPT >/dev/null 2>&1 || true
+  command -v ip6tables &>/dev/null && { ip6tables -F >/dev/null 2>&1 || true; ip6tables -P INPUT ACCEPT >/dev/null 2>&1 || true; }
+
+  rebuild_xray_config
+}
+
+main_systemd_services() {
+  cat <<EOF > /etc/systemd/system/xray.service
+[Unit]
+Description=Xray Engine Daemon Service
+After=network.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+NoNewPrivileges=yes
+ExecStart=$WORK_DIR/xray run -c $CONFIG_DIR
+Restart=on-failure
+RestartPreventExitStatus=23
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat <<EOF > /etc/systemd/system/tunnel.service
+[Unit]
+Description=Cloudflare Argo Tunnel Dynamic Backdoor
+After=network.target
+
+[Service]
+Type=simple
+NoNewPrivileges=yes
+TimeoutStartSec=0
+ExecStart=$WORK_DIR/argo tunnel --url http://localhost:$ARGO_PORT --no-autoupdate --edge-ip-version auto --protocol http2
+StandardOutput=append:$WORK_DIR/argo.log
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  if [[ -f /etc/centos-release ]]; then
+    yum install -y chrony >/dev/null 2>&1 || true
+    systemctl start chronyd >/dev/null 2>&1 || true
+    systemctl enable chronyd >/dev/null 2>&1 || true
+    chronyc -a makestep >/dev/null 2>&1 || true
+    yum update -y ca-certificates >/dev/null 2>&1 || true
+  fi
+
+  echo "0 0" > /proc/sys/net/ipv4/ping_group_range || true
+  systemctl daemon-reload
+  systemctl enable xray >/dev/null 2>&1 || true
+  systemctl restart xray >/dev/null 2>&1 || true
+  systemctl enable tunnel >/dev/null 2>&1 || true
+  systemctl restart tunnel >/dev/null 2>&1 || true
+}
+
+alpine_openrc_services() {
+  cat <<'EOF' > /etc/init.d/xray
+#!/sbin/openrc-run
+description="Xray OpenRC Service"
+command="/etc/xray/xray"
+command_args="run -c /etc/xray/config.json"
+command_background=true
+pidfile="/var/run/xray.pid"
+EOF
+
+  cat <<'EOF' > /etc/init.d/tunnel
+#!/sbin/openrc-run
+description="Cloudflare Tunnel OpenRC Service"
+command="/bin/sh"
+command_args="-c '/etc/xray/argo tunnel --url http://localhost:8080 --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/xray/argo.log 2>&1'"
+command_background=true
+pidfile="/var/run/tunnel.pid"
+EOF
+
+  chmod +x /etc/init.d/xray /etc/init.d/tunnel
+  rc-update add xray default >/dev/null 2>&1 || true
+  rc-update add tunnel default >/dev/null 2>&1 || true
+}
+
+# =========================================================
+# 6. 节点订阅与流媒体更新分发中心
+# =========================================================
+get_info() {  
+  clear
+  local ip=$(get_realip)
+  local argodomain=""
+  
+  if [[ -f "${WORK_DIR}/argo.log" ]]; then
+    for i in {1..5}; do
+      purple "正在捕捉安全穿透网关防护隧道 [第 $i 次尝试]..."
+      argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${WORK_DIR}/argo.log")
+      [[ -n "$argodomain" ]] && break
+      sleep 2
     done
+  else
+    restart_argo
+    sleep 5
+    argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${WORK_DIR}/argo.log")
+  fi
+
+  [[ -z "$argodomain" ]] && { red "警告：未能在日志内抓取到分配的公网临时隧道链接！"; return; }
+
+  green "\n最新穿透域名 (ArgoDomain)：${PURPLE}$argodomain${RE}\n"
+  if [[ "$OUTBOUND_MODE" = "socks5" ]]; then
+    green "全局出口链条：${PURPLE}SOCKS5 Proxy (${SOCKS5_HOST}:${SOCKS5_PORT})${RE}"
+  else
+    green "全局出口链条：${PURPLE}直连 (Direct Network)${RE}\n"
+  fi
+
+  cat <<EOF > "${WORK_DIR}/url.txt"
+vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#$HOSTNAME
+
+vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${HOSTNAME}\", \"add\": \"${CFIP}\", \"port\": \"${CFPORT}\", \"id\": \"${UUID}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"chrome\"}" | base64 -w0)
+EOF
+
+  echo ""
+  while IFS= read -r line; do echo -e "${PURPLE}$line"; done < "${WORK_DIR}/url.txt"
+  base64 -w0 "${WORK_DIR}/url.txt" > "${WORK_DIR}/sub.txt" 2>/dev/null || true
+  echo ""
 }
 
-# ================== 开放所有端口 ==================
-open_all_ports() {
-    info "开放所有 TCP/UDP 端口..."
-    iptables -F
-    iptables -P INPUT ACCEPT
-    iptables -P FORWARD ACCEPT
-    iptables -P OUTPUT ACCEPT
-    info "已开放所有端口"
-    pause
+change_argo_domain() {
+  local ArgoDomain="$1"
+  [[ -z "$ArgoDomain" ]] && return 1
+
+  sed -i "s/sni=[^&]*/sni=$ArgoDomain/g; s/host=[^&]*/host=$ArgoDomain/g" "${WORK_DIR}/url.txt"
+  local content=$(cat "$CLIENT_DIR")
+  local vmess_urls=$(grep -o 'vmess://[^ ]*' "$CLIENT_DIR" || echo "")
+
+  for vmess_url in $vmess_urls; do
+    local encoded_vmess="${vmess_url#vmess://}"
+    local decoded_vmess=$(echo "$encoded_vmess" | base64 -d 2>/dev/null)
+    if [[ -n "$decoded_vmess" ]]; then
+      local updated_vmess=$(echo "$decoded_vmess" | jq --arg new_domain "$ArgoDomain" '.host = $new_domain | .sni = $new_domain')
+      local encoded_updated_vmess=$(echo "$updated_vmess" | base64 | tr -d '\n')
+      content=$(echo "$content" | sed "s|$vmess_url|vmess://$encoded_updated_vmess|")
+    fi
+  done
+
+  echo "$content" > "$CLIENT_DIR"
+  base64 -w0 "${WORK_DIR}/url.txt" > "${WORK_DIR}/sub.txt" 2>/dev/null || true
+  
+  clear
+  green "节点穿透地址同步更新成功："
+  while IFS= read -r line; do echo -e "${PURPLE}$line"; done < "$CLIENT_DIR"
 }
 
-# ================== Docker 清理 ==================
-cleanup_docker() {
-    docker system prune -af --volumes
-    info "已清理所有未使用容器/镜像/卷"
-    pause
+get_quick_tunnel() {
+  restart_argo
+  yellow "正在重置异步安全隧道，请等待 3 秒内环境重刷...\n"
+  sleep 3
+  local get_argodomain=""
+  for i in {1..5}; do
+    get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${WORK_DIR}/argo.log")
+    [[ -n "$get_argodomain" ]] && break
+    sleep 2
+  done
+  if [[ -n "$get_argodomain" ]]; then
+    green "重新生成的动态临时域名：$get_argodomain"
+    change_argo_domain "$get_argodomain"
+  else
+    red "未获取到有效的穿透连接。"
+  fi
 }
 
+# =========================================================
+# 7. 服务运行控制机制 (Xray & Argo)
+# =========================================================
+start_xray() {
+  yellow "正在启动 Xray 核心服务..."
+  if is_alpine; then rc-service xray start; else systemctl start xray; fi
+  green "服务启动命令完成"
+}
 
-# ================== 主菜单 ==================
-main_menu() {
-    root_use
-    while true; do
-        clear
-        if command -v docker >/dev/null 2>&1; then
-            docker_status=$(docker info >/dev/null 2>&1 && echo "运行中" || echo "未运行")
-            total_containers=$(docker ps -a -q 2>/dev/null | wc -l)
-            running_containers=$(docker ps -q 2>/dev/null | wc -l)
+stop_xray() {
+  yellow "正在停止 Xray 核心服务..."
+  if is_alpine; then rc-service xray stop; else systemctl stop xray; fi
+  green "服务关闭命令完成"
+}
+
+restart_xray() {
+  yellow "正在重启 Xray 核心服务..."
+  if is_alpine; then rc-service xray restart; else systemctl daemon-reload && systemctl restart xray; fi
+  green "服务重启命令完成"
+}
+
+start_argo() {
+  yellow "正在启动 Argo 隧道守护进程..."
+  if is_alpine; then rc-service tunnel start; else systemctl start tunnel; fi
+}
+
+stop_argo() {
+  yellow "正在关闭 Argo 隧道守护进程..."
+  if is_alpine; then rc-service tunnel stop; else systemctl stop tunnel; fi
+}
+
+restart_argo() {
+  yellow "正在重启 Argo 隧道组件..."
+  rm -f "${WORK_DIR}/argo.log"
+  if is_alpine; then rc-service tunnel restart; else systemctl daemon-reload && systemctl restart tunnel; fi
+}
+
+uninstall_xray() {
+  yellow "开始彻底卸载 Xray-Argo ..."
+
+  if is_alpine; then
+    rc-service xray stop >/dev/null 2>&1 || true
+    rc-service tunnel stop >/dev/null 2>&1 || true
+    rc-update del xray default >/dev/null 2>&1 || true
+    rc-update del tunnel default >/dev/null 2>&1 || true
+    rm -f /etc/init.d/xray /etc/init.d/tunnel
+  else
+    systemctl stop xray tunnel >/dev/null 2>&1 || true
+    systemctl disable xray tunnel >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/xray.service /etc/systemd/system/tunnel.service
+    systemctl daemon-reload
+  fi
+
+  rm -rf "${WORK_DIR}" /usr/bin/2go
+
+  green "Xray-Argo 已彻底卸载完成"
+}
+
+create_shortcut() {
+  cat <<EOF > "$WORK_DIR/2go.sh"
+#!/usr/bin/env bash
+bash <(curl -sL https://raw.githubusercontent.com/iu683/uu/main/aa.sh) \$1
+EOF
+  chmod +x "$WORK_DIR/2go.sh"
+  ln -sf "$WORK_DIR/2go.sh" /usr/bin/2go
+  [[ -s /usr/bin/2go ]] && green "快捷特权全局系统指令 '2go' 创建成功！" || red "软连接构建失效。"
+}
+
+change_hosts() {
+  echo "0 0" > /proc/sys/net/ipv4/ping_group_range || true
+  sed -i '1s/.*/127.0.0.1   localhost/' /etc/hosts || true
+  sed -i '2s/.*/::1         localhost/' /etc/hosts || true
+}
+
+check_nodes() {
+  local xray_exist
+  check_xray && xray_exist=$? || xray_exist=$?
+  if [[ "$xray_exist" -ne 2 && -f "${WORK_DIR}/url.txt" ]]; then
+    while IFS= read -r line; do purple "$line"; done < "${WORK_DIR}/url.txt"
+    if [[ "$OUTBOUND_MODE" = "socks5" ]]; then
+      green "\n当前流出媒介：远端 SOCKS5 链条 -> (${SOCKS5_HOST}:${SOCKS5_PORT})\n"
+    else
+      green "\n当前流出媒介：原宿主主机直连公网\n"
+    fi
+  else
+    yellow "检测到核心数据盘缺失，请先安装节点组件"
+  fi
+}
+
+# =========================================================
+# 8. 全新追加：运行日志与诊断调度引擎
+# =========================================================
+view_logs() {
+  clear
+  green "================================="
+  green "       Xray-Argo 日志诊断管理    "
+  green "================================="
+  green " 1. 实时跟踪查看 Xray 运行内核流 (按 Ctrl+C 退出)"
+  green " 2. 实时跟踪查看 Argo 穿透网关流 (按 Ctrl+C 退出)"
+  green " 3. 清理系统内所有网关日志存储缓存"
+  purple " 0. 返回上层菜单"
+  green "================================="
+  local log_choice
+  reading "请输入选项: " log_choice
+
+  case "$log_choice" in
+    1)
+      green "正在呼叫 Xray 内核诊断实时流 (退出请按 Ctrl + C)..."
+      sleep 1
+      if is_alpine; then
+        tail -f /var/log/messages 2>/dev/null || grep "xray" /var/log/messages || true
+      else
+        journalctl -u xray.service -f || true
+      fi
+      ;;
+    2)
+      green "正在透视 Cloudflare Tunnel 穿透日志流 (退出请按 Ctrl + C)..."
+      sleep 1
+      if [[ -f "${WORK_DIR}/argo.log" ]]; then
+        tail -f "${WORK_DIR}/argo.log" || true
+      else
+        red "未发现本地 Argo 运行日志记录。"
+      fi
+      ;;
+    3)
+      if [[ -f "${WORK_DIR}/argo.log" ]]; then
+        echo "" > "${WORK_DIR}/argo.log"
+        green "本地持久化临时日志已清空！"
+      fi
+      if ! is_alpine && command -v journalctl &>/dev/null; then
+        journalctl --vacuum-time=1s >/dev/null 2>&1 || true
+        systemctl restart systemd-journald >/dev/null 2>&1 || true
+        green "Systemd 核心日志垃圾清理完毕。"
+      fi
+      ;;
+    0) return 0 ;;
+    *) red "输入不匹配。" ;;
+  esac
+}
+
+# =========================================================
+# 9. 分层抽样功能多重控制面板子菜单
+# =========================================================
+manage_xray_menu() {
+  clear
+  green "================================="
+  green "         Xray 核心管理面板     "
+  green "================================="
+  green " 1. 开启 Xray 主服务"
+  green " 2. 停止 Xray 主服务"
+  green " 3. 重启 Xray 主服务"
+  purple " 0. 返回主菜单"
+  green "================================="
+  local cx
+  reading "请输入选项: " cx
+  case "${cx}" in
+    1) start_xray ;;  
+    2) stop_xray ;;
+    3) restart_xray ;;
+    *) return 0 ;;
+  esac
+}
+
+manage_argo_menu() {
+  local argo_exist
+  check_argo && argo_exist=$? || argo_exist=$?
+  if [[ "$argo_exist" -eq 2 ]]; then
+    yellow "系统检测到 Argo 未安装，拒绝调度子面板！"
+    sleep 15; return
+  fi
+
+  clear
+  green "================================="
+  green "       Argo 隧道管理面板     "
+  green "================================="
+  green " 1. 启动Argo隧道"
+  green " 2. 停止Argo隧道"
+  green " 3. 添加Argo固定隧道"
+  green " 4. 切换回Argo临时隧道"
+  green " 5. 重新获取Argo临时域名"
+  purple " 0. 返回主菜单"
+  green "================================="
+  local ca
+  reading "请输入选项: " ca
+  case "${ca}" in
+    1) start_argo ;;
+    2) stop_argo ;; 
+    3)
+      clear
+      yellow "\n固定隧道可为 Json 文件体或 Token 字符集，端口映射底层固定为 8080端口。\n官方Json隧道获取路径：https://fscarmen.cloudflare.now.cc\n"
+      local argo_domain argo_auth
+      reading "请输入你的绑定的独立公网域名: " argo_domain
+      [[ -z "$argo_domain" ]] && { red "域名无效"; return; }
+      reading "请输入您的专属密钥串 (Token/Json 文本均匹配): " argo_auth
+      
+      if [[ $argo_auth =~ TunnelSecret ]]; then
+        echo "$argo_auth" > "${WORK_DIR}/tunnel.json"
+        cat << EOF > "${WORK_DIR}/tunnel.yml"
+tunnel: $(cut -d\" -f12 <<< "$argo_auth")
+credentials-file: ${WORK_DIR}/tunnel.json
+protocol: http2
+ingress:
+  - hostname: $argo_domain
+    service: http://localhost:8080
+    originRequest:
+      noTLSVerify: true
+  - service: http_status:404
+EOF
+        if is_alpine; then
+          sed -i '/^command_args=/c\command_args="-c '\''/etc/xray/argo tunnel --edge-ip-version auto --config /etc/xray/tunnel.yml run 2>&1'\''"' /etc/init.d/tunnel
         else
-            docker_status="未安装"
-            total_containers=0
-            running_containers=0
+          sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/xray/argo tunnel --edge-ip-version auto --config /etc/xray/tunnel.yml run 2>&1"' /etc/systemd/system/tunnel.service
         fi
+        restart_argo
+        change_argo_domain "$argo_domain"
+      elif [[ $argo_auth =~ ^[A-Z0-9a-z=]{120,250}$ ]]; then
+        if is_alpine; then
+          sed -i "/^command_args=/c\command_args=\"-c '/etc/xray/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token $argo_auth 2>&1'\"" /etc/init.d/tunnel
+        else
+          sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/xray/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token '$argo_auth' 2>&1"' /etc/systemd/system/tunnel.service
+        fi
+        restart_argo
+        change_argo_domain "$argo_domain"
+      else
+        yellow "输入的数据链无法被正常拆解匹配，终止操作！"
+      fi
+      ;; 
+    4)
+      if is_alpine; then alpine_openrc_services; else main_systemd_services; fi
+      get_quick_tunnel
+      ;; 
+    5)  
+      local is_dynamic=0
+      if is_alpine; then
+        grep -Fq -- '--url http://localhost:8080' /etc/init.d/tunnel && is_dynamic=1
+      else
+        grep -q 'ExecStart=.*--url http://localhost:8080' /etc/systemd/system/tunnel.service && is_dynamic=1
+      fi
 
-        IPV6_STATUS=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)
-        ipv6_display=$([ "$IPV6_STATUS" -eq 0 ] && echo "启用" || echo "禁用")
-
-        echo -e "${GREEN}============ Docker 管理 ============${RESET}"
-        echo -e "${YELLOW}Docker: $docker_status | 容器: $running_containers/$total_containers"
-        echo -e "${GREEN} 1) 安装/更新Docker${RESET}"
-        echo -e "${GREEN} 2) 安装/更新DockerCompose${RESET}"
-        echo -e "${GREEN} 3) 卸载Docker&Compose${RESET}"
-        echo -e "${GREEN} 4) 容器管理${RESET}"
-        echo -e "${GREEN} 5) 镜像管理${RESET}"
-        echo -e "${GREEN} 6) 卷管理${RESET}"
-        echo -e "${GREEN} 7) IPv6开关${RESET}"
-        echo -e "${GREEN} 8) 开放所有端口${RESET}"
-        echo -e "${GREEN} 9) 一键清理所有未使用容器/镜像/卷${RESET}"
-        echo -e "${GREEN}10) 重启Docker${RESET}"
-        echo -e "${GREEN} 0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET})" choice
-        case $choice in
-            1) install_docker ;;
-            2) update_docker ;;
-            3) uninstall_docker ;;
-            4) container_menu ;;
-            5) image_menu ;;
-            6) volume_menu ;;
-            7) ipv6_menu ;;
-            8) open_all_ports ;;
-            9) cleanup_docker ;;
-            10) restart_docker ;;
-            0) exit 0 ;;
-            *) warn "无效选择"; pause ;;
-        esac
-    done
+      if [[ "$is_dynamic" -eq 1 ]]; then
+        get_quick_tunnel
+      else
+        yellow "当前您正在运行固定域名的高级网关，禁止申请下发临时域名！"
+      fi 
+      ;; 
+    *) return 0 ;;
+  esac
 }
 
-main_menu
+# =========================================================
+# 10. 系统控制核心总线大厅
+# =========================================================
+
+menu() {
+  while true; do
+    local xray_status_view argo_status_view out_view
+    xray_status_view=$(get_xray_status_msg)
+    argo_status_view=$(get_argo_status_msg)
+    
+    if [[ "$OUTBOUND_MODE" = "socks5" ]]; then
+      out_view="${YELLOW}SOCKS5 Proxy Chain (${SOCKS5_HOST}:${SOCKS5_PORT})${RE}"
+    else
+      out_view="${GREEN}Native Direct (直连出口)${RE}"
+    fi
+
+    clear
+    echo -e "${GREEN}=================================${RE}"
+    echo -e "${GREEN}      Xray-Argo 管理面板          ${RE}"
+    echo -e "${GREEN}=================================${RE}"
+    echo -e " Xray 核心引擎 : $xray_status_view"
+    echo -e " Argo 穿透链路 : $argo_status_view"
+    echo -e " 智能分流出口  : $out_view"
+    echo -e "${GREEN}=================================${RE}"
+    echo -e " ${GREEN}1. 安装部署${RE}"
+    echo -e " ${GREEN}2. 卸载服务${RE}"
+    echo -e " ${GREEN}3. Xray状态管理${RE}"
+    echo -e " ${GREEN}4. Argo隧道管理${RE}"
+    echo -e " ${GREEN}5. 配置节点出口模式 (直连/Socks5)${RE}"
+    echo -e " ${GREEN}6. 查看日志${RE}"
+    echo -e " ${GREEN}7. 查看节点配置${RE}"
+    echo -e " ${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}=================================${RE}"
+    
+    local choice=""
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+    [[ -z "$choice" ]] && continue
+
+    case "${choice}" in
+      1)  
+        local checked
+        check_xray && checked=$? || checked=$?
+        if [[ "$checked" -eq 0 ]]; then
+          yellow "检测到您的系统上已经部署，请勿重复操作！"
+        else
+          manage_packages install jq unzip iptables openssl coreutils lsof
+          install_xray
+          if ! is_alpine; then 
+            main_systemd_services
+          else 
+            alpine_openrc_services
+            change_hosts
+            # ===== 针对 Alpine 显式启动并重启服务 =====
+            rc-service xray restart >/dev/null 2>&1 || rc-service xray start >/dev/null 2>&1
+            rc-service tunnel restart >/dev/null 2>&1 || rc-service tunnel start >/dev/null 2>&1
+          fi
+          sleep 2
+          save_outbound_env; get_info; create_shortcut
+        fi
+        ;;
+      2) uninstall_xray ;;
+      3) manage_xray_menu ;;
+      4) manage_argo_menu ;;
+      5) configure_socks5_outbound ;;
+      6) view_logs ;;
+      7) check_nodes ;;
+      0) exit 0 ;;
+      *) red "输入错误，请重试！" ;;
+    esac
+    pause
+  done
+}
+
+menu "$@"

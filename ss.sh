@@ -1,247 +1,268 @@
 #!/bin/bash
 
 # =========================================================
-# Xray VLESS-Reality 管理脚本 (Alpine Linux 优化版)
+# Xray VLESS-Reality 管理脚本 (Alpine Linux 终极修复版)
 # =========================================================
 
 set -Eeuo pipefail
 
-# ================== 颜色 ==================
+# ================== 颜色定义 ==================
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 BLUE="\033[34m"
-CYAN="\033[36m"
 RESET="\033[0m"
 
-# ================== 基础变量 ==================
-readonly XRAY_CONFIG="/etc/xray/config.json"
-readonly XRAY_BIN="/usr/local/bin/xray"
-readonly PUBLIC_KEY_FILE="/etc/xray/public.key"
-readonly SERVICE_NAME="xray"
+# ================== 基础路径 ==================
+readonly X_DIR="/etc/xray"
+readonly X_CONFIG="${X_DIR}/config.json"
+readonly X_BIN="/usr/local/bin/xray"
+readonly X_PBK="${X_DIR}/public.key"
+readonly X_LINK="/root/xray_vless_reality.txt"
+readonly X_LOG="/var/log/xray.log"
 
-TMP_DIR=$(mktemp -d -t xray_alpine.XXXXXX)
+# ================== 核心工具 ==================
+info() { echo -e "${GREEN}[信息] $*${RESET}"; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}"; }
+error() { echo -e "${RED}[错误] $*${RESET}"; }
+pause() { echo; read -p "按任意键返回菜单..." -n 1 -s; echo; }
 
-# ================== 基础工具 ==================
-cleanup() { [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"; }
-trap cleanup EXIT INT TERM
-
-info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
-error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
-pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
-
-# 获取公网IP
-get_public_ip() {
-    local ip
-    ip=$(curl -4fsSL --max-time 5 https://api.ipify.org || curl -4fsSL --max-time 5 https://ifconfig.me || echo "未知")
-    echo "$ip"
-}
-
-# 检查端口占用
-check_port() {
-    local port="$1"
-    netstat -tuln | grep -q ":${port} " && return 1 || return 0
-}
-
-# ================== 系统状态 ==================
+# 状态获取
 get_xray_status() {
-    if rc-service "$SERVICE_NAME" status 2>/dev/null | grep -q "started"; then
+    if rc-service xray status 2>/dev/null | grep -q "started"; then
         echo -e "${GREEN}● 运行中${RESET}"
-    else
-        echo -e "${RED}● 未运行${RESET}"
-    fi
+    else echo -e "${RED}● 未运行${RESET}"; fi
 }
 
+# 版本获取
 get_xray_version() {
-    [[ -x "$XRAY_BIN" ]] && "$XRAY_BIN" version | head -n 1 | awk '{print $2}' || echo "未安装"
+    [[ -x "$X_BIN" ]] && "$X_BIN" version 2>/dev/null | head -n 1 | awk '{print $2}' || echo "未安装"
 }
 
-# ================== 核心功能 ==================
+# 公网IP获取
+get_public_ip() {
+    curl -4fsSL --max-time 5 https://api.ipify.org || echo "未知IP"
+}
+
+# ================== 核心配置逻辑 ==================
 write_config() {
-    local port="$1" uuid="$2" domain="$3" pri_key="$4" sid="$5"
-    local outbound_proto="${6:-freedom}"
+    local port=$1 uuid=$2 domain=$3 pri=$4 sid=$5
+    local outbound=${6:-'{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}'}
     
-    mkdir -p /etc/xray
+    mkdir -p "$X_DIR" && chmod 755 "$X_DIR"
     
-    # 基础配置模板
-    cat > "$XRAY_CONFIG" <<EOF
+    cat > "$X_CONFIG" <<EOF
 {
     "log": { "loglevel": "warning" },
     "inbounds": [{
-        "port": ${port},
+        "port": $port,
         "protocol": "vless",
         "settings": {
-            "clients": [{ "id": "${uuid}", "flow": "xtls-rprx-vision" }],
+            "clients": [{"id": "$uuid", "flow": "xtls-rprx-vision"}],
             "decryption": "none"
         },
         "streamSettings": {
             "network": "tcp",
             "security": "reality",
             "realitySettings": {
-                "dest": "${domain}:443",
-                "serverNames": ["${domain}"],
-                "privateKey": "${pri_key}",
-                "shortIds": ["${sid}"],
+                "dest": "$domain:443",
+                "serverNames": ["$domain"],
+                "privateKey": "$pri",
+                "shortIds": ["$sid"],
                 "fingerprint": "chrome"
             }
         },
         "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
     }],
-    "outbounds": [
-        $( [[ "$outbound_proto" == "freedom" ]] && echo '{"protocol": "freedom", "tag": "direct"}' || echo "$outbound_proto" )
-    ]
+    "outbounds": [$outbound]
 }
 EOF
 }
 
-setup_service() {
-    cat << 'EOF' > /etc/init.d/xray
+# ================== 功能实现 ==================
+
+# 1. 安装功能
+install_xray() {
+    info "正在安装依赖 (Alpine 专用)..."
+    apk update && apk add curl unzip openssl jq uuidgen gcompat libc6-compat bc > /dev/null 2>&1
+    
+    # 强制创建并同步目录
+    mkdir -p "$X_DIR" && chmod 755 "$X_DIR" && sync
+    
+    local arch=$(uname -m | sed 's/x86_64/64/;s/aarch64/arm64-v8a/')
+    local ver=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+    
+    info "下载 Xray $ver ($arch)..."
+    curl -L -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/$ver/Xray-linux-$arch.zip"
+    unzip -o /tmp/xray.zip -d /tmp/xray_tmp > /dev/null
+    mv -f /tmp/xray_tmp/xray "$X_BIN" && chmod +x "$X_BIN"
+    rm -rf /tmp/xray*
+    
+    read -p "请输入端口 (回车随机): " port; [[ -z "$port" ]] && port=$((RANDOM % 45535 + 10000))
+    read -p "请输入域名 (回车使用 www.amazon.com): " domain; [[ -z "$domain" ]] && domain="www.amazon.com"
+    
+    info "生成密钥对..."
+    local uuid=$(uuidgen)
+    local keys=$($X_BIN x25519)
+    local pri=$(echo "$keys" | grep "Private" | awk '{print $NF}')
+    local pub=$(echo "$keys" | grep "Public" | awk '{print $NF}')
+    local sid=$(openssl rand -hex 4)
+    
+    # 写入公钥
+    echo "$pub" > "$X_PBK"
+    write_config "$port" "$uuid" "$domain" "$pri" "$sid"
+    
+    # 注册 OpenRC 服务并配置日志
+    cat << EOF > /etc/init.d/xray
 #!/sbin/openrc-run
 description="Xray Reality Service"
 command="/usr/local/bin/xray"
 command_args="run -c /etc/xray/config.json"
 command_background="yes"
-pidfile="/run/${RC_SVCNAME}.pid"
+pidfile="/run/xray.pid"
+output_log="$X_LOG"
+error_log="$X_LOG"
 depend() { need net; }
 EOF
     chmod +x /etc/init.d/xray
-    rc-update add xray default
-}
-
-# ================== 功能函数 ==================
-install_xray() {
-    info "正在安装依赖 (Alpine 专用)..."
-    apk update && apk add curl unzip openssl ca-certificates uuidgen jq gcompat libc6-compat > /dev/null 2>&1
-
-    local arch=$(uname -m)
-    case ${arch} in
-        x86_64) local x_arch="64" ;;
-        aarch64) local x_arch="arm64-v8a" ;;
-        *) error "不支持的架构: $arch"; return 1 ;;
-    esac
-
-    local ver=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep '"tag_name":' | cut -d'"' -f4)
-    info "下载 Xray $ver ($arch)..."
-    curl -L -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${ver}/Xray-linux-${x_arch}.zip"
-    unzip -o /tmp/xray.zip -d /tmp/xray_tmp
-    mv -f /tmp/xray_tmp/xray "$XRAY_BIN"
-    chmod +x "$XRAY_BIN"
-    rm -rf /tmp/xray*
-
-    configure_xray
-    setup_service
+    touch "$X_LOG"
+    rc-update add xray default >/dev/null 2>&1
     rc-service xray restart
-}
-
-configure_xray() {
-    read -p "请输入端口 (默认随机): " port
-    [[ -z "$port" ]] && port=$((RANDOM % 45535 + 10000))
     
-    read -p "请输入伪装域名 (默认: www.amazon.com): " domain
-    [[ -z "$domain" ]] && domain="www.amazon.com"
-    
-    uuid=$(uuidgen)
-    keys=$($XRAY_BIN x25519)
-    pri_key=$(echo "$keys" | grep "Private" | awk '{print $NF}')
-    pub_key=$(echo "$keys" | grep "Public" | awk '{print $NF}')
-    sid=$(openssl rand -hex 4)
-
-    echo "$pub_key" > "$PUBLIC_KEY_FILE"
-    write_config "$port" "$uuid" "$domain" "$pri_key" "$sid"
-    
+    # 生成分享链接
     local ip=$(get_public_ip)
-    cat > /root/xray_vless_reality.txt <<EOF
-vless://${uuid}@${ip}:${port}?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=${domain}&fp=chrome&pbk=${pub_key}&sid=${sid}#Alpine-Reality
-EOF
+    echo "vless://$uuid@$ip:$port?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=$domain&fp=chrome&pbk=$pub&sid=$sid#Alpine-Reality" > "$X_LINK"
+    info "安装完成！"
 }
 
-show_current_config() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then error "配置不存在"; return; fi
+# 4. 修改配置
+modify_config() {
+    if [[ ! -f "$X_CONFIG" ]]; then error "请先安装 Xray"; return; fi
     
-    local port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG")
-    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG")
-    local pub_key=$(cat "$PUBLIC_KEY_FILE" 2>/dev/null)
+    # 读取当前配置
+    local curr_port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
+    local curr_domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$X_CONFIG")
+    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
+    local pri=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$X_CONFIG")
+    local sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$X_CONFIG")
+    local pub=$(cat "$X_PBK")
+    local curr_outbound=$(jq -c '.outbounds[0]' "$X_CONFIG")
+
+    read -p "请输入新端口 (回车保持 $curr_port): " n_port
+    n_port=${n_port:-$curr_port}
+    read -p "请输入新域名 (回车保持 $curr_domain): " n_domain
+    n_domain=${n_domain:-$curr_domain}
     
-    echo -e "${GREEN}====== 当前配置 ======${RESET}"
-    echo -e "${YELLOW}端口: $port${RESET}"
-    echo -e "${YELLOW}UUID: $uuid${RESET}"
-    echo -e "${YELLOW}公钥: $pub_key${RESET}"
-    echo -e "${GREEN}链接: ${RESET}"
-    cat /root/xray_vless_reality.txt 2>/dev/null || echo "链接文件丢失"
+    write_config "$n_port" "$uuid" "$n_domain" "$pri" "$sid" "$curr_outbound"
+    rc-service xray restart
+    
+    # 更新分享链接
+    local ip=$(get_public_ip)
+    echo "vless://$uuid@$ip:$n_port?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=$n_domain&fp=chrome&pbk=$pub&sid=$sid#Alpine-Reality" > "$X_LINK"
+    info "配置已更新！"
 }
 
-# ================== SNI 优选 (简化逻辑) ==================
-select_best_sni() {
-    info "正在测试常用域名延迟..."
-    local domains=("www.amazon.com" "www.apple.com" "www.microsoft.com" "www.cloudflare.com")
-    local best_domain=""
-    local min_lat=9999
+# 10. Socks5 出口
+config_socks() {
+    if [[ ! -f "$X_CONFIG" ]]; then error "请先安装 Xray"; return; fi
+    echo -e "1. 开启 Socks5 出口代理\n2. 恢复 Freedom 直连出口"
+    read -p "选择操作: " s_opt
+    case $s_opt in
+        1)
+            read -p "Socks5 地址: " s_host
+            read -p "Socks5 端口: " s_port
+            read -p "用户名 (无则回车): " s_user
+            read -p "密码 (无则回车): " s_pass
+            if [[ -n "$s_user" ]]; then
+                outbound=$(jq -n --arg h "$s_host" --argjson p "$s_port" --arg u "$s_user" --arg pw "$s_pass" \
+                '{"protocol":"socks","settings":{"servers":[{"address":$h,"port":$p,"users":[{"user":$u,"pass":$pw}]}]}}')
+            else
+                outbound=$(jq -n --arg h "$s_host" --argjson p "$s_port" \
+                '{"protocol":"socks","settings":{"servers":[{"address":$h,"port":$p}]}}')
+            fi
+            ;;
+        2) outbound='{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}' ;;
+        *) return ;;
+    esac
     
+    tmp=$(mktemp)
+    jq --argjson obj "$outbound" '.outbounds = [$obj]' "$X_CONFIG" > "$tmp" && mv "$tmp" "$X_CONFIG"
+    rc-service xray restart
+    info "出口配置已切换！"
+}
+
+# 11. SNI 域名优选
+sni_select() {
+    info "正在测试常见域名延迟..."
+    local domains=("www.amazon.com" "www.apple.com" "www.microsoft.com" "www.cloudflare.com" "www.loewe.com")
     for d in "${domains[@]}"; do
-        local lat=$(curl -o /dev/null -s -w "%{time_total}\n" "https://$d")
-        echo -e "[SNI] $d -> ${lat}s"
-        if (( $(echo "$lat < $min_lat" | bc -l) )); then
-            min_lat=$lat; best_domain=$d
+        local start=$(date +%s%3N)
+        if timeout 2 openssl s_client -connect "${d}:443" -servername "${d}" </dev/null >/dev/null 2>&1; then
+            local cost=$(( $(date +%s%3N) - start ))
+            echo -e "[SNI] $d -> ${cost}ms"
         fi
     done
-    info "建议使用最优 SNI: $best_domain"
 }
 
-# ================== 菜单 ==================
+# ================== 菜单逻辑 ==================
 show_menu() {
     clear
     local status=$(get_xray_status)
     local version=$(get_xray_version)
-    local port="-"
-    [[ -f "$XRAY_CONFIG" ]] && port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "-")
+    local port_show="-"
+    [[ -f "$X_CONFIG" ]] && port_show=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "-")
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   Xray Vless+Reality 管理面板   ${RESET}"
+    echo -e "${GREEN}   Xray Vless+Reality 管理面板      ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN} 1. 安装 Xray Vless+Reality${RESET}"
-    echo -e "${GREEN} 2. 更新 Xray 内核${RESET}"
+    echo -e "${GREEN} 2. 更新 Xray${RESET}"
     echo -e "${GREEN} 3. 卸载 Xray${RESET}"
-    echo -e "${GREEN} 4. 重置/修改配置${RESET}"
+    echo -e "${GREEN} 4. 修改配置 (回车保持不变)${RESET}"
     echo -e "${GREEN} 5. 启动 Xray${RESET}"
     echo -e "${GREEN} 6. 停止 Xray${RESET}"
     echo -e "${GREEN} 7. 重启 Xray${RESET}"
-    echo -e "${GREEN} 8. 查看系统日志${RESET}"
-    echo -e "${GREEN} 9. 查看节点配置${RESET}"
+    echo -e "${GREEN} 8. 查看实时日志${RESET}"
+    echo -e "${GREEN} 9. 查看分享链接${RESET}"
     echo -e "${GREEN}10. 配置 Socks5 出口${RESET}"
     echo -e "${GREEN}11. SNI 域名优选✨${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# ================== 主循环 ==================
-main() {
-    while true; do
-        show_menu
-        read -rp "$(echo -e "${GREEN}请输入选项: ${RESET}")" choice
-        case "$choice" in
-            1) install_xray; pause ;;
-            2) install_xray; pause ;; # Alpine 重新运行安装即更新
-            3) 
-                rc-service xray stop 2>/dev/null
-                rc-update del xray default 2>/dev/null
-                rm -rf /etc/xray "$XRAY_BIN" /etc/init.d/xray /root/xray_vless_reality.txt
-                info "卸载完成"; pause ;;
-            4) configure_xray; rc-service xray restart; pause ;;
-            5) rc-service xray start; pause ;;
-            6) rc-service xray stop; pause ;;
-            7) rc-service xray restart; pause ;;
-            8) tail -n 50 /var/log/messages | grep xray; pause ;; # Alpine 日志路径
-            9) show_current_config; pause ;;
-            11) select_best_sni; pause ;;
-            0) exit 0 ;;
-            *) error "无效选项"; sleep 1 ;;
-        esac
-    done
-}
-
-main "$@"
+while true; do
+    show_menu
+    read -p "请输入选项: " choice
+    case $choice in
+        1|2) install_xray; pause ;;
+        3) 
+            rc-service xray stop 2>/dev/null
+            rc-update del xray default 2>/dev/null
+            rm -rf "$X_DIR" "$X_BIN" /etc/init.d/xray "$X_LINK" "$X_LOG"
+            info "卸载完成"; pause ;;
+        4) modify_config; pause ;;
+        5) rc-service xray start; pause ;;
+        6) rc-service xray stop; pause ;;
+        7) rc-service xray restart; pause ;;
+        8) 
+            if [[ -f "$X_LOG" ]]; then
+                echo -e "${YELLOW}查看日志 (Ctrl+C 退出):${RESET}"
+                tail -f "$X_LOG"
+            else error "日志文件不存在"; pause; fi ;;
+        9) 
+            if [[ -f "$X_LINK" ]]; then
+                echo -e "\n${YELLOW}分享链接:${RESET}"
+                cat "$X_LINK"
+                echo -e "\n${YELLOW}公钥 (pbk):${RESET} $(cat "$X_PBK" 2>/dev/null)"
+            else error "节点未配置"; fi
+            pause ;;
+        10) config_socks; pause ;;
+        11) sni_select; pause ;;
+        0) exit 0 ;;
+        *) error "无效选项"; sleep 1 ;;
+    esac
+done

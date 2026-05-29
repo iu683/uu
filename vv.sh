@@ -1,605 +1,265 @@
 #!/bin/bash
 
-# 输出字体颜色
+# =========================================================
+# Xray VLESS-Reality 管理脚本
+# =========================================================
+
+set -Eeuo pipefail
+
+# ================== 颜色定义 ==================
 GREEN="\033[32m"
 RED="\033[31m"
-YELLOW="\033[0;33m"
-NC="\033[0m"
-GREEN_ground="\033[42;37m" # 全局绿色
-RED_ground="\033[41;37m"   # 全局红色
-Info="${GREEN}[信息]${NC}"
-Error="${RED}[错误]${NC}"
-Tip="${YELLOW}[提示]${NC}"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+RESET="\033[0m"
 
-cop_info(){
-clear
-echo -e "${GREEN}######################################
-      DDNS 管理(快捷指令:ddns)        
-######################################${NC}"
-echo
+# ================== 路径与日志 ==================
+readonly X_DIR="/etc/xray"
+readonly X_CONFIG="${X_DIR}/config.json"
+readonly X_BIN="/usr/local/bin/xray"
+readonly X_PBK="${X_DIR}/public.key"
+readonly X_LINK="/root/xray_vless_reality.txt"
+readonly X_LOG="/var/log/xray.log"
+
+# ================== 核心工具 ==================
+info() { echo -e "${GREEN}[信息] $*${RESET}"; }
+warn() { echo -e "${GREEN}[警告] $*${RESET}"; }
+error() { echo -e "${GREEN}[错误] $*${RESET}"; }
+pause() { echo; echo -ne "${GREEN}按任意键返回菜单...${RESET}"; read -n 1 -s; echo; }
+
+get_xray_status() {
+    if rc-service xray status 2>/dev/null | grep -q "started"; then
+        echo -e "${GREEN}● 运行中${RESET}"
+    else echo -e "${RED}● 未运行${RESET}"; fi
 }
 
-# 检查系统是否为 Debian、Ubuntu 或 Alpine
-if ! grep -qiE "debian|ubuntu|alpine" /etc/os-release; then
-    echo -e "${RED}本脚本仅支持 Debian、Ubuntu 或 Alpine 系统，请在这些系统上运行。${NC}"
-    exit 1
-fi
-
-# 检查是否为root用户
-if [[ $(whoami) != "root" ]]; then
-    echo -e "${Error}请以root身份执行该脚本！"
-    exit 1
-fi
-
-# 检查是否安装 curl 和 GNU grep（仅 Alpine）
-check_curl() {
-    if ! command -v curl &>/dev/null; then
-        echo -e "${YELLOW}未检测到 curl，正在安装 curl...${NC}"
-        if grep -qiE "debian|ubuntu" /etc/os-release; then
-            apt update && apt install -y curl
-            if [ $? -ne 0 ]; then
-                echo -e "${RED}在 Debian/Ubuntu 上安装 curl 失败，请手动安装后重新运行脚本。${NC}"
-                exit 1
-            fi
-        elif grep -qiE "alpine" /etc/os-release; then
-            apk update && apk add curl
-            if [ $? -ne 0 ]; then
-                echo -e "${RED}在 Alpine 上安装 curl 失败，请手动安装后重新运行脚本。${NC}"
-                exit 1
-            fi
-        fi
-    fi
-
-    if grep -qiE "alpine" /etc/os-release; then
-        if ! grep --version 2>/dev/null | grep -q "GNU"; then
-            echo -e "${YELLOW}当前 grep 不是 GNU 版本，正在安装 GNU grep...${NC}"
-            apk update && apk add grep
-            if [ $? -ne 0 ]; then
-                echo -e "${RED}在 Alpine 上安装 GNU grep 失败，请手动安装后重新运行脚本。${NC}"
-                exit 1
-            fi
-        fi
-    fi
+get_xray_version() {
+    [[ -x "$X_BIN" ]] && "$X_BIN" version 2>/dev/null | head -n 1 | awk '{print $2}' || echo "未安装"
 }
 
-# 返回菜单公共函数
-back_to_menu() {
-    echo
-    read -rp "按回车键返回菜单..."
+get_public_ip() {
+    curl -4fsSL --max-time 5 https://api.ipify.org || echo "未知IP"
 }
 
-# 开始安装DDNS
-install_ddns(){
-    if [ ! -f "/usr/bin/ddns" ]; then
-        curl -o /usr/bin/ddns https://raw.githubusercontent.com/iu683/uu/main/vv.sh && chmod +x /usr/bin/ddns
-    fi
-    mkdir -p /etc/DDNS
-    cat <<'EOF' > /etc/DDNS/DDNS
-#!/bin/bash
-
-source /etc/DDNS/.config
-
-for Domain in "${Domains[@]}"; do
-    Zone_id=""
-    current_domain="$Domain"
-    while [[ "$current_domain" == *.* ]]; do
-        Zone_id=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$current_domain" \
-             -H "X-Auth-Email: $Email" \
-             -H "X-Auth-Key: $Api_key" \
-             -H "Content-Type: application/json" \
-             | grep -Po '(?<="id":")[^"]*' | head -1)
-        [ -n "$Zone_id" ] && break
-        current_domain=${current_domain#*.}
-    done
-
-    if [ -z "$Zone_id" ]; then
-        echo "无法获取域名 $Domain 的 Zone ID，跳过。"
-        continue
-    fi
-
-    DNS_IDv4=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$Zone_id/dns_records?type=A&name=$Domain" \
-         -H "X-Auth-Email: $Email" \
-         -H "X-Auth-Key: $Api_key" \
-         -H "Content-Type: application/json" \
-         | grep -Po '(?<="id":")[^"]*' | head -1)
-
-    if [ -n "$DNS_IDv4" ] && [ -n "$Public_IPv4" ] && [ "$Public_IPv4" != "$Old_Public_IPv4" ]; then
-        curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$Zone_id/dns_records/$DNS_IDv4" \
-             -H "X-Auth-Email: $Email" \
-             -H "X-Auth-Key: $Api_key" \
-             -H "Content-Type: application/json" \
-             --data "{\"type\":\"A\",\"name\":\"$Domain\",\"content\":\"$Public_IPv4\"}" >/dev/null 2>&1
-    fi
-done
-
-if [ "$ipv6_set" = "true" ]; then
-    for Domainv6 in "${Domainsv6[@]}"; do
-        Zone_idv6=""
-        current_domainv6="$Domainv6"
-        while [[ "$current_domainv6" == *.* ]]; do
-            Zone_idv6=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$current_domainv6" \
-                 -H "X-Auth-Email: $Email" \
-                 -H "X-Auth-Key: $Api_key" \
-                 -H "Content-Type: application/json" \
-                 | grep -Po '(?<="id":")[^"]*' | head -1)
-            [ -n "$Zone_idv6" ] && break
-            current_domainv6=${current_domainv6#*.}
-        done
-
-        if [ -z "$Zone_idv6" ]; then
-            echo "无法获取域名 $Domainv6 的 Zone ID，跳过。"
-            continue
-        fi
-
-        DNS_IDv6=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$Zone_idv6/dns_records?type=AAAA&name=$Domainv6" \
-             -H "X-Auth-Email: $Email" \
-             -H "X-Auth-Key: $Api_key" \
-             -H "Content-Type: application/json" \
-             | grep -Po '(?<="id":")[^"]*' | head -1)
-
-        if [ -n "$DNS_IDv6" ] && [ -n "$Public_IPv6" ] && [ "$Public_IPv6" != "$Old_Public_IPv6" ]; then
-            curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$Zone_idv6/dns_records/$DNS_IDv6" \
-                 -H "X-Auth-Email: $Email" \
-                 -H "X-Auth-Key: $Api_key" \
-                 -H "Content-Type: application/json" \
-                 --data "{\"type\":\"AAAA\",\"name\":\"$Domainv6\",\"content\":\"$Public_IPv6\"}" >/dev/null 2>&1
-        fi
-    done
-fi
-
-send_telegram_notification() {
-    local current_time
-    current_time=$(date "+%Y-%m-%d %H:%M:%S")
-
-    local message=""
-    message+="🚀 <b>Cloudflare DDNS IP 变动提示</b>\n\n"
-
-    # IPv4
-    if [[ -n "$Public_IPv4" && "$Public_IPv4" != "$Old_Public_IPv4" ]]; then
-        message+="📌 <b>IPv4 域名</b>\n"
-
-        for domain in "${Domains[@]}"; do
-            message+="<code>${domain}</code>\n"
-        done
-
-        message+="🔄 <b>最新 IPv4:</b> <code>${Public_IPv4}</code>\n\n"
-    fi
-
-    # IPv6
-    if [[ "$ipv6_set" == "true" && -n "$Public_IPv6" && "$Public_IPv6" != "$Old_Public_IPv6" ]]; then
-        message+="📌 <b>IPv6 域名</b>\n"
-
-        for domainv6 in "${Domainsv6[@]}"; do
-            message+="<code>${domainv6}</code>\n"
-        done
-
-        message+="🔄 <b>最新 IPv6:</b> <code>${Public_IPv6}</code>\n\n"
-    fi
-
-    # 时间
-    message+="⏰ <b>检查时间:</b> ${current_time}"
-
-    # 发送
-    curl -s --max-time 15 \
-        -X POST "https://api.telegram.org/bot${Telegram_Bot_Token}/sendMessage" \
-        --data-urlencode "chat_id=${Telegram_Chat_ID}" \
-        --data-urlencode "parse_mode=HTML" \
-        --data-urlencode "text=${message}" \
-        >/dev/null 2>&1
+# ================== 配置写入 ==================
+write_config() {
+    local port=$1 uuid=$2 domain=$3 pri=$4 sid=$5
+    local outbound=${6:-'{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}'}
+    mkdir -p "$X_DIR" && chmod 755 "$X_DIR"
+    cat > "$X_CONFIG" <<EOF
+{
+    "log": { "loglevel": "warning" },
+    "inbounds": [{
+        "port": $port, "protocol": "vless",
+        "settings": { "clients": [{"id": "$uuid", "flow": "xtls-rprx-vision"}], "decryption": "none" },
+        "streamSettings": {
+            "network": "tcp", "security": "reality",
+            "realitySettings": {
+                "dest": "$domain:443", "serverNames": ["$domain"],
+                "privateKey": "$pri", "shortIds": ["$sid"], "fingerprint": "chrome"
+            }
+        },
+        "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+    }],
+    "outbounds": [$outbound]
 }
-
-if [[ -n "$Telegram_Bot_Token" && -n "$Telegram_Chat_ID" && ( ("$Public_IPv4" != "$Old_Public_IPv4" && -n "$Public_IPv4") || ("$Public_IPv6" != "$Old_Public_IPv6" && -n "$Public_IPv6") ) ]]; then
-    send_telegram_notification
-fi
-
-sleep 3
-
-if [[ -n "$Public_IPv4" && "$Public_IPv4" != "$Old_Public_IPv4" ]]; then
-    sed -i "s/^Old_Public_IPv4=.*/Old_Public_IPv4=\"$Public_IPv4\"/" /etc/DDNS/.config
-fi
-
-if [[ -n "$Public_IPv6" && "$Public_IPv6" != "$Old_Public_IPv6" ]]; then
-    sed -i "s/^Old_Public_IPv6=.*/Old_Public_IPv6=\"$Public_IPv6\"/" /etc/DDNS/.config
-fi
 EOF
-
-    cat <<'EOF' > /etc/DDNS/.config
-Domains=("your_domain1.com" "your_domain2.com")
-ipv6_set="false"
-Domainsv6=("your_domainv6_1.com" "your_domainv6_2.com")
-Email="your_email@gmail.com"
-Api_key="your_api_key"
-Telegram_Bot_Token=""
-Telegram_Chat_ID=""
-
-regex_pattern='^(eth|ens|eno|esp|enp)[0-9]+'
-InterFace=($(ip link show | awk -F': ' '{print $2}' | grep -E "$regex_pattern" | sed "s/@.*//g"))
-
-Public_IPv4=""
-Public_IPv6=""
-Old_Public_IPv4=""
-Old_Public_IPv6=""
-ipv4Regex="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
-ipv6Regex="^([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])$"
-
-if grep -qiE "debian|ubuntu" /etc/os-release; then
-    for i in "${InterFace[@]}"; do
-        ipv4=$(curl -s4 --max-time 3 --interface "$i" ip.sb -k | grep -E -v '^(2a09|104\.28)' || true)
-        if [[ -z "$ipv4" ]]; then
-            ipv4=$(curl -s4 --max-time 3 --interface "$i" https://api.ipify.org -k | grep -E -v '^(2a09|104\.28)' || true)
-        fi
-        if [[ -n "$ipv4" && "$ipv4" =~ $ipv4Regex ]]; then
-            Public_IPv4="$ipv4"
-            break # 修复 Bug：获取到有效 IP 后直接跳出，防止被后续空接口覆盖
-        fi
-    done
-
-    for i in "${InterFace[@]}"; do
-        if [[ "$ipv6_set" == "true" ]]; then
-            ipv6=$(curl -s6 --max-time 3 --interface "$i" ip.sb -k | grep -E -v '^(2a09|104\.28)' || true)
-            if [[ -z "$ipv6" ]]; then
-                ipv6=$(curl -s6 --max-time 3 --interface "$i" https://api6.ipify.org -k | grep -E -v '^(2a09|104\.28)' || true)
-            fi
-            if [[ -n "$ipv6" && "$ipv6" =~ $ipv6Regex ]]; then
-                Public_IPv6="$ipv6"
-                break # 同上
-            fi
-        fi
-    done
-else
-    ipv4=$(curl -s4 --max-time 3 ip.sb -k | grep -E -v '^(2a09|104\.28)' || true)
-    if [[ -z "$ipv4" ]]; then
-        ipv4=$(curl -s4 --max-time 3 https://api.ipify.org -k | grep -E -v '^(2a09|104\.28)' || true)
-    fi
-    if [[ -n "$ipv4" && "$ipv4" =~ $ipv4Regex ]]; then
-        Public_IPv4="$ipv4"
-    fi
-
-    if [[ "$ipv6_set" == "true" ]]; then
-        ipv6=$(curl -s6 --max-time 3 ip.sb -k | grep -E -v '^(2a09|104\.28)' || true)
-        if [[ -z "$ipv6" ]]; then
-            ipv6=$(curl -s6 --max-time 3 https://api6.ipify.org -k | grep -E -v '^(2a09|104\.28)' || true)
-        fi
-        if [[ -n "$ipv6" && "$ipv6" =~ $ipv6Regex ]]; then
-            Public_IPv6="$ipv6"
-        fi
-    fi
-fi
-EOF
-    chmod +x /etc/DDNS/DDNS && chmod +x /etc/DDNS/.config
-    echo -e "${Info}DDNS 安装完成！"
-    echo
 }
 
-# 检查 DDNS 状态
-check_ddns_status() {
-    if grep -qiE "alpine" /etc/os-release; then
-        if crontab -l | grep -q "/etc/DDNS/DDNS"; then
-            ddns_status="running"
-        else
-            ddns_status="dead"
+# ================== SNI 优选 ==================
+select_best_sni() {
+    info "开始优选 SNI 延迟测试..."
+    local SNIS=(
+        amd.com apps.mzstatic.com aws.com azure.microsoft.com beacon.gtv-pub.com
+        bing.com catalog.gamepass.com cdn.bizibly.com cdn-dynmedia-1.microsoft.com
+        devblogs.microsoft.com fpinit.itunes.apple.com go.microsoft.com
+        gray-config-prod.api.arc-cdn.net gray.video-player.arcpublishing.com
+        images.nvidia.com r.bing.com services.digitaleast.mobi snap.licdn.com
+        statici.icloud.com tag.demandbase.com tag-logger.demandbase.com
+        ts1.tc.mm.bing.net ts2.tc.mm.bing.net vs.aws.amazon.com www.apple.com
+        www.icloud.com www.microsoft.com www.oracle.com www.xbox.com
+        www.xilinx.com xp.apple.com
+    )
+    local BEST_SNI=""
+    local BEST_TIME=999999
+
+    for sni in "${SNIS[@]}"; do
+        start=$(date +%s%N)
+        if timeout 2 openssl s_client -connect ${sni}:443 -servername ${sni} -brief </dev/null >/dev/null 2>&1; then
+            end=$(date +%s%N)
+            cost=$(( (end - start) / 1000000 ))
+            echo -e "${GREEN}[SNI] $sni -> ${cost}ms${RESET}"
+            if [ $cost -lt $BEST_TIME ]; then
+                BEST_TIME=$cost; BEST_SNI=$sni
+            fi
         fi
+    done
+
+    if [ -n "$BEST_SNI" ]; then
+        info "最优 SNI: $BEST_SNI (${BEST_TIME}ms)"
+        return 0
     else
-        if [[ -f "/etc/systemd/system/ddns.timer" ]]; then
-            STatus=$(systemctl status ddns.timer | grep Active | awk '{print $3}' | cut -d "(" -f2 | cut -d ")" -f1)
-            if [[ $STatus =~ "waiting" || $STatus =~ "running" ]]; then
-                ddns_status="running"
+        warn "未找到可用 SNI"
+        return 1
+    fi
+}
+
+# ================== Socks5 出口配置 ==================
+config_socks5() {
+    if [[ ! -f "$X_CONFIG" ]]; then error "请先安装 Xray"; return; fi
+    echo -e "${GREEN}--- Socks5 出口配置 ---${RESET}"
+    echo -e "${GREEN}1. 启用 Socks5 出口${RESET}"
+    echo -e "${GREEN}2. 还原 Freedom 直连出口${RESET}"
+    echo -e "${GREEN}0. 返回${RESET}"
+    echo -ne "${GREEN}请选择: ${RESET}"; read s_opt
+
+    case $s_opt in
+        1)
+            echo -ne "${GREEN}Socks5 服务器地址: ${RESET}"; read s_addr
+            echo -ne "${GREEN}Socks5 服务器端口: ${RESET}"; read s_port
+            echo -ne "${GREEN}用户名 (无则直接回车): ${RESET}"; read s_user
+            echo -ne "${GREEN}密码 (无则直接回车): ${RESET}"; read s_pass
+            
+            if [[ -n "$s_user" ]]; then
+                new_outbound=$(jq -n --arg h "$s_addr" --argjson p "$s_port" --arg u "$s_user" --arg pw "$s_pass" \
+                '{"protocol":"socks","settings":{"servers":[{"address":$h,"port":$p,"users":[{"user":$u,"pass":$pw}]}]}}')
             else
-                ddns_status="dead"
+                new_outbound=$(jq -n --arg h "$s_addr" --argjson p "$s_port" \
+                '{"protocol":"socks","settings":{"servers":[{"address":$h,"port":$p}]}}')
             fi
-        else
-            ddns_status="not_installed"
-        fi
-    fi
+            ;;
+        2)
+            new_outbound='{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}'
+            ;;
+        *) return ;;
+    esac
+
+    tmp_cfg=$(mktemp)
+    jq --argjson obj "$new_outbound" '.outbounds = [$obj]' "$X_CONFIG" > "$tmp_cfg" && mv "$tmp_cfg" "$X_CONFIG"
+    rc-service xray restart
+    info "Socks5 出口模式更新成功！"
 }
 
-# 后续操作菜单循环
-go_ahead(){
-    while true; do
-        cop_info
-        check_ddns_status
-        if [[ "$ddns_status" == "running" ]]; then
-            echo -e "${Info}DDNS状态：${GREEN}已安装${NC} 并 ${GREEN}已启动${NC}"
-        else
-            echo -e "${Tip}DDNS状态：${GREEN}已安装${NC} 但 ${RED}未启动${NC}"
-        fi
-        echo
-        echo -e "${Tip}选择一个选项：
-  ${GREEN}1${NC}：重启 DDNS
-  ${GREEN}2${NC}：停止 DDNS
-  ${GREEN}3${NC}：卸载 DDNS
-  ${GREEN}4${NC}：修改要解析的域名
-  ${GREEN}5${NC}：修改 Cloudflare Api
-  ${GREEN}6${NC}：配置 Telegram 通知
-  ${GREEN}7${NC}：更改 DDNS 运行时间
-  ${GREEN}8${NC}：查看服务运行状态
-  ${GREEN}9${NC}：测试 Telegram 通知
-  ${GREEN}0${NC}：退出" 
-        echo
-        read -p "选项: " option
-        if [[ ! "$option" =~ ^[0-9]$ ]]; then
-            echo -e "${Error}请输入正确的数字 [0-9]"
-            sleep 1
-            continue
-        fi
+# ================== 安装与管理 ==================
+install_xray() {
+    info "正在安装依赖与内核..."
+    apk update && apk add curl unzip openssl jq uuidgen gcompat libc6-compat bc > /dev/null 2>&1
+    mkdir -p "$X_DIR" && sync
+    
+    local arch=$(uname -m | sed 's/x86_64/64/;s/aarch64/arm64-v8a/')
+    local ver=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+    
+    info "下载 Xray $ver ($arch)..."
+    curl -L -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/$ver/Xray-linux-$arch.zip"
+    unzip -o /tmp/xray.zip -d /tmp/xray_tmp > /dev/null
+    mv -f /tmp/xray_tmp/xray "$X_BIN" && chmod +x "$X_BIN"
+    rm -rf /tmp/xray*
+    
+    if [[ ! -f "$X_CONFIG" ]]; then
+        echo -ne "${GREEN}请输入入站端口 (回车随机): ${RESET}"; read port; [[ -z "$port" ]] && port=$((RANDOM % 45535 + 10000))
+        echo -ne "${GREEN}请输入伪装域名 (回车 www.amazon.com): ${RESET}"; read domain; [[ -z "$domain" ]] && domain="www.amazon.com"
         
-        case "$option" in
-            0)
-                exit 0
-            ;;
-            1)
-                restart_ddns
-                back_to_menu
-            ;;
-            2)
-                stop_ddns
-                back_to_menu
-            ;;
-            3)
-                if grep -qiE "alpine" /etc/os-release; then
-                    stop_ddns
-                    rm -rf /etc/DDNS /usr/bin/ddns
-                else
-                    systemctl stop ddns.service >/dev/null 2>&1
-                    systemctl stop ddns.timer >/dev/null 2>&1
-                    rm -rf /etc/systemd/system/ddns.service /etc/systemd/system/ddns.timer /etc/DDNS /usr/bin/ddns
-                fi
-                echo -e "${Info}DDNS 已卸载！"
-                exit 0
-            ;;
-            4)
-                set_domain
-                restart_ddns
-                back_to_menu
-            ;;
-            5)
-                set_cloudflare_api
-                restart_ddns
-                back_to_menu
-            ;;
-            6)
-                set_telegram_settings
-                back_to_menu
-            ;;
-            7)
-                set_ddns_run_interval
-                back_to_menu
-            ;;
-            8)
-                show_service_detail
-                back_to_menu
-            ;;
-            9)
-                test_tg_notification
-                back_to_menu
-            ;;
-        esac
-    done
-}
-
-# 设置Cloudflare Api
-set_cloudflare_api(){
-    echo -e "${Tip}开始配置CloudFlare API..."
-    echo
-    read -rp "请输入您的Cloudflare邮箱: " EMail
-    if [ -z "$EMail" ]; then
-        echo -e "${Error}未输入邮箱，操作取消。"
-        return 1
-    fi
-    echo -e "${Info}你的邮箱：${RED_ground}${EMail}${NC}"
-    echo
-
-    read -rp "请输入您的Cloudflare(Global API Key)密钥: " Api_Key
-    if [ -z "$Api_Key" ]; then
-        echo -e "${Error}未输入密钥，操作取消。"
-        return 1
-    fi
-    echo -e "${Info}你的密钥：${RED_ground}${Api_Key}${NC}"
-    echo
-
-    sed -i "s|^Email=.*|Email=\"${EMail}\"|g" /etc/DDNS/.config
-    sed -i "s|^Api_key=.*|Api_key=\"${Api_Key}\"|g" /etc/DDNS/.config
-}
-
-
-# 设置解析的域名
-set_domain() {
-    ipv4_check=$(curl -s -4 ip.sb || true)
-    if [ -n "$ipv4_check" ]; then
-        echo -e "${Info}检测到IPv4地址: ${ipv4_check}"
-        read -rp "请输入IPv4域名（例如:v4.888.xyz，回车跳过）: " Domain_input
-        if [ -n "$Domain_input" ]; then
-            Domain_input="${Domain_input//，/,}"
-            IFS=',' read -ra Domains_arr <<< "$Domain_input"
-            # 格式化写回配置数组
-            local formatted_domains=""
-            for d in "${Domains_arr[@]}"; do formatted_domains+="\"$d\" "; done
-            sed -i "s|^Domains=.*|Domains=($formatted_domains)|" /etc/DDNS/.config
-            echo -e "${Info}已保存IPv4域名: ${RED_ground}${Domains_arr[*]}${NC}"
-        fi
+        local uuid=$(uuidgen)
+        local keys=$($X_BIN x25519)
+        local pri=$(echo "$keys" | grep "Private" | awk '{print $NF}')
+        local pub=$(echo "$keys" | grep "Public" | awk '{print $NF}')
+        local sid=$(openssl rand -hex 4)
+        
+        echo "$pub" > "$X_PBK"
+        write_config "$port" "$uuid" "$domain" "$pri" "$sid"
+        
+        cat << EOF > /etc/init.d/xray
+#!/sbin/openrc-run
+command="/usr/local/bin/xray"
+command_args="run -c /etc/xray/config.json"
+command_background="yes"
+pidfile="/run/xray.pid"
+output_log="$X_LOG"
+error_log="$X_LOG"
+EOF
+        chmod +x /etc/init.d/xray
+        touch "$X_LOG"
+        rc-update add xray default >/dev/null 2>&1
     fi
 
-    ipv6_check=$(curl -s -6 ip.sb || true)
-    if [ -n "$ipv6_check" ]; then
-        echo -e "${Info}检测到IPv6地址: ${ipv6_check}"
-        read -rp "是否开启 IPv6 解析？(y/n，回车跳过): " enable_ipv6
-        if [[ "$enable_ipv6" =~ ^[Yy]$ ]]; then
-            sed -i 's/^ipv6_set=.*/ipv6_set="true"/g' /etc/DDNS/.config
-            read -rp "请输入IPv6域名（例如:v6.888.xyz，回车跳过）: " Domainv6_input
-            if [ -n "$Domainv6_input" ]; then
-                Domainv6_input="${Domainv6_input//，/,}"
-                IFS=',' read -ra Domainsv6_arr <<< "$Domainv6_input"
-                local formatted_domains_v6="" 
-                for d in "${Domainsv6_arr[@]}"; do formatted_domains_v6+="\"$d\" "; done 
-                sed -i "s|^Domainsv6=.*|Domainsv6=($formatted_domains_v6)|" /etc/DDNS/.config
-                echo -e "${Info}已保存IPv6域名: ${RED_ground}${Domainsv6_arr[*]}${NC}"
-            fi
-        else
-            sed -i 's/^ipv6_set=.*/ipv6_set="false"/g' /etc/DDNS/.config
-        fi
-    fi
-}
-# 设置Telegram参数
-set_telegram_settings(){
-    echo -e "${Info}开始配置Telegram通知设置..."
-    read -rp "请输入您的Telegram Bot Token (回车跳过): " Token
-    if [ -n "$Token" ]; then
-        read -rp "请输入您的Telegram Chat ID (回车跳过): " Chat_ID
-        if [ -n "$Chat_ID" ]; then
-            sed -i "s|^Telegram_Bot_Token=.*|Telegram_Bot_Token=\"${Token}\"|g" /etc/DDNS/.config
-            sed -i "s|^Telegram_Chat_ID=.*|Telegram_Chat_ID=\"${Chat_ID}\"|g" /etc/DDNS/.config
-            echo -e "${Info}Telegram 通知配置成功！"
-        fi
-    fi
-}
-
-# 运行DDNS服务
-run_ddns() {
-    if grep -qiE "alpine" /etc/os-release; then
-        if ! crontab -l | grep -q "/etc/DDNS/DDNS"; then
-            (crontab -l 2>/dev/null; echo "*/2 * * * * /bin/bash /etc/DDNS/DDNS >/dev/null 2>&1") | crontab -
-            echo -e "${Info}ddns 脚本已挂载至 Cron，每 2 分钟运行一次！"
-        fi
-    else
-        service='[Unit]
-Description=ddns
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/etc/DDNS
-ExecStart=bash DDNS
-
-[Install]
-WantedBy=multi-user.target'
-
-        timer='[Unit]
-Description=ddns timer
-
-[Timer]
-OnUnitActiveSec=60s
-Unit=ddns.service
-
-[Install]
-WantedBy=multi-user.target'
-
-        if [ ! -f "/etc/systemd/system/ddns.service" ]; then
-            echo "$service" >/etc/systemd/system/ddns.service
-            echo "$timer" >/etc/systemd/system/ddns.timer
-            systemctl daemon-reload
-            systemctl enable --now ddns.timer >/dev/null 2>&1
-            echo -e "${Info}ddns 定时任务已创建，每 1 分钟执行一次！"
-        fi
-    fi
-}
-
-# 更改运行时间间隔
-set_ddns_run_interval() {
-    read -rp "请输入新的 DDNS 运行间隔（分钟）： " interval
-    if ! [[ "$interval" =~ ^[0-9]+$ ]]; then
-        echo -e "${Error}无效输入！"
-        return 1
-    fi
-
-    if grep -qiE "alpine" /etc/os-release; then
-        crontab -l | grep -v "/etc/DDNS/DDNS" | crontab -
-        (crontab -l 2>/dev/null; echo "*/$interval * * * * /bin/bash /etc/DDNS/DDNS >/dev/null 2>&1") | crontab -
-        echo -e "${Info}已变更为每 ${interval} 分钟运行一次！"
-    else
-        sed -i "s/OnUnitActiveSec=.*/OnUnitActiveSec=${interval}m/" /etc/systemd/system/ddns.timer
-        systemctl daemon-reload && systemctl restart ddns.timer
-        echo -e "${Info}已变更为每 ${interval} 分钟运行一次！"
-    fi
-}
-
-restart_ddns() {
-    if grep -qiE "alpine" /etc/os-release; then
-        if crontab -l | grep -q "/etc/DDNS/DDNS"; then
-            echo -e "${Info}DDNS 已在计划任务中生效。"
-        else
-            run_ddns
-        fi
-    else
-        systemctl restart ddns.service >/dev/null 2>&1
-        systemctl restart ddns.timer >/dev/null 2>&1
-        echo -e "${Info}DDNS 服务已重启！"
-    fi
-}
-
-stop_ddns(){
-    if grep -qiE "alpine" /etc/os-release; then
-        crontab -l | grep -v "/etc/DDNS/DDNS" | crontab -
-        echo -e "${Info}DDNS Cron 任务已停止！"
-    else
-        systemctl stop ddns.service >/dev/null 2>&1
-        systemctl stop ddns.timer >/dev/null 2>&1
-        echo -e "${Info}DDNS Systemd 服务已停止！"
-    fi
-}
-
-show_service_detail() {
-    echo -e "${Info}--- 当前配置与状态 ---"
-    source /etc/DDNS/.config
-    echo -e "IPv4 域名: ${YELLOW}${Domains[*]}${NC}"
-    echo -e "IPv6 开启: ${YELLOW}${ipv6_set}${NC}"
-    echo -e "最后记录 IP: ${YELLOW}${Old_Public_IPv4:-未记录}${NC}"
+    rc-service xray restart
     
-    if grep -qiE "alpine" /etc/os-release; then
-        echo -en "Cron 任务: "
-        if crontab -l | grep -q "/etc/DDNS/DDNS"; then
-            echo -e "${GREEN}运行中${NC}"
-            crontab -l | grep "/etc/DDNS/DDNS"
-        else
-            echo -e "${RED}未在计划任务中${NC}"
-        fi
-    else
-        echo -en "Systemd 状态: "
-        if systemctl is-active --quiet ddns.timer; then
-            echo -e "${GREEN}运行中${NC}"
-        else
-            echo -e "${RED}已停止${NC}"
-        fi
-    fi
-    echo
-}
-
-test_tg_notification() {
-    source /etc/DDNS/.config
-    if [[ -z "$Telegram_Bot_Token" || -z "$Telegram_Chat_ID" ]]; then
-        echo -e "${Error} 未配置 Telegram，请先选择选项 6"
-        return
-    fi
-    echo -e "${Info} 正在发送测试消息..."
-    test_msg="🔔 DDNS 测试通知VPS: $(hostname)状态: 配置正常"
+    local ip=$(get_public_ip)
+    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
+    local port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
+    local domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$X_CONFIG")
+    local pub=$(cat "$X_PBK" 2>/dev/null || echo "N/A")
+    local sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$X_CONFIG")
     
-    status_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "https://api.telegram.org/bot$Telegram_Bot_Token/sendMessage" \
-        -d "chat_id=$Telegram_Chat_ID" \
-        -d "text=\"$test_msg\"")
+    local link="vless://$uuid@$ip:$port?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=$domain&fp=chrome&pbk=$pub&sid=$sid#Alpine-Reality"
+    echo "$link" > "$X_LINK"
     
-    if [ "$status_code" -eq 200 ]; then
-        echo -e "${GREEN}[成功]${NC} 请检查你的 Telegram 消息！"
-    else
-        echo -e "${Error} 发送失败，HTTP 状态码: $status_code"
-    fi
+    info "操作成功！当前节点配置："
+    echo -e "${GREEN}$link${RESET}"
 }
 
-# 检查引导函数
-check_ddns_install(){
-    if [ ! -f "/etc/DDNS/.config" ]; then
-        cop_info
-        echo -e "${Tip}DDNS 未安装，现在开始安装..."
-        echo
-        install_ddns
-        set_cloudflare_api
-        set_domain
-        set_telegram_settings
-        run_ddns
-        echo -e "${Info}安装完成，现已进入管理菜单。"
-        sleep 2
-    fi
-    go_ahead
+# ================== 菜单 ==================
+show_menu() {
+    clear
+    local status=$(get_xray_status)
+    local version=$(get_xray_version)
+    local port_show="-"
+    [[ -f "$X_CONFIG" ]] && port_show=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "-")
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   Xray Vless+Reality 管理面板      ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $status"
+    echo -e "${GREEN}版本   :${RESET} ${GREEN}${version}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${GREEN}${port_show}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN} 1. 安装 Xray Vless+Reality${RESET}"
+    echo -e "${GREEN} 2. 更新 Xray${RESET}"
+    echo -e "${GREEN} 3. 卸载 Xray${RESET}"
+    echo -e "${GREEN} 4. 修改配置${RESET}"
+    echo -e "${GREEN} 5. 启动 Xray${RESET}"
+    echo -e "${GREEN} 6. 停止 Xray${RESET}"
+    echo -e "${GREEN} 7. 重启 Xray${RESET}"
+    echo -e "${GREEN} 8. 查看日志${RESET}"
+    echo -e "${GREEN} 9. 查看节点配置${RESET}"
+    echo -e "${GREEN}10. 配置 Socks5出口${RESET}"
+    echo -e "${GREEN}11. SNI域名优选✨${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 执行入口
-check_curl
-check_ddns_install
+while true; do
+    show_menu
+    echo -ne "${GREEN}请输入选项: ${RESET}"; read choice
+    case $choice in
+        1|2) install_xray; pause ;;
+        3) rc-service xray stop 2>/dev/null; rc-update del xray default 2>/dev/null; rm -rf "$X_DIR" "$X_BIN" /etc/init.d/xray "$X_LINK" "$X_LOG"; info "卸载完成"; pause ;;
+        4) 
+            if [[ -f "$X_CONFIG" ]]; then
+                curr_port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
+                curr_domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$X_CONFIG")
+                echo -ne "${GREEN}新端口 (回车保持 $curr_port): ${RESET}"; read n_port; n_port=${n_port:-$curr_port}
+                echo -ne "${GREEN}新域名 (回车保持 $curr_domain): ${RESET}"; read n_domain; n_domain=${n_domain:-$curr_domain}
+                
+                uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
+                pri=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$X_CONFIG")
+                sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$X_CONFIG")
+                pub=$(cat "$X_PBK")
+                curr_out=$(jq -c '.outbounds[0]' "$X_CONFIG")
+                
+                write_config "$n_port" "$uuid" "$n_domain" "$pri" "$sid" "$curr_out"
+                rc-service xray restart
+                install_xray
+            else error "未安装"; fi
+            pause ;;
+        5) rc-service xray start; pause ;;
+        6) rc-service xray stop; pause ;;
+        7) rc-service xray restart; pause ;;
+        8) [[ -f "$X_LOG" ]] && tail -f "$X_LOG" || error "暂无日志"; pause ;;
+        9) [[ -f "$X_LINK" ]] && (echo -e "${GREEN}$(cat "$X_LINK")${RESET}") || error "无配置"; pause ;;
+        10) config_socks5; pause ;;
+        11) select_best_sni; pause ;;
+        0) exit 0 ;;
+        *) error "无效选项"; sleep 1 ;;
+    esac
+done

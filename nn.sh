@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# Shadowsocks-Rust 管理脚本 (Alpine Linux 完美修复版)
+# Shadowsocks-Rust 管理脚本 (Alpine Linux - 支持无损更新)
 # =========================================================
 
 set -euo pipefail
@@ -43,105 +43,110 @@ detect_arch() {
 }
 
 get_public_ip() {
-    curl -4fsSL --max-time 5 https://api.ipify.org || echo "YOUR_IP"
+    local ip
+    for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+        ip=$(curl -4s --max-time 5 "$url") && [[ -n "$ip" ]] && echo "$ip" && return
+    done
+    echo "YOUR_IP"
 }
 
-# ================== 独立配置修改函数 ==================
-modify_ss() {
-    if [[ ! -f "$SS_CONFIG" ]]; then
-        error "未发现配置文件，请先安装。"
-        return 1
-    fi
-
-    local old_port=$(grep '"server_port"' "$SS_CONFIG" | grep -oE '[0-9]+')
-    local old_pass=$(grep '"password"' "$SS_CONFIG" | cut -d '"' -f4)
+# ================== 核心：配置文件处理 ==================
+write_config_and_link() {
+    local port=$1
+    local pass=$2
+    local dns_str=$3
     
-    echo -e "${YELLOW}--- 修改 Shadowsocks 配置 (回车保持当前默认值) ---${RESET}"
-    
-    read -rp "$(echo -e ${GREEN}"请输入服务端口 [当前: $old_port]: "${RESET})" new_port
-    new_port=${new_port:-$old_port}
+    dns_str=$(echo "$dns_str" | tr -d ' ')
+    local dns_json=$(echo "\"${dns_str//,/\",\"}\"")
 
-    read -rp "$(echo -e ${GREEN}"请输入连接密码 [当前: $old_pass]: "${RESET})" new_pass
-    new_pass=${new_pass:-$old_pass}
-
-    # 更新配置文件
-    local tmp_conf=$(mktemp)
-    cat > "$tmp_conf" <<EOF
+    cat > "$SS_CONFIG" <<EOF
 {
     "server": "::",
-    "server_port": $new_port,
-    "password": "$new_pass",
+    "server_port": $port,
+    "password": "$pass",
     "method": "$METHOD",
     "fast_open": true,
     "mode": "tcp_and_udp",
     "timeout": 300,
     "no_delay": true,
     "ipv6_first": false,
-    "nameserver": ["1.1.1.1", "8.8.8.8"]
+    "nameserver": [$dns_json]
 }
 EOF
-    mv "$tmp_conf" "$SS_CONFIG"
-    
-    # 🛠 修复点：确保用户和组存在后再 chown
     chown "${RUN_USER}:${RUN_GROUP}" "$SS_CONFIG"
     chmod 600 "$SS_CONFIG"
 
-    # 生成链接
     local ip=$(get_public_ip)
-    local encoded=$(echo -n "${METHOD}:${new_pass}" | base64 | tr -d '\n')
-    echo "ss://${encoded}@${ip}:${new_port}#$(hostname)-SS2022" > "${SS_DIR}/ss.txt"
-
-    rc-service ss-rust restart
-    info "配置修改成功，服务已重启！"
+    [[ "$ip" =~ : ]] && ip="[$ip]"
+    local encoded=$(echo -n "${METHOD}:${pass}" | base64 | tr -d '\n')
+    echo "ss://${encoded}@${ip}:${port}#$(hostname)-SS2022" > "${SS_DIR}/ss.txt"
 }
 
-# ================== 安装逻辑 ==================
-install_ss() {
-    info "准备环境与依赖..."
-    apk add curl wget tar xz openssl iproute2 coreutils >/dev/null 2>&1
+# ================== 功能：仅更新二进制文件 ==================
+update_ss() {
+    if [[ ! -f "$BINARY_PATH" ]]; then
+        error "未发现已安装的服务，请先选择选项 1 安装。"
+        return 1
+    fi
+
+    local current_ver=$(cat "${SS_DIR}/version.txt" 2>/dev/null || echo "未知")
+    info "检测到当前版本: $current_ver"
     
-    # 🛠 修复点：严谨的组和用户创建逻辑
-    if ! getent group "$RUN_GROUP" >/dev/null; then
-        addgroup -S "$RUN_GROUP"
+    local latest_ver=$(get_latest_version)
+    info "最新版本: v$latest_ver"
+
+    if [[ "$current_ver" == "$latest_ver" ]]; then
+        info "当前已是最新版本，无需更新。"
+        return 0
     fi
-    if ! getent passwd "$RUN_USER" >/dev/null; then
-        adduser -S -D -H -G "$RUN_GROUP" -s /sbin/nologin "$RUN_USER"
+
+    info "正在下载新版本二进制文件..."
+    local arch=$(detect_arch)
+    local url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${latest_ver}/shadowsocks-v${latest_ver}.${arch}.tar.xz"
+    
+    cd "$TMP_DIR"
+    if wget -q --show-progress -O ss.tar.xz "$url"; then
+        tar -xf ss.tar.xz
+        rc-service ss-rust stop || true
+        install -m 755 ssserver "$BINARY_PATH"
+        echo "$latest_ver" > "${SS_DIR}/version.txt"
+        rc-service ss-rust start
+        info "更新成功！已升级至 v$latest_ver，配置已保留。"
+    else
+        error "下载失败，请检查网络。"
     fi
+}
+
+# ================== 功能：安装/修改 (略) ==================
+# 此处保留之前的逻辑，仅在选项 2 调用 update_ss
+install_ss() {
+    info "安装环境中..."
+    apk add curl wget tar xz openssl iproute2 coreutils >/dev/null 2>&1
+    getent group "$RUN_GROUP" >/dev/null || addgroup -S "$RUN_GROUP"
+    getent passwd "$RUN_USER" >/dev/null || adduser -S -D -H -G "$RUN_GROUP" -s /sbin/nologin "$RUN_USER"
 
     local ver=$(get_latest_version)
     local arch=$(detect_arch)
     local url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${ver}/shadowsocks-v${ver}.${arch}.tar.xz"
 
-    info "正在下载版本: v$ver"
     cd "$TMP_DIR"
     wget -q --show-progress -O ss.tar.xz "$url"
-    
     tar -xf ss.tar.xz
     install -m 755 ssserver "$BINARY_PATH"
     
     mkdir -p "$SS_DIR"
     echo "$ver" > "${SS_DIR}/version.txt"
-
-    # 初始日志文件处理
     touch "$LOG_FILE"
     chown "${RUN_USER}:${RUN_GROUP}" "$LOG_FILE"
 
-    # 随机初始值
-    local init_port=$((RANDOM % 40000 + 20000))
-    local init_pass=$(openssl rand -base64 32 | tr -d '\n')
+    local def_port=$((RANDOM % 40000 + 20000))
+    local def_pass=$(openssl rand -base64 32 | tr -d '\n')
     
-    # 写入初始配置用于 modify_ss 读取
-    cat > "$SS_CONFIG" <<EOF
-{
-    "server": "::",
-    "server_port": $init_port,
-    "password": "$init_pass",
-    "method": "$METHOD"
-}
-EOF
-    chown -R "${RUN_USER}:${RUN_GROUP}" "$SS_DIR"
+    echo -e "${YELLOW}--- 初始安装配置 ---${RESET}"
+    read -rp "端口 [$def_port]: " user_port; user_port=${user_port:-$def_port}
+    read -rp "密码 [随机]: " user_pass; user_pass=${user_pass:-$def_pass}
+    write_config_and_link "$user_port" "$user_pass" "1.1.1.1,8.8.8.8"
 
-    # 写入 OpenRC 服务脚本
     cat > "$SS_INIT_SCRIPT" <<EOF
 #!/sbin/openrc-run
 name="ss-rust"
@@ -152,63 +157,71 @@ command_background="yes"
 pidfile="/run/\${RC_SVCNAME}.pid"
 output_log="${LOG_FILE}"
 error_log="${LOG_FILE}"
-depend() {
-    need net
-    after firewall
-}
+depend() { need net; }
 EOF
     chmod +x "$SS_INIT_SCRIPT"
     rc-update add ss-rust default
-    
-    # 引导修改配置
-    modify_ss
+    rc-service ss-rust start
+    info "安装完成！"
+    [[ -f "${SS_DIR}/ss.txt" ]] && cat "${SS_DIR}/ss.txt"
 }
 
-# ================== 菜单 ==================
-while true; do
-    clear
-    status=$(rc-service ss-rust status 2>/dev/null | grep -q "started" && echo -e "${GREEN}● 运行中${RESET}" || echo -e "${RED}● 未运行${RESET}")
-    version=$( [ -f "${SS_DIR}/version.txt" ] && echo "v$(cat ${SS_DIR}/version.txt)" || echo "未安装")
-    port=$( [ -f "$SS_CONFIG" ] && grep '"server_port"' "$SS_CONFIG" | grep -oE '[0-9]+' || echo "-")
+modify_ss() {
+    local old_port=$(grep -E '"server_port":' "$SS_CONFIG" | head -n 1 | grep -oE '[0-9]+')
+    local old_pass=$(grep -E '"password":' "$SS_CONFIG" | head -n 1 | cut -d '"' -f4)
+    local old_dns=$(grep -A 5 '"nameserver":' "$SS_CONFIG" | grep -v '"nameserver":' | tr -d ' "[]\n\r\t' | sed 's/,$//' | grep -v '}')
 
-    echo -e "${BLUE}================================${RESET}"
-    echo -e "${BLUE}   SS-Rust 管理面板 (Alpine)    ${RESET}"
-    echo -e "${BLUE}================================${RESET}"
-    echo -e "状态   : $status"
-    echo -e "版本   : ${YELLOW}${version}${RESET}"
-    echo -e "端口   : ${YELLOW}${port}${RESET}"
-    echo -e "${BLUE}================================${RESET}"
-    echo -e "1. 安装 Shadowsocks-Rust"
-    echo -e "2. 卸载 Shadowsocks-Rust"
-    echo -e "3. 修改配置 (端口/密码)"
-    echo -e "4. 启动 / 停止 / 重启"
-    echo -e "5. 查看节点配置 (SS链接)"
-    echo -e "0. 退出"
-    echo -e "${BLUE}================================${RESET}"
+    read -rp "新端口 [$old_port]: " new_port; new_port=${new_port:-$old_port}
+    read -rp "新密码 [$old_pass]: " new_pass; new_pass=${new_pass:-$old_pass}
+    read -rp "新 DNS [$old_dns]: " new_dns; new_dns=${new_dns:-$old_dns}
+
+    write_config_and_link "$new_port" "$new_pass" "$new_dns"
+    rc-service ss-rust restart >/dev/null 2>&1
+    info "配置修改成功！"
+    [[ -f "${SS_DIR}/ss.txt" ]] && cat "${SS_DIR}/ss.txt"
+}
+
+# ================== 菜单循环 ==================
+while true; do
+    if rc-service ss-rust status 2>/dev/null | grep -q "started"; then
+        STATUS="${GREEN}● 运行中${RESET}"
+    else
+        STATUS="${RED}● 未运行${RESET}"
+    fi
+    V_SHOW=$( [ -f "${SS_DIR}/version.txt" ] && echo "v$(cat ${SS_DIR}/version.txt)" || echo "未安装")
+    P_SHOW=$( [ -f "$SS_CONFIG" ] && grep '"server_port"' "$SS_CONFIG" | head -n 1 | grep -oE '[0-9]+' || echo "-")
+
+    clear
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   Shadowsocks-Rust 管理面板    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $STATUS"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${V_SHOW}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${P_SHOW}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}2. 更新 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}3. 卸载 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}6. 停止 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}7. 重启 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 
     read -rp "请输入选项: " choice
     case $choice in
         1) install_ss; pause ;;
-        2) 
-            rc-service ss-rust stop || true
-            rc-update del ss-rust || true
-            rm -f "$SS_INIT_SCRIPT" "$BINARY_PATH"
-            rm -rf "$SS_DIR" "$LOG_FILE"
-            info "已彻底卸载。"; pause ;;
-        3) modify_ss; pause ;;
-        4) 
-            echo -e "1. 启动  2. 停止  3. 重启"
-            read -rp "请选择: " op
-            [[ "$op" == "1" ]] && rc-service ss-rust start
-            [[ "$op" == "2" ]] && rc-service ss-rust stop
-            [[ "$op" == "3" ]] && rc-service ss-rust restart
-            pause ;;
-        5) 
-            if [[ -f "${SS_DIR}/ss.txt" ]]; then
-                info "节点链接:\n${YELLOW}$(cat "${SS_DIR}/ss.txt")${RESET}"
-            else error "链接未生成。"; fi
-            pause ;;
+        2) update_ss; pause ;;
+        3) rc-service ss-rust stop || true; rc-update del ss-rust || true; rm -f "$SS_INIT_SCRIPT" "$BINARY_PATH"; rm -rf "$SS_DIR" "$LOG_FILE"; info "卸载完成"; pause ;;
+        4) modify_ss; pause ;;
+        5) rc-service ss-rust start; pause ;;
+        6) rc-service ss-rust stop; pause ;;
+        7) rc-service ss-rust restart; pause ;;
+        8) tail -f "$LOG_FILE"; pause ;;
+        9) [[ -f "${SS_DIR}/ss.txt" ]] && cat "${SS_DIR}/ss.txt" || error "未生成"; pause ;;
         0) exit 0 ;;
-        *) sleep 0.5 ;;
     esac
 done

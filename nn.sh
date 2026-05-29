@@ -1,452 +1,278 @@
-#!/bin/bash
-set -euo pipefail
+#!/bin/sh
+# =========================================
+#  Docker 一键部署脚本 (Alpine Linux)
+# =========================================
 
-# =========================================================
-# AnyTLS 一键部署脚本 (Alpine Linux)
-# =========================================================
+set -e
 
-# ================== 颜色定义 ==================
+# ================== 颜色 ==================
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
-BLUE="\033[34m"
 CYAN="\033[36m"
+BOLD="\033[1m"
 RESET="\033[0m"
 
-# ================== 基础变量 ==================
-SCRIPT_VERSION="1.3"
-SERVICE_NAME="anytls"
-BINARY_NAME="anytls-server"
-BINARY_DIR="/usr/local/bin"
-BINARY_PATH="${BINARY_DIR}/${BINARY_NAME}"
-
-ANYTLS_DIR="/etc/anytls"
-ANYTLS_CONFIG="${ANYTLS_DIR}/config.env"
-ANYTLS_SERVICE="/etc/init.d/${SERVICE_NAME}"
-LOG_FILE="/var/log/anytls-manager.log"
-RUN_USER="anytls"
-
-TMP_DIR=$(mktemp -d -t anytls.XXXXXX)
-
-# ================== Root 检查 ==================
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}[错误] 请使用 root 运行${RESET}"
-    exit 1
-fi
-
-# ================== 清理 ==================
-cleanup() {
-    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
-}
-trap cleanup EXIT INT TERM
-
-# ================== 日志 ==================
-log() {
-    echo "$(date '+%F %T') - $1" >> "$LOG_FILE"
-}
+info() { echo -e "${GREEN}[INFO] $1${RESET}"; }
+warn() { echo -e "${YELLOW}[WARN] $1${RESET}"; }
+error() { echo -e "${RED}[ERROR] $1${RESET}"; }
 
 pause() {
-    read -n1 -s -r -p "按任意键返回菜单..." < /dev/tty
-    echo
+    read -p "$(echo -e ${GREEN}按回车键返回菜单...${RESET})" dummy
 }
 
-# ================== 用户与组创建 ==================
-create_user() {
-    getent group "$RUN_USER" &>/dev/null || \
-        addgroup -S "$RUN_USER"
-
-    id "$RUN_USER" &>/dev/null || \
-        adduser -S -D -H -G "$RUN_USER" -s /sbin/nologin "$RUN_USER"
-}
-
-# ================== 公网IP ==================
-get_public_ip() {
-    local ip
-    for cmd in "curl -4fsSL --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in \
-            "https://api.ipify.org" \
-            "https://ip.sb" \
-            "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && {
-                echo "$ip"
-                return
-            }
-        done
-    done
-
-    for cmd in "curl -6fsSL --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in \
-            "https://api64.ipify.org" \
-            "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && {
-                echo "[$ip]"
-                return
-            }
-        done
-    done
-
-    echo "无法获取公网IP"
-}
-
-# ================== 依赖 ==================
-check_deps() {
-    apk add --no-cache curl wget unzip iproute2 bash
-}
-
-# ================== 端口 ==================
-check_port() {
-    if ss -tulnH "( sport = :$1 )" | grep -q . || return 0; then
-        echo -e "${RED}端口 $1 已占用${RESET}"
-        return 1
+root_use() {
+    if [ "$(id -u)" -ne 0 ]; then
+        error "请使用 root 用户运行此脚本"
+        exit 1
     fi
 }
 
-random_port() {
-    awk 'BEGIN{srand(); print int(rand()*(65000-10000+1))+10000}'
+# ================== Docker 功能 ==================
+install_docker() {
+    info "更新 apk 源..."
+    apk update
+    apk upgrade
+
+    info "安装 Docker..."
+    apk add docker py3-pip curl
+
+    info "安装 Docker Compose V2..."
+    COMPOSE_LATEST=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+    curl -L "https://github.com/docker/compose/releases/download/v$COMPOSE_LATEST/docker-compose-linux-x86_64" -o /usr/local/bin/docker-compose
+    chmod +x /usr/local/bin/docker-compose
+
+    info "设置 Docker 开机自启..."
+    rc-update add docker boot
+
+    info "启动 Docker 服务..."
+    service docker start
+
+    info "验证安装..."
+    docker version
+    docker-compose version
+    pause
 }
 
-random_password() {
-    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c16 || true
+update_docker() {
+    info "更新 apk 源..."
+    apk update
+    apk upgrade
+
+    info "更新 Docker..."
+    apk add --upgrade docker
+
+    info "更新 Docker Compose V2..."
+    COMPOSE_LATEST=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+    curl -L "https://github.com/docker/compose/releases/download/v$COMPOSE_LATEST/docker-compose-linux-x86_64" -o /usr/local/bin/docker-compose
+    chmod +x /usr/local/bin/docker-compose
+
+    info "重启 Docker 服务..."
+    service docker restart
+
+    info "更新完成"
+    docker version
+    docker-compose version
+    pause
 }
 
-# ================== 架构 ==================
-detect_arch() {
-    case "$(uname -m)" in
-        x86_64) echo amd64 ;;
-        aarch64) echo arm64 ;;
-        armv7l) echo armv7 ;;
-        *)
-            echo -e "${RED}不支持架构 $(uname -m)${RESET}"
-            exit 1
+uninstall_docker() {
+    info "停止 Docker 服务..."
+    service docker stop || true
+
+    info "卸载 Docker 和 Docker Compose..."
+    apk del docker py3-pip
+    rm -f /usr/local/bin/docker-compose
+
+    info "移除开机自启..."
+    rc-update del docker
+
+    info "卸载完成"
+    pause
+}
+
+restart_docker() {
+    info "重启 Docker 服务..."
+    service docker restart
+    pause
+}
+
+check_status() {
+    if service docker status >/dev/null 2>&1; then
+        info "Docker 服务正在运行"
+    else
+        warn "Docker 服务未运行"
+    fi
+    pause
+}
+
+# ================== 容器管理 ==================
+container_menu() {
+    echo -e "${GREEN}===== 容器管理 =====${RESET}"
+    echo -e "${GREEN}1) 查看所有容器${RESET}"
+    echo -e "${GREEN}2) 启动容器${RESET}"
+    echo -e "${GREEN}3) 停止容器${RESET}"
+    echo -e "${GREEN}4) 删除容器${RESET}"
+    echo -e "${GREEN}0) 返回主菜单${RESET}"
+    read -p "$(echo -e ${GREEN}请选择: ${RESET})" c_choice
+    case $c_choice in
+        1)
+            docker ps -a
+            pause
             ;;
-    esac
-}
-
-# ================== 自动获取 GitHub 最新版本号 ==================
-get_latest_version() {
-    local latest_release
-    latest_release=$(curl -fsSL --max-time 5 "https://api.github.com/repos/anytls/anytls-go/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
-    if [[ -z "$latest_release" ]]; then
-        latest_release=$(curl -fsSLI --max-time 5 "https://github.com/anytls/anytls-go/releases/latest" 2>/dev/null | grep -i 'location:' | sed -E 's/.*\/v?([^/\r\n]+).*/\1/')
-    fi
-    echo "${latest_release:-0.0.12}"
-}
-
-# ================== 配置 ==================
-write_config() {
-    mkdir -p "$ANYTLS_DIR"
-    cat > "$ANYTLS_CONFIG" <<EOF
-ANYTLS_PORT=$1
-ANYTLS_PASSWORD=$2
-EOF
-    chmod 600 "$ANYTLS_CONFIG"
-    chown -R ${RUN_USER}:${RUN_USER} "$ANYTLS_DIR"
-}
-
-# ================== 输出节点 (修复 local 问题) ==================
-output_node_links() {
-    local ip port_num pwd_str hostname
-    port_num=$1
-    pwd_str=$2
-    ip=$(get_public_ip)
-    hostname=$(hostname | cut -d. -f1 | sed 's/ /_/g')
-
-    echo -e "${GREEN}====== AnyTLS 节点信息 ======${RESET}"
-    echo -e "${YELLOW}IP      : ${ip}${RESET}"
-    echo -e "${YELLOW}端口    : ${port_num}${RESET}"
-    echo -e "${YELLOW}密码    : ${pwd_str}${RESET}"
-    echo -e "${GREEN}---------------------------${RESET}"
-    echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
-    echo -e "${YELLOW}[信息] V2rayN 链接：${RESET}"
-    echo -e "${CYAN}anytls://${pwd_str}@${ip}:${port_num}/?insecure=1#${hostname}-Anytls${RESET}"
-    echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
-    echo -e "${CYAN}${hostname}-Anytls = anytls, ${ip}, ${port_num}, password=${pwd_str}, tfo=true, skip-cert-verify=true, reuse=false${RESET}"
-    echo -e "${YELLOW}---------------------------------${RESET}"
-}
-
-# ================== 安装 ==================
-install_ss() {
-    echo -e "${GREEN}[信息] 开始安装 AnyTLS...${RESET}"
-
-    check_deps
-    create_user
-    mkdir -p "$ANYTLS_DIR"
-
-    local arch
-    arch=$(detect_arch)
-
-    echo -e "${GREEN}[信息] 正在获取 AnyTLS 最新版本...${RESET}"
-    local version
-    version=$(get_latest_version)
-    echo -e "${GREEN}[信息] 检测到最新版本为: v${version}${RESET}"
-
-    local url="https://github.com/anytls/anytls-go/releases/download/v${version}/anytls_${version}_linux_${arch}.zip"
-
-    cd "$TMP_DIR"
-    wget "$url" -O anytls.zip
-    unzip -o anytls.zip -d "$TMP_DIR"
-
-    local real_binary_path
-    real_binary_path=$(find "$TMP_DIR" -type f -name "$BINARY_NAME" | head -n 1)
-    if [[ -z "$real_binary_path" ]]; then
-        echo -e "${RED}[错误] 压缩包内未找到可执行程序 ${BINARY_NAME}${RESET}"
-        return 1
-    fi
-
-    install -m755 "$real_binary_path" "$BINARY_PATH"
-    echo "$version" > "${ANYTLS_DIR}/version.txt"
-
-    local port input_port
-    while true; do
-        read -p "请输入监听端口 (默认随机): " input_port < /dev/tty
-        port=${input_port:-$(random_port)}
-
-        if [[ "$port" =~ ^[0-9]+$ ]] &&
-            [ "$port" -ge 1 ] &&
-            [ "$port" -le 65535 ]; then
-
-            check_port "$port" || continue
-            break
-        fi
-
-        echo -e "${RED}端口无效${RESET}"
-    done
-
-    local input_password password
-    read -p "请输入密码 (默认随机): " input_password < /dev/tty
-    password=${input_password:-$(random_password)}
-
-    write_config "$port" "$password"
-
-    cat > "$ANYTLS_SERVICE" <<'EOF'
-#!/sbin/openrc-run
-
-description="AnyTLS Service"
-cfgfile="/etc/anytls/config.env"
-command="/usr/local/bin/anytls-server"
-
-depend() {
-    need net
-    after firewall
-}
-
-start_pre() {
-    if [ ! -f "$cfgfile" ]; then
-        eerror "Configuration file $cfgfile missing!"
-        return 1
-    fi
-    . "$cfgfile"
-    command_args="-l :${ANYTLS_PORT} -p ${ANYTLS_PASSWORD}"
-    
-    command_background="yes"
-    pidfile="/run/${RC_SVCNAME}.pid"
-    
-    if [ "${ANYTLS_PORT}" -lt 1024 ]; then
-        command_user="root:root"
-    else
-        command_user="anytls:anytls"
-    fi
-}
-EOF
-    chmod +x "$ANYTLS_SERVICE"
-
-    rc-update add "$SERVICE_NAME" default
-    rc-service "$SERVICE_NAME" restart
-
-    if ! rc-service "$SERVICE_NAME" status | grep -q "started"; then
-        echo -e "${RED}AnyTLS 启动失败${RESET}"
-        return 1
-    fi
-
-    echo -e "${GREEN}[完成] AnyTLS 安装成功${RESET}"
-    output_node_links "$port" "$password"
-    log "安装成功"
-}
-
-# ================== 更新 AnyTLS 主程序 (移除二次确认) ==================
-update_ss() {
-    if [[ ! -f "${ANYTLS_DIR}/version.txt" || ! -f "$ANYTLS_CONFIG" ]]; then
-        echo -e "${RED}[错误] 未检测到已安装的 AnyTLS 服务，请先执行安装。${RESET}"
-        return 1
-    fi
-
-    local current_version
-    current_version=$(cat "${ANYTLS_DIR}/version.txt")
-    
-    echo -e "${GREEN}[信息] 正在获取最新版本...${RESET}"
-    local latest_version
-    latest_version=$(get_latest_version)
-
-    echo -e "${GREEN}当前版本: v${current_version}${RESET}"
-    echo -e "${GREEN}最新版本: v${latest_version}${RESET}"
-
-    echo -e "${GREEN}[信息] 开始升级主程序到 v${latest_version}...${RESET}"
-    local arch
-    arch=$(detect_arch)
-    local url="https://github.com/anytls/anytls-go/releases/download/v${latest_version}/anytls_${latest_version}_linux_${arch}.zip"
-
-    cd "$TMP_DIR"
-    wget "$url" -O anytls.zip || { echo -e "${RED}下载失败${RESET}"; return 1; }
-    unzip -o anytls.zip -d "$TMP_DIR"
-
-    local real_binary_path
-    real_binary_path=$(find "$TMP_DIR" -type f -name "$BINARY_NAME" | head -n 1)
-    if [[ -z "$real_binary_path" ]]; then
-        echo -e "${RED}[错误] 压缩包内未找到可执行程序 ${BINARY_NAME}${RESET}"
-        return 1
-    fi
-
-    rc-service "$SERVICE_NAME" stop || true
-    install -m755 "$real_binary_path" "$BINARY_PATH"
-    echo "$latest_version" > "${ANYTLS_DIR}/version.txt"
-    rc-service "$SERVICE_NAME" start
-
-    if rc-service "$SERVICE_NAME" status | grep -q "started"; then
-        echo -e "${GREEN}[完成] AnyTLS 成功升级至 v${latest_version}!${RESET}"
-        log "升级成功至 v${latest_version}"
-    else
-        echo -e "${RED}[错误] 升级后服务启动失败，请检查日志。${RESET}"
-    fi
-}
-
-# ================== 修改配置 ==================
-modify_ss() {
-    [[ -f "$ANYTLS_CONFIG" ]] || {
-        echo -e "${RED}配置不存在${RESET}"
-        return
-    }
-
-    ANYTLS_PORT=$(grep 'ANYTLS_PORT=' "$ANYTLS_CONFIG" | cut -d= -f2)
-    ANYTLS_PASSWORD=$(grep 'ANYTLS_PASSWORD=' "$ANYTLS_CONFIG" | cut -d= -f2)
-
-    echo "当前端口: $ANYTLS_PORT"
-    echo "当前密码: $ANYTLS_PASSWORD"
-
-    local port password
-
-    read -p "新端口 [当前:${ANYTLS_PORT}]: " port < /dev/tty
-    port=${port:-$ANYTLS_PORT}
-
-    if [[ "$port" != "$ANYTLS_PORT" ]]; then
-        check_port "$port" || return 1
-    fi
-
-    read -p "新密码 [默认保持]: " password < /dev/tty
-    password=${password:-$ANYTLS_PASSWORD}
-
-    write_config "$port" "$password"
-    rc-service "$SERVICE_NAME" restart
-
-    echo -e "${GREEN}修改成功${RESET}"
-    output_node_links "$port" "$password"
-}
-
-# ================== 卸载 ==================
-uninstall_ss() {
-    rc-service "$SERVICE_NAME" stop || true
-    rc-update del "$SERVICE_NAME" default || true
-
-    rm -f "$ANYTLS_SERVICE"
-    rm -f "$BINARY_PATH"
-    rm -rf "$ANYTLS_DIR"
-
-    deluser "$RUN_USER" &>/dev/null || true
-    delgroup "$RUN_USER" &>/dev/null || true
-
-    echo -e "${GREEN}卸载完成${RESET}"
-}
-
-start_pre() {
-    if [ ! -f "$cfgfile" ]; then
-        eerror "Configuration file $cfgfile missing!"
-        return 1
-    fi
-    . "$cfgfile"
-    command_args="-l :${ANYTLS_PORT} -p ${ANYTLS_PASSWORD}"
-    
-    command_background="yes"
-    pidfile="/run/${RC_SVCNAME}.pid"
-    
-    output_log="/var/log/anytls.log"
-    error_log="/var/log/anytls.log"
-    
-    if [ "${ANYTLS_PORT}" -lt 1024 ]; then
-        command_user="root:root"
-    else
-        command_user="anytls:anytls"
-    fi
-}
-
-# ================== 菜单 ==================
-show_menu() {
-    clear
-    local status
-    if rc-service "$SERVICE_NAME" status 2>/dev/null | grep -q "started"; then
-        status="${GREEN}●运行中${RESET}"
-    else
-        status="${RED}●未运行${RESET}"
-    fi
-
-    local version="未安装"
-    [[ -f "${ANYTLS_DIR}/version.txt" ]] &&
-        version="v$(cat "${ANYTLS_DIR}/version.txt")"
-
-    local port="-"
-    [[ -f "$ANYTLS_CONFIG" ]] &&
-        port=$(grep 'ANYTLS_PORT=' "$ANYTLS_CONFIG" | cut -d= -f2)
-
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}    AnyTLS 管理面板   ${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}版本 :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port}${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}1. 安装 AnyTLS${RESET}"
-    echo -e "${GREEN}2. 更新 AnyTLS${RESET}"
-    echo -e "${GREEN}3. 卸载 AnyTLS${RESET}"
-    echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 AnyTLS${RESET}"
-    echo -e "${GREEN}6. 停止 AnyTLS${RESET}"
-    echo -e "${GREEN}7. 重启 AnyTLS${RESET}"
-    echo -e "${GREEN}8. 查看状态${RESET}"
-    echo -e "${GREEN}9. 查看节点配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-}
-
-# ================== 主循环 ==================
-while true; do
-    show_menu
-
-    set +e
-    read -r -p $'\033[32m请输入选项: \033[0m' choice < /dev/tty
-    set -e
-
-    case $choice in
-        1) install_ss; pause ;;
-        2) update_ss; pause ;;
-        3) uninstall_ss; pause ;;
-        4) modify_ss; pause ;;
-        5) rc-service "$SERVICE_NAME" start; echo -e "${GREEN}[完成] AnyTLS 已启动${RESET}"; pause ;;
-        6) rc-service "$SERVICE_NAME" stop; echo -e "${GREEN}[完成] AnyTLS 已停止${RESET}"; pause ;;
-        7) rc-service "$SERVICE_NAME" restart; echo -e "${GREEN}[完成] AnyTLS 已重启${RESET}"; pause ;;
-        8) view_app_log; pause ;;
-        9)
-            if [[ -f "$ANYTLS_CONFIG" ]]; then
-                # 去掉 local 关键字，安全读取并传递给函数
-                c_port=$(grep 'ANYTLS_PORT=' "$ANYTLS_CONFIG" | cut -d= -f2)
-                c_pass=$(grep 'ANYTLS_PASSWORD=' "$ANYTLS_CONFIG" | cut -d= -f2)
-                output_node_links "$c_port" "$c_pass"
+        2)
+            read -p "容器名称/ID: " cid
+            [ -n "$cid" ] && docker start "$cid" && info "容器 $cid 已启动" || warn "容器名称或ID不能为空"
+            pause
+            ;;
+        3)
+            read -p "容器名称/ID: " cid
+            [ -n "$cid" ] && docker stop "$cid" && info "容器 $cid 已停止" || warn "容器名称或ID不能为空"
+            pause
+            ;;
+        4)
+            read -p "容器名称/ID: " cid
+            if [ -n "$cid" ]; then
+                [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)" = "true" ] && docker stop "$cid"
+                docker rm "$cid"
+                info "容器 $cid 已删除"
             else
-                echo -e "${RED}[错误] 配置文件不存在，请先安装。${RESET}"
+                warn "容器名称或ID不能为空"
             fi
             pause
             ;;
-        0) exit 0 ;;
-        *)
-            echo -e "${RED}无效输入${RESET}"
-            pause
-            ;;
+        0) return ;;
+        *) warn "无效选项"; pause ;;
     esac
-done
+    container_menu
+}
+
+# ================== 镜像管理 ==================
+image_menu() {
+    echo -e "${GREEN}===== 镜像管理 =====${RESET}"
+    echo -e "${GREEN}1) 查看镜像列表${RESET}"
+    echo -e "${GREEN}2) 拉取镜像${RESET}"
+    echo -e "${GREEN}3) 删除镜像${RESET}"
+    echo -e "${GREEN}0) 返回主菜单${RESET}"
+    read -p "请选择: " i_choice
+    case $i_choice in
+        1) docker images; pause ;;
+        2) read -p "镜像名称: " img; docker pull "$img"; pause ;;
+        3) read -p "镜像名称/ID: " img; docker rmi "$img"; pause ;;
+        0) return ;;
+        *) warn "无效选项"; pause ;;
+    esac
+    image_menu
+}
+
+# ================== 卷管理 ==================
+volume_menu() {
+    echo -e "${GREEN}===== 卷管理 =====${RESET}"
+    echo -e "${GREEN}1) 查看卷列表${RESET}"
+    echo -e "${GREEN}2) 删除卷${RESET}"
+    echo -e "${GREEN}0) 返回主菜单${RESET}"
+    read -p "请选择: " v_choice
+    case $v_choice in
+        1) docker volume ls; pause ;;
+        2) read -p "卷名称: " vol; docker volume rm "$vol"; pause ;;
+        0) return ;;
+        *) warn "无效选项"; pause ;;
+    esac
+    volume_menu
+}
+
+# ================== IPv6 开关 ==================
+ipv6_menu() {
+    while true; do
+        IPV6_STATUS=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)
+        CURRENT_STATUS=$([ "$IPV6_STATUS" -eq 0 ] && echo "启用" || echo "禁用")
+        echo -e "${GREEN}===== IPv6 设置 =====${RESET}"
+        echo -e "${YELLOW}当前 IPv6 状态: $CURRENT_STATUS${RESET}"
+        echo -e "${GREEN}1) 启用 IPv6${RESET}"
+        echo -e "${GREEN}2) 禁用 IPv6${RESET}"
+        echo -e "${GREEN}0) 返回主菜单${RESET}"
+        read -p "请选择: " ip_choice
+        case $ip_choice in
+            1) echo 0 > /proc/sys/net/ipv6/conf/all/disable_ipv6
+               grep -q "^net.ipv6.conf.all.disable_ipv6" /etc/sysctl.conf || echo "net.ipv6.conf.all.disable_ipv6 = 0" >> /etc/sysctl.conf
+               sysctl -p >/dev/null 2>&1 || true
+               info "IPv6 已启用"; pause ;;
+            2) echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6
+               grep -q "^net.ipv6.conf.all.disable_ipv6" /etc/sysctl.conf || echo "net.ipv6.conf.all.disable_ipv6 = 1" >> /etc/sysctl.conf
+               sysctl -p >/dev/null 2>&1 || true
+               info "IPv6 已禁用"; pause ;;
+            0) break ;;
+            *) warn "无效选项" ;;
+        esac
+    done
+}
+
+# ================== 开放所有端口 ==================
+open_all_ports() {
+    info "开放所有 TCP/UDP 端口..."
+    iptables -F
+    iptables -P INPUT ACCEPT
+    iptables -P FORWARD ACCEPT
+    iptables -P OUTPUT ACCEPT
+    info "已开放所有端口"
+    pause
+}
+
+# ================== Docker 清理 ==================
+cleanup_docker() {
+    docker system prune -af --volumes
+    info "已清理所有未使用容器/镜像/卷"
+    pause
+}
+
+
+# ================== 主菜单 ==================
+main_menu() {
+    root_use
+    while true; do
+        clear
+        if command -v docker >/dev/null 2>&1; then
+            docker_status=$(docker info >/dev/null 2>&1 && echo "运行中" || echo "未运行")
+            total_containers=$(docker ps -a -q 2>/dev/null | wc -l)
+            running_containers=$(docker ps -q 2>/dev/null | wc -l)
+        else
+            docker_status="未安装"
+            total_containers=0
+            running_containers=0
+        fi
+
+        IPV6_STATUS=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)
+        ipv6_display=$([ "$IPV6_STATUS" -eq 0 ] && echo "启用" || echo "禁用")
+
+        echo -e "${GREEN}============ Docker 管理 ============${RESET}"
+        echo -e "${YELLOW}🐳 | Docker: $docker_status | 容器: $running_containers/$total_containers"
+        echo -e "${GREEN} 1) 安装/更新Docker${RESET}"
+        echo -e "${GREEN} 2) 安装/更新DockerCompose${RESET}"
+        echo -e "${GREEN} 3) 卸载Docker&Compose${RESET}"
+        echo -e "${GREEN} 4) 容器管理${RESET}"
+        echo -e "${GREEN} 5) 镜像管理${RESET}"
+        echo -e "${GREEN} 6) 卷管理${RESET}"
+        echo -e "${GREEN} 7) IPv6开关${RESET}"
+        echo -e "${GREEN} 8) 开放所有端口${RESET}"
+        echo -e "${GREEN} 9) 一键清理所有未使用容器/镜像/卷${RESET}"
+        echo -e "${GREEN}10) 重启Docker${RESET}"
+        echo -e "${GREEN} 0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN} 请选择:${RESET})" choice
+        case $choice in
+            1) install_docker ;;
+            2) update_docker ;;
+            3) uninstall_docker ;;
+            4) container_menu ;;
+            5) image_menu ;;
+            6) volume_menu ;;
+            7) ipv6_menu ;;
+            8) open_all_ports ;;
+            9) cleanup_docker ;;
+            10) restart_docker ;;
+            0) exit 0 ;;
+            *) warn "无效选择"; pause ;;
+        esac
+    done
+}
+
+main_menu

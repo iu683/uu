@@ -1,308 +1,486 @@
-#!/bin/bash
-
+#!/usr/bin/env bash
+#
+# 多后端自动适配 Socks5 管理面板 
+# SPDX-License-Identifier: MIT
+#
 # =========================================================
-# Shadowsocks-Rust 管理脚本 (Alpine Linux )
+# 1. 核心控制与全局环境初始化
 # =========================================================
+set -Eop pipefail
+export LANG=en_US.UTF-8
 
-set -euo pipefail
+# 基础目录与硬编码配置
+WORKDIR="${HOME:-/root}/Socks5"
+readonly PID_FILE="${WORKDIR}/s5.pid"
+readonly META_FILE="${WORKDIR}/meta.env"
+readonly CONFIG_S5="${WORKDIR}/config.json"
+readonly CONFIG_3PROXY="${WORKDIR}/3proxy.cfg"
+readonly SERVICE_FILE="/etc/systemd/system/s5.service"
 
-# ================== 颜色 ==================
+DEFAULT_PORT=1080
+PREFERRED_IMPLS=("s5" "3proxy" "microsocks" "ss5" "danted" "sockd")
+
+# 终端颜色代码
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 BLUE="\033[34m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-# ================== 基础变量 ==================
-SS_DIR="/etc/ss-rust"
-SS_CONFIG="${SS_DIR}/config.json"
-SS_INIT_SCRIPT="/etc/init.d/ss-rust"
-BINARY_PATH="/usr/local/bin/ssserver"
-LOG_FILE="/var/log/ss-rust.log"
-RUN_USER="ss-rust"
-RUN_GROUP="ss-rust"
-METHOD="2022-blake3-aes-256-gcm"
-TMP_DIR=$(mktemp -d -t ss-rust.XXXXXX)
-
-# ================== 工具函数 ==================
-info() { echo -e "${GREEN}[信息] $*${RESET}"; }
-error() { echo -e "${RED}[错误] $*${RESET}"; }
-pause() { echo; echo -ne "${GREEN}按任意键返回菜单...${RESET}"; read -n 1 -s; echo; }
-
-get_latest_version() {
-    curl -fsSL "https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest" | \
-    grep '"tag_name":' | head -n 1 | sed -E 's/.*"v?([^"]+)".*/\1/'
+# =========================================================
+# 2. 官方原生底层工具函数与网络环境探测
+# =========================================================
+has_command() {
+  local _command=$1
+  type -P "$_command" > /dev/null 2>&1
 }
 
-detect_arch() {
-    case "$(uname -m)" in
-        x86_64)  echo "x86_64-unknown-linux-musl" ;;
-        aarch64) echo "aarch64-unknown-linux-musl" ;;
-        *) error "不支持的架构: $(uname -m)"; exit 1 ;;
+info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
+error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
+pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
+
+systemctl() {
+  if ! has_command systemctl; then
+    warn "当前系统不支持 systemd，忽略守护进程操作: systemctl $*"
+    return 0
+  fi
+  command systemctl "$@"
+}
+
+ensure_workdir() {
+  mkdir -p "${WORKDIR}"
+  chmod 700 "${WORKDIR}"
+}
+
+random_port() {
+  shuf -i 20000-60000 -n 1
+}
+
+random_user() {
+  echo "s5_$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 6)"
+}
+
+random_pass() {
+  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12 || echo "s5pass123"
+}
+
+get_best_ip() {
+  local ip
+  for svc in "https://icanhazip.com" "https://ifconfig.me" "https://ipinfo.io/ip" "https://4.ipw.cn"; do
+    ip=$(curl -s --max-time 5 "$svc" || true)
+    ip=$(echo "$ip" | tr -d '[:space:]')
+    if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      echo "$ip"
+      return 0
+    fi
+  done
+
+  if has_command ip; then
+    ip=$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {print $7; exit}')
+    ip=$(echo "$ip" | tr -d '[:space:]')
+    if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      echo "$ip"
+      return 0
+    fi
+  fi
+
+  echo "127.0.0.1"
+}
+
+urlencode() {
+  local s="$1"
+  if has_command python3; then
+    python3 -c "import sys,urllib.parse as u; print(u.quote(sys.argv[1], safe=''))" "$s"
+  elif has_command python; then
+    python -c "import sys,urllib as u; print(u.quote(sys.argv[1]))" "$s"
+  else
+    printf '%s' "$s"
+  fi
+}
+
+# =========================================================
+# 3. 后端组件检测与多包管理器自动安装
+# =========================================================
+detect_existing_impl() {
+  for impl in "${PREFERRED_IMPLS[@]}"; do
+    case "${impl}" in
+      s5|3proxy|microsocks|ss5)
+        if has_command "${impl}"; then echo "${impl}"; return 0; fi
+        ;;
+      danted|sockd)
+        if has_command sockd || has_command danted; then echo "danted"; return 0; fi
+        ;;
     esac
+  done
+  echo ""
 }
 
-get_vps_dns() {
-    local dns_list=$(grep -E '^nameserver' /etc/resolv.conf | awk '{print $2}' | paste -sd "," -)
-    echo "${dns_list:-"1.1.1.1,8.8.8.8"}"
+try_install_package() {
+  local pkg_name="$1"
+  info "正在尝试通过包管理器部署相关组件: ${pkg_name}..."
+  if has_command apt-get; then
+    apt-get update -y && apt-get install -y "${pkg_name}" && return 0
+  elif has_command dnf; then
+    dnf install -y "${pkg_name}" && return 0
+  elif has_command yum; then
+    yum install -y "${pkg_name}" && return 0
+  elif has_command apk; then
+    apk add --no-cache "${pkg_name}" && return 0
+  elif has_command pacman; then
+    pacman -Sy --noconfirm "${pkg_name}" && return 0
+  fi
+  return 1
 }
 
-# 公网IP获取
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    error "无法获取公网 IP 地址。" && return 1
-}
-
-# ================== 核心：写入配置 ==================
-write_config_and_link() {
-    local port=$1
-    local pass=$2
-    local dns_str=$3
-    
-    dns_str=$(echo "$dns_str" | tr -d ' ')
-    local dns_json=$(echo "\"${dns_str//,/\",\"}\"")
-
-    cat > "$SS_CONFIG" <<EOF
+# =========================================================
+# 4. 核心配置文件与守护进程服务生成
+# =========================================================
+generate_backend_config() {
+  case "${BIN_TYPE}" in
+    3proxy)
+      cat << EOF > "${CONFIG_3PROXY}"
+daemon
+maxconn 100
+nserver 8.8.8.8
+nserver 8.8.4.4
+timeouts 1 5 30 60 180 1800 15 60
+users ${USERNAME}:CL:${PASSWORD}
+auth strong
+allow ${USERNAME}
+socks -p${PORT}
+EOF
+      chmod 600 "${CONFIG_3PROXY}"
+      ;;
+    s5)
+      cat << EOF > "${CONFIG_S5}"
 {
-    "server": "::",
-    "server_port": $port,
-    "password": "$pass",
-    "method": "$METHOD",
-    "fast_open": true,
-    "mode": "tcp_and_udp",
-    "timeout": 300,
-    "no_delay": true,
-    "ipv6_first": false,
-    "nameserver": [$dns_json]
+  "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
+  "inbounds": [{
+    "port": ${PORT},
+    "protocol": "socks",
+    "tag": "socks",
+    "settings": {
+      "auth": "password",
+      "udp": false,
+      "ip": "0.0.0.0",
+      "userLevel": 0,
+      "accounts": [{"user": "${USERNAME}", "pass": "${PASSWORD}"}]
+    }
+  }],
+  "outbounds": [{"tag": "direct", "protocol": "freedom"}]
 }
 EOF
-    chown "${RUN_USER}:${RUN_GROUP}" "$SS_CONFIG"
-    chmod 600 "$SS_CONFIG"
-
-    local ip=$(get_public_ip)
-    [[ "$ip" =~ : ]] && ip="[$ip]"
-    local encoded=$(echo -n "${METHOD}:${pass}" | base64 | tr -d '\n')
-    echo "ss://${encoded}@${ip}:${port}#$(hostname)-SS2022" > "${SS_DIR}/ss.txt"
-    echo "${HOSTNAME}-SS2022 = ss, ${ip}, ${port}, encrypt-method=${METHOD}, password=${pass}, tfo=true, udp-relay=true, ecn=true" > "${SS_DIR}/Surge.txt"
+      chmod 600 "${CONFIG_S5}"
+      ;;
+  esac
 }
 
-show_node_info() {
-    if [[ -f "${SS_CONFIG}" ]]; then
-        local ip port pass
+create_start_script() {
+  cat << 'EOF' > "${WORKDIR}/start.sh"
+#!/usr/bin/env bash
+WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${WORKDIR}/meta.env" ]; then
+  source "${WORKDIR}/meta.env"
+else
+  echo "核心环境配置文件 meta.env 丢失"
+  exit 1
+fi
 
-        ip=$(get_public_ip)
-        port=$(grep -E '"server_port":' "$SS_CONFIG" | grep -oE '[0-9]+' | head -n1)
-        pass=$(grep -E '"password":' "$SS_CONFIG" | cut -d '"' -f4 | head -n1)
-
-        [[ "$ip" =~ : ]] && ip="[$ip]"
-
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${YELLOW}       Shadowsocks 节点信息      ${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-
-        echo -e "${YELLOW} IP地址        : ${ip}${RESET}"
-        echo -e "${YELLOW} 端口          : ${port}${RESET}"
-        echo -e "${YELLOW} 密码          : ${pass}${RESET}"
-        echo -e "${YELLOW} 加密          : ${METHOD}${RESET}"
-
-        echo -e "${YELLOW}---------------------------------${RESET}"
-        echo -e "${YELLOW}📄 V6 VPS 请替换为 IPv6 地址 ★${RESET}"
-
-        echo
-        echo -e "${GREEN}SS 链接:${RESET}"
-        [[ -f "${SS_DIR}/ss.txt" ]] && echo -e "${YELLOW}$(cat "${SS_DIR}/ss.txt")${RESET}"
-
-        echo
-        echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
-        [[ -f "${SS_DIR}/Surge.txt" ]] && echo -e "${YELLOW}$(cat "${SS_DIR}/Surge.txt")${RESET}"
-
-        echo -e "${BLUE}================================${RESET}"
-    else
-        error "配置不存在。"
-    fi
-}
-
-# ================== 功能：安装 ==================
-install_ss() {
-    info "正在准备安装环境..."
-    apk add curl wget tar xz openssl iproute2 coreutils >/dev/null 2>&1
-    
-    getent group "$RUN_GROUP" >/dev/null || addgroup -S "$RUN_GROUP"
-    getent passwd "$RUN_USER" >/dev/null || adduser -S -D -H -G "$RUN_GROUP" -s /sbin/nologin "$RUN_USER"
-
-    local ver=$(get_latest_version)
-    local arch=$(detect_arch)
-    local url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${ver}/shadowsocks-v${ver}.${arch}.tar.xz"
-
-    info "正在下载 Shadowsocks-Rust v$ver..."
-    cd "$TMP_DIR"
-    wget -q --show-progress -O ss.tar.xz "$url"
-    tar -xf ss.tar.xz
-    install -m 755 ssserver "$BINARY_PATH"
-    
-    mkdir -p "$SS_DIR"
-    echo "$ver" > "${SS_DIR}/version.txt"
-    touch "$LOG_FILE"
-    chown "${RUN_USER}:${RUN_GROUP}" "$LOG_FILE"
-
-    local def_port=$((RANDOM % 40000 + 20000))
-    local def_pass=$(openssl rand -base64 32 | tr -d '\n')
-    local def_dns=$(get_vps_dns)
-
-    echo -e "${YELLOW}--- 自定义配置 (回车使用随机默认值) ---${RESET}"
-    read -rp "$(echo -e ${GREEN}"设置端口 [默认 $def_port]: "${RESET})" user_port
-    user_port=${user_port:-$def_port}
-    read -rp "$(echo -e ${GREEN}"设置密码 [默认随机生成]: "${RESET})" user_pass
-    user_pass=${user_pass:-$def_pass}
-    read -rp "$(echo -e ${GREEN}"设置 DNS (用逗号隔开) [默认 $def_dns]: "${RESET})" user_dns
-    user_dns=${user_dns:-$def_dns}
-
-    write_config_and_link "$user_port" "$user_pass" "$user_dns"
-
-    cat > "$SS_INIT_SCRIPT" <<EOF
-#!/sbin/openrc-run
-name="ss-rust"
-command="${BINARY_PATH}"
-command_args="-c ${SS_CONFIG}"
-command_user="${RUN_USER}:${RUN_GROUP}"
-command_background="yes"
-pidfile="/run/\${RC_SVCNAME}.pid"
-output_log="${LOG_FILE}"
-error_log="${LOG_FILE}"
-depend() { need net; }
+case "$BIN_TYPE" in
+  3proxy)     exec 3proxy "${WORKDIR}/3proxy.cfg" ;;
+  s5)         exec s5 -c "${WORKDIR}/config.json" ;;
+  microsocks) exec microsocks -i 0.0.0.0 -p "$PORT" -u "$USERNAME" -P "$PASSWORD" ;;
+  ss5)        exec ss5 -u "$USERNAME:$PASSWORD" -p "$PORT" ;;
+  *)          echo "未知的 Socks5 底层实现引擎类型: $BIN_TYPE"; exit 1 ;;
+esac
 EOF
-    chmod +x "$SS_INIT_SCRIPT"
-    rc-update add ss-rust default
-    rc-service ss-rust start
-    info "安装完成！"
-    show_node_info
+  chmod +x "${WORKDIR}/start.sh"
 }
 
-# ================== 功能：更新 (无损替换) ==================
-update_ss() {
-    if [[ ! -f "$BINARY_PATH" ]]; then
-        error "未发现已安装的服务，请先选择选项 1 安装。"
-        return 1
-    fi
+create_service() {
+  cat << EOF > "${SERVICE_FILE}"
+[Unit]
+Description=Socks5 Multi-Backend Service
+After=network.target network-online.target
 
-    local current_ver=$(cat "${SS_DIR}/version.txt" 2>/dev/null || echo "未知")
-    local latest_ver=$(get_latest_version)
+[Service]
+Type=simple
+WorkingDirectory=${WORKDIR}
+ExecStart=${WORKDIR}/start.sh
+Restart=always
+RestartSec=5
 
-    info "当前版本: $current_ver | 最新版本: v$latest_ver"
+[Install]
+WantedBy=multi-user.target
+EOF
 
-    if [[ "$current_ver" == "$latest_ver" ]]; then
-        info "当前已是最新版本，无需更新。"
-        return 0
-    fi
+  if has_command systemctl; then
+    systemctl daemon-reload
+    systemctl enable s5 >/dev/null 2>&1 || true
+  fi
+}
 
-    info "发现新版本，正在下载升级..."
-    local arch=$(detect_arch)
-    local url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${latest_ver}/shadowsocks-v${latest_ver}.${arch}.tar.xz"
-    
-    cd "$TMP_DIR"
-    if wget -q --show-progress -O ss.tar.xz "$url"; then
-        tar -xf ss.tar.xz
-        rc-service ss-rust stop || true
-        install -m 755 ssserver "$BINARY_PATH"
-        echo "$latest_ver" > "${SS_DIR}/version.txt"
-        rc-service ss-rust start
-        info "更新成功！配置已保留。"
+save_meta() {
+  cat << EOF > "${META_FILE}"
+PORT='${PORT}'
+USERNAME='${USERNAME}'
+PASSWORD='${PASSWORD}'
+BIN_TYPE='${BIN_TYPE}'
+EOF
+  chmod 600 "${META_FILE}"
+}
+
+load_meta() {
+  if [ -f "${META_FILE}" ]; then
+    # shellcheck disable=SC1090
+    source "${META_FILE}"
+  else
+    PORT=""
+    USERNAME=""
+    PASSWORD=""
+    BIN_TYPE=""
+  fi
+}
+
+# =========================================================
+# 5. 主流程控制模块（安装、更新、修改、卸载）
+# =========================================================
+write_and_start_service() {
+  ensure_workdir
+  save_meta
+  generate_backend_config
+  create_start_script
+  create_service
+
+  if has_command systemctl; then
+    systemctl restart s5 >/dev/null 2>&1 || true
+    sleep 1.5
+    if systemctl is-active --quiet s5 2>/dev/null; then
+      info "Socks5 核心服务配置并启动成功！"
     else
-        error "下载失败，请检查网络。"
+      error "Socks5 服务启动失败，请运行 'journalctl -u s5 -f' 查看错误日志。"
     fi
+  else
+    pkill -f "${WORKDIR}/start.sh" || true
+    "${WORKDIR}/start.sh" >/dev/null 2>&1 &
+    info "非 systemd 环境，守护进程已挂载至后台进程池中运行。"
+  fi
+  showconf
 }
 
-# ================== 功能：修改配置 ==================
-modify_ss() {
-    if [[ ! -f "$SS_CONFIG" ]]; then
-        error "未发现配置，请先安装"
-        return 1
-    fi
-
-    local old_port=$(grep -E '"server_port":' "$SS_CONFIG" | head -n 1 | grep -oE '[0-9]+')
-    local old_pass=$(grep -E '"password":' "$SS_CONFIG" | head -n 1 | cut -d '"' -f4)
-    
-    # 🛠 改进的 DNS 提取逻辑：直接匹配 nameserver 数组内的内容
-    local old_dns=$(grep -A 5 '"nameserver":' "$SS_CONFIG" | grep -v '"nameserver":' | tr -d ' "[]\n\r\t' | sed 's/,$//' | grep -v '}')
-    
-    if [[ -z "$old_dns" || "$old_dns" == *"{"* ]]; then
-        old_dns=$(get_vps_dns)
-    fi
-
-    echo -e "${YELLOW}--- 修改配置 (回车保持当前值) ---${RESET}"
-    read -rp "$(echo -e ${GREEN}"新端口 [当前 $old_port]: "${RESET})" new_port
-    new_port=${new_port:-$old_port}
-    read -rp "$(echo -e ${GREEN}"新密码 [当前 $old_pass]: "${RESET})" new_pass
-    new_pass=${new_pass:-$old_pass}
-    read -rp "$(echo -e ${GREEN}"新 DNS (用逗号隔开) [当前 $old_dns]: "${RESET})" new_dns
-    new_dns=${new_dns:-$old_dns}
-
-    write_config_and_link "$new_port" "$new_pass" "$new_dns"
-    rc-service ss-rust restart >/dev/null 2>&1 || true
-    info "修改成功！"
-    show_node_info
-}
-
-# ================== 菜单系统 ==================
-while true; do
-    if rc-service ss-rust status 2>/dev/null | grep -q "started"; then
-        STATUS="${GREEN}● 运行中${RESET}"
+inst_socks5() {
+  ensure_workdir
+  
+  # 检测底层引擎依赖
+  local exist_impl
+  exist_impl="$(detect_existing_impl || true)"
+  if [ -n "${exist_impl}" ]; then
+    info "当前系统已存在可用组件实现: ${YELLOW}${exist_impl}${RESET} (将直接适配)"
+    BIN_TYPE="${exist_impl}"
+  else
+    warn "系统未检测到内置的代理实现，开始尝试自动拉取交叉编译依赖..."
+    if try_install_package "microsocks"; then
+      BIN_TYPE="microsocks"
+    elif try_install_package "3proxy"; then
+      BIN_TYPE="3proxy"
     else
-        STATUS="${RED}● 未运行${RESET}"
+      error "未能通过包管理器自动安装任何代理底层实现（microsocks/3proxy）。"
+      error "请检查您的网络连接或手动安装其中之一后重新运行此脚本。"
+      return 1
     fi
+  fi
 
-    VERSION_SHOW=$( [ -f "${SS_DIR}/version.txt" ] && echo "v$(cat ${SS_DIR}/version.txt)" || echo "未安装")
-    PORT_SHOW=$( [ -f "$SS_CONFIG" ] && grep '"server_port"' "$SS_CONFIG" | head -n 1 | grep -oE '[0-9]+' || echo "-")
+  local rand_user
+  rand_user="$(random_user)"
+  local rand_pass
+  rand_pass="$(random_pass)"
+  local rand_port
+  rand_port=$(random_port)
 
+  echo "---------------------------------------------"
+  read -rp "👉 请输入监听端口 (默认随机: ${rand_port}): " input_port
+  PORT=${input_port:-$rand_port}
+  if ! [[ "${PORT}" =~ ^[0-9]+$ ]] || [ "${PORT}" -lt 1 ] || [ "${PORT}" -gt 65535 ]; then
+    warn "端口输入无效，已自动回滚为随机端口: ${rand_port}"
+    PORT="${rand_port}"
+  fi
+
+  read -rp "👉 请设置用户名 (默认随机: ${rand_user}): " input_user
+  USERNAME=${input_user:-$rand_user}
+
+  read -rp "👉 请设置密码 (默认随机: ${rand_pass}): " input_pass
+  PASSWORD=${input_pass:-$rand_pass}
+
+  write_and_start_service
+}
+
+changeconf() {
+  load_meta
+  if [ -z "${BIN_TYPE}" ]; then
+    local exist_impl
+    exist_impl="$(detect_existing_impl || true)"
+    BIN_TYPE="${exist_impl:-}"
+  fi
+  if [ -z "${BIN_TYPE}" ]; then
+    error "未找到有效的底层服务组件，请先执行选项 1 进行安装。"
+    return 1
+  fi
+
+  clear
+  echo -e "${GREEN}====== 修改 Socks5 节点配置 ======${RESET}"
+  echo "提示：直接敲回车将保持原有配置不变"
+  echo "---------------------------------------------"
+
+  local input_port input_user input_pass
+  
+  read -rp "👉 请输入新的监听端口 [当前: ${PORT:-1080}]: " input_port
+  if [ -n "$input_port" ]; then
+    if [[ "${input_port}" =~ ^[0-9]+$ ]] && [ "${input_port}" -ge 1 ] && [ "${input_port}" -le 65535 ]; then
+      PORT="${input_port}"
+    else
+      warn "输入端口格式不合法，保留原端口不变。"
+    fi
+  fi
+
+  read -rp "👉 请设置新的用户名 [当前: ${USERNAME:-unset}]: " input_user
+  USERNAME=${input_user:-$USERNAME}
+
+  read -rp "👉 请设置新的密码 [当前: ${PASSWORD:-unset}]: " input_pass
+  PASSWORD=${input_pass:-$PASSWORD}
+
+  write_and_start_service
+}
+
+uninstall_socks5() {
+  warn "即将从当前系统中彻底卸载并清理 Socks5 服务..."
+
+  if has_command systemctl; then
+    systemctl stop s5 >/dev/null 2>&1 || true
+    systemctl disable s5 >/dev/null 2>&1 || true
+    if [ -f "${SERVICE_FILE}" ]; then
+      rm -f "${SERVICE_FILE}"
+    fi
+    systemctl daemon-reload
+  else
+    pkill -f "${WORKDIR}/start.sh" || true
+  fi
+
+  rm -rf "${WORKDIR}"
+  info "Socks5 全套配置文件及服务已经从您的系统中彻底移除！"
+}
+
+showconf() {
+  load_meta
+  if [ -z "${PORT}" ]; then
+    error "未找到任何可用的元配置文件，请确认服务已成功初始化。"
+    return 1
+  fi
+
+  local ip enc_user enc_pass enc_ip socksurl tlink
+  ip="$(get_best_ip)"
+  enc_user="$(urlencode "${USERNAME}")"
+  enc_pass="$(urlencode "${PASSWORD}")"
+  enc_ip="$(urlencode "${ip}")"
+
+  socksurl="socks://${USERNAME}:${PASSWORD}@${ip}:${PORT}"
+  tlink="https://t.me/socks?server=${enc_ip}&port=${PORT}&user=${enc_user}&pass=${enc_pass}"
+
+  echo -e "${GREEN}====== Socks5 配置 ======${RESET}"
+  echo -e "${YELLOW}● 客户端直连格式:${RESET} ${socksurl}"
+  echo -e "${YELLOW}● Telegram 快捷链接:${RESET} ${tlink}"
+  echo
+}
+
+# =========================================================
+# 6. 面板主菜单
+# =========================================================
+menu() {
+  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
+  ensure_workdir
+
+  while true; do
     clear
+    load_meta
+    
+    local status_display
+    if has_command systemctl && systemctl is-active --quiet s5 2>/dev/null; then
+      status_display="${GREEN}● 运行中${RESET}"
+    else
+      if pkill -0 -f "${WORKDIR}/start.sh" >/dev/null 2>&1; then
+        status_display="${GREEN}● 运行中 (Pidmode)${RESET}"
+      else
+        status_display="${RED}● 未运行${RESET}"
+      fi
+    fi
+
+    local port_display="${PORT:- -}"
+    local engine_display="${BIN_TYPE:-未检测到底层安装}"
+
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   Shadowsocks-Rust 管理面板    ${RESET}"
+    echo -e "${GREEN}        Socks5 管理面板       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $STATUS"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${VERSION_SHOW}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${PORT_SHOW}${RESET}"
+    echo -e "${GREEN}状态   :${RESET} ${status_display}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_display}${RESET}"
+    echo -e "${GREEN}实现   :${RESET} ${CYAN}${engine_display}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Shadowsocks-Rust${RESET}"
-    echo -e "${GREEN}2. 更新 Shadowsocks-Rust${RESET}"
-    echo -e "${GREEN}3. 卸载 Shadowsocks-Rust${RESET}"
-    echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 Shadowsocks-Rust${RESET}"
-    echo -e "${GREEN}6. 停止 Shadowsocks-Rust${RESET}"
-    echo -e "${GREEN}7. 重启 Shadowsocks-Rust${RESET}"
-    echo -e "${GREEN}8. 查看日志${RESET}"
-    echo -e "${GREEN}9. 查看节点配置${RESET}"
+    echo -e "${GREEN}1. 安装 Socks5${RESET}"
+    echo -e "${GREEN}2. 修改配置${RESET}"
+    echo -e "${GREEN}3. 卸载 Socks5${RESET}"
+    echo -e "${GREEN}4. 启动 Socks5${RESET}"
+    echo -e "${GREEN}5. 停止 Socks5${RESET}"
+    echo -e "${GREEN}6. 重启 Socks5${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看连接配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
 
-    read -rp "$(echo -e ${GREEN}"请输入选项: "${RESET})" choice
-    case $choice in
-        1) install_ss; pause ;;
-        2) update_ss; pause ;;
-        3) 
-            rc-service ss-rust stop || true
-            rc-update del ss-rust || true
-            rm -f "$SS_INIT_SCRIPT" "$BINARY_PATH"
-            rm -rf "$SS_DIR" "$LOG_FILE"
-            info "已卸载"; pause ;;
-        4) modify_ss; pause ;;
-        5) rc-service ss-rust start; pause ;;
-        6) rc-service ss-rust stop; pause ;;
-        7) rc-service ss-rust restart; pause ;;
-        8) 
-            info "实时日志 (Ctrl+C 退出):"
-            [[ -f "$LOG_FILE" ]] && tail -f "$LOG_FILE" || error "无日志文件"; pause ;;
-        9) show_node_info; pause ;;
-        0) exit 0 ;;
-        *) sleep 0.5 ;;
+    local choice=""
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+    [[ -z "$choice" ]] && continue
+
+    case "$choice" in
+      1) inst_socks5; pause ;;
+      2) changeconf; pause ;;
+      3) uninstall_socks5; pause ;;
+      4)
+        if has_command systemctl; then
+          systemctl start s5 && info "服务已成功拉起！"
+        else
+          pkill -f "${WORKDIR}/start.sh" || true
+          "${WORKDIR}/start.sh" >/dev/null 2>&1 &
+          info "进程已在后台独立进程池中拉起！"
+        fi
+        pause ;;
+      5)
+        if has_command systemctl; then
+          systemctl stop s5 && info "服务已成功挂起！"
+        else
+          pkill -f "${WORKDIR}/start.sh" && info "后台代理程序已终止！"
+        fi
+        pause ;;
+      6)
+        if has_command systemctl; then
+          systemctl restart s5 && info "服务已成功完成平滑重启！"
+        else
+          pkill -f "${WORKDIR}/start.sh" || true
+          "${WORKDIR}/start.sh" >/dev/null 2>&1 &
+          info "后台独立进程已重载刷新！"
+        fi
+        pause ;;
+      7)
+        if has_command systemctl; then
+          journalctl -u s5.service -n 50 --no-pager
+        else
+          warn "当前 Linux 环境不支持 Systemd 级集中式日志。"
+        fi
+        pause ;;
+      8) showconf; pause ;;
+      0) exit 0 ;;
+      *) error "未识别的无效指令，请重新进行选择。"; sleep 1 ;;
     esac
-done
+  done
+}
+
+menu "$@"

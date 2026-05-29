@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# Shadowsocks-Rust 管理脚本 (Alpine Linux 专属解耦版)
+# Shadowsocks-Rust 管理脚本 (Alpine Linux - 优化版)
 # =========================================================
 
 set -euo pipefail
@@ -42,62 +42,69 @@ detect_arch() {
     esac
 }
 
-get_public_ip() {
-    curl -4fsSL --max-time 5 https://api.ipify.org || echo "YOUR_IP"
+get_vps_dns() {
+    local dns_list=$(grep -E '^nameserver' /etc/resolv.conf | awk '{print $2}' | paste -sd "," -)
+    echo "${dns_list:-"1.1.1.1,8.8.8.8"}"
 }
 
-# ================== 功能函数：修改配置 ==================
-modify_ss() {
-    if [[ ! -f "$SS_CONFIG" ]]; then
-        error "配置文件不存在，请先安装"
-        return 1
-    fi
+get_public_ip() {
+    local ip
+    for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+        ip=$(curl -4s --max-time 5 "$url") && [[ -n "$ip" ]] && echo "$ip" && return
+    done
+    echo "YOUR_IP"
+}
 
-    # 精准提取旧配置
-    local old_port=$(grep -E '"server_port":' "$SS_CONFIG" | head -n 1 | grep -oE '[0-9]+')
-    local old_pass=$(grep -E '"password":' "$SS_CONFIG" | head -n 1 | cut -d '"' -f4)
+# ================== 核心：写入配置 ==================
+write_config_and_link() {
+    local port=$1
+    local pass=$2
+    local dns_str=$3
     
-    echo -e "${YELLOW}--- 修改 Shadowsocks 配置 (回车保持默认) ---${RESET}"
-    
-    read -rp "$(echo -e ${GREEN}"设置新端口 [当前: $old_port]: "${RESET})" new_port
-    new_port=${new_port:-$old_port}
+    dns_str=$(echo "$dns_str" | tr -d ' ')
+    local dns_json=$(echo "\"${dns_str//,/\",\"}\"")
 
-    read -rp "$(echo -e ${GREEN}"设置新密码 [当前: $old_pass]: "${RESET})" new_pass
-    new_pass=${new_pass:-$old_pass}
-
-    # 写入配置
     cat > "$SS_CONFIG" <<EOF
 {
     "server": "::",
-    "server_port": $new_port,
-    "password": "$new_pass",
+    "server_port": $port,
+    "password": "$pass",
     "method": "$METHOD",
     "fast_open": true,
     "mode": "tcp_and_udp",
     "timeout": 300,
     "no_delay": true,
     "ipv6_first": false,
-    "nameserver": ["1.1.1.1", "8.8.8.8"]
+    "nameserver": [$dns_json]
 }
 EOF
     chown "${RUN_USER}:${RUN_GROUP}" "$SS_CONFIG"
-    
-    # 异步生成节点链接文件
+    chmod 600 "$SS_CONFIG"
+
     local ip=$(get_public_ip)
     [[ "$ip" =~ : ]] && ip="[$ip]"
-    local encoded=$(echo -n "${METHOD}:${new_pass}" | base64 | tr -d '\n')
-    echo "ss://${encoded}@${ip}:${new_port}#$(hostname)-SS2022" > "${SS_DIR}/ss.txt"
-
-    rc-service ss-rust restart >/dev/null 2>&1 || true
-    info "配置已更新！"
+    local encoded=$(echo -n "${METHOD}:${pass}" | base64 | tr -d '\n')
+    echo "ss://${encoded}@${ip}:${port}#$(hostname)-SS2022" > "${SS_DIR}/ss.txt"
 }
 
-# ================== 功能函数：安装 ==================
+show_node_info() {
+    if [[ -f "${SS_DIR}/ss.txt" ]]; then
+        echo -e "${BLUE}================================${RESET}"
+        echo -e "${YELLOW}       Shadowsocks 节点信息      ${RESET}"
+        echo -e "${BLUE}================================${RESET}"
+        echo -e "${GREEN}SS 链接:${RESET}"
+        echo -e "${YELLOW}$(cat "${SS_DIR}/ss.txt")${RESET}"
+        echo -e "${BLUE}================================${RESET}"
+    else
+        error "链接文件尚未生成。"
+    fi
+}
+
+# ================== 功能：安装 ==================
 install_ss() {
-    info "正在安装系统依赖..."
+    info "正在准备安装环境..."
     apk add curl wget tar xz openssl iproute2 coreutils >/dev/null 2>&1
     
-    # 用户环境准备
     getent group "$RUN_GROUP" >/dev/null || addgroup -S "$RUN_GROUP"
     getent passwd "$RUN_USER" >/dev/null || adduser -S -D -H -G "$RUN_GROUP" -s /sbin/nologin "$RUN_USER"
 
@@ -111,31 +118,28 @@ install_ss() {
     tar -xf ss.tar.xz
     install -m 755 ssserver "$BINARY_PATH"
     
-    # 建立目录与基础文件
     mkdir -p "$SS_DIR"
     echo "$ver" > "${SS_DIR}/version.txt"
     touch "$LOG_FILE"
     chown "${RUN_USER}:${RUN_GROUP}" "$LOG_FILE"
 
-    # 生成初始随机配置 (仅安装，不修改)
-    local init_port=$((RANDOM % 40000 + 20000))
-    local init_pass=$(openssl rand -base64 32 | tr -d '\n')
-    
-    cat > "$SS_CONFIG" <<EOF
-{
-    "server": "::",
-    "server_port": $init_port,
-    "password": "$init_pass",
-    "method": "$METHOD"
-}
-EOF
-    chown -R "${RUN_USER}:${RUN_GROUP}" "$SS_DIR"
+    local def_port=$((RANDOM % 40000 + 20000))
+    local def_pass=$(openssl rand -base64 32 | tr -d '\n')
+    local def_dns=$(get_vps_dns)
 
-    # 写入 OpenRC 服务脚本
+    echo -e "${YELLOW}--- 自定义配置 (回车使用随机默认值) ---${RESET}"
+    read -rp "$(echo -e ${GREEN}"设置端口 [默认 $def_port]: "${RESET})" user_port
+    user_port=${user_port:-$def_port}
+    read -rp "$(echo -e ${GREEN}"设置密码 [默认随机生成]: "${RESET})" user_pass
+    user_pass=${user_pass:-$def_pass}
+    read -rp "$(echo -e ${GREEN}"设置 DNS (用逗号隔开) [默认 $def_dns]: "${RESET})" user_dns
+    user_dns=${user_dns:-$def_dns}
+
+    write_config_and_link "$user_port" "$user_pass" "$user_dns"
+
     cat > "$SS_INIT_SCRIPT" <<EOF
 #!/sbin/openrc-run
 name="ss-rust"
-description="Shadowsocks-Rust Server"
 command="${BINARY_PATH}"
 command_args="-c ${SS_CONFIG}"
 command_user="${RUN_USER}:${RUN_GROUP}"
@@ -143,16 +147,78 @@ command_background="yes"
 pidfile="/run/\${RC_SVCNAME}.pid"
 output_log="${LOG_FILE}"
 error_log="${LOG_FILE}"
-
-depend() {
-    need net
-}
+depend() { need net; }
 EOF
     chmod +x "$SS_INIT_SCRIPT"
     rc-update add ss-rust default
-    
     rc-service ss-rust start
-    info "安装完成并已启动服务！"
+    info "安装完成！"
+    show_node_info
+}
+
+# ================== 功能：更新 (无损替换) ==================
+update_ss() {
+    if [[ ! -f "$BINARY_PATH" ]]; then
+        error "未发现已安装的服务，请先选择选项 1 安装。"
+        return 1
+    fi
+
+    local current_ver=$(cat "${SS_DIR}/version.txt" 2>/dev/null || echo "未知")
+    local latest_ver=$(get_latest_version)
+
+    info "当前版本: $current_ver | 最新版本: v$latest_ver"
+
+    if [[ "$current_ver" == "$latest_ver" ]]; then
+        info "当前已是最新版本，无需更新。"
+        return 0
+    fi
+
+    info "发现新版本，正在下载升级..."
+    local arch=$(detect_arch)
+    local url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${latest_ver}/shadowsocks-v${latest_ver}.${arch}.tar.xz"
+    
+    cd "$TMP_DIR"
+    if wget -q --show-progress -O ss.tar.xz "$url"; then
+        tar -xf ss.tar.xz
+        rc-service ss-rust stop || true
+        install -m 755 ssserver "$BINARY_PATH"
+        echo "$latest_ver" > "${SS_DIR}/version.txt"
+        rc-service ss-rust start
+        info "更新成功！配置已保留。"
+    else
+        error "下载失败，请检查网络。"
+    fi
+}
+
+# ================== 功能：修改配置 ==================
+modify_ss() {
+    if [[ ! -f "$SS_CONFIG" ]]; then
+        error "未发现配置，请先安装"
+        return 1
+    fi
+
+    local old_port=$(grep -E '"server_port":' "$SS_CONFIG" | head -n 1 | grep -oE '[0-9]+')
+    local old_pass=$(grep -E '"password":' "$SS_CONFIG" | head -n 1 | cut -d '"' -f4)
+    
+    # 🛠 改进的 DNS 提取逻辑：直接匹配 nameserver 数组内的内容
+    local old_dns=$(grep -A 5 '"nameserver":' "$SS_CONFIG" | grep -v '"nameserver":' | tr -d ' "[]\n\r\t' | sed 's/,$//' | grep -v '}')
+    
+    if [[ -z "$old_dns" || "$old_dns" == *"{"* ]]; then
+        old_dns=$(get_vps_dns)
+    fi
+
+    echo -e "${YELLOW}--- 修改配置 (回车保持当前值) ---${RESET}"
+    read -rp "$(echo -e ${GREEN}"新端口 [当前 $old_port]: "${RESET})" new_port
+    new_port=${new_port:-$old_port}
+    read -rp "$(echo -e ${GREEN}"新密码 [当前 $old_pass]: "${RESET})" new_pass
+    new_pass=${new_pass:-$old_pass}
+    read -rp "$(echo -e ${GREEN}"新 DNS (用逗号隔开) [当前 $old_dns]: "${RESET})" new_dns
+    new_dns=${new_dns:-$old_dns}
+
+    write_config_and_link "$new_port" "$new_pass" "$new_dns"
+    rc-service ss-rust restart >/dev/null 2>&1 || true
+    info "修改成功！"
+    show_node_info
 }
 
 # ================== 菜单系统 ==================
@@ -189,30 +255,21 @@ while true; do
     read -rp "$(echo -e ${GREEN}"请输入选项: "${RESET})" choice
     case $choice in
         1) install_ss; pause ;;
-        2) 
-            latest=$(get_latest_version)
-            info "正在更新到 v$latest..."
-            install_ss; pause ;;
+        2) update_ss; pause ;;
         3) 
             rc-service ss-rust stop || true
             rc-update del ss-rust || true
             rm -f "$SS_INIT_SCRIPT" "$BINARY_PATH"
             rm -rf "$SS_DIR" "$LOG_FILE"
-            info "卸载完成"; pause ;;
+            info "已卸载"; pause ;;
         4) modify_ss; pause ;;
         5) rc-service ss-rust start; pause ;;
         6) rc-service ss-rust stop; pause ;;
         7) rc-service ss-rust restart; pause ;;
         8) 
-            info "正在实时查看日志 (Ctrl+C 退出)..."
-            [[ -f "$LOG_FILE" ]] && tail -f "$LOG_FILE" || error "日志文件不存在"; pause ;;
-        9) 
-            if [[ -f "${SS_DIR}/ss.txt" ]]; then
-                info "节点链接:\n${YELLOW}$(cat "${SS_DIR}/ss.txt")${RESET}"
-            else
-                error "配置链接尚未生成，请执行一次修改或重启。"
-            fi
-            pause ;;
+            info "实时日志 (Ctrl+C 退出):"
+            [[ -f "$LOG_FILE" ]] && tail -f "$LOG_FILE" || error "无日志文件"; pause ;;
+        9) show_node_info; pause ;;
         0) exit 0 ;;
         *) sleep 0.5 ;;
     esac

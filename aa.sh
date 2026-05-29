@@ -1,448 +1,209 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
+set -e
 
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# =========================================================
+# Fail2Ban 一键部署脚本 (Alpine Linux)
+# =========================================================
 
-SCRIPT_VERSION="0.2.0"
-SINGBOX_VERSION="1.12.0"
-WORKDIR="/opt/alpine-singbox-snellv5"
-BIN_DIR="/usr/local/bin"
-CONF_DIR="/etc/sing-box"
-SINGBOX_BIN="$BIN_DIR/sing-box"
-SINGBOX_CONF="$CONF_DIR/config.json"
-SERVICE_DIR="/etc/init.d"
-SINGBOX_SERVICE="$SERVICE_DIR/sing-box"
-PROFILE_FILE="$WORKDIR/install.env"
-SYSCTL_FILE="/etc/sysctl.d/99-singbox-snellv5.conf"
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+RESET="\033[0m"
 
-GREEN='\033[32m'
-YELLOW='\033[33m'
-RED='\033[31m'
-BLUE='\033[34m'
-BOLD='\033[1m'
-RESET='\033[0m'
+LOG_PATH="/var/log/auth.log"
 
-info(){ echo -e "${GREEN}[INFO]${RESET} $*"; }
-warn(){ echo -e "${YELLOW}[WARN]${RESET} $*"; }
-error(){ echo -e "${RED}[ERROR]${RESET} $*"; }
-headline(){ echo -e "${BLUE}${BOLD}$*${RESET}"; }
+info() { echo -e "${GREEN}[INFO] $1${RESET}"; }
+warn() { echo -e "${YELLOW}[WARN] $1${RESET}"; }
+error() { echo -e "${RED}[ERROR] $1${RESET}"; }
 
-require_root(){
-  if [[ ${EUID} -ne 0 ]]; then
-    error "请使用 root 运行此脚本"
+# -------------------------
+# 检查系统
+# -------------------------
+if [[ ! -f /etc/alpine-release ]]; then
+    echo -e "${RED}❌ 本脚本仅适用于 Alpine Linux${RESET}"
     exit 1
-  fi
-}
+fi
 
-pause(){
-  read -r -p "按回车继续..."
-}
+# -------------------------
+# 安装 Fail2Ban
+# -------------------------
+install_fail2ban() {
+    info "更新 apk 索引并安装 fail2ban 和 rsyslog..."
+    apk update
+    apk add --no-cache fail2ban rsyslog openssh
 
-trim(){
-  local value="$1"
-  value="${value#${value%%[![:space:]]*}}"
-  value="${value%${value##*[![:space:]]}}"
-  printf '%s' "$value"
-}
+    rc-update add rsyslog
+    service rsyslog start
 
-is_alpine(){
-  [[ -f /etc/alpine-release ]]
-}
+    rc-update add sshd
+    service sshd start
 
-need_cmd(){
-  local cmd="$1"
-  command -v "$cmd" >/dev/null 2>&1 || {
-    error "缺少命令: $cmd"
-    return 1
-  }
-}
+    rc-update add fail2ban
+    service fail2ban start
 
-install_deps(){
-  require_root
-  if ! is_alpine; then
-    error "当前系统不是 Alpine，检测到: $(. /etc/os-release 2>/dev/null; echo ${PRETTY_NAME:-unknown})"
-    return 1
-  fi
-  info "安装依赖中..."
-  apk update
-  apk add --no-cache bash curl wget tar openssl openrc iproute2 jq grep sed coreutils bind-tools
-  mkdir -p "$WORKDIR" "$CONF_DIR"
-  rc-update add local default >/dev/null 2>&1 || true
-  info "依赖安装完成"
-}
+    # 确保日志文件存在
+    [[ ! -f "$LOG_PATH" ]] && touch "$LOG_PATH" && chmod 600 "$LOG_PATH"
 
-get_arch(){
-  local machine
-  machine=$(uname -m)
-  case "$machine" in
-    x86_64|amd64) echo "amd64" ;;
-    aarch64|arm64) echo "arm64" ;;
-    armv7l|armv7) echo "armv7" ;;
-    *)
-      error "不支持的架构: $machine"
-      return 1
-      ;;
-  esac
-}
-
-random_port(){
-  shuf -i 20000-60000 -n 1
-}
-
-random_token(){
-  openssl rand -hex 8
-}
-
-prompt_default(){
-  local prompt="$1"
-  local default="$2"
-  local input
-  read -r -p "$prompt [$default]: " input
-  input=$(trim "$input")
-  if [[ -z "$input" ]]; then
-    printf '%s' "$default"
-  else
-    printf '%s' "$input"
-  fi
-}
-
-validate_port(){
-  local port="$1"
-  [[ "$port" =~ ^[0-9]+$ ]] || return 1
-  (( port >= 1 && port <= 65535 )) || return 1
-}
-
-port_in_use(){
-  local port="$1"
-  ss -tuln | awk '{print $5}' | grep -Eq "(^|:)$port$"
-}
-
-validate_obfs(){
-  local obfs="$1"
-  [[ "$obfs" == "off" || "$obfs" == "http" || "$obfs" == "tls" ]]
-}
-
-validate_bool(){
-  local value="$1"
-  [[ "$value" == "true" || "$value" == "false" ]]
-}
-
-configure_profile(){
-  require_root
-  local listen_addr snell_port psk obfs_mode obfs_host log_level udp_enabled sniff_enabled inbound_tag dns_server
-
-  listen_addr=$(prompt_default "请输入 sing-box 监听地址" "::")
-
-  while true; do
-    snell_port=$(prompt_default "请输入 Snell v5 监听端口" "$(random_port)")
-    if ! validate_port "$snell_port"; then
-      warn "端口格式不正确"
-      continue
+    # 配置 SSH 输出日志
+    if ! grep -q "^SyslogFacility AUTH" /etc/ssh/sshd_config; then
+        echo "SyslogFacility AUTH" >> /etc/ssh/sshd_config
+        echo "LogLevel INFO" >> /etc/ssh/sshd_config
+        service sshd restart
     fi
-    if port_in_use "$snell_port"; then
-      warn "端口 $snell_port 已被占用，请换一个"
-      continue
+
+    # 创建兼容 Alpine 的 filter
+    mkdir -p /etc/fail2ban/filter.d
+    cat >/etc/fail2ban/filter.d/sshd-alpine.conf <<'EOF'
+[Definition]
+failregex = ^.*Failed password for .* from <HOST> port .* ssh2$
+ignoreregex =
+EOF
+
+    info "✅ Fail2Ban 已安装并启动"
+}
+
+# -------------------------
+# 配置 SSH 防护
+# -------------------------
+configure_ssh() {
+    read -p $'\033[32m请输入 SSH 端口（默认22）: \033[0m' SSH_PORT
+    SSH_PORT=${SSH_PORT:-22}
+
+    read -p $'\033[32m请输入最大失败尝试次数 maxretry（默认5）: \033[0m' MAX_RETRY
+    MAX_RETRY=${MAX_RETRY:-5}
+
+    read -p $'\033[32m请输入封禁时间 bantime(秒，默认600): \033[0m' BAN_TIME
+    BAN_TIME=${BAN_TIME:-600}
+
+    mkdir -p /etc/fail2ban/jail.d
+    cat >/etc/fail2ban/jail.d/sshd.local <<EOF
+[sshd]
+enabled = true
+port = $SSH_PORT
+filter = sshd-alpine
+logpath = $LOG_PATH
+maxretry = $MAX_RETRY
+bantime  = $BAN_TIME
+EOF
+
+    service fail2ban restart
+    info "✅ SSH 防暴力破解配置完成"
+    read -p $'\033[32m按回车返回菜单...\033[0m'
+}
+
+# -------------------------
+# 卸载 Fail2Ban
+# -------------------------
+uninstall_fail2ban() {
+    info "正在卸载 Fail2Ban..."
+    service fail2ban stop || true
+    apk del fail2ban rsyslog
+    [[ -f /etc/ssh/sshd_config ]] && sed -i '/SyslogFacility AUTH/d;/LogLevel INFO/d' /etc/ssh/sshd_config
+    info "✅ Fail2Ban 已卸载"
+    read -p $'\033[32m按回车返回菜单...\033[0m'
+}
+
+# -------------------------
+# 查看被封禁 IP
+# -------------------------
+view_banned() {
+    if command -v fail2ban-client &>/dev/null; then
+        BANNED=$(fail2ban-client status sshd 2>/dev/null | grep 'Banned IP list' | cut -d: -f2)
+        echo -e "${GREEN}当前被封禁的 IP:${RESET} ${BANNED:-无}"
+    else
+        echo -e "${RED}Fail2Ban 未安装或未启动${RESET}"
     fi
-    break
-  done
-
-  psk=$(prompt_default "请输入 Snell PSK" "$(random_token)")
-
-  while true; do
-    obfs_mode=$(prompt_default "请输入 obfs 模式(off/http/tls)" "off")
-    validate_obfs "$obfs_mode" && break
-    warn "obfs 仅支持 off / http / tls"
-  done
-
-  obfs_host=$(prompt_default "请输入 obfs host(仅 http/tls 有效)" "www.bing.com")
-  log_level=$(prompt_default "请输入 sing-box 日志级别" "info")
-
-  while true; do
-    udp_enabled=$(prompt_default "是否开启 UDP(true/false)" "true")
-    validate_bool "$udp_enabled" && break
-    warn "请输入 true 或 false"
-  done
-
-  while true; do
-    sniff_enabled=$(prompt_default "是否开启 sniff(true/false)" "false")
-    validate_bool "$sniff_enabled" && break
-    warn "请输入 true 或 false"
-  done
-
-  inbound_tag=$(prompt_default "请输入 inbound 标签" "snell-in")
-  dns_server=$(prompt_default "请输入 sing-box DNS 服务器" "1.1.1.1")
-
-  mkdir -p "$WORKDIR"
-  cat > "$PROFILE_FILE" <<EOF
-SINGBOX_VERSION="$SINGBOX_VERSION"
-LISTEN_ADDR="$listen_addr"
-SNELL_PORT="$snell_port"
-SNELL_PSK="$psk"
-SNELL_OBFS="$obfs_mode"
-SNELL_OBFS_HOST="$obfs_host"
-SB_LOG_LEVEL="$log_level"
-SNELL_UDP="$udp_enabled"
-SNELL_SNIFF="$sniff_enabled"
-SNELL_TAG="$inbound_tag"
-SB_DNS_SERVER="$dns_server"
-EOF
-  chmod 600 "$PROFILE_FILE"
-  info "参数已保存到 $PROFILE_FILE"
+    read -p $'\033[32m按回车返回菜单...\033[0m'
 }
 
-load_profile(){
-  if [[ ! -f "$PROFILE_FILE" ]]; then
-    error "未找到配置参数文件: $PROFILE_FILE，请先执行 1) 安装/初始化"
-    return 1
-  fi
-  # shellcheck disable=SC1090
-  source "$PROFILE_FILE"
+# -------------------------
+# 查看规则列表
+# -------------------------
+view_jails() {
+    if command -v fail2ban-client &>/dev/null; then
+        JAILS=$(fail2ban-client status 2>/dev/null | grep 'Jail list' | cut -d: -f2)
+        echo -e "${GREEN}当前防御规则列表:${RESET} ${JAILS:-无}"
+    else
+        echo -e "${RED}Fail2Ban 未安装或未启动${RESET}"
+    fi
+    read -p $'\033[32m按回车返回菜单...\033[0m'
 }
 
-singbox_download_url(){
-  local arch="$1"
-  printf 'https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz' "$SINGBOX_VERSION" "$SINGBOX_VERSION" "$arch"
+# -------------------------
+# 日志实时监控
+# -------------------------
+monitor_log() {
+    if [[ -f "$LOG_PATH" ]]; then
+        echo -e "${GREEN}进入日志实时监控，按 Ctrl+C 返回菜单${RESET}"
+        trap 'echo -e "\n${GREEN}已退出日志监控${RESET}"' SIGINT
+        tail -n 20 -f "$LOG_PATH" || true
+        trap - SIGINT
+    else
+        echo -e "${RED}日志文件不存在${RESET}"
+        read -p $'\033[32m按回车返回菜单...\033[0m'
+    fi
 }
 
-install_singbox_binary(){
-  local arch url tmpdir extracted
-  arch=$(get_arch)
-  url=$(singbox_download_url "$arch")
-  tmpdir=$(mktemp -d)
-  info "下载 sing-box v$SINGBOX_VERSION"
-  wget -O "$tmpdir/sing-box.tar.gz" "$url"
-  tar -xzf "$tmpdir/sing-box.tar.gz" -C "$tmpdir"
-  extracted=$(find "$tmpdir" -type f -name sing-box | head -n 1)
-  [[ -n "$extracted" ]] || { error "未找到 sing-box 可执行文件"; return 1; }
-  install -m 755 "$extracted" "$SINGBOX_BIN"
-  rm -rf "$tmpdir"
-  info "sing-box 已安装到 $SINGBOX_BIN"
+# -------------------------
+# 关闭 Fail2Ban 防护
+# -------------------------
+disable_fail2ban() {
+    if ! command -v fail2ban-client >/dev/null 2>&1; then
+        echo -e "${RED}Fail2Ban 未安装${RESET}"
+    else
+        warn "正在关闭 Fail2Ban 防护..."
+        service fail2ban stop
+        echo -e "${YELLOW}✅ Fail2Ban 防护已关闭${RESET}"
+    fi
+    read -p $'\033[32m按回车返回菜单...\033[0m'
 }
 
-write_singbox_config(){
-  load_profile
-  mkdir -p "$CONF_DIR"
-  cat > "$SINGBOX_CONF" <<EOF
-{
-  "log": {
-    "level": "${SB_LOG_LEVEL}",
-    "timestamp": true
-  },
-  "dns": {
-    "servers": [
-      {
-        "tag": "default-dns",
-        "address": "${SB_DNS_SERVER}"
-      }
-    ]
-  },
-  "inbounds": [
-    {
-      "type": "snell",
-      "tag": "${SNELL_TAG}",
-      "listen": "${LISTEN_ADDR}",
-      "listen_port": ${SNELL_PORT},
-      "users": [
-        {
-          "name": "default",
-          "password": "${SNELL_PSK}"
-        }
-      ],
-      "version": 5,
-      "udp": ${SNELL_UDP},
-      "sniff": ${SNELL_SNIFF}$(if [[ "$SNELL_OBFS" != "off" ]]; then printf ',\n      "obfs": {\n        "enabled": true,\n        "type": "%s",\n        "host": "%s"\n      }' "$SNELL_OBFS" "$SNELL_OBFS_HOST"; fi)
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    },
-    {
-      "type": "block",
-      "tag": "block"
-    }
-  ],
-  "route": {
-    "final": "direct"
-  }
-}
-EOF
-  chmod 600 "$SINGBOX_CONF"
-  info "已写入 $SINGBOX_CONF"
-}
-
-write_openrc_service(){
-  cat > "$SINGBOX_SERVICE" <<'EOF'
-#!/sbin/openrc-run
-name="sing-box"
-description="sing-box service"
-command="/usr/local/bin/sing-box"
-command_args="run -c /etc/sing-box/config.json"
-command_background="yes"
-pidfile="/run/sing-box.pid"
-output_log="/var/log/sing-box.log"
-error_log="/var/log/sing-box.err"
-depend() {
-  need net
-}
-EOF
-  chmod +x "$SINGBOX_SERVICE"
-  rc-update add sing-box default >/dev/null 2>&1 || true
-  info "OpenRC 服务脚本已写入: $SINGBOX_SERVICE"
-}
-
-enable_sysctl(){
-  cat > "$SYSCTL_FILE" <<'EOF'
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-net.ipv4.tcp_fastopen=3
-net.core.rmem_max=67108864
-net.core.wmem_max=67108864
-EOF
-  sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
-  info "已写入 $SYSCTL_FILE"
-}
-
-cleanup_legacy_snell(){
-  rc-service snell-server stop >/dev/null 2>&1 || true
-  rc-update del snell-server default >/dev/null 2>&1 || true
-  rm -f /etc/init.d/snell-server /usr/local/bin/snell-server
-  rm -rf /etc/snell
-}
-
-validate_singbox_config(){
-  need_cmd "$SINGBOX_BIN"
-  "$SINGBOX_BIN" check -c "$SINGBOX_CONF"
-}
-
-install_all(){
-  install_deps
-  configure_profile
-  install_singbox_binary
-  write_singbox_config
-  write_openrc_service
-  enable_sysctl
-  cleanup_legacy_snell
-  validate_singbox_config
-  start_service
-}
-
-start_service(){
-  need_cmd rc-service
-  validate_singbox_config
-  rc-service sing-box restart || rc-service sing-box start
-  info "sing-box 启动命令已执行"
-}
-
-stop_service(){
-  need_cmd rc-service
-  rc-service sing-box stop || true
-  info "sing-box 停止命令已执行"
-}
-
-restart_service(){
-  stop_service
-  start_service
-}
-
-status_service(){
-  if rc-service sing-box status >/dev/null 2>&1; then
-    echo -e "${GREEN}运行中${RESET}"
-  else
-    echo -e "${RED}未运行${RESET}"
-  fi
-}
-
-show_status(){
-  clear
-  headline "Alpine + sing-box Snell v5 状态"
-  echo "系统: $(cat /etc/alpine-release 2>/dev/null || echo unknown)"
-  echo "sing-box: $(status_service)"
-  echo "sing-box 版本: $($SINGBOX_BIN version 2>/dev/null | head -n1 || echo 未安装)"
-  echo "监听端口: $(jq -r '.inbounds[0].listen_port // "未配置"' "$SINGBOX_CONF" 2>/dev/null || echo 未配置)"
-  echo "协议版本: $(jq -r '.inbounds[0].version // "未配置"' "$SINGBOX_CONF" 2>/dev/null || echo 未配置)"
-  echo "OBFS: $(if [[ -f "$SINGBOX_CONF" ]]; then jq -r 'if .inbounds[0].obfs then .inbounds[0].obfs.type else "off" end' "$SINGBOX_CONF"; else echo 未配置; fi)"
-  echo "OpenRC 开机启动:"
-  rc-update show default | grep 'sing-box' || true
-}
-
-show_config(){
-  clear
-  headline "sing-box 配置"
-  if [[ -f "$SINGBOX_CONF" ]]; then
-    sed -n '1,220p' "$SINGBOX_CONF"
-  else
-    echo "未找到 $SINGBOX_CONF"
-  fi
-}
-
-reconfigure(){
-  configure_profile
-  write_singbox_config
-  validate_singbox_config
-  restart_service
-}
-
-show_client_hint(){
-  load_profile
-  clear
-  headline "客户端参数"
-  echo "协议: Snell v5"
-  echo "地址: ${SNELL_OBFS_HOST}"
-  echo "端口: ${SNELL_PORT}"
-  echo "PSK: ${SNELL_PSK}"
-  echo "UDP: ${SNELL_UDP}"
-  echo "OBFS: ${SNELL_OBFS}"
-  if [[ "$SNELL_OBFS" != "off" ]]; then
-    echo "OBFS Host: ${SNELL_OBFS_HOST}"
-  fi
-  echo "DNS: ${SB_DNS_SERVER}"
-  echo
-  echo "说明: 当前为纯 sing-box 承载的 Snell v5 inbound，不再依赖独立 snell-server。"
-}
-
-uninstall_all(){
-  stop_service || true
-  rc-update del sing-box default >/dev/null 2>&1 || true
-  rm -f "$SINGBOX_SERVICE" "$SINGBOX_BIN"
-  rm -rf "$CONF_DIR" "$WORKDIR"
-  rm -f "$SYSCTL_FILE"
-  cleanup_legacy_snell
-  info "已卸载纯 sing-box Snell v5 环境"
-}
-
-main_menu(){
-  while true; do
+# -------------------------
+# 菜单
+# -------------------------
+while true; do
     clear
-    headline "Alpine 纯 sing-box Snell v5 菜单管理脚本 v${SCRIPT_VERSION}"
-    echo "[1] 安装/初始化"
-    echo "[2] 启动 sing-box"
-    echo "[3] 停止 sing-box"
-    echo "[4] 重启 sing-box"
-    echo "[5] 查看状态"
-    echo "[6] 查看配置"
-    echo "[7] 修改配置并重载"
-    echo "[8] 查看客户端参数"
-    echo "[9] 卸载"
-    echo "[0] 退出"
-    echo
-    read -r -p "请选择: " choice
-    case "$choice" in
-      1) install_all; pause ;;
-      2) start_service; pause ;;
-      3) stop_service; pause ;;
-      4) restart_service; pause ;;
-      5) show_status; pause ;;
-      6) show_config; pause ;;
-      7) reconfigure; pause ;;
-      8) show_client_hint; pause ;;
-      9) uninstall_all; pause ;;
-      0) exit 0 ;;
-      *) warn "无效选项"; sleep 1 ;;
-    esac
-  done
-}
+    echo -e "${GREEN}===SSH 防暴力破解管理菜单===${RESET}"
+    echo -e "${GREEN}1. 安装开启SSH防暴力破解${RESET}"
+    echo -e "${GREEN}2. 关闭SSH防暴力破解${RESET}"
+    echo -e "${GREEN}3. 配置SSH防护参数${RESET}"
+    echo -e "${GREEN}4. 查看SSH拦截记录${RESET}"
+    echo -e "${GREEN}5. 查看防御规则列表${RESET}"
+    echo -e "${GREEN}6. 查看日志实时监控${RESET}"
+    echo -e "${GREEN}7. 卸载防御程序${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    read -p $'\033[32m请输入你的选择: \033[0m' choice
 
-require_root
-main_menu
+    case "$choice" in
+        1)
+            install_fail2ban
+            configure_ssh
+            ;;
+        2)
+            disable_fail2ban
+            ;;
+        3)
+            configure_ssh
+            ;;
+        4)
+            view_banned
+            ;;
+        5)
+            view_jails
+            ;;
+        6)
+            monitor_log
+            read -p $'\033[32m按回车返回菜单...\033[0m'
+            ;;
+        7)
+            uninstall_fail2ban
+            ;;
+        0)
+            break
+            ;;
+        *)
+            echo -e "${RED}无效选择，请重新输入${RESET}"
+            sleep 1
+            ;;
+    esac
+done

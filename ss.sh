@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =========================================================
-# AnyTLS 一键部署脚本 (Alpine Linux 专属修复版)
+# AnyTLS 一键部署脚本 (Alpine Linux)
 # =========================================================
 
 # ================== 颜色定义 ==================
@@ -14,7 +14,7 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 # ================== 基础变量 ==================
-SCRIPT_VERSION="1.1"
+SCRIPT_VERSION="1.3"
 SERVICE_NAME="anytls"
 BINARY_NAME="anytls-server"
 BINARY_DIR="/usr/local/bin"
@@ -50,13 +50,11 @@ pause() {
     echo
 }
 
-# ================== 用户与组创建 (已修复) ==================
+# ================== 用户与组创建 ==================
 create_user() {
-    # 确保 anytls 用户组存在
     getent group "$RUN_USER" &>/dev/null || \
         addgroup -S "$RUN_USER"
 
-    # 确保 anytls 用户存在，并强制指定主用户组为 anytls
     id "$RUN_USER" &>/dev/null || \
         adduser -S -D -H -G "$RUN_USER" -s /sbin/nologin "$RUN_USER"
 }
@@ -145,24 +143,24 @@ EOF
     chown -R ${RUN_USER}:${RUN_USER} "$ANYTLS_DIR"
 }
 
-# ================== 输出节点 ==================
+# ================== 输出节点 (修复 local 问题) ==================
 output_node_links() {
-    local ip
+    local ip port_num pwd_str hostname
+    port_num=$1
+    pwd_str=$2
     ip=$(get_public_ip)
-
-    local hostname
     hostname=$(hostname | cut -d. -f1 | sed 's/ /_/g')
 
     echo -e "${GREEN}====== AnyTLS 节点信息 ======${RESET}"
     echo -e "${YELLOW}IP      : ${ip}${RESET}"
-    echo -e "${YELLOW}端口    : $1${RESET}"
-    echo -e "${YELLOW}密码    : $2${RESET}"
+    echo -e "${YELLOW}端口    : ${port_num}${RESET}"
+    echo -e "${YELLOW}密码    : ${pwd_str}${RESET}"
     echo -e "${GREEN}---------------------------${RESET}"
     echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
     echo -e "${YELLOW}[信息] V2rayN 链接：${RESET}"
-    echo -e "${CYAN}anytls://$2@$ip:$1/?insecure=1#$hostname-Anytls${RESET}"
+    echo -e "${CYAN}anytls://${pwd_str}@${ip}:${port_num}/?insecure=1#${hostname}-Anytls${RESET}"
     echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
-    echo -e "${CYAN}$hostname-Anytls = anytls, $ip, $1, password=$2, tfo=true, skip-cert-verify=true, reuse=false${RESET}"
+    echo -e "${CYAN}${hostname}-Anytls = anytls, ${ip}, ${port_num}, password=${pwd_str}, tfo=true, skip-cert-verify=true, reuse=false${RESET}"
     echo -e "${YELLOW}---------------------------------${RESET}"
 }
 
@@ -220,7 +218,6 @@ install_ss() {
 
     write_config "$port" "$password"
 
-    # 生成 Alpine OpenRC 服务脚本
     cat > "$ANYTLS_SERVICE" <<'EOF'
 #!/sbin/openrc-run
 
@@ -243,10 +240,12 @@ start_pre() {
     
     command_background="yes"
     pidfile="/run/${RC_SVCNAME}.pid"
-    command_user="anytls:anytls"
     
-    # 允许非 root 绑定低端口
-    capabilities="cap_net_bind_service=ep"
+    if [ "${ANYTLS_PORT}" -lt 1024 ]; then
+        command_user="root:root"
+    else
+        command_user="anytls:anytls"
+    fi
 }
 EOF
     chmod +x "$ANYTLS_SERVICE"
@@ -264,7 +263,7 @@ EOF
     log "安装成功"
 }
 
-# ================== 更新 AnyTLS 主程序 ==================
+# ================== 更新 AnyTLS 主程序 (移除二次确认) ==================
 update_ss() {
     if [[ ! -f "${ANYTLS_DIR}/version.txt" || ! -f "$ANYTLS_CONFIG" ]]; then
         echo -e "${RED}[错误] 未检测到已安装的 AnyTLS 服务，请先执行安装。${RESET}"
@@ -280,14 +279,6 @@ update_ss() {
 
     echo -e "${GREEN}当前版本: v${current_version}${RESET}"
     echo -e "${GREEN}最新版本: v${latest_version}${RESET}"
-
-    if [[ "$current_version" == "$latest_version" ]]; then
-        read -p "当前已是最新版本，是否仍要重新下载覆盖？[y/N]: " remode < /dev/tty
-        if [[ ! "$remode" =~ ^[Yy]$ ]]; then
-            echo -e "${YELLOW}已取消更新。${RESET}"
-            return 0
-        fi
-    fi
 
     echo -e "${GREEN}[信息] 开始升级主程序到 v${latest_version}...${RESET}"
     local arch
@@ -384,7 +375,7 @@ show_menu() {
         port=$(grep 'ANYTLS_PORT=' "$ANYTLS_CONFIG" | cut -d= -f2)
 
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}    AnyTLS 管理面板 (Alpine)   ${RESET}"
+    echo -e "${GREEN}    AnyTLS 管理面板   ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}版本 :${RESET} ${YELLOW}${version}${RESET}"
@@ -397,7 +388,7 @@ show_menu() {
     echo -e "${GREEN}5. 启动 AnyTLS${RESET}"
     echo -e "${GREEN}6. 停止 AnyTLS${RESET}"
     echo -e "${GREEN}7. 重启 AnyTLS${RESET}"
-    echo -e "${GREEN}8. 查看运行状态${RESET}"
+    echo -e "${GREEN}8. 查看状态${RESET}"
     echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}==============================${RESET}"
@@ -419,14 +410,16 @@ while true; do
         5) rc-service "$SERVICE_NAME" start; echo -e "${GREEN}[完成] AnyTLS 已启动${RESET}"; pause ;;
         6) rc-service "$SERVICE_NAME" stop; echo -e "${GREEN}[完成] AnyTLS 已停止${RESET}"; pause ;;
         7) rc-service "$SERVICE_NAME" restart; echo -e "${GREEN}[完成] AnyTLS 已重启${RESET}"; pause ;;
-        8) rc-service "$SERVICE_NAME" status; pause ;;
+        8) rc-service "$SERVICE_NAME" status; pause ;
         9)
-            [[ -f "$ANYTLS_CONFIG" ]] && {
-                local p_port p_pass
-                p_port=$(grep 'ANYTLS_PORT=' "$ANYTLS_CONFIG" | cut -d= -f2)
-                p_pass=$(grep 'ANYTLS_PASSWORD=' "$ANYTLS_CONFIG" | cut -d= -f2)
-                output_node_links "$p_port" "$p_pass"
-            }
+            if [[ -f "$ANYTLS_CONFIG" ]]; then
+                # 去掉 local 关键字，安全读取并传递给函数
+                c_port=$(grep 'ANYTLS_PORT=' "$ANYTLS_CONFIG" | cut -d= -f2)
+                c_pass=$(grep 'ANYTLS_PASSWORD=' "$ANYTLS_CONFIG" | cut -d= -f2)
+                output_node_links "$c_port" "$c_pass"
+            else
+                echo -e "${RED}[错误] 配置文件不存在，请先安装。${RESET}"
+            fi
             pause
             ;;
         0) exit 0 ;;

@@ -1,26 +1,11 @@
-#!/usr/bin/env bash
-#
-# 多后端自动适配 Socks5 管理面板 
-# SPDX-License-Identifier: MIT
-#
+#!/bin/bash
+set -euo pipefail
+
 # =========================================================
-# 1. 核心控制与全局环境初始化
+# AnyTLS 一键部署脚本 (Alpine Linux 专属修复版)
 # =========================================================
-set -Eop pipefail
-export LANG=en_US.UTF-8
 
-# 基础目录与硬编码配置
-WORKDIR="${HOME:-/root}/Socks5"
-readonly PID_FILE="${WORKDIR}/s5.pid"
-readonly META_FILE="${WORKDIR}/meta.env"
-readonly CONFIG_S5="${WORKDIR}/config.json"
-readonly CONFIG_3PROXY="${WORKDIR}/3proxy.cfg"
-readonly SERVICE_FILE="/etc/systemd/system/s5.service"
-
-DEFAULT_PORT=1080
-PREFERRED_IMPLS=("s5" "3proxy" "microsocks" "ss5" "danted" "sockd")
-
-# 终端颜色代码
+# ================== 颜色定义 ==================
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
@@ -28,459 +13,426 @@ BLUE="\033[34m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-# =========================================================
-# 2. 官方原生底层工具函数与网络环境探测
-# =========================================================
-has_command() {
-  local _command=$1
-  type -P "$_command" > /dev/null 2>&1
+# ================== 基础变量 ==================
+SCRIPT_VERSION="1.1"
+SERVICE_NAME="anytls"
+BINARY_NAME="anytls-server"
+BINARY_DIR="/usr/local/bin"
+BINARY_PATH="${BINARY_DIR}/${BINARY_NAME}"
+
+ANYTLS_DIR="/etc/anytls"
+ANYTLS_CONFIG="${ANYTLS_DIR}/config.env"
+ANYTLS_SERVICE="/etc/init.d/${SERVICE_NAME}"
+LOG_FILE="/var/log/anytls-manager.log"
+RUN_USER="anytls"
+
+TMP_DIR=$(mktemp -d -t anytls.XXXXXX)
+
+# ================== Root 检查 ==================
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}[错误] 请使用 root 运行${RESET}"
+    exit 1
+fi
+
+# ================== 清理 ==================
+cleanup() {
+    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT INT TERM
+
+# ================== 日志 ==================
+log() {
+    echo "$(date '+%F %T') - $1" >> "$LOG_FILE"
 }
 
-info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
-error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
-pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
-
-systemctl() {
-  if ! has_command systemctl; then
-    warn "当前系统不支持 systemd，忽略守护进程操作: systemctl $*"
-    return 0
-  fi
-  command systemctl "$@"
+pause() {
+    read -n1 -s -r -p "按任意键返回菜单..." < /dev/tty
+    echo
 }
 
-ensure_workdir() {
-  mkdir -p "${WORKDIR}"
-  chmod 700 "${WORKDIR}"
+# ================== 用户与组创建 (已修复) ==================
+create_user() {
+    # 确保 anytls 用户组存在
+    getent group "$RUN_USER" &>/dev/null || \
+        addgroup -S "$RUN_USER"
+
+    # 确保 anytls 用户存在，并强制指定主用户组为 anytls
+    id "$RUN_USER" &>/dev/null || \
+        adduser -S -D -H -G "$RUN_USER" -s /sbin/nologin "$RUN_USER"
+}
+
+# ================== 公网IP ==================
+get_public_ip() {
+    local ip
+    for cmd in "curl -4fsSL --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in \
+            "https://api.ipify.org" \
+            "https://ip.sb" \
+            "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && {
+                echo "$ip"
+                return
+            }
+        done
+    done
+
+    for cmd in "curl -6fsSL --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in \
+            "https://api64.ipify.org" \
+            "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && {
+                echo "[$ip]"
+                return
+            }
+        done
+    done
+
+    echo "无法获取公网IP"
+}
+
+# ================== 依赖 ==================
+check_deps() {
+    apk add --no-cache curl wget unzip iproute2 bash
+}
+
+# ================== 端口 ==================
+check_port() {
+    if ss -tulnH "( sport = :$1 )" | grep -q . || return 0; then
+        echo -e "${RED}端口 $1 已占用${RESET}"
+        return 1
+    fi
 }
 
 random_port() {
-  shuf -i 20000-60000 -n 1
+    awk 'BEGIN{srand(); print int(rand()*(65000-10000+1))+10000}'
 }
 
-random_user() {
-  echo "s5_$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 6)"
+random_password() {
+    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c16 || true
 }
 
-random_pass() {
-  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12 || echo "s5pass123"
-}
-
-get_best_ip() {
-  local ip
-  for svc in "https://icanhazip.com" "https://ifconfig.me" "https://ipinfo.io/ip" "https://4.ipw.cn"; do
-    ip=$(curl -s --max-time 5 "$svc" || true)
-    ip=$(echo "$ip" | tr -d '[:space:]')
-    if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      echo "$ip"
-      return 0
-    fi
-  done
-
-  if has_command ip; then
-    ip=$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {print $7; exit}')
-    ip=$(echo "$ip" | tr -d '[:space:]')
-    if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      echo "$ip"
-      return 0
-    fi
-  fi
-
-  echo "127.0.0.1"
-}
-
-urlencode() {
-  local s="$1"
-  if has_command python3; then
-    python3 -c "import sys,urllib.parse as u; print(u.quote(sys.argv[1], safe=''))" "$s"
-  elif has_command python; then
-    python -c "import sys,urllib as u; print(u.quote(sys.argv[1]))" "$s"
-  else
-    printf '%s' "$s"
-  fi
-}
-
-# =========================================================
-# 3. 后端组件检测与多包管理器自动安装
-# =========================================================
-detect_existing_impl() {
-  for impl in "${PREFERRED_IMPLS[@]}"; do
-    case "${impl}" in
-      s5|3proxy|microsocks|ss5)
-        if has_command "${impl}"; then echo "${impl}"; return 0; fi
-        ;;
-      danted|sockd)
-        if has_command sockd || has_command danted; then echo "danted"; return 0; fi
-        ;;
+# ================== 架构 ==================
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64) echo amd64 ;;
+        aarch64) echo arm64 ;;
+        armv7l) echo armv7 ;;
+        *)
+            echo -e "${RED}不支持架构 $(uname -m)${RESET}"
+            exit 1
+            ;;
     esac
-  done
-  echo ""
 }
 
-try_install_package() {
-  local pkg_name="$1"
-  info "正在尝试通过包管理器部署相关组件: ${pkg_name}..."
-  if has_command apt-get; then
-    apt-get update -y && apt-get install -y "${pkg_name}" && return 0
-  elif has_command dnf; then
-    dnf install -y "${pkg_name}" && return 0
-  elif has_command yum; then
-    yum install -y "${pkg_name}" && return 0
-  elif has_command apk; then
-    apk add --no-cache "${pkg_name}" && return 0
-  elif has_command pacman; then
-    pacman -Sy --noconfirm "${pkg_name}" && return 0
-  fi
-  return 1
-}
-
-# =========================================================
-# 4. 核心配置文件与守护进程服务生成
-# =========================================================
-generate_backend_config() {
-  case "${BIN_TYPE}" in
-    3proxy)
-      cat << EOF > "${CONFIG_3PROXY}"
-daemon
-maxconn 100
-nserver 8.8.8.8
-nserver 8.8.4.4
-timeouts 1 5 30 60 180 1800 15 60
-users ${USERNAME}:CL:${PASSWORD}
-auth strong
-allow ${USERNAME}
-socks -p${PORT}
-EOF
-      chmod 600 "${CONFIG_3PROXY}"
-      ;;
-    s5)
-      cat << EOF > "${CONFIG_S5}"
-{
-  "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
-  "inbounds": [{
-    "port": ${PORT},
-    "protocol": "socks",
-    "tag": "socks",
-    "settings": {
-      "auth": "password",
-      "udp": false,
-      "ip": "0.0.0.0",
-      "userLevel": 0,
-      "accounts": [{"user": "${USERNAME}", "pass": "${PASSWORD}"}]
-    }
-  }],
-  "outbounds": [{"tag": "direct", "protocol": "freedom"}]
-}
-EOF
-      chmod 600 "${CONFIG_S5}"
-      ;;
-  esac
-}
-
-create_start_script() {
-  cat << 'EOF' > "${WORKDIR}/start.sh"
-#!/usr/bin/env bash
-WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -f "${WORKDIR}/meta.env" ]; then
-  source "${WORKDIR}/meta.env"
-else
-  echo "核心环境配置文件 meta.env 丢失"
-  exit 1
-fi
-
-case "$BIN_TYPE" in
-  3proxy)     exec 3proxy "${WORKDIR}/3proxy.cfg" ;;
-  s5)         exec s5 -c "${WORKDIR}/config.json" ;;
-  microsocks) exec microsocks -i 0.0.0.0 -p "$PORT" -u "$USERNAME" -P "$PASSWORD" ;;
-  ss5)        exec ss5 -u "$USERNAME:$PASSWORD" -p "$PORT" ;;
-  *)          echo "未知的 Socks5 底层实现引擎类型: $BIN_TYPE"; exit 1 ;;
-esac
-EOF
-  chmod +x "${WORKDIR}/start.sh"
-}
-
-create_service() {
-  cat << EOF > "${SERVICE_FILE}"
-[Unit]
-Description=Socks5 Multi-Backend Service
-After=network.target network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=${WORKDIR}
-ExecStart=${WORKDIR}/start.sh
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  if has_command systemctl; then
-    systemctl daemon-reload
-    systemctl enable s5 >/dev/null 2>&1 || true
-  fi
-}
-
-save_meta() {
-  cat << EOF > "${META_FILE}"
-PORT='${PORT}'
-USERNAME='${USERNAME}'
-PASSWORD='${PASSWORD}'
-BIN_TYPE='${BIN_TYPE}'
-EOF
-  chmod 600 "${META_FILE}"
-}
-
-load_meta() {
-  if [ -f "${META_FILE}" ]; then
-    # shellcheck disable=SC1090
-    source "${META_FILE}"
-  else
-    PORT=""
-    USERNAME=""
-    PASSWORD=""
-    BIN_TYPE=""
-  fi
-}
-
-# =========================================================
-# 5. 主流程控制模块（安装、更新、修改、卸载）
-# =========================================================
-write_and_start_service() {
-  ensure_workdir
-  save_meta
-  generate_backend_config
-  create_start_script
-  create_service
-
-  if has_command systemctl; then
-    systemctl restart s5 >/dev/null 2>&1 || true
-    sleep 1.5
-    if systemctl is-active --quiet s5 2>/dev/null; then
-      info "Socks5 核心服务配置并启动成功！"
-    else
-      error "Socks5 服务启动失败，请运行 'journalctl -u s5 -f' 查看错误日志。"
+# ================== 自动获取 GitHub 最新版本号 ==================
+get_latest_version() {
+    local latest_release
+    latest_release=$(curl -fsSL --max-time 5 "https://api.github.com/repos/anytls/anytls-go/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
+    if [[ -z "$latest_release" ]]; then
+        latest_release=$(curl -fsSLI --max-time 5 "https://github.com/anytls/anytls-go/releases/latest" 2>/dev/null | grep -i 'location:' | sed -E 's/.*\/v?([^/\r\n]+).*/\1/')
     fi
-  else
-    pkill -f "${WORKDIR}/start.sh" || true
-    "${WORKDIR}/start.sh" >/dev/null 2>&1 &
-    info "非 systemd 环境，守护进程已挂载至后台进程池中运行。"
-  fi
-  showconf
+    echo "${latest_release:-0.0.12}"
 }
 
-inst_socks5() {
-  ensure_workdir
-  
-  # 检测底层引擎依赖
-  local exist_impl
-  exist_impl="$(detect_existing_impl || true)"
-  if [ -n "${exist_impl}" ]; then
-    info "当前系统已存在可用组件实现: ${YELLOW}${exist_impl}${RESET} (将直接适配)"
-    BIN_TYPE="${exist_impl}"
-  else
-    warn "系统未检测到内置的代理实现，开始尝试自动拉取交叉编译依赖..."
-    if try_install_package "microsocks"; then
-      BIN_TYPE="microsocks"
-    elif try_install_package "3proxy"; then
-      BIN_TYPE="3proxy"
-    else
-      error "未能通过包管理器自动安装任何代理底层实现（microsocks/3proxy）。"
-      error "请检查您的网络连接或手动安装其中之一后重新运行此脚本。"
-      return 1
+# ================== 配置 ==================
+write_config() {
+    mkdir -p "$ANYTLS_DIR"
+    cat > "$ANYTLS_CONFIG" <<EOF
+ANYTLS_PORT=$1
+ANYTLS_PASSWORD=$2
+EOF
+    chmod 600 "$ANYTLS_CONFIG"
+    chown -R ${RUN_USER}:${RUN_USER} "$ANYTLS_DIR"
+}
+
+# ================== 输出节点 ==================
+output_node_links() {
+    local ip
+    ip=$(get_public_ip)
+
+    local hostname
+    hostname=$(hostname | cut -d. -f1 | sed 's/ /_/g')
+
+    echo -e "${GREEN}====== AnyTLS 节点信息 ======${RESET}"
+    echo -e "${YELLOW}IP      : ${ip}${RESET}"
+    echo -e "${YELLOW}端口    : $1${RESET}"
+    echo -e "${YELLOW}密码    : $2${RESET}"
+    echo -e "${GREEN}---------------------------${RESET}"
+    echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
+    echo -e "${YELLOW}[信息] V2rayN 链接：${RESET}"
+    echo -e "${CYAN}anytls://$2@$ip:$1/?insecure=1#$hostname-Anytls${RESET}"
+    echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
+    echo -e "${CYAN}$hostname-Anytls = anytls, $ip, $1, password=$2, tfo=true, skip-cert-verify=true, reuse=false${RESET}"
+    echo -e "${YELLOW}---------------------------------${RESET}"
+}
+
+# ================== 安装 ==================
+install_ss() {
+    echo -e "${GREEN}[信息] 开始安装 AnyTLS...${RESET}"
+
+    check_deps
+    create_user
+    mkdir -p "$ANYTLS_DIR"
+
+    local arch
+    arch=$(detect_arch)
+
+    echo -e "${GREEN}[信息] 正在获取 AnyTLS 最新版本...${RESET}"
+    local version
+    version=$(get_latest_version)
+    echo -e "${GREEN}[信息] 检测到最新版本为: v${version}${RESET}"
+
+    local url="https://github.com/anytls/anytls-go/releases/download/v${version}/anytls_${version}_linux_${arch}.zip"
+
+    cd "$TMP_DIR"
+    wget "$url" -O anytls.zip
+    unzip -o anytls.zip -d "$TMP_DIR"
+
+    local real_binary_path
+    real_binary_path=$(find "$TMP_DIR" -type f -name "$BINARY_NAME" | head -n 1)
+    if [[ -z "$real_binary_path" ]]; then
+        echo -e "${RED}[错误] 压缩包内未找到可执行程序 ${BINARY_NAME}${RESET}"
+        return 1
     fi
-  fi
 
-  local rand_user
-  rand_user="$(random_user)"
-  local rand_pass
-  rand_pass="$(random_pass)"
-  local rand_port
-  rand_port=$(random_port)
+    install -m755 "$real_binary_path" "$BINARY_PATH"
+    echo "$version" > "${ANYTLS_DIR}/version.txt"
 
-  echo "---------------------------------------------"
-  read -rp "👉 请输入监听端口 (默认随机: ${rand_port}): " input_port
-  PORT=${input_port:-$rand_port}
-  if ! [[ "${PORT}" =~ ^[0-9]+$ ]] || [ "${PORT}" -lt 1 ] || [ "${PORT}" -gt 65535 ]; then
-    warn "端口输入无效，已自动回滚为随机端口: ${rand_port}"
-    PORT="${rand_port}"
-  fi
+    local port input_port
+    while true; do
+        read -p "请输入监听端口 (默认随机): " input_port < /dev/tty
+        port=${input_port:-$(random_port)}
 
-  read -rp "👉 请设置用户名 (默认随机: ${rand_user}): " input_user
-  USERNAME=${input_user:-$rand_user}
+        if [[ "$port" =~ ^[0-9]+$ ]] &&
+            [ "$port" -ge 1 ] &&
+            [ "$port" -le 65535 ]; then
 
-  read -rp "👉 请设置密码 (默认随机: ${rand_pass}): " input_pass
-  PASSWORD=${input_pass:-$rand_pass}
+            check_port "$port" || continue
+            break
+        fi
 
-  write_and_start_service
+        echo -e "${RED}端口无效${RESET}"
+    done
+
+    local input_password password
+    read -p "请输入密码 (默认随机): " input_password < /dev/tty
+    password=${input_password:-$(random_password)}
+
+    write_config "$port" "$password"
+
+    # 生成 Alpine OpenRC 服务脚本
+    cat > "$ANYTLS_SERVICE" <<'EOF'
+#!/sbin/openrc-run
+
+description="AnyTLS Service"
+cfgfile="/etc/anytls/config.env"
+command="/usr/local/bin/anytls-server"
+
+depend() {
+    need net
+    after firewall
 }
 
-changeconf() {
-  load_meta
-  if [ -z "${BIN_TYPE}" ]; then
-    local exist_impl
-    exist_impl="$(detect_existing_impl || true)"
-    BIN_TYPE="${exist_impl:-}"
-  fi
-  if [ -z "${BIN_TYPE}" ]; then
-    error "未找到有效的底层服务组件，请先执行选项 1 进行安装。"
-    return 1
-  fi
-
-  clear
-  echo -e "${GREEN}====== 修改 Socks5 节点配置 ======${RESET}"
-  echo "提示：直接敲回车将保持原有配置不变"
-  echo "---------------------------------------------"
-
-  local input_port input_user input_pass
-  
-  read -rp "👉 请输入新的监听端口 [当前: ${PORT:-1080}]: " input_port
-  if [ -n "$input_port" ]; then
-    if [[ "${input_port}" =~ ^[0-9]+$ ]] && [ "${input_port}" -ge 1 ] && [ "${input_port}" -le 65535 ]; then
-      PORT="${input_port}"
-    else
-      warn "输入端口格式不合法，保留原端口不变。"
+start_pre() {
+    if [ ! -f "$cfgfile" ]; then
+        eerror "Configuration file $cfgfile missing!"
+        return 1
     fi
-  fi
-
-  read -rp "👉 请设置新的用户名 [当前: ${USERNAME:-unset}]: " input_user
-  USERNAME=${input_user:-$USERNAME}
-
-  read -rp "👉 请设置新的密码 [当前: ${PASSWORD:-unset}]: " input_pass
-  PASSWORD=${input_pass:-$PASSWORD}
-
-  write_and_start_service
-}
-
-uninstall_socks5() {
-  warn "即将从当前系统中彻底卸载并清理 Socks5 服务..."
-
-  if has_command systemctl; then
-    systemctl stop s5 >/dev/null 2>&1 || true
-    systemctl disable s5 >/dev/null 2>&1 || true
-    if [ -f "${SERVICE_FILE}" ]; then
-      rm -f "${SERVICE_FILE}"
-    fi
-    systemctl daemon-reload
-  else
-    pkill -f "${WORKDIR}/start.sh" || true
-  fi
-
-  rm -rf "${WORKDIR}"
-  info "Socks5 全套配置文件及服务已经从您的系统中彻底移除！"
-}
-
-showconf() {
-  load_meta
-  if [ -z "${PORT}" ]; then
-    error "未找到任何可用的元配置文件，请确认服务已成功初始化。"
-    return 1
-  fi
-
-  local ip enc_user enc_pass enc_ip socksurl tlink
-  ip="$(get_best_ip)"
-  enc_user="$(urlencode "${USERNAME}")"
-  enc_pass="$(urlencode "${PASSWORD}")"
-  enc_ip="$(urlencode "${ip}")"
-
-  socksurl="socks://${USERNAME}:${PASSWORD}@${ip}:${PORT}"
-  tlink="https://t.me/socks?server=${enc_ip}&port=${PORT}&user=${enc_user}&pass=${enc_pass}"
-
-  echo -e "${GREEN}====== Socks5 配置 ======${RESET}"
-  echo -e "${YELLOW}● 客户端直连格式:${RESET} ${socksurl}"
-  echo -e "${YELLOW}● Telegram 快捷链接:${RESET} ${tlink}"
-  echo
-}
-
-# =========================================================
-# 6. 面板主菜单
-# =========================================================
-menu() {
-  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
-  ensure_workdir
-
-  while true; do
-    clear
-    load_meta
+    . "$cfgfile"
+    command_args="-l :${ANYTLS_PORT} -p ${ANYTLS_PASSWORD}"
     
-    local status_display
-    if has_command systemctl && systemctl is-active --quiet s5 2>/dev/null; then
-      status_display="${GREEN}● 运行中${RESET}"
-    else
-      if pkill -0 -f "${WORKDIR}/start.sh" >/dev/null 2>&1; then
-        status_display="${GREEN}● 运行中 (Pidmode)${RESET}"
-      else
-        status_display="${RED}● 未运行${RESET}"
-      fi
+    command_background="yes"
+    pidfile="/run/${RC_SVCNAME}.pid"
+    command_user="anytls:anytls"
+    
+    # 允许非 root 绑定低端口
+    capabilities="cap_net_bind_service=ep"
+}
+EOF
+    chmod +x "$ANYTLS_SERVICE"
+
+    rc-update add "$SERVICE_NAME" default
+    rc-service "$SERVICE_NAME" restart
+
+    if ! rc-service "$SERVICE_NAME" status | grep -q "started"; then
+        echo -e "${RED}AnyTLS 启动失败${RESET}"
+        return 1
     fi
 
-    local port_display="${PORT:- -}"
-    local engine_display="${BIN_TYPE:-未检测到底层安装}"
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        Socks5 管理面板       ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} ${status_display}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_display}${RESET}"
-    echo -e "${GREEN}实现   :${RESET} ${CYAN}${engine_display}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Socks5${RESET}"
-    echo -e "${GREEN}2. 修改配置${RESET}"
-    echo -e "${GREEN}3. 卸载 Socks5${RESET}"
-    echo -e "${GREEN}4. 启动 Socks5${RESET}"
-    echo -e "${GREEN}5. 停止 Socks5${RESET}"
-    echo -e "${GREEN}6. 重启 Socks5${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看连接配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-
-    local choice=""
-    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
-    [[ -z "$choice" ]] && continue
-
-    case "$choice" in
-      1) inst_socks5; pause ;;
-      2) changeconf; pause ;;
-      3) uninstall_socks5; pause ;;
-      4)
-        if has_command systemctl; then
-          systemctl start s5 && info "服务已成功拉起！"
-        else
-          pkill -f "${WORKDIR}/start.sh" || true
-          "${WORKDIR}/start.sh" >/dev/null 2>&1 &
-          info "进程已在后台独立进程池中拉起！"
-        fi
-        pause ;;
-      5)
-        if has_command systemctl; then
-          systemctl stop s5 && info "服务已成功挂起！"
-        else
-          pkill -f "${WORKDIR}/start.sh" && info "后台代理程序已终止！"
-        fi
-        pause ;;
-      6)
-        if has_command systemctl; then
-          systemctl restart s5 && info "服务已成功完成平滑重启！"
-        else
-          pkill -f "${WORKDIR}/start.sh" || true
-          "${WORKDIR}/start.sh" >/dev/null 2>&1 &
-          info "后台独立进程已重载刷新！"
-        fi
-        pause ;;
-      7)
-        if has_command systemctl; then
-          journalctl -u s5.service -n 50 --no-pager
-        else
-          warn "当前 Linux 环境不支持 Systemd 级集中式日志。"
-        fi
-        pause ;;
-      8) showconf; pause ;;
-      0) exit 0 ;;
-      *) error "未识别的无效指令，请重新进行选择。"; sleep 1 ;;
-    esac
-  done
+    echo -e "${GREEN}[完成] AnyTLS 安装成功${RESET}"
+    output_node_links "$port" "$password"
+    log "安装成功"
 }
 
-menu "$@"
+# ================== 更新 AnyTLS 主程序 ==================
+update_ss() {
+    if [[ ! -f "${ANYTLS_DIR}/version.txt" || ! -f "$ANYTLS_CONFIG" ]]; then
+        echo -e "${RED}[错误] 未检测到已安装的 AnyTLS 服务，请先执行安装。${RESET}"
+        return 1
+    fi
+
+    local current_version
+    current_version=$(cat "${ANYTLS_DIR}/version.txt")
+    
+    echo -e "${GREEN}[信息] 正在获取最新版本...${RESET}"
+    local latest_version
+    latest_version=$(get_latest_version)
+
+    echo -e "${GREEN}当前版本: v${current_version}${RESET}"
+    echo -e "${GREEN}最新版本: v${latest_version}${RESET}"
+
+    if [[ "$current_version" == "$latest_version" ]]; then
+        read -p "当前已是最新版本，是否仍要重新下载覆盖？[y/N]: " remode < /dev/tty
+        if [[ ! "$remode" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}已取消更新。${RESET}"
+            return 0
+        fi
+    fi
+
+    echo -e "${GREEN}[信息] 开始升级主程序到 v${latest_version}...${RESET}"
+    local arch
+    arch=$(detect_arch)
+    local url="https://github.com/anytls/anytls-go/releases/download/v${latest_version}/anytls_${latest_version}_linux_${arch}.zip"
+
+    cd "$TMP_DIR"
+    wget "$url" -O anytls.zip || { echo -e "${RED}下载失败${RESET}"; return 1; }
+    unzip -o anytls.zip -d "$TMP_DIR"
+
+    local real_binary_path
+    real_binary_path=$(find "$TMP_DIR" -type f -name "$BINARY_NAME" | head -n 1)
+    if [[ -z "$real_binary_path" ]]; then
+        echo -e "${RED}[错误] 压缩包内未找到可执行程序 ${BINARY_NAME}${RESET}"
+        return 1
+    fi
+
+    rc-service "$SERVICE_NAME" stop || true
+    install -m755 "$real_binary_path" "$BINARY_PATH"
+    echo "$latest_version" > "${ANYTLS_DIR}/version.txt"
+    rc-service "$SERVICE_NAME" start
+
+    if rc-service "$SERVICE_NAME" status | grep -q "started"; then
+        echo -e "${GREEN}[完成] AnyTLS 成功升级至 v${latest_version}!${RESET}"
+        log "升级成功至 v${latest_version}"
+    else
+        echo -e "${RED}[错误] 升级后服务启动失败，请检查日志。${RESET}"
+    fi
+}
+
+# ================== 修改配置 ==================
+modify_ss() {
+    [[ -f "$ANYTLS_CONFIG" ]] || {
+        echo -e "${RED}配置不存在${RESET}"
+        return
+    }
+
+    ANYTLS_PORT=$(grep 'ANYTLS_PORT=' "$ANYTLS_CONFIG" | cut -d= -f2)
+    ANYTLS_PASSWORD=$(grep 'ANYTLS_PASSWORD=' "$ANYTLS_CONFIG" | cut -d= -f2)
+
+    echo "当前端口: $ANYTLS_PORT"
+    echo "当前密码: $ANYTLS_PASSWORD"
+
+    local port password
+
+    read -p "新端口 [当前:${ANYTLS_PORT}]: " port < /dev/tty
+    port=${port:-$ANYTLS_PORT}
+
+    if [[ "$port" != "$ANYTLS_PORT" ]]; then
+        check_port "$port" || return 1
+    fi
+
+    read -p "新密码 [默认保持]: " password < /dev/tty
+    password=${password:-$ANYTLS_PASSWORD}
+
+    write_config "$port" "$password"
+    rc-service "$SERVICE_NAME" restart
+
+    echo -e "${GREEN}修改成功${RESET}"
+    output_node_links "$port" "$password"
+}
+
+# ================== 卸载 ==================
+uninstall_ss() {
+    rc-service "$SERVICE_NAME" stop || true
+    rc-update del "$SERVICE_NAME" default || true
+
+    rm -f "$ANYTLS_SERVICE"
+    rm -f "$BINARY_PATH"
+    rm -rf "$ANYTLS_DIR"
+
+    deluser "$RUN_USER" &>/dev/null || true
+    delgroup "$RUN_USER" &>/dev/null || true
+
+    echo -e "${GREEN}卸载完成${RESET}"
+}
+
+# ================== 菜单 ==================
+show_menu() {
+    clear
+    local status
+    if rc-service "$SERVICE_NAME" status 2>/dev/null | grep -q "started"; then
+        status="${GREEN}●运行中${RESET}"
+    else
+        status="${RED}●未运行${RESET}"
+    fi
+
+    local version="未安装"
+    [[ -f "${ANYTLS_DIR}/version.txt" ]] &&
+        version="v$(cat "${ANYTLS_DIR}/version.txt")"
+
+    local port="-"
+    [[ -f "$ANYTLS_CONFIG" ]] &&
+        port=$(grep 'ANYTLS_PORT=' "$ANYTLS_CONFIG" | cut -d= -f2)
+
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}    AnyTLS 管理面板 (Alpine)   ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}版本 :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port}${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}1. 安装 AnyTLS${RESET}"
+    echo -e "${GREEN}2. 更新 AnyTLS${RESET}"
+    echo -e "${GREEN}3. 卸载 AnyTLS${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 AnyTLS${RESET}"
+    echo -e "${GREEN}6. 停止 AnyTLS${RESET}"
+    echo -e "${GREEN}7. 重启 AnyTLS${RESET}"
+    echo -e "${GREEN}8. 查看运行状态${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+}
+
+# ================== 主循环 ==================
+while true; do
+    show_menu
+
+    set +e
+    read -r -p $'\033[32m请输入选项: \033[0m' choice < /dev/tty
+    set -e
+
+    case $choice in
+        1) install_ss; pause ;;
+        2) update_ss; pause ;;
+        3) uninstall_ss; pause ;;
+        4) modify_ss; pause ;;
+        5) rc-service "$SERVICE_NAME" start; echo -e "${GREEN}[完成] AnyTLS 已启动${RESET}"; pause ;;
+        6) rc-service "$SERVICE_NAME" stop; echo -e "${GREEN}[完成] AnyTLS 已停止${RESET}"; pause ;;
+        7) rc-service "$SERVICE_NAME" restart; echo -e "${GREEN}[完成] AnyTLS 已重启${RESET}"; pause ;;
+        8) rc-service "$SERVICE_NAME" status; pause ;;
+        9)
+            [[ -f "$ANYTLS_CONFIG" ]] && {
+                local p_port p_pass
+                p_port=$(grep 'ANYTLS_PORT=' "$ANYTLS_CONFIG" | cut -d= -f2)
+                p_pass=$(grep 'ANYTLS_PASSWORD=' "$ANYTLS_CONFIG" | cut -d= -f2)
+                output_node_links "$p_port" "$p_pass"
+            }
+            pause
+            ;;
+        0) exit 0 ;;
+        *)
+            echo -e "${RED}无效输入${RESET}"
+            pause
+            ;;
+    esac
+done

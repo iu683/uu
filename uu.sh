@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# Xray VLESS-Reality 管理脚本
+# Hysteria 2 管理脚本
 # =========================================================
 
 set -Eeuo pipefail
@@ -10,299 +10,188 @@ set -Eeuo pipefail
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
-BLUE="\033[34m"
 RESET="\033[0m"
 
-# ================== 路径与日志 ==================
-readonly X_DIR="/etc/xray"
-readonly X_CONFIG="${X_DIR}/config.json"
-readonly X_BIN="/usr/local/bin/xray"
-readonly X_PBK="${X_DIR}/public.key"
-readonly X_LINK="/root/xray_vless_reality.txt"
-readonly X_LOG="/var/log/xray.log"
+# ================== 路径定义 ==================
+readonly HY_DIR="/etc/hysteria"
+readonly HY_CONFIG="${HY_DIR}/config.yaml"
+readonly HY_BIN="/usr/local/bin/hysteria"
+readonly HY_LOG="/var/log/hysteria.log"
+readonly HY_NODE_FILE="${HY_DIR}/node.txt"
 
-# ================== 核心工具 ==================
+# ================== 工具函数 ==================
 info() { echo -e "${GREEN}[信息] $*${RESET}"; }
-warn() { echo -e "${GREEN}[警告] $*${RESET}"; }
-error() { echo -e "${GREEN}[错误] $*${RESET}"; }
+error() { echo -e "${RED}[错误] $*${RESET}"; }
 pause() { echo; echo -ne "${GREEN}按任意键返回菜单...${RESET}"; read -n 1 -s; echo; }
 
-# 状态获取
-get_xray_status() {
-    if rc-service xray status 2>/dev/null | grep -q "started"; then
+get_status() {
+    if rc-service hysteria status 2>/dev/null | grep -q "started"; then
         echo -e "${GREEN}● 运行中${RESET}"
     else echo -e "${RED}● 未运行${RESET}"; fi
 }
 
-get_xray_version() {
-    if [[ -x "$X_BIN" ]]; then
-        "$X_BIN" version 2>/dev/null | head -n 1 | awk '{print $2}'
-    else
-        echo "未安装"
+get_version() {
+    if [[ -x "$HY_BIN" ]]; then
+        # 兼容 Hysteria 2 的版本输出格式
+        "$HY_BIN" version 2>/dev/null | head -n 1 | awk '{print $3}' || echo "未知"
+    else echo "未安装"; fi
+}
+
+get_jump_ports() {
+    local ports=$(iptables-save -t nat | grep "PREROUTING" | grep "DNAT" | grep -oE "[0-9]+:[0-9]+" | head -n 1)
+    [[ -z "$ports" ]] && echo -e "${YELLOW}未配置${RESET}" || echo -e "${YELLOW}${ports}${RESET}"
+}
+
+get_public_ip() {
+    curl -4fsSL --max-time 5 https://api.ipify.org || echo "YOUR_SERVER_IP"
+}
+
+# ================== UDP 跳跃逻辑 ==================
+manage_udp_jump() {
+    local action=$1
+    local start=${2:-""}
+    local end=${3:-""}
+    local target_port=${4:-""}
+    local server_ip=$(ip -4 addr show | awk '/inet/ && $2 !~ /^127/ {split($2,a,"/"); print a[1]; exit}')
+
+    # 清理旧规则
+    for rule in $(iptables-save | grep "DNAT" | grep "$server_ip" | awk '{print $0}'); do
+        del_rule=$(echo "$rule" | sed 's/^-A /-D /')
+        eval iptables -t nat $del_rule 2>/dev/null || true
+    done
+
+    if [ "$action" == "add" ]; then
+        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+        iptables -t nat -I PREROUTING 1 -p udp --dport "${start}:${end}" -j DNAT --to-destination "${server_ip}:${target_port}"
+        iptables -I FORWARD 1 -p udp --dport "$target_port" -j ACCEPT 2>/dev/null || true
+        iptables-save > /etc/iptables.rules
+        echo -e "#!/bin/sh\n[ -f /etc/iptables.rules ] && iptables-restore < /etc/iptables.rules" > /etc/local.d/udp_jump.start
+        chmod +x /etc/local.d/udp_jump.start
+        rc-update add local default >/dev/null 2>&1
     fi
 }
 
-# 公网IP获取
-get_public_ip() {
-    curl -4fsSL --max-time 5 https://api.ipify.org || echo "未知IP"
-}
-# ================== 配置写入 ==================
-write_config() {
-    local port=$1 uuid=$2 domain=$3 pri=$4 sid=$5
-    local outbound=${6:-'{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}'}
-    mkdir -p "$X_DIR" && chmod 755 "$X_DIR"
-    cat > "$X_CONFIG" <<EOF
-{
-    "log": { "loglevel": "warning" },
-    "inbounds": [{
-        "port": $port, "protocol": "vless",
-        "settings": { "clients": [{"id": "$uuid", "flow": "xtls-rprx-vision"}], "decryption": "none" },
-        "streamSettings": {
-            "network": "tcp", "security": "reality",
-            "realitySettings": {
-                "dest": "$domain:443", "serverNames": ["$domain"],
-                "privateKey": "$pri", "shortIds": ["$sid"], "fingerprint": "chrome"
-            }
-        },
-        "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
-    }],
-    "outbounds": [$outbound]
-}
+# ================== 安装/更新/配置逻辑 ==================
+install_hy2() {
+    local mode=$1 # 1:安装, 2:更新, 3:修改配置
+    apk update && apk add curl ca-certificates openssl openrc iptables jq > /dev/null 2>&1
+    local arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+    local ver=$(curl -sSL https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r .tag_name)
+    
+    info "正在下载 Hysteria 2 $ver..."
+    curl -fSL "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-$arch" -o "${HY_BIN}.new"
+    chmod +x "${HY_BIN}.new"
+    rc-service hysteria stop 2>/dev/null || true
+    mv "${HY_BIN}.new" "$HY_BIN"
+
+    # 如果是更新且配置已存在，则直接跳到服务重启
+    if [ "$mode" == "2" ] && [[ -f "$HY_CONFIG" ]]; then
+        info "程序更新完成，保持原配置启动..."
+    else
+        # 安装或修改配置模式
+        mkdir -p "$HY_DIR"
+        read -rp "$(echo -e ${GREEN}"请输入主监听端口 (默认随机): "${RESET})" main_port
+        main_port=${main_port:-$((RANDOM % 45535 + 20000))}
+        local pass=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20)
+        
+        # 证书生成
+        openssl req -x509 -nodes -newkey rsa:2048 -keyout "${HY_DIR}/server.key" -out "${HY_DIR}/server.crt" -subj "/CN=www.bing.com" -days 3650 >/dev/null 2>&1
+        
+        cat <<EOF > "$HY_CONFIG"
+listen: :$main_port
+tls:
+  cert: ${HY_DIR}/server.crt
+  key: ${HY_DIR}/server.key
+auth:
+  type: password
+  password: $pass
+masquerade:
+  type: proxy
+  proxy:
+    url: https://bing.com/
+    rewriteHost: true
 EOF
-}
-
-# ================== SNI 优选 ==================
-select_best_sni() {
-    info "开始优选 SNI 延迟测试..."
-    local SNIS=(
-        amd.com apps.mzstatic.com aws.com azure.microsoft.com beacon.gtv-pub.com
-        bing.com catalog.gamepass.com cdn.bizibly.com cdn-dynmedia-1.microsoft.com
-        devblogs.microsoft.com fpinit.itunes.apple.com go.microsoft.com
-        gray-config-prod.api.arc-cdn.net gray.video-player.arcpublishing.com
-        images.nvidia.com r.bing.com services.digitaleast.mobi snap.licdn.com
-        statici.icloud.com tag.demandbase.com tag-logger.demandbase.com
-        ts1.tc.mm.bing.net ts2.tc.mm.bing.net vs.aws.amazon.com www.apple.com
-        www.icloud.com www.microsoft.com www.oracle.com www.xbox.com
-        www.xilinx.com xp.apple.com
-    )
-    local BEST_SNI=""
-    local BEST_TIME=999999
-
-    for sni in "${SNIS[@]}"; do
-        start=$(date +%s%N)
-        if timeout 2 openssl s_client -connect ${sni}:443 -servername ${sni} -brief </dev/null >/dev/null 2>&1; then
-            end=$(date +%s%N)
-            cost=$(( (end - start) / 1000000 ))
-            echo -e "${GREEN}[SNI] $sni -> ${cost}ms${RESET}"
-            if [ $cost -lt $BEST_TIME ]; then
-                BEST_TIME=$cost; BEST_SNI=$sni
+        # 端口跳跃设置
+        echo -e "${YELLOW}是否配置 UDP 端口跳跃? (直接回车跳过)${RESET}"
+        read -rp "$(echo -e ${GREEN}"设置起始端口 (建议10000-65535): "${RESET})" firstport
+        if [[ -n "$firstport" ]]; then
+            read -rp "$(echo -e ${GREEN}"设置末尾端口 (必须大于起始端口): "${RESET})" endport
+            if [[ "$endport" -gt "$firstport" ]]; then
+                manage_udp_jump "add" "$firstport" "$endport" "$main_port"
+            else
+                error "末尾端口错误，跳过跳跃设置。"
             fi
         fi
-    done
-
-    if [ -n "$BEST_SNI" ]; then
-        info "最优 SNI: $BEST_SNI (${BEST_TIME}ms)"
-        return 0
-    else
-        warn "未找到可用 SNI"
-        return 1
-    fi
-}
-
-# ================== 出口模式配置 (严谨版) ==================
-configure_custom_socks5_outbound() {
-    if [[ ! -f "$X_CONFIG" ]]; then 
-        error "错误: Xray 未安装，无法配置出口模式。"
-        return
     fi
 
-    local mode current_protocol tmp_file
-    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$X_CONFIG" 2>/dev/null || echo "freedom")
-
-    echo -e "${GREEN}---------------------------------------------${RESET}"
-    echo -ne "${GREEN}请选择出口模式：${RESET}"
-    [[ "$current_protocol" == "socks" ]] && echo -e "${YELLOW} (当前: Socks5)${RESET}" || echo -e "${GREEN} (当前: 直连)${RESET}"
-    echo -e "${GREEN}1) 直连出口${RESET}"
-    echo -e "${GREEN}2) Socks5 出口${RESET}"
-    echo -e "${GREEN}0) 取消${RESET}"
-    echo -e "${GREEN}---------------------------------------------${RESET}"
-
-    echo -ne "${GREEN}请输入选项 [0-2]: ${RESET}"; read mode
-    case "$mode" in
-        1)
-            tmp_file=$(mktemp)
-            jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$X_CONFIG" > "$tmp_file"
-            cp "$X_CONFIG" "${X_CONFIG}.bak.$(date +%s)"
-            mv "$tmp_file" "$X_CONFIG"
-            restart_xray && info "已成功切换为直连出口！" || error "切换失败。"
-            return ;;
-        2) ;;
-        *) info "已取消配置。"; return ;;
-    esac
-
-    info "配置自定义 Socks5 出口代理..."
-    local s_host s_port s_user s_pass
-    echo -ne "${GREEN}请输入 Socks5 服务器地址/IP: ${RESET}"; read s_host
-    [[ -z "$s_host" ]] && return
-
-    while true; do
-        echo -ne "${GREEN}请输入 Socks5 端口 (默认: 1080): ${RESET}"; read s_port
-        [[ -z "$s_port" ]] && s_port=1080
-        is_valid_port "$s_port" && break || error "端口无效，请输入 1-65535 之间的数字。"
-    done
-
-    echo -ne "${GREEN}请输入 Socks5 用户名 (无则回车): ${RESET}"; read s_user
-    if [[ -n "$s_user" ]]; then
-        echo -ne "${GREEN}请输入 Socks5 密码: ${RESET}"; read -s s_pass; echo
-    else
-        s_pass=""
-    fi
-
-    tmp_file=$(mktemp)
-    if [[ -n "$s_user" ]]; then
-        jq --arg host "$s_host" --argjson port "$s_port" --arg user "$s_user" --arg pass "$s_pass" \
-            '.outbounds = [{"protocol": "socks", "tag": "custom-out", "settings": {"servers": [{"address": $host, "port": $port, "users": [{"user": $user, "pass": $pass}]}]}}]' \
-            "$X_CONFIG" > "$tmp_file"
-    else
-        jq --arg host "$s_host" --argjson port "$s_port" \
-            '.outbounds = [{"protocol": "socks", "tag": "custom-out", "settings": {"servers": [{"address": $host, "port": $port}]}}]' \
-            "$X_CONFIG" > "$tmp_file"
-    fi
-
-    cp "$X_CONFIG" "${X_CONFIG}.bak.$(date +%s)"
-    mv "$tmp_file" "$X_CONFIG"
-    restart_xray && info "已成功切换为 Socks5 出口！" || error "重启失败，请检查 Socks5 信息。"
-}
-
-# 4. 修改配置
-modify_config() {
-    if [[ ! -f "$X_CONFIG" ]]; then error "请先安装 Xray"; return; fi
-    
-    # 读取当前配置
-    local curr_port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
-    local curr_domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$X_CONFIG")
-    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
-    local pri=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$X_CONFIG")
-    local sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$X_CONFIG")
-    local pub=$(cat "$X_PBK")
-    local curr_outbound=$(jq -c '.outbounds[0]' "$X_CONFIG")
-
-    read -p "请输入新端口 (回车保持 $curr_port): " n_port
-    n_port=${n_port:-$curr_port}
-    read -p "请输入新域名 (回车保持 $curr_domain): " n_domain
-    n_domain=${n_domain:-$curr_domain}
-    
-    write_config "$n_port" "$uuid" "$n_domain" "$pri" "$sid" "$curr_outbound"
-    rc-service xray restart
-    
-    # 更新分享链接
-    local ip=$(get_public_ip)
-    echo "vless://$uuid@$ip:$n_port?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=$n_domain&fp=chrome&pbk=$pub&sid=$sid#Alpine-Reality" > "$X_LINK"
-    info "配置已更新！"
-}
-
-# ================== 安装与管理 ==================
-install_xray() {
-    info "正在安装依赖与内核..."
-    apk update && apk add curl unzip openssl jq uuidgen gcompat libc6-compat bc > /dev/null 2>&1
-    mkdir -p "$X_DIR" && sync
-    
-    local arch=$(uname -m | sed 's/x86_64/64/;s/aarch64/arm64-v8a/')
-    local ver=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
-    
-    info "下载 Xray $ver ($arch)..."
-    curl -L -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/$ver/Xray-linux-$arch.zip"
-    unzip -o /tmp/xray.zip -d /tmp/xray_tmp > /dev/null
-    mv -f /tmp/xray_tmp/xray "$X_BIN" && chmod +x "$X_BIN"
-    rm -rf /tmp/xray*
-    
-    if [[ ! -f "$X_CONFIG" ]]; then
-        echo -ne "${GREEN}请输入入站端口 (回车随机): ${RESET}"; read port; [[ -z "$port" ]] && port=$((RANDOM % 45535 + 10000))
-        echo -ne "${GREEN}请输入伪装域名 (回车 www.amazon.com): ${RESET}"; read domain; [[ -z "$domain" ]] && domain="www.amazon.com"
-        
-        local uuid=$(uuidgen)
-        local keys=$($X_BIN x25519)
-        local pri=$(echo "$keys" | grep "Private" | awk '{print $NF}')
-        local pub=$(echo "$keys" | grep "Public" | awk '{print $NF}')
-        local sid=$(openssl rand -hex 4)
-        
-        echo "$pub" > "$X_PBK"
-        write_config "$port" "$uuid" "$domain" "$pri" "$sid"
-        
-        cat << EOF > /etc/init.d/xray
+    # 写入 OpenRC 服务文件
+    cat <<EOF > /etc/init.d/hysteria
 #!/sbin/openrc-run
-command="/usr/local/bin/xray"
-command_args="run -c /etc/xray/config.json"
-command_background="yes"
-pidfile="/run/xray.pid"
-output_log="$X_LOG"
-error_log="$X_LOG"
+name="hysteria2"
+command="$HY_BIN"
+command_args="server -c $HY_CONFIG"
+command_background=true
+pidfile="/run/\${RC_SVCNAME}.pid"
+output_log="$HY_LOG"
+error_log="$HY_LOG"
+depend() { need net; }
 EOF
-        chmod +x /etc/init.d/xray
-        touch "$X_LOG"
-        rc-update add xray default >/dev/null 2>&1
-    fi
+    chmod +x /etc/init.d/hysteria
+    rc-update add hysteria default >/dev/null 2>&1
+    rc-service hysteria restart
 
-    rc-service xray restart
-    
+    # 生成并显示节点信息
     local ip=$(get_public_ip)
-    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
-    local port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
-    local domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$X_CONFIG")
-    local pub=$(cat "$X_PBK" 2>/dev/null || echo "N/A")
-    local sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$X_CONFIG")
-    
-    local link="vless://$uuid@$ip:$port?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=$domain&fp=chrome&pbk=$pub&sid=$sid#Alpine-Reality"
-    echo "$link" > "$X_LINK"
-    
-    info "操作成功！当前节点配置："
-    echo -e "${YELLOW}$link${RESET}"
+    local p=$(grep 'listen:' "$HY_CONFIG" | cut -d':' -f3)
+    local pw=$(grep 'password:' "$HY_CONFIG" | awk '{print $2}')
+    local link="hysteria2://$pw@$ip:$p/?insecure=1&sni=www.bing.com#$(hostname)"
+    echo "$link" > "$HY_NODE_FILE"
+
+    echo -e "\n${GREEN}================ Hysteria 2 节点信息 ==================${RESET}"
+    echo -e "${YELLOW}${link}${RESET}"
+    echo -e "${GREEN}======================================================${RESET}"
 }
 
-# ================== 菜单 ==================
-show_menu() {
-    clear
-    local status=$(get_xray_status)
-    local version=$(get_xray_version)
-    local port_show="-"
-    [[ -f "$X_CONFIG" ]] && port_show=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "-")
+# ================== 菜单循环 ==================
+while true; do
+    status=$(get_status)
+    version=$(get_version)
+    jump_show=$(get_jump_ports)
+    port_show="-"
+    [[ -f "$HY_CONFIG" ]] && port_show=$(grep 'listen:' "$HY_CONFIG" | cut -d':' -f3)
 
+    clear
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   Xray Vless+Reality 管理面板      ${RESET}"
+    echo -e "${GREEN}      Hysteria 2 管理面板       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}跳跃   :${RESET} $jump_show"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 Xray Vless+Reality${RESET}"
-    echo -e "${GREEN} 2. 更新 Xray${RESET}"
-    echo -e "${GREEN} 3. 卸载 Xray${RESET}"
-    echo -e "${GREEN} 4. 修改配置${RESET}"
-    echo -e "${GREEN} 5. 启动 Xray${RESET}"
-    echo -e "${GREEN} 6. 停止 Xray${RESET}"
-    echo -e "${GREEN} 7. 重启 Xray${RESET}"
-    echo -e "${GREEN} 8. 查看日志${RESET}"
-    echo -e "${GREEN} 9. 查看节点配置${RESET}"
-    echo -e "${GREEN}10. 配置Socks5出口${RESET}"
-    echo -e "${GREEN}11. SNI域名优选✨${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}1. 安装 Hysteria 2${RESET}"
+    echo -e "${GREEN}2. 更新 Hysteria 2${RESET}"
+    echo -e "${GREEN}3. 卸载 Hysteria 2${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 Hysteria 2${RESET}"
+    echo -e "${GREEN}6. 停止 Hysteria 2${RESET}"
+    echo -e "${GREEN}7. 重启 Hysteria 2${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
-}
 
-while true; do
-    show_menu
-    echo -ne "${GREEN}请输入选项: ${RESET}"; read choice
+    read -rp "$(echo -e ${GREEN}"请输入选项: "${RESET})" choice
     case $choice in
-        1|2) install_xray; pause ;;
-        3) rc-service xray stop 2>/dev/null; rc-update del xray default 2>/dev/null; rm -rf "$X_DIR" "$X_BIN" /etc/init.d/xray "$X_LINK" "$X_LOG"; info "卸载完成"; pause ;;
-        4) modify_config; pause ;;
-        5) rc-service xray start; pause ;;
-        6) rc-service xray stop; pause ;;
-        7) rc-service xray restart; pause ;;
-        8) [[ -f "$X_LOG" ]] && tail -f "$X_LOG" || error "暂无日志"; pause ;;
-        9) [[ -f "$X_LINK" ]] && (echo -e "${YELLOW}$(cat "$X_LINK")${RESET}") || error "无配置"; pause ;;
-        10) configure_custom_socks5_outbound; pause ;;
-        11) select_best_sni; pause ;;
+        1) install_hy2 1; pause ;;
+        2) install_hy2 2; pause ;;
+        3) rc-service hysteria stop 2>/dev/null || true; manage_udp_jump "remove"; rm -rf "$HY_DIR" "$HY_BIN" /etc/init.d/hysteria "$HY_LOG" "$HY_NODE_FILE"; info "卸载完成"; pause ;;
+        4) install_hy2 3; pause ;;
+        5) rc-service hysteria start; pause ;;
+        6) rc-service hysteria stop; pause ;;
+        7) rc-service hysteria restart; pause ;;
+        8) [[ -f "$HY_LOG" ]] && tail -f "$HY_LOG" || error "无日志"; pause ;;
+        9) [[ -f "$HY_NODE_FILE" ]] && info "节点链接:\n${YELLOW}$(cat "$HY_NODE_FILE")${RESET}" || error "无配置"; pause ;;
         0) exit 0 ;;
         *) error "无效选项"; sleep 1 ;;
     esac

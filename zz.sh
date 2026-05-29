@@ -1,53 +1,133 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# Alpine sing-box TUIC v5 管理面板
+# SPDX-License-Identifier: MIT
+#
+set -Eop pipefail
+export LANG=en_US.UTF-8
 
 # =========================================================
-# Shadowsocks-Rust 管理脚本 (Alpine Linux )
+# 1. 核心控制与全局环境初始化
 # =========================================================
+readonly SINGBOX_VERSION="1.0"
+readonly BINARY_PATH="/usr/local/bin/sing-box"
+readonly TUIC_CONFIG="/etc/sing-box/config.json"
+readonly TUIC_DIR="/root/tuicV5"
+CONFIG_DIR="/etc/sing-box"
+OPENRC_SERVICE_PATH="/etc/init.d/sing-box"
+SYSCTL_FILE="/etc/sysctl.d/99-singbox-tuic.conf"
+LOG_FILE="/var/log/sing-box.log"
+RUN_USER="singbox"
 
-set -euo pipefail
+TMP_DIR=$(mktemp -d -t singbox.XXXXXX)
 
-# ================== 颜色 ==================
+# 颜色标准规范
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 BLUE="\033[34m"
 RESET="\033[0m"
 
-# ================== 基础变量 ==================
-SS_DIR="/etc/ss-rust"
-SS_CONFIG="${SS_DIR}/config.json"
-SS_INIT_SCRIPT="/etc/init.d/ss-rust"
-BINARY_PATH="/usr/local/bin/ssserver"
-LOG_FILE="/var/log/ss-rust.log"
-RUN_USER="ss-rust"
-RUN_GROUP="ss-rust"
-METHOD="2022-blake3-aes-256-gcm"
-TMP_DIR=$(mktemp -d -t ss-rust.XXXXXX)
+info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
+error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
+pause() { echo; read -n 1 -s -r -p "$(echo -e ${GREEN}"按任意键返回菜单..."${RESET})" || true; echo; }
 
-# ================== 工具函数 ==================
-info() { echo -e "${GREEN}[信息] $*${RESET}"; }
-error() { echo -e "${RED}[错误] $*${RESET}"; }
-pause() { echo; echo -ne "${GREEN}按任意键返回菜单...${RESET}"; read -n 1 -s; echo; }
+cleanup() {
+  [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT INT TERM
 
-get_latest_version() {
-    curl -fsSL "https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest" | \
-    grep '"tag_name":' | head -n 1 | sed -E 's/.*"v?([^"]+)".*/\1/'
+generate_random_password() {
+  dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
+}
+
+is_alpine() {
+  [[ -f /etc/alpine-release ]]
+}
+
+install_packages() {
+  info "正在刷新 Alpine 仓库并安装核心依赖..."
+  apk update
+  apk add --no-cache bash curl wget tar openssl openrc iproute2 jq grep sed coreutils bind-tools iptables
+}
+
+create_user() {
+  getent group "$RUN_USER" &>/dev/null || addgroup -S "$RUN_USER"
+  id "$RUN_USER" &>/dev/null || adduser -S -D -H -G "$RUN_USER" -s /sbin/nologin "$RUN_USER"
 }
 
 detect_arch() {
-    case "$(uname -m)" in
-        x86_64)  echo "x86_64-unknown-linux-musl" ;;
-        aarch64) echo "aarch64-unknown-linux-musl" ;;
-        *) error "不支持的架构: $(uname -m)"; exit 1 ;;
-    esac
+  case "$(uname -m)" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l|armv7) echo "armv7" ;;
+    *) error "不支持当前架构: $(uname -m)"; exit 8 ;;
+  esac
 }
 
-get_vps_dns() {
-    local dns_list=$(grep -E '^nameserver' /etc/resolv.conf | awk '{print $2}' | paste -sd "," -)
-    echo "${dns_list:-"1.1.1.1,8.8.8.8"}"
+check_environment() {
+  if ! is_alpine; then
+    error "本脚本仅支持 Alpine Linux 系统。"
+    exit 95
+  fi
+  install_packages
+  create_user
 }
 
-# 公网IP获取
+get_installed_version() {
+  if [[ -f "$BINARY_PATH" ]]; then
+    # 提取纯粹的版本数字，不带多余的 sing-box version 字符串
+    "$BINARY_PATH" version 2>/dev/null | head -n1 | awk '{print $3}' || echo "未知版本"
+  else
+    echo "未安装"
+  fi
+}
+
+
+clear_old_iptables() {
+  if [[ -f "${CONFIG_DIR}/hopping.txt" && -f "${CONFIG_DIR}/main_port.txt" ]]; then
+    local old_hop=$(cat "${CONFIG_DIR}/hopping.txt")
+    local old_port=$(cat "${CONFIG_DIR}/main_port.txt")
+    local old_start=${old_hop%-*}
+    local old_end=${old_hop#*-}
+
+    if [[ -n "$old_start" && -n "$old_end" && -n "$old_port" ]]; then
+      iptables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+      ip6tables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+    fi
+  fi
+}
+
+apply_new_iptables() {
+  clear_old_iptables
+  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
+    local hop_val=$(cat "${CONFIG_DIR}/hopping.txt")
+    local start_p=${hop_val%-*}
+    local end_p=${hop_val#*-}
+    
+    info "正在应用 iptables 转发规则: UDP $start_p-$end_p => 主端口 $port"
+    iptables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port"
+    ip6tables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+    
+    echo "$port" > "${CONFIG_DIR}/main_port.txt"
+  fi
+}
+
+enable_bbr() {
+  cat > "$SYSCTL_FILE" <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_fastopen=3
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+EOF
+  sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
+}
+
+# =========================================================
+# 4. 网络诊断与配置管理辅助
+# =========================================================
 get_public_ip() {
     local ip
     for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
@@ -60,249 +140,520 @@ get_public_ip() {
             ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
-    error "无法获取公网 IP 地址。" && return 1
+    echo "无法获取公网IP"
 }
 
-# ================== 核心：写入配置 ==================
-write_config_and_link() {
-    local port=$1
-    local pass=$2
-    local dns_str=$3
-    
-    dns_str=$(echo "$dns_str" | tr -d ' ')
-    local dns_json=$(echo "\"${dns_str//,/\",\"}\"")
+check_port() {
+  local port="$1"
+  if ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
+    return 1
+  fi
+  return 0
+}
 
-    cat > "$SS_CONFIG" <<EOF
+is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
+
+get_random_port() {
+  local rand_port
+  while true; do
+    rand_port=$(shuf -i 2000-65535 -n 1)
+    if check_port "$rand_port"; then
+      echo "$rand_port" && return 0
+    fi
+  done
+}
+
+get_tuic_status() {
+  if rc-service sing-box status 2>/dev/null | grep -q "started"; then
+    echo "RUNNING"
+  else
+    echo "STOPPED"
+  fi
+}
+
+get_current_port_display() {
+  if [[ -f "$TUIC_CONFIG" ]]; then
+    local main_port jump_range="无"
+    main_port=$(jq -r '.inbounds[0].listen_port // empty' "$TUIC_CONFIG" 2>/dev/null)
+    [[ -f "${CONFIG_DIR}/hopping.txt" ]] && jump_range=$(cat "${CONFIG_DIR}/hopping.txt")
+    
+    if [[ "$jump_range" != "无" ]]; then
+      echo "${main_port} [${jump_range}]"
+    else
+      echo "${main_port:- -}"
+    fi
+  else echo "-"; fi
+}
+
+
+
+# =========================================================
+# 5. 面板节点配置生成核心逻辑
+# =========================================================
+inst_cert() {
+  mkdir -p "$CONFIG_DIR/certs"
+
+  echo "---------------------------------------------"
+  echo -e "Tuic 协议证书申请方式如下："
+  echo -e " 1) 必应自签证书 ${YELLOW}（默认）${RESET}"
+  echo -e " 2) Acme 脚本自动申请 (需放放行 80 端口)"
+  echo -e " 3) 自定义证书路径"
+  echo "---------------------------------------------"
+  local certInput
+  read -rp "请输入选项 [1-3] (直接回车默认自签): " certInput
+  certInput=${certInput:-1}
+
+  cert_path="$CONFIG_DIR/certs/cert.pem"
+  key_path="$CONFIG_DIR/certs/key.pem"
+
+  if [[ $certInput == 2 ]]; then
+    if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
+      warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。请确保已暂时关闭 Web 服务。"
+    fi
+
+    if [[ -f "$cert_path" && -f "$key_path" && -s "$cert_path" && -s "$key_path" && -f "$CONFIG_DIR/certs/ca.log" ]]; then
+      tuic_domain=$(cat "$CONFIG_DIR/certs/ca.log")
+      info "检测到已有域名 [${tuic_domain}] 的安全区证书，正在复用..."
+    else
+      read -rp "请输入需要申请证书的域名: " domain
+      [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
+      
+      info "正在检查并安装 Acme.sh 依赖..."
+      local acme_cmd="/root/.acme.sh/acme.sh"
+      if [[ ! -f "$acme_cmd" ]]; then
+        curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
+      fi
+      
+      "$acme_cmd" --set-default-ca --server letsencrypt
+      
+      info "正在向 Let's Encrypt 申请证书..."
+      if [[ "$(get_public_ip)" =~ ":" ]]; then
+        "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
+      else
+        "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
+      fi
+      
+      if "$acme_cmd" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc; then
+        echo "$domain" > "$CONFIG_DIR/certs/ca.log"
+        tuic_domain=$domain
+        info "Acme 证书申请并成功分发！"
+      else
+        error "Acme 证书申请失败，自动切换回自签模式。"
+        certInput=1
+      fi
+    fi
+  elif [[ $certInput == 3 ]]; then
+    local user_cert user_key
+    read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
+    read -rp "请输入密钥文件 (privkey.pem/key) 的路径: " user_key
+    read -rp "请输入证书对应的域名: " tuic_domain
+    
+    if [[ -f "$user_cert" && -f "$user_key" ]]; then
+      cp -f "$user_cert" "$cert_path"
+      cp -f "$user_key" "$key_path"
+      info "自定义证书已成功同步至配置安全区。"
+    else
+      error "找不到输入的证书文件，自动降级回自签模式。"
+      certInput=1
+    fi
+  fi
+
+  if [[ $certInput == 1 ]]; then
+    info "将使用必应自签证书作为 Tuic 的节点证书"
+    openssl ecparam -genkey -name prime256v1 -out "$key_path"
+    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
+    tuic_domain="www.bing.com"
+  fi
+
+  chmod 644 "$cert_path"
+  chmod 600 "$key_path"
+  chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR/certs"
+}
+
+inst_port() {
+  local default_port=""
+  if [[ -f "$TUIC_CONFIG" ]]; then
+    default_port=$(jq -r '.inbounds[0].listen_port // empty' "$TUIC_CONFIG" 2>/dev/null)
+  fi
+
+  local prompt_msg="设置 Tuic 服务端监听主端口 [1-65535] (回车随机分配): "
+  [[ -n "$default_port" ]] && prompt_msg="设置 Tuic 服务端监听主端口 [当前: ${default_port}, 回车不修改]: "
+
+  while true; do
+    read -rp "$prompt_msg" port
+    if [[ -z "$port" ]]; then
+      if [[ -n "$default_port" ]]; then port="$default_port" && break
+      else
+        port=$(get_random_port)
+        info "已为您随机分配未被占用端口: $port" && break
+      fi
+    elif is_valid_port "$port"; then
+      if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
+        error "端口 ${port} 已被其它程序占用，请更换。" && continue
+      fi
+      break
+    else error "请输入有效的端口数字 (1-65535)"; fi
+  done
+
+  echo "---------------------------------------------"
+  echo -e "Tuic 端口群使用模式 ："
+  echo -e " 1) 单端口模式"
+  echo -e " 2) 端口跳跃模式 ${YELLOW}（默认)${RESET}"
+  echo "---------------------------------------------"
+  local jumpInput
+  read -rp "请选择端口模式 [1-2] (默认2): " jumpInput
+  jumpInput=${jumpInput:-2}
+
+  clear_old_iptables
+
+  if [[ $jumpInput == 2 ]]; then
+    while true; do
+      read -rp "设置外部跳跃起始端口 (建议10000-65535): " firstport
+      read -rp "设置外部跳跃末尾端口 (必须大于起始端口): " endport
+      if is_valid_port "$firstport" && is_valid_port "$endport" && [[ $firstport -lt $endport ]]; then break
+      else error "输入无效，起始端口必须小于末尾端口，请重新输入。"; fi
+    done
+    echo "$firstport-$endport" > "${CONFIG_DIR}/hopping.txt"
+  else
+    rm -f "${CONFIG_DIR}/hopping.txt" "${CONFIG_DIR}/main_port.txt"
+    info "将继续使用单端口模式"
+  fi
+}
+
+write_and_show_config() {
+  local HOSTNAME=$(hostname -s | sed 's/ /_/g')
+  local vps_ip=$(get_public_ip)
+  local last_ip="$vps_ip"
+  [[ "$vps_ip" =~ ":" ]] && last_ip="[$vps_ip]"
+
+  local is_insecure="0"
+  local skip_cert="false"
+  if [[ "$tuic_domain" == "www.bing.com" ]]; then
+    is_insecure="1"
+    skip_cert="true"
+  fi
+
+  cat << EOF > "$TUIC_CONFIG"
 {
-    "server": "::",
-    "server_port": $port,
-    "password": "$pass",
-    "method": "$METHOD",
-    "fast_open": true,
-    "mode": "tcp_and_udp",
-    "timeout": 300,
-    "no_delay": true,
-    "ipv6_first": false,
-    "nameserver": [$dns_json]
+  "log": {
+    "level": "info",
+    "output": "$LOG_FILE",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "tuic",
+      "tag": "tuic-in",
+      "listen": "::",
+      "listen_port": $port,
+      "users": [
+        {
+          "uuid": "$auth_uuid",
+          "password": "$auth_pwd"
+        }
+      ],
+      "congestion_control": "bbr",
+      "zero_rtt_handshake": false,
+      "heartbeat": "10s",
+      "tls": {
+        "enabled": true,
+        "server_name": "$tuic_domain",
+        "alpn": ["h3"],
+        "certificate_path": "$cert_path",
+        "key_path": "$key_path"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
 }
 EOF
-    chown "${RUN_USER}:${RUN_GROUP}" "$SS_CONFIG"
-    chmod 600 "$SS_CONFIG"
 
-    local ip=$(get_public_ip)
-    [[ "$ip" =~ : ]] && ip="[$ip]"
-    local encoded=$(echo -n "${METHOD}:${pass}" | base64 | tr -d '\n')
-    echo "ss://${encoded}@${ip}:${port}#$(hostname)-SS2022" > "${SS_DIR}/ss.txt"
-    echo "${HOSTNAME}-SS2022 = ss, ${ip}, ${port}, encrypt-method=${METHOD}, password=${pass}, tfo=true, udp-relay=true, ecn=true" > "${SS_DIR}/Surge.txt"
+  chmod 640 "$TUIC_CONFIG"
+  chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
+
+  apply_new_iptables
+  mkdir -p "$TUIC_DIR"
+  
+  local hopping_param=""
+  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
+    hopping_param="&mport=$(cat "${CONFIG_DIR}/hopping.txt")"
+  fi
+
+  cat << EOF > "$TUIC_DIR/url.txt"
+V6VPS 请自行替换 IP 地址为 V6
+V2rayN 链接:
+tuic://$auth_uuid:$auth_pwd@$last_ip:$port?alpn=h3&congestion_control=bbr&sni=$tuic_domain&allow_insecure=${is_insecure}${hopping_param}#$HOSTNAME-tuicv5
+
+Surge 配置:
+$HOSTNAME-tuicv5 = tuic-v5, $last_ip, $port, password=$auth_pwd, uuid=$auth_uuid, ecn=true, skip-cert-verify=${skip_cert}, sni=$tuic_domain
+EOF
+
+  rc-service sing-box restart
+  if rc-service sing-box status | grep -q "started"; then
+    info "sing-box TUIC 服务配置并启动成功！"
+  else
+    error "sing-box 启动失败，可在菜单中按 8 查看详细的闪退日志。"
+  fi
+  showconf
 }
 
-show_node_info() {
-    if [[ -f "${SS_CONFIG}" ]]; then
-        local ip port pass
-
-        ip=$(get_public_ip)
-        port=$(grep -E '"server_port":' "$SS_CONFIG" | grep -oE '[0-9]+' | head -n1)
-        pass=$(grep -E '"password":' "$SS_CONFIG" | cut -d '"' -f4 | head -n1)
-
-        [[ "$ip" =~ : ]] && ip="[$ip]"
-
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${YELLOW}       Shadowsocks 节点信息      ${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-
-        echo -e "${YELLOW} IP地址        : ${ip}${RESET}"
-        echo -e "${YELLOW} 端口          : ${port}${RESET}"
-        echo -e "${YELLOW} 密码          : ${pass}${RESET}"
-        echo -e "${YELLOW} 加密          : ${METHOD}${RESET}"
-
-        echo -e "${YELLOW}---------------------------------${RESET}"
-        echo -e "${YELLOW}📄 V6 VPS 请替换为 IPv6 地址 ★${RESET}"
-
-        echo
-        echo -e "${GREEN}SS 链接:${RESET}"
-        [[ -f "${SS_DIR}/ss.txt" ]] && echo -e "${YELLOW}$(cat "${SS_DIR}/ss.txt")${RESET}"
-
-        echo
-        echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
-        [[ -f "${SS_DIR}/Surge.txt" ]] && echo -e "${YELLOW}$(cat "${SS_DIR}/Surge.txt")${RESET}"
-
-        echo -e "${GREEN}================================${RESET}"
-    else
-        error "配置不存在。"
-    fi
-}
-
-# ================== 功能：安装 ==================
-install_ss() {
-    info "正在准备安装环境..."
-    apk add curl wget tar xz openssl iproute2 coreutils >/dev/null 2>&1
-    
-    getent group "$RUN_GROUP" >/dev/null || addgroup -S "$RUN_GROUP"
-    getent passwd "$RUN_USER" >/dev/null || adduser -S -D -H -G "$RUN_GROUP" -s /sbin/nologin "$RUN_USER"
-
-    local ver=$(get_latest_version)
-    local arch=$(detect_arch)
-    local url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${ver}/shadowsocks-v${ver}.${arch}.tar.xz"
-
-    info "正在下载 Shadowsocks-Rust v$ver..."
-    cd "$TMP_DIR"
-    wget -q --show-progress -O ss.tar.xz "$url"
-    tar -xf ss.tar.xz
-    install -m 755 ssserver "$BINARY_PATH"
-    
-    mkdir -p "$SS_DIR"
-    echo "$ver" > "${SS_DIR}/version.txt"
-    touch "$LOG_FILE"
-    chown "${RUN_USER}:${RUN_GROUP}" "$LOG_FILE"
-
-    local def_port=$((RANDOM % 40000 + 20000))
-    local def_pass=$(openssl rand -base64 32 | tr -d '\n')
-    local def_dns=$(get_vps_dns)
-
-    echo -e "${YELLOW}--- 自定义配置 (回车使用随机默认值) ---${RESET}"
-    read -rp "$(echo -e ${GREEN}"设置端口 [默认 $def_port]: "${RESET})" user_port
-    user_port=${user_port:-$def_port}
-    read -rp "$(echo -e ${GREEN}"设置密码 [默认随机生成]: "${RESET})" user_pass
-    user_pass=${user_pass:-$def_pass}
-    read -rp "$(echo -e ${GREEN}"设置 DNS (用逗号隔开) [默认 $def_dns]: "${RESET})" user_dns
-    user_dns=${user_dns:-$def_dns}
-
-    write_config_and_link "$user_port" "$user_pass" "$user_dns"
-
-    cat > "$SS_INIT_SCRIPT" <<EOF
+# =========================================================
+# 6. 安装、更新与卸载核心流控
+# =========================================================
+write_openrc_script() {
+  cat << 'EOF' > "$OPENRC_SERVICE_PATH"
 #!/sbin/openrc-run
-name="ss-rust"
-command="${BINARY_PATH}"
-command_args="-c ${SS_CONFIG}"
-command_user="${RUN_USER}:${RUN_GROUP}"
-command_background="yes"
-pidfile="/run/\${RC_SVCNAME}.pid"
-output_log="${LOG_FILE}"
-error_log="${LOG_FILE}"
-depend() { need net; }
+
+name="sing-box"
+description="sing-box TUIC OpenRC Service"
+cfgfile="/etc/sing-box/config.json"
+logfile="/var/log/sing-box.log"
+command="/usr/local/bin/sing-box"
+command_args="run -c /etc/sing-box/config.json"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    if [ ! -f "$cfgfile" ]; then
+        eerror "Configuration file $cfgfile missing!"
+        return 1
+    fi
+    
+    # 强行打通并创建底层物理日志节点
+    touch "$logfile"
+    chown singbox:singbox "$logfile"
+    chmod 644 "$logfile"
+    
+    command_background="yes"
+    pidfile="/run/${RC_SVCNAME}.pid"
+    
+    # 将标准错误与标准输出双向绑定回物理日志，抓取一切闪退现场
+    output_log="$logfile"
+    error_log="$logfile"
+    
+    local port
+    port=$(jq -r '.inbounds[0].listen_port // 0' "$cfgfile" 2>/dev/null)
+    if [ "$port" -lt 1024 ] && [ "$port" -ne 0 ]; then
+        command_user="root:root"
+    else
+        command_user="singbox:singbox"
+    fi
+}
 EOF
-    chmod +x "$SS_INIT_SCRIPT"
-    rc-update add ss-rust default
-    rc-service ss-rust start
-    info "安装完成！"
-    show_node_info
+  chmod +x "$OPENRC_SERVICE_PATH"
+  rc-update add sing-box default >/dev/null 2>&1 || true
 }
 
-# ================== 功能：更新 (无损替换) ==================
-update_ss() {
-    if [[ ! -f "$BINARY_PATH" ]]; then
-        error "未发现已安装的服务，请先选择选项 1 安装。"
-        return 1
-    fi
-
-    local current_ver=$(cat "${SS_DIR}/version.txt" 2>/dev/null || echo "未知")
-    local latest_ver=$(get_latest_version)
-
-    info "当前版本: $current_ver | 最新版本: v$latest_ver"
-
-    if [[ "$current_ver" == "$latest_ver" ]]; then
-        info "当前已是最新版本，无需更新。"
-        return 0
-    fi
-
-    info "发现新版本，正在下载升级..."
-    local arch=$(detect_arch)
-    local url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${latest_ver}/shadowsocks-v${latest_ver}.${arch}.tar.xz"
-    
-    cd "$TMP_DIR"
-    if wget -q --show-progress -O ss.tar.xz "$url"; then
-        tar -xf ss.tar.xz
-        rc-service ss-rust stop || true
-        install -m 755 ssserver "$BINARY_PATH"
-        echo "$latest_ver" > "${SS_DIR}/version.txt"
-        rc-service ss-rust start
-        info "更新成功！配置已保留。"
-    else
-        error "下载失败，请检查网络。"
-    fi
+download_core() {
+  local arch url
+  arch=$(detect_arch)
+  url=$(printf 'https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz' "$SINGBOX_VERSION" "$SINGBOX_VERSION" "$arch")
+  
+  info "正在下载官方核心 sing-box v$SINGBOX_VERSION..."
+  cd "$TMP_DIR"
+  if ! wget -O sing-box.tar.gz -q "$url"; then
+    curl -fsSL -o sing-box.tar.gz "$url" || { error "下载核心文件失败"; return 1; }
+  fi
+  
+  tar -xzf sing-box.tar.gz -C "$TMP_DIR"
+  local extracted=$(find "$TMP_DIR" -type f -name sing-box | head -n 1)
+  [[ -n "$extracted" ]] || { error "解压目标核心错误"; return 1; }
+  
+  # 如果正在运行，先暂退核心保证覆盖成功
+  rc-service sing-box stop >/dev/null 2>&1 || true
+  install -m 755 "$extracted" "$BINARY_PATH"
+  info "sing-box 核心释放完毕。"
+  return 0
 }
 
-# ================== 功能：修改配置 ==================
-modify_ss() {
-    if [[ ! -f "$SS_CONFIG" ]]; then
-        error "未发现配置，请先安装"
-        return 1
-    fi
+install_tuic() {
+  echo -e "${GREEN}[信息] 开始在 Alpine 下部署 sing-box TUIC V5 ...${RESET}"
+  check_environment
+  mkdir -p "$CONFIG_DIR" "$TUIC_DIR"
 
-    local old_port=$(grep -E '"server_port":' "$SS_CONFIG" | head -n 1 | grep -oE '[0-9]+')
-    local old_pass=$(grep -E '"password":' "$SS_CONFIG" | head -n 1 | cut -d '"' -f4)
-    
-    # 🛠 改进的 DNS 提取逻辑：直接匹配 nameserver 数组内的内容
-    local old_dns=$(grep -A 5 '"nameserver":' "$SS_CONFIG" | grep -v '"nameserver":' | tr -d ' "[]\n\r\t' | sed 's/,$//' | grep -v '}')
-    
-    if [[ -z "$old_dns" || "$old_dns" == *"{"* ]]; then
-        old_dns=$(get_vps_dns)
-    fi
+  local arch url
+  arch=$(detect_arch)
+  url=$(printf 'https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz' "$SINGBOX_VERSION" "$SINGBOX_VERSION" "$arch")
+  
+  info "正在下载官方核心 sing-box v$SINGBOX_VERSION..."
+  cd "$TMP_DIR"
+  if ! wget -O sing-box.tar.gz -q "$url"; then
+    curl -fsSL -o sing-box.tar.gz "$url" || { error "下载核心文件失败"; return 1; }
+  fi
+  
+  tar -xzf sing-box.tar.gz -C "$TMP_DIR"
+  local extracted=$(find "$TMP_DIR" -type f -name sing-box | head -n 1)
+  [[ -n "$extracted" ]] || { error "解压目标核心错误"; return 1; }
+  
+  install -m 755 "$extracted" "$BINARY_PATH"
+  info "sing-box 核心下载并释放完毕。"
 
-    echo -e "${YELLOW}--- 修改配置 (回车保持当前值) ---${RESET}"
-    read -rp "$(echo -e ${GREEN}"新端口 [当前 $old_port]: "${RESET})" new_port
-    new_port=${new_port:-$old_port}
-    read -rp "$(echo -e ${GREEN}"新密码 [当前 $old_pass]: "${RESET})" new_pass
-    new_pass=${new_pass:-$old_pass}
-    read -rp "$(echo -e ${GREEN}"新 DNS (用逗号隔开) [当前 $old_dns]: "${RESET})" new_dns
-    new_dns=${new_dns:-$old_dns}
+  write_openrc_script
+  enable_bbr
 
-    write_config_and_link "$new_port" "$new_pass" "$new_dns"
-    rc-service ss-rust restart >/dev/null 2>&1 || true
-    info "修改成功！"
-    show_node_info
+  inst_cert || return 1
+  inst_port
+  
+  read -rp "设置 Tuic 验证 UUID (回车自动分配随机 UUID): " auth_uuid
+  auth_uuid=${auth_uuid:-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "12345678-1234-1234-1234-123456781234")}
+  
+  read -rp "设置 Tuic 验证密码 (回车自动分配随机密码): " auth_pwd
+  auth_pwd=${auth_pwd:-$(generate_random_password)}
+
+  write_and_show_config
 }
 
-# ================== 菜单系统 ==================
-while true; do
-    if rc-service ss-rust status 2>/dev/null | grep -q "started"; then
-        STATUS="${GREEN}● 运行中${RESET}"
-    else
-        STATUS="${RED}● 未运行${RESET}"
-    fi
+update_tuic() {
+  if [[ ! -f "$BINARY_PATH" ]]; then
+    error "当前系统未检测到核心，无法执行覆盖升级。"
+    return 1
+  fi
+  info "检测到已有环境，正在执行纯净原地覆盖核心升级..."
+  if download_core; then
+    rc-service sing-box start
+    info "sing-box 核心纯净升级覆盖成功，服务已安全启动！"
+  else
+    error "核心升级遭遇未预期中断。"
+  fi
+}
 
-    VERSION_SHOW=$( [ -f "${SS_DIR}/version.txt" ] && echo "v$(cat ${SS_DIR}/version.txt)" || echo "未安装")
-    PORT_SHOW=$( [ -f "$SS_CONFIG" ] && grep '"server_port"' "$SS_CONFIG" | head -n 1 | grep -oE '[0-9]+' || echo "-")
+unsttuic() {
+  warn "即将卸载..."
+  clear_old_iptables
 
+  rc-service sing-box stop || true
+  rc-update del sing-box default >/dev/null 2>&1 || true
+  
+  rm -f "$BINARY_PATH" "$OPENRC_SERVICE_PATH" "$SYSCTL_FILE" "$LOG_FILE"
+  rm -rf "$CONFIG_DIR" "$TUIC_DIR"
+  
+  info "彻底卸载清理完毕！"
+}
+
+changeconf() {
+  if [[ ! -f "$TUIC_CONFIG" ]]; then
+    error "配置文件不存在，请先选择选项 1 安装"
+    return 1
+  fi
+
+  local old_uuid=$(jq -r '.inbounds[0].users[0].uuid // empty' "$TUIC_CONFIG")
+  local old_pwd=$(jq -r '.inbounds[0].users[0].password // empty' "$TUIC_CONFIG")
+  local old_cert=$(jq -r '.inbounds[0].tls.certificate_path // empty' "$TUIC_CONFIG")
+  local old_key=$(jq -r '.inbounds[0].tls.key_path // empty' "$TUIC_CONFIG")
+  local old_sni=$(jq -r '.inbounds[0].tls.server_name // "www.bing.com"' "$TUIC_CONFIG")
+
+  clear
+  echo -e "${GREEN}====== 修改 sing-box Tuic 配置 ======${RESET}"
+  echo "提示：直接敲回车将保持原有配置不变"
+  echo "---------------------------------------------"
+  
+  inst_port 
+
+  local auth_uuid
+  read -rp "设置 Tuic 验证 UUID [当前: ${old_uuid}, 回车不修改]: " auth_uuid
+  auth_uuid=${auth_uuid:-$old_uuid}
+
+  local auth_pwd
+  read -rp "设置 Tuic 验证密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
+  auth_pwd=${auth_pwd:-$old_pwd}
+
+  local cert_path key_path tuic_domain
+  echo "---------------------------------------------"
+  read -rp "是否需要修改证书？[y/N] (直接回车默认不修改): " change_cert_flag
+  if [[ "$change_cert_flag" == "y" || "$change_cert_flag" == "Y" ]]; then
+    inst_cert || return 1
+  else
+    cert_path="$old_cert"
+    key_path="$old_key"
+    tuic_domain="$old_sni"
+  fi
+
+  write_and_show_config
+  info "配置与转发链条刷新修改成功！"
+}
+
+showconf() {
+  if [[ ! -d "$TUIC_DIR" ]]; then
+    error "未找到分享配置文件。"
+    return
+  fi
+  echo -e "${GREEN}====== 节点分享与配置信息 ======${RESET}"
+  cat "$TUIC_DIR/url.txt"
+  echo
+}
+
+
+
+# =========================================================
+# 7. 面板交互菜单 
+# =========================================================
+menu() {
+  while true; do
     clear
+    local raw_status=$(get_tuic_status)
+    local status=""
+    if [[ "$raw_status" == "RUNNING" ]]; then
+      status="${GREEN}● 运行中${RESET}"
+    else
+      status="${RED}● 未运行${RESET}"
+    fi
+
+    local version=$(get_installed_version)
+    local port_show=$(get_current_port_display)
+
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   Shadowsocks-Rust 管理面板    ${RESET}"
+    echo -e "${GREEN}    Sing-box(Tuicv5) 管理面板   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $STATUS"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${VERSION_SHOW}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${PORT_SHOW}${RESET}"
+    echo -e "${GREEN}状态   :${RESET} ${status}"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Shadowsocks-Rust${RESET}"
-    echo -e "${GREEN}2. 更新 Shadowsocks-Rust${RESET}"
-    echo -e "${GREEN}3. 卸载 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}1. 安装 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}2. 更新 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}3. 卸载 Sing-box Tuicv5${RESET}"
     echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 Shadowsocks-Rust${RESET}"
-    echo -e "${GREEN}6. 停止 Shadowsocks-Rust${RESET}"
-    echo -e "${GREEN}7. 重启 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}5. 启动 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}6. 停止 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}7. 重启 Sing-box Tuicv5${RESET}"
     echo -e "${GREEN}8. 查看日志${RESET}"
     echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
 
-    read -rp "$(echo -e ${GREEN}"请输入选项: "${RESET})" choice
-    case $choice in
-        1) install_ss; pause ;;
-        2) update_ss; pause ;;
-        3) 
-            rc-service ss-rust stop || true
-            rc-update del ss-rust || true
-            rm -f "$SS_INIT_SCRIPT" "$BINARY_PATH"
-            rm -rf "$SS_DIR" "$LOG_FILE"
-            info "已卸载"; pause ;;
-        4) modify_ss; pause ;;
-        5) rc-service ss-rust start; pause ;;
-        6) rc-service ss-rust stop; pause ;;
-        7) rc-service ss-rust restart; pause ;;
-        8) 
-            info "实时日志 (Ctrl+C 退出):"
-            [[ -f "$LOG_FILE" ]] && tail -f "$LOG_FILE" || error "无日志文件"; pause ;;
-        9) show_node_info; pause ;;
-        0) exit 0 ;;
-        *) sleep 0.5 ;;
+    local choice=""
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+    [[ -z "$choice" ]] && continue
+
+    case "$choice" in
+      1) install_tuic; pause ;;
+      2) update_tuic; pause ;;
+      3) rm -f "${CONFIG_DIR}/hopping.txt" "${CONFIG_DIR}/main_port.txt" 2>/dev/null; unsttuic; pause ;;
+      4) changeconf; pause ;;
+      5) rc-service sing-box start && info "服务已成功启动！"; pause ;;
+      6) rc-service sing-box stop && info "服务已成功停止！"; pause ;;
+      7) rc-service sing-box restart && info "服务已成功重启！"; pause ;;
+      8) if [[ -f "$LOG_FILE" ]]; then tail -n 50 "$LOG_FILE"; else warn "未发现运行日志文件。"; fi; pause ;;
+      9) showconf; pause ;;
+      0) exit 0 ;;
+      *) error "无效输入，请重新选择。"; sleep 1 ;;
     esac
-done
+  done
+}
+
+if [[ ${EUID} -ne 0 ]]; then
+  error "请切换至 root 用户运行此面板脚本。"
+  exit 1
+fi
+
+menu "$@"

@@ -378,7 +378,7 @@ show_menu() {
     echo -e "${GREEN}    AnyTLS 管理面板   ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}version :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}版本 :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port}${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}1. 安装 AnyTLS${RESET}"
@@ -388,7 +388,7 @@ show_menu() {
     echo -e "${GREEN}5. 启动 AnyTLS${RESET}"
     echo -e "${GREEN}6. 停止 AnyTLS${RESET}"
     echo -e "${GREEN}7. 重启 AnyTLS${RESET}"
-    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看状态${RESET}"
     echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}==============================${RESET}"
@@ -410,12 +410,14 @@ while true; do
         5) rc-service "$SERVICE_NAME" start; echo -e "${GREEN}[完成] AnyTLS 已启动${RESET}"; pause ;;
         6) rc-service "$SERVICE_NAME" stop; echo -e "${GREEN}[完成] AnyTLS 已停止${RESET}"; pause ;;
         7) rc-service "$SERVICE_NAME" restart; echo -e "${GREEN}[完成] AnyTLS 已重启${RESET}"; pause ;;
-        8) 
-            if [ -f "$LOG_FILE" ]; then
-                tail -n 50 "$LOG_FILE"
-            else
-                echo -e "${YELLOW}暂无脚本管理日志${RESET}"
-            fi
+        8) # 确保日志文件存在防止 tail 报错
+            touch "$APP_LOG"
+            echo -e "${YELLOW}[提示] 正在实时查看运行日志，按 Ctrl + C 退出...${RESET}"
+            echo -e "${BLUE}--------------------------------------------------${RESET}"
+            set +e
+            tail -n 50 -f "$APP_LOG"
+            set -e
+            echo -e "\n${BLUE}--------------------------------------------------${RESET}"
             pause 
             ;;
         9)

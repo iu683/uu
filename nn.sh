@@ -1,52 +1,42 @@
 #!/bin/bash
 
-# =========================================================
-# Hysteria 2 管理脚本 (Alpine Linux )
-# =========================================================
-
-set -Eeuo pipefail
-
 # ================== 颜色定义 ==================
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
+GREEN="\033[1;32m"
+RED="\033[1;31m"
+YELLOW="\033[1;33m"
+PURPLE="\033[1;35m"
+SKYBLUE="\033[1;36m"
 RESET="\033[0m"
 
-# ================== 路径定义 ==================
-readonly HY_DIR="/etc/hysteria"
-readonly HY_CONFIG="${HY_DIR}/config.yaml"
-readonly HY_BIN="/usr/local/bin/hysteria"
-readonly HY_LOG="/var/log/hysteria.log"
-readonly HY_NODE_FILE="${HY_DIR}/node.txt"
+# ================== 基础环境变量 ==================
+HOSTNAME=$(hostname)
+USERNAME=$(whoami | tr '[:upper:]' '[:lower:]')
+export SECRET=${SECRET:-$(echo -n "$USERNAME+$HOSTNAME" | md5sum | head -c 32)}
+WORKDIR="$HOME/mtp"
+# 【已修改】改为开机后等待 30 秒再执行重启脚本，防止网卡未准备就绪
+CRON_CMD="@reboot sleep 30 && /bin/bash $WORKDIR/restart.sh >/dev/null 2>&1"
+LOG_FILE="$WORKDIR/mtg.log"
 
 # ================== 工具函数 ==================
-info() { echo -e "${GREEN}[信息] $*${RESET}"; }
-error() { echo -e "${RED}[错误] $*${RESET}"; }
-pause() { echo; echo -ne "${GREEN}按任意键返回菜单...${RESET}"; read -n 1 -s; echo; }
+red_echo() { echo -e "${RED}$1${RESET}"; }
+green_echo() { echo -e "${GREEN}$1${RESET}"; }
+yellow_echo() { echo -e "${YELLOW}$1${RESET}"; }
+purple_echo() { echo -e "${PURPLE}$1${RESET}"; }
 
-get_status() {
-    if rc-service hysteria status 2>/dev/null | grep -q "started"; then
-        echo -e "${GREEN}● 运行中${RESET}"
-    else echo -e "${RED}● 未运行${RESET}"; fi
-}
-
-# 🛠 修复版本抓取：强制重定向并精简匹配
-get_version() {
-    if [[ -x "$HY_BIN" ]]; then
-        local ver=$($HY_BIN version 2>&1 | grep -iE "v[0-9]+\.[0-9]+" | head -n 1 | grep -oE "v[0-9]+\.[0-9]+\.[0-9]+")
-        echo "${ver:-未知}"
+# 获取正在运行的端口
+get_running_port() {
+    local pid=$(pgrep -x mtg)
+    if [[ -n "$pid" ]]; then
+        # 尝试从进程参数中抓取绑定的端口
+        local port=$(ps -p "$pid" -o args= | grep -oE '0\.0\.0\.0:[0-9]+' | cut -d':' -f2)
+        # 如果找不到，尝试从预留文件读取
+        [[ -z "$port" && -f "$WORKDIR/port.txt" ]] && port=$(cat "$WORKDIR/port.txt")
+        echo "${port:-未知}"
     else
-        echo "未安装"
+        echo "无"
     fi
 }
 
-# 🛠 修复跳跃显示：直接读取 nat 表最新状态
-get_jump_ports() {
-    local ports=$(iptables -t nat -L PREROUTING -n --line-numbers | grep "DNAT" | grep -oE "[0-9]+:[0-9]+" | head -n 1)
-    [[ -z "$ports" ]] && echo -e "${YELLOW}未配置${RESET}" || echo -e "${YELLOW}${ports}${RESET}"
-}
-
-# 公网IP获取
 get_public_ip() {
     local ip
     for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
@@ -55,256 +45,254 @@ get_public_ip() {
         done
     done
     for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
+        for url in "https://ip6.n0at.com" "https://ip.sb"; do
             ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
-    error "无法获取公网 IP 地址。" && return 1
+    echo "无法获取公网 IP"
 }
 
-# ================== UDP 跳跃管理 (核心修复) ==================
-manage_udp_jump() {
-    local action=$1
-    local start=${2:-""}
-    local end=${3:-""}
-    local target_port=${4:-""}
-    
-    # 彻底清理所有旧的 DNAT 规则（根据关键字 Hysteria 端口或目的地址）
-    local server_ip=$(ip -4 addr show | awk '/inet/ && $2 !~ /^127/ {split($2,a,"/"); print a[1]; exit}')
-    
-    # 循环删除直到没有匹配规则
-    while iptables -t nat -L PREROUTING -n | grep -q "to:${server_ip}"; do
-        local line_num=$(iptables -t nat -L PREROUTING -n --line-numbers | grep "to:${server_ip}" | head -n 1 | awk '{print $1}')
-        [[ -z "$line_num" ]] && break
-        iptables -t nat -D PREROUTING "$line_num"
+random_port() {
+    shuf -i 2000-65000 -n 1
+}
+
+check_vps_port() {
+    local port=$1
+    while [[ -n $(lsof -i :$port 2>/dev/null) ]]; do
+        red_echo "${port} 端口已经被其他程序占用，请更换端口重试。"
+        read -p "请输入新端口（回车使用随机端口）: " port
+        [[ -z $port ]] && port=$(random_port) && green_echo "使用随机端口: $port"
     done
-
-    if [ "$action" == "add" ]; then
-        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-        iptables -t nat -I PREROUTING 1 -p udp --dport "${start}:${end}" -j DNAT --to-destination "${server_ip}:${target_port}"
-        # 放行 FORWARD
-        iptables -I FORWARD 1 -p udp --dport "$target_port" -j ACCEPT 2>/dev/null || true
-        # 保存规则
-        iptables-save > /etc/iptables.rules
-        echo -e "#!/bin/sh\n[ -f /etc/iptables.rules ] && iptables-restore < /etc/iptables.rules" > /etc/local.d/udp_jump.start
-        chmod +x /etc/local.d/udp_jump.start
-        rc-update add local default >/dev/null 2>&1
-    elif [ "$action" == "remove" ]; then
-        rm -f /etc/iptables.rules /etc/local.d/udp_jump.start
-    fi
+    echo "$port"
 }
 
-# ================== 安装与配置 ==================
-install_hy2() {
-    local mode=$1 # 1:安装, 2:更新, 3:修改配置
-    apk update && apk add curl ca-certificates openssl openrc iptables jq > /dev/null 2>&1
-    local arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
-    
-    # 获取版本并安装
-    local ver=$(curl -sSL https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r .tag_name)
-    info "正在处理 Hysteria 2 $ver..."
-    curl -fSL "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-$arch" -o "${HY_BIN}.new"
-    chmod +x "${HY_BIN}.new"
-    rc-service hysteria stop 2>/dev/null || true
-    mv "${HY_BIN}.new" "$HY_BIN"
+check_devil_port () {
+    port_list=$(devil port list)
+    tcp_ports=$(echo "$port_list" | grep -c "tcp")
+    udp_ports=$(echo "$port_list" | grep -c "udp")
 
-    # 更新模式直接跳过配置
-    if [ "$mode" == "2" ] && [[ -f "$HY_CONFIG" ]]; then
-        info "程序已更新至最新版。"
-    else
-        # 安装或修改模式：先清理旧跳跃规则
-        manage_udp_jump "remove"
-        
-        mkdir -p "$HY_DIR"
-        read -rp "$(echo -e ${GREEN}"请输入主监听端口 (默认随机): "${RESET})" main_port
-        main_port=${main_port:-$((RANDOM % 45535 + 20000))}
-        local pass=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20)
-        
-        openssl req -x509 -nodes -newkey rsa:2048 -keyout "${HY_DIR}/server.key" -out "${HY_DIR}/server.crt" -subj "/CN=www.bing.com" -days 3650 >/dev/null 2>&1
-        
-        cat <<EOF > "$HY_CONFIG"
-listen: :$main_port
-tls:
-  cert: ${HY_DIR}/server.crt
-  key: ${HY_DIR}/server.key
-auth:
-  type: password
-  password: $pass
-masquerade:
-  type: proxy
-  proxy:
-    url: https://bing.com/
-    rewriteHost: true
-EOF
-        # 端口跳跃设置
-        echo -e "${YELLOW}是否配置新的 UDP 端口跳跃? (直接回车跳过)${RESET}"
-        read -rp "$(echo -e ${GREEN}"设置起始端口(建议10000-65535): "${RESET})" firstport
-        if [[ -n "$firstport" ]]; then
-            read -rp "$(echo -e ${GREEN}"设置末尾端口(必须大于起始端口): "${RESET})" endport
-            if [[ "$endport" -gt "$firstport" ]]; then
-                manage_udp_jump "add" "$firstport" "$endport" "$main_port"
+    if [[ $tcp_ports -lt 1 ]]; then
+        yellow_echo "没有可用的 TCP 端口，正在尝试自动调整..."
+        if [[ $udp_ports -ge 3 ]]; then
+            udp_port_to_delete=$(echo "$port_list" | awk '/udp/ {print $1}' | head -n 1)
+            devil port del udp "$udp_port_to_delete" >/dev/null 2>&1
+        fi
+
+        while true; do
+            local rand_p=$(shuf -i 10000-65535 -n 1)
+            result=$(devil port add tcp "$rand_p" 2>&1)
+            if [[ $result == *"Ok"* ]]; then
+                MTP_PORT=$rand_p
+                break
             fi
+        done
+    else
+        MTP_PORT=$(echo "$port_list" | awk '/tcp/ {print $1}' | sed -n '1p')
+    fi
+    devil binexec on >/dev/null 2>&1
+}
+
+install_lsof() {
+    if ! command -v lsof &>/dev/null; then
+        if [ -f "/etc/debian_version" ]; then
+            apt update && apt install -y lsof
+        elif [ -f "/etc/alpine-release" ]; then
+            apk add lsof
         fi
     fi
-
-    # 写入服务并启动
-    cat <<EOF > /etc/init.d/hysteria
-#!/sbin/openrc-run
-name="hysteria2"
-command="$HY_BIN"
-command_args="server -c $HY_CONFIG"
-command_background=true
-pidfile="/run/\${RC_SVCNAME}.pid"
-output_log="$HY_LOG"
-error_log="$HY_LOG"
-depend() { need net; }
-EOF
-    chmod +x /etc/init.d/hysteria
-    rc-update add hysteria default >/dev/null 2>&1
-    rc-service hysteria restart
-
-    local ip=$(get_public_ip)
-    local p=$(grep 'listen:' "$HY_CONFIG" | cut -d':' -f3)
-    local pw=$(grep 'password:' "$HY_CONFIG" | awk '{print $2}')
-    local link="hysteria2://$pw@$ip:$p/?insecure=1&sni=www.bing.com#$(hostname)-hy2"
-    echo "$link" > "$HY_NODE_FILE"
-
-    echo -e "${GREEN}====== 👉 v2rayN 链接 ======${RESET}"
-    echo -e "${YELLOW}${link}${RESET}"
-    echo -e "${GREEN}====== 👉 Surge 配置 ======${RESET}"
-    echo -e "${YELLOW}$HOSTNAME-hy2 = hysteria2, $ip, $p, password=$pw, skip-cert-verify=true, sni=www.bing.com"
-    echo -e "${GREEN}======================================================${RESET}"
 }
 
-# ================== 修改配置函数 (独立) ==================
-modify_config() {
-    if [[ ! -f "$HY_CONFIG" ]]; then
-        error "未检测到配置文件，请先安装 Hysteria 2"
+# ================== Crontab 管理 ==================
+check_cron_status() {
+    # 用更稳健的方式检查 restart.sh 是否已存在于 crontab 中
+    crontab -l 2>/dev/null | grep -q "restart.sh"
+}
+
+set_cron() {
+    if ! check_cron_status; then
+        (crontab -l 2>/dev/null; echo "$CRON_CMD") | crontab -
+    fi
+}
+
+remove_cron() {
+    # 【核心修改】去掉 if check 判断，直接强制过滤！
+    # 这样不管你的路径是 /root/mtp 还是 ~/mtp，只要有 restart.sh 统统杀掉
+    crontab -l 2>/dev/null | grep -v "restart.sh" | crontab -
+}
+# ================== 核心控制服务 ==================
+start_proxy() {
+    if pgrep -x mtg >/dev/null; then
+        yellow_echo "MTProto Proxy 已经在运行中。"
+        return 0
+    fi
+    
+    if [ ! -f "$WORKDIR/mtg" ]; then
+        red_echo "未检测到安装文件，请先选择 1 安装。"
         return 1
     fi
 
-    # 1. 读取当前配置
-    local current_port=$(grep 'listen:' "$HY_CONFIG" | cut -d':' -f3)
-    local current_pass=$(grep 'password:' "$HY_CONFIG" | awk '{print $2}')
-    local current_jump=$(get_jump_ports)
-    local current_start=""
-    local current_end=""
-    [[ -n "$current_jump" ]] && current_start=$(echo "$current_jump" | cut -d':' -f1) && current_end=$(echo "$current_jump" | cut -d':' -f2)
+    local port=$(cat "$WORKDIR/port.txt" 2>/dev/null)
+    if [[ -z "$port" || "$port" == "无" ]]; then
+        red_echo "未检测到配置端口，请重新安装或修改配置。"
+        return 1
+    fi
 
-    echo -e "${YELLOW}--- 修改 Hysteria 2 配置 (回车保持默认) ---${RESET}"
+    cd "$WORKDIR" || return
+    nohup ./mtg run -b 0.0.0.0:$port "$SECRET" --stats-bind=127.0.0.1:$((port + 1)) >> "$LOG_FILE" 2>&1 &
+    green_echo "MTProto Proxy 启动成功！"
+}
 
-    # 2. 修改主端口
-    read -rp "$(echo -e ${GREEN}"设置主端口 (当前: $current_port): "${RESET})" new_port
-    new_port=${new_port:-$current_port}
+stop_proxy() {
+    if pgrep -x mtg >/dev/null; then
+        pkill -9 mtg >/dev/null 2>&1
+        clear
+        green_echo "MTProto Proxy 已成功停止。"
+    else
+        yellow_echo "MTProto Proxy 本就处于停止状态。"
+    fi
+}
 
-    # 3. 修改密码
-    read -rp "$(echo -e ${GREEN}"设置密码 (当前: $current_pass): "${RESET})" new_pass
-    new_pass=${new_pass:-$current_pass}
+show_config() {
+    if [ ! -f "$WORKDIR/link.txt" ]; then
+        red_echo "未找到连接配置，请确保已成功安装。"
+    else
+        purple_echo "==== 当前 MTProto 连接配置 ===="
+        cat "$WORKDIR/link.txt"
+    fi
+}
 
-    # 4. 修改跳跃规则
-    echo -e "${YELLOW}提示: 若需取消跳跃，请在起始端口输入 'off'${RESET}"
-    read -rp "$(echo -e ${GREEN}"设置跳跃起始端口 (当前: ${current_start:-未设置}): "${RESET})" new_start
-    new_start=${new_start:-$current_start}
+# ================== 安装与配置修改 ==================
+download_and_run_mtg() {
+    local arch="amd64"
+    cmd=$(uname -m)
+    if [ "$cmd" == "386" ]; then arch="386"; fi
+    if [ "$cmd" == "arm" ]; then arch="arm"; fi
+    if [ "$cmd" == "aarch64" ]; then arch="arm64"; fi
 
-    if [[ "$new_start" == "off" ]]; then
-        manage_udp_jump "remove"
-    elif [[ -n "$new_start" ]]; then
-        read -rp "$(echo -e ${GREEN}"设置跳跃末尾端口 (当前: ${current_end:-未设置}): "${RESET})" new_end
-        new_end=${new_end:-$current_end}
+    mkdir -p "$WORKDIR"
+    pkill -9 mtg >/dev/null 2>&1
+
+    yellow_echo "正在下载 mtg 核心组件..."
+    wget -q -O "${WORKDIR}/mtg" "https://github.com/whunt1/onekeymakemtg/raw/master/builds/ccbuilds/mtg-linux-$arch"
+    
+    if [ ! -s "${WORKDIR}/mtg" ]; then
+        red_echo "下载核心失败，请检查网络！"
+        return 1
+    fi
+    
+    chmod +x "${WORKDIR}/mtg"
+    echo "$MTP_PORT" > "$WORKDIR/port.txt"
+    cd "$WORKDIR" || return
+
+    # 运行服务并重定向日志
+    nohup ./mtg run -b 0.0.0.0:$MTP_PORT "$SECRET" --stats-bind=127.0.0.1:$((MTP_PORT + 1)) >> "$LOG_FILE" 2>&1 &
+    
+    # 创建守护/重启脚本
+    cat > "${WORKDIR}/restart.sh" <<EOF
+#!/bin/bash
+pkill -9 mtg >/dev/null 2>&1
+cd ${WORKDIR}
+nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$((MTP_PORT + 1)) >> ${LOG_FILE} 2>&1 &
+EOF
+    chmod +x "${WORKDIR}/restart.sh"
+    return 0
+}
+
+core_install() {
+    purple_echo "正在配置 MTProto 代理端口...\n"
+    
+    if [[ "$HOSTNAME" =~ mtp ]] || command -v devil &>/dev/null; then
+        check_devil_port
+        IP_LIST=($(devil vhost list | awk '/^[0-9]+/ {print $1}'))
+        IP1=${IP_LIST[0]:-$(get_public_ip)}
+    else
+        install_lsof
+        read -p "请输入 MTProto 代理端口 (回车使用随机端口): " user_port
+        [[ -z $user_port ]] && user_port=$(random_port)
+        MTP_PORT=$(check_vps_port "$user_port")
+        IP1=$(get_public_ip)
+    fi
+
+    if download_and_run_mtg; then
+        purple_echo "\n🎉 MTProto 安装/修改成功！"
+        LINKS="tg://proxy?server=$IP1&port=$MTP_PORT&secret=$SECRET"
+        green_echo "$LINKS\n"
+        echo -e "$LINKS" > "${WORKDIR}/link.txt"
         
-        if [[ -n "$new_end" && "$new_end" -gt "$new_start" ]]; then
-            manage_udp_jump "add" "$new_start" "$new_end" "$new_port"
-        else
-            error "末尾端口必须大于起始端口，跳跃设置未变更。"
-        fi
-    fi
-
-    # 5. 写入配置并重启
-    sed -i "s/listen: :.*/listen: :$new_port/" "$HY_CONFIG"
-    sed -i "s/password: .*/password: $new_pass/" "$HY_CONFIG"
-    
-    rc-service hysteria restart
-    
-    # 更新节点链接文件
-    local ip=$(get_public_ip)
-    local link="hysteria2://$new_pass@$ip:$new_port/?insecure=1&sni=www.bing.com#$(hostname)-hy2"
-    echo "$link" > "$HY_NODE_FILE"
-    
-    info "配置修改成功并已重启服务！"
-}
-
-# ================== 显示详细配置 ==================
-show_current_config() {
-    if [[ ! -f "$HY_CONFIG" ]]; then
-        error "配置文件不存在"
-        return
-    fi
-
-    local ip port pass jump_ports
-    ip=$(get_public_ip || echo "未知")
-    port=$(grep 'listen:' "$HY_CONFIG" | cut -d':' -f3)
-    pass=$(grep 'password:' "$HY_CONFIG" | awk '{print $2}')
-    jump_ports=$(get_jump_ports)
-
-    echo -e "\n${GREEN}====== Hysteria 2 当前配置 ======${RESET}"
-    echo -e "${YELLOW}IP 地址      : ${ip}${RESET}"
-    echo -e "${YELLOW}主端口       : ${port}${RESET}"
-    echo -e "${YELLOW}连接密码     : ${pass}${RESET}"
-    echo -e "${YELLOW}UDP 跳跃端口 : ${jump_ports:-未配置}${RESET}"
-    
-    if [[ -f "$HY_NODE_FILE" ]]; then
-        echo -e "${GREEN}====== 👉 v2rayN 链接 ======${RESET}"
-        echo -e "${YELLOW}hysteria2://$pass@$ip:$port/?insecure=1&sni=www.bing.com#$(hostname)-hy2"
-        echo -e "${GREEN}====== 👉 Surge 配置 ======${RESET}"
-        echo -e "${YELLOW}$HOSTNAME-hy2 = hysteria2, $ip, $port, password=$pass, skip-cert-verify=true, sni=www.bing.com"
+        read -p "是否同时将MTProto加入开机自启（Crontab）？[回车默认加入,Y/n]: " choice_cron
+        case "$choice_cron" in
+            [nN][oO]|[nN]) remove_cron ;;
+            *) set_cron ;;
+        esac
     fi
 }
 
-
-# ================== 菜单系统 ==================
+# ================== 主菜单循环 ==================
 while true; do
-    status=$(get_status)
-    version=$(get_version)
-    jump_show=$(get_jump_ports)
-    port_show=$(grep 'listen:' "$HY_CONFIG" 2>/dev/null | cut -d':' -f3 || echo "-")
-
     clear
+    # 状态与端口动态获取
+    if pgrep -x mtg >/dev/null; then
+        status_display="${GREEN}正在运行${RESET}"
+    else
+        status_display="${RED}已停止${RESET}"
+    fi
+    
+    # 获取自启状态
+    if check_cron_status; then
+        cron_display="${GREEN}已开启${RESET}"
+    else
+        cron_display="${RED}已关闭${RESET}"
+    fi
+
+    port_display=$(get_running_port)
+
+    # 打印精美面板样式
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      Hysteria 2 管理面板       ${RESET}"
+    echo -e "${GREEN}     MTProto Proxy 管理面板      ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $status"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}跳跃   :${RESET} $jump_show"
+    echo -e "${GREEN}状态     :${RESET} ${status_display}"
+    echo -e "${GREEN}端口     :${RESET} ${YELLOW}${port_display}${RESET}"
+    echo -e "${GREEN}开机自启 :${RESET} ${cron_display}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Hysteria 2${RESET}"
-    echo -e "${GREEN}2. 更新 Hysteria 2${RESET}"
-    echo -e "${GREEN}3. 卸载 Hysteria 2${RESET}"
-    echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 Hysteria 2${RESET}"
-    echo -e "${GREEN}6. 停止 Hysteria 2${RESET}"
-    echo -e "${GREEN}7. 重启 Hysteria 2${RESET}"
-    echo -e "${GREEN}8. 查看日志${RESET}"
-    echo -e "${GREEN}9. 查看节点配置${RESET}"
+    echo -e "${GREEN}1. 安装 MTProto${RESET}"
+    echo -e "${GREEN}2. 修改配置${RESET}"
+    echo -e "${GREEN}3. 卸载 MTProto${RESET}"
+    echo -e "${GREEN}4. 启动 MTProto${RESET}"
+    echo -e "${GREEN}5. 停止 MTProto${RESET}"
+    echo -e "${GREEN}6. 重启 MTProto${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看连接配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
+    read -p "$(echo -e ${GREEN}请选择:${RESET} )" choice
 
-    read -rp "$(echo -e ${GREEN}"请输入选项: "${RESET})" choice
     case $choice in
-        1) install_hy2 1; pause ;;
-        2) install_hy2 2; pause ;;
-        3) 
-            rc-service hysteria stop 2>/dev/null || true
-            manage_udp_jump "remove"
-            rm -rf "$HY_DIR" "$HY_BIN" /etc/init.d/hysteria "$HY_LOG" "$HY_NODE_FILE"
-            info "已彻底卸载并清理规则"; pause ;;
-        4) modify_config; pause ;;
-        5) rc-service hysteria start; pause ;;
-        6) rc-service hysteria stop; pause ;;
-        7) rc-service hysteria restart; pause ;;
-        8) [[ -f "$HY_LOG" ]] && tail -f "$HY_LOG" || error "日志不存在"; pause ;;
-        9) show_current_config || error "未配置"; pause ;;
-        0) exit 0 ;;
-        *) error "无效选项"; sleep 1 ;;
+        1|2)
+            clear; core_install; read -p "按回车返回菜单..." ;;
+        3)
+            clear
+            stop_proxy; remove_cron; rm -rf "$WORKDIR"
+            clear; red_echo "MTProto 已彻底从系统中卸载！"; read -p "按回车返回菜单..." ;;
+        4)
+            clear; start_proxy; read -p "按回车返回菜单..." ;;
+        5)
+            clear; stop_proxy; read -p "按回车返回菜单..." ;;
+        6)
+            clear; stop_proxy; sleep 1; start_proxy; read -p "按回车返回菜单..." ;;
+        7)
+            clear
+            if [ -f "$LOG_FILE" ]; then
+                purple_echo "=== 正在查看最新 50 行运行日志 ==="
+                tail -n 50 "$LOG_FILE"
+            else
+                yellow_echo "暂无日志文件。"
+            fi
+            read -p "按回车返回菜单..." ;;
+        8)
+            clear; show_config; read -p "按回车返回菜单..." ;;
+        0)
+            exit 0 ;;
+        *)
+            red_echo "无效输入！" ; sleep 1 ;;
     esac
 done

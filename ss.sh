@@ -41,9 +41,45 @@ get_xray_version() {
 
 # 公网IP获取
 get_public_ip() {
-    curl -4fsSL --max-time 5 https://api.ipify.org || echo "未知IP"
-}
+    local ip
 
+    for cmd in \
+        "curl -4fsSL --max-time 5" \
+        "wget -4qO- --timeout=5"; do
+
+        for url in \
+            "https://api.ipify.org" \
+            "https://ip.sb" \
+            "https://checkip.amazonaws.com"; do
+
+            ip=$($cmd "$url" 2>/dev/null || true)
+
+            if [[ -n "${ip:-}" ]]; then
+                echo "$ip"
+                return 0
+            fi
+        done
+    done
+
+    for cmd in \
+        "curl -6fsSL --max-time 5" \
+        "wget -6qO- --timeout=5"; do
+
+        for url in \
+            "https://api.ipify.org" \
+            "https://ipv6.ip.sb"; do
+
+            ip=$($cmd "$url" 2>/dev/null || true)
+
+            if [[ -n "${ip:-}" ]]; then
+                echo "$ip"
+                return 0
+            fi
+        done
+    done
+
+    return 1
+}
 # ================== 核心配置逻辑 ==================
 write_config() {
     local port=$1 uuid=$2 domain=$3 pri=$4 sid=$5

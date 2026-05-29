@@ -1,291 +1,376 @@
 #!/bin/bash
 
 # =========================================================
-# Shadowsocks-Rust 管理脚本 (Alpine Linux )
+# Xray VLESS-Reality 管理脚本(Alpine Linux )
 # =========================================================
 
-set -euo pipefail
+set -Eeuo pipefail
 
-# ================== 颜色 ==================
+# ================== 颜色定义 ==================
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 BLUE="\033[34m"
 RESET="\033[0m"
 
-# ================== 基础变量 ==================
-SS_DIR="/etc/ss-rust"
-SS_CONFIG="${SS_DIR}/config.json"
-SS_INIT_SCRIPT="/etc/init.d/ss-rust"
-BINARY_PATH="/usr/local/bin/ssserver"
-LOG_FILE="/var/log/ss-rust.log"
-RUN_USER="ss-rust"
-RUN_GROUP="ss-rust"
-METHOD="2022-blake3-aes-256-gcm"
-TMP_DIR=$(mktemp -d -t ss-rust.XXXXXX)
+# ================== 路径与日志 ==================
+readonly X_DIR="/etc/xray"
+readonly X_CONFIG="${X_DIR}/config.json"
+readonly X_BIN="/usr/local/bin/xray"
+readonly X_PBK="${X_DIR}/public.key"
+readonly X_LINK="/root/xray_vless_reality.txt"
+readonly X_LOG="/var/log/xray.log"
 
-# ================== 工具函数 ==================
+# ================== 核心工具 ==================
 info() { echo -e "${GREEN}[信息] $*${RESET}"; }
-error() { echo -e "${RED}[错误] $*${RESET}"; }
+warn() { echo -e "${GREEN}[警告] $*${RESET}"; }
+error() { echo -e "${GREEN}[错误] $*${RESET}"; }
 pause() { echo; echo -ne "${GREEN}按任意键返回菜单...${RESET}"; read -n 1 -s; echo; }
 
-get_latest_version() {
-    curl -fsSL "https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest" | \
-    grep '"tag_name":' | head -n 1 | sed -E 's/.*"v?([^"]+)".*/\1/'
+# 校验端口是否合法
+is_valid_port() {
+    local port=$1
+    if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+        return 0
+    else
+        return 1
+    fi
 }
 
-detect_arch() {
-    case "$(uname -m)" in
-        x86_64)  echo "x86_64-unknown-linux-musl" ;;
-        aarch64) echo "aarch64-unknown-linux-musl" ;;
-        *) error "不支持的架构: $(uname -m)"; exit 1 ;;
-    esac
+# 重启服务并检查结果
+restart_xray() {
+    rc-service xray restart >/dev/null 2>&1 || true
+    sleep 1
+    if rc-service xray status 2>/dev/null | grep -q "started"; then
+        return 0
+    else
+        return 1
+    fi
 }
 
-get_vps_dns() {
-    local dns_list=$(grep -E '^nameserver' /etc/resolv.conf | awk '{print $2}' | paste -sd "," -)
-    echo "${dns_list:-"1.1.1.1,8.8.8.8"}"
+# 状态获取
+get_xray_status() {
+    if rc-service xray status 2>/dev/null | grep -q "started"; then
+        echo -e "${GREEN}● 运行中${RESET}"
+    else echo -e "${RED}● 未运行${RESET}"; fi
 }
 
+get_xray_version() {
+    if [[ -x "$X_BIN" ]]; then
+        "$X_BIN" version 2>/dev/null | head -n 1 | awk '{print $2}'
+    else
+        echo "未安装"
+    fi
+}
+
+# 公网IP获取
 get_public_ip() {
     local ip
-    for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-        ip=$(curl -4s --max-time 5 "$url") && [[ -n "$ip" ]] && echo "$ip" && return
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
     done
-    echo "YOUR_IP"
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    error "无法获取公网 IP 地址。" && return 1
 }
 
-# ================== 核心：写入配置 ==================
-write_config_and_link() {
-    local port=$1
-    local pass=$2
-    local dns_str=$3
-    
-    dns_str=$(echo "$dns_str" | tr -d ' ')
-    local dns_json=$(echo "\"${dns_str//,/\",\"}\"")
-
-    cat > "$SS_CONFIG" <<EOF
+# ================== 配置写入 ==================
+write_config() {
+    local port=$1 uuid=$2 domain=$3 pri=$4 sid=$5
+    local outbound=${6:-'{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}'}
+    mkdir -p "$X_DIR" && chmod 755 "$X_DIR"
+    cat > "$X_CONFIG" <<EOF
 {
-    "server": "::",
-    "server_port": $port,
-    "password": "$pass",
-    "method": "$METHOD",
-    "fast_open": true,
-    "mode": "tcp_and_udp",
-    "timeout": 300,
-    "no_delay": true,
-    "ipv6_first": false,
-    "nameserver": [$dns_json]
+    "log": { "loglevel": "warning" },
+    "inbounds": [{
+        "port": $port, "protocol": "vless",
+        "settings": { "clients": [{"id": "$uuid", "flow": "xtls-rprx-vision"}], "decryption": "none" },
+        "streamSettings": {
+            "network": "tcp", "security": "reality",
+            "realitySettings": {
+                "dest": "$domain:443", "serverNames": ["$domain"],
+                "privateKey": "$pri", "shortIds": ["$sid"], "fingerprint": "chrome"
+            }
+        },
+        "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+    }],
+    "outbounds": [$outbound]
 }
 EOF
-    chown "${RUN_USER}:${RUN_GROUP}" "$SS_CONFIG"
-    chmod 600 "$SS_CONFIG"
-
-    local ip=$(get_public_ip)
-    [[ "$ip" =~ : ]] && ip="[$ip]"
-    local encoded=$(echo -n "${METHOD}:${pass}" | base64 | tr -d '\n')
-    echo "ss://${encoded}@${ip}:${port}#$(hostname)-SS2022" > "${SS_DIR}/ss.txt"
-    echo "${HOSTNAME}-SS2022 = ss, ${ip}, ${port}, encrypt-method=${METHOD}, password=${pass}, tfo=true, udp-relay=true, ecn=true" > "${SS_DIR}/Surge.txt"
 }
 
-show_node_info() {
-    if [[ -f "${SS_DIR}/ss.txt" ]]; then
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${YELLOW}       Shadowsocks 节点信息      ${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${YELLOW} IP地址        : ${ip}${RESET}"
+# ================== SNI 优选 ==================
+select_best_sni() {
+    info "开始优选 SNI 延迟测试..."
+    local SNIS=(
+        amd.com apps.mzstatic.com aws.com azure.microsoft.com beacon.gtv-pub.com
+        bing.com catalog.gamepass.com cdn.bizibly.com cdn-dynmedia-1.microsoft.com
+        devblogs.microsoft.com fpinit.itunes.apple.com go.microsoft.com
+        gray-config-prod.api.arc-cdn.net gray.video-player.arcpublishing.com
+        images.nvidia.com r.bing.com services.digitaleast.mobi snap.licdn.com
+        statici.icloud.com tag.demandbase.com tag-logger.demandbase.com
+        ts1.tc.mm.bing.net ts2.tc.mm.bing.net vs.aws.amazon.com www.apple.com
+        www.icloud.com www.microsoft.com www.oracle.com www.xbox.com
+        www.xilinx.com xp.apple.com
+    )
+    local BEST_SNI=""
+    local BEST_TIME=999999
 
-        echo -e "${YELLOW} 端口          : ${port}${RESET}"
+    for sni in "${SNIS[@]}"; do
+        start=$(date +%s%N)
+        if timeout 2 openssl s_client -connect ${sni}:443 -servername ${sni} -brief </dev/null >/dev/null 2>&1; then
+            end=$(date +%s%N)
+            cost=$(( (end - start) / 1000000 ))
+            echo -e "${GREEN}[SNI] $sni -> ${cost}ms${RESET}"
+            if [ $cost -lt $BEST_TIME ]; then
+                BEST_TIME=$cost; BEST_SNI=$sni
+            fi
+        fi
+    done
 
-        echo -e "${YELLOW} 密码          : $pass${RESET}"
-
-        echo -e "${YELLOW} 加密          : ${METHOD}${RESET}"
-        echo -e "${YELLOW}---------------------------------${RESET}"
-        echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
-
-        echo -e "${GREEN}SS 链接:${RESET}"
-        echo -e "${YELLOW}$(cat "${SS_DIR}/ss.txt")${RESET}"
-
-        echo
-        echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
-        echo -e "${YELLOW}$(cat "${SS_DIR}/Surge.txt")${RESET}"
-        echo -e "${BLUE}================================${RESET}"
-    else
-        error "链接文件尚未生成。"
-    fi
-}
-
-# ================== 功能：安装 ==================
-install_ss() {
-    info "正在准备安装环境..."
-    apk add curl wget tar xz openssl iproute2 coreutils >/dev/null 2>&1
-    
-    getent group "$RUN_GROUP" >/dev/null || addgroup -S "$RUN_GROUP"
-    getent passwd "$RUN_USER" >/dev/null || adduser -S -D -H -G "$RUN_GROUP" -s /sbin/nologin "$RUN_USER"
-
-    local ver=$(get_latest_version)
-    local arch=$(detect_arch)
-    local url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${ver}/shadowsocks-v${ver}.${arch}.tar.xz"
-
-    info "正在下载 Shadowsocks-Rust v$ver..."
-    cd "$TMP_DIR"
-    wget -q --show-progress -O ss.tar.xz "$url"
-    tar -xf ss.tar.xz
-    install -m 755 ssserver "$BINARY_PATH"
-    
-    mkdir -p "$SS_DIR"
-    echo "$ver" > "${SS_DIR}/version.txt"
-    touch "$LOG_FILE"
-    chown "${RUN_USER}:${RUN_GROUP}" "$LOG_FILE"
-
-    local def_port=$((RANDOM % 40000 + 20000))
-    local def_pass=$(openssl rand -base64 32 | tr -d '\n')
-    local def_dns=$(get_vps_dns)
-
-    echo -e "${YELLOW}--- 自定义配置 (回车使用随机默认值) ---${RESET}"
-    read -rp "$(echo -e ${GREEN}"设置端口 [默认 $def_port]: "${RESET})" user_port
-    user_port=${user_port:-$def_port}
-    read -rp "$(echo -e ${GREEN}"设置密码 [默认随机生成]: "${RESET})" user_pass
-    user_pass=${user_pass:-$def_pass}
-    read -rp "$(echo -e ${GREEN}"设置 DNS (用逗号隔开) [默认 $def_dns]: "${RESET})" user_dns
-    user_dns=${user_dns:-$def_dns}
-
-    write_config_and_link "$user_port" "$user_pass" "$user_dns"
-
-    cat > "$SS_INIT_SCRIPT" <<EOF
-#!/sbin/openrc-run
-name="ss-rust"
-command="${BINARY_PATH}"
-command_args="-c ${SS_CONFIG}"
-command_user="${RUN_USER}:${RUN_GROUP}"
-command_background="yes"
-pidfile="/run/\${RC_SVCNAME}.pid"
-output_log="${LOG_FILE}"
-error_log="${LOG_FILE}"
-depend() { need net; }
-EOF
-    chmod +x "$SS_INIT_SCRIPT"
-    rc-update add ss-rust default
-    rc-service ss-rust start
-    info "安装完成！"
-    show_node_info
-}
-
-# ================== 功能：更新 (无损替换) ==================
-update_ss() {
-    if [[ ! -f "$BINARY_PATH" ]]; then
-        error "未发现已安装的服务，请先选择选项 1 安装。"
-        return 1
-    fi
-
-    local current_ver=$(cat "${SS_DIR}/version.txt" 2>/dev/null || echo "未知")
-    local latest_ver=$(get_latest_version)
-
-    info "当前版本: $current_ver | 最新版本: v$latest_ver"
-
-    if [[ "$current_ver" == "$latest_ver" ]]; then
-        info "当前已是最新版本，无需更新。"
+    if [ -n "$BEST_SNI" ]; then
+        info "最优 SNI: $BEST_SNI (${BEST_TIME}ms)"
         return 0
-    fi
-
-    info "发现新版本，正在下载升级..."
-    local arch=$(detect_arch)
-    local url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${latest_ver}/shadowsocks-v${latest_ver}.${arch}.tar.xz"
-    
-    cd "$TMP_DIR"
-    if wget -q --show-progress -O ss.tar.xz "$url"; then
-        tar -xf ss.tar.xz
-        rc-service ss-rust stop || true
-        install -m 755 ssserver "$BINARY_PATH"
-        echo "$latest_ver" > "${SS_DIR}/version.txt"
-        rc-service ss-rust start
-        info "更新成功！配置已保留。"
     else
-        error "下载失败，请检查网络。"
-    fi
-}
-
-# ================== 功能：修改配置 ==================
-modify_ss() {
-    if [[ ! -f "$SS_CONFIG" ]]; then
-        error "未发现配置，请先安装"
+        warn "未找到可用 SNI"
         return 1
     fi
-
-    local old_port=$(grep -E '"server_port":' "$SS_CONFIG" | head -n 1 | grep -oE '[0-9]+')
-    local old_pass=$(grep -E '"password":' "$SS_CONFIG" | head -n 1 | cut -d '"' -f4)
-    
-    # 🛠 改进的 DNS 提取逻辑：直接匹配 nameserver 数组内的内容
-    local old_dns=$(grep -A 5 '"nameserver":' "$SS_CONFIG" | grep -v '"nameserver":' | tr -d ' "[]\n\r\t' | sed 's/,$//' | grep -v '}')
-    
-    if [[ -z "$old_dns" || "$old_dns" == *"{"* ]]; then
-        old_dns=$(get_vps_dns)
-    fi
-
-    echo -e "${YELLOW}--- 修改配置 (回车保持当前值) ---${RESET}"
-    read -rp "$(echo -e ${GREEN}"新端口 [当前 $old_port]: "${RESET})" new_port
-    new_port=${new_port:-$old_port}
-    read -rp "$(echo -e ${GREEN}"新密码 [当前 $old_pass]: "${RESET})" new_pass
-    new_pass=${new_pass:-$old_pass}
-    read -rp "$(echo -e ${GREEN}"新 DNS (用逗号隔开) [当前 $old_dns]: "${RESET})" new_dns
-    new_dns=${new_dns:-$old_dns}
-
-    write_config_and_link "$new_port" "$new_pass" "$new_dns"
-    rc-service ss-rust restart >/dev/null 2>&1 || true
-    info "修改成功！"
-    show_node_info
 }
 
-# ================== 菜单系统 ==================
-while true; do
-    if rc-service ss-rust status 2>/dev/null | grep -q "started"; then
-        STATUS="${GREEN}● 运行中${RESET}"
-    else
-        STATUS="${RED}● 未运行${RESET}"
+# ================== 出口模式配置  ==================
+configure_custom_socks5_outbound() {
+    if [[ ! -f "$X_CONFIG" ]]; then 
+        error "错误: Xray 未安装，无法配置出口模式。"
+        return
     fi
 
-    VERSION_SHOW=$( [ -f "${SS_DIR}/version.txt" ] && echo "v$(cat ${SS_DIR}/version.txt)" || echo "未安装")
-    PORT_SHOW=$( [ -f "$SS_CONFIG" ] && grep '"server_port"' "$SS_CONFIG" | head -n 1 | grep -oE '[0-9]+' || echo "-")
+    local mode current_protocol tmp_file
+    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$X_CONFIG" 2>/dev/null || echo "freedom")
 
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${GREEN}请选择出口模式：${RESET}"
+    [[ "$current_protocol" == "socks" ]] && echo -e "${YELLOW} (当前: Socks5)${RESET}" || echo -e "${GREEN} (当前: 直连)${RESET}"
+    echo -e "${GREEN}1) 直连出口${RESET}"
+    echo -e "${GREEN}2) Socks5出口${RESET}"
+    echo -e "${GREEN}0) 取消${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+
+    echo -ne "${GREEN}请输入选项 [0-2]: ${RESET}"; read mode
+    case "$mode" in
+        1)
+            tmp_file=$(mktemp)
+            jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$X_CONFIG" > "$tmp_file"
+            cp "$X_CONFIG" "${X_CONFIG}.bak.$(date +%s)"
+            mv "$tmp_file" "$X_CONFIG"
+            restart_xray && info "已成功切换为直连出口！" || error "切换失败。"
+            return ;;
+        2) ;;
+        *) info "已取消配置"; return ;;
+    esac
+
+    info "配置自定义 Socks5 出口代理..."
+    local s_host s_port s_user s_pass
+    echo -ne "${GREEN}请输入 Socks5 服务器地址/IP: ${RESET}"; read s_host
+    [[ -z "$s_host" ]] && return
+
+    while true; do
+        echo -ne "${GREEN}请输入 Socks5 端口 (默认: 1080): ${RESET}"; read s_port
+        [[ -z "$s_port" ]] && s_port=1080
+        is_valid_port "$s_port" && break || error "端口无效，请输入 1-65535 之间的数字。"
+    done
+
+    echo -ne "${GREEN}请输入 Socks5 用户名 (无则回车): ${RESET}"; read s_user
+    if [[ -n "$s_user" ]]; then
+        echo -ne "${GREEN}请输入 Socks5 密码: ${RESET}"; read -s s_pass; echo
+    else
+        s_pass=""
+    fi
+
+    tmp_file=$(mktemp)
+    if [[ -n "$s_user" ]]; then
+        jq --arg host "$s_host" --argjson port "$s_port" --arg user "$s_user" --arg pass "$s_pass" \
+            '.outbounds = [{"protocol": "socks", "tag": "custom-out", "settings": {"servers": [{"address": $host, "port": $port, "users": [{"user": $user, "pass": $pass}]}]}}]' \
+            "$X_CONFIG" > "$tmp_file"
+    else
+        jq --arg host "$s_host" --argjson port "$s_port" \
+            '.outbounds = [{"protocol": "socks", "tag": "custom-out", "settings": {"servers": [{"address": $host, "port": $port}]}}]' \
+            "$X_CONFIG" > "$tmp_file"
+    fi
+
+    cp "$X_CONFIG" "${X_CONFIG}.bak.$(date +%s)"
+    mv "$tmp_file" "$X_CONFIG"
+    restart_xray && info "已成功切换为 Socks5 出口！" || error "重启失败，请检查 Socks5 信息。"
+}
+
+# 4. 修改配置
+modify_config() {
+    if [[ ! -f "$X_CONFIG" ]]; then error "请先安装 Xray"; return; fi
+    
+    # 读取当前配置
+    local curr_port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
+    local curr_domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$X_CONFIG")
+    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
+    local pri=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$X_CONFIG")
+    local sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$X_CONFIG")
+    local pub=$(cat "$X_PBK")
+    local curr_outbound=$(jq -c '.outbounds[0]' "$X_CONFIG")
+
+    read -p "请输入新端口 (回车保持 $curr_port): " n_port
+    n_port=${n_port:-$curr_port}
+    read -p "请输入新域名 (回车保持 $curr_domain): " n_domain
+    n_domain=${n_domain:-$curr_domain}
+    
+    write_config "$n_port" "$uuid" "$n_domain" "$pri" "$sid" "$curr_outbound"
+    rc-service xray restart
+    
+    # 更新分享链接
+    local ip=$(get_public_ip)
+    echo "vless://$uuid@$ip:$n_port?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=$n_domain&fp=chrome&pbk=$pub&sid=$sid#Alpine-Reality" > "$X_LINK"
+    info "配置已更新！"
+}
+
+# ================== 安装与管理 ==================
+install_xray() {
+    info "正在安装依赖与内核..."
+    apk update && apk add curl unzip openssl jq uuidgen gcompat libc6-compat bc > /dev/null 2>&1
+    mkdir -p "$X_DIR" && sync
+    
+    local arch=$(uname -m | sed 's/x86_64/64/;s/aarch64/arm64-v8a/')
+    local ver=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+    
+    info "下载 Xray $ver ($arch)..."
+    curl -L -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/$ver/Xray-linux-$arch.zip"
+    unzip -o /tmp/xray.zip -d /tmp/xray_tmp > /dev/null
+    mv -f /tmp/xray_tmp/xray "$X_BIN" && chmod +x "$X_BIN"
+    rm -rf /tmp/xray*
+    
+    if [[ ! -f "$X_CONFIG" ]]; then
+        echo -ne "${GREEN}请输入入站端口 (回车随机): ${RESET}"; read port; [[ -z "$port" ]] && port=$((RANDOM % 45535 + 10000))
+        echo -ne "${GREEN}请输入伪装域名 (回车 www.amazon.com): ${RESET}"; read domain; [[ -z "$domain" ]] && domain="www.amazon.com"
+        
+        local uuid=$(uuidgen)
+        local keys=$($X_BIN x25519)
+        local pri=$(echo "$keys" | grep "Private" | awk '{print $NF}')
+        local pub=$(echo "$keys" | grep "Public" | awk '{print $NF}')
+        local sid=$(openssl rand -hex 4)
+        
+        echo "$pub" > "$X_PBK"
+        write_config "$port" "$uuid" "$domain" "$pri" "$sid"
+        
+        cat << EOF > /etc/init.d/xray
+#!/sbin/openrc-run
+command="/usr/local/bin/xray"
+command_args="run -c /etc/xray/config.json"
+command_background="yes"
+pidfile="/run/xray.pid"
+output_log="$X_LOG"
+error_log="$X_LOG"
+EOF
+        chmod +x /etc/init.d/xray
+        touch "$X_LOG"
+        rc-update add xray default >/dev/null 2>&1
+    fi
+
+    rc-service xray restart
+    
+    local ip=$(get_public_ip)
+    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
+    local port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
+    local domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$X_CONFIG")
+    local pub=$(cat "$X_PBK" 2>/dev/null || echo "N/A")
+    local sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$X_CONFIG")
+    
+    local link="vless://$uuid@$ip:$port?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=$domain&fp=chrome&pbk=$pub&sid=$sid#Alpine-Reality"
+    echo "$link" > "$X_LINK"
+
+    show_current_config
+    
+
+}
+
+# ================== 显示配置  ==================
+show_current_config() {
+    if [[ ! -f "$X_CONFIG" ]]; then
+        error "配置文件不存在"
+        return
+    fi
+
+    local ip uuid port domain shortid public_key outbound_mode
+    ip=$(get_public_ip || echo "未知")
+    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG" 2>/dev/null || echo "未知")
+    port=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "未知")
+    domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$X_CONFIG" 2>/dev/null || echo "未知")
+    shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$X_CONFIG" 2>/dev/null || echo "未知")
+    public_key=$(cat "$X_PBK" 2>/dev/null || echo "N/A")
+    
+    local current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$X_CONFIG" 2>/dev/null || echo "freedom")
+    [[ "$current_protocol" == "socks" ]] && outbound_mode="Socks5 链式代理" || outbound_mode="直连 (Freedom)"
+
+    echo -e "\n${GREEN}====== 当前配置详情 ======${RESET}"
+    echo -e "${YELLOW}IP地址      : ${ip}${RESET}"
+    echo -e "${YELLOW}端口        : ${port}${RESET}"
+    echo -e "${YELLOW}UUID        : ${uuid}${RESET}"
+    echo -e "${YELLOW}SNI/域名    : ${domain}${RESET}"
+    echo -e "${YELLOW}PublicKey   : ${public_key}${RESET}"
+    echo -e "${YELLOW}ShortID     : ${shortid}${RESET}"
+    echo -e "${YELLOW}出口模式    : ${outbound_mode}${RESET}"
+    
+    if [[ -f "$X_LINK" ]]; then
+        echo -e "${GREEN}====== 👉 v2rayN 分享链接 ======${RESET}"
+        cat "$X_LINK"
+    fi
+    echo
+}
+# ================== 菜单 ==================
+show_menu() {
     clear
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   Shadowsocks-Rust 管理面板    ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $STATUS"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${VERSION_SHOW}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${PORT_SHOW}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Shadowsocks-Rust${RESET}"
-    echo -e "${GREEN}2. 更新 Shadowsocks-Rust${RESET}"
-    echo -e "${GREEN}3. 卸载 Shadowsocks-Rust${RESET}"
-    echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 Shadowsocks-Rust${RESET}"
-    echo -e "${GREEN}6. 停止 Shadowsocks-Rust${RESET}"
-    echo -e "${GREEN}7. 重启 Shadowsocks-Rust${RESET}"
-    echo -e "${GREEN}8. 查看日志${RESET}"
-    echo -e "${GREEN}9. 查看节点配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    local status=$(get_xray_status)
+    local version=$(get_xray_version)
+    local port_show="-"
+    [[ -f "$X_CONFIG" ]] && port_show=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "-")
 
-    read -rp "$(echo -e ${GREEN}"请输入选项: "${RESET})" choice
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   Xray Vless+Reality 管理面板      ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $status"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN} 1. 安装 Xray Vless+Reality${RESET}"
+    echo -e "${GREEN} 2. 更新 Xray${RESET}"
+    echo -e "${GREEN} 3. 卸载 Xray${RESET}"
+    echo -e "${GREEN} 4. 修改配置${RESET}"
+    echo -e "${GREEN} 5. 启动 Xray${RESET}"
+    echo -e "${GREEN} 6. 停止 Xray${RESET}"
+    echo -e "${GREEN} 7. 重启 Xray${RESET}"
+    echo -e "${GREEN} 8. 查看日志${RESET}"
+    echo -e "${GREEN} 9. 查看节点配置${RESET}"
+    echo -e "${GREEN}10. 配置Socks5出口${RESET}"
+    echo -e "${GREEN}11. SNI域名优选✨${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+}
+
+while true; do
+    show_menu
+    echo -ne "${GREEN}请输入选项: ${RESET}"; read choice
     case $choice in
-        1) install_ss; pause ;;
-        2) update_ss; pause ;;
-        3) 
-            rc-service ss-rust stop || true
-            rc-update del ss-rust || true
-            rm -f "$SS_INIT_SCRIPT" "$BINARY_PATH"
-            rm -rf "$SS_DIR" "$LOG_FILE"
-            info "已卸载"; pause ;;
-        4) modify_ss; pause ;;
-        5) rc-service ss-rust start; pause ;;
-        6) rc-service ss-rust stop; pause ;;
-        7) rc-service ss-rust restart; pause ;;
-        8) 
-            info "实时日志 (Ctrl+C 退出):"
-            [[ -f "$LOG_FILE" ]] && tail -f "$LOG_FILE" || error "无日志文件"; pause ;;
-        9) show_node_info; pause ;;
+        1|2) install_xray; pause ;;
+        3) rc-service xray stop 2>/dev/null; rc-update del xray default 2>/dev/null; rm -rf "$X_DIR" "$X_BIN" /etc/init.d/xray "$X_LINK" "$X_LOG"; info "卸载完成"; pause ;;
+        4) modify_config; pause ;;
+        5) rc-service xray start; pause ;;
+        6) rc-service xray stop; pause ;;
+        7) rc-service xray restart; pause ;;
+        8) [[ -f "$X_LOG" ]] && tail -f "$X_LOG" || error "暂无日志"; pause ;;
+        9) show_current_config || error "无配置"; pause ;;
+        10) configure_custom_socks5_outbound; pause ;;
+        11) select_best_sni; pause ;;
         0) exit 0 ;;
-        *) sleep 0.5 ;;
+        *) error "无效选项"; sleep 1 ;;
     esac
 done

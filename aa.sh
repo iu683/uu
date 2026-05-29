@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Alpine sing-box TUIC v5 管理面板 (终极稳定版)
+# Alpine sing-box TUIC v5 管理面板
 # SPDX-License-Identifier: MIT
 #
 set -Eop pipefail
@@ -9,13 +9,12 @@ export LANG=en_US.UTF-8
 # =========================================================
 # 1. 核心控制与全局环境初始化
 # =========================================================
-readonly SINGBOX_VERSION="1.12.0"
+readonly SINGBOX_VERSION="1.0"
 readonly BINARY_PATH="/usr/local/bin/sing-box"
 readonly TUIC_CONFIG="/etc/sing-box/config.json"
 readonly TUIC_DIR="/root/tuicV5"
 CONFIG_DIR="/etc/sing-box"
 OPENRC_SERVICE_PATH="/etc/init.d/sing-box"
-SYSCTL_FILE="/etc/sysctl.d/99-singbox-tuic.conf"
 LOG_FILE="/var/log/sing-box.log"
 RUN_USER="singbox"
 
@@ -114,16 +113,6 @@ apply_new_iptables() {
   fi
 }
 
-enable_bbr() {
-  cat > "$SYSCTL_FILE" <<'EOF'
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-net.ipv4.tcp_fastopen=3
-net.core.rmem_max=67108864
-net.core.wmem_max=67108864
-EOF
-  sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
-}
 
 # =========================================================
 # 4. 网络诊断与配置管理辅助
@@ -455,6 +444,28 @@ EOF
   rc-update add sing-box default >/dev/null 2>&1 || true
 }
 
+download_core() {
+  local arch url
+  arch=$(detect_arch)
+  url=$(printf 'https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz' "$SINGBOX_VERSION" "$SINGBOX_VERSION" "$arch")
+  
+  info "正在下载官方核心 sing-box v$SINGBOX_VERSION..."
+  cd "$TMP_DIR"
+  if ! wget -O sing-box.tar.gz -q "$url"; then
+    curl -fsSL -o sing-box.tar.gz "$url" || { error "下载核心文件失败"; return 1; }
+  fi
+  
+  tar -xzf sing-box.tar.gz -C "$TMP_DIR"
+  local extracted=$(find "$TMP_DIR" -type f -name sing-box | head -n 1)
+  [[ -n "$extracted" ]] || { error "解压目标核心错误"; return 1; }
+  
+  # 如果正在运行，先暂退核心保证覆盖成功
+  rc-service sing-box stop >/dev/null 2>&1 || true
+  install -m 755 "$extracted" "$BINARY_PATH"
+  info "sing-box 核心释放完毕。"
+  return 0
+}
+
 install_tuic() {
   echo -e "${GREEN}[信息] 开始在 Alpine 下部署 sing-box TUIC V5 ...${RESET}"
   check_environment
@@ -478,7 +489,6 @@ install_tuic() {
   info "sing-box 核心下载并释放完毕。"
 
   write_openrc_script
-  enable_bbr
 
   inst_cert || return 1
   inst_port
@@ -497,7 +507,7 @@ update_tuic() {
     error "当前系统未检测到核心，无法执行覆盖升级。"
     return 1
   fi
-  info "检测到已有环境，正在执行纯净原地覆盖核心升级（不破坏任何节点配置）..."
+  info "检测到已有环境，正在执行纯净原地覆盖核心升级..."
   if download_core; then
     rc-service sing-box start
     info "sing-box 核心纯净升级覆盖成功，服务已安全启动！"
@@ -507,13 +517,13 @@ update_tuic() {
 }
 
 unsttuic() {
-  warn "即将从当前 Alpine 系统中清洗干净并下线服务驱动..."
+  warn "即将卸载..."
   clear_old_iptables
 
   rc-service sing-box stop || true
   rc-update del sing-box default >/dev/null 2>&1 || true
   
-  rm -f "$BINARY_PATH" "$OPENRC_SERVICE_PATH" "$SYSCTL_FILE" "$LOG_FILE"
+  rm -f "$BINARY_PATH" "$OPENRC_SERVICE_PATH" "$LOG_FILE"
   rm -rf "$CONFIG_DIR" "$TUIC_DIR"
   
   info "彻底卸载清理完毕！"
@@ -591,19 +601,19 @@ menu() {
     local port_show=$(get_current_port_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       Tuic v5 管理面板         ${RESET}"
+    echo -e "${GREEN}    Sing-box(Tuicv5) 管理面板   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} ${status}"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Tuic${RESET}"
-    echo -e "${GREEN}2. 更新 Tuic${RESET}"
-    echo -e "${GREEN}3. 卸载 Tuic${RESET}"
+    echo -e "${GREEN}1. 安装 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}2. 更新 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}3. 卸载 Sing-box Tuicv5${RESET}"
     echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 Tuic${RESET}"
-    echo -e "${GREEN}6. 停止 Tuic${RESET}"
-    echo -e "${GREEN}7. 重启 Tuic${RESET}"
+    echo -e "${GREEN}5. 启动 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}6. 停止 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}7. 重启 Sing-box Tuicv5${RESET}"
     echo -e "${GREEN}8. 查看日志${RESET}"
     echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"

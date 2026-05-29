@@ -1,438 +1,448 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
-# =========================================================
-# AnyTLS 一键部署脚本
-# =========================================================
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# ================== 颜色定义 ==================
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-BLUE="\033[34m"
-CYAN="\033[36m"
-RESET="\033[0m"
+SCRIPT_VERSION="0.2.0"
+SINGBOX_VERSION="1.12.0"
+WORKDIR="/opt/alpine-singbox-snellv5"
+BIN_DIR="/usr/local/bin"
+CONF_DIR="/etc/sing-box"
+SINGBOX_BIN="$BIN_DIR/sing-box"
+SINGBOX_CONF="$CONF_DIR/config.json"
+SERVICE_DIR="/etc/init.d"
+SINGBOX_SERVICE="$SERVICE_DIR/sing-box"
+PROFILE_FILE="$WORKDIR/install.env"
+SYSCTL_FILE="/etc/sysctl.d/99-singbox-snellv5.conf"
 
-# ================== 基础变量 ==================
-SCRIPT_VERSION="1.0"
-SERVICE_NAME="anytls"
-BINARY_NAME="anytls-server"
-BINARY_DIR="/usr/local/bin"
-BINARY_PATH="${BINARY_DIR}/${BINARY_NAME}"
+GREEN='\033[32m'
+YELLOW='\033[33m'
+RED='\033[31m'
+BLUE='\033[34m'
+BOLD='\033[1m'
+RESET='\033[0m'
 
-ANYTLS_DIR="/etc/anytls"
-ANYTLS_CONFIG="${ANYTLS_DIR}/config.env"
-ANYTLS_SERVICE="/etc/systemd/system/${SERVICE_NAME}.service"
-LOG_FILE="/var/log/anytls-manager.log"
-RUN_USER="anytls"
+info(){ echo -e "${GREEN}[INFO]${RESET} $*"; }
+warn(){ echo -e "${YELLOW}[WARN]${RESET} $*"; }
+error(){ echo -e "${RED}[ERROR]${RESET} $*"; }
+headline(){ echo -e "${BLUE}${BOLD}$*${RESET}"; }
 
-TMP_DIR=$(mktemp -d -t anytls.XXXXXX)
-
-# ================== Root 检查 ==================
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}[错误] 请使用 root 运行${RESET}"
+require_root(){
+  if [[ ${EUID} -ne 0 ]]; then
+    error "请使用 root 运行此脚本"
     exit 1
-fi
-
-# ================== 清理 ==================
-cleanup() {
-    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
-}
-trap cleanup EXIT INT TERM
-
-# ================== 日志 ==================
-log() {
-    echo "$(date '+%F %T') - $1" >> "$LOG_FILE"
+  fi
 }
 
-pause() {
-    read -n1 -s -r -p "按任意键返回菜单..." < /dev/tty
-    echo
+pause(){
+  read -r -p "按回车继续..."
 }
 
-# ================== 用户 ==================
-create_user() {
-    id -u "$RUN_USER" &>/dev/null || \
-        useradd -r -s /usr/sbin/nologin "$RUN_USER"
+trim(){
+  local value="$1"
+  value="${value#${value%%[![:space:]]*}}"
+  value="${value%${value##*[![:space:]]}}"
+  printf '%s' "$value"
 }
 
-# ================== 公网IP ==================
-get_public_ip() {
-    local ip
-    for cmd in "curl -4fsSL --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in \
-            "https://api.ipify.org" \
-            "https://ip.sb" \
-            "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && {
-                echo "$ip"
-                return
-            }
-        done
-    done
-
-    for cmd in "curl -6fsSL --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in \
-            "https://api64.ipify.org" \
-            "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && {
-                echo "[$ip]"
-                return
-            }
-        done
-    done
-
-    echo "无法获取公网IP"
+is_alpine(){
+  [[ -f /etc/alpine-release ]]
 }
 
-# ================== 依赖 ==================
-check_deps() {
-    install_pkg() {
-        if command -v apt >/dev/null 2>&1; then
-            apt update -y
-            apt install -y "$@"
-        elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y "$@"
-        elif command -v yum >/dev/null 2>&1; then
-            yum install -y "$@"
-        elif command -v apk >/dev/null 2>&1; then
-            apk add --no-cache "$@"
-        fi
-    }
-
-    command -v curl >/dev/null || install_pkg curl
-    command -v wget >/dev/null || install_pkg wget
-    command -v unzip >/dev/null || install_pkg unzip
-    command -v ss >/dev/null || install_pkg iproute2
+need_cmd(){
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || {
+    error "缺少命令: $cmd"
+    return 1
+  }
 }
 
-# ================== 端口 ==================
-check_port() {
-    if ss -tulnH "( sport = :$1 )" | grep -q . || return 0; then
-        echo -e "${RED}端口 $1 已占用${RESET}"
-        return 1
+install_deps(){
+  require_root
+  if ! is_alpine; then
+    error "当前系统不是 Alpine，检测到: $(. /etc/os-release 2>/dev/null; echo ${PRETTY_NAME:-unknown})"
+    return 1
+  fi
+  info "安装依赖中..."
+  apk update
+  apk add --no-cache bash curl wget tar openssl openrc iproute2 jq grep sed coreutils bind-tools
+  mkdir -p "$WORKDIR" "$CONF_DIR"
+  rc-update add local default >/dev/null 2>&1 || true
+  info "依赖安装完成"
+}
+
+get_arch(){
+  local machine
+  machine=$(uname -m)
+  case "$machine" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l|armv7) echo "armv7" ;;
+    *)
+      error "不支持的架构: $machine"
+      return 1
+      ;;
+  esac
+}
+
+random_port(){
+  shuf -i 20000-60000 -n 1
+}
+
+random_token(){
+  openssl rand -hex 8
+}
+
+prompt_default(){
+  local prompt="$1"
+  local default="$2"
+  local input
+  read -r -p "$prompt [$default]: " input
+  input=$(trim "$input")
+  if [[ -z "$input" ]]; then
+    printf '%s' "$default"
+  else
+    printf '%s' "$input"
+  fi
+}
+
+validate_port(){
+  local port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  (( port >= 1 && port <= 65535 )) || return 1
+}
+
+port_in_use(){
+  local port="$1"
+  ss -tuln | awk '{print $5}' | grep -Eq "(^|:)$port$"
+}
+
+validate_obfs(){
+  local obfs="$1"
+  [[ "$obfs" == "off" || "$obfs" == "http" || "$obfs" == "tls" ]]
+}
+
+validate_bool(){
+  local value="$1"
+  [[ "$value" == "true" || "$value" == "false" ]]
+}
+
+configure_profile(){
+  require_root
+  local listen_addr snell_port psk obfs_mode obfs_host log_level udp_enabled sniff_enabled inbound_tag dns_server
+
+  listen_addr=$(prompt_default "请输入 sing-box 监听地址" "::")
+
+  while true; do
+    snell_port=$(prompt_default "请输入 Snell v5 监听端口" "$(random_port)")
+    if ! validate_port "$snell_port"; then
+      warn "端口格式不正确"
+      continue
     fi
-}
-
-random_port() {
-    shuf -i 10000-65000 -n1
-}
-
-random_password() {
-    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c16 || true
-}
-
-# ================== 架构 ==================
-detect_arch() {
-    case "$(uname -m)" in
-        x86_64) echo amd64 ;;
-        aarch64) echo arm64 ;;
-        armv7l) echo armv7 ;;
-        *)
-            echo -e "${RED}不支持架构 $(uname -m)${RESET}"
-            exit 1
-            ;;
-    esac
-}
-
-# ================== 自动获取 GitHub 最新版本号 ==================
-get_latest_version() {
-    local latest_release
-    latest_release=$(curl -fsSL --max-time 5 "https://api.github.com/repos/anytls/anytls-go/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
-    if [[ -z "$latest_release" ]]; then
-        latest_release=$(curl -fsSLI --max-time 5 "https://github.com/anytls/anytls-go/releases/latest" 2>/dev/null | grep -i 'location:' | sed -E 's/.*\/v?([^/\r\n]+).*/\1/')
+    if port_in_use "$snell_port"; then
+      warn "端口 $snell_port 已被占用，请换一个"
+      continue
     fi
-    echo "${latest_release:-0.0.12}"
-}
+    break
+  done
 
-# ================== 配置 ==================
-write_config() {
-    mkdir -p "$ANYTLS_DIR"
-    cat > "$ANYTLS_CONFIG" <<EOF
-ANYTLS_PORT=$1
-ANYTLS_PASSWORD=$2
+  psk=$(prompt_default "请输入 Snell PSK" "$(random_token)")
+
+  while true; do
+    obfs_mode=$(prompt_default "请输入 obfs 模式(off/http/tls)" "off")
+    validate_obfs "$obfs_mode" && break
+    warn "obfs 仅支持 off / http / tls"
+  done
+
+  obfs_host=$(prompt_default "请输入 obfs host(仅 http/tls 有效)" "www.bing.com")
+  log_level=$(prompt_default "请输入 sing-box 日志级别" "info")
+
+  while true; do
+    udp_enabled=$(prompt_default "是否开启 UDP(true/false)" "true")
+    validate_bool "$udp_enabled" && break
+    warn "请输入 true 或 false"
+  done
+
+  while true; do
+    sniff_enabled=$(prompt_default "是否开启 sniff(true/false)" "false")
+    validate_bool "$sniff_enabled" && break
+    warn "请输入 true 或 false"
+  done
+
+  inbound_tag=$(prompt_default "请输入 inbound 标签" "snell-in")
+  dns_server=$(prompt_default "请输入 sing-box DNS 服务器" "1.1.1.1")
+
+  mkdir -p "$WORKDIR"
+  cat > "$PROFILE_FILE" <<EOF
+SINGBOX_VERSION="$SINGBOX_VERSION"
+LISTEN_ADDR="$listen_addr"
+SNELL_PORT="$snell_port"
+SNELL_PSK="$psk"
+SNELL_OBFS="$obfs_mode"
+SNELL_OBFS_HOST="$obfs_host"
+SB_LOG_LEVEL="$log_level"
+SNELL_UDP="$udp_enabled"
+SNELL_SNIFF="$sniff_enabled"
+SNELL_TAG="$inbound_tag"
+SB_DNS_SERVER="$dns_server"
 EOF
-    chmod 600 "$ANYTLS_CONFIG"
-    chown -R ${RUN_USER}:${RUN_USER} "$ANYTLS_DIR"
+  chmod 600 "$PROFILE_FILE"
+  info "参数已保存到 $PROFILE_FILE"
 }
 
-# ================== 输出节点 ==================
-output_node_links() {
-    local ip
-    ip=$(get_public_ip)
-
-    local hostname
-    hostname=$(hostname -s | sed 's/ /_/g')
-
-    echo -e "${GREEN}====== AnyTLS 节点信息 ======${RESET}"
-    echo -e "${YELLOW}IP      : ${ip}${RESET}"
-    echo -e "${YELLOW}端口    : $1${RESET}"
-    echo -e "${YELLOW}密码    : $2${RESET}"
-    echo -e "${GREEN}---------------------------${RESET}"
-    echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
-    echo -e "${YELLOW}[信息] V2rayN 链接：${RESET}"
-    echo -e "${CYAN}anytls://$2@$ip:$1/?insecure=1#$hostname-Anytls${RESET}"
-    echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
-    echo -e "${CYAN}$hostname-Anytls = anytls, $ip, $1, password=$2, tfo=true, skip-cert-verify=true, reuse=false${RESET}"
-    echo -e "${YELLOW}---------------------------------${RESET}"
+load_profile(){
+  if [[ ! -f "$PROFILE_FILE" ]]; then
+    error "未找到配置参数文件: $PROFILE_FILE，请先执行 1) 安装/初始化"
+    return 1
+  fi
+  # shellcheck disable=SC1090
+  source "$PROFILE_FILE"
 }
 
-# ================== 安装 ==================
-install_ss() {
-    echo -e "${GREEN}[信息] 开始安装 AnyTLS...${RESET}"
-
-    check_deps
-    create_user
-    mkdir -p "$ANYTLS_DIR"
-
-    local arch
-    arch=$(detect_arch)
-
-    echo -e "${GREEN}[信息] 正在获取 AnyTLS 最新版本...${RESET}"
-    local version
-    version=$(get_latest_version)
-    echo -e "${GREEN}[信息] 检测到最新版本为: v${version}${RESET}"
-
-    local url="https://github.com/anytls/anytls-go/releases/download/v${version}/anytls_${version}_linux_${arch}.zip"
-
-    cd "$TMP_DIR"
-    wget "$url" -O anytls.zip
-    unzip -o anytls.zip -d "$TMP_DIR"
-
-    local real_binary_path
-    real_binary_path=$(find "$TMP_DIR" -type f -name "$BINARY_NAME" | head -n 1)
-    if [[ -z "$real_binary_path" ]]; then
-        echo -e "${RED}[错误] 压缩包内未找到可执行程序 ${BINARY_NAME}${RESET}"
-        return 1
-    fi
-
-    install -m755 "$real_binary_path" "$BINARY_PATH"
-    echo "$version" > "${ANYTLS_DIR}/version.txt"
-
-    local port input_port
-    while true; do
-        read -p "请输入监听端口 (默认随机): " input_port < /dev/tty
-        port=${input_port:-$(random_port)}
-
-        if [[ "$port" =~ ^[0-9]+$ ]] &&
-            [ "$port" -ge 1 ] &&
-            [ "$port" -le 65535 ]; then
-
-            check_port "$port" || continue
-            break
-        fi
-
-        echo -e "${RED}端口无效${RESET}"
-    done
-
-    local input_password password
-    read -p "请输入密码 (默认随机): " input_password < /dev/tty
-    password=${input_password:-$(random_password)}
-
-    write_config "$port" "$password"
-
-    cat > "$ANYTLS_SERVICE" <<EOF
-[Unit]
-Description=AnyTLS Service
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=${RUN_USER}
-Group=${RUN_USER}
-EnvironmentFile=${ANYTLS_CONFIG}
-ExecStart=${BINARY_PATH} -l :\${ANYTLS_PORT} -p \${ANYTLS_PASSWORD}
-Restart=always
-RestartSec=3
-
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME"
-    systemctl restart "$SERVICE_NAME"
-
-    if ! systemctl is-active --quiet "$SERVICE_NAME"; then
-        echo -e "${RED}AnyTLS 启动失败${RESET}"
-        journalctl -u "$SERVICE_NAME" -n20 --no-pager
-        return 1
-    fi
-
-    echo -e "${GREEN}[完成] AnyTLS 安装成功${RESET}"
-    output_node_links "$port" "$password"
-    log "安装成功"
+singbox_download_url(){
+  local arch="$1"
+  printf 'https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz' "$SINGBOX_VERSION" "$SINGBOX_VERSION" "$arch"
 }
 
-# ================== 更新 AnyTLS 主程序 ==================
-update_ss() {
-    if [[ ! -f "${ANYTLS_DIR}/version.txt" || ! -f "$ANYTLS_CONFIG" ]]; then
-        echo -e "${RED}[错误] 未检测到已安装的 AnyTLS 服务，请先执行安装。${RESET}"
-        return 1
-    fi
-
-    local current_version
-    current_version=$(cat "${ANYTLS_DIR}/version.txt")
-    
-    echo -e "${GREEN}[信息] 正在获取最新版本...${RESET}"
-    local latest_version
-    latest_version=$(get_latest_version)
-
-    echo -e "${GREEN}当前版本: v${current_version}${RESET}"
-    echo -e "${GREEN}最新版本: v${latest_version}${RESET}"
-
-    if [[ "$current_version" == "$latest_version" ]]; then
-        echo -e "${YELLOW}[提示] 当前已是最新版本，将直接重新下载覆盖...${RESET}"
-    fi
-
-    echo -e "${GREEN}[信息] 开始升级主程序到 v${latest_version}...${RESET}"
-    local arch
-    arch=$(detect_arch)
-    local url="https://github.com/anytls/anytls-go/releases/download/v${latest_version}/anytls_${latest_version}_linux_${arch}.zip"
-
-    cd "$TMP_DIR"
-    wget "$url" -O anytls.zip || { echo -e "${RED}下载失败${RESET}"; return 1; }
-    unzip -o anytls.zip -d "$TMP_DIR"
-
-    local real_binary_path
-    real_binary_path=$(find "$TMP_DIR" -type f -name "$BINARY_NAME" | head -n 1)
-    if [[ -z "$real_binary_path" ]]; then
-        echo -e "${RED}[错误] 压缩包内未找到可执行程序 ${BINARY_NAME}${RESET}"
-        return 1
-    fi
-
-    systemctl stop "$SERVICE_NAME" || true
-    install -m755 "$real_binary_path" "$BINARY_PATH"
-    echo "$latest_version" > "${ANYTLS_DIR}/version.txt"
-    systemctl start "$SERVICE_NAME"
-
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        echo -e "${GREEN}[完成] AnyTLS 成功升级至 v${latest_version}!${RESET}"
-        log "升级成功至 v${latest_version}"
-    else
-        echo -e "${RED}[错误] 升级后服务启动失败，请检查日志。${RESET}"
-    fi
+install_singbox_binary(){
+  local arch url tmpdir extracted
+  arch=$(get_arch)
+  url=$(singbox_download_url "$arch")
+  tmpdir=$(mktemp -d)
+  info "下载 sing-box v$SINGBOX_VERSION"
+  wget -O "$tmpdir/sing-box.tar.gz" "$url"
+  tar -xzf "$tmpdir/sing-box.tar.gz" -C "$tmpdir"
+  extracted=$(find "$tmpdir" -type f -name sing-box | head -n 1)
+  [[ -n "$extracted" ]] || { error "未找到 sing-box 可执行文件"; return 1; }
+  install -m 755 "$extracted" "$SINGBOX_BIN"
+  rm -rf "$tmpdir"
+  info "sing-box 已安装到 $SINGBOX_BIN"
 }
 
-# ================== 修改配置 ==================
-modify_ss() {
-    [[ -f "$ANYTLS_CONFIG" ]] || {
-        echo -e "${RED}配置不存在${RESET}"
-        return
+write_singbox_config(){
+  load_profile
+  mkdir -p "$CONF_DIR"
+  cat > "$SINGBOX_CONF" <<EOF
+{
+  "log": {
+    "level": "${SB_LOG_LEVEL}",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "default-dns",
+        "address": "${SB_DNS_SERVER}"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "type": "snell",
+      "tag": "${SNELL_TAG}",
+      "listen": "${LISTEN_ADDR}",
+      "listen_port": ${SNELL_PORT},
+      "users": [
+        {
+          "name": "default",
+          "password": "${SNELL_PSK}"
+        }
+      ],
+      "version": 5,
+      "udp": ${SNELL_UDP},
+      "sniff": ${SNELL_SNIFF}$(if [[ "$SNELL_OBFS" != "off" ]]; then printf ',\n      "obfs": {\n        "enabled": true,\n        "type": "%s",\n        "host": "%s"\n      }' "$SNELL_OBFS" "$SNELL_OBFS_HOST"; fi)
     }
-
-    source "$ANYTLS_CONFIG"
-
-    echo "当前端口: $ANYTLS_PORT"
-    echo "当前密码: $ANYTLS_PASSWORD"
-
-    local port password
-
-    read -p "新端口 [当前:${ANYTLS_PORT}]: " port < /dev/tty
-    port=${port:-$ANYTLS_PORT}
-
-    if [[ "$port" != "$ANYTLS_PORT" ]]; then
-        check_port "$port" || return 1
-    fi
-
-    read -p "新密码 [默认保持]: " password < /dev/tty
-    password=${password:-$ANYTLS_PASSWORD}
-
-    write_config "$port" "$password"
-    systemctl restart "$SERVICE_NAME"
-
-    echo -e "${GREEN}修改成功${RESET}"
-    output_node_links "$port" "$password"
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}
+EOF
+  chmod 600 "$SINGBOX_CONF"
+  info "已写入 $SINGBOX_CONF"
 }
 
-# ================== 卸载 ==================
-uninstall_ss() {
-    systemctl stop "$SERVICE_NAME" || true
-    systemctl disable "$SERVICE_NAME" || true
-
-    rm -f "$ANYTLS_SERVICE"
-    rm -f "$BINARY_PATH"
-    rm -rf "$ANYTLS_DIR"
-
-    id -u "$RUN_USER" &>/dev/null && userdel "$RUN_USER" || true
-
-    systemctl daemon-reload
-    echo -e "${GREEN}卸载完成${RESET}"
+write_openrc_service(){
+  cat > "$SINGBOX_SERVICE" <<'EOF'
+#!/sbin/openrc-run
+name="sing-box"
+description="sing-box service"
+command="/usr/local/bin/sing-box"
+command_args="run -c /etc/sing-box/config.json"
+command_background="yes"
+pidfile="/run/sing-box.pid"
+output_log="/var/log/sing-box.log"
+error_log="/var/log/sing-box.err"
+depend() {
+  need net
+}
+EOF
+  chmod +x "$SINGBOX_SERVICE"
+  rc-update add sing-box default >/dev/null 2>&1 || true
+  info "OpenRC 服务脚本已写入: $SINGBOX_SERVICE"
 }
 
-# ================== 菜单 ==================
-show_menu() {
+enable_sysctl(){
+  cat > "$SYSCTL_FILE" <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_fastopen=3
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+EOF
+  sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
+  info "已写入 $SYSCTL_FILE"
+}
+
+cleanup_legacy_snell(){
+  rc-service snell-server stop >/dev/null 2>&1 || true
+  rc-update del snell-server default >/dev/null 2>&1 || true
+  rm -f /etc/init.d/snell-server /usr/local/bin/snell-server
+  rm -rf /etc/snell
+}
+
+validate_singbox_config(){
+  need_cmd "$SINGBOX_BIN"
+  "$SINGBOX_BIN" check -c "$SINGBOX_CONF"
+}
+
+install_all(){
+  install_deps
+  configure_profile
+  install_singbox_binary
+  write_singbox_config
+  write_openrc_service
+  enable_sysctl
+  cleanup_legacy_snell
+  validate_singbox_config
+  start_service
+}
+
+start_service(){
+  need_cmd rc-service
+  validate_singbox_config
+  rc-service sing-box restart || rc-service sing-box start
+  info "sing-box 启动命令已执行"
+}
+
+stop_service(){
+  need_cmd rc-service
+  rc-service sing-box stop || true
+  info "sing-box 停止命令已执行"
+}
+
+restart_service(){
+  stop_service
+  start_service
+}
+
+status_service(){
+  if rc-service sing-box status >/dev/null 2>&1; then
+    echo -e "${GREEN}运行中${RESET}"
+  else
+    echo -e "${RED}未运行${RESET}"
+  fi
+}
+
+show_status(){
+  clear
+  headline "Alpine + sing-box Snell v5 状态"
+  echo "系统: $(cat /etc/alpine-release 2>/dev/null || echo unknown)"
+  echo "sing-box: $(status_service)"
+  echo "sing-box 版本: $($SINGBOX_BIN version 2>/dev/null | head -n1 || echo 未安装)"
+  echo "监听端口: $(jq -r '.inbounds[0].listen_port // "未配置"' "$SINGBOX_CONF" 2>/dev/null || echo 未配置)"
+  echo "协议版本: $(jq -r '.inbounds[0].version // "未配置"' "$SINGBOX_CONF" 2>/dev/null || echo 未配置)"
+  echo "OBFS: $(if [[ -f "$SINGBOX_CONF" ]]; then jq -r 'if .inbounds[0].obfs then .inbounds[0].obfs.type else "off" end' "$SINGBOX_CONF"; else echo 未配置; fi)"
+  echo "OpenRC 开机启动:"
+  rc-update show default | grep 'sing-box' || true
+}
+
+show_config(){
+  clear
+  headline "sing-box 配置"
+  if [[ -f "$SINGBOX_CONF" ]]; then
+    sed -n '1,220p' "$SINGBOX_CONF"
+  else
+    echo "未找到 $SINGBOX_CONF"
+  fi
+}
+
+reconfigure(){
+  configure_profile
+  write_singbox_config
+  validate_singbox_config
+  restart_service
+}
+
+show_client_hint(){
+  load_profile
+  clear
+  headline "客户端参数"
+  echo "协议: Snell v5"
+  echo "地址: ${SNELL_OBFS_HOST}"
+  echo "端口: ${SNELL_PORT}"
+  echo "PSK: ${SNELL_PSK}"
+  echo "UDP: ${SNELL_UDP}"
+  echo "OBFS: ${SNELL_OBFS}"
+  if [[ "$SNELL_OBFS" != "off" ]]; then
+    echo "OBFS Host: ${SNELL_OBFS_HOST}"
+  fi
+  echo "DNS: ${SB_DNS_SERVER}"
+  echo
+  echo "说明: 当前为纯 sing-box 承载的 Snell v5 inbound，不再依赖独立 snell-server。"
+}
+
+uninstall_all(){
+  stop_service || true
+  rc-update del sing-box default >/dev/null 2>&1 || true
+  rm -f "$SINGBOX_SERVICE" "$SINGBOX_BIN"
+  rm -rf "$CONF_DIR" "$WORKDIR"
+  rm -f "$SYSCTL_FILE"
+  cleanup_legacy_snell
+  info "已卸载纯 sing-box Snell v5 环境"
+}
+
+main_menu(){
+  while true; do
     clear
-    local status
-    systemctl is-active --quiet "$SERVICE_NAME" &&
-        status="${GREEN}●运行中${RESET}" ||
-        status="${RED}●未运行${RESET}"
-
-    local version="未安装"
-    [[ -f "${ANYTLS_DIR}/version.txt" ]] &&
-        version="v$(cat "${ANYTLS_DIR}/version.txt")"
-
-    local port="-"
-    [[ -f "$ANYTLS_CONFIG" ]] &&
-        source "$ANYTLS_CONFIG" &&
-        port=$ANYTLS_PORT
-
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}      AnyTLS 管理面板          ${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}版本 :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port}${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}1. 安装 AnyTLS${RESET}"
-    echo -e "${GREEN}2. 更新 AnyTLS${RESET}"
-    echo -e "${GREEN}3. 卸载 AnyTLS${RESET}"
-    echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 AnyTLS${RESET}"
-    echo -e "${GREEN}6. 停止 AnyTLS${RESET}"
-    echo -e "${GREEN}7. 重启 AnyTLS${RESET}"
-    echo -e "${GREEN}8. 查看日志${RESET}"
-    echo -e "${GREEN}9. 查看节点配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
+    headline "Alpine 纯 sing-box Snell v5 菜单管理脚本 v${SCRIPT_VERSION}"
+    echo "[1] 安装/初始化"
+    echo "[2] 启动 sing-box"
+    echo "[3] 停止 sing-box"
+    echo "[4] 重启 sing-box"
+    echo "[5] 查看状态"
+    echo "[6] 查看配置"
+    echo "[7] 修改配置并重载"
+    echo "[8] 查看客户端参数"
+    echo "[9] 卸载"
+    echo "[0] 退出"
+    echo
+    read -r -p "请选择: " choice
+    case "$choice" in
+      1) install_all; pause ;;
+      2) start_service; pause ;;
+      3) stop_service; pause ;;
+      4) restart_service; pause ;;
+      5) show_status; pause ;;
+      6) show_config; pause ;;
+      7) reconfigure; pause ;;
+      8) show_client_hint; pause ;;
+      9) uninstall_all; pause ;;
+      0) exit 0 ;;
+      *) warn "无效选项"; sleep 1 ;;
+    esac
+  done
 }
 
-# ================== 主循环 ==================
-while true; do
-    show_menu
-
-    set +e
-    read -r -p $'\033[32m请输入选项: \033[0m' choice < /dev/tty
-    set -e
-
-    case $choice in
-        1) install_ss; pause ;;
-        2) update_ss; pause ;;
-        3) uninstall_ss; pause ;;
-        4) modify_ss; pause ;;
-        5) systemctl start "$SERVICE_NAME"; echo -e "${GREEN}[完成] AnyTLS 已启动${RESET}"; pause ;;
-        6) systemctl stop "$SERVICE_NAME"; echo -e "${GREEN}[完成] AnyTLS 已停止${RESET}"; pause ;;
-        7) systemctl restart "$SERVICE_NAME"; echo -e "${GREEN}[完成] AnyTLS 已重启${RESET}"; pause ;;
-        8) journalctl -u "$SERVICE_NAME" -e --no-pager; pause ;;
-        9)
-            [[ -f "$ANYTLS_CONFIG" ]] && {
-                source "$ANYTLS_CONFIG"
-                output_node_links "$ANYTLS_PORT" "$ANYTLS_PASSWORD"
-            }
-            pause
-            ;;
-        0) exit 0 ;;
-        *)
-            echo -e "${RED}无效输入${RESET}"
-            pause
-            ;;
-    esac
-done
+require_root
+main_menu

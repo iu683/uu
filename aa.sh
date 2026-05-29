@@ -9,7 +9,6 @@ export LANG=en_US.UTF-8
 # =========================================================
 # 1. 核心控制与全局环境初始化
 # =========================================================
-readonly SINGBOX_VERSION="1.12.0"
 readonly BINARY_PATH="/usr/local/bin/sing-box"
 readonly TUIC_CONFIG="/etc/sing-box/config.json"
 readonly TUIC_DIR="/root/tuicV5"
@@ -17,6 +16,8 @@ CONFIG_DIR="/etc/sing-box"
 OPENRC_SERVICE_PATH="/etc/init.d/sing-box"
 LOG_FILE="/var/log/sing-box.log"
 RUN_USER="singbox"
+REPO_URL="https://github.com/SagerNet/sing-box"
+API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
 
 TMP_DIR=$(mktemp -d -t singbox.XXXXXX)
 
@@ -444,25 +445,65 @@ EOF
   rc-update add sing-box default >/dev/null 2>&1 || true
 }
 
+get_latest_version() {
+  local _tmpfile
+  _tmpfile=$(mktemp)
+  local _tag_name=""
+
+  # 1. 第一重保险：标准 API 请求 (带 5 秒超时保护)
+  if curl -sS --max-time 5 -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases/latest" -o "$_tmpfile"; then
+    _tag_name=$(jq -r '.tag_name // empty' "$_tmpfile" 2>/dev/null || echo "")
+  fi
+  rm -f "$_tmpfile"
+
+  # 2. 第二重保险：如果 API 失败或被限流（比如返回 rate limit 提示），通过网页重定向嗅探
+  if [[ -z "$_tag_name" || "$_tag_name" == "null" ]]; then
+    _tag_name=$(curl -sIL -o /dev/null -w "%{url_effective}" --max-time 5 "$REPO_URL/releases/latest" 2>/dev/null | awk -F'/' '{print $NF}' || echo "")
+  fi
+
+  # 3. 提取纯数字版本号并清理首尾空格
+  local clean_v=""
+  if [[ -n "$_tag_name" && "$_tag_name" != "null" ]]; then
+    clean_v=$(echo "${_tag_name##*v}" | tr -d '[:space:]')
+  fi
+
+  # 4. 第三重保险：如果前两步都失败了，提供一个 2026 年极度稳定的保底正式版
+  if [[ -z "$clean_v" || ! "$clean_v" =~ ^[0-9]+\.[0-9]+ ]]; then
+    warn "未能从网络获取最新版本，启用稳定保底版: 1.13.12"
+    echo "1.13.12"
+  else
+    echo "$clean_v"
+  fi
+}
+
 download_core() {
-  local arch url
+  local arch url current_version
   arch=$(detect_arch)
-  url=$(printf 'https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz' "$SINGBOX_VERSION" "$SINGBOX_VERSION" "$arch")
   
-  info "正在下载官方核心 sing-box v$SINGBOX_VERSION..."
+  # 动态获取解析后的纯版本数字
+  current_version=$(get_latest_version)
+  
+  # 使用全局变量组合出准确的下载直链
+  url=$(printf '%s/releases/download/v%s/sing-box-%s-linux-%s.tar.gz' "$REPO_URL" "$current_version" "$current_version" "$arch")
+  
+  info "正在下载官方核心 sing-box v$current_version ..."
   cd "$TMP_DIR"
+  
   if ! wget -O sing-box.tar.gz -q "$url"; then
-    curl -fsSL -o sing-box.tar.gz "$url" || { error "下载核心文件失败"; return 1; }
+    if ! curl -fsSL -o sing-box.tar.gz "$url"; then
+      error "下载核心文件失败！请检查网络是否能正常访问 GitHub。"
+      error "请求失败的链接为: $url"
+      return 1
+    fi
   fi
   
   tar -xzf sing-box.tar.gz -C "$TMP_DIR"
   local extracted=$(find "$TMP_DIR" -type f -name sing-box | head -n 1)
   [[ -n "$extracted" ]] || { error "解压目标核心错误"; return 1; }
   
-  # 如果正在运行，先暂退核心保证覆盖成功
   rc-service sing-box stop >/dev/null 2>&1 || true
   install -m 755 "$extracted" "$BINARY_PATH"
-  info "sing-box 核心释放完毕。"
+  info "sing-box v$current_version 核心替换成功。"
   return 0
 }
 
@@ -517,7 +558,7 @@ update_tuic() {
 }
 
 unsttuic() {
-  warn "即将从当前 Alpine 系统中清洗干净并下线服务驱动..."
+  warn "即将卸载..."
   clear_old_iptables
 
   rc-service sing-box stop || true

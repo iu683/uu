@@ -11,7 +11,6 @@ RESET="\033[0m"
 # ================== 基础环境变量 ==================
 HOSTNAME=$(hostname)
 USERNAME=$(whoami | tr '[:upper:]' '[:lower:]')
-# Alpine (BusyBox) 的 md5sum 输出格式带空格，这里提取前 32 位
 export SECRET=${SECRET:-$(echo -n "$USERNAME+$HOSTNAME" | md5sum | awk '{print $1}' | head -c 32)}
 WORKDIR="$HOME/mtp"
 CRON_CMD="@reboot sleep 30 && /bin/bash $WORKDIR/restart.sh >/dev/null 2>&1"
@@ -23,11 +22,22 @@ green_echo() { echo -e "${GREEN}$1${RESET}"; }
 yellow_echo() { echo -e "${YELLOW}$1${RESET}"; }
 purple_echo() { echo -e "${PURPLE}$1${RESET}"; }
 
+# 获取最准确的当前运行 PID (多重手段适配 Alpine)
+get_mtg_pid() {
+    local pid=$(pidof mtg)
+    if [[ -z "$pid" ]]; then
+        pid=$(ps -ef 2>/dev/null | grep 'mtg run' | grep -v grep | awk '{print $1}')
+    fi
+    echo "$pid"
+}
+
 # 获取正在运行的端口
 get_running_port() {
-    local pid=$(pgrep -x mtg)
+    local pid=$(get_mtg_pid)
+    local port=""
     if [[ -n "$pid" ]]; then
-        local port=$(ps -o pid,args | grep -E "^[ ]*${pid} " | grep -oE '0\.0\.0\.0:[0-9]+' | cut -d':' -f2)
+        # 优先通过 netstat 获取该 PID 真实监听的端口
+        port=$(netstat -anp 2>/dev/null | grep "$pid/" | grep -i "listen" | awk '{print $4}' | cut -d':' -f2 | head -n 1)
         [[ -z "$port" && -f "$WORKDIR/port.txt" ]] && port=$(cat "$WORKDIR/port.txt")
         echo "${port:-未知}"
     else
@@ -51,13 +61,12 @@ get_public_ip() {
 }
 
 random_port() {
-    # Alpine 没有 shuf 命令，使用 awk 替代生成随机端口
     awk 'BEGIN{srand(); print int(rand()*(65000-2000+1))+2000}'
 }
 
 check_vps_port() {
     local port=$1
-    while [[ -n $(lsof -i :$port 2>/dev/null) ]]; do
+    while [[ -n $(netstat -an 2>/dev/null | grep -E "[:\.]${port} " | grep -i "listen") ]]; do
         red_echo "${port} 端口已经被其他程序占用，请更换端口重试。"
         read -p "请输入新端口（回车使用随机端口）: " port
         [[ -z $port ]] && port=$(random_port) && green_echo "使用随机端口: $port"
@@ -65,27 +74,10 @@ check_vps_port() {
     echo "$port"
 }
 
-# 自动安装 Alpine 必须的依赖组件
 install_alpine_deps() {
     local update_done=0
-    
-    # 检查并安装 bash (防止直接用 ash 执行时部分语法报错)
-    if ! command -v bash &>/dev/null; then
-        apk update && update_done=1
-        apk add bash
-    fi
-    
-    # 检查并安装 lsof (端口检测)
-    if ! command -v lsof &>/dev/null; then
-        [[ $update_done -eq 0 ]] && apk update && update_done=1
-        apk add lsof
-    fi
-
-    # 检查并安装 curl / wget (Busybox 自带的 wget 偶尔缺少 https 支持)
-    if ! command -v curl &>/dev/null; then
-        [[ $update_done -eq 0 ]] && apk update && update_done=1
-        apk add curl
-    fi
+    if ! command -v bash &>/dev/null; then apk update && update_done=1 && apk add bash; fi
+    if ! command -v curl &>/dev/null; then [[ $update_done -eq 0 ]] && apk update && update_done=1; apk add curl; fi
 }
 
 # ================== Crontab 管理 ==================
@@ -97,7 +89,6 @@ set_cron() {
     if ! check_cron_status; then
         (crontab -l 2>/dev/null; echo "$CRON_CMD") | crontab -
     fi
-    # 确保 Alpine 的 crond 服务在后台运行
     rc-service crond start >/dev/null 2>&1 || crond -b >/dev/null 2>&1
 }
 
@@ -107,8 +98,9 @@ remove_cron() {
 
 # ================== 核心控制服务 ==================
 start_proxy() {
-    if pgrep -x mtg >/dev/null; then
-        yellow_echo "MTProto Proxy 已经在运行中。"
+    local pid=$(get_mtg_pid)
+    if [[ -n "$pid" ]]; then
+        yellow_echo "MTProto Proxy 已经在运行中 (PID: $pid)。"
         return 0
     fi
     
@@ -125,16 +117,21 @@ start_proxy() {
 
     cd "$WORKDIR" || return
     nohup ./mtg run -b 0.0.0.0:$port "$SECRET" --stats-bind=127.0.0.1:$((port + 1)) >> "$LOG_FILE" 2>&1 &
-    green_echo "MTProto Proxy 启动成功！"
+    sleep 1
+    green_echo "MTProto Proxy 启动指令已发送！"
 }
 
 stop_proxy() {
-    if pgrep -x mtg >/dev/null; then
-        pkill -9 mtg >/dev/null 2>&1
-        clear
+    # 强制扫描并杀死所有含 mtg 关键词的后台服务进程，确保彻底杀死
+    local pids=$(pidof mtg || ps -ef | grep 'mtg run' | grep -v grep | awk '{print $1}')
+    if [[ -n "$pids" ]]; then
+        echo "$pids" | xargs kill -9 >/dev/null 2>&1
         green_echo "MTProto Proxy 已成功停止。"
     else
-        yellow_echo "MTProto Proxy 本就处于停止状态。"
+        # 托底方案：按名字强杀
+        pkill -9 -f "mtg run" >/dev/null 2>&1
+        pkill -9 mtg >/dev/null 2>&1
+        green_echo "MTProto 停止指令执行完毕。"
     fi
 }
 
@@ -153,14 +150,17 @@ download_and_run_mtg() {
     cmd=$(uname -m)
     if [ "$cmd" == "386" ] || [ "$cmd" == "i686" ]; then arch="386"; fi
     if [ "$cmd" == "armv7l" ] || [ "$cmd" == "armhf" ]; then arch="arm"; fi
-    if [ "$cmd" == "aarch64" ]; then arch="arm64"; fi
+    if [ "$cmd" == "aarch64" ] || [ "$cmd" == "arm64" ]; then arch="arm64"; fi
 
     mkdir -p "$WORKDIR"
-    pkill -9 mtg >/dev/null 2>&1
+    stop_proxy
 
-    yellow_echo "正在下载 mtg 核心组件..."
-    # 针对 Alpine (musl 静态编译兼容性)，使用官方预编译版本更稳妥
-    wget -q -O "${WORKDIR}/mtg" "https://github.com/whunt1/onekeymakemtg/raw/master/builds/ccbuilds/mtg-linux-$arch"
+    yellow_echo "正在下载 mtg 专属 Alpine 静态核心组件..."
+    wget -q -O "${WORKDIR}/mtg" "https://github.com/9600/mtg/releases/download/v2.1.7/mtg-linux-$arch"
+    
+    if [ ! -s "${WORKDIR}/mtg" ]; then
+        wget -q -O "${WORKDIR}/mtg" "https://github.com/whunt1/onekeymakemtg/raw/master/builds/ccbuilds/mtg-linux-$arch"
+    fi
     
     if [ ! -s "${WORKDIR}/mtg" ]; then
         red_echo "下载核心失败，请检查网络！"
@@ -171,12 +171,13 @@ download_and_run_mtg() {
     echo "$MTP_PORT" > "$WORKDIR/port.txt"
     cd "$WORKDIR" || return
 
-    # 运行服务并重定向日志
+    # 启动服务
     nohup ./mtg run -b 0.0.0.0:$MTP_PORT "$SECRET" --stats-bind=127.0.0.1:$((MTP_PORT + 1)) >> "$LOG_FILE" 2>&1 &
     
     # 创建守护/重启脚本
     cat > "${WORKDIR}/restart.sh" <<EOF
 #!/bin/bash
+pkill -9 -f "mtg run" >/dev/null 2>&1
 pkill -9 mtg >/dev/null 2>&1
 cd ${WORKDIR}
 nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$((MTP_PORT + 1)) >> ${LOG_FILE} 2>&1 &
@@ -195,7 +196,8 @@ core_install() {
     IP1=$(get_public_ip)
 
     if download_and_run_mtg; then
-        purple_echo "\n🎉 MTProto 安装/修改成功！"
+        sleep 1
+        purple_echo "\n🎉 MTProto 安装/修改完成！"
         LINKS="tg://proxy?server=$IP1&port=$MTP_PORT&secret=$SECRET"
         green_echo "$LINKS\n"
         echo -e "$LINKS" > "${WORKDIR}/link.txt"
@@ -211,7 +213,14 @@ core_install() {
 # ================== 主菜单循环 ==================
 while true; do
     clear
-    if pgrep -x mtg >/dev/null; then
+    
+    # 状态判定全面升级：进程号、网络端口监听双重验证
+    local current_pid=$(get_mtg_pid)
+    local saved_port=$(cat "$WORKDIR/port.txt" 2>/dev/null)
+    local is_listening=""
+    [[ -n "$saved_port" ]] && is_listening=$(netstat -an 2>/dev/null | grep -E "[:\.]${saved_port} " | grep -i "listen")
+
+    if [[ -n "$current_pid" || -n "$is_listening" ]]; then
         status_display="${GREEN}正在运行${RESET}"
     else
         status_display="${RED}已停止${RESET}"
@@ -250,7 +259,7 @@ while true; do
         3)
             clear
             stop_proxy; remove_cron; rm -rf "$WORKDIR"
-            clear; red_echo "MTProto 已彻底从系统中卸载！"; read -p "按回车返回菜单..." ;;
+            red_echo "MTProto 已彻底从系统中卸载！"; read -p "按回车返回菜单..." ;;
         4)
             clear; start_proxy; read -p "按回车返回菜单..." ;;
         5)

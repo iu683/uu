@@ -1,455 +1,625 @@
 #!/usr/bin/env bash
 #
-# V2Ray Socks5 核心 Alpine 专属管理面板 
+# Sing-box (VMess + WS) Alpine 专属核心控制面板 - V2
 # SPDX-License-Identifier: MIT
 #
-
-set -e
+# =========================================================
+# 1. 核心控制与全局环境初始化
+# =========================================================
+set -Eop pipefail
 export LANG=en_US.UTF-8
 
-# =========================================================
-# 1. 配置文件和日志路径
-# =========================================================
-WORKDIR="/etc/v2ray"
-CONFIG_FILE="/etc/v2ray/config.json"
-V2RAY_LOG="/var/log/v2ray/access.log"
-CREDENTIALS_FILE="/etc/v2ray/credentials.txt"
+# 基础目录与硬编码配置
+readonly SB_CONFIG="/etc/sing-box/config.json"
+readonly SB_BINARY="/usr/local/bin/sing-box"
+readonly SB_DIR="/root/vmessws"
+readonly STATE_FILE="/etc/vmessws-singbox.env"
+EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
+INIT_SERVICE_DIR="/etc/init.d"
+CONFIG_DIR="/etc/sing-box"
+REPO_URL="https://github.com/SagerNet/sing-box"
+API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
+CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
 
-# 颜色定义
-GREEN="\033[0;32m"
-BLUE="\033[0;34m"
-RED="\033[0;31m"
-YELLOW="\033[0;33m"
-PURPLE="\033[0;35m"
-CYAN="\033[0;36m"
-WHITE="\033[1;37m"
-NC="\033[0m"
+# 自动检测环境与动态变量池
+OPERATING_SYSTEM="linux"
+ARCHITECTURE=""
+
+# 终端规范颜色代码
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+CYAN="\033[36m"
+RESET="\033[0m"
 
 # =========================================================
-# 2. 基础辅助与探测工具函数
+# 2. Alpine 原生底层工具函数
 # =========================================================
-check_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        echo -e "${RED}错误: 请使用root权限运行此脚本!${NC}"
-        exit 1
+has_command() {
+  local _command=$1
+  type -P "$_command" > /dev/null 2>&1
+}
+
+curl() {
+  command curl "${CURL_FLAGS[@]}" "$@"
+}
+
+mktemp() {
+  command mktemp -t "sbservinst.XXXXXXXXXX"
+}
+
+info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
+error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
+pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
+
+# OpenRC 服务状态与操作封装
+rc_service() {
+  if ! has_command rc-service; then
+    return 1
+  fi
+  command rc-service "$@"
+}
+
+rc_update() {
+  if ! has_command rc-update; then
+    return 1
+  fi
+  command rc-update "$@"
+}
+
+install_content() {
+  local _install_flags="$1"
+  local _content="$2"
+  local _destination="$3"
+  local _overwrite="$4"
+  local _tmpfile="$(mktemp)"
+
+  echo -ne "安装 $_destination ... "
+  echo "$_content" > "$_tmpfile"
+  if [[ -z "$_overwrite" && -e "$_destination" ]]; then
+    echo -e "已存在"
+  else
+    # 【修复核心】显式创建父级目录，防止因 init.d 不存在报错
+    mkdir -p "$(dirname "$_destination")"
+    if install "$_install_flags" "$_tmpfile" "$_destination"; then
+      echo -e "完成"
+    else
+      echo -e "失败"
     fi
+  fi
+  rm -f "$_tmpfile"
 }
 
-pause() { 
-    read -r -n 1 -s -r -p "按任意键返回菜单..." || true
-    echo 
+remove_file() {
+  local _target="$1"
+  echo -ne "移除 $_target ... "
+  if rm -f "$_target"; then
+    echo -e "完成"
+  fi
 }
 
-# 生成随机端口(1024-65535)
-generate_random_port() {
-    echo $(( (RANDOM % 64511) + 1024 ))
+install_software() {
+  local _package_name="$1"
+  echo "正在通过 apk 安装缺失的依赖 '$_package_name' ... "
+  if apk add --no-cache "$_package_name" >/dev/null 2>&1; then
+    echo "依赖安装成功"
+  else
+    error "无法通过 apk 安装 '$_package_name'，请手动检查 Alpine 源配置。"
+    exit 65
+  fi
 }
 
-# 生成随机用户名和密码
-generate_random_credentials() {
-    local username=$(head /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 8)
-    local password=$(head /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 12)
-    echo "$username:$password"
+check_environment() {
+  if [[ ! -f /etc/alpine-release ]]; then
+    warn "检测到当前系统可能不是 Alpine Linux，但脚本将继续尝试运行..."
+  fi
+
+  case "$(uname -m)" in
+    'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
+    'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
+    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
+  esac
+
+  # 确保 Alpine 环境具备基本工具
+  has_command bash || install_software bash
+  has_command curl || install_software curl
+  has_command grep || install_software grep
+  has_command jq || install_software jq
+  has_command tar || install_software tar
+  has_command python3 || install_software python3
+  
+  # 如果系统支持 rc-service 但没有装 openrc，尝试自动补全
+  if ! has_command rc-service && [ -d /run ] && [ ! -f /.dockerenv ]; then
+    install_software openrc
+  fi
+}
+
+get_installed_version() {
+  if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
+    local version_out
+    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null || echo "")
+    if [[ -n "$version_out" ]]; then
+      echo "$version_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' | head -n 1 || echo "未知格式"
+    else
+      echo "未知版本"
+    fi
+  else
+    echo "未安装"
+  fi
+}
+
+get_latest_version() {
+  local _tmpfile=$(mktemp)
+  if ! curl -sS -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases" -o "$_tmpfile"; then
+    rm -f "$_tmpfile"
+    echo "v1.12.3"
+    return
+  fi
+  local _tag_name=$(jq -r '[.[] | select(.prerelease==false and .draft==false)][0].tag_name' "$_tmpfile" 2>/dev/null || echo "")
+  rm -f "$_tmpfile"
+  
+  if [[ -n "$_tag_name" ]]; then
+    echo "${_tag_name##*\/}"
+  else
+    echo "v1.12.3"
+  fi
+}
+
+download_singbox() {
+  local version="$1"
+  local dest_file="$2"
+  local ver_num="${version#v}"
+  local filename="sing-box-${ver_num}-${OPERATING_SYSTEM}-${ARCHITECTURE}.tar.gz"
+  local download_url="${REPO_URL}/releases/download/${version}/${filename}"
+
+  info "正在下载 Sing-box ${version} (${ARCHITECTURE}) ..."
+  if ! curl -sS "$download_url" -o "$dest_file"; then
+    error "下载失败，请检查网络连接或 GitHub 连通性。"
+    return 1
+  fi
+  return 0
 }
 
 get_public_ip() {
-    local ip
-    for svc in "https://api.ipify.org" "https://ifconfig.me" "https://ipinfo.io/ip"; do
-        ip=$(curl -s --max-time 5 "$svc" || wget -T 5 -qO- "$svc" || true)
-        ip=$(echo "$ip" | tr -d '[:space:]')
-        if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "$ip"
-            return 0
-        fi
-    done
-    echo "127.0.0.1"
+  local ip=''
+  for url in https://api.ipify.org https://ip.sb https://checkip.amazonaws.com; do
+    ip=$(curl -4s --max-time 5 "$url" 2>/dev/null || true)
+    [[ -n "$ip" ]] && { echo "$ip"; return; }
+  done
+  hostname -i | awk '{print $1}' 2>/dev/null || echo "127.0.0.1"
 }
 
-# 纯 awk URL 编码器（兼容 Alpine 极简环境）
-urlencode() {
-    local s="$1"
-    echo -n "$s" | awk 'BEGIN {
-        for (i = 0; i <= 255; i++) ord[sprintf("%c", i)] = i
-    }
-    {
-        encoded = ""
-        for (i = 1; i <= length($0); i++) {
-            c = substr($0, i, 1)
-            if (c ~ /[a-zA-Z0-9_.~-]/) encoded = encoded c
-            else encoded = encoded sprintf("%%%02X", ord[c])
-        }
-        print encoded
-    }'
-}
-
-# 从 config.json 精准动态反查当前配置
-load_current_config() {
-    if [ -f "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
-        CURRENT_PORT=$(jq -r '.inbounds[0].port' "$CONFIG_FILE" 2>/dev/null || echo "")
-        CURRENT_USER=$(jq -r '.inbounds[0].settings.accounts[0].user' "$CONFIG_FILE" 2>/dev/null || echo "")
-        CURRENT_PASS=$(jq -r '.inbounds[0].settings.accounts[0].pass' "$CONFIG_FILE" 2>/dev/null || echo "")
-    else
-        CURRENT_PORT=""
-        CURRENT_USER=""
-        CURRENT_PASS=""
-    fi
-}
-
-# 检查本地端口监听状态
-check_port_listening() {
-    local port=$1
-    if [[ -n "$port" ]]; then
-        netstat -an 2>/dev/null | grep -E "[:\.]${port} " | grep -i "listen"
-    fi
-}
-
-# 验证V2Ray是否正确安装
-verify_v2ray() {
-    if ! command -v v2ray >/dev/null 2>&1; then
-        return 1
-    fi
-    if ! [ -f /etc/init.d/v2ray ]; then
-        return 1
-    fi
-    return 0
-}
-
-# 动态获取 V2Ray 版本号
-get_v2ray_version() {
-    if verify_v2ray; then
-        local ver_output
-        ver_output=$(v2ray -version 2>/dev/null | head -n 1 | awk '{print $2}')
-        echo "v2ray-core ${ver_output:-已安装}"
-    else
-        echo "v2ray-core (未安装)"
-    fi
-}
-
-# =========================================================
-# 3. 依赖部署模块
-# =========================================================
-install_dependencies() {
-    echo -e "${BLUE}正在检查并安装依赖项...${NC}"
-    
-    if ! apk update; then
-        echo -e "${RED}警告: 更新软件包索引失败，将尝试直接拉取组件...${NC}"
-    fi
-    
-    echo -e "${BLUE}安装基础工具...${NC}"
-    if ! apk add --no-cache curl jq openrc; then
-        echo -e "${RED}错误: 安装基础工具失败${NC}"
-        return 1
-    fi
-    
-    echo -e "${BLUE}安装V2Ray...${NC}"
-    if ! apk add --no-cache v2ray; then
-        echo -e "${RED}错误: 安装V2Ray失败。请检查系统网络或内存。${NC}"
-        return 1
-    fi
-    
-    mkdir -p /etc/v2ray
-    mkdir -p /var/log/v2ray
-    
-    if ! ls /etc/init.d/v2ray >/dev/null 2>&1; then
-        echo -e "${YELLOW}找不到标准服务文件，正在手动注入 OpenRC 托管脚本...${NC}"
-        
-        cat > /etc/init.d/v2ray << 'EOF'
+tpl_singbox_server_openrc_base() {
+  cat << 'EOF'
 #!/sbin/openrc-run
 
-name="V2Ray"
-description="V2Ray Service"
-command="/usr/bin/v2ray"
-command_args="run -config /etc/v2ray/config.json"
-pidfile="/var/run/v2ray.pid"
-command_background="yes"
+description="Sing-box Service"
+supervisor="supervise-daemon"
+command="/usr/local/bin/sing-box"
+command_args="run -c /etc/sing-box/config.json"
+extra_started_commands="reload"
 
 depend() {
     need net
     after firewall
 }
 
-start_pre() {
-    checkpath -d -m 0755 -o root:root /var/log/v2ray
+reload() {
+    ebegin "Reloading sing-box configuration"
+    supervise-daemon --signal HUP --name sing-box
+    eend $?
 }
 EOF
-        chmod +x /etc/init.d/v2ray
+}
+
+# =========================================================
+# 3. 面板辅助网络与状态扩展函数
+# =========================================================
+get_sb_status() {
+  if has_command rc-service && rc-service sing-box status >/dev/null 2>&1; then
+    echo -e "${GREEN}● 运行中 (OpenRC)${RESET}"
+  else
+    if pgrep -f "$EXECUTABLE_INSTALL_PATH run" >/dev/null 2>&1; then
+      echo -e "${GREEN}● 运行中 (Pidmode)${RESET}"
+    else
+      echo -e "${RED}● 未运行${RESET}"
     fi
-    
-    rc-update add v2ray default >/dev/null 2>&1 || true
-    echo -e "${GREEN}依赖及核心组件安装完成${NC}"
-    return 0
+  fi
+}
+
+get_current_port_display() {
+  if [[ -f "$SB_CONFIG" ]]; then
+    local port
+    port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "")
+    echo "${port:- -}"
+  else echo "-"; fi
 }
 
 # =========================================================
-# 4. 配置写入与凭据存储模块
+# 4. 面板核心交互与配置文件处理
 # =========================================================
-save_credentials() {
-    local port=$1
-    local username=$2
-    local password=$3
-    
-    echo "端口: $port" > "$CREDENTIALS_FILE"
-    echo "用户名: $username" >> "$CREDENTIALS_FILE"
-    echo "密码: $password" >> "$CREDENTIALS_FILE"
-    chmod 600 "$CREDENTIALS_FILE"
-}
+write_and_show_config() {
+  mkdir -p "$CONFIG_DIR"
 
-configure_v2ray() {
-    local port=$1
-    local username=$2
-    local password=$3
-    
-    mkdir -p /etc/v2ray
-    
-    cat > "$CONFIG_FILE" << EOF
+  local headers_json="{}"
+  if [[ -n "${WSHOST}" ]]; then
+    headers_json="{\"Host\": \"${WSHOST}\"}"
+  fi
+
+  cat << EOF > "$SB_CONFIG"
 {
-  "log": {
-    "access": "/var/log/v2ray/access.log",
-    "error": "/var/log/v2ray/error.log",
-    "loglevel": "info"
-  },
   "inbounds": [
     {
-      "port": $port,
-      "protocol": "socks",
-      "settings": {
-        "auth": "password",
-        "accounts": [
-          {
-            "user": "$username",
-            "pass": "$password"
-          }
-        ],
-        "udp": true
+      "type": "vmess",
+      "tag": "vmess-in",
+      "listen": "::",
+      "listen_port": ${PORT},
+      "users": [
+        {
+          "uuid": "${UUID}"
+        }
+      ],
+      "transport": {
+        "type": "ws",
+        "path": "${WSPATH}",
+        "headers": ${headers_json},
+        "max_early_data": 2048,
+        "early_data_header_name": "Sec-WebSocket-Protocol"
       }
     }
   ],
   "outbounds": [
     {
-      "protocol": "freedom",
-      "settings": {}
+      "type": "direct",
+      "tag": "direct"
     }
   ]
 }
 EOF
-    save_credentials "$port" "$username" "$password"
+
+  SERVER_IP=$(get_public_ip)
+  cat << EOF > "$STATE_FILE"
+PORT='${PORT}'
+UUID='${UUID}'
+WSPATH='${WSPATH}'
+WSHOST='${WSHOST}'
+REMARK='${REMARK}'
+SERVER_IP='${SERVER_IP}'
+EOF
+  chmod 600 "$STATE_FILE"
+
+  # 检查是否支持 OpenRC 服务托管
+  if has_command rc-service && [ -d "$INIT_SERVICE_DIR" ]; then
+    rc_update add sing-box default >/dev/null 2>&1 || true
+    rc_service sing-box restart >/dev/null 2>&1 || true
+    if rc_service sing-box status >/dev/null 2>&1; then
+      info "Sing-box (VMess+WS) 服务通过 OpenRC 启动成功！"
+    else
+      error "Sing-box 服务启动失败，请检查 /var/log/messages 查看错误日志。"
+    fi
+  else
+    # 容器或极简无 OpenRC 环境，降级使用后台常驻 Pid 模式
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+    "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
+    info "未检测到 OpenRC 环境或处于容器中，程序已成功挂载至后台 (Pid 进程模式) 运行。"
+  fi
+  
+  showconf
 }
 
 # =========================================================
-# 5. 主流程控制模块
+# 5. 主流程控制模块与更新功能
 # =========================================================
-action_install() {
-    if verify_v2ray &>/dev/null; then
-        echo -e "${YELLOW}提示: 检测到系统中已安装 V2Ray 核心。如果需要调整参数，请使用选项 2 [修改配置]。${NC}"
-        return 0
+
+inst_singbox() {
+  check_environment
+  
+  if [[ -f "$SB_CONFIG" ]]; then
+    warn "系统检测到已存在配置。如果是要修改配置，请在菜单中选择选项 4。"
+    read -rp "是否执意重新安装？(旧配置将被覆盖) [y/N]: " CONFIRM_REINST
+    [[ "$CONFIRM_REINST" != "y" && "$CONFIRM_REINST" != "Y" ]] && return 0
+  fi
+
+  info "🧹 正在清理前置依赖并准备下载..."
+  if ! command -v sing-box >/dev/null 2>&1; then
+    local latest_version=$(get_latest_version)
+    
+    local _tmpfile_tar=$(mktemp)
+    if ! download_singbox "$latest_version" "$_tmpfile_tar"; then
+      rm -f "$_tmpfile_tar" && return 1
     fi
 
-    if ! install_dependencies; then
-        echo -e "${RED}核心部件部署失败，无法继续。${NC}"
-        return 1
+    echo -ne "正在解压并安装二进制可执行文件 ... "
+    local _tmpdir_extract=$(command mktemp -d -t "sbtar.XXXXXXXXXX")
+    tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
+    
+    local _ver_num="${latest_version#v}"
+    local _extracted_binary=$(find "$_tmpdir_extract" -type f -name "sing-box" | head -n 1)
+    
+    if [[ -n "$_extracted_binary" ]] && install -Dm755 "$_extracted_binary" "$EXECUTABLE_INSTALL_PATH"; then
+      echo "成功"
+    else
+      rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "安装失败" && return 1
     fi
+    rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
+  else
+    info "系统已存在 sing-box 核心组件，跳过基础安装。"
+  fi
 
-    echo -e "${PURPLE}====== 开始初始化 V2Ray Socks5 配置 ======${NC}"
-    
-    local final_port default_p
-    default_p=$(generate_random_port)
-    while true; do
-        read -r -p "👉 请输入监听端口 (回车随机: ${default_p}): " input_port
-        final_port=${input_port:-$default_p}
-        if ! [[ "${final_port}" =~ ^[0-9]+$ ]] || [ "${final_port}" -lt 1 ] || [ "${final_port}" -gt 65535 ]; then
-            echo -e "${RED}端口格式不合法，请输入 1-65535 的数字。${NC}"
-            continue
-        fi
-        if [[ -n $(check_port_listening "$final_port") ]]; then
-            echo -e "${RED}${final_port} 端口已被系统其他程序占用，请更换端口。${NC}"
-            default_p=$(generate_random_port)
-            continue
-        fi
-        break
-    done
+  # 写入服务脚本（已修复父级目录不存在问题）
+  install_content "0755" "$(tpl_singbox_server_openrc_base)" "$INIT_SERVICE_DIR/sing-box" "1"
 
-    local raw_creds default_user default_pass
-    raw_creds=$(generate_random_credentials)
-    default_user=$(echo "$raw_creds" | cut -d':' -f1)
-    default_pass=$(echo "$raw_creds" | cut -d':' -f2)
+  # 兼容 Alpine 无 shuf 的随机端口生成
+  local hostname_str=$(hostname 2>/dev/null || echo "alpine")
+  local rand_port=$(awk 'BEGIN{srand();print int(rand()*(65535-10000+1))+10000}')
+  local rand_uuid=$(python3 -c "import uuid; print(uuid.uuid4())")
+  local rand_path="/$(python3 -c "import secrets; print(secrets.token_hex(4))")"
+  local default_remark="${hostname_str}-vmessws"
 
-    read -r -p "👉 请设置用户名 (回车随机: ${default_user}): " final_user
-    final_user=${final_user:-$default_user}
+  echo "---------------------------------------------"
+  read -rp "👉 请输入监听端口 (默认随机: ${rand_port}): " INPUT_PORT
+  PORT=${INPUT_PORT:-$rand_port}
 
-    read -r -p "👉 请设置密码 (回车随机: ${default_pass}): " final_pass
-    final_pass=${final_pass:-$default_pass}
+  read -rp "👉 请输入 VMess UUID (默认随机: ${rand_uuid}): " INPUT_UUID
+  UUID=${INPUT_UUID:-$rand_uuid}
 
-    configure_v2ray "$final_port" "$final_user" "$final_pass"
-    
-    echo -e "${BLUE}正在调动 OpenRC 唤醒服务...${NC}"
-    rc-service v2ray restart >/dev/null 2>&1 || ./etc/init.d/v2ray restart >/dev/null 2>&1 || true
-    sleep 1.5
-    
-    echo -e "${GREEN}🎉 V2Ray 安装并配置成功！${NC}"
-    show_config_links
+  read -rp "👉 请输入 WebSocket 路径 (默认随机: ${rand_path}): " INPUT_WSPATH
+  WSPATH=${INPUT_WSPATH:-$rand_path}
+
+  read -rp "👉 请输入 WebSocket Host 伪装域名 (默认留空): " INPUT_WSHOST
+  WSHOST=${INPUT_WSHOST:-""}
+
+  read -rp "👉 请输入节点备注名称 (默认: ${default_remark}): " INPUT_REMARK
+  REMARK=${INPUT_REMARK:-$default_remark}
+
+  write_and_show_config
 }
 
-action_modify_config() {
-    if ! verify_v2ray &>/dev/null; then
-        echo -e "${RED}错误: 系统尚未安装 V2Ray 核心，请先执行选项 1 进行安装！${NC}"
-        return 1
-    fi
+modify_config() {
+  if [[ ! -f "$SB_CONFIG" ]]; then
+    error "未找到正在运行的配置文件，请先选择选项 1 安装节点。"
+    return 1
+  fi
 
-    load_current_config
-    echo -e "${PURPLE}====== 修改 V2Ray Socks5 配置 ======${NC}"
-    echo -e "${CYAN}提示：直接敲回车将完全保持原有参数不变${NC}"
-    echo "--------------------------------------------"
+  info "正在读取现有 VMess 节点配置..."
+  local current_port=$(jq -r '.inbounds[0].listen_port // empty' "$SB_CONFIG" 2>/dev/null)
+  local current_uuid=$(jq -r '.inbounds[0].users[0].uuid // empty' "$SB_CONFIG" 2>/dev/null)
+  local current_path=$(jq -r '.inbounds[0].transport.path // empty' "$SB_CONFIG" 2>/dev/null)
+  local current_host=$(jq -r '.inbounds[0].transport.headers.Host // empty' "$SB_CONFIG" 2>/dev/null)
+  
+  local current_remark=""
+  if [[ -f "$STATE_FILE" ]]; then
+    current_remark=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 || true)
+  fi
 
-    local final_port input_port
-    while true; do
-        read -r -p "👉 请输入新的监听端口 [当前: ${CURRENT_PORT:-1080}]: " input_port
-        if [ -z "$input_port" ]; then
-            final_port=$CURRENT_PORT
-            break
-        fi
-        if [[ "${input_port}" =~ ^[0-9]+$ ]] && [ "${input_port}" -ge 1 ] && [ "${input_port}" -le 65535 ]; then
-            if [[ "$input_port" != "$CURRENT_PORT" && -n $(check_port_listening "$input_port") ]]; then
-                echo -e "${RED}${input_port} 端口已被其他程序占用，请换用其他端口。${NC}"
-                continue
-            fi
-            final_port="${input_port}"
-            break
-        else
-            echo -e "${RED}输入端口格式不合法，请输入 1-65535 之间的纯数字。${NC}"
-        fi
-    done
+  local hostname_str=$(hostname 2>/dev/null || echo "alpine")
+  local fallback_remark="${hostname_str}-vmessws"
 
-    local input_user final_user
-    read -r -p "👉 请设置新的用户名 [当前: ${CURRENT_USER:-未设置}]: " input_user
-    final_user=${input_user:-$CURRENT_USER}
+  echo "---------------------------------------------"
+  echo -e "${YELLOW}提示：直接敲回车(Enter)将保持括号内的当前值不变${RESET}"
+  echo "---------------------------------------------"
 
-    local input_pass final_pass
-    read -r -p "👉 请设置新的密码 [当前: ${CURRENT_PASS:-未设置}]: " input_pass
-    final_pass=${input_pass:-$CURRENT_PASS}
+  read -rp "👉 修改监听端口 (当前: ${current_port}): " INPUT_PORT
+  PORT=${INPUT_PORT:-$current_port}
 
-    configure_v2ray "$final_port" "$final_user" "$final_pass"
-    
-    echo -e "${BLUE}正在重载服务使新配置生效...${NC}"
-    rc-service v2ray restart >/dev/null 2>&1 || ./etc/init.d/v2ray restart >/dev/null 2>&1 || true
-    sleep 1.5
-    
-    echo -e "${GREEN}修改成功！新参数已即时应用。${NC}"
-    show_config_links
+  read -rp "👉 修改 VMess UUID (当前: ${current_uuid}): " INPUT_UUID
+  UUID=${INPUT_UUID:-$current_uuid}
+
+  read -rp "👉 修改 WebSocket 路径 (当前: ${current_path}): " INPUT_WSPATH
+  WSPATH=${INPUT_WSPATH:-$current_path}
+
+  read -rp "👉 修改 WebSocket Host 伪装域名 (当前: ${current_host:-未配置/留空}): " INPUT_WSHOST
+  if [[ -z "$INPUT_WSHOST" ]]; then
+    WSHOST="$current_host"
+  else
+    WSHOST="$INPUT_WSHOST"
+  fi
+
+  read -rp "👉 修改节点备注名称 (当前: ${current_remark:-$fallback_remark}): " INPUT_REMARK
+  REMARK=${INPUT_REMARK:-${current_remark:-$fallback_remark}}
+  write_and_show_config
 }
 
-show_config_links() {
-    load_current_config
-    if [ -z "$CURRENT_PORT" ]; then
-        echo -e "${RED}未检测到合法的 V2Ray 节点配置。${NC}"
-        return 1
+update_singbox() {
+  if [[ ! -f "$SB_BINARY" ]]; then
+    error "当前系统未安装 Sing-box，无法执行更新。"
+    return 1
+  fi
+
+  info "正在检查新版本..."
+  local current_version=$(get_installed_version)
+  local latest_version=$(get_latest_version)
+
+  info "当前安装版本: ${YELLOW}${current_version}${RESET}"
+  info "官方最新版本: ${GREEN}${latest_version}${RESET}"
+
+  if [[ "$current_version" == *"$latest_version"* || "$latest_version" == *"$current_version"* ]]; then
+    info "您当前已经是最新版本，无需更新。"
+    return 0
+  fi
+
+  warn "检测到新版本，即将开始平滑更新 (你的节点配置不会改变)..."
+  
+  local _tmpfile_tar=$(mktemp)
+  if ! download_singbox "$latest_version" "$_tmpfile_tar"; then
+    rm -f "$_tmpfile_tar" && return 1
+  fi
+
+  echo -ne "正在覆盖二进制核心文件 ... "
+  local _tmpdir_extract=$(command mktemp -d -t "sbtar.XXXXXXXXXX")
+  tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
+  
+  local _extracted_binary=$(find "$_tmpdir_extract" -type f -name "sing-box" | head -n 1)
+  if [[ -n "$_extracted_binary" ]] && install -Dm755 "$_extracted_binary" "$EXECUTABLE_INSTALL_PATH"; then
+    echo "成功"
+  else
+    rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "覆盖核心失败" && return 1
+  fi
+  rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
+
+  info "正在重启 Sing-box 服务以应用更新..."
+  if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
+    rc_service sing-box restart >/dev/null 2>&1 || true
+    if rc_service sing-box status >/dev/null 2>&1; then
+      info "Sing-box 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
+    else
+      error "核心更新成功，但 OpenRC 重启服务失败，请检查系统日志。"
     fi
-    local ip=$(get_public_ip)
-    
-    local enc_ip enc_port enc_user enc_pass
-    enc_ip=$(urlencode "$ip")
-    enc_port="$CURRENT_PORT"
-    enc_user=$(urlencode "$CURRENT_USER")
-    enc_pass=$(urlencode "$CURRENT_PASS")
-
-    local link_raw="socks://${CURRENT_USER}:${CURRENT_PASS}@${ip}:${CURRENT_PORT}"
-    local link_tg="https://t.me/socks?server=${enc_ip}&port=${enc_port}&user=${enc_user}&pass=${enc_pass}"
-
-    echo -e "${GREEN}====== Socks5 当前配置详情 ======${NC}"
-    echo -e "${YELLOW}● 节点 IP :${NC} ${ip}"
-    echo -e "${YELLOW}● 端口号  :${NC} ${CURRENT_PORT}"
-    echo -e "${YELLOW}● 用户名  :${NC} ${CURRENT_USER}"
-    echo -e "${YELLOW}● 认证密码:${NC} ${CURRENT_PASS}"
-    echo "--------------------------------------------"
-    echo -e "${YELLOW}● 客户端直连格式:${NC}\n  ${link_raw}"
-    echo -e "${YELLOW}● Telegram 一键导入链接:${NC}\n  ${link_tg}"
-    echo
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+    "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
+    info "Sing-box 核心已更新并于后台重启运行。"
+  fi
 }
 
-uninstall_v2ray() {
-    echo -e "${YELLOW}正在从 Alpine 系统卸载 V2Ray 及其所有关联配置...${NC}"
-    rc-service v2ray stop >/dev/null 2>&1 || true
-    rc-update del v2ray default >/dev/null 2>&1 || true
-    rm -f /etc/init.d/v2ray
-    apk del v2ray || true
-    rm -rf "$WORKDIR"
-    rm -rf /var/log/v2ray
-    echo -e "${GREEN}V2Ray 已经彻底从系统中移除！${NC}"
+uninstall_singbox() {
+  if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
+    rc_service sing-box stop >/dev/null 2>&1 || true
+    rc_update del sing-box default >/dev/null 2>&1 || true
+    remove_file "$INIT_SERVICE_DIR/sing-box"
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+  fi
+  
+  remove_file "$EXECUTABLE_INSTALL_PATH"
+  rm -f "$SB_CONFIG" "$STATE_FILE"
+  rm -rf "$CONFIG_DIR" "$SB_DIR"
+
+  info "已卸载 Sing-box、配置文件与状态管理底座。"
+}
+
+showconf() {
+  if [[ ! -f "$STATE_FILE" ]]; then
+    error "未找到任何安装配置底座，请先安装节点。"
+    return 1
+  fi
+  source "$STATE_FILE"
+
+  local vmess_json_str
+  vmess_json_str=$(cat << EOF
+{
+  "v": "2",
+  "ps": "${REMARK}",
+  "add": "${SERVER_IP}",
+  "port": ${PORT},
+  "id": "${UUID}",
+  "aid": 0,
+  "scy": "auto",
+  "net": "ws",
+  "type": "none",
+  "host": "${WSHOST}",
+  "path": "${WSPATH}",
+  "tls": "none",
+  "sni": "",
+  "alpn": ""
+}
+EOF
+)
+  local v2rayn_link=""
+  if base64 --help 2>&1 | grep -q "\-d"; then
+    v2rayn_link="vmess://$(echo -n "$vmess_json_str" | base64 | tr -d '\n\r')"
+  else
+    v2rayn_link="vmess://$(echo -n "$vmess_json_str" | base64 -w 0 2>/dev/null || echo -n "$vmess_json_str" | base64 | tr -d '\n\r')"
+  fi
+
+  echo -e "${GREEN}====== VMess + WebSocket 节点配置信息 ======${RESET}"
+  echo -e "${GREEN}服务器公网 IP   :${RESET} ${SERVER_IP}"
+  echo -e "${GREEN}服务监听端口    :${RESET} ${PORT}"
+  echo -e "${GREEN}VMess 用户UUID :${RESET} ${UUID}"
+  echo -e "${GREEN}传输协议类型    :${RESET} ws (WebSocket)"
+  echo -e "${GREEN}WebSocket 路径 :${RESET} ${WSPATH}"
+  echo -e "${GREEN}WebSocket Host :${RESET} ${WSHOST:-未配置(留空)}"
+  echo -e "${GREEN}节点自定义备注 :${RESET} ${REMARK}"
+  echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
+  echo "---------------------------------------------"
+  echo -e "${GREEN}👉 v2rayN   分享链接:${RESET}"
+  echo -e "${YELLOW}${v2rayn_link}${RESET}"
+  echo
+  echo -e "${GREEN}👉 Surge   分享链接:${RESET}"
+  echo -e "${YELLOW}Vmess+WS = vmess, $SERVER_IP, $PORT, username=$UUID, ws=true, ws-path=$WSPATH, vmess-aead=true${RESET}"
+  echo "---------------------------------------------"
 }
 
 # =========================================================
-# 6. 面板主菜单循环
+# 6. 面板主菜单
 # =========================================================
 menu() {
-    check_root
-    
-    while true; do
-        clear
-        load_current_config
-        
-        local status_display="${RED}● 已停止${NC}"
-        if ! verify_v2ray &>/dev/null; then
-            status_display="${RED}● 未安装核心${NC}"
+  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
+  check_environment
+
+  while true; do
+    clear
+    local status=$(get_sb_status)
+    local version=$(get_installed_version)
+    local port_show=$(get_current_port_display)
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   Sing-box VMess + WS Alpine面板   ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $status"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装 VMess + WS${RESET}"
+    echo -e "${GREEN}2. 更新 VMess + WS${RESET}"
+    echo -e "${GREEN}3. 卸载 VMess + WS${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 VMess + WS${RESET}"
+    echo -e "${GREEN}6. 停止 VMess + WS${RESET}"
+    echo -e "${GREEN}7. 重启 VMess + WS${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+
+    local choice=""
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+    [[ -z "$choice" ]] && continue
+
+    case "$choice" in
+      1) inst_singbox; pause ;;
+      2) update_singbox; pause ;;
+      3) uninstall_singbox; pause ;;
+      4) modify_config; pause ;;
+      5) 
+        if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
+          rc_service sing-box start && info "服务已成功启动！"
         else
-            if rc-service v2ray status 2>/dev/null | grep -qi "started" || [ -n "$(check_port_listening "$CURRENT_PORT")" ]; then
-                status_display="${GREEN}● 运行中 (OpenRC)${NC}"
-            fi
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+          "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
+          info "进程已在后台启动！"
         fi
-
-        local port_display="${CURRENT_PORT:- -}"
-        local engine_display
-        engine_display=$(get_v2ray_version)
-        
-        echo -e "${GREEN}================================${NC}"
-        echo -e "${GREEN}    V2Ray Socks5 Alpine 面板     ${NC}"
-        echo -e "${GREEN}================================${NC}"
-        echo -e "${GREEN}状态   :${NC} ${status_display}"
-        echo -e "${GREEN}端口   :${NC} ${YELLOW}${port_display}${NC}"
-        echo -e "${GREEN}实现   :${NC} ${CYAN}${engine_display}${NC}"
-        echo -e "${GREEN}================================${NC}"
-        echo -e "${GREEN}1. 安装 V2Ray${NC}"
-        echo -e "${GREEN}2. 修改配置${NC}"
-        echo -e "${GREEN}3. 卸载 V2Ray${NC}"
-        echo -e "${GREEN}4. 启动 V2Ray${NC}"
-        echo -e "${GREEN}5. 停止 V2Ray${NC}"
-        echo -e "${GREEN}6. 重启 V2Ray${NC}"
-        echo -e "${GREEN}7. 查看运行日志${NC}"
-        echo -e "${GREEN}8. 查看连接配置${NC}"
-        echo -e "${GREEN}0. 退出${NC}"
-        echo -e "${GREEN}================================${NC}"
-
-        local choice=""
-        read -r -p "$(echo -e "${GREEN}请输入选项: ${NC}")" choice || true
-        [[ -z "$choice" ]] && continue
-
-        case "$choice" in
-            1) clear; action_install; pause ;;
-            2) clear; action_modify_config; pause ;;
-            3)
-                clear
-                if ! verify_v2ray &>/dev/null; then echo -e "${RED}请先执行选项 1 安装核心！${NC}"; else rc-service v2ray start; echo -e "${GREEN}启动指令已执行。${NC}"; fi
-                pause ;;
-            4)
-                clear
-                if ! verify_v2ray &>/dev/null; then echo -e "${RED}服务未安装！${NC}"; else rc-service v2ray stop; echo -e "${GREEN}停止指令已执行. ${NC}"; fi
-                pause ;;
-            5)
-                clear
-                if ! verify_v2ray &>/dev/null; then echo -e "${RED}服务未安装！${NC}"; else rc-service v2ray restart; echo -e "${GREEN}重启指令已执行。${NC}"; fi
-                pause ;;
-            6)
-                clear
-                if [ -f "$V2RAY_LOG" ]; then
-                    echo -e "${PURPLE}=== 最新 50 行访问日志 ===${NC}"
-                    tail -n 50 "$V2RAY_LOG"
-                else
-                    echo -e "${YELLOW}暂无可用访问日志或未产生流量。${NC}"
-                fi
-                pause ;;
-            7|8) clear; show_config_links; pause ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选项，请重新选择！${NC}"; sleep 1 ;;
-        esac
-    done
+        pause ;;
+      6) 
+        if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
+          rc_service sing-box stop && info "服务已成功停止！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台进程已终止！"
+        fi
+        pause ;;
+      7) 
+        if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
+          rc_service sing-box restart && info "服务已成功重启！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+          "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
+          info "后台进程已重启！"
+        fi
+        pause ;;
+      8) 
+        if [[ -f /var/log/messages ]]; then
+          tail -n 50 /var/log/messages | grep sing-box || tail -n 50 /var/log/messages
+        else
+          warn "未找到通用系统日志文件，可尝试通过查看后台进程状态。"
+        fi
+        pause ;;
+      9) showconf; pause ;;
+      0) exit 0 ;;
+      *) error "无效输入，请重新选择。"; sleep 1 ;;
+    esac
+  done
 }
 
 menu "$@"

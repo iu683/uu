@@ -1,157 +1,73 @@
-#!/usr/bin/env bash
-#
-# Alpine sing-box TUIC v5 专属管理面板 
-# SPDX-License-Identifier: MIT
-#
-set -Eop pipefail
-export LANG=en_US.UTF-8
+#!/bin/bash
 
 # =========================================================
-# 1. 核心控制与全局环境初始化
+# Xray VLESS-HTTPUpgrade 管理脚本(Alpine Linux) 
 # =========================================================
-readonly BINARY_PATH="/usr/local/bin/sing-box-tuic"
-readonly TUIC_CONFIG="/etc/sing-box-tuic/config.json"
-readonly TUIC_DIR="/root/tuicV5"
-CONFIG_DIR="/etc/sing-box-tuic"
-OPENRC_SERVICE_PATH="/etc/init.d/sing-box-tuic"
-LOG_FILE="/var/log/sing-box-tuic.log"
-RUN_USER="singbox-tuic"
 
-TMP_DIR=$(mktemp -d -t sb-tuic.XXXXXX)
+set -Eeuo pipefail
 
-# 颜色标准规范 —— 【已完美修复 warm 字符显示错误】
+# ================== 颜色定义 ==================
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 BLUE="\033[34m"
 RESET="\033[0m"
 
-info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
-error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
-pause() { echo; read -n 1 -s -r -p "$(echo -e ${GREEN}"按任意键返回菜单..."${RESET})" || true; echo; }
+# ================== 🚀 服务自定义重命名 ==================
+readonly SERV_NAME="xray-httpupgrade"
 
-cleanup() {
-  [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
-}
-trap cleanup EXIT INT TERM
+# ================== 📂 自定义分享链接存放路径 ==================
+readonly X_LINK_DIR="/root/proxynode/vlesshttpupgrade"
 
-generate_random_password() {
-  dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
-}
+# ================== 路径与日志 (自动联动) ==================
+readonly X_DIR="/etc/${SERV_NAME}"
+readonly X_CONFIG="${X_DIR}/config.json"
+readonly X_BIN="/usr/local/bin/${SERV_NAME}"
+readonly X_LINK="${X_LINK_DIR}/${SERV_NAME}_vless.txt"
+readonly X_LOG="/var/log/${SERV_NAME}.log"
+readonly INIT_FILE="/etc/init.d/${SERV_NAME}"
 
-is_alpine() {
-  [[ -f /etc/alpine-release ]]
-}
+# ================== 核心工具 ==================
+info() { echo -e "${GREEN}[信息] $*${RESET}"; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}"; }
+error() { echo -e "${RED}[错误] $*${RESET}"; }
+pause() { echo; echo -ne "${GREEN}按任意键返回菜单...${RESET}"; read -n 1 -s; echo; }
 
-install_packages() {
-  info "正在刷新 Alpine 仓库并安装核心依赖..."
-  apk update
-  apk add --no-cache bash curl wget tar openssl openrc iproute2 jq grep sed coreutils bind-tools iptables ip6tables
-  
-  if [[ -f /etc/init.d/iptables ]]; then
-    rc-update add iptables default >/dev/null 2>&1 || true
-    rc-service iptables start >/dev/null 2>&1 || true
-  fi
-  if [[ -f /etc/init.d/ip6tables ]]; then
-    rc-update add ip6tables default >/dev/null 2>&1 || true
-    rc-service ip6tables start >/dev/null 2>&1 || true
-  fi
-}
-
-create_user() {
-  getent group "$RUN_USER" &>/dev/null || addgroup -S "$RUN_USER"
-  id "$RUN_USER" &>/dev/null || adduser -S -D -H -G "$RUN_USER" -s /sbin/nologin "$RUN_USER"
-}
-
-detect_arch() {
-  case "$(uname -m)" in
-    x86_64|amd64) echo "amd64" ;;
-    aarch64|arm64) echo "arm64" ;;
-    armv7l|armv7) echo "armv7" ;;
-    *) error "不支持当前架构: $(uname -m)"; exit 8 ;;
-  esac
-}
-
-check_environment() {
-  if ! is_alpine; then
-    error "本脚本仅支持 Alpine Linux 系统。"
-    exit 95
-  fi
-  install_packages
-  create_user
-}
-
-get_installed_version() {
-  if [[ -f "$BINARY_PATH" ]]; then
-    "$BINARY_PATH" version 2>/dev/null | head -n1 | awk '{print $3}' || echo "未知版本"
-  else
-    echo "未安装"
-  fi
-}
-
-get_latest_version() {
-  info "正在从 GitHub 获取 sing-box 最新版本号..."
-  local latest_v
-  latest_v=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r .tag_name | sed 's/^v//')
-  
-  if [[ -z "$latest_v" || "$latest_v" == "null" ]]; then
-    warn "通过 API 获取最新版本失败，尝试备用匹配方案..."
-    latest_v=$(curl -fsSL "https://github.com/SagerNet/sing-box/releases/latest" | grep -oE 'releases/tag/v[0-9.]+' | head -n1 | sed 's|releases/tag/v||')
-  fi
-
-  if [[ -n "$latest_v" ]]; then
-    SINGBOX_VERSION="$latest_v"
-    info "成功获取最新版本: v$SINGBOX_VERSION"
-  else
-    SINGBOX_VERSION="1.12.0"
-    warn "无法获取最新版本，将使用保底版本: v$SINGBOX_VERSION"
-  fi
-}
-
-clear_old_iptables() {
-  if [[ -f "${CONFIG_DIR}/hopping.txt" && -f "${CONFIG_DIR}/main_port.txt" ]]; then
-    local old_hop=$(cat "${CONFIG_DIR}/hopping.txt")
-    local old_port=$(cat "${CONFIG_DIR}/main_port.txt")
-    local old_start=${old_hop%-*}
-    local old_end=${old_hop#*-}
-
-    if [[ -n "$old_start" && -n "$old_end" && -n "$old_port" ]]; then
-      info "正在强力清除旧有的 iptables 端口跳跃规则..."
-      iptables -t nat -D PREROUTING -p udp -m multiport --dports "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
-      ip6tables -t nat -D PREROUTING -p udp -m multiport --dports "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
-      iptables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
-      ip6tables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
-    fi
-  fi
-}
-
-apply_new_iptables() {
-  clear_old_iptables
-  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
-    local hop_val=$(cat "${CONFIG_DIR}/hopping.txt")
-    local start_p=${hop_val%-*}
-    local end_p=${hop_val#*-}
-    
-    info "正在应用 iptables 转发规则: UDP $start_p-$end_p => 主端口 $port"
-    if iptables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port"; then
-      ip6tables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+is_valid_port() {
+    local port=$1
+    if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+        return 0
     else
-      iptables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port"
-      ip6tables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+        return 1
     fi
-    
-    echo "$port" > "${CONFIG_DIR}/main_port.txt"
-    
-    if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
-    if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
-    info "防火墙端口跳跃规则已固化。"
-  fi
 }
 
-# =========================================================
-# 4. 网络诊断与配置管理辅助
-# =========================================================
+restart_xray() {
+    rc-service "$SERV_NAME" restart >/dev/null 2>&1 || true
+    sleep 1
+    if rc-service "$SERV_NAME" status 2>/dev/null | grep -q "started"; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+get_xray_status() {
+    if rc-service "$SERV_NAME" status 2>/dev/null | grep -q "started"; then
+        echo -e "${GREEN}● 运行中 ${RESET}"
+    else 
+        echo -e "${RED}● 未运行 ${RESET}"
+    fi
+}
+
+get_xray_version() {
+    if [[ -x "$X_BIN" ]]; then
+        "$X_BIN" version 2>/dev/null | head -n 1 | awk '{print $2}'
+    else
+        echo "未安装"
+    fi
+}
+
 get_public_ip() {
     local ip
     for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
@@ -159,509 +75,328 @@ get_public_ip() {
             ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网IP"
+    error "无法获取公网 IP 地址。" && return 1
 }
 
-check_port() {
-  local port="$1"
-  if ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
-    return 1
-  fi
-  return 0
-}
+HOSTNAME=$(hostname -s | sed 's/ /_/g')
 
-is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
-
-get_random_port() {
-  local rand_port
-  while true; do
-    rand_port=$(shuf -i 2000-65535 -n 1)
-    if check_port "$rand_port"; then
-      echo "$rand_port" && return 0
-    fi
-  done
-}
-
-get_tuic_status() {
-  if rc-service sing-box-tuic status 2>/dev/null | grep -q "started"; then
-    echo "RUNNING"
-  else
-    echo "STOPPED"
-  fi
-}
-
-get_current_port_display() {
-  if [[ -f "$TUIC_CONFIG" ]]; then
-    local main_port jump_range="无"
-    main_port=$(jq -r '.inbounds[0].listen_port // empty' "$TUIC_CONFIG" 2>/dev/null)
-    [[ -f "${CONFIG_DIR}/hopping.txt" ]] && jump_range=$(cat "${CONFIG_DIR}/hopping.txt")
+# ================== 配置写入 ==================
+write_config() {
+    local port=$1 uuid=$2 path=$3 host_name=$4
+    local outbound=${5:-'{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}'}
+    mkdir -p "$X_DIR" && chmod 755 "$X_DIR"
     
-    if [[ "$jump_range" != "无" ]]; then
-      echo "${main_port} [${jump_range}]"
-    else
-      echo "${main_port:- -}"
-    fi
-  else echo "-"; fi
-}
-
-# =========================================================
-# 5. 面板节点配置生成核心逻辑
-# =========================================================
-inst_cert() {
-  mkdir -p "$CONFIG_DIR/certs"
-
-  echo "---------------------------------------------"
-  echo -e "Tuic 协议证书申请方式如下："
-  echo -e " 1) 必应自签证书 ${YELLOW}（默认）${RESET}"
-  echo -e " 2) Acme 脚本自动申请 (需放行 80 端口)"
-  echo -e " 3) 自定义证书路径"
-  echo "---------------------------------------------"
-  local certInput
-  read -rp "请输入选项 [1-3] (直接回车默认自签): " certInput
-  certInput=${certInput:-1}
-
-  cert_path="$CONFIG_DIR/certs/cert.pem"
-  key_path="$CONFIG_DIR/certs/key.pem"
-
-  if [[ $certInput == 2 ]]; then
-    if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
-      warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。请确保已暂时关闭 Web 服务。"
-    fi
-
-    if [[ -f "$cert_path" && -f "$key_path" && -s "$cert_path" && -s "$key_path" && -f "$CONFIG_DIR/certs/ca.log" ]]; then
-      tuic_domain=$(cat "$CONFIG_DIR/certs/ca.log")
-      info "检测到已有域名 [${tuic_domain}] 的安全区证书，正在复用..."
-    else
-      read -rp "请输入需要申请证书的域名: " domain
-      [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
-      
-      info "正在检查并安装 Acme.sh 依赖..."
-      local acme_cmd="/root/.acme.sh/acme.sh"
-      if [[ ! -f "$acme_cmd" ]]; then
-        curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
-      fi
-      
-      "$acme_cmd" --set-default-ca --server letsencrypt
-      
-      info "正在向 Let's Encrypt 申请证书..."
-      if [[ "$(get_public_ip)" =~ ":" ]]; then
-        "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
-      else
-        "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
-      fi
-      
-      if "$acme_cmd" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc; then
-        echo "$domain" > "$CONFIG_DIR/certs/ca.log"
-        tuic_domain=$domain
-        info "Acme 证书申请并成功分发！"
-      else
-        error "Acme 证书申请失败，自动切换回自签模式。"
-        certInput=1
-      fi
-    fi
-  elif [[ $certInput == 3 ]]; then
-    local user_cert user_key
-    read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
-    read -rp "请输入密钥文件 (privkey.pem/key) 的路径: " user_key
-    read -rp "请输入证书对应的域名: " tuic_domain
-    
-    if [[ -f "$user_cert" && -f "$user_key" ]]; then
-      cp -f "$user_cert" "$cert_path"
-      cp -f "$user_key" "$key_path"
-      info "自定义证书已成功同步至配置安全区。"
-    else
-      error "找不到输入的证书文件，自动降级回自签模式。"
-      certInput=1
-    fi
-  fi
-
-  if [[ $certInput == 1 ]]; then
-    info "将使用必应自签证书作为 Tuic 的节点证书"
-    openssl ecparam -genkey -name prime256v1 -out "$key_path"
-    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
-    tuic_domain="www.bing.com"
-  fi
-
-  chmod 644 "$cert_path"
-  chmod 600 "$key_path"
-  chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR/certs"
-}
-
-inst_port() {
-  local default_port=""
-  if [[ -f "$TUIC_CONFIG" ]]; then
-    default_port=$(jq -r '.inbounds[0].listen_port // empty' "$TUIC_CONFIG" 2>/dev/null)
-  fi
-
-  local prompt_msg="设置 Tuic 服务端监听主端口 [1-65535] (回车随机分配): "
-  [[ -n "$default_port" ]] && prompt_msg="设置 Tuic 服务端监听主端口 [当前: ${default_port}, 回车不修改]: "
-
-  while true; do
-    read -rp "$prompt_msg" port
-    if [[ -z "$port" ]]; then
-      if [[ -n "$default_port" ]]; then port="$default_port" && break
-      else
-        port=$(get_random_port)
-        info "已为您随机分配未被占用端口: $port" && break
-      fi
-    elif is_valid_port "$port"; then
-      if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
-        error "端口 ${port} 已被其它程序占用，请更换。" && continue
-      fi
-      break
-    else error "请输入有效的端口数字 (1-65535)"; fi
-  done
-
-  echo "---------------------------------------------"
-  echo -e "Tuic 端口群使用模式 ："
-  echo -e " 1) 单端口模式"
-  echo -e " 2) 端口跳跃模式 ${YELLOW}（默认)${RESET}"
-  echo "---------------------------------------------"
-  local jumpInput
-  read -rp "请选择端口模式 [1-2] (默认2): " jumpInput
-  jumpInput=${jumpInput:-2}
-
-  clear_old_iptables
-
-  if [[ $jumpInput == 2 ]]; then
-    while true; do
-      read -rp "设置外部跳跃起始端口 (建议10000-65535): " firstport
-      read -rp "设置外部跳跃末尾端口 (必须大于起始端口): " endport
-      if is_valid_port "$firstport" && is_valid_port "$endport" && [[ $firstport -lt $endport ]]; then break
-      else error "输入无效，起始端口必须小于末尾端口，请重新输入。"; fi
-    done
-    echo "$firstport-$endport" > "${CONFIG_DIR}/hopping.txt"
-  else
-    rm -f "${CONFIG_DIR}/hopping.txt" "${CONFIG_DIR}/main_port.txt"
-    info "将继续使用单端口模式"
-    if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
-    if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
-  fi
-}
-
-write_and_show_config() {
-  local HOSTNAME=$(hostname -s | sed 's/ /_/g')
-  local vps_ip=$(get_public_ip)
-  local last_ip="$vps_ip"
-  [[ "$vps_ip" =~ ":" ]] && last_ip="[$vps_ip]"
-
-  local is_insecure="0"
-  local skip_cert="false"
-  if [[ "$tuic_domain" == "www.bing.com" ]]; then
-    is_insecure="1"
-    skip_cert="true"
-  fi
-
-  cat << EOF > "$TUIC_CONFIG"
+    cat > "$X_CONFIG" <<EOF
 {
-  "log": {
-    "level": "info",
-    "output": "$LOG_FILE",
-    "timestamp": true
-  },
-  "inbounds": [
-    {
-      "type": "tuic",
-      "tag": "tuic-in",
-      "listen": "::",
-      "listen_port": $port,
-      "users": [
-        {
-          "uuid": "$auth_uuid",
-          "password": "$auth_pwd"
-        }
-      ],
-      "congestion_control": "bbr",
-      "zero_rtt_handshake": false,
-      "heartbeat": "10s",
-      "tls": {
-        "enabled": true,
-        "server_name": "$tuic_domain",
-        "alpn": ["h3"],
-        "certificate_path": "$cert_path",
-        "key_path": "$key_path"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ],
-  "route": {
-    "final": "direct"
-  }
+    "log": { "loglevel": "warning" },
+    "inbounds": [{
+        "port": $port,
+        "protocol": "vless",
+        "settings": {
+            "clients": [{"id": "$uuid"}],
+            "decryption": "none"
+        },
+        "streamSettings": {
+            "network": "httpupgrade",
+            "security": "none",
+            "httpupgradeSettings": {
+                "path": "$path",
+                "host": "$host_name"
+            }
+        },
+        "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+    }],
+    "outbounds": [$outbound]
 }
 EOF
-
-  chmod 640 "$TUIC_CONFIG"
-  chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
-
-  apply_new_iptables
-  mkdir -p "$TUIC_DIR"
-  
-  local hopping_param=""
-  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
-    hopping_param="&mport=$(cat "${CONFIG_DIR}/hopping.txt")"
-  fi
-
-  cat << EOF > "$TUIC_DIR/url.txt"
-V6VPS 请自行替换 IP 地址为 V6
-V2rayN 链接:
-tuic://$auth_uuid:$auth_pwd@$last_ip:$port?alpn=h3&congestion_control=bbr&sni=$tuic_domain&allow_insecure=${is_insecure}${hopping_param}#$HOSTNAME-tuicv5
-
-Surge 配置:
-$HOSTNAME-tuicv5 = tuic-v5, $last_ip, $port, password=$auth_pwd, uuid=$auth_uuid, ecn=true, skip-cert-verify=${skip_cert}, sni=$tuic_domain
-EOF
-
-  rc-service sing-box-tuic restart
-  if rc-service sing-box-tuic status | grep -q "started"; then
-    info "sing-box TUIC 服务配置并启动成功！"
-  else
-    error "sing-box-tuic 启动失败，可在菜单中按 8 查看详细的闪退日志。"
-  fi
-  showconf
 }
 
-# =========================================================
-# 6. 安装、更新与卸载核心流控
-# =========================================================
-write_openrc_script() {
-  cat << 'EOF' > "$OPENRC_SERVICE_PATH"
+# ================== 出口模式配置 ==================
+configure_custom_socks5_outbound() {
+    if [[ ! -f "$X_CONFIG" ]]; then 
+        error "错误: Xray 未安装，无法配置出口模式。"
+        return
+    fi
+
+    local mode current_protocol tmp_file
+    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$X_CONFIG" 2>/dev/null || echo "freedom")
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${GREEN}请选择出口模式：${RESET}"
+    [[ "$current_protocol" == "socks" ]] && echo -e "${YELLOW} (当前: Socks5)${RESET}" || echo -e "${GREEN} (当前: 直连)${RESET}"
+    echo -e "${GREEN}1) 直连出口${RESET}"
+    echo -e "${GREEN}2) Socks5出口${RESET}"
+    echo -e "${GREEN}0) 取消${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+
+    echo -ne "${GREEN}请输入选项 [0-2]: ${RESET}"; read mode
+    case "$mode" in
+        1)
+            tmp_file=$(mktemp)
+            jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$X_CONFIG" > "$tmp_file"
+            cp "$X_CONFIG" "${X_CONFIG}.bak.$(date +%s)"
+            mv "$tmp_file" "$X_CONFIG"
+            restart_xray && info "已成功切换为直连出口！" || error "切换失败。"
+            return ;;
+        2) ;;
+        *) info "已取消配置"; return ;;
+    esac
+
+    info "配置自定义 Socks5 出口代理..."
+    local s_host s_port s_user s_pass
+    echo -ne "${GREEN}请输入 Socks5 服务器地址/IP: ${RESET}"; read s_host
+    [[ -z "$s_host" ]] && return
+
+    while true; do
+        echo -ne "${GREEN}请输入 Socks5 端口 (默认: 1080): ${RESET}"; read s_port
+        [[ -z "$s_port" ]] && s_port=1080
+        is_valid_port "$s_port" && break || error "端口无效，请输入 1-65535 之间的数字。"
+    done
+
+    echo -ne "${GREEN}请输入 Socks5 用户名 (无则回车): ${RESET}"; read s_user
+    if [[ -n "$s_user" ]]; then
+        echo -ne "${GREEN}请输入 Socks5 密码: ${RESET}"; read -s s_pass; echo
+    else
+        s_pass=""
+    fi
+
+    tmp_file=$(mktemp)
+    if [[ -n "$s_user" ]]; then
+        jq --arg host "$s_host" --argjson port "$s_port" --arg user "$s_user" --arg pass "$s_pass" \
+            '.outbounds = [{"protocol": "socks", "tag": "custom-out", "settings": {"servers": [{"address": $host, "port": $port, "users": [{"user": $user, "pass": $pass}]}]}}]' \
+            "$X_CONFIG" > "$tmp_file"
+    else
+        jq --arg host "$s_host" --argjson port "$s_port" \
+            '.outbounds = [{"protocol": "socks", "tag": "custom-out", "settings": {"servers": [{"address": $host, "port": $port}]}}]' \
+            "$X_CONFIG" > "$tmp_file"
+    fi
+
+    cp "$X_CONFIG" "${X_CONFIG}.bak.$(date +%s)"
+    mv "$tmp_file" "$X_CONFIG"
+    restart_xray && info "已成功切换为 Socks5 出口！" || error "重启失败，请检查 Socks5 信息。"
+}
+
+# 修改配置
+modify_config() {
+    if [[ ! -f "$X_CONFIG" ]]; then error "请先安装 Xray"; return; fi
+    
+    local curr_port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
+    local curr_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
+    local curr_path=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.path // "/"' "$X_CONFIG")
+    local curr_host=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.host // ""' "$X_CONFIG")
+    local curr_outbound=$(jq -c '.outbounds[0]' "$X_CONFIG")
+
+    # 1. 修改端口
+    local n_port
+    while true; do
+        read -p "请输入新端口 (回车保持 $curr_port): " n_port
+        n_port=${n_port:-$curr_port}
+        is_valid_port "$n_port" && break || error "端口无效，请输入 1-65535 之间的数字。"
+    done
+
+    # 2. 修改 UUID
+    local n_uuid
+    while true; do
+        read -p "请输入新 UUID (回车保持 $curr_uuid): " n_uuid
+        n_uuid=${n_uuid:-$curr_uuid}
+        if [[ "$n_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            break
+        else
+            error "UUID 格式不正确，请重新输入。"
+        fi
+    done
+
+    # 3. 修改 Path
+    read -p "请输入新 HTTPUpgrade Path (回车保持 $curr_path): " n_path
+    n_path=${n_path:-$curr_path}
+    [[ "$n_path" != /* ]] && n_path="/${n_path}"
+
+    # 4. 修改 Host
+    read -p "请输入新伪装 Host/域名 (如果没有直接回车，保持 '$curr_host'): " n_host
+    n_host=${n_host:-$curr_host}
+
+    write_config "$n_port" "$n_uuid" "$n_path" "$n_host" "$curr_outbound"
+    rc-service "$SERV_NAME" restart
+    
+    # 重新生成链接
+    local ip=$(get_public_ip || echo "127.0.0.1")
+    local host_addr=$ip
+    [[ -n "$n_host" ]] && host_addr=$n_host
+    
+    mkdir -p "$X_LINK_DIR"
+    echo "vless://$n_uuid@$host_addr:$n_port?encryption=none&type=httpupgrade&security=none&host=$(echo "$n_host" | jq -sRr @uri)&path=$(echo "$n_path" | jq -sRr @uri)#$HOSTNAME-${SERV_NAME}" > "$X_LINK"
+    info "配置已更新并成功重启服务！"
+}
+
+# ================== 安装与管理 ==================
+install_xray() {
+    info "正在安装依赖与内核..."
+    apk update && apk add curl unzip jq uuidgen gcompat libc6-compat bc > /dev/null 2>&1
+    mkdir -p "$X_DIR" && sync
+    
+    local arch=$(uname -m | sed 's/x86_64/64/;s/aarch64/arm64-v8a/')
+    local ver=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+    
+    info "下载 Xray $ver ($arch)..."
+    curl -L -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/$ver/Xray-linux-$arch.zip"
+    unzip -o /tmp/xray.zip -d /tmp/xray_tmp > /dev/null
+    mv -f /tmp/xray_tmp/xray "$X_BIN" && chmod +x "$X_BIN"
+    rm -rf /tmp/xray*
+    
+    if [[ ! -f "$X_CONFIG" ]]; then
+        echo -ne "${GREEN}请输入入站端口 (回车随机): ${RESET}"; read port; [[ -z "$port" ]] && port=$((RANDOM % 45535 + 10000))
+        
+        # 1. 自定义 UUID
+        local uuid
+        while true; do
+            echo -ne "${GREEN}请输入自定义 UUID (回车随机生成): ${RESET}"; read input_uuid
+            if [[ -z "$input_uuid" ]]; then
+                uuid=$(uuidgen)
+                break
+            else
+                if [[ "$input_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+                    uuid="$input_uuid"
+                    break
+                else
+                    error "UUID 格式不正确，请重新输入。"
+                fi
+            fi
+        done
+
+        # 2. 自定义 HTTPUpgrade Path
+        local path
+        echo -ne "${GREEN}请输入自定义 HTTPUpgrade Path (回车默认随机生成): ${RESET}"; read path
+        if [[ -z "$path" ]]; then
+            path="/$(openssl rand -hex 4)"
+            info "👉 采用随机 Path: $path"
+        else
+            [[ "$path" != /* ]] && path="/${path}"
+        fi
+        
+        # 3. 配置伪装 Host
+        echo -ne "${GREEN}请输入可选的伪装 Host 域名 (用于CDN或反向代理识别，没有直接回车): ${RESET}"; read host_name
+        
+        write_config "$port" "$uuid" "$path" "$host_name"
+        
+        # 写入 OpenRC 服务脚本
+        cat << EOF > "$INIT_FILE"
 #!/sbin/openrc-run
-
-name="sing-box-tuic"
-description="sing-box TUIC OpenRC Isolated Service"
-cfgfile="/etc/sing-box-tuic/config.json"
-logfile="/var/log/sing-box-tuic.log"
-command="/usr/local/bin/sing-box-tuic"
-command_args="run -c /etc/sing-box-tuic/config.json"
-
-depend() {
-    need net
-    after iptables ip6tables firewall
-}
-
-start_pre() {
-    if [ ! -f "$cfgfile" ]; then
-        eerror "Configuration file $cfgfile missing!"
-        return 1
-    fi
-    
-    touch "$logfile"
-    chown singbox-tuic:singbox-tuic "$logfile"
-    chmod 644 "$logfile"
-    
-    command_background="yes"
-    pidfile="/run/${RC_SVCNAME}.pid"
-    
-    output_log="$logfile"
-    error_log="$logfile"
-    
-    local port
-    port=$(jq -r '.inbounds[0].listen_port // 0' "$cfgfile" 2>/dev/null)
-    if [ "$port" -lt 1024 ] && [ "$port" -ne 0 ]; then
-        command_user="root:root"
-    else
-        command_user="singbox-tuic:singbox-tuic"
-    fi
-}
+command="${X_BIN}"
+command_args="run -c ${X_CONFIG}"
+command_background="yes"
+pidfile="/run/${SERV_NAME}.pid"
+output_log="$X_LOG"
+error_log="$X_LOG"
 EOF
-  chmod +x "$OPENRC_SERVICE_PATH"
-  rc-update add sing-box-tuic default >/dev/null 2>&1 || true
-}
-
-download_core() {
-  local arch url
-  arch=$(detect_arch)
-  get_latest_version
-  url=$(printf 'https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz' "$SINGBOX_VERSION" "$SINGBOX_VERSION" "$arch")
-  
-  info "正在下载官方核心 sing-box v$SINGBOX_VERSION..."
-  cd "$TMP_DIR"
-  if ! wget -O sing-box.tar.gz -q "$url"; then
-    curl -fsSL -o sing-box.tar.gz "$url" || { error "下载核心文件失败"; return 1; }
-  fi
-  
-  tar -xzf sing-box.tar.gz -C "$TMP_DIR"
-  local extracted=$(find "$TMP_DIR" -type f -name sing-box | head -n 1)
-  [[ -n "$extracted" ]] || { error "解压目标核心错误"; return 1; }
-  
-  rc-service sing-box-tuic stop >/dev/null 2>&1 || true
-  install -m 755 "$extracted" "$BINARY_PATH"
-  info "sing-box-tuic 核心释放完毕。"
-  return 0
-}
-
-install_tuic() {
-  echo -e "${GREEN}[信息] 开始在 Alpine 下部署专属隔离的 sing-box TUIC V5 ...${RESET}"
-  check_environment
-  mkdir -p "$CONFIG_DIR" "$TUIC_DIR"
-
-  if ! download_core; then return 1; fi
-
-  write_openrc_script
-
-  inst_cert || return 1
-  inst_port
-  
-  read -rp "设置 Tuic 验证 UUID (回车自动分配随机 UUID): " auth_uuid
-  auth_uuid=${auth_uuid:-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "12345678-1234-1234-1234-123456781234")}
-  
-  read -rp "设置 Tuic 验证密码 (回车自动分配随机密码): " auth_pwd
-  auth_pwd=${auth_pwd:-$(generate_random_password)}
-
-  write_and_show_config
-}
-
-update_tuic() {
-  if [[ ! -f "$BINARY_PATH" ]]; then
-    error "当前系统未检测到核心，无法执行覆盖升级。"
-    return 1
-  fi
-  info "检测到已有环境，正在执行纯净原地覆盖核心升级..."
-  if download_core; then
-    rc-service sing-box-tuic start
-    info "sing-box-tuic 核心纯净升级覆盖成功，服务已安全启动！"
-  else
-    error "核心升级遭遇未预期中断。"
-  fi
-}
-
-unsttuic() {
-  warn "即将执行全面清洁卸载..."
-  
-  # 【修复核心】：必须在删除配置文件和存储路径之前清空 iptables，否则 clear_old_iptables 会读不到数据导致卸载残留
-  clear_old_iptables
-  if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
-  if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
-
-  rc-service sing-box-tuic stop || true
-  rc-update del sing-box-tuic default >/dev/null 2>&1 || true
-  
-  rm -f "$BINARY_PATH" "$OPENRC_SERVICE_PATH" "$LOG_FILE"
-  rm -rf "$CONFIG_DIR" "$TUIC_DIR"
-  
-  info "专属服务、节点配置及防火墙跳跃链条已彻底卸载清理完毕！"
-}
-
-changeconf() {
-  if [[ ! -f "$TUIC_CONFIG" ]]; then
-    error "配置文件不存在，请先选择选项 1 安装"
-    return 1
-  fi
-
-  local old_uuid=$(jq -r '.inbounds[0].users[0].uuid // empty' "$TUIC_CONFIG")
-  local old_pwd=$(jq -r '.inbounds[0].users[0].password // empty' "$TUIC_CONFIG")
-  local old_cert=$(jq -r '.inbounds[0].tls.certificate_path // empty' "$TUIC_CONFIG")
-  local old_key=$(jq -r '.inbounds[0].tls.key_path // empty' "$TUIC_CONFIG")
-  local old_sni=$(jq -r '.inbounds[0].tls.server_name // "www.bing.com"' "$TUIC_CONFIG")
-
-  clear
-  echo -e "${GREEN}====== 修改 sing-box Tuic 配置 ======${RESET}"
-  echo "提示：直接敲回车将保持原有配置不变"
-  echo "---------------------------------------------"
-  
-  inst_port 
-
-  local auth_uuid
-  read -rp "设置 Tuic 验证 UUID [当前: ${old_uuid}, 回车不修改]: " auth_uuid
-  auth_uuid=${auth_uuid:-$old_uuid}
-
-  local auth_pwd
-  read -rp "设置 Tuic 验证密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
-  auth_pwd=${auth_pwd:-$old_pwd}
-
-  local cert_path key_path tuic_domain
-  echo "---------------------------------------------"
-  read -rp "是否需要修改证书？[y/N] (直接回车默认不修改): " change_cert_flag
-  if [[ "$change_cert_flag" == "y" || "$change_cert_flag" == "Y" ]]; then
-    inst_cert || return 1
-  else
-    cert_path="$old_cert"
-    key_path="$old_key"
-    tuic_domain="$old_sni"
-  fi
-
-  write_and_show_config
-  info "配置与转发链条刷新修改成功！"
-}
-
-showconf() {
-  if [[ ! -d "$TUIC_DIR" ]]; then
-    error "未找到分享配置文件。"
-    return
-  fi
-  echo -e "${GREEN}====== 节点分享与配置信息 ======${RESET}"
-  cat "$TUIC_DIR/url.txt"
-  echo
-}
-
-# =========================================================
-# 7. 面板交互菜单 
-# =========================================================
-menu() {
-  while true; do
-    clear
-    local raw_status=$(get_tuic_status)
-    local status=""
-    if [[ "$raw_status" == "RUNNING" ]]; then
-      status="${GREEN}● 运行中${RESET}"
-    else
-      status="${RED}● 未运行${RESET}"
+        chmod +x "$INIT_FILE"
+        touch "$X_LOG"
+        rc-update add "$SERV_NAME" default >/dev/null 2>&1
     fi
 
-    local version=$(get_installed_version)
-    local port_show=$(get_current_port_display)
+    rc-service "$SERV_NAME" restart
+    
+    # 读取配置生成分享链接
+    local ip=$(get_public_ip || echo "127.0.0.1")
+    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
+    local port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
+    local path=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.path // "/"' "$X_CONFIG")
+    local host_name=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.host // ""' "$X_CONFIG")
+    
+    local host_addr=$ip
+    [[ -n "$host_name" ]] && host_addr=$host_name
+    
+    local link="vless://$uuid@$host_addr:$port?encryption=none&type=httpupgrade&security=none&host=$(echo "$host_name" | jq -sRr @uri)&path=$(echo "$path" | jq -sRr @uri)#$HOSTNAME-${SERV_NAME}"
+    
+    mkdir -p "$X_LINK_DIR"
+    echo "$link" > "$X_LINK"
+
+    show_current_config
+}
+
+# ================== 显示配置 ==================
+show_current_config() {
+    if [[ ! -f "$X_CONFIG" ]]; then
+        error "配置文件不存在"
+        return
+    fi
+
+    local ip uuid port host_name path outbound_mode
+    ip=$(get_public_ip || echo "未知")
+    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG" 2>/dev/null || echo "未知")
+    port=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "未知")
+    path=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.path // "/"' "$X_CONFIG" 2>/dev/null || echo "/")
+    host_name=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.host // "无"' "$X_CONFIG" 2>/dev/null || echo "无")
+    
+    local current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$X_CONFIG" 2>/dev/null || echo "freedom")
+    [[ "$current_protocol" == "socks" ]] && outbound_mode="Socks5 链式代理" || outbound_mode="直连 (Freedom)"
+
+    echo -e "\n${GREEN}====== 当前配置详情 ======${RESET}"
+    echo -e "${YELLOW}独立系统服务: ${SERV_NAME}${RESET}"
+    echo -e "${YELLOW}传输协议    : VLESS + HTTPUpgrade${RESET}"
+    echo -e "${YELLOW}安全传输    : none (纯明文 HTTP)${RESET}"
+    echo -e "${YELLOW}IP地址      : ${ip}${RESET}"
+    echo -e "${YELLOW}端口        : ${port}${RESET}"
+    echo -e "${YELLOW}UUID        : ${uuid}${RESET}"
+    echo -e "${YELLOW}Host 伪装   : ${host_name}${RESET}"
+    echo -e "${YELLOW}HTTPUpgrade Path : ${path}${RESET}"
+    echo -e "${YELLOW}出口模式    : ${outbound_mode}${RESET}"
+    echo -e "${YELLOW}分享存放路径: ${X_LINK}${RESET}"
+    
+    if [[ -f "$X_LINK" ]]; then
+        echo -e "${GREEN}====== 👉 v2rayN 分享链接 ======${RESET}"
+        cat "$X_LINK"
+    fi
+}
+
+# ================== 菜单 ==================
+show_menu() {
+    clear
+    local status=$(get_xray_status)
+    local version=$(get_xray_version)
+    local port_show="-"
+    [[ -f "$X_CONFIG" ]] && port_show=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "-")
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       Sing-box(Tuicv5) 面板    ${RESET}"
+    echo -e "${GREEN}  Xray Vless+httpupgrade 面板  ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} ${status}"
+    echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Sing-box Tuicv5${RESET}"
-    echo -e "${GREEN}2. 更新 Sing-box Tuicv5${RESET}"
-    echo -e "${GREEN}3. 卸载 Sing-box Tuicv5${RESET}"
-    echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 Sing-box Tuicv5${RESET}"
-    echo -e "${GREEN}6. 停止 Sing-box Tuicv5${RESET}"
-    echo -e "${GREEN}7. 重启 Sing-box Tuicv5${RESET}"
-    echo -e "${GREEN}8. 查看日志${RESET}"
-    echo -e "${GREEN}9. 查看节点配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN} 1. 安装 Xray Vless+httpupgrade${RESET}"
+    echo -e "${GREEN} 2. 更新 Xray${RESET}"
+    echo -e "${GREEN} 3. 卸载 Xray${RESET}"
+    echo -e "${GREEN} 4. 修改配置${RESET}"
+    echo -e "${GREEN} 5. 启动 Xray${RESET}"
+    echo -e "${GREEN} 6. 停止 Xray${RESET}"
+    echo -e "${GREEN} 7. 重启 Xray${RESET}"
+    echo -e "${GREEN} 8. 查看日志${RESET}"
+    echo -e "${GREEN} 9. 查看节点配置${RESET}"
+    echo -e "${GREEN}10. 配置Socks5出口${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
-
-    local choice=""
-    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
-    [[ -z "$choice" ]] && continue
-
-    case "$choice" in
-      1) install_tuic; pause ;;
-      2) update_tuic; pause ;;
-      3) unsttuic; pause ;; 
-      4) changeconf; pause ;;
-      5) rc-service sing-box-tuic start && info "服务已成功启动！"; pause ;;
-      6) rc-service sing-box-tuic stop && info "服务已成功停止！"; pause ;;
-      7) rc-service sing-box-tuic restart && info "服务已成功重启！"; pause ;;
-      8) if [[ -f "$LOG_FILE" ]]; then tail -n 50 "$LOG_FILE"; else warn "未发现运行日志文件。"; fi; pause ;;
-      9) showconf; pause ;;
-      0) exit 0 ;;
-      *) error "无效输入，请重新选择。"; sleep 1 ;;
-    esac
-  done
 }
 
-if [[ ${EUID} -ne 0 ]]; then
-  error "请切换至 root 用户运行此面板脚本。"
-  exit 1
-fi
-
-menu "$@"
+while true; do
+    show_menu
+    echo -ne "${GREEN}请输入选项: ${RESET}"; read choice
+    case $choice in
+        1|2) install_xray; pause ;;
+        3) 
+            rc-service "$SERV_NAME" stop 2>/dev/null || true
+            rc-update del "$SERV_NAME" default 2>/dev/null || true
+            rm -rf "$X_DIR" "$X_BIN" "$INIT_FILE" "$X_LINK" "$X_LOG"
+            info "卸载完成"
+            pause 
+            ;;
+        4) modify_config; pause ;;
+        5) rc-service "$SERV_NAME" start; pause ;;
+        6) rc-service "$SERV_NAME" stop; pause ;;
+        7) rc-service "$SERV_NAME" restart; pause ;;
+        8) [[ -f "$X_LOG" ]] && tail -f "$X_LOG" || error "暂无日志"; pause ;;
+        9) show_current_config || error "无配置"; pause ;;
+        10) configure_custom_socks5_outbound; pause ;;
+        0) exit 0 ;;
+        *) error "无效选项"; sleep 1 ;;
+    esac
+done

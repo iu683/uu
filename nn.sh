@@ -12,9 +12,10 @@ export LANG=en_US.UTF-8
 # 基础目录与硬编码配置
 readonly XRAY_CONFIG="/usr/local/etc/xray/config.json"
 readonly XRAY_BINARY="/usr/local/bin/xray"
+readonly STATE_DIR="/root/Xray"
 readonly STATE_FILE="/root/Xray/xray_encryption_info.txt"
 readonly REALITY_FILE="/root/Xray/xray_reality_info.txt"  # 存储格式: pbk|sni|sid
-readonly LINK_FILE="/root/Xray/xray_vless_reality_link.txt"
+readonly LINK_FILE="/root/Xray/xray_vless_encryptionreality_link.txt"
 XRAY_INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
 SYSTEMD_SERVICES_DIR="/etc/systemd/system"
 CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
@@ -30,6 +31,7 @@ RED="\033[31m"
 YELLOW="\033[33m"
 BLUE="\033[34m"
 CYAN="\033[36m"
+RESET="\03 counseling"
 RESET="\033[0m"
 
 # =========================================================
@@ -219,16 +221,12 @@ generate_reality_keys() {
     return 1
   fi
 
-  local private_key=$(echo "$key_pair" | awk '/PrivateKey:/ {print $2}')
-  local public_key=$(echo "$key_pair" | awk '/Password:/ {print $2}')
+  local private_key=$(echo "$key_pair" | grep -i "Private" | sed 's/[[:space:]]//g' | cut -d':' -f2)
+  local public_key=$(echo "$key_pair" | grep -E -i "(Public|Password)" | sed 's/[[:space:]]//g' | cut -d':' -f2)
 
   if [ -z "$private_key" ] || [ -z "$public_key" ]; then
-    private_key=$(echo "$key_pair" | awk '/Private key:/ {print $3}')
-    public_key=$(echo "$key_pair" | awk '/Public key:/ {print $3}')
-  fi
-
-  if [ -z "$private_key" ] || [ -z "$public_key" ]; then
-    error "无法解析 REALITY 密钥对！"
+    error "无法解析 REALITY 密钥对。生成的原始内容为："
+    echo "$key_pair"
     return 1
   fi
   echo "${private_key}|${public_key}"
@@ -238,9 +236,8 @@ generate_reality_keys() {
 # 4. 面板核心交互与配置文件处理
 # =========================================================
 write_and_show_config() {
-  mkdir -p "$(dirname "$STATE_FILE")"
+  mkdir -p "$STATE_DIR"
   
-  # 持久化客户端所需的加解密和 REALITY 基础媒介信息
   rm -f "$STATE_FILE" "$REALITY_FILE"
   echo "$ENCRYPTION" > "$STATE_FILE"
   echo "${PUBLIC_KEY}|${SNI}|${SHORT_ID}" > "$REALITY_FILE"
@@ -296,7 +293,6 @@ REMARK='${REMARK}'
 SERVER_IP='${SERVER_IP}'
 EOF
 
-  # 强制清除旧的残留进程，避免端口占用导致死锁
   pkill -f "$XRAY_BINARY run" || true
 
   if has_command systemctl; then
@@ -361,25 +357,28 @@ inst_xray() {
   PUBLIC_KEY=$(echo "$reality_keys" | cut -d'|' -f2)
 
   # 3. 设定默认交互环境数值
-  local rand_port="443"
+  local rand_port=$((RANDOM % 64512 + 1024))
   local rand_uuid=$(generate_uuid)
+  
+  # ===【优化】Short ID 采用系统随机生成（生成 8 位 16 进制随机偶数指纹）===
+  local rand_sid=$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \t\n')
+  
   local hostname_str=$(hostname 2>/dev/null || echo "linux")
-  local default_remark="${hostname_str}-VLESS-E-REALITY"
-  local default_sni="learn.microsoft.com"
-  local default_sid="20220701"
+  local default_remark="${hostname_str}-VLESS-E-Reality"
+  local default_sni="www.amazon.com"
 
   echo "---------------------------------------------"
-  read -rp "👉 请输入监听端口 (默认: ${rand_port}): " INPUT_PORT
+  read -rp "👉 请输入监听端口 (直接回车使用随机高端口: ${rand_port}): " INPUT_PORT
   PORT=${INPUT_PORT:-$rand_port}
 
-  read -rp "👉 请输入UUID (默认随机: ${rand_uuid}): " INPUT_UUID
+  read -rp "👉 请输入UUID (直接回车使用随机ID: ${rand_uuid}): " INPUT_UUID
   UUID=${INPUT_UUID:-$rand_uuid}
 
   read -rp "👉 请输入 REALITY SNI 伪装域名 (默认: ${default_sni}): " INPUT_SNI
   SNI=${INPUT_SNI:-$default_sni}
 
-  read -rp "👉 请输入 REALITY Short ID (默认: ${default_sid}): " INPUT_SID
-  SHORT_ID=${INPUT_SID:-$default_sid}
+  read -rp "👉 请输入 REALITY Short ID (直接回车使用随机ID: ${rand_sid}): " INPUT_SID
+  SHORT_ID=${INPUT_SID:-$rand_sid}
 
   read -rp "👉 请输入节点备注名称 (默认: ${default_remark}): " INPUT_REMARK
   REMARK=${INPUT_REMARK:-$default_remark}
@@ -395,7 +394,6 @@ modify_config() {
 
   info "正在读取现有节点配置与核心密钥..."
   
-  # 安全底线：精准从运行时文件捞取，修改端口或 UUID 时绝对继承并保护原密钥
   local current_port=$(jq -r '.inbounds[0].port // empty' "$XRAY_CONFIG" 2>/dev/null)
   local current_uuid=$(jq -r '.inbounds[0].settings.clients[0].id // empty' "$XRAY_CONFIG" 2>/dev/null)
   local current_decryption=$(jq -r '.inbounds[0].settings.decryption // empty' "$XRAY_CONFIG" 2>/dev/null)
@@ -436,7 +434,6 @@ modify_config() {
   read -rp "👉 修改节点备注名称 (当前: ${current_remark:-VLESS-E-REALITY}): " INPUT_REMARK
   REMARK=${INPUT_REMARK:-${current_remark:-VLESS-E-REALITY}}
 
-  # 继承关键资产密钥，闭环重写
   DECRYPTION="$current_decryption"
   ENCRYPTION="$current_encryption"
   PRIVATE_KEY="$current_private_key"
@@ -453,7 +450,7 @@ update_xray() {
 
   warn "即将开始平滑更新..."
   if ! execute_official_script "install"; then
-    error "Xray 核心更新 failed！"
+    error "Xray 核心更新失败！"
     return 1
   fi
 
@@ -515,16 +512,15 @@ showconf() {
   local address_for_url=$server_ip
   if [[ $server_ip == *":"* ]]; then address_for_url="[${server_ip}]"; fi
 
-  # 生成标准格式客户端分享链接
   local vless_link="vless://${uuid}@${address_for_url}:${port}?encryption=${encryption}&security=reality&sni=${sni}&sid=${short_id}&fp=chrome&pbk=${public_key}&flow=xtls-rprx-vision&type=tcp#${encoded_remark}"
   echo "$vless_link" > "$LINK_FILE"
 
-  echo -e "${GREEN}====== VLESS-Encryption + REALITY 节点信息 ======${RESET}"
+  echo -e "${GREEN}====== VLESS-Encryption + Reality 节点信息 ======${RESET}"
   echo -e "${GREEN}服务器公网 IP   :${RESET} ${server_ip}"
   echo -e "${GREEN}服务监听端口     :${RESET} ${port}"
   echo -e "${GREEN}用户 UUID        :${RESET} ${uuid}"
   echo -e "${GREEN}协议与加密形态   :${RESET} VLESS Encryption (native + 0-RTT + ML-KEM-768)"
-  echo -e "${GREEN}安全伪装类型     :${RESET} REALITY"
+  echo -e "${GREEN}安全伪装类型     :${RESET} Reality"
   echo -e "${GREEN}流控传输阻断     :${RESET} xtls-rprx-vision (TCP)"
   echo -e "${GREEN}伪装目标 SNI     :${RESET} ${sni}"
   echo -e "${GREEN}REALITY ShortID  :${RESET} ${short_id}"
@@ -532,7 +528,7 @@ showconf() {
   echo -e "${GREEN}节点自定义备注   :${RESET} ${current_remark}"
   echo -e "${YELLOW}📄 V6VPS 请自行替换分享链接中的 IP 为 V6 格式 ★${RESET}"
   echo "---------------------------------------------"
-  echo -e "${GREEN}👉 客户端分享链接 (已存至 $LINK_FILE):${RESET}"
+  echo -e "${GREEN}👉 v2rayN 链接 (已存至 $LINK_FILE):${RESET}"
   echo -e "${YELLOW}${vless_link}${RESET}"
   echo "---------------------------------------------"
 }
@@ -551,21 +547,21 @@ menu() {
     local port_show=$(get_current_port_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   Xray VLESS-E + REALITY 面板   ${RESET}"
+    echo -e "${GREEN}   Xray Encryption+Reality 面板   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 VLESS-E + REALITY${RESET}" 
-    echo -e "${GREEN}2. 更新 Xray 核心组件${RESET}"
-    echo -e "${GREEN}3. 卸载整个协议面板${RESET}"
-    echo -e "${GREEN}4. 修改运行配置 (保留私钥)${RESET}"
-    echo -e "${GREEN}5. 启动 Xray 守护进程${RESET}"
-    echo -e "${GREEN}6. 停止 Xray 守护进程${RESET}"
-    echo -e "${GREEN}7. 重启 Xray 守护进程${RESET}"
-    echo -e "${GREEN}8. 查看集中管理日志${RESET}"
-    echo -e "${GREEN}9. 查看当前节点配置信息${RESET}"
+    echo -e "${GREEN}1. 安装 Encryption+Reality${RESET}" 
+    echo -e "${GREEN}2. 更新 Xray${RESET}"
+    echo -e "${GREEN}3. 卸载 Xray${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 Xray${RESET}"
+    echo -e "${GREEN}6. 停止 Xray${RESET}"
+    echo -e "${GREEN}7. 重举 Xray${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出面板${RESET}"
     echo -e "${GREEN}================================${RESET}"
 

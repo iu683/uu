@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 #
-# Alpine sing-box TUIC v5 专属隔离管理面板
+# Alpine sing-box Hysteria 2 专属管理面板
 # SPDX-License-Identifier: MIT
 #
 set -Eop pipefail
 export LANG=en_US.UTF-8
 
 # =========================================================
-# 1. 核心控制与全局环境初始化（全面重命名，防止冲突）
+# 1. 核心控制与全局环境初始化
 # =========================================================
-readonly BINARY_PATH="/usr/local/bin/sing-box-tuic"
-readonly TUIC_CONFIG="/etc/sing-box-tuic/config.json"
-readonly TUIC_DIR="/root/tuicV5"
-CONFIG_DIR="/etc/sing-box-tuic"
-OPENRC_SERVICE_PATH="/etc/init.d/sing-box-tuic"
-LOG_FILE="/var/log/sing-box-tuic.log"
-RUN_USER="singbox-tuic"
+readonly BINARY_PATH="/usr/local/bin/sing-box-hy2"
+readonly HY2_CONFIG="/etc/sing-box-hy2/config.json"
+readonly HY2_DIR="/root/hy2_share"
+CONFIG_DIR="/etc/sing-box-hy2"
+OPENRC_SERVICE_PATH="/etc/init.d/sing-box-hy2"
+LOG_FILE="/var/log/sing-box-hy2.log"
+RUN_USER="singbox-hy2"
 
-TMP_DIR=$(mktemp -d -t sb-tuic.XXXXXX)
+TMP_DIR=$(mktemp -d -t sb-hy2.XXXXXX)
 
 # 颜色标准规范
 GREEN="\033[32m"
@@ -48,6 +48,15 @@ install_packages() {
   info "正在刷新 Alpine 仓库并安装核心依赖..."
   apk update
   apk add --no-cache bash curl wget tar openssl openrc iproute2 jq grep sed coreutils bind-tools iptables ip6tables
+  
+  if [[ -f /etc/init.d/iptables ]]; then
+    rc-update add iptables default >/dev/null 2>&1 || true
+    rc-service iptables start >/dev/null 2>&1 || true
+  fi
+  if [[ -f /etc/init.d/ip6tables ]]; then
+    rc-update add ip6tables default >/dev/null 2>&1 || true
+    rc-service ip6tables start >/dev/null 2>&1 || true
+  fi
 }
 
 create_user() {
@@ -102,13 +111,15 @@ get_latest_version() {
 
 clear_old_iptables() {
   if [[ -f "${CONFIG_DIR}/hopping.txt" && -f "${CONFIG_DIR}/main_port.txt" ]]; then
-    local old_hop=$(cat "${CONFIG_DIR}/hopping.txt")
-    local old_port=$(cat "${CONFIG_DIR}/main_port.txt")
-    local old_start=${old_hop%-*}
-    local old_end=${old_hop#*-}
+    local old_hop
+    old_hop=$(cat "${CONFIG_DIR}/hopping.txt")
+    local old_port
+    old_port=$(cat "${CONFIG_DIR}/main_port.txt")
+    local old_start="${old_hop%-*}"
+    local old_end="${old_hop#*-}"
 
     if [[ -n "$old_start" && -n "$old_end" && -n "$old_port" ]]; then
-      # 修复：增加了 Alpine 下兼容性更好的 multiport 范围清除
+      info "正在清洁防火墙残留规则..."
       iptables -t nat -D PREROUTING -p udp -m multiport --dports "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
       ip6tables -t nat -D PREROUTING -p udp -m multiport --dports "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
       iptables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
@@ -120,26 +131,24 @@ clear_old_iptables() {
 apply_new_iptables() {
   clear_old_iptables
   if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
-    local hop_val=$(cat "${CONFIG_DIR}/hopping.txt")
-    local start_p=${hop_val%-*}
-    local end_p=${hop_val#*-}
+    local hop_val
+    hop_val=$(cat "${CONFIG_DIR}/hopping.txt")
+    local start_p="${hop_val%-*}"
+    local end_p="${hop_val#*-}"
     
     info "正在应用 iptables 转发规则: UDP $start_p-$end_p => 主端口 $port"
-    # 修复：使用 -m multiport 机制防止 Alpine 下直接用 --dport 范围报错
     if iptables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port"; then
       ip6tables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
     else
-      warn "标准范围注入失败，尝试备用规则注入..."
       iptables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port"
       ip6tables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
     fi
     
     echo "$port" > "${CONFIG_DIR}/main_port.txt"
-    # 保存防火墙，防止 Alpine 重启丢失
-    if [[ -f /etc/init.d/iptables ]]; then
-      rc-service iptables save &>/dev/null || true
-      rc-service ip6tables save &>/dev/null || true
-    fi
+    
+    if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
+    if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
+    info "防火墙端口跳跃规则已固化。"
   fi
 }
 
@@ -181,8 +190,8 @@ get_random_port() {
   done
 }
 
-get_tuic_status() {
-  if rc-service sing-box-tuic status 2>/dev/null | grep -q "started"; then
+get_hy2_status() {
+  if rc-service sing-box-hy2 status 2>/dev/null | grep -q "started"; then
     echo "RUNNING"
   else
     echo "STOPPED"
@@ -190,9 +199,9 @@ get_tuic_status() {
 }
 
 get_current_port_display() {
-  if [[ -f "$TUIC_CONFIG" ]]; then
+  if [[ -f "$HY2_CONFIG" ]]; then
     local main_port jump_range="无"
-    main_port=$(jq -r '.inbounds[0].listen_port // empty' "$TUIC_CONFIG" 2>/dev/null)
+    main_port=$(jq -r '.inbounds[0].listen_port // empty' "$HY2_CONFIG" 2>/dev/null)
     [[ -f "${CONFIG_DIR}/hopping.txt" ]] && jump_range=$(cat "${CONFIG_DIR}/hopping.txt")
     
     if [[ "$jump_range" != "无" ]]; then
@@ -204,13 +213,13 @@ get_current_port_display() {
 }
 
 # =========================================================
-# 5. 面板节点配置生成核心逻辑
+# 5. 面板节点配置生成核心逻辑 (Hysteria 2)
 # =========================================================
 inst_cert() {
   mkdir -p "$CONFIG_DIR/certs"
 
   echo "---------------------------------------------"
-  echo -e "Tuic 协议证书申请方式如下："
+  echo -e "Hysteria 2 协议证书申请方式如下："
   echo -e " 1) 必应自签证书 ${YELLOW}（默认）${RESET}"
   echo -e " 2) Acme 脚本自动申请 (需放行 80 端口)"
   echo -e " 3) 自定义证书路径"
@@ -224,12 +233,12 @@ inst_cert() {
 
   if [[ $certInput == 2 ]]; then
     if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
-      warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。请确保已暂时关闭 Web 服务。"
+      warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。"
     fi
 
     if [[ -f "$cert_path" && -f "$key_path" && -s "$cert_path" && -s "$key_path" && -f "$CONFIG_DIR/certs/ca.log" ]]; then
-      tuic_domain=$(cat "$CONFIG_DIR/certs/ca.log")
-      info "检测到已有域名 [${tuic_domain}] 的安全区证书，正在复用..."
+      hy2_domain=$(cat "$CONFIG_DIR/certs/ca.log")
+      info "检测到已有域名 [${hy2_domain}] 的安全区证书，正在复用..."
     else
       read -rp "请输入需要申请证书的域名: " domain
       [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
@@ -251,7 +260,7 @@ inst_cert() {
       
       if "$acme_cmd" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc; then
         echo "$domain" > "$CONFIG_DIR/certs/ca.log"
-        tuic_domain=$domain
+        hy2_domain=$domain
         info "Acme 证书申请并成功分发！"
       else
         error "Acme 证书申请失败，自动切换回自签模式。"
@@ -262,7 +271,7 @@ inst_cert() {
     local user_cert user_key
     read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
     read -rp "请输入密钥文件 (privkey.pem/key) 的路径: " user_key
-    read -rp "请输入证书对应的域名: " tuic_domain
+    read -rp "请输入证书对应的域名: " hy2_domain
     
     if [[ -f "$user_cert" && -f "$user_key" ]]; then
       cp -f "$user_cert" "$cert_path"
@@ -275,10 +284,10 @@ inst_cert() {
   fi
 
   if [[ $certInput == 1 ]]; then
-    info "将使用必应自签证书作为 Tuic 的节点证书"
+    info "将使用必应自签证书作为 Hysteria 2 的节点证书"
     openssl ecparam -genkey -name prime256v1 -out "$key_path"
     openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
-    tuic_domain="www.bing.com"
+    hy2_domain="www.bing.com"
   fi
 
   chmod 644 "$cert_path"
@@ -288,12 +297,12 @@ inst_cert() {
 
 inst_port() {
   local default_port=""
-  if [[ -f "$TUIC_CONFIG" ]]; then
-    default_port=$(jq -r '.inbounds[0].listen_port // empty' "$TUIC_CONFIG" 2>/dev/null)
+  if [[ -f "$HY2_CONFIG" ]]; then
+    default_port=$(jq -r '.inbounds[0].listen_port // empty' "$HY2_CONFIG" 2>/dev/null)
   fi
 
-  local prompt_msg="设置 Tuic 服务端监听主端口 [1-65535] (回车随机分配): "
-  [[ -n "$default_port" ]] && prompt_msg="设置 Tuic 服务端监听主端口 [当前: ${default_port}, 回车不修改]: "
+  local prompt_msg="设置 Hysteria 2 服务端监听主端口 [1-65535] (回车随机分配): "
+  [[ -n "$default_port" ]] && prompt_msg="设置 Hysteria 2 服务端监听主端口 [当前: ${default_port}, 回车不修改]: "
 
   while true; do
     read -rp "$prompt_msg" port
@@ -312,7 +321,7 @@ inst_port() {
   done
 
   echo "---------------------------------------------"
-  echo -e "Tuic 端口群使用模式 ："
+  echo -e "Hysteria 2 端口群使用模式 ："
   echo -e " 1) 单端口模式"
   echo -e " 2) 端口跳跃模式 ${YELLOW}（默认)${RESET}"
   echo "---------------------------------------------"
@@ -333,23 +342,28 @@ inst_port() {
   else
     rm -f "${CONFIG_DIR}/hopping.txt" "${CONFIG_DIR}/main_port.txt"
     info "将继续使用单端口模式"
+    if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
+    if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
   fi
 }
 
 write_and_show_config() {
-  local HOSTNAME=$(hostname -s | sed 's/ /_/g')
-  local vps_ip=$(get_public_ip)
+  local HOSTNAME
+  HOSTNAME=$(hostname -s | sed 's/ /_/g')
+  local vps_ip
+  vps_ip=$(get_public_ip)
   local last_ip="$vps_ip"
   [[ "$vps_ip" =~ ":" ]] && last_ip="[$vps_ip]"
 
   local is_insecure="0"
   local skip_cert="false"
-  if [[ "$tuic_domain" == "www.bing.com" ]]; then
+  if [[ "$hy2_domain" == "www.bing.com" ]]; then
     is_insecure="1"
     skip_cert="true"
   fi
 
-  cat << EOF > "$TUIC_CONFIG"
+  # 生成 sing-box 格式的 Hysteria 2 配置文件
+  cat << EOF > "$HY2_CONFIG"
 {
   "log": {
     "level": "info",
@@ -358,23 +372,19 @@ write_and_show_config() {
   },
   "inbounds": [
     {
-      "type": "tuic",
-      "tag": "tuic-in",
+      "type": "hysteria2",
+      "tag": "hy2-in",
       "listen": "::",
       "listen_port": $port,
       "users": [
         {
-          "uuid": "$auth_uuid",
           "password": "$auth_pwd"
         }
       ],
-      "congestion_control": "bbr",
-      "zero_rtt_handshake": false,
-      "heartbeat": "10s",
+      "ignore_client_bandwidth": true,
       "tls": {
         "enabled": true,
-        "server_name": "$tuic_domain",
-        "alpn": ["h3"],
+        "server_name": "$hy2_domain",
         "certificate_path": "$cert_path",
         "key_path": "$key_path"
       }
@@ -392,52 +402,53 @@ write_and_show_config() {
 }
 EOF
 
-  chmod 640 "$TUIC_CONFIG"
+  chmod 640 "$HY2_CONFIG"
   chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
 
   apply_new_iptables
-  mkdir -p "$TUIC_DIR"
+  mkdir -p "$HY2_DIR"
   
-  local hopping_param=""
+  local final_port="$port"
   if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
-    hopping_param="&mport=$(cat "${CONFIG_DIR}/hopping.txt")"
+    final_port=$(cat "${CONFIG_DIR}/hopping.txt")
   fi
 
-  cat << EOF > "$TUIC_DIR/url.txt"
+  # 生成标准的 hysteria2:// 统一分享节点链
+  cat << EOF > "$HY2_DIR/url.txt"
 V6VPS 请自行替换 IP 地址为 V6
-V2rayN 链接:
-tuic://$auth_uuid:$auth_pwd@$last_ip:$port?alpn=h3&congestion_control=bbr&sni=$tuic_domain&allow_insecure=${is_insecure}${hopping_param}#$HOSTNAME-tuicv5
+标准 Hysteria 2 统一节点分享链接:
+hysteria2://$auth_pwd@$last_ip:$final_port?sni=$hy2_domain&insecure=${is_insecure}#$HOSTNAME-hy2
 
-Surge 配置:
-$HOSTNAME-tuicv5 = tuic-v5, $last_ip, $port, password=$auth_pwd, uuid=$auth_uuid, ecn=true, skip-cert-verify=${skip_cert}, sni=$tuic_domain
+Surge 4+ / Clash Meta 配置指南:
+类型: hysteria2, 服务器: $vps_ip, 端口: $port, 密码: $auth_pwd, sni: $hy2_domain, skip-cert-verify: ${skip_cert}
 EOF
 
-  rc-service sing-box-tuic restart
-  if rc-service sing-box-tuic status | grep -q "started"; then
-    info "sing-box TUIC 服务配置并启动成功！"
+  rc-service sing-box-hy2 restart
+  if rc-service sing-box-hy2 status | grep -q "started"; then
+    info "sing-box Hysteria 2 服务配置并启动成功！"
   else
-    error "sing-box-tuic 启动失败，可在菜单中按 8 查看详细的闪退日志。"
+    error "sing-box-hy2 启动失败，可在菜单中按 8 查看详细的闪退日志。"
   fi
   showconf
 }
 
 # =========================================================
-# 6. 安装、更新与卸载核心流控（重命名 OpenRC 服务与独立用户）
+# 6. 安装、更新与卸载核心流控
 # =========================================================
 write_openrc_script() {
   cat << 'EOF' > "$OPENRC_SERVICE_PATH"
 #!/sbin/openrc-run
 
-name="sing-box-tuic"
-description="sing-box TUIC OpenRC Isolated Service"
-cfgfile="/etc/sing-box-tuic/config.json"
-logfile="/var/log/sing-box-tuic.log"
-command="/usr/local/bin/sing-box-tuic"
-command_args="run -c /etc/sing-box-tuic/config.json"
+name="sing-box-hy2"
+description="sing-box Hysteria 2 OpenRC Isolated Service"
+cfgfile="/etc/sing-box-hy2/config.json"
+logfile="/var/log/sing-box-hy2.log"
+command="/usr/local/bin/sing-box-hy2"
+command_args="run -c /etc/sing-box-hy2/config.json"
 
 depend() {
     need net
-    after firewall
+    after iptables ip6tables firewall
 }
 
 start_pre() {
@@ -447,7 +458,7 @@ start_pre() {
     fi
     
     touch "$logfile"
-    chown singbox-tuic:singbox-tuic "$logfile"
+    chown singbox-hy2:singbox-hy2 "$logfile"
     chmod 644 "$logfile"
     
     command_background="yes"
@@ -461,12 +472,12 @@ start_pre() {
     if [ "$port" -lt 1024 ] && [ "$port" -ne 0 ]; then
         command_user="root:root"
     else
-        command_user="singbox-tuic:singbox-tuic"
+        command_user="singbox-hy2:singbox-hy2"
     fi
 }
 EOF
   chmod +x "$OPENRC_SERVICE_PATH"
-  rc-update add sing-box-tuic default >/dev/null 2>&1 || true
+  rc-update add sing-box-hy2 default >/dev/null 2>&1 || true
 }
 
 download_core() {
@@ -482,19 +493,20 @@ download_core() {
   fi
   
   tar -xzf sing-box.tar.gz -C "$TMP_DIR"
-  local extracted=$(find "$TMP_DIR" -type f -name sing-box | head -n 1)
+  local extracted
+  extracted=$(find "$TMP_DIR" -type f -name sing-box | head -n 1)
   [[ -n "$extracted" ]] || { error "解压目标核心错误"; return 1; }
   
-  rc-service sing-box-tuic stop >/dev/null 2>&1 || true
+  rc-service sing-box-hy2 stop >/dev/null 2>&1 || true
   install -m 755 "$extracted" "$BINARY_PATH"
-  info "sing-box-tuic 核心释放完毕。"
+  info "sing-box-hy2 核心释放完毕。"
   return 0
 }
 
-install_tuic() {
-  echo -e "${GREEN}[信息] 开始在 Alpine 下部署专属隔离的 sing-box TUIC V5 ...${RESET}"
+install_hy2() {
+  echo -e "${GREEN}[信息] 开始在 Alpine 下部署专属隔离的 sing-box Hysteria 2 ...${RESET}"
   check_environment
-  mkdir -p "$CONFIG_DIR" "$TUIC_DIR"
+  mkdir -p "$CONFIG_DIR" "$HY2_DIR"
 
   if ! download_core; then return 1; fi
 
@@ -503,70 +515,67 @@ install_tuic() {
   inst_cert || return 1
   inst_port
   
-  read -rp "设置 Tuic 验证 UUID (回车自动分配随机 UUID): " auth_uuid
-  auth_uuid=${auth_uuid:-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "12345678-1234-1234-1234-123456781234")}
-  
-  read -rp "设置 Tuic 验证密码 (回车自动分配随机密码): " auth_pwd
+  read -rp "设置 Hysteria 2 验证密码 (回车自动分配随机高强密码): " auth_pwd
   auth_pwd=${auth_pwd:-$(generate_random_password)}
 
   write_and_show_config
 }
 
-update_tuic() {
+update_hy2() {
   if [[ ! -f "$BINARY_PATH" ]]; then
     error "当前系统未检测到核心，无法执行覆盖升级。"
     return 1
   fi
   info "检测到已有环境，正在执行纯净原地覆盖核心升级..."
   if download_core; then
-    rc-service sing-box-tuic start
-    info "sing-box-tuic 核心纯净升级覆盖成功，服务已安全启动！"
+    rc-service sing-box-hy2 start
+    info "sing-box-hy2 核心纯净升级覆盖成功，服务已安全启动！"
   else
     error "核心升级遭遇未预期中断。"
   fi
 }
 
-unsttuic() {
-  warn "即将卸载..."
+unsthy2() {
+  warn "即将执行全面清洁卸载..."
+  
+  # 优先清理防火墙链，避免文件先删掉导致清理不到
   clear_old_iptables
+  if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
+  if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
 
-  rc-service sing-box-tuic stop || true
-  rc-update del sing-box-tuic default >/dev/null 2>&1 || true
+  rc-service sing-box-hy2 stop || true
+  rc-update del sing-box-hy2 default >/dev/null 2>&1 || true
   
   rm -f "$BINARY_PATH" "$OPENRC_SERVICE_PATH" "$LOG_FILE"
-  rm -rf "$CONFIG_DIR" "$TUIC_DIR"
+  rm -rf "$CONFIG_DIR" "$HY2_DIR"
   
-  info "彻底卸载清理完毕！"
+  info "Hysteria 2 专属服务、节点配置及防火墙跳跃链条已彻底清除！"
 }
 
 changeconf() {
-  if [[ ! -f "$TUIC_CONFIG" ]]; then
+  if [[ ! -f "$HY2_CONFIG" ]]; then
     error "配置文件不存在，请先选择选项 1 安装"
     return 1
   fi
 
-  local old_uuid=$(jq -r '.inbounds[0].users[0].uuid // empty' "$TUIC_CONFIG")
-  local old_pwd=$(jq -r '.inbounds[0].users[0].password // empty' "$TUIC_CONFIG")
-  local old_cert=$(jq -r '.inbounds[0].tls.certificate_path // empty' "$TUIC_CONFIG")
-  local old_key=$(jq -r '.inbounds[0].tls.key_path // empty' "$TUIC_CONFIG")
-  local old_sni=$(jq -r '.inbounds[0].tls.server_name // "www.bing.com"' "$TUIC_CONFIG")
+  local old_pwd old_cert old_key old_sni
+  old_pwd=$(jq -r '.inbounds[0].users[0].password // empty' "$HY2_CONFIG")
+  old_cert=$(jq -r '.inbounds[0].tls.certificate_path // empty' "$HY2_CONFIG")
+  old_key=$(jq -r '.inbounds[0].tls.key_path // empty' "$HY2_CONFIG")
+  old_sni=$(jq -r '.inbounds[0].tls.server_name // "www.bing.com"' "$HY2_CONFIG")
 
   clear
-  echo -e "${GREEN}====== 修改 sing-box Tuic 配置 ======${RESET}"
+  echo -e "${GREEN}====== 修改 sing-box Hysteria 2 配置 ======${RESET}"
   echo "提示：直接敲回车将保持原有配置不变"
   echo "---------------------------------------------"
   
   inst_port 
 
-  local auth_uuid
-  read -rp "设置 Tuic 验证 UUID [当前: ${old_uuid}, 回车不修改]: " auth_uuid
-  auth_uuid=${auth_uuid:-$old_uuid}
-
   local auth_pwd
-  read -rp "设置 Tuic 验证密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
+  read -rp "设置 Hysteria 2 验证密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
   auth_pwd=${auth_pwd:-$old_pwd}
 
-  local cert_path key_path tuic_domain
+  local cert_path key_path hy2_domain
   echo "---------------------------------------------"
   read -rp "是否需要修改证书？[y/N] (直接回车默认不修改): " change_cert_flag
   if [[ "$change_cert_flag" == "y" || "$change_cert_flag" == "Y" ]]; then
@@ -574,7 +583,7 @@ changeconf() {
   else
     cert_path="$old_cert"
     key_path="$old_key"
-    tuic_domain="$old_sni"
+    hy2_domain="$old_sni"
   fi
 
   write_and_show_config
@@ -582,12 +591,12 @@ changeconf() {
 }
 
 showconf() {
-  if [[ ! -d "$TUIC_DIR" ]]; then
+  if [[ ! -d "$HY2_DIR" ]]; then
     error "未找到分享配置文件。"
     return
   fi
-  echo -e "${GREEN}====== 节点分享与配置信息 ======${RESET}"
-  cat "$TUIC_DIR/url.txt"
+  echo -e "${GREEN}====== Hysteria 2 节点分享与配置信息 ======${RESET}"
+  cat "$HY2_DIR/url.txt"
   echo
 }
 
@@ -597,7 +606,8 @@ showconf() {
 menu() {
   while true; do
     clear
-    local raw_status=$(get_tuic_status)
+    local raw_status
+    raw_status=$(get_hy2_status)
     local status=""
     if [[ "$raw_status" == "RUNNING" ]]; then
       status="${GREEN}● 运行中${RESET}"
@@ -605,23 +615,25 @@ menu() {
       status="${RED}● 未运行${RESET}"
     fi
 
-    local version=$(get_installed_version)
-    local port_show=$(get_current_port_display)
+    local version
+    version=$(get_installed_version)
+    local port_show
+    port_show=$(get_current_port_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}  Sing-box(Tuicv5) 隔离管理面板   ${RESET}"
+    echo -e "${GREEN}    Sing-box (Hysteria2) 面板    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} ${status}"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Sing-box Tuicv5${RESET}"
-    echo -e "${GREEN}2. 更新 Sing-box Tuicv5${RESET}"
-    echo -e "${GREEN}3. 卸载 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}1. 安装 Sing-box Hysteria 2${RESET}"
+    echo -e "${GREEN}2. 更新 Sing-box Hysteria 2${RESET}"
+    echo -e "${GREEN}3. 卸载 Sing-box Hysteria 2${RESET}"
     echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 Sing-box Tuicv5${RESET}"
-    echo -e "${GREEN}6. 停止 Sing-box Tuicv5${RESET}"
-    echo -e "${GREEN}7. 重启 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}5. 启动 Sing-box Hysteria 2${RESET}"
+    echo -e "${GREEN}6. 停止 Sing-box Hysteria 2${RESET}"
+    echo -e "${GREEN}7. 重启 Sing-box Hysteria 2${RESET}"
     echo -e "${GREEN}8. 查看日志${RESET}"
     echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
@@ -632,13 +644,13 @@ menu() {
     [[ -z "$choice" ]] && continue
 
     case "$choice" in
-      1) install_tuic; pause ;;
-      2) update_tuic; pause ;;
-      3) rm -f "${CONFIG_DIR}/hopping.txt" "${CONFIG_DIR}/main_port.txt" 2>/dev/null; unsttuic; pause ;;
+      1) install_hy2; pause ;;
+      2) update_hy2; pause ;;
+      3) unsthy2; pause ;;
       4) changeconf; pause ;;
-      5) rc-service sing-box-tuic start && info "服务已成功启动！"; pause ;;
-      6) rc-service sing-box-tuic stop && info "服务已成功停止！"; pause ;;
-      7) rc-service sing-box-tuic restart && info "服务已成功重启！"; pause ;;
+      5) rc-service sing-box-hy2 start && info "服务已成功启动！"; pause ;;
+      6) rc-service sing-box-hy2 stop && info "服务已成功停止！"; pause ;;
+      7) rc-service sing-box-hy2 restart && info "服务已成功重启！"; pause ;;
       8) if [[ -f "$LOG_FILE" ]]; then tail -n 50 "$LOG_FILE"; else warn "未发现运行日志文件。"; fi; pause ;;
       9) showconf; pause ;;
       0) exit 0 ;;

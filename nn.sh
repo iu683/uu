@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Sing-box (VMess + WS) Alpine 专属核心控制面板
+# Sing-box (AnyTLS + Reality) Alpine 专属核心控制面板
 # SPDX-License-Identifier: MIT
 #
 # =========================================================
@@ -12,8 +12,8 @@ export LANG=en_US.UTF-8
 # 基础目录与硬编码配置
 readonly SB_CONFIG="/etc/sing-box/config.json"
 readonly SB_BINARY="/usr/local/bin/sing-box"
-readonly SB_DIR="/root/vmessws"
-readonly STATE_FILE="/etc/vmessws-singbox.env"
+readonly SB_DIR="/root/AnyReality"
+readonly STATE_FILE="/etc/anyreality-singbox.env"
 EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
 INIT_SERVICE_DIR="/etc/init.d"
 CONFIG_DIR="/etc/sing-box"
@@ -57,39 +57,35 @@ pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
 # OpenRC 服务状态与操作封装
 rc_service() {
   if ! has_command rc-service; then
-    warn "当前系统未找到 rc-service，忽略守护进程操作: rc-service $*"
-    return 0
+    return 1
   fi
   command rc-service "$@"
 }
 
 rc_update() {
   if ! has_command rc-update; then
-    return 0
+    return 1
   fi
   command rc-update "$@"
 }
 
 install_content() {
-  local _install_flags="$1"
+  local _perms="$1"
   local _content="$2"
   local _destination="$3"
   local _overwrite="$4"
-  local _tmpfile="$(mktemp)"
 
   echo -ne "安装 $_destination ... "
-  echo "$_content" > "$_tmpfile"
   if [[ -z "$_overwrite" && -e "$_destination" ]]; then
     echo -e "已存在"
   else
-    mkdir -p "$(dirname "$_destination")"
-    if install "$_install_flags" "$_tmpfile" "$_destination"; then
+    # 深度兼容级联创建，防止精简版环境报错
+    if mkdir -p "$(dirname "$_destination")" && echo "$_content" > "$_destination" && chmod "$_perms" "$_destination"; then
       echo -e "完成"
     else
       echo -e "失败"
     fi
   fi
-  rm -f "$_tmpfile"
 }
 
 remove_file() {
@@ -112,7 +108,6 @@ install_software() {
 }
 
 check_environment() {
-  # 强制判断 Alpine 环境
   if [[ ! -f /etc/alpine-release ]]; then
     warn "检测到当前系统可能不是 Alpine Linux，但脚本将继续尝试运行..."
   fi
@@ -123,13 +118,14 @@ check_environment() {
     *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
   esac
 
-  # Alpine 极简系统必要依赖检查与补全
+  # 确保 Alpine 环境具备基本依赖
   has_command bash || install_software bash
   has_command curl || install_software curl
   has_command grep || install_software grep
   has_command jq || install_software jq
   has_command tar || install_software tar
   has_command python3 || install_software python3
+  has_command openssl || install_software openssl
 }
 
 get_installed_version() {
@@ -164,16 +160,16 @@ get_latest_version() {
 }
 
 download_singbox() {
-  local version="$1"
-  local dest_file="$2"
-  local ver_num="${version#v}"
-  local filename="sing-box-${ver_num}-${OPERATING_SYSTEM}-${ARCHITECTURE}.tar.gz"
-  local download_url="${REPO_URL}/releases/download/${version}/${filename}"
-
-  info "正在下载 Sing-box ${version} (${ARCHITECTURE}) ..."
-  if ! curl -sS "$download_url" -o "$dest_file"; then
-    error "下载失败，请检查网络连接或 GitHub 连通性。"
-    return 1
+  local _version="$1"
+  local _destination="$2"
+  local _ver_num="${_version#v}"
+  
+  local _download_url="$REPO_URL/releases/download/$_version/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE.tar.gz"
+  
+  info "正在自 GitHub 下载官方 Sing-box 核心组件: $_download_url ..."
+  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
+    error "从 GitHub 下载核心失败！请检查您的网络连接。"
+    return 11
   fi
   return 0
 }
@@ -184,15 +180,15 @@ get_public_ip() {
     ip=$(curl -4s --max-time 5 "$url" 2>/dev/null || true)
     [[ -n "$ip" ]] && { echo "$ip"; return; }
   done
-  hostname -i | awk '{print $1}'
+  hostname -i | awk '{print $1}' 2>/dev/null || echo "127.0.0.1"
 }
 
-# Alpine OpenRC 专属 Init 服务脚本模版
+# Alpine OpenRC 专属服务脚本底座
 tpl_singbox_server_openrc_base() {
   cat << 'EOF'
 #!/sbin/openrc-run
 
-description="Sing-box Service"
+description="Sing-box AnyTLS Reality Service"
 supervisor="supervise-daemon"
 command="/usr/local/bin/sing-box"
 command_args="run -c /etc/sing-box/config.json"
@@ -234,36 +230,58 @@ get_current_port_display() {
   else echo "-"; fi
 }
 
+generate_or_use_key() {
+  if [[ -n "${PRIVATE_KEY:-}" && -n "${PUBLIC_KEY:-}" ]]; then
+    return
+  fi
+  local key_out
+  key_out=$("$EXECUTABLE_INSTALL_PATH" generate reality-keypair 2>/dev/null || echo "")
+  PRIVATE_KEY=$(awk '/PrivateKey/ {print $2}' <<< "$key_out")
+  PUBLIC_KEY=$(awk '/PublicKey/ {print $2}' <<< "$key_out")
+}
+
 # =========================================================
 # 4. 面板核心交互与配置文件处理
 # =========================================================
 write_and_show_config() {
   mkdir -p "$CONFIG_DIR"
 
-  local headers_json="{}"
-  if [[ -n "${WSHOST}" ]]; then
-    headers_json="{\"Host\": \"${WSHOST}\"}"
-  fi
-
   cat << EOF > "$SB_CONFIG"
 {
   "inbounds": [
     {
-      "type": "vmess",
-      "tag": "vmess-in",
+      "type": "anytls",
       "listen": "::",
       "listen_port": ${PORT},
       "users": [
         {
-          "uuid": "${UUID}"
+          "name": "${USERNAME}",
+          "password": "${PASSWORD}"
         }
       ],
-      "transport": {
-        "type": "ws",
-        "path": "${WSPATH}",
-        "headers": ${headers_json},
-        "max_early_data": 2048,
-        "early_data_header_name": "Sec-WebSocket-Protocol"
+      "padding_scheme": [
+        "stop=8",
+        "0=30-30",
+        "1=100-400",
+        "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
+        "3=9-9,500-1000",
+        "4=500-1000",
+        "5=500-1000",
+        "6=500-1000",
+        "7=500-1000"
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${SERVER_NAME}",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "${SERVER_NAME}",
+            "server_port": 443
+          },
+          "private_key": "${PRIVATE_KEY}",
+          "short_id": "${SHORT_ID}"
+        }
       }
     }
   ],
@@ -279,32 +297,33 @@ EOF
   SERVER_IP=$(get_public_ip)
   cat << EOF > "$STATE_FILE"
 PORT='${PORT}'
-UUID='${UUID}'
-WSPATH='${WSPATH}'
-WSHOST='${WSHOST}'
+USERNAME='${USERNAME}'
+PASSWORD='${PASSWORD}'
+SERVER_NAME='${SERVER_NAME}'
+SHORT_ID='${SHORT_ID}'
 REMARK='${REMARK}'
+PRIVATE_KEY='${PRIVATE_KEY}'
+PUBLIC_KEY='${PUBLIC_KEY}'
 SERVER_IP='${SERVER_IP}'
 EOF
   chmod 600 "$STATE_FILE"
 
-  if has_command rc-service; then
+  # 托管环境行为控制
+  if has_command rc-service && [ -d "$INIT_SERVICE_DIR" ]; then
     rc_update add sing-box default >/dev/null 2>&1 || true
     rc_service sing-box restart >/dev/null 2>&1 || true
     if rc_service sing-box status >/dev/null 2>&1; then
-      info "Sing-box (VMess+WS) 服务通过 OpenRC 启动成功！"
+      info "Sing-box (AnyTLS) 服务通过 OpenRC 启动成功！"
     else
-      error "Sing-box 服务启动失败，请检查 /var/log/messages 查看错误日志。"
+      error "Sing-box 服务启动失败，请检查 /var/log/messages 日志。"
     fi
   else
+    # 极简无 OpenRC 容器降级策略
     pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
     "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
-    info "非 OpenRC 环境，程序已挂载至后台旧版 Pid 进程池中运行。"
+    info "未检测到 OpenRC 环境，程序已挂载至后台常驻进程模式。"
   fi
   
-  if command -v awall >/dev/null 2>&1; then
-    warn "检测到 Alpine 正在使用 awall 防火墙，请记得手动放行 ${PORT} 端口。"
-  fi
-
   showconf
 }
 
@@ -331,49 +350,60 @@ inst_singbox() {
     fi
 
     echo -ne "正在解压并安装二进制可执行文件 ... "
-    local _tmpdir_extract=$(command mktemp -d -t "sbtar.XXXXXXXXXX")
+    local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
     tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
     
     local _ver_num="${latest_version#v}"
     local _extracted_binary=$(find "$_tmpdir_extract" -type f -name "sing-box" | head -n 1)
-    
-    if [[ -n "$_extracted_binary" ]] && install -Dm755 "$_extracted_binary" "$EXECUTABLE_INSTALL_PATH"; then
-      echo "成功"
+
+    if [[ -n "$_extracted_binary" ]]; then
+      mkdir -p "$(dirname "$EXECUTABLE_INSTALL_PATH")"
+      if cp "$_extracted_binary" "$EXECUTABLE_INSTALL_PATH" && chmod 755 "$EXECUTABLE_INSTALL_PATH"; then
+        echo "成功"
+      else
+        rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "安装失败" && return 1
+      fi
     else
-      rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "安装失败" && return 1
+      rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "找不到解压核心" && return 1
     fi
     rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
   else
     info "系统已存在 sing-box 核心组件，跳过基础安装。"
   fi
 
-  if has_command rc-service && [[ ! -f "$INIT_SERVICE_DIR/sing-box" ]]; then
-    install_content "0755" "$(tpl_singbox_server_openrc_base)" "$INIT_SERVICE_DIR/sing-box" "1"
-  fi
+  # 写入服务脚本（采用完全兼容 BusyBox 的 install_content 原生重构版）
+  install_content "0755" "$(tpl_singbox_server_openrc_base)" "$INIT_SERVICE_DIR/sing-box" "1"
 
-  # 兼容 Alpine (Busybox) 无 shuf 的随机数生成方案
-  local hostname_str=$(hostname 2>/dev/null || echo "alpine")
+  # 兼容 Alpine 无 shuf 的随机数处理机制
   local rand_port=$(awk 'BEGIN{srand();print int(rand()*(65535-10000+1))+10000}')
-  local rand_uuid=$(python3 -c "import uuid; print(uuid.uuid4())")
-  local rand_path="/$(python3 -c "import secrets; print(secrets.token_hex(4))")"
-  local default_remark="${hostname_str}-vmessws"
+  local rand_user=$(python3 -c "import secrets, string; print('user-' + ''.join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(6)))")
+  local rand_pass=$(python3 -c "import secrets, string; print(''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12)))")
+  local rand_sid=$(python3 -c "import secrets; print(secrets.token_hex(8))")
+  local hostname_str=$(hostname 2>/dev/null || echo "alpine")
+  local default_remark="${hostname_str}-AnyReality"
 
   echo "---------------------------------------------"
   read -rp "👉 请输入监听端口 (默认随机: ${rand_port}): " INPUT_PORT
   PORT=${INPUT_PORT:-$rand_port}
 
-  read -rp "👉 请输入 VMess UUID (默认随机: ${rand_uuid}): " INPUT_UUID
-  UUID=${INPUT_UUID:-$rand_uuid}
+  read -rp "👉 请输入用户名 (默认随机: ${rand_user}): " INPUT_USERNAME
+  USERNAME=${INPUT_USERNAME:-$rand_user}
 
-  read -rp "👉 请输入 WebSocket 路径 (默认随机: ${rand_path}): " INPUT_WSPATH
-  WSPATH=${INPUT_WSPATH:-$rand_path}
+  read -rp "👉 请输入密码 (默认随机: ${rand_pass}): " INPUT_PASSWORD
+  PASSWORD=${INPUT_PASSWORD:-$rand_pass}
 
-  read -rp "👉 请输入 WebSocket Host 伪装域名 (默认留空): " INPUT_WSHOST
-  WSHOST=${INPUT_WSHOST:-""}
+  read -rp "👉 请输入伪装域名/SNI (默认: www.amazon.com): " INPUT_SERVER_NAME
+  SERVER_NAME=${INPUT_SERVER_NAME:-www.amazon.com}
+
+  read -rp "👉 请输入 Reality short_id (默认随机: ${rand_sid}): " INPUT_SHORT_ID
+  SHORT_ID=${INPUT_SHORT_ID:-$rand_sid}
 
   read -rp "👉 请输入节点备注名称 (默认: ${default_remark}): " INPUT_REMARK
   REMARK=${INPUT_REMARK:-$default_remark}
 
+  PRIVATE_KEY=""
+  PUBLIC_KEY=""
+  generate_or_use_key
   write_and_show_config
 }
 
@@ -383,19 +413,23 @@ modify_config() {
     return 1
   fi
 
-  info "正在读取现有 VMess 节点配置..."
+  info "正在读取现有节点配置..."
   local current_port=$(jq -r '.inbounds[0].listen_port // empty' "$SB_CONFIG" 2>/dev/null)
-  local current_uuid=$(jq -r '.inbounds[0].users[0].uuid // empty' "$SB_CONFIG" 2>/dev/null)
-  local current_path=$(jq -r '.inbounds[0].transport.path // empty' "$SB_CONFIG" 2>/dev/null)
-  local current_host=$(jq -r '.inbounds[0].transport.headers.Host // empty' "$SB_CONFIG" 2>/dev/null)
+  local current_user=$(jq -r '.inbounds[0].users[0].name // empty' "$SB_CONFIG" 2>/dev/null)
+  local current_pass=$(jq -r '.inbounds[0].users[0].password // empty' "$SB_CONFIG" 2>/dev/null)
+  local current_sni=$(jq -r '.inbounds[0].tls.server_name // empty' "$SB_CONFIG" 2>/dev/null)
+  local current_sid=$(jq -r '.inbounds[0].tls.reality.short_id // empty' "$SB_CONFIG" 2>/dev/null)
   
+  local current_private_key=$(jq -r '.inbounds[0].tls.reality.private_key // empty' "$SB_CONFIG" 2>/dev/null)
   local current_remark=""
+  local current_public_key=""
   if [[ -f "$STATE_FILE" ]]; then
     current_remark=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 || true)
+    current_public_key=$(grep -E "^PUBLIC_KEY=" "$STATE_FILE" | cut -d"'" -f2 || true)
   fi
 
   local hostname_str=$(hostname 2>/dev/null || echo "alpine")
-  local fallback_remark="${hostname_str}-vmessws"
+  local fallback_remark="${hostname_str}-AnyReality"
 
   echo "---------------------------------------------"
   echo -e "${YELLOW}提示：直接敲回车(Enter)将保持括号内的当前值不变${RESET}"
@@ -404,21 +438,25 @@ modify_config() {
   read -rp "👉 修改监听端口 (当前: ${current_port}): " INPUT_PORT
   PORT=${INPUT_PORT:-$current_port}
 
-  read -rp "👉 修改 VMess UUID (当前: ${current_uuid}): " INPUT_UUID
-  UUID=${INPUT_UUID:-$current_uuid}
+  read -rp "👉 修改用户名 (当前: ${current_user}): " INPUT_USERNAME
+  USERNAME=${INPUT_USERNAME:-$current_user}
 
-  read -rp "👉 修改 WebSocket 路径 (当前: ${current_path}): " INPUT_WSPATH
-  WSPATH=${INPUT_WSPATH:-$current_path}
+  read -rp "👉 修改密码 (当前: ${current_pass}): " INPUT_PASSWORD
+  PASSWORD=${INPUT_PASSWORD:-$current_pass}
 
-  read -rp "👉 修改 WebSocket Host 伪装域名 (当前: ${current_host:-未配置/留空}): " INPUT_WSHOST
-  if [[ -z "$INPUT_WSHOST" ]]; then
-    WSHOST="$current_host"
-  else
-    WSHOST="$INPUT_WSHOST"
-  fi
+  read -rp "👉 修改伪装域名/SNI (当前: ${current_sni}): " INPUT_SERVER_NAME
+  SERVER_NAME=${INPUT_SERVER_NAME:-$current_sni}
+
+  read -rp "👉 修改 Reality short_id (当前: ${current_sid}): " INPUT_SHORT_ID
+  SHORT_ID=${INPUT_SHORT_ID:-$current_sid}
 
   read -rp "👉 修改节点备注名称 (当前: ${current_remark:-$fallback_remark}): " INPUT_REMARK
   REMARK=${INPUT_REMARK:-${current_remark:-$fallback_remark}}
+
+  PRIVATE_KEY="$current_private_key"
+  PUBLIC_KEY="$current_public_key"
+
+  generate_or_use_key
   write_and_show_config
 }
 
@@ -448,24 +486,28 @@ update_singbox() {
   fi
 
   echo -ne "正在覆盖二进制核心文件 ... "
-  local _tmpdir_extract=$(command mktemp -d -t "sbtar.XXXXXXXXXX")
+  local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
   tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
   
   local _extracted_binary=$(find "$_tmpdir_extract" -type f -name "sing-box" | head -n 1)
-  if [[ -n "$_extracted_binary" ]] && install -Dm755 "$_extracted_binary" "$EXECUTABLE_INSTALL_PATH"; then
-    echo "成功"
+  if [[ -n "$_extracted_binary" ]]; then
+    if cp "$_extracted_binary" "$EXECUTABLE_INSTALL_PATH" && chmod 755 "$EXECUTABLE_INSTALL_PATH"; then
+      echo "成功"
+    else
+      rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "覆盖核心失败" && return 1
+    fi
   else
-    rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "覆盖核心失败" && return 1
+    rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "解压错误" && return 1
   fi
   rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
 
   info "正在重启 Sing-box 服务以应用更新..."
-  if has_command rc-service; then
+  if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
     rc_service sing-box restart >/dev/null 2>&1 || true
     if rc_service sing-box status >/dev/null 2>&1; then
       info "Sing-box 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
     else
-      error "核心更新成功，但 OpenRC 重启服务失败，请检查系统日志。"
+      error "核心更新成功，但 OpenRC 重启服务失败。"
     fi
   else
     pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
@@ -475,7 +517,7 @@ update_singbox() {
 }
 
 uninstall_singbox() {
-  if has_command rc-service; then
+  if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
     rc_service sing-box stop >/dev/null 2>&1 || true
     rc_update del sing-box default >/dev/null 2>&1 || true
     remove_file "$INIT_SERVICE_DIR/sing-box"
@@ -487,7 +529,7 @@ uninstall_singbox() {
   rm -f "$SB_CONFIG" "$STATE_FILE"
   rm -rf "$CONFIG_DIR" "$SB_DIR"
 
-  info "已卸载 Sing-box、配置文件与 OpenRC 状态管理底座。"
+  info "已卸载 Sing-box、配置文件与状态文件。"
 }
 
 showconf() {
@@ -497,50 +539,97 @@ showconf() {
   fi
   source "$STATE_FILE"
 
-  local vmess_json_str
-  vmess_json_str=$(cat << EOF
-{
-  "v": "2",
-  "ps": "${REMARK}",
-  "add": "${SERVER_IP}",
-  "port": ${PORT},
-  "id": "${UUID}",
-  "aid": 0,
-  "scy": "auto",
-  "net": "ws",
-  "type": "none",
-  "host": "${WSHOST}",
-  "path": "${WSPATH}",
-  "tls": "none",
-  "sni": "",
-  "alpn": ""
-}
-EOF
-)
-  # 兼容 Alpine Busybox 版本的 base64 命令参数
-  local v2rayn_link=""
-  if base64 --help 2>&1 | grep -q "\-d"; then
-    v2rayn_link="vmess://$(echo -n "$vmess_json_str" | base64 | tr -d '\n\r')"
-  else
-    v2rayn_link="vmess://$(echo -n "$vmess_json_str" | base64 -w 0 2>/dev/null || echo -n "$vmess_json_str" | base64 | tr -d '\n\r')"
-  fi
+  local encoded_remark=$(jq -rn --arg x "$REMARK" '$x|@uri')
+  local v2rayn_link="anytls://${PASSWORD}@${SERVER_IP}:${PORT}?security=reality&sni=${SERVER_NAME}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${encoded_remark}"
 
-  echo -e "${GREEN}====== VMess + WebSocket 节点配置信息 ======${RESET}"
-  echo -e "${GREEN}服务器公网 IP   :${RESET} ${SERVER_IP}"
-  echo -e "${GREEN}服务监听端口    :${RESET} ${PORT}"
-  echo -e "${GREEN}VMess 用户UUID :${RESET} ${UUID}"
-  echo -e "${GREEN}传输协议类型    :${RESET} ws (WebSocket)"
-  echo -e "${GREEN}WebSocket 路径 :${RESET} ${WSPATH}"
-  echo -e "${GREEN}WebSocket Host :${RESET} ${WSHOST:-未配置(留空)}"
+  echo -e "${GREEN}====== AnyTLS+Reality 节点配置信息 ======${RESET}"
+  echo -e "${GREEN}服务器公网 IP :${RESET} ${SERVER_IP}"
+  echo -e "${GREEN}服务监听端口   :${RESET} ${PORT}"
+  echo -e "${GREEN}认证用户名     :${RESET} ${USERNAME}"
+  echo -e "${GREEN}认证通信密码   :${RESET} ${PASSWORD}"
+  echo -e "${GREEN}伪装域名 (SNI) :${RESET} ${SERVER_NAME}"
+  echo -e "${GREEN}Reality 公钥   :${RESET} ${PUBLIC_KEY}"
+  echo -e "${GREEN}Reality 目标ID :${RESET} ${SHORT_ID}"
+  echo -e "${GREEN}客户端指纹模式 :${RESET} chrome"
   echo -e "${GREEN}节点自定义备注 :${RESET} ${REMARK}"
   echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
   echo "---------------------------------------------"
-  echo -e "${GREEN}👉 v2rayN   分享链接:${RESET}"
+  echo -e "${GREEN}👉 v2rayN 分享链接:${RESET}"
   echo -e "${YELLOW}${v2rayn_link}${RESET}"
-  echo
-  echo -e "${GREEN}👉 Surge   分享链接:${RESET}"
-  echo -e "${YELLOW}Vmess+WS = vmess, $SERVER_IP, $PORT, username=$UUID, ws=true, ws-path=$WSPATH, vmess-aead=true${RESET}"
   echo "---------------------------------------------"
+}
+
+# ================== SNI 优选 ==================
+select_best_sni() {
+    info "开始优选 SNI 延迟测试"
+
+    local SNIS=(
+    amd.com
+    apps.mzstatic.com
+    aws.com
+    azure.microsoft.com
+    beacon.gtv-pub.com
+    bing.com
+    catalog.gamepass.com
+    cdn.bizibly.com
+    cdn-dynmedia-1.microsoft.com
+    devblogs.microsoft.com
+    fpinit.itunes.apple.com
+    go.microsoft.com
+    gray-config-prod.api.arc-cdn.net
+    gray.video-player.arcpublishing.com
+    images.nvidia.com
+    r.bing.com
+    services.digitaleast.mobi
+    snap.licdn.com
+    statici.icloud.com
+    tag.demandbase.com
+    tag-logger.demandbase.com
+    ts1.tc.mm.bing.net
+    ts2.tc.mm.bing.net
+    vs.aws.amazon.com
+    www.apple.com
+    www.icloud.com
+    www.microsoft.com
+    www.oracle.com
+    www.xbox.com
+    www.xilinx.com
+    xp.apple.com
+    )
+
+    BEST_SNI=""
+    BEST_TIME=999999
+
+    for sni in "${SNIS[@]}"; do
+        start=$(date +%s%N)
+
+        # 增加对 Alpine 环境下 openssl 超时和断连的处理规范
+        timeout 3 openssl s_client \
+            -connect ${sni}:443 \
+            -servername ${sni} \
+            -brief </dev/null >/dev/null 2>&1
+
+        if [ $? -eq 0 ]; then
+            end=$(date +%s%N)
+            cost=$(( (end - start) / 1000000 ))
+
+            echo "[SNI] $sni -> ${cost}ms"
+
+            if [ $cost -lt $BEST_TIME ]; then
+                BEST_TIME=$cost
+                BEST_SNI=$sni
+            fi
+        fi
+    done
+
+    if [ -n "$BEST_SNI" ]; then
+        info "最优 SNI: $BEST_SNI (${BEST_TIME}ms)"
+        echo "$BEST_SNI"
+        return 0
+    else
+        warn "未找到可用 SNI"
+        return 1
+    fi
 }
 
 # =========================================================
@@ -557,22 +646,23 @@ menu() {
     local port_show=$(get_current_port_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   Sing-box VMess + WS Alpine面板   ${RESET}"
+    echo -e "${GREEN} Sing-box AnyTLS + Reality 面板  ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 VMess + WS${RESET}"
-    echo -e "${GREEN}2. 更新 VMess + WS${RESET}"
-    echo -e "${GREEN}3. 卸载 VMess + WS${RESET}"
-    echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 VMess + WS${RESET}"
-    echo -e "${GREEN}6. 停止 VMess + WS${RESET}"
-    echo -e "${GREEN}7. 重启 VMess + WS${RESET}"
-    echo -e "${GREEN}8. 查看日志${RESET}"
-    echo -e "${GREEN}9. 查看节点配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN} 1. 安装 AnyReality${RESET}"
+    echo -e "${GREEN} 2. 更新 AnyReality${RESET}"
+    echo -e "${GREEN} 3. 卸载 AnyReality${RESET}"
+    echo -e "${GREEN} 4. 修改配置${RESET}"
+    echo -e "${GREEN} 5. 启动 AnyReality${RESET}"
+    echo -e "${GREEN} 6. 停止 AnyReality${RESET}"
+    echo -e "${GREEN} 7. 重启 AnyReality${RESET}"
+    echo -e "${GREEN} 8. 查看日志${RESET}"
+    echo -e "${GREEN} 9. 查看节点配置${RESET}"
+    echo -e "${GREEN}10. SNI域名优选✨${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
 
     local choice=""
@@ -585,7 +675,7 @@ menu() {
       3) uninstall_singbox; pause ;;
       4) modify_config; pause ;;
       5) 
-        if has_command rc-service; then
+        if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
           rc_service sing-box start && info "服务已成功启动！"
         else
           pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
@@ -594,14 +684,14 @@ menu() {
         fi
         pause ;;
       6) 
-        if has_command rc-service; then
+        if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
           rc_service sing-box stop && info "服务已成功停止！"
         else
           pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台进程已终止！"
         fi
         pause ;;
       7) 
-        if has_command rc-service; then
+        if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
           rc_service sing-box restart && info "服务已成功重启！"
         else
           pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
@@ -613,10 +703,11 @@ menu() {
         if [[ -f /var/log/messages ]]; then
           tail -n 50 /var/log/messages | grep sing-box || tail -n 50 /var/log/messages
         else
-          warn "未找到通用系统日志文件，可尝试通过命令手工查看后台进程。"
+          warn "未找到系统日志文件，如在精简容器中运行，建议直接观察前端或进程状态。"
         fi
         pause ;;
       9) showconf; pause ;;
+      10) select_best_sni; pause ;;
       0) exit 0 ;;
       *) error "无效输入，请重新选择。"; sleep 1 ;;
     esac

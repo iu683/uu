@@ -1,15 +1,29 @@
 #!/usr/bin/env bash
 #
-# Xray (VLESS-Encryption) 控制面板
+# Sing-box (AnyTLS + Reality) 控制面板 (重构优化版)
 # SPDX-License-Identifier: MIT
 #
-# =========================================================
-# 1. 核心控制与全局环境初始化
-# =========================================================
-set -Eeuo pipefail
+set -Eop pipefail
 export LANG=en_US.UTF-8
 
-# ================== 颜色 ==================
+# 基础目录与硬编码配置
+readonly SB_CONFIG="/etc/mo-anyreality-sb/config.json"
+readonly SB_BINARY="/usr/local/bin/sing-box"
+readonly SB_DIR="/root/proxynode/anyreality"
+readonly STATE_FILE="/etc/mo-anyreality-sb.env"
+EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
+SYSTEMD_SERVICES_DIR="/etc/systemd/system"
+CONFIG_DIR="/etc/mo-anyreality-sb"
+REPO_URL="https://github.com/SagerNet/sing-box"
+API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
+CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
+
+# 自动检测环境与动态变量池
+PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
+OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
+ARCHITECTURE="${ARCHITECTURE:-}"
+
+# 终端规范颜色代码
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
@@ -17,821 +31,683 @@ BLUE="\033[34m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-# ================== 基础变量 ==================
-readonly SERVICE_NAME="vlessenc"
-readonly XRAY_CONFIG="/usr/local/etc/${SERVICE_NAME}/config.json"
-readonly XRAY_BINARY="/usr/local/bin/${SERVICE_NAME}"
-readonly STATE_FILE="/usr/local/etc/${SERVICE_NAME}/xray_encryption_info.txt"
-readonly LINK_FILE="/root/proxynode/encryption/xray_vless_encryption_link.txt"
-
-# 降级备用版本（当自动获取最新版本失败时使用）
-readonly BACKUP_VERSION="26.3.27"
-
-TMP_DIR=$(mktemp -d -t xray_enc.XXXXXX)
-
-# ================== cleanup ==================
-cleanup() {
-    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+# =========================================================
+# 2. 官方原生底层工具函数
+# =========================================================
+has_command() {
+  local _command=$1
+  type -P "$_command" > /dev/null 2>&1
 }
 
-trap cleanup EXIT INT TERM
+curl() {
+  command curl "${CURL_FLAGS[@]}" "$@"
+}
 
-# ================== 日志与交互 ==================
+mktemp() {
+  command mktemp "$@" "sbservinst.XXXXXXXXXX"
+}
+
 info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
 warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
 error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
 pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
 
-# ================== 获取公网IP ==================
-get_public_ip() {
-    local ip
-
-    for cmd in "curl -4fsSL --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null || true)
-            if [[ -n "${ip:-}" ]]; then
-                echo "$ip"
-                return 0
-            fi
-        done
-    done
-
-    for cmd in "curl -6fsSL --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ipv6.ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null || true)
-            if [[ -n "${ip:-}" ]]; then
-                echo "$ip"
-                return 0
-            fi
-        done
-    done
-
-    return 1
+systemctl() {
+  if ! has_command systemctl; then
+    warn "当前系统不支持 systemd，忽略守护进程操作: systemctl $*"
+    return 0
+  fi
+  command systemctl "$@"
 }
 
-# ================== 检查端口占用 ==================
-check_port() {
-    local port="$1"
-    if ss -tuln | awk '{print $5}' | grep -qE "[:.]${port}$"; then
-        return 1  # 被占用
-    fi
-    return 0  # 没用占用
+install_content() {
+  local _install_flags="$1"
+  local _content="$2"
+  local _destination="$3"
+  local _overwrite="$4"
+  local _tmpfile="$(mktemp)"
+
+  echo -ne "安装 $_destination ... "
+  echo "$_content" > "$_tmpfile"
+  if [[ -z "$_overwrite" && -e "$_destination" ]]; then
+    echo -e "已存在"
+  elif install "$_install_flags" "$_tmpfile" "$_destination"; then
+    echo -e "完成"
+  fi
+  rm -f "$_tmpfile"
 }
 
-# ================== 验证端口格式 ==================
-is_valid_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]
+remove_file() {
+  local _target="$1"
+  echo -ne "移除 $_target ... "
+  if rm -f "$_target"; then
+    echo -e "完成"
+  fi
 }
 
-# ================== 获取可用随机端口 ==================
-get_random_port() {
-    local rand_port
-    while true; do
-        rand_port=$((RANDOM % 55536 + 10000))
-        if check_port "$rand_port"; then
-            echo "$rand_port"
-            return 0
-        fi
-    done
+detect_package_manager() {
+  [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
+  has_command apt && PACKAGE_MANAGEMENT_INSTALL='apt -y --no-install-recommends install' && return 0
+  has_command dnf && PACKAGE_MANAGEMENT_INSTALL='dnf -y install' && return 0
+  has_command yum && PACKAGE_MANAGEMENT_INSTALL='yum -y install' && return 0
+  has_command apk && PACKAGE_MANAGEMENT_INSTALL='apk add --no-cache' && return 0
+  return 1
 }
 
-# ================== UUID验证 ==================
-is_valid_uuid() {
-    [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]
+install_software() {
+  local _package_name="$1"
+  if ! detect_package_manager; then
+    error "未检测到支持的包管理器，请手动安装 $_package_name"
+    exit 65
+  fi
+  echo "正在安装缺失的依赖 '$_package_name' ... "
+  if $PACKAGE_MANAGEMENT_INSTALL "$_package_name" >/dev/null 2>&1; then
+    echo "依赖安装成功"
+  else
+    error "无法通过包管理器安装 '$_package_name'，请手动安装。"
+    exit 65
+  fi
 }
 
-# ================== 架构检测 ==================
-get_arch() {
-    local arch
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64) echo "64" ;;
-        aarch64|arm64) echo "arm64-v8a" ;;
-        armv7l) echo "arm32-v7a" ;;
-        *) error "暂不支持的系统架构: $arch"; return 1 ;;
-    esac
+check_environment() {
+  if [[ "x$(uname)" == "xLinux" ]]; then
+    OPERATING_SYSTEM=linux
+  else
+    error "本脚本仅支持 Linux 系统。"
+    exit 95
+  fi
+
+  case "$(uname -m)" in
+    'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
+    'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
+    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
+  esac
+
+  has_command curl || install_software curl
+  has_command grep || install_software grep
+  has_command jq || install_software jq
+  has_command tar || install_software tar
+  has_command python3 || install_software python3
 }
 
-# ================== 自动获取最新版本号 ==================
-get_latest_version() {
-    local latest_version
-    info "正在获取 GitHub 最新 Xray 版本号..."
-    
-    latest_version=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
-        | jq -r '.tag_name' 2>/dev/null || echo "")
-        
-    latest_version="${latest_version#v}"
-
-    if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
-        warn "通过 GitHub API 获取最新版本失败，将使用内置备用版本: v${BACKUP_VERSION}"
-        echo "$BACKUP_VERSION"
+get_installed_version() {
+  if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
+    local version_out
+    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null || echo "")
+    if [[ -n "$version_out" ]]; then
+      echo "$version_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' | head -n 1 || echo "未知格式"
     else
-        info "成功获取最新版本: v${latest_version}"
-        echo "$latest_version"
+      echo "未知版本"
     fi
+  else
+    echo "未安装"
+  fi
 }
 
-# ================== 从GitHub下载并解压Xray ==================
-download_and_extract_xray() {
-    local arch version
-    arch=$(get_arch) || return 1
-    version=$(get_latest_version)
-    
-    local download_url="https://github.com/XTLS/Xray-core/releases/download/v${version}/Xray-linux-${arch}.zip"
-    local zip_file="$TMP_DIR/xray.zip"
-    
-    info "正在从 GitHub 下载 Xray v${version} (${arch})..."
-    if ! curl -L -fsSL "$download_url" -o "$zip_file"; then
-        error "从 GitHub 下载 Xray 失败，请检查网络连接。"
-        return 1
-    fi
-    
-    info "正在解压..."
-    mkdir -p "$TMP_DIR/extracted"
-    if ! unzip -qo "$zip_file" -d "$TMP_DIR/extracted"; then
-        error "解压 Xray 压缩包失败，请确保系统已安装 unzip。"
-        return 1
-    fi
-    
-    mkdir -p "$(dirname "$XRAY_BINARY")"
-    rm -f "$XRAY_BINARY"
-    cp -f "$TMP_DIR/extracted/xray" "$XRAY_BINARY"
-    chmod +x "$XRAY_BINARY"
-    
-    mkdir -p "/usr/local/share/${SERVICE_NAME}"
-    cp -f "$TMP_DIR/extracted/geoip.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
-    cp -f "$TMP_DIR/extracted/geosite.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
+get_latest_version() {
+  local _tmpfile=$(mktemp)
+  if ! curl -sS -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases" -o "$_tmpfile"; then
+    rm -f "$_tmpfile"
+    return
+  fi
+  local _tag_name=$(jq -r '[.[] | select(.prerelease==false and .draft==false)][0].tag_name' "$_tmpfile" 2>/dev/null || echo "")
+  rm -f "$_tmpfile"
+  
+  if [[ -n "$_tag_name" ]]; then
+    echo "${_tag_name##*\/}"
+  else
+    echo "v1.12.3"
+  fi
 }
 
-# ================== 配置 Systemd 服务 ==================
-setup_systemd_service() {
-    info "配置 Systemd 服务 [${SERVICE_NAME}]..."
-    
-    cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+download_singbox() {
+  local _version="$1"
+  local _destination="$2"
+  local _ver_num="${_version#v}"
+  
+  local _download_url="$REPO_URL/releases/download/$_version/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE.tar.gz"
+  
+  info "正在自 GitHub 下载官方 Sing-box 核心组件: $_download_url ..."
+  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
+    error "从 GitHub 下载核心失败！请检查您的网络连接。"
+    return 11
+  fi
+  return 0
+}
+
+get_public_ip() {
+  local ip=''
+  for url in https://api.ipify.org https://ip.sb https://checkip.amazonaws.com; do
+    ip=$(curl -4s --max-time 5 "$url" 2>/dev/null || true)
+    [[ -n "$ip" ]] && { echo "$ip"; return; }
+  done
+  hostname -I | awk '{print $1}'
+}
+
+tpl_singbox_server_service_base() {
+  cat << EOF
 [Unit]
-Description=Xray VLESS Encryption Service
-Documentation=https://github.com/XTLS/Xray-core
-After=network.target nss-lookup.target
+Description=sing-box service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target network-online.target
 
 [Service]
-User=root
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ExecStart=${XRAY_BINARY} run -config ${XRAY_CONFIG}
+ExecStart=$EXECUTABLE_INSTALL_PATH run -c $SB_CONFIG
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
-RestartPreventExitStatus=23
-LimitNPROC=10000
-LimitNOFILE=1000000
+RestartSec=10s
+LimitNOFILE=infinity
 
 [Install]
 WantedBy=multi-user.target
 EOF
+}
 
+# =========================================================
+# 3. 面板辅助网络与状态扩展函数
+# =========================================================
+get_sb_status() {
+  if has_command systemctl && systemctl is-active --quiet mo-anyreality-sb 2>/dev/null; then
+    echo -e "${GREEN}● 运行中${RESET}"
+  else
+    if pgrep -f "$EXECUTABLE_INSTALL_PATH run" >/dev/null 2>&1; then
+      echo -e "${GREEN}● 运行中 (Pidmode)${RESET}"
+    else
+      echo -e "${RED}● 未运行${RESET}"
+    fi
+  fi
+}
+
+get_current_port_display() {
+  if [[ -f "$SB_CONFIG" ]]; then
+    local port
+    port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "")
+    echo "${port:- -}"
+  else echo "-"; fi
+}
+
+generate_or_use_key() {
+  if [[ -n "${PRIVATE_KEY:-}" && -n "${PUBLIC_KEY:-}" ]]; then
+    return
+  fi
+  local key_out
+  key_out=$("$EXECUTABLE_INSTALL_PATH" generate reality-keypair 2>/dev/null || echo "")
+  PRIVATE_KEY=$(awk '/PrivateKey/ {print $2}' <<< "$key_out")
+  PUBLIC_KEY=$(awk '/PublicKey/ {print $2}' <<< "$key_out")
+}
+
+# =========================================================
+# 4. 面板核心交互与配置文件处理
+# =========================================================
+write_and_show_config() {
+  mkdir -p "$CONFIG_DIR"
+
+  cat << EOF > "$SB_CONFIG"
+{
+  "inbounds": [
+    {
+      "type": "anytls",
+      "listen": "::",
+      "listen_port": ${PORT},
+      "users": [
+        {
+          "name": "${USERNAME}",
+          "password": "${PASSWORD}"
+        }
+      ],
+      "padding_scheme": [
+        "stop=8",
+        "0=30-30",
+        "1=100-400",
+        "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
+        "3=9-9,500-1000",
+        "4=500-1000",
+        "5=500-1000",
+        "6=500-1000",
+        "7=500-1000"
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${SERVER_NAME}",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "${SERVER_NAME}",
+            "server_port": 443
+          },
+          "private_key": "${PRIVATE_KEY}",
+          "short_id": "${SHORT_ID}"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
+
+  SERVER_IP=$(get_public_ip)
+  cat << EOF > "$STATE_FILE"
+PORT='${PORT}'
+USERNAME='${USERNAME}'
+PASSWORD='${PASSWORD}'
+SERVER_NAME='${SERVER_NAME}'
+SHORT_ID='${SHORT_ID}'
+REMARK='${REMARK}'
+PRIVATE_KEY='${PRIVATE_KEY}'
+PUBLIC_KEY='${PUBLIC_KEY}'
+SERVER_IP='${SERVER_IP}'
+EOF
+  chmod 600 "$STATE_FILE"
+
+  if has_command systemctl; then
     systemctl daemon-reload
-    systemctl enable "${SERVICE_NAME}" 2>/dev/null || true
-}
-
-# ================== 获取服务状态与基础参数 ==================
-get_xray_status() {
-    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
-        echo -e "${GREEN}● 运行中${RESET}"
+    systemctl enable mo-anyreality-sb >/dev/null 2>&1 || true
+    systemctl restart mo-anyreality-sb >/dev/null 2>&1 || true
+    if systemctl is-active --quiet mo-anyreality-sb 2>/dev/null; then
+      info "Sing-box (AnyTLS) 服务配置并启动成功！"
     else
-        echo -e "${RED}● 未运行${RESET}"
+      error "Sing-box 服务启动失败，请运行 'journalctl -u mo-anyreality-sb -f' 查看错误日志。"
     fi
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+    "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
+    info "非 systemd 环境，程序已挂载至后台 Pid 进程池中运行。"
+  fi
+  
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
+  fi
+
+  showconf
 }
 
-get_xray_version() {
-    if [[ -x "$XRAY_BINARY" ]]; then
-        "$XRAY_BINARY" version 2>/dev/null \
-            | grep -i "Xray" \
-            | head -n 1 \
-            | awk '{print $2}' || echo "未知"
-    else
-        echo "未安装"
-    fi
-}
+# =========================================================
+# 5. 主流程控制模块与更新功能
+# =========================================================
 
-get_listen_ip() {
-    if sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null | grep -q '= 1'; then
-        echo "0.0.0.0"
-    else
-        echo "::"
-    fi
-}
+inst_singbox() {
+  check_environment
+  
+  if [[ -f "$SB_CONFIG" ]]; then
+    warn "系统检测到已存在配置。如果是要修改配置，请在菜单中选择选项 4。"
+    read -rp "是否执意重新安装？(旧配置将被覆盖) [y/N]: " CONFIRM_REINST
+    [[ "$CONFIRM_REINST" != "y" && "$CONFIRM_REINST" != "Y" ]] && return 0
+  fi
 
-test_config() {
-    if "$XRAY_BINARY" run -test -config "$XRAY_CONFIG" >/dev/null 2>&1; then
-        info "Configuration OK"
-        return 0
-    fi
-    error "配置测试失败"
-    return 1
-}
-
-restart_xray() {
-    systemctl restart "${SERVICE_NAME}" 2>/dev/null || true
-    sleep 1
-
-    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
-        info "${SERVICE_NAME} 启动成功"
-        return 0
-    fi
-
-    error "${SERVICE_NAME} 启动失败"
-    journalctl -u "${SERVICE_NAME}" -n 20 --no-pager || true
-    return 1
-}
-
-# ================== 解析与提取 VLESS 加密对 ==================
-generate_vless_encryption_config() {
-    local vlessenc_output
-    vlessenc_output=$($XRAY_BINARY vlessenc 2>/dev/null || true)
-    if [ -z "$vlessenc_output" ]; then
-        error "生成 VLESS Encryption 配置失败"
-        return 1
-    fi
-
-    local decryption_config=""
-    local encryption_config=""
-    local in_mlkem_section=false
-
-    while IFS= read -r line; do
-        if [[ "$line" == *"Authentication: ML-KEM-768, Post-Quantum"* ]]; then
-            in_mlkem_section=true
-            continue
-        fi
-
-        if [ "$in_mlkem_section" = true ]; then
-            if [[ "$line" == *'"decryption":'* ]]; then
-                decryption_config=$(echo "$line" | sed 's/.*"decryption": "\([^"]*\)".*/\1/')
-            elif [[ "$line" == *'"encryption":'* ]]; then
-                if echo "$line" | grep -q '.*"encryption": "[^"]*"'; then
-                    encryption_config=$(echo "$line" | sed 's/.*"encryption": "\([^"]*\)..*/\1/')
-                else
-                    encryption_config=$(echo "$line" | sed 's/.*"encryption": "\([^"]*\).*/\1/')
-                    read -r next_line
-                    encryption_config="${encryption_config}${next_line}"
-                    encryption_config=$(echo "$encryption_config" | tr -d '"' | tr -d '[:space:]')
-                fi
-                break
-            fi
-        fi
-    done <<< "$vlessenc_output"
-
-    if [ -z "$decryption_config" ] || [ -z "$encryption_config" ]; then
-        error "无法解析 VLESS Encryption 配置。"
-        return 1
-    fi
-
-    echo "${decryption_config}|${encryption_config}"
-}
-
-# ================== 写底层配置 ==================
-write_config() {
-    local port="$1"
-    local uuid="$2"
-    local decryption="$3"
+  info "🧹 正在清理前置依赖并准备下载..."
+  # BUG修复：使用确切路径检查，防止PATH找不到
+  if [[ ! -f "$EXECUTABLE_INSTALL_PATH" ]]; then
+    info "获取 GitHub 官方最新发布版本中..."
+    local latest_version=$(get_latest_version)
     
-    local listen_ip
-    listen_ip=$(get_listen_ip)
-
-    mkdir -p "$(dirname "$XRAY_CONFIG")"
-
-    jq -n \
-        --arg listen "${listen_ip}" \
-        --argjson port "${port}" \
-        --arg uuid "${uuid}" \
-        --arg decryption "${decryption}" \
-        --arg flow "xtls-rprx-vision" \
-    '{
-      "log": {"loglevel": "warning"},
-      "inbounds": [{
-        "listen": $listen,
-        "port": $port,
-        "protocol": "vless",
-        "settings": {
-          "clients": [{"id": $uuid, "flow": $flow}],
-          "decryption": $decryption
-        }
-      }],
-      "outbounds": [{
-        "protocol": "freedom",
-        "settings": {
-          "domainStrategy": "UseIPv4v6"
-        }
-      }]
-    }' > "$XRAY_CONFIG"
-
-    chmod 644 "$XRAY_CONFIG"
-}
-
-# ================== 生成分享链接 ==================
-generate_link() {
-    mkdir -p "$(dirname "$LINK_FILE")"
-    local ip
-    if ! ip=$(get_public_ip); then
-        error "获取公网 IP 失败"
-        return 1
+    local _tmpfile_tar=$(mktemp)
+    if ! download_singbox "$latest_version" "$_tmpfile_tar"; then
+      rm -f "$_tmpfile_tar" && return 1
     fi
 
-    local uuid port encryption remark
-    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null || echo "error")
-    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "443")
+    echo -ne "正在从解压并安装二进制可执行文件 ... "
+    local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
+    tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
     
-    encryption=$(head -n 1 "$STATE_FILE" 2>/dev/null || echo "")
-    remark=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 2>/dev/null || echo "VLESS-Enc")
-
-    local display_ip="$ip"
-    [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
-
-    local encoded_remark
-    encoded_remark=$(jq -rn --arg x "$remark" '$x|@uri')
-
-    cat > "$LINK_FILE" <<EOF
-vless://${uuid}@${display_ip}:${port}?encryption=${encryption}&flow=xtls-rprx-vision&type=tcp&security=none#${encoded_remark}
-EOF
-}
-
-# ================== 显示配置 ==================
-show_current_config() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then
-        error "配置文件不存在"
-        return
-    fi
-
-    local ip uuid port encryption remark outbound_mode
-    ip=$(get_public_ip || echo "未知")
-    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
-    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
-    
-    encryption=$(head -n 1 "$STATE_FILE" 2>/dev/null || echo "未知")
-    remark=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 2>/dev/null || echo "VLESS-E")
-    
-    local current_protocol
-    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$XRAY_CONFIG" 2>/dev/null || echo "freedom")
-    if [[ "$current_protocol" == "socks" ]]; then
-        outbound_mode="Socks5 链式代理"
+    local _ver_num="${latest_version#v}"
+    if install -Dm755 "$_tmpdir_extract/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE/sing-box" "$EXECUTABLE_INSTALL_PATH"; then
+      echo "成功"
     else
-        outbound_mode="直连 (Freedom)"
+      rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "安装失败" && return 1
     fi
+    rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
+  else
+    info "系统已存在 sing-box 核心组件，跳过基础安装。"
+  fi
 
-    echo -e "${GREEN}====== VLESS-Encryption 节点配置信息 ======${RESET}"
-    echo -e "${YELLOW}服务器公网 IP  : ${ip}${RESET}"
-    echo -e "${YELLOW}服务监听端口    : ${port}${RESET}"
-    echo -e "${YELLOW}用户 UUID       : ${uuid}${RESET}"
-    echo -e "${YELLOW}协议与加密      : VLESS Encryption (native + 0-RTT + ML-KEM-768)${RESET}"
-    echo -e "${YELLOW}推荐底层流控    : xtls-rprx-vision${RESET}"
-    echo -e "${YELLOW}出口模式        : ${outbound_mode}${RESET}"
-    echo -e "${YELLOW}节点自定义备注  : ${remark}${RESET}"
-    echo -e "${YELLOW}📄 V6VPS 请自行替换分享链接中的 IP 地址为 V6 ★${RESET}"
-    echo
+  if has_command systemctl && [[ ! -f "$SYSTEMD_SERVICES_DIR/mo-anyreality-sb.service" ]]; then
+    install_content -Dm644 "$(tpl_singbox_server_service_base)" "$SYSTEMD_SERVICES_DIR/mo-anyreality-sb.service" "1"
+  fi
 
-    if [[ -f "$LINK_FILE" ]]; then
-        echo -e "${GREEN}====== 👉 V2rayN 分享链接 (已存至 $LINK_FILE) ======${RESET}"
-        cat "$LINK_FILE"
-    fi
+  local rand_port=$(shuf -i 10000-65535 -n 1)
+  local rand_user=$(python3 -c "import secrets, string; print('user-' + ''.join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(6)))")
+  local rand_pass=$(python3 -c "import secrets, string; print(''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12)))")
+  local rand_sid=$(python3 -c "import secrets; print(secrets.token_hex(8))")
+  local hostname_str=$(hostname 2>/dev/null || echo "linux")
+  local default_remark="${hostname_str}-AnyReality"
+
+  echo "---------------------------------------------"
+  read -rp "👉 请输入监听端口 (默认随机: ${rand_port}): " INPUT_PORT
+  PORT=${INPUT_PORT:-$rand_port}
+
+  read -rp "👉 请输入用户名 (默认随机: ${rand_user}): " INPUT_USERNAME
+  USERNAME=${INPUT_USERNAME:-$rand_user}
+
+  read -rp "👉 请输入密码 (默认随机: ${rand_pass}): " INPUT_PASSWORD
+  PASSWORD=${INPUT_PASSWORD:-$rand_pass}
+
+  read -rp "👉 请输入伪装域名/SNI (默认: www.amazon.com): " INPUT_SERVER_NAME
+  SERVER_NAME=${INPUT_SERVER_NAME:-www.amazon.com}
+
+  read -rp "👉 请输入 Reality short_id (默认随机: ${rand_sid}): " INPUT_SHORT_ID
+  SHORT_ID=${INPUT_SHORT_ID:-$rand_sid}
+
+  read -rp "👉 请输入节点备注名称 (默认: ${default_remark}): " INPUT_REMARK
+  REMARK=${INPUT_REMARK:-$default_remark}
+
+  PRIVATE_KEY=""
+  PUBLIC_KEY=""
+  generate_or_use_key
+  write_and_show_config
 }
 
-# ================== 核心交互配置处理 ==================
-configure_xray() {
-    info "开始配置 VLESS-Encryption 节点..."
-    local port uuid remark
-
-    while true; do
-        read -rp "请输入监听端口 (直接回车随机分配端口): " input_port
-        if [[ -z "$input_port" ]]; then
-            port=$(get_random_port)
-            info "已为您随机分配未被占用端口: $port"
-            break
-        elif is_valid_port "$input_port"; then
-            if ! check_port "$input_port"; then
-                error "端口 ${input_port} 已被占用，请重新输入。"
-                continue
-            fi
-            port="$input_port"
-            break
-        else
-            error "端口无效"
-        fi
-    done
-
-    while true; do
-        read -rp "请输入UUID (直接回车自动随机生成): " input_uuid
-        if [[ -z "${input_uuid:-}" ]]; then
-            if [ -x "$XRAY_BINARY" ]; then
-                uuid=$("$XRAY_BINARY" uuid)
-            else
-                uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "7415d2b8-1454-4da8-963b-4663e8322851")
-            fi
-            break
-        elif is_valid_uuid "$input_uuid"; then
-            uuid="$input_uuid"
-            break
-        else
-            error "UUID 格式无效"
-        fi
-    done
-
-    local hostname_str
-    hostname_str=$(hostname 2>/dev/null || echo "linux")
-    read -rp "请输入节点备注名称 (默认: ${hostname_str}-VLESS-E): " input_remark
-    remark=${input_remark:-${hostname_str}-VLESS-E}
-
-    mkdir -p "$(dirname "$XRAY_CONFIG")"
-
-    # 新建流程生成底层加解密配置对
-    local encryption_info
-    encryption_info=$(generate_vless_encryption_config) || return 1
-    
-    local decryption encryption
-    decryption=$(echo "$encryption_info" | cut -d'|' -f1)
-    encryption=$(echo "$encryption_info" | cut -d'|' -f2)
-
-    # 写入状态文件（第一行为密文，其余为元数据环境）
-    echo "$encryption" > "$STATE_FILE"
-    cat << EOF >> "$STATE_FILE"
-PORT='${port}'
-UUID='${uuid}'
-REMARK='${remark}'
-EOF
-
-    write_config "$port" "$uuid" "$decryption"
-    test_config || return 1
-    generate_link
-    restart_xray
-    show_current_config
-}
-
-# ================== 配置自定义Socks5出口 ==================
-configure_custom_socks5_outbound() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then 
-        error "错误: 未安装，无法配置出口模式。"
-        return
-    fi
-
-    local mode current_protocol tmp_file
-    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$XRAY_CONFIG" 2>/dev/null || echo "freedom")
-
-    echo "---------------------------------------------"
-    echo "请选择出口模式："
-    if [[ "$current_protocol" == "socks" ]]; then
-        echo -e "当前模式: ${YELLOW}Socks5${RESET}"
-    else
-        echo -e "当前模式: ${GREEN}直连${RESET}"
-    fi
-    echo "1) 直连出口"
-    echo "2) Socks5 出口"
-    echo "0) 取消"
-    echo "---------------------------------------------"
-
-    read -rp "请输入选项 [0-2]: " mode || true
-    case "$mode" in
-        1)
-            tmp_file=$(mktemp)
-            jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$XRAY_CONFIG" > "$tmp_file"
-            if ! jq empty "$tmp_file" >/dev/null 2>&1; then
-                rm -f "$tmp_file"
-                error "生成的直连配置无效。"
-                return 1
-            fi
-            cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
-            mv "$tmp_file" "$XRAY_CONFIG"
-            chmod 644 "$XRAY_CONFIG" 2>/dev/null || true
-            if ! restart_xray; then
-                error "切换到直连失败。"
-                return 1
-            fi
-            info "已成功切换为直连出口！"
-            return
-            ;;
-        2)
-            ;;
-        0|"")
-            info "已取消配置。"
-            return
-            ;;
-        *)
-            error "无效选项，请输入 0-2 之间的数字。"
-            return 1
-            ;;
-    esac
-
-    info "配置自定义 Socks5 出口代理..."
-    local socks_host socks_port socks_user socks_pass
-
-    read -rp "请输入 Socks5 服务器地址/IP: " socks_host || true
-    [[ -z "$socks_host" ]] && info "已取消配置。" && return
-
-    while true; do
-        read -rp "请输入 Socks5 端口 (默认: 1080): " socks_port || true
-        [[ -z "$socks_port" ]] && socks_port=1080
-        if is_valid_port "$socks_port"; then
-            break
-        else
-            error "端口无效，请输入一个1-65535之间的数字。"
-        fi
-    done
-
-    read -rp "请输入 Socks5 用户名 (若无密码认证请直接留空回车): " socks_user || true
-    if [[ -n "$socks_user" ]]; then
-        read -rs -p "请输入 Socks5 密码: " socks_pass || true
-        echo
-    else
-        socks_pass=""
-    fi
-
-    tmp_file=$(mktemp)
-
-    if [[ -n "$socks_user" ]]; then
-        jq \
-            --arg host "$socks_host" \
-            --argjson port "$socks_port" \
-            --arg user "$socks_user" \
-            --arg pass "$socks_pass" \
-            '
-            .outbounds = [
-              {
-                "protocol": "socks",
-                "tag": "custom-socks5-out",
-                "settings": {
-                  "servers": [
-                    {
-                      "address": $host,
-                      "port": $port,
-                      "users": [
-                        {
-                          "user": $user,
-                          "pass": $pass
-                        }
-                      ]
-                    }
-                  ]
-                }
-              }
-            ]
-            ' "$XRAY_CONFIG" > "$tmp_file"
-    else
-        jq \
-            --arg host "$socks_host" \
-            --argjson port "$socks_port" \
-            '
-            .outbounds = [
-              {
-                "protocol": "socks",
-                "tag": "custom-socks5-out",
-                "settings": {
-                  "servers": [
-                    {
-                      "address": $host,
-                      "port": $port
-                    }
-                  ]
-                }
-              }
-            ]
-            ' "$XRAY_CONFIG" > "$tmp_file"
-    fi
-
-    if ! jq empty "$tmp_file" >/dev/null 2>&1; then
-        rm -f "$tmp_file"
-        error "生成的 Socks5 配置无效，请检查输入后重试。"
-        return 1
-    fi
-
-    cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
-    mv "$tmp_file" "$XRAY_CONFIG"
-    chmod 644 "$XRAY_CONFIG" 2>/dev/null || true
-
-    if ! restart_xray; then
-        error "重启服务失败，当前配置可能与系统环境不兼容。"
-        return 1
-    fi
-    info "已成功切换为 Socks5 出口！"
-}
-
-# ================== 安装 ==================
-install_xray() {
-    info "开始拉取部署 Xray 核心组件..."
-    download_and_extract_xray || return 1
-    setup_systemd_service
-    configure_xray
-    info "安装完成并已成功启动服务: ${SERVICE_NAME}"
-}
-
-# ================== 更新 ==================
-update_xray() {
-    info "开始平滑更新 Xray 核心程序..."
-    
-    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
-        info "检测到服务正在运行，正在暂退服务进行文件覆盖..."
-        systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
-    fi
-
-    if ! download_and_extract_xray; then
-        error "下载或部署新版本失败，尝试拉起原有服务..."
-        restart_xray
-        return 1
-    fi
-    
-    if restart_xray; then
-        generate_link
-        info "最新版平滑更新成功！当前核心版本: $(get_xray_version)"
-    else
-        error "更新后服务拉起失败，请查看日志。"
-        return 1
-    fi
-}
-
-# ================== 修改配置 ==================
 modify_config() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then
-        error "配置文件不存在，请先执行安装流程"
-        return 1
-    fi
+  if [[ ! -f "$SB_CONFIG" ]]; then
+    error "未找到正在运行的配置文件，请先选择选项 1 安装节点。"
+    return 1
+  fi
 
-    local old_port old_uuid old_decryption old_encryption old_remark
-    old_port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "443")
-    old_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null || echo "")
-    old_decryption=$(jq -r '.inbounds[0].settings.decryption' "$XRAY_CONFIG" 2>/dev/null || echo "")
-    old_encryption=$(head -n 1 "$STATE_FILE" 2>/dev/null || echo "")
-    old_remark=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 2>/dev/null || echo "VLESS-E")
+  info "正在读取现有节点配置..."
+  local current_port=$(jq -r '.inbounds[0].listen_port // empty' "$SB_CONFIG" 2>/dev/null)
+  local current_user=$(jq -r '.inbounds[0].users[0].name // empty' "$SB_CONFIG" 2>/dev/null)
+  local current_pass=$(jq -r '.inbounds[0].users[0].password // empty' "$SB_CONFIG" 2>/dev/null)
+  local current_sni=$(jq -r '.inbounds[0].tls.server_name // empty' "$SB_CONFIG" 2>/dev/null)
+  local current_sid=$(jq -r '.inbounds[0].tls.reality.short_id // empty' "$SB_CONFIG" 2>/dev/null)
+  
+  local current_private_key=$(jq -r '.inbounds[0].tls.reality.private_key // empty' "$SB_CONFIG" 2>/dev/null)
+  local current_remark=""
+  local current_public_key=""
+  if [[ -f "$STATE_FILE" ]]; then
+    current_remark=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 || true)
+    current_public_key=$(grep -E "^PUBLIC_KEY=" "$STATE_FILE" | cut -d"'" -f2 || true)
+  fi
 
-    if [[ -z "$old_decryption" || -z "$old_encryption" ]]; then
-        error "提取加解密密钥底座失败，停止原地修改。请使用选项 1 重新安装。"
-        return 1
-    fi
+  # BUG修复：初始化未定义的兜底备注变量
+  local fallback_remark="AnyReality-Node"
 
-    local port uuid remark
+  echo "---------------------------------------------"
+  echo -e "${YELLOW}提示：直接敲回车(Enter)将保持括号内的当前值不变${RESET}"
+  echo "---------------------------------------------"
 
-    while true; do
-        read -rp "请输入新端口 [当前:${old_port}, 回车不修改]: " input_port
-        if [[ -z "$input_port" ]]; then
-            port="$old_port"
-            break
-        elif [[ "${input_port,,}" == "rand" ]]; then
-            port=$(get_random_port)
-            info "已重分配空闲随机端口: $port"
-            break
-        elif is_valid_port "$input_port"; then
-            if [[ "$input_port" != "$old_port" ]]; then
-                if ! check_port "$input_port"; then
-                    error "端口 ${input_port} 已被占用，请重新换一个。"
-                    continue
-                fi
-            fi
-            port="$input_port"
-            break
-        else
-            error "端口无效，请输入 1-65535 之间的数字。"
-        fi
-    done
+  read -rp "👉 修改监听端口 (当前: ${current_port}): " INPUT_PORT
+  PORT=${INPUT_PORT:-$current_port}
 
-    while true; do
-        read -rp "请输入UUID [当前:${old_uuid}, 回车不修改]: " input_uuid
-        uuid=${input_uuid:-$old_uuid}
-        if is_valid_uuid "$uuid"; then
-            break
-        else
-            error "UUID 格式无效"
-        fi
-    done
+  read -rp "👉 修改用户名 (当前: ${current_user}): " INPUT_USERNAME
+  USERNAME=${INPUT_USERNAME:-$current_user}
 
-    read -rp "请输入节点备注名称 [当前:${old_remark}, 回车不修改]: " input_remark
-    remark=${input_remark:-$old_remark}
+  read -rp "👉 修改密码 (当前: ${current_pass}): " INPUT_PASSWORD
+  PASSWORD=${INPUT_PASSWORD:-$current_pass}
 
-    cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
+  read -rp "👉 修改伪装域名/SNI (当前: ${current_sni}): " INPUT_SERVER_NAME
+  SERVER_NAME=${INPUT_SERVER_NAME:-$current_sni}
 
-    # 平滑修改，完美保留加解密密钥，拒绝重新计算
-    echo "$old_encryption" > "$STATE_FILE"
-    cat << EOF >> "$STATE_FILE"
-PORT='${port}'
-UUID='${uuid}'
-REMARK='${remark}'
-EOF
+  read -rp "👉 修改 Reality short_id (当前: ${current_sid}): " INPUT_SHORT_ID
+  SHORT_ID=${INPUT_SHORT_ID:-$current_sid}
 
-    write_config "$port" "$uuid" "$old_decryption"
-    test_config || return 1
-    generate_link
-    restart_xray
-    info "配置修改成功"
+  read -rp "👉 修改节点备注名称 (当前: ${current_remark:-$fallback_remark}): " INPUT_REMARK
+  REMARK=${INPUT_REMARK:-${current_remark:-$fallback_remark}}
+
+  PRIVATE_KEY="$current_private_key"
+  PUBLIC_KEY="$current_public_key"
+
+  generate_or_use_key
+  write_and_show_config
 }
 
-# ================== 卸载 ==================
-uninstall_xray() {
-    warn "即将开始完全卸载 ${SERVICE_NAME} 服务..."
+update_singbox() {
+  if [[ ! -f "$SB_BINARY" ]]; then
+    error "当前系统未安装 Sing-box，无法执行更新。"
+    return 1
+  fi
 
-    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
-    systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
-    
-    rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+  info "正在检查新版本..."
+  local current_version=$(get_installed_version)
+  local latest_version=$(get_latest_version)
+
+  info "当前安装版本: ${YELLOW}${current_version}${RESET}"
+  info "官方最新版本: ${GREEN}${latest_version}${RESET}"
+
+  if [[ "$current_version" == *"$latest_version"* || "$latest_version" == *"$current_version"* ]]; then
+    info "您当前已经是最新版本，无需更新。"
+    return 0
+  fi
+
+  warn "检测到新版本，即将开始平滑更新 (你的节点配置不会改变)..."
+  
+  local _tmpfile_tar=$(mktemp)
+  if ! download_singbox "$latest_version" "$_tmpfile_tar"; then
+    rm -f "$_tmpfile_tar" && return 1
+  fi
+
+  echo -ne "正在覆盖二进制核心文件 ... "
+  local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
+  tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
+  
+  local _ver_num="${latest_version#v}"
+  if install -Dm755 "$_tmpdir_extract/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE/sing-box" "$EXECUTABLE_INSTALL_PATH"; then
+    echo "成功"
+  else
+    rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "覆盖核心失败" && return 1
+  fi
+  rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
+
+  info "正在重启 Sing-box 服务以应用更新..."
+  if has_command systemctl; then
     systemctl daemon-reload
-    
-    rm -f "$XRAY_BINARY"
-    rm -rf "/usr/local/etc/${SERVICE_NAME}"
-    rm -rf "/usr/local/share/${SERVICE_NAME}"
-    rm -f "$LINK_FILE"
-    
-    info "服务已成功卸载，相关的配置底座与元数据已全部清理。"
+    systemctl restart mo-anyreality-sb >/dev/null 2>&1 || true
+    if systemctl is-active --quiet mo-anyreality-sb 2>/dev/null; then
+      info "Sing-box 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
+    else
+      error "核心更新成功，但服务重启失败，请运行 'journalctl -u mo-anyreality-sb -f' 检查错误。"
+    fi
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+    "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
+    info "Sing-box 核心已更新并于后台重启运行。"
+  fi
 }
 
-# ================== 菜单 ==================
-show_menu() {
-    clear
-    local status version port_show
-    status=$(get_xray_status)
-    version=$(get_xray_version)
-    port_show="-"
+uninstall_singbox() {
+  if has_command systemctl; then
+    systemctl stop mo-anyreality-sb >/dev/null 2>&1 || true
+    systemctl disable mo-anyreality-sb >/dev/null 2>&1 || true
+    remove_file "$SYSTEMD_SERVICES_DIR/mo-anyreality-sb.service"
+    systemctl daemon-reload
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+  fi
+  
+  remove_file "$EXECUTABLE_INSTALL_PATH"
+  rm -f "$SB_CONFIG" "$STATE_FILE"
+  rm -rf "$CONFIG_DIR" "$SB_DIR"
 
-    if [[ -f "$XRAY_CONFIG" ]]; then
-        port_show=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "-")
+  info "已卸载 Sing-box、配置文件与状态文件。"
+}
+
+showconf() {
+  if [[ ! -f "$STATE_FILE" ]]; then
+    error "未找到任何安装配置底座，请先安装节点。"
+    return 1
+  fi
+  source "$STATE_FILE"
+
+  local encoded_remark=$(jq -rn --arg x "$REMARK" '$x|@uri')
+  local v2rayn_link="anytls://${PASSWORD}@${SERVER_IP}:${PORT}?security=reality&sni=${SERVER_NAME}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${encoded_remark}"
+
+  echo -e "${GREEN}====== AnyTLS+Reality 节点配置信息 ======${RESET}"
+  echo -e "${GREEN}服务器公网 IP :${RESET} ${SERVER_IP}"
+  echo -e "${GREEN}服务监听端口   :${RESET} ${PORT}"
+  echo -e "${GREEN}认证用户名     :${RESET} ${USERNAME}"
+  echo -e "${GREEN}认证通信密码   :${RESET} ${PASSWORD}"
+  echo -e "${GREEN}伪装域名 (SNI) :${RESET} ${SERVER_NAME}"
+  echo -e "${GREEN}Reality 公钥   :${RESET} ${PUBLIC_KEY}"
+  echo -e "${GREEN}Reality 目标ID :${RESET} ${SHORT_ID}"
+  echo -e "${GREEN}客户端指纹模式 :${RESET} chrome"
+  echo -e "${GREEN}节点自定义备注 :${RESET} ${REMARK}"
+  echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
+  echo "---------------------------------------------"
+  echo -e "${GREEN}👉 v2rayN 分享链接:${RESET}"
+  echo -e "${YELLOW}${v2rayn_link}${RESET}"
+  echo "---------------------------------------------"
+}
+
+# ================== SNI 优选（高并发重构版） ==================
+select_best_sni() {
+    info "开始高并发 SNI 延迟优选测试..."
+
+    local SNIS=(
+      amd.com apps.mzstatic.com aws.com azure.microsoft.com beacon.gtv-pub.com
+      bing.com catalog.gamepass.com cdn.bizibly.com cdn-dynmedia-1.microsoft.com
+      devblogs.microsoft.com fpinit.itunes.apple.com go.microsoft.com
+      gray-config-prod.api.arc-cdn.net gray.video-player.arcpublishing.com
+      images.nvidia.com r.bing.com services.digitaleast.mobi snap.licdn.com
+      statici.icloud.com tag.demandbase.com tag-logger.demandbase.com
+      ts1.tc.mm.bing.net ts2.tc.mm.bing.net vs.aws.amazon.com www.apple.com
+      www.icloud.com www.microsoft.com www.oracle.com www.xbox.com
+      www.xilinx.com xp.apple.com
+    )
+
+    local tmp_result=$(mktemp)
+    
+    # 利用后台进程实现多线程并发测试
+    for sni in "${SNIS[@]}"; do
+        (
+            local start=$(date +%s%N)
+            if timeout 2 openssl s_client -connect "${sni}:443" -servername "${sni}" -brief </dev/null >/dev/null 2>&1; then
+                local end=$(date +%s%N)
+                local cost=$(( (end - start) / 1000000 ))
+                echo "$cost $sni" >> "$tmp_result"
+                echo -e "[SNI] $sni -> ${GREEN}${cost}ms${RESET}"
+            fi
+        ) &
+    done
+    wait # 等待所有并发测试结束
+
+    if [[ ! -s "$tmp_result" ]]; then
+        warn "未找到任何可用的 SNI 域名，请检查外部网络连接。"
+        rm -f "$tmp_result"
+        return 1
     fi
+
+    # 排序筛选出延迟最低的
+    local best_line=$(sort -n "$tmp_result" | head -n 1)
+    local best_time=$(echo "$best_line" | awk '{print $1}')
+    local best_sni=$(echo "$best_line" | awk '{print $2}')
+    rm -f "$tmp_result"
+
+    info "🏆 最优 SNI 域名为: ${GREEN}$best_sni${RESET} (${best_time}ms)"
+
+    # 联动配置修改逻辑
+    if [[ -f "$SB_CONFIG" ]]; then
+        echo "---------------------------------------------"
+        read -rp "👉 是否将此优选 SNI 直接应用到当前的 Sing-box 配置中？(y/N): " APPLY_SNI
+        if [[ "$APPLY_SNI" == "y" || "$APPLY_SNI" == "Y" ]]; then
+            # 引入当前配置变量
+            PORT=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG")
+            USERNAME=$(jq -r '.inbounds[0].users[0].name' "$SB_CONFIG")
+            PASSWORD=$(jq -r '.inbounds[0].users[0].password' "$SB_CONFIG")
+            SHORT_ID=$(jq -r '.inbounds[0].tls.reality.short_id' "$SB_CONFIG")
+            PRIVATE_KEY=$(jq -r '.inbounds[0].tls.reality.private_key' "$SB_CONFIG")
+            SERVER_NAME="$best_sni"
+            
+            if [[ -f "$STATE_FILE" ]]; then
+                REMARK=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 || echo "AnyReality")
+                PUBLIC_KEY=$(grep -E "^PUBLIC_KEY=" "$STATE_FILE" | cut -d"'" -f2 || echo "")
+            else
+                REMARK="AnyReality"
+                PUBLIC_KEY=""
+            fi
+            
+            write_and_show_config
+        fi
+    else
+        info "提示：当前未生成配置文件，您可以在稍后安装时手动填写此域名。"
+    fi
+    return 0
+}
+
+# =========================================================
+# 6. 面板主菜单
+# =========================================================
+menu() {
+  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
+  check_environment
+
+  while true; do
+    clear
+    local status=$(get_sb_status)
+    local version=$(get_installed_version)
+    local port_show=$(get_current_port_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     VLESS-Encryption 面板       ${RESET}"
+    echo -e "${GREEN} Sing-box AnyTLS + Reality 面板  ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 VLESS-Encryption${RESET}"
-    echo -e "${GREEN} 2. 更新 VLESS-Encryption${RESET}"
-    echo -e "${GREEN} 3. 卸载 VLESS-Encryption${RESET}"
+    echo -e "${GREEN} 1. 安装 AnyReality${RESET}"
+    echo -e "${GREEN} 2. 更新 AnyReality${RESET}"
+    echo -e "${GREEN} 3. 卸载 AnyReality${RESET}"
     echo -e "${GREEN} 4. 修改配置${RESET}"
-    echo -e "${GREEN} 5. 启动 VLESS-Encryption${RESET}"
-    echo -e "${GREEN} 6. 停止 VLESS-Encryption${RESET}"
-    echo -e "${GREEN} 7. 重启 VLESS-Encryption${RESET}"
-    echo -e "${GREEN} 8. 查看服务日志${RESET}"
+    echo -e "${GREEN} 5. 启动 AnyReality${RESET}"
+    echo -e "${GREEN} 6. 停止 AnyReality${RESET}"
+    echo -e "${GREEN} 7. 重启 AnyReality${RESET}"
+    echo -e "${GREEN} 8. 查看日志${RESET}"
     echo -e "${GREEN} 9. 查看节点配置${RESET}"
-    echo -e "${GREEN}10. 配置Socks5出口${RESET}"
+    echo -e "${GREEN}10. SNI域名优选✨${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
-}
 
-# ================== 安装依赖 ==================
-install_dependencies() {
-    if command -v apt &>/dev/null; then
-        apt update && apt install -y jq curl wget sed coreutils unzip iproute2 || true
-    elif command -v dnf &>/dev/null; then
-        dnf install -y jq curl wget sed coreutils unzip iproute2
-    elif command -v yum &>/dev/null; then
-        yum install -y jq curl wget sed coreutils unzip iproute2
-    else
-        error "未知的包管理器，请手动补充环境包: jq, curl, wget, unzip"
-        exit 1
-    fi
-}
+    local choice=""
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+    [[ -z "$choice" ]] && continue
 
-# ================== 依赖检查 ==================
-pre_check() {
-    if [[ $(id -u) -ne 0 ]]; then
-        error "错误: 请切换至 root 用户运行此面板脚本。"
-        exit 1
-    fi
-
-    local deps=(jq curl wget unzip ss awk sed)
-    local missing=0
-
-    for cmd in "${deps[@]}"; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            missing=1
-            break
+    case "$choice" in
+      1) inst_singbox; pause ;;
+      2) update_singbox; pause ;;
+      3) uninstall_singbox; pause ;;
+      4) modify_config; pause ;;
+      5) 
+        if has_command systemctl; then
+          systemctl start mo-anyreality-sb && info "服务已成功启动！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+          "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
+          info "进程已在后台启动！"
         fi
-    done
-
-    if [[ "$missing" -eq 1 ]]; then
-        info "正在初始化并安装缺失的环境依赖组件..."
-        install_dependencies
-    fi
+        pause ;;
+      6) 
+        if has_command systemctl; then
+          systemctl stop mo-anyreality-sb && info "服务已成功停止！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台进程已终止！"
+        fi
+        pause ;;
+      7) 
+        if has_command systemctl; then
+          systemctl restart mo-anyreality-sb && info "服务已成功重启！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+          "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
+          info "后台进程已重启！"
+        fi
+        pause ;;
+      8) 
+        if has_command systemctl; then
+          journalctl -u mo-anyreality-sb.service -n 50 --no-pager
+        else
+          warn "当前环境不支持 systemd 集中日志管理。"
+        fi
+        pause ;;
+      9) showconf; pause ;;
+      10) select_best_sni; pause ;;
+      0) exit 0 ;;
+      *) error "无效输入，请重新选择。"; sleep 1 ;;
+    esac
+  done
 }
 
-# ================== 主循环 ==================
-main() {
-    pre_check
-
-    while true; do
-        show_menu
-        
-        local choice=""
-        read -r -p $'\033[32m请输入选项: \033[0m' choice || true
-        
-        [[ -z "$choice" ]] && continue
-
-        case "$choice" in
-            1) install_xray; pause ;;
-            2) update_xray; pause ;;
-            3) uninstall_xray; pause ;;
-            4) modify_config; pause ;;
-            5) systemctl start "${SERVICE_NAME}" &>/dev/null || true; restart_xray; pause ;;
-            6) systemctl stop "${SERVICE_NAME}" &>/dev/null || true; info "服务已成功停止"; pause ;;
-            7) restart_xray; pause ;;
-            8) journalctl -u "${SERVICE_NAME}" -e --no-pager || true; pause ;;
-            9) show_current_config; pause ;;
-            10) configure_custom_socks5_outbound; pause ;;
-            0) exit 0 ;;
-            *) error "无效输入"; pause ;;
-        esac
-    done
-}
-
-main "$@"
+menu "$@"

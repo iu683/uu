@@ -22,7 +22,7 @@ green_echo() { echo -e "${GREEN}$1${RESET}"; }
 yellow_echo() { echo -e "${YELLOW}$1${RESET}"; }
 purple_echo() { echo -e "${PURPLE}$1${RESET}"; }
 
-# 获取最准确的当前运行 PID (多重手段适配 Alpine)
+# 获取最准确的当前运行 PID
 get_mtg_pid() {
     local pid=$(pidof mtg)
     if [[ -z "$pid" ]]; then
@@ -31,12 +31,25 @@ get_mtg_pid() {
     echo "$pid"
 }
 
+# 获取面板状态显示 (严格在函数内用 local)
+get_status_display() {
+    local current_pid=$(get_mtg_pid)
+    local saved_port=$(cat "$WORKDIR/port.txt" 2>/dev/null)
+    local is_listening=""
+    [[ -n "$saved_port" ]] && is_listening=$(netstat -an 2>/dev/null | grep -E "[:\.]${saved_port} " | grep -i "listen")
+
+    if [[ -n "$current_pid" || -n "$is_listening" ]]; then
+        echo -e "${GREEN}正在运行${RESET}"
+    else
+        echo -e "${RED}已停止${RESET}"
+    fi
+}
+
 # 获取正在运行的端口
 get_running_port() {
     local pid=$(get_mtg_pid)
     local port=""
     if [[ -n "$pid" ]]; then
-        # 优先通过 netstat 获取该 PID 真实监听的端口
         port=$(netstat -anp 2>/dev/null | grep "$pid/" | grep -i "listen" | awk '{print $4}' | cut -d':' -f2 | head -n 1)
         [[ -z "$port" && -f "$WORKDIR/port.txt" ]] && port=$(cat "$WORKDIR/port.txt")
         echo "${port:-未知}"
@@ -52,11 +65,6 @@ get_public_ip() {
             ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://ip6.n0at.com" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
     echo "无法获取公网 IP"
 }
 
@@ -64,12 +72,21 @@ random_port() {
     awk 'BEGIN{srand(); print int(rand()*(65000-2000+1))+2000}'
 }
 
+# 彻底修复输出污染的端口检查函数
 check_vps_port() {
     local port=$1
-    while [[ -n $(netstat -an 2>/dev/null | grep -E "[:\.]${port} " | grep -i "listen") ]]; do
-        red_echo "${port} 端口已经被其他程序占用，请更换端口重试。"
-        read -p "请输入新端口（回车使用随机端口）: " port
-        [[ -z $port ]] && port=$(random_port) && green_echo "使用随机端口: $port"
+    while true; do
+        # 仅仅把提示打印到标准错误(>&2)，确保标准输出只返回纯数字端口
+        if [[ -n $(netstat -an 2>/dev/null | grep -E "[:\.]${port} " | grep -i "listen") ]]; then
+            echo -e "${RED}${port} 端口已经被其他程序占用，请更换端口重试。${RESET}" >&2
+            read -p "请输入新端口（回车使用随机端口）: " port
+            if [[ -z $port ]]; then
+                port=$(random_port)
+                echo -e "${GREEN}使用随机端口: $port${RESET}" >&2
+            fi
+        else
+            break
+        fi
     done
     echo "$port"
 }
@@ -116,23 +133,21 @@ start_proxy() {
     fi
 
     cd "$WORKDIR" || return
-    nohup ./mtg run -b 0.0.0.0:$port "$SECRET" --stats-bind=127.0.0.1:$((port + 1)) >> "$LOG_FILE" 2>&1 &
+    local stats_p=$((port + 1))
+    nohup ./mtg run -b 0.0.0.0:$port "$SECRET" --stats-bind=127.0.0.1:${stats_p} >> "$LOG_FILE" 2>&1 &
     sleep 1
     green_echo "MTProto Proxy 启动指令已发送！"
 }
 
 stop_proxy() {
-    # 强制扫描并杀死所有含 mtg 关键词的后台服务进程，确保彻底杀死
+    # 针对 Alpine 的强杀组合拳
     local pids=$(pidof mtg || ps -ef | grep 'mtg run' | grep -v grep | awk '{print $1}')
     if [[ -n "$pids" ]]; then
         echo "$pids" | xargs kill -9 >/dev/null 2>&1
-        green_echo "MTProto Proxy 已成功停止。"
-    else
-        # 托底方案：按名字强杀
-        pkill -9 -f "mtg run" >/dev/null 2>&1
-        pkill -9 mtg >/dev/null 2>&1
-        green_echo "MTProto 停止指令执行完毕。"
     fi
+    pkill -9 -f "mtg run" >/dev/null 2>&1
+    pkill -9 mtg >/dev/null 2>&1
+    green_echo "MTProto Proxy"
 }
 
 show_config() {
@@ -172,7 +187,8 @@ download_and_run_mtg() {
     cd "$WORKDIR" || return
 
     # 启动服务
-    nohup ./mtg run -b 0.0.0.0:$MTP_PORT "$SECRET" --stats-bind=127.0.0.1:$((MTP_PORT + 1)) >> "$LOG_FILE" 2>&1 &
+    local stats_port=$((MTP_PORT + 1))
+    nohup ./mtg run -b 0.0.0.0:$MTP_PORT "$SECRET" --stats-bind=127.0.0.1:${stats_port} >> "$LOG_FILE" 2>&1 &
     
     # 创建守护/重启脚本
     cat > "${WORKDIR}/restart.sh" <<EOF
@@ -180,7 +196,7 @@ download_and_run_mtg() {
 pkill -9 -f "mtg run" >/dev/null 2>&1
 pkill -9 mtg >/dev/null 2>&1
 cd ${WORKDIR}
-nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$((MTP_PORT + 1)) >> ${LOG_FILE} 2>&1 &
+nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:${stats_port} >> ${LOG_FILE} 2>&1 &
 EOF
     chmod +x "${WORKDIR}/restart.sh"
     return 0
@@ -192,6 +208,8 @@ core_install() {
     
     read -p "请输入 MTProto 代理端口 (回车使用随机端口): " user_port
     [[ -z $user_port ]] && user_port=$(random_port)
+    
+    # 核心修复点：通过 check_vps_port 获取纯净的端口数字
     MTP_PORT=$(check_vps_port "$user_port")
     IP1=$(get_public_ip)
 
@@ -214,17 +232,9 @@ core_install() {
 while true; do
     clear
     
-    # 状态判定全面升级：进程号、网络端口监听双重验证
-    local current_pid=$(get_mtg_pid)
-    local saved_port=$(cat "$WORKDIR/port.txt" 2>/dev/null)
-    local is_listening=""
-    [[ -n "$saved_port" ]] && is_listening=$(netstat -an 2>/dev/null | grep -E "[:\.]${saved_port} " | grep -i "listen")
-
-    if [[ -n "$current_pid" || -n "$is_listening" ]]; then
-        status_display="${GREEN}正在运行${RESET}"
-    else
-        status_display="${RED}已停止${RESET}"
-    fi
+    # 严格调用函数获取状态和端口，杜绝在主循环体直接使用 local
+    status_display=$(get_status_display)
+    port_display=$(get_running_port)
     
     if check_cron_status; then
         cron_display="${GREEN}已开启${RESET}"
@@ -232,10 +242,8 @@ while true; do
         cron_display="${RED}已关闭${RESET}"
     fi
 
-    port_display=$(get_running_port)
-
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   MTProto Proxy Alpine 面板    ${RESET}"
+    echo -e "${GREEN}     MTProto Proxy 管理面板     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态     :${RESET} ${status_display}"
     echo -e "${GREEN}端口     :${RESET} ${YELLOW}${port_display}${RESET}"

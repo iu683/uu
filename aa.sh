@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Xray (VLESS-Encryption + REALITY) 控制面板
-#
+#  VLESS-Encryption + XTLS-Vision 控制面板
+# 
 # =========================================================
 # 1. 核心控制与全局环境初始化
 # =========================================================
@@ -9,15 +9,18 @@ set -Eeuo pipefail
 export LANG=en_US.UTF-8
 
 # 基础目录与硬编码配置
-readonly SERVICE_NAME="xray-vless-enc"
+readonly SERVICE_NAME="xray-vless-vision"
 readonly XRAY_CONFIG="/usr/local/etc/${SERVICE_NAME}/config.json"
 readonly XRAY_BINARY="/usr/local/bin/${SERVICE_NAME}"
-readonly STATE_DIR="/root/proxynode/Xray_Enc"
+readonly STATE_DIR="/root/encryption"
 readonly STATE_FILE="${STATE_DIR}/xray_encryption_info.txt"
-readonly REALITY_FILE="${STATE_DIR}/xray_reality_info.txt"  # 存储格式: pbk|sni|sid
-readonly LINK_FILE="${STATE_DIR}/xray_vless_encryptionreality_link.txt"
+readonly LINK_FILE="${STATE_DIR}/xray_vless_vision_link.txt"
 
-# 降级备用版本
+# 证书默认生成路径
+readonly CERT_DIR="/usr/local/etc/${SERVICE_NAME}/certs"
+readonly CERT_FILE="${CERT_DIR}/server.crt"
+readonly KEY_FILE="${CERT_DIR}/server.key"
+
 readonly BACKUP_VERSION="26.3.27"
 
 # 终端规范颜色代码
@@ -28,9 +31,9 @@ BLUE="\033[34m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-TMP_DIR=$(mktemp -d -t xray_enc.XXXXXX)
+TMP_DIR=$(mktemp -d -t xray_vision.XXXXXX)
 
-# ================== 自动清理垃圾 ==================
+# 自动清理垃圾
 cleanup() {
   [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
 }
@@ -89,18 +92,6 @@ is_valid_uuid() {
   [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]
 }
 
-is_valid_shortid() {
-  local len=${#1}
-  if [[ "$1" =~ ^[0-9a-fA-F]+$ ]] && (( len % 2 == 0 )) && (( len <= 16 )); then
-    return 0
-  fi
-  return 1
-}
-
-is_valid_domain() {
-  [[ "$1" =~ ^([a-zA-Z0-9](-?[a-zA-Z0-9])*\.)+[A-Za-z]{2,}$ ]]
-}
-
 get_arch() {
   local arch
   arch=$(uname -m)
@@ -127,8 +118,16 @@ get_latest_version() {
   fi
 }
 
+generate_self_signed_cert() {
+  local domain="$1"
+  mkdir -p "$CERT_DIR"
+  info "正在为桥接域名 [${domain}] 生成自签名 TLS 证书..."
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$KEY_FILE" -out "$CERT_FILE" -days 3650 -subj "/CN=${domain}" 2>/dev/null
+  chmod 644 "$CERT_FILE" "$KEY_FILE"
+}
+
 # =========================================================
-# 3. 从 GitHub 下载、编译解压与服务构建核心
+# 3. 从 GitHub 下载与服务构建核心
 # =========================================================
 download_and_extract_xray() {
   local arch version
@@ -165,7 +164,7 @@ setup_systemd_service() {
   info "配置 Systemd 本地守护进程 [${SERVICE_NAME}]..."
   cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
-Description=Xray VLESS-Encryption Reality Service
+Description=Xray VLESS-Encryption XTLS-Vision Service
 Documentation=https://github.com/XTLS/Xray-core
 After=network.target nss-lookup.target
 
@@ -204,14 +203,6 @@ get_xray_version() {
   fi
 }
 
-get_listen_ip() {
-  if sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null | grep -q '= 1'; then
-    echo "0.0.0.0"
-  else
-    echo "::"
-  fi
-}
-
 test_config() {
   if "$XRAY_BINARY" run -test -config "$XRAY_CONFIG" >/dev/null 2>&1; then
     return 0
@@ -233,7 +224,7 @@ restart_xray() {
 }
 
 # =========================================================
-# 4. 密钥动态解析与生成模块
+# 4. 后量子加密资产（VLESS-Encryption）生成模块
 # =========================================================
 generate_vless_encryption_config() {
   local vlessenc_output
@@ -278,64 +269,45 @@ generate_vless_encryption_config() {
   echo "${decryption_config}|${encryption_config}"
 }
 
-generate_reality_keys() {
-  local key_pair
-  key_pair=$($XRAY_BINARY x25519 2>/dev/null || true)
-  if [ -z "$key_pair" ]; then
-    error "生成 REALITY 密钥对失败！"
-    return 1
-  fi
-  local private_key=$(echo "$key_pair" | grep -i "Private" | sed 's/[[:space:]]//g' | cut -d':' -f2)
-  local public_key=$(echo "$key_pair" | grep -E -i "(Public|Password)" | sed 's/[[:space:]]//g' | cut -d':' -f2)
-  echo "${private_key}|${public_key}"
-}
-
 # =========================================================
-# 5. 配置文件读写与订阅渲染
+# 5. 配置文件与 XTLS-Vision 渲染
 # =========================================================
 write_config() {
   local port="$1"
   local uuid="$2"
-  local domain="$3"
-  local private_key="$4"
-  local shortid="$5"
-  local decryption="$6"
+  local decryption="$3"
+  local domain="$4"
 
-  local listen_ip
-  listen_ip=$(get_listen_ip)
   mkdir -p "$(dirname "$XRAY_CONFIG")"
 
-  # 原生使用 jq 构建精细配置架构，防止污染转义字符
+  # 核心：标准 TLS 运行环境 + 激活 xtls-rprx-vision + 后量子解密
   jq -n \
-    --arg listen_ip "$listen_ip" \
     --argjson port "$port" \
     --arg uuid "$uuid" \
     --arg decryption "$decryption" \
-    --arg private_key "$private_key" \
-    --arg sni "$domain" \
-    --arg short_id "$shortid" \
-    --arg flow "xtls-rprx-vision" \
+    --arg cert "$CERT_FILE" \
+    --arg key "$KEY_FILE" \
   '{
     "log": {"loglevel": "warning"},
     "inbounds": [{
-      "listen": $listen_ip,
+      "listen": "::",
       "port": $port,
       "protocol": "vless",
       "settings": {
-        "clients": [{"id": $uuid, "flow": $flow}],
+        "clients": [{
+          "id": $uuid,
+          "flow": "xtls-rprx-vision"
+        }],
         "decryption": $decryption
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": ($sni + ":443"),
-          "xver": 0,
-          "serverNames": [$sni],
-          "privateKey": $private_key,
-          "shortIds": [$short_id],
-          "fingerprint": "chrome"
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [{
+            "certificateFile": $cert,
+            "keyFile": $key
+          }]
         }
       },
       "sniffing": {
@@ -358,15 +330,11 @@ generate_link() {
     return 1
   fi
 
-  local uuid port domain shortid encryption public_key
+  local uuid port encryption
   uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null || echo "error")
   port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "443")
-  domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG" 2>/dev/null || echo "www.amazon.com")
-  shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG" 2>/dev/null || echo "")
-  
-  encryption=$(head -n 1 "$STATE_FILE" 2>/dev/null || echo "none")
-  local reality_info=$(cat "$REALITY_FILE" 2>/dev/null || echo "")
-  public_key=$(echo "$reality_info" | cut -d '|' -f1)
+  encryption=$(cat "$STATE_FILE" 2>/dev/null || echo "none")
+  local domain="www.bing.com"
 
   local display_ip="$ip"
   [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
@@ -376,7 +344,8 @@ generate_link() {
   [[ -z "$hostname" ]] && hostname="Xray"
 
   mkdir -p "$STATE_DIR"
-  echo "vless://${uuid}@${display_ip}:${port}?flow=xtls-rprx-vision&encryption=${encryption}&type=tcp&security=reality&sni=${domain}&fp=chrome&pbk=${public_key}&sid=${shortid}&spx=%2F#${hostname}-VLESS-Enc-Reality" > "$LINK_FILE"
+  # 生成同时包含后量子加密与 XTLS-Vision 的标准分享链接
+  echo "vless://${uuid}@${display_ip}:${port}?encryption=${encryption}&flow=xtls-rprx-vision&security=tls&sni=${domain}&type=tcp#${hostname}-Enc-Vision" > "$LINK_FILE"
 }
 
 show_current_config() {
@@ -385,35 +354,29 @@ show_current_config() {
     return
   fi
 
-  local ip uuid port domain shortid public_key outbound_mode encryption
+  local ip uuid port outbound_mode encryption
   ip=$(get_public_ip || echo "未知")
   uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
   port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
-  domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
-  shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG" 2>/dev/null || echo "无")
-  
-  encryption=$(head -n 1 "$STATE_FILE" 2>/dev/null || echo "未知")
-  local reality_info=$(cat "$REALITY_FILE" 2>/dev/null || echo "")
-  public_key=$(echo "$reality_info" | cut -d '|' -f1)
+  encryption=$(cat "$STATE_FILE" 2>/dev/null || echo "未知")
 
   local current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$XRAY_CONFIG" 2>/dev/null || echo "freedom")
   outbound_mode=$([[ "$current_protocol" == "socks" ]] && echo "Socks5 链式代理出口" || echo "直连 (Freedom)")
 
-  echo -e "${GREEN}====== VLESS-Encryption + Reality 节点配置 ======${RESET}"
-  echo -e "${YELLOW}服务器公网 IP : ${ip}${RESET}"
-  echo -e "${YELLOW}服务监听端口   : ${port}${RESET}"
-  echo -e "${YELLOW}用户 UUID      : ${uuid}${RESET}"
-  echo -e "${YELLOW}后量子加密形态 : ${encryption}${RESET}"
-  echo -e "${YELLOW}伪装 SNI 域名  : ${domain}${RESET}"
-  echo -e "${YELLOW}REALITY 公钥   : ${public_key}${RESET}"
-  echo -e "${YELLOW}REALITY ShortID: ${shortid}${RESET}"
-  echo -e "${YELLOW}当前出口模式   : ${outbound_mode}${RESET}"
+  echo -e "${GREEN}====== VLESS-Encryption + Vision 配置信息 ======${RESET}"
+  echo -e "${YELLOW}服务器公网 IP   : ${ip}${RESET}"
+  echo -e "${YELLOW}服务监听端口     : ${port}${RESET}"
+  echo -e "${YELLOW}用户 UUID        : ${uuid}${RESET}"
+  echo -e "${YELLOW}流控模式 (Flow)  : xtls-rprx-vision${RESET}"
+  echo -e "${YELLOW}安全传输 (Layer) : 标准 TLS (自签证书)${RESET}"
+  echo -e "${YELLOW}后量子客户端密钥 : ${encryption}${RESET}"
+  echo -e "${YELLOW}当前出口模式     : ${outbound_mode}${RESET}"
   echo
 
   if [[ -f "$LINK_FILE" ]]; then
-    echo -e "${GREEN}====== 👉 分享链接 ======${RESET}"
+    echo -e "${GREEN}====== 👉 v2rayN 分享链接 ======${RESET}"
     cat "$LINK_FILE"
-    echo "---------------------------------------------"
+    echo "--------------------------------------------------------"
   fi
 }
 
@@ -425,17 +388,12 @@ install_xray() {
   download_and_extract_xray || return 1
   setup_systemd_service
 
-  info "开始生成后量子 VLESS Encryption 密钥..."
+  info "开始静态提取后量子 VLESS Encryption 密钥..."
   local encryption_info=$(generate_vless_encryption_config) || return 1
   local decryption=$(echo "$encryption_info" | cut -d'|' -f1)
   local encryption=$(echo "$encryption_info" | cut -d'|' -f2)
 
-  info "开始生成 REALITY 密钥对..."
-  local reality_keys=$(generate_reality_keys) || return 1
-  local private_key=$(echo "$reality_keys" | cut -d'|' -f1)
-  local public_key=$(echo "$reality_keys" | cut -d'|' -f2)
-
-  local port uuid domain short_id
+  local port uuid domain="www.bing.com"
   while true; do
     read -rp "请输入监听端口 (回车随机分配): " input_port
     if [[ -z "$input_port" ]]; then
@@ -449,26 +407,12 @@ install_xray() {
   read -rp "请输入UUID (回车自动随机生成): " input_uuid
   uuid=${input_uuid:-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "7415d2b8-1454-4da8-963b-4663e8322851")}
 
-  while true; do
-    read -rp "请输入SNI伪装域名 (默认:www.amazon.com): " input_domain
-    domain=${input_domain:-www.amazon.com}
-    is_valid_domain "$domain" && break || error "域名格式错误"
-  done
-
-  while true; do
-    read -rp "请输入自定义 ShortID (回车自动生成 8 位字符): " input_shortid
-    if [[ -z "$input_shortid" ]]; then
-      short_id=$(openssl rand -hex 4); break
-    elif is_valid_shortid "$input_shortid"; then
-      short_id="$input_shortid"; break
-    else error "ShortID 必须为偶数位(≤16位)十六进制字符"; fi
-  done
+  generate_self_signed_cert "$domain"
 
   mkdir -p "$STATE_DIR"
   echo "$encryption" > "$STATE_FILE"
-  echo "${public_key}|${domain}|${short_id}" > "$REALITY_FILE"
 
-  write_config "$port" "$uuid" "$domain" "$private_key" "$short_id" "$decryption"
+  write_config "$port" "$uuid" "$decryption" "$domain"
   test_config || return 1
   generate_link
   restart_xray
@@ -477,7 +421,7 @@ install_xray() {
 
 update_xray() {
   if [[ ! -f "$XRAY_BINARY" ]]; then
-    error "当前未执行原生编译安装，无法升级！"
+    error "当前未执行原生安装，无法升级！"
     return 1
   fi
   info "正在平滑更新 Xray 核心..."
@@ -496,19 +440,12 @@ modify_config() {
     return 1
   fi
 
-  local old_port old_uuid old_domain private_key old_shortid old_decryption old_encryption
+  local old_port old_uuid old_decryption
   old_port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null)
   old_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null)
-  old_domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG" 2>/dev/null)
-  private_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$XRAY_CONFIG" 2>/dev/null)
-  old_shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG" 2>/dev/null)
   old_decryption=$(jq -r '.inbounds[0].settings.decryption' "$XRAY_CONFIG" 2>/dev/null)
-  
-  old_encryption=$(cat "$STATE_FILE" 2>/dev/null || echo "")
-  local reality_info=$(cat "$REALITY_FILE" 2>/dev/null || echo "")
-  local public_key=$(echo "$reality_info" | cut -d '|' -f1)
 
-  local port uuid domain shortid
+  local port uuid domain="www.bing.com"
   while true; do
     read -rp "请输入新端口 [当前:${old_port}, 回车保持不变]: " input_port
     if [[ -z "$input_port" ]]; then port="$old_port"; break
@@ -523,20 +460,7 @@ modify_config() {
   read -rp "请输入UUID [当前:${old_uuid}, 回车不修改]: " input_uuid
   uuid=${input_uuid:-$old_uuid}
 
-  while true; do
-    read -rp "请输入SNI域名 [当前:${old_domain}, 回车不修改]: " input_domain
-    domain=${input_domain:-$old_domain}
-    is_valid_domain "$domain" && break || error "域名格式错误"
-  done
-
-  while true; do
-    read -rp "请输入ShortID [当前:${old_shortid}, 回车不修改]: " input_shortid
-    shortid=${input_shortid:-$old_shortid}
-    is_valid_shortid "$shortid" && break || error "ShortID 必须为偶数位(≤16位)十六进制字符"
-  done
-
-  echo "${public_key}|${domain}|${shortid}" > "$REALITY_FILE"
-  write_config "$port" "$uuid" "$domain" "$private_key" "$shortid" "$old_decryption"
+  write_config "$port" "$uuid" "$old_decryption" "$domain"
   test_config || return 1
   generate_link
   restart_xray
@@ -555,8 +479,8 @@ configure_custom_socks5_outbound() {
   echo "---------------------------------------------"
   echo -e "当前分流出口路径: $( [[ "$current_protocol" == "socks" ]] && echo -e "${YELLOW}Socks5 代理出口${RESET}" || echo -e "${GREEN}直连本地 (Freedom)${RESET}" )"
   echo "1) 直连出口"
-  echo "2) Socks5 出口"
-  echo "0) 取消变更"
+  echo "2) 自定义Socks5出口"
+  echo "0) 取消"
   echo "---------------------------------------------"
 
   read -rp "请输入选项 [0-2]: " mode || true
@@ -581,7 +505,7 @@ configure_custom_socks5_outbound() {
     is_valid_port "$socks_port" && break || error "端口数值越界，请重新输入"
   done
 
-  read -rp "请输入 Socks5 认证账户 (若无明文账密认证请直接敲回车跳过): " socks_user || true
+  read -rp "请输入 Socks5 认证账户 (若无账密认证直接回车跳过): " socks_user || true
   if [[ -n "$socks_user" ]]; then
     read -rs -p "请输入 Socks5 认证密码: " socks_pass || true; echo
   else socks_pass=""; fi
@@ -599,52 +523,6 @@ configure_custom_socks5_outbound() {
 
   mv "$tmp_file" "$XRAY_CONFIG"; chmod 644 "$XRAY_CONFIG"
   restart_xray && info "已成功切换为 Socks5 出口！"
-}
-
-select_best_sni() {
-    info "开始优选 SNI 延迟测试"
-
-    local SNIS=(
-        amd.com apps.mzstatic.com aws.com azure.microsoft.com beacon.gtv-pub.com
-        bing.com catalog.gamepass.com cdn.bizibly.com cdn-dynmedia-1.microsoft.com
-        devblogs.microsoft.com fpinit.itunes.apple.com go.microsoft.com
-        gray-config-prod.api.arc-cdn.net gray.video-player.arcpublishing.com
-        images.nvidia.com r.bing.com services.digitaleast.mobi snap.licdn.com
-        statici.icloud.com tag.demandbase.com tag-logger.demandbase.com
-        ts1.tc.mm.bing.net ts2.tc.mm.bing.net vs.aws.amazon.com www.apple.com
-        www.icloud.com www.microsoft.com www.oracle.com www.xbox.com
-        www.xilinx.com xp.apple.com
-    )
-
-    local BEST_SNI=""
-    local BEST_TIME=999999
-
-    for sni in "${SNIS[@]}"; do
-        local start
-        start=$(date +%s%N)
-
-        if timeout 3 openssl s_client -connect "${sni}:443" -servername "${sni}" -brief </dev/null >/dev/null 2>&1; then
-            local end cost
-            end=$(date +%s%N)
-            cost=$(( (end - start) / 1000000 ))
-
-            echo "[SNI] $sni -> ${cost}ms"
-
-            if [ $cost -lt $BEST_TIME ]; then
-                BEST_TIME=$cost
-                BEST_SNI=$sni
-            fi
-        fi
-    done
-
-    if [ -n "$BEST_SNI" ]; then
-        info "最优 SNI: $BEST_SNI (${BEST_TIME}ms)"
-        echo "$BEST_SNI"
-        return 0
-    else
-        warn "未找到可用 SNI"
-        return 1
-    fi
 }
 
 uninstall_xray() {
@@ -672,24 +550,23 @@ show_menu() {
   [[ -f "$XRAY_CONFIG" ]] && port_show=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "-")
 
   echo -e "${GREEN}================================${RESET}"
-  echo -e "${GREEN}   Xray Encryption+Reality 面板   ${RESET}"
+  echo -e "${GREEN}    VLESS-Encryption 面板       ${RESET}"
   echo -e "${GREEN}================================${RESET}"
   echo -e "${GREEN}状态   :${RESET} $status"
   echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
   echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
   echo -e "${GREEN}================================${RESET}"
-  echo -e "${GREEN} 1. 安装 Encryption+Reality${RESET}" 
-  echo -e "${GREEN} 2. 更新 Encryption+Reality${RESET}"
-  echo -e "${GREEN} 3. 卸载 Encryption+Reality${RESET}"
+  echo -e "${GREEN} 1. 安装 VLESS-Encryption${RESET}" 
+  echo -e "${GREEN} 2. 更新 VLESS-Encryption${RESET}"
+  echo -e "${GREEN} 3. 卸载 VLESS-Encryption${RESET}"
   echo -e "${GREEN} 4. 修改配置${RESET}"
-  echo -e "${GREEN} 5. 启动 Encryption+Reality${RESET}"
-  echo -e "${GREEN} 6. 停止 Encryption+Reality${RESET}"
-  echo -e "${GREEN} 7. 重举 Encryption+Reality${RESET}"
-  echo -e "${GREEN} 8. 查看日志${RESET}"
+  echo -e "${GREEN} 5. 开启 VLESS-Encryption${RESET}"
+  echo -e "${GREEN} 6. 停止 VLESS-Encryption${RESET}"
+  echo -e "${GREEN} 7. 重启 VLESS-Encryption${RESET}"
+  echo -e "${GREEN} 8. 查看服务日志${RESET}"
   echo -e "${GREEN} 9. 查看节点配置${RESET}"
   echo -e "${GREEN}10. 配置Socks5出口${RESET}"
-  echo -e "${GREEN}11. SNI域名优选✨${RESET}"
-  echo -e "${GREEN}0. 退出${RESET}"
+  echo -e "${GREEN} 0. 退出${RESET}"
   echo -e "${GREEN}================================${RESET}"
 }
 
@@ -717,7 +594,7 @@ pre_check() {
     if ! command -v "$cmd" >/dev/null 2>&1; then missing=1; break; fi
   done
   if [[ "$missing" -eq 1 ]]; then
-    info "检测到当前环境缺少编译依赖，正在由本地软件源补全..."
+    info "检测到当前环境缺少依赖，正在由本地软件源补全..."
     install_dependencies
   fi
 }
@@ -741,7 +618,6 @@ main() {
       8) journalctl -u "${SERVICE_NAME}" -e --no-pager || true; pause ;;
       9) show_current_config; pause ;;
       10) configure_custom_socks5_outbound; pause ;;
-      11) select_best_sni; pause ;;
       0) exit 0 ;;
       *) error "无效输入"; pause ;;
     esac

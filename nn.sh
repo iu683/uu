@@ -1,467 +1,467 @@
 #!/usr/bin/env bash
 #
-# 多后端自动适配 Alpine Linux Socks5 管理面板 
+# V2Ray Socks5 核心 Alpine 专属管理面板 
 # SPDX-License-Identifier: MIT
 #
-# =========================================================
-# 1. 核心控制与全局环境初始化
-# =========================================================
+
 set -e
-export LANG=zh_CN.UTF-8
-
-# 基础目录与硬编码配置
-WORKDIR="${HOME:-/root}/Socks5"
-readonly PID_FILE="${WORKDIR}/s5.pid"
-readonly META_FILE="${WORKDIR}/meta.env"
-readonly CONFIG_S5="${WORKDIR}/config.json"
-readonly CONFIG_3PROXY="${WORKDIR}/3proxy.cfg"
-
-DEFAULT_PORT=1080
-PREFERRED_IMPLS=("microsocks" "3proxy" "s5")
-
-# 终端颜色代码
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-BLUE="\033[34m"
-CYAN="\033[36m"
-RESET="\033[0m"
+export LANG=en_US.UTF-8
 
 # =========================================================
-# 2. 官方原生底层工具函数与网络环境探测
+# 1. 配置文件和日志路径
 # =========================================================
-has_command() {
-  type -P "$1" > /dev/null 2>&1
-}
+WORKDIR="/etc/v2ray"
+CONFIG_FILE="/etc/v2ray/config.json"
+V2RAY_LOG="/var/log/v2ray/access.log"
+CREDENTIALS_FILE="/etc/v2ray/credentials.txt"
 
-info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
-error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
-pause() { read -r -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
+# 颜色定义
+GREEN="\033[0;32m"
+BLUE="\033[0;34m"
+RED="\033[0;31m"
+YELLOW="\033[0;33m"
+PURPLE="\033[0;35m"
+CYAN="\033[0;36m"
+WHITE="\033[1;37m"
+NC="\033[0m"
 
-ensure_workdir() {
-  mkdir -p "${WORKDIR}"
-  chmod 700 "${WORKDIR}"
-}
-
-random_port() {
-  # 兼容 Alpine (BusyBox) 的 awk 随机数发生器
-  awk 'BEGIN{srand(); print int(rand()*(60000-20000+1))+20000}'
-}
-
-random_user() {
-  echo "s5_$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 6)"
-}
-
-random_pass() {
-  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12 || echo "s5pass123"
-}
-
-get_best_ip() {
-  local ip
-  for svc in "https://api.ipify.org" "https://ifconfig.me" "https://ipinfo.io/ip"; do
-    ip=$(curl -s --max-time 5 "$svc" || wget -T 5 -qO- "$svc" || true)
-    ip=$(echo "$ip" | tr -d '[:space:]')
-    if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      echo "$ip"
-      return 0
+# =========================================================
+# 2. 基础辅助与探测工具函数
+# =========================================================
+check_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "${RED}错误: 请使用root权限运行此脚本!${NC}"
+        exit 1
     fi
-  done
-  echo "127.0.0.1"
 }
 
+pause() { 
+    read -r -n 1 -s -r -p "按任意键返回菜单..." || true
+    echo 
+}
+
+# 生成随机端口(1024-65535)
+generate_random_port() {
+    echo $(( (RANDOM % 64511) + 1024 ))
+}
+
+# 生成随机用户名和密码
+generate_random_credentials() {
+    local username=$(head /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 8)
+    local password=$(head /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 12)
+    echo "$username:$password"
+}
+
+get_public_ip() {
+    local ip
+    for svc in "https://api.ipify.org" "https://ifconfig.me" "https://ipinfo.io/ip"; do
+        ip=$(curl -s --max-time 5 "$svc" || wget -T 5 -qO- "$svc" || true)
+        ip=$(echo "$ip" | tr -d '[:space:]')
+        if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    echo "127.0.0.1"
+}
+
+# 纯 awk URL 编码器（兼容 Alpine 极简环境）
 urlencode() {
-  local s="$1"
-  if has_command python3; then
-    python3 -c "import sys,urllib.parse as u; print(u.quote(sys.argv[1], safe=''))" "$s"
-  else
-    # 纯 shell 托底转换
+    local s="$1"
     echo -n "$s" | awk 'BEGIN {
-      for (i = 0; i <= 255; i++) ord[sprintf("%c", i)] = i
+        for (i = 0; i <= 255; i++) ord[sprintf("%c", i)] = i
     }
     {
-      encoded = ""
-      for (i = 1; i <= length($0); i++) {
-        c = substr($0, i, 1)
-        if (c ~ /[a-zA-Z0-9_.~-]/) encoded = encoded c
-        else encoded = encoded sprintf("%%%02X", ord[c])
-      }
-      print encoded
+        encoded = ""
+        for (i = 1; i <= length($0); i++) {
+            c = substr($0, i, 1)
+            if (c ~ /[a-zA-Z0-9_.~-]/) encoded = encoded c
+            else encoded = encoded sprintf("%%%02X", ord[c])
+        }
+        print encoded
     }'
-  fi
 }
 
-# =========================================================
-# 3. 后端组件检测与多包管理器自动安装
-# =========================================================
-detect_existing_impl() {
-  for impl in "${PREFERRED_IMPLS[@]}"; do
-    if has_command "${impl}"; then echo "${impl}"; return 0; fi
-  done
-  echo ""
-}
-
-try_install_package() {
-  local pkg_name="$1"
-  info "正在尝试通过 apk 包管理器部署相关组件: ${pkg_name}..."
-  if has_command apk; then
-    apk update >/dev/null 2>&1
-    apk add --no-cache "${pkg_name}" >/dev/null 2>&1 && return 0
-  fi
-  return 1
-}
-
-# =========================================================
-# 4. 核心配置文件与守护进程服务生成
-# =========================================================
-generate_backend_config() {
-  case "${BIN_TYPE}" in
-    3proxy)
-      cat << EOF > "${CONFIG_3PROXY}"
-daemon
-maxconn 100
-nserver 8.8.8.8
-nserver 1.1.1.1
-timeouts 1 5 30 60 180 1800 15 60
-users ${USERNAME}:CL:${PASSWORD}
-auth strong
-allow ${USERNAME}
-socks -p${PORT}
-EOF
-      chmod 600 "${CONFIG_3PROXY}"
-      ;;
-    s5)
-      cat << EOF > "${CONFIG_S5}"
-{
-  "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
-  "inbounds": [{
-    "port": ${PORT},
-    "protocol": "socks",
-    "tag": "socks",
-    "settings": {
-      "auth": "password",
-      "udp": false,
-      "ip": "0.0.0.0",
-      "userLevel": 0,
-      "accounts": [{"user": "${USERNAME}", "pass": "${PASSWORD}"}]
-    }
-  }],
-  "outbounds": [{"tag": "direct", "protocol": "freedom"}]
-}
-EOF
-      chmod 600 "${CONFIG_S5}"
-      ;;
-  esac
-}
-
-create_start_script() {
-  cat << 'EOF' > "${WORKDIR}/start.sh"
-#!/usr/bin/env bash
-WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -f "${WORKDIR}/meta.env" ]; then
-  source "${WORKDIR}/meta.env"
-else
-  echo "核心环境配置文件 meta.env 丢失"
-  exit 1
-fi
-
-# 写入当前脚本的 PID 以便 Alpine 精准追踪状态
-echo "$$" > "${WORKDIR}/s5.pid"
-
-case "$BIN_TYPE" in
-  3proxy)     exec 3proxy "${WORKDIR}/3proxy.cfg" ;;
-  s5)         exec s5 -c "${WORKDIR}/config.json" ;;
-  microsocks) exec microsocks -i 0.0.0.0 -p "$PORT" -u "$USERNAME" -P "$PASSWORD" ;;
-  *)          echo "未知的 Socks5 底层实现引擎类型: $BIN_TYPE"; exit 1 ;;
-esac
-EOF
-  chmod +x "${WORKDIR}/start.sh"
-}
-
-save_meta() {
-  cat << EOF > "${META_FILE}"
-PORT='${PORT}'
-USERNAME='${USERNAME}'
-PASSWORD='${PASSWORD}'
-BIN_TYPE='${BIN_TYPE}'
-EOF
-  chmod 600 "${META_FILE}"
-}
-
-load_meta() {
-  if [ -f "${META_FILE}" ]; then
-    # shellcheck disable=SC1090
-    source "${META_FILE}"
-  else
-    PORT=""
-    USERNAME=""
-    PASSWORD=""
-    BIN_TYPE=""
-  fi
-}
-
-get_runtime_pid() {
-  local saved_pid=""
-  if [ -f "${PID_FILE}" ]; then
-    saved_pid=$(cat "${PID_FILE}" 2>/dev/null)
-  fi
-  # 验证 PID 对应进程是否依然存活，且属于当前的代理后端
-  if [[ -n "$saved_pid" ]] && kill -0 "$saved_pid" 2>/dev/null; then
-    echo "$saved_pid"
-  else
-    # 模糊兜底扫描
-    local fallback_pid=""
-    fallback_pid=$(ps -ef 2>/dev/null | grep -E 'start.sh|microsocks|3proxy|s5 -c' | grep -v grep | awk '{print $1}' | head -n 1)
-    echo "$fallback_pid"
-  fi
-}
-
-check_port_listening() {
-  local check_port=$1
-  if [[ -n "$check_port" ]]; then
-    netstat -an 2>/dev/null | grep -E "[:\.]${check_port} " | grep -i "listen"
-  fi
-}
-
-# =========================================================
-# 5. 主流程控制模块（安装、更新、修改、卸载）
-# =========================================================
-write_and_start_service() {
-  ensure_workdir
-  save_meta
-  generate_backend_config
-  create_start_script
-
-  # 强杀历史进程
-  stop_service_internal
-
-  # 挂载 Alpine 专属后台独立守护池中运行
-  nohup "${WORKDIR}/start.sh" >/dev/null 2>&1 &
-  sleep 1.5
-
-  local active_pid
-  active_pid=$(get_runtime_pid)
-  local is_listen
-  is_listen=$(check_port_listening "$PORT")
-
-  if [[ -n "$active_pid" || -n "$is_listen" ]]; then
-    info "Socks5 核心服务配置并启动成功！"
-  else
-    error "Socks5 服务启动失败，请检查端口是否冲突或查看本地进程日志。"
-  fi
-  showconf
-}
-
-stop_service_internal() {
-  local active_pid
-  active_pid=$(get_runtime_pid)
-  if [[ -n "$active_pid" ]]; then
-    kill -9 "$active_pid" >/dev/null 2>&1 || true
-  fi
-  # 深度强杀可能残留的分支后端进程
-  pkill -9 -f "${WORKDIR}/start.sh" >/dev/null 2>&1 || true
-  pkill -9 -x microsocks >/dev/null 2>&1 || true
-  pkill -9 -x 3proxy >/dev/null 2>&1 || true
-  pkill -9 -x s5 >/dev/null 2>&1 || true
-  rm -f "${PID_FILE}"
-}
-
-inst_socks5() {
-  ensure_workdir
-  
-  local exist_impl
-  exist_impl="$(detect_existing_impl || true)"
-  if [ -n "${exist_impl}" ]; then
-    info "当前 Alpine 系统已存在可用组件实现: ${YELLOW}${exist_impl}${RESET}"
-    BIN_TYPE="${exist_impl}"
-  else
-    warn "未检测到内置的代理实现，开始尝试自动拉取 Alpine 原生轻量组件..."
-    if try_install_package "microsocks"; then
-      BIN_TYPE="microsocks"
-    elif try_install_package "3proxy"; then
-      BIN_TYPE="3proxy"
+# 从 config.json 精准动态反查当前配置
+load_current_config() {
+    if [ -f "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
+        CURRENT_PORT=$(jq -r '.inbounds[0].port' "$CONFIG_FILE" 2>/dev/null || echo "")
+        CURRENT_USER=$(jq -r '.inbounds[0].settings.accounts[0].user' "$CONFIG_FILE" 2>/dev/null || echo "")
+        CURRENT_PASS=$(jq -r '.inbounds[0].settings.accounts[0].pass' "$CONFIG_FILE" 2>/dev/null || echo "")
     else
-      error "未能通过 apk 自动部署代理组件。请执行 'apk add microsocks' 后重新运行此脚本。"
-      return 1
+        CURRENT_PORT=""
+        CURRENT_USER=""
+        CURRENT_PASS=""
     fi
-  fi
-
-  local rand_user rand_pass rand_port
-  rand_user="$(random_user)"
-  rand_pass="$(random_pass)"
-  rand_port=$(random_port)
-
-  echo "---------------------------------------------"
-  while true; do
-    read -rp "👉 请输入监听端口 (默认随机: ${rand_port}): " input_port
-    PORT=${input_port:-$rand_port}
-    if ! [[ "${PORT}" =~ ^[0-9]+$ ]] || [ "${PORT}" -lt 1 ] || [ "${PORT}" -gt 65535 ]; then
-      warn "端口输入无效，请输入 1-65535 之间的数字。"
-      continue
-    fi
-    # 适配 Alpine (BusyBox) 的网络占用排查
-    if [[ -n $(check_port_listening "$PORT") ]]; then
-      error "${PORT} 端口已经被其他程序占用，请更换端口重试。"
-      rand_port=$(random_port)
-      continue
-    fi
-    break
-  done
-
-  read -rp "👉 请设置用户名 (默认随机: ${rand_user}): " input_user
-  USERNAME=${input_user:-$rand_user}
-
-  read -rp "👉 请设置密码 (默认随机: ${rand_pass}): " input_pass
-  PASSWORD=${input_pass:-$rand_pass}
-
-  write_and_start_service
 }
 
-changeconf() {
-  load_meta
-  if [ -z "${BIN_TYPE}" ]; then
-    BIN_TYPE="$(detect_existing_impl || true)"
-  fi
-  if [ -z "${BIN_TYPE}" ]; then
-    error "未找到有效的底层服务组件，请先执行选项 1 进行安装。"
-    return 1
-  fi
-
-  clear
-  echo -e "${GREEN}====== 修改 Socks5 节点配置 ======${RESET}"
-  echo "提示：直接敲回车将保持原有配置不变"
-  echo "---------------------------------------------"
-
-  local input_port input_user input_pass
-  
-  while true; do
-    read -rp "👉 请输入新的监听端口 [当前: ${PORT:-1080}]: " input_port
-    if [ -n "$input_port" ]; then
-      if [[ "${input_port}" =~ ^[0-9]+$ ]] && [ "${input_port}" -ge 1 ] && [ "${input_port}" -le 65535 ]; then
-        if [[ "$input_port" != "$PORT" && -n $(check_port_listening "$input_port") ]]; then
-          error "${input_port} 端口已被其他程序占用，请更换端口。"
-          continue
-        fi
-        PORT="${input_port}"
-      else
-        warn "输入端口格式不合法，保留原端口不变。"
-      fi
+# 检查本地端口监听状态
+check_port_listening() {
+    local port=$1
+    if [[ -n "$port" ]]; then
+        netstat -an 2>/dev/null | grep -E "[:\.]${port} " | grep -i "listen"
     fi
-    break
-  done
-
-  read -rp "👉 请设置新的用户名 [当前: ${USERNAME:-unset}]: " input_user
-  USERNAME=${input_user:-$USERNAME}
-
-  read -rp "👉 请设置新的密码 [当前: ${PASSWORD:-unset}]: " input_pass
-  PASSWORD=${input_pass:-$PASSWORD}
-
-  write_and_start_service
 }
 
-uninstall_socks5() {
-  warn "即将从当前 Alpine 系统中彻底卸载并清理 Socks5 服务..."
-  stop_service_internal
-  rm -rf "${WORKDIR}"
-  info "Socks5 全套配置文件及后台进程已经彻底移除！"
+# 验证V2Ray是否正确安装
+verify_v2ray() {
+    if ! command -v v2ray >/dev/null 2>&1; then
+        return 1
+    fi
+    if ! [ -f /etc/init.d/v2ray ]; then
+        return 1
+    fi
+    return 0
 }
 
-showconf() {
-  load_meta
-  if [ -z "${PORT}" ]; then
-    error "未找到任何可用的元配置文件，请确认服务已成功初始化。"
-    return 1
-  fi
-
-  local ip enc_user enc_pass enc_ip socksurl tlink
-  ip="$(get_best_ip)"
-  enc_user="$(urlencode "${USERNAME}")"
-  enc_pass="$(urlencode "${PASSWORD}")"
-  enc_ip="$(urlencode "${ip}")"
-
-  socksurl="socks://${USERNAME}:${PASSWORD}@${ip}:${PORT}"
-  tlink="https://t.me/socks?server=${enc_ip}&port=${PORT}&user=${enc_user}&pass=${enc_pass}"
-
-  echo -e "${GREEN}====== Socks5 配置 ======${RESET}"
-  echo -e "${YELLOW}● 客户端直连格式:${RESET} ${socksurl}"
-  echo -e "${YELLOW}● Telegram 快捷链接:${RESET} ${tlink}"
-  echo
+# 动态获取 V2Ray 版本号
+get_v2ray_version() {
+    if verify_v2ray; then
+        local ver_output
+        ver_output=$(v2ray -version 2>/dev/null | head -n 1 | awk '{print $2}')
+        echo "v2ray-core ${ver_output:-已安装}"
+    else
+        echo "v2ray-core (未安装)"
+    fi
 }
 
 # =========================================================
-# 6. 面板主菜单
+# 3. 依赖部署模块
+# =========================================================
+install_dependencies() {
+    echo -e "${BLUE}正在检查并安装依赖项...${NC}"
+    
+    # 更新软件包索引
+    if ! apk update; then
+        echo -e "${RED}警告: 更新软件包索引失败，将尝试直接拉取组件...${NC}"
+    fi
+    
+    # 安装基本工具
+    echo -e "${BLUE}安装基础工具...${NC}"
+    if ! apk add --no-cache curl jq openrc; then
+        echo -e "${RED}错误: 安装基础工具失败${NC}"
+        return 1
+    fi
+    
+    # 安装V2Ray
+    echo -e "${BLUE}安装V2Ray...${NC}"
+    if ! apk add --no-cache v2ray; then
+        echo -e "${RED}错误: 安装V2Ray失败。请检查系统网络或内存。${NC}"
+        return 1
+    fi
+    
+    # 创建必要的目录
+    mkdir -p /etc/v2ray
+    mkdir -p /var/log/v2ray
+    
+    # 检查V2Ray服务是否存在，不存在则手动创建
+    if ! ls /etc/init.d/v2ray >/dev/null 2>&1; then
+        echo -e "${YELLOW}找不到标准服务文件，正在手动注入 OpenRC 托管脚本...${NC}"
+        
+        cat > /etc/init.d/v2ray << 'EOF'
+#!/sbin/openrc-run
+
+name="V2Ray"
+description="V2Ray Service"
+command="/usr/bin/v2ray"
+command_args="run -config /etc/v2ray/config.json"
+pidfile="/var/run/v2ray.pid"
+command_background="yes"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath -d -m 0755 -o root:root /var/log/v2ray
+}
+EOF
+        chmod +x /etc/init.d/v2ray
+    fi
+    
+    # 启用V2Ray服务
+    rc-update add v2ray default >/dev/null 2>&1 || true
+    echo -e "${GREEN}依赖及核心组件安装完成${NC}"
+    return 0
+}
+
+# =========================================================
+# 4. 配置写入与凭据存储模块
+# =========================================================
+save_credentials() {
+    local port=$1
+    local username=$2
+    local password=$3
+    
+    echo "端口: $port" > "$CREDENTIALS_FILE"
+    echo "用户名: $username" >> "$CREDENTIALS_FILE"
+    echo "密码: $password" >> "$CREDENTIALS_FILE"
+    chmod 600 "$CREDENTIALS_FILE"
+}
+
+configure_v2ray() {
+    local port=$1
+    local username=$2
+    local password=$3
+    
+    mkdir -p /etc/v2ray
+    
+    cat > "$CONFIG_FILE" << EOF
+{
+  "log": {
+    "access": "/var/log/v2ray/access.log",
+    "error": "/var/log/v2ray/error.log",
+    "loglevel": "info"
+  },
+  "inbounds": [
+    {
+      "port": $port,
+      "protocol": "socks",
+      "settings": {
+        "auth": "password",
+        "accounts": [
+          {
+            "user": "$username",
+            "pass": "$password"
+          }
+        ],
+        "udp": true
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {}
+    }
+  ]
+}
+EOF
+    save_credentials "$port" "$username" "$password"
+}
+
+# =========================================================
+# 5. 主流程控制模块
+# =========================================================
+
+# 流程 1：全新的纯净安装
+action_install() {
+    if verify_v2ray &>/dev/null; then
+        echo -e "${YELLOW}提示: 检测到系统中已安装 V2Ray 核心。如果需要调整参数，请使用选项 2 [修改配置]。${NC}"
+        return 0
+    fi
+
+    if ! install_dependencies; then
+        echo -e "${RED}核心部件部署失败，无法继续。${NC}"
+        return 1
+    fi
+
+    echo -e "${PURPLE}====== 开始初始化 V2Ray Socks5 配置 ======${NC}"
+    
+    local final_port default_p
+    default_p=$(generate_random_port)
+    while true; do
+        read -r -p "👉 请输入监听端口 (回车随机: ${default_p}): " input_port
+        final_port=${input_port:-$default_p}
+        if ! [[ "${final_port}" =~ ^[0-9]+$ ]] || [ "${final_port}" -lt 1 ] || [ "${final_port}" -gt 65535 ]; then
+            echo -e "${RED}端口格式不合法，请输入 1-65535 的数字。${NC}"
+            continue
+        fi
+        if [[ -n $(check_port_listening "$final_port") ]]; then
+            echo -e "${RED}${final_port} 端口已被系统其他程序占用，请更换端口。${NC}"
+            default_p=$(generate_random_port)
+            continue
+        fi
+        break
+    done
+
+    local raw_creds default_user default_pass
+    raw_creds=$(generate_random_credentials)
+    default_user=$(echo "$raw_creds" | cut -d':' -f1)
+    default_pass=$(echo "$raw_creds" | cut -d':' -f2)
+
+    read -r -p "👉 请设置用户名 (回车随机: ${default_user}): " final_user
+    final_user=${final_user:-$default_user}
+
+    read -r -p "👉 请设置密码 (回车随机: ${default_pass}): " final_pass
+    final_pass=${final_pass:-$default_pass}
+
+    configure_v2ray "$final_port" "$final_user" "$final_pass"
+    
+    echo -e "${BLUE}正在调动 OpenRC 唤醒服务...${NC}"
+    rc-service v2ray restart >/dev/null 2>&1 || ./etc/init.d/v2ray restart >/dev/null 2>&1 || true
+    sleep 1.5
+    
+    echo -e "${GREEN}🎉 V2Ray 安装并配置成功！${NC}"
+    show_config_links
+}
+
+# 流程 2：独立的配置修改
+action_modify_config() {
+    if ! verify_v2ray &>/dev/null; then
+        echo -e "${RED}错误: 系统尚未安装 V2Ray 核心，请先执行选项 1 进行安装！${NC}"
+        return 1
+    fi
+
+    load_current_config
+    echo -e "${PURPLE}====== 修改 V2Ray Socks5 配置 ======${NC}"
+    echo -e "${CYAN}提示：直接敲回车将完全保持原有参数不变${NC}"
+    echo "--------------------------------------------"
+
+    local final_port input_port
+    while true; do
+        read -r -p "👉 请输入新的监听端口 [当前: ${CURRENT_PORT:-1080}]: " input_port
+        if [ -z "$input_port" ]; then
+            final_port=$CURRENT_PORT
+            break
+        fi
+        if [[ "${input_port}" =~ ^[0-9]+$ ]] && [ "${input_port}" -ge 1 ] && [ "${input_port}" -le 65535 ]; then
+            if [[ "$input_port" != "$CURRENT_PORT" && -n $(check_port_listening "$input_port") ]]; then
+                echo -e "${RED}${input_port} 端口已被其他程序占用，请换用其他端口。${NC}"
+                continue
+            fi
+            final_port="${input_port}"
+            break
+        else
+            echo -e "${RED}输入端口格式不合法，请输入 1-65535 之间的纯数字。${NC}"
+        fi
+    done
+
+    local input_user final_user
+    read -r -p "👉 请设置新的用户名 [当前: ${CURRENT_USER:-未设置}]: " input_user
+    final_user=${input_user:-$CURRENT_USER}
+
+    local input_pass final_pass
+    read -r -p "👉 请设置新的密码 [当前: ${CURRENT_PASS:-未设置}]: " input_pass
+    final_pass=${input_pass:-$CURRENT_PASS}
+
+    configure_v2ray "$final_port" "$final_user" "$final_pass"
+    
+    echo -e "${BLUE}正在重载服务使新配置生效...${NC}"
+    rc-service v2ray restart >/dev/null 2>&1 || ./etc/init.d/v2ray restart >/dev/null 2>&1 || true
+    sleep 1.5
+    
+    echo -e "${GREEN}修改成功！新参数已即时应用。${NC}"
+    show_config_links
+}
+
+show_config_links() {
+    load_current_config
+    if [ -z "$CURRENT_PORT" ]; then
+        echo -e "${RED}未检测到合法的 V2Ray 节点配置。${NC}"
+        return 1
+    fi
+    local ip=$(get_public_ip)
+    
+    # 转换各种参数做标准的 URL 安全转义
+    local enc_ip enc_port enc_user enc_pass
+    enc_ip=$(urlencode "$ip")
+    enc_port="$CURRENT_PORT"
+    enc_user=$(urlencode "$CURRENT_USER")
+    enc_pass=$(urlencode "$CURRENT_PASS")
+
+    local直连格式="socks://${CURRENT_USER}:${CURRENT_PASS}@${ip}:${CURRENT_PORT}"
+    local tg快捷链="https://t.me/socks?server=${enc_ip}&port=${enc_port}&user=${enc_user}&pass=${enc_pass}"
+
+    echo -e "${GREEN}====== Socks5 当前配置详情 ======${NC}"
+    echo -e "${YELLOW}● 节点 IP :${NC} ${ip}"
+    echo -e "${YELLOW}● 端口号  :${NC} ${CURRENT_PORT}"
+    echo -e "${YELLOW}● 用户名  :${NC} ${CURRENT_USER}"
+    echo -e "${YELLOW}● 认证密码:${NC} ${CURRENT_PASS}"
+    echo "--------------------------------------------"
+    echo -e "${YELLOW}● 客户端直连格式:${NC}\n  ${直连格式}"
+    echo -e "${YELLOW}● Telegram 一键导入链接:${NC}\n  ${tg快捷链}"
+    echo
+}
+
+uninstall_v2ray() {
+    echo -e "${YELLOW}正在从 Alpine 系统卸载 V2Ray 及其所有关联配置...${NC}"
+    rc-service v2ray stop >/dev/null 2>&1 || true
+    rc-update del v2ray default >/dev/null 2>&1 || true
+    rm -f /etc/init.d/v2ray
+    apk del v2ray || true
+    rm -rf "$WORKDIR"
+    rm -rf /var/log/v2ray
+    echo -e "${GREEN}V2Ray 已经彻底从系统中移除！${NC}"
+}
+
+# =========================================================
+# 6. 面板主菜单循环
 # =========================================================
 menu() {
-  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
-  ensure_workdir
-
-  while true; do
-    clear
-    load_meta
+    check_root
     
-    local status_display active_pid is_listen
-    active_pid=$(get_runtime_pid)
-    is_listen=$(check_port_listening "$PORT")
-
-    if [[ -n "$active_pid" || -n "$is_listen" ]]; then
-      status_display="${GREEN}● 运行中 (Alpine 独立进程池)${RESET}"
-    else
-      status_display="${RED}● 未运行${RESET}"
-    fi
-
-    local port_display="${PORT:- -}"
-    local engine_display="${BIN_TYPE:-未检测到底层安装}"
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     Socks5 Alpine 管理面板     ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} ${status_display}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_display}${RESET}"
-    echo -e "${GREEN}实现   :${RESET} ${CYAN}${engine_display}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Socks5${RESET}"
-    echo -e "${GREEN}2. 修改配置${RESET}"
-    echo -e "${GREEN}3. 卸载 Socks5${RESET}"
-    echo -e "${GREEN}4. 启动 Socks5${RESET}"
-    echo -e "${GREEN}5. 停止 Socks5${RESET}"
-    echo -e "${GREEN}6. 重启 Socks5${RESET}"
-    echo -e "${GREEN}8. 查看连接配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-
-    local choice=""
-    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
-    [[ -z "$choice" ]] && continue
-
-    case "$choice" in
-      1) inst_socks5; pause ;;
-      2) changeconf; pause ;;
-      3) uninstall_socks5; pause ;;
-      4)
-        if [[ -n $(get_runtime_pid) || -n $(check_port_listening "$PORT") ]]; then
-          yellow_echo "Socks5 服务已经在运行中。"
+    while true; do
+        clear
+        load_current_config
+        
+        # 1. 精准获取当前状态
+        local status_display="${RED}● 已停止${NC}"
+        if ! verify_v2ray &>/dev/null; then
+            status_display="${RED}● 未安装核心${NC}"
         else
-          nohup "${WORKDIR}/start.sh" >/dev/null 2>&1 &
-          sleep 1
-          info "进程已在后台独立进程池中拉起！"
+            if rc-service v2ray status 2>/dev/null | grep -qi "started" || [ -n "$(check_port_listening "$CURRENT_PORT")" ]; then
+                status_display="${GREEN}● 运行中 (OpenRC)${NC}"
+            fi
         fi
-        pause ;;
-      5)
-        stop_service_internal
-        info "后台代理程序已终止！"
-        pause ;;
-      6)
-        stop_service_internal
-        sleep 1
-        nohup "${WORKDIR}/start.sh" >/dev/null 2>&1 &
-        sleep 1
-        info "后台独立进程已重载刷新！"
-        pause ;;
-      8) showconf; pause ;;
-      0) exit 0 ;;
-      *) error "未识别的无效指令，请重新进行选择。"; sleep 1 ;;
-    esac
-  done
+
+        # 2. 动态显示端口和实现
+        local port_display="${CURRENT_PORT:- -}"
+        local engine_display
+        engine_display=$(get_v2ray_version)
+        
+        echo -e "${GREEN}================================${NC}"
+        echo -e "${GREEN}    V2Ray Socks5 Alpine 面板     ${NC}"
+        echo -e "${GREEN}================================${NC}"
+        echo -e "${GREEN}状态   :${NC} ${status_display}"
+        echo -e "${GREEN}版本   :${NC} ${CYAN}${engine_display}${NC}"
+        echo -e "${GREEN}端口   :${NC} ${YELLOW}${port_display}${NC}"
+        echo -e "${GREEN}================================${NC}"
+        echo -e "${GREEN}1. 安装 V2Ray${NC}"
+        echo -e "${GREEN}2. 修改配置${NC}"
+        echo -e "${GREEN}3. 卸载 V2Ray${NC}"
+        echo -e "${GREEN}4. 启动 V2Ray${NC}"
+        echo -e "${GREEN}5. 停止 V2Ray${NC}"
+        echo -e "${GREEN}6. 重启 V2Ray${NC}"
+        echo -e "${GREEN}7. 查看运行日志${NC}"
+        echo -e "${GREEN}8. 查看连接配置${NC}"
+        echo -e "${GREEN}0. 退出${NC}"
+        echo -e "${GREEN}================================${NC}"
+
+        local choice=""
+        read -r -p "$(echo -e "${GREEN}请输入选项: ${NC}")" choice || true
+        [[ -z "$choice" ]] && continue
+
+        case "$choice" in
+            1) clear; action_install; pause ;;
+            2) clear; action_modify_config; pause ;;
+            3)
+                clear
+                if ! verify_v2ray &>/dev/null; then echo -e "${RED}请先执行选项 1 安装核心！${NC}"; else rc-service v2ray start; echo -e "${GREEN}启动指令已执行。${NC}"; fi
+                pause ;;
+            4)
+                clear
+                if ! verify_v2ray &>/dev/null; then echo -e "${RED}服务未安装！${NC}"; else rc-service v2ray stop; echo -e "${GREEN}停止指令已执行。${NC}"; fi
+                pause ;;
+            5)
+                clear
+                if ! verify_v2ray &>/dev/null; then echo -e "${RED}服务未安装！${NC}"; else rc-service v2ray restart; echo -e "${GREEN}重启指令已执行。${NC}"; fi
+                pause ;;
+            6)
+                clear
+                if [ -f "$V2RAY_LOG" ]; then
+                    echo -e "${PURPLE}=== 最新 50 行访问日志 ===${NC}"
+                    tail -n 50 "$V2RAY_LOG"
+                else
+                    echo -e "${YELLOW}暂无可用访问日志或未产生流量。${NC}"
+                fi
+                pause ;;
+            7|8) clear; show_config_links; pause ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选项，请重新选择！${NC}"; sleep 1 ;;
+        esac
+    done
 }
 
 menu "$@"

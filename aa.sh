@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Sing-box (VMess + WS) Alpine 专属核心控制面板 - V3 (彻底修复版)
+# Sing-box (NaiveProxy) Alpine 专属管理面板 (修复版)
 # SPDX-License-Identifier: MIT
 #
 # =========================================================
@@ -12,8 +12,7 @@ export LANG=en_US.UTF-8
 # 基础目录与硬编码配置
 readonly SB_CONFIG="/etc/sing-box/config.json"
 readonly SB_BINARY="/usr/local/bin/sing-box"
-readonly SB_DIR="/root/vmessws"
-readonly STATE_FILE="/etc/vmessws-singbox.env"
+readonly SB_DIR="/root/NaiveProxy"
 EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
 INIT_SERVICE_DIR="/etc/init.d"
 CONFIG_DIR="/etc/sing-box"
@@ -21,11 +20,11 @@ REPO_URL="https://github.com/SagerNet/sing-box"
 API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
 CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
 
-# 自动检测环境与动态变量池
+# 自动检测环境变量
 OPERATING_SYSTEM="linux"
-ARCHITECTURE=""
+ARCHITECTURE="${ARCHITECTURE:-}"
 
-# 终端规范颜色代码
+# 终端颜色代码
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
@@ -54,7 +53,7 @@ warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
 error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
 pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
 
-# OpenRC 服务状态与操作封装
+# OpenRC 服务操作封装
 rc_service() {
   if ! has_command rc-service; then
     return 1
@@ -79,7 +78,6 @@ install_content() {
   if [[ -z "$_overwrite" && -e "$_destination" ]]; then
     echo -e "已存在"
   else
-    # 【彻底修复】放弃 install 级联指令，用最稳妥的原生组合拳创建
     if mkdir -p "$(dirname "$_destination")" && echo "$_content" > "$_destination" && chmod "$_perms" "$_destination"; then
       echo -e "完成"
     else
@@ -118,13 +116,18 @@ check_environment() {
     *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
   esac
 
-  # 确保 Alpine 环境具备基本工具
+  # 确保 Alpine 环境具备基本依赖与 glibc 兼容层
   has_command bash || install_software bash
   has_command curl || install_software curl
   has_command grep || install_software grep
   has_command jq || install_software jq
   has_command tar || install_software tar
-  has_command python3 || install_software python3
+  
+  # 关键修复：Alpine 必须安装 gcompat 才能运行官方 Sing-box 二进制文件
+  if ! apk info -e gcompat >/dev/null 2>&1; then
+    info "检测到缺少 glibc 运行环境，正在安装 gcompat 兼容层..."
+    install_software gcompat
+  fi
 }
 
 get_installed_version() {
@@ -134,7 +137,7 @@ get_installed_version() {
     if [[ -n "$version_out" ]]; then
       echo "$version_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' | head -n 1 || echo "未知格式"
     else
-      echo "未知版本"
+      echo "未知版本(请尝试安装gcompat)"
     fi
   else
     echo "未安装"
@@ -159,34 +162,26 @@ get_latest_version() {
 }
 
 download_singbox() {
-  local version="$1"
-  local dest_file="$2"
-  local ver_num="${version#v}"
-  local filename="sing-box-${ver_num}-${OPERATING_SYSTEM}-${ARCHITECTURE}.tar.gz"
-  local download_url="${REPO_URL}/releases/download/${version}/${filename}"
-
-  info "正在下载 Sing-box ${version} (${ARCHITECTURE}) ..."
-  if ! curl -sS "$download_url" -o "$dest_file"; then
-    error "下载失败，请检查网络连接或 GitHub 连通性。"
-    return 1
+  local _version="$1"
+  local _destination="$2"
+  local _ver_num="${_version#v}"
+  
+  local _download_url="$REPO_URL/releases/download/$_version/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE.tar.gz"
+  
+  info "正在下载官方 Sing-box 核心组件: $_download_url ..."
+  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
+    error "核心下载失败！请检查您的网络连接。"
+    return 11
   fi
   return 0
 }
 
-get_public_ip() {
-  local ip=''
-  for url in https://api.ipify.org https://ip.sb https://checkip.amazonaws.com; do
-    ip=$(curl -4s --max-time 5 "$url" 2>/dev/null || true)
-    [[ -n "$ip" ]] && { echo "$ip"; return; }
-  done
-  hostname -i | awk '{print $1}' 2>/dev/null || echo "127.0.0.1"
-}
-
+# Alpine OpenRC 专属服务脚本底座
 tpl_singbox_server_openrc_base() {
   cat << 'EOF'
 #!/sbin/openrc-run
 
-description="Sing-box Service"
+description="Sing-box NaiveProxy Service"
 supervisor="supervise-daemon"
 command="/usr/local/bin/sing-box"
 command_args="run -c /etc/sing-box/config.json"
@@ -206,7 +201,7 @@ EOF
 }
 
 # =========================================================
-# 3. 面板辅助网络与状态扩展函数
+# 3. 面板辅助网络与配置扩展函数
 # =========================================================
 get_sb_status() {
   if has_command rc-service && rc-service sing-box status >/dev/null 2>&1; then
@@ -220,12 +215,18 @@ get_sb_status() {
   fi
 }
 
-get_current_port_display() {
+get_current_domain_display() {
   if [[ -f "$SB_CONFIG" ]]; then
-    local port
-    port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "")
-    echo "${port:- -}"
+    local domain
+    domain=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || echo "")
+    echo "${domain:- -}"
   else echo "-"; fi
+}
+
+# 完美适配 BusyBox 的随机字符串生成函数
+generate_random_string() {
+  local length=$1
+  cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c "$length" || true
 }
 
 # =========================================================
@@ -234,30 +235,30 @@ get_current_port_display() {
 write_and_show_config() {
   mkdir -p "$CONFIG_DIR"
 
-  local headers_json="{}"
-  if [[ -n "${WSHOST}" ]]; then
-    headers_json="{\"Host\": \"${WSHOST}\"}"
-  fi
-
   cat << EOF > "$SB_CONFIG"
 {
+  "log": {
+    "level": "info"
+  },
   "inbounds": [
     {
-      "type": "vmess",
-      "tag": "vmess-in",
+      "type": "naive",
+      "tag": "naive-in",
       "listen": "::",
-      "listen_port": ${PORT},
+      "listen_port": ${sb_port},
       "users": [
         {
-          "uuid": "${UUID}"
+          "username": "${sb_username}",
+          "password": "${sb_password}"
         }
       ],
-      "transport": {
-        "type": "ws",
-        "path": "${WSPATH}",
-        "headers": ${headers_json},
-        "max_early_data": 2048,
-        "early_data_header_name": "Sec-WebSocket-Protocol"
+      "tls": {
+        "enabled": true,
+        "server_name": "${sb_domain}",
+        "acme": {
+          "domain": ["${sb_domain}"],
+          "email": "${sb_email}"
+        }
       }
     }
   ],
@@ -270,151 +271,114 @@ write_and_show_config() {
 }
 EOF
 
-  SERVER_IP=$(get_public_ip)
-  cat << EOF > "$STATE_FILE"
-PORT='${PORT}'
-UUID='${UUID}'
-WSPATH='${WSPATH}'
-WSHOST='${WSHOST}'
-REMARK='${REMARK}'
-SERVER_IP='${SERVER_IP}'
-EOF
-  chmod 600 "$STATE_FILE"
+  mkdir -p "$SB_DIR"
+  
+  local encoded_node_name=$(jq -rn --arg x "$sb_node_name" '$x|@uri')
+  local share_link="naive+https://${sb_username}:${sb_password}@${sb_domain}:${sb_port}#${sb_node_name}"
 
-  # 检查是否支持并存在 OpenRC 服务托管环境
+  cat << EOF > "$SB_DIR/url.txt"
+V2rayN 配置分享链接:
+${share_link}
+EOF
+
+  cat << EOF > "$SB_DIR/meta.env"
+sb_domain="${sb_domain}"
+sb_email="${sb_email}"
+sb_username="${sb_username}"
+sb_password="${sb_password}"
+sb_node_name="${sb_node_name}"
+sb_port="${sb_port}"
+EOF
+
+  # 托管环境行为控制 (OpenRC 适配)
   if has_command rc-service && [ -d "$INIT_SERVICE_DIR" ]; then
     rc_update add sing-box default >/dev/null 2>&1 || true
     rc_service sing-box restart >/dev/null 2>&1 || true
+    
     if rc_service sing-box status >/dev/null 2>&1; then
-      info "Sing-box (VMess+WS) 服务通过 OpenRC 启动成功！"
+      info "Sing-box 服务通过 OpenRC 配置并启动成功！"
     else
       error "Sing-box 服务启动失败，请检查 /var/log/messages 查看错误日志。"
     fi
   else
-    # 极简无守护或 Docker 环境，直接以传统 PID 后台常驻模式运行
     pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
     "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
-    info "提示：未检测到 OpenRC 运行环境，程序已采用常驻进程 (PID-Mode) 后台挂载运行。"
+    info "非 OpenRC 环境，程序已挂载至后台常驻进程模式。"
   fi
-  
   showconf
 }
 
 # =========================================================
 # 5. 主流程控制模块与更新功能
 # =========================================================
-
 inst_singbox() {
   check_environment
   
-  if [[ -f "$SB_CONFIG" ]]; then
-    warn "系统检测到已存在配置。如果是要修改配置，请在菜单中选择选项 4。"
-    read -rp "是否执意重新安装？(旧配置将被覆盖) [y/N]: " CONFIRM_REINST
-    [[ "$CONFIRM_REINST" != "y" && "$CONFIRM_REINST" != "Y" ]] && return 0
-  fi
-
-  info "🧹 正在清理前置依赖并准备下载..."
-  if ! command -v sing-box >/dev/null 2>&1; then
-    local latest_version=$(get_latest_version)
-    
-    local _tmpfile_tar=$(mktemp)
-    if ! download_singbox "$latest_version" "$_tmpfile_tar"; then
-      rm -f "$_tmpfile_tar" && return 1
-    fi
-
-    echo -ne "正在解压并安装二进制可执行文件 ... "
-    local _tmpdir_extract=$(command mktemp -d -t "sbtar.XXXXXXXXXX")
-    tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
-    
-    local _ver_num="${latest_version#v}"
-    local _extracted_binary=$(find "$_tmpdir_extract" -type f -name "sing-box" | head -n 1)
-    
-    if [[ -n "$_extracted_binary" ]]; then
-      mkdir -p "$(dirname "$EXECUTABLE_INSTALL_PATH")"
-      if cp "$_extracted_binary" "$EXECUTABLE_INSTALL_PATH" && chmod 755 "$EXECUTABLE_INSTALL_PATH"; then
-        echo "成功"
-      else
-        rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "安装失败" && return 1
-      fi
-    else
-      rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "未找到核心文件" && return 1
-    fi
-    rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
+  info "🧹 正在释放 80 和 443 端口以防冲突..."
+  if has_command rc-service; then
+    rc_service caddy stop >/dev/null 2>&1 || true
+    rc_service nginx stop >/dev/null 2>&1 || true
+    rc_service sing-box stop >/dev/null 2>&1 || true
   else
-    info "系统已存在 sing-box 核心组件，跳过基础安装。"
+    pkill -f "caddy" || true
+    pkill -f "nginx" || true
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
   fi
 
-  # 写入服务脚本（采用完全兼容 BusyBox 的 install_content 原生重构版）
+  info "获取官方最新发布版本中..."
+  local latest_version=$(get_latest_version)
+  
+  local _tmpfile_tar=$(mktemp)
+  if ! download_singbox "$latest_version" "$_tmpfile_tar"; then
+    rm -f "$_tmpfile_tar" && return 1
+  fi
+
+  echo -ne "正在解压并安装二进制可执行文件 ... "
+  local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
+  tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
+  
+  local _extracted_binary=$(find "$_tmpdir_extract" -type f -name "sing-box" | head -n 1)
+
+  if [[ -n "$_extracted_binary" ]]; then
+    mkdir -p "$(dirname "$EXECUTABLE_INSTALL_PATH")"
+    if cp "$_extracted_binary" "$EXECUTABLE_INSTALL_PATH" && chmod 755 "$EXECUTABLE_INSTALL_PATH"; then
+      echo "成功"
+    else
+      rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "安装失败" && return 1
+    fi
+  else
+    rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "找不到解压核心" && return 1
+  fi
+  rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
+
+  # 写入 Alpine OpenRC 服务脚本
   install_content "0755" "$(tpl_singbox_server_openrc_base)" "$INIT_SERVICE_DIR/sing-box" "1"
 
-  # 兼容 Alpine 无 shuf 的随机端口生成
+  local rand_user=$(generate_random_string 8)
+  local rand_pass=$(generate_random_string 16)
+  local rand_email="$(generate_random_string 10)@gmail.com"
   local hostname_str=$(hostname 2>/dev/null || echo "alpine")
-  local rand_port=$(awk 'BEGIN{srand();print int(rand()*(65535-10000+1))+10000}')
-  local rand_uuid=$(python3 -c "import uuid; print(uuid.uuid4())")
-  local rand_path="/$(python3 -c "import secrets; print(secrets.token_hex(4))")"
-  local default_remark="${hostname_str}-vmessws"
+  local default_remark="${hostname_str}-NaiveProxy"
 
   echo "---------------------------------------------"
-  read -rp "👉 请输入监听端口 (默认随机: ${rand_port}): " INPUT_PORT
-  PORT=${INPUT_PORT:-$rand_port}
+  read -rp "👉 请输入解析好的域名 (例如: naive.example.com): " sb_domain
+  [[ -z "$sb_domain" ]] && error "域名不能为空！" && return 1
 
-  read -rp "👉 请输入 VMess UUID (默认随机: ${rand_uuid}): " INPUT_UUID
-  UUID=${INPUT_UUID:-$rand_uuid}
+  read -rp "👉 请输入你的邮箱 (默认随机: ${rand_email}): " sb_email
+  sb_email=${sb_email:-"$rand_email"}
 
-  read -rp "👉 请输入 WebSocket 路径 (默认随机: ${rand_path}): " INPUT_WSPATH
-  WSPATH=${INPUT_WSPATH:-$rand_path}
+  read -rp "👉 请设置 NaiveProxy 用户名 (默认随机: ${rand_user}): " sb_username
+  sb_username=${sb_username:-"$rand_user"}
 
-  read -rp "👉 请输入 WebSocket Host 伪装域名 (默认留空): " INPUT_WSHOST
-  WSHOST=${INPUT_WSHOST:-""}
+  read -rp "👉 请设置 NaiveProxy 密码 (默认随机: ${rand_pass}): " sb_password
+  sb_password=${sb_password:-"$rand_pass"}
 
-  read -rp "👉 请输入节点备注名称 (默认: ${default_remark}): " INPUT_REMARK
-  REMARK=${INPUT_REMARK:-$default_remark}
+  read -rp "👉 请设置节点备注 (默认: ${default_remark}): " sb_node_name
+  sb_node_name=${sb_node_name:-$default_remark}
 
-  write_and_show_config
-}
+  read -rp "👉 请设置监听端口 (默认: 443): " sb_port
+  sb_port=${sb_port:-443}
 
-modify_config() {
-  if [[ ! -f "$SB_CONFIG" ]]; then
-    error "未找到正在运行的配置文件，请先选择选项 1 安装节点。"
-    return 1
-  fi
-
-  info "正在读取现有 VMess 节点配置..."
-  local current_port=$(jq -r '.inbounds[0].listen_port // empty' "$SB_CONFIG" 2>/dev/null)
-  local current_uuid=$(jq -r '.inbounds[0].users[0].uuid // empty' "$SB_CONFIG" 2>/dev/null)
-  local current_path=$(jq -r '.inbounds[0].transport.path // empty' "$SB_CONFIG" 2>/dev/null)
-  local current_host=$(jq -r '.inbounds[0].transport.headers.Host // empty' "$SB_CONFIG" 2>/dev/null)
-  
-  local current_remark=""
-  if [[ -f "$STATE_FILE" ]]; then
-    current_remark=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 || true)
-  fi
-
-  local hostname_str=$(hostname 2>/dev/null || echo "alpine")
-  local fallback_remark="${hostname_str}-vmessws"
-
-  echo "---------------------------------------------"
-  echo -e "${YELLOW}提示：直接敲回车(Enter)将保持括号内的当前值不变${RESET}"
-  echo "---------------------------------------------"
-
-  read -rp "👉 修改监听端口 (当前: ${current_port}): " INPUT_PORT
-  PORT=${INPUT_PORT:-$current_port}
-
-  read -rp "👉 修改 VMess UUID (当前: ${current_uuid}): " INPUT_UUID
-  UUID=${INPUT_UUID:-$current_uuid}
-
-  read -rp "👉 修改 WebSocket 路径 (当前: ${current_path}): " INPUT_WSPATH
-  WSPATH=${INPUT_WSPATH:-$current_path}
-
-  read -rp "👉 修改 WebSocket Host 伪装域名 (当前: ${current_host:-未配置/留空}): " INPUT_WSHOST
-  if [[ -z "$INPUT_WSHOST" ]]; then
-    WSHOST="$current_host"
-  else
-    WSHOST="$INPUT_WSHOST"
-  fi
-
-  read -rp "👉 修改节点备注名称 (当前: ${current_remark:-$fallback_remark}): " INPUT_REMARK
-  REMARK=${INPUT_REMARK:-${current_remark:-$fallback_remark}}
   write_and_show_config
 }
 
@@ -444,7 +408,7 @@ update_singbox() {
   fi
 
   echo -ne "正在覆盖二进制核心文件 ... "
-  local _tmpdir_extract=$(command mktemp -d -t "sbtar.XXXXXXXXXX")
+  local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
   tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
   
   local _extracted_binary=$(find "$_tmpdir_extract" -type f -name "sing-box" | head -n 1)
@@ -465,7 +429,7 @@ update_singbox() {
     if rc_service sing-box status >/dev/null 2>&1; then
       info "Sing-box 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
     else
-      error "核心更新成功，但 OpenRC 重启服务失败，请检查系统日志。"
+      error "核心更新成功，但 OpenRC 重启服务失败。"
     fi
   else
     pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
@@ -475,6 +439,8 @@ update_singbox() {
 }
 
 uninstall_singbox() {
+  warn "即将从当前系统中彻底卸载 Sing-box (NaiveProxy)"
+
   if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
     rc_service sing-box stop >/dev/null 2>&1 || true
     rc_update del sing-box default >/dev/null 2>&1 || true
@@ -482,64 +448,69 @@ uninstall_singbox() {
   else
     pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
   fi
-  
-  remove_file "$EXECUTABLE_INSTALL_PATH"
-  rm -f "$SB_CONFIG" "$STATE_FILE"
-  rm -rf "$CONFIG_DIR" "$SB_DIR"
 
-  info "已卸载 Sing-box、配置文件与状态管理底座。"
+  remove_file "$EXECUTABLE_INSTALL_PATH"
+  rm -rf /etc/sing-box "$SB_DIR"
+
+  info "Sing-box 已彻底从您的系统中移除！"
+}
+
+changeconf() {
+  if [[ ! -f "$SB_CONFIG" ]]; then
+    error "配置文件不存在，请先安装 Sing-box"
+    return 1
+  fi
+
+  if [[ -f "$SB_DIR/meta.env" ]]; then
+    source "$SB_DIR/meta.env"
+  else
+    sb_domain=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG")
+    sb_email=$(jq -r '.inbounds[0].tls.acme.email' "$SB_CONFIG")
+    sb_username=$(jq -r '.inbounds[0].users[0].username' "$SB_CONFIG")
+    sb_password=$(jq -r '.inbounds[0].users[0].password' "$SB_CONFIG")
+    sb_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG")
+    sb_node_name="NaiveProxy"
+  fi
+
+  [[ -z "$sb_port" || "$sb_port" == "null" ]] && sb_port=443
+
+  clear
+  echo -e "${GREEN}====== 修改 Sing-box Naive 配置 ======${RESET}"
+  echo "提示：直接敲回车将保持原有配置不变"
+  echo "---------------------------------------------"
+  
+  local input_domain input_email input_user input_pass input_name input_port
+
+  read -rp "👉 请输入解析好的域名 [当前: ${sb_domain}]: " input_domain
+  sb_domain=${input_domain:-$sb_domain}
+
+  read -rp "👉 请输入你的邮箱 [当前: ${sb_email}]: " input_email
+  sb_email=${input_email:-$sb_email}
+
+  read -rp "👉 请设置 NaiveProxy 用户名 [当前: ${sb_username}]: " input_user
+  sb_username=${input_user:-$sb_username}
+
+  read -rp "👉 请设置 NaiveProxy 密码 [当前: ${sb_password}]: " input_pass
+  sb_password=${input_pass:-$sb_password}
+
+  read -rp "👉 请设置节点备注 [当前: ${sb_node_name}]: " input_name
+  sb_node_name=${input_name:-$sb_node_name}
+
+  read -rp "👉 请设置监听端口 [当前: ${sb_port}]: " input_port
+  sb_port=${input_port:-$sb_port}
+
+  write_and_show_config
+  info "配置修改并应用成功！"
 }
 
 showconf() {
-  if [[ ! -f "$STATE_FILE" ]]; then
-    error "未找到任何安装配置底座，请先安装节点。"
-    return 1
+  if [[ ! -d "$SB_DIR" || ! -f "$SB_DIR/url.txt" ]]; then
+    error "未找到分享链接配置文件。"
+    return
   fi
-  source "$STATE_FILE"
-
-  local vmess_json_str
-  vmess_json_str=$(cat << EOF
-{
-  "v": "2",
-  "ps": "${REMARK}",
-  "add": "${SERVER_IP}",
-  "port": ${PORT},
-  "id": "${UUID}",
-  "aid": 0,
-  "scy": "auto",
-  "net": "ws",
-  "type": "none",
-  "host": "${WSHOST}",
-  "path": "${WSPATH}",
-  "tls": "none",
-  "sni": "",
-  "alpn": ""
-}
-EOF
-)
-  local v2rayn_link=""
-  if base64 --help 2>&1 | grep -q "\-d"; then
-    v2rayn_link="vmess://$(echo -n "$vmess_json_str" | base64 | tr -d '\n\r')"
-  else
-    v2rayn_link="vmess://$(echo -n "$vmess_json_str" | base64 -w 0 2>/dev/null || echo -n "$vmess_json_str" | base64 | tr -d '\n\r')"
-  fi
-
-  echo -e "${GREEN}====== VMess + WebSocket 节点配置信息 ======${RESET}"
-  echo -e "${GREEN}服务器公网 IP   :${RESET} ${SERVER_IP}"
-  echo -e "${GREEN}服务监听端口    :${RESET} ${PORT}"
-  echo -e "${GREEN}VMess 用户UUID :${RESET} ${UUID}"
-  echo -e "${GREEN}传输协议类型    :${RESET} ws (WebSocket)"
-  echo -e "${GREEN}WebSocket 路径 :${RESET} ${WSPATH}"
-  echo -e "${GREEN}WebSocket Host :${RESET} ${WSHOST:-未配置(留空)}"
-  echo -e "${GREEN}节点自定义备注 :${RESET} ${REMARK}"
-  echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
-  echo "---------------------------------------------"
-  echo -e "${GREEN}👉 v2rayN   分享链接:${RESET}"
-  echo -e "${YELLOW}${v2rayn_link}${RESET}"
+  echo -e "${GREEN}====== 节点分享链接 ======${RESET}"
+  cat "$SB_DIR/url.txt"
   echo
-  echo -e "${GREEN}👉 Surge   分享链接:${RESET}"
-  echo -e "${YELLOW}Vmesh+WS = vmess, $SERVER_IP, $PORT, username=$UUID, ws=true, ws-path=$WSPATH, vmess-aead=true${RESET}"
-  echo "---------------------------------------------"
 }
 
 # =========================================================
@@ -553,22 +524,22 @@ menu() {
     clear
     local status=$(get_sb_status)
     local version=$(get_installed_version)
-    local port_show=$(get_current_port_display)
+    local domain_show=$(get_current_domain_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   Sing-box VMess + WS Alpine面板   ${RESET}"
+    echo -e "${GREEN}    Sing-box NaiveProxy 面板    ${RESET}"
+    echo -e "${GREEN}=====( Alpine Linux OpenRC )====${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $status"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}域名   :${RESET} ${YELLOW}${domain_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $status"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 VMess + WS${RESET}"
-    echo -e "${GREEN}2. 更新 VMess + WS${RESET}"
-    echo -e "${GREEN}3. 卸载 VMess + WS${RESET}"
-    echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 VMess + WS${RESET}"
-    echo -e "${GREEN}6. 停止 VMess + WS${RESET}"
-    echo -e "${GREEN}7. 重启 VMess + WS${RESET}"
+    echo -e "${GREEN}1. 安装 Sing-box (Naive)${RESET}"
+    echo -e "${GREEN}2. 更新 Sing-box (Naive)${RESET}"
+    echo -e "${GREEN}3. 卸载 Sing-box (Naive)${RESET}"
+    echo -e "${GREEN}4. 修改配置 ${RESET}"
+    echo -e "${GREEN}5. 启动 Sing-box (Naive)${RESET}"
+    echo -e "${GREEN}6. 停止 Sing-box (Naive)${RESET}"
+    echo -e "${GREEN}7. 重启 Sing-box (Naive)${RESET}"
     echo -e "${GREEN}8. 查看日志${RESET}"
     echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
@@ -579,10 +550,10 @@ menu() {
     [[ -z "$choice" ]] && continue
 
     case "$choice" in
-      1) inst_singbox; pause ;;
+      1) inst_box=inst_singbox; $inst_box; pause ;;
       2) update_singbox; pause ;;
       3) uninstall_singbox; pause ;;
-      4) modify_config; pause ;;
+      4) changeconf; pause ;;
       5) 
         if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
           rc_service sing-box start && info "服务已成功启动！"
@@ -610,9 +581,15 @@ menu() {
         pause ;;
       8) 
         if [[ -f /var/log/messages ]]; then
-          tail -n 50 /var/log/messages | grep sing-box || tail -n 50 /var/log/messages
+          echo -e "${CYAN}--- 最近 50 行相关系统日志 ---${RESET}"
+          tail -n 50 /var/log/messages | grep -E 'sing-box|supervise-daemon' || tail -n 50 /var/log/messages
+          echo "--------------------------------------"
+          if [[ -f "$EXECUTABLE_INSTALL_PATH" && -f "$SB_CONFIG" ]]; then
+            echo -e "${YELLOW}[提示] 如果上面在不断闪退，下面是手动测试的输出：${RESET}"
+            "$EXECUTABLE_INSTALL_PATH" check -c "$SB_CONFIG" || true
+          fi
         else
-          warn "未找到通用系统日志文件，可尝试通过查看后台进程状态。"
+          warn "未找到系统日志文件 /var/log/messages"
         fi
         pause ;;
       9) showconf; pause ;;

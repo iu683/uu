@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Sing-box (AnyTLS + Reality) 控制面板 (高级兼容重构版)
+# Alpine sing-box TUIC v5 专属自愈共存管理面板
 # SPDX-License-Identifier: MIT
 #
 set -Eop pipefail
@@ -9,310 +9,387 @@ export LANG=en_US.UTF-8
 # =========================================================
 # 1. 核心控制与全局环境初始化
 # =========================================================
-# 动态检测系统中的 init.d 残留，自动对齐冲突路径
-if [[ -f "/etc/init.d/sing-box" ]] && grep -q "ap-anyreality-sb" "/etc/init.d/sing-box" 2>/dev/null; then
-  readonly SB_CONFIG="/etc/ap-anyreality-sb/config.json"
-  readonly STATE_FILE="/etc/ap-anyreality-sb.env"
-  CONFIG_DIR="/etc/ap-anyreality-sb"
-else
-  readonly SB_CONFIG="/etc/mo-anyreality-sb/config.json"
-  readonly STATE_FILE="/etc/mo-anyreality-sb.env"
-  CONFIG_DIR="/etc/mo-anyreality-sb"
-fi
+readonly SB_SERVICE_NAME="sing-box-tuic"
+readonly BINARY_PATH="/usr/local/bin/sing-box-tuic"
+readonly TUIC_CONFIG="/etc/sing-box-tuic/config.json"
+readonly TUIC_DIR="/root/tuicV5"
+readonly STATE_FILE="/etc/sing-box-tuic-standalone.env"
+CONFIG_DIR="/etc/sing-box-tuic"
+OPENRC_SERVICE_PATH="/etc/init.d/sing-box-tuic"
+LOG_FILE="/var/log/sing-box-tuic.log"
+RUN_USER="singbox"
 
-readonly SB_BINARY="/usr/local/bin/sing-box"
-readonly SB_DIR="/root/proxynode/anyreality"
-EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
-SYSTEMD_SERVICES_DIR="/etc/systemd/system"
-REPO_URL="https://github.com/SagerNet/sing-box"
-API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
-CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
+TMP_DIR=$(mktemp -d -t sbtuic.XXXXXX)
 
-# 自动检测环境与动态变量池
-PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
-OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
-ARCHITECTURE="${ARCHITECTURE:-}"
-
-# 终端规范颜色代码
+# 颜色标准规范
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 BLUE="\033[34m"
-CYAN="\033[36m"
 RESET="\033[0m"
-
-# =========================================================
-# 2. 官方原生底层工具函数
-# =========================================================
-has_command() {
-  local _command=$1
-  type -P "$_command" > /dev/null 2>&1
-}
-
-curl() {
-  command curl "${CURL_FLAGS[@]}" "$@"
-}
-
-mktemp() {
-  command mktemp "$@" "sbservinst.XXXXXXXXXX"
-}
 
 info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
 warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
 error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
-pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
+pause() { echo; read -n 1 -s -r -p "$(echo -e ${GREEN}"按任意键返回菜单..."${RESET})" || true; echo; }
 
-systemctl() {
-  if ! has_command systemctl; then
-    return 0
-  fi
-  command systemctl "$@"
+cleanup() {
+  [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT INT TERM
+
+generate_random_password() {
+  dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
 }
 
-install_content() {
-  local _install_flags="$1"
-  local _content="$2"
-  local _destination="$3"
-  local _overwrite="$4"
-  local _tmpfile="$(mktemp)"
-
-  echo -ne "安装 $_destination ... "
-  echo "$_content" > "$_tmpfile"
-  if [[ -z "$_overwrite" && -e "$_destination" ]]; then
-    echo -e "已存在"
-  elif install "$_install_flags" "$_tmpfile" "$_destination"; then
-    echo -e "完成"
-  fi
-  rm -f "$_tmpfile"
+is_alpine() {
+  [[ -f /etc/alpine-release ]]
 }
 
-remove_file() {
-  local _target="$1"
-  echo -ne "移除 $_target ... "
-  if rm -f "$_target"; then
-    echo -e "完成"
-  fi
+install_packages() {
+  info "正在刷新 Alpine 仓库并安装核心依赖..."
+  apk update
+  apk add --no-cache bash curl wget tar openssl openrc iproute2 iptables jq grep sed coreutils bind-tools
 }
 
-detect_package_manager() {
-  [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
-  has_command apt && PACKAGE_MANAGEMENT_INSTALL='apt -y --no-install-recommends install' && return 0
-  has_command dnf && PACKAGE_MANAGEMENT_INSTALL='dnf -y install' && return 0
-  has_command yum && PACKAGE_MANAGEMENT_INSTALL='yum -y install' && return 0
-  has_command apk && PACKAGE_MANAGEMENT_INSTALL='apk add --no-cache' && return 0
-  return 1
+create_user() {
+  getent group "$RUN_USER" &>/dev/null || addgroup -S "$RUN_USER"
+  id "$RUN_USER" &>/dev/null || adduser -S -D -H -G "$RUN_USER" -s /sbin/nologin "$RUN_USER"
 }
 
-install_software() {
-  local _package_name="$1"
-  if ! detect_package_manager; then
-    error "未检测到支持的包管理器，请手动安装 $_package_name"
-    exit 65
-  fi
-  echo "正在安装缺失的依赖 '$_package_name' ... "
-  if $PACKAGE_MANAGEMENT_INSTALL "$_package_name" >/dev/null 2>&1; then
-    echo "依赖安装成功"
-  else
-    error "无法通过包管理器安装 '$_package_name'，请手动安装。"
-    exit 65
-  fi
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l|armv7) echo "armv7" ;;
+    *) error "不支持当前架构: $(uname -m)"; exit 8 ;;
+  esac
 }
 
+# =========================================================
+# 2. 【核心修复】底层内核自愈与环境对齐逻辑
+# =========================================================
 check_environment() {
-  if [[ "x$(uname)" == "xLinux" ]]; then
-    OPERATING_SYSTEM=linux
-  else
-    error "本脚本仅支持 Linux 系统。"
+  if ! is_alpine; then
+    error "本脚本仅支持 Alpine Linux 系统。"
     exit 95
   fi
+  install_packages
+  create_user
+  
+  # 1. 自动补全 glibc 动态运行库，消除 not found 闪退
+  if [[ -f /etc/alpine-release ]]; then
+    apk info -e gcompat >/dev/null 2>&1 || apk add --no-cache gcompat >/dev/null 2>&1 || true
+  fi
 
-  case "$(uname -m)" in
-    'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
-    'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
-    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
-  esac
+  # 2. 强行激活内核 IPv4 路由转发（彻底解决端口跳跃失联的核心关键点）
+  info "正在检测并强行激活 Linux 内核路由转发功能..."
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf 2>/dev/null || true
+  echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
 
-  has_command curl || install_software curl
-  has_command grep || install_software grep
-  has_command jq || install_software jq
-  has_command tar || install_software tar
-  has_command python3 || install_software python3
+  # 3. 强行加载并固化 Alpine 所需的 iptables 转发重定向内核模块
+  info "正在注入并固化端口重定向所需内核依赖模块..."
+  local modules=(ip_tables iptable_nat xt_REDIRECT)
+  for mod in "${modules[@]}"; do
+    modprobe "$mod" >/dev/null 2>&1 || true
+    if [[ -f /etc/modules ]] && ! grep -q -w "$mod" /etc/modules; then
+      echo "$mod" >> /etc/modules
+    fi
+  done
 }
 
 get_installed_version() {
-  if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
-    local version_out
-    # 显式赋予执行权限防止未知版本错误
-    chmod +x "$EXECUTABLE_INSTALL_PATH" 2>/dev/null || true
-    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null || echo "")
-    if [[ -n "$version_out" ]]; then
-      echo "$version_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' | head -n 1 || echo "未知格式"
-    else
-      echo "未知版本"
-    fi
+  if [[ -f "$BINARY_PATH" ]]; then
+    "$BINARY_PATH" version 2>/dev/null | head -n1 | awk '{print $3}' || echo "未知版本"
   else
     echo "未安装"
   fi
 }
 
 get_latest_version() {
-  local _tmpfile=$(mktemp)
-  if ! curl -sS -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases" -o "$_tmpfile"; then
-    rm -f "$_tmpfile"
-    return
-  fi
-  local _tag_name=$(jq -r '[.[] | select(.prerelease==false and .draft==false)][0].tag_name' "$_tmpfile" 2>/dev/null || echo "")
-  rm -f "$_tmpfile"
+  info "正在从 GitHub 获取 sing-box 最新版本号..."
+  local latest_v
+  latest_v=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r .tag_name | sed 's/^v//' 2>/dev/null)
   
-  if [[ -n "$_tag_name" ]]; then
-    echo "${_tag_name##*\/}"
+  if [[ -z "$latest_v" || "$latest_v" == "null" ]]; then
+    warn "通过 API 获取最新版本失败，尝试备用匹配方案..."
+    latest_v=$(curl -fsSL "https://github.com/SagerNet/sing-box/releases/latest" | grep -oE 'releases/tag/v[0-9.]+' | head -n1 | sed 's|releases/tag/v||' 2>/dev/null)
+  fi
+
+  if [[ -n "$latest_v" ]]; then
+    SINGBOX_VERSION="$latest_v"
+    info "成功获取最新版本: v$SINGBOX_VERSION"
   else
-    echo "v1.12.3"
+    SINGBOX_VERSION="1.12.3"
+    warn "无法获取最新版本，将使用保底版本: v$SINGBOX_VERSION"
   fi
 }
 
-download_singbox() {
-  local _version="$1"
-  local _destination="$2"
-  local _ver_num="${_version#v}"
-  
-  local _download_url="$REPO_URL/releases/download/$_version/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE.tar.gz"
-  
-  info "正在自 GitHub 下载官方 Sing-box 核心组件: $_download_url ..."
-  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
-    error "从 GitHub 下载核心失败！请检查您的网络连接。"
-    return 11
+# =========================================================
+# 3. 防火墙端口跳跃精细控制链条
+# =========================================================
+clear_old_iptables() {
+  if [[ -f "${CONFIG_DIR}/hopping.txt" && -f "${CONFIG_DIR}/main_port.txt" ]]; then
+    local old_hop=$(cat "${CONFIG_DIR}/hopping.txt")
+    local old_port=$(cat "${CONFIG_DIR}/main_port.txt")
+    local old_start=${old_hop%-*}
+    local old_end=${old_hop#*-}
+
+    if [[ -n "$old_start" && -n "$old_end" && -n "$old_port" ]]; then
+      iptables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+      ip6tables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+    fi
+  fi
+}
+
+apply_new_iptables() {
+  clear_old_iptables
+  if [[ -f "${CONFIG_DIR}/hopping.txt" && -f "${CONFIG_DIR}/main_port.txt" ]]; then
+    local hop_val=$(cat "${CONFIG_DIR}/hopping.txt")
+    local main_p=$(cat "${CONFIG_DIR}/main_port.txt")
+    local start_p=${hop_val%-*}
+    local end_p=${hop_val#*-}
+    
+    info "正在建立高精度 NAT 重定向链条: UDP $start_p-$end_p => 主监听端口 $main_p"
+    iptables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$main_p"
+    ip6tables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$main_p" 2>/dev/null || true
+  fi
+}
+
+get_public_ip() {
+  local ip
+  for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+    for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+      ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+    done
+  done
+  echo "127.0.0.1"
+}
+
+check_port() {
+  local port="$1"
+  if ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
+    return 1
   fi
   return 0
 }
 
-get_public_ip() {
-  local ip=''
-  for url in https://api.ipify.org https://ip.sb https://checkip.amazonaws.com; do
-    ip=$(curl -4s --max-time 5 "$url" 2>/dev/null || true)
-    [[ -n "$ip" ]] && { echo "$ip"; return; }
+is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
+
+get_random_port() {
+  local rand_port
+  while true; do
+    rand_port=$(shuf -i 2000-65535 -n 1)
+    if check_port "$rand_port"; then
+      echo "$rand_port" && return 0
+    fi
   done
-  hostname -I | awk '{print $1}'
 }
 
-tpl_singbox_server_service_base() {
-  cat << EOF
-[Unit]
-Description=sing-box service
-Documentation=https://sing-box.sagernet.org
-After=network.target nss-lookup.target network-online.target
-
-[Service]
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-ExecStart=$EXECUTABLE_INSTALL_PATH run -c $SB_CONFIG
-ExecReload=/bin/kill -HUP \$MAINPID
-Restart=on-failure
-RestartSec=10s
-LimitNOFILE=infinity
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-# =========================================================
-# 3. 面板辅助网络与状态扩展函数
-# =========================================================
-get_sb_status() {
-  if has_command systemctl && systemctl is-active --quiet mo-anyreality-sb 2>/dev/null; then
-    echo -e "${GREEN}● 运行中 (Systemd)${RESET}"
-  elif [[ -f "/etc/init.d/sing-box" ]] && /etc/init.d/sing-box status >/dev/null 2>&1; then
-    echo -e "${GREEN}● 运行中 (Init.d)${RESET}"
+get_tuic_status() {
+  if rc-service "$SB_SERVICE_NAME" status 2>/dev/null | grep -q "started"; then
+    echo "RUNNING"
   else
-    if pgrep -f "$EXECUTABLE_INSTALL_PATH run" >/dev/null 2>&1; then
-      echo -e "${GREEN}● 运行中 (Pidmode)${RESET}"
+    if pgrep -f "$BINARY_PATH run" >/dev/null 2>&1; then
+      echo "RUNNING"
     else
-      echo -e "${RED}● 未运行${RESET}"
+      echo "STOPPED"
     fi
   fi
 }
 
 get_current_port_display() {
-  if [[ -f "$SB_CONFIG" ]]; then
-    local port
-    port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "")
-    echo "${port:- -}"
+  if [[ -f "$TUIC_CONFIG" ]]; then
+    local main_port jump_range="无"
+    main_port=$(jq -r '.inbounds[0].listen_port // empty' "$TUIC_CONFIG" 2>/dev/null)
+    [[ -f "${CONFIG_DIR}/hopping.txt" ]] && jump_range=$(cat "${CONFIG_DIR}/hopping.txt")
+    
+    if [[ "$jump_range" != "无" ]]; then
+      echo "${main_port} [跳跃: ${jump_range}]"
+    else
+      echo "${main_port:- -}"
+    fi
   else echo "-"; fi
 }
 
-generate_or_use_key() {
-  if [[ -n "${PRIVATE_KEY:-}" && -n "${PUBLIC_KEY:-}" ]]; then
-    return
-  fi
-  chmod +x "$EXECUTABLE_INSTALL_PATH" 2>/dev/null || true
-  local key_out
-  key_out=$("$EXECUTABLE_INSTALL_PATH" generate reality-keypair 2>/dev/null || echo "")
-  
-  if [[ -n "$key_out" ]]; then
-    # 放弃依赖 awk，改用纯 bash 字符串切片，100%兼容 BusyBox/Alpine 环境
-    while IFS= read -r line; do
-      if [[ "$line" == *"PrivateKey"* ]]; then
-        PRIVATE_KEY="${line#*:}"
-        PRIVATE_KEY="${PRIVATE_KEY//[[:space:]]/}"
-      elif [[ "$line" == *"PublicKey"* ]]; then
-        PUBLIC_KEY="${line#*:}"
-        PUBLIC_KEY="${PUBLIC_KEY//[[:space:]]/}"
+inst_cert() {
+  mkdir -p "$CONFIG_DIR/certs"
+
+  echo "---------------------------------------------"
+  echo -e "Tuic 协议证书申请方式如下："
+  echo -e " 1) 必应自签证书 ${YELLOW}（默认）${RESET}"
+  echo -e " 2) Acme 脚本自动申请 (需放行 80 端口)"
+  echo -e " 3) 自定义证书路径"
+  echo "---------------------------------------------"
+  local certInput
+  read -rp "请输入选项 [1-3] (直接回车默认自签): " certInput
+  certInput=${certInput:-1}
+
+  cert_path="$CONFIG_DIR/certs/cert.pem"
+  key_path="$CONFIG_DIR/certs/key.pem"
+
+  if [[ $certInput == 2 ]]; then
+    if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
+      warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。请确保已暂时关闭 Web 服务。"
+    fi
+
+    if [[ -f "$cert_path" && -f "$key_path" && -s "$cert_path" && -s "$key_path" && -f "$CONFIG_DIR/certs/ca.log" ]]; then
+      tuic_domain=$(cat "$CONFIG_DIR/certs/ca.log")
+      info "检测到已有域名 [${tuic_domain}] 的安全区证书，正在复用..."
+    else
+      read -rp "请输入需要申请证书的域名: " domain
+      [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
+      
+      info "正在检查并安装 Acme.sh 依赖..."
+      local acme_cmd="/root/.acme.sh/acme.sh"
+      if [[ ! -f "$acme_cmd" ]]; then
+        curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum 2>/dev/null | cut -c 1-16 || echo "admin")@gmail.com
       fi
-    done <<< "$key_out"
+      
+      "$acme_cmd" --set-default-ca --server letsencrypt
+      
+      info "正在向 Let's Encrypt 申请证书..."
+      if [[ "$(get_public_ip)" =~ ":" ]]; then
+        "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
+      else
+        "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
+      fi
+      
+      if "$acme_cmd" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc; then
+        echo "$domain" > "$CONFIG_DIR/certs/ca.log"
+        tuic_domain=$domain
+        info "Acme 证书申请并成功分发！"
+      else
+        error "Acme 证书申请失败，自动切换回自签模式。"
+        certInput=1
+      fi
+    fi
+  elif [[ $certInput == 3 ]]; then
+    local user_cert user_key
+    read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
+    read -rp "请输入密钥文件 (privkey.pem/key) 的路径: " user_key
+    read -rp "请输入证书对应的域名: " tuic_domain
+    
+    if [[ -f "$user_cert" && -f "$user_key" ]]; then
+      cp -f "$user_cert" "$cert_path"
+      cp -f "$user_key" "$key_path"
+      info "自定义证书已成功同步至配置安全区。"
+    else
+      error "找不到输入的证书文件，自动降级回自签模式。"
+      certInput=1
+    fi
   fi
 
-  # 如果因为环境极其特殊仍然获取失败，则进入终极降级手动输入
-  if [[ -z "${PRIVATE_KEY}" || -z "${PUBLIC_KEY}" ]]; then
-    error "内核自动密钥对生成失败(系统环境受限)。"
-    warn "请在下方手动贴入您事先准备好的 Reality 密钥："
-    read -rp "👉 请输入您的 PrivateKey (私钥): " PRIVATE_KEY
-    read -rp "👉 请输入您的 PublicKey (公钥): " PUBLIC_KEY
+  if [[ $certInput == 1 ]]; then
+    info "将使用必应自签证书作为 Tuic 的节点证书"
+    openssl ecparam -genkey -name prime256v1 -out "$key_path"
+    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
+    tuic_domain="www.bing.com"
+  fi
+
+  chmod 644 "$cert_path"
+  chmod 600 "$key_path"
+  chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR/certs"
+}
+
+inst_port() {
+  local default_port=""
+  if [[ -f "$TUIC_CONFIG" ]]; then
+    default_port=$(jq -r '.inbounds[0].listen_port // empty' "$TUIC_CONFIG" 2>/dev/null)
+  fi
+
+  local prompt_msg="设置 Tuic 服务端监听主端口 [1-65535] (回车随机分配): "
+  [[ -n "$default_port" ]] && prompt_msg="设置 Tuic 服务端监听主端口 [当前: ${default_port}, 回车不修改]: "
+
+  while true; do
+    read -rp "$prompt_msg" port
+    if [[ -z "$port" ]]; then
+      if [[ -n "$default_port" ]]; then port="$default_port" && break
+      else
+        port=$(get_random_port)
+        info "已为您随机分配未被占用端口: $port" && break
+      fi
+    elif is_valid_port "$port"; then
+      if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
+        error "端口 ${port} 已被其它程序占用，请更换。" && continue
+      fi
+      break
+    else error "请输入有效的端口数字 (1-65535)"; fi
+  done
+
+  # 写入临时记录供 iptables 提取
+  echo "$port" > "${CONFIG_DIR}/main_port.txt"
+
+  echo "---------------------------------------------"
+  echo -e "Tuic 端口群使用模式 ："
+  echo -e " 1) 单端口模式"
+  echo -e " 2) 端口跳跃模式 ${YELLOW}（默认)${RESET}"
+  echo "---------------------------------------------"
+  local jumpInput
+  read -rp "请选择端口模式 [1-2] (默认2): " jumpInput
+  jumpInput=${jumpInput:-2}
+
+  clear_old_iptables
+
+  if [[ $jumpInput == 2 ]]; then
+    while true; do
+      read -rp "设置外部跳跃起始端口 (建议10000-65535): " firstport
+      read -rp "设置外部跳跃末尾端口 (必须大一些且不冲突): " endport
+      if is_valid_port "$firstport" && is_valid_port "$endport" && [[ $firstport -lt $endport ]]; then break
+      else error "输入无效，起始端口必须小于末尾端口，请重新输入。"; fi
+    done
+    echo "$firstport-$endport" > "${CONFIG_DIR}/hopping.txt"
+  else
+    rm -f "${CONFIG_DIR}/hopping.txt"
+    info "将继续使用单端口模式"
   fi
 }
 
-# =========================================================
-# 4. 面板核心交互与配置文件处理
-# =========================================================
 write_and_show_config() {
-  mkdir -p "$CONFIG_DIR"
+  local HOSTNAME=$(hostname -s | sed 's/ /_/g')
+  local vps_ip=$(get_public_ip)
+  local last_ip="$vps_ip"
+  [[ "$vps_ip" =~ ":" ]] && last_ip="[$vps_ip]"
 
-  cat << EOF > "$SB_CONFIG"
+  local is_insecure="0"
+  local skip_cert="false"
+  if [[ "$tuic_domain" == "www.bing.com" ]]; then
+    is_insecure="1"
+    skip_cert="true"
+  fi
+
+  # 提取写入的主监听端口
+  local main_p=$(cat "${CONFIG_DIR}/main_port.txt")
+
+  cat << EOF > "$TUIC_CONFIG"
 {
+  "log": {
+    "level": "info",
+    "output": "$LOG_FILE",
+    "timestamp": true
+  },
   "inbounds": [
     {
-      "type": "anytls",
+      "type": "tuic",
+      "tag": "tuic-in",
       "listen": "::",
-      "listen_port": ${PORT},
+      "listen_port": $main_p,
       "users": [
         {
-          "name": "${USERNAME}",
-          "password": "${PASSWORD}"
+          "uuid": "$auth_uuid",
+          "password": "$auth_pwd"
         }
       ],
-      "padding_scheme": [
-        "stop=8",
-        "0=30-30",
-        "1=100-400",
-        "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
-        "3=9-9,500-1000",
-        "4=500-1000",
-        "5=500-1000",
-        "6=500-1000",
-        "7=500-1000"
-      ],
+      "congestion_control": "bbr",
+      "zero_rtt_handshake": false,
+      "heartbeat": "10s",
       "tls": {
         "enabled": true,
-        "server_name": "${SERVER_NAME}",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "${SERVER_NAME}",
-            "server_port": 443
-          },
-          "private_key": "${PRIVATE_KEY}",
-          "short_id": "${SHORT_ID}"
-        }
+        "server_name": "$tuic_domain",
+        "alpn": ["h3"],
+        "certificate_path": "$cert_path",
+        "key_path": "$key_path"
       }
     }
   ],
@@ -321,374 +398,270 @@ write_and_show_config() {
       "type": "direct",
       "tag": "direct"
     }
-  ]
+  ],
+  "route": {
+    "final": "direct"
+  }
 }
 EOF
 
-  SERVER_IP=$(get_public_ip)
+  chmod 640 "$TUIC_CONFIG"
+  chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
+
+  # 【核心注入点】先彻底把底层的转发链路和路由刷新打通
+  apply_new_iptables
+  mkdir -p "$TUIC_DIR"
+  
+  local hopping_param=""
+  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
+    hopping_param="&mport=$(cat "${CONFIG_DIR}/hopping.txt")"
+  fi
+
+  cat << EOF > "$TUIC_DIR/url.txt"
+V6VPS 请自行替换 IP 地址为 V6
+V2rayN 链接:
+tuic://$auth_uuid:$auth_pwd@$last_ip:$main_p?alpn=h3&congestion_control=bbr&sni=$tuic_domain&allow_insecure=${is_insecure}${hopping_param}#$HOSTNAME-tuicv5
+
+Surge 配置:
+$HOSTNAME-tuicv5 = tuic-v5, $last_ip, $main_p, password=$auth_pwd, uuid=$auth_uuid, ecn=true, skip-cert-verify=${skip_cert}, sni=$tuic_domain
+EOF
+
   cat << EOF > "$STATE_FILE"
-PORT='${PORT}'
-USERNAME='${USERNAME}'
-PASSWORD='${PASSWORD}'
-SERVER_NAME='${SERVER_NAME}'
-SHORT_ID='${SHORT_ID}'
-REMARK='${REMARK}'
-PRIVATE_KEY='${PRIVATE_KEY}'
-PUBLIC_KEY='${PUBLIC_KEY}'
-SERVER_IP='${SERVER_IP}'
+port='${main_p}'
+auth_uuid='${auth_uuid}'
+auth_pwd='${auth_pwd}'
+tuic_domain='${tuic_domain}'
+cert_path='${cert_path}'
+key_path='${key_path}'
 EOF
   chmod 600 "$STATE_FILE"
 
-  # 服务调配控制
-  if has_command systemctl && [[ -f "$SYSTEMD_SERVICES_DIR/mo-anyreality-sb.service" ]]; then
-    systemctl daemon-reload
-    systemctl enable mo-anyreality-sb >/dev/null 2>&1 || true
-    systemctl restart mo-anyreality-sb >/dev/null 2>&1 || true
-  elif [[ -f "/etc/init.d/sing-box" ]]; then
-    /etc/init.d/sing-box restart >/dev/null 2>&1 || true
-    info "已通过系统 init.d 守护进程应用新配置并重启。"
+  rc-service "$SB_SERVICE_NAME" restart >/dev/null 2>&1 || true
+  if rc-service "$SB_SERVICE_NAME" status 2>/dev/null | grep -q "started"; then
+    info "sing-box TUIC 服务配置并启动成功！"
   else
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-    chmod +x "$EXECUTABLE_INSTALL_PATH"
-    "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
-    info "非 systemd 环境，程序已重新挂载至后台 Pid 进程池中运行。"
+    if pgrep -f "$BINARY_PATH run" >/dev/null 2>&1; then
+      info "服务已在常驻后台进程状态下建立成功！"
+    else
+      error "sing-box TUIC 启动失败，可在菜单中按 8 查看详细的错误日志。"
+    fi
   fi
-  
-  if command -v ufw >/dev/null 2>&1; then
-    ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
-  fi
-
   showconf
 }
 
-# =========================================================
-# 5. 主流程控制模块与更新功能
-# =========================================================
-inst_singbox() {
-  check_environment
-  
-  if [[ -f "$SB_CONFIG" ]]; then
-    warn "系统检测到已存在配置。如果是要修改配置，请在菜单中选择选项 4。"
-    read -rp "是否执意重新安装？(旧配置将被覆盖) [y/N]: " CONFIRM_REINST
-    [[ "$CONFIRM_REINST" != "y" && "$CONFIRM_REINST" != "Y" ]] && return 0
-  fi
+write_openrc_script() {
+  cat << EOF > "$OPENRC_SERVICE_PATH"
+#!/sbin/openrc-run
 
-  info "🧹 正在清理前置依赖并准备下载..."
-  if [[ ! -f "$EXECUTABLE_INSTALL_PATH" ]]; then
-    info "获取 GitHub 官方最新发布版本中..."
-    local latest_version=$(get_latest_version)
+name="${SB_SERVICE_NAME}"
+description="sing-box TUIC OpenRC Standalone Service"
+cfgfile="${TUIC_CONFIG}"
+logfile="${LOG_FILE}"
+command="${BINARY_PATH}"
+command_args="run -c ${TUIC_CONFIG}"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    if [ ! -f "\$cfgfile" ]; then
+        eerror "Configuration file \$cfgfile missing!"
+        return 1
+    fi
     
-    local _tmpfile_tar=$(mktemp)
-    if ! download_singbox "$latest_version" "$_tmpfile_tar"; then
-      rm -f "$_tmpfile_tar" && return 1
+    # 每次启动服务前强行拉起系统的转发模块和 iptables 状态，实现完美自愈
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    modprobe iptable_nat >/dev/null 2>&1 || true
+    modprobe xt_REDIRECT >/dev/null 2>&1 || true
+    
+    # 强行刷新 NAT 映射确保重启后不会丢包
+    if [ -f "/etc/sing-box-tuic/hopping.txt" ] && [ -f "/etc/sing-box-tuic/main_port.txt" ]; then
+        local hop_val=\$(cat "/etc/sing-box-tuic/hopping.txt")
+        local main_p=\$(cat "/etc/sing-box-tuic/main_port.txt")
+        local start_p=\${hop_val%-*}
+        local end_p=\${hop_val#*-}
+        iptables -t nat -D PREROUTING -p udp --dport "\$start_p:\$end_p" -j REDIRECT --to-ports "\$main_p" 2>/dev/null || true
+        iptables -t nat -A PREROUTING -p udp --dport "\$start_p:\$end_p" -j REDIRECT --to-ports "\$main_p"
     fi
 
-    echo -ne "正在从解压并安装二进制可执行文件 ... "
-    local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
-    tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
+    touch "\$logfile"
+    chown singbox:singbox "\$logfile"
+    chmod 644 "\$logfile"
     
-    local _ver_num="${latest_version#v}"
-    if install -Dm755 "$_tmpdir_extract/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE/sing-box" "$EXECUTABLE_INSTALL_PATH"; then
-      echo "成功"
-      chmod +x "$EXECUTABLE_INSTALL_PATH"
+    command_background="yes"
+    pidfile="/run/\${RC_SVCNAME}.pid"
+    output_log="\$logfile"
+    error_log="\$logfile"
+    
+    local port
+    port=\$(jq -r '.inbounds[0].listen_port // 0' "\$cfgfile" 2>/dev/null)
+    if [ "\$port" -lt 1024 ] && [ "\$port" -ne 0 ]; then
+        command_user="root:root"
     else
-      rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "安装失败" && return 1
+        command_user="singbox:singbox"
     fi
-    rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
-  else
-    info "系统已存在 sing-box 核心组件，跳过基础安装。"
-    chmod +x "$EXECUTABLE_INSTALL_PATH"
+}
+EOF
+  chmod +x "$OPENRC_SERVICE_PATH"
+  rc-update add "$SB_SERVICE_NAME" default >/dev/null 2>&1 || true
+}
+
+download_core() {
+  local arch url
+  arch=$(detect_arch)
+  get_latest_version
+  url=$(printf 'https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz' "$SINGBOX_VERSION" "$SINGBOX_VERSION" "$arch")
+  
+  info "正在下载官方核心 sing-box v$SINGBOX_VERSION..."
+  cd "$TMP_DIR"
+  if ! wget -O sing-box.tar.gz -q "$url"; then
+    curl -fsSL -o sing-box.tar.gz "$url" || { error "下载核心文件失败"; return 1; }
   fi
+  
+  tar -xzf sing-box.tar.gz -C "$TMP_DIR"
+  local extracted=$(find "$TMP_DIR" -type f -name sing-box | head -n 1)
+  [[ -n "$extracted" ]] || { error "解压目标核心错误"; return 1; }
+  
+  rc-service "$SB_SERVICE_NAME" stop >/dev/null 2>&1 || true
+  install -m 755 "$extracted" "$BINARY_PATH"
+  info "sing-box TUIC 专属核心释放完毕。"
+  return 0
+}
 
-  if has_command systemctl && [[ ! -f "$SYSTEMD_SERVICES_DIR/mo-anyreality-sb.service" ]] && [[ ! -f "/etc/init.d/sing-box" ]]; then
-    install_content -Dm644 "$(tpl_singbox_server_service_base)" "$SYSTEMD_SERVICES_DIR/mo-anyreality-sb.service" "1"
-  fi
+install_tuic() {
+  echo -e "${GREEN}[信息] 开始在 Alpine 下部署 sing-box TUIC V5 独立自愈系统...${RESET}"
+  check_environment
+  mkdir -p "$CONFIG_DIR" "$TUIC_DIR"
 
-  # 全新随机默认值
-  local rand_port=$(shuf -i 10000-65535 -n 1)
-  local rand_user=$(python3 -c "import secrets, string; print('user-' + ''.join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(6)))")
-  local rand_pass=$(python3 -c "import secrets, string; print(''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12)))")
-  local rand_sid=$(python3 -c "import secrets; print(secrets.token_hex(8))")
-  local hostname_str=$(hostname 2>/dev/null || echo "linux")
-  local default_remark="${hostname_str}-AnyReality"
+  if ! download_core; then return 1; fi
 
-  echo "---------------------------------------------"
-  read -rp "👉 请输入监听端口 (默认随机: ${rand_port}): " INPUT_PORT
-  PORT=${INPUT_PORT:-$rand_port}
+  write_openrc_script
+  inst_cert || return 1
+  inst_port
+  
+  read -rp "设置 Tuic 验证 UUID (回车自动分配随机 UUID): " auth_uuid
+  auth_uuid=${auth_uuid:-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "12345678-1234-1234-1234-123456781234")}
+  
+  read -rp "设置 Tuic 验证密码 (回车自动分配随机密码): " auth_pwd
+  auth_pwd=${auth_pwd:-$(generate_random_password)}
 
-  read -rp "👉 请输入用户名 (默认随机: ${rand_user}): " INPUT_USERNAME
-  USERNAME=${INPUT_USERNAME:-$rand_user}
-
-  read -rp "👉 请输入密码 (默认随机: ${rand_pass}): " INPUT_PASSWORD
-  PASSWORD=${INPUT_PASSWORD:-$rand_pass}
-
-  read -rp "👉 请输入伪装域名/SNI (默认: www.amazon.com): " INPUT_SERVER_NAME
-  SERVER_NAME=${INPUT_SERVER_NAME:-www.amazon.com}
-
-  read -rp "👉 请输入 Reality short_id (默认随机: ${rand_sid}): " INPUT_SHORT_ID
-  SHORT_ID=${INPUT_SHORT_ID:-$rand_sid}
-
-  read -rp "👉 请输入节点备注名称 (默认: ${default_remark}): " INPUT_REMARK
-  REMARK=${INPUT_REMARK:-$default_remark}
-
-  PRIVATE_KEY=""
-  PUBLIC_KEY=""
-  generate_or_use_key
   write_and_show_config
 }
 
-modify_config() {
-  if [[ ! -f "$SB_CONFIG" ]]; then
-    error "未找到正在运行的配置文件，请先选择选项 1 安装节点。"
+update_tuic() {
+  if [[ ! -f "$BINARY_PATH" ]]; then
+    error "当前系统未检测到独立内核，无法执行原地升级。"
+    return 1
+  fi
+  info "检测到已有隔离环境，正在执行专属内核原地无损覆盖升级..."
+  if download_core; then
+    rc-service "$SB_SERVICE_NAME" start >/dev/null 2>&1 || true
+    info "sing-box TUIC 专属核心升级成功，服务已安全启动！"
+  else
+    error "核心升级遭遇未预期中断。"
+  fi
+}
+
+unsttuic() {
+  warn "即将清除端口规则并安全卸载 sing-box TUIC v5 服务..."
+  clear_old_iptables
+
+  rc-service "$SB_SERVICE_NAME" stop >/dev/null 2>&1 || true
+  rc-update del "$SB_SERVICE_NAME" default >/dev/null 2>&1 || true
+  pkill -f "$BINARY_PATH run" || true
+  
+  rm -f "$BINARY_PATH" "$OPENRC_SERVICE_PATH" "$LOG_FILE" "$STATE_FILE"
+  rm -rf "$CONFIG_DIR" "$TUIC_DIR"
+  
+  info "独立空间卸载、转发链条完全清理干净！"
+}
+
+changeconf() {
+  if [[ ! -f "$TUIC_CONFIG" ]]; then
+    error "配置文件不存在，请先选择选项 1 安装独立服务"
     return 1
   fi
 
-  info "正在读取现有节点配置..."
-  local current_port=$(jq -r '.inbounds[0].listen_port // empty' "$SB_CONFIG" 2>/dev/null)
-  local current_user=$(jq -r '.inbounds[0].users[0].name // empty' "$SB_CONFIG" 2>/dev/null)
-  local current_pass=$(jq -r '.inbounds[0].users[0].password // empty' "$SB_CONFIG" 2>/dev/null)
-  local current_sni=$(jq -r '.inbounds[0].tls.server_name // empty' "$SB_CONFIG" 2>/dev/null)
-  local current_sid=$(jq -r '.inbounds[0].tls.reality.short_id // empty' "$SB_CONFIG" 2>/dev/null)
-  local current_private_key=$(jq -r '.inbounds[0].tls.reality.private_key // empty' "$SB_CONFIG" 2>/dev/null)
+  local old_uuid=$(jq -r '.inbounds[0].users[0].uuid // empty' "$TUIC_CONFIG")
+  local old_pwd=$(jq -r '.inbounds[0].users[0].password // empty' "$TUIC_CONFIG")
+  local old_cert=$(jq -r '.inbounds[0].tls.certificate_path // empty' "$TUIC_CONFIG")
+  local old_key=$(jq -r '.inbounds[0].tls.key_path // empty' "$TUIC_CONFIG")
+  local old_sni=$(jq -r '.inbounds[0].tls.server_name // "www.bing.com"' "$TUIC_CONFIG")
+
+  clear
+  echo -e "${GREEN}====== 修改 sing-box Tuic 配置 ======${RESET}"
+  echo "提示：直接敲回车将保持原有配置不变"
+  echo "---------------------------------------------"
   
-  local current_remark=""
-  local current_public_key=""
-  if [[ -f "$STATE_FILE" ]]; then
-    current_remark=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 || true)
-    current_public_key=$(grep -E "^PUBLIC_KEY=" "$STATE_FILE" | cut -d"'" -f2 || true)
+  inst_port 
+
+  local auth_uuid
+  read -rp "设置 Tuic 验证 UUID [当前: ${old_uuid}, 回车不修改]: " auth_uuid
+  auth_uuid=${auth_uuid:-$old_uuid}
+
+  local auth_pwd
+  read -rp "设置 Tuic 验证密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
+  auth_pwd=${auth_pwd:-$old_pwd}
+
+  local cert_path key_path tuic_domain
+  echo "---------------------------------------------"
+  read -rp "是否需要修改证书？[y/N] (直接回车默认不修改): " change_cert_flag
+  if [[ "$change_cert_flag" == "y" || "$change_cert_flag" == "Y" ]]; then
+    inst_cert || return 1
+  else
+    cert_path="$old_cert"
+    key_path="$old_key"
+    tuic_domain="$old_sni"
   fi
 
-  local fallback_remark="AnyReality-Node"
-
-  echo "---------------------------------------------"
-  echo -e "${YELLOW}提示：直接敲回车(Enter)将保持括号内的当前值不变${RESET}"
-  echo "---------------------------------------------"
-
-  read -rp "👉 修改监听端口 (当前: ${current_port}): " INPUT_PORT
-  PORT=${INPUT_PORT:-$current_port}
-
-  read -rp "👉 修改用户名 (当前: ${current_user}): " INPUT_USERNAME
-  USERNAME=${INPUT_USERNAME:-$current_user}
-
-  read -rp "👉 修改密码 (当前: ${current_pass}): " INPUT_PASSWORD
-  PASSWORD=${INPUT_PASSWORD:-$current_pass}
-
-  read -rp "👉 修改伪装域名/SNI (当前: ${current_sni}): " INPUT_SERVER_NAME
-  SERVER_NAME=${INPUT_SERVER_NAME:-$current_sni}
-
-  read -rp "👉 修改 Reality short_id (当前: ${current_sid}): " INPUT_SHORT_ID
-  SHORT_ID=${INPUT_SHORT_ID:-$current_sid}
-
-  read -rp "👉 修改节点备注名称 (当前: ${current_remark:-$fallback_remark}): " INPUT_REMARK
-  REMARK=${INPUT_REMARK:-${current_remark:-$fallback_remark}}
-
-  PRIVATE_KEY="$current_private_key"
-  PUBLIC_KEY="$current_public_key"
-
-  generate_or_use_key
   write_and_show_config
-}
-
-update_singbox() {
-  if [[ ! -f "$EXECUTABLE_INSTALL_PATH" ]]; then
-    error "当前系统未安装 Sing-box，无法执行更新。"
-    return 1
-  fi
-
-  info "正在检查新版本..."
-  local current_version=$(get_installed_version)
-  local latest_version=$(get_latest_version)
-
-  info "当前安装版本: ${YELLOW}${current_version}${RESET}"
-  info "官方最新版本: ${GREEN}${latest_version}${RESET}"
-
-  if [[ "$current_version" == *"$latest_version"* || "$latest_version" == *"$current_version"* ]]; then
-    info "您当前已经是最新版本，无需更新。"
-    return 0
-  fi
-
-  warn "检测到新版本，即将开始平滑更新 (你的节点配置不会改变)..."
-  
-  local _tmpfile_tar=$(mktemp)
-  if ! download_singbox "$latest_version" "$_tmpfile_tar"; then
-    rm -f "$_tmpfile_tar" && return 1
-  fi
-
-  echo -ne "正在覆盖二进制核心文件 ... "
-  local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
-  tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
-  
-  local _ver_num="${latest_version#v}"
-  if install -Dm755 "$_tmpdir_extract/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE/sing-box" "$EXECUTABLE_INSTALL_PATH"; then
-    echo "成功"
-    chmod +x "$EXECUTABLE_INSTALL_PATH"
-  else
-    rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "覆盖核心失败" && return 1
-  fi
-  rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
-
-  info "正在重启 Sing-box 服务以应用更新..."
-  if has_command systemctl && [[ -f "$SYSTEMD_SERVICES_DIR/mo-anyreality-sb.service" ]]; then
-    systemctl daemon-reload
-    systemctl restart mo-anyreality-sb >/dev/null 2>&1 || true
-  elif [[ -f "/etc/init.d/sing-box" ]]; then
-    /etc/init.d/sing-box restart >/dev/null 2>&1 || true
-  else
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-    "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
-  fi
-  info "更新流程顺利结束。"
-}
-
-uninstall_singbox() {
-  if has_command systemctl && [[ -f "$SYSTEMD_SERVICES_DIR/mo-anyreality-sb.service" ]]; then
-    systemctl stop mo-anyreality-sb >/dev/null 2>&1 || true
-    systemctl disable mo-anyreality-sb >/dev/null 2>&1 || true
-    remove_file "$SYSTEMD_SERVICES_DIR/mo-anyreality-sb.service"
-    systemctl daemon-reload
-  elif [[ -f "/etc/init.d/sing-box" ]]; then
-    /etc/init.d/sing-box stop >/dev/null 2>&1 || true
-    warn "系统拥有托管的 init.d 脚本，为了防止系统依赖受损，仅清空节点配置，请知悉。"
-  else
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-  fi
-  
-  remove_file "$EXECUTABLE_INSTALL_PATH"
-  rm -f "$SB_CONFIG" "$STATE_FILE"
-  rm -rf "$CONFIG_DIR" "$SB_DIR"
-
-  info "已卸载控制面板创建的配置与节点文件。"
+  info "独立转发链条与自愈配置文件更新成功！"
 }
 
 showconf() {
-  if [[ ! -f "$STATE_FILE" ]]; then
-    error "未找到任何安装配置底座，请先安装节点。"
-    return 1
+  if [[ ! -d "$TUIC_DIR" ]]; then
+    error "未找到分享配置文件。"
+    return
   fi
-  source "$STATE_FILE"
-
-  local encoded_remark=$(jq -rn --arg x "$REMARK" '$x|@uri')
-  local v2rayn_link="anytls://${PASSWORD}@${SERVER_IP}:${PORT}?security=reality&sni=${SERVER_NAME}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${encoded_remark}"
-
-  echo -e "${GREEN}====== AnyTLS+Reality 节点配置信息 ======${RESET}"
-  echo -e "${GREEN}服务器公网 IP :${RESET} ${SERVER_IP}"
-  echo -e "${GREEN}服务监听端口   :${RESET} ${PORT}"
-  echo -e "${GREEN}认证用户名     :${RESET} ${USERNAME}"
-  echo -e "${GREEN}认证通信密码   :${RESET} ${PASSWORD}"
-  echo -e "${GREEN}伪装域名 (SNI) :${RESET} ${SERVER_NAME}"
-  echo -e "${GREEN}Reality 公钥   :${RESET} ${PUBLIC_KEY}"
-  echo -e "${GREEN}Reality 目标ID :${RESET} ${SHORT_ID}"
-  echo -e "${GREEN}客户端指纹模式 :${RESET} chrome"
-  echo -e "${GREEN}节点自定义备注 :${RESET} ${REMARK}"
-  echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
-  echo "---------------------------------------------"
-  echo -e "${GREEN}👉 v2rayN 分享链接:${RESET}"
-  echo -e "${YELLOW}${v2rayn_link}${RESET}"
-  echo "---------------------------------------------"
+  echo -e "${GREEN}====== 节点分享与配置信息 ======${RESET}"
+  cat "$TUIC_DIR/url.txt"
+  echo
 }
 
-# ================== SNI 优选（高并发联动版） ==================
-select_best_sni() {
-    info "开始高并发 SNI 延迟优选测试..."
-
-    local SNIS=(
-      amd.com apps.mzstatic.com aws.com azure.microsoft.com beacon.gtv-pub.com
-      bing.com catalog.gamepass.com cdn.bizibly.com cdn-dynmedia-1.microsoft.com
-      devblogs.microsoft.com fpinit.itunes.apple.com go.microsoft.com
-      gray-config-prod.api.arc-cdn.net gray.video-player.arcpublishing.com
-      images.nvidia.com r.bing.com services.digitaleast.mobi snap.licdn.com
-      statici.icloud.com tag.demandbase.com tag-logger.demandbase.com
-      ts1.tc.mm.bing.net ts2.tc.mm.bing.net vs.aws.amazon.com www.apple.com
-      www.icloud.com www.microsoft.com www.oracle.com www.xbox.com
-      www.xilinx.com xp.apple.com
-    )
-
-    local tmp_result=$(mktemp)
-    
-    for sni in "${SNIS[@]}"; do
-        (
-            local start=$(date +%s%N)
-            if timeout 2 openssl s_client -connect "${sni}:443" -servername "${sni}" -brief </dev/null >/dev/null 2>&1; then
-                local end=$(date +%s%N)
-                local cost=$(( (end - start) / 1000000 ))
-                echo "$cost $sni" >> "$tmp_result"
-                echo -e "[SNI] $sni -> ${GREEN}${cost}ms${RESET}"
-            fi
-        ) &
-    done
-    wait
-
-    if [[ ! -s "$tmp_result" ]]; then
-        warn "未找到任何可用的 SNI 域名。"
-        rm -f "$tmp_result"
-        return 1
-    fi
-
-    local best_line=$(sort -n "$tmp_result" | head -n 1)
-    local best_time=$(echo "$best_line" | awk '{print $1}')
-    local best_sni=$(echo "$best_line" | awk '{print $2}')
-    rm -f "$tmp_result"
-
-    info "🏆 最优 SNI 域名为: ${GREEN}$best_sni${RESET} (${best_time}ms)"
-
-    if [[ -f "$SB_CONFIG" ]]; then
-        echo "---------------------------------------------"
-        read -rp "👉 是否将此优选 SNI 直接应用到当前的 Sing-box 配置中？(y/N): " APPLY_SNI
-        if [[ "$APPLY_SNI" == "y" || "$APPLY_SNI" == "Y" ]]; then
-            PORT=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG")
-            USERNAME=$(jq -r '.inbounds[0].users[0].name' "$SB_CONFIG")
-            PASSWORD=$(jq -r '.inbounds[0].users[0].password' "$SB_CONFIG")
-            SHORT_ID=$(jq -r '.inbounds[0].tls.reality.short_id' "$SB_CONFIG")
-            PRIVATE_KEY=$(jq -r '.inbounds[0].tls.reality.private_key' "$SB_CONFIG")
-            SERVER_NAME="$best_sni"
-            
-            if [[ -f "$STATE_FILE" ]]; then
-                REMARK=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 || echo "AnyReality")
-                PUBLIC_KEY=$(grep -E "^PUBLIC_KEY=" "$STATE_FILE" | cut -d"'" -f2 || echo "")
-            else
-                REMARK="AnyReality"
-                PUBLIC_KEY=""
-            fi
-            
-            write_and_show_config
-        fi
-    else
-        info "提示：当前未生成配置文件，您可以在安装节点时手动填入此域名。"
-    fi
-    return 0
-}
-
-# =========================================================
-# 6. 面板主菜单
-# =========================================================
 menu() {
-  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
   check_environment
-
   while true; do
     clear
-    local status=$(get_sb_status)
+    local raw_status=$(get_tuic_status)
+    local status=""
+    if [[ "$raw_status" == "RUNNING" ]]; then
+      status="${GREEN}● 运行中${RESET}"
+    else
+      status="${RED}● 未运行${RESET}"
+    fi
+
     local version=$(get_installed_version)
     local port_show=$(get_current_port_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} Sing-box AnyTLS + Reality 面板  ${RESET}"
+    echo -e "${GREEN}   Sing-box(Tuicv5) 隔离独立面板 ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $status"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}状态   :${RESET} ${status}"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 AnyReality${RESET}"
-    echo -e "${GREEN} 2. 更新 AnyReality${RESET}"
-    echo -e "${GREEN} 3. 卸载 AnyReality${RESET}"
-    echo -e "${GREEN} 4. 修改配置${RESET}"
-    echo -e "${GREEN} 5. 启动 AnyReality${RESET}"
-    echo -e "${GREEN} 6. 停止 AnyReality${RESET}"
-    echo -e "${GREEN} 7. 重启 AnyReality${RESET}"
-    echo -e "${GREEN} 8. 查看日志${RESET}"
-    echo -e "${GREEN} 9. 查看节点配置${RESET}"
-    echo -e "${GREEN}10. SNI域名优选✨${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}1. 安装 隔离型 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}2. 更新 隔离型 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}3. 卸载 隔离型 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}4. 修改隔离配置${RESET}"
+    echo -e "${GREEN}5. 启动 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}6. 停止 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}7. 重启 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}8. 查看专属闪退与系统日志${RESET}"
+    echo -e "${GREEN}9. 查看节点分享配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
 
     local choice=""
@@ -696,58 +669,24 @@ menu() {
     [[ -z "$choice" ]] && continue
 
     case "$choice" in
-      1) inst_singbox; pause ;;
-      2) update_singbox; pause ;;
-      3) uninstall_singbox; pause ;;
-      4) modify_config; pause ;;
-      5) 
-        if has_command systemctl && [[ -f "$SYSTEMD_SERVICES_DIR/mo-anyreality-sb.service" ]]; then
-          systemctl start mo-anyreality-sb && info "服务已成功启动！"
-        elif [[ -f "/etc/init.d/sing-box" ]]; then
-          /etc/init.d/sing-box start && info "系统守护进程已呼叫启动！"
-        else
-          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-          "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
-          info "进程已在后台挂载启动！"
-        fi
-        pause ;;
-      6) 
-        if has_command systemctl && [[ -f "$SYSTEMD_SERVICES_DIR/mo-anyreality-sb.service" ]]; then
-          systemctl stop mo-anyreality-sb && info "服务已成功停止！"
-        elif [[ -f "/etc/init.d/sing-box" ]]; then
-          /etc/init.d/sing-box stop && info "系统守护进程已接收停止指令！"
-        else
-          pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台进程已终止！"
-        fi
-        pause ;;
-      7) 
-        if has_command systemctl && [[ -f "$SYSTEMD_SERVICES_DIR/mo-anyreality-sb.service" ]]; then
-          systemctl restart mo-anyreality-sb && info "服务已成功重启！"
-        elif [[ -f "/etc/init.d/sing-box" ]]; then
-          /etc/init.d/sing-box restart && info "系统守护进程已完成重启！"
-        else
-          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-          "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
-          info "后台进程已重启！"
-        fi
-        pause ;;
-      8) 
-        if has_command systemctl && [[ -f "$SYSTEMD_SERVICES_DIR/mo-anyreality-sb.service" ]]; then
-          journalctl -u mo-anyreality-sb.service -n 50 --no-pager
-        elif [[ -f "/var/log/messages" ]]; then
-          tail -n 50 /var/log/messages | grep -E "sing-box|supervise-daemon" || tail -n 30 /var/log/messages
-        elif has_command logread; then
-          logread -e sing-box | tail -n 50
-        else
-          warn "当前环境未发现集中的系统级日志文件。"
-        fi
-        pause ;;
+      1) install_tuic; pause ;;
+      2) update_tuic; pause ;;
+      3) rm -f "${CONFIG_DIR}/hopping.txt" "${CONFIG_DIR}/main_port.txt" 2>/dev/null; unsttuic; pause ;;
+      4) changeconf; pause ;;
+      5) rc-service "$SB_SERVICE_NAME" start || pkill -f "$BINARY_PATH run" || true; info "服务已成功递交启动指令。"; pause ;;
+      6) rc-service "$SB_SERVICE_NAME" stop || pkill -f "$BINARY_PATH run" || true; info "服务已成功递交停止指令。"; pause ;;
+      7) rc-service "$SB_SERVICE_NAME" restart || true; info "服务与防火墙规则已重启刷新。"; pause ;;
+      8) if [[ -f "$LOG_FILE" ]]; then tail -n 50 "$LOG_FILE"; else warn "未发现运行日志文件，请检查服务是否从未启动成功。"; fi; pause ;;
       9) showconf; pause ;;
-      10) select_best_sni; pause ;;
       0) exit 0 ;;
       *) error "无效输入，请重新选择。"; sleep 1 ;;
     esac
   done
 }
+
+if [[ ${EUID} -ne 0 ]]; then
+  error "请切换至 root 用户运行此面板脚本。"
+  exit 1
+fi
 
 menu "$@"

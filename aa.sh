@@ -1,27 +1,31 @@
 #!/usr/bin/env bash
 #
-# Sing-box (AnyTLS + Reality) 控制面板 (重构优化版)
+# Sing-box (AnyTLS + Reality) Alpine 专属核心控制面板 (独立共存版)
 # SPDX-License-Identifier: MIT
 #
+# =========================================================
+# 1. 核心控制与全局环境初始化
+# =========================================================
 set -Eop pipefail
 export LANG=en_US.UTF-8
 
-# 基础目录与硬编码配置
-readonly SB_CONFIG="/etc/mo-anyreality-sb/config.json"
-readonly SB_BINARY="/usr/local/bin/sing-box"
-readonly SB_DIR="/root/proxynode/anyreality"
-readonly STATE_FILE="/etc/mo-anyreality-sb.env"
-EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
-SYSTEMD_SERVICES_DIR="/etc/systemd/system"
-CONFIG_DIR="/etc/mo-anyreality-sb"
+# 【重构：独立路径与服务名，防止与原生冲突】
+readonly SB_SERVICE_NAME="sing-box-anyreality"
+readonly SB_CONFIG="/etc/sing-box-anyreality/config.json"
+readonly SB_BINARY="/usr/local/bin/sing-box-anyreality"
+readonly SB_DIR="/root/AnyReality"
+readonly STATE_FILE="/etc/anyreality-singbox-standalone.env"
+EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box-anyreality"
+INIT_SERVICE_DIR="/etc/init.d"
+CONFIG_DIR="/etc/sing-box-anyreality"
+
 REPO_URL="https://github.com/SagerNet/sing-box"
 API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
 CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
 
 # 自动检测环境与动态变量池
-PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
-OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
-ARCHITECTURE="${ARCHITECTURE:-}"
+OPERATING_SYSTEM="linux"
+ARCHITECTURE=""
 
 # 终端规范颜色代码
 GREEN="\033[32m"
@@ -32,7 +36,7 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 # =========================================================
-# 2. 官方原生底层工具函数
+# 2. Alpine 原生底层工具函数
 # =========================================================
 has_command() {
   local _command=$1
@@ -44,7 +48,7 @@ curl() {
 }
 
 mktemp() {
-  command mktemp "$@" "sbservinst.XXXXXXXXXX"
+  command mktemp -t "sbservinst.XXXXXXXXXX"
 }
 
 info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
@@ -52,29 +56,38 @@ warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
 error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
 pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
 
-systemctl() {
-  if ! has_command systemctl; then
-    warn "当前系统不支持 systemd，忽略守护进程操作: systemctl $*"
-    return 0
+# OpenRC 服务状态与操作封装
+rc_service() {
+  if ! has_command rc-service; then
+    return 1
   fi
-  command systemctl "$@"
+  command rc-service "$@"
+}
+
+rc_update() {
+  if ! has_command rc-update; then
+    return 1
+  fi
+  command rc-update "$@"
 }
 
 install_content() {
-  local _install_flags="$1"
+  local _perms="$1"
   local _content="$2"
   local _destination="$3"
   local _overwrite="$4"
-  local _tmpfile="$(mktemp)"
 
   echo -ne "安装 $_destination ... "
-  echo "$_content" > "$_tmpfile"
   if [[ -z "$_overwrite" && -e "$_destination" ]]; then
     echo -e "已存在"
-  elif install "$_install_flags" "$_tmpfile" "$_destination"; then
-    echo -e "完成"
+  else
+    # 深度兼容级联创建，防止精简版环境报错
+    if mkdir -p "$(dirname "$_destination")" && echo "$_content" > "$_destination" && chmod "$_perms" "$_destination"; then
+      echo -e "完成"
+    else
+      echo -e "失败"
+    fi
   fi
-  rm -f "$_tmpfile"
 }
 
 remove_file() {
@@ -85,36 +98,20 @@ remove_file() {
   fi
 }
 
-detect_package_manager() {
-  [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
-  has_command apt && PACKAGE_MANAGEMENT_INSTALL='apt -y --no-install-recommends install' && return 0
-  has_command dnf && PACKAGE_MANAGEMENT_INSTALL='dnf -y install' && return 0
-  has_command yum && PACKAGE_MANAGEMENT_INSTALL='yum -y install' && return 0
-  has_command apk && PACKAGE_MANAGEMENT_INSTALL='apk add --no-cache' && return 0
-  return 1
-}
-
 install_software() {
   local _package_name="$1"
-  if ! detect_package_manager; then
-    error "未检测到支持的包管理器，请手动安装 $_package_name"
-    exit 65
-  fi
-  echo "正在安装缺失的依赖 '$_package_name' ... "
-  if $PACKAGE_MANAGEMENT_INSTALL "$_package_name" >/dev/null 2>&1; then
+  echo "正在通过 apk 安装缺失的依赖 '$_package_name' ... "
+  if apk add --no-cache "$_package_name" >/dev/null 2>&1; then
     echo "依赖安装成功"
   else
-    error "无法通过包管理器安装 '$_package_name'，请手动安装。"
+    error "无法通过 apk 安装 '$_package_name'，请手动检查 Alpine 源配置。"
     exit 65
   fi
 }
 
 check_environment() {
-  if [[ "x$(uname)" == "xLinux" ]]; then
-    OPERATING_SYSTEM=linux
-  else
-    error "本脚本仅支持 Linux 系统。"
-    exit 95
+  if [[ ! -f /etc/alpine-release ]]; then
+    warn "检测到当前系统可能不是 Alpine Linux，但脚本将继续尝试运行..."
   fi
 
   case "$(uname -m)" in
@@ -123,11 +120,14 @@ check_environment() {
     *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
   esac
 
+  # 确保 Alpine 环境具备基本依赖
+  has_command bash || install_software bash
   has_command curl || install_software curl
   has_command grep || install_software grep
   has_command jq || install_software jq
   has_command tar || install_software tar
   has_command python3 || install_software python3
+  has_command openssl || install_software openssl
 }
 
 get_installed_version() {
@@ -148,6 +148,7 @@ get_latest_version() {
   local _tmpfile=$(mktemp)
   if ! curl -sS -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases" -o "$_tmpfile"; then
     rm -f "$_tmpfile"
+    echo "v1.12.3"
     return
   fi
   local _tag_name=$(jq -r '[.[] | select(.prerelease==false and .draft==false)][0].tag_name' "$_tmpfile" 2>/dev/null || echo "")
@@ -181,27 +182,30 @@ get_public_ip() {
     ip=$(curl -4s --max-time 5 "$url" 2>/dev/null || true)
     [[ -n "$ip" ]] && { echo "$ip"; return; }
   done
-  hostname -I | awk '{print $1}'
+  hostname -i | awk '{print $1}' 2>/dev/null || echo "127.0.0.1"
 }
 
-tpl_singbox_server_service_base() {
+# Alpine OpenRC 专属服务脚本底座（已独立化重构）
+tpl_singbox_server_openrc_base() {
   cat << EOF
-[Unit]
-Description=sing-box service
-Documentation=https://sing-box.sagernet.org
-After=network.target nss-lookup.target network-online.target
+#!/sbin/openrc-run
 
-[Service]
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-ExecStart=$EXECUTABLE_INSTALL_PATH run -c $SB_CONFIG
-ExecReload=/bin/kill -HUP \$MAINPID
-Restart=on-failure
-RestartSec=10s
-LimitNOFILE=infinity
+description="Sing-box AnyTLS Reality Standalone Service"
+supervisor="supervise-daemon"
+command="${EXECUTABLE_INSTALL_PATH}"
+command_args="run -c ${SB_CONFIG}"
+extra_started_commands="reload"
 
-[Install]
-WantedBy=multi-user.target
+depend() {
+    need net
+    after firewall
+}
+
+reload() {
+    ebegin "Reloading ${SB_SERVICE_NAME} configuration"
+    supervise-daemon --signal HUP --name ${SB_SERVICE_NAME}
+    eend \$?
+}
 EOF
 }
 
@@ -209,8 +213,8 @@ EOF
 # 3. 面板辅助网络与状态扩展函数
 # =========================================================
 get_sb_status() {
-  if has_command systemctl && systemctl is-active --quiet mo-anyreality-sb 2>/dev/null; then
-    echo -e "${GREEN}● 运行中${RESET}"
+  if has_command rc-service && rc-service "$SB_SERVICE_NAME" status >/dev/null 2>&1; then
+    echo -e "${GREEN}● 运行中 ${RESET}"
   else
     if pgrep -f "$EXECUTABLE_INSTALL_PATH run" >/dev/null 2>&1; then
       echo -e "${GREEN}● 运行中 (Pidmode)${RESET}"
@@ -306,25 +310,22 @@ SERVER_IP='${SERVER_IP}'
 EOF
   chmod 600 "$STATE_FILE"
 
-  if has_command systemctl; then
-    systemctl daemon-reload
-    systemctl enable mo-anyreality-sb >/dev/null 2>&1 || true
-    systemctl restart mo-anyreality-sb >/dev/null 2>&1 || true
-    if systemctl is-active --quiet mo-anyreality-sb 2>/dev/null; then
-      info "Sing-box (AnyTLS) 服务配置并启动成功！"
+  # 托管环境行为控制
+  if has_command rc-service && [ -d "$INIT_SERVICE_DIR" ]; then
+    rc_update add "$SB_SERVICE_NAME" default >/dev/null 2>&1 || true
+    rc_service "$SB_SERVICE_NAME" restart >/dev/null 2>&1 || true
+    if rc_service "$SB_SERVICE_NAME" status >/dev/null 2>&1; then
+      info "Sing-box (AnyTLS) 独立服务通过 OpenRC 启动成功！"
     else
-      error "Sing-box 服务启动失败，请运行 'journalctl -u mo-anyreality-sb -f' 查看错误日志。"
+      error "Sing-box 独立服务启动失败，请检查 /var/log/messages 日志。"
     fi
   else
+    # 极简无 OpenRC 容器降级策略
     pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
     "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
-    info "非 systemd 环境，程序已挂载至后台 Pid 进程池中运行。"
+    info "未检测到 OpenRC 环境，独立程序已挂载至后台常驻进程模式。"
   fi
   
-  if command -v ufw >/dev/null 2>&1; then
-    ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
-  fi
-
   showconf
 }
 
@@ -336,15 +337,13 @@ inst_singbox() {
   check_environment
   
   if [[ -f "$SB_CONFIG" ]]; then
-    warn "系统检测到已存在配置。如果是要修改配置，请在菜单中选择选项 4。"
+    warn "系统检测到已存在独立配置。如果是要修改配置，请在菜单中选择选项 4。"
     read -rp "是否执意重新安装？(旧配置将被覆盖) [y/N]: " CONFIRM_REINST
     [[ "$CONFIRM_REINST" != "y" && "$CONFIRM_REINST" != "Y" ]] && return 0
   fi
 
   info "🧹 正在清理前置依赖并准备下载..."
-  # BUG修复：使用确切路径检查，防止PATH找不到
   if [[ ! -f "$EXECUTABLE_INSTALL_PATH" ]]; then
-    info "获取 GitHub 官方最新发布版本中..."
     local latest_version=$(get_latest_version)
     
     local _tmpfile_tar=$(mktemp)
@@ -352,30 +351,37 @@ inst_singbox() {
       rm -f "$_tmpfile_tar" && return 1
     fi
 
-    echo -ne "正在从解压并安装二进制可执行文件 ... "
+    echo -ne "正在解压并安装独立二进制可执行文件 ... "
     local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
     tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
     
     local _ver_num="${latest_version#v}"
-    if install -Dm755 "$_tmpdir_extract/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE/sing-box" "$EXECUTABLE_INSTALL_PATH"; then
-      echo "成功"
+    local _extracted_binary=$(find "$_tmpdir_extract" -type f -name "sing-box" | head -n 1)
+
+    if [[ -n "$_extracted_binary" ]]; then
+      mkdir -p "$(dirname "$EXECUTABLE_INSTALL_PATH")"
+      if cp "$_extracted_binary" "$EXECUTABLE_INSTALL_PATH" && chmod 755 "$EXECUTABLE_INSTALL_PATH"; then
+        echo "成功"
+      else
+        rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "安装失败" && return 1
+      fi
     else
-      rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "安装失败" && return 1
+      rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "找不到解压核心" && return 1
     fi
     rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
   else
-    info "系统已存在 sing-box 核心组件，跳过基础安装。"
+    info "系统已存在该独立版本的核心组件，跳过基础安装。"
   fi
 
-  if has_command systemctl && [[ ! -f "$SYSTEMD_SERVICES_DIR/mo-anyreality-sb.service" ]]; then
-    install_content -Dm644 "$(tpl_singbox_server_service_base)" "$SYSTEMD_SERVICES_DIR/mo-anyreality-sb.service" "1"
-  fi
+  # 写入服务脚本（采用完全兼容 BusyBox 的 install_content 原生重构版）
+  install_content "0755" "$(tpl_singbox_server_openrc_base)" "$INIT_SERVICE_DIR/$SB_SERVICE_NAME" "1"
 
-  local rand_port=$(shuf -i 10000-65535 -n 1)
+  # 兼容 Alpine 无 shuf 的随机数处理机制
+  local rand_port=$(awk 'BEGIN{srand();print int(rand()*(65535-10000+1))+10000}')
   local rand_user=$(python3 -c "import secrets, string; print('user-' + ''.join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(6)))")
   local rand_pass=$(python3 -c "import secrets, string; print(''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12)))")
   local rand_sid=$(python3 -c "import secrets; print(secrets.token_hex(8))")
-  local hostname_str=$(hostname 2>/dev/null || echo "linux")
+  local hostname_str=$(hostname 2>/dev/null || echo "alpine")
   local default_remark="${hostname_str}-AnyReality"
 
   echo "---------------------------------------------"
@@ -424,8 +430,8 @@ modify_config() {
     current_public_key=$(grep -E "^PUBLIC_KEY=" "$STATE_FILE" | cut -d"'" -f2 || true)
   fi
 
-  # BUG修复：初始化未定义的兜底备注变量
-  local fallback_remark="AnyReality-Node"
+  local hostname_str=$(hostname 2>/dev/null || echo "alpine")
+  local fallback_remark="${hostname_str}-AnyReality"
 
   echo "---------------------------------------------"
   echo -e "${YELLOW}提示：直接敲回车(Enter)将保持括号内的当前值不变${RESET}"
@@ -458,7 +464,7 @@ modify_config() {
 
 update_singbox() {
   if [[ ! -f "$SB_BINARY" ]]; then
-    error "当前系统未安装 Sing-box，无法执行更新。"
+    error "当前系统未安装该版本 Sing-box，无法执行更新。"
     return 1
   fi
 
@@ -481,40 +487,42 @@ update_singbox() {
     rm -f "$_tmpfile_tar" && return 1
   fi
 
-  echo -ne "正在覆盖二进制核心文件 ... "
+  echo -ne "正在覆盖独立二进制核心文件 ... "
   local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
   tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
   
-  local _ver_num="${latest_version#v}"
-  if install -Dm755 "$_tmpdir_extract/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE/sing-box" "$EXECUTABLE_INSTALL_PATH"; then
-    echo "成功"
+  local _extracted_binary=$(find "$_tmpdir_extract" -type f -name "sing-box" | head -n 1)
+  if [[ -n "$_extracted_binary" ]]; then
+    if cp "$_extracted_binary" "$EXECUTABLE_INSTALL_PATH" && chmod 755 "$EXECUTABLE_INSTALL_PATH"; then
+      echo "成功"
+    else
+      rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "覆盖核心失败" && return 1
+    fi
   else
-    rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "覆盖核心失败" && return 1
+    rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "解压错误" && return 1
   fi
   rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
 
-  info "正在重启 Sing-box 服务以应用更新..."
-  if has_command systemctl; then
-    systemctl daemon-reload
-    systemctl restart mo-anyreality-sb >/dev/null 2>&1 || true
-    if systemctl is-active --quiet mo-anyreality-sb 2>/dev/null; then
-      info "Sing-box 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
+  info "正在重启独立服务以应用更新..."
+  if has_command rc-service && [ -f "$INIT_SERVICE_DIR/$SB_SERVICE_NAME" ]; then
+    rc_service "$SB_SERVICE_NAME" restart >/dev/null 2>&1 || true
+    if rc_service "$SB_SERVICE_NAME" status >/dev/null 2>&1; then
+      info "独立核心已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
     else
-      error "核心更新成功，但服务重启失败，请运行 'journalctl -u mo-anyreality-sb -f' 检查错误。"
+      error "核心更新成功，但 OpenRC 重启服务失败。"
     fi
   else
     pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
     "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
-    info "Sing-box 核心已更新并于后台重启运行。"
+    info "独立核心已更新并于后台重启运行。"
   fi
 }
 
 uninstall_singbox() {
-  if has_command systemctl; then
-    systemctl stop mo-anyreality-sb >/dev/null 2>&1 || true
-    systemctl disable mo-anyreality-sb >/dev/null 2>&1 || true
-    remove_file "$SYSTEMD_SERVICES_DIR/mo-anyreality-sb.service"
-    systemctl daemon-reload
+  if has_command rc-service && [ -f "$INIT_SERVICE_DIR/$SB_SERVICE_NAME" ]; then
+    rc_service "$SB_SERVICE_NAME" stop >/dev/null 2>&1 || true
+    rc_update del "$SB_SERVICE_NAME" default >/dev/null 2>&1 || true
+    remove_file "$INIT_SERVICE_DIR/$SB_SERVICE_NAME"
   else
     pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
   fi
@@ -523,7 +531,7 @@ uninstall_singbox() {
   rm -f "$SB_CONFIG" "$STATE_FILE"
   rm -rf "$CONFIG_DIR" "$SB_DIR"
 
-  info "已卸载 Sing-box、配置文件与状态文件。"
+  info "已完全卸载该独立 Sing-box 服务、配置文件与状态文件。"
 }
 
 showconf() {
@@ -553,79 +561,77 @@ showconf() {
   echo "---------------------------------------------"
 }
 
-# ================== SNI 优选（高并发重构版） ==================
+# ================== SNI 优选 ==================
 select_best_sni() {
-    info "开始高并发 SNI 延迟优选测试..."
+    info "开始优选 SNI 延迟测试"
 
     local SNIS=(
-      amd.com apps.mzstatic.com aws.com azure.microsoft.com beacon.gtv-pub.com
-      bing.com catalog.gamepass.com cdn.bizibly.com cdn-dynmedia-1.microsoft.com
-      devblogs.microsoft.com fpinit.itunes.apple.com go.microsoft.com
-      gray-config-prod.api.arc-cdn.net gray.video-player.arcpublishing.com
-      images.nvidia.com r.bing.com services.digitaleast.mobi snap.licdn.com
-      statici.icloud.com tag.demandbase.com tag-logger.demandbase.com
-      ts1.tc.mm.bing.net ts2.tc.mm.bing.net vs.aws.amazon.com www.apple.com
-      www.icloud.com www.microsoft.com www.oracle.com www.xbox.com
-      www.xilinx.com xp.apple.com
+    amd.com
+    apps.mzstatic.com
+    aws.com
+    azure.microsoft.com
+    beacon.gtv-pub.com
+    bing.com
+    catalog.gamepass.com
+    cdn.bizibly.com
+    cdn-dynmedia-1.microsoft.com
+    devblogs.microsoft.com
+    fpinit.itunes.apple.com
+    go.microsoft.com
+    gray-config-prod.api.arc-cdn.net
+    gray.video-player.arcpublishing.com
+    images.nvidia.com
+    r.bing.com
+    services.digitaleast.mobi
+    snap.licdn.com
+    statici.icloud.com
+    tag.demandbase.com
+    tag-logger.demandbase.com
+    ts1.tc.mm.bing.net
+    ts2.tc.mm.bing.net
+    vs.aws.amazon.com
+    www.apple.com
+    www.icloud.com
+    www.microsoft.com
+    www.oracle.com
+    www.xbox.com
+    www.xilinx.com
+    xp.apple.com
     )
 
-    local tmp_result=$(mktemp)
-    
-    # 利用后台进程实现多线程并发测试
-    for sni in "${SNIS[@]}"; do
-        (
-            local start=$(date +%s%N)
-            if timeout 2 openssl s_client -connect "${sni}:443" -servername "${sni}" -brief </dev/null >/dev/null 2>&1; then
-                local end=$(date +%s%N)
-                local cost=$(( (end - start) / 1000000 ))
-                echo "$cost $sni" >> "$tmp_result"
-                echo -e "[SNI] $sni -> ${GREEN}${cost}ms${RESET}"
-            fi
-        ) &
-    done
-    wait # 等待所有并发测试结束
+    BEST_SNI=""
+    BEST_TIME=999999
 
-    if [[ ! -s "$tmp_result" ]]; then
-        warn "未找到任何可用的 SNI 域名，请检查外部网络连接。"
-        rm -f "$tmp_result"
+    for sni in "${SNIS[@]}"; do
+        start=$(date +%s%N)
+
+        # 增加对 Alpine 环境下 openssl 超时和断连的处理规范
+        timeout 3 openssl s_client \
+            -connect ${sni}:443 \
+            -servername ${sni} \
+            -brief </dev/null >/dev/null 2>&1
+
+        if [ $? -eq 0 ]; then
+            end=$(date +%s%N)
+            cost=$(( (end - start) / 1000000 ))
+
+            echo "[SNI] $sni -> ${cost}ms"
+
+            if [ $cost -lt $BEST_TIME ]; then
+                BEST_TIME=$cost
+                BEST_SNI=$sni
+            fi
+        fi
+    done
+
+    if [ -n "$BEST_SNI" ]; then
+        info "最优 SNI: $BEST_SNI (${BEST_TIME}ms)"
+        echo "$BEST_SNI"
+        return 0
+    else
+        warn "未找到可用 SNI"
         return 1
     fi
-
-    # 排序筛选出延迟最低的
-    local best_line=$(sort -n "$tmp_result" | head -n 1)
-    local best_time=$(echo "$best_line" | awk '{print $1}')
-    local best_sni=$(echo "$best_line" | awk '{print $2}')
-    rm -f "$tmp_result"
-
-    info "🏆 最优 SNI 域名为: ${GREEN}$best_sni${RESET} (${best_time}ms)"
-
-    # 联动配置修改逻辑
-    if [[ -f "$SB_CONFIG" ]]; then
-        echo "---------------------------------------------"
-        read -rp "👉 是否将此优选 SNI 直接应用到当前的 Sing-box 配置中？(y/N): " APPLY_SNI
-        if [[ "$APPLY_SNI" == "y" || "$APPLY_SNI" == "Y" ]]; then
-            # 引入当前配置变量
-            PORT=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG")
-            USERNAME=$(jq -r '.inbounds[0].users[0].name' "$SB_CONFIG")
-            PASSWORD=$(jq -r '.inbounds[0].users[0].password' "$SB_CONFIG")
-            SHORT_ID=$(jq -r '.inbounds[0].tls.reality.short_id' "$SB_CONFIG")
-            PRIVATE_KEY=$(jq -r '.inbounds[0].tls.reality.private_key' "$SB_CONFIG")
-            SERVER_NAME="$best_sni"
-            
-            if [[ -f "$STATE_FILE" ]]; then
-                REMARK=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 || echo "AnyReality")
-                PUBLIC_KEY=$(grep -E "^PUBLIC_KEY=" "$STATE_FILE" | cut -d"'" -f2 || echo "")
-            else
-                REMARK="AnyReality"
-                PUBLIC_KEY=""
-            fi
-            
-            write_and_show_config
-        fi
-    else
-        info "提示：当前未生成配置文件，您可以在稍后安装时手动填写此域名。"
-    fi
-    return 0
 }
 
 # =========================================================
@@ -641,16 +647,16 @@ menu() {
     local version=$(get_installed_version)
     local port_show=$(get_current_port_display)
 
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} Sing-box AnyTLS + Reality 面板  ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}=====================================${RESET}"
+    echo -e "${GREEN} Sing-box AnyReality 独立共存面板     ${RESET}"
+    echo -e "${GREEN}=====================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 AnyReality${RESET}"
-    echo -e "${GREEN} 2. 更新 AnyReality${RESET}"
-    echo -e "${GREEN} 3. 卸载 AnyReality${RESET}"
+    echo -e "${GREEN}=====================================${RESET}"
+    echo -e "${GREEN} 1. 安装 AnyReality 独立服务${RESET}"
+    echo -e "${GREEN} 2. 更新 AnyReality 独立内核${RESET}"
+    echo -e "${GREEN} 3. 卸载 AnyReality 独立服务${RESET}"
     echo -e "${GREEN} 4. 修改配置${RESET}"
     echo -e "${GREEN} 5. 启动 AnyReality${RESET}"
     echo -e "${GREEN} 6. 停止 AnyReality${RESET}"
@@ -659,7 +665,7 @@ menu() {
     echo -e "${GREEN} 9. 查看节点配置${RESET}"
     echo -e "${GREEN}10. SNI域名优选✨${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}=====================================${RESET}"
 
     local choice=""
     read -r -p $'\033[32m请输入选项: \033[0m' choice || true
@@ -671,35 +677,35 @@ menu() {
       3) uninstall_singbox; pause ;;
       4) modify_config; pause ;;
       5) 
-        if has_command systemctl; then
-          systemctl start mo-anyreality-sb && info "服务已成功启动！"
+        if has_command rc-service && [ -f "$INIT_SERVICE_DIR/$SB_SERVICE_NAME" ]; then
+          rc_service "$SB_SERVICE_NAME" start && info "服务已成功启动！"
         else
           pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
           "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
-          info "进程已在后台启动！"
+          info "进程已在后台独立启动！"
         fi
         pause ;;
       6) 
-        if has_command systemctl; then
-          systemctl stop mo-anyreality-sb && info "服务已成功停止！"
+        if has_command rc-service && [ -f "$INIT_SERVICE_DIR/$SB_SERVICE_NAME" ]; then
+          rc_service "$SB_SERVICE_NAME" stop && info "服务已成功停止！"
         else
-          pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台进程已终止！"
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台独立进程已终止！"
         fi
         pause ;;
       7) 
-        if has_command systemctl; then
-          systemctl restart mo-anyreality-sb && info "服务已成功重启！"
+        if has_command rc-service && [ -f "$INIT_SERVICE_DIR/$SB_SERVICE_NAME" ]; then
+          rc_service "$SB_SERVICE_NAME" restart && info "服务已成功重启！"
         else
           pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
           "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
-          info "后台进程已重启！"
+          info "后台独立进程已重启！"
         fi
         pause ;;
       8) 
-        if has_command systemctl; then
-          journalctl -u mo-anyreality-sb.service -n 50 --no-pager
+        if [[ -f /var/log/messages ]]; then
+          tail -n 50 /var/log/messages | grep "$SB_SERVICE_NAME" || tail -n 50 /var/log/messages
         else
-          warn "当前环境不支持 systemd 集中日志管理。"
+          warn "未找到系统日志文件，如在精简容器中运行，建议直接观察前端或进程状态。"
         fi
         pause ;;
       9) showconf; pause ;;

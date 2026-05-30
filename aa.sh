@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# Xray VLESS-Reality 管理脚本(Alpine Linux - 独占服务版)
+# Xray VLESS-Reality 管理脚本(Alpine Linux )
 # =========================================================
 
 set -Eeuo pipefail
@@ -21,7 +21,7 @@ readonly X_DIR="/etc/${SERV_NAME}"
 readonly X_CONFIG="${X_DIR}/config.json"
 readonly X_BIN="/usr/local/bin/${SERV_NAME}"
 readonly X_PBK="${X_DIR}/public.key"
-readonly X_LINK="/root/${SERV_NAME}_vless_reality.txt"
+readonly X_LINK="/root/proxynode/Reality/${SERV_NAME}_vless_reality.txt"
 readonly X_LOG="/var/log/${SERV_NAME}.log"
 readonly INIT_FILE="/etc/init.d/${SERV_NAME}"
 
@@ -55,9 +55,9 @@ restart_xray() {
 # 状态获取
 get_xray_status() {
     if rc-service "$SERV_NAME" status 2>/dev/null | grep -q "started"; then
-        echo -e "${GREEN}● 运行中 (${SERV_NAME})${RESET}"
+        echo -e "${GREEN}● 运行中 ${RESET}"
     else 
-        echo -e "${RED}● 未运行 (${SERV_NAME})${RESET}"
+        echo -e "${RED}● 未运行 ${RESET}"
     fi
 }
 
@@ -221,23 +221,56 @@ modify_config() {
     
     local curr_port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
     local curr_domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$X_CONFIG")
-    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
+    local curr_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
     local pri=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$X_CONFIG")
-    local sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$X_CONFIG")
+    local curr_sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$X_CONFIG")
     local pub=$(cat "$X_PBK")
     local curr_outbound=$(jq -c '.outbounds[0]' "$X_CONFIG")
 
-    read -p "请输入新端口 (回车保持 $curr_port): " n_port
-    n_port=${n_port:-$curr_port}
+    # 1. 修改端口
+    local n_port
+    while true; do
+        read -p "请输入新端口 (回车保持 $curr_port): " n_port
+        n_port=${n_port:-$curr_port}
+        is_valid_port "$n_port" && break || error "端口无效，请输入 1-65535 之间的数字。"
+    done
+
+    # 2. 修改域名
     read -p "请输入新域名 (回车保持 $curr_domain): " n_domain
     n_domain=${n_domain:-$curr_domain}
     
-    write_config "$n_port" "$uuid" "$n_domain" "$pri" "$sid" "$curr_outbound"
+    # 3. 修改 UUID
+    local n_uuid
+    while true; do
+        read -p "请输入新 UUID (回车保持 $curr_uuid): " n_uuid
+        n_uuid=${n_uuid:-$curr_uuid}
+        if [[ "$n_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            break
+        else
+            error "UUID 格式不正确，请重新输入（标准36位连字符格式）。"
+        fi
+    done
+
+    # 4. 修改 ShortID
+    local n_sid
+    while true; do
+        read -p "请输入新 ShortID (回车保持 $curr_sid): " n_sid
+        n_sid=${n_sid:-$curr_sid}
+        if [[ "$n_sid" =~ ^[0-9a-fA-F]+$ ]] && (( ${#n_sid} % 2 == 0 )) && (( ${#n_sid} >= 2 && ${#n_sid} <= 16 )); then
+            break
+        else
+            error "ShortID 格式不正确，必须是偶数长度的十六进制字符（2-16位，例：a1b2c3d4）。"
+        fi
+    done
+
+    write_config "$n_port" "$n_uuid" "$n_domain" "$pri" "$n_sid" "$curr_outbound"
     rc-service "$SERV_NAME" restart
     
     local ip=$(get_public_ip)
-    echo "vless://$uuid@$ip:$n_port?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=$n_domain&fp=chrome&pbk=$pub&sid=$sid#$HOSTNAME-Reality" > "$X_LINK"
-    info "配置已更新！"
+    # ✨ 核心修复点 1：写入前确保目标目录链存在
+    mkdir -p "$(dirname "$X_LINK")"
+    echo "vless://$n_uuid@$ip:$n_port?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=$n_domain&fp=chrome&pbk=$pub&sid=$n_sid#$HOSTNAME-Reality" > "$X_LINK"
+    info "配置已更新并成功重启服务！"
 }
 
 # ================== 安装与管理 ==================
@@ -259,11 +292,43 @@ install_xray() {
         echo -ne "${GREEN}请输入入站端口 (回车随机): ${RESET}"; read port; [[ -z "$port" ]] && port=$((RANDOM % 45535 + 10000))
         echo -ne "${GREEN}请输入伪装域名 (回车 www.amazon.com): ${RESET}"; read domain; [[ -z "$domain" ]] && domain="www.amazon.com"
         
-        local uuid=$(uuidgen)
+        # 1. 自定义或生成 UUID
+        local uuid
+        while true; do
+            echo -ne "${GREEN}请输入自定义 UUID (回车随机生成): ${RESET}"; read input_uuid
+            if [[ -z "$input_uuid" ]]; then
+                uuid=$(uuidgen)
+                break
+            else
+                if [[ "$input_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+                    uuid="$input_uuid"
+                    break
+                else
+                    error "UUID 格式不正确，请重新输入。"
+                fi
+            fi
+        done
+
+        # 2. 自定义或生成 ShortID
+        local sid
+        while true; do
+            echo -ne "${GREEN}请输入自定义 ShortID (回车随机生成, 必须是偶数长度的 2/4/6/8 字节十六进制): ${RESET}"; read input_sid
+            if [[ -z "$input_sid" ]]; then
+                sid=$(openssl rand -hex 4)
+                break
+            else
+                if [[ "$input_sid" =~ ^[0-9a-fA-F]+$ ]] && (( ${#input_sid} % 2 == 0 )) && (( ${#input_sid} >= 2 && ${#input_sid} <= 16 )); then
+                    sid="$input_sid"
+                    break
+                else
+                    error "ShortID 格式不正确，必须是偶数长度的十六进制字符（例：a1b2c3d4）。"
+                fi
+            fi
+        done
+        
         local keys=$($X_BIN x25519)
         local pri=$(echo "$keys" | grep "Private" | awk '{print $NF}')
         local pub=$(echo "$keys" | grep "Public" | awk '{print $NF}')
-        local sid=$(openssl rand -hex 4)
         
         echo "$pub" > "$X_PBK"
         write_config "$port" "$uuid" "$domain" "$pri" "$sid"
@@ -293,6 +358,9 @@ EOF
     local sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$X_CONFIG")
     
     local link="vless://$uuid@$ip:$port?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=$domain&fp=chrome&pbk=$pub&sid=$sid#$HOSTNAME-Reality"
+    
+    # ✨ 核心修复点 2：写入前确保目标目录链存在
+    mkdir -p "$(dirname "$X_LINK")"
     echo "$link" > "$X_LINK"
 
     show_current_config

@@ -1,277 +1,467 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# 多后端自动适配 Alpine Linux Socks5 管理面板 
+# SPDX-License-Identifier: MIT
+#
+# =========================================================
+# 1. 核心控制与全局环境初始化
+# =========================================================
+set -e
+export LANG=zh_CN.UTF-8
 
-# ================== 颜色定义 ==================
-GREEN="\033[1;32m"
-RED="\033[1;31m"
-YELLOW="\033[1;33m"
-PURPLE="\033[1;35m"
-SKYBLUE="\033[1;36m"
+# 基础目录与硬编码配置
+WORKDIR="${HOME:-/root}/Socks5"
+readonly PID_FILE="${WORKDIR}/s5.pid"
+readonly META_FILE="${WORKDIR}/meta.env"
+readonly CONFIG_S5="${WORKDIR}/config.json"
+readonly CONFIG_3PROXY="${WORKDIR}/3proxy.cfg"
+
+DEFAULT_PORT=1080
+PREFERRED_IMPLS=("microsocks" "3proxy" "s5")
+
+# 终端颜色代码
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-# ================== 基础环境变量 ==================
-HOSTNAME=$(hostname)
-USERNAME=$(whoami | tr '[:upper:]' '[:lower:]')
-# Alpine (BusyBox) 的 md5sum 输出格式带空格，这里提取前 32 位
-export SECRET=${SECRET:-$(echo -n "$USERNAME+$HOSTNAME" | md5sum | awk '{print $1}' | head -c 32)}
-WORKDIR="$HOME/mtp"
-CRON_CMD="@reboot sleep 30 && /bin/bash $WORKDIR/restart.sh >/dev/null 2>&1"
-LOG_FILE="$WORKDIR/mtg.log"
-
-# ================== 工具函数 ==================
-red_echo() { echo -e "${RED}$1${RESET}"; }
-green_echo() { echo -e "${GREEN}$1${RESET}"; }
-yellow_echo() { echo -e "${YELLOW}$1${RESET}"; }
-purple_echo() { echo -e "${PURPLE}$1${RESET}"; }
-
-# 获取正在运行的端口
-get_running_port() {
-    local pid=$(pgrep -x mtg)
-    if [[ -n "$pid" ]]; then
-        local port=$(ps -o pid,args | grep -E "^[ ]*${pid} " | grep -oE '0\.0\.0\.0:[0-9]+' | cut -d':' -f2)
-        [[ -z "$port" && -f "$WORKDIR/port.txt" ]] && port=$(cat "$WORKDIR/port.txt")
-        echo "${port:-未知}"
-    else
-        echo "无"
-    fi
+# =========================================================
+# 2. 官方原生底层工具函数与网络环境探测
+# =========================================================
+has_command() {
+  type -P "$1" > /dev/null 2>&1
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://ip6.n0at.com" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP"
+info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
+error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
+pause() { read -r -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
+
+ensure_workdir() {
+  mkdir -p "${WORKDIR}"
+  chmod 700 "${WORKDIR}"
 }
 
 random_port() {
-    # Alpine 没有 shuf 命令，使用 awk 替代生成随机端口
-    awk 'BEGIN{srand(); print int(rand()*(65000-2000+1))+2000}'
+  # 兼容 Alpine (BusyBox) 的 awk 随机数发生器
+  awk 'BEGIN{srand(); print int(rand()*(60000-20000+1))+20000}'
 }
 
-check_vps_port() {
-    local port=$1
-    # 使用 netstat -an 替代 lsof，在 Alpine (BusyBox) 下极其稳定且不需要 root 权限
-    while [[ -n $(netstat -an 2>/dev/null | grep -E "[:\.]${port} " | grep -i "listen") ]]; do
-        red_echo "${port} 端口已经被其他程序占用，请更换端口重试。"
-        read -p "请输入新端口（回车使用随机端口）: " port
-        [[ -z $port ]] && port=$(random_port) && green_echo "使用随机端口: $port"
-    done
-    echo "$port"
+random_user() {
+  echo "s5_$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 6)"
 }
 
-# 自动安装 Alpine 必须的依赖组件
-install_alpine_deps() {
-    local update_done=0
-    
-    # 检查并安装 bash (防止直接用 ash 执行时部分语法报错)
-    if ! command -v bash &>/dev/null; then
-        apk update && update_done=1
-        apk add bash
-    fi
-    
-    # 检查并安装 lsof (端口检测)
-    if ! command -v lsof &>/dev/null; then
-        [[ $update_done -eq 0 ]] && apk update && update_done=1
-        apk add lsof
-    fi
-
-    # 检查并安装 curl / wget (Busybox 自带的 wget 偶尔缺少 https 支持)
-    if ! command -v curl &>/dev/null; then
-        [[ $update_done -eq 0 ]] && apk update && update_done=1
-        apk add curl
-    fi
+random_pass() {
+  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12 || echo "s5pass123"
 }
 
-# ================== Crontab 管理 ==================
-check_cron_status() {
-    crontab -l 2>/dev/null | grep -q "restart.sh"
+get_best_ip() {
+  local ip
+  for svc in "https://api.ipify.org" "https://ifconfig.me" "https://ipinfo.io/ip"; do
+    ip=$(curl -s --max-time 5 "$svc" || wget -T 5 -qO- "$svc" || true)
+    ip=$(echo "$ip" | tr -d '[:space:]')
+    if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      echo "$ip"
+      return 0
+    fi
+  done
+  echo "127.0.0.1"
 }
 
-set_cron() {
-    if ! check_cron_status; then
-        (crontab -l 2>/dev/null; echo "$CRON_CMD") | crontab -
-    fi
-    # 确保 Alpine 的 crond 服务在后台运行
-    rc-service crond start >/dev/null 2>&1 || crond -b >/dev/null 2>&1
+urlencode() {
+  local s="$1"
+  if has_command python3; then
+    python3 -c "import sys,urllib.parse as u; print(u.quote(sys.argv[1], safe=''))" "$s"
+  else
+    # 纯 shell 托底转换
+    echo -n "$s" | awk 'BEGIN {
+      for (i = 0; i <= 255; i++) ord[sprintf("%c", i)] = i
+    }
+    {
+      encoded = ""
+      for (i = 1; i <= length($0); i++) {
+        c = substr($0, i, 1)
+        if (c ~ /[a-zA-Z0-9_.~-]/) encoded = encoded c
+        else encoded = encoded sprintf("%%%02X", ord[c])
+      }
+      print encoded
+    }'
+  fi
 }
 
-remove_cron() {
-    crontab -l 2>/dev/null | grep -v "restart.sh" | crontab -
+# =========================================================
+# 3. 后端组件检测与多包管理器自动安装
+# =========================================================
+detect_existing_impl() {
+  for impl in "${PREFERRED_IMPLS[@]}"; do
+    if has_command "${impl}"; then echo "${impl}"; return 0; fi
+  done
+  echo ""
 }
 
-# ================== 核心控制服务 ==================
-start_proxy() {
-    if pgrep -x mtg >/dev/null; then
-        yellow_echo "MTProto Proxy 已经在运行中。"
-        return 0
-    fi
-    
-    if [ ! -f "$WORKDIR/mtg" ]; then
-        red_echo "未检测到安装文件，请先选择 1 安装。"
-        return 1
-    fi
-
-    local port=$(cat "$WORKDIR/port.txt" 2>/dev/null)
-    if [[ -z "$port" || "$port" == "无" ]]; then
-        red_echo "未检测到配置端口，请重新安装或修改配置。"
-        return 1
-    fi
-
-    cd "$WORKDIR" || return
-    nohup ./mtg run -b 0.0.0.0:$port "$SECRET" --stats-bind=127.0.0.1:$((port + 1)) >> "$LOG_FILE" 2>&1 &
-    green_echo "MTProto Proxy 启动成功！"
+try_install_package() {
+  local pkg_name="$1"
+  info "正在尝试通过 apk 包管理器部署相关组件: ${pkg_name}..."
+  if has_command apk; then
+    apk update >/dev/null 2>&1
+    apk add --no-cache "${pkg_name}" >/dev/null 2>&1 && return 0
+  fi
+  return 1
 }
 
-stop_proxy() {
-    if pgrep -x mtg >/dev/null; then
-        pkill -9 mtg >/dev/null 2>&1
-        clear
-        green_echo "MTProto Proxy 已成功停止。"
-    else
-        yellow_echo "MTProto Proxy 本就处于停止状态。"
-    fi
-}
-
-show_config() {
-    if [ ! -f "$WORKDIR/link.txt" ]; then
-        red_echo "未找到连接配置，请确保已成功安装。"
-    else
-        purple_echo "==== 当前 MTProto 连接配置 ===="
-        cat "$WORKDIR/link.txt"
-    fi
-}
-
-# ================== 安装与配置修改 ==================
-download_and_run_mtg() {
-    local arch="amd64"
-    cmd=$(uname -m)
-    if [ "$cmd" == "386" ] || [ "$cmd" == "i686" ]; then arch="386"; fi
-    if [ "$cmd" == "armv7l" ] || [ "$cmd" == "armhf" ]; then arch="arm"; fi
-    if [ "$cmd" == "aarch64" ]; then arch="arm64"; fi
-
-    mkdir -p "$WORKDIR"
-    pkill -9 mtg >/dev/null 2>&1
-
-    yellow_echo "正在下载 mtg 核心组件..."
-    # 针对 Alpine (musl 静态编译兼容性)，使用官方预编译版本更稳妥
-    wget -q -O "${WORKDIR}/mtg" "https://github.com/whunt1/onekeymakemtg/raw/master/builds/ccbuilds/mtg-linux-$arch"
-    
-    if [ ! -s "${WORKDIR}/mtg" ]; then
-        red_echo "下载核心失败，请检查网络！"
-        return 1
-    fi
-    
-    chmod +x "${WORKDIR}/mtg"
-    echo "$MTP_PORT" > "$WORKDIR/port.txt"
-    cd "$WORKDIR" || return
-
-    # 运行服务并重定向日志
-    nohup ./mtg run -b 0.0.0.0:$MTP_PORT "$SECRET" --stats-bind=127.0.0.1:$((MTP_PORT + 1)) >> "$LOG_FILE" 2>&1 &
-    
-    # 创建守护/重启脚本
-    cat > "${WORKDIR}/restart.sh" <<EOF
-#!/bin/bash
-pkill -9 mtg >/dev/null 2>&1
-cd ${WORKDIR}
-nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$((MTP_PORT + 1)) >> ${LOG_FILE} 2>&1 &
+# =========================================================
+# 4. 核心配置文件与守护进程服务生成
+# =========================================================
+generate_backend_config() {
+  case "${BIN_TYPE}" in
+    3proxy)
+      cat << EOF > "${CONFIG_3PROXY}"
+daemon
+maxconn 100
+nserver 8.8.8.8
+nserver 1.1.1.1
+timeouts 1 5 30 60 180 1800 15 60
+users ${USERNAME}:CL:${PASSWORD}
+auth strong
+allow ${USERNAME}
+socks -p${PORT}
 EOF
-    chmod +x "${WORKDIR}/restart.sh"
-    return 0
+      chmod 600 "${CONFIG_3PROXY}"
+      ;;
+    s5)
+      cat << EOF > "${CONFIG_S5}"
+{
+  "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
+  "inbounds": [{
+    "port": ${PORT},
+    "protocol": "socks",
+    "tag": "socks",
+    "settings": {
+      "auth": "password",
+      "udp": false,
+      "ip": "0.0.0.0",
+      "userLevel": 0,
+      "accounts": [{"user": "${USERNAME}", "pass": "${PASSWORD}"}]
+    }
+  }],
+  "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+}
+EOF
+      chmod 600 "${CONFIG_S5}"
+      ;;
+  esac
 }
 
-core_install() {
-    install_alpine_deps
-    purple_echo "正在配置 MTProto 代理端口...\n"
-    
-    read -p "请输入 MTProto 代理端口 (回车使用随机端口): " user_port
-    [[ -z $user_port ]] && user_port=$(random_port)
-    MTP_PORT=$(check_vps_port "$user_port")
-    IP1=$(get_public_ip)
+create_start_script() {
+  cat << 'EOF' > "${WORKDIR}/start.sh"
+#!/usr/bin/env bash
+WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${WORKDIR}/meta.env" ]; then
+  source "${WORKDIR}/meta.env"
+else
+  echo "核心环境配置文件 meta.env 丢失"
+  exit 1
+fi
 
-    if download_and_run_mtg; then
-        purple_echo "\n🎉 MTProto 安装/修改成功！"
-        LINKS="tg://proxy?server=$IP1&port=$MTP_PORT&secret=$SECRET"
-        green_echo "$LINKS\n"
-        echo -e "$LINKS" > "${WORKDIR}/link.txt"
-        
-        read -p "是否同时将MTProto加入开机自启（Crontab）？[回车默认加入,Y/n]: " choice_cron
-        case "$choice_cron" in
-            [nN][oO]|[nN]) remove_cron ;;
-            *) set_cron ;;
-        esac
+# 写入当前脚本的 PID 以便 Alpine 精准追踪状态
+echo "$$" > "${WORKDIR}/s5.pid"
+
+case "$BIN_TYPE" in
+  3proxy)     exec 3proxy "${WORKDIR}/3proxy.cfg" ;;
+  s5)         exec s5 -c "${WORKDIR}/config.json" ;;
+  microsocks) exec microsocks -i 0.0.0.0 -p "$PORT" -u "$USERNAME" -P "$PASSWORD" ;;
+  *)          echo "未知的 Socks5 底层实现引擎类型: $BIN_TYPE"; exit 1 ;;
+esac
+EOF
+  chmod +x "${WORKDIR}/start.sh"
+}
+
+save_meta() {
+  cat << EOF > "${META_FILE}"
+PORT='${PORT}'
+USERNAME='${USERNAME}'
+PASSWORD='${PASSWORD}'
+BIN_TYPE='${BIN_TYPE}'
+EOF
+  chmod 600 "${META_FILE}"
+}
+
+load_meta() {
+  if [ -f "${META_FILE}" ]; then
+    # shellcheck disable=SC1090
+    source "${META_FILE}"
+  else
+    PORT=""
+    USERNAME=""
+    PASSWORD=""
+    BIN_TYPE=""
+  fi
+}
+
+get_runtime_pid() {
+  local saved_pid=""
+  if [ -f "${PID_FILE}" ]; then
+    saved_pid=$(cat "${PID_FILE}" 2>/dev/null)
+  fi
+  # 验证 PID 对应进程是否依然存活，且属于当前的代理后端
+  if [[ -n "$saved_pid" ]] && kill -0 "$saved_pid" 2>/dev/null; then
+    echo "$saved_pid"
+  else
+    # 模糊兜底扫描
+    local fallback_pid=""
+    fallback_pid=$(ps -ef 2>/dev/null | grep -E 'start.sh|microsocks|3proxy|s5 -c' | grep -v grep | awk '{print $1}' | head -n 1)
+    echo "$fallback_pid"
+  fi
+}
+
+check_port_listening() {
+  local check_port=$1
+  if [[ -n "$check_port" ]]; then
+    netstat -an 2>/dev/null | grep -E "[:\.]${check_port} " | grep -i "listen"
+  fi
+}
+
+# =========================================================
+# 5. 主流程控制模块（安装、更新、修改、卸载）
+# =========================================================
+write_and_start_service() {
+  ensure_workdir
+  save_meta
+  generate_backend_config
+  create_start_script
+
+  # 强杀历史进程
+  stop_service_internal
+
+  # 挂载 Alpine 专属后台独立守护池中运行
+  nohup "${WORKDIR}/start.sh" >/dev/null 2>&1 &
+  sleep 1.5
+
+  local active_pid
+  active_pid=$(get_runtime_pid)
+  local is_listen
+  is_listen=$(check_port_listening "$PORT")
+
+  if [[ -n "$active_pid" || -n "$is_listen" ]]; then
+    info "Socks5 核心服务配置并启动成功！"
+  else
+    error "Socks5 服务启动失败，请检查端口是否冲突或查看本地进程日志。"
+  fi
+  showconf
+}
+
+stop_service_internal() {
+  local active_pid
+  active_pid=$(get_runtime_pid)
+  if [[ -n "$active_pid" ]]; then
+    kill -9 "$active_pid" >/dev/null 2>&1 || true
+  fi
+  # 深度强杀可能残留的分支后端进程
+  pkill -9 -f "${WORKDIR}/start.sh" >/dev/null 2>&1 || true
+  pkill -9 -x microsocks >/dev/null 2>&1 || true
+  pkill -9 -x 3proxy >/dev/null 2>&1 || true
+  pkill -9 -x s5 >/dev/null 2>&1 || true
+  rm -f "${PID_FILE}"
+}
+
+inst_socks5() {
+  ensure_workdir
+  
+  local exist_impl
+  exist_impl="$(detect_existing_impl || true)"
+  if [ -n "${exist_impl}" ]; then
+    info "当前 Alpine 系统已存在可用组件实现: ${YELLOW}${exist_impl}${RESET}"
+    BIN_TYPE="${exist_impl}"
+  else
+    warn "未检测到内置的代理实现，开始尝试自动拉取 Alpine 原生轻量组件..."
+    if try_install_package "microsocks"; then
+      BIN_TYPE="microsocks"
+    elif try_install_package "3proxy"; then
+      BIN_TYPE="3proxy"
+    else
+      error "未能通过 apk 自动部署代理组件。请执行 'apk add microsocks' 后重新运行此脚本。"
+      return 1
     fi
+  fi
+
+  local rand_user rand_pass rand_port
+  rand_user="$(random_user)"
+  rand_pass="$(random_pass)"
+  rand_port=$(random_port)
+
+  echo "---------------------------------------------"
+  while true; do
+    read -rp "👉 请输入监听端口 (默认随机: ${rand_port}): " input_port
+    PORT=${input_port:-$rand_port}
+    if ! [[ "${PORT}" =~ ^[0-9]+$ ]] || [ "${PORT}" -lt 1 ] || [ "${PORT}" -gt 65535 ]; then
+      warn "端口输入无效，请输入 1-65535 之间的数字。"
+      continue
+    fi
+    # 适配 Alpine (BusyBox) 的网络占用排查
+    if [[ -n $(check_port_listening "$PORT") ]]; then
+      error "${PORT} 端口已经被其他程序占用，请更换端口重试。"
+      rand_port=$(random_port)
+      continue
+    fi
+    break
+  done
+
+  read -rp "👉 请设置用户名 (默认随机: ${rand_user}): " input_user
+  USERNAME=${input_user:-$rand_user}
+
+  read -rp "👉 请设置密码 (默认随机: ${rand_pass}): " input_pass
+  PASSWORD=${input_pass:-$rand_pass}
+
+  write_and_start_service
 }
 
-# ================== 主菜单循环 ==================
-while true; do
+changeconf() {
+  load_meta
+  if [ -z "${BIN_TYPE}" ]; then
+    BIN_TYPE="$(detect_existing_impl || true)"
+  fi
+  if [ -z "${BIN_TYPE}" ]; then
+    error "未找到有效的底层服务组件，请先执行选项 1 进行安装。"
+    return 1
+  fi
+
+  clear
+  echo -e "${GREEN}====== 修改 Socks5 节点配置 ======${RESET}"
+  echo "提示：直接敲回车将保持原有配置不变"
+  echo "---------------------------------------------"
+
+  local input_port input_user input_pass
+  
+  while true; do
+    read -rp "👉 请输入新的监听端口 [当前: ${PORT:-1080}]: " input_port
+    if [ -n "$input_port" ]; then
+      if [[ "${input_port}" =~ ^[0-9]+$ ]] && [ "${input_port}" -ge 1 ] && [ "${input_port}" -le 65535 ]; then
+        if [[ "$input_port" != "$PORT" && -n $(check_port_listening "$input_port") ]]; then
+          error "${input_port} 端口已被其他程序占用，请更换端口。"
+          continue
+        fi
+        PORT="${input_port}"
+      else
+        warn "输入端口格式不合法，保留原端口不变。"
+      fi
+    fi
+    break
+  done
+
+  read -rp "👉 请设置新的用户名 [当前: ${USERNAME:-unset}]: " input_user
+  USERNAME=${input_user:-$USERNAME}
+
+  read -rp "👉 请设置新的密码 [当前: ${PASSWORD:-unset}]: " input_pass
+  PASSWORD=${input_pass:-$PASSWORD}
+
+  write_and_start_service
+}
+
+uninstall_socks5() {
+  warn "即将从当前 Alpine 系统中彻底卸载并清理 Socks5 服务..."
+  stop_service_internal
+  rm -rf "${WORKDIR}"
+  info "Socks5 全套配置文件及后台进程已经彻底移除！"
+}
+
+showconf() {
+  load_meta
+  if [ -z "${PORT}" ]; then
+    error "未找到任何可用的元配置文件，请确认服务已成功初始化。"
+    return 1
+  fi
+
+  local ip enc_user enc_pass enc_ip socksurl tlink
+  ip="$(get_best_ip)"
+  enc_user="$(urlencode "${USERNAME}")"
+  enc_pass="$(urlencode "${PASSWORD}")"
+  enc_ip="$(urlencode "${ip}")"
+
+  socksurl="socks://${USERNAME}:${PASSWORD}@${ip}:${PORT}"
+  tlink="https://t.me/socks?server=${enc_ip}&port=${PORT}&user=${enc_user}&pass=${enc_pass}"
+
+  echo -e "${GREEN}====== Socks5 配置 ======${RESET}"
+  echo -e "${YELLOW}● 客户端直连格式:${RESET} ${socksurl}"
+  echo -e "${YELLOW}● Telegram 快捷链接:${RESET} ${tlink}"
+  echo
+}
+
+# =========================================================
+# 6. 面板主菜单
+# =========================================================
+menu() {
+  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
+  ensure_workdir
+
+  while true; do
     clear
-    if pgrep -x mtg >/dev/null; then
-        status_display="${GREEN}正在运行${RESET}"
-    else
-        status_display="${RED}已停止${RESET}"
-    fi
+    load_meta
     
-    if check_cron_status; then
-        cron_display="${GREEN}已开启${RESET}"
+    local status_display active_pid is_listen
+    active_pid=$(get_runtime_pid)
+    is_listen=$(check_port_listening "$PORT")
+
+    if [[ -n "$active_pid" || -n "$is_listen" ]]; then
+      status_display="${GREEN}● 运行中 (Alpine 独立进程池)${RESET}"
     else
-        cron_display="${RED}已关闭${RESET}"
+      status_display="${RED}● 未运行${RESET}"
     fi
 
-    port_display=$(get_running_port)
+    local port_display="${PORT:- -}"
+    local engine_display="${BIN_TYPE:-未检测到底层安装}"
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   MTProto Proxy Alpine 面板    ${RESET}"
+    echo -e "${GREEN}     Socks5 Alpine 管理面板     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态     :${RESET} ${status_display}"
-    echo -e "${GREEN}端口     :${RESET} ${YELLOW}${port_display}${RESET}"
-    echo -e "${GREEN}开机自启 :${RESET} ${cron_display}"
+    echo -e "${GREEN}状态   :${RESET} ${status_display}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_display}${RESET}"
+    echo -e "${GREEN}实现   :${RESET} ${CYAN}${engine_display}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 MTProto${RESET}"
+    echo -e "${GREEN}1. 安装 Socks5${RESET}"
     echo -e "${GREEN}2. 修改配置${RESET}"
-    echo -e "${GREEN}3. 卸载 MTProto${RESET}"
-    echo -e "${GREEN}4. 启动 MTProto${RESET}"
-    echo -e "${GREEN}5. 停止 MTProto${RESET}"
-    echo -e "${GREEN}6. 重启 MTProto${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}3. 卸载 Socks5${RESET}"
+    echo -e "${GREEN}4. 启动 Socks5${RESET}"
+    echo -e "${GREEN}5. 停止 Socks5${RESET}"
+    echo -e "${GREEN}6. 重启 Socks5${RESET}"
     echo -e "${GREEN}8. 查看连接配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    read -p "$(echo -e ${GREEN}请选择:${RESET} )" choice
 
-    case $choice in
-        1|2)
-            clear; core_install; read -p "按回车返回菜单..." ;;
-        3)
-            clear
-            stop_proxy; remove_cron; rm -rf "$WORKDIR"
-            clear; red_echo "MTProto 已彻底从系统中卸载！"; read -p "按回车返回菜单..." ;;
-        4)
-            clear; start_proxy; read -p "按回车返回菜单..." ;;
-        5)
-            clear; stop_proxy; read -p "按回车返回菜单..." ;;
-        6)
-            clear; stop_proxy; sleep 1; start_proxy; read -p "按回车返回菜单..." ;;
-        7)
-            clear
-            if [ -f "$LOG_FILE" ]; then
-                purple_echo "=== 正在查看最新 50 行运行日志 ==="
-                tail -n 50 "$LOG_FILE"
-            else
-                yellow_echo "暂无日志文件。"
-            fi
-            read -p "按回车返回菜单..." ;;
-        8)
-            clear; show_config; read -p "按回车返回菜单..." ;;
-        0)
-            exit 0 ;;
-        *)
-            red_echo "无效输入！" ; sleep 1 ;;
+    local choice=""
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+    [[ -z "$choice" ]] && continue
+
+    case "$choice" in
+      1) inst_socks5; pause ;;
+      2) changeconf; pause ;;
+      3) uninstall_socks5; pause ;;
+      4)
+        if [[ -n $(get_runtime_pid) || -n $(check_port_listening "$PORT") ]]; then
+          yellow_echo "Socks5 服务已经在运行中。"
+        else
+          nohup "${WORKDIR}/start.sh" >/dev/null 2>&1 &
+          sleep 1
+          info "进程已在后台独立进程池中拉起！"
+        fi
+        pause ;;
+      5)
+        stop_service_internal
+        info "后台代理程序已终止！"
+        pause ;;
+      6)
+        stop_service_internal
+        sleep 1
+        nohup "${WORKDIR}/start.sh" >/dev/null 2>&1 &
+        sleep 1
+        info "后台独立进程已重载刷新！"
+        pause ;;
+      8) showconf; pause ;;
+      0) exit 0 ;;
+      *) error "未识别的无效指令，请重新进行选择。"; sleep 1 ;;
     esac
-done
+  done
+}
+
+menu "$@"

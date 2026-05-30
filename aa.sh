@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# Xray VLESS-Reality 管理脚本(Alpine Linux )
+# Xray VLESS-Encryption 管理脚本(Alpine Linux) 
 # =========================================================
 
 set -Eeuo pipefail
@@ -13,15 +13,18 @@ YELLOW="\033[33m"
 BLUE="\033[34m"
 RESET="\033[0m"
 
-# ================== 路径与日志 ==================
-# 隔离服务名称，防止冲突
-readonly SERV_NAME="xray-reality"
+# ================== 🚀 服务自定义重命名 ==================
+readonly SERV_NAME="xray-vless-encrypt"
 
+# ================== 📂 自定义分享链接存放路径 ==================
+readonly X_LINK_DIR="/root/proxynode/vlessencryption"
+
+# ================== 路径与日志 (自动联动) ==================
 readonly X_DIR="/etc/${SERV_NAME}"
 readonly X_CONFIG="${X_DIR}/config.json"
 readonly X_BIN="/usr/local/bin/${SERV_NAME}"
-readonly X_PBK="${X_DIR}/public.key"
-readonly X_LINK="/root/proxynode/Reality/${SERV_NAME}_vless_reality.txt"
+readonly X_LINK="${X_LINK_DIR}/${SERV_NAME}_vless.txt"
+readonly X_STATE="${X_DIR}/encryption_matrix.state"
 readonly X_LOG="/var/log/${SERV_NAME}.log"
 readonly INIT_FILE="/etc/init.d/${SERV_NAME}"
 
@@ -31,7 +34,6 @@ warn() { echo -e "${YELLOW}[警告] $*${RESET}"; }
 error() { echo -e "${RED}[错误] $*${RESET}"; }
 pause() { echo; echo -ne "${GREEN}按任意键返回菜单...${RESET}"; read -n 1 -s; echo; }
 
-# 校验端口是否合法
 is_valid_port() {
     local port=$1
     if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
@@ -41,7 +43,6 @@ is_valid_port() {
     fi
 }
 
-# 重启服务并检查结果
 restart_xray() {
     rc-service "$SERV_NAME" restart >/dev/null 2>&1 || true
     sleep 1
@@ -52,12 +53,15 @@ restart_xray() {
     fi
 }
 
-# 状态获取
 get_xray_status() {
     if rc-service "$SERV_NAME" status 2>/dev/null | grep -q "started"; then
         echo -e "${GREEN}● 运行中 ${RESET}"
     else 
-        echo -e "${RED}● 未运行 ${RESET}"
+        if pgrep -f "$X_BIN run" >/dev/null 2>&1; then
+            echo -e "${GREEN}● 运行中 ${RESET}"
+        else
+            echo -e "${RED}● 未运行 ${RESET}"
+        fi
     fi
 }
 
@@ -69,7 +73,6 @@ get_xray_version() {
     fi
 }
 
-# 公网IP获取
 get_public_ip() {
     local ip
     for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
@@ -77,80 +80,90 @@ get_public_ip() {
             ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
     error "无法获取公网 IP 地址。" && return 1
+}
+
+generate_vless_encryption_config() {
+    local vlessenc_output
+    vlessenc_output=$($X_BIN vlessenc 2>/dev/null || true)
+    if [ -z "$vlessenc_output" ]; then
+        error "调用核心生成 VLESS Encryption 配置失败"
+        return 1
+    fi
+
+    local decryption_config=""
+    local encryption_config=""
+    local in_mlkem_section=false
+
+    while IFS= read -r line; do
+        if [[ "$line" == *"Authentication: ML-KEM-768, Post-Quantum"* ]]; then
+            in_mlkem_section=true
+            continue
+        fi
+
+        if [ "$in_mlkem_section" = true ]; then
+            if [[ "$line" == *'"decryption":'* ]]; then
+                decryption_config=$(echo "$line" | sed 's/.*"decryption": "\([^"]*\)".*/\1/')
+            elif [[ "$line" == *'"encryption":'* ]]; then
+                if echo "$line" | grep -q '.*"encryption": "[^"]*"'; then
+                    encryption_config=$(echo "$line" | sed 's/.*"encryption": "\([^"]*\)".*/\1/')
+                else
+                    encryption_config=$(echo "$line" | sed 's/.*"encryption": "\([^"]*\).*/\1/')
+                    read -r next_line
+                    encryption_config="${encryption_config}${next_line}"
+                    encryption_config=$(echo "$encryption_config" | tr -d '"' | tr -d '[:space:]')
+                fi
+                break
+            fi
+        fi
+    done <<< "$vlessenc_output"
+
+    if [ -z "$decryption_config" ] || [ -z "$encryption_config" ]; then
+        error "无法解析内嵌的 VLESS Encryption 后量子证书拓扑"
+        return 1
+    fi
+
+    echo "${decryption_config}|${encryption_config}"
 }
 
 HOSTNAME=$(hostname -s | sed 's/ /_/g')
 
-# ================== 配置写入 ==================
+# ================== 配置写入 (已修复流控写入) ==================
 write_config() {
-    local port=$1 uuid=$2 domain=$3 pri=$4 sid=$5
-    local outbound=${6:-'{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}'}
+    local port=$1 uuid=$2 flow=$3 decryption=$4
+    local outbound=${5:-'{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}'}
     mkdir -p "$X_DIR" && chmod 755 "$X_DIR"
-    cat > "$X_CONFIG" <<EOF
-{
-    "log": { "loglevel": "warning" },
-    "inbounds": [{
-        "port": $port, "protocol": "vless",
-        "settings": { "clients": [{"id": "$uuid", "flow": "xtls-rprx-vision"}], "decryption": "none" },
-        "streamSettings": {
-            "network": "tcp", "security": "reality",
-            "realitySettings": {
-                "dest": "$domain:443", "serverNames": ["$domain"],
-                "privateKey": "$pri", "shortIds": ["$sid"], "fingerprint": "chrome"
-            }
-        },
-        "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
-    }],
-    "outbounds": [$outbound]
-}
-EOF
-}
-
-# ================== SNI 优选 ==================
-select_best_sni() {
-    info "开始优选 SNI 延迟测试..."
-    local SNIS=(
-        amd.com apps.mzstatic.com aws.com azure.microsoft.com beacon.gtv-pub.com
-        bing.com catalog.gamepass.com cdn.bizibly.com cdn-dynmedia-1.microsoft.com
-        devblogs.microsoft.com fpinit.itunes.apple.com go.microsoft.com
-        gray-config-prod.api.arc-cdn.net gray.video-player.arcpublishing.com
-        images.nvidia.com r.bing.com services.digitaleast.mobi snap.licdn.com
-        statici.icloud.com tag.demandbase.com tag-logger.demandbase.com
-        ts1.tc.mm.bing.net ts2.tc.mm.bing.net vs.aws.amazon.com www.apple.com
-        www.icloud.com www.microsoft.com www.oracle.com www.xbox.com
-        www.xilinx.com xp.apple.com
-    )
-    local BEST_SNI=""
-    local BEST_TIME=999999
-
-    for sni in "${SNIS[@]}"; do
-        start=$(date +%s%N)
-        if timeout 2 openssl s_client -connect ${sni}:443 -servername ${sni} -brief </dev/null >/dev/null 2>&1; then
-            end=$(date +%s%N)
-            cost=$(( (end - start) / 1000000 ))
-            echo -e "${GREEN}[SNI] $sni -> ${cost}ms${RESET}"
-            if [ $cost -lt $BEST_TIME ]; then
-                BEST_TIME=$cost; BEST_SNI=$sni
-            fi
-        fi
-    done
-
-    if [ -n "$BEST_SNI" ]; then
-        info "最优 SNI: $BEST_SNI (${BEST_TIME}ms)"
-        return 0
+    
+    # 构建基础 client 对象，根据 flow 是否为空决定是否写入流控键值
+    local client_json
+    if [[ -z "$flow" ]]; then
+        client_json=$(jq -n --arg id "$uuid" '[{"id": $id}]')
     else
-        warn "未找到可用 SNI"
-        return 1
+        client_json=$(jq -n --arg id "$uuid" --arg flow "$flow" '[{"id": $id, "flow": $flow}]')
     fi
+
+    jq -n \
+        --arg listen "::" \
+        --argjson port "$port" \
+        --argjson clients "$client_json" \
+        --arg decryption "$decryption" \
+        --argjson outbound "[$outbound]" \
+    '{
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "listen": $listen,
+            "port": $port,
+            "protocol": "vless",
+            "settings": {
+                "clients": $clients,
+                "decryption": $decryption
+            }
+        }],
+        "outbounds": $outbound
+    }' > "$X_CONFIG"
 }
 
-# ================== 出口模式配置  ==================
+# ================== 出口模式配置 ==================
 configure_custom_socks5_outbound() {
     if [[ ! -f "$X_CONFIG" ]]; then 
         error "错误: Xray 未安装，无法配置出口模式。"
@@ -215,16 +228,17 @@ configure_custom_socks5_outbound() {
     restart_xray && info "已成功切换为 Socks5 出口！" || error "重启失败，请检查 Socks5 信息。"
 }
 
-# 修改配置
+# 修改配置 (已联动流控修改)
 modify_config() {
     if [[ ! -f "$X_CONFIG" ]]; then error "请先安装 Xray"; return; fi
+    if [[ ! -f "$X_STATE" ]]; then error "快照状态文件缺失，请重新安装以初始化矩阵"; return; fi
     
     local curr_port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
-    local curr_domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$X_CONFIG")
     local curr_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
-    local pri=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$X_CONFIG")
-    local curr_sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$X_CONFIG")
-    local pub=$(cat "$X_PBK")
+    local curr_flow=$(jq -r '.inbounds[0].settings.clients[0].flow // ""' "$X_CONFIG")
+    [[ "$curr_flow" == "null" ]] && curr_flow=""
+    local curr_decryption=$(jq -r '.inbounds[0].settings.decryption' "$X_CONFIG")
+    local curr_encryption=$(cat "$X_STATE")
     local curr_outbound=$(jq -c '.outbounds[0]' "$X_CONFIG")
 
     # 1. 修改端口
@@ -235,11 +249,7 @@ modify_config() {
         is_valid_port "$n_port" && break || error "端口无效，请输入 1-65535 之间的数字。"
     done
 
-    # 2. 修改域名
-    read -p "请输入新域名 (回车保持 $curr_domain): " n_domain
-    n_domain=${n_domain:-$curr_domain}
-    
-    # 3. 修改 UUID
+    # 2. 修改 UUID
     local n_uuid
     while true; do
         read -p "请输入新 UUID (回车保持 $curr_uuid): " n_uuid
@@ -247,36 +257,35 @@ modify_config() {
         if [[ "$n_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
             break
         else
-            error "UUID 格式不正确，请重新输入（标准36位连字符格式）。"
+            error "UUID 格式不正确，请重新输入。"
         fi
     done
 
-    # 4. 修改 ShortID
-    local n_sid
-    while true; do
-        read -p "请输入新 ShortID (回车保持 $curr_sid): " n_sid
-        n_sid=${n_sid:-$curr_sid}
-        if [[ "$n_sid" =~ ^[0-9a-fA-F]+$ ]] && (( ${#n_sid} % 2 == 0 )) && (( ${#n_sid} >= 2 && ${#n_sid} <= 16 )); then
-            break
-        else
-            error "ShortID 格式不正确，必须是偶数长度的十六进制字符（2-16位，例：a1b2c3d4）。"
-        fi
-    done
+    # 3. 修改流控 (Flow)
+    local n_flow
+    read -p "请输入流控 (如 xtls-rprx-vision，留空则不启用，当前: ${curr_flow:-无}): " n_flow
+    n_flow=${n_flow:-$curr_flow}
 
-    write_config "$n_port" "$n_uuid" "$n_domain" "$pri" "$n_sid" "$curr_outbound"
+    write_config "$n_port" "$n_uuid" "$n_flow" "$curr_decryption" "$curr_outbound"
     rc-service "$SERV_NAME" restart
     
-    local ip=$(get_public_ip)
-    # ✨ 核心修复点 1：写入前确保目标目录链存在
-    mkdir -p "$(dirname "$X_LINK")"
-    echo "vless://$n_uuid@$ip:$n_port?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=$n_domain&fp=chrome&pbk=$pub&sid=$n_sid#$HOSTNAME-Reality" > "$X_LINK"
+    # 重新生成链接
+    local ip=$(get_public_ip || echo "127.0.0.1")
+    local host_addr=$ip
+    if [[ $ip == *":"* ]]; then host_addr="[$ip]"; fi
+    
+    local flow_param=""
+    if [[ -n "$n_flow" ]]; then flow_param="&flow=$n_flow"; fi
+
+    mkdir -p "$X_LINK_DIR"
+    echo "vless://$n_uuid@$host_addr:$n_port?encryption=$curr_encryption&security=none&type=tcp${flow_param}#$HOSTNAME-vless-Encryption" > "$X_LINK"
     info "配置已更新并成功重启服务！"
 }
 
 # ================== 安装与管理 ==================
 install_xray() {
     info "正在安装依赖与内核..."
-    apk update && apk add curl unzip openssl jq uuidgen gcompat libc6-compat bc > /dev/null 2>&1
+    apk update && apk add curl unzip jq uuidgen gcompat libc6-compat bc openssl > /dev/null 2>&1
     mkdir -p "$X_DIR" && sync
     
     local arch=$(uname -m | sed 's/x86_64/64/;s/aarch64/arm64-v8a/')
@@ -290,14 +299,17 @@ install_xray() {
     
     if [[ ! -f "$X_CONFIG" ]]; then
         echo -ne "${GREEN}请输入入站端口 (回车随机): ${RESET}"; read port; [[ -z "$port" ]] && port=$((RANDOM % 45535 + 10000))
-        echo -ne "${GREEN}请输入伪装域名 (回车 www.amazon.com): ${RESET}"; read domain; [[ -z "$domain" ]] && domain="www.amazon.com"
         
-        # 1. 自定义或生成 UUID
+        # 1. 自定义 UUID
         local uuid
         while true; do
             echo -ne "${GREEN}请输入自定义 UUID (回车随机生成): ${RESET}"; read input_uuid
             if [[ -z "$input_uuid" ]]; then
-                uuid=$(uuidgen)
+                if [ -x "$X_BIN" ]; then
+                    uuid=$($X_BIN uuid 2>/dev/null || uuidgen)
+                else
+                    uuid=$(uuidgen)
+                fi
                 break
             else
                 if [[ "$input_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
@@ -309,31 +321,31 @@ install_xray() {
             fi
         done
 
-        # 2. 自定义或生成 ShortID
-        local sid
-        while true; do
-            echo -ne "${GREEN}请输入自定义 ShortID (回车随机生成, 必须是偶数长度的 2/4/6/8 字节十六进制): ${RESET}"; read input_sid
-            if [[ -z "$input_sid" ]]; then
-                sid=$(openssl rand -hex 4)
-                break
-            else
-                if [[ "$input_sid" =~ ^[0-9a-fA-F]+$ ]] && (( ${#input_sid} % 2 == 0 )) && (( ${#input_sid} >= 2 && ${#input_sid} <= 16 )); then
-                    sid="$input_sid"
-                    break
-                else
-                    error "ShortID 格式不正确，必须是偶数长度的十六进制字符（例：a1b2c3d4）。"
-                fi
-            fi
-        done
+        # 流控设置选择 (默认推荐 xtls-rprx-vision)
+        local flow
+        echo -ne "${GREEN}请输入流控设置 (回车默认 xtls-rprx-vision, 输入 none 留空): ${RESET}"; read input_flow
+        if [[ -z "$input_flow" ]]; then
+            flow="xtls-rprx-vision"
+        elif [[ "$input_flow" == "none" ]]; then
+            flow=""
+        else
+            flow="$input_flow"
+        fi
+
+        # 2. 生成抗量子对称矩阵对
+        info "正在实时构建后量子加解密通信矩阵..."
+        local encryption_info
+        encryption_info=$(generate_vless_encryption_config)
         
-        local keys=$($X_BIN x25519)
-        local pri=$(echo "$keys" | grep "Private" | awk '{print $NF}')
-        local pub=$(echo "$keys" | grep "Public" | awk '{print $NF}')
+        local decryption=$(echo "$encryption_info" | cut -d'|' -f1)
+        local encryption=$(echo "$encryption_info" | cut -d'|' -f2)
         
-        echo "$pub" > "$X_PBK"
-        write_config "$port" "$uuid" "$domain" "$pri" "$sid"
+        # 锁存客户端密钥快照
+        echo "$encryption" > "$X_STATE"
         
-        # 写入独立名称的 OpenRC 服务脚本
+        write_config "$port" "$uuid" "$flow" "$decryption"
+        
+        # 写入 OpenRC 服务脚本
         cat << EOF > "$INIT_FILE"
 #!/sbin/openrc-run
 command="${X_BIN}"
@@ -350,51 +362,59 @@ EOF
 
     rc-service "$SERV_NAME" restart
     
-    local ip=$(get_public_ip)
+    # 读取配置生成分享链接
+    local ip=$(get_public_ip || echo "127.0.0.1")
     local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
     local port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
-    local domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$X_CONFIG")
-    local pub=$(cat "$X_PBK" 2>/dev/null || echo "N/A")
-    local sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$X_CONFIG")
+    local flow=$(jq -r '.inbounds[0].settings.clients[0].flow // ""' "$X_CONFIG")
+    [[ "$flow" == "null" ]] && flow=""
+    local encryption=$(cat "$X_STATE")
     
-    local link="vless://$uuid@$ip:$port?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=$domain&fp=chrome&pbk=$pub&sid=$sid#$HOSTNAME-Reality"
+    local host_addr=$ip
+    if [[ $ip == *":"* ]]; then host_addr="[$ip]"; fi
     
-    # ✨ 核心修复点 2：写入前确保目标目录链存在
-    mkdir -p "$(dirname "$X_LINK")"
+    local flow_param=""
+    if [[ -n "$flow" ]]; then flow_param="&flow=$flow"; fi
+    
+    local link="vless://$uuid@$host_addr:$port?encryption=$encryption&security=none&type=tcp${flow_param}#$HOSTNAME-vless-Encryption"
+    
+    mkdir -p "$X_LINK_DIR"
     echo "$link" > "$X_LINK"
 
     show_current_config
 }
 
-# ================== 显示配置  ==================
+# ================== 显示配置 (全功能看板对接) ==================
 show_current_config() {
     if [[ ! -f "$X_CONFIG" ]]; then
         error "配置文件不存在"
         return
     fi
 
-    local ip uuid port domain shortid public_key outbound_mode
+    local ip uuid port flow outbound_mode remark
     ip=$(get_public_ip || echo "未知")
     uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG" 2>/dev/null || echo "未知")
     port=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "未知")
-    domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$X_CONFIG" 2>/dev/null || echo "未知")
-    shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$X_CONFIG" 2>/dev/null || echo "未知")
-    public_key=$(cat "$X_PBK" 2>/dev/null || echo "N/A")
+    flow=$(jq -r '.inbounds[0].settings.clients[0].flow // "未启用"' "$X_CONFIG" 2>/dev/null || echo "未启用")
+    [[ "$flow" == "null" ]] && flow="未启用"
+    remark="$HOSTNAME-${SERV_NAME}"
     
     local current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$X_CONFIG" 2>/dev/null || echo "freedom")
     [[ "$current_protocol" == "socks" ]] && outbound_mode="Socks5 链式代理" || outbound_mode="直连 (Freedom)"
 
-    echo -e "\n${GREEN}====== 当前配置详情 ======${RESET}"
-    echo -e "${YELLOW}IP地址      : ${ip}${RESET}"
-    echo -e "${YELLOW}端口        : ${port}${RESET}"
-    echo -e "${YELLOW}UUID        : ${uuid}${RESET}"
-    echo -e "${YELLOW}SNI/域名    : ${domain}${RESET}"
-    echo -e "${YELLOW}PublicKey   : ${public_key}${RESET}"
-    echo -e "${YELLOW}ShortID     : ${shortid}${RESET}"
-    echo -e "${YELLOW}出口模式    : ${outbound_mode}${RESET}"
-    
+    echo -e "${GREEN}====== VLESS-Encryption 节点配置信息 ======${RESET}"
+    echo -e "${YELLOW}服务器公网 IP   : ${ip}${RESET}"
+    echo -e "${YELLOW}服务监听端口    : ${port}${RESET}"
+    echo -e "${YELLOW}用户 UUID       : ${uuid}${RESET}"
+    echo -e "${YELLOW}协议与加密      : VLESS Encryption (native + 0-RTT + ML-KEM-768)${RESET}"
+    echo -e "${YELLOW}当前流控 (Flow) : ${flow}${RESET}"
+    echo -e "${YELLOW}出口模式        : ${outbound_mode}${RESET}"
+    echo -e "${YELLOW}节点自定义备注  : ${remark}${RESET}"
+    echo -e "${YELLOW}📄 V6VPS 请自行替换分享链接中的 IP 地址为 V6 ★${RESET}"
+    echo
+
     if [[ -f "$X_LINK" ]]; then
-        echo -e "${GREEN}====== 👉 v2rayN 分享链接 ======${RESET}"
+        echo -e "${GREEN}====== 👉 V2rayN 分享链接 (已存至 $X_LINK) ======${RESET}"
         cat "$X_LINK"
     fi
 }
@@ -408,23 +428,22 @@ show_menu() {
     [[ -f "$X_CONFIG" ]] && port_show=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "-")
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   Xray Vless+Reality 管理面板   ${RESET}"
+    echo -e "${GREEN}   Xray VLESS-Encryption 面板    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态     :${RESET} $status"
-    echo -e "${GREEN}版本     :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口     :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $status"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 Xray Vless+Reality${RESET}"
+    echo -e "${GREEN} 1. 安装 Xray VLESS-Encryption${RESET}"
     echo -e "${GREEN} 2. 更新 Xray${RESET}"
     echo -e "${GREEN} 3. 卸载 Xray${RESET}"
     echo -e "${GREEN} 4. 修改配置${RESET}"
     echo -e "${GREEN} 5. 启动 Xray${RESET}"
     echo -e "${GREEN} 6. 停止 Xray${RESET}"
-    echo -e "${GREEN} 7. 重启 Xray${RESET}"
+    echo -e "${GREEN} 7. 重举 Xray${RESET}"
     echo -e "${GREEN} 8. 查看日志${RESET}"
     echo -e "${GREEN} 9. 查看节点配置${RESET}"
     echo -e "${GREEN}10. 配置Socks5出口${RESET}"
-    echo -e "${GREEN}11. SNI域名优选✨${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
@@ -448,7 +467,6 @@ while true; do
         8) [[ -f "$X_LOG" ]] && tail -f "$X_LOG" || error "暂无日志"; pause ;;
         9) show_current_config || error "无配置"; pause ;;
         10) configure_custom_socks5_outbound; pause ;;
-        11) select_best_sni; pause ;;
         0) exit 0 ;;
         *) error "无效选项"; sleep 1 ;;
     esac

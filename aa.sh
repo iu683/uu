@@ -1,25 +1,23 @@
 #!/usr/bin/env bash
 #
-# Alpine sing-box TUIC v5 管理面板 (完全独立共存版)
+# Alpine sing-box TUIC v5 专属隔离管理面板
 # SPDX-License-Identifier: MIT
 #
 set -Eop pipefail
 export LANG=en_US.UTF-8
 
 # =========================================================
-# 1. 核心控制与全局环境初始化（全面隔离硬编码资产）
+# 1. 核心控制与全局环境初始化（全面重命名，防止冲突）
 # =========================================================
-readonly SB_SERVICE_NAME="sing-box-tuic"
 readonly BINARY_PATH="/usr/local/bin/sing-box-tuic"
 readonly TUIC_CONFIG="/etc/sing-box-tuic/config.json"
 readonly TUIC_DIR="/root/tuicV5"
-readonly STATE_FILE="/etc/sing-box-tuic-standalone.env"
 CONFIG_DIR="/etc/sing-box-tuic"
 OPENRC_SERVICE_PATH="/etc/init.d/sing-box-tuic"
 LOG_FILE="/var/log/sing-box-tuic.log"
-RUN_USER="singbox"
+RUN_USER="singbox-tuic"
 
-TMP_DIR=$(mktemp -d -t sbtuic.XXXXXX)
+TMP_DIR=$(mktemp -d -t sb-tuic.XXXXXX)
 
 # 颜色标准规范
 GREEN="\033[32m"
@@ -49,7 +47,7 @@ is_alpine() {
 install_packages() {
   info "正在刷新 Alpine 仓库并安装核心依赖..."
   apk update
-  apk add --no-cache bash curl wget tar openssl openrc iproute2 jq grep sed coreutils bind-tools iptables
+  apk add --no-cache bash curl wget tar openssl openrc iproute2 jq grep sed coreutils bind-tools iptables ip6tables
 }
 
 create_user() {
@@ -73,14 +71,6 @@ check_environment() {
   fi
   install_packages
   create_user
-  
-  # 【🔥 核心修复：自动检查并补全 gcompat 依赖，解决 Alpine 下的 not found 二进制闪退问题】
-  if [[ -f /etc/alpine-release ]]; then
-    apk info -e gcompat >/dev/null 2>&1 || {
-      info "检测到 Alpine 环境下缺失 glibc 兼容层，正在安装 gcompat..."
-      apk add --no-cache gcompat >/dev/null 2>&1 || true
-    }
-  fi
 }
 
 get_installed_version() {
@@ -94,18 +84,18 @@ get_installed_version() {
 get_latest_version() {
   info "正在从 GitHub 获取 sing-box 最新版本号..."
   local latest_v
-  latest_v=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r .tag_name | sed 's/^v//' 2>/dev/null)
+  latest_v=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r .tag_name | sed 's/^v//')
   
   if [[ -z "$latest_v" || "$latest_v" == "null" ]]; then
     warn "通过 API 获取最新版本失败，尝试备用匹配方案..."
-    latest_v=$(curl -fsSL "https://github.com/SagerNet/sing-box/releases/latest" | grep -oE 'releases/tag/v[0-9.]+' | head -n1 | sed 's|releases/tag/v||' 2>/dev/null)
+    latest_v=$(curl -fsSL "https://github.com/SagerNet/sing-box/releases/latest" | grep -oE 'releases/tag/v[0-9.]+' | head -n1 | sed 's|releases/tag/v||')
   fi
 
   if [[ -n "$latest_v" ]]; then
     SINGBOX_VERSION="$latest_v"
     info "成功获取最新版本: v$SINGBOX_VERSION"
   else
-    SINGBOX_VERSION="1.12.3"
+    SINGBOX_VERSION="1.12.0"
     warn "无法获取最新版本，将使用保底版本: v$SINGBOX_VERSION"
   fi
 }
@@ -118,6 +108,9 @@ clear_old_iptables() {
     local old_end=${old_hop#*-}
 
     if [[ -n "$old_start" && -n "$old_end" && -n "$old_port" ]]; then
+      # 修复：增加了 Alpine 下兼容性更好的 multiport 范围清除
+      iptables -t nat -D PREROUTING -p udp -m multiport --dports "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+      ip6tables -t nat -D PREROUTING -p udp -m multiport --dports "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
       iptables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
       ip6tables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
     fi
@@ -132,26 +125,40 @@ apply_new_iptables() {
     local end_p=${hop_val#*-}
     
     info "正在应用 iptables 转发规则: UDP $start_p-$end_p => 主端口 $port"
-    iptables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port"
-    ip6tables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+    # 修复：使用 -m multiport 机制防止 Alpine 下直接用 --dport 范围报错
+    if iptables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port"; then
+      ip6tables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+    else
+      warn "标准范围注入失败，尝试备用规则注入..."
+      iptables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port"
+      ip6tables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+    fi
     
     echo "$port" > "${CONFIG_DIR}/main_port.txt"
+    # 保存防火墙，防止 Alpine 重启丢失
+    if [[ -f /etc/init.d/iptables ]]; then
+      rc-service iptables save &>/dev/null || true
+      rc-service ip6tables save &>/dev/null || true
+    fi
   fi
 }
 
+# =========================================================
+# 4. 网络诊断与配置管理辅助
+# =========================================================
 get_public_ip() {
-  local ip
-  for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-    for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-      ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
     done
-  done
-  for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-    for url in "https://api64.ipify.org" "https://ip.sb"; do
-      ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
     done
-  done
-  echo "127.0.0.1"
+    echo "无法获取公网IP"
 }
 
 check_port() {
@@ -175,14 +182,10 @@ get_random_port() {
 }
 
 get_tuic_status() {
-  if rc-service "$SB_SERVICE_NAME" status 2>/dev/null | grep -q "started"; then
+  if rc-service sing-box-tuic status 2>/dev/null | grep -q "started"; then
     echo "RUNNING"
   else
-    if pgrep -f "$BINARY_PATH run" >/dev/null 2>&1; then
-      echo "RUNNING"
-    else
-      echo "STOPPED"
-    fi
+    echo "STOPPED"
   fi
 }
 
@@ -200,6 +203,9 @@ get_current_port_display() {
   else echo "-"; fi
 }
 
+# =========================================================
+# 5. 面板节点配置生成核心逻辑
+# =========================================================
 inst_cert() {
   mkdir -p "$CONFIG_DIR/certs"
 
@@ -231,7 +237,7 @@ inst_cert() {
       info "正在检查并安装 Acme.sh 依赖..."
       local acme_cmd="/root/.acme.sh/acme.sh"
       if [[ ! -f "$acme_cmd" ]]; then
-        curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum 2>/dev/null | cut -c 1-16 || echo "admin")@gmail.com
+        curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
       fi
       
       "$acme_cmd" --set-default-ca --server letsencrypt
@@ -406,40 +412,28 @@ Surge 配置:
 $HOSTNAME-tuicv5 = tuic-v5, $last_ip, $port, password=$auth_pwd, uuid=$auth_uuid, ecn=true, skip-cert-verify=${skip_cert}, sni=$tuic_domain
 EOF
 
-  # 写入持久化环境变量状态，方便读取
-  cat << EOF > "$STATE_FILE"
-port='${port}'
-auth_uuid='${auth_uuid}'
-auth_pwd='${auth_pwd}'
-tuic_domain='${tuic_domain}'
-cert_path='${cert_path}'
-key_path='${key_path}'
-EOF
-  chmod 600 "$STATE_FILE"
-
-  rc-service "$SB_SERVICE_NAME" restart >/dev/null 2>&1 || true
-  if rc-service "$SB_SERVICE_NAME" status 2>/dev/null | grep -q "started"; then
+  rc-service sing-box-tuic restart
+  if rc-service sing-box-tuic status | grep -q "started"; then
     info "sing-box TUIC 服务配置并启动成功！"
   else
-    if pgrep -f "$BINARY_PATH run" >/dev/null 2>&1; then
-      info "服务已在独立进程模式下建立成功！"
-    else
-      error "sing-box TUIC 启动失败，可在菜单中按 8 查看详细的错误日志。"
-    fi
+    error "sing-box-tuic 启动失败，可在菜单中按 8 查看详细的闪退日志。"
   fi
   showconf
 }
 
+# =========================================================
+# 6. 安装、更新与卸载核心流控（重命名 OpenRC 服务与独立用户）
+# =========================================================
 write_openrc_script() {
-  cat << EOF > "$OPENRC_SERVICE_PATH"
+  cat << 'EOF' > "$OPENRC_SERVICE_PATH"
 #!/sbin/openrc-run
 
-name="${SB_SERVICE_NAME}"
-description="sing-box TUIC OpenRC Standalone Service"
-cfgfile="${TUIC_CONFIG}"
-logfile="${LOG_FILE}"
-command="${BINARY_PATH}"
-command_args="run -c ${TUIC_CONFIG}"
+name="sing-box-tuic"
+description="sing-box TUIC OpenRC Isolated Service"
+cfgfile="/etc/sing-box-tuic/config.json"
+logfile="/var/log/sing-box-tuic.log"
+command="/usr/local/bin/sing-box-tuic"
+command_args="run -c /etc/sing-box-tuic/config.json"
 
 depend() {
     need net
@@ -447,32 +441,32 @@ depend() {
 }
 
 start_pre() {
-    if [ ! -f "\$cfgfile" ]; then
-        eerror "Configuration file \$cfgfile missing!"
+    if [ ! -f "$cfgfile" ]; then
+        eerror "Configuration file $cfgfile missing!"
         return 1
     fi
     
-    touch "\$logfile"
-    chown singbox:singbox "\$logfile"
-    chmod 644 "\$logfile"
+    touch "$logfile"
+    chown singbox-tuic:singbox-tuic "$logfile"
+    chmod 644 "$logfile"
     
     command_background="yes"
-    pidfile="/run/\${RC_SVCNAME}.pid"
+    pidfile="/run/${RC_SVCNAME}.pid"
     
-    output_log="\$logfile"
-    error_log="\$logfile"
+    output_log="$logfile"
+    error_log="$logfile"
     
     local port
-    port=\$(jq -r '.inbounds[0].listen_port // 0' "\$cfgfile" 2>/dev/null)
-    if [ "\$port" -lt 1024 ] && [ "\$port" -ne 0 ]; then
+    port=$(jq -r '.inbounds[0].listen_port // 0' "$cfgfile" 2>/dev/null)
+    if [ "$port" -lt 1024 ] && [ "$port" -ne 0 ]; then
         command_user="root:root"
     else
-        command_user="singbox:singbox"
+        command_user="singbox-tuic:singbox-tuic"
     fi
 }
 EOF
   chmod +x "$OPENRC_SERVICE_PATH"
-  rc-update add "$SB_SERVICE_NAME" default >/dev/null 2>&1 || true
+  rc-update add sing-box-tuic default >/dev/null 2>&1 || true
 }
 
 download_core() {
@@ -491,14 +485,14 @@ download_core() {
   local extracted=$(find "$TMP_DIR" -type f -name sing-box | head -n 1)
   [[ -n "$extracted" ]] || { error "解压目标核心错误"; return 1; }
   
-  rc-service "$SB_SERVICE_NAME" stop >/dev/null 2>&1 || true
+  rc-service sing-box-tuic stop >/dev/null 2>&1 || true
   install -m 755 "$extracted" "$BINARY_PATH"
-  info "sing-box TUIC 专属核心释放完毕。"
+  info "sing-box-tuic 核心释放完毕。"
   return 0
 }
 
 install_tuic() {
-  echo -e "${GREEN}[信息] 开始在 Alpine 下部署 sing-box TUIC V5 独立系统...${RESET}"
+  echo -e "${GREEN}[信息] 开始在 Alpine 下部署专属隔离的 sing-box TUIC V5 ...${RESET}"
   check_environment
   mkdir -p "$CONFIG_DIR" "$TUIC_DIR"
 
@@ -520,35 +514,34 @@ install_tuic() {
 
 update_tuic() {
   if [[ ! -f "$BINARY_PATH" ]]; then
-    error "当前系统未检测到独立内核，无法执行原地升级。"
+    error "当前系统未检测到核心，无法执行覆盖升级。"
     return 1
   fi
-  info "检测到已有隔离环境，正在执行专属内核原地无损覆盖升级..."
+  info "检测到已有环境，正在执行纯净原地覆盖核心升级..."
   if download_core; then
-    rc-service "$SB_SERVICE_NAME" start >/dev/null 2>&1 || true
-    info "sing-box TUIC 专属核心升级成功，服务已安全复活！"
+    rc-service sing-box-tuic start
+    info "sing-box-tuic 核心纯净升级覆盖成功，服务已安全启动！"
   else
     error "核心升级遭遇未预期中断。"
   fi
 }
 
 unsttuic() {
-  warn "即将完全隔离并安全卸载 sing-box TUIC v5 服务..."
+  warn "即将卸载..."
   clear_old_iptables
 
-  rc-service "$SB_SERVICE_NAME" stop >/dev/null 2>&1 || true
-  rc-update del "$SB_SERVICE_NAME" default >/dev/null 2>&1 || true
-  pkill -f "$BINARY_PATH run" || true
+  rc-service sing-box-tuic stop || true
+  rc-update del sing-box-tuic default >/dev/null 2>&1 || true
   
-  rm -f "$BINARY_PATH" "$OPENRC_SERVICE_PATH" "$LOG_FILE" "$STATE_FILE"
+  rm -f "$BINARY_PATH" "$OPENRC_SERVICE_PATH" "$LOG_FILE"
   rm -rf "$CONFIG_DIR" "$TUIC_DIR"
   
-  info "隔离卸载、转发链条清理完成！"
+  info "彻底卸载清理完毕！"
 }
 
 changeconf() {
   if [[ ! -f "$TUIC_CONFIG" ]]; then
-    error "配置文件不存在，请先选择选项 1 安装独立服务"
+    error "配置文件不存在，请先选择选项 1 安装"
     return 1
   fi
 
@@ -585,7 +578,7 @@ changeconf() {
   fi
 
   write_and_show_config
-  info "独立转发链条与配置文件刷新成功！"
+  info "配置与转发链条刷新修改成功！"
 }
 
 showconf() {
@@ -598,8 +591,10 @@ showconf() {
   echo
 }
 
+# =========================================================
+# 7. 面板交互菜单 
+# =========================================================
 menu() {
-  check_environment
   while true; do
     clear
     local raw_status=$(get_tuic_status)
@@ -614,21 +609,21 @@ menu() {
     local port_show=$(get_current_port_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   Sing-box(Tuicv5) 隔离独立面板 ${RESET}"
+    echo -e "${GREEN}  Sing-box(Tuicv5) 隔离管理面板   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} ${status}"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}状态   :${RESET} ${status}"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 隔离型 Sing-box Tuicv5${RESET}"
-    echo -e "${GREEN}2. 更新 隔离型 Sing-box Tuicv5${RESET}"
-    echo -e "${GREEN}3. 卸载 隔离型 Sing-box Tuicv5${RESET}"
-    echo -e "${GREEN}4. 修改隔离配置${RESET}"
+    echo -e "${GREEN}1. 安装 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}2. 更新 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}3. 卸载 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
     echo -e "${GREEN}5. 启动 Sing-box Tuicv5${RESET}"
     echo -e "${GREEN}6. 停止 Sing-box Tuicv5${RESET}"
     echo -e "${GREEN}7. 重启 Sing-box Tuicv5${RESET}"
-    echo -e "${GREEN}8. 查看专属闪退与系统日志${RESET}"
-    echo -e "${GREEN}9. 查看节点分享配置${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
 
@@ -641,10 +636,10 @@ menu() {
       2) update_tuic; pause ;;
       3) rm -f "${CONFIG_DIR}/hopping.txt" "${CONFIG_DIR}/main_port.txt" 2>/dev/null; unsttuic; pause ;;
       4) changeconf; pause ;;
-      5) rc-service "$SB_SERVICE_NAME" start || pkill -f "$BINARY_PATH run" || true; info "服务已成功递交启动指令。"; pause ;;
-      6) rc-service "$SB_SERVICE_NAME" stop || pkill -f "$BINARY_PATH run" || true; info "服务已成功递交停止指令。"; pause ;;
-      7) rc-service "$SB_SERVICE_NAME" restart || true; info "服务已重启。"; pause ;;
-      8) if [[ -f "$LOG_FILE" ]]; then tail -n 50 "$LOG_FILE"; else warn "未发现运行日志文件，请检查服务是否从未启动成功。"; fi; pause ;;
+      5) rc-service sing-box-tuic start && info "服务已成功启动！"; pause ;;
+      6) rc-service sing-box-tuic stop && info "服务已成功停止！"; pause ;;
+      7) rc-service sing-box-tuic restart && info "服务已成功重启！"; pause ;;
+      8) if [[ -f "$LOG_FILE" ]]; then tail -n 50 "$LOG_FILE"; else warn "未发现运行日志文件。"; fi; pause ;;
       9) showconf; pause ;;
       0) exit 0 ;;
       *) error "无效输入，请重新选择。"; sleep 1 ;;

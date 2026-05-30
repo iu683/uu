@@ -1,34 +1,31 @@
 #!/usr/bin/env bash
 #
-# Xray (VLESS-Encryption + REALITY) Alpine Linux 专属控制面板
+# Sing-box (NaiveProxy) 控制面板 
 # SPDX-License-Identifier: MIT
 #
 # =========================================================
 # 1. 核心控制与全局环境初始化
 # =========================================================
-set -Eeuo pipefail
+set -Eop pipefail
 export LANG=en_US.UTF-8
 
 # 基础目录与硬编码配置
-readonly XRAY_CONFIG="/usr/local/etc/xray/config.json"
-readonly XRAY_BINARY="/usr/local/bin/xray"
-readonly INIT_SERVICE_PATH="/etc/init.d/xray"
-readonly STATE_DIR="/root/Xray"
-readonly STATE_FILE="/root/Xray/xray_encryption_info.txt"
-readonly REALITY_FILE="/root/Xray/xray_reality_info.txt"  # 存储格式: pbk|sni|sid
-readonly LINK_FILE="/root/Xray/xray_vless_encryptionreality_link.txt"
-readonly REPO_API_URL="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
+readonly SB_CONFIG="/etc/mo-naiveproxy-sb/config.json"
+readonly SB_BINARY="/usr/local/bin/sing-box"
+readonly SB_DIR="/root/proxynode/naiveproxy"
+EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
+SYSTEMD_SERVICES_DIR="/etc/systemd/system"
+CONFIG_DIR="/etc/mo-naiveproxy-sb"
+REPO_URL="https://github.com/SagerNet/sing-box"
+API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
+CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
 
-TMP_DIR=$(mktemp -d -p /tmp xray_alpine.XXXXXX)
+# 自动检测环境变量
+PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
+OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
+ARCHITECTURE="${ARCHITECTURE:-}"
 
-# ================== cleanup ==================
-cleanup() {
-    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
-}
-
-trap cleanup EXIT INT TERM
-
-# 终端规范颜色代码
+# 终端颜色代码
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
@@ -37,572 +34,547 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 # =========================================================
-# 2. 基础底层工具函数 (适配 Alpine 环境)
+# 2. 官方原生底层工具函数
 # =========================================================
+has_command() {
+  local _command=$1
+  type -P "$_command" > /dev/null 2>&1
+}
+
+curl() {
+  command curl "${CURL_FLAGS[@]}" "$@"
+}
+
+mktemp() {
+  command mktemp "$@" "sbservinst.XXXXXXXXXX"
+}
+
 info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
 warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
 error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
 pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
 
-get_public_ip() {
-    local ip=''
-    for url in https://api.ipify.org https://ip.sb https://checkip.amazonaws.com; do
-        ip=$(curl -4s --max-time 5 "$url" 2>/dev/null || true)
-        [[ -n "$ip" ]] && { echo "$ip"; return; }
-    done
-    hostname -i | awk '{print $1}' 2>/dev/null || echo "127.0.0.1"
+systemctl() {
+  if ! has_command systemctl; then
+    warn "当前系统不支持 systemd，忽略守护进程操作: systemctl $*"
+    return 0
+  fi
+  command systemctl "$@"
 }
 
-get_random_port() {
-    local rand_port
-    while true; do
-        rand_port=$((RANDOM % 55536 + 10000))
-        if ! ss -tuln | awk '{print $5}' | grep -qE "[:.]${rand_port}$"; then
-            echo "$rand_port"
-            return 0
-        fi
-    done
+install_content() {
+  local _install_flags="$1"
+  local _content="$2"
+  local _destination="$3"
+  local _overwrite="$4"
+  local _tmpfile="$(mktemp)"
+
+  echo -ne "安装 $_destination ... "
+  echo "$_content" > "$_tmpfile"
+  if [[ -z "$_overwrite" && -e "$_destination" ]]; then
+    echo -e "已存在"
+  elif install "$_install_flags" "$_tmpfile" "$_destination"; then
+    echo -e "完成"
+  fi
+  rm -f "$_tmpfile"
+}
+
+remove_file() {
+  local _target="$1"
+  echo -ne "移除 $_target ... "
+  if rm -f "$_target"; then
+    echo -e "完成"
+  fi
+}
+
+detect_package_manager() {
+  [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
+  has_command apt && PACKAGE_MANAGEMENT_INSTALL='apt -y --no-install-recommends install' && return 0
+  has_command dnf && PACKAGE_MANAGEMENT_INSTALL='dnf -y install' && return 0
+  has_command yum && PACKAGE_MANAGEMENT_INSTALL='yum -y install' && return 0
+  has_command apk && PACKAGE_MANAGEMENT_INSTALL='apk add --no-cache' && return 0
+  return 1
+}
+
+install_software() {
+  local _package_name="$1"
+  if ! detect_package_manager; then
+    error "未检测到支持的包管理器，请手动安装 $_package_name"
+    exit 65
+  fi
+  echo "正在安装缺失的依赖 '$_package_name' ... "
+  if $PACKAGE_MANAGEMENT_INSTALL "$_package_name" >/dev/null 2>&1; then
+    echo "依赖安装成功"
+  else
+    error "无法通过包管理器安装 '$_package_name'，请手动安装。"
+    exit 65
+  fi
+}
+
+check_environment() {
+  if [[ "x$(uname)" == "xLinux" ]]; then
+    OPERATING_SYSTEM=linux
+  else
+    error "本脚本仅支持 Linux 系统。"
+    exit 95
+  fi
+
+  case "$(uname -m)" in
+    'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
+    'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
+    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
+  esac
+
+  has_command curl || install_software curl
+  has_command grep || install_software grep
+  has_command jq || install_software jq
+  has_command tar || install_software tar
 }
 
 get_installed_version() {
-    if [[ -f "$XRAY_BINARY" ]]; then
-        "$XRAY_BINARY" version 2>/dev/null | head -n 1 | awk '{print $2}' || echo "未知版本"
+  if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
+    local version_out
+    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null || echo "")
+    if [[ -n "$version_out" ]]; then
+      echo "$version_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' | head -n 1 || echo "未知格式"
     else
-        echo "未安装"
+      echo "未知版本"
     fi
+  else
+    echo "未安装"
+  fi
 }
 
-get_xray_status() {
-    if command -v rc-service &>/dev/null && rc-service xray status >/dev/null 2>&1; then
-        echo -e "${GREEN}● 运行中 (OpenRC)${RESET}"
-    else
-        if pgrep -f "$XRAY_BINARY run" >/dev/null 2>&1; then
-            echo -e "${GREEN}● 运行中 (Pidmode)${RESET}"
-        else
-            echo -e "${RED}● 未运行${RESET}"
-        fi
-    fi
+get_latest_version() {
+  local _tmpfile=$(mktemp)
+  if ! curl -sS -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases" -o "$_tmpfile"; then
+    rm -f "$_tmpfile"
+    return
+  fi
+  local _tag_name=$(jq -r '[.[] | select(.prerelease==false and .draft==false)][0].tag_name' "$_tmpfile" 2>/dev/null || echo "")
+  rm -f "$_tmpfile"
+  
+  if [[ -n "$_tag_name" ]]; then
+    echo "${_tag_name##*\/}"
+  else
+    echo "v1.12.3"
+  fi
 }
 
-get_current_port_display() {
-    if [[ -f "$XRAY_CONFIG" ]]; then
-        local port
-        port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "")
-        echo "${port:- -}"
-    else echo "-"; fi
+download_singbox() {
+  local _version="$1"
+  local _destination="$2"
+  local _ver_num="${_version#v}"
+  
+  local _download_url="$REPO_URL/releases/download/$_version/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE.tar.gz"
+  
+  info "正在下载官方 Sing-box 核心组件: $_download_url ..."
+  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
+    error "核心下载失败！请检查您的网络连接。"
+    return 11
+  fi
+  return 0
 }
 
-generate_uuid() {
-    if [ -f "$XRAY_BINARY" ] && [ -x "$XRAY_BINARY" ]; then
-        $XRAY_BINARY uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid
-    else
-        cat /proc/sys/kernel/random/uuid
-    fi
-}
+tpl_singbox_server_service_base() {
+  cat << EOF
+[Unit]
+Description=sing-box service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target network-online.target
 
-# =========================================================
-# 3. Alpine OpenRC 守护脚本模板
-# =========================================================
-write_openrc_script() {
-    cat << 'EOF' > "$INIT_SERVICE_PATH"
-#!/sbin/openrc-run
+[Service]
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+ExecStart=$EXECUTABLE_INSTALL_PATH run -c $SB_CONFIG
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=infinity
 
-description="Xray VLESS-Encryption+REALITY Service"
-supervisor="supervise-daemon"
-command="/usr/local/bin/xray"
-command_args="run -c /usr/local/etc/xray/config.json"
-
-depend() {
-    need net
-    after firewall
-}
+[Install]
+WantedBy=multi-user.target
 EOF
-    chmod 755 "$INIT_SERVICE_PATH"
 }
 
 # =========================================================
-# 4. 核心提取与无缝下载 (摆脱官方 Systemd 脚本束缚)
+# 3. 面板辅助网络与配置扩展函数
 # =========================================================
-download_and_extract_core() {
-    local arch
-    case "$(uname -m)" in
-        'x86_64') arch="64" ;;
-        'aarch64' | 'armv8') arch="arm64-v8a" ;;
-        *) error "不支持的 Alpine 系统架构: $(uname -m)"; return 1 ;;
-    esac
-
-    info "正在自 GitHub 获取 Xray 最新发版矩阵..."
-    local release_json="$TMP_DIR/release.json"
-    if ! curl -fsSL "$REPO_API_URL" -o "$release_json"; then
-        error "获取 GitHub 发行列表失败，请检查网络"
-        return 1
+get_sb_status() {
+  if has_command systemctl && systemctl is-active --quiet mo-naiveproxy-sb 2>/dev/null; then
+    echo -e "${GREEN}● 运行中${RESET}"
+  else
+    if pgrep -f "$EXECUTABLE_INSTALL_PATH run" >/dev/null 2>&1; then
+      echo -e "${GREEN}● 运行中 (Pidmode)${RESET}"
+    else
+      echo -e "${RED}● 未运行${RESET}"
     fi
-
-    local download_url
-    download_url=$(jq -r --arg arch "Xray-linux-${arch}.zip" '.assets[] | select(.name==$arch) | .browser_download_url' "$release_json")
-
-    if [[ -z "$download_url" || "$download_url" == "null" ]]; then
-        error "未能在当前架构中匹配到有效的发布包"
-        return 1
-    fi
-
-    info "开始下载 Xray 核心主程序组件..."
-    local zip_file="$TMP_DIR/xray.zip"
-    if ! curl -L -f -# "$download_url" -o "$zip_file"; then
-        error "下载 Xray 压缩归档失败"
-        return 1
-    fi
-
-    info "执行纯净解压覆盖..."
-    mkdir -p "$(dirname "$XRAY_BINARY")"
-    unzip -qjo "$zip_file" "xray" -d "$(dirname "$XRAY_BINARY")"
-    chmod 755 "$XRAY_BINARY"
-
-    # 下载附加 Geo 数据资产
-    mkdir -p /usr/local/share/xray
-    local geoip_url=$(jq -r '.assets[] | select(.name=="geoip.dat") | .browser_download_url' "$release_json")
-    local geosite_url=$(jq -r '.assets[] | select(.name=="geosite.dat") | .browser_download_url' "$release_json")
-    
-    [[ -n "$geoip_url" ]] && curl -L -f -s "$geoip_url" -o /usr/local/share/xray/geoip.dat || true
-    [[ -n "$geosite_url" ]] && curl -L -f -s "$geosite_url" -o /usr/local/share/xray/geosite.dat || true
-    
-    return 0
+  fi
 }
 
-generate_vless_encryption_config() {
-    local vlessenc_output
-    vlessenc_output=$($XRAY_BINARY vlessenc 2>/dev/null || true)
-    if [ -z "$vlessenc_output" ]; then
-        error "生成 VLESS Encryption 配置失败"
-        return 1
-    fi
-
-    local decryption_config=""
-    local encryption_config=""
-    local in_mlkem_section=false
-
-    while IFS= read -r line; do
-        if [[ "$line" == *"Authentication: ML-KEM-768, Post-Quantum"* ]]; then
-            in_mlkem_section=true
-            continue
-        fi
-
-        if [ "$in_mlkem_section" = true ]; then
-            if [[ "$line" == *'"decryption":'* ]]; then
-                decryption_config=$(echo "$line" | sed 's/.*"decryption": "\([^"]*\)".*/\1/')
-            elif [[ "$line" == *'"encryption":'* ]]; then
-                if echo "$line" | grep -q '.*"encryption": "[^"]*"'; then
-                    encryption_config=$(echo "$line" | sed 's/.*"encryption": "\([^"]*\)".*/\1/')
-                else
-                    encryption_config=$(echo "$line" | sed 's/.*"encryption": "\([^"]*\).*/\1/')
-                    read -r next_line
-                    encryption_config="${encryption_config}${next_line}"
-                    encryption_config=$(echo "$encryption_config" | tr -d '"' | tr -d '[:space:]')
-                fi
-                break
-            fi
-        fi
-    done <<< "$vlessenc_output"
-
-    if [ -z "$decryption_config" ] || [ -z "$encryption_config" ]; then
-        error "无法解析 VLESS Encryption 配置。"
-        return 1
-    fi
-
-    echo "${decryption_config}|${encryption_config}"
+get_current_domain_display() {
+  if [[ -f "$SB_CONFIG" ]]; then
+    local domain
+    domain=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || echo "")
+    echo "${domain:- -}"
+  else echo "-"; fi
 }
 
-generate_reality_keys() {
-    local key_pair
-    key_pair=$($XRAY_BINARY x25519 2>/dev/null || true)
-    if [ -z "$key_pair" ]; then
-        error "生成 REALITY 密钥对失败！"
-        return 1
-    fi
-
-    local private_key=$(echo "$key_pair" | grep -i "Private" | sed 's/[[:space:]]//g' | cut -d':' -f2)
-    local public_key=$(echo "$key_pair" | grep -E -i "(Public|Password)" | sed 's/[[:space:]]//g' | cut -d':' -f2)
-
-    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
-        error "无法解析 REALITY 密钥对。"
-        return 1
-    fi
-    echo "${private_key}|${public_key}"
+# 随机字符串生成函数
+generate_random_string() {
+  local length=$1
+  LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c "$length" || true
 }
 
 # =========================================================
 # 4. 面板核心交互与配置文件处理
 # =========================================================
 write_and_show_config() {
-    mkdir -p "$STATE_DIR"
-    
-    rm -f "$STATE_FILE" "$REALITY_FILE"
-    echo "$ENCRYPTION" > "$STATE_FILE"
-    echo "${PUBLIC_KEY}|${SNI}|${SHORT_ID}" > "$REALITY_FILE"
+  mkdir -p "$CONFIG_DIR"
 
-    mkdir -p "$(dirname "$XRAY_CONFIG")"
-    jq -n \
-        --argjson port "$PORT" \
-        --arg uuid "$UUID" \
-        --arg decryption "$DECRYPTION" \
-        --arg private_key "$PRIVATE_KEY" \
-        --arg sni "$SNI" \
-        --arg short_id "$SHORT_ID" \
-        --arg flow "xtls-rprx-vision" \
-    '{
-        "log": {"loglevel": "warning"},
-        "inbounds": [{
-            "listen": "::",
-            "port": $port,
-            "protocol": "vless",
-            "settings": {
-                "clients": [{"id": $uuid, "flow": $flow}],
-                "decryption": $decryption
-            },
-            "streamSettings": {
-                "network": "tcp",
-                "security": "reality",
-                "realitySettings": {
-                    "show": false,
-                    "dest": ($sni + ":443"),
-                    "xver": 0,
-                    "serverNames": [$sni],
-                    "privateKey": $private_key,
-                    "shortIds": [$short_id],
-                    "fingerprint": "chrome"
-                }
-            }
-        }],
-        "outbounds": [{
-            "protocol": "freedom",
-            "settings": {
-                "domainStrategy": "UseIPv4v6"
-            }
-        }]
-    }' > "$XRAY_CONFIG"
-
-    chmod 644 "$XRAY_CONFIG"
-    
-    SERVER_IP=$(get_public_ip)
-    cat << EOF >> "$STATE_FILE"
-PORT='${PORT}'
-UUID='${UUID}'
-REMARK='${REMARK}'
-SERVER_IP='${SERVER_IP}'
+  cat << EOF > "$SB_CONFIG"
+{
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
+    {
+      "type": "naive",
+      "tag": "naive-in",
+      "listen": "::",
+      "listen_port": ${sb_port},
+      "users": [
+        {
+          "username": "${sb_username}",
+          "password": "${sb_password}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${sb_domain}",
+        "acme": {
+          "domain": ["${sb_domain}"],
+          "email": "${sb_email}"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
 EOF
 
-    # 重启并接管守护体系 (OpenRC/Pid双路兼容)
-    if command -v rc-service &>/dev/null; then
-        write_openrc_script
-        rc-update add xray default >/dev/null 2>&1 || true
-        rc-service xray restart >/dev/null 2>&1 || true
-        sleep 1
-        if rc-service xray status >/dev/null 2>&1; then
-            info "Xray 已通过 OpenRC 启动并加载托管守护！"
-        else
-            error "服务启动异常，可选择菜单 8 查看测试输出。"
-        fi
-    else
-        pkill -f "$XRAY_BINARY run" || true
-        "$XRAY_BINARY" run -c "$XRAY_CONFIG" >/dev/null 2>&1 &
-        info "非 OpenRC 环境，已直接注入后台常驻进程运行。"
-    fi
+  mkdir -p "$SB_DIR"
+  
+  # 彻底解决旧版本 curl 报错，使用完美的 jq 自带编码器
+  local encoded_node_name=$(jq -rn --arg x "$sb_node_name" '$x|@uri')
+  local share_link="naive+https://${sb_username}:${sb_password}@${sb_domain}:${sb_port}#${sb_node_name}"
 
-    showconf
+  cat << EOF > "$SB_DIR/url.txt"
+V2rayN 配置分享链接:
+${share_link}
+EOF
+
+  cat << EOF > "$SB_DIR/meta.env"
+sb_domain="${sb_domain}"
+sb_email="${sb_email}"
+sb_username="${sb_username}"
+sb_password="${sb_password}"
+sb_node_name="${sb_node_name}"
+sb_port="${sb_port}"
+EOF
+
+  if has_command systemctl; then
+    systemctl daemon-reload
+    systemctl enable mo-naiveproxy-sb >/dev/null 2>&1 || true
+    systemctl restart mo-naiveproxy-sb >/dev/null 2>&1 || true
+    
+    if systemctl is-active --quiet mo-naiveproxy-sb 2>/dev/null; then
+      info "Sing-box 服务配置并启动成功！"
+    else
+      error "Sing-box 服务启动失败，请运行 'journalctl -u mo-naiveproxy-sb -f' 查看错误日志。"
+    fi
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+    "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
+    info "非 systemd 环境，程序已挂载至后台 Pid 进程池中运行。"
+  fi
+  showconf
 }
 
 # =========================================================
 # 5. 主流程控制模块与更新功能
 # =========================================================
-inst_xray() {
-    if [[ -f "$XRAY_CONFIG" ]]; then
-        warn "系统检测到已存在配置。"
-        read -rp "是否强制清空重新部署？ [y/N]: " CONFIRM_REINST
-        [[ "$CONFIRM_REINST" != "y" && "$CONFIRM_REINST" != "Y" ]] && return 0
-    fi
+inst_singbox() {
+  check_environment
+  
+  info "🧹 正在释放 80 和 443 端口以防冲突..."
+  systemctl stop mo-naiveproxy-caddy nginx apache2 mo-naiveproxy-sb 2>/dev/null || true
 
-    info "🧹 正在整理 Alpine 静态底层组件依赖..."
-    if [[ ! -f "$XRAY_BINARY" ]]; then
-        download_and_extract_core || return 1
-    fi
+  info "获取官方最新发布版本中..."
+  local latest_version=$(get_latest_version)
+  
+  local _tmpfile_tar=$(mktemp)
+  if ! download_singbox "$latest_version" "$_tmpfile_tar"; then
+    rm -f "$_tmpfile_tar" && return 1
+  fi
 
-    local encryption_info
-    encryption_info=$(generate_vless_encryption_config) || return 1
-    DECRYPTION=$(echo "$encryption_info" | cut -d'|' -f1)
-    ENCRYPTION=$(echo "$encryption_info" | cut -d'|' -f2)
+  echo -ne "正在解压并安装二进制可执行文件 ... "
+  local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
+  tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
+  
+  local _ver_num="${latest_version#v}"
+  if install -Dm755 "$_tmpdir_extract/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE/sing-box" "$EXECUTABLE_INSTALL_PATH"; then
+    echo "成功"
+  else
+    rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "安装失败" && return 1
+  fi
+  rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
 
-    local reality_keys
-    reality_keys=$(generate_reality_keys) || return 1
-    PRIVATE_KEY=$(echo "$reality_keys" | cut -d'|' -f1)
-    PUBLIC_KEY=$(echo "$reality_keys" | cut -d'|' -f2)
+  if has_command systemctl; then
+    install_content -Dm644 "$(tpl_singbox_server_service_base)" "$SYSTEMD_SERVICES_DIR/mo-naiveproxy-sb.service" "1"
+  fi
 
-    local rand_port rand_uuid rand_sid hostname_str default_remark default_sni
-    rand_port=$(get_random_port)
-    rand_uuid=$(generate_uuid)
-    rand_sid=$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \t\n')
-    hostname_str=$(hostname -s 2>/dev/null || echo "alpine")
-    default_remark="${hostname_str}-VLESS-E-Reality"
-    default_sni="www.amazon.com"
+  local rand_user=$(generate_random_string 8)
+  local rand_pass=$(generate_random_string 16)
+  local rand_email="$(generate_random_string 10)@gmail.com"
+  local hostname_str=$(hostname 2>/dev/null || echo "linux")
+  local default_remark="${hostname_str}-NaiveProxy"
 
-    echo "---------------------------------------------"
-    read -rp "👉 请输入监听端口 (直接回车随机分配: ${rand_port}): " INPUT_PORT
-    PORT=${INPUT_PORT:-$rand_port}
+  echo "---------------------------------------------"
+  read -rp "👉 请输入解析好的域名 (例如: naive.example.com): " sb_domain
+  [[ -z "$sb_domain" ]] && error "域名不能为空！" && return 1
 
-    read -rp "👉 请输入UUID (直接回车高强随机: ${rand_uuid}): " INPUT_UUID
-    UUID=${INPUT_UUID:-$rand_uuid}
+  read -rp "👉 请输入你的邮箱 (默认随机: ${rand_email}): " sb_email
+  sb_email=${sb_email:-"$rand_email"}
 
-    read -rp "👉 请输入 REALITY SNI 伪装域名 (默认: ${default_sni}): " INPUT_SNI
-    SNI=${INPUT_SNI:-$default_sni}
+  read -rp "👉 请设置 NaiveProxy 用户名 (默认随机: ${rand_user}): " sb_username
+  sb_username=${sb_username:-"$rand_user"}
 
-    read -rp "👉 请输入 REALITY Short ID (直接回车使用随机: ${rand_sid}): " INPUT_SID
-    SHORT_ID=${INPUT_SID:-$rand_sid}
+  read -rp "👉 请设置 NaiveProxy 密码 (默认随机: ${rand_pass}): " sb_password
+  sb_password=${sb_password:-"$rand_pass"}
 
-    read -rp "👉 请输入节点备注名称 (默认: ${default_remark}): " INPUT_REMARK
-    REMARK=${INPUT_REMARK:-$default_remark}
+  read -rp "👉 请设置节点备注 (默认: ${default_remark}): " sb_node_name
+  sb_node_name=${sb_node_name:-$default_remark}
 
-    write_and_show_config
+  read -rp "👉 请设置监听端口 (默认: 443): " sb_port
+  sb_port=${sb_port:-443}
+
+  write_and_show_config
 }
 
-modify_config() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then
-        error "未找到运行的配置，请先执行选项 1 安装。"
-        return 1
-    fi
+update_singbox() {
+  if [[ ! -f "$SB_BINARY" ]]; then
+    error "当前系统未安装 Sing-box，无法执行更新。"
+    return 1
+  fi
 
-    info "正在拉取现有后量子密钥与 REALITY 矩阵快照..."
-    
-    local current_port current_uuid current_decryption current_private_key current_sni current_short_id current_encryption reality_info current_public_key
-    current_port=$(jq -r '.inbounds[0].port // empty' "$XRAY_CONFIG" 2>/dev/null)
-    current_uuid=$(jq -r '.inbounds[0].settings.clients[0].id // empty' "$XRAY_CONFIG" 2>/dev/null)
-    current_decryption=$(jq -r '.inbounds[0].settings.decryption // empty' "$XRAY_CONFIG" 2>/dev/null)
-    current_private_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey // empty' "$XRAY_CONFIG" 2>/dev/null)
-    current_sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // empty' "$XRAY_CONFIG" 2>/dev/null)
-    current_short_id=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0] // empty' "$XRAY_CONFIG" 2>/dev/null)
-    
-    current_encryption=$(head -n 1 "$STATE_FILE" 2>/dev/null || echo "")
-    reality_info=$(cat "$REALITY_FILE" 2>/dev/null || echo "")
-    current_public_key=$(echo "$reality_info" | cut -d'|' -f1 || true)
+  info "正在检查新版本..."
+  local current_version=$(get_installed_version)
+  local latest_version=$(get_latest_version)
 
-    if [[ -z "$current_decryption" || -z "$current_private_key" || -z "$current_encryption" || -z "$current_public_key" ]]; then
-        error "加解密/REALITY密钥快照记录受损，为防节点失联，请执行选项 1 全新安装。"
-        return 1
-    fi
+  info "当前安装版本: ${YELLOW}${current_version}${RESET}"
+  info "官方最新版本: ${GREEN}${latest_version}${RESET}"
 
-    local current_remark=""
-    if [[ -f "$STATE_FILE" ]]; then
-        current_remark=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 || true)
-    fi
+  if [[ "$current_version" == *"$latest_version"* || "$latest_version" == *"$current_version"* ]]; then
+    info "您当前已经是最新版本，无需更新。"
+    return 0
+  fi
 
-    echo "---------------------------------------------"
-    echo -e "${YELLOW}提示：回车(Enter)保留括号内的当前原设定值${RESET}"
-    echo "---------------------------------------------"
+  warn "检测到新版本，即将开始平滑更新 (你的节点配置不会改变)..."
+  
+  local _tmpfile_tar=$(mktemp)
+  if ! download_singbox "$latest_version" "$_tmpfile_tar"; then
+    rm -f "$_tmpfile_tar" && return 1
+  fi
 
-    read -rp "👉 修改监听端口 (当前: ${current_port}): " INPUT_PORT
-    PORT=${INPUT_PORT:-$current_port}
+  echo -ne "正在覆盖二进制核心文件 ... "
+  local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
+  tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
+  
+  local _ver_num="${latest_version#v}"
+  if install -Dm755 "$_tmpdir_extract/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE/sing-box" "$EXECUTABLE_INSTALL_PATH"; then
+    echo "成功"
+  else
+    rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "覆盖核心失败" && return 1
+  fi
+  rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
 
-    read -rp "👉 修改UUID (当前: ${current_uuid}): " INPUT_UUID
-    UUID=${INPUT_UUID:-$current_uuid}
-
-    read -rp "👉 修改 REALITY SNI 域名 (当前: ${current_sni}): " INPUT_SNI
-    SNI=${INPUT_SNI:-$current_sni}
-
-    read -rp "👉 修改 REALITY Short ID (当前: ${current_short_id}): " INPUT_SID
-    SHORT_ID=${INPUT_SID:-$current_short_id}
-
-    read -rp "👉 修改节点备注名称 (当前: ${current_remark:-VLESS-E-REALITY}): " INPUT_REMARK
-    REMARK=${INPUT_REMARK:-${current_remark:-VLESS-E-REALITY}}
-
-    DECRYPTION="$current_decryption"
-    ENCRYPTION="$current_encryption"
-    PRIVATE_KEY="$current_private_key"
-    PUBLIC_KEY="$current_public_key"
-
-    write_and_show_config
-}
-
-update_xray() {
-    if [[ ! -f "$XRAY_BINARY" ]]; then
-        error "未检测到已安装的核心，无法执行升级。"
-        return 1
-    fi
-
-    warn "开始获取最新的 GitHub 发行版核心..."
-    download_and_extract_core || return 1
-
-    info "重启服务组件中..."
-    if command -v rc-service &>/dev/null; then
-        rc-service xray restart >/dev/null 2>&1 || true
+  info "正在重启 Sing-box 服务以应用更新..."
+  if has_command systemctl; then
+    systemctl daemon-reload
+    systemctl restart mo-naiveproxy-sb >/dev/null 2>&1 || true
+    if systemctl is-active --quiet mo-naiveproxy-sb 2>/dev/null; then
+      info "Sing-box 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
     else
-        pkill -f "$XRAY_BINARY run" || true
-        "$XRAY_BINARY" run -c "$XRAY_CONFIG" >/dev/null 2>&1 &
+      error "核心更新成功，但服务重启失败，请运行 'journalctl -u mo-naiveproxy-sb -f' 检查错误。"
     fi
-    info "Xray 核心已成功平滑迭代完毕。"
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+    "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
+    info "Sing-box 核心已更新并于后台重启运行。"
+  fi
 }
 
-uninstall_xray() {
-    warn "执行彻底洗车解绑与配置数据清洗..."
-    if command -v rc-service &>/dev/null; then
-        rc-service xray stop >/dev/null 2>&1 || true
-        rc-update del xray default >/dev/null 2>&1 || true
-    else
-        pkill -f "$XRAY_BINARY run" || true
-    fi
-    rm -f "$XRAY_BINARY" "$INIT_SERVICE_PATH" "$LINK_FILE" "$STATE_FILE" "$REALITY_FILE"
-    rm -rf /usr/local/etc/xray /usr/local/share/xray
-    info "Xray 面板与核心数据已完全从 Alpine 中连根铲除。"
+uninstall_singbox() {
+  warn "即将从当前系统中彻底卸载 Sing-box (NaiveProxy)"
+
+  if has_command systemctl; then
+    systemctl stop mo-naiveproxy-sb >/dev/null 2>&1 || true
+    systemctl disable mo-naiveproxy-sb >/dev/null 2>&1 || true
+    remove_file "$SYSTEMD_SERVICES_DIR/mo-naiveproxy-sb.service"
+    systemctl daemon-reload
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+  fi
+
+  remove_file "$EXECUTABLE_INSTALL_PATH"
+  rm -rf /etc/mo-naiveproxy-sb "$SB_DIR"
+
+  info "Sing-box 已彻底从您的系统中移除！"
+}
+
+changeconf() {
+  if [[ ! -f "$SB_CONFIG" ]]; then
+    error "配置文件不存在，请先安装 Sing-box"
+    return 1
+  fi
+
+  if [[ -f "$SB_DIR/meta.env" ]]; then
+    source "$SB_DIR/meta.env"
+  else
+    sb_domain=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG")
+    sb_email=$(jq -r '.inbounds[0].tls.acme.email' "$SB_CONFIG")
+    sb_username=$(jq -r '.inbounds[0].users[0].username' "$SB_CONFIG")
+    sb_password=$(jq -r '.inbounds[0].users[0].password' "$SB_CONFIG")
+    sb_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG")
+    sb_node_name="NaiveProxy"
+  fi
+
+  # 容错处理：如果旧配置里的端口由于某种原因提取失败，默认赋值为 443
+  [[ -z "$sb_port" || "$sb_port" == "null" ]] && sb_port=443
+
+  clear
+  echo -e "${GREEN}====== 修改 Sing-box Naive 配置 ======${RESET}"
+  echo "提示：直接敲回车将保持原有配置不变"
+  echo "---------------------------------------------"
+  
+  local input_domain input_email input_user input_pass input_name input_port
+
+  read -rp "👉 请输入解析好的域名 [当前: ${sb_domain}]: " input_domain
+  sb_domain=${input_domain:-$sb_domain}
+
+  read -rp "👉 请输入你的邮箱 [当前: ${sb_email}]: " input_email
+  sb_email=${input_email:-$sb_email}
+
+  read -rp "👉 请设置 NaiveProxy 用户名 [当前: ${sb_username}]: " input_user
+  sb_username=${input_user:-$sb_username}
+
+  read -rp "👉 请设置 NaiveProxy 密码 [当前: ${sb_password}]: " input_pass
+  sb_password=${input_pass:-$sb_password}
+
+  read -rp "👉 请设置节点备注 [当前: ${sb_node_name}]: " input_name
+  sb_node_name=${input_name:-$sb_node_name}
+
+  read -rp "👉 请设置监听端口 [当前: ${sb_port}]: " input_port
+  sb_port=${input_port:-$sb_port}
+
+  write_and_show_config
+  info "配置修改并应用成功！"
 }
 
 showconf() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then
-        error "未发现生效的配置文件。"
-        return 1
-    fi
-
-    local uuid port encryption reality_info public_key sni short_id server_ip current_remark encoded_remark address_for_url vless_link
-    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG")
-    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG")
-    encryption=$(head -n 1 "$STATE_FILE" 2>/dev/null)
-    
-    reality_info=$(cat "$REALITY_FILE" 2>/dev/null || echo "")
-    public_key=$(echo "$reality_info" | cut -d'|' -f1)
-    sni=$(echo "$reality_info" | cut -d'|' -f2)
-    short_id=$(echo "$reality_info" | cut -d'|' -f3)
-
-    server_ip=$(get_public_ip)
-    
-    current_remark="VLESS-E-REALITY"
-    if [[ -f "$STATE_FILE" ]]; then
-        current_remark=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 || echo "VLESS-E-REALITY")
-    fi
-
-    encoded_remark=$(jq -rn --arg x "$current_remark" '$x|@uri')
-    address_for_url=$server_ip
-    if [[ $server_ip == *":"* ]]; then address_for_url="[${server_ip}]"; fi
-
-    vless_link="vless://${uuid}@${address_for_url}:${port}?encryption=${encryption}&security=reality&sni=${sni}&sid=${short_id}&fp=chrome&pbk=${public_key}&flow=xtls-rprx-vision&type=tcp#${encoded_remark}"
-    echo "$vless_link" > "$LINK_FILE"
-
-    echo -e "${GREEN}====== VLESS-Encryption + Reality 节点信息 ======${RESET}"
-    echo -e "${GREEN}服务器公网 IP   :${RESET} ${server_ip}"
-    echo -e "${GREEN}服务监听端口     :${RESET} ${port}"
-    echo -e "${GREEN}用户 UUID        :${RESET} ${uuid}"
-    echo -e "${GREEN}协议与加密形态   :${RESET} VLESS Encryption (native + 0-RTT + ML-KEM-768)"
-    echo -e "${GREEN}安全伪装类型     :${RESET} Reality"
-    echo -e "${GREEN}流控传输阻断     :${RESET} xtls-rprx-vision (TCP)"
-    echo -e "${GREEN}伪装目标 SNI     :${RESET} ${sni}"
-    echo -e "${GREEN}REALITY ShortID  :${RESET} ${short_id}"
-    echo -e "${GREEN}REALITY 公钥 pbk :${RESET} ${public_key}"
-    echo -e "${GREEN}节点自定义备注   :${RESET} ${current_remark}"
-    echo -e "${YELLOW}📄 V6VPS 请自行替换分享链接中的 IP 为 V6 格式 ★${RESET}"
-    echo "---------------------------------------------"
-    echo -e "${GREEN}👉 v2rayN 链接 (已存至 $LINK_FILE):${RESET}"
-    echo -e "${YELLOW}${vless_link}${RESET}"
-    echo "---------------------------------------------"
+  if [[ ! -d "$SB_DIR" || ! -f "$SB_DIR/url.txt" ]]; then
+    error "未找到分享链接配置文件。"
+    return
+  fi
+  echo -e "${GREEN}====== 节点分享链接 ======${RESET}"
+  cat "$SB_DIR/url.txt"
+  echo
 }
 
 # =========================================================
-# 6. 环境强制自校正
-# =========================================================
-check_environment() {
-    if [[ $(id -u) -ne 0 ]]; then error "请切换至 root 用户运行此面板脚本。" && exit 1; fi
-
-    local deps=(jq curl wget openssl ss awk grep tr unzip)
-    local missing=0
-
-    for cmd in "${deps[@]}"; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then missing=1 && break; fi
-    done
-
-    if ! apk info -e gcompat >/dev/null 2>&1; then missing=1; fi
-
-    if [[ "$missing" -eq 1 ]]; then
-        info "正在为您配置 Alpine 环境与后量子兼容依赖 (gcompat / unzip)..."
-        apk add --no-cache jq curl wget openssl iproute2 coreutils gcompat bash unzip || true
-    fi
-}
-
-# =========================================================
-# 7. 面板主菜单
+# 6. 面板主菜单
 # =========================================================
 menu() {
-    check_environment
+  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
+  check_environment
 
-    while true; do
-        clear
-        local status version port_show
-        status=$(get_xray_status)
-        version=$(get_installed_version)
-        port_show=$(get_current_port_display)
+  while true; do
+    clear
+    local status=$(get_sb_status)
+    local version=$(get_installed_version)
+    local domain_show=$(get_current_domain_display)
 
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}   Xray Encryption+Reality 面板   ${RESET}"
-        echo -e "${GREEN}=====( Alpine Linux OpenRC )====${RESET}"
-        echo -e "${GREEN}状态   :${RESET} $status"
-        echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-        echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}1. 安装 Encryption+Reality${RESET}" 
-        echo -e "${GREEN}2. 更新 Xray ${RESET}"
-        echo -e "${GREEN}3. 卸载 Xray${RESET}"
-        echo -e "${GREEN}4. 修改配置${RESET}"
-        echo -e "${GREEN}5. 启动 Xray${RESET}"
-        echo -e "${GREEN}6. 停止 Xray${RESET}"
-        echo -e "${GREEN}7. 重启 Xray${RESET}"
-        echo -e "${GREEN}8. 查看日志${RESET}"
-        echo -e "${GREEN}9. 查看节点配置${RESET}"
-        echo -e "${GREEN}0. 退出面板${RESET}"
-        echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   Sing-box (NaiveProxy) 面板    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $status"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}域名   :${RESET} ${YELLOW}${domain_show}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装 Sing-box (Naive)${RESET}"
+    echo -e "${GREEN}2. 更新 Sing-box (Naive)${RESET}"
+    echo -e "${GREEN}3. 卸载 Sing-box (Naive)${RESET}"
+    echo -e "${GREEN}4. 修改配置 ${RESET}"
+    echo -e "${GREEN}5. 启动 Sing-box (Naive)${RESET}"
+    echo -e "${GREEN}6. 停止 Sing-box (Naive)${RESET}"
+    echo -e "${GREEN}7. 重启 Sing-box (Naive)${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 
-        local choice=""
-        read -r -p $'\033[32m请输入选项: \033[0m' choice || true
-        [[ -z "$choice" ]] && continue
+    local choice=""
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+    [[ -z "$choice" ]] && continue
 
-        case "$choice" in
-            1) inst_xray; pause ;;
-            2) update_xray; pause ;;
-            3) uninstall_xray; pause ;;
-            4) modify_config; pause ;;
-            5) 
-                if command -v rc-service &>/dev/null; then
-                    rc-service xray start && info "服务已成功启动！"
-                else
-                    pkill -f "$XRAY_BINARY run" || true
-                    "$XRAY_BINARY" run -c "$XRAY_CONFIG" >/dev/null 2>&1 &
-                    info "进程已在后台拉起！"
-                fi
-                pause ;;
-            6) 
-                if command -v rc-service &>/dev/null; then
-                    rc-service xray stop && info "服务已成功停止！"
-                else
-                    pkill -f "$XRAY_BINARY run" && info "后台进程已终止！"
-                fi
-                pause ;;
-            7) 
-                if command -v rc-service &>/dev/null; then
-                    rc-service xray restart && info "服务已成功重启！"
-                else
-                    pkill -f "$XRAY_BINARY run" || true
-                    "$XRAY_BINARY" run -c "$XRAY_CONFIG" >/dev/null 2>&1 &
-                fi
-                pause ;;
-            8) 
-                if [[ -f /var/log/messages ]]; then
-                    echo -e "${CYAN}--- 最近 50 行核心系统相关日志 ---${RESET}"
-                    tail -n 50 /var/log/messages | grep -E 'xray|supervise-daemon' || tail -n 50 /var/log/messages
-                    echo "--------------------------------------"
-                else
-                    warn "系统暂未建立全局通用日志追踪：/var/log/messages"
-                fi
-                if [[ -f "$XRAY_BINARY" && -f "$XRAY_CONFIG" ]]; then
-                    "$XRAY_BINARY" run -test -config "$XRAY_CONFIG" || true
-                fi
-                pause ;;
-            9) showconf; pause ;;
-            0) exit 0 ;;
-            *) error "无效输入，请重新选择。"; sleep 1 ;;
-        esac
-    done
+    case "$choice" in
+      1) inst_box=inst_singbox; $inst_box; pause ;;
+      2) update_singbox; pause ;;
+      3) uninstall_singbox; pause ;;
+      4) changeconf; pause ;;
+      5) 
+        if has_command systemctl; then
+          systemctl start mo-naiveproxy-sb && info "服务已成功启动！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+          "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
+          info "进程已在后台启动！"
+        fi
+        pause ;;
+      6) 
+        if has_command systemctl; then
+          systemctl stop mo-naiveproxy-sb && info "服务已成功停止！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台进程已终止！"
+        fi
+        pause ;;
+      7) 
+        if has_command systemctl; then
+          systemctl restart mo-naiveproxy-sb && info "服务已成功重启！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+          "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
+          info "后台进程已重启！"
+        fi
+        pause ;;
+      8) 
+        if has_command systemctl; then
+          journalctl -u mo-naiveproxy-sb.service -n 50 --no-pager
+        else
+          warn "当前环境不支持 systemd 集中日志管理。"
+        fi
+        pause ;;
+      9) showconf; pause ;;
+      0) exit 0 ;;
+      *) error "无效输入，请重新选择。"; sleep 1 ;;
+    esac
+  done
 }
 
 menu "$@"

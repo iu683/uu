@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# Xray VLESS-Reality 管理脚本
+# Xray VLESS-Encryption (ML-KEM-768) + Reality 管理脚本
 # =========================================================
 
 set -Eeuo pipefail
@@ -15,12 +15,12 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 # ================== 基础变量 ==================
-readonly SERVICE_NAME="vlessreality"
+readonly SERVICE_NAME="vlessEncryptionreality"
 readonly XRAY_CONFIG="/usr/local/etc/${SERVICE_NAME}/config.json"
 readonly XRAY_BINARY="/usr/local/bin/${SERVICE_NAME}"
 readonly XRAY_PUBLIC_KEY_FILE="/usr/local/etc/${SERVICE_NAME}/public.key"
 
-# 降级备用版本（当自动获取最新版本失败时使用）
+# 降级备用版本（ML-KEM 至少需要 Xray-core v24.11.10 或更新版本）
 readonly BACKUP_VERSION="26.3.27"
 
 TMP_DIR=$(mktemp -d -t xray.XXXXXX)
@@ -127,6 +127,15 @@ is_valid_uuid() {
     [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]
 }
 
+# ================== ShortID 验证 ==================
+is_valid_shortid() {
+    local len=${#1}
+    if [[ "$1" =~ ^[0-9a-fA-F]+$ ]] && (( len % 2 == 0 )) && (( len <= 16 )); then
+        return 0
+    fi
+    return 1
+}
+
 # ================== 域名验证 ==================
 is_valid_domain() {
     [[ "$1" =~ ^([a-zA-Z0-9](-?[a-zA-Z0-9])*\.)+[A-Za-z]{2,}$ ]]
@@ -149,11 +158,9 @@ get_latest_version() {
     local latest_version
     info "正在获取 GitHub 最新 Xray 版本号..."
     
-    # 尝试通过 GitHub API 获取最新 Release Tag
     latest_version=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
         | jq -r '.tag_name' 2>/dev/null || echo "")
         
-    # 去除可能存在的 'v' 前缀
     latest_version="${latest_version#v}"
 
     if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
@@ -182,20 +189,16 @@ download_and_extract_xray() {
     
     info "正在解压..."
     mkdir -p "$TMP_DIR/extracted"
-    # 【优化】添加 -o 参数，强制覆盖临时目录中的内容，防止交互卡住
     if ! unzip -qo "$zip_file" -d "$TMP_DIR/extracted"; then
         error "解压 Xray 压缩包失败，请确保系统已安装 unzip。"
         return 1
     fi
     
-    # 安装二进制文件
     mkdir -p "$(dirname "$XRAY_BINARY")"
-    # 【优化】先尝试删除旧文件，防止 Text file busy；如果删不掉，cp 也会因为服务停止而成功
     rm -f "$XRAY_BINARY"
     cp -f "$TMP_DIR/extracted/xray" "$XRAY_BINARY"
     chmod +x "$XRAY_BINARY"
     
-    # 安装 GeoData 资源文件
     mkdir -p "/usr/local/share/${SERVICE_NAME}"
     cp -f "$TMP_DIR/extracted/geoip.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
     cp -f "$TMP_DIR/extracted/geosite.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
@@ -207,7 +210,7 @@ setup_systemd_service() {
     
     cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
-Description=Xray Vless Reality Service
+Description=Xray Vless Encryption Reality Service
 Documentation=https://github.com/XTLS/Xray-core
 After=network.target nss-lookup.target
 
@@ -323,7 +326,7 @@ get_public_key() {
     [[ -f "$XRAY_PUBLIC_KEY_FILE" ]] && cat "$XRAY_PUBLIC_KEY_FILE"
 }
 
-# ================== 写配置 ==================
+# ================== 写配置 (切换为 VLESS-Encryption + ML-KEM-768) ==================
 write_config() {
     local port="$1"
     local uuid="$2"
@@ -336,6 +339,7 @@ write_config() {
 
     mkdir -p "$(dirname "$XRAY_CONFIG")"
 
+    # 修改点：将 flow 改为 "vless-encryption"，并添加 encryptionSettings 指定 ml-kem-768
     cat > "$XRAY_CONFIG" <<EOF
 {
   "log": {
@@ -350,10 +354,13 @@ write_config() {
         "clients": [
           {
             "id": "${uuid}",
-            "flow": "xtls-rprx-vision"
+            "flow": "vless-encryption"
           }
         ],
-        "decryption": "none"
+        "decryption": "none",
+        "encryptionSettings": {
+          "kem": "ml-kem-768"
+        }
       },
       "streamSettings": {
         "network": "tcp",
@@ -415,8 +422,9 @@ generate_link() {
     hostname=$(hostname -s 2>/dev/null | tr ' ' '_')
     [[ -z "$hostname" ]] && hostname="Xray"
 
+    # 修改点：将链接中的 flow 变更为 vless-encryption，并显式指定 kem=ml-kem-768
     cat > /root/xray_vless_reality.txt <<EOF
-vless://${uuid}@${display_ip}:${port}?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=${domain}&fp=chrome&pbk=${public_key}&sid=${shortid}&spx=%2F#${hostname}-Reality
+vless://${uuid}@${display_ip}:${port}?flow=vless-encryption&kem=ml-kem-768&encryption=none&type=tcp&security=reality&sni=${domain}&fp=chrome&pbk=${public_key}&sid=${shortid}&spx=%2F#${hostname}-VLESS-Encryption
 EOF
 }
 
@@ -447,6 +455,7 @@ show_current_config() {
     echo -e "${YELLOW}IP地址      : ${ip}${RESET}"
     echo -e "${YELLOW}端口        : ${port}${RESET}"
     echo -e "${YELLOW}UUID        : ${uuid}${RESET}"
+    echo -e "${YELLOW}流控模式    : vless-encryption (ML-KEM-768)${RESET}"
     echo -e "${YELLOW}SNI         : ${domain}${RESET}"
     echo -e "${YELLOW}PublicKey   : ${public_key}${RESET}"
     echo -e "${YELLOW}ShortID     : ${shortid}${RESET}"
@@ -454,7 +463,7 @@ show_current_config() {
     echo
 
     if [[ -f /root/xray_vless_reality.txt ]]; then
-        echo -e "${GREEN}====== 👉 v2rayN 分享链接 ======${RESET}"
+        echo -e "${GREEN}====== 👉 分享链接 ======${RESET}"
         cat /root/xray_vless_reality.txt
     fi
 }
@@ -462,7 +471,7 @@ show_current_config() {
 # ================== 配置 Xray ==================
 configure_xray() {
     info "开始配置 Reality 节点..."
-    local port uuid domain
+    local port uuid domain short_id
 
     while true; do
         read -rp "请输入端口 (直接回车随机分配端口): " input_port
@@ -505,12 +514,24 @@ configure_xray() {
         fi
     done
 
+    while true; do
+        read -rp "请输入自定义 ShortID (直接回车自动生成 8 位字符): " input_shortid
+        if [[ -z "$input_shortid" ]]; then
+            short_id=$(openssl rand -hex 4)
+            break
+        elif is_valid_shortid "$input_shortid"; then
+            short_id="$input_shortid"
+            break
+        else
+            error "ShortID 无效！必须为偶数位（最长16位）的十六进制字符（0-9, a-f）。"
+        fi
+    done
+
     mkdir -p "/usr/local/etc/${SERVICE_NAME}"
 
-    local keys private_key short_id
+    local keys private_key
     keys=$(generate_reality_keys) || return 1
     private_key=$(echo "$keys" | cut -d '|' -f1)
-    short_id=$(openssl rand -hex 4)
 
     write_config "$port" "$uuid" "$domain" "$private_key" "$short_id"
     test_config || return 1
@@ -680,7 +701,6 @@ install_xray() {
 update_xray() {
     info "开始更新 Xray 程序..."
     
-    # 【优化】更新前必须先停止服务，释放二进制文件的占用
     if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
         info "检测到服务正在运行，正在停止服务以进行更新..."
         systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
@@ -693,7 +713,6 @@ update_xray() {
         return 1
     fi
     
-    # 【优化】使用 restart_xray 会自动 start 并检查状态
     if restart_xray; then
         info "最新版更新并启动成功！当前版本: $(get_xray_version)"
     else
@@ -701,6 +720,7 @@ update_xray() {
         return 1
     fi
 }
+
 # ================== 修改配置 ==================
 modify_config() {
     if [[ ! -f "$XRAY_CONFIG" ]]; then
@@ -708,16 +728,16 @@ modify_config() {
         return 1
     fi
 
-    local old_port old_uuid old_domain private_key shortid
+    local old_port old_uuid old_domain private_key old_shortid
     old_port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "443")
     old_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null || echo "")
     old_domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG" 2>/dev/null || echo "")
     private_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$XRAY_CONFIG" 2>/dev/null || echo "")
-    shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG" 2>/dev/null || echo "")
+    old_shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG" 2>/dev/null || echo "")
 
-    [[ "$shortid" == "null" || -z "$shortid" ]] && shortid=$(openssl rand -hex 4)
+    [[ "$old_shortid" == "null" || -z "$old_shortid" ]] && old_shortid=$(openssl rand -hex 4)
 
-    local port uuid domain
+    local port uuid domain shortid
 
     while true; do
         read -rp "请输入新端口 [当前:${old_port}, 回车不修改]: " input_port
@@ -760,6 +780,16 @@ modify_config() {
             break
         else
             error "域名格式无效"
+        fi
+    done
+
+    while true; do
+        read -rp "请输入ShortID [当前:${old_shortid}, 回车不修改]: " input_shortid
+        shortid=${input_shortid:-$old_shortid}
+        if is_valid_shortid "$shortid"; then
+            break
+        else
+            error "ShortID 无效！必须为偶数位（最长16位）的十六进制字符（0-9, a-f）。"
         fi
     done
 
@@ -850,19 +880,20 @@ show_menu() {
     fi
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      Vless-Reality 管理面板       ${RESET}"
+    echo -e "${GREEN}    VLESS-Encryption 管理面板    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}加密   :${RESET} ${CYAN}ML-KEM-768 + REALITY${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 Vless+Reality${RESET}"
-    echo -e "${GREEN} 2. 更新 Vless+Reality${RESET}"
-    echo -e "${GREEN} 3. 卸载 Vless+Reality${RESET}"
+    echo -e "${GREEN} 1. 安装 VLESS-Enc+Reality${RESET}"
+    echo -e "${GREEN} 2. 更新 Xray-core 二进制${RESET}"
+    echo -e "${GREEN} 3. 卸载 VLESS-Enc+Reality${RESET}"
     echo -e "${GREEN} 4. 修改配置${RESET}"
-    echo -e "${GREEN} 5. 启动 Vless+Reality${RESET}"
-    echo -e "${GREEN} 6. 停止 Vless+Reality${RESET}"
-    echo -e "${GREEN} 7. 重启 Vless+Reality${RESET}"
+    echo -e "${GREEN} 5. 启动服务${RESET}"
+    echo -e "${GREEN} 6. 停止服务${RESET}"
+    echo -e "${GREEN} 7. 重启服务${RESET}"
     echo -e "${GREEN} 8. 查看服务日志${RESET}"
     echo -e "${GREEN} 9. 查看节点配置${RESET}"
     echo -e "${GREEN}10. 配置Socks5出口${RESET}"
@@ -895,7 +926,7 @@ pre_check() {
     local deps=(jq curl wget openssl ss timeout unzip)
     local missing=0
 
-    for cmd in "${deps[@]}"; do
+    for cmd in ${deps[@]}; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing=1
             break

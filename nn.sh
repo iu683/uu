@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# Xray VLESS-Reality 管理脚本(Alpine Linux )
+# Xray VLESS-Reality-XHTTP 管理脚本(Alpine Linux )
 # =========================================================
 
 set -Eeuo pipefail
@@ -13,15 +13,16 @@ YELLOW="\033[33m"
 BLUE="\033[34m"
 RESET="\033[0m"
 
-# ================== 路径与日志 ==================
-# 隔离服务名称，防止冲突
-readonly SERV_NAME="xray-reality"
+# ================== 🚀 服务自定义重命名 ==================
+# 想要改名直接修改下方双引号内的文本即可（建议只用小写字母、数字或横杠）
+readonly SERV_NAME="xray-xhttp"
 
+# ================== 路径与日志 (自动联动) ==================
 readonly X_DIR="/etc/${SERV_NAME}"
 readonly X_CONFIG="${X_DIR}/config.json"
 readonly X_BIN="/usr/local/bin/${SERV_NAME}"
 readonly X_PBK="${X_DIR}/public.key"
-readonly X_LINK="/root/proxynode/${SERV_NAME}_vless_reality.txt"
+readonly X_LINK="/root/proxynode/Realityxhttp/${SERV_NAME}_vless_reality.txt"
 readonly X_LOG="/var/log/${SERV_NAME}.log"
 readonly INIT_FILE="/etc/init.d/${SERV_NAME}"
 
@@ -92,17 +93,29 @@ write_config() {
     local port=$1 uuid=$2 domain=$3 pri=$4 sid=$5
     local outbound=${6:-'{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}'}
     mkdir -p "$X_DIR" && chmod 755 "$X_DIR"
+    
     cat > "$X_CONFIG" <<EOF
 {
     "log": { "loglevel": "warning" },
     "inbounds": [{
-        "port": $port, "protocol": "vless",
-        "settings": { "clients": [{"id": "$uuid", "flow": "xtls-rprx-vision"}], "decryption": "none" },
+        "port": $port,
+        "protocol": "vless",
+        "settings": {
+            "clients": [{"id": "$uuid"}],
+            "decryption": "none"
+        },
         "streamSettings": {
-            "network": "tcp", "security": "reality",
+            "network": "xhttp",
+            "security": "reality",
+            "xhttpSettings": {
+                "path": "/"
+            },
             "realitySettings": {
-                "dest": "$domain:443", "serverNames": ["$domain"],
-                "privateKey": "$pri", "shortIds": ["$sid"], "fingerprint": "chrome"
+                "dest": "$domain:443",
+                "serverNames": ["$domain"],
+                "privateKey": "$pri",
+                "shortIds": ["$sid"],
+                "fingerprint": "chrome"
             }
         },
         "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
@@ -221,23 +234,55 @@ modify_config() {
     
     local curr_port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
     local curr_domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$X_CONFIG")
-    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
+    local curr_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
     local pri=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$X_CONFIG")
-    local sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$X_CONFIG")
+    local curr_sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$X_CONFIG")
     local pub=$(cat "$X_PBK")
     local curr_outbound=$(jq -c '.outbounds[0]' "$X_CONFIG")
 
-    read -p "请输入新端口 (回车保持 $curr_port): " n_port
-    n_port=${n_port:-$curr_port}
+    # 1. 修改端口
+    local n_port
+    while true; do
+        read -p "请输入新端口 (回车保持 $curr_port): " n_port
+        n_port=${n_port:-$curr_port}
+        is_valid_port "$n_port" && break || error "端口无效，请输入 1-65535 之间的数字。"
+    done
+
+    # 2. 修改域名
     read -p "请输入新域名 (回车保持 $curr_domain): " n_domain
     n_domain=${n_domain:-$curr_domain}
     
-    write_config "$n_port" "$uuid" "$n_domain" "$pri" "$sid" "$curr_outbound"
+    # 3. 修改 UUID
+    local n_uuid
+    while true; do
+        read -p "请输入新 UUID (回车保持 $curr_uuid): " n_uuid
+        n_uuid=${n_uuid:-$curr_uuid}
+        if [[ "$n_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            break
+        else
+            error "UUID 格式不正确，请重新输入（标准36位连字符格式）。"
+        fi
+    done
+
+    # 4. 修改 ShortID
+    local n_sid
+    while true; do
+        read -p "请输入新 ShortID (回车保持 $curr_sid): " n_sid
+        n_sid=${n_sid:-$curr_sid}
+        if [[ "$n_sid" =~ ^[0-9a-fA-F]+$ ]] && (( ${#n_sid} % 2 == 0 )) && (( ${#n_sid} >= 2 && ${#n_sid} <= 16 )); then
+            break
+        else
+            error "ShortID 格式不正确，必须是偶数长度的十六进制字符（2-16位，例：a1b2c3d4）。"
+        fi
+    done
+
+    write_config "$n_port" "$n_uuid" "$n_domain" "$pri" "$n_sid" "$curr_outbound"
     rc-service "$SERV_NAME" restart
     
     local ip=$(get_public_ip)
-    echo "vless://$uuid@$ip:$n_port?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=$n_domain&fp=chrome&pbk=$pub&sid=$sid#$HOSTNAME-Reality" > "$X_LINK"
-    info "配置已更新！"
+    mkdir -p "$(dirname "$X_LINK")"
+    echo "vless://$n_uuid@$ip:$n_port?encryption=none&type=xhttp&security=reality&sni=$n_domain&fp=chrome&pbk=$pub&sid=$n_sid#$HOSTNAME-${SERV_NAME}" > "$X_LINK"
+    info "配置已更新并成功重启服务！"
 }
 
 # ================== 安装与管理 ==================
@@ -267,12 +312,11 @@ install_xray() {
                 uuid=$(uuidgen)
                 break
             else
-                # 简单校验 UUID 长度和格式
                 if [[ "$input_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
                     uuid="$input_uuid"
                     break
                 else
-                    error "UUID 格式不正确，请重新输入（格式如：固定的36位包含连字符的字符串）。"
+                    error "UUID 格式不正确，请重新输入。"
                 fi
             fi
         done
@@ -285,7 +329,6 @@ install_xray() {
                 sid=$(openssl rand -hex 4)
                 break
             else
-                # 校验：必须是纯十六进制，且长度必须是 2, 4, 6, 8, 10, 12, 14, 16
                 if [[ "$input_sid" =~ ^[0-9a-fA-F]+$ ]] && (( ${#input_sid} % 2 == 0 )) && (( ${#input_sid} >= 2 && ${#input_sid} <= 16 )); then
                     sid="$input_sid"
                     break
@@ -326,7 +369,9 @@ EOF
     local pub=$(cat "$X_PBK" 2>/dev/null || echo "N/A")
     local sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$X_CONFIG")
     
-    local link="vless://$uuid@$ip:$port?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=$domain&fp=chrome&pbk=$pub&sid=$sid#$HOSTNAME-Reality"
+    local link="vless://$uuid@$ip:$port?encryption=none&type=xhttp&security=reality&sni=$domain&fp=chrome&pbk=$pub&sid=$sid#$HOSTNAME-${SERV_NAME}"
+    
+    mkdir -p "$(dirname "$X_LINK")"
     echo "$link" > "$X_LINK"
 
     show_current_config
@@ -351,6 +396,8 @@ show_current_config() {
     [[ "$current_protocol" == "socks" ]] && outbound_mode="Socks5 链式代理" || outbound_mode="直连 (Freedom)"
 
     echo -e "\n${GREEN}====== 当前配置详情 ======${RESET}"
+    echo -e "${YELLOW}独立系统服务: ${SERV_NAME}${RESET}"
+    echo -e "${YELLOW}传输协议    : VLESS + Reality + XHTTP${RESET}"
     echo -e "${YELLOW}IP地址      : ${ip}${RESET}"
     echo -e "${YELLOW}端口        : ${port}${RESET}"
     echo -e "${YELLOW}UUID        : ${uuid}${RESET}"
@@ -360,7 +407,7 @@ show_current_config() {
     echo -e "${YELLOW}出口模式    : ${outbound_mode}${RESET}"
     
     if [[ -f "$X_LINK" ]]; then
-        echo -e "${GREEN}====== 👉 v2rayN 分享链接 ======${RESET}"
+        echo -e "${GREEN}====== 👉 v2rayN  分享链接 ======${RESET}"
         cat "$X_LINK"
     fi
 }
@@ -374,13 +421,13 @@ show_menu() {
     [[ -f "$X_CONFIG" ]] && port_show=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "-")
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   Xray Vless+Reality 管理面板   ${RESET}"
+    echo -e "${GREEN}  Xray Vless+Reality+XHTTP 面板  ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态     :${RESET} $status"
-    echo -e "${GREEN}版本     :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口     :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}状态         :${RESET} $status"
+    echo -e "${GREEN}版本         :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口         :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 Xray Vless+Reality${RESET}"
+    echo -e "${GREEN} 1. 安装 Xray Vless+Reality+XHTTP${RESET}"
     echo -e "${GREEN} 2. 更新 Xray${RESET}"
     echo -e "${GREEN} 3. 卸载 Xray${RESET}"
     echo -e "${GREEN} 4. 修改配置${RESET}"

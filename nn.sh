@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 #
-# Xray (VLESS-Encryption + REALITY) 核心控制面板 (原生 GitHub 下载/编译集成版)
-# SPDX-License-Identifier: MIT
+# Xray (VLESS-Encryption + REALITY) 控制面板
 #
 # =========================================================
 # 1. 核心控制与全局环境初始化
@@ -13,7 +12,7 @@ export LANG=en_US.UTF-8
 readonly SERVICE_NAME="xray-vless-enc"
 readonly XRAY_CONFIG="/usr/local/etc/${SERVICE_NAME}/config.json"
 readonly XRAY_BINARY="/usr/local/bin/${SERVICE_NAME}"
-readonly STATE_DIR="/root/Xray_Enc"
+readonly STATE_DIR="/root/proxynode/EncryptionReality"
 readonly STATE_FILE="${STATE_DIR}/xray_encryption_info.txt"
 readonly REALITY_FILE="${STATE_DIR}/xray_reality_info.txt"  # 存储格式: pbk|sni|sid
 readonly LINK_FILE="${STATE_DIR}/xray_vless_encryptionreality_link.txt"
@@ -412,7 +411,7 @@ show_current_config() {
   echo
 
   if [[ -f "$LINK_FILE" ]]; then
-    echo -e "${GREEN}====== 👉 节点通用分享链接 ======${RESET}"
+    echo -e "${GREEN}====== 👉 分享链接 ======${RESET}"
     cat "$LINK_FILE"
     echo "---------------------------------------------"
   fi
@@ -511,7 +510,7 @@ modify_config() {
 
   local port uuid domain shortid
   while true; do
-    read -rp "请输入新端口 [当前:${old_port}, 回车保持不变, 输入 rand 重新分配]: " input_port
+    read -rp "请输入新端口 [当前:${old_port}, 回车保持不变]: " input_port
     if [[ -z "$input_port" ]]; then port="$old_port"; break
     elif [[ "${input_port,,}" == "rand" ]]; then
       port=$(get_random_port); info "分配未占用随机端口: $port"; break
@@ -555,9 +554,9 @@ configure_custom_socks5_outbound() {
 
   echo "---------------------------------------------"
   echo -e "当前分流出口路径: $( [[ "$current_protocol" == "socks" ]] && echo -e "${YELLOW}Socks5 代理出口${RESET}" || echo -e "${GREEN}直连本地 (Freedom)${RESET}" )"
-  echo "1) 恢复默认直连出口"
-  echo "2) 劫持切换为自定义 Socks5 出口代理"
-  echo "0) 取消变更"
+  echo "1) 直连出口"
+  echo "2) Socks5 出口"
+  echo "0) 取消"
   echo "---------------------------------------------"
 
   read -rp "请输入选项 [0-2]: " mode || true
@@ -566,7 +565,7 @@ configure_custom_socks5_outbound() {
       tmp_file=$(mktemp)
       jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$XRAY_CONFIG" > "$tmp_file"
       mv "$tmp_file" "$XRAY_CONFIG"; chmod 644 "$XRAY_CONFIG"
-      restart_xray && info "核心已平滑回滚切回本地直连出口！"
+      restart_xray && info "切回本地直连出口！"
       return ;;
     2) ;;
     *) info "操作已安全取消。"; return ;;
@@ -599,37 +598,53 @@ configure_custom_socks5_outbound() {
   fi
 
   mv "$tmp_file" "$XRAY_CONFIG"; chmod 644 "$XRAY_CONFIG"
-  restart_xray && info "前置核心成功桥接并挂载 Socks5 外部出站分流！"
+  restart_xray && info "已成功切换为 Socks5 出口！"
 }
 
 select_best_sni() {
-  info "开始在本地集群拉取经典安全 SNI 进行延迟和阻断探针测试..."
-  local SNIS=(
-    amd.com apps.mzstatic.com aws.com azure.microsoft.com beacon.gtv-pub.com
-    bing.com catalog.gamepass.com cdn.bizibly.com cdn-dynmedia-1.microsoft.com
-    devblogs.microsoft.com fpinit.itunes.apple.com go.microsoft.com
-    gray-config-prod.api.arc-cdn.net gray.video-player.arcpublishing.com
-    images.nvidia.com r.bing.com services.digitaleast.mobi snap.licdn.com
-    statici.icloud.com tag.demandbase.com tag-logger.demandbase.com
-    ts1.tc.mm.bing.net ts2.tc.mm.bing.net vs.aws.amazon.com www.apple.com
-    www.icloud.com www.microsoft.com www.oracle.com www.xbox.com
-    www.xilinx.com xp.apple.com
-  )
-  local BEST_SNI="" BEST_TIME=999999
+    info "开始优选 SNI 延迟测试"
 
-  for sni in "${SNIS[@]}"; do
-    local start=$(date +%s%N)
-    if timeout 3 openssl s_client -connect "${sni}:443" -servername "${sni}" -brief </dev/null >/dev/null 2>&1; then
-      local end=$(date +%s%N)
-      local cost=$(( (end - start) / 1000000 ))
-      echo "探针测绘 -> $sni 延迟响应: ${cost}ms"
-      if [ $cost -lt $BEST_TIME ]; then BEST_TIME=$cost; BEST_SNI=$sni; fi
+    local SNIS=(
+        amd.com apps.mzstatic.com aws.com azure.microsoft.com beacon.gtv-pub.com
+        bing.com catalog.gamepass.com cdn.bizibly.com cdn-dynmedia-1.microsoft.com
+        devblogs.microsoft.com fpinit.itunes.apple.com go.microsoft.com
+        gray-config-prod.api.arc-cdn.net gray.video-player.arcpublishing.com
+        images.nvidia.com r.bing.com services.digitaleast.mobi snap.licdn.com
+        statici.icloud.com tag.demandbase.com tag-logger.demandbase.com
+        ts1.tc.mm.bing.net ts2.tc.mm.bing.net vs.aws.amazon.com www.apple.com
+        www.icloud.com www.microsoft.com www.oracle.com www.xbox.com
+        www.xilinx.com xp.apple.com
+    )
+
+    local BEST_SNI=""
+    local BEST_TIME=999999
+
+    for sni in "${SNIS[@]}"; do
+        local start
+        start=$(date +%s%N)
+
+        if timeout 3 openssl s_client -connect "${sni}:443" -servername "${sni}" -brief </dev/null >/dev/null 2>&1; then
+            local end cost
+            end=$(date +%s%N)
+            cost=$(( (end - start) / 1000000 ))
+
+            echo "[SNI] $sni -> ${cost}ms"
+
+            if [ $cost -lt $BEST_TIME ]; then
+                BEST_TIME=$cost
+                BEST_SNI=$sni
+            fi
+        fi
+    done
+
+    if [ -n "$BEST_SNI" ]; then
+        info "最优 SNI: $BEST_SNI (${BEST_TIME}ms)"
+        echo "$BEST_SNI"
+        return 0
+    else
+        warn "未找到可用 SNI"
+        return 1
     fi
-  done
-
-  if [ -n "$BEST_SNI" ]; then
-    info "👑 系统测绘探优完毕！当前最佳伪装域为: $BEST_SNI (${BEST_TIME}ms)"
-  else warn "未扫描到支持 TLS 握手且不被本地阻断的目标宿主域名"; fi
 }
 
 uninstall_xray() {
@@ -643,7 +658,7 @@ uninstall_xray() {
   rm -rf "/usr/local/etc/${SERVICE_NAME}"
   rm -rf "/usr/local/share/${SERVICE_NAME}"
   rm -rf "$STATE_DIR"
-  info "本地架构组件卸载完毕，残留历史配置文件已彻底全盘抹除！"
+  info "服务已成功卸载并安全清理。"
 }
 
 # =========================================================
@@ -657,24 +672,24 @@ show_menu() {
   [[ -f "$XRAY_CONFIG" ]] && port_show=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "-")
 
   echo -e "${GREEN}================================${RESET}"
-  echo -e "${GREEN}    Xray Encryption+Reality 面板   ${RESET}"
+  echo -e "${GREEN}   Xray Encryption+Reality 面板   ${RESET}"
   echo -e "${GREEN}================================${RESET}"
   echo -e "${GREEN}状态   :${RESET} $status"
   echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
   echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
   echo -e "${GREEN}================================${RESET}"
-  echo -e "${GREEN}1. 原生编译安装 Encryption+Reality${RESET}" 
-  echo -e "${GREEN}2. 更新 Xray 核心${RESET}"
-  echo -e "${GREEN}3. 卸载 Xray 核心与所有配置${RESET}"
-  echo -e "${GREEN}4. 修改当前节点配置${RESET}"
-  echo -e "${GREEN}5. 开启服务守护${RESET}"
-  echo -e "${GREEN}6. 暂停服务守护${RESET}"
-  echo -e "${GREEN}7. 重启服务守护${RESET}"
-  echo -e "${GREEN}8. 实时打印集中日志${RESET}"
-  echo -e "${GREEN}9. 完整检视当前共享配置${RESET}"
-  echo -e "${GREEN}10. 配置 Socks5 分流出口${RESET}"
-  echo -e "${GREEN}11. 测绘扫描本地 SNI 域名优选✨${RESET}"
-  echo -e "${GREEN}0. 安全退出面板${RESET}"
+  echo -e "${GREEN} 1. 安装 Encryption+Reality${RESET}" 
+  echo -e "${GREEN} 2. 更新 Encryption+Reality${RESET}"
+  echo -e "${GREEN} 3. 卸载 Encryption+Reality${RESET}"
+  echo -e "${GREEN} 4. 修改配置${RESET}"
+  echo -e "${GREEN} 5. 启动 Encryption+Reality${RESET}"
+  echo -e "${GREEN} 6. 停止 Encryption+Reality${RESET}"
+  echo -e "${GREEN} 7. 重启 Encryption+Reality${RESET}"
+  echo -e "${GREEN} 8. 查看服务日志${RESET}"
+  echo -e "${GREEN} 9. 查看节点配置${RESET}"
+  echo -e "${GREEN}10. 配置Socks5出口${RESET}"
+  echo -e "${GREEN}11. SNI域名优选✨${RESET}"
+  echo -e "${GREEN}0. 退出${RESET}"
   echo -e "${GREEN}================================${RESET}"
 }
 

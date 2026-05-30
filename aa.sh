@@ -1,293 +1,379 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# V2Ray Socks5 核心 Alpine 专属管理面板 
+# SPDX-License-Identifier: MIT
+#
 
-# ================== 颜色定义 ==================
-GREEN="\033[1;32m"
-RED="\033[1;31m"
-YELLOW="\033[1;33m"
-PURPLE="\033[1;35m"
-SKYBLUE="\033[1;36m"
-RESET="\033[0m"
+set -e
+export LANG=en_US.UTF-8
 
-# ================== 基础环境变量 ==================
-HOSTNAME=$(hostname)
-USERNAME=$(whoami | tr '[:upper:]' '[:lower:]')
-export SECRET=${SECRET:-$(echo -n "$USERNAME+$HOSTNAME" | md5sum | awk '{print $1}' | head -c 32)}
-WORKDIR="$HOME/mtp"
-CRON_CMD="@reboot sleep 30 && /bin/bash $WORKDIR/restart.sh >/dev/null 2>&1"
-LOG_FILE="$WORKDIR/mtg.log"
+# =========================================================
+# 1. 配置文件和日志路径
+# =========================================================
+WORKDIR="/etc/v2ray"
+CONFIG_FILE="/etc/v2ray/config.json"
+V2RAY_LOG="/var/log/v2ray/access.log"
+CREDENTIALS_FILE="/etc/v2ray/credentials.txt"
 
-# ================== 工具函数 ==================
-red_echo() { echo -e "${RED}$1${RESET}"; }
-green_echo() { echo -e "${GREEN}$1${RESET}"; }
-yellow_echo() { echo -e "${YELLOW}$1${RESET}"; }
-purple_echo() { echo -e "${PURPLE}$1${RESET}"; }
+# 颜色定义
+GREEN="\033[0;32m"
+BLUE="\033[0;34m"
+RED="\033[0;31m"
+YELLOW="\033[0;33m"
+PURPLE="\033[0;35m"
+CYAN="\033[0;36m"
+WHITE="\033[1;37m"
+NC="\033[0m"
 
-# 获取最准确的当前运行 PID
-get_mtg_pid() {
-    local pid=$(pidof mtg)
-    if [[ -z "$pid" ]]; then
-        pid=$(ps -ef 2>/dev/null | grep 'mtg run' | grep -v grep | awk '{print $1}')
-    fi
-    echo "$pid"
-}
-
-# 获取面板状态显示 (严格在函数内用 local)
-get_status_display() {
-    local current_pid=$(get_mtg_pid)
-    local saved_port=$(cat "$WORKDIR/port.txt" 2>/dev/null)
-    local is_listening=""
-    [[ -n "$saved_port" ]] && is_listening=$(netstat -an 2>/dev/null | grep -E "[:\.]${saved_port} " | grep -i "listen")
-
-    if [[ -n "$current_pid" || -n "$is_listening" ]]; then
-        echo -e "${GREEN}正在运行${RESET}"
-    else
-        echo -e "${RED}已停止${RESET}"
+# =========================================================
+# 2. 基础辅助与探测工具函数
+# =========================================================
+check_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "${RED}错误: 请使用root权限运行此脚本!${NC}"
+        exit 1
     fi
 }
 
-# 获取正在运行的端口
-get_running_port() {
-    local pid=$(get_mtg_pid)
-    local port=""
-    if [[ -n "$pid" ]]; then
-        port=$(netstat -anp 2>/dev/null | grep "$pid/" | grep -i "listen" | awk '{print $4}' | cut -d':' -f2 | head -n 1)
-        [[ -z "$port" && -f "$WORKDIR/port.txt" ]] && port=$(cat "$WORKDIR/port.txt")
-        echo "${port:-未知}"
-    else
-        echo "无"
-    fi
+pause() { 
+    read -r -n 1 -s -r -p "按任意键返回菜单..." || true
+    echo 
+}
+
+# 生成随机端口(1024-65535)
+generate_random_port() {
+    echo $(( (RANDOM % 64511) + 1024 ))
+}
+
+# 生成随机用户名和密码
+generate_random_credentials() {
+    local username=$(head /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 8)
+    local password=$(head /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 12)
+    echo "$username:$password"
 }
 
 get_public_ip() {
     local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP"
-}
-
-random_port() {
-    awk 'BEGIN{srand(); print int(rand()*(65000-2000+1))+2000}'
-}
-
-# 彻底修复输出污染的端口检查函数
-check_vps_port() {
-    local port=$1
-    while true; do
-        # 仅仅把提示打印到标准错误(>&2)，确保标准输出只返回纯数字端口
-        if [[ -n $(netstat -an 2>/dev/null | grep -E "[:\.]${port} " | grep -i "listen") ]]; then
-            echo -e "${RED}${port} 端口已经被其他程序占用，请更换端口重试。${RESET}" >&2
-            read -p "请输入新端口（回车使用随机端口）: " port
-            if [[ -z $port ]]; then
-                port=$(random_port)
-                echo -e "${GREEN}使用随机端口: $port${RESET}" >&2
-            fi
-        else
-            break
+    for svc in "https://api.ipify.org" "https://ifconfig.me" "https://ipinfo.io/ip"; do
+        ip=$(curl -s --max-time 5 "$svc" || wget -T 5 -qO- "$svc" || true)
+        ip=$(echo "$ip" | tr -d '[:space:]')
+        if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$ip"
+            return 0
         fi
     done
-    echo "$port"
+    echo "127.0.0.1"
 }
 
-install_alpine_deps() {
-    local update_done=0
-    if ! command -v bash &>/dev/null; then apk update && update_done=1 && apk add bash; fi
-    if ! command -v curl &>/dev/null; then [[ $update_done -eq 0 ]] && apk update && update_done=1; apk add curl; fi
-}
-
-# ================== Crontab 管理 ==================
-check_cron_status() {
-    crontab -l 2>/dev/null | grep -q "restart.sh"
-}
-
-set_cron() {
-    if ! check_cron_status; then
-        (crontab -l 2>/dev/null; echo "$CRON_CMD") | crontab -
-    fi
-    rc-service crond start >/dev/null 2>&1 || crond -b >/dev/null 2>&1
-}
-
-remove_cron() {
-    crontab -l 2>/dev/null | grep -v "restart.sh" | crontab -
-}
-
-# ================== 核心控制服务 ==================
-start_proxy() {
-    local pid=$(get_mtg_pid)
-    if [[ -n "$pid" ]]; then
-        yellow_echo "MTProto Proxy 已经在运行中 (PID: $pid)。"
-        return 0
-    fi
-    
-    if [ ! -f "$WORKDIR/mtg" ]; then
-        red_echo "未检测到安装文件，请先选择 1 安装。"
-        return 1
-    fi
-
-    local port=$(cat "$WORKDIR/port.txt" 2>/dev/null)
-    if [[ -z "$port" || "$port" == "无" ]]; then
-        red_echo "未检测到配置端口，请重新安装或修改配置。"
-        return 1
-    fi
-
-    cd "$WORKDIR" || return
-    local stats_p=$((port + 1))
-    nohup ./mtg run -b 0.0.0.0:$port "$SECRET" --stats-bind=127.0.0.1:${stats_p} >> "$LOG_FILE" 2>&1 &
-    sleep 1
-    green_echo "MTProto Proxy 启动指令已发送！"
-}
-
-stop_proxy() {
-    # 针对 Alpine 的强杀组合拳
-    local pids=$(pidof mtg || ps -ef | grep 'mtg run' | grep -v grep | awk '{print $1}')
-    if [[ -n "$pids" ]]; then
-        echo "$pids" | xargs kill -9 >/dev/null 2>&1
-    fi
-    pkill -9 -f "mtg run" >/dev/null 2>&1
-    pkill -9 mtg >/dev/null 2>&1
-    green_echo "MTProto Proxy"
-}
-
-show_config() {
-    if [ ! -f "$WORKDIR/link.txt" ]; then
-        red_echo "未找到连接配置，请确保已成功安装。"
+# 从 config.json 精准动态反查当前配置
+load_current_config() {
+    if [ -f "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
+        CURRENT_PORT=$(jq -r '.inbounds[0].port' "$CONFIG_FILE" 2>/dev/null || echo "")
+        CURRENT_USER=$(jq -r '.inbounds[0].settings.accounts[0].user' "$CONFIG_FILE" 2>/dev/null || echo "")
+        CURRENT_PASS=$(jq -r '.inbounds[0].settings.accounts[0].pass' "$CONFIG_FILE" 2>/dev/null || echo "")
     else
-        purple_echo "==== 当前 MTProto 连接配置 ===="
-        cat "$WORKDIR/link.txt"
+        CURRENT_PORT=""
+        CURRENT_USER=""
+        CURRENT_PASS=""
     fi
 }
 
-# ================== 安装与配置修改 ==================
-download_and_run_mtg() {
-    local arch="amd64"
-    cmd=$(uname -m)
-    if [ "$cmd" == "386" ] || [ "$cmd" == "i686" ]; then arch="386"; fi
-    if [ "$cmd" == "armv7l" ] || [ "$cmd" == "armhf" ]; then arch="arm"; fi
-    if [ "$cmd" == "aarch64" ] || [ "$cmd" == "arm64" ]; then arch="arm64"; fi
+# 检查本地端口监听状态
+check_port_listening() {
+    local port=$1
+    if [[ -n "$port" ]]; then
+        netstat -an 2>/dev/null | grep -E "[:\.]${port} " | grep -i "listen"
+    fi
+}
 
-    mkdir -p "$WORKDIR"
-    stop_proxy
-
-    yellow_echo "正在下载 mtg 专属 Alpine 静态核心组件..."
-    wget -q -O "${WORKDIR}/mtg" "https://github.com/9600/mtg/releases/download/v2.1.7/mtg-linux-$arch"
+# =========================================================
+# 3. 安装与依赖部署模块
+# =========================================================
+install_dependencies() {
+    echo -e "${BLUE}正在检查并安装依赖项...${NC}"
     
-    if [ ! -s "${WORKDIR}/mtg" ]; then
-        wget -q -O "${WORKDIR}/mtg" "https://github.com/whunt1/onekeymakemtg/raw/master/builds/ccbuilds/mtg-linux-$arch"
+    # 更新软件包索引
+    if ! apk update; then
+        echo -e "${RED}更新软件包索引失败，将尝试直接安装...${NC}"
     fi
     
-    if [ ! -s "${WORKDIR}/mtg" ]; then
-        red_echo "下载核心失败，请检查网络！"
+    # 安装基本工具
+    echo -e "${BLUE}安装基础工具...${NC}"
+    if ! apk add --no-cache curl jq openrc; then
+        echo -e "${RED}安装基础工具失败${NC}"
         return 1
     fi
     
-    chmod +x "${WORKDIR}/mtg"
-    echo "$MTP_PORT" > "$WORKDIR/port.txt"
-    cd "$WORKDIR" || return
-
-    # 启动服务
-    local stats_port=$((MTP_PORT + 1))
-    nohup ./mtg run -b 0.0.0.0:$MTP_PORT "$SECRET" --stats-bind=127.0.0.1:${stats_port} >> "$LOG_FILE" 2>&1 &
+    # 安装V2Ray
+    echo -e "${BLUE}安装V2Ray...${NC}"
+    if ! apk add --no-cache v2ray; then
+        echo -e "${RED}安装V2Ray失败。可能是由于内存不足或网络问题。${NC}"
+        return 1
+    fi
     
-    # 创建守护/重启脚本
-    cat > "${WORKDIR}/restart.sh" <<EOF
-#!/bin/bash
-pkill -9 -f "mtg run" >/dev/null 2>&1
-pkill -9 mtg >/dev/null 2>&1
-cd ${WORKDIR}
-nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:${stats_port} >> ${LOG_FILE} 2>&1 &
+    # 创建必要的目录
+    mkdir -p /etc/v2ray
+    mkdir -p /var/log/v2ray
+    
+    # 检查V2Ray服务是否存在，不存在则手动创建
+    if ! ls /etc/init.d/v2ray >/dev/null 2>&1; then
+        echo -e "${RED}找不到V2Ray服务。尝试手动创建服务文件...${NC}"
+        
+        cat > /etc/init.d/v2ray << 'EOF'
+#!/sbin/openrc-run
+
+name="V2Ray"
+description="V2Ray Service"
+command="/usr/bin/v2ray"
+command_args="run -config /etc/v2ray/config.json"
+pidfile="/var/run/v2ray.pid"
+command_background="yes"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath -d -m 0755 -o root:root /var/log/v2ray
+}
 EOF
-    chmod +x "${WORKDIR}/restart.sh"
+        chmod +x /etc/init.d/v2ray
+    fi
+    
+    # 启用V2Ray服务
+    if ! rc-update add v2ray default; then
+        echo -e "${RED}无法启用V2Ray服务开机自启。继续但某些功能可能无法工作。${NC}"
+    fi
+    
+    echo -e "${GREEN}依赖安装完成${NC}"
     return 0
 }
 
-core_install() {
-    install_alpine_deps
-    purple_echo "正在配置 MTProto 代理端口...\n"
-    
-    read -p "请输入 MTProto 代理端口 (回车使用随机端口): " user_port
-    [[ -z $user_port ]] && user_port=$(random_port)
-    
-    # 核心修复点：通过 check_vps_port 获取纯净的端口数字
-    MTP_PORT=$(check_vps_port "$user_port")
-    IP1=$(get_public_ip)
-
-    if download_and_run_mtg; then
-        sleep 1
-        purple_echo "\n🎉 MTProto 安装/修改完成！"
-        LINKS="tg://proxy?server=$IP1&port=$MTP_PORT&secret=$SECRET"
-        green_echo "$LINKS\n"
-        echo -e "$LINKS" > "${WORKDIR}/link.txt"
-        
-        read -p "是否同时将MTProto加入开机自启（Crontab）？[回车默认加入,Y/n]: " choice_cron
-        case "$choice_cron" in
-            [nN][oO]|[nN]) remove_cron ;;
-            *) set_cron ;;
-        esac
+# 验证V2Ray是否正确安装
+verify_v2ray() {
+    if ! command -v v2ray >/dev/null 2>&1; then
+        echo -e "${RED}V2Ray未安装或不在PATH中。${NC}"
+        return 1
     fi
+    if ! [ -f /etc/init.d/v2ray ]; then
+        echo -e "${RED}找不到V2Ray服务文件。${NC}"
+        return 1
+    fi
+    return 0
 }
 
-# ================== 主菜单循环 ==================
-while true; do
-    clear
+# =========================================================
+# 4. 配置写入与凭据存储模块
+# =========================================================
+save_credentials() {
+    local port=$1
+    local username=$2
+    local password=$3
     
-    # 严格调用函数获取状态和端口，杜绝在主循环体直接使用 local
-    status_display=$(get_status_display)
-    port_display=$(get_running_port)
+    echo "端口: $port" > "$CREDENTIALS_FILE"
+    echo "用户名: $username" >> "$CREDENTIALS_FILE"
+    echo "密码: $password" >> "$CREDENTIALS_FILE"
+    chmod 600 "$CREDENTIALS_FILE"
+    echo -e "${GREEN}凭据已保存到 $CREDENTIALS_FILE${NC}"
+}
+
+configure_v2ray() {
+    local port=$1
+    local username=$2
+    local password=$3
     
-    if check_cron_status; then
-        cron_display="${GREEN}已开启${RESET}"
-    else
-        cron_display="${RED}已关闭${RESET}"
+    mkdir -p /etc/v2ray
+    
+    cat > "$CONFIG_FILE" << EOF
+{
+  "log": {
+    "access": "/var/log/v2ray/access.log",
+    "error": "/var/log/v2ray/error.log",
+    "loglevel": "info"
+  },
+  "inbounds": [
+    {
+      "port": $port,
+      "protocol": "socks",
+      "settings": {
+        "auth": "password",
+        "accounts": [
+          {
+            "user": "$username",
+            "pass": "$password"
+          }
+        ],
+        "udp": true
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {}
+    }
+  ]
+}
+EOF
+
+    echo -e "${GREEN}V2Ray已配置为使用端口 $port 和用户名/密码认证${NC}"
+    save_credentials "$port" "$username" "$password"
+}
+
+# =========================================================
+# 5. 主流程交互模块（安装、修改、启动、停止、查看）
+# =========================================================
+core_install_or_modify() {
+    install_dependencies
+    if ! verify_v2ray; then
+        echo -e "${RED}环境验证未通过，停止配置。${NC}"
+        return 1
     fi
 
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     MTProto Proxy 管理面板     ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态     :${RESET} ${status_display}"
-    echo -e "${GREEN}端口     :${RESET} ${YELLOW}${port_display}${RESET}"
-    echo -e "${GREEN}开机自启 :${RESET} ${cron_display}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 MTProto${RESET}"
-    echo -e "${GREEN}2. 修改配置${RESET}"
-    echo -e "${GREEN}3. 卸载 MTProto${RESET}"
-    echo -e "${GREEN}4. 启动 MTProto${RESET}"
-    echo -e "${GREEN}5. 停止 MTProto${RESET}"
-    echo -e "${GREEN}6. 重启 MTProto${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看连接配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    read -p "$(echo -e ${GREEN}请选择:${RESET} )" choice
+    load_current_config
+    echo -e "${PURPLE}====== 配置 V2Ray Socks5 参数 ======${NC}"
+    
+    # 1. 端口配置与占用拦截
+    local final_port=""
+    local default_p
+    default_p=${CURRENT_PORT:-$(generate_random_port)}
+    while true; do
+        read -r -p "👉 请输入监听端口 (回车默认: ${default_p}): " input_port
+        final_port=${input_port:-$default_p}
+        if ! [[ "${final_port}" =~ ^[0-9]+$ ]] || [ "${final_port}" -lt 1 ] || [ "${final_port}" -gt 65535 ]; then
+            echo -e "${RED}端口输入无效，请输入 1-65535 之间的数字。${NC}"
+            continue
+        fi
+        if [[ "$final_port" != "$CURRENT_PORT" && -n $(check_port_listening "$final_port") ]]; then
+            echo -e "${RED}${final_port} 端口已被其他程序占用，请更换端口。${NC}"
+            default_p=$(generate_random_port)
+            continue
+        fi
+        break
+    done
 
-    case $choice in
-        1|2)
-            clear; core_install; read -p "按回车返回菜单..." ;;
-        3)
-            clear
-            stop_proxy; remove_cron; rm -rf "$WORKDIR"
-            red_echo "MTProto 已彻底从系统中卸载！"; read -p "按回车返回菜单..." ;;
-        4)
-            clear; start_proxy; read -p "按回车返回菜单..." ;;
-        5)
-            clear; stop_proxy; read -p "按回车返回菜单..." ;;
-        6)
-            clear; stop_proxy; sleep 1; start_proxy; read -p "按回车返回菜单..." ;;
-        7)
-            clear
-            if [ -f "$LOG_FILE" ]; then
-                purple_echo "=== 正在查看最新 50 行运行日志 ==="
-                tail -n 50 "$LOG_FILE"
-            else
-                yellow_echo "暂无日志文件。"
+    # 2. 账号密码配置
+    local raw_creds=$(generate_random_credentials)
+    local default_user=${CURRENT_USER:-$(echo "$raw_creds" | cut -d':' -f1)}
+    local default_pass=${CURRENT_PASS:-$(echo "$raw_creds" | cut -d':' -f2)}
+
+    read -r -p "👉 请设置用户名 (回车默认: ${default_user}): " final_user
+    final_user=${final_user:-$default_user}
+
+    read -r -p "👉 请设置密码 (回车默认: ${default_pass}): " final_pass
+    final_pass=${final_pass:-$default_pass}
+
+    # 执行配置写入与重启
+    configure_v2ray "$final_port" "$final_user" "$final_pass"
+    
+    echo -e "${BLUE}正在重载 OpenRC 服务状态...${NC}"
+    rc-service v2ray restart >/dev/null 2>&1 || ./etc/init.d/v2ray restart >/dev/null 2>&1 || true
+    sleep 1.5
+    
+    show_config_links
+}
+
+show_config_links() {
+    load_current_config
+    if [ -z "$CURRENT_PORT" ]; then
+        echo -e "${RED}未检测到有效的 V2Ray 配置文件，请先执行选项 1 安装。${NC}"
+        return 1
+    fi
+    local ip=$(get_public_ip)
+    
+    echo -e "${GREEN}====== V2Ray Socks5 连接凭证 ======${NC}"
+    echo -e "${YELLOW}● 节点地址:${NC} ${ip}"
+    echo -e "${YELLOW}● 监听端口:${NC} ${CURRENT_PORT}"
+    echo -e "${YELLOW}● 用户名字:${NC} ${CURRENT_USER}"
+    echo -e "${YELLOW}● 认证密码:${NC} ${CURRENT_PASS}"
+    echo -e "${YELLOW}● 客户端直连格式:${NC} socks://${CURRENT_USER}:${CURRENT_PASS}@${ip}:${CURRENT_PORT}"
+    echo
+}
+
+uninstall_v2ray() {
+    echo -e "${YELLOW}正在从 Alpine 系统卸载 V2Ray 及其所有关联配置...${NC}"
+    rc-service v2ray stop >/dev/null 2>&1 || true
+    rc-update del v2ray default >/dev/null 2>&1 || true
+    rm -f /etc/init.d/v2ray
+    apk del v2ray
+    rm -rf "$WORKDIR"
+    rm -rf /var/log/v2ray
+    echo -e "${GREEN}V2Ray 已经彻底从系统中移除！${NC}"
+}
+
+# =========================================================
+# 6. 面板主菜单循环
+# =========================================================
+menu() {
+    check_root
+    
+    while true; do
+        clear
+        load_current_config
+        
+        # OpenRC 运行状态判定
+        local status_display="${RED}● 已停止${NC}"
+        if verify_v2ray &>/dev/null; then
+            if rc-service v2ray status 2>/dev/null | grep -qi "started" || [ -n "$(check_port_listening "$CURRENT_PORT")" ]; then
+                status_display="${GREEN}● 运行中 (OpenRC)${NC}"
             fi
-            read -p "按回车返回菜单..." ;;
-        8)
-            clear; show_config; read -p "按回车返回菜单..." ;;
-        0)
-            exit 0 ;;
-        *)
-            red_echo "无效输入！" ; sleep 1 ;;
-    esac
-done
+        else
+            status_display="${RED}● 未安装核心${NC}"
+        fi
+
+        local port_display="${CURRENT_PORT:- -}"
+        
+        echo -e "${GREEN}================================${NC}"
+        echo -e "${GREEN}    V2Ray Socks5 Alpine 面板     ${NC}"
+        echo -e "${GREEN}================================${NC}"
+        echo -e "${GREEN}状态   :${NC} ${status_display}"
+        echo -e "${GREEN}端口   :${NC} ${YELLOW}${port_display}${NC}"
+        echo -e "${GREEN}实现   :${NC} ${CYAN}v2ray-core (Socks5)${NC}"
+        echo -e "${GREEN}================================${NC}"
+        echo -e "${GREEN}1. 安装 / 修改配置${NC}"
+        echo -e "${GREEN}2. 卸载 V2Ray${NC}"
+        echo -e "${GREEN}3. 启动 V2Ray${NC}"
+        echo -e "${GREEN}4. 停止 V2Ray${NC}"
+        echo -e "${GREEN}5. 重启 V2Ray${NC}"
+        echo -e "${GREEN}6. 查看运行日志${NC}"
+        echo -e "${GREEN}7. 查看当前连接配置${NC}"
+        echo -e "${GREEN}0. 退出${NC}"
+        echo -e "${GREEN}================================${NC}"
+
+        local choice=""
+        read -r -p "$(echo -e "${GREEN}请输入选项: ${NC}")" choice || true
+        [[ -z "$choice" ]] && continue
+
+        case "$choice" in
+            1) clear; core_install_or_modify; pause ;;
+            2) clear; uninstall_v2ray; pause ;;
+            3)
+                clear
+                if ! verify_v2ray; then echo -e "${RED}请先安装核心！${NC}"; else rc-service v2ray start; echo -e "${GREEN}启动指令已执行。${NC}"; fi
+                pause ;;
+            4)
+                clear
+                if ! verify_v2ray; then echo -e "${RED}服务未安装！${NC}"; else rc-service v2ray stop; echo -e "${GREEN}停止指令已执行。${NC}"; fi
+                pause ;;
+            5)
+                clear
+                if ! verify_v2ray; then echo -e "${RED}服务未安装！${NC}"; else rc-service v2ray restart; echo -e "${GREEN}重启指令已执行。${NC}"; fi
+                pause ;;
+            6)
+                clear
+                if [ -f "$V2RAY_LOG" ]; then
+                    echo -e "${PURPLE}=== 最新 50 行访问日志 ===${NC}"
+                    tail -n 50 "$V2RAY_LOG"
+                else
+                    echo -e "${YELLOW}暂无可用访问日志或未产生流量。${NC}"
+                fi
+                pause ;;
+            7) clear; show_config_links; pause ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选项，请重新选择！${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+menu "$@"

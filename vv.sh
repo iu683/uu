@@ -92,27 +92,28 @@ pick_service_manager() {
 }
 
 install_packages() {
+  info "正在尝试自动安装依赖包 (curl, unzip, ca-certificates, python3)..."
   if command -v apt-get >/dev/null 2>&1; then
     run_as_root apt-get update
-    run_as_root apt-get install -y curl unzip ca-certificates
+    run_as_root apt-get install -y curl unzip ca-certificates python3
   elif command -v dnf >/dev/null 2>&1; then
-    run_as_root dnf install -y curl unzip ca-certificates
+    run_as_root dnf install -y curl unzip ca-certificates python3
   elif command -v yum >/dev/null 2>&1; then
-    run_as_root yum install -y curl unzip ca-certificates
+    run_as_root yum install -y curl unzip ca-certificates python3
   elif command -v apk >/dev/null 2>&1; then
-    run_as_root apk add --no-cache curl unzip ca-certificates
+    run_as_root apk add --no-cache curl unzip ca-certificates python3
   elif command -v pacman >/dev/null 2>&1; then
-    run_as_root pacman -Sy --noconfirm curl unzip ca-certificates
+    run_as_root pacman -Sy --noconfirm curl unzip ca-certificates python3
   elif command -v zypper >/dev/null 2>&1; then
-    run_as_root zypper --non-interactive install curl unzip ca-certificates
+    run_as_root zypper --non-interactive install curl unzip ca-certificates python3
   else
-    die "无法自动安装依赖，请手动安装: curl unzip ca-certificates"
+    warn "无法确定包管理器，请手动确保安装了: curl unzip ca-certificates python3"
   fi
 }
 
 fetch_latest_release() {
   local api tag
-  api="https://api.github.com/repos/$REPO/releases/latest"
+  api="https://v6.gh-proxy.org/https://api.github.com/repos/$REPO/releases/latest"
   tag="$(curl -fsSL "$api" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
   [ -n "$tag" ] || die "获取最新版本失败"
   echo "$tag"
@@ -183,7 +184,7 @@ download_and_install_binary() {
   os="$2"
   arch="$3"
   asset="$(build_asset_name "$version" "$os" "$arch")"
-  url="https://github.com/$REPO/releases/download/$version/$asset"
+  url="https://v6.gh-proxy.org/https://github.com/$REPO/releases/download/$version/$asset"
   tmpdir="$(mktemp -d)"
 
   info "下载 $asset"
@@ -193,7 +194,7 @@ download_and_install_binary() {
   }
 
   checksum_file="$tmpdir/checksums.txt"
-  if curl -fsSL "https://github.com/$REPO/releases/download/$version/checksums.txt" -o "$checksum_file"; then
+  if curl -fsSL "https://v6.gh-proxy.org/https://github.com/$REPO/releases/download/$version/checksums.txt" -o "$checksum_file"; then
     expected="$(grep "  $asset$" "$checksum_file" | awk '{print $1}')"
     if [ -n "$expected" ] && command -v sha256sum >/dev/null 2>&1; then
       actual="$(sha256sum "$tmpdir/$asset" | awk '{print $1}')"
@@ -400,19 +401,10 @@ show_status() {
 update_usque() {
   local os arch version runtime mode bind port
   need_cmd uname
-  need_cmd curl
-  need_cmd python3
-  if ! command -v unzip >/dev/null 2>&1; then
-    info "检测到未安装 unzip，尝试自动安装依赖"
-    install_packages
-  fi
-  need_cmd unzip
 
-  # 优先尝试用 Python 解析，如果失败则自动回退到用 grep/sed 盲切（从而彻底免除对 Python3 的强依赖）
-  if command -v python3 >/dev/null 2>&1; then
-    tag="$(echo "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name",""))')"
-  else
-    tag="$(echo "$json" | grep -o '"tag_name": *"[^"]*"' | sed 's/"tag_name": *//"/' | sed 's/"//g')"
+  # 如果没有 curl、unzip 或 python3，直接进入自动安装流程，而不是拦截报错
+  if ! command -v curl >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+    install_packages
   fi
 
   os="$(detect_os)"

@@ -1,431 +1,544 @@
-#!/bin/bash
-
-# =========================================================
-# Xray VLESS-Encryption 管理脚本(Alpine Linux) - 
-# =========================================================
-
+#!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ================== 颜色定义 ==================
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-BLUE="\033[34m"
-RESET="\033[0m"
+REPO="Diniboy1123/usque"
+BIN_NAME="usque"
+INSTALL_DIR="/usr/local/bin"
+BIN_PATH="$INSTALL_DIR/$BIN_NAME"
+CONFIG_DIR="/etc/usque"
+CONFIG_PATH="$CONFIG_DIR/config.json"
+SERVICE_NAME="usque"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+STATE_FILE="/etc/usque/runtime.env"
+DEFAULT_MODE="socks"
+DEFAULT_BIND="127.0.0.1"
+DEFAULT_PORT="1080"
+AUTO_REGISTER_NAME=""
+AUTO_REGISTER_LOCALE="en_US"
+AUTO_REGISTER_MODEL="PC"
+AUTO_REGISTER_JWT=""
 
-# ================== 🚀 服务自定义重命名 ==================
-readonly SERV_NAME="xray-vless-encrypt"
+# ---- 颜色定义 ----
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+RESET='\033[0m' 
+NC='\033[0m'
 
-# ================== 📂 自定义分享链接存放路径 ==================
-readonly X_LINK_DIR="/root/proxynode/vlessEncryption"
-
-# ================== 路径与日志 (自动联动) ==================
-readonly X_DIR="/etc/${SERV_NAME}"
-readonly X_CONFIG="${X_DIR}/config.json"
-readonly X_BIN="/usr/local/bin/${SERV_NAME}"
-readonly X_LINK="${X_LINK_DIR}/${SERV_NAME}_vless.txt"
-readonly X_STATE="${X_DIR}/encryption_matrix.state"
-readonly X_LOG="/var/log/${SERV_NAME}.log"
-readonly INIT_FILE="/etc/init.d/${SERV_NAME}"
-
-# ================== 核心工具 ==================
-info() { echo -e "${GREEN}[信息] $*${RESET}"; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}"; }
-error() { echo -e "${RED}[错误] $*${RESET}"; }
-pause() { echo; echo -ne "${GREEN}按任意键返回菜单...${RESET}"; read -n 1 -s; echo; }
-
-is_valid_port() {
-    local port=$1
-    if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
-        return 0
-    else
-        return 1
-    fi
+log() {
+  printf '%s\n' "$*"
 }
 
-restart_xray() {
-    rc-service "$SERV_NAME" restart >/dev/null 2>&1 || true
-    sleep 1
-    if rc-service "$SERV_NAME" status 2>/dev/null | grep -q "started"; then
-        return 0
-    else
-        return 1
-    fi
+info() {
+  printf "[${GREEN}*${NC}] %s\n" "$*"
 }
 
-get_xray_status() {
-    if rc-service "$SERV_NAME" status 2>/dev/null | grep -q "started"; then
-        echo -e "${GREEN}● 运行中 ${RESET}"
-    else 
-        if pgrep -f "$X_BIN run" >/dev/null 2>&1; then
-            echo -e "${GREEN}● 运行中 ${RESET}"
-        else
-            echo -e "${RED}● 未运行 ${RESET}"
-        fi
-    fi
+warn() {
+  printf "[${YELLOW}!${NC}] %s\n" "$*" >&2
 }
 
-get_xray_version() {
-    if [[ -x "$X_BIN" ]]; then
-        "$X_BIN" version 2>/dev/null | head -n 1 | awk '{print $2}'
-    else
-        echo "未安装"
-    fi
+die() {
+  printf "[${RED}x${NC}] %s\n" "$*" >&2
+  exit 1
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    error "无法获取公网 IP 地址。" && return 1
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "缺少依赖命令: $1"
 }
 
-generate_vless_encryption_config() {
-    local vlessenc_output
-    vlessenc_output=$($X_BIN vlessenc 2>/dev/null || true)
-    if [ -z "$vlessenc_output" ]; then
-        error "调用核心生成 VLESS Encryption 配置失败"
-        return 1
-    fi
-
-    local decryption_config=""
-    local encryption_config=""
-    local in_mlkem_section=false
-
-    while IFS= read -r line; do
-        if [[ "$line" == *"Authentication: ML-KEM-768, Post-Quantum"* ]]; then
-            in_mlkem_section=true
-            continue
-        fi
-
-        if [ "$in_mlkem_section" = true ]; then
-            if [[ "$line" == *'"decryption":'* ]]; then
-                decryption_config=$(echo "$line" | sed 's/.*"decryption": "\([^"]*\)".*/\1/')
-            elif [[ "$line" == *'"encryption":'* ]]; then
-                if echo "$line" | grep -q '.*"encryption": "[^"]*"'; then
-                    encryption_config=$(echo "$line" | sed 's/.*"encryption": "\([^"]*\)".*/\1/')
-                else
-                    encryption_config=$(echo "$line" | sed 's/.*"encryption": "\([^"]*\).*/\1/')
-                    read -r next_line
-                    encryption_config="${encryption_config}${next_line}"
-                    encryption_config=$(echo "$encryption_config" | tr -d '"' | tr -d '[:space:]')
-                fi
-                break
-            fi
-        fi
-    done <<< "$vlessenc_output"
-
-    if [ -z "$decryption_config" ] || [ -z "$encryption_config" ]; then
-        error "无法解析内嵌的 VLESS Encryption 后量子证书拓扑"
-        return 1
-    fi
-
-    echo "${decryption_config}|${encryption_config}"
+run_as_root() {
+  if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    die "需要 root 权限执行: $*"
+  fi
 }
 
-HOSTNAME=$(hostname -s | sed 's/ /_/g')
-
-# ================== 配置写入 (完全对齐 VLESS-Encryption 模板) ==================
-write_config() {
-    local port=$1 uuid=$2 decryption=$3
-    local outbound=${4:-'{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}'}
-    mkdir -p "$X_DIR" && chmod 755 "$X_DIR"
-    
-    cat > "$X_CONFIG" <<EOF
-{
-    "log": { "loglevel": "warning" },
-    "inbounds": [{
-        "listen": "::",
-        "port": $port,
-        "protocol": "vless",
-        "settings": {
-            "clients": [{"id": "$uuid", "flow": ""}],
-            "decryption": "$decryption"
-        }
-    }],
-    "outbounds": [$outbound]
+detect_os() {
+  local os
+  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  case "$os" in
+    linux) echo "linux" ;;
+    darwin) echo "darwin" ;;
+    *) die "暂不支持的系统: $os" ;;
+  esac
 }
+
+detect_arch() {
+  local arch
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l|armv7) echo "armv7" ;;
+    armv6l|armv6) echo "armv6" ;;
+    armv5tel|armv5|arm) echo "armv5" ;;
+    mips) echo "mips" ;;
+    mips64) echo "mips64" ;;
+    mips64el|mips64le) echo "mips64le" ;;
+    mipsel|mipsle) echo "mipsle" ;;
+    *) die "暂不支持的架构: $arch" ;;
+  esac
+}
+
+pick_service_manager() {
+  if command -v systemctl >/dev/null 2>&1; then
+    echo "systemd"
+  else
+    echo "none"
+  fi
+}
+
+install_packages() {
+  if command -v apt-get >/dev/null 2>&1; then
+    run_as_root apt-get update
+    run_as_root apt-get install -y curl unzip ca-certificates
+  elif command -v dnf >/dev/null 2>&1; then
+    run_as_root dnf install -y curl unzip ca-certificates
+  elif command -v yum >/dev/null 2>&1; then
+    run_as_root yum install -y curl unzip ca-certificates
+  elif command -v apk >/dev/null 2>&1; then
+    run_as_root apk add --no-cache curl unzip ca-certificates
+  elif command -v pacman >/dev/null 2>&1; then
+    run_as_root pacman -Sy --noconfirm curl unzip ca-certificates
+  elif command -v zypper >/dev/null 2>&1; then
+    run_as_root zypper --non-interactive install curl unzip ca-certificates
+  else
+    die "无法自动安装依赖，请手动安装: curl unzip ca-certificates"
+  fi
+}
+
+fetch_latest_release() {
+  local api tag
+  api="https://api.github.com/repos/$REPO/releases/latest"
+  tag="$(curl -fsSL "$api" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
+  [ -n "$tag" ] || die "获取最新版本失败"
+  echo "$tag"
+}
+
+build_asset_name() {
+  local version os arch
+  version="$1"
+  os="$2"
+  arch="$3"
+  version="${version#v}"
+  echo "usque_${version}_${os}_${arch}.zip"
+}
+
+write_runtime_env() {
+  local mode bind port tmp
+  mode="$1"
+  bind="$2"
+  port="$3"
+  run_as_root mkdir -p "$CONFIG_DIR"
+  tmp="$(mktemp)"
+  cat > "$tmp" <<EOF
+USQUE_MODE="$mode"
+USQUE_BIND="$bind"
+USQUE_PORT="$port"
 EOF
+  run_as_root install -m 0644 "$tmp" "$STATE_FILE"
+  rm -f "$tmp"
 }
 
-# ================== 出口模式配置 ==================
-configure_custom_socks5_outbound() {
-    if [[ ! -f "$X_CONFIG" ]]; then 
-        error "错误: Xray 未安装，无法配置出口模式。"
-        return
-    fi
+load_runtime_env() {
+  local mode bind port
+  mode="$DEFAULT_MODE"
+  bind="$DEFAULT_BIND"
+  port="$DEFAULT_PORT"
+  if [ -f "$STATE_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$STATE_FILE"
+    mode="${USQUE_MODE:-$mode}"
+    bind="${USQUE_BIND:-$bind}"
+    port="${USQUE_PORT:-$port}"
+  fi
+  printf '%s|%s|%s\n' "$mode" "$bind" "$port"
+}
 
-    local mode current_protocol tmp_file
-    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$X_CONFIG" 2>/dev/null || echo "freedom")
+require_valid_port() {
+  local port
+  port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] || die "端口必须是数字"
+  [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "端口必须在 1-65535 之间"
+}
 
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请选择出口模式：${RESET}"
-    [[ "$current_protocol" == "socks" ]] && echo -e "${YELLOW} (当前: Socks5)${RESET}" || echo -e "${GREEN} (当前: 直连)${RESET}"
-    echo -e "${GREEN}1) 直连出口${RESET}"
-    echo -e "${GREEN}2) Socks5出口${RESET}"
-    echo -e "${GREEN}0) 取消${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+port_in_use() {
+  local port
+  port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -lnt | awk '{print $4}' | grep -Eq "[:.]${port}$"
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$"
+  else
+    return 1
+  fi
+}
 
-    echo -ne "${GREEN}请输入选项 [0-2]: ${RESET}"; read mode
-    case "$mode" in
-        1)
-            tmp_file=$(mktemp)
-            jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$X_CONFIG" > "$tmp_file"
-            cp "$X_CONFIG" "${X_CONFIG}.bak.$(date +%s)"
-            mv "$tmp_file" "$X_CONFIG"
-            restart_xray && info "已成功切换为直连出口！" || error "切换失败。"
-            return ;;
-        2) ;;
-        *) info "已取消配置"; return ;;
-    esac
+download_and_install_binary() {
+  local version os arch asset url tmpdir checksum_file actual expected
+  version="$1"
+  os="$2"
+  arch="$3"
+  asset="$(build_asset_name "$version" "$os" "$arch")"
+  url="https://github.com/$REPO/releases/download/$version/$asset"
+  tmpdir="$(mktemp -d)"
 
-    info "配置自定义 Socks5 出口代理..."
-    local s_host s_port s_user s_pass
-    echo -ne "${GREEN}请输入 Socks5 服务器地址/IP: ${RESET}"; read s_host
-    [[ -z "$s_host" ]] && return
+  info "下载 $asset"
+  curl -fL "$url" -o "$tmpdir/$asset" || {
+    rm -rf "$tmpdir"
+    die "下载失败: $url"
+  }
 
-    while true; do
-        echo -ne "${GREEN}请输入 Socks5 端口 (默认: 1080): ${RESET}"; read s_port
-        [[ -z "$s_port" ]] && s_port=1080
-        is_valid_port "$s_port" && break || error "端口无效，请输入 1-65535 之间的数字。"
-    done
-
-    echo -ne "${GREEN}请输入 Socks5 用户名 (无则回车): ${RESET}"; read s_user
-    if [[ -n "$s_user" ]]; then
-        echo -ne "${GREEN}请输入 Socks5 密码: ${RESET}"; read -s s_pass; echo
+  checksum_file="$tmpdir/checksums.txt"
+  if curl -fsSL "https://github.com/$REPO/releases/download/$version/checksums.txt" -o "$checksum_file"; then
+    expected="$(grep "  $asset$" "$checksum_file" | awk '{print $1}')"
+    if [ -n "$expected" ] && command -v sha256sum >/dev/null 2>&1; then
+      actual="$(sha256sum "$tmpdir/$asset" | awk '{print $1}')"
+      [ "$actual" = "$expected" ] || {
+        rm -rf "$tmpdir"
+        die "校验失败: $asset"
+      }
+      info "SHA256 校验通过"
     else
-        s_pass=""
+      warn "跳过 SHA256 校验（未找到匹配校验值或 sha256sum）"
     fi
+  else
+    warn "未获取到 checksums.txt，跳过校验"
+  fi
 
-    tmp_file=$(mktemp)
-    if [[ -n "$s_user" ]]; then
-        jq --arg host "$s_host" --argjson port "$s_port" --arg user "$s_user" --arg pass "$s_pass" \
-            '.outbounds = [{"protocol": "socks", "tag": "custom-out", "settings": {"servers": [{"address": $host, "port": $port, "users": [{"user": $user, "pass": $pass}]}]}}]' \
-            "$X_CONFIG" > "$tmp_file"
-    else
-        jq --arg host "$s_host" --argjson port "$s_port" \
-            '.outbounds = [{"protocol": "socks", "tag": "custom-out", "settings": {"servers": [{"address": $host, "port": $port}]}}]' \
-            "$X_CONFIG" > "$tmp_file"
-    fi
-
-    cp "$X_CONFIG" "${X_CONFIG}.bak.$(date +%s)"
-    mv "$tmp_file" "$X_CONFIG"
-    restart_xray && info "已成功切换为 Socks5 出口！" || error "重启失败，请检查 Socks5 信息。"
+  unzip -qo "$tmpdir/$asset" -d "$tmpdir/unpack"
+  [ -f "$tmpdir/unpack/$BIN_NAME" ] || {
+    rm -rf "$tmpdir"
+    die "压缩包中未找到 $BIN_NAME"
+  }
+  chmod +x "$tmpdir/unpack/$BIN_NAME"
+  run_as_root mkdir -p "$INSTALL_DIR"
+  run_as_root install -m 0755 "$tmpdir/unpack/$BIN_NAME" "$BIN_PATH"
+  rm -rf "$tmpdir"
+  info "已更新到 $BIN_PATH"
 }
 
-# 修改配置
-modify_config() {
-    if [[ ! -f "$X_CONFIG" ]]; then error "请先安装 Xray"; return; fi
-    if [[ ! -f "$X_STATE" ]]; then error "快照状态文件缺失，请重新安装以初始化矩阵"; return; fi
-    
-    local curr_port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
-    local curr_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
-    local curr_decryption=$(jq -r '.inbounds[0].settings.decryption' "$X_CONFIG")
-    local curr_encryption=$(cat "$X_STATE")
-    local curr_outbound=$(jq -c '.outbounds[0]' "$X_CONFIG")
+create_systemd_service() {
+  local tmp
+  tmp="$(mktemp)"
+  cat > "$tmp" <<EOF
+[Unit]
+Description=usque Cloudflare WARP MASQUE service
+After=network-online.target
+Wants=network-online.target
 
-    # 1. 修改端口
-    local n_port
-    while true; do
-        read -p "请输入新端口 (回车保持 $curr_port): " n_port
-        n_port=${n_port:-$curr_port}
-        is_valid_port "$n_port" && break || error "端口无效，请输入 1-65535 之间的数字。"
-    done
+[Service]
+Type=simple
+EnvironmentFile=-$STATE_FILE
+ExecStart=/bin/sh -c 'exec "$BIN_PATH" -c "$CONFIG_PATH" "\${USQUE_MODE:-socks}" --bind "\${USQUE_BIND:-127.0.0.1}" --port "\${USQUE_PORT:-1080}"'
+Restart=always
+RestartSec=5
 
-    # 2. 修改 UUID
-    local n_uuid
-    while true; do
-        read -p "请输入新 UUID (回车保持 $curr_uuid): " n_uuid
-        n_uuid=${n_uuid:-$curr_uuid}
-        if [[ "$n_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-            break
-        else
-            error "UUID 格式不正确，请重新输入。"
-        fi
-    done
-
-    write_config "$n_port" "$n_uuid" "$curr_decryption" "$curr_outbound"
-    rc-service "$SERV_NAME" restart
-    
-    # 重新生成链接
-    local ip=$(get_public_ip || echo "127.0.0.1")
-    local host_addr=$ip
-    if [[ $ip == *":"* ]]; then host_addr="[$ip]"; fi
-    
-    mkdir -p "$X_LINK_DIR"
-    echo "vless://$n_uuid@$host_addr:$n_port?encryption=$curr_encryption&security=none&type=tcp#$HOSTNAME-${SERV_NAME}" > "$X_LINK"
-    info "配置已更新并成功重启服务！"
-}
-
-# ================== 安装与管理 ==================
-install_xray() {
-    info "正在安装依赖与内核..."
-    apk update && apk add curl unzip jq uuidgen gcompat libc6-compat bc openssl > /dev/null 2>&1
-    mkdir -p "$X_DIR" && sync
-    
-    local arch=$(uname -m | sed 's/x86_64/64/;s/aarch64/arm64-v8a/')
-    local ver=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
-    
-    info "下载 Xray $ver ($arch)..."
-    curl -L -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/$ver/Xray-linux-$arch.zip"
-    unzip -o /tmp/xray.zip -d /tmp/xray_tmp > /dev/null
-    mv -f /tmp/xray_tmp/xray "$X_BIN" && chmod +x "$X_BIN"
-    rm -rf /tmp/xray*
-    
-    if [[ ! -f "$X_CONFIG" ]]; then
-        echo -ne "${GREEN}请输入入站端口 (回车随机): ${RESET}"; read port; [[ -z "$port" ]] && port=$((RANDOM % 45535 + 10000))
-        
-        # 1. 自定义 UUID
-        local uuid
-        while true; do
-            echo -ne "${GREEN}请输入自定义 UUID (回车随机生成): ${RESET}"; read input_uuid
-            if [[ -z "$input_uuid" ]]; then
-                if [ -x "$X_BIN" ]; then
-                    uuid=$($X_BIN uuid 2>/dev/null || uuidgen)
-                else
-                    uuid=$(uuidgen)
-                fi
-                break
-            else
-                if [[ "$input_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-                    uuid="$input_uuid"
-                    break
-                else
-                    error "UUID 格式不正确，请重新输入。"
-                fi
-            fi
-        done
-
-        # 2. 生成抗量子对称矩阵对
-        info "正在实时构建后量子加解密通信矩阵..."
-        local encryption_info
-        encryption_info=$(generate_vless_encryption_config)
-        
-        local decryption=$(echo "$encryption_info" | cut -d'|' -f1)
-        local encryption=$(echo "$encryption_info" | cut -d'|' -f2)
-        
-        # 锁存客户端密钥快照
-        echo "$encryption" > "$X_STATE"
-        
-        write_config "$port" "$uuid" "$decryption"
-        
-        # 写入 OpenRC 服务脚本
-        cat << EOF > "$INIT_FILE"
-#!/sbin/openrc-run
-command="${X_BIN}"
-command_args="run -c ${X_CONFIG}"
-command_background="yes"
-pidfile="/run/${SERV_NAME}.pid"
-output_log="$X_LOG"
-error_log="$X_LOG"
+[Install]
+WantedBy=multi-user.target
 EOF
-        chmod +x "$INIT_FILE"
-        touch "$X_LOG"
-        rc-update add "$SERV_NAME" default >/dev/null 2>&1
-    fi
-
-    rc-service "$SERV_NAME" restart
-    
-    # 读取配置生成分享链接
-    local ip=$(get_public_ip || echo "127.0.0.1")
-    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
-    local port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
-    local encryption=$(cat "$X_STATE")
-    
-    local host_addr=$ip
-    if [[ $ip == *":"* ]]; then host_addr="[$ip]"; fi
-    
-    local link="vless://$uuid@$host_addr:$port?encryption=$encryption&security=none&type=tcp#$HOSTNAME-${SERV_NAME}"
-    
-    mkdir -p "$X_LINK_DIR"
-    echo "$link" > "$X_LINK"
-
-    show_current_config
+  run_as_root install -m 0644 "$tmp" "$SERVICE_FILE"
+  rm -f "$tmp"
+  run_as_root systemctl daemon-reload
+  run_as_root systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
 }
 
-# ================== 显示配置 ==================
-show_current_config() {
-    if [[ ! -f "$X_CONFIG" ]]; then
-        error "配置文件不存在"
-        return
-    fi
-
-    local ip uuid port outbound_mode
-    ip=$(get_public_ip || echo "未知")
-    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG" 2>/dev/null || echo "未知")
-    port=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "未知")
-    
-    local current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$X_CONFIG" 2>/dev/null || echo "freedom")
-    [[ "$current_protocol" == "socks" ]] && outbound_mode="Socks5 链式代理" || outbound_mode="直连 (Freedom)"
-
-    echo -e "\n${GREEN}====== 当前配置详情 ======${RESET}"
-    echo -e "${YELLOW}传输协议    : VLESS-Encryption ${RESET}"
-    echo -e "${YELLOW}底层加密算法: native + 0-RTT + ML-KEM-768${RESET}"
-    echo -e "${YELLOW}安全传输    : security=none ${RESET}"
-    echo -e "${YELLOW}IP地址      : ${ip}${RESET}"
-    echo -e "${YELLOW}端口        : ${port}${RESET}"
-    echo -e "${YELLOW}UUID        : ${uuid}${RESET}"
-    echo -e "${YELLOW}出口模式    : ${outbound_mode}${RESET}"
-    echo -e "${YELLOW}分享存放路径: ${X_LINK}${RESET}"
-    
-    if [[ -f "$X_LINK" ]]; then
-        echo -e "${GREEN}====== 👉 v2rayN 分享链接 ======${RESET}"
-        cat "$X_LINK"
-    fi
+ensure_systemd_service() {
+  [ "$(pick_service_manager)" = "systemd" ] || return 0
+  create_systemd_service
 }
 
-# ================== 菜单 ==================
-show_menu() {
-    clear
-    local status=$(get_xray_status)
-    local version=$(get_xray_version)
-    local port_show="-"
-    [[ -f "$X_CONFIG" ]] && port_show=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "-")
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   Xray VLESS-Encryption 面板    ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $status"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 Xray VLESS-Encryption${RESET}"
-    echo -e "${GREEN} 2. 更新 Xray${RESET}"
-    echo -e "${GREEN} 3. 卸载 Xray${RESET}"
-    echo -e "${GREEN} 4. 修改配置${RESET}"
-    echo -e "${GREEN} 5. 启动 Xray${RESET}"
-    echo -e "${GREEN} 6. 停止 Xray${RESET}"
-    echo -e "${GREEN} 7. 重启 Xray${RESET}"
-    echo -e "${GREEN} 8. 查看日志${RESET}"
-    echo -e "${GREEN} 9. 查看节点配置${RESET}"
-    echo -e "${GREEN}10. 配置Socks5出口${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+get_installed_version() {
+  if [ ! -x "$BIN_PATH" ]; then
+    echo "-"
+    return
+  fi
+  "$BIN_PATH" version 2>/dev/null | head -n1 | awk -F': ' '{print $2}'
 }
 
-while true; do
-    show_menu
-    echo -ne "${GREEN}请输入选项: ${RESET}"; read choice
-    case $choice in
-        1|2) install_xray; pause ;;
-        3) 
-            rc-service "$SERV_NAME" stop 2>/dev/null || true
-            rc-update del "$SERV_NAME" default 2>/dev/null || true
-            rm -rf "$X_DIR" "$X_BIN" "$INIT_FILE" "$X_LINK" "$X_LOG"
-            info "卸载完成"
-            pause 
-            ;;
-        4) modify_config; pause ;;
-        5) rc-service "$SERV_NAME" start; pause ;;
-        6) rc-service "$SERV_NAME" stop; pause ;;
-        7) rc-service "$SERV_NAME" restart; pause ;;
-        8) [[ -f "$X_LOG" ]] && tail -f "$X_LOG" || error "暂无日志"; pause ;;
-        9) show_current_config || error "无配置"; pause ;;
-        10) configure_custom_socks5_outbound; pause ;;
-        0) exit 0 ;;
-        *) error "无效选项"; sleep 1 ;;
+config_exists() {
+  [ -s "$CONFIG_PATH" ]
+}
+
+auto_register() {
+  [ -x "$BIN_PATH" ] || die "usque 未安装，请先安装"
+
+  if config_exists; then
+    info "检测到已存在配置，跳过自动注册"
+    return 0
+  fi
+
+  run_as_root mkdir -p "$CONFIG_DIR"
+
+  local args
+  args="-c $CONFIG_PATH register -a"
+
+  if [ -n "$AUTO_REGISTER_NAME" ]; then
+    args="$args -n '$AUTO_REGISTER_NAME'"
+  fi
+  if [ -n "$AUTO_REGISTER_LOCALE" ]; then
+    args="$args -l '$AUTO_REGISTER_LOCALE'"
+  fi
+  if [ -n "$AUTO_REGISTER_MODEL" ]; then
+    args="$args -m '$AUTO_REGISTER_MODEL'"
+  fi
+  if [ -n "$AUTO_REGISTER_JWT" ]; then
+    args="$args --jwt '$AUTO_REGISTER_JWT'"
+  fi
+
+  info "开始自动注册..."
+  run_as_root /bin/sh -c "exec '$BIN_PATH' $args"
+
+  config_exists || die "自动注册失败，未生成配置文件"
+  info "自动注册完成: $CONFIG_PATH"
+}
+
+prompt_install_options() {
+  local current_runtime current_mode current_bind current_port input
+  current_runtime="$(load_runtime_env)"
+  current_mode="${current_runtime%%|*}"
+  current_bind="$(printf '%s' "$current_runtime" | cut -d'|' -f2)"
+  current_port="$(printf '%s' "$current_runtime" | cut -d'|' -f3)"
+
+  printf '模式 [socks/http-proxy] (默认 %s): ' "$current_mode"
+  read -r input
+  if [ -n "$input" ]; then
+    case "$input" in
+      socks|http-proxy) current_mode="$input" ;;
+      *) die "模式只支持 socks 或 http-proxy" ;;
     esac
-done
+  fi
+
+  printf '监听地址 (默认 %s): ' "$current_bind"
+  read -r input
+  if [ -n "$input" ]; then
+    current_bind="$input"
+  fi
+
+  printf '端口 (默认 %s): ' "$current_port"
+  read -r input
+  if [ -n "$input" ]; then
+    require_valid_port "$input"
+    current_port="$input"
+  fi
+
+  printf '设备名（可留空）: '
+  read -r input
+  AUTO_REGISTER_NAME="$input"
+
+  printf 'ZeroTrust JWT（可留空）: '
+  read -r input
+  AUTO_REGISTER_JWT="$input"
+
+  if port_in_use "$current_port"; then
+    warn "检测到端口 $current_port 可能已被占用，启动前请确认"
+  fi
+
+  write_runtime_env "$current_mode" "$current_bind" "$current_port"
+}
+
+install_register_start() {
+  prompt_install_options
+  update_usque
+
+  if [ "$(pick_service_manager)" = "systemd" ] && [ -f "$SERVICE_FILE" ]; then
+    start_service
+    info "安装完成"
+  else
+    warn "当前系统未使用 systemd，已完成部署和注册，请手动启动"
+  fi
+}
+
+show_status() {
+  local runtime mode bind port installed svc status_line version
+  runtime="$(load_runtime_env)"
+  mode="${runtime%%|*}"
+  bind="$(printf '%s' "$runtime" | cut -d'|' -f2)"
+  port="$(printf '%s' "$runtime" | cut -d'|' -f3)"
+  
+  installed="未安装"
+  version="-"
+  if [ -x "$BIN_PATH" ]; then
+    installed="已安装"
+    version="$(get_installed_version)"
+    version="${version:--}"
+  fi
+  
+  svc="$(pick_service_manager)"
+  status_line="未运行"
+  if [ "$svc" = "systemd" ] && [ -f "$SERVICE_FILE" ]; then
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+      status_line="运行中"
+    fi
+  else
+    status_line="未安装"
+  fi
+
+  echo -e "${GREEN}================================${RESET}"
+  echo -e "${GREEN}         usque 管理面板          ${RESET}"
+  echo -e "${GREEN}================================${RESET}"
+  echo -e "${GREEN}状态   :${RESET} ${YELLOW}$status_line${RESET}"
+  echo -e "${GREEN}版本   :${RESET} ${YELLOW}$version${RESET}"
+  echo -e "${GREEN}模式   :${RESET} ${YELLOW}$mode${RESET}"
+  echo -e "${GREEN}监听   :${RESET} ${YELLOW}${bind}:${port}${RESET}"
+  echo -e "${GREEN}================================${RESET}"
+  echo -e "${GREEN} 1. 安装 usque${RESET}"
+  echo -e "${GREEN} 2. 更新 usque${RESET}"
+  echo -e "${GREEN} 3. 卸载 usque${RESET}"
+  echo -e "${GREEN} 4. 更换端口${RESET}"
+  echo -e "${GREEN} 5. 启动 usque${RESET}"
+  echo -e "${GREEN} 6. 停止 usque${RESET}"
+  echo -e "${GREEN} 7. 重启 usque${RESET}"
+  echo -e "${GREEN} 8. 查看服务日志${RESET}"
+  echo -e "${GREEN} 0. 退出${RESET}"
+  echo -e "${GREEN}================================${RESET}"
+}
+
+update_usque() {
+  local os arch version runtime mode bind port
+  need_cmd uname
+  need_cmd curl
+  need_cmd python3
+  if ! command -v unzip >/dev/null 2>&1; then
+    info "检测到未安装 unzip，尝试自动安装依赖"
+    install_packages
+  fi
+  need_cmd unzip
+
+  # 优先尝试用 Python 解析，如果失败则自动回退到用 grep/sed 盲切（从而彻底免除对 Python3 的强依赖）
+  if command -v python3 >/dev/null 2>&1; then
+    tag="$(echo "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name",""))')"
+  else
+    tag="$(echo "$json" | grep -o '"tag_name": *"[^"]*"' | sed 's/"tag_name": *//"/' | sed 's/"//g')"
+  fi
+
+  os="$(detect_os)"
+  arch="$(detect_arch)"
+  version="$(fetch_latest_release)"
+  info "系统: $os"
+  info "架构: $arch"
+  info "最新版本: $version"
+
+  download_and_install_binary "$version" "$os" "$arch"
+  run_as_root mkdir -p "$CONFIG_DIR"
+
+  runtime="$(load_runtime_env)"
+  mode="${runtime%%|*}"
+  bind="$(printf '%s' "$runtime" | cut -d'|' -f2)"
+  port="$(printf '%s' "$runtime" | cut -d'|' -f3)"
+  write_runtime_env "$mode" "$bind" "$port"
+
+  if [ "$os" = "linux" ] && [ "$(pick_service_manager)" = "systemd" ]; then
+    ensure_systemd_service
+    info "已创建 systemd 服务"
+  else
+    warn "当前系统未创建 systemd 服务"
+  fi
+
+  "$BIN_PATH" version || true
+  auto_register
+  log
+  log "安装完成"
+  log "手动启动: $BIN_PATH -c $CONFIG_PATH $mode --bind $bind --port $port"
+}
+
+uninstall_usque() {
+  if [ "$(pick_service_manager)" = "systemd" ] && [ -f "$SERVICE_FILE" ]; then
+    run_as_root systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+    run_as_root systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    run_as_root rm -f "$SERVICE_FILE"
+    run_as_root systemctl daemon-reload
+  fi
+
+  run_as_root rm -f "$BIN_PATH"
+  run_as_root rm -f "$STATE_FILE"
+  if [ -d "$CONFIG_DIR" ]; then
+    run_as_root rm -rf "$CONFIG_DIR"
+  fi
+  log "卸载完成"
+}
+
+change_port() {
+  local runtime mode bind old_port new_port
+  runtime="$(load_runtime_env)"
+  mode="${runtime%%|*}"
+  bind="$(printf '%s' "$runtime" | cut -d'|' -f2)"
+  old_port="$(printf '%s' "$runtime" | cut -d'|' -f3)"
+
+  printf '当前端口 %s，输入新端口: ' "$old_port"
+  read -r new_port
+  require_valid_port "$new_port"
+
+  if [ "$new_port" != "$old_port" ] && port_in_use "$new_port"; then
+    die "端口 $new_port 已被占用"
+  fi
+
+  write_runtime_env "$mode" "$bind" "$new_port"
+  info "端口已更新为 $new_port"
+
+  if [ "$(pick_service_manager)" = "systemd" ] && [ -f "$SERVICE_FILE" ]; then
+    run_as_root systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
+    info "已尝试重启服务"
+  fi
+}
+
+start_service() {
+  [ "$(pick_service_manager)" = "systemd" ] || die "当前系统不支持 systemd 服务管理"
+  [ -f "$SERVICE_FILE" ] || die "服务文件不存在，请先安装"
+  run_as_root systemctl start "$SERVICE_NAME"
+  info "服务已启动"
+}
+
+stop_service() {
+  [ "$(pick_service_manager)" = "systemd" ] || die "当前系统不支持 systemd 服务管理"
+  [ -f "$SERVICE_FILE" ] || die "服务文件不存在"
+  run_as_root systemctl stop "$SERVICE_NAME"
+  info "服务已停止"
+}
+
+restart_service() {
+  [ "$(pick_service_manager)" = "systemd" ] || die "当前系统不支持 systemd 服务管理"
+  [ -f "$SERVICE_FILE" ] || die "服务文件不存在"
+  run_as_root systemctl restart "$SERVICE_NAME"
+  info "服务已重启"
+}
+
+service_status() {
+  [ "$(pick_service_manager)" = "systemd" ] || die "当前系统不支持 systemd 服务管理"
+  [ -f "$SERVICE_FILE" ] || die "服务文件不存在"
+  run_as_root systemctl status "$SERVICE_NAME" --no-pager
+}
+
+pause() {
+  printf "\n${GREEN}按回车继续...${RESET}"
+  read -r _
+}
+
+menu_loop() {
+  local choice
+  while true; do
+    clear || true
+    show_status
+    
+    printf "${GREEN}请选择: ${RESET}"
+    read -r choice
+    case "$choice" in
+      1) install_register_start ;;
+      2) update_usque ;;
+      3) uninstall_usque ;;
+      4) change_port ;;
+      5) start_service ;;
+      6) stop_service ;;
+      7) restart_service ;;
+      8) service_status ;;
+      0) exit 0 ;;
+      *) warn "无效选项" ;;
+    esac
+    pause
+  done
+}
+
+menu_loop "$@"

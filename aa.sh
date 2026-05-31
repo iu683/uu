@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# VaultFleet 一键管理脚本
+# Kulin Dashboard 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="vaultfleet"
+APP_NAME="kulin-dashboard"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -39,7 +39,7 @@ menu() {
 
         clear
 
-        echo -e "${GREEN}=== VaultFleet 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Kulin Dashboard 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -75,25 +75,25 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:8080]: " input_port
-    PORT=${input_port:-8080}
+    read -p "请输入访问端口 [默认:8008]: " input_port
+    PORT=${input_port:-8008}
 
     check_port "$PORT" || return
 
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  vaultfleet:
-    image: ghcr.io/momo-z/vaultfleet:latest
+  dashboard:
+    image: ghcr.io/shuijiao1/kulin-dashboard:latest
 
-    container_name: vaultfleet
+    container_name: kulin-dashboard
 
     restart: unless-stopped
 
     ports:
-      - "127.0.0.1:${PORT}:8080"
+      - "127.0.0.1:${PORT}:8008"
 
     volumes:
-      - ./data:/data
+      - ./data:/dashboard/data
 
     logging:
       driver: "json-file"
@@ -107,8 +107,9 @@ EOF
     docker compose up -d
 
     echo
-    echo -e "${GREEN}✅ VaultFleet 已启动${RESET}"
+    echo -e "${GREEN}✅ Kulin Dashboard 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${YELLOW}🌐 账号/密码: admin/admin${RESET}"
     echo -e "${YELLOW}📂 数据目录: $APP_DIR/data${RESET}"
 
     read -p "按回车返回菜单..."
@@ -128,7 +129,7 @@ update_app() {
 
 restart_app() {
 
-    docker restart vaultfleet
+    docker restart kulin-dashboard
 
     echo -e "${GREEN}✅ 已重启${RESET}"
 
@@ -137,12 +138,12 @@ restart_app() {
 
 view_logs() {
 
-    docker logs -f vaultfleet
+    docker logs -f kulin-dashboard
 }
 
 check_status() {
 
-    docker ps | grep vaultfleet
+    docker ps | grep kulin-dashboard
 
     read -p "按回车返回菜单..."
 }

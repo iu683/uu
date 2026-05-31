@@ -1,321 +1,567 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-RESET="\033[0m"
+REPO="Diniboy1123/usque"
+BIN_NAME="usque"
+INSTALL_DIR="/usr/local/bin"
+BIN_PATH="$INSTALL_DIR/$BIN_NAME"
+CONFIG_DIR="/etc/usque"
+CONFIG_PATH="$CONFIG_DIR/config.json"
+SERVICE_NAME="usque"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+STATE_FILE="/etc/usque/runtime.env"
+DEFAULT_MODE="socks"
+DEFAULT_BIND="127.0.0.1"
+DEFAULT_PORT="1080"
+AUTO_REGISTER_NAME=""
+AUTO_REGISTER_LOCALE="en_US"
+AUTO_REGISTER_MODEL="PC"
+AUTO_REGISTER_JWT=""
 
-PORT_FILE="/etc/warp-port.conf"
-
-info(){ echo -e "${GREEN}[信息] $1${RESET}"; }
-warn(){ echo -e "${YELLOW}[警告] $1${RESET}"; }
-error(){ echo -e "${RED}[错误] $1${RESET}"; }
-
-pause(){ read -rp "按回车继续..." _; }
-
-# =============================
-# 环境检测
-# =============================
-check_systemd() {
-    if [[ "$(ps -p 1 -o comm=)" != "systemd" ]]; then
-        error "当前环境不支持 systemd（Docker/LXC/OpenVZ）"
-        error "无法使用官方 WARP 客户端"
-        return 1
-    fi
+log() {
+  printf '%s\n' "$*"
 }
 
-# =============================
-# warp-svc 保证运行
-# =============================
-ensure_warp_service() {
-    if ! systemctl is-active --quiet warp-svc; then
-        warn "warp-svc 未运行，尝试启动..."
-        systemctl daemon-reexec
-        systemctl daemon-reload
-        systemctl enable warp-svc >/dev/null 2>&1 || true
-        systemctl restart warp-svc
-        sleep 2
-    fi
-
-    if ! systemctl is-active --quiet warp-svc; then
-        error "warp-svc 启动失败"
-        journalctl -u warp-svc -n 20 --no-pager
-        return 1
-    fi
+info() {
+  printf '[*] %s\n' "$*"
 }
 
-check_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] && (( $1 > 0 && $1 < 65536 ))
+warn() {
+  printf '[!] %s\n' "$*" >&2
 }
 
-is_port_used() {
-    ss -lnt | awk '{print $4}' | grep -q ":$1$"
+die() {
+  printf '[x] %s\n' "$*" >&2
+  exit 1
 }
 
-is_installed() {
-    command -v warp-cli >/dev/null 2>&1
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "缺少依赖命令: $1"
 }
 
-# =============================
-# 随机端口
-# =============================
-random_port() {
-    while true; do
-        port=$(shuf -i 10000-60000 -n 1)
-        if ! is_port_used "$port"; then
-            echo "$port"
-            return
-        fi
-    done
+run_as_root() {
+  if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    die "需要 root 权限执行: $*"
+  fi
 }
 
-get_port_input() {
-    read -rp "请输入 Socks5 端口 (回车随机): " port
+detect_os() {
+  local os
+  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  case "$os" in
+    linux) echo "linux" ;;
+    darwin) echo "darwin" ;;
+    *) die "暂不支持的系统: $os" ;;
+  esac
+}
 
-    if [[ -z "$port" ]]; then
-        port=$(random_port)
-        info "使用随机端口: $port" >&2
+detect_arch() {
+  local arch
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l|armv7) echo "armv7" ;;
+    armv6l|armv6) echo "armv6" ;;
+    armv5tel|armv5|arm) echo "armv5" ;;
+    mips) echo "mips" ;;
+    mips64) echo "mips64" ;;
+    mips64el|mips64le) echo "mips64le" ;;
+    mipsel|mipsle) echo "mipsle" ;;
+    *) die "暂不支持的架构: $arch" ;;
+  esac
+}
+
+pick_service_manager() {
+  if command -v systemctl >/dev/null 2>&1; then
+    echo "systemd"
+  else
+    echo "none"
+  fi
+}
+
+install_packages() {
+  if command -v apt-get >/dev/null 2>&1; then
+    run_as_root apt-get update
+    run_as_root apt-get install -y curl unzip ca-certificates
+  elif command -v dnf >/dev/null 2>&1; then
+    run_as_root dnf install -y curl unzip ca-certificates
+  elif command -v yum >/dev/null 2>&1; then
+    run_as_root yum install -y curl unzip ca-certificates
+  elif command -v apk >/dev/null 2>&1; then
+    run_as_root apk add --no-cache curl unzip ca-certificates
+  elif command -v pacman >/dev/null 2>&1; then
+    run_as_root pacman -Sy --noconfirm curl unzip ca-certificates
+  elif command -v zypper >/dev/null 2>&1; then
+    run_as_root zypper --non-interactive install curl unzip ca-certificates
+  else
+    die "无法自动安装依赖，请手动安装: curl unzip ca-certificates"
+  fi
+}
+
+fetch_latest_release() {
+  local api tag
+  api="https://api.github.com/repos/$REPO/releases/latest"
+  tag="$(curl -fsSL "$api" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
+  [ -n "$tag" ] || die "获取最新版本失败"
+  echo "$tag"
+}
+
+build_asset_name() {
+  local version os arch
+  version="$1"
+  os="$2"
+  arch="$3"
+  version="${version#v}"
+  echo "usque_${version}_${os}_${arch}.zip"
+}
+
+write_runtime_env() {
+  local mode bind port tmp
+  mode="$1"
+  bind="$2"
+  port="$3"
+  run_as_root mkdir -p "$CONFIG_DIR"
+  tmp="$(mktemp)"
+  cat > "$tmp" <<EOF
+USQUE_MODE="$mode"
+USQUE_BIND="$bind"
+USQUE_PORT="$port"
+EOF
+  run_as_root install -m 0644 "$tmp" "$STATE_FILE"
+  rm -f "$tmp"
+}
+
+load_runtime_env() {
+  local mode bind port
+  mode="$DEFAULT_MODE"
+  bind="$DEFAULT_BIND"
+  port="$DEFAULT_PORT"
+  if [ -f "$STATE_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$STATE_FILE"
+    mode="${USQUE_MODE:-$mode}"
+    bind="${USQUE_BIND:-$bind}"
+    port="${USQUE_PORT:-$port}"
+  fi
+  printf '%s|%s|%s\n' "$mode" "$bind" "$port"
+}
+
+require_valid_port() {
+  local port
+  port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] || die "端口必须是数字"
+  [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "端口必须在 1-65535 之间"
+}
+
+port_in_use() {
+  local port
+  port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -lnt | awk '{print $4}' | grep -Eq "[:.]${port}$"
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$"
+  else
+    return 1
+  fi
+}
+
+download_and_install_binary() {
+  local version os arch asset url tmpdir checksum_file actual expected
+  version="$1"
+  os="$2"
+  arch="$3"
+  asset="$(build_asset_name "$version" "$os" "$arch")"
+  url="https://github.com/$REPO/releases/download/$version/$asset"
+  tmpdir="$(mktemp -d)"
+
+  info "下载 $asset"
+  curl -fL "$url" -o "$tmpdir/$asset" || {
+    rm -rf "$tmpdir"
+    die "下载失败: $url"
+  }
+
+  checksum_file="$tmpdir/checksums.txt"
+  if curl -fsSL "https://github.com/$REPO/releases/download/$version/checksums.txt" -o "$checksum_file"; then
+    expected="$(grep "  $asset$" "$checksum_file" | awk '{print $1}')"
+    if [ -n "$expected" ] && command -v sha256sum >/dev/null 2>&1; then
+      actual="$(sha256sum "$tmpdir/$asset" | awk '{print $1}')"
+      [ "$actual" = "$expected" ] || {
+        rm -rf "$tmpdir"
+        die "校验失败: $asset"
+      }
+      info "SHA256 校验通过"
     else
-        if ! check_port "$port"; then
-            error "端口无效" >&2
-            return 1
-        fi
-
-        if is_port_used "$port"; then
-            error "端口已被占用" >&2
-            return 1
-        fi
-
-        info "使用自定义端口: $port" >&2
+      warn "跳过 SHA256 校验（未找到匹配校验值或 sha256sum）"
     fi
+  else
+    warn "未获取到 checksums.txt，跳过校验"
+  fi
 
-    echo "$port"
+  unzip -qo "$tmpdir/$asset" -d "$tmpdir/unpack"
+  [ -f "$tmpdir/unpack/$BIN_NAME" ] || {
+    rm -rf "$tmpdir"
+    die "压缩包中未找到 $BIN_NAME"
+  }
+  chmod +x "$tmpdir/unpack/$BIN_NAME"
+  run_as_root mkdir -p "$INSTALL_DIR"
+  run_as_root install -m 0755 "$tmpdir/unpack/$BIN_NAME" "$BIN_PATH"
+  rm -rf "$tmpdir"
+  info "已更新到 $BIN_PATH"
 }
 
-# =============================
-# 安装
-# =============================
-install_warp() {
-    check_systemd || return
-    port=$(get_port_input) || return
+create_systemd_service() {
+  local tmp
+  tmp="$(mktemp)"
+  cat > "$tmp" <<EOF
+[Unit]
+Description=usque Cloudflare WARP MASQUE service
+After=network-online.target
+Wants=network-online.target
 
-    info "安装依赖..."
-    apt update
-    apt install -y gnupg curl lsb-release
+[Service]
+Type=simple
+EnvironmentFile=-$STATE_FILE
+ExecStart=/bin/sh -c 'exec "$BIN_PATH" -c "$CONFIG_PATH" "\${USQUE_MODE:-socks}" --bind "\${USQUE_BIND:-127.0.0.1}" --port "\${USQUE_PORT:-1080}"'
+Restart=always
+RestartSec=5
 
-    info "写入 WARP 源..."
-    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
-    | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-
-    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] \
-https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
-    > /etc/apt/sources.list.d/cloudflare-client.list
-
-    apt update
-    apt install -y cloudflare-warp
-
-    info "启动 WARP 服务..."
-    ensure_warp_service || return
-
-    info "注册账户..."
-    if warp-cli registration show >/dev/null 2>&1; then
-        info "已注册，跳过"
-    else
-        if warp-cli registration new --help 2>&1 | grep -q accept-tos; then
-            warp-cli registration new --accept-tos
-        else
-            warp-cli registration new
-        fi
-    fi
-
-    info "设置 Proxy 模式..."
-    warp-cli mode proxy
-    warp-cli proxy port "$port"
-    echo "$port" > "$PORT_FILE"
-
-    info "设置 MASQUE 协议..."
-    warp-cli tunnel protocol set MASQUE || true
-
-    info "连接 WARP..."
-    warp-cli connect
-
-    sleep 2
-
-    info "完成 ✅"
-    echo -e "${CYAN}socks5://127.0.0.1:$port${RESET}"
+[Install]
+WantedBy=multi-user.target
+EOF
+  run_as_root install -m 0644 "$tmp" "$SERVICE_FILE"
+  rm -f "$tmp"
+  run_as_root systemctl daemon-reload
+  run_as_root systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
 }
 
-# =============================
-# 状态获取 (供面板上方显示使用)
-# =============================
-get_status_info() {
-    if ! is_installed; then
-        panel_status="${RED}未安装${RESET}"
-        panel_version="${RED}未安装${RESET}"
-        panel_port="${RED}未配置${RESET}"
-        return
-    fi
-
-    # 获取端口
-    if [[ -f "$PORT_FILE" ]]; then
-        panel_port=$(cat "$PORT_FILE")
-    else
-        panel_port="未知"
-    fi
-
-    # 获取版本
-    panel_version=$(warp-cli --version 2>/dev/null | awk '{print $2}' || echo "未知")
-
-    # 获取运行状态
-    if ! systemctl is-active --quiet warp-svc; then
-        panel_status="${RED}服务未运行${RESET}"
-    else
-        local raw_status
-        raw_status=$(warp-cli status 2>/dev/null | grep "Status update" | awk -F': ' '{print $2}' || true)
-        case "$raw_status" in
-            Connected) panel_status="${GREEN}已连接 (运行中)${RESET}" ;;
-            Connecting) panel_status="${YELLOW}连接中${RESET}" ;;
-            Disconnected) panel_status="${YELLOW}未连接 (已停止)${RESET}" ;;
-            *) panel_status="${YELLOW}已启动服务${RESET}" ;;
-        esac
-    fi
+ensure_systemd_service() {
+  [ "$(pick_service_manager)" = "systemd" ] || return 0
+  create_systemd_service
 }
 
-# =============================
-# 测试代理 / 查看节点配置
-# =============================
-test_proxy() {
-    if [[ ! -f "$PORT_FILE" ]]; then
-        error "未找到端口"
-        return
-    fi
-
-    port=$(cat "$PORT_FILE")
-    info "当前配置的本地代理: socks5://127.0.0.1:$port"
-    info "正在测试代理可用性..."
-
-    result=$(curl -s --max-time 10 --proxy socks5://127.0.0.1:$port ifconfig.me || true)
-
-    if [[ -n "$result" ]]; then
-        echo -e "${GREEN}测试成功 ✅${RESET} 出口IP: ${CYAN}$result${RESET}"
-    else
-        error "测试失败，代理当前无法通网"
-    fi
+get_installed_version() {
+  if [ ! -x "$BIN_PATH" ]; then
+    echo "-"
+    return
+  fi
+  "$BIN_PATH" version 2>/dev/null | head -n1 | awk -F': ' '{print $2}'
 }
 
-# =============================
-# 修改配置
-# =============================
-change_port() {
-    if ! is_installed; then
-        error "未安装 WARP"
-        return
-    fi
-
-    ensure_warp_service || return
-    port=$(get_port_input) || return
-
-    warp-cli proxy port "$port"
-    echo "$port" > "$PORT_FILE"
-
-    info "端口已修改 ✅ -> $port"
+config_exists() {
+  [ -s "$CONFIG_PATH" ]
 }
 
-# =============================
-# 查看日志
-# =============================
-view_logs() {
-    info "正在查看最近 30 条日志 (按 q 退出)..."
-    journalctl -u warp-svc -n 30 --no-pager
+auto_register() {
+  [ -x "$BIN_PATH" ] || die "usque 未安装，请先安装"
+
+  if config_exists; then
+    info "检测到已存在配置，跳过自动注册"
+    return 0
+  fi
+
+  run_as_root mkdir -p "$CONFIG_DIR"
+
+  local args
+  args="-c $CONFIG_PATH register -a"
+
+  if [ -n "$AUTO_REGISTER_NAME" ]; then
+    args="$args -n '$AUTO_REGISTER_NAME'"
+  fi
+  if [ -n "$AUTO_REGISTER_LOCALE" ]; then
+    args="$args -l '$AUTO_REGISTER_LOCALE'"
+  fi
+  if [ -n "$AUTO_REGISTER_MODEL" ]; then
+    args="$args -m '$AUTO_REGISTER_MODEL'"
+  fi
+  if [ -n "$AUTO_REGISTER_JWT" ]; then
+    args="$args --jwt '$AUTO_REGISTER_JWT'"
+  fi
+
+  info "开始自动注册..."
+  run_as_root /bin/sh -c "exec '$BIN_PATH' $args"
+
+  config_exists || die "自动注册失败，未生成配置文件"
+  info "自动注册完成: $CONFIG_PATH"
 }
 
-# =============================
-# 卸载
-# =============================
-uninstall_warp() {
-    warn "正在卸载 WARP..."
+prompt_install_options() {
+  local current_runtime current_mode current_bind current_port input
+  current_runtime="$(load_runtime_env)"
+  current_mode="${current_runtime%%|*}"
+  current_bind="$(printf '%s' "$current_runtime" | cut -d'|' -f2)"
+  current_port="$(printf '%s' "$current_runtime" | cut -d'|' -f3)"
 
-    warp-cli disconnect 2>/dev/null || true
-    systemctl stop warp-svc 2>/dev/null || true
-    systemctl disable warp-svc 2>/dev/null || true
-
-    apt remove -y cloudflare-warp
-    apt autoremove -y
-
-    rm -f /etc/apt/sources.list.d/cloudflare-client.list
-    rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-    rm -f "$PORT_FILE"
-
-    info "卸载完成 ✅"
-}
-
-# =============================
-# 菜单
-# =============================
-menu() {
-    clear
-    # 每次刷新菜单前动态获取一次状态、版本、端口
-    get_status_info
-
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}         WARP 管理面板          ${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $panel_status"
-    echo -e "${GREEN}版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${panel_port}${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}1. 安装 WARP${RESET}"
-    echo -e "${GREEN}2. 更新 WARP${RESET}"
-    echo -e "${GREEN}3. 卸载 WARP${RESET}"
-    echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 WARP${RESET}"
-    echo -e "${GREEN}6. 停止 WARP${RESET}"
-    echo -e "${GREEN}7. 重启 WARP${RESET}"
-    echo -e "${GREEN}8. 查看日志${RESET}"
-    echo -e "${GREEN}9. 查看节点配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    
-    read -rp $'\033[32m请选择: \033[0m' num
-
-    case $num in
-        1) install_warp ;;
-        2) 
-            info "检查并更新官方客户端..."
-            apt update && apt install --only-upgrade -y cloudflare-warp
-            ;;
-        3) uninstall_warp ;;
-        4) change_port ;;
-        5) 
-            info "启动服务并连接..."
-            systemctl start warp-svc 2>/dev/null || true
-            warp-cli connect 2>/dev/null || true
-            info "命令已下发"
-            ;;
-        6) 
-            info "断开连接并停止服务..."
-            warp-cli disconnect 2>/dev/null || true
-            systemctl stop warp-svc 2>/dev/null || true
-            info "命令已下发"
-            ;;
-        7) 
-            info "重启服务..."
-            systemctl restart warp-svc 2>/dev/null || true
-            sleep 1
-            warp-cli connect 2>/dev/null || true
-            info "重启完成"
-            ;;
-        8) view_logs ;;
-        9) test_proxy ;;
-        0) exit 0 ;;
-        *) warn "无效选项" ;;
+  printf '模式 [socks/http-proxy] (默认 %s): ' "$current_mode"
+  read -r input
+  if [ -n "$input" ]; then
+    case "$input" in
+      socks|http-proxy) current_mode="$input" ;;
+      *) die "模式只支持 socks 或 http-proxy" ;;
     esac
+  fi
 
-    pause
+  printf '监听地址 (默认 %s): ' "$current_bind"
+  read -r input
+  if [ -n "$input" ]; then
+    current_bind="$input"
+  fi
+
+  printf '端口 (默认 %s): ' "$current_port"
+  read -r input
+  if [ -n "$input" ]; then
+    require_valid_port "$input"
+    current_port="$input"
+  fi
+
+  printf '设备名（可留空）: '
+  read -r input
+  AUTO_REGISTER_NAME="$input"
+
+  printf 'ZeroTrust JWT（可留空）: '
+  read -r input
+  AUTO_REGISTER_JWT="$input"
+
+  if port_in_use "$current_port"; then
+    warn "检测到端口 $current_port 可能已被占用，启动前请确认"
+  fi
+
+  write_runtime_env "$current_mode" "$current_bind" "$current_port"
 }
 
-while true; do
-    menu
-done
+install_register_start() {
+  prompt_install_options
+  update_usque
+
+  if [ "$(pick_service_manager)" = "systemd" ] && [ -f "$SERVICE_FILE" ]; then
+    start_service
+    info "部署 + 注册 + 启动 已完成"
+  else
+    warn "当前系统未使用 systemd，已完成部署和注册，请手动启动"
+  fi
+}
+
+show_status() {
+  local runtime mode bind port installed svc status_line version reg_state
+  runtime="$(load_runtime_env)"
+  mode="${runtime%%|*}"
+  bind="$(printf '%s' "$runtime" | cut -d'|' -f2)"
+  port="$(printf '%s' "$runtime" | cut -d'|' -f3)"
+  installed="未安装"
+  version="-"
+  if [ -x "$BIN_PATH" ]; then
+    installed="已安装"
+    version="$(get_installed_version)"
+    version="${version:--}"
+  fi
+  svc="$(pick_service_manager)"
+  status_line="未创建"
+  if [ "$svc" = "systemd" ] && [ -f "$SERVICE_FILE" ]; then
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+      status_line="运行中"
+    else
+      status_line="未运行"
+    fi
+  fi
+  if config_exists; then
+    reg_state="已完成"
+  else
+    reg_state="未完成"
+  fi
+
+  echo "================================"
+  echo " usque 管理脚本"
+  echo "================================"
+  echo "状态   : $installed"
+  echo "模式   : $mode"
+  echo "监听   : $bind:$port"
+  echo "服务   : $status_line"
+  echo "注册   : $reg_state"
+  echo "配置   : $CONFIG_PATH"
+  echo "================================"
+  echo "1. 安装 + 注册 + 启动"
+  echo "2. 更新 usque"
+  echo "3. 卸载 usque"
+  echo "4. 更换端口"
+  echo "5. 启动服务"
+  echo "6. 停止服务"
+  echo "7. 重启服务"
+  echo "8. 查看服务状态"
+  echo "0. 退出"
+  echo "================================"
+}
+
+update_usque() {
+  local os arch version runtime mode bind port
+  need_cmd uname
+  need_cmd curl
+  need_cmd python3
+  if ! command -v unzip >/dev/null 2>&1; then
+    info "检测到未安装 unzip，尝试自动安装依赖"
+    install_packages
+  fi
+  need_cmd unzip
+
+  os="$(detect_os)"
+  arch="$(detect_arch)"
+  version="$(fetch_latest_release)"
+  info "系统: $os"
+  info "架构: $arch"
+  info "最新版本: $version"
+
+  download_and_install_binary "$version" "$os" "$arch"
+  run_as_root mkdir -p "$CONFIG_DIR"
+
+  runtime="$(load_runtime_env)"
+  mode="${runtime%%|*}"
+  bind="$(printf '%s' "$runtime" | cut -d'|' -f2)"
+  port="$(printf '%s' "$runtime" | cut -d'|' -f3)"
+  write_runtime_env "$mode" "$bind" "$port"
+
+  if [ "$os" = "linux" ] && [ "$(pick_service_manager)" = "systemd" ]; then
+    ensure_systemd_service
+    info "已创建 systemd 服务"
+  else
+    warn "当前系统未创建 systemd 服务"
+  fi
+
+  "$BIN_PATH" version || true
+  auto_register
+  log
+  log "安装完成"
+  log "手动启动: $BIN_PATH -c $CONFIG_PATH $mode --bind $bind --port $port"
+}
+
+uninstall_usque() {
+  if [ "$(pick_service_manager)" = "systemd" ] && [ -f "$SERVICE_FILE" ]; then
+    run_as_root systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+    run_as_root systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    run_as_root rm -f "$SERVICE_FILE"
+    run_as_root systemctl daemon-reload
+  fi
+
+  run_as_root rm -f "$BIN_PATH"
+  run_as_root rm -f "$STATE_FILE"
+  if [ -d "$CONFIG_DIR" ]; then
+    run_as_root rm -rf "$CONFIG_DIR"
+  fi
+  log "卸载完成"
+}
+
+change_port() {
+  local runtime mode bind old_port new_port
+  runtime="$(load_runtime_env)"
+  mode="${runtime%%|*}"
+  bind="$(printf '%s' "$runtime" | cut -d'|' -f2)"
+  old_port="$(printf '%s' "$runtime" | cut -d'|' -f3)"
+
+  printf '当前端口 %s，输入新端口: ' "$old_port"
+  read -r new_port
+  require_valid_port "$new_port"
+
+  if [ "$new_port" != "$old_port" ] && port_in_use "$new_port"; then
+    die "端口 $new_port 已被占用"
+  fi
+
+  write_runtime_env "$mode" "$bind" "$new_port"
+  info "端口已更新为 $new_port"
+
+  if [ "$(pick_service_manager)" = "systemd" ] && [ -f "$SERVICE_FILE" ]; then
+    run_as_root systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
+    info "已尝试重启服务"
+  fi
+}
+
+start_service() {
+  [ "$(pick_service_manager)" = "systemd" ] || die "当前系统不支持 systemd 服务管理"
+  [ -f "$SERVICE_FILE" ] || die "服务文件不存在，请先安装"
+  run_as_root systemctl start "$SERVICE_NAME"
+  info "服务已启动"
+}
+
+stop_service() {
+  [ "$(pick_service_manager)" = "systemd" ] || die "当前系统不支持 systemd 服务管理"
+  [ -f "$SERVICE_FILE" ] || die "服务文件不存在"
+  run_as_root systemctl stop "$SERVICE_NAME"
+  info "服务已停止"
+}
+
+restart_service() {
+  [ "$(pick_service_manager)" = "systemd" ] || die "当前系统不支持 systemd 服务管理"
+  [ -f "$SERVICE_FILE" ] || die "服务文件不存在"
+  run_as_root systemctl restart "$SERVICE_NAME"
+  info "服务已重启"
+}
+
+service_status() {
+  [ "$(pick_service_manager)" = "systemd" ] || die "当前系统不支持 systemd 服务管理"
+  [ -f "$SERVICE_FILE" ] || die "服务文件不存在"
+  run_as_root systemctl status "$SERVICE_NAME" --no-pager
+}
+
+pause() {
+  printf '\n按回车继续...'
+  read -r _
+}
+
+menu_loop() {
+  local choice
+  while true; do
+    clear || true
+    show_status
+    printf '请选择: '
+    read -r choice
+    case "$choice" in
+      1) install_register_start ;;
+      2) update_usque ;;
+      3) uninstall_usque ;;
+      4) change_port ;;
+      5) start_service ;;
+      6) stop_service ;;
+      7) restart_service ;;
+      8) service_status ;;
+      0) exit 0 ;;
+      *) warn "无效选项" ;;
+    esac
+    pause
+  done
+}
+
+main() {
+  local action
+  action="${1:-menu}"
+  case "$action" in
+    install-all) install_register_start ;;
+    update) update_usque ;;
+    install) update_usque ;;
+    uninstall) uninstall_usque ;;
+    change-port) change_port ;;
+    start) start_service ;;
+    stop) stop_service ;;
+    restart) restart_service ;;
+    status) service_status ;;
+    menu) menu_loop ;;
+    *)
+      cat <<EOF
+用法:
+  bash usque-manager.sh            # 菜单模式
+  bash usque-manager.sh install-all
+  bash usque-manager.sh update
+  bash usque-manager.sh install      # 兼容别名
+  bash usque-manager.sh uninstall
+  bash usque-manager.sh change-port
+  bash usque-manager.sh start
+  bash usque-manager.sh stop
+  bash usque-manager.sh restart
+  bash usque-manager.sh status
+EOF
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

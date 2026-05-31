@@ -18,20 +18,27 @@ AUTO_REGISTER_LOCALE="en_US"
 AUTO_REGISTER_MODEL="PC"
 AUTO_REGISTER_JWT=""
 
+# ---- 颜色定义 ----
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+RESET='\033[0m' 
+NC='\033[0m'
+
 log() {
   printf '%s\n' "$*"
 }
 
 info() {
-  printf '[*] %s\n' "$*"
+  printf "[${GREEN}*${NC}] %s\n" "$*"
 }
 
 warn() {
-  printf '[!] %s\n' "$*" >&2
+  printf "[${YELLOW}!${NC}] %s\n" "$*" >&2
 }
 
 die() {
-  printf '[x] %s\n' "$*" >&2
+  printf "[${RED}x${NC}] %s\n" "$*" >&2
   exit 1
 }
 
@@ -339,18 +346,19 @@ install_register_start() {
 
   if [ "$(pick_service_manager)" = "systemd" ] && [ -f "$SERVICE_FILE" ]; then
     start_service
-    info "部署 + 注册 + 启动 已完成"
+    info "安装完成"
   else
     warn "当前系统未使用 systemd，已完成部署和注册，请手动启动"
   fi
 }
 
 show_status() {
-  local runtime mode bind port installed svc status_line version reg_state
+  local runtime mode bind port installed svc status_line version
   runtime="$(load_runtime_env)"
   mode="${runtime%%|*}"
   bind="$(printf '%s' "$runtime" | cut -d'|' -f2)"
   port="$(printf '%s' "$runtime" | cut -d'|' -f3)"
+  
   installed="未安装"
   version="-"
   if [ -x "$BIN_PATH" ]; then
@@ -358,41 +366,34 @@ show_status() {
     version="$(get_installed_version)"
     version="${version:--}"
   fi
+  
   svc="$(pick_service_manager)"
-  status_line="未创建"
+  status_line="未运行"
   if [ "$svc" = "systemd" ] && [ -f "$SERVICE_FILE" ]; then
     if systemctl is-active --quiet "$SERVICE_NAME"; then
       status_line="运行中"
-    else
-      status_line="未运行"
     fi
-  fi
-  if config_exists; then
-    reg_state="已完成"
   else
-    reg_state="未完成"
+    status_line="未安装"
   fi
 
-  echo "================================"
-  echo " usque 管理脚本"
-  echo "================================"
-  echo "状态   : $installed"
-  echo "模式   : $mode"
-  echo "监听   : $bind:$port"
-  echo "服务   : $status_line"
-  echo "注册   : $reg_state"
-  echo "配置   : $CONFIG_PATH"
-  echo "================================"
-  echo "1. 安装 + 注册 + 启动"
-  echo "2. 更新 usque"
-  echo "3. 卸载 usque"
-  echo "4. 更换端口"
-  echo "5. 启动服务"
-  echo "6. 停止服务"
-  echo "7. 重启服务"
-  echo "8. 查看服务状态"
-  echo "0. 退出"
-  echo "================================"
+  echo -e "${GREEN}================================${RESET}"
+  echo -e "${GREEN}         usque 管理面板          ${RESET}"
+  echo -e "${GREEN}================================${RESET}"
+  echo -e "${GREEN}状态   :${RESET} ${YELLOW}$status_line${RESET}"
+  echo -e "${GREEN}模式   :${RESET} ${YELLOW}$mode${RESET}"
+  echo -e "${GREEN}端口   :${RESET} ${YELLOW}${bind}:${port}${RESET}"
+  echo -e "${GREEN}================================${RESET}"
+  echo -e "${GREEN} 1. 安装 usque${RESET}"
+  echo -e "${GREEN} 2. 更新 usque${RESET}"
+  echo -e "${GREEN} 3. 卸载 usque${RESET}"
+  echo -e "${GREEN} 4. 更换端口${RESET}"
+  echo -e "${GREEN} 5. 启动 usque${RESET}"
+  echo -e "${GREEN} 6. 停止 usque${RESET}"
+  echo -e "${GREEN} 7. 重启 usque${RESET}"
+  echo -e "${GREEN} 8. 查看服务日志${RESET}"
+  echo -e "${GREEN} 0. 退出${RESET}"
+  echo -e "${GREEN}================================${RESET}"
 }
 
 update_usque() {
@@ -504,7 +505,7 @@ service_status() {
 }
 
 pause() {
-  printf '\n按回车继续...'
+  printf "\n${GREEN}按回车继续...${RESET}"
   read -r _
 }
 
@@ -513,7 +514,8 @@ menu_loop() {
   while true; do
     clear || true
     show_status
-    printf '请选择: '
+    
+    printf "${GREEN}请选择 [${YELLOW}0-11${GREEN}]: ${RESET}"
     read -r choice
     case "$choice" in
       1) install_register_start ;;
@@ -531,37 +533,4 @@ menu_loop() {
   done
 }
 
-main() {
-  local action
-  action="${1:-menu}"
-  case "$action" in
-    install-all) install_register_start ;;
-    update) update_usque ;;
-    install) update_usque ;;
-    uninstall) uninstall_usque ;;
-    change-port) change_port ;;
-    start) start_service ;;
-    stop) stop_service ;;
-    restart) restart_service ;;
-    status) service_status ;;
-    menu) menu_loop ;;
-    *)
-      cat <<EOF
-用法:
-  bash usque-manager.sh            # 菜单模式
-  bash usque-manager.sh install-all
-  bash usque-manager.sh update
-  bash usque-manager.sh install      # 兼容别名
-  bash usque-manager.sh uninstall
-  bash usque-manager.sh change-port
-  bash usque-manager.sh start
-  bash usque-manager.sh stop
-  bash usque-manager.sh restart
-  bash usque-manager.sh status
-EOF
-      exit 1
-      ;;
-  esac
-}
-
-main "$@"
+menu_loop "$@"

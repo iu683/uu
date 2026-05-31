@@ -1,14 +1,30 @@
 #!/usr/bin/env bash
 #
-# Xray (Socks5) 控制面板 
+# Sing-box (NaiveProxy) Alpine 专属管理面板
+# SPDX-License-Identifier: MIT
 #
 # =========================================================
 # 1. 核心控制与全局环境初始化
 # =========================================================
-set -Eeuo pipefail
+set -Eop pipefail
 export LANG=en_US.UTF-8
 
-# ================== 颜色 ==================
+# 基础目录与硬编码配置
+readonly SB_CONFIG="/etc/ap-naiveproxy-sb/config.json"
+readonly SB_BINARY="/usr/local/bin/sing-box"
+readonly SB_DIR="/root/proxynode/naiveproxy"
+EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
+INIT_SERVICE_DIR="/etc/init.d"
+CONFIG_DIR="/etc/ap-naiveproxy-sb"
+REPO_URL="https://github.com/SagerNet/sing-box"
+API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
+CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
+
+# 自动检测环境变量
+OPERATING_SYSTEM="linux"
+ARCHITECTURE="${ARCHITECTURE:-}"
+
+# 终端颜色代码
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
@@ -16,653 +32,570 @@ BLUE="\033[34m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-# ================== 基础变量 ==================
-readonly SERVICE_NAME="xraysocks5"
-readonly XRAY_CONFIG="/usr/local/etc/${SERVICE_NAME}/config.json"
-readonly XRAY_BINARY="/usr/local/bin/${SERVICE_NAME}"
-readonly LINK_FILE="/root/proxynode/socks5/xray_socks5.txt"
-
-# 降级备用版本
-readonly BACKUP_VERSION="26.3.27"
-
-TMP_DIR=$(mktemp -d -t xray_socks.XXXXXX)
-
-# ================== cleanup ==================
-cleanup() {
-    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+# =========================================================
+# 2. Alpine 原生底层工具函数
+# =========================================================
+has_command() {
+  local _command=$1
+  type -P "$_command" > /dev/null 2>&1
 }
 
-trap cleanup EXIT INT TERM
+curl() {
+  command curl "${CURL_FLAGS[@]}" "$@"
+}
 
-# ================== 日志与交互 ==================
+mktemp() {
+  command mktemp -t "sbservinst.XXXXXXXXXX"
+}
+
 info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
 warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
 error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
 pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
 
-# ================== 获取公网IP ==================
-get_public_ip() {
-    local ip
-
-    for cmd in "curl -4fsSL --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null || true)
-            if [[ -n "${ip:-}" ]]; then
-                echo "$ip"
-                return 0
-            fi
-        done
-    done
-
-    for cmd in "curl -6fsSL --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ipv6.ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null || true)
-            if [[ -n "${ip:-}" ]]; then
-                echo "$ip"
-                return 0
-            fi
-        done
-    done
-
+# OpenRC 服务操作封装
+rc_service() {
+  if ! has_command rc-service; then
     return 1
+  fi
+  command rc-service "$@"
 }
 
-# ================== URL 编码函数 (保障TG链接可用性) ==================
-url_encode() {
-    local string="${1}"
-    local strlen="${#string}"
-    local encoded=""
-    local pos c o
-
-    for (( pos=0 ; pos<strlen ; pos++ )); do
-        c=${string:$pos:1}
-        case "$c" in
-            [-_.~a-zA-Z0-9] ) encoded+="$c" ;;
-            * )
-                printf -v o '%%%02X' "'$c"
-                encoded+="$o"
-                ;;
-        esac
-    done
-    echo "${encoded}"
+rc_update() {
+  if ! has_command rc-update; then
+    return 1
+  fi
+  command rc-update "$@"
 }
 
-# ================== 检查端口占用 ==================
-check_port() {
-    local port="$1"
-    if ss -tuln | awk '{print $5}' | grep -qE "[:.]${port}$"; then
-        return 1  # 被占用
-    fi
-    return 0  # 没用占用
-}
+install_content() {
+  local _perms="$1"
+  local _content="$2"
+  local _destination="$3"
+  local _overwrite="$4"
 
-# ================== 验证端口格式 ==================
-is_valid_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]
-}
-
-# ================== 获取可用随机端口 ==================
-get_random_port() {
-    local rand_port
-    while true; do
-        rand_port=$((RANDOM % 55536 + 10000))
-        if check_port "$rand_port"; then
-            echo "$rand_port"
-            return 0
-        fi
-    done
-}
-
-# ================== 生成随机字符串 ==================
-generate_random_string() {
-    local length="$1"
-    if command -v openssl >/dev/null 2>&1; then
-        openssl rand -hex "$((length / 2))"
+  echo -ne "安装 $_destination ... "
+  if [[ -z "$_overwrite" && -e "$_destination" ]]; then
+    echo -e "已存在"
+  else
+    if mkdir -p "$(dirname "$_destination")" && echo "$_content" > "$_destination" && chmod "$_perms" "$_destination"; then
+      echo -e "完成"
     else
-        tr -dc 'a-zA-Z0-9' < /dev/urandom 2>/dev/null | head -c "$length" || echo "admin$(RANDOM)"
+      echo -e "失败"
     fi
+  fi
 }
 
-# ================== 架构检测 ==================
-get_arch() {
-    local arch
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64) echo "64" ;;
-        aarch64|arm64) echo "arm64-v8a" ;;
-        armv7l) echo "arm32-v7a" ;;
-        *) error "暂不支持的系统架构: $arch"; return 1 ;;
-    esac
+remove_file() {
+  local _target="$1"
+  echo -ne "移除 $_target ... "
+  if rm -f "$_target"; then
+    echo -e "完成"
+  fi
 }
 
-# ================== 自动获取最新版本号 ==================
+install_software() {
+  local _package_name="$1"
+  echo "正在通过 apk 安装缺失的依赖 '$_package_name' ... "
+  if apk add --no-cache "$_package_name" >/dev/null 2>&1; then
+    echo "依赖安装成功"
+  else
+    error "无法通过 apk 安装 '$_package_name'，请手动检查 Alpine 源配置。"
+    exit 65
+  fi
+}
+
+check_environment() {
+  if [[ ! -f /etc/alpine-release ]]; then
+    warn "检测到当前系统可能不是 Alpine Linux，但脚本将继续尝试运行..."
+  fi
+
+  case "$(uname -m)" in
+    'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
+    'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
+    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
+  esac
+
+  # 确保 Alpine 环境具备基本依赖与 glibc 兼容层
+  has_command bash || install_software bash
+  has_command curl || install_software curl
+  has_command grep || install_software grep
+  has_command jq || install_software jq
+  has_command tar || install_software tar
+  
+  # 关键修复：Alpine 必须安装 gcompat 才能运行官方 Sing-box 二进制文件
+  if ! apk info -e gcompat >/dev/null 2>&1; then
+    info "检测到缺少 glibc 运行环境，正在安装 gcompat 兼容层..."
+    install_software gcompat
+  fi
+}
+
+get_installed_version() {
+  if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
+    local version_out
+    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null || echo "")
+    if [[ -n "$version_out" ]]; then
+      echo "$version_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' | head -n 1 || echo "未知格式"
+    else
+      echo "未知版本(请尝试安装gcompat)"
+    fi
+  else
+    echo "未安装"
+  fi
+}
+
 get_latest_version() {
-    local latest_version
-    info "正在获取 GitHub 最新 Xray 版本号..."
-    
-    latest_version=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
-        | jq -r '.tag_name' 2>/dev/null || echo "")
-        
-    latest_version="${latest_version#v}"
+  local _tmpfile=$(mktemp)
+  if ! curl -sS -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases" -o "$_tmpfile"; then
+    rm -f "$_tmpfile"
+    echo "v1.12.3"
+    return
+  fi
+  local _tag_name=$(jq -r '[.[] | select(.prerelease==false and .draft==false)][0].tag_name' "$_tmpfile" 2>/dev/null || echo "")
+  rm -f "$_tmpfile"
+  
+  if [[ -n "$_tag_name" ]]; then
+    echo "${_tag_name##*\/}"
+  else
+    echo "v1.12.3"
+  fi
+}
 
-    if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
-        warn "通过 GitHub API 获取最新版本失败，将使用内置备用版本: v${BACKUP_VERSION}"
-        echo "$BACKUP_VERSION"
+download_singbox() {
+  local _version="$1"
+  local _destination="$2"
+  local _ver_num="${_version#v}"
+  
+  local _download_url="$REPO_URL/releases/download/$_version/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE.tar.gz"
+  
+  info "正在下载官方 Sing-box 核心组件: $_download_url ..."
+  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
+    error "核心下载失败！请检查您的网络连接。"
+    return 11
+  fi
+  return 0
+}
+
+# Alpine OpenRC 专属服务脚本底座
+tpl_singbox_server_openrc_base() {
+  cat << 'EOF'
+#!/sbin/openrc-run
+
+description="Sing-box NaiveProxy Service"
+supervisor="supervise-daemon"
+command="/usr/local/bin/sing-box"
+command_args="run -c /etc/ap-naiveproxy-sb/config.json"
+extra_started_commands="reload"
+
+depend() {
+    need net
+    after firewall
+}
+
+reload() {
+    ebegin "Reloading sing-box configuration"
+    supervise-daemon --signal HUP --name sing-box
+    eend $?
+}
+EOF
+}
+
+# =========================================================
+# 3. 面板辅助网络与配置扩展函数
+# =========================================================
+get_sb_status() {
+  if has_command rc-service && rc-service ap-naiveproxy-sb status >/dev/null 2>&1; then
+    echo -e "${GREEN}● 运行中 ${RESET}"
+  else
+    if pgrep -f "$EXECUTABLE_INSTALL_PATH run" >/dev/null 2>&1; then
+      echo -e "${GREEN}● 运行中 ${RESET}"
     else
-        info "成功获取最新版本: v${latest_version}"
-        echo "$latest_version"
+      echo -e "${RED}● 未运行${RESET}"
     fi
+  fi
 }
 
-# ================== 从GitHub下载并解压Xray ==================
-download_and_extract_xray() {
-    local arch version
-    arch=$(get_arch) || return 1
-    version=$(get_latest_version)
-    
-    local download_url="https://github.com/XTLS/Xray-core/releases/download/v${version}/Xray-linux-${arch}.zip"
-    local zip_file="$TMP_DIR/xray.zip"
-    
-    info "正在从 GitHub 下载 Xray v${version} (${arch})..."
-    if ! curl -L -fsSL "$download_url" -o "$zip_file"; then
-        error "从 GitHub 下载 Xray 失败，请检查网络连接。"
-        return 1
-    fi
-    
-    info "正在解压..."
-    mkdir -p "$TMP_DIR/extracted"
-    if ! unzip -qo "$zip_file" -d "$TMP_DIR/extracted"; then
-        error "解压 Xray 压缩包失败，请确保系统已安装 unzip。"
-        return 1
-    fi
-    
-    mkdir -p "$(dirname "$XRAY_BINARY")"
-    rm -f "$XRAY_BINARY"
-    cp -f "$TMP_DIR/extracted/xray" "$XRAY_BINARY"
-    chmod +x "$XRAY_BINARY"
-    
-    mkdir -p "/usr/local/share/${SERVICE_NAME}"
-    cp -f "$TMP_DIR/extracted/geoip.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
-    cp -f "$TMP_DIR/extracted/geosite.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
+get_current_domain_display() {
+  if [[ -f "$SB_CONFIG" ]]; then
+    local domain
+    domain=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || echo "")
+    echo "${domain:- -}"
+  else echo "-"; fi
 }
 
-# ================== 配置 Systemd 服务 ==================
-setup_systemd_service() {
-    info "配置 Systemd 服务 [${SERVICE_NAME}]..."
-    
-    cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
-[Unit]
-Description=Xray Socks5 Server Service
-Documentation=https://github.com/XTLS/Xray-core
-After=network.target nss-lookup.target
+# 完美适配 BusyBox 的随机字符串生成函数
+generate_random_string() {
+  local length=$1
+  cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c "$length" || true
+}
 
-[Service]
-User=root
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ExecStart=${XRAY_BINARY} run -config ${XRAY_CONFIG}
-Restart=on-failure
-RestartPreventExitStatus=23
-LimitNPROC=10000
-LimitNOFILE=1000000
+# =========================================================
+# 4. 面板核心交互与配置文件处理
+# =========================================================
+write_and_show_config() {
+  mkdir -p "$CONFIG_DIR"
 
-[Install]
-WantedBy=multi-user.target
+  cat << EOF > "$SB_CONFIG"
+{
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
+    {
+      "type": "naive",
+      "tag": "naive-in",
+      "listen": "::",
+      "listen_port": ${sb_port},
+      "users": [
+        {
+          "username": "${sb_username}",
+          "password": "${sb_password}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${sb_domain}",
+        "acme": {
+          "domain": ["${sb_domain}"],
+          "email": "${sb_email}"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
 EOF
 
-    systemctl daemon-reload
-    systemctl enable "${SERVICE_NAME}" 2>/dev/null || true
-}
+  mkdir -p "$SB_DIR"
+  
+  local encoded_node_name=$(jq -rn --arg x "$sb_node_name" '$x|@uri')
+  local share_link="naive+https://${sb_username}:${sb_password}@${sb_domain}:${sb_port}#${sb_node_name}"
 
-# ================== 获取服务状态与基础参数 ==================
-get_xray_status() {
-    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
-        echo -e "${GREEN}● 运行中${RESET}"
+  cat << EOF > "$SB_DIR/url.txt"
+V2rayN 配置分享链接:
+${share_link}
+EOF
+
+  cat << EOF > "$SB_DIR/meta.env"
+sb_domain="${sb_domain}"
+sb_email="${sb_email}"
+sb_username="${sb_username}"
+sb_password="${sb_password}"
+sb_node_name="${sb_node_name}"
+sb_port="${sb_port}"
+EOF
+
+  # 托管环境行为控制 (OpenRC 适配)
+  if has_command rc-service && [ -d "$INIT_SERVICE_DIR" ]; then
+    rc_update add sing-box default >/dev/null 2>&1 || true
+    rc_service sing-box restart >/dev/null 2>&1 || true
+    
+    if rc_service sing-box status >/dev/null 2>&1; then
+      info "Sing-box 服务通过 OpenRC 配置并启动成功！"
     else
-        echo -e "${RED}● 未运行${RESET}"
+      error "Sing-box 服务启动失败，请检查 /var/log/messages 查看错误日志。"
     fi
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+    "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
+    info "非 OpenRC 环境，程序已挂载至后台常驻进程模式。"
+  fi
+  showconf
 }
 
-get_xray_version() {
-    if [[ -x "$XRAY_BINARY" ]]; then
-        "$XRAY_BINARY" version 2>/dev/null \
-            | grep -i "Xray" \
-            | head -n 1 \
-            | awk '{print $2}' || echo "未知"
+# =========================================================
+# 5. 主流程控制模块与更新功能
+# =========================================================
+inst_singbox() {
+  check_environment
+  
+  info "🧹 正在释放 80 和 443 端口以防冲突..."
+  if has_command rc-service; then
+    rc_service caddy stop >/dev/null 2>&1 || true
+    rc_service nginx stop >/dev/null 2>&1 || true
+    rc_service sing-box stop >/dev/null 2>&1 || true
+  else
+    pkill -f "caddy" || true
+    pkill -f "nginx" || true
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+  fi
+
+  info "获取官方最新发布版本中..."
+  local latest_version=$(get_latest_version)
+  
+  local _tmpfile_tar=$(mktemp)
+  if ! download_singbox "$latest_version" "$_tmpfile_tar"; then
+    rm -f "$_tmpfile_tar" && return 1
+  fi
+
+  echo -ne "正在解压并安装二进制可执行文件 ... "
+  local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
+  tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
+  
+  local _extracted_binary=$(find "$_tmpdir_extract" -type f -name "sing-box" | head -n 1)
+
+  if [[ -n "$_extracted_binary" ]]; then
+    mkdir -p "$(dirname "$EXECUTABLE_INSTALL_PATH")"
+    if cp "$_extracted_binary" "$EXECUTABLE_INSTALL_PATH" && chmod 755 "$EXECUTABLE_INSTALL_PATH"; then
+      echo "成功"
     else
-        echo "未安装"
+      rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "安装失败" && return 1
     fi
+  else
+    rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "找不到解压核心" && return 1
+  fi
+  rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
+
+  # 写入 Alpine OpenRC 服务脚本
+  install_content "0755" "$(tpl_singbox_server_openrc_base)" "$INIT_SERVICE_DIR/sing-box" "1"
+
+  local rand_user=$(generate_random_string 8)
+  local rand_pass=$(generate_random_string 16)
+  local rand_email="$(generate_random_string 10)@gmail.com"
+  local hostname_str=$(hostname 2>/dev/null || echo "alpine")
+  local default_remark="${hostname_str}-NaiveProxy"
+
+  echo "---------------------------------------------"
+  read -rp "👉 请输入解析好的域名 (例如: naive.example.com): " sb_domain
+  [[ -z "$sb_domain" ]] && error "域名不能为空！" && return 1
+
+  read -rp "👉 请输入你的邮箱 (默认随机: ${rand_email}): " sb_email
+  sb_email=${sb_email:-"$rand_email"}
+
+  read -rp "👉 请设置 NaiveProxy 用户名 (默认随机: ${rand_user}): " sb_username
+  sb_username=${sb_username:-"$rand_user"}
+
+  read -rp "👉 请设置 NaiveProxy 密码 (默认随机: ${rand_pass}): " sb_password
+  sb_password=${sb_password:-"$rand_pass"}
+
+  read -rp "👉 请设置节点备注 (默认: ${default_remark}): " sb_node_name
+  sb_node_name=${sb_node_name:-$default_remark}
+
+  read -rp "👉 请设置监听端口 (默认: 443): " sb_port
+  sb_port=${sb_port:-443}
+
+  write_and_show_config
 }
 
-get_listen_ip() {
-    if sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null | grep -q '= 1'; then
-        echo "0.0.0.0"
-    else
-        echo "::"
-    fi
-}
-
-test_config() {
-    if "$XRAY_BINARY" run -test -config "$XRAY_CONFIG" >/dev/null 2>&1; then
-        info "Configuration OK"
-        return 0
-    fi
-    error "配置测试失败"
+update_singbox() {
+  if [[ ! -f "$SB_BINARY" ]]; then
+    error "当前系统未安装 Sing-box，无法执行更新。"
     return 1
+  fi
+
+  info "正在检查新版本..."
+  local current_version=$(get_installed_version)
+  local latest_version=$(get_latest_version)
+
+  info "当前安装版本: ${YELLOW}${current_version}${RESET}"
+  info "官方最新版本: ${GREEN}${latest_version}${RESET}"
+
+  if [[ "$current_version" == *"$latest_version"* || "$latest_version" == *"$current_version"* ]]; then
+    info "您当前已经是最新版本，无需更新。"
+    return 0
+  fi
+
+  warn "检测到新版本，即将开始平滑更新 (你的节点配置不会改变)..."
+  
+  local _tmpfile_tar=$(mktemp)
+  if ! download_singbox "$latest_version" "$_tmpfile_tar"; then
+    rm -f "$_tmpfile_tar" && return 1
+  fi
+
+  echo -ne "正在覆盖二进制核心文件 ... "
+  local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
+  tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
+  
+  local _extracted_binary=$(find "$_tmpdir_extract" -type f -name "sing-box" | head -n 1)
+  if [[ -n "$_extracted_binary" ]]; then
+    if cp "$_extracted_binary" "$EXECUTABLE_INSTALL_PATH" && chmod 755 "$EXECUTABLE_INSTALL_PATH"; then
+      echo "成功"
+    else
+      rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "覆盖核心失败" && return 1
+    fi
+  else
+    rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "解压错误" && return 1
+  fi
+  rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
+
+  info "正在重启 Sing-box 服务以应用更新..."
+  if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
+    rc_service sing-box restart >/dev/null 2>&1 || true
+    if rc_service sing-box status >/dev/null 2>&1; then
+      info "Sing-box 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
+    else
+      error "核心更新成功，但 OpenRC 重启服务失败。"
+    fi
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+    "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
+    info "Sing-box 核心已更新并于后台重启运行。"
+  fi
 }
 
-restart_xray() {
-    systemctl restart "${SERVICE_NAME}" 2>/dev/null || true
-    sleep 1
+uninstall_singbox() {
+  warn "即将从当前系统中彻底卸载 Sing-box (NaiveProxy)"
 
-    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
-        info "${SERVICE_NAME} 启动成功"
-        return 0
-    fi
+  if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
+    rc_service sing-box stop >/dev/null 2>&1 || true
+    rc_update del sing-box default >/dev/null 2>&1 || true
+    remove_file "$INIT_SERVICE_DIR/sing-box"
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+  fi
 
-    error "${SERVICE_NAME} 启动失败"
-    journalctl -u "${SERVICE_NAME}" -n 20 --no-pager || true
+  remove_file "$EXECUTABLE_INSTALL_PATH"
+  rm -rf /etc/ap-naiveproxy-sb "$SB_DIR"
+
+  info "Sing-box 已彻底从您的系统中移除！"
+}
+
+changeconf() {
+  if [[ ! -f "$SB_CONFIG" ]]; then
+    error "配置文件不存在，请先安装 Sing-box"
     return 1
+  fi
+
+  if [[ -f "$SB_DIR/meta.env" ]]; then
+    source "$SB_DIR/meta.env"
+  else
+    sb_domain=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG")
+    sb_email=$(jq -r '.inbounds[0].tls.acme.email' "$SB_CONFIG")
+    sb_username=$(jq -r '.inbounds[0].users[0].username' "$SB_CONFIG")
+    sb_password=$(jq -r '.inbounds[0].users[0].password' "$SB_CONFIG")
+    sb_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG")
+    sb_node_name="NaiveProxy"
+  fi
+
+  [[ -z "$sb_port" || "$sb_port" == "null" ]] && sb_port=443
+
+  clear
+  echo -e "${GREEN}====== 修改 Sing-box Naive 配置 ======${RESET}"
+  echo "提示：直接敲回车将保持原有配置不变"
+  echo "---------------------------------------------"
+  
+  local input_domain input_email input_user input_pass input_name input_port
+
+  read -rp "👉 请输入解析好的域名 [当前: ${sb_domain}]: " input_domain
+  sb_domain=${input_domain:-$sb_domain}
+
+  read -rp "👉 请输入你的邮箱 [当前: ${sb_email}]: " input_email
+  sb_email=${input_email:-$sb_email}
+
+  read -rp "👉 请设置 NaiveProxy 用户名 [当前: ${sb_username}]: " input_user
+  sb_username=${input_user:-$sb_username}
+
+  read -rp "👉 请设置 NaiveProxy 密码 [当前: ${sb_password}]: " input_pass
+  sb_password=${input_pass:-$sb_password}
+
+  read -rp "👉 请设置节点备注 [当前: ${sb_node_name}]: " input_name
+  sb_node_name=${input_name:-$sb_node_name}
+
+  read -rp "👉 请设置监听端口 [当前: ${sb_port}]: " input_port
+  sb_port=${input_port:-$sb_port}
+
+  write_and_show_config
+  info "配置修改并应用成功！"
 }
 
-# ================== 写底层配置 ==================
-write_config() {
-    local port="$1"
-    local user="$2"
-    local pass="$3"
-    
-    local listen_ip
-    listen_ip=$(get_listen_ip)
-
-    mkdir -p "$(dirname "$XRAY_CONFIG")"
-
-    local settings_json
-    if [[ -n "$user" && -n "$pass" ]]; then
-        settings_json=$(jq -n --arg u "$user" --arg p "$pass" '{"auth": "password", "accounts": [{"user": $u, "pass": $p}], "udp": true}')
-    else
-        settings_json=$(jq -n '{"auth": "noauth", "udp": true}')
-    fi
-
-    jq -n \
-        --arg listen "${listen_ip}" \
-        --argjson port "${port}" \
-        --argjson settings "${settings_json}" \
-    '{
-      "log": {"loglevel": "warning"},
-      "inbounds": [{
-        "listen": $listen,
-        "port": $port,
-        "protocol": "socks",
-        "settings": $settings,
-        "sniffing": {
-          "enabled": true,
-          "destOverride": ["http", "tls", "quic"]
-        }
-      }],
-      "outbounds": [{
-        "protocol": "freedom",
-        "settings": {
-          "domainStrategy": "UseIPv4v6"
-        }
-      }]
-    }' > "$XRAY_CONFIG"
-
-    chmod 644 "$XRAY_CONFIG"
+showconf() {
+  if [[ ! -d "$SB_DIR" || ! -f "$SB_DIR/url.txt" ]]; then
+    error "未找到分享链接配置文件。"
+    return
+  fi
+  echo -e "${GREEN}====== 节点分享链接 ======${RESET}"
+  cat "$SB_DIR/url.txt"
+  echo
 }
 
-# ================== 生成分享链接 (已集成 socks 链接与 tlink) ==================
-generate_link() {
-    mkdir -p "$(dirname "$LINK_FILE")"
-    local ip
-    if ! ip=$(get_public_ip); then
-        error "获取公网 IP 失败"
-        return 1
-    fi
+# =========================================================
+# 6. 面板主菜单
+# =========================================================
+menu() {
+  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
+  check_environment
 
-    local port user pass
-    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "1080")
-    
-    local auth_type
-    auth_type=$(jq -r '.inbounds[0].settings.auth' "$XRAY_CONFIG" 2>/dev/null || echo "noauth")
-
-    if [[ "$auth_type" == "password" ]]; then
-        user=$(jq -r '.inbounds[0].settings.accounts[0].user' "$XRAY_CONFIG" 2>/dev/null || echo "")
-        pass=$(jq -r '.inbounds[0].settings.accounts[0].pass' "$XRAY_CONFIG" 2>/dev/null || echo "")
-    else
-        user=""
-        pass=""
-    fi
-
-    local display_ip="$ip"
-    [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
-
-    # 对 Telegram 链接的组件进行 URL 编码以防有特殊字符
-    local enc_ip enc_user enc_pass
-    enc_ip=$(url_encode "$ip")
-    enc_user=$(url_encode "$user")
-    enc_pass=$(url_encode "$pass")
-
-    {
-        if [[ -n "$user" && -n "$pass" ]]; then
-            echo "socks5://${user}:${pass}@${display_ip}:${port}"
-            echo "socks://${user}:${pass}@${display_ip}:${port}"
-            echo "https://t.me/socks?server=${enc_ip}&port=${port}&user=${enc_user}&pass=${enc_pass}"
-        else
-            echo "socks5://${display_ip}:${port}"
-            echo "socks://${display_ip}:${port}"
-            echo "https://t.me/socks?server=${enc_ip}&port=${port}"
-        fi
-    } > "$LINK_FILE"
-}
-
-# ================== 显示配置 (已美化并整合输出) ==================
-show_current_config() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then
-        error "配置文件不存在"
-        return
-    fi
-
-    local ip port auth_type user pass
-    ip=$(get_public_ip || echo "未知")
-    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
-    auth_type=$(jq -r '.inbounds[0].settings.auth' "$XRAY_CONFIG" 2>/dev/null || echo "noauth")
-
-    echo -e "${GREEN}====== Xray Socks5 服务端配置 ======${RESET}"
-    echo -e "${YELLOW}服务器公网 IP  : ${ip}${RESET}"
-    echo -e "${YELLOW}服务监听端口    : ${port}${RESET}"
-    
-    if [[ "$auth_type" == "password" ]]; then
-        user=$(jq -r '.inbounds[0].settings.accounts[0].user' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
-        pass=$(jq -r '.inbounds[0].settings.accounts[0].pass' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
-        echo -e "${YELLOW}认证方式        : 密码认证 (Password)${RESET}"
-        echo -e "${YELLOW}用户名          : ${user}${RESET}"
-        echo -e "${YELLOW}密码            : ${pass}${RESET}"
-    else
-        echo -e "${YELLOW}认证方式        : 免密认证 (NoAuth)${RESET}"
-    fi
-    echo
-
-    if [[ -f "$LINK_FILE" ]]; then
-        local display_ip="$ip"
-        [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
-
-        local enc_ip enc_user enc_pass
-        enc_ip=$(url_encode "$ip")
-        enc_user=$(url_encode "$user")
-        enc_pass=$(url_encode "$pass")
-
-        echo -e "${GREEN}====== Socks5 配置 (已存至 $LINK_FILE) ======${RESET}"
-        if [[ "$auth_type" == "password" ]]; then
-            echo -e "${YELLOW}● 客户端直连格式 (Socks5):${RESET} socks5://${user}:${pass}@${display_ip}:${port}"
-            echo -e "${YELLOW}● 客户端直连格式 (Socks):${RESET} socks://${user}:${pass}@${display_ip}:${port}"
-            echo -e "${YELLOW}● Telegram 快捷链接:${RESET} https://t.me/socks?server=${enc_ip}&port=${port}&user=${enc_user}&pass=${enc_pass}"
-        else
-            echo -e "${YELLOW}● 客户端直连格式 (Socks5):${RESET} socks5://${display_ip}:${port}"
-            echo -e "${YELLOW}● 客户端直连格式 (Socks):${RESET} socks://${display_ip}:${port}"
-            echo -e "${YELLOW}● Telegram 快捷链接:${RESET} https://t.me/socks?server=${enc_ip}&port=${port}"
-        fi
-    fi
-    echo
-}
-
-# ================== 核心交互配置处理 ==================
-configure_xray() {
-    info "开始配置 Socks5 服务端节点..."
-    local port user pass
-
-    while true; do
-        read -rp "请输入监听端口 (直接回车随机分配端口): " input_port
-        if [[ -z "$input_port" ]]; then
-            port=$(get_random_port)
-            info "已为您随机分配未被占用端口: $port"
-            break
-        elif is_valid_port "$input_port"; then
-            if ! check_port "$input_port"; then
-                error "端口 ${input_port} 已被占用，请重新输入。"
-                continue
-            fi
-            port="$input_port"
-            break
-        else
-            error "端口无效"
-        fi
-    done
-
-    read -rp "请输入 Socks5 用户名 (直接回车自动随机生成): " input_user
-    if [[ -z "$input_user" ]]; then
-        user=$(generate_random_string 8)
-        pass=$(generate_random_string 12)
-        info "已自动生成高强度账号：${user}，密码：${pass}"
-    else
-        user="$input_user"
-        while true; do
-            read -rp "请输入 Socks5 密码 (不能为空): " pass
-            [[ -n "$pass" ]] && break
-            error "密码不能为空，请重新输入。"
-        done
-    fi
-
-    write_config "$port" "$user" "$pass"
-    test_config || return 1
-    generate_link
-    restart_xray
-    show_current_config
-}
-
-# ================== 安装 ==================
-install_xray() {
-    info "开始安装 Xray 核心依赖..."
-    download_and_extract_xray || return 1
-    setup_systemd_service
-    configure_xray
-    info "安装完成并已成功启动服务: ${SERVICE_NAME}"
-}
-
-# ================== 更新 ==================
-update_xray() {
-    info "开始更新 Xray 程序..."
-    
-    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
-        info "检测到服务正在运行，正在停止服务以进行更新..."
-        systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
-    fi
-
-    if ! download_and_extract_xray; then
-        error "下载或安装新版本失败，尝试重新启动原服务..."
-        restart_xray
-        return 1
-    fi
-    
-    if restart_xray; then
-        generate_link
-        info "最新版更新并启动成功！当前版本: $(get_xray_version)"
-    else
-        error "更新后服务启动失败，请查看日志。"
-        return 1
-    fi
-}
-
-# ================== 修改配置 ==================
-modify_config() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then
-        error "配置文件不存在"
-        return 1
-    fi
-
-    local old_port old_auth old_user old_pass
-    old_port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "1080")
-    old_auth=$(jq -r '.inbounds[0].settings.auth' "$XRAY_CONFIG" 2>/dev/null || echo "noauth")
-    
-    if [[ "$old_auth" == "password" ]]; then
-        old_user=$(jq -r '.inbounds[0].settings.accounts[0].user' "$XRAY_CONFIG" 2>/dev/null || echo "")
-        old_pass=$(jq -r '.inbounds[0].settings.accounts[0].pass' "$XRAY_CONFIG" 2>/dev/null || echo "")
-    else
-        old_user=""
-        old_pass=""
-    fi
-
-    local port user pass
-
-    while true; do
-        read -rp "请输入新端口 [当前:${old_port}, 回车不修改]: " input_port
-        if [[ -z "$input_port" ]]; then
-            port="$old_port"
-            break
-        elif [[ "${input_port,,}" == "rand" ]]; then
-            port=$(get_random_port)
-            info "已重分配空闲随机端口: $port"
-            break
-        elif is_valid_port "$input_port"; then
-            if [[ "$input_port" != "$old_port" ]]; then
-                if ! check_port "$input_port"; then
-                    error "端口 ${input_port} 已被占用，请更换。"
-                    continue
-                fi
-            fi
-            port="$input_port"
-            break
-        else
-            error "端口无效，请输入 1-65535 之间的数字。"
-        fi
-    done
-
-    read -rp "请输入新用户名 [当前:${old_user}, 输入 rand 重新生成随机账号密码, 回车不修改]: " input_user
-    if [[ -z "$input_user" ]]; then
-        user="$old_user"
-        pass="$old_pass"
-    elif [[ "${input_user,,}" == "rand" ]]; then
-        user=$(generate_random_string 8)
-        pass=$(generate_random_string 12)
-        info "已重新生成高强度账号：${user}，密码：${pass}"
-    else
-        user="$input_user"
-        read -rp "请输入新密码: " input_pass
-        pass="$input_pass"
-    fi
-
-    cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
-
-    write_config "$port" "$user" "$pass"
-    test_config || return 1
-    generate_link
-    restart_xray
-    info "配置修改成功"
-}
-
-# ================== 卸载 ==================
-uninstall_xray() {
-    warn "即将卸载 ${SERVICE_NAME} 服务..."
-
-    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
-    systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
-    
-    rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
-    systemctl daemon-reload
-    
-    rm -f "$XRAY_BINARY"
-    rm -rf "/usr/local/etc/${SERVICE_NAME}"
-    rm -rf "/usr/local/share/${SERVICE_NAME}"
-    rm -f "$LINK_FILE"
-    
-    info "服务已完全卸载并清理残留。"
-}
-
-# ================== 菜单 ==================
-show_menu() {
+  while true; do
     clear
-    local status version port_show
-    status=$(get_xray_status)
-    version=$(get_xray_version)
-    port_show="-"
-
-    if [[ -f "$XRAY_CONFIG" ]]; then
-        port_show=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "-")
-    fi
+    local status=$(get_sb_status)
+    local version=$(get_installed_version)
+    local domain_show=$(get_current_domain_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        Xray Socks5 面板        ${RESET}"
+    echo -e "${GREEN}    Sing-box NaiveProxy 面板    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $status"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $status"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}域名   :${RESET} ${YELLOW}${domain_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 Xray Socks5${RESET}"
-    echo -e "${GREEN} 2. 更新 Xray Socks5${RESET}"
-    echo -e "${GREEN} 3. 卸载 Xray Socks5${RESET}"
-    echo -e "${GREEN} 4. 修改配置${RESET}"
-    echo -e "${GREEN} 5. 启动 Xray Socks5${RESET}"
-    echo -e "${GREEN} 6. 停止 Xray Socks5${RESET}"
-    echo -e "${GREEN} 7. 重启 Xray Socks5${RESET}"
-    echo -e "${GREEN} 8. 查看日志${RESET}"
-    echo -e "${GREEN} 9. 查看节点配置${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}1. 安装 Sing-box NaiveProxy${RESET}"
+    echo -e "${GREEN}2. 更新 Sing-box NaiveProxy${RESET}"
+    echo -e "${GREEN}3. 卸载 Sing-box NaiveProxy${RESET}"
+    echo -e "${GREEN}4. 修改配置 ${RESET}"
+    echo -e "${GREEN}5. 启动 Sing-box NaiveProxy${RESET}"
+    echo -e "${GREEN}6. 停止 Sing-box NaiveProxy${RESET}"
+    echo -e "${GREEN}7. 重启 Sing-box NaiveProxy${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
-}
 
-# ================== 安装依赖 ==================
-install_dependencies() {
-    if command -v apt &>/dev/null; then
-        apt update && apt install -y jq curl wget sed coreutils unzip iproute2 openssl || true
-    elif command -v dnf &>/dev/null; then
-        dnnf install -y jq curl wget sed coreutils unzip iproute2 openssl
-    elif command -v yum &>/dev/null; then
-        yum install -y jq curl wget sed coreutils unzip iproute2 openssl
-    else
-        error "未知的包管理器，请手动补充环境包: jq, curl, wget, unzip, openssl"
-        exit 1
-    fi
-}
+    local choice=""
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+    [[ -z "$choice" ]] && continue
 
-# ================== 依赖检查 ==================
-pre_check() {
-    if [[ $(id -u) -ne 0 ]]; then
-        error "请使用 root 用户运行"
-        exit 1
-    fi
-
-    local deps=(jq curl wget unzip ss awk sed openssl)
-    local missing=0
-
-    for cmd in "${deps[@]}"; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            missing=1
-            break
+    case "$choice" in
+      1) inst_box=inst_singbox; $inst_box; pause ;;
+      2) update_singbox; pause ;;
+      3) uninstall_singbox; pause ;;
+      4) changeconf; pause ;;
+      5) 
+        if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
+          rc_service sing-box start && info "服务已成功启动！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+          "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
+          info "进程已在后台启动！"
         fi
-    done
-
-    if [[ "$missing" -eq 1 ]]; then
-        info "检测到缺失依赖，正在安装..."
-        install_dependencies
-    fi
+        pause ;;
+      6) 
+        if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
+          rc_service sing-box stop && info "服务已成功停止！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台进程已终止！"
+        fi
+        pause ;;
+      7) 
+        if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
+          rc_service sing-box restart && info "服务已成功重启！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+          "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
+          info "后台进程已重启！"
+        fi
+        pause ;;
+      8) 
+        if [[ -f /var/log/messages ]]; then
+          echo -e "${CYAN}--- 最近 50 行相关系统日志 ---${RESET}"
+          tail -n 50 /var/log/messages | grep -E 'sing-box|supervise-daemon' || tail -n 50 /var/log/messages
+          echo "--------------------------------------"
+          if [[ -f "$EXECUTABLE_INSTALL_PATH" && -f "$SB_CONFIG" ]]; then
+            "$EXECUTABLE_INSTALL_PATH" check -c "$SB_CONFIG" || true
+          fi
+        else
+          warn "未找到系统日志文件 /var/log/messages"
+        fi
+        pause ;;
+      9) showconf; pause ;;
+      0) exit 0 ;;
+      *) error "无效输入，请重新选择。"; sleep 1 ;;
+    esac
+  done
 }
 
-# ================== 主循环 ==================
-main() {
-    pre_check
-
-    while true; do
-        show_menu
-        
-        local choice=""
-        read -r -p $'\033[32m请输入选项: \033[0m' choice || true
-        
-        [[ -z "$choice" ]] && continue
-
-        case "$choice" in
-            1) install_xray; pause ;;
-            2) update_xray; pause ;;
-            3) uninstall_xray; pause ;;
-            4) modify_config; pause ;;
-            5) systemctl start "${SERVICE_NAME}" &>/dev/null || true; restart_xray; pause ;;
-            6) systemctl stop "${SERVICE_NAME}" &>/dev/null || true; info "服务已停止"; pause ;;
-            7) restart_xray; pause ;;
-            8) journalctl -u "${SERVICE_NAME}" -e --no-pager || true; pause ;;
-            9) show_current_config; pause ;;
-            0) exit 0 ;;
-            *) error "无效输入"; pause ;;
-        esac
-    done
-}
-
-main "$@"
+menu "$@"

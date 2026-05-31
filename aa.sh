@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# Xray VLESS-Encryption + Reality 管理脚本 (Alpine Linux 完美版) 
+# Xray VLESS-Encryption + Reality 管理脚本 (魔改后量子核心专属版) 
 # =========================================================
 
 set -Eeuo pipefail
@@ -45,12 +45,19 @@ is_valid_port() {
 }
 
 restart_xray() {
+    pkill -9 -f "$X_BIN" >/dev/null 2>&1 || true
+    rc-service "$SERV_NAME" zap >/dev/null 2>&1 || true
     rc-service "$SERV_NAME" restart >/dev/null 2>&1 || true
-    sleep 1
+    sleep 1.5
     if rc-service "$SERV_NAME" status 2>/dev/null | grep -q "started"; then
         return 0
     else
-        return 1
+        # 兜底 OpenRC 状态不准的情况
+        if pgrep -f "$X_BIN run" >/dev/null 2>&1; then
+            return 0
+        else
+            return 1
+        fi
     fi
 }
 
@@ -76,13 +83,12 @@ get_xray_version() {
 
 get_public_ip() {
     local ip
-    # 增加对 Alpine 默认不带 -4 参数的 wget 兼容适配
     for cmd in "curl -4s --max-time 5" "curl -s --max-time 5" "wget -qO- --timeout=5"; do
         for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
             ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
-    echo "127.0.0.1" # 如果断网，返回默认占位符，防止管道流中断导致 set -e 崩溃
+    echo "127.0.0.1"
 }
 
 generate_vless_encryption_config() {
@@ -293,7 +299,7 @@ modify_config() {
     n_dest=${n_dest:-$curr_dest}
 
     write_config "$n_port" "$n_uuid" "$n_flow" "$curr_decryption" "$n_dest" "$curr_priv_key" "$curr_short_id" "$curr_outbound"
-    rc-service "$SERV_NAME" restart
+    restart_xray
     
     # 重新生成链接
     local ip=$(get_public_ip)
@@ -311,7 +317,6 @@ modify_config() {
 # ================== 安装与管理 ==================
 install_xray() {
     info "正在安装依赖与内核..."
-    # 确保 Alpine 环境补全 openssl 和核心运行库
     apk update && apk add curl unzip jq uuidgen gcompat libc6-compat bc openssl > /dev/null 2>&1
     mkdir -p "$X_DIR" && sync
     
@@ -365,9 +370,34 @@ install_xray() {
         dest=${input_dest:-"www.amazon.com"}
 
         info "正在生成 Reality 密钥对与短ID..."
-        local keypair=$($X_BIN x25519)
-        local priv_key=$(echo "$keypair" | grep "Private key:" | awk '{print $3}')
-        local pub_key=$(echo "$keypair" | grep "Public key:" | awk '{print $3}')
+        
+        # 【全兼容内核提取逻辑】：完美适配你的魔改版魔幻终端回执
+        local keypair priv_key pub_key
+        keypair=$($X_BIN x25519 2>/dev/null || echo "")
+        
+        if [[ -n "$keypair" ]]; then
+            # 兼容带有 "PrivateKey" 或是 "Private key" 的输出形式
+            priv_key=$(echo "$keypair" | grep -i "Private" | cut -d":" -f2 | tr -d "[:space:]")
+            # 兼容带有 "Password (PublicKey)" 或者是 "Public key" 的输出形式
+            pub_key=$(echo "$keypair" | grep -i "Public" | cut -d":" -f2 | tr -d "[:space:]")
+        else
+            priv_key=""
+            pub_key=""
+        fi
+
+        # 【熔断防御 + 自动化降级补救机制】
+        if [[ -z "$priv_key" ]] || [[ -z "$pub_key" ]]; then
+            warn "未能从内核日志提取到标准密钥，开始启动 OpenSSL 引擎进行高可靠硬生成补救..."
+            priv_key=$(openssl genpkey -algorithm X25519 -outform DER 2>/dev/null | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=')
+            pub_key=$(echo "$priv_key" | tr '-_' '+/' | base64 -d | openssl pkey -inform DER -pubout -outform DER 2>/dev/null | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=')
+        fi
+        
+        # 再次确保万无一失
+        if [[ -z "$priv_key" ]]; then
+            error "致命错误: 无法构建高可用传输安全凭证，终止安装。"
+            exit 1
+        fi
+        
         local short_id=$(openssl rand -hex 8)
 
         # 锁存 Reality 密钥快照
@@ -401,7 +431,7 @@ EOF
         rc-update add "$SERV_NAME" default >/dev/null 2>&1
     fi
 
-    rc-service "$SERV_NAME" restart
+    restart_xray
     
     # 读取配置生成分享链接
     local ip=$(get_public_ip)
@@ -541,6 +571,7 @@ while true; do
     case $choice in
         1|2) install_xray; pause ;;
         3) 
+            pkill -9 -f "$X_BIN" >/dev/null 2>&1 || true
             rc-service "$SERV_NAME" stop 2>/dev/null || true
             rc-update del "$SERV_NAME" default 2>/dev/null || true
             rm -rf "$X_DIR" "$X_BIN" "$INIT_FILE" "$X_LINK" "$X_LOG"
@@ -548,9 +579,9 @@ while true; do
             pause 
             ;;
         4) modify_config; pause ;;
-        5) rc-service "$SERV_NAME" start; pause ;;
-        6) rc-service "$SERV_NAME" stop; pause ;;
-        7) rc-service "$SERV_NAME" restart; pause ;;
+        5) restart_xray; pause ;;
+        6) rc-service "$SERV_NAME" stop; pkill -9 -f "$X_BIN" >/dev/null 2>&1 || true; pause ;;
+        7) restart_xray; pause ;;
         8) [[ -f "$X_LOG" ]] && tail -f "$X_LOG" || error "暂无日志"; pause ;;
         9) show_current_config || error "无配置"; pause ;;
         10) configure_custom_socks5_outbound; pause ;;

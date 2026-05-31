@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# Xray VLESS-Encryption + Reality 管理脚本 (魔改后量子核心专属版) 
+# Xray Socks5 管理脚本 (Alpine Linux ) 
 # =========================================================
 
 set -Eeuo pipefail
@@ -14,18 +14,16 @@ BLUE="\033[34m"
 RESET="\033[0m"
 
 # ================== 🚀 服务自定义重命名 ==================
-readonly SERV_NAME="xray-vless-encryptrea"
+readonly SERV_NAME="xray-socks5"
 
 # ================== 📂 自定义分享链接存放路径 ==================
-readonly X_LINK_DIR="/root/proxynode/vlessencryptionReality"
+readonly X_LINK_DIR="/root/proxynode/socks5"
 
 # ================== 路径与日志 (自动联动) ==================
 readonly X_DIR="/etc/${SERV_NAME}"
 readonly X_CONFIG="${X_DIR}/config.json"
 readonly X_BIN="/usr/local/bin/${SERV_NAME}"
-readonly X_LINK="${X_LINK_DIR}/${SERV_NAME}_vless.txt"
-readonly X_STATE="${X_DIR}/encryption_matrix.state"
-readonly X_REALITY_STATE="${X_DIR}/reality.state"
+readonly X_LINK="${X_LINK_DIR}/${SERV_NAME}_socks5.txt"
 readonly X_LOG="/var/log/${SERV_NAME}.log"
 readonly INIT_FILE="/etc/init.d/${SERV_NAME}"
 
@@ -44,31 +42,11 @@ is_valid_port() {
     fi
 }
 
-restart_xray() {
-    pkill -9 -f "$X_BIN" >/dev/null 2>&1 || true
-    rc-service "$SERV_NAME" zap >/dev/null 2>&1 || true
-    rc-service "$SERV_NAME" restart >/dev/null 2>&1 || true
-    sleep 1.5
-    if rc-service "$SERV_NAME" status 2>/dev/null | grep -q "started"; then
-        return 0
-    else
-        if pgrep -f "$X_BIN run" >/dev/null 2>&1; then
-            return 0
-        else
-            return 1
-        fi
-    fi
-}
-
 get_xray_status() {
     if rc-service "$SERV_NAME" status 2>/dev/null | grep -q "started"; then
         echo -e "${GREEN}● 运行中 ${RESET}"
     else 
-        if pgrep -f "$X_BIN run" >/dev/null 2>&1; then
-            echo -e "${GREEN}● 运行中 ${RESET}"
-        else
-            echo -e "${RED}● 未运行 ${RESET}"
-        fi
+        echo -e "${RED}● 未运行 ${RESET}"
     fi
 }
 
@@ -82,255 +60,102 @@ get_xray_version() {
 
 get_public_ip() {
     local ip
-    for cmd in "curl -4s --max-time 5" "curl -s --max-time 5" "wget -qO- --timeout=5"; do
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
         for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
             ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
-    echo "127.0.0.1"
-}
-
-# 🔥 【核心重写】超强流式状态机：完美吞下换行的超长后量子证书
-generate_vless_encryption_config() {
-    local vlessenc_output
-    vlessenc_output=$($X_BIN vlessenc 2>/dev/null || true)
-    if [ -z "$vlessenc_output" ]; then
-        error "调用核心生成 VLESS Encryption 配置失败"
-        return 1
-    fi
-
-    # 使用 awk 精准定位 ML-KEM-768 后量子板块，并抽取多行证书
-    local parsed_tokens
-    parsed_tokens=$(echo "$vlessenc_output" | awk '
-    BEGIN { flag=0; dec=""; enc=""; in_dec=0; in_enc=0; }
-    /Authentication: ML-KEM-768, Post-Quantum/ { flag=1; next; }
-    /Authentication:/ { flag=0; } # 遇到其他的认证则关闭开关
-    
-    flag {
-        # 处理 decryption 提取
-        if ($0 ~ /"decryption":/) {
-            in_dec=1;
-            str = substr($0, index($0, "\"decryption\":"));
-            sub(/^"decryption":[[:space:]]*"/, "", str);
-            dec = dec str;
-            if (dec ~ /"$/) { sub(/"$/, "", dec); in_dec=0; }
-            next;
-        }
-        if (in_dec) {
-            dec = dec $0;
-            if (dec ~ /"$/) { sub(/"$/, "", dec); in_dec=0; }
-            next;
-        }
-        
-        # 处理 encryption 提取
-        if ($0 ~ /"encryption":/) {
-            in_enc=1;
-            str = substr($0, index($0, "\"encryption\":"));
-            sub(/^"encryption":[[:space:]]*"/, "", str);
-            enc = enc str;
-            if (enc ~ /"$/) { sub(/"$/, "", enc); in_enc=0; }
-            next;
-        }
-        if (in_enc) {
-            enc = enc $0;
-            if (enc ~ /"$/) { sub(/"$/, "", enc); in_enc=0; }
-            next;
-        }
-    }
-    END {
-        # 移除可能误读的残留双引号和所有空白字符
-        gsub(/[[:space:]"\r\n]/, "", dec);
-        gsub(/[[:space:]"\r\n]/, "", enc);
-        print dec "|" enc;
-    }')
-
-    local decryption=$(echo "$parsed_tokens" | cut -d'|' -f1)
-    local encryption=$(echo "$parsed_tokens" | cut -d'|' -f2)
-
-    if [ -z "$decryption" ] || [ -z "$encryption" ]; then
-        error "无法解析内嵌的 VLESS Encryption 后量子证书拓扑"
-        return 1
-    fi
-
-    echo "${decryption}|${encryption}"
+    error "无法获取公网 IP 地址。" && return 1
 }
 
 HOSTNAME=$(hostname -s | sed 's/ /_/g')
 
-# ================== 配置写入 (支持 Reality + Encryption) ==================
+# ================== 配置写入 ==================
 write_config() {
-    local port=$1 uuid=$2 flow=$3 decryption=$4 dest=$5 priv_key=$6 short_id=$7
-    local outbound=${8:-'{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}'}
+    local port=$1 user=$2 pass=$3
     mkdir -p "$X_DIR" && chmod 755 "$X_DIR"
     
-    local client_json
-    if [[ -z "$flow" || "$flow" == "none" ]]; then
-        client_json=$(jq -n --arg id "$uuid" '[{"id": $id}]')
-    else
-        client_json=$(jq -n --arg id "$uuid" --arg flow "$flow" '[{"id": $id, "flow": $flow}]')
+    # 构造 accounts 数组
+    local accounts_json="[]"
+    if [[ -n "$user" && -n "$pass" ]]; then
+        accounts_json="[{\"user\": \"$user\", \"pass\": \"$pass\"}]"
     fi
 
-    jq -n \
-        --arg listen "::" \
-        --argjson port "$port" \
-        --argjson clients "$client_json" \
-        --arg decryption "$decryption" \
-        --arg dest "$dest" \
-        --arg priv_key "$priv_key" \
-        --arg json_sid "$short_id" \
-        --argjson outbound "[$outbound]" \
-    '{
-        "log": {"loglevel": "warning"},
-        "inbounds": [{
-            "listen": $listen,
-            "port": $port,
-            "protocol": "vless",
-            "settings": {
-                "clients": $clients,
-                "decryption": $decryption
-            },
-            "streamSettings": {
-                "network": "tcp",
-                "security": "reality",
-                "realitySettings": {
-                    "show": false,
-                    "dest": ($dest + ":4443"),
-                    "serverNames": [$dest],
-                    "privateKey": $priv_key,
-                    "shortIds": [$json_sid]
-                }
-            }
-        }],
-        "outbounds": $outbound
-    }' > "$X_CONFIG"
+    cat > "$X_CONFIG" <<EOF
+{
+    "log": { "loglevel": "warning" },
+    "inbounds": [{
+        "port": $port,
+        "protocol": "socks",
+        "settings": {
+            "auth": "$([[ -n "$user" ]] && echo "password" || echo "noauth")",
+            "accounts": $accounts_json,
+            "udp": true
+        }
+    }],
+    "outbounds": [{
+        "protocol": "freedom",
+        "settings": { "domainStrategy": "UseIPv4v6" }
+    }]
+}
+EOF
 }
 
-# ================== 出口模式配置 ==================
-configure_custom_socks5_outbound() {
-    if [[ ! -f "$X_CONFIG" ]]; then 
-        error "错误: Xray 未安装，无法配置出口模式。"
-        return
-    fi
-
-    local mode current_protocol tmp_file
-    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$X_CONFIG" 2>/dev/null || echo "freedom")
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请选择出口模式：${RESET}"
-    [[ "$current_protocol" == "socks" ]] && echo -e "${YELLOW} (当前: Socks5)${RESET}" || echo -e "${GREEN} (当前: 直连)${RESET}"
-    echo -e "${GREEN}1) 直连出口${RESET}"
-    echo -e "${GREEN}2) Socks5出口${RESET}"
-    echo -e "${GREEN}0) 取消${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-
-    echo -ne "${GREEN}请输入选项 [0-2]: ${RESET}"; read -r mode
-    case "$mode" in
-        1)
-            tmp_file=$(mktemp)
-            jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$X_CONFIG" > "$tmp_file"
-            cp "$X_CONFIG" "${X_CONFIG}.bak.$(date +%s)"
-            mv "$tmp_file" "$X_CONFIG"
-            restart_xray && info "已成功切换为直连出口！" || error "切换失败。"
-            return ;;
-        2) ;;
-        *) info "已取消配置"; return ;;
-    esac
-
-    info "配置自定义 Socks5 出口代理..."
-    local s_host s_port s_user s_pass
-    echo -ne "${GREEN}请输入 Socks5 服务器地址/IP: ${RESET}"; read -r s_host
-    [[ -z "$s_host" ]] && return
-
-    while true; do
-        echo -ne "${GREEN}请输入 Socks5 端口 (默认: 1080): ${RESET}"; read -r s_port
-        [[ -z "$s_port" ]] && s_port=1080
-        is_valid_port "$s_port" && break || error "端口无效，请输入 1-65535 之间的数字。"
-    done
-
-    echo -ne "${GREEN}请输入 Socks5 用户名 (无则回车): ${RESET}"; read -r s_user
-    if [[ -n "$s_user" ]]; then
-        echo -ne "${GREEN}请输入 Socks5 密码: ${RESET}"; read -s -r s_pass; echo
-    else
-        s_pass=""
-    fi
-
-    tmp_file=$(mktemp)
-    if [[ -n "$s_user" ]]; then
-        jq --arg host "$s_host" --argjson port "$s_port" --arg user "$s_user" --arg pass "$s_pass" \
-            '.outbounds = [{"protocol": "socks", "tag": "custom-out", "settings": {"servers": [{"address": $host, "port": $port, "users": [{"user": $user, "pass": $pass}]}]}}]' \
-            "$X_CONFIG" > "$tmp_file"
-    else
-        jq --arg host "$s_host" --argjson port "$s_port" \
-            '.outbounds = [{"protocol": "socks", "tag": "custom-out", "settings": {"servers": [{"address": $host, "port": $port}]}}]' \
-            "$X_CONFIG" > "$tmp_file"
-    fi
-
-    cp "$X_CONFIG" "${X_CONFIG}.bak.$(date +%s)"
-    mv "$tmp_file" "$X_CONFIG"
-    restart_xray && info "已成功切换为 Socks5 出口！" || error "重启失败，请检查 Socks5 信息。"
-}
-
-# 修改配置
+# ================== 修改配置 ==================
 modify_config() {
     if [[ ! -f "$X_CONFIG" ]]; then error "请先安装 Xray"; return; fi
-    if [[ ! -f "$X_STATE" ]] || [[ ! -f "$X_REALITY_STATE" ]]; then error "快照状态文件缺失，请重新安装以初始化矩阵"; return; fi
     
     local curr_port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
-    local curr_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
-    local curr_flow=$(jq -r '.inbounds[0].settings.clients[0].flow // "xtls-rprx-vision"' "$X_CONFIG")
-    [[ "$curr_flow" == "null" ]] && curr_flow="xtls-rprx-vision"
-    local curr_decryption=$(jq -r '.inbounds[0].settings.decryption' "$X_CONFIG")
-    local curr_encryption=$(cat "$X_STATE")
-    local curr_outbound=$(jq -c '.outbounds[0]' "$X_CONFIG")
-
-    local curr_dest=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$X_CONFIG")
-    local curr_priv_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$X_CONFIG")
-    local curr_pub_key=$(cut -d'|' -f2 "$X_REALITY_STATE")
-    local curr_short_id=$(cut -d'|' -f3 "$X_REALITY_STATE")
+    local curr_user=$(jq -r '.inbounds[0].settings.accounts[0].user // ""' "$X_CONFIG")
+    local curr_pass=$(jq -r '.inbounds[0].settings.accounts[0].pass // ""' "$X_CONFIG")
 
     # 1. 修改端口
     local n_port
     while true; do
-        read -p "请输入新端口 (回车保持 $curr_port): " n_port
+        read -p "请输入新 Socks5 端口 (回车保持 $curr_port): " n_port
         n_port=${n_port:-$curr_port}
         is_valid_port "$n_port" && break || error "端口无效，请输入 1-65535 之间的数字。"
     done
 
-    # 2. 修改 UUID
-    local n_uuid
-    while true; do
-        read -p "请输入新 UUID (回车保持 $curr_uuid): " n_uuid
-        n_uuid=${n_uuid:-$curr_uuid}
-        if [[ "$n_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-            break
-        else
-            error "UUID 格式不正确，请重新输入。"
+    # 2. 修改账号密码
+    read -p "请输入新用户名 (回车保持当前, 清空认证输 clear, 输 random 随机生成): " n_user
+    n_user=${n_user:-$curr_user}
+    
+    local n_pass=""
+    if [[ "$n_user" == "clear" ]]; then
+        n_user=""
+        n_pass=""
+    elif [[ "$n_user" == "random" ]]; then
+        n_user=$(openssl rand -hex 4)
+        n_pass=$(openssl rand -hex 8)
+        info "👉 已生成随机账号: $n_user"
+        info "👉 已生成随机密码: $n_pass"
+    elif [[ -n "$n_user" ]]; then
+        read -p "请输入新密码 (回车保持旧密码): " n_pass
+        n_pass=${n_pass:-$curr_pass}
+        if [[ -z "$n_pass" ]]; then
+            error "启用了认证则密码不能为空！"
+            return
         fi
-    done
+    fi
 
-    # 3. 修改流控 (Flow)
-    local n_flow
-    read -p "请输入流控 (回车保持 $curr_flow, 建议 xtls-rprx-vision): " n_flow
-    n_flow=${n_flow:-$curr_flow}
-
-    # 4. 修改伪装域名
-    local n_dest
-    read -p "请输入新伪装域名 (回车保持 $curr_dest): " n_dest
-    n_dest=${n_dest:-$curr_dest}
-
-    write_config "$n_port" "$n_uuid" "$n_flow" "$curr_decryption" "$n_dest" "$curr_priv_key" "$curr_short_id" "$curr_outbound"
-    restart_xray
+    write_config "$n_port" "$n_user" "$n_pass"
+    rc-service "$SERV_NAME" restart
     
-    # 重新生成链接
-    local ip=$(get_public_ip)
-    local host_addr=$ip
-    if [[ $ip == *":"* ]]; then host_addr="[$ip]"; fi
-    
-    local flow_param=""
-    if [[ -n "$n_flow" && "$n_flow" != "none" ]]; then flow_param="&flow=$n_flow"; fi
+    # 生成新链接
+    local ip=$(get_public_ip || echo "127.0.0.1")
+    local enc_ip=$(echo -n "$ip" | jq -sRr @uri)
+    local enc_user=$(echo -n "$n_user" | jq -sRr @uri)
+    local enc_pass=$(echo -n "$n_pass" | jq -sRr @uri)
 
     mkdir -p "$X_LINK_DIR"
-    echo "vless://$n_uuid@$host_addr:$n_port?encryption=$curr_encryption&security=reality&sni=$n_dest&pbk=$curr_pub_key&sid=$curr_short_id&fp=chrome&type=tcp${flow_param}#$HOSTNAME-vless-Encryption-Reality" > "$X_LINK"
+    if [[ -n "$n_user" ]]; then
+        echo "socks://${enc_user}:${enc_pass}@${ip}:${n_port}#${HOSTNAME}-socks5" > "$X_LINK"
+        echo "https://t.me/socks?server=${enc_ip}&port=${n_port}&user=${enc_user}&pass=${enc_pass}" >> "$X_LINK"
+    else
+        echo "socks://${ip}:${n_port}#${HOSTNAME}-socks5" > "$X_LINK"
+        echo "https://t.me/socks?server=${enc_ip}&port=${n_port}" >> "$X_LINK"
+    fi
     info "配置已更新并成功重启服务！"
 }
 
@@ -350,234 +175,100 @@ install_xray() {
     rm -rf /tmp/xray*
     
     if [[ ! -f "$X_CONFIG" ]]; then
-        echo -ne "${GREEN}请输入入站端口 (回车随机): ${RESET}"; read -r port; [[ -z "$port" ]] && port=$((RANDOM % 45535 + 10000))
-        
-        # 1. 自定义 UUID
-        local uuid
+        local port
         while true; do
-            echo -ne "${GREEN}请输入自定义 UUID (回车随机生成): ${RESET}"; read -r input_uuid
-            if [[ -z "$input_uuid" ]]; then
-                if [ -x "$X_BIN" ]; then
-                    uuid=$($X_BIN uuid 2>/dev/null || uuidgen)
-                else
-                    uuid=$(uuidgen)
-                fi
-                break
-            else
-                if [[ "$input_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-                    uuid="$input_uuid"
-                    break
-                else
-                    error "UUID 格式不正确，请重新输入。"
-                fi
-            fi
+            echo -ne "${GREEN}请输入入站端口 (回车随机): ${RESET}"; read port
+            [[ -z "$port" ]] && port=$((RANDOM % 45535 + 10000))
+            is_valid_port "$port" && break || error "端口无效，请输入 1-65535 之间的数字。"
         done
-
-        # 流控设置选择
-        local flow
-        echo -ne "${GREEN}请输入流控设置 (回车默认 xtls-rprx-vision): ${RESET}"; read -r input_flow
-        if [[ -z "$input_flow" ]]; then
-            flow="xtls-rprx-vision"
-        elif [[ "$input_flow" == "none" ]]; then
-            flow=""
+        
+        # 自定义 Socks5 验证账号 (默认按回车直接生成随机账号密码)
+        echo -ne "${GREEN}请输入 Socks5 用户名 (直接回车默认随机生成): ${RESET}"; read user
+        local pass=""
+        if [[ -z "$user" ]]; then
+            user=$(openssl rand -hex 4)   # 8位随机字符
+            pass=$(openssl rand -hex 8)   # 16位随机字符
+            info "👉 采用默认随机生成用户名: ${user}"
+            info "👉 采用默认随机生成密 码: ${pass}"
         else
-            flow="$input_flow"
-        fi
-
-        # Reality 专属参数引导
-        local dest
-        echo -ne "${GREEN}请输入 Reality 伪装域名 (回车默认 www.amazon.com ): ${RESET}"; read -r input_dest
-        dest=${input_dest:-"www.amazon.com"}
-
-        info "正在生成 Reality 密钥对与短ID..."
-        
-        local keypair priv_key pub_key
-        keypair=$($X_BIN x25519 2>/dev/null || echo "")
-        
-        if [[ -n "$keypair" ]]; then
-            priv_key=$(echo "$keypair" | grep -i "Private" | cut -d":" -f2 | tr -d "[:space:]")
-            pub_key=$(echo "$keypair" | grep -i "Public" | cut -d":" -f2 | tr -d "[:space:]")
-        else
-            priv_key=""
-            pub_key=""
-        fi
-
-        # 补救降级机制
-        if [[ -z "$priv_key" ]] || [[ -z "$pub_key" ]]; then
-            warn "未能从内核日志提取到标准密钥，开始启动 OpenSSL 引擎进行高可靠硬生成补救..."
-            priv_key=$(openssl genpkey -algorithm X25519 -outform DER 2>/dev/null | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=')
-            pub_key=$(echo "$priv_key" | tr '-_' '+/' | base64 -d | openssl pkey -inform DER -pubout -outform DER 2>/dev/null | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=')
+            while true; do
+                echo -ne "${GREEN}请输入 Socks5 密码: ${RESET}"; read pass
+                [[ -n "$pass" ]] && break || error "设置了用户名，密码不能为空！"
+            done
         fi
         
-        if [[ -z "$priv_key" ]]; then
-            error "致命错误: 无法构建高可用传输安全凭证，终止安装。"
-            exit 1
-        fi
+        write_config "$port" "$user" "$pass"
         
-        local short_id=$(openssl rand -hex 8)
-        echo "${priv_key}|${pub_key}|${short_id}" > "$X_REALITY_STATE"
-
-        # 2. 生成抗量子对称矩阵对
-        info "正在实时构建后量子加解密通信矩阵..."
-        local encryption_info
-        encryption_info=$(generate_vless_encryption_config)
-        
-        local decryption=$(echo "$encryption_info" | cut -d'|' -f1)
-        local encryption=$(echo "$encryption_info" | cut -d'|' -f2)
-        
-        echo "$encryption" > "$X_STATE"
-        
-        write_config "$port" "$uuid" "$flow" "$decryption" "$dest" "$priv_key" "$short_id"
-        
-        # 写入 OpenRC 服务启动脚本
+        # 写入 OpenRC 服务脚本
         cat << EOF > "$INIT_FILE"
 #!/sbin/openrc-run
-description="Xray VLESS-Encryption + Reality 魔改服务"
 command="${X_BIN}"
 command_args="run -c ${X_CONFIG}"
 command_background="yes"
 pidfile="/run/${SERV_NAME}.pid"
-start_stop_daemon_args="--background --make-pidfile"
 output_log="$X_LOG"
 error_log="$X_LOG"
-
-depend() {
-    need net
-    after firewall
-}
 EOF
         chmod +x "$INIT_FILE"
         touch "$X_LOG"
         rc-update add "$SERV_NAME" default >/dev/null 2>&1
     fi
 
-    restart_xray
+    rc-service "$SERV_NAME" restart
     
-    # 读取最新配置生成分享链接
-    local ip=$(get_public_ip)
-    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
+    # 读取配置生成双链接
+    local ip=$(get_public_ip || echo "127.0.0.1")
     local port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
-    local flow=$(jq -r '.inbounds[0].settings.clients[0].flow // ""' "$X_CONFIG")
-    [[ "$flow" == "null" ]] && flow=""
+    local user=$(jq -r '.inbounds[0].settings.accounts[0].user // ""' "$X_CONFIG")
+    local pass=$(jq -r '.inbounds[0].settings.accounts[0].pass // ""' "$X_CONFIG")
     
-    local encryption=$(cat "$X_STATE")
-    local pub_key=$(cut -d'|' -f2 "$X_REALITY_STATE")
-    local short_id=$(cut -d'|' -f3 "$X_REALITY_STATE")
-    local dest=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$X_CONFIG")
-    
-    local host_addr=$ip
-    if [[ $ip == *":"* ]]; then host_addr="[$ip]"; fi
-    
-    local flow_param=""
-    if [[ -n "$flow" && "$flow" != "none" ]]; then flow_param="&flow=$flow"; fi
-    
-    local link="vless://$uuid@$host_addr:$port?encryption=$encryption&security=reality&sni=$dest&pbk=$pub_key&sid=$short_id&fp=chrome&type=tcp${flow_param}#$HOSTNAME-vless-Encryption-Reality"
+    local enc_ip=$(echo -n "$ip" | jq -sRr @uri)
+    local enc_user=$(echo -n "$user" | jq -sRr @uri)
+    local enc_pass=$(echo -n "$pass" | jq -sRr @uri)
     
     mkdir -p "$X_LINK_DIR"
-    echo "$link" > "$X_LINK"
+    if [[ -n "$user" ]]; then
+        echo "socks://${enc_user}:${enc_pass}@${ip}:${port}#${HOSTNAME}-socks5" > "$X_LINK"
+        echo "https://t.me/socks?server=${enc_ip}&port=${port}&user=${enc_user}&pass=${enc_pass}" >> "$X_LINK"
+    else
+        echo "socks://${ip}:${port}#${HOSTNAME}-socks5" > "$X_LINK"
+        echo "https://t.me/socks?server=${enc_ip}&port=${port}" >> "$X_LINK"
+    fi
 
     show_current_config
 }
 
-# ================== SNI 优选功能增强闭环 ==================
-select_best_sni() {
-    info "开始优选 SNI 延迟测试..."
-    local SNIS=(
-        amd.com apps.mzstatic.com aws.com azure.microsoft.com beacon.gtv-pub.com
-        bing.com catalog.gamepass.com cdn.bizibly.com cdn-dynmedia-1.microsoft.com
-        devblogs.microsoft.com fpinit.itunes.apple.com go.microsoft.com
-        gray-config-prod.api.arc-cdn.net gray.video-player.arcpublishing.com
-        images.nvidia.com r.bing.com services.digitaleast.mobi snap.licdn.com
-        statici.icloud.com tag.demandbase.com tag-logger.demandbase.com
-        ts1.tc.mm.bing.net ts2.tc.mm.bing.net vs.aws.amazon.com www.apple.com
-        www.icloud.com www.microsoft.com www.oracle.com www.xbox.com
-        www.xilinx.com xp.apple.com
-    )
-    local BEST_SNI=""
-    local BEST_TIME=999999
-
-    for sni in "${SNIS[@]}"; do
-        start=$(date +%s%N)
-        if timeout 2 openssl s_client -connect ${sni}:443 -servername ${sni} -brief </dev/null >/dev/null 2>&1; then
-            end=$(date +%s%N)
-            cost=$(( (end - start) / 1000000 ))
-            echo -e "${GREEN}[SNI] $sni -> ${cost}ms${RESET}"
-            if [ $cost -lt $BEST_TIME ]; then
-                BEST_TIME=$cost; BEST_SNI=$sni
-            fi
-        fi
-    done
-
-    if [ -n "$BEST_SNI" ]; then
-        echo
-        info "最优 SNI 结果: $BEST_SNI (${BEST_TIME}ms)"
-        echo -ne "${YELLOW}是否自动将此 SNI 应用到当前的 Reality 伪装域名配置中？[y/N]: ${RESET}"; read -r opt
-        if [[ "$opt" == "y" || "$opt" == "Y" ]]; then
-            if [[ ! -f "$X_CONFIG" ]]; then error "配置不存在，无法直接应用。"; return; fi
-            
-            local curr_port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
-            local curr_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
-            local curr_flow=$(jq -r '.inbounds[0].settings.clients[0].flow // "xtls-rprx-vision"' "$X_CONFIG")
-            [[ "$curr_flow" == "null" ]] && curr_flow="xtls-rprx-vision"
-            local curr_decryption=$(jq -r '.inbounds[0].settings.decryption' "$X_CONFIG")
-            local curr_outbound=$(jq -c '.outbounds[0]' "$X_CONFIG")
-            local curr_encryption=$(cat "$X_STATE")
-            local curr_priv_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$X_CONFIG")
-            local curr_pub_key=$(cut -d'|' -f2 "$X_REALITY_STATE")
-            local curr_short_id=$(cut -d'|' -f3 "$X_REALITY_STATE")
-
-            write_config "$curr_port" "$curr_uuid" "$curr_flow" "$curr_decryption" "$BEST_SNI" "$curr_priv_key" "$curr_short_id" "$curr_outbound"
-            restart_xray
-            
-            local ip=$(get_public_ip)
-            local host_addr=$ip
-            if [[ $ip == *":"* ]]; then host_addr="[$ip]"; fi
-            local flow_param=""
-            if [[ -n "$curr_flow" && "$curr_flow" != "none" ]]; then flow_param="&flow=$curr_flow"; fi
-
-            echo "vless://$curr_uuid@$host_addr:$curr_port?encryption=$curr_encryption&security=reality&sni=$BEST_SNI&pbk=$curr_pub_key&sid=$curr_short_id&fp=chrome&type=tcp${flow_param}#$HOSTNAME-vless-Encryption-Reality" > "$X_LINK"
-            info "已成功应用 SNI 并重启服务！"
-        fi
-    else
-        warn "未找到可用 SNI"
-    fi
-}
-
-# ================== 显示配置 (全功能看板对接) ==================
+# ================== 显示配置 ==================
 show_current_config() {
     if [[ ! -f "$X_CONFIG" ]]; then
         error "配置文件不存在"
         return
     fi
 
-    local ip uuid port flow outbound_mode remark
-    ip=$(get_public_ip)
-    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG" 2>/dev/null || echo "未知")
+    local ip port user pass auth_mode
+    ip=$(get_public_ip || echo "未知")
     port=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "未知")
-    flow=$(jq -r '.inbounds[0].settings.clients[0].flow // "未启用"' "$X_CONFIG" 2>/dev/null || echo "未启用")
-    [[ "$flow" == "null" ]] && flow="未启用"
-    remark="$HOSTNAME-${SERV_NAME}"
+    user=$(jq -r '.inbounds[0].settings.accounts[0].user // "无"' "$X_CONFIG" 2>/dev/null || echo "无")
+    pass=$(jq -r '.inbounds[0].settings.accounts[0].pass // "无"' "$X_CONFIG" 2>/dev/null || echo "无")
     
-    local dest=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$X_CONFIG" 2>/dev/null || echo "未知")
-    local current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$X_CONFIG" 2>/dev/null || echo "freedom")
-    [[ "$current_protocol" == "socks" ]] && outbound_mode="Socks5 链式代理" || outbound_mode="直连 (Freedom)"
+    local auth_status=$(jq -r '.inbounds[0].settings.auth' "$X_CONFIG" 2>/dev/null || echo "noauth")
+    [[ "$auth_status" == "password" ]] && auth_mode="用户名密码验证" || auth_mode="匿名免密 (noauth)"
 
-    echo -e "${GREEN}====== VLESS-Encryption + Reality 节点配置信息 ======${RESET}"
-    echo -e "${YELLOW}服务器公网 IP     : ${ip}${RESET}"
-    echo -e "${YELLOW}服务监听端口      : ${port}${RESET}"
-    echo -e "${YELLOW}用户 UUID        : ${uuid}${RESET}"
-    echo -e "${YELLOW}协议与安全      : VLESS + Reality (TCP)${RESET}"
-    echo -e "${YELLOW}后量子加密拓扑  : Encryption (native + 0-RTT + ML-KEM-768)${RESET}"
-    echo -e "${YELLOW}Reality伪装SNI  : ${dest}${RESET}"
-    echo -e "${YELLOW}当前流控 (Flow) : ${flow}${RESET}"
-    echo -e "${YELLOW}出口模式        : ${outbound_mode}${RESET}"
-    echo -e "${YELLOW}节点自定义备注  : ${remark}${RESET}"
-    echo -e "${YELLOW}📄 V6VPS 请自行替换分享链接中的 IP 地址为 V6 ★${RESET}"
-    echo
-
+    echo -e "\n${GREEN}====== 当前配置详情 ======${RESET}"
+    echo -e "${YELLOW}传输协议     : Socks5 代理${RESET}"
+    echo -e "${YELLOW}认证模式     : ${auth_mode}${RESET}"
+    echo -e "${YELLOW}IP地址       : ${ip}${RESET}"
+    echo -e "${YELLOW}端口         : ${port}${RESET}"
+    echo -e "${YELLOW}用户名       : ${user}${RESET}"
+    echo -e "${YELLOW}密码         : ${pass}${RESET}"
+    echo -e "${YELLOW}出口模式     : 直连 (Freedom)${RESET}"
+    echo -e "${YELLOW}分享存放路径 : ${X_LINK}${RESET}"
+    
     if [[ -f "$X_LINK" ]]; then
-        echo -e "${GREEN}====== 👉 Xray 分享链接 (已存至 $X_LINK) ======${RESET}"
-        cat "$X_LINK"
+        echo -e "${GREEN}====== 👉 通用客户端 Socks5 链接 ======${RESET}"
+        sed -n '1p' "$X_LINK"
+        echo -e "${GREEN}====== 🚀 Telegram 内置一键代理链接 ======${RESET}"
+        sed -n '2p' "$X_LINK"
     fi
 }
 
@@ -590,14 +281,14 @@ show_menu() {
     [[ -f "$X_CONFIG" ]] && port_show=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "-")
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} Xray VLESS-Encrypt+Reality 面板 ${RESET}"
+    echo -e "${GREEN}      Xray Socks5 管理面板       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 Xray VLESS-Encrypt+Reality${RESET}"
-    echo -e "${GREEN} 2. 更新 Xray${RESET}"
+    echo -e "${GREEN} 1. 安装 Xray Socks5 ${RESET}"
+    echo -e "${GREEN} 2. 更新 Xray {RESET}"
     echo -e "${GREEN} 3. 卸载 Xray${RESET}"
     echo -e "${GREEN} 4. 修改配置${RESET}"
     echo -e "${GREEN} 5. 启动 Xray${RESET}"
@@ -605,19 +296,16 @@ show_menu() {
     echo -e "${GREEN} 7. 重启 Xray${RESET}"
     echo -e "${GREEN} 8. 查看日志${RESET}"
     echo -e "${GREEN} 9. 查看节点配置${RESET}"
-    echo -e "${GREEN}10. 配置Socks5出口${RESET}"
-    echo -e "${GREEN}11. SNI域名优选✨${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
 while true; do
     show_menu
-    echo -ne "${GREEN}请输入选项: ${RESET}"; read -r choice
+    echo -ne "${GREEN}请输入选项: ${RESET}"; read choice
     case $choice in
         1|2) install_xray; pause ;;
         3) 
-            pkill -9 -f "$X_BIN" >/dev/null 2>&1 || true
             rc-service "$SERV_NAME" stop 2>/dev/null || true
             rc-update del "$SERV_NAME" default 2>/dev/null || true
             rm -rf "$X_DIR" "$X_BIN" "$INIT_FILE" "$X_LINK" "$X_LOG"
@@ -625,13 +313,11 @@ while true; do
             pause 
             ;;
         4) modify_config; pause ;;
-        5) restart_xray; pause ;;
-        6) rc-service "$SERV_NAME" stop; pkill -9 -f "$X_BIN" >/dev/null 2>&1 || true; pause ;;
-        7) restart_xray; pause ;;
+        5) rc-service "$SERV_NAME" start; pause ;;
+        6) rc-service "$SERV_NAME" stop; pause ;;
+        7) rc-service "$SERV_NAME" restart; pause ;;
         8) [[ -f "$X_LOG" ]] && tail -f "$X_LOG" || error "暂无日志"; pause ;;
         9) show_current_config || error "无配置"; pause ;;
-        10) configure_custom_socks5_outbound; pause ;;
-        11) select_best_sni; pause ;;
         0) exit 0 ;;
         *) error "无效选项"; sleep 1 ;;
     esac

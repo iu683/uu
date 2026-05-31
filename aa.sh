@@ -1,825 +1,293 @@
-#!/usr/bin/env bash
-#
-# Xray (VLESS-Encryption + REALITY) Alpine Linux 专属控制面板
-# SPDX-License-Identifier: MIT
-#
-# =========================================================
-# 1. 核心控制与全局环境初始化
-# =========================================================
-set -Eeuo pipefail
-export LANG=en_US.UTF-8
+#!/bin/bash
 
-# --- 完全隔离的独立路径与服务名称配置 ---
-readonly SERVICE_NAME="xray-pqreality"
-readonly XRAY_CONFIG="/usr/local/etc/${SERVICE_NAME}/config.json"
-readonly XRAY_BINARY="/usr/local/bin/${SERVICE_NAME}"
-readonly INIT_SERVICE_PATH="/etc/init.d/${SERVICE_NAME}"
-readonly STATE_DIR="/root/proxynode/vlessEncryptionReality"
-readonly STATE_FILE="${STATE_DIR}/encryption_info.txt"
-readonly REALITY_FILE="${STATE_DIR}/reality_info.txt"  # 存储格式: pbk|sni|sid
-readonly LINK_FILE="${STATE_DIR}/vless_link.txt"
-readonly GEO_DIR="/usr/local/share/${SERVICE_NAME}"    # 移至顶层全局只读，防止二次赋值报错
-readonly REPO_API_URL="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
-
-TMP_DIR=$(mktemp -d -p /tmp xray_alpine_pq.XXXXXX)
-
-# ================== cleanup ==================
-cleanup() {
-    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
-}
-
-trap cleanup EXIT INT TERM
-
-# 终端规范颜色代码
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-BLUE="\033[34m"
-CYAN="\033[36m"
+# ================== 颜色定义 ==================
+GREEN="\033[1;32m"
+RED="\033[1;31m"
+YELLOW="\033[1;33m"
+PURPLE="\033[1;35m"
+SKYBLUE="\033[1;36m"
 RESET="\033[0m"
 
-# =========================================================
-# 2. 基础底层工具函数 (适配 Alpine 环境)
-# =========================================================
-info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
-error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
-pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
+# ================== 基础环境变量 ==================
+HOSTNAME=$(hostname)
+USERNAME=$(whoami | tr '[:upper:]' '[:lower:]')
+export SECRET=${SECRET:-$(echo -n "$USERNAME+$HOSTNAME" | md5sum | awk '{print $1}' | head -c 32)}
+WORKDIR="/root/proxynode/mtp"
+CRON_CMD="@reboot sleep 30 && /bin/bash $WORKDIR/restart.sh >/dev/null 2>&1"
+LOG_FILE="$WORKDIR/mtg.log"
+
+# ================== 工具函数 ==================
+red_echo() { echo -e "${RED}$1${RESET}"; }
+green_echo() { echo -e "${GREEN}$1${RESET}"; }
+yellow_echo() { echo -e "${YELLOW}$1${RESET}"; }
+purple_echo() { echo -e "${PURPLE}$1${RESET}"; }
+
+# 获取最准确的当前运行 PID
+get_mtg_pid() {
+    local pid=$(pidof mtg)
+    if [[ -z "$pid" ]]; then
+        pid=$(ps -ef 2>/dev/null | grep 'mtg run' | grep -v grep | awk '{print $1}')
+    fi
+    echo "$pid"
+}
+
+# 获取面板状态显示 (严格在函数内用 local)
+get_status_display() {
+    local current_pid=$(get_mtg_pid)
+    local saved_port=$(cat "$WORKDIR/port.txt" 2>/dev/null)
+    local is_listening=""
+    [[ -n "$saved_port" ]] && is_listening=$(netstat -an 2>/dev/null | grep -E "[:\.]${saved_port} " | grep -i "listen")
+
+    if [[ -n "$current_pid" || -n "$is_listening" ]]; then
+        echo -e "${GREEN}正在运行${RESET}"
+    else
+        echo -e "${RED}已停止${RESET}"
+    fi
+}
+
+# 获取正在运行的端口
+get_running_port() {
+    local pid=$(get_mtg_pid)
+    local port=""
+    if [[ -n "$pid" ]]; then
+        port=$(netstat -anp 2>/dev/null | grep "$pid/" | grep -i "listen" | awk '{print $4}' | cut -d':' -f2 | head -n 1)
+        [[ -z "$port" && -f "$WORKDIR/port.txt" ]] && port=$(cat "$WORKDIR/port.txt")
+        echo "${port:-未知}"
+    else
+        echo "无"
+    fi
+}
 
 get_public_ip() {
-    local ip=''
-    for url in https://api.ipify.org https://ip.sb https://checkip.amazonaws.com; do
-        ip=$(curl -4s --max-time 5 "$url" 2>/dev/null || true)
-        [[ -n "$ip" ]] && { echo "$ip"; return; }
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
     done
-    hostname -i | awk '{print $1}' 2>/dev/null || echo "127.0.0.1"
+    echo "无法获取公网 IP"
 }
 
-get_random_port() {
-    local rand_port
+random_port() {
+    awk 'BEGIN{srand(); print int(rand()*(65000-2000+1))+2000}'
+}
+
+# 彻底修复输出污染的端口检查函数
+check_vps_port() {
+    local port=$1
     while true; do
-        rand_port=$((RANDOM % 55536 + 10000))
-        if ! ss -tuln | awk '{print $5}' | grep -qE "[:.]${rand_port}$"; then
-            echo "$rand_port"
-            return 0
+        # 仅仅把提示打印到标准错误(>&2)，确保标准输出只返回纯数字端口
+        if [[ -n $(netstat -an 2>/dev/null | grep -E "[:\.]${port} " | grep -i "listen") ]]; then
+            echo -e "${RED}${port} 端口已经被其他程序占用，请更换端口重试。${RESET}" >&2
+            read -p "请输入新端口（回车使用随机端口）: " port
+            if [[ -z $port ]]; then
+                port=$(random_port)
+                echo -e "${GREEN}使用随机端口: $port${RESET}" >&2
+            fi
+        else
+            break
         fi
     done
+    echo "$port"
 }
 
-is_valid_port() {
-    local port="$1"
-    if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+install_alpine_deps() {
+    local update_done=0
+    if ! command -v bash &>/dev/null; then apk update && update_done=1 && apk add bash; fi
+    if ! command -v curl &>/dev/null; then [[ $update_done -eq 0 ]] && apk update && update_done=1; apk add curl; fi
+}
+
+# ================== Crontab 管理 ==================
+check_cron_status() {
+    crontab -l 2>/dev/null | grep -q "restart.sh"
+}
+
+set_cron() {
+    if ! check_cron_status; then
+        (crontab -l 2>/dev/null; echo "$CRON_CMD") | crontab -
+    fi
+    rc-service crond start >/dev/null 2>&1 || crond -b >/dev/null 2>&1
+}
+
+remove_cron() {
+    crontab -l 2>/dev/null | grep -v "restart.sh" | crontab -
+}
+
+# ================== 核心控制服务 ==================
+start_proxy() {
+    local pid=$(get_mtg_pid)
+    if [[ -n "$pid" ]]; then
+        yellow_echo "MTProto Proxy 已经在运行中 (PID: $pid)。"
         return 0
     fi
-    return 1
-}
-
-get_installed_version() {
-    if [[ -f "$XRAY_BINARY" && -x "$XRAY_BINARY" ]]; then
-        local ver
-        # 优化版本抓取正则，精准提取首行包含的 Xray 规范版本号
-        ver=$("$XRAY_BINARY" version 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "")
-        if [[ -n "$ver" ]]; then
-            echo "v$ver"
-        else
-            echo "未知版本"
-        fi
-    else
-        echo "未安装"
+    
+    if [ ! -f "$WORKDIR/mtg" ]; then
+        red_echo "未检测到安装文件，请先选择 1 安装。"
+        return 1
     fi
-}
 
-get_xray_status() {
-    if command -v rc-service &>/dev/null && rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
-        echo -e "${GREEN}● 运行中 ${RESET}"
-    else
-        if pgrep -f "$XRAY_BINARY run" >/dev/null 2>&1; then
-            echo -e "${GREEN}● 运行中 ${RESET}"
-        else
-            echo -e "${RED}● 未运行${RESET}"
-        fi
+    local port=$(cat "$WORKDIR/port.txt" 2>/dev/null)
+    if [[ -z "$port" || "$port" == "无" ]]; then
+        red_echo "未检测到配置端口，请重新安装或修改配置。"
+        return 1
     fi
-}
 
-get_current_port_display() {
-    if [[ -f "$XRAY_CONFIG" ]]; then
-        local port
-        port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "")
-        echo "${port:- -}"
-    else echo "-"; fi
-}
-
-generate_uuid() {
-    if [ -f "$XRAY_BINARY" ] && [ -x "$XRAY_BINARY" ]; then
-        $XRAY_BINARY uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid
-    else
-        cat /proc/sys/kernel/random/uuid
-    fi
-}
-
-# =========================================================
-# 3. Alpine OpenRC 守护脚本模板
-# =========================================================
-write_openrc_script() {
-    cat << EOF > "$INIT_SERVICE_PATH"
-#!/sbin/openrc-run
-
-description="Xray VLESS-Encryption+REALITY Independent Service ($SERVICE_NAME)"
-supervisor="supervise-daemon"
-command="$XRAY_BINARY"
-command_args="run -c $XRAY_CONFIG"
-
-depend() {
-    need net
-    after firewall
-}
-EOF
-    chmod 755 "$INIT_SERVICE_PATH"
-}
-
-# 内部统一重启控制函数
-trigger_restart_logic() {
-    if command -v rc-service &>/dev/null && [ -f "$INIT_SERVICE_PATH" ]; then
-        rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 || true
-    else
-        pkill -f "$XRAY_BINARY run" || true
-        sleep 0.5
-        "$XRAY_BINARY" run -c "$XRAY_CONFIG" >/dev/null 2>&1 &
-    fi
+    cd "$WORKDIR" || return
+    local stats_p=$((port + 1))
+    nohup ./mtg run -b 0.0.0.0:$port "$SECRET" --stats-bind=127.0.0.1:${stats_p} >> "$LOG_FILE" 2>&1 &
     sleep 1
-    # 简单校验进程是否存在
-    if pgrep -f "$XRAY_BINARY run" >/dev/null 2>&1; then
-        return 0
+    green_echo "MTProto Proxy 启动指令已发送！"
+}
+
+stop_proxy() {
+    # 针对 Alpine 的强杀组合拳
+    local pids=$(pidof mtg || ps -ef | grep 'mtg run' | grep -v grep | awk '{print $1}')
+    if [[ -n "$pids" ]]; then
+        echo "$pids" | xargs kill -9 >/dev/null 2>&1
+    fi
+    pkill -9 -f "mtg run" >/dev/null 2>&1
+    pkill -9 mtg >/dev/null 2>&1
+    green_echo "MTProto Proxy"
+}
+
+show_config() {
+    if [ ! -f "$WORKDIR/link.txt" ]; then
+        red_echo "未找到连接配置，请确保已成功安装。"
     else
-        return 1
+        purple_echo "==== 当前 MTProto 连接配置 ===="
+        cat "$WORKDIR/link.txt"
     fi
 }
 
-# =========================================================
-# 4. 核心提取与无缝下载
-# =========================================================
-download_and_extract_core() {
-    local arch
-    case "$(uname -m)" in
-        'x86_64') arch="64" ;;
-        'aarch64' | 'armv8') arch="arm64-v8a" ;;
-        *) error "不支持的 Alpine 系统架构: $(uname -m)"; return 1 ;;
-    esac
+# ================== 安装与配置修改 ==================
+download_and_run_mtg() {
+    local arch="amd64"
+    cmd=$(uname -m)
+    if [ "$cmd" == "386" ] || [ "$cmd" == "i686" ]; then arch="386"; fi
+    if [ "$cmd" == "armv7l" ] || [ "$cmd" == "armhf" ]; then arch="arm"; fi
+    if [ "$cmd" == "aarch64" ] || [ "$cmd" == "arm64" ]; then arch="arm64"; fi
 
-    info "正在自 GitHub 获取 Xray 最新发版矩阵..."
-    local release_json="$TMP_DIR/release.json"
-    if ! curl -fsSL "$REPO_API_URL" -o "$release_json"; then
-        error "获取 GitHub 发行列表失败，请检查网络"
-        return 1
-    fi
+    mkdir -p "$WORKDIR"
+    stop_proxy
 
-    local download_url
-    download_url=$(jq -r --arg arch "Xray-linux-${arch}.zip" '.assets[] | select(.name==$arch) | .browser_download_url' "$release_json")
-
-    if [[ -z "$download_url" || "$download_url" == "null" ]]; then
-        error "未能在当前架构中匹配到有效的发布包"
-        return 1
-    fi
-
-    info "开始下载 Xray 核心主程序组件..."
-    local zip_file="$TMP_DIR/xray.zip"
-    if ! curl -L -f -# "$download_url" -o "$zip_file"; then
-        error "下载 Xray 压缩归档失败"
-        return 1
-    fi
-
-    info "执行纯净解压并重命名隔离目标..."
-    mkdir -p "$(dirname "$XRAY_BINARY")"
-    unzip -qjo "$zip_file" "xray" -d "$TMP_DIR"
-    mv -f "$TMP_DIR/xray" "$XRAY_BINARY"
-    chmod 755 "$XRAY_BINARY"
-
-    # 下载附加 Geo 数据资产
-    mkdir -p "$GEO_DIR"
-    local geoip_url=$(jq -r '.assets[] | select(.name=="geoip.dat") | .browser_download_url' "$release_json")
-    local geosite_url=$(jq -r '.assets[] | select(.name=="geosite.dat") | .browser_download_url' "$release_json")
+    yellow_echo "正在下载 mtg 专属 Alpine 静态核心组件..."
+    wget -q -O "${WORKDIR}/mtg" "https://github.com/9600/mtg/releases/download/v2.1.7/mtg-linux-$arch"
     
-    [[ -n "$geoip_url" ]] && curl -L -f -s "$geoip_url" -o "${GEO_DIR}/geoip.dat" || true
-    [[ -n "$geosite_url" ]] && curl -L -f -s "$geosite_url" -o "${GEO_DIR}/geosite.dat" || true
+    if [ ! -s "${WORKDIR}/mtg" ]; then
+        wget -q -O "${WORKDIR}/mtg" "https://github.com/whunt1/onekeymakemtg/raw/master/builds/ccbuilds/mtg-linux-$arch"
+    fi
     
+    if [ ! -s "${WORKDIR}/mtg" ]; then
+        red_echo "下载核心失败，请检查网络！"
+        return 1
+    fi
+    
+    chmod +x "${WORKDIR}/mtg"
+    echo "$MTP_PORT" > "$WORKDIR/port.txt"
+    cd "$WORKDIR" || return
+
+    # 启动服务
+    local stats_port=$((MTP_PORT + 1))
+    nohup ./mtg run -b 0.0.0.0:$MTP_PORT "$SECRET" --stats-bind=127.0.0.1:${stats_port} >> "$LOG_FILE" 2>&1 &
+    
+    # 创建守护/重启脚本
+    cat > "${WORKDIR}/restart.sh" <<EOF
+#!/bin/bash
+pkill -9 -f "mtg run" >/dev/null 2>&1
+pkill -9 mtg >/dev/null 2>&1
+cd ${WORKDIR}
+nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:${stats_port} >> ${LOG_FILE} 2>&1 &
+EOF
+    chmod +x "${WORKDIR}/restart.sh"
     return 0
 }
 
-generate_vless_encryption_config() {
-    local vlessenc_output
-    vlessenc_output=$($XRAY_BINARY vlessenc 2>/dev/null || true)
-    if [ -z "$vlessenc_output" ]; then
-        error "生成 VLESS Encryption 配置失败"
-        return 1
-    fi
-
-    local decryption_config=""
-    local encryption_config=""
-    local in_mlkem_section=false
-
-    while IFS= read -r line; do
-        if [[ "$line" == *"Authentication: ML-KEM-768, Post-Quantum"* ]]; then
-            in_mlkem_section=true
-            continue
-        fi
-
-        if [ "$in_mlkem_section" = true ]; then
-            if [[ "$line" == *'"decryption":'* ]]; then
-                decryption_config=$(echo "$line" | sed 's/.*"decryption": "\([^"]*\)".*/\1/')
-            elif [[ "$line" == *'"encryption":'* ]]; then
-                if echo "$line" | grep -q '.*"encryption": "[^"]*"'; then
-                    encryption_config=$(echo "$line" | sed 's/.*"encryption": "\([^"]*\)".*/\1/')
-                else
-                    encryption_config=$(echo "$line" | sed 's/.*"encryption": "\([^"]*\).*/\1/')
-                    read -r next_line
-                    encryption_config="${encryption_config}${next_line}"
-                    encryption_config=$(echo "$encryption_config" | tr -d '"' | tr -d '[:space:]')
-                fi
-                break
-            fi
-        fi
-    done <<< "$vlessenc_output"
-
-    if [ -z "$decryption_config" ] || [ -z "$encryption_config" ]; then
-        error "无法解析 VLESS Encryption 配置。"
-        return 1
-    fi
-
-    echo "${decryption_config}|${encryption_config}"
-}
-
-generate_reality_keys() {
-    local key_pair
-    key_pair=$($XRAY_BINARY x25519 2>/dev/null || true)
-    if [ -z "$key_pair" ]; then
-        error "生成 REALITY 密钥对失败！"
-        return 1
-    fi
-
-    local private_key=$(echo "$key_pair" | grep -i "Private" | sed 's/[[:space:]]//g' | cut -d':' -f2)
-    local public_key=$(echo "$key_pair" | grep -E -i "(Public|Password)" | sed 's/[[:space:]]//g' | cut -d':' -f2)
-
-    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
-        error "无法解析 REALITY 密钥对。"
-        return 1
-    fi
-    echo "${private_key}|${public_key}"
-}
-
-# =========================================================
-# 5. 面板核心交互与配置文件处理
-# =========================================================
-write_and_show_config() {
-    mkdir -p "$STATE_DIR"
+core_install() {
+    install_alpine_deps
+    purple_echo "正在配置 MTProto 代理端口...\n"
     
-    rm -f "$STATE_FILE" "$REALITY_FILE"
-    echo "$ENCRYPTION" > "$STATE_FILE"
-    echo "${PUBLIC_KEY}|${SNI}|${SHORT_ID}" > "$REALITY_FILE"
-
-    mkdir -p "$(dirname "$XRAY_CONFIG")"
+    read -p "请输入 MTProto 代理端口 (回车使用随机端口): " user_port
+    [[ -z $user_port ]] && user_port=$(random_port)
     
-    jq -n \
-        --argjson port "$PORT" \
-        --arg uuid "$UUID" \
-        --arg decryption "$DECRYPTION" \
-        --arg private_key "$PRIVATE_KEY" \
-        --arg sni "$SNI" \
-        --arg short_id "$SHORT_ID" \
-        --arg flow "xtls-rprx-vision" \
-        --arg asset_dir "$GEO_DIR" \
-    '{
-        "log": {"loglevel": "warning"},
-        "assets": {"dir": $asset_dir},
-        "inbounds": [{
-            "listen": "::",
-            "port": $port,
-            "protocol": "vless",
-            "settings": {
-                "clients": [{"id": $uuid, "flow": $flow}],
-                "decryption": $decryption
-            },
-            "streamSettings": {
-                "network": "tcp",
-                "security": "reality",
-                "realitySettings": {
-                    "show": false,
-                    "dest": ($sni + ":443"),
-                    "xver": 0,
-                    "serverNames": [$sni],
-                    "privateKey": $private_key,
-                    "shortIds": [$short_id],
-                    "fingerprint": "chrome"
-                }
-            }
-        }],
-        "outbounds": [{
-            "protocol": "freedom",
-            "settings": {
-                "domainStrategy": "UseIPv4v6"
-            }
-        }]
-    }' > "$XRAY_CONFIG"
+    # 核心修复点：通过 check_vps_port 获取纯净的端口数字
+    MTP_PORT=$(check_vps_port "$user_port")
+    IP1=$(get_public_ip)
 
-    chmod 644 "$XRAY_CONFIG"
-    
-    SERVER_IP=$(get_public_ip)
-    cat << EOF >> "$STATE_FILE"
-PORT='${PORT}'
-UUID='${UUID}'
-REMARK='${REMARK}'
-SERVER_IP='${SERVER_IP}'
-EOF
-
-    if command -v rc-service &>/dev/null; then
-        write_openrc_script
-        rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
-        rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 || true
+    if download_and_run_mtg; then
         sleep 1
-        if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
-            info "Xray 独立专属服务已通过 OpenRC 启动！"
-        else
-            error "独立服务启动异常，可选择菜单 8 查看测试输出。"
-        fi
-    else
-        pkill -f "$XRAY_BINARY run" || true
-        "$XRAY_BINARY" run -c "$XRAY_CONFIG" >/dev/null 2>&1 &
-        info "非 OpenRC 环境，已将独立进程注入后台运行。"
-    fi
-
-    showconf
-}
-
-# =========================================================
-# 6. 主流程控制模块与更新功能
-# =========================================================
-inst_xray() {
-    if [[ -f "$XRAY_CONFIG" ]]; then
-        warn "系统检测到本独立面板已存在配置。"
-        read -rp "是否强制清空重新部署？ [y/N]: " CONFIRM_REINST
-        [[ "$CONFIRM_REINST" != "y" && "$CONFIRM_REINST" != "Y" ]] && return 0
-    fi
-
-    info "清理并准备专属的 Alpine 静态组件依赖环境..."
-    if [[ ! -f "$XRAY_BINARY" ]]; then
-        download_and_extract_core || return 1
-    fi
-
-    local encryption_info
-    encryption_info=$(generate_vless_encryption_config) || return 1
-    DECRYPTION=$(echo "$encryption_info" | cut -d'|' -f1)
-    ENCRYPTION=$(echo "$encryption_info" | cut -d'|' -f2)
-
-    local reality_keys
-    reality_keys=$(generate_reality_keys) || return 1
-    PRIVATE_KEY=$(echo "$reality_keys" | cut -d'|' -f1)
-    PUBLIC_KEY=$(echo "$reality_keys" | cut -d'|' -f2)
-
-    local rand_port rand_uuid rand_sid hostname_str default_remark default_sni
-    rand_port=$(get_random_port)
-    rand_uuid=$(generate_uuid)
-    rand_sid=$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \t\n')
-    hostname_str=$(hostname -s 2>/dev/null || echo "alpine")
-    default_remark="${hostname_str}-VLESS-E-Reality"
-    default_sni="www.amazon.com"
-
-    echo "---------------------------------------------"
-    read -rp "👉 请输入监听端口 (直接回车随机分配: ${rand_port}): " INPUT_PORT
-    PORT=${INPUT_PORT:-$rand_port}
-
-    read -rp "👉 请输入UUID (直接回车高强随机: ${rand_uuid}): " INPUT_UUID
-    UUID=${INPUT_UUID:-$rand_uuid}
-
-    read -rp "👉 请输入 REALITY SNI 伪装域名 (默认: ${default_sni}): " INPUT_SNI
-    SNI=${INPUT_SNI:-$default_sni}
-
-    read -rp "👉 请输入 REALITY Short ID (直接回车使用随机: ${rand_sid}): " INPUT_SID
-    SHORT_ID=${INPUT_SID:-$rand_sid}
-
-    read -rp "👉 请输入节点备注名称 (默认: ${default_remark}): " INPUT_REMARK
-    REMARK=${INPUT_REMARK:-$default_remark}
-
-    write_and_show_config
-}
-
-modify_config() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then
-        error "未找到运行的专属配置，请先执行选项 1 安装。"
-        return 1
-    fi
-
-    info "正在拉取现有后量子密钥与 REALITY 矩阵快照..."
-    
-    local current_port current_uuid current_decryption current_private_key current_sni current_short_id current_encryption reality_info current_public_key
-    current_port=$(jq -r '.inbounds[0].port // empty' "$XRAY_CONFIG" 2>/dev/null)
-    current_uuid=$(jq -r '.inbounds[0].settings.clients[0].id // empty' "$XRAY_CONFIG" 2>/dev/null)
-    current_decryption=$(jq -r '.inbounds[0].settings.decryption // empty' "$XRAY_CONFIG" 2>/dev/null)
-    current_private_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey // empty' "$XRAY_CONFIG" 2>/dev/null)
-    current_sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // empty' "$XRAY_CONFIG" 2>/dev/null)
-    current_short_id=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0] // empty' "$XRAY_CONFIG" 2>/dev/null)
-    
-    current_encryption=$(head -n 1 "$STATE_FILE" 2>/dev/null || echo "")
-    reality_info=$(cat "$REALITY_FILE" 2>/dev/null || echo "")
-    current_public_key=$(echo "$reality_info" | cut -d'|' -f1 || true)
-
-    if [[ -z "$current_decryption" || -z "$current_private_key" || -z "$current_encryption" || -z "$current_public_key" ]]; then
-        error "加解密快照记录受损，为防节点失联，请执行选项 1 全新独立安装。"
-        return 1
-    fi
-
-    local current_remark=""
-    if [[ -f "$STATE_FILE" ]]; then
-        current_remark=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 || true)
-    fi
-
-    echo "---------------------------------------------"
-    echo -e "${YELLOW}提示：回车(Enter)保留括号内的当前原设定值${RESET}"
-    echo "---------------------------------------------"
-
-    read -rp "👉 修改监听端口 (当前: ${current_port}): " INPUT_PORT
-    PORT=${INPUT_PORT:-$current_port}
-
-    read -rp "👉 修改UUID (当前: ${current_uuid}): " INPUT_UUID
-    UUID=${INPUT_UUID:-$current_uuid}
-
-    read -rp "👉 修改 REALITY SNI 域名 (当前: ${current_sni}): " INPUT_SNI
-    SNI=${INPUT_SNI:-$current_sni}
-
-    read -rp "👉 修改 REALITY Short ID (当前: ${current_short_id}): " INPUT_SID
-    SHORT_ID=${INPUT_SID:-$current_short_id}
-
-    read -rp "👉 修改节点备注名称 (当前: ${current_remark:-VLESS-E-REALITY}): " INPUT_REMARK
-    REMARK=${INPUT_REMARK:-${current_remark:-VLESS-E-REALITY}}
-
-    DECRYPTION="$current_decryption"
-    ENCRYPTION="$current_encryption"
-    PRIVATE_KEY="$current_private_key"
-    PUBLIC_KEY="$current_public_key"
-
-    write_and_show_config
-}
-
-update_xray() {
-    if [[ ! -f "$XRAY_BINARY" ]]; then
-        error "未检测到已安装的专属核心，无法执行升级。"
-        return 1
-    fi
-
-    warn "开始获取最新的 GitHub 发行版核心..."
-    download_and_extract_core || return 1
-
-    info "重启专属服务组件中..."
-    trigger_restart_logic || true
-    info "Xray 独立核心已成功平滑迭代完毕。"
-}
-
-uninstall_xray() {
-    warn "执行彻底卸载专属独立服务与配置数据清洗..."
-    if command -v rc-service &>/dev/null; then
-        rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
-        rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
-    else
-        pkill -f "$XRAY_BINARY run" || true
-    fi
-    rm -f "$XRAY_BINARY" "$INIT_SERVICE_PATH"
-    rm -rf "$STATE_DIR" "/usr/local/etc/${SERVICE_NAME}" "/usr/local/share/${SERVICE_NAME}"
-    info "Xray 专属独立面板与专属核心已完全从系统中卸载。"
-}
-
-showconf() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then
-        error "未发现生效的专属配置文件。"
-        return 1
-    fi
-
-    local uuid port encryption reality_info public_key sni short_id server_ip current_remark encoded_remark address_for_url vless_link
-    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG")
-    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG")
-    encryption=$(head -n 1 "$STATE_FILE" 2>/dev/null)
-    
-    reality_info=$(cat "$REALITY_FILE" 2>/dev/null || echo "")
-    public_key=$(echo "$reality_info" | cut -d'|' -f1)
-    sni=$(echo "$reality_info" | cut -d'|' -f2)
-    short_id=$(echo "$reality_info" | cut -d'|' -f3)
-
-    server_ip=$(get_public_ip)
-    
-    current_remark="VLESS-E-REALITY"
-    if [[ -f "$STATE_FILE" ]]; then
-        current_remark=$(grep -E "^REMARK=" "$STATE_FILE" | cut -d"'" -f2 || echo "VLESS-E-REALITY")
-    fi
-
-    encoded_remark=$(jq -rn --arg x "$current_remark" '$x|@uri')
-    address_for_url=$server_ip
-    if [[ $server_ip == *":"* ]]; then address_for_url="[${server_ip}]"; fi
-
-    vless_link="vless://${uuid}@${address_for_url}:${port}?encryption=${encryption}&security=reality&sni=${sni}&sid=${short_id}&fp=chrome&pbk=${public_key}&flow=xtls-rprx-vision&type=tcp#${encoded_remark}"
-    echo "$vless_link" > "$LINK_FILE"
-
-    echo -e "${GREEN}====== VLESS-Encryption + Reality 节点信息 ======${RESET}"
-    echo -e "${GREEN}服务器公网 IP   :${RESET} ${server_ip}"
-    echo -e "${GREEN}服务监听端口     :${RESET} ${port}"
-    echo -e "${GREEN}用户 UUID        :${RESET} ${uuid}"
-    echo -e "${GREEN}协议与加密形态   :${RESET} VLESS Encryption (native + 0-RTT + ML-KEM-768)"
-    echo -e "${GREEN}安全伪装类型     :${RESET} Reality"
-    echo -e "${GREEN}流控传输阻断     :${RESET} xtls-rprx-vision (TCP)"
-    echo -e "${GREEN}伪装目标 SNI     :${RESET} ${sni}"
-    echo -e "${GREEN}REALITY ShortID  :${RESET} ${short_id}"
-    echo -e "${GREEN}REALITY 公钥 pbk :${RESET} ${public_key}"
-    echo -e "${GREEN}节点自定义备注   :${RESET} ${current_remark}"
-    echo -e "${YELLOW}📄 V6VPS 请自行替换分享链接中的 IP 为 V6 格式 ★${RESET}"
-    echo "---------------------------------------------"
-    echo -e "${GREEN}👉 v2rayN 链接 (已存至 $LINK_FILE):${RESET}"
-    echo -e "${YELLOW}${vless_link}${RESET}"
-    echo "---------------------------------------------"
-}
-
-# =========================================================
-# 7. 环境强制自校正
-# =========================================================
-check_environment() {
-    if [[ $(id -u) -ne 0 ]]; then error "请切换至 root 用户运行此面板脚本。" && exit 1; fi
-
-    local deps=(jq curl wget openssl ss awk grep tr unzip)
-    local missing=0
-
-    for cmd in "${deps[@]}"; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then missing=1 && break; fi
-    done
-
-    if ! apk info -e gcompat >/dev/null 2>&1; then missing=1; fi
-
-    if [[ "$missing" -eq 1 ]]; then
-        info "正在为您配置 Alpine 环境与后量子兼容依赖 (gcompat / unzip)..."
-        apk add --no-cache jq curl wget openssl iproute2 coreutils gcompat bash unzip || true
-    fi
-}
-
-# ================== SNI 优选 ==================
-select_best_sni() {
-    info "开始优选 SNI 延迟测试..."
-    local SNIS=(
-        amd.com apps.mzstatic.com aws.com azure.microsoft.com beacon.gtv-pub.com
-        bing.com catalog.gamepass.com cdn.bizibly.com cdn-dynmedia-1.microsoft.com
-        devblogs.microsoft.com fpinit.itunes.apple.com go.microsoft.com
-        gray-config-prod.api.arc-cdn.net gray.video-player.arcpublishing.com
-        images.nvidia.com r.bing.com services.digitaleast.mobi snap.licdn.com
-        statici.icloud.com tag.demandbase.com tag-logger.demandbase.com
-        ts1.tc.mm.bing.net ts2.tc.mm.bing.net vs.aws.amazon.com www.apple.com
-        www.icloud.com www.microsoft.com www.oracle.com www.xbox.com
-        www.xilinx.com xp.apple.com
-    )
-    local BEST_SNI=""
-    local BEST_TIME=999999
-
-    for sni in "${SNIS[@]}"; do
-        start=$(date +%s%N)
-        if timeout 2 openssl s_client -connect ${sni}:443 -servername ${sni} -brief </dev/null >/dev/null 2>&1; then
-            end=$(date +%s%N)
-            cost=$(( (end - start) / 1000000 ))
-            echo -e "${GREEN}[SNI] $sni -> ${cost}ms${RESET}"
-            if [ $cost -lt $BEST_TIME ]; then
-                BEST_TIME=$cost; BEST_SNI=$sni
-            fi
-        fi
-    done
-
-    if [ -n "$BEST_SNI" ]; then
-        info "最优 SNI: $BEST_SNI (${BEST_TIME}ms)"
-        return 0
-    else
-        warn "未找到可用 SNI"
-        return 1
-    fi
-}
-
-# ================== 配置自定义Socks5出口 ==================
-configure_custom_socks5_outbound() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then 
-        error "错误: 未安装，无法配置出口模式。"
-        return
-    fi
-
-    local mode current_protocol tmp_file
-    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$XRAY_CONFIG" 2>/dev/null || echo "freedom")
-
-    echo "---------------------------------------------"
-    echo "请选择出口模式："
-    if [[ "$current_protocol" == "socks" ]]; then
-        echo -e "当前模式: ${YELLOW}Socks5 出口${RESET}"
-    else
-        echo -e "当前模式: ${GREEN}直连出口${RESET}"
-    fi
-    echo "1) 直连出口"
-    echo "2) Socks5 出口"
-    echo "0) 取消"
-    echo "---------------------------------------------"
-
-    read -rp "请输入选项 [0-2]: " mode || true
-    case "$mode" in
-        1)
-            tmp_file=$(mktemp)
-            jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$XRAY_CONFIG" > "$tmp_file"
-            if ! jq empty "$tmp_file" >/dev/null 2>&1; then
-                rm -f "$tmp_file"
-                error "生成的直连配置无效。"
-                return 1
-            fi
-            cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
-            mv "$tmp_file" "$XRAY_CONFIG"
-            chmod 644 "$XRAY_CONFIG" 2>/dev/null || true
-            if ! trigger_restart_logic; then
-                error "切换到直连失败，服务无法重启。"
-                return 1
-            fi
-            info "已成功切换为直连出口！"
-            return
-            ;;
-        2)
-            ;;
-        0|"")
-            info "已取消配置。"
-            return
-            ;;
-        *)
-            error "无效选项，请输入 0-2 之间的数字。"
-            return 1
-            ;;
-    esac
-
-    info "配置自定义 Socks5 出口代理..."
-    local socks_host socks_port socks_user socks_pass
-
-    read -rp "请输入 Socks5 服务器地址/IP: " socks_host || true
-    [[ -z "$socks_host" ]] && info "已取消配置。" && return
-
-    while true; do
-        read -rp "请输入 Socks5 端口 (默认: 1080): " socks_port || true
-        [[ -z "$socks_port" ]] && socks_port=1080
-        if is_valid_port "$socks_port"; then
-            break
-        else
-            error "端口无效，请输入一个1-65535之间的数字。"
-        fi
-    done
-
-    read -rp "请输入 Socks5 用户名 (若无密码认证请直接留空回车): " socks_user || true
-    if [[ -n "$socks_user" ]]; then
-        read -rs -p "请输入 Socks5 密码: " socks_pass || true
-        echo
-    else
-        socks_pass=""
-    fi
-
-    tmp_file=$(mktemp)
-
-    if [[ -n "$socks_user" ]]; then
-        jq \
-            --arg host "$socks_host" \
-            --argjson port "$socks_port" \
-            --arg user "$socks_user" \
-            --arg pass "$socks_pass" \
-            '
-            .outbounds = [
-              {
-                "protocol": "socks",
-                "tag": "custom-socks5-out",
-                "settings": {
-                  "servers": [
-                    {
-                      "address": $host,
-                      "port": $port,
-                      "users": [
-                        {
-                          "user": $user,
-                          "pass": $pass
-                        }
-                      ]
-                    }
-                  ]
-                }
-              }
-            ]
-            ' "$XRAY_CONFIG" > "$tmp_file"
-    else
-        jq \
-            --arg host "$socks_host" \
-            --argjson port "$socks_port" \
-            '
-            .outbounds = [
-              {
-                "protocol": "socks",
-                "tag": "custom-socks5-out",
-                "settings": {
-                  "servers": [
-                    {
-                      "address": $host,
-                      "port": $port
-                    }
-                  ]
-                }
-              }
-            ]
-            ' "$XRAY_CONFIG" > "$tmp_file"
-    fi
-
-    if ! jq empty "$tmp_file" >/dev/null 2>&1; then
-        rm -f "$tmp_file"
-        error "生成的 Socks5 配置无效，请检查输入后重试。"
-        return 1
-    fi
-
-    cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
-    mv "$tmp_file" "$XRAY_CONFIG"
-    chmod 644 "$XRAY_CONFIG" 2>/dev/null || true
-
-    if ! trigger_restart_logic; then
-        error "重启服务失败，当前 Socks5 配置可能不兼容。"
-        return 1
-    fi
-    info "已成功切换为 Socks5 出口！"
-}
-
-# =========================================================
-# 8. 面板主菜单
-# =========================================================
-menu() {
-    check_environment
-
-    while true; do
-        clear
-        local status version port_show
-        status=$(get_xray_status)
-        version=$(get_installed_version)
-        port_show=$(get_current_port_display)
-
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} Xray VLESS-Encrypt+Reality 面板 ${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}状态   :${RESET} $status"
-        echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-        echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} 1. 安装 Xray VLESS-Encrypt+Reality${RESET}"
-        echo -e "${GREEN} 2. 更新 Xray${RESET}"
-        echo -e "${GREEN} 3. 卸载 Xray${RESET}"
-        echo -e "${GREEN} 4. 修改配置${RESET}"
-        echo -e "${GREEN} 5. 启动 Xray${RESET}"
-        echo -e "${GREEN} 6. 停止 Xray${RESET}"
-        echo -e "${GREEN} 7. 重启 Xray${RESET}"
-        echo -e "${GREEN} 8. 查看日志${RESET}"
-        echo -e "${GREEN} 9. 查看节点配置${RESET}"
-        echo -e "${GREEN}10. 配置Socks5出口${RESET}"
-        echo -e "${GREEN}11. SNI域名优选 ✨${RESET}"
-        echo -e "${GREEN} 0. 退出${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-
-        local choice=""
-        read -r -p $'\033[32m请输入选项: \033[0m' choice || true
-        [[ -z "$choice" ]] && continue
-
-        case "$choice" in
-            1) inst_xray; pause ;;
-            2) update_xray; pause ;;
-            3) uninstall_xray; pause ;;
-            4) modify_config; pause ;;
-            5) 
-                if command -v rc-service &>/dev/null && [ -f "$INIT_SERVICE_PATH" ]; then
-                    rc-service "$SERVICE_NAME" start && info "独立服务已成功启动！"
-                else
-                    pkill -f "$XRAY_BINARY run" || true
-                    "$XRAY_BINARY" run -c "$XRAY_CONFIG" >/dev/null 2>&1 &
-                    info "专属独立进程已在后台拉起！"
-                fi
-                pause ;;
-            6) 
-                if command -v rc-service &>/dev/null && [ -f "$INIT_SERVICE_PATH" ]; then
-                    rc-service "$SERVICE_NAME" stop && info "独立服务已成功停止！"
-                else
-                    pkill -f "$XRAY_BINARY run" && info "专属后台进程已终止！"
-                fi
-                pause ;;
-            7) 
-                trigger_restart_logic && info "服务已成功完成重启重启！"
-                pause ;;
-            8) 
-                if [[ -f /var/log/messages ]]; then
-                    echo -e "${CYAN}--- 最近 50 行专属系统服务日志 ---${RESET}"
-                    tail -n 50 /var/log/messages | grep -E "${SERVICE_NAME}|supervise-daemon" || tail -n 50 /var/log/messages
-                    echo "--------------------------------------"
-                else
-                    warn "系统暂未建立全局通用日志追踪：/var/log/messages"
-                fi
-                if [[ -f "$XRAY_BINARY" && -f "$XRAY_CONFIG" ]]; then
-                    "$XRAY_BINARY" run -test -config "$XRAY_CONFIG" || true
-                fi
-                pause ;;
-            9) showconf; pause ;;
-            10) configure_custom_socks5_outbound; pause ;;
-            11) select_best_sni; pause ;;
-            0) exit 0 ;;
-            *) error "无效输入，请重新选择。"; sleep 1 ;;
+        purple_echo "\n🎉 MTProto 安装/修改完成！"
+        LINKS="tg://proxy?server=$IP1&port=$MTP_PORT&secret=$SECRET"
+        green_echo "$LINKS\n"
+        echo -e "$LINKS" > "${WORKDIR}/link.txt"
+        
+        read -p "是否同时将MTProto加入开机自启（Crontab）？[回车默认加入,Y/n]: " choice_cron
+        case "$choice_cron" in
+            [nN][oO]|[nN]) remove_cron ;;
+            *) set_cron ;;
         esac
-    done
+    fi
 }
 
-menu "$@"
+# ================== 主菜单循环 ==================
+while true; do
+    clear
+    
+    # 严格调用函数获取状态和端口，杜绝在主循环体直接使用 local
+    status_display=$(get_status_display)
+    port_display=$(get_running_port)
+    
+    if check_cron_status; then
+        cron_display="${GREEN}已开启${RESET}"
+    else
+        cron_display="${RED}已关闭${RESET}"
+    fi
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}     MTProto Proxy 管理面板     ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态     :${RESET} ${status_display}"
+    echo -e "${GREEN}端口     :${RESET} ${YELLOW}${port_display}${RESET}"
+    echo -e "${GREEN}开机自启 :${RESET} ${cron_display}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装 MTProto${RESET}"
+    echo -e "${GREEN}2. 修改配置${RESET}"
+    echo -e "${GREEN}3. 卸载 MTProto${RESET}"
+    echo -e "${GREEN}4. 启动 MTProto${RESET}"
+    echo -e "${GREEN}5. 停止 MTProto${RESET}"
+    echo -e "${GREEN}6. 重启 MTProto${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看连接配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    read -p "$(echo -e ${GREEN}请选择:${RESET} )" choice
+
+    case $choice in
+        1|2)
+            clear; core_install; read -p "按回车返回菜单..." ;;
+        3)
+            clear
+            stop_proxy; remove_cron; rm -rf "$WORKDIR"
+            red_echo "MTProto 已彻底从系统中卸载！"; read -p "按回车返回菜单..." ;;
+        4)
+            clear; start_proxy; read -p "按回车返回菜单..." ;;
+        5)
+            clear; stop_proxy; read -p "按回车返回菜单..." ;;
+        6)
+            clear; stop_proxy; sleep 1; start_proxy; read -p "按回车返回菜单..." ;;
+        7)
+            clear
+            if [ -f "$LOG_FILE" ]; then
+                purple_echo "=== 正在查看最新 50 行运行日志 ==="
+                tail -n 50 "$LOG_FILE"
+            else
+                yellow_echo "暂无日志文件。"
+            fi
+            read -p "按回车返回菜单..." ;;
+        8)
+            clear; show_config; read -p "按回车返回菜单..." ;;
+        0)
+            exit 0 ;;
+        *)
+            red_echo "无效输入！" ; sleep 1 ;;
+    esac
+done

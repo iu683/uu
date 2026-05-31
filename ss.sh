@@ -18,7 +18,7 @@ AUTO_REGISTER_LOCALE="en_US"
 AUTO_REGISTER_MODEL="PC"
 AUTO_REGISTER_JWT=""
 
-# ---- 颜色定义 (兼容你的 RESET 命名) ----
+# ---- 颜色定义 ----
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 RED='\033[0;31m'
@@ -92,21 +92,22 @@ pick_service_manager() {
 }
 
 install_packages() {
+  info "正在尝试自动安装依赖包 (curl, unzip, ca-certificates, python3)..."
   if command -v apt-get >/dev/null 2>&1; then
     run_as_root apt-get update
-    run_as_root apt-get install -y curl unzip ca-certificates
+    run_as_root apt-get install -y curl unzip ca-certificates python3
   elif command -v dnf >/dev/null 2>&1; then
-    run_as_root dnf install -y curl unzip ca-certificates
+    run_as_root dnf install -y curl unzip ca-certificates python3
   elif command -v yum >/dev/null 2>&1; then
-    run_as_root yum install -y curl unzip ca-certificates
+    run_as_root yum install -y curl unzip ca-certificates python3
   elif command -v apk >/dev/null 2>&1; then
-    run_as_root apk add --no-cache curl unzip ca-certificates
+    run_as_root apk add --no-cache curl unzip ca-certificates python3
   elif command -v pacman >/dev/null 2>&1; then
-    run_as_root pacman -Sy --noconfirm curl unzip ca-certificates
+    run_as_root pacman -Sy --noconfirm curl unzip ca-certificates python3
   elif command -v zypper >/dev/null 2>&1; then
-    run_as_root zypper --non-interactive install curl unzip ca-certificates
+    run_as_root zypper --non-interactive install curl unzip ca-certificates python3
   else
-    die "无法自动安装依赖，请手动安装: curl unzip ca-certificates"
+    warn "无法确定包管理器，请手动确保安装了: curl unzip ca-certificates python3"
   fi
 }
 
@@ -374,15 +375,16 @@ show_status() {
       status_line="运行中"
     fi
   else
-    status_line="未创建服务"
+    status_line="未安装"
   fi
 
   echo -e "${GREEN}================================${RESET}"
-  echo -e "${GREEN}        usque 管理面板          ${RESET}"
+  echo -e "${GREEN}         usque 管理面板          ${RESET}"
   echo -e "${GREEN}================================${RESET}"
-  echo -e "${GREEN}状态   :${RESET} $status_line ($installed)"
+  echo -e "${GREEN}状态   :${RESET} ${YELLOW}$status_line${RESET}"
+  echo -e "${GREEN}版本   :${RESET} ${YELLOW}$version${RESET}"
   echo -e "${GREEN}模式   :${RESET} ${YELLOW}$mode${RESET}"
-  echo -e "${GREEN}端口   :${RESET} ${YELLOW}${bind}:${port} (${mode})${RESET}"
+  echo -e "${GREEN}监听   :${RESET} ${YELLOW}${bind}:${port}${RESET}"
   echo -e "${GREEN}================================${RESET}"
   echo -e "${GREEN} 1. 安装 usque${RESET}"
   echo -e "${GREEN} 2. 更新 usque${RESET}"
@@ -406,6 +408,11 @@ update_usque() {
     install_packages
   fi
   need_cmd unzip
+
+  # 如果没有 curl、unzip 或 python3，直接进入自动安装流程，而不是拦截报错
+  if ! command -v curl >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+    install_packages
+  fi
 
   os="$(detect_os)"
   arch="$(detect_arch)"
@@ -505,7 +512,7 @@ service_status() {
 }
 
 pause() {
-  printf '\n按回车继续...'
+  printf "\n${GREEN}按回车继续...${RESET}"
   read -r _
 }
 
@@ -514,7 +521,8 @@ menu_loop() {
   while true; do
     clear || true
     show_status
-    printf '请选择: '
+    
+    printf "${GREEN}请选择: ${RESET}"
     read -r choice
     case "$choice" in
       1) install_register_start ;;

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #=============================================================================
-# 颜色定义（保留中文变量名以兼容现有代码）
+# 颜色定义
 gl_hong='\033[31m'      # 红色
 gl_lv='\033[32m'        # 绿色
 gl_huang='\033[33m'     # 黄色
@@ -182,9 +182,8 @@ check_root() {
 break_end() {
     [ "$AUTO_MODE" = "1" ] && return
     echo -e "${gl_lv}操作完成${gl_bai}"
-    echo "按任意键继续..."
+    echo -e "${gl_lv}按回车返回菜单...${gl_bai}"
     read -n 1 -s -r -p ""
-    echo ""
 }
 
 clean_sysctl_conf() {
@@ -538,65 +537,8 @@ calculate_optimal_swap() {
     esac
 }
 
-manage_swap() {
-    while true; do
-        clear
-        echo -e "${gl_kjlan}=== 虚拟内存管理（仅限 /swapfile） ===${gl_bai}"
-        echo -e "${gl_huang}提示:${gl_bai} 如需调整 /dev/ swap 分区，请手动执行 swapoff/swap 分区工具。"
-
-        local mem_total=$(free -m | awk 'NR==2{print $2}')
-        local swap_used=$(free -m | awk 'NR==3{print $3}')
-        local swap_total=$(free -m | awk 'NR==3{print $2}')
-        local swap_info=$(free -m | awk 'NR==3{used=$3; total=$2; if (total == 0) {percentage=0} else {percentage=used*100/total}; printf "%dM/%dM (%d%%)", used, total, percentage}')
-        
-        echo -e "物理内存:     ${gl_huang}${mem_total}MB${gl_bai}"
-        echo -e "当前虚拟内存: ${gl_huang}$swap_info${gl_bai}"
-        echo "------------------------------------------------"
-        echo "1. 分配 1024M (1GB) - 固定配置"
-        echo "2. 分配 2048M (2GB) - 固定配置"
-        echo "3. 分配 4096M (4GB) - 固定配置"
-        echo "4. 智能计算推荐值 - 自动计算最佳配置"
-        echo "0. 返回主菜单"
-        echo "------------------------------------------------"
-        read -e -p "请输入选择: " choice
-        
-        case "$choice" in
-            1)
-                add_swap 1024
-                break_end
-                ;;
-            2)
-                add_swap 2048
-                break_end
-                ;;
-            3)
-                add_swap 4096
-                break_end
-                ;;
-            4)
-                calculate_optimal_swap
-                if [ $? -eq 0 ]; then
-                    break_end
-                fi
-                ;;
-            0)
-                return
-                ;;
-            *)
-                echo "无效选择"
-                sleep 2
-                ;;
-        esac
-    done
-}
-
-
-#=============================================================================
-# 功能3 的 tcp_mtu_probing=1 + clamp-mss-to-pmtu 已覆盖 MTU 智能探测
-#=============================================================================
 
 auto_cleanup_legacy_mtu() {
-    # 检测旧版功能4的配置文件是否存在
     [ -f /usr/local/etc/mtu-optimize.conf ] || return 0
 
     # 恢复默认路由 MTU
@@ -642,7 +584,7 @@ auto_cleanup_legacy_mtu() {
         systemctl daemon-reload 2>/dev/null
     fi
 
-    echo -e "${gl_huang}⚠️ 检测到旧版MTU优化配置（已被功能3的tcp_mtu_probing替代），已自动清理${gl_bai}"
+    echo -e "${gl_huang}⚠️ 已自动清理${gl_bai}"
     sleep 2
 }
 
@@ -1518,7 +1460,7 @@ apply_mss_clamp() {
 
 # 直连/落地优化配置
 bbr_configure_direct() {
-    echo -e "${gl_kjlan}=== 配置 BBR v3 + FQ 直连/落地优化（智能检测版） ===${gl_bai}"
+    echo -e "${gl_lv}=== BBR网络优化 ===${gl_bai}"
     echo ""
     
     # 步骤 0：SWAP智能检测和建议
@@ -1948,8 +1890,7 @@ LIMITSEOF
     # 最终判断
     if [ "$actual_qdisc" = "fq" ] && [ "$actual_cc" = "bbr" ] && \
        [ "$actual_wmem" = "$buffer_bytes" ] && [ "$actual_rmem" = "$buffer_bytes" ]; then
-        echo -e "${gl_lv}✅ BBR v3 直连/落地优化配置完成并已生效！${gl_bai}"
-        echo -e "${gl_zi}配置说明: ${buffer_mb}MB 缓冲区（${detected_bandwidth} Mbps 带宽），适合直连/落地场景${gl_bai}"
+        echo -e "${gl_lv}✅ BBR网络优化完成并已生效！${gl_bai}"
     else
         echo -e "${gl_huang}⚠️ 配置已保存但部分参数未生效${gl_bai}"
         echo -e "${gl_huang}建议执行以下操作：${gl_bai}"
@@ -2731,23 +2672,23 @@ show_main_menu() {
     local is_installed=$?
 
     if echo "$kernel_release" | grep -qi 'xanmod'; then
-        kernel_line="XanMod 运行中 | ${kernel_release}"
+        kernel_line="XanMod 运行中 "
     elif [ $is_installed -eq 0 ]; then
-        kernel_line="XanMod 已安装 | ${kernel_release}"
+        kernel_line="XanMod 已安装 "
     else
-        kernel_line="默认内核 | ${kernel_release}"
+        kernel_line="默认内核"
     fi
 
     if [ "$current_cc" = "bbr" ]; then
         bbr_line="已启用"
     else
-        bbr_line="未启用 (${current_cc})"
+        bbr_line="未启用"
     fi
 
     echo -e "${COLOR_GREEN}================================${COLOR_RESET}"
-    echo -e "${COLOR_GREEN}      BBR / XanMod 网络调优      ${COLOR_RESET}"
+    echo -e "${COLOR_GREEN}     BBR V3/ XanMod 网络调优     ${COLOR_RESET}"
     echo -e "${COLOR_GREEN}================================${COLOR_RESET}"
-    echo -e "${COLOR_GREEN}内核   :${COLOR_RESET} ${kernel_line}"
+    echo -e "${COLOR_GREEN}内核   :${COLOR_RESET} ${COLOR_YELLOW}${kernel_line}${COLOR_RESET}"
     echo -e "${COLOR_GREEN}BBR    :${COLOR_RESET} ${COLOR_YELLOW}${bbr_line}${COLOR_RESET}"
     echo -e "${COLOR_GREEN}================================${COLOR_RESET}"
     echo -e "${COLOR_GREEN} 1. 安装/更新 XanMod 内核${COLOR_RESET}"
@@ -2755,7 +2696,8 @@ show_main_menu() {
     echo -e "${COLOR_GREEN} 3. 卸载BBR网络优化${COLOR_RESET}"
     echo -e "${COLOR_GREEN} 0. 退出${COLOR_RESET}"
     echo -e "${COLOR_GREEN}================================${COLOR_RESET}"
-    read -e -p "请输入选择: " choice
+    read -e -p "$(echo -e "${COLOR_GREEN}请输入选择: ")" choice
+    echo -e "${COLOR_RESET}\c"
 
     case "$choice" in
         1)
@@ -2771,10 +2713,8 @@ show_main_menu() {
             ;;
         3)
             uninstall_all
-            break_end
             ;;
         0)
-            echo "退出脚本"
             exit 0
             ;;
         *)
@@ -3037,14 +2977,14 @@ uninstall_xanmod() {
 
 # 完全卸载脚本所有内容
 uninstall_all() {
-    echo -e "${gl_kjlan}开始卸载...${gl_bai}"
+    echo -e "${gl_lv}开始卸载...${gl_bai}"
     echo ""
     
     local uninstall_count=0
     local xanmod_removed=0
     
     # 1. 卸载 XanMod 内核
-    echo -e "${gl_huang}[1/8] 检查并卸载 XanMod 内核...${gl_bai}"
+    echo -e "${gl_huang}检查并卸载 XanMod 内核...${gl_bai}"
     if dpkg -l | grep -qE '^ii\s+linux-.*xanmod'; then
         # 安全检查：确认有回退内核
         local non_xanmod_kernels=$(dpkg -l 2>/dev/null | grep '^ii' | grep 'linux-image-' | grep -v 'xanmod' | grep -v 'dbg' | wc -l)
@@ -3072,7 +3012,7 @@ uninstall_all() {
     echo ""
     
     # 3. 清理 sysctl 配置文件
-    echo -e "${gl_huang}[3/8] 清理 sysctl 配置文件...${gl_bai}"
+    echo -e "${gl_huang}清理 sysctl 配置文件...${gl_bai}"
     local sysctl_files=(
         "$SYSCTL_CONF"
         "/etc/sysctl.d/99-bbr-xanmod.conf"
@@ -3097,7 +3037,7 @@ uninstall_all() {
     echo ""
     
     # 4. 清理 XanMod 软件源
-    echo -e "${gl_huang}[4/8] 清理 XanMod 软件源...${gl_bai}"
+    echo -e "${gl_huang}清理 XanMod 软件源...${gl_bai}"
     local repo_files=(
         "/etc/apt/sources.list.d/xanmod-release.list"
         "/usr/share/keyrings/xanmod-archive-keyring.gpg"
@@ -3119,11 +3059,10 @@ uninstall_all() {
     fi
     echo ""
     
-    # 5. 清理持久化服务和优化配置（功能3/4/5）
-    echo -e "${gl_huang}[5/8] 清理持久化服务和优化配置...${gl_bai}"
+    # 5. 清理持久化服务和优化配置
+    echo -e "${gl_huang}清理持久化服务和优化配置...${gl_bai}"
     local persist_cleaned=0
 
-    # 功能4: MTU优化 — 恢复路由/链路MTU + 清理服务
     if [ -f /usr/local/etc/mtu-optimize.conf ]; then
         . /usr/local/etc/mtu-optimize.conf 2>/dev/null
         # 恢复默认路由 MTU
@@ -3173,7 +3112,7 @@ uninstall_all() {
 
     if [ $persist_cleaned -gt 0 ]; then
         systemctl daemon-reload 2>/dev/null || true
-        echo -e "  ${gl_lv}✅ 已清理 $persist_cleaned 个持久化组件${gl_bai}"
+        echo -e "  ${gl_lv}✅ 已清理持久化服务${gl_bai}"
         uninstall_count=$((uninstall_count + 1))
     else
         echo -e "  ${gl_huang}未找到持久化服务${gl_bai}"
@@ -3197,10 +3136,12 @@ uninstall_all() {
     echo ""
     
     # 7. 应用 sysctl 更改
-    echo -e "${gl_huang}[7/8] 应用系统配置更改...${gl_bai}"
+    echo -e "${gl_huang}应用系统配置更改...${gl_bai}"
     sysctl --system > /dev/null 2>&1
     echo -e "  ${gl_lv}✅ 系统配置已重置${gl_bai}"
+    echo -e "  ${gl_lv}✅ 重启系统后生效${gl_bai}"
     echo ""
+    reboot
 }
 
 

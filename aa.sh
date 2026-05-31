@@ -1,601 +1,308 @@
-#!/usr/bin/env bash
-#
-# Sing-box (NaiveProxy) Alpine 专属管理面板
-# SPDX-License-Identifier: MIT
-#
+#!/bin/bash
+
 # =========================================================
-# 1. 核心控制与全局环境初始化
+# Shadowsocks-Rust 管理脚本 (Alpine Linux )
 # =========================================================
-set -Eop pipefail
-export LANG=en_US.UTF-8
 
-# 基础目录与硬编码配置
-readonly SB_CONFIG="/etc/ap-naiveproxy-sb/config.json"
-readonly SB_BINARY="/usr/local/bin/sing-box"
-readonly SB_DIR="/root/proxynode/naiveproxy"
-EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
-INIT_SERVICE_DIR="/etc/init.d"
-CONFIG_DIR="/etc/ap-naiveproxy-sb"
-REPO_URL="https://github.com/SagerNet/sing-box"
-API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
-CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
+set -euo pipefail
 
-# 自动检测环境变量
-OPERATING_SYSTEM="linux"
-ARCHITECTURE="${ARCHITECTURE:-}"
-
-# 终端颜色代码
+# ================== 颜色 ==================
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 BLUE="\033[34m"
-CYAN="\033[36m"
 RESET="\033[0m"
 
-# =========================================================
-# 2. Alpine 原生底层工具函数
-# =========================================================
-has_command() {
-  local _command=$1
-  type -P "$_command" > /dev/null 2>&1
-}
+# ================== 基础变量 ==================
+SS_DIR="/etc/ss-rust"
+SS_CONFIG="${SS_DIR}/config.json"
+SS_INIT_SCRIPT="/etc/init.d/ss-rust"
+BINARY_PATH="/usr/local/bin/ssserver"
+LOG_FILE="/var/log/ss-rust.log"
+RUN_USER="ss-rust"
+RUN_GROUP="ss-rust"
+METHOD="2022-blake3-aes-256-gcm"
+TMP_DIR=$(mktemp -d -t ss-rust.XXXXXX)
 
-curl() {
-  command curl "${CURL_FLAGS[@]}" "$@"
-}
-
-mktemp() {
-  command mktemp -t "sbservinst.XXXXXXXXXX"
-}
-
-info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
-error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
-pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
-
-# OpenRC 服务操作封装
-rc_service() {
-  if ! has_command rc-service; then
-    return 1
-  fi
-  command rc-service "$@"
-}
-
-rc_update() {
-  if ! has_command rc-update; then
-    return 1
-  fi
-  command rc-update "$@"
-}
-
-install_content() {
-  local _perms="$1"
-  local _content="$2"
-  local _destination="$3"
-  local _overwrite="$4"
-
-  echo -ne "安装 $_destination ... "
-  if [[ -z "$_overwrite" && -e "$_destination" ]]; then
-    echo -e "已存在"
-  else
-    if mkdir -p "$(dirname "$_destination")" && echo "$_content" > "$_destination" && chmod "$_perms" "$_destination"; then
-      echo -e "完成"
-    else
-      echo -e "失败"
-    fi
-  fi
-}
-
-remove_file() {
-  local _target="$1"
-  echo -ne "移除 $_target ... "
-  if rm -f "$_target"; then
-    echo -e "完成"
-  fi
-}
-
-install_software() {
-  local _package_name="$1"
-  echo "正在通过 apk 安装缺失的依赖 '$_package_name' ... "
-  if apk add --no-cache "$_package_name" >/dev/null 2>&1; then
-    echo "依赖安装成功"
-  else
-    error "无法通过 apk 安装 '$_package_name'，请手动检查 Alpine 源配置。"
-    exit 65
-  fi
-}
-
-check_environment() {
-  if [[ ! -f /etc/alpine-release ]]; then
-    warn "检测到当前系统可能不是 Alpine Linux，但脚本将继续尝试运行..."
-  fi
-
-  case "$(uname -m)" in
-    'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
-    'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
-    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
-  esac
-
-  # 确保 Alpine 环境具备基本依赖与 glibc 兼容层
-  has_command bash || install_software bash
-  has_command curl || install_software curl
-  has_command grep || install_software grep
-  has_command jq || install_software jq
-  has_command tar || install_software tar
-  
-  # 关键修复：Alpine 必须安装 gcompat 才能运行官方 Sing-box 二进制文件
-  if ! apk info -e gcompat >/dev/null 2>&1; then
-    info "检测到缺少 glibc 运行环境，正在安装 gcompat 兼容层..."
-    install_software gcompat
-  fi
-}
-
-get_installed_version() {
-  if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
-    local version_out
-    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null || echo "")
-    if [[ -n "$version_out" ]]; then
-      echo "$version_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' | head -n 1 || echo "未知格式"
-    else
-      echo "未知版本(请尝试安装gcompat)"
-    fi
-  else
-    echo "未安装"
-  fi
-}
+# ================== 工具函数 ==================
+info() { echo -e "${GREEN}[信息] $*${RESET}"; }
+error() { echo -e "${RED}[错误] $*${RESET}"; }
+pause() { echo; echo -ne "${GREEN}按任意键返回菜单...${RESET}"; read -n 1 -s; echo; }
 
 get_latest_version() {
-  local _tmpfile=$(mktemp)
-  if ! curl -sS -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases" -o "$_tmpfile"; then
-    rm -f "$_tmpfile"
-    echo "v1.12.3"
-    return
-  fi
-  local _tag_name=$(jq -r '[.[] | select(.prerelease==false and .draft==false)][0].tag_name' "$_tmpfile" 2>/dev/null || echo "")
-  rm -f "$_tmpfile"
-  
-  if [[ -n "$_tag_name" ]]; then
-    echo "${_tag_name##*\/}"
-  else
-    echo "v1.12.3"
-  fi
+    curl -fsSL "https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest" | \
+    grep '"tag_name":' | head -n 1 | sed -E 's/.*"v?([^"]+)".*/\1/'
 }
 
-download_singbox() {
-  local _version="$1"
-  local _destination="$2"
-  local _ver_num="${_version#v}"
-  
-  local _download_url="$REPO_URL/releases/download/$_version/sing-box-$_ver_num-$OPERATING_SYSTEM-$ARCHITECTURE.tar.gz"
-  
-  info "正在下载官方 Sing-box 核心组件: $_download_url ..."
-  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
-    error "核心下载失败！请检查您的网络连接。"
-    return 11
-  fi
-  return 0
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64)  echo "x86_64-unknown-linux-musl" ;;
+        aarch64) echo "aarch64-unknown-linux-musl" ;;
+        *) error "不支持的架构: $(uname -m)"; exit 1 ;;
+    esac
 }
 
-# Alpine OpenRC 专属服务脚本底座
-tpl_singbox_server_openrc_base() {
-  cat << 'EOF'
-#!/sbin/openrc-run
-
-description="Sing-box NaiveProxy Service"
-supervisor="supervise-daemon"
-command="/usr/local/bin/sing-box"
-command_args="run -c /etc/ap-naiveproxy-sb/config.json"
-extra_started_commands="reload"
-
-depend() {
-    need net
-    after firewall
+get_vps_dns() {
+    local dns_list=$(grep -E '^nameserver' /etc/resolv.conf | awk '{print $2}' | paste -sd "," -)
+    echo "${dns_list:-"1.1.1.1,8.8.8.8"}"
 }
 
-reload() {
-    ebegin "Reloading sing-box configuration"
-    supervise-daemon --signal HUP --name sing-box
-    eend $?
-}
-EOF
-}
-
-# =========================================================
-# 3. 面板辅助网络与配置扩展函数
-# =========================================================
-get_sb_status() {
-  if has_command rc-service && rc-service ap-naiveproxy-sb status >/dev/null 2>&1; then
-    echo -e "${GREEN}● 运行中 ${RESET}"
-  else
-    if pgrep -f "$EXECUTABLE_INSTALL_PATH run" >/dev/null 2>&1; then
-      echo -e "${GREEN}● 运行中 ${RESET}"
-    else
-      echo -e "${RED}● 未运行${RESET}"
-    fi
-  fi
+# 公网IP获取
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    error "无法获取公网 IP 地址。" && return 1
 }
 
-get_current_domain_display() {
-  if [[ -f "$SB_CONFIG" ]]; then
-    local domain
-    domain=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || echo "")
-    echo "${domain:- -}"
-  else echo "-"; fi
-}
-
-# 完美适配 BusyBox 的随机字符串生成函数
-generate_random_string() {
-  local length=$1
-  cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c "$length" || true
-}
-
-# =========================================================
-# 4. 面板核心交互与配置文件处理
-# =========================================================
-write_and_show_config() {
-  mkdir -p "$CONFIG_DIR"
-
-  cat << EOF > "$SB_CONFIG"
-{
-  "log": {
-    "level": "info"
-  },
-  "inbounds": [
-    {
-      "type": "naive",
-      "tag": "naive-in",
-      "listen": "::",
-      "listen_port": ${sb_port},
-      "users": [
-        {
-          "username": "${sb_username}",
-          "password": "${sb_password}"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${sb_domain}",
-        "acme": {
-          "domain": ["${sb_domain}"],
-          "email": "${sb_email}"
-        }
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ]
-}
-EOF
-
-  mkdir -p "$SB_DIR"
-  
-  local encoded_node_name=$(jq -rn --arg x "$sb_node_name" '$x|@uri')
-  local share_link="naive+https://${sb_username}:${sb_password}@${sb_domain}:${sb_port}#${sb_node_name}"
-
-  cat << EOF > "$SB_DIR/url.txt"
-V2rayN 配置分享链接:
-${share_link}
-EOF
-
-  cat << EOF > "$SB_DIR/meta.env"
-sb_domain="${sb_domain}"
-sb_email="${sb_email}"
-sb_username="${sb_username}"
-sb_password="${sb_password}"
-sb_node_name="${sb_node_name}"
-sb_port="${sb_port}"
-EOF
-
-  # 托管环境行为控制 (OpenRC 适配)
-  if has_command rc-service && [ -d "$INIT_SERVICE_DIR" ]; then
-    rc_update add sing-box default >/dev/null 2>&1 || true
-    rc_service sing-box restart >/dev/null 2>&1 || true
+# ================== 核心：写入配置 ==================
+write_config_and_link() {
+    local port=$1
+    local pass=$2
+    local dns_str=$3
     
-    if rc_service sing-box status >/dev/null 2>&1; then
-      info "Sing-box 服务通过 OpenRC 配置并启动成功！"
+    dns_str=$(echo "$dns_str" | tr -d ' ')
+    local dns_json=$(echo "\"${dns_str//,/\",\"}\"")
+
+    cat > "$SS_CONFIG" <<EOF
+{
+    "server": "::",
+    "server_port": $port,
+    "password": "$pass",
+    "method": "$METHOD",
+    "fast_open": true,
+    "mode": "tcp_and_udp",
+    "timeout": 300,
+    "no_delay": true,
+    "ipv6_first": false,
+    "nameserver": [$dns_json]
+}
+EOF
+    chown "${RUN_USER}:${RUN_GROUP}" "$SS_CONFIG"
+    chmod 600 "$SS_CONFIG"
+
+    local ip=$(get_public_ip)
+    [[ "$ip" =~ : ]] && ip="[$ip]"
+    local encoded=$(echo -n "${METHOD}:${pass}" | base64 | tr -d '\n')
+    echo "ss://${encoded}@${ip}:${port}#$(hostname)-SS2022" > "${SS_DIR}/ss.txt"
+    echo "${HOSTNAME}-SS2022 = ss, ${ip}, ${port}, encrypt-method=${METHOD}, password=${pass}, tfo=true, udp-relay=true, ecn=true" > "${SS_DIR}/Surge.txt"
+}
+
+show_node_info() {
+    if [[ -f "${SS_CONFIG}" ]]; then
+        local ip port pass
+
+        ip=$(get_public_ip)
+        port=$(grep -E '"server_port":' "$SS_CONFIG" | grep -oE '[0-9]+' | head -n1)
+        pass=$(grep -E '"password":' "$SS_CONFIG" | cut -d '"' -f4 | head -n1)
+
+        [[ "$ip" =~ : ]] && ip="[$ip]"
+
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${YELLOW}       Shadowsocks 节点信息      ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+
+        echo -e "${YELLOW} IP地址        : ${ip}${RESET}"
+        echo -e "${YELLOW} 端口          : ${port}${RESET}"
+        echo -e "${YELLOW} 密码          : ${pass}${RESET}"
+        echo -e "${YELLOW} 加密          : ${METHOD}${RESET}"
+
+        echo -e "${YELLOW}---------------------------------${RESET}"
+        echo -e "${YELLOW}📄 V6 VPS 请替换为 IPv6 地址 ★${RESET}"
+
+        echo
+        echo -e "${GREEN}SS 链接:${RESET}"
+        [[ -f "${SS_DIR}/ss.txt" ]] && echo -e "${YELLOW}$(cat "${SS_DIR}/ss.txt")${RESET}"
+
+        echo
+        echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
+        [[ -f "${SS_DIR}/Surge.txt" ]] && echo -e "${YELLOW}$(cat "${SS_DIR}/Surge.txt")${RESET}"
+
+        echo -e "${GREEN}================================${RESET}"
     else
-      error "Sing-box 服务启动失败，请检查 /var/log/messages 查看错误日志。"
+        error "配置不存在。"
     fi
-  else
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-    "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
-    info "非 OpenRC 环境，程序已挂载至后台常驻进程模式。"
-  fi
-  showconf
 }
 
-# =========================================================
-# 5. 主流程控制模块与更新功能
-# =========================================================
-inst_singbox() {
-  check_environment
-  
-  info "🧹 正在释放 80 和 443 端口以防冲突..."
-  if has_command rc-service; then
-    rc_service caddy stop >/dev/null 2>&1 || true
-    rc_service nginx stop >/dev/null 2>&1 || true
-    rc_service sing-box stop >/dev/null 2>&1 || true
-  else
-    pkill -f "caddy" || true
-    pkill -f "nginx" || true
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-  fi
+# ================== 功能：安装 ==================
+install_ss() {
+    info "正在准备安装环境..."
+    apk add curl wget tar xz openssl iproute2 coreutils >/dev/null 2>&1
+    
+    getent group "$RUN_GROUP" >/dev/null || addgroup -S "$RUN_GROUP"
+    getent passwd "$RUN_USER" >/dev/null || adduser -S -D -H -G "$RUN_GROUP" -s /sbin/nologin "$RUN_USER"
 
-  info "获取官方最新发布版本中..."
-  local latest_version=$(get_latest_version)
-  
-  local _tmpfile_tar=$(mktemp)
-  if ! download_singbox "$latest_version" "$_tmpfile_tar"; then
-    rm -f "$_tmpfile_tar" && return 1
-  fi
+    local ver=$(get_latest_version)
+    local arch=$(detect_arch)
+    local url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${ver}/shadowsocks-v${ver}.${arch}.tar.xz"
 
-  echo -ne "正在解压并安装二进制可执行文件 ... "
-  local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
-  tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
-  
-  local _extracted_binary=$(find "$_tmpdir_extract" -type f -name "sing-box" | head -n 1)
+    info "正在下载 Shadowsocks-Rust v$ver..."
+    cd "$TMP_DIR"
+    wget -q --show-progress -O ss.tar.xz "$url"
+    tar -xf ss.tar.xz
+    install -m 755 ssserver "$BINARY_PATH"
+    
+    mkdir -p "$SS_DIR"
+    echo "$ver" > "${SS_DIR}/version.txt"
+    touch "$LOG_FILE"
+    chown "${RUN_USER}:${RUN_GROUP}" "$LOG_FILE"
 
-  if [[ -n "$_extracted_binary" ]]; then
-    mkdir -p "$(dirname "$EXECUTABLE_INSTALL_PATH")"
-    if cp "$_extracted_binary" "$EXECUTABLE_INSTALL_PATH" && chmod 755 "$EXECUTABLE_INSTALL_PATH"; then
-      echo "成功"
+    local def_port=$((RANDOM % 40000 + 20000))
+    local def_pass=$(openssl rand -base64 32 | tr -d '\n')
+    local def_dns=$(get_vps_dns)
+
+    echo -e "${YELLOW}--- 自定义配置 (回车使用随机默认值) ---${RESET}"
+    read -rp "$(echo -e ${GREEN}"设置端口 [默认 $def_port]: "${RESET})" user_port
+    user_port=${user_port:-$def_port}
+    read -rp "$(echo -e ${GREEN}"设置密码 [默认随机生成]: "${RESET})" user_pass
+    user_pass=${user_pass:-$def_pass}
+    read -rp "$(echo -e ${GREEN}"设置 DNS (用逗号隔开) [默认 $def_dns]: "${RESET})" user_dns
+    user_dns=${user_dns:-$def_dns}
+
+    write_config_and_link "$user_port" "$user_pass" "$user_dns"
+
+    cat > "$SS_INIT_SCRIPT" <<EOF
+#!/sbin/openrc-run
+name="ss-rust"
+command="${BINARY_PATH}"
+command_args="-c ${SS_CONFIG}"
+command_user="${RUN_USER}:${RUN_GROUP}"
+command_background="yes"
+pidfile="/run/\${RC_SVCNAME}.pid"
+output_log="${LOG_FILE}"
+error_log="${LOG_FILE}"
+depend() { need net; }
+EOF
+    chmod +x "$SS_INIT_SCRIPT"
+    rc-update add ss-rust default
+    rc-service ss-rust start
+    info "安装完成！"
+    show_node_info
+}
+
+# ================== 功能：更新 (无损替换) ==================
+update_ss() {
+    if [[ ! -f "$BINARY_PATH" ]]; then
+        error "未发现已安装的服务，请先选择选项 1 安装。"
+        return 1
+    fi
+
+    local current_ver=$(cat "${SS_DIR}/version.txt" 2>/dev/null || echo "未知")
+    local latest_ver=$(get_latest_version)
+
+    info "当前版本: $current_ver | 最新版本: v$latest_ver"
+
+    if [[ "$current_ver" == "$latest_ver" ]]; then
+        info "当前已是最新版本，无需更新。"
+        return 0
+    fi
+
+    info "发现新版本，正在下载升级..."
+    local arch=$(detect_arch)
+    local url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${latest_ver}/shadowsocks-v${latest_ver}.${arch}.tar.xz"
+    
+    cd "$TMP_DIR"
+    if wget -q --show-progress -O ss.tar.xz "$url"; then
+        tar -xf ss.tar.xz
+        rc-service ss-rust stop || true
+        install -m 755 ssserver "$BINARY_PATH"
+        echo "$latest_ver" > "${SS_DIR}/version.txt"
+        rc-service ss-rust start
+        info "更新成功！配置已保留。"
     else
-      rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "安装失败" && return 1
+        error "下载失败，请检查网络。"
     fi
-  else
-    rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "找不到解压核心" && return 1
-  fi
-  rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
-
-  # 写入 Alpine OpenRC 服务脚本
-  install_content "0755" "$(tpl_singbox_server_openrc_base)" "$INIT_SERVICE_DIR/sing-box" "1"
-
-  local rand_user=$(generate_random_string 8)
-  local rand_pass=$(generate_random_string 16)
-  local rand_email="$(generate_random_string 10)@gmail.com"
-  local hostname_str=$(hostname 2>/dev/null || echo "alpine")
-  local default_remark="${hostname_str}-NaiveProxy"
-
-  echo "---------------------------------------------"
-  read -rp "👉 请输入解析好的域名 (例如: naive.example.com): " sb_domain
-  [[ -z "$sb_domain" ]] && error "域名不能为空！" && return 1
-
-  read -rp "👉 请输入你的邮箱 (默认随机: ${rand_email}): " sb_email
-  sb_email=${sb_email:-"$rand_email"}
-
-  read -rp "👉 请设置 NaiveProxy 用户名 (默认随机: ${rand_user}): " sb_username
-  sb_username=${sb_username:-"$rand_user"}
-
-  read -rp "👉 请设置 NaiveProxy 密码 (默认随机: ${rand_pass}): " sb_password
-  sb_password=${sb_password:-"$rand_pass"}
-
-  read -rp "👉 请设置节点备注 (默认: ${default_remark}): " sb_node_name
-  sb_node_name=${sb_node_name:-$default_remark}
-
-  read -rp "👉 请设置监听端口 (默认: 443): " sb_port
-  sb_port=${sb_port:-443}
-
-  write_and_show_config
 }
 
-update_singbox() {
-  if [[ ! -f "$SB_BINARY" ]]; then
-    error "当前系统未安装 Sing-box，无法执行更新。"
-    return 1
-  fi
+# ================== 功能：修改配置 ==================
+modify_ss() {
+    if [[ ! -f "$SS_CONFIG" ]]; then
+        error "未发现配置，请先安装"
+        return 1
+    fi
 
-  info "正在检查新版本..."
-  local current_version=$(get_installed_version)
-  local latest_version=$(get_latest_version)
+    local old_port=$(grep -E '"server_port":' "$SS_CONFIG" | head -n 1 | grep -oE '[0-9]+')
+    local old_pass=$(grep -E '"password":' "$SS_CONFIG" | head -n 1 | cut -d '"' -f4)
+    
+    # 🛠 改进的 DNS 提取逻辑：直接匹配 nameserver 数组内的内容
+    local old_dns=$(grep -A 5 '"nameserver":' "$SS_CONFIG" | grep -v '"nameserver":' | tr -d ' "[]\n\r\t' | sed 's/,$//' | grep -v '}')
+    
+    if [[ -z "$old_dns" || "$old_dns" == *"{"* ]]; then
+        old_dns=$(get_vps_dns)
+    fi
 
-  info "当前安装版本: ${YELLOW}${current_version}${RESET}"
-  info "官方最新版本: ${GREEN}${latest_version}${RESET}"
+    echo -e "${YELLOW}--- 修改配置 (回车保持当前值) ---${RESET}"
+    read -rp "$(echo -e ${GREEN}"新端口 [当前 $old_port]: "${RESET})" new_port
+    new_port=${new_port:-$old_port}
+    read -rp "$(echo -e ${GREEN}"新密码 [当前 $old_pass]: "${RESET})" new_pass
+    new_pass=${new_pass:-$old_pass}
+    read -rp "$(echo -e ${GREEN}"新 DNS (用逗号隔开) [当前 $old_dns]: "${RESET})" new_dns
+    new_dns=${new_dns:-$old_dns}
 
-  if [[ "$current_version" == *"$latest_version"* || "$latest_version" == *"$current_version"* ]]; then
-    info "您当前已经是最新版本，无需更新。"
-    return 0
-  fi
+    write_config_and_link "$new_port" "$new_pass" "$new_dns"
+    rc-service ss-rust restart >/dev/null 2>&1 || true
+    info "修改成功！"
+    show_node_info
+}
 
-  warn "检测到新版本，即将开始平滑更新 (你的节点配置不会改变)..."
-  
-  local _tmpfile_tar=$(mktemp)
-  if ! download_singbox "$latest_version" "$_tmpfile_tar"; then
-    rm -f "$_tmpfile_tar" && return 1
-  fi
-
-  echo -ne "正在覆盖二进制核心文件 ... "
-  local _tmpdir_extract=$(command mktemp -d -t sbtar.XXXXXXXXXX)
-  tar -zxf "$_tmpfile_tar" -C "$_tmpdir_extract"
-  
-  local _extracted_binary=$(find "$_tmpdir_extract" -type f -name "sing-box" | head -n 1)
-  if [[ -n "$_extracted_binary" ]]; then
-    if cp "$_extracted_binary" "$EXECUTABLE_INSTALL_PATH" && chmod 755 "$EXECUTABLE_INSTALL_PATH"; then
-      echo "成功"
+# ================== 菜单系统 ==================
+while true; do
+    if rc-service ss-rust status 2>/dev/null | grep -q "started"; then
+        STATUS="${GREEN}● 运行中${RESET}"
     else
-      rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "覆盖核心失败" && return 1
+        STATUS="${RED}● 未运行${RESET}"
     fi
-  else
-    rm -rf "$_tmpfile_tar" "$_tmpdir_extract" && error "解压错误" && return 1
-  fi
-  rm -rf "$_tmpfile_tar" "$_tmpdir_extract"
 
-  info "正在重启 Sing-box 服务以应用更新..."
-  if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
-    rc_service sing-box restart >/dev/null 2>&1 || true
-    if rc_service sing-box status >/dev/null 2>&1; then
-      info "Sing-box 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
-    else
-      error "核心更新成功，但 OpenRC 重启服务失败。"
-    fi
-  else
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-    "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
-    info "Sing-box 核心已更新并于后台重启运行。"
-  fi
-}
+    VERSION_SHOW=$( [ -f "${SS_DIR}/version.txt" ] && echo "v$(cat ${SS_DIR}/version.txt)" || echo "未安装")
+    PORT_SHOW=$( [ -f "$SS_CONFIG" ] && grep '"server_port"' "$SS_CONFIG" | head -n 1 | grep -oE '[0-9]+' || echo "-")
 
-uninstall_singbox() {
-  warn "即将从当前系统中彻底卸载 Sing-box (NaiveProxy)"
-
-  if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
-    rc_service sing-box stop >/dev/null 2>&1 || true
-    rc_update del sing-box default >/dev/null 2>&1 || true
-    remove_file "$INIT_SERVICE_DIR/sing-box"
-  else
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-  fi
-
-  remove_file "$EXECUTABLE_INSTALL_PATH"
-  rm -rf /etc/ap-naiveproxy-sb "$SB_DIR"
-
-  info "Sing-box 已彻底从您的系统中移除！"
-}
-
-changeconf() {
-  if [[ ! -f "$SB_CONFIG" ]]; then
-    error "配置文件不存在，请先安装 Sing-box"
-    return 1
-  fi
-
-  if [[ -f "$SB_DIR/meta.env" ]]; then
-    source "$SB_DIR/meta.env"
-  else
-    sb_domain=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG")
-    sb_email=$(jq -r '.inbounds[0].tls.acme.email' "$SB_CONFIG")
-    sb_username=$(jq -r '.inbounds[0].users[0].username' "$SB_CONFIG")
-    sb_password=$(jq -r '.inbounds[0].users[0].password' "$SB_CONFIG")
-    sb_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG")
-    sb_node_name="NaiveProxy"
-  fi
-
-  [[ -z "$sb_port" || "$sb_port" == "null" ]] && sb_port=443
-
-  clear
-  echo -e "${GREEN}====== 修改 Sing-box Naive 配置 ======${RESET}"
-  echo "提示：直接敲回车将保持原有配置不变"
-  echo "---------------------------------------------"
-  
-  local input_domain input_email input_user input_pass input_name input_port
-
-  read -rp "👉 请输入解析好的域名 [当前: ${sb_domain}]: " input_domain
-  sb_domain=${input_domain:-$sb_domain}
-
-  read -rp "👉 请输入你的邮箱 [当前: ${sb_email}]: " input_email
-  sb_email=${input_email:-$sb_email}
-
-  read -rp "👉 请设置 NaiveProxy 用户名 [当前: ${sb_username}]: " input_user
-  sb_username=${input_user:-$sb_username}
-
-  read -rp "👉 请设置 NaiveProxy 密码 [当前: ${sb_password}]: " input_pass
-  sb_password=${input_pass:-$sb_password}
-
-  read -rp "👉 请设置节点备注 [当前: ${sb_node_name}]: " input_name
-  sb_node_name=${input_name:-$sb_node_name}
-
-  read -rp "👉 请设置监听端口 [当前: ${sb_port}]: " input_port
-  sb_port=${input_port:-$sb_port}
-
-  write_and_show_config
-  info "配置修改并应用成功！"
-}
-
-showconf() {
-  if [[ ! -d "$SB_DIR" || ! -f "$SB_DIR/url.txt" ]]; then
-    error "未找到分享链接配置文件。"
-    return
-  fi
-  echo -e "${GREEN}====== 节点分享链接 ======${RESET}"
-  cat "$SB_DIR/url.txt"
-  echo
-}
-
-# =========================================================
-# 6. 面板主菜单
-# =========================================================
-menu() {
-  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
-  check_environment
-
-  while true; do
     clear
-    local status=$(get_sb_status)
-    local version=$(get_installed_version)
-    local domain_show=$(get_current_domain_display)
-
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    Sing-box NaiveProxy 面板    ${RESET}"
+    echo -e "${GREEN}   Shadowsocks-Rust 管理面板    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $status"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}域名   :${RESET} ${YELLOW}${domain_show}${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $STATUS"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${VERSION_SHOW}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${PORT_SHOW}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Sing-box NaiveProxy${RESET}"
-    echo -e "${GREEN}2. 更新 Sing-box NaiveProxy${RESET}"
-    echo -e "${GREEN}3. 卸载 Sing-box NaiveProxy${RESET}"
-    echo -e "${GREEN}4. 修改配置 ${RESET}"
-    echo -e "${GREEN}5. 启动 Sing-box NaiveProxy${RESET}"
-    echo -e "${GREEN}6. 停止 Sing-box NaiveProxy${RESET}"
-    echo -e "${GREEN}7. 重启 Sing-box NaiveProxy${RESET}"
+    echo -e "${GREEN}1. 安装 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}2. 更新 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}3. 卸载 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}6. 停止 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}7. 重启 Shadowsocks-Rust${RESET}"
     echo -e "${GREEN}8. 查看日志${RESET}"
     echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
 
-    local choice=""
-    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
-    [[ -z "$choice" ]] && continue
-
-    case "$choice" in
-      1) inst_box=inst_singbox; $inst_box; pause ;;
-      2) update_singbox; pause ;;
-      3) uninstall_singbox; pause ;;
-      4) changeconf; pause ;;
-      5) 
-        if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
-          rc_service sing-box start && info "服务已成功启动！"
-        else
-          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-          "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
-          info "进程已在后台启动！"
-        fi
-        pause ;;
-      6) 
-        if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
-          rc_service sing-box stop && info "服务已成功停止！"
-        else
-          pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台进程已终止！"
-        fi
-        pause ;;
-      7) 
-        if has_command rc-service && [ -f "$INIT_SERVICE_DIR/sing-box" ]; then
-          rc_service sing-box restart && info "服务已成功重启！"
-        else
-          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-          "$EXECUTABLE_INSTALL_PATH" run -c "$SB_CONFIG" >/dev/null 2>&1 &
-          info "后台进程已重启！"
-        fi
-        pause ;;
-      8) 
-        if [[ -f /var/log/messages ]]; then
-          echo -e "${CYAN}--- 最近 50 行相关系统日志 ---${RESET}"
-          tail -n 50 /var/log/messages | grep -E 'sing-box|supervise-daemon' || tail -n 50 /var/log/messages
-          echo "--------------------------------------"
-          if [[ -f "$EXECUTABLE_INSTALL_PATH" && -f "$SB_CONFIG" ]]; then
-            "$EXECUTABLE_INSTALL_PATH" check -c "$SB_CONFIG" || true
-          fi
-        else
-          warn "未找到系统日志文件 /var/log/messages"
-        fi
-        pause ;;
-      9) showconf; pause ;;
-      0) exit 0 ;;
-      *) error "无效输入，请重新选择。"; sleep 1 ;;
+    read -rp "$(echo -e ${GREEN}"请输入选项: "${RESET})" choice
+    case $choice in
+        1) install_ss; pause ;;
+        2) update_ss; pause ;;
+        3) 
+            rc-service ss-rust stop || true
+            rc-update del ss-rust || true
+            rm -f "$SS_INIT_SCRIPT" "$BINARY_PATH"
+            rm -rf "$SS_DIR" "$LOG_FILE"
+            info "已卸载"; pause ;;
+        4) modify_ss; pause ;;
+        5) rc-service ss-rust start; pause ;;
+        6) rc-service ss-rust stop; pause ;;
+        7) rc-service ss-rust restart; pause ;;
+        8) 
+            info "实时日志 (Ctrl+C 退出):"
+            [[ -f "$LOG_FILE" ]] && tail -f "$LOG_FILE" || error "无日志文件"; pause ;;
+        9) show_node_info; pause ;;
+        0) exit 0 ;;
+        *) sleep 0.5 ;;
     esac
-  done
-}
-
-menu "$@"
+done

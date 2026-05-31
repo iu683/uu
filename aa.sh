@@ -665,6 +665,7 @@ server_reboot() {
 #=============================================================================
 
 # 带宽检测函数
+# 带宽检测函数
 detect_bandwidth() {
     # 所有交互式输出重定向到stderr，避免被命令替换捕获
     echo "" >&2
@@ -679,6 +680,9 @@ detect_bandwidth() {
     read -e -p "请输入选择 [1]: " bw_choice
     bw_choice=${bw_choice:-1}
 
+    # 定义 Speedtest 核心统一参数（同时接受协议、隐私、免责）
+    local st_args="--accept-license --accept-gdpr"
+
     case "$bw_choice" in
         1)
             # 自动检测带宽 - 选择最近服务器
@@ -691,7 +695,6 @@ detect_bandwidth() {
             # 检查speedtest是否安装
             if ! command -v speedtest &>/dev/null; then
                 echo -e "${gl_huang}speedtest 未安装，正在安装...${gl_bai}" >&2
-                # 调用脚本中已有的安装逻辑（简化版）
                 local cpu_arch=$(uname -m)
                 local download_url
                 case "$cpu_arch" in
@@ -707,7 +710,7 @@ detect_bandwidth() {
                         echo "500"
                         return 1
                         ;;
-                esac
+                                esac
                 
                 cd /tmp
                 wget -q "$download_url" -O speedtest.tgz && \
@@ -725,8 +728,8 @@ detect_bandwidth() {
             # 智能测速：获取附近服务器列表，按距离依次尝试
             echo -e "${gl_zi}正在搜索附近测速服务器...${gl_bai}" >&2
             
-            # 获取附近服务器列表（按延迟排序）
-            local servers_list=$(speedtest --accept-license --servers 2>/dev/null | sed -nE 's/^[[:space:]]*([0-9]+).*/\1/p' | head -n 10)
+            # 【修复】获取服务器列表时也必须加上隐私参数，否则也会返回空导致触发 "auto"
+            local servers_list=$(speedtest $st_args --servers 2>/dev/null | sed -nE 's/^[[:space:]]*([0-9]+).*/\1/p' | head -n 10)
             
             if [ -z "$servers_list" ]; then
                 echo -e "${gl_huang}无法获取服务器列表，使用自动选择...${gl_bai}" >&2
@@ -753,10 +756,10 @@ detect_bandwidth() {
                 
                 if [ "$server_id" = "auto" ]; then
                     echo -e "${gl_zi}[尝试 ${attempt}] 自动选择最近服务器...${gl_bai}" >&2
-                    speedtest_output=$(speedtest --accept-license 2>&1)
+                    speedtest_output=$(speedtest $st_args 2>&1)
                 else
                     echo -e "${gl_zi}[尝试 ${attempt}] 测试服务器 #${server_id}...${gl_bai}" >&2
-                    speedtest_output=$(speedtest --accept-license --server-id="$server_id" 2>&1)
+                    speedtest_output=$(speedtest $st_args --server-id="$server_id" 2>&1)
                 fi
                 
                 echo "$speedtest_output" >&2
@@ -926,7 +929,8 @@ detect_bandwidth() {
                 echo "" >&2
                 echo -e "${gl_kjlan}附近的测速服务器列表：${gl_bai}" >&2
                 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
-                speedtest --accept-license --servers 2>/dev/null | head -n 20 >&2
+                # 【修复】此处也带上统一的隐私参数
+                speedtest $st_args --servers 2>/dev/null | head -n 20 >&2
                 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
                 echo "" >&2
             fi
@@ -949,7 +953,8 @@ detect_bandwidth() {
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
             echo "" >&2
             
-            local speedtest_output=$(speedtest --accept-license --server-id="$server_id" 2>&1)
+            # 【修复】带上隐私参数进行指定测速
+            local speedtest_output=$(speedtest $st_args --server-id="$server_id" 2>&1)
             echo "$speedtest_output" >&2
             echo "" >&2
             
@@ -1033,7 +1038,7 @@ detect_bandwidth() {
             echo "" >&2
             echo -e "${gl_huang}【高带宽服务器】${gl_bai}" >&2
             echo "7. 1.5 Gbps   (中高端VPS)" >&2
-            echo "8. 2 Gbps     (高性能VPS)" >&2
+            echo "8. 2 Gbps      (高性能VPS)" >&2
             echo "9. 2.5 Gbps   (准万兆)" >&2
             echo "" >&2
             echo -e "${gl_zi}提示: 缓冲区大小将根据后续选择的地区自动计算${gl_bai}" >&2
@@ -2726,11 +2731,11 @@ show_main_menu() {
     local is_installed=$?
 
     if echo "$kernel_release" | grep -qi 'xanmod'; then
-        kernel_line="XanMod 运行中 | ${kernel_release}"
+        kernel_line="XanMod 运行中 "
     elif [ $is_installed -eq 0 ]; then
-        kernel_line="XanMod 已安装 | ${kernel_release}"
+        kernel_line="XanMod 已安装"
     else
-        kernel_line="默认内核 | ${kernel_release}"
+        kernel_line="默认内核"
     fi
 
     if [ "$current_cc" = "bbr" ]; then
@@ -2996,21 +3001,30 @@ uninstall_xanmod() {
 
     case "$confirm" in
         [Yy])
-            # 使用能匹配元包和内核包的模式
             echo "正在卸载 XanMod 相关包..."
-            if apt purge -y 'linux-*xanmod*' 2>&1; then
-                # 验证卸载结果
+            local xanmod_packages
+            xanmod_packages=$(dpkg -l 2>/dev/null | awk '/^ii\s+linux-.*xanmod/ {print $2}')
+
+            if [ -z "$xanmod_packages" ]; then
+                echo -e "${gl_huang}未检测到已安装的 XanMod 包${gl_bai}"
+            else
+                echo "$xanmod_packages" | awk '{print "  - " $1}'
+                DEBIAN_FRONTEND=noninteractive apt purge -y $xanmod_packages
+                local purge_rc=$?
+
+                if [ $purge_rc -ne 0 ]; then
+                    echo -e "${gl_hong}❌ 卸载命令执行失败，请手动检查${gl_bai}"
+                    break_end
+                    return 1
+                fi
+
                 if dpkg -l 2>/dev/null | grep -qE '^ii\s+linux-.*xanmod'; then
                     echo -e "${gl_hong}⚠️  部分 XanMod 包未能卸载，请手动检查：${gl_bai}"
                     dpkg -l | grep -E '^ii\s+linux-.*xanmod' | awk '{print "  - " $2}'
                 else
                     echo -e "${gl_lv}✅ XanMod 内核包已全部卸载${gl_bai}"
                 fi
-                update-grub 2>/dev/null
-            else
-                echo -e "${gl_hong}❌ 卸载命令执行失败，请手动检查${gl_bai}"
-                break_end
-                return 1
+                update-grub 2>/dev/null || true
             fi
 
             # 清理软件源和 GPG 密钥
@@ -3039,7 +3053,7 @@ uninstall_all() {
     local xanmod_removed=0
     
     # 1. 卸载 XanMod 内核
-    echo -e "${gl_huang}[1/8] 检查并卸载 XanMod 内核...${gl_bai}"
+    echo -e "${gl_huang}检查并卸载 XanMod 内核...${gl_bai}"
     if dpkg -l | grep -qE '^ii\s+linux-.*xanmod'; then
         # 安全检查：确认有回退内核
         local non_xanmod_kernels=$(dpkg -l 2>/dev/null | grep '^ii' | grep 'linux-image-' | grep -v 'xanmod' | grep -v 'dbg' | wc -l)
@@ -3048,10 +3062,17 @@ uninstall_all() {
             echo -e "  ${gl_huang}请先安装默认内核: apt install -y linux-image-amd64${gl_bai}"
         else
             echo "  正在卸载 XanMod 内核..."
-            if apt purge -y 'linux-*xanmod*' > /dev/null 2>&1; then
-                update-grub > /dev/null 2>&1
+            local xanmod_packages
+            xanmod_packages=$(dpkg -l 2>/dev/null | awk '/^ii\s+linux-.*xanmod/ {print $2}')
+            if [ -z "$xanmod_packages" ]; then
+                echo -e "  ${gl_huang}未检测到已安装的 XanMod 包${gl_bai}"
             else
-                echo -e "  ${gl_hong}❌ XanMod 内核卸载命令执行失败，请手动检查${gl_bai}"
+                DEBIAN_FRONTEND=noninteractive apt purge -y $xanmod_packages > /dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                    update-grub > /dev/null 2>&1 || true
+                else
+                    echo -e "  ${gl_hong}❌ XanMod 内核卸载命令执行失败，请手动检查${gl_bai}"
+                fi
             fi
             if dpkg -l | grep -qE '^ii\s+linux-.*xanmod'; then
                 echo -e "  ${gl_hong}❌ 仍检测到 XanMod 内核，请手动检查${gl_bai}"
@@ -3067,7 +3088,7 @@ uninstall_all() {
     echo ""
     
     # 3. 清理 sysctl 配置文件
-    echo -e "${gl_huang}[3/8] 清理 sysctl 配置文件...${gl_bai}"
+    echo -e "${gl_huang}清理 sysctl 配置文件...${gl_bai}"
     local sysctl_files=(
         "$SYSCTL_CONF"
         "/etc/sysctl.d/99-bbr-xanmod.conf"
@@ -3092,7 +3113,7 @@ uninstall_all() {
     echo ""
     
     # 4. 清理 XanMod 软件源
-    echo -e "${gl_huang}[4/8] 清理 XanMod 软件源...${gl_bai}"
+    echo -e "${gl_huang} 清理 XanMod 软件源...${gl_bai}"
     local repo_files=(
         "/etc/apt/sources.list.d/xanmod-release.list"
         "/usr/share/keyrings/xanmod-archive-keyring.gpg"
@@ -3114,8 +3135,8 @@ uninstall_all() {
     fi
     echo ""
     
-    # 5. 清理持久化服务和优化配置（功能3/4/5）
-    echo -e "${gl_huang}[5/8] 清理持久化服务和优化配置...${gl_bai}"
+    # 5. 清理持久化服务和优化配置
+    echo -e "${gl_huang}清理持久化服务和优化配置...${gl_bai}"
     local persist_cleaned=0
 
     # 功能4: MTU优化 — 恢复路由/链路MTU + 清理服务
@@ -3192,7 +3213,7 @@ uninstall_all() {
     echo ""
     
     # 7. 应用 sysctl 更改
-    echo -e "${gl_huang}[7/8] 应用系统配置更改...${gl_bai}"
+    echo -e "${gl_huang} 应用系统配置更改...${gl_bai}"
     sysctl --system > /dev/null 2>&1
     echo -e "  ${gl_lv}✅ 系统配置已重置${gl_bai}"
     echo ""

@@ -1,407 +1,652 @@
 #!/bin/bash
 
 # =========================================================
-# Xray Socks5 管理脚本 (Alpine Linux ) 
+# Xray VLESS-REALITY-xhttp  管理脚本
 # =========================================================
 
 set -Eeuo pipefail
 
-# ================== 颜色定义 ==================
+# ================== 颜色 ==================
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 BLUE="\033[34m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-# ================== 🚀 服务自定义重命名 ==================
-readonly SERV_NAME="xray-socks5"
+# ================== 基础变量 ==================
+readonly SERVICE_NAME="vless-xhttp"
+readonly XRAY_CONFIG="/usr/local/etc/${SERVICE_NAME}/config.json"
+readonly XRAY_BINARY="/usr/local/bin/${SERVICE_NAME}"
+readonly XRAY_PUBLIC_KEY_FILE="/usr/local/etc/${SERVICE_NAME}/public.key"
 
-# ================== 📂 自定义分享链接存放路径 ==================
-readonly X_LINK_DIR="/root/proxynode/socks5"
+# 降级备用版本
+readonly BACKUP_VERSION="26.3.27"
 
-# ================== 路径与日志 (自动联动) ==================
-readonly X_DIR="/etc/${SERV_NAME}"
-readonly X_CONFIG="${X_DIR}/config.json"
-readonly X_BIN="/usr/local/bin/${SERV_NAME}"
-readonly X_LINK="${X_LINK_DIR}/${SERV_NAME}_socks5.txt"
-readonly X_LOG="/var/log/${SERV_NAME}.log"
-readonly INIT_FILE="/etc/init.d/${SERV_NAME}"
+TMP_DIR=$(mktemp -d -t xray.XXXXXX)
 
-# ================== 核心工具 ==================
-info() { echo -e "${GREEN}[信息] $*${RESET}"; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}"; }
-error() { echo -e "${RED}[错误] $*${RESET}"; }
-pause() { echo; echo -ne "${GREEN}按任意键返回菜单...${RESET}"; read -n 1 -s; echo; }
+# ================== cleanup ==================
+cleanup() {
+    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+}
+
+trap cleanup EXIT INT TERM
+
+# ================== 日志 ==================
+info() {
+    echo -e "${GREEN}[信息] $*${RESET}" >&2
+}
+
+warn() {
+    echo -e "${YELLOW}[警告] $*${RESET}" >&2
+}
+
+error() {
+    echo -e "${RED}[错误] $*${RESET}" >&2
+}
+
+pause() {
+    read -n 1 -s -r -p "按任意键返回菜单..." || true
+    echo
+}
+
+# ================== 获取公网IP ==================
+get_public_ip() {
+    local ip
+    for cmd in "curl -4fsSL --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null || true)
+            if [[ -n "${ip:-}" ]]; then echo "$ip"; return 0; fi
+        done
+    done
+    for cmd in "curl -6fsSL --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ipv6.ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null || true)
+            if [[ -n "${ip:-}" ]]; then echo "$ip"; return 0; fi
+        done
+    done
+    return 1
+}
+
+# ================== 检查与校验 ==================
+check_port() {
+    local port="$1"
+    if ss -tuln | awk '{print $5}' | grep -qE "[:.]${port}$"; then return 1; fi
+    return 0
+}
 
 is_valid_port() {
-    local port=$1
-    if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
-        return 0
+    [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]
+}
+
+get_random_port() {
+    local rand_port
+    while true; do
+        rand_port=$((RANDOM % 55536 + 10000))
+        if check_port "$rand_port"; then echo "$rand_port"; return 0; fi
+    done
+}
+
+is_valid_uuid() {
+    [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]
+}
+
+is_valid_shortid() {
+    local len=${#1}
+    if [[ "$1" =~ ^[0-9a-fA-F]+$ ]] && (( len % 2 == 0 )) && (( len <= 16 )); then return 0; fi
+    return 1
+}
+
+is_valid_domain() {
+    [[ "$1" =~ ^([a-zA-Z0-9](-?[a-zA-Z0-9])*\.)+[A-Za-z]{2,}$ ]]
+}
+
+is_valid_path() {
+    [[ "$1" =~ ^\/[a-zA-Z0-9\/_-]+$ ]]
+}
+
+get_arch() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64) echo "64" ;;
+        aarch64|arm64) echo "arm64-v8a" ;;
+        armv7l) echo "arm32-v7a" ;;
+        *) error "暂不支持的系统架构: $arch"; return 1 ;;
+    esac
+}
+
+get_latest_version() {
+    local latest_version
+    info "正在获取 GitHub 最新 Xray 版本号..."
+    latest_version=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null | jq -r '.tag_name' 2>/dev/null || echo "")
+    latest_version="${latest_version#v}"
+    if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
+        warn "拉取最新版本失败，将使用内置备用版本: v${BACKUP_VERSION}"
+        echo "$BACKUP_VERSION"
     else
-        return 1
+        info "成功获取最新版本: v${latest_version}"
+        echo "$latest_version"
     fi
 }
 
+# ================== 下载并安装 ==================
+download_and_extract_xray() {
+    local arch version
+    arch=$(get_arch) || return 1
+    version=$(get_latest_version)
+    local download_url="https://github.com/XTLS/Xray-core/releases/download/v${version}/Xray-linux-${arch}.zip"
+    local zip_file="$TMP_DIR/xray.zip"
+    
+    info "正在下载 Xray v${version} (${arch})..."
+    if ! curl -L -fsSL "$download_url" -o "$zip_file"; then
+        error "从 GitHub 下载 Xray 失败"
+        return 1
+    fi
+    
+    info "正在解压..."
+    mkdir -p "$TMP_DIR/extracted"
+    if ! unzip -qo "$zip_file" -d "$TMP_DIR/extracted"; then
+        error "解压失败，请确保系统已安装 unzip。"
+        return 1
+    fi
+    
+    mkdir -p "$(dirname "$XRAY_BINARY")"
+    rm -f "$XRAY_BINARY"
+    cp -f "$TMP_DIR/extracted/xray" "$XRAY_BINARY"
+    chmod +x "$XRAY_BINARY"
+    
+    mkdir -p "/usr/local/share/${SERVICE_NAME}"
+    cp -f "$TMP_DIR/extracted/geoip.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
+    cp -f "$TMP_DIR/extracted/geosite.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
+}
+
+setup_systemd_service() {
+    info "配置 Systemd 服务 [${SERVICE_NAME}]..."
+    cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=Xray Vless Reality xhttp Service
+After=network.target nss-lookup.target
+
+[Service]
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=${XRAY_BINARY} run -config ${XRAY_CONFIG}
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable "${SERVICE_NAME}" 2>/dev/null || true
+}
+
 get_xray_status() {
-    if rc-service "$SERV_NAME" status 2>/dev/null | grep -q "started"; then
-        echo -e "${GREEN}● 运行中 ${RESET}"
-    else 
-        echo -e "${RED}● 未运行 ${RESET}"
+    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+        echo -e "${GREEN}● 运行中${RESET}"
+    else
+        echo -e "${RED}● 未运行${RESET}"
     fi
 }
 
 get_xray_version() {
-    if [[ -x "$X_BIN" ]]; then
-        "$X_BIN" version 2>/dev/null | head -n 1 | awk '{print $2}'
+    if [[ -x "$XRAY_BINARY" ]]; then
+        "$XRAY_BINARY" version 2>/dev/null | grep -i "Xray" | head -n 1 | awk '{print $2}' || echo "未知"
     else
         echo "未安装"
     fi
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    error "无法获取公网 IP 地址。" && return 1
+test_config() {
+    if "$XRAY_BINARY" run -test -config "$XRAY_CONFIG"; then
+        info "配置测试成功！"
+        return 0
+    fi
+    error "配置测试失败"
+    return 1
 }
 
-HOSTNAME=$(hostname -s | sed 's/ /_/g')
+restart_xray() {
+    systemctl restart "${SERVICE_NAME}" 2>/dev/null || true
+    sleep 1
+    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+        info "服务启动成功"
+        return 0
+    fi
+    error "服务启动失败"
+    journalctl -u "${SERVICE_NAME}" -n 20 --no-pager || true
+    return 1
+}
 
-# ================== 配置写入 ==================
+generate_reality_keys() {
+    info "正在生成 Reality 密钥对..."
+    local key_pair private_key public_key
+    if ! key_pair=$(timeout 10 "$XRAY_BINARY" x25519 2>/dev/null); then
+        error "密钥生成失败"
+        return 1
+    fi
+    private_key=$(echo "$key_pair" | grep -i "Private" | awk -F ': ' '{print $2}' | tr -d '\r')
+    public_key=$(echo "$key_pair" | grep -i "Public" | awk -F ': ' '{print $2}' | tr -d '\r')
+    echo "$public_key" > "$XRAY_PUBLIC_KEY_FILE"
+    echo "${private_key}|${public_key}"
+}
+
+get_public_key() {
+    [[ -f "$XRAY_PUBLIC_KEY_FILE" ]] && cat "$XRAY_PUBLIC_KEY_FILE"
+}
+
+# ================== 使用 JQ 动态安全写配置 ==================
 write_config() {
-    local port=$1 user=$2 pass=$3
-    mkdir -p "$X_DIR" && chmod 755 "$X_DIR"
-    
-    # 构造 accounts 数组
-    local accounts_json="[]"
-    if [[ -n "$user" && -n "$pass" ]]; then
-        accounts_json="[{\"user\": \"$user\", \"pass\": \"$pass\"}]"
-    fi
+    local port="$1"
+    local uuid="$2"
+    local domain="$3"
+    local private_key="$4"
+    local shortid="$5"
+    local path="$6"
 
-    cat > "$X_CONFIG" <<EOF
-{
-    "log": { "loglevel": "warning" },
-    "inbounds": [{
-        "port": $port,
-        "protocol": "socks",
-        "settings": {
-            "auth": "$([[ -n "$user" && -n "$pass" ]] && echo "password" || echo "noauth")",
-            "accounts": $accounts_json,
-            "udp": true
-        }
-    }],
-    "outbounds": [{
-        "protocol": "freedom",
-        "settings": { "domainStrategy": "UseIPv4v6" }
-    }]
+    mkdir -p "$(dirname "$XRAY_CONFIG")"
+
+    jq -n \
+        --argjson port "$port" \
+        --arg uuid "$uuid" \
+        --arg target "$domain" \
+        --arg privateKey "$private_key" \
+        --arg shortId "$shortid" \
+        --arg path "$path" \
+      '{
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+          "listen": "::",
+          "port": $port,
+          "protocol": "vless",
+          "settings": {
+            "clients": [{"id": $uuid}],
+            "decryption": "none"
+          },
+          "streamSettings": {
+            "network": "xhttp",
+            "security": "reality",
+            "realitySettings": {
+              "show": false,
+              "dest": ($target + ":443"),
+              "serverNames": [$target],
+              "privateKey": $privateKey,
+              "shortIds": [$shortId]
+            },
+            "xhttpSettings": {
+              "host": "",
+              "path": $path
+            }
+          },
+          "sniffing": {
+            "enabled": true,
+            "destOverride": ["http", "tls", "quic"],
+            "metadataOnly": false
+          }
+        }],
+        "outbounds": [{
+          "protocol": "freedom",
+          "settings": {
+            "domainStrategy": "UseIPv4v6"
+          }
+        }]
+      }' > "$XRAY_CONFIG"
 }
+
+# ================== 生成分享链接 ==================
+generate_link() {
+    local ip uuid port domain shortid public_key path display_ip hostname
+    if ! ip=$(get_public_ip); then error "获取公网 IP 失败"; return 1; fi
+
+    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null)
+    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null)
+    domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG" 2>/dev/null)
+    shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG" 2>/dev/null)
+    path=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$XRAY_CONFIG" 2>/dev/null)
+    public_key=$(get_public_key)
+
+    display_ip="$ip"
+    [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
+    hostname=$(hostname -s 2>/dev/null | tr ' ' '_')
+    [[ -z "$hostname" ]] && hostname="Xray"
+
+    cat > /root/proxynode/Realityxhttp/xray_vless_reality.txt <<EOF
+vless://${uuid}@${display_ip}:${port}?encryption=none&type=xhttp&security=reality&sni=${domain}&fp=chrome&pbk=${public_key}&sid=${shortid}&path=${path}#${hostname}-VLESS-Reality-xhttp
 EOF
 }
 
-# ================== 修改配置 ==================
-modify_config() {
-    if [[ ! -f "$X_CONFIG" ]]; then error "请先安装 Xray"; return; fi
+# ================== 显示节点信息 ==================
+show_current_config() {
+    if [[ ! -f "$XRAY_CONFIG" ]]; then error "配置文件不存在"; return; fi
+    local ip uuid port domain shortid public_key path outbound_mode current_protocol
+    ip=$(get_public_ip || echo "未知")
+    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null)
+    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null)
+    domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG" 2>/dev/null)
+    shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG" 2>/dev/null)
+    path=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$XRAY_CONFIG" 2>/dev/null)
+    public_key=$(get_public_key)
     
-    local curr_port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
-    local curr_user=$(jq -r '.inbounds[0].settings.accounts[0].user // ""' "$X_CONFIG")
-    local curr_pass=$(jq -r '.inbounds[0].settings.accounts[0].pass // ""' "$X_CONFIG")
+    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$XRAY_CONFIG" 2>/dev/null)
+    outbound_mode=$([[ "$current_protocol" == "socks" ]] && echo "Socks5 链式代理" || echo "直连 (Freedom)")
 
-    # 1. 修改端口
-    local n_port
+    echo -e "${GREEN}====== 当前配置 ======${RESET}"
+    echo -e "${YELLOW}IP地址      : ${ip}${RESET}"
+    echo -e "${YELLOW}端口        : ${port}${RESET}"
+    echo -e "${YELLOW}UUID        : ${uuid}${RESET}"
+    echo -e "${YELLOW}SNI (域名)  : ${domain}${RESET}"
+    echo -e "${YELLOW}PublicKey   : ${public_key}${RESET}"
+    echo -e "${YELLOW}ShortID     : ${shortid}${RESET}"
+    echo -e "${YELLOW}XHTTP Path  : ${path}${RESET}"
+    echo -e "${YELLOW}出口模式    : ${outbound_mode}${RESET}"
+    echo -e "${YELLOW}📄 V6VPS 请自行替换分享链接中的 IP 地址为 V6 ★${RESET}"
+    echo
+
+    if [[ -f /root/proxynode/Realityxhttp/xray_vless_reality.txt ]]; then
+        echo -e "${GREEN}====== 👉 v2rayN 分享链接 ======${RESET}"
+        cat /root/proxynode/Realityxhttp/xray_vless_reality.txt
+    fi
+}
+
+# ================== 配置节点逻辑 ==================
+configure_xray() {
+    info "开始配置 Reality-xhttp 节点..."
+    local port uuid domain short_id path input_port input_uuid input_domain input_shortid input_path keys private_key
+
     while true; do
-        read -p "请输入新 Socks5 端口 (回车保持 $curr_port): " n_port
-        n_port=${n_port:-$curr_port}
-        is_valid_port "$n_port" && break || error "端口无效，请输入 1-65535 之间的数字。"
+        read -rp "请输入端口 (直接回车随机分配端口): " input_port
+        if [[ -z "$input_port" ]]; then
+            port=$(get_random_port); info "分配未占用端口: $port"; break
+        elif is_valid_port "$input_port"; then
+            if ! check_port "$input_port"; then error "端口已被占用，请更换"; continue; fi
+            port="$input_port"; break
+        else error "端口无效"; fi
     done
 
-    # 2. 修改用户名 (独立分离)
-    local n_user
-    read -p "请输入新用户名 (回车保持当前, 清空认证输 clear, 输 random 随机生成): " n_user
-    n_user=${n_user:-$curr_user}
-    
-    if [[ "$n_user" == "clear" ]]; then
-        n_user=""
-    elif [[ "$n_user" == "random" ]]; then
-        n_user=$(openssl rand -hex 4)
-        info "👉 已生成随机用户名: $n_user"
-    fi
-    
-    # 3. 修改密码 (独立分离)
-    local n_pass=""
-    if [[ -n "$n_user" ]]; then
-        # 只有在存在用户名的情况下，才需要配置密码
-        read -p "请输入新密码 (回车保持当前, 输 random 随机生成): " n_pass
-        # 如果当前原本就没设密码，curr_pass 为空，这里避免回车继承空值
-        if [[ -z "$n_pass" && -n "$curr_pass" ]]; then
-            n_pass="$curr_pass"
-        fi
+    while true; do
+        read -rp "请输入UUID (直接回车自动生成): " input_uuid
+        if [[ -z "${input_uuid:-}" ]]; then
+            uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d"); break
+        elif is_valid_uuid "$input_uuid"; then uuid="$input_uuid"; break
+        else error "UUID 格式无效"; fi
+    done
 
-        if [[ "$n_pass" == "random" || -z "$n_pass" ]]; then
-            if [[ "$n_pass" == "random" || -z "$curr_pass" ]]; then
-                n_pass=$(openssl rand -hex 8)
-                info "👉 已生成随机密码: $n_pass"
-            fi
-        fi
+    while true; do
+        read -rp "请输入SNI域名 (默认:www.amazon.com): " input_domain
+        domain=${input_domain:-www.amazon.com}
+        if is_valid_domain "$domain"; then break; else error "域名格式无效"; fi
+    done
 
-        # 最终安全卡点验证
-        if [[ -z "$n_pass" ]]; then
-            error "错误：启用了用户名认证，密码绝对不能为空！"
-            return
-        fi
-    else
-        # 删除了用户名，密码自动随之清空
-        n_pass=""
-        info "👉 认证已清空，变更为免密匿名模式。"
-    fi
+    while true; do
+        read -rp "请输入自定义 ShortID (直接回车自动生成 8 位): " input_shortid
+        if [[ -z "$input_shortid" ]]; then short_id=$(openssl rand -hex 4); break
+        elif is_valid_shortid "$input_shortid"; then short_id="$input_shortid"; break
+        else error "必须为偶数位（最长16位）的十六进制字符(0-9, a-f)"; fi
+    done
 
-    write_config "$n_port" "$n_user" "$n_pass"
-    rc-service "$SERV_NAME" restart
-    
-    # 生成新链接
-    local ip=$(get_public_ip || echo "127.0.0.1")
-    local enc_ip=$(echo -n "$ip" | jq -sRr @uri)
-    local enc_user=$(echo -n "$n_user" | jq -sRr @uri)
-    local enc_pass=$(echo -n "$n_pass" | jq -sRr @uri)
-
-    mkdir -p "$X_LINK_DIR"
-    if [[ -n "$n_user" ]]; then
-        echo "socks://${enc_user}:${enc_pass}@${ip}:${n_port}#${HOSTNAME}-socks5" > "$X_LINK"
-        echo "https://t.me/socks?server=${enc_ip}&port=${n_port}&user=${enc_user}&pass=${enc_pass}" >> "$X_LINK"
-    else
-        echo "socks://${ip}:${n_port}#${HOSTNAME}-socks5" > "$X_LINK"
-        echo "https://t.me/socks?server=${enc_ip}&port=${n_port}" >> "$X_LINK"
-    fi
-    info "配置已更新并成功重启服务！"
-}
-
-# ================== 安装与管理 ==================
-install_xray() {
-    info "正在安装依赖与内核..."
-    apk update && apk add curl unzip jq uuidgen gcompat libc6-compat bc openssl > /dev/null 2>&1
-    mkdir -p "$X_DIR" && sync
-    
-    local arch=$(uname -m | sed 's/x86_64/64/;s/aarch64/arm64-v8a/')
-    local ver=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
-    
-    info "下载 Xray $ver ($arch)..."
-    curl -L -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/$ver/Xray-linux-$arch.zip"
-    unzip -o /tmp/xray.zip -d /tmp/xray_tmp > /dev/null
-    mv -f /tmp/xray_tmp/xray "$X_BIN" && chmod +x "$X_BIN"
-    rm -rf /tmp/xray*
-    
-    if [[ ! -f "$X_CONFIG" ]]; then
-        local port
-        while true; do
-            echo -ne "${GREEN}请输入入站端口 (回车随机): ${RESET}"; read port
-            [[ -z "$port" ]] && port=$((RANDOM % 45535 + 10000))
-            is_valid_port "$port" && break || error "端口无效，请输入 1-65535 之间的数字。"
-        done
-        
-        # 1. 安装时：独立处理账号生成
-        echo -ne "${GREEN}请输入 Socks5 用户名 (直接回车默认随机生成): ${RESET}"; read user
-        if [[ -z "$user" ]]; then
-            user=$(openssl rand -hex 4)   # 8位随机字符
-            info "👉 采用默认随机生成用户名: ${user}"
-        fi
-
-        # 2. 安装时：独立处理密码生成
-        local pass=""
-        if [[ -z "$pass" ]]; then
-            # 这里的判定逻辑承接上一步。如果上一步是回车，这里也会自动进随机生成
-            # 如果上一步用户自己输入了用户名，则强制要求用户输入密码
-            if [[ -ne ${#user} || "$user" != "$(jq -r . 2>/dev/null <<< "\"$user\"")" ]]; then 
-                # 这一段精简了逻辑，根据上面用户是否输入来进行不同分配
-                :
-            fi
-        fi
-
-        # 重新调顺安装时的密码交互逻辑：
-        # 如果上一步用户名是全新手动输入的，就提示输入密码；如果是回车的，就自动分开生产
-        if [ -n "${pass}" ] || [[ -z "${n_user:-}" ]]; then
-             # 占位小校验
-             :
-        fi
-
-        # 下面是精简规范后的安装交互判定
-        if [[ -z "${pass}" ]]; then
-            # 如果是刚生成的随机账号或者回车状态
-            # 我们通过外部变量或者 read 时的情况来区分：
-            # 这里直接用更清晰的代码重构这个判定区：
-            if [[ -z "${input_raw_user:-}" ]]; then
-                # 为了防止前面read没存原始状态，我们直接看当前是不是手动输入
-                # 如果用户想完全手工或者完全随机，直接用下面最稳妥的分离法：
-                :
-            fi
-        fi
-    fi
-}
-
-# 修正合并后的安装逻辑核心区
-install_xray_fixed() {
-    info "正在安装依赖与内核..."
-    apk update && apk add curl unzip jq uuidgen gcompat libc6-compat bc openssl > /dev/null 2>&1
-    mkdir -p "$X_DIR" && sync
-    
-    local arch=$(uname -m | sed 's/x86_64/64/;s/aarch64/arm64-v8a/')
-    local ver=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
-    
-    info "下载 Xray $ver ($arch)..."
-    curl -L -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/$ver/Xray-linux-$arch.zip"
-    unzip -o /tmp/xray.zip -d /tmp/xray_tmp > /dev/null
-    mv -f /tmp/xray_tmp/xray "$X_BIN" && chmod +x "$X_BIN"
-    rm -rf /tmp/xray*
-    
-    if [[ ! -f "$X_CONFIG" ]]; then
-        local port
-        while true; do
-            echo -ne "${GREEN}请输入入站端口 (回车随机): ${RESET}"; read port
-            [[ -z "$port" ]] && port=$((RANDOM % 45535 + 10000))
-            is_valid_port "$port" && break || error "端口无效，请输入 1-65535 之间的数字。"
-        done
-        
-        local user pass
-        # 账号与密码完全分开独立询问与生产
-        echo -ne "${GREEN}请输入 Socks5 用户名 (直接回车默认随机生成): ${RESET}"; read user
-        if [[ -z "$user" ]]; then
-            user=$(openssl rand -hex 4)   # 8位随机字符
-            info "👉 采用默认随机生成用户名: ${user}"
-        fi
-        
-        echo -ne "${GREEN}请输入 Socks5 密码 (直接回车默认随机生成): ${RESET}"; read pass
-        if [[ -z "$pass" ]]; then
-            pass=$(openssl rand -hex 8)   # 16位随机字符
-            info "👉 采用默认随机生成密 码: ${pass}"
+    while true; do
+        read -rp "请输入XHTTP路径 (默认: 随机路径): " input_path
+        if [[ -z "$input_path" ]]; then
+            path="/$(openssl rand -hex 4)"; break
         else
-            if [[ -z "$pass" ]]; then
-                while true; do
-                    echo -ne "${GREEN}密码不能为空，请重新输入 Socks5 密码: ${RESET}"; read pass
-                    [[ -n "$pass" ]] && break
-                done
-            fi
+            [[ ! "$input_path" =~ ^\/ ]] && input_path="/$input_path"
+            if is_valid_path "$input_path"; then path="$input_path"; break; else error "路径格式无效"; fi
         fi
-        
-        write_config "$port" "$user" "$pass"
-        
-        # 写入 OpenRC 服务脚本
-        cat << EOF > "$INIT_FILE"
-#!/sbin/openrc-run
-command="${X_BIN}"
-command_args="run -c ${X_CONFIG}"
-command_background="yes"
-pidfile="/run/${SERV_NAME}.pid"
-output_log="$X_LOG"
-error_log="$X_LOG"
-EOF
-        chmod +x "$INIT_FILE"
-        touch "$X_LOG"
-        rc-update add "$SERV_NAME" default >/dev/null 2>&1
-    fi
+    done
 
-    rc-service "$SERV_NAME" restart
-    
-    # 读取配置生成双链接
-    local ip=$(get_public_ip || echo "127.0.0.1")
-    local port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
-    local user=$(jq -r '.inbounds[0].settings.accounts[0].user // ""' "$X_CONFIG")
-    local pass=$(jq -r '.inbounds[0].settings.accounts[0].pass // ""' "$X_CONFIG")
-    
-    local enc_ip=$(echo -n "$ip" | jq -sRr @uri)
-    local enc_user=$(echo -n "$user" | jq -sRr @uri)
-    local enc_pass=$(echo -n "$pass" | jq -sRr @uri)
-    
-    mkdir -p "$X_LINK_DIR"
-    if [[ -n "$user" ]]; then
-        echo "socks://${enc_user}:${enc_pass}@${ip}:${port}#${HOSTNAME}-socks5" > "$X_LINK"
-        echo "https://t.me/socks?server=${enc_ip}&port=${port}&user=${enc_user}&pass=${enc_pass}" >> "$X_LINK"
-    else
-        echo "socks://${ip}:${port}#${HOSTNAME}-socks5" > "$X_LINK"
-        echo "https://t.me/socks?server=${enc_ip}&port=${port}" >> "$X_LINK"
-    fi
+    mkdir -p "/usr/local/etc/${SERVICE_NAME}"
+    keys=$(generate_reality_keys) || return 1
+    private_key=$(echo "$keys" | cut -d '|' -f1)
 
+    write_config "$port" "$uuid" "$domain" "$private_key" "$short_id" "$path"
+    test_config || return 1
+    generate_link
+    restart_xray
     show_current_config
 }
 
-# ================== 显示配置 ==================
-show_current_config() {
-    if [[ ! -f "$X_CONFIG" ]]; then
-        error "配置文件不存在"
+# ================== 链式代理出口配置 ==================
+configure_custom_socks5_outbound() {
+    if [[ ! -f "$XRAY_CONFIG" ]]; then error "请先完成安装！"; return; fi
+    local mode current_protocol tmp_file socks_host socks_port socks_user socks_pass
+    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$XRAY_CONFIG" 2>/dev/null)
+
+    echo "---------------------------------------------"
+    echo "请选择出口模式 (当前: $([[ "$current_protocol" == "socks" ]] && echo -e "${YELLOW}Socks5${RESET}" || echo -e "${GREEN}直连${RESET}"))"
+    echo "1) 直连出口"
+    echo "2) Socks5 出口"
+    echo "0) 取消"
+    echo "---------------------------------------------"
+    read -rp "请输入选项 [0-2]: " mode || true
+    
+    if [[ "$mode" == "1" ]]; then
+        tmp_file=$(mktemp)
+        jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$XRAY_CONFIG" > "$tmp_file"
+        mv "$tmp_file" "$XRAY_CONFIG" && chmod 644 "$XRAY_CONFIG"
+        restart_xray && info "已成功切换为直连出口！"
         return
+    elif [[ "$mode" != "2" ]]; then
+        info "已取消"; return
     fi
 
-    local ip port user pass auth_mode
-    ip=$(get_public_ip || echo "未知")
-    port=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "未知")
-    user=$(jq -r '.inbounds[0].settings.accounts[0].user // "无"' "$X_CONFIG" 2>/dev/null || echo "无")
-    pass=$(jq -r '.inbounds[0].settings.accounts[0].pass // "无"' "$X_CONFIG" 2>/dev/null || echo "无")
-    
-    local auth_status=$(jq -r '.inbounds[0].settings.auth' "$X_CONFIG" 2>/dev/null || echo "noauth")
-    [[ "$auth_status" == "password" ]] && auth_mode="用户名密码验证" || auth_mode="匿名免密 (noauth)"
+    read -rp "请输入 Socks5 服务器地址/IP: " socks_host
+    [[ -z "$socks_host" ]] && return
+    while true; do
+        read -rp "请输入 Socks5 端口 (默认: 1080): " socks_port; socks_port=${socks_port:-1080}
+        if is_valid_port "$socks_port"; then break; else error "端口无效"; fi
+    done
+    read -rp "请输入 Socks5 用户名 (若无认证直接留空回车): " socks_user
+    socks_pass=""
+    if [[ -n "$socks_user" ]]; then read -rs -p "请输入 Socks5 密码: " socks_pass; echo; fi
 
-    echo -e "\n${GREEN}====== 当前配置详情 ======${RESET}"
-    echo -e "${YELLOW}IP地址       : ${ip}${RESET}"
-    echo -e "${YELLOW}端口         : ${port}${RESET}"
-    echo -e "${YELLOW}用户名       : ${user}${RESET}"
-    echo -e "${YELLOW}密码         : ${pass}${RESET}"
-    echo -e "${YELLOW}分享存放路径 : ${X_LINK}${RESET}"
-    
-    if [[ -f "$X_LINK" ]]; then
-        echo -e "${GREEN}====== 👉 通用客户端 Socks5 链接 ======${RESET}"
-        sed -n '1p' "$X_LINK"
-        echo -e "${GREEN}====== 🚀 Telegram 一键代理链接 ======${RESET}"
-        sed -n '2p' "$X_LINK"
+    tmp_file=$(mktemp)
+    if [[ -n "$socks_user" ]]; then
+        jq --arg host "$socks_host" --argjson port "$socks_port" --arg user "$socks_user" --arg pass "$socks_pass" \
+        '.outbounds = [{"protocol": "socks", "tag": "socks-out", "settings": {"servers": [{"address": $host, "port": $port, "users": [{"user": $user, "pass": $pass}]}]}}]' "$XRAY_CONFIG" > "$tmp_file"
+    else
+        jq --arg host "$socks_host" --argjson port "$socks_port" \
+        '.outbounds = [{"protocol": "socks", "tag": "socks-out", "settings": {"servers": [{"address": $host, "port": $port}]}}]' "$XRAY_CONFIG" > "$tmp_file"
+    fi
+
+    mv "$tmp_file" "$XRAY_CONFIG" && chmod 644 "$XRAY_CONFIG"
+    restart_xray && info "Socks5出口代理配置成功！"
+}
+
+# ================== 修改节点配置逻辑 ==================
+modify_config() {
+    if [[ ! -f "$XRAY_CONFIG" ]]; then error "配置文件不存在"; return 1; fi
+    local old_port old_uuid old_domain private_key old_shortid old_path port uuid domain shortid path input_port input_uuid input_domain input_shortid input_path
+
+    old_port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG")
+    old_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG")
+    old_domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG")
+    private_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$XRAY_CONFIG")
+    old_shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG")
+    old_path=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path // "/random"' "$XRAY_CONFIG")
+
+    while true; do
+        read -rp "请输入新端口 [当前:${old_port}, 回车不修改]: " input_port
+        if [[ -z "$input_port" ]]; then port="$old_port"; break
+        elif is_valid_port "$input_port"; then
+            if [[ "$input_port" != "$old_port" ]] && ! check_port "$input_port"; then error "端口占用"; continue; fi
+            port="$input_port"; break
+        else error "端口无效"; fi
+    done
+
+    read -rp "请输入UUID [当前:${old_uuid}, 回车不修改]: " input_uuid
+    uuid=${input_uuid:-$old_uuid}
+
+    read -rp "请输入SNI域名 [当前:${old_domain}, 回车不修改]: " input_domain
+    domain=${input_domain:-$old_domain}
+
+    while true; do
+        read -rp "请输入ShortID [当前:${old_shortid}, 回车不修改]: " input_shortid
+        shortid=${input_shortid:-$old_shortid}
+        if is_valid_shortid "$shortid"; then break; else error "格式错误"; fi
+    done
+
+    while true; do
+        read -rp "请输入XHTTP路径 [当前:${old_path}, 回车不修改]: " input_path
+        path=${input_path:-$old_path}
+        [[ ! "$path" =~ ^\/ ]] && path="/$path"
+        if is_valid_path "$path"; then break; else error "格式错误"; fi
+    done
+
+    write_config "$port" "$uuid" "$domain" "$private_key" "$shortid" "$path"
+    test_config || return 1
+    generate_link
+    restart_xray
+    info "配置修改成功！"
+}
+
+# ================== 其他面板维护命令 ==================
+install_xray() {
+    info "开始拉取、解压并初始化安装 Xray-core..."
+    download_and_extract_xray || return 1
+    setup_systemd_service
+    configure_xray
+}
+
+update_xray() {
+    info "更新 Xray-core 二进制内核..."
+    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+    if download_and_extract_xray && restart_xray; then
+        info "升级完成！当前核心版本: $(get_xray_version)"
+    else
+        error "升级失败，正在尝试恢复..."
+        restart_xray
     fi
 }
 
-# ================== 菜单 ==================
+uninstall_xray() {
+    warn "即将全盘卸载并清理 vless-xhttp 服务..."
+    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+    systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+    systemctl daemon-reload
+    rm -f "$XRAY_BINARY"
+    rm -rf "/usr/local/etc/${SERVICE_NAME}" "/usr/local/share/${SERVICE_NAME}" /root/xray_vless_reality.txt
+    info "服务已成功卸载并安全清理。"
+}
+
+# ================== SNI 优选 ==================
+select_best_sni() {
+    info "开始优选 SNI 延迟测试"
+
+    local SNIS=(
+        amd.com apps.mzstatic.com aws.com azure.microsoft.com beacon.gtv-pub.com
+        bing.com catalog.gamepass.com cdn.bizibly.com cdn-dynmedia-1.microsoft.com
+        devblogs.microsoft.com fpinit.itunes.apple.com go.microsoft.com
+        gray-config-prod.api.arc-cdn.net gray.video-player.arcpublishing.com
+        images.nvidia.com r.bing.com services.digitaleast.mobi snap.licdn.com
+        statici.icloud.com tag.demandbase.com tag-logger.demandbase.com
+        ts1.tc.mm.bing.net ts2.tc.mm.bing.net vs.aws.amazon.com www.apple.com
+        www.icloud.com www.microsoft.com www.oracle.com www.xbox.com
+        www.xilinx.com xp.apple.com
+    )
+
+    local BEST_SNI=""
+    local BEST_TIME=999999
+
+    for sni in "${SNIS[@]}"; do
+        local start
+        start=$(date +%s%N)
+
+        if timeout 3 openssl s_client -connect "${sni}:443" -servername "${sni}" -brief </dev/null >/dev/null 2>&1; then
+            local end cost
+            end=$(date +%s%N)
+            cost=$(( (end - start) / 1000000 ))
+
+            echo "[SNI] $sni -> ${cost}ms"
+
+            if [ $cost -lt $BEST_TIME ]; then
+                BEST_TIME=$cost
+                BEST_SNI=$sni
+            fi
+        fi
+    done
+
+    if [ -n "$BEST_SNI" ]; then
+        info "最优 SNI: $BEST_SNI (${BEST_TIME}ms)"
+        echo "$BEST_SNI"
+        return 0
+    else
+        warn "未找到可用 SNI"
+        return 1
+    fi
+}
+
+
+# ================== 菜单系统 ==================
 show_menu() {
     clear
-    local status=$(get_xray_status)
-    local version=$(get_xray_version)
-    local port_show="-"
-    [[ -f "$X_CONFIG" ]] && port_show=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "-")
+    local status version port_show
+    status=$(get_xray_status)
+    version=$(get_xray_version)
+    port_show=$([[ -f "$XRAY_CONFIG" ]] && jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "-")
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      Xray Socks5 管理面板       ${RESET}"
+    echo -e "${GREEN}    VLESS-Reality-xhttp 面板     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 Xray Socks5 ${RESET}"
-    echo -e "${GREEN} 2. 更新 Xray${RESET}"
-    echo -e "${GREEN} 3. 卸载 Xray${RESET}"
+    echo -e "${GREEN} 1. 安装 VLESS-Reality-xhttp${RESET}"
+    echo -e "${GREEN} 2. 更新 VLESS-Reality-xhttp${RESET}"
+    echo -e "${GREEN} 3. 卸载 VLESS-Reality-xhttp${RESET}"
     echo -e "${GREEN} 4. 修改配置${RESET}"
-    echo -e "${GREEN} 5. 启动 Xray${RESET}"
-    echo -e "${GREEN} 6. 停止 Xray${RESET}"
-    echo -e "${GREEN} 7. 重启 Xray${RESET}"
-    echo -e "${GREEN} 8. 查看日志${RESET}"
+    echo -e "${GREEN} 5. 启动 VLESS-Reality-xhttp${RESET}"
+    echo -e "${GREEN} 6. 停止 VLESS-Reality-xhttp${RESET}"
+    echo -e "${GREEN} 7. 重启 VLESS-Reality-xhttp${RESET}"
+    echo -e "${GREEN} 8. 查看服务日志${RESET}"
     echo -e "${GREEN} 9. 查看节点配置${RESET}"
+    echo -e "${GREEN}10. 配置Socks5出口${RESET}"
+    echo -e "${GREEN}11. SNI域名优选✨${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-while true; do
-    show_menu
-    echo -ne "${GREEN}请输入选项: ${RESET}"; read choice
-    case $choice in
-        1|2) install_xray_fixed; pause ;;
-        3) 
-            rc-service "$SERV_NAME" stop 2>/dev/null || true
-            rc-update del "$SERV_NAME" default 2>/dev/null || true
-            rm -rf "$X_DIR" "$X_BIN" "$INIT_FILE" "$X_LINK" "$X_LOG" "$X_LINK_DIR"
-            info "卸载完成"
-            pause 
-            ;;
-        4) modify_config; pause ;;
-        5) rc-service "$SERV_NAME" start; pause ;;
-        6) rc-service "$SERV_NAME" stop; pause ;;
-        7) rc-service "$SERV_NAME" restart; pause ;;
-        8) [[ -f "$X_LOG" ]] && tail -f "$X_LOG" || error "暂无日志"; pause ;;
-        9) show_current_config || error "无配置"; pause ;;
-        0) exit 0 ;;
-        *) error "无效选项"; sleep 1 ;;
-    esac
-done
+pre_check() {
+    if [[ $(id -u) -ne 0 ]]; then error "请切换到 root 用户运行"; exit 1; fi
+    local missing=0 deps=(jq curl wget openssl ss timeout unzip)
+    for cmd in "${deps[@]}"; do if ! command -v "$cmd" >/dev/null 2>&1; then missing=1; break; fi; done
+    if [[ "$missing" -eq 1 ]]; then
+        info "正在安装必须依赖项..."
+        if command -v apt &>/dev/null; then apt update && apt install -y jq curl wget openssl ca-certificates iproute2 unzip || true
+        elif command -v dnf &>/dev/null; then dnf install -y jq curl wget openssl ca-certificates iproute2 unzip
+        elif command -v yum &>/dev/null; then yum install -y jq curl wget openssl ca-certificates iproute2 unzip; fi
+    fi
+}
+
+main() {
+    pre_check
+    while true; do
+        show_menu
+        local choice=""
+        read -r -p $'\033[32m请输入数字选项: \033[0m' choice || true
+        [[ -z "$choice" ]] && continue
+        case "$choice" in
+            1) install_xray; pause ;;
+            2) update_xray; pause ;;
+            3) uninstall_xray; pause ;;
+            4) modify_config; pause ;;
+            5) systemctl start "${SERVICE_NAME}" &>/dev/null || true; restart_xray; pause ;;
+            6) systemctl stop "${SERVICE_NAME}" &>/dev/null || true; info "服务已停止"; pause ;;
+            7) restart_xray; pause ;;
+            8) journalctl -u "${SERVICE_NAME}" -e --no-pager || true; pause ;;
+            9) show_current_config; pause ;;
+            10) configure_custom_socks5_outbound; pause ;;
+            11) select_best_sni; pause ;;
+            0) exit 0 ;;
+            *) error "无效选项"; pause ;;
+        esac
+    done
+}
+
+main "$@"

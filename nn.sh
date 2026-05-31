@@ -1,12 +1,26 @@
-#!/bin/bash
-
+#!/usr/bin/env bash
+#
+# Socks5 控制面板
+# SPDX-License-Identifier: MIT
+#
 # =========================================================
-# Xray VLESS-REALITY-xhttp  管理脚本
+# 1. 核心控制与全局环境初始化
 # =========================================================
+set -Eop pipefail
+export LANG=en_US.UTF-8
 
-set -Eeuo pipefail
+# 基础目录与硬编码配置
+WORKDIR="/root/proxynode/Socks5"
+readonly PID_FILE="${WORKDIR}/s5.pid"
+readonly META_FILE="${WORKDIR}/meta.env"
+readonly CONFIG_S5="${WORKDIR}/config.json"
+readonly CONFIG_3PROXY="${WORKDIR}/3proxy.cfg"
+readonly SERVICE_FILE="/etc/systemd/system/mo-socks5.service"
 
-# ================== 颜色 ==================
+DEFAULT_PORT=1080
+PREFERRED_IMPLS=("s5" "3proxy" "microsocks" "ss5" "danted" "sockd")
+
+# 终端颜色代码
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
@@ -14,639 +28,459 @@ BLUE="\033[34m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-# ================== 基础变量 ==================
-readonly SERVICE_NAME="vless-xhttp"
-readonly XRAY_CONFIG="/usr/local/etc/${SERVICE_NAME}/config.json"
-readonly XRAY_BINARY="/usr/local/bin/${SERVICE_NAME}"
-readonly XRAY_PUBLIC_KEY_FILE="/usr/local/etc/${SERVICE_NAME}/public.key"
-
-# 降级备用版本
-readonly BACKUP_VERSION="26.3.27"
-
-TMP_DIR=$(mktemp -d -t xray.XXXXXX)
-
-# ================== cleanup ==================
-cleanup() {
-    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+# =========================================================
+# 2. 官方原生底层工具函数与网络环境探测
+# =========================================================
+has_command() {
+  local _command=$1
+  type -P "$_command" > /dev/null 2>&1
 }
 
-trap cleanup EXIT INT TERM
+info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
+error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
+pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
 
-# ================== 日志 ==================
-info() {
-    echo -e "${GREEN}[信息] $*${RESET}" >&2
-}
-
-warn() {
-    echo -e "${YELLOW}[警告] $*${RESET}" >&2
-}
-
-error() {
-    echo -e "${RED}[错误] $*${RESET}" >&2
-}
-
-pause() {
-    read -n 1 -s -r -p "按任意键返回菜单..." || true
-    echo
-}
-
-# ================== 获取公网IP ==================
-get_public_ip() {
-    local ip
-    for cmd in "curl -4fsSL --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null || true)
-            if [[ -n "${ip:-}" ]]; then echo "$ip"; return 0; fi
-        done
-    done
-    for cmd in "curl -6fsSL --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ipv6.ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null || true)
-            if [[ -n "${ip:-}" ]]; then echo "$ip"; return 0; fi
-        done
-    done
-    return 1
-}
-
-# ================== 检查与校验 ==================
-check_port() {
-    local port="$1"
-    if ss -tuln | awk '{print $5}' | grep -qE "[:.]${port}$"; then return 1; fi
+systemctl() {
+  if ! has_command systemctl; then
+    warn "当前系统不支持 systemd，忽略守护进程操作: systemctl $*"
     return 0
+  fi
+  command systemctl "$@"
 }
 
-is_valid_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]
+ensure_workdir() {
+  mkdir -p "${WORKDIR}"
+  chmod 700 "${WORKDIR}"
 }
 
-get_random_port() {
-    local rand_port
-    while true; do
-        rand_port=$((RANDOM % 55536 + 10000))
-        if check_port "$rand_port"; then echo "$rand_port"; return 0; fi
-    done
+random_port() {
+  shuf -i 20000-60000 -n 1
 }
 
-is_valid_uuid() {
-    [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]
+random_user() {
+  echo "s5_$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 6)"
 }
 
-is_valid_shortid() {
-    local len=${#1}
-    if [[ "$1" =~ ^[0-9a-fA-F]+$ ]] && (( len % 2 == 0 )) && (( len <= 16 )); then return 0; fi
-    return 1
+random_pass() {
+  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12 || echo "s5pass123"
 }
 
-is_valid_domain() {
-    [[ "$1" =~ ^([a-zA-Z0-9](-?[a-zA-Z0-9])*\.)+[A-Za-z]{2,}$ ]]
+get_best_ip() {
+  local ip
+  for svc in "https://icanhazip.com" "https://ifconfig.me" "https://ipinfo.io/ip" "https://4.ipw.cn"; do
+    ip=$(curl -s --max-time 5 "$svc" || true)
+    ip=$(echo "$ip" | tr -d '[:space:]')
+    if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      echo "$ip"
+      return 0
+    fi
+  done
+
+  if has_command ip; then
+    ip=$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {print $7; exit}')
+    ip=$(echo "$ip" | tr -d '[:space:]')
+    if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      echo "$ip"
+      return 0
+    fi
+  fi
+
+  echo "127.0.0.1"
 }
 
-is_valid_path() {
-    [[ "$1" =~ ^\/[a-zA-Z0-9\/_-]+$ ]]
+urlencode() {
+  local s="$1"
+  if has_command python3; then
+    python3 -c "import sys,urllib.parse as u; print(u.quote(sys.argv[1], safe=''))" "$s"
+  elif has_command python; then
+    python -c "import sys,urllib as u; print(u.quote(sys.argv[1]))" "$s"
+  else
+    printf '%s' "$s"
+  fi
 }
 
-get_arch() {
-    local arch
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64) echo "64" ;;
-        aarch64|arm64) echo "arm64-v8a" ;;
-        armv7l) echo "arm32-v7a" ;;
-        *) error "暂不支持的系统架构: $arch"; return 1 ;;
+# =========================================================
+# 3. 后端组件检测与多包管理器自动安装
+# =========================================================
+detect_existing_impl() {
+  for impl in "${PREFERRED_IMPLS[@]}"; do
+    case "${impl}" in
+      s5|3proxy|microsocks|ss5)
+        if has_command "${impl}"; then echo "${impl}"; return 0; fi
+        ;;
+      danted|sockd)
+        if has_command sockd || has_command danted; then echo "danted"; return 0; fi
+        ;;
     esac
+  done
+  echo ""
 }
 
-get_latest_version() {
-    local latest_version
-    info "正在获取 GitHub 最新 Xray 版本号..."
-    latest_version=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null | jq -r '.tag_name' 2>/dev/null || echo "")
-    latest_version="${latest_version#v}"
-    if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
-        warn "拉取最新版本失败，将使用内置备用版本: v${BACKUP_VERSION}"
-        echo "$BACKUP_VERSION"
-    else
-        info "成功获取最新版本: v${latest_version}"
-        echo "$latest_version"
-    fi
+try_install_package() {
+  local pkg_name="$1"
+  info "正在尝试通过包管理器部署相关组件: ${pkg_name}..."
+  if has_command apt-get; then
+    apt-get update -y && apt-get install -y "${pkg_name}" && return 0
+  elif has_command dnf; then
+    dnf install -y "${pkg_name}" && return 0
+  elif has_command yum; then
+    yum install -y "${pkg_name}" && return 0
+  elif has_command apk; then
+    apk add --no-cache "${pkg_name}" && return 0
+  elif has_command pacman; then
+    pacman -Sy --noconfirm "${pkg_name}" && return 0
+  fi
+  return 1
 }
 
-# ================== 下载并安装 ==================
-download_and_extract_xray() {
-    local arch version
-    arch=$(get_arch) || return 1
-    version=$(get_latest_version)
-    local download_url="https://github.com/XTLS/Xray-core/releases/download/v${version}/Xray-linux-${arch}.zip"
-    local zip_file="$TMP_DIR/xray.zip"
-    
-    info "正在下载 Xray v${version} (${arch})..."
-    if ! curl -L -fsSL "$download_url" -o "$zip_file"; then
-        error "从 GitHub 下载 Xray 失败"
-        return 1
-    fi
-    
-    info "正在解压..."
-    mkdir -p "$TMP_DIR/extracted"
-    if ! unzip -qo "$zip_file" -d "$TMP_DIR/extracted"; then
-        error "解压失败，请确保系统已安装 unzip。"
-        return 1
-    fi
-    
-    mkdir -p "$(dirname "$XRAY_BINARY")"
-    rm -f "$XRAY_BINARY"
-    cp -f "$TMP_DIR/extracted/xray" "$XRAY_BINARY"
-    chmod +x "$XRAY_BINARY"
-    
-    mkdir -p "/usr/local/share/${SERVICE_NAME}"
-    cp -f "$TMP_DIR/extracted/geoip.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
-    cp -f "$TMP_DIR/extracted/geosite.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
+# =========================================================
+# 4. 核心配置文件与守护进程服务生成
+# =========================================================
+generate_backend_config() {
+  case "${BIN_TYPE}" in
+    3proxy)
+      cat << EOF > "${CONFIG_3PROXY}"
+daemon
+maxconn 100
+nserver 8.8.8.8
+nserver 8.8.4.4
+timeouts 1 5 30 60 180 1800 15 60
+users ${USERNAME}:CL:${PASSWORD}
+auth strong
+allow ${USERNAME}
+socks -p${PORT}
+EOF
+      chmod 600 "${CONFIG_3PROXY}"
+      ;;
+    s5)
+      cat << EOF > "${CONFIG_S5}"
+{
+  "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
+  "inbounds": [{
+    "port": ${PORT},
+    "protocol": "socks",
+    "tag": "socks",
+    "settings": {
+      "auth": "password",
+      "udp": false,
+      "ip": "0.0.0.0",
+      "userLevel": 0,
+      "accounts": [{"user": "${USERNAME}", "pass": "${PASSWORD}"}]
+    }
+  }],
+  "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+}
+EOF
+      chmod 600 "${CONFIG_S5}"
+      ;;
+  esac
 }
 
-setup_systemd_service() {
-    info "配置 Systemd 服务 [${SERVICE_NAME}]..."
-    cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+create_start_script() {
+  cat << 'EOF' > "${WORKDIR}/start.sh"
+#!/usr/bin/env bash
+WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${WORKDIR}/meta.env" ]; then
+  source "${WORKDIR}/meta.env"
+else
+  echo "核心环境配置文件 meta.env 丢失"
+  exit 1
+fi
+
+case "$BIN_TYPE" in
+  3proxy)     exec 3proxy "${WORKDIR}/3proxy.cfg" ;;
+  s5)         exec s5 -c "${WORKDIR}/config.json" ;;
+  microsocks) exec microsocks -i 0.0.0.0 -p "$PORT" -u "$USERNAME" -P "$PASSWORD" ;;
+  ss5)        exec ss5 -u "$USERNAME:$PASSWORD" -p "$PORT" ;;
+  *)          echo "未知的 Socks5 底层实现引擎类型: $BIN_TYPE"; exit 1 ;;
+esac
+EOF
+  chmod +x "${WORKDIR}/start.sh"
+}
+
+create_service() {
+  cat << EOF > "${SERVICE_FILE}"
 [Unit]
-Description=Xray Vless Reality xhttp Service
-After=network.target nss-lookup.target
+Description=Socks5 Multi-Backend Service
+After=network.target network-online.target
 
 [Service]
-User=root
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ExecStart=${XRAY_BINARY} run -config ${XRAY_CONFIG}
-Restart=on-failure
-RestartPreventExitStatus=23
-LimitNPROC=10000
-LimitNOFILE=1000000
+Type=simple
+WorkingDirectory=${WORKDIR}
+ExecStart=${WORKDIR}/start.sh
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+  if has_command systemctl; then
     systemctl daemon-reload
-    systemctl enable "${SERVICE_NAME}" 2>/dev/null || true
+    systemctl enable mo-socks5 >/dev/null 2>&1 || true
+  fi
 }
 
-get_xray_status() {
-    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
-        echo -e "${GREEN}● 运行中${RESET}"
-    else
-        echo -e "${RED}● 未运行${RESET}"
-    fi
-}
-
-get_xray_version() {
-    if [[ -x "$XRAY_BINARY" ]]; then
-        "$XRAY_BINARY" version 2>/dev/null | grep -i "Xray" | head -n 1 | awk '{print $2}' || echo "未知"
-    else
-        echo "未安装"
-    fi
-}
-
-test_config() {
-    if "$XRAY_BINARY" run -test -config "$XRAY_CONFIG"; then
-        info "配置测试成功！"
-        return 0
-    fi
-    error "配置测试失败"
-    return 1
-}
-
-restart_xray() {
-    systemctl restart "${SERVICE_NAME}" 2>/dev/null || true
-    sleep 1
-    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
-        info "服务启动成功"
-        return 0
-    fi
-    error "服务启动失败"
-    journalctl -u "${SERVICE_NAME}" -n 20 --no-pager || true
-    return 1
-}
-
-generate_reality_keys() {
-    info "正在生成 Reality 密钥对..."
-    local key_pair private_key public_key
-    if ! key_pair=$(timeout 10 "$XRAY_BINARY" x25519 2>/dev/null); then
-        error "密钥生成失败"
-        return 1
-    fi
-    private_key=$(echo "$key_pair" | grep -i "Private" | awk -F ': ' '{print $2}' | tr -d '\r')
-    public_key=$(echo "$key_pair" | grep -i "Public" | awk -F ': ' '{print $2}' | tr -d '\r')
-    echo "$public_key" > "$XRAY_PUBLIC_KEY_FILE"
-    echo "${private_key}|${public_key}"
-}
-
-get_public_key() {
-    [[ -f "$XRAY_PUBLIC_KEY_FILE" ]] && cat "$XRAY_PUBLIC_KEY_FILE"
-}
-
-# ================== 使用 JQ 动态安全写配置 ==================
-write_config() {
-    local port="$1"
-    local uuid="$2"
-    local domain="$3"
-    local private_key="$4"
-    local shortid="$5"
-    local path="$6"
-
-    mkdir -p "$(dirname "$XRAY_CONFIG")"
-
-    jq -n \
-        --argjson port "$port" \
-        --arg uuid "$uuid" \
-        --arg target "$domain" \
-        --arg privateKey "$private_key" \
-        --arg shortId "$shortid" \
-        --arg path "$path" \
-      '{
-        "log": {"loglevel": "warning"},
-        "inbounds": [{
-          "listen": "::",
-          "port": $port,
-          "protocol": "vless",
-          "settings": {
-            "clients": [{"id": $uuid}],
-            "decryption": "none"
-          },
-          "streamSettings": {
-            "network": "xhttp",
-            "security": "reality",
-            "realitySettings": {
-              "show": false,
-              "dest": ($target + ":443"),
-              "serverNames": [$target],
-              "privateKey": $privateKey,
-              "shortIds": [$shortId]
-            },
-            "xhttpSettings": {
-              "host": "",
-              "path": $path
-            }
-          },
-          "sniffing": {
-            "enabled": true,
-            "destOverride": ["http", "tls", "quic"],
-            "metadataOnly": false
-          }
-        }],
-        "outbounds": [{
-          "protocol": "freedom",
-          "settings": {
-            "domainStrategy": "UseIPv4v6"
-          }
-        }]
-      }' > "$XRAY_CONFIG"
-}
-
-# ================== 生成分享链接 ==================
-generate_link() {
-    local ip uuid port domain shortid public_key path display_ip hostname
-    if ! ip=$(get_public_ip); then error "获取公网 IP 失败"; return 1; fi
-
-    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null)
-    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null)
-    domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG" 2>/dev/null)
-    shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG" 2>/dev/null)
-    path=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$XRAY_CONFIG" 2>/dev/null)
-    public_key=$(get_public_key)
-
-    display_ip="$ip"
-    [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
-    hostname=$(hostname -s 2>/dev/null | tr ' ' '_')
-    [[ -z "$hostname" ]] && hostname="Xray"
-
-    cat > /root/proxynode/Realityxhttp/xray_vless_reality.txt <<EOF
-vless://${uuid}@${display_ip}:${port}?encryption=none&type=xhttp&security=reality&sni=${domain}&fp=chrome&pbk=${public_key}&sid=${shortid}&path=${path}#${hostname}-VLESS-Reality-xhttp
+save_meta() {
+  cat << EOF > "${META_FILE}"
+PORT='${PORT}'
+USERNAME='${USERNAME}'
+PASSWORD='${PASSWORD}'
+BIN_TYPE='${BIN_TYPE}'
 EOF
+  chmod 600 "${META_FILE}"
 }
 
-# ================== 显示节点信息 ==================
-show_current_config() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then error "配置文件不存在"; return; fi
-    local ip uuid port domain shortid public_key path outbound_mode current_protocol
-    ip=$(get_public_ip || echo "未知")
-    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null)
-    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null)
-    domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG" 2>/dev/null)
-    shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG" 2>/dev/null)
-    path=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$XRAY_CONFIG" 2>/dev/null)
-    public_key=$(get_public_key)
-    
-    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$XRAY_CONFIG" 2>/dev/null)
-    outbound_mode=$([[ "$current_protocol" == "socks" ]] && echo "Socks5 链式代理" || echo "直连 (Freedom)")
-
-    echo -e "${GREEN}====== 当前配置 ======${RESET}"
-    echo -e "${YELLOW}IP地址      : ${ip}${RESET}"
-    echo -e "${YELLOW}端口        : ${port}${RESET}"
-    echo -e "${YELLOW}UUID        : ${uuid}${RESET}"
-    echo -e "${YELLOW}SNI (域名)  : ${domain}${RESET}"
-    echo -e "${YELLOW}PublicKey   : ${public_key}${RESET}"
-    echo -e "${YELLOW}ShortID     : ${shortid}${RESET}"
-    echo -e "${YELLOW}XHTTP Path  : ${path}${RESET}"
-    echo -e "${YELLOW}出口模式    : ${outbound_mode}${RESET}"
-    echo -e "${YELLOW}📄 V6VPS 请自行替换分享链接中的 IP 地址为 V6 ★${RESET}"
-    echo
-
-    if [[ -f /root/proxynode/Realityxhttp/xray_vless_reality.txt ]]; then
-        echo -e "${GREEN}====== 👉 v2rayN 分享链接 ======${RESET}"
-        cat /root/proxynode/Realityxhttp/xray_vless_reality.txt
-    fi
+load_meta() {
+  if [ -f "${META_FILE}" ]; then
+    # shellcheck disable=SC1090
+    source "${META_FILE}"
+  else
+    PORT=""
+    USERNAME=""
+    PASSWORD=""
+    BIN_TYPE=""
+  fi
 }
 
-# ================== 配置节点逻辑 ==================
-configure_xray() {
-    info "开始配置 Reality-xhttp 节点..."
-    local port uuid domain short_id path input_port input_uuid input_domain input_shortid input_path keys private_key
+# =========================================================
+# 5. 主流程控制模块（安装、更新、修改、卸载）
+# =========================================================
+write_and_start_service() {
+  ensure_workdir
+  save_meta
+  generate_backend_config
+  create_start_script
+  create_service
 
-    while true; do
-        read -rp "请输入端口 (直接回车随机分配端口): " input_port
-        if [[ -z "$input_port" ]]; then
-            port=$(get_random_port); info "分配未占用端口: $port"; break
-        elif is_valid_port "$input_port"; then
-            if ! check_port "$input_port"; then error "端口已被占用，请更换"; continue; fi
-            port="$input_port"; break
-        else error "端口无效"; fi
-    done
-
-    while true; do
-        read -rp "请输入UUID (直接回车自动生成): " input_uuid
-        if [[ -z "${input_uuid:-}" ]]; then
-            uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d"); break
-        elif is_valid_uuid "$input_uuid"; then uuid="$input_uuid"; break
-        else error "UUID 格式无效"; fi
-    done
-
-    while true; do
-        read -rp "请输入SNI域名 (默认:www.amazon.com): " input_domain
-        domain=${input_domain:-www.amazon.com}
-        if is_valid_domain "$domain"; then break; else error "域名格式无效"; fi
-    done
-
-    while true; do
-        read -rp "请输入自定义 ShortID (直接回车自动生成 8 位): " input_shortid
-        if [[ -z "$input_shortid" ]]; then short_id=$(openssl rand -hex 4); break
-        elif is_valid_shortid "$input_shortid"; then short_id="$input_shortid"; break
-        else error "必须为偶数位（最长16位）的十六进制字符(0-9, a-f)"; fi
-    done
-
-    while true; do
-        read -rp "请输入XHTTP路径 (默认: 随机路径): " input_path
-        if [[ -z "$input_path" ]]; then
-            path="/$(openssl rand -hex 4)"; break
-        else
-            [[ ! "$input_path" =~ ^\/ ]] && input_path="/$input_path"
-            if is_valid_path "$input_path"; then path="$input_path"; break; else error "路径格式无效"; fi
-        fi
-    done
-
-    mkdir -p "/usr/local/etc/${SERVICE_NAME}"
-    keys=$(generate_reality_keys) || return 1
-    private_key=$(echo "$keys" | cut -d '|' -f1)
-
-    write_config "$port" "$uuid" "$domain" "$private_key" "$short_id" "$path"
-    test_config || return 1
-    generate_link
-    restart_xray
-    show_current_config
-}
-
-# ================== 链式代理出口配置 ==================
-configure_custom_socks5_outbound() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then error "请先完成安装！"; return; fi
-    local mode current_protocol tmp_file socks_host socks_port socks_user socks_pass
-    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$XRAY_CONFIG" 2>/dev/null)
-
-    echo "---------------------------------------------"
-    echo "请选择出口模式 (当前: $([[ "$current_protocol" == "socks" ]] && echo -e "${YELLOW}Socks5${RESET}" || echo -e "${GREEN}直连${RESET}"))"
-    echo "1) 直连出口"
-    echo "2) Socks5 出口"
-    echo "0) 取消"
-    echo "---------------------------------------------"
-    read -rp "请输入选项 [0-2]: " mode || true
-    
-    if [[ "$mode" == "1" ]]; then
-        tmp_file=$(mktemp)
-        jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$XRAY_CONFIG" > "$tmp_file"
-        mv "$tmp_file" "$XRAY_CONFIG" && chmod 644 "$XRAY_CONFIG"
-        restart_xray && info "已成功切换为直连出口！"
-        return
-    elif [[ "$mode" != "2" ]]; then
-        info "已取消"; return
-    fi
-
-    read -rp "请输入 Socks5 服务器地址/IP: " socks_host
-    [[ -z "$socks_host" ]] && return
-    while true; do
-        read -rp "请输入 Socks5 端口 (默认: 1080): " socks_port; socks_port=${socks_port:-1080}
-        if is_valid_port "$socks_port"; then break; else error "端口无效"; fi
-    done
-    read -rp "请输入 Socks5 用户名 (若无认证直接留空回车): " socks_user
-    socks_pass=""
-    if [[ -n "$socks_user" ]]; then read -rs -p "请输入 Socks5 密码: " socks_pass; echo; fi
-
-    tmp_file=$(mktemp)
-    if [[ -n "$socks_user" ]]; then
-        jq --arg host "$socks_host" --argjson port "$socks_port" --arg user "$socks_user" --arg pass "$socks_pass" \
-        '.outbounds = [{"protocol": "socks", "tag": "socks-out", "settings": {"servers": [{"address": $host, "port": $port, "users": [{"user": $user, "pass": $pass}]}]}}]' "$XRAY_CONFIG" > "$tmp_file"
+  if has_command systemctl; then
+    systemctl restart mo-socks5 >/dev/null 2>&1 || true
+    sleep 1.5
+    if systemctl is-active --quiet mo-socks5 2>/dev/null; then
+      info "Socks5 核心服务配置并启动成功！"
     else
-        jq --arg host "$socks_host" --argjson port "$socks_port" \
-        '.outbounds = [{"protocol": "socks", "tag": "socks-out", "settings": {"servers": [{"address": $host, "port": $port}]}}]' "$XRAY_CONFIG" > "$tmp_file"
+      error "Socks5 服务启动失败，请运行 'journalctl -u s5 -f' 查看错误日志。"
     fi
-
-    mv "$tmp_file" "$XRAY_CONFIG" && chmod 644 "$XRAY_CONFIG"
-    restart_xray && info "Socks5出口代理配置成功！"
+  else
+    pkill -f "${WORKDIR}/start.sh" || true
+    "${WORKDIR}/start.sh" >/dev/null 2>&1 &
+    info "非 systemd 环境，守护进程已挂载至后台进程池中运行。"
+  fi
+  showconf
 }
 
-# ================== 修改节点配置逻辑 ==================
-modify_config() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then error "配置文件不存在"; return 1; fi
-    local old_port old_uuid old_domain private_key old_shortid old_path port uuid domain shortid path input_port input_uuid input_domain input_shortid input_path
-
-    old_port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG")
-    old_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG")
-    old_domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG")
-    private_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$XRAY_CONFIG")
-    old_shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG")
-    old_path=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path // "/random"' "$XRAY_CONFIG")
-
-    while true; do
-        read -rp "请输入新端口 [当前:${old_port}, 回车不修改]: " input_port
-        if [[ -z "$input_port" ]]; then port="$old_port"; break
-        elif is_valid_port "$input_port"; then
-            if [[ "$input_port" != "$old_port" ]] && ! check_port "$input_port"; then error "端口占用"; continue; fi
-            port="$input_port"; break
-        else error "端口无效"; fi
-    done
-
-    read -rp "请输入UUID [当前:${old_uuid}, 回车不修改]: " input_uuid
-    uuid=${input_uuid:-$old_uuid}
-
-    read -rp "请输入SNI域名 [当前:${old_domain}, 回车不修改]: " input_domain
-    domain=${input_domain:-$old_domain}
-
-    while true; do
-        read -rp "请输入ShortID [当前:${old_shortid}, 回车不修改]: " input_shortid
-        shortid=${input_shortid:-$old_shortid}
-        if is_valid_shortid "$shortid"; then break; else error "格式错误"; fi
-    done
-
-    while true; do
-        read -rp "请输入XHTTP路径 [当前:${old_path}, 回车不修改]: " input_path
-        path=${input_path:-$old_path}
-        [[ ! "$path" =~ ^\/ ]] && path="/$path"
-        if is_valid_path "$path"; then break; else error "格式错误"; fi
-    done
-
-    write_config "$port" "$uuid" "$domain" "$private_key" "$shortid" "$path"
-    test_config || return 1
-    generate_link
-    restart_xray
-    info "配置修改成功！"
-}
-
-# ================== 其他面板维护命令 ==================
-install_xray() {
-    info "开始拉取、解压并初始化安装 Xray-core..."
-    download_and_extract_xray || return 1
-    setup_systemd_service
-    configure_xray
-}
-
-update_xray() {
-    info "更新 Xray-core 二进制内核..."
-    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
-    if download_and_extract_xray && restart_xray; then
-        info "升级完成！当前核心版本: $(get_xray_version)"
+inst_socks5() {
+  ensure_workdir
+  
+  # 检测底层引擎依赖
+  local exist_impl
+  exist_impl="$(detect_existing_impl || true)"
+  if [ -n "${exist_impl}" ]; then
+    info "当前系统已存在可用组件实现: ${YELLOW}${exist_impl}${RESET} (将直接适配)"
+    BIN_TYPE="${exist_impl}"
+  else
+    warn "系统未检测到内置的代理实现，开始尝试自动拉取交叉编译依赖..."
+    if try_install_package "microsocks"; then
+      BIN_TYPE="microsocks"
+    elif try_install_package "3proxy"; then
+      BIN_TYPE="3proxy"
     else
-        error "升级失败，正在尝试恢复..."
-        restart_xray
+      error "未能通过包管理器自动安装任何代理底层实现（microsocks/3proxy）。"
+      error "请检查您的网络连接或手动安装其中之一后重新运行此脚本。"
+      return 1
     fi
+  fi
+
+  local rand_user
+  rand_user="$(random_user)"
+  local rand_pass
+  rand_pass="$(random_pass)"
+  local rand_port
+  rand_port=$(random_port)
+
+  echo "---------------------------------------------"
+  read -rp "👉 请输入监听端口 (默认随机: ${rand_port}): " input_port
+  PORT=${input_port:-$rand_port}
+  if ! [[ "${PORT}" =~ ^[0-9]+$ ]] || [ "${PORT}" -lt 1 ] || [ "${PORT}" -gt 65535 ]; then
+    warn "端口输入无效，已自动回滚为随机端口: ${rand_port}"
+    PORT="${rand_port}"
+  fi
+
+  read -rp "👉 请设置用户名 (默认随机: ${rand_user}): " input_user
+  USERNAME=${input_user:-$rand_user}
+
+  read -rp "👉 请设置密码 (默认随机: ${rand_pass}): " input_pass
+  PASSWORD=${input_pass:-$rand_pass}
+
+  write_and_start_service
 }
 
-uninstall_xray() {
-    warn "即将全盘卸载并清理 vless-xhttp 服务..."
-    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
-    systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
-    rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+changeconf() {
+  load_meta
+  if [ -z "${BIN_TYPE}" ]; then
+    local exist_impl
+    exist_impl="$(detect_existing_impl || true)"
+    BIN_TYPE="${exist_impl:-}"
+  fi
+  if [ -z "${BIN_TYPE}" ]; then
+    error "未找到有效的底层服务组件，请先执行选项 1 进行安装。"
+    return 1
+  fi
+
+  clear
+  echo -e "${GREEN}====== 修改 Socks5 节点配置 ======${RESET}"
+  echo "提示：直接敲回车将保持原有配置不变"
+  echo "---------------------------------------------"
+
+  local input_port input_user input_pass
+  
+  read -rp "👉 请输入新的监听端口 [当前: ${PORT:-1080}]: " input_port
+  if [ -n "$input_port" ]; then
+    if [[ "${input_port}" =~ ^[0-9]+$ ]] && [ "${input_port}" -ge 1 ] && [ "${input_port}" -le 65535 ]; then
+      PORT="${input_port}"
+    else
+      warn "输入端口格式不合法，保留原端口不变。"
+    fi
+  fi
+
+  read -rp "👉 请设置新的用户名 [当前: ${USERNAME:-unset}]: " input_user
+  USERNAME=${input_user:-$USERNAME}
+
+  read -rp "👉 请设置新的密码 [当前: ${PASSWORD:-unset}]: " input_pass
+  PASSWORD=${input_pass:-$PASSWORD}
+
+  write_and_start_service
+}
+
+uninstall_socks5() {
+  warn "即将从当前系统中彻底卸载并清理 Socks5 服务..."
+
+  if has_command systemctl; then
+    systemctl stop mo-socks5 >/dev/null 2>&1 || true
+    systemctl disable mo-socks5 >/dev/null 2>&1 || true
+    if [ -f "${SERVICE_FILE}" ]; then
+      rm -f "${SERVICE_FILE}"
+    fi
     systemctl daemon-reload
-    rm -f "$XRAY_BINARY"
-    rm -rf "/usr/local/etc/${SERVICE_NAME}" "/usr/local/share/${SERVICE_NAME}" /root/xray_vless_reality.txt
-    info "服务已成功卸载并安全清理。"
+  else
+    pkill -f "${WORKDIR}/start.sh" || true
+  fi
+
+  rm -rf "${WORKDIR}"
+  info "Socks5 全套配置文件及服务已经从您的系统中彻底移除！"
 }
 
-# ================== SNI 优选 ==================
-select_best_sni() {
-    info "开始优选 SNI 延迟测试"
+showconf() {
+  load_meta
+  if [ -z "${PORT}" ]; then
+    error "未找到任何可用的元配置文件，请确认服务已成功初始化。"
+    return 1
+  fi
 
-    local SNIS=(
-        amd.com apps.mzstatic.com aws.com azure.microsoft.com beacon.gtv-pub.com
-        bing.com catalog.gamepass.com cdn.bizibly.com cdn-dynmedia-1.microsoft.com
-        devblogs.microsoft.com fpinit.itunes.apple.com go.microsoft.com
-        gray-config-prod.api.arc-cdn.net gray.video-player.arcpublishing.com
-        images.nvidia.com r.bing.com services.digitaleast.mobi snap.licdn.com
-        statici.icloud.com tag.demandbase.com tag-logger.demandbase.com
-        ts1.tc.mm.bing.net ts2.tc.mm.bing.net vs.aws.amazon.com www.apple.com
-        www.icloud.com www.microsoft.com www.oracle.com www.xbox.com
-        www.xilinx.com xp.apple.com
-    )
+  local ip enc_user enc_pass enc_ip socksurl tlink
+  ip="$(get_best_ip)"
+  enc_user="$(urlencode "${USERNAME}")"
+  enc_pass="$(urlencode "${PASSWORD}")"
+  enc_ip="$(urlencode "${ip}")"
 
-    local BEST_SNI=""
-    local BEST_TIME=999999
+  socksurl="socks://${USERNAME}:${PASSWORD}@${ip}:${PORT}"
+  tlink="https://t.me/socks?server=${enc_ip}&port=${PORT}&user=${enc_user}&pass=${enc_pass}"
 
-    for sni in "${SNIS[@]}"; do
-        local start
-        start=$(date +%s%N)
-
-        if timeout 3 openssl s_client -connect "${sni}:443" -servername "${sni}" -brief </dev/null >/dev/null 2>&1; then
-            local end cost
-            end=$(date +%s%N)
-            cost=$(( (end - start) / 1000000 ))
-
-            echo "[SNI] $sni -> ${cost}ms"
-
-            if [ $cost -lt $BEST_TIME ]; then
-                BEST_TIME=$cost
-                BEST_SNI=$sni
-            fi
-        fi
-    done
-
-    if [ -n "$BEST_SNI" ]; then
-        info "最优 SNI: $BEST_SNI (${BEST_TIME}ms)"
-        echo "$BEST_SNI"
-        return 0
-    else
-        warn "未找到可用 SNI"
-        return 1
-    fi
+  echo -e "${GREEN}====== Socks5 配置 ======${RESET}"
+  echo -e "${YELLOW}● 客户端直连格式:${RESET} ${socksurl}"
+  echo -e "${YELLOW}● Telegram 快捷链接:${RESET} ${tlink}"
+  echo
 }
 
+# =========================================================
+# 6. 面板主菜单
+# =========================================================
+menu() {
+  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
+  ensure_workdir
 
-# ================== 菜单系统 ==================
-show_menu() {
+  while true; do
     clear
-    local status version port_show
-    status=$(get_xray_status)
-    version=$(get_xray_version)
-    port_show=$([[ -f "$XRAY_CONFIG" ]] && jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "-")
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    VLESS-Reality-xhttp 面板     ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $status"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 VLESS-Reality-xhttp${RESET}"
-    echo -e "${GREEN} 2. 更新 VLESS-Reality-xhttp${RESET}"
-    echo -e "${GREEN} 3. 卸载 VLESS-Reality-xhttp${RESET}"
-    echo -e "${GREEN} 4. 修改配置${RESET}"
-    echo -e "${GREEN} 5. 启动 VLESS-Reality-xhttp${RESET}"
-    echo -e "${GREEN} 6. 停止 VLESS-Reality-xhttp${RESET}"
-    echo -e "${GREEN} 7. 重启 VLESS-Reality-xhttp${RESET}"
-    echo -e "${GREEN} 8. 查看服务日志${RESET}"
-    echo -e "${GREEN} 9. 查看节点配置${RESET}"
-    echo -e "${GREEN}10. 配置Socks5出口${RESET}"
-    echo -e "${GREEN}11. SNI域名优选✨${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-}
-
-pre_check() {
-    if [[ $(id -u) -ne 0 ]]; then error "请切换到 root 用户运行"; exit 1; fi
-    local missing=0 deps=(jq curl wget openssl ss timeout unzip)
-    for cmd in "${deps[@]}"; do if ! command -v "$cmd" >/dev/null 2>&1; then missing=1; break; fi; done
-    if [[ "$missing" -eq 1 ]]; then
-        info "正在安装必须依赖项..."
-        if command -v apt &>/dev/null; then apt update && apt install -y jq curl wget openssl ca-certificates iproute2 unzip || true
-        elif command -v dnf &>/dev/null; then dnf install -y jq curl wget openssl ca-certificates iproute2 unzip
-        elif command -v yum &>/dev/null; then yum install -y jq curl wget openssl ca-certificates iproute2 unzip; fi
+    load_meta
+    
+    local status_display
+    if has_command systemctl && systemctl is-active --quiet mo-socks5 2>/dev/null; then
+      status_display="${GREEN}● 运行中${RESET}"
+    else
+      if pkill -0 -f "${WORKDIR}/start.sh" >/dev/null 2>&1; then
+        status_display="${GREEN}● 运行中 (Pidmode)${RESET}"
+      else
+        status_display="${RED}● 未运行${RESET}"
+      fi
     fi
+
+    local port_display="${PORT:- -}"
+    local engine_display="${BIN_TYPE:-未检测到底层安装}"
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}        Socks5 管理面板       ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} ${status_display}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_display}${RESET}"
+    echo -e "${GREEN}实现   :${RESET} ${YELLOW}${engine_display}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装 Socks5${RESET}"
+    echo -e "${GREEN}2. 修改配置${RESET}"
+    echo -e "${GREEN}3. 卸载 Socks5${RESET}"
+    echo -e "${GREEN}4. 启动 Socks5${RESET}"
+    echo -e "${GREEN}5. 停止 Socks5${RESET}"
+    echo -e "${GREEN}6. 重启 Socks5${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看连接配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+
+    local choice=""
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+    [[ -z "$choice" ]] && continue
+
+    case "$choice" in
+      1) inst_socks5; pause ;;
+      2) changeconf; pause ;;
+      3) uninstall_socks5; pause ;;
+      4)
+        if has_command systemctl; then
+          systemctl start mo-socks5 && info "服务已成功拉起！"
+        else
+          pkill -f "${WORKDIR}/start.sh" || true
+          "${WORKDIR}/start.sh" >/dev/null 2>&1 &
+          info "进程已在后台独立进程池中拉起！"
+        fi
+        pause ;;
+      5)
+        if has_command systemctl; then
+          systemctl stop mo-socks5 && info "服务已成功挂起！"
+        else
+          pkill -f "${WORKDIR}/start.sh" && info "后台代理程序已终止！"
+        fi
+        pause ;;
+      6)
+        if has_command systemctl; then
+          systemctl restart mo-socks5 && info "服务已成功完成平滑重启！"
+        else
+          pkill -f "${WORKDIR}/start.sh" || true
+          "${WORKDIR}/start.sh" >/dev/null 2>&1 &
+          info "后台独立进程已重载刷新！"
+        fi
+        pause ;;
+      7)
+        if has_command systemctl; then
+          journalctl -u mo-socks5.service -n 50 --no-pager
+        else
+          warn "当前 Linux 环境不支持 Systemd 级集中式日志。"
+        fi
+        pause ;;
+      8) showconf; pause ;;
+      0) exit 0 ;;
+      *) error "未识别的无效指令，请重新进行选择。"; sleep 1 ;;
+    esac
+  done
 }
 
-main() {
-    pre_check
-    while true; do
-        show_menu
-        local choice=""
-        read -r -p $'\033[32m请输入数字选项: \033[0m' choice || true
-        [[ -z "$choice" ]] && continue
-        case "$choice" in
-            1) install_xray; pause ;;
-            2) update_xray; pause ;;
-            3) uninstall_xray; pause ;;
-            4) modify_config; pause ;;
-            5) systemctl start "${SERVICE_NAME}" &>/dev/null || true; restart_xray; pause ;;
-            6) systemctl stop "${SERVICE_NAME}" &>/dev/null || true; info "服务已停止"; pause ;;
-            7) restart_xray; pause ;;
-            8) journalctl -u "${SERVICE_NAME}" -e --no-pager || true; pause ;;
-            9) show_current_config; pause ;;
-            10) configure_custom_socks5_outbound; pause ;;
-            11) select_best_sni; pause ;;
-            0) exit 0 ;;
-            *) error "无效选项"; pause ;;
-        esac
-    done
-}
-
-main "$@"
+menu "$@"

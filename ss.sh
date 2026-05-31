@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Xray (VLESS-Encryption + REALITY) Alpine Linux 专属独立控制面板
+# Xray (VLESS-Encryption + REALITY) Alpine Linux 专属控制面板
 # SPDX-License-Identifier: MIT
 #
 # =========================================================
@@ -14,7 +14,7 @@ readonly SERVICE_NAME="xray-pqreality"
 readonly XRAY_CONFIG="/usr/local/etc/${SERVICE_NAME}/config.json"
 readonly XRAY_BINARY="/usr/local/bin/${SERVICE_NAME}"
 readonly INIT_SERVICE_PATH="/etc/init.d/${SERVICE_NAME}"
-readonly STATE_DIR="/root/proxynode/${SERVICE_NAME}"
+readonly STATE_DIR="/root/proxynode/vlessEncryptionReality"
 readonly STATE_FILE="${STATE_DIR}/encryption_info.txt"
 readonly REALITY_FILE="${STATE_DIR}/reality_info.txt"  # 存储格式: pbk|sni|sid
 readonly LINK_FILE="${STATE_DIR}/vless_link.txt"
@@ -66,13 +66,20 @@ get_random_port() {
     done
 }
 
+is_valid_port() {
+    local port="$1"
+    if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+        return 0
+    fi
+    return 1
+}
+
 get_installed_version() {
     if [[ -f "$XRAY_BINARY" && -x "$XRAY_BINARY" ]]; then
-        # 兼容独立二进制重命名后的版本提取，精准匹配数字版本号
         local ver
-        ver=$("$XRAY_BINARY" version 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "")
+        ver=$("$XRAY_BINARY" version 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "")
         if [[ -n "$ver" ]]; then
-            echo "$ver"
+            echo "v$ver"
         else
             echo "未知版本"
         fi
@@ -86,7 +93,7 @@ get_xray_status() {
         echo -e "${GREEN}● 运行中 ${RESET}"
     else
         if pgrep -f "$XRAY_BINARY run" >/dev/null 2>&1; then
-            echo -e "${GREEN}● 运行中 (Pidmode)${RESET}"
+            echo -e "${GREEN}● 运行中 ${RESET}"
         else
             echo -e "${RED}● 未运行${RESET}"
         fi
@@ -121,12 +128,33 @@ supervisor="supervise-daemon"
 command="$XRAY_BINARY"
 command_args="run -c $XRAY_CONFIG"
 
+# 由守护进程自动将核心标准输出日志收集重定向至系统统一路径
+output_log="/var/log/${SERVICE_NAME}.log"
+error_log="/var/log/${SERVICE_NAME}.log"
+
 depend() {
     need net
     after firewall
 }
 EOF
     chmod 755 "$INIT_SERVICE_PATH"
+}
+
+# 内部统一平滑重启与生命周期逻辑
+trigger_restart_logic() {
+    if command -v rc-service &>/dev/null && [ -f "$INIT_SERVICE_PATH" ]; then
+        rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 || true
+    else
+        pkill -f "$XRAY_BINARY run" || true
+        sleep 0.5
+        "$XRAY_BINARY" run -c "$XRAY_CONFIG" >/dev/null 2>&1 &
+    fi
+    sleep 1
+    if pgrep -f "$XRAY_BINARY run" >/dev/null 2>&1; then
+        return 0
+    else
+        return 1
+    fi
 }
 
 # =========================================================
@@ -241,7 +269,7 @@ generate_reality_keys() {
 }
 
 # =========================================================
-# 4. 面板核心交互与配置文件处理
+# 5. 面板核心交互与配置文件处理
 # =========================================================
 write_and_show_config() {
     mkdir -p "$STATE_DIR"
@@ -324,7 +352,7 @@ EOF
 }
 
 # =========================================================
-# 5. 主流程控制模块与更新功能
+# 6. 主流程控制模块与更新功能
 # =========================================================
 inst_xray() {
     if [[ -f "$XRAY_CONFIG" ]]; then
@@ -442,12 +470,7 @@ update_xray() {
     download_and_extract_core || return 1
 
     info "重启专属服务组件中..."
-    if command -v rc-service &>/dev/null; then
-        rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 || true
-    else
-        pkill -f "$XRAY_BINARY run" || true
-        "$XRAY_BINARY" run -c "$XRAY_CONFIG" >/dev/null 2>&1 &
-    fi
+    trigger_restart_logic || true
     info "Xray 独立核心已成功平滑迭代完毕。"
 }
 
@@ -513,7 +536,7 @@ showconf() {
 }
 
 # =========================================================
-# 6. 环境强制自校正
+# 7. 环境强制自校正
 # =========================================================
 check_environment() {
     if [[ $(id -u) -ne 0 ]]; then error "请切换至 root 用户运行此面板脚本。" && exit 1; fi
@@ -533,8 +556,193 @@ check_environment() {
     fi
 }
 
+# ================== SNI 优选 ==================
+select_best_sni() {
+    info "开始优选 SNI 延迟测试..."
+    local SNIS=(
+        amd.com apps.mzstatic.com aws.com azure.microsoft.com beacon.gtv-pub.com
+        bing.com catalog.gamepass.com cdn.bizibly.com cdn-dynmedia-1.microsoft.com
+        devblogs.microsoft.com fpinit.itunes.apple.com go.microsoft.com
+        gray-config-prod.api.arc-cdn.net gray.video-player.arcpublishing.com
+        images.nvidia.com r.bing.com services.digitaleast.mobi snap.licdn.com
+        statici.icloud.com tag.demandbase.com tag-logger.demandbase.com
+        ts1.tc.mm.bing.net ts2.tc.mm.bing.net vs.aws.amazon.com www.apple.com
+        www.icloud.com www.microsoft.com www.oracle.com www.xbox.com
+        www.xilinx.com xp.apple.com
+    )
+    local BEST_SNI=""
+    local BEST_TIME=999999
+
+    for sni in "${SNIS[@]}"; do
+        start=$(date +%s%N)
+        if timeout 2 openssl s_client -connect ${sni}:443 -servername ${sni} -brief </dev/null >/dev/null 2>&1; then
+            end=$(date +%s%N)
+            cost=$(( (end - start) / 1000000 ))
+            echo -e "${GREEN}[SNI] $sni -> ${cost}ms${RESET}"
+            if [ $cost -lt $BEST_TIME ]; then
+                BEST_TIME=$cost; BEST_SNI=$sni
+            fi
+        fi
+    done
+
+    if [ -n "$BEST_SNI" ]; then
+        info "最优 SNI: $BEST_SNI (${BEST_TIME}ms)"
+        return 0
+    else
+        warn "未找到可用 SNI"
+        return 1
+    fi
+}
+
+# ================== 配置自定义Socks5出口 ==================
+configure_custom_socks5_outbound() {
+    if [[ ! -f "$XRAY_CONFIG" ]]; then 
+        error "错误: 未安装，无法配置出口模式。"
+        return
+    fi
+
+    local mode current_protocol tmp_file
+    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$XRAY_CONFIG" 2>/dev/null || echo "freedom")
+
+    echo "---------------------------------------------"
+    echo "请选择出口模式："
+    if [[ "$current_protocol" == "socks" ]]; then
+        echo -e "当前模式: ${YELLOW}Socks5 出口${RESET}"
+    else
+        echo -e "当前模式: ${GREEN}直连出口${RESET}"
+    fi
+    echo "1) 直连出口"
+    echo "2) Socks5 出口"
+    echo "0) 取消"
+    echo "---------------------------------------------"
+
+    read -rp "请输入选项 [0-2]: " mode || true
+    case "$mode" in
+        1)
+            tmp_file=$(mktemp)
+            jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$XRAY_CONFIG" > "$tmp_file"
+            if ! jq empty "$tmp_file" >/dev/null 2>&1; then
+                rm -f "$tmp_file"
+                error "生成的直连配置无效。"
+                return 1
+            fi
+            cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
+            mv "$tmp_file" "$XRAY_CONFIG"
+            chmod 644 "$XRAY_CONFIG" 2>/dev/null || true
+            if ! trigger_restart_logic; then
+                error "切换到直连失败，服务无法重启。"
+                return 1
+            fi
+            info "已成功切换为直连出口！"
+            return
+            ;;
+        2)
+            ;;
+        0|"")
+            info "已取消配置。"
+            return
+            ;;
+        *)
+            error "无效选项，请输入 0-2 之间的数字。"
+            return 1
+            ;;
+    esac
+
+    info "配置自定义 Socks5 出口代理..."
+    local socks_host socks_port socks_user socks_pass
+
+    read -rp "请输入 Socks5 服务器地址/IP: " socks_host || true
+    [[ -z "$socks_host" ]] && info "已取消配置。" && return
+
+    while true; do
+        read -rp "请输入 Socks5 端口 (默认: 1080): " socks_port || true
+        [[ -z "$socks_port" ]] && socks_port=1080
+        if is_valid_port "$socks_port"; then
+            break
+        else
+            error "端口无效，请输入一个1-65535之间的数字。"
+        fi
+    done
+
+    read -rp "请输入 Socks5 用户名 (若无密码认证请直接留空回车): " socks_user || true
+    if [[ -n "$socks_user" ]]; then
+        read -rs -p "请输入 Socks5 密码: " socks_pass || true
+        echo
+    else
+        socks_pass=""
+    fi
+
+    tmp_file=$(mktemp)
+
+    if [[ -n "$socks_user" ]]; then
+        jq \
+            --arg host "$socks_host" \
+            --argjson port "$socks_port" \
+            --arg user "$socks_user" \
+            --arg pass "$socks_pass" \
+            '
+            .outbounds = [
+              {
+                "protocol": "socks",
+                "tag": "custom-socks5-out",
+                "settings": {
+                  "servers": [
+                    {
+                      "address": $host,
+                      "port": $port,
+                      "users": [
+                        {
+                          "user": $user,
+                          "pass": $pass
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            ]
+            ' "$XRAY_CONFIG" > "$tmp_file"
+    else
+        jq \
+            --arg host "$socks_host" \
+            --argjson port "$socks_port" \
+            '
+            .outbounds = [
+              {
+                "protocol": "socks",
+                "tag": "custom-socks5-out",
+                "settings": {
+                  "servers": [
+                    {
+                      "address": $host,
+                      "port": $port
+                    }
+                  ]
+                }
+              }
+            ]
+            ' "$XRAY_CONFIG" > "$tmp_file"
+    fi
+
+    if ! jq empty "$tmp_file" >/dev/null 2>&1; then
+        rm -f "$tmp_file"
+        error "生成的 Socks5 配置无效，请检查输入后重试。"
+        return 1
+    fi
+
+    cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
+    mv "$tmp_file" "$XRAY_CONFIG"
+    chmod 644 "$XRAY_CONFIG" 2>/dev/null || true
+
+    if ! trigger_restart_logic; then
+        error "重启服务失败，当前 Socks5 配置可能不兼容。"
+        return 1
+    fi
+    info "已成功切换为 Socks5 出口！"
+}
+
 # =========================================================
-# 7. 面板主菜单
+# 8. 面板主菜单
 # =========================================================
 menu() {
     check_environment
@@ -547,23 +755,24 @@ menu() {
         port_show=$(get_current_port_display)
 
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}  Xray (独占专属) PQ-Reality面板  ${RESET}"
+        echo -e "${GREEN} Xray VLESS-Encrypt+Reality 面板 ${RESET}"
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}专属服务:${RESET} ${CYAN}${SERVICE_NAME}${RESET}"
-        echo -e "${GREEN}状态    :${RESET} $status"
-        echo -e "${GREEN}版本    :${RESET} ${YELLOW}${version}${RESET}"
-        echo -e "${GREEN}端口    :${RESET} ${YELLOW}${port_show}${RESET}"
+        echo -e "${GREEN}状态   :${RESET} $status"
+        echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+        echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}1. 安装 Encryption+Reality (完全独立)${RESET}" 
-        echo -e "${GREEN}2. 更新 Xray 专属核心${RESET}"
-        echo -e "${GREEN}3. 卸载 Xray 专属服务${RESET}"
-        echo -e "${GREEN}4. 修改配置${RESET}"
-        echo -e "${GREEN}5. 启动服务${RESET}"
-        echo -e "${GREEN}6. 停止服务${RESET}"
-        echo -e "${GREEN}7. 重启服务${RESET}"
-        echo -e "${GREEN}8. 查看独立日志与测试${RESET}"
-        echo -e "${GREEN}9. 查看节点配置${RESET}"
-        echo -e "${GREEN}0. 退出${RESET}"
+        echo -e "${GREEN} 1. 安装 Xray VLESS-Encrypt+Reality${RESET}"
+        echo -e "${GREEN} 2. 更新 Xray${RESET}"
+        echo -e "${GREEN} 3. 卸载 Xray${RESET}"
+        echo -e "${GREEN} 4. 修改配置${RESET}"
+        echo -e "${GREEN} 5. 启动 Xray${RESET}"
+        echo -e "${GREEN} 6. 停止 Xray${RESET}"
+        echo -e "${GREEN} 7. 重启 Xray${RESET}"
+        echo -e "${GREEN} 8. 查看日志 (全部核心日志)${RESET}"
+        echo -e "${GREEN} 9. 查看节点配置${RESET}"
+        echo -e "${GREEN}10. 配置Socks5出口${RESET}"
+        echo -e "${GREEN}11. SNI域名优选 ✨${RESET}"
+        echo -e "${GREEN} 0. 退出${RESET}"
         echo -e "${GREEN}================================${RESET}"
 
         local choice=""
@@ -576,7 +785,7 @@ menu() {
             3) uninstall_xray; pause ;;
             4) modify_config; pause ;;
             5) 
-                if command -v rc-service &>/dev/null; then
+                if command -v rc-service &>/dev/null && [ -f "$INIT_SERVICE_PATH" ]; then
                     rc-service "$SERVICE_NAME" start && info "独立服务已成功启动！"
                 else
                     pkill -f "$XRAY_BINARY run" || true
@@ -585,33 +794,29 @@ menu() {
                 fi
                 pause ;;
             6) 
-                if command -v rc-service &>/dev/null; then
+                if command -v rc-service &>/dev/null && [ -f "$INIT_SERVICE_PATH" ]; then
                     rc-service "$SERVICE_NAME" stop && info "独立服务已成功停止！"
                 else
                     pkill -f "$XRAY_BINARY run" && info "专属后台进程已终止！"
                 fi
                 pause ;;
             7) 
-                if command -v rc-service &>/dev/null; then
-                    rc-service "$SERVICE_NAME" restart && info "独立服务已成功重启！"
-                else
-                    pkill -f "$XRAY_BINARY run" || true
-                    "$XRAY_BINARY" run -c "$XRAY_CONFIG" >/dev/null 2>&1 &
-                fi
+                trigger_restart_logic && info "独立服务已成功完成重启！"
                 pause ;;
             8) 
-                if [[ -f /var/log/messages ]]; then
-                    echo -e "${CYAN}--- 最近 50 行专属系统服务日志 ---${RESET}"
-                    tail -n 50 /var/log/messages | grep -E "${SERVICE_NAME}|supervise-daemon" || tail -n 50 /var/log/messages
-                    echo "--------------------------------------"
+                local core_log="/var/log/${SERVICE_NAME}.log"
+                echo -e "${CYAN}--- Xray 核心全部运行日志 ---${RESET}"
+                if [[ -f "$core_log" ]]; then
+                    # 干净利落地一次性打印全部核心日志，不包含多余测试内容
+                    cat "$core_log"
                 else
-                    warn "系统暂未建立全局通用日志追踪：/var/log/messages"
+                    warn "暂未检测到服务运行日志，请确保执行选项 5 或 7 启动了服务。"
                 fi
-                if [[ -f "$XRAY_BINARY" && -f "$XRAY_CONFIG" ]]; then
-                    "$XRAY_BINARY" run -test -config "$XRAY_CONFIG" || true
-                fi
+                echo "--------------------------------------"
                 pause ;;
             9) showconf; pause ;;
+            10) configure_custom_socks5_outbound; pause ;;
+            11) select_best_sni; pause ;;
             0) exit 0 ;;
             *) error "无效输入，请重新选择。"; sleep 1 ;;
         esac

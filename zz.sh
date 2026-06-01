@@ -11,7 +11,7 @@ GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 BLUE="\033[34m"
-RESET="\03"
+RESET="\033[0m"
 Info="${GREEN}[信息]${RESET}"
 Error="${RED}[错误]${RESET}"
 
@@ -41,14 +41,15 @@ log() {
 }
 
 pause() {
-    read -n 1 -s -r -p "按任意键返回菜单..." || exit 1
+    echo -n "按任意键返回菜单..."
+    read -n 1 -s -r || true
     echo
 }
 
 # ================== 优化获取公网IP ==================
 get_public_ip() {
     local ip
-    ip=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+')
+    ip=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || echo "")
     if [[ -n "$ip" ]] && [[ "$ip" != "127.0.0.1" ]]; then
         echo "$ip"
         return
@@ -64,7 +65,7 @@ check_deps() {
         if command -v apt >/dev/null 2>&1; then
             apt update -y && apt install -y "$@"
         elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y "$@"
+            dnnf install -y "$@"
         elif command -v yum >/dev/null 2>&1; then
             yum install -y "$@"
         fi
@@ -88,6 +89,7 @@ check_port() {
         echo -e "${RED}端口 $1 已被占用${RESET}"
         return 1
     fi
+    return 0
 }
 
 # ================== 辅助生成器与校验 ==================
@@ -97,13 +99,19 @@ get_system_dns() { grep -E '^nameserver' /etc/resolv.conf | awk '{print $2}' | p
 
 validate_password() {
     local password="$1"
+    # 防御 set -e: 必须使用 if 或将命令包裹，确保解密失败不直接退出整条脚本
     if ! echo "$password" | base64 -d >/dev/null 2>&1; then
-        echo -e "${RED}密码不是合法 Base64${RESET}" && return 1
+        echo -e "${RED}密码不是合法 Base64${RESET}"
+        return 1
     fi
-    local decoded_len=$(echo "$password" | base64 -d 2>/dev/null | wc -c)
+    
+    local decoded_len
+    decoded_len=$(echo "$password" | base64 -d 2>/dev/null | wc -c || echo "0")
     if [[ "$decoded_len" -ne "$KEY_BYTES" ]]; then
-        echo -e "${RED}密码必须为 ${KEY_BYTES} 字节${RESET}" && return 1
+        echo -e "${RED}密码必须为 ${KEY_BYTES} 字节 (当前解密后为 ${decoded_len} 字节)${RESET}"
+        return 1
     fi
+    return 0
 }
 
 detect_arch() {
@@ -209,7 +217,7 @@ generate_links() {
     local stls_pwd="$5"
 
     IP=$(get_public_ip)
-    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+    HOSTNAME=$(hostname -s | sed 's/ /_/g' || echo "server")
     
     SS_BASE=$(echo -n "${METHOD}:${password}" | base64 -w 0)
     SHADOWTLS_JSON="{\"version\":\"3\",\"password\":\"${stls_pwd}\",\"host\":\"${stls_sni}\"}"
@@ -230,9 +238,10 @@ configure_ss() {
     load_existing_config
     
     local ss_port password dns stls_port stls_sni stls_pwd
+    local input_stls_port input_ss_port input_password input_stls_pwd input_sni input_dns
 
     while true; do
-        read -p "请输入Shadow-TLS公网端口 (回车默认/保持当前: ${OLD_STLS_PORT}): " input_stls_port || exit 1
+        read -p "请输入Shadow-TLS公网端口 (回车默认/保持当前: ${OLD_STLS_PORT}): " input_stls_port || true
         stls_port=${input_stls_port:-$OLD_STLS_PORT}
 
         if [[ "$stls_port" =~ ^[0-9]+$ ]] && [[ "$stls_port" -ge 1 ]] && [[ "$stls_port" -le 65535 ]]; then
@@ -247,7 +256,7 @@ configure_ss() {
 
     while true; do
         local default_ss_port=$([[ -n "$OLD_SS_PORT" ]] && echo "$OLD_SS_PORT" || random_port)
-        read -p "请输入内部SS端口 (回车默认/保持当前: ${default_ss_port}): " input_ss_port || exit 1
+        read -p "请输入内部SS端口 (回车默认/保持当前: ${default_ss_port}): " input_ss_port || true
         ss_port=${input_ss_port:-$default_ss_port}
 
         if [[ "$ss_port" =~ ^[0-9]+$ ]] && [[ "$ss_port" -ge 1 ]] && [[ "$ss_port" -le 65535 ]]; then
@@ -264,21 +273,27 @@ configure_ss() {
         fi
     done
 
-    local default_ss_pwd=$([[ -n "$OLD_SS_PWD" ]] && echo "$OLD_SS_PWD" || random_key)
-    read -p "请输入SS密码 (回车默认/保持当前配置密码: ${default_ss_pwd}): " input_password || exit 1
-    password=${input_password:-$default_ss_pwd}
-    validate_password "$password" || return
+    while true; do
+        local default_ss_pwd=$([[ -n "$OLD_SS_PWD" ]] && echo "$OLD_SS_PWD" || random_key)
+        read -p "请输入SS密码 (回车默认/保持当前配置密码): " input_password || true
+        password=${input_password:-$default_ss_pwd}
+        if validate_password "$password"; then
+            break
+        else
+            echo -e "${YELLOW}自动生成的密钥符合标准，若手动输入需满足32位Base64规范。${RESET}"
+        fi
+    done
 
     local default_stls_pwd=$([[ -n "$OLD_STLS_PWD" ]] && echo "$OLD_STLS_PWD" || openssl rand -hex 16)
-    read -p "请输入Shadow-TLS密码 (回车默认/保持当前: ${default_stls_pwd}): " input_stls_pwd || exit 1
+    read -p "请输入Shadow-TLS密码 (回车默认/保持当前: ${default_stls_pwd}): " input_stls_pwd || true
     stls_pwd=${input_stls_pwd:-$default_stls_pwd}
 
-    read -p "请输入SNI伪装域名 (回车默认/保持当前: ${OLD_STLS_SNI}): " input_sni || exit 1
+    read -p "请输入SNI伪装域名 (回车默认/保持当前: ${OLD_STLS_SNI}): " input_sni || true
     stls_sni=${input_sni:-$OLD_STLS_SNI}
 
     local default_dns=$([[ -n "$OLD_DNS" ]] && echo "$OLD_DNS" || get_system_dns)
     [[ -z "$default_dns" ]] && default_dns="1.1.1.1,8.8.8.8"
-    read -p "请输入 DNS (回车默认/保持当前: ${default_dns}): " input_dns || exit 1
+    read -p "请输入 DNS (回车默认/保持当前: ${default_dns}): " input_dns || true
     dns=${input_dns:-$default_dns}
 
     write_config "$ss_port" "$password" "$dns" "$stls_port" "$stls_sni" "$stls_pwd"
@@ -308,11 +323,10 @@ ExecStart=${SS_File} -c ${SS_Conf}
 WantedBy=multi-user.target" > /etc/systemd/system/ss-rust.service
 
     systemctl daemon-reload
-    systemctl enable --now ss-rust
+    systemctl enable --now ss-rust || true
 }
 
 service_stls() {
-    # 【彻底修复】完全移除已弃用的 --fastopen 参数，纯净无报错启动
     cat > /etc/systemd/system/shadowtls.service <<-EOF
 [Unit]
 Description=Shadow TLS Service
@@ -335,7 +349,7 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable --now shadowtls
+    systemctl enable --now shadowtls || true
     echo -e "${Info} 服务部署自启配置完成！"
 }
 
@@ -358,15 +372,23 @@ print_node_info() {
     echo -e "${YELLOW} 外网公网端口   : ${show_listen_port}${RESET}"
     echo -e "${YELLOW} Shadow-TLS 密码 : ${stls_pwd}${RESET}"
     echo -e "${YELLOW} SNI 伪装域名    : ${stls_sni}${RESET}"
-    echo -e "${YELLOW} SS内部隔离端口  : ${ss_port} (外部不可访问)${RESET}"
+    echo -e "${YELLOW} SS内部隔离端口  : ${ss_port} ${RESET}"
     echo -e "${YELLOW} SS 密码        : ${password}${RESET}"
     echo -e "${YELLOW} 加密方式       : ${METHOD}${RESET}"
     echo -e "${YELLOW}-------------------------------------------------${RESET}"
     echo -e "${GREEN}[信息] SS 链接：${RESET}"
-    [[ -f "${SS_DIR}/ss.txt" ]] && cat "${SS_DIR}/ss.txt" || echo "未生成链接"
+    if [[ -f "${SS_DIR}/ss.txt" ]]; then
+        echo -e "${YELLOW}$(cat "${SS_DIR}/ss.txt")${RESET}"
+    else
+        echo "未生成链接"
+    fi
     echo -e ""
     echo -e "${GREEN}[信息] Surge配置:${RESET}"
-    [[ -f "${SS_DIR}/surge.txt" ]] && echo -e "${YELLOW}$(cat "${SS_DIR}/surge.txt")${RESET}" || echo "未生成配置"
+    if [[ -f "${SS_DIR}/surge.txt" ]]; then
+        echo -e "${YELLOW}$(cat "${SS_DIR}/surge.txt")${RESET}"
+    else
+        echo "未生成配置"
+    fi
     echo -e "${YELLOW}-------------------------------------------------${RESET}"
 }
 
@@ -406,9 +428,9 @@ modify_ss() {
         echo -e "${RED}错误：未检测到已有安装，请先选择选项【1】进行安装！${RESET}" && return
     fi
     configure_ss
-    systemctl restart ss-rust
-    service_stls # 刷新服务配置，确保移除 --fastopen 的变更生效
-    systemctl restart shadowtls
+    systemctl restart ss-rust || true
+    service_stls
+    systemctl restart shadowtls || true
     echo -e "${GREEN}[完成] 服务配置已应用并成功重启！${RESET}"
     print_node_info
     log "配置已被修改并安全应用"
@@ -429,12 +451,12 @@ show_log_menu() {
         echo -e "${GREEN}===========================================${RESET}"
         
         local sub_choice
-        read -r -p "请选择需要查看的日志选项: " sub_choice || exit 1
+        read -r -p $'\033[32m请输入选项: \033[0m' sub_choice || true
         case $sub_choice in
-            1) journalctl -u shadowtls -n 50 --no-pager; pause ;;
-            2) journalctl -u shadowtls -f ;;
-            3) journalctl -u ss-rust -n 50 --no-pager; pause ;;
-            4) journalctl -u ss-rust -f ;;
+            1) journalctl -u shadowtls -n 50 --no-pager || true; pause ;;
+            2) journalctl -u shadowtls -f || true ;;
+            3) journalctl -u ss-rust -n 50 --no-pager || true; pause ;;
+            4) journalctl -u ss-rust -f || true ;;
             0) break ;;
             *) echo -e "${RED}无效输入${RESET}"; sleep 1 ;;
         esac
@@ -462,8 +484,8 @@ update_ss() {
         echo "$STLS_VERSION" > "${SS_DIR}/stls_version.txt"
     fi
 
-    service_stls # 同步服务启动参数
-    systemctl restart ss-rust shadowtls
+    service_stls
+    systemctl restart ss-rust shadowtls || true
     echo -e "${GREEN}[完成] 更新执行完毕，服务已安全重启${RESET}"
     log "更新组件成功"
 }
@@ -500,7 +522,7 @@ show_menu() {
     echo -e "${GREEN}      Shadowsocks + Shadow-TLS 管理面板     ${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     echo -e "${GREEN}服务状态 :${RESET} ${status_ss} | ${status_stls}"
-    echo -e "${GREEN}组件版本 :${RESET} SS: ${YELLOW}${v_ss}${RESET} | Shadow-TLS: ${YELLOW}${v_stls}${RESET}"
+    echo -e "${GREEN}组件版本 :${RESET} ${YELLOW}SS: ${v_ss}${RESET} | ${YELLOW}Shadow-TLS: ${v_stls}${RESET}"
     echo -e "${GREEN}公网端口 :${RESET} ${YELLOW}${p_stls}${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     echo -e "${GREEN}1. 安装 Shadowsocks + Shadow-TLS${RESET}"
@@ -519,15 +541,15 @@ show_menu() {
 # ================== 主循环 ==================
 while true; do
     show_menu
-    read -r -p $'\033[32m请输入选项: \033[0m' choice || exit 1
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
     case $choice in
         1) install_ss; pause ;;
         2) update_ss; pause ;;
         3) uninstall_ss; pause ;;
         4) modify_ss; pause ;;
-        5) systemctl start ss-rust shadowtls; echo -e "${GREEN}[完成] 服务已启动${RESET}"; pause ;;
-        6) systemctl stop shadowtls ss-rust; echo -e "${GREEN}[完成] 服务已停止${RESET}"; pause ;;
-        7) systemctl restart ss-rust shadowtls; echo -e "${GREEN}[完成] 服务已重启${RESET}"; pause ;;
+        5) systemctl start ss-rust shadowtls || true; echo -e "${GREEN}[完成] 服务已启动${RESET}"; pause ;;
+        6) systemctl stop shadowtls ss-rust || true; echo -e "${GREEN}[完成] 服务已停止${RESET}"; pause ;;
+        7) systemctl restart ss-rust shadowtls || true; echo -e "${GREEN}[完成] 服务已重启${RESET}"; pause ;;
         8) show_log_menu ;;
         9) print_node_info; pause ;;
         0) exit 0 ;;

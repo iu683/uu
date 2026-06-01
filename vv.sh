@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =========================================================
-# Shadowsocks-Rust + Shadow-TLS 一体化独立管理脚本 (全面加固版)
+# Shadowsocks-Rust + Shadow-TLS 一体化独立管理脚本 (严格严谨版)
 # SS加密方式: 2022-blake3-aes-256-gcm
 # =========================================================
 
@@ -148,12 +148,12 @@ load_existing_config() {
     if [[ -f "$STLS_Conf" ]]; then
         OLD_STLS_PORT=$(grep -oP '"listen":\s*"[^"]+:\K[0-9]+' "$STLS_Conf" || echo "8443")
         OLD_STLS_PWD=$(grep -oP '"password":\s*"\K[^"]+' "$STLS_Conf" || echo "")
-        # 兼容读取数组格式或旧格式的 SNI
-        OLD_STLS_SNI=$(grep -oP '"tls_addr":\s*\[?\s*"\K[^:]+' "$STLS_Conf" || echo "captive.apple.com")
+        OLD_STLS_SNI=$(grep -oP '"(server_name|host|tls_addr)":\s*("\K[^"]+|\[\s*\{\s*")?' "$STLS_Conf" | head -n 1 | tr -d '"[{: ' || echo "captive.apple.com")
+        [[ -z "$OLD_STLS_SNI" ]] && OLD_STLS_SNI="captive.apple.com"
     fi
 }
 
-# ================== 写配置 (修正 tls_addr 为结构体数组) ==================
+# ================== 写配置 (严格对齐字段与强制字符串类型) ==================
 write_config() {
     local ss_port="$1"
     local password="$2"
@@ -171,7 +171,7 @@ write_config() {
         }
     }')
 
-    # 写入 Shadowsocks-Rust 配置
+    # 1. 写入 Shadowsocks-Rust 配置
     cat > "$SS_Conf" <<EOF
 {
     "server": "127.0.0.1",
@@ -190,7 +190,7 @@ write_config() {
 EOF
     chmod 600 "$SS_Conf"
 
-    # 【核心修复】将 tls_addr 改为符合 struct TlsAddrs 预期的 JSON 数组格式
+    # 2. 【绝对修复】对齐最新版要求：端口 443 必须用双引号包包裹为字符串 `"443"` 
     cat > "$STLS_Conf" <<EOF
 {
     "v3": true,
@@ -198,7 +198,11 @@ EOF
         "listen": "[::]:$stls_port",
         "server_addr": "127.0.0.1:$ss_port",
         "tls_addr": [
-            "$stls_sni:443"
+            {
+                "server_name": "$stls_sni",
+                "host": "$stls_sni",
+                "port": "443"
+            }
         ],
         "password": "$stls_pwd",
         "fastopen": true
@@ -273,7 +277,7 @@ configure_ss() {
     done
 
     local default_ss_pwd=$([[ -n "$OLD_SS_PWD" ]] && echo "$OLD_SS_PWD" || random_key)
-    read -p "请输入SS密码 (回车默认/保持当前配置密码${default_ss_pwd}): " input_password || exit 1
+    read -p "请输入SS密码 (回车默认/保持当前配置密码): " input_password || exit 1
     password=${input_password:-$default_ss_pwd}
     validate_password "$password" || return
 
@@ -357,7 +361,7 @@ print_node_info() {
     local password=$(grep password "$SS_Conf" | cut -d '"' -f4 || echo "未知")
     local show_listen_port=$(grep -oP '"listen":\s*"[^"]+:\K[0-9]+' "$STLS_Conf" || echo "未知")
     local stls_pwd=$(grep -oP '"password":\s*"\K[^"]+' "$STLS_Conf" || echo "未知")
-    local stls_sni=$(grep -oP '"tls_addr":\s*\[?\s*"\K[^:]+' "$STLS_Conf" || echo "未知")
+    local stls_sni=$(grep -oP '"server_name":\s*"\K[^"]+' "$STLS_Conf" | head -n 1 || echo "未知")
 
     echo -e "${GREEN}====== Shadowsocks + Shadow-TLS 配置 ======${RESET}"
     echo -e "${YELLOW} 公网 IP 地址   : ${IP}${RESET}"

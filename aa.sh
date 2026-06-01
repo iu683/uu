@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# NetCenter 一键管理脚本
+# Fingerprint Proxy Switchboard 管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,32 +8,24 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="netcenter"
+APP_NAME="fingerprint-proxy-switchboard"
 APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+REPO_URL="https://github.com/6mb/fingerprint-proxy-switchboard.git"
 
-generate_password() {
-    openssl rand -base64 12 | tr -d "=+/" | cut -c1-12
+generate_secret() {
+    openssl rand -hex 16
 }
 
 check_docker() {
 
-    if ! command -v docker &>/dev/null; then
+    if ! command -v docker >/dev/null 2>&1; then
         echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
         curl -fsSL https://get.docker.com | bash
     fi
 
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+    if ! docker compose version >/dev/null 2>&1; then
+        echo -e "${RED}未检测到 Docker Compose v2${RESET}"
         exit 1
-    fi
-}
-
-check_port() {
-
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
     fi
 }
 
@@ -43,7 +35,7 @@ menu() {
 
         clear
 
-        echo -e "${GREEN}=== NetCenter 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Fingerprint Proxy Switchboard ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -71,83 +63,74 @@ install_app() {
 
     check_docker
 
-    mkdir -p "$APP_DIR"
-
-    if [ -f "$COMPOSE_FILE" ]; then
+    if [ -d "$APP_DIR" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
         read confirm
         [[ "$confirm" != "y" ]] && return
+        rm -rf "$APP_DIR"
     fi
 
     echo
-    read -p "监听端口 [默认:8055]: " input_port
-    PORT=${input_port:-8055}
-    check_port "$PORT" || return
 
-    read -p "登录用户名 [默认:admin]: " input_user
-    USERNAME=${input_user:-admin}
+    read -p "面板端口 [默认6310]: " input_panel_port
+    PANEL_PORT=${input_panel_port:-6310}
 
-    DEFAULT_PASS=$(generate_password)
-    read -p "登录密码 [默认随机生成]: " input_pass
-    PASSWORD=${input_pass:-$DEFAULT_PASS}
+    read -p "Mihomo API端口 [默认6311]: " input_api_port
+    MIHOMO_PORT=${input_api_port:-6311}
 
-    read -p "监听地址 [默认:127.0.0.1]: " input_host
-    HOST=${input_host:-127.0.0.1}
+    read -p "请输入公网IP或域名: " PUBLIC_HOST
 
-    read -p "监控网卡 [留空自动检测]: " IFACE
+    PANEL_TOKEN=$(generate_secret)
+    PROXY_PASS=$(generate_secret)
+    MIHOMO_SECRET=$(generate_secret)
 
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  netcenter:
-    image: ghcr.io/xx2468171796/netcenter:latest
+    cd /opt || exit
 
-    container_name: netcenter
-
-    restart: unless-stopped
-
-    pid: host
-    network_mode: host
-
-    cap_add:
-      - SYS_PTRACE
-
-    environment:
-      HOST_PROC: /host/proc
-      HOST_ROOT: /host
-      SM_PORT: ${PORT}
-      SM_HOST: ${HOST}
-      SM_USER: ${USERNAME}
-      SM_PASS: ${PASSWORD}
-      $( [ -n "$IFACE" ] && echo "SM_IFACE: ${IFACE}" )
-
-    volumes:
-      - /proc:/host/proc:ro
-      - /:/host:ro,rslave
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - netcenter-data:/app/data
-      - netcenter-vnstat:/var/lib/vnstat
-
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-volumes:
-  netcenter-data:
-  netcenter-vnstat:
-EOF
+    git clone "$REPO_URL" "$APP_NAME"
 
     cd "$APP_DIR" || exit
 
-    docker compose up -d
+    mkdir -p config
+
+    cat > .env <<EOF
+PANEL_HOST=127.0.0.1
+PANEL_PORT=${PANEL_PORT}
+PANEL_TOKEN=${PANEL_TOKEN}
+PUBLIC_HOST=${PUBLIC_HOST}
+
+PROXY_AUTH=fingerprint:${PROXY_PASS}
+
+MIHOMO_API=http://127.0.0.1:${MIHOMO_PORT}
+MIHOMO_SECRET=${MIHOMO_SECRET}
+MIHOMO_CONTROLLER=127.0.0.1:${MIHOMO_PORT}
+MIHOMO_CONFIG_PATH=/root/.config/mihomo/config.yaml
+
+SLOT_PORTS=6181,6182,6183,6184,6185,6186
+
+SOURCE_PATH=/app/config/source.yaml
+SOURCES_PATH=/app/config/sources.yaml
+OUTPUT_PATH=/app/config/config.yaml
+DELAY_TEST_URL=https://www.gstatic.com/generate_204
+EOF
+
+    cat > config/source.yaml <<EOF
+proxies:
+  - name: Example-SS
+    type: ss
+    server: example.invalid
+    port: 443
+    cipher: aes-128-gcm
+    password: change-me
+EOF
+
+    docker compose up -d --build
 
     echo
-    echo -e "${GREEN}✅ NetCenter 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://${HOST}:${PORT}${RESET}"
-    echo -e "${YELLOW}👤 用户名: ${USERNAME}${RESET}"
-    echo -e "${YELLOW}🔐 密码: ${PASSWORD}${RESET}"
-    echo -e "${YELLOW}📂 安装目录: ${APP_DIR}${RESET}"
+    echo -e "${GREEN}✅ Fingerprint Proxy Switchboard 已启动${RESET}"
+    echo -e "${YELLOW}🌐 面板: http://127.0.0.1:${PANEL_PORT}${RESET}"
+    echo -e "${YELLOW}🔑 PANEL_TOKEN: ${PANEL_TOKEN}${RESET}"
+    echo -e "${YELLOW}🔐 PROXY_AUTH: fingerprint:${PROXY_PASS}${RESET}"
+    echo -e "${YELLOW}📂 安装目录: ${APP_DIR}"
 
     read -p "按回车返回菜单..."
 }
@@ -156,8 +139,8 @@ update_app() {
 
     cd "$APP_DIR" || return
 
-    docker compose pull
-    docker compose up -d
+    git pull
+    docker compose up -d --build
 
     echo -e "${GREEN}✅ 更新完成${RESET}"
 
@@ -166,7 +149,8 @@ update_app() {
 
 restart_app() {
 
-    docker restart netcenter
+    cd "$APP_DIR" || return
+    docker compose restart
 
     echo -e "${GREEN}✅ 已重启${RESET}"
 
@@ -175,12 +159,14 @@ restart_app() {
 
 view_logs() {
 
-    docker logs -f netcenter
+    cd "$APP_DIR" || return
+    docker compose logs -f
 }
 
 check_status() {
 
-    docker ps | grep netcenter
+    cd "$APP_DIR" || return
+    docker compose ps
 
     read -p "按回车返回菜单..."
 }
@@ -188,7 +174,6 @@ check_status() {
 uninstall_app() {
 
     cd "$APP_DIR" || return
-
     docker compose down -v
     rm -rf "$APP_DIR"
 

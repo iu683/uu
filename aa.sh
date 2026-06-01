@@ -1,867 +1,437 @@
-#!/usr/bin/env bash
-#
-# sing-box (VLESS+WS+TLS) 核心控制面板 [Alpine Linux 专属]
-# SPDX-License-Identifier: MIT
-#
-# =========================================================
-# 1. 核心控制与全局环境初始化
-# =========================================================
-set -Eop pipefail
-export LANG=en_US.UTF-8
+#!/bin/sh
+set -e
 
-# 基础目录与硬编码配置
-readonly SB_CONFIG="/etc/singbox-vless-ws/config.json"
-readonly SB_BINARY="/usr/local/bin/sing-box"
-readonly SB_DIR="/root/proxynode/VlessWS"
-EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
-OPENRC_SERVICES_DIR="/etc/init.d"
-CONFIG_DIR="/etc/singbox-vless-ws"
-REPO_URL="https://github.com/SagerNet/sing-box"
-API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
-CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
-
-# 自动检测环境变量
-PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
-OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
-ARCHITECTURE="${ARCHITECTURE:-}"
-SINGBOX_USER="${SINGBOX_USER:-}"
-SINGBOX_HOME_DIR="${SINGBOX_HOME_DIR:-}"
-
-# 终端颜色代码
+# ================== 颜色与输出函数 ==================
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
-BLUE="\033[34m"
-CYAN="\033[36m"
 RESET="\033[0m"
 
-# =========================================================
-# 2. 底层工具函数
-# =========================================================
-has_command() {
-  local _command=$1
-  type -P "$_command" > /dev/null 2>&1
+_ok()   { echo -e "${GREEN}[OK] $1${RESET}"; }
+_warn() { echo -e "${YELLOW}[WARN] $1${RESET}"; }
+_err()  { echo -e "${RED}[ERROR] $1${RESET}"; return 1; }
+_info() { echo -e "${GREEN}[INFO] $1${RESET}"; }
+
+# ================== 变量 ==================
+SNELL_DIR="/etc/snell"
+SNELL_CONFIG="$SNELL_DIR/snell-server.conf"
+SNELL_RC_SERVICE="/etc/init.d/snell"
+SNELL_LOG="/var/log/snell.log"
+LOG_FILE="/var/log/snell_manager.log"
+SNELL_DEFAULT_VERSION="5.0.1"
+
+# ================== 工具函数 ==================
+create_user() {
+    id -u snell >/dev/null 2>&1 || adduser -S -D -H -s /sbin/nologin snell 2>/dev/null || true
 }
 
-curl() {
-  command curl "${CURL_FLAGS[@]}" "$@"
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return
+        done
+    done
+    echo "127.0.0.1"
 }
 
-mktemp() {
-  command mktemp "$@" "sbservinst.XXXXXXXXXX"
-}
-
-info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
-error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
-pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
-
-generate_uuid() {
-  if has_command uuidgen; then
-    uuidgen | tr '[:upper:]' '[:lower:]'
-  elif [[ -f /proc/sys/kernel/random/uuid ]]; then
-    cat /proc/sys/kernel/random/uuid
-  else
-    # 兼容 Alpine 下没有 md5sum 或语法差异，使用 od/hexdump 替代
-    cat /dev/urandom | head -c 16 | hexdump -e '8/1 "%02x" "-" 4/1 "%02x" "-" 4/1 "%02x" "-" 4/1 "%02x" "-" 12/1 "%02x" "\n"' | head -n 1
-  fi
-}
-
-rc_service() {
-  if ! has_command rc-service; then
-    return 0
-  fi
-  command rc-service "$@"
-}
-
-install_content() {
-  local _install_flags="$1"
-  local _content="$2"
-  local _destination="$3"
-  local _overwrite="$4"
-  local _tmpfile="$(mktemp)"
-
-  echo -ne "安装 $_destination ... "
-  echo "$_content" > "$_tmpfile"
-  if [[ -z "$_overwrite" && -e "$_destination" ]]; then
-    echo -e "已存在"
-  elif install "$_install_flags" "$_tmpfile" "$_destination"; then
-    echo -e "完成"
-  fi
-  rm -f "$_tmpfile"
-}
-
-remove_file() {
-  local _target="$1"
-  echo -ne "移除 $_target ... "
-  if rm -f "$_target"; then
-    echo -e "完成"
-  fi
-}
-
-detect_package_manager() {
-  [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
-  has_command apk && PACKAGE_MANAGEMENT_INSTALL='apk add --no-cache' && return 0
-  return 1
-}
-
-install_software() {
-  local _package_name="$1"
-  if ! detect_package_manager; then
-    error "未检测到支持的包管理器，请手动安装 $_package_name"
-    exit 65
-  fi
-  echo "正在安装缺失的依赖 '$_package_name' ... "
-  if $PACKAGE_MANAGEMENT_INSTALL "$_package_name" >/dev/null 2>&1; then
-    echo "依赖安装成功"
-  else
-    error "无法通过包管理器安装 '$_package_name'，请手动安装。"
-    exit 65
-  fi
-}
-
-is_user_exists() { id "$1" > /dev/null 2>&1; }
-
-check_environment() {
-  if [[ "x$(uname)" == "xLinux" ]]; then
-    OPERATING_SYSTEM=linux
-  else
-    error "本脚本仅支持 Linux 系统。"
-    exit 95
-  fi
-
-  case "$(uname -m)" in
-    'i386' | 'i686') ARCHITECTURE='386' ;;
-    'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
-    'armv5tel' | 'armv6l' | 'armv7' | 'armv7l') ARCHITECTURE='armv7' ;;
-    'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
-    's390x') ARCHITECTURE='s390x' ;;
-    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
-  esac
-
-  # 确保 Alpine 环境必要的依赖组件完整
-  has_command bash || install_software bash
-  has_command curl || install_software curl
-  has_command grep || install_software grep
-  has_command jq || install_software jq
-  has_command openssl || install_software openssl
-  has_command gcompat || install_software gcompat
-  has_command tar || install_software tar
-  has_command socat || install_software socat
-  has_command python3 || install_software python3
-}
-
-get_installed_version() {
-  if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
-    local version_out
-    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null | head -n 1 || echo "")
-    if [[ -n "$version_out" ]]; then
-      echo "$version_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "未知格式"
-    else
-      echo "未知版本"
+check_port() {
+    if netstat -tln | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
     fi
-  else
-    echo "未安装"
-  fi
 }
 
-get_latest_version() {
-  local _tmpfile=$(mktemp)
-  if ! curl -sS -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases/latest" -o "$_tmpfile"; then
-    rm -f "$_tmpfile"
-    return
-  fi
-  local _tag_name=$(jq -r '.tag_name' "$_tmpfile" 2>/dev/null || echo "")
-  rm -f "$_tmpfile"
-  
-  if [[ -n "$_tag_name" ]]; then
-    echo "${_tag_name##*v}"
-  else
-    echo ""
-  fi
+random_key() {
+    cat /dev/urandom | tr -dc A-Za-z0-9 | head -c 16
 }
 
-download_singbox() {
-  local _version="$1"
-  local _destination="$2"
-  local _download_url="$REPO_URL/releases/download/v${_version}/sing-box-${_version}-linux-${ARCHITECTURE}.tar.gz"
-  
-  info "正在下载官方 sing-box 核心组件: $_download_url ..."
-  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
-    error "核心下载失败！请检查您的网络连接。"
-    return 11
-  fi
-  return 0
+random_port() {
+    awk 'BEGIN{srand();print int(rand()*(65000-2000+1))+2000}'
 }
 
-# Alpine OpenRC 服务脚本模板（支持创建PID运行目录并修正属主）
-tpl_singbox_openrc_service() {
-  cat << 'EOF'
+get_system_dns() {
+    grep -E "^nameserver" /etc/resolv.conf | awk '{print $2}' | paste -sd "," -
+}
+
+pause() {
+    echo -n "按任意键返回菜单..."
+    read -r -n 1 arg
+    echo
+}
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+_map_arch() {
+    local raw_arch=$(uname -m)
+    case "$raw_arch" in
+        x86_64|amd64) echo "amd64" ;;
+        aarch64|arm64) echo "aarch64" ;;
+        armv7l|armhf) echo "armv7l" ;;
+        *) return 1 ;;
+    esac
+}
+
+_get_snell_latest_version() {
+    local latest_version
+    latest_version=$(curl -sL -A "Mozilla/5.0" "https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell" | grep -oE 'v5\.[0-9]+\.[0-9]+' | head -n 1 2>/dev/null || echo "")
+    if [ -n "$latest_version" ]; then
+        echo "${latest_version#v}"
+    else
+        echo "$SNELL_DEFAULT_VERSION"
+    fi
+}
+
+# 从配置文件中安全提取现有配置项的函数
+_get_conf_value() {
+    local key="$1"
+    if [ -f "$SNELL_CONFIG" ]; then
+        grep "^${key}" "$SNELL_CONFIG" | awk -F'=' '{print $2}' | sed 's/ //g'
+    fi
+}
+
+# ================== 配置 Snell (支持读取现有值，回车不变) ==================
+configure_snell() {
+    mkdir -p "$SNELL_DIR"
+    echo -e "${GREEN}[信息] 开始配置 Snell...${RESET}"
+
+    # 读取旧配置（若存在）
+    local old_listen=$(_get_conf_value "listen")
+    local old_port=""
+    [ -n "$old_listen" ] && old_port=$(echo "$old_listen" | awk -F: '{print $NF}')
+    local old_key=$(_get_conf_value "psk")
+    local old_obfs=$(_get_conf_value "obfs")
+    local old_ipv6=$(_get_conf_value "ipv6")
+    local old_tfo=$(_get_conf_value "tfo")
+    local old_dns=$(_get_conf_value "dns")
+
+    # 1. 端口
+    local default_port="${old_port:-$(random_port)}"
+    echo -n "请输入端口 (当前/默认: $default_port): "
+    read -r input_port
+    port=${input_port:-$default_port}
+    if [ "$port" != "$old_port" ]; then
+        check_port "$port" || return 1
+    fi
+
+    # 2. 密钥
+    local default_key="${old_key:-$(random_key)}"
+    echo -n "请输入 Snell 密钥 (当前/默认: $default_key): "
+    read -r input_key
+    key=${input_key:-$default_key}
+
+    # 3. OBFS
+    local current_obfs_str="${old_obfs:-off}"
+    echo -e "${YELLOW}配置 OBFS (当前配置: $current_obfs_str)：[注意] 无特殊作用不建议启用${RESET}"
+    echo "1. TLS   2. HTTP   3. 关闭"
+    echo -n "请选择 (直接回车保持当前不变): "
+    read -r obfs_choice
+    case $obfs_choice in
+        1) obfs="tls" ;;
+        2) obfs="http" ;;
+        3) obfs="off" ;;
+        *) obfs="$current_obfs_str" ;;
+    esac
+
+    # 4. IPv6
+    local current_ipv6_str="关闭"
+    [ "$old_ipv6" = "1" ] && current_ipv6_str="开启"
+    echo -e "${YELLOW}是否开启 IPv6 支持？(当前配置: $current_ipv6_str)${RESET}"
+    echo "1. 开启   2. 关闭"
+    echo -n "请选择 (直接回车保持当前不变): "
+    read -r ipv6_choice
+    case $ipv6_choice in
+        1) ipv6="1" ;;
+        2) ipv6="0" ;;
+        *) ipv6="${old_ipv6:-0}" ;;
+    esac
+
+    # 5. TFO
+    local current_tfo_str="开启"
+    [ "$old_tfo" = "0" ] && current_tfo_str="关闭"
+    echo -e "${YELLOW}是否开启 TCP Fast Open (TFO)？(当前配置: $current_tfo_str)${RESET}"
+    echo "1. 开启   2. 关闭"
+    echo -n "请选择 (直接回车保持当前不变): "
+    read -r tfo_choice
+    case $tfo_choice in
+        1) tfo="1" ;;
+        2) tfo="0" ;;
+        *) tfo="${old_tfo:-1}" ;;
+    esac
+
+    # 6. DNS
+    local system_dns=$(get_system_dns)
+    local default_dns="${old_dns:-${system_dns:-1.1.1.1,8.8.8.8}}"
+    echo -n "请输入 DNS (当前/默认: $default_dns): "
+    read -r input_dns
+    dns=${input_dns:-$default_dns}
+
+    # 组合监听地址
+    if [ "$ipv6" = "1" ]; then LISTEN="::0:$port"; else LISTEN="0.0.0.0:$port"; fi
+
+    # 写入配置
+    cat > "$SNELL_CONFIG" <<EOF
+[snell-server]
+listen = $LISTEN
+psk = $key
+obfs = $obfs
+ipv6 = $ipv6
+tfo = $tfo
+dns = $dns
+EOF
+
+    IP=$(get_public_ip)
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+    surge_tfo="false"; [ "$tfo" = "1" ] && surge_tfo="true"
+
+    cat <<EOF > "$SNELL_DIR/config.txt"
+$HOSTNAME-Snell = snell, $IP, $port, psk=$key, version=5, tfo=$surge_tfo, reuse=true, ecn=true
+EOF
+
+    _ok "配置已成功写入 $SNELL_CONFIG"
+    log "Snell 配置已成功更新。"
+}
+
+# ================== 核心 Alpine 部署逻辑 ==================
+# 仅下载并覆盖二进制文件，不重装/不覆盖原有配置
+_download_and_install_binary() {
+    local sarch=$( _map_arch ) || { _err "不支持的架构"; return 1; }
+    
+    _info "正在安装 Alpine 必要系统依赖 (upx, unzip, curl)..."
+    apk add --no-cache upx unzip curl >/dev/null 2>&1
+
+    _info "正在获取官方最新稳定版版本号..."
+    local version=$( _get_snell_latest_version )
+    version="${version#v}"
+
+    local tmp=$(mktemp -d)
+    local download_url="https://dl.nssurge.com/snell/snell-server-v${version}-linux-${sarch}.zip"
+
+    _info "正在下载 Snell v$version (架构: $sarch)..."
+    if curl -sLo "$tmp/snell.zip" --connect-timeout 60 "$download_url"; then
+        if unzip -oq "$tmp/snell.zip" -d "$tmp/"; then
+            _info "检测到 Alpine 环境，正在进行 UPX 壳解压兼容处理..."
+            if command -v upx >/dev/null 2>&1; then
+                upx -d "$tmp/snell-server" >/dev/null 2>&1 || _warn "UPX 脱壳失败或无需脱壳"
+            else
+                _err "UPX 工具不可用，无法完成解压"
+                rm -rf "$tmp"; return 1
+            fi
+
+            install -m 755 "$tmp/snell-server" /usr/local/bin/snell-server-v5
+            rm -rf "$tmp"
+            echo "$version"
+            return 0
+        else
+            _err "解压失败"
+        fi
+    else
+        _err "下载失败: $download_url"
+    fi
+    rm -rf "$tmp"
+    return 1
+}
+
+# 部署 OpenRC 脚本管理
+_deploy_openrc_service() {
+    _info "正在写入 Alpine OpenRC 服务管理配置..."
+    cat > "$SNELL_RC_SERVICE" <<'EOF'
 #!/sbin/openrc-run
 
-description="sing-box Server Service"
-pidfile="/run/singbox-vless-ws/singbox-vless-ws.pid"
-command="/usr/local/bin/sing-box"
-command_args="run --config /etc/singbox-vless-ws/config.json"
-command_background="true"
-start_stop_daemon_args="--user sing-box:sing-box --make-pidfile"
+description="Snell Server v5"
+command="/usr/local/bin/snell-server-v5"
+command_args="-c /etc/snell/snell-server.conf"
+command_background="yes"
+pidfile="/run/snell.pid"
+output_log="/var/log/snell.log"
+error_log="/var/log/snell.log"
 
 depend() {
     need net
     after firewall
 }
-
-start_pre() {
-    checkpath -d -m 0755 -o sing-box:sing-box /run/singbox-vless-ws
-}
 EOF
+    chmod +x "$SNELL_RC_SERVICE"
+    rc-update add snell default >/dev/null 2>&1 || true
 }
 
-# =========================================================
-# 3. 网络与配置扩展辅助函数
-# =========================================================
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    error "无法获取公网 IP 地址。" && return 1
-}
-
-check_port() {
-  local port="$1"
-  # 适配 Alpine/Busybox 的 netstat / ss 语法差异
-  if has_command ss; then
-    ss -tunlp 2>/dev/null | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port" && return 1
-  else
-    netstat -tunlp 2>/dev/null | grep -w tcp | awk '{print $4}' | sed 's/.*://g' | grep -q -w "$port" && return 1
-  fi
-  return 0
-}
-
-is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
-
-get_random_port() {
-  local rand_port
-  while true; do
-    # Alpine Busybox 没有 shuf 命令，用 awk 替代随机数生成
-    rand_port=$(awk 'BEGIN{srand(); print int(rand()*(65535-2000+1))+2000}')
-    if check_port "$rand_port"; then
-      echo "$rand_port" && return 0
-    fi
-  done
-}
-
-get_sb_status() {
-  if has_command rc-service && rc-service singbox-vless-ws status 2>/dev/null | grep -q "started"; then
-    echo -e "${GREEN}● 运行中 ${RESET}"
-  else
-    if pgrep -f "$EXECUTABLE_INSTALL_PATH run" >/dev/null 2>&1; then
-      echo -e "${GREEN}● 运行中 ${RESET}"
-    else
-      echo -e "${RED}● 未运行${RESET}"
-    fi
-  fi
-}
-
-get_current_port_display() {
-  if [[ -f "$SB_CONFIG" ]]; then
-    local main_port
-    main_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "")
-    echo "${main_port:- -}"
-  else echo "-"; fi
-}
-
-restart_singbox_service() {
-  if has_command rc-service && [[ -f "$OPENRC_SERVICES_DIR/singbox-vless-ws" ]]; then
-    rc-service singbox-vless-ws restart >/dev/null 2>&1 || true
-    rc-service singbox-vless-ws status 2>/dev/null | grep -q "started"
-  else
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-    # 采用 Alpine 后台运行沙箱用户
-    su -s /bin/bash -c "$EXECUTABLE_INSTALL_PATH run --config $SB_CONFIG >/dev/null 2>&1 &" sing-box
-    return 0
-  fi
-}
-
-# =========================================================
-# 4. 证书、端口交互、配置写入与自定义 Socks5 出口
-# =========================================================
-inst_cert() {
-  mkdir -p /etc/singbox-vless-ws
-  
-  echo "---------------------------------------------"
-  echo -e "sing-box TLS 证书申请方式如下："
-  echo -e " 1) Acme 脚本自动申请 (需放行 80 端口)"
-  echo -e " 2) 自定义证书路径"
-  echo "---------------------------------------------"
-  local certInput
-  read -rp "请输入选项 [1-2] (直接回车默认Acme脚本自动申请): " certInput
-  certInput=${certInput:-1}
-
-  cert_path="/etc/singbox-vless-ws/fullchain.pem"
-  key_path="/etc/singbox-vless-ws/privkey.pem"
-
-  if [[ $certInput == 1 ]]; then
-    if [[ $(check_port "80") -eq 0 ]]; then
-      warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。请确保已暂时关闭 Web 服务。"
+# 选项 1：全新安装
+install_snell_v5() {
+    if [ -x /usr/local/bin/snell-server-v5 ]; then
+        _ok "Snell 已安装，如需更新请使用选项 2，修改配置请用选项 4。"; return 0
     fi
 
-    local vps_ip=$(get_public_ip)
-    read -rp "请输入需要申请证书的域名: " domain
-    [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
+    local ver=$(_download_and_install_binary)
+    [ -z "$ver" ] && return 1
+
+    create_user
+    configure_snell || return 1
+    _deploy_openrc_service
     
-    info "正在检查并安装 Acme.sh 依赖..."
-    has_command socat || install_software socat
+    rc-service snell restart >/dev/null 2>&1 || true
+    _ok "Snell 已在 Alpine Linux 上成功部署并运行！"
+    log "Alpine Snell 安装成功"
 
-    local acme_cmd="/root/.acme.sh/acme.sh"
-    if [[ ! -f "$acme_cmd" ]]; then
-      curl https://get.acme.sh | sh -s email=$(date +%s%N 2>/dev/null || date +%s)@gmail.com
-    fi
-    
-    "$acme_cmd" --set-default-ca --server letsencrypt
-    
-    info "正在向 Let's Encrypt 申请证书..."
-    if [[ "$vps_ip" =~ ":" ]]; then
-      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
+    # ================== 新增：安装完直接显示节点配置 ==================
+    echo
+    echo -e "${GREEN}===============================================${RESET}"
+    echo -e "${GREEN}               🎉 Snell 安装成功 🎉            ${RESET}"
+    echo -e "${GREEN}===============================================${RESET}"
+    echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
+    echo -e "${GREEN}👉 请复制以下配置到你的 Surge 配置文件中：${RESET}"
+    echo
+    if [ -f "$SNELL_DIR/config.txt" ]; then
+        echo -e "${YELLOW}$(cat "$SNELL_DIR/config.txt")${RESET}"
     else
-      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
+        _warn "未找到节点配置文件文本。"
     fi
-    
-    if "$acme_cmd" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc; then
-      echo "$domain" > /etc/singbox-vless-ws/ca.log
-      sb_domain=$domain
-      info "Acme 证书申请并成功分发至安全沙箱！"
-    else
-      error "Acme 证书申请失败，自动切换回自定义证书路径。"
-      certInput=2
-    fi
-    
-  elif [[ $certInput == 2 ]]; then
-    local user_cert user_key
-    read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
-    read -rp "请输入密钥文件 (privkey.pem/key) 的路径: " user_key
-    read -rp "请输入证书对应的域名: " sb_domain
-    
-    if [[ -f "$user_cert" && -f "$user_key" ]]; then
-      cp -f "$user_cert" "$cert_path"
-      cp -f "$user_key" "$key_path"
-      info "自定义证书已成功同步解耦至内部安全区。"
-    else
-      error "找不到输入的证书文件，自动Acme 证书申请。"
-      certInput=1
-    fi
-  fi
-
-  chmod 644 "$cert_path"
-  chmod 600 "$key_path"
-  if is_user_exists "sing-box"; then
-    chown -R sing-box:sing-box /etc/singbox-vless-ws
-  fi
+    echo -e "${GREEN}===============================================${RESET}"
+    echo
 }
 
-inst_port() {
-  local default_port=""
-  [[ -f "$SB_CONFIG" ]] && default_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "")
+# 选项 2：纯净更新（不覆盖、不重装配置）
+update_snell_v5() {
+    if [ ! -x /usr/local/bin/snell-server-v5 ]; then
+        _err "检测到系统未安装 Snell，请先选择选项 1 进行安装！"; return 1
+    fi
 
-  local prompt_msg="设置 sing-box 主端口 [1-65535] (回车随机分配): "
-  [[ -n "$default_port" ]] && prompt_msg="设置 sing-box 主端口 [当前: ${default_port}, 回车不修改]: "
+    _info "开始检查并更新 Snell 二进制程序（保留当前所有配置不变）..."
+    local ver=$(_download_and_install_binary)
+    [ -z "$ver" ] && return 1
 
-  while true; do
-    read -rp "$prompt_msg" port
-    if [[ -z "$port" ]]; then
-      if [[ -n "$default_port" ]]; then port="$default_port" && break
-      else
-        port=$(get_random_port)
-        info "已为您随机分配未被占用端口: $port" && break
-      fi
-    elif is_valid_port "$port"; then
-      if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
-        error "端口 ${port} 已被其它程序占用，请更换。" && continue
-      fi
-      break
-    else error "请输入有效的端口数字 (1-65535)"; fi
-  done
+    _deploy_openrc_service
+    _restart_snell_process
+    _ok "Snell 已成功更新，且当前配置已完好保留并重启完毕！"
+    log "Alpine Snell 成功更新"
 }
 
-configure_custom_socks5_outbound() {
-    if [[ ! -f "$SB_CONFIG" ]]; then 
-        error "错误: 未安装，无法配置出口模式。"
-        return
-    fi
-
-    local mode current_type tmp_file
-    current_type=$(jq -r '.outbounds[0].type // "direct"' "$SB_CONFIG" 2>/dev/null || echo "direct")
-
-    echo "---------------------------------------------"
-    echo "请选择出口模式："
-    if [[ "$current_type" == "socks" ]]; then
-        echo -e "当前模式: ${YELLOW}Socks5 代理出口${RESET}"
-    else
-        echo -e "当前模式: ${GREEN}本地直连出口${RESET}"
-    fi
-    echo "1) 直连出口"
-    echo "2) Socks5出口"
-    echo "0) 取消"
-    echo "---------------------------------------------"
-
-    read -rp "请输入选项 [0-2]: " mode || true
-    case "$mode" in
-        1)
-            tmp_file=$(mktemp)
-            jq '.outbounds = [{"type": "direct", "tag": "direct"}]' "$SB_CONFIG" > "$tmp_file"
-            if ! jq empty "$tmp_file" >/dev/null 2>&1; then
-                rm -f "$tmp_file"
-                error "生成的直连配置无效。"
-                return 1
-            fi
-            cp "$SB_CONFIG" "${SB_CONFIG}.bak.$(date +%s)"
-            mv "$tmp_file" "$SB_CONFIG"
-            chmod 644 "$SB_CONFIG" 2>/dev/null || true
-            if is_user_exists "sing-box"; then chown sing-box:sing-box "$SB_CONFIG"; fi
-
-            if ! restart_singbox_service; then
-                error "切换到直连失败。"
-                return 1
-            fi
-            info "已成功切换为直连出口！"
-            return
-            ;;
-        2)
-            ;;
-        0|"")
-            info "已取消配置。"
-            return
-            ;;
-        *)
-            error "无效选项，请输入 0-2 之间的数字。"
-            return 1
-            ;;
-    esac
-
-    info "配置自定义 Socks5 出口代理..."
-    local socks_host socks_port socks_user socks_pass
-
-    read -rp "请输入 Socks5 服务器地址/IP: " socks_host || true
-    [[ -z "$socks_host" ]] && info "已取消配置。" && return
-
-    while true; do
-        read -rp "请输入 Socks5 端口 (默认: 1080): " socks_port || true
-        [[ -z "$socks_port" ]] && socks_port=1080
-        if is_valid_port "$socks_port"; then
-            break
-        else
-            error "端口无效，请输入一个1-65535之间的数字。"
-        fi
-    done
-
-    read -rp "请输入 Socks5 用户名 (若无密码认证请直接留空回车): " socks_user || true
-    if [[ -n "$socks_user" ]]; then
-        read -rs -p "请输入 Socks5 密码: " socks_pass || true
-        echo
-    else
-        socks_pass=""
-    fi
-
-    tmp_file=$(mktemp)
-
-    if [[ -n "$socks_user" ]]; then
-        jq \
-            --arg host "$socks_host" \
-            --argjson port "$socks_port" \
-            --arg user "$socks_user" \
-            --arg pass "$socks_pass" \
-            '.outbounds = [ { "type": "socks", "tag": "custom-socks5-out", "server": $host, "server_port": $port, "username": $user, "password": $pass } ]' "$SB_CONFIG" > "$tmp_file"
-    else
-        jq \
-            --arg host "$socks_host" \
-            --argjson port "$socks_port" \
-            '.outbounds = [ { "type": "socks", "tag": "custom-socks5-out", "server": $host, "server_port": $port } ]' "$SB_CONFIG" > "$tmp_file"
-    fi
-
-    if ! jq empty "$tmp_file" >/dev/null 2>&1; then
-        rm -f "$tmp_file"
-        error "生成的 Socks5 配置无效，请检查输入后重试。"
-        return 1
-    fi
-
-    cp "$SB_CONFIG" "${SB_CONFIG}.bak.$(date +%s)"
-    mv "$tmp_file" "$SB_CONFIG"
-    chmod 644 "$SB_CONFIG" 2>/dev/null || true
-    if is_user_exists "sing-box"; then chown sing-box:sing-box "$SB_CONFIG"; fi
-
-    if ! restart_singbox_service; then
-        error "重启服务失败，当前配置可能与系统环境不兼容。"
-        return 1
-    fi
-    info "已成功切换为 Socks5 出口！"
+uninstall_snell() {
+    echo -e "${RED}[警告] 正在彻底从 Alpine 卸载 Snell 服务...${RESET}"
+    rc-service snell stop >/dev/null 2>&1 || true
+    rc-update del snell >/dev/null 2>&1 || true
+    pkill -f snell-server-v5 || true
+    rm -f "$SNELL_RC_SERVICE"
+    rm -f /usr/local/bin/snell-server-v5
+    rm -rf "$SNELL_DIR"
+    rm -f "$SNELL_LOG"
+    _ok "Alpine Snell 服务已完全卸载。"
 }
 
-write_and_show_config() {
-  local hostname=$(hostname -s | sed 's/ /_/g')
-  local ip=$(get_public_ip)
-  local url_ip="$ip"
-  if [[ "$ip" =~ ":" ]]; then 
-    url_ip="[$ip]"
-  fi
-
-  cat << EOF > /etc/singbox-vless-ws/config.json
-{
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
-  "inbounds": [
-    {
-      "type": "vless",
-      "tag": "vless-in",
-      "listen": "::",
-      "listen_port": $port,
-      "users": [
-        {
-          "uuid": "$auth_pwd",
-          "flow": ""
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "$sb_domain",
-        "key_path": "$key_path",
-        "certificate_path": "$cert_path"
-      },
-      "transport": {
-        "type": "ws",
-        "path": "$ws_path"
-      }
+# 统一的启动/重启底层逻辑（确保日志正确重定向）
+_restart_snell_process() {
+    rc-service snell restart >/dev/null 2>&1 || {
+        pkill -f snell-server-v5 || true
+        touch "$SNELL_LOG"
+        nohup /usr/local/bin/snell-server-v5 -c "$SNELL_CONFIG" >> "$SNELL_LOG" 2>&1 &
     }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ]
-}
-EOF
-
-  mkdir -p "$SB_DIR"
-
-  cat << EOF > "$SB_DIR/url.txt"
-====== VLESS + WS + TLS 节点信息 ======
-IP    : ${ip}
-端口  : $port
-UUID  : $auth_pwd
-SIN   : $sb_domain
-HOST  : $sb_domain
-路径  : $ws_path
----------------------------
-📄 V6VPS 请自行替换 IP 地址为 V6 ★
-[信息] V2rayN  链接：
-vless://$auth_pwd@$url_ip:$port?sni=$sb_domain&host=$sb_domain&security=tls&type=ws&path=$(echo "$ws_path" | sed 's/\//%2F/g')#$hostname-Vlesswstls
----------------------------------
-EOF
-
-  if is_user_exists "sing-box"; then
-    chown -R sing-box:sing-box /etc/singbox-vless-ws
-  fi
-
-  if restart_singbox_service; then
-    info "sing-box (VLESS+WS+TLS) 服务配置并启动成功！"
-  else
-    error "sing-box 服务启动失败，请查看日志。"
-  fi
-  
-  showconf
 }
 
-# =========================================================
-# 5. 主流程功能控制模块
-# =========================================================
-instsingbox() {
-  check_environment
-  
-  info "获取官方最新发布版本中..."
-  local latest_version=$(get_latest_version)
-  if [[ -z "$latest_version" ]]; then
-    error "无法获取最新版本号，请检查网络设置。"
-    return 1
-  fi
-  
-  local _tmparchive=$(mktemp)
-  if ! download_singbox "$latest_version" "$_tmparchive"; then
-    rm -f "$_tmparchive" && return 1
-  fi
-
-  echo -ne "正在解压并安装二进制可执行文件 ... "
-  local _tmpdir=$(mktemp -d)
-  tar -xzf "$_tmparchive" -C "$_tmpdir"
-  
-  if install -Dm755 "$_tmpdir"/sing-box-*/sing-box "$EXECUTABLE_INSTALL_PATH"; then
-    echo "成功"
-  else
-    rm -rf "$_tmparchive" "$_tmpdir" && error "安装失败" && return 1
-  fi
-  rm -rf "$_tmparchive" "$_tmpdir"
-
-  SINGBOX_USER="sing-box"
-  SINGBOX_HOME_DIR="/var/lib/sing-box"
-  if ! is_user_exists "$SINGBOX_USER"; then
-    echo -ne "正在创建系统独立沙箱运行用户 $SINGBOX_USER ... "
-    mkdir -p "$SINGBOX_HOME_DIR"
-    # [核心修复] 先创建主用户组，再创建对应的独立安全用户
-    addgroup -S "$SINGBOX_USER" >/dev/null 2>&1 || true
-    adduser -S -D -G "$SINGBOX_USER" -h "$SINGBOX_HOME_DIR" -s /sbin/nologin "$SINGBOX_USER" >/dev/null 2>&1 || true
-    echo "成功"
-  fi
-
-  # 写入 Alpine OpenRC 守护进程配置
-  if has_command rc-update; then
-    install_content -Dm755 "$(tpl_singbox_openrc_service)" "$OPENRC_SERVICES_DIR/singbox-vless-ws" "1"
-    rc-update add singbox-vless-ws default >/dev/null 2>&1 || true
-  fi
-
-  inst_cert || return 1
-  inst_port
-  
-  read -rp "设置 VLESS UUID (直接回车将自动分配强随机 UUID): " auth_pwd
-  auth_pwd=${auth_pwd:-$(generate_uuid)}
-
-  read -rp "设置 WebSocket 路径 (直接回车默认 /ws): " ws_path
-  ws_path=${ws_path:-/ws}
-  [[ ! "$ws_path" =~ ^/ ]] && ws_path="/$ws_path"
-
-  write_and_show_config
-}
-
-update_singbox() {
-  if [[ ! -f "$SB_BINARY" ]]; then
-    error "当前系统未安装 sing-box，无法执行更新。"
-    return 1
-  fi
-
-  info "正在检查新版本..."
-  local current_version=$(get_installed_version)
-  local latest_version=$(get_latest_version)
-
-  if [[ -z "$latest_version" ]]; then
-    error "无法连接 to GitHub API 获取最新版本，请稍后再试。"
-    return 1
-  fi
-
-  info "当前安装版本: ${YELLOW}${current_version}${RESET}"
-  info "官方最新版本: ${GREEN}${latest_version}${RESET}"
-
-  if [[ "$current_version" == "$latest_version" ]]; then
-    info "您当前已经是最新版本，无需更新。"
-    return 0
-  fi
-
-  warn "检测到新版本，即将开始平滑更新 (你的配置与运行数据不会改变)..."
-  
-  local _tmparchive=$(mktemp)
-  if ! download_singbox "$latest_version" "$_tmparchive"; then
-    rm -f "$_tmparchive" && return 1
-  fi
-
-  echo -ne "正在覆盖二进制核心文件 ... "
-  local _tmpdir=$(mktemp -d)
-  tar -xzf "$_tmparchive" -C "$_tmpdir"
-  if install -Dm755 "$_tmpdir"/sing-box-*/sing-box "$EXECUTABLE_INSTALL_PATH"; then
-    echo "成功"
-  else
-    rm -rf "$_tmparchive" "$_tmpdir" && error "覆盖核心失败" && return 1
-  fi
-  rm -rf "$_tmparchive" "$_tmpdir"
-
-  info "正在重启 sing-box 服务以应用更新..."
-  if restart_singbox_service; then
-    info "sing-box 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
-  else
-    error "核心更新成功，但服务重启失败。"
-  fi
-}
-
-unstsingbox() {
-  warn "即将从当前系统中彻底卸载 sing-box"
-
-  if has_command rc-service && [[ -f "$OPENRC_SERVICES_DIR/singbox-vless-ws" ]]; then
-    rc-service singbox-vless-ws stop >/dev/null 2>&1 || true
-    rc-update del singbox-vless-ws >/dev/null 2>&1 || true
-    remove_file "$OPENRC_SERVICES_DIR/singbox-vless-ws"
-  else
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-  fi
-  
-  remove_file "$EXECUTABLE_INSTALL_PATH"
-  rm -rf /etc/singbox-vless-ws "$SB_DIR"
-
-  info "sing-box 已彻底从您的系统中移除！"
-}
-
-changeconf() {
-  if [[ ! -f "$SB_CONFIG" ]]; then
-    error "配置文件不存在，请先安装 sing-box"
-    return 1
-  fi
-
-  local old_pwd=$(jq -r '.inbounds[0].users[0].uuid' "$SB_CONFIG" 2>/dev/null || true)
-  local old_path=$(jq -r '.inbounds[0].transport.path' "$SB_CONFIG" 2>/dev/null || echo "/ws")
-  local old_cert=$(jq -r '.inbounds[0].tls.certificate_path' "$SB_CONFIG" 2>/dev/null || true)
-  local old_key=$(jq -r '.inbounds[0].tls.key_path' "$SB_CONFIG" 2>/dev/null || true)
-  local old_sni=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || "www.bing.com")
-
-  clear
-  echo -e "${GREEN}====== 修改 sing-box (VLESS+WS+TLS) 配置 ======${RESET}"
-  echo "提示：直接敲回车将保持原有配置不变"
-  echo "---------------------------------------------"
-  
-  inst_port 
-
-  local auth_pwd
-  read -rp "设置 VLESS 新 UUID [当前: ${old_pwd}, 回车不修改]: " auth_pwd
-  auth_pwd=${auth_pwd:-$old_pwd}
-
-  local ws_path
-  read -rp "设置 新 WebSocket 路径 [当前: ${old_path}, 回车不修改]: " ws_path
-  ws_path=${ws_path:-$old_path}
-  [[ ! "$ws_path" =~ ^/ ]] && ws_path="/$ws_path"
-
-  local cert_path key_path sb_domain
-  echo "---------------------------------------------"
-  read -rp "是否需要修改证书？[y/N] (直接回车默认不修改): " change_cert_flag
-  if [[ "$change_cert_flag" == "y" || "$change_cert_flag" == "Y" ]]; then
-    inst_cert || return 1
-  else
-    cert_path="$old_cert"
-    key_path="$old_key"
-    sb_domain="$old_sni"
-  fi
-
-  write_and_show_config
-  info "配置修改并应用成功！"
-}
-
-showconf() {
-  if [[ ! -f "$SB_CONFIG" ]]; then
-    error "未找到 VLESS 配置文件，请确保已成功部署节点。"
-    return
-  fi
-
-  local hostname=$(hostname -s | sed 's/ /_/g')
-  local main_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "18055")
-  local auth_pwd=$(jq -r '.inbounds[0].users[0].uuid' "$SB_CONFIG" 2>/dev/null || echo "UUID")
-  local sb_domain=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || echo "www.bing.com")
-  local ws_path=$(jq -r '.inbounds[0].transport.path' "$SB_CONFIG" 2>/dev/null || echo "/ws")
-  
-  local is_insecure="0"
-  if [[ "$sb_domain" == "www.bing.com" ]]; then
-    is_insecure="1"
-  fi
-
-  local ip=$(get_public_ip)
-  local url_ip="$ip"
-  if [[ "$ip" =~ ":" ]]; then 
-    url_ip="[$ip]"
-  fi
-
-  echo -e "${GREEN}====== VLESS + WS + TLS 节点信息 ======${RESET}"
-  echo -e "${YELLOW}IP      : ${ip}${RESET}"
-  echo -e "${YELLOW}端口    : ${main_port}${RESET}"
-  echo -e "${YELLOW}UUID    : ${auth_pwd}${RESET}"
-  echo -e "${YELLOW}SNI     : ${sb_domain}${RESET}"
-  echo -e "${YELLOW}host     : ${sb_domain}${RESET}"
-  echo -e "${YELLOW}WS 路径 : ${ws_path}${RESET}"
-  echo -e "${GREEN}---------------------------${RESET}"
-  echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
-  echo -e "${GREEN}[信息] V2rayN 链接：${RESET}"
-  echo -e "${YELLOW}vless://${auth_pwd}@${url_ip}:${main_port}?sub=1&sni=${sb_domain}&host=${sb_domain}&security=tls&allowInsecure=${is_insecure}&type=ws&path=$(echo "$ws_path" | sed 's/\//%2F/g')#${hostname}-Vlesswstls${RESET}"
-  echo -e "${YELLOW}---------------------------------${RESET}"
-}
-
-# =========================================================
-# 6. 面板主菜单循环
-# =========================================================
-menu() {
-  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
-  check_environment
-
-  while true; do
+# ================== 菜单 ==================
+show_menu() {
     clear
-    local status=$(get_sb_status)
-    local version=$(get_installed_version)
-    local port_show=$(get_current_port_display)
+    if rc-service snell status 2>&1 | grep -q "started" || pgrep -x "snell-server-v5" >/dev/null; then
+        STATUS="${GREEN}● 运行中${RESET}"
+    else
+        STATUS="${RED}● 未运行${RESET}"
+    fi
+
+    VERSION_SHOW="未安装"
+    if [ -x /usr/local/bin/snell-server-v5 ]; then
+        VERSION_SHOW=$(/usr/local/bin/snell-server-v5 -v 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || echo "v5.x")
+    fi
+
+    PORT_SHOW="-"
+    if [ -f "$SNELL_CONFIG" ]; then
+        PORT_SHOW=$(grep '^listen' "$SNELL_CONFIG" | awk -F: '{print $NF}')
+    fi
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}  Sing-box VLESS-WS-TLS 面板(Alpine)${RESET}"
+    echo -e "${GREEN}        Snell  管理面板         ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $status"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $STATUS"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}$VERSION_SHOW${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}$PORT_SHOW${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1.安装 Sing-box VLESS+WS+TLS${RESET}"
-    echo -e "${GREEN} 2.更新 Sing-box ${RESET}"
-    echo -e "${GREEN} 3.卸载 Sing-box ${RESET}"
-    echo -e "${GREEN} 4.修改配置${RESET}"
-    echo -e "${GREEN} 5.启动 Sing-box ${RESET}"
-    echo -e "${GREEN} 6.停止 Sing-box ${RESET}"
-    echo -e "${GREEN} 7.重启 Sing-box ${RESET}"
-    echo -e "${GREEN} 8.查看日志${RESET}"
-    echo -e "${GREEN} 9.查看节点配置${RESET}"
-    echo -e "${GREEN}10.配置Socks5出口${RESET}"
+    echo -e "${GREEN}1. 安装 Snell${RESET}"
+    echo -e "${GREEN}2. 更新 Snell${RESET}"
+    echo -e "${GREEN}3. 卸载 Snell${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 Snell${RESET}"
+    echo -e "${GREEN}6. 停止 Snell${RESET}"
+    echo -e "${GREEN}7. 重启 Snell${RESET}"
+    echo -e "${GREEN}8. 查看运行日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
-
-    local choice=""
-    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
-    [[ -z "$choice" ]] && continue
-
-    case "$choice" in
-      1) instsingbox; pause ;;
-      2) update_singbox; pause ;;
-      3) unstsingbox; pause ;;
-      4) changeconf; pause ;;
-      5) 
-        if has_command rc-service && [[ -f "$OPENRC_SERVICES_DIR/singbox-vless-ws" ]]; then
-          rc-service singbox-vless-ws start && info "服务已成功启动 (OpenRC)！"
-        else
-          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-          su -s /bin/bash -c "$EXECUTABLE_INSTALL_PATH run --config $SB_CONFIG >/dev/null 2>&1 &" sing-box
-          info "进程已在后台独立启动！"
-        fi
-        pause ;;
-      6) 
-        if has_command rc-service && [[ -f "$OPENRC_SERVICES_DIR/singbox-vless-ws" ]]; then
-          rc-service singbox-vless-ws stop && info "服务已成功停止 (OpenRC)！"
-        else
-          pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台进程已终止！"
-        fi
-        pause ;;
-      7) 
-        restart_singbox_service && info "服务/进程已重启！"
-        pause ;;
-      8) 
-        # Alpine 环境 OpenRC 的后台日志标准查询
-        if [[ -f "$SB_CONFIG" ]]; then
-           echo -e "${CYAN}提示: 当前 sing-box 以 OpenRC 守护模式后台或独立沙箱进程启动。${RESET}"
-           echo -e "${CYAN}如需进行实时核心数据流与报错调试，建议手动前台运行：${RESET}"
-           echo -e "${YELLOW}sing-box run --config $SB_CONFIG${RESET}"
-        else
-           error "未发现配置文件，无法诊断。"
-        fi
-        pause ;;
-      9) showconf; pause ;;
-      10) configure_custom_socks5_outbound; pause ;;
-      0) exit 0 ;;
-      *) error "无效输入，请重新选择。"; sleep 1 ;;
-    esac
-  done
 }
 
-menu "$@"
+# ================== 主循环 ==================
+while true; do
+    show_menu
+    echo -e -n "${GREEN}请输入选项: ${RESET}"
+    read -r choice
+    case $choice in
+        1) install_snell_v5; pause ;;
+        2) update_snell_v5; pause ;;
+        3) uninstall_snell; pause ;;
+        4) 
+            if [ ! -f "$SNELL_CONFIG" ]; then 
+                _err "未找到配置文件，请先安装！"
+            else
+                configure_snell
+                _restart_snell_process
+                _ok "配置已重载，Snell 服务已平滑重启！"
+                # 重载后同样显示最新节点信息
+                echo -e "\n${GREEN}👉  Surge 节点配置：${RESET}"
+                echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
+                [ -f "$SNELL_DIR/config.txt" ] && echo -e "${YELLOW}$(cat "$SNELL_DIR/config.txt")${RESET}\n"
+            fi
+            pause ;;
+        5) 
+            rc-service snell start >/dev/null 2>&1 || { 
+                if ! pgrep -x "snell-server-v5" >/dev/null; then
+                    touch "$SNELL_LOG"
+                    nohup /usr/local/bin/snell-server-v5 -c "$SNELL_CONFIG" >> "$SNELL_LOG" 2>&1 &
+                fi
+            }
+            _ok "Snell 已成功启动"
+            pause ;;
+        6) 
+            rc-service snell stop >/dev/null 2>&1 || pkill -f snell-server-v5 || true
+            _ok "Snell 已停止"
+            pause ;;
+        7) 
+            _restart_snell_process
+            _ok "Snell 已重启"
+            pause ;;
+        8)
+            echo -e "${GREEN}--- Snell 核心运行日志 (最新50行) ---${RESET}"
+            if [ -f "$SNELL_LOG" ] && [ -s "$SNELL_LOG" ]; then
+                tail -n 50 "$SNELL_LOG"
+                echo -e "${YELLOW}------------------------------------------------${RESET}"
+                echo -n "是否需要实时追踪新日志输出？(y/n, 默认 n): "
+                read -r watch_choice
+                if [ "$watch_choice" = "y" ] || [ "$watch_choice" = "Y" ]; then
+                    echo -e "${YELLOW}提示: 按 Ctrl+C 即可退出日志实时追踪并返回菜单${RESET}"
+                    tail -f "$SNELL_LOG"
+                fi
+            else
+                _warn "暂无 Snell 运行日志或日志文件为空。 (请确保服务已正常启动并产生流量)"
+            fi
+            pause ;;
+        9)
+            if [ -f "$SNELL_CONFIG" ]; then
+                echo -e "${GREEN}====== 当前 Snell 内部配置 ======${RESET}"
+                cat "$SNELL_CONFIG"
+                echo -e "${GREEN}====== Surge 专属配置 ======${RESET}"
+                [ -f "$SNELL_DIR/config.txt" ] && cat "$SNELL_DIR/config.txt" || echo "暂无配置文本"
+            else
+                echo -e "${RED}配置文件不存在，请先安装！${RESET}"
+            fi
+            pause ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效输入${RESET}"; pause ;;
+    esac
+done

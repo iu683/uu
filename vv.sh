@@ -1,386 +1,675 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+#
+# Xray (Socks5) 控制面板 
+#
+# =========================================================
+# 1. 核心控制与全局环境初始化
+# =========================================================
+set -Eeuo pipefail
+export LANG=en_US.UTF-8
 
-#================================================================================
-# 常量和全局变量
-#================================================================================
+# ================== 颜色 ==================
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+CYAN="\033[36m"
+RESET="\033[0m"
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-NC='\033[0m' 
+# ================== 基础变量 ==================
+readonly SERVICE_NAME="xraysocks5"
+readonly XRAY_CONFIG="/usr/local/etc/${SERVICE_NAME}/config.json"
+readonly XRAY_BINARY="/usr/local/bin/${SERVICE_NAME}"
+readonly LINK_FILE="/root/proxynode/socks5/xray_socks5.txt"
 
-CONFIG_FILE="/etc/tun2socks/config.yaml"
-SERVICE_FILE="/etc/systemd/system/tun2socks.service"
-BINARY_PATH="/usr/local/bin/tun2socks"
+# 降级备用版本
+readonly BACKUP_VERSION="26.3.27"
 
-# 备用 DNS64 服务器（用于纯 IPv6 环境下代理/解析 GitHub）
-ALTERNATE_DNS64_SERVERS=(
-    "2a00:1098:2b::1"
-    "2a01:4f8:c2c:123f::1"
-    "2a01:4f9:c010:3f02::1"
-    "2001:67c:2b0::4"
-    "2001:67c:2b0::6"
-)
+TMP_DIR=$(mktemp -d -t xray_socks.XXXXXX)
 
-#================================================================================
-# 日志和工具函数
-#================================================================================
-info() { echo -e "${BLUE}[信息]${NC} $1"; }
-success() { echo -e "${GREEN}[成功]${NC} $1"; }
-warning() { echo -e "${YELLOW}[警告]${NC} $1"; }
-error() { echo -e "${RED}[错误]${NC} $1"; }
-step() { echo -e "${PURPLE}[步骤]${NC} $1"; }
+# ================== cleanup ==================
+cleanup() {
+    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+}
 
-require_root() {
-    if [ "$EUID" -ne 0 ]; then
-        error "请使用 root 权限运行此脚本，例如: sudo $0"
-        exit 1
+trap cleanup EXIT INT TERM
+
+# ================== 日志与交互 ==================
+info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
+error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
+pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
+
+# ================== 获取公网IP ==================
+get_public_ip() {
+    local ip
+
+    for cmd in "curl -4fsSL --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null || true)
+            if [[ -n "${ip:-}" ]]; then
+                echo "$ip"
+                return 0
+            fi
+        done
+    done
+
+    for cmd in "curl -6fsSL --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ipv6.ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null || true)
+            if [[ -n "${ip:-}" ]]; then
+                echo "$ip"
+                return 0
+            fi
+        done
+    done
+
+    return 1
+}
+
+# ================== URL 编码函数 (保障TG链接可用性) ==================
+url_encode() {
+    local string="${1}"
+    local strlen="${#string}"
+    local encoded=""
+    local pos c o
+
+    for (( pos=0 ; pos<strlen ; pos++ )); do
+        c=${string:$pos:1}
+        case "$c" in
+            [-_.~a-zA-Z0-9] ) encoded+="$c" ;;
+            * )
+                printf -v o '%%%02X' "'$c"
+                encoded+="$o"
+                ;;
+        esac
+    done
+    echo "${encoded}"
+}
+
+# ================== 检查端口占用 ==================
+check_port() {
+    local port="$1"
+    if ss -tuln | awk '{print $5}' | grep -qE "[:.]${port}$"; then
+        return 1  # 被占用
+    fi
+    return 0  # 没用占用
+}
+
+# ================== 验证端口格式 ==================
+is_valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]
+}
+
+# ================== 获取可用随机端口 ==================
+get_random_port() {
+    local rand_port
+    while true; do
+        rand_port=$((RANDOM % 55536 + 10000))
+        if check_port "$rand_port"; then
+            echo "$rand_port"
+            return 0
+        fi
+    done
+}
+
+# ================== 生成随机字符串 ==================
+generate_random_string() {
+    local length="$1"
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex "$((length / 2))"
+    else
+        tr -dc 'a-zA-Z0-9' < /dev/urandom 2>/dev/null | head -c "$length" || echo "admin$(RANDOM)"
     fi
 }
 
-cleanup_ip_rules() {
-    step "正在清理残留的 IP 规则和路由..."
-    ip rule del fwmark 438 lookup main pref 10 2>/dev/null || true
-    ip -6 rule del fwmark 438 lookup main pref 10 2>/dev/null || true
-    ip route del default dev tun0 table 20 2>/dev/null || true
-    ip rule del lookup 20 pref 20 2>/dev/null || true
-    ip rule del to 127.0.0.0/8 lookup main pref 16 2>/dev/null || true
-    ip rule del to 10.0.0.0/8 lookup main pref 16 2>/dev/null || true
-    ip rule del to 172.16.0.0/12 lookup main pref 16 2>/dev/null || true
-    ip rule del to 192.168.0.0/16 lookup main pref 16 2>/dev/null || true
-
-    while ip rule del pref 15 2>/dev/null; do true; done
-    while ip -6 rule del pref 15 2>/dev/null; do true; done
-    success "IP 规则和路由清理完成。"
+# ================== 架构检测 ==================
+get_arch() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64) echo "64" ;;
+        aarch64|arm64) echo "arm64-v8a" ;;
+        armv7l) echo "arm32-v7a" ;;
+        *) error "暂不支持的系统架构: $arch"; return 1 ;;
+    esac
 }
 
-#================================================================================
-# 核心逻辑函数
-#================================================================================
-
-# 生成或更新 Systemd 服务脚本
-generate_service_file() {
-    local MAIN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
-    local MAIN_IP6=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
-    local RULE_ADD_V4="" RULE_DEL_V4="" RULE_ADD_V6="" RULE_DEL_V6=""
+# ================== 自动获取最新版本号 ==================
+get_latest_version() {
+    local latest_version
+    info "正在获取 GitHub 最新 Xray 版本号..."
     
-    [ -n "$MAIN_IP" ] && RULE_ADD_V4="ExecStartPost=/sbin/ip rule add from $MAIN_IP lookup main pref 15" && RULE_DEL_V4="ExecStop=/sbin/ip rule del from $MAIN_IP lookup main pref 15"
-    [ -n "$MAIN_IP6" ] && RULE_ADD_V6="ExecStartPost=/sbin/ip -6 rule add from $MAIN_IP6 lookup main pref 15" && RULE_DEL_V6="ExecStop=/sbin/ip -6 rule del from $MAIN_IP6 lookup main pref 15"
+    latest_version=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
+        | jq -r '.tag_name' 2>/dev/null || echo "")
+        
+    latest_version="${latest_version#v}"
 
-    cat > "$SERVICE_FILE" <<EOF
+    if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
+        warn "通过 GitHub API 获取最新版本失败，将使用内置备用版本: v${BACKUP_VERSION}"
+        echo "$BACKUP_VERSION"
+    else
+        info "成功获取最新版本: v${latest_version}"
+        echo "$latest_version"
+    fi
+}
+
+# ================== 从GitHub下载并解压Xray ==================
+download_and_extract_xray() {
+    local arch version
+    arch=$(get_arch) || return 1
+    version=$(get_latest_version)
+    
+    local download_url="https://github.com/XTLS/Xray-core/releases/download/v${version}/Xray-linux-${arch}.zip"
+    local zip_file="$TMP_DIR/xray.zip"
+    
+    info "正在从 GitHub 下载 Xray v${version} (${arch})..."
+    if ! curl -L -fsSL "$download_url" -o "$zip_file"; then
+        error "从 GitHub 下载 Xray 失败，请检查网络连接。"
+        return 1
+    fi
+    
+    info "正在解压..."
+    mkdir -p "$TMP_DIR/extracted"
+    if ! unzip -qo "$zip_file" -d "$TMP_DIR/extracted"; then
+        error "解压 Xray 压缩包失败，请确保系统已安装 unzip。"
+        return 1
+    fi
+    
+    mkdir -p "$(dirname "$XRAY_BINARY")"
+    rm -f "$XRAY_BINARY"
+    cp -f "$TMP_DIR/extracted/xray" "$XRAY_BINARY"
+    chmod +x "$XRAY_BINARY"
+    
+    mkdir -p "/usr/local/share/${SERVICE_NAME}"
+    cp -f "$TMP_DIR/extracted/geoip.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
+    cp -f "$TMP_DIR/extracted/geosite.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
+}
+
+# ================== 配置 Systemd 服务 ==================
+setup_systemd_service() {
+    info "配置 Systemd 服务 [${SERVICE_NAME}]..."
+    
+    cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
-Description=Tun2Socks Tunnel Service
-After=network.target
+Description=Xray Socks5 Server Service
+Documentation=https://github.com/XTLS/Xray-core
+After=network.target nss-lookup.target
 
 [Service]
-Type=simple
-ExecStart=$BINARY_PATH $CONFIG_FILE
-ExecStartPost=/bin/sleep 1
-ExecStartPost=/sbin/ip rule add fwmark 438 lookup main pref 10
-ExecStartPost=/sbin/ip -6 rule add fwmark 438 lookup main pref 10
-ExecStartPost=/sbin/ip route add default dev tun0 table 20
-ExecStartPost=/sbin/ip rule add lookup 20 pref 20
-${RULE_ADD_V4}
-${RULE_ADD_V6}
-ExecStartPost=/sbin/ip rule add to 127.0.0.0/8 lookup main pref 16
-ExecStartPost=/sbin/ip rule add to 10.0.0.0/8 lookup main pref 16
-ExecStartPost=/sbin/ip rule add to 172.16.0.0/12 lookup main pref 16
-ExecStartPost=/sbin/ip rule add to 192.168.0.0/16 lookup main pref 16
-
-ExecStop=/sbin/ip rule del fwmark 438 lookup main pref 10
-ExecStop=/sbin/ip -6 rule del fwmark 438 lookup main pref 10
-ExecStop=/sbin/ip route del default dev tun0 table 20
-ExecStop=/sbin/ip rule del lookup 20 pref 20
-${RULE_DEL_V4}
-${RULE_DEL_V6}
-ExecStop=/sbin/ip rule del to 127.0.0.0/8 lookup main pref 16
-ExecStop=/sbin/ip rule del to 10.0.0.0/8 lookup main pref 16
-ExecStop=/sbin/ip rule del to 172.16.0.0/12 lookup main pref 16
-ExecStop=/sbin/ip rule del to 192.168.0.0/16 lookup main pref 16
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=${XRAY_BINARY} run -config ${XRAY_CONFIG}
 Restart=on-failure
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable tun2socks.service 2>/dev/null
+    systemctl enable "${SERVICE_NAME}" 2>/dev/null || true
 }
 
-# 自动读取并修改配置
-modify_config() {
-    if [ ! -f "$CONFIG_FILE" ]; then
-        error "配置文件未找到 ($CONFIG_FILE)，请先选择 1 安装。"
+# ================== 获取服务状态与基础参数 ==================
+get_xray_status() {
+    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+        echo -e "${GREEN}● 运行中${RESET}"
+    else
+        echo -e "${RED}● 未运行${RESET}"
+    fi
+}
+
+get_xray_version() {
+    if [[ -x "$XRAY_BINARY" ]]; then
+        "$XRAY_BINARY" version 2>/dev/null \
+            | grep -i "Xray" \
+            | head -n 1 \
+            | awk '{print $2}' || echo "未知"
+    else
+        echo "未安装"
+    fi
+}
+
+get_listen_ip() {
+    if sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null | grep -q '= 1'; then
+        echo "0.0.0.0"
+    else
+        echo "::"
+    fi
+}
+
+test_config() {
+    if "$XRAY_BINARY" run -test -config "$XRAY_CONFIG" >/dev/null 2>&1; then
+        info "Configuration OK"
+        return 0
+    fi
+    error "配置测试失败"
+    return 1
+}
+
+restart_xray() {
+    systemctl restart "${SERVICE_NAME}" 2>/dev/null || true
+    sleep 1
+
+    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+        info "${SERVICE_NAME} 启动成功"
+        return 0
+    fi
+
+    error "${SERVICE_NAME} 启动失败"
+    journalctl -u "${SERVICE_NAME}" -n 20 --no-pager || true
+    return 1
+}
+
+# ================== 写底层配置 ==================
+write_config() {
+    local port="$1"
+    local user="$2"
+    local pass="$3"
+    
+    local listen_ip
+    listen_ip=$(get_listen_ip)
+
+    mkdir -p "$(dirname "$XRAY_CONFIG")"
+
+    local settings_json
+    if [[ -n "$user" && -n "$pass" ]]; then
+        settings_json=$(jq -n --arg u "$user" --arg p "$pass" '{"auth": "password", "accounts": [{"user": $u, "pass": $p}], "udp": true}')
+    else
+        settings_json=$(jq -n '{"auth": "noauth", "udp": true}')
+    fi
+
+    jq -n \
+        --arg listen "${listen_ip}" \
+        --argjson port "${port}" \
+        --argjson settings "${settings_json}" \
+    '{
+      "log": {"loglevel": "warning"},
+      "inbounds": [{
+        "listen": $listen,
+        "port": $port,
+        "protocol": "socks",
+        "settings": $settings,
+        "sniffing": {
+          "enabled": true,
+          "destOverride": ["http", "tls", "quic"]
+        }
+      }],
+      "outbounds": [{
+        "protocol": "freedom",
+        "settings": {
+          "domainStrategy": "UseIPv4v6"
+        }
+      }]
+    }' > "$XRAY_CONFIG"
+
+    chmod 644 "$XRAY_CONFIG"
+}
+
+# ================== 生成分享链接 (已集成 socks 链接与 tlink) ==================
+generate_link() {
+    mkdir -p "$(dirname "$LINK_FILE")"
+    local ip
+    if ! ip=$(get_public_ip); then
+        error "获取公网 IP 失败"
         return 1
     fi
 
-    step "正在读取当前配置..."
-    local current_address=$(grep -oP '^\s*address:\s*'\''?\K[^'\''\s]+' "$CONFIG_FILE" | head -n 1)
-    local current_port=$(grep -oP '^\s*port:\s*\K[0-9]+' "$CONFIG_FILE" | head -n 1)
-    local current_username=$(grep -oP '^\s*username:\s*'\''?\K[^'\''\s]+' "$CONFIG_FILE" | head -n 1)
-    local current_password=$(grep -oP '^\s*password:\s*'\''?\K[^'\''\s]+' "$CONFIG_FILE" | head -n 1)
+    local port user pass
+    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "1080")
+    
+    local auth_type
+    auth_type=$(jq -r '.inbounds[0].settings.auth' "$XRAY_CONFIG" 2>/dev/null || echo "noauth")
 
-    echo -e "${CYAN}------------------------------------------------${NC}"
-    echo -e "提示: 直接按 ${YELLOW}回车 (Enter)${NC} 将保持当前默认值"
-    echo -e "${CYAN}------------------------------------------------${NC}"
+    if [[ "$auth_type" == "password" ]]; then
+        user=$(jq -r '.inbounds[0].settings.accounts[0].user' "$XRAY_CONFIG" 2>/dev/null || echo "")
+        pass=$(jq -r '.inbounds[0].settings.accounts[0].pass' "$XRAY_CONFIG" 2>/dev/null || echo "")
+    else
+        user=""
+        pass=""
+    fi
 
-    local address
-    read -r -p "Socks5 服务器地址 [$current_address]: " address
-    [ -z "$address" ] && address=$current_address
+    local display_ip="$ip"
+    [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
 
-    local port
+    # 对 Telegram 链接的组件进行 URL 编码以防有特殊字符
+    local enc_ip enc_user enc_pass
+    enc_ip=$(url_encode "$ip")
+    enc_user=$(url_encode "$user")
+    enc_pass=$(url_encode "$pass")
+
+    {
+        if [[ -n "$user" && -n "$pass" ]]; then
+            echo "socks://${user}:${pass}@${display_ip}:${port}"
+            echo "https://t.me/socks?server=${enc_ip}&port=${port}&user=${enc_user}&pass=${enc_pass}"
+        else
+            echo "socks://${display_ip}:${port}"
+            echo "https://t.me/socks?server=${enc_ip}&port=${port}"
+        fi
+    } > "$LINK_FILE"
+}
+
+# ================== 显示配置 (已美化并整合输出) ==================
+show_current_config() {
+    if [[ ! -f "$XRAY_CONFIG" ]]; then
+        error "配置文件不存在"
+        return
+    fi
+
+    local ip port auth_type user pass
+    ip=$(get_public_ip || echo "未知")
+    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
+    auth_type=$(jq -r '.inbounds[0].settings.auth' "$XRAY_CONFIG" 2>/dev/null || echo "noauth")
+
+    echo -e "${GREEN}====== Xray Socks5 服务端配置 ======${RESET}"
+    echo -e "${YELLOW}服务器公网 IP   : ${ip}${RESET}"
+    echo -e "${YELLOW}服务监听端口    : ${port}${RESET}"
+    
+    if [[ "$auth_type" == "password" ]]; then
+        user=$(jq -r '.inbounds[0].settings.accounts[0].user' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
+        pass=$(jq -r '.inbounds[0].settings.accounts[0].pass' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
+        echo -e "${YELLOW}认证方式        : 密码认证 (Password)${RESET}"
+        echo -e "${YELLOW}用户名          : ${user}${RESET}"
+        echo -e "${YELLOW}密码            : ${pass}${RESET}"
+    else
+        echo -e "${YELLOW}认证方式        : 免密认证 (NoAuth)${RESET}"
+    fi
+
+    if [[ -f "$LINK_FILE" ]]; then
+        local display_ip="$ip"
+        [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
+
+        local enc_ip enc_user enc_pass
+        enc_ip=$(url_encode "$ip")
+        enc_user=$(url_encode "$user")
+        enc_pass=$(url_encode "$pass")
+
+        echo -e "${GREEN}====== Socks5 配置 (已存至 $LINK_FILE) ======${RESET}"
+        if [[ "$auth_type" == "password" ]]; then
+            echo -e "${YELLOW}● 客户端直连格式:${RESET} socks://${user}:${pass}@${display_ip}:${port}"
+            echo -e "${YELLOW}● Telegram 快捷链接:${RESET} https://t.me/socks?server=${enc_ip}&port=${port}&user=${enc_user}&pass=${enc_pass}"
+        else
+            echo -e "${YELLOW}● 客户端直连格式:${RESET} socks://${display_ip}:${port}"
+            echo -e "${YELLOW}● Telegram快捷链接:${RESET} https://t.me/socks?server=${enc_ip}&port=${port}"
+        fi
+    fi
+    echo
+}
+
+# ================== 核心交互配置处理 ==================
+configure_xray() {
+    info "开始配置 Socks5 服务端节点..."
+    local port user pass
+
     while true; do
-        read -r -p "Socks5 服务器端口 [$current_port]: " port
-        [ -z "$port" ] && port=$current_port
-        if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+        read -rp "请输入监听端口 (直接回车随机分配端口): " input_port
+        if [[ -z "$input_port" ]]; then
+            port=$(get_random_port)
+            info "已为您随机分配未被占用端口: $port"
+            break
+        elif is_valid_port "$input_port"; then
+            if ! check_port "$input_port"; then
+                error "端口 ${input_port} 已被占用，请重新输入。"
+                continue
+            fi
+            port="$input_port"
             break
         else
-            error "无效的端口号，请输入 1 到 65535 之间的数字。"
+            error "端口无效"
         fi
     done
 
-    local username
-    read -r -p "Socks5 用户名 (可选) [$current_username]: " username
-    [ -z "$username" ] && username=$current_username
-
-    local password
-    read -r -p "Socks5 密码 (可选) [$current_password]: " password
-    [ -z "$password" ] && password=$current_password
-
-    # 如果服务存在，先停止
-    if [ -f "$SERVICE_FILE" ]; then
-        systemctl stop tun2socks.service 2>/dev/null || true
+    # 1. 独立处理账号生成
+    read -rp "请输入 Socks5 用户名 (直接回车自动随机生成): " input_user
+    if [[ -z "$input_user" ]]; then
+        user=$(generate_random_string 8)
+        info "已自动生成随机账号：${user}"
+    else
+        user="$input_user"
     fi
 
-    # 写入配置
-    cat > "$CONFIG_FILE" <<EOF
-tunnel:
-  name: tun0
-  mtu: 8500
-  multi-queue: true
-  ipv4: 198.18.0.1
+    # 2. 独立处理密码生成
+    read -rp "请输入 Socks5 密码 (直接回车自动随机生成): " input_pass
+    if [[ -z "$input_pass" ]]; then
+        pass=$(generate_random_string 12)
+        info "已自动生成高强度密码：${pass}"
+    else
+        pass="$input_pass"
+    fi
 
-socks5:
-  port: $port
-  address: '$address'
-  udp: 'udp'
-$( [ -n "$username" ] && echo "  username: '$username'" )
-$( [ -n "$password" ] && echo "  password: '$password'" )
-  mark: 438
-EOF
+    write_config "$port" "$user" "$pass"
+    test_config || return 1
+    generate_link
+    restart_xray
+    show_current_config
+}
 
-    # 如果服务文件存在，顺便重启服务
-    if [ -f "$SERVICE_FILE" ]; then
-        step "正在重启 tun2socks 服务..."
-        systemctl restart tun2socks.service 2>/dev/null || systemctl start tun2socks.service
-        success "配置修改成功并已应用！"
+# ================== 安装 ==================
+install_xray() {
+    info "开始安装 Xray 核心依赖..."
+    download_and_extract_xray || return 1
+    setup_systemd_service
+    configure_xray
+    info "安装完成并已成功启动服务: ${SERVICE_NAME}"
+}
+
+# ================== 更新 ==================
+update_xray() {
+    info "开始更新 Xray 程序..."
+    
+    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+        info "检测到服务正在运行，正在停止服务以进行更新..."
+        systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+    fi
+
+    if ! download_and_extract_xray; then
+        error "下载或安装新版本失败，尝试重新启动原服务..."
+        restart_xray
+        return 1
+    fi
+    
+    if restart_xray; then
+        generate_link
+        info "最新版更新并启动成功！当前版本: $(get_xray_version)"
+    else
+        error "更新后服务启动失败，请查看日志。"
+        return 1
     fi
 }
 
-uninstall_tun2socks() {
-    cleanup_ip_rules
-    step "正在停止并禁用 tun2socks 服务..."
-    systemctl stop tun2socks.service 2>/dev/null || true
-    systemctl disable tun2socks.service 2>/dev/null || true
-
-    step "正在移除相关文件..."
-    rm -f "$SERVICE_FILE"
-    rm -rf "/etc/tun2socks"
-    rm -f "$BINARY_PATH"
-    systemctl daemon-reload
-    systemctl reset-failed tun2socks.service &>/dev/null || true
-    success "卸载完成。"
-}
-
-install_tun2socks() {
-    if [ -f "$BINARY_PATH" ] && [ -f "$SERVICE_FILE" ]; then
-        warning "检测到已经安装过 tun2socks。"
-        read -r -p "是否覆盖安装？(y/N): " re_inst
-        if [[ ! "$re_inst" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-            info "已取消安装。"
-            return 0
-        fi
-    fi
-
-    cleanup_ip_rules
-    
-    # 1. 下载核心二进制文件
-    step "正在获取 tun2socks 最新内核..."
-    mkdir -p "/etc/tun2socks"
-    local REPO="heiher/hev-socks5-tunnel"
-    local DOWNLOAD_URL=""
-    
-    # 尝试直接通过常规网络获取
-    DOWNLOAD_URL=$(curl -s --connect-timeout 5 https://api.github.com/repos/$REPO/releases/latest | grep "browser_download_url" | grep "linux-x86_64" | cut -d '"' -f 4)
-    
-    # 如果常规网络失败（纯 v6 环境无法直接请求 GitHub v4 地址），切换 DNS64 试错法
-    if [ -z "$DOWNLOAD_URL" ]; then
-        warning "常规连接失败，检测到可能处于纯 IPv6 环境，正在尝试轮询 DNS64 备用服务器..."
-        for dns64 in "${ALTERNATE_DNS64_SERVERS[@]}"; do
-            info "尝试通过 DNS64 [$dns64] 获取资源..."
-            DOWNLOAD_URL=$(curl -s --connect-timeout 5 --dns-servers "$dns64" https://api.github.com/repos/$REPO/releases/latest | grep "browser_download_url" | grep "linux-x86_64" | cut -d '"' -f 4)
-            if [ -n "$DOWNLOAD_URL" ]; then
-                success "成功通过 DNS64 服务器 [$dns64] 获取到下载链接。"
-                # 记录当前有效的 dns64 服务供后续下载使用
-                local active_dns64="$dns64"
-                break
-            fi
-        done
-    fi
-
-    if [ -z "$DOWNLOAD_URL" ]; then
-        error "无法获取下载链接。请检查网络或确认 DNS64 备用服务器是否可用。"
+# ================== 修改配置 ==================
+modify_config() {
+    if [[ ! -f "$XRAY_CONFIG" ]]; then
+        error "配置文件不存在"
         return 1
     fi
 
-    info "开始下载: $DOWNLOAD_URL"
+    local old_port old_auth old_user old_pass
+    old_port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "1080")
+    old_auth=$(jq -r '.inbounds[0].settings.auth' "$XRAY_CONFIG" 2>/dev/null || echo "noauth")
     
-    # 根据是否使用了 DNS64 决定 curl 的参数
-    if [ -n "$active_dns64" ]; then
-        if ! curl -L --dns-servers "$active_dns64" -o "$BINARY_PATH" "$DOWNLOAD_URL"; then
-            error "通过 DNS64 下载核心文件失败。"
-            return 1
-        fi
+    if [[ "$old_auth" == "password" ]]; then
+        old_user=$(jq -r '.inbounds[0].settings.accounts[0].user' "$XRAY_CONFIG" 2>/dev/null || echo "")
+        old_pass=$(jq -r '.inbounds[0].settings.accounts[0].pass' "$XRAY_CONFIG" 2>/dev/null || echo "")
     else
-        if ! curl -L -o "$BINARY_PATH" "$DOWNLOAD_URL"; then
-            error "下载核心文件失败，请检查网络。"
-            return 1
+        old_user=""
+        old_pass=""
+    fi
+
+    local port user pass
+
+    while true; do
+        read -rp "请输入新端口 [当前:${old_port}, 回车不修改]: " input_port
+        if [[ -z "$input_port" ]]; then
+            port="$old_port"
+            break
+        elif [[ "${input_port,,}" == "rand" ]]; then
+            port=$(get_random_port)
+            info "已重分配空闲随机端口: $port"
+            break
+        elif is_valid_port "$input_port"; then
+            if [[ "$input_port" != "$old_port" ]]; then
+                if ! check_port "$input_port"; then
+                    error "端口 ${input_port} 已被占用，请更换。"
+                    continue
+                fi
+            fi
+            port="$input_port"
+            break
+        else
+            error "端口无效，请输入 1-65535 之间的数字。"
         fi
+    done
+
+    # 3. 在配置修改阶段也进行彻底分离
+    read -rp "请输入新用户名 [当前:${old_user}, 回车不修改]: " input_user
+    if [[ -z "$input_user" ]]; then
+        user="$old_user"
+    elif [[ "${input_user,,}" == "rand" ]]; then
+        user=$(generate_random_string 8)
+        info "已重新生成随机账号：${user}"
+    else
+        user="$input_user"
     fi
-    chmod +x "$BINARY_PATH"
 
-    # 2. 初始化一个默认配置文件（供随后的修改逻辑读取默认值）
-    if [ ! -f "$CONFIG_FILE" ]; then
-        cat > "$CONFIG_FILE" <<EOF
-tunnel:
-  name: tun0
-socks5:
-  port: 1080
-  address: '127.0.0.1'
-EOF
+    read -rp "请输入新密码 [当前:${old_pass}, 回车不修改]: " input_pass
+    if [[ -z "$input_pass" ]]; then
+        pass="$old_pass"
+    elif [[ "${input_pass,,}" == "rand" ]]; then
+        pass=$(generate_random_string 12)
+        info "已重新生成高强度密码：${pass}"
+    else
+        pass="$input_pass"
     fi
 
-    # 3. 引导用户输入节点数据并写入 config.yaml
-    modify_config
+    cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
 
-    # 4. 先生成服务环境，再启动，防止出现 Unit not found
-    step "正在构建系统服务环境..."
-    generate_service_file
-
-    step "正在启动 tun2socks 服务..."
-    systemctl start tun2socks.service
-    success "tun2socks 安装且启动成功！"
+    write_config "$port" "$user" "$pass"
+    test_config || return 1
+    generate_link
+    restart_xray
+    info "配置修改成功"
 }
 
-#================================================================================
-# 交互式面板渲染
-#================================================================================
+# ================== 卸载 ==================
+uninstall_xray() {
+    warn "即将卸载 ${SERVICE_NAME} 服务..."
+
+    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+    systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
+    
+    rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+    systemctl daemon-reload
+    
+    rm -f "$XRAY_BINARY"
+    rm -rf "/usr/local/etc/${SERVICE_NAME}"
+    rm -rf "/usr/local/share/${SERVICE_NAME}"
+    rm -f "$LINK_FILE"
+    rm -rf /root/proxynode/socks5
+    
+    info "服务已完全卸载并清理残留。"
+}
+
+# ================== 菜单 ==================
 show_menu() {
     clear
-    # 1. 动态获取状态
-    if [ -f "$SERVICE_FILE" ] && systemctl is-active --quiet tun2socks.service; then
-        status_line="${GREEN}正在运行${NC}"
-    else
-        status_line="${RED}未运行${NC}"
+    local status version port_show
+    status=$(get_xray_status)
+    version=$(get_xray_version)
+    port_show="-"
+
+    if [[ -f "$XRAY_CONFIG" ]]; then
+        port_show=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "-")
     fi
 
-    # 2. 动态获取配置
-    if [ -f "$CONFIG_FILE" ]; then
-        bind=$(grep -oP '^\s*address:\s*'\''?\K[^'\''\s]+' "$CONFIG_FILE" | head -n 1)
-        port=$(grep -oP '^\s*port:\s*\K[0-9]+' "$CONFIG_FILE" | head -n 1)
-        mode_val=$(grep -oP '^\s*name:\s*\K\w+' "$CONFIG_FILE" | head -n 1)
-        [ -z "$mode_val" ] && mode_val="tun0"
-    else
-        bind="None"
-        port="None"
-        mode_val="None"
-    fi
-
-    echo -e "${GREEN}================================${NC}"
-    echo -e "${GREEN}       tun2socks 管理面板        ${NC}"
-    echo -e "${GREEN}================================${NC}"
-    echo -e "${GREEN}状态   :${NC} ${status_line}"
-    echo -e "${GREEN}模式   :${NC} ${YELLOW}$mode_val${NC}"
-    echo -e "${GREEN}监听   :${NC} ${YELLOW}${bind}:${port}${NC}"
-    echo -e "${GREEN}================================${NC}"
-    echo -e "${GREEN} 1. 安装 tun2socks${NC}"
-    echo -e "${GREEN} 2. 修改 节点配置${NC}"
-    echo -e "${GREEN} 3. 卸载 tun2socks${NC}"
-    echo -e "${GREEN} 4. 启动 tun2socks${NC}"
-    echo -e "${GREEN} 5. 停止 tun2socks${NC}"
-    echo -e "${GREEN} 6. 重启 tun2socks${NC}"
-    echo -e "${GREEN} 7. 查看服务日志${NC}"
-    echo -e "${GREEN} 0. 退出${NC}"
-    echo -e "${GREEN}================================${NC}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}        Xray Socks5 面板        ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $status"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN} 1. 安装 Xray Socks5${RESET}"
+    echo -e "${GREEN} 2. 更新 Xray Socks5${RESET}"
+    echo -e "${GREEN} 3. 卸载 Xray Socks5${RESET}"
+    echo -e "${GREEN} 4. 修改配置${RESET}"
+    echo -e "${GREEN} 5. 启动 Xray Socks5${RESET}"
+    echo -e "${GREEN} 6. 停止 Xray Socks5${RESET}"
+    echo -e "${GREEN} 7. 重启 Xray Socks5${RESET}"
+    echo -e "${GREEN} 8. 查看日志${RESET}"
+    echo -e "${GREEN} 9. 查看节点配置${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-#================================================================================
-# 主循环逻辑
-#================================================================================
+# ================== 安装依赖 ==================
+install_dependencies() {
+    if command -v apt &>/dev/null; then
+        apt update && apt install -y jq curl wget sed coreutils unzip iproute2 openssl || true
+    elif command -v dnf &>/dev/null; then
+        dnf install -y jq curl wget sed coreutils unzip iproute2 openssl
+    elif command -v yum &>/dev/null; then
+        yum install -y jq curl wget sed coreutils unzip iproute2 openssl
+    else
+        error "未知的包管理器，请手动补充环境包: jq, curl, wget, unzip, openssl"
+        exit 1
+    fi
+}
+
+# ================== 依赖检查 ==================
+pre_check() {
+    if [[ $(id -u) -ne 0 ]]; then
+        error "请使用 root 用户运行"
+        exit 1
+    fi
+
+    local deps=(jq curl wget unzip ss awk sed openssl)
+    local missing=0
+
+    for cmd in "${deps[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing=1
+            break
+        fi
+    done
+
+    if [[ "$missing" -eq 1 ]]; then
+        info "检测到缺失依赖，正在安装..."
+        install_dependencies
+    fi
+}
+
+# ================== 主循环 ==================
 main() {
-    require_root
-    
+    pre_check
+
     while true; do
         show_menu
-        read -r -p "请选择操作: " choice
+        
+        local choice=""
+        read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+        
+        [[ -z "$choice" ]] && continue
+
         case "$choice" in
-            1)
-                install_tun2socks
-                ;;
-            2)
-                modify_config
-                ;;
-            3)
-                uninstall_tun2socks
-                ;;
-            4)
-                step "正在启动服务..."
-                if [ -f "$SERVICE_FILE" ]; then
-                    systemctl start tun2socks.service && success "启动成功。" || error "启动失败。"
-                else
-                    error "服务未安装，请先选择 1。"
-                fi
-                ;;
-            5)
-                step "正在停止服务..."
-                if [ -f "$SERVICE_FILE" ]; then
-                    systemctl stop tun2socks.service && success "停止成功。" || error "停止失败。"
-                else
-                    error "服务未安装。"
-                fi
-                ;;
-            6)
-                step "正在重启服务..."
-                if [ -f "$SERVICE_FILE" ]; then
-                    systemctl restart tun2socks.service && success "重启成功。" || error "重启失败。"
-                else
-                    error "服务未安装。"
-                fi
-                ;;
-            7)
-                if [ -f "$SERVICE_FILE" ]; then
-                    step "显示最近20条服务日志 (按 q 退出)："
-                    journalctl -u tun2socks.service -n 20 --no-pager
-                else
-                    error "没有日志，服务尚未安装。"
-                fi
-                ;;
-            0)
-                exit 0
-                ;;
-            *)
-                error "无效选项，请重新输入。"
-                ;;
+            1) install_xray; pause ;;
+            2) update_xray; pause ;;
+            3) uninstall_xray; pause ;;
+            4) modify_config; pause ;;
+            5) systemctl start "${SERVICE_NAME}" &>/dev/null || true; restart_xray; pause ;;
+            6) systemctl stop "${SERVICE_NAME}" &>/dev/null || true; info "服务已停止"; pause ;;
+            7) restart_xray; pause ;;
+            8) journalctl -u "${SERVICE_NAME}" -e --no-pager || true; pause ;;
+            9) show_current_config; pause ;;
+            0) exit 0 ;;
+            *) error "无效输入"; pause ;;
         esac
-        echo
-        read -r -p "按回车键返回主菜单..."
     done
 }
 
-# 脚本入口点
 main "$@"

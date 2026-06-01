@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# sing-box (VLESS+WS+TLS) 核心控制面板
+# sing-box (VLESS+WS+TLS) 核心控制面板 [Alpine Linux ]
 # SPDX-License-Identifier: MIT
 #
 # =========================================================
@@ -14,7 +14,7 @@ readonly SB_CONFIG="/etc/singbox-vless-ws/config.json"
 readonly SB_BINARY="/usr/local/bin/sing-box"
 readonly SB_DIR="/root/proxynode/VlessWS"
 EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
-SYSTEMD_SERVICES_DIR="/etc/systemd/system"
+OPENRC_SERVICES_DIR="/etc/init.d"
 CONFIG_DIR="/etc/singbox-vless-ws"
 REPO_URL="https://github.com/SagerNet/sing-box"
 API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
@@ -62,16 +62,16 @@ generate_uuid() {
   elif [[ -f /proc/sys/kernel/random/uuid ]]; then
     cat /proc/sys/kernel/random/uuid
   else
-    cat /dev/urandom | head -n 50 | md5sum | head -c 32 | sed -r 's/([0-9a-f]{8})([0-9a-f]{4})([0-9a-f]{4})([0-9a-f]{4})([0-9a-f]{12})/\1-\2-\3-\4-\5/'
+    # 兼容 Alpine 下没有 md5sum 或语法差异，使用 od/hexdump 替代
+    cat /dev/urandom | head -c 16 | hexdump -e '8/1 "%02x" "-" 4/1 "%02x" "-" 4/1 "%02x" "-" 4/1 "%02x" "-" 12/1 "%02x" "\n"' | head -n 1
   fi
 }
 
-systemctl() {
-  if ! has_command systemctl; then
-    warn "当前系统不支持 systemd，忽略守护进程操作: systemctl $*"
+rc_service() {
+  if ! has_command rc-service; then
     return 0
   fi
-  command systemctl "$@"
+  command rc-service "$@"
 }
 
 install_content() {
@@ -101,9 +101,6 @@ remove_file() {
 
 detect_package_manager() {
   [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
-  has_command apt && PACKAGE_MANAGEMENT_INSTALL='apt -y --no-install-recommends install' && return 0
-  has_command dnf && PACKAGE_MANAGEMENT_INSTALL='dnf -y install' && return 0
-  has_command yum && PACKAGE_MANAGEMENT_INSTALL='yum -y install' && return 0
   has_command apk && PACKAGE_MANAGEMENT_INSTALL='apk add --no-cache' && return 0
   return 1
 }
@@ -142,6 +139,8 @@ check_environment() {
     *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
   esac
 
+  # 确保 Alpine 环境必要的依赖组件完整
+  has_command bash || install_software bash
   has_command curl || install_software curl
   has_command grep || install_software grep
   has_command jq || install_software jq
@@ -192,27 +191,22 @@ download_singbox() {
   return 0
 }
 
-tpl_singbox_server_service_base() {
-  local _config_name="$1"
-  cat << EOF
-[Unit]
-Description=sing-box Server Service (${_config_name}.json)
-After=network.target nss-lookup.target
+# Alpine OpenRC 服务脚本模板
+tpl_singbox_openrc_service() {
+  cat << 'EOF'
+#!/sbin/openrc-run
 
-[Service]
-Type=simple
-ExecStart=$EXECUTABLE_INSTALL_PATH run --config ${CONFIG_DIR}/${_config_name}.json
-WorkingDirectory=$SINGBOX_HOME_DIR
-User=$SINGBOX_USER
-Group=$SINGBOX_USER
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-NoNewPrivileges=true
-Restart=on-failure
-RestartSec=10s
+description="sing-box Server Service"
+pidfile="/run/singbox-vless-ws.pid"
+command="/usr/local/bin/sing-box"
+command_args="run --config /etc/singbox-vless-ws/config.json"
+command_background="true"
+start_stop_daemon_args="--user sing-box:sing-box"
 
-[Install]
-WantedBy=multi-user.target
+depend() {
+    need net
+    after firewall
+}
 EOF
 }
 
@@ -236,8 +230,11 @@ get_public_ip() {
 
 check_port() {
   local port="$1"
-  if ss -tunlp 2>/dev/null | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
-    return 1
+  # 适配 Alpine/Busybox 的 netstat / ss 语法差异
+  if has_command ss; then
+    ss -tunlp 2>/dev/null | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port" && return 1
+  else
+    netstat -tunlp 2>/dev/null | grep -w tcp | awk '{print $4}' | sed 's/.*://g' | grep -q -w "$port" && return 1
   fi
   return 0
 }
@@ -247,7 +244,8 @@ is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 6553
 get_random_port() {
   local rand_port
   while true; do
-    rand_port=$(shuf -i 2000-65535 -n 1)
+    # Alpine Busybox 没有 shuf 命令，用 awk 替代随机数生成
+    rand_port=$(awk 'BEGIN{srand(); print int(rand()*(65535-2000+1))+2000}')
     if check_port "$rand_port"; then
       echo "$rand_port" && return 0
     fi
@@ -255,7 +253,7 @@ get_random_port() {
 }
 
 get_sb_status() {
-  if has_command systemctl && systemctl is-active --quiet singbox-vless-ws 2>/dev/null; then
+  if has_command rc-service && rc-service singbox-vless-ws status 2>/dev/null | grep -q "started"; then
     echo -e "${GREEN}● 运行中${RESET}"
   else
     if pgrep -f "$EXECUTABLE_INSTALL_PATH run" >/dev/null 2>&1; then
@@ -275,14 +273,13 @@ get_current_port_display() {
 }
 
 restart_singbox_service() {
-  if has_command systemctl; then
-    systemctl daemon-reload
-    systemctl enable singbox-vless-ws >/dev/null 2>&1 || true
-    systemctl restart singbox-vless-ws >/dev/null 2>&1 || true
-    systemctl is-active --quiet singbox-vless-ws 2>/dev/null
+  if has_command rc-service && [[ -f "$OPENRC_SERVICES_DIR/singbox-vless-ws" ]]; then
+    rc-service singbox-vless-ws restart >/dev/null 2>&1 || true
+    rc-service singbox-vless-ws status 2>/dev/null | grep -q "started"
   else
     pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-    "$EXECUTABLE_INSTALL_PATH" run --config "$SB_CONFIG" >/dev/null 2>&1 &
+    # 采用 Alpine 极简后台运行沙箱用户
+    su -s /bin/bash -c "$EXECUTABLE_INSTALL_PATH run --config $SB_CONFIG >/dev/null 2>&1 &" sing-box
     return 0
   fi
 }
@@ -306,7 +303,8 @@ inst_cert() {
   key_path="/etc/singbox-vless-ws/privkey.pem"
 
   if [[ $certInput == 1 ]]; then
-    if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
+    # 检测 80 端口冲突
+    if check_port "80" -eq 0; then
       warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。请确保已暂时关闭 Web 服务。"
     fi
 
@@ -315,9 +313,12 @@ inst_cert() {
     [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
     
     info "正在检查并安装 Acme.sh 依赖..."
+    # Alpine 环境 acme.sh 依赖 socat
+    has_command socat || install_software socat
+
     local acme_cmd="/root/.acme.sh/acme.sh"
     if [[ ! -f "$acme_cmd" ]]; then
-      curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
+      curl https://get.acme.sh | sh -s email=$(date +%s%N 2>/dev/null || date +%s)@gmail.com
     fi
     
     "$acme_cmd" --set-default-ca --server letsencrypt
@@ -392,7 +393,6 @@ configure_custom_socks5_outbound() {
     fi
 
     local mode current_type tmp_file
-    # 提取当前首个出口的协议类型
     current_type=$(jq -r '.outbounds[0].type // "direct"' "$SB_CONFIG" 2>/dev/null || echo "direct")
 
     echo "---------------------------------------------"
@@ -411,7 +411,6 @@ configure_custom_socks5_outbound() {
     case "$mode" in
         1)
             tmp_file=$(mktemp)
-            # 修改为符合 sing-box 规范的 direct 路由出口
             jq '.outbounds = [{"type": "direct", "tag": "direct"}]' "$SB_CONFIG" > "$tmp_file"
             if ! jq empty "$tmp_file" >/dev/null 2>&1; then
                 rm -f "$tmp_file"
@@ -443,7 +442,6 @@ configure_custom_socks5_outbound() {
     esac
 
     info "配置自定义 Socks5 出口代理..."
-
     local socks_host socks_port socks_user socks_pass
 
     read -rp "请输入 Socks5 服务器地址/IP: " socks_host || true
@@ -469,39 +467,18 @@ configure_custom_socks5_outbound() {
 
     tmp_file=$(mktemp)
 
-    # 构造符合 sing-box 规范的 Socks 出口配置架构
     if [[ -n "$socks_user" ]]; then
         jq \
             --arg host "$socks_host" \
             --argjson port "$socks_port" \
             --arg user "$socks_user" \
             --arg pass "$socks_pass" \
-            '
-            .outbounds = [
-              {
-                "type": "socks",
-                "tag": "custom-socks5-out",
-                "server": $host,
-                "server_port": $port,
-                "username": $user,
-                "password": $pass
-              }
-            ]
-            ' "$SB_CONFIG" > "$tmp_file"
+            '.outbounds = [ { "type": "socks", "tag": "custom-socks5-out", "server": $host, "server_port": $port, "username": $user, "password": $pass } ]' "$SB_CONFIG" > "$tmp_file"
     else
         jq \
             --arg host "$socks_host" \
             --argjson port "$socks_port" \
-            '
-            .outbounds = [
-              {
-                "type": "socks",
-                "tag": "custom-socks5-out",
-                "server": $host,
-                "server_port": $port
-              }
-            ]
-            ' "$SB_CONFIG" > "$tmp_file"
+            '.outbounds = [ { "type": "socks", "tag": "custom-socks5-out", "server": $host, "server_port": $port } ]' "$SB_CONFIG" > "$tmp_file"
     fi
 
     if ! jq empty "$tmp_file" >/dev/null 2>&1; then
@@ -530,7 +507,6 @@ write_and_show_config() {
     url_ip="[$ip]"
   fi
 
-  # 默认生成直连模式的配置文件结构
   cat << EOF > /etc/singbox-vless-ws/config.json
 {
   "log": {
@@ -594,7 +570,7 @@ EOF
   if restart_singbox_service; then
     info "sing-box (VLESS+WS+TLS) 服务配置并启动成功！"
   else
-    error "sing-box 服务启动失败，请运行监控菜单查看日志。"
+    error "sing-box 服务启动失败，请查看日志。"
   fi
   
   showconf
@@ -633,13 +609,16 @@ instsingbox() {
   SINGBOX_HOME_DIR="/var/lib/sing-box"
   if ! is_user_exists "$SINGBOX_USER"; then
     echo -ne "正在创建系统独立沙箱运行用户 $SINGBOX_USER ... "
-    useradd -r -d "$SINGBOX_HOME_DIR" -m "$SINGBOX_USER" >/dev/null 2>&1 || true
+    # 适配 Alpine/Busybox 的 adduser 语法
+    mkdir -p "$SINGBOX_HOME_DIR"
+    adduser -S -D -h "$SINGBOX_HOME_DIR" -s /sbin/nologin "$SINGBOX_USER" >/dev/null 2>&1 || true
     echo "成功"
   fi
 
-  if has_command systemctl; then
-    install_content -Dm644 "$(tpl_singbox_server_service_base 'config')" "$SYSTEMD_SERVICES_DIR/singbox-vless-ws.service" "1"
-    install_content -Dm644 "$(tpl_singbox_server_service_base '%i')" "$SYSTEMD_SERVICES_DIR/singbox-vless-ws@.service" "1"
+  # 写入 Alpine OpenRC 守护进程配置
+  if has_command rc-update; then
+    install_content -Dm755 "$(tpl_singbox_openrc_service)" "$OPENRC_SERVICES_DIR/singbox-vless-ws" "1"
+    rc-update add singbox-vless-ws default >/dev/null 2>&1 || true
   fi
 
   inst_cert || return 1
@@ -706,12 +685,10 @@ update_singbox() {
 unstsingbox() {
   warn "即将从当前系统中彻底卸载 sing-box"
 
-  if has_command systemctl; then
-    systemctl stop singbox-vless-ws >/dev/null 2>&1 || true
-    systemctl disable singbox-vless-ws >/dev/null 2>&1 || true
-    remove_file "$SYSTEMD_SERVICES_DIR/singbox-vless-ws.service"
-    remove_file "$SYSTEMD_SERVICES_DIR/singbox-vless-ws@.service"
-    systemctl daemon-reload
+  if has_command rc-service && [[ -f "$OPENRC_SERVICES_DIR/singbox-vless-ws" ]]; then
+    rc-service singbox-vless-ws stop >/dev/null 2>&1 || true
+    rc-update del singbox-vless-ws >/dev/null 2>&1 || true
+    remove_file "$OPENRC_SERVICES_DIR/singbox-vless-ws"
   else
     pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
   fi
@@ -800,7 +777,6 @@ showconf() {
   echo -e "${GREEN}[信息] V2rayN 链接：${RESET}"
   echo -e "${YELLOW}vless://${auth_pwd}@${url_ip}:${main_port}?sub=1&sni=${sb_domain}&host=${sb_domain}&security=tls&allowInsecure=${is_insecure}&type=ws&path=$(echo "$ws_path" | sed 's/\//%2F/g')#${hostname}-Vlesswstls${RESET}"
   echo -e "${YELLOW}---------------------------------${RESET}"
-  echo
 }
 
 # =========================================================
@@ -817,7 +793,7 @@ menu() {
     local port_show=$(get_current_port_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    Sing-box VLESS-WS-TLS 面板  ${RESET}"
+    echo -e "${GREEN}   Sing-box VLESS-WS-TLS 面板   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
@@ -846,35 +822,31 @@ menu() {
       3) unstsingbox; pause ;;
       4) changeconf; pause ;;
       5) 
-        if has_command systemctl; then
-          systemctl start singbox-vless-ws && info "服务已成功启动！"
+        if has_command rc-service && [[ -f "$OPENRC_SERVICES_DIR/singbox-vless-ws" ]]; then
+          rc-service singbox-vless-ws start && info "服务已成功启动 (OpenRC)！"
         else
           pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-          "$EXECUTABLE_INSTALL_PATH" run --config "$SB_CONFIG" >/dev/null 2>&1 &
-          info "进程已在后台启动！"
+          su -s /bin/bash -c "$EXECUTABLE_INSTALL_PATH run --config $SB_CONFIG >/dev/null 2>&1 &" sing-box
+          info "进程已在后台独立启动！"
         fi
         pause ;;
       6) 
-        if has_command systemctl; then
-          systemctl stop singbox-vless-ws && info "服务已成功停止！"
+        if has_command rc-service && [[ -f "$OPENRC_SERVICES_DIR/singbox-vless-ws" ]]; then
+          rc-service singbox-vless-ws stop && info "服务已成功停止 (OpenRC)！"
         else
           pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台进程已终止！"
         fi
         pause ;;
       7) 
-        if has_command systemctl; then
-          systemctl restart singbox-vless-ws && info "服务已成功重启！"
-        else
-          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-          "$EXECUTABLE_INSTALL_PATH" run --config "$SB_CONFIG" >/dev/null 2>&1 &
-          info "后台进程已重启！"
-        fi
+        restart_singbox_service && info "服务/进程已重启！"
         pause ;;
       8) 
-        if has_command systemctl; then
-          journalctl -u singbox-vless-ws.service -n 50 --no-pager
+        # Alpine 下通过标准轻量级日志或者本地配置文件中转
+        if [[ -f "$SB_CONFIG" ]]; then
+           echo -e "${CYAN}提示: 当前 sing-box 未设定独立日志文件。如需查看实时终端输出，可手动执行：${RESET}"
+           echo -e "${YELLOW}sing-box run --config $SB_CONFIG${RESET}"
         else
-          warn "当前环境不支持 systemd 集中日志管理。"
+           error "未发现配置文件，无法诊断。"
         fi
         pause ;;
       9) showconf; pause ;;

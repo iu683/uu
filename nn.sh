@@ -3,7 +3,7 @@
 set -eu
 
 # =========================================================
-# Snell v5 + Shadow-TLS v3 一体化独立管理脚本 (Alpine 完美修复版)
+# Snell v5 + Shadow-TLS v3 一体化独立管理脚本 (Alpine )
 # =========================================================
 
 # ================== 颜色与输出函数 ==================
@@ -195,11 +195,10 @@ EOF
     chown snell-tls:snell-tls "${SNELL_DIR}/surge.txt" || true
 }
 
-# ================== OpenRC 服务启动脚本（彻底重构防死锁） ==================
+# ================== OpenRC 服务启动脚本构建 (Alpine专属) ==================
 service() {
     id -u snell-tls >/dev/null 2>&1 || useradd -r -s /sbin/nologin snell-tls || true
 
-    # 构建健壮的 Snell 启动服务脚本
     cat > /etc/init.d/snell-tlss <<'EOF'
 #!/sbin/openrc-run
 
@@ -210,9 +209,6 @@ command_background="yes"
 command_user="snell-tls:snell-tls"
 pidfile="/run/${RC_SVCNAME}.pid"
 
-# 优雅停机兼容处理
-start_stop_daemon_args="--quiet"
-
 depend() {
     need net
     after firewall
@@ -220,11 +216,10 @@ depend() {
 EOF
     chmod +x /etc/init.d/snell-tlss
     rc-update add snell-tlss default || true
-    rc-service snell-tlss restart || true
+    rc-service snell-tlss start || true
 }
 
 service_stls() {
-    # 构建健壮的 Shadow-TLS 启动服务脚本，彻底摒弃 flock 冲突风险
     cat > /etc/init.d/shadowtlsn <<'EOF'
 #!/sbin/openrc-run
 
@@ -232,13 +227,12 @@ description="Shadow TLS Service v3"
 command="/usr/local/bin/stls-integrated-shadow-tlsn"
 pidfile="/run/${RC_SVCNAME}.pid"
 command_background="yes"
-start_stop_daemon_args="--quiet"
 
 start_pre() {
     if [ -f /etc/snell-tls/shadow-tlsn.env ]; then
         . /etc/snell-tls/shadow-tlsn.env
     else
-        eerror "Environment file missing!"
+        eerror "Environment file /etc/snell-tls/shadow-tlsn.env missing!"
         return 1
     fi
     
@@ -253,7 +247,6 @@ depend() {
 EOF
     chmod +x /etc/init.d/shadowtlsn
     rc-update add shadowtlsn default || true
-    rc-service shadowtlsn restart || true
     _info "OpenRC 服务部署自启配置完成！"
 }
 
@@ -437,9 +430,8 @@ execute_configuration_flow() {
 _download_and_install_binary() {
     local sarch=$( _map_arch ) || { _err "不支持的架构"; return 1; }
     
-    # 【核心修复】引入 gcompat 以支持脱壳后的 glibc 动态程序运行
-    _info "正在安装 Alpine 必要系统依赖 (gcompat, upx, unzip, curl, iproute2, openssl, shadow)..."
-    apk add --no-cache gcompat upx unzip curl iproute2 openssl shadow >/dev/null 2>&1
+    _info "正在安装 Alpine 必要系统依赖 (upx, unzip, curl, iproute2, openssl, shadow)..."
+    apk add --no-cache upx unzip curl iproute2 openssl shadow >/dev/null 2>&1
 
     _info "正在获取官方最新稳定版版本号..."
     local version=$( _get_snell_latest_version )
@@ -497,6 +489,7 @@ install_ss() {
     print_node_info
 }
 
+
 # ================== 修改现有配置 ==================
 modify_ss() {
     _info "进入修改配置模块..."
@@ -505,49 +498,36 @@ modify_ss() {
         return
     fi
     
+    _info "正在安全停止现有服务以防死锁..."
+    rc-service shadowtlsn stop >/dev/null 2>&1 || true
+    rc-service snell-tlss stop >/dev/null 2>&1 || true
+    
+    # 仅执行数据交互，不要在里面顺便重启服务
     execute_configuration_flow true
     
-    _info "正在安全平滑重启底层 OpenRC 服务..."
-    rc-service snell-tlss restart || true
-    service_stls
-    rc-service shadowtlsn restart || true
+    _info "正在通过 OpenRC 依赖链平滑安全启动服务..."
+    # 刷新一下自启配置（内部不含 start 指令）
+    # 提示：请确保你把下面 service_stls 里的 rc-service shadowtlsn start || true 删掉，或者直接用本处的流
     
-    _info "核心配置已被覆写，服务重启完毕！"
+    # 直接由 OpenRC 托管拉起，net -> snell-tlss -> shadowtlsn 串行启动
+    rc-service snell-tlss start || true
+    sleep 1 # 给 BusyBox 1秒钟微调释放文件锁
+    rc-service shadowtlsn start || true
+    
+    _info "核心配置已被覆写，服务安全重启完毕！"
     print_node_info
     log "配置已被修改并安全应用"
-}
-
-# ================== 日志查看菜单 (Alpine系统日志适配) ==================
-show_log_menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}===========================================${RESET}"
-        echo -e "${GREEN}             日志查看分类菜单              ${RESET}"
-        echo -e "${GREEN}===========================================${RESET}"
-        _warn "由于 Alpine 默认将 OpenRC 后台标准输出重定向到系统日志，"
-        _warn "若未配置 syslog，请通过进程或管理日志排查。"
-        echo -e "${YELLOW}-------------------------------------------${RESET}"
-        echo -e "${YELLOW}1. 查看脚本系统管理操作日志${RESET}"
-        echo -e "${YELLOW}2. 查看系统默认 /var/log/messages (最新50条)${RESET}"
-        echo -e "${0}. 返回主菜单${RESET}"
-        echo -e "${GREEN}===========================================${RESET}"
-        
-        local sub_choice
-        printf "\033[32m请输入选项: \033[0m"
-        read -r sub_choice || true
-        case $sub_choice in
-            1) [ -f "$LOG_FILE" ] && tail -n 50 "$LOG_FILE" || echo "暂无管理日志"; pause ;;
-            2) [ -f "/var/log/messages" ] && tail -n 50 /var/log/messages | grep -E 'snell|shadow' || echo "无法读取系统消息日志文件"; pause ;;
-            0) break ;;
-            *) _err "无效输入"; sleep 1 ;;
-        esac
-    done
 }
 
 # ================== 更新 ==================
 update_ss() {
     _info "开始更新二进制组件..."
     
+    _info "正在安全停止旧服务..."
+    rc-service shadowtlsn stop >/dev/null 2>&1 || true
+    rc-service snell-tlss stop >/dev/null 2>&1 || true
+    sleep 1
+
     if [ -f "$SNELL_Conf" ]; then
         _download_and_install_binary
     fi
@@ -560,9 +540,11 @@ update_ss() {
         echo "$STLS_VERSION" > "${SNELL_DIR}/stls_version.txt"
     fi
 
-    service_stls
-    rc-service snell-tlss restart || true
-    rc-service shadowtlsn restart || true
+    _info "正在重新拉起全新组件..."
+    rc-service snell-tlss start || true
+    sleep 1
+    rc-service shadowtlsn start || true
+    
     _info "更新执行完毕，服务已安全重启"
     log "更新组件成功"
 }
@@ -598,13 +580,13 @@ show_menu() {
         p_stls=$(awk -F'=' '/^STLS_LISTEN=/{print $2}' "$STLS_Env" 2>/dev/null | awk -F':' '{print $NF}' | tr -d '\r\n' || echo "-")
     fi
     local p_snell="-"
-    if [ -f "$SNELL_Conf" ]Local raw_listen; then
+    if [ -f "$SNELL_Conf" ]; then
         local raw_listen=$(awk -F'= ' '/^listen/{print $2}' "$SNELL_Conf" 2>/dev/null | tr -d ' \t\n' || echo "-")
         p_snell=${raw_listen#*:}
     fi
 
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}         Snell  + Shadow-TLS 面板          ${RESET}"
+    echo -e "${GREEN}        Snell  + Shadow-TLS   面板    ${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     echo -e "${GREEN}服务状态 :${RESET} ${status_snell} | ${status_stls}"
     echo -e "${GREEN}组件版本 :${RESET} ${YELLOW}Snell: v${v_snell}${RESET} | ${YELLOW}Shadow-TLS: ${v_stls}${RESET}"
@@ -619,7 +601,7 @@ show_menu() {
     echo -e "${GREEN}7. 重启 Snell  + Shadow-TLS ${RESET}"
     echo -e "${GREEN}8. 查看运行日志${RESET}"
     echo -e "${GREEN}9. 查看节点配置${RESET}"
-    echo -e "${0}. 退出${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
 }
 
@@ -636,7 +618,7 @@ while true; do
         5) rc-service snell-tlss start || true; rc-service shadowtlsn start || true; _info "服务已启动"; pause ;;
         6) rc-service shadowtlsn stop || true; rc-service snell-tlss stop || true; _info "服务已停止"; pause ;;
         7) rc-service snell-tlss restart || true; rc-service shadowtlsn restart || true; _info "服务已重启"; pause ;;
-        8) show_log_menu ;;
+        8) [ -f "/var/log/messages" ] && tail -n 50 /var/log/messages | grep -E 'snell|shadow' || echo "无法读取系统消息日志文件"; pause ;;
         9) print_node_info; pause ;;
         0) exit 0 ;;
         *) _err "无效输入" ; pause ;;

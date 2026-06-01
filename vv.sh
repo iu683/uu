@@ -76,8 +76,7 @@ _map_arch() {
 
 _get_snell_latest_version() {
     local latest_version
-    # 匹配 v 后面跟着任意主版本号（数字）、次版本号和修订号的格式
-    latest_version=$(curl -sL -A "Mozilla/5.0" "https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 2>/dev/null || echo "")
+    latest_version=$(curl -sL -A "Mozilla/5.0" "https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell" | grep -oE 'v5\.[0-9]+\.[0-9]+' | head -n 1 2>/dev/null || echo "")
     if [ -n "$latest_version" ]; then
         echo "${latest_version#v}"
     else
@@ -93,10 +92,10 @@ _get_conf_value() {
     fi
 }
 
-# ================== 配置 Snell v5 (支持读取现有值，回车不变) ==================
+# ================== 配置 Snell (支持读取现有值，回车不变) ==================
 configure_snell() {
     mkdir -p "$SNELL_DIR"
-    echo -e "${GREEN}[信息] 开始配置 Snell v5...${RESET}"
+    echo -e "${GREEN}[信息] 开始配置 Snell...${RESET}"
 
     # 读取旧配置（若存在）
     local old_listen=$(_get_conf_value "listen")
@@ -261,7 +260,7 @@ EOF
 # 选项 1：全新安装
 install_snell_v5() {
     if [ -x /usr/local/bin/snell-server-v5 ]; then
-        _ok "Snell v5 已安装，如需更新请使用选项 2，修改配置请用选项 4。"; return 0
+        _ok "Snell 已安装，如需更新请使用选项 2，修改配置请用选项 4。"; return 0
     fi
 
     local ver=$(_download_and_install_binary)
@@ -272,8 +271,23 @@ install_snell_v5() {
     _deploy_openrc_service
     
     rc-service snell restart >/dev/null 2>&1 || true
-    _ok "Snell v$ver 已在 Alpine Linux 上成功部署并运行！"
-    log "Alpine Snell v$ver 安装成功"
+    _ok "Snell 已在 Alpine Linux 上成功部署并运行！"
+    log "Alpine Snell 安装成功"
+
+    # ================== 新增：安装完直接显示节点配置 ==================
+    echo
+    echo -e "${GREEN}===============================================${RESET}"
+    echo -e "${GREEN}               🎉 Snell 安装成功 🎉            ${RESET}"
+    echo -e "${GREEN}===============================================${RESET}"
+    echo -e "${GREEN}👉 请复制以下配置到你的 Surge 配置文件中：${RESET}"
+    echo
+    if [ -f "$SNELL_DIR/config.txt" ]; then
+        echo -e "${YELLOW}$(cat "$SNELL_DIR/config.txt")${RESET}"
+    else
+        _warn "未找到节点配置文件文本。"
+    fi
+    echo -e "${GREEN}===============================================${RESET}"
+    echo
 }
 
 # 选项 2：纯净更新（不覆盖、不重装配置）
@@ -368,6 +382,9 @@ while true; do
                 configure_snell
                 _restart_snell_process
                 _ok "配置已重载，Snell 服务已平滑重启！"
+                # 重载后同样显示最新节点信息
+                echo -e "\n${GREEN}👉  Surge 节点配置：${RESET}"
+                [ -f "$SNELL_DIR/config.txt" ] && echo -e "${YELLOW}$(cat "$SNELL_DIR/config.txt")${RESET}\n"
             fi
             pause ;;
         5) 
@@ -406,7 +423,7 @@ while true; do
             if [ -f "$SNELL_CONFIG" ]; then
                 echo -e "${GREEN}====== 当前 Snell 内部配置 ======${RESET}"
                 cat "$SNELL_CONFIG"
-                echo -e "${GREEN}====== Surge 专属代理配置 ======${RESET}"
+                echo -e "${GREEN}====== Surge 专属配置 ======${RESET}"
                 [ -f "$SNELL_DIR/config.txt" ] && cat "$SNELL_DIR/config.txt" || echo "暂无配置文本"
             else
                 echo -e "${RED}配置文件不存在，请先安装！${RESET}"

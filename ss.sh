@@ -1,686 +1,725 @@
-#!/bin/sh
-# 针对 Alpine Linux 深度优化，使用标准 sh 执行
-set -eu
-
+#!/usr/bin/env bash
+#
+# Xray (Socks5) 控制面板 
+#
 # =========================================================
-# Snell v5 + Shadow-TLS v3 一体化独立管理脚本 (Alpine )
+# 1. 核心控制与全局环境初始化
 # =========================================================
+set -Eeuo pipefail
+export LANG=en_US.UTF-8
 
-# ================== 颜色与输出函数 ==================
+# ================== 颜色 ==================
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
+BLUE="\033[34m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-_info() { echo -e "${GREEN}[信息] $1${RESET}"; }
-_warn() { echo -e "${YELLOW}[警告] $1${RESET}"; }
-_err()  { echo -e "${RED}[错误] $1${RESET}"; }
-
 # ================== 基础变量 ==================
-SNELL_DIR="/etc/snell-tls"
-SNELL_Conf="${SNELL_DIR}/snell-server.conf"
-SNELL_File="/usr/local/bin/snell-server-v5"
+readonly SERVICE_NAME="xraysocks5"
+readonly XRAY_CONFIG="/usr/local/etc/${SERVICE_NAME}/config.json"
+readonly XRAY_BINARY="/usr/local/bin/${SERVICE_NAME}"
+readonly LINK_FILE="/root/proxynode/socks5/xray_socks5.txt"
 
-STLS_Env="${SNELL_DIR}/shadow-tlsn.env"
-STLS_File="/usr/local/bin/stls-integrated-shadow-tlsn"
+# 降级备用版本
+readonly BACKUP_VERSION="26.3.27"
 
-LOG_FILE="/var/log/stls-integrated-snell-managers.log"
-
-TMP_DIR=$(mktemp -d -t snell-v5.XXXXXX)
+TMP_DIR=$(mktemp -d -t xray_socks.XXXXXX)
 
 # ================== cleanup ==================
 cleanup() {
-    [ -d "$TMP_DIR" ] && rm -rf "$TMP_DIR"
+    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
 }
+
 trap cleanup EXIT INT TERM
 
-# ================== 日志与暂停 ==================
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" 2>/dev/null || true
-}
+# ================== 日志与交互 ==================
+info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
+error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
+pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
 
-pause() {
-    echo -n "按任意键返回菜单..."
-    read -r -n 1 -s || true
-    echo
-}
-
-# ================== 智能获取公网双栈 IP ==================
+# ================== 获取公网IP ==================
 get_public_ip() {
     local ip
-    ip=$(curl -4fsSL --max-time 3 https://api.ipify.org 2>/dev/null || echo "")
-    if [ -z "$ip" ]; then
-        ip=$(curl -6fsSL --max-time 3 https://api64.ipify.org 2>/dev/null || echo "")
-        [ -n "$ip" ] && echo "[$ip]" && return
-    fi
-    [ -z "$ip" ] && ip="你的服务器IP"
-    echo "$ip"
-}
 
-# ================== 检查端口 ==================
-check_port() {
-    if ss -tulnH | grep -q ":$1 "; then
-        _err "端口 $1 已被占用"
-        return 1
-    fi
-    return 0
-}
-
-# ================== 辅助生成器 ==================
-random_key() {
-    tr -dc A-Za-z0-9 </dev/urandom 2>/dev/null | head -c 16 || echo "SnellPskKey12345"
-}
-
-random_port() {
-    awk 'BEGIN{srand(); print int(rand()*(65000-2000+1))+2000}'
-}
-
-get_system_dns() { 
-    grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ',' | sed 's/,$//' || echo "1.1.1.1,8.8.8.8"
-}
-
-_map_arch() {
-    case "$(uname -m)" in
-        x86_64)  echo "amd64" ;;
-        aarch64) echo "aarch64" ;;
-        *) return 1 ;;
-    esac
-}
-
-detect_stls_arch() {
-    case "$(uname -m)" in
-        x86_64)  echo "x86_64-unknown-linux-musl" ;;
-        aarch64) echo "aarch64-unknown-linux-musl" ;;
-        *) _err "不支持架构: $(uname -m)" && exit 1 ;;
-    esac
-}
-
-_get_snell_latest_version() {
-    local latest_version
-    latest_version=$(curl -sL -A "Mozilla/5.0" "https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell" | grep -oE 'v5\.[0-9]+\.[0-9]+' | head -n 1 2>/dev/null || echo "")
-    [ -z "$latest_version" ] && latest_version="v5.0.1"
-    echo "$latest_version"
-}
-
-get_latest_stls_version() {
-    curl -fsSL --max-time 5 "https://api.github.com/repos/ihciah/shadow-tls/releases/latest" 2>/dev/null | grep tag_name | cut -d '"' -f4 || echo "v0.2.25"
-}
-
-# ================== 安全的数据提取引擎 ==================
-load_existing_config() {
-    OLD_STLS_PORT="8443"
-    OLD_SNELL_PORT=""
-    OLD_SNELL_PSK=""
-    OLD_STLS_PWD=""
-    OLD_STLS_SNI="captive.apple.com"
-    OLD_DNS=""
-    OLD_IPV6="false"
-    OLD_TFO="true"
-
-    if [ -f "$SNELL_Conf" ]; then
-        local raw_listen
-        raw_listen=$(awk -F'= ' '/^listen/{print $2}' "$SNELL_Conf" 2>/dev/null | tr -d ' \t\n' || echo "")
-        OLD_SNELL_PORT=${raw_listen#*:}
-        OLD_SNELL_PSK=$(awk -F'= ' '/^psk/{print $2}' "$SNELL_Conf" 2>/dev/null | tr -d ' \t\n' || echo "")
-        OLD_DNS=$(awk -F'= ' '/^dns/{print $2}' "$SNELL_Conf" 2>/dev/null | tr -d ' \t\n' || echo "")
-        OLD_IPV6=$(awk -F'= ' '/^ipv6/{print $2}' "$SNELL_Conf" 2>/dev/null | tr -d ' \t\n' || echo "false")
-        OLD_TFO=$(awk -F'= ' '/^tfo/{print $2}' "$SNELL_Conf" 2>/dev/null | tr -d ' \t\n' || echo "true")
-    fi
-
-    if [ -f "$STLS_Env" ]; then
-        OLD_STLS_PORT=$(awk -F'=' '/^STLS_LISTEN=/{print $2}' "$STLS_Env" 2>/dev/null | awk -F':' '{print $NF}' | tr -d '\r\n' || echo "443")
-        OLD_STLS_PWD=$(awk -F'=' '/^STLS_PASSWORD=/{print $2}' "$STLS_Env" 2>/dev/null | tr -d '\r\n' || echo "")
-        
-        local raw_tls
-        raw_tls=$(awk -F'=' '/^STLS_TLS=/{print $2}' "$STLS_Env" 2>/dev/null | tr -d '\r\n' || echo "")
-        if [ -n "$raw_tls" ]; then
-            OLD_STLS_SNI=${raw_tls%:[0-9]*}
-        fi
-        [ -z "$OLD_STLS_SNI" ] && OLD_STLS_SNI="gateway.icloud.com"
-    fi
-    return 0
-}
-
-# ================== 写配置核心引擎 ==================
-write_config() {
-    local snell_port="$1"
-    local psk="$2"
-    local dns="$3"
-    local ipv6="$4"
-    local tfo="$5"
-    local stls_port="$6"
-    local stls_sni="$7"
-    local stls_pwd="$8"
-
-    mkdir -p "$SNELL_DIR"
-
-    cat > "$SNELL_Conf" <<EOF
-[snell-server]
-listen = 127.0.0.1:$snell_port
-psk = $psk
-obfs = off
-ipv6 = $ipv6
-tfo = $tfo
-dns = $dns
-EOF
-    chmod 600 "$SNELL_Conf"
-
-    cat > "$STLS_Env" <<EOF
-STLS_LISTEN=[::]:$stls_port
-STLS_SERVER=127.0.0.1:$snell_port
-STLS_TLS=$stls_sni:443
-STLS_PASSWORD=$stls_pwd
-EOF
-    chmod 600 "$STLS_Env"
-
-    id -u snell-tls >/dev/null 2>&1 || useradd -r -s /sbin/nologin snell-tls || true
-    chown -R snell-tls:snell-tls "$SNELL_DIR"
-}
-
-# ================== 生成并保存链接 ==================
-generate_links() {
-    local snell_port="$1"
-    local psk="$2"
-    local tfo="$3"
-    local stls_port="$4"
-    local stls_sni="$5"
-    local stls_pwd="$6"
-
-    IP=$(get_public_ip)
-    HOSTNAME=$(hostname -s 2>/dev/null | sed 's/ /_/g' || echo "server")
-
-    cat > "${SNELL_DIR}/surge.txt" <<EOF
-$HOSTNAME-Snell+ShadowTLS = snell, $IP, $stls_port, psk=$psk, version=5, tfo=$tfo, shadow-tls-password=$stls_pwd, shadow-tls-sni=$stls_sni, shadow-tls-version=3, ecn=true
-EOF
-    chown snell-tls:snell-tls "${SNELL_DIR}/surge.txt" || true
-}
-
-# ================== OpenRC 服务启动脚本构建 (Alpine专属) ==================
-service() {
-    id -u snell-tls >/dev/null 2>&1 || useradd -r -s /sbin/nologin snell-tls || true
-
-    cat > /etc/init.d/snell-tlss <<'EOF'
-#!/sbin/openrc-run
-
-description="Snell v5 Server Service"
-command="/usr/local/bin/snell-server-v5"
-command_args="-c /etc/snell-tls/snell-server.conf"
-command_background="yes"
-command_user="snell-tls:snell-tls"
-pidfile="/run/${RC_SVCNAME}.pid"
-
-# 增加独立日志记录
-output_log="/var/log/snell.log"
-error_log="/var/log/snell.log"
-
-depend() {
-    need net
-    after firewall
-}
-EOF
-    chmod +x /etc/init.d/snell-tlss
-    rc-update add snell-tlss default || true
-    touch /var/log/snell.log && chown snell-tls:snell-tls /var/log/snell.log || true
-    rc-service snell-tlss start || true
-}
-
-service_stls() {
-    cat > /etc/init.d/shadowtlsn <<'EOF'
-#!/sbin/openrc-run
-
-description="Shadow TLS Service v3"
-command="/usr/local/bin/stls-integrated-shadow-tlsn"
-pidfile="/run/${RC_SVCNAME}.pid"
-command_background="yes"
-
-# 增加独立日志记录
-output_log="/var/log/shadowtls.log"
-error_log="/var/log/shadowtls.log"
-
-start_pre() {
-    if [ -f /etc/snell-tls/shadow-tlsn.env ]; then
-        . /etc/snell-tls/shadow-tlsn.env
-    else
-        eerror "Environment file /etc/snell-tls/shadow-tlsn.env missing!"
-        return 1
-    fi
-    
-    export MONOIO_FORCE_LEGACY_DRIVER=1
-    command_args="--v3 server --password $STLS_PASSWORD --listen $STLS_LISTEN --server $STLS_SERVER --tls $STLS_TLS"
-}
-
-depend() {
-    need net snell-tlss
-    after firewall snell-tlss
-}
-EOF
-    chmod +x /etc/init.d/shadowtlsn
-    rc-update add shadowtlsn default || true
-    touch /var/log/shadowtls.log && chown shadowtls:shadowtls /var/log/shadowtls.log || true
-    rc-service shadowtlsn start || true
-    _info "OpenRC 服务部署自启配置完成！"
-}
-
-# ================== 打印配置详情 ==================
-print_node_info() {
-    IP=$(get_public_ip)
-    if [ ! -f "$STLS_Env" ] || [ ! -f "$SNELL_Conf" ]; then
-        _err "配置文件不存在，请先选择选项【1】进行安装初始化。" && return
-    fi
-    
-    local snell_port
-    local raw_listen=$(awk -F'= ' '/^listen/{print $2}' "$SNELL_Conf" 2>/dev/null | tr -d ' \t\n' || echo "未知")
-    snell_port=${raw_listen#*:}
-    local psk=$(awk -F'= ' '/^psk/{print $2}' "$SNELL_Conf" 2>/dev/null | tr -d ' \t\n' || echo "未知")
-    
-    local show_listen_port=$(awk -F'=' '/^STLS_LISTEN=/{print $2}' "$STLS_Env" 2>/dev/null | awk -F':' '{print $NF}' | tr -d '\r\n' || echo "未知")
-    local stls_pwd=$(awk -F'=' '/^STLS_PASSWORD=/{print $2}' "$STLS_Env" 2>/dev/null | tr -d '\r\n' || echo "未知")
-    
-    local raw_tls b_sni="未知"
-    raw_tls=$(awk -F'=' '/^STLS_TLS=/{print $2}' "$STLS_Env" 2>/dev/null | tr -d '\r\n' || echo "")
-    if [ -n "$raw_tls" ]; then
-        b_sni=${raw_tls%:[0-9]*}
-    fi
-
-    echo -e "${GREEN}====== Snell  + Shadow-TLS v3 配置 ======${RESET}"
-    echo -e "${YELLOW} 公网 IP 地址   : ${IP}${RESET}"
-    echo -e "${YELLOW} 外网公网端口   : ${show_listen_port}${RESET}"
-    echo -e "${YELLOW} Shadow-TLS 密码 : ${stls_pwd}${RESET}"
-    echo -e "${YELLOW} SNI 伪装域名    : ${b_sni}${RESET}"
-    echo -e "${YELLOW} Snell内部端口   : ${snell_port} ${RESET}"
-    echo -e "${YELLOW} Snell PSK 密钥  : ${psk}${RESET}"
-    echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
-    echo -e "${YELLOW}-------------------------------------------------${RESET}"
-    _info "Surge 配置:"
-    if [ -f "${SNELL_DIR}/surge.txt" ]; then
-        echo -e "${YELLOW}$(cat "${SNELL_DIR}/surge.txt")${RESET}"
-    else
-        echo "未生成配置"
-    fi
-    echo -e "${YELLOW}-------------------------------------------------${RESET}"
-}
-
-# ================== 动态配置交互流 ==================
-execute_configuration_flow() {
-    local is_modify_mode="$1"
-    
-    load_existing_config || true
-    
-    local snell_port psk dns ipv6 tfo stls_port stls_sni stls_pwd
-    local input_stls_port input_snell_port input_psk input_stls_pwd input_sni input_dns input_ipv6 input_tfo
-
-    while true; do
-        if [ "$is_modify_mode" = true ]; then
-            printf "请输入Shadow-TLS公网端口 (当前: %s, 回车保持不修改): " "${OLD_STLS_PORT:-443}"
-        else
-            printf "请输入Shadow-TLS公网端口 (默认: %s, 回车直接采纳): " "${OLD_STLS_PORT:-443}"
-        fi
-        read -r input_stls_port || input_stls_port=""
-        stls_port=${input_stls_port:-${OLD_STLS_PORT:-443}}
-
-        if echo "$stls_port" | grep -qE '^[0-9]+$' && [ "$stls_port" -ge 1 ] && [ "$stls_port" -le 65535 ]; then
-            if [ "$stls_port" != "$OLD_STLS_PORT" ]; then
-                check_port "$stls_port" || continue
+    for cmd in "curl -4fsSL --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null || true)
+            if [[ -n "${ip:-}" ]]; then
+                echo "$ip"
+                return 0
             fi
-            break
-        else
-            _err "端口格式不正确，必须在 1-65535 之间。"
-        fi
+        done
     done
 
-    while true; do
-        local default_snell_port=""
-        default_snell_port=${OLD_SNELL_PORT:-$(random_port || echo "38221")}
-        
-        if [ "$is_modify_mode" = true ]; then
-            printf "请输入内部Snell端口 (当前: %s, 回车保持不修改): " "$default_snell_port"
-        else
-            printf "请输入内部Snell端口 (随机推荐: %s, 回车直接采纳): " "$default_snell_port"
-        fi
-        read -r input_snell_port || input_snell_port=""
-        snell_port=${input_snell_port:-$default_snell_port}
-
-        if echo "$snell_port" | grep -qE '^[0-9]+$' && [ "$snell_port" -ge 1 ] && [ "$snell_port" -le 65535 ]; then
-            if [ "$snell_port" -eq "$stls_port" ]; then
-                _err "内部Snell端口绝不能与外网公网端口相同！"
-                continue
+    for cmd in "curl -6fsSL --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ipv6.ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null || true)
+            if [[ -n "${ip:-}" ]]; then
+                echo "$ip"
+                return 0
             fi
-            if [ "$snell_port" != "$OLD_SNELL_PORT" ]; then
-                check_port "$snell_port" || continue
-            fi
-            break
-        else
-            _err "端口格式不正确，必须在 1-65535 之间。"
-        fi
+        done
     done
 
-    while true; do
-        local default_psk=""
-        default_psk=${OLD_SNELL_PSK:-$(random_key || echo "")}
-
-        if [ "$is_modify_mode" = true ]; then
-            printf "请输入Snell PSK密钥 (当前: %s, 回车保持不修改):\n> " "$default_psk"
-        else
-            printf "请输入Snell PSK密钥 (默认随机生成: %s, 回车直接采纳):\n> " "$default_psk"
-        fi
-        read -r input_psk || input_psk=""
-        psk=${input_psk:-$default_psk}
-        if [ -n "$psk" ]; then
-            break
-        else
-            _err "PSK密钥不能为空！"
-        fi
-    done
-
-    while true; do
-        local default_stls_pwd=""
-        default_stls_pwd=${OLD_STLS_PWD:-$(openssl rand -hex 8 2>/dev/null || echo "StlsPurePwd123456")}
-        
-        if [ "$is_modify_mode" = true ]; then
-            printf "请输入Shadow-TLS密码 (当前: %s, 回车保持不修改): " "$default_stls_pwd"
-        else
-            printf "请输入Shadow-TLS密码 (默认随机生成: %s, 回车直接采纳): " "$default_stls_pwd"
-        fi
-        read -r input_stls_pwd || input_stls_pwd=""
-        stls_pwd=${input_stls_pwd:-$default_stls_pwd}
-        if [ -n "$stls_pwd" ]; then
-            break
-        else
-            _err "密码不能为空！"
-        fi
-    done
-
-    while true; do
-        local default_sni=${OLD_STLS_SNI:-"gateway.icloud.com"}
-        if [ "$is_modify_mode" = true ]; then
-            printf "请输入Shadow-TLS SNI伪装域名 (当前: %s, 回车保持不修改): " "$default_sni"
-        else
-            printf "请输入Shadow-TLS SNI伪装域名 (默认: %s, 回车直接采纳): " "$default_sni"
-        fi
-        read -r input_sni || input_sni=""
-        stls_sni=${input_sni:-$default_sni}
-        if echo "$stls_sni" | grep -qE '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'; then
-            break
-        else
-            _err "伪装域名格式不正确，请输入合法的域名 (如 gateway.icloud.com)"
-        fi
-    done
-
-    while true; do
-        local sys_dns=""
-        sys_dns=$(get_system_dns || echo "1.1.1.1,8.8.8.8")
-        local default_dns=${OLD_DNS:-$sys_dns}
-        
-        if [ "$is_modify_mode" = true ]; then
-            printf "请输入Snell自定义DNS (当前: %s, 回车保持不修改): " "$default_dns"
-        else
-            printf "请输入Snell自定义DNS (默认采纳系统: %s, 回车直接采纳): " "$default_dns"
-        fi
-        read -r input_dns || input_dns=""
-        dns=${input_dns:-$default_dns}
-        if [ -n "$dns" ]; then
-            break
-        else
-            _err "DNS 不能为空！"
-        fi
-    done
-
-    printf "是否开启 IPv6 支持？(当前: %s, 1.开启 2.关闭, 默认 2): " "$OLD_IPV6"
-    read -r input_ipv6 || input_ipv6=""
-    if [ "$input_ipv6" = "1" ]; then ipv6="true"; elif [ "$input_ipv6" = "2" ]; then ipv6="false"; else ipv6="$OLD_IPV6"; fi
-
-    printf "是否开启 TCP Fast Open？(当前: %s, 1.开启 2.关闭, 默认 1): " "$OLD_TFO"
-    read -r input_tfo || input_tfo=""
-    if [ "$input_tfo" = "1" ]; then tfo="true"; elif [ "$input_tfo" = "2" ]; then tfo="false"; else tfo="$OLD_TFO"; fi
-
-    write_config "$snell_port" "$psk" "$dns" "$ipv6" "$tfo" "$stls_port" "$stls_sni" "$stls_pwd" || true
-    generate_links "$snell_port" "$psk" "$tfo" "$stls_port" "$stls_sni" "$stls_pwd" || true
-}
-
-# ================== 核心 Alpine 部署与下载逻辑 ==================
-_download_and_install_binary() {
-    local sarch=$( _map_arch ) || { _err "不支持的架构"; return 1; }
-    
-    _info "正在安装 Alpine 必要系统依赖 (upx, unzip, curl, iproute2, openssl, shadow)..."
-    apk add --no-cache upx unzip curl iproute2 openssl shadow >/dev/null 2>&1
-
-    _info "正在获取官方最新稳定版版本号..."
-    local version=$( _get_snell_latest_version )
-    version="${version#v}"
-
-    local tmp=$(mktemp -d)
-    local download_url="https://dl.nssurge.com/snell/snell-server-v${version}-linux-${sarch}.zip"
-
-    _info "正在下载 Snell v$version (架构: $sarch)..."
-    if curl -sLo "$tmp/snell.zip" --connect-timeout 60 "$download_url"; then
-        if unzip -oq "$tmp/snell.zip" -d "$tmp/"; then
-            _info "检测到 Alpine 环境，正在进行 UPX 壳解压兼容处理..."
-            if command -v upx >/dev/null 2>&1; then
-                upx -d "$tmp/snell-server" >/dev/null 2>&1 || _warn "UPX 脱壳失败或无需脱壳"
-            else
-                _err "UPX 工具不可用，无法完成解压"
-                rm -rf "$tmp"; return 1
-            fi
-
-            install -m 755 "$tmp/snell-server" "$SNELL_File"
-            rm -rf "$tmp"
-            echo "$version" > "${SNELL_DIR}/version.txt"
-            return 0
-        else
-            _err "解压失败"
-        fi
-    else
-        _err "下载失败: $download_url"
-    fi
-    rm -rf "$tmp"
     return 1
 }
 
-# ================== 安装入口 ==================
-install_ss() {
-    _info "开始全新安装 Snell & Shadow-TLS v3 核心组件..."
-    mkdir -p "$SNELL_DIR"
+# ================== URL 编码函数 (保障TG链接可用性) ==================
+url_encode() {
+    local string="${1}"
+    local strlen="${#string}"
+    local encoded=""
+    local pos c o
 
-    # 执行核心封装好的 Alpine 下载脱壳逻辑
-    _download_and_install_binary
-
-    STLS_VERSION=$(get_latest_stls_version)
-    STLS_ARCH=$(detect_stls_arch)
-    _info "正在下载 Shadow-TLS ${STLS_VERSION}..."
-    wget -O "$TMP_DIR/shadow-tls" "https://github.com/ihciah/shadow-tls/releases/download/${STLS_VERSION}/shadow-tls-${STLS_ARCH}"
-    install -m 755 "$TMP_DIR/shadow-tls" "$STLS_File"
-    echo "$STLS_VERSION" > "${SNELL_DIR}/stls_version.txt"
-
-    execute_configuration_flow false
-    service
-    service_stls
-
-    _info "服务安装部署成功，节点已启动运行！"
-    log "全新安装并初始化成功"
-    print_node_info
+    for (( pos=0 ; pos<strlen ; pos++ )); do
+        c=${string:$pos:1}
+        case "$c" in
+            [-_.~a-zA-Z0-9] ) encoded+="$c" ;;
+            * )
+                printf -v o '%%%02X' "'$c"
+                encoded+="$o"
+                ;;
+        esac
+    done
+    echo "${encoded}"
 }
 
-
-# ================== 修改现有配置 ==================
-modify_ss() {
-    _info "进入修改配置模块..."
-    if [ ! -f "$SNELL_Conf" ] || [ ! -f "$STLS_Env" ]; then
-        _err "错误：未检测到环境配置文件，请先选择选项【1】进行完整安装！"
-        return
+# ================== 检查端口占用 ==================
+check_port() {
+    local port="$1"
+    if ss -tuln | awk '{print $5}' | grep -qE "[:.]${port}$"; then
+        return 1  # 被占用
     fi
-    
-    _info "正在安全停止现有服务以防死锁..."
-    rc-service shadowtlsn stop >/dev/null 2>&1 || true
-    rc-service snell-tlss stop >/dev/null 2>&1 || true
-    
-    # 仅执行数据交互，不要在里面顺便重启服务
-    execute_configuration_flow true
-    
-    _info "正在通过 OpenRC 依赖链平滑安全启动服务..."
-    # 刷新一下自启配置（内部不含 start 指令）
-    # 提示：请确保你把下面 service_stls 里的 rc-service shadowtlsn start || true 删掉，或者直接用本处的流
-    
-    # 直接由 OpenRC 托管拉起，net -> snell-tlss -> shadowtlsn 串行启动
-    rc-service snell-tlss start || true
-    sleep 1 # 给 BusyBox 1秒钟微调释放文件锁
-    rc-service shadowtlsn start || true
-    
-    _info "核心配置已被覆写，服务安全重启完毕！"
-    print_node_info
-    log "配置已被修改并安全应用"
+    return 0  # 没用占用
 }
 
-# ================== 更新 ==================
-update_ss() {
-    _info "开始更新二进制组件..."
-    
-    _info "正在安全停止旧服务..."
-    rc-service shadowtlsn stop >/dev/null 2>&1 || true
-    rc-service snell-tlss stop >/dev/null 2>&1 || true
-    sleep 1
-
-    if [ -f "$SNELL_Conf" ]; then
-        _download_and_install_binary
-    fi
-
-    if [ -f "$STLS_Env" ]; then
-        STLS_VERSION=$(get_latest_stls_version)
-        STLS_ARCH=$(detect_stls_arch)
-        wget -O "$TMP_DIR/shadow-tls" "https://github.com/ihciah/shadow-tls/releases/download/${STLS_VERSION}/shadow-tls-${STLS_ARCH}"
-        install -m 755 "$TMP_DIR/shadow-tls" "$STLS_File"
-        echo "$STLS_VERSION" > "${SNELL_DIR}/stls_version.txt"
-    fi
-
-    _info "正在重新拉起全新组件..."
-    rc-service snell-tlss start || true
-    sleep 1
-    rc-service shadowtlsn start || true
-    
-    _info "更新执行完毕，服务已安全重启"
-    log "更新组件成功"
+# ================== 验证端口格式 ==================
+is_valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]
 }
 
-# ================== 卸载 ==================
-uninstall_ss() {
-    _warn "正在卸载独立一体化服务..."
-    rc-service shadowtlsn stop || true
-    rc-service snell-tlss stop || true
-    rc-update del shadowtlsn default || true
-    rc-update del snell-tlss default || true
-    rm -f /etc/init.d/snell-tlss /etc/init.d/shadowtlsn
-    rm -rf "$SNELL_DIR"
-    rm -f "$SNELL_File" "$STLS_File"
-    _info "卸载清理完毕"
-    log "安全卸载成功"
-}
-
-
-# ================== 独立日志查看子菜单 ==================
-check_logs() {
+# ================== 获取可用随机端口 ==================
+get_random_port() {
+    local rand_port
     while true; do
-        clear
-        echo -e "${GREEN}===========================================${RESET}"
-        echo -e "${GREEN}         Snell + Shadow-TLS 日志面板        ${RESET}"
-        echo -e "${GREEN}===========================================${RESET}"
-        echo -e "${YELLOW}1. 查看 Snell 最新日志 (最后50行)${RESET}"
-        echo -e "${YELLOW}2. 实时追踪 Snell 日志 (Ctrl+C 退出)${RESET}"
-        echo -e "${YELLOW}-------------------------------------------${RESET}"
-        echo -e "${GREEN}3. 查看 Shadow-TLS 最新日志 (最后50行)${RESET}"
-        echo -e "${GREEN}4. 实时追踪 Shadow-TLS 日志 (Ctrl+C 退出)${RESET}"
-        echo -e "${GREEN}===========================================${GREEN}${RESET}"
-        echo -e "${RED}0. 返回主菜单${RESET}"
-        echo -e "${GREEN}===========================================${RESET}"
-        printf "\033[32m请选择日志操作: \033[0m"
-        read -r log_choice || true
-        
-        case $log_choice in
-            1)
-                echo -e "\n${GREEN}====== Snell 运行日志 ======${RESET}"
-                if [ -f "/var/log/snell.log" ]; then tail -n 50 /var/log/snell.log; else _warn "暂无 Snell 日志文件"; fi
-                pause
-                ;;
-            2)
-                echo -e "\n${GREEN}====== 正在实时追踪 Snell 日志 (按 Ctrl+C 终止) ======${RESET}"
-                if [ -f "/var/log/snell.log" ]; then tail -f /var/log/snell.log; else _warn "日志文件不存在"; pause; fi
-                ;;
-            3)
-                echo -e "\n${GREEN}====== Shadow-TLS 运行日志 ======${RESET}"
-                if [ -f "/var/log/shadowtls.log" ]; then tail -n 50 /var/log/shadowtls.log; else _warn "暂无 Shadow-TLS 日志文件"; fi
-                pause
-                ;;
-            4)
-                echo -e "\n${GREEN}====== 正在实时追踪 Shadow-TLS 日志 (按 Ctrl+C 终止) ======${RESET}"
-                if [ -f "/var/log/shadowtls.log" ]; then tail -f /var/log/shadowtls.log; else _warn "日志文件不存在"; pause; fi
-                ;;
-            0)
-                break
-                ;;
-            *)
-                _err "无效输入"
-                pause
-                ;;
-        case
+        rand_port=$((RANDOM % 55536 + 10000))
+        if check_port "$rand_port"; then
+            echo "$rand_port"
+            return 0
+        fi
     done
 }
 
-# ================== 主菜单面板 ==================
+# ================== 生成随机字符串 ==================
+generate_random_string() {
+    local length="$1"
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex "$((length / 2))"
+    else
+        tr -dc 'a-zA-Z0-9' < /dev/urandom 2>/dev/null | head -c "$length" || echo "admin$(RANDOM)"
+    fi
+}
+
+# ================== 架构检测 ==================
+get_arch() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64) echo "64" ;;
+        aarch64|arm64) echo "arm64-v8a" ;;
+        armv7l) echo "arm32-v7a" ;;
+        *) error "暂不支持的系统架构: $arch"; return 1 ;;
+    esac
+}
+
+# ================== 自动获取最新版本号 ==================
+get_latest_version() {
+    local latest_version
+    info "正在获取 GitHub 最新 Xray 版本号..."
+    
+    latest_version=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
+        | jq -r '.tag_name' 2>/dev/null || echo "")
+        
+    latest_version="${latest_version#v}"
+
+    if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
+        warn "通过 GitHub API 获取最新版本失败，将使用内置备用版本: v${BACKUP_VERSION}"
+        echo "$BACKUP_VERSION"
+    else
+        info "成功获取最新版本: v${latest_version}"
+        echo "$latest_version"
+    fi
+}
+
+# ================== 从GitHub下载并解压Xray ==================
+download_and_extract_xray() {
+    local arch version
+    arch=$(get_arch) || return 1
+    version=$(get_latest_version)
+    
+    local download_url="https://github.com/XTLS/Xray-core/releases/download/v${version}/Xray-linux-${arch}.zip"
+    local zip_file="$TMP_DIR/xray.zip"
+    
+    info "正在从 GitHub 下载 Xray v${version} (${arch})..."
+    if ! curl -L -fsSL "$download_url" -o "$zip_file"; then
+        error "从 GitHub 下载 Xray 失败，请检查网络连接。"
+        return 1
+    fi
+    
+    info "正在解压..."
+    mkdir -p "$TMP_DIR/extracted"
+    if ! unzip -qo "$zip_file" -d "$TMP_DIR/extracted"; then
+        error "解压 Xray 压缩包失败，请确保系统已安装 unzip。"
+        return 1
+    fi
+    
+    mkdir -p "$(dirname "$XRAY_BINARY")"
+    rm -f "$XRAY_BINARY"
+    cp -f "$TMP_DIR/extracted/xray" "$XRAY_BINARY"
+    chmod +x "$XRAY_BINARY"
+    
+    mkdir -p "/usr/local/share/${SERVICE_NAME}"
+    cp -f "$TMP_DIR/extracted/geoip.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
+    cp -f "$TMP_DIR/extracted/geosite.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
+}
+
+# ================== 配置 Systemd 服务 ==================
+setup_systemd_service() {
+    info "配置 Systemd 服务 [${SERVICE_NAME}]..."
+    
+    cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=Xray Socks5 Server Service
+Documentation=https://github.com/XTLS/Xray-core
+After=network.target nss-lookup.target
+
+[Service]
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=${XRAY_BINARY} run -config ${XRAY_CONFIG}
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable "${SERVICE_NAME}" 2>/dev/null || true
+}
+
+# ================== 获取服务状态与基础参数 ==================
+get_xray_status() {
+    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+        echo -e "${GREEN}● 运行中${RESET}"
+    else
+        echo -e "${RED}● 未运行${RESET}"
+    fi
+}
+
+get_xray_version() {
+    if [[ -x "$XRAY_BINARY" ]]; then
+        "$XRAY_BINARY" version 2>/dev/null \
+            | grep -i "Xray" \
+            | head -n 1 \
+            | awk '{print $2}' || echo "未知"
+    else
+        echo "未安装"
+    fi
+}
+
+get_listen_ip() {
+    if sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null | grep -q '= 1'; then
+        echo "0.0.0.0"
+    else
+        echo "::"
+    fi
+}
+
+test_config() {
+    if "$XRAY_BINARY" run -test -config "$XRAY_CONFIG" >/dev/null 2>&1; then
+        info "Configuration OK"
+        return 0
+    fi
+    error "配置测试失败"
+    return 1
+}
+
+restart_xray() {
+    systemctl restart "${SERVICE_NAME}" 2>/dev/null || true
+    sleep 1
+
+    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+        info "${SERVICE_NAME} 启动成功"
+        return 0
+    fi
+
+    error "${SERVICE_NAME} 启动失败"
+    journalctl -u "${SERVICE_NAME}" -n 20 --no-pager || true
+    return 1
+}
+
+# ================== 写底层配置 ==================
+write_config() {
+    local port="$1"
+    local user="$2"
+    local pass="$3"
+    
+    local listen_ip
+    listen_ip=$(get_listen_ip)
+
+    mkdir -p "$(dirname "$XRAY_CONFIG")"
+
+    local settings_json
+    if [[ -n "$user" && -n "$pass" ]]; then
+        settings_json=$(jq -n --arg u "$user" --arg p "$pass" '{"auth": "password", "accounts": [{"user": $u, "pass": $p}], "udp": true}')
+    else
+        settings_json=$(jq -n '{"auth": "noauth", "udp": true}')
+    fi
+
+    jq -n \
+        --arg listen "${listen_ip}" \
+        --argjson port "${port}" \
+        --argjson settings "${settings_json}" \
+    '{
+      "log": {"loglevel": "warning"},
+      "inbounds": [{
+        "listen": $listen,
+        "port": $port,
+        "protocol": "socks",
+        "settings": $settings,
+        "sniffing": {
+          "enabled": true,
+          "destOverride": ["http", "tls", "quic"]
+        }
+      }],
+      "outbounds": [{
+        "protocol": "freedom",
+        "settings": {
+          "domainStrategy": "UseIPv4v6"
+        }
+      }]
+    }' > "$XRAY_CONFIG"
+
+    chmod 644 "$XRAY_CONFIG"
+}
+
+# ================== 生成分享链接 (已集成 socks 链接与 tlink) ==================
+generate_link() {
+    mkdir -p "$(dirname "$LINK_FILE")"
+    local ip
+    if ! ip=$(get_public_ip); then
+        error "获取公网 IP 失败"
+        return 1
+    fi
+
+    local port user pass
+    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "1080")
+    
+    local auth_type
+    auth_type=$(jq -r '.inbounds[0].settings.auth' "$XRAY_CONFIG" 2>/dev/null || echo "noauth")
+
+    if [[ "$auth_type" == "password" ]]; then
+        user=$(jq -r '.inbounds[0].settings.accounts[0].user' "$XRAY_CONFIG" 2>/dev/null || echo "")
+        pass=$(jq -r '.inbounds[0].settings.accounts[0].pass' "$XRAY_CONFIG" 2>/dev/null || echo "")
+    else
+        user=""
+        pass=""
+    fi
+
+    local display_ip="$ip"
+    [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
+
+    # 对 Telegram 链接的组件进行 URL 编码以防有特殊字符
+    local enc_ip enc_user enc_pass
+    enc_ip=$(url_encode "$ip")
+    enc_user=$(url_encode "$user")
+    enc_pass=$(url_encode "$pass")
+
+    {
+        if [[ -n "$user" && -n "$pass" ]]; then
+            echo "socks://${user}:${pass}@${display_ip}:${port}"
+            echo "https://t.me/socks?server=${enc_ip}&port=${port}&user=${enc_user}&pass=${enc_pass}"
+        else
+            echo "socks://${display_ip}:${port}"
+            echo "https://t.me/socks?server=${enc_ip}&port=${port}"
+        fi
+    } > "$LINK_FILE"
+}
+
+# ================== 显示配置 (已美化并整合输出) ==================
+show_current_config() {
+    if [[ ! -f "$XRAY_CONFIG" ]]; then
+        error "配置文件不存在"
+        return
+    fi
+
+    local ip port auth_type user pass
+    ip=$(get_public_ip || echo "未知")
+    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
+    auth_type=$(jq -r '.inbounds[0].settings.auth' "$XRAY_CONFIG" 2>/dev/null || echo "noauth")
+
+    echo -e "${GREEN}====== Xray Socks5 服务端配置 ======${RESET}"
+    echo -e "${YELLOW}服务器公网 IP   : ${ip}${RESET}"
+    echo -e "${YELLOW}服务监听端口    : ${port}${RESET}"
+    
+    if [[ "$auth_type" == "password" ]]; then
+        user=$(jq -r '.inbounds[0].settings.accounts[0].user' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
+        pass=$(jq -r '.inbounds[0].settings.accounts[0].pass' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
+        echo -e "${YELLOW}认证方式        : 密码认证 (Password)${RESET}"
+        echo -e "${YELLOW}用户名          : ${user}${RESET}"
+        echo -e "${YELLOW}密码            : ${pass}${RESET}"
+    else
+        echo -e "${YELLOW}认证方式        : 免密认证 (NoAuth)${RESET}"
+    fi
+
+    if [[ -f "$LINK_FILE" ]]; then
+        local display_ip="$ip"
+        [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
+
+        local enc_ip enc_user enc_pass
+        enc_ip=$(url_encode "$ip")
+        enc_user=$(url_encode "$user")
+        enc_pass=$(url_encode "$pass")
+
+        echo -e "${GREEN}====== Socks5 配置 (已存至 $LINK_FILE) ======${RESET}"
+        if [[ "$auth_type" == "password" ]]; then
+            echo -e "${YELLOW}● 客户端直连格式:${RESET} socks://${user}:${pass}@${display_ip}:${port}"
+            echo -e "${YELLOW}● Telegram 快捷链接:${RESET} https://t.me/socks?server=${enc_ip}&port=${port}&user=${enc_user}&pass=${enc_pass}"
+        else
+            echo -e "${YELLOW}● 客户端直连格式:${RESET} socks://${display_ip}:${port}"
+            echo -e "${YELLOW}● Telegram快捷链接:${RESET} https://t.me/socks?server=${enc_ip}&port=${port}"
+        fi
+    fi
+    echo
+}
+
+# ================== 核心交互配置处理 ==================
+configure_xray() {
+    info "开始配置 Socks5 服务端节点..."
+    local port user pass auth_choice
+
+    # 1. 端口配置
+    while true; do
+        read -rp "请输入监听端口 (直接回车随机分配端口): " input_port
+        if [[ -z "$input_port" ]]; then
+            port=$(get_random_port)
+            info "已为您随机分配未被占用端口: $port"
+            break
+        elif is_valid_port "$input_port"; then
+            if ! check_port "$input_port"; then
+                error "端口 ${input_port} 已被占用，请重新输入。"
+                continue
+            fi
+            port="$input_port"
+            break
+        else
+            error "端口无效"
+        fi
+    done
+
+    # 2. 认证模式选项
+    echo -e "${GREEN}请选择认证方式:${RESET}"
+    echo -e " 1. 密码认证 (需要用户名和密码)"
+    echo -e " 2. 免密认证 (允许任何人直接连接)"
+    while true; do
+        read -rp "请输入选项 [1-2, 默认 1]: " auth_choice
+        auth_choice="${auth_choice:-1}" # 默认密码认证
+
+        if [[ "$auth_choice" == "1" ]]; then
+            # 独立处理账号生成
+            read -rp "请输入 Socks5 用户名 (直接回车自动随机生成): " input_user
+            if [[ -z "$input_user" ]]; then
+                user=$(generate_random_string 8)
+                info "已自动生成随机账号：${user}"
+            else
+                user="$input_user"
+            fi
+
+            # 独立处理密码生成
+            read -rp "请输入 Socks5 密码 (直接回车自动随机生成): " input_pass
+            if [[ -z "$input_pass" ]]; then
+                pass=$(generate_random_string 12)
+                info "已自动生成高强度密码：${pass}"
+            else
+                pass="$input_pass"
+            fi
+            break
+        elif [[ "$auth_choice" == "2" ]]; then
+            user=""
+            pass=""
+            info "已选择：免密认证 (NoAuth)"
+            break
+        else
+            error "输入无效，请输入 1 或 2"
+        fi
+    done
+
+    write_config "$port" "$user" "$pass"
+    test_config || return 1
+    generate_link
+    restart_xray
+    show_current_config
+}
+
+# ================== 安装 ==================
+install_xray() {
+    info "开始安装 Xray 核心依赖..."
+    download_and_extract_xray || return 1
+    setup_systemd_service
+    configure_xray
+    info "安装完成并已成功启动服务: ${SERVICE_NAME}"
+}
+
+# ================== 更新 ==================
+update_xray() {
+    info "开始更新 Xray 程序..."
+    
+    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+        info "检测到服务正在运行，正在停止服务以进行更新..."
+        systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+    fi
+
+    if ! download_and_extract_xray; then
+        error "下载或安装新版本失败，尝试重新启动原服务..."
+        restart_xray
+        return 1
+    fi
+    
+    if restart_xray; then
+        generate_link
+        info "最新版更新并启动成功！当前版本: $(get_xray_version)"
+    else
+        error "更新后服务启动失败，请查看日志。"
+        return 1
+    fi
+}
+
+# ================== 修改配置 ==================
+modify_config() {
+    if [[ ! -f "$XRAY_CONFIG" ]]; then
+        error "配置文件不存在"
+        return 1
+    fi
+
+    local old_port old_auth old_user old_pass
+    old_port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "1080")
+    old_auth=$(jq -r '.inbounds[0].settings.auth' "$XRAY_CONFIG" 2>/dev/null || echo "noauth")
+    
+    if [[ "$old_auth" == "password" ]]; then
+        old_user=$(jq -r '.inbounds[0].settings.accounts[0].user' "$XRAY_CONFIG" 2>/dev/null || echo "")
+        old_pass=$(jq -r '.inbounds[0].settings.accounts[0].pass' "$XRAY_CONFIG" 2>/dev/null || echo "")
+    else
+        old_user=""
+        old_pass=""
+    fi
+
+    local port user pass auth_choice
+
+    # 1. 端口修改
+    while true; do
+        read -rp "请输入新端口 [当前:${old_port}, 回车不修改]: " input_port
+        if [[ -z "$input_port" ]]; then
+            port="$old_port"
+            break
+        elif [[ "${input_port,,}" == "rand" ]]; then
+            port=$(get_random_port)
+            info "已重分配空闲随机端口: $port"
+            break
+        elif is_valid_port "$input_port"; then
+            if [[ "$input_port" != "$old_port" ]]; then
+                if ! check_port "$input_port"; then
+                    error "端口 ${input_port} 已被占用，请更换。"
+                    continue
+                fi
+            fi
+            port="$input_port"
+            break
+        else
+            error "端口无效，请输入 1-65535 之间的数字。"
+        fi
+    done
+
+    # 2. 认证模式修改选项
+    local current_mode="密码认证"
+    [[ "$old_auth" == "noauth" ]] && current_mode="免密认证"
+
+    echo -e "${GREEN}请选择新的认证方式 [当前: ${current_mode}]:${RESET}"
+    echo -e " 1. 密码认证"
+    echo -e " 2. 免密认证"
+    while true; do
+        read -rp "请输入选项 [1-2, 回车保持当前]: " auth_choice
+        
+        # 如果直接回车，保持旧的模式
+        if [[ -z "$auth_choice" ]]; then
+            user="$old_user"
+            pass="$old_pass"
+            if [[ "$old_auth" == "password" ]]; then
+                read -rp "是否修改用户名？[当前:${old_user}, 回车不修改]: " input_user
+                [[ -n "$input_user" ]] && user="$input_user"
+                read -rp "是否修改密码？[当前:${old_pass}, 回车不修改]: " input_pass
+                [[ -n "$input_pass" ]] && pass="$input_pass"
+            fi
+            break
+        fi
+
+        if [[ "$auth_choice" == "1" ]]; then
+            read -rp "请输入新用户名 [旧:${old_user:-无}, 回车自动生成]: " input_user
+            if [[ -z "$input_user" ]]; then
+                user=$(generate_random_string 8)
+                info "已自动生成随机账号：${user}"
+            else
+                user="$input_user"
+            fi
+
+            read -rp "请输入新密码 [旧:${old_pass:-无}, 回车自动生成]: " input_pass
+            if [[ -z "$input_pass" ]]; then
+                pass=$(generate_random_string 12)
+                info "已自动生成高强度密码：${pass}"
+            else
+                pass="$input_pass"
+            fi
+            break
+        elif [[ "$auth_choice" == "2" ]]; then
+            user=""
+            pass=""
+            info "已切换为：免密认证 (NoAuth)"
+            break
+        else
+            error "输入无效，请输入 1 或 2"
+        fi
+    done
+
+    cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
+
+    write_config "$port" "$user" "$pass"
+    test_config || return 1
+    generate_link
+    restart_xray
+    info "配置修改成功"
+}
+
+# ================== 卸载 ==================
+uninstall_xray() {
+    warn "即将卸载 ${SERVICE_NAME} 服务..."
+
+    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+    systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
+    
+    rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+    systemctl daemon-reload
+    
+    rm -f "$XRAY_BINARY"
+    rm -rf "/usr/local/etc/${SERVICE_NAME}"
+    rm -rf "/usr/local/share/${SERVICE_NAME}"
+    rm -f "$LINK_FILE"
+    rm -rf /root/proxynode/socks5
+    
+    info "服务已完全卸载并清理残留。"
+}
+
+# ================== 菜单 ==================
 show_menu() {
     clear
-    local status_snell="${RED}● Snell未运行${RESET}"
-    local status_stls="${RED}● TLS未运行${RESET}"
-    
-    rc-service snell-tlss status >/dev/null 2>&1 && status_snell="${GREEN}● Snell运行中${RESET}"
-    rc-service shadowtlsn status >/dev/null 2>&1 && status_stls="${GREEN}● TLS运行中${RESET}"
+    local status version port_show
+    status=$(get_xray_status)
+    version=$(get_xray_version)
+    port_show="-"
 
-    local v_snell="未安装" && [ -f "${SNELL_DIR}/version.txt" ] && v_snell="$(cat "${SNELL_DIR}/version.txt")"
-    local v_stls="未安装" && [ -f "${SNELL_DIR}/stls_version.txt" ] && v_stls="$(cat "${SNELL_DIR}/stls_version.txt")"
-    
-    local p_stls="-"
-    if [ -f "$STLS_Env" ]; then 
-        p_stls=$(awk -F'=' '/^STLS_LISTEN=/{print $2}' "$STLS_Env" 2>/dev/null | awk -F':' '{print $NF}' | tr -d '\r\n' || echo "-")
-    fi
-    local p_snell="-"
-    if [ -f "$SNELL_Conf" ]; then
-        local raw_listen=$(awk -F'= ' '/^listen/{print $2}' "$SNELL_Conf" 2>/dev/null | tr -d ' \t\n' || echo "-")
-        p_snell=${raw_listen#*:}
+    if [[ -f "$XRAY_CONFIG" ]]; then
+        port_show=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "-")
     fi
 
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}        Snell  + Shadow-TLS   面板    ${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}服务状态 :${RESET} ${status_snell} | ${status_stls}"
-    echo -e "${GREEN}组件版本 :${RESET} ${YELLOW}Snell: v${v_snell}${RESET} | ${YELLOW}Shadow-TLS: ${v_stls}${RESET}"
-    echo -e "${GREEN}运行端口 :${RESET} ${YELLOW}外网(TLS): ${p_stls}${RESET} | ${YELLOW}内部(Snell): ${p_snell}${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}1. 安装 Snell  + Shadow-TLS ${RESET}"
-    echo -e "${GREEN}2. 更新 Snell  + Shadow-TLS ${RESET}"
-    echo -e "${GREEN}3. 卸载 Snell  + Shadow-TLS ${RESET}"
-    echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 Snell  + Shadow-TLS ${RESET}"
-    echo -e "${GREEN}6. 停止 Snell  + Shadow-TLS ${RESET}"
-    echo -e "${GREEN}7. 重启 Snell  + Shadow-TLS ${RESET}"
-    echo -e "${GREEN}8. 查看运行日志${RESET}"
-    echo -e "${GREEN}9. 查看节点配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}        Xray Socks5 面板        ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $status"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN} 1. 安装 Xray Socks5${RESET}"
+    echo -e "${GREEN} 2. 更新 Xray Socks5${RESET}"
+    echo -e "${GREEN} 3. 卸载 Xray Socks5${RESET}"
+    echo -e "${GREEN} 4. 修改配置${RESET}"
+    echo -e "${GREEN} 5. 启动 Xray Socks5${RESET}"
+    echo -e "${GREEN} 6. 停止 Xray Socks5${RESET}"
+    echo -e "${GREEN} 7. 重启 Xray Socks5${RESET}"
+    echo -e "${GREEN} 8. 查看日志${RESET}"
+    echo -e "${GREEN} 9. 查看节点配置${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+}
+
+# ================== 安装依赖 ==================
+install_dependencies() {
+    if command -v apt &>/dev/null; then
+        apt update && apt install -y jq curl wget sed coreutils unzip iproute2 openssl || true
+    elif command -v dnf &>/dev/null; then
+        dnf install -y jq curl wget sed coreutils unzip iproute2 openssl
+    elif command -v yum &>/dev/null; then
+        yum install -y jq curl wget sed coreutils unzip iproute2 openssl
+    else
+        error "未知的包管理器，请手动补充环境包: jq, curl, wget, unzip, openssl"
+        exit 1
+    fi
+}
+
+# ================== 依赖检查 ==================
+pre_check() {
+    if [[ $(id -u) -ne 0 ]]; then
+        error "请使用 root 用户运行"
+        exit 1
+    fi
+
+    local deps=(jq curl wget unzip ss awk sed openssl)
+    local missing=0
+
+    for cmd in "${deps[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing=1
+            break
+        fi
+    done
+
+    if [[ "$missing" -eq 1 ]]; then
+        info "检测到缺失依赖，正在安装..."
+        install_dependencies
+    fi
 }
 
 # ================== 主循环 ==================
-while true; do
-    show_menu
-    printf "\033[32m请输入选项: \033[0m"
-    read -r choice || true
-    case $choice in
-        1) install_ss; pause ;;
-        2) update_ss; pause ;;
-        3) uninstall_ss; pause ;;
-        4) modify_ss; pause ;;
-        5) rc-service snell-tlss start || true; rc-service shadowtlsn start || true; _info "服务已启动"; pause ;;
-        6) rc-service shadowtlsn stop || true; rc-service snell-tlss stop || true; _info "服务已停止"; pause ;;
-        7) rc-service snell-tlss restart || true; rc-service shadowtlsn restart || true; _info "服务已重启"; pause ;;
-        8) check_logs ;;
-        9) print_node_info; pause ;;
-        0) exit 0 ;;
-        *) _err "无效输入" ; pause ;;
-    esac
-done
+main() {
+    pre_check
+
+    while true; do
+        show_menu
+        
+        local choice=""
+        read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+        
+        [[ -z "$choice" ]] && continue
+
+        case "$choice" in
+            1) install_xray; pause ;;
+            2) update_xray; pause ;;
+            3) uninstall_xray; pause ;;
+            4) modify_config; pause ;;
+            5) systemctl start "${SERVICE_NAME}" &>/dev/null || true; restart_xray; pause ;;
+            6) systemctl stop "${SERVICE_NAME}" &>/dev/null || true; info "服务已停止"; pause ;;
+            7) restart_xray; pause ;;
+            8) journalctl -u "${SERVICE_NAME}" -e --no-pager || true; pause ;;
+            9) show_current_config; pause ;;
+            0) exit 0 ;;
+            *) error "无效输入"; pause ;;
+        esac
+    done
+}
+
+main "$@"

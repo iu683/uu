@@ -1,536 +1,500 @@
-#!/usr/bin/env bash
-set -Eeuo pipefail
+#!/bin/bash
+set -euo pipefail
 
-REPO="Diniboy1123/usque"
-BIN_NAME="usque"
-INSTALL_DIR="/usr/local/bin"
-BIN_PATH="$INSTALL_DIR/$BIN_NAME"
-CONFIG_DIR="/etc/usque"
-CONFIG_PATH="$CONFIG_DIR/config.json"
-SERVICE_NAME="usque"
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-STATE_FILE="/etc/usque/runtime.env"
-DEFAULT_MODE="socks"
-DEFAULT_BIND="127.0.0.1"
-DEFAULT_PORT="1080"
-AUTO_REGISTER_NAME=""
-AUTO_REGISTER_LOCALE="en_US"
-AUTO_REGISTER_MODEL="PC"
-AUTO_REGISTER_JWT=""
+# =========================================================
+# Shadowsocks-Rust + Shadow-TLS 一体化管理脚本
+# SS加密方式: 2022-blake3-aes-256-gcm
+# =========================================================
 
-# ---- 颜色定义 ----
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-RED='\033[0;31m'
-RESET='\033[0m' 
-NC='\033[0m'
+# ================== 颜色 ==================
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+RESET="\033[0m"
 
+# ================== 基础变量 ==================
+SS_DIR="/etc/ss-rust"
+SS_CONFIG="${SS_DIR}/config.json"
+SS_SERVICE="/etc/systemd/system/ss-rust.service"
+BINARY_PATH="/usr/local/bin/ssserver"
+
+STLS_BINARY_PATH="/usr/local/bin/shadow-tls"
+STLS_SERVICE="/etc/systemd/system/shadow-tls.service"
+STLS_ENV_FILE="${SS_DIR}/shadow-tls.env"
+
+LOG_FILE="/var/log/ss-rust-manager.log"
+RUN_USER="ss-rust"
+METHOD="2022-blake3-aes-256-gcm"
+KEY_BYTES=32
+
+TMP_DIR=$(mktemp -d -t ss-rust.XXXXXX)
+
+# ================== cleanup ==================
+cleanup() {
+    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT INT TERM
+
+# ================== 日志与暂停 ==================
 log() {
-  printf '%s\n' "$*"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
 }
 
-info() {
-  printf "[${GREEN}*${NC}] %s\n" "$*"
+pause() {
+    read -n 1 -s -r -p "按任意键返回菜单..."
+    echo
 }
 
-warn() {
-  printf "[${YELLOW}!${NC}] %s\n" "$*" >&2
+# ================== 创建用户 ==================
+create_user() {
+    id -u "$RUN_USER" &>/dev/null || \
+        useradd -r -s /usr/sbin/nologin "$RUN_USER"
 }
 
-die() {
-  printf "[${RED}x${NC}] %s\n" "$*" >&2
-  exit 1
+# ================== 获取公网IP ==================
+get_public_ip() {
+    local ip
+    for cmd in "curl -4fsSL --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6fsSL --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ipv6.ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "[$ip]" && return
+        done
+    done
+    echo "无法获取公网IP"
 }
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "缺少依赖命令: $1"
+# ================== 检查依赖 ==================
+check_deps() {
+    echo -e "${GREEN}[信息] 检查系统依赖...${RESET}"
+    install_pkg() {
+        if command -v apt >/dev/null 2>&1; then
+            apt update -y && apt install -y "$@"
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y "$@"
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y "$@"
+        fi
+    }
+    command -v curl >/dev/null 2>&1 || install_pkg curl
+    command -v wget >/dev/null 2>&1 || install_pkg wget
+    command -v tar  >/dev/null 2>&1 || install_pkg tar
+    if ! command -v xz >/dev/null 2>&1; then
+        if command -v apt >/dev/null 2>&1; then install_pkg xz-utils; else install_pkg xz; fi
+    fi
+    command -v ss >/dev/null 2>&1 || {
+        if command -v apt >/dev/null 2>&1; then install_pkg iproute2; else install_pkg iproute; fi
+    }
+    command -v openssl >/dev/null 2>&1 || install_pkg openssl
+    echo -e "${GREEN}[完成] 依赖检查完成${RESET}"
 }
 
-run_as_root() {
-  if [ "${EUID:-$(id -u)}" -eq 0 ]; then
-    "$@"
-  elif command -v sudo >/dev/null 2>&1; then
-    sudo "$@"
-  else
-    die "需要 root 权限执行: $*"
-  fi
+# ================== 检查端口 ==================
+check_port() {
+    if ss -tulnH "( sport = :$1 )" | grep -q .; then
+        echo -e "${RED}端口 $1 已被占用${RESET}"
+        return 1
+    fi
 }
 
-detect_os() {
-  local os
-  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
-  case "$os" in
-    linux) echo "linux" ;;
-    darwin) echo "darwin" ;;
-    *) die "暂不支持的系统: $os" ;;
-  esac
+# ================== 辅助生成器 ==================
+random_key() { openssl rand -base64 "$KEY_BYTES" | tr -d '\n'; }
+random_port() { shuf -i 2000-65000 -n 1; }
+get_system_dns() { grep -E '^nameserver' /etc/resolv.conf | awk '{print $2}' | paste -sd "," -; }
+
+validate_password() {
+    local password="$1"
+    if ! echo "$password" | base64 -d >/dev/null 2>&1; then
+        echo -e "${RED}密码不是合法 Base64${RESET}" && return 1
+    fi
+    local decoded_len=$(echo "$password" | base64 -d 2>/dev/null | wc -c)
+    if [[ "$decoded_len" -ne "$KEY_BYTES" ]]; then
+        echo -e "${RED}密码必须为 ${KEY_BYTES} 字节${RESET}" && return 1
+    fi
 }
 
 detect_arch() {
-  local arch
-  arch="$(uname -m)"
-  case "$arch" in
-    x86_64|amd64) echo "amd64" ;;
-    aarch64|arm64) echo "arm64" ;;
-    armv7l|armv7) echo "armv7" ;;
-    armv6l|armv6) echo "armv6" ;;
-    armv5tel|armv5|arm) echo "armv5" ;;
-    mips) echo "mips" ;;
-    mips64) echo "mips64" ;;
-    mips64el|mips64le) echo "mips64le" ;;
-    mipsel|mipsle) echo "mipsle" ;;
-    *) die "暂不支持的架构: $arch" ;;
-  esac
+    case "$(uname -m)" in
+        x86_64)  echo "x86_64-unknown-linux-gnu" ;;
+        aarch64) echo "aarch64-unknown-linux-gnu" ;;
+        *) echo -e "${RED}不支持架构: $(uname -m)${RESET}" && exit 1 ;;
+    esac
 }
 
-pick_service_manager() {
-  if command -v systemctl >/dev/null 2>&1; then
-    echo "systemd"
-  else
-    echo "none"
-  fi
+detect_stls_arch() {
+    case "$(uname -m)" in
+        x86_64)  echo "x86_64-unknown-linux-musl" ;;
+        aarch64) echo "aarch64-unknown-linux-musl" ;;
+        *) echo -e "${RED}不支持架构: $(uname -m)${RESET}" && exit 1 ;;
+    esac
 }
 
-install_packages() {
-  info "正在尝试自动安装依赖包 (curl, unzip, ca-certificates, python3)..."
-  if command -v apt-get >/dev/null 2>&1; then
-    run_as_root apt-get update
-    run_as_root apt-get install -y curl unzip ca-certificates python3
-  elif command -v dnf >/dev/null 2>&1; then
-    run_as_root dnf install -y curl unzip ca-certificates python3
-  elif command -v yum >/dev/null 2>&1; then
-    run_as_root yum install -y curl unzip ca-certificates python3
-  elif command -v apk >/dev/null 2>&1; then
-    run_as_root apk add --no-cache curl unzip ca-certificates python3
-  elif command -v pacman >/dev/null 2>&1; then
-    run_as_root pacman -Sy --noconfirm curl unzip ca-certificates python3
-  elif command -v zypper >/dev/null 2>&1; then
-    run_as_root zypper --non-interactive install curl unzip ca-certificates python3
-  else
-    warn "无法确定包管理器，请手动确保安装了: curl unzip ca-certificates python3"
-  fi
+get_latest_version() {
+    curl -fsSL "https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest" | grep tag_name | cut -d '"' -f4 | sed 's/v//'
 }
 
-fetch_latest_release() {
-  local api tag
-  api="https://api.github.com/repos/$REPO/releases/latest"
-  tag="$(curl -fsSL "$api" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
-  [ -n "$tag" ] || die "获取最新版本失败"
-  echo "$tag"
+get_latest_stls_version() {
+    curl -fsSL "https://api.github.com/repos/ihciah/shadow-tls/releases/latest" | grep tag_name | cut -d '"' -f4
 }
 
-build_asset_name() {
-  local version os arch
-  version="$1"
-  os="$2"
-  arch="$3"
-  version="${version#v}"
-  echo "usque_${version}_${os}_${arch}.zip"
-}
+# ================== 写配置 ==================
+write_config() {
+    local ss_port="$1"
+    local password="$2"
+    local dns="$3"
+    local stls_port="$4"
+    local stls_sni="$5"
+    local stls_pwd="$6"
 
-write_runtime_env() {
-  local mode bind port tmp
-  mode="$1"
-  bind="$2"
-  port="$3"
-  run_as_root mkdir -p "$CONFIG_DIR"
-  tmp="$(mktemp)"
-  cat > "$tmp" <<EOF
-USQUE_MODE="$mode"
-USQUE_BIND="$bind"
-USQUE_PORT="$port"
+    mkdir -p "$SS_DIR"
+
+    DNS_JSON=$(echo "$dns" | awk -F',' '{
+        for(i=1;i<=NF;i++){
+            gsub(/^[ \t]+|[ \t]+$/, "", $i)
+            printf "%s\"%s\"", (i>1?",":""), $i
+        }
+    }')
+
+    # SS 绑定在本地环回 127.0.0.1
+    cat > "$SS_CONFIG" <<EOF
+{
+    "server": "127.0.0.1",
+    "server_port": $ss_port,
+    "password": "$password",
+    "method": "$METHOD",
+    "fast_open": true,
+    "mode": "tcp_and_udp",
+    "timeout": 300,
+    "no_delay": true,
+    "ipv6_first": false,
+    "nameserver": [
+        $DNS_JSON
+    ]
+}
 EOF
-  run_as_root install -m 0644 "$tmp" "$STATE_FILE"
-  rm -f "$tmp"
+    chmod 600 "$SS_CONFIG"
+
+    cat > "$STLS_ENV_FILE" <<EOF
+STLS_LISTEN=:::$stls_port
+STLS_SERVER=127.0.0.1:$ss_port
+STLS_TLS=$stls_sni:443
+STLS_PASSWORD=$stls_pwd
+EOF
+    chmod 600 "$STLS_ENV_FILE"
+    chown -R ${RUN_USER}:${RUN_USER} "$SS_DIR"
 }
 
-load_runtime_env() {
-  local mode bind port
-  mode="$DEFAULT_MODE"
-  bind="$DEFAULT_BIND"
-  port="$DEFAULT_PORT"
-  if [ -f "$STATE_FILE" ]; then
-    # shellcheck disable=SC1090
-    . "$STATE_FILE"
-    mode="${USQUE_MODE:-$mode}"
-    bind="${USQUE_BIND:-$bind}"
-    port="${USQUE_PORT:-$port}"
-  fi
-  printf '%s|%s|%s\n' "$mode" "$bind" "$port"
+# ================== 生成并保存链接 ==================
+generate_links() {
+    local ss_port="$1"
+    local password="$2"
+    local stls_port="$3"
+    local stls_sni="$4"
+    local stls_pwd="$5"
+
+    IP=$(get_public_ip)
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+    ENCODED_USERINFO=$(echo -n "${METHOD}:${password}" | base64 -w 0)
+
+    # 1️⃣ 生成 shadow-tls JSON 并在 base64 编码
+    SHADOWTLS_JSON="{\"version\":\"3\",\"password\":\"${stls_pwd}\",\"host\":\"${stls_sni}\"}"
+    SHADOWTLS_BASE=$(echo -n "$SHADOWTLS_JSON" | base64 -w 0)
+
+    # 标准 SS 链接 (通过 plugin 携带 Base64 后的配置数据)
+    cat > "${SS_DIR}/ss.txt" <<EOF
+ss://${ENCODED_USERINFO}@${IP}:${stls_port}/?plugin=shadow-tls%3B${SHADOWTLS_BASE}#${HOSTNAME}-STLS
+EOF
+
+    # Surge 节点配置格式
+    cat > "${SS_DIR}/surge.txt" <<EOF
+$HOSTNAME = ss, $IP, $stls_port, encrypt-method=$METHOD, password=$password, shadow-tls-password=$stls_pwd, shadow-tls-sni=$stls_sni, shadow-tls-version=3, tfo=true, udp-relay=true, ecn=true
+EOF
 }
 
-require_valid_port() {
-  local port
-  port="$1"
-  [[ "$port" =~ ^[0-9]+$ ]] || die "端口必须是数字"
-  [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "端口必须在 1-65535 之间"
-}
+# ================== 配置逻辑 ==================
+configure_ss() {
+    echo -e "${GREEN}[信息] 开始配置 Shadowsocks + Shadow-TLS...${RESET}"
+    
+    local ss_port password dns stls_port stls_sni stls_pwd
 
-port_in_use() {
-  local port
-  port="$1"
-  if command -v ss >/dev/null 2>&1; then
-    ss -lnt | awk '{print $4}' | grep -Eq "[:.]${port}$"
-  elif command -v netstat >/dev/null 2>&1; then
-    netstat -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$"
-  else
-    return 1
-  fi
-}
+    # 1. 自定义公网端口 (Shadow-TLS 端口)
+    while true; do
+        read -p "请输入外网公网端口 (默认: 随机生成): " input_stls_port
+        if [[ -z "$input_stls_port" ]]; then
+            stls_port=$(random_port)
+        else
+            stls_port="$input_stls_port"
+        fi
 
-download_and_install_binary() {
-  local version os arch asset url tmpdir checksum_file actual expected
-  version="$1"
-  os="$2"
-  arch="$3"
-  asset="$(build_asset_name "$version" "$os" "$arch")"
-  url="https://github.com/$REPO/releases/download/$version/$asset"
-  tmpdir="$(mktemp -d)"
+        if [[ "$stls_port" =~ ^[0-9]+$ ]] && [[ "$stls_port" -ge 1 ]] && [[ "$stls_port" -le 65535 ]]; then
+            check_port "$stls_port" || continue
+            break
+        else
+            echo -e "${RED}端口无效${RESET}"
+        fi
+    done
 
-  info "下载 $asset"
-  curl -fL "$url" -o "$tmpdir/$asset" || {
-    rm -rf "$tmpdir"
-    die "下载失败: $url"
-  }
+    # 2. 自定义本地内部隔离端口 (SS 端口)
+    while true; do
+        read -p "请输入SS内部隔离端口 (默认: 随机生成): " input_ss_port
+        if [[ -z "$input_ss_port" ]]; then
+            ss_port=$(random_port)
+        else
+            ss_port="$input_ss_port"
+        fi
 
-  checksum_file="$tmpdir/checksums.txt"
-  if curl -fsSL "https://github.com/$REPO/releases/download/$version/checksums.txt" -o "$checksum_file"; then
-    expected="$(grep "  $asset$" "$checksum_file" | awk '{print $1}')"
-    if [ -n "$expected" ] && command -v sha256sum >/dev/null 2>&1; then
-      actual="$(sha256sum "$tmpdir/$asset" | awk '{print $1}')"
-      [ "$actual" = "$expected" ] || {
-        rm -rf "$tmpdir"
-        die "校验失败: $asset"
-      }
-      info "SHA256 校验通过"
+        if [[ "$ss_port" =~ ^[0-9]+$ ]] && [[ "$ss_port" -ge 1 ]] && [[ "$ss_port" -le 65535 ]]; then
+            if [[ "$ss_port" -eq "$stls_port" ]]; then
+                echo -e "${RED}SS端口不能与公网端口相同！${RESET}"
+                continue
+            fi
+            check_port "$ss_port" || continue
+            break
+        else
+            echo -e "${RED}端口无效${RESET}"
+        fi
+    done
+
+    # 3. SS 密码
+    read -p "请输入SS密码 (默认: 随机生成): " input_password
+    if [[ -z "$input_password" ]]; then
+        password=$(random_key)
     else
-      warn "跳过 SHA256 校验（未找到匹配校验值或 sha256sum）"
+        validate_password "$input_password" || return
+        password="$input_password"
     fi
-  else
-    warn "未获取到 checksums.txt，跳过校验"
-  fi
 
-  unzip -qo "$tmpdir/$asset" -d "$tmpdir/unpack"
-  [ -f "$tmpdir/unpack/$BIN_NAME" ] || {
-    rm -rf "$tmpdir"
-    die "压缩包中未找到 $BIN_NAME"
-  }
-  chmod +x "$tmpdir/unpack/$BIN_NAME"
-  run_as_root mkdir -p "$INSTALL_DIR"
-  run_as_root install -m 0755 "$tmpdir/unpack/$BIN_NAME" "$BIN_PATH"
-  rm -rf "$tmpdir"
-  info "已更新到 $BIN_PATH"
+    # 4. Shadow-TLS 密码
+    read -p "请输入Shadow-TLS密码 (默认: 随机生成): " input_stls_pwd
+    stls_pwd=${input_stls_pwd:-$(openssl rand -hex 16)}
+
+    # 5. 伪装 SNI 域名
+    read -p "请输入SNI伪装域名 (默认: gateway.icloud.com): " input_sni
+    stls_sni=${input_sni:-"gateway.icloud.com"}
+
+    # 6. DNS
+    default_dns=$(get_system_dns)
+    [[ -z "$default_dns" ]] && default_dns="1.1.1.1,8.8.8.8"
+    read -p "请输入 DNS (默认: $default_dns): " dns
+    dns=${dns:-$default_dns}
+
+    write_config "$ss_port" "$password" "$dns" "$stls_port" "$stls_sni" "$stls_pwd"
+    generate_links "$ss_port" "$password" "$stls_port" "$stls_sni" "$stls_pwd"
+
+    echo -e "${GREEN}[完成] 配置已保存${RESET}"
+    print_node_info
 }
 
-create_systemd_service() {
-  local tmp
-  tmp="$(mktemp)"
-  cat > "$tmp" <<EOF
+# ================== 打印配置详情 ==================
+print_node_info() {
+    IP=$(get_public_ip)
+    if [[ ! -f "$STLS_ENV_FILE" ]]; then
+        echo -e "${RED}配置文件不存在${RESET}" && return
+    fi
+    source "$STLS_ENV_FILE"
+    local ss_port=$(grep server_port "$SS_CONFIG" | grep -o '[0-9]\+')
+    local password=$(grep password "$SS_CONFIG" | cut -d '"' -f4)
+
+    echo -e "${GREEN}====== Shadowsocks + Shadow-TLS 配置 ======${RESET}"
+    echo -e "${YELLOW} 公网 IP 地址   : ${IP}${RESET}"
+    echo -e "${YELLOW} 外网公网端口   : ${STLS_LISTEN##*:}${RESET}"
+    echo -e "${YELLOW} Shadow-TLS 密码 : ${STLS_PASSWORD}${RESET}"
+    echo -e "${YELLOW} SNI 伪装域名    : ${STLS_TLS%% *}${RESET}"
+    echo -e "${YELLOW} SS内部隔离端口  : ${ss_port} (外部不可访问)${RESET}"
+    echo -e "${YELLOW} SS 密码        : ${password}${RESET}"
+    echo -e "${YELLOW} 加密方式       : ${METHOD}${RESET}"
+    echo -e "${YELLOW}-------------------------------------------------${RESET}"
+    echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
+    echo -e "${GREEN}[信息] SS 链接：${RESET}"
+    cat "${SS_DIR}/ss.txt"
+    echo -e ""
+    echo -e "${YELLOW}Surge配置:${RESET}"
+    echo -e "${YELLOW}$(cat "${SS_DIR}/surge.txt")${RESET}"
+    echo -e "${YELLOW}-------------------------------------------------${RESET}"
+}
+
+# ================== 修改配置 ==================
+modify_ss() {
+    echo -e "${GREEN}[信息] 开始修改配置...${RESET}"
+    if [[ ! -f "$SS_CONFIG" ]] || [[ ! -f "$STLS_ENV_FILE" ]]; then
+        echo -e "${RED}配置文件不存在，请先安装。${RESET}" && return
+    fi
+    configure_ss
+    systemctl restart ss-rust shadow-tls
+    log "配置已修改并重启服务"
+}
+
+# ================== 安装 ==================
+install_ss() {
+    echo -e "${GREEN}[信息] 开始安装 Shadowsocks-Rust & Shadow-TLS...${RESET}"
+    check_deps
+    create_user
+    mkdir -p "$SS_DIR"
+    cd "$TMP_DIR"
+
+    # 安装 Shadowsocks-Rust
+    VERSION=$(get_latest_version)
+    ARCH=$(detect_arch)
+    URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${VERSION}/shadowsocks-v${VERSION}.${ARCH}.tar.xz"
+    wget -O ss.tar.xz "$URL" && tar -xf ss.tar.xz && install -m 755 ssserver "$BINARY_PATH"
+    echo "$VERSION" > "${SS_DIR}/version.txt"
+
+    # 安装 Shadow-TLS
+    STLS_VERSION=$(get_latest_stls_version)
+    STLS_ARCH=$(detect_stls_arch)
+    STLS_URL="https://github.com/ihciah/shadow-tls/releases/download/${STLS_VERSION}/shadow-tls-${STLS_ARCH}"
+    wget -O shadow-tls "$STLS_URL" && install -m 755 shadow-tls "$STLS_BINARY_PATH"
+    echo "$STLS_VERSION" > "${SS_DIR}/stls_version.txt"
+
+    configure_ss
+
+    # ===== systemd: ss-rust =====
+    cat > "$SS_SERVICE" <<EOF
 [Unit]
-Description=usque Cloudflare WARP MASQUE service
+Description=Shadowsocks Rust Server
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=-$STATE_FILE
-ExecStart=/bin/sh -c 'exec "$BIN_PATH" -c "$CONFIG_PATH" "\${USQUE_MODE:-socks}" --bind "\${USQUE_BIND:-127.0.0.1}" --port "\${USQUE_PORT:-1080}"'
-Restart=always
-RestartSec=5
+User=${RUN_USER}
+Group=${RUN_USER}
+ExecStart=${BINARY_PATH} -c ${SS_CONFIG}
+Restart=on-failure
+RestartSec=3
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+LimitNOFILE=1048576
+EOF
+
+    # ===== systemd: shadow-tls =====
+    cat > "$STLS_SERVICE" <<EOF
+[Unit]
+Description=Shadow-TLS Server Service
+After=network-online.target ss-rust.service
+Requires=ss-rust.service
+
+[Service]
+Type=simple
+User=${RUN_USER}
+Group=${RUN_USER}
+EnvironmentFile=${STLS_ENV_FILE}
+ExecStart=${STLS_BINARY_PATH} --fastopen server --listen \$STLS_LISTEN --server \$STLS_SERVER --tls \$STLS_TLS --password \$STLS_PASSWORD --v3
+Restart=on-failure
+RestartSec=3
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  run_as_root install -m 0644 "$tmp" "$SERVICE_FILE"
-  rm -f "$tmp"
-  run_as_root systemctl daemon-reload
-  run_as_root systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+
+    systemctl daemon-reload
+    systemctl enable ss-rust shadow-tls
+    systemctl restart ss-rust shadow-tls
+    echo -e "${GREEN}[完成] 服务已成功安装并启动！${RESET}"
+    log "安装完成"
 }
 
-ensure_systemd_service() {
-  [ "$(pick_service_manager)" = "systemd" ] || return 0
-  create_systemd_service
-}
-
-get_installed_version() {
-  if [ ! -x "$BIN_PATH" ]; then
-    echo "-"
-    return
-  fi
-  "$BIN_PATH" version 2>/dev/null | head -n1 | awk -F': ' '{print $2}'
-}
-
-config_exists() {
-  [ -s "$CONFIG_PATH" ]
-}
-
-auto_register() {
-  [ -x "$BIN_PATH" ] || die "usque 未安装，请先安装"
-
-  if config_exists; then
-    info "检测到已存在配置，跳过自动注册"
-    return 0
-  fi
-
-  run_as_root mkdir -p "$CONFIG_DIR"
-
-  local args
-  args="-c $CONFIG_PATH register -a"
-
-  if [ -n "$AUTO_REGISTER_NAME" ]; then
-    args="$args -n '$AUTO_REGISTER_NAME'"
-  fi
-  if [ -n "$AUTO_REGISTER_LOCALE" ]; then
-    args="$args -l '$AUTO_REGISTER_LOCALE'"
-  fi
-  if [ -n "$AUTO_REGISTER_MODEL" ]; then
-    args="$args -m '$AUTO_REGISTER_MODEL'"
-  fi
-  if [ -n "$AUTO_REGISTER_JWT" ]; then
-    args="$args --jwt '$AUTO_REGISTER_JWT'"
-  fi
-
-  info "开始自动注册..."
-  run_as_root /bin/sh -c "exec '$BIN_PATH' $args"
-
-  config_exists || die "自动注册失败，未生成配置文件"
-  info "自动注册完成: $CONFIG_PATH"
-}
-
-prompt_install_options() {
-  local current_runtime current_mode current_bind current_port input
-  current_runtime="$(load_runtime_env)"
-  current_mode="${current_runtime%%|*}"
-  current_bind="$(printf '%s' "$current_runtime" | cut -d'|' -f2)"
-  current_port="$(printf '%s' "$current_runtime" | cut -d'|' -f3)"
-
-  printf '模式 [socks/http-proxy] (默认 %s): ' "$current_mode"
-  read -r input
-  if [ -n "$input" ]; then
-    case "$input" in
-      socks|http-proxy) current_mode="$input" ;;
-      *) die "模式只支持 socks 或 http-proxy" ;;
-    esac
-  fi
-
-  printf '监听地址 (默认 %s): ' "$current_bind"
-  read -r input
-  if [ -n "$input" ]; then
-    current_bind="$input"
-  fi
-
-  printf '端口 (默认 %s): ' "$current_port"
-  read -r input
-  if [ -n "$input" ]; then
-    require_valid_port "$input"
-    current_port="$input"
-  fi
-
-  printf '设备名（可留空）: '
-  read -r input
-  AUTO_REGISTER_NAME="$input"
-
-  printf 'ZeroTrust JWT（可留空）: '
-  read -r input
-  AUTO_REGISTER_JWT="$input"
-
-  if port_in_use "$current_port"; then
-    warn "检测到端口 $current_port 可能已被占用，启动前请确认"
-  fi
-
-  write_runtime_env "$current_mode" "$current_bind" "$current_port"
-}
-
-install_register_start() {
-  prompt_install_options
-  update_usque
-
-  if [ "$(pick_service_manager)" = "systemd" ] && [ -f "$SERVICE_FILE" ]; then
-    start_service
-    info "安装完成"
-  else
-    warn "当前系统未使用 systemd，已完成部署和注册，请手动启动"
-  fi
-}
-
-show_status() {
-  local runtime mode bind port installed svc status_line version
-  runtime="$(load_runtime_env)"
-  mode="${runtime%%|*}"
-  bind="$(printf '%s' "$runtime" | cut -d'|' -f2)"
-  port="$(printf '%s' "$runtime" | cut -d'|' -f3)"
-  
-  installed="未安装"
-  version="-"
-  if [ -x "$BIN_PATH" ]; then
-    installed="已安装"
-    version="$(get_installed_version)"
-    version="${version:--}"
-  fi
-  
-  svc="$(pick_service_manager)"
-  status_line="未运行"
-  if [ "$svc" = "systemd" ] && [ -f "$SERVICE_FILE" ]; then
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-      status_line="运行中"
-    fi
-  else
-    status_line="未安装"
-  fi
-
-  echo -e "${GREEN}================================${RESET}"
-  echo -e "${GREEN}         usque 管理面板          ${RESET}"
-  echo -e "${GREEN}================================${RESET}"
-  echo -e "${GREEN}状态   :${RESET} ${YELLOW}$status_line${RESET}"
-  echo -e "${GREEN}版本   :${RESET} ${YELLOW}$version${RESET}"
-  echo -e "${GREEN}模式   :${RESET} ${YELLOW}$mode${RESET}"
-  echo -e "${GREEN}监听   :${RESET} ${YELLOW}${bind}:${port}${RESET}"
-  echo -e "${GREEN}================================${RESET}"
-  echo -e "${GREEN} 1. 安装 usque${RESET}"
-  echo -e "${GREEN} 2. 更新 usque${RESET}"
-  echo -e "${GREEN} 3. 卸载 usque${RESET}"
-  echo -e "${GREEN} 4. 更换端口${RESET}"
-  echo -e "${GREEN} 5. 启动 usque${RESET}"
-  echo -e "${GREEN} 6. 停止 usque${RESET}"
-  echo -e "${GREEN} 7. 重启 usque${RESET}"
-  echo -e "${GREEN} 8. 查看服务日志${RESET}"
-  echo -e "${GREEN} 0. 退出${RESET}"
-  echo -e "${GREEN}================================${RESET}"
-}
-
-update_usque() {
-  local os arch version runtime mode bind port
-  need_cmd uname
-
-  # 如果没有 curl、unzip 或 python3，直接进入自动安装流程，而不是拦截报错
-  if ! command -v curl >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
-    install_packages
-  fi
-
-  os="$(detect_os)"
-  arch="$(detect_arch)"
-  version="$(fetch_latest_release)"
-  info "系统: $os"
-  info "架构: $arch"
-  info "最新版本: $version"
-
-  download_and_install_binary "$version" "$os" "$arch"
-  run_as_root mkdir -p "$CONFIG_DIR"
-
-  runtime="$(load_runtime_env)"
-  mode="${runtime%%|*}"
-  bind="$(printf '%s' "$runtime" | cut -d'|' -f2)"
-  port="$(printf '%s' "$runtime" | cut -d'|' -f3)"
-  write_runtime_env "$mode" "$bind" "$port"
-
-  if [ "$os" = "linux" ] && [ "$(pick_service_manager)" = "systemd" ]; then
-    ensure_systemd_service
-    info "已创建 systemd 服务"
-  else
-    warn "当前系统未创建 systemd 服务"
-  fi
-
-  "$BIN_PATH" version || true
-  auto_register
-  log
-  log "安装完成"
-  log "手动启动: $BIN_PATH -c $CONFIG_PATH $mode --bind $bind --port $port"
-}
-
-uninstall_usque() {
-  if [ "$(pick_service_manager)" = "systemd" ] && [ -f "$SERVICE_FILE" ]; then
-    run_as_root systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
-    run_as_root systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
-    run_as_root rm -f "$SERVICE_FILE"
-    run_as_root systemctl daemon-reload
-  fi
-
-  run_as_root rm -f "$BIN_PATH"
-  run_as_root rm -f "$STATE_FILE"
-  if [ -d "$CONFIG_DIR" ]; then
-    run_as_root rm -rf "$CONFIG_DIR"
-  fi
-  log "卸载完成"
-}
-
-change_port() {
-  local runtime mode bind old_port new_port
-  runtime="$(load_runtime_env)"
-  mode="${runtime%%|*}"
-  bind="$(printf '%s' "$runtime" | cut -d'|' -f2)"
-  old_port="$(printf '%s' "$runtime" | cut -d'|' -f3)"
-
-  printf '当前端口 %s，输入新端口: ' "$old_port"
-  read -r new_port
-  require_valid_port "$new_port"
-
-  if [ "$new_port" != "$old_port" ] && port_in_use "$new_port"; then
-    die "端口 $new_port 已被占用"
-  fi
-
-  write_runtime_env "$mode" "$bind" "$new_port"
-  info "端口已更新为 $new_port"
-
-  if [ "$(pick_service_manager)" = "systemd" ] && [ -f "$SERVICE_FILE" ]; then
-    run_as_root systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
-    info "已尝试重启服务"
-  fi
-}
-
-start_service() {
-  [ "$(pick_service_manager)" = "systemd" ] || die "当前系统不支持 systemd 服务管理"
-  [ -f "$SERVICE_FILE" ] || die "服务文件不存在，请先安装"
-  run_as_root systemctl start "$SERVICE_NAME"
-  info "服务已启动"
-}
-
-stop_service() {
-  [ "$(pick_service_manager)" = "systemd" ] || die "当前系统不支持 systemd 服务管理"
-  [ -f "$SERVICE_FILE" ] || die "服务文件不存在"
-  run_as_root systemctl stop "$SERVICE_NAME"
-  info "服务已停止"
-}
-
-restart_service() {
-  [ "$(pick_service_manager)" = "systemd" ] || die "当前系统不支持 systemd 服务管理"
-  [ -f "$SERVICE_FILE" ] || die "服务文件不存在"
-  run_as_root systemctl restart "$SERVICE_NAME"
-  info "服务已重启"
-}
-
-service_status() {
-  [ "$(pick_service_manager)" = "systemd" ] || die "当前系统不支持 systemd 服务管理"
-  [ -f "$SERVICE_FILE" ] || die "服务文件不存在"
-  run_as_root systemctl status "$SERVICE_NAME" --no-pager
-}
-
-pause() {
-  printf "\n${GREEN}按回车继续...${RESET}"
-  read -r _
-}
-
-menu_loop() {
-  local choice
-  while true; do
-    clear || true
-    show_status
+# ================== 更新 ==================
+update_ss() {
+    echo -e "${GREEN}[信息] 开始更新二进制文件...${RESET}"
+    cd "$TMP_DIR"
     
-    printf "${GREEN}请选择: ${RESET}"
-    read -r choice
-    case "$choice" in
-      1) install_register_start ;;
-      2) update_usque ;;
-      3) uninstall_usque ;;
-      4) change_port ;;
-      5) start_service ;;
-      6) stop_service ;;
-      7) restart_service ;;
-      8) service_status ;;
-      0) exit 0 ;;
-      *) warn "无效选项" ;;
-    esac
-    pause
-  done
+    if [[ -f "$SS_CONFIG" ]]; then
+        VERSION=$(get_latest_version)
+        ARCH=$(detect_arch)
+        wget -O ss.tar.xz "https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${VERSION}/shadowsocks-v${VERSION}.${ARCH}.tar.xz"
+        tar -xf ss.tar.xz && install -m 755 ssserver "$BINARY_PATH"
+        echo "$VERSION" > "${SS_DIR}/version.txt"
+    fi
+
+    if [[ -f "$STLS_ENV_FILE" ]]; then
+        STLS_VERSION=$(get_latest_stls_version)
+        STLS_ARCH=$(detect_stls_arch)
+        wget -O shadow-tls "https://github.com/ihciah/shadow-tls/releases/download/${STLS_VERSION}/shadow-tls-${STLS_ARCH}"
+        install -m 755 shadow-tls "$STLS_BINARY_PATH"
+        echo "$STLS_VERSION" > "${SS_DIR}/stls_version.txt"
+    fi
+
+    systemctl restart ss-rust shadow-tls
+    echo -e "${GREEN}[完成] 更新执行完毕${RESET}"
+    log "更新成功"
 }
 
-menu_loop "$@"
+# ================== 卸载 ==================
+uninstall_ss() {
+    echo -e "${RED}[警告] 正在卸载服务...${RESET}"
+    systemctl stop shadow-tls ss-rust || true
+    systemctl disable shadow-tls ss-rust || true
+    rm -f "$SS_SERVICE" "$STLS_SERVICE"
+    rm -rf "$SS_DIR"
+    rm -f "$BINARY_PATH" "$STLS_BINARY_PATH"
+    systemctl daemon-reload
+    echo -e "${GREEN}[完成] 卸载清理完毕${RESET}"
+    log "卸载成功"
+}
+
+# ================== 菜单 ==================
+show_menu() {
+    clear
+    local status_ss="${RED}● SS未运行${RESET}"
+    local status_stls="${RED}● TLS未运行${RESET}"
+    systemctl is-active --quiet ss-rust && status_ss="${GREEN}● SS运行中${RESET}"
+    systemctl is-active --quiet shadow-tls && status_stls="${GREEN}● TLS运行中${RESET}"
+
+    local v_ss="未安装" && [[ -f "${SS_DIR}/version.txt" ]] && v_ss="v$(cat "${SS_DIR}/version.txt")"
+    local v_stls="未安装" && [[ -f "${SS_DIR}/stls_version.txt" ]] && v_stls="$(cat "${SS_DIR}/stls_version.txt")"
+    local p_stls="-" && [[ -f "$STLS_ENV_FILE" ]] && { source "$STLS_ENV_FILE"; p_stls="${STLS_LISTEN##*:}"; }
+
+    echo -e "${GREEN}===========================================${RESET}"
+    echo -e "${GREEN}      Shadowsocks + Shadow-TLS 管理面板     ${RESET}"
+    echo -e "${GREEN}===========================================${RESET}"
+    echo -e "${GREEN}服务状态 :${RESET} ${status_ss}  /  ${status_stls}"
+    echo -e "${GREEN}组件版本 :${RESET} SS: ${YELLOW}${v_ss}${RESET} | Shadow-TLS: ${YELLOW}${v_stls}${RESET}"
+    echo -e "${GREEN}公网端口 :${RESET} ${YELLOW}${p_stls}${RESET}"
+    echo -e "${GREEN}===========================================${RESET}"
+    echo -e "${GREEN}1. 安装 一体化服务 (SS + Shadow-TLS)${RESET}"
+    echo -e "${GREEN}2. 更新 二进制核心${RESET}"
+    echo -e "${GREEN}3. 卸载 一体化服务${RESET}"
+    echo -e "${GREEN}4. 修改 节点配置${RESET}"
+    echo -e "${GREEN}5. 启动 节点服务${RESET}"
+    echo -e "${GREEN}6. 停止 节点服务${RESET}"
+    echo -e "${GREEN}7. 重启 节点服务${RESET}"
+    echo -e "${GREEN}8. 查看 服务日志 (Shadow-TLS)${RESET}"
+    echo -e "${GREEN}9. 查看 当前节点链接配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}===========================================${RESET}"
+}
+
+# ================== 主循环 ==================
+while true; do
+    show_menu
+    read -r -p $'\033[32m请输入选项: \033[0m' choice
+    case $choice in
+        1) install_ss; pause ;;
+        2) update_ss; pause ;;
+        3) uninstall_ss; pause ;;
+        4) modify_ss; pause ;;
+        5) systemctl start ss-rust shadow-tls; echo -e "${GREEN}[完成] 服务已启动${RESET}"; pause ;;
+        6) systemctl stop shadow-tls ss-rust; echo -e "${GREEN}[完成] 服务已停止${RESET}"; pause ;;
+        7) systemctl restart ss-rust shadow-tls; echo -e "${GREEN}[完成] 服务已重启${RESET}"; pause ;;
+        8) journalctl -u shadow-tls -e --no-pager; pause ;;
+        9) print_node_info; pause ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效输入${RESET}"; pause ;;
+    esac
+done

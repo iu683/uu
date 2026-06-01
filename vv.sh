@@ -4,7 +4,6 @@ set -e
 #================================================================================
 # 常量和全局变量
 #================================================================================
-VERSION="1.1.5"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -18,6 +17,15 @@ NC='\033[0m'
 CONFIG_FILE="/etc/tun2socks/config.yaml"
 SERVICE_FILE="/etc/systemd/system/tun2socks.service"
 BINARY_PATH="/usr/local/bin/tun2socks"
+
+# 备用 DNS64 服务器（用于纯 IPv6 环境下代理/解析 GitHub）
+ALTERNATE_DNS64_SERVERS=(
+    "2a00:1098:2b::1"
+    "2a01:4f8:c2c:123f::1"
+    "2a01:4f9:c010:3f02::1"
+    "2001:67c:2b0::4"
+    "2001:67c:2b0::6"
+)
 
 #================================================================================
 # 日志和工具函数
@@ -205,17 +213,44 @@ install_tun2socks() {
     step "正在获取 tun2socks 最新内核..."
     mkdir -p "/etc/tun2socks"
     local REPO="heiher/hev-socks5-tunnel"
-    local DOWNLOAD_URL=$(curl -s https://api.github.com/repos/$REPO/releases/latest | grep "browser_download_url" | grep "linux-x86_64" | cut -d '"' -f 4)
+    local DOWNLOAD_URL=""
     
+    # 尝试直接通过常规网络获取
+    DOWNLOAD_URL=$(curl -s --connect-timeout 5 https://api.github.com/repos/$REPO/releases/latest | grep "browser_download_url" | grep "linux-x86_64" | cut -d '"' -f 4)
+    
+    # 如果常规网络失败（纯 v6 环境无法直接请求 GitHub v4 地址），切换 DNS64 试错法
     if [ -z "$DOWNLOAD_URL" ]; then
-        error "无法获取下载链接，请检查网络是否能访问 GitHub 接口。"
+        warning "常规连接失败，检测到可能处于纯 IPv6 环境，正在尝试轮询 DNS64 备用服务器..."
+        for dns64 in "${ALTERNATE_DNS64_SERVERS[@]}"; do
+            info "尝试通过 DNS64 [$dns64] 获取资源..."
+            DOWNLOAD_URL=$(curl -s --connect-timeout 5 --dns-servers "$dns64" https://api.github.com/repos/$REPO/releases/latest | grep "browser_download_url" | grep "linux-x86_64" | cut -d '"' -f 4)
+            if [ -n "$DOWNLOAD_URL" ]; then
+                success "成功通过 DNS64 服务器 [$dns64] 获取到下载链接。"
+                # 记录当前有效的 dns64 服务供后续下载使用
+                local active_dns64="$dns64"
+                break
+            fi
+        done
+    fi
+
+    if [ -z "$DOWNLOAD_URL" ]; then
+        error "无法获取下载链接。请检查网络或确认 DNS64 备用服务器是否可用。"
         return 1
     fi
 
     info "开始下载: $DOWNLOAD_URL"
-    if ! curl -L -o "$BINARY_PATH" "$DOWNLOAD_URL"; then
-        error "下载核心文件失败，请检查网络。"
-        return 1
+    
+    # 根据是否使用了 DNS64 决定 curl 的参数
+    if [ -n "$active_dns64" ]; then
+        if ! curl -L --dns-servers "$active_dns64" -o "$BINARY_PATH" "$DOWNLOAD_URL"; then
+            error "通过 DNS64 下载核心文件失败。"
+            return 1
+        fi
+    else
+        if ! curl -L -o "$BINARY_PATH" "$DOWNLOAD_URL"; then
+            error "下载核心文件失败，请检查网络。"
+            return 1
+        fi
     fi
     chmod +x "$BINARY_PATH"
 
@@ -249,9 +284,9 @@ show_menu() {
     clear
     # 1. 动态获取状态
     if [ -f "$SERVICE_FILE" ] && systemctl is-active --quiet tun2socks.service; then
-        status_line="${GREEN}正在运行 (Running)${NC}"
+        status_line="${GREEN}正在运行${NC}"
     else
-        status_line="${RED}未运行 (Stopped)${NC}"
+        status_line="${RED}未运行${NC}"
     fi
 
     # 2. 动态获取配置
@@ -270,7 +305,6 @@ show_menu() {
     echo -e "${GREEN}       tun2socks 管理面板        ${NC}"
     echo -e "${GREEN}================================${NC}"
     echo -e "${GREEN}状态   :${NC} ${status_line}"
-    echo -e "${GREEN}版本   :${NC} ${YELLOW}$VERSION${NC}"
     echo -e "${GREEN}模式   :${NC} ${YELLOW}$mode_val${NC}"
     echo -e "${GREEN}监听   :${NC} ${YELLOW}${bind}:${port}${NC}"
     echo -e "${GREEN}================================${NC}"
@@ -293,7 +327,7 @@ main() {
     
     while true; do
         show_menu
-        read -r -p "请选择操作 [0-7]: " choice
+        read -r -p "请选择操作: " choice
         case "$choice" in
             1)
                 install_tun2socks
@@ -337,7 +371,6 @@ main() {
                 fi
                 ;;
             0)
-                info "感谢使用，再见！"
                 exit 0
                 ;;
             *)

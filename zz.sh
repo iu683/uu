@@ -124,11 +124,11 @@ get_latest_stls_version() {
 
 # ================== 安全的数据提取引擎 ==================
 load_existing_config() {
-    OLD_STLS_PORT="443"
+    OLD_STLS_PORT="8443"
     OLD_SNELL_PORT=""
     OLD_SNELL_PSK=""
     OLD_STLS_PWD=""
-    OLD_STLS_SNI="gateway.icloud.com"
+    OLD_STLS_SNI="captive.apple.com"
     OLD_DNS=""
     OLD_IPV6="false"
     OLD_TFO="true"
@@ -207,7 +207,7 @@ generate_links() {
     HOSTNAME=$(hostname -s 2>/dev/null | sed 's/ /_/g' || echo "server")
 
     cat > "${SNELL_DIR}/surge.txt" <<EOF
-$HOSTNAME-Snell+ShadowTLS = snell, $IP, $stls_port, psk=$psk, version=5, tfo=$tfo, ecn=true, shadow-tls-password=$stls_pwd, shadow-tls-sni=$stls_sni, shadow-tls-v3=true
+$HOSTNAME-Snell+ShadowTLS = snell, $IP, $stls_port, psk=$psk, version=5, tfo=$tfo, shadow-tls-password=$stls_pwd, shadow-tls-sni=$stls_sni, shadow-tls-version=3, ecn=true
 EOF
     chown snell-tls:snell-tls "${SNELL_DIR}/surge.txt" || true
 }
@@ -401,7 +401,7 @@ execute_configuration_flow() {
     while true; do
         local default_sni=${OLD_STLS_SNI:-"gateway.icloud.com"}
         if [ "$is_modify_mode" = true ]; then
-            printf "请输入Shadow-TLS SNI伪装域名 (当前: %s, 回車保持不修改): " "$default_sni"
+            printf "请输入Shadow-TLS SNI伪装域名 (当前: %s, 回车保持不修改): " "$default_sni"
         else
             printf "请输入Shadow-TLS SNI伪装域名 (默认: %s, 回车直接采纳): " "$default_sni"
         fi
@@ -567,7 +567,7 @@ uninstall_ss() {
     rm -rf "$SNELL_DIR"
     rm -f "$SNELL_File" "$STLS_File"
     systemctl daemon-reload
-    echo -e "${GREEN}[完成] 卸载清理完毕，未对原有系统默认 Snell 产生任何干扰${RESET}"
+    echo -e "${GREEN}[完成] 卸载清理完毕${RESET}"
     log "安全卸载成功"
 }
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Xray (HTTP) 控制面板 
+# Xray (HTTP) 控制面板 (Alpine Linux 专属版)
 #
 # =========================================================
 # 1. 核心控制与全局环境初始化
@@ -18,9 +18,11 @@ RESET="\033[0m"
 
 # ================== 基础变量 ==================
 readonly SERVICE_NAME="xrayhttp"
-readonly XRAY_CONFIG="/usr/local/etc/${SERVICE_NAME}/config.json"
+readonly XRAY_CONFIG="/etc/${SERVICE_NAME}/config.json"
 readonly XRAY_BINARY="/usr/local/bin/${SERVICE_NAME}"
 readonly LINK_FILE="/root/proxynode/http/xray_http.txt"
+readonly INIT_FILE="/etc/init.d/${SERVICE_NAME}"
+readonly X_LOG="/var/log/${SERVICE_NAME}.log"
 
 # 降级备用版本
 readonly BACKUP_VERSION="26.3.27"
@@ -42,7 +44,7 @@ pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
 
 # ================== 获取公网IP ==================
 get_public_ip() {
-    local ip
+    local ip=""
 
     for cmd in "curl -4fsSL --max-time 5" "wget -4qO- --timeout=5"; do
         for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
@@ -87,13 +89,14 @@ url_encode() {
     echo "${encoded}"
 }
 
-# ================== 检查端口占用 ==================
+# ================== 检查端口占用 (Alpine 适配版) ==================
 check_port() {
     local port="$1"
-    if ss -tuln | awk '{print $5}' | grep -qE "[:.]${port}$"; then
+    # 使用 Alpine 自带的 netstat 进行端口过滤
+    if netstat -tuln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}$"; then
         return 1  # 被占用
     fi
-    return 0  # 没用占用
+    return 0  # 没有占用
 }
 
 # ================== 验证端口格式 ==================
@@ -103,7 +106,7 @@ is_valid_port() {
 
 # ================== 获取可用随机端口 ==================
 get_random_port() {
-    local rand_port
+    local rand_port=""
     while true; do
         rand_port=$((RANDOM % 55536 + 10000))
         if check_port "$rand_port"; then
@@ -119,7 +122,7 @@ generate_random_string() {
     if command -v openssl >/dev/null 2>&1; then
         openssl rand -hex "$((length / 2))"
     else
-        tr -dc 'a-zA-Z0-9' < /dev/urandom 2>/dev/null | head -c "$length" || echo "admin$(RANDOM)"
+        tr -dc 'a-zA-Z0-9' < /dev/urandom 2>/dev/null | head -c "$length" || echo "admin$((RANDOM))"
     fi
 }
 
@@ -137,7 +140,7 @@ get_arch() {
 
 # ================== 自动获取最新版本号 ==================
 get_latest_version() {
-    local latest_version
+    local latest_version=""
     info "正在获取 GitHub 最新 Xray 版本号..."
     
     latest_version=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
@@ -186,38 +189,34 @@ download_and_extract_xray() {
     cp -f "$TMP_DIR/extracted/geosite.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
 }
 
-# ================== 配置 Systemd 服务 ==================
-setup_systemd_service() {
-    info "配置 Systemd 服务 [${SERVICE_NAME}]..."
+# ================== 配置 OpenRC 服务 (Alpine 专用) ==================
+setup_openrc_service() {
+    info "配置 OpenRC 服务 [${SERVICE_NAME}]..."
     
-    cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
-[Unit]
-Description=Xray HTTP Server Service
-Documentation=https://github.com/XTLS/Xray-core
-After=network.target nss-lookup.target
+    cat << EOF > "$INIT_FILE"
+#!/sbin/openrc-run
+description="Xray HTTP Server Service"
+command="${XRAY_BINARY}"
+command_args="run -c ${XRAY_CONFIG}"
+command_background="yes"
+pidfile="/run/${SERVICE_NAME}.pid"
+output_log="$X_LOG"
+error_log="$X_LOG"
 
-[Service]
-User=root
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ExecStart=${XRAY_BINARY} run -config ${XRAY_CONFIG}
-Restart=on-failure
-RestartPreventExitStatus=23
-LimitNPROC=10000
-LimitNOFILE=1000000
-
-[Install]
-WantedBy=multi-user.target
+depend() {
+    need net
+    after firewall
+}
 EOF
 
-    systemctl daemon-reload
-    systemctl enable "${SERVICE_NAME}" 2>/dev/null || true
+    chmod +x "$INIT_FILE"
+    touch "$X_LOG"
+    rc-update add "${SERVICE_NAME}" default >/dev/null 2>&1 || true
 }
 
 # ================== 获取服务状态与基础参数 ==================
 get_xray_status() {
-    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+    if rc-service "${SERVICE_NAME}" status 2>/dev/null | grep -q "started"; then
         echo -e "${GREEN}● 运行中${RESET}"
     else
         echo -e "${RED}● 未运行${RESET}"
@@ -253,20 +252,22 @@ test_config() {
 }
 
 restart_xray() {
-    systemctl restart "${SERVICE_NAME}" 2>/dev/null || true
+    # 彻底关掉可能产生 bind 端口冲突的僵尸进程
+    killall "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    rc-service "${SERVICE_NAME}" restart >/dev/null 2>&1 || true
     sleep 1
 
-    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+    if rc-service "${SERVICE_NAME}" status 2>/dev/null | grep -q "started"; then
         info "${SERVICE_NAME} 启动成功"
         return 0
     fi
 
     error "${SERVICE_NAME} 启动失败"
-    journalctl -u "${SERVICE_NAME}" -n 20 --no-pager || true
+    [[ -f "$X_LOG" ]] && tail -n 20 "$X_LOG" || true
     return 1
 }
 
-# ================== 写底层配置 (已改为 HTTP 协议) ==================
+# ================== 写底层配置 ==================
 write_config() {
     local port="$1"
     local user="$2"
@@ -279,7 +280,6 @@ write_config() {
 
     local settings_json
     if [[ -n "$user" && -n "$pass" ]]; then
-        # HTTP 协议下，账号密码鉴权在 accounts 数组中
         settings_json=$(jq -n --arg u "$user" --arg p "$pass" '{"accounts": [{"user": $u, "pass": $p}]}')
     else
         settings_json=$(jq -n '{"accounts": []}')
@@ -312,51 +312,41 @@ write_config() {
     chmod 644 "$XRAY_CONFIG"
 }
 
-# ================== 生成分享链接 (已集成 http 链接与 tlink) ==================
+# ================== 生成分享链接 ==================
 generate_link() {
     mkdir -p "$(dirname "$LINK_FILE")"
-    local ip
+    local ip=""
     if ! ip=$(get_public_ip); then
         error "获取公网 IP 失败"
         return 1
     fi
 
-    local port user pass
+    local port="" user="" pass=""
     port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "8080")
     
-    # 检查 HTTP accounts 是否有内容
     user=$(jq -r '.inbounds[0].settings.accounts[0].user // empty' "$XRAY_CONFIG" 2>/dev/null || echo "")
     pass=$(jq -r '.inbounds[0].settings.accounts[0].pass // empty' "$XRAY_CONFIG" 2>/dev/null || echo "")
 
     local display_ip="$ip"
     [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
 
-    # 对 Telegram 链接的组件进行 URL 编码
-    local enc_ip enc_user enc_pass
-    enc_ip=$(url_encode "$ip")
-    enc_user=$(url_encode "$user")
-    enc_pass=$(url_encode "$pass")
-
     {
         if [[ -n "$user" && -n "$pass" ]]; then
             echo "http://${user}:${pass}@${display_ip}:${port}"
-            # Telegram 同样支持通过特定格式唤起 HTTP 代理设置（部分客户端支持）
-            echo "https://t.me/socks?server=${enc_ip}&port=${port}&user=${enc_user}&pass=${enc_pass}"
         else
             echo "http://${display_ip}:${port}"
-            echo "https://t.me/socks?server=${enc_ip}&port=${port}"
         fi
     } > "$LINK_FILE"
 }
 
-# ================== 显示配置 (已美化并整合输出) ==================
+# ================== 显示配置 ==================
 show_current_config() {
     if [[ ! -f "$XRAY_CONFIG" ]]; then
         error "配置文件不存在"
         return
     fi
 
-    local ip port user pass auth_type
+    local ip="" port="" user="" pass=""
     ip=$(get_public_ip || echo "未知")
     port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
     
@@ -379,28 +369,21 @@ show_current_config() {
         local display_ip="$ip"
         [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
 
-        local enc_ip enc_user enc_pass
-        enc_ip=$(url_encode "$ip")
-        enc_user=$(url_encode "$user")
-        enc_pass=$(url_encode "$pass")
-
         echo -e "${GREEN}====== HTTP 配置 (已存至 $LINK_FILE) ======${RESET}"
         if [[ -n "$user" && -n "$pass" ]]; then
             echo -e "${YELLOW}● 客户端直连格式:${RESET} http://${user}:${pass}@${display_ip}:${port}"
-            echo -e "${YELLOW}● Telegram 快捷链接:${RESET} https://t.me/socks?server=${enc_ip}&port=${port}&user=${enc_user}&pass=${enc_pass}"
         else
             echo -e "${YELLOW}● 客户端直连格式:${RESET} http://${display_ip}:${port}"
-            echo -e "${YELLOW}● Telegram快捷链接:${RESET} https://t.me/socks?server=${enc_ip}&port=${port}"
         fi
     fi
-    echo
 }
 
 # ================== 核心交互配置处理 ==================
 configure_xray() {
     info "开始配置 HTTP 服务端节点..."
-    local port user pass
+    local port="" user="" pass="" auth_choice="" input_port="" input_user="" input_pass=""
 
+    # 1. 端口选择
     while true; do
         read -rp "请输入监听端口 (直接回车随机分配端口): " input_port
         if [[ -z "$input_port" ]]; then
@@ -419,23 +402,40 @@ configure_xray() {
         fi
     done
 
-    # 1. 独立处理账号生成
-    read -rp "请输入 HTTP 用户名 (直接回车自动随机生成): " input_user
-    if [[ -z "$input_user" ]]; then
-        user=$(generate_random_string 8)
-        info "已自动生成随机账号：${user}"
-    else
-        user="$input_user"
-    fi
+    # 2. 认证模式选项
+    echo -e "${GREEN}请选择认证方式:${RESET}"
+    echo -e " 1. 密码认证 (需要用户名和密码)"
+    echo -e " 2. 免密认证 (允许任何人直接连接)"
+    while true; do
+        read -rp "请输入选项 [1-2, 默认 1]: " auth_choice
+        auth_choice="${auth_choice:-1}"
 
-    # 2. 独立处理密码生成
-    read -rp "请输入 HTTP 密码 (直接回车自动随机生成): " input_pass
-    if [[ -z "$input_pass" ]]; then
-        pass=$(generate_random_string 12)
-        info "已自动生成高强度密码：${pass}"
-    else
-        pass="$input_pass"
-    fi
+        if [[ "$auth_choice" == "1" ]]; then
+            read -rp "请输入 HTTP 用户名 (直接回车自动随机生成): " input_user
+            if [[ -z "$input_user" ]]; then
+                user=$(generate_random_string 8)
+                info "已自动生成随机账号：${user}"
+            else
+                user="$input_user"
+            fi
+
+            read -rp "请输入 HTTP 密码 (直接回车自动随机生成): " input_pass
+            if [[ -z "$input_pass" ]]; then
+                pass=$(generate_random_string 12)
+                info "已自动生成高强度密码：${pass}"
+            else
+                pass="$input_pass"
+            fi
+            break
+        elif [[ "$auth_choice" == "2" ]]; then
+            user=""
+            pass=""
+            info "已选择：免密认证 (NoAuth)"
+            break
+        else
+            error "输入无效，请输入 1 或 2"
+        fi
+    done
 
     write_config "$port" "$user" "$pass"
     test_config || return 1
@@ -448,7 +448,7 @@ configure_xray() {
 install_xray() {
     info "开始安装 Xray 核心依赖..."
     download_and_extract_xray || return 1
-    setup_systemd_service
+    setup_openrc_service
     configure_xray
     info "安装完成并已成功启动服务: ${SERVICE_NAME}"
 }
@@ -457,9 +457,9 @@ install_xray() {
 update_xray() {
     info "开始更新 Xray 程序..."
     
-    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+    if rc-service "${SERVICE_NAME}" status 2>/dev/null | grep -q "started"; then
         info "检测到服务正在运行，正在停止服务以进行更新..."
-        systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+        rc-service "${SERVICE_NAME}" stop >/dev/null 2>&1 || true
     fi
 
     if ! download_and_extract_xray; then
@@ -484,13 +484,14 @@ modify_config() {
         return 1
     fi
 
-    local old_port old_user old_pass
+    local old_port="" old_user="" old_pass=""
     old_port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "8080")
     old_user=$(jq -r '.inbounds[0].settings.accounts[0].user // empty' "$XRAY_CONFIG" 2>/dev/null || echo "")
     old_pass=$(jq -r '.inbounds[0].settings.accounts[0].pass // empty' "$XRAY_CONFIG" 2>/dev/null || echo "")
 
-    local port user pass
+    local port="" user="" pass="" auth_choice="" input_port="" input_user="" input_pass=""
 
+    # 1. 端口修改
     while true; do
         read -rp "请输入新端口 [当前:${old_port}, 回车不修改]: " input_port
         if [[ -z "$input_port" ]]; then
@@ -514,26 +515,54 @@ modify_config() {
         fi
     done
 
-    # 3. 在配置修改阶段也进行彻底分离
-    read -rp "请输入新用户名 [当前:${old_user}, 回车不修改]: " input_user
-    if [[ -z "$input_user" ]]; then
-        user="$old_user"
-    elif [[ "${input_user,,}" == "rand" ]]; then
-        user=$(generate_random_string 8)
-        info "已重新生成随机账号：${user}"
-    else
-        user="$input_user"
-    fi
+    # 2. 认证模式修改选项
+    local current_mode="密码认证"
+    [[ -z "$old_user" ]] && current_mode="免密认证"
 
-    read -rp "请输入新密码 [当前:${old_pass}, 回车不修改]: " input_pass
-    if [[ -z "$input_pass" ]]; then
-        pass="$old_pass"
-    elif [[ "${input_pass,,}" == "rand" ]]; then
-        pass=$(generate_random_string 12)
-        info "已重新生成高强度密码：${pass}"
-    else
-        pass="$input_pass"
-    fi
+    echo -e "${GREEN}请选择新的认证方式 [当前: ${current_mode}]:${RESET}"
+    echo -e " 1. 密码认证"
+    echo -e " 2. 免密认证"
+    while true; do
+        read -rp "请输入选项 [1-2, 回车保持当前]: " auth_choice
+        
+        if [[ -z "$auth_choice" ]]; then
+            user="$old_user"
+            pass="$old_pass"
+            if [[ -n "$user" ]]; then
+                read -rp "是否修改用户名？[当前:${old_user}, 回车不修改]: " input_user
+                [[ -n "$input_user" ]] && user="$input_user"
+                read -rp "是否修改密码？[当前:${old_pass}, 回车不修改]: " input_pass
+                [[ -n "$input_pass" ]] && pass="$input_pass"
+            fi
+            break
+        fi
+
+        if [[ "$auth_choice" == "1" ]]; then
+            read -rp "请输入新用户名 [旧:${old_user:-无}, 回车自动生成]: " input_user
+            if [[ -z "$input_user" ]]; then
+                user=$(generate_random_string 8)
+                info "已自动生成随机账号：${user}"
+            else
+                user="$input_user"
+            fi
+
+            read -rp "请输入新密码 [旧:${old_pass:-无}, 回车自动生成]: " input_pass
+            if [[ -z "$input_pass" ]]; then
+                pass=$(generate_random_string 12)
+                info "已自动生成高强度密码：${pass}"
+            else
+                pass="$input_pass"
+            fi
+            break
+        elif [[ "$auth_choice" == "2" ]]; then
+            user=""
+            pass=""
+            info "已切换为：免密认证 (NoAuth)"
+            break
+        else
+            error "输入无效，请输入 1 或 2"
+        fi
+    done
 
     cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
 
@@ -548,16 +577,15 @@ modify_config() {
 uninstall_xray() {
     warn "即将卸载 ${SERVICE_NAME} 服务..."
 
-    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
-    systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
+    rc-service "${SERVICE_NAME}" stop >/dev/null 2>&1 || true
+    rc-update del "${SERVICE_NAME}" default >/dev/null 2>&1 || true
     
-    rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
-    systemctl daemon-reload
-    
+    rm -f "$INIT_FILE"
     rm -f "$XRAY_BINARY"
-    rm -rf "/usr/local/etc/${SERVICE_NAME}"
+    rm -rf "/etc/${SERVICE_NAME}"
     rm -rf "/usr/local/share/${SERVICE_NAME}"
     rm -f "$LINK_FILE"
+    rm -f "$X_LOG"
     rm -rf /root/proxynode/http
     
     info "服务已完全卸载并清理残留。"
@@ -569,14 +597,14 @@ show_menu() {
     local status version port_show
     status=$(get_xray_status)
     version=$(get_xray_version)
-    port_show="-"
+    port_show="-";
 
     if [[ -f "$XRAY_CONFIG" ]]; then
         port_show=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "-")
     fi
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        Xray HTTP 面板          ${RESET}"
+    echo -e "${GREEN}         Xray HTTP 面板         ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
@@ -595,18 +623,11 @@ show_menu() {
     echo -e "${GREEN}================================${RESET}"
 }
 
-# ================== 安装依赖 ==================
+# ================== 专属 Alpine 依赖安装 ==================
 install_dependencies() {
-    if command -v apt &>/dev/null; then
-        apt update && apt install -y jq curl wget sed coreutils unzip iproute2 openssl || true
-    elif command -v dnf &>/dev/null; then
-        dnf install -y jq curl wget sed coreutils unzip iproute2 openssl
-    elif command -v yum &>/dev/null; then
-        yum install -y jq curl wget sed coreutils unzip iproute2 openssl
-    else
-        error "未知的包管理器，请手动补充环境包: jq, curl, wget, unzip, openssl"
-        exit 1
-    fi
+    info "正在通过 apk 包管理器补充环境组件..."
+    apk update
+    apk add jq curl wget sed coreutils unzip openssl gcompat libc6-compat bc
 }
 
 # ================== 依赖检查 ==================
@@ -616,7 +637,7 @@ pre_check() {
         exit 1
     fi
 
-    local deps=(jq curl wget unzip ss awk sed openssl)
+    local deps=(jq curl wget sed unzip awk openssl)
     local missing=0
 
     for cmd in "${deps[@]}"; do
@@ -627,7 +648,6 @@ pre_check() {
     done
 
     if [[ "$missing" -eq 1 ]]; then
-        info "检测到缺失依赖，正在安装..."
         install_dependencies
     fi
 }
@@ -649,10 +669,10 @@ main() {
             2) update_xray; pause ;;
             3) uninstall_xray; pause ;;
             4) modify_config; pause ;;
-            5) systemctl start "${SERVICE_NAME}" &>/dev/null || true; restart_xray; pause ;;
-            6) systemctl stop "${SERVICE_NAME}" &>/dev/null || true; info "服务已停止"; pause ;;
+            5) rc-service "${SERVICE_NAME}" start >/dev/null 2>&1; restart_xray; pause ;;
+            6) rc-service "${SERVICE_NAME}" stop >/dev/null 2>&1; info "服务已停止"; pause ;;
             7) restart_xray; pause ;;
-            8) journalctl -u "${SERVICE_NAME}" -e --no-pager || true; pause ;;
+            8) [[ -f "$X_LOG" ]] && tail -n 50 "$X_LOG" || error "暂无日志文件"; pause ;;
             9) show_current_config; pause ;;
             0) exit 0 ;;
             *) error "无效输入"; pause ;;

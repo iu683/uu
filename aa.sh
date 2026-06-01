@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =========================================================
-# Shadowsocks-Rust + Shadow-TLS 一体化独立管理脚本
+# Shadowsocks-Rust + Shadow-TLS 一体化独立管理脚本 (官方对齐版)
 # SS加密方式: 2022-blake3-aes-256-gcm
 # =========================================================
 
@@ -148,11 +148,13 @@ load_existing_config() {
     if [[ -f "$STLS_Conf" ]]; then
         OLD_STLS_PORT=$(grep -oP '"listen":\s*"[^"]+:\K[0-9]+' "$STLS_Conf" || echo "8443")
         OLD_STLS_PWD=$(grep -oP '"password":\s*"\K[^"]+' "$STLS_Conf" || echo "")
-        OLD_STLS_SNI=$(grep -oP '"tls_addr":\s*"\K[^:]+' "$STLS_Conf" || echo "captive.apple.com")
+        # 从最新版多层级嵌套 Map 格式中安全提取 SNI
+        OLD_STLS_SNI=$(grep -oP '"(server_name|host|tls_addr)":\s*("\K[^"]+|\[\s*\{\s*")?' "$STLS_Conf" | head -n 1 | tr -d '"[{: ' || echo "captive.apple.com")
+        [[ -z "$OLD_STLS_SNI" ]] && OLD_STLS_SNI="captive.apple.com"
     fi
 }
 
-# ================== 写配置 (适配最新新版规范) ==================
+# ================== 写配置 (严格对齐 ServerName:Host:Port 官方规范) ==================
 write_config() {
     local ss_port="$1"
     local password="$2"
@@ -170,7 +172,7 @@ write_config() {
         }
     }')
 
-    # 写入 Shadowsocks-Rust 配置
+    # 1. 写入 Shadowsocks-Rust 配置
     cat > "$SS_Conf" <<EOF
 {
     "server": "127.0.0.1",
@@ -189,14 +191,20 @@ write_config() {
 EOF
     chmod 600 "$SS_Conf"
 
-    # 修正：写入适配最新版 v3 官方规范的字段 (server_addr 和 tls_addr)
+    # 2. 【核心修复】将 tls_addr 内部重构为标准 Map 映射结构，满足底层解析器预期
     cat > "$STLS_Conf" <<EOF
 {
     "v3": true,
     "server": {
         "listen": "[::]:$stls_port",
         "server_addr": "127.0.0.1:$ss_port",
-        "tls_addr": "$stls_sni:443",
+        "tls_addr": [
+            {
+                "server_name": "$stls_sni",
+                "host": "$stls_sni",
+                "port": 443
+            }
+        ],
         "password": "$stls_pwd",
         "fastopen": true
     }
@@ -292,7 +300,7 @@ configure_ss() {
     echo -e "${GREEN}[完成] 配置重写保存完毕${RESET}"
 }
 
-# ================== 构建系统自启动服务 (强固高性能版) ==================
+# ================== 构建系统自启动服务 ==================
 service() {
     echo "
 [Unit]
@@ -354,7 +362,7 @@ print_node_info() {
     local password=$(grep password "$SS_Conf" | cut -d '"' -f4 || echo "未知")
     local show_listen_port=$(grep -oP '"listen":\s*"[^"]+:\K[0-9]+' "$STLS_Conf" || echo "未知")
     local stls_pwd=$(grep -oP '"password":\s*"\K[^"]+' "$STLS_Conf" || echo "未知")
-    local stls_sni=$(grep -oP '"tls_addr":\s*"\K[^:]+' "$STLS_Conf" || echo "未知")
+    local stls_sni=$(grep -oP '"server_name":\s*"\K[^"]+' "$STLS_Conf" | head -n 1 || echo "未知")
 
     echo -e "${GREEN}====== Shadowsocks + Shadow-TLS 配置 ======${RESET}"
     echo -e "${YELLOW} 公网 IP 地址   : ${IP}${RESET}"
@@ -426,7 +434,7 @@ show_log_menu() {
         echo -e "${YELLOW}2. 实时追踪 Shadow-TLS 日志 (Ctrl+C 退出)${RESET}"
         echo -e "${YELLOW}3. 查看 Shadowsocks-Rust 运行日志 (最新50条)${RESET}"
         echo -e "${YELLOW}4. 实时追踪 Shadowsocks-Rust 日志 (Ctrl+C 退出)${RESET}"
-        echo -e "${YELLOW}0. 返回主菜单${RESET}"
+        echo -e "${0}0. 返回主菜单${RESET}"
         echo -e "${GREEN}===========================================${RESET}"
         
         local sub_choice
@@ -500,7 +508,7 @@ show_menu() {
     echo -e "${GREEN}      Shadowsocks + Shadow-TLS 管理面板     ${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     echo -e "${GREEN}服务状态 :${RESET} ${status_ss} | ${status_stls}"
-    echo -e "${GREEN}组件版本 :${RESET} ${YELLOW}SS: ${v_ss}${RESET} | ${YELLOW}Shadow-TLS: ${v_stls}${RESET}"
+    echo -e "${GREEN}组件版本 :${RESET} SS: ${YELLOW}${v_ss}${RESET} | Shadow-TLS: ${YELLOW}${v_stls}${RESET}"
     echo -e "${GREEN}公网端口 :${RESET} ${YELLOW}${p_stls}${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     echo -e "${GREEN}1. 安装 Shadowsocks + Shadow-TLS${RESET}"
@@ -509,7 +517,7 @@ show_menu() {
     echo -e "${GREEN}4. 修改配置${RESET}"
     echo -e "${GREEN}5. 启动 Shadowsocks + Shadow-TLS${RESET}"
     echo -e "${GREEN}6. 停止 Shadowsocks + Shadow-TLS${RESET}"
-    echo -e "${GREEN}7. 重启 Shadowsocks + Shadow-TLS${RESET}"
+    echo -e "${GREEN}7. 重举 Shadowsocks + Shadow-TLS${RESET}"
     echo -e "${GREEN}8. 查看运行日志${RESET}"
     echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"

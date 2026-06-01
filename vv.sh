@@ -11,7 +11,7 @@ GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 BLUE="\033[34m"
-RESET="\030[0m"
+RESET="\033[0m"
 Info="${GREEN}[信息]${RESET}"
 Error="${RED}[错误]${RESET}"
 
@@ -49,14 +49,7 @@ pause() {
 # ================== 优化获取公网IP ==================
 get_public_ip() {
     local ip
-    # 使用 if 结构防御 set -e 管道
-    if ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' > /tmp/ip_tmp.txt 2>/dev/null; then
-        ip=$(cat /tmp/ip_tmp.txt)
-        rm -f /tmp/ip_tmp.txt
-    else
-        ip=""
-    fi
-    
+    ip=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || echo "")
     if [[ -n "$ip" ]] && [[ "$ip" != "127.0.0.1" ]]; then
         echo "$ip"
         return
@@ -92,7 +85,6 @@ check_deps() {
 
 # ================== 检查端口 ==================
 check_port() {
-    # 用 if 包裹，切断 set -e 对 grep 返回值的强退触发
     if ss -tulnH "( sport = :$1 )" | grep -q .; then
         echo -e "${RED}端口 $1 已被占用${RESET}"
         return 1
@@ -113,13 +105,7 @@ validate_password() {
     fi
     
     local decoded_len
-    # 拆开管道，安全获取解密字节数
-    if decoded_len=$(echo "$password" | base64 -d 2>/dev/null | wc -c); then
-        :
-    else
-        decoded_len="0"
-    fi
-    
+    decoded_len=$(echo "$password" | base64 -d 2>/dev/null | wc -c || echo "0")
     if [[ "$decoded_len" -ne "$KEY_BYTES" ]]; then
         echo -e "${RED}密码必须为 ${KEY_BYTES} 字节 (当前解密后为 ${decoded_len} 字节)${RESET}"
         return 1
@@ -151,7 +137,7 @@ get_latest_stls_version() {
     curl -fsSL --max-time 5 "https://api.github.com/repos/ihciah/shadow-tls/releases/latest" | grep tag_name | cut -d '"' -f4 || echo "v0.2.25"
 }
 
-# ================== 读取现有配置（已彻底修复 pipefail 漏洞） ==================
+# ================== 读取现有配置 (全面防 set -e 崩溃防御) ==================
 load_existing_config() {
     OLD_STLS_PORT="8443"
     OLD_SS_PORT=""
@@ -160,24 +146,19 @@ load_existing_config() {
     OLD_STLS_SNI="captive.apple.com"
     OLD_DNS=""
 
-    # 引入临时关闭 pipefail 保护策略，防止旧文件字段缺失导致 grep 强退
-    set +e
     if [[ -f "$SS_Conf" ]]; then
-        OLD_SS_PORT=$(grep server_port "$SS_Conf" 2>/dev/null | grep -o '[0-9]\+')
-        OLD_SS_PWD=$(grep password "$SS_Conf" 2>/dev/null | cut -d '"' -f4)
-        OLD_DNS=$(grep -A 5 "nameserver" "$SS_Conf" 2>/dev/null | grep -oE '[0-9.]+' | paste -sd "," -)
+        OLD_SS_PORT=$(grep server_port "$SS_Conf" | grep -o '[0-9]\+' || echo "")
+        OLD_SS_PWD=$(grep password "$SS_Conf" | cut -d '"' -f4 2>/dev/null || echo "")
+        # 通过安全方式提取 DNS 信息，防止由于 grep 未匹配导致的 1 状态码中断脚本
+        OLD_DNS=$(grep -A 5 "nameserver" "$SS_Conf" 2>/dev/null | grep -oE '[0-9.]+' | paste -sd "," - || echo "")
     fi
 
     if [[ -f "$STLS_Env" ]]; then
-        OLD_STLS_PORT=$(grep -E '^STLS_LISTEN=' "$STLS_Env" 2>/dev/null | cut -d':' -f4)
-        OLD_STLS_PWD=$(grep -E '^STLS_PASSWORD=' "$STLS_Env" 2>/dev/null | cut -d'=' -f2)
-        OLD_STLS_SNI=$(grep -E '^STLS_TLS=' "$STLS_Env" 2>/dev/null | cut -d'=' -f2 | cut -d':' -f1)
+        OLD_STLS_PORT=$(grep -E '^STLS_LISTEN=' "$STLS_Env" | cut -d':' -f4 || echo "8443")
+        OLD_STLS_PWD=$(grep -E '^STLS_PASSWORD=' "$STLS_Env" | cut -d'=' -f2 || echo "")
+        OLD_STLS_SNI=$(grep -E '^STLS_TLS=' "$STLS_Env" | cut -d'=' -f2 | cut -d':' -f1 || echo "captive.apple.com")
+        [[ -z "$OLD_STLS_SNI" ]] && OLD_STLS_SNI="captive.apple.com"
     fi
-    set -e # 恢复严格错误检查
-
-    # 保底留白，避免空变量干扰后续 read
-    [[ -z "$OLD_STLS_PORT" ]] && OLD_STLS_PORT="8443"
-    [[ -z "$OLD_STLS_SNI" ]] && OLD_STLS_SNI="captive.apple.com"
 }
 
 # ================== 写配置核心引擎 ==================
@@ -236,7 +217,7 @@ generate_links() {
     local stls_pwd="$5"
 
     IP=$(get_public_ip)
-    HOSTNAME=$(hostname -s 2>/dev/null | sed 's/ /_/g' || echo "server")
+    HOSTNAME=$(hostname -s | sed 's/ /_/g' || echo "server")
     
     SS_BASE=$(echo -n "${METHOD}:${password}" | base64 -w 0)
     SHADOWTLS_JSON="{\"version\":\"3\",\"password\":\"${stls_pwd}\",\"host\":\"${stls_sni}\"}"
@@ -323,7 +304,7 @@ print_node_info() {
     echo -e "${YELLOW} SNI 伪装域名    : ${stls_sni}${RESET}"
     echo -e "${YELLOW} SS内部隔离端口  : ${ss_port} ${RESET}"
     echo -e "${YELLOW} SS 密码        : ${password}${RESET}"
-    echo -e "${YELLOW} 加密方式       : ${METHOD}${RESET}"
+    echo -e "${YELLOW} 加密方式        : ${METHOD}${RESET}"
     echo -e "${YELLOW}-------------------------------------------------${RESET}"
     echo -e "${GREEN}[信息] SS 链接：${RESET}"
     if [[ -f "${SS_DIR}/ss.txt" ]]; then
@@ -341,10 +322,44 @@ print_node_info() {
     echo -e "${YELLOW}-------------------------------------------------${RESET}"
 }
 
-# ================== 动态配置交互流 ==================
+# ================== 安全的数据提取引擎 (彻底修复 IPv6 端口切割崩溃) ==================
+load_existing_config() {
+    OLD_STLS_PORT="8443"
+    OLD_SS_PORT=""
+    OLD_SS_PWD=""
+    OLD_STLS_PWD=""
+    OLD_STLS_SNI="captive.apple.com"
+    OLD_DNS=""
+
+    if [[ -f "$SS_Conf" ]]; then
+        # 使用 awk 提取，并用 || true 确保即使没找到也不会让 pipefail 报错
+        OLD_SS_PORT=$(awk -F: '/server_port/{print $2}' "$SS_Conf" 2>/dev/null | tr -d ' ,"'\t\n || echo "")
+        OLD_SS_PWD=$(awk -F'"' '/password/{print $4}' "$SS_Conf" 2>/dev/null | tr -d '\n' || echo "")
+        OLD_DNS=$(awk '/nameserver/{flag=1;next} /]/{flag=0} flag' "$SS_Conf" 2>/dev/null | grep -oE '[0-9.]+' | paste -sd "," - || echo "")
+    fi
+
+    if [[ -f "$STLS_Env" ]]; then
+        # 针对 [::]:8443 这种 IPv6 格式，用 awk 提取最后一个冒号后面的数字，极其稳定
+        OLD_STLS_PORT=$(awk -F':' '/^STLS_LISTEN=/{print $NF}' "$STLS_Env" 2>/dev/null | tr -d '\r\n' || echo "8443")
+        OLD_STLS_PWD=$(awk -F'=' '/^STLS_PASSWORD=/{print $2}' "$STLS_Env" 2>/dev/null | tr -d '\r\n' || echo "")
+        
+        local raw_tls
+        raw_tls=$(awk -F'=' '/^STLS_TLS=/{print $2}' "$STLS_Env" 2>/dev/null | tr -d '\r\n' || echo "")
+        if [[ -n "$raw_tls" ]]; then
+            # 提取域名（去掉后面的 :443）
+            OLD_STLS_SNI=${raw_tls%:[0-9]*}
+        fi
+        [[ -z "$OLD_STLS_SNI" ]] && OLD_STLS_SNI="captive.apple.com"
+    fi
+    return 0
+}
+
+# ================== 独立模块：动态配置交互流 (绝对不闪退版) ==================
 execute_configuration_flow() {
     local is_modify_mode="$1"
-    load_existing_config
+    
+    # 强制不参与 set -e 检查
+    load_existing_config || true
     
     local ss_port password dns stls_port stls_sni stls_pwd
     local input_stls_port input_ss_port input_password input_stls_pwd input_sni input_dns
@@ -352,14 +367,16 @@ execute_configuration_flow() {
     # 1. 配置 Shadow-TLS 外网公网端口
     while true; do
         if [ "$is_modify_mode" = true ]; then
-            read -p "请输入Shadow-TLS公网端口 (当前: ${OLD_STLS_PORT}, 回车保持不修改): " input_stls_port || true
+            printf "请输入Shadow-TLS公网端口 (当前: %s, 回车保持不修改): " "${OLD_STLS_PORT:-8443}"
         else
-            read -p "请输入Shadow-TLS公网端口 (默认: ${OLD_STLS_PORT}, 回车直接采纳): " input_stls_port || true
+            printf "请输入Shadow-TLS公网端口 (默认: %s, 回车直接采纳): " "${OLD_STLS_PORT:-8443}"
         fi
-        stls_port=${input_stls_port:-$OLD_STLS_PORT}
+        read -r input_stls_port || input_stls_port=""
+        
+        stls_port=${input_stls_port:-${OLD_STLS_PORT:-8443}}
 
-        if [[ "$stls_port" =~ ^[0-9]+$ ]] && [[ "$stls_port" -ge 1 ]] && [[ "$stls_port" -le 65535 ]]; then
-            if [[ "$stls_port" != "$OLD_STLS_PORT" ]]; then
+        if [[ "$stls_port" =~ ^[0-9]+$ ]] && [ "$stls_port" -ge 1 ] && [ "$stls_port" -le 65535 ]; then
+            if [ "$stls_port" != "$OLD_STLS_PORT" ]; then
                 check_port "$stls_port" || continue
             fi
             break
@@ -370,20 +387,24 @@ execute_configuration_flow() {
 
     # 2. 配置 SS 内部端口
     while true; do
-        local default_ss_port=$([[ -n "$OLD_SS_PORT" ]] && echo "$OLD_SS_PORT" || random_port)
+        local default_ss_port=""
+        default_ss_port=${OLD_SS_PORT:-$(random_port || echo "49152")}
+        
         if [ "$is_modify_mode" = true ]; then
-            read -p "请输入内部SS端口 (当前: ${default_ss_port}, 回车保持不修改): " input_ss_port || true
+            printf "请输入内部SS端口 (当前: %s, 回车保持不修改): " "$default_ss_port"
         else
-            read -p "请输入内部SS端口 (随机推荐: ${default_ss_port}, 回车直接采纳): " input_ss_port || true
+            printf "请输入内部SS端口 (随机推荐: %s, 回车直接采纳): " "$default_ss_port"
         fi
+        read -r input_ss_port || input_ss_port=""
+        
         ss_port=${input_ss_port:-$default_ss_port}
 
-        if [[ "$ss_port" =~ ^[0-9]+$ ]] && [[ "$ss_port" -ge 1 ]] && [[ "$ss_port" -le 65535 ]]; then
-            if [[ "$ss_port" -eq "$stls_port" ]]; then
-                echo -e "${RED}内部SS端口绝对不能与外网公网端口相同！${RESET}"
+        if [[ "$ss_port" =~ ^[0-9]+$ ]] && [ "$ss_port" -ge 1 ] && [ "$ss_port" -le 65535 ]; then
+            if [ "$ss_port" -eq "$stls_port" ]; then
+                echo -e "${RED}内部SS端口绝不能与外网公网端口相同！${RESET}"
                 continue
             fi
-            if [[ "$ss_port" != "$OLD_SS_PORT" ]]; then
+            if [ "$ss_port" != "$OLD_SS_PORT" ]; then
                 check_port "$ss_port" || continue
             fi
             break
@@ -394,51 +415,90 @@ execute_configuration_flow() {
 
     # 3. 配置 SS 密码
     while true; do
-        local default_ss_pwd=$([[ -n "$OLD_SS_PWD" ]] && echo "$OLD_SS_PWD" || random_key)
-        if [ "$is_modify_mode" = true ]; then
-            read -p "请输入SS密码 (回车保持当前长密钥): " input_password || true
-        else
-            read -p "请输入SS密码 (回车自动生成合规密钥): " input_password || true
+        local default_ss_pwd=""
+        default_ss_pwd=${OLD_SS_PWD:-$(random_key || echo "")}
+        if [ -z "$default_ss_pwd" ]; then
+            default_ss_pwd=$(openssl rand -base64 32 2>/dev/null | tr -d '\n' || echo "")
         fi
+
+        if [ "$is_modify_mode" = true ]; then
+            printf "请输入SS密码 (当前: %s, 回车保持不修改):\n> " "$default_ss_pwd"
+        else
+            printf "请输入SS密码 (默认随机生成: %s, 回车直接采纳):\n> " "$default_ss_pwd"
+        fi
+        read -r input_password || input_password=""
+        
         password=${input_password:-$default_ss_pwd}
+
         if validate_password "$password"; then
             break
-        else
-            echo -e "${YELLOW}提示：SS 2022 加密要求密码必须是 32 字节的合法 Base64 字符串。${RESET}"
         fi
     done
 
     # 4. 配置 Shadow-TLS 密码
-    local default_stls_pwd=$([[ -n "$OLD_STLS_PWD" ]] && echo "$OLD_STLS_PWD" || openssl rand -hex 16)
-    if [ "$is_modify_mode" = true ]; then
-        read -p "请输入Shadow-TLS密码 (当前: ${default_stls_pwd}, 回车保持不修改): " input_stls_pwd || true
-    else
-        read -p "请输入Shadow-TLS密码 (回车自动生成随机密码): " input_stls_pwd || true
-    fi
-    stls_pwd=${input_stls_pwd:-$default_stls_pwd}
+    while true; do
+        local default_stls_pwd=""
+        default_stls_pwd=${OLD_STLS_PWD:-$(openssl rand -base64 16 2>/dev/null | tr -d '\n' || echo "StlsPassword123")}
+        
+        if [ "$is_modify_mode" = true ]; then
+            printf "请输入Shadow-TLS密码 (当前: %s, 回车保持不修改): " "$default_stls_pwd"
+        else
+            printf "请输入Shadow-TLS密码 (默认随机生成: %s, 回车直接采纳): " "$default_stls_pwd"
+        fi
+        read -r input_stls_pwd || input_stls_pwd=""
+        
+        stls_pwd=${input_stls_pwd:-$default_stls_pwd}
+        if [[ -n "$stls_pwd" ]]; then
+            break
+        else
+            echo -e "${RED}密码不能为空！${RESET}"
+        fi
+    done
 
-    # 5. 配置 SNI 域名
-    if [ "$is_modify_mode" = true ]; then
-        read -p "请输入SNI伪装域名 (当前: ${OLD_STLS_SNI}, 回车保持不修改): " input_sni || true
-    else
-        read -p "请输入SNI伪装域名 (默认: ${OLD_STLS_SNI}, 回车直接采纳): " input_sni || true
-    fi
-    stls_sni=${input_sni:-$OLD_STLS_SNI}
+    # 5. 配置 SNI 伪装域名
+    while true; do
+        local default_sni=${OLD_STLS_SNI:-"captive.apple.com"}
+        if [ "$is_modify_mode" = true ]; then
+            printf "请输入Shadow-TLS SNI伪装域名 (当前: %s, 回车保持不修改): " "$default_sni"
+        else
+            printf "请输入Shadow-TLS SNI伪装域名 (默认: %s, 回车直接采纳): " "$default_sni"
+        fi
+        read -r input_sni || input_sni=""
+        
+        stls_sni=${input_sni:-$default_sni}
+        if [[ "$stls_sni" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+            break
+        else
+            echo -e "${RED}伪装域名格式不正确，请输入合法的域名 (如 gateway.icloud.com)${RESET}"
+        fi
+    done
 
-    # 6. 配置 DNS
-    local default_dns=$([[ -n "$OLD_DNS" ]] && echo "$OLD_DNS" || get_system_dns)
-    [[ -z "$default_dns" ]] && default_dns="1.1.1.1,8.8.8.8"
-    if [ "$is_modify_mode" = true ]; then
-        read -p "请输入自定义DNS (当前: ${default_dns}, 回车保持不修改): " input_dns || true
-    else
-        read -p "请输入自定义DNS (多个逗号隔开, 回车默认同步系统): " input_dns || true
-    fi
-    dns=${input_dns:-$default_dns}
+    # 6. 配置 SS 自定义下发 DNS
+    while true; do
+        local sys_dns=""
+        sys_dns=$(get_system_dns || echo "1.1.1.1")
+        local default_dns=${OLD_DNS:-$sys_dns}
+        
+        if [ "$is_modify_mode" = true ]; then
+            printf "请输入SS内部自定义DNS (当前: %s, 回车保持不修改): " "$default_dns"
+        else
+            printf "请输入SS内部自定义DNS (默认采纳系统: %s, 回车直接采纳): " "$default_dns"
+        fi
+        read -r input_dns || input_dns=""
+        
+        dns=${input_dns:-$default_dns}
+        if [[ -n "$dns" ]]; then
+            break
+        else
+            echo -e "${RED}DNS 不能为空！${RESET}"
+        fi
+    done
 
-    write_config "$ss_port" "$password" "$dns" "$stls_port" "$stls_sni" "$stls_pwd"
-    generate_links "$ss_port" "$password" "$stls_port" "$stls_sni" "$stls_pwd"
+    # 最终执行存储
+    write_config "$ss_port" "$password" "$dns" "$stls_port" "$stls_sni" "$stls_pwd" || true
+    generate_links "$ss_port" "$password" "$stls_port" "$stls_sni" "$stls_pwd" || true
+
 }
-
 # ================== 安装入口 ==================
 install_ss() {
     echo -e "${GREEN}[信息] 开始全新安装 Shadowsocks-Rust & Shadow-TLS 核心组件...${RESET}"
@@ -460,6 +520,7 @@ install_ss() {
     install -m 755 shadow-tls "$STLS_File"
     echo "$STLS_VERSION" > "${SS_DIR}/stls_version.txt"
 
+    # 调用配置流：非修改模式
     execute_configuration_flow false
     service
     service_stls
@@ -477,6 +538,7 @@ modify_ss() {
         return
     fi
     
+    # 先安全加载一次并调用配置流：修改模式
     execute_configuration_flow true
     
     echo -e "${GREEN}[管理] 正在安全平滑重启底层内核服务...${RESET}"

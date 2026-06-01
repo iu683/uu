@@ -1,14 +1,34 @@
 #!/usr/bin/env bash
 #
-# Xray (Socks5) 控制面板 
+# sing-box (VLESS+WS+TLS) 核心控制面板 [Alpine Linux 专属]
+# SPDX-License-Identifier: MIT
 #
 # =========================================================
 # 1. 核心控制与全局环境初始化
 # =========================================================
-set -Eeuo pipefail
+set -Eop pipefail
 export LANG=en_US.UTF-8
 
-# ================== 颜色 ==================
+# 基础目录与硬编码配置
+readonly SB_CONFIG="/etc/singbox-vless-ws/config.json"
+readonly SB_BINARY="/usr/local/bin/sing-box"
+readonly SB_DIR="/root/proxynode/VlessWS"
+readonly SB_LOG="/var/log/singbox-vless-ws.log"
+EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
+OPENRC_SERVICES_DIR="/etc/init.d"
+CONFIG_DIR="/etc/singbox-vless-ws"
+REPO_URL="https://github.com/SagerNet/sing-box"
+API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
+CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
+
+# 自动检测环境变量
+PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
+OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
+ARCHITECTURE="${ARCHITECTURE:-}"
+SINGBOX_USER="${SINGBOX_USER:-}"
+SINGBOX_HOME_DIR="${SINGBOX_HOME_DIR:-}"
+
+# 终端颜色代码
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
@@ -16,710 +36,841 @@ BLUE="\033[34m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-# ================== 基础变量 ==================
-readonly SERVICE_NAME="xraysocks5"
-readonly XRAY_CONFIG="/usr/local/etc/${SERVICE_NAME}/config.json"
-readonly XRAY_BINARY="/usr/local/bin/${SERVICE_NAME}"
-readonly LINK_FILE="/root/proxynode/socks5/xray_socks5.txt"
-
-# 降级备用版本
-readonly BACKUP_VERSION="26.3.27"
-
-TMP_DIR=$(mktemp -d -t xray_socks.XXXXXX)
-
-# ================== cleanup ==================
-cleanup() {
-    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+# =========================================================
+# 2. 底层工具函数
+# =========================================================
+has_command() {
+  local _command=$1
+  type -P "$_command" > /dev/null 2>&1
 }
 
-trap cleanup EXIT INT TERM
+curl() {
+  command curl "${CURL_FLAGS[@]}" "$@"
+}
 
-# ================== 日志与交互 ==================
+mktemp() {
+  command mktemp "$@" "sbservinst.XXXXXXXXXX"
+}
+
 info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
 warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
 error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
 pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
 
-# ================== 获取公网IP ==================
+generate_uuid() {
+  if has_command uuidgen; then
+    uuidgen | tr '[:upper:]' '[:lower:]'
+  elif [[ -f /proc/sys/kernel/random/uuid ]]; then
+    cat /proc/sys/kernel/random/uuid
+  else
+    cat /dev/urandom | head -c 16 | hexdump -e '8/1 "%02x" "-" 4/1 "%02x" "-" 4/1 "%02x" "-" 4/1 "%02x" "-" 12/1 "%02x" "\n"' | head -n 1
+  fi
+}
+
+rc_service() {
+  if ! has_command rc-service; then
+    return 0
+  fi
+  command rc-service "$@"
+}
+
+install_content() {
+  local _install_flags="$1"
+  local _content="$2"
+  local _destination="$3"
+  local _overwrite="$4"
+  local _tmpfile="$(mktemp)"
+
+  echo -ne "安装 $_destination ... "
+  echo "$_content" > "$_tmpfile"
+  if [[ -z "$_overwrite" && -e "$_destination" ]]; then
+    echo -e "已存在"
+  elif install "$_install_flags" "$_tmpfile" "$_destination"; then
+    echo -e "完成"
+  fi
+  rm -f "$_tmpfile"
+}
+
+remove_file() {
+  local _target="$1"
+  echo -ne "移除 $_target ... "
+  if rm -f "$_target"; then
+    echo -e "完成"
+  fi
+}
+
+detect_package_manager() {
+  [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
+  has_command apk && PACKAGE_MANAGEMENT_INSTALL='apk add --no-cache' && return 0
+  return 1
+}
+
+install_software() {
+  local _package_name="$1"
+  if ! detect_package_manager; then
+    error "未检测到支持的包管理器，请手动安装 $_package_name"
+    exit 65
+  fi
+  if $PACKAGE_MANAGEMENT_INSTALL "$_package_name" >/dev/null 2>&1; then
+    echo "依赖安装成功"
+  else
+    error "无法通过包管理器安装 '$_package_name'，请手动安装。"
+    exit 65
+  fi
+}
+
+is_user_exists() { id "$1" > /dev/null 2>&1; }
+
+check_environment() {
+  if [[ "x$(uname)" == "xLinux" ]]; then
+    OPERATING_SYSTEM=linux
+  else
+    error "本脚本仅支持 Linux 系统。"
+    exit 95
+  fi
+
+  case "$(uname -m)" in
+    'i386' | 'i686') ARCHITECTURE='386' ;;
+    'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
+    'armv5tel' | 'armv6l' | 'armv7' | 'armv7l') ARCHITECTURE='armv7' ;;
+    'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
+    's390x') ARCHITECTURE='s390x' ;;
+    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
+  esac
+
+  has_command bash || install_software bash
+  has_command curl || install_software curl
+  has_command grep || install_software grep
+  has_command jq || install_software jq
+  has_command openssl || install_software openssl
+  has_command gcompat || install_software gcompat
+  has_command tar || install_software tar
+  has_command socat || install_software socat
+  has_command python3 || install_software python3
+}
+
+get_installed_version() {
+  if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
+    local version_out
+    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null | head -n 1 || echo "")
+    if [[ -n "$version_out" ]]; then
+      echo "$version_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "未知格式"
+    else
+      echo "未知版本"
+    fi
+  else
+    echo "未安装"
+  fi
+}
+
+get_latest_version() {
+  local _tmpfile=$(mktemp)
+  if ! curl -sS -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases/latest" -o "$_tmpfile"; then
+    rm -f "$_tmpfile"
+    return
+  fi
+  local _tag_name=$(jq -r '.tag_name' "$_tmpfile" 2>/dev/null || echo "")
+  rm -f "$_tmpfile"
+  
+  if [[ -n "$_tag_name" ]]; then
+    echo "${_tag_name##*v}"
+  else
+    echo ""
+  fi
+}
+
+download_singbox() {
+  local _version="$1"
+  local _destination="$2"
+  local _download_url="$REPO_URL/releases/download/v${_version}/sing-box-${_version}-linux-${ARCHITECTURE}.tar.gz"
+  
+  info "正在下载官方 sing-box 核心组件: $_download_url ..."
+  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
+    error "核心下载失败！请检查您的网络连接。"
+    return 11
+  fi
+  return 0
+}
+
+# Alpine OpenRC 服务脚本模板（支持创建PID运行目录、重定向捕获日志并修正属主）
+tpl_singbox_openrc_service() {
+  cat << 'EOF'
+#!/sbin/openrc-run
+
+description="sing-box Server Service"
+pidfile="/run/singbox-vless-ws/singbox-vless-ws.pid"
+command="/usr/local/bin/sing-box"
+command_args="run --config /etc/singbox-vless-ws/config.json"
+command_background="true"
+start_stop_daemon_args="--user sing-box:sing-box --make-pidfile --stdout /var/log/singbox-vless-ws.log --stderr /var/log/singbox-vless-ws.log"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath -d -m 0755 -o sing-box:sing-box /run/singbox-vless-ws
+    checkpath -f -m 0644 -o sing-box:sing-box /var/log/singbox-vless-ws.log
+}
+EOF
+}
+
+# =========================================================
+# 3. 网络与配置扩展辅助函数
+# =========================================================
 get_public_ip() {
     local ip
-
-    for cmd in "curl -4fsSL --max-time 5" "wget -4qO- --timeout=5"; do
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
         for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null || true)
-            if [[ -n "${ip:-}" ]]; then
-                echo "$ip"
-                return 0
-            fi
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
-
-    for cmd in "curl -6fsSL --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ipv6.ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null || true)
-            if [[ -n "${ip:-}" ]]; then
-                echo "$ip"
-                return 0
-            fi
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
-
-    return 1
+    error "无法获取公网 IP 地址。" && return 1
 }
 
-# ================== URL 编码函数 (保障TG链接可用性) ==================
-url_encode() {
-    local string="${1}"
-    local strlen="${#string}"
-    local encoded=""
-    local pos c o
-
-    for (( pos=0 ; pos<strlen ; pos++ )); do
-        c=${string:$pos:1}
-        case "$c" in
-            [-_.~a-zA-Z0-9] ) encoded+="$c" ;;
-            * )
-                printf -v o '%%%02X' "'$c"
-                encoded+="$o"
-                ;;
-        esac
-    done
-    echo "${encoded}"
-}
-
-# ================== 检查端口占用 ==================
 check_port() {
-    local port="$1"
-    if ss -tuln | awk '{print $5}' | grep -qE "[:.]${port}$"; then
-        return 1  # 被占用
-    fi
-    return 0  # 没用占用
+  local port="$1"
+  if has_command ss; then
+    ss -tunlp 2>/dev/null | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port" && return 1
+  else
+    netstat -tunlp 2>/dev/null | grep -w tcp | awk '{print $4}' | sed 's/.*://g' | grep -q -w "$port" && return 1
+  fi
+  return 0
 }
 
-# ================== 验证端口格式 ==================
-is_valid_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]
-}
+is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
 
-# ================== 获取可用随机端口 ==================
 get_random_port() {
-    local rand_port
-    while true; do
-        rand_port=$((RANDOM % 55536 + 10000))
-        if check_port "$rand_port"; then
-            echo "$rand_port"
-            return 0
-        fi
-    done
+  local rand_port
+  while true; do
+    rand_port=$(awk 'BEGIN{srand(); print int(rand()*(65535-2000+1))+2000}')
+    if check_port "$rand_port"; then
+      echo "$rand_port" && return 0
+    fi
+  done
 }
 
-# ================== 生成随机字符串 ==================
-generate_random_string() {
-    local length="$1"
-    if command -v openssl >/dev/null 2>&1; then
-        openssl rand -hex "$((length / 2))"
+get_sb_status() {
+  if has_command rc-service && rc-service singbox-vless-ws status 2>/dev/null | grep -q "started"; then
+    echo -e "${GREEN}● 运行中 ${RESET}"
+  else
+    if pgrep -f "$EXECUTABLE_INSTALL_PATH run" >/dev/null 2>&1; then
+      echo -e "${GREEN}● 运行中 ${RESET}"
     else
-        tr -dc 'a-zA-Z0-9' < /dev/urandom 2>/dev/null | head -c "$length" || echo "admin$(RANDOM)"
+      echo -e "${RED}● 未运行${RESET}"
     fi
+  fi
 }
 
-# ================== 架构检测 ==================
-get_arch() {
-    local arch
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64) echo "64" ;;
-        aarch64|arm64) echo "arm64-v8a" ;;
-        armv7l) echo "arm32-v7a" ;;
-        *) error "暂不支持的系统架构: $arch"; return 1 ;;
-    esac
+get_current_port_display() {
+  if [[ -f "$SB_CONFIG" ]]; then
+    local main_port
+    main_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "")
+    echo "${main_port:- -}"
+  else echo "-"; fi
 }
 
-# ================== 自动获取最新版本号 ==================
-get_latest_version() {
-    local latest_version
-    info "正在获取 GitHub 最新 Xray 版本号..."
+restart_singbox_service() {
+  # 确保日志文件存在并有正确属主
+  touch "$SB_LOG" 2>/dev/null || true
+  if is_user_exists "sing-box" && getent group "sing-box" >/dev/null 2>&1; then
+    chown sing-box:sing-box "$SB_LOG" 2>/dev/null || true
+  fi
+
+  if has_command rc-service && [[ -f "$OPENRC_SERVICES_DIR/singbox-vless-ws" ]]; then
+    rc-service singbox-vless-ws restart >/dev/null 2>&1 || true
+    rc-service singbox-vless-ws status 2>/dev/null | grep -q "started"
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+    su -s /bin/bash -c "$EXECUTABLE_INSTALL_PATH run --config $SB_CONFIG >> $SB_LOG 2>&1 &" sing-box
+    return 0
+  fi
+}
+
+# =========================================================
+# 4. 证书、端口交互、配置写入与自定义 Socks5 出口
+# =========================================================
+inst_cert() {
+  mkdir -p /etc/singbox-vless-ws
+  
+  echo "---------------------------------------------"
+  echo -e "sing-box TLS 证书申请方式如下："
+  echo -e " 1) Acme 脚本自动申请 (需放行 80 端口)"
+  echo -e " 2) 自定义证书路径"
+  echo "---------------------------------------------"
+  local certInput
+  read -rp "请输入选项 [1-2] (直接回车默认Acme脚本自动申请): " certInput
+  certInput=${certInput:-1}
+
+  cert_path="/etc/singbox-vless-ws/fullchain.pem"
+  key_path="/etc/singbox-vless-ws/privkey.pem"
+
+  if [[ $certInput == 1 ]]; then
+    if [[ $(check_port "80") -eq 0 ]]; then
+      warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。请确保已暂时关闭 Web 服务。"
+    fi
+
+    local vps_ip=$(get_public_ip)
+    read -rp "请输入需要申请证书的域名: " domain
+    [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
     
-    latest_version=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
-        | jq -r '.tag_name' 2>/dev/null || echo "")
-        
-    latest_version="${latest_version#v}"
+    info "正在检查并安装 Acme.sh 依赖..."
+    has_command socat || install_software socat
 
-    if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
-        warn "通过 GitHub API 获取最新版本失败，将使用内置备用版本: v${BACKUP_VERSION}"
-        echo "$BACKUP_VERSION"
+    local acme_cmd="/root/.acme.sh/acme.sh"
+    if [[ ! -f "$acme_cmd" ]]; then
+      curl https://get.acme.sh | sh -s email=$(date +%s%N 2>/dev/null || date +%s)@gmail.com
+    fi
+    
+    "$acme_cmd" --set-default-ca --server letsencrypt
+    
+    info "正在向 Let's Encrypt 申请证书..."
+    if [[ "$vps_ip" =~ ":" ]]; then
+      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
     else
-        info "成功获取最新版本: v${latest_version}"
-        echo "$latest_version"
-    fi
-}
-
-# ================== 从GitHub下载并解压Xray ==================
-download_and_extract_xray() {
-    local arch version
-    arch=$(get_arch) || return 1
-    version=$(get_latest_version)
-    
-    local download_url="https://github.com/XTLS/Xray-core/releases/download/v${version}/Xray-linux-${arch}.zip"
-    local zip_file="$TMP_DIR/xray.zip"
-    
-    info "正在从 GitHub 下载 Xray v${version} (${arch})..."
-    if ! curl -L -fsSL "$download_url" -o "$zip_file"; then
-        error "从 GitHub 下载 Xray 失败，请检查网络连接。"
-        return 1
+      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
     fi
     
-    info "正在解压..."
-    mkdir -p "$TMP_DIR/extracted"
-    if ! unzip -qo "$zip_file" -d "$TMP_DIR/extracted"; then
-        error "解压 Xray 压缩包失败，请确保系统已安装 unzip。"
-        return 1
-    fi
-    
-    mkdir -p "$(dirname "$XRAY_BINARY")"
-    rm -f "$XRAY_BINARY"
-    cp -f "$TMP_DIR/extracted/xray" "$XRAY_BINARY"
-    chmod +x "$XRAY_BINARY"
-    
-    mkdir -p "/usr/local/share/${SERVICE_NAME}"
-    cp -f "$TMP_DIR/extracted/geoip.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
-    cp -f "$TMP_DIR/extracted/geosite.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
-}
-
-# ================== 配置 Systemd 服务 ==================
-setup_systemd_service() {
-    info "配置 Systemd 服务 [${SERVICE_NAME}]..."
-    
-    cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
-[Unit]
-Description=Xray Socks5 Server Service
-Documentation=https://github.com/XTLS/Xray-core
-After=network.target nss-lookup.target
-
-[Service]
-User=root
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ExecStart=${XRAY_BINARY} run -config ${XRAY_CONFIG}
-Restart=on-failure
-RestartPreventExitStatus=23
-LimitNPROC=10000
-LimitNOFILE=1000000
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable "${SERVICE_NAME}" 2>/dev/null || true
-}
-
-# ================== 获取服务状态与基础参数 ==================
-get_xray_status() {
-    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
-        echo -e "${GREEN}● 运行中${RESET}"
+    if "$acme_cmd" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc; then
+      echo "$domain" > /etc/singbox-vless-ws/ca.log
+      sb_domain=$domain
+      info "Acme 证书申请并成功分发至安全沙箱！"
     else
-        echo -e "${RED}● 未运行${RESET}"
+      error "Acme 证书申请失败，自动切换回自定义证书路径。"
+      certInput=2
     fi
-}
-
-get_xray_version() {
-    if [[ -x "$XRAY_BINARY" ]]; then
-        "$XRAY_BINARY" version 2>/dev/null \
-            | grep -i "Xray" \
-            | head -n 1 \
-            | awk '{print $2}' || echo "未知"
-    else
-        echo "未安装"
-    fi
-}
-
-get_listen_ip() {
-    if sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null | grep -q '= 1'; then
-        echo "0.0.0.0"
-    else
-        echo "::"
-    fi
-}
-
-test_config() {
-    if "$XRAY_BINARY" run -test -config "$XRAY_CONFIG" >/dev/null 2>&1; then
-        info "Configuration OK"
-        return 0
-    fi
-    error "配置测试失败"
-    return 1
-}
-
-restart_xray() {
-    systemctl restart "${SERVICE_NAME}" 2>/dev/null || true
-    sleep 1
-
-    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
-        info "${SERVICE_NAME} 启动成功"
-        return 0
-    fi
-
-    error "${SERVICE_NAME} 启动失败"
-    journalctl -u "${SERVICE_NAME}" -n 20 --no-pager || true
-    return 1
-}
-
-# ================== 写底层配置 ==================
-write_config() {
-    local port="$1"
-    local user="$2"
-    local pass="$3"
     
-    local listen_ip
-    listen_ip=$(get_listen_ip)
-
-    mkdir -p "$(dirname "$XRAY_CONFIG")"
-
-    local settings_json
-    if [[ -n "$user" && -n "$pass" ]]; then
-        settings_json=$(jq -n --arg u "$user" --arg p "$pass" '{"auth": "password", "accounts": [{"user": $u, "pass": $p}], "udp": true}')
+  elif [[ $certInput == 2 ]]; then
+    local user_cert user_key
+    read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
+    read -rp "请输入密钥文件 (privkey.pem/key) 的路径: " user_key
+    read -rp "请输入证书对应的域名: " sb_domain
+    
+    if [[ -f "$user_cert" && -f "$user_key" ]]; then
+      cp -f "$user_cert" "$cert_path"
+      cp -f "$user_key" "$key_path"
+      info "自定义证书已成功同步解耦至内部安全区。"
     else
-        settings_json=$(jq -n '{"auth": "noauth", "udp": true}')
+      error "找不到输入的证书文件，自动Acme 证书申请。"
+      certInput=1
     fi
+  fi
 
-    jq -n \
-        --arg listen "${listen_ip}" \
-        --argjson port "${port}" \
-        --argjson settings "${settings_json}" \
-    '{
-      "log": {"loglevel": "warning"},
-      "inbounds": [{
-        "listen": $listen,
-        "port": $port,
-        "protocol": "socks",
-        "settings": $settings,
-        "sniffing": {
-          "enabled": true,
-          "destOverride": ["http", "tls", "quic"]
-        }
-      }],
-      "outbounds": [{
-        "protocol": "freedom",
-        "settings": {
-          "domainStrategy": "UseIPv4v6"
-        }
-      }]
-    }' > "$XRAY_CONFIG"
-
-    chmod 644 "$XRAY_CONFIG"
+  chmod 644 "$cert_path"
+  chmod 600 "$key_path"
+  if is_user_exists "sing-box" && getent group "sing-box" >/dev/null 2>&1; then
+    chown -R sing-box:sing-box /etc/singbox-vless-ws
+  fi
 }
 
-# ================== 生成分享链接 (已集成 socks 链接与 tlink) ==================
-generate_link() {
-    mkdir -p "$(dirname "$LINK_FILE")"
-    local ip
-    if ! ip=$(get_public_ip); then
-        error "获取公网 IP 失败"
-        return 1
-    fi
+inst_port() {
+  local default_port=""
+  [[ -f "$SB_CONFIG" ]] && default_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "")
 
-    local port user pass auth_type
-    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "1080")
-    auth_type=$(jq -r '.inbounds[0].settings.auth' "$XRAY_CONFIG" 2>/dev/null || echo "noauth")
+  local prompt_msg="设置 sing-box 主端口 [1-65535] (回车随机分配): "
+  [[ -n "$default_port" ]] && prompt_msg="设置 sing-box 主端口 [当前: ${default_port}, 回车不修改]: "
 
-    # 显式初始化变量，防止 unbound 报错
-    user=""
-    pass=""
-
-    if [[ "$auth_type" == "password" ]]; then
-        user=$(jq -r '.inbounds[0].settings.accounts[0].user // empty' "$XRAY_CONFIG" 2>/dev/null || echo "")
-        pass=$(jq -r '.inbounds[0].settings.accounts[0].pass // empty' "$XRAY_CONFIG" 2>/dev/null || echo "")
-    fi
-
-    local display_ip="$ip"
-    [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
-
-    # 对 Telegram 链接的组件进行 URL 编码
-    local enc_ip enc_user enc_pass
-    enc_ip=$(url_encode "$ip")
-    enc_user=$(url_encode "$user")
-    enc_pass=$(url_encode "$pass")
-
-    {
-        if [[ -n "$user" && -n "$pass" ]]; then
-            echo "socks://${user}:${pass}@${display_ip}:${port}"
-            echo "https://t.me/socks?server=${enc_ip}&port=${port}&user=${enc_user}&pass=${enc_pass}"
-        else
-            echo "socks://${display_ip}:${port}"
-            echo "https://t.me/socks?server=${enc_ip}&port=${port}"
-        fi
-    } > "$LINK_FILE"
+  while true; do
+    read -rp "$prompt_msg" port
+    if [[ -z "$port" ]]; then
+      if [[ -n "$default_port" ]]; then port="$default_port" && break
+      else
+        port=$(get_random_port)
+        info "已为您随机分配未被占用端口: $port" && break
+      fi
+    elif is_valid_port "$port"; then
+      if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
+        error "端口 ${port} 已被其它程序占用，请更换。" && continue
+      fi
+      break
+    else error "请输入有效的端口数字 (1-65535)"; fi
+  done
 }
-# ================== 显示配置 (已美化并整合输出) ==================
-show_current_config() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then
-        error "配置文件不存在"
+
+configure_custom_socks5_outbound() {
+    if [[ ! -f "$SB_CONFIG" ]]; then 
+        error "错误: 未安装，无法配置出口模式。"
         return
     fi
 
-    local ip port auth_type user pass
-    ip=$(get_public_ip || echo "未知")
-    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
-    auth_type=$(jq -r '.inbounds[0].settings.auth' "$XRAY_CONFIG" 2>/dev/null || echo "noauth")
+    local mode current_type tmp_file
+    current_type=$(jq -r '.outbounds[0].type // "direct"' "$SB_CONFIG" 2>/dev/null || echo "direct")
 
-    # 初始化变量
-    user=""
-    pass=""
-
-    echo -e "${GREEN}====== Xray Socks5 服务端配置 ======${RESET}"
-    echo -e "${YELLOW}服务器公网 IP   : ${ip}${RESET}"
-    echo -e "${YELLOW}服务监听端口    : ${port}${RESET}"
-    
-    if [[ "$auth_type" == "password" ]]; then
-        user=$(jq -r '.inbounds[0].settings.accounts[0].user // empty' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
-        pass=$(jq -r '.inbounds[0].settings.accounts[0].pass // empty' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
-        echo -e "${YELLOW}认证方式        : 密码认证 (Password)${RESET}"
-        echo -e "${YELLOW}用户名          : ${user}${RESET}"
-        echo -e "${YELLOW}密码            : ${pass}${RESET}"
+    echo "---------------------------------------------"
+    echo "请选择出口模式："
+    if [[ "$current_type" == "socks" ]]; then
+        echo -e "当前模式: ${YELLOW}Socks5 代理出口${RESET}"
     else
-        echo -e "${YELLOW}认证方式        : 免密认证 (NoAuth)${RESET}"
+        echo -e "当前模式: ${GREEN}本地直连出口${RESET}"
     fi
+    echo "1) 直连出口"
+    echo "2) Socks5出口"
+    echo "0) 取消"
+    echo "---------------------------------------------"
 
-    if [[ -f "$LINK_FILE" ]]; then
-        local display_ip="$ip"
-        [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
-
-        local enc_ip enc_user enc_pass
-        enc_ip=$(url_encode "$ip")
-        enc_user=$(url_encode "$user")
-        enc_pass=$(url_encode "$pass")
-
-        echo -e "${GREEN}====== Socks5 配置 (已存至 $LINK_FILE) ======${RESET}"
-        if [[ "$auth_type" == "password" ]]; then
-            echo -e "${YELLOW}● 客户端直连格式:${RESET} socks://${user}:${pass}@${display_ip}:${port}"
-            echo -e "${YELLOW}● Telegram 快捷链接:${RESET} https://t.me/socks?server=${enc_ip}&port=${port}&user=${enc_user}&pass=${enc_pass}"
-        else
-            echo -e "${YELLOW}● 客户端直连格式:${RESET} socks://${display_ip}:${port}"
-            echo -e "${YELLOW}● Telegram快捷链接:${RESET} https://t.me/socks?server=${enc_ip}&port=${port}"
-        fi
-    fi
-}
-# ================== 核心交互配置处理 ==================
-configure_xray() {
-    info "开始配置 Socks5 服务端节点..."
-    local port user pass auth_choice
-
-    # 1. 端口配置
-    while true; do
-        read -rp "请输入监听端口 (直接回车随机分配端口): " input_port
-        if [[ -z "$input_port" ]]; then
-            port=$(get_random_port)
-            info "已为您随机分配未被占用端口: $port"
-            break
-        elif is_valid_port "$input_port"; then
-            if ! check_port "$input_port"; then
-                error "端口 ${input_port} 已被占用，请重新输入。"
-                continue
+    read -rp "请输入选项 [0-2]: " mode || true
+    case "$mode" in
+        1)
+            tmp_file=$(mktemp)
+            jq '.outbounds = [{"type": "direct", "tag": "direct"}]' "$SB_CONFIG" > "$tmp_file"
+            if ! jq empty "$tmp_file" >/dev/null 2>&1; then
+                rm -f "$tmp_file"
+                error "生成的直连配置无效。"
+                return 1
             fi
-            port="$input_port"
+            cp "$SB_CONFIG" "${SB_CONFIG}.bak.$(date +%s)"
+            mv "$tmp_file" "$SB_CONFIG"
+            chmod 644 "$SB_CONFIG" 2>/dev/null || true
+            if is_user_exists "sing-box" && getent group "sing-box" >/dev/null 2>&1; then chown sing-box:sing-box "$SB_CONFIG"; fi
+
+            if ! restart_singbox_service; then
+                error "切换到直连失败。"
+                return 1
+            fi
+            info "已成功切换为直连出口！"
+            return
+            ;;
+        2)
+            ;;
+        0|"")
+            info "已取消配置。"
+            return
+            ;;
+        *)
+            error "无效选项，请输入 0-2 之间的数字。"
+            return 1
+            ;;
+    esac
+
+    info "配置自定义 Socks5 出口代理..."
+    local socks_host socks_port socks_user socks_pass
+
+    read -rp "请输入 Socks5 服务器地址/IP: " socks_host || true
+    [[ -z "$socks_host" ]] && info "已取消配置。" && return
+
+    while true; do
+        read -rp "请输入 Socks5 端口 (默认: 1080): " socks_port || true
+        [[ -z "$socks_port" ]] && socks_port=1080
+        if is_valid_port "$socks_port"; then
             break
         else
-            error "端口无效"
+            error "端口无效，请输入一个1-65535之间的数字。"
         fi
     done
 
-    # 2. 认证模式选项
-    echo -e "${GREEN}请选择认证方式:${RESET}"
-    echo -e " 1. 密码认证 (需要用户名和密码)"
-    echo -e " 2. 免密认证 (允许任何人直接连接)"
-    while true; do
-        read -rp "请输入选项 [1-2, 默认 1]: " auth_choice
-        auth_choice="${auth_choice:-1}" # 默认密码认证
-
-        if [[ "$auth_choice" == "1" ]]; then
-            # 独立处理账号生成
-            read -rp "请输入 Socks5 用户名 (直接回车自动随机生成): " input_user
-            if [[ -z "$input_user" ]]; then
-                user=$(generate_random_string 8)
-                info "已自动生成随机账号：${user}"
-            else
-                user="$input_user"
-            fi
-
-            # 独立处理密码生成
-            read -rp "请输入 Socks5 密码 (直接回车自动随机生成): " input_pass
-            if [[ -z "$input_pass" ]]; then
-                pass=$(generate_random_string 12)
-                info "已自动生成高强度密码：${pass}"
-            else
-                pass="$input_pass"
-            fi
-            break
-        elif [[ "$auth_choice" == "2" ]]; then
-            user=""
-            pass=""
-            info "已选择：免密认证 (NoAuth)"
-            break
-        else
-            error "输入无效，请输入 1 或 2"
-        fi
-    done
-
-    write_config "$port" "$user" "$pass"
-    test_config || return 1
-    generate_link
-    restart_xray
-    show_current_config
-}
-
-# ================== 安装 ==================
-install_xray() {
-    info "开始安装 Xray 核心依赖..."
-    download_and_extract_xray || return 1
-    setup_systemd_service
-    configure_xray
-    info "安装完成并已成功启动服务: ${SERVICE_NAME}"
-}
-
-# ================== 更新 ==================
-update_xray() {
-    info "开始更新 Xray 程序..."
-    
-    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
-        info "检测到服务正在运行，正在停止服务以进行更新..."
-        systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
-    fi
-
-    if ! download_and_extract_xray; then
-        error "下载或安装新版本失败，尝试重新启动原服务..."
-        restart_xray
-        return 1
-    fi
-    
-    if restart_xray; then
-        generate_link
-        info "最新版更新并启动成功！当前版本: $(get_xray_version)"
+    read -rp "请输入 Socks5 用户名 (若无密码认证请直接留空回车): " socks_user || true
+    if [[ -n "$socks_user" ]]; then
+        read -rs -p "请输入 Socks5 密码: " socks_pass || true
+        echo
     else
-        error "更新后服务启动失败，请查看日志。"
-        return 1
+        socks_pass=""
     fi
-}
 
-# ================== 修改配置 ==================
-modify_config() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then
-        error "配置文件不存在"
+    tmp_file=$(mktemp)
+
+    if [[ -n "$socks_user" ]]; then
+        jq \
+            --arg host "$socks_host" \
+            --argjson port "$socks_port" \
+            --arg user "$socks_user" \
+            --arg pass "$socks_pass" \
+            '.outbounds = [ { "type": "socks", "tag": "custom-socks5-out", "server": $host, "server_port": $port, "username": $user, "password": $pass } ]' "$SB_CONFIG" > "$tmp_file"
+    else
+        jq \
+            --arg host "$socks_host" \
+            --argjson port "$socks_port" \
+            '.outbounds = [ { "type": "socks", "tag": "custom-socks5-out", "server": $host, "server_port": $port } ]' "$SB_CONFIG" > "$tmp_file"
+    fi
+
+    if ! jq empty "$tmp_file" >/dev/null 2>&1; then
+        rm -f "$tmp_file"
+        error "生成的 Socks5 配置无效，请检查输入后重试。"
         return 1
     fi
 
-    local old_port old_auth old_user old_pass
-    old_port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "1080")
-    old_auth=$(jq -r '.inbounds[0].settings.auth' "$XRAY_CONFIG" 2>/dev/null || echo "noauth")
-    
-    if [[ "$old_auth" == "password" ]]; then
-        old_user=$(jq -r '.inbounds[0].settings.accounts[0].user' "$XRAY_CONFIG" 2>/dev/null || echo "")
-        old_pass=$(jq -r '.inbounds[0].settings.accounts[0].pass' "$XRAY_CONFIG" 2>/dev/null || echo "")
-    else
-        old_user=""
-        old_pass=""
+    cp "$SB_CONFIG" "${SB_CONFIG}.bak.$(date +%s)"
+    mv "$tmp_file" "$SB_CONFIG"
+    chmod 644 "$SB_CONFIG" 2>/dev/null || true
+    if is_user_exists "sing-box" && getent group "sing-box" >/dev/null 2>&1; then chown sing-box:sing-box "$SB_CONFIG"; fi
+
+    if ! restart_singbox_service; then
+        error "重启服务失败，当前配置可能与系统环境不兼容。"
+        return 1
     fi
-
-    local port user pass auth_choice
-
-    # 1. 端口修改
-    while true; do
-        read -rp "请输入新端口 [当前:${old_port}, 回车不修改]: " input_port
-        if [[ -z "$input_port" ]]; then
-            port="$old_port"
-            break
-        elif [[ "${input_port,,}" == "rand" ]]; then
-            port=$(get_random_port)
-            info "已重分配空闲随机端口: $port"
-            break
-        elif is_valid_port "$input_port"; then
-            if [[ "$input_port" != "$old_port" ]]; then
-                if ! check_port "$input_port"; then
-                    error "端口 ${input_port} 已被占用，请更换。"
-                    continue
-                fi
-            fi
-            port="$input_port"
-            break
-        else
-            error "端口无效，请输入 1-65535 之间的数字。"
-        fi
-    done
-
-    # 2. 认证模式修改选项
-    local current_mode="密码认证"
-    [[ "$old_auth" == "noauth" ]] && current_mode="免密认证"
-
-    echo -e "${GREEN}请选择新的认证方式 [当前: ${current_mode}]:${RESET}"
-    echo -e " 1. 密码认证"
-    echo -e " 2. 免密认证"
-    while true; do
-        read -rp "请输入选项 [1-2, 回车保持当前]: " auth_choice
-        
-        # 如果直接回车，保持旧的模式
-        if [[ -z "$auth_choice" ]]; then
-            user="$old_user"
-            pass="$old_pass"
-            if [[ "$old_auth" == "password" ]]; then
-                read -rp "是否修改用户名？[当前:${old_user}, 回车不修改]: " input_user
-                [[ -n "$input_user" ]] && user="$input_user"
-                read -rp "是否修改密码？[当前:${old_pass}, 回车不修改]: " input_pass
-                [[ -n "$input_pass" ]] && pass="$input_pass"
-            fi
-            break
-        fi
-
-        if [[ "$auth_choice" == "1" ]]; then
-            read -rp "请输入新用户名 [旧:${old_user:-无}, 回车自动生成]: " input_user
-            if [[ -z "$input_user" ]]; then
-                user=$(generate_random_string 8)
-                info "已自动生成随机账号：${user}"
-            else
-                user="$input_user"
-            fi
-
-            read -rp "请输入新密码 [旧:${old_pass:-无}, 回车自动生成]: " input_pass
-            if [[ -z "$input_pass" ]]; then
-                pass=$(generate_random_string 12)
-                info "已自动生成高强度密码：${pass}"
-            else
-                pass="$input_pass"
-            fi
-            break
-        elif [[ "$auth_choice" == "2" ]]; then
-            user=""
-            pass=""
-            info "已切换为：免密认证 (NoAuth)"
-            break
-        else
-            error "输入无效，请输入 1 或 2"
-        fi
-    done
-
-    cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
-
-    write_config "$port" "$user" "$pass"
-    test_config || return 1
-    generate_link
-    restart_xray
-    info "配置修改成功"
+    info "已成功切换为 Socks5 出口！"
 }
 
-# ================== 卸载 ==================
-uninstall_xray() {
-    warn "即将卸载 ${SERVICE_NAME} 服务..."
+write_and_show_config() {
+  local hostname=$(hostname -s | sed 's/ /_/g')
+  local ip=$(get_public_ip)
+  local url_ip="$ip"
+  if [[ "$ip" =~ ":" ]]; then 
+    url_ip="[$ip]"
+  fi
 
-    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
-    systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
-    
-    rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
-    systemctl daemon-reload
-    
-    rm -f "$XRAY_BINARY"
-    rm -rf "/usr/local/etc/${SERVICE_NAME}"
-    rm -rf "/usr/local/share/${SERVICE_NAME}"
-    rm -f "$LINK_FILE"
-    rm -rf /root/proxynode/socks5
-    
-    info "服务已完全卸载并清理残留。"
+  cat << EOF > /etc/singbox-vless-ws/config.json
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-in",
+      "listen": "::",
+      "listen_port": $port,
+      "users": [
+        {
+          "uuid": "$auth_pwd",
+          "flow": ""
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "$sb_domain",
+        "key_path": "$key_path",
+        "certificate_path": "$cert_path"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "$ws_path"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
+
+  mkdir -p "$SB_DIR"
+
+  cat << EOF > "$SB_DIR/url.txt"
+====== VLESS + WS + TLS 节点信息 ======
+IP    : ${ip}
+端口  : $port
+UUID  : $auth_pwd
+SIN   : $sb_domain
+HOST  : $sb_domain
+路径  : $ws_path
+---------------------------
+📄 V6VPS 请自行替换 IP 地址为 V6 ★
+[信息] V2rayN   链接：
+vless://$auth_pwd@$url_ip:$port?sni=$sb_domain&host=$sb_domain&security=tls&type=ws&path=$(echo "$ws_path" | sed 's/\//%2F/g')#$hostname-Vlesswstls
+---------------------------------
+EOF
+
+  if is_user_exists "sing-box" && getent group "sing-box" >/dev/null 2>&1; then
+    chown -R sing-box:sing-box /etc/singbox-vless-ws
+  fi
+
+  if restart_singbox_service; then
+    info "sing-box (VLESS+WS+TLS) 服务配置并启动成功！"
+  else
+    error "sing-box 服务启动失败，请查看日志。"
+  fi
+  
+  showconf
 }
 
-# ================== 菜单 ==================
-show_menu() {
+# =========================================================
+# 5. 主流程功能控制模块
+# =========================================================
+instsingbox() {
+  check_environment
+  
+  info "获取官方最新发布版本中..."
+  local latest_version=$(get_latest_version)
+  if [[ -z "$latest_version" ]]; then
+    error "无法获取最新版本号，请检查网络设置。"
+    return 1
+  fi
+  
+  local _tmparchive=$(mktemp)
+  if ! download_singbox "$latest_version" "$_tmparchive"; then
+    rm -f "$_tmparchive" && return 1
+  fi
+
+  echo -ne "正在解压并安装二进制可执行文件 ... "
+  local _tmpdir=$(mktemp -d)
+  tar -xzf "$_tmparchive" -C "$_tmpdir"
+  
+  if install -Dm755 "$_tmpdir"/sing-box-*/sing-box "$EXECUTABLE_INSTALL_PATH"; then
+    echo "成功"
+  else
+    rm -rf "$_tmparchive" "$_tmpdir" && error "安装失败" && return 1
+  fi
+  rm -rf "$_tmparchive" "$_tmpdir"
+
+  SINGBOX_USER="sing-box"
+  SINGBOX_HOME_DIR="/var/lib/sing-box"
+
+  if ! getent group "$SINGBOX_USER" >/dev/null 2>&1; then
+    addgroup -S "$SINGBOX_USER" >/dev/null 2>&1 || true
+  fi
+
+  if ! is_user_exists "$SINGBOX_USER"; then
+    echo -ne "正在创建系统独立沙箱运行用户 $SINGBOX_USER ... "
+    mkdir -p "$SINGBOX_HOME_DIR"
+    adduser -S -D -G "$SINGBOX_USER" -h "$SINGBOX_HOME_DIR" -s /sbin/nologin "$SINGBOX_USER" >/dev/null 2>&1 || true
+    echo "成功"
+  fi
+
+  if has_command rc-update; then
+    install_content -Dm755 "$(tpl_singbox_openrc_service)" "$OPENRC_SERVICES_DIR/singbox-vless-ws" "1"
+    rc-update add singbox-vless-ws default >/dev/null 2>&1 || true
+  fi
+
+  inst_cert || return 1
+  inst_port
+  
+  read -rp "设置 VLESS UUID (直接回车将自动分配强随机 UUID): " auth_pwd
+  auth_pwd=${auth_pwd:-$(generate_uuid)}
+
+  read -rp "设置 WebSocket 路径 (直接回车默认 /ws): " ws_path
+  ws_path=${ws_path:-/ws}
+  [[ ! "$ws_path" =~ ^/ ]] && ws_path="/$ws_path"
+
+  write_and_show_config
+}
+
+update_singbox() {
+  if [[ ! -f "$SB_BINARY" ]]; then
+    error "当前系统未安装 sing-box，无法执行更新。"
+    return 1
+  fi
+
+  info "正在检查新版本..."
+  local current_version=$(get_installed_version)
+  local latest_version=$(get_latest_version)
+
+  if [[ -z "$latest_version" ]]; then
+    error "无法连接 to GitHub API 获取最新版本，请稍后再试。"
+    return 1
+  fi
+
+  info "当前安装版本: ${YELLOW}${current_version}${RESET}"
+  info "官方最新版本: ${GREEN}${latest_version}${RESET}"
+
+  if [[ "$current_version" == "$latest_version" ]]; then
+    info "您当前已经是最新版本，无需更新。"
+    return 0
+  fi
+
+  warn "检测到新版本，即将开始平滑更新 (你的配置与运行数据不会改变)..."
+  
+  local _tmparchive=$(mktemp)
+  if ! download_singbox "$latest_version" "$_tmparchive"; then
+    rm -f "$_tmparchive" && return 1
+  fi
+
+  echo -ne "正在覆盖二进制核心文件 ... "
+  local _tmpdir=$(mktemp -d)
+  tar -xzf "$_tmparchive" -C "$_tmpdir"
+  if install -Dm755 "$_tmpdir"/sing-box-*/sing-box "$EXECUTABLE_INSTALL_PATH"; then
+    echo "成功"
+  else
+    rm -rf "$_tmparchive" "$_tmpdir" && error "覆盖核心失败" && return 1
+  fi
+  rm -rf "$_tmparchive" "$_tmpdir"
+
+  info "正在重启 sing-box 服务以应用更新..."
+  if restart_singbox_service; then
+    info "sing-box 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
+  else
+    error "核心更新成功，但服务重启失败。"
+  fi
+}
+
+unstsingbox() {
+  warn "即将从当前系统中彻底卸载 sing-box"
+
+  if has_command rc-service && [[ -f "$OPENRC_SERVICES_DIR/singbox-vless-ws" ]]; then
+    rc-service singbox-vless-ws stop >/dev/null 2>&1 || true
+    rc-update del singbox-vless-ws >/dev/null 2>&1 || true
+    remove_file "$OPENRC_SERVICES_DIR/singbox-vless-ws"
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+  fi
+  
+  remove_file "$EXECUTABLE_INSTALL_PATH"
+  rm -f "$SB_LOG"
+  rm -rf /etc/singbox-vless-ws "$SB_DIR"
+
+  info "sing-box 已彻底从您的系统中移除！"
+}
+
+changeconf() {
+  if [[ ! -f "$SB_CONFIG" ]]; then
+    error "配置文件不存在，请先安装 sing-box"
+    return 1
+  fi
+
+  local old_pwd=$(jq -r '.inbounds[0].users[0].uuid' "$SB_CONFIG" 2>/dev/null || true)
+  local old_path=$(jq -r '.inbounds[0].transport.path' "$SB_CONFIG" 2>/dev/null || echo "/ws")
+  local old_cert=$(jq -r '.inbounds[0].tls.certificate_path' "$SB_CONFIG" 2>/dev/null || true)
+  local old_key=$(jq -r '.inbounds[0].tls.key_path' "$SB_CONFIG" 2>/dev/null || true)
+  local old_sni=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || "www.bing.com")
+
+  clear
+  echo -e "${GREEN}====== 修改 sing-box (VLESS+WS+TLS) 配置 ======${RESET}"
+  echo "提示：直接敲回车将保持原有配置不变"
+  echo "---------------------------------------------"
+  
+  inst_port 
+
+  local auth_pwd
+  read -rp "设置 VLESS 新 UUID [当前: ${old_pwd}, 回车不修改]: " auth_pwd
+  auth_pwd=${auth_pwd:-$old_pwd}
+
+  local ws_path
+  read -rp "设置 新 WebSocket 路径 [当前: ${old_path}, 回车不修改]: " ws_path
+  ws_path=${ws_path:-$old_path}
+  [[ ! "$ws_path" =~ ^/ ]] && ws_path="/$ws_path"
+
+  local cert_path key_path sb_domain
+  echo "---------------------------------------------"
+  read -rp "是否需要修改证书？[y/N] (直接回车默认不修改): " change_cert_flag
+  if [[ "$change_cert_flag" == "y" || "$change_cert_flag" == "Y" ]]; then
+    inst_cert || return 1
+  else
+    cert_path="$old_cert"
+    key_path="$old_key"
+    sb_domain="$old_sni"
+  fi
+
+  write_and_show_config
+  info "配置修改并应用成功！"
+}
+
+showconf() {
+  if [[ ! -f "$SB_CONFIG" ]]; then
+    error "未找到 VLESS 配置文件，请确保已成功部署节点。"
+    return
+  fi
+
+  local hostname=$(hostname -s | sed 's/ /_/g')
+  local main_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "18055")
+  local auth_pwd=$(jq -r '.inbounds[0].users[0].uuid' "$SB_CONFIG" 2>/dev/null || echo "UUID")
+  local sb_domain=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || echo "www.bing.com")
+  local ws_path=$(jq -r '.inbounds[0].transport.path' "$SB_CONFIG" 2>/dev/null || echo "/ws")
+  
+  local is_insecure="0"
+  if [[ "$sb_domain" == "www.bing.com" ]]; then
+    is_insecure="1"
+  fi
+
+  local ip=$(get_public_ip)
+  local url_ip="$ip"
+  if [[ "$ip" =~ ":" ]]; then 
+    url_ip="[$ip]"
+  fi
+
+  echo -e "${GREEN}====== VLESS + WS + TLS 节点信息 ======${RESET}"
+  echo -e "${YELLOW}IP      : ${ip}${RESET}"
+  echo -e "${YELLOW}端口    : ${main_port}${RESET}"
+  echo -e "${YELLOW}UUID    : ${auth_pwd}${RESET}"
+  echo -e "${YELLOW}SNI     : ${sb_domain}${RESET}"
+  echo -e "${YELLOW}host     : ${sb_domain}${RESET}"
+  echo -e "${YELLOW}WS 路径 : ${ws_path}${RESET}"
+  echo -e "${GREEN}---------------------------${RESET}"
+  echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
+  echo -e "${GREEN}[信息] V2rayN 链接：${RESET}"
+  echo -e "${YELLOW}vless://${auth_pwd}@${url_ip}:${main_port}?sub=1&sni=${sb_domain}&host=${sb_domain}&security=tls&allowInsecure=${is_insecure}&type=ws&path=$(echo "$ws_path" | sed 's/\//%2F/g')#${hostname}-Vlesswstls${RESET}"
+  echo -e "${YELLOW}---------------------------------${RESET}"
+}
+
+# =========================================================
+# 6. 面板主菜单循环
+# =========================================================
+menu() {
+  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
+  check_environment
+
+  while true; do
     clear
-    local status version port_show
-    status=$(get_xray_status)
-    version=$(get_xray_version)
-    port_show="-"
-
-    if [[ -f "$XRAY_CONFIG" ]]; then
-        port_show=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "-")
-    fi
+    local status=$(get_sb_status)
+    local version=$(get_installed_version)
+    local port_show=$(get_current_port_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        Xray Socks5 面板        ${RESET}"
+    echo -e "${GREEN}   Sing-box VLESS-WS-TLS 面板   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 Xray Socks5${RESET}"
-    echo -e "${GREEN} 2. 更新 Xray Socks5${RESET}"
-    echo -e "${GREEN} 3. 卸载 Xray Socks5${RESET}"
-    echo -e "${GREEN} 4. 修改配置${RESET}"
-    echo -e "${GREEN} 5. 启动 Xray Socks5${RESET}"
-    echo -e "${GREEN} 6. 停止 Xray Socks5${RESET}"
-    echo -e "${GREEN} 7. 重启 Xray Socks5${RESET}"
-    echo -e "${GREEN} 8. 查看日志${RESET}"
-    echo -e "${GREEN} 9. 查看节点配置${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN} 1.安装 Sing-box VLESS+WS+TLS${RESET}"
+    echo -e "${GREEN} 2.更新 Sing-box ${RESET}"
+    echo -e "${GREEN} 3.卸载 Sing-box ${RESET}"
+    echo -e "${GREEN} 4.修改配置${RESET}"
+    echo -e "${GREEN} 5.启动 Sing-box ${RESET}"
+    echo -e "${GREEN} 6.停止 Sing-box ${RESET}"
+    echo -e "${GREEN} 7.重启 Sing-box ${RESET}"
+    echo -e "${GREEN} 8.查看日志${RESET}"
+    echo -e "${GREEN} 9.查看节点配置${RESET}"
+    echo -e "${GREEN}10.配置Socks5出口${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
-}
 
-# ================== 安装依赖 ==================
-install_dependencies() {
-    if command -v apt &>/dev/null; then
-        apt update && apt install -y jq curl wget sed coreutils unzip iproute2 openssl || true
-    elif command -v dnf &>/dev/null; then
-        dnf install -y jq curl wget sed coreutils unzip iproute2 openssl
-    elif command -v yum &>/dev/null; then
-        yum install -y jq curl wget sed coreutils unzip iproute2 openssl
-    else
-        error "未知的包管理器，请手动补充环境包: jq, curl, wget, unzip, openssl"
-        exit 1
-    fi
-}
+    local choice=""
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+    [[ -z "$choice" ]] && continue
 
-# ================== 依赖检查 ==================
-pre_check() {
-    if [[ $(id -u) -ne 0 ]]; then
-        error "请使用 root 用户运行"
-        exit 1
-    fi
-
-    local deps=(jq curl wget unzip ss awk sed openssl)
-    local missing=0
-
-    for cmd in "${deps[@]}"; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            missing=1
-            break
+    case "$choice" in
+      1) instsingbox; pause ;;
+      2) update_singbox; pause ;;
+      3) unstsingbox; pause ;;
+      4) changeconf; pause ;;
+      5) 
+        if has_command rc-service && [[ -f "$OPENRC_SERVICES_DIR/singbox-vless-ws" ]]; then
+          rc-service singbox-vless-ws start && info "服务已成功启动 (OpenRC)！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+          touch "$SB_LOG" && chmod 644 "$SB_LOG"
+          if is_user_exists "sing-box"; then chown sing-box:sing-box "$SB_LOG"; fi
+          su -s /bin/bash -c "$EXECUTABLE_INSTALL_PATH run --config $SB_CONFIG >> $SB_LOG 2>&1 &" sing-box
+          info "进程已在后台独立启动！"
         fi
-    done
-
-    if [[ "$missing" -eq 1 ]]; then
-        info "检测到缺失依赖，正在安装..."
-        install_dependencies
-    fi
+        pause ;;
+      6) 
+        if has_command rc-service && [[ -f "$OPENRC_SERVICES_DIR/singbox-vless-ws" ]]; then
+          rc-service singbox-vless-ws stop && info "服务已成功停止 (OpenRC)！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台进程已终止！"
+        fi
+        pause ;;
+      7) 
+        restart_singbox_service && info "服务/进程已重启！"
+        pause ;;
+      8) 
+        #  适配 Alpine 环境查看实时滚动日志
+        if [[ -f "$SB_LOG" ]]; then
+           echo -e "${CYAN}正在实时读取 sing-box 核心日志 (按 Ctrl+C 即可退出)...${RESET}"
+           echo "------------------------------------------------------------------------"
+           # 使用 tail -f 实时追踪最后50行日志
+           tail -n 50 -f "$SB_LOG" || true
+        else
+           error "未发现核心日志文件 ($SB_LOG)，服务可能未曾启动。"
+           pause
+        fi
+        ;;
+      9) showconf; pause ;;
+      10) configure_custom_socks5_outbound; pause ;;
+      0) exit 0 ;;
+      *) error "无效输入，请重新选择。"; sleep 1 ;;
+    esac
+  done
 }
 
-# ================== 主循环 ==================
-main() {
-    pre_check
-
-    while true; do
-        show_menu
-        
-        local choice=""
-        read -r -p $'\033[32m请输入选项: \033[0m' choice || true
-        
-        [[ -z "$choice" ]] && continue
-
-        case "$choice" in
-            1) install_xray; pause ;;
-            2) update_xray; pause ;;
-            3) uninstall_xray; pause ;;
-            4) modify_config; pause ;;
-            5) systemctl start "${SERVICE_NAME}" &>/dev/null || true; restart_xray; pause ;;
-            6) systemctl stop "${SERVICE_NAME}" &>/dev/null || true; info "服务已停止"; pause ;;
-            7) restart_xray; pause ;;
-            8) journalctl -u "${SERVICE_NAME}" -e --no-pager || true; pause ;;
-            9) show_current_config; pause ;;
-            0) exit 0 ;;
-            *) error "无效输入"; pause ;;
-        esac
-    done
-}
-
-main "$@"
+menu "$@"

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =========================================================
-# Shadowsocks-Rust + Shadow-TLS 一体化管理脚本
+# Shadowsocks-Rust + Shadow-TLS 一体化独立管理脚本 (安全修复版)
 # SS加密方式: 2022-blake3-aes-256-gcm
 # =========================================================
 
@@ -14,17 +14,17 @@ BLUE="\033[34m"
 RESET="\033[0m"
 
 # ================== 基础变量 ==================
-SS_DIR="/etc/ss-rust"
+SS_DIR="/etc/stls-integrated-ss"
 SS_CONFIG="${SS_DIR}/config.json"
-SS_SERVICE="/etc/systemd/system/ss-rust.service"
-BINARY_PATH="/usr/local/bin/ssserver"
+SS_SERVICE="/etc/systemd/system/stls-integrated-ss.service"
+BINARY_PATH="/usr/local/bin/stls-integrated-ssserver"
 
-STLS_BINARY_PATH="/usr/local/bin/shadow-tls"
-STLS_SERVICE="/etc/systemd/system/shadow-tls.service"
+STLS_BINARY_PATH="/usr/local/bin/stls-integrated-shadow-tls"
+STLS_SERVICE="/etc/systemd/system/stls-integrated-tls.service"
 STLS_ENV_FILE="${SS_DIR}/shadow-tls.env"
 
-LOG_FILE="/var/log/ss-rust-manager.log"
-RUN_USER="ss-rust"
+LOG_FILE="/var/log/stls-integrated-manager.log"
+RUN_USER="stls-integrated"
 METHOD="2022-blake3-aes-256-gcm"
 KEY_BYTES=32
 
@@ -38,11 +38,12 @@ trap cleanup EXIT INT TERM
 
 # ================== 日志与暂停 ==================
 log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 pause() {
-    read -n 1 -s -r -p "按任意键返回菜单..."
+    # 同样防止后台运行时 pause 卡死
+    read -n 1 -s -r -p "按任意键返回菜单..." || exit 1
     echo
 }
 
@@ -101,10 +102,10 @@ check_port() {
     fi
 }
 
-# ================== 辅助生成器 ==================
+# ================== 辅助生成器与校验 ==================
 random_key() { openssl rand -base64 "$KEY_BYTES" | tr -d '\n'; }
 random_port() { shuf -i 2000-65000 -n 1; }
-get_system_dns() { grep -E '^nameserver' /etc/resolv.conf | awk '{print $2}' | paste -sd "," -; }
+get_system_dns() { grep -E '^nameserver' /etc/resolv.conf | awk '{print $2}' | paste -sd "," - || echo "1.1.1.1"; }
 
 validate_password() {
     local password="$1"
@@ -141,6 +142,30 @@ get_latest_stls_version() {
     curl -fsSL "https://api.github.com/repos/ihciah/shadow-tls/releases/latest" | grep tag_name | cut -d '"' -f4
 }
 
+# ================== 读取现有配置 ==================
+load_existing_config() {
+    OLD_STLS_PORT="8443"
+    OLD_SS_PORT=""
+    OLD_SS_PWD=""
+    OLD_STLS_PWD=""
+    OLD_STLS_SNI="captive.apple.com"
+    OLD_DNS=""
+
+    if [[ -f "$SS_CONFIG" ]]; then
+        OLD_SS_PORT=$(grep server_port "$SS_CONFIG" | grep -o '[0-9]\+' || echo "")
+        OLD_SS_PWD=$(grep password "$SS_CONFIG" | cut -d '"' -f4 || echo "")
+        OLD_DNS=$(grep -A 5 "nameserver" "$SS_CONFIG" | grep -oE '[0-9.]+' | paste -sd "," - || echo "")
+    fi
+
+    if [[ -f "$STLS_ENV_FILE" ]]; then
+        local listen_line=$(grep "STLS_LISTEN=" "$STLS_ENV_FILE" | cut -d'=' -f2- || echo "")
+        [[ -n "$listen_line" ]] && OLD_STLS_PORT="${listen_line##*:}"
+        OLD_STLS_PWD=$(grep "STLS_PASSWORD=" "$STLS_ENV_FILE" | cut -d'=' -f2- || echo "")
+        local tls_line=$(grep "STLS_TLS=" "$STLS_ENV_FILE" | cut -d'=' -f2- || echo "")
+        [[ -n "$tls_line" ]] && OLD_STLS_SNI="${tls_line%%:*}"
+    fi
+}
+
 # ================== 写配置 ==================
 write_config() {
     local ss_port="$1"
@@ -159,7 +184,6 @@ write_config() {
         }
     }')
 
-    # SS 安全绑定在本地环回 127.0.0.1
     cat > "$SS_CONFIG" <<EOF
 {
     "server": "127.0.0.1",
@@ -198,111 +222,103 @@ generate_links() {
 
     IP=$(get_public_ip)
     HOSTNAME=$(hostname -s | sed 's/ /_/g')
-    ENCODED_USERINFO=$(echo -n "${METHOD}:${password}" | base64 -w 0)
-
-    # 1️⃣ 生成 shadow-tls JSON 并经过 base64 编码
+    
+    SS_BASE=$(echo -n "${METHOD}:${password}" | base64 -w 0)
     SHADOWTLS_JSON="{\"version\":\"3\",\"password\":\"${stls_pwd}\",\"host\":\"${stls_sni}\"}"
     SHADOWTLS_BASE=$(echo -n "$SHADOWTLS_JSON" | base64 -w 0)
 
-    # 标准 SS + Plugin 携带格式
     cat > "${SS_DIR}/ss.txt" <<EOF
-ss://${ENCODED_USERINFO}@${IP}:${stls_port}/?plugin=shadow-tls%3B${SHADOWTLS_BASE}#${HOSTNAME}-STLS
+ss://${SS_BASE}@${IP}:${stls_port}?shadow-tls=${SHADOWTLS_BASE}#$HOSTNAME-Shadowsocks+ShadowTLS
 EOF
 
-    # Surge 专用格式配置
     cat > "${SS_DIR}/surge.txt" <<EOF
-$HOSTNAME = ss, $IP, $stls_port, encrypt-method=$METHOD, password=$password, shadow-tls-password=$stls_pwd, shadow-tls-sni=$stls_sni, shadow-tls-version=3, tfo=true, udp-relay=true, ecn=true
+$HOSTNAME-Shadowsocks+ShadowTLS = ss, $IP, $stls_port, encrypt-method=$METHOD, password=$password, shadow-tls-password=$stls_pwd, shadow-tls-sni=$stls_sni, shadow-tls-version=3, tfo=true, udp-relay=true, ecn=true
 EOF
 }
 
-# ================== 配置逻辑 ==================
+# ================== 核心配置交互流 ==================
 configure_ss() {
-    echo -e "${GREEN}[信息] 开始配置 Shadowsocks + Shadow-TLS...${RESET}"
+    echo -e "${GREEN}[信息] 开始配置 Shadowsocks + Shadow-TLS 参数...${RESET}"
+    load_existing_config
     
     local ss_port password dns stls_port stls_sni stls_pwd
 
-    # 1. 自定义公网端口 (Shadow-TLS 端口)
     while true; do
-        read -p "请输入外网公网端口 (默认: 随机生成): " input_stls_port
-        if [[ -z "$input_stls_port" ]]; then
-            stls_port=$(random_port)
-        else
-            stls_port="$input_stls_port"
-        fi
+        read -p "请输入Shadow-TLS公网端口 (回车默认/保持当前: ${OLD_STLS_PORT}): " input_stls_port || exit 1
+        stls_port=${input_stls_port:-$OLD_STLS_PORT}
 
         if [[ "$stls_port" =~ ^[0-9]+$ ]] && [[ "$stls_port" -ge 1 ]] && [[ "$stls_port" -le 65535 ]]; then
-            check_port "$stls_port" || continue
+            if [[ "$stls_port" != "$OLD_STLS_PORT" ]]; then
+                check_port "$stls_port" || continue
+            fi
             break
         else
             echo -e "${RED}端口无效${RESET}"
         fi
     done
 
-    # 2. 自定义本地内部隔离端口 (SS 端口)
     while true; do
-        read -p "请输入SS内部隔离端口 (默认: 随机生成): " input_ss_port
-        if [[ -z "$input_ss_port" ]]; then
-            ss_port=$(random_port)
-        else
-            ss_port="$input_ss_port"
-        fi
+        local default_ss_port=$([[ -n "$OLD_SS_PORT" ]] && echo "$OLD_SS_PORT" || random_port)
+        read -p "请输入内部SS端口 (回车默认/保持当前: ${default_ss_port}): " input_ss_port || exit 1
+        ss_port=${input_ss_port:-$default_ss_port}
 
         if [[ "$ss_port" =~ ^[0-9]+$ ]] && [[ "$ss_port" -ge 1 ]] && [[ "$ss_port" -le 65535 ]]; then
             if [[ "$ss_port" -eq "$stls_port" ]]; then
                 echo -e "${RED}内部SS端口绝对不能与公网端口相同！${RESET}"
                 continue
             fi
-            check_port "$ss_port" || continue
+            if [[ "$ss_port" != "$OLD_SS_PORT" ]]; then
+                check_port "$ss_port" || continue
+            fi
             break
         else
             echo -e "${RED}端口无效${RESET}"
         fi
     done
 
-    # 3. SS 密码
-    read -p "请输入SS密码 (默认: 随机生成): " input_password
-    if [[ -z "$input_password" ]]; then
-        password=$(random_key)
-    else
-        validate_password "$input_password" || return
-        password="$input_password"
-    fi
+    local default_ss_pwd=$([[ -n "$OLD_SS_PWD" ]] && echo "$OLD_SS_PWD" || random_key)
+    read -p "请输入SS密码 (回车默认/保持当前配置密码): " input_password || exit 1
+    password=${input_password:-$default_ss_pwd}
+    validate_password "$password" || return
 
-    # 4. Shadow-TLS 密码
-    read -p "请输入Shadow-TLS密码 (默认: 随机生成): " input_stls_pwd
-    stls_pwd=${input_stls_pwd:-$(openssl rand -hex 16)}
+    local default_stls_pwd=$([[ -n "$OLD_STLS_PWD" ]] && echo "$OLD_STLS_PWD" || openssl rand -hex 16)
+    read -p "请输入Shadow-TLS密码 (回车默认/保持当前: ${default_stls_pwd}): " input_stls_pwd || exit 1
+    stls_pwd=${input_stls_pwd:-$default_stls_pwd}
 
-    # 5. 伪装 SNI 域名
-    read -p "请输入SNI伪装域名 (默认: gateway.icloud.com): " input_sni
-    stls_sni=${input_sni:-"gateway.icloud.com"}
+    read -p "请输入SNI伪装域名 (回车默认/保持当前: ${OLD_STLS_SNI}): " input_sni || exit 1
+    stls_sni=${input_sni:-$OLD_STLS_SNI}
 
-    # 6. DNS
-    default_dns=$(get_system_dns)
+    local default_dns=$([[ -n "$OLD_DNS" ]] && echo "$OLD_DNS" || get_system_dns)
     [[ -z "$default_dns" ]] && default_dns="1.1.1.1,8.8.8.8"
-    read -p "请输入 DNS (默认: $default_dns): " dns
-    dns=${dns:-$default_dns}
+    read -p "请输入 DNS (回车默认/保持当前: ${default_dns}): " input_dns || exit 1
+    dns=${input_dns:-$default_dns}
 
     write_config "$ss_port" "$password" "$dns" "$stls_port" "$stls_sni" "$stls_pwd"
     generate_links "$ss_port" "$password" "$stls_port" "$stls_sni" "$stls_pwd"
 
-    echo -e "${GREEN}[完成] 配置已保存${RESET}"
-    print_node_info
+    echo -e "${GREEN}[完成] 配置重写保存完毕${RESET}"
 }
 
 # ================== 打印配置详情 ==================
 print_node_info() {
     IP=$(get_public_ip)
-    if [[ ! -f "$STLS_ENV_FILE" ]]; then
-        echo -e "${RED}配置文件不存在${RESET}" && return
+    if [[ ! -f "$STLS_ENV_FILE" ]] || [[ ! -f "$SS_CONFIG" ]]; then
+        echo -e "${RED}配置文件不存在，请先选择选项【1】进行安装初始化。${RESET}" && return
     fi
+    
+    # 临时关闭未定义变量检查防止 source 报错
+    set +u
     source "$STLS_ENV_FILE"
-    local ss_port=$(grep server_port "$SS_CONFIG" | grep -o '[0-9]\+')
-    local password=$(grep password "$SS_CONFIG" | cut -d '"' -f4)
+    set -u
+    
+    local ss_port=$(grep server_port "$SS_CONFIG" | grep -o '[0-9]\+' || echo "未知")
+    local password=$(grep password "$SS_CONFIG" | cut -d '"' -f4 || echo "未知")
+    local show_listen_port="${STLS_LISTEN##*:}"
 
     echo -e "${GREEN}====== Shadowsocks + Shadow-TLS 配置 ======${RESET}"
     echo -e "${YELLOW} 公网 IP 地址   : ${IP}${RESET}"
-    echo -e "${YELLOW} 外网公网端口   : ${STLS_LISTEN##*:}${RESET}"
-    echo -e "${YELLOW} Shadow-TLS 密码 : ${STLS_PASSWORD}${RESET}"
+    echo -e "${YELLOW} 外网公网端口   : ${show_listen_port:-8443}${RESET}"
+    echo -e "${YELLOW} Shadow-TLS 密码 : ${STLS_PASSWORD:-}${RESET}"
     echo -e "${YELLOW} SNI 伪装域名    : ${STLS_TLS%% *}${RESET}"
     echo -e "${YELLOW} SS内部隔离端口  : ${ss_port} (外部不可访问)${RESET}"
     echo -e "${YELLOW} SS 密码        : ${password}${RESET}"
@@ -310,52 +326,52 @@ print_node_info() {
     echo -e "${YELLOW}-------------------------------------------------${RESET}"
     echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
     echo -e "${GREEN}[信息] SS 链接：${RESET}"
-    cat "${SS_DIR}/ss.txt"
+    [[ -f "${SS_DIR}/ss.txt" ]] && cat "${SS_DIR}/ss.txt" || echo "未生成链接"
     echo -e ""
     echo -e "${GREEN}[信息] Surge配置:${RESET}"
-    echo -e "${YELLOW}$(cat "${SS_DIR}/surge.txt")${RESET}"
+    [[ -f "${SS_DIR}/surge.txt" ]] && echo -e "${YELLOW}$(cat "${SS_DIR}/surge.txt")${RESET}" || echo "未生成配置"
     echo -e "${YELLOW}-------------------------------------------------${RESET}"
 }
 
 # ================== 修改配置 ==================
 modify_ss() {
-    echo -e "${GREEN}[信息] 开始修改配置...${RESET}"
     if [[ ! -f "$SS_CONFIG" ]] || [[ ! -f "$STLS_ENV_FILE" ]]; then
-        echo -e "${RED}配置文件不存在，请先安装。${RESET}" && return
+        echo -e "${RED}错误：未检测到已有安装，请先选择选项【1】进行安装！${RESET}" && return
     fi
     configure_ss
-    systemctl restart ss-rust shadow-tls
-    log "配置已修改并重启服务"
+    systemctl restart stls-integrated-ss stls-integrated-tls
+    echo -e "${GREEN}[完成] 服务配置已应用并成功重启！${RESET}"
+    print_node_info
+    log "独立配置已被用户手动修改并成功重启"
 }
 
-# ================== 安装 ==================
+# ================== 纯环境安装与服务构建 ==================
 install_ss() {
-    echo -e "${GREEN}[信息] 开始安装 Shadowsocks-Rust & Shadow-TLS...${RESET}"
+    echo -e "${GREEN}[信息] 开始全新安装 Shadowsocks-Rust & Shadow-TLS 核心组件...${RESET}"
     check_deps
     create_user
     mkdir -p "$SS_DIR"
     cd "$TMP_DIR"
 
-    # 安装 Shadowsocks-Rust
     VERSION=$(get_latest_version)
     ARCH=$(detect_arch)
-    URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${VERSION}/shadowsocks-v${VERSION}.${ARCH}.tar.xz"
-    wget -O ss.tar.xz "$URL" && tar -xf ss.tar.xz && install -m 755 ssserver "$BINARY_PATH"
+    echo -e "${GREEN}[信息] 正在下载 Shadowsocks-Rust v${VERSION}...${RESET}"
+    wget -O ss.tar.xz "https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${VERSION}/shadowsocks-v${VERSION}.${ARCH}.tar.xz"
+    tar -xf ss.tar.xz && install -m 755 ssserver "$BINARY_PATH"
     echo "$VERSION" > "${SS_DIR}/version.txt"
 
-    # 安装 Shadow-TLS
     STLS_VERSION=$(get_latest_stls_version)
     STLS_ARCH=$(detect_stls_arch)
-    STLS_URL="https://github.com/ihciah/shadow-tls/releases/download/${STLS_VERSION}/shadow-tls-${STLS_ARCH}"
-    wget -O shadow-tls "$STLS_URL" && install -m 755 shadow-tls "$STLS_BINARY_PATH"
+    echo -e "${GREEN}[信息] 正在下载 Shadow-TLS ${STLS_VERSION}...${RESET}"
+    wget -O shadow-tls "https://github.com/ihciah/shadow-tls/releases/download/${STLS_VERSION}/shadow-tls-${STLS_ARCH}"
+    install -m 755 shadow-tls "$STLS_BINARY_PATH"
     echo "$STLS_VERSION" > "${SS_DIR}/stls_version.txt"
 
     configure_ss
 
-    # ===== systemd: ss-rust =====
     cat > "$SS_SERVICE" <<EOF
 [Unit]
-Description=Shadowsocks Rust Server
+Description=Shadowsocks Rust Server (Integrated)
 After=network-online.target
 Wants=network-online.target
 
@@ -375,13 +391,11 @@ ProtectHome=true
 LimitNOFILE=1048576
 EOF
 
-    # ===== systemd: shadow-tls =====
-    # 核心修正：依据官方语法，把 --v3 移到全局参数区（server命令前方）
     cat > "$STLS_SERVICE" <<EOF
 [Unit]
-Description=Shadow-TLS Server Service
-After=network-online.target ss-rust.service
-Requires=ss-rust.service
+Description=Shadow-TLS Server Service (Integrated)
+After=network-online.target stls-integrated-ss.service
+Requires=stls-integrated-ss.service
 
 [Service]
 Type=simple
@@ -404,15 +418,17 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable ss-rust shadow-tls
-    systemctl restart ss-rust shadow-tls
-    echo -e "${GREEN}[完成] 服务已成功安装并启动！${RESET}"
-    log "安装完成"
+    systemctl enable stls-integrated-ss stls-integrated-tls
+    systemctl restart stls-integrated-ss stls-integrated-tls
+    echo -e "${GREEN}[完成] 服务安装部署成功，节点已启动运行！${RESET}"
+    log "全新安装并初始化成功"
+    
+    print_node_info
 }
 
 # ================== 更新 ==================
 update_ss() {
-    echo -e "${GREEN}[信息] 开始更新二进制文件...${RESET}"
+    echo -e "${GREEN}[信息] 开始更新二进制组件...${RESET}"
     cd "$TMP_DIR"
     
     if [[ -f "$SS_CONFIG" ]]; then
@@ -431,22 +447,22 @@ update_ss() {
         echo "$STLS_VERSION" > "${SS_DIR}/stls_version.txt"
     fi
 
-    systemctl restart ss-rust shadow-tls
-    echo -e "${GREEN}[完成] 更新执行完毕${RESET}"
-    log "更新成功"
+    systemctl restart stls-integrated-ss stls-integrated-tls
+    echo -e "${GREEN}[完成] 更新执行完毕，服务已安全重启${RESET}"
+    log "更新组件成功"
 }
 
 # ================== 卸载 ==================
 uninstall_ss() {
-    echo -e "${RED}[警告] 正在卸载服务...${RESET}"
-    systemctl stop shadow-tls ss-rust || true
-    systemctl disable shadow-tls ss-rust || true
+    echo -e "${RED}[警告] 正在卸载独立一体化服务...${RESET}"
+    systemctl stop stls-integrated-tls stls-integrated-ss || true
+    systemctl disable stls-integrated-tls stls-integrated-ss || true
     rm -f "$SS_SERVICE" "$STLS_SERVICE"
     rm -rf "$SS_DIR"
     rm -f "$BINARY_PATH" "$STLS_BINARY_PATH"
     systemctl daemon-reload
     echo -e "${GREEN}[完成] 卸载清理完毕${RESET}"
-    log "卸载成功"
+    log "安全卸载成功"
 }
 
 # ================== 菜单 ==================
@@ -454,46 +470,51 @@ show_menu() {
     clear
     local status_ss="${RED}● SS未运行${RESET}"
     local status_stls="${RED}● TLS未运行${RESET}"
-    systemctl is-active --quiet ss-rust && status_ss="${GREEN}● SS运行中${RESET}"
-    systemctl is-active --quiet shadow-tls && status_stls="${GREEN}● TLS运行中${RESET}"
+    systemctl is-active --quiet stls-integrated-ss && status_ss="${GREEN}● SS运行中${RESET}"
+    systemctl is-active --quiet stls-integrated-tls && status_stls="${GREEN}● TLS运行中${RESET}"
 
     local v_ss="未安装" && [[ -f "${SS_DIR}/version.txt" ]] && v_ss="v$(cat "${SS_DIR}/version.txt")"
     local v_stls="未安装" && [[ -f "${SS_DIR}/stls_version.txt" ]] && v_stls="$(cat "${SS_DIR}/stls_version.txt")"
-    local p_stls="-" && [[ -f "$STLS_ENV_FILE" ]] && { source "$STLS_ENV_FILE"; p_stls="${STLS_LISTEN##*:}"; }
+    local p_stls="-"
+    if [[ -f "$STLS_ENV_FILE" ]]; then 
+        local tmp_listen=$(grep "STLS_LISTEN=" "$STLS_ENV_FILE" | cut -d'=' -f2- || echo "")
+        [[ -n "$tmp_listen" ]] && p_stls="${tmp_listen##*:}"
+    fi
 
     echo -e "${GREEN}===========================================${RESET}"
     echo -e "${GREEN}      Shadowsocks + Shadow-TLS 管理面板     ${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}服务状态 :${RESET} ${status_ss}  /  ${status_stls}"
+    echo -e "${GREEN}服务状态 :${RESET} ${status_ss} | ${status_stls}"
     echo -e "${GREEN}组件版本 :${RESET} SS: ${YELLOW}${v_ss}${RESET} | Shadow-TLS: ${YELLOW}${v_stls}${RESET}"
     echo -e "${GREEN}公网端口 :${RESET} ${YELLOW}${p_stls}${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}1. 安装 一体化服务 (SS + Shadow-TLS)${RESET}"
-    echo -e "${GREEN}2. 更新 二进制核心${RESET}"
-    echo -e "${GREEN}3. 卸载 一体化服务${RESET}"
-    echo -e "${GREEN}4. 修改 节点配置${RESET}"
-    echo -e "${GREEN}5. 启动 节点服务${RESET}"
-    echo -e "${GREEN}6. 停止 节点服务${RESET}"
-    echo -e "${GREEN}7. 重启 节点服务${RESET}"
-    echo -e "${GREEN}8. 查看 服务日志 (Shadow-TLS)${RESET}"
-    echo -e "${GREEN}9. 查看 当前节点链接配置${RESET}"
-    echo -e "${0}. 退出${RESET}"
+    echo -e "${GREEN}1. 安装 Shadowsocks + Shadow-TLS${RESET}"
+    echo -e "${GREEN}2. 更新 Shadowsocks + Shadow-TLS${RESET}"
+    echo -e "${GREEN}3. 卸载 Shadowsocks + Shadow-TLS${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 Shadowsocks + Shadow-TLS${RESET}"
+    echo -e "${GREEN}6. 停止 Shadowsocks + Shadow-TLS${RESET}"
+    echo -e "${GREEN}7. 重启 Shadowsocks + Shadow-TLS${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
 }
 
 # ================== 主循环 ==================
 while true; do
     show_menu
-    read -r -p $'\033[32m请输入选项: \033[0m' choice
+    # 【核心修复点】加上 || exit 1。如果环境失去交互终端，脚本会自动彻底安全关闭，而不再引发死循环。
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || exit 1
     case $choice in
         1) install_ss; pause ;;
         2) update_ss; pause ;;
         3) uninstall_ss; pause ;;
         4) modify_ss; pause ;;
-        5) systemctl start ss-rust shadow-tls; echo -e "${GREEN}[完成] 服务已启动${RESET}"; pause ;;
-        6) systemctl stop shadow-tls ss-rust; echo -e "${GREEN}[完成] 服务已停止${RESET}"; pause ;;
-        7) systemctl restart ss-rust shadow-tls; echo -e "${GREEN}[完成] 服务已重启${RESET}"; pause ;;
-        8) journalctl -u shadow-tls -e --no-pager; pause ;;
+        5) systemctl start stls-integrated-ss stls-integrated-tls; echo -e "${GREEN}[完成] 服务已启动${RESET}"; pause ;;
+        6) systemctl stop stls-integrated-tls stls-integrated-ss; echo -e "${GREEN}[完成] 服务已停止${RESET}"; pause ;;
+        7) systemctl restart stls-integrated-ss stls-integrated-tls; echo -e "${GREEN}[完成] 服务已重启${RESET}"; pause ;;
+        8) journalctl -u stls-integrated-tls -e --no-pager; pause ;;
         9) print_node_info; pause ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效输入${RESET}"; pause ;;

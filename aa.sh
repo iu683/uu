@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# sing-box (VLESS+WS+TLS) 核心控制面板 [Alpine Linux ]
+# sing-box (VLESS+WS+TLS) 核心控制面板 [Alpine Linux 专属]
 # SPDX-License-Identifier: MIT
 #
 # =========================================================
@@ -145,7 +145,10 @@ check_environment() {
   has_command grep || install_software grep
   has_command jq || install_software jq
   has_command openssl || install_software openssl
+  has_command gcompat || install_software gcompat
   has_command tar || install_software tar
+  has_command socat || install_software socat
+  has_command python3 || install_software python3
 }
 
 get_installed_version() {
@@ -191,21 +194,25 @@ download_singbox() {
   return 0
 }
 
-# Alpine OpenRC 服务脚本模板
+# Alpine OpenRC 服务脚本模板（支持创建PID运行目录并修正属主）
 tpl_singbox_openrc_service() {
   cat << 'EOF'
 #!/sbin/openrc-run
 
 description="sing-box Server Service"
-pidfile="/run/singbox-vless-ws.pid"
+pidfile="/run/singbox-vless-ws/singbox-vless-ws.pid"
 command="/usr/local/bin/sing-box"
 command_args="run --config /etc/singbox-vless-ws/config.json"
 command_background="true"
-start_stop_daemon_args="--user sing-box:sing-box"
+start_stop_daemon_args="--user sing-box:sing-box --make-pidfile"
 
 depend() {
     need net
     after firewall
+}
+
+start_pre() {
+    checkpath -d -m 0755 -o sing-box:sing-box /run/singbox-vless-ws
 }
 EOF
 }
@@ -254,10 +261,10 @@ get_random_port() {
 
 get_sb_status() {
   if has_command rc-service && rc-service singbox-vless-ws status 2>/dev/null | grep -q "started"; then
-    echo -e "${GREEN}● 运行中${RESET}"
+    echo -e "${GREEN}● 运行中 ${RESET}"
   else
     if pgrep -f "$EXECUTABLE_INSTALL_PATH run" >/dev/null 2>&1; then
-      echo -e "${GREEN}● 运行中${RESET}"
+      echo -e "${GREEN}● 运行中 ${RESET}"
     else
       echo -e "${RED}● 未运行${RESET}"
     fi
@@ -278,7 +285,7 @@ restart_singbox_service() {
     rc-service singbox-vless-ws status 2>/dev/null | grep -q "started"
   else
     pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-    # 采用 Alpine 极简后台运行沙箱用户
+    # 采用 Alpine 后台运行沙箱用户
     su -s /bin/bash -c "$EXECUTABLE_INSTALL_PATH run --config $SB_CONFIG >/dev/null 2>&1 &" sing-box
     return 0
   fi
@@ -303,8 +310,7 @@ inst_cert() {
   key_path="/etc/singbox-vless-ws/privkey.pem"
 
   if [[ $certInput == 1 ]]; then
-    # 检测 80 端口冲突
-    if check_port "80" -eq 0; then
+    if [[ $(check_port "80") -eq 0 ]]; then
       warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。请确保已暂时关闭 Web 服务。"
     fi
 
@@ -313,7 +319,6 @@ inst_cert() {
     [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
     
     info "正在检查并安装 Acme.sh 依赖..."
-    # Alpine 环境 acme.sh 依赖 socat
     has_command socat || install_software socat
 
     local acme_cmd="/root/.acme.sh/acme.sh"
@@ -609,9 +614,10 @@ instsingbox() {
   SINGBOX_HOME_DIR="/var/lib/sing-box"
   if ! is_user_exists "$SINGBOX_USER"; then
     echo -ne "正在创建系统独立沙箱运行用户 $SINGBOX_USER ... "
-    # 适配 Alpine/Busybox 的 adduser 语法
     mkdir -p "$SINGBOX_HOME_DIR"
-    adduser -S -D -h "$SINGBOX_HOME_DIR" -s /sbin/nologin "$SINGBOX_USER" >/dev/null 2>&1 || true
+    # [核心修复] 先创建主用户组，再创建对应的独立安全用户
+    addgroup -S "$SINGBOX_USER" >/dev/null 2>&1 || true
+    adduser -S -D -G "$SINGBOX_USER" -h "$SINGBOX_HOME_DIR" -s /sbin/nologin "$SINGBOX_USER" >/dev/null 2>&1 || true
     echo "成功"
   fi
 
@@ -793,7 +799,7 @@ menu() {
     local port_show=$(get_current_port_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   Sing-box VLESS-WS-TLS 面板   ${RESET}"
+    echo -e "${GREEN}  Sing-box VLESS-WS-TLS 面板(Alpine)${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
@@ -841,9 +847,10 @@ menu() {
         restart_singbox_service && info "服务/进程已重启！"
         pause ;;
       8) 
-        # Alpine 下通过标准轻量级日志或者本地配置文件中转
+        # Alpine 环境 OpenRC 的后台日志标准查询
         if [[ -f "$SB_CONFIG" ]]; then
-           echo -e "${CYAN}提示: 当前 sing-box 未设定独立日志文件。如需查看实时终端输出，可手动执行：${RESET}"
+           echo -e "${CYAN}提示: 当前 sing-box 以 OpenRC 守护模式后台或独立沙箱进程启动。${RESET}"
+           echo -e "${CYAN}如需进行实时核心数据流与报错调试，建议手动前台运行：${RESET}"
            echo -e "${YELLOW}sing-box run --config $SB_CONFIG${RESET}"
         else
            error "未发现配置文件，无法诊断。"

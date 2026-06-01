@@ -295,18 +295,17 @@ inst_cert() {
   
   echo "---------------------------------------------"
   echo -e "sing-box TLS 证书申请方式如下："
-  echo -e " 1) 必应自签证书 ${YELLOW}（默认）${RESET}"
-  echo -e " 2) Acme 脚本自动申请 (需放行 80 端口)"
-  echo -e " 3) 自定义证书路径"
+  echo -e " 1) Acme 脚本自动申请 (需放行 80 端口)"
+  echo -e " 2) 自定义证书路径"
   echo "---------------------------------------------"
   local certInput
-  read -rp "请输入选项 [1-3] (直接回车默认自签): " certInput
+  read -rp "请输入选项 [1-2] (直接回车默认Acme脚本自动申请): " certInput
   certInput=${certInput:-1}
 
   cert_path="/etc/singbox-vless-ws/fullchain.pem"
   key_path="/etc/singbox-vless-ws/privkey.pem"
 
-  if [[ $certInput == 2 ]]; then
+  if [[ $certInput == 1 ]]; then
     if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
       warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。请确保已暂时关闭 Web 服务。"
     fi
@@ -335,11 +334,11 @@ inst_cert() {
       sb_domain=$domain
       info "Acme 证书申请并成功分发至安全沙箱！"
     else
-      error "Acme 证书申请失败，自动切换回自签模式。"
-      certInput=1
+      error "Acme 证书申请失败，自动切换回自定义证书路径。"
+      certInput=2
     fi
     
-  elif [[ $certInput == 3 ]]; then
+  elif [[ $certInput == 2 ]]; then
     local user_cert user_key
     read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
     read -rp "请输入密钥文件 (privkey.pem/key) 的路径: " user_key
@@ -350,16 +349,9 @@ inst_cert() {
       cp -f "$user_key" "$key_path"
       info "自定义证书已成功同步解耦至内部安全区。"
     else
-      error "找不到输入的证书文件，自动降级回自签模式。"
+      error "找不到输入的证书文件，自动Acme 证书申请。"
       certInput=1
     fi
-  fi
-
-  if [[ $certInput == 1 ]]; then
-    info "将使用必应自签证书作为 sing-box 的节点证书"
-    openssl ecparam -genkey -name prime256v1 -out "$key_path"
-    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
-    sb_domain="www.bing.com"
   fi
 
   chmod 644 "$cert_path"
@@ -408,10 +400,10 @@ configure_custom_socks5_outbound() {
     if [[ "$current_type" == "socks" ]]; then
         echo -e "当前模式: ${YELLOW}Socks5 代理出口${RESET}"
     else
-        echo -e "当前模式: ${GREEN}本地直连出口 (direct)${RESET}"
+        echo -e "当前模式: ${GREEN}本地直连出口${RESET}"
     fi
-    echo "1) 直连出口 (direct)"
-    echo "2) Socks5 出口"
+    echo "1) 直连出口"
+    echo "2) Socks5出口"
     echo "0) 取消"
     echo "---------------------------------------------"
 
@@ -585,11 +577,13 @@ EOF
 IP    : ${ip}
 端口  : $port
 UUID  : $auth_pwd
-别名  : $ws_path
+SIN   : $sb_domain
+HOST  : $sb_domain
+路径  : $ws_path
 ---------------------------
 📄 V6VPS 请自行替换 IP 地址为 V6 ★
-[信息] V2rayN / Xray 链接：
-vless://$auth_pwd@$url_ip:$port?sni=$sb_domain&security=tls&type=ws&path=$(echo "$ws_path" | sed 's/\//%2F/g')#$hostname-VlessWS
+[信息] V2rayN  链接：
+vless://$auth_pwd@$url_ip:$port?sni=$sb_domain&host=$sb_domain&security=tls&type=ws&path=$(echo "$ws_path" | sed 's/\//%2F/g')#$hostname-Vlesswstls
 ---------------------------------
 EOF
 
@@ -672,7 +666,7 @@ update_singbox() {
   local latest_version=$(get_latest_version)
 
   if [[ -z "$latest_version" ]]; then
-    error "无法连接到 GitHub API 获取最新版本，请稍后再试。"
+    error "无法连接 to GitHub API 获取最新版本，请稍后再试。"
     return 1
   fi
 
@@ -799,11 +793,12 @@ showconf() {
   echo -e "${YELLOW}端口    : ${main_port}${RESET}"
   echo -e "${YELLOW}UUID    : ${auth_pwd}${RESET}"
   echo -e "${YELLOW}SNI     : ${sb_domain}${RESET}"
+  echo -e "${YELLOW}host     : ${sb_domain}${RESET}"
   echo -e "${YELLOW}WS 路径 : ${ws_path}${RESET}"
   echo -e "${GREEN}---------------------------${RESET}"
   echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
-  echo -e "${GREEN}[信息] V2rayN / Xray 链接：${RESET}"
-  echo -e "${YELLOW}vless://${auth_pwd}@${url_ip}:${main_port}?sub=1&sni=${sb_domain}&security=tls&allowInsecure=${is_insecure}&type=ws&path=$(echo "$ws_path" | sed 's/\//%2F/g')#${hostname}-VlessWS${RESET}"
+  echo -e "${GREEN}[信息] V2rayN 链接：${RESET}"
+  echo -e "${YELLOW}vless://${auth_pwd}@${url_ip}:${main_port}?sub=1&sni=${sb_domain}&host=${sb_domain}&security=tls&allowInsecure=${is_insecure}&type=ws&path=$(echo "$ws_path" | sed 's/\//%2F/g')#${hostname}-Vlesswstls${RESET}"
   echo -e "${YELLOW}---------------------------------${RESET}"
   echo
 }
@@ -822,22 +817,22 @@ menu() {
     local port_show=$(get_current_port_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    Sing-box VLESS+WS+TLS 面板  ${RESET}"
+    echo -e "${GREEN}    Sing-box VLESS-WS-TLS 面板  ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Sing-box VLESS+WS+TLS${RESET}"
-    echo -e "${GREEN}2. 更新 Sing-box 核心组件${RESET}"
-    echo -e "${GREEN}3. 卸载 Sing-box 核心组件${RESET}"
-    echo -e "${GREEN}4. 修改基础配置 (端口/UUID/路径)${RESET}"
-    echo -e "${GREEN}5. 配置自定义 Socks5 出口代理${RESET}"
-    echo -e "${GREEN}6. 启动 Sing-box 服务${RESET}"
-    echo -e "${GREEN}7. 停止 Sing-box 服务${RESET}"
-    echo -e "${GREEN}8. 重启 Sing-box 服务${RESET}"
-    echo -e "${GREEN}9. 查看 Sing-box 日志${RESET}"
-    echo -e "${GREEN}10.查看节点配置 (分享链接)${RESET}"
+    echo -e "${GREEN} 1.安装 Sing-box VLESS+WS+TLS${RESET}"
+    echo -e "${GREEN} 2.更新 Sing-box ${RESET}"
+    echo -e "${GREEN} 3.卸载 Sing-box ${RESET}"
+    echo -e "${GREEN} 4.修改配置${RESET}"
+    echo -e "${GREEN} 5.启动 Sing-box ${RESET}"
+    echo -e "${GREEN} 6.停止 Sing-box ${RESET}"
+    echo -e "${GREEN} 7.重启 Sing-box ${RESET}"
+    echo -e "${GREEN} 8.查看日志${RESET}"
+    echo -e "${GREEN} 9.查看节点配置${RESET}"
+    echo -e "${GREEN}10.配置Socks5出口${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
 
@@ -850,8 +845,7 @@ menu() {
       2) update_singbox; pause ;;
       3) unstsingbox; pause ;;
       4) changeconf; pause ;;
-      5) configure_custom_socks5_outbound; pause ;;
-      6) 
+      5) 
         if has_command systemctl; then
           systemctl start singbox-vless-ws && info "服务已成功启动！"
         else
@@ -860,14 +854,14 @@ menu() {
           info "进程已在后台启动！"
         fi
         pause ;;
-      7) 
+      6) 
         if has_command systemctl; then
           systemctl stop singbox-vless-ws && info "服务已成功停止！"
         else
           pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台进程已终止！"
         fi
         pause ;;
-      8) 
+      7) 
         if has_command systemctl; then
           systemctl restart singbox-vless-ws && info "服务已成功重启！"
         else
@@ -876,14 +870,15 @@ menu() {
           info "后台进程已重启！"
         fi
         pause ;;
-      9) 
+      8) 
         if has_command systemctl; then
           journalctl -u singbox-vless-ws.service -n 50 --no-pager
         else
           warn "当前环境不支持 systemd 集中日志管理。"
         fi
         pause ;;
-      10) showconf; pause ;;
+      9) showconf; pause ;;
+      10) configure_custom_socks5_outbound; pause ;;
       0) exit 0 ;;
       *) error "无效输入，请重新选择。"; sleep 1 ;;
     esac

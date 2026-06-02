@@ -1,4 +1,4 @@
-#!/bash/bin
+#!/bin/bash
 set -e
 
 CADDYFILE="/etc/caddy/Caddyfile"
@@ -145,7 +145,7 @@ uninstall_caddy() {
     pause
 }
 
-# 带智能错误直显的语法验证器（供内部核心调用）
+# 带智能错误直显的语法验证器
 validate_and_reload() {
     local BACKUP_FILE=$1
     echo -e "${YELLOW}正在对调整后的 Caddyfile 进行语法安全性检查...${RESET}"
@@ -169,7 +169,6 @@ validate_and_reload() {
     fi
 }
 
-# 独立重载选项（主菜单 9 调用）
 reload_caddy() {
     if systemctl is-active --quiet caddy; then
         validate_and_reload ""
@@ -180,13 +179,36 @@ reload_caddy() {
     pause
 }
 
+# 改进的配置清洗逻辑：精准提取和删除目标域名的完整 {} 块，防止孤立大括号残留
+remove_domain_block() {
+    local tgt=$1
+    sudo awk -v domain="$tgt" '
+    BEGIN { inside = 0; brace_count = 0 }
+    # 匹配块的开始：包含目标域名且带有左大括号，或者处于寻找大括号的状态
+    $0 ~ "^[[:space:]]*" domain "([[:space:],:{]|$)" {
+        inside = 1
+        if ($0 ~ "{") brace_count += gsub(/{/, "{")
+        if ($0 ~ "}") brace_count -= gsub(/}/, "}")
+        next
+    }
+    inside {
+        if ($0 ~ "{") brace_count += gsub(/{/, "{")
+        if ($0 ~ "}") brace_count -= gsub(/}/, "}")
+        if (brace_count <= 0 && $0 ~ "}") {
+            inside = 0
+        }
+        next
+    }
+    { print }
+    ' "$CADDYFILE" > /tmp/caddyfile.tmp && sudo mv /tmp/caddyfile.tmp "$CADDYFILE"
+}
+
 add_site() {
     read -p "请输入域名 (example.com)： " DOMAIN
     [ -z "$DOMAIN" ] && return
     read -p "是否需要 h2c/gRPC 代理？(y/n，回车默认 n)： " H2C
     H2C=${H2C:-n}
     
-    # 创建备份
     local BK_FILE="/tmp/caddyfile.bak.$(date +%s)"
     sudo cp "$CADDYFILE" "$BK_FILE"
 
@@ -301,20 +323,12 @@ delete_site() {
 
     DOMAIN="${DOMAINS[$((NUM-1))]}"
     
-    # 建立回滚点
     local BK_FILE="/tmp/caddyfile.bak.$(date +%s)"
     sudo cp "$CADDYFILE" "$BK_FILE"
 
-    # 执行高效精准模块化移除
-    sudo awk -v tgt="$DOMAIN" '
-    BEGIN { skip = 0 }
-    $0 ~ "^[[:space:]]*" tgt "([[:space:],:{]|$)" { skip = 1; next }
-    skip && /^[[:space:]]*\}/ { skip = 0; next }
-    skip { next }
-    { print }
-    ' "$CADDYFILE" > /tmp/caddyfile.tmp && sudo mv /tmp/caddyfile.tmp "$CADDYFILE"
+    # 使用新的深度块消除函数
+    remove_domain_block "$DOMAIN"
 
-    # 实施拦截检测，如果验证失败触发安全熔断
     if validate_and_reload "$BK_FILE"; then
         echo -e "${GREEN}域名 ${DOMAIN} 已彻底从 Caddyfile 中移除！${RESET}"
         
@@ -380,13 +394,8 @@ modify_site() {
     local BK_FILE="/tmp/caddyfile.bak.$(date +%s)"
     sudo cp "$CADDYFILE" "$BK_FILE"
 
-    sudo awk -v tgt="$DOMAIN" '
-    BEGIN { skip = 0 }
-    $0 ~ "^[[:space:]]*" tgt "([[:space:],:{]|$)" { skip = 1; next }
-    skip && /^[[:space:]]*\}/ { skip = 0; next }
-    skip { next }
-    { print }
-    ' "$CADDYFILE" > /tmp/caddyfile.tmp && sudo mv /tmp/caddyfile.tmp "$CADDYFILE"
+    # 先彻底移除旧配置块
+    remove_domain_block "$DOMAIN"
     
     NEW_CONFIG="\n${DOMAIN} {\n"
     if [ -n "$OLD_TLS_LINE" ]; then
@@ -613,11 +622,11 @@ emby_proxy_menu() {
     while true; do
         clear
         echo -e "${GREEN}==== Emby 反代管理 ====${RESET}"
-        echo -e "${GREEN}1) 普通反代 (自动申请证书)${RESET}"
-        echo -e "${GREEN}2) 主站 + 推流重定向 (自动申请证书)${RESET}"
-        echo -e "${GREEN}3) 普通反代 (使用自定义证书) ★${RESET}"
-        echo -e "${GREEN}0) 返回主菜单${RESET}"
-        echo -ne "${GREEN}请选择 [0-3]: ${RESET}" 
+        echo -e "${GREEN}1. 普通反代(自动申请证书)${RESET}"
+        echo -e "${GREEN}2. 主站+推流重定向(自动申请证书)${RESET}"
+        echo -e "${GREEN}3. 普通反代(使用自定义证书)${RESET}"
+        echo -e "${GREEN}0. 返回主菜单${RESET}"
+        echo -ne "${GREEN}请选择: ${RESET}" 
         read -r emby_choice
 
         case $emby_choice in
@@ -677,6 +686,24 @@ view_sites() {
     pause
 }
 
+view_caddy_logs() {
+    if ! systemctl is-active --quiet caddy; then
+        echo -e "${RED}错误: Caddy 服务当前未运行，无实时日志输出。${RESET}"
+        pause
+        return
+    fi
+    clear
+    echo -e "${GREEN}======================================================${RESET}"
+    echo -e "${GREEN}          ◈ 正在实时捕获 Caddy 运行日志 ◈             ${RESET}"
+    echo -e "${YELLOW}    >> 提示: 键盘按下 Ctrl + C 即可随时退出日志流 <<  ${RESET}"
+    echo -e "${GREEN}======================================================${RESET}"
+    echo ""
+    sudo journalctl -u caddy -f -n 50 || true
+    echo ""
+    echo -e "${YELLOW}已退出日志查看。${RESET}"
+    pause
+}
+
 menu() {
     while true; do
         clear
@@ -697,8 +724,9 @@ menu() {
         echo -e "${GREEN} 7. Emby反代管理${RESET}"
         echo -e "${GREEN} 8. 查看证书状态${RESET}"
         echo -e "${GREEN} 9. 重载Caddy配置${RESET}"
-        echo -e "${GREEN}10. 更新Caddy${RESET}"
-        echo -e "${GREEN}11. 卸载Caddy${RESET}"
+        echo -e "${GREEN}10. 查看Caddy日志${RESET}"
+        echo -e "${GREEN}11. 更新Caddy${RESET}"
+        echo -e "${GREEN}12. 卸载Caddy${RESET}"
         echo -e "${GREEN} 0. 退出${RESET}"
         echo -e "${GREEN}================================${RESET}"
         echo -ne "${GREEN} 请选择: ${RESET}"
@@ -714,9 +742,10 @@ menu() {
             7) emby_proxy_menu ;;
             8) check_domains_status ;;
             9) reload_caddy ;;
-            10) update_caddy ;;
-            11) uninstall_caddy ;;
-            0) echo "退出面板。"; exit 0 ;;
+            10) view_caddy_logs ;;
+            11) update_caddy ;;
+            12) uninstall_caddy ;;
+            0) exit 0 ;;
             *) echo -e "${RED}无效选项${RESET}"; pause ;;
         esac
     done

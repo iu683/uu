@@ -208,10 +208,10 @@ install_nginx() {
     systemctl daemon-reload
     systemctl enable --now nginx
     echo
-    echo -ne "${YELLOW}是否现在配置反向代理并申请证书？(Y/n,默认Y): ${RESET}"
+    echo -ne "${YELLOW}是否现在配置反向代理并申请证书？(y/n,默认y): ${RESET}"
     read CONFIRM
 
-    CONFIRM=${CONFIRM:-Y}
+    CONFIRM=${CONFIRM:-y}
     if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
         echo -e "${RED}已取消配置退出${RESET}"
         exit 0
@@ -239,7 +239,7 @@ install_nginx() {
     sort -u "$EMAIL_FILE" -o "$EMAIL_FILE"
     echo -ne "${GREEN}请输入域名: ${RESET}"; read DOMAIN
     check_domain_resolution "$DOMAIN"
-    echo -ne "${GREEN}请输入反代目标: ${RESET}"; read TARGET
+    echo -ne "${GREEN}请输入反代目标(例如:http://127.0.0.1:5788): ${RESET}"; read TARGET
     echo -ne "${GREEN}是否为 WebSocket 反代? (y/n，默认 y): ${RESET}"; read IS_WS
     IS_WS=${IS_WS:-y}
 
@@ -262,7 +262,7 @@ add_config() {
     read DOMAIN
     check_domain_resolution "$DOMAIN"
 
-    echo -ne "${GREEN}请输入反代目标(例如http://127.0.0.1:5788): ${RESET}"
+    echo -ne "${GREEN}请输入反代目标(例如:http://127.0.0.1:5788): ${RESET}"
     read TARGET
 
     EMAIL_FILE="/etc/nginx/.cert_emails"
@@ -331,7 +331,7 @@ modify_config() {
 
     DOMAIN="${DOMAINS[$((choice-1))]}"
     CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
-    echo -ne "${GREEN}请输入新反代目标(例如http://127.0.0.1:5788): ${RESET}"; read TARGET
+    echo -ne "${GREEN}请输入新反代目标(例如:http://127.0.0.1:5788): ${RESET}"; read TARGET
     echo -ne "${GREEN}是否为 WebSocket 反代? (y/n，回车默认 y): ${RESET}"; read IS_WS
     IS_WS=${IS_WS:-y}
     echo -ne "${GREEN}请输入最大上传大小 (默认 200M): ${RESET}"
@@ -470,8 +470,8 @@ test_renew() {
 
 check_cert() {
     # 合并查看托管证书与自定义证书
-    echo -e "${GREEN}1) 查看证书详细信息${RESET}"
-    echo -e "${GREEN}2) 查看自定义证书详细信息${RESET}"
+    echo -e "${GREEN}1) 查看托管证书${RESET}"
+    echo -e "${GREEN}2) 查看自定义证${RESET}"
     echo -ne "${GREEN}请选择 [1-2]: ${RESET}"
     read c_choice
     if [ "$c_choice" == "1" ]; then
@@ -495,14 +495,14 @@ check_cert() {
 }
 
 check_domains_status() {
-    echo -e "${GREEN}%-22s %-10s %-15s %-10s${RESET}" "域名/IP" "类型" "到期时间" "剩余天数"
+    # 修复了表格头部输出的格式化问题
+    printf "${GREEN}%-25s %-10s %-15s %-10s${RESET}\n" "域名/IP" "类型" "到期时间" "剩余天数"
     echo -e "${GREEN}------------------------------------------------------------${RESET}"
 
     CONFIG_DIR="/etc/nginx/sites-available"
     if [ -d "$CONFIG_DIR" ]; then
         for DOMAIN in $(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort); do
             CONFIG_PATH="$CONFIG_DIR/$DOMAIN"
-            # 提取配置文件中的证书路径
             CERT_PATH=$(grep "ssl_certificate " "$CONFIG_PATH" | awk '{print $2}' | tr -d ';')
             
             if [ -f "$CERT_PATH" ]; then
@@ -512,14 +512,17 @@ check_domains_status() {
                 END_DATE=$(openssl x509 -enddate -noout -in "$CERT_PATH" | cut -d= -f2)
                 END_TS=$(date -d "$END_DATE" +%s)
                 NOW_TS=$(date +%s)
-                DAYS_LEFT=$(( (END_TS - now_ts) / 86400 ))
+                
+                # 修复核心：确保两个变量都是大写
+                DAYS_LEFT=$(( (END_TS - NOW_TS) / 86400 ))
 
                 if [ $DAYS_LEFT -ge 30 ]; then STATUS="有效"
                 elif [ $DAYS_LEFT -ge 0 ]; then STATUS="即期"
                 else STATUS="已过期"; fi
 
-                printf "%-22s %-10s %-15s %d 天\n" \
-                    "$DOMAIN" "$TYPE" "$(date -d "$END_DATE" +"%Y-%m-%d")" "$DAYS_LEFT"
+                # 优化了列宽对齐，保证中文和字母混合时不会错位
+                printf "%-25s %-10s %-15s %-10s\n" \
+                    "$DOMAIN" "$TYPE" "$(date -d "$END_DATE" +"%Y-%m-%d")" "$DAYS_LEFT 天"
             fi
         done
     fi
@@ -545,7 +548,7 @@ add_custom_cert_config() {
     echo -ne "${GREEN}请输入您的自定义域名或公网IP: ${RESET}"; read DOMAIN
     [ -z "$DOMAIN" ] && return
 
-    echo -ne "${GREEN}请输入反代目标(如 http://127.0.0.1:8080): ${RESET}"; read TARGET
+    echo -ne "${GREEN}请输入反代目标(例如：http://127.0.0.1:8080): ${RESET}"; read TARGET
     echo -ne "${GREEN}是否为 WebSocket 反代? (y/n, 默认y): ${RESET}"; read IS_WS
     IS_WS=${IS_WS:-y}
     echo -ne "${GREEN}请输入最大上传大小 (默认 200M): ${RESET}"; read MAX_SIZE
@@ -576,15 +579,18 @@ add_custom_cert_config() {
     # 调用核心生成配置函数，传入特定路径参数
     generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE" "$DIR_PATH/fullchain.pem" "$DIR_PATH/privkey.pem"
     create_default_server
-
+    
     if nginx -t; then
         systemctl reload nginx
-        green "✅ 自定义证书反代站点 $DOMAIN 添加成功！"
+        echo -e "${GREEN}✅ 自定义证书反代站点 https://$DOMAIN 添加成功！${RESET}"
     else
-        red "❌ Nginx 配置语法错误，已自动撤销软链接，请检查证书有效性。"
+        echo -e "${RED}❌ Nginx 配置语法错误，已自动撤销软链接，请检查证书有效性。${RESET}"
         rm -f "/etc/nginx/sites-enabled/$DOMAIN"
     fi
+
     pause
+
+
 }
 
 # ==========================================
@@ -787,7 +793,7 @@ emby_menu() {
 # ------------------------------
 while true; do
     clear
-    echo -e "${GREEN}===== Nginx 管理菜单 =====${RESET}"
+    echo -e "${GREEN}======= Nginx 管理菜单 =======${RESET}"
     echo -e "${GREEN} 1) 安装Nginx${RESET}"
     echo -e "${GREEN} 2) 添加配置${RESET}"
     echo -e "${GREEN} 3) 添加配置(自定义证书)${RESET}"

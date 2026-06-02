@@ -258,13 +258,9 @@ get_random_port() {
 
 get_sb_status() {
   if has_command systemctl && systemctl is-active --quiet singbox-vless-ws 2>/dev/null; then
-    echo -e "${GREEN}● 运行中${RESET}"
+    echo -e "${YELLOW}● 运行中${RESET}"
   else
-    if pgrep -f "$EXECUTABLE_INSTALL_PATH run" >/dev/null 2>&1; then
-      echo -e "${GREEN}● 运行中${RESET}"
-    else
-      echo -e "${RED}● 未运行${RESET}"
-    fi
+    echo -e "${RED}● 未运行${RESET}"
   fi
 }
 
@@ -297,26 +293,15 @@ inst_cert() {
   
   echo "---------------------------------------------"
   echo -e "sing-box TLS 证书申请方式如下："
-  echo -e " 1) Acme 独立模式申请(需要开放 80 端口)${YELLOW}（默认）${RESET}"
-  echo -e " 2) Acme DNS API 自动申请 (无需放行80端口)"
-  echo -e " 3) 自定义证书路径 (软链接挂载)"
+  echo -e " 1) Acme自动申请 (需放行 80 端口)${YELLOW}（默认）${RESET}"
+  echo -e " 2) 自定义证书路径"
   echo "---------------------------------------------"
   local certInput
-  read -rp "请输入选项 [1-3] (直接回车默认独立模式申请): " certInput
+  read -rp "请输入选项 [1-2] (直接回车默认Acme自动申请): " certInput
   certInput=${certInput:-1}
 
   cert_path="/etc/singbox-vless-ws/fullchain.pem"
   key_path="/etc/singbox-vless-ws/privkey.pem"
-  local acme_cmd="/root/.acme.sh/acme.sh"
-
-  # 只要选了 1 或 3，都先确保安装好 acme.sh 基础组件
-  if [[ $certInput == 1 || $certInput == 2 ]]; then
-    info "正在检查并安装 Acme.sh 依赖..."
-    if [[ ! -f "$acme_cmd" ]]; then
-      curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
-    fi
-    "$acme_cmd" --set-default-ca --server letsencrypt
-  fi
 
   if [[ $certInput == 1 ]]; then
     if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
@@ -327,6 +312,14 @@ inst_cert() {
     read -rp "请输入需要申请证书的域名: " domain
     [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
     
+    info "正在检查并安装 Acme.sh 依赖..."
+    local acme_cmd="/root/.acme.sh/acme.sh"
+    if [[ ! -f "$acme_cmd" ]]; then
+      curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
+    fi
+    
+    "$acme_cmd" --set-default-ca --server letsencrypt
+    
     info "正在向 Let's Encrypt 申请证书..."
     if [[ "$vps_ip" =~ ":" ]]; then
       "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
@@ -334,16 +327,17 @@ inst_cert() {
       "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
     fi
     
+    # 自动配置带有无人值守热重载逻辑
     if "$acme_cmd" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc --reloadcmd "systemctl restart singbox-vless-ws 2>/dev/null || pkill -f 'sing-box run' || true"; then
       echo "$domain" > /etc/singbox-vless-ws/ca.log
       sb_domain=$domain
-      info "Acme 独立模式证书申请并成功分发！"
+      info "Acme 证书申请并成功分发至安全沙箱！"
     else
       error "Acme 证书申请失败，自动切换回自定义证书路径。"
       certInput=2
     fi
     
-  elif [[ $certInput == 3 ]]; then
+  elif [[ $certInput == 2 ]]; then
     while true; do
       local user_cert user_key
       read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
@@ -353,14 +347,19 @@ inst_cert() {
       if [[ -f "$user_cert" && -f "$user_key" ]]; then
         rm -f "$cert_path" "$key_path"
 
+        # 如果外部证书在 /root 目录下，做出预警和权限修复（允许 sing-box 系统用户穿透读取）
         if [[ "$user_cert" == /root/* ]] || [[ "$user_key" == /root/* ]]; then
           warn "检测到您的外部证书源路径在 /root 目录下，正在修复目录穿透检索权限..."
           chmod +x "$(dirname "$user_cert")" 2>/dev/null || true
         fi
         
+        # 补齐外部文件读取基础权限
         chmod 644 "$user_cert" 2>/dev/null || true
         chmod 644 "$user_key" 2>/dev/null || true
 
+        # =========================================================
+        # 核心改造点：自定义证书和私钥改为软链接 (ln -sf) 挂载入内部安全区
+        # =========================================================
         ln -sf "$user_cert" "$cert_path"
         ln -sf "$user_key" "$key_path"
         info "自定义证书已通过软链接无缝接入内部安全区。"
@@ -370,77 +369,14 @@ inst_cert() {
         echo "---------------------------------------------"
       fi
     done
-
-  elif [[ $certInput == 2 ]]; then
-    read -rp "请输入需要申请证书的域名: " domain
-    [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
-
-    echo "---------------------------------------------"
-    echo "请选择 DNS 提供商："
-    echo "1) cloudflare"
-    echo "2) aliyun"
-    echo "3) dnspod"
-    echo "---------------------------------------------"
-    local dns_provider
-    read -rp "请输入选项 [1-3]: " dns_provider
-
-    local dns_flag=""
-    case "$dns_provider" in
-      1)
-        dns_flag="dns_cf"
-        local cf_token cf_account
-        read -rp "请输入 Cloudflare API Token (推荐) 或 Global API Key: " cf_token
-        if [[ ${#cf_token} -eq 37 ]]; then
-          export CF_Token="$cf_token"
-        else
-          export CF_Key="$cf_token"
-          read -rp "请输入 Cloudflare 注册邮箱: " cf_account
-          export CF_Email="$cf_account"
-        fi
-        ;;
-      2)
-        dns_flag="dns_ali"
-        local ali_key ali_secret
-        read -rp "请输入 阿里云 Ali_Key: " ali_key
-        read -rp "请输入 阿里云 Ali_Secret: " ali_secret
-        export Ali_Key="$ali_key"
-        export Ali_Secret="$ali_secret"
-        ;;
-      3)
-        dns_flag="dns_dp"
-        local dp_id dp_key
-        read -rp "请输入 DNSPod Token ID: " dp_id
-        read -rp "请输入 DNSPod Token Key: " dp_key
-        export DP_Id="$dp_id"
-        export DP_Key="$dp_key"
-        ;;
-      *)
-        error "无效输入，停止 API 申请。"
-        return 1
-        ;;
-    esac
-
-    info "正在通过 DNS API 向 Let's Encrypt 申请证书 (可能需要 1-2 分钟验证，请耐心等待)..."
-    if "$acme_cmd" --issue --dns "$dns_flag" -d "$domain" -k ec-256 --insecure; then
-      if "$acme_cmd" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc --reloadcmd "systemctl restart singbox-vless-ws 2>/dev/null || pkill -f 'sing-box run' || true"; then
-        echo "$domain" > /etc/singbox-vless-ws/ca.log
-        sb_domain=$domain
-        info "Acme DNS 模式证书申请成功且已配置自动续签指令！"
-      else
-        error "证书分发失败。"
-        return 1
-      fi
-    else
-      error "DNS API 证书申请失败，请确认 API 凭证与域名解析归属正确。"
-      return 1
-    fi
   fi
 
-  # 规范化证书安全区的属性
+  # 规范化证书安全区的属性（如果是软链接则不破坏原属主，若为常规文件则设定安全掩码和用户组属）
   if [[ ! -L "$cert_path" ]]; then chmod 644 "$cert_path" 2>/dev/null || true; fi
   if [[ ! -L "$key_path" ]]; then chmod 600 "$key_path" 2>/dev/null || true; fi
   
   if is_user_exists "sing-box"; then
+    # 针对链接本身和沙箱目录赋权，防止 sing-box 进程启动时无读取权限
     chown -h sing-box:sing-box "$cert_path" "$key_path" 2>/dev/null || true
     chown sing-box:sing-box /etc/singbox-vless-ws 2>/dev/null || true
   fi
@@ -477,6 +413,7 @@ configure_custom_socks5_outbound() {
     fi
 
     local mode current_type tmp_file
+    # 提取当前首个出口的协议类型
     current_type=$(jq -r '.outbounds[0].type // "direct"' "$SB_CONFIG" 2>/dev/null || echo "direct")
 
     echo "---------------------------------------------"
@@ -495,6 +432,7 @@ configure_custom_socks5_outbound() {
     case "$mode" in
         1)
             tmp_file=$(mktemp)
+            # 修改为符合 sing-box 规范的 direct 路由出口
             jq '.outbounds = [{"type": "direct", "tag": "direct"}]' "$SB_CONFIG" > "$tmp_file"
             if ! jq empty "$tmp_file" >/dev/null 2>&1; then
                 rm -f "$tmp_file"
@@ -552,6 +490,7 @@ configure_custom_socks5_outbound() {
 
     tmp_file=$(mktemp)
 
+    # 构造符合 sing-box 规范的 Socks 出口配置架构
     if [[ -n "$socks_user" ]]; then
         jq \
             --arg host "$socks_host" \
@@ -612,6 +551,7 @@ write_and_show_config() {
     url_ip="[$ip]"
   fi
 
+  # 默认生成直连模式的配置文件结构
   cat << EOF > /etc/singbox-vless-ws/config.json
 {
   "log": {

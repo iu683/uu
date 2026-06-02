@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# ACME Pro 证书申请（纯本地管理：支持域名与 IP 强制续期）
+# ACME Pro 证书申请（本地管理：支持域名与 IP 强制续期）
 # ==========================================
 export LANG=en_US.UTF-8
 
@@ -16,7 +16,7 @@ yellow(){ echo -e "${YELLOW}$1${RESET}"; }
 [[ $EUID -ne 0 ]] && red "请使用 root 运行" && exit
 
 ACME_HOME="/root/.acme.sh"
-SSL_DIR="/root/ssl"
+SSL_DIR="/etc/ssl"
 mkdir -p $SSL_DIR
 
 # 简易 pause 函数
@@ -86,7 +86,7 @@ start_web(){
 }
 
 # ==========================================
-# 安装/导出证书（已严格修改为你指定的纯净本地导出模式）
+# 安装/导出证书
 # ==========================================
 install_cert(){
     local domain=$1

@@ -1,442 +1,796 @@
-#!/bin/bash
-# ==========================================
-# ACME Pro 证书申请（本地管理：支持域名与 IP 强制续期）
-# ==========================================
+#!/usr/bin/env bash
+#
+# sing-box (AnyTLS) 核心控制面板
+# SPDX-License-Identifier: MIT
+#
+# =========================================================
+# 1. 核心控制与全局环境初始化
+# =========================================================
+set -Eop pipefail
 export LANG=en_US.UTF-8
 
+# 基础目录与硬编码配置
+readonly SB_CONFIG="/etc/mo-anytls-sb/config.json"
+readonly SB_BINARY="/usr/local/bin/sing-box"
+readonly SB_DIR="/root/proxynode/Anytls"
+EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
+SYSTEMD_SERVICES_DIR="/etc/systemd/system"
+CONFIG_DIR="/etc/mo-anytls-sb"
+REPO_URL="https://github.com/SagerNet/sing-box"
+API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
+CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
+
+# 自动检测环境变量
+PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
+OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
+ARCHITECTURE="${ARCHITECTURE:-}"
+SINGBOX_USER="${SINGBOX_USER:-}"
+SINGBOX_HOME_DIR="${SINGBOX_HOME_DIR:-}"
+
+# 终端颜色代码
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
+BLUE="\033[34m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-green(){ echo -e "${GREEN}$1${RESET}"; }
-red(){ echo -e "${RED}$1${RESET}"; }
-yellow(){ echo -e "${YELLOW}$1${RESET}"; }
-
-[[ $EUID -ne 0 ]] && red "请使用 root 运行" && exit
-
-ACME_HOME="/root/.acme.sh"
-SSL_DIR="/etc/acmessl"
-mkdir -p $SSL_DIR
-
-# 简易 pause 函数
-pause() {
-    read -p $'\033[32m按回车返回菜单...\033[0m' temp
+# =========================================================
+# 2. 底层工具函数
+# =========================================================
+has_command() {
+  local _command=$1
+  type -P "$_command" > /dev/null 2>&1
 }
 
-# ===============================
-# 依赖检测
-# ===============================
-install_dep(){
-    if command -v apt >/dev/null 2>&1; then
-        apt update -y
-        apt install -y curl socat cron wget python3 openssl
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y curl socat cronie wget python3 openssl
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y curl socat cronie wget python3 openssl
-    fi
+curl() {
+  command curl "${CURL_FLAGS[@]}" "$@"
 }
 
-# ===============================
-# 安装 acme.sh
-# ===============================
-install_acme(){
-    if [ ! -f "$ACME_HOME/acme.sh" ]; then
-        read -p "请输入注册邮箱（回车自动生成）: " email
-        [ -z "$email" ] && email="$(date +%s)@gmail.com"
-        curl https://get.acme.sh | sh -s email=$email
-        green "acme.sh 安装完成"
-    fi
+mktemp() {
+  command mktemp "$@" "sbservinst.XXXXXXXXXX"
 }
 
-# ===============================
-# 更新 acme.sh
-# ===============================
-update_acme(){
-    if [ -f "$ACME_HOME/acme.sh" ]; then
-        yellow "正在检查并更新 acme.sh..."
-        $ACME_HOME/acme.sh --upgrade
-        if [ $? -eq 0 ]; then
-            green "acme.sh 更新成功！"
-        else
-            red "更新失败，请检查 network 连接。"
-        fi
+info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
+error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
+pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
+
+generate_random_password() {
+  # 生成 16 位强随机密码作为 AnyTLS 备用密钥
+  dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
+}
+
+systemctl() {
+  if ! has_command systemctl; then
+    warn "当前系统不支持 systemd，忽略守护进程操作: systemctl $*"
+    return 0
+  fi
+  command systemctl "$@"
+}
+
+install_content() {
+  local _install_flags="$1"
+  local _content="$2"
+  local _destination="$3"
+  local _overwrite="$4"
+  local _tmpfile="$(mktemp)"
+
+  echo -ne "安装 $_destination ... "
+  echo "$_content" > "$_tmpfile"
+  if [[ -z "$_overwrite" && -e "$_destination" ]]; then
+    echo -e "已存在"
+  elif install "$_install_flags" "$_tmpfile" "$_destination"; then
+    echo -e "完成"
+  fi
+  rm -f "$_tmpfile"
+}
+
+remove_file() {
+  local _target="$1"
+  echo -ne "移除 $_target ... "
+  if rm -f "$_target"; then
+    echo -e "完成"
+  fi
+}
+
+detect_package_manager() {
+  [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
+  has_command apt && PACKAGE_MANAGEMENT_INSTALL='apt -y --no-install-recommends install' && return 0
+  has_command dnf && PACKAGE_MANAGEMENT_INSTALL='dnf -y install' && return 0
+  has_command yum && PACKAGE_MANAGEMENT_INSTALL='yum -y install' && return 0
+  has_command apk && PACKAGE_MANAGEMENT_INSTALL='apk add --no-cache' && return 0
+  return 1
+}
+
+install_software() {
+  local _package_name="$1"
+  if ! detect_package_manager; then
+    error "未检测到支持的包管理器，请手动安装 $_package_name"
+    exit 65
+  fi
+  echo "正在安装缺失的依赖 '$_package_name' ... "
+  if $PACKAGE_MANAGEMENT_INSTALL "$_package_name" >/dev/null 2>&1; then
+    echo "依赖安装成功"
+  else
+    error "无法通过包管理器安装 '$_package_name'，请手动安装。"
+    exit 65
+  fi
+}
+
+is_user_exists() { id "$1" > /dev/null 2>&1; }
+
+check_environment() {
+  if [[ "x$(uname)" == "xLinux" ]]; then
+    OPERATING_SYSTEM=linux
+  else
+    error "本脚本仅支持 Linux 系统。"
+    exit 95
+  fi
+
+  case "$(uname -m)" in
+    'i386' | 'i686') ARCHITECTURE='386' ;;
+    'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
+    'armv5tel' | 'armv6l' | 'armv7' | 'armv7l') ARCHITECTURE='armv7' ;;
+    'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
+    's390x') ARCHITECTURE='s390x' ;;
+    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
+  esac
+
+  has_command curl || install_software curl
+  has_command grep || install_software grep
+  has_command jq || install_software jq
+  has_command openssl || install_software openssl
+  has_command tar || install_software tar
+  has_command socat || install_software socat
+  has_command python3 || install_software python3
+}
+
+get_installed_version() {
+  if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
+    local version_out
+    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null | head -n 1 || echo "")
+    if [[ -n "$version_out" ]]; then
+      echo "$version_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "未知格式"
     else
-        red "未检测到已安装的 acme.sh，请先申请证书或执行安装。"
+      echo "未知版本"
     fi
+  else
+    echo "未安装"
+  fi
 }
 
-# ===============================
-# 停止/恢复 Web 服务
-# ===============================
-stop_web(){
-    if systemctl is-active nginx >/dev/null 2>&1; then
-        systemctl stop nginx
-        WEB_STOP=nginx
-    fi
-    if systemctl is-active apache2 >/dev/null 2>&1; then
-        systemctl stop apache2
-        WEB_STOP=apache2
-    fi
+get_latest_version() {
+  local _tmpfile=$(mktemp)
+  if ! curl -sS -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases/latest" -o "$_tmpfile"; then
+    rm -f "$_tmpfile"
+    return
+  fi
+  local _tag_name=$(jq -r '.tag_name' "$_tmpfile" 2>/dev/null || echo "")
+  rm -f "$_tmpfile"
+  
+  if [[ -n "$_tag_name" ]]; then
+    echo "${_tag_name##*v}"
+  else
+    echo ""
+  fi
 }
 
-start_web(){
-    [ ! -z "$WEB_STOP" ] && systemctl start $WEB_STOP
+download_singbox() {
+  local _version="$1"
+  local _destination="$2"
+  local _download_url="$REPO_URL/releases/download/v${_version}/sing-box-${_version}-linux-${ARCHITECTURE}.tar.gz"
+  
+  info "正在下载官方 sing-box 核心组件: $_download_url ..."
+  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
+    error "核心下载失败！请检查您的网络连接。"
+    return 11
+  fi
+  return 0
 }
 
-# ==========================================
-# 安装/导出证书
-# ==========================================
-install_cert(){
-    local domain=$1
-    mkdir -p $SSL_DIR/$domain
-    
-    # 严格使用你指定的导出命令
-    $ACME_HOME/acme.sh --install-cert -d $domain \
-        --key-file       $SSL_DIR/$domain/private.key \
-        --fullchain-file $SSL_DIR/$domain/cert.crt
-        
-    green "证书本地同步完成"
-    green "路径: $SSL_DIR/$domain/"
+tpl_singbox_server_service_base() {
+  local _config_name="$1"
+  cat << EOF
+[Unit]
+Description=sing-box Server Service (${_config_name}.json)
+After=network.target nss-lookup.target
+
+[Service]
+Type=simple
+ExecStart=$EXECUTABLE_INSTALL_PATH run --config ${CONFIG_DIR}/${_config_name}.json
+WorkingDirectory=$SINGBOX_HOME_DIR
+User=$SINGBOX_USER
+Group=$SINGBOX_USER
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=true
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
+EOF
 }
 
-# ===============================
-# 智能获取公网 IP 函数
-# ===============================
+# =========================================================
+# 3. 网络与配置扩展辅助函数
+# =========================================================
 get_public_ip() {
-    local mode="${1:-"-4"}" 
-    local ip cmd urls
-
-    if [[ "$mode" == "-6" ]]; then
-        cmd_list=("curl -6fsSL --max-time 5" "wget -6qO- --timeout=5")
-        urls=("https://api64.ipify.org" "https://ipv6.ip.sb" "https://v6.ident.me")
-    else
-        cmd_list=("curl -4fsSL --max-time 5" "wget -4qO- --timeout=5")
-        urls=("https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com")
-    fi
-
-    for cmd in "${cmd_list[@]}"; do
-        for url in "${urls[@]}"; do
-            ip=$($cmd "$url" 2>/dev/null || true)
-            ip=$(echo "$ip" | tr -d '[:space:]')
-            if [[ -n "$ip" ]]; then
-                if [[ "$mode" == "-4" && "$ip" =~ \. ]] || [[ "$mode" == "-6" && "$ip" =~ : ]]; then
-                    echo "$ip"
-                    return 0
-                fi
-            fi
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    error "无法获取公网 IP 地址。" && return 1
+}
+
+check_port() {
+  local port="$1"
+  if ss -tunlp 2>/dev/null | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
     return 1
+  fi
+  return 0
 }
 
-# ==========================================
-# 获取系统状态数据（直接从 acme.sh 源码文件提取 VER=）
-# ==========================================
-get_system_status() {
-    local acme_file="$ACME_HOME/acme.sh"
-    if [ -f "$acme_file" ]; then
-        STATUS="${GREEN}运行中${RESET}"
-        
-        # 直接从文件内容中检索 VER=xxx 或 _VERSION=xxx 
-        VERSION_SHOW=$(grep -E '^(VER|漏洞标记|_VERSION)=' "$acme_file" | head -n 1 | cut -d'=' -f2 | tr -d '"'\'' ')
-        
-        # 兜底：如果文本提取依然失败，则固定为 3.1.4
-        if [ -z "$VERSION_SHOW" ]; then
-            VERSION_SHOW="3.1.4"
-        fi
-        
-        # 计算已申请的证书数量
-        SITE_COUNT=$($ACME_HOME/acme.sh --list | tail -n +2 | wc -l)
+is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
+
+get_random_port() {
+  local rand_port
+  while true; do
+    rand_port=$(shuf -i 2000-65535 -n 1)
+    if check_port "$rand_port"; then
+      echo "$rand_port" && return 0
+    fi
+  done
+}
+
+get_sb_status() {
+  if has_command systemctl && systemctl is-active --quiet mo-anytls-sb 2>/dev/null; then
+    echo -e "${GREEN}● 运行中${RESET}"
+  else
+    if pgrep -f "$EXECUTABLE_INSTALL_PATH run" >/dev/null 2>&1; then
+      echo -e "${GREEN}● 运行中${RESET}"
     else
-        STATUS="${RED}未运行${RESET}"
-        VERSION_SHOW="--"
-        SITE_COUNT="0"
+      echo -e "${RED}● 未运行${RESET}"
     fi
+  fi
 }
 
-# ===============================
-# 1. 域名 80 端口模式申请证书
-# ===============================
-standalone_issue(){
-    read -p "请输入域名: " domain
-    [ -z "$domain" ] && red "域名不能为空" && return 1
-    stop_web
-    $ACME_HOME/acme.sh --issue -d $domain --standalone -k ec-256 --server https://acme-v02.api.letsencrypt.org/directory
-    [ $? -eq 0 ] && install_cert $domain || red "证书申请失败"
-    start_web
+get_current_port_display() {
+  if [[ -f "$SB_CONFIG" ]]; then
+    local main_port
+    main_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "")
+    echo "${main_port:- -}"
+  else echo "-"; fi
 }
 
-# ==========================================
-# 2. IP 短周期证书申请 (仅支持纯 IPv4 模式)
-# ==========================================
-ip_issue(){
-    yellow "正在检索服务器公网 IPv4..."
-    local v4_ip=$(get_public_ip -4 || true)
-    
-    if [ -z "$v4_ip" ]; then
-        red "未检测到有效的公网 IPv4，请检查网络后再试。"
-        return 1
+# =========================================================
+# 4. 证书、端口交互与配置写入
+# =========================================================
+inst_cert() {
+  mkdir -p /etc/mo-anytls-sb
+  
+  echo "---------------------------------------------"
+  echo -e "sing-box TLS 证书申请方式如下："
+  echo -e " 1) 必应自签证书 ${YELLOW}（默认）${RESET}"
+  echo -e " 2) Acme自动申请 (需放行80端口)"
+  echo -e " 3) 自定义证书路径"
+  echo "---------------------------------------------"
+  local certInput
+  read -rp "请输入选项 [1-3] (直接回车默认自签): " certInput
+  certInput=${certInput:-1}
+
+  cert_path="/etc/mo-anytls-sb/fullchain.pem"
+  key_path="/etc/mo-anytls-sb/privkey.pem"
+
+  if [[ $certInput == 2 ]]; then
+    if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
+      warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。请确保已暂时关闭 Web 服务。"
     fi
 
-    echo "--------------------------------"
-    green "侦测到公网 IPv4: $v4_ip"
-    echo "--------------------------------"
-
-    yellow "即将通过 Let's Encrypt 申请 5天短周期证书 ($v4_ip)..."
-    stop_web
+    local vps_ip=$(get_public_ip)
+    read -rp "请输入需要申请证书的域名: " domain
+    [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
     
-    $ACME_HOME/acme.sh --issue --standalone \
-        --certificate-profile shortlived \
-        -d "$v4_ip" \
-        --keylength 2048 \
-        --server letsencrypt \
-        --force
-
-    if [ $? -eq 0 ]; then
-        install_cert "$v4_ip"
+    info "正在检查并安装 Acme.sh 依赖..."
+    local acme_cmd="/root/.acme.sh/acme.sh"
+    if [[ ! -f "$acme_cmd" ]]; then
+      curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
+    fi
+    
+    "$acme_cmd" --set-default-ca --server letsencrypt
+    
+    info "正在向 Let's Encrypt 申请证书..."
+    if [[ "$vps_ip" =~ ":" ]]; then
+      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
     else
-        red "证书申请失败。请检查该 IP 的 80 端口是否在系统防火墙（iptables/ufw）或云服务商安全组中放行。"
+      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
     fi
-    start_web
-}
-
-# ===============================
-# 3. DNS 模式申请证书
-# ===============================
-dns_issue(){
-    read -p "请输入域名: " domain
-    [ -z "$domain" ] && red "域名不能为空" && return 1
-    echo "1.Cloudflare"
-    echo "2.DNSPod"
-    echo "3.Aliyun"
-    read -p "请选择: " type
-    case $type in
-        1)
-            read -p "CF_Key: " CF_Key
-            read -p "CF_Email: " CF_Email
-            export CF_Key CF_Email
-            $ACME_HOME/acme.sh --issue --dns dns_cf -d $domain -k ec-256 --server https://acme-v02.api.letsencrypt.org/directory
-            ;;
-        2)
-            read -p "DP_Id: " DP_Id
-            read -p "DP_Key: " DP_Key
-            export DP_Id DP_Key
-            $ACME_HOME/acme.sh --issue --dns dns_dp -d $domain -k ec-256 --server https://acme-v02.api.letsencrypt.org/directory
-            ;;
-        3)
-            read -p "Ali_Key: " Ali_Key
-            read -p "Ali_Secret: " Ali_Secret
-            export Ali_Key Ali_Secret
-            $ACME_HOME/acme.sh --issue --dns dns_ali -d $domain -k ec-256 --server https://acme-v02.api.letsencrypt.org/directory
-            ;;
-        *)
-            red "无效选择"
-            return 1
-            ;;
-    esac
-    [ $? -eq 0 ] && install_cert $domain || red "证书申请失败"
-}
-
-# ==========================================
-# 4. 强制续期全部本地证书（包含 IP 短周期）
-# ==========================================
-renew_all(){
-    yellow "正在强制续期本地全部证书 (包括域名与短周期IP)..."
-    stop_web
     
-    # 执行你指定的 IP/域名 强制全续期命令
-    $ACME_HOME/acme.sh --renew-all --ecc --force
-    local res=$?
-    
-    # 强制续期成功后，使用你指定的命令重新导出并覆盖本地存储
-    if [ -d "$SSL_DIR" ]; then
-        for domain in $(ls $SSL_DIR); do
-            if $ACME_HOME/acme.sh --list | grep -q "$domain"; then
-                yellow "正在同步重新导出 [$domain] 的证书文件..."
-                # 严格使用你指定的本地导出命令结构
-                $ACME_HOME/acme.sh --install-cert -d "$domain" \
-                    --key-file       $SSL_DIR/$domain/private.key \
-                    --fullchain-file $SSL_DIR/$domain/cert.crt >/dev/null
-            fi
-        done
+    # 【核心优化点】: 
+    # 1. 判定当前的守护进程环境，生成对应的重启命令
+    # 2. 使用 --reloadcmd。这样以后每次 crontab 触发自动续期成功后，Acme 会自动把新证书刷进路径，并自动重启 sing-box！
+    local reload_cmd="pkill -f '$EXECUTABLE_INSTALL_PATH run' || true; '$EXECUTABLE_INSTALL_PATH' run --config /etc/mo-anytls-sb/config.json >/dev/null 2>&1 &"
+    if has_command systemctl; then
+      reload_cmd="systemctl restart mo-anytls-sb"
     fi
-    start_web
-    echo "----------------------------------------"
-    green "全部本地证书已执行强制续期并完成同步！"
-    pause
+
+    info "正在配置证书自动同步与服务重载钩子..."
+    if "$acme_cmd" --install-cert -d "${domain}" \
+      --key-file "$key_path" \
+      --fullchain-file "$cert_path" \
+      --ecc \
+      --reloadcmd "$reload_cmd"; then
+      
+      echo "$domain" > /etc/mo-anytls-sb/ca.log
+      sb_domain=$domain
+      info "Acme 证书申请成功！已建立自动续期同步与服务重启快线。"
+    else
+      error "Acme 证书申请失败，自动切换回自签模式。"
+      certInput=1
+    fi
+    
+  elif [[ $certInput == 3 ]]; then
+    local user_cert user_key
+    read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
+    read -rp "请输入密钥文件 (privkey.pem/key) 的路径: " user_key
+    read -rp "请输入证书对应的域名: " sb_domain
+    
+    if [[ -f "$user_cert" && -f "$user_key" ]]; then
+      # 【优化点】自定义证书改用软链接（ln -sf），原文件更新时，沙箱内同步生效
+      rm -f "$cert_path" "$key_path"
+      ln -sf "$user_cert" "$cert_path"
+      ln -sf "$user_key" "$key_path"
+      info "自定义证书已通过软链接同步至内部安全区。"
+    else
+      error "找不到输入的证书文件，自动降级回自签模式。"
+      certInput=1
+    fi
+  fi
+
+  if [[ $certInput == 1 ]]; then
+    info "将使用必应自签证书作为 sing-box 的节点证书"
+    rm -f "$cert_path" "$key_path" # 清理可能残留的软链接
+    openssl ecparam -genkey -name prime256v1 -out "$key_path"
+    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
+    sb_domain="www.bing.com"
+  fi
+
+  # 如果是软链接，chmod -h 和 chown -h 可以确保只修改链接本身或穿透正确
+  chmod 644 "$cert_path" || true
+  chmod 600 "$key_path" || true
+  if is_user_exists "sing-box"; then
+    chown -R sing-box:sing-box /etc/mo-anytls-sb
+  fi
 }
 
-# ==========================================
-# 5. 域名/IP 证书本地状态实时监控
-# ==========================================
-check_domains_status() {
+inst_port() {
+  local default_port=""
+  [[ -f "$SB_CONFIG" ]] && default_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "")
+
+  local prompt_msg="设置 sing-box 主端口 [1-65535] (回车随机分配): "
+  [[ -n "$default_port" ]] && prompt_msg="设置 sing-box 主端口 [当前: ${default_port}, 回车不修改]: "
+
+  while true; do
+    read -rp "$prompt_msg" port
+    if [[ -z "$port" ]]; then
+      if [[ -n "$default_port" ]]; then port="$default_port" && break
+      else
+        port=$(get_random_port)
+        info "已为您随机分配未被占用端口: $port" && break
+      fi
+    elif is_valid_port "$port"; then
+      if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
+        error "端口 ${port} 已被其它程序占用，请更换。" && continue
+      fi
+      break
+    else error "请输入有效的端口数字 (1-65535)"; fi
+  done
+}
+
+write_and_show_config() {
+  local hostname=$(hostname -s | sed 's/ /_/g')
+  local ip=$(get_public_ip)
+  local url_ip="$ip"
+  if [[ "$ip" =~ ":" ]]; then 
+    url_ip="[$ip]"
+  fi
+
+  # 1. 写入服务端核心 JSON
+  cat << EOF > /etc/mo-anytls-sb/config.json
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "anytls",
+      "tag": "anytls-in",
+      "listen": "::",
+      "listen_port": $port,
+      "users": [
+        {
+          "name": "user1",
+          "password": "$auth_pwd"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "$sb_domain",
+        "key_path": "$key_path",
+        "certificate_path": "$cert_path"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
+
+  mkdir -p "$SB_DIR"
+  
+  # 2. 写入通用客户端 sing-box.json 备份
+  cat << EOF > "$SB_DIR/sb-client.json"
+{
+  "log": {
+    "level": "info"
+  },
+  "outbounds": [
+    {
+      "type": "anytls",
+      "tag": "anytls-out",
+      "server": "$url_ip",
+      "server_port": $port,
+      "password": "$auth_pwd",
+      "tls": {
+        "enabled": true,
+        "server_name": "$sb_domain",
+        "insecure": true
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
+
+  # 3. 固化持久化节点数据（保存为文本形式，防止转移丢失）
+  cat << EOF > "$SB_DIR/url.txt"
+====== AnyTLS 节点信息 ======
+IP      : ${ip}
+端口    : $port
+密码    : $auth_pwd
+---------------------------
+📄 V6VPS 请自行替换 IP 地址为 V6 ★
+[信息] V2rayN 链接：
+anytls://$auth_pwd@$url_ip:$port/?insecure=1#$hostname-Anytls
+[信息] Surge 配置：
+$hostname-Anytls = anytls, $url_ip, $port, password=$auth_pwd, tfo=true, skip-cert-verify=true, reuse=false
+---------------------------------
+EOF
+
+  if is_user_exists "sing-box"; then
+    chown -R sing-box:sing-box /etc/mo-anytls-sb
+  fi
+
+  # 4. 守护进程分支运行
+  if has_command systemctl; then
+    systemctl daemon-reload
+    systemctl enable mo-anytls-sb >/dev/null 2>&1 || true
+    systemctl restart mo-anytls-sb >/dev/null 2>&1 || true
+    
+    if systemctl is-active --quiet mo-anytls-sb 2>/dev/null; then
+      info "sing-box (anytls) 服务配置并启动成功！"
+    else
+      error "sing-box 服务启动失败，请运行 'systemctl status mo-anytls-sb' 查看日志。"
+    fi
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+    "$EXECUTABLE_INSTALL_PATH" run --config $SB_CONFIG >/dev/null 2>&1 &
+    info "非 systemd 环境，程序已挂载至后台 Pid 进程池中运行。"
+  fi
+  
+  showconf
+}
+
+# =========================================================
+# 5. 主流程功能控制模块
+# =========================================================
+instsingbox() {
+  check_environment
+  
+  info "获取官方最新发布版本中..."
+  local latest_version=$(get_latest_version)
+  if [[ -z "$latest_version" ]]; then
+    error "无法获取最新版本号，请检查网络设置。"
+    return 1
+  fi
+  
+  local _tmparchive=$(mktemp)
+  if ! download_singbox "$latest_version" "$_tmparchive"; then
+    rm -f "$_tmparchive" && return 1
+  fi
+
+  echo -ne "正在解压并安装二进制可执行文件 ... "
+  local _tmpdir=$(mktemp -d)
+  tar -xzf "$_tmparchive" -C "$_tmpdir"
+  
+  if install -Dm755 "$_tmpdir"/sing-box-*/sing-box "$EXECUTABLE_INSTALL_PATH"; then
+    echo "成功"
+  else
+    rm -rf "$_tmparchive" "$_tmpdir" && error "安装失败" && return 1
+  fi
+  rm -rf "$_tmparchive" "$_tmpdir"
+
+  SINGBOX_USER="sing-box"
+  SINGBOX_HOME_DIR="/var/lib/sing-box"
+  if ! is_user_exists "$SINGBOX_USER"; then
+    echo -ne "正在创建系统独立沙箱运行用户 $SINGBOX_USER ... "
+    useradd -r -d "$SINGBOX_HOME_DIR" -m "$SINGBOX_USER" >/dev/null 2>&1 || true
+    echo "成功"
+  fi
+
+  if has_command systemctl; then
+    install_content -Dm644 "$(tpl_singbox_server_service_base 'config')" "$SYSTEMD_SERVICES_DIR/mo-anytls-sb.service" "1"
+    install_content -Dm644 "$(tpl_singbox_server_service_base '%i')" "$SYSTEMD_SERVICES_DIR/mo-anytls-sb@.service" "1"
+  fi
+
+  inst_cert || return 1
+  inst_port
+  
+  # 优先支持自定义密码输入，直接回车则采用 16 位强随机密码
+  read -rp "设置 AnyTLS 验证密码 (直接回车将自动分配强随机密码): " auth_pwd
+  auth_pwd=${auth_pwd:-$(generate_random_password)}
+
+  write_and_show_config
+}
+
+update_singbox() {
+  if [[ ! -f "$SB_BINARY" ]]; then
+    error "当前系统未安装 sing-box，无法执行更新。"
+    return 1
+  fi
+
+  info "正在检查新版本..."
+  local current_version=$(get_installed_version)
+  local latest_version=$(get_latest_version)
+
+  if [[ -z "$latest_version" ]]; then
+    error "无法连接到 GitHub API 获取最新版本，请稍后再试。"
+    return 1
+  fi
+
+  info "当前安装版本: ${YELLOW}${current_version}${RESET}"
+  info "官方最新版本: ${GREEN}${latest_version}${RESET}"
+
+  if [[ "$current_version" == "$latest_version" ]]; then
+    info "您当前已经是最新版本，无需更新。"
+    return 0
+  fi
+
+  warn "检测到新版本，即将开始平滑更新 (你的配置与运行数据不会改变)..."
+  
+  local _tmparchive=$(mktemp)
+  if ! download_singbox "$latest_version" "$_tmparchive"; then
+    rm -f "$_tmparchive" && return 1
+  fi
+
+  echo -ne "正在覆盖二进制核心文件 ... "
+  local _tmpdir=$(mktemp -d)
+  tar -xzf "$_tmparchive" -C "$_tmpdir"
+  if install -Dm755 "$_tmpdir"/sing-box-*/sing-box "$EXECUTABLE_INSTALL_PATH"; then
+    echo "成功"
+  else
+    rm -rf "$_tmparchive" "$_tmpdir" && error "覆盖核心失败" && return 1
+  fi
+  rm -rf "$_tmparchive" "$_tmpdir"
+
+  info "正在重启 sing-box 服务以应用更新..."
+  if has_command systemctl; then
+    systemctl daemon-reload
+    systemctl restart mo-anytls-sb >/dev/null 2>&1 || true
+    if systemctl is-active --quiet mo-anytls-sb 2>/dev/null; then
+      info "sing-box 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
+    else
+      error "核心更新成功，但服务重启失败，请运行 'systemctl status mo-anytls-sb' 检查错误。"
+    fi
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+    "$EXECUTABLE_INSTALL_PATH" run --config "$SB_CONFIG" >/dev/null 2>&1 &
+    info "sing-box 核心已更新并于后台重启运行。"
+  fi
+}
+
+unstsingbox() {
+  warn "即将从当前系统中彻底卸载 sing-box"
+
+  if has_command systemctl; then
+    systemctl stop mo-anytls-sb >/dev/null 2>&1 || true
+    systemctl disable mo-anytls-sb >/dev/null 2>&1 || true
+    remove_file "$SYSTEMD_SERVICES_DIR/mo-anytls-sb.service"
+    remove_file "$SYSTEMD_SERVICES_DIR/mo-anytls-sb@.service"
+    systemctl daemon-reload
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+  fi
+  
+  remove_file "$EXECUTABLE_INSTALL_PATH"
+  rm -rf /etc/mo-anytls-sb "$SB_DIR"
+
+  info "sing-box 已彻底从您的系统中移除！"
+}
+
+changeconf() {
+  if [[ ! -f "$SB_CONFIG" ]]; then
+    error "配置文件不存在，请先安装 sing-box"
+    return 1
+  fi
+
+  local old_pwd=$(jq -r '.inbounds[0].users[0].password' "$SB_CONFIG" 2>/dev/null || true)
+  local old_cert=$(jq -r '.inbounds[0].tls.certificate_path' "$SB_CONFIG" 2>/dev/null || true)
+  local old_key=$(jq -r '.inbounds[0].tls.key_path' "$SB_CONFIG" 2>/dev/null || true)
+  local old_sni=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || "www.bing.com")
+
+  clear
+  echo -e "${GREEN}====== 修改 sing-box (AnyTLS) 配置 ======${RESET}"
+  echo "提示：直接敲回车将保持原有配置不变"
+  echo "---------------------------------------------"
+  
+  inst_port 
+
+  local auth_pwd
+  # 这里的修改配置模块同样支持自定义新密码，回车则沿用旧密码
+  read -rp "设置 AnyTLS 新密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
+  auth_pwd=${auth_pwd:-$old_pwd}
+
+  local cert_path key_path sb_domain
+  echo "---------------------------------------------"
+  read -rp "是否需要修改证书？[y/N] (直接回车默认不修改): " change_cert_flag
+  if [[ "$change_cert_flag" == "y" || "$change_cert_flag" == "Y" ]]; then
+    inst_cert || return 1
+  else
+    cert_path="$old_cert"
+    key_path="$old_key"
+    sb_domain="$old_sni"
+  fi
+
+  write_and_show_config
+  info "配置修改并应用成功！"
+}
+
+showconf() {
+  if [[ ! -f "$SB_CONFIG" ]]; then
+    error "未找到 AnyTLS 配置文件，请确保已成功部署节点。"
+    return
+  fi
+
+  # 实时从服务端核心配置中提取参数，确保 100% 准确
+  local hostname=$(hostname -s | sed 's/ /_/g')
+  local main_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "18055")
+  local auth_pwd=$(jq -r '.inbounds[0].users[0].password' "$SB_CONFIG" 2>/dev/null || echo "密码")
+  local sb_domain=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || echo "anyoo.vfz.dpdns.org")
+  
+  # 自动判定证书校验逻辑：如果是 bing.com 的自签证书，则客户端必须 insecure=1；如果是合法 Acme 证书，则 insecure=0
+  local is_insecure="0"
+  local skip_cert="false"
+  if [[ "$sb_domain" == "www.bing.com" ]]; then
+    is_insecure="1"
+    skip_cert="true"
+  fi
+
+  local ip=$(get_public_ip)
+  local url_ip="$ip"
+  if [[ "$ip" =~ ":" ]]; then 
+    url_ip="[$ip]"
+  fi
+
+  echo -e "${GREEN}====== AnyTLS 节点信息 ======${RESET}"
+  echo -e "${YELLOW}IP      : ${ip}${RESET}"
+  echo -e "${YELLOW}端口    : ${main_port}${RESET}"
+  echo -e "${YELLOW}密码    : ${auth_pwd}${RESET}"
+  echo -e "${YELLOW}SNI    : ${sb_domain}${RESET}"
+  echo -e "${GREEN}---------------------------${RESET}"
+  echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
+  echo -e "${GREEN}[信息] V2rayN 链接：${RESET}"
+  echo -e "${YELLOW}anytls://${auth_pwd}@${url_ip}:${main_port}?security=tls&sni=${sb_domain}&insecure=${is_insecure}&allowInsecure=${is_insecure}&type=tcp&headerType=none#${hostname}-Anytls${RESET}"
+  echo -e "${GREEN}[信息] Surge 配置：${RESET}"
+  echo -e "${YELLOW}${hostname}-Anytls = anytls, ${url_ip}, ${main_port}, password=${auth_pwd}, sni=${sb_domain}, tfo=true, skip-cert-verify=${skip_cert}, reuse=false${RESET}"
+  echo -e "${YELLOW}---------------------------------${RESET}"
+  echo
+}
+
+# =========================================================
+# 6. 面板主菜单循环
+# =========================================================
+menu() {
+  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
+  check_environment
+
+  while true; do
     clear
-    echo -e "${YELLOW}========================================${RESET}"
-    echo -e "${YELLOW}        ◈ 本地证书状态实时监控 ◈            ${RESET}"
-    echo -e "${YELLOW}========================================${RESET}"
+    local status=$(get_sb_status)
+    local version=$(get_installed_version)
+    local port_show=$(get_current_port_display)
 
-    mapfile -t DOMAINS < <($ACME_HOME/acme.sh --list | tail -n +2 | awk '{print $1}')
-    
-    if [ ${#DOMAINS[@]} -eq 0 ] || [ "${DOMAINS[0]}" == "" ]; then
-        echo -e "${RED} ❌ 当前系统 acme.sh 未检测到任何已签发的本地证书。${RESET}"
-        echo -e "${YELLOW}----------------------------------------${RESET}"
-        pause
-        return
-    fi
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}      Sing-box AnyTLS 面板      ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $status"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装 Sing-box AnyTLS${RESET}"
+    echo -e "${GREEN}2. 更新 Sing-box AnyTLS${RESET}"
+    echo -e "${GREEN}3. 卸载 Sing-box AnyTLS${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 Sing-box AnyTLS${RESET}"
+    echo -e "${GREEN}6. 停止 Sing-box AnyTLS${RESET}"
+    echo -e "${GREEN}7. 重启 Sing-box AnyTLS${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 
-    for DOMAIN in "${DOMAINS[@]}"; do
-        [ -z "$DOMAIN" ] && continue
-        local CERT_PATH="$SSL_DIR/$DOMAIN/cert.crt"
-        local TYPE="ACME 本地管理 (域名/IP)"
+    local choice=""
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+    [[ -z "$choice" ]] && continue
 
-        echo -e "${YELLOW}◈ 域名/IP: ${RESET}${YELLOW}${DOMAIN}${RESET}"
-        echo -e "  ├─ ${YELLOW}证书类型: ${RESET}${TYPE}"
-
-        if [ -f "$CERT_PATH" ]; then
-            END_DATE=$(openssl x509 -enddate -noout -in "$CERT_PATH" | cut -d= -f2)
-            if END_TS=$(date -d "$END_DATE" +%s 2>/dev/null); then
-                NOW_TS=$(date +%s)
-                DAYS_LEFT=$(( (END_TS - NOW_TS) / 86400 ))
-                
-                if [ $DAYS_LEFT -ge 30 ]; then
-                    STATUS_COLOR="${GREEN}"
-                    STATUS_TEXT="正常有效"
-                elif [ $DAYS_LEFT -ge 0 ]; then
-                    STATUS_COLOR="${YELLOW}"
-                    STATUS_TEXT="即将过期 (请注意)"
-                else
-                    STATUS_COLOR="${RED}"
-                    STATUS_TEXT="已过期 (请立即更新)"
-                fi
-                echo -e "  ├─ ${YELLOW}到期时间: ${RESET}$(date -d "$END_DATE" +"%Y-%m-%d" 2>/dev/null || echo "$END_DATE")"
-                echo -e "  ├─ ${YELLOW}剩余天数: ${RESET}${STATUS_COLOR}${DAYS_LEFT} 天${RESET}"
-                echo -e "  └─ ${YELLOW}运行状态: ${RESET}${STATUS_COLOR}${STATUS_TEXT}${RESET}"
-            else
-                if openssl x509 -checkend 2592000 -in "$CERT_PATH" >/dev/null; then
-                    echo -e "  └─ ${YELLOW}运行状态: ${RESET}${GREEN}正常有效 (剩余 > 30天)${RESET}"
-                else
-                    echo -e "  └─ ${YELLOW}运行状态: ${RESET}${YELLOW}即将过期或已过期${RESET}"
-                fi
-            fi
+    case "$choice" in
+      1) instsingbox; pause ;;
+      2) update_singbox; pause ;;
+      3) unstsingbox; pause ;;
+      4) changeconf; pause ;;
+      5) 
+        if has_command systemctl; then
+          systemctl start mo-anytls-sb && info "服务已成功启动！"
         else
-            echo -e "  └─ ${YELLOW}运行状态: ${RESET}${RED}未在 $SSL_DIR 中找到导出的证书文件${RESET}"
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+          "$EXECUTABLE_INSTALL_PATH" run --config "$SB_CONFIG" >/dev/null 2>&1 &
+          info "进程已在后台启动！"
         fi
-        echo -e "${YELLOW}----------------------------------------${RESET}"
-    done
-    pause
-}
-
-# ==========================================
-# 6. 删除本地证书（纯本地列表删除）
-# ==========================================
-remove_cert(){
-    mapfile -t certs < <($ACME_HOME/acme.sh --list | tail -n +2 | awk '{print $1}')
-    if [ ${#certs[@]} -eq 0 ] || [ "${certs[0]}" == "" ]; then
-        red "当前没有任何本地证书可删除"
-        pause
-        return 0
-    fi
-    green "本地可删除的证书列表："
-    echo "编号    域名/IP"
-    echo "---------------------------"
-    for i in "${!certs[@]}"; do
-        [ -z "${certs[$i]}" ] && continue
-        printf "%-4s %s\n" "$((i+1))" "${certs[$i]}"
-    done
-    
-    read -p "请输入要删除的编号 (输入0返回): " num
-    [ "$num" == "0" ] && return 0
-    if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -lt 1 ] || [ "$num" -gt "${#certs[@]}" ]; then
-        red "无效编号"
-        pause
-        return 0
-    fi
-    
-    domain="${certs[$((num-1))]}"
-    
-    $ACME_HOME/acme.sh --remove -d "$domain" --ecc >/dev/null 2>&1
-    $ACME_HOME/acme.sh --remove -d "$domain" >/dev/null 2>&1
-    
-    if [ -d "$SSL_DIR/$domain" ]; then
-        rm -rf "$SSL_DIR/$domain"
-    fi
-    
-    green "证书 [$domain] 已成功从本地及 acme.sh 中删除。"
-    pause
-}
-
-# ===============================
-# 7. 查看自动续期任务
-# ===============================
-show_cron(){
-    echo
-    green "当前 acme.sh 自动续期任务:"
-    crontab -l | grep acme.sh || yellow "未发现自动续期任务"
-    echo
-    pause
-}
-
-# ===============================
-# 9. 卸载 acme.sh
-# ===============================
-uninstall_acme(){
-    [ -f "$ACME_HOME/acme.sh" ] && "$ACME_HOME/acme.sh" --uninstall >/dev/null 2>&1
-    [ -d "$ACME_HOME" ] && rm -rf "$ACME_HOME"
-    [ -d "/etc/acme" ] && rm -rf "/etc/acme"
-    [ -d "$SSL_DIR" ] && rm -rf "$SSL_DIR"
-
-    crontab -l 2>/dev/null | grep -v acme.sh | crontab -
-    
-    [ -f "$HOME/.bashrc" ] && sed -i '/acme.sh.env/d' "$HOME/.bashrc"
-    [ -f "$HOME/.profile" ] && sed -i '/acme.sh.env/d' "$HOME/.profile"
-    
-    green "acme.sh 已彻底卸载"
-    pause
-}
-
-# ===============================
-# 主菜单循环
-# ===============================
-while true
-do
-    clear
-    get_system_status
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        ACME  管理面板          ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $STATUS"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}$VERSION_SHOW${RESET}"
-    echo -e "${GREEN}证书   :${RESET} ${YELLOW}$SITE_COUNT 个${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装ACME${RESET}"
-    echo -e "${GREEN} 2. 申请域名证书(80端口模式)${RESET}"
-    echo -e "${GREEN} 3. 申请IP证书(IP短周期模式)${RESET}"
-    echo -e "${GREEN} 4. 申请域名证书(DNSAPI模式)${RESET}"
-    echo -e "${GREEN} 5. 强制续期全部本地证书${RESET}"
-    echo -e "${GREEN} 6. 查看已申请证书${RESET}"
-    echo -e "${GREEN} 7. 删除指定本地证书${RESET}"
-    echo -e "${GREEN} 8. 查看定时自动续期任务${RESET}"
-    echo -e "${GREEN} 9. 更新ACME${RESET}"
-    echo -e "${GREEN}10. 卸载ACME${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN} 请选择: ${RESET}"
-    
-    read num
-    case $num in
-        1) install_dep; install_acme; pause;;
-        2) [ ! -f "$ACME_HOME/acme.sh" ] && install_dep && install_acme; standalone_issue;;
-        3) [ ! -f "$ACME_HOME/acme.sh" ] && install_dep && install_acme; ip_issue;;
-        4) [ ! -f "$ACME_HOME/acme.sh" ] && install_dep && install_acme; dns_issue;;
-        5) renew_all;;
-        6) check_domains_status;;
-        7) remove_cert;;
-        8) show_cron;;
-        9) update_acme; pause;;
-       10) uninstall_acme;;
-        0) exit;;
-        *) echo -e "${RED}无效选项${RESET}"; pause;;
+        pause ;;
+      6) 
+        if has_command systemctl; then
+          systemctl stop mo-anytls-sb && info "服务已成功停止！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台进程已终止！"
+        fi
+        pause ;;
+      7) 
+        if has_command systemctl; then
+          systemctl restart mo-anytls-sb && info "服务已成功重启！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+          "$EXECUTABLE_INSTALL_PATH" run --config "$SB_CONFIG" >/dev/null 2>&1 &
+          info "后台进程已重启！"
+        fi
+        pause ;;
+      8) 
+        if has_command systemctl; then
+          journalctl -u mo-anytls-sb.service -n 50 --no-pager
+        else
+          warn "当前环境不支持 systemd 集中日志管理。"
+        fi
+        pause ;;
+      9) showconf; pause ;;
+      0) exit 0 ;;
+      *) error "无效输入，请重新选择。"; sleep 1 ;;
     esac
-done
+  done
+}
+
+menu "$@"

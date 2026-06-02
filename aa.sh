@@ -21,7 +21,7 @@ get_nginx_status() {
     if ! command -v nginx >/dev/null 2>&1; then
         STATUS="${RED}未安装${RESET}"
     elif systemctl is-active nginx >/dev/null 2>&1; then
-        STATUS="${GREEN}运行中${RESET}"
+        STATUS="${YELLOW}运行中${RESET}"
     else
         STATUS="${RED}已停止${RESET}"
     fi
@@ -46,19 +46,19 @@ get_nginx_ports() {
 
     # 检测 80 端口是否在监听
     if ss -tunlp | grep -q ":80 "; then
-        p80="${GREEN}80${RESET}"
+        p80="${YELLOW}80${RESET}"
     else
         p80="${RED}80${RESET}"
     fi
 
     # 检测 443 端口是否在监听
     if ss -tunlp | grep -q ":443 "; then
-        p443="${GREEN}443${RESET}"
+        p443="${YELLOW}443${RESET}"
     else
         p443="${RED}443${RESET}"
     fi
 
-    PORT_SHOW="$p80, $p443"
+    PORT_SHOW="$p80 ${YELLOW}|${RESET} $p443"
 }
 
 get_site_count() {
@@ -72,7 +72,7 @@ get_site_count() {
 }
 
 # ------------------------------
-# 原脚本核心功能函数（完整保留）
+# 本核心功能函数
 # ------------------------------
 generate_random_email() {
     RAND_STR=$(tr -dc a-z0-9 </dev/urandom | head -c 10)
@@ -900,13 +900,12 @@ update_nginx_software() {
 }
 
 # ------------------------------
-# 主菜单循环（UI 最终全看板融合版）
+# 主菜单循环
 # ------------------------------
 while true; do
     # 动态刷新看板数据
     get_nginx_status
     get_nginx_version
-    get_nginx_ports
     get_site_count
 
     clear
@@ -915,8 +914,7 @@ while true; do
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $STATUS"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}$VERSION_SHOW${RESET}"
-    echo -e "${GREEN}端口   :${RESET} $PORT_SHOW"
-    echo -e "${GREEN}站点 :${RESET} ${YELLOW}$SITE_COUNT 个${RESET}"
+    echo -e "${GREEN}站点   :${RESET} ${YELLOW}$SITE_COUNT 个${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN} 1. 安装 Nginx${RESET}"
     echo -e "${GREEN} 2. 添加配置 (Certbot托管)${RESET}"
@@ -932,7 +930,7 @@ while true; do
     echo -e "${GREEN}12. 卸载Nginx${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN} 请选择[0-12]:${RESET}"
+    echo -ne "${GREEN} 请选择:${RESET}"
     read choice
 
     case $choice in

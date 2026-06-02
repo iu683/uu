@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# sing-box (AnyTLS) 核心控制面板
+# sing-box (VLESS+WS+TLS) 核心控制面板
 # SPDX-License-Identifier: MIT
 #
 # =========================================================
@@ -10,12 +10,12 @@ set -Eop pipefail
 export LANG=en_US.UTF-8
 
 # 基础目录与硬编码配置
-readonly SB_CONFIG="/etc/mo-anytls-sb/config.json"
+readonly SB_CONFIG="/etc/singbox-vless-ws/config.json"
 readonly SB_BINARY="/usr/local/bin/sing-box"
-readonly SB_DIR="/root/proxynode/Anytls"
+readonly SB_DIR="/root/proxynode/VlessWS"
 EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
 SYSTEMD_SERVICES_DIR="/etc/systemd/system"
-CONFIG_DIR="/etc/mo-anytls-sb"
+CONFIG_DIR="/etc/singbox-vless-ws"
 REPO_URL="https://github.com/SagerNet/sing-box"
 API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
 CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
@@ -24,8 +24,8 @@ CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
 PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
 OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
 ARCHITECTURE="${ARCHITECTURE:-}"
-SINGBOX_USER="${SINGBOX_USER:-sing-box}"
-SINGBOX_HOME_DIR="${SINGBOX_HOME_DIR:-/var/lib/sing-box}"
+SINGBOX_USER="${SINGBOX_USER:-}"
+SINGBOX_HOME_DIR="${SINGBOX_HOME_DIR:-}"
 
 # 终端颜色代码
 GREEN="\033[32m"
@@ -56,8 +56,14 @@ warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
 error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
 pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
 
-generate_random_password() {
-  dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
+generate_uuid() {
+  if has_command uuidgen; then
+    uuidgen | tr '[:upper:]' '[:lower:]'
+  elif [[ -f /proc/sys/kernel/random/uuid ]]; then
+    cat /proc/sys/kernel/random/uuid
+  else
+    cat /dev/urandom | head -n 50 | md5sum | head -c 32 | sed -r 's/([0-9a-f]{8})([0-9a-f]{4})([0-9a-f]{4})([0-9a-f]{4})([0-9a-f]{12})/\1-\2-\3-\4-\5/'
+  fi
 }
 
 systemctl() {
@@ -143,42 +149,6 @@ check_environment() {
   has_command tar || install_software tar
   has_command socat || install_software socat
   has_command python3 || install_software python3
-}
-
-# =========================================================
-# 2.5 权限修复核心扩展函数
-# =========================================================
-fix_external_cert_permission() {
-  local cert=$1
-  local key=$2
-  
-  # 1. 针对 root 目录的致命硬拦截（保持拦截，root 没法简单 +x）
-  if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
-    error "致命拒绝: 检测到您的证书位于 /root/ 目录下！"
-    warn "原因分析: /root 目录权限极为严苛(700)，任何非root用户均无权穿透。即使强行赋予文件权限，内核也会因路径阻塞拒绝读取。"
-    info "权威推荐: 请在 acme.sh 脚本命令中加上安装指令，将证书自动导出到公共目录（如 /etc/ssl/ 或 /etc/certs/ 文件夹下）再试。"
-    return 1
-  fi
-
-  # 2. 自动提取证书所在的真实外部上级目录
-  local cert_dir=$(dirname "$cert")
-  
-  # 3. 核心修复：赋予外部子目录 x 检索权限，允许 sing-box 用户穿透进入
-  info "正在为外部证书目录赋予检索穿透权限 (+x) ..."
-  chmod +x "$cert_dir" 2>/dev/null || true
-  
-  # 4. 核心修复：放行真实证书与密钥文件的读取权限（644 / 600 或 644）
-  # 提示：为了让外部更新时能无缝读取，统一刷成 644 权限
-  info "正在规范化外部证书与私钥文件的读取权限 (644) ..."
-  chmod 644 "$cert" "$key" 2>/dev/null || true
-  
-  # 5. 附加高级安全 ACL 策略（如果系统支持，能让穿透更稳固，不支持也无妨）
-  if command -v setfacl >/dev/null 2>&1; then
-    setfacl -m u:"$SINGBOX_USER":rx "$cert_dir" 2>/dev/null || true
-    setfacl -m u:"$SINGBOX_USER":r "$cert" "$key" 2>/dev/null || true
-  fi
-  
-  return 0
 }
 
 get_installed_version() {
@@ -287,7 +257,7 @@ get_random_port() {
 }
 
 get_sb_status() {
-  if has_command systemctl && systemctl is-active --quiet mo-anytls-sb 2>/dev/null; then
+  if has_command systemctl && systemctl is-active --quiet singbox-vless-ws 2>/dev/null; then
     echo -e "${GREEN}● 运行中${RESET}"
   else
     if pgrep -f "$EXECUTABLE_INSTALL_PATH run" >/dev/null 2>&1; then
@@ -306,26 +276,49 @@ get_current_port_display() {
   else echo "-"; fi
 }
 
+restart_singbox_service() {
+  if has_command systemctl; then
+    systemctl daemon-reload
+    systemctl enable singbox-vless-ws >/dev/null 2>&1 || true
+    systemctl restart singbox-vless-ws >/dev/null 2>&1 || true
+    systemctl is-active --quiet singbox-vless-ws 2>/dev/null
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+    "$EXECUTABLE_INSTALL_PATH" run --config "$SB_CONFIG" >/dev/null 2>&1 &
+    return 0
+  fi
+}
+
 # =========================================================
-# 4. 证书、端口交互与配置写入
+# 4. 证书、端口交互、配置写入与自定义 Socks5 出口
 # =========================================================
 inst_cert() {
-  mkdir -p /etc/mo-anytls-sb
+  mkdir -p /etc/singbox-vless-ws
   
   echo "---------------------------------------------"
   echo -e "sing-box TLS 证书申请方式如下："
-  echo -e " 1) 必应自签证书 ${YELLOW}（默认）${RESET}"
-  echo -e " 2) Acme自动申请 (需放行 80 端口)"
-  echo -e " 3) 自定义证书路径"
+  echo -e " 1) Acme 独立模式申请 (需占用/放行 80 端口)${YELLOW}（默认）${RESET}"
+  echo -e " 2) 自定义证书路径 (软链接挂载)"
+  echo -e " 3) Acme DNS API 自动申请 (无需放行 80 端口，支持自动续签)"
   echo "---------------------------------------------"
   local certInput
-  read -rp "请输入选项 [1-3] (直接回车默认自签): " certInput
+  read -rp "请输入选项 [1-3] (直接回车默认独立模式申请): " certInput
   certInput=${certInput:-1}
 
-  cert_path="/etc/mo-anytls-sb/fullchain.pem"
-  key_path="/etc/mo-anytls-sb/privkey.pem"
+  cert_path="/etc/singbox-vless-ws/fullchain.pem"
+  key_path="/etc/singbox-vless-ws/privkey.pem"
+  local acme_cmd="/root/.acme.sh/acme.sh"
 
-  if [[ $certInput == 2 ]]; then
+  # 只要选了 1 或 3，都先确保安装好 acme.sh 基础组件
+  if [[ $certInput == 1 || $certInput == 3 ]]; then
+    info "正在检查并安装 Acme.sh 依赖..."
+    if [[ ! -f "$acme_cmd" ]]; then
+      curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
+    fi
+    "$acme_cmd" --set-default-ca --server letsencrypt
+  fi
+
+  if [[ $certInput == 1 ]]; then
     if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
       warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。请确保已暂时关闭 Web 服务。"
     fi
@@ -334,14 +327,6 @@ inst_cert() {
     read -rp "请输入需要申请证书的域名: " domain
     [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
     
-    info "正在检查并安装 Acme.sh 依赖..."
-    local acme_cmd="/root/.acme.sh/acme.sh"
-    if [[ ! -f "$acme_cmd" ]]; then
-      curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
-    fi
-    
-    "$acme_cmd" --set-default-ca --server letsencrypt
-    
     info "正在向 Let's Encrypt 申请证书..."
     if [[ "$vps_ip" =~ ":" ]]; then
       "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
@@ -349,26 +334,16 @@ inst_cert() {
       "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
     fi
     
-    local reload_cmd="pkill -f '$EXECUTABLE_INSTALL_PATH run' || true; '$EXECUTABLE_INSTALL_PATH' run --config /etc/mo-anytls-sb/config.json >/dev/null 2>&1 &"
-    if has_command systemctl; then
-      reload_cmd="systemctl restart mo-anytls-sb"
-    fi
-
-    info "正在配置证书自动同步与服务重载钩子..."
-    if "$acme_cmd" --install-cert -d "${domain}" \
-      --key-file "$key_path" \
-      --fullchain-file "$cert_path" \
-      --ecc \
-      --reloadcmd "$reload_cmd"; then
-      echo "$domain" > /etc/mo-anytls-sb/ca.log
+    if "$acme_cmd" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc --reloadcmd "systemctl restart singbox-vless-ws 2>/dev/null || pkill -f 'sing-box run' || true"; then
+      echo "$domain" > /etc/singbox-vless-ws/ca.log
       sb_domain=$domain
-      info "Acme 证书申请并成功分发至安全沙箱！"
+      info "Acme 独立模式证书申请并成功分发！"
     else
-      error "Acme 证书申请失败，自动切换回自签模式。"
-      certInput=1
+      error "Acme 证书申请失败，自动切换回自定义证书路径。"
+      certInput=2
     fi
     
-  elif [[ $certInput == 3 ]]; then
+  elif [[ $certInput == 2 ]]; then
     while true; do
       local user_cert user_key
       read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
@@ -376,36 +351,98 @@ inst_cert() {
       read -rp "请输入证书对应的域名: " sb_domain
       
       if [[ -f "$user_cert" && -f "$user_key" ]]; then
-        # 【调用全新扩展函数】：检查并修复外部路径可能导致 sing-box 发生的阻断
-        if ! fix_external_cert_permission "$user_cert" "$user_key"; then
-          echo "---------------------------------------------"
-          continue
-        fi
-
         rm -f "$cert_path" "$key_path"
+
+        if [[ "$user_cert" == /root/* ]] || [[ "$user_key" == /root/* ]]; then
+          warn "检测到您的外部证书源路径在 /root 目录下，正在修复目录穿透检索权限..."
+          chmod +x "$(dirname "$user_cert")" 2>/dev/null || true
+        fi
+        
+        chmod 644 "$user_cert" 2>/dev/null || true
+        chmod 644 "$user_key" 2>/dev/null || true
+
         ln -sf "$user_cert" "$cert_path"
         ln -sf "$user_key" "$key_path"
-        info "自定义证书已成功通过软链接同步至内部安全区。"
+        info "自定义证书已通过软链接无缝接入内部安全区。"
         break
       else
         error "找不到输入的证书文件，请重新输入或按 Ctrl+C 退出。"
         echo "---------------------------------------------"
       fi
     done
+
+  elif [[ $certInput == 3 ]]; then
+    read -rp "请输入需要申请证书的域名: " domain
+    [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
+
+    echo "---------------------------------------------"
+    echo "请选择 DNS 提供商："
+    echo "1) cloudflare"
+    echo "2) aliyun"
+    echo "3) dnspod"
+    echo "---------------------------------------------"
+    local dns_provider
+    read -rp "请输入选项 [1-3]: " dns_provider
+
+    local dns_flag=""
+    case "$dns_provider" in
+      1)
+        dns_flag="dns_cf"
+        local cf_token cf_account
+        read -rp "请输入 Cloudflare API Token (推荐) 或 Global API Key: " cf_token
+        if [[ ${#cf_token} -eq 37 ]]; then
+          export CF_Token="$cf_token"
+        else
+          export CF_Key="$cf_token"
+          read -rp "请输入 Cloudflare 注册邮箱: " cf_account
+          export CF_Email="$cf_account"
+        fi
+        ;;
+      2)
+        dns_flag="dns_ali"
+        local ali_key ali_secret
+        read -rp "请输入 阿里云 Ali_Key: " ali_key
+        read -rp "请输入 阿里云 Ali_Secret: " ali_secret
+        export Ali_Key="$ali_key"
+        export Ali_Secret="$ali_secret"
+        ;;
+      3)
+        dns_flag="dns_dp"
+        local dp_id dp_key
+        read -rp "请输入 DNSPod Token ID: " dp_id
+        read -rp "请输入 DNSPod Token Key: " dp_key
+        export DP_Id="$dp_id"
+        export DP_Key="$dp_key"
+        ;;
+      *)
+        error "无效输入，停止 API 申请。"
+        return 1
+        ;;
+    esac
+
+    info "正在通过 DNS API 向 Let's Encrypt 申请证书 (可能需要 1-2 分钟验证，请耐心等待)..."
+    if "$acme_cmd" --issue --dns "$dns_flag" -d "$domain" -k ec-256 --insecure; then
+      if "$acme_cmd" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc --reloadcmd "systemctl restart singbox-vless-ws 2>/dev/null || pkill -f 'sing-box run' || true"; then
+        echo "$domain" > /etc/singbox-vless-ws/ca.log
+        sb_domain=$domain
+        info "Acme DNS 模式证书申请成功且已配置自动续签指令！"
+      else
+        error "证书分发失败。"
+        return 1
+      fi
+    else
+      error "DNS API 证书申请失败，请确认 API 凭证与域名解析归属正确。"
+      return 1
+    fi
   fi
 
-  if [[ $certInput == 1 ]]; then
-    info "将使用必应自签证书作为 sing-box 的节点证书"
-    rm -f "$cert_path" "$key_path"
-    openssl ecparam -genkey -name prime256v1 -out "$key_path"
-    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
-    sb_domain="www.bing.com"
-  fi
-
-  chmod 644 "$cert_path" || true
-  chmod 600 "$key_path" || true
-  if is_user_exists "$SINGBOX_USER"; then
-    chown -R "$SINGBOX_USER":"$SINGBOX_USER" /etc/mo-anytls-sb
+  # 规范化证书安全区的属性
+  if [[ ! -L "$cert_path" ]]; then chmod 644 "$cert_path" 2>/dev/null || true; fi
+  if [[ ! -L "$key_path" ]]; then chmod 600 "$key_path" 2>/dev/null || true; fi
+  
+  if is_user_exists "sing-box"; then
+    chown -h sing-box:sing-box "$cert_path" "$key_path" 2>/dev/null || true
+    chown sing-box:sing-box /etc/singbox-vless-ws 2>/dev/null || true
   fi
 }
 
@@ -433,6 +470,140 @@ inst_port() {
   done
 }
 
+configure_custom_socks5_outbound() {
+    if [[ ! -f "$SB_CONFIG" ]]; then 
+        error "错误: 未安装，无法配置出口模式。"
+        return
+    fi
+
+    local mode current_type tmp_file
+    current_type=$(jq -r '.outbounds[0].type // "direct"' "$SB_CONFIG" 2>/dev/null || echo "direct")
+
+    echo "---------------------------------------------"
+    echo "请选择出口模式："
+    if [[ "$current_type" == "socks" ]]; then
+        echo -e "当前模式: ${YELLOW}Socks5 代理出口${RESET}"
+    else
+        echo -e "当前模式: ${GREEN}本地直连出口${RESET}"
+    fi
+    echo "1) 直连出口"
+    echo "2) Socks5出口"
+    echo "0) 取消"
+    echo "---------------------------------------------"
+
+    read -rp "请输入选项 [0-2]: " mode || true
+    case "$mode" in
+        1)
+            tmp_file=$(mktemp)
+            jq '.outbounds = [{"type": "direct", "tag": "direct"}]' "$SB_CONFIG" > "$tmp_file"
+            if ! jq empty "$tmp_file" >/dev/null 2>&1; then
+                rm -f "$tmp_file"
+                error "生成的直连配置无效。"
+                return 1
+            fi
+            cp "$SB_CONFIG" "${SB_CONFIG}.bak.$(date +%s)"
+            mv "$tmp_file" "$SB_CONFIG"
+            chmod 644 "$SB_CONFIG" 2>/dev/null || true
+            if is_user_exists "sing-box"; then chown sing-box:sing-box "$SB_CONFIG"; fi
+
+            if ! restart_singbox_service; then
+                error "切换到直连失败。"
+                return 1
+            fi
+            info "已成功切换为直连出口！"
+            return
+            ;;
+        2)
+            ;;
+        0|"")
+            info "已取消配置。"
+            return
+            ;;
+        *)
+            error "无效选项，请输入 0-2 之间的数字。"
+            return 1
+            ;;
+    esac
+
+    info "配置自定义 Socks5 出口代理..."
+
+    local socks_host socks_port socks_user socks_pass
+
+    read -rp "请输入 Socks5 服务器地址/IP: " socks_host || true
+    [[ -z "$socks_host" ]] && info "已取消配置。" && return
+
+    while true; do
+        read -rp "请输入 Socks5 端口 (默认: 1080): " socks_port || true
+        [[ -z "$socks_port" ]] && socks_port=1080
+        if is_valid_port "$socks_port"; then
+            break
+        else
+            error "端口无效，请输入一个1-65535之间的数字。"
+        fi
+    done
+
+    read -rp "请输入 Socks5 用户名 (若无密码认证请直接留空回车): " socks_user || true
+    if [[ -n "$socks_user" ]]; then
+        read -rs -p "请输入 Socks5 密码: " socks_pass || true
+        echo
+    else
+        socks_pass=""
+    fi
+
+    tmp_file=$(mktemp)
+
+    if [[ -n "$socks_user" ]]; then
+        jq \
+            --arg host "$socks_host" \
+            --argjson port "$socks_port" \
+            --arg user "$socks_user" \
+            --arg pass "$socks_pass" \
+            '
+            .outbounds = [
+              {
+                "type": "socks",
+                "tag": "custom-socks5-out",
+                "server": $host,
+                "server_port": $port,
+                "username": $user,
+                "password": $pass
+              }
+            ]
+            ' "$SB_CONFIG" > "$tmp_file"
+    else
+        jq \
+            --arg host "$socks_host" \
+            --argjson port "$socks_port" \
+            '
+            .outbounds = [
+              {
+                "type": "socks",
+                "tag": "custom-socks5-out",
+                "server": $host,
+                "server_port": $port
+              }
+            ]
+            ' "$SB_CONFIG" > "$tmp_file"
+    fi
+
+    if ! jq empty "$tmp_file" >/dev/null 2>&1; then
+        rm -f "$tmp_file"
+        error "生成的 Socks5 配置无效，请检查输入后重试。"
+        return 1
+    fi
+
+    cp "$SB_CONFIG" "${SB_CONFIG}.bak.$(date +%s)"
+    mv "$tmp_file" "$SB_CONFIG"
+    chmod 644 "$SB_CONFIG" 2>/dev/null || true
+    if is_user_exists "sing-box"; then chown sing-box:sing-box "$SB_CONFIG"; fi
+
+    if ! restart_singbox_service; then
+        error "重启服务失败，当前配置可能与系统环境不兼容。"
+        return 1
+    fi
+    info "已成功切换为 Socks5 出口！"
+}
+
 write_and_show_config() {
   local hostname=$(hostname -s | sed 's/ /_/g')
   local ip=$(get_public_ip)
@@ -441,8 +612,7 @@ write_and_show_config() {
     url_ip="[$ip]"
   fi
 
-  # 1. 写入服务端核心 JSON
-  cat << EOF > /etc/mo-anytls-sb/config.json
+  cat << EOF > /etc/singbox-vless-ws/config.json
 {
   "log": {
     "level": "info",
@@ -450,14 +620,14 @@ write_and_show_config() {
   },
   "inbounds": [
     {
-      "type": "anytls",
-      "tag": "anytls-in",
+      "type": "vless",
+      "tag": "vless-in",
       "listen": "::",
       "listen_port": $port,
       "users": [
         {
-          "name": "user1",
-          "password": "$auth_pwd"
+          "uuid": "$auth_pwd",
+          "flow": ""
         }
       ],
       "tls": {
@@ -465,6 +635,10 @@ write_and_show_config() {
         "server_name": "$sb_domain",
         "key_path": "$key_path",
         "certificate_path": "$cert_path"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "$ws_path"
       }
     }
   ],
@@ -478,68 +652,30 @@ write_and_show_config() {
 EOF
 
   mkdir -p "$SB_DIR"
-  
-  # 2. 写入通用客户端 sing-box.json 备份
-  cat << EOF > "$SB_DIR/sb-client.json"
-{
-  "log": {
-    "level": "info"
-  },
-  "outbounds": [
-    {
-      "type": "anytls",
-      "tag": "anytls-out",
-      "server": "$url_ip",
-      "server_port": $port,
-      "password": "$auth_pwd",
-      "tls": {
-        "enabled": true,
-        "server_name": "$sb_domain",
-        "insecure": true
-      }
-    },
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ]
-}
-EOF
 
-  # 3. 固化持久化节点数据
   cat << EOF > "$SB_DIR/url.txt"
-====== AnyTLS 节点信息 ======
-IP      : ${ip}
-端口    : $port
-密码    : $auth_pwd
+====== VLESS + WS + TLS 节点信息 ======
+IP    : ${ip}
+端口  : $port
+UUID  : $auth_pwd
+SNI   : $sb_domain
+HOST  : $sb_domain
+路径  : $ws_path
 ---------------------------
 📄 V6VPS 请自行替换 IP 地址为 V6 ★
-[信息] V2rayN 链接：
-anytls://$auth_pwd@$url_ip:$port/?insecure=1#$hostname-Anytls
-[信息] Surge 配置：
-$hostname-Anytls = anytls, $url_ip, $port, password=$auth_pwd, tfo=true, skip-cert-verify=true, reuse=false
+[信息] V2rayN  链接：
+vless://$auth_pwd@$url_ip:$port?sni=$sb_domain&host=$sb_domain&security=tls&type=ws&path=$(echo "$ws_path" | sed 's/\//%2F/g')#$hostname-Vlesswstls
 ---------------------------------
 EOF
 
-  if is_user_exists "$SINGBOX_USER"; then
-    chown -R "$SINGBOX_USER":"$SINGBOX_USER" /etc/mo-anytls-sb
+  if is_user_exists "sing-box"; then
+    chown -R sing-box:sing-box /etc/singbox-vless-ws 2>/dev/null || true
   fi
 
-  # 4. 守护进程分支运行
-  if has_command systemctl; then
-    systemctl daemon-reload
-    systemctl enable mo-anytls-sb >/dev/null 2>&1 || true
-    systemctl restart mo-anytls-sb >/dev/null 2>&1 || true
-    
-    if systemctl is-active --quiet mo-anytls-sb 2>/dev/null; then
-      info "sing-box (anytls) 服务配置并启动成功！"
-    else
-      error "sing-box 服务启动失败，请运行 'systemctl status mo-anytls-sb' 查看日志。"
-    fi
+  if restart_singbox_service; then
+    info "sing-box (VLESS+WS+TLS) 服务配置并启动成功！"
   else
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-    "$EXECUTABLE_INSTALL_PATH" run --config $SB_CONFIG >/dev/null 2>&1 &
-    info "非 systemd 环境，程序已挂载至后台 Pid 进程池中运行。"
+    error "sing-box 服务启动失败，请运行监控菜单查看日志。"
   fi
   
   showconf
@@ -574,6 +710,8 @@ instsingbox() {
   fi
   rm -rf "$_tmparchive" "$_tmpdir"
 
+  SINGBOX_USER="sing-box"
+  SINGBOX_HOME_DIR="/var/lib/sing-box"
   if ! is_user_exists "$SINGBOX_USER"; then
     echo -ne "正在创建系统独立沙箱运行用户 $SINGBOX_USER ... "
     useradd -r -d "$SINGBOX_HOME_DIR" -m "$SINGBOX_USER" >/dev/null 2>&1 || true
@@ -581,15 +719,19 @@ instsingbox() {
   fi
 
   if has_command systemctl; then
-    install_content -Dm644 "$(tpl_singbox_server_service_base 'config')" "$SYSTEMD_SERVICES_DIR/mo-anytls-sb.service" "1"
-    install_content -Dm644 "$(tpl_singbox_server_service_base '%i')" "$SYSTEMD_SERVICES_DIR/mo-anytls-sb@.service" "1"
+    install_content -Dm644 "$(tpl_singbox_server_service_base 'config')" "$SYSTEMD_SERVICES_DIR/singbox-vless-ws.service" "1"
+    install_content -Dm644 "$(tpl_singbox_server_service_base '%i')" "$SYSTEMD_SERVICES_DIR/singbox-vless-ws@.service" "1"
   fi
 
   inst_cert || return 1
   inst_port
   
-  read -rp "设置 AnyTLS 验证密码 (直接回车将自动分配强随机密码): " auth_pwd
-  auth_pwd=${auth_pwd:-$(generate_random_password)}
+  read -rp "设置 VLESS UUID (直接回车将自动分配强随机 UUID): " auth_pwd
+  auth_pwd=${auth_pwd:-$(generate_uuid)}
+
+  read -rp "设置 WebSocket 路径 (直接回车默认 /ws): " ws_path
+  ws_path=${ws_path:-/ws}
+  [[ ! "$ws_path" =~ ^/ ]] && ws_path="/$ws_path"
 
   write_and_show_config
 }
@@ -605,7 +747,7 @@ update_singbox() {
   local latest_version=$(get_latest_version)
 
   if [[ -z "$latest_version" ]]; then
-    error "无法连接到 GitHub API 获取最新版本，请稍后再试。"
+    error "无法连接 to GitHub API 获取最新版本，请稍后再试。"
     return 1
   fi
 
@@ -635,18 +777,10 @@ update_singbox() {
   rm -rf "$_tmparchive" "$_tmpdir"
 
   info "正在重启 sing-box 服务以应用更新..."
-  if has_command systemctl; then
-    systemctl daemon-reload
-    systemctl restart mo-anytls-sb >/dev/null 2>&1 || true
-    if systemctl is-active --quiet mo-anytls-sb 2>/dev/null; then
-      info "sing-box 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
-    else
-      error "核心更新成功，但服务重启失败，请运行 'systemctl status mo-anytls-sb' 检查错误。"
-    fi
+  if restart_singbox_service; then
+    info "sing-box 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
   else
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-    "$EXECUTABLE_INSTALL_PATH" run --config "$SB_CONFIG" >/dev/null 2>&1 &
-    info "sing-box 核心已更新并于后台重启运行。"
+    error "核心更新成功，但服务重启失败。"
   fi
 }
 
@@ -654,17 +788,17 @@ unstsingbox() {
   warn "即将从当前系统中彻底卸载 sing-box"
 
   if has_command systemctl; then
-    systemctl stop mo-anytls-sb >/dev/null 2>&1 || true
-    systemctl disable mo-anytls-sb >/dev/null 2>&1 || true
-    remove_file "$SYSTEMD_SERVICES_DIR/mo-anytls-sb.service"
-    remove_file "$SYSTEMD_SERVICES_DIR/mo-anytls-sb@.service"
+    systemctl stop singbox-vless-ws >/dev/null 2>&1 || true
+    systemctl disable singbox-vless-ws >/dev/null 2>&1 || true
+    remove_file "$SYSTEMD_SERVICES_DIR/singbox-vless-ws.service"
+    remove_file "$SYSTEMD_SERVICES_DIR/singbox-vless-ws@.service"
     systemctl daemon-reload
   else
     pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
   fi
   
   remove_file "$EXECUTABLE_INSTALL_PATH"
-  rm -rf /etc/mo-anytls-sb "$SB_DIR"
+  rm -rf /etc/singbox-vless-ws "$SB_DIR"
 
   info "sing-box 已彻底从您的系统中移除！"
 }
@@ -675,21 +809,27 @@ changeconf() {
     return 1
   fi
 
-  local old_pwd=$(jq -r '.inbounds[0].users[0].password' "$SB_CONFIG" 2>/dev/null || true)
+  local old_pwd=$(jq -r '.inbounds[0].users[0].uuid' "$SB_CONFIG" 2>/dev/null || true)
+  local old_path=$(jq -r '.inbounds[0].transport.path' "$SB_CONFIG" 2>/dev/null || echo "/ws")
   local old_cert=$(jq -r '.inbounds[0].tls.certificate_path' "$SB_CONFIG" 2>/dev/null || true)
   local old_key=$(jq -r '.inbounds[0].tls.key_path' "$SB_CONFIG" 2>/dev/null || true)
   local old_sni=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || "www.bing.com")
 
   clear
-  echo -e "${GREEN}====== 修改 sing-box (AnyTLS) 配置 ======${RESET}"
+  echo -e "${GREEN}====== 修改 sing-box (VLESS+WS+TLS) 配置 ======${RESET}"
   echo "提示：直接敲回车将保持原有配置不变"
   echo "---------------------------------------------"
   
   inst_port 
 
   local auth_pwd
-  read -rp "设置 AnyTLS 新密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
+  read -rp "设置 VLESS 新 UUID [当前: ${old_pwd}, 回车不修改]: " auth_pwd
   auth_pwd=${auth_pwd:-$old_pwd}
+
+  local ws_path
+  read -rp "设置 新 WebSocket 路径 [当前: ${old_path}, 回车不修改]: " ws_path
+  ws_path=${ws_path:-$old_path}
+  [[ ! "$ws_path" =~ ^/ ]] && ws_path="/$ws_path"
 
   local cert_path key_path sb_domain
   echo "---------------------------------------------"
@@ -708,20 +848,19 @@ changeconf() {
 
 showconf() {
   if [[ ! -f "$SB_CONFIG" ]]; then
-    error "未找到 AnyTLS 配置文件，请确保已成功部署节点。"
+    error "未找到 VLESS 配置文件，请确保已成功部署节点。"
     return
   fi
 
   local hostname=$(hostname -s | sed 's/ /_/g')
   local main_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "18055")
-  local auth_pwd=$(jq -r '.inbounds[0].users[0].password' "$SB_CONFIG" 2>/dev/null || echo "密码")
-  local sb_domain=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || echo "anyoo.vfz.dpdns.org")
+  local auth_pwd=$(jq -r '.inbounds[0].users[0].uuid' "$SB_CONFIG" 2>/dev/null || echo "UUID")
+  local sb_domain=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || echo "www.bing.com")
+  local ws_path=$(jq -r '.inbounds[0].transport.path' "$SB_CONFIG" 2>/dev/null || echo "/ws")
   
   local is_insecure="0"
-  local skip_cert="false"
   if [[ "$sb_domain" == "www.bing.com" ]]; then
     is_insecure="1"
-    skip_cert="true"
   fi
 
   local ip=$(get_public_ip)
@@ -730,19 +869,18 @@ showconf() {
     url_ip="[$ip]"
   fi
 
-  echo -e "${GREEN}====== AnyTLS 节点信息 ======${RESET}"
+  echo -e "${GREEN}====== VLESS + WS + TLS 节点信息 ======${RESET}"
   echo -e "${YELLOW}IP      : ${ip}${RESET}"
   echo -e "${YELLOW}端口    : ${main_port}${RESET}"
-  echo -e "${YELLOW}密码    : ${auth_pwd}${RESET}"
+  echo -e "${YELLOW}UUID    : ${auth_pwd}${RESET}"
   echo -e "${YELLOW}SNI     : ${sb_domain}${RESET}"
+  echo -e "${YELLOW}host     : ${sb_domain}${RESET}"
+  echo -e "${YELLOW}WS 路径 : ${ws_path}${RESET}"
   echo -e "${GREEN}---------------------------${RESET}"
   echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
   echo -e "${GREEN}[信息] V2rayN 链接：${RESET}"
-  echo -e "${YELLOW}anytls://${auth_pwd}@${url_ip}:${main_port}?security=tls&sni=${sb_domain}&insecure=${is_insecure}&allowInsecure=${is_insecure}&type=tcp&headerType=none#${hostname}-Anytls${RESET}"
-  echo -e "${GREEN}[信息] Surge 配置：${RESET}"
-  echo -e "${YELLOW}${hostname}-Anytls = anytls, ${url_ip}, ${main_port}, password=${auth_pwd}, sni=${sb_domain}, tfo=true, skip-cert-verify=${skip_cert}, reuse=false${RESET}"
+  echo -e "${YELLOW}vless://${auth_pwd}@${url_ip}:${main_port}?sub=1&sni=${sb_domain}&host=${sb_domain}&security=tls&allowInsecure=${is_insecure}&type=ws&path=$(echo "$ws_path" | sed 's/\//%2F/g')#${hostname}-Vlesswstls${RESET}"
   echo -e "${YELLOW}---------------------------------${RESET}"
-  echo
 }
 
 # =========================================================
@@ -759,22 +897,23 @@ menu() {
     local port_show=$(get_current_port_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      Sing-box AnyTLS 面板      ${RESET}"
+    echo -e "${GREEN}    Sing-box VLESS-WS-TLS 面板  ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Sing-box AnyTLS${RESET}"
-    echo -e "${GREEN}2. 更新 Sing-box AnyTLS${RESET}"
-    echo -e "${GREEN}3. 卸载 Sing-box AnyTLS${RESET}"
-    echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 Sing-box AnyTLS${RESET}"
-    echo -e "${GREEN}6. 停止 Sing-box AnyTLS${RESET}"
-    echo -e "${GREEN}7. 重启 Sing-box AnyTLS${RESET}"
-    echo -e "${GREEN}8. 查看日志${RESET}"
-    echo -e "${GREEN}9. 查看节点配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN} 1.安装 Sing-box VLESS-WS-TLS${RESET}"
+    echo -e "${GREEN} 2.更新 Sing-box ${RESET}"
+    echo -e "${GREEN} 3.卸载 Sing-box ${RESET}"
+    echo -e "${GREEN} 4.修改配置${RESET}"
+    echo -e "${GREEN} 5.启动 Sing-box ${RESET}"
+    echo -e "${GREEN} 6.停止 Sing-box ${RESET}"
+    echo -e "${GREEN} 7.重启 Sing-box ${RESET}"
+    echo -e "${GREEN} 8.查看日志${RESET}"
+    echo -e "${GREEN} 9.查看节点配置${RESET}"
+    echo -e "${GREEN}10.配置Socks5出口${RESET}"
+    echo -e "${GREEN} 0.退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
 
     local choice=""
@@ -788,7 +927,7 @@ menu() {
       4) changeconf; pause ;;
       5) 
         if has_command systemctl; then
-          systemctl start mo-anytls-sb && info "服务已成功启动！"
+          systemctl start singbox-vless-ws && info "服务已成功启动！"
         else
           pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
           "$EXECUTABLE_INSTALL_PATH" run --config "$SB_CONFIG" >/dev/null 2>&1 &
@@ -797,14 +936,14 @@ menu() {
         pause ;;
       6) 
         if has_command systemctl; then
-          systemctl stop mo-anytls-sb && info "服务已成功停止！"
+          systemctl stop singbox-vless-ws && info "服务已成功停止！"
         else
           pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台进程已终止！"
         fi
         pause ;;
       7) 
         if has_command systemctl; then
-          systemctl restart mo-anytls-sb && info "服务已成功重启！"
+          systemctl restart singbox-vless-ws && info "服务已成功重启！"
         else
           pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
           "$EXECUTABLE_INSTALL_PATH" run --config "$SB_CONFIG" >/dev/null 2>&1 &
@@ -813,12 +952,13 @@ menu() {
         pause ;;
       8) 
         if has_command systemctl; then
-          journalctl -u mo-anytls-sb.service -n 50 --no-pager
+          journalctl -u singbox-vless-ws.service -n 50 --no-pager
         else
           warn "当前环境不支持 systemd 集中日志管理。"
         fi
         pause ;;
       9) showconf; pause ;;
+      10) configure_custom_socks5_outbound; pause ;;
       0) exit 0 ;;
       *) error "无效输入，请重新选择。"; sleep 1 ;;
     esac

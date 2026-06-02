@@ -1,223 +1,294 @@
 #!/bin/bash
-set -e
+# ==========================================
+# ACME Pro 证书申请（纯本地管理：支持域名与 IP 强制续期）
+# ==========================================
+export LANG=en_US.UTF-8
 
-CADDYFILE="/etc/caddy/Caddyfile"
-CADDY_DATA="/var/lib/caddy/.local/share/caddy"
-CADDY_CERTS_DIR="/etc/caddy/certs"
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-# ==================== 自动化环境检查与修复 ====================
-if ! command -v sudo >/dev/null 2>&1; then
-    echo -e "${YELLOW}检测到系统未安装 sudo，正在尝试自动安装...${RESET}"
-    if command -v apt >/dev/null 2>&1; then
-        apt update -q && apt install -yq sudo
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y sudo
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y sudo
-    else
-        echo -e "${RED}错误: 无法确定包管理器，请手动安装 sudo 后再试。${RESET}"
-        exit 1
-    fi
-    echo -e "${GREEN}sudo 安装成功！${RESET}"
-fi
+green(){ echo -e "${GREEN}$1${RESET}"; }
+red(){ echo -e "${RED}$1${RESET}"; }
+yellow(){ echo -e "${YELLOW}$1${RESET}"; }
 
-[ ! -d "/etc/caddy" ] && sudo mkdir -p /etc/caddy
-[ ! -d "$CADDY_CERTS_DIR" ] && sudo mkdir -p $CADDY_CERTS_DIR && sudo chown -R caddy:caddy $CADDY_CERTS_DIR 2>/dev/null || true
-[ ! -f "$CADDYFILE" ] && sudo touch $CADDYFILE
+[[ $EUID -ne 0 ]] && red "请使用 root 运行" && exit
 
+ACME_HOME="/root/.acme.sh"
+SSL_DIR="/root/ssl"
+mkdir -p $SSL_DIR
+
+# 简易 pause 函数
 pause() {
-    echo -ne "${YELLOW}按回车返回菜单...${RESET}"
-    read -r
+    read -p $'\033[32m按回车返回菜单...\033[0m' temp
 }
 
-# 终极精准版域名提取函数（过滤保留字，必须包含点，防止误伤）
-get_all_domains() {
-    [ ! -f "$CADDYFILE" ] && return
-    grep -E '^[[:space:]]*([a-zA-Z0-9.-]+|:[0-9]+|http[s]?://[a-zA-Z0-9.-]+)' "$CADDYFILE" | \
-    sed -E 's/https?:\/\///g' | \
-    awk '{print $1}' | \
-    awk -F: '{print $1}' | \
-    grep -Ev '^(file_server|reverse_proxy|root|import|tls|header|encode|route|handle|handle_path|log|respond|rewrite|redir|try_files|{|}|\*)$' | \
-    grep '\.' | sort -u
+# ===============================
+# 依赖检测
+# ===============================
+install_dep(){
+    if command -v apt >/dev/null 2>&1; then
+        apt update -y
+        apt install -y curl socat cron wget python3 openssl
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y curl socat cronie wget python3 openssl
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y curl socat cronie wget python3 openssl
+    fi
 }
 
-get_system_status() {
-    if ! command -v caddy >/dev/null 2>&1; then
-        STATUS="${RED}未安装${RESET}"
-        VERSION_SHOW="-"
-        SITE_COUNT="0"
-        return
+# ===============================
+# 安装 acme.sh
+# ===============================
+install_acme(){
+    if [ ! -f "$ACME_HOME/acme.sh" ]; then
+        read -p "请输入注册邮箱（回车自动生成）: " email
+        [ -z "$email" ] && email="$(date +%s)@gmail.com"
+        curl https://get.acme.sh | sh -s email=$email
+        green "acme.sh 安装完成"
     fi
-
-    if systemctl is-active --quiet caddy; then
-        STATUS="${GREEN}运行中${RESET}"
-    else
-        STATUS="${RED}已停止${RESET}"
-    fi
-
-    VERSION_SHOW=$(caddy version | awk '{print $1}')
-    SITE_COUNT=$(get_all_domains | wc -l)
 }
 
-install_caddy() {
-    if command -v caddy >/dev/null 2>&1; then
-        echo -e "${GREEN}Caddy 已安装${RESET}"
-        pause
-        return
-    fi
-
-    if ! command -v apt >/dev/null 2>&1; then
-        echo -e "${RED}仅支持 Debian/Ubuntu 系统${RESET}"
-        pause
-        return
-    fi
-
-    echo -e "${GREEN}正在安装 Caddy...${RESET}"
-    sudo apt update -q
-    sudo apt install -yq debian-keyring debian-archive-keyring apt-transport-https curl
-
-    if [ ! -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]; then
-        curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | \
-        sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-    fi
-
-    if [ ! -f /etc/apt/sources.list.d/caddy-stable.list ]; then
-        curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt | \
-        sudo tee /etc/apt/sources.list.d/caddy-stable.list
-    fi
-
-    sudo apt update -q
-    sudo apt install -yq caddy
-    sudo systemctl enable caddy
-    sudo systemctl start caddy
-
-    sudo mkdir -p $CADDY_CERTS_DIR && sudo chown -R caddy:caddy $CADDY_CERTS_DIR 2>/dev/null || true
-
-    echo -e "${GREEN}Caddy 安装完成并已启动${RESET}"
-    pause
-}
-
-update_caddy() {
-    if ! command -v caddy >/dev/null 2>&1; then
-        echo -e "${RED}Caddy 未安装，无法更新${RESET}"
-        pause
-        return
-    fi
-
-    echo -e "${GREEN}正在检查并更新 Caddy...${RESET}"
-    sudo apt update -q
-    sudo apt install --only-upgrade -y caddy
-    echo -e "${GREEN}Caddy 更新程序执行完毕${RESET}"
-    pause
-}
-
-uninstall_caddy() {
-    if ! command -v caddy >/dev/null 2>&1; then
-        echo -e "${YELLOW}Caddy 未安装${RESET}"
-        pause
-        return
-    fi
-
-    echo -ne "${YELLOW}确定要彻底卸载 Caddy 吗？此操作不可逆！(y/n): ${RESET}"; read -r CONFIRM
-    if [[ "$CONFIRM" != "y" ]]; then
-        echo -e "${YELLOW}已取消卸载${RESET}"
-        pause
-        return
-    fi
-
-    echo -e "${GREEN}正在卸载 Caddy...${RESET}"
-    sudo systemctl stop caddy 2>/dev/null || true
-    sudo systemctl disable caddy 2>/dev/null || true
-
-    sudo apt purge -y caddy
-    sudo apt autoremove -y
-
-    sudo rm -rf /etc/caddy /var/lib/caddy /var/log/caddy
-    sudo rm -f /etc/apt/sources.list.d/caddy-stable.list /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-
-    sudo systemctl daemon-reload
-    sudo systemctl reset-failed
-
-    echo -e "${GREEN}Caddy 已干净卸载${RESET}"
-    pause
-}
-
-reload_caddy() {
-    if systemctl is-active --quiet caddy; then
-        if sudo caddy validate --config "$CADDYFILE" >/dev/null 2>&1; then
-            sudo systemctl reload caddy
-            echo -e "${GREEN}Caddy 配置验证通过，已成功重载！${RESET}"
+# ===============================
+# 更新 acme.sh
+# ===============================
+update_acme(){
+    if [ -f "$ACME_HOME/acme.sh" ]; then
+        yellow "正在检查并更新 acme.sh..."
+        $ACME_HOME/acme.sh --upgrade
+        if [ $? -eq 0 ]; then
+            green "acme.sh 更新成功！"
         else
-            echo -e "${RED}错误: Caddyfile 语法检查未通过，拒绝重载！${RESET}"
-            echo -e "${YELLOW}请执行命令手动排查原因: sudo caddy validate --config $CADDYFILE${RESET}"
+            red "更新失败，请检查网络连接。"
         fi
     else
-        echo -e "${YELLOW}Caddy 未运行，正在尝试启动...${RESET}"
-        sudo systemctl start caddy
+        red "未检测到已安装的 acme.sh，请先申请证书或执行安装。"
     fi
+}
+
+# ===============================
+# 停止/恢复 Web 服务
+# ===============================
+stop_web(){
+    if systemctl is-active nginx >/dev/null 2>&1; then
+        systemctl stop nginx
+        WEB_STOP=nginx
+    fi
+    if systemctl is-active apache2 >/dev/null 2>&1; then
+        systemctl stop apache2
+        WEB_STOP=apache2
+    fi
+}
+
+start_web(){
+    [ ! -z "$WEB_STOP" ] && systemctl start $WEB_STOP
+}
+
+# ===============================
+# 安装/导出证书
+# ===============================
+install_cert(){
+    domain=$1
+    mkdir -p $SSL_DIR/$domain
+    $ACME_HOME/acme.sh --install-cert -d $domain \
+        --key-file       $SSL_DIR/$domain/private.key \
+        --fullchain-file $SSL_DIR/$domain/cert.crt
+    green "证书安装完成"
+    green "路径: $SSL_DIR/$domain/"
+}
+
+# ===============================
+# 智能获取公网 IP 函数
+# ===============================
+get_public_ip() {
+    local mode="${1:-"-4"}" 
+    local ip cmd urls
+
+    if [[ "$mode" == "-6" ]]; then
+        cmd_list=("curl -6fsSL --max-time 5" "wget -6qO- --timeout=5")
+        urls=("https://api64.ipify.org" "https://ipv6.ip.sb" "https://v6.ident.me")
+    else
+        cmd_list=("curl -4fsSL --max-time 5" "wget -4qO- --timeout=5")
+        urls=("https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com")
+    fi
+
+    for cmd in "${cmd_list[@]}"; do
+        for url in "${urls[@]}"; do
+            ip=$($cmd "$url" 2>/dev/null || true)
+            ip=$(echo "$ip" | tr -d '[:space:]')
+            if [[ -n "$ip" ]]; then
+                if [[ "$mode" == "-4" && "$ip" =~ \. ]] || [[ "$mode" == "-6" && "$ip" =~ : ]]; then
+                    echo "$ip"
+                    return 0
+                fi
+            fi
+        done
+    done
+    return 1
+}
+
+# ==========================================
+# 获取系统状态数据（直接从 acme.sh 源码文件提取 VER=）
+# ==========================================
+get_system_status() {
+    local acme_file="$ACME_HOME/acme.sh"
+    if [ -f "$acme_file" ]; then
+        STATUS="${GREEN}运行中${RESET}"
+        
+        # 直接从文件内容中检索 VER=xxx 或 _VERSION=xxx 
+        VERSION_SHOW=$(grep -E '^(VER|漏洞标记|_VERSION)=' "$acme_file" | head -n 1 | cut -d'=' -f2 | tr -d '"'\'' ')
+        
+        # 兜底：如果文本提取依然失败，则赋予 3.1.4 默认值
+        if [ -z "$VERSION_SHOW" ]; then
+            VERSION_SHOW="3.1.4"
+        fi
+        
+        # 计算已申请的证书数量
+        SITE_COUNT=$($ACME_HOME/acme.sh --list | tail -n +2 | wc -l)
+    else
+        STATUS="${RED}未运行${RESET}"
+        VERSION_SHOW="--"
+        SITE_COUNT="0"
+    fi
+}
+
+# ===============================
+# 1. 域名 80 端口模式申请证书
+# ===============================
+standalone_issue(){
+    read -p "请输入域名: " domain
+    [ -z "$domain" ] && red "域名不能为空" && return 1
+    stop_web
+    $ACME_HOME/acme.sh --issue -d $domain --standalone -k ec-256 --server https://acme-v02.api.letsencrypt.org/directory
+    [ $? -eq 0 ] && install_cert $domain || red "证书申请失败"
+    start_web
+}
+
+# ==========================================
+# 2. IP 短周期证书申请 (仅支持纯 IPv4 模式)
+# ==========================================
+ip_issue(){
+    yellow "正在检索服务器公网 IPv4..."
+    local v4_ip=$(get_public_ip -4 || true)
+    
+    if [ -z "$v4_ip" ]; then
+        red "未检测到有效的公网 IPv4，请检查网络后再试。"
+        return 1
+    fi
+
+    echo "--------------------------------"
+    green "侦测到公网 IPv4: $v4_ip"
+    echo "--------------------------------"
+
+    yellow "即将通过 Let's Encrypt 申请 5天短周期证书 ($v4_ip)..."
+    stop_web
+    
+    $ACME_HOME/acme.sh --issue --standalone \
+        --certificate-profile shortlived \
+        -d "$v4_ip" \
+        --keylength 2048 \
+        --server letsencrypt \
+        --force
+
+    if [ $? -eq 0 ]; then
+        install_cert "$v4_ip"
+    else
+        red "证书申请失败。请检查该 IP 的 80 端口是否在系统防火墙（iptables/ufw）或云服务商安全组中放行。"
+    fi
+    start_web
+}
+
+# ===============================
+# 3. DNS 模式申请证书
+# ===============================
+dns_issue(){
+    read -p "请输入域名: " domain
+    [ -z "$domain" ] && red "域名不能为空" && return 1
+    echo "1.Cloudflare"
+    echo "2.DNSPod"
+    echo "3.Aliyun"
+    read -p "请选择: " type
+    case $type in
+        1)
+            read -p "CF_Key: " CF_Key
+            read -p "CF_Email: " CF_Email
+            export CF_Key CF_Email
+            $ACME_HOME/acme.sh --issue --dns dns_cf -d $domain -k ec-256 --server https://acme-v02.api.letsencrypt.org/directory
+            ;;
+        2)
+            read -p "DP_Id: " DP_Id
+            read -p "DP_Key: " DP_Key
+            export DP_Id DP_Key
+            $ACME_HOME/acme.sh --issue --dns dns_dp -d $domain -k ec-256 --server https://acme-v02.api.letsencrypt.org/directory
+            ;;
+        3)
+            read -p "Ali_Key: " Ali_Key
+            read -p "Ali_Secret: " Ali_Secret
+            export Ali_Key Ali_Secret
+            $ACME_HOME/acme.sh --issue --dns dns_ali -d $domain -k ec-256 --server https://acme-v02.api.letsencrypt.org/directory
+            ;;
+        *)
+            red "无效选择"
+            return 1
+            ;;
+    esac
+    [ $? -eq 0 ] && install_cert $domain || red "证书申请失败"
+}
+
+# ==========================================
+# 4. 强制续期全部本地证书（包含 IP 短周期）
+# ==========================================
+renew_all(){
+    yellow "正在强制续期本地全部证书 (包括域名与短周期IP)..."
+    stop_web
+    $ACME_HOME/acme.sh --renew-all --ecc --force
+    local res=$?
+    
+    # 强制续期成功后重新导出文件到本地存储目录
+    if [ -d "$SSL_DIR" ]; then
+        for domain in $(ls $SSL_DIR); do
+            if $ACME_HOME/acme.sh --list | grep -q "$domain"; then
+                yellow "正在重新导出同步 [$domain] 的新证书文件..."
+                $ACME_HOME/acme.sh --install-cert -d $domain \
+                    --key-file       $SSL_DIR/$domain/private.key \
+                    --fullchain-file $SSL_DIR/$domain/cert.crt >/dev/null
+            fi
+        done
+    fi
+    start_web
+    echo "----------------------------------------"
+    green "全部本地证书已执行强制续期并完成同步！"
     pause
 }
 
-add_site() {
-    read -p "请输入域名 (example.com)： " DOMAIN
-    [ -z "$DOMAIN" ] && return
-    read -p "是否需要 h2c/gRPC 代理？(y/n，回车默认 n)： " H2C
-    H2C=${H2C:-n}
-    
-    SITE_CONFIG="\n${DOMAIN} {\n"
-    if [[ "$H2C" == "y" ]]; then
-        read -p "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： " H2C_PATH
-        read -p "请输入内网目标地址 (例如 127.0.0.1:8008)： " H2C_TARGET
-        SITE_CONFIG+="    reverse_proxy ${H2C_PATH} h2c://${H2C_TARGET}\n"
-    fi
-
-    read -p "请输入普通 HTTP 代理目标 (默认 127.0.0.1:8008)： " HTTP_TARGET
-    HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
-    SITE_CONFIG+="    reverse_proxy ${HTTP_TARGET}\n}\n"
-
-    echo -e "$SITE_CONFIG" | sudo tee -a $CADDYFILE >/dev/null
-    echo -e "${GREEN}站点 ${DOMAIN} 添加成功${RESET}"
-    reload_caddy
-}
-
+# ==========================================
+# 5. 域名/IP 证书本地状态实时监控
+# ==========================================
 check_domains_status() {
     clear
     echo -e "${YELLOW}========================================${RESET}"
-    echo -e "${YELLOW}        ◈ 域名证书状态实时监控 ◈            ${RESET}"
+    echo -e "${YELLOW}        ◈ 本地证书状态实时监控 ◈            ${RESET}"
     echo -e "${YELLOW}========================================${RESET}"
 
-    mapfile -t DOMAINS < <(get_all_domains)
-    if [ ${#DOMAINS[@]} -eq 0 ]; then
-        echo -e "${RED} ❌ 当前系统未检测到任何反代站点配置或未找到 Caddyfile。${RESET}"
+    mapfile -t DOMAINS < <($ACME_HOME/acme.sh --list | tail -n +2 | awk '{print $1}')
+    
+    if [ ${#DOMAINS[@]} -eq 0 ] || [ "${DOMAINS[0]}" == "" ]; then
+        echo -e "${RED} ❌ 当前系统 acme.sh 未检测到任何已签发的本地证书。${RESET}"
         echo -e "${YELLOW}----------------------------------------${RESET}"
         pause
         return
     fi
 
     for DOMAIN in "${DOMAINS[@]}"; do
-        local CERT_PATH=""
-        local TYPE="自动申请 (Let's Encrypt / ZeroSSL)"
+        [ -z "$DOMAIN" ] && continue
+        local CERT_PATH="$SSL_DIR/$DOMAIN/cert.crt"
+        local TYPE="ACME 本地管理 (域名/IP)"
 
-        if [ -d "$CADDY_DATA" ]; then
-            CERT_PATH=$(sudo find "$CADDY_DATA" -type f -name "$DOMAIN.crt" 2>/dev/null | head -n 1)
-        fi
-
-        if [ -z "$CERT_PATH" ] && grep -A 5 "${DOMAIN}" "$CADDYFILE" | grep -q "tls "; then
-            local CUSTOM_PATH=$(grep -A 5 "${DOMAIN}" "$CADDYFILE" | grep "tls " | awk '{print $2}' | tr -d '\r\n')
-            if [ -f "$CUSTOM_PATH" ]; then
-                CERT_PATH="$CUSTOM_PATH"
-                TYPE="自定义证书 (.pem/.crt)"
-            fi
-        fi
-
-        echo -e "${YELLOW}◈ 域名: ${RESET}${YELLOW}${DOMAIN}${RESET}"
+        echo -e "${YELLOW}◈ 域名/IP: ${RESET}${YELLOW}${DOMAIN}${RESET}"
         echo -e "  ├─ ${YELLOW}证书类型: ${RESET}${TYPE}"
 
-        if [ -n "$CERT_PATH" ] && [ -f "$CERT_PATH" ]; then
+        if [ -f "$CERT_PATH" ]; then
             END_DATE=$(openssl x509 -enddate -noout -in "$CERT_PATH" | cut -d= -f2)
             if END_TS=$(date -d "$END_DATE" +%s 2>/dev/null); then
                 NOW_TS=$(date +%s)
@@ -244,423 +315,122 @@ check_domains_status() {
                 fi
             fi
         else
-            echo -e "  └─ ${YELLOW}运行状态: ${RESET}${RED}未找到证书或尚未签发成功${RESET}"
+            echo -e "  └─ ${YELLOW}运行状态: ${RESET}${RED}未在 $SSL_DIR 中找到导出的证书文件${RESET}"
         fi
         echo -e "${YELLOW}----------------------------------------${RESET}"
     done
     pause
 }
 
-# 【全新高稳健版】彻底解决各种多行、包含 tls 自定义指令站点删除失败的问题
-delete_site() {
-    mapfile -t DOMAINS < <(get_all_domains)
-    if [ ${#DOMAINS[@]} -eq 0 ]; then
-        echo -e "${YELLOW}没有可删除的域名${RESET}"
+# ==========================================
+# 6. 删除本地证书（纯本地列表删除）
+# ==========================================
+remove_cert(){
+    mapfile -t certs < <($ACME_HOME/acme.sh --list | tail -n +2 | awk '{print $1}')
+    if [ ${#certs[@]} -eq 0 ] || [ "${certs[0]}" == "" ]; then
+        red "当前没有任何本地证书可删除"
         pause
-        return
+        return 0
     fi
-
-    echo -e "${GREEN}请选择要删除的域名编号（输入0返回菜单）:${RESET}"
-    for i in "${!DOMAINS[@]}"; do
-        echo "$((i+1))) ${DOMAINS[$i]}"
+    green "本地可删除的证书列表："
+    echo "编号    域名/IP"
+    echo "---------------------------"
+    for i in "${!certs[@]}"; do
+        [ -z "${certs[$i]}" ] && continue
+        printf "%-4s %s\n" "$((i+1))" "${certs[$i]}"
     done
-    read -p "输入编号： " NUM
-
-    if [[ "$NUM" == "0" || -z "$NUM" ]]; then return; fi
-
-    if ! [[ "$NUM" =~ ^[0-9]+$ ]] || [ "$NUM" -lt 1 ] || [ "$NUM" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效编号${RESET}"
+    
+    read -p "请输入要删除的编号 (输入0返回): " num
+    [ "$num" == "0" ] && return 0
+    if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -lt 1 ] || [ "$num" -gt "${#certs[@]}" ]; then
+        red "无效编号"
         pause
-        return
+        return 0
     fi
-
-    DOMAIN="${DOMAINS[$((NUM-1))]}"
     
-    # 采用高兼容 awk 模块：完美精准删除指定域名及其紧随的花括号包裹块
-    sudo awk -v tgt="$DOMAIN" '
-    BEGIN { skip = 0 }
-    $0 ~ "^[[:space:]]*" tgt "([[:space:],:{]|$)" { skip = 1; next }
-    skip && /^[[:space:]]*\}/ { skip = 0; next }
-    skip { next }
-    { print }
-    ' "$CADDYFILE" > /tmp/caddyfile.tmp && sudo mv /tmp/caddyfile.tmp "$CADDYFILE"
-
-    echo -e "${GREEN}域名 ${DOMAIN} 已彻底从 Caddyfile 中移除！${RESET}"
-
-    # 清理相关证书遗留
-    local CERT_DIR=$(sudo find "$CADDY_DATA" -type d -name "$DOMAIN" 2>/dev/null | head -n 1)
-    if [ -n "$CERT_DIR" ] && [ -d "$CERT_DIR" ]; then
-        read -p "是否一并删除该域名证书？(y/n): " DEL_CERT
-        if [[ "$DEL_CERT" == "y" ]]; then
-            sudo rm -rf "$CERT_DIR"
-            echo -e "${GREEN}已删除自动申请的证书：${RESET}${CERT_DIR}"
-        fi
-    fi
-
-    if [ -f "$CADDY_CERTS_DIR/${DOMAIN}.fullchain.pem" ] || [ -f "$CADDY_CERTS_DIR/emby_${DOMAIN}.fullchain.pem" ]; then
-        read -p "检测到本地自定义证书缓存，是否一并清除？(y/n): " DEL_CCERT
-        if [[ "$DEL_CCERT" == "y" ]]; then
-            sudo rm -f "$CADDY_CERTS_DIR/${DOMAIN}"* "$CADDY_CERTS_DIR/emby_${DOMAIN}"*
-            echo -e "${GREEN}自定义静态证书文件已清理。${RESET}"
-        fi
-    fi
-
-    reload_caddy
-}
-
-modify_site() {
-    mapfile -t DOMAINS < <(get_all_domains)
-    if [ ${#DOMAINS[@]} -eq 0 ]; then
-        echo -e "${YELLOW}没有可修改的域名${RESET}"
-        pause
-        return
-    fi
-
-    echo -e "${GREEN}请选择要修改的域名编号（输入0返回菜单）:${RESET}"
-    for i in "${!DOMAINS[@]}"; do
-        echo "$((i+1))) ${DOMAINS[$i]}"
-    done
-    read -p "输入编号： " NUM
-
-    if [[ "$NUM" == "0" || -z "$NUM" ]]; then return; fi
-
-    if ! [[ "$NUM" =~ ^[0-9]+$ ]] || [ "$NUM" -lt 1 ] || [ "$NUM" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效编号${RESET}"
-        pause
-        return
-    fi
-
-    DOMAIN="${DOMAINS[$((NUM-1))]}"
-
-    local OLD_TLS_LINE=$(grep -A 5 "${DOMAIN}" "$CADDYFILE" | grep "tls " | head -n 1 | tr -d '\r')
-
-    read -p "请输入普通 HTTP 代理目标 (默认 127.0.0.1:8008)： " HTTP_TARGET
-    HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
-
-    read -p "是否需要 h2c/gRPC 代理？(y/n，回车默认 n)： " H2C
-    H2C=${H2C:-n}
-    H2C_CONFIG=""
-    if [[ "$H2C" == "y" ]]; then
-        read -p "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： " H2C_PATH
-        read -p "请输入内网目标地址 (例如 127.0.0.1:8008)： " H2C_TARGET
-        H2C_CONFIG="    reverse_proxy ${H2C_PATH} h2c://${H2C_TARGET}\n"
-    fi
-
-    sudo awk -v tgt="$DOMAIN" '
-    BEGIN { skip = 0 }
-    $0 ~ "^[[:space:]]*" tgt "([[:space:],:{]|$)" { skip = 1; next }
-    skip && /^[[:space:]]*\}/ { skip = 0; next }
-    skip { next }
-    { print }
-    ' "$CADDYFILE" > /tmp/caddyfile.tmp && sudo mv /tmp/caddyfile.tmp "$CADDYFILE"
+    domain="${certs[$((num-1))]}"
     
-    NEW_CONFIG="\n${DOMAIN} {\n"
-    if [ -n "$OLD_TLS_LINE" ]; then
-        NEW_CONFIG+="${OLD_TLS_LINE}\n"
-    fi
-    NEW_CONFIG+="${H2C_CONFIG}    reverse_proxy ${HTTP_TARGET}\n}\n"
+    $ACME_HOME/acme.sh --remove -d "$domain" --ecc >/dev/null 2>&1
+    $ACME_HOME/acme.sh --remove -d "$domain" >/dev/null 2>&1
     
-    echo -e "$NEW_CONFIG" | sudo tee -a $CADDYFILE >/dev/null
+    if [ -d "$SSL_DIR/$domain" ]; then
+        rm -rf "$SSL_DIR/$domain"
+    fi
     
-    echo -e "${GREEN}域名 ${DOMAIN} 配置已成功修改并自动维系证书凭证！${RESET}"
-    reload_caddy
-}
-
-add_site_with_cert() {
-    read -p "请输入域名 (example.com)： " DOMAIN
-    [ -z "$DOMAIN" ] && return
-    read -p "是否需要 h2c/gRPC 代理？(y/n，回车默认 n)： " H2C
-    H2C=${H2C:-n}
-
-    read -p "请输入证书文件路径 (.pem/.crt)： " RAW_CERT_PATH
-    read -p "请输入私钥文件路径 (.key)： " RAW_KEY_PATH
-
-    if [ ! -f "$RAW_CERT_PATH" ] || [ ! -f "$RAW_KEY_PATH" ]; then
-        echo -e "${RED}错误: 输入的证书或私钥文件路径不存在！请重新确认。${RESET}"
-        pause
-        return
-    fi
-
-    sudo mkdir -p $CADDY_CERTS_DIR
-    local SAFE_CERT="$CADDY_CERTS_DIR/${DOMAIN}.fullchain.pem"
-    local SAFE_KEY="$CADDY_CERTS_DIR/${DOMAIN}.privkey.key"
-
-    echo -e "${YELLOW}正在安全同步证书文件，并为您自动处理 Caddy 读取权限...${RESET}"
-    sudo cp -f "$RAW_CERT_PATH" "$SAFE_CERT"
-    sudo cp -f "$RAW_KEY_PATH" "$SAFE_KEY"
-    sudo chown -R caddy:caddy $CADDY_CERTS_DIR
-    sudo chmod 644 "$SAFE_CERT" "$SAFE_KEY"
-
-    SITE_CONFIG="\n${DOMAIN} {\n"
-    SITE_CONFIG+="    tls ${SAFE_CERT} ${SAFE_KEY}\n"
-
-    if [[ "$H2C" == "y" ]]; then
-        read -p "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： " H2C_PATH
-        read -p "请输入内网目标地址 (例如 127.0.0.1:8008)： " H2C_TARGET
-        SITE_CONFIG+="    reverse_proxy ${H2C_PATH} h2c://${H2C_TARGET}\n"
-    fi
-
-    read -p "请输入普通 HTTP 代理目标 (默认 127.0.0.1:8008)： " HTTP_TARGET
-    HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
-    SITE_CONFIG+="    reverse_proxy ${HTTP_TARGET}\n}\n"
-
-    echo -e "$SITE_CONFIG" | sudo tee -a $CADDYFILE >/dev/null
-    echo -e "${GREEN}站点 ${DOMAIN} (自定义证书已自动授权放行) 添加成功${RESET}"
-
-    reload_caddy
-}
-
-add_emby_site_caddy() {
-    echo -ne "${GREEN}请输入您的域名 (例: emby.example.com): ${RESET}"; read -r DOMAIN
-    [ -z "$DOMAIN" ] && return
-    echo -ne "${GREEN}请输入 Emby 目标地址 (例: http://127.0.0.1:8096): ${RESET}"; read -r TARGET
-    
-    local TARGET_HOST=$(echo "$TARGET" | awk -F[/:] '{print $4}')
-    
-    sudo tee -a $CADDYFILE >/dev/null <<EOF
-
-$DOMAIN {
-    encode gzip
-
-    reverse_proxy $TARGET {
-        flush_interval -1
-        header_up Host {upstream_hostport}
-        header_up X-Real-IP {remote_host}
-        header_up X-Forwarded-For {remote_host}
-EOF
-
-    if [[ "$TARGET" == https* ]]; then
-        sudo tee -a $CADDYFILE >/dev/null <<EOF
-        header_up Host $TARGET_HOST
-        transport http {
-            tls_server_name $TARGET_HOST
-        }
-EOF
-    fi
-
-    sudo tee -a $CADDYFILE >/dev/null <<EOF
-    }
-
-    header {
-        Access-Control-Allow-Origin *
-        Access-Control-Allow-Methods "GET, POST, OPTIONS, DELETE, PUT"
-        Access-Control-Allow-Headers "X-Emby-Authorization, Content-Type, Authorization, X-Requested-With"
-    }
-}
-EOF
-
-    echo -e "${GREEN}配置已生成！访问地址: https://${DOMAIN}${RESET}"
-    reload_caddy
-}
-
-add_emby_split_site_caddy() {
-    echo -ne "${GREEN}请输入您的域名(例: emby.example.com): ${RESET}"; read -r DOMAIN
-    [ -z "$DOMAIN" ] && return
-    echo -ne "${GREEN}请输入 Emby 主站地址(例: https://emby.example.com): ${RESET}"; read -r T_MAIN
-    echo -ne "${GREEN}请输入推流后端地址(例: https://emby.xx.com): ${RESET}"; read -r T_STREAM
-
-    local STREAM_HOST=$(echo "$T_STREAM" | awk -F[/:] '{print $4}')
-
-    sudo tee -a $CADDYFILE >/dev/null <<EOF
-
-$DOMAIN {
-    handle_path /s1/* {
-        reverse_proxy $T_STREAM {
-            flush_interval -1
-            header_up Host $STREAM_HOST
-            header_up X-Real-IP ""
-            header_up X-Forwarded-For ""
-        }
-    }
-
-    handle {
-        reverse_proxy $T_MAIN {
-            flush_interval -1
-            header_up Host {upstream_hostport}
-            header_up X-Real-IP ""
-            header_up X-Forwarded-For ""
-        }
-    }
-}
-EOF
-    echo -e "${GREEN}访问地址: https://${DOMAIN}${RESET}"
-    reload_caddy
-}
-
-add_emby_custom_cert_caddy() {
-    echo -ne "${GREEN}请输入您的域名 (例: emby.example.com): ${RESET}"; read -r DOMAIN
-    [ -z "$DOMAIN" ] && return
-    
-    echo -ne "${GREEN}请输入证书文件路径 (.pem/.crt): ${RESET}"; read -r RAW_CERT_PATH
-    echo -ne "${GREEN}请输入私钥文件路径 (.key): ${RESET}"; read -r RAW_KEY_PATH
-
-    if [ ! -f "$RAW_CERT_PATH" ] || [ ! -f "$RAW_KEY_PATH" ]; then
-        echo -e "${RED}错误: 输入的证书或私钥文件路径 nonexistent！${RESET}"
-        pause
-        return
-    fi
-
-    sudo mkdir -p $CADDY_CERTS_DIR
-    local SAFE_CERT="$CADDY_CERTS_DIR/emby_${DOMAIN}.fullchain.pem"
-    local SAFE_KEY="$CADDY_CERTS_DIR/emby_${DOMAIN}.privkey.key"
-
-    echo -e "${YELLOW}正在同步证书文件并下发 Caddy 专属访问权限...${RESET}"
-    sudo cp -f "$RAW_CERT_PATH" "$SAFE_CERT"
-    sudo cp -f "$RAW_KEY_PATH" "$SAFE_KEY"
-    sudo chown -R caddy:caddy $CADDY_CERTS_DIR
-    sudo chmod 644 "$SAFE_CERT" "$SAFE_KEY"
-
-    echo -ne "${GREEN}请输入 Emby 目标地址 (例: http://127.0.0.1:8096): ${RESET}"; read -r TARGET
-    local TARGET_HOST=$(echo "$TARGET" | awk -F[/:] '{print $4}')
-    
-    sudo tee -a $CADDYFILE >/dev/null <<EOF
-
-$DOMAIN {
-    tls $SAFE_CERT $SAFE_KEY
-    encode gzip
-
-    reverse_proxy $TARGET {
-        flush_interval -1
-        header_up Host {upstream_hostport}
-        header_up X-Real-IP {remote_host}
-        header_up X-Forwarded-For {remote_host}
-EOF
-
-    if [[ "$TARGET" == https* ]]; then
-        sudo tee -a $CADDYFILE >/dev/null <<EOF
-        header_up Host $TARGET_HOST
-        transport http {
-            tls_server_name $TARGET_HOST
-        }
-EOF
-    fi
-
-    sudo tee -a $CADDYFILE >/dev/null <<EOF
-    }
-
-    header {
-        Access-Control-Allow-Origin *
-        Access-Control-Allow-Methods "GET, POST, OPTIONS, DELETE, PUT"
-        Access-Control-Allow-Headers "X-Emby-Authorization, Content-Type, Authorization, X-Requested-With"
-    }
-}
-EOF
-
-    echo -e "${GREEN}自定义证书 Emby 配置已生成！访问地址: https://${DOMAIN}${RESET}"
-    reload_caddy
-}
-
-emby_proxy_menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}==== Emby 反代管理 ====${RESET}"
-        echo -e "${GREEN}1) 普通反代 (自动申请证书)${RESET}"
-        echo -e "${GREEN}2) 主站 + 推流重定向 (自动申请证书)${RESET}"
-        echo -e "${GREEN}3) 普通反代 (使用自定义证书) ★${RESET}"
-        echo -e "${GREEN}0) 返回主菜单${RESET}"
-        echo -ne "${GREEN}请选择 [0-3]: ${RESET}" 
-        read -r emby_choice
-
-        case $emby_choice in
-            1) add_emby_site_caddy; break ;;
-            2) add_emby_split_site_caddy; break ;;
-            3) add_emby_custom_cert_caddy; break ;;
-            0) return ;;
-            *) echo -e "${RED}无效选项${RESET}"; pause ;;
-        esac
-    done
-}
-
-view_sites() {
-    mapfile -t DOMAINS < <(get_all_domains)
-    if [ ${#DOMAINS[@]} -eq 0 ]; then
-        echo -e "${YELLOW}没有已配置的域名${RESET}"
-        pause
-        return
-    fi
-
-    echo -e "${GREEN}请选择要查看证书信息的域名编号（输入0返回菜单）:${RESET}"
-    for i in "${!DOMAINS[@]}"; do
-        echo "$((i+1))) ${DOMAINS[$i]}"
-    done
-
-    read -p "输入编号： " NUM
-    if [[ "$NUM" == "0" || -z "$NUM" ]]; then return; fi
-
-    if ! [[ "$NUM" =~ ^[0-9]+$ ]] || [ "$NUM" -lt 1 ] || [ "$NUM" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效编号${RESET}"
-        pause
-        return
-    fi
-
-    DOMAIN="${DOMAINS[$((NUM-1))]}"
-    
-    local CERT_FILE=""
-    if [ -d "$CADDY_DATA" ]; then
-        CERT_FILE=$(sudo find "$CADDY_DATA" -type f -name "$DOMAIN.crt" 2>/dev/null | head -n 1)
-    fi
-
-    if [ -z "$CERT_FILE" ] && [ -f "$CADDY_CERTS_DIR/${DOMAIN}.fullchain.pem" ]; then
-        CERT_FILE="$CADDY_CERTS_DIR/${DOMAIN}.fullchain.pem"
-    fi
-    if [ -z "$CERT_FILE" ] && [ -f "$CADDY_CERTS_DIR/emby_${DOMAIN}.fullchain.pem" ]; then
-        CERT_FILE="$CADDY_CERTS_DIR/emby_${DOMAIN}.fullchain.pem"
-    fi
-
-    if [ -n "$CERT_FILE" ] && [ -f "$CERT_FILE" ]; then
-        echo -e "${GREEN}证书路径：${RESET}${CERT_FILE}"
-        echo -e "${GREEN}证书信息：${RESET}"
-        openssl x509 -in "$CERT_FILE" -noout -text | awk '
-            /Subject:/ || /Issuer:/ || /Not Before:/ || /Not After :/ {print}'
-    else
-        echo -e "${YELLOW}${DOMAIN} - 未在系统默认路径找到证书${RESET}"
-    fi
+    green "证书 [$domain] 已成功从本地及 acme.sh 中删除。"
     pause
 }
 
-menu() {
-    while true; do
-        clear
-        get_system_status
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}         Caddy  管理面板        ${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}状态   :${RESET} $STATUS"
-        echo -e "${GREEN}版本   :${RESET} ${YELLOW}$VERSION_SHOW${RESET}"
-        echo -e "${GREEN}站点   :${RESET} ${YELLOW}$SITE_COUNT 个${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} 1. 安装Caddy${RESET}"
-        echo -e "${GREEN} 2. 添加站点${RESET}"
-        echo -e "${GREEN} 3. 修改配置${RESET}"
-        echo -e "${GREEN} 4. 添加站点(自定义证书)${RESET}"
-        echo -e "${GREEN} 5. 删除站点${RESET}"
-        echo -e "${GREEN} 6. 查看证书信息${RESET}"
-        echo -e "${GREEN} 7. Emby反代管理${RESET}"
-        echo -e "${GREEN} 8. 查看证书状态${RESET}"
-        echo -e "${GREEN} 9. 重载Caddy配置${RESET}"
-        echo -e "${GREEN}10. 更新Caddy${RESET}"
-        echo -e "${GREEN}11. 卸载Caddy${RESET}"
-        echo -e "${GREEN} 0. 退出${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
-        read choice
-
-        case $choice in
-            1) install_caddy ;;
-            2) add_site ;;
-            3) modify_site ;;
-            4) add_site_with_cert ;;
-            5) delete_site ;;
-            6) view_sites ;;
-            7) emby_proxy_menu ;;
-            8) check_domains_status ;;
-            9) reload_caddy ;;
-            10) update_caddy ;;
-            11) uninstall_caddy ;;
-            0) echo "退出面板。"; exit 0 ;;
-            *) echo -e "${RED}无效选项${RESET}"; pause ;;
-        esac
-    done
+# ===============================
+# 7. 查看自动续期任务
+# ===============================
+show_cron(){
+    echo
+    green "当前 acme.sh 自动续期任务:"
+    crontab -l | grep acme.sh || yellow "未发现自动续期任务"
+    echo
+    pause
 }
 
-menu
+# ===============================
+# 9. 卸载 acme.sh
+# ===============================
+uninstall_acme(){
+    [ -f "$ACME_HOME/acme.sh" ] && "$ACME_HOME/acme.sh" --uninstall >/dev/null 2>&1
+    [ -d "$ACME_HOME" ] && rm -rf "$ACME_HOME"
+    [ -d "/etc/acme" ] && rm -rf "/etc/acme"
+    [ -d "$SSL_DIR" ] && rm -rf "$SSL_DIR"
+
+    crontab -l 2>/dev/null | grep -v acme.sh | crontab -
+    
+    [ -f "$HOME/.bashrc" ] && sed -i '/acme.sh.env/d' "$HOME/.bashrc"
+    [ -f "$HOME/.profile" ] && sed -i '/acme.sh.env/d' "$HOME/.profile"
+    
+    green "acme.sh 已彻底卸载"
+    pause
+}
+
+# ===============================
+# 主菜单循环
+# ===============================
+while true
+do
+    clear
+    get_system_status
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}        ACME  管理面板          ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $STATUS"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}$VERSION_SHOW${RESET}"
+    echo -e "${GREEN}证书   :${RESET} ${YELLOW}$SITE_COUNT 个${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN} 1. 安装ACME${RESET}"
+    echo -e "${GREEN} 2. 申请域名证书(80端口模式)${RESET}"
+    echo -e "${GREEN} 3. 申请IP证书(IP短周期模式)${RESET}"
+    echo -e "${GREEN} 4. 申请域名证书(DNSAPI模式)${RESET}"
+    echo -e "${GREEN} 5. 强制续期全部本地证书${RESET}"
+    echo -e "${GREEN} 6. 查看已申请证书${RESET}"
+    echo -e "${GREEN} 7. 删除指定本地证书${RESET}"
+    echo -e "${GREEN} 8. 查看定时自动续期任务${RESET}"
+    echo -e "${GREEN} 9. 更新ACME${RESET}"
+    echo -e "${GREEN}10. 卸载ACME${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${GREEN} 请选择: ${RESET}"
+    
+    read num
+    case $num in
+        1) install_dep; install_acme; pause;;
+        2) [ ! -f "$ACME_HOME/acme.sh" ] && install_dep && install_acme; standalone_issue;;
+        3) [ ! -f "$ACME_HOME/acme.sh" ] && install_dep && install_acme; ip_issue;;
+        4) [ ! -f "$ACME_HOME/acme.sh" ] && install_dep && install_acme; dns_issue;;
+        5) renew_all;;
+        6) check_domains_status;;
+        7) remove_cert;;
+        8) show_cron;;
+        9) update_acme; pause;;
+       10) uninstall_acme;;
+        0) exit;;
+        *) echo -e "${RED}无效选项${RESET}"; pause;;
+    esac
+done

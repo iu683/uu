@@ -1,227 +1,327 @@
 #!/bin/bash
-# 一键系统重装脚本（分类菜单 + 编号选择 + 动态交互安全版 + 支持SSH公钥）
-# 支持 Linux 全系列 + Windows 全系列
+# ==========================================
+# ACME Pro 证书申请（支持域名与 IP 短周期）
+# ==========================================
+export LANG=en_US.UTF-8
 
-# 设置颜色
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-# 自动检测并安装基础依赖 (curl, wget, openssl)
-install_dependencies() {
-    local deps=("curl" "wget" "openssl")
-    local missing_deps=()
+green(){ echo -e "${GREEN}$1${RESET}"; }
+red(){ echo -e "${RED}$1${RESET}"; }
+yellow(){ echo -e "${YELLOW}$1${RESET}"; }
 
-    # 检查哪些工具缺失
-    for dep in "${deps[@]}"; do
-        if ! command -v "$dep" >/dev/null 2>&1; then
-            missing_deps+=("$dep")
-        fi
+[[ $EUID -ne 0 ]] && red "请使用 root 运行" && exit
+
+ACME_HOME="$HOME/.acme.sh"
+SSL_DIR="/root/ssl"
+mkdir -p $SSL_DIR
+
+# ===============================
+# 依赖检测
+# ===============================
+install_dep(){
+    if command -v apt >/dev/null 2>&1; then
+        apt update -y
+        apt install -y curl socat cron wget python3 openssl
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y curl socat cronie wget python3 openssl
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y curl socat cronie wget python3 openssl
+    fi
+}
+
+# ===============================
+# 安装 acme.sh
+# ===============================
+install_acme(){
+    if [ ! -f "$ACME_HOME/acme.sh" ]; then
+        read -p "请输入注册邮箱（回车自动生成）: " email
+        [ -z "$email" ] && email="$(date +%s)@gmail.com"
+        curl https://get.acme.sh | sh -s email=$email
+        green "acme.sh 安装完成"
+    fi
+}
+
+# ===============================
+# 停止/恢复 Web 服务
+# ===============================
+stop_web(){
+    if systemctl is-active nginx >/dev/null 2>&1; then
+        systemctl stop nginx
+        WEB_STOP=nginx
+    fi
+    if systemctl is-active apache2 >/dev/null 2>&1; then
+        systemctl stop apache2
+        WEB_STOP=apache2
+    fi
+}
+
+start_web(){
+    [ ! -z "$WEB_STOP" ] && systemctl start $WEB_STOP
+}
+
+# ===============================
+# 安装/导出证书
+# ===============================
+install_cert(){
+    domain=$1
+    mkdir -p $SSL_DIR/$domain
+    $ACME_HOME/acme.sh --install-cert -d $domain \
+        --key-file       $SSL_DIR/$domain/private.key \
+        --fullchain-file $SSL_DIR/$domain/cert.crt
+    green "证书安装完成"
+    green "路径: $SSL_DIR/$domain/"
+}
+
+# ===============================
+# 智能获取公网 IP 函数 (优化版)
+# ===============================
+get_public_ip() {
+    local mode="${1:-"-4"}" 
+    local ip cmd urls
+
+    if [[ "$mode" == "-6" ]]; then
+        cmd_list=("curl -6fsSL --max-time 5" "wget -6qO- --timeout=5")
+        urls=("https://api64.ipify.org" "https://ipv6.ip.sb" "https://v6.ident.me")
+    else
+        cmd_list=("curl -4fsSL --max-time 5" "wget -4qO- --timeout=5")
+        urls=("https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com")
+    fi
+
+    for cmd in "${cmd_list[@]}"; do
+        for url in "${urls[@]}"; do
+            ip=$($cmd "$url" 2>/dev/null || true)
+            ip=$(echo "$ip" | tr -d '[:space:]')
+            if [[ -n "$ip" ]]; then
+                # 简单防错校验：v4 必须含点，v6 必须含冒号
+                if [[ "$mode" == "-4" && "$ip" =~ \. ]] || [[ "$mode" == "-6" && "$ip" =~ : ]]; then
+                    echo "$ip"
+                    return 0
+                fi
+            fi
+        done
     done
+    return 1
+}
 
-    # 如果没有缺失的工具，直接跳过
-    if [ ${#missing_deps[@]} -eq 0 ]; then
+# ===============================
+# 1. 域名 80 端口模式申请证书
+# ===============================
+standalone_issue(){
+    read -p "请输入域名: " domain
+    [ -z "$domain" ] && red "域名不能为空" && return 1
+    stop_web
+    $ACME_HOME/acme.sh --issue -d $domain --standalone -k ec-256 --server https://acme-v02.api.letsencrypt.org/directory
+    [ $? -eq 0 ] && install_cert $domain || red "证书申请失败"
+    start_web
+}
+
+# ===============================
+# 2. IP 短周期证书申请 (Let's Encrypt - 支持双栈)
+# ===============================
+ip_issue(){
+    yellow "正在检索服务器公网 IP..."
+    local v4_ip=$(get_public_ip -4 || true)
+    local v6_ip=$(get_public_ip -6 || true)
+    
+    local ip_args=""
+    local main_ip=""
+
+    if [[ -n "$v4_ip" ]]; then
+        green "侦测到 IPv4: $v4_ip"
+        ip_args="-d $v4_ip"
+        main_ip="$v4_ip"
+    fi
+    if [[ -n "$v6_ip" ]]; then
+        green "侦测到 IPv6: $v6_ip"
+        ip_args="$ip_args -d $v6_ip"
+        [ -z "$main_ip" ] && main_ip="$v6_ip"
+    fi
+
+    if [ -z "$main_ip" ]; then
+        red "未检测到有效的公网 IPv4 或 IPv6，无法申请 IP 证书。"
+        return 1
+    fi
+
+    yellow "即将通过 Let's Encrypt 申请 5天短周期 IP 证书 (Standalone 模式)..."
+    stop_web
+    
+    # 组合你的硬核参数执行申请
+    $ACME_HOME/acme.sh --issue --standalone \
+        --certificate-profile shortlived \
+        $ip_args \
+        --keylength 2048 \
+        --server letsencrypt \
+        --force
+
+    if [ $? -eq 0 ]; then
+        install_cert "$main_ip"
+        green "提示：双栈证书主目录已归类在: $SSL_DIR/$main_ip/"
+    else
+        red "IP 证书申请失败，请确保 80 端口对外放行，且未被抢占。"
+    fi
+    start_web
+}
+
+# ===============================
+# 3. DNS 模式申请证书
+# ===============================
+dns_issue(){
+    read -p "请输入域名: " domain
+    [ -z "$domain" ] && red "域名不能为空" && return 1
+    echo "1.Cloudflare"
+    echo "2.DNSPod"
+    echo "3.Aliyun"
+    read -p "请选择: " type
+    case $type in
+        1)
+            read -p "CF_Key: " CF_Key
+            read -p "CF_Email: " CF_Email
+            export CF_Key CF_Email
+            $ACME_HOME/acme.sh --issue --dns dns_cf -d $domain -k ec-256 --server https://acme-v02.api.letsencrypt.org/directory
+            ;;
+        2)
+            read -p "DP_Id: " DP_Id
+            read -p "DP_Key: " DP_Key
+            export DP_Id DP_Key
+            $ACME_HOME/acme.sh --issue --dns dns_dp -d $domain -k ec-256 --server https://acme-v02.api.letsencrypt.org/directory
+            ;;
+        3)
+            read -p "Ali_Key: " Ali_Key
+            read -p "Ali_Secret: " Ali_Secret
+            export Ali_Key Ali_Secret
+            $ACME_HOME/acme.sh --issue --dns dns_ali -d $domain -k ec-256 --server https://acme-v02.api.letsencrypt.org/directory
+            ;;
+        *)
+            red "无效选择"
+            return 1
+            ;;
+    esac
+    [ $? -eq 0 ] && install_cert $domain || red "证书申请失败"
+}
+
+# ===============================
+# 续期所有证书
+# ===============================
+renew_all(){
+    $ACME_HOME/acme.sh --cron -f
+    green "全部证书已尝试续期"
+}
+
+# ===============================
+# 删除证书
+# ===============================
+remove_cert(){
+    certs=($($ACME_HOME/acme.sh --list | tail -n +2 | awk '{print $1}'))
+    if [ ${#certs[@]} -eq 0 ]; then
+        red "当前没有任何证书可删除"
         return 0
     fi
-
-    echo -e "${YELLOW}发现缺失依赖: ${missing_deps[*]}，正在自动安装...${RESET}"
-
-    # 识别包管理器并安装
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -y && apt-get install -y "${missing_deps[@]}"
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y "${missing_deps[@]}"
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y "${missing_deps[@]}"
-    elif command -v apk >/dev/null 2>&1; then
-        apk add --no-cache "${missing_deps[@]}"
-    else
-        echo -e "${RED}❌ 错误: 未知系统架构，无法自动安装依赖 ${missing_deps[*]}，请手动安装后重试。${RESET}"
-        exit 1
-    fi
-}
-
-# 运行依赖检查
-install_dependencies
-
-# 随机密码生成函数（生成12位包含大小写字母和数字的随机密码）
-generate_random_password() {
-    if command -v openssl >/dev/null 2>&1; then
-        openssl rand -base64 9 | tr -d '+/' | cut -c1-12
-    else
-        tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 12
-    fi
-}
-
-# 下载脚本
-download_script() {
-    local type="$1"
-    if [ "$type" == "MollyLau" ]; then
-        wget --no-check-certificate -qO InstallNET.sh "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/InstallNET.sh" && chmod +x InstallNET.sh
-    else
-        curl -sO "https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh" && chmod +x reinstall.sh
-    fi
-}
-
-# 系统信息表：编号|系统名|分类|下载方式|默认用户名|默认密码|默认端口|重装基础命令
-systems=(
-"1|debian13|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 13"
-"2|debian12|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 12"
-"3|debian11|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 11"
-"4|debian10|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 10"
-"5|ubuntu26.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 26.04"
-"6|ubuntu24.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 24.04"
-"7|ubuntu22.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 22.04"
-"8|ubuntu20.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 20.04"
-"9|ubuntu18.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 18.04"
-"10|Alpine3.23|Alpine|bin456789|root|123@@@|22|bash reinstall.sh alpine 3.23"
-"11|Alpine3.22|Alpine|bin456789|root|123@@@|22|bash reinstall.sh alpine 3.22"
-"12|Alpine3.21|Alpine|bin456789|root|123@@@|22|bash reinstall.sh alpine 3.21"
-"13|Alpine3.20|Alpine|bin456789|root|123@@@|22|bash reinstall.sh alpine 3.20"
-"14|AlpineEdge|Alpine|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -alpine"
-"15|rocky10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh rocky"
-"16|rocky9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh rocky 9"
-"17|alma10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh almalinux"
-"18|alma9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh almalinux 9"
-"19|oracle10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh oracle"
-"20|oracle9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh oracle 9"
-"21|fedora44|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh fedora 44"
-"22|fedora43|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh fedora 43"
-"23|centos10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh centos 10"
-"24|centos9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh centos 9"
-"25|arch|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh arch"
-"26|kali|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh kali"
-"27|openeuler|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh openeuler"
-"28|opensuseTumbleweed|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh opensuse"
-"29|fnos飞牛公测版|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh fnos"
-"30|windows11|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 11 -lang cn"
-"31|windows10|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 10 -lang cn"
-"32|windows7|Windows|bin456789|Administrator|123@@@|3389|bash reinstall.sh windows --iso=\"https://drive.massgrave.dev/cn_windows_7_professional_with_sp1_x64_dvd_u_677031.iso\" --image-name='Windows 7 PROFESSIONAL'"
-"33|windowsServer2025|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2025 -lang cn"
-"34|windowsServer2022|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2022 -lang cn"
-"35|windowsServer2019|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2019 -lang cn"
-"36|windowsServer2016|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2016 -lang cn"
-"37|windows11arm|Windows|bin456789|Administrator|123@@@|3389|bash reinstall.sh dd --img https://r2.hotdog.eu.org/win11-arm-with-pagefile-15g.xz"
-)
-
-while true; do
-    # 显示菜单
-    echo -e "${GREEN}=== 重装系统管理菜单 ===${RESET}"
-
-    last_category=""
-    for sys in "${systems[@]}"; do
-        IFS="|" read -r id name category _ _ _ _ _ <<< "$sys"
-        if [[ "$category" != "$last_category" ]]; then
-            echo -e "${GREEN}--- $category 系统 ---${RESET}"
-            last_category="$category"
-        fi
-        echo -e "${YELLOW}${id}. ${name}${RESET}"
+    green "可删除的证书列表："
+    echo "编号   域名/IP"
+    echo "---------------------------"
+    for i in "${!certs[@]}"; do
+        printf "%-4s %s\n" "$((i+1))" "${certs[$i]}"
     done
-    echo -e "${RED} 0. 退出${RESET}"
-
-    # 用户选择编号
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read num_choice
-
-    # 支持 0 或 00 退出
-    if [[ "$num_choice" == "0" || "$num_choice" == "00" ]]; then
-        exit 0
+    
+    read -p "请输入要删除的编号 (输入0返回): " num
+    [ "$num" == "0" ] && return 0
+    if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -lt 1 ] || [ "$num" -gt "${#certs[@]}" ]; then
+        red "无效编号"
+        return 0
     fi
+    domain="${certs[$((num-1))]}"
+    $ACME_HOME/acme.sh --remove -d "$domain" --ecc >/dev/null 2>&1
+    [ -d "$SSL_DIR/$domain" ] && rm -rf "$SSL_DIR/$domain"
+    green "证书 $domain 已删除"
+}
 
-    found=0
-    for sys in "${systems[@]}"; do
-        IFS="|" read -r id name category dl def_user def_pass def_port cmd <<< "$sys"
-        if [[ "$num_choice" == "$id" ]]; then
-            found=1
-            
-            echo -e "${YELLOW}警告: 此操作将会完全重装系统，磁盘上所有数据将丢失！${RESET}"
-            echo -e "${YELLOW}请确保已备份重要数据！${RESET}"
-            
+# ===============================
+# 卸载 acme.sh
+# ===============================
+uninstall_acme(){
+    [ -f "$ACME_HOME/acme.sh" ] && "$ACME_HOME/acme.sh" --uninstall >/dev/null 2>&1
+    [ -d "$ACME_HOME" ] && rm -rf "$ACME_HOME"
+    [ -d "/etc/acme" ] && rm -rf "/etc/acme"
+    [ -d "$SSL_DIR" ] && rm -rf "$SSL_DIR"
 
-            echo -ne "${YELLOW}你确定要重装 ${name} 系统吗？(y/n): ${RESET}"
-            read confirm
-            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-                echo -e "${YELLOW}已取消重装 ${name} 系统，返回菜单${RESET}"
-                sleep 1
-                break
-            fi
+    crontab -l 2>/dev/null | grep -v acme.sh | crontab -
+    
+    [ -f "$HOME/.bashrc" ] && sed -i '/acme.sh.env/d' "$HOME/.bashrc"
+    [ -f "$HOME/.profile" ] && sed -i '/acme.sh.env/d' "$HOME/.profile"
+    
+    green "acme.sh 已彻底卸载"
+}
 
-            final_cmd="$cmd"
+show_cron(){
+    echo
+    green "当前 acme.sh 自动续期任务:"
+    crontab -l | grep acme.sh || yellow "未发现自动续期任务"
+    echo
+}
 
-            # 如果是 bin456789 且是 Linux 系统，触发自定义交互
-            if [[ "$dl" == "bin456789" && "$category" != "Windows" && "$name" != *"dd"* ]]; then
-                echo -e "\n${GREEN}--- 配置新系统凭据 ---${RESET}"
-                
-                # 1. 交互输入用户名
-                read -p "请输入用户名 (默认 ${def_user}): " custom_user
-                custom_user=${custom_user:-$def_user}
-
-                # 2. 交互输入 SSH 公钥
-                echo -e "${YELLOW}提示: 支持公钥文本、URL、github:用户名、gitlab:用户名等${RESET}"
-                echo -e "${YELLOW}例如: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIfueBkiS7BPBXMoW6RWvoDE995J61bv6xxYlD6yP3kD root@localhost${RESET}"
-                read -p "请输入 SSH 公钥 (留空则使用密码登录): " custom_key
-
-                # 3. 交互输入密码 (仅在没有输入公钥时触发)
-                custom_pass=""
-                if [[ -z "$custom_key" ]]; then
-                    # 在这里动态生成随机密码
-                    rand_pass=$(generate_random_password)
-                    read -p "请输入 ${custom_user} 的密码 (直接回车随机生成: ${rand_pass}): " custom_pass
-                    custom_pass=${custom_pass:-$rand_pass}
-                else
-                    echo -e "${GREEN}检测到已输入公钥，重装时将不配置密码。${RESET}"
-                fi
-
-                # 4. 交互输入端口
-                read -p "请输入 SSH 端口 (默认 ${def_port}): " custom_port
-                custom_port=${custom_port:-$def_port}
-
-                # 动态拼接自定义参数
-                if [[ -n "$custom_key" ]]; then
-                    # 使用公钥，不传 --password
-                    final_cmd="$cmd --username \"$custom_user\" --ssh-key \"$custom_key\" --ssh-port \"$custom_port\""
-                else
-                    # 使用密码
-                    final_cmd="$cmd --username \"$custom_user\" --password \"$custom_pass\" --ssh-port \"$custom_port\""
-                fi
-                
-                # 打印最终凭据给用户核对
-                echo -e "\n${YELLOW}请牢记重装后凭据:${RESET}"
-                echo -e "用户名: ${GREEN}${custom_user}${RESET}  SSH端口: ${GREEN}${custom_port}${RESET}"
-                if [[ -n "$custom_key" ]]; then
-                    echo -e "登录方式: ${GREEN}仅限 SSH 公钥证书登录${RESET}"
-                else
-                    echo -e "初始密码: ${RED}${custom_pass}${RESET}  (请复制保存！)"
-                fi
+# ===============================
+# 查看已申请证书
+# ===============================
+list_cert(){
+    printf "%-22s %-8s %-15s %-10s\n" "域名/IP" "状态" "到期时间" "剩余天数"
+    echo "------------------------------------------------------------"
+    $ACME_HOME/acme.sh --list | tail -n +2 | awk '{print $1}' | while read domain; do
+        CERT_FILE="$SSL_DIR/$domain/cert.crt"
+        if [ ! -f "$CERT_FILE" ]; then
+            status="异常"; expire_date="无证书"; remain="--"
+        else
+            expire=$(openssl x509 -enddate -noout -in "$CERT_FILE" | cut -d= -f2)
+            expire_ts=$(date -d "$expire" +%s 2>/dev/null)
+            now_ts=$(date +%s)
+            if [ -n "$expire_ts" ]; then
+                remain=$(( (expire_ts - now_ts) / 86400 ))
+                [ "$remain" -ge 0 ] && status="有效" || status="已过期"
+                expire_date=$(date -d "$expire" +"%Y-%m-%d" 2>/dev/null)
             else
-                # MollyLau 脚本或 Windows/DD 镜像保持原样提示
-                echo -e "\n${YELLOW}重装后初始用户名: ${GREEN}$def_user${RESET}  初始密码: ${GREEN}$def_pass${RESET}  远程端口: ${GREEN}$def_port${RESET}"
+                status="异常"; expire_date="未知"; remain="--"
             fi
-
-            # 第二次最终执行确认
-            echo ""
-            read -p "按回车键开始下载并触发重装流程 (Ctrl+C取消)..." dummy
-
-            # 开始下载并执行
-            echo -e "${GREEN}🔧 正在下载重装...${RESET}"
-            download_script "$dl"
-            
-            echo -e "${GREEN}🔧 正在执行重装命令...${RESET}"
-            # 执行最终拼接好的命令
-            eval "$final_cmd"
-
-            # 绿色重启提示
-            echo -e "${GREEN}✔ 系统重装环境已就绪。${RESET}"
-            read -p "按回车键确认重启服务器并开始底层重装(Ctrl+C取消)..." dummy
-            
-            echo -e "${GREEN}>>> 正在重启系统...${RESET}"
-            reboot
-            break 2
         fi
+        printf "%-22s %-8s %-15s %-10s\n" "$domain" "$status" "$expire_date" "$remain 天"
     done
+}
 
-    if [[ $found -eq 0 ]]; then
-        echo -e "${RED}无效编号，请重新选择！${RESET}"
-    fi
+# ===============================
+# 菜单
+# ===============================
+while true
+do
+    clear
+    green "==============================="
+    green "     ACME申请证书工具"
+    green "==============================="
+    green "1. 申请域名证书 (80端口模式)"
+    green "2. 申请 IP 证书 (短周期5天)"
+    green "3. 申请域名证书 (DNSAPI模式)"
+    green "4. 续期全部证书"
+    green "5. 查看已申请证书"
+    green "6. 删除指定证书"
+    green "7. 查看自动续期任务"
+    green "8. 更新"
+    green "9. 卸载"
+    green "0. 退出"
+
+    read -p $'\033[32m请选择: \033[0m' num
+    case $num in
+        1) install_dep; install_acme; standalone_issue;;
+        2) install_dep; install_acme; ip_issue;;
+        3) install_dep; install_acme; dns_issue;;
+        4) renew_all;;
+        5) list_cert;;
+        6) remove_cert;;
+        7) show_cron;;
+        8) acme.sh --upgrade;;
+        9) uninstall_acme;;
+        0) exit;;
+        *) echo -e "${RED}无效选项${RESET}";;
+    esac
+    read -p $'\033[32m按回车返回菜单...\033[0m' temp
 done

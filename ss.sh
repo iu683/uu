@@ -6,6 +6,19 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
+red() {
+    echo -e "${RED}$1${RESET}"
+}
+
+green() {
+    echo -e "${GREEN}$1${RESET}"
+}
+
+yellow() {
+    echo -e "${YELLOW}$1${RESET}"
+}
+
+
 # 默认自定义证书存放归档目录
 CUSTOM_SSL_BASE="/etc/nginx/custom_ssl"
 mkdir -p "$CUSTOM_SSL_BASE"
@@ -208,10 +221,10 @@ install_nginx() {
     systemctl daemon-reload
     systemctl enable --now nginx
     echo
-    echo -ne "${YELLOW}是否现在配置反向代理并申请证书？(Y/n,默认Y): ${RESET}"
+    echo -ne "${YELLOW}是否现在配置反向代理并申请证书？(y/n,默认y): ${RESET}"
     read CONFIRM
 
-    CONFIRM=${CONFIRM:-Y}
+    CONFIRM=${CONFIRM:-y}
     if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
         echo -e "${RED}已取消配置退出${RESET}"
         exit 0
@@ -239,7 +252,7 @@ install_nginx() {
     sort -u "$EMAIL_FILE" -o "$EMAIL_FILE"
     echo -ne "${GREEN}请输入域名: ${RESET}"; read DOMAIN
     check_domain_resolution "$DOMAIN"
-    echo -ne "${GREEN}请输入反代目标(例如http://127.0.0.1:5788): ${RESET}"; read TARGET
+    echo -ne "${GREEN}请输入反代目标(例如:http://127.0.0.1:5788): ${RESET}"; read TARGET
     echo -ne "${GREEN}是否为 WebSocket 反代? (y/n，默认 y): ${RESET}"; read IS_WS
     IS_WS=${IS_WS:-y}
 
@@ -262,7 +275,7 @@ add_config() {
     read DOMAIN
     check_domain_resolution "$DOMAIN"
 
-    echo -ne "${GREEN}请输入反代目标(例如http://127.0.0.1:5788): ${RESET}"
+    echo -ne "${GREEN}请输入反代目标(例如:http://127.0.0.1:5788): ${RESET}"
     read TARGET
 
     EMAIL_FILE="/etc/nginx/.cert_emails"
@@ -331,7 +344,7 @@ modify_config() {
 
     DOMAIN="${DOMAINS[$((choice-1))]}"
     CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
-    echo -ne "${GREEN}请输入新反代目标(例如http://127.0.0.1:5788): ${RESET}"; read TARGET
+    echo -ne "${GREEN}请输入新反代目标(例如:http://127.0.0.1:5788): ${RESET}"; read TARGET
     echo -ne "${GREEN}是否为 WebSocket 反代? (y/n，回车默认 y): ${RESET}"; read IS_WS
     IS_WS=${IS_WS:-y}
     echo -ne "${GREEN}请输入最大上传大小 (默认 200M): ${RESET}"
@@ -396,7 +409,7 @@ delete_config() {
     if grep -q "$CUSTOM_SSL_BASE" "$CONFIG_PATH"; then
         # 自定义证书站点清理
         rm -f "/etc/nginx/sites-available/$DOMAIN" "/etc/nginx/sites-enabled/$DOMAIN"
-        echo -ne "${YELLOW}是否同时删除本地自定义证书源文件？(y/N): ${RESET}"
+        echo -ne "${YELLOW}是否同时删除自定义证书源文件？(y/N): ${RESET}"
         read del_cust
         if [[ "$del_cust" =~ ^[Yy]$ ]]; then
             rm -rf "$CUSTOM_SSL_BASE/$DOMAIN"
@@ -470,8 +483,8 @@ test_renew() {
 
 check_cert() {
     # 合并查看托管证书与自定义证书
-    echo -e "${GREEN}1) 查看证书详细信息${RESET}"
-    echo -e "${GREEN}2) 查看自定义证书详细信息${RESET}"
+    echo -e "${GREEN}1) 查看Certbot托管证书${RESET}"
+    echo -e "${GREEN}2) 查看自定义证书${RESET}"
     echo -ne "${GREEN}请选择 [1-2]: ${RESET}"
     read c_choice
     if [ "$c_choice" == "1" ]; then
@@ -495,34 +508,57 @@ check_cert() {
 }
 
 check_domains_status() {
-    echo -e "${GREEN}%-22s %-10s %-15s %-10s${RESET}" "域名/IP" "类型" "到期时间" "剩余天数"
-    echo -e "${GREEN}------------------------------------------------------------${RESET}"
+    clear
+    echo -e "${YELLOW}========================================${RESET}"
+    echo -e "${YELLOW}        ◈ 域名证书状态实时监控 ◈          ${RESET}"
+    echo -e "${YELLOW}========================================${RESET}"
 
     CONFIG_DIR="/etc/nginx/sites-available"
+    local has_site=0
+
     if [ -d "$CONFIG_DIR" ]; then
         for DOMAIN in $(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort); do
             CONFIG_PATH="$CONFIG_DIR/$DOMAIN"
-            # 提取配置文件中的证书路径
             CERT_PATH=$(grep "ssl_certificate " "$CONFIG_PATH" | awk '{print $2}' | tr -d ';')
             
             if [ -f "$CERT_PATH" ]; then
-                TYPE="托管"
-                [[ "$CERT_PATH" =~ "$CUSTOM_SSL_BASE" ]] && TYPE="自定义"
+                has_site=1
+                TYPE="托管 (Certbot)"
+                [[ "$CERT_PATH" =~ "$CUSTOM_SSL_BASE" ]] && TYPE="自定义证书"
 
                 END_DATE=$(openssl x509 -enddate -noout -in "$CERT_PATH" | cut -d= -f2)
                 END_TS=$(date -d "$END_DATE" +%s)
                 NOW_TS=$(date +%s)
-                DAYS_LEFT=$(( (END_TS - now_ts) / 86400 ))
+                DAYS_LEFT=$(( (END_TS - NOW_TS) / 86400 ))
 
-                if [ $DAYS_LEFT -ge 30 ]; then STATUS="有效"
-                elif [ $DAYS_LEFT -ge 0 ]; then STATUS="即期"
-                else STATUS="已过期"; fi
+                # 动态颜色配置
+                if [ $DAYS_LEFT -ge 30 ]; then
+                    STATUS_COLOR="${GREEN}"
+                    STATUS_TEXT="正常有效"
+                elif [ $DAYS_LEFT -ge 0 ]; then
+                    STATUS_COLOR="${YELLOW}"
+                    STATUS_TEXT="即将过期 (请注意)"
+                else
+                    STATUS_COLOR="${RED}"
+                    STATUS_TEXT="已过期 (请立即更新)"
+                fi
 
-                printf "%-22s %-10s %-15s %d 天\n" \
-                    "$DOMAIN" "$TYPE" "$(date -d "$END_DATE" +"%Y-%m-%d")" "$DAYS_LEFT"
+                # 完美复刻你要求的树状美化排版
+                echo -e "${YELLOW}◈ 域名: ${RESET}${YELLOW}${DOMAIN}${RESET}"
+                echo -e "  ├─ ${YELLOW}证书类型: ${RESET}${TYPE}"
+                echo -e "  ├─ ${YELLOW}到期时间: ${RESET}$(date -d "$END_DATE" +"%Y-%m-%d")"
+                echo -e "  ├─ ${YELLOW}剩余天数: ${RESET}${STATUS_COLOR}${DAYS_LEFT} 天${RESET}"
+                echo -e "  └─ ${YELLOW}运行状态: ${RESET}${STATUS_COLOR}${STATUS_TEXT}${RESET}"
+                echo -e "${YELLOW}----------------------------------------${RESET}"
             fi
         done
     fi
+
+    if [ $has_site -eq 0 ]; then
+        echo -e "${RED} ❌ 当前系统未检测到任何反代站点配置。${RESET}"
+        echo -e "${YELLOW}----------------------------------------${RESET}"
+    fi
+
     pause
 }
 
@@ -545,7 +581,7 @@ add_custom_cert_config() {
     echo -ne "${GREEN}请输入您的自定义域名或公网IP: ${RESET}"; read DOMAIN
     [ -z "$DOMAIN" ] && return
 
-    echo -ne "${GREEN}请输入反代目标(如 http://127.0.0.1:8080): ${RESET}"; read TARGET
+    echo -ne "${GREEN}请输入反代目标(例如：http://127.0.0.1:8080): ${RESET}"; read TARGET
     echo -ne "${GREEN}是否为 WebSocket 反代? (y/n, 默认y): ${RESET}"; read IS_WS
     IS_WS=${IS_WS:-y}
     echo -ne "${GREEN}请输入最大上传大小 (默认 200M): ${RESET}"; read MAX_SIZE
@@ -573,18 +609,21 @@ add_custom_cert_config() {
     cp -f "$USER_CERT" "$DIR_PATH/fullchain.pem"
     cp -f "$USER_KEY" "$DIR_PATH/privkey.pem"
 
+    chmod 600 "$DIR_PATH/privkey.pem"
+    chmod 644 "$DIR_PATH/fullchain.pem"
+
     # 调用核心生成配置函数，传入特定路径参数
     generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE" "$DIR_PATH/fullchain.pem" "$DIR_PATH/privkey.pem"
     create_default_server
     
     if nginx -t; then
         systemctl reload nginx
-        echo -e "${GREEN}✅ 自定义证书反代站点 $DOMAIN 添加成功！${RESET}"
+        echo -e "${GREEN}✅ 自定义证书反代站点 https://$DOMAIN 添加成功！${RESET}"
     else
         echo -e "${RED}❌ Nginx 配置语法错误，已自动撤销软链接，请检查证书有效性。${RESET}"
         rm -f "/etc/nginx/sites-enabled/$DOMAIN"
     fi
-    
+
     pause
 
 
@@ -738,9 +777,9 @@ EOF
 
 emby_menu() {
     clear
-    echo -e "${GREEN}===== Emby 反向代理专项配置 =====${RESET}"
-    echo -e "${GREEN}1) 普通反代${RESET}"
-    echo -e "${GREEN}2) 主站+推流路径重定向${RESET}"
+    echo -e "${GREEN}===== Emby 反向代理配置 =====${RESET}"
+    echo -e "${GREEN}1) 普通反代(Certbot托管)${RESET}"
+    echo -e "${GREEN}2) 主站+推流路径重定向(Certbot托管)${RESET}"
     echo -e "${GREEN}3) 普通反代(自定义证书)${RESET}"
     echo -e "${GREEN}0) 返回主菜单${RESET}"
     echo -ne "${GREEN}请选择 [0-3]: ${RESET}"
@@ -750,7 +789,7 @@ emby_menu() {
         1)
             echo -ne "${GREEN}请输入您的域名: ${RESET}"; read DOMAIN
             check_domain_resolution "$DOMAIN"
-            echo -ne "${GREEN}请输入 Emby 地址 (例: https://emby.com): ${RESET}"; read TARGET
+            echo -ne "${GREEN}请输入Emby地址(例如: https://emby.com): ${RESET}"; read TARGET
             EMAIL=$(generate_random_email)
             certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
             generate_emby_normal_conf "$DOMAIN" "$TARGET"
@@ -759,8 +798,8 @@ emby_menu() {
         2)
             echo -ne "${GREEN}请输入您的域名: ${RESET}"; read DOMAIN
             check_domain_resolution "$DOMAIN"
-            echo -ne "${GREEN}请输入 Emby 主站地址: ${RESET}"; read T_MAIN
-            echo -ne "${GREEN}请输入推流后端地址: ${RESET}"; read T_STREAM
+            echo -ne "${GREEN}请输入Emby主站地址(例如: https://emby1.com): ${RESET}"; read T_MAIN
+            echo -ne "${GREEN}请输入推流后端地址(例如: https://emby2.com): ${RESET}"; read T_STREAM
             EMAIL=$(generate_random_email)
             certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
             generate_emby_stream_conf "$DOMAIN" "$T_MAIN" "$T_STREAM"
@@ -769,7 +808,7 @@ emby_menu() {
         3)
             echo -ne "${GREEN}请输入您的域名: ${RESET}"; read DOMAIN
             check_domain_resolution "$DOMAIN"
-            echo -ne "${GREEN}请输入 Emby 地址: ${RESET}"; read TARGET
+            echo -ne "${GREEN}请输入Emby地址(例如: https://emby.com): ${RESET}"; read TARGET
             local DIR_PATH="$CUSTOM_SSL_BASE/$DOMAIN"
             mkdir -p "$DIR_PATH"
             echo -ne "${GREEN}证书公钥(crt/pem)绝对路径: ${RESET}"; read USER_CERT
@@ -785,25 +824,91 @@ emby_menu() {
     esac
 }
 
+# ==========================================
+# Nginx 软件平滑更新与版本升级
+# ==========================================
+update_nginx_software() {
+    clear
+    echo -e "${YELLOW}========================================${RESET}"
+    echo -e "${YELLOW}        ◈ 正在执行 Nginx 软件版本升级 ◈    ${RESET}"
+    echo -e "${YELLOW}========================================${RESET}"
+
+    # 1. 检测当前版本
+    if ! command -v nginx >/dev/null 2>&1; then
+        echo -e "${RED}❌ 系统未安装 Nginx，无法更新。请先使用选项 1 安装。${RESET}"
+        pause && return
+    fi
+    local CURRENT_VER=$(nginx -v 2>&1 | awk -F/ '{print $2}')
+    echo -e "${GREEN}◈ 当前 Nginx 版本: ${RESET}${YELLOW}${CURRENT_VER}${RESET}"
+    echo -e "${YELLOW}----------------------------------------${RESET}"
+
+    echo -ne "${YELLOW}是否开始检查更新并平滑升级？(y/N): ${RESET}"
+    read up_choice
+    if [[ ! "$up_choice" =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}⏭ 已取消升级。${RESET}"
+        pause && return
+    fi
+
+    # 2. 备份核心配置
+    echo -e "${GREEN}  ├─ [1/3] 正在安全备份现有的反代配置与证书...${RESET}"
+    local BACKUP_DIR="/root/nginx_backup_$(date +%Y%m%d%H%M%S)"
+    mkdir -p "$BACKUP_DIR"
+    [ -d "/etc/nginx/sites-available" ] && cp -r /etc/nginx/sites-available "$BACKUP_DIR/" || true
+    [ -d "$CUSTOM_SSL_BASE" ] && cp -r "$CUSTOM_SSL_BASE" "$BACKUP_DIR/" || true
+    echo -e "${GREEN}  ├─ 备份成功，备份路径: ${BACKUP_DIR}${RESET}"
+
+    # 3. 执行 APT 升级
+    echo -e "${GREEN}  ├─ [2/3] 正在从系统源拉取最新 Nginx 软件包...${RESET}"
+    export DEBIAN_FRONTEND=noninteractive
+    apt update -y
+    
+    # 使用 force-confold 确保不覆盖用户改过的 nginx.conf 主配置
+    if apt install --only-upgrade -y \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        nginx nginx-common nginx-core; then
+        
+        # 4. 恢复与验证
+        echo -e "${GREEN}  ├─ [3/3] 正在还原配置并验证新版本服务...${RESET}"
+        # 兜底：如果更新意外导致目录丢失则还原
+        [ -d "$BACKUP_DIR/sites-available" ] && cp -r "$BACKUP_DIR/sites-available"/* /etc/nginx/sites-available/ || true
+        [ -d "$BACKUP_DIR/custom_ssl" ] && cp -r "$BACKUP_DIR/custom_ssl"/* "$CUSTOM_SSL_BASE/" || true
+        
+        systemctl daemon-reload
+        systemctl restart nginx || systemctl start nginx
+        
+        local NEW_VER=$(nginx -v 2>&1 | awk -F/ '{print $2}')
+        echo -e "${YELLOW}----------------------------------------${RESET}"
+        echo -e "${GREEN}✅ Nginx 软件升级完成！${RESET}"
+        echo -e "${GREEN}◈ 升级后版本: ${RESET}${GREEN}${NEW_VER}${RESET}"
+    else
+        echo -e "${RED}❌ 软件升级期间出现错误，正在尝试重启原服务...${RESET}"
+        systemctl start nginx || true
+    fi
+    echo -e "${YELLOW}========================================${RESET}"
+    pause
+}
+
 # ------------------------------
 # 主菜单
 # ------------------------------
 while true; do
     clear
-    echo -e "${GREEN}===== Nginx 管理菜单 =====${RESET}"
-    echo -e "${GREEN} 1) 安装Nginx${RESET}"
-    echo -e "${GREEN} 2) 添加配置${RESET}"
-    echo -e "${GREEN} 3) 添加配置(自定义证书)${RESET}"
-    echo -e "${GREEN} 4) 修改配置${RESET}"
-    echo -e "${GREEN} 5) 删除配置${RESET}"
-    echo -e "${GREEN} 6) 测试证书续期${RESET}"
-    echo -e "${GREEN} 7) 查看证书文件${RESET}"
-    echo -e "${GREEN} 8) 查看证书状态${RESET}"
-    echo -e "${GREEN} 9) Emby反代${RESET}"
-    echo -e "${GREEN}10) 重载Nginx配置${RESET}"
-    echo -e "${GREEN}11) 卸载Nginx${RESET}"
-    echo -e "${GREEN} 0) 退出${RESET}"
-    echo -ne "${GREEN} 请选择[0-11]:${RESET}"
+    echo -e "${GREEN}======= Nginx 管理菜单 =======${RESET}"
+    echo -e "${GREEN} 1. 安装Nginx${RESET}"
+    echo -e "${GREEN} 2. 添加配置(Certbot托管)${RESET}"
+    echo -e "${GREEN} 3. 添加配置(自定义证书)${RESET}"
+    echo -e "${GREEN} 4. 修改配置${RESET}"
+    echo -e "${GREEN} 5. 删除配置${RESET}"
+    echo -e "${GREEN} 6. 测试证书续期${RESET}"
+    echo -e "${GREEN} 7. 查看证书信息${RESET}"
+    echo -e "${GREEN} 8. 查看证书状态${RESET}"
+    echo -e "${GREEN} 9. Emby反代配置${RESET}"
+    echo -e "${GREEN}10. 重载Nginx配置${RESET}"
+    echo -e "${GREEN}11. 更新Nginx${RESET}"
+    echo -e "${GREEN}12. 卸载Nginx${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -ne "${GREEN} 请选择[0-12]:${RESET}"
     read choice
     case $choice in
         1) install_nginx ;;
@@ -816,7 +921,8 @@ while true; do
         8) check_domains_status ;;
         9) emby_menu ;;
         10) nginx -t && systemctl reload nginx && echo -e "${GREEN}Nginx 配置已重载成功${RESET}" || echo -e "${RED}配置检查失败，请修复后重试${RESET}"; pause ;;
-        11) uninstall_nginx ;;
+        11) update_nginx_software ;;
+        12) uninstall_nginx ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ; pause ;;
     esac

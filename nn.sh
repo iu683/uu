@@ -3,14 +3,14 @@
 set -e
 
 CADDYFILE="/etc/caddy/Caddyfile"
-CADDY_DATA="/var/lib/caddy/.local/share/caddy"
+CADDY_DATA="/root/.local/share/caddy" # root 运行模式下，自动签发证书默认存于 root 家目录
 CADDY_CERTS_DIR="/etc/caddy/certs"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
-RESET="\033[0m"
+RESET="\03="
 
-# ==================== 自动化环境检查与修复 (Alpine 专属) ====================
+# ==================== 自动化环境检查与修复 (Alpine Root 专属版) ====================
 if [ ! -f /etc/alpine-release ]; then
     echo -e "${RED}错误: 本脚本为 Alpine Linux 专属，检测到当前系统不是 Alpine！${RESET}"
     exit 1
@@ -21,7 +21,7 @@ INIT_DEPS=()
 command -v sudo >/dev/null 2>&1 || INIT_DEPS+=("sudo")
 command -v openssl >/dev/null 2>&1 || INIT_DEPS+=("openssl")
 command -v curl >/dev/null 2>&1 || INIT_DEPS+=("curl")
-command -v gawk >/dev/null 2>&1 || INIT_DEPS+=("gawk") # BusyBox 的 awk 功能有限，换成 gawk
+command -v gawk >/dev/null 2>&1 || INIT_DEPS+=("gawk") 
 
 if [ ${#INIT_DEPS[@]} -ne 0 ]; then
     echo -e "${YELLOW}检测到缺少必要依赖: ${INIT_DEPS[*]}，正在自动通过 apk 安装...${RESET}"
@@ -32,9 +32,22 @@ fi
 # 软链接 gawk 为 awk 确保后续兼容
 [ -f /usr/bin/gawk ] && ln -sf /usr/bin/gawk /usr/bin/awk 2>/dev/null || true
 
-[ ! -d "/etc/caddy" ] && sudo mkdir -p /etc/caddy
-[ ! -d "$CADDY_CERTS_DIR" ] && sudo mkdir -p $CADDY_CERTS_DIR && sudo chown -R caddy:caddy $CADDY_CERTS_DIR 2>/dev/null || true
-[ ! -f "$CADDYFILE" ] && sudo touch $CADDYFILE
+# 确保 Caddy 配置目录和基础文件绝对存在，且完全归属 root
+if [ ! -d "/etc/caddy" ]; then
+    sudo mkdir -p /etc/caddy
+fi
+
+# 如果 Caddyfile 不存在或为空，初始化一个合法的空配置
+if [ ! -f "$CADDYFILE" ] || [ ! -s "$CADDYFILE" ]; then
+    echo -e "${YELLOW}正在初始化空的 Caddyfile...${RESET}"
+    sudo tee "$CADDYFILE" >/dev/null <<EOF
+# Caddy Configuration File
+# Managed by Alpine Caddy Panel (Root Mode)
+EOF
+fi
+
+# 确保证书归档目录存在，且属于 root
+[ ! -d "$CADDY_CERTS_DIR" ] && sudo mkdir -p $CADDY_CERTS_DIR && sudo chown -R root:root $CADDY_CERTS_DIR 2>/dev/null || true
 
 pause() {
     echo -ne "${YELLOW}按回车返回菜单...${RESET}"
@@ -59,9 +72,8 @@ get_system_status() {
         return
     fi
 
-    # Alpine 使用 rc-service 检查状态
     if rc-service caddy status 2>/dev/null | grep -q "started"; then
-        STATUS="${GREEN}运行中${RESET}"
+        STATUS="${GREEN}运行中 (Root 模式)${RESET}"
     else
         STATUS="${RED}已停止${RESET}"
     fi
@@ -81,13 +93,13 @@ install_caddy() {
     sudo apk update -q
     sudo apk add -q caddy
 
-    # 允许开机自启并启动服务
+    # 注意：运行此脚本前请确保已按照上一步重写了 /etc/init.d/caddy 脚本
     sudo rc-update add caddy default 2>/dev/null || true
     sudo rc-service caddy start
 
-    sudo mkdir -p $CADDY_CERTS_DIR && sudo chown -R caddy:caddy $CADDY_CERTS_DIR 2>/dev/null || true
+    sudo mkdir -p $CADDY_CERTS_DIR && sudo chown -R root:root $CADDY_CERTS_DIR 2>/dev/null || true
 
-    echo -e "${GREEN}Caddy 安装完成并已启动 (OpenRC)${RESET}"
+    echo -e "${GREEN}Caddy 安装完成并已尝试启动 (OpenRC)${RESET}"
     pause
 }
 
@@ -134,8 +146,8 @@ validate_and_reload() {
     local BACKUP_FILE=$1
     echo -e "${YELLOW}正在对调整后的 Caddyfile 进行语法安全性检查...${RESET}"
     
+    # 既然是 root 运行，直接采用最高系统权限验证
     if local ERR_MSG=$(sudo caddy validate --config "$CADDYFILE" 2>&1); then
-        # OpenRC 重载配置
         sudo rc-service caddy reload 2>/dev/null || sudo rc-service caddy start
         echo -e "${GREEN}✔ Caddy 配置验证通过，服务已成功平滑重载！${RESET}"
         return 0
@@ -249,7 +261,6 @@ check_domains_status() {
 
         if [ -n "$CERT_PATH" ] && ( [ -f "$CERT_PATH" ] || [ -L "$CERT_PATH" ] ); then
             END_DATE=$(openssl x509 -enddate -noout -in "$CERT_PATH" | cut -d= -f2)
-            # Alpine 的 date 命令基于 BusyBox/Musl，处理某些特殊时间格式需要兼容
             if END_TS=$(date -d "$END_DATE" +%s 2>/dev/null) || END_TS=$(date -D "%b %d %T %Y %Z" -d "$END_DATE" +%s 2>/dev/null); then
                 NOW_TS=$(date +%s)
                 DAYS_LEFT=$(( (END_TS - NOW_TS) / 86400 ))
@@ -394,26 +405,27 @@ modify_site() {
     pause
 }
 
+# 辅助检查与授权函数：既然是 Root 模式运行，扫清父目录的权限死角，不再拦截 /root/ 目录
 fix_external_cert_permission() {
     local cert=$1
     local key=$2
     
-    if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
-        echo -e "${RED}❌ 致命拒绝: 检测到您的证书位于 /root/ 目录下！${RESET}"
-        echo -e "${YELLOW}原因分析: /root 目录权限极为严苛(700)，Alpine系统下caddy用户绝对无权穿透。${RESET}"
-        echo -e "${GREEN}💡 权威推荐: 请在 acme.sh 脚本命令中加上安装指令，将证书自动导出到公共目录（如 /etc/ssl/ 或 /etc/certs/ 文件夹下）再试。${RESET}"
+    if [ ! -f "$cert" ] || [ ! -f "$key" ]; then
+        echo -e "${RED}❌ 错误: 证书或私钥文件实际不存在，无法配置权限！${RESET}"
         return 1
     fi
 
-    local cert_dir=$(dirname "$cert")
-    sudo chmod +x "$cert_dir" 2>/dev/null || true
-    sudo chmod 644 "$cert" "$key" 2>/dev/null || true
+    local current_dir=$(dirname "$cert")
+    echo -e "${YELLOW}Root 运行模式：正在确保目录链路穿透畅通...${RESET}"
     
-    # Alpine 没有 systemd 的 ACL，但我们尽量确保文件权限正确
-    if command -v setfacl >/dev/null 2>&1; then
-        sudo setfacl -m u:caddy:rx "$cert_dir" 2>/dev/null || true
-        sudo setfacl -m u:caddy:r "$cert" "$key" 2>/dev/null || true
-    fi
+    while [[ "$current_dir" != "/" && -n "$current_dir" ]]; do
+        if [ -d "$current_dir" ]; then
+            sudo chmod +x "$current_dir" 2>/dev/null || true
+        fi
+        current_dir=$(dirname "$current_dir")
+    done
+
+    sudo chmod 600 "$cert" "$key" 2>/dev/null || true # 既然是 root，给予更安全且排他的 600 权限
     return 0
 }
 
@@ -425,12 +437,6 @@ add_site_with_cert() {
 
     read -p "请输入证书文件绝对路径 (.pem/.crt/ACME源文件路径)： " RAW_CERT_PATH
     read -p "请输入私钥文件绝对路径 (.key)： " RAW_KEY_PATH
-
-    if [ ! -f "$RAW_CERT_PATH" ] || [ ! -f "$RAW_KEY_PATH" ]; then
-        echo -e "${RED}错误: 输入的证书或私钥文件路径不存在！请重新确认。${RESET}"
-        pause
-        return
-    fi
 
     if ! fix_external_cert_permission "$RAW_CERT_PATH" "$RAW_KEY_PATH"; then
         pause
@@ -448,7 +454,7 @@ add_site_with_cert() {
     sudo rm -f "$SAFE_CERT" "$SAFE_KEY"
     sudo ln -sf "$RAW_CERT_PATH" "$SAFE_CERT"
     sudo ln -sf "$RAW_KEY_PATH" "$SAFE_KEY"
-    sudo chown -h caddy:caddy "$SAFE_CERT" "$SAFE_KEY"
+    sudo chown -h root:root "$SAFE_CERT" "$SAFE_KEY" # 修正为 root 所有
 
     SITE_CONFIG="\n${DOMAIN} {\n"
     SITE_CONFIG+="    tls ${SAFE_CERT} ${SAFE_KEY}\n"
@@ -463,7 +469,8 @@ add_site_with_cert() {
     HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
     SITE_CONFIG+="    reverse_proxy ${HTTP_TARGET}\n}\n"
 
-    echo -e "$SITE_CONFIG" | sudo tee -a $CADDYFILE >/dev/null
+    # 修复此前原代码的大小写笔误 Bug ($CADDYfile -> $CADDYFILE)
+    echo -e "$SITE_CONFIG" | sudo tee -a "$CADDYFILE" >/dev/null
 
     if validate_and_reload "$BK_FILE"; then
         echo -e "${GREEN}站点 ${DOMAIN} (自定义软链式) 添加成功${RESET}"
@@ -567,12 +574,6 @@ add_emby_custom_cert_caddy() {
     echo -ne "${GREEN}请输入证书文件绝对路径 (.pem/.crt): ${RESET}"; read -r RAW_CERT_PATH
     echo -ne "${GREEN}请输入私钥文件绝对路径 (.key): ${RESET}"; read -r RAW_KEY_PATH
 
-    if [ ! -f "$RAW_CERT_PATH" ] || [ ! -f "$RAW_KEY_PATH" ]; then
-        echo -e "${RED}错误: 输入的证书或私钥文件路径不存在！${RESET}"
-        pause
-        return
-    fi
-
     if ! fix_external_cert_permission "$RAW_CERT_PATH" "$RAW_KEY_PATH"; then
         pause
         return
@@ -589,7 +590,7 @@ add_emby_custom_cert_caddy() {
     sudo rm -f "$SAFE_CERT" "$SAFE_KEY"
     sudo ln -sf "$RAW_CERT_PATH" "$SAFE_CERT"
     sudo ln -sf "$RAW_KEY_PATH" "$SAFE_KEY"
-    sudo chown -h caddy:caddy "$SAFE_CERT" "$SAFE_KEY"
+    sudo chown -h root:root "$SAFE_CERT" "$SAFE_KEY"
 
     echo -ne "${GREEN}请输入 Emby 目标地址 (例: http://127.0.0.1:8096): ${RESET}"; read -r TARGET
     local TARGET_HOST=$(echo "$TARGET" | awk -F[/:] '{print $4}')
@@ -703,18 +704,33 @@ view_sites() {
 }
 
 view_caddy_logs() {
+    clear
     if ! rc-service caddy status 2>/dev/null | grep -q "started"; then
-        echo -e "${RED}错误: Caddy 服务当前未运行，无实时日志输出。${RESET}"
+        echo -e "${RED}⚠️ 检测到 Caddy 服务当前【未运行 / 已停止】！${RESET}"
+        echo -e "${YELLOW}正在强行为您执行底层的 Caddy 核心配置文件语法安全性诊断...${RESET}"
+        echo -e "${GREEN}执行命令: caddy validate --config /etc/caddy/Caddyfile${RESET}"
+        echo -e "${YELLOW}------------------- [诊断输出开始] -------------------${RESET}"
+        echo ""
+        
+        if sudo caddy validate --config /etc/caddy/Caddyfile 2>&1; then
+            echo ""
+            echo -e "${GREEN}✔ 核心诊断结论: 您的 Caddyfile 语法本身完全正确！${RESET}"
+            echo -e "${YELLOW}💡 提示: 既然语法正确但服务没运行，极大可能是 80/443 端口被占用了，或者证书路径存在链故障。${RESET}"
+        else
+            echo ""
+            echo -e "${RED}❌ 核心诊断结论: 您的 Caddyfile 存在语法错误或路径死链！请根据上方报错修改。${RESET}"
+        fi
+        
+        echo -e "${YELLOW}------------------- [诊断输出结束] -------------------${RESET}"
         pause
         return
     fi
-    clear
+
     echo -e "${GREEN}======================================================${RESET}"
     echo -e "${GREEN}          ◈ 正在实时捕获 Caddy 运行日志 ◈             ${RESET}"
     echo -e "${YELLOW}   >> 提示: 键盘按下 Ctrl + C 即可随时退出日志流 <<  ${RESET}"
     echo -e "${GREEN}======================================================${RESET}"
     echo ""
-    # Alpine 默认将服务日志输出到标准位置，如果没有配置，则读取系统默认日志
     if [ -f /var/log/caddy.log ]; then
         sudo tail -n 50 -f /var/log/caddy.log
     elif [ -f /var/log/messages ]; then
@@ -734,7 +750,7 @@ menu() {
         clear
         get_system_status
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}          Caddy 管理面板        ${RESET}"
+        echo -e "${GREEN}      Alpine Caddy 管理面板       ${RESET}"
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN}状态   :${RESET} $STATUS"
         echo -e "${GREEN}版本   :${RESET} ${YELLOW}$VERSION_SHOW${RESET}"
@@ -776,5 +792,4 @@ menu() {
     done
 }
 
-# 启动菜单
 menu

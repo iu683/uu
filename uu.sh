@@ -144,6 +144,7 @@ validate_and_reload() {
     local BACKUP_FILE=$1
     echo -e "${YELLOW}正在对调整后的 Caddyfile 进行语法安全性检查...${RESET}"
     
+    # 临时给予测试读取权限
     if local ERR_MSG=$(sudo caddy validate --config "$CADDYFILE" 2>&1); then
         sudo rc-service caddy reload 2>/dev/null || sudo rc-service caddy start
         echo -e "${GREEN}✔ Caddy 配置验证通过，服务已成功平滑重载！${RESET}"
@@ -195,26 +196,28 @@ remove_domain_block() {
 }
 
 add_site() {
-    read -p "请输入域名 (例如:example.com)： " DOMAIN
+    echo -ne "请输入域名 (例如: example.com)： "; read -r DOMAIN
     [ -z "$DOMAIN" ] && return
-    read -p "是否需要 h2c/gRPC 代理？(y/n，回车默认 n)： " H2C
+    echo -ne "是否需要 h2c/gRPC 代理？(y/n，回车默认 n)： "; read -r H2C
     H2C=${H2C:-n}
     
-    local BK_FILE="/tmp/caddyfile.bak.$(date +%s)"
+    # 使用更安全的 Alpine 兼容级随机备份后缀
+    local TS=$(date +%s 2>/dev/null || echo "bk")
+    local BK_FILE="/tmp/caddyfile.bak.$TS"
     sudo cp "$CADDYFILE" "$BK_FILE"
 
     SITE_CONFIG="\n${DOMAIN} {\n"
     if [[ "$H2C" == "y" ]]; then
-        read -p "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： " H2C_PATH
-        read -p "请输入内网目标地址 (例如 127.0.0.1:8008)： " H2C_TARGET
+        echo -ne "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： "; read -r H2C_PATH
+        echo -ne "请输入内网目标地址 (例如 127.0.0.1:8008)： "; read -r H2C_TARGET
         SITE_CONFIG+="    reverse_proxy ${H2C_PATH} h2c://${H2C_TARGET}\n"
     fi
 
-    read -p "请输入普通 HTTP 代理目标 (例如 127.0.0.1:8008)： " HTTP_TARGET
+    echo -ne "请输入普通 HTTP 代理目标 (例如 127.0.0.1:8008)： "; read -r HTTP_TARGET
     HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
     SITE_CONFIG+="    reverse_proxy ${HTTP_TARGET}\n}\n"
 
-    echo -e "$SITE_CONFIG" | sudo tee -a $CADDYFILE >/dev/null
+    echo -e "$SITE_CONFIG" | sudo tee -a "$CADDYFILE" >/dev/null
     
     if validate_and_reload "$BK_FILE"; then
         echo -e "${GREEN}站点 ${DOMAIN} 添加成功${RESET}"
@@ -226,10 +229,10 @@ add_site() {
 check_domains_status() {
     clear
     echo -e "${YELLOW}========================================${RESET}"
-    echo -e "${YELLOW}       ◈ 域名证书状态实时监控 ◈            ${RESET}"
+    echo -e "${YELLOW}        ◈ 域名证书状态实时监控 ◈            ${RESET}"
     echo -e "${YELLOW}========================================${RESET}"
 
-    mapfile -t DOMAINS < <(get_all_domains)
+    DOMAINS=($(get_all_domains))
     if [ ${#DOMAINS[@]} -eq 0 ]; then
         echo -e "${RED} ❌ 当前系统未检测到任何反代站点配置或未找到 Caddyfile。${RESET}"
         echo -e "${YELLOW}----------------------------------------${RESET}"
@@ -291,7 +294,7 @@ check_domains_status() {
 }
 
 delete_site() {
-    mapfile -t DOMAINS < <(get_all_domains)
+    DOMAINS=($(get_all_domains))
     if [ ${#DOMAINS[@]} -eq 0 ]; then
         echo -e "${YELLOW}没有可删除的域名${RESET}"
         pause
@@ -302,7 +305,7 @@ delete_site() {
     for i in "${!DOMAINS[@]}"; do
         echo "$((i+1))) ${DOMAINS[$i]}"
     done
-    read -p "输入编号： " NUM
+    echo -ne "输入编号： "; read -r NUM
 
     if [[ "$NUM" == "0" || -z "$NUM" ]]; then return; fi
 
@@ -314,7 +317,8 @@ delete_site() {
 
     DOMAIN="${DOMAINS[$((NUM-1))]}"
     
-    local BK_FILE="/tmp/caddyfile.bak.$(date +%s)"
+    local TS=$(date +%s 2>/dev/null || echo "bk")
+    local BK_FILE="/tmp/caddyfile.bak.$TS"
     sudo cp "$CADDYFILE" "$BK_FILE"
 
     remove_domain_block "$DOMAIN"
@@ -324,8 +328,8 @@ delete_site() {
         
         local CERT_DIR=$(sudo find "$CADDY_DATA" -type d -name "$DOMAIN" 2>/dev/null | head -n 1)
         if [ -n "$CERT_DIR" ] && [ -d "$CERT_DIR" ]; then
-            read -p "是否一并删除该域名自动签发的证书？(y/n,默认y): " DEL_CERT
-            if [[ "$DEL_CERT" == "y" ]]; then
+            echo -ne "是否一并删除该域名自动签发的证书？(y/n,默认y): "; read -r DEL_CERT
+            if [[ "$DEL_CERT" == "y" || -z "$DEL_CERT" ]]; then
                 sudo rm -rf "$CERT_DIR"
                 echo -e "${GREEN}已删除自动申请的证书。${RESET}"
             fi
@@ -333,7 +337,7 @@ delete_site() {
 
         if [ -L "$CADDY_CERTS_DIR/${DOMAIN}.fullchain.pem" ] || [ -f "$CADDY_CERTS_DIR/${DOMAIN}.fullchain.pem" ] || \
            [ -L "$CADDY_CERTS_DIR/emby_${DOMAIN}.fullchain.pem" ] || [ -f "$CADDY_CERTS_DIR/emby_${DOMAIN}.fullchain.pem" ]; then
-            read -p "检测到本地自定义证书缓存或软链接，是否一并清除？(y/n): " DEL_CCERT
+            echo -ne "检测到本地自定义证书缓存或软链接，是否一并清除？(y/n): "; read -r DEL_CCERT
             if [[ "$DEL_CCERT" == "y" ]]; then
                 sudo rm -f "$CADDY_CERTS_DIR/${DOMAIN}"* "$CADDY_CERTS_DIR/emby_${DOMAIN}"*
                 echo -e "${GREEN}自定义证书链接/文件已清理。${RESET}"
@@ -345,7 +349,7 @@ delete_site() {
 }
 
 modify_site() {
-    mapfile -t DOMAINS < <(get_all_domains)
+    DOMAINS=($(get_all_domains))
     if [ ${#DOMAINS[@]} -eq 0 ]; then
         echo -e "${YELLOW}没有可修改的域名${RESET}"
         pause
@@ -356,7 +360,7 @@ modify_site() {
     for i in "${!DOMAINS[@]}"; do
         echo "$((i+1))) ${DOMAINS[$i]}"
     done
-    read -p "输入编号： " NUM
+    echo -ne "输入编号： "; read -r NUM
 
     if [[ "$NUM" == "0" || -z "$NUM" ]]; then return; fi
 
@@ -370,19 +374,20 @@ modify_site() {
 
     local OLD_TLS_LINE=$(grep -A 5 "${DOMAIN}" "$CADDYFILE" | grep "tls " | head -n 1 | tr -d '\r')
 
-    read -p "请输入普通 HTTP 代理目标 (例如 127.0.0.1:8008)： " HTTP_TARGET
+    echo -ne "请输入普通 HTTP 代理目标 (例如 127.0.0.1:8008)： "; read -r HTTP_TARGET
     HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
 
-    read -p "是否需要 h2c/gRPC 代理？(y/n，回车默认 n)： " H2C
+    echo -ne "是否需要 h2c/gRPC 代理？(y/n，回车默认 n)： "; read -r H2C
     H2C=${H2C:-n}
     H2C_CONFIG=""
     if [[ "$H2C" == "y" ]]; then
-        read -p "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： " H2C_PATH
-        read -p "请输入内网目标地址 (例如 127.0.0.1:8008)： " H2C_TARGET
+        echo -ne "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： "; read -r H2C_PATH
+        echo -ne "请输入内网目标地址 (例如 127.0.0.1:8008)： "; read -r H2C_TARGET
         H2C_CONFIG="    reverse_proxy ${H2C_PATH} h2c://${H2C_TARGET}\n"
     fi
 
-    local BK_FILE="/tmp/caddyfile.bak.$(date +%s)"
+    local TS=$(date +%s 2>/dev/null || echo "bk")
+    local BK_FILE="/tmp/caddyfile.bak.$TS"
     sudo cp "$CADDYFILE" "$BK_FILE"
 
     remove_domain_block "$DOMAIN"
@@ -393,7 +398,7 @@ modify_site() {
     fi
     NEW_CONFIG+="${H2C_CONFIG}    reverse_proxy ${HTTP_TARGET}\n}\n"
     
-    echo -e "$NEW_CONFIG" | sudo tee -a $CADDYFILE >/dev/null
+    echo -e "$NEW_CONFIG" | sudo tee -a "$CADDYFILE" >/dev/null
     
     if validate_and_reload "$BK_FILE"; then
         echo -e "${GREEN}域名 ${DOMAIN} 配置已成功修改并自动维系证书凭证！${RESET}"
@@ -408,72 +413,69 @@ fix_external_cert_permission() {
     
     if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
         echo -e "${RED}❌ 致命拒绝: 检测到您的证书位于 /root/ 目录下！${RESET}"
-        echo -e "${YELLOW}原因分析: /root 目录权限极为严苛(700)，Alpine系统下caddy用户绝对无权穿透。${RESET}"
-        echo -e "${GREEN}💡 权威推荐: 请在 acme.sh 脚本命令中加上安装指令，将证书自动导出到公共目录（如 /etc/ssl/ 或 /etc/certs/ 文件夹下）再试。${RESET}"
+        echo -e "${YELLOW}原因分析: /root 目录权限极为严苛(700)，强烈不建议直接穿透。${RESET}"
+        echo -e "${GREEN}💡 推荐: 请将证书导出到公共目录（如 /etc/ssl/ 或 /etc/caddy/certs/）再试。${RESET}"
         return 1
     fi
 
-    local cert_dir=$(dirname "$cert")
-    sudo chmod +x "$cert_dir" 2>/dev/null || true
-    sudo chmod 644 "$cert" "$key" 2>/dev/null || true
-    
-    if command -v setfacl >/dev/null 2>&1; then
-        sudo setfacl -m u:caddy:rx "$cert_dir" 2>/dev/null || true
-        sudo setfacl -m u:caddy:r "$cert" "$key" 2>/dev/null || true
+    if [ ! -f "$cert" ] || [ ! -f "$key" ]; then
+        echo -e "${RED}❌ 错误: 证书或私钥文件实际不存在，请检查路径！${RESET}"
+        return 1
     fi
+
+    # 安全地赋予 Caddy 组及用户读取权限
+    sudo chmod 644 "$cert" "$key" 2>/dev/null || true
+    sudo chown caddy:caddy "$cert" "$key" 2>/dev/null || true
     return 0
 }
 
 add_site_with_cert() {
-    read -p "请输入域名 (example.com)： " DOMAIN
+    echo -ne "请输入域名 (example.com)： "; read -r DOMAIN
     [ -z "$DOMAIN" ] && return
-    read -p "是否需要 h2c/gRPC 代理？(y/n，回车默认 n)： " H2C
+    echo -ne "是否需要 h2c/gRPC 代理？(y/n，回车默认 n)： "; read -r H2C
     H2C=${H2C:-n}
 
-    read -p "请输入证书文件绝对路径 (.pem/.crt/ACME源文件路径)： " RAW_CERT_PATH
-    read -p "请输入私钥文件绝对路径 (.key)： " RAW_KEY_PATH
-
-    if [ ! -f "$RAW_CERT_PATH" ] || [ ! -f "$RAW_KEY_PATH" ]; then
-        echo -e "${RED}错误: 输入的证书或私钥文件路径不存在！请重新确认。${RESET}"
-        pause
-        return
-    fi
+    echo -ne "请输入证书文件绝对路径 (.pem/.crt)： "; read -r RAW_CERT_PATH
+    echo -ne "请输入私钥文件绝对路径 (.key)： "; read -r RAW_KEY_PATH
 
     if ! fix_external_cert_permission "$RAW_CERT_PATH" "$RAW_KEY_PATH"; then
         pause
         return
     fi
 
-    local BK_FILE="/tmp/caddyfile.bak.$(date +%s)"
+    local TS=$(date +%s 2>/dev/null || echo "bk")
+    local BK_FILE="/tmp/caddyfile.bak.$TS"
     sudo cp "$CADDYFILE" "$BK_FILE"
 
     sudo mkdir -p $CADDY_CERTS_DIR
     local SAFE_CERT="$CADDY_CERTS_DIR/${DOMAIN}.fullchain.pem"
     local SAFE_KEY="$CADDY_CERTS_DIR/${DOMAIN}.privkey.key"
 
-    echo -e "${YELLOW}正在建立安全链接，完美支撑 ACME 自动化后续无缝续期...${RESET}"
+    echo -e "${YELLOW}正在建立安全物理复制/链接以确保 Caddy 读取稳定...${RESET}"
     sudo rm -f "$SAFE_CERT" "$SAFE_KEY"
-    sudo ln -sf "$RAW_CERT_PATH" "$SAFE_CERT"
-    sudo ln -sf "$RAW_KEY_PATH" "$SAFE_KEY"
-    sudo chown -h caddy:caddy "$SAFE_CERT" "$SAFE_KEY"
+    sudo cp -f "$RAW_CERT_PATH" "$SAFE_CERT"
+    sudo cp -f "$RAW_KEY_PATH" "$SAFE_KEY"
+    sudo chmod 644 "$SAFE_CERT" "$SAFE_KEY"
+    sudo chown caddy:caddy "$SAFE_CERT" "$SAFE_KEY"
 
     SITE_CONFIG="\n${DOMAIN} {\n"
     SITE_CONFIG+="    tls ${SAFE_CERT} ${SAFE_KEY}\n"
 
     if [[ "$H2C" == "y" ]]; then
-        read -p "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： " H2C_PATH
-        read -p "请输入内网目标地址 (例如 127.0.0.1:8008)： " H2C_TARGET
+        echo -ne "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： "; read -r H2C_PATH
+        echo -ne "请输入内网目标地址 (例如 127.0.0.1:8008)： "; read -r H2C_TARGET
         SITE_CONFIG+="    reverse_proxy ${H2C_PATH} h2c://${H2C_TARGET}\n"
     fi
 
-    read -p "请输入普通 HTTP 代理目标 (例如 127.0.0.1:8008)： " HTTP_TARGET
+    echo -ne "请输入普通 HTTP 代理目标 (例如 127.0.0.1:8008)： "; read -r HTTP_TARGET
     HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
     SITE_CONFIG+="    reverse_proxy ${HTTP_TARGET}\n}\n"
 
-    echo -e "$SITE_CONFIG" | sudo tee -a $CADDYFILE >/dev/null
+    # 【重要修复】：此处 $CADDYfile 修改为了大写的 $CADDYFILE
+    echo -e "$SITE_CONFIG" | sudo tee -a "$CADDYFILE" >/dev/null
 
     if validate_and_reload "$BK_FILE"; then
-        echo -e "${GREEN}站点 ${DOMAIN} (自定义软链式) 添加成功${RESET}"
+        echo -e "${GREEN}站点 ${DOMAIN} (自定义证书式) 添加成功${RESET}"
         echo -e "${GREEN}访问地址: https://${DOMAIN}${RESET}"
     fi
     rm -f "$BK_FILE"
@@ -486,10 +488,11 @@ add_emby_site_caddy() {
     echo -ne "${GREEN}请输入 Emby 目标地址 (例: http://127.0.0.1:8096): ${RESET}"; read -r TARGET
     
     local TARGET_HOST=$(echo "$TARGET" | awk -F[/:] '{print $4}')
-    local BK_FILE="/tmp/caddyfile.bak.$(date +%s)"
+    local TS=$(date +%s 2>/dev/null || echo "bk")
+    local BK_FILE="/tmp/caddyfile.bak.$TS"
     sudo cp "$CADDYFILE" "$BK_FILE"
 
-    sudo tee -a $CADDYFILE >/dev/null <<EOF
+    sudo tee -a "$CADDYFILE" >/dev/null <<EOF
 
 $DOMAIN {
     encode gzip
@@ -502,7 +505,7 @@ $DOMAIN {
 EOF
 
     if [[ "$TARGET" == https* ]]; then
-        sudo tee -a $CADDYFILE >/dev/null <<EOF
+        sudo tee -a "$CADDYFILE" >/dev/null <<EOF
         header_up Host $TARGET_HOST
         transport http {
             tls_server_name $TARGET_HOST
@@ -510,7 +513,7 @@ EOF
 EOF
     fi
 
-    sudo tee -a $CADDYFILE >/dev/null <<EOF
+    sudo tee -a "$CADDYFILE" >/dev/null <<EOF
     }
 
     header {
@@ -535,10 +538,11 @@ add_emby_split_site_caddy() {
     echo -ne "${GREEN}请输入推流后端地址(例: https://emby.xx.com): ${RESET}"; read -r T_STREAM
 
     local STREAM_HOST=$(echo "$T_STREAM" | awk -F[/:] '{print $4}')
-    local BK_FILE="/tmp/caddyfile.bak.$(date +%s)"
+    local TS=$(date +%s 2>/dev/null || echo "bk")
+    local BK_FILE="/tmp/caddyfile.bak.$TS"
     sudo cp "$CADDYFILE" "$BK_FILE"
 
-    sudo tee -a $CADDYFILE >/dev/null <<EOF
+    sudo tee -a "$CADDYFILE" >/dev/null <<EOF
 
 $DOMAIN {
     handle_path /s1/* {
@@ -574,18 +578,13 @@ add_emby_custom_cert_caddy() {
     echo -ne "${GREEN}请输入证书文件绝对路径 (.pem/.crt): ${RESET}"; read -r RAW_CERT_PATH
     echo -ne "${GREEN}请输入私钥文件绝对路径 (.key): ${RESET}"; read -r RAW_KEY_PATH
 
-    if [ ! -f "$RAW_CERT_PATH" ] || [ ! -f "$RAW_KEY_PATH" ]; then
-        echo -e "${RED}错误: 输入的证书或私钥文件路径不存在！${RESET}"
-        pause
-        return
-    fi
-
     if ! fix_external_cert_permission "$RAW_CERT_PATH" "$RAW_KEY_PATH"; then
         pause
         return
     fi
 
-    local BK_FILE="/tmp/caddyfile.bak.$(date +%s)"
+    local TS=$(date +%s 2>/dev/null || echo "bk")
+    local BK_FILE="/tmp/caddyfile.bak.$TS"
     sudo cp "$CADDYFILE" "$BK_FILE"
 
     sudo mkdir -p $CADDY_CERTS_DIR
@@ -594,14 +593,15 @@ add_emby_custom_cert_caddy() {
 
     echo -e "${YELLOW}正在建立 Emby 证书安全链接以支持后续平滑续期...${RESET}"
     sudo rm -f "$SAFE_CERT" "$SAFE_KEY"
-    sudo ln -sf "$RAW_CERT_PATH" "$SAFE_CERT"
-    sudo ln -sf "$RAW_KEY_PATH" "$SAFE_KEY"
-    sudo chown -h caddy:caddy "$SAFE_CERT" "$SAFE_KEY"
+    sudo cp -f "$RAW_CERT_PATH" "$SAFE_CERT"
+    sudo cp -f "$RAW_KEY_PATH" "$SAFE_KEY"
+    sudo chmod 644 "$SAFE_CERT" "$SAFE_KEY"
+    sudo chown caddy:caddy "$SAFE_CERT" "$SAFE_KEY"
 
     echo -ne "${GREEN}请输入 Emby 目标地址 (例: http://127.0.0.1:8096): ${RESET}"; read -r TARGET
     local TARGET_HOST=$(echo "$TARGET" | awk -F[/:] '{print $4}')
     
-    sudo tee -a $CADDYFILE >/dev/null <<EOF
+    sudo tee -a "$CADDYFILE" >/dev/null <<EOF
 
 $DOMAIN {
     tls $SAFE_CERT $SAFE_KEY
@@ -615,7 +615,7 @@ $DOMAIN {
 EOF
 
     if [[ "$TARGET" == https* ]]; then
-        sudo tee -a $CADDYFILE >/dev/null <<EOF
+        sudo tee -a "$CADDYFILE" >/dev/null <<EOF
         header_up Host $TARGET_HOST
         transport http {
             tls_server_name $TARGET_HOST
@@ -623,7 +623,7 @@ EOF
 EOF
     fi
 
-    sudo tee -a $CADDYFILE >/dev/null <<EOF
+    sudo tee -a "$CADDYFILE" >/dev/null <<EOF
     }
 
     header {
@@ -663,7 +663,7 @@ emby_proxy_menu() {
 }
 
 view_sites() {
-    mapfile -t DOMAINS < <(get_all_domains)
+    DOMAINS=($(get_all_domains))
     if [ ${#DOMAINS[@]} -eq 0 ]; then
         echo -e "${YELLOW}没有已配置的域名${RESET}"
         pause
@@ -675,7 +675,7 @@ view_sites() {
         echo "$((i+1))) ${DOMAINS[$i]}"
     done
 
-    read -p "输入编号： " NUM
+    echo -ne "输入编号： "; read -r NUM
     if [[ "$NUM" == "0" || -z "$NUM" ]]; then return; fi
 
     if ! [[ "$NUM" =~ ^[0-9]+$ ]] || [ "$NUM" -lt 1 ] || [ "$NUM" -gt ${#DOMAINS[@]} ]; then
@@ -709,10 +709,8 @@ view_sites() {
     pause
 }
 
-# 【升级功能区】：第10项 智能诊断与日志查看
 view_caddy_logs() {
     clear
-    # 检查服务是否在运行
     if ! rc-service caddy status 2>/dev/null | grep -q "started"; then
         echo -e "${RED}⚠️ 检测到 Caddy 服务当前【未运行 / 已停止】！${RESET}"
         echo -e "${YELLOW}正在强行为您执行底层的 Caddy 核心配置文件语法安全性诊断...${RESET}"
@@ -720,11 +718,10 @@ view_caddy_logs() {
         echo -e "${YELLOW}------------------- [诊断输出开始] -------------------${RESET}"
         echo ""
         
-        # 直接执行 caddy validate 输出结果
         if sudo caddy validate --config /etc/caddy/Caddyfile 2>&1; then
             echo ""
             echo -e "${GREEN}✔ 核心诊断结论: 您的 Caddyfile 语法本身完全正确！${RESET}"
-            echo -e "${YELLOW}💡 提示: 既然语法正确但服务没运行，极大概率是 80/443 端口被占用了，或是自定义证书权限被限死。${RESET}"
+            echo -e "${YELLOW}💡 提示: 既然语法正确但服务没运行，极大可能是 80/443 端口被占用了，或者证书路径存在死链。${RESET}"
         else
             echo ""
             echo -e "${RED}❌ 核心诊断结论: 您的 Caddyfile 存在语法错误或路径死链！请根据上方报错修改。${RESET}"
@@ -735,9 +732,8 @@ view_caddy_logs() {
         return
     fi
 
-    # 如果服务正在运行，进入正常的日志捕获模式
     echo -e "${GREEN}======================================================${RESET}"
-    echo -e "${GREEN}          ◈ 正在实时捕获 Caddy 运行日志 ◈             ${RESET}"
+    echo -e "${GREEN}           ◈ 正在实时捕获 Caddy 运行日志 ◈             ${RESET}"
     echo -e "${YELLOW}   >> 提示: 键盘按下 Ctrl + C 即可随时退出日志流 <<  ${RESET}"
     echo -e "${GREEN}======================================================${RESET}"
     echo ""

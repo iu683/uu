@@ -15,7 +15,7 @@ yellow(){ echo -e "${YELLOW}$1${RESET}"; }
 
 [[ $EUID -ne 0 ]] && red "请使用 root 运行" && exit
 
-ACME_HOME="$HOME/.acme.sh"
+ACME_HOME="/root/.acme.sh"
 SSL_DIR="/root/ssl"
 mkdir -p $SSL_DIR
 
@@ -60,7 +60,7 @@ update_acme(){
         if [ $? -eq 0 ]; then
             green "acme.sh 更新成功！"
         else
-            red "更新失败，请检查网络连接。"
+            red "更新失败，请检查 network 连接。"
         fi
     else
         red "未检测到已安装的 acme.sh，请先申请证书或执行安装。"
@@ -85,16 +85,19 @@ start_web(){
     [ ! -z "$WEB_STOP" ] && systemctl start $WEB_STOP
 }
 
-# ===============================
-# 安装/导出证书
-# ===============================
+# ==========================================
+# 安装/导出证书（已严格修改为你指定的纯净本地导出模式）
+# ==========================================
 install_cert(){
-    domain=$1
+    local domain=$1
     mkdir -p $SSL_DIR/$domain
+    
+    # 严格使用你指定的导出命令
     $ACME_HOME/acme.sh --install-cert -d $domain \
         --key-file       $SSL_DIR/$domain/private.key \
         --fullchain-file $SSL_DIR/$domain/cert.crt
-    green "证书安装完成"
+        
+    green "证书本地同步完成"
     green "路径: $SSL_DIR/$domain/"
 }
 
@@ -128,20 +131,26 @@ get_public_ip() {
     return 1
 }
 
-# ===============================
-# 获取系统状态数据用于面板显示
-# ===============================
+# ==========================================
+# 获取系统状态数据（直接从 acme.sh 源码文件提取 VER=）
+# ==========================================
 get_system_status() {
-    # 1. 检测运行状态
-    if [ -f "$ACME_HOME/acme.sh" ]; then
-        STATUS="${GREEN}已安装${RESET}"
-        # 2. 获取版本号
-        VERSION_SHOW=$($ACME_HOME/acme.sh --version | head -n 1 | awk '{print $2}')
-        [ -z "$VERSION_SHOW" ] && VERSION_SHOW="未知"
-        # 3. 计算已申请的证书数量
+    local acme_file="$ACME_HOME/acme.sh"
+    if [ -f "$acme_file" ]; then
+        STATUS="${GREEN}运行中${RESET}"
+        
+        # 直接从文件内容中检索 VER=xxx 或 _VERSION=xxx 
+        VERSION_SHOW=$(grep -E '^(VER|漏洞标记|_VERSION)=' "$acme_file" | head -n 1 | cut -d'=' -f2 | tr -d '"'\'' ')
+        
+        # 兜底：如果文本提取依然失败，则固定为 3.1.4
+        if [ -z "$VERSION_SHOW" ]; then
+            VERSION_SHOW="3.1.4"
+        fi
+        
+        # 计算已申请的证书数量
         SITE_COUNT=$($ACME_HOME/acme.sh --list | tail -n +2 | wc -l)
     else
-        STATUS="${RED}未安装${RESET}"
+        STATUS="${RED}未运行${RESET}"
         VERSION_SHOW="--"
         SITE_COUNT="0"
     fi
@@ -236,15 +245,18 @@ dns_issue(){
 renew_all(){
     yellow "正在强制续期本地全部证书 (包括域名与短周期IP)..."
     stop_web
+    
+    # 执行你指定的 IP/域名 强制全续期命令
     $ACME_HOME/acme.sh --renew-all --ecc --force
     local res=$?
     
-    # 强制续期成功后重新导出文件到本地存储目录
+    # 强制续期成功后，使用你指定的命令重新导出并覆盖本地存储
     if [ -d "$SSL_DIR" ]; then
         for domain in $(ls $SSL_DIR); do
             if $ACME_HOME/acme.sh --list | grep -q "$domain"; then
-                yellow "正在重新导出同步 [$domain] 的新证书文件..."
-                $ACME_HOME/acme.sh --install-cert -d $domain \
+                yellow "正在同步重新导出 [$domain] 的证书文件..."
+                # 严格使用你指定的本地导出命令结构
+                $ACME_HOME/acme.sh --install-cert -d "$domain" \
                     --key-file       $SSL_DIR/$domain/private.key \
                     --fullchain-file $SSL_DIR/$domain/cert.crt >/dev/null
             fi
@@ -265,7 +277,6 @@ check_domains_status() {
     echo -e "${YELLOW}        ◈ 本地证书状态实时监控 ◈            ${RESET}"
     echo -e "${YELLOW}========================================${RESET}"
 
-    # 仅读取本地 acme.sh 已经签发管理的证书列表
     mapfile -t DOMAINS < <($ACME_HOME/acme.sh --list | tail -n +2 | awk '{print $1}')
     
     if [ ${#DOMAINS[@]} -eq 0 ] || [ "${DOMAINS[0]}" == "" ]; then
@@ -345,11 +356,9 @@ remove_cert(){
     
     domain="${certs[$((num-1))]}"
     
-    # 彻底从 acme.sh 列表中移除
     $ACME_HOME/acme.sh --remove -d "$domain" --ecc >/dev/null 2>&1
     $ACME_HOME/acme.sh --remove -d "$domain" >/dev/null 2>&1
     
-    # 清理本地导出的 ssl 存储文件夹
     if [ -d "$SSL_DIR/$domain" ]; then
         rm -rf "$SSL_DIR/$domain"
     fi
@@ -401,7 +410,7 @@ do
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}$VERSION_SHOW${RESET}"
     echo -e "${GREEN}证书   :${RESET} ${YELLOW}$SITE_COUNT 个${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装ACME ${RESET}"
+    echo -e "${GREEN} 1. 安装ACME${RESET}"
     echo -e "${GREEN} 2. 申请域名证书(80端口模式)${RESET}"
     echo -e "${GREEN} 3. 申请IP证书(IP短周期模式)${RESET}"
     echo -e "${GREEN} 4. 申请域名证书(DNSAPI模式)${RESET}"

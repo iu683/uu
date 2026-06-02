@@ -8,6 +8,16 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
+# 随机密码生成函数（生成12位包含大小写字母和数字的随机密码）
+generate_random_password() {
+    # 优先使用 openssl，次选 tr 配合 /dev/urandom
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -base64 9 | tr -d '+/' | cut -c1-12
+    else
+        tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 12
+    fi
+}
+
 # 下载脚本
 download_script() {
     local type="$1"
@@ -22,37 +32,41 @@ download_script() {
 systems=(
 "1|debian13|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 13"
 "2|debian12|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 12"
-"3|debian11|Debian|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -debian 11"
-"4|debian10|Debian|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -debian 10"
+"3|debian11|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 11"
+"4|debian10|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 10"
 "5|ubuntu26.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 26.04"
 "6|ubuntu24.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 24.04"
-"7|ubuntu22.04|Ubuntu|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -ubuntu 22.04"
-"8|ubuntu20.04|Ubuntu|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -ubuntu 20.04"
-"9|ubuntu18.04|Ubuntu|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -ubuntu 18.04"
-"10|rocky10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh rocky"
-"11|rocky9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh rocky 9"
-"12|alma10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh almalinux"
-"13|alma9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh almalinux 9"
-"14|oracle10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh oracle"
-"15|oracle9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh oracle 9"
-"16|fedora44|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh fedora 44"
-"17|fedora43|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh fedora 43"
-"18|centos10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh centos 10"
-"19|centos9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh centos 9"
-"20|Alpine Linux|其他Linux|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -alpine"
-"21|arch|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh arch"
-"22|kali|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh kali"
-"23|openeuler|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh openeuler"
-"24|opensuseTumbleweed|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh opensuse"
-"25|fnos飞牛公测版|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh fnos"
-"26|windows11|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 11 -lang cn"
-"27|windows10|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 10 -lang cn"
-"28|windows7|Windows|bin456789|Administrator|123@@@|3389|bash reinstall.sh windows --iso=\"https://drive.massgrave.dev/cn_windows_7_professional_with_sp1_x64_dvd_u_677031.iso\" --image-name='Windows 7 PROFESSIONAL'"
-"29|windowsServer2025|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2025 -lang cn"
-"30|windowsServer2022|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2022 -lang cn"
-"31|windowsServer2019|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2019 -lang cn"
-"32|windowsServer2016|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2016 -lang cn"
-"33|windows11arm|Windows|bin456789|Administrator|123@@@|3389|bash reinstall.sh dd --img https://r2.hotdog.eu.org/win11-arm-with-pagefile-15g.xz"
+"7|ubuntu22.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 22.04"
+"8|ubuntu20.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 20.04"
+"9|ubuntu18.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 18.04"
+"10|Alpine3.23|Alpine|bin456789|root|123@@@|22|bash reinstall.sh alpine 3.23"
+"11|Alpine3.22|Alpine|bin456789|root|123@@@|22|bash reinstall.sh alpine 3.22"
+"12|Alpine3.21|Alpine|bin456789|root|123@@@|22|bash reinstall.sh alpine 3.21"
+"13|Alpine3.20|Alpine|bin456789|root|123@@@|22|bash reinstall.sh alpine 3.20"
+"14|AlpineEdge|Alpine|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -alpine"
+"15|rocky10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh rocky"
+"16|rocky9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh rocky 9"
+"17|alma10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh almalinux"
+"18|alma9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh almalinux 9"
+"19|oracle10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh oracle"
+"20|oracle9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh oracle 9"
+"21|fedora44|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh fedora 44"
+"22|fedora43|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh fedora 43"
+"23|centos10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh centos 10"
+"24|centos9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh centos 9"
+"25|arch|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh arch"
+"26|kali|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh kali"
+"27|openeuler|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh openeuler"
+"28|opensuseTumbleweed|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh opensuse"
+"29|fnos飞牛公测版|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh fnos"
+"30|windows11|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 11 -lang cn"
+"31|windows10|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 10 -lang cn"
+"32|windows7|Windows|bin456789|Administrator|123@@@|3389|bash reinstall.sh windows --iso=\"https://drive.massgrave.dev/cn_windows_7_professional_with_sp1_x64_dvd_u_677031.iso\" --image-name='Windows 7 PROFESSIONAL'"
+"33|windowsServer2025|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2025 -lang cn"
+"34|windowsServer2022|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2022 -lang cn"
+"35|windowsServer2019|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2019 -lang cn"
+"36|windowsServer2016|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2016 -lang cn"
+"37|windows11arm|Windows|bin456789|Administrator|123@@@|3389|bash reinstall.sh dd --img https://r2.hotdog.eu.org/win11-arm-with-pagefile-15g.xz"
 )
 
 while true; do
@@ -71,7 +85,8 @@ while true; do
     echo -e "${RED} 0. 退出${RESET}"
 
     # 用户选择编号
-    read -p "$(echo -e ${GREEN}请输入选项: ${RESET})" num_choice
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read num_choice
 
     # 支持 0 或 00 退出
     if [[ "$num_choice" == "0" || "$num_choice" == "00" ]]; then
@@ -84,11 +99,12 @@ while true; do
         if [[ "$num_choice" == "$id" ]]; then
             found=1
             
-            echo -e "\n${RED}⚠️  警告: 此操作将会完全重装系统，磁盘上所有数据将丢失！${RESET}"
-            echo -e "${RED}⚠️  请确保已备份重要数据！${RESET}"
+            echo -e "${YELLOW}警告: 此操作将会完全重装系统，磁盘上所有数据将丢失！${RESET}"
+            echo -e "${YELLOW}请确保已备份重要数据！${RESET}"
             
-            # 第一次安全确认
-            read -p "$(echo -e ${RED}你确定要重装 ${name} 系统吗？(y/n): ${RESET})" confirm
+
+            echo -ne "${YELLOW}你确定要重装 ${name} 系统吗？(y/n): ${RESET}"
+            read confirm
             if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
                 echo -e "${YELLOW}已取消重装 ${name} 系统，返回菜单${RESET}"
                 sleep 1
@@ -97,7 +113,7 @@ while true; do
 
             final_cmd="$cmd"
 
-            # 核心改动：如果是 bin456789 且是 Linux 系统，触发自定义交互
+            # 如果是 bin456789 且是 Linux 系统，触发自定义交互
             if [[ "$dl" == "bin456789" && "$category" != "Windows" && "$name" != *"dd"* ]]; then
                 echo -e "\n${GREEN}--- 配置新系统凭据 ---${RESET}"
                 
@@ -112,12 +128,10 @@ while true; do
                 # 3. 交互输入密码 (仅在没有输入公钥时触发)
                 custom_pass=""
                 if [[ -z "$custom_key" ]]; then
-                    read -p "请输入 ${custom_user} 的密码: " custom_pass
-                    if [[ -z "$custom_pass" ]]; then
-                        echo -e "${RED}❌ 错误: 未提供公钥，且密码不能为空，操作已取消。${RESET}"
-                        sleep 1
-                        break
-                    fi
+                    # 在这里动态生成随机密码
+                    rand_pass=$(generate_random_password)
+                    read -p "请输入 ${custom_user} 的密码 (直接回车随机生成: ${rand_pass}): " custom_pass
+                    custom_pass=${custom_pass:-$rand_pass}
                 else
                     echo -e "${GREEN}检测到已输入公钥，重装时将不配置密码。${RESET}"
                 fi
@@ -139,9 +153,9 @@ while true; do
                 echo -e "\n${YELLOW}请牢记重装后凭据:${RESET}"
                 echo -e "用户名: ${GREEN}${custom_user}${RESET}  SSH端口: ${GREEN}${custom_port}${RESET}"
                 if [[ -n "$custom_key" ]]; then
-                    echo -e "登录方式: ${GREEN}仅限 SSH 公钥证书登录 (密码为空)${RESET}"
+                    echo -e "登录方式: ${GREEN}仅限 SSH 公钥证书登录${RESET}"
                 else
-                    echo -e "初始密码: ${GREEN}${custom_pass}${RESET}"
+                    echo -e "初始密码: ${RED}${custom_pass}${RESET}  (请复制保存！)"
                 fi
             else
                 # MollyLau 脚本或 Windows/DD 镜像保持原样提示

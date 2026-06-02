@@ -35,32 +35,6 @@ get_nginx_version() {
     fi
 }
 
-get_nginx_ports() {
-    if ! command -v ss >/dev/null 2>&1; then
-        PORT_SHOW="未知 (缺少 ss 命令)"
-        return
-    fi
-
-    local p80=""
-    local p443=""
-
-    # 检测 80 端口是否在监听
-    if ss -tunlp | grep -q ":80 "; then
-        p80="${YELLOW}80${RESET}"
-    else
-        p80="${RED}80${RESET}"
-    fi
-
-    # 检测 443 端口是否在监听
-    if ss -tunlp | grep -q ":443 "; then
-        p443="${YELLOW}443${RESET}"
-    else
-        p443="${RED}443${RESET}"
-    fi
-
-    PORT_SHOW="$p80 ${YELLOW}|${RESET} $p443"
-}
-
 get_site_count() {
     CONFIG_DIR="/etc/nginx/sites-available"
     if [ -d "$CONFIG_DIR" ]; then
@@ -228,6 +202,13 @@ check_domain_resolution() {
 }
 
 install_nginx() {
+
+    if command -v nginx >/dev/null 2>&1 && command -v certbot >/dev/null 2>&1; then
+        echo -e "${YELLOW}提示: 检测到系统已安装 Nginx 与 Certbot，自动跳过安装。${RESET}"
+        pause
+        return
+    fi
+    
     ensure_nginx_conf
     remove_default_server
 
@@ -611,7 +592,7 @@ add_custom_cert_config() {
     echo -ne "${GREEN}请输入您的自定义域名或公网IP: ${RESET}"; read DOMAIN
     [ -z "$DOMAIN" ] && return
 
-    echo -ne "${GREEN}请输入反代目标(例如：http://127.0.0.1:8080): ${RESET}"; read TARGET
+    echo -ne "${GREEN}请输入反代目标(例如：http://127.0.0.1:5788): ${RESET}"; read TARGET
     echo -ne "${GREEN}是否为 WebSocket 反代? (y/n, 默认y): ${RESET}"; read IS_WS
     IS_WS=${IS_WS:-y}
     echo -ne "${GREEN}请输入最大上传大小 (默认 200M): ${RESET}"; read MAX_SIZE
@@ -651,6 +632,9 @@ add_custom_cert_config() {
     pause
 }
 
+# ------------------------------------------------------------
+# 优化重构：适配全新新版 Nginx (HTTP/2 改为标准 http2 on 指令)
+# ------------------------------------------------------------
 generate_emby_normal_conf() {
     local DOMAIN=$1
     local TARGET=$2
@@ -670,7 +654,8 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
+    listen 443 ssl;
+    http2 on;
     server_name $DOMAIN;
 
     ssl_certificate $CERT_PATH;
@@ -731,7 +716,8 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
+    listen 443 ssl;
+    http2 on;
     server_name $DOMAIN;
 
     ssl_certificate $CERT_PATH;
@@ -797,10 +783,10 @@ EOF
 emby_menu() {
     clear
     echo -e "${GREEN}===== Emby 反向代理配置 =====${RESET}"
-    echo -e "${GREEN}1) 普通反代(Certbot托管)${RESET}"
-    echo -e "${GREEN}2) 主站+推流路径重定向(Certbot托管)${RESET}"
-    echo -e "${GREEN}3) 普通反代(自定义证书)${RESET}"
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
+    echo -e "${GREEN}1.普通反代(Certbot托管)${RESET}"
+    echo -e "${GREEN}2.主站+推流路径重定向(Certbot托管)${RESET}"
+    echo -e "${GREEN}3.普通反代(自定义证书)${RESET}"
+    echo -e "${GREEN}0.返回主菜单${RESET}"
     echo -ne "${GREEN}请选择 [0-3]: ${RESET}"
     read emby_choice
 
@@ -830,23 +816,34 @@ emby_menu() {
             echo -ne "${GREEN}请输入Emby地址(例如: https://emby.com): ${RESET}"; read TARGET
             local DIR_PATH="$CUSTOM_SSL_BASE/$DOMAIN"
             mkdir -p "$DIR_PATH"
-            echo -ne "${GREEN}证书公钥(crt/pem)绝对路径: ${RESET}"; read USER_CERT
-            echo -ne "${GREEN}证书私钥(key/pem)绝对路径: ${RESET}"; read USER_KEY
+           
+            echo -e "${YELLOW}---------------------------------------------${RESET}"
+            echo -e "${YELLOW}请提供您的自定义 SSL 证书文件绝对路径。${RESET}"
+            echo -e "${YELLOW}---------------------------------------------${RESET}"
+
+            echo -ne "${GREEN}请输入 证书公钥(fullchain/crt) 文件的绝对路径: ${RESET}"; read USER_CERT
+            echo -ne "${GREEN}请输入 证书私钥(privkey/key) 文件的绝对路径: ${RESET}"; read USER_KEY
+
             if [ ! -f "$USER_CERT" ] || [ ! -f "$USER_KEY" ]; then red "文件不存在"; rm -rf "$DIR_PATH"; pause; return; fi
             cp -f "$USER_CERT" "$DIR_PATH/fullchain.pem"
             cp -f "$USER_KEY" "$DIR_PATH/privkey.pem"
+
+            chmod 600 "$DIR_PATH/privkey.pem"
+            chmod 644 "$DIR_PATH/fullchain.pem"
+
             generate_emby_normal_conf "$DOMAIN" "$TARGET" "$DIR_PATH/fullchain.pem" "$DIR_PATH/privkey.pem"
             nginx -t && systemctl reload nginx
+            echo -e "${GREEN}✅ 自定义证书反代站点 https://$DOMAIN 添加成功！${RESET}"
             pause ;;
         0) return ;;
-        *) echo -e "${RED}无效输入!${RESET}"; sleep 1; emby_menu ;;
+        *) echo -e "${RED}无效输入!${RESET}", sleep 1; emby_menu ;;
     esac
 }
 
 update_nginx_software() {
     clear
     echo -e "${YELLOW}========================================${RESET}"
-    echo -e "${YELLOW}        ◈ 正在执行 Nginx 软件版本升级 ◈    ${RESET}"
+    echo -e "${YELLOW}     ◈ 正在执行 Nginx 软件版本升级 ◈    ${RESET}"
     echo -e "${YELLOW}========================================${RESET}"
 
     if ! command -v nginx >/dev/null 2>&1; then
@@ -857,7 +854,7 @@ update_nginx_software() {
     echo -e "${GREEN}◈ 当前 Nginx 版本: ${RESET}${YELLOW}${CURRENT_VER}${RESET}"
     echo -e "${YELLOW}----------------------------------------${RESET}"
 
-    echo -ne "${YELLOW}是否开始检查更新并平滑升级？(y/N): ${RESET}"
+    echo -ne "${YELLOW}是否开始检查更新并平滑升级？(y/N,默认N): ${RESET}"
     read up_choice
     if [[ ! "$up_choice" =~ ^[Yy]$ ]]; then
         echo -e "${YELLOW}⏭ 已取消升级。${RESET}"

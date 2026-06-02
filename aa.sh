@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# sing-box (AnyTLS) 核心控制面板
+# Hysteria 2 控制面板
 # SPDX-License-Identifier: MIT
 #
 # =========================================================
@@ -10,22 +10,22 @@ set -Eop pipefail
 export LANG=en_US.UTF-8
 
 # 基础目录与硬编码配置
-readonly SB_CONFIG="/etc/mo-anytls-sb/config.json"
-readonly SB_BINARY="/usr/local/bin/sing-box"
-readonly SB_DIR="/root/proxynode/Anytls"
-EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
+readonly HY_CONFIG="/etc/mo-hy2/config.yaml"
+readonly HY_BINARY="/usr/local/bin/hysteria"
+readonly HY_DIR="/root/proxynode/hy2"
+EXECUTABLE_INSTALL_PATH="/usr/local/bin/hysteria"
 SYSTEMD_SERVICES_DIR="/etc/systemd/system"
-CONFIG_DIR="/etc/mo-anytls-sb"
-REPO_URL="https://github.com/SagerNet/sing-box"
-API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
+CONFIG_DIR="/etc/mo-hy2"
+REPO_URL="https://github.com/apernet/hysteria"
+API_BASE_URL="https://api.github.com/repos/apernet/hysteria"
 CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
 
 # 自动检测环境变量
 PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
 OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
 ARCHITECTURE="${ARCHITECTURE:-}"
-SINGBOX_USER="${SINGBOX_USER:-}"
-SINGBOX_HOME_DIR="${SINGBOX_HOME_DIR:-}"
+HYSTERIA_USER="${HYSTERIA_USER:-}"
+HYSTERIA_HOME_DIR="${HYSTERIA_HOME_DIR:-}"
 
 # 终端颜色代码
 GREEN="\033[32m"
@@ -35,8 +35,12 @@ BLUE="\033[34m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
+# 全局变量占位
+firstport=""
+endport=""
+
 # =========================================================
-# 2. 底层工具函数
+# 2. 官方原生底层工具函数
 # =========================================================
 has_command() {
   local _command=$1
@@ -48,7 +52,7 @@ curl() {
 }
 
 mktemp() {
-  command mktemp "$@" "sbservinst.XXXXXXXXXX"
+  command mktemp "$@" "hyservinst.XXXXXXXXXX"
 }
 
 info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
@@ -57,7 +61,6 @@ error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
 pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
 
 generate_random_password() {
-  # 生成 16 位强随机密码作为 AnyTLS 备用密钥
   dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
 }
 
@@ -105,16 +108,36 @@ detect_package_manager() {
 
 install_software() {
   local _package_name="$1"
+
   if ! detect_package_manager; then
     error "未检测到支持的包管理器，请手动安装 $_package_name"
     exit 65
   fi
-  echo "正在安装缺失的依赖 '$_package_name' ... "
-  if $PACKAGE_MANAGEMENT_INSTALL "$_package_name" >/dev/null 2>&1; then
+
+  echo "正在安装缺失依赖: $_package_name"
+
+  if $PACKAGE_MANAGEMENT_INSTALL $_package_name >/dev/null 2>&1; then
     echo "依赖安装成功"
   else
-    error "无法通过包管理器安装 '$_package_name'，请手动安装。"
+    error "无法安装 $_package_name"
     exit 65
+  fi
+}
+
+install_netfilter_persistent() {
+  if has_command apt; then
+    export DEBIAN_FRONTEND=noninteractive
+
+    echo "安装 netfilter-persistent..."
+
+    install_software "iptables-persistent netfilter-persistent"
+
+    systemctl enable netfilter-persistent >/dev/null 2>&1
+    systemctl restart netfilter-persistent >/dev/null 2>&1
+
+    echo "netfilter-persistent 安装完成"
+  else
+    echo "当前系统不支持 netfilter-persistent，跳过"
   fi
 }
 
@@ -131,7 +154,7 @@ check_environment() {
   case "$(uname -m)" in
     'i386' | 'i686') ARCHITECTURE='386' ;;
     'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
-    'armv5tel' | 'armv6l' | 'armv7' | 'armv7l') ARCHITECTURE='armv7' ;;
+    'armv5tel' | 'armv6l' | 'armv7' | 'armv7l') ARCHITECTURE='arm' ;;
     'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
     's390x') ARCHITECTURE='s390x' ;;
     *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
@@ -141,17 +164,20 @@ check_environment() {
   has_command grep || install_software grep
   has_command jq || install_software jq
   has_command openssl || install_software openssl
-  has_command tar || install_software tar
   has_command socat || install_software socat
   has_command python3 || install_software python3
+  
+  if ! has_command iptables; then
+    install_software iptables
+  fi
 }
 
 get_installed_version() {
   if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
     local version_out
-    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null | head -n 1 || echo "")
+    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null || "$EXECUTABLE_INSTALL_PATH" -v 2>/dev/null || echo "")
     if [[ -n "$version_out" ]]; then
-      echo "$version_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "未知格式"
+      echo "$version_out" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "未知格式"
     else
       echo "未知版本"
     fi
@@ -170,38 +196,46 @@ get_latest_version() {
   rm -f "$_tmpfile"
   
   if [[ -n "$_tag_name" ]]; then
-    echo "${_tag_name##*v}"
+    echo "${_tag_name##*\/}"
   else
     echo ""
   fi
 }
 
-download_singbox() {
+download_hysteria() {
   local _version="$1"
   local _destination="$2"
-  local _download_url="$REPO_URL/releases/download/v${_version}/sing-box-${_version}-linux-${ARCHITECTURE}.tar.gz"
+  local _download_url="$REPO_URL/releases/download/app/$_version/hysteria-$OPERATING_SYSTEM-$ARCHITECTURE"
   
-  info "正在下载官方 sing-box 核心组件: $_download_url ..."
+  if [[ ! "$_version" =~ "v" ]]; then
+     _version="v$_version"
+  fi
+  
+  info "正在下载官方 Hysteria 核心组件: $_download_url ..."
   if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
-    error "核心下载失败！请检查您的网络连接。"
-    return 11
+    _download_url="$REPO_URL/releases/download/$_version/hysteria-$OPERATING_SYSTEM-$ARCHITECTURE"
+    if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
+      error "核心下载失败！请检查您的网络连接。"
+      return 11
+    fi
   fi
   return 0
 }
 
-tpl_singbox_server_service_base() {
+tpl_hysteria_server_service_base() {
   local _config_name="$1"
   cat << EOF
 [Unit]
-Description=sing-box Server Service (${_config_name}.json)
-After=network.target nss-lookup.target
+Description=Hysteria Server Service (${_config_name}.yaml)
+After=network.target
 
 [Service]
 Type=simple
-ExecStart=$EXECUTABLE_INSTALL_PATH run --config ${CONFIG_DIR}/${_config_name}.json
-WorkingDirectory=$SINGBOX_HOME_DIR
-User=$SINGBOX_USER
-Group=$SINGBOX_USER
+ExecStart=$EXECUTABLE_INSTALL_PATH server --config ${CONFIG_DIR}/${_config_name}.yaml
+WorkingDirectory=$HYSTERIA_HOME_DIR
+User=$HYSTERIA_USER
+Group=$HYSTERIA_USER
+Environment=HYSTERIA_LOG_LEVEL=info
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 NoNewPrivileges=true
@@ -214,7 +248,37 @@ EOF
 }
 
 # =========================================================
-# 3. 网络与配置扩展辅助函数
+# 2.5 外部证书自动穿透赋权扩展函数
+# =========================================================
+fix_external_cert_permission() {
+  local cert=$1
+  local key=$2
+  local target_user=${3:-hysteria}
+  
+  if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
+    error "致命拒绝: 检测到您的证书位于 /root/ 目录下！"
+    warn "原因分析: /root 目录权限极为严苛(700)，非root用户无权穿透。即使强行赋予文件权限，内核也会由于路径阻塞拒绝读取。"
+    info "权威推荐: 请重新导出或申请证书到公共目录（如 /etc/ssl/ 或 /etc/certs/ 文件夹下）再试。"
+    return 1
+  fi
+
+  local cert_dir=$(dirname "$cert")
+  info "正在为外部证书目录赋予检索穿透权限 (+x) ..."
+  chmod +x "$cert_dir" 2>/dev/null || true
+  
+  info "正在规范化外部证书与私钥文件的读取权限 (644) ..."
+  chmod 644 "$cert" "$key" 2>/dev/null || true
+  
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m u:"$target_user":rx "$cert_dir" 2>/dev/null || true
+    setfacl -m u:"$target_user":r "$cert" "$key" 2>/dev/null || true
+  fi
+  
+  return 0
+}
+
+# =========================================================
+# 3. 面板辅助网络与配置扩展函数
 # =========================================================
 get_public_ip() {
     local ip
@@ -233,7 +297,7 @@ get_public_ip() {
 
 check_port() {
   local port="$1"
-  if ss -tunlp 2>/dev/null | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
+  if ss -tunlp 2>/dev/null | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
     return 1
   fi
   return 0
@@ -251,11 +315,11 @@ get_random_port() {
   done
 }
 
-get_sb_status() {
-  if has_command systemctl && systemctl is-active --quiet mo-anytls-sb 2>/dev/null; then
+get_hy_status() {
+  if has_command systemctl && systemctl is-active --quiet mo-hy2 2>/dev/null; then
     echo -e "${GREEN}● 运行中${RESET}"
   else
-    if pgrep -f "$EXECUTABLE_INSTALL_PATH run" >/dev/null 2>&1; then
+    if pgrep -f "$EXECUTABLE_INSTALL_PATH server" >/dev/null 2>&1; then
       echo -e "${GREEN}● 运行中${RESET}"
     else
       echo -e "${RED}● 未运行${RESET}"
@@ -264,31 +328,35 @@ get_sb_status() {
 }
 
 get_current_port_display() {
-  if [[ -f "$SB_CONFIG" ]]; then
-    local main_port
-    main_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "")
+  if [[ -f "$HY_CONFIG" ]]; then
+    local main_port jump_range
+    main_port=$(grep -E '^listen:' "$HY_CONFIG" | awk -F ':' '{print $3}' | tr -d ' ')
+    if [[ -f "$HY_DIR/hy-client.yaml" ]]; then
+      jump_range=$(grep -E '^server:' "$HY_DIR/hy-client.yaml" | awk -F ',' '{print $2}' | tr -d ' ')
+      [[ -n "$jump_range" ]] && echo "${main_port} [${jump_range}]" && return
+    fi
     echo "${main_port:- -}"
   else echo "-"; fi
 }
 
 # =========================================================
-# 4. 证书、端口交互与配置写入
+# 4. 面板核心交互逻辑 (证书 / 端口群)
 # =========================================================
 inst_cert() {
-  mkdir -p /etc/mo-anytls-sb
+  mkdir -p /etc/mo-hy2
   
   echo "---------------------------------------------"
-  echo -e "sing-box TLS 证书申请方式如下："
-  echo -e " 1) 必应自签证书 ${YELLOW}（默认）${RESET}"
-  echo -e " 2) Acme自动申请 (需放行80端口)"
+  echo -e "Hysteria 2 协议证书申请方式如下："
+  echo -e " 1) 必应自签证书"
+  echo -e " 2) Acme自动申请 (需放行 80 端口)${YELLOW}（默认）${RESET}"
   echo -e " 3) 自定义证书路径"
   echo "---------------------------------------------"
   local certInput
-  read -rp "请输入选项 [1-3] (直接回车默认自签): " certInput
-  certInput=${certInput:-1}
+  read -rp "请输入选项 [1-3] (直接回车默认Acme自动申请): " certInput
+  certInput=${certInput:-2}
 
-  cert_path="/etc/mo-anytls-sb/fullchain.pem"
-  key_path="/etc/mo-anytls-sb/privkey.pem"
+  cert_path="/etc/mo-hy2/server.crt"
+  key_path="/etc/mo-hy2/server.key"
 
   if [[ $certInput == 2 ]]; then
     if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
@@ -307,76 +375,83 @@ inst_cert() {
     
     "$acme_cmd" --set-default-ca --server letsencrypt
     
-    info "正在向 Let's Encrypt 申请证书..."
+    # 根据底层架构动态装配专属的无缝热重启重载指令
+    local reload_cmd
+    if has_command systemctl; then
+      reload_cmd="systemctl restart mo-hy2"
+    else
+      reload_cmd="pkill -f '$EXECUTABLE_INSTALL_PATH server' || true; '$EXECUTABLE_INSTALL_PATH' server --config '$HY_CONFIG' >/dev/null 2>&1 &"
+    fi
+
+    info "正在向 Let's Encrypt 申请证书并配置自动重载规则..."
     if [[ "$vps_ip" =~ ":" ]]; then
       "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
     else
       "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
     fi
     
-    # 【核心优化点】: 
-    # 1. 判定当前的守护进程环境，生成对应的重启命令
-    # 2. 使用 --reloadcmd。这样以后每次 crontab 触发自动续期成功后，Acme 会自动把新证书刷进路径，并自动重启 sing-box！
-    local reload_cmd="pkill -f '$EXECUTABLE_INSTALL_PATH run' || true; '$EXECUTABLE_INSTALL_PATH' run --config /etc/mo-anytls-sb/config.json >/dev/null 2>&1 &"
-    if has_command systemctl; then
-      reload_cmd="systemctl restart mo-anytls-sb"
-    fi
-
-    info "正在配置证书自动同步与服务重载钩子..."
-    if "$acme_cmd" --install-cert -d "${domain}" \
-      --key-file "$key_path" \
-      --fullchain-file "$cert_path" \
-      --ecc \
-      --reloadcmd "$reload_cmd"; then
-      
-      echo "$domain" > /etc/mo-anytls-sb/ca.log
-      sb_domain=$domain
-      info "Acme 证书申请成功！已建立自动续期同步与服务重启快线。"
+    # =========================================================
+    # 核心修改点：加入 --reloadcmd 联动机制，实现证书长效续期无人值守
+    # =========================================================
+    if "$acme_cmd" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc --reloadcmd "$reload_cmd"; then
+      echo "$domain" > /etc/mo-hy2/ca.log
+      hy_domain=$domain
+      info "Acme 证书申请、部署并成功挂载自动化重载命令！"
     else
-      error "Acme 证书申请失败，自动切换回自签模式。"
+      error "Acme 证书部署失败，自动切换回自签模式。"
       certInput=1
     fi
     
   elif [[ $certInput == 3 ]]; then
-    local user_cert user_key
-    read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
-    read -rp "请输入密钥文件 (privkey.pem/key) 的路径: " user_key
-    read -rp "请输入证书对应的域名: " sb_domain
-    
-    if [[ -f "$user_cert" && -f "$user_key" ]]; then
-      # 【优化点】自定义证书改用软链接（ln -sf），原文件更新时，沙箱内同步生效
-      rm -f "$cert_path" "$key_path"
-      ln -sf "$user_cert" "$cert_path"
-      ln -sf "$user_key" "$key_path"
-      info "自定义证书已通过软链接同步至内部安全区。"
-    else
-      error "找不到输入的证书文件，自动降级回自签模式。"
-      certInput=1
-    fi
+    while true; do
+      local user_cert user_key
+      read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
+      read -rp "请输入密钥文件 (privkey.pem/key) 的路径: " user_key
+      read -rp "请输入证书对应的域名: " hy_domain
+      
+      if [[ -f "$user_cert" && -f "$user_key" ]]; then
+        rm -f "$cert_path" "$key_path"
+        
+        if ! fix_external_cert_permission "$user_cert" "$user_key" "${HYSTERIA_USER:-hysteria}"; then
+          echo "---------------------------------------------"
+          continue
+        fi
+
+        ln -sf "$user_cert" "$cert_path"
+        ln -sf "$user_key" "$key_path"
+        info "自定义证书已通过软链接无缝接入内部安全区。"
+        break
+      else
+        error "找不到输入的证书文件，请重新输入或按 Ctrl+C 退出。"
+        echo "---------------------------------------------"
+      fi
+    done
   fi
 
   if [[ $certInput == 1 ]]; then
-    info "将使用必应自签证书作为 sing-box 的节点证书"
-    rm -f "$cert_path" "$key_path" # 清理可能残留的软链接
+    info "将使用必应自签证书作为 Hysteria 2 的节点证书"
+    rm -f "$cert_path" "$key_path"
     openssl ecparam -genkey -name prime256v1 -out "$key_path"
     openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
-    sb_domain="www.bing.com"
+    hy_domain="www.bing.com"
   fi
 
-  # 如果是软链接，chmod -h 和 chown -h 可以确保只修改链接本身或穿透正确
-  chmod 644 "$cert_path" || true
-  chmod 600 "$key_path" || true
-  if is_user_exists "sing-box"; then
-    chown -R sing-box:sing-box /etc/mo-anytls-sb
+  if is_user_exists "${HYSTERIA_USER:-hysteria}"; then
+    chown "${HYSTERIA_USER:-hysteria}":"${HYSTERIA_USER:-hysteria}" /etc/mo-hy2
+    if [[ ! -L "$cert_path" ]]; then chmod 644 "$cert_path" && chown "${HYSTERIA_USER:-hysteria}":"${HYSTERIA_USER:-hysteria}" "$cert_path"; else chown -h "${HYSTERIA_USER:-hysteria}":"${HYSTERIA_USER:-hysteria}" "$cert_path"; fi
+    if [[ ! -L "$key_path" ]]; then chmod 600 "$key_path" && chown "${HYSTERIA_USER:-hysteria}":"${HYSTERIA_USER:-hysteria}" "$key_path"; else chown -h "${HYSTERIA_USER:-hysteria}":"${HYSTERIA_USER:-hysteria}" "$key_path"; fi
+  else
+    [[ ! -L "$cert_path" ]] && chmod 644 "$cert_path" || true
+    [[ ! -L "$key_path" ]] && chmod 600 "$key_path" || true
   fi
 }
 
 inst_port() {
   local default_port=""
-  [[ -f "$SB_CONFIG" ]] && default_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "")
+  [[ -f "$HY_CONFIG" ]] && default_port=$(grep -E '^listen:' "$HY_CONFIG" | awk -F ':' '{print $3}' | tr -d ' ')
 
-  local prompt_msg="设置 sing-box 主端口 [1-65535] (回车随机分配): "
-  [[ -n "$default_port" ]] && prompt_msg="设置 sing-box 主端口 [当前: ${default_port}, 回车不修改]: "
+  local prompt_msg="设置 Hysteria 2 主端口 [1-65535] (回车随机分配): "
+  [[ -n "$default_port" ]] && prompt_msg="设置 Hysteria 2 主端口 [当前: ${default_port}, 回车不修改]: "
 
   while true; do
     read -rp "$prompt_msg" port
@@ -393,125 +468,179 @@ inst_port() {
       break
     else error "请输入有效的端口数字 (1-65535)"; fi
   done
+
+  local default_mode="2"
+  local old_first=""
+  local old_end=""
+  
+  if [[ -f "$HY_DIR/hy-client.yaml" ]]; then
+    local check_hop=$(grep -E '^server:' "$HY_DIR/hy-client.yaml" | awk -F ',' '{print $2}' | tr -d ' ')
+    if [[ -n "$check_hop" && "$check_hop" =~ ^[0-9]+-[0-9]+$ ]]; then
+      old_first=$(echo "$check_hop" | cut -d'-' -f1)
+      old_end=$(echo "$check_hop" | cut -d'-' -f2)
+      default_mode="2"
+    else
+      [[ -n "$default_port" ]] && default_mode="1"
+    fi
+  fi
+
+  echo "---------------------------------------------"
+  echo -e "Hysteria 2 端口群使用模式："
+  echo -e " 1) 单端口模式"
+  echo -e " 2) 端口跳跃模式 [当前默认: $default_mode]"
+  echo "---------------------------------------------"
+  local jumpInput
+  read -rp "请选择端口模式 [1-2] (直接回车保持默认): " jumpInput
+  jumpInput=${jumpInput:-$default_mode}
+
+  iptables -t nat -F PREROUTING >/dev/null 2>&1 || true
+  ip6tables -t nat -F PREROUTING >/dev/null 2>&1 || true
+
+  if [[ $jumpInput == 2 ]]; then
+    local prompt_first="设置起始端口 (建议10000-65535): "
+    local prompt_end="设置末尾端口 (必须大于起始端口): "
+    [[ -n "$old_first" ]] && prompt_first="设置起始端口 [当前: ${old_first}, 回车不修改]: "
+    [[ -n "$old_end" ]] && prompt_end="设置末尾端口 [当前: ${old_end}, 回车不修改]: "
+
+    while true; do
+      read -rp "$prompt_first" input_first
+      input_first=${input_first:-$old_first}
+      
+      read -rp "$prompt_end" input_end
+      input_end=${input_end:-$old_end}
+      
+      if is_valid_port "$input_first" && is_valid_port "$input_end" && [[ $input_first -lt $input_end ]]; then 
+        firstport="$input_first"
+        endport="$input_end"
+        break
+      else 
+        error "输入无效，起始端口必须小于末尾端口，请重新输入。"
+      fi
+    done
+    
+    iptables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port"
+    ip6tables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port"
+    
+    if has_command netfilter-persistent; then
+      netfilter-persistent save >/dev/null 2>&1 || true
+    else
+      warn "缺少 netfilter-persistent 工具，端口跳跃规则可能在重启后失效。"
+    fi
+    info "已成功配置端口跳跃规则: $firstport-$endport -> $port"
+  else
+    firstport=""
+    endport=""
+    info "将继续使用单端口模式"
+  fi
 }
 
 write_and_show_config() {
-  local hostname=$(hostname -s | sed 's/ /_/g')
-  local ip=$(get_public_ip)
-  local url_ip="$ip"
-  if [[ "$ip" =~ ":" ]]; then 
-    url_ip="[$ip]"
+  local HOSTNAME=$(hostname -s | sed 's/ /_/g')
+  local vps_ip=$(get_public_ip)
+
+  local is_insecure="0"
+  local skip_cert="false"
+  local yaml_insecure="false"
+
+  if [[ "$hy_domain" == "www.bing.com" ]]; then
+    is_insecure="1"
+    skip_cert="true"
+    yaml_insecure="true"
   fi
 
-  # 1. 写入服务端核心 JSON
-  cat << EOF > /etc/mo-anytls-sb/config.json
-{
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
-  "inbounds": [
-    {
-      "type": "anytls",
-      "tag": "anytls-in",
-      "listen": "::",
-      "listen_port": $port,
-      "users": [
-        {
-          "name": "user1",
-          "password": "$auth_pwd"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "$sb_domain",
-        "key_path": "$key_path",
-        "certificate_path": "$cert_path"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ]
-}
+  cat << EOF > /etc/mo-hy2/config.yaml
+listen: :$port
+
+tls:
+  cert: $cert_path
+  key: $key_path
+
+quic:
+  initStreamReceiveWindow: 16777216
+  maxStreamReceiveWindow: 16777216
+  initConnReceiveWindow: 33554432
+  maxConnReceiveWindow: 33554432
+
+auth:
+  type: password
+  password: $auth_pwd
+
+masquerade:
+  type: proxy
+  proxy:
+    url: https://$proxysite
+    rewriteHost: true
 EOF
 
-  mkdir -p "$SB_DIR"
+  local last_port=$port
+  [[ -n "${firstport}" && -n "${endport}" ]] && last_port="$port,$firstport-$endport"
   
-  # 2. 写入通用客户端 sing-box.json 备份
-  cat << EOF > "$SB_DIR/sb-client.json"
-{
-  "log": {
-    "level": "info"
-  },
-  "outbounds": [
-    {
-      "type": "anytls",
-      "tag": "anytls-out",
-      "server": "$url_ip",
-      "server_port": $port,
-      "password": "$auth_pwd",
-      "tls": {
-        "enabled": true,
-        "server_name": "$sb_domain",
-        "insecure": true
-      }
-    },
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ]
-}
-EOF
-
-  # 3. 固化持久化节点数据（保存为文本形式，防止转移丢失）
-  cat << EOF > "$SB_DIR/url.txt"
-====== AnyTLS 节点信息 ======
-IP      : ${ip}
-端口    : $port
-密码    : $auth_pwd
----------------------------
-📄 V6VPS 请自行替换 IP 地址为 V6 ★
-[信息] V2rayN 链接：
-anytls://$auth_pwd@$url_ip:$port/?insecure=1#$hostname-Anytls
-[信息] Surge 配置：
-$hostname-Anytls = anytls, $url_ip, $port, password=$auth_pwd, tfo=true, skip-cert-verify=true, reuse=false
----------------------------------
-EOF
-
-  if is_user_exists "sing-box"; then
-    chown -R sing-box:sing-box /etc/mo-anytls-sb
+  local last_ip="$vps_ip"
+  local url_ip="$vps_ip"
+  if [[ "$vps_ip" =~ ":" ]]; then 
+    last_ip="[$vps_ip]"
   fi
 
-  # 4. 守护进程分支运行
+  mkdir -p "$HY_DIR"
+  
+  cat << EOF > "$HY_DIR/hy-client.yaml"
+server: $last_ip:$last_port
+auth: $auth_pwd
+tls:
+  sni: $hy_domain
+  insecure: $yaml_insecure
+quic:
+  initStreamReceiveWindow: 16777216
+  maxStreamReceiveWindow: 16777216
+  initConnReceiveWindow: 33554432
+  maxConnReceiveWindow: 33554432
+fastOpen: true
+socks5:
+  listen: 127.0.0.1:5678
+transport:
+  udp:
+    hopInterval: 30s 
+EOF
+
+  cat << EOF > "$HY_DIR/url.txt"
+V6VPS 请自行替换 IP 地址为 V6
+V2rayN 配置分享链接:
+hysteria2://$auth_pwd@$last_ip:$port?insecure=${is_insecure}&sni=$hy_domain#$HOSTNAME-hy2
+
+Surge  配置格式:
+$HOSTNAME-hy2 = hysteria2, $url_ip, $port, password=$auth_pwd, skip-cert-verify=${skip_cert}, sni=$hy_domain
+EOF
+
+  if is_user_exists "${HYSTERIA_USER:-hysteria}"; then
+    chown "${HYSTERIA_USER:-hysteria}":"${HYSTERIA_USER:-hysteria}" /etc/mo-hy2
+    chown "${HYSTERIA_USER:-hysteria}":"${HYSTERIA_USER:-hysteria}" /etc/mo-hy2/config.yaml 2>/dev/null || true
+    chown -h "${HYSTERIA_USER:-hysteria}":"${HYSTERIA_USER:-hysteria}" "$cert_path" "$key_path" 2>/dev/null || true
+  fi
+
   if has_command systemctl; then
     systemctl daemon-reload
-    systemctl enable mo-anytls-sb >/dev/null 2>&1 || true
-    systemctl restart mo-anytls-sb >/dev/null 2>&1 || true
+    systemctl enable mo-hy2 >/dev/null 2>&1 || true
+    systemctl restart mo-hy2 >/dev/null 2>&1 || true
     
-    if systemctl is-active --quiet mo-anytls-sb 2>/dev/null; then
-      info "sing-box (anytls) 服务配置并启动成功！"
+    if systemctl is-active --quiet mo-hy2 2>/dev/null; then
+      info "Hysteria 2 服务配置并启动成功！"
     else
-      error "sing-box 服务启动失败，请运行 'systemctl status mo-anytls-sb' 查看日志。"
+      error "Hysteria 2 服务启动失败，请运行 'systemctl status mo-hy2' 查看日志。"
     fi
   else
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-    "$EXECUTABLE_INSTALL_PATH" run --config $SB_CONFIG >/dev/null 2>&1 &
+    pkill -f "$EXECUTABLE_INSTALL_PATH server" || true
+    "$EXECUTABLE_INSTALL_PATH" server --config $HY_CONFIG >/dev/null 2>&1 &
     info "非 systemd 环境，程序已挂载至后台 Pid 进程池中运行。"
   fi
-  
   showconf
 }
 
 # =========================================================
-# 5. 主流程功能控制模块
+# 5. 主流程控制模块与更新功能
 # =========================================================
-instsingbox() {
+insthysteria() {
   check_environment
+  install_netfilter_persistent
   
   info "获取官方最新发布版本中..."
   local latest_version=$(get_latest_version)
@@ -520,48 +649,48 @@ instsingbox() {
     return 1
   fi
   
-  local _tmparchive=$(mktemp)
-  if ! download_singbox "$latest_version" "$_tmparchive"; then
-    rm -f "$_tmparchive" && return 1
+  local _tmpfile=$(mktemp)
+  if ! download_hysteria "$latest_version" "$_tmpfile"; then
+    rm -f "$_tmpfile" && return 1
   fi
 
-  echo -ne "正在解压并安装二进制可执行文件 ... "
-  local _tmpdir=$(mktemp -d)
-  tar -xzf "$_tmparchive" -C "$_tmpdir"
-  
-  if install -Dm755 "$_tmpdir"/sing-box-*/sing-box "$EXECUTABLE_INSTALL_PATH"; then
+  echo -ne "正在安装二进制可执行文件 ... "
+  if install -Dm755 "$_tmpfile" "$EXECUTABLE_INSTALL_PATH"; then
     echo "成功"
   else
-    rm -rf "$_tmparchive" "$_tmpdir" && error "安装失败" && return 1
+    rm -f "$_tmpfile" && error "安装失败" && return 1
   fi
-  rm -rf "$_tmparchive" "$_tmpdir"
+  rm -f "$_tmpfile"
 
-  SINGBOX_USER="sing-box"
-  SINGBOX_HOME_DIR="/var/lib/sing-box"
-  if ! is_user_exists "$SINGBOX_USER"; then
-    echo -ne "正在创建系统独立沙箱运行用户 $SINGBOX_USER ... "
-    useradd -r -d "$SINGBOX_HOME_DIR" -m "$SINGBOX_USER" >/dev/null 2>&1 || true
+  HYSTERIA_USER="hysteria"
+  HYSTERIA_HOME_DIR="/var/lib/hysteria"
+  if ! is_user_exists "$HYSTERIA_USER"; then
+    echo -ne "正在创建系统独立沙箱运行用户 $HYSTERIA_USER ... "
+    useradd -r -d "$HYSTERIA_HOME_DIR" -m "$HYSTERIA_USER" >/dev/null 2>&1 || true
     echo "成功"
   fi
 
   if has_command systemctl; then
-    install_content -Dm644 "$(tpl_singbox_server_service_base 'config')" "$SYSTEMD_SERVICES_DIR/mo-anytls-sb.service" "1"
-    install_content -Dm644 "$(tpl_singbox_server_service_base '%i')" "$SYSTEMD_SERVICES_DIR/mo-anytls-sb@.service" "1"
+    install_content -Dm644 "$(tpl_hysteria_server_service_base 'config')" "$SYSTEMD_SERVICES_DIR/mo-hy2.service" "1"
+    install_content -Dm644 "$(tpl_hysteria_server_service_base '%i')" "$SYSTEMD_SERVICES_DIR/hysteria-server@.service" "1"
   fi
 
+  firstport="" && endport=""
   inst_cert || return 1
   inst_port
   
-  # 优先支持自定义密码输入，直接回车则采用 16 位强随机密码
-  read -rp "设置 AnyTLS 验证密码 (直接回车将自动分配强随机密码): " auth_pwd
+  read -rp "设置 Hysteria 2 验证密码 (回车自动分配随机密码): " auth_pwd
   auth_pwd=${auth_pwd:-$(generate_random_password)}
+  
+  read -rp "请输入 Hysteria 2 的伪装网站地址 (默认: en.snu.ac.kr): " proxysite
+  proxysite=${proxysite:-"en.snu.ac.kr"}
 
   write_and_show_config
 }
 
-update_singbox() {
-  if [[ ! -f "$SB_BINARY" ]]; then
-    error "当前系统未安装 sing-box，无法执行更新。"
+update_hysteria() {
+  if [[ ! -f "$HY_BINARY" ]]; then
+    error "当前系统未安装 Hysteria 2，无法执行更新。"
     return 1
   fi
 
@@ -582,82 +711,86 @@ update_singbox() {
     return 0
   fi
 
-  warn "检测到新版本，即将开始平滑更新 (你的配置与运行数据不会改变)..."
+  warn "检测到新版本，即将开始平滑更新 (你的配置与端口规则不会改变)..."
   
-  local _tmparchive=$(mktemp)
-  if ! download_singbox "$latest_version" "$_tmparchive"; then
-    rm -f "$_tmparchive" && return 1
+  local _tmpfile=$(mktemp)
+  if ! download_hysteria "$latest_version" "$_tmpfile"; then
+    rm -f "$_tmpfile" && return 1
   fi
 
   echo -ne "正在覆盖二进制核心文件 ... "
-  local _tmpdir=$(mktemp -d)
-  tar -xzf "$_tmparchive" -C "$_tmpdir"
-  if install -Dm755 "$_tmpdir"/sing-box-*/sing-box "$EXECUTABLE_INSTALL_PATH"; then
+  if install -Dm755 "$_tmpfile" "$EXECUTABLE_INSTALL_PATH"; then
     echo "成功"
   else
-    rm -rf "$_tmparchive" "$_tmpdir" && error "覆盖核心失败" && return 1
+    rm -f "$_tmpfile" && error "覆盖核心失败" && return 1
   fi
-  rm -rf "$_tmparchive" "$_tmpdir"
+  rm -f "$_tmpfile"
 
-  info "正在重启 sing-box 服务以应用更新..."
+  info "正在重启 Hysteria 2 服务以应用更新..."
   if has_command systemctl; then
     systemctl daemon-reload
-    systemctl restart mo-anytls-sb >/dev/null 2>&1 || true
-    if systemctl is-active --quiet mo-anytls-sb 2>/dev/null; then
-      info "sing-box 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
+    systemctl restart mo-hy2 >/dev/null 2>&1 || true
+    if systemctl is-active --quiet mo-hy2 2>/dev/null; then
+      info "Hysteria 2 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
     else
-      error "核心更新成功，但服务重启失败，请运行 'systemctl status mo-anytls-sb' 检查错误。"
+      error "核心更新成功，但服务重启失败，请运行 'systemctl status mo-hy2' 检查错误。"
     fi
   else
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-    "$EXECUTABLE_INSTALL_PATH" run --config "$SB_CONFIG" >/dev/null 2>&1 &
-    info "sing-box 核心已更新并于后台重启运行。"
+    pkill -f "$EXECUTABLE_INSTALL_PATH server" || true
+    "$EXECUTABLE_INSTALL_PATH" server --config "$HY_CONFIG" >/dev/null 2>&1 &
+    info "Hysteria 2 核心已更新并于后台重启运行。"
   fi
 }
 
-unstsingbox() {
-  warn "即将从当前系统中彻底卸载 sing-box"
+unsthysteria() {
+  warn "即将从当前系统中彻底卸载 Hysteria 2"
 
   if has_command systemctl; then
-    systemctl stop mo-anytls-sb >/dev/null 2>&1 || true
-    systemctl disable mo-anytls-sb >/dev/null 2>&1 || true
-    remove_file "$SYSTEMD_SERVICES_DIR/mo-anytls-sb.service"
-    remove_file "$SYSTEMD_SERVICES_DIR/mo-anytls-sb@.service"
+    systemctl stop mo-hy2 >/dev/null 2>&1 || true
+    systemctl disable mo-hy2 >/dev/null 2>&1 || true
+    remove_file "$SYSTEMD_SERVICES_DIR/mo-hy2.service"
+    remove_file "$SYSTEMD_SERVICES_DIR/hysteria-server@.service"
     systemctl daemon-reload
   else
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
+    pkill -f "$EXECUTABLE_INSTALL_PATH server" || true
   fi
   
   remove_file "$EXECUTABLE_INSTALL_PATH"
-  rm -rf /etc/mo-anytls-sb "$SB_DIR"
+  rm -rf /etc/mo-hy2 "$HY_DIR"
+  
+  iptables -t nat -F PREROUTING >/dev/null 2>&1 || true
+  ip6tables -t nat -F PREROUTING >/dev/null 2>&1 || true
+  has_command netfilter-persistent && netfilter-persistent save >/dev/null 2>&1 || true
 
-  info "sing-box 已彻底从您的系统中移除！"
+  info "Hysteria 2 已彻底从您的系统中移除！"
 }
 
 changeconf() {
-  if [[ ! -f "$SB_CONFIG" ]]; then
-    error "配置文件不存在，请先安装 sing-box"
+  if [[ ! -f "$HY_CONFIG" ]]; then
+    error "配置文件不存在，请先安装 Hysteria 2"
     return 1
   fi
 
-  local old_pwd=$(jq -r '.inbounds[0].users[0].password' "$SB_CONFIG" 2>/dev/null || true)
-  local old_cert=$(jq -r '.inbounds[0].tls.certificate_path' "$SB_CONFIG" 2>/dev/null || true)
-  local old_key=$(jq -r '.inbounds[0].tls.key_path' "$SB_CONFIG" 2>/dev/null || true)
-  local old_sni=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || "www.bing.com")
+  local old_pwd=$(grep -E '^\s*password:' "$HY_CONFIG" | awk '{print $2}' | tr -d '"'\' || true)
+  local old_cert=$(grep -E '^\s*cert:' "$HY_CONFIG" | awk '{print $2}' | tr -d '"'\' || true)
+  local old_key=$(grep -E '^\s*key:' "$HY_CONFIG" | awk '{print $2}' | tr -d '"'\' || true)
+  local old_site=$(grep -E '^\s*url:' "$HY_CONFIG" | awk '{print $2}' | sed 's#https://##' | tr -d '"'\' || true)
+  local old_sni="www.bing.com"
+  [[ -f "$HY_DIR/hy-client.yaml" ]] && old_sni=$(grep -E '^\s*sni:' "$HY_DIR/hy-client.yaml" | awk '{print $2}' | tr -d '"'\' || true)
 
   clear
-  echo -e "${GREEN}====== 修改 sing-box (AnyTLS) 配置 ======${RESET}"
+  echo -e "${GREEN}====== 修改 Hysteria 2 配置 ======${RESET}"
   echo "提示：直接敲回车将保持原有配置不变"
   echo "---------------------------------------------"
   
+  firstport="" && endport=""
   inst_port 
 
   local auth_pwd
-  # 这里的修改配置模块同样支持自定义新密码，回车则沿用旧密码
-  read -rp "设置 AnyTLS 新密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
+  read -rp "设置 Hysteria 2 密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
   auth_pwd=${auth_pwd:-$old_pwd}
 
-  local cert_path key_path sb_domain
+  local cert_path key_path hy_domain
   echo "---------------------------------------------"
   read -rp "是否需要修改证书？[y/N] (直接回车默认不修改): " change_cert_flag
   if [[ "$change_cert_flag" == "y" || "$change_cert_flag" == "Y" ]]; then
@@ -665,56 +798,33 @@ changeconf() {
   else
     cert_path="$old_cert"
     key_path="$old_key"
-    sb_domain="$old_sni"
+    hy_domain="$old_sni"
   fi
+
+  local proxysite
+  echo "---------------------------------------------"
+  read -rp "请输入新的伪装网站地址 [当前: ${old_site}, 回车不修改]: " proxysite
+  proxysite=${proxysite:-$old_site}
 
   write_and_show_config
   info "配置修改并应用成功！"
 }
 
 showconf() {
-  if [[ ! -f "$SB_CONFIG" ]]; then
-    error "未找到 AnyTLS 配置文件，请确保已成功部署节点。"
+  if [[ ! -d "$HY_DIR" ]]; then
+    error "未找到客户端配置文件。"
     return
   fi
-
-  # 实时从服务端核心配置中提取参数，确保 100% 准确
-  local hostname=$(hostname -s | sed 's/ /_/g')
-  local main_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "18055")
-  local auth_pwd=$(jq -r '.inbounds[0].users[0].password' "$SB_CONFIG" 2>/dev/null || echo "密码")
-  local sb_domain=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || echo "anyoo.vfz.dpdns.org")
-  
-  # 自动判定证书校验逻辑：如果是 bing.com 的自签证书，则客户端必须 insecure=1；如果是合法 Acme 证书，则 insecure=0
-  local is_insecure="0"
-  local skip_cert="false"
-  if [[ "$sb_domain" == "www.bing.com" ]]; then
-    is_insecure="1"
-    skip_cert="true"
-  fi
-
-  local ip=$(get_public_ip)
-  local url_ip="$ip"
-  if [[ "$ip" =~ ":" ]]; then 
-    url_ip="[$ip]"
-  fi
-
-  echo -e "${GREEN}====== AnyTLS 节点信息 ======${RESET}"
-  echo -e "${YELLOW}IP      : ${ip}${RESET}"
-  echo -e "${YELLOW}端口    : ${main_port}${RESET}"
-  echo -e "${YELLOW}密码    : ${auth_pwd}${RESET}"
-  echo -e "${YELLOW}SNI    : ${sb_domain}${RESET}"
-  echo -e "${GREEN}---------------------------${RESET}"
-  echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
-  echo -e "${GREEN}[信息] V2rayN 链接：${RESET}"
-  echo -e "${YELLOW}anytls://${auth_pwd}@${url_ip}:${main_port}?security=tls&sni=${sb_domain}&insecure=${is_insecure}&allowInsecure=${is_insecure}&type=tcp&headerType=none#${hostname}-Anytls${RESET}"
-  echo -e "${GREEN}[信息] Surge 配置：${RESET}"
-  echo -e "${YELLOW}${hostname}-Anytls = anytls, ${url_ip}, ${main_port}, password=${auth_pwd}, sni=${sb_domain}, tfo=true, skip-cert-verify=${skip_cert}, reuse=false${RESET}"
-  echo -e "${YELLOW}---------------------------------${RESET}"
+  echo -e "${GREEN}====== 客户端 YAML 配置 ======${RESET}"
+  cat "$HY_DIR/hy-client.yaml"
+  echo
+  echo -e "${GREEN}====== 节点分享链接 ======${RESET}"
+  cat "$HY_DIR/url.txt"
   echo
 }
 
 # =========================================================
-# 6. 面板主菜单循环
+# 6. 面板主菜单
 # =========================================================
 menu() {
   [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
@@ -722,24 +832,24 @@ menu() {
 
   while true; do
     clear
-    local status=$(get_sb_status)
+    local status=$(get_hy_status)
     local version=$(get_installed_version)
     local port_show=$(get_current_port_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      Sing-box AnyTLS 面板      ${RESET}"
+    echo -e "${GREEN}      Hysteria 2 管理面板       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Sing-box AnyTLS${RESET}"
-    echo -e "${GREEN}2. 更新 Sing-box AnyTLS${RESET}"
-    echo -e "${GREEN}3. 卸载 Sing-box AnyTLS${RESET}"
+    echo -e "${GREEN}1. 安装 Hysteria 2${RESET}"
+    echo -e "${GREEN}2. 更新 Hysteria 2${RESET}"
+    echo -e "${GREEN}3. 卸载 Hysteria 2${RESET}"
     echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 Sing-box AnyTLS${RESET}"
-    echo -e "${GREEN}6. 停止 Sing-box AnyTLS${RESET}"
-    echo -e "${GREEN}7. 重启 Sing-box AnyTLS${RESET}"
+    echo -e "${GREEN}5. 启动 Hysteria 2${RESET}"
+    echo -e "${GREEN}6. 停止 Hysteria 2${RESET}"
+    echo -e "${GREEN}7. 重启 Hysteria 2${RESET}"
     echo -e "${GREEN}8. 查看日志${RESET}"
     echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
@@ -750,38 +860,38 @@ menu() {
     [[ -z "$choice" ]] && continue
 
     case "$choice" in
-      1) instsingbox; pause ;;
-      2) update_singbox; pause ;;
-      3) unstsingbox; pause ;;
+      1) insthysteria; pause ;;
+      2) update_hysteria; pause ;;
+      3) unsthysteria; pause ;;
       4) changeconf; pause ;;
       5) 
         if has_command systemctl; then
-          systemctl start mo-anytls-sb && info "服务已成功启动！"
+          systemctl start mo-hy2 && info "服务已成功启动！"
         else
-          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-          "$EXECUTABLE_INSTALL_PATH" run --config "$SB_CONFIG" >/dev/null 2>&1 &
+          pkill -f "$EXECUTABLE_INSTALL_PATH server" || true
+          "$EXECUTABLE_INSTALL_PATH" server --config "$HY_CONFIG" >/dev/null 2>&1 &
           info "进程已在后台启动！"
         fi
         pause ;;
       6) 
         if has_command systemctl; then
-          systemctl stop mo-anytls-sb && info "服务已成功停止！"
+          systemctl stop mo-hy2 && info "服务已成功停止！"
         else
-          pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台进程已终止！"
+          pkill -f "$EXECUTABLE_INSTALL_PATH server" && info "后台进程已终止！"
         fi
         pause ;;
       7) 
         if has_command systemctl; then
-          systemctl restart mo-anytls-sb && info "服务已成功重启！"
+          systemctl restart mo-hy2 && info "服务已成功重启！"
         else
-          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-          "$EXECUTABLE_INSTALL_PATH" run --config "$SB_CONFIG" >/dev/null 2>&1 &
+          pkill -f "$EXECUTABLE_INSTALL_PATH server" || true
+          "$EXECUTABLE_INSTALL_PATH" server --config "$HY_CONFIG" >/dev/null 2>&1 &
           info "后台进程已重启！"
         fi
         pause ;;
       8) 
         if has_command systemctl; then
-          journalctl -u mo-anytls-sb.service -n 50 --no-pager
+          journalctl -u mo-hy2.service -n 50 --no-pager
         else
           warn "当前环境不支持 systemd 集中日志管理。"
         fi

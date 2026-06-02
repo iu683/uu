@@ -1,372 +1,60 @@
 #!/bin/bash
+# ========================================
+# 安全版 Debian 重装执行器
+# 功能: 下载远程重装脚本，执行前安全确认
+# ========================================
 
-# =========================================================
-# Xray Socks5 管理脚本 (Alpine Linux ) 
-# =========================================================
+REINSTALL_URL="https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
+SCRIPT_NAME="reinstall.sh"
 
-set -Eeuo pipefail
-
-# ================== 颜色定义 ==================
+# 颜色
 GREEN="\033[32m"
 RED="\033[31m"
-YELLOW="\033[33m"
-BLUE="\033[34m"
 RESET="\033[0m"
 
-# ================== 🚀 服务自定义重命名 ==================
-readonly SERV_NAME="xray-socks5"
+echo -e "${GREEN}警告: 此操作将会完全重装系统，磁盘上所有数据将丢失！${RESET}"
+echo -e "${GREEN}请确保已备份重要数据！${RESET}"
 
-# ================== 📂 自定义分享链接存放路径 ==================
-readonly X_LINK_DIR="/root/proxynode/socks5"
+# 用户确认
+read -p $'\033[31m你确定要继续吗？(y/n): \033[0m' CONFIRM
+if [[ "$CONFIRM" != "y" ]]; then
+    echo -e "${RED}已取消操作${RESET}"
+    exit 1
+fi
 
-# ================== 路径与日志 (自动联动) ==================
-readonly X_DIR="/etc/${SERV_NAME}"
-readonly X_CONFIG="${X_DIR}/config.json"
-readonly X_BIN="/usr/local/bin/${SERV_NAME}"
-readonly X_LINK="${X_LINK_DIR}/${SERV_NAME}_socks5.txt"
-readonly X_LOG="/var/log/${SERV_NAME}.log"
-readonly INIT_FILE="/etc/init.d/${SERV_NAME}"
+# 用户名（默认 root）
+read -p "请输入用户名 (默认 root): " USERNAME
+USERNAME=${USERNAME:-root}
 
-# ================== 核心工具 ==================
-info() { echo -e "${GREEN}[信息] $*${RESET}"; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}"; }
-error() { echo -e "${RED}[错误] $*${RESET}"; }
-pause() { echo; echo -ne "${GREEN}按任意键返回菜单...${RESET}"; read -n 1 -s; echo; }
+# 可见输入密码（不隐藏）
+read -p "请输入 ${USERNAME} 密码 (用于重装系统): " ROOT_PASS
+if [[ -z "$ROOT_PASS" ]]; then
+    echo -e "${RED}❌ 密码不能为空，已取消操作。${RESET}"
+    exit 1
+fi
 
-is_valid_port() {
-    local port=$1
-    if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
-        return 0
-    else
-        return 1
-    fi
-}
+# SSH 端口
+read -p "请输入 SSH 端口 (默认 22): " SSH_PORT
+SSH_PORT=${SSH_PORT:-22}
 
-get_xray_status() {
-    if rc-service "$SERV_NAME" status 2>/dev/null | grep -q "started"; then
-        echo -e "${GREEN}● 运行中 ${RESET}"
-    else 
-        echo -e "${RED}● 未运行 ${RESET}"
-    fi
-}
+# 下载脚本
+if ! wget -q "$REINSTALL_URL" -O "$SCRIPT_NAME"; then
+    echo -e "${RED}❌ 下载失败，请检查网络或 URL。${RESET}"
+    exit 1
+fi
 
-get_xray_version() {
-    if [[ -x "$X_BIN" ]]; then
-        "$X_BIN" version 2>/dev/null | head -n 1 | awk '{print $2}'
-    else
-        echo "未安装"
-    fi
-}
+chmod +x "$SCRIPT_NAME"
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    error "无法获取公网 IP 地址。" && return 1
-}
+# 执行重装脚本
+echo -e "${GREEN}🔧 正在执行重装...${RESET}"
+./"$SCRIPT_NAME" debian 13 \
+    --username "$USERNAME" \
+    --password "$ROOT_PASS" \
+    --ssh-port "$SSH_PORT"
 
-HOSTNAME=$(hostname -s | sed 's/ /_/g')
+# 绿色重启提示
+echo -e "${GREEN}✔ 系统将在完成后重启。${RESET}"
+read -p "按 Enter 确认重启..." dummy
 
-# ================== 配置写入 ==================
-write_config() {
-    local port=$1 user=$2 pass=$3
-    mkdir -p "$X_DIR" && chmod 755 "$X_DIR"
-    
-    # 构造 accounts 数组
-    local accounts_json="[]"
-    if [[ -n "$user" && -n "$pass" ]]; then
-        accounts_json="[{\"user\": \"$user\", \"pass\": \"$pass\"}]"
-    fi
-
-    cat > "$X_CONFIG" <<EOF
-{
-    "log": { "loglevel": "warning" },
-    "inbounds": [{
-        "port": $port,
-        "protocol": "socks",
-        "settings": {
-            "auth": "$([[ -n "$user" && -n "$pass" ]] && echo "password" || echo "noauth")",
-            "accounts": $accounts_json,
-            "udp": true
-        }
-    }],
-    "outbounds": [{
-        "protocol": "freedom",
-        "settings": { "domainStrategy": "UseIPv4v6" }
-    }]
-}
-EOF
-}
-
-# ================== 修改配置 ==================
-modify_config() {
-    if [[ ! -f "$X_CONFIG" ]]; then error "请先安装 Xray"; return; fi
-    
-    local curr_port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
-    local curr_auth=$(jq -r '.inbounds[0].settings.auth // "noauth"' "$X_CONFIG")
-    local curr_user=$(jq -r '.inbounds[0].settings.accounts[0].user // empty' "$X_CONFIG" 2>/dev/null || echo "")
-    local curr_pass=$(jq -r '.inbounds[0].settings.accounts[0].pass // empty' "$X_CONFIG" 2>/dev/null || echo "")
-
-    # 1. 修改端口
-    local n_port=""
-    while true; do
-        echo -ne "请输入新 Socks5 端口 (回车保持 $curr_port): "; read n_port
-        n_port=${n_port:-$curr_port}
-        is_valid_port "$n_port" && break || error "端口无效，请输入 1-65535 之间的数字。"
-    done
-
-    # 2. 修改认证模式
-    local n_user="" n_pass="" auth_choice=""
-    local current_mode="密码认证"
-    [[ "$curr_auth" == "noauth" ]] && current_mode="免密认证"
-
-    echo -e "${GREEN}请选择新的认证方式 [当前: ${current_mode}]:${RESET}"
-    echo -e " 1. 密码认证"
-    echo -e " 2. 免密认证"
-    
-    while true; do
-        echo -ne "请输入选项 [1-2, 回车保持当前]: "; read auth_choice
-        
-        # 回车保持当前
-        if [[ -z "$auth_choice" ]]; then
-            n_user="$curr_user"
-            n_pass="$curr_pass"
-            if [[ "$curr_auth" == "password" ]]; then
-                echo -ne "请输入新用户名 (回车保持当前): "; read temp_user
-                n_user=${temp_user:-$curr_user}
-                
-                echo -ne "请输入新密码 (回车保持当前): "; read temp_pass
-                n_pass=${temp_pass:-$curr_pass}
-            fi
-            break
-        fi
-
-        if [[ "$auth_choice" == "1" ]]; then
-            echo -ne "请输入新用户名 [旧:${curr_user:-无}, 回车自动生成]: "; read temp_user
-            if [[ -z "$temp_user" ]]; then
-                n_user=$(openssl rand -hex 4)
-                info "👉 已自动生成随机账号：${n_user}"
-            else
-                n_user="$temp_user"
-            fi
-
-            echo -ne "请输入新密码 [旧:${curr_pass:-无}, 回车自动生成]: "; read temp_pass
-            if [[ -z "$temp_pass" ]]; then
-                n_pass=$(openssl rand -hex 8)
-                info "👉 已自动生成高强度密码：${n_pass}"
-            else
-                n_pass="$temp_pass"
-            fi
-            break
-        elif [[ "$auth_choice" == "2" ]]; then
-            n_user=""
-            n_pass=""
-            info "👉 已切换为：免密认证 (NoAuth)"
-            break
-        else
-            error "输入无效，请输入 1 或 2"
-        fi
-    done
-
-    write_config "$n_port" "$n_user" "$n_pass"
-    rc-service "$SERV_NAME" restart
-    
-    # 生成新链接
-    local ip=$(get_public_ip || echo "127.0.0.1")
-    local enc_ip=$(echo -n "$ip" | jq -sRr @uri)
-    local enc_user=$(echo -n "$n_user" | jq -sRr @uri)
-    local enc_pass=$(echo -n "$n_pass" | jq -sRr @uri)
-
-    mkdir -p "$X_LINK_DIR"
-    if [[ -n "$n_user" ]]; then
-        echo "socks://${enc_user}:${enc_pass}@${ip}:${n_port}#${HOSTNAME}-socks5" > "$X_LINK"
-        echo "https://t.me/socks?server=${enc_ip}&port=${n_port}&user=${enc_user}&pass=${enc_pass}" >> "$X_LINK"
-    else
-        echo "socks://${ip}:${n_port}#${HOSTNAME}-socks5" > "$X_LINK"
-        echo "https://t.me/socks?server=${enc_ip}&port=${n_port}" >> "$X_LINK"
-    fi
-    info "配置已更新并成功重启服务！"
-}
-# ================== 安装与管理 (账号密码彻底解耦独立生产) ==================
-install_xray() {
-    info "正在安装依赖与内核..."
-    apk update && apk add curl unzip jq uuidgen gcompat libc6-compat bc openssl > /dev/null 2>&1
-    mkdir -p "$X_DIR" && sync
-    
-    local arch=$(uname -m | sed 's/x86_64/64/;s/aarch64/arm64-v8a/')
-    local ver=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
-    
-    info "下载 Xray $ver ($arch)..."
-    curl -L -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/$ver/Xray-linux-$arch.zip"
-    unzip -o /tmp/xray.zip -d /tmp/xray_tmp > /dev/null
-    mv -f /tmp/xray_tmp/xray "$X_BIN" && chmod +x "$X_BIN"
-    rm -rf /tmp/xray*
-    
-    if [[ ! -f "$X_CONFIG" ]]; then
-        local port=""
-        while true; do
-            echo -ne "${GREEN}请输入入站端口 (回车随机): ${RESET}"; read port
-            [[ -z "$port" ]] && port=$((RANDOM % 45535 + 10000))
-            is_valid_port "$port" && break || error "端口无效，请输入 1-65535 之间的数字。"
-        done
-        
-        # 显式初始化变量，安全通过 set -u 检查
-        local user="" pass="" auth_choice=""
-        
-        # 提供认证选项菜单
-        echo -e "${GREEN}请选择认证方式:${RESET}"
-        echo -e " 1. 密码认证 (需要用户名和密码)"
-        echo -e " 2. 免密认证 (允许任何人直接连接)"
-        while true; do
-            echo -ne "${GREEN}请输入选项 [1-2, 默认 1]: ${RESET}"; read auth_choice
-            auth_choice="${auth_choice:-1}"
-
-            if [[ "$auth_choice" == "1" ]]; then
-                # 独立询问用户名
-                echo -ne "${GREEN}请输入 Socks5 用户名 (直接回车默认随机生成): ${RESET}"; read user
-                if [[ -z "$user" ]]; then
-                    user=$(openssl rand -hex 4)   # 8位随机字符
-                    info "👉 采用默认随机生成用户名: ${user}"
-                fi
-                
-                # 独立询问密码
-                echo -ne "${GREEN}请输入 Socks5 密码 (直接回车默认随机生成): ${RESET}"; read pass
-                if [[ -z "$pass" ]]; then
-                    pass=$(openssl rand -hex 8)   # 16位随机字符
-                    info "👉 采用默认随机生成密码: ${pass}"
-                fi
-                break
-            elif [[ "$auth_choice" == "2" ]]; then
-                user=""
-                pass=""
-                info "👉 已选择：免密认证 (NoAuth)"
-                break
-            else
-                error "输入无效，请输入 1 或 2"
-            fi
-        done
-        
-        write_config "$port" "$user" "$pass"
-        
-        # 写入 OpenRC 服务脚本
-        cat << EOF > "$INIT_FILE"
-#!/sbin/openrc-run
-command="${X_BIN}"
-command_args="run -c ${X_CONFIG}"
-command_background="yes"
-pidfile="/run/${SERV_NAME}.pid"
-output_log="$X_LOG"
-error_log="$X_LOG"
-EOF
-        chmod +x "$INIT_FILE"
-        touch "$X_LOG"
-        rc-update add "$SERV_NAME" default >/dev/null 2>&1
-    fi
-
-    rc-service "$SERV_NAME" restart
-    
-    # 读取配置生成双链接 (修复未赋值引起的报错)
-    local ip=$(get_public_ip || echo "127.0.0.1")
-    local c_port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
-    local c_user=$(jq -r '.inbounds[0].settings.accounts[0].user // empty' "$X_CONFIG" 2>/dev/null || echo "")
-    local c_pass=$(jq -r '.inbounds[0].settings.accounts[0].pass // empty' "$X_CONFIG" 2>/dev/null || echo "")
-    
-    local enc_ip=$(echo -n "$ip" | jq -sRr @uri)
-    local enc_user=$(echo -n "$c_user" | jq -sRr @uri)
-    local enc_pass=$(echo -n "$c_pass" | jq -sRr @uri)
-    
-    mkdir -p "$X_LINK_DIR"
-    if [[ -n "$c_user" ]]; then
-        echo "socks://${enc_user}:${enc_pass}@${ip}:${c_port}#${HOSTNAME}-socks5" > "$X_LINK"
-        echo "https://t.me/socks?server=${enc_ip}&port=${c_port}&user=${enc_user}&pass=${enc_pass}" >> "$X_LINK"
-    else
-        echo "socks://${ip}:${c_port}#${HOSTNAME}-socks5" > "$X_LINK"
-        echo "https://t.me/socks?server=${enc_ip}&port=${c_port}" >> "$X_LINK"
-    fi
-
-    show_current_config
-}
-# ================== 显示配置 ==================
-show_current_config() {
-    if [[ ! -f "$X_CONFIG" ]]; then
-        error "配置文件不存在"
-        return
-    fi
-
-    local ip port user pass auth_mode
-    ip=$(get_public_ip || echo "未知")
-    port=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "未知")
-    user=$(jq -r '.inbounds[0].settings.accounts[0].user // "无"' "$X_CONFIG" 2>/dev/null || echo "无")
-    pass=$(jq -r '.inbounds[0].settings.accounts[0].pass // "无"' "$X_CONFIG" 2>/dev/null || echo "无")
-    
-    local auth_status=$(jq -r '.inbounds[0].settings.auth' "$X_CONFIG" 2>/dev/null || echo "noauth")
-    [[ "$auth_status" == "password" ]] && auth_mode="用户名密码验证" || auth_mode="匿名免密 (noauth)"
-
-    echo -e "\n${GREEN}====== 当前配置详情 ======${RESET}"
-    echo -e "${YELLOW}IP地址       : ${ip}${RESET}"
-    echo -e "${YELLOW}端口         : ${port}${RESET}"
-    echo -e "${YELLOW}用户名       : ${user}${RESET}"
-    echo -e "${YELLOW}密码         : ${pass}${RESET}"
-    echo -e "${YELLOW}分享存放路径 : ${X_LINK}${RESET}"
-    
-    if [[ -f "$X_LINK" ]]; then
-        echo -e "${GREEN}====== 👉 通用客户端 Socks5 链接 ======${RESET}"
-        sed -n '1p' "$X_LINK"
-        echo -e "${GREEN}====== 🚀 Telegram 内置一键代理链接 ======${RESET}"
-        sed -n '2p' "$X_LINK"
-    fi
-}
-
-# ================== 菜单 ==================
-show_menu() {
-    clear
-    local status=$(get_xray_status)
-    local version=$(get_xray_version)
-    local port_show="-"
-    [[ -f "$X_CONFIG" ]] && port_show=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "-")
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      Xray Socks5 管理面板       ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $status"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 Xray Socks5 ${RESET}"
-    echo -e "${GREEN} 2. 更新 Xray${RESET}"
-    echo -e "${GREEN} 3. 卸载 Xray${RESET}"
-    echo -e "${GREEN} 4. 修改配置${RESET}"
-    echo -e "${GREEN} 5. 启动 Xray${RESET}"
-    echo -e "${GREEN} 6. 停止 Xray${RESET}"
-    echo -e "${GREEN} 7. 重启 Xray${RESET}"
-    echo -e "${GREEN} 8. 查看日志${RESET}"
-    echo -e "${GREEN} 9. 查看节点配置${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-}
-
-while true; do
-    show_menu
-    echo -ne "${GREEN}请输入选项: ${RESET}"; read choice
-    case $choice in
-        1|2) install_xray; pause ;;
-        3) 
-            rc-service "$SERV_NAME" stop 2>/dev/null || true
-            rc-update del "$SERV_NAME" default 2>/dev/null || true
-            rm -rf "$X_DIR" "$X_BIN" "$INIT_FILE" "$X_LINK" "$X_LOG" "$X_LINK_DIR"
-            info "卸载完成"
-            pause 
-            ;;
-        4) modify_config; pause ;;
-        5) rc-service "$SERV_NAME" start; pause ;;
-        6) rc-service "$SERV_NAME" stop; pause ;;
-        7) rc-service "$SERV_NAME" restart; pause ;;
-        8) [[ -f "$X_LOG" ]] && tail -f "$X_LOG" || error "暂无日志"; pause ;;
-        9) show_current_config || error "无配置"; pause ;;
-        0) exit 0 ;;
-        *) error "无效选项"; sleep 1 ;;
-    esac
-done
+echo -e "${GREEN}>>> 正在重启系统...${RESET}"
+reboot

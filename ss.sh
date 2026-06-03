@@ -15,12 +15,12 @@ CUSTOM_SSL_BASE="/etc/nginx/custom_ssl"
 mkdir -p "$CUSTOM_SSL_BASE"
 
 # ------------------------------
-# 顶层看板动态数据获取 (适配 OpenRC)
+# 顶层看板动态数据获取
 # ------------------------------
 get_nginx_status() {
     if ! command -v nginx >/dev/null 2>&1; then
         STATUS="${RED}未安装${RESET}"
-    elif rc-service nginx status >/dev/null 2>&1; then
+    elif pgrep -x nginx >/dev/null 2>&1; then
         STATUS="${YELLOW}运行中${RESET}"
     else
         STATUS="${RED}已停止${RESET}"
@@ -50,6 +50,7 @@ get_site_count() {
         SITE_COUNT="0"
     fi
 }
+
 
 # ------------------------------
 # 核心功能函数
@@ -218,19 +219,37 @@ check_domain_resolution() {
     fi
 }
 
-# 新增功能：平滑重载 Nginx 配置
+# 新增功能：平滑重载或智能复活 Nginx 配置
 reload_nginx() {
     echo -e "${GREEN}正在验证 Nginx 配置语法...${RESET}"
+    
+    # 1. 严格的语法检查前置
     if nginx -t; then
-        echo -e "${GREEN}语法验证通过，正在平滑重载 OpenRC Nginx 服务...${RESET}"
-        if rc-service nginx reload; then
+        echo -e "${GREEN}语法验证通过，正在尝试平滑重载...${RESET}"
+        
+        # 2. 尝试标准平滑重载（静音处理，不让不必要的报错干扰控制台）
+        if rc-service nginx reload >/dev/null 2>&1; then
             echo -e "${GREEN}✅ Nginx 配置重载成功！${RESET}"
         else
-            echo -e "${RED}❌ 重载失败！服务可能未在运行，尝试直接启动...${RESET}"
-            rc-service nginx start
+            echo -e "${YELLOW}⚠️ 重载失败（服务当前未运行或状态异常），正在尝试智能修复并启动...${RESET}"
+            
+            # 3. 核心救活逻辑：清理旧积压
+            killall nginx >/dev/null 2>&1      # 确保无孤儿进程占用 80/443
+            rc-service nginx zap >/dev/null 2>&1  # 强制重置 OpenRC 的假死缓存状态
+            
+            # 4. 重新正式拉起服务
+            echo -e "${GREEN}正在启动 Nginx 服务...${RESET}"
+            if rc-service nginx start; then
+                echo -e "${GREEN}✅ Nginx 服务已成功启动，新配置已生效！${RESET}"
+                return 0 
+            else
+                echo -e "${RED}❌ 致命错误：Nginx 无法启动，请检查端口是否被其他非 Nginx 程序占用！${RESET}"
+                return 1
+            fi
         fi
     else
         echo -e "${RED}❌ Nginx 配置语法错误！未执行重载，请检查上方的错误提示。${RESET}"
+        return 1
     fi
     pause
 }
@@ -262,7 +281,7 @@ install_nginx() {
     create_default_server
     
     rc-update add nginx default
-    rc-service nginx start
+
     
     echo
     echo -ne "${YELLOW}是否现在配置反向代理并申请证书？(y/n,默认y): ${RESET}"
@@ -296,25 +315,69 @@ install_nginx() {
     sort -u "$EMAIL_FILE" -o "$EMAIL_FILE"
     echo -ne "${GREEN}请输入域名(例如:example.com): ${RESET}"; read DOMAIN
     check_domain_resolution "$DOMAIN"
-    echo -ne "${GREEN}请输入公网访问端口 (直接回车默认 443): ${RESET}"; read LISTEN_PORT
+    echo -ne "${GREEN}请输入公网访问端口 (直接回车默认 443): ${RESET}"
+    read LISTEN_PORT
     LISTEN_PORT=${LISTEN_PORT:-443}
     echo -ne "${GREEN}请输入反代目标(例如:http://127.0.0.1:5788): ${RESET}"; read TARGET
-    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n，默认 y): ${RESET}"; read IS_WS
+    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n，默认 y): ${RESET}"
+    read IS_WS
     IS_WS=${IS_WS:-y}
 
     echo -ne "${GREEN}请输入最大上传大小 (默认 200M): ${RESET}"
     read MAX_SIZE
     MAX_SIZE=${MAX_SIZE:-200M}
 
-    certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-    generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE" "" "" "$LISTEN_PORT"
-    nginx -t && rc-service nginx reload
 
+    # ==================== 🛠️ 核心修改部分 ====================
+    echo -e "${GREEN}正在通过 --nginx 模式向 Let's Encrypt 申请证书...${RESET}"
+    
+    # 显式指定 Alpine 下的 Nginx 配置目录和控制路径，防止 Certbot 找不到服务瞎折腾
+    certbot certonly --nginx \
+        --nginx-server-root /etc/nginx \
+        --nginx-ctl /usr/sbin/nginx \
+        -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
+
+    # 安全检查防线：只有证书确实生成了，才去写入反代配置
+    if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
+        echo -e "${GREEN}✅ 证书申请成功！正在生成业务配置文件...${RESET}"
+        
+        # 写入你的反代配置
+        generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE" "" "" "$LISTEN_PORT"
+
+        # 2. 【核心修复】证书申请完后，彻底清理 Certbot 
+        killall nginx >/dev/null 2>&1      # 强杀 Certbot 没关干净的临时进程，释放 80 端口
+        rc-service nginx zap >/dev/null 2>&1  # 强制重置 OpenRC 错乱的服务状态
+ 
+ 
+        echo -e "${GREEN}正在启动 Nginx 服务...${RESET}"
+        rc-service nginx start
+        
+        
+        # 测试新配置并热重载 Nginx
+        if nginx -t; then
+            rc-service nginx reload
+            echo -e "${GREEN}安装完成！配置已生效。${RESET}"
+            if [ "$LISTEN_PORT" = "443" ]; then
+                echo -e "${GREEN}访问地址: https://$DOMAIN${RESET}"
+            else
+                echo -e "${GREEN}访问地址: https://$DOMAIN:$LISTEN_PORT${RESET}"
+            fi
+        else
+            echo -e "${RED}❌ 错误: Nginx 最终业务配置语法测试失败，执行安全回滚！${RESET}"
+            rm -f "/etc/nginx/sites-enabled/$DOMAIN" 2>/dev/null
+            rc-service nginx reload
+        fi
+    else
+        echo -e "${RED}❌ 错误: Certbot --nginx 模式证书申请失败！${RESET}"
+        echo -e "${YELLOW}已终止反代配置写入，防止 Nginx 全盘瘫痪。请检查 80 端口放行情况与防火墙。${RESET}"
+    fi
+
+    # 自动续期定时任务 (适配 Alpine 的 rc-service)
     if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
         (crontab -l 2>/dev/null; echo "0 2 * * * certbot renew --quiet --post-hook 'rc-service nginx reload'") | crontab -
     fi
+    # ========================================================
 
-    echo -e "${GREEN}安装完成！访问: https://$DOMAIN:$LISTEN_PORT${RESET}"
     pause
 }
 
@@ -615,8 +678,8 @@ check_domains_status() {
 }
 
 uninstall_nginx() {
-    echo -e "${YELLOW}警告: 此操作将卸载 Nginx 并删除所有相关配置文件和证书！${RESET}"
-    read -r -p "你确定要卸载 Nginx 吗？(y/N): " confirm
+    echo -e "${RED}💥 警告: 此操作将物理完全卸载 Nginx 核心，并彻底抹除所有反代配置与托管证书！${RESET}"
+    read -r -p "确定要斩草除根式卸载 Nginx 吗？(y/N): " confirm
     
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo -e "${YELLOW}操作已取消。${RESET}"
@@ -624,18 +687,34 @@ uninstall_nginx() {
         return 0
     fi
 
-    echo -e "${YELLOW}正在卸载 Nginx (Alpine)...${RESET}"
-    rc-service nginx stop || true
-    rc-update del nginx default || true
-    apk del nginx certbot certbot-nginx || true
-    rm -rf /etc/nginx /etc/letsencrypt "$CUSTOM_SSL_BASE" /var/log/nginx
-    remove_default_server
+    echo -e "${YELLOW}正在强行关闭服务并擦除系统组件...${RESET}"
+    rc-service nginx stop >/dev/null 2>&1 || true
+    rc-update del nginx default >/dev/null 2>&1 || true
     
+    # 强制杀死一切可能残留的相关进程
+    killall nginx 2>/dev/null || true
+    killall certbot 2>/dev/null || true
+
+    # 使用 APK 卸载
+    echo -e "${YELLOW}正在从系统卸载核心包...${RESET}"
+    apk del nginx certbot certbot-nginx nginx-openrc nginx-vim 2>/dev/null || true
+    
+    # 彻底抹除残留目录
+    echo -e "${YELLOW}正在彻底擦除本地配置与证书归档...${RESET}"
+    rm -rf /etc/nginx
+    rm -rf /etc/letsencrypt
+    rm -rf "$CUSTOM_SSL_BASE"
+    rm -rf /var/log/nginx
+    rm -rf /var/lib/nginx
+    rm -rf /run/nginx.pid 2>/dev/null || true
+    
+    # 清理定时任务
     crontab -l 2>/dev/null | grep -v "certbot renew" | crontab - 2>/dev/null || true
     
-    echo -e "${GREEN}已成功卸载${RESET}"
+    echo -e "${GREEN}✅ Nginx 及其环境配置已彻底卸载干净！系统已恢复纯净状态。${RESET}"
     pause
 }
+
 
 fix_external_cert_permission() {
     local cert=$1
@@ -1007,13 +1086,13 @@ main_menu() {
         get_nginx_version
         get_site_count
         clear
-        echo -e "${GREEN}========================================${RESET}"
-        echo -e "${GREEN}        ◈ Nginx 反向代理管理面板 ◈   ${RESET}"
-        echo -e "${GREEN}========================================${RESET}"
-        echo -e "${GREEN} 状态: ${STATUS}${RESET}"
-        echo -e "${GREEN} 版本: ${YELLOW}${VERSION_SHOW}${RESET}"
-        echo -e "${GREEN} 站点: ${YELLOW}${SITE_COUNT}个${RESET}"
-        echo -e "${GREEN}========================================${RESET}"
+        echo -e "${GREEN}=============================${RESET}"
+        echo -e "${GREEN}  ◈ Nginx 反向代理管理面板 ◈  ${RESET}"
+        echo -e "${GREEN}=============================${RESET}"
+        echo -e "${GREEN}状态   :${STATUS}${RESET}"
+        echo -e "${GREEN}状态   :${YELLOW}${VERSION_SHOW}${RESET}"
+        echo -e "${GREEN}状态   :${YELLOW}${SITE_COUNT}个${RESET}"
+        echo -e "${GREEN}=============================${RESET}"
         echo -e "${GREEN} 1. 安装 Nginx${RESET}"
         echo -e "${GREEN} 2. 添加配置 (Certbot托管)${RESET}"
         echo -e "${GREEN} 3. 添加配置 (自定义证书)${RESET}"
@@ -1027,7 +1106,7 @@ main_menu() {
         echo -e "${GREEN}11. 升级Nginx${RESET}"
         echo -e "${GREEN}12. 卸载Nginx${RESET}"
         echo -e "${GREEN} 0. 退出${RESET}"
-        echo -e "${GREEN}========================================${RESET}"
+        echo -e "${GREEN}=============================${RESET}"
         echo -ne "${GREEN} 请选择: ${RESET}"
         read choice
 

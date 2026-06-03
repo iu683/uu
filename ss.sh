@@ -1,167 +1,341 @@
 #!/bin/bash
-# VPS SWAP 管理面板 (完美兼容 Alpine/Debian/Ubuntu/CentOS)
+set -e
 
-SWAP_FILE="/swapfile"
+# ===============================
+# 防火墙管理脚本（Debian/Ubuntu 双栈 IPv4/IPv6）
+# ===============================
+
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
-NC="\033[0m"
+YELLOW="\033[33m"
 RESET="\033[0m"
-Info="${GREEN}[信息]${NC}"
-Error="${RED}[错误]${NC}"
-Tip="${YELLOW}[提示]${NC}"
 
-# 获取系统 ID
-if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    OS_ID="$ID"
-else
-    OS_ID="unknown"
-fi
+# ===============================
+# 动态信息获取函数（对应新菜单风格）
+# ===============================
 
-# 检查是否为root用户
-if [[ $(whoami) != "root" ]]; then
-    echo -e "${Error}请以root身份执行该脚本！"
-    exit 1
-fi
-
-# 返回菜单公共函数
-back_to_menu() {
-    read -rp "按回车键返回菜单..."
+# 1. 获取 SSH 端口
+get_ssh_port() {
+    local port
+    port=$(grep -E '^ *Port ' /etc/ssh/sshd_config | awk '{print $2}' | head -n 1)
+    [[ -z "$port" || ! "$port" =~ ^[0-9]+$ ]] && port=22
+    echo "$port"
 }
 
-# 核心状态获取函数：通过 /proc/meminfo 完美兼容所有 Linux 分支
-get_swap_status() {
-    if [ ! -f /proc/meminfo ]; then
-        STATUS="${RED}未知 (读取失败)${RESET}"
-        return
-    fi
-
-    # 提取 SwapTotal，单位为 kB
-    local swap_total_kb
-    swap_total_kb=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
-
-    if [ -z "$swap_total_kb" ] || [ "$swap_total_kb" -eq 0 ]; then
-        STATUS="${RED}未启用${RESET}"
+# 2. 获取防火墙运行状态
+get_firewall_status() {
+    if systemctl is-active --quiet netfilter-persistent 2>/dev/null; then
+        echo -e "${GREEN}● 已开启 (开机自启)${RESET}"
     else
-        # 转换为 MB，免 bc 纯整数/低精度浮点计算
-        local swap_total_mb=$((swap_total_kb / 1024))
-        if [ "$swap_total_mb" -ge 1000 ]; then
-            # 如果大于 1000M，保留一位小数显示为 G
-            local swap_total_g_int=$((swap_total_mb / 1024))
-            local swap_total_g_dec=$(( (swap_total_mb % 1024) * 10 / 1024 ))
-            STATUS="${GREEN}已启用 (${swap_total_g_int}.${swap_total_g_dec}G)${RESET}"
+        # 检查是否至少有规则在运行
+        if iptables -P INPUT 2>/dev/null | grep -q "DROP"; then
+            echo -e "${YELLOW}● 运行中 (未设自启)${RESET}"
         else
-            STATUS="${GREEN}已启用 (${swap_total_mb}M)${RESET}"
+            echo -e "${RED}○ 已关闭 (全放行)${RESET}"
         fi
     fi
 }
 
-
-
-
-add_swap() {
-    echo -ne "${Tip}请输入要添加的 SWAP 大小 (单位G, 默认1): "
-    read -r SWAP_SIZE
-    SWAP_SIZE=${SWAP_SIZE:-1}
-
-    if [[ ! "$SWAP_SIZE" =~ ^[0-9]+$ ]]; then
-        echo -e "${Error}无效的数字输入，操作取消。"
-        return 1
-    fi
-
-    # 检查并清理旧的 Swap 挂载
-    swapoff "$SWAP_FILE" 2>/dev/null || true
-    [ -f "$SWAP_FILE" ] && rm -f "$SWAP_FILE"
-
-    echo -e "${Info}正在创建 ${YELLOW}${SWAP_SIZE}G${RESET} 的 Swap 文件，请稍候..."
-    
-    # 针对 Alpine 的特殊适配，fallocate 在某些文件系统或 Alpine 下不可用，优先用 dd 兜底
-    if command -v fallocate >/dev/null 2>&1 && [ "$OS_ID" != "alpine" ]; then
-        fallocate -l ${SWAP_SIZE}G "$SWAP_FILE" || dd if=/dev/zero of="$SWAP_FILE" bs=1M count=$((SWAP_SIZE*1024))
+# 3. 获取 iptables 版本
+get_iptables_version() {
+    if command -v iptables &>/dev/null; then
+        iptables --version | awk '{print $2}'
     else
-        dd if=/dev/zero of="$SWAP_FILE" bs=1M count=$((SWAP_SIZE*1024))
+        echo "未安装"
     fi
-
-    chmod 600 "$SWAP_FILE"
-    mkswap "$SWAP_FILE"
-    swapon "$SWAP_FILE"
-
-    # 写入开机自动挂载
-    if ! grep -q "$SWAP_FILE" /etc/fstab; then
-        echo "$SWAP_FILE none swap sw 0 0" >> /etc/fstab
-    fi
-
-    echo -e "${Info}SWAP 空间创建成功并已应用！"
 }
 
-del_swap() {
-    echo -e "${Tip}正在安全卸载并删除 SWAP 文件..."
-    swapoff "$SWAP_FILE" 2>/dev/null || true
-    
-    if [ -f /etc/fstab ]; then
-        sed -i "\|$SWAP_FILE|d" /etc/fstab
-    fi
-    
-    if [ -f "$SWAP_FILE" ]; then
-        rm -f "$SWAP_FILE"
-    fi
-    echo -e "${Info}SWAP 空间已彻底删除，配置清理完毕！"
+# 4. 统计当前封禁的独立 IP 数量 (DROP/REJECT)
+get_banned_ip_count() {
+    local count4 count6 total
+    count4=$(iptables -L INPUT -n 2>/dev/null | grep -E "DROP|REJECT" | grep -v "tcp dport" | awk '{print $4}' | grep -v "0.0.0.0" | sort -u | wc -l)
+    count6=$(ip6tables -L INPUT -n 2>/dev/null | grep -E "DROP|REJECT" | grep -v "tcp dport" | awk '{print $4}' | grep -v "::" | sort -u | wc -l)
+    total=$((count4 + count6))
+    echo "$total"
 }
 
-view_swap() {
-    echo -e "${Info}--- 系统内存与 SWAP 详细状态 ---"
-    echo
-    # 部分 Alpine 环境下 free 报错，做兜底输出
-    free -m 2>/dev/null || cat /proc/meminfo | grep -E "MemTotal|MemFree|SwapTotal|SwapFree"
-    echo
-    echo -e "${Info}--- 挂载设备信息 ---"
-    if swapon --show >/dev/null 2>&1; then
-        swapon --show
+# ===============================
+# 防火墙核心逻辑函数
+# ===============================
+
+save_rules() {
+    netfilter-persistent save 2>/dev/null || true
+}
+
+save_and_enable_autoload() {
+    save_rules
+    systemctl enable netfilter-persistent 2>/dev/null || true
+    systemctl start netfilter-persistent 2>/dev/null || true
+    echo -e "${GREEN}✅ 规则已保存，并设置为开机自动加载${RESET}"
+    read -p "按回车继续..."
+}
+
+init_rules() {
+    local ssh_port
+    ssh_port=$(get_ssh_port)
+    for proto in iptables ip6tables; do
+        $proto -F
+        $proto -X
+        $proto -t nat -F 2>/dev/null || true
+        $proto -t nat -X 2>/dev/null || true
+        $proto -t mangle -F 2>/dev/null || true
+        $proto -t mangle -X 2>/dev/null || true
+        $proto -P INPUT DROP
+        $proto -P FORWARD DROP
+        $proto -P OUTPUT ACCEPT
+        $proto -A INPUT -i lo -j ACCEPT
+        $proto -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+        $proto -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
+        $proto -A INPUT -p tcp --dport 80 -j ACCEPT
+        $proto -A INPUT -p tcp --dport 443 -j ACCEPT
+    done
+    save_rules
+    systemctl enable netfilter-persistent 2>/dev/null || true
+    systemctl start netfilter-persistent 2>/dev/null || true
+}
+
+check_installed() {
+    dpkg -l | grep -q iptables-persistent
+}
+
+install_firewall() {
+    echo -e "${YELLOW}正在安装防火墙，请稍候...${RESET}"
+    apt update -y
+    apt remove -y ufw iptables-persistent || true
+    apt install -y iptables-persistent curl || true
+    init_rules
+    echo -e "${GREEN}✅ 防火墙安装完成，默认放行 SSH/80/443${RESET}"
+    echo -e "${GREEN}✅ 已设置开机自动加载规则${RESET}"
+    read -p "按回车继续..."
+}
+
+clear_firewall() {
+    echo -e "${YELLOW}正在清空防火墙规则并放行所有流量...${RESET}"
+    for proto in iptables ip6tables; do
+        $proto -F
+        $proto -X
+        $proto -P INPUT ACCEPT
+        $proto -P FORWARD ACCEPT
+        $proto -P OUTPUT ACCEPT
+    done
+    save_rules
+    systemctl disable netfilter-persistent 2>/dev/null || true
+    echo -e "${GREEN}✅ 防火墙规则已清空，所有流量已放行${RESET}"
+    read -p "按回车继续..."
+}
+
+restore_default_rules() {
+    echo -e "${YELLOW}正在恢复默认防火墙规则 (仅放行 SSH/80/443)...${RESET}"
+    local ssh_port
+    ssh_port=$(get_ssh_port)
+    echo -e "${GREEN}检测到 SSH 端口: $ssh_port${RESET}"
+    init_rules
+    echo -e "${GREEN}✅ 默认规则已恢复${RESET}"
+    read -p "按回车继续..."
+}
+
+open_all_ports() {
+    echo -e "${YELLOW}正在放行所有端口（IPv4/IPv6）...${RESET}"
+    for proto in iptables ip6tables; do
+        $proto -F
+        $proto -X
+        $proto -P INPUT ACCEPT
+        $proto -P FORWARD ACCEPT
+        $proto -P OUTPUT ACCEPT
+    done
+    save_rules
+    echo -e "${GREEN}✅ 所有端口已放行（全开放）${RESET}"
+    read -p "按回车继续..."
+}
+
+ip_action() {
+    local action=$1 ip=$2 proto
+    if [[ $ip =~ : ]]; then
+        proto="ip6tables"
     else
-        cat /proc/swaps
+        proto="iptables"
     fi
-}
 
-# 主循环面板
-while true; do
-    clear
-    get_swap_status
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}         ◈  VPS SWAP 管理面板  ◈        ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN} 系统环境  : ${YELLOW}${OS_ID}${RESET}"
-    echo -e "${GREEN} SWAP状态  : ${STATUS}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}  1. 添加 SWAP (自定大小)${RESET}"
-    echo -e "${GREEN}  2. 删除 SWAP (彻底清理)${RESET}"
-    echo -e "${GREEN}  3. 查看系统详细内存状态${RESET}"
-    echo -e "${GREEN} ------------------------------------- ${RESET}"
-    echo -e "${GREEN}  0. 退出${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -ne "${GREEN} 请输入操作编号: ${RESET}"
-    
-    read -r choice
-    
-    case "$choice" in
-        1)
-            add_swap
-            back_to_menu
-            ;;
-        2)
-            del_swap
-            back_to_menu
-            ;;
-        3)
-            view_swap
-            back_to_menu
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            echo -e "${Error}无效选择，请输入正确的数字编号。"
-            sleep 1
+    case $action in
+        accept) $proto -I INPUT -s "$ip" -j ACCEPT ;;
+        drop)   $proto -I INPUT -s "$ip" -j DROP ;;
+        delete)
+            while $proto -C INPUT -s "$ip" -j ACCEPT 2>/dev/null; do
+                $proto -D INPUT -s "$ip" -j ACCEPT
+            done
+            while $proto -C INPUT -s "$ip" -j DROP 2>/dev/null; do
+                $proto -D INPUT -s "$ip" -j DROP
+            done
             ;;
     esac
-done
+}
+
+ping_action() {
+    local action=$1
+    for proto in iptables ip6tables; do
+        case $action in
+            allow)
+                while $proto -C INPUT -p icmp -j DROP 2>/dev/null; do $proto -D INPUT -p icmp -j DROP; done
+                while $proto -C OUTPUT -p icmp -j DROP 2>/dev/null; do $proto -D OUTPUT -p icmp -j DROP; done
+                if [ "$proto" = "iptables" ]; then
+                    $proto -I INPUT -p icmp --icmp-type echo-request -j ACCEPT
+                    $proto -I OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT
+                else
+                    $proto -I INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT
+                    $proto -I OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT
+                fi
+                ;;
+            deny)
+                if [ "$proto" = "iptables" ]; then
+                    while $proto -C INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null; do $proto -D INPUT -p icmp --icmp-type echo-request -j ACCEPT; done
+                    while $proto -C OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT 2>/dev/null; do $proto -D OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT; done
+                    $proto -I INPUT -p icmp --icmp-type echo-request -j DROP
+                    $proto -I OUTPUT -p icmp --icmp-type echo-reply -j DROP
+                else
+                    # 这里已修复修复：去除了原本误触的 = 号
+                    while $proto -C INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT 2>/dev/null; do $proto -D INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT; done
+                    while $proto -C OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT 2>/dev/null; do $proto -D OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT; done
+                    $proto -I INPUT -p icmpv6 --icmpv6-type echo-request -j DROP
+                    $proto -I OUTPUT -p icmpv6 --icmpv6-type echo-reply -j DROP
+                fi
+                ;;
+        esac
+    done
+}
+
+# ===============================
+# 全新风格管理菜单
+# ===============================
+menu() {
+    while true; do
+        # 动态获取当前系统防火墙数据
+        STATUS=$(get_firewall_status)
+        VERSION_SHOW=$(get_iptables_version)
+        PORT_SHOW=$(get_ssh_port)
+        SITE_COUNT=$(get_banned_ip_count)
+
+        clear
+        echo -e "${GREEN}===============================${RESET}"
+        echo -e "${GREEN}   ◈   双栈防火墙管理面板   ◈  ${RESET}"
+        echo -e "${GREEN}===============================${RESET}"
+        echo -e "${GREEN} 状态  : ${STATUS}"
+        echo -e "${GREEN} 规则  : ${YELLOW}${VERSION_SHOW}${RESET}"
+        echo -e "${GREEN} 端口  : ${YELLOW}${PORT_SHOW}${RESET}"
+        echo -e "${GREEN} 封禁  : ${YELLOW}${SITE_COUNT} 个 IP${RESET}"
+        echo -e "${GREEN}===============================${RESET}"
+        echo -e "${GREEN}  1. 开放指定端口 (TCP/UDP)${RESET}"
+        echo -e "${GREEN}  2. 关闭指定端口 (TCP/UDP)${RESET}"
+        echo -e "${GREEN}  3. 开放所有端口 (全放行)${RESET}"
+        echo -e "${GREEN}  4. 恢复默认安全规则 (放行SSH/80/443)${RESET}"
+        echo -e "${GREEN}  5. 添加 IP 白名单 (放行)${RESET}"
+        echo -e "${GREEN}  6. 添加 IP 黑名单 (封禁)${RESET}"
+        echo -e "${GREEN}  7. 删除指定 IP 规则${RESET}"
+        echo -e "${GREEN}  8. 允许 PING (ICMP)${RESET}"
+        echo -e "${GREEN}  9. 禁用 PING (ICMP)${RESET}"
+        echo -e "${GREEN} 10. 查看当前防火墙详细规则${RESET}"
+        echo -e "${GREEN} 11. 保存规则并设置开机自启${RESET}"
+        echo -e "${GREEN}  0. 退出${RESET}"
+        echo -e "${GREEN}===============================${RESET}"
+        echo -ne "${GREEN} 请选择: ${RESET}"
+        read -r choice
+
+        case $choice in
+            1)
+                read -p "请输入要开放的端口号: " PORT
+                if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+                    echo -e "${RED}❌ 错误：请输入 1-65535 之间的有效端口号${RESET}"
+                    read -p "按回车返回菜单..."
+                    continue
+                fi
+                for proto in iptables ip6tables; do
+                    while $proto -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null; do $proto -D INPUT -p tcp --dport "$PORT" -j DROP; done
+                    while $proto -C INPUT -p udp --dport "$PORT" -j DROP 2>/dev/null; do $proto -D INPUT -p udp --dport "$PORT" -j DROP; done
+                    $proto -I INPUT -p tcp --dport "$PORT" -j ACCEPT
+                    $proto -I INPUT -p udp --dport "$PORT" -j ACCEPT
+                done
+                save_rules
+                echo -e "${GREEN}✅ 已开放端口 $PORT${RESET}"
+                read -p "按回车继续..."
+                ;;
+            2)
+                read -p "请输入要关闭的端口号: " PORT
+                if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+                    echo -e "${RED}❌ 错误：请输入 1-65535 之间的有效端口号${RESET}"
+                    read -p "按回车返回菜单..."
+                    continue
+                fi
+                for proto in iptables ip6tables; do
+                    while $proto -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; do $proto -D INPUT -p tcp --dport "$PORT" -j ACCEPT; done
+                    while $proto -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; do $proto -D INPUT -p udp --dport "$PORT" -j ACCEPT; done
+                    $proto -I INPUT -p tcp --dport "$PORT" -j DROP
+                    $proto -I INPUT -p udp --dport "$PORT" -j DROP
+                done
+                save_rules
+                echo -e "${GREEN}✅ 已关闭端口 $PORT${RESET}"
+                read -p "按回车继续..."
+                ;;
+            3) open_all_ports ;;
+            4) restore_default_rules ;;
+            5)
+                read -p "请输入要放行的IP: " IP
+                ip_action accept "$IP"
+                save_rules
+                echo -e "${GREEN}✅ IP $IP 已放行${RESET}"
+                read -p "按回车继续..."
+                ;;
+            6)
+                read -p "请输入要封禁的IP: " IP
+                ip_action drop "$IP"
+                save_rules
+                echo -e "${GREEN}✅ IP $IP 已封禁${RESET}"
+                read -p "按回车继续..."
+                ;;
+            7)
+                read -p "请输入要删除的IP: " IP
+                ip_action delete "$IP"
+                save_rules
+                echo -e "${GREEN}✅ IP $IP 规则已删除${RESET}"
+                read -p "按回车继续..."
+                ;;
+            8)
+                ping_action allow
+                save_rules
+                echo -e "${GREEN}✅ 已允许 PING（ICMP）${RESET}"
+                read -p "按回车继续..."
+                ;;
+            9)
+                ping_action deny
+                save_rules
+                echo -e "${GREEN}✅ 已禁用 PING（ICMP）${RESET}"
+                read -p "按回车继续..."
+                ;;
+            10)
+                clear
+                echo -e "${YELLOW}当前防火墙状态:${RESET}"
+                echo "--- iptables IPv4 ---"
+                iptables -L -n -v --line-numbers
+                echo -e "\n--- ip6tables IPv6 ---"
+                ip6tables -L -n -v --line-numbers
+                read -r -p "按回车返回菜单..." || true
+                ;;
+            11) save_and_enable_autoload ;;
+            0) clear; break ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ===============================
+# 脚本入口
+# ===============================
+# 检查 root 权限
+if [ "$EUID" -ne 0 ]; then
+   echo -e "${RED}❌ 错误: 请使用 root 权限运行此脚本！${RESET}"
+   exit 1
+fi
+
+if ! check_installed; then
+    install_firewall
+fi
+
+menu

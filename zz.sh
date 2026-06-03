@@ -1,6 +1,6 @@
 #!/bin/bash
 # =========================================================================
-# 字体与语言环境智能管理面板（多系统自动适配）
+# Cron 定时任务智能管理面板（跨系统自适配 + 安全无缝交互版）
 # =========================================================================
 
 # 严格的 Root 权限检查
@@ -33,116 +33,204 @@ get_os_type() {
 
 OS=$(get_os_type)
 
-# 动态获取当前系统的语言状态
-get_current_locale() {
-    echo "${LANG:-未设置}"
+# 安装并启动 crontab 服务 
+install_crontab_if_missing() {
+    if ! command -v crontab >/dev/null 2>&1; then
+        echo -e "${YELLOW}🔧 未检测到 crontab 组件，正在为您自动补全...${RESET}"
+        case "$OS" in
+            Alpine)
+                apk add --no-cache dcron >/dev/null 2>&1
+                rc-update add crond default >/dev/null 2>&1
+                rc-service crond start >/dev/null 2>&1
+                ;;
+            Ubuntu|Debian)
+                apt-get update -y >/dev/null 2>&1
+                apt-get install -y cron >/dev/null 2>&1
+                systemctl enable --now cron >/dev/null 2>&1
+                ;;
+            RedHat)
+                yum install -y cronie >/dev/null 2>&1 || dnf install -y cronie >/dev/null 2>&1
+                systemctl enable --now crond >/dev/null 2>&1
+                ;;
+            *)
+                echo -e "${RED}❌ 无法自动识别系统类型，请手动安装 crontab！${RESET}"
+                read -rp "按回车键退出..."
+                exit 1
+                ;;
+        esac
+        echo -e "${GREEN}✅ crontab 安装完成并已自动启动服务！${RESET}"
+        sleep 1
+    else
+        # 服务保活，确保其运行
+        if [ "$OS" = "Alpine" ]; then
+            rc-service crond start >/dev/null 2>&1
+        elif command -v systemctl >/dev/null 2>&1; then
+            systemctl start cron >/dev/null 2>&1 || systemctl start crond >/dev/null 2>&1
+        fi
+    fi
 }
 
-# 核心语言环境应用函数
-apply_locale() {
-    local target_lang=$1
-    
-    case "$OS" in
-        Ubuntu|Debian)
-            echo -e "${YELLOW}🔧 正在更新 apt 缓存并安装必要字体与语言包...${RESET}"
-            apt-get update -y >/dev/null 2>&1
-            apt-get install -y locales >/dev/null 2>&1
-            
-            if [ "$target_lang" = "zh_CN.UTF-8" ]; then
-                apt-get install -y fonts-wqy-microhei fonts-wqy-zenhei >/dev/null 2>&1
-            else
-                apt-get install -y fonts-dejavu fonts-liberation >/dev/null 2>&1
-            fi
+# 校验数字范围 
+validate_number() {
+    local value="$1" local min="$2" local max="$3" local name="$4"
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt "$min" ] || [ "$value" -gt "$max" ]; then
+        echo -e "${RED}❌ 错误：${name} 输入无效，应在 $min 到 $max 之间！${RESET}"
+        return 1
+    fi
+    return 0
+}
 
-            # 配置并生成 Locale（移除 set -e 规避 sed 报错引发挂科）
-            echo -e "${YELLOW}🔄 正在生成语言环境: $target_lang...${RESET}"
-            if [ -f /etc/locale.gen ]; then
-                # 先取消注释，如果不存在则追加
-                sed -i "s/^#\?\s*\($target_lang UTF-8\)/\1/" /etc/locale.gen 2>/dev/null
-                if ! grep -q "$target_lang UTF-8" /etc/locale.gen; then
-                    echo "$target_lang UTF-8" >> /etc/locale.gen
-                fi
-            fi
-            locale-gen "$target_lang" >/dev/null 2>&1
-            
-            # 强制锁入环境配置
-            if command -v update-locale >/dev/null 2>&1; then
-                update-locale LANG="$target_lang" LC_ALL="$target_lang" >/dev/null 2>&1
-            fi
-            echo "LANG=$target_lang" > /etc/default/locale
-            echo "LC_ALL=$target_lang" >> /etc/default/locale
+# 添加任务 
+add_cron_task() {
+    echo -e "\n${YELLOW}=== ➕ 添加新定时任务 ===${RESET}"
+    echo -ne "${GREEN}请输入新任务要执行的 Shell 命令: ${RESET}"
+    read -r newquest
+    [ -z "$newquest" ] && return
+
+    echo -e "\n${YELLOW}------ ⏰ 选择触发周期 ------${RESET}"
+    echo -e "${GREEN}  1) 每月任务 (指定某天 00:00 执行)${RESET}"            
+    echo -e "${GREEN}  2) 每周任务 (指定周几 00:00 执行)${RESET}"
+    echo -e "${GREEN}  3) 每天任务 (指定每天几点 00分 执行)${RESET}"  
+    echo -e "${GREEN}  4) 每小时任务 (指定每小时第几分钟 执行)${RESET}"
+    echo -e "${YELLOW}----------------------------${RESET}"
+    echo -ne "${GREEN}请选择时间类型: ${RESET}"
+    read -r dingshi
+
+    case "$dingshi" in
+        1)
+            echo -ne "${YELLOW}每月的几号执行任务？ (1-31): ${RESET}"
+            read -r day
+            validate_number "$day" 1 31 "日期" || { read -rp "按回车键返回..."; return; }
+            (crontab -l 2>/dev/null; echo "0 0 $day * * $newquest") | crontab -
             ;;
-            
-        Alpine)
-            echo -e "${YELLOW}🔧 正在通过 apk 补全 Alpine 字体与 musl 本地化组件...${RESET}"
-            # 关键补丁：Alpine 必须安装 musl-locales 才能真正支持 zh_CN 等非英语言环境
-            apk add --no-cache musl-locales musl-locales-lang >/dev/null 2>&1
-            
-            if [ "$target_lang" = "zh_CN.UTF-8" ]; then
-                # 从官方 testing 仓库拉取文泉驿中文字体
-                apk add --no-cache ttf-dejavu font-wqy-zenhei --repository http://dl-cdn.alpinelinux.org/alpine/edge/testing >/dev/null 2>&1
-            else
-                apk add --no-cache ttf-dejavu >/dev/null 2>&1
-            fi
-            
-            # Alpine 的环境变量持久化机制
-            echo -e "${YELLOW}🔄 正在写入系统全局环境变量...${RESET}"
-            mkdir -p /etc/profile.d
-            echo "export LANG=$target_lang" > /etc/profile.d/locale.sh
-            echo "export LC_ALL=$target_lang" >> /etc/profile.d/locale.sh
-            chmod +x /etc/profile.d/locale.sh
+        2)
+            echo -ne "${YELLOW}周几执行任务？ (0-6, 0=周日): ${RESET}"
+            read -r weekday
+            validate_number "$weekday" 0 6 "星期" || { read -rp "按回车键返回..."; return; }
+            (crontab -l 2>/dev/null; echo "0 0 * * $weekday $newquest") | crontab -
             ;;
-            
+        3)
+            echo -ne "${YELLOW}每天几点执行任务？（小时，0-23）: ${RESET}"
+            read -r hour
+            validate_number "$hour" 0 23 "小时" || { read -rp "按回车键返回..."; return; }
+            (crontab -l 2>/dev/null; echo "0 $hour * * * $newquest") | crontab -
+            ;;
+        4)
+            echo -ne "${YELLOW}每小时第几分钟执行任务？（分钟，0-59）: ${RESET}"
+            read -r minute
+            validate_number "$minute" 0 59 "分钟" || { read -rp "按回车键返回..."; return; }
+            (crontab -l 2>/dev/null; echo "$minute * * * * $newquest") | crontab -
+            ;;
         *)
-            echo -e "${RED}⚠️ 当前系统 [${OS}] 未做深度定制，尝试通用变量写入...${RESET}"
+            echo -e "${RED}❌ 无效选择${RESET}"
+            sleep 1
+            return
             ;;
     esac
-
-    # 立即污染并刷新当前临时 Shell 生效
-    export LANG="$target_lang"
-    export LC_ALL="$target_lang"
+    echo -e "\n${GREEN}✅ 任务已成功持久化写入 crontab 定时列表！${RESET}"
+    read -rp "按回车键返回菜单..."
 }
+
+# 删除任务
+delete_cron_task() {
+    echo -e "\n${YELLOW}=== ➖ 删除定时任务 ===${RESET}"
+    local tmp_cron="/tmp/cron_list_tmp"
+    
+    # 安全导出，避免因 crontab 为空触发 set -e 崩溃（虽然新脚本已经拿掉了 set -e，但安全第一）
+    crontab -l 2>/dev/null > "$tmp_cron" || true
+    
+    if [ ! -s "$tmp_cron" ]; then
+        echo -e "${YELLOW}💡 当前系统中没有任何运行中的定时任务。${RESET}"
+        rm -f "$tmp_cron"
+        read -rp "按回车键返回菜单..."
+        return
+    fi
+
+    echo -e "${GREEN}当前可删除的任务列表:${RESET}"
+    awk '{print "  " NR") " $0}' "$tmp_cron"
+    echo -e "${YELLOW}---------------------------------------${RESET}"
+    echo -ne "${YELLOW}请输入要删除的任务序号（多个用空格分隔）: ${RESET}"
+    read -r indices
+    [ -z "$indices" ] && { rm -f "$tmp_cron"; return; }
+
+    # 倒序排列序号，从后往前删，避免行号因动态缩减而错位
+    local sorted_indices=$(echo "$indices" | tr ' ' '\n' | sort -rn)
+    
+    for idx in $sorted_indices; do
+        if [[ "$idx" =~ ^[0-9]+$ ]]; then
+            # 兼容适配：使用通用的 sed 行为，完美契合 Alpine Busybox 与 传统 Linux
+            sed -i "${idx}d" "$tmp_cron" 2>/dev/null || sed -i "" "${idx}d" "$tmp_cron" 2>/dev/null
+        fi
+    done
+
+    crontab "$tmp_cron"
+    rm -f "$tmp_cron"
+    echo -e "\n${GREEN}✅ 选定任务已成功剔除并同步到系统内核！${RESET}"
+    read -rp "按回车键返回菜单..."
+}
+
+# 编辑任务 
+edit_cron_task() {
+    echo -e "\n${YELLOW}=== 📝 手动编辑定时任务 ===${RESET}"
+    if ! command -v nano >/dev/null 2>&1 && ! command -v vim >/dev/null 2>&1; then
+        echo -e "${YELLOW}🔧 正在安装轻量文本编辑器 nano...${RESET}"
+        case "$OS" in
+            Alpine) apk add --no-cache nano >/dev/null 2>&1 ;;
+            Ubuntu|Debian) apt-get update -y >/dev/null 2>&1 && apt-get install -y nano >/dev/null 2>&1 ;;
+            *) yum install -y nano >/dev/null 2>&1 || dnf install -y nano >/dev/null 2>&1 ;;
+        esac
+    fi
+    export EDITOR=$(command -v nano || command -v vim || command -v vi)
+    crontab -e
+}
+
+# 预检安装
+install_crontab_if_missing
 
 # 主循环面板
 while true; do
     clear
-    CURRENT_LANG=$(get_current_locale)
-    
+
+
+    # 【核心修复】不使用 local 和 eval，改用最纯正、兼容性最强的标准管道组合拳
+    if crontab -l >/dev/null 2>&1; then
+        TASK_COUNT=$(crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]' | wc -l | tr -d ' ')
+    else
+        TASK_COUNT=0
+    fi
+
     echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}       ◈ 字体与语言环境管理面板 ◈      ${RESET}"
+    echo -e "${GREEN}       ◈  Cron 定时任务管理面板  ◈      ${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN} 检测到系统 : ${YELLOW}${OS}${RESET}"
-    echo -e "${GREEN} 当前语言包 : ${YELLOW}${CURRENT_LANG}${RESET}"
+    echo -e "${GREEN} 当前系统环境 : ${YELLOW}${OS}${RESET}"
+    echo -e "${GREEN} 活跃任务总数 : ${YELLOW}${YELLOW}${TASK_COUNT} 条${RESET}"
     echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  1. 切换为【中文环境】${RESET}"
-    echo -e "${GREEN}  2. 切换为【英文环境】${RESET}"
-    echo -e "${GREEN}  0. 退出${RESET}"
+    echo -e "${GREEN} 📋 当前系统定时任务快照：${RESET}"
+    
+
+   # 【核心修复】同步采用纯正标准管道，精准过滤展示
+    if [ "$TASK_COUNT" -gt 0 ]; then
+        crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]' | awk '{print "   • " $0}'
+    else
+        echo -e "   ${YELLOW}(暂无用户自定义的定时任务)${RESET}"
+    fi
+    
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN}  1) 快速添加定时任务(引导式)${RESET}"
+    echo -e "${GREEN}  2) 精准删除定时任务(支持多选)${RESET}"
+    echo -e "${GREEN}  3) 深度手动编辑任务(打开编辑器)${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN}  0) 退出${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
     
     echo -ne "${GREEN} 请选择操作编号: ${RESET}"
-    read choice
+    read -r choice
 
     case "$choice" in
-        1)
-            echo -e "\n${YELLOW}🚀 开始配置中文环境...${RESET}"
-            apply_locale "zh_CN.UTF-8"
-            echo -e "\n${GREEN}✅ 中文环境及支持字体配置完成！${RESET}"
-            echo -e "${YELLOW}💡 提示：为了让 SSH 终端完整显示中文，请重新连接您的 SSH 会话。${RESET}"
-            read -rp "按回车键返回菜单..."
-            ;;
-        2)
-            echo -e "\n${YELLOW}🚀 开始配置英文环境...${RESET}"
-            apply_locale "en_US.UTF-8"
-            echo -e "\n${GREEN}✅ 英文环境配置完成！${RESET}"
-            echo -e "${YELLOW}💡 提示：界面已重置，部分未刷新组件重新连接 SSH 后即可恢复纯英文。${RESET}"
-            read -rp "按回车键返回菜单..."
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            echo -e "${RED}❌ 输入错误，无此选项${RESET}"
-            sleep 1
-            ;;
+        1) add_cron_task ;;
+        2) delete_cron_task ;;
+        3) edit_cron_task ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}❌ 输入错误，无此选项${RESET}"; sleep 1 ;;
     esac
 done

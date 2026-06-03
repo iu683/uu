@@ -1,175 +1,211 @@
-#!/bin/sh
-set -e
+#!/bin/bash
+# =========================================================
+# 系统清理工具（全面适配 Alpine / Ubuntu / Debian / CentOS）
+# =========================================================
 
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-RESOLV_FILE="/etc/resolv.conf"
-
 # =========================================================
-# root 检测 (Alpine 标准 sh 兼容语法)
+# root 检测
 # =========================================================
-if [ "$(id -u)" -ne 0 ]; then
+if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}错误: 请使用 root 权限运行此脚本${RESET}"
     exit 1
 fi
 
-
 # =========================================================
-# 动态获取当前正在生效的 DNS 状态 (针对 Alpine 深度健壮优化)
+# 健壮性容器检测 (兼容 Alpine / 传统系统)
 # =========================================================
-get_dns_status() {
-    if [ -f "$RESOLV_FILE" ]; then
-        # 1. 提取所有合法的 nameserver 地址
-        local all_dns=$(awk '/^\s*nameserver/ {print $2}' "$RESOLV_FILE")
-        
-        # 2. 纯 IPv4 提取：过滤掉包含冒号的行，并将多行合并为单行展示
-        STATUS_IPv4=$(echo "$all_dns" | awk '!/:/ {printf "%s ", $0}' | sed 's/ $//')
-        
-        # 3. 纯 IPv6 提取：只保留包含冒号的行，并将多行合并为单行展示
-        STATUS_IPv6=$(echo "$all_dns" | awk '/:/ {printf "%s ", $0}' | sed 's/ $//')
-        
-        # 如果变量为空，则给予友好提示
-        [ -z "$STATUS_IPv4" ] && STATUS_IPv4="未配置"
-        [ -z "$STATUS_IPv6" ] && STATUS_IPv6="未配置"
-    else
-        STATUS_IPv4="${RED}文件不存在${RESET}"
-        STATUS_IPv6="${RED}文件不存在${RESET}"
-    fi
-
-    # 4. 检查文件是否被锁定
-    if command -v lsattr >/dev/null 2>&1 && [ -f "$RESOLV_FILE" ]; then
-        if lsattr "$RESOLV_FILE" 2>/dev/null | head -n 1 | cut -d' ' -f1 | grep -q 'i'; then
-            LOCK_STATUS="${RED}已锁定 (🔒)${RESET}"
-        else
-            LOCK_STATUS="${GREEN}未锁定 (🔓)${RESET}"
+check_container() {
+    IS_CONTAINER=0
+    if [ -f /.dockerenv ] || [ -f /run/.containerenv ]; then
+        IS_CONTAINER=1
+    elif [ -f /proc/1/cgroup ] && grep -qaE '(docker|lxc|kubepods)' /proc/1/cgroup; then
+        IS_CONTAINER=1
+    elif command -v systemd-detect-virt >/dev/null 2>&1; then
+        if systemd-detect-virt --quiet; then
+            IS_CONTAINER=1
         fi
-    else
-        LOCK_STATUS="不支持检测"
     fi
 }
 
 # =========================================================
-# 设置 resolv.conf DNS
+# 动态获取当前系统状态
 # =========================================================
-set_dns_resolvconf() {
-    DNS1=$1
-    DNS2=$2
-
-    echo -e "${GREEN}正在设置 DNS: $DNS1 $DNS2${RESET}"
-
-    # 解锁文件（如果支持 chattr）
-    if command -v chattr >/dev/null 2>&1; then
-        chattr -i $RESOLV_FILE 2>/dev/null || true
+get_system_status() {
+    # 1. 检测容器状态
+    check_container
+    if [ "$IS_CONTAINER" -eq 1 ]; then
+        ENV_STATUS="${YELLOW}容器环境 (🔒 自动跳过内核清理)${RESET}"
+    else
+        ENV_STATUS="${GREEN}物理机 / 独立VPS${RESET}"
     fi
+
+    # 2. 检测包管理器
+    if command -v apk >/dev/null 2>&1; then
+        PM_STATUS="APK (Alpine)"
+    elif command -v apt >/dev/null 2>&1; then
+        PM_STATUS="APT (Debian/Ubuntu)"
+    elif command -v dnf >/dev/null 2>&1; then
+        PM_STATUS="DNF (RHEL/Fedora)"
+    elif command -v yum >/dev/null 2>&1; then
+        PM_STATUS="YUM (CentOS)"
+    else
+        PM_STATUS="${RED}未知/不支持${RESET}"
+    fi
+
+    # 3. 获取根分区磁盘占用情况 (兼容 BusyBox df)
+    local use_percent=$(df -h / | awk 'NR==2 {print $5}' | sed 's/%//')
+    # 备用兼容方案：如果有些系统输出在第3行
+    [ -z "$use_percent" ] && use_percent=$(df -h / | awk 'END{print $5}' | sed 's/%//')
     
-    rm -f $RESOLV_FILE
-
-    cat > $RESOLV_FILE <<EOF
-nameserver $DNS1
-EOF
-
-    if [ -n "$DNS2" ]; then
-        echo "nameserver $DNS2" >> $RESOLV_FILE
+    if [ -z "$use_percent" ]; then
+        DISK_STATUS="获取失败"
+    elif [ "$use_percent" -lt 60 ]; then
+        DISK_STATUS="${GREEN}${use_percent}%已用${RESET}"
+    elif [ "$use_percent" -lt 80 ]; then
+        DISK_STATUS="${YELLOW}${use_percent}%已用 (建议清理)${RESET}"
+    else
+        DISK_STATUS="${RED}${use_percent}%已用 (极度紧张!)${RESET}"
     fi
+}
 
-    cat >> $RESOLV_FILE <<EOF
-options timeout:2 attempts:3
-EOF
+# =========================================================
+# 等待包管理器锁 (防止脚本冲突)
+# =========================================================
+wait_for_lock() {
+    local cmd=$1
+    local lock_file=$2
+    if command -v fuser >/dev/null 2>&1; then
+        while fuser "$lock_file" >/dev/null 2>&1; do
+            echo -e "${YELLOW}等待其他 $cmd 进程释放锁...${RESET}"
+            sleep 2
+        done
+    fi
+}
 
-    echo -ne "${GREEN}是否锁定 resolv.conf 防止网络重启被覆盖? (y/n): ${RESET}"
-    read -r LOCK </dev/tty
-    if [ "$LOCK" = "y" ] || [ "$LOCK" = "Y" ]; then
-        if command -v chattr >/dev/null 2>&1; then
-            chattr +i $RESOLV_FILE 2>/dev/null || true
-            echo -e "${GREEN}已成功锁定 resolv.conf${RESET}"
-        else
-            echo -e "${YELLOW}当前系统缺少 chattr 命令，无法锁定文件${RESET}"
+# =========================================================
+# 执行系统垃圾清理
+# =========================================================
+clean_system() {
+    echo -e "${YELLOW}正在开始系统垃圾清理...${RESET}"
+    export DEBIAN_FRONTEND=noninteractive
+
+    if command -v apk >/dev/null 2>&1; then
+        echo -e "${GREEN}[1/2] 正在清理 APK 缓存...${RESET}"
+        apk cache clean
+        rm -rf /var/cache/apk/*
+    elif command -v apt >/dev/null 2>&1; then
+        echo -e "${GREEN}[1/2] 正在清理 APT 缓存与孤立包...${RESET}"
+        wait_for_lock "APT" /var/lib/dpkg/lock-frontend
+        apt update -y
+        wait_for_lock "APT" /var/lib/dpkg/lock-frontend
+        apt autoremove --purge -y
+        apt clean
+        apt autoclean
+        dpkg -l | awk '/^rc/ {print $2}' | xargs -r apt purge -y
+        if [ "$IS_CONTAINER" -eq 0 ]; then
+            CURRENT_KERNEL=$(uname -r)
+            dpkg --list | awk '/linux-image-[0-9]/ {print $2}' | grep -v "$CURRENT_KERNEL" | xargs -r apt purge -y
+        fi
+    elif command -v dnf >/dev/null 2>&1; then
+        echo -e "${GREEN}[1/2] 正在清理 DNF 垃圾...${RESET}"
+        wait_for_lock "DNF" /var/run/dnf.pid
+        dnf autoremove -y
+        dnf clean all
+        if [ "$IS_CONTAINER" -eq 0 ]; then
+            dnf remove $(dnf repoquery --installonly --latest-limit=-2 -q) -y 2>/dev/null || true
+        fi
+    elif command -v yum >/dev/null 2>&1; then
+        echo -e "${GREEN}[1/2] 正在清理 YUM 垃圾...${RESET}"
+        wait_for_lock "YUM" /var/run/yum.pid
+        yum autoremove -y
+        yum clean all
+        if [ "$IS_CONTAINER" -eq 0 ] && command -v package-cleanup >/dev/null 2>&1; then
+            package-cleanup --oldkernels --count=2 -y
         fi
     fi
 
-    echo -e "${GREEN}DNS 配置更新完成！${RESET}"
-}
-
-# =========================================================
-# 自定义 DNS 输入
-# =========================================================
-custom_dns() {
-    echo -ne "${GREEN}请输入主 DNS: ${RESET}"
-    read -r MAIN_DNS </dev/tty
-    echo -ne "${GREEN}请输入备用 DNS (可留空): ${RESET}"
-    read -r BACKUP_DNS </dev/tty
-
-    if [ -z "$MAIN_DNS" ]; then
-        echo -e "${RED}主 DNS 不能为空${RESET}"
-        return
+    # 清理日志
+    echo -e "${GREEN}[2/2] 正在清理系统日志...${RESET}"
+    if command -v journalctl >/dev/null 2>&1; then
+        journalctl --vacuum-time=7d
+    else
+        # 兼容 Alpine 等无 journalctl 的系统
+        find /var/log -type f -name "*.log" -exec truncate -s 0 {} \;
+        echo -e "${YELLOW}提示: 当前系统未使用 systemd-journald，已对 /var/log/*.log 进行截断清空${RESET}"
     fi
 
-    set_dns_resolvconf "$MAIN_DNS" "$BACKUP_DNS"
+    echo -e "${GREEN}系统垃圾清理完成！${RESET}"
 }
 
 # =========================================================
-# 恢复默认
+# 执行 Docker 垃圾清理
 # =========================================================
-restore_default() {
-    echo -e "${YELLOW}正在恢复系统默认 DNS...${RESET}"
-    if command -v chattr >/dev/null 2>&1; then
-        chattr -i $RESOLV_FILE 2>/dev/null || true
+clean_docker() {
+    if command -v docker >/dev/null 2>&1; then
+        echo -e "${YELLOW}正在清理 Docker 未使用的镜像、容器与卷...${RESET}"
+        docker system prune -af --volumes
+        echo -e "${GREEN}Docker 数据清理完成！${RESET}"
+    else
+        echo -e "${YELLOW}未检测到 Docker 环境，跳过清理${RESET}"
     fi
-    rm -f $RESOLV_FILE
-    # Alpine 可以通过重启网络触发 udhcpc 自动重新获取 DNS
-    echo -e "${GREEN}静态 DNS 已清理。提示：在 Alpine 下可执行 'rc-service networking restart' 重新获取 DHCP DNS${RESET}"
 }
 
 # =========================================================
-# DNS 视觉面板菜单
+# 主视觉面板菜单
 # =========================================================
-dns_menu() {
+system_clean_menu() {
     while true; do
-        # 每次循环动态读取最新 DNS 状态
-        get_dns_status
+        # 每次循环动态读取系统状态
+        get_system_status
 
         clear
-        echo -e "${GREEN}===============================${RESET}"
-        echo -e "${GREEN}   ◈    DNS 系统管理面板   ◈   ${RESET}"
-        echo -e "${GREEN}===============================${RESET}"
-        echo -e "${GREEN} IPv4 DNS : ${YELLOW}${STATUS_IPV4}${RESET}"
-        echo -e "${GREEN} IPv6 DNS : ${YELLOW}${STATUS_IPv6}${RESET}"
-        echo -e "${GREEN} 锁定状态 : ${LOCK_STATUS}"
-        echo -e "${GREEN}===============================${RESET}"
-        echo -e "${GREEN}  1. Google DNS (8.8.8.8)${RESET}"
-        echo -e "${GREEN}  2. Cloudflare DNS (1.1.1.1)${RESET}"
-        echo -e "${GREEN}  3. 阿里云 DNS (223.5.5.5)${RESET}"
-        echo -e "${GREEN}  4. 腾讯云 DNS (119.29.29.29)${RESET}"
-        echo -e "${GREEN}  5. IPv6 双公网 DNS${RESET}"
-        echo -e "${GREEN}  6. 手动输入自定义 DNS${RESET}"
-        echo -e "${GREEN}  7. 清理静态配置并恢复默认${RESET}"
-        echo -e "${GREEN}  0. 退出${RESET}"
-        echo -e "${GREEN}===============================${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
+        echo -e "${GREEN}=======================================${RESET}"
+        echo -e "${GREEN}     ◈    Linux 系统清理面板    ◈     ${RESET}"
+        echo -e "${GREEN}=======================================${RESET}"
+        echo -e "${GREEN} 当前环境   : ${ENV_STATUS}"
+        echo -e "${GREEN} 包管理器   : ${YELLOW}${PM_STATUS}${RESET}"
+        echo -e "${GREEN} 磁盘状态   : ${DISK_STATUS}"
+        echo -e "${GREEN}=======================================${RESET}"
+        echo -e "${GREEN}  1. 清理系统垃圾 (缓存/日志/旧包)${RESET}"
+        echo -e "${GREEN}  2. 一键全面清理 (系统垃圾 + Docker)${RESET}"
+        echo -e "${GREEN}  3. 安装运行定时自动清理任务${RESET}"
+        echo -e "${GREEN}  0. 退出面板${RESET}"
+        echo -e "${GREEN}=======================================${RESET}"
+        echo -ne "${GREEN} 请选择操作: ${RESET}"
         
-        read -r choice </dev/tty
+        read -r choice
 
         case $choice in
-            1) set_dns_resolvconf "8.8.8.8" "1.1.1.1" ;;
-            2) set_dns_resolvconf "1.1.1.1" "1.0.0.1" ;;
-            3) set_dns_resolvconf "223.5.5.5" "223.6.6.6" ;;
-            4) set_dns_resolvconf "119.29.29.29" "119.28.28.28" ;;
-            5) set_dns_resolvconf "2606:4700:4700::1111" "2001:4860:4860::8888" ;;
-            6) custom_dns ;;
-            7) restore_default ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择，请重新输入...${RESET}"; sleep 1; continue ;;
+            1)
+                clean_system
+                ;;
+            2)
+                clean_system
+                clean_docker
+                ;;
+            3)
+                echo -e "${YELLOW}正在从远程获取自动清理并执行...${RESET}"
+                bash <(curl -fsSL https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/clean-server.sh) || true
+                ;;
+            0)
+                break
+                ;;
+            *)
+                echo -e "${RED}无效选择，请重新输入...${RESET}"
+                sleep 1
+                continue
+                ;;
         esac
 
-        echo -ne "${GREEN}按回车返回面板...${RESET}"
-        read -r </dev/tty
+        echo -ne "\n${GREEN}按回车返回面板...${RESET}"
+        read -r
     done
 }
 
-# =========================================================
-# 执行主逻辑
-# =========================================================
-dns_menu
+# 启动菜单
+system_clean_menu

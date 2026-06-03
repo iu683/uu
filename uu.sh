@@ -1,5 +1,4 @@
 #!/bin/bash
-# 强制使用 bash 运行，Alpine 默认是 ash
 set -e
 
 CADDYFILE="/etc/caddy/Caddyfile"
@@ -33,15 +32,23 @@ if [ ! -d "/etc/caddy" ]; then
     sudo mkdir -p /etc/caddy
 fi
 
-if [ ! -f "$CADDYFILE" ] || [ ! -s "$CADDYFILE" ]; then
-    echo -e "${YELLOW}正在初始化空的 Caddyfile...${RESET}"
-    sudo tee "$CADDYFILE" >/dev/null <<EOF
-# Caddy Configuration File
-# Managed by Alpine Caddy Panel
-EOF
-fi
+# 确保全局块初始化正确
+ensure_global_block() {
+    if [ ! -f "$CADDYFILE" ] || [ ! -s "$CADDYFILE" ]; then
+        local rand_num=$((RANDOM % 90000 + 10000))
+        echo -e "{\n    email caddy-admin.${rand_num}@ssl-notice.internal\n}\n" | sudo tee "$CADDYFILE" >/dev/null
+    else
+        if ! grep -q "email " "$CADDYFILE"; then
+            local rand_num=$((RANDOM % 90000 + 10000))
+            local tmpfile=$(mktemp)
+            echo -e "{\n    email caddy-admin.${rand_num}@ssl-notice.internal\n}\n" > "$tmpfile"
+            cat "$CADDYFILE" >> "$tmpfile"
+            sudo mv "$tmpfile" "$CADDYFILE"
+        fi
+    fi
+}
+ensure_global_block
 
-# 确保 Caddy 核心运行数据目录及证书软链目录权限完全正确
 sudo mkdir -p /var/lib/caddy/.local/share/caddy
 sudo mkdir -p $CADDY_CERTS_DIR
 sudo chown -R caddy:caddy /var/lib/caddy $CADDY_CERTS_DIR 2>/dev/null || true
@@ -52,7 +59,6 @@ pause() {
     read -r
 }
 
-# ==================== 端口冲突预检 ====================
 check_port_conflict() {
     if command -v netstat >/dev/null 2>&1; then
         local conflict=$(netstat -ntlp 2>/dev/null | grep -E ':80 |:443 ' | grep -v 'caddy' || true)
@@ -103,9 +109,7 @@ install_caddy() {
     echo -e "${GREEN}正在通过 apk 安装 Caddy...${RESET}"
     sudo apk update -q && sudo apk add -q caddy
     sudo rc-update add caddy default 2>/dev/null || true
-    
-    sudo mkdir -p /var/lib/caddy/.local/share/caddy
-    sudo chown -R caddy:caddy /var/lib/caddy $CADDY_CERTS_DIR 2>/dev/null || true
+    ensure_global_block
     
     sudo rc-service caddy start
     echo -e "${GREEN}Caddy 安装完成并已启动${RESET}"
@@ -150,19 +154,27 @@ validate_and_reload() {
     echo -e "${YELLOW}正在对调整后的 Caddyfile 进行语法安全性检查...${RESET}"
     
     if local ERR_MSG=$(sudo caddy validate --config "$CADDYFILE" 2>&1); then
-        # 强制清除潜在的僵尸进程或 OpenRC 的崩溃挂起标记
-        sudo pkill -9 caddy || true
-        sudo rc-service caddy zap 2>/dev/null || true
-        sudo rc-service caddy start 2>/dev/null
-        echo -e "${GREEN}✔ Caddy 配置验证通过，服务已成功平滑重启！${RESET}"
-        return 0
+        echo -e "${GREEN}✔ Caddy 配置语法检查通过！正在强制刷新服务...${RESET}"
+        
+        sudo rc-service caddy stop >/dev/null 2>&1 || true
+        sudo pkill -9 caddy >/dev/null 2>&1 || true
+        sudo pkill -9 supervise-daemon >/dev/null 2>&1 || true
+        sudo rc-service caddy zap >/dev/null 2>&1 || true
+        
+        if sudo rc-service caddy start >/dev/null 2>&1; then
+            echo -e "${GREEN}✔ Caddy 服务已成功重启，全自动证书申请已在后台静默运行！${RESET}"
+            return 0
+        else
+            echo -e "${RED}❌ 系统守护进程拉起失败！请用选项10排查。${RESET}"
+            return 1
+        fi
     else
-        echo -e "${RED}❌ 错误: Caddyfile 语法检查未通过！拒绝写入新配置。${RESET}"
+        echo -e "${RED}❌ 错误: Caddyfile 语法检查未通过！拒绝应用此配置。${RESET}"
         echo -e "${YELLOW}---------------- [Caddy 核心报错日志] ----------------${RESET}"
         echo -e "$ERR_MSG"
         echo -e "${YELLOW}------------------------------------------------------${RESET}"
         if [ -n "$BACKUP_FILE" ] && [ -f "$BACKUP_FILE" ]; then
-            echo -e "${GREEN}🔄 系统检测到潜在崩溃风险，已自动秒级回滚。${RESET}"
+            echo -e "${GREEN}🔄 检测到崩溃风险，已自动将配置秒级回滚。${RESET}"
             sudo cp -f "$BACKUP_FILE" "$CADDYFILE"
         fi
         return 1
@@ -170,8 +182,6 @@ validate_and_reload() {
 }
 
 reload_caddy() {
-    sudo pkill -9 caddy || true
-    sudo rc-service caddy zap 2>/dev/null || true
     validate_and_reload ""
     pause
 }
@@ -210,22 +220,12 @@ add_site() {
     echo -ne "请输入普通 HTTP 代理目标 (例如 127.0.0.1:8008)： "; read -r HTTP_TARGET
     HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
 
-    echo -ne "请输入联系邮箱 (用于接收证书过期提醒，直接回车自动生成): "
-    read -r USER_EMAIL
-    if [ -z "$USER_EMAIL" ]; then
-        local rand_num=$((RANDOM % 90000 + 10000))
-        EMAIL="caddy-admin.${rand_num}@ssl-notice.internal"
-    else
-        EMAIL="$USER_EMAIL"
-    fi
-
     local TS=$(date +%s 2>/dev/null || echo "bk")
     local BK_FILE="/tmp/caddyfile.bak.$TS"
     sudo cp "$CADDYFILE" "$BK_FILE"
 
-    SITE_CONFIG="\n${DOMAIN} {\n"
-    SITE_CONFIG+="    tls {\n        email ${EMAIL}\n    }\n"
-    
+    # 全自动配置：站点块内只写明确的 tls 触发自动申请，邮箱归全局块管
+    SITE_CONFIG="\n${DOMAIN} {\n    tls\n"
     if [[ "$H2C" == "y" ]]; then
         echo -ne "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： "; read -r H2C_PATH
         echo -ne "请输入内网目标地址 (例如 127.0.0.1:8008)： "; read -r H2C_TARGET
@@ -235,8 +235,8 @@ add_site() {
 
     echo -e "$SITE_CONFIG" | sudo tee -a "$CADDYFILE" >/dev/null
     if validate_and_reload "$BK_FILE"; then
-        echo -e "${GREEN}站点 ${DOMAIN} 添加成功并重载配置！${RESET}"
-        echo -e "${YELLOW}💡 提示: 自动申请通常需要 10秒~2分钟，如果长时间不生效，请使用主菜单选项 10 实时观察证书申请日志。${RESET}"
+        echo -e "${GREEN}站点 ${DOMAIN} 添加成功！${RESET}"
+        echo -e "${YELLOW}💡 提示: 证书正在后台异步全自动签发，可使用选项 10 查看进度。${RESET}"
     fi
     rm -f "$BK_FILE"
     pause
@@ -258,7 +258,7 @@ check_domains_status() {
 
     for DOMAIN in "${DOMAINS[@]}"; do
         local CERT_PATH=""
-        local TYPE="自动申请"
+        local TYPE="全自动申请"
 
         if [ -d "$CADDY_DATA" ]; then
             CERT_PATH=$(sudo find "$CADDY_DATA" -type f -name "$DOMAIN.crt" 2>/dev/null | head -n 1)
@@ -268,7 +268,7 @@ check_domains_status() {
             local CUSTOM_PATH=$(grep -A 5 "${DOMAIN}" "$CADDYFILE" | grep "tls " | awk '{print $2}' | tr -d '\r\n')
             if [ -e "$CUSTOM_PATH" ]; then
                 CERT_PATH="$CUSTOM_PATH"
-                TYPE="自定义证书 (软链接保持更新)"
+                TYPE="自定义证书"
             fi
         fi
 
@@ -302,7 +302,7 @@ check_domains_status() {
                 fi
             fi
         else
-            echo -e "  └─ ${YELLOW}运行状态: ${RESET}${RED}未找到证书或尚未签发成功 (请通过主菜单10查看实时日志)${RESET}"
+            echo -e "  └─ ${YELLOW}运行状态: ${RESET}${RED}未找到物理证书，后台正在全自动与 ACME 通信签发中...${RESET}"
         fi
         echo -e "${YELLOW}----------------------------------------${RESET}"
     done
@@ -367,9 +367,6 @@ modify_site() {
     fi
 
     DOMAIN="${DOMAINS[$((NUM-1))]}"
-    
-    # 提取旧配置里的 tls 块（如果有的话）
-    local HAS_OLD_TLS=$(grep -A 5 "${DOMAIN} {" "$CADDYFILE" | grep "tls" || true)
 
     echo -ne "请输入普通 HTTP 代理目标 (例如 127.0.0.1:8008)： "; read -r HTTP_TARGET
     HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
@@ -389,20 +386,12 @@ modify_site() {
 
     remove_domain_block "$DOMAIN"
     
-    NEW_CONFIG="\n${DOMAIN} {\n"
-    if [ -n "$HAS_OLD_TLS" ]; then
-        # 如果老配置有，简单补全标准结构
-        local rand_num=$((RANDOM % 90000 + 10000))
-        NEW_CONFIG+="    tls {\n        email caddy-admin.${rand_num}@ssl-notice.internal\n    }\n"
-    else
-        local rand_num=$((RANDOM % 90000 + 10000))
-        NEW_CONFIG+="    tls {\n        email caddy-admin.${rand_num}@ssl-notice.internal\n    }\n"
-    fi
+    NEW_CONFIG="\n${DOMAIN} {\n    tls\n"
     NEW_CONFIG+="${H2C_CONFIG}    reverse_proxy ${HTTP_TARGET}\n}\n"
     
     echo -e "$NEW_CONFIG" | sudo tee -a "$CADDYFILE" >/dev/null
     if validate_and_reload "$BK_FILE"; then
-        echo -e "${GREEN}域名 ${DOMAIN} 配置已成功修改！${RESET}"
+        echo -e "${GREEN}域名 ${DOMAIN} 配置已成功修改并刷新！${RESET}"
     fi
     rm -f "$BK_FILE"
     pause
@@ -413,7 +402,7 @@ link_and_fix_permissions() {
     local symlink_dst=$2
 
     if [ ! -f "$src_file" ]; then
-        echo -e "${RED}❌ 错误: 源证书/密钥文件 [${src_file}] 实际不存在，请检查输入路径！${RESET}"
+        echo -e "${RED}❌ 错误: 源证书/密钥文件 [${src_file}] 实际不存在！${RESET}"
         return 1
     fi
 
@@ -422,8 +411,8 @@ link_and_fix_permissions() {
     local dir_path=$(dirname "$src_file")
     while [ "$dir_path" != "/" ] && [ -n "$dir_path" ]; do
         if [[ "$dir_path" == /root* ]]; then
-            echo -e "${RED}❌ 拒绝: 检测到源证书位于 /root 极度隐秘目录下，OpenRC 的 caddy 用户绝无可能越权穿透。${RESET}"
-            echo -e "${YELLOW}💡 强烈建议: 请将 acme 证书导出路径改为 /etc/ssl/ 或 /etc/caddy/ 等公共非 root 目录下！${RESET}"
+            echo -e "${RED}❌ 拒绝: 检测到源证书位于 /root 目录下，OpenRC 的 caddy 用户无法穿透。${RESET}"
+            echo -e "${YELLOW}💡 建议: 请将证书导出至 /etc/ssl/ 或 /etc/caddy/ 等公共目录下！${RESET}"
             return 1
         fi
         sudo chmod +x "$dir_path" 2>/dev/null || true
@@ -432,7 +421,6 @@ link_and_fix_permissions() {
 
     sudo rm -f "$symlink_dst"
     sudo ln -sf "$src_file" "$symlink_dst"
-    
     sudo chown -h caddy:caddy "$symlink_dst" 2>/dev/null || true
     sudo chown -R caddy:caddy "$CADDY_CERTS_DIR" 2>/dev/null || true
     return 0
@@ -450,7 +438,6 @@ add_site_with_cert() {
     local LINK_CERT="$CADDY_CERTS_DIR/${DOMAIN}.fullchain.pem"
     local LINK_KEY="$CADDY_CERTS_DIR/${DOMAIN}.privkey.key"
 
-    echo -e "${YELLOW}正在智能打通父目录权限并建立不占空间的软链接...${RESET}"
     if ! link_and_fix_permissions "$RAW_CERT_PATH" "$LINK_CERT"; then pause; return; fi
     if ! link_and_fix_permissions "$RAW_KEY_PATH" "$LINK_KEY"; then pause; return; fi
 
@@ -474,8 +461,7 @@ add_site_with_cert() {
     echo -e "$SITE_CONFIG" | sudo tee -a "$CADDYFILE" >/dev/null
 
     if validate_and_reload "$BK_FILE"; then
-        echo -e "${GREEN}站点 ${DOMAIN} (动态软链证书模式) 添加成功！${RESET}"
-        echo -e "${GREEN}今后源证书文件更新时，Caddy 将会自动同步加载最新的凭证。${RESET}"
+        echo -e "${GREEN}站点 ${DOMAIN} (自定义证书) 添加成功！${RESET}"
     fi
     rm -f "$BK_FILE"
     pause
@@ -493,15 +479,10 @@ add_emby_site_caddy() {
     local BK_FILE="/tmp/caddyfile.bak.$TS"
     sudo cp "$CADDYFILE" "$BK_FILE"
 
-    local rand_num=$((RANDOM % 90000 + 10000))
-    local EMAIL="caddy-admin.${rand_num}@ssl-notice.internal"
-
     sudo tee -a "$CADDYFILE" >/dev/null <<EOF
 
 $DOMAIN {
-    tls {
-        email $EMAIL
-    }
+    tls
     encode gzip
     reverse_proxy $TARGET {
         flush_interval -1
@@ -548,15 +529,10 @@ add_emby_split_site_caddy() {
     local BK_FILE="/tmp/caddyfile.bak.$TS"
     sudo cp "$CADDYFILE" "$BK_FILE"
 
-    local rand_num=$((RANDOM % 90000 + 10000))
-    local EMAIL="caddy-admin.${rand_num}@ssl-notice.internal"
-
     sudo tee -a "$CADDYFILE" >/dev/null <<EOF
 
 $DOMAIN {
-    tls {
-        email $EMAIL
-    }
+    tls
     handle_path /s1/* {
         reverse_proxy $T_STREAM {
             flush_interval -1
@@ -632,7 +608,7 @@ EOF
 }
 EOF
     if validate_and_reload "$BK_FILE"; then
-        echo -e "${GREEN}自定义证书域名${DOMAIN} ，Emby 配置已成功生成！${RESET}"
+        echo -e "${GREEN}Emby 配置已成功生成！${RESET}"
     fi
     rm -f "$BK_FILE"
     pause
@@ -694,10 +670,9 @@ view_sites() {
 
     if [ -n "$CERT_FILE" ] && [ -e "$CERT_FILE" ]; then
         echo -e "${GREEN}证书路径：${RESET}${CERT_FILE}"
-        echo -e "${GREEN}证书信息：${RESET}"
         openssl x509 -in "$CERT_FILE" -noout -text | awk '/Subject:/ || /Issuer:/ || /Not Before:/ || /Not After :/ {print}'
     else
-        echo -e "${YELLOW}${DOMAIN} - 系统中暂未生成物理证书，可能还在排队向 ACME 申请中，请通过选项 10 查看实时日志。${RESET}"
+        echo -e "${YELLOW}${DOMAIN} - 系统中暂未生成证书，可能还在签发中，请通过主菜单10查看实时日志。${RESET}"
     fi
     pause
 }
@@ -709,13 +684,12 @@ view_caddy_logs() {
     echo -e "${YELLOW}    >> 提示: 键盘按下 Ctrl + C 即可随时退出日志流 <<  ${RESET}"
     echo -e "${GREEN}======================================================${RESET}"
     echo ""
-    # 强制尝试提取 Alpine OpenRC 系统日志流中的 Caddy 记录
     if [ -f /var/log/messages ]; then
-        sudo grep -i caddy /var/log/messages | tail -n 100
+        sudo grep -i caddy /var/log/messages | tail -n 50
         echo -e "${YELLOW}------------------- [ 实时追踪开始 ] -------------------${RESET}"
         sudo tail -f /var/log/messages | grep --line-buffered -i caddy || true
     else
-        echo -e "${RED}未找到物理日志文件，正在尝试以非服务模式临时打印前台报错：${RESET}"
+        echo -e "${RED}未找到标准系统日志，正尝试以前台诊断模式拉取日志输出：${RESET}"
         sudo -u caddy caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
     fi
     pause
@@ -740,7 +714,7 @@ menu() {
         echo -e "${GREEN} 6. 查看证书信息${RESET}"
         echo -e "${GREEN} 7. Emby反代管理${RESET}"
         echo -e "${GREEN} 8. 查看证书状态${RESET}"
-        echo -e "${GREEN} 9. 重载Caddy配置${RESET}"
+        echo -e "${GREEN} 9. 强制重置并拉起服务${RESET}"
         echo -e "${GREEN}10. 查看Caddy日志${RESET}"
         echo -e "${GREEN}11. 更新Caddy${RESET}"
         echo -e "${GREEN}12. 卸载Caddy${RESET}"

@@ -1,6 +1,6 @@
 #!/bin/bash
 # =========================================================================
-# IPv4 / IPv6 智能管理面板（支持选择性持久化配置 + 多系统自动适配）
+# 字体与语言环境智能管理面板
 # =========================================================================
 
 # 严格的 Root 权限检查
@@ -14,112 +14,116 @@ RED="\033[31m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-# 检查命令是否存在
-has_cmd() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-# 获取系统内核/发行版 ID
+# 自动精确识别发行版
 get_os_type() {
-    if [ -f /etc/os-release ]; then
+    if [ -f /etc/alpine-release ]; then
+        echo "Alpine"
+    elif [ -f /etc/os-release ]; then
         . /etc/os-release
-        echo "$ID"
+        case "$ID" in
+            ubuntu) echo "Ubuntu" ;;
+            debian) echo "Debian" ;;
+            centos|rhel|rocky|almalinux) echo "RedHat" ;;
+            *) echo "Linux" ;;
+        esac
     else
-        echo "unknown"
+        echo "Linux"
     fi
 }
 
-# 智能安装依赖
-install_pkg() {
-    local pkg="$1"
-    local os=$(get_os_type)
+OS=$(get_os_type)
 
-    if has_cmd "$pkg"; then
-        return
-    fi
+# 动态获取当前系统的语言状态
+get_current_locale() {
+    echo "${LANG:-未设置}"
+}
 
-    if [ "$os" = "alpine" ]; then
-        case "$pkg" in
-            sysctl) return 0 ;; 
-            ping6|ping) pkg="iputils" ;; 
-        esac
-    fi
-
-    echo -e "${YELLOW}🔧 正在为您补全系统依赖: $pkg ...${RESET}"
-
-    case "$os" in
-        ubuntu|debian)
+# 核心语言环境应用函数
+apply_locale() {
+    local target_lang=$1
+    
+    case "$OS" in
+        Ubuntu|Debian)
+            echo -e "${YELLOW}🔧 正在更新 apt 缓存并安装必要字体与语言包...${RESET}"
             apt-get update -y >/dev/null 2>&1
-            apt-get install -y "$pkg" >/dev/null 2>&1
+            apt-get install -y locales >/dev/null 2>&1
+            
+            if [ "$target_lang" = "zh_CN.UTF-8" ]; then
+                apt-get install -y fonts-wqy-microhei fonts-wqy-zenhei >/dev/null 2>&1
+            else
+                apt-get install -y fonts-dejavu fonts-liberation >/dev/null 2>&1
+            fi
+
+            # 配置并生成 Locale
+            echo -e "${YELLOW}🔄 正在生成语言环境: $target_lang...${RESET}"
+            if [ -f /etc/locale.gen ]; then
+                sed -i "s/^#\?\s*\($target_lang UTF-8\)/\1/" /etc/locale.gen 2>/dev/null
+                if ! grep -q "$target_lang UTF-8" /etc/locale.gen; then
+                    echo "$target_lang UTF-8" >> /etc/locale.gen
+                fi
+            fi
+            locale-gen "$target_lang" >/dev/null 2>&1
+            
+            # 强制锁入环境配置
+            if command -v update-locale >/dev/null 2>&1; then
+                update-locale LANG="$target_lang" LC_ALL="$target_lang" >/dev/null 2>&1
+            fi
+            echo "LANG=$target_lang" > /etc/default/locale
+            echo "LC_ALL=$target_lang" >> /etc/default/locale
             ;;
-        alpine)
-            apk add --no-cache "$pkg" >/dev/null 2>&1
+            
+        Alpine)
+            echo -e "${YELLOW}🔧 正在通过 apk 补全 Alpine 字体与 musl 本地化组件...${RESET}"
+            # 1. 补齐多语言底层包与 GNU coreutils 工具链（彻底解决 Busybox 无法解析中文国际化的问题）
+            apk add --no-cache musl-locales musl-locales-lang coreutils >/dev/null 2>&1
+            
+            if [ "$target_lang" = "zh_CN.UTF-8" ]; then
+                # 从官方 testing 仓库拉取标准的文泉驿中文字体，防止终端看中文全是 [?] 方块
+                apk add --no-cache ttf-dejavu font-wqy-zenhei --repository http://dl-cdn.alpinelinux.org/alpine/edge/testing >/dev/null 2>&1
+            else
+                apk add --no-cache ttf-dejavu >/dev/null 2>&1
+            fi
+            
+            # 2. 【核心修复】清理所有可能导致干扰的历史语言变量
+            rm -f /etc/profile.d/locale.sh
+            if [ -f /etc/profile ]; then
+                sed -i '/LANG=/d' /etc/profile
+                sed -i '/LANGUAGE=/d' /etc/profile
+                sed -i '/LC_ALL=/d' /etc/profile
+                sed -i '/zh_CN/d' /etc/profile
+                sed -i '/en_US/d' /etc/profile
+            fi
+            
+            # 3. 【降维打击】直接强制把变量锁死在全局 /etc/profile 的最底部
+            # 这样无论 SSH 工具怎么强推本地英文变量，在进系统的最后一刻都会被强制洗成目标语言
+            echo -e "\n🔄 正在向系统全局写入环境配置..."
+            cat >> /etc/profile <<EOF
+
+export LANG=$target_lang
+export LANGUAGE=$(echo "$target_lang" | cut -d'.' -f1):$(echo "$target_lang" | cut -d'_' -f1)
+export LC_ALL=$target_lang
+EOF
             ;;
-        centos|rhel|rocky|almalinux)
-            yum install -y "$pkg" >/dev/null 2>&1 || dnf install -y "$pkg" >/dev/null 2>&1
+            
+        *)
+            echo -e "${RED}⚠️ 当前系统 [${OS}] 未做深度定制，尝试通用变量写入...${RESET}"
             ;;
     esac
 }
 
-# 检查常用核心依赖
-check_deps() {
-    local deps=(curl ip ping sysctl awk grep)
-    for cmd in "${deps[@]}"; do
-        install_pkg "$cmd"
-    done
-}
-
-# 自动检测主网卡名称
-detect_iface() {
-    ip -o link show | awk -F': ' '{print $2}' | grep -vE 'lo|docker|veth|br-' | head -n1
-}
-
-# 获取并格式化主页的 IP 状态
-get_menu_status() {
-    local iface="$1"
-    
-    # 1. 检查 IPv4 本地地址
-    local v4_addr=$(ip -4 addr show dev "$iface" 2>/dev/null | grep "inet" | awk '{print $2}' | head -n1)
-    if [ -z "$v4_addr" ]; then
-        V4_STATUS="${RED}未就绪 (无IP)${RESET}"
-    else
-        V4_STATUS="${YELLOW}已启用 (${v4_addr})${RESET}"
-    fi
-
-    # 2. 检查 IPv6 内核状态与本地地址
-    local is_v6_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
-    if [ "$is_v6_disabled" = "1" ]; then
-        V6_STATUS="${RED}已禁用${RESET}"
-    else
-        local v6_addr=$(ip -6 addr show dev "$iface" 2>/dev/null | grep "inet6" | grep -v "fe80" | awk '{print $2}' | head -n1)
-        if [ -z "$v6_addr" ]; then
-            V6_STATUS="${YELLOW}已开启${RESET}"
-        else
-            V6_STATUS="${YELLOW}已启用(${v6_addr})${RESET}"
-        fi
-    fi
-}
-
-# 执行依赖检查
-check_deps
-
-# 主循环
+# 主循环面板
 while true; do
     clear
-    iface=$(detect_iface)
-    [ -z "$iface" ] && iface="未检测到网卡"
-    get_menu_status "$iface"
-
+    CURRENT_LANG=$(get_current_locale)
+    
     echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}       ◈  IPv4 / IPv6 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}       ◈ 字体与语言环境管理面板 ◈    ${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN} 活跃主网卡 : ${YELLOW}${iface}${RESET}"
-    echo -e "${GREEN} IPv4 状态  : ${V4_STATUS}"
-    echo -e "${GREEN} IPv6 状态  : ${V6_STATUS}"
+    echo -e "${GREEN} 检测到系统 : ${YELLOW}${OS}${RESET}"
+    echo -e "${GREEN} 当前语言包 : ${YELLOW}${CURRENT_LANG}${RESET}"
     echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  1) 禁用 IPv6（可选临时或永久）${RESET}"
-    echo -e "${GREEN}  2) 开启并启用 IPv6（自动刷新网络）${RESET}"
-    echo -e "${GREEN}  3) 深度查看 IP 状态 & 公网连通性测试${RESET}"
+    echo -e "${GREEN}  1) 切换为【中文环境】${RESET}"
+    echo -e "${GREEN}  2) 切换为【英文环境】${RESET}"
     echo -e "${GREEN}  0) 退出${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
     
@@ -128,104 +132,17 @@ while true; do
 
     case "$choice" in
         1)
-            # 临时禁用（对内核直接生效）
-            sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1
-            sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1
-            sysctl -w net.ipv6.conf.${iface}.disable_ipv6=1 >/dev/null 2>&1
-            
-            # 弹出子菜单询问是否转为永久
-            echo -e "\n${YELLOW}------ 💾 持久化配置选项 ------${RESET}"
-            echo -e "${GREEN}  1) 仅临时禁用（默认，重启服务器后恢复 IPv6）${RESET}"
-            echo -e "${GREEN}  2) 转为永久禁用（锁入系统文件，重启不失效）${RESET}"
-            echo -ne "${YELLOW} 请选择禁用模式 [默认 1]: ${RESET}"
-            read perm_choice
-            
-            if [ "$perm_choice" = "2" ]; then
-                # 写入永久配置文件
-                if [ -f /etc/sysctl.conf ]; then
-                    sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
-                    echo "net.ipv6.conf.all.disable_ipv6 = 1" >> /etc/sysctl.conf
-                    echo "net.ipv6.conf.default.disable_ipv6 = 1" >> /etc/sysctl.conf
-                    echo "net.ipv6.conf.${iface}.disable_ipv6 = 1" >> /etc/sysctl.conf
-                    sysctl -p >/dev/null 2>&1
-                fi
-                echo -e "\n${GREEN}✅ 已成功【永久禁用】IPv6，重启不会失效！${RESET}"
-            else
-                # 默认或选1，清理可能存在的旧永久文件残留，保持纯临时状态
-                if [ -f /etc/sysctl.conf ]; then
-                    sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
-                    sysctl -p >/dev/null 2>&1
-                fi
-                echo -e "\n${GREEN}✅ 已成功【临时禁用】IPv6（重启服务器后将自动恢复）。${RESET}"
-            fi
+            echo -e "\n${YELLOW}🚀 开始配置中文环境...${RESET}"
+            apply_locale "zh_CN.UTF-8"
+            echo -e "\n${GREEN}✅ 中文环境及支持字体配置完成！${RESET}"
+            echo -e "${YELLOW}💡 提示：系统底层已修改，请【彻底断开并重新连接 SSH】查看中文效果。${RESET}"
             read -rp "按回车键返回菜单..."
             ;;
         2)
-            # 1. 临时生效
-            sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
-            sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
-            sysctl -w net.ipv6.conf.${iface}.disable_ipv6=0 >/dev/null 2>&1
-            
-            # 2. 清理永久禁用的配置文件残留，防止重启后又被禁用
-            if [ -f /etc/sysctl.conf ]; then
-                sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
-                sysctl -p >/dev/null 2>&1
-            fi
-            
-            echo -e "\n${GREEN}✅ 内核 IPv6 模块已激活。${RESET}"
-            echo -e "${YELLOW}系统需重启才能获取公网 IPv6 地址${RESET}"
-            read -rp "按回车键立即重启系统，或 Ctrl+C 取消..."
-            reboot
-            read -rp "按回车键返回菜单..."
-            ;;
-        3)
-            echo -e "\n${GREEN}🌐 [1/3] 内核 IPv6 状态：${RESET}"
-            is_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
-            if [ "$is_disabled" = "1" ]; then
-                echo -e "${RED}❌ 内核已禁用 IPv6${RESET}"
-            else
-                echo -e "${GREEN}✅ 内核已启用 IPv6${RESET}"
-            fi
-
-            echo -e "\n${GREEN}📌 [2/3] 本地网卡 IPv6 地址分配情况：${RESET}"
-            if ip -6 addr show dev "$iface" >/dev/null 2>&1; then
-                ip -6 addr show dev "$iface" | grep "inet6" || echo "⚠️ 该网卡暂未获取到任何 IPv6 地址"
-            else
-                ip -6 addr | grep "inet6" || echo "❌ 未检测到任何 IPv6 地址"
-            fi
-
-            echo -e "\n${GREEN}🔎 [3/3] 公网连通性及双栈公网 IP 测试：${RESET}"
-            
-            # IPv4 测试
-            if has_cmd ping; then
-                ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 && echo -e "${GREEN}✅ IPv4 路由连通正常${RESET}" || echo -e "${RED}❌ IPv4 路由无法访问公网${RESET}"
-            fi
-            if has_cmd curl; then
-                echo -n "   └─ 本机公网 IPv4: "
-                curl -4 -s --connect-timeout 4 ifconfig.co || echo -e "${YELLOW}获取超时${RESET}"
-                echo
-            fi
-
-            # IPv6 测试
-            has_v6=false
-            if has_cmd ping6; then
-                ping6 -c 2 -W 3 ipv6.google.com >/dev/null 2>&1 && has_v6=true
-            elif has_cmd ping; then
-                ping -6 -c 2 -W 3 ipv6.google.com >/dev/null 2>&1 && has_v6=true
-            fi
-
-            if [ "$has_v6" = true ]; then
-                echo -e "${GREEN}✅ IPv6 路由连通正常${RESET}"
-                if has_cmd curl; then
-                    echo -n "   └─ 本机公网 IPv6: "
-                    curl -6 -s --connect-timeout 4 ifconfig.co || echo -e "${YELLOW}获取超时${RESET}"
-                    echo
-                fi
-            else
-                echo -e "${RED}❌ IPv6 无法访问外部网络${RESET}"
-            fi
-
-            echo
+            echo -e "\n${YELLOW}🚀 开始配置英文环境...${RESET}"
+            apply_locale "en_US.UTF-8"
+            echo -e "\n${GREEN}✅ 英文环境配置完成！${RESET}"
+            echo -e "${YELLOW}💡 提示：系统底层已修改，请【彻底断开并重新连接 SSH】查看英文效果。${RESET}"
             read -rp "按回车键返回菜单..."
             ;;
         0)

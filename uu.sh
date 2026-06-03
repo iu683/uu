@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Alpine sing-box AnyTLS 专属管理面板
+# Alpine sing-box TUIC v5 专属管理面板 (权限自动化穿透版)
 # SPDX-License-Identifier: MIT
 #
 set -Eop pipefail
@@ -9,22 +9,29 @@ export LANG=en_US.UTF-8
 # =========================================================
 # 1. 核心控制与全局环境初始化
 # =========================================================
-readonly BINARY_PATH="/usr/local/bin/sing-box-anytls"
-readonly ANYTLS_CONFIG="/etc/sing-box-anytls/config.json"
-readonly SB_DIR="/root/proxynode/anytls"
-CONFIG_DIR="/etc/sing-box-anytls"
-OPENRC_SERVICE_PATH="/etc/init.d/sing-box-anytls"
-LOG_FILE="/var/log/sing-box-anytls.log"
-RUN_USER="singbox-anytls"
+readonly BINARY_PATH="/usr/local/bin/sing-box-tuic"
+readonly TUIC_CONFIG="/etc/sing-box-tuic/config.json"
+readonly TUIC_DIR="/root/proxynode/tuicv5"
+CONFIG_DIR="/etc/sing-box-tuic"
+OPENRC_SERVICE_PATH="/etc/init.d/sing-box-tuic"
+LOG_FILE="/var/log/sing-box-tuic.log"
+RUN_USER="singbox-tuic"
 
-TMP_DIR=$(mktemp -d -t sb-anytls.XXXXXX)
+TMP_DIR=$(mktemp -d -t sb-tuic.XXXXXX)
+
+# 全局上下文锁（防止子函数变量污染与作用域丢失）
+port=""
+auth_uuid=""
+auth_pwd=""
+cert_path="/etc/sing-box-tuic/certs/cert.pem"
+key_path="/etc/sing-box-tuic/certs/key.pem"
+tuic_domain=""
 
 # 颜色标准规范
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 BLUE="\033[34m"
-CYAN="\033[36m"
 RESET="\033[0m"
 
 info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
@@ -48,7 +55,16 @@ is_alpine() {
 install_packages() {
   info "正在刷新 Alpine 仓库并安装核心依赖..."
   apk update
-  apk add --no-cache bash curl wget tar openssl openrc iproute2 jq grep sed coreutils bind-tools gcompat socat python3
+  apk add --no-cache bash curl wget tar openssl openrc iproute2 jq grep sed coreutils bind-tools iptables ip6tables gcompat socat python3 acl
+  
+  if [[ -f /etc/init.d/iptables ]]; then
+    rc-update add iptables default >/dev/null 2>&1 || true
+    rc-service iptables start >/dev/null 2>&1 || true
+  fi
+  if [[ -f /etc/init.d/ip6tables ]]; then
+    rc-update add ip6tables default >/dev/null 2>&1 || true
+    rc-service ip6tables start >/dev/null 2>&1 || true
+  fi
 }
 
 create_user() {
@@ -101,27 +117,66 @@ get_latest_version() {
   fi
 }
 
-# =========================================================
-# 4. 网络诊断与配置管理辅助
-# =========================================================
+clear_old_iptables() {
+  if [[ -f "${CONFIG_DIR}/hopping.txt" && -f "${CONFIG_DIR}/main_port.txt" ]]; then
+    local old_hop old_port old_start old_end
+    old_hop=$(cat "${CONFIG_DIR}/hopping.txt")
+    old_port=$(cat "${CONFIG_DIR}/main_port.txt")
+    old_start="${old_hop%-*}"
+    old_end="${old_hop#*-}"
+
+    if [[ -n "$old_start" && -n "$old_end" && -n "$old_port" ]]; then
+      info "正在强力清除旧有的 iptables 端口跳跃规则..."
+      iptables -t nat -D PREROUTING -p udp -m multiport --dports "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+      ip6tables -t nat -D PREROUTING -p udp -m multiport --dports "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+      iptables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+      ip6tables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+    fi
+  fi
+}
+
+apply_new_iptables() {
+  clear_old_iptables
+  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
+    local hop_val start_p end_p
+    hop_val=$(cat "${CONFIG_DIR}/hopping.txt")
+    start_p="${hop_val%-*}"
+    end_p="${hop_val#*-}"
+    
+    info "正在应用 iptables 转发规则: UDP $start_p-$end_p => 主端口 $port"
+    if iptables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null; then
+      ip6tables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+    else
+      iptables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+      ip6tables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+    fi
+    
+    echo "$port" > "${CONFIG_DIR}/main_port.txt"
+    
+    if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
+    if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
+    info "防火墙端口跳跃规则已固化。"
+  fi
+}
+
 get_public_ip() {
-    local ip_addr
+    local ip
     for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
         for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip_addr=$($cmd "$url" 2>/dev/null) && [[ -n "$ip_addr" ]] && echo "$ip_addr" && return
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
     for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
         for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip_addr=$($cmd "$url" 2>/dev/null) && [[ -n "$ip_addr" ]] && echo "$ip_addr" && return
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
-    echo "127.0.0.1"
+    echo "无法获取公网IP"
 }
 
 check_port() {
-  local port_chk="$1"
-  if ss -tunlp | grep -E -q ":$port_chk "; then
+  local check_p="$1"
+  if ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$check_p"; then
     return 1
   fi
   return 0
@@ -139,8 +194,8 @@ get_random_port() {
   done
 }
 
-get_anytls_status() {
-  if rc-service sing-box-anytls status 2>/dev/null | grep -q "started"; then
+get_tuic_status() {
+  if rc-service sing-box-tuic status 2>/dev/null | grep -q "started"; then
     echo "RUNNING"
   else
     echo "STOPPED"
@@ -148,64 +203,62 @@ get_anytls_status() {
 }
 
 get_current_port_display() {
-  if [[ -f "$ANYTLS_CONFIG" ]]; then
-    jq -r '.inbounds[0].listen_port // empty' "$ANYTLS_CONFIG" 2>/dev/null || echo "-"
+  if [[ -f "$TUIC_CONFIG" ]]; then
+    local main_port jump_range="无"
+    main_port=$(jq -r '.inbounds[0].listen_port // empty' "$TUIC_CONFIG" 2>/dev/null)
+    [[ -f "${CONFIG_DIR}/hopping.txt" ]] && jump_range=$(cat "${CONFIG_DIR}/hopping.txt")
+    
+    if [[ "$jump_range" != "无" ]]; then
+      echo "${main_port} [${jump_range}]"
+    else
+      echo "${main_port:- -}"
+    fi
   else echo "-"; fi
 }
 
-# 修复外部自定义证书的穿透访问权限，确保非root运行的 singbox-anytls 用户有权读取
+# =========================================================
+# 5. 核心权限机制：全自动多级穿透锁
+# =========================================================
 fix_external_cert_permission() {
   local cert="$1"
   local key="$2"
   
-  # 针对 /root 目录的致命硬拦截
   if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
     error "致命拒绝: 检测到您的证书位于 /root/ 目录下！"
-    warn "原因分析: /root 目录权限极为严苛(700)，任何非root用户(包括 singbox-anytls)均无权穿透。"
-    warn "         即使强行赋予文件 644 权限，内核也会因路径阻塞拒绝读取。"
-    info "权威推荐: 请在 acme.sh 命令中加上 --install-cert 指令，将证书自动分发到公共目录"
-    info "         (例如: /etc/sing-box-anytls/certs/ 或 /etc/ssl/ 文件夹下) 再试。"
+    warn "原因分析: /root 目录权限极为严苛(700)，非 root 用户无法穿透检索。"
+    info "权威推荐: 请将证书手动移动到公共目录 (如 /etc/amee/ 或 /etc/ssl/) 后再试。"
     return 1
   fi
 
-  # 1. 自动提取并【逐级向上】放行外部证书的所有上级目录
-  info "正在为外部证书路径逐级赋予检索穿透权限 (+x) ..."
+  info "正在自动分析并为自定义证书路径执行多级穿透提权 (+x) ..."
   local dir
   for file in "$cert" "$key"; do
     dir=$(dirname "$file")
     while [[ "$dir" != "/" && -n "$dir" ]]; do
       chmod o+x "$dir" 2>/dev/null || true
-      
-      # 3. 如果系统支持 ACL，精准安全地给 sing-box 账号加上特殊通行证
       if command -v setfacl >/dev/null 2>&1; then
         setfacl -m u:"$RUN_USER":rx "$dir" 2>/dev/null || true
       fi
-      
       dir=$(dirname "$dir")
     done
   done
   
-  # 2. 确保证书和密钥文件本身可读（私钥通常建议 640 或 644，为了降权用户读取，这里规范为 644 或配合 ACL）
-  info "正在规范化外部证书与私钥文件的读取权限 ..."
+  info "正在规范化外部证书文件的读取白名单权限 ..."
   chmod 644 "$cert" 2>/dev/null || true
   chmod 644 "$key" 2>/dev/null || true
   
   if command -v setfacl >/dev/null 2>&1; then
     setfacl -m u:"$RUN_USER":r "$cert" "$key" 2>/dev/null || true
   fi
-  
   return 0
 }
 
-# =========================================================
-# 5. 面板节点配置生成核心逻辑 (AnyTLS)
-# =========================================================
 inst_cert() {
   mkdir -p "$CONFIG_DIR/certs"
 
   echo "---------------------------------------------"
-  echo -e "AnyTLS 证书申请方式如下："
-  echo -e " 1) 必应伪装自签证书 ${YELLOW}（默认）${RESET}"
+  echo -e "Tuic 协议证书申请方式如下："
+  echo -e " 1) 必应自签证书 ${YELLOW}（默认）${RESET}"
   echo -e " 2) Acme自动申请 (需放行 80 端口)"
   echo -e " 3) 自定义证书路径"
   echo "---------------------------------------------"
@@ -218,13 +271,14 @@ inst_cert() {
 
   if [[ $certInput == 2 ]]; then
     if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
-      warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。"
+      warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。请确保已暂时关闭 Web 服务。"
     fi
 
     if [[ -f "$cert_path" && -f "$key_path" && -s "$cert_path" && -s "$key_path" && -f "$CONFIG_DIR/certs/ca.log" ]]; then
-      sb_domain=$(cat "$CONFIG_DIR/certs/ca.log")
-      info "检测到已有域名 [${sb_domain}] 的安全区证书，正在复用..."
+      tuic_domain=$(cat "$CONFIG_DIR/certs/ca.log")
+      info "检测到已有域名 [${tuic_domain}] 的安全区证书，正在复用..."
     else
+      local domain
       read -rp "请输入需要申请证书的域名: " domain
       [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
       
@@ -243,19 +297,16 @@ inst_cert() {
         "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
       fi
       
-      # =========================================================
-      # 【智能状态探针】纯 OpenRC 架构：有配置(续期)则重启，无配置(初装)则静默
-      # =========================================================
-      local reload_cmd="[ -f /etc/sing-box-anytls/config.json ] && /sbin/rc-service sing-box-anytls restart || echo '[信息] 初次部署，跳过服务同步'"
-
+      local reload_cmd="[ -f /etc/sing-box-tuic/config.json ] && /sbin/rc-service sing-box-tuic restart || echo '[信息] 初次部署，跳过服务同步'"
+      
       if "$acme_cmd" --install-cert -d "${domain}" \
         --key-file "$key_path" \
         --fullchain-file "$cert_path" \
         --ecc \
         --reloadcmd "$reload_cmd"; then
         echo "$domain" > "$CONFIG_DIR/certs/ca.log"
-        sb_domain=$domain
-        info "Acme 专属伪装证书申请并成功分发（已配置自动续签重启机制）！"
+        tuic_domain=$domain
+        info "Acme 证书申请并成功分发！"
       else
         error "Acme 证书申请失败，自动切换回自签模式。"
         certInput=1
@@ -263,57 +314,83 @@ inst_cert() {
     fi
   elif [[ $certInput == 3 ]]; then
     while true; do
-      local user_cert user_key
-      read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
-      read -rp "请输入密钥文件 (privkey.pem/key) 的路径: " user_key
-      read -rp "请输入证书对应的域名: " sb_domain
+      local user_cert user_key cert_dir guessed_key default_sni
+      echo "---------------------------------------------"
+      read -rp "请输入公钥文件 (cert.crt/pem) 的路径: " user_cert
+      if [[ -z "$user_cert" ]]; then
+        error "路径不能为空，请重新输入。"
+        continue
+      fi
+
+      # 智能推导同目录下的私钥文件
+      cert_dir=$(dirname "$user_cert")
+      guessed_key=""
+      for k_name in "cert.key" "private.key" "key.pem" "privkey.pem" "key.key" "cert.key.key"; do
+        if [[ -f "${cert_dir}/${k_name}" ]]; then
+          guessed_key="${cert_dir}/${k_name}"
+          break
+        fi
+      done
+      
+      # 智能推导可能的 SNI 域名
+      default_sni=$(basename "$cert_dir")
+      [[ "$default_sni" == "certs" || "$default_sni" == "ssl" || -z "$default_sni" ]] && default_sni="aploou.csy.dpdns.org"
+
+      local key_prompt="请输入密钥文件 (key.pem/key/crt) 的路径"
+      [[ -n "$guessed_key" ]] && key_prompt="请输入密钥文件路径 [已为您智能匹配，回车默认: ${guessed_key}]"
+      read -rp "${key_prompt}: " user_key
+      user_key=${user_key:-$guessed_key}
+
+      read -rp "请输入证书对应的 SNI 域名 [回车默认: ${default_sni}]: " tuic_domain
+      tuic_domain=${tuic_domain:-$default_sni}
       
       if [[ -f "$user_cert" && -f "$user_key" ]]; then
         rm -f "$cert_path" "$key_path"
-        
-        # 建立软链接之前，先修复外部文件和目录的穿透访问权限
-        fix_external_cert_permission "$user_cert" "$user_key"
-
-        ln -sf "$user_cert" "$cert_path"
-        ln -sf "$user_key" "$key_path"
-        info "自定义证书已成功通过软链接同步至内部安全区。"
-        break
+        if fix_external_cert_permission "$user_cert" "$user_key"; then
+          ln -sf "$user_cert" "$cert_path"
+          ln -sf "$user_key" "$key_path"
+          info "自定义外部证书已通过安全软链接无缝同步。"
+          break
+        else
+          return 1
+        fi
       else
-        error "找不到输入的证书文件，请重新输入。"
-        echo "---------------------------------------------"
+        error "找不到输入的证书文件，请检查路径是否正确并重新输入！"
       fi
     done
   fi
 
   if [[ $certInput == 1 ]]; then
-    info "将使用必应自签证书作为 AnyTLS 外壳的节点证书"
+    info "将使用必应自签证书作为 Tuic 的节点证书"
     rm -f "$cert_path" "$key_path"
     openssl ecparam -genkey -name prime256v1 -out "$key_path"
     openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
-    sb_domain="www.bing.com"
-    
-    chmod 644 "$cert_path" || true
-    chmod 600 "$key_path" || true
+    tuic_domain="www.bing.com"
   fi
 
-  # 规范所有权：使用 -h 规避穿透修改外部真实证书所有权
+  # 全局固化安全配置区的属主权限
+  chmod 755 "$CONFIG_DIR" "$CONFIG_DIR/certs" 2>/dev/null || true
+  chmod 644 "$cert_path" 2>/dev/null || true
+  chmod 600 "$key_path" 2>/dev/null || true
   chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
-  chown -h ${RUN_USER}:${RUN_USER} "$cert_path" "$key_path" 2>/dev/null || true
+  chown -h ${RUN_USER}:${RUN_USER} "$CONFIG_DIR/certs"/* 2>/dev/null || true
 }
 
 inst_port() {
   local default_port=""
-  if [[ -f "$ANYTLS_CONFIG" ]]; then
-    default_port=$(jq -r '.inbounds[0].listen_port // empty' "$ANYTLS_CONFIG" 2>/dev/null)
+  if [[ -f "$TUIC_CONFIG" ]]; then
+    default_port=$(jq -r '.inbounds[0].listen_port // empty' "$TUIC_CONFIG" 2>/dev/null)
   fi
 
-  local prompt_msg="设置 AnyTLS 服务端监听主端口 [1-65535] (回车随机分配): "
-  [[ -n "$default_port" ]] && prompt_msg="设置 AnyTLS 服务端监听主端口 [当前: ${default_port}, 回车不修改]: "
+  local prompt_msg="设置 Tuic 服务端监听主端口 [1-65535] (回车随机分配): "
+  [[ -n "$default_port" ]] && prompt_msg="设置 Tuic 服务端监听主端口 [当前: ${default_port}, 回车不修改]: "
 
   while true; do
     read -rp "$prompt_msg" port
     if [[ -z "$port" ]]; then
-      if [[ -n "$default_port" ]]; then port="$default_port" && break
+      if [[ -n "$default_port" ]]; then 
+        port="$default_port"
+        break
       else
         port=$(get_random_port)
         info "已为您随机分配未被占用端口: $port" && break
@@ -323,16 +400,85 @@ inst_port() {
         error "端口 ${port} 已被其它程序占用，请更换。" && continue
       fi
       break
-    else error "请输入有效的端口数字 (1-65535)"; fi
+    else 
+      error "请输入有效的端口数字 (1-65535)"
+    fi
   done
+
+  local default_hop=""
+  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
+    default_hop=$(cat "${CONFIG_DIR}/hopping.txt")
+  fi
+
+  echo "---------------------------------------------"
+  if [[ -n "$default_hop" ]]; then
+    echo -e "Tuic 端口群使用模式 [当前已启用跳跃: ${default_hop}]："
+  else
+    echo -e "Tuic 端口群使用模式 ："
+  fi
+  echo -e " 1) 单端口模式"
+  echo -e " 2) 端口跳跃模式 ${YELLOW}（默认)${RESET}"
+  echo "---------------------------------------------"
+  local jumpInput
+  read -rp "请选择端口模式 [1-2] (直接回车默认不变或选择默认项): " jumpInput
+  
+  if [[ -z "$jumpInput" && -n "$default_hop" ]]; then
+    info "检测到回车确认，将 100% 保持原有端口跳跃配置 [${default_hop}] 保持不变。"
+    echo "$port" > "${CONFIG_DIR}/main_port.txt"
+    return 0
+  fi
+
+  jumpInput=${jumpInput:-2}
+  clear_old_iptables
+
+  if [[ $jumpInput == 2 ]]; then
+    local old_start="" old_end="" firstport="" endport=""
+    if [[ -n "$default_hop" ]]; then
+      old_start="${default_hop%-*}"
+      old_end="${default_hop#*-}"
+    fi
+
+    while true; do
+      local start_prompt="设置外部跳跃起始端口 (建议10000-65535)"
+      [[ -n "$old_start" ]] && start_prompt="设置外部跳跃起始端口 [当前: ${old_start}, 回车不修改]"
+      read -rp "${start_prompt}: " firstport
+      firstport=${firstport:-$old_start}
+
+      local end_prompt="设置外部跳跃末尾端口 (必须大于起始端口)"
+      [[ -n "$old_end" ]] && end_prompt="设置外部跳跃末尾端口 [当前: ${old_end}, 回车不修改]"
+      read -rp "${end_prompt}: " endport
+      endport=${endport:-$old_end}
+
+      if is_valid_port "$firstport" && is_valid_port "$endport" && [[ $firstport -lt $endport ]]; then 
+        break
+      else 
+        error "输入无效，起始端口必须小于末尾端口，请重新输入。"
+      fi
+    done
+    echo "$firstport-$endport" > "${CONFIG_DIR}/hopping.txt"
+  else
+    rm -f "${CONFIG_DIR}/hopping.txt" "${CONFIG_DIR}/main_port.txt"
+    info "已成功切换回单端口纯净模式"
+    if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
+    if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
+  fi
 }
 
 write_and_show_config() {
-  local url_ip
-  url_ip=$(get_public_ip)
+  local HOSTNAME vps_ip last_ip is_insecure skip_cert hopping_param
+  HOSTNAME=$(hostname -s | sed 's/ /_/g')
+  vps_ip=$(get_public_ip)
+  last_ip="$vps_ip"
+  [[ "$vps_ip" =~ ":" ]] && last_ip="[$vps_ip]"
 
-  # 1. 写入服务端隔离配置文件 (anytls 协议入站)
-  cat << EOF > "$ANYTLS_CONFIG"
+  is_insecure="0"
+  skip_cert="false"
+  if [[ "$tuic_domain" == "www.bing.com" ]]; then
+    is_insecure="1"
+    skip_cert="true"
+  fi
+
+  cat << EOF > "$TUIC_CONFIG"
 {
   "log": {
     "level": "info",
@@ -341,18 +487,23 @@ write_and_show_config() {
   },
   "inbounds": [
     {
-      "type": "anytls",
-      "tag": "anytls-in",
+      "type": "tuic",
+      "tag": "tuic-in",
       "listen": "::",
       "listen_port": $port,
       "users": [
         {
+          "uuid": "$auth_uuid",
           "password": "$auth_pwd"
         }
       ],
+      "congestion_control": "bbr",
+      "zero_rtt_handshake": false,
+      "heartbeat": "10s",
       "tls": {
         "enabled": true,
-        "server_name": "$sb_domain",
+        "server_name": "$tuic_domain",
+        "alpn": ["h3"],
         "certificate_path": "$cert_path",
         "key_path": "$key_path"
       }
@@ -370,63 +521,50 @@ write_and_show_config() {
 }
 EOF
 
-  chmod 640 "$ANYTLS_CONFIG"
+  chmod 640 "$TUIC_CONFIG"
   chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
-  mkdir -p "$SB_DIR"
+  chown -h ${RUN_USER}:${RUN_USER} "$CONFIG_DIR/certs"/* 2>/dev/null || true
+
+  apply_new_iptables
+  mkdir -p "$TUIC_DIR"
   
-  # 2. 写入通用客户端 sing-box.json 备份
-  cat << EOF > "$SB_DIR/sb-client.json"
-{
-  "log": {
-    "level": "info"
-  },
-  "outbounds": [
-    {
-      "type": "anytls",
-      "tag": "anytls-out",
-      "server": "$url_ip",
-      "server_port": $port,
-      "password": "$auth_pwd",
-      "tls": {
-        "enabled": true,
-        "server_name": "$sb_domain",
-        "insecure": true
-      }
-    },
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ]
-}
+  hopping_param=""
+  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
+    hopping_param="&mport=$(cat "${CONFIG_DIR}/hopping.txt")"
+  fi
+
+  cat << EOF > "$TUIC_DIR/url.txt"
+V6VPS 请自行替换 IP 地址为 V6
+V2rayN 链接:
+tuic://$auth_uuid:$auth_pwd@$last_ip:$port?alpn=h3&congestion_control=bbr&sni=$tuic_domain&allow_insecure=${is_insecure}${hopping_param}#$HOSTNAME-tuicv5
+
+Surge 配置:
+$HOSTNAME-tuicv5 = tuic-v5, $last_ip, $port, password=$auth_pwd, uuid=$auth_uuid, ecn=true, skip-cert-verify=${skip_cert}, sni=$tuic_domain
 EOF
 
-  rc-service sing-box-anytls restart
-  if rc-service sing-box-anytls status | grep -q "started"; then
-    info "sing-box AnyTLS 服务运行环境安全就绪！"
+  rc-service sing-box-tuic restart
+  if rc-service sing-box-tuic status 2>/dev/null | grep -q "started"; then
+    info "sing-box TUIC 服务配置并启动成功！"
   else
-    error "核心服务启动失败，请进入菜单 8 查看隔离日志。"
+    error "sing-box-tuic 启动失败，可在菜单中按 8 查看详细的闪退日志。"
   fi
   showconf
 }
 
-# =========================================================
-# 6. 安装、更新与卸载核心流控
-# =========================================================
 write_openrc_script() {
   cat << 'EOF' > "$OPENRC_SERVICE_PATH"
 #!/sbin/openrc-run
 
-name="sing-box-anytls"
-description="sing-box AnyTLS OpenRC Isolated Service"
-cfgfile="/etc/sing-box-anytls/config.json"
-logfile="/var/log/sing-box-anytls.log"
-command="/usr/local/bin/sing-box-anytls"
-command_args="run -c /etc/sing-box-anytls/config.json"
+name="sing-box-tuic"
+description="sing-box TUIC OpenRC Isolated Service"
+cfgfile="/etc/sing-box-tuic/config.json"
+logfile="/var/log/sing-box-tuic.log"
+command="/usr/local/bin/sing-box-tuic"
+command_args="run -c /etc/sing-box-tuic/config.json"
 
 depend() {
     need net
-    after firewall
+    after iptables ip6tables firewall
 }
 
 start_pre() {
@@ -436,7 +574,7 @@ start_pre() {
     fi
     
     touch "$logfile"
-    chown singbox-anytls:singbox-anytls "$logfile"
+    chown singbox-tuic:singbox-tuic "$logfile"
     chmod 644 "$logfile"
     
     command_background="yes"
@@ -450,12 +588,12 @@ start_pre() {
     if [ "$port" -lt 1024 ] && [ "$port" -ne 0 ]; then
         command_user="root:root"
     else
-        command_user="singbox-anytls:singbox-anytls"
+        command_user="singbox-tuic:singbox-tuic"
     fi
 }
 EOF
   chmod +x "$OPENRC_SERVICE_PATH"
-  rc-update add sing-box-anytls default >/dev/null 2>&1 || true
+  rc-update add sing-box-tuic default >/dev/null 2>&1 || true
 }
 
 download_core() {
@@ -475,16 +613,16 @@ download_core() {
   extracted=$(find "$TMP_DIR" -type f -name sing-box | head -n 1)
   [[ -n "$extracted" ]] || { error "解压目标核心错误"; return 1; }
   
-  rc-service sing-box-anytls stop >/dev/null 2>&1 || true
+  rc-service sing-box-tuic stop >/dev/null 2>&1 || true
   install -m 755 "$extracted" "$BINARY_PATH"
-  info "sing-box-anytls 核心释放完毕。"
+  info "sing-box-tuic 核心释放完毕。"
   return 0
 }
 
-install_anytls() {
-  echo -e "${GREEN}[信息] 开始在 Alpine 下部署专属隔离的 sing-box AnyTLS 环境 ...${RESET}"
+install_tuic() {
+  echo -e "${GREEN}[信息] 开始在 Alpine 下部署专属隔离的 sing-box TUIC V5 ...${RESET}"
   check_environment
-  mkdir -p "$CONFIG_DIR" "$SB_DIR"
+  mkdir -p "$CONFIG_DIR" "$TUIC_DIR"
 
   if ! download_core; then return 1; fi
 
@@ -493,118 +631,93 @@ install_anytls() {
   inst_cert || return 1
   inst_port
   
-  read -rp "设置 AnyTLS 密码 (回车自动分配高强随机字符串): " auth_pwd
+  read -rp "设置 Tuic 验证 UUID (回车自动分配随机 UUID): " auth_uuid
+  auth_uuid=${auth_uuid:-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "12345678-1234-1234-1234-123456781234")}
+  
+  read -rp "设置 Tuic 验证密码 (回车自动分配随机密码): " auth_pwd
   auth_pwd=${auth_pwd:-$(generate_random_password)}
 
   write_and_show_config
 }
 
-update_anytls() {
+update_tuic() {
   if [[ ! -f "$BINARY_PATH" ]]; then
     error "当前系统未检测到核心，无法执行覆盖升级。"
     return 1
   fi
   info "检测到已有环境，正在执行纯净原地覆盖核心升级..."
   if download_core; then
-    rc-service sing-box-anytls start
-    info "sing-box-anytls 核心纯净升级覆盖成功，服务已安全启动！"
+    rc-service sing-box-tuic start
+    info "sing-box-tuic 核心纯净升级覆盖成功，服务已安全启动！"
   else
     error "核心升级遭遇未预期中断。"
   fi
 }
 
-unstanytls() {
+unsttuic() {
   warn "即将执行全面清洁卸载..."
+  
+  clear_old_iptables
+  if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
+  if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
 
-  rc-service sing-box-anytls stop || true
-  rc-update del sing-box-anytls default >/dev/null 2>&1 || true
+  rc-service sing-box-tuic stop || true
+  rc-update del sing-box-tuic default >/dev/null 2>&1 || true
   
   rm -f "$BINARY_PATH" "$OPENRC_SERVICE_PATH" "$LOG_FILE"
-  rm -rf "$CONFIG_DIR" "$SB_DIR"
+  rm -rf "$CONFIG_DIR" "$TUIC_DIR"
   
-  info "AnyTLS 专属隔离服务及相关配置已被彻底清洁卸载！"
+  info "专属服务、节点配置及防火墙跳跃链条已彻底卸载清理完毕！"
 }
 
 changeconf() {
-  if [[ ! -f "$ANYTLS_CONFIG" ]]; then
+  if [[ ! -f "$TUIC_CONFIG" ]]; then
     error "配置文件不存在，请先选择选项 1 安装"
     return 1
   fi
 
-  local old_pwd old_cert old_key old_sni
-  old_pwd=$(jq -r '.inbounds[0].users[0].password // empty' "$ANYTLS_CONFIG")
-  old_cert=$(jq -r '.inbounds[0].tls.certificate_path // empty' "$ANYTLS_CONFIG")
-  old_key=$(jq -r '.inbounds[0].tls.key_path // empty' "$ANYTLS_CONFIG")
-  old_sni=$(jq -r '.inbounds[0].tls.server_name // "www.bing.com"' "$ANYTLS_CONFIG")
+  local old_uuid old_pwd old_cert old_key old_sni change_cert_flag
+  old_uuid=$(jq -r '.inbounds[0].users[0].uuid // empty' "$TUIC_CONFIG")
+  old_pwd=$(jq -r '.inbounds[0].users[0].password // empty' "$TUIC_CONFIG")
+  old_cert=$(jq -r '.inbounds[0].tls.certificate_path // empty' "$TUIC_CONFIG")
+  old_key=$(jq -r '.inbounds[0].tls.key_path // empty' "$TUIC_CONFIG")
+  old_sni=$(jq -r '.inbounds[0].tls.server_name // "www.bing.com"' "$TUIC_CONFIG")
 
   clear
-  echo -e "${GREEN}====== 修改 AnyTLS 专属配置 ======${RESET}"
+  echo -e "${GREEN}====== 修改 sing-box Tuic 配置 ======${RESET}"
   echo "提示：直接敲回车将保持原有配置不变"
   echo "---------------------------------------------"
   
   inst_port 
 
-  local auth_pwd
-  read -rp "设置 AnyTLS 验证密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
+  read -rp "设置 Tuic 验证 UUID [当前: ${old_uuid}, 回车不修改]: " auth_uuid
+  auth_uuid=${auth_uuid:-$old_uuid}
+
+  read -rp "设置 Tuic 验证密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
   auth_pwd=${auth_pwd:-$old_pwd}
 
-  local cert_path key_path sb_domain
   echo "---------------------------------------------"
-  read -rp "是否需要修改伪装层证书？[y/N] (直接回车默认不修改): " change_cert_flag
+  read -rp "是否需要修改证书？[y/N] (直接回车默认不修改): " change_cert_flag
   if [[ "$change_cert_flag" == "y" || "$change_cert_flag" == "Y" ]]; then
     inst_cert || return 1
   else
     cert_path="$old_cert"
     key_path="$old_key"
-    sb_domain="$old_sni"
+    tuic_domain="$old_sni"
   fi
 
   write_and_show_config
-  info "配置与客户端备份刷新修改成功！"
+  info "配置与转发链条刷新修改成功！"
 }
 
-# =========================================================
-# 核心业务重构：精准嵌入最新的动态提取与对齐展示函数
-# =========================================================
 showconf() {
-  if [[ ! -f "$ANYTLS_CONFIG" ]]; then
-    error "未发现核心配置文件，请先选择选项 1 安装。"
+  if [[ ! -d "$TUIC_DIR" ]]; then
+    error "未找到分享配置文件。"
     return
   fi
-
-  # 实时从服务端核心配置中提取参数，确保 100% 准确
-  local hostname=$(hostname -s | sed 's/ /_/g')
-  local main_port=$(jq -r '.inbounds[0].listen_port' "$ANYTLS_CONFIG" 2>/dev/null || echo "18055")
-  local auth_pwd=$(jq -r '.inbounds[0].users[0].password' "$ANYTLS_CONFIG" 2>/dev/null || echo "密码")
-  local sb_domain=$(jq -r '.inbounds[0].tls.server_name' "$ANYTLS_CONFIG" 2>/dev/null || echo "anyoo.vfz.dpdns.org")
-  
-  # 自动判定证书校验逻辑：如果是 bing.com 的自签证书，则客户端必须 insecure=1；如果是合法 Acme 证书，则 insecure=0
-  local is_insecure="0"
-  local skip_cert="false"
-  if [[ "$sb_domain" == "www.bing.com" ]]; then
-    is_insecure="1"
-    skip_cert="true"
-  fi
-
-  local ip=$(get_public_ip)
-  local url_ip="$ip"
-  if [[ "$ip" =~ ":" ]]; then 
-    url_ip="[$ip]"
-  fi
-
-  echo -e "${GREEN}====== AnyTLS 节点信息 ======${RESET}"
-  echo -e "${YELLOW}IP       : ${ip}${RESET}"
-  echo -e "${YELLOW}端口     : ${main_port}${RESET}"
-  echo -e "${YELLOW}密码     : ${auth_pwd}${RESET}"
-  echo -e "${YELLOW}伪装 SNI : ${sb_domain}${RESET}"
-  echo -e "${GREEN}---------------------------${RESET}"
-  echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
-  echo -e "${YELLOW}[信息] V2rayN 链接：${RESET}"
-  echo -e "${YELLOW}anytls://${auth_pwd}@${url_ip}:${main_port}?security=tls&sni=${sb_domain}&insecure=${is_insecure}&allowInsecure=${is_insecure}&type=tcp&headerType=none#${hostname}-Anytls${RESET}"
-  echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
-  echo -e "${YELLOW}${hostname}-Anytls = anytls, ${url_ip}, ${main_port}, password=${auth_pwd}, sni=${sb_domain}, tfo=true, skip-cert-verify=${skip_cert}, reuse=false${RESET}"
-  echo -e "${YELLOW}---------------------------------${RESET}"
-  
+  echo -e "${GREEN}====== 节点分享与配置信息 ======${RESET}"
+  cat "$TUIC_DIR/url.txt"
+  echo
 }
 
 # =========================================================
@@ -613,9 +726,8 @@ showconf() {
 menu() {
   while true; do
     clear
-    local raw_status status version port_show
-    raw_status=$(get_anytls_status)
-    status=""
+    local raw_status status version port_show choice
+    raw_status=$(get_tuic_status)
     if [[ "$raw_status" == "RUNNING" ]]; then
       status="${GREEN}● 运行中${RESET}"
     else
@@ -626,40 +738,40 @@ menu() {
     port_show=$(get_current_port_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      Sing-box AnyTLS 面板      ${RESET}"
+    echo -e "${GREEN}       Sing-box Tuicv5 面板     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} ${status}"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Sing-box AnyTLS${RESET}"
-    echo -e "${GREEN}2. 更新 Sing-box AnyTLS${RESET}"
-    echo -e "${GREEN}3. 卸载 Sing-box AnyTLS${RESET}"
+    echo -e "${GREEN}1. 安装 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}2. 更新 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}3. 卸载 Sing-box Tuicv5${RESET}"
     echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 Sing-box AnyTLS${RESET}"
-    echo -e "${GREEN}6. 停止 Sing-box AnyTLS${RESET}"
-    echo -e "${GREEN}7. 重启 Sing-box AnyTLS${RESET}"
+    echo -e "${GREEN}5. 启动 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}6. 停止 Sing-box Tuicv5${RESET}"
+    echo -e "${GREEN}7. 重启 Sing-box Tuicv5${RESET}"
     echo -e "${GREEN}8. 查看日志${RESET}"
     echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
 
-    local choice=""
+    choice=""
     read -r -p $'\033[32m请输入选项: \033[0m' choice || true
     [[ -z "$choice" ]] && continue
 
     case "$choice" in
-      1) install_anytls; pause ;;
-      2) update_anytls; pause ;;
-      3) unstanytls; pause ;;
+      1) install_tuic; pause ;;
+      2) update_tuic; pause ;;
+      3) unsttuic; pause ;; 
       4) changeconf; pause ;;
-      5) rc-service sing-box-anytls start && info "服务已成功启动！"; pause ;;
-      6) rc-service sing-box-anytls stop && info "服务已成功停止！"; pause ;;
-      7) rc-service sing-box-anytls restart && info "服务已成功重启！"; pause ;;
+      5) rc-service sing-box-tuic start && info "服务已成功启动！"; pause ;;
+      6) rc-service sing-box-tuic stop && info "服务已成功停止！"; pause ;;
+      7) rc-service sing-box-tuic restart && info "服务已成功重启！"; pause ;;
       8) if [[ -f "$LOG_FILE" ]]; then tail -n 50 "$LOG_FILE"; else warn "未发现运行日志文件。"; fi; pause ;;
       9) showconf; pause ;;
       0) exit 0 ;;
-      *) error "无效输入，请重新选择. "; sleep 1 ;;
+      *) error "无效输入，请重新选择。"; sleep 1 ;;
     esac
   done
 }

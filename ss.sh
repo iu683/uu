@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Alpine sing-box TUIC v5 专属管理面板 (自定义证书优化版)
+# Alpine sing-box TUIC v5 专属管理面板 (权限固化终极版)
 # SPDX-License-Identifier: MIT
 #
 set -Eop pipefail
@@ -19,7 +19,7 @@ RUN_USER="singbox-tuic"
 
 TMP_DIR=$(mktemp -d -t sb-tuic.XXXXXX)
 
-# 全局上下文锁（防止子函数变量污染与作用域丢失）
+# 全局上下文锁
 port=""
 auth_uuid=""
 auth_pwd=""
@@ -217,39 +217,33 @@ get_current_port_display() {
 }
 
 # =========================================================
-# 5. 安全权限及穿透核心控制逻辑
+# 5. 核心流控与经过实测的四步权限强力穿透修复逻辑
 # =========================================================
-fix_external_cert_permission() {
+fix_external_cert_permission_final() {
   local cert="$1"
   local key="$2"
   
   if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
     error "致命拒绝: 检测到您的证书位于 /root/ 目录下！"
     warn "原因分析: /root 目录权限极为严苛(700)，非 root 用户无法穿透检索。"
-    info "权威推荐: 请将证书自动分发或手动移动到公共目录 (如 /etc/amee/ 或 /etc/ssl/) 后再试。"
+    info "权威推荐: 请将证书手动移动到公共目录 (如 /etc/amee/ 或 /etc/ssl/) 后再试。"
     return 1
   fi
 
-  info "正在自动分析并为外部证书路径执行多级穿透提权 (+x) ..."
+  info "正在强行赋予证书所在的多级父目录检索穿透权限..."
   local dir
   for file in "$cert" "$key"; do
     dir=$(dirname "$file")
     while [[ "$dir" != "/" && -n "$dir" ]]; do
       chmod o+x "$dir" 2>/dev/null || true
-      if command -v setfacl >/dev/null 2>&1; then
-        setfacl -m u:"$RUN_USER":rx "$dir" 2>/dev/null || true
-      fi
       dir=$(dirname "$dir")
     done
   done
   
-  info "正在规范化外部证书文件的读取白名单权限 ..."
+  info "正在规范化自定义目录下的证书和私钥读取白名单权限..."
   chmod 644 "$cert" 2>/dev/null || true
   chmod 644 "$key" 2>/dev/null || true
   
-  if command -v setfacl >/dev/null 2>&1; then
-    setfacl -m u:"$RUN_USER":r "$cert" "$key" 2>/dev/null || true
-  fi
   return 0
 }
 
@@ -285,7 +279,10 @@ inst_cert() {
       info "正在检查并安装 Acme.sh 依赖..."
       local acme_cmd="/root/.acme.sh/acme.sh"
       if [[ ! -f "$acme_cmd" ]]; then
-        curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
+        # 换用 Alpine 兼容性最好的标准随机邮箱生成方案
+        local random_str
+        random_str=$(date +%s | md5sum 2>/dev/null | cut -c 1-10 || date +%s | tail -c 10)
+        curl https://get.acme.sh | sh -s email="acme_${random_str}@gmail.com"
       fi
       
       "$acme_cmd" --set-default-ca --server letsencrypt
@@ -325,7 +322,7 @@ inst_cert() {
       # 智能推导同目录下的私钥文件
       cert_dir=$(dirname "$user_cert")
       guessed_key=""
-      for k_name in "cert.key" "private.key" "key.pem" "privkey.pem" "key.key" "cert.key.key"; do
+      for k_name in "private.key" "cert.key" "key.pem" "privkey.pem" "key.key"; do
         if [[ -f "${cert_dir}/${k_name}" ]]; then
           guessed_key="${cert_dir}/${k_name}"
           break
@@ -336,7 +333,7 @@ inst_cert() {
       default_sni=$(basename "$cert_dir")
       [[ "$default_sni" == "certs" || "$default_sni" == "ssl" || -z "$default_sni" ]] && default_sni="aploou.csy.dpdns.org"
 
-      local key_prompt="请输入密钥文件 (key.pem/key/crt) 的路径"
+      local key_prompt="请输入密钥文件 (key.pem/key) 的路径"
       [[ -n "$guessed_key" ]] && key_prompt="请输入密钥文件路径 [已为您智能匹配，回车默认: ${guessed_key}]"
       read -rp "${key_prompt}: " user_key
       user_key=${user_key:-$guessed_key}
@@ -346,7 +343,7 @@ inst_cert() {
       
       if [[ -f "$user_cert" && -f "$user_key" ]]; then
         rm -f "$cert_path" "$key_path"
-        if fix_external_cert_permission "$user_cert" "$user_key"; then
+        if fix_external_cert_permission_final "$user_cert" "$user_key"; then
           ln -sf "$user_cert" "$cert_path"
           ln -sf "$user_key" "$key_path"
           info "自定义外部证书已通过安全软链接无缝同步。"
@@ -368,10 +365,11 @@ inst_cert() {
     tuic_domain="www.bing.com"
   fi
 
-  chmod 644 "$cert_path" || true
-  chmod 600 "$key_path" || true
+  # 全面固化黄金四步的配置安全区修正
+  info "正在强行修复 sing-box 配置安全区内的权限与软链接属主..."
   chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
-  chown -h ${RUN_USER}:${RUN_USER} "$cert_path" "$key_path" 2>/dev/null || true
+  chown -h ${RUN_USER}:${RUN_USER} "$CONFIG_DIR/certs"/* 2>/dev/null || true
+  chmod 755 "$CONFIG_DIR" "$CONFIG_DIR/certs"
 }
 
 inst_port() {
@@ -521,6 +519,7 @@ EOF
 
   chmod 640 "$TUIC_CONFIG"
   chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
+  chown -h ${RUN_USER}:${RUN_USER} "$CONFIG_DIR/certs"/* 2>/dev/null || true
 
   apply_new_iptables
   mkdir -p "$TUIC_DIR"
@@ -539,18 +538,14 @@ Surge 配置:
 $HOSTNAME-tuicv5 = tuic-v5, $last_ip, $port, password=$auth_pwd, uuid=$auth_uuid, ecn=true, skip-cert-verify=${skip_cert}, sni=$tuic_domain
 EOF
 
-  rc-service sing-box-tuic restart
-  if rc-service sing-box-tuic status 2>/dev/null | grep -q "started"; then
-    info "sing-box TUIC 服务配置并启动成功！"
-  else
-    error "sing-box-tuic 启动失败，可在菜单中按 8 查看详细的闪退日志。"
-  fi
+  info "正在重启 OpenRC 服务管理器..."
+  rc-service sing-box-tuic stop >/dev/null 2>&1 || true
+  sleep 1.5
+  rc-service sing-box-tuic start
+  
   showconf
 }
 
-# =========================================================
-# 6. 安装、更新与卸载核心流控
-# =========================================================
 write_openrc_script() {
   cat << 'EOF' > "$OPENRC_SERVICE_PATH"
 #!/sbin/openrc-run

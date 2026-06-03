@@ -1,8 +1,9 @@
-#!/bin/bash
+#!/bin/sh
+# 上面改成 Alpine 默认的 /bin/sh，同时内部语法保持兼容
 set -e
 
 # ===============================
-# 防火墙管理脚本（Debian/Ubuntu 双栈 IPv4/IPv6）
+# 防火墙管理脚本（Alpine Linux 双栈 IPv4/IPv6）
 # ===============================
 
 GREEN="\033[32m"
@@ -11,35 +12,52 @@ YELLOW="\033[33m"
 RESET="\033[0m"
 
 # ===============================
-# 动态信息获取函数（对应新菜单风格）
+# 动态信息获取函数
 # ===============================
 
 # 1. 获取 SSH 端口
 get_ssh_port() {
     local port
-    port=$(grep -E '^ *Port ' /etc/ssh/sshd_config | awk '{print $2}' | head -n 1)
+    if [ -f /etc/ssh/sshd_config ]; then
+        port=$(grep -E '^ *Port ' /etc/ssh/sshd_config | awk '{print $2}' | head -n 1)
+    fi
+    # 如果没匹配到，或者 Alpine 默认使用 Dropbear
     [[ -z "$port" || ! "$port" =~ ^[0-9]+$ ]] && port=22
     echo "$port"
 }
 
-# 2. 获取防火墙运行状态
+# 2. 获取防火墙运行状态 (基于 OpenRC)
 get_firewall_status() {
-    if systemctl is-active --quiet netfilter-persistent 2>/dev/null; then
-        echo -e "${GREEN}● 已开启 (开机自启)${RESET}"
+    local status4 status6
+    status4=$(rc-service iptables status 2>/dev/null | grep -E "started|status:.*started" || true)
+    status6=$(rc-service ip6tables status 2>/dev/null | grep -E "started|status:.*started" || true)
+
+    if [ -n "$status4" ] || [ -n "$status6" ]; then
+        # 检查是否开机自启
+        if rc-status default | grep -q "iptables" 2>/dev/null; then
+            echo -e "${GREEN}● 已开启 (开机自启)${RESET}"
+        else
+            echo -e "${YELLOW}● 运行中 (未设自启)${RESET}"
+        fi
     else
         # 检查是否至少有规则在运行
         if iptables -P INPUT 2>/dev/null | grep -q "DROP"; then
-            echo -e "${YELLOW}● 运行中 (未设自启)${RESET}"
+            echo -e "${YELLOW}● 运行中 (服务未接管)${RESET}"
         else
             echo -e "${RED}○ 已关闭 (全放行)${RESET}"
         fi
     fi
 }
 
-# 3. 获取 iptables 版本
-get_iptables_version() {
+# 3. 获取当前实际使用的防火墙后端内核
+get_firewall_type() {
     if command -v iptables &>/dev/null; then
-        iptables --version | awk '{print $2}'
+        # 针对 Alpine 区分是 nftables 后端还是传统 legacy 后端
+        if iptables --version | grep -qi "nftables"; then
+            echo "iptables (nftables 后端)"
+        else
+            echo "iptables (legacy 后端)"
+        fi
     else
         echo "未安装"
     fi
@@ -55,18 +73,22 @@ get_banned_ip_count() {
 }
 
 # ===============================
-# 防火墙核心逻辑函数
+# 防火墙核心逻辑函数 (Alpine OpenRC 适配)
 # ===============================
 
 save_rules() {
-    netfilter-persistent save 2>/dev/null || true
+    # Alpine 下保存规则的标准命令
+    /etc/init.d/iptables save >/dev/null 2>&1 || true
+    /etc/init.d/ip6tables save >/dev/null 2>&1 || true
 }
 
 save_and_enable_autoload() {
     save_rules
-    systemctl enable netfilter-persistent 2>/dev/null || true
-    systemctl start netfilter-persistent 2>/dev/null || true
-    echo -e "${GREEN}✅ 规则已保存，并设置为开机自动加载${RESET}"
+    rc-update add iptables default >/dev/null 2>&1 || true
+    rc-update add ip6tables default >/dev/null 2>&1 || true
+    rc-service iptables start >/dev/null 2>&1 || true
+    rc-service ip6tables start >/dev/null 2>&1 || true
+    echo -e "${GREEN}✅ 规则已保存，并已通过 OpenRC 设置为开机自动加载${RESET}"
     read -p "按回车继续..."
 }
 
@@ -90,22 +112,32 @@ init_rules() {
         $proto -A INPUT -p tcp --dport 443 -j ACCEPT
     done
     save_rules
-    systemctl enable netfilter-persistent 2>/dev/null || true
-    systemctl start netfilter-persistent 2>/dev/null || true
+    # 确保服务开启
+    rc-service iptables start >/dev/null 2>&1 || true
+    rc-service ip6tables start >/dev/null 2>&1 || true
 }
 
 check_installed() {
-    dpkg -l | grep -q iptables-persistent
+    # 检查 Alpine 是否安装了 iptables 核心及 OpenRC 脚本
+    [ -f /etc/init.d/iptables ] && [ -f /etc/init.d/ip6tables ]
 }
 
 install_firewall() {
-    echo -e "${YELLOW}正在安装防火墙，请稍候...${RESET}"
-    apt update -y
-    apt remove -y ufw iptables-persistent || true
-    apt install -y iptables-persistent curl || true
+    echo -e "${YELLOW}正在为 Alpine Linux 安装防火墙组件...${RESET}"
+    apk update
+    # 清理可能存在的冲突组件并安装核心包
+    apk del ufw 2>/dev/null || true
+    apk add iptables ip6tables curl
+    
+    # 初始化默认规则
     init_rules
+    
+    # 设置开机自启
+    rc-update add iptables default >/dev/null 2>&1 || true
+    rc-update add ip6tables default >/dev/null 2>&1 || true
+    
     echo -e "${GREEN}✅ 防火墙安装完成，默认放行 SSH/80/443${RESET}"
-    echo -e "${GREEN}✅ 已设置开机自动加载规则${RESET}"
+    echo -e "${GREEN}✅ 已通过 OpenRC 设置开机自动加载规则${RESET}"
     read -p "按回车继续..."
 }
 
@@ -119,8 +151,9 @@ clear_firewall() {
         $proto -P OUTPUT ACCEPT
     done
     save_rules
-    systemctl disable netfilter-persistent 2>/dev/null || true
-    echo -e "${GREEN}✅ 防火墙规则已清空，所有流量已放行${RESET}"
+    rc-update del iptables default >/dev/null 2>&1 || true
+    rc-update del ip6tables default >/dev/null 2>&1 || true
+    echo -e "${GREEN}✅ 防火墙规则已清空，所有流量已放行，开机自启已取消${RESET}"
     read -p "按回车继续..."
 }
 
@@ -192,7 +225,6 @@ ping_action() {
                     $proto -I INPUT -p icmp --icmp-type echo-request -j DROP
                     $proto -I OUTPUT -p icmp --icmp-type echo-reply -j DROP
                 else
-                    # 这里已修复修复：去除了原本误触的 = 号
                     while $proto -C INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT 2>/dev/null; do $proto -D INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT; done
                     while $proto -C OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT 2>/dev/null; do $proto -D OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT; done
                     $proto -I INPUT -p icmpv6 --icmpv6-type echo-request -j DROP
@@ -208,20 +240,19 @@ ping_action() {
 # ===============================
 menu() {
     while true; do
-        # 动态获取当前系统防火墙数据
         STATUS=$(get_firewall_status)
-        VERSION_SHOW=$(get_iptables_version)
+        FIREWALL_TYPE=$(get_firewall_type)
         PORT_SHOW=$(get_ssh_port)
         SITE_COUNT=$(get_banned_ip_count)
 
         clear
         echo -e "${GREEN}===============================${RESET}"
-        echo -e "${GREEN}   ◈   双栈防火墙管理面板   ◈  ${RESET}"
+        echo -e "${GREEN}   ◈   双栈防火墙管理面板  ◈   ${RESET}"
         echo -e "${GREEN}===============================${RESET}"
         echo -e "${GREEN} 状态  : ${STATUS}"
-        echo -e "${GREEN} 规则  : ${YELLOW}${VERSION_SHOW}${RESET}"
+        echo -e "${GREEN} 内核  : ${YELLOW}${FIREWALL_TYPE}${RESET}"
         echo -e "${GREEN} 端口  : ${YELLOW}${PORT_SHOW}${RESET}"
-        echo -e "${GREEN} 封禁  : ${YELLOW}${SITE_COUNT} 个 IP${RESET}"
+        echo -e "${GREEN} 规则  : ${YELLOW}${SITE_COUNT} 个 IP${RESET}"
         echo -e "${GREEN}===============================${RESET}"
         echo -e "${GREEN}  1. 开放指定端口 (TCP/UDP)${RESET}"
         echo -e "${GREEN}  2. 关闭指定端口 (TCP/UDP)${RESET}"
@@ -329,7 +360,7 @@ menu() {
 # 脚本入口
 # ===============================
 # 检查 root 权限
-if [ "$EUID" -ne 0 ]; then
+if [ "$(id -u)" -ne 0 ]; then
    echo -e "${RED}❌ 错误: 请使用 root 权限运行此脚本！${RESET}"
    exit 1
 fi

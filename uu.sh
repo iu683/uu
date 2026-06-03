@@ -236,7 +236,7 @@ ping_action() {
 menu() {
     while true; do
         STATUS=$(get_firewall_status)
-        VERSION_SHOW=$(get_iptables_version)
+        FIREWALL_TYPE=$(get_firewall_type)
         PORT_SHOW=$(get_ssh_port)
         SITE_COUNT=$(get_banned_ip_count)
 
@@ -245,9 +245,9 @@ menu() {
         echo -e "${GREEN}   ◈   双栈防火墙管理面板  ◈   ${RESET}"
         echo -e "${GREEN}===============================${RESET}"
         echo -e "${GREEN} 状态  : ${STATUS}"
-        echo -e "${GREEN} 规则  : ${YELLOW}${VERSION_SHOW}${RESET}"
+        echo -e "${GREEN} 内核  : ${YELLOW}${FIREWALL_TYPE}${RESET}"
         echo -e "${GREEN} 端口  : ${YELLOW}${PORT_SHOW}${RESET}"
-        echo -e "${GREEN} 封禁  : ${YELLOW}${SITE_COUNT} 个 IP${RESET}"
+        echo -e "${GREEN} 规则  : ${YELLOW}${SITE_COUNT} 个 IP${RESET}"
         echo -e "${GREEN}===============================${RESET}"
         echo -e "${GREEN}  1. 开放指定端口 (TCP/UDP)${RESET}"
         echo -e "${GREEN}  2. 关闭指定端口 (TCP/UDP)${RESET}"

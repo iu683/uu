@@ -1,372 +1,226 @@
-#!/bin/sh
-# 上面改成 Alpine 默认的 /bin/sh，同时内部语法保持兼容
-set -e
+#!/bin/bash
+# =========================================================================
+# Cron 定时任务智能管理面板（跨系统自适配 + 安全无缝交互版）
+# =========================================================================
 
-# ===============================
-# 防火墙管理脚本（Alpine Linux 双栈 IPv4/IPv6）
-# ===============================
+# 严格的 Root 权限检查
+if [ "$EUID" -ne 0 ]; then
+    echo -e "\033[31m❌ 错误：请使用 root 权限（或通过 sudo）运行此脚本！\033[0m"
+    exit 1
+fi
 
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-# ===============================
-# 动态信息获取函数
-# ===============================
-
-# 1. 获取 SSH 端口
-get_ssh_port() {
-    local port
-    if [ -f /etc/ssh/sshd_config ]; then
-        port=$(grep -E '^ *Port ' /etc/ssh/sshd_config | awk '{print $2}' | head -n 1)
-    fi
-    # 如果没匹配到，或者 Alpine 默认使用 Dropbear
-    [[ -z "$port" || ! "$port" =~ ^[0-9]+$ ]] && port=22
-    echo "$port"
-}
-
-# 2. 获取防火墙运行状态 (基于 OpenRC)
-get_firewall_status() {
-    local status4 status6
-    status4=$(rc-service iptables status 2>/dev/null | grep -E "started|status:.*started" || true)
-    status6=$(rc-service ip6tables status 2>/dev/null | grep -E "started|status:.*started" || true)
-
-    if [ -n "$status4" ] || [ -n "$status6" ]; then
-        # 检查是否开机自启
-        if rc-status default | grep -q "iptables" 2>/dev/null; then
-            echo -e "${GREEN}● 已开启 (开机自启)${RESET}"
-        else
-            echo -e "${YELLOW}● 运行中 (未设自启)${RESET}"
-        fi
+# 自动精确识别发行版
+get_os_type() {
+    if [ -f /etc/alpine-release ]; then
+        echo "Alpine"
+    elif [ -f /etc/os-release ]; then
+        . /etc/os-release
+        case "$ID" in
+            ubuntu) echo "Ubuntu" ;;
+            debian) echo "Debian" ;;
+            centos|rhel|rocky|almalinux) echo "RedHat" ;;
+            *) echo "Linux" ;;
+        esac
     else
-        # 检查是否至少有规则在运行
-        if iptables -P INPUT 2>/dev/null | grep -q "DROP"; then
-            echo -e "${YELLOW}● 运行中 (服务未接管)${RESET}"
-        else
-            echo -e "${RED}○ 已关闭 (全放行)${RESET}"
+        echo "Linux"
+    fi
+}
+
+OS=$(get_os_type)
+
+# 安装并启动 crontab 服务 
+install_crontab_if_missing() {
+    if ! command -v crontab >/dev/null 2>&1; then
+        echo -e "${YELLOW}🔧 未检测到 crontab 组件，正在为您自动补全...${RESET}"
+        case "$OS" in
+            Alpine)
+                apk add --no-cache dcron >/dev/null 2>&1
+                rc-update add crond default >/dev/null 2>&1
+                rc-service crond start >/dev/null 2>&1
+                ;;
+            Ubuntu|Debian)
+                apt-get update -y >/dev/null 2>&1
+                apt-get install -y cron >/dev/null 2>&1
+                systemctl enable --now cron >/dev/null 2>&1
+                ;;
+            RedHat)
+                yum install -y cronie >/dev/null 2>&1 || dnf install -y cronie >/dev/null 2>&1
+                systemctl enable --now crond >/dev/null 2>&1
+                ;;
+            *)
+                echo -e "${RED}❌ 无法自动识别系统类型，请手动安装 crontab！${RESET}"
+                read -rp "按回车键退出..."
+                exit 1
+                ;;
+        esac
+        echo -e "${GREEN}✅ crontab 安装完成并已自动启动服务！${RESET}"
+        sleep 1
+    else
+        # 服务保活，确保其运行
+        if [ "$OS" = "Alpine" ]; then
+            rc-service crond start >/dev/null 2>&1
+        elif command -v systemctl >/dev/null 2>&1; then
+            systemctl start cron >/dev/null 2>&1 || systemctl start crond >/dev/null 2>&1
         fi
     fi
 }
 
-# 3. 获取当前实际使用的防火墙后端内核
-get_firewall_type() {
-    if command -v iptables &>/dev/null; then
-        # 针对 Alpine 区分是 nftables 后端还是传统 legacy 后端
-        if iptables --version | grep -qi "nftables"; then
-            echo "iptables (nftables 后端)"
-        else
-            echo "iptables (legacy 后端)"
-        fi
-    else
-        echo "未安装"
+# 校验数字范围 
+validate_number() {
+    local value="$1" local min="$2" local max="$3" local name="$4"
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt "$min" ] || [ "$value" -gt "$max" ]; then
+        echo -e "${RED}❌ 错误：${name} 输入无效，应在 $min 到 $max 之间！${RESET}"
+        return 1
     fi
+    return 0
 }
 
-# 4. 统计当前封禁的独立 IP 数量 (DROP/REJECT)
-get_banned_ip_count() {
-    local count4 count6 total
-    count4=$(iptables -L INPUT -n 2>/dev/null | grep -E "DROP|REJECT" | grep -v "tcp dport" | awk '{print $4}' | grep -v "0.0.0.0" | sort -u | wc -l)
-    count6=$(ip6tables -L INPUT -n 2>/dev/null | grep -E "DROP|REJECT" | grep -v "tcp dport" | awk '{print $4}' | grep -v "::" | sort -u | wc -l)
-    total=$((count4 + count6))
-    echo "$total"
-}
+# 添加任务 
+add_cron_task() {
+    echo -e "\n${YELLOW}=== ➕ 添加新定时任务 ===${RESET}"
+    echo -ne "${GREEN}请输入新任务要执行的 Shell 命令: ${RESET}"
+    read -r newquest
+    [ -z "$newquest" ] && return
 
-# ===============================
-# 防火墙核心逻辑函数 (Alpine OpenRC 适配)
-# ===============================
+    echo -e "\n${YELLOW}------ ⏰ 选择触发周期 ------${RESET}"
+    echo -e "${GREEN}  1) 每月任务 (指定某天 00:00 执行)${RESET}"            
+    echo -e "${GREEN}  2) 每周任务 (指定周几 00:00 执行)${RESET}"
+    echo -e "${GREEN}  3) 每天任务 (指定每天几点 00分 执行)${RESET}"  
+    echo -e "${GREEN}  4) 每小时任务 (指定每小时第几分钟 执行)${RESET}"
+    echo -e "${YELLOW}----------------------------${RESET}"
+    echo -ne "${GREEN}请选择时间类型: ${RESET}"
+    read -r dingshi
 
-save_rules() {
-    # Alpine 下保存规则的标准命令
-    /etc/init.d/iptables save >/dev/null 2>&1 || true
-    /etc/init.d/ip6tables save >/dev/null 2>&1 || true
-}
-
-save_and_enable_autoload() {
-    save_rules
-    rc-update add iptables default >/dev/null 2>&1 || true
-    rc-update add ip6tables default >/dev/null 2>&1 || true
-    rc-service iptables start >/dev/null 2>&1 || true
-    rc-service ip6tables start >/dev/null 2>&1 || true
-    echo -e "${GREEN}✅ 规则已保存，并已通过 OpenRC 设置为开机自动加载${RESET}"
-    read -p "按回车继续..."
-}
-
-init_rules() {
-    local ssh_port
-    ssh_port=$(get_ssh_port)
-    for proto in iptables ip6tables; do
-        $proto -F
-        $proto -X
-        $proto -t nat -F 2>/dev/null || true
-        $proto -t nat -X 2>/dev/null || true
-        $proto -t mangle -F 2>/dev/null || true
-        $proto -t mangle -X 2>/dev/null || true
-        $proto -P INPUT DROP
-        $proto -P FORWARD DROP
-        $proto -P OUTPUT ACCEPT
-        $proto -A INPUT -i lo -j ACCEPT
-        $proto -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-        $proto -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
-        $proto -A INPUT -p tcp --dport 80 -j ACCEPT
-        $proto -A INPUT -p tcp --dport 443 -j ACCEPT
-    done
-    save_rules
-    # 确保服务开启
-    rc-service iptables start >/dev/null 2>&1 || true
-    rc-service ip6tables start >/dev/null 2>&1 || true
-}
-
-check_installed() {
-    # 检查 Alpine 是否安装了 iptables 核心及 OpenRC 脚本
-    [ -f /etc/init.d/iptables ] && [ -f /etc/init.d/ip6tables ]
-}
-
-install_firewall() {
-    echo -e "${YELLOW}正在为 Alpine Linux 安装防火墙组件...${RESET}"
-    apk update
-    # 清理可能存在的冲突组件并安装核心包
-    apk del ufw 2>/dev/null || true
-    apk add iptables ip6tables curl
-    
-    # 初始化默认规则
-    init_rules
-    
-    # 设置开机自启
-    rc-update add iptables default >/dev/null 2>&1 || true
-    rc-update add ip6tables default >/dev/null 2>&1 || true
-    
-    echo -e "${GREEN}✅ 防火墙安装完成，默认放行 SSH/80/443${RESET}"
-    echo -e "${GREEN}✅ 已通过 OpenRC 设置开机自动加载规则${RESET}"
-    read -p "按回车继续..."
-}
-
-clear_firewall() {
-    echo -e "${YELLOW}正在清空防火墙规则并放行所有流量...${RESET}"
-    for proto in iptables ip6tables; do
-        $proto -F
-        $proto -X
-        $proto -P INPUT ACCEPT
-        $proto -P FORWARD ACCEPT
-        $proto -P OUTPUT ACCEPT
-    done
-    save_rules
-    rc-update del iptables default >/dev/null 2>&1 || true
-    rc-update del ip6tables default >/dev/null 2>&1 || true
-    echo -e "${GREEN}✅ 防火墙规则已清空，所有流量已放行，开机自启已取消${RESET}"
-    read -p "按回车继续..."
-}
-
-restore_default_rules() {
-    echo -e "${YELLOW}正在恢复默认防火墙规则 (仅放行 SSH/80/443)...${RESET}"
-    local ssh_port
-    ssh_port=$(get_ssh_port)
-    echo -e "${GREEN}检测到 SSH 端口: $ssh_port${RESET}"
-    init_rules
-    echo -e "${GREEN}✅ 默认规则已恢复${RESET}"
-    read -p "按回车继续..."
-}
-
-open_all_ports() {
-    echo -e "${YELLOW}正在放行所有端口（IPv4/IPv6）...${RESET}"
-    for proto in iptables ip6tables; do
-        $proto -F
-        $proto -X
-        $proto -P INPUT ACCEPT
-        $proto -P FORWARD ACCEPT
-        $proto -P OUTPUT ACCEPT
-    done
-    save_rules
-    echo -e "${GREEN}✅ 所有端口已放行（全开放）${RESET}"
-    read -p "按回车继续..."
-}
-
-ip_action() {
-    local action=$1 ip=$2 proto
-    if [[ $ip =~ : ]]; then
-        proto="ip6tables"
-    else
-        proto="iptables"
-    fi
-
-    case $action in
-        accept) $proto -I INPUT -s "$ip" -j ACCEPT ;;
-        drop)   $proto -I INPUT -s "$ip" -j DROP ;;
-        delete)
-            while $proto -C INPUT -s "$ip" -j ACCEPT 2>/dev/null; do
-                $proto -D INPUT -s "$ip" -j ACCEPT
-            done
-            while $proto -C INPUT -s "$ip" -j DROP 2>/dev/null; do
-                $proto -D INPUT -s "$ip" -j DROP
-            done
+    case "$dingshi" in
+        1)
+            echo -ne "${YELLOW}每月的几号执行任务？ (1-31): ${RESET}"
+            read -r day
+            validate_number "$day" 1 31 "日期" || { read -rp "按回车键返回..."; return; }
+            (crontab -l 2>/dev/null; echo "0 0 $day * * $newquest") | crontab -
+            ;;
+        2)
+            echo -ne "${YELLOW}周几执行任务？ (0-6, 0=周日): ${RESET}"
+            read -r weekday
+            validate_number "$weekday" 0 6 "星期" || { read -rp "按回车键返回..."; return; }
+            (crontab -l 2>/dev/null; echo "0 0 * * $weekday $newquest") | crontab -
+            ;;
+        3)
+            echo -ne "${YELLOW}每天几点执行任务？（小时，0-23）: ${RESET}"
+            read -r hour
+            validate_number "$hour" 0 23 "小时" || { read -rp "按回车键返回..."; return; }
+            (crontab -l 2>/dev/null; echo "0 $hour * * * $newquest") | crontab -
+            ;;
+        4)
+            echo -ne "${YELLOW}每小时第几分钟执行任务？（分钟，0-59）: ${RESET}"
+            read -r minute
+            validate_number "$minute" 0 59 "分钟" || { read -rp "按回车键返回..."; return; }
+            (crontab -l 2>/dev/null; echo "$minute * * * * $newquest") | crontab -
+            ;;
+        *)
+            echo -e "${RED}❌ 无效选择${RESET}"
+            sleep 1
+            return
             ;;
     esac
+    echo -e "\n${GREEN}✅ 任务已成功持久化写入 crontab 定时列表！${RESET}"
+    read -rp "按回车键返回菜单..."
 }
 
-ping_action() {
-    local action=$1
-    for proto in iptables ip6tables; do
-        case $action in
-            allow)
-                while $proto -C INPUT -p icmp -j DROP 2>/dev/null; do $proto -D INPUT -p icmp -j DROP; done
-                while $proto -C OUTPUT -p icmp -j DROP 2>/dev/null; do $proto -D OUTPUT -p icmp -j DROP; done
-                if [ "$proto" = "iptables" ]; then
-                    $proto -I INPUT -p icmp --icmp-type echo-request -j ACCEPT
-                    $proto -I OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT
-                else
-                    $proto -I INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT
-                    $proto -I OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT
-                fi
-                ;;
-            deny)
-                if [ "$proto" = "iptables" ]; then
-                    while $proto -C INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null; do $proto -D INPUT -p icmp --icmp-type echo-request -j ACCEPT; done
-                    while $proto -C OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT 2>/dev/null; do $proto -D OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT; done
-                    $proto -I INPUT -p icmp --icmp-type echo-request -j DROP
-                    $proto -I OUTPUT -p icmp --icmp-type echo-reply -j DROP
-                else
-                    while $proto -C INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT 2>/dev/null; do $proto -D INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT; done
-                    while $proto -C OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT 2>/dev/null; do $proto -D OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT; done
-                    $proto -I INPUT -p icmpv6 --icmpv6-type echo-request -j DROP
-                    $proto -I OUTPUT -p icmpv6 --icmpv6-type echo-reply -j DROP
-                fi
-                ;;
-        esac
+# 删除任务
+delete_cron_task() {
+    echo -e "\n${YELLOW}=== ➖ 删除定时任务 ===${RESET}"
+    local tmp_cron="/tmp/cron_list_tmp"
+    
+    # 安全导出，避免因 crontab 为空触发 set -e 崩溃（虽然新脚本已经拿掉了 set -e，但安全第一）
+    crontab -l 2>/dev/null > "$tmp_cron" || true
+    
+    if [ ! -s "$tmp_cron" ]; then
+        echo -e "${YELLOW}💡 当前系统中没有任何运行中的定时任务。${RESET}"
+        rm -f "$tmp_cron"
+        read -rp "按回车键返回菜单..."
+        return
+    fi
+
+    echo -e "${GREEN}当前可删除的任务列表:${RESET}"
+    awk '{print "  " NR") " $0}' "$tmp_cron"
+    echo -e "${YELLOW}---------------------------------------${RESET}"
+    echo -ne "${YELLOW}请输入要删除的任务序号（多个用空格分隔）: ${RESET}"
+    read -r indices
+    [ -z "$indices" ] && { rm -f "$tmp_cron"; return; }
+
+    # 倒序排列序号，从后往前删，避免行号因动态缩减而错位
+    local sorted_indices=$(echo "$indices" | tr ' ' '\n' | sort -rn)
+    
+    for idx in $sorted_indices; do
+        if [[ "$idx" =~ ^[0-9]+$ ]]; then
+            # 兼容适配：使用通用的 sed 行为，完美契合 Alpine Busybox 与 传统 Linux
+            sed -i "${idx}d" "$tmp_cron" 2>/dev/null || sed -i "" "${idx}d" "$tmp_cron" 2>/dev/null
+        fi
     done
+
+    crontab "$tmp_cron"
+    rm -f "$tmp_cron"
+    echo -e "\n${GREEN}✅ 选定任务已成功剔除并同步到系统内核！${RESET}"
+    read -rp "按回车键返回菜单..."
 }
 
-# ===============================
-# 全新风格管理菜单
-# ===============================
-menu() {
-    while true; do
-        STATUS=$(get_firewall_status)
-        FIREWALL_TYPE=$(get_firewall_type)
-        PORT_SHOW=$(get_ssh_port)
-        SITE_COUNT=$(get_banned_ip_count)
-
-        clear
-        echo -e "${GREEN}===============================${RESET}"
-        echo -e "${GREEN}   ◈   双栈防火墙管理面板  ◈   ${RESET}"
-        echo -e "${GREEN}===============================${RESET}"
-        echo -e "${GREEN} 状态  : ${STATUS}"
-        echo -e "${GREEN} 内核  : ${YELLOW}${FIREWALL_TYPE}${RESET}"
-        echo -e "${GREEN} 端口  : ${YELLOW}${PORT_SHOW}${RESET}"
-        echo -e "${GREEN} 规则  : ${YELLOW}${SITE_COUNT} 个 IP${RESET}"
-        echo -e "${GREEN}===============================${RESET}"
-        echo -e "${GREEN}  1. 开放指定端口 (TCP/UDP)${RESET}"
-        echo -e "${GREEN}  2. 关闭指定端口 (TCP/UDP)${RESET}"
-        echo -e "${GREEN}  3. 开放所有端口 (全放行)${RESET}"
-        echo -e "${GREEN}  4. 恢复默认安全规则 (放行SSH/80/443)${RESET}"
-        echo -e "${GREEN}  5. 添加 IP 白名单 (放行)${RESET}"
-        echo -e "${GREEN}  6. 添加 IP 黑名单 (封禁)${RESET}"
-        echo -e "${GREEN}  7. 删除指定 IP 规则${RESET}"
-        echo -e "${GREEN}  8. 允许 PING (ICMP)${RESET}"
-        echo -e "${GREEN}  9. 禁用 PING (ICMP)${RESET}"
-        echo -e "${GREEN} 10. 查看当前防火墙详细规则${RESET}"
-        echo -e "${GREEN} 11. 保存规则并设置开机自启${RESET}"
-        echo -e "${GREEN}  0. 退出${RESET}"
-        echo -e "${GREEN}===============================${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
-        read -r choice
-
-        case $choice in
-            1)
-                read -p "请输入要开放的端口号: " PORT
-                if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
-                    echo -e "${RED}❌ 错误：请输入 1-65535 之间的有效端口号${RESET}"
-                    read -p "按回车返回菜单..."
-                    continue
-                fi
-                for proto in iptables ip6tables; do
-                    while $proto -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null; do $proto -D INPUT -p tcp --dport "$PORT" -j DROP; done
-                    while $proto -C INPUT -p udp --dport "$PORT" -j DROP 2>/dev/null; do $proto -D INPUT -p udp --dport "$PORT" -j DROP; done
-                    $proto -I INPUT -p tcp --dport "$PORT" -j ACCEPT
-                    $proto -I INPUT -p udp --dport "$PORT" -j ACCEPT
-                done
-                save_rules
-                echo -e "${GREEN}✅ 已开放端口 $PORT${RESET}"
-                read -p "按回车继续..."
-                ;;
-            2)
-                read -p "请输入要关闭的端口号: " PORT
-                if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
-                    echo -e "${RED}❌ 错误：请输入 1-65535 之间的有效端口号${RESET}"
-                    read -p "按回车返回菜单..."
-                    continue
-                fi
-                for proto in iptables ip6tables; do
-                    while $proto -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; do $proto -D INPUT -p tcp --dport "$PORT" -j ACCEPT; done
-                    while $proto -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; do $proto -D INPUT -p udp --dport "$PORT" -j ACCEPT; done
-                    $proto -I INPUT -p tcp --dport "$PORT" -j DROP
-                    $proto -I INPUT -p udp --dport "$PORT" -j DROP
-                done
-                save_rules
-                echo -e "${GREEN}✅ 已关闭端口 $PORT${RESET}"
-                read -p "按回车继续..."
-                ;;
-            3) open_all_ports ;;
-            4) restore_default_rules ;;
-            5)
-                read -p "请输入要放行的IP: " IP
-                ip_action accept "$IP"
-                save_rules
-                echo -e "${GREEN}✅ IP $IP 已放行${RESET}"
-                read -p "按回车继续..."
-                ;;
-            6)
-                read -p "请输入要封禁的IP: " IP
-                ip_action drop "$IP"
-                save_rules
-                echo -e "${GREEN}✅ IP $IP 已封禁${RESET}"
-                read -p "按回车继续..."
-                ;;
-            7)
-                read -p "请输入要删除的IP: " IP
-                ip_action delete "$IP"
-                save_rules
-                echo -e "${GREEN}✅ IP $IP 规则已删除${RESET}"
-                read -p "按回车继续..."
-                ;;
-            8)
-                ping_action allow
-                save_rules
-                echo -e "${GREEN}✅ 已允许 PING（ICMP）${RESET}"
-                read -p "按回车继续..."
-                ;;
-            9)
-                ping_action deny
-                save_rules
-                echo -e "${GREEN}✅ 已禁用 PING（ICMP）${RESET}"
-                read -p "按回车继续..."
-                ;;
-            10)
-                clear
-                echo -e "${YELLOW}当前防火墙状态:${RESET}"
-                echo "--- iptables IPv4 ---"
-                iptables -L -n -v --line-numbers
-                echo -e "\n--- ip6tables IPv6 ---"
-                ip6tables -L -n -v --line-numbers
-                read -r -p "按回车返回菜单..." || true
-                ;;
-            11) save_and_enable_autoload ;;
-            0) clear; break ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+# 编辑任务 
+edit_cron_task() {
+    echo -e "\n${YELLOW}=== 📝 手动编辑定时任务 ===${RESET}"
+    if ! command -v nano >/dev/null 2>&1 && ! command -v vim >/dev/null 2>&1; then
+        echo -e "${YELLOW}🔧 正在安装轻量文本编辑器 nano...${RESET}"
+        case "$OS" in
+            Alpine) apk add --no-cache nano >/dev/null 2>&1 ;;
+            Ubuntu|Debian) apt-get update -y >/dev/null 2>&1 && apt-get install -y nano >/dev/null 2>&1 ;;
+            *) yum install -y nano >/dev/null 2>&1 || dnf install -y nano >/dev/null 2>&1 ;;
         esac
-    done
+    fi
+    export EDITOR=$(command -v nano || command -v vim || command -v vi)
+    crontab -e
 }
 
-# ===============================
-# 脚本入口
-# ===============================
-# 检查 root 权限
-if [ "$(id -u)" -ne 0 ]; then
-   echo -e "${RED}❌ 错误: 请使用 root 权限运行此脚本！${RESET}"
-   exit 1
-fi
+# 预检安装
+install_crontab_if_missing
 
-if ! check_installed; then
-    install_firewall
-fi
+# 主循环面板
+while true; do
+    clear
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}       ◈  Cron 定时任务管理面板  ◈      ${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN} 当前系统环境 : ${YELLOW}${OS}${RESET}"
+    echo -e "${GREEN} 活跃任务总数 : ${YELLOW}$(crontab -l 2>/dev/null | grep -v '^#' | grep -c '[^\s]' || echo 0) 条${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN} 📋 当前系统定时任务快照：${RESET}"
+    
+    # 优雅高亮展示当前任务快照
+    if crontab -l >/dev/null 2>&1; then
+        crontab -l | awk '{print "   • " $0}'
+    else
+        echo -e "   ${YELLOW}(暂无活跃的定时任务)${RESET}"
+    fi
+    
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN}  1) 快速添加定时任务 (引导式)${RESET}"
+    echo -e "${GREEN}  2) 精准删除定时任务 (支持多选)${RESET}"
+    echo -e "${GREEN}  3) 深度手动编辑任务 (打开编辑器)${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN}  0) 退出${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    
+    echo -ne "${GREEN} 请选择操作编号: ${RESET}"
+    read -r choice
 
-menu
+    case "$choice" in
+        1) add_cron_task ;;
+        2) delete_cron_task ;;
+        3) edit_cron_task ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}❌ 输入错误，无此选项${RESET}"; sleep 1 ;;
+    esac
+done

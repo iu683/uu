@@ -1,952 +1,720 @@
-#!/usr/bin/env bash
-#
-# sing-box (VLESS+WS+TLS) 核心控制面板 [Alpine Linux 专属完美权限版]
-# SPDX-License-Identifier: MIT
-#
-# =========================================================
-# 1. 核心控制与全局环境初始化
-# =========================================================
-set -Eop pipefail
-export LANG=en_US.UTF-8
+#!/bin/bash
+# ========================================
+# 🐳 Alpine Linux 专用一键 VPS Docker 管理工具
+# ========================================
 
-# 基础目录与硬编码配置
-readonly SB_CONFIG="/etc/singbox-vless-ws/config.json"
-readonly SB_BINARY="/usr/local/bin/sing-box"
-readonly SB_DIR="/root/proxynode/VlessWS"
-readonly SB_LOG="/var/log/singbox-vless-ws.log"
-EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
-OPENRC_SERVICES_DIR="/etc/init.d"
-CONFIG_DIR="/etc/singbox-vless-ws"
-REPO_URL="https://github.com/SagerNet/sing-box"
-API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
-CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
-
-# 自动检测环境变量
-PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
-OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
-ARCHITECTURE="${ARCHITECTURE:-}"
-SINGBOX_USER="${SINGBOX_USER:-}"
-SINGBOX_HOME_DIR="${SINGBOX_HOME_DIR:-}"
-
-# 终端颜色代码
-GREEN="\033[32m"
+# -----------------------------
+# 颜色
+# -----------------------------
 RED="\033[31m"
+GREEN="\033[32m"
 YELLOW="\033[33m"
-BLUE="\033[34m"
 CYAN="\033[36m"
+BOLD="\033[1m"
 RESET="\033[0m"
+BLUE="\033[34m"
 
-# =========================================================
-# 2. 底层工具函数
-# =========================================================
-has_command() {
-  local _command=$1
-  type -P "$_command" > /dev/null 2>&1
+# -----------------------------
+# 检查 root
+# -----------------------------
+root_use() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}请使用 root 用户运行脚本${RESET}"
+        exit 1
+    fi
 }
 
-curl() {
-  command curl "${CURL_FLAGS[@]}" "$@"
-}
+# -----------------------------
+# 重启 Docker 并恢复容器端口映射
+# -----------------------------
+restart_docker() {
+    root_use
+    echo -e "${YELLOW}正在重启 Docker...${RESET}"
 
-mktemp() {
-  command mktemp "$@" "sbservinst.XXXXXXXXXX"
-}
-
-info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
-error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
-pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
-
-generate_uuid() {
-  if has_command uuidgen; then
-    uuidgen | tr '[:upper:]' '[:lower:]'
-  elif [[ -f /proc/sys/kernel/random/uuid ]]; then
-    cat /proc/sys/kernel/random/uuid
-  else
-    cat /dev/urandom | head -c 16 | hexdump -e '8/1 "%02x" "-" 4/1 "%02x" "-" 4/1 "%02x" "-" 4/1 "%02x" "-" 12/1 "%02x" "\n"' | head -n 1
-  fi
-}
-
-rc_service() {
-  if ! has_command rc-service; then
-    return 0
-  fi
-  command rc-service "$@"
-}
-
-install_content() {
-  local _install_flags="$1"
-  local _content="$2"
-  local _destination="$3"
-  local _overwrite="$4"
-  local _tmpfile="$(mktemp)"
-
-  echo -ne "安装 $_destination ... "
-  echo "$_content" > "$_tmpfile"
-  if [[ -z "$_overwrite" && -e "$_destination" ]]; then
-    echo -e "已存在"
-  elif install "$_install_flags" "$_tmpfile" "$_destination"; then
-    echo -e "完成"
-  fi
-  rm -f "$_tmpfile"
-}
-
-remove_file() {
-  local _target="$1"
-  echo -ne "移除 $_target ... "
-  if rm -f "$_target"; then
-    echo -e "完成"
-  fi
-}
-
-detect_package_manager() {
-  [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
-  has_command apk && PACKAGE_MANAGEMENT_INSTALL='apk add --no-cache' && return 0
-  return 1
-}
-
-install_software() {
-  local _package_name="$1"
-  if ! detect_package_manager; then
-    error "未检测到支持的包管理器，请手动安装 $_package_name"
-    exit 65
-  fi
-  if $PACKAGE_MANAGEMENT_INSTALL "$_package_name" >/dev/null 2>&1; then
-    echo "依赖安装成功"
-  else
-    error "无法通过包管理器安装 '$_package_name'，请手动安装。"
-    exit 65
-  fi
-}
-
-is_user_exists() { id "$1" > /dev/null 2>&1; }
-
-check_environment() {
-  if [[ "x$(uname)" == "xLinux" ]]; then
-    OPERATING_SYSTEM=linux
-  else
-    error "本脚本仅支持 Linux 系统。"
-    exit 95
-  fi
-
-  case "$(uname -m)" in
-    'i386' | 'i686') ARCHITECTURE='386' ;;
-    'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
-    'armv5tel' | 'armv6l' | 'armv7' | 'armv7l') ARCHITECTURE='armv7' ;;
-    'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
-    's390x') ARCHITECTURE='s390x' ;;
-    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
-  esac
-
-  has_command bash || install_software bash
-  has_command curl || install_software curl
-  has_command grep || install_software grep
-  has_command jq || install_software jq
-  has_command openssl || install_software openssl
-  has_command gcompat || install_software gcompat
-  has_command tar || install_software tar
-  has_command socat || install_software socat
-  has_command python3 || install_software python3
-}
-
-get_installed_version() {
-  if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
-    local version_out
-    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null | head -n 1 || echo "")
-    if [[ -n "$version_out" ]]; then
-      echo "$version_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "未知格式"
+    if [ -f /etc/init.d/docker ]; then
+        rc-service docker restart
     else
-      echo "未知版本"
-    fi
-  else
-    echo "未安装"
-  fi
-}
-
-get_latest_version() {
-  local _tmpfile=$(mktemp)
-  if ! curl -sS -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases/latest" -o "$_tmpfile"; then
-    rm -f "$_tmpfile"
-    return
-  fi
-  local _tag_name=$(jq -r '.tag_name' "$_tmpfile" 2>/dev/null || echo "")
-  rm -f "$_tmpfile"
-  
-  if [[ -n "$_tag_name" ]]; then
-    echo "${_tag_name##*v}"
-  else
-    echo ""
-  fi
-}
-
-download_singbox() {
-  local _version="$1"
-  local _destination="$2"
-  local _download_url="$REPO_URL/releases/download/v${_version}/sing-box-${_version}-linux-${ARCHITECTURE}.tar.gz"
-  
-  info "正在下载官方 sing-box 核心组件: $_download_url ..."
-  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
-    error "核心下载失败！请检查您的网络连接。"
-    return 11
-  fi
-  return 0
-}
-
-tpl_singbox_openrc_service() {
-  cat << 'EOF'
-#!/sbin/openrc-run
-
-description="sing-box Server Service"
-pidfile="/run/singbox-vless-ws/singbox-vless-ws.pid"
-command="/usr/local/bin/sing-box"
-command_args="run --config /etc/singbox-vless-ws/config.json"
-command_background="true"
-start_stop_daemon_args="--user sing-box:sing-box --make-pidfile --stdout /var/log/singbox-vless-ws.log --stderr /var/log/singbox-vless-ws.log"
-
-depend() {
-    need net
-    after firewall
-}
-
-start_pre() {
-    checkpath -d -m 0755 -o sing-box:sing-box /run/singbox-vless-ws
-    checkpath -f -m 0644 -o sing-box:sing-box /var/log/singbox-vless-ws.log
-}
-EOF
-}
-
-# =========================================================
-# 3. 网络与配置扩展辅助函数
-# =========================================================
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    error "无法获取公网 IP 地址。" && return 1
-}
-
-check_port() {
-  local port="$1"
-  if has_command ss; then
-    ss -tunlp 2>/dev/null | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port" && return 1
-  else
-    netstat -tunlp 2>/dev/null | grep -w tcp | awk '{print $4}' | sed 's/.*://g' | grep -q -w "$port" && return 1
-  fi
-  return 0
-}
-
-is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
-
-get_random_port() {
-  local rand_port
-  while true; do
-    rand_port=$(awk 'BEGIN{srand(); print int(rand()*(65535-2000+1))+2000}')
-    if check_port "$rand_port"; then
-      echo "$rand_port" && return 0
-    fi
-  done
-}
-
-get_sb_status() {
-  if has_command rc-service && rc-service singbox-vless-ws status 2>/dev/null | grep -q "started"; then
-    echo -e "${GREEN}● 运行中 ${RESET}"
-  else
-    if pgrep -f "$EXECUTABLE_INSTALL_PATH run" >/dev/null 2>&1; then
-      echo -e "${GREEN}● 运行中 ${RESET}"
-    else
-      echo -e "${RED}● 未运行${RESET}"
-    fi
-  fi
-}
-
-get_current_port_display() {
-  if [[ -f "$SB_CONFIG" ]]; then
-    local main_port
-    main_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "")
-    echo "${main_port:- -}"
-  else echo "-"; fi
-}
-
-restart_singbox_service() {
-  touch "$SB_LOG" 2>/dev/null || true
-  if is_user_exists "sing-box" && getent group "sing-box" >/dev/null 2>&1; then
-    chown sing-box:sing-box "$SB_LOG" 2>/dev/null || true
-  fi
-
-  if has_command rc-service && [[ -f "$OPENRC_SERVICES_DIR/singbox-vless-ws" ]]; then
-    rc-service singbox-vless-ws restart >/dev/null 2>&1 || true
-    rc-service singbox-vless-ws status 2>/dev/null | grep -q "started"
-  else
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-    su -s /bin/bash -c "$EXECUTABLE_INSTALL_PATH run --config $SB_CONFIG >> $SB_LOG 2>&1 &" sing-box
-    return 0
-  fi
-}
-
-# 强行赋予自定义证书多级父目录检索穿透及白名单读取权限的核心函数
-fix_external_cert_permission_vless() {
-  local cert="$1"
-  local key="$2"
-  
-  if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
-    error "致命拒绝: 检测到您的证书位于 /root/ 目录下！"
-    warn "原因分析: /root 目录权限严苛(700)，非 root 用户无法穿透检索。"
-    info "权威推荐: 请将证书手动移动到公共目录 (如 /etc/amee/ 或 /etc/ssl/) 后再试。"
-    return 1
-  fi
-
-  info "正在强行赋予证书所在的多级父目录检索穿透权限 (o+x)..."
-  local dir
-  for file in "$cert" "$key"; do
-    dir=$(dirname "$file")
-    while [[ "$dir" != "/" && -n "$dir" ]]; do
-      chmod o+x "$dir" 2>/dev/null || true
-      dir=$(dirname "$dir")
-    done
-  done
-  
-  info "正在规范化自定义目录下的证书和私钥读取白名单权限 (644)..."
-  chmod 644 "$cert" 2>/dev/null || true
-  chmod 644 "$key" 2>/dev/null || true
-  return 0
-}
-
-# =========================================================
-# 4. 经过重构、全面固化的证书申请与路径同步交互
-# =========================================================
-inst_cert() {
-  mkdir -p /etc/singbox-vless-ws
-
-  echo "---------------------------------------------"
-  echo -e "sing-box TLS 证书申请方式如下："
-  echo -e " 1) Acme自动申请(需要开放80端口)${YELLOW}（默认）${RESET}"
-  echo -e " 2) 自定义证书路径"
-  echo "---------------------------------------------"
-  local certInput
-  read -rp "请输入选项 [1-2] (直接回车默认Acme自动申请): " certInput
-  certInput=${certInput:-1}
-
-  cert_path="/etc/singbox-vless-ws/fullchain.pem"
-  key_path="/etc/singbox-vless-ws/privkey.pem"
-
-  if [[ $certInput == 1 ]]; then
-    if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
-      warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。请确保已暂时关闭 Web 服务。"
+        pkill dockerd 2>/dev/null
+        nohup dockerd >/dev/null 2>&1 &
+        sleep 5
     fi
 
-    local vps_ip=$(get_public_ip)
-    read -rp "请输入需要申请证书的域名: " domain
-    [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
-    
-    info "正在检查并安装 Acme.sh 依赖..."
-    has_command socat || install_software socat
-
-    local acme_cmd="/root/.acme.sh/acme.sh"
-    if [[ ! -f "$acme_cmd" ]]; then
-      # 100% 兼容 Alpine 开箱即用的随机合规谷歌邮箱前缀生成逻辑
-      local rand_prefix
-      rand_prefix=$(openssl rand -hex 6 2>/dev/null || date +%s | tail -c 8)
-      curl https://get.acme.sh | sh -s email="${rand_prefix}@gmail.com"
-    fi
-
-    "$acme_cmd" --set-default-ca --server letsencrypt
-    info "正在向 Let's Encrypt 申请证书..."
-    rm -f "$cert_path" "$key_path"
-    if [[ "$vps_ip" =~ ":" ]]; then
-      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
-    else
-      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
-    fi
-    
-    # 核心改动：在 --install-cert 的命令里追加 --reloadcmd 挂载面板的重启机制，确保持续续签时自动重启
-    # 同时在初次安装成功分支里，显式触发一次重启同步
-    local reload_trigger="[ -f /etc/init.d/singbox-vless-ws ] && rc-service singbox-vless-ws restart || echo '[信息] 初次部署，跳过服务同步'"
-
-    if "$acme_cmd" --install-cert -d "${domain}" \
-      --key-file "$key_path" \
-      --fullchain-file "$cert_path" \
-      --ecc \
-      --reloadcmd "$reload_trigger"; then
-      
-      echo "$domain" > /etc/singbox-vless-ws/ca.log
-      sb_domain=$domain
-      info "Acme 证书申请并成功分发至安全沙箱！"
-    else
-      error "Acme 证书申请失败，自动切换回自定义证书路径。"
-      certInput=2
-    fi
-    
-  fi
-
-  if [[ $certInput == 2 ]]; then
-    while true; do
-      local user_cert user_key cert_dir guessed_key default_sni
-      echo "---------------------------------------------"
-      read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
-      if [[ -z "$user_cert" ]]; then
-        error "路径不能为空，请重新输入。"
-        continue
-      fi
-
-      # 智能匹配同目录下的私钥
-      cert_dir=$(dirname "$user_cert")
-      guessed_key=""
-      for k_name in "privkey.pem" "private.key" "cert.key" "key.pem" "key.key"; do
-        if [[ -f "${cert_dir}/${k_name}" ]]; then
-          guessed_key="${cert_dir}/${k_name}"
-          break
-        fi
-      done
-
-      # 智能提取可能的 SNI 域名
-      default_sni=$(basename "$cert_dir")
-      [[ "$default_sni" == "certs" || "$default_sni" == "ssl" || -z "$default_sni" ]] && default_sni="uuobc.csyk.dpdns.org"
-
-      local key_prompt="请输入密钥文件 (privkey.pem/key) 的路径"
-      [[ -n "$guessed_key" ]] && key_prompt="请输入密钥文件路径 [已智能匹配，回车默认: ${guessed_key}]"
-      read -rp "${key_prompt}: " user_key
-      user_key=${user_key:-$guessed_key}
-
-      read -rp "请输入证书对应的 SNI 域名 [回车默认: ${default_sni}]: " sb_domain
-      sb_domain=${sb_domain:-$default_sni}
-      
-      if [[ -f "$user_cert" && -f "$user_key" ]]; then
-        rm -f "$cert_path" "$key_path"
-        if fix_external_cert_permission_vless "$user_cert" "$user_key"; then
-          # 通过软链接安全无缝透传到沙箱内部
-          ln -sf "$user_cert" "$cert_path"
-          ln -sf "$user_key" "$key_path"
-          info "自定义外部证书已通过安全软链接无缝同步。"
-          break
+    if docker info &>/dev/null; then
+        echo -e "${GREEN}✅ Docker 已成功重启${RESET}"
+        containers=$(docker ps -a -q)
+        if [ -n "$containers" ]; then
+            echo -e "${CYAN}正在重启所有容器以恢复端口映射...${RESET}"
+            docker restart $containers
+            echo -e "${GREEN}✅ 所有容器已重启并恢复端口映射${RESET}"
         else
-          return 1
+            echo -e "${YELLOW}没有容器需要重启${RESET}"
         fi
-      else
-        error "找不到输入的证书文件，请检查路径是否正确并重新输入！"
-      fi
-    done
-  fi
-
-  # 【终极防线】强行修复安全配置区，对软链接本身做宿主修正 (-h)
-  info "正在强行修复 sing-box 配置安全区内的权限与软链接属主..."
-  chmod 755 /etc/singbox-vless-ws
-  chmod 644 "$cert_path" "$key_path" 2>/dev/null || true
-  if is_user_exists "sing-box" && getent group "sing-box" >/dev/null 2>&1; then
-    chown -R sing-box:sing-box /etc/singbox-vless-ws
-    chown -h sing-box:sing-box /etc/singbox-vless-ws/* 2>/dev/null || true
-  fi
+    else
+        echo -e "${RED}❌ Docker 重启失败，请检查日志${RESET}"
+    fi
 }
 
-inst_port() {
-  local default_port=""
-  [[ -f "$SB_CONFIG" ]] && default_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "")
-
-  local prompt_msg="设置 sing-box 主端口 [1-65535] (回车随机分配): "
-  [[ -n "$default_port" ]] && prompt_msg="设置 sing-box 主端口 [当前: ${default_port}, 回车不修改]: "
-
-  while true; do
-    read -rp "$prompt_msg" port
-    if [[ -z "$port" ]]; then
-      if [[ -n "$default_port" ]]; then port="$default_port" && break
-      else
-        port=$(get_random_port)
-        info "已为您随机分配未被占用端口: $port" && break
-      fi
-    elif is_valid_port "$port"; then
-      if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
-        error "端口 ${port} 已被其它程序占用，请更换。" && continue
-      fi
-      break
-    else error "请输入有效的端口数字 (1-65535)"; fi
-  done
-}
-
-configure_custom_socks5_outbound() {
-    if [[ ! -f "$SB_CONFIG" ]]; then 
-        error "错误: 未安装，无法配置出口模式。"
-        return
-    fi
-
-    local mode current_type tmp_file
-    current_type=$(jq -r '.outbounds[0].type // "direct"' "$SB_CONFIG" 2>/dev/null || echo "direct")
-
-    echo "---------------------------------------------"
-    echo "请选择出口模式："
-    if [[ "$current_type" == "socks" ]]; then
-        echo -e "当前模式: ${YELLOW}Socks5 代理出口${RESET}"
-    else
-        echo -e "当前模式: ${GREEN}本地直连出口${RESET}"
-    fi
-    echo "1) 直连出口"
-    echo "2) Socks5出口"
-    echo "0) 取消"
-    echo "---------------------------------------------"
-
-    read -rp "请输入选项 [0-2]: " mode || true
-    case "$mode" in
-        1)
-            tmp_file=$(mktemp)
-            jq '.outbounds = [{"type": "direct", "tag": "direct"}]' "$SB_CONFIG" > "$tmp_file"
-            if ! jq empty "$tmp_file" >/dev/null 2>&1; then
-                rm -f "$tmp_file"
-                error "生成的直连配置无效。"
-                return 1
-            fi
-            cp "$SB_CONFIG" "${SB_CONFIG}.bak.$(date +%s)"
-            mv "$tmp_file" "$SB_CONFIG"
-            chmod 644 "$SB_CONFIG" 2>/dev/null || true
-            if is_user_exists "sing-box" && getent group "sing-box" >/dev/null 2>&1; then chown sing-box:sing-box "$SB_CONFIG"; fi
-
-            if ! restart_singbox_service; then
-                error "切换到直连失败。"
-                return 1
-            fi
-            info "已成功切换为直连出口！"
-            return
-            ;;
-        2)
-            ;;
-        0|"")
-            info "已取消配置。"
-            return
-            ;;
-        *)
-            error "无效选项，请输入 0-2 之间的数字。"
-            return 1
-            ;;
-    esac
-
-    info "配置自定义 Socks5 出口代理..."
-    local socks_host socks_port socks_user socks_pass
-
-    read -rp "请输入 Socks5 服务器地址/IP: " socks_host || true
-    [[ -z "$socks_host" ]] && info "已取消配置。" && return
-
-    while true; do
-        read -rp "请输入 Socks5 端口 (默认: 1080): " socks_port || true
-        [[ -z "$socks_port" ]] && socks_port=1080
-        if is_valid_port "$socks_port"; then
-            break
-        else
-            error "端口无效，请输入一个1-65535之间的数字。"
-        fi
-    done
-
-    read -rp "请输入 Socks5 用户名 (若无密码认证请直接留空回车): " socks_user || true
-    if [[ -n "$socks_user" ]]; then
-        read -rs -p "请输入 Socks5 密码: " socks_pass || true
-        echo
-    else
-        socks_pass=""
-    fi
-
-    tmp_file=$(mktemp)
-
-    if [[ -n "$socks_user" ]]; then
-        jq \
-            --arg host "$socks_host" \
-            --argjson port "$socks_port" \
-            --arg user "$socks_user" \
-            --arg pass "$socks_pass" \
-            --arg password "$socks_pass" \
-            '.outbounds = [ { "type": "socks", "tag": "custom-socks5-out", "server": $host, "server_port": $port, "username": $user, "password": $pass } ]' "$SB_CONFIG" > "$tmp_file"
-    else
-        jq \
-            --arg host "$socks_host" \
-            --argjson port "$socks_port" \
-            '.outbounds = [ { "type": "socks", "tag": "custom-socks5-out", "server": $host, "server_port": $port } ]' "$SB_CONFIG" > "$tmp_file"
-    fi
-
-    if ! jq empty "$tmp_file" >/dev/null 2>&1; then
-        rm -f "$tmp_file"
-        error "生成的 Socks5 配置无效，请检查输入后重试。"
+# -----------------------------
+# 检测 Docker 是否安装并运行
+# -----------------------------
+check_docker_running() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${RED}❌ Docker 未安装，请先安装 Docker${RESET}"
         return 1
     fi
-
-    cp "$SB_CONFIG" "${SB_CONFIG}.bak.$(date +%s)"
-    mv "$tmp_file" "$SB_CONFIG"
-    chmod 644 "$SB_CONFIG" 2>/dev/null || true
-    if is_user_exists "sing-box" && getent group "sing-box" >/dev/null 2>&1; then chown sing-box:sing-box "$SB_CONFIG"; fi
-
-    if ! restart_singbox_service; then
-        error "重启服务失败，当前配置可能与系统环境不兼容。"
+    if ! docker info &>/dev/null; then
+        echo -e "${YELLOW} Docker 未运行，尝试启动...${RESET}"
+        if [ -f /etc/init.d/docker ]; then
+            rc-service docker start
+        else
+            nohup dockerd >/dev/null 2>&1 &
+            sleep 5
+        fi
+    fi
+    if ! docker info &>/dev/null; then
+        echo -e "${RED}❌ Docker 启动失败，请检查日志${RESET}"
         return 1
     fi
-    info "已成功切换为 Socks5 出口！"
+    return 0
 }
 
-write_and_show_config() {
-  local hostname=$(hostname -s | sed 's/ /_/g')
-  local ip=$(get_public_ip)
-  local url_ip="$ip"
-  if [[ "$ip" =~ ":" ]]; then 
-    url_ip="[$ip]"
-  fi
+# -----------------------------
+# 自动检测国内/国外
+# -----------------------------
+detect_country() {
+    local country=$(curl -s --max-time 5 ipinfo.io/country)
+    if [[ "$country" == "CN" ]]; then
+        echo "CN"
+    else
+        echo "OTHER"
+    fi
+}
 
-  cat << EOF > /etc/singbox-vless-ws/config.json
+# -----------------------------
+# 安装/更新 Docker (Alpine 专用)
+# -----------------------------
+docker_install_update() {
+    root_use
+    echo -e "${CYAN}正在为 Alpine Linux 安装/更新 Docker...${RESET}"
+    
+    # 确保启用 community 仓库（Docker 在该仓库中）
+    if ! grep -q "community" /etc/apk/repositories; then
+        local alpine_ver=$(cut -d. -f1,2 /etc/alpine-release)
+        echo "http://dl-cdn.alpinelinux.org/alpine/v${alpine_ver}/community" >> /etc/apk/repositories
+    fi
+
+    apk update
+    # Alpine 下的 docker 需要同时安装 docker-cli
+    apk add docker docker-cli bash curl jq grep
+
+    local country=$(detect_country)
+    echo -e "${CYAN}检测到国家: $country${RESET}"
+    if [ "$country" = "CN" ]; then
+        echo -e "${YELLOW}配置国内加速镜像源...${RESET}"
+        mkdir -p /etc/docker
+        cat > /etc/docker/daemon.json << EOF
 {
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
-  "inbounds": [
-    {
-      "type": "vless",
-      "tag": "vless-in",
-      "listen": "::",
-      "listen_port": $port,
-      "users": [
-        {
-          "uuid": "$auth_pwd",
-          "flow": ""
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "$sb_domain",
-        "key_path": "$key_path",
-        "certificate_path": "$cert_path"
-      },
-      "transport": {
-        "type": "ws",
-        "path": "$ws_path"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
+  "registry-mirrors": [
+    "https://docker.0.unsee.tech",
+    "https://docker.1panel.live",
+    "https://registry.dockermirror.com",
+    "https://docker.m.daocloud.io"
   ]
 }
 EOF
+    fi
 
-  mkdir -p "$SB_DIR"
-
-  cat << EOF > "$SB_DIR/url.txt"
-====== VLESS + WS + TLS 节点信息 ======
-IP    : ${ip}
-端口  : $port
-UUID  : $auth_pwd
-SNI   : $sb_domain
-HOST  : $sb_domain
-路径  : $ws_path
----------------------------
-📄 V6VPS 请自行替换 IP 地址为 V6 ★
-[信息] V2rayN    链接：
-vless://$auth_pwd@$url_ip:$port?sni=$sb_domain&host=$sb_domain&security=tls&type=ws&path=$(echo "$ws_path" | sed 's/\//%2F/g')#$hostname-Vlesswstls
----------------------------------
-EOF
-
-  if is_user_exists "sing-box" && getent group "sing-box" >/dev/null 2>&1; then
-    chown -R sing-box:sing-box /etc/singbox-vless-ws
-    chown -h sing-box:sing-box /etc/singbox-vless-ws/* 2>/dev/null || true
-  fi
-
-  if restart_singbox_service; then
-    info "sing-box (VLESS+WS+TLS) 服务配置并通过 OpenRC 启动成功！"
-  else
-    error "sing-box 服务启动失败，请查看日志。"
-  fi
-  
-  showconf
+    # 注册 OpenRC 开机自启
+    rc-update add docker default
+    rc-service docker start
+    echo -e "${GREEN}Docker 安装/更新完成并已启动（已设置开机自启）${RESET}"
 }
 
-# =========================================================
-# 5. 主流程功能控制模块
-# =========================================================
-instsingbox() {
-  check_environment
-  
-  info "获取官方最新发布版本中..."
-  local latest_version=$(get_latest_version)
-  if [[ -z "$latest_version" ]]; then
-    error "无法获取最新版本号，请检查网络设置。"
-    return 1
-  fi
-  
-  local _tmparchive=$(mktemp)
-  if ! download_singbox "$latest_version" "$_tmparchive"; then
-    rm -f "$_tmparchive" && return 1
-  fi
+# -----------------------------
+# 卸载 Docker
+# -----------------------------
+docker_uninstall() {
+    root_use
+    echo -e "${RED}正在卸载 Docker 和 Docker Compose...${RESET}"
+    
+    rc-service docker stop 2>/dev/null
+    rc-update del docker default 2>/dev/null
+    pkill dockerd 2>/dev/null
 
-  echo -ne "正在解压并安装二进制可执行文件 ... "
-  local _tmpdir=$(mktemp -d)
-  tar -xzf "$_tmparchive" -C "$_tmpdir"
-  
-  if install -Dm755 "$_tmpdir"/sing-box-*/sing-box "$EXECUTABLE_INSTALL_PATH"; then
-    echo "成功"
-  else
-    rm -rf "$_tmparchive" "$_tmpdir" && error "安装失败" && return 1
-  fi
-  rm -rf "$_tmparchive" "$_tmpdir"
+    apk del docker docker-cli docker-compose 2>/dev/null || true
+    rm -f /usr/local/bin/docker-compose
 
-  SINGBOX_USER="sing-box"
-  SINGBOX_HOME_DIR="/var/lib/sing-box"
-
-  if ! getent group "$SINGBOX_USER" >/dev/null 2>&1; then
-    addgroup -S "$SINGBOX_USER" >/dev/null 2>&1 || true
-  fi
-
-  if ! is_user_exists "$SINGBOX_USER"; then
-    echo -ne "正在创建系统独立沙箱运行用户 $SINGBOX_USER ... "
-    mkdir -p "$SINGBOX_HOME_DIR"
-    adduser -S -D -G "$SINGBOX_USER" -h "$SINGBOX_HOME_DIR" -s /sbin/nologin "$SINGBOX_USER" >/dev/null 2>&1 || true
-    echo "成功"
-  fi
-
-  if has_command rc-update; then
-    install_content -Dm755 "$(tpl_singbox_openrc_service)" "$OPENRC_SERVICES_DIR/singbox-vless-ws" "1"
-    rc-update add singbox-vless-ws default >/dev/null 2>&1 || true
-  fi
-
-  inst_cert || return 1
-  inst_port
-  
-  read -rp "设置 VLESS UUID (直接回车将自动分配强随机 UUID): " auth_pwd
-  auth_pwd=${auth_pwd:-$(generate_uuid)}
-
-  read -rp "设置 WebSocket 路径 (直接回车默认 /ws): " ws_path
-  ws_path=${ws_path:-/ws}
-  [[ ! "$ws_path" =~ ^/ ]] && ws_path="/$ws_path"
-
-  write_and_show_config
+    rm -rf /var/lib/docker /etc/docker /var/run/docker.sock
+    echo -e "${GREEN}Docker 和 Docker Compose 已卸载干净${RESET}"
 }
 
-update_singbox() {
-  if [[ ! -f "$SB_BINARY" ]]; then
-    error "当前系统未安装 sing-box，无法执行更新。"
-    return 1
-  fi
-
-  info "正在检查新版本..."
-  local current_version=$(get_installed_version)
-  local latest_version=$(get_latest_version)
-
-  if [[ -z "$latest_version" ]]; then
-    error "无法连接 to GitHub API 获取最新版本，请稍后再试。"
-    return 1
-  fi
-
-  info "当前安装版本: ${YELLOW}${current_version}${RESET}"
-  info "官方最新版本: ${GREEN}${latest_version}${RESET}"
-
-  if [[ "$current_version" == "$latest_version" ]]; then
-    info "您当前已经是最新版本，无需更新。"
-    return 0
-  fi
-
-  warn "检测到新版本，即将开始平滑更新 (你的配置与运行数据不会改变)..."
-  
-  local _tmparchive=$(mktemp)
-  if ! download_singbox "$latest_version" "$_tmparchive"; then
-    rm -f "$_tmparchive" && return 1
-  fi
-
-  echo -ne "正在覆盖二进制核心文件 ... "
-  local _tmpdir=$(mktemp -d)
-  tar -xzf "$_tmparchive" -C "$_tmpdir"
-  if install -Dm755 "$_tmpdir"/sing-box-*/sing-box "$EXECUTABLE_INSTALL_PATH"; then
-    echo "成功"
-  else
-    rm -rf "$_tmparchive" "$_tmpdir" && error "覆盖核心失败" && return 1
-  fi
-  rm -rf "$_tmparchive" "$_tmpdir"
-
-  info "正在重启 sing-box 服务以应用更新..."
-  if restart_singbox_service; then
-    info "sing-box 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
-  else
-    error "核心更新成功，但服务重启失败。"
-  fi
+# -----------------------------
+# Docker Compose 安装/更新
+# -----------------------------
+docker_compose_install_update() {
+    root_use
+    echo -e "${CYAN}正在安装/更新 Docker Compose...${RESET}"
+    
+    # 优先尝试通过 apk 安装官方最新的 docker-compose 插件/包
+    if ! grep -q "community" /etc/apk/repositories; then
+        local alpine_ver=$(cut -d. -f1,2 /etc/alpine-release)
+        echo "http://dl-cdn.alpinelinux.org/alpine/v${alpine_ver}/community" >> /etc/apk/repositories
+        apk update
+    fi
+    apk add jq curl
+    
+    local latest=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
+    latest=${latest:-"v2.30.0"}
+    
+    # 转换为 Alpine (musl) 兼容的架构名
+    local arch=$(uname -m)
+    curl -L "https://github.com/docker/compose/releases/download/$latest/docker-compose-$(uname -s)-$arch" -o /usr/local/bin/docker-compose
+    chmod +x /usr/local/bin/docker-compose
+    
+    echo -e "${GREEN}Docker Compose 已安装/更新到版本 $latest${RESET}"
 }
 
-unstsingbox() {
-  warn "即将从当前系统中彻底卸载 sing-box"
-
-  if has_command rc-service && [[ -f "$OPENRC_SERVICES_DIR/singbox-vless-ws" ]]; then
-    rc-service singbox-vless-ws stop >/dev/null 2>&1 || true
-    rc-update del singbox-vless-ws >/dev/null 2>&1 || true
-    remove_file "$OPENRC_SERVICES_DIR/singbox-vless-ws"
-  else
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-  fi
-  
-  remove_file "$EXECUTABLE_INSTALL_PATH"
-  rm -f "$SB_LOG"
-  rm -rf /etc/singbox-vless-ws "$SB_DIR"
-
-  info "sing-box 已彻底从您的系统中移除！"
+# -----------------------------
+# Docker IPv6
+# -----------------------------
+docker_ipv6_on() {
+    root_use
+    mkdir -p /etc/docker
+    if [ -f /etc/docker/daemon.json ]; then
+        jq '. + {ipv6:true,"fixed-cidr-v6":"fd00::/64"}' /etc/docker/daemon.json 2>/dev/null \
+            >/etc/docker/daemon.json.tmp || \
+            echo '{"ipv6":true,"fixed-cidr-v6":"fd00::/64"}' > /etc/docker/daemon.json.tmp
+    else
+        echo '{"ipv6":true,"fixed-cidr-v6":"fd00::/64"}' > /etc/docker/daemon.json.tmp
+    fi
+    mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+    restart_docker
+    echo -e "${GREEN}✅ Docker IPv6 已开启${RESET}"
 }
 
-changeconf() {
-  if [[ ! -f "$SB_CONFIG" ]]; then
-    error "配置文件不存在，请先安装 sing-box"
-    return 1
-  fi
-
-  local old_pwd=$(jq -r '.inbounds[0].users[0].uuid' "$SB_CONFIG" 2>/dev/null || true)
-  local old_path=$(jq -r '.inbounds[0].transport.path' "$SB_CONFIG" 2>/dev/null || echo "/ws")
-  local old_cert=$(jq -r '.inbounds[0].tls.certificate_path' "$SB_CONFIG" 2>/dev/null || true)
-  local old_key=$(jq -r '.inbounds[0].tls.key_path' "$SB_CONFIG" 2>/dev/null || true)
-  local old_sni=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || "www.bing.com")
-
-  clear
-  echo -e "${GREEN}====== 修改 sing-box (VLESS+WS+TLS) 配置 ======${RESET}"
-  echo "提示：直接敲回车将保持原有配置不变"
-  echo "---------------------------------------------"
-  
-  inst_port 
-
-  local auth_pwd
-  read -rp "设置 VLESS 新 UUID [当前: ${old_pwd}, 回车不修改]: " auth_pwd
-  auth_pwd=${auth_pwd:-$old_pwd}
-
-  local ws_path
-  read -rp "设置 新 WebSocket 路径 [当前: ${old_path}, 回车不修改]: " ws_path
-  ws_path=${ws_path:-$old_path}
-  [[ ! "$ws_path" =~ ^/ ]] && ws_path="/$ws_path"
-
-  local cert_path key_path sb_domain
-  echo "---------------------------------------------"
-  read -rp "是否需要修改证书？[y/N] (直接回车默认不修改): " change_cert_flag
-  if [[ "$change_cert_flag" == "y" || "$change_cert_flag" == "Y" ]]; then
-    inst_cert || return 1
-  else
-    cert_path="$old_cert"
-    key_path="$old_key"
-    sb_domain="$old_sni"
-  fi
-
-  write_and_show_config
-  info "配置修改并应用成功！"
+docker_ipv6_off() {
+    root_use
+    if [ -f /etc/docker/daemon.json ]; then
+        jq 'del(.ipv6) | del(.["fixed-cidr-v6"])' /etc/docker/daemon.json \
+            >/etc/docker/daemon.json.tmp 2>/dev/null || \
+            cp /etc/docker/daemon.json /etc/docker/daemon.json.tmp
+        mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+        restart_docker
+        echo -e "${GREEN}✅ Docker IPv6 已关闭${RESET}"
+    else
+        echo -e "${YELLOW} Docker 配置文件不存在，无法关闭 IPv6${RESET}"
+    fi
 }
 
-showconf() {
-  if [[ ! -f "$SB_CONFIG" ]]; then
-    error "未找到 VLESS 配置文件，请确保已成功部署节点。"
-    return
-  fi
+# -----------------------------
+# 开放所有端口（支持 Alpine iptables/nftables）
+# -----------------------------
+open_all_ports() {
+    root_use
+    read -p "确认要开放所有端口吗？(Y/N): " confirm
+    [[ $confirm =~ [Yy] ]] || { echo -e "${YELLOW}操作已取消${RESET}"; return; }
+    echo -e "${YELLOW}正在清理防火墙规则...${RESET}"
 
-  local hostname=$(hostname -s | sed 's/ /_/g')
-  local main_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "18055")
-  local auth_pwd=$(jq -r '.inbounds[0].users[0].uuid' "$SB_CONFIG" 2>/dev/null || echo "UUID")
-  local sb_domain=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || echo "www.bing.com")
-  local ws_path=$(jq -r '.inbounds[0].transport.path' "$SB_CONFIG" 2>/dev/null || echo "/ws")
-  
-  local is_insecure="0"
-  if [[ "$sb_domain" == "www.bing.com" ]]; then
-    is_insecure="1"
-  fi
-
-  local ip=$(get_public_ip)
-  local url_ip="$ip"
-  if [[ "$ip" =~ ":" ]]; then 
-    url_ip="[$ip]"
-  fi
-
-  echo -e "${GREEN}====== VLESS + WS + TLS 节点信息 ======${RESET}"
-  echo -e "${YELLOW}IP      : ${ip}${RESET}"
-  echo -e "${YELLOW}端口    : ${main_port}${RESET}"
-  echo -e "${YELLOW}UUID    : ${auth_pwd}${RESET}"
-  echo -e "${YELLOW}SNI     : ${sb_domain}${RESET}"
-  echo -e "${YELLOW}host    : ${sb_domain}${RESET}"
-  echo -e "${YELLOW}WS 路径 : ${ws_path}${RESET}"
-  echo -e "${GREEN}---------------------------${RESET}"
-  echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
-  echo -e "${GREEN}[信息] V2rayN 链接：${RESET}"
-  echo -e "${YELLOW}vless://${auth_pwd}@${url_ip}:${main_port}?sub=1&sni=${sb_domain}&host=${sb_domain}&security=tls&allowInsecure=${is_insecure}&type=ws&path=$(echo "$ws_path" | sed 's/\//%2F/g')#${hostname}-Vlesswstls${RESET}"
-  echo -e "${YELLOW}---------------------------------${RESET}"
+    if command -v iptables &>/dev/null; then
+        iptables -P INPUT ACCEPT 2>/dev/null
+        iptables -P FORWARD ACCEPT 2>/dev/null
+        iptables -P OUTPUT ACCEPT 2>/dev/null
+        iptables -F 2>/dev/null
+    fi
+    if command -v ip6tables &>/dev/null; then
+        ip6tables -P INPUT ACCEPT 2>/dev/null
+        ip6tables -P FORWARD ACCEPT 2>/dev/null
+        ip6tables -P OUTPUT ACCEPT 2>/dev/null
+        ip6tables -F 2>/dev/null
+    fi
+    if command -v nft &>/dev/null; then
+        nft flush ruleset 2>/dev/null || true
+    fi
+    # 如果装了 Alpine ufw 或 awall
+    rc-service ufw stop 2>/dev/null
+    rc-service ip tables stop 2>/dev/null
+    
+    echo -e "${GREEN}✅ 已关闭可能冲突的独立防火墙服务并开放基本端口${RESET}"
+    restart_docker
 }
 
-# =========================================================
-# 6. 面板主菜单循环
-# =========================================================
-menu() {
-  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
-  check_environment
+# -----------------------------
+# Alpine iptables 软链接切换逻辑
+# -----------------------------
+switch_iptables_legacy() {
+    root_use
+    if [ -f /sbin/iptables-legacy ] || [ -f /usr/sbin/iptables-legacy ]; then
+        # 备份规则
+        command -v iptables-save &>/dev/null && iptables-save > /tmp/iptables_v4.bak
+        
+        # Alpine 修改软链接
+        ln -sf /sbin/iptables-legacy /sbin/iptables 2>/dev/null || ln -sf /usr/sbin/iptables-legacy /usr/sbin/iptables
+        ln -sf /sbin/ip6tables-legacy /sbin/ip6tables 2>/dev/null || ln -sf /usr/sbin/ip6tables-legacy /usr/sbin/ip6tables
+        
+        restart_docker
+        [ -f /tmp/iptables_v4.bak ] && command -v iptables-restore &>/dev/null && iptables-restore < /tmp/iptables_v4.bak
+        echo -e "${GREEN}✅ Alpine 已成功切换到 iptables-legacy${RESET}"
+    else
+        # 如果未安装，帮用户安装
+        echo -e "${YELLOW}未检测到 legacy 组件，正在安装 iptables 传统包...${RESET}"
+        apk add iptables
+        switch_iptables_legacy
+    fi
+}
 
-  while true; do
+switch_iptables_nft() {
+    root_use
+    if [ -f /sbin/iptables-nft ] || [ -f /usr/sbin/iptables-nft ]; then
+        command -v iptables-save &>/dev/null && iptables-save > /tmp/iptables_v4.bak
+        
+        ln -sf /sbin/iptables-nft /sbin/iptables 2>/dev/null || ln -sf /usr/sbin/iptables-nft /usr/sbin/iptables
+        ln -sf /sbin/ip6tables-nft /sbin/ip6tables 2>/dev/null || ln -sf /usr/sbin/ip6tables-nft /usr/sbin/ip6tables
+        
+        restart_docker
+        [ -f /tmp/iptables_v4.bak ] && command -v iptables-restore &>/dev/null && iptables-restore < /tmp/iptables_v4.bak
+        echo -e "${GREEN}✅ Alpine 已成功切换到 iptables-nft${RESET}"
+    else
+        echo -e "${YELLOW}未检测到 nft 组件，正在安装 nftables 包...${RESET}"
+        apk add nftables iptables-nft
+        switch_iptables_nft
+    fi
+}
+
+# -----------------------------
+# 状态查询
+# -----------------------------
+docker_status() {
+    if docker info &>/dev/null; then
+        echo "运行中"
+    else
+        echo "未运行"
+    fi
+}
+
+current_iptables() {
+    if [ -L /sbin/iptables ]; then
+        local link=$(readlink /sbin/iptables)
+        if [[ $link == *legacy* ]]; then
+            echo "legacy"
+        else
+            echo "nft"
+        fi
+    else
+        echo "未知 (未设置软链接)"
+    fi
+}
+
+# -----------------------------
+# Docker 容器管理
+# -----------------------------
+docker_ps() {
+    if ! check_docker_running; then return; fi
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker 容器管理 =====${RESET}"
+        docker ps -a --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}"
+        echo -e "${GREEN}01. 创建新容器${RESET}"
+        echo -e "${GREEN}02. 启动容器${RESET}"
+        echo -e "${GREEN}03. 停止容器${RESET}"
+        echo -e "${GREEN}04. 删除容器${RESET}"
+        echo -e "${GREEN}05. 重启容器${RESET}"
+        echo -e "${GREEN}06. 启动所有容器${RESET}"
+        echo -e "${GREEN}07. 停止所有容器${RESET}"
+        echo -e "${GREEN}08. 删除所有容器${RESET}"
+        echo -e "${GREEN}09. 重启所有容器${RESET}"
+        echo -e "${GREEN}10. 进入容器${RESET}"
+        echo -e "${GREEN}11. 查看日志${RESET}"
+        echo -e "${GREEN} 0. 返回主菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            01|1) read -p "请输入创建命令: " cmd; $cmd ;;
+            02|2) read -p "请输入容器名: " name; docker start $name ;;
+            03|3) read -p "请输入容器名: " name; docker stop $name ;;
+            04|4) read -p "请输入容器名: " name; docker rm -f $name ;;
+            05|5) read -p "请输入容器名: " name; docker restart $name ;;
+            06|6) containers=$(docker ps -a -q); [ -n "$containers" ] && docker start $containers || echo "无容器可启动" ;;
+            07|7) containers=$(docker ps -q); [ -n "$containers" ] && docker stop $containers || echo "无容器正在运行" ;;
+            08|8) read -p "确定删除所有容器? (Y/N): " c; [[ $c =~ [Yy] ]] && docker rm -f $(docker ps -a -q) ;;
+            09|9) containers=$(docker ps -q); [ -n "$containers" ] && docker restart $containers || echo "无容器正在运行" ;;
+            10) read -p "请输入容器名: " name; docker exec -it $name /bin/sh ;; # Alpine环境多用sh
+            11) read -p "请输入容器名: " name; docker logs -f $name ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+# -----------------------------
+# Docker 镜像管理
+# -----------------------------
+docker_image() {
+    if ! check_docker_running; then return; fi
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker 镜像管理 =====${RESET}"
+        docker image ls
+        echo -e "${GREEN}01. 拉取镜像${RESET}"
+        echo -e "${GREEN}02. 更新镜像${RESET}"
+        echo -e "${GREEN}03. 删除镜像${RESET}"
+        echo -e "${GREEN}04. 删除所有镜像${RESET}"
+        echo -e "${GREEN} 0. 返回主菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            01|1) read -p "请输入镜像名: " imgs; for img in $imgs; do docker pull $img; done ;;
+            02|2) read -p "请输入镜像名: " imgs; for img in $imgs; do docker pull $img; done ;;
+            03|3) read -p "请输入镜像名: " imgs; for img in $imgs; do docker rmi -f $img; done ;;
+            04|4) read -p "确定删除所有镜像? (Y/N): " c; [[ $c =~ [Yy] ]] && docker rmi -f $(docker images -q) ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+# -----------------------------
+# Docker 卷管理
+# -----------------------------
+docker_volume() {
+    if ! check_docker_running; then return; fi
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker 卷管理 =====${RESET}"
+        docker volume ls
+        echo -e "${GREEN}1. 创建卷${RESET}"
+        echo -e "${GREEN}2. 删除卷${RESET}"
+        echo -e "${GREEN}3. 删除所有无用卷${RESET}"
+        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            1) read -p "请输入卷名: " v; docker volume create $v ;;
+            2) read -p "请输入卷名: " v; docker volume rm $v ;;
+            3) docker volume prune -f ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+# -----------------------------
+# 清理所有未使用资源
+# -----------------------------
+docker_cleanup() {
+    root_use
+    echo -e "${YELLOW}清理所有未使用容器、镜像、卷...${RESET}"
+    docker system prune -af --volumes
+    echo -e "${GREEN}清理完成${RESET}"
+}
+
+# -----------------------------
+# Docker 网络管理
+# -----------------------------
+docker_network() {
+    if ! check_docker_running; then return; fi
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker 网络管理 =====${RESET}"
+        docker network ls
+        echo -e "${GREEN}1. 创建网络${RESET}"
+        echo -e "${GREEN}2. 加入网络${RESET}"
+        echo -e "${GREEN}3. 退出网络${RESET}"
+        echo -e "${GREEN}4. 删除网络${RESET}"
+        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " sub_choice
+        case $sub_choice in
+            1) read -p "设置新网络名: " dockernetwork; docker network create $dockernetwork ;;
+            2) read -p "加入网络名: " dockernetwork; read -p "容器名: " dockername; docker network connect $dockernetwork $dockername ;;
+            3) read -p "退出网络名: " dockernetwork; read -p "容器名: " dockername; docker network disconnect $dockernetwork $dockername ;;
+            4) read -p "请输入要删除的网络名: " dockernetwork; docker network rm $dockernetwork || echo -e "${RED}删除失败，网络可能被容器占用${RESET}" ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+# -----------------------------
+# Docker 备份/恢复菜单 (Alpine 优化版)
+# -----------------------------
+docker_backup_menu() {
+    root_use
+
+    BACKUP_DIR="/opt/docker_backups"
+    LOG_FILE="$BACKUP_DIR/backup.log"
+    mkdir -p "$BACKUP_DIR"
+
+    # 用 apk 检查依赖
+    if ! command -v jq &>/dev/null || ! command -v tar &>/dev/null; then
+        echo -e "${YELLOW}正在 Alpine 下配置基础依赖 (jq, tar)...${RESET}"
+        apk add jq tar gzip curl
+    fi
+
+    # 检查空间 (Alpine BusyBox 的 df 不支持 --output)
+    local avail_space=$(df -k "$BACKUP_DIR" | tail -1 | awk '{print $4}')
+    if (( avail_space < 1048576 )); then
+        echo -e "${RED}磁盘剩余空间不足 1GB，无法执行备份！${RESET}"
+        read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+        return
+    fi
+
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker Run备份与恢复 =====${RESET}"
+        echo -e "${GREEN}1. 备份 Docker${RESET}"
+        echo -e "${GREEN}2. 恢复 Docker${RESET}"
+        echo -e "${GREEN}3. 删除备份文件${RESET}"
+        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            1)
+                while true; do
+                    echo -e "${YELLOW}选择备份类型:${RESET}"
+                    echo -e "${GREEN}1. 容器${RESET}"
+                    echo -e "${GREEN}2. 镜像${RESET}"
+                    echo -e "${GREEN}3. 卷${RESET}"
+                    echo -e "${GREEN}4. 全量${RESET}"
+                    echo -e "${GREEN}0. 返回上一级${RESET}"
+                    read -p "$(echo -e ${GREEN}请选择:${RESET}) " btype
+                    [[ "$btype" == "0" ]] && break
+
+                    read -p "请输入备份文件名（默认 docker_backup_$(date +%F).tar.gz）: " backup_name
+                    backup_name=${backup_name:-docker_backup_$(date +%F).tar.gz}
+                    backup_path="$BACKUP_DIR/$backup_name"
+
+                    TMP_BACKUP_DIR=$(mktemp -d /tmp/docker_backup_XXXX)
+
+                    # --- 容器备份 ---
+                    if [[ "$btype" == "1" || "$btype" == "4" ]]; then
+                        echo "可用容器列表："
+                        docker ps -a --format "{{.Names}}"
+                        read -p "请输入要备份的容器名（多个用空格，留空则全部）: " selected_containers
+                        [[ -z "$selected_containers" ]] && selected_containers=$(docker ps -a --format "{{.Names}}")
+                        for cname in $selected_containers; do
+                            cid=$(docker ps -a -q -f name="^${cname}$")
+                            [[ -z "$cid" ]] && echo "容器 $cname 不存在，跳过" && continue
+                            docker inspect $cid > "$TMP_BACKUP_DIR/container_${cname}.json"
+                            docker export "$cid" -o "$TMP_BACKUP_DIR/container_${cname}.tar"
+                            echo "$(date '+%F %T') 备份容器 $cname 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    # --- 镜像备份 ---
+                    if [[ "$btype" == "2" || "$btype" == "4" ]]; then
+                        echo "可用镜像列表："
+                        docker images --format "{{.Repository}}:{{.Tag}}"
+                        read -p "请输入要备份的镜像（多个用空格，留空则全部）: " selected_images
+                        [[ -z "$selected_images" ]] && selected_images=$(docker images --format "{{.Repository}}:{{.Tag}}")
+                        for iname in $selected_images; do
+                            [[ "$iname" == "<none>:<none>" ]] && continue
+                            safe_name=$(echo "$iname" | tr '/:' '_')
+                            docker save "$iname" -o "$TMP_BACKUP_DIR/image_${safe_name}.tar"
+                            echo "$(date '+%F %T') 备份镜像 $iname 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    # --- 卷备份 ---
+                    if [[ "$btype" == "3" || "$btype" == "4" ]]; then
+                        echo "可用卷列表："
+                        docker volume ls -q
+                        read -p "请输入要备份的卷名（多个用空格，留空则全部）: " selected_volumes
+                        [[ -z "$selected_volumes" ]] && selected_volumes=$(docker volume ls -q)
+                        for vol in $selected_volumes; do
+                            [[ ! -d /var/lib/docker/volumes/"$vol"/_data ]] && echo "卷 $vol 不存在，跳过" && continue
+                            tar -czf "$TMP_BACKUP_DIR/volume_${vol}.tar.gz" -C /var/lib/docker/volumes/"$vol"/_data .
+                            echo "$(date '+%F %T') 备份卷 $vol 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    tar -czf "$backup_path" -C "$TMP_BACKUP_DIR" .
+                    rm -rf "$TMP_BACKUP_DIR"
+                    echo -e "${GREEN}备份完成: $backup_path${RESET}"
+                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+                    break
+                done
+                ;;
+            2)
+                while true; do
+                    echo -e "${YELLOW}选择恢复类型:${RESET}"
+                    echo -e "${GREEN}1. 容器${RESET}"
+                    echo -e "${GREEN}2. 镜像${RESET}"
+                    echo -e "${GREEN}3. 卷${RESET}"
+                    echo -e "${GREEN}4. 全量${RESET}"
+                    echo -e "${GREEN}0. 返回上一级${RESET}"
+                    read -p "$(echo -e ${GREEN}请选择:${RESET}) " rtype
+                    [[ "$rtype" == "0" ]] && break
+
+                    read -p "请输入备份文件路径: " backup_file
+                    [[ ! -f "$backup_file" ]] && echo -e "${RED}备份文件不存在${RESET}" && read -p "按回车继续..." && continue
+
+                    TMP_RESTORE_DIR=$(mktemp -d /tmp/docker_restore_XXXX)
+                    tar -xzf "$backup_file" -C "$TMP_RESTORE_DIR"
+
+                    # --- 容器恢复 ---
+                    if [[ "$rtype" == "1" || "$rtype" == "4" ]]; then
+                        for cjson in "$TMP_RESTORE_DIR"/container_*.json; do
+                            [ ! -f "$cjson" ] && continue
+                            cname=$(basename "$cjson" | sed 's/container_\(.*\).json/\1/')
+                            image=$(jq -r '.[0].Config.Image' "$cjson")
+                            envs=$(jq -r '.[0].Config.Env | join(" -e ")' "$cjson")
+                            [[ -n "$envs" ]] && envs="-e $envs"
+                            ports=$(jq -r '.[0].HostConfig.PortBindings | to_entries | map("\(.value[0].HostPort):\(.key)") | join(" -p ")' "$cjson")
+                            [[ -n "$ports" ]] && ports="-p $ports"
+                            mounts=$(jq -r '.[0].Mounts | map("-v \(.Source):\(.Destination)") | join(" ")' "$cjson")
+                            network=$(jq -r '.[0].HostConfig.NetworkMode' "$cjson")
+
+                            # 如果镜像不存在，尝试从备份加载
+                            safe_image_name=$(echo "$image" | tr '/:' '_')
+                            img_tar="$TMP_RESTORE_DIR/image_${safe_image_name}.tar"
+                            [[ -f "$img_tar" ]] && docker load -i "$img_tar"
+
+                            docker run -d --name "$cname" $envs $ports $mounts --network "$network" "$image"
+                            echo "$(date '+%F %T') 恢复容器 $cname 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    # --- 镜像恢复 ---
+                    if [[ "$rtype" == "2" || "$rtype" == "4" ]]; then
+                        for img_file in "$TMP_RESTORE_DIR"/image_*.tar; do
+                            [[ -f "$img_file" ]] && docker load -i "$img_file"
+                        done
+                    fi
+
+                    # --- 卷恢复 ---
+                    if [[ "$rtype" == "3" || "$rtype" == "4" ]]; then
+                        for vol_file in "$TMP_RESTORE_DIR"/volume_*.tar.gz; do
+                            [ ! -f "$vol_file" ] && continue
+                            vol_name=$(basename "$vol_file" | sed 's/volume_\(.*\).tar.gz/\1/')
+                            if docker volume inspect "$vol_name" &>/dev/null; then
+                                read -p "卷 $vol_name 已存在，是否覆盖? (y/N): " confirm
+                                [[ "$confirm" != "y" ]] && continue
+                            fi
+                            docker volume create "$vol_name" >/dev/null 2>&1
+                            tar -xzf "$vol_file" -C /var/lib/docker/volumes/"$vol_name"/_data
+                            echo "$(date '+%F %T') 恢复卷 $vol_name 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    rm -rf "$TMP_RESTORE_DIR"
+                    echo -e "${GREEN}恢复完成${RESET}"
+                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+                    break
+                done
+                ;;
+            3)
+                while true; do
+                    echo "当前备份目录：$BACKUP_DIR"
+                    ls "$BACKUP_DIR"
+                    read -p "请输入要删除的备份文件名（支持空格或*通配符，输入0返回）: " del_files
+                    [[ "$del_files" == "0" ]] && break
+                    cd "$BACKUP_DIR" && rm -f $del_files
+                    echo -e "${GREEN}删除完成${RESET}"
+                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+                    break
+                done
+                ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}"; read -p "$(echo -e ${GREEN}按回车继续...${RESET})" ;;
+        esac
+    done
+}
+
+# -----------------------------
+# 容器监控 (兼容 Alpine BusyBox)
+# -----------------------------
+monitor_docker_containers() {
     clear
-    local status=$(get_sb_status)
-    local version=$(get_installed_version)
-    local port_show=$(get_current_port_display)
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}        🐳 Docker 容器监控${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
 
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   Sing-box VLESS-WS-TLS 面板   ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $status"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1.安装 Sing-box VLESS-WS-TLS${RESET}"
-    echo -e "${GREEN} 2.更新 Sing-box ${RESET}"
-    echo -e "${GREEN} 3.卸载 Sing-box ${RESET}"
-    echo -e "${GREEN} 4.修改配置${RESET}"
-    echo -e "${GREEN} 5.启动 Sing-box ${RESET}"
-    echo -e "${GREEN} 6.停止 Sing-box ${RESET}"
-    echo -e "${GREEN} 7.重启 Sing-box ${RESET}"
-    echo -e "${GREEN} 8.查看日志${RESET}"
-    echo -e "${GREEN} 9.查看节点配置${RESET}"
-    echo -e "${GREEN}10.配置Socks5出口${RESET}"
-    echo -e "${GREEN} 0.退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    if ! check_docker_running; then return; fi
 
-    local choice=""
-    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
-    [[ -z "$choice" ]] && continue
+    docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" | sort -k3 -hr | while IFS=$'\t' read -r name cpu mem net; do
+        local raw_status
+        raw_status=$(docker ps -a --filter "name=^/${name}$" --format "{{.Status}}")
+        
+        # 汉化引擎 (BusyBox 兼容)
+        local uptime
+        uptime=$(echo "$raw_status" | \
+            sed 's/Up /运行 /; s/Exited/已停止/; s/(healthy)/(健康)/; s/(unhealthy)/(非健康)/; s/(starting)/(启动中)/; s/seconds/秒/; s/second/秒/; s/minutes/分钟/; s/minute/分钟/; s/hours/小时/; s/hour/小时/; s/days/天/; s/day/天/; s/weeks/周/; s/week/周/; s/months/月/; s/month/月/; s/about //; s/ago/前/')
 
-    case "$choice" in
-      1) instsingbox; pause ;;
-      2) update_singbox; pause ;;
-      3) unstsingbox; pause ;;
-      4) changeconf; pause ;;
-      5) 
-        if has_command rc-service && [[ -f "$OPENRC_SERVICES_DIR/singbox-vless-ws" ]]; then
-          rc-service singbox-vless-ws start && info "服务已成功启动 (OpenRC)！"
-        else
-          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-          touch "$SB_LOG" && chmod 644 "$SB_LOG"
-          if is_user_exists "sing-box"; then chown sing-box:sing-box "$SB_LOG"; fi
-          su -s /bin/bash -c "$EXECUTABLE_INSTALL_PATH run --config $SB_CONFIG >> $SB_LOG 2>&1 &" sing-box
-          info "进程已在后台独立启动！"
-        fi
-        pause ;;
-      6) 
-        if has_command rc-service && [[ -f "$OPENRC_SERVICES_DIR/singbox-vless-ws" ]]; then
-          rc-service singbox-vless-ws stop && info "服务已成功停止 (OpenRC)！"
-        else
-          pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台进程已终止！"
-        fi
-        pause ;;
-      7) 
-        restart_singbox_service && info "服务/进程已重启！"
-        pause ;;
-      8) 
-        if [[ -f "$SB_LOG" ]]; then
-           echo -e "${CYAN}正在实时读取 sing-box 核心日志 (按 Ctrl+C 即可退出)...${RESET}"
-           echo "------------------------------------------------------------------------"
-           tail -n 50 -f "$SB_LOG" || true
-        else
-           error "未发现核心日志文件 ($SB_LOG)，服务可能未曾启动。"
-           pause
-        fi
-        ;;
-      9) showconf; pause ;;
-      10) configure_custom_socks5_outbound; pause ;;
-      0) exit 0 ;;
-      *) error "无效输入，请重新选择。"; sleep 1 ;;
-    esac
-  done
+        echo -e "${YELLOW}◈ 容器: ${RESET}${YELLOW}${name}${RESET}"
+        echo -e "  ├─ ${YELLOW}CPU 占用: ${RESET}${cpu}"
+        echo -e "  ├─ ${YELLOW}内存使用: ${RESET}${mem}"
+        echo -e "  ├─ ${YELLOW}网络 I/O: ${RESET}${net}"
+        echo -e "  └─ ${YELLOW}运行状态: ${RESET}${YELLOW}${uptime}${RESET}"
+        echo -e "${YELLOW}----------------------------------------${RESET}"
+    done
 }
 
-menu "$@"
+# -----------------------------
+# 主菜单
+# -----------------------------
+main_menu() {
+    root_use
+    while true; do
+        clear
+        echo -e "\033[36m"
+        echo "  ____                                "
+        echo " |  _ \  ___   ___| | _____ _ __ "
+        echo " | | |/ _ \ / __| |/ / _ \ '__|"
+        echo " | |_| | (_) | (__|   <  __/ |   "
+        echo " |____/ \___/ \___|_|\_\___|_|   "
+        echo -e "${BLUE}        --- Alpine Linux 专用版 ---${RESET}"
+        
+        if command -v docker &>/dev/null; then
+            local d_status=$(docker info &>/dev/null && echo "运行中" || echo "未运行")
+            local total=$(docker ps -a -q 2>/dev/null | wc -l)
+            local running=$(docker ps -q 2>/dev/null | wc -l)
+            echo -e "${YELLOW}🐳| Docker: $d_status | 总容器: $total | 运行中: $running${RESET}"
+            echo -e "${YELLOW}🐳| 防火墙驱动: $(current_iptables)${RESET}"
+        else
+            echo -e "${YELLOW}🐳| Docker: 未安装 | 防火墙驱动: $(current_iptables)${RESET}"
+        fi
+        echo -e "----------------------------------------"
+        echo -e "${GREEN}01. 安装/更新 Docker${RESET}"
+        echo -e "${GREEN}02. 安装/更新 Docker Compose${RESET}"
+        echo -e "${GREEN}03. 卸载 Docker & Compose${RESET}"
+        echo -e "${GREEN}04. 容器管理${RESET}"
+        echo -e "${GREEN}05. 镜像管理${RESET}"
+        echo -e "${GREEN}06. 开启 IPv6${RESET}"
+        echo -e "${GREEN}07. 关闭 IPv6${RESET}"
+        echo -e "${GREEN}08. 开放所有端口${RESET}"
+        echo -e "${GREEN}09. 网络管理${RESET}"
+        echo -e "${GREEN}10. 切换至 iptables-legacy${RESET}"
+        echo -e "${GREEN}11. 切换至 iptables-nft${RESET}"
+        echo -e "${GREEN}12. Docker 备份/恢复${RESET}"
+        echo -e "${GREEN}13. 卷管理${RESET}"
+        echo -e "${GREEN}14. 一键清理所有未使用容器/镜像/卷${RESET}"
+        echo -e "${GREEN}15. 重启 Docker 服务${RESET}"
+        echo -e "${GREEN}16. Docker 容器实时监控${RESET}"
+        echo -e "${GREEN} 0. 退出${RESET}"
+        echo -e "----------------------------------------"
+        read -p "$(echo -e ${GREEN}请选择 [0-16]:${RESET}) " choice
+        case $choice in
+            01|1) docker_install_update ;;
+            02|2) docker_compose_install_update ;;
+            03|3) docker_uninstall ;;
+            04|4) check_docker_running && docker_ps ;;
+            05|5) check_docker_running && docker_image ;;
+            06|6) check_docker_running && docker_ipv6_on ;;
+            07|7) check_docker_running && docker_ipv6_off ;;
+            08|8) open_all_ports ;;
+            09|9) check_docker_running && docker_network ;;
+            10) switch_iptables_legacy ;;
+            11) switch_iptables_nft ;;
+            12) check_docker_running && docker_backup_menu ;;
+            13) check_docker_running && docker_volume ;;
+            14) check_docker_running && docker_cleanup ;;
+            15) check_docker_running && restart_docker ;;
+            16) monitor_docker_containers ;;
+             0) exit 0 ;;
+             *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+# 启动
+main_menu

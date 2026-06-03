@@ -27,6 +27,7 @@ get_nginx_status() {
     fi
 }
 
+
 get_nginx_version() {
     if command -v nginx >/dev/null 2>&1; then
         local nginx_out
@@ -50,6 +51,26 @@ get_site_count() {
         SITE_COUNT="0"
     fi
 }
+
+# 🛠️ 核心突击：强杀所有占用 80 端口的孤儿残留进程
+force_kill_80() {
+    echo -e "${YELLOW}正在全网通缉 80 端口占用情况...${RESET}"
+    killall nginx 2>/dev/null || true
+    
+    local count=0
+    while netstat -ntlp 2>/dev/null | grep -q ":80 " && [ $count -lt 3 ]; do
+        local PIDS=$(netstat -ntlp 2>/dev/null | grep ":80 " | awk '{print $7}' | cut -d/ -f1 | grep -E '^[0-9]+$' || true)
+        if [ -n "$PIDS" ]; then
+            echo -e "${RED}警告: 发现 80 端口仍被残留进程 (PID: ${PIDS}) 占用！正在强制闪击...${RESET}"
+            for pid in $PIDS; do
+                kill -9 "$pid" 2>/dev/null || true
+            done
+            count=$((count+1))
+            sleep 1
+        fi
+    done
+}
+
 
 # ------------------------------
 # 核心功能函数
@@ -147,7 +168,6 @@ EOF
     ln -sf "$DEFAULT_PATH" /etc/nginx/sites-enabled/default_server_block
 }
 
-# 核心重构：支持自定义外部端口监听
 generate_server_config() {
     DOMAIN=$1
     TARGET=$2
@@ -155,13 +175,13 @@ generate_server_config() {
     MAX_SIZE=$4
     CERT_PATH=$5    
     KEY_PATH=$6       
-    LISTEN_PORT=$7  # 新增：外部监听端口参数
+    LISTEN_PORT=$7  
     CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
 
     MAX_SIZE=${MAX_SIZE:-200M}
     CERT_PATH=${CERT_PATH:-"/etc/letsencrypt/live/$DOMAIN/fullchain.pem"}
     KEY_PATH=${KEY_PATH:-"/etc/letsencrypt/live/$DOMAIN/privkey.pem"}
-    LISTEN_PORT=${LISTEN_PORT:-443} # 默认 443 端口
+    LISTEN_PORT=${LISTEN_PORT:-443} 
 
     if [ "$IS_WS" == "y" ]; then
         WS_HEADERS="proxy_http_version 1.1;
@@ -171,7 +191,6 @@ generate_server_config() {
         WS_HEADERS=""
     fi
 
-    # 动态写入监听配置
     cat > "$CONFIG_PATH" <<EOF
 server {
     listen 80;
@@ -220,6 +239,23 @@ check_domain_resolution() {
     fi
 }
 
+# 新增功能：平滑重载 Nginx 配置
+reload_nginx() {
+    echo -e "${GREEN}正在验证 Nginx 配置语法...${RESET}"
+    if nginx -t; then
+        echo -e "${GREEN}语法验证通过，正在平滑重载 OpenRC Nginx 服务...${RESET}"
+        if rc-service nginx reload; then
+            echo -e "${GREEN}✅ Nginx 配置重载成功！${RESET}"
+        else
+            echo -e "${RED}❌ 重载失败！服务可能未在运行，尝试直接启动...${RESET}"
+            rc-service nginx start
+        fi
+    else
+        echo -e "${RED}❌ Nginx 配置语法错误！未执行重载，请检查上方的错误提示。${RESET}"
+    fi
+    pause
+}
+
 install_nginx() {
     if command -v nginx >/dev/null 2>&1 && command -v certbot >/dev/null 2>&1; then
         echo -e "${YELLOW}提示: 检测到系统已安装 Nginx 与 Certbot，自动跳过安装。${RESET}"
@@ -247,6 +283,15 @@ install_nginx() {
     create_default_server
     
     rc-update add nginx default
+
+    # 运行强杀 80 函数
+    force_kill_80
+
+    echo -e "${GREEN}正在激活并启动 Nginx 服务...${RESET}"
+    rc-service nginx zap >/dev/null 2>&1 || true # 清除 OpenRC 的 crashed 崩溃缓存状态
+
+
+    echo -e "${GREEN}正在启动 Nginx 服务...${RESET}"
     rc-service nginx start
     
     echo
@@ -291,7 +336,11 @@ install_nginx() {
     read MAX_SIZE
     MAX_SIZE=${MAX_SIZE:-200M}
 
-    # 注意：Certbot 申请证书时必须依赖 80 端口，独立申请成功后，反代服务才会应用自定义端口
+    # === 🚀 额外防线：在 Certbot 运行前再次确保 80 端口未被其他临时服务卡死 ===
+    if netstat -ntlp 2>/dev/null | grep -q ":80 " && ! rc-service nginx status >/dev/null 2>&1; then
+        kill -9 $(netstat -ntlp 2>/dev/null | grep ":80 " | awk '{print $7}' | cut -d/ -f1) 2>/dev/null || true
+    fi
+
     certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
     generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE" "" "" "$LISTEN_PORT"
     nginx -t && rc-service nginx reload
@@ -307,7 +356,7 @@ install_nginx() {
 add_config() {
     mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
 
-    echo -ne "${GREEN}请输入域名(例如:example.com): ${RESET}"
+    echo -ne "${GREEN}请输入域名(example.com): ${RESET}"
     read DOMAIN
     check_domain_resolution "$DOMAIN"
 
@@ -315,7 +364,7 @@ add_config() {
     read LISTEN_PORT
     LISTEN_PORT=${LISTEN_PORT:-443}
 
-    echo -ne "${GREEN}请输入反代目标(例如:http://127.0.0.1:5788): ${RESET}"
+    echo -ne "${GREEN}请输入反代目标(http://127.0.0.1:5788): ${RESET}"
     read TARGET
 
     EMAIL_FILE="/etc/nginx/.cert_emails"
@@ -385,7 +434,6 @@ modify_config() {
     DOMAIN="${DOMAINS[$((choice-1))]}"
     CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
     
-    # 提取旧配置里的自定义端口
     local old_port=$(grep "listen " "$CONFIG_PATH" | grep "ssl" | awk '{print $2}' | tr -d ';')
     old_port=${old_port:-443}
 
@@ -602,8 +650,8 @@ check_domains_status() {
 }
 
 uninstall_nginx() {
-    echo -e "${YELLOW}警告: 此操作将卸载 Nginx 并删除所有相关配置文件和证书！${RESET}"
-    read -r -p "你确定要卸载 Nginx 吗？(y/N): " confirm
+    echo -e "${RED}💥 警告: 此操作将物理完全卸载 Nginx 核心，并彻底抹除所有反代配置与托管证书！${RESET}"
+    read -r -p "确定要斩草除根式卸载 Nginx 吗？(y/N): " confirm
     
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo -e "${YELLOW}操作已取消。${RESET}"
@@ -611,18 +659,34 @@ uninstall_nginx() {
         return 0
     fi
 
-    echo -e "${YELLOW}正在卸载 Nginx (Alpine)...${RESET}"
-    rc-service nginx stop || true
-    rc-update del nginx default || true
-    apk del nginx certbot certbot-nginx || true
-    rm -rf /etc/nginx /etc/letsencrypt "$CUSTOM_SSL_BASE" /var/log/nginx
-    remove_default_server
+    echo -e "${YELLOW}正在强行关闭服务并擦除系统组件...${RESET}"
+    rc-service nginx stop >/dev/null 2>&1 || true
+    rc-update del nginx default >/dev/null 2>&1 || true
     
+    # 强制杀死一切可能残留的相关进程
+    killall nginx 2>/dev/null || true
+    killall certbot 2>/dev/null || true
+
+    # 使用 APK 卸载
+    echo -e "${YELLOW}正在从系统卸载核心包...${RESET}"
+    apk del nginx certbot certbot-nginx nginx-openrc nginx-vim 2>/dev/null || true
+    
+    # 彻底抹除残留目录
+    echo -e "${YELLOW}正在彻底擦除本地配置与证书归档...${RESET}"
+    rm -rf /etc/nginx
+    rm -rf /etc/letsencrypt
+    rm -rf "$CUSTOM_SSL_BASE"
+    rm -rf /var/log/nginx
+    rm -rf /var/lib/nginx
+    rm -rf /run/nginx.pid 2>/dev/null || true
+    
+    # 清理定时任务
     crontab -l 2>/dev/null | grep -v "certbot renew" | crontab - 2>/dev/null || true
     
-    echo -e "${GREEN}已成功卸载${RESET}"
+    echo -e "${GREEN}✅ Nginx 及其环境配置已彻底卸载干净！系统已恢复纯净状态。${RESET}"
     pause
 }
+
 
 fix_external_cert_permission() {
     local cert=$1
@@ -704,29 +768,28 @@ add_custom_cert_config() {
     pause
 }
 
-# ------------------------------------------------------------
-# 优化重构：适配新版 Nginx (HTTP/2 改为标准 http2 on 指令)
-# ------------------------------------------------------------
 generate_emby_normal_conf() {
     local DOMAIN=$1
     local TARGET=$2
     local CERT_PATH=$3
     local KEY_PATH=$4
+    local LISTEN_PORT=$5  # 新增：外部监听端口参数
     local CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
     local TARGET_HOST=$(echo $TARGET | awk -F[/:] '{print $4}')
 
     CERT_PATH=${CERT_PATH:-"/etc/letsencrypt/live/$DOMAIN/fullchain.pem"}
     KEY_PATH=${KEY_PATH:-"/etc/letsencrypt/live/$DOMAIN/privkey.pem"}
+    LISTEN_PORT=${LISTEN_PORT:-443} # 默认 443
 
     cat > "$CONFIG_PATH" <<EOF
 server {
     listen 80;
     server_name $DOMAIN;
-    return 301 https://\$host\$request_uri;
+    return 301 https://\$host:${LISTEN_PORT}\$request_uri;
 }
 
 server {
-    listen 443 ssl;
+    listen $LISTEN_PORT ssl;
     http2 on;
     server_name $DOMAIN;
 
@@ -765,6 +828,7 @@ server {
 }
 EOF
     ln -sf "$CONFIG_PATH" "/etc/nginx/sites-enabled/$DOMAIN"
+    configure_firewall "$LISTEN_PORT"
 }
 
 generate_emby_stream_conf() {
@@ -773,22 +837,24 @@ generate_emby_stream_conf() {
     local T_STREAM=$3
     local CERT_PATH=$4
     local KEY_PATH=$5
+    local LISTEN_PORT=$6  # 新增：外部监听端口参数
     local CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
     local MAIN_HOST=$(echo $T_MAIN | awk -F[/:] '{print $4}')
     local STREAM_HOST=$(echo $T_STREAM | awk -F[/:] '{print $4}')
 
     CERT_PATH=${CERT_PATH:-"/etc/letsencrypt/live/$DOMAIN/fullchain.pem"}
     KEY_PATH=${KEY_PATH:-"/etc/letsencrypt/live/$DOMAIN/privkey.pem"}
+    LISTEN_PORT=${LISTEN_PORT:-443} # 默认 443
 
     cat > "$CONFIG_PATH" <<EOF
 server {
     listen 80;
     server_name $DOMAIN;
-    return 301 https://\$host\$request_uri;
+    return 301 https://\$host:${LISTEN_PORT}\$request_uri;
 }
 
 server {
-    listen 443 ssl;
+    listen $LISTEN_PORT ssl;
     http2 on;
     server_name $DOMAIN;
 
@@ -819,8 +885,9 @@ server {
         proxy_read_timeout 86400;
         proxy_send_timeout 86400;
 
-        proxy_redirect $T_STREAM/ /s1/;
-        proxy_redirect $T_STREAM /s1/;
+        # 动态处理带非标准端口的重定向劫持
+        proxy_redirect $T_STREAM/ https://\$host:${LISTEN_PORT}/s1/;
+        proxy_redirect $T_STREAM https://\$host:${LISTEN_PORT}/s1/;
     }
 
     location /s1/ {
@@ -850,6 +917,7 @@ server {
 }
 EOF
     ln -sf "$CONFIG_PATH" "/etc/nginx/sites-enabled/$DOMAIN"
+    configure_firewall "$LISTEN_PORT"
 }
 
 emby_menu() {
@@ -858,7 +926,7 @@ emby_menu() {
     echo -e "${GREEN}1.普通反代(Certbot托管)${RESET}"
     echo -e "${GREEN}2.主站+推流路径重定向(Certbot托管)${RESET}"
     echo -e "${GREEN}3.普通反代(自定义证书)${RESET}"
-    echo -e "${0}.返回主菜单${RESET}"
+    echo -e "${GREEN}0.返回主菜单${RESET}"
     echo -ne "${GREEN}请选择 [0-3]: ${RESET}"
     read emby_choice
 
@@ -866,35 +934,41 @@ emby_menu() {
         1)
             echo -ne "${GREEN}请输入您的域名: ${RESET}"; read DOMAIN
             check_domain_resolution "$DOMAIN"
+            echo -ne "${GREEN}请输入公网访问端口 (直接回车默认 443): ${RESET}"; read LISTEN_PORT
+            LISTEN_PORT=${LISTEN_PORT:-443}
             echo -ne "${GREEN}请输入Emby地址(例如: https://emby.com): ${RESET}"; read TARGET
             EMAIL=$(generate_random_email)
             certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-            generate_emby_normal_conf "$DOMAIN" "$TARGET"
+            generate_emby_normal_conf "$DOMAIN" "$TARGET" "" "" "$LISTEN_PORT"
             nginx -t && rc-service nginx reload
             echo -e "${GREEN}========================================${RESET}"
             echo -e "${GREEN}✅ 普通模式配置成功!${RESET}"
-            echo -e "${GREEN}🌐 访问地址: https://$DOMAIN${RESET}"
+            echo -e "${GREEN}🌐 访问地址: https://$DOMAIN:$LISTEN_PORT${RESET}"
             echo -e "${GREEN}========================================${RESET}"
             pause ;;
         2)
             echo -ne "${GREEN}请输入您的域名: ${RESET}"; read DOMAIN
             check_domain_resolution "$DOMAIN"
+            echo -ne "${GREEN}请输入公网访问端口 (直接回车默认 443): ${RESET}"; read LISTEN_PORT
+            LISTEN_PORT=${LISTEN_PORT:-443}
             echo -ne "${GREEN}请输入Emby主站地址(例如: https://emby1.com): ${RESET}"; read T_MAIN
             echo -ne "${GREEN}请输入推流后端地址(例如: https://emby2.com): ${RESET}"; read T_STREAM
             EMAIL=$(generate_random_email)
             certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-            generate_emby_stream_conf "$DOMAIN" "$T_MAIN" "$T_STREAM"
+            generate_emby_stream_conf "$DOMAIN" "$T_MAIN" "$T_STREAM" "" "" "$LISTEN_PORT"
             nginx -t && rc-service nginx reload
             echo -e "${GREEN}========================================${RESET}"
             echo -e "${GREEN}✅ 分流重定向模式配置成功!${RESET}"
-            echo -e "${GREEN}🌐 主站访问地址: https://$DOMAIN${RESET}"
-            echo -e "${GREEN}🚀 推流重定向路径: https://$DOMAIN/s1/${RESET}"
+            echo -e "${GREEN}🌐 主站访问地址: https://$DOMAIN:$LISTEN_PORT${RESET}"
+            echo -e "${GREEN}🚀 推流重定向路径: https://$DOMAIN:$LISTEN_PORT/s1/${RESET}"
             echo -e "${YELLOW}提示: 所有发往 $T_STREAM 的请求已自动劫持至 /s1/${RESET}"
             echo -e "${GREEN}========================================${RESET}"
             pause ;;
         3)
             echo -ne "${GREEN}请输入您的域名: ${RESET}"; read DOMAIN
             check_domain_resolution "$DOMAIN"
+            echo -ne "${GREEN}请输入公网访问端口 (直接回车默认 443): ${RESET}"; read LISTEN_PORT
+            LISTEN_PORT=${LISTEN_PORT:-443}
             echo -ne "${GREEN}请输入Emby地址(例如: https://emby.com): ${RESET}"; read TARGET
             local DIR_PATH="$CUSTOM_SSL_BASE/$DOMAIN"
             mkdir -p "$DIR_PATH"
@@ -917,11 +991,11 @@ emby_menu() {
             ln -sf "$ABS_CERT" "$DIR_PATH/fullchain.pem"
             ln -sf "$ABS_KEY" "$DIR_PATH/privkey.pem"
 
-            generate_emby_normal_conf "$DOMAIN" "$TARGET" "$DIR_PATH/fullchain.pem" "$DIR_PATH/privkey.pem"
+            generate_emby_normal_conf "$DOMAIN" "$TARGET" "$DIR_PATH/fullchain.pem" "$DIR_PATH/privkey.pem" "$LISTEN_PORT"
             nginx -t && rc-service nginx reload
             echo -e "${GREEN}========================================${RESET}"
             echo -e "${GREEN}✅ 普通模式配置成功!${RESET}"
-            echo -e "${GREEN}🌐 访问地址: https://$DOMAIN${RESET}"
+            echo -e "${GREEN}🌐 访问地址: https://$DOMAIN:$LISTEN_PORT${RESET}"
             echo -e "${GREEN}========================================${RESET}"
             pause ;;
         0) return ;;
@@ -932,7 +1006,7 @@ emby_menu() {
 update_nginx_software() {
     clear
     echo -e "${YELLOW}========================================${RESET}"
-    echo -e "${YELLOW}    ◈ 正在执行 Nginx 软件版本升级 (Alpine) ◈    ${RESET}"
+    echo -e "${YELLOW}    ◈ 正在执行 Nginx 软件版本升级◈    ${RESET}"
     echo -e "${YELLOW}========================================${RESET}"
 
     if ! command -v nginx >/dev/null 2>&1; then
@@ -970,7 +1044,7 @@ update_nginx_software() {
             echo -e "${RED}❌ Nginx 配置验证失败！旧服务继续维持运行，请检查配置。${RESET}"
         fi
     else
-        echo -e "${RED}❌ 从 Alpine 软件源升级失败，请检查网络！${RESET}"
+        echo -e "${RED}❌ 从 Alpine 软件源升级失败，请检查 network！${RESET}"
     fi
     pause
 }
@@ -984,26 +1058,28 @@ main_menu() {
         get_nginx_version
         get_site_count
         clear
-        echo -e "${GREEN}========================================${RESET}"
-        echo -e "${GREEN}       ◈ Nginx 反向代理管理面板 (Alpine) ◈   ${RESET}"
-        echo -e "${GREEN}========================================${RESET}"
-        echo -e "${GREEN} Nginx 状态: ${STATUS}     |  Nginx 版本: ${YELLOW}${VERSION_SHOW}${RESET}"
-        echo -e "${GREEN} 已配站点数: ${YELLOW}${SITE_COUNT}${RESET}"
-        echo -e "${GREEN}========================================${RESET}"
-        echo -e "${GREEN} 1. 安装 Nginx 和 Certbot环境${RESET}"
-        echo -e "${GREEN} 2. 添加 反代站点配置 (Certbot 托管SSL - 可自定义端口)${RESET}"
-        echo -e "${GREEN} 3. 添加 反代站点配置 (自定义本地SSL - 可自定义端口)${RESET}"
-        echo -e "${GREEN} 4. 修改 现有站点反代目标和端口${RESET}"
-        echo -e "${GREEN} 5. 删除 现有反代站点配置${RESET}"
-        echo -e "${GREEN} 6. 检查 所有域名证书到期天数${RESET}"
-        echo -e "${GREEN} 7. 测试 托管证书手动续期 (Dry-Run)${RESET}"
-        echo -e "${GREEN} 8. 查看 现有证书详情路径${RESET}"
-        echo -e "${GREEN} 9. 独立面板: Emby 流媒体高级代理配置${RESET}"
-        echo -e "${GREEN}10. 平滑升级 Nginx 软件版本${RESET}"
-        echo -e "${RED}11. 彻底卸载 Nginx 环境${RESET}"
-        echo -e "${GREEN} 0. 退出脚本${RESET}"
-        echo -e "${GREEN}========================================${RESET}"
-        echo -ne "${GREEN}请输入操作编号 [0-11]: ${RESET}"
+        echo -e "${GREEN}=============================${RESET}"
+        echo -e "${GREEN}  ◈ Nginx 反向代理管理面板 ◈  ${RESET}"
+        echo -e "${GREEN}=============================${RESET}"
+        echo -e "${GREEN}状态   :${STATUS}${RESET}"
+        echo -e "${GREEN}状态   :${YELLOW}${VERSION_SHOW}${RESET}"
+        echo -e "${GREEN}状态   :${YELLOW}${SITE_COUNT}个${RESET}"
+        echo -e "${GREEN}=============================${RESET}"
+        echo -e "${GREEN} 1. 安装 Nginx${RESET}"
+        echo -e "${GREEN} 2. 添加配置 (Certbot托管)${RESET}"
+        echo -e "${GREEN} 3. 添加配置 (自定义证书)${RESET}"
+        echo -e "${GREEN} 4. 修改配置${RESET}"
+        echo -e "${GREEN} 5. 删除配置${RESET}"
+        echo -e "${GREEN} 6. 测试证书续期${RESET}"
+        echo -e "${GREEN} 7. 查看证书信息${RESET}"
+        echo -e "${GREEN} 8. 查看证书状态${RESET}"
+        echo -e "${GREEN} 9. Emby反代配置${RESET}"
+        echo -e "${GREEN}10. 重载Nginx配置${RESET}"
+        echo -e "${GREEN}11. 升级Nginx${RESET}"
+        echo -e "${GREEN}12. 卸载Nginx${RESET}"
+        echo -e "${GREEN} 0. 退出${RESET}"
+        echo -e "${GREEN}=============================${RESET}"
+        echo -ne "${GREEN} 请选择: ${RESET}"
         read choice
 
         case $choice in
@@ -1012,12 +1088,13 @@ main_menu() {
             3) add_custom_cert_config ;;
             4) modify_config ;;
             5) delete_config ;;
-            6) check_domains_status ;;
-            7) test_renew ;;
-            8) check_cert ;;
+            6) test_renew ;;
+            7) check_cert ;;
+            8) check_domains_status ;;
             9) emby_menu ;;
-           10) update_nginx_software ;;
-           11) uninstall_nginx ;;
+           10) reload_nginx ;; 
+           11) update_nginx_software ;;
+           12) uninstall_nginx ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效输入，请重新选择！${RESET}"; sleep 1 ;;
         esac

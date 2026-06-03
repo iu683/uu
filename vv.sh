@@ -9,7 +9,8 @@ RED="\033[31m"
 RESET="\033[0m"
 
 SCRIPT_PATH="/usr/local/bin/clean-server"
-SCRIPT_URL="bash <(curl -sL https://raw.githubusercontent.com/iu683/uu/main/vv.sh)"
+# 修复：只保留纯粹的原始文件下载直链
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/vv.sh" 
 CONFIG_FILE="/etc/clean-server.conf"
 
 # 加载 TG 配置
@@ -192,27 +193,34 @@ install_script() {
     # 动态获取当前正在执行的脚本名/路径
     local current_run="$0"
 
-    if [ ! -f "$SCRIPT_PATH" ]; then
-        # 创建本地目标目录
-        mkdir -p "$(dirname "$SCRIPT_PATH")"
-        
-        # 替代 [[ "$0" != *"bash"* ]] 的 POSIX 健壮写法
-        # 检查当前执行的是否是有效的实体脚本文件，而不是通过管道或标准输入直接喂给 bash/sh 的
-        if [ -f "$current_run" ]; then
-            cp "$current_run" "$SCRIPT_PATH"
+    # 创建本地目标目录
+    mkdir -p "$(dirname "$SCRIPT_PATH")"
+    
+    # 检查当前执行的是否是有效的实体脚本文件（本地运行），还是通过管道喂给 bash 的（远程运行）
+    if [ -f "$current_run" ] && [ "$(basename "$current_run")" = "uu.sh" ]; then
+        echo -e "${YELLOW}检测到本地脚本，正在复制到系统目录...${RESET}"
+        cp "$current_run" "$SCRIPT_PATH"
+    else
+        # 远程运行或找不到本地源文件时，走网络下载
+        echo -e "${YELLOW}正在下载组件到 $SCRIPT_PATH ...${RESET}"
+        if command -v curl >/dev/null 2>&1; then
+            curl -sL "$SCRIPT_URL" -o "$SCRIPT_PATH"
+        elif command -v wget >/dev/null 2>&1; then
+            wget -qO "$SCRIPT_PATH" "$SCRIPT_URL"
         else
-            # 只有当找不到本地文件时（例如用户用 curl 远程直接挂载运行），才走网络下载
-            if command -v curl >/dev/null 2>&1; then
-                curl -sL "$SCRIPT_URL" -o "$SCRIPT_PATH"
-            elif command -v wget >/dev/null 2>&1; then
-                wget -qO "$SCRIPT_PATH" "$SCRIPT_URL"
-            else
-                echo "错误: 系统缺少 curl 或 wget 命令，无法下载组件"
-                return 1
-            fi
+            echo -e "${RED}错误: 系统缺少 curl 或 wget 命令，无法下载组件${RESET}"
+            return 1
         fi
+    fi
+
+    # 【核心修复】安全校验：确保文件确实存在且大小大于 0 字节
+    if [ -s "$SCRIPT_PATH" ]; then
         chmod +x "$SCRIPT_PATH"
-        sleep 2
+        sleep 1
+    else
+        echo -e "${RED}错误: 脚本未能成功写入到 $SCRIPT_PATH，请检查网络或 URL 权限！${RESET}"
+        # 如果是第一次下载失败，由于没有生成可用脚本，建议直接退出，防止后面的菜单报错
+        exit 1
     fi
 }
 
@@ -240,8 +248,10 @@ if [ "$1" = "--auto" ]; then
     exit 0
 fi
 
-# 预安装拦截
-install_script
+# 【修复核心】只有当本地找不到有效的实体脚本时，才触发安装/下载逻辑
+if [ ! -s "$SCRIPT_PATH" ]; then
+    install_script
+fi
 
 # =========================================================
 # 主视觉面板菜单逻辑
@@ -251,7 +261,7 @@ auto_clean_menu() {
         # 刷新当前状态
         get_system_status
 
-        clear
+    
         echo -e "${GREEN}=======================================${RESET}"
         echo -e "${GREEN}     ◈   服务器自动化清理面板   ◈      ${RESET}"
         echo -e "${GREEN}=======================================${RESET}"

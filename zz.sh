@@ -1,782 +1,449 @@
-#!/usr/bin/env bash
-#
-# Alpine sing-box TUIC v5 专属管理面板 (权限固化终极版)
-# SPDX-License-Identifier: MIT
-#
-set -Eop pipefail
+#!/bin/bash
+# ==========================================
+# ACME Pro 证书申请（Alpine 专属：ZeroSSL 驱动）
+# ==========================================
 export LANG=en_US.UTF-8
 
-# =========================================================
-# 1. 核心控制与全局环境初始化
-# =========================================================
-readonly BINARY_PATH="/usr/local/bin/sing-box-tuic"
-readonly TUIC_CONFIG="/etc/sing-box-tuic/config.json"
-readonly TUIC_DIR="/root/proxynode/tuicv5"
-CONFIG_DIR="/etc/sing-box-tuic"
-OPENRC_SERVICE_PATH="/etc/init.d/sing-box-tuic"
-LOG_FILE="/var/log/sing-box-tuic.log"
-RUN_USER="singbox-tuic"
-
-TMP_DIR=$(mktemp -d -t sb-tuic.XXXXXX)
-
-# 全局上下文锁
-port=""
-auth_uuid=""
-auth_pwd=""
-cert_path="/etc/sing-box-tuic/certs/cert.pem"
-key_path="/etc/sing-box-tuic/certs/key.pem"
-tuic_domain=""
-
-# 颜色标准规范
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
-BLUE="\033[34m"
 RESET="\033[0m"
 
-info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
-error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
-pause() { echo; read -n 1 -s -r -p "$(echo -e ${GREEN}"按任意键返回菜单..."${RESET})" || true; echo; }
+green(){ echo -e "${GREEN}$1${RESET}"; }
+red(){ echo -e "${RED}$1${RESET}"; }
+yellow(){ echo -e "${YELLOW}$1${RESET}"; }
 
-cleanup() {
-  [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
-}
-trap cleanup EXIT INT TERM
+[[ $EUID -ne 0 ]] && red "请使用 root 运行" && exit
 
-generate_random_password() {
-  dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
-}
+ACME_HOME="/root/.acme.sh"
+SSL_DIR="/etc/acmessl"
+mkdir -p $SSL_DIR
 
-is_alpine() {
-  [[ -f /etc/alpine-release ]]
+# 简易 pause 函数
+pause() {
+    read -p $'\033[32m按回车返回菜单...\033[0m' temp
 }
 
-install_packages() {
-  info "正在刷新 Alpine 仓库并安装核心依赖..."
-  apk update
-  apk add --no-cache bash curl wget tar openssl openrc iproute2 jq grep sed coreutils bind-tools iptables ip6tables gcompat socat python3
-  
-  if [[ -f /etc/init.d/iptables ]]; then
-    rc-update add iptables default >/dev/null 2>&1 || true
-    rc-service iptables start >/dev/null 2>&1 || true
-  fi
-  if [[ -f /etc/init.d/ip6tables ]]; then
-    rc-update add ip6tables default >/dev/null 2>&1 || true
-    rc-service ip6tables start >/dev/null 2>&1 || true
-  fi
-}
-
-create_user() {
-  getent group "$RUN_USER" &>/dev/null || addgroup -S "$RUN_USER"
-  id "$RUN_USER" &>/dev/null || adduser -S -D -H -G "$RUN_USER" -s /sbin/nologin "$RUN_USER"
-}
-
-detect_arch() {
-  case "$(uname -m)" in
-    x86_64|amd64) echo "amd64" ;;
-    aarch64|arm64) echo "arm64" ;;
-    armv7l|armv7) echo "armv7" ;;
-    *) error "不支持当前架构: $(uname -m)"; exit 8 ;;
-  esac
-}
-
-check_environment() {
-  if ! is_alpine; then
-    error "本脚本仅支持 Alpine Linux 系统。"
-    exit 95
-  fi
-  install_packages
-  create_user
-}
-
-get_installed_version() {
-  if [[ -f "$BINARY_PATH" ]]; then
-    "$BINARY_PATH" version 2>/dev/null | head -n1 | awk '{print $3}' || echo "未知版本"
-  else
-    echo "未安装"
-  fi
-}
-
-get_latest_version() {
-  info "正在从 GitHub 获取 sing-box 最新版本号..."
-  local latest_v
-  latest_v=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r .tag_name | sed 's/^v//')
-  
-  if [[ -z "$latest_v" || "$latest_v" == "null" ]]; then
-    warn "通过 API 获取最新版本失败，尝试备用匹配方案..."
-    latest_v=$(curl -fsSL "https://github.com/SagerNet/sing-box/releases/latest" | grep -oE 'releases/tag/v[0-9.]+' | head -n1 | sed 's|releases/tag/v||')
-  fi
-
-  if [[ -n "$latest_v" ]]; then
-    SINGBOX_VERSION="$latest_v"
-    info "成功获取最新版本: v$SINGBOX_VERSION"
-  else
-    SINGBOX_VERSION="1.13.12"
-    warn "无法获取最新版本，将使用保底版本: v$SINGBOX_VERSION"
-  fi
-}
-
-clear_old_iptables() {
-  if [[ -f "${CONFIG_DIR}/hopping.txt" && -f "${CONFIG_DIR}/main_port.txt" ]]; then
-    local old_hop old_port old_start old_end
-    old_hop=$(cat "${CONFIG_DIR}/hopping.txt")
-    old_port=$(cat "${CONFIG_DIR}/main_port.txt")
-    old_start="${old_hop%-*}"
-    old_end="${old_hop#*-}"
-
-    if [[ -n "$old_start" && -n "$old_end" && -n "$old_port" ]]; then
-      info "正在强力清除旧有的 iptables 端口跳跃规则..."
-      iptables -t nat -D PREROUTING -p udp -m multiport --dports "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
-      ip6tables -t nat -D PREROUTING -p udp -m multiport --dports "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
-      iptables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
-      ip6tables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
-    fi
-  fi
-}
-
-apply_new_iptables() {
-  clear_old_iptables
-  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
-    local hop_val start_p end_p
-    hop_val=$(cat "${CONFIG_DIR}/hopping.txt")
-    start_p="${hop_val%-*}"
-    end_p="${hop_val#*-}"
+# ===============================
+# 依赖检测 (Alpine apk 专用)
+# ===============================
+install_dep(){
+    yellow "正在为 Alpine Linux 安装必要依赖..."
+    apk update
+    # 安装 bash, curl, openssl, socat 以及用于计算时间的 tzdata
+    apk add --no-interactive bash curl openssl socat wget crond tzdata python3
     
-    info "正在应用 iptables 转发规则: UDP $start_p-$end_p => 主端口 $port"
-    if iptables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null; then
-      ip6tables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
-    else
-      iptables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
-      ip6tables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+    # 确保 crond 服务在 Alpine 中启动
+    if command -v rc-service >/dev/null 2>&1; then
+        rc-service crond start >/dev/null 2>&1
+        rc-update add crond default >/dev/null 2>&1
     fi
-    
-    echo "$port" > "${CONFIG_DIR}/main_port.txt"
-    
-    if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
-    if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
-    info "防火墙端口跳跃规则已固化。"
-  fi
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网IP"
-}
-
-check_port() {
-  local check_p="$1"
-  if ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$check_p"; then
-    return 1
-  fi
-  return 0
-}
-
-is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
-
-get_random_port() {
-  local rand_port
-  while true; do
-    rand_port=$(shuf -i 2000-65535 -n 1)
-    if check_port "$rand_port"; then
-      echo "$rand_port" && return 0
-    fi
-  done
-}
-
-get_tuic_status() {
-  if rc-service sing-box-tuic status 2>/dev/null | grep -q "started"; then
-    echo "RUNNING"
-  else
-    echo "STOPPED"
-  fi
-}
-
-get_current_port_display() {
-  if [[ -f "$TUIC_CONFIG" ]]; then
-    local main_port jump_range="无"
-    main_port=$(jq -r '.inbounds[0].listen_port // empty' "$TUIC_CONFIG" 2>/dev/null)
-    [[ -f "${CONFIG_DIR}/hopping.txt" ]] && jump_range=$(cat "${CONFIG_DIR}/hopping.txt")
-    
-    if [[ "$jump_range" != "无" ]]; then
-      echo "${main_port} [${jump_range}]"
-    else
-      echo "${main_port:- -}"
-    fi
-  else echo "-"; fi
-}
-
-# =========================================================
-# 5. 核心流控与经过实测的四步权限强力穿透修复逻辑
-# =========================================================
-fix_external_cert_permission_final() {
-  local cert="$1"
-  local key="$2"
-  
-  if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
-    error "致命拒绝: 检测到您的证书位于 /root/ 目录下！"
-    warn "原因分析: /root 目录权限极为严苛(700)，非 root 用户无法穿透检索。"
-    info "权威推荐: 请将证书手动移动到公共目录 (如 /etc/amee/ 或 /etc/ssl/) 后再试。"
-    return 1
-  fi
-
-  info "正在强行赋予证书所在的多级父目录检索穿透权限..."
-  local dir
-  for file in "$cert" "$key"; do
-    dir=$(dirname "$file")
-    while [[ "$dir" != "/" && -n "$dir" ]]; do
-      chmod o+x "$dir" 2>/dev/null || true
-      dir=$(dirname "$dir")
-    done
-  done
-  
-  info "正在规范化自定义目录下的证书和私钥读取白名单权限..."
-  chmod 644 "$cert" 2>/dev/null || true
-  chmod 644 "$key" 2>/dev/null || true
-  
-  return 0
-}
-
-inst_cert() {
-  mkdir -p "$CONFIG_DIR/certs"
-
-  echo "---------------------------------------------"
-  echo -e "Tuic 协议证书申请方式如下："
-  echo -e " 1) 必应自签证书 ${YELLOW}（默认）${RESET}"
-  echo -e " 2) Acme自动申请 (需放行 80 端口)"
-  echo -e " 3) 自定义证书路径"
-  echo "---------------------------------------------"
-  local certInput
-  read -rp "请输入选项 [1-3] (直接回车默认自签): " certInput
-  certInput=${certInput:-1}
-
-  cert_path="$CONFIG_DIR/certs/cert.pem"
-  key_path="$CONFIG_DIR/certs/key.pem"
-
-  if [[ $certInput == 2 ]]; then
-    if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
-      warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。请确保已暂时关闭 Web 服务。"
-    fi
-
-    if [[ -f "$cert_path" && -f "$key_path" && -s "$cert_path" && -s "$key_path" && -f "$CONFIG_DIR/certs/ca.log" ]]; then
-      tuic_domain=$(cat "$CONFIG_DIR/certs/ca.log")
-      info "检测到已有域名 [${tuic_domain}] 的安全区证书，正在复用..."
-    else
-      local domain
-      read -rp "请输入需要申请证书的域名: " domain
-      [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
-      
-      info "正在检查并安装 Acme.sh 依赖..."
-      local acme_cmd="/root/.acme.sh/acme.sh"
-      if [[ ! -f "$acme_cmd" ]]; then
-        # 使用 Alpine 100% 自带的 openssl 生成标准的 12 位随机十六进制字符作为谷歌邮箱前缀
-        local rand_prefix
-        rand_prefix=$(openssl rand -hex 6 2>/dev/null || date +%s | tail -c 8)
-        local random_google_email="tuic.${rand_prefix}@gmail.com"
+# ===============================
+# 安装 acme.sh 并初始化 ZeroSSL
+# ===============================
+install_acme(){
+    if [ ! -f "$ACME_HOME/acme.sh" ]; then
+        read -p "请输入注册 ZeroSSL 的邮箱（回车自动生成）: " email
+        [ -z "$email" ] && email="$(date +%s)@gmail.com"
         
-        info "已为您随机生成合规谷歌邮箱: ${random_google_email}"
-        curl https://get.acme.sh | sh -s email="${random_google_email}"
-      fi
-      
-      "$acme_cmd" --set-default-ca --server letsencrypt
-      
-      info "正在向 Let's Encrypt 申请证书..."
-      if [[ "$(get_public_ip)" =~ ":" ]]; then
-        "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
-      else
-        "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
-      fi
-      
-      local reload_cmd="[ -f /etc/sing-box-tuic/config.json ] && /sbin/rc-service sing-box-tuic restart || echo '[信息] 初次部署，跳过服务同步'"
-      
-      if "$acme_cmd" --install-cert -d "${domain}" \
-        --key-file "$key_path" \
-        --fullchain-file "$cert_path" \
-        --ecc \
-        --reloadcmd "$reload_cmd"; then
-        echo "$domain" > "$CONFIG_DIR/certs/ca.log"
-        tuic_domain=$domain
-        info "Acme 证书申请并成功分发！"
-      else
-        error "Acme 证书申请失败，自动切换回自签模式。"
-        certInput=1
-      fi
+        yellow "正在下载安装 acme.sh..."
+        curl https://get.acme.sh | sh -s email=$email
+        
+        yellow "正在将默认 CA 设置为 ZeroSSL..."
+        $ACME_HOME/acme.sh --set-default-ca --server zerossl
+        
+        green "acme.sh 安装并初始化 ZeroSSL 完成！"
+    else
+        $ACME_HOME/acme.sh --set-default-ca --server zerossl >/dev/null 2>&1
     fi
-  elif [[ $certInput == 3 ]]; then
-    while true; do
-      local user_cert user_key cert_dir guessed_key default_sni
-      echo "---------------------------------------------"
-      read -rp "请输入公钥文件 (cert.crt/pem) 的路径: " user_cert
-      if [[ -z "$user_cert" ]]; then
-        error "路径不能为空，请重新输入。"
-        continue
-      fi
+}
 
-      # 智能推导同目录下的私钥文件
-      cert_dir=$(dirname "$user_cert")
-      guessed_key=""
-      for k_name in "private.key" "cert.key" "key.pem" "privkey.pem" "key.key"; do
-        if [[ -f "${cert_dir}/${k_name}" ]]; then
-          guessed_key="${cert_dir}/${k_name}"
-          break
-        fi
-      done
-      
-      # 智能推导可能的 SNI 域名
-      default_sni=$(basename "$cert_dir")
-      [[ "$default_sni" == "certs" || "$default_sni" == "ssl" || -z "$default_sni" ]] && default_sni="aploou.csy.dpdns.org"
-
-      local key_prompt="请输入密钥文件 (key.pem/key) 的路径"
-      [[ -n "$guessed_key" ]] && key_prompt="请输入密钥文件路径 [已为您智能匹配，回车默认: ${guessed_key}]"
-      read -rp "${key_prompt}: " user_key
-      user_key=${user_key:-$guessed_key}
-
-      read -rp "请输入证书对应的 SNI 域名 [回车默认: ${default_sni}]: " tuic_domain
-      tuic_domain=${tuic_domain:-$default_sni}
-      
-      if [[ -f "$user_cert" && -f "$user_key" ]]; then
-        rm -f "$cert_path" "$key_path"
-        if fix_external_cert_permission_final "$user_cert" "$user_key"; then
-          ln -sf "$user_cert" "$cert_path"
-          ln -sf "$user_key" "$key_path"
-          info "自定义外部证书已通过安全软链接无缝同步。"
-          break
+# ===============================
+# 更新 acme.sh
+# ===============================
+update_acme(){
+    if [ -f "$ACME_HOME/acme.sh" ]; then
+        yellow "正在检查并更新 acme.sh..."
+        $ACME_HOME/acme.sh --upgrade
+        if [ $? -eq 0 ]; then
+            green "acme.sh 更新成功！"
         else
-          return 1
+            red "更新失败，请检查网络连接。"
         fi
-      else
-        error "找不到输入的证书文件，请检查路径是否正确并重新输入！"
-      fi
-    done
-  fi
-
-  if [[ $certInput == 1 ]]; then
-    info "将使用必应自签证书作为 Tuic 的节点证书"
-    rm -f "$cert_path" "$key_path"
-    openssl ecparam -genkey -name prime256v1 -out "$key_path"
-    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
-    tuic_domain="www.bing.com"
-  fi
-
-  # 全面固化黄金四步的配置安全区修正
-  info "正在强行修复 sing-box 配置安全区内的权限与软链接属主..."
-  chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
-  chown -h ${RUN_USER}:${RUN_USER} "$CONFIG_DIR/certs"/* 2>/dev/null || true
-  chmod 755 "$CONFIG_DIR" "$CONFIG_DIR/certs"
+    else
+        red "未检测到已安装的 acme.sh，请先申请证书或执行安装。"
+    fi
 }
 
-inst_port() {
-  local default_port=""
-  if [[ -f "$TUIC_CONFIG" ]]; then
-    default_port=$(jq -r '.inbounds[0].listen_port // empty' "$TUIC_CONFIG" 2>/dev/null)
-  fi
-
-  local prompt_msg="设置 Tuic 服务端监听主端口 [1-65535] (回车随机分配): "
-  [[ -n "$default_port" ]] && prompt_msg="设置 Tuic 服务端监听主端口 [当前: ${default_port}, 回车不修改]: "
-
-  while true; do
-    read -rp "$prompt_msg" port
-    if [[ -z "$port" ]]; then
-      if [[ -n "$default_port" ]]; then 
-        port="$default_port"
-        break
-      else
-        port=$(get_random_port)
-        info "已为您随机分配未被占用端口: $port" && break
-      fi
-    elif is_valid_port "$port"; then
-      if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
-        error "端口 ${port} 已被其它程序占用，请更换。" && continue
-      fi
-      break
-    else 
-      error "请输入有效的端口数字 (1-65535)"
+# ===============================
+# 停止/恢复 Web 服务 (Alpine OpenRC 适配)
+# ===============================
+stop_web(){
+    if command -v rc-service >/dev/null 2>&1; then
+        if rc-service nginx status >/dev/null 2>&1; then
+            rc-service nginx stop >/dev/null 2>&1
+            WEB_STOP=nginx
+        fi
+        if rc-service apache2 status >/dev/null 2>&1; then
+            rc-service apache2 stop >/dev/null 2>&1
+            WEB_STOP=apache2
+        fi
     fi
-  done
+}
 
-  local default_hop=""
-  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
-    default_hop=$(cat "${CONFIG_DIR}/hopping.txt")
-  fi
+start_web(){
+    [ ! -z "$WEB_STOP" ] && command -v rc-service >/dev/null 2>&1 && rc-service $WEB_STOP start >/dev/null 2>&1
+}
 
-  echo "---------------------------------------------"
-  if [[ -n "$default_hop" ]]; then
-    echo -e "Tuic 端口群使用模式 [当前已启用跳跃: ${default_hop}]："
-  else
-    echo -e "Tuic 端口群使用模式 ："
-  fi
-  echo -e " 1) 单端口模式"
-  echo -e " 2) 端口跳跃模式 ${YELLOW}（默认)${RESET}"
-  echo "---------------------------------------------"
-  local jumpInput
-  read -rp "请选择端口模式 [1-2] (直接回车默认不变或选择默认项): " jumpInput
-  
-  if [[ -z "$jumpInput" && -n "$default_hop" ]]; then
-    info "检测到回车确认，将 100% 保持原有端口跳跃配置 [${default_hop}] 保持不变。"
-    echo "$port" > "${CONFIG_DIR}/main_port.txt"
-    return 0
-  fi
+# ==========================================
+# 安装/导出证书
+# ==========================================
+install_cert(){
+    local domain=$1
+    mkdir -p $SSL_DIR/$domain
+    
+    $ACME_HOME/acme.sh --install-cert -d $domain \
+        --key-file       $SSL_DIR/$domain/private.key \
+        --fullchain-file $SSL_DIR/$domain/cert.crt
+        
+    green "证书本地同步完成"
+    green "路径: $SSL_DIR/$domain/"
+}
 
-  jumpInput=${jumpInput:-2}
-  clear_old_iptables
+# ===============================
+# 智能获取公网 IP 函数
+# ===============================
+get_public_ip() {
+    local mode="${1:-"-4"}" 
+    local ip cmd urls
 
-  if [[ $jumpInput == 2 ]]; then
-    local old_start="" old_end="" firstport="" endport=""
-    if [[ -n "$default_hop" ]]; then
-      old_start="${default_hop%-*}"
-      old_end="${default_hop#*-}"
+    if [[ "$mode" == "-6" ]]; then
+        cmd_list=("curl -6fsSL --max-time 5" "wget -6qO- --timeout=5")
+        urls=("https://api64.ipify.org" "https://ipv6.ip.sb" "https://v6.ident.me")
+    else
+        cmd_list=("curl -4fsSL --max-time 5" "wget -4qO- --timeout=5")
+        urls=("https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com")
     fi
 
-    while true; do
-      local start_prompt="设置外部跳跃起始端口 (建议10000-65535)"
-      [[ -n "$old_start" ]] && start_prompt="设置外部跳跃起始端口 [当前: ${old_start}, 回车不修改]"
-      read -rp "${start_prompt}: " firstport
-      firstport=${firstport:-$old_start}
-
-      local end_prompt="设置外部跳跃末尾端口 (必须大于起始端口)"
-      [[ -n "$old_end" ]] && end_prompt="设置外部跳跃末尾端口 [当前: ${old_end}, 回车不修改]"
-      read -rp "${end_prompt}: " endport
-      endport=${endport:-$old_end}
-
-      if is_valid_port "$firstport" && is_valid_port "$endport" && [[ $firstport -lt $endport ]]; then 
-        break
-      else 
-        error "输入无效，起始端口必须小于末尾端口，请重新输入。"
-      fi
+    for cmd in "${cmd_list[@]}"; do
+        for url in "${urls[@]}"; do
+            ip=$($cmd "$url" 2>/dev/null || true)
+            ip=$(echo "$ip" | tr -d '[:space:]')
+            if [[ -n "$ip" ]]; then
+                if [[ "$mode" == "-4" && "$ip" =~ \. ]] || [[ "$mode" == "-6" && "$ip" =~ : ]]; then
+                    echo "$ip"
+                    return 0
+                fi
+            fi
+        done
     done
-    echo "$firstport-$endport" > "${CONFIG_DIR}/hopping.txt"
-  else
-    rm -f "${CONFIG_DIR}/hopping.txt" "${CONFIG_DIR}/main_port.txt"
-    info "已成功切换回单端口纯净模式"
-    if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
-    if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
-  fi
+    return 1
 }
 
-write_and_show_config() {
-  local HOSTNAME vps_ip last_ip is_insecure skip_cert hopping_param
-  HOSTNAME=$(hostname -s | sed 's/ /_/g')
-  vps_ip=$(get_public_ip)
-  last_ip="$vps_ip"
-  [[ "$vps_ip" =~ ":" ]] && last_ip="[$vps_ip]"
-
-  is_insecure="0"
-  skip_cert="false"
-  if [[ "$tuic_domain" == "www.bing.com" ]]; then
-    is_insecure="1"
-    skip_cert="true"
-  fi
-
-  cat << EOF > "$TUIC_CONFIG"
-{
-  "log": {
-    "level": "info",
-    "output": "$LOG_FILE",
-    "timestamp": true
-  },
-  "inbounds": [
-    {
-      "type": "tuic",
-      "tag": "tuic-in",
-      "listen": "::",
-      "listen_port": $port,
-      "users": [
-        {
-          "uuid": "$auth_uuid",
-          "password": "$auth_pwd"
-        }
-      ],
-      "congestion_control": "bbr",
-      "zero_rtt_handshake": false,
-      "heartbeat": "10s",
-      "tls": {
-        "enabled": true,
-        "server_name": "$tuic_domain",
-        "alpn": ["h3"],
-        "certificate_path": "$cert_path",
-        "key_path": "$key_path"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ],
-  "route": {
-    "final": "direct"
-  }
-}
-EOF
-
-  chmod 640 "$TUIC_CONFIG"
-  chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
-  chown -h ${RUN_USER}:${RUN_USER} "$CONFIG_DIR/certs"/* 2>/dev/null || true
-
-  apply_new_iptables
-  mkdir -p "$TUIC_DIR"
-  
-  hopping_param=""
-  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
-    hopping_param="&mport=$(cat "${CONFIG_DIR}/hopping.txt")"
-  fi
-
-  cat << EOF > "$TUIC_DIR/url.txt"
-V6VPS 请自行替换 IP 地址为 V6
-V2rayN 链接:
-tuic://$auth_uuid:$auth_pwd@$last_ip:$port?alpn=h3&congestion_control=bbr&sni=$tuic_domain&allow_insecure=${is_insecure}${hopping_param}#$HOSTNAME-tuicv5
-
-Surge 配置:
-$HOSTNAME-tuicv5 = tuic-v5, $last_ip, $port, password=$auth_pwd, uuid=$auth_uuid, ecn=true, skip-cert-verify=${skip_cert}, sni=$tuic_domain
-EOF
-
-  info "正在重启 OpenRC 服务管理器..."
-  rc-service sing-box-tuic stop >/dev/null 2>&1 || true
-  sleep 1.5
-  rc-service sing-box-tuic start
-  
-  showconf
+# ==========================================
+# 获取系统状态数据
+# ==========================================
+get_system_status() {
+    local acme_file="$ACME_HOME/acme.sh"
+    if [ -f "$acme_file" ]; then
+        STATUS="${GREEN}运行中 (ZeroSSL)${RESET}"
+        VERSION_SHOW=$(grep -E '^(VER|漏洞标记|_VERSION)=' "$acme_file" | head -n 1 | cut -d'=' -f2 | tr -d '"'\'' ')
+        if [ -z "$VERSION_SHOW" ]; then
+            VERSION_SHOW="3.1.4"
+        fi
+        SITE_COUNT=$($ACME_HOME/acme.sh --list | tail -n +2 | wc -l)
+    else
+        STATUS="${RED}未运行${RESET}"
+        VERSION_SHOW="--"
+        SITE_COUNT="0"
+    fi
 }
 
-write_openrc_script() {
-  cat << 'EOF' > "$OPENRC_SERVICE_PATH"
-#!/sbin/openrc-run
-
-name="sing-box-tuic"
-description="sing-box TUIC OpenRC Isolated Service"
-cfgfile="/etc/sing-box-tuic/config.json"
-logfile="/var/log/sing-box-tuic.log"
-command="/usr/local/bin/sing-box-tuic"
-command_args="run -c /etc/sing-box-tuic/config.json"
-
-depend() {
-    need net
-    after iptables ip6tables firewall
+# ===============================
+# 1. 域名 80 端口模式申请证书
+# ===============================
+standalone_issue(){
+    read -p "请输入域名 (example.com): " domain
+    [ -z "$domain" ] && red "域名不能为空" && return 1
+    stop_web
+    
+    $ACME_HOME/acme.sh --issue -d $domain --standalone -k ec-256 --server zerossl
+    [ $? -eq 0 ] && install_cert $domain || red "ZeroSSL 域名证书申请失败"
+    start_web
 }
 
-start_pre() {
-    if [ ! -f "$cfgfile" ]; then
-        eerror "Configuration file $cfgfile missing!"
+# ==========================================
+# 2. IP 证书申请 (ZeroSSL 公网 IP 模式)
+# ==========================================
+ip_issue(){
+    yellow "正在检索服务器公网 IPv4..."
+    local v4_ip=$(get_public_ip -4 || true)
+    
+    if [ -z "$v4_ip" ]; then
+        red "未检测到有效的公网 IPv4，请检查网络后再试。"
         return 1
     fi
+
+    echo "--------------------------------"
+    green "侦测到公网 IPv4: $v4_ip"
+    echo "--------------------------------"
+
+    yellow "即将通过 ZeroSSL 申请公网 IP 证书 ($v4_ip)..."
+    stop_web
     
-    touch "$logfile"
-    chown singbox-tuic:singbox-tuic "$logfile"
-    chmod 644 "$logfile"
-    
-    command_background="yes"
-    pidfile="/run/${RC_SVCNAME}.pid"
-    
-    output_log="$logfile"
-    error_log="$logfile"
-    
-    local port
-    port=$(jq -r '.inbounds[0].listen_port // 0' "$cfgfile" 2>/dev/null)
-    if [ "$port" -lt 1024 ] && [ "$port" -ne 0 ]; then
-        command_user="root:root"
+    $ACME_HOME/acme.sh --issue --standalone \
+        -d "$v4_ip" \
+        --keylength 2048 \
+        --server zerossl \
+        --force
+
+    if [ $? -eq 0 ]; then
+        install_cert "$v4_ip"
     else
-        command_user="singbox-tuic:singbox-tuic"
+        red "证书申请失败。请确保防火墙已放行 80 端口。"
     fi
-}
-EOF
-  chmod +x "$OPENRC_SERVICE_PATH"
-  rc-update add sing-box-tuic default >/dev/null 2>&1 || true
+    start_web
 }
 
-download_core() {
-  local arch url
-  arch=$(detect_arch)
-  get_latest_version
-  url=$(printf 'https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz' "$SINGBOX_VERSION" "$SINGBOX_VERSION" "$arch")
-  
-  info "正在下载官方核心 sing-box v$SINGBOX_VERSION..."
-  cd "$TMP_DIR"
-  if ! wget -O sing-box.tar.gz -q "$url"; then
-    curl -fsSL -o sing-box.tar.gz "$url" || { error "下载核心文件失败"; return 1; }
-  fi
-  
-  tar -xzf sing-box.tar.gz -C "$TMP_DIR"
-  local extracted
-  extracted=$(find "$TMP_DIR" -type f -name sing-box | head -n 1)
-  [[ -n "$extracted" ]] || { error "解压目标核心错误"; return 1; }
-  
-  rc-service sing-box-tuic stop >/dev/null 2>&1 || true
-  install -m 755 "$extracted" "$BINARY_PATH"
-  info "sing-box-tuic 核心释放完毕。"
-  return 0
-}
-
-install_tuic() {
-  echo -e "${GREEN}[信息] 开始在 Alpine 下部署专属隔离的 sing-box TUIC V5 ...${RESET}"
-  check_environment
-  mkdir -p "$CONFIG_DIR" "$TUIC_DIR"
-
-  if ! download_core; then return 1; fi
-
-  write_openrc_script
-
-  inst_cert || return 1
-  inst_port
-  
-  read -rp "设置 Tuic 验证 UUID (回车自动分配随机 UUID): " auth_uuid
-  auth_uuid=${auth_uuid:-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "12345678-1234-1234-1234-123456781234")}
-  
-  read -rp "设置 Tuic 验证密码 (回车自动分配随机密码): " auth_pwd
-  auth_pwd=${auth_pwd:-$(generate_random_password)}
-
-  write_and_show_config
-}
-
-update_tuic() {
-  if [[ ! -f "$BINARY_PATH" ]]; then
-    error "当前系统未检测到核心，无法执行覆盖升级。"
-    return 1
-  fi
-  info "检测到已有环境，正在执行纯净原地覆盖核心升级..."
-  if download_core; then
-    rc-service sing-box-tuic start
-    info "sing-box-tuic 核心纯净升级覆盖成功，服务已安全启动！"
-  else
-    error "核心升级遭遇未预期中断。"
-  fi
-}
-
-unsttuic() {
-  warn "即将执行全面清洁卸载..."
-  
-  clear_old_iptables
-  if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
-  if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
-
-  rc-service sing-box-tuic stop || true
-  rc-update del sing-box-tuic default >/dev/null 2>&1 || true
-  
-  rm -f "$BINARY_PATH" "$OPENRC_SERVICE_PATH" "$LOG_FILE"
-  rm -rf "$CONFIG_DIR" "$TUIC_DIR"
-  
-  info "专属服务、节点配置及防火墙跳跃链条已彻底卸载清理完毕！"
-}
-
-changeconf() {
-  if [[ ! -f "$TUIC_CONFIG" ]]; then
-    error "配置文件不存在，请先选择选项 1 安装"
-    return 1
-  fi
-
-  local old_uuid old_pwd old_cert old_key old_sni change_cert_flag
-  old_uuid=$(jq -r '.inbounds[0].users[0].uuid // empty' "$TUIC_CONFIG")
-  old_pwd=$(jq -r '.inbounds[0].users[0].password // empty' "$TUIC_CONFIG")
-  old_cert=$(jq -r '.inbounds[0].tls.certificate_path // empty' "$TUIC_CONFIG")
-  old_key=$(jq -r '.inbounds[0].tls.key_path // empty' "$TUIC_CONFIG")
-  old_sni=$(jq -r '.inbounds[0].tls.server_name // "www.bing.com"' "$TUIC_CONFIG")
-
-  clear
-  echo -e "${GREEN}====== 修改 sing-box Tuic 配置 ======${RESET}"
-  echo "提示：直接敲回车将保持原有配置不变"
-  echo "---------------------------------------------"
-  
-  inst_port 
-
-  read -rp "设置 Tuic 验证 UUID [当前: ${old_uuid}, 回车不修改]: " auth_uuid
-  auth_uuid=${auth_uuid:-$old_uuid}
-
-  read -rp "设置 Tuic 验证密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
-  auth_pwd=${auth_pwd:-$old_pwd}
-
-  echo "---------------------------------------------"
-  read -rp "是否需要修改证书？[y/N] (直接回车默认不修改): " change_cert_flag
-  if [[ "$change_cert_flag" == "y" || "$change_cert_flag" == "Y" ]]; then
-    inst_cert || return 1
-  else
-    cert_path="$old_cert"
-    key_path="$old_key"
-    tuic_domain="$old_sni"
-  fi
-
-  write_and_show_config
-  info "配置与转发链条刷新修改成功！"
-}
-
-showconf() {
-  if [[ ! -d "$TUIC_DIR" ]]; then
-    error "未找到分享配置文件。"
-    return
-  fi
-  echo -e "${GREEN}====== 节点分享与配置信息 ======${RESET}"
-  cat "$TUIC_DIR/url.txt"
-  echo
-}
-
-# =========================================================
-# 7. 面板交互菜单 
-# =========================================================
-menu() {
-  while true; do
-    clear
-    local raw_status status version port_show choice
-    raw_status=$(get_tuic_status)
-    if [[ "$raw_status" == "RUNNING" ]]; then
-      status="${GREEN}● 运行中${RESET}"
-    else
-      status="${RED}● 未运行${RESET}"
-    fi
-
-    version=$(get_installed_version)
-    port_show=$(get_current_port_display)
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       Sing-box Tuicv5 面板     ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} ${status}"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Sing-box Tuicv5${RESET}"
-    echo -e "${GREEN}2. 更新 Sing-box Tuicv5${RESET}"
-    echo -e "${GREEN}3. 卸载 Sing-box Tuicv5${RESET}"
-    echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 Sing-box Tuicv5${RESET}"
-    echo -e "${GREEN}6. 停止 Sing-box Tuicv5${RESET}"
-    echo -e "${GREEN}7. 重启 Sing-box Tuicv5${RESET}"
-    echo -e "${GREEN}8. 查看日志${RESET}"
-    echo -e "${GREEN}9. 查看节点配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-
-    choice=""
-    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
-    [[ -z "$choice" ]] && continue
-
-    case "$choice" in
-      1) install_tuic; pause ;;
-      2) update_tuic; pause ;;
-      3) unsttuic; pause ;; 
-      4) changeconf; pause ;;
-      5) rc-service sing-box-tuic start && info "服务已成功启动！"; pause ;;
-      6) rc-service sing-box-tuic stop && info "服务已成功停止！"; pause ;;
-      7) rc-service sing-box-tuic restart && info "服务已成功重启！"; pause ;;
-      8) if [[ -f "$LOG_FILE" ]]; then tail -n 50 "$LOG_FILE"; else warn "未发现运行日志文件。"; fi; pause ;;
-      9) showconf; pause ;;
-      0) exit 0 ;;
-      *) error "无效输入，请重新选择。"; sleep 1 ;;
+# ===============================
+# 3. DNS 模式申请证书
+# ===============================
+dns_issue(){
+    read -p "请输入域名 (example.com): " domain
+    [ -z "$domain" ] && red "域名不能为空" && return 1
+    echo "1.Cloudflare"
+    echo "2.DNSPod"
+    echo "3.Aliyun"
+    read -p "请选择: " type
+    case $type in
+        1)
+            read -p "CF_Key: " CF_Key
+            read -p "CF_Email: " CF_Email
+            export CF_Key CF_Email
+            $ACME_HOME/acme.sh --issue --dns dns_cf -d $domain -k ec-256 --server zerossl
+            ;;
+        2)
+            read -p "DP_Id: " DP_Id
+            read -p "DP_Key: " DP_Key
+            export DP_Id DP_Key
+            $ACME_HOME/acme.sh --issue --dns dns_dp -d $domain -k ec-256 --server zerossl
+            ;;
+        3)
+            read -p "Ali_Key: " Ali_Key
+            read -p "Ali_Secret: " Ali_Secret
+            export Ali_Key Ali_Secret
+            $ACME_HOME/acme.sh --issue --dns dns_ali -d $domain -k ec-256 --server zerossl
+            ;;
+        *)
+            red "无效选择"
+            return 1
+            ;;
     esac
-  done
+    [ $? -eq 0 ] && install_cert $domain || red "ZeroSSL 证书申请失败"
 }
 
-if [[ ${EUID} -ne 0 ]]; then
-  error "请切换至 root 用户运行此面板脚本。"
-  exit 1
-fi
+# ==========================================
+# 4. 强制续期全部本地证书
+# ==========================================
+renew_all(){
+    yellow "正在强制续期本地全部 ZeroSSL 证书..."
+    stop_web
+    
+    $ACME_HOME/acme.sh --renew-all --force
+    
+    if [ -d "$SSL_DIR" ]; then
+        for domain in $(ls $SSL_DIR); do
+            if $ACME_HOME/acme.sh --list | grep -q "$domain"; then
+                yellow "正在同步重新导出 [$domain] 的证书文件..."
+                $ACME_HOME/acme.sh --install-cert -d "$domain" \
+                    --key-file       $SSL_DIR/$domain/private.key \
+                    --fullchain-file $SSL_DIR/$domain/cert.crt >/dev/null
+            fi
+        done
+    fi
+    start_web
+    echo "----------------------------------------"
+    green "全部本地 ZeroSSL 证书已执行强制续期并完成同步！"
+    pause
+}
 
-menu "$@"
+# ==========================================
+# 5. 域名/IP 证书本地状态实时监控 (Alpine 兼容版)
+# ==========================================
+check_domains_status() {
+    clear
+    echo -e "${YELLOW}========================================${RESET}"
+    echo -e "${YELLOW}        ◈ 本地 ZeroSSL 证书状态实时监控 ◈            ${RESET}"
+    echo -e "${YELLOW}========================================${RESET}"
+
+    # Alpine 下使用 awk 安全提取域名列表
+    local domains_list=$($ACME_HOME/acme.sh --list | tail -n +2 | awk '{print $1}')
+    
+    if [ -z "$domains_list" ]; then
+        echo -e "${RED} ❌ 当前系统 acme.sh 未检测到任何已签发的本地证书。${RESET}"
+        echo -e "${YELLOW}----------------------------------------${RESET}"
+        pause
+        return
+    fi
+
+    for DOMAIN in $domains_list; do
+        [ -z "$DOMAIN" ] && continue
+        local CERT_PATH="$SSL_DIR/$DOMAIN/cert.crt"
+        local TYPE="ZeroSSL 本地管理 (域名/IP)"
+
+        echo -e "${YELLOW}◈ 域名/IP: ${RESET}${YELLOW}${DOMAIN}${RESET}"
+        echo -e "  ├─ ${YELLOW}证书类型: ${RESET}${TYPE}"
+
+        if [ -f "$CERT_PATH" ]; then
+            # 针对 Alpine BusyBox date 命令的局限性，改用 openssl 循环步进探测剩余天数
+            local days=0
+            while openssl x509 -checkend $((days * 86400)) -in "$CERT_PATH" >/dev/null 2>&1; do
+                days=$((days + 1))
+                if [ $days -gt 120 ]; then break; fi # 防止异常无限循环
+            done
+            local DAYS_LEFT=$((days - 1))
+            
+            # 提取原始到期时间文本显示
+            local END_DATE=$(openssl x509 -enddate -noout -in "$CERT_PATH" | cut -d= -f2)
+
+            if [ $DAYS_LEFT -ge 30 ]; then
+                STATUS_COLOR="${GREEN}"
+                STATUS_TEXT="正常有效"
+            elif [ $DAYS_LEFT -ge 0 ]; then
+                STATUS_COLOR="${YELLOW}"
+                STATUS_TEXT="即将过期 (请注意)"
+            else
+                STATUS_COLOR="${RED}"
+                STATUS_TEXT="已过期 (请立即更新)"
+            fi
+            
+            echo -e "  ├─ ${YELLOW}到期时间: ${RESET}$END_DATE"
+            echo -e "  ├─ ${YELLOW}剩余天数: ${RESET}${STATUS_COLOR}${DAYS_LEFT} 天${RESET}"
+            echo -e "  └─ ${YELLOW}运行状态: ${RESET}${STATUS_COLOR}${STATUS_TEXT}${RESET}"
+        else
+            echo -e "  └─ ${YELLOW}运行状态: ${RESET}${RED}未在 $SSL_DIR 中找到导出的证书文件${RESET}"
+        fi
+        echo -e "${YELLOW}----------------------------------------${RESET}"
+    done
+    pause
+}
+
+# ==========================================
+# 6. 删除本地证书
+# ==========================================
+remove_cert(){
+    local certs=$($ACME_HOME/acme.sh --list | tail -n +2 | awk '{print $1}')
+    if [ -z "$certs" ]; then
+        red "当前没有任何本地证书可删除"
+        pause
+        return 0
+    fi
+    
+    green "本地可删除的证书列表："
+    echo "编号    域名/IP"
+    echo "---------------------------"
+    
+    local i=1
+    for cert in $certs; do
+        printf "%-4s %s\n" "$i" "$cert"
+        eval cert_map_$i="$cert"
+        i=$((i+1))
+    done
+    local total_certs=$((i-1))
+    
+    read -p "请输入要删除的编号 (输入0返回): " num
+    [ "$num" == "0" ] && return 0
+    if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -lt 1 ] || [ "$num" -gt "$total_certs" ]; then
+        red "无效编号"
+        pause
+        return 0
+    fi
+    
+    local domain=$(eval echo \$cert_map_$num)
+    
+    $ACME_HOME/acme.sh --remove -d "$domain" --ecc >/dev/null 2>&1
+    $ACME_HOME/acme.sh --remove -d "$domain" >/dev/null 2>&1
+    
+    if [ -d "$SSL_DIR/$domain" ]; then
+        rm -rf "$SSL_DIR/$domain"
+    fi
+    
+    green "证书 [$domain] 已成功从本地及 acme.sh 中删除。"
+    pause
+}
+
+# ===============================
+# 7. 查看自动续期任务
+# ===============================
+show_cron(){
+    echo
+    green "当前 acme.sh 自动续期任务:"
+    crontab -l 2>/dev/null | grep acme.sh || yellow "未发现自动续期任务"
+    echo
+    pause
+}
+
+# ===============================
+# 9. 卸载 acme.sh
+# ===============================
+uninstall_acme(){
+    [ -f "$ACME_HOME/acme.sh" ] && "$ACME_HOME/acme.sh" --uninstall >/dev/null 2>&1
+    [ -d "$ACME_HOME" ] && rm -rf "$ACME_HOME"
+    [ -d "/etc/acme" ] && rm -rf "/etc/acme"
+    [ -d "$SSL_DIR" ] && rm -rf "$SSL_DIR"
+
+    crontab -l 2>/dev/null | grep -v acme.sh | crontab -
+    
+    [ -f "$HOME/.bashrc" ] && sed -i '/acme.sh.env/d' "$HOME/.bashrc"
+    [ -f "$HOME/.profile" ] && sed -i '/acme.sh.env/d' "$HOME/.profile"
+    
+    green "acme.sh 已彻底卸载"
+    pause
+}
+
+# ===============================
+# 主菜单循环
+# ===============================
+while true
+do
+    clear
+    get_system_status
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}      ACME 管理面板 (ZeroSSL)    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $STATUS"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}$VERSION_SHOW${RESET}"
+    echo -e "${GREEN}证书   :${RESET} ${YELLOW}$SITE_COUNT 个${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN} 1. 安装ACME${RESET}"
+    echo -e "${GREEN} 2. 申请域名证书(80端口模式)${RESET}"
+    echo -e "${GREEN} 3. 申请IP证书(IP模式)${RESET}"
+    echo -e "${GREEN} 4. 申请域名证书(DNSAPI模式)${RESET}"
+    echo -e "${GREEN} 5. 强制续期全部本地证书${RESET}"
+    echo -e "${GREEN} 6. 查看已申请证书${RESET}"
+    echo -e "${GREEN} 7. 删除指定本地证书${RESET}"
+    echo -e "${GREEN} 8. 查看定时自动续期任务${RESET}"
+    echo -e "${GREEN} 9. 更新ACME${RESET}"
+    echo -e "${GREEN}10. 卸载ACME${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${GREEN} 请选择: ${RESET}"
+    
+    read num
+    case $num in
+        1) install_dep; install_acme; pause;;
+        2) [ ! -f "$ACME_HOME/acme.sh" ] && install_dep && install_acme; standalone_issue;;
+        3) [ ! -f "$ACME_HOME/acme.sh" ] && install_dep && install_acme; ip_issue;;
+        4) [ ! -f "$ACME_HOME/acme.sh" ] && install_dep && install_acme; dns_issue;;
+        5) renew_all;;
+        6) check_domains_status;;
+        7) remove_cert;;
+        8) show_cron;;
+        9) update_acme; pause;;
+       10) uninstall_acme;;
+        0) exit;;
+        *) echo -e "${RED}无效选项${RESET}"; pause;;
+    esac
+done

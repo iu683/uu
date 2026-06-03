@@ -218,34 +218,44 @@ get_current_port_display() {
 # =========================================================
 # 5. 面板节点配置生成核心逻辑 (修复外部自定义证书赋权)
 # =========================================================
+# 修复外部自定义证书的穿透访问权限，确保非root运行的账户有权读取
 fix_external_cert_permission() {
   local cert="$1"
   local key="$2"
   
+  # 针对 /root 目录的致命硬拦截
   if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
     error "致命拒绝: 检测到您的证书位于 /root/ 目录下！"
-    warn "原因分析: /root 目录权限极为严苛(700)，任何非 root 用户(包括 singbox-tuic)均无权穿透。"
+    warn "原因分析: /root 目录权限极为严苛(700)，任何非root用户(包括 $RUN_USER)均无权穿透。"
     warn "         即使强行赋予文件 644 权限，内核也会因路径阻塞拒绝读取。"
-    info "权威推荐: 请在 acme.sh 脚本命令中加上安装指令，将证书自动导出到公共目录（如 /etc/ssl/ 或 /etc/certs/ 文件夹下）再试。"
+    info "权威推荐: 请在 acme.sh 命令中加上 --install-cert 指令，将证书自动分发到公共目录"
+    info "         (例如: /etc/sing-box-tuic/certs/ 或 /etc/ssl/ 文件夹下) 再试。"
     return 1
   fi
 
+  # 1. 自动提取并【逐级向上】放行外部证书的所有上级目录
   info "正在为外部证书路径逐级赋予检索穿透权限 (+x) ..."
-  local dir file
+  local dir
   for file in "$cert" "$key"; do
     dir=$(dirname "$file")
     while [[ "$dir" != "/" && -n "$dir" ]]; do
       chmod o+x "$dir" 2>/dev/null || true
-      if has_command setfacl; then
+      
+      # 3. 如果系统支持 ACL，精准安全地给 sing-box 账号加上特殊通行证
+      if command -v setfacl >/dev/null 2>&1; then
         setfacl -m u:"$RUN_USER":rx "$dir" 2>/dev/null || true
       fi
+      
       dir=$(dirname "$dir")
     done
   done
   
+  # 2. 确保证书和密钥文件本身可读（遵从要求：彻底开放 644 权限）
   info "正在规范化外部证书与私钥文件的读取权限 (644) ..."
-  chmod 644 "$cert" "$key" 2>/dev/null || true
-  if has_command setfacl; then
+  chmod 644 "$cert" 2>/dev/null || true
+  chmod 644 "$key" 2>/dev/null || true
+  
+  if command -v setfacl >/dev/null 2>&1; then
     setfacl -m u:"$RUN_USER":r "$cert" "$key" 2>/dev/null || true
   fi
   

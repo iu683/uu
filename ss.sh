@@ -1,410 +1,351 @@
-#!/bin/sh
-# 上面改成 Alpine 默认的 /bin/sh，同时内部语法保持兼容
-set -e
+#!/bin/bash
 
-# ===============================
-# 防火墙管理脚本（Alpine Linux 双栈 IPv4/IPv6）
-# ===============================
+# =========================================
+# 系统更新源切换菜单脚本（现代化面板版）
+# 支持 Ubuntu / Debian / CentOS / Alpine
+# =========================================
 
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+# 检查 Root 权限
+if [ "$EUID" -ne 0 ]; then
+    echo -e "\033[31m❌ 错误：请使用 root 权限或 sudo 运行此脚本！\033[0m"
+    exit 1
+fi
 
-# ===============================
-# 动态信息获取函数
-# ===============================
+# 颜色定义
+GREEN='\033[32m'
+YELLOW='\033[33m'
+RED='\033[31m'
+RESET='\033[0m'
 
-# 1. 获取 SSH 端口
-get_ssh_port() {
-    local port
-    if [ -f /etc/ssh/sshd_config ]; then
-        port=$(grep -E '^ *Port ' /etc/ssh/sshd_config | awk '{print $2}' | head -n 1)
-    fi
-    # 如果没匹配到，或者 Alpine 默认使用 Dropbear
-    [[ -z "$port" || ! "$port" =~ ^[0-9]+$ ]] && port=22
-    echo "$port"
-}
+# 获取系统信息
+if [ -f /etc/os-release ]; then
+    source /etc/os-release
+    OS_ID="${NAME} ${VERSION_ID}"
+else
+    OS_ID="Unknown Linux"
+    ID="unknown"
+fi
 
-# 2. 获取防火墙运行状态 (基于 OpenRC)
-get_firewall_status() {
-    local status4 status6
-    status4=$(rc-service iptables status 2>/dev/null | grep -E "started|status:.*started" || true)
-    status6=$(rc-service ip6tables status 2>/dev/null | grep -E "started|status:.*started" || true)
-
-    if [ -n "$status4" ] || [ -n "$status6" ]; then
-        # 检查是否开机自启
-        if rc-status default | grep -q "iptables" 2>/dev/null; then
-            echo -e "${YELLOW}● 已开启 (开机自启)${RESET}"
+# 获取系统 codename 或版本标识
+get_codename() {
+    if command -v lsb_release >/dev/null 2>&1; then
+        codename=$(lsb_release -cs)
+    elif [ -n "$VERSION_CODENAME" ]; then
+        codename=$VERSION_CODENAME
+    elif [ "$ID" = "alpine" ]; then
+        # Alpine 使用 v3.18, v3.19 这样的格式，如果是 edge 分支则为 edge
+        if [[ "$VERSION_ID" == *"_alpha"* || "$VERSION_ID" == *"_beta"* ]]; then
+            codename="edge"
         else
-            echo -e "${YELLOW}● 运行中 (未设自启)${RESET}"
+            codename="v${VERSION_ID%.*}" # 提取主版本号如 v3.19
         fi
+    elif [ -n "$VERSION_ID" ]; then
+        case "$ID" in
+            ubuntu)
+                case "$VERSION_ID" in
+                    "18.04") codename="bionic" ;;
+                    "20.04") codename="focal" ;;
+                    "22.04") codename="jammy" ;;
+                    "24.04") codename="noble" ;;
+                    *) codename="noble" ;;
+                esac
+                ;;
+            debian)
+                case "$VERSION_ID" in
+                    "10") codename="buster" ;;
+                    "11") codename="bullseye" ;;
+                    "12") codename="bookworm" ;;
+                    "13") codename="trixie" ;;
+                    *) codename="bookworm" ;;
+                esac
+                ;;
+            centos|rhel|rocky|almalinux)
+                codename="el${VERSION_ID%%.*}"
+                ;;
+        esac
     else
-        # 检查是否至少有规则在运行
-        if iptables -P INPUT 2>/dev/null | grep -q "DROP"; then
-            echo -e "${YELLOW}● 运行中 (服务未接管)${RESET}"
-        else
-            echo -e "${RED}○ 已关闭 (全放行)${RESET}"
-        fi
+        codename="stable"
     fi
 }
+get_codename
 
-# 3. 获取当前实际使用的防火墙后端内核
-get_firewall_type() {
-    if command -v iptables &>/dev/null; then
-        # 针对 Alpine 区分是 nftables 后端还是传统 legacy 后端
-        if iptables --version | grep -qi "nftables"; then
-            echo "iptables (nftables 后端)"
-        else
-            echo "iptables (legacy 后端)"
-        fi
-    else
-        echo "未安装"
-    fi
-}
+# 定义更新源
+aliyun_ubuntu_source="http://mirrors.aliyun.com/ubuntu/"
+official_ubuntu_source="http://archive.ubuntu.com/ubuntu/"
+tsinghua_ubuntu_source="https://mirrors.tuna.tsinghua.edu.cn/ubuntu/"
 
-# 4. 统计当前封禁的独立 IP 数量 (DROP/REJECT)
-get_banned_ip_count() {
-    local count4 count6 total
-    count4=$(iptables -L INPUT -n 2>/dev/null | grep -E "DROP|REJECT" | grep -v "tcp dport" | awk '{print $4}' | grep -v "0.0.0.0" | sort -u | wc -l)
-    count6=$(ip6tables -L INPUT -n 2>/dev/null | grep -E "DROP|REJECT" | grep -v "tcp dport" | awk '{print $4}' | grep -v "::" | sort -u | wc -l)
-    total=$((count4 + count6))
-    echo "$total"
-}
+aliyun_debian_source="http://mirrors.aliyun.com/debian/"
+official_debian_source="http://deb.debian.org/debian/"
+tsinghua_debian_source="https://mirrors.tuna.tsinghua.edu.cn/debian/"
 
-# ===============================
-# 防火墙核心逻辑函数 (Alpine OpenRC 适配)
-# ===============================
+aliyun_centos_source="mirrors.aliyun.com"
+official_centos_source="mirror.centos.org"
+tsinghua_centos_source="mirrors.tuna.tsinghua.edu.cn"
 
-save_rules() {
-    # Alpine 下保存规则的标准命令
-    /etc/init.d/iptables save >/dev/null 2>&1 || true
-    /etc/init.d/ip6tables save >/dev/null 2>&1 || true
-}
+aliyun_alpine_source="https://mirrors.aliyun.com/alpine/"
+official_alpine_source="https://dl-cdn.alpinelinux.org/alpine/"
+tsinghua_alpine_source="https://mirrors.tuna.tsinghua.edu.cn/alpine/"
 
-save_and_enable_autoload() {
-    save_rules
-    rc-update add iptables default >/dev/null 2>&1 || true
-    rc-update add ip6tables default >/dev/null 2>&1 || true
-    rc-service iptables start >/dev/null 2>&1 || true
-    rc-service ip6tables start >/dev/null 2>&1 || true
-    echo -e "${GREEN}✅ 规则已保存，并已通过 OpenRC 设置为开机自动加载${RESET}"
-    read -p "按回车继续..."
-}
-
-init_rules() {
-    local ssh_port
-    ssh_port=$(get_ssh_port)
-    for proto in iptables ip6tables; do
-        $proto -F
-        $proto -X
-        $proto -t nat -F 2>/dev/null || true
-        $proto -t nat -X 2>/dev/null || true
-        $proto -t mangle -F 2>/dev/null || true
-        $proto -t mangle -X 2>/dev/null || true
-        $proto -P INPUT DROP
-        $proto -P FORWARD DROP
-        $proto -P OUTPUT ACCEPT
-        $proto -A INPUT -i lo -j ACCEPT
-        $proto -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-        $proto -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
-        $proto -A INPUT -p tcp --dport 80 -j ACCEPT
-        $proto -A INPUT -p tcp --dport 443 -j ACCEPT
-    done
-    save_rules
-    # 确保服务开启
-    rc-service iptables start >/dev/null 2>&1 || true
-    rc-service ip6tables start >/dev/null 2>&1 || true
-}
-
-check_installed() {
-    # 检查 Alpine 是否安装了 iptables 核心及 OpenRC 脚本
-    [ -f /etc/init.d/iptables ] && [ -f /etc/init.d/ip6tables ]
-}
-
-install_firewall() {
-    echo -e "${YELLOW}正在为 Alpine Linux 安装防火墙组件...${RESET}"
-    apk update
-    # 清理可能存在的冲突组件并安装核心包
-    apk del ufw 2>/dev/null || true
-    apk add iptables ip6tables curl
-    
-    # 初始化默认规则
-    init_rules
-    
-    # 设置开机自启
-    rc-update add iptables default >/dev/null 2>&1 || true
-    rc-update add ip6tables default >/dev/null 2>&1 || true
-    
-    echo -e "${GREEN}✅ 防火墙安装完成，默认放行 SSH/80/443${RESET}"
-    echo -e "${GREEN}✅ 已通过 OpenRC 设置开机自动加载规则${RESET}"
-    read -p "按回车继续..."
-}
-
-clear_firewall() {
-    echo -e "${YELLOW}正在清空防火墙规则并放行所有流量...${RESET}"
-    for proto in iptables ip6tables; do
-        $proto -F
-        $proto -X
-        $proto -P INPUT ACCEPT
-        $proto -P FORWARD ACCEPT
-        $proto -P OUTPUT ACCEPT
-    done
-    save_rules
-    rc-update del iptables default >/dev/null 2>&1 || true
-    rc-update del ip6tables default >/dev/null 2>&1 || true
-    echo -e "${GREEN}✅ 防火墙规则已清空，所有流量已放行，开机自启已取消${RESET}"
-    read -p "按回车继续..."
-}
-
-restore_default_rules() {
-    echo -e "${YELLOW}正在恢复默认防火墙规则 (仅放行 SSH/80/443)...${RESET}"
-    local ssh_port
-    ssh_port=$(get_ssh_port)
-    echo -e "${GREEN}检测到 SSH 端口: $ssh_port${RESET}"
-    init_rules
-    echo -e "${GREEN}✅ 默认规则已恢复${RESET}"
-    read -p "按回车继续..."
-}
-
-open_all_ports() {
-    echo -e "${YELLOW}正在放行所有端口（IPv4/IPv6）...${RESET}"
-    for proto in iptables ip6tables; do
-        $proto -F
-        $proto -X
-        $proto -P INPUT ACCEPT
-        $proto -P FORWARD ACCEPT
-        $proto -P OUTPUT ACCEPT
-    done
-    save_rules
-    echo -e "${GREEN}✅ 所有端口已放行（全开放）${RESET}"
-    read -p "按回车继续..."
-}
-
-ip_action() {
-    local action=$1 ip=$2 proto
-    if [[ $ip =~ : ]]; then
-        proto="ip6tables"
-    else
-        proto="iptables"
-    fi
-
-    case $action in
-        accept) $proto -I INPUT -s "$ip" -j ACCEPT ;;
-        drop)   $proto -I INPUT -s "$ip" -j DROP ;;
-        delete)
-            while $proto -C INPUT -s "$ip" -j ACCEPT 2>/dev/null; do
-                $proto -D INPUT -s "$ip" -j ACCEPT
-            done
-            while $proto -C INPUT -s "$ip" -j DROP 2>/dev/null; do
-                $proto -D INPUT -s "$ip" -j DROP
-            done
+# 获取当前软件源状态
+get_current_source_status() {
+    case "$ID" in
+        ubuntu|debian)
+            # 兼容新版 Ubuntu 使用 sources.sources 格式
+            local file="/etc/apt/sources.list"
+            [ ! -f "$file" ] && [ -f /etc/apt/sources.list.d/ubuntu.sources ] && file="/etc/apt/sources.list.d/ubuntu.sources"
+            if [ -f "$file" ]; then
+                local main_url=$(grep -v '^#' "$file" | grep -E 'deb http|deb https|URIs: http' | head -n 1 | awk '{print $2}' | sed 's/URIs://')
+                [ -z "$main_url" ] && echo "未检测到有效源" || echo "$main_url" | sed -e 's|http://||' -e 's|https://||' -e 's|/.*||'
+            else
+                echo "未找到软件源配置文件"
+            fi
+            ;;
+        centos|rhel|rocky|almalinux)
+            if [ -f /etc/yum.repos.d/CentOS-Base.repo ]; then
+                local main_url=$(grep -v '^#' /etc/yum.repos.d/CentOS-Base.repo | grep -E 'baseurl=|mirrorlist=' | head -n 1 | cut -d= -f2)
+                [ -z "$main_url" ] && echo "未检测到有效源" || echo "$main_url" | sed -e 's|http://||' -e 's|https://||' -e 's|/.*||'
+            else
+                echo "CentOS-Base.repo 不存在"
+            fi
+            ;;
+        alpine)
+            if [ -f /etc/apk/repositories ]; then
+                local main_url=$(grep -v '^#' /etc/apk/repositories | head -n 1)
+                [ -z "$main_url" ] && echo "未检测到有效源" || echo "$main_url" | sed -e 's|http://||' -e 's|https://||' -e 's|/.*||'
+            else
+                echo "repositories 不存在"
+            fi
+            ;;
+        *)
+            echo "不支持的系统"
             ;;
     esac
 }
 
-ping_action() {
-    local action=$1
-    for proto in iptables ip6tables; do
-        case $action in
-            allow)
-                while $proto -C INPUT -p icmp -j DROP 2>/dev/null; do $proto -D INPUT -p icmp -j DROP; done
-                while $proto -C OUTPUT -p icmp -j DROP 2>/dev/null; do $proto -D OUTPUT -p icmp -j DROP; done
-                if [ "$proto" = "iptables" ]; then
-                    $proto -I INPUT -p icmp --icmp-type echo-request -j ACCEPT
-                    $proto -I OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT
-                else
-                    $proto -I INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT
-                    $proto -I OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT
-                fi
-                ;;
-            deny)
-                if [ "$proto" = "iptables" ]; then
-                    while $proto -C INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null; do $proto -D INPUT -p icmp --icmp-type echo-request -j ACCEPT; done
-                    while $proto -C OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT 2>/dev/null; do $proto -D OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT; done
-                    $proto -I INPUT -p icmp --icmp-type echo-request -j DROP
-                    $proto -I OUTPUT -p icmp --icmp-type echo-reply -j DROP
-                else
-                    while $proto -C INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT 2>/dev/null; do $proto -D INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT; done
-                    while $proto -C OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT 2>/dev/null; do $proto -D OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT; done
-                    $proto -I INPUT -p icmpv6 --icmpv6-type echo-request -j DROP
-                    $proto -I OUTPUT -p icmpv6 --icmpv6-type echo-reply -j DROP
-                fi
-                ;;
-        esac
-    done
+# 备份当前源
+backup_sources() {
+    case "$ID" in
+        ubuntu|debian)
+            [ -f /etc/apt/sources.list ] && cp /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null
+            [ -f /etc/apt/sources.list.d/ubuntu.sources ] && cp /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.bak 2>/dev/null
+            ;;
+        centos|rhel|rocky|almalinux)
+            mkdir -p /etc/yum.repos.d/bak 2>/dev/null
+            cp /etc/yum.repos.d/*.repo /etc/yum.repos.d/bak/ 2>/dev/null
+            ;;
+        alpine)
+            cp /etc/apk/repositories /etc/apk/repositories.bak 2>/dev/null
+            ;;
+    esac
+    echo -e "${GREEN}已备份当前更新源副本${RESET}"
 }
 
-uninstall_firewall() {
-    echo -e "${RED}⚠️ 警告：正在放行所有流量，并彻底卸载防火墙组件...${RESET}"
-    read -p "确认要卸载吗？(y/n): " confirm
-    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-        echo -e "${YELLOW}已取消卸载。${RESET}"
-        read -p "按回车继续..."
-        return
+# 还原初始源
+restore_sources() {
+    case "$ID" in
+        ubuntu|debian)
+            if [ -f /etc/apt/sources.list.bak ] || [ -f /etc/apt/sources.list.d/ubuntu.sources.bak ]; then
+                [ -f /etc/apt/sources.list.bak ] && cp /etc/apt/sources.list.bak /etc/apt/sources.list
+                [ -f /etc/apt/sources.list.d/ubuntu.sources.bak ] && cp /etc/apt/sources.list.d/ubuntu.sources.bak /etc/apt/sources.list.d/ubuntu.sources
+                echo -e "${GREEN}已还原初始更新源${RESET}"
+            else
+                echo -e "${RED}❌ 备份文件不存在，无法还原${RESET}"; return 1
+            fi
+            ;;
+        centos|rhel|rocky|almalinux)
+            if [ -d /etc/yum.repos.d/bak ]; then
+                cp /etc/yum.repos.d/bak/*.repo /etc/yum.repos.d/
+                echo -e "${GREEN}已还原初始更新源${RESET}"
+            else
+                echo -e "${RED}❌ 备份文件不存在，无法还原${RESET}"; return 1
+            fi
+            ;;
+        alpine)
+            if [ -f /etc/apk/repositories.bak ]; then
+                cp /etc/apk/repositories.bak /etc/apk/repositories
+                echo -e "${GREEN}已还原初始更新源${RESET}"
+            else
+                echo -e "${RED}❌ 备份文件不存在，无法还原${RESET}"; return 1
+            fi
+            ;;
+    esac
+}
+
+# 切换 Ubuntu/Debian 源
+switch_apt_source() {
+    local new_source="$1"
+    local source_name="$2"
+
+    # 清理可能干扰的新版 ubuntu.sources
+    [ -f /etc/apt/sources.list.d/ubuntu.sources ] && rm -f /etc/apt/sources.list.d/ubuntu.sources
+
+    if [ "$ID" = "debian" ]; then
+        # 优化安全性组件源的判断（Debian 11之后安全性路径变更）
+        local sec_url="http://security.debian.org/debian-security"
+        [[ "$new_source" == *"aliyun"* ]] && sec_url="http://mirrors.aliyun.com/debian-security"
+        [[ "$new_source" == *"tsinghua"* ]] && sec_url="https://mirrors.tuna.tsinghua.edu.cn/debian-security"
+
+        cat >/etc/apt/sources.list <<EOF
+deb ${new_source} ${codename} main contrib non-free non-free-firmware
+deb ${new_source} ${codename}-updates main contrib non-free non-free-firmware
+deb ${new_source} ${codename}-backports main contrib non-free non-free-firmware
+deb ${sec_url} ${codename}-security main contrib non-free non-free-firmware
+EOF
+    elif [ "$ID" = "ubuntu" ]; then
+        cat >/etc/apt/sources.list <<EOF
+deb ${new_source} ${codename} main restricted universe multiverse
+deb ${new_source} ${codename}-updates main restricted universe multiverse
+deb ${new_source} ${codename}-backports main restricted universe multiverse
+deb ${new_source} ${codename}-security main restricted universe multiverse
+EOF
     fi
-
-    # 1. 全放行流量
-    for proto in iptables ip6tables; do
-        if command -v $proto &>/dev/null; then
-            $proto -F 2>/dev/null || true
-            $proto -X 2>/dev/null || true
-            $proto -P INPUT ACCEPT 2>/dev/null || true
-            $proto -P FORWARD ACCEPT 2>/dev/null || true
-            $proto -P OUTPUT ACCEPT 2>/dev/null || true
-        fi
-    done
-
-    # 2. 从开机自启中移除服务并停止服务
-    rc-service iptables stop >/dev/null 2>&1 || true
-    rc-service ip6tables stop >/dev/null 2>&1 || true
-    rc-update del iptables default >/dev/null 2>&1 || true
-    rc-update del ip6tables default >/dev/null 2>&1 || true
-
-    # 3. 删除保存的规则文件
-    rm -rf /etc/iptables/* 2>/dev/null || true
-
-    # 4. 用 apk 移除相关软件包
-    apk del iptables ip6tables 2>/dev/null || true
-
-    echo -e "${GREEN}✅ 防火墙已成功完全卸载，当前网络流量已全部放行！${RESET}"
-    read -p "按回车退出..."
-    exit 0
-}
-# ===============================
-# 全新风格管理菜单
-# ===============================
-menu() {
-    while true; do
-        STATUS=$(get_firewall_status)
-        FIREWALL_TYPE=$(get_firewall_type)
-        PORT_SHOW=$(get_ssh_port)
-        SITE_COUNT=$(get_banned_ip_count)
-
-        clear
-        echo -e "${GREEN}===============================${RESET}"
-        echo -e "${GREEN}   ◈   双栈防火墙管理面板  ◈   ${RESET}"
-        echo -e "${GREEN}===============================${RESET}"
-        echo -e "${GREEN} 状态  : ${STATUS}"
-        echo -e "${GREEN} 内核  : ${YELLOW}${FIREWALL_TYPE}${RESET}"
-        echo -e "${GREEN} 端口  : ${YELLOW}${PORT_SHOW}${RESET}"
-        echo -e "${GREEN} 规则  : ${YELLOW}${SITE_COUNT} 个 IP${RESET}"
-        echo -e "${GREEN}===============================${RESET}"
-        echo -e "${GREEN}  1. 开放指定端口 (TCP/UDP)${RESET}"
-        echo -e "${GREEN}  2. 关闭指定端口 (TCP/UDP)${RESET}"
-        echo -e "${GREEN}  3. 开放所有端口 (全放行)${RESET}"
-        echo -e "${GREEN}  4. 恢复默认安全规则 (放行SSH/80/443)${RESET}"
-        echo -e "${GREEN}  5. 添加 IP 白名单 (放行)${RESET}"
-        echo -e "${GREEN}  6. 添加 IP 黑名单 (封禁)${RESET}"
-        echo -e "${GREEN}  7. 删除指定 IP 规则${RESET}"
-        echo -e "${GREEN}  8. 允许 PING (ICMP)${RESET}"
-        echo -e "${GREEN}  9. 禁用 PING (ICMP)${RESET}"
-        echo -e "${GREEN} 10. 查看当前防火墙详细规则${RESET}"
-        echo -e "${GREEN} 11. 保存规则并设置开机自启${RESET}"
-        echo -e "${GREEN} 12. 卸载防火墙${RESET}"
-        echo -e "${GREEN}  0. 退出${RESET}"
-        echo -e "${GREEN}===============================${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
-        read -r choice
-
-        case $choice in
-            1)
-                read -p "请输入要开放的端口号: " PORT
-                if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
-                    echo -e "${RED}❌ 错误：请输入 1-65535 之间的有效端口号${RESET}"
-                    read -p "按回车返回菜单..."
-                    continue
-                fi
-                for proto in iptables ip6tables; do
-                    while $proto -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null; do $proto -D INPUT -p tcp --dport "$PORT" -j DROP; done
-                    while $proto -C INPUT -p udp --dport "$PORT" -j DROP 2>/dev/null; do $proto -D INPUT -p udp --dport "$PORT" -j DROP; done
-                    $proto -I INPUT -p tcp --dport "$PORT" -j ACCEPT
-                    $proto -I INPUT -p udp --dport "$PORT" -j ACCEPT
-                done
-                save_rules
-                echo -e "${GREEN}✅ 已开放端口 $PORT${RESET}"
-                read -p "按回车继续..."
-                ;;
-            2)
-                read -p "请输入要关闭的端口号: " PORT
-                if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
-                    echo -e "${RED}❌ 错误：请输入 1-65535 之间的有效端口号${RESET}"
-                    read -p "按回车返回菜单..."
-                    continue
-                fi
-                for proto in iptables ip6tables; do
-                    while $proto -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; do $proto -D INPUT -p tcp --dport "$PORT" -j ACCEPT; done
-                    while $proto -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; do $proto -D INPUT -p udp --dport "$PORT" -j ACCEPT; done
-                    $proto -I INPUT -p tcp --dport "$PORT" -j DROP
-                    $proto -I INPUT -p udp --dport "$PORT" -j DROP
-                done
-                save_rules
-                echo -e "${GREEN}✅ 已关闭端口 $PORT${RESET}"
-                read -p "按回车继续..."
-                ;;
-            3) open_all_ports ;;
-            4) restore_default_rules ;;
-            5)
-                read -p "请输入要放行的IP: " IP
-                ip_action accept "$IP"
-                save_rules
-                echo -e "${GREEN}✅ IP $IP 已放行${RESET}"
-                read -p "按回车继续..."
-                ;;
-            6)
-                read -p "请输入要封禁的IP: " IP
-                ip_action drop "$IP"
-                save_rules
-                echo -e "${GREEN}✅ IP $IP 已封禁${RESET}"
-                read -p "按回车继续..."
-                ;;
-            7)
-                read -p "请输入要删除的IP: " IP
-                ip_action delete "$IP"
-                save_rules
-                echo -e "${GREEN}✅ IP $IP 规则已删除${RESET}"
-                read -p "按回车继续..."
-                ;;
-            8)
-                ping_action allow
-                save_rules
-                echo -e "${GREEN}✅ 已允许 PING（ICMP）${RESET}"
-                read -p "按回车继续..."
-                ;;
-            9)
-                ping_action deny
-                save_rules
-                echo -e "${GREEN}✅ 已禁用 PING（ICMP）${RESET}"
-                read -p "按回车继续..."
-                ;;
-            10)
-                clear
-                echo -e "${YELLOW}当前防火墙状态:${RESET}"
-                echo "--- iptables IPv4 ---"
-                iptables -L -n -v --line-numbers
-                echo -e "\n--- ip6tables IPv6 ---"
-                ip6tables -L -n -v --line-numbers
-                read -r -p "按回车返回菜单..." || true
-                ;;
-            11) save_and_enable_autoload ;;
-            12) uninstall_firewall ;;
-            0) clear; break ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
+    echo -e "${GREEN}✅ 已切换到 ${source_name} 源（${codename}）${RESET}"
 }
 
-# ===============================
-# 脚本入口
-# ===============================
-# 检查 root 权限
-if [ "$(id -u)" -ne 0 ]; then
-   echo -e "${RED}❌ 错误: 请使用 root 权限运行此脚本！${RESET}"
-   exit 1
-fi
+# 切换 CentOS 源（修复原脚本直接替换 baseurl 导致的格式损坏）
+switch_yum_source() {
+    local new_source="$1"
+    local source_name="$2"
+    
+    # 兼容 CentOS 7/8 及其衍生版全面切换
+    sed -i 's|^mirrorlist=|#mirrorlist=|g' /etc/yum.repos.d/CentOS-*.repo 2>/dev/null
+    sed -i 's|^#baseurl=|baseurl=|g' /etc/yum.repos.d/CentOS-*.repo 2>/dev/null
+    sed -i "s|mirror.centos.org|$new_source|g" /etc/yum.repos.d/CentOS-*.repo 2>/dev/null
+    sed -i "s|mirrors.aliyun.com|$new_source|g" /etc/yum.repos.d/CentOS-*.repo 2>/dev/null
+    sed -i "s|mirrors.tuna.tsinghua.edu.cn|$new_source|g" /etc/yum.repos.d/CentOS-*.repo 2>/dev/null
+    
+    echo -e "${GREEN}✅ 已切换到 ${source_name} YUM 源${RESET}"
+}
 
-if ! check_installed; then
-    install_firewall
-fi
+# 切换 Alpine 源
+switch_alpine_source() {
+    local new_source="$1"
+    local source_name="$2"
+    
+    cat > /etc/apk/repositories <<EOF
+${new_source}${codename}/main
+${new_source}${codename}/community
+EOF
+    echo -e "${GREEN}✅ 已切换到 ${source_name} Alpine 源（${codename}）${RESET}"
+}
 
-menu
+# 更新缓存
+update_cache() {
+    case "$ID" in
+        ubuntu|debian)
+            echo -e "${YELLOW}正在更新 apt 缓存...${RESET}"
+            apt-get update -y >/dev/null
+            ;;
+        centos|rhel|rocky|almalinux)
+            echo -e "${YELLOW}正在生成 yum 缓存...${RESET}"
+            yum clean all >/dev/null
+            yum makecache -y >/dev/null
+            ;;
+        alpine)
+            echo -e "${YELLOW}正在更新 apk 缓存...${RESET}"
+            apk update --no-cache >/dev/null
+            ;;
+    esac
+    echo -e "${GREEN}更新完成${RESET}"
+}
+
+# 暂停函数
+pause() {
+    read -rp "$(echo -e "${YELLOW}按回车键继续...${RESET}")"
+}
+
+# 显示国内/国外推荐源列表
+show_recommended_sources() {
+    clear
+    echo -e "${GREEN}正在获取国内推荐源列表...${RESET}"
+    if command -v curl >/dev/null 2>&1; then
+        bash <(curl -sSL https://linuxmirrors.cn/main.sh)
+    elif command -v wget >/dev/null 2>&1; then
+        bash <(wget -qO- https://linuxmirrors.cn/main.sh)
+    else
+        echo -e "${RED}未检测到 curl 或 wget 命令，Alpine 系统请先运行: apk add curl${RESET}"
+    fi
+    pause
+}
+
+# 主菜单展示
+show_menu() {
+    clear
+    STATUS=$(get_current_source_status)
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}     ◈  Linux 系统更新源管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN} 系统环境  : ${YELLOW}${OS_ID}${RESET}"
+    echo -e "${GREEN} 当前源状态: ${YELLOW}${STATUS}${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}  1. 切换到 阿里云源 (国内推荐)${RESET}"
+    echo -e "${GREEN}  2. 切换到 官方原生源 (海外推荐)${RESET}"
+    echo -e "${GREEN}  3. 切换到 清华大学源 (高校教育网)${RESET}"
+    echo -e "${GREEN}  4. 备份当前源文件副本${RESET}"
+    echo -e "${GREEN}  5. 还原初始更新源 (并自动刷新缓存)${RESET}"
+    echo -e "${GREEN}  6. 国内/国外推荐源列表${RESET}"
+    echo -e "${GREEN}  0. 退出${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -ne "${GREEN} 请输入操作编号: ${RESET}"
+}
+
+# 主循环
+while true; do
+    show_menu
+    read choice
+    case "$choice" in
+        1)
+            backup_sources
+            case "$ID" in
+                ubuntu) switch_apt_source "$aliyun_ubuntu_source" "阿里云" ;;
+                debian) switch_apt_source "$aliyun_debian_source" "阿里云" ;;
+                centos|rhel|rocky|almalinux) switch_yum_source "$aliyun_centos_source" "阿里云" ;;
+                alpine) switch_alpine_source "$aliyun_alpine_source" "阿里云" ;;
+            esac
+            update_cache
+            pause
+            ;;
+        2)
+            backup_sources
+            case "$ID" in
+                ubuntu) switch_apt_source "$official_ubuntu_source" "官方" ;;
+                debian) switch_apt_source "$official_debian_source" "官方" ;;
+                centos|rhel|rocky|almalinux) switch_yum_source "$official_centos_source" "官方" ;;
+                alpine) switch_alpine_source "$official_alpine_source" "官方" ;;
+            esac
+            update_cache
+            pause
+            ;;
+        3)
+            backup_sources
+            case "$ID" in
+                ubuntu) switch_apt_source "$tsinghua_ubuntu_source" "清华" ;;
+                debian) switch_apt_source "$tsinghua_debian_source" "清华" ;;
+                centos|rhel|rocky|almalinux) switch_yum_source "$tsinghua_centos_source" "清华" ;;
+                alpine) switch_alpine_source "$tsinghua_alpine_source" "清华" ;;
+            esac
+            update_cache
+            pause
+            ;;
+        4)
+            backup_sources
+            pause
+            ;;
+        5)
+            if restore_sources; then
+                update_cache
+            fi
+            pause
+            ;;
+        6)
+            show_recommended_sources
+            ;;
+        0)
+            break
+            ;;
+        *)
+            echo -e "${RED}无效选择，请重新输入${RESET}"
+            sleep 1
+            ;;
+    esac
+done

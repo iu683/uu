@@ -1,291 +1,148 @@
 #!/bin/bash
-# =========================================================
-# 服务器定时自动化清理工具（全面适配 Alpine / Ubuntu / Debian）
-# =========================================================
+# =========================================================================
+# 字体与语言环境智能管理面板（多系统自动适配）
+# =========================================================================
+
+# 严格的 Root 权限检查
+if [ "$EUID" -ne 0 ]; then
+    echo -e "\033[31m❌ 错误：请使用 root 权限（或通过 sudo）运行此脚本！\033[0m"
+    exit 1
+fi
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-SCRIPT_PATH="/usr/local/bin/clean-server"
-SCRIPT_URL="bash <(curl -sL https://raw.githubusercontent.com/iu683/uu/main/zz.sh)"
-CONFIG_FILE="/etc/clean-server.conf"
-
-# 加载 TG 配置
-[ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
-
-# =========================================================
-# 动态获取系统与定时器状态
-# =========================================================
-get_system_status() {
-    # 1. 检查 TG 状态
-    if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
-        TG_STATUS="${GREEN}已配置 (🔔)${RESET}"
+# 自动精确识别发行版
+get_os_type() {
+    if [ -f /etc/alpine-release ]; then
+        echo "Alpine"
+    elif [ -f /etc/os-release ]; then
+        . /etc/os-release
+        case "$ID" in
+            ubuntu) echo "Ubuntu" ;;
+            debian) echo "Debian" ;;
+            centos|rhel|rocky|almalinux) echo "RedHat" ;;
+            *) echo "Linux" ;;
+        esac
     else
-        TG_STATUS="未配置"
-    fi
-
-    # 2. 检查定时任务状态 (支持 Alpine BusyBox crontab)
-    if crontab -l 2>/dev/null | grep -q "$SCRIPT_PATH --auto"; then
-        CRON_STATUS="${GREEN}已开启 (⏰)${RESET}"
-    else
-        CRON_STATUS="已关闭"
-    fi
-
-    # 3. 检查 Alpine 环境下 crond 服务是否运行
-    if command -v rc-service >/dev/null 2>&1; then
-        if rc-service crond status 2>/dev/null | grep -q "started"; then
-            CRON_SERVICE="${GREEN}正常运行${RESET}"
-        else
-            CRON_SERVICE="${RED}已停止 (需要开启服务定时任务才有效)${RESET}"
-        fi
-    else
-        CRON_SERVICE="${GREEN}正常 (systemd控制)${RESET}"
+        echo "Linux"
     fi
 }
 
-# =========================================================
-# Telegram 通知模块
-# =========================================================
-send_tg() {
-    [ -z "$TG_BOT_TOKEN" ] && return
-    [ -z "$TG_CHAT_ID" ] && return
-    SERVER_NAME=${SERVER_NAME:-$(hostname)}
-    MESSAGE="$1"
-    curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
-        -d chat_id="$TG_CHAT_ID" \
-        -d text="[$SERVER_NAME] $MESSAGE" >/dev/null
+OS=$(get_os_type)
+
+# 动态获取当前系统的语言状态
+get_current_locale() {
+    echo "${LANG:-未设置}"
 }
 
-set_telegram() {
-    echo -e "${GREEN}=== Telegram 通知配置 ===${RESET}"
-    read -p "请输入 Telegram Bot Token: " TG_BOT_TOKEN
-    read -p "请输入 Telegram Chat ID: " TG_CHAT_ID
-    read -p "请输入服务器名称 (留空使用本机的 hostname): " SERVER_NAME
-    [ -z "$SERVER_NAME" ] && SERVER_NAME=$(hostname)
+# 核心语言环境应用函数
+apply_locale() {
+    local target_lang=$1
     
-    cat > "$CONFIG_FILE" <<EOF
-TG_BOT_TOKEN="$TG_BOT_TOKEN"
-TG_CHAT_ID="$TG_CHAT_ID"
-SERVER_NAME="$SERVER_NAME"
-EOF
-    echo -e "${GREEN}配置已成功保存！${RESET}"
-}
-
-# =========================================================
-# 核心清理模块 (针对 Alpine 健壮性优化)
-# =========================================================
-clean_logs() {
-    echo -e "${YELLOW}正在清理系统历史日志 /var/log...${RESET}"
-    find /var/log -type f -name "*.log" -mtime +7 -delete 2>/dev/null
-    find /var/log -type f -name "*.log" -exec truncate -s 0 {} \; 2>/dev/null
-}
-
-clean_journal() {
-    if command -v journalctl >/dev/null 2>&1; then
-        echo -e "${YELLOW}正在清理 systemd 日志...${RESET}"
-        journalctl --vacuum-time=7d >/dev/null 2>&1
-    else
-        echo -e "${YELLOW}系统没有检测到 journalctl，跳过该项${RESET}"
-    fi
-}
-
-clean_docker() {
-    if ! command -v docker >/dev/null 2>&1; then
-        echo -e "${YELLOW}未检测到 Docker 环境，跳过清理${RESET}"
-        return
-    fi
-
-    echo -e "${YELLOW}正在安全截断 Docker 容器日志...${RESET}"
-    find /var/lib/docker/containers/ -name "*-json.log" -size +50M -exec truncate -s 0 {} \; 2>/dev/null
-
-    echo -e "${YELLOW}正在清理未使用的无用镜像与资源...${RESET}"
-    docker system prune -af --volumes >/dev/null 2>&1
-    echo -e "${GREEN}Docker 清理完成！${RESET}"
-}
-
-clean_tmp() {
-    echo -e "${YELLOW}正在清理 /tmp 历史临时文件...${RESET}"
-    find /tmp -type f -mtime +3 -delete 2>/dev/null
-}
-
-clean_cache() {
-    echo -e "${YELLOW}正在清理系统包管理器缓存...${RESET}"
-    if command -v apt >/dev/null 2>&1; then
-        apt clean
-    elif command -v apk >/dev/null 2>&1; then
-        apk cache clean >/dev/null 2>&1
-        rm -rf /var/cache/apk/*
-    fi
-}
-
-run_all() {
-    echo -e "${GREEN}>>> 开始执行服务器全面清理任务...${RESET}"
-    clean_logs
-    clean_journal
-    clean_docker
-    clean_tmp
-    clean_cache
-    echo -e "${GREEN}>>> 服务器一键清理完成！${RESET}"
-    send_tg "✅服务器自动化清理任务已顺利完成"
-}
-
-# =========================================================
-# 定时任务管理模块 (适配 Alpine BusyBox)
-# =========================================================
-enable_cron() {
-    echo -e "${GREEN}=== 设置定时自动清理频率 ===${RESET}"
-    echo -e "${GREEN} 1) 每天凌晨 1:00${RESET}"
-    echo -e "${GREEN} 2) 每周一凌晨 1:00${RESET}"
-    echo -e "${GREEN} 3) 每月1号凌晨 1:00${RESET}"
-    echo -e "${GREEN} 4) 每 6 小时清理一次${RESET}"
-    echo -e "${GREEN} 5) 自定义 Cron 表达式${RESET}"
-    read -p " 请选择频率: " c
-
-    # 先导出当前的 crontab (过滤掉已有清理任务)
-    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --auto" > /tmp/cron.tmp || true
-
-    case $c in
-        1) echo "0 1 * * * $SCRIPT_PATH --auto" >> /tmp/cron.tmp ;;
-        2) echo "0 1 * * 1 $SCRIPT_PATH --auto" >> /tmp/cron.tmp ;;
-        3) echo "0 1 1 * * $SCRIPT_PATH --auto" >> /tmp/cron.tmp ;;
-        4) echo "0 */6 * * * $SCRIPT_PATH --auto" >> /tmp/cron.tmp ;;
-        5)
-            echo -e "${YELLOW}提示: 分 时 日 月 周 (例如每30分钟: */30 * * * *)${RESET}"
-            read -p "请输入完整 cron 表达式: " CRON_EXP
-            if [ -n "$CRON_EXP" ]; then
-                echo "$CRON_EXP $SCRIPT_PATH --auto" >> /tmp/cron.tmp
+    case "$OS" in
+        Ubuntu|Debian)
+            echo -e "${YELLOW}🔧 正在更新 apt 缓存并安装必要字体与语言包...${RESET}"
+            apt-get update -y >/dev/null 2>&1
+            apt-get install -y locales >/dev/null 2>&1
+            
+            if [ "$target_lang" = "zh_CN.UTF-8" ]; then
+                apt-get install -y fonts-wqy-microhei fonts-wqy-zenhei >/dev/null 2>&1
             else
-                echo -e "${RED}输入为空，取消操作${RESET}"
-                rm -f /tmp/cron.tmp
-                return
+                apt-get install -y fonts-dejavu fonts-liberation >/dev/null 2>&1
             fi
+
+            # 配置并生成 Locale（移除 set -e 规避 sed 报错引发挂科）
+            echo -e "${YELLOW}🔄 正在生成语言环境: $target_lang...${RESET}"
+            if [ -f /etc/locale.gen ]; then
+                # 先取消注释，如果不存在则追加
+                sed -i "s/^#\?\s*\($target_lang UTF-8\)/\1/" /etc/locale.gen 2>/dev/null
+                if ! grep -q "$target_lang UTF-8" /etc/locale.gen; then
+                    echo "$target_lang UTF-8" >> /etc/locale.gen
+                fi
+            fi
+            locale-gen "$target_lang" >/dev/null 2>&1
+            
+            # 强制锁入环境配置
+            if command -v update-locale >/dev/null 2>&1; then
+                update-locale LANG="$target_lang" LC_ALL="$target_lang" >/dev/null 2>&1
+            fi
+            echo "LANG=$target_lang" > /etc/default/locale
+            echo "LC_ALL=$target_lang" >> /etc/default/locale
             ;;
+            
+        Alpine)
+            echo -e "${YELLOW}🔧 正在通过 apk 补全 Alpine 字体与 musl 本地化组件...${RESET}"
+            # 关键补丁：Alpine 必须安装 musl-locales 才能真正支持 zh_CN 等非英语言环境
+            apk add --no-cache musl-locales musl-locales-lang >/dev/null 2>&1
+            
+            if [ "$target_lang" = "zh_CN.UTF-8" ]; then
+                # 从官方 testing 仓库拉取文泉驿中文字体
+                apk add --no-cache ttf-dejavu font-wqy-zenhei --repository http://dl-cdn.alpinelinux.org/alpine/edge/testing >/dev/null 2>&1
+            else
+                apk add --no-cache ttf-dejavu >/dev/null 2>&1
+            fi
+            
+            # Alpine 的环境变量持久化机制
+            echo -e "${YELLOW}🔄 正在写入系统全局环境变量...${RESET}"
+            mkdir -p /etc/profile.d
+            echo "export LANG=$target_lang" > /etc/profile.d/locale.sh
+            echo "export LC_ALL=$target_lang" >> /etc/profile.d/locale.sh
+            chmod +x /etc/profile.d/locale.sh
+            ;;
+            
         *)
-            echo -e "${RED}无效选项，操作取消${RESET}"
-            rm -f /tmp/cron.tmp
-            return
+            echo -e "${RED}⚠️ 当前系统 [${OS}] 未做深度定制，尝试通用变量写入...${RESET}"
             ;;
     esac
 
-    # 导入回 crontab 并兼容 BusyBox
-    crontab /tmp/cron.tmp
-    rm -f /tmp/cron.tmp
+    # 立即污染并刷新当前临时 Shell 生效
+    export LANG="$target_lang"
+    export LC_ALL="$target_lang"
+}
+
+# 主循环面板
+while true; do
+    clear
+    CURRENT_LANG=$(get_current_locale)
     
-    # 在 Alpine 下尝试自动启动 crond 服务
-    if command -v rc-service >/dev/null 2>&1; then
-        rc-service crond start >/dev/null 2>&1 || true
-        rc-update add crond default >/dev/null 2>&1 || true
-    fi
-    echo -e "${GREEN}自动清理定时任务已成功激活！${RESET}"
-}
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}       ◈ 字体与语言环境管理面板 ◈      ${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN} 检测到系统 : ${YELLOW}${OS}${RESET}"
+    echo -e "${GREEN} 当前语言包 : ${YELLOW}${CURRENT_LANG}${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN}  1. 切换为【中文环境】${RESET}"
+    echo -e "${GREEN}  2. 切换为【英文环境】${RESET}"
+    echo -e "${GREEN}  0. 退出${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    
+    echo -ne "${GREEN} 请选择操作编号: ${RESET}"
+    read choice
 
-disable_cron() {
-    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --auto" > /tmp/cron.tmp || true
-    crontab /tmp/cron.tmp
-    rm -f /tmp/cron.tmp
-    echo -e "${YELLOW}自动清理定时任务已关闭${RESET}"
-}
-
-# =========================================================
-# 脚本自身的安装/更新与卸载
-# =========================================================
-install_script() {
-    if [ ! -f "$SCRIPT_PATH" ]; then
-        # 创建本地目录
-        mkdir -p "$(dirname "$SCRIPT_PATH")"
-        if [ -f "$0" ] && [[ "$0" != *"bash"* ]]; then
-            cp "$0" "$SCRIPT_PATH"
-        else
-            curl -sL "$SCRIPT_URL" -o "$SCRIPT_PATH"
-        fi
-        chmod +x "$SCRIPT_PATH"
-        sleep 2
-    fi
-}
-
-update_script() {
-    echo -e "${YELLOW}正在从远程获取最新版本...${RESET}"
-    curl -sL "$SCRIPT_URL" -o "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
-    echo -e "${GREEN}脚本升级更新完成！${RESET}"
-}
-
-uninstall_script() {
-    echo -e "${RED}正在清理并准备卸载...${RESET}"
-    disable_cron
-    rm -f "$SCRIPT_PATH"
-    rm -f "$CONFIG_FILE"
-    echo -e "${GREEN}卸载已全部完成${RESET}"
-    exit 0
-}
-
-# =========================================================
-# 自动化静默执行入口 (由 Cron 触发)
-# =========================================================
-if [ "$1" = "--auto" ]; then
-    run_all
-    exit 0
-fi
-
-# 预安装拦截
-install_script
-
-# =========================================================
-# 主视觉面板菜单逻辑
-# =========================================================
-auto_clean_menu() {
-    while true; do
-        # 刷新当前状态
-        get_system_status
-
-        clear
-        echo -e "${GREEN}=======================================${RESET}"
-        echo -e "${GREEN}     ◈   服务器自动化清理面板   ◈      ${RESET}"
-        echo -e "${GREEN}=======================================${RESET}"
-        echo -e "${GREEN} 定时清理状态 : ${CRON_STATUS}"
-        echo -e "${GREEN} Cron服务监控 : ${CRON_SERVICE}"
-        echo -e "${GREEN} TG 通知状态  : ${TG_STATUS}"
-        echo -e "${GREEN}=======================================${RESET}"
-        echo -e "${GREEN}  1. 仅清理系统日志 (/var/log)${RESET}"
-        echo -e "${GREEN}  2. 仅清理 systemd 运行时日志${RESET}"
-        echo -e "${GREEN}  3. 仅清理 Docker (资源与容器日志)${RESET}"
-        echo -e "${GREEN}  4. 仅清理 /tmp 历史临时文件${RESET}"
-        echo -e "${GREEN}  5. 仅清理系统包管理器缓存${RESET}"
-        echo -e "${GREEN} ------------------------------------- ${RESET}"
-        echo -e "${GREEN}  6. 一键手动全面清理${RESET}"
-        echo -e "${GREEN}  7. 开启/修改 定时自动清理任务${RESET}"
-        echo -e "${GREEN}  8. 关闭定时自动清理任务${RESET}"
-        echo -e "${GREEN}  9. 设置/调整 Telegram 消息通知${RESET}"
-        echo -e "${GREEN} 10. 更新脚本${RESET}"
-        echo -e "${GREEN} 11. 卸载脚本${RESET}"
-        echo -e "${GREEN}  0. 退出面板${RESET}"
-        echo -e "${GREEN}=======================================${RESET}"
-        echo -ne "${GREEN} 请选择操作: ${RESET}"
-        
-        read -r choice
-
-        case $choice in
-            1) clean_logs ;;
-            2) clean_journal ;;
-            3) clean_docker ;;
-            4) clean_tmp ;;
-            5) clean_cache ;;
-            6) run_all ;;
-            7) enable_cron ;;
-            8) disable_cron ;;
-            9) set_telegram ;;
-            10) update_script ;;
-            11) uninstall_script ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择，请重新输入...${RESET}"; sleep 1; continue ;;
-        esac
-
-        echo -ne "\n${GREEN}按回车返回面板...${RESET}"
-        read -r
-    done
-}
-
-# 运行菜单
-auto_clean_menu
+    case "$choice" in
+        1)
+            echo -e "\n${YELLOW}🚀 开始配置中文环境...${RESET}"
+            apply_locale "zh_CN.UTF-8"
+            echo -e "\n${GREEN}✅ 中文环境及支持字体配置完成！${RESET}"
+            echo -e "${YELLOW}💡 提示：为了让 SSH 终端完整显示中文，请重新连接您的 SSH 会话。${RESET}"
+            read -rp "按回车键返回菜单..."
+            ;;
+        2)
+            echo -e "\n${YELLOW}🚀 开始配置英文环境...${RESET}"
+            apply_locale "en_US.UTF-8"
+            echo -e "\n${GREEN}✅ 英文环境配置完成！${RESET}"
+            echo -e "${YELLOW}💡 提示：界面已重置，部分未刷新组件重新连接 SSH 后即可恢复纯英文。${RESET}"
+            read -rp "按回车键返回菜单..."
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}❌ 输入错误，无此选项${RESET}"
+            sleep 1
+            ;;
+    esac
+done

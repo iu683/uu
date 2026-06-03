@@ -1,252 +1,340 @@
 #!/bin/bash
-# 万能 DNS 切换管理面板（支持 Ubuntu / Debian / Alpine）
+set -e
 
-dns_order=( "HK" "JP" "TW" "SG" "KR" "US" "UK" "DE" "SB" "RFC" "NHK" "自定义" )
-
-declare -A dns_list=(
-  ["HK"]="154.83.83.83"
-  ["JP"]="45.76.215.40"
-  ["TW"]="154.83.83.86"
-  ["SG"]="149.28.158.78"
-  ["KR"]="158.247.223.218"
-  ["US"]="66.42.97.127"
-  ["UK"]="45.32.179.189"
-  ["DE"]="80.240.28.27"
-  ["SB"]="6.6.6.6"
-  ["RFC"]="22.22.22.22"
-  ["NHK"]="151.247.88.3"
-)
+# ===============================
+# 防火墙管理脚本（Debian/Ubuntu 双栈 IPv4/IPv6）
+# ===============================
 
 GREEN="\033[32m"
 RED="\033[31m"
-YELLOW="\033[0;33m"
-NC="\033[0m"
+YELLOW="\033[33m"
 RESET="\033[0m"
-Info="${GREEN}[信息]${NC}"
-Error="${RED}[错误]${NC}"
-Tip="${YELLOW}[提示]${NC}"
 
-# 检查是否为root用户
-if [[ $(whoami) != "root" ]]; then
-    echo -e "${Error}请以root身份执行该脚本！"
-    exit 1
+# ===============================
+# 动态信息获取函数（对应新菜单风格）
+# ===============================
+
+# 1. 获取 SSH 端口
+get_ssh_port() {
+    local port
+    port=$(grep -E '^ *Port ' /etc/ssh/sshd_config | awk '{print $2}' | head -n 1)
+    [[ -z "$port" || ! "$port" =~ ^[0-9]+$ ]] && port=22
+    echo "$port"
+}
+
+# 2. 获取防火墙运行状态
+get_firewall_status() {
+    if systemctl is-active --quiet netfilter-persistent 2>/dev/null; then
+        echo -e "${GREEN}● 已开启 (开机自启)${RESET}"
+    else
+        # 检查是否至少有规则在运行
+        if iptables -P INPUT 2>/dev/null | grep -q "DROP"; then
+            echo -e "${YELLOW}● 运行中 (未设自启)${RESET}"
+        else
+            echo -e "${RED}○ 已关闭 (全放行)${RESET}"
+        fi
+    fi
+}
+
+# 3. 获取 iptables 版本
+get_iptables_version() {
+    if command -v iptables &>/dev/null; then
+        iptables --version | awk '{print $2}'
+    else
+        echo "未安装"
+    fi
+}
+
+# 4. 统计当前封禁的独立 IP 数量 (DROP/REJECT)
+get_banned_ip_count() {
+    local count4 count6 total
+    count4=$(iptables -L INPUT -n 2>/dev/null | grep -E "DROP|REJECT" | grep -v "tcp dport" | awk '{print $4}' | grep -v "0.0.0.0" | sort -u | wc -l)
+    count6=$(ip6tables -L INPUT -n 2>/dev/null | grep -E "DROP|REJECT" | grep -v "tcp dport" | awk '{print $4}' | grep -v "::" | sort -u | wc -l)
+    total=$((count4 + count6))
+    echo "$total"
+}
+
+# ===============================
+# 防火墙核心逻辑函数
+# ===============================
+
+save_rules() {
+    netfilter-persistent save 2>/dev/null || true
+}
+
+save_and_enable_autoload() {
+    save_rules
+    systemctl enable netfilter-persistent 2>/dev/null || true
+    systemctl start netfilter-persistent 2>/dev/null || true
+    echo -e "${GREEN}✅ 规则已保存，并设置为开机自动加载${RESET}"
+    read -p "按回车继续..."
+}
+
+init_rules() {
+    local ssh_port
+    ssh_port=$(get_ssh_port)
+    for proto in iptables ip6tables; do
+        $proto -F
+        $proto -X
+        $proto -t nat -F 2>/dev/null || true
+        $proto -t nat -X 2>/dev/null || true
+        $proto -t mangle -F 2>/dev/null || true
+        $proto -t mangle -X 2>/dev/null || true
+        $proto -P INPUT DROP
+        $proto -P FORWARD DROP
+        $proto -P OUTPUT ACCEPT
+        $proto -A INPUT -i lo -j ACCEPT
+        $proto -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+        $proto -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
+        $proto -A INPUT -p tcp --dport 80 -j ACCEPT
+        $proto -A INPUT -p tcp --dport 443 -j ACCEPT
+    done
+    save_rules
+    systemctl enable netfilter-persistent 2>/dev/null || true
+    systemctl start netfilter-persistent 2>/dev/null || true
+}
+
+check_installed() {
+    dpkg -l | grep -q iptables-persistent
+}
+
+install_firewall() {
+    echo -e "${YELLOW}正在安装防火墙，请稍候...${RESET}"
+    apt update -y
+    apt remove -y ufw iptables-persistent || true
+    apt install -y iptables-persistent curl || true
+    init_rules
+    echo -e "${GREEN}✅ 防火墙安装完成，默认放行 SSH/80/443${RESET}"
+    echo -e "${GREEN}✅ 已设置开机自动加载规则${RESET}"
+    read -p "按回车继续..."
+}
+
+clear_firewall() {
+    echo -e "${YELLOW}正在清空防火墙规则并放行所有流量...${RESET}"
+    for proto in iptables ip6tables; do
+        $proto -F
+        $proto -X
+        $proto -P INPUT ACCEPT
+        $proto -P FORWARD ACCEPT
+        $proto -P OUTPUT ACCEPT
+    done
+    save_rules
+    systemctl disable netfilter-persistent 2>/dev/null || true
+    echo -e "${GREEN}✅ 防火墙规则已清空，所有流量已放行${RESET}"
+    read -p "按回车继续..."
+}
+
+restore_default_rules() {
+    echo -e "${YELLOW}正在恢复默认防火墙规则 (仅放行 SSH/80/443)...${RESET}"
+    local ssh_port
+    ssh_port=$(get_ssh_port)
+    echo -e "${GREEN}检测到 SSH 端口: $ssh_port${RESET}"
+    init_rules
+    echo -e "${GREEN}✅ 默认规则已恢复${RESET}"
+    read -p "按回车继续..."
+}
+
+open_all_ports() {
+    echo -e "${YELLOW}正在放行所有端口（IPv4/IPv6）...${RESET}"
+    for proto in iptables ip6tables; do
+        $proto -F
+        $proto -X
+        $proto -P INPUT ACCEPT
+        $proto -P FORWARD ACCEPT
+        $proto -P OUTPUT ACCEPT
+    done
+    save_rules
+    echo -e "${GREEN}✅ 所有端口已放行（全开放）${RESET}"
+    read -p "按回车继续..."
+}
+
+ip_action() {
+    local action=$1 ip=$2 proto
+    if [[ $ip =~ : ]]; then
+        proto="ip6tables"
+    else
+        proto="iptables"
+    fi
+
+    case $action in
+        accept) $proto -I INPUT -s "$ip" -j ACCEPT ;;
+        drop)   $proto -I INPUT -s "$ip" -j DROP ;;
+        delete)
+            while $proto -C INPUT -s "$ip" -j ACCEPT 2>/dev/null; do
+                $proto -D INPUT -s "$ip" -j ACCEPT
+            done
+            while $proto -C INPUT -s "$ip" -j DROP 2>/dev/null; do
+                $proto -D INPUT -s "$ip" -j DROP
+            done
+            ;;
+    esac
+}
+
+ping_action() {
+    local action=$1
+    for proto in iptables ip6tables; do
+        case $action in
+            allow)
+                while $proto -C INPUT -p icmp -j DROP 2>/dev/null; do $proto -D INPUT -p icmp -j DROP; done
+                while $proto -C OUTPUT -p icmp -j DROP 2>/dev/null; do $proto -D OUTPUT -p icmp -j DROP; done
+                if [ "$proto" = "iptables" ]; then
+                    $proto -I INPUT -p icmp --icmp-type echo-request -j ACCEPT
+                    $proto -I OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT
+                else
+                    $proto -I INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT
+                    $proto -I OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT
+                fi
+                ;;
+            deny)
+                if [ "$proto" = "iptables" ]; then
+                    while $proto -C INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null; do $proto -D INPUT -p icmp --icmp-type echo-request -j ACCEPT; done
+                    while $proto -C OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT 2>/dev/null; do $proto -D OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT; done
+                    $proto -I INPUT -p icmp --icmp-type echo-request -j DROP
+                    $proto -I OUTPUT -p icmp --icmp-type echo-reply -j DROP
+                else
+                    =while $proto -C INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT 2>/dev/null; do $proto -D INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT; done
+                    while $proto -C OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT 2>/dev/null; do $proto -D OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT; done
+                    $proto -I INPUT -p icmpv6 --icmpv6-type echo-request -j DROP
+                    $proto -I OUTPUT -p icmpv6 --icmpv6-type echo-reply -j DROP
+                fi
+                ;;
+        esac
+    done
+}
+
+# ===============================
+# 全新风格管理菜单
+# ===============================
+menu() {
+    while true; do
+        # 动态获取当前系统防火墙数据
+        STATUS=$(get_firewall_status)
+        VERSION_SHOW=$(get_iptables_version)
+        PORT_SHOW=$(get_ssh_port)
+        SITE_COUNT=$(get_banned_ip_count)
+
+        clear
+        echo -e "${GREEN}===============================${RESET}"
+        echo -e "${GREEN}   ◈   双栈防火墙管理面板   ◈  ${RESET}"
+        echo -e "${GREEN}===============================${RESET}"
+        echo -e "${GREEN} 状态  : ${STATUS}"
+        echo -e "${GREEN} 规则  : ${YELLOW}${VERSION_SHOW}${RESET}"
+        echo -e "${GREEN} 端口  : ${YELLOW}${PORT_SHOW}${RESET}"
+        echo -e "${GREEN} 封禁  : ${YELLOW}${SITE_COUNT} 个 IP${RESET}"
+        echo -e "${GREEN}===============================${RESET}"
+        echo -e "${GREEN}  1. 开放指定端口 (TCP/UDP)${RESET}"
+        echo -e "${GREEN}  2. 关闭指定端口 (TCP/UDP)${RESET}"
+        echo -e "${GREEN}  3. 开放所有端口 (全放行)${RESET}"
+        echo -e "${GREEN}  4. 恢复默认安全规则 (放行SSH/80/443)${RESET}"
+        echo -e "${GREEN}  5. 添加 IP 白名单 (放行)${RESET}"
+        echo -e "${GREEN}  6. 添加 IP 黑名单 (封禁)${RESET}"
+        echo -e "${GREEN}  7. 删除指定 IP 规则${RESET}"
+        echo -e "${GREEN}  8. 允许 PING (ICMP)${RESET}"
+        echo -e "${GREEN}  9. 禁用 PING (ICMP)${RESET}"
+        echo -e "${GREEN} 10. 查看当前防火墙详细规则${RESET}"
+        echo -e "${GREEN} 11. 保存规则并设置开机自启${RESET}"
+        echo -e "${GREEN}  0. 退出${RESET}"
+        echo -e "${GREEN}===============================${RESET}"
+        echo -ne "${GREEN} 请选择: ${RESET}"
+        read -r choice
+
+        case $choice in
+            1)
+                read -p "请输入要开放的端口号: " PORT
+                if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+                    echo -e "${RED}❌ 错误：请输入 1-65535 之间的有效端口号${RESET}"
+                    read -p "按回车返回菜单..."
+                    continue
+                fi
+                for proto in iptables ip6tables; do
+                    while $proto -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null; do $proto -D INPUT -p tcp --dport "$PORT" -j DROP; done
+                    while $proto -C INPUT -p udp --dport "$PORT" -j DROP 2>/dev/null; do $proto -D INPUT -p udp --dport "$PORT" -j DROP; done
+                    $proto -I INPUT -p tcp --dport "$PORT" -j ACCEPT
+                    $proto -I INPUT -p udp --dport "$PORT" -j ACCEPT
+                done
+                save_rules
+                echo -e "${GREEN}✅ 已开放端口 $PORT${RESET}"
+                read -p "按回车继续..."
+                ;;
+            2)
+                read -p "请输入要关闭的端口号: " PORT
+                if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+                    echo -e "${RED}❌ 错误：请输入 1-65535 之间的有效端口号${RESET}"
+                    read -p "按回车返回菜单..."
+                    continue
+                fi
+                for proto in iptables ip6tables; do
+                    while $proto -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; do $proto -D INPUT -p tcp --dport "$PORT" -j ACCEPT; done
+                    while $proto -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; do $proto -D INPUT -p udp --dport "$PORT" -j ACCEPT; done
+                    $proto -I INPUT -p tcp --dport "$PORT" -j DROP
+                    $proto -I INPUT -p udp --dport "$PORT" -j DROP
+                done
+                save_rules
+                echo -e "${GREEN}✅ 已关闭端口 $PORT${RESET}"
+                read -p "按回车继续..."
+                ;;
+            3) open_all_ports ;;
+            4) restore_default_rules ;;
+            5)
+                read -p "请输入要放行的IP: " IP
+                ip_action accept "$IP"
+                save_rules
+                echo -e "${GREEN}✅ IP $IP 已放行${RESET}"
+                read -p "按回车继续..."
+                ;;
+            6)
+                read -p "请输入要封禁的IP: " IP
+                ip_action drop "$IP"
+                save_rules
+                echo -e "${GREEN}✅ IP $IP 已封禁${RESET}"
+                read -p "按回车继续..."
+                ;;
+            7)
+                read -p "请输入要删除的IP: " IP
+                ip_action delete "$IP"
+                save_rules
+                echo -e "${GREEN}✅ IP $IP 规则已删除${RESET}"
+                read -p "按回车继续..."
+                ;;
+            8)
+                ping_action allow
+                save_rules
+                echo -e "${GREEN}✅ 已允许 PING（ICMP）${RESET}"
+                read -p "按回车继续..."
+                ;;
+            9)
+                ping_action deny
+                save_rules
+                echo -e "${GREEN}✅ 已禁用 PING（ICMP）${RESET}"
+                read -p "按回车继续..."
+                ;;
+            10)
+                clear
+                echo -e "${YELLOW}当前防火墙状态:${RESET}"
+                echo "--- iptables IPv4 ---"
+                iptables -L -n -v --line-numbers
+                echo -e "\n--- ip6tables IPv6 ---"
+                ip6tables -L -n -v --line-numbers
+                read -r -p "按回车返回菜单..." || true
+                ;;
+            11) save_and_enable_autoload ;;
+            0) clear; break ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ===============================
+# 脚本入口
+# ===============================
+# 检查 root 权限
+if [ "$EUID" -ne 0 ]; then
+   echo -e "${RED}❌ 错误: 请使用 root 权限运行此脚本！${RESET}"
+   exit 1
 fi
 
-########################################
-# 判断系统类型与状态
-########################################
-is_ubuntu() {
-    [ -f /etc/os-release ] && grep -qi ubuntu /etc/os-release
-}
+if ! check_installed; then
+    install_firewall
+fi
 
-is_alpine() {
-    [ -f /etc/os-release ] && grep -qi alpine /etc/os-release
-}
-
-is_resolved_mode() {
-    if command -v systemctl &>/dev/null; then
-        systemctl is-active systemd-resolved >/dev/null 2>&1
-    else
-        false
-    fi
-}
-
-get_current_dns() {
-    if [ -f /etc/resolv.conf ]; then
-        # 提取第一个 nameserver
-        local current
-        current=$(grep -m 1 '^nameserver' /etc/resolv.conf | awk '{print $2}')
-        echo "${current:-未知}"
-    else
-        echo "无 resolv.conf"
-    fi
-}
-
-get_lock_status() {
-    if command -v lsattr &>/dev/null; then
-        if lsattr /etc/resolv.conf 2>/dev/null | grep -q "i"; then
-            echo -e "${RED}已锁定 (i)${RESET}"
-        else
-            echo -e "${GREEN}未锁定${RESET}"
-        fi
-    else
-        echo -e "${YELLOW}不支持检测${RESET}"
-    fi
-}
-
-get_system_env() {
-    if is_ubuntu; then
-        echo "Ubuntu"
-    elif is_alpine; then
-        echo "Alpine"
-    else
-        echo "Debian/Other"
-    fi
-}
-
-cop_info(){
-    clear
-    local current_dns
-    current_dns=$(get_current_dns)
-    local lock_status
-    lock_status=$(get_lock_status)
-    local sys_env
-    sys_env=$(get_system_env)
-
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}         ◈  DNS 自动化切换面板  ◈      ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN} 当前系统环境 : ${YELLOW}${sys_env}${RESET}"
-    echo -e "${GREEN} 当前首选 DNS : ${YELLOW}${current_dns}${RESET}"
-    echo -e "${GREEN} 配置文件状态 : ${lock_status}"
-    echo -e "${GREEN}=======================================${RESET}"
-}
-
-# 返回菜单公共函数
-back_to_menu() {
-    echo
-    read -rp "按回车键返回菜单..."
-}
-
-# 兼容 Alpine/Debian 的命令调用
-run_chattr() {
-    if command -v chattr &>/dev/null; then
-        chattr "$@" 2>/dev/null || busybox chattr "$@" 2>/dev/null
-    fi
-}
-
-########################################
-# 修改 resolv.conf 文件模式（可锁定）
-########################################
-set_resolvconf_dns() {
-    # 解锁
-    if command -v lsattr &>/dev/null; then
-        if lsattr /etc/resolv.conf 2>/dev/null | grep -q "i"; then
-            echo -e "${Info}检测到 resolv.conf 已锁定，正在解锁..."
-            run_chattr -i /etc/resolv.conf
-        fi
-    fi
-
-    cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null
-
-    cat > /etc/resolv.conf <<EOF
-nameserver $1
-options timeout:2 attempts:3
-EOF
-
-    echo -e "${Info}DNS 已写入 resolv.conf"
-
-    # 可选锁定
-    echo -ne "${Tip}是否锁定 /etc/resolv.conf 防止被覆盖? (y/n): "
-    read -r lock_choice
-    if [[ "$lock_choice" == "y" || "$lock_choice" == "Y" ]]; then
-        run_chattr +i /etc/resolv.conf
-        echo -e "${Info}/etc/resolv.conf 已成功锁定！"
-    fi
-}
-
-########################################
-# 关闭 Ubuntu resolved 并写入 resolv.conf（可锁定）
-########################################
-disable_ubuntu_resolved() {
-    echo -e "${Info}检测到 Ubuntu + systemd-resolved，正在关闭服务..."
-    systemctl stop systemd-resolved
-    systemctl disable systemd-resolved
-
-    rm -f /etc/resolv.conf
-
-    cat > /etc/resolv.conf <<EOF
-nameserver $1
-nameserver 1.1.1.1
-options timeout:2 attempts:3
-EOF
-
-    echo -e "${Info}resolved 已关闭，DNS 已覆盖写入 /etc/resolv.conf"
-
-    # 可选锁定
-    echo -ne "${Tip}是否锁定 /etc/resolv.conf 防止被覆盖? (y/n): "
-    read -r lock_choice
-    if [[ "$lock_choice" == "y" || "$lock_choice" == "Y" ]]; then
-        run_chattr +i /etc/resolv.conf
-        echo -e "${Info}/etc/resolv.conf 已成功锁定！"
-    fi
-}
-
-########################################
-# 临时 resolvectl 模式
-########################################
-set_resolved_runtime_dns() {
-    interface=$(ip route | awk '/default/ {print $5; exit}')
-    if [ -z "$interface" ]; then
-        echo -e "${Error}无法检测到默认网络接口"
-        return
-    fi
-    resolvectl dns "$interface" "$1"
-    resolvectl flush-caches
-    echo -e "${Info}DNS 已通过 resolvectl 临时应用成功"
-}
-
-########################################
-# 主循环
-########################################
-while true; do
-    cop_info
-    
-    count=0
-    # 动态渲染两两对齐菜单（排除最后一个“自定义”选项单独处理）
-    total_elements=${#dns_order[@]}
-    for ((i=0; i<total_elements-1; i++)); do
-        ((count++))
-        printf "${GREEN}  %02d. %-14s${RESET}" "$count" "${dns_order[i]}"
-        (( count % 2 == 0 )) && echo ""
-    done
-    
-    # 如果前面数量是奇数，先补一个换行
-    (( (total_elements - 1) % 2 != 0 )) && echo ""
-    
-    # 让最后一个“自定义”强制单独起一行
-    ((count++))
-    printf "${GREEN}  %02d. %-14s${RESET}\n" "$count" "${dns_order[total_elements-1]}"
-    
-    echo -e "${GREEN} ------------------------------------- ${RESET}"
-    echo -e "${GREEN}  00. 退出管理面板${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -ne "${GREEN} 请输入操作编号: ${RESET}"
-    
-    read -r choice
-
-    # 支持 0 或 00 退出
-    [[ "$choice" == "0" || "$choice" == "00" ]] && exit 0
-
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#dns_order[@]} )); then
-        region="${dns_order[$((choice-1))]}"
-
-        if [ "$region" = "自定义" ]; then
-            echo -ne "${Tip}请输入自定义 DNS IP: "
-            read -r dns_to_set
-            if [[ -z "$dns_to_set" ]]; then
-                echo -e "${Error}未输入有效 IP，操作取消。"
-                back_to_menu
-                continue
-            fi
-        else
-            dns_to_set="${dns_list[$region]}"
-        fi
-
-        echo -e "${Info}正在设置 DNS 为: ${YELLOW}$dns_to_set ($region)${NC} ..."
-
-        # 核心判定分支
-        if is_ubuntu && is_resolved_mode; then
-            disable_ubuntu_resolved "$dns_to_set"
-        elif is_resolved_mode; then
-            set_resolved_runtime_dns "$dns_to_set"
-        else
-            set_resolvconf_dns "$dns_to_set"
-        fi
-
-        back_to_menu
-    else
-        echo -e "${Error}无效选择，请输入正确的数字编号。"
-        sleep 1
-    fi
-done
+menu

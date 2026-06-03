@@ -1,382 +1,105 @@
 #!/bin/bash
-set -e
-
-# ===============================
-# 防火墙管理脚本（Debian/Ubuntu 双栈 IPv4/IPv6）
-# ===============================
+# ========================================
+# 智能时间同步脚本（自动识别容器/物理机）
+# 适配：Debian / Ubuntu / Alpine
+# ========================================
 
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
+RED="\033[31m"
+BLUE="\033[36m"
 RESET="\033[0m"
 
-# ===============================
-# 动态信息获取函数（对应新菜单风格）
-# ===============================
+echo -e "${GREEN}========================================${RESET}"
+echo -e "${GREEN}         ⏰ 智能时间同步配置            ${RESET}"
+echo -e "${GREEN}========================================${RESET}"
 
-# 1. 获取 SSH 端口
-get_ssh_port() {
-    local port
-    port=$(grep -E '^ *Port ' /etc/ssh/sshd_config | awk '{print $2}' | head -n 1)
-    [[ -z "$port" || ! "$port" =~ ^[0-9]+$ ]] && port=22
-    echo "$port"
-}
-
-# 2. 获取防火墙运行状态
-get_firewall_status() {
-    if systemctl is-active --quiet netfilter-persistent 2>/dev/null; then
-        echo -e "${YELLOW}● 已开启 (开机自启)${RESET}"
-    else
-        # 检查是否至少有规则在运行
-        if iptables -P INPUT 2>/dev/null | grep -q "DROP"; then
-            echo -e "${YELLOW}● 运行中 (未设自启)${RESET}"
-        else
-            echo -e "${RED}○ 已关闭 (全放行)${RESET}"
-        fi
-    fi
-}
-
-# 3. 获取当前实际使用的防火墙后端内核 
-get_firewall_type() {
-    if command -v iptables &>/dev/null; then
-        # 区分是 nftables 后端还是传统 legacy 后端
-        if iptables --version | grep -qi "nftables"; then
-            echo "iptables (nftables 后端)"
-        else
-            echo "iptables (legacy 后端)"
-        fi
-    else
-        echo "未安装"
-    fi
-}
-
-# 4. 统计当前封禁的独立 IP 数量 (DROP/REJECT)
-get_banned_ip_count() {
-    local count4 count6 total
-    count4=$(iptables -L INPUT -n 2>/dev/null | grep -E "DROP|REJECT" | grep -v "tcp dport" | awk '{print $4}' | grep -v "0.0.0.0" | sort -u | wc -l)
-    count6=$(ip6tables -L INPUT -n 2>/dev/null | grep -E "DROP|REJECT" | grep -v "tcp dport" | awk '{print $4}' | grep -v "::" | sort -u | wc -l)
-    total=$((count4 + count6))
-    echo "$total"
-}
-
-# ===============================
-# 防火墙核心逻辑函数
-# ===============================
-
-save_rules() {
-    netfilter-persistent save 2>/dev/null || true
-}
-
-save_and_enable_autoload() {
-    save_rules
-    systemctl enable netfilter-persistent 2>/dev/null || true
-    systemctl start netfilter-persistent 2>/dev/null || true
-    echo -e "${GREEN}✅ 规则已保存，并设置为开机自动加载${RESET}"
-    read -p "按回车继续..."
-}
-
-init_rules() {
-    local ssh_port
-    ssh_port=$(get_ssh_port)
-    for proto in iptables ip6tables; do
-        $proto -F
-        $proto -X
-        $proto -t nat -F 2>/dev/null || true
-        $proto -t nat -X 2>/dev/null || true
-        $proto -t mangle -F 2>/dev/null || true
-        $proto -t mangle -X 2>/dev/null || true
-        $proto -P INPUT DROP
-        $proto -P FORWARD DROP
-        $proto -P OUTPUT ACCEPT
-        $proto -A INPUT -i lo -j ACCEPT
-        $proto -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-        $proto -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
-        $proto -A INPUT -p tcp --dport 80 -j ACCEPT
-        $proto -A INPUT -p tcp --dport 443 -j ACCEPT
-    done
-    save_rules
-    systemctl enable netfilter-persistent 2>/dev/null || true
-    systemctl start netfilter-persistent 2>/dev/null || true
-}
-
-check_installed() {
-    dpkg -l | grep -q iptables-persistent
-}
-
-install_firewall() {
-    echo -e "${YELLOW}正在安装防火墙，请稍候...${RESET}"
-    apt update -y
-    apt remove -y ufw iptables-persistent || true
-    apt install -y iptables-persistent curl || true
-    init_rules
-    echo -e "${GREEN}✅ 防火墙安装完成，默认放行 SSH/80/443${RESET}"
-    echo -e "${GREEN}✅ 已设置开机自动加载规则${RESET}"
-    read -p "按回车继续..."
-}
-
-clear_firewall() {
-    echo -e "${YELLOW}正在清空防火墙规则并放行所有流量...${RESET}"
-    for proto in iptables ip6tables; do
-        $proto -F
-        $proto -X
-        $proto -P INPUT ACCEPT
-        $proto -P FORWARD ACCEPT
-        $proto -P OUTPUT ACCEPT
-    done
-    save_rules
-    systemctl disable netfilter-persistent 2>/dev/null || true
-    echo -e "${GREEN}✅ 防火墙规则已清空，所有流量已放行${RESET}"
-    read -p "按回车继续..."
-}
-
-restore_default_rules() {
-    echo -e "${YELLOW}正在恢复默认防火墙规则 (仅放行 SSH/80/443)...${RESET}"
-    local ssh_port
-    ssh_port=$(get_ssh_port)
-    echo -e "${GREEN}检测到 SSH 端口: $ssh_port${RESET}"
-    init_rules
-    echo -e "${GREEN}✅ 默认规则已恢复${RESET}"
-    read -p "按回车继续..."
-}
-
-open_all_ports() {
-    echo -e "${YELLOW}正在放行所有端口（IPv4/IPv6）...${RESET}"
-    for proto in iptables ip6tables; do
-        $proto -F
-        $proto -X
-        $proto -P INPUT ACCEPT
-        $proto -P FORWARD ACCEPT
-        $proto -P OUTPUT ACCEPT
-    done
-    save_rules
-    echo -e "${GREEN}✅ 所有端口已放行（全开放）${RESET}"
-    read -p "按回车继续..."
-}
-
-ip_action() {
-    local action=$1 ip=$2 proto
-    if [[ $ip =~ : ]]; then
-        proto="ip6tables"
-    else
-        proto="iptables"
-    fi
-
-    case $action in
-        accept) $proto -I INPUT -s "$ip" -j ACCEPT ;;
-        drop)   $proto -I INPUT -s "$ip" -j DROP ;;
-        delete)
-            while $proto -C INPUT -s "$ip" -j ACCEPT 2>/dev/null; do
-                $proto -D INPUT -s "$ip" -j ACCEPT
-            done
-            while $proto -C INPUT -s "$ip" -j DROP 2>/dev/null; do
-                $proto -D INPUT -s "$ip" -j DROP
-            done
-            ;;
-    esac
-}
-
-ping_action() {
-    local action=$1
-    for proto in iptables ip6tables; do
-        case $action in
-            allow)
-                while $proto -C INPUT -p icmp -j DROP 2>/dev/null; do $proto -D INPUT -p icmp -j DROP; done
-                while $proto -C OUTPUT -p icmp -j DROP 2>/dev/null; do $proto -D OUTPUT -p icmp -j DROP; done
-                if [ "$proto" = "iptables" ]; then
-                    $proto -I INPUT -p icmp --icmp-type echo-request -j ACCEPT
-                    $proto -I OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT
-                else
-                    $proto -I INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT
-                    $proto -I OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT
-                fi
-                ;;
-            deny)
-                if [ "$proto" = "iptables" ]; then
-                    while $proto -C INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null; do $proto -D INPUT -p icmp --icmp-type echo-request -j ACCEPT; done
-                    while $proto -C OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT 2>/dev/null; do $proto -D OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT; done
-                    $proto -I INPUT -p icmp --icmp-type echo-request -j DROP
-                    $proto -I OUTPUT -p icmp --icmp-type echo-reply -j DROP
-                else
-                    # 这里已修复修复：去除了原本误触的 = 号
-                    while $proto -C INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT 2>/dev/null; do $proto -D INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT; done
-                    while $proto -C OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT 2>/dev/null; do $proto -D OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT; done
-                    $proto -I INPUT -p icmpv6 --icmpv6-type echo-request -j DROP
-                    $proto -I OUTPUT -p icmpv6 --icmpv6-type echo-reply -j DROP
-                fi
-                ;;
-        esac
-    done
-}
-
-# 彻底卸载防火墙组件并全部放行
-uninstall_firewall() {
-    clear
-    echo -e "${RED}警告：该操作将清空所有规则并卸载防火墙自启组件，恢复网络全放行不设防状态！${RESET}"
-    read -p "确定要彻底卸载吗？(y/n): " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo "已取消卸载。"
-        read -p "按回车继续..."
-        return
-    fi
-
-    echo -e "${YELLOW}正在清理规则并将策略修改为 ACCEPT...${RESET}"
-    for proto in iptables ip6tables; do
-        $proto -F
-        $proto -X
-        $proto -t nat -F 2>/dev/null || true
-        $proto -t nat -X 2>/dev/null || true
-        $proto -t mangle -F 2>/dev/null || true
-        $proto -t mangle -X 2>/dev/null || true
-        $proto -P INPUT ACCEPT
-        $proto -P FORWARD ACCEPT
-        $proto -P OUTPUT ACCEPT
-    done
-
-    echo -e "${YELLOW}正在停止并卸载守护服务...${RESET}"
-    systemctl stop netfilter-persistent 2>/dev/null || true
-    systemctl disable netfilter-persistent 2>/dev/null || true
-    apt purge -y iptables-persistent netfilter-persistent || true
-    apt autoremove -y
-
-    echo -e "${GREEN}✅ 防火墙已彻底卸载，所有网络流量已恢复不受限状态。${RESET}"
-    exit 0
-}
-
-# ===============================
-# 全新风格管理菜单
-# ===============================
-menu() {
-    while true; do
-        # 动态获取当前系统防火墙数据
-        STATUS=$(get_firewall_status)
-        TYPE_SHOW=$(get_firewall_type)
-        PORT_SHOW=$(get_ssh_port)
-        SITE_COUNT=$(get_banned_ip_count)
-
-        clear
-        echo -e "${GREEN}===============================${RESET}"
-        echo -e "${GREEN}   ◈   双栈防火墙管理面板   ◈  ${RESET}"
-        echo -e "${GREEN}===============================${RESET}"
-        echo -e "${GREEN} 状态  : ${STATUS}"
-        echo -e "${GREEN} 内核  : ${YELLOW}${TYPE_SHOW}${RESET}"
-        echo -e "${GREEN} 端口  : ${YELLOW}${PORT_SHOW}${RESET}"
-        echo -e "${GREEN} 规则  : ${YELLOW}${SITE_COUNT} 个 IP${RESET}"
-        echo -e "${GREEN}===============================${RESET}"
-        echo -e "${GREEN}  1. 开放指定端口 (TCP/UDP)${RESET}"
-        echo -e "${GREEN}  2. 关闭指定端口 (TCP/UDP)${RESET}"
-        echo -e "${GREEN}  3. 开放所有端口 (全放行)${RESET}"
-        echo -e "${GREEN}  4. 恢复默认安全规则 (放行SSH/80/443)${RESET}"
-        echo -e "${GREEN}  5. 添加 IP 白名单 (放行)${RESET}"
-        echo -e "${GREEN}  6. 添加 IP 黑名单 (封禁)${RESET}"
-        echo -e "${GREEN}  7. 删除指定 IP 规则${RESET}"
-        echo -e "${GREEN}  8. 允许 PING (ICMP)${RESET}"
-        echo -e "${GREEN}  9. 禁用 PING (ICMP)${RESET}"
-        echo -e "${GREEN} 10. 查看当前防火墙详细规则${RESET}"
-        echo -e "${GREEN} 11. 保存规则并设置开机自启${RESET}"
-        echo -e "${GREEN} 12. 卸载防火墙功能${RESET}"
-        echo -e "${GREEN}  0. 退出${RESET}"
-        echo -e "${GREEN}===============================${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
-        read -r choice
-
-        case $choice in
-            1)
-                read -p "请输入要开放的端口号: " PORT
-                if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
-                    echo -e "${RED}❌ 错误：请输入 1-65535 之间的有效端口号${RESET}"
-                    read -p "按回车返回菜单..."
-                    continue
-                fi
-                for proto in iptables ip6tables; do
-                    while $proto -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null; do $proto -D INPUT -p tcp --dport "$PORT" -j DROP; done
-                    while $proto -C INPUT -p udp --dport "$PORT" -j DROP 2>/dev/null; do $proto -D INPUT -p udp --dport "$PORT" -j DROP; done
-                    $proto -I INPUT -p tcp --dport "$PORT" -j ACCEPT
-                    $proto -I INPUT -p udp --dport "$PORT" -j ACCEPT
-                done
-                save_rules
-                echo -e "${GREEN}✅ 已开放端口 $PORT${RESET}"
-                read -p "按回车继续..."
-                ;;
-            2)
-                read -p "请输入要关闭的端口号: " PORT
-                if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
-                    echo -e "${RED}❌ 错误：请输入 1-65535 之间的有效端口号${RESET}"
-                    read -p "按回车返回菜单..."
-                    continue
-                fi
-                for proto in iptables ip6tables; do
-                    while $proto -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; do $proto -D INPUT -p tcp --dport "$PORT" -j ACCEPT; done
-                    while $proto -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; do $proto -D INPUT -p udp --dport "$PORT" -j ACCEPT; done
-                    $proto -I INPUT -p tcp --dport "$PORT" -j DROP
-                    $proto -I INPUT -p udp --dport "$PORT" -j DROP
-                done
-                save_rules
-                echo -e "${GREEN}✅ 已关闭端口 $PORT${RESET}"
-                read -p "按回车继续..."
-                ;;
-            3) open_all_ports ;;
-            4) restore_default_rules ;;
-            5)
-                read -p "请输入要放行的IP: " IP
-                ip_action accept "$IP"
-                save_rules
-                echo -e "${GREEN}✅ IP $IP 已放行${RESET}"
-                read -p "按回车继续..."
-                ;;
-            6)
-                read -p "请输入要封禁的IP: " IP
-                ip_action drop "$IP"
-                save_rules
-                echo -e "${GREEN}✅ IP $IP 已封禁${RESET}"
-                read -p "按回车继续..."
-                ;;
-            7)
-                read -p "请输入要删除的IP: " IP
-                ip_action delete "$IP"
-                save_rules
-                echo -e "${GREEN}✅ IP $IP 规则已删除${RESET}"
-                read -p "按回车继续..."
-                ;;
-            8)
-                ping_action allow
-                save_rules
-                echo -e "${GREEN}✅ 已允许 PING（ICMP）${RESET}"
-                read -p "按回车继续..."
-                ;;
-            9)
-                ping_action deny
-                save_rules
-                echo -e "${GREEN}✅ 已禁用 PING（ICMP）${RESET}"
-                read -p "按回车继续..."
-                ;;
-            10)
-                clear
-                echo -e "${YELLOW}当前防火墙状态:${RESET}"
-                echo "--- iptables IPv4 ---"
-                iptables -L -n -v --line-numbers
-                echo -e "\n--- ip6tables IPv6 ---"
-                ip6tables -L -n -v --line-numbers
-                read -r -p "按回车返回菜单..." || true
-                ;;
-            11) save_and_enable_autoload ;;
-            12) uninstall_firewall ;;
-            0) clear; break ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
-# ===============================
-# 脚本入口
-# ===============================
-# 检查 root 权限
+# 1. 权限检查
 if [ "$EUID" -ne 0 ]; then
-   echo -e "${RED}❌ 错误: 请使用 root 权限运行此脚本！${RESET}"
-   exit 1
+    echo -e "${RED}❌ 请使用 root 运行${RESET}"
+    exit 1
 fi
 
-if ! check_installed; then
-    install_firewall
+# 2. 系统识别
+if [ -f /etc/alpine-release ]; then
+    OS="Alpine"
+elif [ -f /etc/debian_version ]; then
+    OS="Debian/Ubuntu"
+else
+    echo -e "${RED}❌ 暂不支持此系统${RESET}"
+    exit 1
 fi
 
-menu
+echo -e "${GREEN}✔ 系统检测通过：$OS${RESET}"
+
+# 3. 检测虚拟化环境 (容器无需同步)
+IS_CONTAINER=false
+if [ "$OS" == "Alpine" ]; then
+    # Alpine 下简单检测方式
+    if [ -f /.dockerenv ] || grep -qi "docker\|lxc" /proc/1/cgroup 2>/dev/null; then
+        IS_CONTAINER=true
+        VIRT_TYPE="Container"
+    fi
+else
+    # Debian/Ubuntu 使用 systemd-detect-virt
+    VIRT_TYPE=$(systemd-detect-virt)
+    if [[ "$VIRT_TYPE" == "lxc" || "$VIRT_TYPE" == "openvz" || "$VIRT_TYPE" == "docker" ]]; then
+        IS_CONTAINER=true
+    fi
+fi
+
+if [ "$IS_CONTAINER" = true ]; then
+    echo -e "${YELLOW}⚠ 检测到容器环境：$VIRT_TYPE${RESET}"
+    echo -e "${GREEN}✔ 容器时间由宿主机管理，无需配置时间同步${RESET}"
+    date
+    exit 0
+fi
+
+# 4. 执行同步逻辑
+if [ "$OS" == "Alpine" ]; then
+    # ================= Alpine 逻辑 =================
+    echo -e "${YELLOW}🔄 正在配置 Alpine 时间同步 (Chrony)...${RESET}"
+    apk add --no-cache chrony
+    
+    # 强制同步一次
+    rc-update add chronyd default
+    rc-service chronyd stop >/dev/null 2>&1 || true
+    
+    echo -e "${YELLOW}🚀 正在进行首次强制对时...${RESET}"
+    chronyd -q 'server ntp.aliyun.com iburst' || true
+    
+    rc-service chronyd start
+    echo -e "${GREEN}✔ Chrony 服务已启动${RESET}"
+    date
+
+else
+    # ================= Debian/Ubuntu 逻辑 (修复版) =================
+    echo -e "${YELLOW}🔄 检查并关闭冲突的 NTP 服务...${RESET}"
+    systemctl stop ntp chrony openntpd 2>/dev/null || true
+    systemctl disable ntp chrony openntpd 2>/dev/null || true
+
+    if ! dpkg -s systemd-timesyncd >/dev/null 2>&1; then
+        echo -e "${YELLOW}📦 安装 systemd-timesyncd...${RESET}"
+        apt update -y && apt install -y systemd-timesyncd
+    fi
+
+    echo -e "${YELLOW}🚀 启动时间同步服务...${RESET}"
+    # 1. 解锁并直接启动服务
+    systemctl unmask systemd-timesyncd >/dev/null 2>&1 || true
+    systemctl enable systemd-timesyncd >/dev/null 2>&1 || true
+    systemctl restart systemd-timesyncd
+
+    # 2. 尝试通知 timedatectl
+    timedatectl set-ntp true >/dev/null 2>&1 || true
+
+    sleep 2
+    if systemctl is-active --quiet systemd-timesyncd; then
+        echo -e "${GREEN}✔ 时间同步已成功启动${RESET}"
+    else
+        echo -e "${RED}❌ 启动失败，请检查日志${RESET}"
+    fi
+    echo -e "${BLUE}========== 当前状态 ==========${RESET}"
+    timedatectl status
+fi
+
+echo -e "${BLUE}==================================${RESET}"

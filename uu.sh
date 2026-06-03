@@ -1,776 +1,775 @@
-#!/bin/bash
-# 强制使用 bash 运行，Alpine 默认是 ash
-set -e
+#!/usr/bin/env bash
+#
+# Alpine sing-box Hysteria 2 专属管理面板
+# SPDX-License-Identifier: MIT
+#
+set -Eop pipefail
+export LANG=en_US.UTF-8
 
-CADDYFILE="/etc/caddy/Caddyfile"
-CADDY_DATA="/var/lib/caddy/.local/share/caddy"
-CADDY_CERTS_DIR="/etc/caddy/certs"
+# =========================================================
+# 1. 核心控制与全局环境初始化
+# =========================================================
+readonly BINARY_PATH="/usr/local/bin/sing-box-hy2"
+readonly HY2_CONFIG="/etc/sing-box-hy2/config.json"
+readonly HY2_DIR="/root/proxynode/hy2"
+CONFIG_DIR="/etc/sing-box-hy2"
+OPENRC_SERVICE_PATH="/etc/init.d/sing-box-hy2"
+LOG_FILE="/var/log/sing-box-hy2.log"
+RUN_USER="singbox-hy2"
+
+TMP_DIR=$(mktemp -d -t sb-hy2.XXXXXX)
+
+# 颜色标准规范
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
 RESET="\033[0m"
 
-# ==================== 自动化环境检查与修复 ====================
-if [ ! -f /etc/alpine-release ]; then
-    echo -e "${RED}错误: 本脚本为 Alpine Linux 专属！${RESET}"
-    exit 1
-fi
+info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
+error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
+pause() { echo; read -n 1 -s -r -p "$(echo -e ${GREEN}"按任意键返回菜单..."${RESET})" || true; echo; }
 
-INIT_DEPS=()
-command -v sudo >/dev/null 2>&1 || INIT_DEPS+=("sudo")
-command -v openssl >/dev/null 2>&1 || INIT_DEPS+=("openssl")
-command -v curl >/dev/null 2>&1 || INIT_DEPS+=("curl")
-command -v gawk >/dev/null 2>&1 || INIT_DEPS+=("gawk") 
+cleanup() {
+  [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT INT TERM
 
-if [ ${#INIT_DEPS[@]} -ne 0 ]; then
-    echo -e "${YELLOW}正在自动安装必要依赖: ${INIT_DEPS[*]}...${RESET}"
-    apk update -q && apk add -q "${INIT_DEPS[@]}"
-fi
-
-[ -f /usr/bin/gawk ] && ln -sf /usr/bin/gawk /usr/bin/awk 2>/dev/null || true
-
-if [ ! -d "/etc/caddy" ]; then
-    sudo mkdir -p /etc/caddy
-fi
-
-if [ ! -f "$CADDYFILE" ] || [ ! -s "$CADDYFILE" ]; then
-    echo -e "${YELLOW}正在初始化空的 Caddyfile...${RESET}"
-    sudo tee "$CADDYFILE" >/dev/null <<EOF
-# Caddy Configuration File
-# Managed by Alpine Caddy Panel
-EOF
-fi
-
-[ ! -d "$CADDY_CERTS_DIR" ] && sudo mkdir -p $CADDY_CERTS_DIR && sudo chown -R root:root $CADDY_CERTS_DIR 2>/dev/null || true
-
-pause() {
-    echo -ne "${YELLOW}按回车返回菜单...${RESET}"
-    read -r
+generate_random_password() {
+  dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
 }
 
-get_all_domains() {
-    [ ! -f "$CADDYFILE" ] && return
-    grep -E '^[[:space:]]*([a-zA-Z0-9.-]+|:[0-9]+|http[s]?://[a-zA-Z0-9.-]+)' "$CADDYFILE" | \
-    sed -E 's/https?:\/\///g' | \
-    awk '{print $1}' | \
-    awk -F: '{print $1}' | \
-    grep -Ev '^(file_server|reverse_proxy|root|import|tls|header|encode|route|handle|handle_path|log|respond|rewrite|redir|try_files|{|}|\*)$' | \
-    grep '\.' | sort -u
+is_alpine() {
+  [[ -f /etc/alpine-release ]]
 }
 
-# ==================== 【修改】纯原生状态检测 ====================
-get_system_status() {
-    if ! command -v caddy >/dev/null 2>&1; then
-        STATUS="${RED}未安装${RESET}"
-        VERSION_SHOW="-"
-        SITE_COUNT="0"
-        return
+install_packages() {
+  info "正在刷新 Alpine 仓库并安装核心依赖..."
+  apk update
+  apk add --no-cache bash curl wget tar openssl openrc iproute2 jq grep sed coreutils bind-tools iptables ip6tables gcompat socat python3
+  
+  if [[ -f /etc/init.d/iptables ]]; then
+    rc-update add iptables default >/dev/null 2>&1 || true
+    rc-service iptables start >/dev/null 2>&1 || true
+  fi
+  if [[ -f /etc/init.d/ip6tables ]]; then
+    rc-update add ip6tables default >/dev/null 2>&1 || true
+    rc-service ip6tables start >/dev/null 2>&1 || true
+  fi
+}
+
+create_user() {
+  getent group "$RUN_USER" &>/dev/null || addgroup -S "$RUN_USER"
+  id "$RUN_USER" &>/dev/null || adduser -S -D -H -G "$RUN_USER" -s /sbin/nologin "$RUN_USER"
+}
+
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l|armv7) echo "armv7" ;;
+    *) error "不支持当前架构: $(uname -m)"; exit 8 ;;
+  esac
+}
+
+check_environment() {
+  if ! is_alpine; then
+    error "本脚本仅支持 Alpine Linux 系统。"
+    exit 95
+  fi
+  install_packages
+  create_user
+}
+
+get_installed_version() {
+  if [[ -f "$BINARY_PATH" ]]; then
+    "$BINARY_PATH" version 2>/dev/null | head -n1 | awk '{print $3}' || echo "未知版本"
+  else
+    echo "未安装"
+  fi
+}
+
+get_latest_version() {
+  info "正在从 GitHub 获取 sing-box 最新版本号..."
+  local latest_v
+  latest_v=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r .tag_name | sed 's/^v//')
+  
+  if [[ -z "$latest_v" || "$latest_v" == "null" ]]; then
+    warn "通过 API 获取最新版本失败，尝试备用匹配方案..."
+    latest_v=$(curl -fsSL "https://github.com/SagerNet/sing-box/releases/latest" | grep -oE 'releases/tag/v[0-9.]+' | head -n1 | sed 's|releases/tag/v||')
+  fi
+
+  if [[ -n "$latest_v" ]]; then
+    SINGBOX_VERSION="$latest_v"
+    info "成功获取最新版本: v$SINGBOX_VERSION"
+  else
+    SINGBOX_VERSION="1.13.12"
+    warn "无法获取最新版本，将使用保底版本: v$SINGBOX_VERSION"
+  fi
+}
+
+clear_old_iptables() {
+  if [[ -f "${CONFIG_DIR}/hopping.txt" && -f "${CONFIG_DIR}/main_port.txt" ]]; then
+    local old_hop
+    old_hop=$(cat "${CONFIG_DIR}/hopping.txt")
+    local old_port
+    old_port=$(cat "${CONFIG_DIR}/main_port.txt")
+    local old_start="${old_hop%-*}"
+    local old_end="${old_hop#*-}"
+
+    if [[ -n "$old_start" && -n "$old_end" && -n "$old_port" ]]; then
+      info "正在清洁防火墙残留规则..."
+      iptables -t nat -D PREROUTING -p udp -m multiport --dports "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+      ip6tables -t nat -D PREROUTING -p udp -m multiport --dports "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+      iptables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+      ip6tables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
     fi
+  fi
+}
 
-    # 抛弃 OpenRC 账本，直接用 pgrep 锁定内核里是否有原生 caddy 进程
-    if pgrep -x caddy >/dev/null 2>&1; then
-        STATUS="${GREEN}运行中${RESET}"
+apply_new_iptables() {
+  clear_old_iptables
+  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
+    local hop_val
+    hop_val=$(cat "${CONFIG_DIR}/hopping.txt")
+    local start_p="${hop_val%-*}"
+    local end_p="${hop_val#*-}"
+    
+    info "正在应用 iptables 转发规则: UDP $start_p-$end_p => 主端口 $port"
+    if iptables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port"; then
+      ip6tables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
     else
-        STATUS="${RED}已停止${RESET}"
+      iptables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port"
+      ip6tables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
     fi
-
-    VERSION_SHOW=$(caddy version | awk '{print $1}')
-    SITE_COUNT=$(get_all_domains | wc -l)
+    
+    echo "$port" > "${CONFIG_DIR}/main_port.txt"
+    
+    if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
+    if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
+    info "防火墙端口跳跃规则已固化。"
+  fi
 }
 
-# ==================== 【修改】纯原生安装与原生拉起 ====================
-install_caddy() {
-    if command -v caddy >/dev/null 2>&1; then
-        echo -e "${GREEN}Caddy 已安装${RESET}"
-        pause
-        return
-    fi
-
-    echo -e "${GREEN}正在通过 apk 安装 Caddy...${RESET}"
-    sudo apk update -q && sudo apk add -q caddy
-    
-    # 【核心改动】清除 OpenRC 注册，改用 Caddy 原生后台模式拉起
-    sudo rc-update del caddy default >/dev/null 2>&1 || true
-    echo -e "${YELLOW}正在通过原生模式后台初始化 Caddy 服务...${RESET}"
-    sudo caddy start --config "$CADDYFILE" >/dev/null 2>&1
-    
-    sudo mkdir -p $CADDY_CERTS_DIR 2>/dev/null || true
-    echo -e "${GREEN}Caddy 安装完成并已成功独立运行！${RESET}"
-    pause
+# =========================================================
+# 4. 网络诊断与配置管理辅助
+# =========================================================
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网IP"
 }
 
-update_caddy() {
-    if ! command -v caddy >/dev/null 2>&1; then
-        echo -e "${RED}Caddy 未安装，无法更新${RESET}"
-        pause
-        return
-    fi
-    echo -e "${GREEN}正在检查并更新 Caddy 固件...${RESET}"
-    
-    # 先安全保存进程
-    local was_running=0
-    pgrep -x caddy >/dev/null 2>&1 && was_running=1
-    
-    sudo killall -9 caddy >/dev/null 2>&1 || true
-    sudo apk update -q && sudo apk add -q --upgrade caddy
-    
-    if [ $was_running -eq 1 ]; then
-        sudo caddy start --config "$CADDYFILE" >/dev/null 2>&1
-    fi
-    echo -e "${GREEN}Caddy 更新程序执行完毕${RESET}"
-    pause
+check_port() {
+  local port="$1"
+  if ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
+    return 1
+  fi
+  return 0
 }
 
-# ==================== 【修改】纯原生强力卸载 ====================
-uninstall_caddy() {
-    if ! command -v caddy >/dev/null 2>&1; then
-        echo -e "${YELLOW}Caddy 未安装${RESET}"
-        pause
-        return
+is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
+
+get_random_port() {
+  local rand_port
+  while true; do
+    rand_port=$(shuf -i 2000-65535 -n 1)
+    if check_port "$rand_port"; then
+      echo "$rand_port" && return 0
     fi
-    echo -ne "${YELLOW}确定要彻底卸载 Caddy 吗？此操作不可逆！(y/n): ${RESET}"; read -r CONFIRM
-    if [[ "$CONFIRM" != "y" ]]; then
-        echo -e "${YELLOW}已取消卸载${RESET}"
-        pause
-        return
-    fi
-    echo -e "${GREEN}正在强制注销 Caddy 进程群...${RESET}"
-    
-    # 【核心改动】干净利落地用 -9 信号物理超度进程
-    sudo killall -9 caddy >/dev/null 2>&1 || true
-    sudo rc-update del caddy default >/dev/null 2>&1 || true
-    sudo apk del caddy
-    sudo rm -rf /etc/caddy /var/lib/caddy /var/log/caddy
-    echo -e "${GREEN}Caddy 已从系统中完全原生抹除${RESET}"
-    pause
+  done
 }
 
-# ==================== 【修改】纯原生秒级重载/复活控制流 ====================
-validate_and_reload() {
-    local BACKUP_FILE=$1
-    echo -e "${YELLOW}正在对调整后的 Caddyfile 进行原生语法安全性检查...${RESET}"
+get_hy2_status() {
+  if rc-service sing-box-hy2 status 2>/dev/null | grep -q "started"; then
+    echo "RUNNING"
+  else
+    echo "STOPPED"
+  fi
+}
+
+get_current_port_display() {
+  if [[ -f "$HY2_CONFIG" ]]; then
+    local main_port jump_range="无"
+    main_port=$(jq -r '.inbounds[0].listen_port // empty' "$HY2_CONFIG" 2>/dev/null)
+    [[ -f "${CONFIG_DIR}/hopping.txt" ]] && jump_range=$(cat "${CONFIG_DIR}/hopping.txt")
     
-    # 1. 验证新配置文件语法
-    if local ERR_MSG=$(sudo caddy validate --config "$CADDYFILE" 2>&1); then
-        echo -e "${GREEN}✔ 语法验证通过！正在应用配置...${RESET}"
+    if [[ "$jump_range" != "无" ]]; then
+      echo "${main_port} [${jump_range}]"
+    else
+      echo "${main_port:- -}"
+    fi
+  else echo "-"; fi
+}
+
+# =========================================================
+# 5. 面板节点配置生成核心逻辑 (Hysteria 2)
+# =========================================================
+
+
+# 精准修复外部自定义证书的穿透访问权限，确保非 root 运行的 singbox-hy2 用户有权读取
+fix_external_cert_permission() {
+  local cert="$1"
+  local key="$2"
+  
+  # 针对 /root 目录的致命硬拦截
+  if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
+    error "致命拒绝: 检测到您的证书位于 /root/ 目录下！"
+    warn "原因分析: /root 目录权限极为严苛(700)，任何非 root 用户(包括 singbox-hy2)均无权穿透。"
+    warn "         即使强行赋予文件 644 权限，内核也会因路径阻塞拒绝读取。"
+    info "权威推荐: 请在 acme.sh 命令中加上 --install-cert 指令，将证书自动分发到公共目录"
+    info "         (例如: /etc/sing-box-hy2/certs/ 或 /etc/ssl/ 文件夹下) 再试。"
+    return 1
+  fi
+
+  # 1. 自动提取并【逐级向上】放行外部证书的所有上级目录
+  info "正在为外部证书路径逐级赋予检索穿透权限 (+x) ..."
+  local dir
+  for file in "$cert" "$key"; do
+    dir=$(dirname "$file")
+    while [[ "$dir" != "/" && -n "$dir" ]]; do
+      chmod o+x "$dir" 2>/dev/null || true
+      
+      # 如果系统支持 ACL，精准安全地给 sing-box 账号加上特殊通行证
+      if command -v setfacl >/dev/null 2>&1; then
+        setfacl -m u:"$RUN_USER":rx "$dir" 2>/dev/null || true
+      fi
+      dir=$(dirname "$dir")
+    done
+  done
+  
+  # 2. 确保证书和密钥文件本身可读
+  info "正在规范化外部证书与私钥文件的读取权限 ..."
+  chmod 644 "$cert" 2>/dev/null || true
+  chmod 644 "$key" 2>/dev/null || true
+  
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m u:"$RUN_USER":r "$cert" "$key" 2>/dev/null || true
+  fi
+  return 0
+}
+
+
+inst_cert() {
+  mkdir -p "$CONFIG_DIR/certs"
+
+  echo "---------------------------------------------"
+  echo -e "Hysteria 2 协议证书申请方式如下："
+  echo -e " 1) 必应自签证书 "
+  echo -e " 2) Acme自动申请 (需放行 80 端口)${YELLOW}（默认）${RESET}"
+  echo -e " 3) 自定义证书路径"
+  echo "---------------------------------------------"
+  local certInput
+  read -rp "请输入选项 [1-3] (直接回车默认Acme 脚本自动申请): " certInput
+  certInput=${certInput:-2}
+
+  cert_path="$CONFIG_DIR/certs/cert.pem"
+  key_path="$CONFIG_DIR/certs/key.pem"
+
+  if [[ $certInput == 2 ]]; then
+    if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
+      warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。"
+    fi
+
+    if [[ -f "$cert_path" && -f "$key_path" && -s "$cert_path" && -s "$key_path" && -f "$CONFIG_DIR/certs/ca.log" ]]; then
+      hy2_domain=$(cat "$CONFIG_DIR/certs/ca.log")
+      info "检测到已有域名 [${hy2_domain}] 的安全区证书，正在复用..."
+    else
+      read -rp "请输入需要申请证书的域名: " domain
+      [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
+      
+      info "正在检查并安装 Acme.sh 依赖..."
+      local acme_cmd="/root/.acme.sh/acme.sh"
+      if [[ ! -f "$acme_cmd" ]]; then
+        curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
+      fi
+      
+      "$acme_cmd" --set-default-ca --server letsencrypt
+      
+      info "正在向 Let's Encrypt 申请证书..."
+      if [[ "$(get_public_ip)" =~ ":" ]]; then
+        "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
+      else
+        "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
+      fi
+      
+      # 【智能状态探针】纯 OpenRC 架构：有配置(续期)则重启，无配置(初装)则静默
+      local reload_cmd="[ -f /etc/sing-box-hy2/config.json ] && /sbin/rc-service sing-box-hy2 restart || echo '[信息] 初次部署，跳过服务同步'"
+      
+      if "$acme_cmd" --install-cert -d "${domain}" \
+        --key-file "$key_path" \
+        --fullchain-file "$cert_path" \
+        --ecc \
+        --reloadcmd "$reload_cmd"; then
+        echo "$domain" > "$CONFIG_DIR/certs/ca.log"
+        hy2_domain=$domain
+        info "Acme 证书申请并成功分发！"
+      else
+        error "Acme 证书申请失败，自动切换回自签模式。"
+        certInput=1
+      fi
+    fi
+  elif [[ $certInput == 3 ]]; then
+    while true; do
+      local user_cert user_key
+      read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
+      read -rp "请输入密钥文件 (privkey.pem/key) 的路径: " user_key
+      read -rp "请输入证书对应的域名: " hy2_domain
+      
+      if [[ -f "$user_cert" && -f "$user_key" ]]; then
+        rm -f "$cert_path" "$key_path"
         
-        # 2. 判断进程状态，决定走原生重载(reload)还是原生启动(start)
-        if pgrep -x caddy >/dev/null 2>&1; then
-            # 进程在跑，使用 caddy 原生的零断网 reload 信号，极其优雅
-            if sudo caddy reload --config "$CADDYFILE" >/dev/null 2>&1; then
-                echo -e "${GREEN}✔ Caddy 原生配置已完成零丢包热重载！${RESET}"
-                return 0
-            fi
-        fi
-        
-        # 3. 进程没在跑或者热重载意外卡死，执行原生强制复活
-        sudo killall -9 caddy >/dev/null 2>&1 || true
-        if sudo caddy start --config "$CADDYFILE" >/dev/null 2>&1; then
-            echo -e "${GREEN}✔ Caddy 独立主服务已强力冷启动，配置生效！${RESET}"
-            return 0
+        # 建立软链接或拷贝之前，先穿透修复外部文件和目录的读取权限
+        if fix_external_cert_permission "$user_cert" "$user_key"; then
+          ln -sf "$user_cert" "$cert_path"
+          ln -sf "$user_key" "$key_path"
+          info "自定义外部证书已通过安全软链接无缝同步。"
+          break
         else
-            echo -e "${RED}❌ 致命错误: 无法拉起原生 Caddy 二进制，请检查 80/443 端口是否被占用！${RESET}"
-            return 1
+          return 1
         fi
-    else
-        echo -e "${RED}❌ 错误: Caddyfile 语法检查未通过！拒绝写入新配置。${RESET}"
-        echo -e "${YELLOW}---------------- [Caddy 核心报错日志] ----------------${RESET}"
-        echo -e "$ERR_MSG"
-        echo -e "${YELLOW}------------------------------------------------------${RESET}"
-        if [ -n "$BACKUP_FILE" ] && [ -f "$BACKUP_FILE" ]; then
-            echo -e "${GREEN}🔄 系统检测到潜在崩溃风险，已自动秒级回滚。${RESET}"
-            sudo cp -f "$BACKUP_FILE" "$CADDYFILE"
-        fi
-        return 1
-    fi
-}
+      else
+        error "找不到输入的证书文件，请重新确认路径。"
+        echo "---------------------------------------------"
+      fi
+    done
+  fi
 
-# ==================== 【修改】纯原生菜单重载调用 ====================
-reload_caddy() {
-    if pgrep -x caddy >/dev/null 2>&1; then
-        validate_and_reload ""
-    else
-        echo -e "${YELLOW}Caddy 当前未运行，正在尝试纯原生方式拉起服务...${RESET}"
-        sudo killall -9 caddy >/dev/null 2>&1 || true
-        if sudo caddy start --config "$CADDYFILE" >/dev/null 2>&1; then
-            echo -e "${GREEN}✅ 原生 Caddy 服务启动成功！${RESET}"
-        else
-            echo -e "${RED}❌ 启动失败，请检查端口占用。${RESET}"
-        fi
-    fi
-    pause
-}
-
-remove_domain_block() {
-    local tgt=$1
-    sudo awk -v domain="$tgt" '
-    BEGIN { inside = 0; brace_count = 0 }
-    $0 ~ "^[[:space:]]*" domain "([[:space:],:{]|$)" {
-        inside = 1
-        if ($0 ~ "{") brace_count += gsub(/{/, "{")
-        if ($0 ~ "}") brace_count -= gsub(/}/, "}")
-        next
-    }
-    inside {
-        if ($0 ~ "{") brace_count += gsub(/{/, "{")
-        if ($0 ~ "}") brace_count -= gsub(/}/, "}")
-        if (brace_count <= 0 && $0 ~ "}") {
-            inside = 0
-        }
-        next
-    }
-    { print }
-    ' "$CADDYFILE" > /tmp/caddyfile.tmp && sudo mv /tmp/caddyfile.tmp "$CADDYFILE"
-}
-
-add_site() {
-    echo -ne "请输入域名 (例如: example.com)： "; read -r DOMAIN
-    [ -z "$DOMAIN" ] && return
-    echo -ne "是否需要 h2c/gRPC 代理？(y/n，回车默认 n)： "; read -r H2C
-    H2C=${H2C:-n}
+  if [[ $certInput == 1 ]]; then
+    info "将使用必应自签证书作为 Hysteria 2 外壳的节点证书"
+    rm -f "$cert_path" "$key_path"
+    openssl ecparam -genkey -name prime256v1 -out "$key_path"
+    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
+    hy2_domain="www.bing.com"
     
-    local TS=$(date +%s 2>/dev/null || echo "bk")
-    local BK_FILE="/tmp/caddyfile.bak.$TS"
-    sudo cp "$CADDYFILE" "$BK_FILE"
+    chmod 644 "$cert_path" || true
+    chmod 600 "$key_path" || true
+  fi
 
-    SITE_CONFIG="\n${DOMAIN} {\n"
-    if [[ "$H2C" == "y" ]]; then
-        echo -ne "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： "; read -r H2C_PATH
-        echo -ne "请输入内网目标地址 (例如 127.0.0.1:8008)： "; read -r H2C_TARGET
-        SITE_CONFIG+="    reverse_proxy ${H2C_PATH} h2c://${H2C_TARGET}\n"
-    fi
-
-    echo -ne "请输入普通 HTTP 代理目标 (例如 127.0.0.1:8008)： "; read -r HTTP_TARGET
-    HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
-    SITE_CONFIG+="    reverse_proxy ${HTTP_TARGET}\n}\n"
-
-    echo -e "$SITE_CONFIG" | sudo tee -a "$CADDYFILE" >/dev/null
-    if validate_and_reload "$BK_FILE"; then
-        echo -e "${GREEN}站点 ${DOMAIN} 添加成功${RESET}"
-    fi
-    rm -f "$BK_FILE"
-    pause
+  # 规范所有权：使用 -h 规避穿透修改外部真实证书所有权
+  chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
+  chown -h ${RUN_USER}:${RUN_USER} "$cert_path" "$key_path" 2>/dev/null || true
 }
 
-check_domains_status() {
-    clear
-    echo -e "${YELLOW}========================================${RESET}"
-    echo -e "${YELLOW}        ◈ 域名证书状态实时监控 ◈            ${RESET}"
-    echo -e "${YELLOW}========================================${RESET}"
+inst_port() {
+  local default_port=""
+  if [[ -f "$HY2_CONFIG" ]]; then
+    default_port=$(jq -r '.inbounds[0].listen_port // empty' "$HY2_CONFIG" 2>/dev/null)
+  fi
 
-    DOMAINS=($(get_all_domains))
-    if [ ${#DOMAINS[@]} -eq 0 ]; then
-        echo -e "${RED} ❌ 当前系统未检测到任何反代站点配置。${RESET}"
-        echo -e "${YELLOW}----------------------------------------${RESET}"
-        pause
-        return
-    fi
+  local prompt_msg="设置 Hysteria 2 服务端监听主端口 [1-65535] (回车随机分配): "
+  [[ -n "$default_port" ]] && prompt_msg="设置 Hysteria 2 服务端监听主端口 [当前: ${default_port}, 回车不修改]: "
 
-    for DOMAIN in "${DOMAINS[@]}"; do
-        local CERT_PATH=""
-        local TYPE="自动申请"
+  while true; do
+    read -rp "$prompt_msg" port
+    if [[ -z "$port" ]]; then
+      if [[ -n "$default_port" ]]; then port="$default_port" && break
+      else
+        port=$(get_random_port)
+        info "已为您随机分配未被占用端口: $port" && break
+      fi
+    elif is_valid_port "$port"; then
+      if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
+        error "端口 ${port} 已被其它程序占用，请更换。" && continue
+      fi
+      break
+    else error "请输入有效的端口数字 (1-65535)"; fi
+  done
 
-        if [ -d "$CADDY_DATA" ]; then
-            CERT_PATH=$(sudo find "$CADDY_DATA" -type f -name "$DOMAIN.crt" 2>/dev/null | head -n 1)
-        fi
+  # =========================================================
+  # 【记忆重构核心】读取并展示现有的端口跳跃配置
+  # =========================================================
+  local default_hop=""
+  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
+    default_hop=$(cat "${CONFIG_DIR}/hopping.txt")
+  fi
 
-        if [ -z "$CERT_PATH" ] && grep -A 5 "${DOMAIN}" "$CADDYFILE" | grep -q "tls "; then
-            local CUSTOM_PATH=$(grep -A 5 "${DOMAIN}" "$CADDYFILE" | grep "tls " | awk '{print $2}' | tr -d '\r\n')
-            if [ -e "$CUSTOM_PATH" ]; then
-                CERT_PATH="$CUSTOM_PATH"
-                TYPE="自定义证书 (软链接保持更新)"
-            fi
-        fi
-
-        echo -e "${YELLOW}◈ 域名: ${RESET}${YELLOW}${DOMAIN}${RESET}"
-        echo -e "  ├─ ${YELLOW}证书类型: ${RESET}${TYPE}"
-
-        if [ -n "$CERT_PATH" ] && [ -e "$CERT_PATH" ]; then
-            END_DATE=$(openssl x509 -enddate -noout -in "$CERT_PATH" | cut -d= -f2)
-            if END_TS=$(date -d "$END_DATE" +%s 2>/dev/null) || END_TS=$(date -D "%b %d %T %Y %Z" -d "$END_DATE" +%s 2>/dev/null); then
-                NOW_TS=$(date +%s)
-                DAYS_LEFT=$(( (END_TS - NOW_TS) / 86400 ))
-                
-                if [ $DAYS_LEFT -ge 30 ]; then
-                    STATUS_COLOR="${GREEN}"
-                    STATUS_TEXT="正常有效"
-                elif [ $DAYS_LEFT -ge 0 ]; then
-                    STATUS_COLOR="${YELLOW}"
-                    STATUS_TEXT="即将过期"
-                else
-                    STATUS_COLOR="${RED}"
-                    STATUS_TEXT="已过期"
-                fi
-                echo -e "  ├─ ${YELLOW}到期时间: ${RESET}$(date -d "@$END_TS" +"%Y-%m-%d" 2>/dev/null || echo "$END_DATE")"
-                echo -e "  ├─ ${YELLOW}剩余天数: ${RESET}${STATUS_COLOR}${DAYS_LEFT} 天${RESET}"
-                echo -e "  └─ ${YELLOW}运行状态: ${RESET}${STATUS_COLOR}${STATUS_TEXT}${RESET}"
-            else
-                if openssl x509 -checkend 2592000 -in "$CERT_PATH" >/dev/null; then
-                    echo -e "  └─ ${YELLOW}运行状态: ${RESET}${GREEN}正常有效 (剩余 > 30天)${RESET}"
-                else
-                    echo -e "  └─ ${YELLOW}运行状态: ${RESET}${YELLOW}即将过期或已过期${RESET}"
-                fi
-            fi
-        else
-            echo -e "  └─ ${YELLOW}运行状态: ${RESET}${RED}未找到证书或尚未签发成功${RESET}"
-        fi
-        echo -e "${YELLOW}----------------------------------------${RESET}"
-    done
-    pause
-}
-
-delete_site() {
-    DOMAINS=($(get_all_domains))
-    if [ ${#DOMAINS[@]} -eq 0 ]; then
-        echo -e "${YELLOW}没有可删除的域名${RESET}"
-        pause
-        return
-    fi
-
-    echo -e "${GREEN}请选择要删除的域名编号（输入0返回菜单）:${RESET}"
-    for i in "${!DOMAINS[@]}"; do
-        echo "$((i+1))) ${DOMAINS[$i]}"
-    done
-    echo -ne "输入编号： "; read -r NUM
-    if [[ "$NUM" == "0" || -z "$NUM" ]]; then return; fi
-
-    if ! [[ "$NUM" =~ ^[0-9]+$ ]] || [ "$NUM" -lt 1 ] || [ "$NUM" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效编号${RESET}"
-        pause
-        return
-    fi
-
-    DOMAIN="${DOMAINS[$((NUM-1))]}"
-    local TS=$(date +%s 2>/dev/null || echo "bk")
-    local BK_FILE="/tmp/caddyfile.bak.$TS"
-    sudo cp "$CADDYFILE" "$BK_FILE"
-
-    remove_domain_block "$DOMAIN"
-
-    if validate_and_reload "$BK_FILE"; then
-        echo -e "${GREEN}域名 ${DOMAIN} 已彻底从配置中移除！${RESET}"
-        sudo rm -f "$CADDY_CERTS_DIR/${DOMAIN}"* "$CADDY_CERTS_DIR/emby_${DOMAIN}"*
-    fi
-    rm -f "$BK_FILE"
-    pause
-}
-
-modify_site() {
-    DOMAINS=($(get_all_domains))
-    if [ ${#DOMAINS[@]} -eq 0 ]; then
-        echo -e "${YELLOW}没有可修改的域名${RESET}"
-        pause
-        return
-    fi
-
-    echo -e "${GREEN}请选择要修改的域名编号（输入0返回菜单）:${RESET}"
-    for i in "${!DOMAINS[@]}"; do
-        echo "$((i+1))) ${DOMAINS[$i]}"
-    done
-    echo -ne "输入编号： "; read -r NUM
-    if [[ "$NUM" == "0" || -z "$NUM" ]]; then return; fi
-
-    if ! [[ "$NUM" =~ ^[0-9]+$ ]] || [ "$NUM" -lt 1 ] || [ "$NUM" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效编号${RESET}"
-        pause
-        return
-    fi
-
-    DOMAIN="${DOMAINS[$((NUM-1))]}"
-    local OLD_TLS_LINE=$(grep -A 5 "${DOMAIN}" "$CADDYFILE" | grep "tls " | head -n 1 | tr -d '\r')
-
-    echo -ne "请输入普通 HTTP 代理目标 (例如 127.0.0.1:8008)： "; read -r HTTP_TARGET
-    HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
-
-    echo -ne "是否需要 h2c/gRPC 代理？(y/n，回车默认 n)： "; read -r H2C
-    H2C=${H2C:-n}
-    H2C_CONFIG=""
-    if [[ "$H2C" == "y" ]]; then
-        echo -ne "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： "; read -r H2C_PATH
-        echo -ne "请输入内网目标地址 (例如 127.0.0.1:8008)： "; read -r H2C_TARGET
-        H2C_CONFIG="    reverse_proxy ${H2C_PATH} h2c://${H2C_TARGET}\n"
-    fi
-
-    local TS=$(date +%s 2>/dev/null || echo "bk")
-    local BK_FILE="/tmp/caddyfile.bak.$TS"
-    sudo cp "$CADDYFILE" "$BK_FILE"
-
-    remove_domain_block "$DOMAIN"
-    
-    NEW_CONFIG="\n${DOMAIN} {\n"
-    if [ -n "$OLD_TLS_LINE" ]; then
-        NEW_CONFIG+="${OLD_TLS_LINE}\n"
-    fi
-    NEW_CONFIG+="${H2C_CONFIG}    reverse_proxy ${HTTP_TARGET}\n}\n"
-    
-    echo -e "$NEW_CONFIG" | sudo tee -a "$CADDYFILE" >/dev/null
-    if validate_and_reload "$BK_FILE"; then
-        echo -e "${GREEN}域名 ${DOMAIN} 配置已成功修改！${RESET}"
-    fi
-    rm -f "$BK_FILE"
-    pause
-}
-
-link_and_fix_permissions() {
-    local src_file=$1
-    local symlink_dst=$2
-
-    if [ ! -f "$src_file" ]; then
-        echo -e "${RED}❌ 错误: 源证书/密钥文件 [${src_file}] 实际不存在，请检查输入路径！${RESET}"
-        return 1
-    fi
-
-    sudo chmod 644 "$src_file" 2>/dev/null || true
-
-    local dir_path=$(dirname "$src_file")
-    while [ "$dir_path" != "/" ] && [ -n "$dir_path" ]; do
-        if [[ "$dir_path" == /root* ]]; then
-            echo -e "${RED}❌ 拒绝: 检测到源证书位于 /root 极度隐秘目录下。${RESET}"
-            echo -e "${YELLOW}💡 强烈建议: 请将 acme 证书导出路径改为 /etc/ssl/ 或 /etc/amee/ 等公共非 root 目录下！${RESET}"
-            return 1
-        fi
-        sudo chmod +x "$dir_path" 2>/dev/null || true
-        dir_path=$(dirname "$dir_path")
-    done
-
-    sudo rm -f "$symlink_dst"
-    sudo ln -sf "$src_file" "$symlink_dst"
+  echo "---------------------------------------------"
+  if [[ -n "$default_hop" ]]; then
+    echo -e "Hysteria 2 端口群使用模式 [当前已启用跳跃: ${default_hop}]："
+  else
+    echo -e "Hysteria 2 端口群使用模式 ："
+  fi
+  echo -e " 1) 单端口模式"
+  echo -e " 2) 端口跳跃模式 ${YELLOW}（默认)${RESET}"
+  echo "---------------------------------------------"
+  
+  local jumpInput
+  read -rp "请选择端口模式 [1-2] (直接回车默认不变或选择默认项): " jumpInput
+  
+  # 如果用户直接回车，且以前有跳跃记录，则直接保持现有的 iptables 逻辑并退出函数
+  if [[ -z "$jumpInput" && -n "$default_hop" ]]; then
+    info "检测到回车确认，将 100% 保持原有端口跳跃配置 [${default_hop}] 保持不变。"
+    # 刷新主端口记录，防止主端口变了但跳跃目标没变
+    echo "$port" > "${CONFIG_DIR}/main_port.txt"
     return 0
-}
+  fi
 
-add_site_with_cert() {
-    echo -ne "请输入域名 (example.com)： "; read -r DOMAIN
-    [ -z "$DOMAIN" ] && return
-    echo -ne "是否需要 h2c/gRPC 代理？(y/n，回车默认 n)： "; read -r H2C
-    H2C=${H2C:-n}
+  # 如果没有旧配置且直接回车，则走向默认选项 2
+  jumpInput=${jumpInput:-2}
 
-    echo -ne "请输入【源证书文件】绝对路径 (.pem/.crt)： "; read -r RAW_CERT_PATH
-    echo -ne "请输入【源私钥文件】绝对路径 (.key)： "; read -r RAW_KEY_PATH
+  # 只有在用户明确重新选择模式时，才清理旧防火墙规则
+  clear_old_iptables
 
-    local LINK_CERT="$CADDY_CERTS_DIR/${DOMAIN}.fullchain.pem"
-    local LINK_KEY="$CADDY_CERTS_DIR/${DOMAIN}.privkey.key"
-
-    echo -e "${YELLOW}正在智能打通父目录权限并建立不占空间的软链接...${RESET}"
-    if ! link_and_fix_permissions "$RAW_CERT_PATH" "$LINK_CERT"; then pause; return; fi
-    if ! link_and_fix_permissions "$RAW_KEY_PATH" "$LINK_KEY"; then pause; return; fi
-
-    local TS=$(date +%s 2>/dev/null || echo "bk")
-    local BK_FILE="/tmp/caddyfile.bak.$TS"
-    sudo cp "$CADDYFILE" "$BK_FILE"
-
-    SITE_CONFIG="\n${DOMAIN} {\n"
-    SITE_CONFIG+="    tls ${LINK_CERT} ${LINK_KEY}\n"
-
-    if [[ "$H2C" == "y" ]]; then
-        echo -ne "请输入 h2c 代理路径 (例如 /proto.NezhaService/*)： "; read -r H2C_PATH
-        echo -ne "请输入内网目标地址 (例如 127.0.0.1:8008)： "; read -r H2C_TARGET
-        SITE_CONFIG+="    reverse_proxy ${H2C_PATH} h2c://${H2C_TARGET}\n"
+  if [[ $jumpInput == 2 ]]; then
+    local old_start="" old_end=""
+    if [[ -n "$default_hop" ]]; then
+      old_start="${default_hop%-*}"
+      old_end="${default_hop#*-}"
     fi
 
-    echo -ne "请输入普通 HTTP 代理目标 (例如 127.0.0.1:8008)： "; read -r HTTP_TARGET
-    HTTP_TARGET=${HTTP_TARGET:-127.0.0.1:8008}
-    SITE_CONFIG+="    reverse_proxy ${HTTP_TARGET}\n}\n"
-
-    echo -e "$SITE_CONFIG" | sudo tee -a "$CADDYFILE" >/dev/null
-
-    if validate_and_reload "$BK_FILE"; then
-        echo -e "${GREEN}站点 ${DOMAIN} (动态软链证书模式) 添加成功！${RESET}"
-        echo -e "${GREEN}今后源证书文件更新时，Caddy 将会自动同步加载最新的凭证。${RESET}"
-    fi
-    rm -f "$BK_FILE"
-    pause
-}
-
-add_emby_site_caddy() {
-    echo -ne "${GREEN}请输入您的域名 (例: emby.example.com): ${RESET}"; read -r DOMAIN
-    [ -z "$DOMAIN" ] && return
-    echo -ne "${GREEN}请输入 Emby 目标地址 (例: http://127.0.0.1:8096): ${RESET}"; read -r TARGET
-    
-    local TARGET_HOST=$(echo "$TARGET" | awk -F[/:] '{print $4}')
-    local TS=$(date +%s 2>/dev/null || echo "bk")
-    local BK_FILE="/tmp/caddyfile.bak.$TS"
-    sudo cp "$CADDYFILE" "$BK_FILE"
-
-    sudo tee -a "$CADDYFILE" >/dev/null <<EOF
-
-$DOMAIN {
-    encode gzip
-    reverse_proxy $TARGET {
-        flush_interval -1
-        header_up Host {upstream_hostport}
-        header_up X-Real-IP {remote_host}
-        header_up X-Forwarded-For {remote_host}
-EOF
-
-    if [[ "$TARGET" == https* ]]; then
-        sudo tee -a "$CADDYFILE" >/dev/null <<EOF
-        header_up Host $TARGET_HOST
-        transport http {
-            tls_server_name $TARGET_HOST
-        }
-EOF
-    fi
-
-    sudo tee -a "$CADDYFILE" >/dev/null <<EOF
-    }
-    header {
-        Access-Control-Allow-Origin *
-        Access-Control-Allow-Methods "GET, POST, OPTIONS, DELETE, PUT"
-        Access-Control-Allow-Headers "X-Emby-Authorization, Content-Type, Authorization, X-Requested-With"
-    }
-}
-EOF
-    if validate_and_reload "$BK_FILE"; then
-        echo -e "${GREEN}配置已生成！访问地址: https://${DOMAIN}${RESET}"
-    fi
-    rm -f "$BK_FILE"
-    pause
-}
-
-add_emby_split_site_caddy() {
-    echo -ne "${GREEN}请输入您的域名(例: emby.example.com): ${RESET}"; read -r DOMAIN
-    [ -z "$DOMAIN" ] && return
-    echo -ne "${GREEN}请输入 Emby 主站地址: ${RESET}"; read -r T_MAIN
-    echo -ne "${GREEN}请输入推流后端地址: ${RESET}"; read -r T_STREAM
-
-    local STREAM_HOST=$(echo "$T_STREAM" | awk -F[/:] '{print $4}')
-    local TS=$(date +%s 2>/dev/null || echo "bk")
-    local BK_FILE="/tmp/caddyfile.bak.$TS"
-    sudo cp "$CADDYFILE" "$BK_FILE"
-
-    sudo tee -a "$CADDYFILE" >/dev/null <<EOF
-
-$DOMAIN {
-    handle_path /s1/* {
-        reverse_proxy $T_STREAM {
-            flush_interval -1
-            header_up Host $STREAM_HOST
-            header_up X-Real-IP ""
-            header_up X-Forwarded-For ""
-        }
-    }
-    handle {
-        reverse_proxy $T_MAIN {
-            flush_interval -1
-            header_up Host {upstream_hostport}
-            header_up X-Real-IP ""
-            header_up X-Forwarded-For ""
-        }
-    }
-}
-EOF
-    if validate_and_reload "$BK_FILE"; then
-        echo -e "${GREEN}访问地址: https://${DOMAIN}${RESET}"
-    fi
-    rm -f "$BK_FILE"
-    pause
-}
-
-add_emby_custom_cert_caddy() {
-    echo -ne "${GREEN}请输入您的域名 (例: emby.example.com): ${RESET}"; read -r DOMAIN
-    [ -z "$DOMAIN" ] && return
-    echo -ne "${GREEN}请输入源证书绝对路径 (.pem/.crt): ${RESET}"; read -r RAW_CERT_PATH
-    echo -ne "${GREEN}请输入源私钥绝对路径 (.key): ${RESET}"; read -r RAW_KEY_PATH
-
-    local LINK_CERT="$CADDY_CERTS_DIR/emby_${DOMAIN}.fullchain.pem"
-    local LINK_KEY="$CADDY_CERTS_DIR/emby_${DOMAIN}.privkey.key"
-
-    if ! link_and_fix_permissions "$RAW_CERT_PATH" "$LINK_CERT"; then pause; return; fi
-    if ! link_and_fix_permissions "$RAW_KEY_PATH" "$LINK_KEY"; then pause; return; fi
-
-    echo -ne "${GREEN}请输入 Emby 目标地址 (例: http://127.0.0.1:8096): ${RESET}"; read -r TARGET
-    local TARGET_HOST=$(echo "$TARGET" | awk -F[/:] '{print $4}')
-    
-    local TS=$(date +%s 2>/dev/null || echo "bk")
-    local BK_FILE="/tmp/caddyfile.bak.$TS"
-    sudo cp "$CADDYFILE" "$BK_FILE"
-
-    sudo tee -a "$CADDYFILE" >/dev/null <<EOF
-
-$DOMAIN {
-    tls $LINK_CERT $LINK_KEY
-    encode gzip
-    reverse_proxy $TARGET {
-        flush_interval -1
-        header_up Host {upstream_hostport}
-        header_up X-Real-IP {remote_host}
-        header_up X-Forwarded-For {remote_host}
-EOF
-
-    if [[ "$TARGET" == https* ]]; then
-        sudo tee -a "$CADDYFILE" >/dev/null <<EOF
-        header_up Host $TARGET_HOST
-        transport http {
-            tls_server_name $TARGET_HOST
-        }
-EOF
-    fi
-
-    sudo tee -a "$CADDYFILE" >/dev/null <<EOF
-    }
-    header {
-        Access-Control-Allow-Origin *
-        Access-Control-Allow-Methods "GET, POST, OPTIONS, DELETE, PUT"
-        Access-Control-Allow-Headers "X-Emby-Authorization, Content-Type, Authorization, X-Requested-With"
-    }
-}
-EOF
-    if validate_and_reload "$BK_FILE"; then
-        echo -e "${GREEN}自定义软链证书 Emby 配置已成功生成！${RESET}"
-    fi
-    rm -f "$BK_FILE"
-    pause
-}
-
-emby_proxy_menu() {
     while true; do
-        clear
-        echo -e "${GREEN}==== Emby 反代管理 ====${RESET}"
-        echo -e "${GREEN}1. 普通反代(自动申请证书)${RESET}"
-        echo -e "${GREEN}2. 主站+推流重定向(自动申请证书)${RESET}"
-        echo -e "${GREEN}3. 普通反代(使用自定义软链证书)${RESET}"
-        echo -e "${GREEN}0. 返回主菜单${RESET}"
-        echo -ne "${GREEN}请选择: ${RESET}" 
-        read -r emby_choice
-        case $emby_choice in
-            1) add_emby_site_caddy; break ;;
-            2) add_emby_split_site_caddy; break ;;
-            3) add_emby_custom_cert_caddy; break ;;
-            0) return ;;
-            *) echo -e "${RED}无效选项${RESET}"; pause ;;
-        esac
+      local start_prompt="设置外部跳跃起始端口 (建议10000-65535)"
+      [[ -n "$old_start" ]] && start_prompt="设置外部跳跃起始端口 [当前: ${old_start}, 回车不修改]"
+      read -rp "${start_prompt}: " firstport
+      firstport=${firstport:-$old_start}
+
+      local end_prompt="设置外部跳跃末尾端口 (必须大于起始端口)"
+      [[ -n "$old_end" ]] && end_prompt="设置外部跳跃末尾端口 [当前: ${old_end}, 回车不修改]"
+      read -rp "${end_prompt}: " endport
+      endport=${endport:-$old_end}
+
+      if is_valid_port "$firstport" && is_valid_port "$endport" && [[ $firstport -lt $endport ]]; then 
+        break
+      else 
+        error "输入无效！起始端口必须小于末尾端口，且范围在 1-65535 之间，请重新输入。"; 
+      fi
     done
+    echo "$firstport-$endport" > "${CONFIG_DIR}/hopping.txt"
+  else
+    # 用户明确选择了 1 (单端口模式)，清除记录文件
+    rm -f "${CONFIG_DIR}/hopping.txt" "${CONFIG_DIR}/main_port.txt"
+    info "已成功切换回单端口纯净模式"
+    if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
+    if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
+  fi
 }
 
-view_sites() {
-    DOMAINS=($(get_all_domains))
-    if [ ${#DOMAINS[@]} -eq 0 ]; then
-        echo -e "${YELLOW}没有已配置的域名${RESET}"
-        pause
-        return
-    fi
+write_and_show_config() {
+  local HOSTNAME
+  HOSTNAME=$(hostname -s | sed 's/ /_/g')
+  local vps_ip
+  vps_ip=$(get_public_ip)
+  local last_ip="$vps_ip"
+  [[ "$vps_ip" =~ ":" ]] && last_ip="[$vps_ip]"
 
-    echo -e "${GREEN}请选择要查看证书信息的域名编号（输入0返回菜单）:${RESET}"
-    for i in "${!DOMAINS[@]}"; do
-        echo "$((i+1))) ${DOMAINS[$i]}"
-    done
+  local is_insecure="0"
+  local skip_cert="false"
+  if [[ "$hy2_domain" == "www.bing.com" ]]; then
+    is_insecure="1"
+    skip_cert="true"
+  fi
 
-    echo -ne "输入编号： "; read -r NUM
-    if [[ "$NUM" == "0" || -z "$NUM" ]]; then return; fi
+  # 生成 sing-box 格式的 Hysteria 2 配置文件
+  cat << EOF > "$HY2_CONFIG"
+{
+  "log": {
+    "level": "info",
+    "output": "$LOG_FILE",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "hysteria2",
+      "tag": "hy2-in",
+      "listen": "::",
+      "listen_port": $port,
+      "users": [
+        {
+          "password": "$auth_pwd"
+        }
+      ],
+      "ignore_client_bandwidth": true,
+      "tls": {
+        "enabled": true,
+        "server_name": "$hy2_domain",
+        "certificate_path": "$cert_path",
+        "key_path": "$key_path"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}
+EOF
 
-    if ! [[ "$NUM" =~ ^[0-9]+$ ]] || [ "$NUM" -lt 1 ] || [ "$NUM" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效编号${RESET}"
-        pause
-        return
-    fi
+  chmod 640 "$HY2_CONFIG"
+  chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
 
-    DOMAIN="${DOMAINS[$((NUM-1))]}"
-    local CERT_FILE=""
-    if [ -d "$CADDY_DATA" ]; then
-        CERT_FILE=$(sudo find "$CADDY_DATA" -type f -name "$DOMAIN.crt" 2>/dev/null | head -n 1)
-    fi
-    if [ -z "$CERT_FILE" ] && [ -e "$CADDY_CERTS_DIR/${DOMAIN}.fullchain.pem" ]; then
-        CERT_FILE="$CADDY_CERTS_DIR/${DOMAIN}.fullchain.pem"
-    fi
-    if [ -z "$CERT_FILE" ] && [ -e "$CADDY_CERTS_DIR/emby_${DOMAIN}.fullchain.pem" ]; then
-        CERT_FILE="$CADDY_CERTS_DIR/emby_${DOMAIN}.fullchain.pem"
-    fi
+  apply_new_iptables
+  mkdir -p "$HY2_DIR"
+  
+  local final_port="$port"
+  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
+    final_port=$(cat "${CONFIG_DIR}/hopping.txt")
+  fi
 
-    if [ -n "$CERT_FILE" ] && [ -e "$CERT_FILE" ]; then
-        echo -e "${GREEN}证书路径：${RESET}${CERT_FILE}"
-        echo -e "${GREEN}证书信息：${RESET}"
-        openssl x509 -in "$CERT_FILE" -noout -text | awk '/Subject:/ || /Issuer:/ || /Not Before:/ || /Not After :/ {print}'
-    else
-        echo -e "${YELLOW}${DOMAIN} - 未在系统默认路径找到证书${RESET}"
-    fi
-    pause
+  # 生成标准的 hysteria2:// 统一分享节点链
+  cat << EOF > "$HY2_DIR/url.txt"
+V6VPS 请自行替换 IP 地址为 V6
+V2rayN 链接:
+hysteria2://$auth_pwd@$last_ip:$port?sni=$hy2_domain&insecure=${is_insecure}#$HOSTNAME-hy2
+
+Surge 配置:
+$HOSTNAME-hy2 = hysteria2, $last_ip, $port, password=$auth_pwd, skip-cert-verify=true, sni=$hy2_domain
+EOF
+
+  rc-service sing-box-hy2 restart
+  if rc-service sing-box-hy2 status | grep -q "started"; then
+    info "sing-box Hysteria 2 服务配置并启动成功！"
+  else
+    error "sing-box-hy2 启动失败，可在菜单中按 8 查看详细的闪退日志。"
+  fi
+  showconf
 }
 
-# ==================== 【修改】纯原生语法安全性诊断（无需服务运行） ====================
-view_caddy_logs() {
-    clear
-    if ! pgrep -x caddy >/dev/null 2>&1; then
-        echo -e "${RED}⚠️ 检测到 Caddy 服务当前【未运行 / 已停止】！${RESET}"
-        echo -e "${YELLOW}正在强行为您执行底层的 Caddy 核心配置文件语法安全性诊断...${RESET}"
-        echo -e "${GREEN}执行命令: caddy validate --config /etc/caddy/Caddyfile${RESET}"
-        echo -e "${YELLOW}------------------- [诊断输出开始] -------------------${RESET}"
-        echo ""
-        if sudo caddy validate --config /etc/caddy/Caddyfile 2>&1; then
-            echo ""
-            echo -e "${GREEN}✔ 核心诊断结论: 您的 Caddyfile 语法本身完全正确！${RESET}"
-        else
-            echo ""
-            echo -e "${RED}❌ 核心诊断结论: 您的 Caddyfile 存在语法错误或路径死链！请根据上方报错修改。${RESET}"
-        fi
-        echo -e "${YELLOW}------------------- [诊断输出结束] -------------------${RESET}"
-        pause
-        return
-    fi
+# =========================================================
+# 6. 安装、更新与卸载核心流控
+# =========================================================
+write_openrc_script() {
+  cat << 'EOF' > "$OPENRC_SERVICE_PATH"
+#!/sbin/openrc-run
 
-    echo -e "${GREEN}======================================================${RESET}"
-    echo -e "${GREEN}           ◈ 正在实时捕获 Caddy 运行日志 ◈             ${RESET}"
-    echo -e "${YELLOW}   >> 提示: 键盘按下 Ctrl + C 即可随时退出日志流 <<  ${RESET}"
-    echo -e "${GREEN}======================================================${RESET}"
-    echo ""
+name="sing-box-hy2"
+description="sing-box Hysteria 2 OpenRC Isolated Service"
+cfgfile="/etc/sing-box-hy2/config.json"
+logfile="/var/log/sing-box-hy2.log"
+command="/usr/local/bin/sing-box-hy2"
+command_args="run -c /etc/sing-box-hy2/config.json"
+
+depend() {
+    need net
+    after iptables ip6tables firewall
+}
+
+start_pre() {
+    if [ ! -f "$cfgfile" ]; then
+        eerror "Configuration file $cfgfile missing!"
+        return 1
+    fi
     
-    # 纯原生通过系统全局 syslog 或普通文件捕获
-    if [ -f /var/log/caddy.log ]; then
-        sudo tail -n 50 -f /var/log/caddy.log
-    elif [ -f /var/log/messages ]; then
-        sudo grep -i caddy /var/log/messages | tail -n 50
-        sudo tail -f /var/log/messages | grep --line-buffered -i caddy || true
+    touch "$logfile"
+    chown singbox-hy2:singbox-hy2 "$logfile"
+    chmod 644 "$logfile"
+    
+    command_background="yes"
+    pidfile="/run/${RC_SVCNAME}.pid"
+    
+    output_log="$logfile"
+    error_log="$logfile"
+    
+    local port
+    port=$(jq -r '.inbounds[0].listen_port // 0' "$cfgfile" 2>/dev/null)
+    if [ "$port" -lt 1024 ] && [ "$port" -ne 0 ]; then
+        command_user="root:root"
     else
-        echo -e "${YELLOW}未找到独立日志文件，正在执行 caddy 原生运行流实时检测(前台诊断，按 Ctrl+C 退出)...${RESET}"
-        sudo caddy run --config "$CADDYFILE" 2>&1 | tail -n 50
+        command_user="singbox-hy2:singbox-hy2"
     fi
-    pause
+}
+EOF
+  chmod +x "$OPENRC_SERVICE_PATH"
+  rc-update add sing-box-hy2 default >/dev/null 2>&1 || true
 }
 
+download_core() {
+  local arch url
+  arch=$(detect_arch)
+  get_latest_version
+  url=$(printf 'https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz' "$SINGBOX_VERSION" "$SINGBOX_VERSION" "$arch")
+  
+  info "正在下载官方核心 sing-box v$SINGBOX_VERSION..."
+  cd "$TMP_DIR"
+  if ! wget -O sing-box.tar.gz -q "$url"; then
+    curl -fsSL -o sing-box.tar.gz "$url" || { error "下载核心文件失败"; return 1; }
+  fi
+  
+  tar -xzf sing-box.tar.gz -C "$TMP_DIR"
+  local extracted
+  extracted=$(find "$TMP_DIR" -type f -name sing-box | head -n 1)
+  [[ -n "$extracted" ]] || { error "解压目标核心错误"; return 1; }
+  
+  rc-service sing-box-hy2 stop >/dev/null 2>&1 || true
+  install -m 755 "$extracted" "$BINARY_PATH"
+  info "sing-box-hy2 核心释放完毕。"
+  return 0
+}
+
+install_hy2() {
+  echo -e "${GREEN}[信息] 开始在 Alpine 下部署专属隔离的 sing-box Hysteria 2 ...${RESET}"
+  check_environment
+  mkdir -p "$CONFIG_DIR" "$HY2_DIR"
+
+  if ! download_core; then return 1; fi
+
+  write_openrc_script
+
+  inst_cert || return 1
+  inst_port
+  
+  read -rp "设置 Hysteria 2 验证密码 (回车自动分配随机高强密码): " auth_pwd
+  auth_pwd=${auth_pwd:-$(generate_random_password)}
+
+  write_and_show_config
+}
+
+update_hy2() {
+  if [[ ! -f "$BINARY_PATH" ]]; then
+    error "当前系统未检测到核心，无法执行覆盖升级。"
+    return 1
+  fi
+  info "检测到已有环境，正在执行纯净原地覆盖核心升级..."
+  if download_core; then
+    rc-service sing-box-hy2 start
+    info "sing-box-hy2 核心纯净升级覆盖成功，服务已安全启动！"
+  else
+    error "核心升级遭遇未预期中断。"
+  fi
+}
+
+unsthy2() {
+  warn "即将执行全面清洁卸载..."
+  
+  # 优先清理防火墙链，避免文件先删掉导致清理不到
+  clear_old_iptables
+  if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
+  if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
+
+  rc-service sing-box-hy2 stop || true
+  rc-update del sing-box-hy2 default >/dev/null 2>&1 || true
+  
+  rm -f "$BINARY_PATH" "$OPENRC_SERVICE_PATH" "$LOG_FILE"
+  rm -rf "$CONFIG_DIR" "$HY2_DIR"
+  
+  info "Hysteria 2 专属服务、节点配置及防火墙跳跃链条已彻底清除！"
+}
+
+changeconf() {
+  if [[ ! -f "$HY2_CONFIG" ]]; then
+    error "配置文件不存在，请先选择选项 1 安装"
+    return 1
+  fi
+
+  local old_pwd old_cert old_key old_sni
+  old_pwd=$(jq -r '.inbounds[0].users[0].password // empty' "$HY2_CONFIG")
+  old_cert=$(jq -r '.inbounds[0].tls.certificate_path // empty' "$HY2_CONFIG")
+  old_key=$(jq -r '.inbounds[0].tls.key_path // empty' "$HY2_CONFIG")
+  old_sni=$(jq -r '.inbounds[0].tls.server_name // "www.bing.com"' "$HY2_CONFIG")
+
+  clear
+  echo -e "${GREEN}====== 修改 sing-box Hysteria 2 配置 ======${RESET}"
+  echo "提示：直接敲回车将保持原有配置不变"
+  echo "---------------------------------------------"
+  
+  inst_port 
+
+  local auth_pwd
+  read -rp "设置 Hysteria 2 验证密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
+  auth_pwd=${auth_pwd:-$old_pwd}
+
+  local cert_path key_path hy2_domain
+  echo "---------------------------------------------"
+  read -rp "是否需要修改证书？[y/N] (直接回车默认不修改): " change_cert_flag
+  if [[ "$change_cert_flag" == "y" || "$change_cert_flag" == "Y" ]]; then
+    inst_cert || return 1
+  else
+    cert_path="$old_cert"
+    key_path="$old_key"
+    hy2_domain="$old_sni"
+  fi
+
+  write_and_show_config
+  info "配置与转发链条刷新修改成功！"
+}
+
+showconf() {
+  if [[ ! -d "$HY2_DIR" ]]; then
+    error "未找到分享配置文件。"
+    return
+  fi
+  echo -e "${GREEN}====== Hysteria 2 节点分享与配置信息 ======${RESET}"
+  cat "$HY2_DIR/url.txt"
+  echo
+}
+
+# =========================================================
+# 7. 面板交互菜单 
+# =========================================================
 menu() {
-    while true; do
-        clear
-        get_system_status
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}        Caddy  管理面板          ${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}状态   :${RESET} $STATUS"
-        echo -e "${GREEN}版本   :${RESET} ${YELLOW}$VERSION_SHOW${RESET}"
-        echo -e "${GREEN}站点   :${RESET} ${YELLOW}$SITE_COUNT 个${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} 1. 安装Caddy${RESET}"
-        echo -e "${GREEN} 2. 添加站点(自动申请)${RESET}"
-        echo -e "${GREEN} 3. 修改配置${RESET}"
-        echo -e "${GREEN} 4. 添加站点(自定义证书)${RESET}"
-        echo -e "${GREEN} 5. 删除站点${RESET}"
-        echo -e "${GREEN} 6. 查看证书信息${RESET}"
-        echo -e "${GREEN} 7. Emby反代管理${RESET}"
-        echo -e "${GREEN} 8. 查看证书状态${RESET}"
-        echo -e "${GREEN} 9. 重载Caddy配置${RESET}"
-        echo -e "${GREEN}10. 查看Caddy日志${RESET}"
-        echo -e "${GREEN}11. 更新Caddy${RESET}"
-        echo -e "${GREEN}12. 卸载Caddy${RESET}"
-        echo -e "${GREEN} 0. 退出${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
-        read choice
+  while true; do
+    clear
+    local raw_status
+    raw_status=$(get_hy2_status)
+    local status=""
+    if [[ "$raw_status" == "RUNNING" ]]; then
+      status="${GREEN}● 运行中${RESET}"
+    else
+      status="${RED}● 未运行${RESET}"
+    fi
 
-        case $choice in
-            1) install_caddy ;;
-            2) add_site ;;
-            3) modify_site ;;
-            4) add_site_with_cert ;;
-            5) delete_site ;;
-            6) view_sites ;;
-            7) emby_proxy_menu ;;
-            8) check_domains_status ;;
-            9) reload_caddy ;;
-            10) view_caddy_logs ;;
-            11) update_caddy ;;
-            12) uninstall_caddy ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选项${RESET}"; pause ;;
-        esac
-    done
+    local version
+    version=$(get_installed_version)
+    local port_show
+    port_show=$(get_current_port_display)
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}     Sing-box Hysteria2 面板    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} ${status}"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装 Sing-box Hysteria2${RESET}"
+    echo -e "${GREEN}2. 更新 Sing-box Hysteria2${RESET}"
+    echo -e "${GREEN}3. 卸载 Sing-box Hysteria2${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 Sing-box Hysteria2${RESET}"
+    echo -e "${GREEN}6. 停止 Sing-box Hysteria2${RESET}"
+    echo -e "${GREEN}7. 重启 Sing-box Hysteria2${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+
+    local choice=""
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+    [[ -z "$choice" ]] && continue
+
+    case "$choice" in
+      1) install_hy2; pause ;;
+      2) update_hy2; pause ;;
+      3) unsthy2; pause ;;
+      4) changeconf; pause ;;
+      5) rc-service sing-box-hy2 start && info "服务已成功启动！"; pause ;;
+      6) rc-service sing-box-hy2 stop && info "服务已成功停止！"; pause ;;
+      7) rc-service sing-box-hy2 restart && info "服务已成功重启！"; pause ;;
+      8) if [[ -f "$LOG_FILE" ]]; then tail -n 50 "$LOG_FILE"; else warn "未发现运行日志文件。"; fi; pause ;;
+      9) showconf; pause ;;
+      0) exit 0 ;;
+      *) error "无效输入，请重新选择。"; sleep 1 ;;
+    esac
+  done
 }
 
-menu
+if [[ ${EUID} -ne 0 ]]; then
+  error "请切换至 root 用户运行此面板脚本。"
+  exit 1
+fi
+
+menu "$@"

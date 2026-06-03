@@ -52,25 +52,6 @@ get_site_count() {
     fi
 }
 
-# 🛠️ 核心突击：强杀所有占用 80 端口的孤儿残留进程
-force_kill_80() {
-    echo -e "${YELLOW}正在全网通缉 80 端口占用情况...${RESET}"
-    killall nginx 2>/dev/null || true
-    
-    local count=0
-    while netstat -ntlp 2>/dev/null | grep -q ":80 " && [ $count -lt 3 ]; do
-        local PIDS=$(netstat -ntlp 2>/dev/null | grep ":80 " | awk '{print $7}' | cut -d/ -f1 | grep -E '^[0-9]+$' || true)
-        if [ -n "$PIDS" ]; then
-            echo -e "${RED}警告: 发现 80 端口仍被残留进程 (PID: ${PIDS}) 占用！正在强制闪击...${RESET}"
-            for pid in $PIDS; do
-                kill -9 "$pid" 2>/dev/null || true
-            done
-            count=$((count+1))
-            sleep 1
-        fi
-    done
-}
-
 
 # ------------------------------
 # 核心功能函数
@@ -284,14 +265,6 @@ install_nginx() {
     
     rc-update add nginx default
 
-    # 运行强杀 80 函数
-    force_kill_80
-
-    echo -e "${GREEN}正在激活并启动 Nginx 服务...${RESET}"
-    rc-service nginx zap >/dev/null 2>&1 || true # 清除 OpenRC 的 crashed 崩溃缓存状态
-
-    echo -e "${GREEN}正在启动 Nginx 服务...${RESET}"
-    rc-service nginx start
     
     echo
     echo -ne "${YELLOW}是否现在配置反向代理并申请证书？(y/n,默认y): ${RESET}"
@@ -325,9 +298,9 @@ install_nginx() {
     sort -u "$EMAIL_FILE" -o "$EMAIL_FILE"
     echo -ne "${GREEN}请输入域名(例如:example.com): ${RESET}"; read DOMAIN
     check_domain_resolution "$DOMAIN"
-
+    echo -ne "${GREEN}请输入公网访问端口 (直接回车默认 443): ${RESET}"
+    read LISTEN_PORT
     LISTEN_PORT=${LISTEN_PORT:-443}
-
     echo -ne "${GREEN}请输入反代目标(例如:http://127.0.0.1:5788): ${RESET}"; read TARGET
     echo -ne "${GREEN}是否为 WebSocket 反代? (y/n，默认 y): ${RESET}"
     read IS_WS
@@ -337,10 +310,6 @@ install_nginx() {
     read MAX_SIZE
     MAX_SIZE=${MAX_SIZE:-200M}
 
-    # === 🚀 额外防线：在 Certbot 运行前再次确保 80 端口未被其他临时服务卡死 ===
-    if netstat -ntlp 2>/dev/null | grep -q ":80 " && ! rc-service nginx status >/dev/null 2>&1; then
-        kill -9 $(netstat -ntlp 2>/dev/null | grep ":80 " | awk '{print $7}' | cut -d/ -f1) 2>/dev/null || true
-    fi
 
     # ==================== 🛠️ 核心修改部分 ====================
     echo -e "${GREEN}正在通过 --nginx 模式向 Let's Encrypt 申请证书...${RESET}"
@@ -357,6 +326,15 @@ install_nginx() {
         
         # 写入你的反代配置
         generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE" "" "" "$LISTEN_PORT"
+
+        # 2. 【核心修复】证书申请完后，彻底清理 Certbot 
+        killall nginx >/dev/null 2>&1      # 强杀 Certbot 没关干净的临时进程，释放 80 端口
+        rc-service nginx zap >/dev/null 2>&1  # 强制重置 OpenRC 错乱的服务状态
+ 
+ 
+        echo -e "${GREEN}正在启动 Nginx 服务...${RESET}"
+        rc-service nginx start
+        
         
         # 测试新配置并热重载 Nginx
         if nginx -t; then
@@ -393,6 +371,8 @@ add_config() {
     read DOMAIN
     check_domain_resolution "$DOMAIN"
 
+    echo -ne "${GREEN}请输入公网访问端口 (直接回车默认 443): ${RESET}"
+    read LISTEN_PORT
     LISTEN_PORT=${LISTEN_PORT:-443}
 
     echo -ne "${GREEN}请输入反代目标(http://127.0.0.1:5788): ${RESET}"
@@ -468,7 +448,8 @@ modify_config() {
     local old_port=$(grep "listen " "$CONFIG_PATH" | grep "ssl" | awk '{print $2}' | tr -d ';')
     old_port=${old_port:-443}
 
-
+    echo -ne "${GREEN}请输入新公网访问端口 (直接回车保持原样: ${old_port}): ${RESET}"
+    read LISTEN_PORT
     LISTEN_PORT=${LISTEN_PORT:-$old_port}
 
     echo -ne "${GREEN}请输入新反代目标(例如:http://127.0.0.1:5788): ${RESET}"; read TARGET
@@ -681,7 +662,7 @@ check_domains_status() {
 
 uninstall_nginx() {
     echo -e "${RED}💥 警告: 此操作将物理完全卸载 Nginx 核心，并彻底抹除所有反代配置与托管证书！${RESET}"
-    read -r -p "确定要卸载 Nginx 吗？(y/N): " confirm
+    read -r -p "确定要斩草除根式卸载 Nginx 吗？(y/N): " confirm
     
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo -e "${YELLOW}操作已取消。${RESET}"
@@ -746,6 +727,8 @@ add_custom_cert_config() {
     echo -ne "${GREEN}请输入您的自定义域名或公网IP(例如:example.com): ${RESET}"; read DOMAIN
     [ -z "$DOMAIN" ] && return
 
+    echo -ne "${GREEN}请输入公网访问端口 (直接回车默认 443): ${RESET}"
+    read LISTEN_PORT
     LISTEN_PORT=${LISTEN_PORT:-443}
 
     echo -ne "${GREEN}请输入反代目标(例如：http://127.0.0.1:5788): ${RESET}"; read TARGET
@@ -801,13 +784,13 @@ generate_emby_normal_conf() {
     local TARGET=$2
     local CERT_PATH=$3
     local KEY_PATH=$4
-    local LISTEN_PORT=$5  
+    local LISTEN_PORT=$5  # 新增：外部监听端口参数
     local CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
     local TARGET_HOST=$(echo $TARGET | awk -F[/:] '{print $4}')
 
     CERT_PATH=${CERT_PATH:-"/etc/letsencrypt/live/$DOMAIN/fullchain.pem"}
     KEY_PATH=${KEY_PATH:-"/etc/letsencrypt/live/$DOMAIN/privkey.pem"}
-    LISTEN_PORT=${LISTEN_PORT:-443} 
+    LISTEN_PORT=${LISTEN_PORT:-443} # 默认 443
 
     cat > "$CONFIG_PATH" <<EOF
 server {

@@ -1,957 +1,750 @@
 #!/usr/bin/env bash
-#
-# sing-box (VLESS+WS+TLS) 核心控制面板 [Alpine Linux 专属完美权限版]
-# SPDX-License-Identifier: MIT
-#
-# =========================================================
-# 1. 核心控制与全局环境初始化
-# =========================================================
-set -Eop pipefail
-export LANG=en_US.UTF-8
+# ========================================================
+# ◈ Nginx 反向代理多系统一键管理面板 ◈
+# 支持系统: Alpine, Debian, Ubuntu, CentOS/Rocky
+# ========================================================
 
-# 基础目录与硬编码配置
-readonly SB_CONFIG="/etc/singbox-vless-ws/config.json"
-readonly SB_BINARY="/usr/local/bin/sing-box"
-readonly SB_DIR="/root/proxynode/VlessWS"
-readonly SB_LOG="/var/log/singbox-vless-ws.log"
-EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
-OPENRC_SERVICES_DIR="/etc/init.d"
-CONFIG_DIR="/etc/singbox-vless-ws"
-REPO_URL="https://github.com/SagerNet/sing-box"
-API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
-CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
+set -euo pipefail
 
-# 自动检测环境变量
-PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
-OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
-ARCHITECTURE="${ARCHITECTURE:-}"
-SINGBOX_USER="${SINGBOX_USER:-}"
-SINGBOX_HOME_DIR="${SINGBOX_HOME_DIR:-}"
+# 颜色定义
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+RESET='\033[0m'
 
-# 终端颜色代码
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-BLUE="\033[34m"
-CYAN="\033[36m"
-RESET="\033[0m"
+# 全局路径变量 (兼容多系统)
+NGINX_MAIN="/etc/nginx/nginx.conf"
+HTTP_D="/etc/nginx/http.d"
+CONF_PREFIX="proxy-lite-"
+ACME_HOME="/root/.acme.sh"
+CERT_HOME="/etc/nginx/certs"
 
-# =========================================================
-# 2. 底层工具函数
-# =========================================================
-has_command() {
-  local _command=$1
-  type -P "$_command" > /dev/null 2>&1
-}
-
-curl() {
-  command curl "${CURL_FLAGS[@]}" "$@"
-}
-
-mktemp() {
-  command mktemp "$@" "sbservinst.XXXXXXXXXX"
-}
-
-info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
-error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
-pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
-
-generate_uuid() {
-  if has_command uuidgen; then
-    uuidgen | tr '[:upper:]' '[:lower:]'
-  elif [[ -f /proc/sys/kernel/random/uuid ]]; then
-    cat /proc/sys/kernel/random/uuid
-  else
-    cat /dev/urandom | head -c 16 | hexdump -e '8/1 "%02x" "-" 4/1 "%02x" "-" 4/1 "%02x" "-" 4/1 "%02x" "-" 12/1 "%02x" "\n"' | head -n 1
-  fi
-}
-
-rc_service() {
-  if ! has_command rc-service; then
-    return 0
-  fi
-  command rc-service "$@"
-}
-
-install_content() {
-  local _install_flags="$1"
-  local _content="$2"
-  local _destination="$3"
-  local _overwrite="$4"
-  local _tmpfile="$(mktemp)"
-
-  echo -ne "安装 $_destination ... "
-  echo "$_content" > "$_tmpfile"
-  if [[ -z "$_overwrite" && -e "$_destination" ]]; then
-    echo -e "已存在"
-  elif install "$_install_flags" "$_tmpfile" "$_destination"; then
-    echo -e "完成"
-  fi
-  rm -f "$_tmpfile"
-}
-
-remove_file() {
-  local _target="$1"
-  echo -ne "移除 $_target ... "
-  if rm -f "$_target"; then
-    echo -e "完成"
-  fi
-}
-
-detect_package_manager() {
-  [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
-  has_command apk && PACKAGE_MANAGEMENT_INSTALL='apk add --no-cache' && return 0
-  return 1
-}
-
-install_software() {
-  local _package_name="$1"
-  if ! detect_package_manager; then
-    error "未检测到支持的包管理器，请手动安装 $_package_name"
-    exit 65
-  fi
-  if $PACKAGE_MANAGEMENT_INSTALL "$_package_name" >/dev/null 2>&1; then
-    echo "依赖安装成功"
-  else
-    error "无法通过包管理器安装 '$_package_name'，请手动安装。"
-    exit 65
-  fi
-}
-
-is_user_exists() { id "$1" > /dev/null 2>&1; }
-
-check_environment() {
-  if [[ "x$(uname)" == "xLinux" ]]; then
-    OPERATING_SYSTEM=linux
-  else
-    error "本脚本仅支持 Linux 系统。"
-    exit 95
-  fi
-
-  case "$(uname -m)" in
-    'i386' | 'i686') ARCHITECTURE='386' ;;
-    'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
-    'armv5tel' | 'armv6l' | 'armv7' | 'armv7l') ARCHITECTURE='armv7' ;;
-    'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
-    's390x') ARCHITECTURE='s390x' ;;
-    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
-  esac
-
-  has_command bash || install_software bash
-  has_command curl || install_software curl
-  has_command grep || install_software grep
-  has_command jq || install_software jq
-  has_command openssl || install_software openssl
-  has_command gcompat || install_software gcompat
-  has_command tar || install_software tar
-  has_command socat || install_software socat
-  has_command python3 || install_software python3
-}
-
-get_installed_version() {
-  if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
-    local version_out
-    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null | head -n 1 || echo "")
-    if [[ -n "$version_out" ]]; then
-      echo "$version_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "未知格式"
+# 检测系统环境
+detect_os() {
+    if [ -f /etc/alpine-release ]; then
+        OS="alpine"
+        HTTP_D="/etc/nginx/http.d"
+    elif [ -f /etc/debian_version ]; then
+        OS="debian"
+        HTTP_D="/etc/nginx/conf.d"
+    elif [ -f /etc/redhat-release ]; then
+        OS="rhel"
+        HTTP_D="/etc/nginx/conf.d"
     else
-      echo "未知版本"
+        echo -e "${RED}未识别的系统，脚本可能无法完美运行。${RESET}"
+        OS="unknown"
+        HTTP_D="/etc/nginx/conf.d"
     fi
-  else
-    echo "未安装"
-  fi
 }
 
-get_latest_version() {
-  local _tmpfile=$(mktemp)
-  if ! curl -sS -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases/latest" -o "$_tmpfile"; then
-    rm -f "$_tmpfile"
-    return
-  fi
-  local _tag_name=$(jq -r '.tag_name' "$_tmpfile" 2>/dev/null || echo "")
-  rm -f "$_tmpfile"
-  
-  if [[ -n "$_tag_name" ]]; then
-    echo "${_tag_name##*v}"
-  else
-    echo ""
-  fi
+need_root() {
+    [ "$(id -u)" -eq 0 ] || {
+        echo -e "${RED}请使用 root 权限运行此脚本。${RESET}"
+        exit 1
+    }
 }
 
-download_singbox() {
-  local _version="$1"
-  local _destination="$2"
-  local _download_url="$REPO_URL/releases/download/v${_version}/sing-box-${_version}-linux-${ARCHITECTURE}.tar.gz"
-  
-  info "正在下载官方 sing-box 核心组件: $_download_url ..."
-  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
-    error "核心下载失败！请检查您的网络连接。"
-    return 11
-  fi
-  return 0
+
+pause() {
+    echo -e "\n${YELLOW}按任意键返回主菜单...${RESET}"
+    read -n 1 -s </dev/tty
 }
 
-tpl_singbox_openrc_service() {
-  cat << 'EOF'
-#!/sbin/openrc-run
-
-description="sing-box Server Service"
-pidfile="/run/singbox-vless-ws/singbox-vless-ws.pid"
-command="/usr/local/bin/sing-box"
-command_args="run --config /etc/singbox-vless-ws/config.json"
-command_background="true"
-start_stop_daemon_args="--user sing-box:sing-box --make-pidfile --stdout /var/log/singbox-vless-ws.log --stderr /var/log/singbox-vless-ws.log"
-
-depend() {
-    need net
-    after firewall
+generate_random_email() {
+    local rand_num=$(openssl rand -hex 6 2>/dev/null || date +%s | tail -c 8)
+    echo "${rand_num}@gmail.com"
 }
 
-start_pre() {
-    checkpath -d -m 0755 -o sing-box:sing-box /run/singbox-vless-ws
-    checkpath -f -m 0644 -o sing-box:sing-box /var/log/singbox-vless-ws.log
+
+prompt() {
+    local var_name="$1" local text="$2" local default="${3:-}" local value=""
+    if [ -n "$default" ]; then
+        read -r -p "$text [$default]: " value </dev/tty || true
+        value="${value:-$default}"
+    else
+        read -r -p "$text: " value </dev/tty || true
+    fi
+    printf -v "$var_name" '%s' "$value"
+}
+
+yesno() {
+    local var_name="$1" local text="$2" local default="${3:-y}" local ans="" hint="y/N"
+    [ "$default" = "y" ] && hint="Y/n"
+    read -r -p "$text [$hint]: " ans </dev/tty || true
+    ans="${ans:-$default}"
+    case "$ans" in
+        y|Y|yes|YES) printf -v "$var_name" 'y' ;;
+        *) printf -v "$var_name" 'n' ;;
+    esac
+}
+
+strip_scheme() {
+    local s="${1:-}"
+    s="${s#http://}" && s="${s#https://}" && s="${s%%/*}"
+    echo "$s"
+}
+
+sanitize_name() {
+    echo "$1" | sed 's/[^A-Za-z0-9._-]/_/g'
+}
+
+is_port() {
+    local p="${1:-}"
+    [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]
+}
+
+is_valid_email() {
+    [[ "${1:-}" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]
+}
+
+# 动态获取面板状态数据
+get_panel_status() {
+    if [ "$OS" = "alpine" ]; then
+        if rc-service nginx status 2>&1 | grep -q "started"; then
+            STATUS="${GREEN}已启动 (OpenRC)${RESET}"
+        else
+            STATUS="${RED}未运行${RESET}"
+        fi
+    else
+        if systemctl is-active --quiet nginx 2>/dev/null; then
+            STATUS="${GREEN}已启动 (Systemd)${RESET}"
+        else
+            STATUS="${RED}未运行${RESET}"
+        fi
+    fi
+
+    if command -v nginx >/dev/null 2>&1; then
+        VERSION_SHOW=$(nginx -v 2>&1 | cut -d'/' -f2)
+    else
+        VERSION_SHOW="${RED}未安装${RESET}"
+    fi
+
+    if [ -d "$HTTP_D" ]; then
+        SITE_COUNT=$(find "$HTTP_D" -name "${CONF_PREFIX}*.conf" 2>/dev/null | wc -l)
+    else
+        SITE_COUNT=0
+    fi
+}
+
+manage_nginx_service() {
+    local action="$1"
+    if [ "$OS" = "alpine" ]; then
+        case "$action" in
+            start) rc-service nginx start >/dev/null 2>&1 || true ;;
+            stop) rc-service nginx stop >/dev/null 2>&1 || true ;;
+            restart) rc-service nginx restart >/dev/null 2>&1 || true ;;
+            reload) rc-service nginx reload >/dev/null 2>&1 || rc-service nginx restart >/dev/null 2>&1 ;;
+            enable) rc-update add nginx default >/dev/null 2>&1 || true ;;
+            disable) rc-update del nginx default >/dev/null 2>&1 || true ;;
+        esac
+    else
+        case "$action" in
+            start) systemctl start nginx >/dev/null 2>&1 || true ;;
+            stop) systemctl stop nginx >/dev/null 2>&1 || true ;;
+            restart) systemctl restart nginx >/dev/null 2>&1 || true ;;
+            reload) systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 ;;
+            enable) systemctl enable nginx >/dev/null 2>&1 || true ;;
+            disable) systemctl disable nginx >/dev/null 2>&1 || true ;;
+        esac
+    fi
+}
+
+ensure_deps() {
+    echo "==> 正在安装/检查系统依赖..."
+    case "$OS" in
+        alpine)
+            apk add --no-cache nginx bash curl ca-certificates openssl socat apache2-utils iproute2 >/dev/null
+            ;;
+        debian)
+            apt-get update -y >/dev/null
+            apt-get install -y nginx bash curl ca-certificates openssl socat apache2-utils iproute2 >/dev/null
+            ;;
+        rhel)
+            dnf install -y epel-release >/dev/null || true
+            dnf install -y nginx bash curl ca-certificates openssl socat httpd-tools iproute2 >/dev/null
+            ;;
+    esac
+}
+
+ensure_dirs() {
+    mkdir -p /run/nginx "$HTTP_D" /var/log/nginx "$CERT_HOME"
+}
+
+write_main_nginx_conf() {
+    echo "==> 初始化轻量 nginx.conf ..."
+    [ -f "$NGINX_MAIN" ] && cp -f "$NGINX_MAIN" "${NGINX_MAIN}.bak.$(date +%s)" || true
+
+    cat > "$NGINX_MAIN" <<EOF
+user nginx;
+worker_processes auto;
+pid /run/nginx/nginx.pid;
+error_log /var/log/nginx/error.log warn;
+
+events {
+    worker_connections 1024;
+    use epoll;
+    multi_accept on;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+    server_tokens off;
+    access_log off;
+
+    include ${HTTP_D}/*.conf;
 }
 EOF
 }
 
-# =========================================================
-# 3. 网络与配置扩展辅助函数
-# =========================================================
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    error "无法获取公网 IP 地址。" && return 1
-}
-
-check_port() {
-  local port="$1"
-  if has_command ss; then
-    ss -tunlp 2>/dev/null | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port" && return 1
-  else
-    netstat -tunlp 2>/dev/null | grep -w tcp | awk '{print $4}' | sed 's/.*://g' | grep -q -w "$port" && return 1
-  fi
-  return 0
-}
-
-is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
-
-get_random_port() {
-  local rand_port
-  while true; do
-    rand_port=$(awk 'BEGIN{srand(); print int(rand()*(65535-2000+1))+2000}')
-    if check_port "$rand_port"; then
-      echo "$rand_port" && return 0
+install_or_init_acme_sh() {
+    if [ ! -x "${ACME_HOME}/acme.sh" ]; then
+        local ACME_EMAIL=$(generate_random_email)
+        echo "==> 正在使用随机 Gmail 邮箱安装 acme.sh: $ACME_EMAIL"
+        curl -fsSL https://get.acme.sh | sh -s email="$ACME_EMAIL"
     fi
-  done
 }
 
-get_sb_status() {
-  if has_command rc-service && rc-service singbox-vless-ws status 2>/dev/null | grep -q "started"; then
-    echo -e "${GREEN}● 运行中 ${RESET}"
-  else
-    if pgrep -f "$EXECUTABLE_INSTALL_PATH run" >/dev/null 2>&1; then
-      echo -e "${GREEN}● 运行中 ${RESET}"
-    else
-      echo -e "${RED}● 未运行${RESET}"
-    fi
-  fi
-}
-
-get_current_port_display() {
-  if [[ -f "$SB_CONFIG" ]]; then
-    local main_port
-    main_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "")
-    echo "${main_port:- -}"
-  else echo "-"; fi
-}
-
-restart_singbox_service() {
-  touch "$SB_LOG" 2>/dev/null || true
-  if is_user_exists "sing-box" && getent group "sing-box" >/dev/null 2>&1; then
-    chown sing-box:sing-box "$SB_LOG" 2>/dev/null || true
-  fi
-
-  if has_command rc-service && [[ -f "$OPENRC_SERVICES_DIR/singbox-vless-ws" ]]; then
-    rc-service singbox-vless-ws restart >/dev/null 2>&1 || true
-    rc-service singbox-vless-ws status 2>/dev/null | grep -q "started"
-  else
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-    su -s /bin/bash -c "$EXECUTABLE_INSTALL_PATH run --config $SB_CONFIG >> $SB_LOG 2>&1 &" sing-box
-    return 0
-  fi
-}
-
-fix_external_cert_permission_vless() {
-  local cert="$1"
-  local key="$2"
-  
-  if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
-    error "致命拒绝: 检测到您的证书位于 /root/ 目录下！"
-    warn "原因分析: /root 目录权限严苛(700)，非 root 用户无法穿透检索。"
-    info "权威推荐: 请将证书手动移动到公共目录 (如 /etc/amee/ 或 /etc/ssl/) 后再试。"
-    return 1
-  fi
-
-  info "正在强行赋予证书所在的多级父目录检索穿透权限 (o+x)..."
-  local dir
-  for file in "$cert" "$key"; do
-    dir=$(dirname "$file")
-    while [[ "$dir" != "/" && -n "$dir" ]]; do
-      chmod o+x "$dir" 2>/dev/null || true
-      dir=$(dirname "$dir")
-    done
-  done
-  
-  info "正在规范化自定义目录下的证书和私钥读取白名单权限 (644)..."
-  chmod 644 "$cert" 2>/dev/null || true
-  chmod 644 "$key" 2>/dev/null || true
-  return 0
-}
-
-# =========================================================
-# 4. 经过重构、全面固化的证书申请与路径同步交互
-# =========================================================
-inst_cert() {
-  mkdir -p /etc/singbox-vless-ws
-
-  echo "---------------------------------------------"
-  echo -e "sing-box TLS 证书申请方式如下："
-  echo -e " 1) Acme自动申请 (Let's Encrypt)${YELLOW}（默认）${RESET}"
-  echo -e " 2) ZeroSSL自动申请"
-  echo -e " 3) 自定义证书路径"
-  echo "---------------------------------------------"
-  local certInput
-  read -rp "请输入选项 [1-3] (直接回车默认 Let's Encrypt 申请): " certInput
-  certInput=${certInput:-1}
-
-  cert_path="/etc/singbox-vless-ws/fullchain.pem"
-  key_path="/etc/singbox-vless-ws/privkey.pem"
-
-  if [[ $certInput == 1 || $certInput == 2 ]]; then
-    if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
-      warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。请确保已暂时关闭 Web 服务。"
-    fi
-
-    local vps_ip=$(get_public_ip)
-    read -rp "请输入需要申请证书的域名: " domain
-    [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
+choose_ca_provider() {
+    echo -e "${YELLOW}请选择证书签发机构 (CA Provider)：${RESET}"
+    echo "1) Let's Encrypt (推荐，无限制快速签发)"
+    echo "2) ZeroSSL"
+    read -r -p "输入序号 [1-2]: " CA_CHOICE </dev/tty
     
-    info "正在检查并安装 Acme.sh 依赖..."
-    has_command socat || install_software socat
+    case "$CA_CHOICE" in
+        2)
+            echo "==> 切换默认 CA 为 ZeroSSL..."
+            "${ACME_HOME}/acme.sh" --set-default-ca --server zerossl >/dev/null 2>&1 || true
+            if [ ! -d "${ACME_HOME}/ca/zerossl" ] && [ ! -d "${ACME_HOME}/ca/acme.zerossl.com" ]; then
+                local Z_EMAIL=$(generate_random_email)
+                echo -e "${YELLOW}==> 首次使用 ZeroSSL，正在为您随机注册 Gmail 账号: ${Z_EMAIL}${RESET}"
+                "${ACME_HOME}/acme.sh" --register-account -m "$Z_EMAIL" --server zerossl
+            fi
+            ;;
+        *)
+            echo "==> 切换默认 CA 为 Let's Encrypt..."
+            "${ACME_HOME}/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+            ;;
+    esac
+}
 
-    local acme_cmd="/root/.acme.sh/acme.sh"
-    local rand_prefix
-    rand_prefix=$(openssl rand -hex 6 2>/dev/null || date +%s | tail -c 8)
-    local user_email="${rand_prefix}@gmail.com"
+choose_dns_provider() {
+    echo -e "${YELLOW}请选择 DNS 提供商进行验证：${RESET}"
+    echo "1) Cloudflare"
+    echo "2) 阿里云 (Aliyun)"
+    echo "3) 腾讯云 (DNSPod)"
+    read -r -p "输入序号: " DNS_CHOICE </dev/tty
+    case "$DNS_CHOICE" in
+        1) DNS_PROVIDER="cloudflare" ;;
+        2) DNS_PROVIDER="aliyun" ;;
+        3) DNS_PROVIDER="dnspod" ;;
+        *) echo -e "${RED}无效选择${RESET}"; return 1 ;;
+    esac
+}
 
-    if [[ ! -f "$acme_cmd" ]]; then
-      curl https://get.acme.sh | sh -s email="${user_email}"
+setup_dns_env() {
+    case "$1" in
+        cloudflare)
+            prompt CF_Token "请输入 Cloudflare API Token"
+            [ -n "${CF_Token:-}" ] || { echo "CF_Token 不能为空"; return 1; }
+            export CF_Token
+            ;;
+        aliyun)
+            prompt Ali_Key "请输入阿里云 Ali_Key"
+            prompt Ali_Secret "请输入阿里云 Ali_Secret"
+            [ -n "${Ali_Key:-}" ] && [ -n "${Ali_Secret:-}" ] || { echo "Key/Secret 不能为空"; return 1; }
+            export Ali_Key Ali_Secret
+            ;;
+        dnspod)
+            prompt DP_Id "请输入 DNSPod DP_Id"
+            prompt DP_Key "请输入 DNSPod DP_Key"
+            [ -n "${DP_Id:-}" ] && [ -n "${DP_Key:-}" ] || { echo "ID/Key 不能为空"; return 1; }
+            export DP_Id DP_Key
+            ;;
+    esac
+}
+
+issue_and_install_cert() {
+    local domain="$1" local provider="$2"
+    local cert_dir="${CERT_HOME}/${domain}"
+    mkdir -p "$cert_dir"
+
+    echo "==> 正在通过 DNS 验证申请证书: ${domain} ..."
+    local dns_flag="dns_cf"
+    [ "$provider" = "aliyun" ] && dns_flag="dns_ali"
+    [ "$provider" = "dnspod" ] && dns_flag="dns_dp"
+
+    "${ACME_HOME}/acme.sh" --issue --dns "$dns_flag" -d "$domain" --keylength ec-256 --force
+
+    echo "==> 安装证书到系统目录..."
+    "${ACME_HOME}/acme.sh" --install-cert -d "$domain" --ecc \
+        --fullchain-file "${cert_dir}/fullchain.cer" \
+        --key-file "${cert_dir}/private.key" \
+        --reloadcmd "nginx -t && nginx -s reload || true"
+}
+
+# 2. 添加配置 (自动申请并托管证书)
+add_common_site() {
+    prompt DOMAIN "请输入反代域名"
+    DOMAIN="$(strip_scheme "$DOMAIN")"
+    [ -n "$DOMAIN" ] || return 1
+
+    prompt LISTEN_PORT "请输入本机监听端口" "443"
+    is_port "$LISTEN_PORT" || return 1
+
+    prompt UP_HOST "请输入反代后端 IP/主机名 (如 127.0.0.1)" "127.0.0.1"
+    prompt UP_PORT "请输入反代后端端口" "80"
+    is_port "$UP_PORT" || return 1
+
+    choose_ca_provider || return 1
+
+    choose_dns_provider || return 1
+    setup_dns_env "$DNS_PROVIDER" || return 1
+    issue_and_install_cert "$DOMAIN" "$DNS_PROVIDER"
+
+    local conf_path="${HTTP_D}/${CONF_PREFIX}$(sanitize_name "$DOMAIN")-${LISTEN_PORT}.conf"
+    local cert_dir="${CERT_HOME}/${DOMAIN}"
+
+    cat > "$conf_path" <<EOF
+# META domain=${DOMAIN} port=${LISTEN_PORT} upstream=http://${UP_HOST}:${UP_PORT} type=common_acme
+server {
+    listen ${LISTEN_PORT} ssl;
+    listen [::]:${LISTEN_PORT} ssl;
+    server_name ${DOMAIN};
+
+    ssl_certificate     ${cert_dir}/fullchain.cer;
+    ssl_certificate_key ${cert_dir}/private.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location / {
+        proxy_pass http://${UP_HOST}:${UP_PORT};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+EOF
+    nginx -t && manage_nginx_service reload
+    echo -e "${GREEN}==> 普通反代创建成功！访问地址: https://${DOMAIN}:${LISTEN_PORT}${RESET}"
+}
+
+# 【补全】 3. 添加配置 (自定义证书)
+add_custom_cert_site() {
+    echo -e "${YELLOW}=== 添加配置 (使用自备/自定义证书) ===${RESET}"
+    prompt DOMAIN "请输入反代域名"
+    DOMAIN="$(strip_scheme "$DOMAIN")"
+    [ -n "$DOMAIN" ] || return 1
+
+    prompt LISTEN_PORT "请输入本机监听端口" "443"
+    is_port "$LISTEN_PORT" || return 1
+
+    prompt UP_HOST "请输入反代后端 IP/主机名" "127.0.0.1"
+    prompt UP_PORT "请输入反代后端端口" "80"
+    is_port "$UP_PORT" || return 1
+
+    prompt CUSTOM_CERT "请输入自备证书 (.crt/.cer/fullchain) 文件的绝对路径"
+    prompt CUSTOM_KEY "请输入自备私钥 (.key/private.key) 文件的绝对路径"
+
+    if [ ! -f "$CUSTOM_CERT" ] || [ ! -f "$CUSTOM_KEY" ]; then
+        echo -e "${RED}错误: 指定的证书或私钥文件不存在，请检查路径！${RESET}"
+        return 1
     fi
 
-    if [[ $certInput == 1 ]]; then
-      info "正在切换 ACME 默认 CA 为 Let's Encrypt..."
-      "$acme_cmd" --set-default-ca --server letsencrypt
-    elif [[ $certInput == 2 ]]; then
-      info "正在切换 ACME 默认 CA 为 ZeroSSL 并注册账号..."
-      "$acme_cmd" --set-default-ca --server zerossl
-      "$acme_cmd" --register-account -m "${user_email}" --server zerossl
-    fi
+    # 复制自备证书到系统统一的管理目录
+    local cert_dir="${CERT_HOME}/${DOMAIN}"
+    mkdir -p "$cert_dir"
+    cp -f "$CUSTOM_CERT" "${cert_dir}/fullchain.cer"
+    cp -f "$CUSTOM_KEY" "${cert_dir}/private.key"
 
-    info "正在向 CA 机构申请证书..."
-    rm -f "$cert_path" "$key_path"
-    if [[ "$vps_ip" =~ ":" ]]; then
-      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
+    local conf_path="${HTTP_D}/${CONF_PREFIX}$(sanitize_name "$DOMAIN")-${LISTEN_PORT}.conf"
+
+    cat > "$conf_path" <<EOF
+# META domain=${DOMAIN} port=${LISTEN_PORT} upstream=http://${UP_HOST}:${UP_PORT} type=custom_cert
+server {
+    listen ${LISTEN_PORT} ssl;
+    listen [::]:${LISTEN_PORT} ssl;
+    server_name ${DOMAIN};
+
+    ssl_certificate     ${cert_dir}/fullchain.cer;
+    ssl_certificate_key ${cert_dir}/private.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location / {
+        proxy_pass http://${UP_HOST}:${UP_PORT};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+EOF
+    nginx -t && manage_nginx_service reload
+    echo -e "${GREEN}==> 自定义证书反代配置成功！访问地址: https://${DOMAIN}:${LISTEN_PORT}${RESET}"
+}
+
+# 9. Emby 专属流媒体反代配置
+add_emby_site() {
+    echo -e "${YELLOW}=== Emby 专属流媒体高级反代配置 ===${RESET}"
+    prompt DOMAIN "请输入 Emby 绑定的域名"
+    DOMAIN="$(strip_scheme "$DOMAIN")"
+    [ -n "$DOMAIN" ] || return 1
+
+    prompt LISTEN_PORT "请输入 HTTPS 本地监听端口" "52443"
+    is_port "$LISTEN_PORT" || return 1
+
+    prompt UP_HOST "请输入 Emby 后端主机名或内网 IP (不要带 https://)"
+    UP_HOST="$(strip_scheme "$UP_HOST")"
+    
+    prompt UP_PORT "请输入 Emby 后端端口" "443"
+    is_port "$UP_PORT" || return 1
+
+    # 【新增】证书获取类型交互
+    echo -e "${YELLOW}请选择为此 Emby 站点部署的证书类型：${RESET}"
+    echo "1) 自动申请证书 (通过 acme.sh 脚本自动托管机制)"
+    echo "2) 使用自定义证书 (需手动提供已有的密钥对)"
+    read -r -p "输入序号 [1-2]: " CERT_MODE_CHOICE </dev/tty
+    
+    local cert_meta_type="emby_acme"
+    local cert_dir="${CERT_HOME}/${DOMAIN}"
+
+    if [ "$CERT_MODE_CHOICE" = "2" ]; then
+        prompt CUSTOM_CERT "请输入自备证书 (.crt/.cer) 文件的绝对路径"
+        prompt CUSTOM_KEY "请输入自备私钥 (.key) 文件的绝对路径"
+        if [ ! -f "$CUSTOM_CERT" ] || [ ! -f "$CUSTOM_KEY" ]; then
+            echo -e "${RED}错误: 证书或私钥文件路径有误，配置终止！${RESET}"
+            return 1
+        fi
+        mkdir -p "$cert_dir"
+        cp -f "$CUSTOM_CERT" "${cert_dir}/fullchain.cer"
+        cp -f "$CUSTOM_KEY" "${cert_dir}/private.key"
+        cert_meta_type="emby_custom_cert"
     else
-      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
+        choose_ca_provider || return 1
+        choose_dns_provider || return 1
+        setup_dns_env "$DNS_PROVIDER" || return 1
+        issue_and_install_cert "$DOMAIN" "$DNS_PROVIDER"
+    fi
+
+    yesno ENABLE_AUTH "是否启用 BasicAuth 额外密码门禁" "n"
+    local auth_block="" htpasswd_file="/etc/nginx/.htpasswd-${LISTEN_PORT}"
+    if [ "$ENABLE_AUTH" = "y" ]; then
+        prompt AUTH_USER "BasicAuth 用户名" "emby"
+        prompt AUTH_PASS "BasicAuth 密码"
+        htpasswd -bc "$htpasswd_file" "$AUTH_USER" "$AUTH_PASS" >/dev/null
+        auth_block="auth_basic \"Restricted\"; auth_basic_user_file ${htpasswd_file};"
+    fi
+
+    yesno SKIP_VERIFY "若上游为内网自签证书，是否跳过验证" "y"
+    local verify_block=""
+    [ "$SKIP_VERIFY" = "y" ] && verify_block="proxy_ssl_verify off;"
+
+    local conf_path="${HTTP_D}/${CONF_PREFIX}$(sanitize_name "$DOMAIN")-${LISTEN_PORT}.conf"
+
+    cat > "$conf_path" <<EOF
+# META domain=${DOMAIN} port=${LISTEN_PORT} upstream=https://${UP_HOST}:${UP_PORT} type=${cert_meta_type}
+server {
+    listen ${LISTEN_PORT} ssl;
+    listen [::]:${LISTEN_PORT} ssl;
+    server_name ${DOMAIN};
+
+    ssl_certificate     ${cert_dir}/fullchain.cer;
+    ssl_certificate_key ${cert_dir}/private.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location / {
+        ${auth_block}
+        proxy_pass https://${UP_HOST}:${UP_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$proxy_host;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 3600s;
+        proxy_ssl_server_name on;
+        ${verify_block}
+    }
+}
+EOF
+    nginx -t && manage_nginx_service reload
+    echo -e "${GREEN}==> Emby 高级反代配置成功！访问地址: https://${DOMAIN}:${LISTEN_PORT}${RESET}"
+}
+
+list_sites() {
+    echo -e "${YELLOW}=== 当前已托管的反向代理站点 ===${RESET}"
+    local found=0
+    if [ -d "$HTTP_D" ]; then
+        for f in "${HTTP_D}/${CONF_PREFIX}"*.conf; do
+            [ -e "$f" ] || continue
+            found=1
+            local meta domain port upstream
+            meta="$(grep -E '^# META ' "$f" | head -n1 || true)"
+            domain="$(echo "$meta" | sed -n 's/.*domain=\([^ ]*\).*/\1/p')"
+            port="$(echo "$meta" | sed -n 's/.*port=\([^ ]*\).*/\1/p')"
+            upstream="$(echo "$meta" | sed -n 's/.*upstream=\([^ ]*\).*/\1/p')"
+            echo -e "◈ 域名: ${GREEN}${domain}${RESET} | 监听端口: ${YELLOW}${port}${RESET} | 后端: ${upstream}"
+        done
+    fi
+    [ "$found" -eq 1 ] || echo "（暂无任何反代站点）"
+}
+
+delete_site() {
+    list_sites
+    prompt DOMAIN "请输入要删除的域名"
+    DOMAIN="$(strip_scheme "$DOMAIN")"
+    prompt LISTEN_PORT "请输入对应的监听端口"
+    
+    local conf_path="${HTTP_D}/${CONF_PREFIX}$(sanitize_name "$DOMAIN")-${LISTEN_PORT}.conf"
+    if [ -f "$conf_path" ]; then
+        rm -f "$conf_path"
+        rm -f "/etc/nginx/.htpasswd-${LISTEN_PORT}" || true
+        echo -e "${GREEN}站点配置文件已移除。${RESET}"
+        nginx -t && manage_nginx_service reload
+    else
+        echo -e "${RED}未找到对应的站点配置文件。${RESET}"
+    fi
+}
+
+# 【改写升级】实时监控本地证书状态 (完美兼容多系统/Alpine)
+check_domains_status() {
+    clear
+    echo -e "${YELLOW}========================================${RESET}"
+    echo -e "${YELLOW}        ◈ 本地证书状态实时监控 ◈            ${RESET}"
+    echo -e "${YELLOW}========================================${RESET}"
+
+    # 兼容低版本 Bash 与 Alpine 替代 mapfile
+    local DOMAINS=()
+    if [ -x "${ACME_HOME}/acme.sh" ]; then
+        while read -r line; do
+            [ -n "$line" ] && DOMAINS+=("$line")
+        done < <("${ACME_HOME}/acme.sh" --list | tail -n +2 | awk '{print $1}')
     fi
     
-    local reload_trigger="[ -f /etc/init.d/singbox-vless-ws ] && rc-service singbox-vless-ws restart || echo '[信息] 初次部署，跳过服务同步'"
-
-    if "$acme_cmd" --install-cert -d "${domain}" \
-      --key-file "$key_path" \
-      --fullchain-file "$cert_path" \
-      --ecc \
-      --reloadcmd "$reload_trigger"; then
-      
-      echo "$domain" > /etc/singbox-vless-ws/ca.log
-      sb_domain=$domain
-      info "证书申请并成功分发至安全沙箱！"
-    else
-      error "自动证书申请失败，切换回自定义证书路径。"
-      certInput=3
+    # 补充扫描非 acme.sh 托管的自定义证书目录
+    if [ -d "$CERT_HOME" ]; then
+        for d in "$CERT_HOME"/*; do
+            if [ -d "$d" ]; then
+                local b_name=$(basename "$d")
+                # 去重加入队列
+                [[ " ${DOMAINS[*]} " =~ " ${b_name} " ]] || DOMAINS+=("$b_name")
+            fi
+        done
     fi
-  fi
 
-  if [[ $certInput == 3 ]]; then
-    while true; do
-      local user_cert user_key cert_dir guessed_key default_sni
-      echo "---------------------------------------------"
-      read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
-      if [[ -z "$user_cert" ]]; then
-        error "路径不能为空，请重新输入。"
-        continue
-      fi
-
-      cert_dir=$(dirname "$user_cert")
-      guessed_key=""
-      for k_name in "privkey.pem" "private.key" "cert.key" "key.pem" "key.key"; do
-        if [[ -f "${cert_dir}/${k_name}" ]]; then
-          guessed_key="${cert_dir}/${k_name}"
-          break
-        fi
-      done
-
-      default_sni=$(basename "$cert_dir")
-      [[ "$default_sni" == "certs" || "$default_sni" == "ssl" || -z "$default_sni" ]] && default_sni="uuobc.csyk.dpdns.org"
-
-      local key_prompt="请输入密钥文件 (privkey.pem/key) 的路径"
-      [[ -n "$guessed_key" ]] && key_prompt="请输入密钥文件路径 [已智能匹配，回车默认: ${guessed_key}]"
-      read -rp "${key_prompt}: " user_key
-      user_key=${user_key:-$guessed_key}
-
-      read -rp "请输入证书对应的 SNI 域名 [回车默认: ${default_sni}]: " sb_domain
-      sb_domain=${sb_domain:-$default_sni}
-      
-      if [[ -f "$user_cert" && -f "$user_key" ]]; then
-        rm -f "$cert_path" "$key_path"
-        if fix_external_cert_permission_vless "$user_cert" "$user_key"; then
-          ln -sf "$user_cert" "$cert_path"
-          ln -sf "$user_key" "$key_path"
-          info "自定义外部证书已通过安全软链接无缝同步。"
-          break
-        else
-          return 1
-        fi
-      else
-        error "找不到输入的证书文件，请检查路径是否正确并重新输入！"
-      fi
-    done
-  fi
-
-  info "正在强行修复 sing-box 配置安全区内的权限与软链接属主..."
-  chmod 755 /etc/singbox-vless-ws
-  chmod 644 "$cert_path" "$key_path" 2>/dev/null || true
-  if is_user_exists "sing-box" && getent group "sing-box" >/dev/null 2>&1; then
-    chown -R sing-box:sing-box /etc/singbox-vless-ws
-    chown -h sing-box:sing-box /etc/singbox-vless-ws/* 2>/dev/null || true
-  fi
-}
-
-inst_port() {
-  local default_port=""
-  [[ -f "$SB_CONFIG" ]] && default_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "")
-
-  local prompt_msg="设置 sing-box 主端口 [1-65535] (回车随机分配): "
-  [[ -n "$default_port" ]] && prompt_msg="设置 sing-box 主端口 [当前: ${default_port}, 回车不修改]: "
-
-  while true; do
-    read -rp "$prompt_msg" port
-    if [[ -z "$port" ]]; then
-      if [[ -n "$default_port" ]]; then port="$default_port" && break
-      else
-        port=$(get_random_port)
-        info "已为您随机分配未被占用端口: $port" && break
-      fi
-    elif is_valid_port "$port"; then
-      if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
-        error "端口 ${port} 已被其它程序占用，请更换。" && continue
-      fi
-      break
-    else error "请输入有效的端口数字 (1-65535)"; fi
-  done
-}
-
-configure_custom_socks5_outbound() {
-    if [[ ! -f "$SB_CONFIG" ]]; then 
-        error "错误: 未安装，无法配置出口模式。"
+    if [ ${#DOMAINS[@]} -eq 0 ]; then
+        echo -e "${RED} ❌ 当前系统未检测到任何已配置的本地证书。${RESET}"
+        echo -e "${YELLOW}----------------------------------------${RESET}"
+        pause
         return
     fi
 
-    local mode current_type tmp_file
-    current_type=$(jq -r '.outbounds[0].type // "direct"' "$SB_CONFIG" 2>/dev/null || echo "direct")
-
-    echo "---------------------------------------------"
-    echo "请选择出口模式："
-    if [[ "$current_type" == "socks" ]]; then
-        echo -e "当前模式: ${YELLOW}Socks5 代理出口${RESET}"
-    else
-        echo -e "当前模式: ${GREEN}本地直连出口${RESET}"
-    fi
-    echo "1) 直连出口"
-    echo "2) Socks5出口"
-    echo "0) 取消"
-    echo "---------------------------------------------"
-
-    read -rp "请输入选项 [0-2]: " mode || true
-    case "$mode" in
-        1)
-            tmp_file=$(mktemp)
-            jq '.outbounds = [{"type": "direct", "tag": "direct"}]' "$SB_CONFIG" > "$tmp_file"
-            if ! jq empty "$tmp_file" >/dev/null 2>&1; then
-                rm -f "$tmp_file"
-                error "生成的直连配置无效。"
-                return 1
+    for DOMAIN in "${DOMAINS[@]}"; do
+        [ -z "$DOMAIN" ] && continue
+        local CERT_PATH="${CERT_HOME}/${DOMAIN}/fullchain.cer"
+        local TYPE="ACME 自动管理 (域名/IP)"
+        
+        # 判断证书来源类型
+        if [ -f "${HTTP_D}/${CONF_PREFIX}${DOMAIN}"*.conf ]; then
+            if grep -q "type=custom_cert" "${HTTP_D}/${CONF_PREFIX}${DOMAIN}"*.conf 2>/dev/null; then
+                TYPE="用户自备/自定义证书"
             fi
-            cp "$SB_CONFIG" "${SB_CONFIG}.bak.$(date +%s)"
-            mv "$tmp_file" "$SB_CONFIG"
-            chmod 644 "$SB_CONFIG" 2>/dev/null || true
-            if is_user_exists "sing-box" && getent group "sing-box" >/dev/null 2>&1; then chown sing-box:sing-box "$SB_CONFIG"; fi
-
-            if ! restart_singbox_service; then
-                error "切换到直连失败。"
-                return 1
-            fi
-            info "已成功切换为直连出口！"
-            return
-            ;;
-        2)
-            ;;
-        0|"")
-            info "已取消配置。"
-            return
-            ;;
-        *)
-            error "无效选项，请输入 0-2 之间的数字。"
-            return 1
-            ;;
-    esac
-
-    info "配置自定义 Socks5 出口代理..."
-    local socks_host socks_port socks_user socks_pass
-
-    read -rp "请输入 Socks5 服务器地址/IP: " socks_host || true
-    [[ -z "$socks_host" ]] && info "已取消配置。" && return
-
-    while true; do
-        read -rp "请输入 Socks5 端口 (默认: 1080): " socks_port || true
-        [[ -z "$socks_port" ]] && socks_port=1080
-        if is_valid_port "$socks_port"; then
-            break
-        else
-            error "端口无效，请输入一个1-65535之间的数字。"
         fi
+
+        echo -e "${YELLOW}◈ 域名/IP: ${RESET}${YELLOW}${DOMAIN}${RESET}"
+        echo -e "  ├─ ${YELLOW}证书类型: ${RESET}${TYPE}"
+
+        if [ -f "$CERT_PATH" ]; then
+            # 跨系统兼容的到期时间抓取格式
+            END_DATE=$(openssl x509 -enddate -noout -in "$CERT_PATH" | cut -d= -f2)
+            
+            # 使用 openssl 计算剩余天数，规避 Alpine date 命令对 -d 参数不支持的硬伤
+            local now_epoch=$(date +%s)
+            # 提取证书过期时间戳
+            if command -v perl >/dev/null 2>&1; then
+                # 若系统有 perl 辅助计算
+                local end_epoch=$(perl -MHTTP::Date -e "print str2time('$END_DATE')")
+                DAYS_LEFT=$(( (end_epoch - now_epoch) / 86400 ))
+            else
+                # 纯 openssl 静态检查天数方案
+                DAYS_LEFT=0
+                while openssl x509 -checkend $((DAYS_LEFT * 86400)) -in "$CERT_PATH" >/dev/null 2>&1; do
+                    DAYS_LEFT=$((DAYS_LEFT + 1))
+                    [ $DAYS_LEFT -gt 365 ] && break
+                done
+                # 如果一开始就过期
+                if [ $DAYS_LEFT -eq 0 ]; then DAYS_LEFT=-1; fi
+            fi
+
+            if [ $DAYS_LEFT -ge 30 ]; then
+                STATUS_COLOR="${GREEN}"
+                STATUS_TEXT="正常有效"
+            elif [ $DAYS_LEFT -ge 0 ]; then
+                STATUS_COLOR="${YELLOW}"
+                STATUS_TEXT="即将过期 (请注意)"
+            else
+                STATUS_COLOR="${RED}"
+                STATUS_TEXT="已过期 (请立即更新)"
+            fi
+            
+            echo -e "  ├─ ${YELLOW}到期时间: ${RESET}${END_DATE}"
+            echo -e "  ├─ ${YELLOW}剩余天数: ${RESET}${STATUS_COLOR}${DAYS_LEFT} 天${RESET}"
+            echo -e "  └─ ${YELLOW}运行状态: ${RESET}${STATUS_COLOR}${STATUS_TEXT}${RESET}"
+        else
+            echo -e "  └─ ${YELLOW}运行状态: ${RESET}${RED}未在 $CERT_HOME 中找到导出的证书文件${RESET}"
+        fi
+        echo -e "${YELLOW}----------------------------------------${RESET}"
     done
-
-    read -rp "请输入 Socks5 用户名 (若无密码认证请直接留空回车): " socks_user || true
-    if [[ -n "$socks_user" ]]; then
-        read -rs -p "请输入 Socks5 密码: " socks_pass || true
-        echo
-    else
-        socks_pass=""
-    fi
-
-    tmp_file=$(mktemp)
-
-    if [[ -n "$socks_user" ]]; then
-        jq \
-            --arg host "$socks_host" \
-            --argjson port "$socks_port" \
-            --arg user "$socks_user" \
-            --arg pass "$socks_pass" \
-            --arg password "$socks_pass" \
-            '.outbounds = [ { "type": "socks", "tag": "custom-socks5-out", "server": $host, "server_port": $port, "username": $user, "password": $pass } ]' "$SB_CONFIG" > "$tmp_file"
-    else
-        jq \
-            --arg host "$socks_host" \
-            --argjson port "$socks_port" \
-            '.outbounds = [ { "type": "socks", "tag": "custom-socks5-out", "server": $host, "server_port": $port } ]' "$SB_CONFIG" > "$tmp_file"
-    fi
-
-    if ! jq empty "$tmp_file" >/dev/null 2>&1; then
-        rm -f "$tmp_file"
-        error "生成的 Socks5 配置无效，请检查输入后重试。"
-        return 1
-    fi
-
-    cp "$SB_CONFIG" "${SB_CONFIG}.bak.$(date +%s)"
-    mv "$tmp_file" "$SB_CONFIG"
-    chmod 644 "$SB_CONFIG" 2>/dev/null || true
-    if is_user_exists "sing-box" && getent group "sing-box" >/dev/null 2>&1; then chown sing-box:sing-box "$SB_CONFIG"; fi
-
-    if ! restart_singbox_service; then
-        error "重启服务失败，当前配置可能与系统环境不兼容。"
-        return 1
-    fi
-    info "已成功切换为 Socks5 出口！"
+    pause
 }
 
-write_and_show_config() {
-  local hostname=$(hostname -s | sed 's/ /_/g')
-  local ip=$(get_public_ip)
-  local url_ip="$ip"
-  if [[ "$ip" =~ ":" ]]; then 
-    url_ip="[$ip]"
-  fi
-
-  cat << EOF > /etc/singbox-vless-ws/config.json
-{
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
-  "inbounds": [
-    {
-      "type": "vless",
-      "tag": "vless-in",
-      "listen": "::",
-      "listen_port": $port,
-      "users": [
-        {
-          "uuid": "$auth_pwd",
-          "flow": ""
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "$sb_domain",
-        "key_path": "$key_path",
-        "certificate_path": "$cert_path"
-      },
-      "transport": {
-        "type": "ws",
-        "path": "$ws_path"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ]
-}
-EOF
-
-  mkdir -p "$SB_DIR"
-
-  cat << EOF > "$SB_DIR/url.txt"
-====== VLESS + WS + TLS 节点信息 ======
-IP    : ${ip}
-端口  : $port
-UUID  : $auth_pwd
-SNI   : $sb_domain
-HOST  : $sb_domain
-路径  : $ws_path
----------------------------
-📄 V6VPS 请自行替换 IP 地址为 V6 ★
-[信息] V2rayN    链接：
-vless://$auth_pwd@$url_ip:$port?sni=$sb_domain&host=$sb_domain&security=tls&type=ws&path=$(echo "$ws_path" | sed 's/\//%2F/g')#$hostname-Vlesswstls
----------------------------------
-EOF
-
-  if is_user_exists "sing-box" && getent group "sing-box" >/dev/null 2>&1; then
-    chown -R sing-box:sing-box /etc/singbox-vless-ws
-    chown -h sing-box:sing-box /etc/singbox-vless-ws/* 2>/dev/null || true
-  fi
-
-  if restart_singbox_service; then
-    info "sing-box (VLESS+WS+TLS) 服务配置并通过 OpenRC 启动成功！"
-  else
-    error "sing-box 服务启动失败，请查看日志。"
-  fi
-  
-  showconf
-}
-
-# =========================================================
-# 5. 主流程功能控制模块
-# =========================================================
-instsingbox() {
-  check_environment
-  
-  info "获取官方最新发布版本中..."
-  local latest_version=$(get_latest_version)
-  if [[ -z "$latest_version" ]]; then
-    error "无法获取最新版本号，请检查网络设置。"
-    return 1
-  fi
-  
-  local _tmparchive=$(mktemp)
-  if ! download_singbox "$latest_version" "$_tmparchive"; then
-    rm -f "$_tmparchive" && return 1
-  fi
-
-  echo -ne "正在解压并安装二进制可执行文件 ... "
-  local _tmpdir=$(mktemp -d)
-  tar -xzf "$_tmparchive" -C "$_tmpdir"
-  
-  if install -Dm755 "$_tmpdir"/sing-box-*/sing-box "$EXECUTABLE_INSTALL_PATH"; then
-    echo "成功"
-  else
-    rm -rf "$_tmparchive" "$_tmpdir" && error "安装失败" && return 1
-  fi
-  rm -rf "$_tmparchive" "$_tmpdir"
-
-  SINGBOX_USER="sing-box"
-  SINGBOX_HOME_DIR="/var/lib/sing-box"
-
-  if ! getent group "$SINGBOX_USER" >/dev/null 2>&1; then
-    addgroup -S "$SINGBOX_USER" >/dev/null 2>&1 || true
-  fi
-
-  if ! is_user_exists "$SINGBOX_USER"; then
-    echo -ne "正在创建系统独立沙箱运行用户 $SINGBOX_USER ... "
-    mkdir -p "$SINGBOX_HOME_DIR"
-    adduser -S -D -G "$SINGBOX_USER" -h "$SINGBOX_HOME_DIR" -s /sbin/nologin "$SINGBOX_USER" >/dev/null 2>&1 || true
-    echo "成功"
-  fi
-
-  if has_command rc-update; then
-    install_content -Dm755 "$(tpl_singbox_openrc_service)" "$OPENRC_SERVICES_DIR/singbox-vless-ws" "1"
-    rc-update add singbox-vless-ws default >/dev/null 2>&1 || true
-  fi
-
-  inst_cert || return 1
-  inst_port
-  
-  read -rp "设置 VLESS UUID (直接回车将自动分配强随机 UUID): " auth_pwd
-  auth_pwd=${auth_pwd:-$(generate_uuid)}
-
-  read -rp "设置 WebSocket 路径 (直接回车默认 /ws): " ws_path
-  ws_path=${ws_path:-/ws}
-  [[ ! "$ws_path" =~ ^/ ]] && ws_path="/$ws_path"
-
-  write_and_show_config
-}
-
-update_singbox() {
-  if [[ ! -f "$SB_BINARY" ]]; then
-    error "当前系统未安装 sing-box，无法执行更新。"
-    return 1
-  fi
-
-  info "正在检查新版本..."
-  local current_version=$(get_installed_version)
-  local latest_version=$(get_latest_version)
-
-  if [[ -z "$latest_version" ]]; then
-    error "无法连接 to GitHub API 获取最新版本，请稍后再试。"
-    return 1
-  fi
-
-  info "当前安装版本: ${YELLOW}${current_version}${RESET}"
-  info "官方最新版本: ${GREEN}${latest_version}${RESET}"
-
-  if [[ "$current_version" == "$latest_version" ]]; then
-    info "您当前已经是最新版本，无需更新。"
-    return 0
-  fi
-
-  warn "检测到新版本，即将开始平滑更新 (你的配置与运行数据不会改变)..."
-  
-  local _tmparchive=$(mktemp)
-  if ! download_singbox "$latest_version" "$_tmparchive"; then
-    rm -f "$_tmparchive" && return 1
-  fi
-
-  echo -ne "正在覆盖二进制核心文件 ... "
-  local _tmpdir=$(mktemp -d)
-  tar -xzf "$_tmparchive" -C "$_tmpdir"
-  if install -Dm755 "$_tmpdir"/sing-box-*/sing-box "$EXECUTABLE_INSTALL_PATH"; then
-    echo "成功"
-  else
-    rm -rf "$_tmparchive" "$_tmpdir" && error "覆盖核心失败" && return 1
-  fi
-  rm -rf "$_tmparchive" "$_tmpdir"
-
-  info "正在重启 sing-box 服务以应用更新..."
-  if restart_singbox_service; then
-    info "sing-box 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
-  else
-    error "核心更新成功，但服务重启失败。"
-  fi
-}
-
-unstsingbox() {
-  warn "即将从当前系统中彻底卸载 sing-box"
-
-  if has_command rc-service && [[ -f "$OPENRC_SERVICES_DIR/singbox-vless-ws" ]]; then
-    rc-service singbox-vless-ws stop >/dev/null 2>&1 || true
-    rc-update del singbox-vless-ws >/dev/null 2>&1 || true
-    remove_file "$OPENRC_SERVICES_DIR/singbox-vless-ws"
-  else
-    pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-  fi
-  
-  remove_file "$EXECUTABLE_INSTALL_PATH"
-  rm -f "$SB_LOG"
-  rm -rf /etc/singbox-vless-ws "$SB_DIR"
-
-  info "sing-box 已彻底从您的系统中移除！"
-}
-
-changeconf() {
-  if [[ ! -f "$SB_CONFIG" ]]; then
-    error "配置文件不存在，请先安装 sing-box"
-    return 1
-  fi
-
-  local old_pwd=$(jq -r '.inbounds[0].users[0].uuid' "$SB_CONFIG" 2>/dev/null || true)
-  local old_path=$(jq -r '.inbounds[0].transport.path' "$SB_CONFIG" 2>/dev/null || echo "/ws")
-  local old_cert=$(jq -r '.inbounds[0].tls.certificate_path' "$SB_CONFIG" 2>/dev/null || true)
-  local old_key=$(jq -r '.inbounds[0].tls.key_path' "$SB_CONFIG" 2>/dev/null || true)
-  local old_sni=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || "www.bing.com")
-
-  clear
-  echo -e "${GREEN}====== 修改 sing-box (VLESS+WS+TLS) 配置 ======${RESET}"
-  echo "提示：直接敲回车将保持原有配置不变"
-  echo "---------------------------------------------"
-  
-  inst_port 
-
-  local auth_pwd
-  read -rp "设置 VLESS 新 UUID [当前: ${old_pwd}, 回车不修改]: " auth_pwd
-  auth_pwd=${auth_pwd:-$old_pwd}
-
-  local ws_path
-  read -rp "设置 新 WebSocket 路径 [当前: ${old_path}, 回车不修改]: " ws_path
-  ws_path=${ws_path:-$old_path}
-  [[ ! "$ws_path" =~ ^/ ]] && ws_path="/$ws_path"
-
-  local cert_path key_path sb_domain
-  echo "---------------------------------------------"
-  read -rp "是否需要修改证书？[y/N] (直接回车默认不修改): " change_cert_flag
-  if [[ "$change_cert_flag" == "y" || "$change_cert_flag" == "Y" ]]; then
-    inst_cert || return 1
-  else
-    cert_path="$old_cert"
-    key_path="$old_key"
-    sb_domain="$old_sni"
-  fi
-
-  write_and_show_config
-  info "配置修改并应用成功！"
-}
-
-showconf() {
-  if [[ ! -f "$SB_CONFIG" ]]; then
-    error "未找到 VLESS 配置文件，请确保已成功部署节点。"
-    return
-  fi
-
-  local hostname=$(hostname -s | sed 's/ /_/g')
-  local main_port=$(jq -r '.inbounds[0].listen_port' "$SB_CONFIG" 2>/dev/null || echo "18055")
-  local auth_pwd=$(jq -r '.inbounds[0].users[0].uuid' "$SB_CONFIG" 2>/dev/null || echo "UUID")
-  local sb_domain=$(jq -r '.inbounds[0].tls.server_name' "$SB_CONFIG" 2>/dev/null || echo "www.bing.com")
-  local ws_path=$(jq -r '.inbounds[0].transport.path' "$SB_CONFIG" 2>/dev/null || echo "/ws")
-  
-  local is_insecure="0"
-  if [[ "$sb_domain" == "www.bing.com" ]]; then
-    is_insecure="1"
-  fi
-
-  local ip=$(get_public_ip)
-  local url_ip="$ip"
-  if [[ "$ip" =~ ":" ]]; then 
-    url_ip="[$ip]"
-  fi
-
-  echo -e "${GREEN}====== VLESS + WS + TLS 节点信息 ======${RESET}"
-  echo -e "${YELLOW}IP      : ${ip}${RESET}"
-  echo -e "${YELLOW}端口    : ${main_port}${RESET}"
-  echo -e "${YELLOW}UUID    : ${auth_pwd}${RESET}"
-  echo -e "${YELLOW}SNI     : ${sb_domain}${RESET}"
-  echo -e "${YELLOW}host    : ${sb_domain}${RESET}"
-  echo -e "${YELLOW}WS 路径 : ${ws_path}${RESET}"
-  echo -e "${GREEN}---------------------------${RESET}"
-  echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
-  echo -e "${GREEN}[信息] V2rayN 链接：${RESET}"
-  echo -e "${YELLOW}vless://${auth_pwd}@${url_ip}:${main_port}?sub=1&sni=${sb_domain}&host=${sb_domain}&security=tls&allowInsecure=${is_insecure}&type=ws&path=$(echo "$ws_path" | sed 's/\//%2F/g')#${hostname}-Vlesswstls${RESET}"
-  echo -e "${YELLOW}---------------------------------${RESET}"
-}
-
-# =========================================================
-# 6. 面板主菜单循环
-# =========================================================
-menu() {
-  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
-  check_environment
-
-  while true; do
+test_cert_renew() {
     clear
-    local status=$(get_sb_status)
-    local version=$(get_installed_version)
-    local port_show=$(get_current_port_display)
+    echo -e "${YELLOW}=========================================${RESET}"
+    echo -e "${YELLOW}       ◈    ACME 证书手动强制续期    ◈    ${RESET}"
+    echo -e "${YELLOW}=========================================${RESET}"
+    
+    if [ ! -x "${ACME_HOME}/acme.sh" ]; then
+        echo -e "${RED}错误: 系统未检测到 acme.sh，无法执行自动续期操作。${RESET}"
+        return 0
+    fi
 
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   Sing-box VLESS-WS-TLS 面板   ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $status"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1.安装 Sing-box VLESS-WS-TLS${RESET}"
-    echo -e "${GREEN} 2.更新 Sing-box ${RESET}"
-    echo -e "${GREEN} 3.卸载 Sing-box ${RESET}"
-    echo -e "${GREEN} 4.修改配置${RESET}"
-    echo -e "${GREEN} 5.启动 Sing-box ${RESET}"
-    echo -e "${GREEN} 6.停止 Sing-box ${RESET}"
-    echo -e "${GREEN} 7.重启 Sing-box ${RESET}"
-    echo -e "${GREEN} 8.查看日志${RESET}"
-    echo -e "${GREEN} 9.查看节点配置${RESET}"
-    echo -e "${GREEN}10.配置Socks5出口${RESET}"
-    echo -e "${GREEN} 0.退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    local domains=()
+    local count=0
+    while read -r line; do
+        if [ -n "$line" ]; then
+            count=$((count + 1))
+            domains+=("$line")
+            echo -e "  ${YELLOW}${count})${RESET} 域名/IP: ${GREEN}${line}${RESET}"
+        fi
+    done < <("${ACME_HOME}/acme.sh" --list | tail -n +2 | awk '{print $1}')
 
-    local choice=""
-    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
-    [[ -z "$choice" ]] && continue
+    if [ "$count" -eq 0 ]; then
+        echo -e "${RED}当前 acme.sh 列表中无任何可供续期的域名。${RESET}"
+        return 0
+    fi
 
-    case "$choice" in
-      1) instsingbox; pause ;;
-      2) update_singbox; pause ;;
-      3) unstsingbox; pause ;;
-      4) changeconf; pause ;;
-      5) 
-        if has_command rc-service && [[ -f "$OPENRC_SERVICES_DIR/singbox-vless-ws" ]]; then
-          rc-service singbox-vless-ws start && info "服务已成功启动 (OpenRC)！"
-        else
-          pkill -f "$EXECUTABLE_INSTALL_PATH run" || true
-          touch "$SB_LOG" && chmod 644 "$SB_LOG"
-          if is_user_exists "sing-box"; then chown sing-box:sing-box "$SB_LOG"; fi
-          su -s /bin/bash -c "$EXECUTABLE_INSTALL_PATH run --config $SB_CONFIG >> $SB_LOG 2>&1 &" sing-box
-          info "进程已在后台独立启动！"
+    echo -e "  ${YELLOW}0)${RESET} 返回主菜单"
+    echo -e "${YELLOW}=========================================${RESET}"
+    echo -ne "${GREEN}请选择想要强制续期的证书序号 [0-${count}]: ${RESET}"
+    read -r idx </dev/tty
+
+    if [ "$idx" = "0" ] || [ -z "$idx" ]; then
+        return 0
+    fi
+
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "$count" ]; then
+        echo -e "${RED}输入序号非法！${RESET}"
+        sleep 1
+        return 0
+    fi
+
+    local target_domain="${domains[$((idx - 1))]}"
+    echo -e "${YELLOW}==> 正在向证书颁发机构申请强制更新域名: ${target_domain} ...${RESET}"
+    
+    if "${ACME_HOME}/acme.sh" --renew -d "$target_domain" --ecc --force; then
+        echo -e "${GREEN}✔ 证书续期成功！正在尝试复制和重载 Nginx 服务...${RESET}"
+        local cert_dir="${CERT_HOME}/${target_domain}"
+        if [ -d "$cert_dir" ]; then
+            "${ACME_HOME}/acme.sh" --install-cert -d "$target_domain" --ecc \
+                --fullchain-file "${cert_dir}/fullchain.cer" \
+                --key-file "${cert_dir}/private.key"
         fi
-        pause ;;
-      6) 
-        if has_command rc-service && [[ -f "$OPENRC_SERVICES_DIR/singbox-vless-ws" ]]; then
-          rc-service singbox-vless-ws stop && info "服务已成功停止 (OpenRC)！"
-        else
-          pkill -f "$EXECUTABLE_INSTALL_PATH run" && info "后台进程已终止！"
-        fi
-        pause ;;
-      7) 
-        restart_singbox_service && info "服务/进程已重启！"
-        pause ;;
-      8) 
-        if [[ -f "$SB_LOG" ]]; then
-           echo -e "${CYAN}正在实时读取 sing-box 核心日志 (按 Ctrl+C 即可退出)...${RESET}"
-           echo "------------------------------------------------------------------------"
-           # 核心改动：在子 Shell 中执行并保护主进程，使其不被 Ctrl+C 连带杀死
-           (trap 'exit 0' INT; tail -n 50 -f "$SB_LOG") || true
-           echo -e "\n${GREEN}[信息] 已退出日志查看。${RESET}"
-           pause
-        else
-           error "未发现核心日志文件 ($SB_LOG)，服务可能未曾启动。"
-           pause
-        fi
-        ;;
-      9) showconf; pause ;;
-      10) configure_custom_socks5_outbound; pause ;;
-      0) exit 0 ;;
-      *) error "无效输入，请重新选择。"; sleep 1 ;;
-    esac
-  done
+        nginx -t && manage_nginx_service reload
+        echo -e "${GREEN}✔ 证书文件部署与 Nginx 服务重载全部完成！${RESET}"
+    else
+        echo -e "${RED}❌ 证书续期失败！具体错误原因请参考上方 acme.sh 官方日志。${RESET}"
+    fi
 }
 
-menu "$@"
+uninstall_nginx() {
+    yesno CONFIRM "确定要完全卸载反代系统和 Nginx 吗？" "n"
+    if [ "$CONFIRM" = "y" ]; then
+        manage_nginx_service stop || true
+        manage_nginx_service disable || true
+        rm -f "${HTTP_D}/${CONF_PREFIX}"*.conf 2>/dev/null || true
+        rm -rf "$CERT_HOME"
+        
+        local tmp_cron="/tmp/cron_backup"
+        if crontab -l > "$tmp_cron" 2>/dev/null; then
+            sed -i '/acme.sh/d' "$tmp_cron" && crontab "$tmp_cron"
+        fi
+        rm -f "$tmp_cron"
+
+        case "$OS" in
+            alpine) apk del nginx >/dev/null 2>&1 || true ;;
+            debian) apt-get purge -y nginx >/dev/null 2>&1 || true ;;
+            rhel) dnf remove -y nginx >/dev/null 2>&1 || true ;;
+        esac
+        echo -e "${GREEN}卸载完成！${RESET}"
+    fi
+}
+
+# 终极主菜单面板
+main_panel() {
+    need_root
+    detect_os
+    
+    while true; do
+        get_panel_status
+        clear
+        echo -e "${GREEN}===============================${RESET}"
+        echo -e "${GREEN} ◈  Nginx 反向代理管理面板  ◈  ${RESET}"
+        echo -e "${GREEN}===============================${RESET}"
+        echo -e "${GREEN} 状态     : ${STATUS}"
+        echo -e "${GREEN} 版本     : ${YELLOW}${VERSION_SHOW}${RESET}"
+        echo -e "${GREEN} 数量     : ${YELLOW}${SITE_COUNT} 个${RESET}"
+        echo -e "${GREEN}===============================${RESET}"
+        echo -e "${GREEN}  1. 安装 Nginx${RESET}"
+        echo -e "${GREEN}  2. 添加配置(自动申请证书)${RESET}"
+        echo -e "${GREEN}  3. 添加配置(使用自定义证书)${RESET}"
+        echo -e "${GREEN}  4. 删除配置${RESET}"
+        echo -e "${GREEN}  5. 证书续期${RESET}"
+        echo -e "${GREEN}  6. 查看证书状态${RESET}"
+        echo -e "${GREEN}  7. 查看当前站点${RESET}"
+        echo -e "${GREEN}  8. Emby反代配置${RESET}"
+        echo -e "${GREEN}  9. 重载Nginx服务${RESET}"
+        echo -e "${GREEN} 10. 卸载Nginx${RESET}"
+        echo -e "${GREEN}  0. 退出${RESET}"
+        echo -e "${GREEN}===============================${RESET}"
+        echo -ne "${GREEN} 请选择: ${RESET}"
+        read -r choice </dev/tty
+
+        case "$choice" in
+            1)  ensure_deps && ensure_dirs && install_or_init_acme_sh && write_main_nginx_conf && manage_nginx_service enable && manage_nginx_service start ; pause ;;
+            2)  add_common_site ; pause ;;
+            3)  add_custom_cert_site ; pause ;;
+            4)  delete_site ; pause ;;
+            5)  test_cert_renew ; pause ;;
+            6)  check_domains_status ;;
+            7)  list_sites ; pause ;;
+            8)  add_emby_site ; pause ;;
+            9)  manage_nginx_service reload && echo -e "${GREEN}重载成功！${RESET}" ; pause ;;
+            10) uninstall_nginx ; pause ;;
+            0)  clear && exit 0 ;;
+            *)  echo -e "${RED}输入错误，请重新选择！${RESET}" ; pause ;;
+        esac
+    done
+}
+
+main_panel "$@"

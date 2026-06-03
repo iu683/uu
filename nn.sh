@@ -1,1127 +1,775 @@
-#!/bin/bash
-set +e
+#!/usr/bin/env bash
+#
+# Alpine sing-box Hysteria 2 专属管理面板
+# SPDX-License-Identifier: MIT
+#
+set -Eop pipefail
+export LANG=en_US.UTF-8
 
+# =========================================================
+# 1. 核心控制与全局环境初始化
+# =========================================================
+readonly BINARY_PATH="/usr/local/bin/sing-box-hy2"
+readonly HY2_CONFIG="/etc/sing-box-hy2/config.json"
+readonly HY2_DIR="/root/proxynode/hy2"
+CONFIG_DIR="/etc/sing-box-hy2"
+OPENRC_SERVICE_PATH="/etc/init.d/sing-box-hy2"
+LOG_FILE="/var/log/sing-box-hy2.log"
+RUN_USER="singbox-hy2"
+
+TMP_DIR=$(mktemp -d -t sb-hy2.XXXXXX)
+
+# 颜色标准规范
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
 RESET="\033[0m"
 
-red() { echo -e "${RED}$1${RESET}"; }
-green() { echo -e "${GREEN}$1${RESET}"; }
-yellow() { echo -e "${YELLOW}$1${RESET}"; }
+info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
+error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
+pause() { echo; read -n 1 -s -r -p "$(echo -e ${GREEN}"按任意键返回菜单..."${RESET})" || true; echo; }
 
-# 默认自定义证书存放归档目录
-CUSTOM_SSL_BASE="/etc/nginx/custom_ssl"
-mkdir -p "$CUSTOM_SSL_BASE"
+cleanup() {
+  [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT INT TERM
 
-# ------------------------------
-# 顶层看板动态数据获取 (适配 OpenRC)
-# ------------------------------
-get_nginx_status() {
-    if ! command -v nginx >/dev/null 2>&1; then
-        STATUS="${RED}未安装${RESET}"
-    elif rc-service nginx status >/dev/null 2>&1; then
-        STATUS="${YELLOW}运行中${RESET}"
-    else
-        STATUS="${RED}已停止${RESET}"
-    fi
+generate_random_password() {
+  dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
 }
 
-
-get_nginx_version() {
-    if command -v nginx >/dev/null 2>&1; then
-        local nginx_out
-        nginx_out=$(nginx -v 2>&1)
-        
-        if [[ $nginx_out =~ /([0-9.]+) ]]; then
-            VERSION_SHOW="${BASH_REMATCH[1]}"
-        else
-            VERSION_SHOW="未知"
-        fi
-    else
-        VERSION_SHOW="无"
-    fi
+is_alpine() {
+  [[ -f /etc/alpine-release ]]
 }
 
-get_site_count() {
-    CONFIG_DIR="/etc/nginx/sites-available"
-    if [ -d "$CONFIG_DIR" ]; then
-        SITE_COUNT=$(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | wc -l | tr -d ' ')
-    else
-        SITE_COUNT="0"
-    fi
+install_packages() {
+  info "正在刷新 Alpine 仓库并安装核心依赖..."
+  apk update
+  apk add --no-cache bash curl wget tar openssl openrc iproute2 jq grep sed coreutils bind-tools iptables ip6tables gcompat socat python3
+  
+  if [[ -f /etc/init.d/iptables ]]; then
+    rc-update add iptables default >/dev/null 2>&1 || true
+    rc-service iptables start >/dev/null 2>&1 || true
+  fi
+  if [[ -f /etc/init.d/ip6tables ]]; then
+    rc-update add ip6tables default >/dev/null 2>&1 || true
+    rc-service ip6tables start >/dev/null 2>&1 || true
+  fi
 }
 
-# 🛠️ 核心突击：强杀所有占用 80 端口的孤儿残留进程
-force_kill_80() {
-    echo -e "${YELLOW}正在全网通缉 80 端口占用情况...${RESET}"
-    killall nginx 2>/dev/null || true
+create_user() {
+  getent group "$RUN_USER" &>/dev/null || addgroup -S "$RUN_USER"
+  id "$RUN_USER" &>/dev/null || adduser -S -D -H -G "$RUN_USER" -s /sbin/nologin "$RUN_USER"
+}
+
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l|armv7) echo "armv7" ;;
+    *) error "不支持当前架构: $(uname -m)"; exit 8 ;;
+  esac
+}
+
+check_environment() {
+  if ! is_alpine; then
+    error "本脚本仅支持 Alpine Linux 系统。"
+    exit 95
+  fi
+  install_packages
+  create_user
+}
+
+get_installed_version() {
+  if [[ -f "$BINARY_PATH" ]]; then
+    "$BINARY_PATH" version 2>/dev/null | head -n1 | awk '{print $3}' || echo "未知版本"
+  else
+    echo "未安装"
+  fi
+}
+
+get_latest_version() {
+  info "正在从 GitHub 获取 sing-box 最新版本号..."
+  local latest_v
+  latest_v=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r .tag_name | sed 's/^v//')
+  
+  if [[ -z "$latest_v" || "$latest_v" == "null" ]]; then
+    warn "通过 API 获取最新版本失败，尝试备用匹配方案..."
+    latest_v=$(curl -fsSL "https://github.com/SagerNet/sing-box/releases/latest" | grep -oE 'releases/tag/v[0-9.]+' | head -n1 | sed 's|releases/tag/v||')
+  fi
+
+  if [[ -n "$latest_v" ]]; then
+    SINGBOX_VERSION="$latest_v"
+    info "成功获取最新版本: v$SINGBOX_VERSION"
+  else
+    SINGBOX_VERSION="1.13.12"
+    warn "无法获取最新版本，将使用保底版本: v$SINGBOX_VERSION"
+  fi
+}
+
+clear_old_iptables() {
+  if [[ -f "${CONFIG_DIR}/hopping.txt" && -f "${CONFIG_DIR}/main_port.txt" ]]; then
+    local old_hop
+    old_hop=$(cat "${CONFIG_DIR}/hopping.txt")
+    local old_port
+    old_port=$(cat "${CONFIG_DIR}/main_port.txt")
+    local old_start="${old_hop%-*}"
+    local old_end="${old_hop#*-}"
+
+    if [[ -n "$old_start" && -n "$old_end" && -n "$old_port" ]]; then
+      info "正在清洁防火墙残留规则..."
+      iptables -t nat -D PREROUTING -p udp -m multiport --dports "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+      ip6tables -t nat -D PREROUTING -p udp -m multiport --dports "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+      iptables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+      ip6tables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+    fi
+  fi
+}
+
+apply_new_iptables() {
+  clear_old_iptables
+  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
+    local hop_val
+    hop_val=$(cat "${CONFIG_DIR}/hopping.txt")
+    local start_p="${hop_val%-*}"
+    local end_p="${hop_val#*-}"
     
-    local count=0
-    while netstat -ntlp 2>/dev/null | grep -q ":80 " && [ $count -lt 3 ]; do
-        local PIDS=$(netstat -ntlp 2>/dev/null | grep ":80 " | awk '{print $7}' | cut -d/ -f1 | grep -E '^[0-9]+$' || true)
-        if [ -n "$PIDS" ]; then
-            echo -e "${RED}警告: 发现 80 端口仍被残留进程 (PID: ${PIDS}) 占用！正在强制闪击...${RESET}"
-            for pid in $PIDS; do
-                kill -9 "$pid" 2>/dev/null || true
-            done
-            count=$((count+1))
-            sleep 1
-        fi
-    done
-}
-
-
-# ------------------------------
-# 核心功能函数
-# ------------------------------
-generate_random_email() {
-    RAND_STR=$(tr -dc a-z0-9 </dev/urandom | head -c 10)
-    echo "${RAND_STR}@gmail.com"
-}
-
-validate_email() {
-    [[ "$1" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
-}
-
-pause() {
-    echo -ne "${YELLOW}按回车返回菜单...${RESET}"
-    read
-}
-
-configure_firewall() {
-    local PORT=$1
-    if [ -n "$PORT" ]; then
-        if command -v ufw >/dev/null 2>&1; then
-            ufw allow $PORT/tcp || true
-        elif command -v firewall-cmd >/dev/null 2>&1; then
-            firewall-cmd --permanent --add-port=$PORT/tcp || true
-            firewall-cmd --reload || true
-        fi
-    fi
-}
-
-remove_default_server() {
-    echo -e "${YELLOW}清理系统自带的 default server 配置...${RESET}"
-    rm -f /etc/nginx/sites-enabled/default
-    rm -f /etc/nginx/sites-available/default
-    rm -f /etc/nginx/http.d/default.conf 2>/dev/null || true 
-}
-
-ensure_nginx_conf() {
-    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-    if [ ! -f /etc/nginx/nginx.conf ]; then
-        cat > /etc/nginx/nginx.conf <<'EOF'
-user nginx;
-worker_processes auto;
-pcre_jit on;
-pid /run/nginx.pid;
-
-events {
-    worker_connections 1024;
-}
-
-http {
-    sendfile on;
-    tcp_nopush on;
-    tcp_nodelay on;
-    keepalive_timeout 65;
-    types_hash_max_size 2048;
-    include /etc/nginx/mime.types;
-    default_type application/octet-stream;
-
-    access_log /var/log/nginx/access.log;
-    error_log /var/log/nginx/error.log;
-
-    gzip on;
-    include /etc/nginx/conf.d/*.conf;
-    include /etc/nginx/sites-enabled/*;
-}
-EOF
-    fi
-
-    if [ ! -f /etc/nginx/mime.types ]; then
-        cat > /etc/nginx/mime.types <<'EOF'
-types {
-    text/html  html htm shtml;
-    text/css   css;
-    text/xml   xml;
-    image/gif  gif;
-    image/jpeg jpeg jpg;
-    application/javascript js;
-    application/atom+xml atom;
-    application/rss+xml rss;
-}
-EOF
-    fi
-}
-
-create_default_server() {
-    DEFAULT_PATH="/etc/nginx/sites-available/default_server_block"
-    [ ! -f "$DEFAULT_PATH" ] && cat > "$DEFAULT_PATH" <<EOF
-server {
-    listen 80 default_server;
-    server_name _;
-    return 403;
-}
-EOF
-    ln -sf "$DEFAULT_PATH" /etc/nginx/sites-enabled/default_server_block
-}
-
-generate_server_config() {
-    DOMAIN=$1
-    TARGET=$2
-    IS_WS=$3
-    MAX_SIZE=$4
-    CERT_PATH=$5    
-    KEY_PATH=$6       
-    LISTEN_PORT=$7  
-    CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
-
-    MAX_SIZE=${MAX_SIZE:-200M}
-    CERT_PATH=${CERT_PATH:-"/etc/letsencrypt/live/$DOMAIN/fullchain.pem"}
-    KEY_PATH=${KEY_PATH:-"/etc/letsencrypt/live/$DOMAIN/privkey.pem"}
-    LISTEN_PORT=${LISTEN_PORT:-443} 
-
-    if [ "$IS_WS" == "y" ]; then
-        WS_HEADERS="proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \"Upgrade\";"
+    info "正在应用 iptables 转发规则: UDP $start_p-$end_p => 主端口 $port"
+    if iptables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port"; then
+      ip6tables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
     else
-        WS_HEADERS=""
-    fi
-
-    cat > "$CONFIG_PATH" <<EOF
-server {
-    listen 80;
-    server_name $DOMAIN;
-    return 301 https://\$host:${LISTEN_PORT}\$request_uri;
-}
-
-server {
-    listen $LISTEN_PORT ssl;
-    server_name $DOMAIN;
-
-    ssl_certificate $CERT_PATH;
-    ssl_certificate_key $KEY_PATH;
-
-    location / {
-        client_max_body_size $MAX_SIZE;
-
-        proxy_pass $TARGET;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        $WS_HEADERS
-    }
-}
-EOF
-    ln -sf "$CONFIG_PATH" "/etc/nginx/sites-enabled/$DOMAIN"
-    configure_firewall "$LISTEN_PORT"
-    if [ "$LISTEN_PORT" != "443" ]; then
-        configure_firewall "443"
-    fi
-    configure_firewall "80"
-}
-
-check_domain_resolution() {
-    DOMAIN=$1
-    if [[ "$DOMAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        return 0
-    fi
-    VPS_IP=$(curl -s https://ipinfo.io/ip)
-    DOMAIN_IP=$(dig +short "$DOMAIN" | tail -n1)
-    if [ -z "$DOMAIN_IP" ] || [ "$DOMAIN_IP" != "$VPS_IP" ]; then
-        echo -e "${RED}警告: 域名 $DOMAIN 解析为 $DOMAIN_IP, VPS IP 为 $VPS_IP${RESET}"
-    else
-        echo -e "${GREEN}域名解析正常${RESET}"
-    fi
-}
-
-# 新增功能：平滑重载 Nginx 配置
-reload_nginx() {
-    echo -e "${GREEN}正在验证 Nginx 配置语法...${RESET}"
-    if nginx -t; then
-        echo -e "${GREEN}语法验证通过，正在平滑重载 OpenRC Nginx 服务...${RESET}"
-        if rc-service nginx reload; then
-            echo -e "${GREEN}✅ Nginx 配置重载成功！${RESET}"
-        else
-            echo -e "${RED}❌ 重载失败！服务可能未在运行，尝试直接启动...${RESET}"
-            rc-service nginx start
-        fi
-    else
-        echo -e "${RED}❌ Nginx 配置语法错误！未执行重载，请检查上方的错误提示。${RESET}"
-    fi
-    pause
-}
-
-install_nginx() {
-    if command -v nginx >/dev/null 2>&1 && command -v certbot >/dev/null 2>&1; then
-        echo -e "${YELLOW}提示: 检测到系统已安装 Nginx 与 Certbot，自动跳过安装。${RESET}"
-        pause
-        return
+      iptables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port"
+      ip6tables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
     fi
     
-    ensure_nginx_conf
-    remove_default_server
-
-    echo -e "${GREEN}开始安装依赖和 Nginx 组件 (Alpine APK)...${RESET}"
-    apk update
-    if ! apk add nginx certbot certbot-nginx curl bind-tools; then
-        echo -e "${RED}安装失败，尝试自动修复...${RESET}"
-        uninstall_nginx
-        echo -e "${YELLOW}重新尝试安装...${RESET}"
-        apk add nginx certbot certbot-nginx curl bind-tools || {
-            echo -e "${RED}修复后安装仍然失败，请手动检查 Alpine 镜像源！${RESET}"
-            pause
-            return
-        }
-    fi
-
-    remove_default_server
-    create_default_server
+    echo "$port" > "${CONFIG_DIR}/main_port.txt"
     
-    rc-update add nginx default
-
-    # 运行强杀 80 函数
-    force_kill_80
-
-    echo
-    echo -ne "${YELLOW}是否现在配置反向代理并申请证书？(y/n,默认y): ${RESET}"
-    read CONFIRM
-
-    CONFIRM=${CONFIRM:-y}
-    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-        echo -e "${RED}已取消配置退出${RESET}"
-        exit 0
-    fi
-
-    EMAIL_FILE="/etc/nginx/.cert_emails"
-    if [ -f "$EMAIL_FILE" ] && [ -s "$EMAIL_FILE" ]; then
-        DEFAULT_EMAIL=$(head -n1 "$EMAIL_FILE")
-    else
-        DEFAULT_EMAIL=$(generate_random_email)
-    fi
-
-    echo -ne "${GREEN}请输入邮箱地址 (回车自动生成: ${DEFAULT_EMAIL}): ${RESET}"
-    read EMAIL
-    EMAIL=${EMAIL:-$DEFAULT_EMAIL}
-
-    if ! validate_email "$EMAIL"; then
-        echo -e "${RED}邮箱格式不正确${RESET}"
-        pause
-        return
-    fi
-
-    echo -e "${GREEN}使用邮箱: ${EMAIL}${RESET}"
-    echo "$EMAIL" >> "$EMAIL_FILE"
-    sort -u "$EMAIL_FILE" -o "$EMAIL_FILE"
-    echo -ne "${GREEN}请输入域名(例如:example.com): ${RESET}"; read DOMAIN
-    check_domain_resolution "$DOMAIN"
-
-    LISTEN_PORT=${LISTEN_PORT:-443}
-
-    echo -ne "${GREEN}请输入反代目标(例如:http://127.0.0.1:5788): ${RESET}"; read TARGET
-    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n，默认 y): ${RESET}"
-    read IS_WS
-    IS_WS=${IS_WS:-y}
-
-    echo -ne "${GREEN}请输入最大上传大小 (默认 200M): ${RESET}"
-    read MAX_SIZE
-    MAX_SIZE=${MAX_SIZE:-200M}
-
-    # === 🚀 额外防线：在 Certbot 运行前再次确保 80 端口未被其他临时服务卡死 ===
-    if netstat -ntlp 2>/dev/null | grep -q ":80 " && ! rc-service nginx status >/dev/null 2>&1; then
-        kill -9 $(netstat -ntlp 2>/dev/null | grep ":80 " | awk '{print $7}' | cut -d/ -f1) 2>/dev/null || true
-    fi
-
-    # ==================== 🛠️ 核心修改部分 ====================
-    echo -e "${GREEN}正在通过 --nginx 模式向 Let's Encrypt 申请证书...${RESET}"
-    
-    # 显式指定 Alpine 下的 Nginx 配置目录和控制路径，防止 Certbot 找不到服务瞎折腾
-    certbot certonly --nginx \
-        --nginx-server-root /etc/nginx \
-        --nginx-ctl /usr/sbin/nginx \
-        -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-
-    # 安全检查防线：只有证书确实生成了，才去写入反代配置
-    if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
-        echo -e "${GREEN}✅ 证书申请成功！正在生成业务配置文件...${RESET}"
-        
-        # 写入你的反代配置
-        generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE" "" "" "$LISTEN_PORT"
-        
-        # 测试新配置并热重载 Nginx
-        if nginx -t; then
-            rc-service nginx reload
-            echo -e "${GREEN}安装完成！配置已生效。${RESET}"
-            if [ "$LISTEN_PORT" = "443" ]; then
-                echo -e "${GREEN}访问地址: https://$DOMAIN${RESET}"
-            else
-                echo -e "${GREEN}访问地址: https://$DOMAIN:$LISTEN_PORT${RESET}"
-            fi
-        else
-            echo -e "${RED}❌ 错误: Nginx 最终业务配置语法测试失败，执行安全回滚！${RESET}"
-            rm -f "/etc/nginx/sites-enabled/$DOMAIN" 2>/dev/null
-            rc-service nginx reload
-        fi
-    else
-        echo -e "${RED}❌ 错误: Certbot --nginx 模式证书申请失败！${RESET}"
-        echo -e "${YELLOW}已终止反代配置写入，防止 Nginx 全盘瘫痪。请检查 80 端口放行情况与防火墙。${RESET}"
-    fi
-
-    # 自动续期定时任务 (适配 Alpine 的 rc-service)
-    if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
-        (crontab -l 2>/dev/null; echo "0 2 * * * certbot renew --quiet --post-hook 'rc-service nginx reload'") | crontab -
-    fi
-    # ========================================================
-
-    pause
+    if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
+    if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
+    info "防火墙端口跳跃规则已固化。"
+  fi
 }
 
-add_config() {
-    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-
-    echo -ne "${GREEN}请输入域名(example.com): ${RESET}"
-    read DOMAIN
-    check_domain_resolution "$DOMAIN"
-
-    LISTEN_PORT=${LISTEN_PORT:-443}
-
-    echo -ne "${GREEN}请输入反代目标(http://127.0.0.1:5788): ${RESET}"
-    read TARGET
-
-    EMAIL_FILE="/etc/nginx/.cert_emails"
-    if [ -f "$EMAIL_FILE" ] && [ -s "$EMAIL_FILE" ]; then
-        DEFAULT_EMAIL=$(head -n1 "$EMAIL_FILE")
-    else
-        DEFAULT_EMAIL=$(generate_random_email)
-    fi
-
-    echo -ne "${GREEN}请输入邮箱地址 (回车自动生成: ${DEFAULT_EMAIL}): ${RESET}"
-    read EMAIL
-    EMAIL=${EMAIL:-$DEFAULT_EMAIL}
-
-    if ! validate_email "$EMAIL"; then
-        echo -e "${RED}邮箱格式不正确${RESET}"
-        pause
-        return
-    fi
-
-    echo "$EMAIL" >> "$EMAIL_FILE"
-    sort -u "$EMAIL_FILE" -o "$EMAIL_FILE"
-
-    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n，回车默认 y): ${RESET}"
-    read IS_WS
-    IS_WS=${IS_WS:-y}
-
-    echo -ne "${GREEN}请输入最大上传大小 (默认 200M): ${RESET}"
-    read MAX_SIZE
-    MAX_SIZE=${MAX_SIZE:-200M}
-
-    if [ -f "/etc/nginx/sites-available/$DOMAIN" ]; then
-        echo -e "${YELLOW}配置已存在${RESET}"
-        pause
-        return
-    fi
-
-    certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-    generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE" "" "" "$LISTEN_PORT"
-    create_default_server
-    nginx -t && rc-service nginx reload
-    echo -e "${GREEN}添加完成！访问: https://$DOMAIN:$LISTEN_PORT${RESET}"
-    pause
-}
-
-modify_config() {
-    CONFIG_DIR="/etc/nginx/sites-available"
-    [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}还没有任何配置文件！${RESET}" && pause && return
-
-    DOMAINS=($(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort))
-    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有域名配置！${RESET}" && pause && return
-
-    echo -e "${GREEN}现有配置的域名/IP:${RESET}"
-    for i in "${!DOMAINS[@]}"; do
-        echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"
-    done
-
-    echo -ne "${GREEN}请输入编号 (0 返回): ${RESET}"
-    read choice
-    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ ]]; then
-        echo -e "${YELLOW}已取消${RESET}"; return
-    fi
-    if [ "$choice" -eq 0 ]; then return; fi
-    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效选择${RESET}"; pause; return
-    fi
-
-    DOMAIN="${DOMAINS[$((choice-1))]}"
-    CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
-    
-    local old_port=$(grep "listen " "$CONFIG_PATH" | grep "ssl" | awk '{print $2}' | tr -d ';')
-    old_port=${old_port:-443}
-
-
-    LISTEN_PORT=${LISTEN_PORT:-$old_port}
-
-    echo -ne "${GREEN}请输入新反代目标(例如:http://127.0.0.1:5788): ${RESET}"; read TARGET
-    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n，回车默认 y): ${RESET}"; read IS_WS
-    IS_WS=${IS_WS:-y}
-    echo -ne "${GREEN}请输入最大上传大小 (默认 200M): ${RESET}"
-    read MAX_SIZE
-    MAX_SIZE=${MAX_SIZE:-200M}
-
-    if grep -q "$CUSTOM_SSL_BASE" "$CONFIG_PATH"; then
-        local current_cert=$(grep "ssl_certificate " "$CONFIG_PATH" | awk '{print $2}' | tr -d ';')
-        local current_key=$(grep "ssl_certificate_key " "$CONFIG_PATH" | awk '{print $2}' | tr -d ';')
-        generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE" "$current_cert" "$current_key" "$LISTEN_PORT"
-    else
-        echo -ne "${GREEN}是否更新邮箱? (y/n，回车默认 n): ${RESET}"
-        read c
-        c=${c:-n}
-        if [[ "$c" == "y" ]]; then
-            DEFAULT_EMAIL=$(generate_random_email)
-            echo -ne "${GREEN}请输入新邮箱 (回车默认: ${DEFAULT_EMAIL}): ${RESET}"
-            read EMAIL
-            EMAIL=${EMAIL:-$DEFAULT_EMAIL}
-            if ! validate_email "$EMAIL"; then
-                echo -e "${RED}邮箱格式不正确${RESET}"; pause; return
-            fi
-            certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-        fi
-        generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE" "" "" "$LISTEN_PORT"
-    fi
-
-    create_default_server
-    nginx -t && rc-service nginx reload
-    echo -e "${GREEN}修改完成！访问: https://$DOMAIN:$LISTEN_PORT${RESET}"
-    pause
-}
-
-delete_config() {
-    CONFIG_DIR="/etc/nginx/sites-available"
-    [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}没有配置文件！${RESET}" && pause && return
-
-    DOMAINS=($(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort))
-    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有域名配置！${RESET}" && pause && return
-
-    echo -e "${GREEN}可删除的域名/IP:${RESET}"
-    for i in "${!DOMAINS[@]}"; do
-        echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"
-    done
-
-    echo -ne "${GREEN}请选择编号 (0 返回): ${RESET}"
-    read choice
-    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ ]]; then
-        echo -e "${YELLOW}已取消${RESET}"; return
-    fi
-    if [ "$choice" -eq 0 ]; then return; fi
-    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效选择${RESET}"; pause; return
-    fi
-
-    DOMAIN="${DOMAINS[$((choice-1))]}"
-    CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
-
-    if grep -q "$CUSTOM_SSL_BASE" "$CONFIG_PATH"; then
-        rm -f "/etc/nginx/sites-available/$DOMAIN" "/etc/nginx/sites-enabled/$DOMAIN"
-        echo -ne "${YELLOW}是否同时删除自定义证书源文件？(y/N): ${RESET}"
-        read del_cust
-        if [[ "$del_cust" =~ ^[Yy]$ ]]; then
-            rm -rf "$CUSTOM_SSL_BASE/$DOMAIN"
-            echo -e "${GREEN}自定义证书源文件已删除${RESET}"
-        fi
-    else
-        rm -f "/etc/nginx/sites-available/$DOMAIN" "/etc/nginx/sites-enabled/$DOMAIN"
-        echo -ne "${YELLOW}是否同时删除托管的 Certbot 证书 $DOMAIN ? (y/N): ${RESET}"
-        read del_cert
-        if [[ "$del_cert" =~ ^[Yy]$ ]]; then
-            certbot delete --cert-name "$DOMAIN" || true
-            echo -e "${GREEN}Certbot 证书已删除${RESET}"
-        else
-            echo -e "${YELLOW}证书保留${RESET}"
-        fi
-    fi
-
-    if nginx -t; then
-        rc-service nginx reload
-        echo -e "${GREEN}站点 $DOMAIN 已完全删除${RESET}"
-    else
-        echo -e "${RED}Nginx 配置测试失败，请检查！${RESET}"
-    fi
-    pause
-}
-
-test_renew() {
-    CONFIG_DIR="/etc/nginx/sites-available"
-    [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}没有配置文件${RESET}" && pause && return
-
-    DOMAINS=($(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort))
-    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有域名配置！${RESET}" && pause && return
-
-    local valid_count=0
-    for d in "${DOMAINS[@]}"; do
-        if ! grep -q "$CUSTOM_SSL_BASE" "/etc/nginx/sites-available/$d"; then
-            valid_count=$((valid_count+1))
-        fi
-    done
-
-    if [ $valid_count -eq 0 ]; then
-        echo -e "${YELLOW}当前全部站点均为自定义证书，无需通过 Certbot 续期。${RESET}"
-        pause && return
-    fi
-
-    echo -e "${GREEN}以下为可执行 Certbot 续期测试的托管站点:${RESET}"
-    local idx=1
-    local mapped_domains=()
-    for d in "${DOMAINS[@]}"; do
-        if ! grep -q "$CUSTOM_SSL_BASE" "/etc/nginx/sites-available/$d"; then
-            echo -e "${GREEN}${idx}) $d${RESET}"
-            mapped_domains+=("$d")
-            idx=$((idx+1))
-        fi
-    done
-
-    echo -ne "${GREEN}选择编号 (0 返回): ${RESET}"
-    read choice
-    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ || "$choice" -eq 0 ]]; then return; fi
-    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#mapped_domains[@]} ]; then
-        echo -e "${RED}无效选择${RESET}"; pause; return
-    fi
-
-    DOMAIN="${mapped_domains[$((choice-1))]}"
-    echo -e "${GREEN}正在测试 $DOMAIN 的证书续期...${RESET}"
-    certbot renew --dry-run --cert-name "$DOMAIN"
-    pause
-}
-
-check_cert() {
-    echo -e "${GREEN}1) 查看Certbot托管证书${RESET}"
-    echo -e "${GREEN}2) 查看自定义证书${RESET}"
-    echo -ne "${GREEN}请选择 [1-2]: ${RESET}"
-    read c_choice
-    if [ "$c_choice" == "1" ]; then
-        Bronze_DIR="/etc/letsencrypt/live"
-        [ ! -d "$Bronze_DIR" ] && echo -e "${GREEN}没有托管证书${RESET}" && pause && return
-        DOMAINS=()
-        for DOMAIN in $(ls "$Bronze_DIR"); do
-            [ -f "$Bronze_DIR/$DOMAIN/fullchain.pem" ] && DOMAINS+=("$DOMAIN")
+# =========================================================
+# 4. 网络诊断与配置管理辅助
+# =========================================================
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
-        if [ ${#DOMAINS[@]} -eq 0 ]; then echo -e "${GREEN}没有有效托管证书${RESET}"; pause; return; fi
-        for i in "${!DOMAINS[@]}"; do echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"; done
-        echo -ne "${GREEN}请选择编号 (0 返回): ${RESET}"; read choice
-        if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -eq 0 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then return; fi
-        certbot certificates --cert-name "${DOMAINS[$((choice-1))]}"
-    elif [ "$c_choice" == "2" ]; then
-        if [ -d "$CUSTOM_SSL_BASE" ]; then
-            ls -lR "$CUSTOM_SSL_BASE"
-        fi
-    fi
-    pause
-}
-
-check_domains_status() {
-    clear
-    echo -e "${YELLOW}========================================${RESET}"
-    echo -e "${YELLOW}        ◈ 域名证书状态实时监控 ◈          ${RESET}"
-    echo -e "${YELLOW}========================================${RESET}"
-
-    CONFIG_DIR="/etc/nginx/sites-available"
-    local has_site=0
-
-    if [ -d "$CONFIG_DIR" ]; then
-        for DOMAIN in $(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort); do
-            CONFIG_PATH="$CONFIG_DIR/$DOMAIN"
-            CERT_PATH=$(grep "ssl_certificate " "$CONFIG_PATH" | awk '{print $2}' | tr -d ';')
-            
-            if [ -f "$CERT_PATH" ]; then
-                has_site=1
-                TYPE="托管 (Certbot)"
-                [[ "$CERT_PATH" =~ "$CUSTOM_SSL_BASE" ]] && TYPE="自定义证书"
-
-                END_DATE=$(openssl x509 -enddate -noout -in "$CERT_PATH" | cut -d= -f2)
-                END_TS=$(date -d "$END_DATE" +%s)
-                NOW_TS=$(date +%s)
-                DAYS_LEFT=$(( (END_TS - NOW_TS) / 86400 ))
-
-                if [ $DAYS_LEFT -ge 30 ]; then
-                    STATUS_COLOR="${GREEN}"
-                    STATUS_TEXT="正常有效"
-                elif [ $DAYS_LEFT -ge 0 ]; then
-                    STATUS_COLOR="${YELLOW}"
-                    STATUS_TEXT="即将过期 (请注意)"
-                else
-                    STATUS_COLOR="${RED}"
-                    STATUS_TEXT="已过期 (请立即更新)"
-                fi
-
-                echo -e "${YELLOW}◈ 域名: ${RESET}${YELLOW}${DOMAIN}${RESET}"
-                echo -e "  ├─ ${YELLOW}证书类型: ${RESET}${TYPE}"
-                echo -e "  ├─ ${YELLOW}到期时间: ${RESET}$(date -d "$END_DATE" +"%Y-%m-%d")"
-                echo -e "  ├─ ${YELLOW}剩余天数: ${RESET}${STATUS_COLOR}${DAYS_LEFT} 天${RESET}"
-                echo -e "  └─ ${YELLOW}运行状态: ${RESET}${STATUS_COLOR}${STATUS_TEXT}${RESET}"
-                echo -e "${YELLOW}----------------------------------------${RESET}"
-            fi
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
-    fi
-
-    if [ $has_site -eq 0 ]; then
-        echo -e "${RED} ❌ 当前系统未检测到任何反代站点配置。${RESET}"
-        echo -e "${YELLOW}----------------------------------------${RESET}"
-    fi
-    pause
+    done
+    echo "无法获取公网IP"
 }
 
-uninstall_nginx() {
-    echo -e "${RED}💥 警告: 此操作将物理完全卸载 Nginx 核心，并彻底抹除所有反代配置与托管证书！${RESET}"
-    read -r -p "确定要卸载 Nginx 吗？(y/N): " confirm
-    
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo -e "${YELLOW}操作已取消。${RESET}"
-        pause
-        return 0
-    fi
-
-    echo -e "${YELLOW}正在强行关闭服务并擦除系统组件...${RESET}"
-    rc-service nginx stop >/dev/null 2>&1 || true
-    rc-update del nginx default >/dev/null 2>&1 || true
-    
-    # 强制杀死一切可能残留的相关进程
-    killall nginx 2>/dev/null || true
-    killall certbot 2>/dev/null || true
-
-    # 使用 APK 卸载
-    echo -e "${YELLOW}正在从系统卸载核心包...${RESET}"
-    apk del nginx certbot certbot-nginx nginx-openrc nginx-vim 2>/dev/null || true
-    
-    # 彻底抹除残留目录
-    echo -e "${YELLOW}正在彻底擦除本地配置与证书归档...${RESET}"
-    rm -rf /etc/nginx
-    rm -rf /etc/letsencrypt
-    rm -rf "$CUSTOM_SSL_BASE"
-    rm -rf /var/log/nginx
-    rm -rf /var/lib/nginx
-    rm -rf /run/nginx.pid 2>/dev/null || true
-    
-    # 清理定时任务
-    crontab -l 2>/dev/null | grep -v "certbot renew" | crontab - 2>/dev/null || true
-    
-    echo -e "${GREEN}✅ Nginx 及其环境配置已彻底卸载干净！系统已恢复纯净状态。${RESET}"
-    pause
+check_port() {
+  local port="$1"
+  if ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
+    return 1
+  fi
+  return 0
 }
 
+is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
 
+get_random_port() {
+  local rand_port
+  while true; do
+    rand_port=$(shuf -i 2000-65535 -n 1)
+    if check_port "$rand_port"; then
+      echo "$rand_port" && return 0
+    fi
+  done
+}
+
+get_hy2_status() {
+  if rc-service sing-box-hy2 status 2>/dev/null | grep -q "started"; then
+    echo "RUNNING"
+  else
+    echo "STOPPED"
+  fi
+}
+
+get_current_port_display() {
+  if [[ -f "$HY2_CONFIG" ]]; then
+    local main_port jump_range="无"
+    main_port=$(jq -r '.inbounds[0].listen_port // empty' "$HY2_CONFIG" 2>/dev/null)
+    [[ -f "${CONFIG_DIR}/hopping.txt" ]] && jump_range=$(cat "${CONFIG_DIR}/hopping.txt")
+    
+    if [[ "$jump_range" != "无" ]]; then
+      echo "${main_port} [${jump_range}]"
+    else
+      echo "${main_port:- -}"
+    fi
+  else echo "-"; fi
+}
+
+# =========================================================
+# 5. 面板节点配置生成核心逻辑 (Hysteria 2)
+# =========================================================
+
+
+# 精准修复外部自定义证书的穿透访问权限，确保非 root 运行的 singbox-hy2 用户有权读取
 fix_external_cert_permission() {
-    local cert=$1
-    local key=$2
+  local cert="$1"
+  local key="$2"
+  
+  # 针对 /root 目录的致命硬拦截
+  if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
+    error "致命拒绝: 检测到您的证书位于 /root/ 目录下！"
+    warn "原因分析: /root 目录权限极为严苛(700)，任何非 root 用户(包括 singbox-hy2)均无权穿透。"
+    warn "         即使强行赋予文件 644 权限，内核也会因路径阻塞拒绝读取。"
+    info "权威推荐: 请在 acme.sh 命令中加上 --install-cert 指令，将证书自动分发到公共目录"
+    info "         (例如: /etc/sing-box-hy2/certs/ 或 /etc/ssl/ 文件夹下) 再试。"
+    return 1
+  fi
+
+  # 1. 自动提取并【逐级向上】放行外部证书的所有上级目录
+  info "正在为外部证书路径逐级赋予检索穿透权限 (+x) ..."
+  local dir
+  for file in "$cert" "$key"; do
+    dir=$(dirname "$file")
+    while [[ "$dir" != "/" && -n "$dir" ]]; do
+      chmod o+x "$dir" 2>/dev/null || true
+      
+      # 如果系统支持 ACL，精准安全地给 sing-box 账号加上特殊通行证
+      if command -v setfacl >/dev/null 2>&1; then
+        setfacl -m u:"$RUN_USER":rx "$dir" 2>/dev/null || true
+      fi
+      dir=$(dirname "$dir")
+    done
+  done
+  
+  # 2. 确保证书和密钥文件本身可读
+  info "正在规范化外部证书与私钥文件的读取权限 ..."
+  chmod 644 "$cert" 2>/dev/null || true
+  chmod 644 "$key" 2>/dev/null || true
+  
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m u:"$RUN_USER":r "$cert" "$key" 2>/dev/null || true
+  fi
+  return 0
+}
+
+
+inst_cert() {
+  mkdir -p "$CONFIG_DIR/certs"
+
+  echo "---------------------------------------------"
+  echo -e "Hysteria 2 协议证书申请方式如下："
+  echo -e " 1) 必应自签证书 "
+  echo -e " 2) Acme自动申请 (需放行 80 端口)${YELLOW}（默认）${RESET}"
+  echo -e " 3) 自定义证书路径"
+  echo "---------------------------------------------"
+  local certInput
+  read -rp "请输入选项 [1-3] (直接回车默认Acme 脚本自动申请): " certInput
+  certInput=${certInput:-2}
+
+  cert_path="$CONFIG_DIR/certs/cert.pem"
+  key_path="$CONFIG_DIR/certs/key.pem"
+
+  if [[ $certInput == 2 ]]; then
+    if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
+      warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。"
+    fi
+
+    if [[ -f "$cert_path" && -f "$key_path" && -s "$cert_path" && -s "$key_path" && -f "$CONFIG_DIR/certs/ca.log" ]]; then
+      hy2_domain=$(cat "$CONFIG_DIR/certs/ca.log")
+      info "检测到已有域名 [${hy2_domain}] 的安全区证书，正在复用..."
+    else
+      read -rp "请输入需要申请证书的域名: " domain
+      [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
+      
+      info "正在检查并安装 Acme.sh 依赖..."
+      local acme_cmd="/root/.acme.sh/acme.sh"
+      if [[ ! -f "$acme_cmd" ]]; then
+        curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
+      fi
+      
+      "$acme_cmd" --set-default-ca --server letsencrypt
+      
+      info "正在向 Let's Encrypt 申请证书..."
+      if [[ "$(get_public_ip)" =~ ":" ]]; then
+        "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
+      else
+        "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
+      fi
+      
+      # 定义 acme.sh 续签成功后自动重启 OpenRC 服务的钩子命令
+      local reload_cmd="rc-service sing-box-hy2 restart"
+
+      if "$acme_cmd" --install-cert -d "${domain}" \
+        --key-file "$key_path" \
+        --fullchain-file "$cert_path" \
+        --ecc \
+        --reloadcmd "$reload_cmd"; then
+        echo "$domain" > "$CONFIG_DIR/certs/ca.log"
+        hy2_domain=$domain
+        info "Acme 专属证书申请完成（自动续签与 OpenRC 重启机制已强绑定）！"
+      else
+        error "Acme 证书申请遭遇未预期拦截，自动切换回保底自签模式。"
+        certInput=1
+      fi
+    fi
+  elif [[ $certInput == 3 ]]; then
+    while true; do
+      local user_cert user_key
+      read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
+      read -rp "请输入密钥文件 (privkey.pem/key) 的路径: " user_key
+      read -rp "请输入证书对应的域名: " hy2_domain
+      
+      if [[ -f "$user_cert" && -f "$user_key" ]]; then
+        rm -f "$cert_path" "$key_path"
+        
+        # 建立软链接或拷贝之前，先穿透修复外部文件和目录的读取权限
+        if fix_external_cert_permission "$user_cert" "$user_key"; then
+          ln -sf "$user_cert" "$cert_path"
+          ln -sf "$user_key" "$key_path"
+          info "自定义外部证书已通过安全软链接无缝同步。"
+          break
+        else
+          return 1
+        fi
+      else
+        error "找不到输入的证书文件，请重新确认路径。"
+        echo "---------------------------------------------"
+      fi
+    done
+  fi
+
+  if [[ $certInput == 1 ]]; then
+    info "将使用必应自签证书作为 Hysteria 2 外壳的节点证书"
+    rm -f "$cert_path" "$key_path"
+    openssl ecparam -genkey -name prime256v1 -out "$key_path"
+    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
+    hy2_domain="www.bing.com"
     
-    if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
-        echo -e "${RED}❌ 致命拒绝: 检测到您的证书源文件位于 /root/ 目录下！${RESET}"
-        echo -e "${YELLOW}原因分析: /root 目录权限极为严苛(700)，任何非root用户(包括 Nginx 的 nginx 组)均无权穿透。${RESET}"
-        echo -e "${YELLOW}         即使这里使用了软链接，Nginx 依然无法越权读取源文件！${RESET}"
-        echo -e "${GREEN}💡 权威推荐: 请在 acme.sh 脚本命令中加上安装指令(--install-cert)，将证书自动导出到公共目录（如 /etc/ssl/ 或 /etc/certs/ 文件夹下）再试。${RESET}"
+    chmod 644 "$cert_path" || true
+    chmod 600 "$key_path" || true
+  fi
+
+  # 规范所有权：使用 -h 规避穿透修改外部真实证书所有权
+  chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
+  chown -h ${RUN_USER}:${RUN_USER} "$cert_path" "$key_path" 2>/dev/null || true
+}
+
+inst_port() {
+  local default_port=""
+  if [[ -f "$HY2_CONFIG" ]]; then
+    default_port=$(jq -r '.inbounds[0].listen_port // empty' "$HY2_CONFIG" 2>/dev/null)
+  fi
+
+  local prompt_msg="设置 Hysteria 2 服务端监听主端口 [1-65535] (回车随机分配): "
+  [[ -n "$default_port" ]] && prompt_msg="设置 Hysteria 2 服务端监听主端口 [当前: ${default_port}, 回车不修改]: "
+
+  while true; do
+    read -rp "$prompt_msg" port
+    if [[ -z "$port" ]]; then
+      if [[ -n "$default_port" ]]; then port="$default_port" && break
+      else
+        port=$(get_random_port)
+        info "已为您随机分配未被占用端口: $port" && break
+      fi
+    elif is_valid_port "$port"; then
+      if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
+        error "端口 ${port} 已被其它程序占用，请更换。" && continue
+      fi
+      break
+    else error "请输入有效的端口数字 (1-65535)"; fi
+  done
+
+  # =========================================================
+  # 【记忆重构核心】读取并展示现有的端口跳跃配置
+  # =========================================================
+  local default_hop=""
+  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
+    default_hop=$(cat "${CONFIG_DIR}/hopping.txt")
+  fi
+
+  echo "---------------------------------------------"
+  if [[ -n "$default_hop" ]]; then
+    echo -e "Hysteria 2 端口群使用模式 [当前已启用跳跃: ${default_hop}]："
+  else
+    echo -e "Hysteria 2 端口群使用模式 ："
+  fi
+  echo -e " 1) 单端口模式"
+  echo -e " 2) 端口跳跃模式 ${YELLOW}（默认)${RESET}"
+  echo "---------------------------------------------"
+  
+  local jumpInput
+  read -rp "请选择端口模式 [1-2] (直接回车默认不变或选择默认项): " jumpInput
+  
+  # 如果用户直接回车，且以前有跳跃记录，则直接保持现有的 iptables 逻辑并退出函数
+  if [[ -z "$jumpInput" && -n "$default_hop" ]]; then
+    info "检测到回车确认，将 100% 保持原有端口跳跃配置 [${default_hop}] 保持不变。"
+    # 刷新主端口记录，防止主端口变了但跳跃目标没变
+    echo "$port" > "${CONFIG_DIR}/main_port.txt"
+    return 0
+  fi
+
+  # 如果没有旧配置且直接回车，则走向默认选项 2
+  jumpInput=${jumpInput:-2}
+
+  # 只有在用户明确重新选择模式时，才清理旧防火墙规则
+  clear_old_iptables
+
+  if [[ $jumpInput == 2 ]]; then
+    local old_start="" old_end=""
+    if [[ -n "$default_hop" ]]; then
+      old_start="${default_hop%-*}"
+      old_end="${default_hop#*-}"
+    fi
+
+    while true; do
+      local start_prompt="设置外部跳跃起始端口 (建议10000-65535)"
+      [[ -n "$old_start" ]] && start_prompt="设置外部跳跃起始端口 [当前: ${old_start}, 回车不修改]"
+      read -rp "${start_prompt}: " firstport
+      firstport=${firstport:-$old_start}
+
+      local end_prompt="设置外部跳跃末尾端口 (必须大于起始端口)"
+      [[ -n "$old_end" ]] && end_prompt="设置外部跳跃末尾端口 [当前: ${old_end}, 回车不修改]"
+      read -rp "${end_prompt}: " endport
+      endport=${endport:-$old_end}
+
+      if is_valid_port "$firstport" && is_valid_port "$endport" && [[ $firstport -lt $endport ]]; then 
+        break
+      else 
+        error "输入无效！起始端口必须小于末尾端口，且范围在 1-65535 之间，请重新输入。"; 
+      fi
+    done
+    echo "$firstport-$endport" > "${CONFIG_DIR}/hopping.txt"
+  else
+    # 用户明确选择了 1 (单端口模式)，清除记录文件
+    rm -f "${CONFIG_DIR}/hopping.txt" "${CONFIG_DIR}/main_port.txt"
+    info "已成功切换回单端口纯净模式"
+    if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
+    if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
+  fi
+}
+
+write_and_show_config() {
+  local HOSTNAME
+  HOSTNAME=$(hostname -s | sed 's/ /_/g')
+  local vps_ip
+  vps_ip=$(get_public_ip)
+  local last_ip="$vps_ip"
+  [[ "$vps_ip" =~ ":" ]] && last_ip="[$vps_ip]"
+
+  local is_insecure="0"
+  local skip_cert="false"
+  if [[ "$hy2_domain" == "www.bing.com" ]]; then
+    is_insecure="1"
+    skip_cert="true"
+  fi
+
+  # 生成 sing-box 格式的 Hysteria 2 配置文件
+  cat << EOF > "$HY2_CONFIG"
+{
+  "log": {
+    "level": "info",
+    "output": "$LOG_FILE",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "hysteria2",
+      "tag": "hy2-in",
+      "listen": "::",
+      "listen_port": $port,
+      "users": [
+        {
+          "password": "$auth_pwd"
+        }
+      ],
+      "ignore_client_bandwidth": true,
+      "tls": {
+        "enabled": true,
+        "server_name": "$hy2_domain",
+        "certificate_path": "$cert_path",
+        "key_path": "$key_path"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}
+EOF
+
+  chmod 640 "$HY2_CONFIG"
+  chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
+
+  apply_new_iptables
+  mkdir -p "$HY2_DIR"
+  
+  local final_port="$port"
+  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
+    final_port=$(cat "${CONFIG_DIR}/hopping.txt")
+  fi
+
+  # 生成标准的 hysteria2:// 统一分享节点链
+  cat << EOF > "$HY2_DIR/url.txt"
+V6VPS 请自行替换 IP 地址为 V6
+V2rayN 链接:
+hysteria2://$auth_pwd@$last_ip:$port?sni=$hy2_domain&insecure=${is_insecure}#$HOSTNAME-hy2
+
+Surge 配置:
+$HOSTNAME-hy2 = hysteria2, $last_ip, $port, password=$auth_pwd, skip-cert-verify=true, sni=$hy2_domain
+EOF
+
+  rc-service sing-box-hy2 restart
+  if rc-service sing-box-hy2 status | grep -q "started"; then
+    info "sing-box Hysteria 2 服务配置并启动成功！"
+  else
+    error "sing-box-hy2 启动失败，可在菜单中按 8 查看详细的闪退日志。"
+  fi
+  showconf
+}
+
+# =========================================================
+# 6. 安装、更新与卸载核心流控
+# =========================================================
+write_openrc_script() {
+  cat << 'EOF' > "$OPENRC_SERVICE_PATH"
+#!/sbin/openrc-run
+
+name="sing-box-hy2"
+description="sing-box Hysteria 2 OpenRC Isolated Service"
+cfgfile="/etc/sing-box-hy2/config.json"
+logfile="/var/log/sing-box-hy2.log"
+command="/usr/local/bin/sing-box-hy2"
+command_args="run -c /etc/sing-box-hy2/config.json"
+
+depend() {
+    need net
+    after iptables ip6tables firewall
+}
+
+start_pre() {
+    if [ ! -f "$cfgfile" ]; then
+        eerror "Configuration file $cfgfile missing!"
         return 1
     fi
-
-    local cert_dir=$(dirname "$cert")
-    chmod +x "$cert_dir" 2>/dev/null || true
-    chmod 644 "$cert" "$key" 2>/dev/null || true
     
-    if command -v setfacl >/dev/null 2>&1; then
-        setfacl -m u:nginx:rx "$cert_dir" 2>/dev/null || true
-        setfacl -m u:nginx:r "$cert" "$key" 2>/dev/null || true
-    fi
-    return 0
-}
-
-add_custom_cert_config() {
-    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-    echo -ne "${GREEN}请输入您的自定义域名或公网IP(例如:example.com): ${RESET}"; read DOMAIN
-    [ -z "$DOMAIN" ] && return
-
-    LISTEN_PORT=${LISTEN_PORT:-443}
-
-    echo -ne "${GREEN}请输入反代目标(例如：http://127.0.0.1:5788): ${RESET}"; read TARGET
-    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n, 默认y): ${RESET}"; read IS_WS
-    IS_WS=${IS_WS:-y}
-    echo -ne "${GREEN}请输入最大上传大小 (默认 200M): ${RESET}"; read MAX_SIZE
-    MAX_SIZE=${MAX_SIZE:-200M}
-
-    local DIR_PATH="$CUSTOM_SSL_BASE/$DOMAIN"
-    mkdir -p "$DIR_PATH"
-
-    echo -e "${YELLOW}---------------------------------------------${RESET}"
-    echo -e "${YELLOW}请提供您的自定义 SSL 证书文件绝对路径。${RESET}"
-    echo -e "${YELLOW}---------------------------------------------${RESET}"
+    touch "$logfile"
+    chown singbox-hy2:singbox-hy2 "$logfile"
+    chmod 644 "$logfile"
     
-    echo -ne "${GREEN}请输入 证书公钥(fullchain/crt) 文件的路径: ${RESET}"; read USER_CERT
-    echo -ne "${GREEN}请输入 证书私钥(privkey/key) 文件的路径: ${RESET}"; read USER_KEY
-
-    local ABS_CERT=$(readlink -f "$USER_CERT" 2>/dev/null || realpath "$USER_CERT" 2>/dev/null || echo "$USER_CERT")
-    local ABS_KEY=$(readlink -f "$USER_KEY" 2>/dev/null || realpath "$USER_KEY" 2>/dev/null || echo "$USER_KEY")
-
-    if [ ! -f "$ABS_CERT" ] || [ ! -f "$ABS_KEY" ]; then
-        red "错误: 您输入的证书文件路径不存在，请核实后再试！"
-        rm -rf "$DIR_PATH"
-        pause && return
-    fi
-
-    if ! fix_external_cert_permission "$ABS_CERT" "$ABS_KEY"; then
-        rm -rf "$DIR_PATH"
-        pause && return
-    fi
-
-    rm -f "$DIR_PATH/fullchain.pem" "$DIR_PATH/privkey.pem"
-    ln -sf "$ABS_CERT" "$DIR_PATH/fullchain.pem"
-    ln -sf "$ABS_KEY" "$DIR_PATH/privkey.pem"
-
-    generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE" "$DIR_PATH/fullchain.pem" "$DIR_PATH/privkey.pem" "$LISTEN_PORT"
-    create_default_server
+    command_background="yes"
+    pidfile="/run/${RC_SVCNAME}.pid"
     
-    if nginx -t; then
-        rc-service nginx reload
-        echo -e "${GREEN}✅ 自定义证书反代站点 https://$DOMAIN:$LISTEN_PORT 添加成功！${RESET}"
+    output_log="$logfile"
+    error_log="$logfile"
+    
+    local port
+    port=$(jq -r '.inbounds[0].listen_port // 0' "$cfgfile" 2>/dev/null)
+    if [ "$port" -lt 1024 ] && [ "$port" -ne 0 ]; then
+        command_user="root:root"
     else
-        echo -e "${RED}❌ Nginx 配置语法错误，已自动撤销，请检查证书有效性。${RESET}"
-        rm -f "/etc/nginx/sites-enabled/$DOMAIN"
-        rm -rf "$DIR_PATH"
+        command_user="singbox-hy2:singbox-hy2"
     fi
-    pause
-}
-
-generate_emby_normal_conf() {
-    local DOMAIN=$1
-    local TARGET=$2
-    local CERT_PATH=$3
-    local KEY_PATH=$4
-    local LISTEN_PORT=$5  
-    local CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
-    local TARGET_HOST=$(echo $TARGET | awk -F[/:] '{print $4}')
-
-    CERT_PATH=${CERT_PATH:-"/etc/letsencrypt/live/$DOMAIN/fullchain.pem"}
-    KEY_PATH=${KEY_PATH:-"/etc/letsencrypt/live/$DOMAIN/privkey.pem"}
-    LISTEN_PORT=${LISTEN_PORT:-443} 
-
-    cat > "$CONFIG_PATH" <<EOF
-server {
-    listen 80;
-    server_name $DOMAIN;
-    return 301 https://\$host:${LISTEN_PORT}\$request_uri;
-}
-
-server {
-    listen $LISTEN_PORT ssl;
-    http2 on;
-    server_name $DOMAIN;
-
-    ssl_certificate $CERT_PATH;
-    ssl_certificate_key $KEY_PATH;
-
-    client_max_body_size 5000M;
-
-    location / {
-        add_header 'Access-Control-Allow-Origin' '*' always;
-        add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS, DELETE, PUT' always;
-        add_header 'Access-Control-Allow-Headers' 'X-Emby-Authorization, Content-Type, Authorization, X-Requested-With' always;
-        if (\$request_method = 'OPTIONS') { return 204; }
-
-        proxy_pass $TARGET;
-        proxy_ssl_server_name on;
-        proxy_set_header Host $TARGET_HOST;
-        proxy_pass_request_headers on;
-
-        proxy_set_header X-Real-IP "";
-        proxy_set_header X-Forwarded-For "";
-        proxy_set_header CF-Connecting-IP "";
-        proxy_set_header X-Forwarded-Proto https;
-
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_max_temp_file_size 0;
-
-        proxy_read_timeout 86400;
-        proxy_send_timeout 86400;
-    }
 }
 EOF
-    ln -sf "$CONFIG_PATH" "/etc/nginx/sites-enabled/$DOMAIN"
-    configure_firewall "$LISTEN_PORT"
+  chmod +x "$OPENRC_SERVICE_PATH"
+  rc-update add sing-box-hy2 default >/dev/null 2>&1 || true
 }
 
-generate_emby_stream_conf() {
-    local DOMAIN=$1
-    local T_MAIN=$2
-    local T_STREAM=$3
-    local CERT_PATH=$4
-    local KEY_PATH=$5
-    local LISTEN_PORT=$6  # 新增：外部监听端口参数
-    local CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
-    local MAIN_HOST=$(echo $T_MAIN | awk -F[/:] '{print $4}')
-    local STREAM_HOST=$(echo $T_STREAM | awk -F[/:] '{print $4}')
-
-    CERT_PATH=${CERT_PATH:-"/etc/letsencrypt/live/$DOMAIN/fullchain.pem"}
-    KEY_PATH=${KEY_PATH:-"/etc/letsencrypt/live/$DOMAIN/privkey.pem"}
-    LISTEN_PORT=${LISTEN_PORT:-443} # 默认 443
-
-    cat > "$CONFIG_PATH" <<EOF
-server {
-    listen 80;
-    server_name $DOMAIN;
-    return 301 https://\$host:${LISTEN_PORT}\$request_uri;
+download_core() {
+  local arch url
+  arch=$(detect_arch)
+  get_latest_version
+  url=$(printf 'https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz' "$SINGBOX_VERSION" "$SINGBOX_VERSION" "$arch")
+  
+  info "正在下载官方核心 sing-box v$SINGBOX_VERSION..."
+  cd "$TMP_DIR"
+  if ! wget -O sing-box.tar.gz -q "$url"; then
+    curl -fsSL -o sing-box.tar.gz "$url" || { error "下载核心文件失败"; return 1; }
+  fi
+  
+  tar -xzf sing-box.tar.gz -C "$TMP_DIR"
+  local extracted
+  extracted=$(find "$TMP_DIR" -type f -name sing-box | head -n 1)
+  [[ -n "$extracted" ]] || { error "解压目标核心错误"; return 1; }
+  
+  rc-service sing-box-hy2 stop >/dev/null 2>&1 || true
+  install -m 755 "$extracted" "$BINARY_PATH"
+  info "sing-box-hy2 核心释放完毕。"
+  return 0
 }
 
-server {
-    listen $LISTEN_PORT ssl;
-    http2 on;
-    server_name $DOMAIN;
+install_hy2() {
+  echo -e "${GREEN}[信息] 开始在 Alpine 下部署专属隔离的 sing-box Hysteria 2 ...${RESET}"
+  check_environment
+  mkdir -p "$CONFIG_DIR" "$HY2_DIR"
 
-    ssl_certificate $CERT_PATH;
-    ssl_certificate_key $KEY_PATH;
+  if ! download_core; then return 1; fi
 
-    client_max_body_size 5000M;
+  write_openrc_script
 
-    location / {
-        proxy_pass $T_MAIN;
-        proxy_ssl_server_name on;
-        proxy_set_header Host $MAIN_HOST;
-        proxy_pass_request_headers on;
+  inst_cert || return 1
+  inst_port
+  
+  read -rp "设置 Hysteria 2 验证密码 (回车自动分配随机高强密码): " auth_pwd
+  auth_pwd=${auth_pwd:-$(generate_random_password)}
 
-        proxy_set_header X-Real-IP "";
-        proxy_set_header X-Forwarded-For "";
-        proxy_set_header CF-Connecting-IP "";
-        proxy_set_header X-Forwarded-Proto https;
-
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_max_temp_file_size 0;
-
-        proxy_read_timeout 86400;
-        proxy_send_timeout 86400;
-
-        # 动态处理带非标准端口的重定向劫持
-        proxy_redirect $T_STREAM/ https://\$host:${LISTEN_PORT}/s1/;
-        proxy_redirect $T_STREAM https://\$host:${LISTEN_PORT}/s1/;
-    }
-
-    location /s1/ {
-        rewrite ^/s1(/.*)$ \$1 break;
-        proxy_pass $T_STREAM;
-        proxy_ssl_server_name on;
-        proxy_set_header Host $STREAM_HOST;
-        proxy_pass_request_headers on;
-
-        proxy_set_header X-Real-IP "";
-        proxy_set_header X-Forwarded-For "";
-        proxy_set_header CF-Connecting-IP "";
-        proxy_set_header X-Forwarded-Proto https;
-
-        proxy_http_version 1.1;
-        proxy_set_header Connection "";
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_max_temp_file_size 0;
-
-        proxy_set_header Range \$http_range;
-        proxy_set_header If-Range \$http_if_range;
-
-        proxy_read_timeout 86400;
-        proxy_send_timeout 86400;
-    }
-}
-EOF
-    ln -sf "$CONFIG_PATH" "/etc/nginx/sites-enabled/$DOMAIN"
-    configure_firewall "$LISTEN_PORT"
+  write_and_show_config
 }
 
-emby_menu() {
+update_hy2() {
+  if [[ ! -f "$BINARY_PATH" ]]; then
+    error "当前系统未检测到核心，无法执行覆盖升级。"
+    return 1
+  fi
+  info "检测到已有环境，正在执行纯净原地覆盖核心升级..."
+  if download_core; then
+    rc-service sing-box-hy2 start
+    info "sing-box-hy2 核心纯净升级覆盖成功，服务已安全启动！"
+  else
+    error "核心升级遭遇未预期中断。"
+  fi
+}
+
+unsthy2() {
+  warn "即将执行全面清洁卸载..."
+  
+  # 优先清理防火墙链，避免文件先删掉导致清理不到
+  clear_old_iptables
+  if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
+  if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
+
+  rc-service sing-box-hy2 stop || true
+  rc-update del sing-box-hy2 default >/dev/null 2>&1 || true
+  
+  rm -f "$BINARY_PATH" "$OPENRC_SERVICE_PATH" "$LOG_FILE"
+  rm -rf "$CONFIG_DIR" "$HY2_DIR"
+  
+  info "Hysteria 2 专属服务、节点配置及防火墙跳跃链条已彻底清除！"
+}
+
+changeconf() {
+  if [[ ! -f "$HY2_CONFIG" ]]; then
+    error "配置文件不存在，请先选择选项 1 安装"
+    return 1
+  fi
+
+  local old_pwd old_cert old_key old_sni
+  old_pwd=$(jq -r '.inbounds[0].users[0].password // empty' "$HY2_CONFIG")
+  old_cert=$(jq -r '.inbounds[0].tls.certificate_path // empty' "$HY2_CONFIG")
+  old_key=$(jq -r '.inbounds[0].tls.key_path // empty' "$HY2_CONFIG")
+  old_sni=$(jq -r '.inbounds[0].tls.server_name // "www.bing.com"' "$HY2_CONFIG")
+
+  clear
+  echo -e "${GREEN}====== 修改 sing-box Hysteria 2 配置 ======${RESET}"
+  echo "提示：直接敲回车将保持原有配置不变"
+  echo "---------------------------------------------"
+  
+  inst_port 
+
+  local auth_pwd
+  read -rp "设置 Hysteria 2 验证密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
+  auth_pwd=${auth_pwd:-$old_pwd}
+
+  local cert_path key_path hy2_domain
+  echo "---------------------------------------------"
+  read -rp "是否需要修改证书？[y/N] (直接回车默认不修改): " change_cert_flag
+  if [[ "$change_cert_flag" == "y" || "$change_cert_flag" == "Y" ]]; then
+    inst_cert || return 1
+  else
+    cert_path="$old_cert"
+    key_path="$old_key"
+    hy2_domain="$old_sni"
+  fi
+
+  write_and_show_config
+  info "配置与转发链条刷新修改成功！"
+}
+
+showconf() {
+  if [[ ! -d "$HY2_DIR" ]]; then
+    error "未找到分享配置文件。"
+    return
+  fi
+  echo -e "${GREEN}====== Hysteria 2 节点分享与配置信息 ======${RESET}"
+  cat "$HY2_DIR/url.txt"
+  echo
+}
+
+# =========================================================
+# 7. 面板交互菜单 
+# =========================================================
+menu() {
+  while true; do
     clear
-    echo -e "${GREEN}===== Emby 反向代理配置 =====${RESET}"
-    echo -e "${GREEN}1.普通反代(Certbot托管)${RESET}"
-    echo -e "${GREEN}2.主站+推流路径重定向(Certbot托管)${RESET}"
-    echo -e "${GREEN}3.普通反代(自定义证书)${RESET}"
-    echo -e "${GREEN}0.返回主菜单${RESET}"
-    echo -ne "${GREEN}请选择 [0-3]: ${RESET}"
-    read emby_choice
+    local raw_status
+    raw_status=$(get_hy2_status)
+    local status=""
+    if [[ "$raw_status" == "RUNNING" ]]; then
+      status="${GREEN}● 运行中${RESET}"
+    else
+      status="${RED}● 未运行${RESET}"
+    fi
 
-    case $emby_choice in
-        1)
-            echo -ne "${GREEN}请输入您的域名: ${RESET}"; read DOMAIN
-            check_domain_resolution "$DOMAIN"
-            echo -ne "${GREEN}请输入公网访问端口 (直接回车默认 443): ${RESET}"; read LISTEN_PORT
-            LISTEN_PORT=${LISTEN_PORT:-443}
-            echo -ne "${GREEN}请输入Emby地址(例如: https://emby.com): ${RESET}"; read TARGET
-            EMAIL=$(generate_random_email)
-            certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-            generate_emby_normal_conf "$DOMAIN" "$TARGET" "" "" "$LISTEN_PORT"
-            nginx -t && rc-service nginx reload
-            echo -e "${GREEN}========================================${RESET}"
-            echo -e "${GREEN}✅ 普通模式配置成功!${RESET}"
-            echo -e "${GREEN}🌐 访问地址: https://$DOMAIN:$LISTEN_PORT${RESET}"
-            echo -e "${GREEN}========================================${RESET}"
-            pause ;;
-        2)
-            echo -ne "${GREEN}请输入您的域名: ${RESET}"; read DOMAIN
-            check_domain_resolution "$DOMAIN"
-            echo -ne "${GREEN}请输入公网访问端口 (直接回车默认 443): ${RESET}"; read LISTEN_PORT
-            LISTEN_PORT=${LISTEN_PORT:-443}
-            echo -ne "${GREEN}请输入Emby主站地址(例如: https://emby1.com): ${RESET}"; read T_MAIN
-            echo -ne "${GREEN}请输入推流后端地址(例如: https://emby2.com): ${RESET}"; read T_STREAM
-            EMAIL=$(generate_random_email)
-            certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-            generate_emby_stream_conf "$DOMAIN" "$T_MAIN" "$T_STREAM" "" "" "$LISTEN_PORT"
-            nginx -t && rc-service nginx reload
-            echo -e "${GREEN}========================================${RESET}"
-            echo -e "${GREEN}✅ 分流重定向模式配置成功!${RESET}"
-            echo -e "${GREEN}🌐 主站访问地址: https://$DOMAIN:$LISTEN_PORT${RESET}"
-            echo -e "${GREEN}🚀 推流重定向路径: https://$DOMAIN:$LISTEN_PORT/s1/${RESET}"
-            echo -e "${YELLOW}提示: 所有发往 $T_STREAM 的请求已自动劫持至 /s1/${RESET}"
-            echo -e "${GREEN}========================================${RESET}"
-            pause ;;
-        3)
-            echo -ne "${GREEN}请输入您的域名: ${RESET}"; read DOMAIN
-            check_domain_resolution "$DOMAIN"
-            echo -ne "${GREEN}请输入公网访问端口 (直接回车默认 443): ${RESET}"; read LISTEN_PORT
-            LISTEN_PORT=${LISTEN_PORT:-443}
-            echo -ne "${GREEN}请输入Emby地址(例如: https://emby.com): ${RESET}"; read TARGET
-            local DIR_PATH="$CUSTOM_SSL_BASE/$DOMAIN"
-            mkdir -p "$DIR_PATH"
-           
-            echo -e "${YELLOW}---------------------------------------------${RESET}"
-            echo -e "${YELLOW}请提供您的自定义 SSL 证书文件绝对路径。${RESET}"
-            echo -e "${YELLOW}---------------------------------------------${RESET}"
+    local version
+    version=$(get_installed_version)
+    local port_show
+    port_show=$(get_current_port_display)
 
-            echo -ne "${GREEN}请输入 证书公钥(fullchain/crt) 文件的绝对路径: ${RESET}"; read USER_CERT
-            echo -ne "${GREEN}请输入 证书私钥(privkey/key) 文件的绝对路径: ${RESET}"; read USER_KEY
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}     Sing-box Hysteria2 面板    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} ${status}"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装 Sing-box Hysteria2${RESET}"
+    echo -e "${GREEN}2. 更新 Sing-box Hysteria2${RESET}"
+    echo -e "${GREEN}3. 卸载 Sing-box Hysteria2${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 Sing-box Hysteria2${RESET}"
+    echo -e "${GREEN}6. 停止 Sing-box Hysteria2${RESET}"
+    echo -e "${GREEN}7. 重启 Sing-box Hysteria2${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 
-            local ABS_CERT=$(readlink -f "$USER_CERT" 2>/dev/null || realpath "$USER_CERT" 2>/dev/null || echo "$USER_CERT")
-            local ABS_KEY=$(readlink -f "$USER_KEY" 2>/dev/null || realpath "$USER_KEY" 2>/dev/null || echo "$USER_KEY")
+    local choice=""
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+    [[ -z "$choice" ]] && continue
 
-            if [ ! -f "$ABS_CERT" ] || [ ! -f "$ABS_KEY" ]; then red "文件不存在"; rm -rf "$DIR_PATH"; pause; return; fi
-            
-            if ! fix_external_cert_permission "$ABS_CERT" "$ABS_KEY"; then rm -rf "$DIR_PATH"; pause; return; fi
-
-            rm -f "$DIR_PATH/fullchain.pem" "$DIR_PATH/privkey.pem"
-            ln -sf "$ABS_CERT" "$DIR_PATH/fullchain.pem"
-            ln -sf "$ABS_KEY" "$DIR_PATH/privkey.pem"
-
-            generate_emby_normal_conf "$DOMAIN" "$TARGET" "$DIR_PATH/fullchain.pem" "$DIR_PATH/privkey.pem" "$LISTEN_PORT"
-            nginx -t && rc-service nginx reload
-            echo -e "${GREEN}========================================${RESET}"
-            echo -e "${GREEN}✅ 普通模式配置成功!${RESET}"
-            echo -e "${GREEN}🌐 访问地址: https://$DOMAIN:$LISTEN_PORT${RESET}"
-            echo -e "${GREEN}========================================${RESET}"
-            pause ;;
-        0) return ;;
-        *) echo -e "${RED}无效输入!${RESET}", sleep 1; emby_menu ;;
+    case "$choice" in
+      1) install_hy2; pause ;;
+      2) update_hy2; pause ;;
+      3) unsthy2; pause ;;
+      4) changeconf; pause ;;
+      5) rc-service sing-box-hy2 start && info "服务已成功启动！"; pause ;;
+      6) rc-service sing-box-hy2 stop && info "服务已成功停止！"; pause ;;
+      7) rc-service sing-box-hy2 restart && info "服务已成功重启！"; pause ;;
+      8) if [[ -f "$LOG_FILE" ]]; then tail -n 50 "$LOG_FILE"; else warn "未发现运行日志文件。"; fi; pause ;;
+      9) showconf; pause ;;
+      0) exit 0 ;;
+      *) error "无效输入，请重新选择。"; sleep 1 ;;
     esac
+  done
 }
 
-update_nginx_software() {
-    clear
-    echo -e "${YELLOW}========================================${RESET}"
-    echo -e "${YELLOW}    ◈ 正在执行 Nginx 软件版本升级◈    ${RESET}"
-    echo -e "${YELLOW}========================================${RESET}"
+if [[ ${EUID} -ne 0 ]]; then
+  error "请切换至 root 用户运行此面板脚本。"
+  exit 1
+fi
 
-    if ! command -v nginx >/dev/null 2>&1; then
-        echo -e "${RED}❌ 系统未安装 Nginx，无法更新。请先使用主菜单选项安装。${RESET}"
-        pause && return
-    fi
-    local CURRENT_VER=$(nginx -v 2>&1 | awk -F/ '{print $2}')
-    echo -e "${GREEN}◈ 当前 Nginx 版本: ${RESET}${YELLOW}${CURRENT_VER}${RESET}"
-    echo -e "${YELLOW}----------------------------------------${RESET}"
-
-    echo -ne "${YELLOW}是否开始检查更新并平滑升级？(y/N,默认N): ${RESET}"
-    read up_choice
-    if [[ ! "$up_choice" =~ ^[Yy]$ ]]; then
-        echo -e "${YELLOW}⏭ 已取消升级。${RESET}"
-        pause && return
-    fi
-
-    echo -e "${GREEN}  ├─ [1/3] 正在安全备份现有的反代配置与证书...${RESET}"
-    local BACKUP_DIR="/etc/nginxbackup/nginx_backup_$(date +%Y%m%d%H%M%S)"
-    mkdir -p "$BACKUP_DIR"
-    [ -d "/etc/nginx/sites-available" ] && cp -r /etc/nginx/sites-available "$BACKUP_DIR/" || true
-    [ -d "$CUSTOM_SSL_BASE" ] && cp -r "$CUSTOM_SSL_BASE" "$BACKUP_DIR/" || true
-    echo -e "${GREEN}  ├─ 备份成功，备份路径: ${BACKUP_DIR}${RESET}"
-
-    echo -e "${GREEN}  ├─ [2/3] 正在从系统源拉取最新 Nginx 软件包...${RESET}"
-    apk update
-    
-    if apk add --upgrade nginx certbot certbot-nginx; then
-        echo -e "${GREEN}  ├─ [3/3] 正在验证配置并平滑重载新版本服务...${RESET}"
-        if nginx -t >/dev/null 2>&1; then
-            rc-service nginx reload
-            local NEW_VER=$(nginx -v 2>&1 | awk -F/ '{print $2}')
-            echo -e "${GREEN}  └─ 🎉 升级成功！当前版本从 ${YELLOW}${CURRENT_VER}${RESET} 变为 ${GREEN}${NEW_VER}${RESET}"
-        else
-            echo -e "${RED}❌ Nginx 配置验证失败！旧服务继续维持运行，请检查配置。${RESET}"
-        fi
-    else
-        echo -e "${RED}❌ 从 Alpine 软件源升级失败，请检查 network！${RESET}"
-    fi
-    pause
-}
-
-# ------------------------------
-# 主菜单逻辑
-# ------------------------------
-main_menu() {
-    while true; do
-        get_nginx_status
-        get_nginx_version
-        get_site_count
-        clear
-        echo -e "${GREEN}=============================${RESET}"
-        echo -e "${GREEN}  ◈ Nginx 反向代理管理面板 ◈  ${RESET}"
-        echo -e "${GREEN}=============================${RESET}"
-        echo -e "${GREEN}状态   :${STATUS}${RESET}"
-        echo -e "${GREEN}状态   :${YELLOW}${VERSION_SHOW}${RESET}"
-        echo -e "${GREEN}状态   :${YELLOW}${SITE_COUNT}个${RESET}"
-        echo -e "${GREEN}=============================${RESET}"
-        echo -e "${GREEN} 1. 安装 Nginx${RESET}"
-        echo -e "${GREEN} 2. 添加配置 (Certbot托管)${RESET}"
-        echo -e "${GREEN} 3. 添加配置 (自定义证书)${RESET}"
-        echo -e "${GREEN} 4. 修改配置${RESET}"
-        echo -e "${GREEN} 5. 删除配置${RESET}"
-        echo -e "${GREEN} 6. 测试证书续期${RESET}"
-        echo -e "${GREEN} 7. 查看证书信息${RESET}"
-        echo -e "${GREEN} 8. 查看证书状态${RESET}"
-        echo -e "${GREEN} 9. Emby反代配置${RESET}"
-        echo -e "${GREEN}10. 重载Nginx配置${RESET}"
-        echo -e "${GREEN}11. 升级Nginx${RESET}"
-        echo -e "${GREEN}12. 卸载Nginx${RESET}"
-        echo -e "${GREEN} 0. 退出${RESET}"
-        echo -e "${GREEN}=============================${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
-        read choice
-
-        case $choice in
-            1) install_nginx ;;
-            2) add_config ;;
-            3) add_custom_cert_config ;;
-            4) modify_config ;;
-            5) delete_config ;;
-            6) test_renew ;;
-            7) check_cert ;;
-            8) check_domains_status ;;
-            9) emby_menu ;;
-           10) reload_nginx ;; 
-           11) update_nginx_software ;;
-           12) uninstall_nginx ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效输入，请重新选择！${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
-# 运行主菜单
-main_menu
+menu "$@"

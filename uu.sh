@@ -27,6 +27,7 @@ get_nginx_status() {
     fi
 }
 
+
 get_nginx_version() {
     if command -v nginx >/dev/null 2>&1; then
         local nginx_out
@@ -50,6 +51,26 @@ get_site_count() {
         SITE_COUNT="0"
     fi
 }
+
+# 🛠️ 核心突击：强杀所有占用 80 端口的孤儿残留进程
+force_kill_80() {
+    echo -e "${YELLOW}正在全网通缉 80 端口占用情况...${RESET}"
+    killall nginx 2>/dev/null || true
+    
+    local count=0
+    while netstat -ntlp 2>/dev/null | grep -q ":80 " && [ $count -lt 3 ]; do
+        local PIDS=$(netstat -ntlp 2>/dev/null | grep ":80 " | awk '{print $7}' | cut -d/ -f1 | grep -E '^[0-9]+$' || true)
+        if [ -n "$PIDS" ]; then
+            echo -e "${RED}警告: 发现 80 端口仍被残留进程 (PID: ${PIDS}) 占用！正在强制闪击...${RESET}"
+            for pid in $PIDS; do
+                kill -9 "$pid" 2>/dev/null || true
+            done
+            count=$((count+1))
+            sleep 1
+        fi
+    done
+}
+
 
 # ------------------------------
 # 核心功能函数
@@ -262,6 +283,14 @@ install_nginx() {
     create_default_server
     
     rc-update add nginx default
+
+    # 运行强杀 80 函数
+    force_kill_80
+
+    echo -e "${GREEN}正在激活并启动 Nginx 服务...${RESET}"
+    rc-service nginx zap >/dev/null 2>&1 || true # 清除 OpenRC 的 crashed 崩溃缓存状态
+
+    echo -e "${GREEN}正在启动 Nginx 服务...${RESET}"
     rc-service nginx start
     
     echo
@@ -296,25 +325,64 @@ install_nginx() {
     sort -u "$EMAIL_FILE" -o "$EMAIL_FILE"
     echo -ne "${GREEN}请输入域名(例如:example.com): ${RESET}"; read DOMAIN
     check_domain_resolution "$DOMAIN"
-    echo -ne "${GREEN}请输入公网访问端口 (直接回车默认 443): ${RESET}"; read LISTEN_PORT
+    echo -ne "${GREEN}请输入公网访问端口 (直接回车默认 443): ${RESET}"
+    read LISTEN_PORT
     LISTEN_PORT=${LISTEN_PORT:-443}
     echo -ne "${GREEN}请输入反代目标(例如:http://127.0.0.1:5788): ${RESET}"; read TARGET
-    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n，默认 y): ${RESET}"; read IS_WS
+    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n，默认 y): ${RESET}"
+    read IS_WS
     IS_WS=${IS_WS:-y}
 
     echo -ne "${GREEN}请输入最大上传大小 (默认 200M): ${RESET}"
     read MAX_SIZE
     MAX_SIZE=${MAX_SIZE:-200M}
 
-    certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-    generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE" "" "" "$LISTEN_PORT"
-    nginx -t && rc-service nginx reload
+    # === 🚀 额外防线：在 Certbot 运行前再次确保 80 端口未被其他临时服务卡死 ===
+    if netstat -ntlp 2>/dev/null | grep -q ":80 " && ! rc-service nginx status >/dev/null 2>&1; then
+        kill -9 $(netstat -ntlp 2>/dev/null | grep ":80 " | awk '{print $7}' | cut -d/ -f1) 2>/dev/null || true
+    fi
 
+    # ==================== 🛠️ 核心修改部分 ====================
+    echo -e "${GREEN}正在通过 --nginx 模式向 Let's Encrypt 申请证书...${RESET}"
+    
+    # 显式指定 Alpine 下的 Nginx 配置目录和控制路径，防止 Certbot 找不到服务瞎折腾
+    certbot certonly --nginx \
+        --nginx-server-root /etc/nginx \
+        --nginx-ctl /usr/sbin/nginx \
+        -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
+
+    # 安全检查防线：只有证书确实生成了，才去写入反代配置
+    if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
+        echo -e "${GREEN}✅ 证书申请成功！正在生成业务配置文件...${RESET}"
+        
+        # 写入你的反代配置
+        generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE" "" "" "$LISTEN_PORT"
+        
+        # 测试新配置并热重载 Nginx
+        if nginx -t; then
+            rc-service nginx reload
+            echo -e "${GREEN}安装完成！配置已生效。${RESET}"
+            if [ "$LISTEN_PORT" = "443" ]; then
+                echo -e "${GREEN}访问地址: https://$DOMAIN${RESET}"
+            else
+                echo -e "${GREEN}访问地址: https://$DOMAIN:$LISTEN_PORT${RESET}"
+            fi
+        else
+            echo -e "${RED}❌ 错误: Nginx 最终业务配置语法测试失败，执行安全回滚！${RESET}"
+            rm -f "/etc/nginx/sites-enabled/$DOMAIN" 2>/dev/null
+            rc-service nginx reload
+        fi
+    else
+        echo -e "${RED}❌ 错误: Certbot --nginx 模式证书申请失败！${RESET}"
+        echo -e "${YELLOW}已终止反代配置写入，防止 Nginx 全盘瘫痪。请检查 80 端口放行情况与防火墙。${RESET}"
+    fi
+
+    # 自动续期定时任务 (适配 Alpine 的 rc-service)
     if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
         (crontab -l 2>/dev/null; echo "0 2 * * * certbot renew --quiet --post-hook 'rc-service nginx reload'") | crontab -
     fi
+    # ========================================================
 
-    echo -e "${GREEN}安装完成！访问: https://$DOMAIN:$LISTEN_PORT${RESET}"
     pause
 }
 
@@ -615,8 +683,8 @@ check_domains_status() {
 }
 
 uninstall_nginx() {
-    echo -e "${YELLOW}警告: 此操作将卸载 Nginx 并删除所有相关配置文件和证书！${RESET}"
-    read -r -p "你确定要卸载 Nginx 吗？(y/N): " confirm
+    echo -e "${RED}💥 警告: 此操作将物理完全卸载 Nginx 核心，并彻底抹除所有反代配置与托管证书！${RESET}"
+    read -r -p "确定要斩草除根式卸载 Nginx 吗？(y/N): " confirm
     
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo -e "${YELLOW}操作已取消。${RESET}"
@@ -624,18 +692,34 @@ uninstall_nginx() {
         return 0
     fi
 
-    echo -e "${YELLOW}正在卸载 Nginx (Alpine)...${RESET}"
-    rc-service nginx stop || true
-    rc-update del nginx default || true
-    apk del nginx certbot certbot-nginx || true
-    rm -rf /etc/nginx /etc/letsencrypt "$CUSTOM_SSL_BASE" /var/log/nginx
-    remove_default_server
+    echo -e "${YELLOW}正在强行关闭服务并擦除系统组件...${RESET}"
+    rc-service nginx stop >/dev/null 2>&1 || true
+    rc-update del nginx default >/dev/null 2>&1 || true
     
+    # 强制杀死一切可能残留的相关进程
+    killall nginx 2>/dev/null || true
+    killall certbot 2>/dev/null || true
+
+    # 使用 APK 卸载
+    echo -e "${YELLOW}正在从系统卸载核心包...${RESET}"
+    apk del nginx certbot certbot-nginx nginx-openrc nginx-vim 2>/dev/null || true
+    
+    # 彻底抹除残留目录
+    echo -e "${YELLOW}正在彻底擦除本地配置与证书归档...${RESET}"
+    rm -rf /etc/nginx
+    rm -rf /etc/letsencrypt
+    rm -rf "$CUSTOM_SSL_BASE"
+    rm -rf /var/log/nginx
+    rm -rf /var/lib/nginx
+    rm -rf /run/nginx.pid 2>/dev/null || true
+    
+    # 清理定时任务
     crontab -l 2>/dev/null | grep -v "certbot renew" | crontab - 2>/dev/null || true
     
-    echo -e "${GREEN}已成功卸载${RESET}"
+    echo -e "${GREEN}✅ Nginx 及其环境配置已彻底卸载干净！系统已恢复纯净状态。${RESET}"
     pause
 }
+
 
 fix_external_cert_permission() {
     local cert=$1

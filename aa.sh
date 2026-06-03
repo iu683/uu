@@ -1,149 +1,151 @@
-#!/bin/bash
+#!/bin/sh
 set -e
 
 GREEN="\033[32m"
 RED="\033[31m"
-RESET="\033[0m"
 YELLOW="\033[33m"
+RESET="\033[0m"
+
+RESOLV_FILE="/etc/resolv.conf"
 
 # =========================================================
-# 动态获取 Fail2Ban 的状态、版本、监听端口与拦截数据
+# root 检测 (Alpine 标准 sh 兼容语法)
 # =========================================================
-get_fail2ban_status() {
-    # 1. 检查运行状态
-    if systemctl is-active --quiet fail2ban 2>/dev/null; then
-        STATUS="${GREEN}已运行${RESET}"
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}错误: 请使用 root 权限运行此脚本${RESET}"
+    exit 1
+fi
+
+
+# =========================================================
+# 动态获取当前正在生效的 DNS 状态 (针对 Alpine 深度健壮优化)
+# =========================================================
+get_dns_status() {
+    if [ -f "$RESOLV_FILE" ]; then
+        # 1. 提取所有合法的 nameserver 地址
+        local all_dns=$(awk '/^\s*nameserver/ {print $2}' "$RESOLV_FILE")
+        
+        # 2. 纯 IPv4 提取：过滤掉包含冒号的行，并将多行合并为单行展示
+        STATUS_IPv4=$(echo "$all_dns" | awk '!/:/ {printf "%s ", $0}' | sed 's/ $//')
+        
+        # 3. 纯 IPv6 提取：只保留包含冒号的行，并将多行合并为单行展示
+        STATUS_IPv6=$(echo "$all_dns" | awk '/:/ {printf "%s ", $0}' | sed 's/ $//')
+        
+        # 如果变量为空，则给予友好提示
+        [ -z "$STATUS_IPv4" ] && STATUS_IPv4="未配置"
+        [ -z "$STATUS_IPv6" ] && STATUS_IPv6="未配置"
     else
-        STATUS="${RED}未运行${RESET}"
+        STATUS_IPv4="${RED}文件不存在${RESET}"
+        STATUS_IPv6="${RED}文件不存在${RESET}"
     fi
-    
-    # 2. 获取版本号
-    if command -v fail2ban-client >/dev/null 2>&1; then
-        VERSION_SHOW=$(fail2ban-client --version | head -n 1 | awk '{print $2}')
+
+    # 4. 检查文件是否被锁定
+    if command -v lsattr >/dev/null 2>&1 && [ -f "$RESOLV_FILE" ]; then
+        if lsattr "$RESOLV_FILE" 2>/dev/null | head -n 1 | cut -d' ' -f1 | grep -q 'i'; then
+            LOCK_STATUS="${RED}已锁定 (🔒)${RESET}"
+        else
+            LOCK_STATUS="${GREEN}未锁定 (🔓)${RESET}"
+        fi
     else
-        VERSION_SHOW="未安装"
-    fi
-    
-    # 3. 动态获取 SSH 监听端口
-    if [ -f /etc/fail2ban/jail.d/sshd.local ]; then
-        # 从配置文件中提取 port 字段的值
-        local port_check=$(grep -E '^\s*port\s*=' /etc/fail2ban/jail.d/sshd.local | head -n 1 | awk -F'=' '{print $2}' | tr -d ' ')
-        PORT_SHOW=${port_check:-22}
-    else
-        PORT_SHOW="未知"
-    fi
-    
-    # 4. 统计当前拦截的 IP 总数
-    if systemctl is-active --quiet fail2ban 2>/dev/null && command -v fail2ban-client >/dev/null 2>&1; then
-        local jails=$(fail2ban-client status | grep "Jail list:" | sed 's/.*Jail list://' | tr ',' ' ')
-        local total_banned=0
-        for jail in $jails; do
-            local count=$(fail2ban-client status "$jail" | grep "Currently banned:" | awk '{print $4}')
-            total_banned=$((total_banned + count))
-        done
-        SITE_COUNT=$total_banned
-    else
-        SITE_COUNT=0
+        LOCK_STATUS="不支持检测"
     fi
 }
 
 # =========================================================
-# Fail2Ban 功能核心函数
+# 设置 resolv.conf DNS
 # =========================================================
-check_fail2ban() {
-    if ! systemctl is-active --quiet fail2ban; then
-        echo -e "${GREEN}Fail2Ban 未运行，正在启动...${RESET}"
-        systemctl enable --now fail2ban
-        sleep 1
+set_dns_resolvconf() {
+    DNS1=$1
+    DNS2=$2
+
+    echo -e "${GREEN}正在设置 DNS: $DNS1 $DNS2${RESET}"
+
+    # 解锁文件（如果支持 chattr）
+    if command -v chattr >/dev/null 2>&1; then
+        chattr -i $RESOLV_FILE 2>/dev/null || true
     fi
-}
+    
+    rm -f $RESOLV_FILE
 
-install_fail2ban() {
-    echo -e "${GREEN}正在安装 Fail2Ban...${RESET}"
-    if [ -f /etc/debian_version ]; then
-        apt update
-        apt install -y fail2ban curl wget
-    elif [ -f /etc/redhat-release ]; then
-        yum install -y epel-release
-        yum install -y fail2ban curl wget
-    else
-        echo -e "${RED}不支持的操作系统${RESET}"
-        exit 1
-    fi
-    systemctl enable --now fail2ban
-    sleep 1
-}
-
-configure_ssh() {
-    if [ -f /etc/debian_version ]; then
-        LOG_PATH="/var/log/auth.log"
-    elif [ -f /etc/redhat-release ]; then
-        LOG_PATH="/var/log/secure"
-    else
-        echo -e "${RED}不支持的操作系统${RESET}"
-        exit 1
-    fi
-
-    read -p $'\033[32m请输入 SSH 端口（默认22）: \033[0m' SSH_PORT
-    SSH_PORT=${SSH_PORT:-22}
-
-    read -p $'\033[32m请输入最大失败尝试次数 maxretry（默认5）: \033[0m' MAX_RETRY
-    MAX_RETRY=${MAX_RETRY:-5}
-
-    read -p $'\033[32m请输入封禁时间 bantime(秒，默认600) : \033[0m' BAN_TIME
-    BAN_TIME=${BAN_TIME:-600}
-
-    mkdir -p /etc/fail2ban/jail.d
-    cat >/etc/fail2ban/jail.d/sshd.local <<EOF
-[sshd]
-enabled = true
-port = $SSH_PORT
-filter = sshd
-logpath = $LOG_PATH
-maxretry = $MAX_RETRY
-bantime  = $BAN_TIME
+    cat > $RESOLV_FILE <<EOF
+nameserver $DNS1
 EOF
 
-    systemctl restart fail2ban
-    sleep 1
-    echo -e "${GREEN}SSH 防暴力破解配置完成${RESET}"
-}
-
-uninstall_fail2ban() {
-    echo -e "${GREEN}正在卸载 Fail2Ban...${RESET}"
-    systemctl stop fail2ban || true
-    if [ -f /etc/debian_version ]; then
-        apt remove -y fail2ban
-    elif [ -f /etc/redhat-release ]; then
-        yum remove -y fail2ban
+    if [ -n "$DNS2" ]; then
+        echo "nameserver $DNS2" >> $RESOLV_FILE
     fi
-    echo -e "${GREEN}Fail2Ban 已卸载${RESET}"
+
+    cat >> $RESOLV_FILE <<EOF
+options timeout:2 attempts:3
+EOF
+
+    echo -ne "${GREEN}是否锁定 resolv.conf 防止网络重启被覆盖? (y/n): ${RESET}"
+    read -r LOCK </dev/tty
+    if [ "$LOCK" = "y" ] || [ "$LOCK" = "Y" ]; then
+        if command -v chattr >/dev/null 2>&1; then
+            chattr +i $RESOLV_FILE 2>/dev/null || true
+            echo -e "${GREEN}已成功锁定 resolv.conf${RESET}"
+        else
+            echo -e "${YELLOW}当前系统缺少 chattr 命令，无法锁定文件${RESET}"
+        fi
+    fi
+
+    echo -e "${GREEN}DNS 配置更新完成！${RESET}"
 }
 
 # =========================================================
-# 换装后的全新 Fail2Ban 管理面板 (带端口显示)
+# 自定义 DNS 输入
 # =========================================================
-fail2ban_menu() {
+custom_dns() {
+    echo -ne "${GREEN}请输入主 DNS: ${RESET}"
+    read -r MAIN_DNS </dev/tty
+    echo -ne "${GREEN}请输入备用 DNS (可留空): ${RESET}"
+    read -r BACKUP_DNS </dev/tty
+
+    if [ -z "$MAIN_DNS" ]; then
+        echo -e "${RED}主 DNS 不能为空${RESET}"
+        return
+    fi
+
+    set_dns_resolvconf "$MAIN_DNS" "$BACKUP_DNS"
+}
+
+# =========================================================
+# 恢复默认
+# =========================================================
+restore_default() {
+    echo -e "${YELLOW}正在恢复系统默认 DNS...${RESET}"
+    if command -v chattr >/dev/null 2>&1; then
+        chattr -i $RESOLV_FILE 2>/dev/null || true
+    fi
+    rm -f $RESOLV_FILE
+    # Alpine 可以通过重启网络触发 udhcpc 自动重新获取 DNS
+    echo -e "${GREEN}静态 DNS 已清理。提示：在 Alpine 下可执行 'rc-service networking restart' 重新获取 DHCP DNS${RESET}"
+}
+
+# =========================================================
+# DNS 视觉面板菜单
+# =========================================================
+dns_menu() {
     while true; do
-        # 每次循环动态更新 Fail2Ban 的数据
-        get_fail2ban_status
+        # 每次循环动态读取最新 DNS 状态
+        get_dns_status
 
         clear
         echo -e "${GREEN}===============================${RESET}"
-        echo -e "${GREEN} ◈  SSH 防暴力破解管理面板  ◈  ${RESET}"
+        echo -e "${GREEN}   ◈    DNS 系统管理面板   ◈   ${RESET}"
         echo -e "${GREEN}===============================${RESET}"
-        echo -e "${GREEN} 状态     : ${STATUS}"
-        echo -e "${GREEN} 版本     : ${YELLOW}${VERSION_SHOW}${RESET}"
-        echo -e "${GREEN} 监听端口 : ${YELLOW}${PORT_SHOW}${RESET}"
-        echo -e "${GREEN} 封禁数量 : ${YELLOW}${SITE_COUNT} 个 IP${RESET}"
+        echo -e "${GREEN} IPv4 DNS : ${YELLOW}${STATUS_IPV4}${RESET}"
+        echo -e "${GREEN} IPv6 DNS : ${YELLOW}${STATUS_IPv6}${RESET}"
+        echo -e "${GREEN} 锁定状态 : ${LOCK_STATUS}"
         echo -e "${GREEN}===============================${RESET}"
-        echo -e "${GREEN}  1. 安装并开启 SSH 防护${RESET}"
-        echo -e "${GREEN}  2. 关闭 SSH 防护功能${RESET}"
-        echo -e "${GREEN}  3. 配置 SSH 防护参数${RESET}"
-        echo -e "${GREEN}  4. 查看 SSH 拦截记录${RESET}"
-        echo -e "${GREEN}  5. 查看当前防御规则列表${RESET}"
-        echo -e "${GREEN}  6. 查看日志实时监控${RESET}"
-        echo -e "${GREEN}  7. 卸载 Fail2Ban 程序${RESET}"
+        echo -e "${GREEN}  1. Google DNS (8.8.8.8)${RESET}"
+        echo -e "${GREEN}  2. Cloudflare DNS (1.1.1.1)${RESET}"
+        echo -e "${GREEN}  3. 阿里云 DNS (223.5.5.5)${RESET}"
+        echo -e "${GREEN}  4. 腾讯云 DNS (119.29.29.29)${RESET}"
+        echo -e "${GREEN}  5. IPv6 双公网 DNS${RESET}"
+        echo -e "${GREEN}  6. 手动输入自定义 DNS${RESET}"
+        echo -e "${GREEN}  7. 清理静态配置并恢复默认${RESET}"
         echo -e "${GREEN}  0. 退出${RESET}"
         echo -e "${GREEN}===============================${RESET}"
         echo -ne "${GREEN} 请选择: ${RESET}"
@@ -151,83 +153,23 @@ fail2ban_menu() {
         read -r choice </dev/tty
 
         case $choice in
-            1)
-                if ! command -v fail2ban-client >/dev/null 2>&1; then
-                    install_fail2ban
-                else
-                    systemctl enable --now fail2ban
-                fi
-                configure_ssh
-                ;;
-            2)
-                check_fail2ban
-                if [ -f /etc/fail2ban/jail.d/sshd.local ]; then
-                    sed -i '/enabled/s/true/false/' /etc/fail2ban/jail.d/sshd.local
-                    systemctl restart fail2ban
-                    sleep 1
-                    echo -e "${GREEN}SSH 防暴力破解已关闭${RESET}"
-                else
-                    echo -e "${RED}SSH 配置文件不存在，请先安装并开启 SSH 防护${RESET}"
-                fi
-                read -p $'\033[32m按回车返回菜单...\033[0m'
-                ;;
-            3)
-                check_fail2ban
-                if [ -f /etc/fail2ban/jail.d/sshd.local ]; then
-                    configure_ssh
-                else
-                    echo -e "${RED}SSH 配置文件不存在，请先安装并开启 SSH 防护${RESET}"
-                fi
-                read -p $'\033[32m按回车返回菜单...\033[0m'
-                ;;
-            4)
-                check_fail2ban
-                echo -e "${GREEN}当前被封禁的 IP 列表:${RESET}"
-                BANNED=$(fail2ban-client status sshd | grep 'Banned IP list' | cut -d: -f2)
-                if [ -z "$BANNED" ]; then
-                    echo -e "${GREEN}无${RESET}"
-                else
-                    echo -e "${GREEN}$BANNED${RESET}"
-                fi
-                echo -e "${GREEN}✅ 状态显示完成${RESET}"
-                read -p $'\033[32m按回车返回菜单...\033[0m'
-                ;;
-            5)
-                check_fail2ban
-                echo -e "${GREEN}当前防御规则列表:${RESET}"
-                JAILS=$(fail2ban-client status | grep 'Jail list' | cut -d: -f2)
-                if [ -z "$JAILS" ]; then
-                    echo -e "${GREEN}无${RESET}"
-                else
-                    echo -e "${GREEN}$JAILS${RESET}"
-                fi
-                echo -e "${GREEN}✅ 状态显示完成${RESET}"
-                read -p $'\033[32m按回车返回菜单...\033[0m'
-                ;;
-            6)
-                check_fail2ban
-                echo -e "${GREEN}进入日志实时监控，按 Ctrl+C 返回菜单${RESET}"
-                trap 'echo -e "\n${GREEN}已退出日志监控，返回菜单${RESET}"' SIGINT
-                tail -n 20 -f /var/log/fail2ban.log || true
-                trap - SIGINT
-                read -p $'\033[32m按回车继续...\033[0m'
-                ;;
-            7)
-                uninstall_fail2ban
-                break
-                ;;
-            0)
-                break
-                ;;
-            *)
-                echo -e "${RED}无效的选择，请重新输入${RESET}"
-                sleep 1
-                ;;
+            1) set_dns_resolvconf "8.8.8.8" "1.1.1.1" ;;
+            2) set_dns_resolvconf "1.1.1.1" "1.0.0.1" ;;
+            3) set_dns_resolvconf "223.5.5.5" "223.6.6.6" ;;
+            4) set_dns_resolvconf "119.29.29.29" "119.28.28.28" ;;
+            5) set_dns_resolvconf "2606:4700:4700::1111" "2001:4860:4860::8888" ;;
+            6) custom_dns ;;
+            7) restore_default ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择，请重新输入...${RESET}"; sleep 1; continue ;;
         esac
+
+        echo -ne "${GREEN}按回车返回面板...${RESET}"
+        read -r </dev/tty
     done
 }
 
 # =========================================================
 # 执行主逻辑
 # =========================================================
-fail2ban_menu
+dns_menu

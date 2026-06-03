@@ -36,10 +36,15 @@ get_firewall_status() {
     fi
 }
 
-# 3. 获取 iptables 版本
-get_iptables_version() {
+# 3. 获取当前实际使用的防火墙后端内核 
+get_firewall_type() {
     if command -v iptables &>/dev/null; then
-        iptables --version | awk '{print $2}'
+        # 区分是 nftables 后端还是传统 legacy 后端
+        if iptables --version | grep -qi "nftables"; then
+            echo "iptables (nftables 后端)"
+        else
+            echo "iptables (legacy 后端)"
+        fi
     else
         echo "未安装"
     fi
@@ -192,7 +197,8 @@ ping_action() {
                     $proto -I INPUT -p icmp --icmp-type echo-request -j DROP
                     $proto -I OUTPUT -p icmp --icmp-type echo-reply -j DROP
                 else
-                    =while $proto -C INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT 2>/dev/null; do $proto -D INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT; done
+                    # 这里已修复修复：去除了原本误触的 = 号
+                    while $proto -C INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT 2>/dev/null; do $proto -D INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT; done
                     while $proto -C OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT 2>/dev/null; do $proto -D OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT; done
                     $proto -I INPUT -p icmpv6 --icmpv6-type echo-request -j DROP
                     $proto -I OUTPUT -p icmpv6 --icmpv6-type echo-reply -j DROP
@@ -209,7 +215,7 @@ menu() {
     while true; do
         # 动态获取当前系统防火墙数据
         STATUS=$(get_firewall_status)
-        VERSION_SHOW=$(get_iptables_version)
+        TYPE_SHOW=$(get_firewall_type)
         PORT_SHOW=$(get_ssh_port)
         SITE_COUNT=$(get_banned_ip_count)
 
@@ -218,7 +224,7 @@ menu() {
         echo -e "${GREEN}   ◈   双栈防火墙管理面板   ◈  ${RESET}"
         echo -e "${GREEN}===============================${RESET}"
         echo -e "${GREEN} 状态  : ${STATUS}"
-        echo -e "${GREEN} 规则  : ${YELLOW}${VERSION_SHOW}${RESET}"
+        echo -e "${GREEN} 内核  : ${YELLOW}${TYPE_SHOW}${RESET}"
         echo -e "${GREEN} 端口  : ${YELLOW}${PORT_SHOW}${RESET}"
         echo -e "${GREEN} 封禁  : ${YELLOW}${SITE_COUNT} 个 IP${RESET}"
         echo -e "${GREEN}===============================${RESET}"

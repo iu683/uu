@@ -20,7 +20,7 @@ mkdir -p "$CUSTOM_SSL_BASE"
 get_nginx_status() {
     if ! command -v nginx >/dev/null 2>&1; then
         STATUS="${RED}未安装${RESET}"
-    elif pgrep -x nginx >/dev/null 2>&1; then
+    elif pgrep -f "nginx: master" >/dev/null 2>&1; then
         STATUS="${YELLOW}运行中${RESET}"
     else
         STATUS="${RED}已停止${RESET}"
@@ -51,6 +51,31 @@ get_site_count() {
     fi
 }
 
+# 全新功能：纯原生强力重启 Nginx（
+restart_nginx() {
+    echo -e "${GREEN}正在验证 Nginx 配置语法...${RESET}"
+    
+    # 1. 严格的语法检查
+    if nginx -t; then
+        echo -e "${GREEN}语法验证通过，正在执行原生强制重启...${RESET}"
+        
+        # 2. 暴力清空所有正在运行的旧 Nginx 进程，瞬间释放所有端口（80/5524/5547等）
+        killall -9 nginx >/dev/null 2>&1
+        
+        # 3. 直接调用 Nginx 自己的二进制命令启动，不通过任何中间商
+        if nginx; then
+            echo -e "${GREEN}✅ Nginx 服务已纯原生启动，所有反代站点配置已完美生效！${RESET}"
+            return 0
+        else
+            echo -e "${RED}❌ 致命错误：Nginx 启动失败！${RESET}"
+            return 1
+        fi
+    else
+        echo -e "${RED}❌ Nginx 配置语法错误！未执行重启，请检查上方的错误提示。${RESET}"
+        return 1
+    fi
+    pause
+}
 
 # ------------------------------
 # 核心功能函数
@@ -219,40 +244,6 @@ check_domain_resolution() {
     fi
 }
 
-# 新增功能：平滑重载或智能复活 Nginx 配置
-reload_nginx() {
-    echo -e "${GREEN}正在验证 Nginx 配置语法...${RESET}"
-    
-    # 1. 严格的语法检查前置
-    if nginx -t; then
-        echo -e "${GREEN}语法验证通过，正在尝试平滑重载...${RESET}"
-        
-        # 2. 尝试标准平滑重载（静音处理，不让不必要的报错干扰控制台）
-        if rc-service nginx reload >/dev/null 2>&1; then
-            echo -e "${GREEN}✅ Nginx 配置重载成功！${RESET}"
-        else
-            echo -e "${YELLOW}⚠️ 重载失败（服务当前未运行或状态异常），正在尝试智能修复并启动...${RESET}"
-            
-            # 3. 核心救活逻辑：清理旧积压
-            killall nginx >/dev/null 2>&1      # 确保无孤儿进程占用 80/443
-            rc-service nginx zap >/dev/null 2>&1  # 强制重置 OpenRC 的假死缓存状态
-            
-            # 4. 重新正式拉起服务
-            echo -e "${GREEN}正在启动 Nginx 服务...${RESET}"
-            if rc-service nginx start; then
-                echo -e "${GREEN}✅ Nginx 服务已成功启动，新配置已生效！${RESET}"
-                return 0 
-            else
-                echo -e "${RED}❌ 致命错误：Nginx 无法启动，请检查端口是否被其他非 Nginx 程序占用！${RESET}"
-                return 1
-            fi
-        fi
-    else
-        echo -e "${RED}❌ Nginx 配置语法错误！未执行重载，请检查上方的错误提示。${RESET}"
-        return 1
-    fi
-    pause
-}
 
 install_nginx() {
     if command -v nginx >/dev/null 2>&1 && command -v certbot >/dev/null 2>&1; then
@@ -350,12 +341,11 @@ install_nginx() {
  
  
         echo -e "${GREEN}正在启动 Nginx 服务...${RESET}"
-        rc-service nginx start
-        
+        restart_nginx
         
         # 测试新配置并热重载 Nginx
         if nginx -t; then
-            rc-service nginx reload
+            nginx -s reload
             echo -e "${GREEN}安装完成！配置已生效。${RESET}"
             if [ "$LISTEN_PORT" = "443" ]; then
                 echo -e "${GREEN}访问地址: https://$DOMAIN${RESET}"
@@ -365,7 +355,7 @@ install_nginx() {
         else
             echo -e "${RED}❌ 错误: Nginx 最终业务配置语法测试失败，执行安全回滚！${RESET}"
             rm -f "/etc/nginx/sites-enabled/$DOMAIN" 2>/dev/null
-            rc-service nginx reload
+            nginx -s reload
         fi
     else
         echo -e "${RED}❌ 错误: Certbot --nginx 模式证书申请失败！${RESET}"
@@ -432,7 +422,7 @@ add_config() {
     certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
     generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE" "" "" "$LISTEN_PORT"
     create_default_server
-    nginx -t && rc-service nginx reload
+    nginx -t && nginx -s reload
     echo -e "${GREEN}添加完成！访问: https://$DOMAIN:$LISTEN_PORT${RESET}"
     pause
 }
@@ -498,7 +488,7 @@ modify_config() {
     fi
 
     create_default_server
-    nginx -t && rc-service nginx reload
+    nginx -t && nginx -s reload
     echo -e "${GREEN}修改完成！访问: https://$DOMAIN:$LISTEN_PORT${RESET}"
     pause
 }
@@ -549,7 +539,7 @@ delete_config() {
     fi
 
     if nginx -t; then
-        rc-service nginx reload
+        nginx -t && nginx -s reload
         echo -e "${GREEN}站点 $DOMAIN 已完全删除${RESET}"
     else
         echo -e "${RED}Nginx 配置测试失败，请检查！${RESET}"
@@ -679,7 +669,7 @@ check_domains_status() {
 
 uninstall_nginx() {
     echo -e "${RED}💥 警告: 此操作将物理完全卸载 Nginx 核心，并彻底抹除所有反代配置与托管证书！${RESET}"
-    read -r -p "确定要斩草除根式卸载 Nginx 吗？(y/N): " confirm
+    read -r -p "确定要卸载 Nginx 吗？(y/N): " confirm
     
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo -e "${YELLOW}操作已取消。${RESET}"
@@ -786,7 +776,7 @@ add_custom_cert_config() {
     create_default_server
     
     if nginx -t; then
-        rc-service nginx reload
+        nginx -t && nginx -s reload
         echo -e "${GREEN}✅ 自定义证书反代站点 https://$DOMAIN:$LISTEN_PORT 添加成功！${RESET}"
     else
         echo -e "${RED}❌ Nginx 配置语法错误，已自动撤销，请检查证书有效性。${RESET}"
@@ -875,11 +865,6 @@ generate_emby_stream_conf() {
     LISTEN_PORT=${LISTEN_PORT:-443} # 默认 443
 
     cat > "$CONFIG_PATH" <<EOF
-server {
-    listen 80;
-    server_name $DOMAIN;
-    return 301 https://\$host:${LISTEN_PORT}\$request_uri;
-}
 
 server {
     listen $LISTEN_PORT ssl;
@@ -968,7 +953,7 @@ emby_menu() {
             EMAIL=$(generate_random_email)
             certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
             generate_emby_normal_conf "$DOMAIN" "$TARGET" "" "" "$LISTEN_PORT"
-            nginx -t && rc-service nginx reload
+            nginx -t && nginx -s reload
             echo -e "${GREEN}========================================${RESET}"
             echo -e "${GREEN}✅ 普通模式配置成功!${RESET}"
             echo -e "${GREEN}🌐 访问地址: https://$DOMAIN:$LISTEN_PORT${RESET}"
@@ -984,7 +969,7 @@ emby_menu() {
             EMAIL=$(generate_random_email)
             certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
             generate_emby_stream_conf "$DOMAIN" "$T_MAIN" "$T_STREAM" "" "" "$LISTEN_PORT"
-            nginx -t && rc-service nginx reload
+            nginx -t && nginx -s reload
             echo -e "${GREEN}========================================${RESET}"
             echo -e "${GREEN}✅ 分流重定向模式配置成功!${RESET}"
             echo -e "${GREEN}🌐 主站访问地址: https://$DOMAIN:$LISTEN_PORT${RESET}"
@@ -1020,7 +1005,7 @@ emby_menu() {
             ln -sf "$ABS_KEY" "$DIR_PATH/privkey.pem"
 
             generate_emby_normal_conf "$DOMAIN" "$TARGET" "$DIR_PATH/fullchain.pem" "$DIR_PATH/privkey.pem" "$LISTEN_PORT"
-            nginx -t && rc-service nginx reload
+            nginx -t && nginx -s reload
             echo -e "${GREEN}========================================${RESET}"
             echo -e "${GREEN}✅ 普通模式配置成功!${RESET}"
             echo -e "${GREEN}🌐 访问地址: https://$DOMAIN:$LISTEN_PORT${RESET}"
@@ -1065,7 +1050,7 @@ update_nginx_software() {
     if apk add --upgrade nginx certbot certbot-nginx; then
         echo -e "${GREEN}  ├─ [3/3] 正在验证配置并平滑重载新版本服务...${RESET}"
         if nginx -t >/dev/null 2>&1; then
-            rc-service nginx reload
+            nginx -t && nginx -s reload
             local NEW_VER=$(nginx -v 2>&1 | awk -F/ '{print $2}')
             echo -e "${GREEN}  └─ 🎉 升级成功！当前版本从 ${YELLOW}${CURRENT_VER}${RESET} 变为 ${GREEN}${NEW_VER}${RESET}"
         else
@@ -1102,7 +1087,7 @@ main_menu() {
         echo -e "${GREEN} 7. 查看证书信息${RESET}"
         echo -e "${GREEN} 8. 查看证书状态${RESET}"
         echo -e "${GREEN} 9. Emby反代配置${RESET}"
-        echo -e "${GREEN}10. 重载Nginx配置${RESET}"
+        echo -e "${GREEN}10. 重载Nginx${RESET}"
         echo -e "${GREEN}11. 升级Nginx${RESET}"
         echo -e "${GREEN}12. 卸载Nginx${RESET}"
         echo -e "${GREEN} 0. 退出${RESET}"
@@ -1120,7 +1105,7 @@ main_menu() {
             7) check_cert ;;
             8) check_domains_status ;;
             9) emby_menu ;;
-           10) reload_nginx ;; 
+           10) nginx -t && nginx -s reload ;;
            11) update_nginx_software ;;
            12) uninstall_nginx ;;
             0) exit 0 ;;

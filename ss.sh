@@ -1,268 +1,350 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# 强制使用 bash 运行
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
 
+#################################################
+# caadybackup - 自动安装 + 自动更新增强版 (Caddy + 网站)
+# 适配说明: 已全面兼容 Alpine Linux (OpenRC) 架构
+#################################################
+
+#################################
+# 远程自动安装逻辑
+#################################
+INSTALL_DIR="/opt/caadybackup"
+LOCAL_SCRIPT="$INSTALL_DIR/caadybackup.sh"
+REMOTE_URL="https://raw.githubusercontent.com/iu683/uu/main/ss.sh"
+
+# 环境依赖检测（针对 Alpine 精简环境进行动态补全）
+if [ -f /etc/alpine-release ]; then
+    INIT_DEPS=()
+    command -v curl >/dev/null 2>&1 || INIT_DEPS+=("curl")
+    command -v bash >/dev/null 2>&1 || INIT_DEPS+=("bash")
+    command -v tar >/dev/null 2>&1 || INIT_DEPS+=("tar")
+    
+    if [ ${#INIT_DEPS[@]} -ne 0 ]; then
+        apk update -q && apk add -q "${INIT_DEPS[@]}"
+    fi
+fi
+
+if [[ "$0" != "$LOCAL_SCRIPT" ]]; then
+    mkdir -p "$INSTALL_DIR"
+
+    curl -fsSL -o "$LOCAL_SCRIPT.tmp" "$REMOTE_URL" || {
+        echo "下载失败"
+        exit 1
+    }
+
+    if [[ ! -f "$LOCAL_SCRIPT" ]] || ! cmp -s "$LOCAL_SCRIPT.tmp" "$LOCAL_SCRIPT"; then
+        mv "$LOCAL_SCRIPT.tmp" "$LOCAL_SCRIPT"
+        chmod +x "$LOCAL_SCRIPT"
+        echo "已安装/更新到最新版本"
+    else
+        rm -f "$LOCAL_SCRIPT.tmp"
+    fi
+
+    exec bash "$LOCAL_SCRIPT" "$@"
+fi
+
+#################################
+# 颜色
+#################################
 GREEN="\033[32m"
 RED="\033[31m"
+CYAN="\033[36m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-CONFIG="/etc/ssh/sshd_config"
-BACKUP="/etc/ssh/sshd_config.bak"
+#################################
+# 基础路径
+#################################
+CONFIG_FILE="$INSTALL_DIR/config.sh"
+LOG_FILE="$INSTALL_DIR/backup.log"
+CRON_TAG="#caadybackup_cron"
 
+DATA_DIR_DEFAULT="$INSTALL_DIR/data"
+RETAIN_DAYS_DEFAULT=7
+SERVICE_NAME_DEFAULT="$(hostname)"
 
+mkdir -p "$INSTALL_DIR"
 
-# 判断是否为 Alpine 系统
-IS_ALPINE=false
-if [ -f /etc/alpine-release ]; then
-    IS_ALPINE=true
+#################################
+# Caddy 配置/数据路径动态适配
+#################################
+CADDYFILE="/etc/caddy/Caddyfile"
+
+# 智能兼容：探测 Alpine APK 默认路径、原生独立运行路径与标准路径
+if [ -d "/var/lib/caddy/.local/share/caddy" ]; then
+    CADDY_DATA="/var/lib/caddy/.local/share/caddy"
+elif [ -d "/root/.local/share/caddy" ]; then
+    CADDY_DATA="/root/.local/share/caddy"
+else
+    CADDY_DATA="$HOME/.local/share/caddy"
 fi
 
+WWW_DIR="/var/www"
 
 #################################
-# SSH 服务重启与备份
+# 卸载
 #################################
-restart_ssh() {
-    if [ "$IS_ALPINE" = true ]; then
-        rc-service sshd restart 2>/dev/null
-    else
-        if command -v systemctl &>/dev/null; then
-            systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
-        else
-            service ssh restart 2>/dev/null || service sshd restart 2>/dev/null
-        fi
-    fi
-    echo -e "${GREEN}✔ SSH 已重启生效${RESET}"
+if [[ "$1" == "--uninstall" ]]; then
+    echo -e "${YELLOW}正在卸载...${RESET}"
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+    rm -rf "$INSTALL_DIR"
+    echo -e "${GREEN}卸载完成${RESET}"
+    exit 0
+fi
+
+#################################
+# 加载配置
+#################################
+load_config() {
+    [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+    DATA_DIR=${DATA_DIR:-$DATA_DIR_DEFAULT}
+    RETAIN_DAYS=${RETAIN_DAYS:-$RETAIN_DAYS_DEFAULT}
+    SERVICE_NAME=${SERVICE_NAME:-$SERVICE_NAME_DEFAULT}
 }
-
-backup_config() {
-    cp "$CONFIG" "$BACKUP" 2>/dev/null
-    echo -e "${YELLOW}已备份 → $BACKUP${RESET}"
-}
-
+load_config
+mkdir -p "$DATA_DIR"
 
 #################################
-# 分离获取 3 个核心状态
+# 保存配置
 #################################
-get_each_ssh_status() {
-    # ---- 1. 检测公钥文件状态 ----
-    if [ -f "/root/.ssh/authorized_keys" ] && [ -s "/root/.ssh/authorized_keys" ]; then
-        local count=$(wc -l < /root/.ssh/authorized_keys)
-        STATUS_FILE="${YELLOW}[正常] ( ${count} 个公钥)${RESET}"
-    else
-        STATUS_FILE="${RED}[未设置]${RESET}"
-    fi
-
-    # 获取 SSH 实际生效配置
-    local sshd_vars=$(sshd -T 2>/dev/null)
-    if [ -z "$sshd_vars" ]; then
-        sshd_vars=$(cat /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null)
-    fi
-
-    local pubkey_status=$(echo "$sshd_vars" | grep -i "^pubkeyauthentication" | awk '{print $2}' | tr 'A-Z' 'a-z' | head -n 1)
-    local root_login_status=$(echo "$sshd_vars" | grep -i "^permitrootlogin" | awk '{print $2}' | tr 'A-Z' 'a-z' | head -n 1)
-
-    # ---- 2. 检测公钥总开关状态 ----
-    if [[ "$pubkey_status" == "no" ]]; then
-        STATUS_PUBKEY="${RED}[已禁用]${RESET}"
-    else
-        STATUS_PUBKEY="${YELLOW}[已开启]${RESET}"
-    fi
-
-    # ---- 3. 检测 Root 登录及密码登录状态 ----
-    # 整合显示，让密码登录状态无所遁形
-    local root_str=""
-    if [[ "$root_login_status" == "no" || "$root_login_status" == "forced-commands-only" ]]; then
-        root_str="${RED}Root已禁${RESET}"
-    else
-        root_str="${GREEN}Root允许(${root_login_status})${RESET}"
-    fi
-
-    local pass_str=""
-    if [[ "$pass_status" == "no" ]]; then
-        pass_str="${RED}密码登录:关${RESET}"
-    else
-        pass_str="${GREEN}密码登录:开${RESET}"
-    fi
-    
-    STATUS_ROOT="[${root_str} / ${pass_str}]"
-}
+save_config() {
+cat > "$CONFIG_FILE" <<EOF
+DATA_DIR="$DATA_DIR"
+RETAIN_DAYS="$RETAIN_DAYS"
+SERVICE_NAME="$SERVICE_NAME"
+TG_TOKEN="$TG_TOKEN"
+TG_CHAT_ID="$TG_CHAT_ID"
+EOF
 }
 
 #################################
-# 选项 2 的管理公钥登录（子菜单）
+# Telegram 通知
 #################################
-manage_key_menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}======管理公钥登录配置======${RESET}"
-        echo -e "${GREEN} 1.开启公钥+密码登录(推荐)${RESET}"
-        echo -e "${GREEN} 2.切换密码登录(关闭公钥)${RESET}"
-        echo -e "${GREEN} 0. 返回主菜单${RESET}"
-        read -p $'\033[32m 请选择: \033[0m' sub_choice
+send_tg() {
+    [[ -z "$TG_TOKEN" || -z "$TG_CHAT_ID" ]] && return
+    MESSAGE="[$SERVICE_NAME] $1"
+    curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+        -d chat_id="$TG_CHAT_ID" \
+        -d text="$MESSAGE" >/dev/null 2>&1
+}
 
-        case $sub_choice in
-            1)
-                backup_config
-                sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$CONFIG"
-                sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$CONFIG"
-                echo -e "${GREEN}✔ 公钥 + 密码登录已开启${RESET}"
-                restart_ssh
-                pause
-                ;;
-            2)
-                backup_config
-                sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication no/' "$CONFIG"
-                sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$CONFIG"
-                echo -e "${YELLOW}✔ 已关闭公钥，仅密码登录${RESET}"
-                restart_ssh
-                pause
-                ;;
-            0)
-                return
-                ;;
-            *)
-                echo -e "${RED}输入错误，请重新选择${RESET}"
-                sleep 1
-                ;;
-        esac
+#################################
+# 备份 Caddy 配置 + 证书
+#################################
+backup() {
+    # 适配 BusyBox 版本的 date 命令，移除了可能冲突的复杂格式
+    TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+    FILE="$DATA_DIR/caddy_backup_$TIMESTAMP.tar.gz"
+
+    echo -e "${CYAN}开始备份 Caddy 配置、证书...${RESET}"
+
+    # 路径健壮性校验
+    local caddy_bin=""
+    if [ -f "/usr/sbin/caddy" ]; then caddy_bin="/usr/sbin/caddy"; else caddy_bin="/usr/bin/caddy"; fi
+
+    [[ ! -f "$caddy_bin" ]] && echo -e "${RED}未找到 Caddy 可执行文件${RESET}" && return
+    [[ ! -f "$CADDYFILE" ]] && echo -e "${RED}未找到 Caddyfile${RESET}" && return
+    [[ ! -d "$CADDY_DATA" ]] && echo -e "${RED}未找到 Caddy 数据目录${RESET}" && return
+
+    # 使用 -P 参数防止 BusyBox/GNU tar 清除根路径首斜杠引发恢复错位
+    tar -czPf "$FILE" \
+        "$caddy_bin" \
+        "$CADDYFILE" \
+        "$CADDY_DATA" >> "$LOG_FILE" 2>&1
+
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}备份成功：$FILE${RESET}"
+        send_tg "✅ Caddy备份成功: $TIMESTAMP"
+    else
+        echo -e "${RED}备份失败${RESET}"
+        send_tg "❌ Caddy备份失败"
+    fi
+
+    # 清理旧备份
+    find "$DATA_DIR" -type f -name "*.tar.gz" -mtime +"$RETAIN_DAYS" -delete 2>/dev/null || true
+}
+
+#################################
+# 恢复备份
+#################################
+restore() {
+    shopt -s nullglob
+    FILE_LIST=("$DATA_DIR"/*.tar.gz)
+    [[ ${#FILE_LIST[@]} -eq 0 ]] && echo -e "${RED}没有备份文件${RESET}" && return
+
+    echo -e "${CYAN}备份列表:${RESET}"
+    for i in "${!FILE_LIST[@]}"; do
+        echo -e "${GREEN}$((i+1)). $(basename "${FILE_LIST[$i]}")${RESET}"
     done
-}
 
+    read -p "输入恢复序号: " num
+    [[ ! $num =~ ^[0-9]+$ ]] && return
+    FILE="${FILE_LIST[$((num-1))]}"
+    [[ -z "$FILE" ]] && return
 
-#################################
-# 一键清除 SSH 密钥
-#################################
-clear_all_ssh_keys() {
-    echo -e "${RED}警告：此操作将删除所有用户 SSH 密钥！${RESET}"
-    read -p $'\033[33m确认清除请输入(y): \033[0m' confirm
+    echo -e "${YELLOW}确认恢复？将覆盖 Caddy 配置、证书 (y/n)${RESET}"
+    read confirm
+    [[ "$confirm" != "y" ]] && return
 
-    if [[ "$confirm" != "y" ]]; then
-        echo -e "${GREEN}已取消操作${RESET}"
-        sleep 1
-        return
-    fi
+    # 使用 -P 确保绝对路径无缝覆盖回原目录
+    tar -xzPf "$FILE" -C /
 
-    echo -e "${GREEN}正在清理 SSH 密钥...${RESET}"
-    rm -rf /root/.ssh /home/*/.ssh 2>/dev/null
-    restart_ssh
-    echo -e "${GREEN}SSH 密钥已全部清理完成${RESET}"
-    pause
-}
+    echo -e "${GREEN}恢复完成${RESET}"
+    send_tg "🔄 Caddy 已恢复: $(basename "$FILE")"
 
-#################################
-# 本地生成并配置密钥登录
-#################################
-setup_local_ssh_key() {
-    echo -e "${YELLOW}开始生成 SSH 密钥并配置公钥登录...${RESET}"
-    
-    if [ "$IS_ALPINE" = true ]; then
-        apk add --no-cache openssh-client openssh-server >/dev/null 2>&1
-    fi
+    # ==================== Alpine + Systemd 双架构智能重启 ====================
+    echo -e "${CYAN}正在尝试重启 Caddy 服务...${RESET}"
 
-    mkdir -p /root/.ssh
-    chmod 700 /root/.ssh
-
-    read -p "请输入密钥保存路径（默认 /root/.ssh/id_ed25519）: " keypath
-    keypath=${keypath:-/root/.ssh/id_ed25519}
-
-    # 避免重复生成导致覆盖
-    if [ -f "$keypath" ]; then
-        read -p "密钥已存在，是否覆盖？(y/n): " overwrite
-        if [[ "$overwrite" != "y" ]]; then
-            echo -e "${YELLOW}已取消生成，使用原有密钥配置...${RESET}"
+    if [ -f /etc/alpine-release ] && command -v rc-service >/dev/null 2>&1; then
+        # 1. 优先适配 Alpine OpenRC 架构
+        echo -e "${CYAN}检测到 Alpine 环境，正在通过 OpenRC 管理器重启...${RESET}"
+        if rc-service caddy status 2>/dev/null | grep -q "started"; then
+            rc-service caddy restart
         else
-            ssh-keygen -t ed25519 -f "$keypath" -f ""
+            rc-service caddy start || true
+        fi
+        
+        # 针对脚本独立原生运行模式进行兼容复活
+        if pgrep -x caddy >/dev/null 2>&1; then
+            echo -e "${GREEN}Caddy 重启成功${RESET}"
+            send_tg "⚡ Caddy 已通过 OpenRC/原生 方式重启"
+        else
+            # 如果没有进程，尝试使用 caddy 命令直接拉起后台
+            killall -9 caddy >/dev/null 2>&1 || true
+            if caddy start --config "$CADDYFILE" >/dev/null 2>&1; then
+                echo -e "${GREEN}Caddy 独立原生拉起成功${RESET}"
+                send_tg "⚡ Caddy 已通过独立原生进程重启"
+            else
+                echo -e "${RED}Caddy 启动失败，请检查 Caddyfile 配置${RESET}"
+                send_tg "❌ Caddy 重启失败"
+            fi
+        fi
+
+    elif command -v systemctl >/dev/null 2>&1; then
+        # 2. 传统 Systemd 架构兜底
+        if systemctl list-unit-files | grep -q '^caddy.service'; then
+            systemctl daemon-reload
+            systemctl restart caddy
+
+            if systemctl is-active --quiet caddy; then
+                echo -e "${GREEN}Caddy 重启成功${RESET}"
+                send_tg "⚡ Caddy 已通过 systemd 重启"
+            else
+                echo -e "${RED}Caddy 启动失败，请检查日志${RESET}"
+                send_tg "❌ Caddy 重启失败"
+            fi
+        else
+            echo -e "${RED}未检测到 caddy.service${RESET}"
         fi
     else
-        ssh-keygen -t ed25519 -f "$keypath" -f ""
-    fi
-
-    if [ -f "${keypath}.pub" ]; then
-        cat "${keypath}.pub" >> /root/.ssh/authorized_keys
-        chmod 600 /root/.ssh/authorized_keys
-        
-        backup_config
-        sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/g' "$CONFIG"
-        
-        echo -e "${GREEN}✔ 密钥登录配置完成${RESET}"
-        echo "公钥路径: ${keypath}.pub"
-        echo "私钥路径: ${keypath}"
-        echo -e "\n${GREEN}================== 您的私钥内容 ==================${RESET}"
-        cat "$keypath"
-        echo -e "${GREEN}==================================================${RESET}"
-        echo -e "${YELLOW}请务必复制上方私钥并妥善保存！${RESET}"
-    else
-        echo -e "${RED}错误：密钥生成失败！${RESET}"
-    fi
-    restart_ssh
-    pause
-}
-
-#################################
-# 禁用 root 密码登录（极致安全加固）
-#################################
-disable_root_password() {
-    # 安全检查：如果没有设置公钥，警告用户
-    if [ ! -f "/root/.ssh/authorized_keys" ] || [ ! -s "/root/.ssh/authorized_keys" ]; then
-        echo -e "${RED}严重警告：检测到您还未设置任何公钥！${RESET}"
-        echo -e "${RED}此时禁用密码登录将导致您完全无法通过 SSH 连上这台服务器！${RESET}"
-        read -p $'\033[33m确定要继续吗？请输入(yes_i_know): \033[0m' extreme_confirm
-        if [[ "$extreme_confirm" != "yes_i_know" ]]; then
-            echo -e "${GREEN}已紧急取消操作，建议先设置公钥。${RESET}"
-            sleep 2
-            return
+        # 3. 无系统管理器时的原生冷启动兜底
+        echo -e "${YELLOW}未检测到系统服务管理器，正在执行独立二进制原生唤醒...${RESET}"
+        killall -9 caddy >/dev/null 2>&1 || true
+        if caddy start --config "$CADDYFILE" >/dev/null 2>&1; then
+            echo -e "${GREEN}Caddy 原生唤醒成功${RESET}"
+        else
+            echo -e "${RED}Caddy 唤醒失败${RESET}"
         fi
     fi
-
-    echo -e "${YELLOW}正在安全加固：禁用 root 密码登录...${RESET}"
-    backup_config
-
-    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/g' "$CONFIG"
-    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/g' "$CONFIG"
-
-    echo -e "${GREEN}✔ root 密码登录已禁用，现在仅允许公钥登录${RESET}"
-    restart_ssh
-    pause
 }
 
 #################################
-# 暂停提示
+# 设置 TG
 #################################
-pause() {
-    read -p $'\033[32m按回车继续...\033[0m'
+set_tg() {
+    read -p "服务名称: " SERVICE_NAME
+    read -p "TG BOT TOKEN: " TG_TOKEN
+    read -p "TG CHAT ID: " TG_CHAT_ID
+    save_config
+    echo -e "${GREEN}TG 已启用${RESET}"
+    send_tg "✅ TG 测试成功"
 }
 
 #################################
-# 主循环菜单
+# 设置定时任务（稳定版）
+#################################
+add_cron() {
+    echo -e "${CYAN}1 每天0点${RESET}"
+    echo -e "${CYAN}2 每周一0点${RESET}"
+    echo -e "${CYAN}3 每月1号${RESET}"
+    echo -e "${CYAN}4 自定义${RESET}"
+
+    read -p "选择: " t
+    case $t in
+        1) cron="0 0 * * *" ;;
+        2) cron="0 0 * * 1" ;;
+        3) cron="0 0 1 * *" ;;
+        4) read -p "cron表达式: " cron ;;
+        * ) return ;;
+    esac
+
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/caadybackup_cron 2>/dev/null
+    echo "$cron /usr/bin/env bash $INSTALL_DIR/caadybackup.sh auto >> $INSTALL_DIR/cron.log 2>&1 $CRON_TAG" >> /tmp/caadybackup_cron
+    crontab /tmp/caadybackup_cron
+    rm -f /tmp/caadybackup_cron
+    echo -e "${GREEN}定时任务已设置${RESET}"
+}
+
+#################################
+# 删除定时任务
+#################################
+remove_cron() {
+    if crontab -l 2>/dev/null | grep -q "$CRON_TAG"; then
+        crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/caadybackup_cron 2>/dev/null
+        crontab /tmp/caadybackup_cron
+        rm -f /tmp/caadybackup_cron
+        echo -e "${GREEN}定时任务已删除${RESET}"
+    else
+        echo -e "${YELLOW}未发现定时任务${RESET}"
+    fi
+}
+
+#################################
+# auto模式
+#################################
+if [[ "$1" == "auto" ]]; then
+    backup
+    exit 0
+fi
+
+#################################
+# 菜单
 #################################
 while true; do
     clear
-    get_each_ssh_status
+    echo -e "${CYAN}==== Caddy 备份系统 ====${RESET}"
+    echo -e "${GREEN}1. 立即备份${RESET}"
+    echo -e "${GREEN}2. 恢复备份${RESET}"
+    echo -e "${GREEN}3. 设置定时任务${RESET}"
+    echo -e "${GREEN}4. 删除定时任务${RESET}"
+    echo -e "${GREEN}5. 设置备份目录(当前: $DATA_DIR)${RESET}"
+    echo -e "${GREEN}6. 设置保留天数(当前: $RETAIN_DAYS 天)${RESET}"
+    echo -e "${GREEN}7. 设置Telegram通知${RESET}"
+    echo -e "${GREEN}8. 卸载${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
 
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       root 公钥登录管理         ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}当前状态 :${RESET} ${STATUS_FILE}"
-    echo -e "${GREEN}公钥登录 :${RESET} ${STATUS_PUBKEY}"
-    echo -e "${GREEN}密码登录 :${RESET} ${STATUS_ROOT}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1) 设置公钥登录${RESET}"
-    echo -e "${GREEN} 2) 管理公钥登录${RESET}"
-    echo -e "${GREEN} 3) 禁用root登录${RESET}"
-    echo -e "${GREEN} 4) 清除SSH公钥${RESET}"
-    echo -e "${GREEN} 0) 退出${RESET}"
-    read -p $'\033[32m 请选择: \033[0m' choice
-
-    case $choice in
-        1) setup_local_ssh_key ;; 
-        2) manage_key_menu ;; 
-        3) disable_root_password ;; 
-        4) clear_all_ssh_keys ;;
-        0) 
-            exit 0 
+    read -p "$(echo -e ${GREEN}选择: ${RESET})" c
+    case $c in
+        1) backup ;;
+        2) restore ;;
+        3) add_cron ;;
+        4) remove_cron ;;
+        5) read -p "新目录: " DATA_DIR; mkdir -p "$DATA_DIR"; save_config ;;
+        6) read -p "保留天数: " RETAIN_DAYS; save_config ;;
+        7) set_tg ;;
+        8)
+            echo -e "${YELLOW}正在卸载...${RESET}"
+            crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+            rm -rf "$INSTALL_DIR"
+            echo -e "${GREEN}卸载完成${RESET}"
+            exit 0
             ;;
-        *)
-            echo -e "${RED}输入错误，请重新选择${RESET}"
-            sleep 1
-            ;;
+        0) exit 0 ;;
     esac
+
+    read -p "$(echo -e ${GREEN}回车继续....${RESET})"
 done

@@ -1,197 +1,365 @@
-#!/bin/sh
-# OpenRC 自启动服务管理脚本 v2.9 (颜色控制彻底修复版)
-# 提示文字统一绿色，完美兼容多系统，解决 awk 颜色代码暴露及对齐错乱问题
+#!/bin/bash
+# ==================================================
+# VPS Geo Firewall (IPv4+IPv6)
+# Debian / Ubuntu / Alpine Linux (完美适配)
+# 独立链 / 端口控制 / 自动更新 / 白名单 / 卸载
+# ==================================================
 
-# ================== 颜色定义 ==================
-RED="\033[31m"
+CONF="/opt/geoip/geo.conf"
+UPDATE_SCRIPT="/opt/geoip/update_geo.sh"
+SCRIPT_PATH="/usr/local/bin/geofirewall"
+SCRIPT_URL=" https://raw.githubusercontent.com/iu683/uu/main/zz.sh"
+
 GREEN="\033[32m"
+RED="\033[31m"
 YELLOW="\033[33m"
-CYAN="\033[36m"
-BOLD="\033[1m"
+BLUE="\033[34m"
 RESET="\033[0m"
 
-# ================== 配置 ==================
-PAGE_SIZE=20   # 每页显示多少条
-CURRENT_PAGE=1
-TMP_MATRIX="/tmp/openrc_matrix.$$"
+green(){ echo -e "${GREEN}$1${RESET}"; }
+red(){ echo -e "${RED}$1${RESET}"; }
 
-# ================== 权限自动侦测 ==================
-SUDO=""
-if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
-    SUDO="sudo"
+[[ $(id -u) != 0 ]] && red "请使用 root 运行" && exit 1
+
+# 检测系统类型
+if [ -f /etc/alpine-release ]; then
+    SYS_TYPE="alpine"
+else
+    SYS_TYPE="debian"
 fi
 
-# ================== 用户输入关键词 ==================
-printf "${GREEN}请输入关键词过滤（默认显示所有服务）: ${RESET}"
-read -r KEYWORD
+# ================== 初始化环境 ==================
+init_env(){
+    mkdir -p /opt/geoip
+    touch $CONF
 
-# ================== 生成完整服务列表 (OpenRC 适配) ==================
-generate_full_list() {
-    rm -f "$TMP_MATRIX"
-    idx=1
-
-    for service_path in /etc/init.d/*; do
-        [ ! -f "$service_path" ] && continue
-        service=$(basename "$service_path")
-        
-        # 排除系统内置函数引导项
-        [ "$service" = "functions.sh" ] && continue
-
-        # 获取简短描述
-        desc=$(grep -E '^[[:space:]]*description=' "$service_path" | cut -d'"' -f2 | cut -d"'" -f2 | head -n 1)
-        [ -z "$desc" ] && desc="无描述信息"
-
-        # 关键词双向过滤
-        if [ -n "$KEYWORD" ]; then
-            if ! echo "$service" | grep -q "$KEYWORD" && ! echo "$desc" | grep -q "$KEYWORD"; then
-                continue
-            fi
-        fi
-
-        # 判定自启动状态 (只存纯文本，不包含任何颜色代码)
-        if rc-update show 2>/dev/null | grep -Eq "^[[:space:]]*$service[[:space:]]*\|"; then
-            run_levels=$(rc-update show 2>/dev/null | grep "^[[:space:]]*$service[[:space:]]*|" | awk -F'|' '{print $2}' | xargs)
-            state="enabled(${run_levels})"
+    if [[ ! -f /opt/geoip/.deps_installed ]]; then
+        if [ "$SYS_TYPE" = "alpine" ]; then
+            apk update
+            apk add ipset iptables ip6tables curl bash ipset-openrc iptables-openrc
+            rc-update add iptables default 2>/dev/null
+            rc-update add ip6tables default 2>/dev/null
+            rc-service iptables start 2>/dev/null
+            rc-service ip6tables start 2>/dev/null
         else
-            state="disabled"
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y ipset iptables curl iptables-persistent netfilter-persistent
         fi
+        touch /opt/geoip/.deps_installed
+        green "依赖安装完成"
+    fi
+}
 
-        # 判定当前活跃状态 (只存纯文本)
-        if rc-service "$service" status 2>/dev/null | grep -q "status: started"; then
-            act_status="started"
-        else
-            act_status="stopped"
-        fi
+# ================== 下载或更新脚本 ==================
+download_script(){
+    mkdir -p "$(dirname "$SCRIPT_PATH")"
+    curl -sSL "$SCRIPT_URL" -o "$SCRIPT_PATH"
+    chmod +x "$SCRIPT_PATH"
+    green "已更新"
+}
 
-        # 将干净的数据写入文件矩阵，使用冒号分割
-        echo "${idx}:${service}:${state}:${act_status}:${desc}" >> "$TMP_MATRIX"
-        idx=$((idx + 1))
+# ================== 获取信息 (兼容 Alpine) ==================
+get_my_ip(){ 
+    ip route get 1.1.1.1 2>/dev/null | awk '{print $7}' | head -n1
+}
+
+get_ssh_port(){
+    grep -i "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1
+}
+
+# ================== 规则持久化保存函数 ==================
+save_rules(){
+    if [ "$SYS_TYPE" = "alpine" ]; then
+        /etc/init.d/iptables save >/dev/null 2>&1
+        /etc/init.d/ip6tables save >/dev/null 2>&1
+    else
+        netfilter-persistent save >/dev/null 2>&1
+    fi
+}
+
+# ================== 自动更新IP库 ==================
+install_auto_update(){
+cat > $UPDATE_SCRIPT <<EOF
+#!/bin/bash
+CONF="/opt/geoip/geo.conf"
+source \$CONF 2>/dev/null
+[[ -z "\$COUNTRY" ]] && exit 0
+CC_L=\$(echo \$COUNTRY | tr A-Z a-z)
+curl -s -o /opt/geoip/\${CC_L}.zone https://www.ipdeny.com/ipblocks/data/countries/\${CC_L}.zone
+curl -s -o /opt/geoip/\${CC_L}.ipv6.zone https://www.ipdeny.com/ipv6/ipaddresses/aggregated/\${CC_L}-aggregated.zone
+EOF
+
+    chmod +x $UPDATE_SCRIPT
+    (crontab -l 2>/dev/null | grep -v update_geo.sh; echo "0 3 * * * /bin/bash $UPDATE_SCRIPT") | crontab -
+    green "每日 03:00 自动更新IP库"
+}
+
+# ================== 原子更新 ipset ==================
+update_ipset(){
+    local SET_NAME=$1
+    local FILE=$2
+    local FAMILY=$3
+
+    [[ ! -s "$FILE" ]] && { red "IP库文件为空 $SET_NAME"; return 1; }
+
+    ipset create $SET_NAME hash:net family $FAMILY -exist
+    ipset create ${SET_NAME}_tmp hash:net family $FAMILY -exist
+    ipset flush ${SET_NAME}_tmp
+
+    while read -r ip; do
+        [[ -n "$ip" ]] && ipset add ${SET_NAME}_tmp "$ip" 2>/dev/null
+    done < "$FILE"
+
+    ipset swap ${SET_NAME}_tmp $SET_NAME
+    ipset destroy ${SET_NAME}_tmp
+    return 0
+}
+
+# ================== 应用规则 ==================
+apply_rules(){
+    source $CONF 2>/dev/null
+    [[ -z "$COUNTRY" ]] && { red "未配置规则"; return; }
+
+    SSH_PORT=$(get_ssh_port)
+    [[ -z "$SSH_PORT" ]] && SSH_PORT=22
+    green "默认放行SSH端口: $SSH_PORT"
+
+    # 创建 GEO_CHAIN 链
+    iptables -N GEO_CHAIN 2>/dev/null
+    ip6tables -N GEO_CHAIN 2>/dev/null
+    iptables -F GEO_CHAIN
+    ip6tables -F GEO_CHAIN
+
+    # INPUT 链跳转
+    iptables -C INPUT -j GEO_CHAIN 2>/dev/null || iptables -I INPUT -j GEO_CHAIN
+    ip6tables -C INPUT -j GEO_CHAIN 2>/dev/null || ip6tables -I INPUT -j GEO_CHAIN
+
+    # 基础规则
+    iptables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    ip6tables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    MYIP=$(get_my_ip)
+    [[ -n "$MYIP" ]] && iptables -A GEO_CHAIN -s $MYIP -j ACCEPT
+
+    iptables -A GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
+    ip6tables -A GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
+
+    # 白名单
+    for ip in $WHITELIST; do
+        [[ -n "$ip" ]] && {
+            iptables -I GEO_CHAIN 2 -s $ip -j ACCEPT
+            ip6tables -I GEO_CHAIN 2 -s $ip -j ACCEPT
+        }
     done
-}
 
-# ================== 刷新并显示某一页 ==================
-refresh_list() {
-    clear
-    if [ ! -s "$TMP_MATRIX" ]; then
-        TOTAL_COUNT=0
-        TOTAL_PAGES=1
-    else
-        TOTAL_COUNT=$(wc -l < "$TMP_MATRIX")
-        TOTAL_PAGES=$(( (TOTAL_COUNT + PAGE_SIZE - 1) / PAGE_SIZE ))
-    fi
+    CC_L=$(echo $COUNTRY | tr A-Z a-z)
+    V4FILE="/opt/geoip/${CC_L}.zone"
+    V6FILE="/opt/geoip/${CC_L}.ipv6.zone"
 
-    echo -e "${BOLD}${CYAN}=== OpenRC 服务列表（第 $CURRENT_PAGE 页 / 共 ${TOTAL_PAGES} 页，总计 ${TOTAL_COUNT} 个服务） ===${RESET}"
-    printf "${BOLD}%-5s %-25s %-20s %-15s %s${RESET}\n" "No." "SERVICE" "AUTO-START" "STATUS" "DESCRIPTION"
-    echo "--------------------------------------------------------------------------------------------------------"
+    curl -s -o $V4FILE https://www.ipdeny.com/ipblocks/data/countries/$CC_L.zone
+    curl -s -o $V6FILE https://www.ipdeny.com/ipv6/ipaddresses/aggregated/$CC_L-aggregated.zone
 
-    if [ "$TOTAL_COUNT" -gt 0 ]; then
-        start_line=$(( (CURRENT_PAGE - 1) * PAGE_SIZE + 1 ))
-        end_line=$(( CURRENT_PAGE * PAGE_SIZE ))
+    update_ipset geo_v4 $V4FILE inet
+    update_ipset geo_v6 $V6FILE inet6
 
-        # 由 awk 统一在渲染时现场加颜色，这样完全不会影响长格式对齐，也不会暴露转义符
-        sed -n "${start_line},${end_line}p" "$TMP_MATRIX" | awk -F':' -v r="$RED" -v g="$GREEN" -v y="$YELLOW" -v rst="$RESET" '
-        {
-            no=$1; service=$2; state=$3; act_status=$4; desc=$5;
-
-            # 现场计算自启动颜色
-            if (state ~ /enabled/) {
-                state_fmt = g state rst
-            } else {
-                state_fmt = y state rst
-            }
-
-            # 现场计算运行状态颜色
-            if (act_status == "started") {
-                act_fmt = g act_status rst
-            } else {
-                act_fmt = r act_status rst
-            }
-
-            # 极速且格式完美的渲染输出
-            printf "%-5s %-25s %-31s %-26s %s\n", no, service, state_fmt, act_fmt, desc
-        }'
-    else
-        echo -e "       ${YELLOW}没有找到匹配的服务${RESET}"
-    fi
-}
-
-# ================== 初始化 ==================
-generate_full_list
-refresh_list
-
-# ================== 用户选择操作 ==================
-while true; do
-    echo
-    printf "${GREEN}输入序号看详情，s 序号停用+禁用，r 刷新，n 下一页，p 上一页，0 退出: ${RESET}"
-    read -r INPUT
-
-    if [ "$INPUT" = "0" ] || [ -z "$INPUT" ]; then
-        break
-
-    elif [ "$INPUT" = "r" ]; then
-        generate_full_list
-        refresh_list
-
-    elif [ "$INPUT" = "n" ]; then
-        TOTAL_COUNT=$(wc -l < "$TMP_MATRIX" 2>/dev/null || echo 0)
-        max_page=$(( (TOTAL_COUNT + PAGE_SIZE - 1) / PAGE_SIZE ))
-        if [ "$CURRENT_PAGE" -lt "$max_page" ]; then
-            CURRENT_PAGE=$((CURRENT_PAGE + 1))
-        fi
-        refresh_list
-
-    elif [ "$INPUT" = "p" ]; then
-        if [ "$CURRENT_PAGE" -gt 1 ]; then
-            CURRENT_PAGE=$((CURRENT_PAGE - 1))
-        fi
-        refresh_list
-
-    # 匹配输入形式如 "s 3" 或 "s 3 4 5" 停止并禁用
-    elif echo "$INPUT" | grep -Eq "^s[[:space:]]*[0-9 ]+$"; then
-        NUMS=$(echo "$INPUT" | sed 's/^s[[:space:]]*//')
-        for num in $NUMS; do
-            line_data=$(grep -E "^${num}:" "$TMP_MATRIX" 2>/dev/null)
-            if [ -n "$line_data" ]; then
-                service=$(echo "$line_data" | cut -d':' -f2)
-                
-                echo -e "\n${CYAN}正在处理服务: $service ...${RESET}"
-                # 1. 停止服务
-                $SUDO rc-service "$service" stop
-                
-                # 2. 禁用自启动
-                if rc-update show | grep -q "$service"; then
-                    if $SUDO rc-update del "$service" >/dev/null 2>&1; then
-                        echo -e "${RED}[已禁用自启] $service${RESET}"
-                    else
-                        echo -e "${YELLOW}[禁用自启失败] $service${RESET}"
-                    fi
-                fi
+    # 封锁/允许规则
+    for proto in tcp udp; do
+        if [[ "$MODE" == "block" ]]; then
+            if [[ "$PORTS" == "all" ]]; then
+                iptables -A GEO_CHAIN -p $proto -m set --match-set geo_v4 src -j DROP
+                ip6tables -A GEO_CHAIN -p $proto -m set --match-set geo_v6 src -j DROP
             else
-                echo -e "${YELLOW}无效序号: $num${RESET}"
+                for p in $PORTS; do
+                    iptables -A GEO_CHAIN -p $proto --dport $p -m set --match-set geo_v4 src -j DROP
+                    ip6tables -A GEO_CHAIN -p $proto --dport $p -m set --match-set geo_v6 src -j DROP
+                done
             fi
-        done
-        generate_full_list
-        refresh_list
-
-    # 纯数字：查看服务状态详情
-    elif echo "$INPUT" | grep -Eq "^[0-9]+$"; then
-        line_data=$(grep -E "^${INPUT}:" "$TMP_MATRIX" 2>/dev/null)
-        if [ -n "$line_data" ]; then
-            service=$(echo "$line_data" | cut -d':' -f2)
-            echo -e "\n${CYAN}=== $service 详细运行状态 ===${RESET}"
-            
-            rc-service "$service" status
-            
-            echo -e "\n${YELLOW}按回车返回菜单...${RESET}"
-            read -r _
-            refresh_list
         else
-            echo -e "${YELLOW}无效序号: $INPUT${RESET}"
+            if [[ "$PORTS" == "all" ]]; then
+                iptables -A GEO_CHAIN -p $proto -m set ! --match-set geo_v4 src -j DROP
+                ip6tables -A GEO_CHAIN -p $proto -m set ! --match-set geo_v6 src -j DROP
+            else
+                for p in $PORTS; do
+                    iptables -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set geo_v4 src -j DROP
+                    ip6tables -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set geo_v6 src -j DROP
+                done
+            fi
         fi
-    else
-        echo -e "${YELLOW}无效输入，请重新输入${RESET}"
-    fi
-done
+    done
 
-# 清理痕迹
-rm -f "$TMP_MATRIX"
+    save_rules
+    green "规则已成功应用并持久化保存"
+}
+
+# ================== 添加规则 ==================
+add_rule(){
+    echo -e "${GREEN}选择模式:${RESET}"
+    echo -e "${GREEN}1 封锁某国某端口${RESET}"
+    echo -e "${GREEN}2 封锁某国所有端口${RESET}"
+    echo -e "${GREEN}3 只允许某国某端口${RESET}"
+    echo -e "${GREEN}4 只允许某国访问整个服务器${RESET}"
+    read -p $'\033[32m选择模式(1-4): \033[0m' choice
+
+    case "$choice" in
+        1)
+            MODE="block"
+            read -p $'\033[32m国家代码(例如 cn us jp): \033[0m' COUNTRY
+            read -p $'\033[32m端口 (多个空格): \033[0m' PORTS
+            ;;
+        2)
+            MODE="block"
+            read -p $'\033[32m国家代码(例如 cn us jp): \033[0m' COUNTRY
+            PORTS="all"
+            ;;
+        3)
+            MODE="allow"
+            read -p $'\033[32m国家代码(例如 cn us jp): \033[0m' COUNTRY
+            read -p $'\033[32m端口(例如 443 80 多个空格): \033[0m' PORTS
+            ;;
+        4)
+            MODE="allow"
+            read -p $'\033[32m国家代码(例如 cn us jp): \033[0m' COUNTRY
+            PORTS="all"
+            ;;
+        *)
+            red "无效选择"
+            return
+            ;;
+    esac
+
+    echo "MODE=\"$MODE\"" > $CONF
+    echo "COUNTRY=\"$COUNTRY\"" >> $CONF
+    echo "PORTS=\"$PORTS\"" >> $CONF
+    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
+
+    install_auto_update
+    apply_rules
+}
+
+# ================== 白名单 ==================
+add_whitelist(){
+    read -p $'\033[32m输入白名单 IP (多个空格): \033[0m' ips
+    source $CONF 2>/dev/null
+    WHITELIST="$WHITELIST $ips"
+    echo "MODE=\"$MODE\"" > $CONF
+    echo "COUNTRY=\"$COUNTRY\"" >> $CONF
+    echo "PORTS=\"$PORTS\"" >> $CONF
+    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
+    apply_rules
+}
+
+delete_whitelist(){
+    read -p $'\033[32m输入要删除的白名单 IP (多个空格): \033[0m' ips
+    source $CONF 2>/dev/null
+    for ip in $ips; do
+        WHITELIST=$(echo $WHITELIST | sed "s/\b$ip\b//g")
+    done
+    echo "MODE=\"$MODE\"" > $CONF
+    echo "COUNTRY=\"$COUNTRY\"" >> $CONF
+    echo "PORTS=\"$PORTS\"" >> $CONF
+    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
+    apply_rules
+}
+
+# ================== 删除端口规则 ==================
+delete_rules(){
+    source $CONF 2>/dev/null
+    [[ -z "$PORTS" ]] && { red "未检测到配置"; return; }
+    read -p $'\033[32m输入要删除的端口 (多个空格): \033[0m' DEL_PORTS
+    [[ -z "$DEL_PORTS" ]] && { red "未输入端口"; return; }
+    for p in $DEL_PORTS; do
+        for proto in tcp udp; do
+            iptables -L GEO_CHAIN --line-numbers -n | grep "$proto" | grep "dpt:$p" | awk '{print $1}' | sort -rn | while read num; do
+                iptables -D GEO_CHAIN $num
+            done
+            ip6tables -L GEO_CHAIN --line-numbers -n | grep "$proto" | grep "dpt:$p" | awk '{print $1}' | sort -rn | while read num; do
+                ip6tables -D GEO_CHAIN $num
+            done
+        done
+        green "端口 $p 规则已删除"
+    done
+    save_rules
+}
+
+# ================== 查看规则 ==================
+view_rules(){
+    clear
+    green "========= 当前配置 ========="
+    cat $CONF 2>/dev/null
+    echo
+    iptables -L GEO_CHAIN -n --line-numbers 2>/dev/null
+    echo
+    ip6tables -L GEO_CHAIN -n --line-numbers 2>/dev/null
+    echo
+    ipset list | grep "^Name:"
+}
+
+# ================== 卸载 ==================
+uninstall_all(){
+    green "正在卸载"
+    iptables -D INPUT -j GEO_CHAIN 2>/dev/null
+    ip6tables -D INPUT -j GEO_CHAIN 2>/dev/null
+    iptables -F GEO_CHAIN 2>/dev/null
+    ip6tables -F GEO_CHAIN 2>/dev/null
+    iptables -X GEO_CHAIN 2>/dev/null
+    ip6tables -X GEO_CHAIN 2>/dev/null
+    ipset list | grep "^Name: geo_" | awk '{print $2}' | xargs -r -I {} ipset destroy {}
+    rm -rf /opt/geoip
+    crontab -l 2>/dev/null | grep -v update_geo.sh | crontab -
+    rm -f $SCRIPT_PATH
+    save_rules
+    green "已彻底卸载完成"
+    exit 0
+}
+
+# ================== 菜单 (已加入动态配置显示) ==================
+menu(){
+    clear
+    # 读取最新配置
+    local v_mode="未配置"
+    local v_country="无"
+    local v_ports="无"
+    if [ -f "$CONF" ]; then
+        source $CONF 2>/dev/null
+        [ "$MODE" == "block" ] && v_mode="${RED}仅封锁${RESET}"
+        [ "$MODE" == "allow" ] && v_mode="${GREEN}仅放行${RESET}"
+        [ -n "$COUNTRY" ] && v_country=$(echo "$COUNTRY" | tr 'a-z' 'A-Z')
+        [ -n "$PORTS" ] && v_ports="$PORTS"
+    fi
+
+    echo -e "${GREEN}=========================${RESET}"
+    echo -e "${GREEN}  ◈   VPS国家防火墙   ◈  ${RESET}"
+    echo -e "${GREEN}=========================${RESET}"
+    echo -e "${GREEN}当前模式: ${v_mode}"
+    echo -e "${GREEN}目标国家: ${YELLOW}${v_country}${RESET}"
+    echo -e "${GREEN}受控端口: ${YELLOW}${v_ports}${RESET}"
+    echo -e "${GREEN}=========================${RESET}"
+    echo -e "${GREEN}1 添加规则${RESET}"
+    echo -e "${GREEN}2 删除端口规则${RESET}"
+    echo -e "${GREEN}3 查看规则详情${RESET}"
+    echo -e "${GREEN}4 添加白名单${RESET}"
+    echo -e "${GREEN}5 删除白名单${RESET}"
+    echo -e "${GREEN}6 更新${RESET}"
+    echo -e "${GREEN}7 卸载${RESET}"
+    echo -e "${GREEN}0 退出${RESET}"
+    echo -e "${GREEN}=========================${RESET}"
+    read -r -p $'\033[32m请选择: \033[0m' num
+    case $num in
+        1) add_rule ;;
+        2) delete_rules ;;
+        3) view_rules ;;
+        4) add_whitelist ;;
+        5) delete_whitelist ;;
+        6) download_script ;;
+        7) uninstall_all ;;
+        0) exit ;;
+    esac
+}
+
+# ================== 主循环 ==================
+init_env
+while true; do
+    menu
+    read -r -p $'\033[32m按回车继续...\033[0m'
+done

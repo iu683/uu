@@ -1,145 +1,177 @@
-#!/bin/sh
-# =================================================
-# VPS 一键解压工具 Pro（全系统完美兼容版）
-# 支持 Debian / Ubuntu / CentOS / Rocky / Alma / Fedora / Arch / Alpine
-# =================================================
-
-set -e
+#!/bin/bash
 
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
-BLUE="\033[36m"
 RESET="\033[0m"
 
-echo -e "${GREEN}====== VPS 解压工具 ======${RESET}"
+CONFIG="/etc/ssh/sshd_config"
+BACKUP="/etc/ssh/sshd_config.bak"
 
-# 必须 root
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}请使用 root 运行此脚本！${RESET}"
-    exit 1
-fi
+SET_KEY_URL="https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/secretkey.sh"
 
-# ===============================
-# 自动识别包管理器 (已加入 Alpine 支持)
-# ===============================
-detect_pm() {
-    if command -v apk >/dev/null 2>&1; then
-        PM="apk"
-        INSTALL="apk add --no-cache"
-        UPDATE="true" # Alpine 安装时带 --no-cache 不需要单独 update
-    elif command -v apt-get >/dev/null 2>&1; then
-        PM="apt-get"
-        INSTALL="apt-get install -y"
-        UPDATE="apt-get update -y"
-    elif command -v dnf >/dev/null 2>&1; then
-        PM="dnf"
-        INSTALL="dnf install -y"
-        UPDATE="dnf makecache"
-    elif command -v yum >/dev/null 2>&1; then
-        PM="yum"
-        INSTALL="yum install -y"
-        UPDATE="yum makecache"
-    elif command -v pacman >/dev/null 2>&1; then
-        PM="pacman"
-        INSTALL="pacman -Sy --noconfirm"
-        UPDATE="pacman -Sy"
+#################################
+# SSH 服务重启与备份
+#################################
+restart_ssh() {
+    if command -v systemctl &>/dev/null; then
+        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
     else
-        echo -e "${RED}❌ 不支持的系统，未找到包管理器${RESET}"
-        exit 1
+        service ssh restart 2>/dev/null || service sshd restart 2>/dev/null
+    fi
+    echo -e "${GREEN}✔ SSH 已重启生效${RESET}"
+}
+
+backup_config() {
+    cp "$CONFIG" "$BACKUP" 2>/dev/null
+    echo -e "${YELLOW}已备份 → $BACKUP${RESET}"
+}
+
+#################################
+# 分离获取 3 个核心状态
+#################################
+get_each_ssh_status() {
+    # ---- 1. 检测公钥文件状态 ----
+    if [ -f "/root/.ssh/authorized_keys" ] && [ -s "/root/.ssh/authorized_keys" ]; then
+        local count=$(wc -l < /root/.ssh/authorized_keys)
+        STATUS_FILE="${GREEN}[正常] (共 ${count} 个公钥)${RESET}"
+    else
+        STATUS_FILE="${RED}[未设置] (文件不存在或为空)${RESET}"
+    fi
+
+    # 获取 SSH 实际生效配置
+    local sshd_vars=$(sshd -T 2>/dev/null)
+    if [ -z "$sshd_vars" ]; then
+        sshd_vars=$(cat /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null)
+    fi
+
+    local pubkey_status=$(echo "$sshd_vars" | grep -i "^pubkeyauthentication" | awk '{print $2}' | tr 'A-Z' 'a-z' | head -n 1)
+    local root_login_status=$(echo "$sshd_vars" | grep -i "^permitrootlogin" | awk '{print $2}' | tr 'A-Z' 'a-z' | head -n 1)
+
+    # ---- 2. 检测公钥总开关状态 ----
+    if [[ "$pubkey_status" == "no" ]]; then
+        STATUS_PUBKEY="${RED}[已禁用] (PubkeyAuthentication=no)${RESET}"
+    else
+        STATUS_PUBKEY="${GREEN}[已开启] (PubkeyAuthentication=yes)${RESET}"
+    fi
+
+    # ---- 3. 检测 Root 登录状态 ----
+    if [[ "$root_login_status" == "no" || "$root_login_status" == "forced-commands-only" ]]; then
+        STATUS_ROOT="${RED}[已禁用] (PermitRootLogin=no)${RESET}"
+    else
+        STATUS_ROOT="${GREEN}[已开启] (${root_login_status})${RESET}"
     fi
 }
 
-# 智能安装函数
-install_pkg() {
-    local cmd_name="$1"
-    local pkg_name="$2"
-    
-    # 如果没指定包名，默认包名和命令名一致
-    [ -z "$pkg_name" ] && pkg_name="$cmd_name"
+#################################
+# 选项 2 的管理公钥登录（子菜单）
+#################################
+manage_key_menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}======管理公钥登录配置======${RESET}"
+        echo -e "${GREEN} 1.开启 公钥+密码登录 (推荐)${RESET}"
+        echo -e "${GREEN} 2.切换为仅密码登录(关闭公钥)${RESET}"
+        echo -e "${GREEN} 0. 返回主菜单${RESET}"
+        read -p $'\033[32m 请选择: \033[0m' sub_choice
 
-    if ! command -v "$cmd_name" >/dev/null 2>&1; then
-        echo -e "${YELLOW}⚙️ $cmd_name 未安装，正在通过 $PM 安装包 $pkg_name ...${RESET}"
-        $UPDATE >/dev/null 2>&1 || true
-        $INSTALL "$pkg_name"
-    fi
+        case $sub_choice in
+            1)
+                backup_config
+                sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$CONFIG"
+                sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$CONFIG"
+                echo -e "${GREEN}✔ 公钥 + 密码登录已开启${RESET}"
+                restart_ssh
+                pause
+                ;;
+            2)
+                backup_config
+                sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication no/' "$CONFIG"
+                sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$CONFIG"
+                echo -e "${YELLOW}✔ 已关闭公钥，仅密码登录${RESET}"
+                restart_ssh
+                pause
+                ;;
+            0)
+                return
+                ;;
+            *)
+                echo -e "${RED}输入错误，请重新选择${RESET}"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
-detect_pm
+#################################
+# 执行远程脚本 (用于选项1)
+#################################
+run_script() {
+    local url=$1
+    local name=$2
 
-# 交互输入文件路径
-echo -ne "${GREEN}请输入要解压的文件路径：${RESET}"
-read -r FILE
+    echo -e "${GREEN}正在执行：${name}${RESET}"
+    bash <(curl -fsSL "$url")
+    pause
+}
 
-# 修复：改用 POSIX 标准语法检测文件是否存在，防止 Alpine 下 sh 环境闪退
-if [ ! -f "$FILE" ]; then
-    echo -e "${RED}❌ 文件不存在！退出${RESET}"
-    exit 1
-fi
+#################################
+# 一键清除 SSH 密钥
+#################################
+clear_all_ssh_keys() {
+    echo -e "${RED}警告：此操作将删除所有用户 SSH 密钥！${RESET}"
+    read -p $'\033[33m确认清除请输入(y): \033[0m' confirm
 
-# 交互输入目标路径
-echo -ne "请输入解压到的目标目录（默认当前目录 [ $(pwd) ]）："
-read -r DEST
-DEST=${DEST:-$(pwd)}
+    if [[ "$confirm" != "y" ]]; then
+        echo -e "${GREEN}已取消操作${RESET}"
+        sleep 1
+        return
+    fi
 
-mkdir -p "$DEST"
+    echo -e "${GREEN}正在清理 SSH 密钥...${RESET}"
+    rm -rf /root/.ssh /home/*/.ssh 2>/dev/null
+    restart_ssh
+    echo -e "${GREEN}SSH 密钥已全部清理完成${RESET}"
+    pause
+}
 
-FILENAME=$(basename "$FILE")
-LOWER_NAME=$(echo "$FILENAME" | tr '[:upper:]' '[:lower:]')
+#################################
+# 暂停提示
+#################################
+pause() {
+    read -p $'\033[32m按回车继续...\033[0m'
+}
 
-echo -e "${BLUE}🔍 正在识别文件类型...${RESET}"
+#################################
+# 主循环菜单
+#################################
+while true; do
+    clear
+    get_each_ssh_status
 
-case "$LOWER_NAME" in
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}     root 公钥登录管理          ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}当前状态 :${RESET} ${STATUS_LABEL}"
+    echo -e "${GREEN}公钥登录 :${RESET} ${STATUS_PUBKEY}"
+    echo -e "${GREEN}密码登录 :${RESET} ${STATUS_LABEL}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN} 1) 设置公钥登录${RESET}"
+    echo -e "${GREEN} 2) 管理公钥登录${RESET}"
+    echo -e "${GREEN} 3) 清除所有SSH密钥${RESET}"
+    echo -e "${GREEN} 0) 退出${RESET}"
+    read -p $'\033[32m 请选择: \033[0m' choice
 
-    *.zip)
-        install_pkg unzip
-        echo -e "${GREEN}📦 正在解压 ZIP 文件...${RESET}"
-        unzip -o "$FILE" -d "$DEST"
-        ;;
-
-    *.tar)
-        echo -e "${GREEN}📦 正在解压 TAR 文件...${RESET}"
-        tar -xvf "$FILE" -C "$DEST"
-        ;;
-
-    *.tar.gz|*.tgz)
-        echo -e "${GREEN}📦 正在解压 TAR.GZ 文件...${RESET}"
-        tar -xvzf "$FILE" -C "$DEST"
-        ;;
-
-    *.tar.bz2)
-        echo -e "${GREEN}📦 正在解压 TAR.BZ2 文件...${RESET}"
-        tar -xvjf "$FILE" -C "$DEST"
-        ;;
-
-    *.tar.xz)
-        echo -e "${GREEN}📦 正在解压 TAR.XZ 文件...${RESET}"
-        tar -xvJf "$FILE" -C "$DEST"
-        ;;
-
-    *.rar)
-        install_pkg unrar
-        echo -e "${GREEN}📦 正在解压 RAR 文件...${RESET}"
-        unrar x -o+ "$FILE" "$DEST"
-        ;;
-
-    *.7z)
-        # 针对不同包管理器的 7z 命名规则做智能转换
-        if [ "$PM" = "apk" ]; then
-            install_pkg 7z p7zip
-        elif [ "$PM" = "apt-get" ]; then
-            install_pkg 7z p7zip-full
-        else
-            install_pkg 7z p7zip
-        fi
-        echo -e "${GREEN}📦 正在解压 7Z 文件...${RESET}"
-        7z x "$FILE" -o"$DEST" -y
-        ;;
-
-    *)
-        echo -e "${RED}❌ 不支持的压缩格式: $FILENAME${RESET}"
-        exit 1
-        ;;
-esac
-
-echo -e "${GREEN}✅ 解压完成！文件已放到: $DEST${RESET}"
+    case $choice in
+        1) run_script "$SET_KEY_URL" "设置公钥登录" ;;
+        2) manage_key_menu ;; 
+        3) clear_all_ssh_keys ;;
+        0) 
+            exit 0 
+            ;;
+        *)
+            echo -e "${RED}输入错误，请重新选择${RESET}"
+            sleep 1
+            ;;
+    esac
+done

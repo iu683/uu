@@ -1,296 +1,256 @@
-#!/bin/sh
-# =========================================================================
-#       ◈ 多系统通用运维工具箱一键部署面板 (POSIX Shell 完美兼容版)
-# =========================================================================
-
-# 权限校验
-if [ "$(id -u)" -ne 0 ]; then
-    echo "\033[31m❌ 错误：请使用 root 权限或 sudo 运行此脚本！\033[0m"
-    exit 1
-fi
+#!/bin/bash
 
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-# ================== 精准系统检测 ==================
-detect_os() {
-    if [ -f /etc/os-release ]; then
-        os_name=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+CONFIG="/etc/ssh/sshd_config"
+BACKUP="/etc/ssh/sshd_config.bak"
+
+
+
+# 判断是否为 Alpine 系统
+IS_ALPINE=false
+if [ -f /etc/alpine-release ]; then
+    IS_ALPINE=true
+fi
+
+
+#################################
+# SSH 服务重启与备份
+#################################
+restart_ssh() {
+    if [ "$IS_ALPINE" = true ]; then
+        rc-service sshd restart 2>/dev/null
     else
-        os_name="unknown"
+        if command -v systemctl &>/dev/null; then
+            systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
+        else
+            service ssh restart 2>/dev/null || service sshd restart 2>/dev/null
+        fi
     fi
-    
-    # 规范化家族名称
-    case "$os_name" in
-        fedora|rocky|alma|centos) os_family="rhel" ;;
-        ubuntu|debian|kali|linuxmint) os_family="debian" ;;
-        alpine) os_family="alpine" ;;
-        amzn) os_family="amazon" ;;
-        *) os_family="unknown" ;;
-    esac
+    echo -e "${GREEN}✔ SSH 已重启生效${RESET}"
 }
 
-# ================== 核心通用安装引擎 ==================
-install_tool_core() {
-    local tool="$1"
-    local sys_mode="$2"
-    
-    echo -e "${YELLOW}⚙️ 正在为您在 ${os_name} 系统上配置 ${tool} ...${RESET}"
-    
-    # 针对特定系统工具做特殊分支处理
-    if [ "$sys_mode" = "sys" ]; then
-        case "$os_family" in
-            rhel)
-                yum install epel-release -y >/dev/null 2>&1
-                yum install -y "$tool"
-                return $?
+backup_config() {
+    cp "$CONFIG" "$BACKUP" 2>/dev/null
+    echo -e "${YELLOW}已备份 → $BACKUP${RESET}"
+}
+
+
+#################################
+# 分离获取 3 个核心状态
+#################################
+get_each_ssh_status() {
+    # ---- 1. 检测公钥文件状态 ----
+    if [ -f "/root/.ssh/authorized_keys" ] && [ -s "/root/.ssh/authorized_keys" ]; then
+        local count=$(wc -l < /root/.ssh/authorized_keys)
+        STATUS_FILE="${YELLOW}[正常] ( ${count} 个公钥)${RESET}"
+    else
+        STATUS_FILE="${RED}[未设置] (文件不存在或为空)${RESET}"
+    fi
+
+    # 获取 SSH 实际生效配置
+    local sshd_vars=$(sshd -T 2>/dev/null)
+    if [ -z "$sshd_vars" ]; then
+        sshd_vars=$(cat /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null)
+    fi
+
+    local pubkey_status=$(echo "$sshd_vars" | grep -i "^pubkeyauthentication" | awk '{print $2}' | tr 'A-Z' 'a-z' | head -n 1)
+    local root_login_status=$(echo "$sshd_vars" | grep -i "^permitrootlogin" | awk '{print $2}' | tr 'A-Z' 'a-z' | head -n 1)
+
+    # ---- 2. 检测公钥总开关状态 ----
+    if [[ "$pubkey_status" == "no" ]]; then
+        STATUS_PUBKEY="${RED}[已禁用]${RESET}"
+    else
+        STATUS_PUBKEY="${YELLOW}[已开启]${RESET}"
+    fi
+
+    # ---- 3. 检测 Root 登录状态 ----
+    if [[ "$root_login_status" == "no" || "$root_login_status" == "forced-commands-only" ]]; then
+        STATUS_ROOT="${RED}[已禁用]${RESET}"
+    else
+        STATUS_ROOT="${YELLOW}[已开启]${RESET}"
+    fi
+}
+
+#################################
+# 选项 2 的管理公钥登录（子菜单）
+#################################
+manage_key_menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}======管理公钥登录配置======${RESET}"
+        echo -e "${GREEN} 1.开启 公钥+密码登录 (推荐)${RESET}"
+        echo -e "${GREEN} 2.切换为仅密码登录(关闭公钥)${RESET}"
+        echo -e "${GREEN} 0. 返回主菜单${RESET}"
+        read -p $'\033[32m 请选择: \033[0m' sub_choice
+
+        case $sub_choice in
+            1)
+                backup_config
+                sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$CONFIG"
+                sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$CONFIG"
+                echo -e "${GREEN}✔ 公钥 + 密码登录已开启${RESET}"
+                restart_ssh
+                pause
                 ;;
-            amazon)
-                amazon-linux-extras install epel -y >/dev/null 2>&1 || yum install epel-release -y >/dev/null 2>&1
-                yum install -y "$tool"
-                return $?
+            2)
+                backup_config
+                sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication no/' "$CONFIG"
+                sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$CONFIG"
+                echo -e "${YELLOW}✔ 已关闭公钥，仅密码登录${RESET}"
+                restart_ssh
+                pause
                 ;;
-            debian)
-                if [ "$tool" = "mtr" ]; then
-                    apt-get update -y && apt-get install -y mtr-tiny
-                    return $?
-                fi
+            0)
+                return
+                ;;
+            *)
+                echo -e "${RED}输入错误，请重新选择${RESET}"
+                sleep 1
                 ;;
         esac
-    fi
-
-    # 标准通用安装路由
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -y >/dev/null 2>&1 && apt-get install -y "$tool"
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y "$tool"
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y "$tool"
-    elif command -v apk >/dev/null 2>&1; then
-        apk add --no-cache "$tool"
-    else
-        echo -e "${RED}❌ 错误：无法识别此系统的包管理器！${RESET}"
-        return 1
-    fi
-}
-
-# 检查是否安装
-check_installed() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-# ================== 工具元数据驱动器 (代替容易闪退的关联数组) ==================
-# 格式化存储明细： 编号 | 工具名称 | 运行测试模式 | 系统专属限制 (留空代表通用)
-get_tool_data() {
-    case "$1" in
-        1)  echo "curl:help:" ;;
-        2)  echo "wget:help:" ;;
-        3)  echo "sudo:help:" ;;
-        4)  echo "socat:help:" ;;
-        5)  echo "htop:run:" ;;
-        6)  echo "iftop:run:" ;;
-        7)  echo "unzip:help:" ;;
-        8)  echo "tar:help:" ;;
-        9)  echo "tmux:help:" ;;
-        10) echo "ffmpeg:help:" ;;
-        11) echo "btop:run:" ;;
-        12) echo "ranger:run_root:" ;;
-        13) echo "ncdu:run_root:" ;;
-        14) echo "fzf:run_root:" ;;
-        15) echo "vim:help_root:" ;;
-        16) echo "nano:help_root:" ;;
-        17) echo "git:help_root:" ;;
-        18) echo "screen:sys:centos,rocky,amzn" ;;
-        19) echo "masscan:sys:centos,rocky,amzn" ;;
-        20) echo "iperf3:sys:" ;;
-        21) echo "mtr:sys:" ;;
-        *)  echo "NONE" ;;
-    esac
-}
-
-# ================== 智能动态菜单渲染 ==================
-show_menu() {
-    clear
-    echo -e "${GREEN}=====================================${RESET}"
-    echo -e "${GREEN}     ◈ 运维必备全能工具箱面板 ◈      ${RESET}"
-    echo -e "${GREEN}=====================================${RESET}"
-    echo -e "${GREEN} 宿主系统:${RESET} ${YELLOW}$os_name${RESET}"
-    echo -e "${GREEN} 核心架构:${RESET} ${YELLOW}$(uname -m)${RESET}"
-    echo -e "${GREEN}------------------------------------=${RESET}"
-    
-    local i=1
-    while [ $i -le 21 ]; do
-        local data=$(get_tool_data $i)
-        IFS=":" read -r tool mode support_os _ <<EOF
-$data
-EOF
-        # 校验系统特定的软件展示限制
-        if [ -n "$support_os" ]; then
-            echo ",$support_os," | grep -q ",$os_name,"
-            if [ $? -ne 0 ]; then
-                i=$((i+1))
-                continue
-            fi
-        fi
-
-        # 状态标色
-        if check_installed "$tool"; then
-            status="${GREEN}✔ 已安装${RESET}"
-        else
-            status="${RED}✖ 未安装${RESET}"
-        fi
-
-        # 优雅的对齐格式化输出
-        printf "${GREEN} [%02d] %-12s${RESET} %b\n" "$i" "$tool" "$status"
-        i=$((i+1))
     done
-    
-    echo -e "${GREEN}------------------------------------=${RESET}"
-    echo -e "${YELLOW} [99] 工具卸载${RESET}"
-    echo -e "${RED} [00] 退出${RESET}"
-    echo -e "${GREEN}=====================================${RESET}"
 }
 
-# ================== 动作调度核心执行器 ==================
-execute_action() {
-    local tool="$1"
-    local mode="$2"
 
-    if ! check_installed "$tool"; then
-        install_tool_core "$tool" "$mode"
-        if [ $? -ne 0 ] || ! check_installed "$tool"; then
-            echo -e "${RED}❌ $tool 安装失败，请检查软件源仓库配置。${RESET}"
-            return 1
-        fi
-        echo -e "${GREEN}✅ $tool 成功部署就绪！${RESET}"
-    else
-        echo -e "${GREEN}💡 检测到 $tool 已经安装在系统环境中。${RESET}"
-    fi
+#################################
+# 一键清除 SSH 密钥
+#################################
+clear_all_ssh_keys() {
+    echo -e "${RED}警告：此操作将删除所有用户 SSH 密钥！${RESET}"
+    read -p $'\033[33m确认清除请输入(y): \033[0m' confirm
 
-    # 引导运行或调出帮助信息
-    echo -e "${YELLOW}-------------------------------------${RESET}"
-    case "$mode" in
-        help)      echo -e "即将调取帮助快照: $tool --help"; sleep 1; "$tool" --help ;;
-        run)       echo -e "即将立刻进入并运行工具: $tool"; sleep 1; "$tool" ;;
-        run_root)  echo -e "即将切入根路径运行工具: $tool"; sleep 1; cd / && "$tool"; cd ~ ;;
-        help_root) echo -e "即将切入根路径调取帮助: $tool -h"; sleep 1; cd / && "$tool" -h; cd ~ ;;
-        sys)       echo -e "环境包部署完成，您现在可以直接在全局键入 [ ${tool} ] 使用它。" ;;
-    esac
-}
-
-# ================== 智能多选卸载引擎 (精准检测版) ==================
-uninstall_mode() {
-    clear
-    echo -e "${RED}=====================================${RESET}"
-    echo -e "${RED}      ◈ 软件卸载清洗中心 ◈          ${RESET}"
-    echo -e "${RED}=====================================${RESET}"
-    
-    # 动态扫描已存在的工具
-    local count=0
-    local i=1
-    while [ $i -le 21 ]; do
-        local data=$(get_tool_data $i)
-        IFS=":" read -r tool _ <<EOF
-$data
-EOF
-        if check_installed "$tool"; then
-            count=$((count+1))
-            eval "inst_tool_$count=\"$tool\""
-            echo -e "${GREEN}  $count) $tool${RESET}"
-        fi
-        i=$((i+1))
-    done
-
-    if [ $count -eq 0 ]; then
-        echo -e "${YELLOW}🍃 系统非常洁净，没有发现可供卸载的工具组件。${RESET}"
-        read -r -p "按 [回车键] 返回菜单..." dummy
+    if [[ "$confirm" != "y" ]]; then
+        echo -e "${GREEN}已取消操作${RESET}"
+        sleep 1
         return
     fi
 
-    echo ""
-    echo -ne "${YELLOW}请输入需要清洗的软件编号 (支持以空格或逗号多选, 如 1 3 5): ${RESET}"
-    read -r choices
-    
-    # 兼容处理用户输入的逗号
-    choices=$(echo "$choices" | tr ',' ' ')
-    
-    for choice in $choices; do
-        # 验证数字合法性
-        echo "$choice" | grep -q '^[0-9]\+$' || continue
-        if [ "$choice" -ge 1 ] && [ "$choice" -le $count ]; then
-            eval "target_tool=\$inst_tool_$choice"
-            
-            # 映射实际的真实包名
-            local real_package="$target_tool"
-            if [ "$os_family" = "debian" ] && [ "$target_tool" = "mtr" ]; then
-                real_package="mtr-tiny"
-            fi
-
-            echo -e "${YELLOW}⚡ 正在全盘清洗组件: $target_tool (实际包名: $real_package) ...${RESET}"
-            
-            if command -v apt-get >/dev/null 2>&1; then
-                apt-get purge -y "$real_package"
-                apt-get autoremove -y >/dev/null 2>&1
-            elif command -v dnf >/dev/null 2>&1; then
-                dnf remove -y "$real_package"
-            elif command -v yum >/dev/null 2>&1; then
-                yum remove -y "$real_package"
-            elif command -v apk >/dev/null 2>&1; then
-                apk del "$real_package"
-            fi
-            
-            # 【核心修复】强制刷新当前环境的命令哈希表，防止缓存误报
-            hash -r 2>/dev/null
-
-            # 重新检查命令是否还存在
-            if check_installed "$target_tool"; then
-                echo -e "${RED}❌ $target_tool 移除失败！可能该组件是系统核心依赖，被包管理器保护。${RESET}"
-            else
-                echo -e "${GREEN}✓ $target_tool 已安全移除！${RESET}"
-            fi
-        else
-            echo -e "${RED}❌ 无效的选择序列号: $choice${RESET}"
-        fi
-    done
-    read -r -p "操作完成，按 [回车键] 返回主菜单..." dummy
+    echo -e "${GREEN}正在清理 SSH 密钥...${RESET}"
+    rm -rf /root/.ssh /home/*/.ssh 2>/dev/null
+    restart_ssh
+    echo -e "${GREEN}SSH 密钥已全部清理完成${RESET}"
+    pause
 }
 
-# ================== 主循环入口 ==================
-detect_os
+#################################
+# 本地生成并配置密钥登录
+#################################
+setup_local_ssh_key() {
+    echo -e "${YELLOW}开始生成 SSH 密钥并配置公钥登录...${RESET}"
+    
+    if [ "$IS_ALPINE" = true ]; then
+        apk add --no-cache openssh-client openssh-server >/dev/null 2>&1
+    fi
 
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
+
+    read -p "请输入密钥保存路径（默认 /root/.ssh/id_ed25519）: " keypath
+    keypath=${keypath:-/root/.ssh/id_ed25519}
+
+    # 避免重复生成导致覆盖
+    if [ -f "$keypath" ]; then
+        read -p "密钥已存在，是否覆盖？(y/n): " overwrite
+        if [[ "$overwrite" != "y" ]]; then
+            echo -e "${YELLOW}已取消生成，使用原有密钥配置...${RESET}"
+        else
+            ssh-keygen -t ed25519 -f "$keypath" -N ""
+        fi
+    else
+        ssh-keygen -t ed25519 -f "$keypath" -N ""
+    fi
+
+    if [ -f "${keypath}.pub" ]; then
+        cat "${keypath}.pub" >> /root/.ssh/authorized_keys
+        chmod 600 /root/.ssh/authorized_keys
+        
+        backup_config
+        sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/g' "$CONFIG"
+        
+        echo -e "${GREEN}✔ 密钥登录配置完成${RESET}"
+        echo "公钥路径: ${keypath}.pub"
+        echo "私钥路径: ${keypath}"
+        echo -e "\n${GREEN}================== 您的私钥内容 ==================${RESET}"
+        cat "$keypath"
+        echo -e "${GREEN}==================================================${RESET}"
+        echo -e "${YELLOW}请务必复制上方私钥并妥善保存！${RESET}"
+    else
+        echo -e "${RED}错误：密钥生成失败！${RESET}"
+    fi
+    restart_ssh
+    pause
+}
+
+#################################
+# 禁用 root 密码登录（极致安全加固）
+#################################
+disable_root_password() {
+    # 安全检查：如果没有设置公钥，警告用户
+    if [ ! -f "/root/.ssh/authorized_keys" ] || [ ! -s "/root/.ssh/authorized_keys" ]; then
+        echo -e "${RED}严重警告：检测到您还未设置任何公钥！${RESET}"
+        echo -e "${RED}此时禁用密码登录将导致您完全无法通过 SSH 连上这台服务器！${RESET}"
+        read -p $'\033[33m确定要继续吗？请输入(yes_i_know): \033[0m' extreme_confirm
+        if [[ "$extreme_confirm" != "yes_i_know" ]]; then
+            echo -e "${GREEN}已紧急取消操作，建议先设置公钥。${RESET}"
+            sleep 2
+            return
+        fi
+    fi
+
+    echo -e "${YELLOW}正在安全加固：禁用 root 密码登录...${RESET}"
+    backup_config
+
+    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/g' "$CONFIG"
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/g' "$CONFIG"
+
+    echo -e "${GREEN}✔ root 密码登录已禁用，现在仅允许公钥登录${RESET}"
+    restart_ssh
+    pause
+}
+
+#################################
+# 暂停提示
+#################################
+pause() {
+    read -p $'\033[32m按回车继续...\033[0m'
+}
+
+#################################
+# 主循环菜单
+#################################
 while true; do
-    show_menu
-    echo -ne "${GREEN}请输入您的首选操作编号: ${RESET}"
-    read -r sub_choice
+    clear
+    get_each_ssh_status
 
-    # 兼容非标数字格式输入
-    if [ "$sub_choice" = "0" ] || [ "$sub_choice" = "00" ]; then
-        exit 0
-    fi
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}       root 公钥登录管理         ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}当前状态 :${RESET} ${STATUS_FILE}"
+    echo -e "${GREEN}公钥登录 :${RESET} ${STATUS_PUBKEY}"
+    echo -e "${GREEN}密码登录 :${RESET} ${STATUS_ROOT}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN} 1) 设置公钥登录${RESET}"
+    echo -e "${GREEN} 2) 管理公钥登录${RESET}"
+    echo -e "${GREEN} 3) 禁用root登录${RESET}"
+    echo -e "${GREEN} 4) 清除SSH公钥${RESET}"
+    echo -e "${GREEN} 0) 退出${RESET}"
+    read -p $'\033[32m 请选择: \033[0m' choice
 
-    if [ "$sub_choice" = "99" ]; then
-        uninstall_mode
-        continue
-    fi
-
-    # 判断输入合法性与范围
-    echo "$sub_choice" | grep -q '^[0-9]\+$'
-    if [ $? -ne 0 ] || [ "$sub_choice" -lt 1 ] || [ "$sub_choice" -gt 21 ]; then
-        echo -e "${RED}❌ 警告：请输入有效的菜单指令数字！${RESET}"
-        sleep 1
-        continue
-    fi
-
-    # 获取选定的配置行
-    tool_raw_data=$(get_tool_data "$sub_choice")
-    if [ "$tool_raw_data" != "NONE" ]; then
-        IFS=":" read -r target_tool target_mode _ <<EOF
-$tool_raw_data
-EOF
-        execute_action "$target_tool" "$target_mode"
-        echo ""
-        read -r -p "👉 任务完毕，按 [回车键] 重回主菜单..." dummy
-    fi
+    case $choice in
+        1) setup_local_ssh_key ;; 
+        2) manage_key_menu ;; 
+        3) disable_root_password ;; 
+        4) clear_all_ssh_keys ;;
+        0) 
+            exit 0 
+            ;;
+        *)
+            echo -e "${RED}输入错误，请重新选择${RESET}"
+            sleep 1
+            ;;
+    esac
 done

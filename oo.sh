@@ -134,10 +134,39 @@ get_latest_version() {
     echo "$version"
 }
 
+
+
+# 检查当前版本
 # 检查当前版本
 get_current_version() {
     if [[ -f "$MOSDNS_BINARY" ]]; then
-        $MOSDNS_BINARY version 2>/dev/null | grep -o 'v[0-9.]*' | head -1 || echo "unknown"
+        # 运行二进制并抓取完整的版本输出
+        local ver_raw=$($MOSDNS_BINARY version 2>/dev/null || echo "")
+        
+        if [[ -z "$ver_raw" ]]; then
+            echo "已安装 (无法获取版本)"
+            return 0
+        fi
+
+        # 1. 精准提取编译时间（如 26.05.25）
+        local build_time=$(echo "$ver_raw" | grep -oE 'build time: [0-9.]+' | awk '{print $3}')
+        
+        # 2. 精准提取主版本号（如 v4.6.0）
+        local clean_ver=$(echo "$ver_raw" | grep -oE 'version: v[0-9.]+' | awk '{print $2}')
+        
+        # 3. 如果提取不到，用原有的正则兜底
+        if [[ -z "$clean_ver" ]]; then
+            clean_ver=$(echo "$ver_raw" | grep -oE 'v[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+        fi
+        
+        # 4. 智能拼装：针对作者不改版本号的特殊照顾
+        if [[ "$clean_ver" == "v4.6.0" && -n "$build_time" ]]; then
+            echo "v4.6.0 (Build: ${build_time})"
+        elif [[ -n "$clean_ver" && "$clean_ver" != "v" ]]; then
+            echo "$clean_ver"
+        else
+            echo "$ver_raw" | head -n 1 | cut -c1-20
+        fi
     else
         echo "未安装"
     fi
@@ -431,20 +460,20 @@ configure_system_dns() {
     # 配置DNS为127.0.0.1
     echo -e "nameserver 127.0.0.1\n" > /etc/resolv.conf
     
-    # 添加保护（增加用户确认）
+    # 添加保护（默认锁定）
     echo
     log_warning "即将对 /etc/resolv.conf 设置 chattr +i 锁定保护。"
     log_warning "锁定后，其他系统网络服务（如 NetworkManager、DHCP）将无法修改此文件。"
-    read -p "是否确认锁定以防止DNS被覆盖? (y/N): " -n 1 -r
+    read -p "是否确认锁定以防止DNS被覆盖? (Y/n): " -n 1 -r
     echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
+    # 如果用户直接回车(空值) 或者 输入了 Y/y，则执行锁定
+    if [[ -z "$REPLY" || $REPLY =~ ^[Yy]$ ]]; then
         chattr +i /etc/resolv.conf
         log_success "系统DNS已配置并锁定为 Mosdns-x (127.0.0.1)"
     else
         log_info "已跳过 chattr 锁定，DNS 已修改但可能在重启或网络重连后被系统覆盖。"
     fi
 }
-
 # 恢复系统DNS
 restore_system_dns() {
     log_info "恢复系统DNS配置..."
@@ -549,6 +578,7 @@ edit_config() {
     fi
 }
 
+
 # 更新Mosdns-x
 update_mosdns_x() {
     local latest_version=$(get_latest_version)
@@ -566,14 +596,28 @@ update_mosdns_x() {
     
     log_info "更新 Mosdns-x: $current_version -> $latest_version"
     
+    # 【核心修复】为了防止停止服务后网络断开，先临时恢复系统DNS
+    log_info "正在临时恢复系统公共 DNS 以确保下载期间网络畅通..."
+    if [[ -f "/etc/resolv.conf" ]]; then
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        # 临时写入公共 DNS，保证能解析 github.com
+        echo -e "nameserver 8.8.8.8\nameserver 1.1.1.1\n" > /etc/resolv.conf
+    fi
+    
     # 停止服务
+    log_info "正在停止旧版服务..."
     systemctl stop mosdns
     
-    # 安装新版本
+    # 安装新版本（此时系统DNS是通的，可以正常下载）
     install_mosdns_x "$latest_version"
     
     # 启动服务
+    log_info "正在启动新版服务..."
     systemctl start mosdns
+    
+    # 【核心恢复】新版启动成功后，重新把系统 DNS 劫持回本地
+    log_info "正在重新配置系统 DNS 指向 Mosdns-x..."
+    configure_system_dns
     
     log_success "更新完成"
 }
@@ -673,7 +717,7 @@ main() {
         echo -e "${GREEN} 0. 退出${RESET}"
         echo -e "${GREEN}================================${RESET}"
         
-        read -p "请输入数字: " num
+        read -p $'\e[32m请输入数字: \e[0m' num
         case "$num" in
             1)
                 log_info "开始安装 Mosdns-x..."

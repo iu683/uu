@@ -1,398 +1,332 @@
 #!/bin/bash
-PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
-export PATH
-LANG=en_US.UTF-8
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+#################################################
+#  ACME证书备份系统
+#################################################
 
-error_msg() { echo -e "${RED}[错误] $1${NC}"; }
-warning_msg() { echo -e "${YELLOW}[警告] $1${NC}"; }
-success_msg() { echo -e "${GREEN}[成功] $1${NC}"; }
-info_msg() { echo -e "${BLUE}[信息] $1${NC}"; }
+INSTALL_DIR="/opt/acmebackup"
+LOCAL_SCRIPT="$INSTALL_DIR/acmebackup.sh"
+REMOTE_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
 
-confirm() {
-    local prompt="$1 (y/N): "
-    local answer
-    read -p "$prompt" answer </dev/tty
-    case "$answer" in [Yy]|[Yy][Ee][Ss]) return 0 ;; *) return 1 ;; esac
-}
-
-check_root() {
-    [ "$EUID" -ne 0 ] && { error_msg "请使用 root 权限运行此脚本。"; exit 1; }
-}
-
-get_system_disk_base() {
-    local root_dev=$(df -P / | awk 'NR==2 {print $1}')
-    local boot_dev=$(df -P /boot 2>/dev/null | awk 'NR==2 {print $1}')
-    for dev in $root_dev $boot_dev; do
-        echo "$dev" | sed -e 's/[0-9]*$//' -e 's/p[0-9]*$//'
-    done | sort -u
-}
-
-is_system_disk() {
-    local dev=$1
-    local base=$(echo "$dev" | sed -e 's/[0-9]*$//' -e 's/p[0-9]*$//')
-    local sys_disks=$(get_system_disk_base)
-    for sd in $sys_disks; do
-        [[ "$base" == "$sd" ]] && return 0
-    done
-    [[ "$base" =~ ^/dev/(sda|vda|xvda|hda|nvme0n1)$ ]] && return 0
-    return 1
-}
-
-is_system_mountpoint() {
-    local mp=$1
-    case "$mp" in
-        /|/boot|/boot/*|/usr|/usr/*|/var|/var/*|/tmp|/etc|/etc/*|/root|/proc|/sys|/dev)
-            return 0 ;;
-        *)
-            return 1 ;;
-    esac
-}
-
-get_data_disks() {
-    local sys_disks=$(get_system_disk_base)
-    for disk in $(lsblk -d -o NAME,TYPE | grep disk | awk '{print $1}'); do
-        local full_disk="/dev/$disk"
-        local base=$(echo "$full_disk" | sed -e 's/[0-9]*$//' -e 's/p[0-9]*$//')
-        local is_sys=0
-        for sd in $sys_disks; do
-            [[ "$base" == "$sd" ]] && is_sys=1 && break
-        done
-        [[ $is_sys -eq 1 ]] && continue
-        [[ "$base" =~ ^/dev/(sda|vda|xvda|hda|nvme0n1)$ ]] && continue
-        echo "$disk"
-    done
-}
-
-force_unmount_disk() {
-    local disk=$1
-    if is_system_disk "/dev/$disk"; then
-        error_msg "拒绝卸载系统盘 /dev/$disk！"
-        return 1
+# Alpine 环境依赖检查与自动提示
+if [ -f /etc/alpine-release ]; then
+    if ! command -v curl &>/dev/null || ! command -v cmp &>/dev/null || ! tar --version 2>&1 | grep -q "GNU"; then
+        echo "检测到 Alpine 环境，正在自动安装必要依赖 (bash, curl, tar, diffutils)..."
+        apk update && apk add bash curl tar diffutils
     fi
-    info_msg "正在强制卸载 /dev/$disk 相关的所有挂载点..."
-    local mounts=$(mount | grep "^/dev/${disk}" | awk '{print $1}')
-    for dev in $mounts; do
-        umount "$dev" 2>/dev/null
-        if mount | grep -q "^$dev "; then
-            info_msg "普通卸载失败，使用懒卸载 (lazy)..."
-            umount -l "$dev" 2>/dev/null
-            sleep 1
-        fi
-    done
-    if mount | grep -q "^/dev/${disk}"; then
-        error_msg "无法卸载 /dev/$disk 的分区，请手动处理。"
-        return 1
-    fi
-    success_msg "卸载完成。"
-    return 0
-}
+fi
 
-view_disk_info() {
-    clear
-    echo -e "${CYAN}==================== 磁盘分区信息 ====================${NC}"
-    echo ""
-    echo -e "${GREEN}>>> lsblk 输出：${NC}"
-    lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE
-    echo ""
-    echo -e "${GREEN}>>> fdisk -l 输出（仅数据盘）：${NC}"
-    for disk in $(get_data_disks); do
-        fdisk -l "/dev/$disk" 2>/dev/null | head -n 20
-    done
-    echo ""
-    read -p "按回车键返回主菜单..." dummy </dev/tty
-}
+if [[ "$0" != "$LOCAL_SCRIPT" ]]; then
+    mkdir -p "$INSTALL_DIR"
 
-mount_disk() {
-    clear
-    echo -e "${CYAN}==================== 挂载磁盘向导 ====================${NC}"
+    curl -fsSL -o "$LOCAL_SCRIPT.tmp" "$REMOTE_URL" || {
+        echo "下载失败，将继续使用本地/当前脚本运行"
+        cp "$0" "$LOCAL_SCRIPT"
+        chmod +x "$LOCAL_SCRIPT"
+    }
 
-    local disks=($(get_data_disks))
-    if [ ${#disks[@]} -eq 0 ]; then
-        error_msg "未检测到可用数据盘。"
-        read -p "按回车键返回主菜单..." dummy </dev/tty
-        return
-    fi
-
-    echo -e "${BLUE}检测到以下数据盘:${NC}"
-    local index=1
-    for disk in "${disks[@]}"; do
-        local size=$(lsblk -d -o NAME,SIZE | grep -w "$disk" | awk '{print $2}')
-        local model=$(lsblk -d -o NAME,MODEL | grep -w "$disk" | awk '{$1=""; print $0}' | sed 's/^[ \t]*//')
-        local mount_status="未挂载"
-        mount | grep -q "^/dev/$disk" && mount_status="${YELLOW}已挂载${NC}"
-        printf "  [%d] %-8s  %-10s  %-20s %b\n" "$index" "$disk" "$size" "$model" "$mount_status"
-        ((index++))
-    done
-
-    local choice
-    while true; do
-        read -p "请输入要操作的磁盘编号 (1-${#disks[@]})，输入 0 返回: " choice </dev/tty
-        [[ "$choice" == "0" ]] && return
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#disks[@]} ]; then
-            selected_disk="${disks[$((choice-1))]}"
-            break
+    if [[ -f "$LOCAL_SCRIPT.tmp" ]]; then
+        if [[ ! -f "$LOCAL_SCRIPT" ]] || ! cmp -s "$LOCAL_SCRIPT.tmp" "$LOCAL_SCRIPT"; then
+            mv "$LOCAL_SCRIPT.tmp" "$LOCAL_SCRIPT"
+            chmod +x "$LOCAL_SCRIPT"
+            echo "已安装/更新到最新版本"
         else
-            warning_msg "输入无效。"
-        fi
-    done
-    info_msg "选择的磁盘: /dev/$selected_disk"
-
-    if is_system_disk "/dev/$selected_disk"; then
-        error_msg "选择的磁盘为系统盘，禁止操作！"
-        read -p "按回车键返回..." dummy </dev/tty
-        return
-    fi
-
-    local mount_point=""
-    while true; do
-        read -p "请输入挂载点目录 (绝对路径，例如 /data 或 /home，输入 0 返回): " mp </dev/tty
-        [[ "$mp" == "0" ]] && return
-        if [[ "$mp" != /* ]]; then
-            warning_msg "必须是绝对路径。"
-            continue
-        fi
-        if [[ "$mp" == "/" ]]; then
-            warning_msg "不能挂载到根目录 /。"
-            continue
-        fi
-        if mountpoint -q "$mp"; then
-            warning_msg "目录 $mp 已被挂载。"
-            continue
-        fi
-        if is_system_mountpoint "$mp"; then
-            warning_msg "$mp 是系统关键目录，禁止作为挂载点。"
-            continue
-        fi
-        mount_point="$mp"
-        break
-    done
-    info_msg "挂载点: $mount_point"
-
-    if [ -d "$mount_point" ] && [ -n "$(ls -A "$mount_point" 2>/dev/null)" ]; then
-        warning_msg "目录 $mount_point 非空！"
-        echo -e "${YELLOW}当前目录内容：${NC}"
-        ls -la "$mount_point" | head -n 10
-        echo -e "${RED}如果继续挂载，该目录内的所有文件将被永久删除！${NC}"
-        if ! confirm "确定要清空 $mount_point 并继续挂载吗？"; then
-            info_msg "操作已取消。"
-            read -p "按回车键返回..." dummy </dev/tty
-            return
-        fi
-        echo -e "${RED}最后一次警告：即将清空 $mount_point 目录！${NC}"
-        if ! confirm "输入 yes 确认清空并继续 (yes/N): "; then
-            info_msg "操作已取消。"
-            read -p "按回车键返回..." dummy </dev/tty
-            return
-        fi
-        info_msg "正在清空 $mount_point ..."
-        rm -rf "$mount_point"/*
-        success_msg "目录已清空。"
-    fi
-
-    if mount | grep -q "^/dev/$selected_disk"; then
-        warning_msg "磁盘 /dev/$selected_disk 已有分区挂载。"
-        if ! confirm "是否重新分区并格式化（将清除所有数据）？"; then
-            local part1="/dev/${selected_disk}1"
-            if [ -b "$part1" ]; then
-                info_msg "尝试挂载已有分区 $part1 到 $mount_point"
-                mkdir -p "$mount_point"
-                mount "$part1" "$mount_point" || { error_msg "挂载失败。"; return; }
-                sed -i "\|^$part1|d" /etc/fstab
-                echo "$part1    $mount_point    ext4    defaults    0 0" >> /etc/fstab
-                success_msg "挂载成功，已写入 /etc/fstab"
-                df -h | grep "$mount_point"
-                read -p "按回车键继续..." dummy </dev/tty
-                return
-            else
-                error_msg "未找到分区 $part1。"
-                read -p "按回车键返回..." dummy </dev/tty
-                return
-            fi
+            rm -f "$LOCAL_SCRIPT.tmp"
         fi
     fi
 
-    if fdisk -l "/dev/$selected_disk" 2>/dev/null | grep -qiE "NTFS|FAT"; then
-        warning_msg "检测到 Windows 分区！"
-        confirm "格式化将清除所有数据，确定继续吗？" || return
-    fi
+    exec bash "$LOCAL_SCRIPT" "$@"
+fi
 
-    echo -e "${RED}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${NC}"
-    echo -e "${RED}!!  警告：即将对 /dev/$selected_disk 分区并格式化  !!${NC}"
-    echo -e "${RED}!!  该磁盘上的所有数据都将被永久清除！        !!${NC}"
-    echo -e "${RED}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${NC}"
-    confirm "确定要继续吗？" || return
+#################################
+# 颜色
+#################################
+GREEN="\033[32m"
+RED="\033[31m"
+CYAN="\033[36m"
+YELLOW="\033[33m"
+RESET="\033[0m"
 
-    cp /etc/fstab /etc/fstab.bak.$(date +%Y%m%d%H%M%S)
-    info_msg "已备份 /etc/fstab"
+#################################
+# 基础路径
+#################################
+CONFIG_FILE="$INSTALL_DIR/config.sh"
+LOG_FILE="$INSTALL_DIR/backup.log"
+CRON_TAG="acmebackup_cron"
 
-    force_unmount_disk "$selected_disk" || { read -p "按回车键返回..." dummy </dev/tty; return; }
+DATA_DIR_DEFAULT="$INSTALL_DIR/data"
+RETAIN_DAYS_DEFAULT=7
+SERVICE_NAME_DEFAULT="$(hostname)"
 
-    info_msg "正在清除分区表并创建新分区..."
-    (
-    echo d; echo d; echo d; echo d
-    echo n; echo p; echo 1; echo; echo
-    echo w
-    ) | fdisk "/dev/$selected_disk" > /dev/null 2>&1
+mkdir -p "$INSTALL_DIR"
 
-    partprobe "/dev/$selected_disk" 2>/dev/null || blockdev --rereadpt "/dev/$selected_disk" 2>/dev/null
-    sleep 3
+#################################
+# ACME路径
+#################################
+ACME_HOME="/root/.acme.sh"
+SSL_DIR="/root/ssl"
 
-    local part1="/dev/${selected_disk}1"
-    if [ ! -b "$part1" ]; then
-        info_msg "fdisk 失败，尝试 parted 创建 GPT 分区..."
-        parted -s "/dev/$selected_disk" mklabel gpt
-        parted -s "/dev/$selected_disk" mkpart primary ext4 0% 100%
-        partprobe "/dev/$selected_disk" 2>/dev/null
-        sleep 3
-        part1="/dev/${selected_disk}1"
-        [ ! -b "$part1" ] && { error_msg "分区创建失败。"; return; }
-    fi
-
-    if mount | grep -q "^$part1 "; then
-        umount -l "$part1" 2>/dev/null
-        sleep 1
-    fi
-
-    info_msg "格式化 $part1 为 ext4..."
-    mkfs.ext4 -F "$part1" || { error_msg "格式化失败。"; return; }
-
-    mkdir -p "$mount_point"
-    mount "$part1" "$mount_point" || { error_msg "挂载失败。"; return; }
-
-    sed -i "\|^$part1|d" /etc/fstab
-    echo "$part1    $mount_point    ext4    defaults    0 0" >> /etc/fstab
-
-    success_msg "磁盘挂载完成！"
-    df -h | grep "$mount_point"
-    read -p "按回车键继续..." dummy </dev/tty
-}
-
-unmount_partition() {
-    clear
-    echo -e "${CYAN}==================== 卸载分区 ====================${NC}"
-
-    echo -e "${GREEN}当前挂载的分区（仅数据盘）：${NC}"
-    mount | grep "^/dev/" | while read line; do
-        dev=$(echo "$line" | awk '{print $1}')
-        mp=$(echo "$line" | awk '{print $3}')
-        if is_system_disk "$dev" || is_system_mountpoint "$mp"; then
-            continue
-        fi
-        echo "$line" | awk '{print NR")", $1, "->", $3}' | column -t
-    done
-
-    local count=$(mount | grep "^/dev/" | while read line; do
-        dev=$(echo "$line" | awk '{print $1}')
-        mp=$(echo "$line" | awk '{print $3}')
-        is_system_disk "$dev" || is_system_mountpoint "$mp" || echo "1"
-    done | wc -l)
-    if [ "$count" -eq 0 ]; then
-        info_msg "没有可卸载的数据盘分区。"
-        read -p "按回车键返回主菜单..." dummy </dev/tty
-        return
-    fi
-
-    echo ""
-    read -p "请输入要卸载的设备名（如 /dev/vdb1）或挂载点（如 /home），输入 0 返回: " target </dev/tty
-    [[ "$target" == "0" ]] && return
-
-    local dev mp
-    if [ -b "$target" ]; then
-        dev="$target"
-        mp=$(mount | grep "^$dev " | awk '{print $3}')
-    elif [ -d "$target" ]; then
-        mp="$target"
-        dev=$(mount | grep " $mp " | awk '{print $1}')
+#################################
+# 卸载
+#################################
+if [[ "$1" == "--uninstall" ]]; then
+    echo -e "${YELLOW}正在卸载...${RESET}"
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/cron_back
+    if [ -s /tmp/cron_back ]; then
+        crontab /tmp/cron_back
     else
-        error_msg "输入无效，不是设备文件也不是目录。"
-        read -p "按回车键返回..." dummy </dev/tty
-        return
+        crontab -r 2>/dev/null
     fi
+    rm -f /tmp/cron_back
+    rm -rf "$INSTALL_DIR"
+    echo -e "${GREEN}卸载完成${RESET}"
+    exit 0
+fi
 
-    if [ -z "$dev" ] || [ -z "$mp" ]; then
-        error_msg "未找到对应的挂载关系。"
-        read -p "按回车键返回..." dummy </dev/tty
-        return
-    fi
+#################################
+# 加载配置
+#################################
+load_config() {
+    [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
-    if is_system_disk "$dev"; then
-        error_msg "拒绝卸载系统盘 $dev！"
-        read -p "按回车键返回..." dummy </dev/tty
-        return
-    fi
-    if is_system_mountpoint "$mp"; then
-        error_msg "拒绝卸载系统关键目录 $mp！"
-        read -p "按回车键返回..." dummy </dev/tty
-        return
-    fi
+    DATA_DIR=${DATA_DIR:-$DATA_DIR_DEFAULT}
+    RETAIN_DAYS=${RETAIN_DAYS:-$RETAIN_DAYS_DEFAULT}
+    SERVICE_NAME=${SERVICE_NAME:-$SERVICE_NAME_DEFAULT}
+}
+load_config
+mkdir -p "$DATA_DIR"
 
-    info_msg "将卸载设备 $dev 从挂载点 $mp"
-    if ! confirm "确定卸载吗？"; then
-        info_msg "操作取消。"
-        read -p "按回车键返回..." dummy </dev/tty
-        return
-    fi
-
-    umount "$mp" 2>/dev/null
-    if mountpoint -q "$mp"; then
-        warning_msg "普通卸载失败，尝试强制卸载..."
-        umount -l "$mp"
-        sleep 1
-        if mountpoint -q "$mp"; then
-            error_msg "卸载失败，请手动处理。"
-            read -p "按回车键返回..." dummy </dev/tty
-            return
-        fi
-    fi
-
-    sed -i "\|^$dev|d" /etc/fstab
-    success_msg "卸载成功，并已从 /etc/fstab 移除条目。"
-    read -p "按回车键继续..." dummy </dev/tty
+#################################
+# 保存配置
+#################################
+save_config() {
+cat > "$CONFIG_FILE" <<EOF
+DATA_DIR="$DATA_DIR"
+RETAIN_DAYS="$RETAIN_DAYS"
+SERVICE_NAME="$SERVICE_NAME"
+TG_TOKEN="$TG_TOKEN"
+TG_CHAT_ID="$TG_CHAT_ID"
+EOF
 }
 
-view_disk_usage() {
-    clear
-    echo -e "${CYAN}==================== 磁盘使用情况 ====================${NC}"
-    df -h
-    echo ""
-    read -p "按回车键返回主菜单..." dummy </dev/tty
+#################################
+# Telegram
+#################################
+send_tg() {
+    [[ -z "$TG_TOKEN" || -z "$TG_CHAT_ID" ]] && return
+    MESSAGE="[$SERVICE_NAME] $1"
+    curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+        -d chat_id="$TG_CHAT_ID" \
+        -d text="$MESSAGE" >/dev/null 2>&1
 }
 
-show_menu() {
-    clear
-    echo -e " ${GREEN}==============================${NC}"
-    echo -e " ${GREEN}        磁盘管理工具           ${NC}"
-    echo -e " ${GREEN}==============================${NC}"
-    echo -e " ${GREEN}1) 查看磁盘分区信息${NC}"
-    echo -e " ${GREEN}2) 挂载磁盘(仅数据盘)${NC}"
-    echo -e " ${GREEN}3) 卸载分区(仅数据盘)${NC}"
-    echo -e " ${GREEN}4) 查看磁盘使用情况${NC}"
-    echo -e " ${GREEN}0) 退出${NC}"
+#################################
+# 备份
+#################################
+backup() {
+    TIMESTAMP=$(date +%F_%H-%M-%S)
+    FILE="$DATA_DIR/acme_backup_$TIMESTAMP.tar.gz"
+
+    echo -e "${CYAN}开始备份 ACME证书...${RESET}"
+
+    [[ ! -d "$ACME_HOME" ]] && echo -e "${RED}未找到 acme.sh 目录 ($ACME_HOME)${RESET}" && return
+    [[ ! -d "$SSL_DIR" ]] && echo -e "${RED}未找到证书目录 ($SSL_DIR)${RESET}" && return
+
+    # 使用依赖自动安装的 GNU tar 规避 BusyBox tar 绝对路径截断问题
+    tar czf "$FILE" "$ACME_HOME" "$SSL_DIR" >> "$LOG_FILE" 2>&1
+
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}备份成功：$FILE${RESET}"
+        send_tg "✅ ACME备份成功"
+    else
+        echo -e "${RED}备份失败，详情请查看 $LOG_FILE${RESET}"
+        send_tg "❌ ACME备份失败"
+    fi
+
+    find "$DATA_DIR" -type f -name "*.tar.gz" -mtime +"$RETAIN_DAYS" -delete
 }
 
+#################################
+# 恢复
+#################################
+restore() {
+    shopt -s nullglob
+    FILE_LIST=("$DATA_DIR"/*.tar.gz)
 
-main() {
-    check_root
-    while true; do
-        show_menu
-        echo -ne "${GREEN} 请输入选项: ${RESET}"
-        read opt
-        case "$opt" in
-            1) view_disk_info ;;
-            2) mount_disk ;;
-            3) unmount_partition ;;
-            4) view_disk_usage ;;
-            0) exit 0 ;;
-            *) warning_msg "无效选项，请重新输入。" ; sleep 1 ;;
-        esac
+    if [[ ${#FILE_LIST[@]} -eq 0 ]]; then
+        echo -e "${RED}没有备份文件${RESET}"
+        return
+    fi
+
+    echo -e "${CYAN}备份列表:${RESET}"
+    for i in "${!FILE_LIST[@]}"; do
+        echo -e "${GREEN}$((i+1)). $(basename "${FILE_LIST[$i]}")${RESET}"
     done
+
+    read -p "输入序号: " num
+
+    if ! [[ "$num" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}输入错误${RESET}"
+        return
+    fi
+
+    if (( num < 1 || num > ${#FILE_LIST[@]} )); then
+        echo -e "${RED}序号超出范围${RESET}"
+        return
+    fi
+
+    FILE="${FILE_LIST[$((num-1))]}"
+
+    if [[ -z "$FILE" || ! -f "$FILE" ]]; then
+        echo -e "${RED}备份文件不存在${RESET}"
+        return
+    fi
+
+    echo -e "${YELLOW}确认恢复？(y/n)${RESET}"
+    read confirm
+    [[ "$confirm" != "y" ]] && return
+
+    # =========================
+    # 解压 (GNU tar 确保绝对路径无缝解压)
+    # =========================
+    tar xzf "$FILE" -C /
+
+    # =========================
+    # 校验
+    # =========================
+    if [[ ! -d /root/.acme.sh || ! -d /root/ssl ]]; then
+        echo -e "${RED}恢复失败：文件未正确解压${RESET}"
+        return
+    fi
+
+    # =========================
+    # 修复权限（关键）
+    # =========================
+    chmod 755 /root/.acme.sh/acme.sh 2>/dev/null
+    chmod -R 755 /root/.acme.sh 2>/dev/null
+    chmod -R 600 /root/.acme.sh/*.conf 2>/dev/null
+
+    chmod -R 600 /root/ssl 2>/dev/null
+
+    # =========================
+    # 恢复 cron（关键）
+    # =========================
+    if [[ -f /root/.acme.sh/acme.sh ]]; then
+        /root/.acme.sh/acme.sh --install-cronjob
+    fi
+
+    echo -e "${GREEN}恢复完成（ACME已自动恢复运行）${RESET}"
 }
 
-main
+#################################
+# 定时任务
+#################################
+add_cron() {
+    echo -e "${CYAN}1 每天0点${RESET}"
+    echo -e "${CYAN}2 每周一0点${RESET}"
+    echo -e "${CYAN}3 每月1号${RESET}"
+    echo -e "${CYAN}4 自定义${RESET}"
+
+    read -p "选择: " t
+    case $t in
+        1) cron="0 0 * * *" ;;
+        2) cron="0 0 * * 1" ;;
+        3) cron="0 0 1 * *" ;;
+        4)
+            read -p "请输入 cron 表达式: " cron
+
+            # 简单校验
+            if [[ ! "$cron" =~ ^([0-9*/,-]+[[:space:]]){4}[0-9*/,-]+$ ]]; then
+               echo -e "${RED}格式错误，例如: */2 * * * *${RESET}"
+               return
+            fi
+            ;;
+        *) return ;;
+    esac
+
+    # 兼容 BusyBox 的 Crontab 读写逻辑
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/acmebackup 2>/dev/null
+    echo "$cron bash $LOCAL_SCRIPT auto >> $INSTALL_DIR/cron.log 2>&1 #$CRON_TAG" >> /tmp/acmebackup
+    crontab /tmp/acmebackup
+    rm -f /tmp/acmebackup
+
+    echo -e "${GREEN}定时任务已设置: $cron${RESET}"
+}
+
+remove_cron() {
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/acmebackup
+    if [ -s /tmp/acmebackup ]; then
+        crontab /tmp/acmebackup
+    else
+        crontab -r 2>/dev/null
+    fi
+    rm -f /tmp/acmebackup
+    echo -e "${GREEN}已删除定时任务${RESET}"
+}
+
+show_cron(){
+    echo -e "${CYAN}当前任务:${RESET}"
+    crontab -l 2>/dev/null | grep "$CRON_TAG" || echo "无"
+}
+
+#################################
+# auto
+#################################
+if [[ "$1" == "auto" ]]; then
+    backup
+    exit 0
+fi
+
+#################################
+# 菜单
+#################################
+while true; do
+    clear
+    echo -e "${GREEN}==== ACME备份工具 ====${RESET}"
+    echo -e "${GREEN}1. 立即备份${RESET}"
+    echo -e "${GREEN}2. 恢复备份${RESET}"
+    echo -e "${GREEN}3. 设置定时任务${RESET}"
+    echo -e "${GREEN}4. 删除定时任务${RESET}"
+    echo -e "${GREEN}5. 设置备份目录(当前: $DATA_DIR)${RESET}"
+    echo -e "${GREEN}6. 设置保留天数(当前: $RETAIN_DAYS 天)${RESET}"
+    echo -e "${GREEN}7. 设置Telegram${RESET}"
+    echo -e "${GREEN}8. 查看定时任务${RESET}"
+    echo -e "${GREEN}9. 卸载${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+
+    read -r -p $'\033[32m选择: \033[0m' c
+    case $c in
+        1) backup ;;
+        2) restore ;;
+        3) add_cron ;;
+        4) remove_cron ;;
+        5) read -p "备份目录: " DATA_DIR; mkdir -p "$DATA_DIR"; save_config ;;
+        6) read -p "备份文件保留天数: " RETAIN_DAYS; save_config ;;
+        7)
+            read -p "服务器名称(默认: $(hostname)): " SERVICE_NAME
+            SERVICE_NAME=${SERVICE_NAME:-$(hostname)}
+            read -p "TG TOKEN: " TG_TOKEN
+            read -p "CHAT ID: " TG_CHAT_ID
+            save_config
+            ;;
+        8) show_cron ;;
+        9)
+           echo -e "${YELLOW}正在卸载...${RESET}"
+           crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/acmebackup
+           if [ -s /tmp/acmebackup ]; then
+               crontab /tmp/acmebackup
+           else
+               crontab -r 2>/dev/null
+           fi
+           rm -f /tmp/acmebackup
+           rm -rf "$INSTALL_DIR"
+           echo -e "${RED}卸载完成${RESET}"
+           exit 0
+           ;;
+        0) exit ;;
+    esac
+
+    read -p "回车继续..."
+done

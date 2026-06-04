@@ -1,144 +1,197 @@
 #!/bin/sh
-# 端口占用释放脚本 v2.1 多系统适配（完美支持 Alpine Linux）
-# 特点：兼容 BusyBox 工具链，摆脱 Bash 数组依赖，智能平替 lsof
+# OpenRC 自启动服务管理脚本 v2.9 (颜色控制彻底修复版)
+# 提示文字统一绿色，完美兼容多系统，解决 awk 颜色代码暴露及对齐错乱问题
 
 # ================== 颜色定义 ==================
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
-RESET="\033[0m"
 BOLD="\033[1m"
+RESET="\033[0m"
 
-# ================== 权限与命令兼容性检查 ==================
-# 检查是否为 root，不是 root 且有 sudo 则加 sudo
+# ================== 配置 ==================
+PAGE_SIZE=20   # 每页显示多少条
+CURRENT_PAGE=1
+TMP_MATRIX="/tmp/openrc_matrix.$$"
+
+# ================== 权限自动侦测 ==================
 SUDO=""
-if [ "$(id -u)" -ne 0 ]; then
-    if command -v sudo >/dev/null 2>&1; then
-        SUDO="sudo"
-    fi
+if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
 fi
 
-# 核心：根据环境选择如何获取端口进程
-get_port_processes() {
-    local target_port="$1"
-    # 如果是在 Alpine 环境，或者没有真正的 lsof
-    if [ -f /etc/alpine-release ] || ! command -v lsof >/dev/null 2>&1; then
-        # 使用 netstat 作为 Alpine 下的完美替代，提取对应端口的 PID 和进程名
-        # netstat 输出中，Local Address 最后一项是端口，最后一列是 PID/Program name
-        $SUDO netstat -tulnp 2>/dev/null | awk -v p=":${target_port}$" '$4 ~ p {print $0}' | \
-        awk '{
-            # 提取最后一列的 PID/Name，形如 "2096/sshd"
-            split($NF, a, "/")
-            pid = a[1]
-            name = a[2]
-            if (pid ~ /^[0-9]+$/) {
-                # 统一输出格式为: PID USER PROTO COMMAND
-                print pid " root " $1 " " name
+# ================== 用户输入关键词 ==================
+printf "${GREEN}请输入关键词过滤（默认显示所有服务）: ${RESET}"
+read -r KEYWORD
+
+# ================== 生成完整服务列表 (OpenRC 适配) ==================
+generate_full_list() {
+    rm -f "$TMP_MATRIX"
+    idx=1
+
+    for service_path in /etc/init.d/*; do
+        [ ! -f "$service_path" ] && continue
+        service=$(basename "$service_path")
+        
+        # 排除系统内置函数引导项
+        [ "$service" = "functions.sh" ] && continue
+
+        # 获取简短描述
+        desc=$(grep -E '^[[:space:]]*description=' "$service_path" | cut -d'"' -f2 | cut -d"'" -f2 | head -n 1)
+        [ -z "$desc" ] && desc="无描述信息"
+
+        # 关键词双向过滤
+        if [ -n "$KEYWORD" ]; then
+            if ! echo "$service" | grep -q "$KEYWORD" && ! echo "$desc" | grep -q "$KEYWORD"; then
+                continue
+            fi
+        fi
+
+        # 判定自启动状态 (只存纯文本，不包含任何颜色代码)
+        if rc-update show 2>/dev/null | grep -Eq "^[[:space:]]*$service[[:space:]]*\|"; then
+            run_levels=$(rc-update show 2>/dev/null | grep "^[[:space:]]*$service[[:space:]]*|" | awk -F'|' '{print $2}' | xargs)
+            state="enabled(${run_levels})"
+        else
+            state="disabled"
+        fi
+
+        # 判定当前活跃状态 (只存纯文本)
+        if rc-service "$service" status 2>/dev/null | grep -q "status: started"; then
+            act_status="started"
+        else
+            act_status="stopped"
+        fi
+
+        # 将干净的数据写入文件矩阵，使用冒号分割
+        echo "${idx}:${service}:${state}:${act_status}:${desc}" >> "$TMP_MATRIX"
+        idx=$((idx + 1))
+    done
+}
+
+# ================== 刷新并显示某一页 ==================
+refresh_list() {
+    clear
+    if [ ! -s "$TMP_MATRIX" ]; then
+        TOTAL_COUNT=0
+        TOTAL_PAGES=1
+    else
+        TOTAL_COUNT=$(wc -l < "$TMP_MATRIX")
+        TOTAL_PAGES=$(( (TOTAL_COUNT + PAGE_SIZE - 1) / PAGE_SIZE ))
+    fi
+
+    echo -e "${BOLD}${CYAN}=== OpenRC 服务列表（第 $CURRENT_PAGE 页 / 共 ${TOTAL_PAGES} 页，总计 ${TOTAL_COUNT} 个服务） ===${RESET}"
+    printf "${BOLD}%-5s %-25s %-20s %-15s %s${RESET}\n" "No." "SERVICE" "AUTO-START" "STATUS" "DESCRIPTION"
+    echo "--------------------------------------------------------------------------------------------------------"
+
+    if [ "$TOTAL_COUNT" -gt 0 ]; then
+        start_line=$(( (CURRENT_PAGE - 1) * PAGE_SIZE + 1 ))
+        end_line=$(( CURRENT_PAGE * PAGE_SIZE ))
+
+        # 由 awk 统一在渲染时现场加颜色，这样完全不会影响长格式对齐，也不会暴露转义符
+        sed -n "${start_line},${end_line}p" "$TMP_MATRIX" | awk -F':' -v r="$RED" -v g="$GREEN" -v y="$YELLOW" -v rst="$RESET" '
+        {
+            no=$1; service=$2; state=$3; act_status=$4; desc=$5;
+
+            # 现场计算自启动颜色
+            if (state ~ /enabled/) {
+                state_fmt = g state rst
+            } else {
+                state_fmt = y state rst
             }
+
+            # 现场计算运行状态颜色
+            if (act_status == "started") {
+                act_fmt = g act_status rst
+            } else {
+                act_fmt = r act_status rst
+            }
+
+            # 极速且格式完美的渲染输出
+            printf "%-5s %-25s %-31s %-26s %s\n", no, service, state_fmt, act_fmt, desc
         }'
     else
-        # 标准 Linux 原生原生支持 lsof 时的处理逻辑
-        $SUDO lsof -i :"$target_port" -t 2>/dev/null | while read -r pid; do
-            if [ -n "$pid" ]; then
-                # 补全进程的其他基本信息
-                local_proto=$($SUDO lsof -i :"$target_port" | grep "$pid" | awk '{print $5}' | head -n 1)
-                local_cmd=$(ps -o comm= -p "$pid")
-                local_user=$(ps -o user= -p "$pid")
-                echo "$pid $local_user $local_proto $local_cmd"
-            fi
-        done
+        echo -e "       ${YELLOW}没有找到匹配的服务${RESET}"
     fi
 }
 
-# ================== 用户输入端口 ==================
-echo -ne "${GREEN}请输入要释放的端口号: ${RESET}"
-read -r PORT
-if [ -z "$PORT" ]; then
-    echo -e "${RED}端口号不能为空，退出${RESET}"
-    exit 1
-fi
+# ================== 初始化 ==================
+generate_full_list
+refresh_list
 
-# ================== 获取占用进程 ==================
-# 由于 Alpine sh 不支持数组，我们通过临时文件或文本变量来缓存数据
-RAW_DATA=$(get_port_processes "$PORT")
+# ================== 用户选择操作 ==================
+while true; do
+    echo
+    printf "${GREEN}输入序号看详情，s 序号停用+禁用，r 刷新，n 下一页，p 上一页，0 退出: ${RESET}"
+    read -r INPUT
 
-if [ -z "$RAW_DATA" ]; then
-    echo -e "${GREEN}端口 $PORT 没有被占用${RESET}"
-    exit 0
-fi
+    if [ "$INPUT" = "0" ] || [ -z "$INPUT" ]; then
+        break
 
-echo -e "${YELLOW}端口 $PORT 被以下进程占用:${RESET}"
-printf "${BOLD}%-5s %-8s %-10s %-10s %s${RESET}\n" "No." "PID" "USER" "PROTO" "COMMAND"
+    elif [ "$INPUT" = "r" ]; then
+        generate_full_list
+        refresh_list
 
-# 解析并展示
-idx=1
-echo "$RAW_DATA" | while read -r pid user proto cmd; do
-    printf "%-5s %-8s %-10s %-10s %s\n" "$idx" "$pid" "$user" "$proto" "$cmd"
-    idx=$((idx + 1))
-done
+    elif [ "$INPUT" = "n" ]; then
+        TOTAL_COUNT=$(wc -l < "$TMP_MATRIX" 2>/dev/null || echo 0)
+        max_page=$(( (TOTAL_COUNT + PAGE_SIZE - 1) / PAGE_SIZE ))
+        if [ "$CURRENT_PAGE" -lt "$max_page" ]; then
+            CURRENT_PAGE=$((CURRENT_PAGE + 1))
+        fi
+        refresh_list
 
-# ================== 用户选择杀掉的序号 ==================
-echo -ne "\n${GREEN}请输入要杀掉的序号（多个用空格分开，输入 0 退出）: ${RESET}"
-read -r SELECTION
+    elif [ "$INPUT" = "p" ]; then
+        if [ "$CURRENT_PAGE" -gt 1 ]; then
+            CURRENT_PAGE=$((CURRENT_PAGE - 1))
+        fi
+        refresh_list
 
-if [ "$SELECTION" = "0" ] || [ -z "$SELECTION" ]; then
-    echo -e "${GREEN}未操作，退出${RESET}"
-    exit 0
-fi
+    # 匹配输入形式如 "s 3" 或 "s 3 4 5" 停止并禁用
+    elif echo "$INPUT" | grep -Eq "^s[[:space:]]*[0-9 ]+$"; then
+        NUMS=$(echo "$INPUT" | sed 's/^s[[:space:]]*//')
+        for num in $NUMS; do
+            line_data=$(grep -E "^${num}:" "$TMP_MATRIX" 2>/dev/null)
+            if [ -n "$line_data" ]; then
+                service=$(echo "$line_data" | cut -d':' -f2)
+                
+                echo -e "\n${CYAN}正在处理服务: $service ...${RESET}"
+                # 1. 停止服务
+                $SUDO rc-service "$service" stop
+                
+                # 2. 禁用自启动
+                if rc-update show | grep -q "$service"; then
+                    if $SUDO rc-update del "$service" >/dev/null 2>&1; then
+                        echo -e "${RED}[已禁用自启] $service${RESET}"
+                    else
+                        echo -e "${YELLOW}[禁用自启失败] $service${RESET}"
+                    fi
+                fi
+            else
+                echo -e "${YELLOW}无效序号: $num${RESET}"
+            fi
+        done
+        generate_full_list
+        refresh_list
 
-# ================== 转化选择的序号为 PID ==================
-PIDS_TO_KILL=""
-VALID_SELECTION=""
-
-for num in $SELECTION; do
-    # 根据序号定位提取对应的 PID
-    target_pid=$(echo "$RAW_DATA" | awk -v n="$num" 'NR==n {print $1}')
-    if [ -n "$target_pid" ]; then
-        PIDS_TO_KILL="$PIDS_TO_KILL $target_pid"
-        VALID_SELECTION="$VALID_SELECTION $num"
+    # 纯数字：查看服务状态详情
+    elif echo "$INPUT" | grep -Eq "^[0-9]+$"; then
+        line_data=$(grep -E "^${INPUT}:" "$TMP_MATRIX" 2>/dev/null)
+        if [ -n "$line_data" ]; then
+            service=$(echo "$line_data" | cut -d':' -f2)
+            echo -e "\n${CYAN}=== $service 详细运行状态 ===${RESET}"
+            
+            rc-service "$service" status
+            
+            echo -e "\n${YELLOW}按回车返回菜单...${RESET}"
+            read -r _
+            refresh_list
+        else
+            echo -e "${YELLOW}无效序号: $INPUT${RESET}"
+        fi
     else
-        echo -e "${RED}警告: 序号 $num 不存在，已忽略${RESET}"
+        echo -e "${YELLOW}无效输入，请重新输入${RESET}"
     fi
 done
 
-if [ -z "$PIDS_TO_KILL" ]; then
-    echo -e "${RED}没有有效的序号被选择，退出${RESET}"
-    exit 1
-fi
-
-# ================== 确认操作 ==================
-echo -e "${YELLOW}你确定要杀掉以下进程吗？${RESET}"
-for num in $VALID_SELECTION; do
-    target_pid=$(echo "$RAW_DATA" | awk -v n="$num" 'NR==n {print $1}')
-    echo -e "${RED}序号 $num => PID $target_pid${RESET}"
-done
-
-echo -ne "${GREEN}输入 y 确认，其他键取消: ${RESET}"
-read -r CONFIRM
-
-case "$CONFIRM" in
-    [Yy]*)
-        # 执行杀进程操作
-        for pid in $PIDS_TO_KILL; do
-            if $SUDO kill -9 "$pid" 2>/dev/null; then
-                echo -e "${GREEN}成功杀掉 PID: $pid${RESET}"
-            else
-                echo -e "${RED}无法杀掉 PID: $pid（可能已被释放或权限不足）${RESET}"
-            fi
-        done
-        ;;
-    *)
-        echo -e "${GREEN}操作已取消，退出${RESET}"
-        exit 0
-        ;;
-esac
-
-# ================== 检查端口是否释放 ==================
-sleep 0.5 # 稍等半秒给内核释放套接字的时间
-CHECK_AGAIN=$(get_port_processes "$PORT")
-if [ -z "$CHECK_AGAIN" ]; then
-    echo -e "${GREEN}端口 $PORT 已成功释放${RESET}"
-else
-    echo -e "${RED}端口 $PORT 仍被占用，请检查${RESET}"
-fi
+# 清理痕迹
+rm -f "$TMP_MATRIX"

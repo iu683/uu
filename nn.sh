@@ -74,7 +74,6 @@ restart_nginx() {
         echo -e "${RED}❌ Nginx 配置语法错误！未执行重启，请检查上方的错误提示。${RESET}"
         return 1
     fi
-    pause
 }
 
 # ------------------------------

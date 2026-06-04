@@ -1,412 +1,332 @@
 #!/bin/bash
-# ==================================================
-# VPS Geo Firewall (IPv4+IPv6)
-# Debian / Ubuntu / Alpine Linux (完美兼容容器与精简环境)
-# 独立链 / 端口控制 / 自动更新 / 白名单 / 卸载
-# ==================================================
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
 
-CONF="/opt/geoip/geo.conf"
-UPDATE_SCRIPT="/opt/geoip/update_geo.sh"
-SCRIPT_PATH="/usr/local/bin/geofirewall"
-SCRIPT_URL="https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/GeoFirewall.sh"
+#################################################
+#  ACME证书备份系统
+#################################################
 
+INSTALL_DIR="/opt/acmebackup"
+LOCAL_SCRIPT="$INSTALL_DIR/acmebackup.sh"
+REMOTE_URL="https://raw.githubusercontent.com/iu683/uu/main/oo.sh"
+
+# Alpine 环境依赖检查与自动提示
+if [ -f /etc/alpine-release ]; then
+    if ! command -v curl &>/dev/null || ! command -v cmp &>/dev/null || ! tar --version 2>&1 | grep -q "GNU"; then
+        echo "检测到 Alpine 环境，正在自动安装必要依赖 (bash, curl, tar, diffutils)..."
+        apk update && apk add bash curl tar diffutils
+    fi
+fi
+
+if [[ "$0" != "$LOCAL_SCRIPT" ]]; then
+    mkdir -p "$INSTALL_DIR"
+
+    curl -fsSL -o "$LOCAL_SCRIPT.tmp" "$REMOTE_URL" || {
+        echo "下载失败，将继续使用本地/当前脚本运行"
+        cp "$0" "$LOCAL_SCRIPT"
+        chmod +x "$LOCAL_SCRIPT"
+    }
+
+    if [[ -f "$LOCAL_SCRIPT.tmp" ]]; then
+        if [[ ! -f "$LOCAL_SCRIPT" ]] || ! cmp -s "$LOCAL_SCRIPT.tmp" "$LOCAL_SCRIPT"; then
+            mv "$LOCAL_SCRIPT.tmp" "$LOCAL_SCRIPT"
+            chmod +x "$LOCAL_SCRIPT"
+            echo "已安装/更新到最新版本"
+        else
+            rm -f "$LOCAL_SCRIPT.tmp"
+        fi
+    fi
+
+    exec bash "$LOCAL_SCRIPT" "$@"
+fi
+
+#################################
+# 颜色
+#################################
 GREEN="\033[32m"
 RED="\033[31m"
+CYAN="\033[36m"
 YELLOW="\033[33m"
-BLUE="\033[34m"
 RESET="\033[0m"
 
-green(){ echo -e "${GREEN}$1${RESET}"; }
-red(){ echo -e "${RED}$1${RESET}"; }
+#################################
+# 基础路径
+#################################
+CONFIG_FILE="$INSTALL_DIR/config.sh"
+LOG_FILE="$INSTALL_DIR/backup.log"
+CRON_TAG="acmebackup_cron"
 
-[[ $(id -u) != 0 ]] && red "请使用 root 运行" && exit 1
+DATA_DIR_DEFAULT="$INSTALL_DIR/data"
+RETAIN_DAYS_DEFAULT=7
+SERVICE_NAME_DEFAULT="$(hostname)"
 
-# 检测系统类型
-if [ -f /etc/alpine-release ]; then
-    SYS_TYPE="alpine"
-else
-    SYS_TYPE="debian"
+mkdir -p "$INSTALL_DIR"
+
+#################################
+# ACME路径
+#################################
+ACME_HOME="/root/.acme.sh"
+SSL_DIR="/root/ssl"
+
+#################################
+# 卸载
+#################################
+if [[ "$1" == "--uninstall" ]]; then
+    echo -e "${YELLOW}正在卸载...${RESET}"
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/cron_back
+    if [ -s /tmp/cron_back ]; then
+        crontab /tmp/cron_back
+    else
+        crontab -r 2>/dev/null
+    fi
+    rm -f /tmp/cron_back
+    rm -rf "$INSTALL_DIR"
+    echo -e "${GREEN}卸载完成${RESET}"
+    exit 0
 fi
 
-# ================== 初始化环境 ==================
-init_env(){
-    mkdir -p /opt/geoip
-    touch $CONF
+#################################
+# 加载配置
+#################################
+load_config() {
+    [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
-    if [[ ! -f /opt/geoip/.deps_installed ]]; then
-        if [ "$SYS_TYPE" = "alpine" ]; then
-            apk update
-            # 无论如何先尝试安装 ipset 和 iptables 相关组件
-            apk add ipset iptables ip6tables curl bash ipset-openrc iptables-openrc 2>/dev/null
-            rc-update add iptables default 2>/dev/null
-            rc-update add ip6tables default 2>/dev/null
-            rc-service iptables start 2>/dev/null
-            rc-service ip6tables start 2>/dev/null
-        else
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update
-            apt-get install -y ipset iptables curl iptables-persistent netfilter-persistent
-        fi
-        touch /opt/geoip/.deps_installed
-        green "依赖环境检测完成"
-    fi
+    DATA_DIR=${DATA_DIR:-$DATA_DIR_DEFAULT}
+    RETAIN_DAYS=${RETAIN_DAYS:-$RETAIN_DAYS_DEFAULT}
+    SERVICE_NAME=${SERVICE_NAME:-$SERVICE_NAME_DEFAULT}
 }
+load_config
+mkdir -p "$DATA_DIR"
 
-# ================== 下载或更新脚本 ==================
-download_script(){
-    mkdir -p "$(dirname "$SCRIPT_PATH")"
-    curl -sSL "$SCRIPT_URL" -o "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
-    green "已更新"
-}
-
-# ================== 获取信息 ==================
-get_my_ip(){ 
-    ip route get 1.1.1.1 2>/dev/null | awk '{print $7}' | head -n1
-}
-
-get_ssh_port(){
-    grep -i "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1
-}
-
-# ================== 规则持久化保存函数 ==================
-save_rules(){
-    if [ "$SYS_TYPE" = "alpine" ]; then
-        /etc/init.d/iptables save >/dev/null 2>&1
-        /etc/init.d/ip6tables save >/dev/null 2>&1
-    else
-        netfilter-persistent save >/dev/null 2>&1
-    fi
-}
-
-# ================== 自动更新IP库 ==================
-install_auto_update(){
-cat > $UPDATE_SCRIPT <<EOF
-#!/bin/bash
-CONF="/opt/geoip/geo.conf"
-source \$CONF 2>/dev/null
-[[ -z "\$COUNTRY" ]] && exit 0
-CC_L=\$(echo \$COUNTRY | tr A-Z a-z)
-curl -s -o /opt/geoip/\${CC_L}.zone https://www.ipdeny.com/ipblocks/data/countries/\${CC_L}.zone
-curl -s -o /opt/geoip/\${CC_L}.ipv6.zone https://www.ipdeny.com/ipv6/ipaddresses/aggregated/\${CC_L}-aggregated.zone
-# 重新触发规则应用以更新内存中的IP
-/bin/bash $SCRIPT_PATH apply
+#################################
+# 保存配置
+#################################
+save_config() {
+cat > "$CONFIG_FILE" <<EOF
+DATA_DIR="$DATA_DIR"
+RETAIN_DAYS="$RETAIN_DAYS"
+SERVICE_NAME="$SERVICE_NAME"
+TG_TOKEN="$TG_TOKEN"
+TG_CHAT_ID="$TG_CHAT_ID"
 EOF
-
-    chmod +x $UPDATE_SCRIPT
-    (crontab -l 2>/dev/null | grep -v update_geo.sh; echo "0 3 * * * /bin/bash $UPDATE_SCRIPT") | crontab -
-    green "每日 03:00 自动更新IP库"
 }
 
-# ================== 应用规则 (核心兼容重构) ==================
-apply_rules(){
-    source $CONF 2>/dev/null
-    [[ -z "$COUNTRY" ]] && { red "未配置规则"; return; }
+#################################
+# Telegram
+#################################
+send_tg() {
+    [[ -z "$TG_TOKEN" || -z "$TG_CHAT_ID" ]] && return
+    MESSAGE="[$SERVICE_NAME] $1"
+    curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+        -d chat_id="$TG_CHAT_ID" \
+        -d text="$MESSAGE" >/dev/null 2>&1
+}
 
-    SSH_PORT=$(get_ssh_port)
-    [[ -z "$SSH_PORT" ]] && SSH_PORT=22
-    green "默认放行SSH端口: $SSH_PORT"
+#################################
+# 备份
+#################################
+backup() {
+    TIMESTAMP=$(date +%F_%H-%M-%S)
+    FILE="$DATA_DIR/acme_backup_$TIMESTAMP.tar.gz"
 
-    CC_L=$(echo $COUNTRY | tr A-Z a-z)
-    V4FILE="/opt/geoip/${CC_L}.zone"
-    V6FILE="/opt/geoip/${CC_L}.ipv6.zone"
+    echo -e "${CYAN}开始备份 ACME证书...${RESET}"
 
-    # 下载最新 IP 库
-    curl -s -o $V4FILE https://www.ipdeny.com/ipblocks/data/countries/$CC_L.zone
-    curl -s -o $V6FILE https://www.ipdeny.com/ipv6/ipaddresses/aggregated/$CC_L-aggregated.zone
+    [[ ! -d "$ACME_HOME" ]] && echo -e "${RED}未找到 acme.sh 目录 ($ACME_HOME)${RESET}" && return
+    [[ ! -d "$SSL_DIR" ]] && echo -e "${RED}未找到证书目录 ($SSL_DIR)${RESET}" && return
 
-    # 1. 基础链与跳转初始化
-    iptables -N GEO_CHAIN 2>/dev/null
-    ip6tables -N GEO_CHAIN 2>/dev/null
-    iptables -F GEO_CHAIN
-    ip6tables -F GEO_CHAIN
+    # 使用依赖自动安装的 GNU tar 规避 BusyBox tar 绝对路径截断问题
+    tar czf "$FILE" "$ACME_HOME" "$SSL_DIR" >> "$LOG_FILE" 2>&1
 
-    iptables -C INPUT -j GEO_CHAIN 2>/dev/null || iptables -I INPUT -j GEO_CHAIN
-    ip6tables -C INPUT -j GEO_CHAIN 2>/dev/null || ip6tables -I INPUT -j GEO_CHAIN
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}备份成功：$FILE${RESET}"
+        send_tg "✅ ACME备份成功"
+    else
+        echo -e "${RED}备份失败，详情请查看 $LOG_FILE${RESET}"
+        send_tg "❌ ACME备份失败"
+    fi
 
-    # Established, Related 放行
-    iptables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    ip6tables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    find "$DATA_DIR" -type f -name "*.tar.gz" -mtime +"$RETAIN_DAYS" -delete
+}
 
-    # 放行本地 IP 和 SSH
-    MYIP=$(get_my_ip)
-    [[ -n "$MYIP" ]] && iptables -A GEO_CHAIN -s $MYIP -j ACCEPT
-    iptables -A GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
-    ip6tables -A GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
+#################################
+# 恢复
+#################################
+restore() {
+    shopt -s nullglob
+    FILE_LIST=("$DATA_DIR"/*.tar.gz)
 
-    # 白名单放行
-    for ip in $WHITELIST; do
-        [[ -n "$ip" ]] && {
-            iptables -A GEO_CHAIN -s $ip -j ACCEPT
-            ip6tables -A GEO_CHAIN -s $ip -j ACCEPT
-        }
+    if [[ ${#FILE_LIST[@]} -eq 0 ]]; then
+        echo -e "${RED}没有备份文件${RESET}"
+        return
+    fi
+
+    echo -e "${CYAN}备份列表:${RESET}"
+    for i in "${!FILE_LIST[@]}"; do
+        echo -e "${GREEN}$((i+1)). $(basename "${FILE_LIST[$i]}")${RESET}"
     done
 
-    # 2. 判断是否能够运行 ipset
-    if [ "$SYS_TYPE" != "alpine" ] && command -v ipset >/dev/null 2>&1; then
-        # ------ Debian/Ubuntu 高效 ipset 方案 ------
-        ipset create geo_v4 hash:net family inet -exist
-        ipset create geo_v4_tmp hash:net family inet -exist
-        ipset flush geo_v4_tmp
-        while read -r ip; do [[ -n "$ip" ]] && ipset add geo_v4_tmp "$ip" 2>/dev/null; done < "$V4FILE"
-        ipset swap geo_v4_tmp geo_v4
-        ipset destroy geo_v4_tmp
+    read -p "输入序号: " num
 
-        ipset create geo_v6 hash:net family inet6 -exist
-        ipset create geo_v6_tmp hash:net family inet6 -exist
-        ipset flush geo_v6_tmp
-        while read -r ip; do [[ -n "$ip" ]] && ipset add geo_v6_tmp "$ip" 2>/dev/null; done < "$V6FILE"
-        ipset swap geo_v6_tmp geo_v6
-        ipset destroy geo_v6_tmp
-
-        # 应用底层过滤规则
-        for proto in tcp udp; do
-            if [[ "$MODE" == "block" ]]; then
-                if [[ "$PORTS" == "all" ]]; then
-                    iptables -A GEO_CHAIN -p $proto -m set --match-set geo_v4 src -j DROP
-                    ip6tables -A GEO_CHAIN -p $proto -m set --match-set geo_v6 src -j DROP
-                else
-                    for p in $PORTS; do
-                        iptables -A GEO_CHAIN -p $proto --dport $p -m set --match-set geo_v4 src -j DROP
-                        ip6tables -A GEO_CHAIN -p $proto --dport $p -m set --match-set geo_v6 src -j DROP
-                    done
-                fi
-            else
-                if [[ "$PORTS" == "all" ]]; then
-                    iptables -A GEO_CHAIN -p $proto -m set ! --match-set geo_v4 src -j DROP
-                    ip6tables -A GEO_CHAIN -p $proto -m set ! --match-set geo_v6 src -j DROP
-                else
-                    for p in $PORTS; do
-                        iptables -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set geo_v4 src -j DROP
-                        ip6tables -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set geo_v6 src -j DROP
-                    done
-                fi
-            fi
-        done
-    else
-        # ------ Alpine / 无ipset环境的 纯 iptables 方案 ------
-        green "检测到当前环境不支持 ipset，正在自动切换为纯 iptables 模式..."
-        
-        # 预先生成 iptables 批量追加脚本以提高效率
-        local v4_rules="/tmp/v4_rules.txt"
-        local v6_rules="/tmp/v6_rules.txt"
-        > $v4_rules
-        > $v6_rules
-
-        for proto in tcp udp; do
-            if [[ "$MODE" == "block" ]]; then
-                if [[ "$PORTS" == "all" ]]; then
-                    while read -r ip; do [[ -n "$ip" ]] && echo "-A GEO_CHAIN -s $ip -p $proto -j DROP" >> $v4_rules; done < "$V4FILE"
-                    while read -r ip; do [[ -n "$ip" ]] && echo "-A GEO_CHAIN -s $ip -p $proto -j DROP" >> $v6_rules; done < "$V6FILE"
-                else
-                    for p in $PORTS; do
-                        while read -r ip; do [[ -n "$ip" ]] && echo "-A GEO_CHAIN -s $ip -p $proto --dport $p -j DROP" >> $v4_rules; done < "$V4FILE"
-                        while read -r ip; do [[ -n "$ip" ]] && echo "-A GEO_CHAIN -s $ip -p $proto --dport $p -j DROP" >> $v6_rules; done < "$V6FILE"
-                    done
-                fi
-            else
-                # “只允许”模式在纯iptables下，先放行该国，最后一条规则封锁其余所有
-                if [[ "$PORTS" == "all" ]]; then
-                    while read -r ip; do [[ -n "$ip" ]] && echo "-A GEO_CHAIN -s $ip -p $proto -j ACCEPT" >> $v4_rules; done < "$V4FILE"
-                    while read -r ip; do [[ -n "$ip" ]] && echo "-A GEO_CHAIN -s $ip -p $proto -j ACCEPT" >> $v6_rules; done < "$V6FILE"
-                    echo "-A GEO_CHAIN -p $proto -j DROP" >> $v4_rules
-                    echo "-A GEO_CHAIN -p $proto -j DROP" >> $v6_rules
-                else
-                    for p in $PORTS; do
-                        while read -r ip; do [[ -n "$ip" ]] && echo "-A GEO_CHAIN -s $ip -p $proto --dport $p -j ACCEPT" >> $v4_rules; done < "$V4FILE"
-                        while read -r ip; do [[ -n "$ip" ]] && echo "-A GEO_CHAIN -s $ip -p $proto --dport $p -j ACCEPT" >> $v6_rules; done < "$V6FILE"
-                        echo "-A GEO_CHAIN -p $proto --dport $p -j DROP" >> $v4_rules
-                        echo "-A GEO_CHAIN -p $proto --dport $p -j DROP" >> $v6_rules
-                    done
-                fi
-            fi
-        done
-
-        # 批量导入规则（避免逐条处理导致的超长耗时）
-        [[ -s "$v4_rules" ]] && iptables-restore -n < <(echo "*filter"; cat $v4_rules; echo "COMMIT")
-        [[ -s "$v6_rules" ]] && ip6tables-restore -n < <(echo "*filter"; cat $v6_rules; echo "COMMIT")
-        rm -f $v4_rules $v6_rules
+    if ! [[ "$num" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}输入错误${RESET}"
+        return
     fi
 
-    save_rules
-    green "规则已成功应用并持久化保存"
+    if (( num < 1 || num > ${#FILE_LIST[@]} )); then
+        echo -e "${RED}序号超出范围${RESET}"
+        return
+    fi
+
+    FILE="${FILE_LIST[$((num-1))]}"
+
+    if [[ -z "$FILE" || ! -f "$FILE" ]]; then
+        echo -e "${RED}备份文件不存在${RESET}"
+        return
+    fi
+
+    echo -e "${YELLOW}确认恢复？(y/n)${RESET}"
+    read confirm
+    [[ "$confirm" != "y" ]] && return
+
+    # =========================
+    # 解压 (GNU tar 确保绝对路径无缝解压)
+    # =========================
+    tar xzf "$FILE" -C /
+
+    # =========================
+    # 校验
+    # =========================
+    if [[ ! -d /root/.acme.sh || ! -d /root/ssl ]]; then
+        echo -e "${RED}恢复失败：文件未正确解压${RESET}"
+        return
+    fi
+
+    # =========================
+    # 修复权限（关键）
+    # =========================
+    chmod 755 /root/.acme.sh/acme.sh 2>/dev/null
+    chmod -R 755 /root/.acme.sh 2>/dev/null
+    chmod -R 600 /root/.acme.sh/*.conf 2>/dev/null
+
+    chmod -R 600 /root/ssl 2>/dev/null
+
+    # =========================
+    # 恢复 cron（关键）
+    # =========================
+    if [[ -f /root/.acme.sh/acme.sh ]]; then
+        /root/.acme.sh/acme.sh --install-cronjob
+    fi
+
+    echo -e "${GREEN}恢复完成（ACME已自动恢复运行）${RESET}"
 }
 
-# ================== 添加规则 ==================
-add_rule(){
-    echo -e "${GREEN}选择模式:${RESET}"
-    echo -e "${GREEN}1 封锁某国某端口${RESET}"
-    echo -e "${GREEN}2 封锁某国所有端口${RESET}"
-    echo -e "${GREEN}3 只允许某国某端口${RESET}"
-    echo -e "${GREEN}4 只允许某国访问整个服务器${RESET}"
-    read -p $'\033[32m选择模式(1-4): \033[0m' choice
+#################################
+# 定时任务
+#################################
+add_cron() {
+    echo -e "${CYAN}1 每天0点${RESET}"
+    echo -e "${CYAN}2 每周一0点${RESET}"
+    echo -e "${CYAN}3 每月1号${RESET}"
+    echo -e "${CYAN}4 自定义${RESET}"
 
-    case "$choice" in
-        1)
-            MODE="block"
-            read -p $'\033[32m国家代码(例如 cn us jp): \033[0m' COUNTRY
-            read -p $'\033[32m端口 (多个空格): \033[0m' PORTS
-            ;;
-        2)
-            MODE="block"
-            read -p $'\033[32m国家代码(例如 cn us jp): \033[0m' COUNTRY
-            PORTS="all"
-            ;;
-        3)
-            MODE="allow"
-            read -p $'\033[32m国家代码(例如 cn us jp): \033[0m' COUNTRY
-            read -p $'\033[32m端口(例如 443 80 多个空格): \033[0m' PORTS
-            ;;
+    read -p "选择: " t
+    case $t in
+        1) cron="0 0 * * *" ;;
+        2) cron="0 0 * * 1" ;;
+        3) cron="0 0 1 * *" ;;
         4)
-            MODE="allow"
-            read -p $'\033[32m国家代码(例如 cn us jp): \033[0m' COUNTRY
-            PORTS="all"
+            read -p "请输入 cron 表达式: " cron
+
+            # 简单校验
+            if [[ ! "$cron" =~ ^([0-9*/,-]+[[:space:]]){4}[0-9*/,-]+$ ]]; then
+               echo -e "${RED}格式错误，例如: */2 * * * *${RESET}"
+               return
+            fi
             ;;
-        *)
-            red "无效选择"
-            return
-            ;;
+        *) return ;;
     esac
 
-    echo "MODE=\"$MODE\"" > $CONF
-    echo "COUNTRY=\"$COUNTRY\"" >> $CONF
-    echo "PORTS=\"$PORTS\"" >> $CONF
-    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
+    # 兼容 BusyBox 的 Crontab 读写逻辑
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/acmebackup 2>/dev/null
+    echo "$cron bash $LOCAL_SCRIPT auto >> $INSTALL_DIR/cron.log 2>&1 #$CRON_TAG" >> /tmp/acmebackup
+    crontab /tmp/acmebackup
+    rm -f /tmp/acmebackup
 
-    install_auto_update
-    apply_rules
+    echo -e "${GREEN}定时任务已设置: $cron${RESET}"
 }
 
-# ================== 白名单 ==================
-add_whitelist(){
-    read -p $'\033[32m输入白名单 IP (多个空格): \033[0m' ips
-    source $CONF 2>/dev/null
-    WHITELIST="$WHITELIST $ips"
-    echo "MODE=\"$MODE\"" > $CONF
-    echo "COUNTRY=\"$COUNTRY\"" >> $CONF
-    echo "PORTS=\"$PORTS\"" >> $CONF
-    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
-    apply_rules
-}
-
-delete_whitelist(){
-    read -p $'\033[32m输入要删除的白名单 IP (多个空格): \033[0m' ips
-    source $CONF 2>/dev/null
-    for ip in $ips; do
-        WHITELIST=$(echo $WHITELIST | sed "s/\b$ip\b//g")
-    done
-    echo "MODE=\"$MODE\"" > $CONF
-    echo "COUNTRY=\"$COUNTRY\"" >> $CONF
-    echo "PORTS=\"$PORTS\"" >> $CONF
-    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
-    apply_rules
-}
-
-# ================== 删除端口规则 ==================
-delete_rules(){
-    source $CONF 2>/dev/null
-    [[ -z "$PORTS" ]] && { red "未检测到配置"; return; }
-    read -p $'\033[32m输入要删除的端口 (多个空格): \033[0m' DEL_PORTS
-    [[ -z "$DEL_PORTS" ]] && { red "未输入端口"; return; }
-    for p in $DEL_PORTS; do
-        for proto in tcp udp; do
-            iptables -L GEO_CHAIN --line-numbers -n | grep "$proto" | grep "dpt:$p" | awk '{print $1}' | sort -rn | while read num; do
-                iptables -D GEO_CHAIN $num
-            done
-            ip6tables -L GEO_CHAIN --line-numbers -n | grep "$proto" | grep "dpt:$p" | awk '{print $1}' | sort -rn | while read num; do
-                ip6tables -D GEO_CHAIN $num
-            done
-        done
-        green "端口 $p 规则已删除"
-    done
-    save_rules
-}
-
-# ================== 查看规则 ==================
-view_rules(){
-    clear
-    green "========= 当前配置 ========="
-    cat $CONF 2>/dev/null
-    echo
-    iptables -L GEO_CHAIN -n --line-numbers 2>/dev/null
-    echo
-    ip6tables -L GEO_CHAIN -n --line-numbers 2>/dev/null
-    echo
-    if command -v ipset >/dev/null 2>&1; then
-        ipset list | grep "^Name:"
+remove_cron() {
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/acmebackup
+    if [ -s /tmp/acmebackup ]; then
+        crontab /tmp/acmebackup
+    else
+        crontab -r 2>/dev/null
     fi
+    rm -f /tmp/acmebackup
+    echo -e "${GREEN}已删除定时任务${RESET}"
 }
 
-# ================== 卸载 ==================
-uninstall_all(){
-    green "正在卸载"
-    iptables -D INPUT -j GEO_CHAIN 2>/dev/null
-    ip6tables -D INPUT -j GEO_CHAIN 2>/dev/null
-    iptables -F GEO_CHAIN 2>/dev/null
-    ip6tables -F GEO_CHAIN 2>/dev/null
-    iptables -X GEO_CHAIN 2>/dev/null
-    ip6tables -X GEO_CHAIN 2>/dev/null
-    if command -v ipset >/dev/null 2>&1; then
-        ipset list | grep "^Name: geo_" | awk '{print $2}' | xargs -r -I {} ipset destroy {} 2>/dev/null
-    fi
-    rm -rf /opt/geoip
-    crontab -l 2>/dev/null | grep -v update_geo.sh | crontab -
-    rm -f $SCRIPT_PATH
-    save_rules
-    green "已彻底卸载完成"
+show_cron(){
+    echo -e "${CYAN}当前任务:${RESET}"
+    crontab -l 2>/dev/null | grep "$CRON_TAG" || echo "无"
+}
+
+#################################
+# auto
+#################################
+if [[ "$1" == "auto" ]]; then
+    backup
     exit 0
-}
+fi
 
-# ================== 菜单 ==================
-menu(){
+#################################
+# 菜单
+#################################
+while true; do
     clear
-    local v_mode="未配置"
-    local v_country="无"
-    local v_ports="无"
-    if [ -f "$CONF" ]; then
-        source $CONF 2>/dev/null
-        [ "$MODE" == "block" ] && v_mode="${RED}仅封锁${RESET}"
-        [ "$MODE" == "allow" ] && v_mode="${GREEN}仅放行${RESET}"
-        [ -n "$COUNTRY" ] && v_country=$(echo "$COUNTRY" | tr 'a-z' 'A-Z')
-        [ -n "$PORTS" ] && v_ports="$PORTS"
-    fi
+    echo -e "${GREEN}==== ACME备份工具 ====${RESET}"
+    echo -e "${GREEN}1. 立即备份${RESET}"
+    echo -e "${GREEN}2. 恢复备份${RESET}"
+    echo -e "${GREEN}3. 设置定时任务${RESET}"
+    echo -e "${GREEN}4. 删除定时任务${RESET}"
+    echo -e "${GREEN}5. 设置备份目录(当前: $DATA_DIR)${RESET}"
+    echo -e "${GREEN}6. 设置保留天数(当前: $RETAIN_DAYS 天)${RESET}"
+    echo -e "${GREEN}7. 设置Telegram${RESET}"
+    echo -e "${GREEN}8. 查看定时任务${RESET}"
+    echo -e "${GREEN}9. 卸载${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
 
-    echo -e "${GREEN}===== VPS国家防火墙 =====${RESET}"
-    echo -e "${BLUE}当前模式: ${v_mode}"
-    echo -e "${BLUE}目标国家: ${YELLOW}${v_country}${RESET}"
-    echo -e "${BLUE}受控端口: ${YELLOW}${v_ports}${RESET}"
-    echo -e "${GREEN}=========================${RESET}"
-    echo -e "${GREEN}1 添加规则${RESET}"
-    echo -e "${GREEN}2 删除端口规则${RESET}"
-    echo -e "${GREEN}3 查看规则详情${RESET}"
-    echo -e "${GREEN}4 添加白名单${RESET}"
-    echo -e "${GREEN}5 删除白名单${RESET}"
-    echo -e "${GREEN}6 更新${RESET}"
-    echo -e "${GREEN}7 卸载${RESET}"
-    echo -e "${GREEN}0 退出${RESET}"
-    echo -e "${GREEN}=========================${RESET}"
-    read -r -p $'\033[32m请选择: \033[0m' num
-    case $num in
-        1) add_rule ;;
-        2) delete_rules ;;
-        3) view_rules ;;
-        4) add_whitelist ;;
-        5) delete_whitelist ;;
-        6) download_script ;;
-        7) uninstall_all ;;
+    read -r -p $'\033[32m选择: \033[0m' c
+    case $c in
+        1) backup ;;
+        2) restore ;;
+        3) add_cron ;;
+        4) remove_cron ;;
+        5) read -p "备份目录: " DATA_DIR; mkdir -p "$DATA_DIR"; save_config ;;
+        6) read -p "备份文件保留天数: " RETAIN_DAYS; save_config ;;
+        7)
+            read -p "服务器名称(默认: $(hostname)): " SERVICE_NAME
+            SERVICE_NAME=${SERVICE_NAME:-$(hostname)}
+            read -p "TG TOKEN: " TG_TOKEN
+            read -p "CHAT ID: " TG_CHAT_ID
+            save_config
+            ;;
+        8) show_cron ;;
+        9)
+           echo -e "${YELLOW}正在卸载...${RESET}"
+           crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/acmebackup
+           if [ -s /tmp/acmebackup ]; then
+               crontab /tmp/acmebackup
+           else
+               crontab -r 2>/dev/null
+           fi
+           rm -f /tmp/acmebackup
+           rm -rf "$INSTALL_DIR"
+           echo -e "${RED}卸载完成${RESET}"
+           exit 0
+           ;;
         0) exit ;;
     esac
-}
 
-# 支持直接命令行静默调用（为了配合自动化 cron 更新）
-if [ "$1" == "apply" ]; then
-    apply_rules
-    exit 0
-fi
-
-# ================== 主循环 ==================
-init_env
-while true; do
-    menu
-    read -r -p $'\033[32m按回车继续...\033[0m'
+    read -p "回车继续..."
 done

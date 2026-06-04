@@ -1,238 +1,359 @@
 #!/bin/bash
 # =========================================================================
-# Cron 定时任务智能管理面板（跨系统自适配 + 安全无缝交互版）
+#       ◈ 多语言开发环境通用安装/卸载智控面板 ◈
 # =========================================================================
 
-# 严格的 Root 权限检查
+# 权限校验
 if [ "$EUID" -ne 0 ]; then
-    echo -e "\033[31m❌ 错误：请使用 root 权限（或通过 sudo）运行此脚本！\033[0m"
+    echo -e "\033[31m❌ 错误：请使用 root 权限运行此脚本！\033[0m"
     exit 1
 fi
 
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+green="\033[32m"
+yellow="\033[33m"
+red="\033[31m"
+skyblue="\033[36m"
+purple="\033[35m"
+re="\033[0m"
 
-# 自动精确识别发行版
-get_os_type() {
-    if [ -f /etc/alpine-release ]; then
-        echo "Alpine"
-    elif [ -f /etc/os-release ]; then
-        . /etc/os-release
-        case "$ID" in
-            ubuntu) echo "Ubuntu" ;;
-            debian) echo "Debian" ;;
-            centos|rhel|rocky|almalinux) echo "RedHat" ;;
-            *) echo "Linux" ;;
-        esac
+# ================== 系统动态精准检测 ==================
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        OS=$(grep -o -E "Debian|Ubuntu|CentOS|Alpine|Fedora|Rocky|AlmaLinux|Amazon" /etc/os-release | head -n 1)
+    fi
+    if [ -z "$OS" ]; then
+        echo -e "${red}❌ 不支持的系统架构！${re}"
+        exit 1
     else
-        echo "Linux"
+        echo -e "${green}当前检测到宿主系统：${yellow}${OS}${re}"
     fi
 }
 
-OS=$(get_os_type)
-
-# 安装并启动 crontab 服务 
-install_crontab_if_missing() {
-    if ! command -v crontab >/dev/null 2>&1; then
-        echo -e "${YELLOW}🔧 未检测到 crontab 组件，正在为您自动补全...${RESET}"
-        case "$OS" in
-            Alpine)
-                apk add --no-cache dcron >/dev/null 2>&1
-                rc-update add crond default >/dev/null 2>&1
-                rc-service crond start >/dev/null 2>&1
-                ;;
-            Ubuntu|Debian)
-                apt-get update -y >/dev/null 2>&1
-                apt-get install -y cron >/dev/null 2>&1
-                systemctl enable --now cron >/dev/null 2>&1
-                ;;
-            RedHat)
-                yum install -y cronie >/dev/null 2>&1 || dnf install -y cronie >/dev/null 2>&1
-                systemctl enable --now crond >/dev/null 2>&1
-                ;;
-            *)
-                echo -e "${RED}❌ 无法自动识别系统类型，请手动安装 crontab！${RESET}"
-                read -rp "按回车键退出..."
-                exit 1
-                ;;
-        esac
-        echo -e "${GREEN}✅ crontab 安装完成并已自动启动服务！${RESET}"
-        sleep 1
-    else
-        # 服务保活，确保其运行
-        if [ "$OS" = "Alpine" ]; then
-            rc-service crond start >/dev/null 2>&1
-        elif command -v systemctl >/dev/null 2>&1; then
-            systemctl start cron >/dev/null 2>&1 || systemctl start crond >/dev/null 2>&1
-        fi
-    fi
-}
-
-# 校验数字范围 
-validate_number() {
-    local value="$1" local min="$2" local max="$3" local name="$4"
-    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt "$min" ] || [ "$value" -gt "$max" ]; then
-        echo -e "${RED}❌ 错误：${name} 输入无效，应在 $min 到 $max 之间！${RESET}"
-        return 1
-    fi
-    return 0
-}
-
-# 添加任务 
-add_cron_task() {
-    echo -e "\n${YELLOW}=== ➕ 添加新定时任务 ===${RESET}"
-    echo -ne "${GREEN}请输入新任务要执行的 Shell 命令: ${RESET}"
-    read -r newquest
-    [ -z "$newquest" ] && return
-
-    echo -e "\n${YELLOW}------ ⏰ 选择触发周期 ------${RESET}"
-    echo -e "${GREEN}  1) 每月任务 (指定某天 00:00 执行)${RESET}"            
-    echo -e "${GREEN}  2) 每周任务 (指定周几 00:00 执行)${RESET}"
-    echo -e "${GREEN}  3) 每天任务 (指定每天几点 00分 执行)${RESET}"  
-    echo -e "${GREEN}  4) 每小时任务 (指定每小时第几分钟 执行)${RESET}"
-    echo -e "${YELLOW}----------------------------${RESET}"
-    echo -ne "${GREEN}请选择时间类型: ${RESET}"
-    read -r dingshi
-
-    case "$dingshi" in
-        1)
-            echo -ne "${YELLOW}每月的几号执行任务？ (1-31): ${RESET}"
-            read -r day
-            validate_number "$day" 1 31 "日期" || { read -rp "按回车键返回..."; return; }
-            (crontab -l 2>/dev/null; echo "0 0 $day * * $newquest") | crontab -
+# ================== 自动化依赖环境补全 ==================
+install_deps() {
+    echo -e "${yellow}⚙️ 正在为您自动同步系统基础依赖包...${re}"
+    case "$OS" in
+        Debian|Ubuntu)
+            apt-get update -y >/dev/null 2>&1
+            apt-get install -y wget tar build-essential libreadline-dev libncursesw5-dev libssl-dev libsqlite3-dev tk-dev libgdbm-dev libc6-dev libbz2-dev libffi-dev zlib1g-dev curl jq software-properties-common ca-certificates gnupg >/dev/null 2>&1
             ;;
-        2)
-            echo -ne "${YELLOW}周几执行任务？ (0-6, 0=周日): ${RESET}"
-            read -r weekday
-            validate_number "$weekday" 0 6 "星期" || { read -rp "按回车键返回..."; return; }
-            (crontab -l 2>/dev/null; echo "0 0 * * $weekday $newquest") | crontab -
+        CentOS)
+            yum update -y >/dev/null 2>&1
+            yum groupinstall -y "Development Tools" >/dev/null 2>&1
+            yum install -y wget tar openssl-devel bzip2-devel libffi-devel zlib-devel curl jq epel-release yum-utils >/dev/null 2>&1
             ;;
-        3)
-            echo -ne "${YELLOW}每天几点执行任务？（小时，0-23）: ${RESET}"
-            read -r hour
-            validate_number "$hour" 0 23 "小时" || { read -rp "按回车键返回..."; return; }
-            (crontab -l 2>/dev/null; echo "0 $hour * * * $newquest") | crontab -
+        Fedora|Rocky|AlmaLinux|Amazon)
+            dnf update -y >/dev/null 2>&1
+            dnf groupinstall -y "Development Tools" >/dev/null 2>&1
+            dnf install -y wget tar openssl-devel bzip2-devel libffi-devel zlib-devel curl jq epel-release yum-utils >/dev/null 2>&1
             ;;
-        4)
-            echo -ne "${YELLOW}每小时第几分钟执行任务？（分钟，0-59）: ${RESET}"
-            read -r minute
-            validate_number "$minute" 0 59 "分钟" || { read -rp "按回车键返回..."; return; }
-            (crontab -l 2>/dev/null; echo "$minute * * * * $newquest") | crontab -
-            ;;
-        *)
-            echo -e "${RED}❌ 无效选择${RESET}"
-            sleep 1
-            return
+        Alpine)
+            apk update >/dev/null 2>&1
+            apk add wget tar build-base openssl-dev bzip2-dev libffi-dev zlib-dev curl jq >/dev/null 2>&1
             ;;
     esac
-    echo -e "\n${GREEN}✅ 任务已成功持久化写入 crontab 定时列表！${RESET}"
-    read -rp "按回车键返回菜单..."
 }
 
-# 删除任务
-delete_cron_task() {
-    echo -e "\n${YELLOW}=== ➖ 删除定时任务 ===${RESET}"
-    local tmp_cron="/tmp/cron_list_tmp"
-    
-    # 安全导出，避免因 crontab 为空触发 set -e 崩溃（虽然新脚本已经拿掉了 set -e，但安全第一）
-    crontab -l 2>/dev/null > "$tmp_cron" || true
-    
-    if [ ! -s "$tmp_cron" ]; then
-        echo -e "${YELLOW}💡 当前系统中没有任何运行中的定时任务。${RESET}"
-        rm -f "$tmp_cron"
-        read -rp "按回车键返回菜单..."
+get_arch() {
+    local arch_raw=$(uname -m)
+    case "$arch_raw" in
+        x86_64|amd64) ARCH="amd64" ;;
+        x86) ARCH="386" ;;
+        arm64|aarch64) ARCH="arm64" ;;
+        *) echo -e "${red}❌ 不支持的硬件架构: $arch_raw${re}"; exit 1 ;;
+    esac
+}
+
+# ================== Python 3.14+ 编译环境 ==================
+install_python() {
+    local latest_version="3.14.3"
+    if command -v python3 >/dev/null 2>&1; then
+        local current_version=$(python3 -V 2>&1 | awk '{print $2}')
+        if [ "$current_version" = "$latest_version" ]; then
+            echo -e "${green}✓ Python 已是指定编译版本: ${yellow}${latest_version}${re}"
+            return
+        fi
+        echo -ne "${yellow}检测到当前已存在版本 ${current_version}, 是否继续编译安装 Python ${latest_version}？[y/n]: ${re}"
+        read -r confirm
+        if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then return; fi
+    fi
+
+    install_deps
+    cd /tmp || exit 1
+    echo -e "${yellow}🚀 正在从官网拉取 Python ${latest_version} 源码包...${re}"
+    wget -c "https://www.python.org/ftp/python/${latest_version}/Python-${latest_version}.tar.xz"
+
+    if [ ! -f "Python-${latest_version}.tar.xz" ]; then
+        echo -e "${red}❌ Python 源码下载失败${re}"
         return
     fi
 
-    echo -e "${GREEN}当前可删除的任务列表:${RESET}"
-    awk '{print "  " NR") " $0}' "$tmp_cron"
-    echo -e "${YELLOW}---------------------------------------${RESET}"
-    echo -ne "${YELLOW}请输入要删除的任务序号（多个用空格分隔）: ${RESET}"
-    read -r indices
-    [ -z "$indices" ] && { rm -f "$tmp_cron"; return; }
-
-    # 倒序排列序号，从后往前删，避免行号因动态缩减而错位
-    local sorted_indices=$(echo "$indices" | tr ' ' '\n' | sort -rn)
+    tar -xf "Python-${latest_version}.tar.xz" && cd "Python-${latest_version}" || exit 1
+    echo -e "${yellow}⚙️ 正在为您配置安全编译环境 (Prefix: /usr/local/python3)...${re}"
+    ./configure --prefix=/usr/local/python3 >/dev/null 2>&1
     
-    for idx in $sorted_indices; do
-        if [[ "$idx" =~ ^[0-9]+$ ]]; then
-            # 兼容适配：使用通用的 sed 行为，完美契合 Alpine Busybox 与 传统 Linux
-            sed -i "${idx}d" "$tmp_cron" 2>/dev/null || sed -i "" "${idx}d" "$tmp_cron" 2>/dev/null
-        fi
-    done
+    echo -e "${yellow}🛠️ 正在多核并行编译中，请耐心等待...${re}"
+    make -j$(nproc 2>/dev/null || echo 2) >/dev/null 2>&1
+    make altinstall >/dev/null 2>&1
 
-    crontab "$tmp_cron"
-    rm -f "$tmp_cron"
-    echo -e "\n${GREEN}✅ 选定任务已成功剔除并同步到系统内核！${RESET}"
-    read -rp "按回车键返回菜单..."
+    local PY_BIN=$(find /usr/local/python3/bin -name "python3.*" | sort -V | tail -n1)
+    local PIP_BIN=$(find /usr/local/python3/bin -name "pip3*" | head -n1)
+
+    ln -sf "$PY_BIN" /usr/local/bin/python3
+    ln -sf "$PIP_BIN" /usr/local/bin/pip3
+
+    python3 -m ensurepip --upgrade >/dev/null 2>&1
+    python3 -m pip install --upgrade pip >/dev/null 2>&1
+
+    echo -e "${green}✅ Python ${latest_version} 环境已在全局无缝就绪！${re}"
+    cd /tmp && rm -rf "Python-${latest_version}"*
 }
 
-# 编辑任务 
-edit_cron_task() {
-    echo -e "\n${YELLOW}=== 📝 手动编辑定时任务 ===${RESET}"
-    if ! command -v nano >/dev/null 2>&1 && ! command -v vim >/dev/null 2>&1; then
-        echo -e "${YELLOW}🔧 正在安装轻量文本编辑器 nano...${RESET}"
-        case "$OS" in
-            Alpine) apk add --no-cache nano >/dev/null 2>&1 ;;
-            Ubuntu|Debian) apt-get update -y >/dev/null 2>&1 && apt-get install -y nano >/dev/null 2>&1 ;;
-            *) yum install -y nano >/dev/null 2>&1 || dnf install -y nano >/dev/null 2>&1 ;;
-        esac
-    fi
-    export EDITOR=$(command -v nano || command -v vim || command -v vi)
-    crontab -e
+remove_python() {
+    echo -e "${yellow}⚡ 正在清除自定义编译的 Python 环境...${re}"
+    rm -rf /usr/local/python3
+    rm -f /usr/local/bin/python3* /usr/local/bin/pip3*
+    echo -e "${green}✓ Python 卸载完成${re}"
 }
 
-# 预检安装
-install_crontab_if_missing
-
-# 主循环面板
-while true; do
-    clear
-
-
-    # 核心过滤规则定义：剔除注释、空行、语言环境、以及 Alpine 自带的系统级 periodic 维护任务
-    local filter_cmd="grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]'"
-    
-    # 【极致过滤】计算真正属于用户自己添加的活跃任务总数
-    if crontab -l >/dev/null 2>&1; then
-        TASK_COUNT=$(eval "crontab -l 2>/dev/null | $filter_cmd | wc -l" | tr -d ' ')
-    else
-        TASK_COUNT=0
+# ================== Node.js 跨平台全自动适配 ==================
+install_node() {
+    if command -v node >/dev/null 2>&1; then
+        echo -e "${yellow}✓ Node.js 已存在，当前版本: $(node -v)${re}"
+        return
     fi
-
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}       ◈  Cron 定时任务管理面板  ◈      ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN} 当前系统环境 : ${YELLOW}${OS}${RESET}"
-    echo -e "${GREEN} 活跃任务总数 : ${YELLOW}${YELLOW}${TASK_COUNT} 条${RESET}"
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN} 📋 当前系统定时任务快照：${RESET}"
+    echo -e "${yellow}🚀 正在为您部署跨平台 Node.js 环境...${re}"
     
-
-    if [ "$TASK_COUNT" -gt 0 ]; then
-        eval "crontab -l 2>/dev/null | $filter_cmd" | awk '{print "   • " $0}'
-    else
-        echo -e "   ${YELLOW}(暂无用户自定义的定时任务)${RESET}"
-    fi
-    
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  1) 快速添加定时任务(引导式)${RESET}"
-    echo -e "${GREEN}  2) 精准删除定时任务(支持多选)${RESET}"
-    echo -e "${GREEN}  3) 深度手动编辑任务(打开编辑器)${RESET}"
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  0) 退出${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    
-    echo -ne "${GREEN} 请选择操作编号: ${RESET}"
-    read -r choice
-
-    case "$choice" in
-        1) add_cron_task ;;
-        2) delete_cron_task ;;
-        3) edit_cron_task ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}❌ 输入错误，无此选项${RESET}"; sleep 1 ;;
+    case "$OS" in
+        Ubuntu|Debian)
+            curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
+            apt-get install -y nodejs >/dev/null 2>&1
+            ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon)
+            curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
+            dnf install -y nodejs >/dev/null 2>&1 || yum install -y nodejs >/dev/null 2>&1
+            ;;
+        Alpine)
+            apk add --no-cache nodejs npm >/dev/null 2>&1
+            ;;
     esac
-done
+
+    if command -v node >/dev/null 2>&1; then
+        echo -e "${green}✅ Node.js 安装成功！【Node: $(node -v) | NPM: $(npm -v 2>/dev/null || echo 'N/A')】${re}"
+    else
+        echo -e "${red}❌ Node.js 部署失败，请检查网路！${re}"
+    fi
+}
+
+remove_node() {
+    echo -e "${yellow}⚡ 正在卸载 Node.js 环境...${re}"
+    case "$OS" in
+        Ubuntu|Debian) apt-get purge -y nodejs >/dev/null 2>&1 && apt-get autoremove -y >/dev/null 2>&1 ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon) yum remove -y nodejs >/dev/null 2>&1 || dnf remove -y nodejs >/dev/null 2>&1 ;;
+        Alpine) apk del nodejs npm >/dev/null 2>&1 ;;
+    esac
+    echo -e "${green}✓ Node.js 卸载完成${re}"
+}
+
+# ================== Golang 极致通用升级版 ==================
+install_go() {
+    get_arch
+    echo -e "${yellow}🔍 🔍 正在检索 Go 官网最新长期支持版...${re}"
+    local latest_version=$(curl -s https://go.dev/dl/ | grep -oE 'go[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+    local latest_version_num=${latest_version#go}
+
+    if command -v go >/dev/null 2>&1; then
+        local current_version=$(go version | grep -oE 'go[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+        current_version=${current_version#go}
+        if [ "$current_version" = "$latest_version_num" ]; then
+            echo -e "${green}✓ Go 当前已是最新长期支持版: $current_version${re}"
+            return
+        fi
+        echo -ne "${yellow}当前版本为 $current_version, 是否一键平滑升级至 $latest_version_num？[y/n]: ${re}"
+        read -r confirm
+        if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then return; fi
+        remove_go
+    fi
+
+    echo -e "${yellow}🚀 正在下载 Golang 内核: ${latest_version_num}...${re}"
+    wget -O /tmp/go_latest.tar.gz "https://go.dev/dl/${latest_version}.linux-${ARCH}.tar.gz"
+
+    if [ ! -f /tmp/go_latest.tar.gz ]; then
+        echo -e "${red}❌ Go 二进制包拉取失败${re}"
+        return
+    fi
+
+    rm -rf /usr/local/go
+    tar -C /usr/local -xzf /tmp/go_latest.tar.gz
+    rm -f /tmp/go_latest.tar.gz
+
+    # 环境持久化同步
+    if [ ! -f /etc/profile.d/go.sh ]; then
+        echo "export PATH=/usr/local/go/bin:\$PATH" > /etc/profile.d/go.sh
+    fi
+    
+    export PATH=/usr/local/go/bin:$PATH
+    echo -e "${green}✅ Go 环境部署完成！当前内核: $(/usr/local/go/bin/go version)${re}"
+}
+
+remove_go() {
+    echo -e "${yellow}⚡ 正在清除系统级别 Go 语言环境...${re}"
+    rm -rf /usr/local/go
+    rm -f /etc/profile.d/go.sh
+    echo -e "${green}✓ Go 卸载完成${re}"
+}
+
+# ================== Java LTS 21 生产适配 ==================
+install_java() {
+    if command -v java >/dev/null 2>&1; then
+        echo -e "${yellow}✓ 检查到系统已存在 Java 版本: $(java -version 2>&1 | head -n1)${re}"
+        echo -ne "${yellow}是否执意重置并重新安装 OpenJDK 21？ [y/N]: ${re}"
+        read -r confirm
+        if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then return; fi
+        remove_java
+    fi
+
+    echo -e "${yellow}🚀 正在为您匹配最适合当前系统的 OpenJDK 21...${re}"
+    case "$OS" in
+        Debian|Ubuntu)
+            apt-get update -y >/dev/null 2>&1
+            if grep -qi "bookworm" /etc/os-release; then
+                apt-get install -y wget gpg ca-certificates >/dev/null 2>&1
+                mkdir -p /etc/apt/keyrings
+                wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor -o /etc/apt/keyrings/adoptium.gpg >/dev/null 2>&1
+                echo "deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb bookworm main" > /etc/apt/sources.list.d/adoptium.list
+                apt-get update -y >/dev/null 2>&1
+                apt-get install -y temurin-21-jdk >/dev/null 2>&1
+            else
+                apt-get install -y openjdk-21-jdk >/dev/null 2>&1
+            fi
+            ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon)
+            yum install -y java-21-openjdk java-21-openjdk-devel >/dev/null 2>&1 || dnf install -y java-21-openjdk java-21-openjdk-devel >/dev/null 2>&1
+            ;;
+        Alpine)
+            apk add openjdk21 >/dev/null 2>&1
+            ;;
+    esac
+
+    if command -v java >/dev/null 2>&1; then
+        echo -e "${green}✅ Java 21 安装成功！环境快照：${re}"
+        java -version
+    else
+        echo -e "${red}❌ Java 安装因环境原因遭遇阻碍${re}"
+    fi
+}
+
+remove_java() {
+    echo -e "${yellow}⚡ 正在清除 OpenJDK / Temurin 系统组件...${re}"
+    case "$OS" in
+        Debian|Ubuntu)
+            apt-get remove -y 'openjdk-*' 'temurin-*' >/dev/null 2>&1
+            apt-get autoremove -y >/dev/null 2>&1
+            rm -f /etc/apt/sources.list.d/adoptium.list /etc/apt/keyrings/adoptium.gpg
+            ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon)
+            yum remove -y java-21-openjdk* >/dev/null 2>&1 || dnf remove -y java-21-openjdk* >/dev/null 2>&1
+            ;;
+        Alpine)
+            apk del openjdk21 >/dev/null 2>&1
+            ;;
+    esac
+    rm -rf /usr/lib/jvm /usr/local/java
+    echo -e "${green}✓ Java 环境卸载成功${re}"
+}
+
+# ================== PHP 安全稳定运行版 ==================
+install_php() {
+    echo -e "${yellow}🚀 正在为您接入并拉取适用于 ${OS} 的 PHP 环境...${re}"
+    case "$OS" in
+        Ubuntu)
+            apt-get install -y software-properties-common >/dev/null 2>&1
+            add-apt-repository -y ppa:ondrej/php >/dev/null 2>&1
+            apt-get update -y >/dev/null 2>&1
+            apt-get install -y php php-cli php-fpm php-mysql php-xml php-curl php-mbstring php-zip >/dev/null 2>&1
+            ;;
+        Debian)
+            # Debian 原生极其稳定，默认源直接安装长期支持版
+            apt-get update -y >/dev/null 2>&1
+            apt-get install -y php php-cli php-fpm php-mysql php-xml php-curl php-mbstring php-zip >/dev/null 2>&1
+            ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon)
+            # 兼容企业级全系 Linux
+            dnf install -y php php-cli php-fpm php-mysqlnd php-xml php-mbstring php-curl php-zip >/dev/null 2>&1 || \
+            yum install -y php php-cli php-fpm php-mysqlnd php-xml php-mbstring php-curl php-zip >/dev/null 2>&1
+            ;;
+        Alpine)
+            apk add --no-cache php php-cli php-fpm php-mysqli php-curl php-xml php-mbstring php-zip >/dev/null 2>&1
+            ;;
+    esac
+    
+    if command -v php >/dev/null 2>&1; then
+        echo -e "${green}✅ PHP 部署完成！版本快照: $(php -v | head -n1)${re}"
+    else
+        echo -e "${red}❌ PHP 环境安装失败，请检查源配置${re}"
+    fi
+}
+
+remove_php() {
+    echo -e "${yellow}⚡ 正在清除 PHP 组件及相关扩展依赖...${re}"
+    case "$OS" in
+        Debian|Ubuntu) apt-get purge -y php* >/dev/null 2>&1 && apt-get autoremove -y >/dev/null 2>&1 ;;
+        CentOS|Fedora|Rocky|AlmaLinux|Amazon) yum remove -y php* >/dev/null 2>&1 || dnf remove -y php* >/dev/null 2>&1 ;;
+        Alpine) apk del php php-cli php-fpm php-mysqli php-curl php-xml php-mbstring php-zip >/dev/null 2>&1 ;;
+    esac
+    echo -e "${green}✓ PHP 全线环境卸载完成${re}"
+}
+
+# ================== 核心可交互式大面板 ==================
+main_menu() {
+    detect_os
+    while true; do
+        clear
+        echo -e "${green}=======================================${re}"
+        echo -e "${green}         ◈ 开发语言环境面板 ◈         ${re}"
+        echo -e "${green}=======================================${re}"
+        echo -e "${green} 系统架构 :${re} ${yellow}$(uname -m)${re}" 
+        echo -e "${green} 宿主系统 :${re} ${yellow}${OS}${re}"
+        echo -e "$green}---------------------------------------${re}"
+        echo -e "${green}  1) 安装 Python 3.14+ (源码编译)${re}"
+        echo -e "${green}  2) 安装 Node.js LTS  (官方多端适配)${re}"
+        echo -e "${green}  3) 安装 Golang 最新版 (全局自适应)${re}"
+        echo -e "${green}  4) 安装 Java LTS 21  (多端生产级)${re}"
+        echo -e "${green}  5) 安装 PHP 服务环境 (轻量运行组件)${re}"
+        echo -e "${green}---------------------------------------${re}"
+        echo -e "${red}  6) 御载 Python 环境${re}"
+        echo -e "${red}  7) 御载 Node.js 环境${re}"
+        echo -e "${red}  8) 御载 Golang 环境${re}"
+        echo -e "${red}  9) 御载 Java 运行环境${re}"
+        echo -e "${red} 10) 御载 PHP 服务环境${re}"
+        echo -e "${green}---------------------------------------${re}"
+        echo -e "${yellow}  0) 退出"
+        echo -e "${green}=======================================${re}"
+        
+        echo -ne "${green}请输入操作指令编号: ${re}"
+        read -r choice
+
+        case "$choice" in
+            1) install_python ;;
+            2) install_node ;;
+            3) install_go ;;
+            4) java_out=$(install_java) ;;
+            5) install_php ;;
+            6) remove_python ;;
+            7) remove_node ;;
+            8) remove_go ;;
+            9) remove_java ;;
+            10) remove_php ;;
+            0) exit 0 ;;
+            *) echo -e "${red}❌ 输入无效，请重新选择！${re}"; sleep 1; continue ;;
+        esac
+        
+        echo ""
+        echo -ne "${skyblue}👉 操作已执行完毕，按 [回车键] 重回主菜单...${re}"
+        read -r dummy
+    done
+}
+
+# 启动面板入口
+main_menu

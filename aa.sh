@@ -1,193 +1,294 @@
-#!/bin/bash
+#!/bin/sh
 # =========================================================================
-#       ◈ Tmux 虚拟化工作区通用多端管理面板 ◈
+#       ◈ 多系统通用运维工具箱一键部署面板 (POSIX Shell 完美兼容版)
 # =========================================================================
 
-# 设置颜色
+# 权限校验
+if [ "$(id -u)" -ne 0 ]; then
+    echo "\033[31m❌ 错误：请使用 root 权限或 sudo 运行此脚本！\033[0m"
+    exit 1
+fi
+
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
-SKYBLUE="\033[36m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-# ================== 自动化多平台安装组件 ==================
-install_tmux() {
-    if ! command -v tmux >/dev/null 2>&1; then
-        echo -e "${YELLOW}⚙️ 正在检测宿主系统包管理器并自动部署 Tmux...${RESET}"
-        
-        # 智能判定包管理器，免去手工 sudo 的尴尬
-        local cmd_prefix=""
-        if command -v sudo >/dev/null 2>&1; then cmd_prefix="sudo"; fi
-
-        if command -v apk >/dev/null 2>&1; then
-            $cmd_prefix apk add --no-cache tmux >/dev/null 2>&1
-        elif command -v apt-get >/dev/null 2>&1; then
-            $cmd_prefix apt-get update -y >/dev/null 2>&1
-            $cmd_prefix apt-get install -y tmux >/dev/null 2>&1
-        elif command -v dnf >/dev/null 2>&1; then
-            $cmd_prefix dnf install -y tmux >/dev/null 2>&1
-        elif command -v yum >/dev/null 2>&1; then
-            $cmd_prefix yum install -y tmux >/dev/null 2>&1
-        else
-            echo -e "${RED}❌ 错误: 无法识别当前系统架构，请手动安装 tmux 后重试。${RESET}"
-            read -r -p "按 [回车键] 返回菜单..." dummy
-            return 1
-        fi
-    fi
-
-    if command -v tmux >/dev/null 2>&1; then
-        echo -e "${GREEN}✅ Tmux 虚拟化核心组件已完美就绪！${RESET}"
+# ================== 精准系统检测 ==================
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        os_name=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
     else
-        echo -e "${RED}❌ Tmux 安装失败，请检查网络源。${RESET}"
+        os_name="unknown"
     fi
-    read -r -p "按 [回车键] 返回菜单..." dummy
+    
+    # 规范化家族名称
+    case "$os_name" in
+        fedora|rocky|alma|centos) os_family="rhel" ;;
+        ubuntu|debian|kali|linuxmint) os_family="debian" ;;
+        alpine) os_family="alpine" ;;
+        amzn) os_family="amazon" ;;
+        *) os_family="unknown" ;;
+    esac
 }
 
-# ================== 卸载组件 ==================
-remove_tmux() {
-    if command -v tmux >/dev/null 2>&1; then
-        echo -e "${YELLOW}⚡ 正在清空宿主机中的 Tmux 组件...${RESET}"
-        local cmd_prefix=""
-        if command -v sudo >/dev/null 2>&1; then cmd_prefix="sudo"; fi
-
-        case "$cmd_prefix" in
-            *)
-                if command -v apk >/dev/null 2>&1; then $cmd_prefix apk del tmux >/dev/null 2>&1;
-                elif command -v apt-get >/dev/null 2>&1; then $cmd_prefix apt-get remove -y tmux >/dev/null 2>&1;
-                elif command -v dnf >/dev/null 2>&1; then $cmd_prefix dnf remove -y tmux >/dev/null 2>&1;
-                elif command -v yum >/dev/null 2>&1; then $cmd_prefix yum remove -y tmux >/dev/null 2>&1; fi
+# ================== 核心通用安装引擎 ==================
+install_tool_core() {
+    local tool="$1"
+    local sys_mode="$2"
+    
+    echo -e "${YELLOW}⚙️ 正在为您在 ${os_name} 系统上配置 ${tool} ...${RESET}"
+    
+    # 针对特定系统工具做特殊分支处理
+    if [ "$sys_mode" = "sys" ]; then
+        case "$os_family" in
+            rhel)
+                yum install epel-release -y >/dev/null 2>&1
+                yum install -y "$tool"
+                return $?
+                ;;
+            amazon)
+                amazon-linux-extras install epel -y >/dev/null 2>&1 || yum install epel-release -y >/dev/null 2>&1
+                yum install -y "$tool"
+                return $?
+                ;;
+            debian)
+                if [ "$tool" = "mtr" ]; then
+                    apt-get update -y && apt-get install -y mtr-tiny
+                    return $?
+                fi
                 ;;
         esac
-        echo -e "${GREEN}✓ Tmux 已安全卸载。${RESET}"
-    else
-        echo -e "${YELLOW}提示: 系统中未检测到 Tmux 环境，无需御载。${RESET}"
     fi
-    read -r -p "按 [回车键] 返回菜单..." dummy
-}
 
-# ================== 智能开启/直连虚拟工作区 ==================
-open_workspace() {
-    local SESSION_NAME="$1"
-    
-    # 前置拦截：确保组件存在
-    if ! command -v tmux >/dev/null 2>&1; then
-        echo -e "${RED}❌ 错误：未检测到 Tmux 环境！请先选 [a] 安装工作区环境。${RESET}"
-        read -r -p "按 [回车键] 返回菜单..." dummy
+    # 标准通用安装路由
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y >/dev/null 2>&1 && apt-get install -y "$tool"
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y "$tool"
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y "$tool"
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache "$tool"
+    else
+        echo -e "${RED}❌ 错误：无法识别此系统的包管理器！${RESET}"
         return 1
     fi
-
-    # 检测当前是否已经在其他的 Tmux 会话里嵌套（防止无限套娃报错）
-    if [ -n "$TMUX" ]; then
-        echo -e "${RED}⚠️  您当前已经身处一个 Tmux 会话中了！不能在内部再次嵌套连接。${RESET}"
-        read -r -p "按 [回车键] 返回主菜单..." dummy
-        return 1
-    fi
-
-    # 检查工作区是否存在
-    tmux has-session -t "$SESSION_NAME" 2>/dev/null
-    if [ $? -ne 0 ]; then
-        # 后台静默创建会话
-        tmux new-session -s "$SESSION_NAME" -d
-        echo -e "${GREEN}🚀 工作区 [ ${SESSION_NAME} ] 初始化成功并移至后台运行。${RESET}"
-    fi
-
-    # 温馨温馨交互视觉
-    echo -e "\n${SKYBLUE}==================================================${RESET}"
-    echo -e " ⚡ 正在全速切入工作区 : ${GREEN}${SESSION_NAME}${RESET}"
-    echo -e " 📌 温馨逃脱小贴士 :"
-    echo -e "    若稍后想要【挂起并退出】该工作区，请在键盘上依次按下："
-    echo -e "    ${YELLOW}Ctrl + B${RESET}  然后松开，再单按一次键盘上的  ${YELLOW}D${RESET}"
-    echo -e "${SKYBLUE}==================================================${RESET}"
-    echo ""
-    read -r -p "👉 准备好了？按 [回车键] 立即进入..." dummy
-
-    # 直连接入会话
-    tmux attach-session -t "$SESSION_NAME"
 }
 
-# ================== 强制销毁指定工作区 ==================
-delete_workspace() {
-    if ! command -v tmux >/dev/null 2>&1; then
-        echo -e "${RED}❌ 错误：未检测到已安装的 Tmux 组件。${RESET}"
-        read -r -p "按 [回车键] 返回菜单..." dummy
-        return 1
-    fi
-
-    # 打印当前正在运行的，方便用户看
-    if tmux list-sessions >/dev/null 2>&1; then
-        echo -e "${YELLOW}当前存活的工作区列表：${RESET}"
-        tmux list-sessions | awk -F: '{print "  • " $1}'
-        echo ""
-    else
-        echo -e "${YELLOW}当前暂无任何活跃的工作区。${RESET}"
-    fi
-
-    read -r -p "$(echo -e ${RED}请输入要彻底强杀的工作区名称: ${RESET})" del_name
-    if [ -z "$del_name" ]; then
-        echo -e "${YELLOW}输入为空，已放弃操作。${RESET}"
-    else
-        tmux kill-session -t "$del_name" 2>/dev/null
-        if [ $? -eq 0 ]; then
-            echo -e "${GREEN}✅ 工作区 [ ${del_name} ] 及其内部的所有后台程序已被安全强制销毁。${RESET}"
-        else
-            echo -e "${RED}❌ 销毁失败：未找到名为 [ ${del_name} ] 的工作区。${RESET}"
-        fi
-    fi
-    read -r -p "按 [回车键] 返回菜单..." dummy
+# 检查是否安装
+check_installed() {
+    command -v "$1" >/dev/null 2>&1
 }
 
-# ================== 全局状态快照面板 ==================
-show_status() {
-    if ! command -v tmux >/dev/null 2>&1; then
-        echo -e "${RED}❌ 未安装 Tmux，无法获取虚拟化工作区状态。${RESET}"
-    else
-        if tmux list-sessions >/dev/null 2>&1; then
-            echo -e "${GREEN}📋 当前后台挂载运行的工作区状态清单:${RESET}"
-            echo -e "${SKYBLUE}--------------------------------------------------${RESET}"
-            tmux list-sessions
-            echo -e "${SKYBLUE}--------------------------------------------------${RESET}"
-        else
-            echo -e "${YELLOW}🍃 干净如初：当前暂无任何用户自定义的后台工作区。${RESET}"
-        fi
-    fi
-    read -r -p "按 [回车键] 重回主菜单..." dummy
+# ================== 工具元数据驱动器 (代替容易闪退的关联数组) ==================
+# 格式化存储明细： 编号 | 工具名称 | 运行测试模式 | 系统专属限制 (留空代表通用)
+get_tool_data() {
+    case "$1" in
+        1)  echo "curl:help:" ;;
+        2)  echo "wget:help:" ;;
+        3)  echo "sudo:help:" ;;
+        4)  echo "socat:help:" ;;
+        5)  echo "htop:run:" ;;
+        6)  echo "iftop:run:" ;;
+        7)  echo "unzip:help:" ;;
+        8)  echo "tar:help:" ;;
+        9)  echo "tmux:help:" ;;
+        10) echo "ffmpeg:help:" ;;
+        11) echo "btop:run:" ;;
+        12) echo "ranger:run_root:" ;;
+        13) echo "ncdu:run_root:" ;;
+        14) echo "fzf:run_root:" ;;
+        15) echo "vim:help_root:" ;;
+        16) echo "nano:help_root:" ;;
+        17) echo "git:help_root:" ;;
+        18) echo "screen:sys:centos,rocky,amzn" ;;
+        19) echo "masscan:sys:centos,rocky,amzn" ;;
+        20) echo "iperf3:sys:" ;;
+        21) echo "mtr:sys:" ;;
+        *)  echo "NONE" ;;
+    esac
 }
 
-# ================== 核心可交互大主菜单 ==================
-while true; do
+# ================== 智能动态菜单渲染 ==================
+show_menu() {
     clear
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}     ◈ 智控虚拟化多端工作区管理面板 ◈  ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${YELLOW} a) 安装虚拟工作区环境 (Tmux)${RESET}"
-    echo -e "${YELLOW} b) 卸载 Tmux 环境${RESET}"
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN} 1) 切入 / 开启 [ 2号工作区 (work2) ]"
-    echo -e "${GREEN} 2) 切入 / 开启 [ 2号工作区 (work2) ]"
-    echo -e "${GREEN} 3) 切入 / 开启 [ 3号工作区 (work3) ]"
-    echo -e "${GREEN} 4) 切入 / 开启 [ 4号工作区 (work4) ]"
-    echo -e "${GREEN} 5) 切入 / 开启 [ 5号工作区 (work5) ]"
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN} 6) 强制销毁并清除指定后台工作区${RESET}"
-    echo -e "${GREEN} 7) 实时检索当前存活的工作区快照${RESET}"
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN} 0) 退出"
-    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}=====================================${RESET}"
+    echo -e "${GREEN}     ◈ 运维必备全能工具箱面板 ◈      ${RESET}"
+    echo -e "${GREEN}=====================================${RESET}"
+    echo -e "${GREEN} 宿主系统:${RESET} ${YELLOW}$os_name${RESET}"
+    echo -e "${GREEN} 核心架构:${RESET} ${YELLOW}$(uname -m)${RESET}"
+    echo -e "${GREEN}------------------------------------=${RESET}"
     
-    echo -ne "${GREEN}请输入操作指令选项: ${RESET}"
+    local i=1
+    while [ $i -le 21 ]; do
+        local data=$(get_tool_data $i)
+        IFS=":" read -r tool mode support_os _ <<EOF
+$data
+EOF
+        # 校验系统特定的软件展示限制
+        if [ -n "$support_os" ]; then
+            echo ",$support_os," | grep -q ",$os_name,"
+            if [ $? -ne 0 ]; then
+                i=$((i+1))
+                continue
+            fi
+        fi
+
+        # 状态标色
+        if check_installed "$tool"; then
+            status="${GREEN}✔ 已安装${RESET}"
+        else
+            status="${RED}✖ 未安装${RESET}"
+        fi
+
+        # 优雅的对齐格式化输出
+        printf "${GREEN} [%02d] %-12s${RESET} %b\n" "$i" "$tool" "$status"
+        i=$((i+1))
+    done
+    
+    echo -e "${GREEN}------------------------------------=${RESET}"
+    echo -e "${YELLOW} [99] 批量/单个多选工具卸载${RESET}"
+    echo -e "${RED} [00] 退出${RESET}"
+    echo -e "${GREEN}=====================================${RESET}"
+}
+
+# ================== 动作调度核心执行器 ==================
+execute_action() {
+    local tool="$1"
+    local mode="$2"
+
+    if ! check_installed "$tool"; then
+        install_tool_core "$tool" "$mode"
+        if [ $? -ne 0 ] || ! check_installed "$tool"; then
+            echo -e "${RED}❌ $tool 安装失败，请检查软件源仓库配置。${RESET}"
+            return 1
+        fi
+        echo -e "${GREEN}✅ $tool 成功部署就绪！${RESET}"
+    else
+        echo -e "${GREEN}💡 检测到 $tool 已经安装在系统环境中。${RESET}"
+    fi
+
+    # 引导运行或调出帮助信息
+    echo -e "${YELLOW}-------------------------------------${RESET}"
+    case "$mode" in
+        help)      echo -e "即将调取帮助快照: $tool --help"; sleep 1; "$tool" --help ;;
+        run)       echo -e "即将立刻进入并运行工具: $tool"; sleep 1; "$tool" ;;
+        run_root)  echo -e "即将切入根路径运行工具: $tool"; sleep 1; cd / && "$tool"; cd ~ ;;
+        help_root) echo -e "即将切入根路径调取帮助: $tool -h"; sleep 1; cd / && "$tool" -h; cd ~ ;;
+        sys)       echo -e "环境包部署完成，您现在可以直接在全局键入 [ ${tool} ] 使用它。" ;;
+    esac
+}
+
+# ================== 智能多选卸载引擎 (终极完美版) ==================
+uninstall_mode() {
+    clear
+    echo -e "${RED}=====================================${RESET}"
+    echo -e "${RED}      ◈ 软件卸载清洗中心 ◈          ${RESET}"
+    echo -e "${RED}=====================================${RESET}"
+    
+    # 动态扫描已存在的工具
+    local count=0
+    local i=1
+    while [ $i -le 21 ]; do
+        local data=$(get_tool_data $i)
+        IFS=":" read -r tool _ <<EOF
+$data
+EOF
+        if check_installed "$tool"; then
+            count=$((count+1))
+            eval "inst_tool_$count=\"$tool\""
+            echo -e "${GREEN}  $count) $tool${RESET}"
+        fi
+        i=$((i+1))
+    done
+
+    if [ $count -eq 0 ]; then
+        echo -e "${YELLOW}🍃 系统非常洁净，没有发现可供卸载的工具组件。${RESET}"
+        read -r -p "按 [回车键] 返回菜单..." dummy
+        return
+    fi
+
+    echo ""
+    echo -ne "${YELLOW}请输入需要清洗的软件编号 (支持以空格或逗号多选, 如 1 3 5): ${RESET}"
+    read -r choices
+    
+    # 兼容处理用户输入的逗号
+    choices=$(echo "$choices" | tr ',' ' ')
+    
+    for choice in $choices; do
+        # 验证数字合法性
+        echo "$choice" | grep -q '^[0-9]\+$' || continue
+        if [ "$choice" -ge 1 ] && [ "$choice" -le $count ]; then
+            eval "target_tool=\$inst_tool_$choice"
+            
+            # 【核心修复】映射实际的真实包名
+            local real_package="$target_tool"
+            if [ "$os_family" = "debian" ] && [ "$target_tool" = "mtr" ]; then
+                real_package="mtr-tiny"
+            fi
+
+            echo -e "${YELLOW}⚡ 正在全盘清洗组件: $target_tool (实际包名: $real_package) ...${RESET}"
+            
+            if command -v apt-get >/dev/null 2>&1; then
+                apt-get purge -y "$real_package"
+                # 顺便帮用户清理掉不再需要的孤立依赖（解决你日志中提示的 autoremove 问题）
+                apt-get autoremove -y >/dev/null 2>&1
+            elif command -v dnf >/dev/null 2>&1; then
+                dnf remove -y "$real_package"
+            elif command -v yum >/dev/null 2>&1; then
+                yum remove -y "$real_package"
+            elif command -v apk >/dev/null 2>&1; then
+                apk del "$real_package"
+            fi
+            
+            # 重新检查命令是否还存在
+            if check_installed "$target_tool"; then
+                echo -e "${RED}❌ $target_tool 移除失败！可能该组件是系统核心依赖，被包管理器保护。${RESET}"
+            else
+                echo -e "${GREEN}✓ $target_tool 已安全移除！${RESET}"
+            fi
+        else
+            echo -e "${RED}❌ 无效的选择序列号: $choice${RESET}"
+        fi
+    done
+    read -r -p "操作完成，按 [回车键] 返回主菜单..." dummy
+}
+# ================== 主循环入口 ==================
+detect_os
+
+while true; do
+    show_menu
+    echo -ne "${GREEN}请输入您的首选操作编号: ${RESET}"
     read -r sub_choice
 
-    case "$sub_choice" in
-        a|[Aa]) install_tmux ;;
-        b|[Bb]) remove_tmux ;;
-        1) open_workspace "work1" ;;
-        2) open_workspace "work2" ;;
-        3) open_workspace "work3" ;;
-        4) open_workspace "work4" ;;
-        5) open_workspace "work5" ;;
-        6) delete_workspace ;;
-        7) show_status ;;
-        0) echo -e "${YELLOW}已安全退出工作区控制台，您的后台任务仍在安全运行！${RESET}"; exit 0 ;;
-        *) echo -e "${RED}❌ 无效指令，请重新输入！${RESET}"; sleep 1 ;;
-    esac
+    # 兼容非标数字格式输入
+    if [ "$sub_choice" = "0" ] || [ "$sub_choice" = "00" ]; then
+        echo -e "${YELLOW}感谢使用，控制台脚本已安全退出。${RESET}"
+        exit 0
+    fi
+
+    if [ "$sub_choice" = "99" ]; then
+        uninstall_mode
+        continue
+    fi
+
+    # 判断输入合法性与范围
+    echo "$sub_choice" | grep -q '^[0-9]\+$'
+    if [ $? -ne 0 ] || [ "$sub_choice" -lt 1 ] || [ "$sub_choice" -gt 21 ]; then
+        echo -e "${RED}❌ 警告：请输入有效的菜单指令数字！${RESET}"
+        sleep 1
+        continue
+    fi
+
+    # 获取选定的配置行
+    tool_raw_data=$(get_tool_data "$sub_choice")
+    if [ "$tool_raw_data" != "NONE" ]; then
+        IFS=":" read -r target_tool target_mode _ <<EOF
+$tool_raw_data
+EOF
+        execute_action "$target_tool" "$target_mode"
+        echo ""
+        read -r -p "👉 任务完毕，按 [回车键] 重回主菜单..." dummy
+    fi
 done

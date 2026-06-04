@@ -1,102 +1,301 @@
 #!/bin/bash
-# ======================================
-# Ookla Speedtest 一键安装脚本
-# Debian / Ubuntu / Alpine 全通用版
-# ======================================
-
-set -e
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-echo -e "${GREEN}🚀 开始安装 Speedtest CLI...${RESET}"
+CONFIG="/etc/ssh/sshd_config"
+BACKUP="/etc/ssh/sshd_config.bak"
 
-# 必须 root
-if [ "$(id -u)" -ne 0 ]; then
-  echo -e "${RED}❌ 请使用 root 或 sudo 运行！${RESET}"
-  exit 1
-fi
-
-# ======================================
-# 智能分流安装引擎
-# ======================================
+# 判断是否为 Alpine 系统
+IS_ALPINE=false
 if [ -f /etc/alpine-release ]; then
-    # ---------------- Alpine Linux 部署分支 ----------------
-    echo -e "${YELLOW}📦 检测到 Alpine 系统，正在下载官方静态二进制包...${RESET}"
-    
-    # 1. 安装必要的轻量基础依赖（允许失败，防止因软件源问题卡死）
-    apk add --no-cache wget tar ca-certificates >/dev/null 2>&1 || true
-    
-    # 2. 自动识别 CPU 架构
-    arch=$(uname -m)
-    download_arch="x86_64"
-    
-    case "$arch" in
-        x86_64)   download_arch="x86_64" ;;
-        aarch64|arm64) download_arch="aarch64" ;;
-        armv7l)   download_arch="armhf" ;;
-        i386|i686) download_arch="i386" ;;
-        *) echo -e "${RED}❌ 抱歉，当前架构 $arch 暂无官方编译包${RESET}"; exit 1 ;;
-    esac
-
-    # 3. 下载并解压（针对 Alpine BusyBox 优化的管道流，不生成临时文件，极稳）
-    url="https://download.speedtest.net/awt/cli/ookla-speedtest-1.2.0-linux-${download_arch}.tgz"
-    
-    # 创建一个临时目录用于解压
-    mkdir -p /tmp/spd_install
-    
-    # 使用 wget 下载，如果失败给出明确提示，而不是闷声闪退
-    if ! wget -qO /tmp/spd_install/speedtest.tgz "$url"; then
-        echo -e "${RED}❌ 下载 Speedtest 失败，请检查网络或 DNS 设置！${RESET}"
-        exit 1
-    fi
-    
-    # Alpine 的 tar 完美解压命令
-    cd /tmp/spd_install
-    tar -xzf speedtest.tgz speedtest
-    
-    # 移动到全局路径
-    mv speedtest /usr/local/bin/
-    chmod +x /usr/local/bin/speedtest
-    
-    # 清理现场
-    cd - >/dev/null
-    rm -rf /tmp/spd_install
-
-else
-    # ---------------- Debian / Ubuntu 部署分支 ----------------
-    # 1. 安装 curl
-    if ! command -v curl >/dev/null 2>&1; then
-      echo "📦 安装 curl..."
-      apt-get update -y
-      apt-get install -y curl
-    fi
-
-    # 2. 添加 Ookla 官方源
-    echo "📦 添加 Ookla 仓库..."
-    curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash
-
-    # 3. 安装 speedtest
-    echo "📦 安装 speedtest..."
-    apt-get install -y speedtest
+    IS_ALPINE=true
 fi
 
-# 确保命令哈希表刷新，防止找不到命令
-hash -r 2>/dev/null
+#################################
+# 核心函数：安全修改 SSH 配置（解决子配置文件覆盖问题）
+#################################
+modify_ssh_config() {
+    local key=$1
+    local value=$2
 
-echo -e "${GREEN}✅ 安装完成！${RESET}"
+    # 1. 备份主配置
+    [ -f "$CONFIG" ] && [ ! -f "$BACKUP" ] && cp "$CONFIG" "$BACKUP"
 
-# ======================================
-# 自动测速
-# ======================================
-echo ""
-echo -e "${GREEN}🚀 开始测速...${RESET}"
-echo "-------------------------------------"
+    # 2. 修改主配置文件
+    if grep -q -i "^[# ]*${key}" "$CONFIG"; then
+        sed -i "s|^[# ]*${key}.*|${key} ${value}|g" "$CONFIG"
+    else
+        echo "${key} ${value}" >> "$CONFIG"
+    fi
 
-# 运行测速并自动同意 Ookla 的用户隐私协议
-speedtest --accept-license --accept-gdpr
+    # 3. 注释掉子配置文件（sshd_config.d/*.conf）中的冲突项，确保主配置绝对生效
+    if [ -d "/etc/ssh/sshd_config.d" ]; then
+        for sub_conf in /etc/ssh/sshd_config.d/*.conf; do
+            if [ -f "$sub_conf" ]; then
+                sed -i "s|^[ ]*${key}|#&|g" "$sub_conf" 2>/dev/null
+            fi
+        done
+    fi
+}
 
-echo "-------------------------------------"
-echo -e "${GREEN}🎉 完成！以后直接运行： speedtest${RESET}"
+#################################
+# SSH 服务重启与备份
+#################################
+restart_ssh() {
+    if [ "$IS_ALPINE" = true ]; then
+        rc-service sshd restart 2>/dev/null
+    else
+        if command -v systemctl &>/dev/null; then
+            systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
+        else
+            service ssh restart 2>/dev/null || service sshd restart 2>/dev/null
+        fi
+    fi
+    echo -e "${GREEN}✔ SSH 已重启生效${RESET}"
+}
+
+backup_config() {
+    cp "$CONFIG" "$BACKUP" 2>/dev/null
+    echo -e "${YELLOW}已备份 → $BACKUP${RESET}"
+}
+
+#################################
+# 分离获取 3 个核心状态
+#################################
+get_each_ssh_status() {
+    # ---- 1. 检测公钥文件状态 ----
+    if [ -f "/root/.ssh/authorized_keys" ] && [ -s "/root/.ssh/authorized_keys" ]; then
+        local count=$(wc -l < /root/.ssh/authorized_keys)
+        STATUS_FILE="${YELLOW}[正常] ( ${count} 个公钥)${RESET}"
+    else
+        STATUS_FILE="${RED}[未设置]${RESET}"
+    fi
+
+    # 获取 SSH 实际生效配置
+    local sshd_vars=$(sshd -T 2>/dev/null)
+    if [ -z "$sshd_vars" ]; then
+        sshd_vars=$(cat /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null)
+    fi
+
+    local pubkey_status=$(echo "$sshd_vars" | grep -i "^pubkeyauthentication" | awk '{print $2}' | tr 'A-Z' 'a-z' | head -n 1)
+    local root_login_status=$(echo "$sshd_vars" | grep -i "^permitrootlogin" | awk '{print $2}' | tr 'A-Z' 'a-z' | head -n 1)
+    local pass_status=$(echo "$sshd_vars" | grep -i "^passwordauthentication" | awk '{print $2}' | tr 'A-Z' 'a-z' | head -n 1)
+
+    # ---- 2. 检测公钥总开关状态 ----
+    if [[ "$pubkey_status" == "no" ]]; then
+        STATUS_PUBKEY="${RED}[已禁用]${RESET}"
+    else
+        STATUS_PUBKEY="${YELLOW}[已开启]${RESET}"
+    fi
+
+    # ---- 3. 检测 Root 登录及密码登录状态 ----
+    local root_str=""
+    if [[ "$root_login_status" == "no" || "$root_login_status" == "forced-commands-only" ]]; then
+        root_str="${RED}Root已禁${RESET}"
+    else
+        root_str="${YELLOW}Root允许${RESET}"
+    fi
+
+    local pass_str=""
+    if [[ "$pass_status" == "no" ]]; then
+        pass_str="${RED}密码登录:关${RESET}"
+    else
+        pass_str="${YELLOW}密码登录:开${RESET}"
+    fi
+    
+    STATUS_ROOT="[${root_str} / ${pass_str}]"
+}
+
+#################################
+# 选项 2 的管理公钥登录（子菜单）
+#################################
+manage_key_menu() {
+    while true; do
+        clear
+        # 修复点：子菜单顶端同样加上状态刷新显示
+        get_each_ssh_status
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}       管理公钥登录配置         ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}当前状态 :${RESET} ${STATUS_FILE}"
+        echo -e "${GREEN}公钥登录 :${RESET} ${STATUS_PUBKEY}"
+        echo -e "${GREEN}密码登录 :${RESET} ${STATUS_ROOT}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN} 1) 开启公钥+密码登录(推荐)${RESET}"
+        echo -e "${GREEN} 2) 切换密码登录(关闭公钥)${RESET}"
+        echo -e "${GREEN} 0) 返回主菜单${RESET}"
+        read -p $'\033[32m 请选择: \033[0m' sub_choice
+
+        case $sub_choice in
+            1)
+                modify_ssh_config "PubkeyAuthentication" "yes"
+                modify_ssh_config "PasswordAuthentication" "yes"
+                echo -e "${GREEN}✔ 公钥 + 密码登录已开启${RESET}"
+                restart_ssh
+                pause
+                ;;
+            2)
+                modify_ssh_config "PubkeyAuthentication" "no"
+                modify_ssh_config "PasswordAuthentication" "yes"
+                echo -e "${YELLOW}✔ 已关闭公钥，仅密码登录${RESET}"
+                restart_ssh
+                pause
+                ;;
+            0)
+                return
+                ;;
+            *)
+                echo -e "${RED}输入错误，请重新选择${RESET}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+#################################
+# 一键清除 SSH 密钥
+#################################
+clear_all_ssh_keys() {
+    echo -e "${RED}警告：此操作将删除所有用户 SSH 密钥！${RESET}"
+    read -p $'\033[33m确认清除请输入(y): \033[0m' confirm
+
+    if [[ "$confirm" != "y" ]]; then
+        echo -e "${GREEN}已取消操作${RESET}"
+        sleep 1
+        return
+    fi
+
+    echo -e "${GREEN}正在清理 SSH 密钥...${RESET}"
+    rm -rf /root/.ssh /home/*/.ssh 2>/dev/null
+    restart_ssh
+    echo -e "${GREEN}SSH 密钥已全部清理完成${RESET}"
+    pause
+}
+
+#################################
+# 本地生成并配置密钥登录（修复密码设置与路径报错）
+#################################
+setup_local_ssh_key() {
+    echo -e "${YELLOW}开始生成 SSH 密钥并配置公钥登录...${RESET}"
+    
+    if [ "$IS_ALPINE" = true ]; then
+        apk add --no-cache openssh-client openssh-server >/dev/null 2>&1
+    fi
+
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
+
+    read -p "请输入密钥保存路径（默认 /root/.ssh/id_ed25519）: " input_path
+    
+    local keypath="${input_path}"
+    if [ -z "$keypath" ]; then
+        keypath="/root/.ssh/id_ed25519"
+    fi
+
+    # 避免重复生成导致覆盖
+    if [ -f "$keypath" ]; then
+        read -p "密钥已存在，是否覆盖？(y/n): " overwrite
+        if [[ "$overwrite" != "y" ]]; then
+            echo -e "${YELLOW}已取消生成，使用原有密钥配置...${RESET}"
+        else
+            # 修复点：移除了原本错误的 -f "" 串行，保留正常交互，用户可直接设置公钥密码短语
+            ssh-keygen -t ed25519 -f "$keypath"
+        fi
+    else
+        # 修复点：移除了原本错误的 -f ""
+        ssh-keygen -t ed25519 -f "$keypath"
+    fi
+
+    if [ -f "${keypath}.pub" ]; then
+        cat "${keypath}.pub" >> /root/.ssh/authorized_keys
+        chmod 600 /root/.ssh/authorized_keys
+        
+        modify_ssh_config "PubkeyAuthentication" "yes"
+        
+        echo -e "${GREEN}✔ 密钥登录配置完成${RESET}"
+        echo "公钥路径: ${keypath}.pub"
+        echo "私钥路径: ${keypath}"
+        echo -e "\n${GREEN}================== 您的私钥内容 ==================${RESET}"
+        cat "$keypath"
+        echo -e "${GREEN}==================================================${RESET}"
+        echo -e "${YELLOW}请务必复制上方私钥并妥善保存！${RESET}"
+        echo -e "${YELLOW}提示：如果您刚才设置了密码（Passphrase），请在连接时一并输入。${RESET}"
+    else
+        echo -e "${RED}错误：密钥生成失败！${RESET}"
+    fi
+    restart_ssh
+    pause
+}
+
+#################################
+# 禁用 root 密码登录（极致安全加固）
+#################################
+disable_root_password() {
+    # 安全检查：如果没有设置公钥，警告用户
+    if [ ! -f "/root/.ssh/authorized_keys" ] || [ ! -s "/root/.ssh/authorized_keys" ]; then
+        echo -e "${RED}严重警告：检测到您还未设置任何公钥！${RESET}"
+        echo -e "${RED}此时禁用密码登录将导致您完全无法通过 SSH 连上这台服务器！${RESET}"
+        read -p $'\033[33m确定要继续吗？请输入(yes_i_know): \033[0m' extreme_confirm
+        if [[ "$extreme_confirm" != "yes_i_know" ]]; then
+            echo -e "${GREEN}已紧急取消操作，建议先设置公钥。${RESET}"
+            sleep 2
+            return
+        fi
+    fi
+
+    echo -e "${YELLOW}正在安全加固：禁用 root 密码登录...${RESET}"
+    
+    # 使用强效修改机制，防止云厂商子配置文件覆盖
+    modify_ssh_config "PermitRootLogin" "prohibit-password"
+    modify_ssh_config "PasswordAuthentication" "no"
+
+    echo -e "${GREEN}✔ root 密码登录已禁用，现在仅允许公钥登录${RESET}"
+    restart_ssh
+    pause
+}
+
+#################################
+# 暂停提示
+#################################
+pause() {
+    read -p $'\033[32m按回车继续...\033[0m'
+}
+
+#################################
+# 主循环菜单
+#################################
+while true; do
+    clear
+    get_each_ssh_status
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}       root 公钥登录管理         ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}当前状态 :${RESET} ${STATUS_FILE}"
+    echo -e "${GREEN}公钥登录 :${RESET} ${STATUS_PUBKEY}"
+    echo -e "${GREEN}密码登录 :${RESET} ${STATUS_ROOT}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN} 1) 设置公钥登录${RESET}"
+    echo -e "${GREEN} 2) 管理公钥登录${RESET}"
+    echo -e "${GREEN} 3) 禁用root登录${RESET}"
+    echo -e "${GREEN} 4) 清除SSH公钥${RESET}"
+    echo -e "${GREEN} 0) 退出${RESET}"
+    read -p $'\033[32m 请选择: \033[0m' choice
+
+    case $choice in
+        1) setup_local_ssh_key ;; 
+        2) manage_key_menu ;; 
+        3) disable_root_password ;; 
+        4) clear_all_ssh_keys ;;
+        0) 
+            exit 0 
+            ;;
+        *)
+            echo -e "${RED}输入错误，请重新选择${RESET}"
+            sleep 1
+            ;;
+    esac
+done

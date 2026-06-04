@@ -1,323 +1,471 @@
-#!/usr/bin/env bash
-# 兼容 Alpine 的环境变量
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export HOME=${HOME:-/root}
+#!/bin/sh
+# 注意：Alpine 默认不带 bash，这里使用标准的 /bin/sh，语法保持绝对兼容
+set -e
 
-#################################################
-# nginxbackup - 自动安装 + 自动更新增强版
-#################################################
+# ===============================
+# 防火墙管理脚本（Alpine 双栈 IPv4/IPv6 - Docker 完美兼容版）
+# ===============================
 
-INSTALL_DIR="/opt/nginxbackup"
-LOCAL_SCRIPT="$INSTALL_DIR/nginxbackup.sh"
-REMOTE_URL="https://raw.githubusercontent.com/iu683/uu/main/nn.sh"
-
-# 检测并安装依赖（专门针对 Alpine 增强）
-if [ -f /etc/alpine-release ]; then
-    # Alpine 默认没有 bash, curl, tar, findutils(标准find), certbot/letsencrypt 路径兼容
-    # 提示：如果作为容器运行，确保已安装 bash
-    if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
-        echo "检测到 Alpine 系统，正在安装必要依赖..."
-        apk update && apk add --no-cache curl tar bash findutils
-    fi
-fi
-
-#################################
-# 远程自动安装逻辑
-#################################
-if [[ "$0" != "$LOCAL_SCRIPT" ]]; then
-    mkdir -p "$INSTALL_DIR"
-
-    curl -fsSL -o "$LOCAL_SCRIPT.tmp" "$REMOTE_URL" || {
-        echo "下载失败"
-        exit 1
-    }
-
-    if [[ ! -f "$LOCAL_SCRIPT" ]] || ! cmp -s "$LOCAL_SCRIPT.tmp" "$LOCAL_SCRIPT"; then
-        mv "$LOCAL_SCRIPT.tmp" "$LOCAL_SCRIPT"
-        chmod +x "$LOCAL_SCRIPT"
-        echo "已安装/更新到最新版本"
-    else
-        rm -f "$LOCAL_SCRIPT.tmp"
-    fi
-
-    exec bash "$LOCAL_SCRIPT" "$@"
-fi
-
-#################################
-# 颜色
-#################################
 GREEN="\033[32m"
 RED="\033[31m"
-CYAN="\033[36m"
 YELLOW="\033[33m"
+BLUE="\033[34m"
+PURPLE="\033[35m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-#################################
-# 基础路径
-#################################
-CONFIG_FILE="$INSTALL_DIR/config.sh"
-LOG_FILE="$INSTALL_DIR/backup.log"
-CRON_TAG="nginxbackup_cron" 
+# ===============================
+# 动态信息获取函数
+# ===============================
 
-DATA_DIR_DEFAULT="$INSTALL_DIR/data"
-RETAIN_DAYS_DEFAULT=7
-SERVICE_NAME_DEFAULT="$(hostname 2>/dev/null || echo 'Alpine-Server')"
-
-mkdir -p "$INSTALL_DIR"
-
-#################################
-# 卸载
-#################################
-if [[ "$1" == "--uninstall" ]]; then
-    echo -e "${YELLOW}正在卸载...${RESET}"
-    crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
-    rm -rf "$INSTALL_DIR"
-    echo -e "${GREEN}卸载完成${RESET}"
-    exit 0
-fi
-
-#################################
-# 加载配置
-#################################
-load_config() {
-    [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
-
-    DATA_DIR=${DATA_DIR:-$DATA_DIR_DEFAULT}
-    RETAIN_DAYS=${RETAIN_DAYS:-$RETAIN_DAYS_DEFAULT}
-    SERVICE_NAME=${SERVICE_NAME:-$SERVICE_NAME_DEFAULT}
-}
-load_config
-mkdir -p "$DATA_DIR"
-
-#################################
-# 保存配置
-#################################
-save_config() {
-cat > "$CONFIG_FILE" <<EOF
-DATA_DIR="$DATA_DIR"
-RETAIN_DAYS="$RETAIN_DAYS"
-SERVICE_NAME="$SERVICE_NAME"
-TG_TOKEN="$TG_TOKEN"
-TG_CHAT_ID="$TG_CHAT_ID"
-EOF
-}
-
-#################################
-# Telegram 通知
-#################################
-send_tg() {
-    [[ -z "$TG_TOKEN" || -z "$TG_CHAT_ID" ]] && return
-    MESSAGE="[$SERVICE_NAME] $1"
-    curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
-        -d chat_id="$TG_CHAT_ID" \
-        -d text="$MESSAGE" >/dev/null 2>&1
-}
-
-#################################
-# 备份
-#################################
-backup() {
-    if ! command -v nginx >/dev/null 2>&1; then
-        echo -e "${RED}未安装 nginx${RESET}"
-        return
+get_ssh_port() {
+    local port
+    if [ -f /etc/ssh/sshd_config ]; then
+        port=$(grep -E '^ *Port ' /etc/ssh/sshd_config | awk '{print $2}' | head -n 1)
     fi
-
-    TIMESTAMP=$(date +%F_%H-%M-%S)
-    FILE="$DATA_DIR/nginx_$TIMESTAMP.tar.gz"
-
-    echo -e "${CYAN}检查 nginx 配置...${RESET}"
-    nginx -t >/dev/null 2>&1 || {
-        echo -e "${RED}nginx 配置错误${RESET}"
-        send_tg "❌ 备份失败（配置错误）"
-        return
-    }
-
-    echo -e "${CYAN}开始备份...${RESET}"
-
-    # Alpine/BusyBox 的 tar 不支持某些 GNU 特异参数，这里采用通用打包方式
-    # 同时检查目录是否存在，不存在则跳过，避免 tar 报错
-    TARGET_DIRS=""
-    [[ -d "/etc/nginx" ]] && TARGET_DIRS="$TARGET_DIRS /etc/nginx"
-    [[ -d "/etc/letsencrypt" ]] && TARGET_DIRS="$TARGET_DIRS /etc/letsencrypt"
-
-    if [[ -z "$TARGET_DIRS" ]]; then
-        echo -e "${RED}未找到备份目标目录${RESET}"
-        return
+    # 如果是 Alpine 自带的 Dropbear SSH
+    if [ -z "$port" ] && [ -f /etc/conf.d/dropbear ]; then
+        port=$(grep -E '^ *DROPBEAR_OPTS=' /etc/conf.d/dropbear | grep -oE '-p [0-9]+' | awk '{print $2}')
     fi
+    [[ -z "$port" || ! "$port" =~ ^[0-9]+$ ]] && port=22
+    echo "$port"
+}
 
-    tar czf "$FILE" $TARGET_DIRS >> "$LOG_FILE" 2>&1
-
-    if [[ $? -eq 0 ]]; then
-        echo -e "${GREEN}备份成功${RESET}"
-        send_tg "✅ nginx备份成功: $TIMESTAMP"
+get_firewall_status() {
+    if rc-service iptables status 2>/dev/null | grep -q "started"; then
+        echo -e "${YELLOW}● 已开启(开机自启)${RESET}"
     else
-        echo -e "${RED}备份失败${RESET}"
-        send_tg "❌ nginx备份失败"
-    fi
-
-    # 清理旧备份：BusyBox 的 find 不支持 +7 这种写法或 -delete 参数！
-    # 兼容处理：使用标准 find 语法（或由 apk 安装的 findutils 提供支持）
-    find "$DATA_DIR" -type f -name "*.tar.gz" -mtime +"$RETAIN_DAYS" -exec rm -f {} \;
-}
-
-#################################
-# 恢复
-#################################
-restore() {
-    shopt -s nullglob
-    FILE_LIST=("$DATA_DIR"/*.tar.gz)
-
-    if [[ ${#FILE_LIST[@]} -eq 0 ]]; then
-        echo -e "${RED}没有备份文件${RESET}"
-        return
-    fi
-
-    echo -e "${CYAN}备份列表:${RESET}"
-    for i in "${!FILE_LIST[@]}"; do
-        echo -e "${GREEN}$((i+1)). $(basename "${FILE_LIST[$i]}")${RESET}"
-    done
-
-    read -p "输入恢复序号: " num
-    [[ ! $num =~ ^[0-9]+$ ]] && return
-
-    FILE="${FILE_LIST[$((num-1))]}"
-    [[ -z "$FILE" ]] && return
-
-    echo -e "${YELLOW}确认恢复？将覆盖当前环境 (y/n)${RESET}"
-    read confirm
-    [[ "$confirm" != "y" ]] && return
-
-    echo -e "${YELLOW}正在停止 Nginx 业务进程...${RESET}"
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl stop nginx 2>/dev/null || true
-    elif command -v rc-service >/dev/null 2>&1; then
-        rc-service nginx stop >/dev/null 2>&1 || true
-    elif [ -f /etc/init.d/nginx ]; then
-        /etc/init.d/nginx stop 2>/dev/null || true
-    fi
-
-    # 兼容清空旧路径，防止解压软链接时死锁或覆盖失败
-    echo -e "${YELLOW}正在解压还原快照数据...${RESET}"
-    tar xzf "$FILE" --overwrite -C / 2>/dev/null || tar xzf "$FILE" -C /
-
-    echo -e "${CYAN}正在对恢复后的配置执行语法校验...${RESET}"
-    if nginx -t >/dev/null 2>&1; then
-        echo -e "${YELLOW}正在重启拉起 Nginx 服务...${RESET}"
-        if command -v systemctl >/dev/null 2>&1; then
-            systemctl start nginx
-        elif command -v rc-service >/dev/null 2>&1; then
-            rc-service nginx start
-        elif [ -f /etc/init.d/nginx ]; then
-            /etc/init.d/nginx start
+        if iptables -P INPUT 2>/dev/null | grep -q "DROP"; then
+            echo -e "${YELLOW}● 运行中(未设自启)${RESET}"
+        else
+            echo -e "${RED}○ 已关闭 (全放行)${RESET}"
         fi
-        echo -e "${GREEN}✅ 完美恢复完成！环境已恢复上线。${RESET}"
-        send_tg "🔄 Nginx 环境已成功回滚恢复至快照: $(basename "$FILE")"
-    else
-        echo -e "${RED}❌ 致命：恢复后的配置存在语法错误，为了安全未强行拉起服务，请核实！${RESET}"
     fi
 }
 
-#################################
-# 设置 TG
-#################################
-set_tg() {
-    read -p "服务名称: " SERVICE_NAME
-    read -p "TG BOT TOKEN: " TG_TOKEN
-    read -p "TG CHAT ID: " TG_CHAT_ID
-    save_config
-    echo -e "${GREEN}TG 已启用${RESET}"
-    send_tg "✅ TG 测试成功"
+get_firewall_type() {
+    if command -v iptables &>/dev/null; then
+        if iptables --version | grep -qi "nftables"; then
+            echo "iptables (nftables)"
+        else
+            echo "iptables (legacy)"
+        fi
+    else
+        echo "未安装"
+    fi
 }
 
-#################################
-# 设置定时任务（兼容 BusyBox crontab）
-#################################
-add_cron() {
-    echo -e "${CYAN}1 每天0点${RESET}"
-    echo -e "${CYAN}2 每周一0点${RESET}"
-    echo -e "${CYAN}3 每月1号${RESET}"
-    echo -e "${CYAN}4 自定义${RESET}"
+get_banned_ip_count() {
+    local count4 count6 total
+    count4=$(iptables -S INPUT 2>/dev/null | grep " -j DROP" | grep -vE "dport|sport" | wc -l || echo 0)
+    count6=$(ip6tables -S INPUT 2>/dev/null | grep " -j DROP" | grep -vE "dport|sport" | wc -l || echo 0)
+    total=$((count4 + count6))
+    echo "$total"
+}
 
-    read -p "选择: " t
+# ===============================
+# 防火墙核心逻辑函数
+# ===============================
 
-    case $t in
-        1) cron="0 0 * * *" ;;
-        2) cron="0 0 * * 1" ;;
-        3) cron="0 0 1 * *" ;;
-        4) read -p "cron表达式: " cron ;;
-        *) return ;;
+save_rules() {
+    # Alpine 使用 OpenRC 脚本自带的 save 参数来持久化规则
+    rc-service iptables save &>/dev/null || true
+    rc-service ip6tables save &>/dev/null || true
+}
+
+save_and_enable_autoload() {
+    save_rules
+    rc-update add iptables default &>/dev/null || true
+    rc-update add ip6tables default &>/dev/null || true
+    rc-service iptables start &>/dev/null || true
+    rc-service ip6tables start &>/dev/null || true
+    echo -e "${GREEN}✅ 规则已保存，并设置为开机自动加载 (OpenRC)${RESET}"
+    read -p "按回车继续..."
+}
+
+init_rules() {
+    local ssh_port
+    ssh_port=$(get_ssh_port)
+    for proto in iptables ip6tables; do
+        # 【Docker 兼容】：绝对不执行全局清空(-F)，只精准清空 INPUT 链
+        $proto -F INPUT
+        
+        # 核心策略：入站默认拦截，转发和出站保持 ACCEPT（Docker 严重依赖 FORWARD）
+        $proto -P INPUT DROP
+        $proto -P FORWARD ACCEPT
+        $proto -P OUTPUT ACCEPT
+        
+        # 基础放行规则
+        $proto -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+        $proto -A INPUT -i lo -j ACCEPT
+        $proto -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
+        $proto -A INPUT -p tcp --dport 80 -j ACCEPT
+        $proto -A INPUT -p tcp --dport 443 -j ACCEPT
+    done
+    save_rules
+    rc-update add iptables default &>/dev/null || true
+    rc-update add ip6tables default &>/dev/null || true
+    rc-service iptables start &>/dev/null || true
+    rc-service ip6tables start &>/dev/null || true
+}
+
+check_installed() {
+    # Alpine 使用 apk info 检查安装情况
+    apk info -e iptables && apk info -e ip6tables
+}
+
+install_firewall() {
+    echo -e "${YELLOW}正在安装防火墙组件 (Alpine 专属)，请稍候...${RESET}"
+    apk update
+    # 确保安装了 iptables, ip6tables 和常用基础工具
+    apk add iptables ip6tables curl
+    init_rules
+    echo -e "${GREEN}✅ 防火墙安装完成，默认放行 SSH/80/443${RESET}"
+    echo -e "${GREEN}✅ 已通过 OpenRC 设置开机自动加载规则${RESET}"
+    read -p "按回车继续..."
+}
+
+clear_firewall() {
+    echo -e "${YELLOW}正在恢复宿主机默认策略并放行所有流量...${RESET}"
+    for proto in iptables ip6tables; do
+        $proto -F INPUT
+        $proto -P INPUT ACCEPT
+        $proto -P FORWARD ACCEPT
+        $proto -P OUTPUT ACCEPT
+    done
+    if iptables -L DOCKER-USER -n &>/dev/null; then
+        iptables -F DOCKER-USER
+    fi
+    save_rules
+    rc-update del iptables default &>/dev/null || true
+    rc-update del ip6tables default &>/dev/null || true
+    echo -e "${GREEN}✅ 防火墙入站限制已清空，宿主机流量已全放行（未损坏 Docker 链）${RESET}"
+    read -p "按回车继续..."
+}
+
+restore_default_rules() {
+    echo -e "${YELLOW}正在恢复默认防火墙规则 (仅放行 SSH/80/443)...${RESET}"
+    local ssh_port
+    ssh_port=$(get_ssh_port)
+    echo -e "${GREEN}检测到 SSH 端口: $ssh_port${RESET}"
+    init_rules
+    echo -e "${GREEN}✅ 默认规则已恢复${RESET}"
+    read -p "按回车继续..."
+}
+
+open_all_ports() {
+    echo -e "${YELLOW}正在放行所有宿主机端口（IPv4/IPv6）...${RESET}"
+    for proto in iptables ip6tables; do
+        $proto -F INPUT
+        $proto -P INPUT ACCEPT
+        $proto -P FORWARD ACCEPT
+    done
+    save_rules
+    echo -e "${GREEN}✅ 宿主机所有端口已放行（全开放）${RESET}"
+    read -p "按回车继续..."
+}
+
+ip_action() {
+    local action=$1 ip=$2 proto
+    if [[ $ip =~ : ]]; then
+        proto="ip6tables"
+    else
+        proto="iptables"
+    fi
+
+    case $action in
+        accept) 
+            if ! $proto -C INPUT -s "$ip" -j ACCEPT 2>/dev/null; then
+                $proto -I INPUT 1 -s "$ip" -j ACCEPT 
+            fi
+            ;;
+        drop)   
+            if ! $proto -C INPUT -s "$ip" -j DROP 2>/dev/null; then
+                $proto -I INPUT 1 -s "$ip" -j DROP 
+            fi
+            # 【Docker 兼容改造】
+            if [ "$proto" = "iptables" ] && iptables -L DOCKER-USER -n &>/dev/null; then
+                if ! iptables -C DOCKER-USER -s "$ip" -j DROP 2>/dev/null; then
+                    iptables -I DOCKER-USER 1 -s "$ip" -j DROP
+                fi
+            fi
+            ;;
+        delete)
+            while $proto -C INPUT -s "$ip" -j ACCEPT 2>/dev/null; do $proto -D INPUT -s "$ip" -j ACCEPT; done
+            while $proto -C INPUT -s "$ip" -j DROP 2>/dev/null; do $proto -D INPUT -s "$ip" -j DROP; done
+            if [ "$proto" = "iptables" ] && iptables -L DOCKER-USER -n &>/dev/null; then
+                while iptables -C DOCKER-USER -s "$ip" -j DROP 2>/dev/null; do iptables -D DOCKER-USER -s "$ip" -j DROP; done
+            fi
+            ;;
     esac
-
-    # BusyBox 的 crontab 不支持直接追加文件，先安全导出
-    crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/nginxbackup_cron 2>/dev/null
-
-    # 写入新任务，把 TAG 留在前面或作为注释，确保 BusyBox 不会解析错误
-    # 注意：BusyBox cron 的末尾加 # 注释在某些老版本会报错，改成标准环境变量或标准格式
-    echo "$cron /usr/bin/env bash $INSTALL_DIR/nginxbackup.sh auto >> $INSTALL_DIR/cron.log 2>&1 #$CRON_TAG" >> /tmp/nginxbackup_cron
-
-    crontab /tmp/nginxbackup_cron
-    rm -f /tmp/nginxbackup_cron
-
-    echo -e "${GREEN}定时任务已设置${RESET}"
 }
 
-#################################
-# 删除定时任务
-#################################
-remove_cron() {
-    if crontab -l 2>/dev/null | grep -q "$CRON_TAG"; then
-        crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/nginxbackup_cron 2>/dev/null
-        crontab /tmp/nginxbackup_cron
-        rm -f /tmp/nginxbackup_cron
-        echo -e "${GREEN}定时任务已删除${RESET}"
+ping_action() {
+    local action=$1
+    
+    while iptables -C INPUT -p icmp -j DROP 2>/dev/null; do iptables -D INPUT -p icmp -j DROP; done
+    while iptables -C OUTPUT -p icmp -j DROP 2>/dev/null; do iptables -D OUTPUT -p icmp -j DROP; done
+    while iptables -C INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null; do iptables -D INPUT -p icmp --icmp-type echo-request -j ACCEPT; done
+    while iptables -C OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT 2>/dev/null; do iptables -D OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT; done
+    
+    while ip6tables -C INPUT -p icmpv6 -j DROP 2>/dev/null; do ip6tables -D INPUT -p icmpv6 -j DROP; done
+    while ip6tables -C OUTPUT -p icmpv6 -j DROP 2>/dev/null; do ip6tables -D OUTPUT -p icmpv6 -j DROP; done
+    while ip6tables -C INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT 2>/dev/null; do ip6tables -D INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT; done
+    while ip6tables -C OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT 2>/dev/null; do ip6tables -D OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT; done
+
+    if [ "$action" = "allow" ]; then
+        iptables -I INPUT -p icmp --icmp-type echo-request -j ACCEPT
+        iptables -I OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT
+        ip6tables -I INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT
+        ip6tables -I OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT
     else
-        echo -e "${YELLOW}未发现定时任务${RESET}"
+        iptables -I INPUT -p icmp --icmp-type echo-request -j DROP
+        iptables -I OUTPUT -p icmp --icmp-type echo-reply -j DROP
+        ip6tables -I INPUT -p icmpv6 --icmpv6-type echo-request -j DROP
+        ip6tables -I OUTPUT -p icmpv6 --icmpv6-type echo-reply -j DROP
     fi
 }
 
-#################################
-# auto模式
-#################################
-if [[ "$1" == "auto" ]]; then
-    backup
+uninstall_firewall() {
+    clear
+    echo -e "${RED}⚠️ 警告：该操作将清空所有宿主机入站规则并卸载防火墙组件，恢复网络全放行状态！${RESET}"
+    read -p "确定要彻底卸载吗？(y/n): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "已取消卸载。"
+        read -p "按回车继续..."
+        return
+    fi
+
+    echo -e "${YELLOW}正在清理宿主机 INPUT 规则并修改策略...${RESET}"
+    for proto in iptables ip6tables; do
+        $proto -F INPUT
+        $proto -P INPUT ACCEPT
+        $proto -P FORWARD ACCEPT
+        $proto -P OUTPUT ACCEPT
+    done
+    if iptables -L DOCKER-USER -n &>/dev/null; then
+        iptables -F DOCKER-USER
+    fi
+
+    echo -e "${YELLOW}正在停止并移除 Alpine 开机守护服务...${RESET}"
+    rc-service iptables stop 2>/dev/null || true
+    rc-service ip6tables stop 2>/dev/null || true
+    rc-update del iptables default 2>/dev/null || true
+    rc-update del ip6tables default 2>/dev/null || true
+    
+    # 移除软件包
+    apk del iptables ip6tables
+
+    echo -e "${GREEN}✅ 防火墙已彻底卸载，Docker 及系统核心流量未受干扰。${RESET}"
     exit 0
+}
+
+view_visual_rules() {
+    clear
+    local ports_tcp ports_udp ping_status_v4 ping_status_v6
+    local policy_v4 policy_v6
+
+    # 针对 Alpine 里的标准 POSIX grep 进行了提取兼容调整
+    policy_v4=$(iptables -L INPUT -n 2>/dev/null | head -n 1 | awk '{print $4}' | tr -d ')')
+    policy_v6=$(ip6tables -L INPUT -n 2>/dev/null | head -n 1 | awk '{print $4}' | tr -d ')')
+    [[ -z "$policy_v4" ]] && policy_v4="UNKNOWN"
+    [[ -z "$policy_v6" ]] && policy_v6="UNKNOWN"
+
+    # 更安全的 awk 端口信息过滤，防止 Alpine BusyBox 剪切不兼容 -P 模式
+    ports_tcp=$( (iptables -S INPUT 2>/dev/null; ip6tables -S INPUT 2>/dev/null) | grep " -j ACCEPT" | grep "dport " | grep -E "tcp" | awk '{for(i=1;i<=NF;i++) if($i=="--dport") print $(i+1)}' | sort -nu | tr '\n' ' ')
+    ports_udp=$( (iptables -S INPUT 2>/dev/null; ip6tables -S INPUT 2>/dev/null) | grep " -j ACCEPT" | grep "dport " | grep -E "udp" | awk '{for(i=1;i<=NF;i++) if($i=="--dport") print $(i+1)}' | sort -nu | tr '\n' ' ')
+    [[ -z "$ports_tcp" ]] && ports_tcp="无"
+    [[ -z "$ports_udp" ]] && ports_udp="无"
+
+    if iptables -S INPUT 2>/dev/null | grep "icmp" | grep -q "DROP"; then ping_status_v4="${RED}禁打(DROP)${RESET}"; else ping_status_v4="${GREEN}允许(ACCEPT)${RESET}"; fi
+    if ip6tables -S INPUT 2>/dev/null | grep "icmpv6" | grep -q "DROP"; then ping_status_v6="${RED}禁打(DROP)${RESET}"; else ping_status_v6="${GREEN}允许(ACCEPT)${RESET}"; fi
+
+    echo -e "${CYAN}==================================================${RESET}"
+    echo -e "${CYAN}         📊 核心网络数据及规则总览看板              ${RESET}"
+    echo -e "${CYAN}==================================================${RESET}"
+    echo -e " 🛡️  ${CYAN}宿主机默认入站策略 (Default Policy):${RESET}"
+    echo -e "    - IPv4 INPUT 链 : $policy_v4"
+    echo -e "    - IPv6 INPUT 链 : $policy_v6"
+    echo -e " 🌐 ${CYAN}ICMP 响应状态 (PING):${RESET}"
+    echo -e "    - IPv4 Ping 回应: $ping_status_v4"
+    echo -e "    - IPv6 Ping 回应: $ping_status_v6"
+    echo -e "${CYAN}--------------------------------------------------${RESET}"
+
+    echo -e " 🔓 ${GREEN}当前对宿主机公网开放的端口列表：${RESET}"
+    echo -e "    +----------+--------------------------------------+"
+    echo -e "    | ${YELLOW}协议类型${RESET} | ${YELLOW}开放的端口号${RESET}                      |"
+    echo -e "    +----------+--------------------------------------+"
+    printf "    |  %-6s  | %-36s |\n" "TCP" "$ports_tcp"
+    printf "    |  %-6s  | %-36s |\n" "UDP" "$ports_udp"
+    echo -e "    +----------+--------------------------------------+"
+    echo -e "${CYAN}--------------------------------------------------${RESET}"
+
+    echo -e " ⚪ ${BLUE}IP 白名单规则 (放行特定源 IP)：${RESET}"
+    local whitelist=$(iptables -S INPUT 2>/dev/null | grep " -j ACCEPT" | grep -E " -s " | grep -vE "dport|sport|lo|state" | awk '{for(i=1;i<=NF;i++) if($i=="-s") print $(i+1)}' || true)
+    local whitelist6=$(ip6tables -S INPUT 2>/dev/null | grep " -j ACCEPT" | grep -E " -s " | grep -vE "dport|sport|lo|state" | awk '{for(i=1;i<=NF;i++) if($i=="-s") print $(i+1)}' || true)
+    
+    if [[ -n "$whitelist" || -n "$whitelist6" ]]; then
+        for ip in $whitelist; do echo -e "    ⚡ [IPv4] -> $ip"; done
+        for ip in $whitelist6; do echo -e "    ⚡ [IPv6] -> $ip"; done
+    else
+        echo -e "    (当前无特定 IP 白名单规则)"
+    fi
+
+    echo -e "\n ⚫ ${RED}IP 黑名单规则 (已同步阻断宿主机与 Docker)：${RESET}"
+    local blacklist=$(iptables -S INPUT 2>/dev/null | grep " -j DROP" | grep -E " -s " | grep -vE "dport|sport" | awk '{for(i=1;i<=NF;i++) if($i=="-s") print $(i+1)}' || true)
+    local blacklist6=$(ip6tables -S INPUT 2>/dev/null | grep " -j DROP" | grep -E " -s " | grep -vE "dport|sport" | awk '{for(i=1;i<=NF;i++) if($i=="-s") print $(i+1)}' || true)
+    
+    if [[ -n "$blacklist" || -n "$blacklist6" ]]; then
+        for ip in $blacklist; do echo -e "    ❌ [IPv4] -> $ip"; done
+        for ip in $blacklist6; do echo -e "    ❌ [IPv6] -> $ip"; done
+    else
+        echo -e "    (当前无特定 IP 黑名单规则)"
+    fi
+
+    echo -e "${CYAN}==================================================${RESET}"
+    read -r -p "按回车返回主菜单..." || true
+}
+
+# ===============================
+# 管理菜单
+# ===============================
+menu() {
+    while true; do
+        STATUS=$(get_firewall_status)
+        TYPE_SHOW=$(get_firewall_type)
+        PORT_SHOW=$(get_ssh_port)
+        SITE_COUNT=$(get_banned_ip_count)
+
+        clear
+        echo -e "${GREEN}===============================${RESET}"
+        echo -e "${GREEN}    ◈  Alpine 双栈防火墙控制台 ◈      ${RESET}"
+        echo -e "${GREEN}===============================${RESET}"
+        echo -e "${GREEN} 状态  : ${STATUS}"
+        echo -e "${GREEN} 内核  : ${YELLOW}${TYPE_SHOW}${RESET}"
+        echo -e "${GREEN} 端口  : ${YELLOW}${PORT_SHOW}${RESET}"
+        echo -e "${GREEN} 封禁  : ${YELLOW}${SITE_COUNT} 个 IP${RESET}"
+        echo -e "${GREEN}===============================${RESET}"
+        echo -e "${GREEN}  1. 开放指定端口 (TCP/UDP)${RESET}"
+        echo -e "${GREEN}  2. 关闭指定端口 (TCP/UDP)${RESET}"
+        echo -e "${GREEN}  3. 开放所有端口 (全放行)${RESET}"
+        echo -e "${GREEN}  4. 恢复默认安全规则 (放行SSH/80/443)${RESET}"
+        echo -e "${GREEN}  5. 添加 IP 白名单 (放行)${RESET}"
+        echo -e "${GREEN}  6. 添加 IP 黑名单 (封禁)${RESET}"
+        echo -e "${GREEN}  7. 删除指定 IP 规则${RESET}"
+        echo -e "${GREEN}  8. 允许 PING (ICMP)${RESET}"
+        echo -e "${GREEN}  9. 禁用 PING (ICMP)${RESET}"
+        echo -e "${GREEN} 10. 查看当前防火墙详细规则${RESET}"
+        echo -e "${GREEN} 11. 保存规则并设置开机自启${RESET}"
+        echo -e "${GREEN} 12. 卸载防火墙${RESET}"
+        echo -e "${GREEN}  0. 退出${RESET}"
+        echo -e "${GREEN}===============================${RESET}"
+        echo -ne "${GREEN} 请选择: ${RESET}"
+        read -r choice
+
+        case $choice in
+            1)
+                read -p "请输入要开放的端口号: " PORT
+                if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+                    echo -e "${RED}❌ 错误：请输入 1-65535 之间的有效端口号${RESET}"
+                    read -p "按回车返回菜单..."
+                    continue
+                fi
+                for proto in iptables ip6tables; do
+                    while $proto -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null; do $proto -D INPUT -p tcp --dport "$PORT" -j DROP; done
+                    while $proto -C INPUT -p udp --dport "$PORT" -j DROP 2>/dev/null; do $proto -D INPUT -p udp --dport "$PORT" -j DROP; done
+                    if ! $proto -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; then
+                        $proto -I INPUT -p tcp --dport "$PORT" -j ACCEPT
+                    fi
+                    if ! $proto -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; then
+                        $proto -I INPUT -p udp --dport "$PORT" -j ACCEPT
+                    fi
+                done
+                save_rules
+                echo -e "${GREEN}✅ 已开放端口 $PORT${RESET}"
+                read -p "按回车继续..."
+                ;;
+            2)
+                read -p "请输入要关闭的端口号: " PORT
+                if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+                    echo -e "${RED}❌ 错误：请输入 1-65535 之间的有效端口号${RESET}"
+                    read -p "按回车返回菜单..."
+                    continue
+                fi
+                
+                if [ "$PORT" -eq "$PORT_SHOW" ]; then
+                    echo -e "${RED}⚠️ 拒绝操作：当前端口为 SSH 端口！${RESET}"
+                    read -p "按回车返回菜单..."
+                    continue
+                fi
+                
+                for proto in iptables ip6tables; do
+                    while $proto -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; do $proto -D INPUT -p tcp --dport "$PORT" -j ACCEPT; done
+                    while $proto -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; do $proto -D INPUT -p udp --dport "$PORT" -j ACCEPT; done
+                    if ! $proto -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null; then
+                        $proto -I INPUT -p tcp --dport "$PORT" -j DROP
+                    fi
+                    if ! $proto -C INPUT -p udp --dport "$PORT" -j DROP 2>/dev/null; then
+                        $proto -I INPUT -p udp --dport "$PORT" -j DROP
+                    fi
+                done
+                save_rules
+                echo -e "${GREEN}✅ 已关闭宿主机端口 $PORT (注:若该端口由Docker映射，可在容器配置中管理)${RESET}"
+                read -p "按回车继续..."
+                ;;
+            3) open_all_ports ;;
+            4) restore_default_rules ;;
+            5)
+                read -p "请输入要放行的IP: " IP
+                ip_action accept "$IP"
+                save_rules
+                echo -e "${GREEN}✅ IP $IP 已放行${RESET}"
+                read -p "按回车继续..."
+                ;;
+            6)
+                read -p "请输入要封禁的IP: " IP
+                ip_action drop "$IP"
+                save_rules
+                echo -e "${GREEN}✅ IP $IP 已封禁（已同步应用至宿主机与Docker容器）${RESET}"
+                read -p "按回车继续..."
+                ;;
+            7)
+                read -p "请输入要删除的IP: " IP
+                ip_action delete "$IP"
+                save_rules
+                echo -e "${GREEN}✅ IP $IP 规则已删除${RESET}"
+                read -p "按回车继续..."
+                ;;
+            8)
+                ping_action allow
+                save_rules
+                echo -e "${GREEN}✅ 已允许 PING（ICMP）${RESET}"
+                read -p "按回车继续..."
+                ;;
+            9)
+                ping_action deny
+                save_rules
+                echo -e "${GREEN}✅ 已禁用 PING（ICMP）${RESET}"
+                read -p "按回车继续..."
+                ;;
+            10) view_visual_rules ;;
+            11) save_and_enable_autoload ;;
+            12) uninstall_firewall ;;
+            0) clear; break ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ===============================
+# 脚本入口
+# ===============================
+if [ "$(id -u)" -ne 0 ]; then
+   echo -e "${RED}❌ 错误: 请使用 root 权限运行此脚本！${RESET}"
+   exit 1
 fi
 
-#################################
-# 菜单
-#################################
-while true; do
-    clear
-    echo -e "${CYAN}==== Nginx 备份系统 ====${RESET}"
-    echo -e "${GREEN}1. 立即备份${RESET}"
-    echo -e "${GREEN}2. 恢复备份${RESET}"
-    echo -e "${GREEN}3. 设置定时任务${RESET}"
-    echo -e "${GREEN}4. 删除定时任务${RESET}"
-    echo -e "${GREEN}5. 设置备份目录(当前: $DATA_DIR)${RESET}"
-    echo -e "${GREEN}6. 设置保留天数(当前: $RETAIN_DAYS 天)${RESET}"
-    echo -e "${GREEN}7. 设置Telegram通知${RESET}"
-    echo -e "${GREEN}8. 卸载${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
+if ! check_installed; then
+    install_firewall
+fi
 
-    read -p "$(echo -e ${GREEN}选择: ${RESET})" c
-
-    case $c in
-        1) backup ;;
-        2) restore ;;
-        3) add_cron ;;
-        4) remove_cron ;;
-        5) read -p "新目录: " DATA_DIR; mkdir -p "$DATA_DIR"; save_config ;;
-        6) read -p "保留天数: " RETAIN_DAYS; save_config ;;
-        7) set_tg ;;
-        8) 
-            echo -e "${YELLOW}正在卸载...${RESET}"
-            crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
-            rm -rf "$INSTALL_DIR"
-            echo -e "${GREEN}卸载完成${RESET}"
-            exit 0
-            ;;
-        0) exit 0 ;;
-    esac
-
-    read -p "$(echo -e ${GREEN}回车继续....${RESET})"
-done
+menu

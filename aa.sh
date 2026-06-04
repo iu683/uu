@@ -1,147 +1,200 @@
 #!/bin/sh
-# ss 彩色高亮增强版 v5.6 多系统适配（完美支持 Alpine Linux）
-# 特点：兼容 BusyBox 工具链，修复排序与参数报错
+# OpenRC 自启动服务管理脚本 v3.0 (完美收官防呆版)
+# 提示文字统一绿色，解决所有对齐、乱码及非典型环境空删报错
 
 # ================== 颜色定义 ==================
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-BLUE="\033[34m"
-PURPLE="\033[35m"
 CYAN="\033[36m"
-RESET="\033[0m"
 BOLD="\033[1m"
+RESET="\033[0m"
 
-# ================== 依赖环境检查 (针对Alpine) ==================
-# Alpine 默认的 BusyBox ss 功能极弱。为了能看到进程和完整的网络状态，
-# 脚本会自动尝试使用 netstat 作为备用，或者提示安装 iproute2。
-SS_CMD="ss -tulna"
-if [ -f /etc/alpine-release ]; then
-    # 检查是否安装了全量版的 iproute2
-    if ss -v 2>&1 | grep -q "iproute2"; then
-        SS_CMD="ss -tulnape"
-    else
-        # Alpine 下如果没装 iproute2，BusyBox 的 netstat -tulnp 更好用
-        SS_CMD="netstat -tulnp"
-    fi
-else
-    SS_CMD="ss -tulnape"
+# ================== 配置 ==================
+PAGE_SIZE=20   # 每页显示多少条
+CURRENT_PAGE=1
+TMP_MATRIX="/tmp/openrc_matrix.$$"
+
+# ================== 权限自动侦测 ==================
+SUDO=""
+if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
 fi
 
-# ================== 用户输入 ==================
-echo -ne "${GREEN}"
-printf "是否启用实时刷新？(y/N): "
-read -r resp
-case "$resp" in
-    [Yy]*) REFRESH=1 ;;
-    *) REFRESH=0 ;;
-esac
+# ================== 用户输入关键词 ==================
+printf "${GREEN}请输入关键词过滤（默认显示所有服务）: ${RESET}"
+read -r KEYWORD
 
-printf "过滤协议 (tcp/udp, 默认全部): "
-read -r FILTER_PROTO
-# 转换为小写 (Alpine sh 不支持 ${v,,})
-FILTER_PROTO=$(echo "$FILTER_PROTO" | tr 'A-Z' 'a-z')
+# ================== 生成完整服务列表 ==================
+generate_full_list() {
+    rm -f "$TMP_MATRIX"
+    idx=1
 
-printf "过滤端口 (数字/多个用逗号分隔, 默认全部): "
-read -r FILTER_PORT
-echo -ne "${RESET}"
+    for service_path in /etc/init.d/*; do
+        [ ! -f "$service_path" ] && continue
+        service=$(basename "$service_path")
+        
+        # 排除引导项
+        [ "$service" = "functions.sh" ] && continue
 
-# ================== 表头 ==================
-printf "${BOLD}%-6s %-12s %-10s %-10s %-30s %-30s %s${RESET}\n" \
-    "Proto" "State" "Recv-Q" "Send-Q" "Local:Port" "Peer:Port" "Process"
+        # 获取描述
+        desc=$(grep -E '^[[:space:]]*description=' "$service_path" | cut -d'"' -f2 | cut -d"'" -f2 | head -n 1)
+        [ -z "$desc" ] && desc="无描述信息"
 
-# ================== 循环显示 ==================
-while true; do
-    [ "$REFRESH" -eq 1 ] && clear
-
-    # 执行命令并处理
-    $SS_CMD 2>/dev/null | awk 'NR>1' | while read -r line; do
-        [[ "$line" =~ Failed.*cgroup ]] && continue
-
-        # 解析字段
-        proto=$(echo "$line" | awk '{print $1}')
-        state=$(echo "$line" | awk '{print $2}')
-        recvq=$(echo "$line" | awk '{print $3}')
-        sendq=$(echo "$line" | awk '{print $4}')
-        local_addr=$(echo "$line" | awk '{print $5}')
-        peer_addr=$(echo "$line" | awk '{print $6}')
-        process=$(echo "$line" | awk '{for(i=7;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
-
-        # 如果是 netstat 格式，状态列可能和 ss 不同，做个简单兼容
-        if [ "$proto" = "Active" ] || [ "$proto" = "Proto" ]; then continue; fi
-
-        # 提取端口 (兼容 IPv6 格式如 [::]:80 或 :::80)
-        port=$(echo "$local_addr" | awk -F: '{print $NF}')
-
-        # 协议过滤
-        if [ -n "$FILTER_PROTO" ] && [ "$FILTER_PROTO" != "全部" ] && [ "$proto" != "$FILTER_PROTO" ]; then
-            continue
+        # 关键词过滤
+        if [ -n "$KEYWORD" ]; then
+            if ! echo "$service" | grep -q "$KEYWORD" && ! echo "$desc" | grep -q "$KEYWORD"; then
+                continue
+            fi
         fi
 
-        # 端口过滤 (兼容 Alpine sh 数组限制)
-        if [ -n "$FILTER_PORT" ]; then
-            match=0
-            # 将逗号替换为空格进行遍历
-            for p in $(echo "$FILTER_PORT" | tr ',' ' '); do
-                if [ "$port" = "$p" ]; then
-                    match=1
-                    break
-                fi
-            done
-            [ $match -eq 0 ] && continue
-        fi
-
-        # 高风险端口标记
-        case "$port" in
-            22|80|443|3389) risk=1 ;;
-            *) risk=0 ;;
-        esac
-
-        # 协议颜色
-        case "$proto" in
-            tcp|TCP) proto_color="${GREEN}${proto}${RESET}" ;;
-            udp|UDP) proto_color="${CYAN}${proto}${RESET}" ;;
-            *) proto_color="$proto" ;;
-        esac
-
-        # 状态颜色
-        case "$state" in
-            LISTEN|Listen) state_color="${YELLOW}${state}${RESET}" ;;
-            ESTAB|Established) state_color="${GREEN}${state}${RESET}" ;;
-            SYN-RECV|FIN-WAIT-1|FIN-WAIT-2|CLOSE-WAIT|CLOSING|LAST-ACK|TIME-WAIT)
-                state_color="${PURPLE}${state}${RESET}" ;;
-            UNCONN) state_color="${BLUE}${state}${RESET}" ;;
-            *) state_color="$state" ;;
-        esac
-
-        # 本地地址颜色
-        if echo "$local_addr" | grep -Eq "^127\.|^::1|^10\.|^192\.168\.|^172\.1[6-9]\.|^172\.2[0-9]\.|^172\.3[0-1]\.|^\[::1\]|^\[f"; then
-            local_color="$BLUE$local_addr$RESET"
-        elif [ "$risk" -eq 1 ]; then
-            local_color="$RED$local_addr$RESET"
+        # 判定自启动状态 (纯文本)
+        if rc-update show 2>/dev/null | grep -Eq "^[[:space:]]*$service[[:space:]]*\|"; then
+            run_levels=$(rc-update show 2>/dev/null | grep "^[[:space:]]*$service[[:space:]]*|" | awk -F'|' '{print $2}' | xargs)
+            state="enabled(${run_levels})"
         else
-            local_color="$YELLOW$local_addr$RESET"
+            state="disabled"
         fi
 
-        # 输出格式，前置 risk 用于后续排序
-        printf "%d@@%s@@%s@@%s@@%s@@%s@@%s@@%s\n" \
-            "$risk" "$proto_color" "$state_color" "$recvq" "$sendq" "$local_color" "$peer_addr" "$process"
+        # 判定当前活跃状态 (纯文本)
+        if rc-service "$service" status 2>/dev/null | grep -q "status: started"; then
+            act_status="started"
+        else
+            act_status="stopped"
+        fi
 
-    done | sort -t '@' -k 1,1 -r | while IFS='@' read -r _ proto state recvq sendq local peer proc; do
-        # 打印最终结果
-        printf "%-6b %-12b %-10s %-10s %-30b %-30s %s\n" \
-            "$proto" "$state" "$recvq" "$sendq" "$local" "$peer" "$proc"
+        echo "${idx}:${service}:${state}:${act_status}:${desc}" >> "$TMP_MATRIX"
+        idx=$((idx + 1))
     done
+}
 
-    # ================== 退出逻辑 ==================
-    if [ "$REFRESH" -eq 1 ]; then
-        echo -e "\n${GREEN}输入 ${RED}0${GREEN} 回车退出实时刷新，其他回车继续...${RESET}"
-        read -r input
-        if [ "$input" = "0" ]; then
-            echo -e "${GREEN}退出实时刷新${RESET}"
-            break
+# ================== 刷新并显示某一页 ==================
+refresh_list() {
+    clear
+    if [ ! -s "$TMP_MATRIX" ]; then
+        TOTAL_COUNT=0
+        TOTAL_PAGES=1
+    else
+        TOTAL_COUNT=$(wc -l < "$TMP_MATRIX")
+        TOTAL_PAGES=$(( (TOTAL_COUNT + PAGE_SIZE - 1) / PAGE_SIZE ))
+    fi
+
+    echo -e "${BOLD}${CYAN}=== OpenRC 服务列表（第 $CURRENT_PAGE 页 / 共 ${TOTAL_PAGES} 页，总计 ${TOTAL_COUNT} 个服务） ===${RESET}"
+    printf "${BOLD}%-5s %-25s %-20s %-15s %s${RESET}\n" "No." "SERVICE" "AUTO-START" "STATUS" "DESCRIPTION"
+    echo "--------------------------------------------------------------------------------------------------------"
+
+    if [ "$TOTAL_COUNT" -gt 0 ]; then
+        start_line=$(( (CURRENT_PAGE - 1) * PAGE_SIZE + 1 ))
+        end_line=$(( CURRENT_PAGE * PAGE_SIZE ))
+
+        sed -n "${start_line},${end_line}p" "$TMP_MATRIX" | awk -F':' -v r="$RED" -v g="$GREEN" -v y="$YELLOW" -v rst="$RESET" '
+        {
+            no=$1; service=$2; state=$3; act_status=$4; desc=$5;
+
+            if (state ~ /enabled/) {
+                state_fmt = g state rst
+            } else {
+                state_fmt = y state rst
+            }
+
+            if (act_status == "started") {
+                act_fmt = g act_status rst
+            } else {
+                act_fmt = r act_status rst
+            }
+
+            printf "%-5s %-25s %-31s %-26s %s\n", no, service, state_fmt, act_fmt, desc
+        }'
+    else
+        echo -e "       ${YELLOW}没有找到匹配的服务${RESET}"
+    fi
+}
+
+# ================== 初始化 ==================
+generate_full_list
+refresh_list
+
+# ================== 核心交互逻辑 ==================
+while true; do
+    echo
+    printf "${GREEN}输入序号看详情，s 序号停用+禁用，r 刷新，n 下一页，p 上一页，0 退出: ${RESET}"
+    read -r INPUT
+
+    if [ "$INPUT" = "0" ] || [ -z "$INPUT" ]; then
+        break
+
+    elif [ "$INPUT" = "r" ]; then
+        generate_full_list
+        refresh_list
+
+    elif [ "$INPUT" = "n" ]; then
+        TOTAL_COUNT=$(wc -l < "$TMP_MATRIX" 2>/dev/null || echo 0)
+        max_page=$(( (TOTAL_COUNT + PAGE_SIZE - 1) / PAGE_SIZE ))
+        if [ "$CURRENT_PAGE" -lt "$max_page" ]; then
+            CURRENT_PAGE=$((CURRENT_PAGE + 1))
+        fi
+        refresh_list
+
+    elif [ "$INPUT" = "p" ]; then
+        if [ "$CURRENT_PAGE" -gt 1 ]; then
+            CURRENT_PAGE=$((CURRENT_PAGE - 1))
+        fi
+        refresh_list
+
+    # 多选停止+禁用
+    elif echo "$INPUT" | grep -Eq "^s[[:space:]]*[0-9 ]+$"; then
+        NUMS=$(echo "$INPUT" | sed 's/^s[[:space:]]*//')
+        for num in $NUMS; do
+            line_data=$(grep -E "^${num}:" "$TMP_MATRIX" 2>/dev/null)
+            if [ -n "$line_data" ]; then
+                service=$(echo "$line_data" | cut -d':' -f2)
+                curr_state=$(echo "$line_data" | cut -d':' -f3)
+                curr_act=$(echo "$line_data" | cut -d':' -f4)
+                
+                echo -e "\n${CYAN}正在处理服务: $service ...${RESET}"
+                
+                # 1. 如果还在运行，执行停止
+                if [ "$curr_act" = "started" ]; then
+                    $SUDO rc-service "$service" stop
+                else
+                    echo -e "${YELLOW}[提示] 服务原本就是停止状态${RESET}"
+                fi
+                
+                # 2. 如果本来就是启用的，才进行注销自启
+                if echo "$curr_state" | grep -q "enabled"; then
+                    if $SUDO rc-update del "$service" >/dev/null 2>&1; then
+                        echo -e "${RED}[已禁用自启] $service${RESET}"
+                    else
+                        echo -e "${YELLOW}[禁用自启失败] $service${RESET}"
+                    fi
+                else
+                    echo -e "${YELLOW}[提示] 服务原本就未开启自启动${RESET}"
+                fi
+            else
+                echo -e "${YELLOW}无效序号: $num${RESET}"
+            fi
+        done
+        generate_full_list
+        refresh_list
+
+    # 查看服务状态
+    elif echo "$INPUT" | grep -Eq "^[0-9]+$"; then
+        line_data=$(grep -E "^${INPUT}:" "$TMP_MATRIX" 2>/dev/null)
+        if [ -n "$line_data" ]; then
+            service=$(echo "$line_data" | cut -d':' -f2)
+            echo -e "\n${CYAN}=== $service 详细运行状态 ===${RESET}"
+            
+            rc-service "$service" status
+            
+            echo -e "\n${YELLOW}按回车返回菜单...${RESET}"
+            read -r _
+            refresh_list
+        else
+            echo -e "${YELLOW}无效序号: $INPUT${RESET}"
         fi
     else
-        break
+        echo -e "${YELLOW}无效输入，请重新输入${RESET}"
     fi
 done
+
+rm -f "$TMP_MATRIX"

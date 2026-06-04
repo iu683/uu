@@ -1,11 +1,11 @@
-#!/bin/bash
+#!/bin/sh
 # =========================================================================
-# Cron 定时任务智能管理面板（跨系统自适配 + 安全无缝交互版）
+#       ◈ 多系统通用运维工具箱一键部署面板 (POSIX Shell 完美兼容版)
 # =========================================================================
 
-# 严格的 Root 权限检查
-if [ "$EUID" -ne 0 ]; then
-    echo -e "\033[31m❌ 错误：请使用 root 权限（或通过 sudo）运行此脚本！\033[0m"
+# 权限校验
+if [ "$(id -u)" -ne 0 ]; then
+    echo "\033[31m❌ 错误：请使用 root 权限或 sudo 运行此脚本！\033[0m"
     exit 1
 fi
 
@@ -14,213 +14,267 @@ RED="\033[31m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-# 自动精确识别发行版
-get_os_type() {
-    if [ -f /etc/alpine-release ]; then
-        echo "Alpine"
-    elif [ -f /etc/os-release ]; then
-        . /etc/os-release
-        case "$ID" in
-            ubuntu) echo "Ubuntu" ;;
-            debian) echo "Debian" ;;
-            centos|rhel|rocky|almalinux) echo "RedHat" ;;
-            *) echo "Linux" ;;
-        esac
+# ================== 精准系统检测 ==================
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        os_name=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
     else
-        echo "Linux"
+        os_name="unknown"
     fi
+    
+    # 规范化家族名称
+    case "$os_name" in
+        fedora|rocky|alma|centos) os_family="rhel" ;;
+        ubuntu|debian|kali|linuxmint) os_family="debian" ;;
+        alpine) os_family="alpine" ;;
+        amzn) os_family="amazon" ;;
+        *) os_family="unknown" ;;
+    esac
 }
 
-OS=$(get_os_type)
-
-# 安装并启动 crontab 服务 
-install_crontab_if_missing() {
-    if ! command -v crontab >/dev/null 2>&1; then
-        echo -e "${YELLOW}🔧 未检测到 crontab 组件，正在为您自动补全...${RESET}"
-        case "$OS" in
-            Alpine)
-                apk add --no-cache dcron >/dev/null 2>&1
-                rc-update add crond default >/dev/null 2>&1
-                rc-service crond start >/dev/null 2>&1
+# ================== 核心通用安装引擎 ==================
+install_tool_core() {
+    local tool="$1"
+    local sys_mode="$2"
+    
+    echo -e "${YELLOW}⚙️ 正在为您在 ${os_name} 系统上配置 ${tool} ...${RESET}"
+    
+    # 针对特定系统工具做特殊分支处理
+    if [ "$sys_mode" = "sys" ]; then
+        case "$os_family" in
+            rhel)
+                yum install epel-release -y >/dev/null 2>&1
+                yum install -y "$tool"
+                return $?
                 ;;
-            Ubuntu|Debian)
-                apt-get update -y >/dev/null 2>&1
-                apt-get install -y cron >/dev/null 2>&1
-                systemctl enable --now cron >/dev/null 2>&1
+            amazon)
+                amazon-linux-extras install epel -y >/dev/null 2>&1 || yum install epel-release -y >/dev/null 2>&1
+                yum install -y "$tool"
+                return $?
                 ;;
-            RedHat)
-                yum install -y cronie >/dev/null 2>&1 || dnf install -y cronie >/dev/null 2>&1
-                systemctl enable --now crond >/dev/null 2>&1
-                ;;
-            *)
-                echo -e "${RED}❌ 无法自动识别系统类型，请手动安装 crontab！${RESET}"
-                read -rp "按回车键退出..."
-                exit 1
+            debian)
+                if [ "$tool" = "mtr" ]; then
+                    apt-get update -y && apt-get install -y mtr-tiny
+                    return $?
+                fi
                 ;;
         esac
-        echo -e "${GREEN}✅ crontab 安装完成并已自动启动服务！${RESET}"
-        sleep 1
-    else
-        # 服务保活，确保其运行
-        if [ "$OS" = "Alpine" ]; then
-            rc-service crond start >/dev/null 2>&1
-        elif command -v systemctl >/dev/null 2>&1; then
-            systemctl start cron >/dev/null 2>&1 || systemctl start crond >/dev/null 2>&1
-        fi
     fi
-}
 
-# 校验数字范围 
-validate_number() {
-    local value="$1" local min="$2" local max="$3" local name="$4"
-    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt "$min" ] || [ "$value" -gt "$max" ]; then
-        echo -e "${RED}❌ 错误：${name} 输入无效，应在 $min 到 $max 之间！${RESET}"
+    # 标准通用安装路由
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y >/dev/null 2>&1 && apt-get install -y "$tool"
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y "$tool"
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y "$tool"
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache "$tool"
+    else
+        echo -e "${RED}❌ 错误：无法识别此系统的包管理器！${RESET}"
         return 1
     fi
-    return 0
 }
 
-# 添加任务 
-add_cron_task() {
-    echo -e "\n${YELLOW}=== ➕ 添加新定时任务 ===${RESET}"
-    echo -ne "${GREEN}请输入新任务要执行的 Shell 命令: ${RESET}"
-    read -r newquest
-    [ -z "$newquest" ] && return
+# 检查是否安装
+check_installed() {
+    command -v "$1" >/dev/null 2>&1
+}
 
-    echo -e "\n${YELLOW}------ ⏰ 选择触发周期 ------${RESET}"
-    echo -e "${GREEN}  1) 每月任务 (指定某天 00:00 执行)${RESET}"            
-    echo -e "${GREEN}  2) 每周任务 (指定周几 00:00 执行)${RESET}"
-    echo -e "${GREEN}  3) 每天任务 (指定每天几点 00分 执行)${RESET}"  
-    echo -e "${GREEN}  4) 每小时任务 (指定每小时第几分钟 执行)${RESET}"
-    echo -e "${YELLOW}----------------------------${RESET}"
-    echo -ne "${GREEN}请选择时间类型: ${RESET}"
-    read -r dingshi
-
-    case "$dingshi" in
-        1)
-            echo -ne "${YELLOW}每月的几号执行任务？ (1-31): ${RESET}"
-            read -r day
-            validate_number "$day" 1 31 "日期" || { read -rp "按回车键返回..."; return; }
-            (crontab -l 2>/dev/null; echo "0 0 $day * * $newquest") | crontab -
-            ;;
-        2)
-            echo -ne "${YELLOW}周几执行任务？ (0-6, 0=周日): ${RESET}"
-            read -r weekday
-            validate_number "$weekday" 0 6 "星期" || { read -rp "按回车键返回..."; return; }
-            (crontab -l 2>/dev/null; echo "0 0 * * $weekday $newquest") | crontab -
-            ;;
-        3)
-            echo -ne "${YELLOW}每天几点执行任务？（小时，0-23）: ${RESET}"
-            read -r hour
-            validate_number "$hour" 0 23 "小时" || { read -rp "按回车键返回..."; return; }
-            (crontab -l 2>/dev/null; echo "0 $hour * * * $newquest") | crontab -
-            ;;
-        4)
-            echo -ne "${YELLOW}每小时第几分钟执行任务？（分钟，0-59）: ${RESET}"
-            read -r minute
-            validate_number "$minute" 0 59 "分钟" || { read -rp "按回车键返回..."; return; }
-            (crontab -l 2>/dev/null; echo "$minute * * * * $newquest") | crontab -
-            ;;
-        *)
-            echo -e "${RED}❌ 无效选择${RESET}"
-            sleep 1
-            return
-            ;;
+# ================== 工具元数据驱动器 (代替容易闪退的关联数组) ==================
+# 格式化存储明细： 编号 | 工具名称 | 运行测试模式 | 系统专属限制 (留空代表通用)
+get_tool_data() {
+    case "$1" in
+        1)  echo "curl:help:" ;;
+        2)  echo "wget:help:" ;;
+        3)  echo "sudo:help:" ;;
+        4)  echo "socat:help:" ;;
+        5)  echo "htop:run:" ;;
+        6)  echo "iftop:run:" ;;
+        7)  echo "unzip:help:" ;;
+        8)  echo "tar:help:" ;;
+        9)  echo "tmux:help:" ;;
+        10) echo "ffmpeg:help:" ;;
+        11) echo "btop:run:" ;;
+        12) echo "ranger:run_root:" ;;
+        13) echo "ncdu:run_root:" ;;
+        14) echo "fzf:run_root:" ;;
+        15) echo "vim:help_root:" ;;
+        16) echo "nano:help_root:" ;;
+        17) echo "git:help_root:" ;;
+        18) echo "screen:sys:centos,rocky,amzn" ;;
+        19) echo "masscan:sys:centos,rocky,amzn" ;;
+        20) echo "iperf3:sys:" ;;
+        21) echo "mtr:sys:" ;;
+        *)  echo "NONE" ;;
     esac
-    echo -e "\n${GREEN}✅ 任务已成功持久化写入 crontab 定时列表！${RESET}"
-    read -rp "按回车键返回菜单..."
 }
 
-# 删除任务
-delete_cron_task() {
-    echo -e "\n${YELLOW}=== ➖ 删除定时任务 ===${RESET}"
-    local tmp_cron="/tmp/cron_list_tmp"
+# ================== 智能动态菜单渲染 ==================
+show_menu() {
+    clear
+    echo -e "${GREEN}=====================================${RESET}"
+    echo -e "${GREEN}     ◈ 运维必备全能工具箱面板 ◈      ${RESET}"
+    echo -e "${GREEN}=====================================${RESET}"
+    echo -e "${GREEN} 宿主系统:${RESET} ${YELLOW}$os_name${RESET}"
+    echo -e "${GREEN} 核心架构:${RESET} ${YELLOW}$(uname -m)${RESET}"
+    echo -e "${GREEN}------------------------------------=${RESET}"
     
-    # 安全导出，避免因 crontab 为空触发 set -e 崩溃（虽然新脚本已经拿掉了 set -e，但安全第一）
-    crontab -l 2>/dev/null > "$tmp_cron" || true
+    local i=1
+    while [ $i -le 21 ]; do
+        local data=$(get_tool_data $i)
+        IFS=":" read -r tool mode support_os _ <<EOF
+$data
+EOF
+        # 校验系统特定的软件展示限制
+        if [ -n "$support_os" ]; then
+            echo ",$support_os," | grep -q ",$os_name,"
+            if [ $? -ne 0 ]; then
+                i=$((i+1))
+                continue
+            fi
+        fi
+
+        # 状态标色
+        if check_installed "$tool"; then
+            status="${GREEN}✔ 已安装${RESET}"
+        else
+            status="${RED}✖ 未安装${RESET}"
+        fi
+
+        # 优雅的对齐格式化输出
+        printf "${GREEN} [%02d] %-12s${RESET} %b\n" "$i" "$tool" "$status"
+        i=$((i+1))
+    done
     
-    if [ ! -s "$tmp_cron" ]; then
-        echo -e "${YELLOW}💡 当前系统中没有任何运行中的定时任务。${RESET}"
-        rm -f "$tmp_cron"
-        read -rp "按回车键返回菜单..."
+    echo -e "${GREEN}------------------------------------=${RESET}"
+    echo -e "${YELLOW} [99] 📦 批量/单个多选工具卸载模式${RESET}"
+    echo -e "${RED} 0 退出${RESET}"
+    echo -e "${GREEN}=====================================${RESET}"
+}
+
+# ================== 动作调度核心执行器 ==================
+execute_action() {
+    local tool="$1"
+    local mode="$2"
+
+    if ! check_installed "$tool"; then
+        install_tool_core "$tool" "$mode"
+        if [ $? -ne 0 ] || ! check_installed "$tool"; then
+            echo -e "${RED}❌ $tool 安装失败，请检查软件源仓库配置。${RESET}"
+            return 1
+        fi
+        echo -e "${GREEN}✅ $tool 成功部署就绪！${RESET}"
+    else
+        echo -e "${GREEN}💡 检测到 $tool 已经安装在系统环境中。${RESET}"
+    fi
+
+    # 引导运行或调出帮助信息
+    echo -e "${YELLOW}-------------------------------------${RESET}"
+    case "$mode" in
+        help)      echo -e "即将调取帮助快照: $tool --help"; sleep 1; "$tool" --help ;;
+        run)       echo -e "即将立刻进入并运行工具: $tool"; sleep 1; "$tool" ;;
+        run_root)  echo -e "即将切入根路径运行工具: $tool"; sleep 1; cd / && "$tool"; cd ~ ;;
+        help_root) echo -e "即将切入根路径调取帮助: $tool -h"; sleep 1; cd / && "$tool" -h; cd ~ ;;
+        sys)       echo -e "环境包部署完成，您现在可以直接在全局键入 [ ${tool} ] 使用它。" ;;
+    esac
+}
+
+# ================== 智能多选御载引擎 ==================
+uninstall_mode() {
+    clear
+    echo -e "${RED}=====================================${RESET}"
+    echo -e "${RED}       ◈ 软件卸载清洗中心 ◈          ${RESET}"
+    echo -e "${RED}=====================================${RESET}"
+    
+    # 动态扫描已存在的工具
+    local list=""
+    local count=0
+    local i=1
+    while [ $i -le 21 ]; do
+        local data=$(get_tool_data $i)
+        IFS=":" read -r tool _ <<EOF
+$data
+EOF
+        if check_installed "$tool"; then
+            count=$((count+1))
+            eval "inst_tool_$count=\"$tool\""
+            echo -e "${GREEN}  $count) $tool${RESET}"
+        fi
+        i=$((i+1))
+    done
+
+    if [ $count -eq 0 ]; then
+        echo -e "${YELLOW}🍃 系统非常洁净，没有发现可供御载的工具组件。${RESET}"
+        read -r -p "按 [回车键] 返回菜单..." dummy
         return
     fi
 
-    echo -e "${GREEN}当前可删除的任务列表:${RESET}"
-    awk '{print "  " NR") " $0}' "$tmp_cron"
-    echo -e "${YELLOW}---------------------------------------${RESET}"
-    echo -ne "${YELLOW}请输入要删除的任务序号（多个用空格分隔）: ${RESET}"
-    read -r indices
-    [ -z "$indices" ] && { rm -f "$tmp_cron"; return; }
-
-    # 倒序排列序号，从后往前删，避免行号因动态缩减而错位
-    local sorted_indices=$(echo "$indices" | tr ' ' '\n' | sort -rn)
+    echo ""
+    echo -ne "${YELLOW}请输入需要清洗的软件编号 (支持以空格或逗号多选, 如 1 3 5): ${RESET}"
+    read -r choices
     
-    for idx in $sorted_indices; do
-        if [[ "$idx" =~ ^[0-9]+$ ]]; then
-            # 兼容适配：使用通用的 sed 行为，完美契合 Alpine Busybox 与 传统 Linux
-            sed -i "${idx}d" "$tmp_cron" 2>/dev/null || sed -i "" "${idx}d" "$tmp_cron" 2>/dev/null
+    # 兼容处理用户输入的逗号
+    choices=$(echo "$choices" | tr ',' ' ')
+    
+    for choice in $choices; do
+        # 验证数字合法性
+        echo "$choice" | grep -q '^[0-9]\+$' || continue
+        if [ "$choice" -ge 1 ] && [ "$choice" -le $count ]; then
+            eval "target_tool=\$inst_tool_$choice"
+            echo -e "${YELLOW}⚡ 正在全盘清洗组件: $target_tool ...${RESET}"
+            
+            if command -v apt-get >/dev/null 2>&1; then
+                apt-get remove -y "$target_tool" >/dev/null 2>&1
+            elif command -v dnf >/dev/null 2>&1; then
+                dnf remove -y "$target_tool" >/dev/null 2>&1
+            elif command -v yum >/dev/null 2>&1; then
+                yum remove -y "$target_tool" >/dev/null 2>&1
+            elif command -v apk >/dev/null 2>&1; then
+                apk del "$target_tool" >/dev/null 2>&1
+            fi
+            echo -e "${GREEN}✓ $target_tool 已安全移除！${RESET}"
+        else
+            echo -e "${RED}❌ 无效的选择序列号: $choice${RESET}"
         fi
     done
-
-    crontab "$tmp_cron"
-    rm -f "$tmp_cron"
-    echo -e "\n${GREEN}✅ 选定任务已成功剔除并同步到系统内核！${RESET}"
-    read -rp "按回车键返回菜单..."
+    read -r -p "操作完成，按 [回车键] 返回主菜单..." dummy
 }
 
-# 编辑任务 
-edit_cron_task() {
-    echo -e "\n${YELLOW}=== 📝 手动编辑定时任务 ===${RESET}"
-    if ! command -v nano >/dev/null 2>&1 && ! command -v vim >/dev/null 2>&1; then
-        echo -e "${YELLOW}🔧 正在安装轻量文本编辑器 nano...${RESET}"
-        case "$OS" in
-            Alpine) apk add --no-cache nano >/dev/null 2>&1 ;;
-            Ubuntu|Debian) apt-get update -y >/dev/null 2>&1 && apt-get install -y nano >/dev/null 2>&1 ;;
-            *) yum install -y nano >/dev/null 2>&1 || dnf install -y nano >/dev/null 2>&1 ;;
-        esac
-    fi
-    export EDITOR=$(command -v nano || command -v vim || command -v vi)
-    crontab -e
-}
+# ================== 主循环入口 ==================
+detect_os
 
-# 预检安装
-install_crontab_if_missing
-
-# 主循环面板
 while true; do
-    clear
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}       ◈  Cron 定时任务管理面板  ◈      ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN} 当前系统环境 : ${YELLOW}${OS}${RESET}"
-    echo -e "${GREEN} 活跃任务总数 : ${YELLOW}$(crontab -l 2>/dev/null | grep -v '^#' | grep -c '[^\s]' || echo 0) 条${RESET}"
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN} 📋 当前系统定时任务快照：${RESET}"
-    
-    # 优雅高亮展示当前任务快照
-    if crontab -l >/dev/null 2>&1; then
-        crontab -l | awk '{print "   • " $0}'
-    else
-        echo -e "   ${YELLOW}(暂无活跃的定时任务)${RESET}"
-    fi
-    
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  1) 快速添加定时任务 (引导式)${RESET}"
-    echo -e "${GREEN}  2) 精准删除定时任务 (支持多选)${RESET}"
-    echo -e "${GREEN}  3) 深度手动编辑任务 (打开编辑器)${RESET}"
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  0) 退出${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    
-    echo -ne "${GREEN} 请选择操作编号: ${RESET}"
-    read -r choice
+    show_menu
+    echo -ne "${GREEN}请输入您的首选操作编号: ${RESET}"
+    read -r sub_choice
 
-    case "$choice" in
-        1) add_cron_task ;;
-        2) delete_cron_task ;;
-        3) edit_cron_task ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}❌ 输入错误，无此选项${RESET}"; sleep 1 ;;
-    esac
+    # 兼容非标数字格式输入
+    if [ "$sub_choice" = "0" ] || [ "$sub_choice" = "00" ]; then
+        exit 0
+    fi
+
+    if [ "$sub_choice" = "99" ]; then
+        uninstall_mode
+        continue
+    fi
+
+    # 判断输入合法性与范围
+    echo "$sub_choice" | grep -q '^[0-9]\+$'
+    if [ $? -ne 0 ] || [ "$sub_choice" -lt 1 ] || [ "$sub_choice" -gt 21 ]; then
+        echo -e "${RED}❌ 警告：请输入有效的菜单指令数字！${RESET}"
+        sleep 1
+        continue
+    fi
+
+    # 获取选定的配置行
+    tool_raw_data=$(get_tool_data "$sub_choice")
+    if [ "$tool_raw_data" != "NONE" ]; then
+        IFS=":" read -r target_tool target_mode _ <<EOF
+$tool_raw_data
+EOF
+        execute_action "$target_tool" "$target_mode"
+        echo ""
+        read -r -p "👉 任务完毕，按 [回车键] 重回主菜单..." dummy
+    fi
 done

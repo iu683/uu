@@ -1,72 +1,98 @@
 #!/bin/bash
-# ======================================
-# Ookla / Open-Source Speedtest 一键安装脚本
-# Debian / Ubuntu / Alpine 全系统完美适配版
-# ======================================
-
-set -e
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-echo -e "${GREEN}🚀 开始安装 Speedtest CLI...${RESET}"
+SET_KEY_URL="https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/secretkey.sh"
+MANAGE_KEY_URL="https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/SSHPubkey.sh"
 
-# 必须 root
-if [ "$(id -u)" -ne 0 ]; then
-  echo -e "${RED}❌ 请使用 root 或 sudo 运行！${RESET}"
-  exit 1
-fi
+#################################
+# 动态获取当前 root 密钥开关状态
+#################################
+get_ssh_status_label() {
+    if [ -f "/root/.ssh/authorized_keys" ] && [ -s "/root/.ssh/authorized_keys" ]; then
+        local count=$(wc -l < /root/.ssh/authorized_keys)
+        echo -e "${YELLOW}[已开启 - 共 ${count} 个公钥]${RESET}"
+    else
+        echo -e "${RED}[已关闭 - 未设置公钥]${RESET}"
+    fi
+}
 
-# ======================================
-# 智能分流安装引擎
-# ======================================
-if [ -f /etc/alpine-release ]; then
-    # ---------------- Alpine Linux 部署分支 ----------------
-    echo -e "${YELLOW}📦 检测到 Alpine 系统，正在通过 apk 官方源安装...${RESET}"
-    
-    # 1. 直接一行命令安装官方源的 speedtest-cli
-    apk add --no-cache speedtest-cli
-    
-    # 2. 创建软链接，确保全局命令与商业版 speedtest 兼容，防止后续脚本卡死
-    if [ ! -f /usr/local/bin/speedtest ] && [ ! -f /usr/bin/speedtest ]; then
-        ln -sf $(command -v speedtest-cli) /usr/bin/speedtest
+#################################
+# 执行远程脚本
+#################################
+run_script() {
+    local url=$1
+    local name=$2
+
+    echo -e "${GREEN}正在执行：${name}${RESET}"
+    bash <(curl -fsSL "$url")
+    pause
+}
+
+#################################
+# 一键清除 SSH 密钥
+#################################
+clear_all_ssh_keys() {
+    echo -e "${RED}警告：此操作将删除所有用户 SSH 密钥！${RESET}"
+    echo -e "${RED}包括：/root/.ssh 和 /home/*/.ssh${RESET}"
+    read -p $'\033[33m确认清除请输入(y): \033[0m' confirm
+
+    if [[ "$confirm" != "y" ]]; then
+        echo -e "${GREEN}已取消操作${RESET}"
+        sleep 1
+        return
     fi
 
-else
-    # ---------------- Debian / Ubuntu 部署分支 ----------------
-    # 1. 安装 curl
-    if ! command -v curl >/dev/null 2>&1; then
-      echo "📦 安装 curl..."
-      apt-get update -y
-      apt-get install -y curl
-    fi
+    echo -e "${GREEN}正在清理 SSH 密钥...${RESET}"
 
-    # 2. 添加 Ookla 官方源并安装
-    echo "📦 添加 Ookla 仓库并安装..."
-    curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash
-    apt-get install -y speedtest
-fi
+    rm -rf /root/.ssh /home/*/.ssh 2>/dev/null
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
 
-# 确保命令哈希表刷新
-hash -r 2>/dev/null
+    echo -e "${GREEN}SSH 密钥已全部清理完成${RESET}"
+    pause
+}
 
-echo -e "${GREEN}✅ 安装完成！${RESET}"
+#################################
+# 暂停提示
+#################################
+pause() {
+    read -p $'\033[32m按回车返回菜单...\033[0m'
+}
 
-# ======================================
-# 自动测速
-# ======================================
-echo ""
-echo -e "${GREEN}🚀 开始测速...${RESET}"
-echo "-------------------------------------"
+#################################
+# 主循环菜单
+#################################
+while true; do
+    clear
+    # 每次循环动态获取最新状态
+    STATUS_LABEL=$(get_ssh_status_label)
 
-# 智能判断：开源版 speedtest-cli 不需要也不支持这两个商业隐私参数
-if speedtest --help 2>&1 | grep -q "accept-license"; then
-    speedtest --accept-license --accept-gdpr
-else
-    speedtest
-fi
 
-echo "-------------------------------------"
-echo -e "${GREEN}🎉 完成！以后直接运行： speedtest${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}     root 公钥登录管理          ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}当前状态 :${RESET} ${STATUS_LABEL}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN} 1) 设置公钥登录${RESET}"
+    echo -e "${GREEN} 2) 管理公钥登录${RESET}"
+    echo -e "${GREEN} 3) 清除所有SSH密钥${RESET}"
+    echo -e "${GREEN} 0) 退出${RESET}"
+    read -p $'\033[32m 请选择: \033[0m' choice
+
+    case $choice in
+        1) run_script "$SET_KEY_URL" "设置公钥登录" ;;
+        2) run_script "$MANAGE_KEY_URL" "管理公钥登录" ;;
+        3) clear_all_ssh_keys ;;
+        0) 
+            echo -e "${GREEN}退出脚本。${RESET}"
+            exit 0 
+            ;;
+        *)
+            echo -e "${RED}输入错误，请重新选择${RESET}"
+            sleep 1
+            ;;
+    esac
+done

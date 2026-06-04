@@ -2,7 +2,7 @@
 set -e
 
 # ===============================
-# 防火墙管理脚本（Debian/Ubuntu 双栈 IPv4/IPv6）
+# 防火墙管理脚本（Debian/Ubuntu 双栈 IPv4/IPv6 - Docker 完美兼容版）
 # ===============================
 
 GREEN="\033[32m"
@@ -26,10 +26,10 @@ get_ssh_port() {
 
 get_firewall_status() {
     if systemctl is-active --quiet netfilter-persistent 2>/dev/null; then
-        echo -e "${GREEN}● 已开启 (开机自启)${RESET}"
+        echo -e "${YELLOW}● 已开启(开机自启)${RESET}"
     else
         if iptables -P INPUT 2>/dev/null | grep -q "DROP"; then
-            echo -e "${YELLOW}● 运行中 (未设自启)${RESET}"
+            echo -e "${YELLOW}● 运行中(未设自启)${RESET}"
         else
             echo -e "${RED}○ 已关闭 (全放行)${RESET}"
         fi
@@ -39,9 +39,9 @@ get_firewall_status() {
 get_firewall_type() {
     if command -v iptables &>/dev/null; then
         if iptables --version | grep -qi "nftables"; then
-            echo "iptables (nftables 后端)"
+            echo "iptables (nftables)"
         else
-            echo "iptables (legacy 后端)"
+            echo "iptables (legacy)"
         fi
     else
         echo "未安装"
@@ -50,8 +50,9 @@ get_firewall_type() {
 
 get_banned_ip_count() {
     local count4 count6 total
-    count4=$(iptables -L INPUT -n 2>/dev/null | grep -E "DROP|REJECT" | grep -v "tcp dport" | awk '{print $4}' | grep -v "0.0.0.0" | sort -u | wc -l)
-    count6=$(ip6tables -L INPUT -n 2>/dev/null | grep -E "DROP|REJECT" | grep -v "tcp dport" | awk '{print $4}' | grep -v "::" | sort -u | wc -l)
+    # 使用 -S 精准统计纯 IP 封禁条目
+    count4=$(iptables -S INPUT 2>/dev/null | grep " -j DROP" | grep -vE "dport|sport" | wc -l || echo 0)
+    count6=$(ip6tables -S INPUT 2>/dev/null | grep " -j DROP" | grep -vE "dport|sport" | wc -l || echo 0)
     total=$((count4 + count6))
     echo "$total"
 }
@@ -76,17 +77,17 @@ init_rules() {
     local ssh_port
     ssh_port=$(get_ssh_port)
     for proto in iptables ip6tables; do
-        $proto -F
-        $proto -X
-        $proto -t nat -F 2>/dev/null || true
-        $proto -t nat -X 2>/dev/null || true
-        $proto -t mangle -F 2>/dev/null || true
-        $proto -t mangle -X 2>/dev/null || true
+        # 【Docker 兼容】：绝对不执行全局清空(-F)，只精准清空 INPUT 链
+        $proto -F INPUT
+        
+        # 核心策略：入站默认拦截，转发和出站保持 ACCEPT（Docker 严重依赖 FORWARD）
         $proto -P INPUT DROP
-        $proto -P FORWARD DROP
+        $proto -P FORWARD ACCEPT
         $proto -P OUTPUT ACCEPT
-        $proto -A INPUT -i lo -j ACCEPT
+        
+        # 基础放行规则（用 -A 追加，确保后续用户使用 -I 1 插入的白名单拥有最高优先级）
         $proto -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+        $proto -A INPUT -i lo -j ACCEPT
         $proto -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
         $proto -A INPUT -p tcp --dport 80 -j ACCEPT
         $proto -A INPUT -p tcp --dport 443 -j ACCEPT
@@ -112,17 +113,19 @@ install_firewall() {
 }
 
 clear_firewall() {
-    echo -e "${YELLOW}正在清空防火墙规则并放行所有流量...${RESET}"
+    echo -e "${YELLOW}正在恢复宿主机默认策略并放行所有流量...${RESET}"
     for proto in iptables ip6tables; do
-        $proto -F
-        $proto -X
+        $proto -F INPUT
         $proto -P INPUT ACCEPT
         $proto -P FORWARD ACCEPT
         $proto -P OUTPUT ACCEPT
     done
+    if iptables -L DOCKER-USER -n &>/dev/null; then
+        iptables -F DOCKER-USER
+    fi
     save_rules
     systemctl disable netfilter-persistent 2>/dev/null || true
-    echo -e "${GREEN}✅ 防火墙规则已清空，所有流量已放行${RESET}"
+    echo -e "${GREEN}✅ 防火墙入站限制已清空，宿主机流量已全放行（未损坏 Docker 链）${RESET}"
     read -p "按回车继续..."
 }
 
@@ -137,16 +140,14 @@ restore_default_rules() {
 }
 
 open_all_ports() {
-    echo -e "${YELLOW}正在放行所有端口（IPv4/IPv6）...${RESET}"
+    echo -e "${YELLOW}正在放行所有宿主机端口（IPv4/IPv6）...${RESET}"
     for proto in iptables ip6tables; do
-        $proto -F
-        $proto -X
+        $proto -F INPUT
         $proto -P INPUT ACCEPT
         $proto -P FORWARD ACCEPT
-        $proto -P OUTPUT ACCEPT
     done
     save_rules
-    echo -e "${GREEN}✅ 所有端口已放行（全开放）${RESET}"
+    echo -e "${GREEN}✅ 宿主机所有端口已放行（全开放）${RESET}"
     read -p "按回车继续..."
 }
 
@@ -159,50 +160,63 @@ ip_action() {
     fi
 
     case $action in
-        accept) $proto -I INPUT -s "$ip" -j ACCEPT ;;
-        drop)   $proto -I INPUT -s "$ip" -j DROP ;;
+        accept) 
+            # 显式指定插入到第 1 行，确保拥有最高匹配优先级
+            if ! $proto -C INPUT -s "$ip" -j ACCEPT 2>/dev/null; then
+                $proto -I INPUT 1 -s "$ip" -j ACCEPT 
+            fi
+            ;;
+        drop)   
+            # 黑名单同样置顶
+            if ! $proto -C INPUT -s "$ip" -j DROP 2>/dev/null; then
+                $proto -I INPUT 1 -s "$ip" -j DROP 
+            fi
+            # 【Docker 兼容改造】：如果存在 DOCKER-USER 链，将黑名单同步封禁在 Docker 顶端 (位置 1)
+            if [ "$proto" = "iptables" ] && iptables -L DOCKER-USER -n &>/dev/null; then
+                if ! iptables -C DOCKER-USER -s "$ip" -j DROP 2>/dev/null; then
+                    iptables -I DOCKER-USER 1 -s "$ip" -j DROP
+                fi
+            fi
+            ;;
         delete)
             while $proto -C INPUT -s "$ip" -j ACCEPT 2>/dev/null; do $proto -D INPUT -s "$ip" -j ACCEPT; done
             while $proto -C INPUT -s "$ip" -j DROP 2>/dev/null; do $proto -D INPUT -s "$ip" -j DROP; done
+            if [ "$proto" = "iptables" ] && iptables -L DOCKER-USER -n &>/dev/null; then
+                while iptables -C DOCKER-USER -s "$ip" -j DROP 2>/dev/null; do iptables -D DOCKER-USER -s "$ip" -j DROP; done
+            fi
             ;;
     esac
 }
 
 ping_action() {
     local action=$1
-    for proto in iptables ip6tables; do
-        case $action in
-            allow)
-                while $proto -C INPUT -p icmp -j DROP 2>/dev/null; do $proto -D INPUT -p icmp -j DROP; done
-                while $proto -C OUTPUT -p icmp -j DROP 2>/dev/null; do $proto -D OUTPUT -p icmp -j DROP; done
-                if [ "$proto" = "iptables" ]; then
-                    $proto -I INPUT -p icmp --icmp-type echo-request -j ACCEPT
-                    $proto -I OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT
-                else
-                    $proto -I INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT
-                    $proto -I OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT
-                fi
-                ;;
-            deny)
-                if [ "$proto" = "iptables" ]; then
-                    while $proto -C INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null; do $proto -D INPUT -p icmp --icmp-type echo-request -j ACCEPT; done
-                    while $proto -C OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT 2>/dev/null; do $proto -D OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT; done
-                    $proto -I INPUT -p icmp --icmp-type echo-request -j DROP
-                    $proto -I OUTPUT -p icmp --icmp-type echo-reply -j DROP
-                else
-                    while $proto -C INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT 2>/dev/null; do $proto -D INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT; done
-                    while $proto -C OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT 2>/dev/null; do $proto -D OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT; done
-                    $proto -I INPUT -p icmpv6 --icmpv6-type echo-request -j DROP
-                    $proto -I OUTPUT -p icmpv6 --icmpv6-type echo-reply -j DROP
-                fi
-                ;;
-        esac
-    done
+    
+    while iptables -C INPUT -p icmp -j DROP 2>/dev/null; do iptables -D INPUT -p icmp -j DROP; done
+    while iptables -C OUTPUT -p icmp -j DROP 2>/dev/null; do iptables -D OUTPUT -p icmp -j DROP; done
+    while iptables -C INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null; do iptables -D INPUT -p icmp --icmp-type echo-request -j ACCEPT; done
+    while iptables -C OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT 2>/dev/null; do iptables -D OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT; done
+    
+    while ip6tables -C INPUT -p icmpv6 -j DROP 2>/dev/null; do ip6tables -D INPUT -p icmpv6 -j DROP; done
+    while ip6tables -C OUTPUT -p icmpv6 -j DROP 2>/dev/null; do ip6tables -D OUTPUT -p icmpv6 -j DROP; done
+    while ip6tables -C INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT 2>/dev/null; do ip6tables -D INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT; done
+    while ip6tables -C OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT 2>/dev/null; do ip6tables -D OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT; done
+
+    if [ "$action" = "allow" ]; then
+        iptables -I INPUT -p icmp --icmp-type echo-request -j ACCEPT
+        iptables -I OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT
+        ip6tables -I INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT
+        ip6tables -I OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT
+    else
+        iptables -I INPUT -p icmp --icmp-type echo-request -j DROP
+        iptables -I OUTPUT -p icmp --icmp-type echo-reply -j DROP
+        ip6tables -I INPUT -p icmpv6 --icmpv6-type echo-request -j DROP
+        ip6tables -I OUTPUT -p icmpv6 --icmpv6-type echo-reply -j DROP
+    fi
 }
 
 uninstall_firewall() {
     clear
-    echo -e "${RED}⚠️ 警告：该操作将清空所有规则并卸载防火墙自启组件，恢复网络全放行不设防状态！${RESET}"
+    echo -e "${RED}⚠️ 警告：该操作将清空所有宿主机入站规则并卸载防火墙组件，恢复网络全放行状态！${RESET}"
     read -p "确定要彻底卸载吗？(y/n): " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo "已取消卸载。"
@@ -210,18 +224,16 @@ uninstall_firewall() {
         return
     fi
 
-    echo -e "${YELLOW}正在清理规则并将策略修改为 ACCEPT...${RESET}"
+    echo -e "${YELLOW}正在清理宿主机 INPUT 规则并修改策略...${RESET}"
     for proto in iptables ip6tables; do
-        $proto -F
-        $proto -X
-        $proto -t nat -F 2>/dev/null || true
-        $proto -t nat -X 2>/dev/null || true
-        $proto -t mangle -F 2>/dev/null || true
-        $proto -t mangle -X 2>/dev/null || true
+        $proto -F INPUT
         $proto -P INPUT ACCEPT
         $proto -P FORWARD ACCEPT
         $proto -P OUTPUT ACCEPT
     done
+    if iptables -L DOCKER-USER -n &>/dev/null; then
+        iptables -F DOCKER-USER
+    fi
 
     echo -e "${YELLOW}正在停止并卸载守护服务...${RESET}"
     systemctl stop netfilter-persistent 2>/dev/null || true
@@ -229,40 +241,40 @@ uninstall_firewall() {
     apt purge -y iptables-persistent netfilter-persistent || true
     apt autoremove -y
 
-    echo -e "${GREEN}✅ 防火墙已彻底卸载，所有网络流量已恢复不受限状态。${RESET}"
+    echo -e "${GREEN}✅ 防火墙已彻底卸载，Docker 及系统核心流量未受干扰。${RESET}"
     exit 0
 }
 
-# ===============================
-# 🚀 优化后的直观防火墙规则查看函数 (选项 10)
-# ===============================
 view_visual_rules() {
     clear
     local ports_tcp ports_udp ping_status_v4 ping_status_v6
+    local policy_v4 policy_v6
 
-    # 1. 提取已放行的 TCP/UDP 端口
-    ports_tcp=$(iptables -L INPUT -n 2>/dev/null | grep "ACCEPT" | grep "tcp dpt:" | sed -E 's/.*dpt:([0-9:]+).*/\1/' | tr '\n' ' ')
-    ports_udp=$(iptables -L INPUT -n 2>/dev/null | grep "ACCEPT" | grep "udp dpt:" | sed -E 's/.*dpt:([0-9:]+).*/\1/' | tr '\n' ' ')
+    policy_v4=$(iptables -L INPUT -n 2>/dev/null | head -n 1 | grep -oP "policy \K[A-Z]+")
+    policy_v6=$(ip6tables -L INPUT -n 2>/dev/null | head -n 1 | grep -oP "policy \K[A-Z]+")
+    [[ -z "$policy_v4" ]] && policy_v4="UNKNOWN"
+    [[ -z "$policy_v6" ]] && policy_v6="UNKNOWN"
+
+    ports_tcp=$( (iptables -S INPUT 2>/dev/null; ip6tables -S INPUT 2>/dev/null) | grep " -j ACCEPT" | grep "dport " | grep -E "tcp" | grep -oP "dport \K[0-9:]+" | sort -nu | tr '\n' ' ')
+    ports_udp=$( (iptables -S INPUT 2>/dev/null; ip6tables -S INPUT 2>/dev/null) | grep " -j ACCEPT" | grep "dport " | grep -E "udp" | grep -oP "dport \K[0-9:]+" | sort -nu | tr '\n' ' ')
     [[ -z "$ports_tcp" ]] && ports_tcp="无"
     [[ -z "$ports_udp" ]] && ports_udp="无"
 
-    # 2. 判断 PING 状态
-    if iptables -L INPUT -n 2>/dev/null | grep "DROP" | grep -q "icmp"; then ping_status_v4="${RED}禁打(DROP)${RESET}"; else ping_status_v4="${GREEN}允许(ACCEPT)${RESET}"; fi
-    if ip6tables -L INPUT -n 2>/dev/null | grep "DROP" | grep -q "ipv6-icmp"; then ping_status_v6="${RED}禁打(DROP)${RESET}"; else ping_status_v6="${GREEN}允许(ACCEPT)${RESET}"; fi
+    if iptables -S INPUT 2>/dev/null | grep "icmp" | grep -q "DROP"; then ping_status_v4="${RED}禁打(DROP)${RESET}"; else ping_status_v4="${GREEN}允许(ACCEPT)${RESET}"; fi
+    if ip6tables -S INPUT 2>/dev/null | grep "icmpv6" | grep -q "DROP"; then ping_status_v6="${RED}禁打(DROP)${RESET}"; else ping_status_v6="${GREEN}允许(ACCEPT)${RESET}"; fi
 
     echo -e "${CYAN}==================================================${RESET}"
-    echo -e "${CYAN}        📊 核心网络数据及规则总览看板             ${RESET}"
+    echo -e "${CYAN}         📊 核心网络数据及规则总览看板              ${RESET}"
     echo -e "${CYAN}==================================================${RESET}"
-    echo -e " 🛡️  ${CYAN}默认入站策略 (Default Policy):${RESET}"
-    echo -e "    - IPv4 INPUT 链 : $(iptables -L INPUT -n | head -n 1 | awk '{print $4}')"
-    echo -e "    - IPv6 INPUT 链 : $(ip6tables -L INPUT -n | head -n 1 | awk '{print $4}')"
+    echo -e " 🛡️  ${CYAN}宿主机默认入站策略 (Default Policy):${RESET}"
+    echo -e "    - IPv4 INPUT 链 : $policy_v4"
+    echo -e "    - IPv6 INPUT 链 : $policy_v6"
     echo -e " 🌐 ${CYAN}ICMP 响应状态 (PING):${RESET}"
     echo -e "    - IPv4 Ping 回应: $ping_status_v4"
     echo -e "    - IPv6 Ping 回应: $ping_status_v6"
     echo -e "${CYAN}--------------------------------------------------${RESET}"
 
-    # 打印放行端口表格
-    echo -e " 🔓 ${GREEN}当前对公网开放的端口列表：${RESET}"
+    echo -e " 🔓 ${GREEN}当前对宿主机公网开放的端口列表：${RESET}"
     echo -e "    +----------+--------------------------------------+"
     echo -e "    | ${YELLOW}协议类型${RESET} | ${YELLOW}开放的端口号${RESET}                      |"
     echo -e "    +----------+--------------------------------------+"
@@ -271,10 +283,11 @@ view_visual_rules() {
     echo -e "    +----------+--------------------------------------+"
     echo -e "${CYAN}--------------------------------------------------${RESET}"
 
-    # 3. 提取 IP 白名单 / 黑名单
     echo -e " ⚪ ${BLUE}IP 白名单规则 (放行特定源 IP)：${RESET}"
-    local whitelist=$(iptables -L INPUT -n | grep "ACCEPT" | grep -vE "dpt:|0.0.0.0/0|state" | awk '{print $4}' || true)
-    local whitelist6=$(ip6tables -L INPUT -n | grep "ACCEPT" | grep -vE "dpt:|::/0|state" | awk '{print $4}' || true)
+    # 完美正则提取：不仅抓纯IP，也能完美抓取带掩码格式（如 1.2.3.4/32）的源IP
+    local whitelist=$(iptables -S INPUT 2>/dev/null | grep " -j ACCEPT" | grep -E " -s [0-9]" | grep -vE "dport|sport|lo|state" | grep -oP " -s \K[^ ]+" || true)
+    local whitelist6=$(ip6tables -S INPUT 2>/dev/null | grep " -j ACCEPT" | grep -E " -s [0-9a-fA-F:]" | grep -vE "dport|sport|lo|state" | grep -oP " -s \K[^ ]+" || true)
+    
     if [[ -n "$whitelist" || -n "$whitelist6" ]]; then
         for ip in $whitelist; do echo -e "    ⚡ [IPv4] -> $ip"; done
         for ip in $whitelist6; do echo -e "    ⚡ [IPv6] -> $ip"; done
@@ -282,9 +295,10 @@ view_visual_rules() {
         echo -e "    (当前无特定 IP 白名单规则)"
     fi
 
-    echo -e "\n ⚫ ${RED}IP 黑名单规则 (封禁恶意恶意源 IP)：${RESET}"
-    local blacklist=$(iptables -L INPUT -n | grep -E "DROP|REJECT" | grep -v "dpt:" | awk '{print $4}' || true)
-    local blacklist6=$(ip6tables -L INPUT -n | grep -E "DROP|REJECT" | grep -v "dpt:" | awk '{print $4}' || true)
+    echo -e "\n ⚫ ${RED}IP 黑名单规则 (已同步阻断宿主机与 Docker)：${RESET}"
+    local blacklist=$(iptables -S INPUT 2>/dev/null | grep " -j DROP" | grep -E " -s [0-9]" | grep -vE "dport|sport" | grep -oP " -s \K[^ ]+" || true)
+    local blacklist6=$(ip6tables -S INPUT 2>/dev/null | grep " -j DROP" | grep -E " -s [0-9a-fA-F:]" | grep -vE "dport|sport" | grep -oP " -s \K[^ ]+" || true)
+    
     if [[ -n "$blacklist" || -n "$blacklist6" ]]; then
         for ip in $blacklist; do echo -e "    ❌ [IPv4] -> $ip"; done
         for ip in $blacklist6; do echo -e "    ❌ [IPv6] -> $ip"; done
@@ -308,7 +322,7 @@ menu() {
 
         clear
         echo -e "${GREEN}===============================${RESET}"
-        echo -e "${GREEN} ◈   高级双栈防火墙管理面板   ◈ ${RESET}"
+        echo -e "${GREEN}    ◈  双栈防火墙控制台 ◈      ${RESET}"
         echo -e "${GREEN}===============================${RESET}"
         echo -e "${GREEN} 状态  : ${STATUS}"
         echo -e "${GREEN} 内核  : ${YELLOW}${TYPE_SHOW}${RESET}"
@@ -324,9 +338,9 @@ menu() {
         echo -e "${GREEN}  7. 删除指定 IP 规则${RESET}"
         echo -e "${GREEN}  8. 允许 PING (ICMP)${RESET}"
         echo -e "${GREEN}  9. 禁用 PING (ICMP)${RESET}"
-        echo -e "${BLUE} 10. 查看当前防火墙详细规则 (直观看板)${RESET}"
+        echo -e "${GREEN} 10. 查看当前防火墙详细规则${RESET}"
         echo -e "${GREEN} 11. 保存规则并设置开机自启${RESET}"
-        echo -e "${RED} 12. 彻底卸载防火墙功能${RESET}"
+        echo -e "${GREEN} 12. 卸载防火墙${RESET}"
         echo -e "${GREEN}  0. 退出${RESET}"
         echo -e "${GREEN}===============================${RESET}"
         echo -ne "${GREEN} 请选择: ${RESET}"
@@ -343,8 +357,12 @@ menu() {
                 for proto in iptables ip6tables; do
                     while $proto -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null; do $proto -D INPUT -p tcp --dport "$PORT" -j DROP; done
                     while $proto -C INPUT -p udp --dport "$PORT" -j DROP 2>/dev/null; do $proto -D INPUT -p udp --dport "$PORT" -j DROP; done
-                    $proto -I INPUT -p tcp --dport "$PORT" -j ACCEPT
-                    $proto -I INPUT -p udp --dport "$PORT" -j ACCEPT
+                    if ! $proto -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; then
+                        $proto -I INPUT -p tcp --dport "$PORT" -j ACCEPT
+                    fi
+                    if ! $proto -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; then
+                        $proto -I INPUT -p udp --dport "$PORT" -j ACCEPT
+                    fi
                 done
                 save_rules
                 echo -e "${GREEN}✅ 已开放端口 $PORT${RESET}"
@@ -357,14 +375,25 @@ menu() {
                     read -p "按回车返回菜单..."
                     continue
                 fi
+                
+                if [ "$PORT" -eq "$PORT_SHOW" ]; then
+                    echo -e "${RED}⚠️ 拒绝操作：当前端口为 SSH 端口！${RESET}"
+                    read -p "按回车返回菜单..."
+                    continue
+                fi
+                
                 for proto in iptables ip6tables; do
                     while $proto -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; do $proto -D INPUT -p tcp --dport "$PORT" -j ACCEPT; done
                     while $proto -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; do $proto -D INPUT -p udp --dport "$PORT" -j ACCEPT; done
-                    $proto -I INPUT -p tcp --dport "$PORT" -j DROP
-                    $proto -I INPUT -p udp --dport "$PORT" -j DROP
+                    if ! $proto -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null; then
+                        $proto -I INPUT -p tcp --dport "$PORT" -j DROP
+                    fi
+                    if ! $proto -C INPUT -p udp --dport "$PORT" -j DROP 2>/dev/null; then
+                        $proto -I INPUT -p udp --dport "$PORT" -j DROP
+                    fi
                 done
                 save_rules
-                echo -e "${GREEN}✅ 已关闭端口 $PORT${RESET}"
+                echo -e "${GREEN}✅ 已关闭宿主机端口 $PORT (注:若该端口由Docker映射，可在容器配置中管理)${RESET}"
                 read -p "按回车继续..."
                 ;;
             3) open_all_ports ;;
@@ -380,7 +409,7 @@ menu() {
                 read -p "请输入要封禁的IP: " IP
                 ip_action drop "$IP"
                 save_rules
-                echo -e "${GREEN}✅ IP $IP 已封禁${RESET}"
+                echo -e "${GREEN}✅ IP $IP 已封禁（已同步应用至宿主机与Docker容器）${RESET}"
                 read -p "按回车继续..."
                 ;;
             7)

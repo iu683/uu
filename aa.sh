@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Mosdns-x 自动化管理脚本
-# 功能：安装、更新、配置、守护进程管理
+# Mosdns-x Alpine 专属自动化管理脚本
+# 功能：安装、更新、配置、OpenRC 守护进程管理
 
 set -e
 
@@ -20,7 +20,7 @@ MOSDNS_CONFIG_DIR="/etc/mosdns-x"
 MOSDNS_CONFIG_FILE="/etc/mosdns-x/config.yaml"
 MOSDNS_LOG_DIR="/var/log/mosdns-x"
 MOSDNS_LOG_FILE="/var/log/mosdns-x/mosdns-x.log"
-MOSDNS_SERVICE_FILE="/etc/systemd/system/mosdns.service"
+MOSDNS_SERVICE_FILE="/etc/init.d/mosdns"
 MOSDNS_LOGROTATE_FILE="/etc/logrotate.d/mosdns-x"
 MOSDNS_USER="mosdns"
 MOSDNS_GROUP="mosdns"
@@ -72,10 +72,9 @@ check_root() {
 check_permissions() {
     log_info "检查权限和端口可用性..."
     
-    # 检查端口53是否被占用
-    if ss -tuln | grep -q ":53 "; then
-        local port_process=$(ss -tuln | grep ":53 " | head -1)
-        log_warning "端口53已被占用: $port_process"
+    # Alpine 默认使用 busybox netstat 或 ss，这里兼容处理
+    if ss -tuln 2>/dev/null | grep -q ":53 " || netstat -tuln 2>/dev/null | grep -q ":53 "; then
+        log_warning "端口53已被占用！"
         log_warning "Mosdns-x需要端口53，请确保没有其他DNS服务运行"
         
         # 询问是否继续
@@ -87,31 +86,36 @@ check_permissions() {
         fi
     fi
     
-    # 检查是否有权限访问端口53
-    if ! ss -tuln | grep -q ":53 " && ! timeout 1 bash -c "</dev/tcp/127.0.0.1/53" 2>/dev/null; then
-        log_info "端口53可用"
-    fi
-    
     log_success "权限检查完成"
 }
 
-# 检查系统依赖
+# 检查系统依赖 (Alpine 专属修改)
 check_dependencies() {
-    log_info "检查系统依赖..."
+    log_info "检查 Alpine 系统依赖..."
     
     local missing_deps=()
     
-    # 检查必需的命令
-    for cmd in curl wget unzip systemctl dnsutils; do
+    # 映射 Alpine 对应的软件包名 (dnsutils -> bind-tools)
+    for cmd in curl wget unzip bind-tools logrotate; do
         if ! command -v $cmd &> /dev/null; then
-            missing_deps+=($cmd)
+            if [[ "$cmd" == "bind-tools" || "$cmd" == "nslookup" ]]; then
+                missing_deps+=("bind-tools")
+            else
+                missing_deps+=($cmd)
+            fi
         fi
     done
     
+    # 确保 bash 自身和 openrc 工具可用
+    if ! command -v rc-service &> /dev/null; then
+        log_error "未检测到 OpenRC 环境，本脚本仅支持 Alpine Linux (OpenRC) 系统。"
+        exit 1
+    fi
+    
     if [[ ${#missing_deps[@]} -gt 0 ]]; then
-        log_info "安装缺失的依赖: ${missing_deps[*]}"
-        apt-get update
-        apt-get install -y ${missing_deps[@]}
+        log_info "安装 Alpine 缺失的依赖: ${missing_deps[*]}"
+        apk update
+        apk add ${missing_deps[@]}
     fi
     
     log_success "系统依赖检查完成"
@@ -119,60 +123,49 @@ check_dependencies() {
 
 # 获取最新版本
 get_latest_version() {
-    # 尝试从GitHub API获取
     local version=$(curl -s "$GITHUB_API_URL" | grep -o '"tag_name": "[^"]*' | grep -o '[^"]*$' 2>/dev/null || echo "")
     
     if [[ -z "$version" ]]; then
-        # 备用方案：解析releases页面
         version=$(curl -s "$GITHUB_RELEASES_URL" | grep -o 'tag/[^"]*' | head -1 | cut -d'/' -f2 2>/dev/null || echo "")
     fi
     
     if [[ -z "$version" ]]; then
-        version="v25.10.08"
+        version="v26.5.25"
     fi
     
     echo "$version"
 }
 
 # 检查当前版本
-
 get_current_version() {
     if [[ -f "$MOSDNS_BINARY" ]]; then
-        # 1. 获取完整的版本输出（去掉前后空格和换行）
-        local ver_output=$($MOSDNS_BINARY version 2>/dev/null | head -n 1 | xargs || echo "")
+        local ver_raw=$($MOSDNS_BINARY version 2>/dev/null || echo "")
         
-        if [[ -z "$ver_output" ]]; then
+        if [[ -z "$ver_raw" ]]; then
             echo "已安装 (无法获取版本)"
             return 0
         fi
 
-        # 2. 尝试匹配标准的 v 开头加数字版本号 (例如 v26.05.25)
-        local clean_ver=$(echo "$ver_output" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        local build_time=$(echo "$ver_raw" | grep -oE 'build time: [0-9.]+' | awk '{print $3}')
+        local clean_ver=$(echo "$ver_raw" | grep -oE 'version: v[0-9.]+' | awk '{print $2}')
         
-        # 3. 如果没匹配到，尝试匹配带日期的版本号 (例如 v26.05) 或者纯数字组合
         if [[ -z "$clean_ver" ]]; then
-            clean_ver=$(echo "$ver_output" | grep -oE 'v[0-9.-]+' | head -1)
+            clean_ver=$(echo "$ver_raw" | grep -oE 'v[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
         fi
         
-        # 4. 如果还是空的，说明作者可能没加 "v"，直接提取输出里的第一个数字串，或者直接打印第一行前两个单词
-        if [[ -z "$clean_ver" || "$clean_ver" == "v" ]]; then
-            clean_ver=$(echo "$ver_output" | grep -oE '[0-9]+\.[0-9]+[^ ]*' | head -1)
-            # 如果提取到了纯数字，手动帮它补上 "v" 保持美观
-            [[ -n "$clean_ver" ]] && clean_ver="v$clean_ver"
-        fi
-
-        # 5. 兜底策略：如果上面的正则全翻车了，直接把命令返回的第一行原样丢给面板
-        if [[ -z "$clean_ver" || "$clean_ver" == "v" ]]; then
-            echo "$ver_output" | cut -c1-15
-        else
+        if [[ "$clean_ver" == "v4.6.0" && -n "$build_time" ]]; then
+            echo "v4.6.0 (${build_time})"
+        elif [[ -n "$clean_ver" && "$clean_ver" != "v" ]]; then
             echo "$clean_ver"
+        else
+            echo "$ver_raw" | head -n 1 | cut -c1-20
         fi
     else
         echo "未安装"
     fi
 }
 
-# 下载并安装Mosdns-x
+# 下载并安装 Mosdns-x
 install_mosdns_x() {
     local version=$1
     local arch=$(get_architecture)
@@ -188,22 +181,17 @@ install_mosdns_x() {
     local temp_dir=$(mktemp -d)
     local zip_file="$temp_dir/mosdns-linux-${arch}.zip"
     
-    # 下载文件
     if ! wget -q --show-progress -O "$zip_file" "$download_url"; then
         log_error "下载失败: $download_url"
         rm -rf "$temp_dir"
         exit 1
     fi
     
-    # 解压并安装
     log_info "解压并安装..."
     cd "$temp_dir"
     unzip -q "$zip_file"
     
-    # 安装二进制文件
     install -m 755 mosdns "$MOSDNS_BINARY"
-    
-    # 清理临时文件
     rm -rf "$temp_dir"
     
     log_success "Mosdns-x $version 安装完成"
@@ -213,38 +201,21 @@ install_mosdns_x() {
 setup_user_and_dirs() {
     log_info "创建用户和目录..."
     
-    # 创建配置目录
     mkdir -p "$MOSDNS_CONFIG_DIR"
     mkdir -p "$MOSDNS_LOG_DIR"
     
-    # 检查是否为root用户运行
-    if [[ $EUID -eq 0 ]]; then
-        # root用户运行，创建专用用户但服务以root运行
-        if ! id "$MOSDNS_USER" &>/dev/null; then
-            useradd -r -s /bin/false -d "$MOSDNS_CONFIG_DIR" "$MOSDNS_USER"
-            log_info "创建用户: $MOSDNS_USER（用于文件权限管理）"
-        fi
-        
-        # 设置目录权限（root拥有，mosdns用户可读）
-        chown -R root:root "$MOSDNS_CONFIG_DIR"
-        chown -R root:root "$MOSDNS_LOG_DIR"
-        chmod 755 "$MOSDNS_CONFIG_DIR"
-        chmod 755 "$MOSDNS_LOG_DIR"
-        
-        log_info "使用root权限运行，目录权限已优化"
-    else
-        # 非root用户运行，使用专用用户
-        if ! id "$MOSDNS_USER" &>/dev/null; then
-            useradd -r -s /bin/false -d "$MOSDNS_CONFIG_DIR" "$MOSDNS_USER"
-            log_info "创建用户: $MOSDNS_USER"
-        fi
-        
-        # 设置权限
-        chown -R "$MOSDNS_USER:$MOSDNS_GROUP" "$MOSDNS_CONFIG_DIR"
-        chown -R "$MOSDNS_USER:$MOSDNS_GROUP" "$MOSDNS_LOG_DIR"
-        
-        log_warning "非root用户运行，可能需要额外权限配置"
+    # Alpine 使用 shadow 包或 standard adduser
+    if ! id "$MOSDNS_USER" &>/dev/null; then
+        addgroup -S "$MOSDNS_GROUP" 2>/dev/null || true
+        adduser -S -G "$MOSDNS_GROUP" -h "$MOSDNS_CONFIG_DIR" -s /sbin/nologin "$MOSDNS_USER"
+        log_info "创建用户: $MOSDNS_USER"
     fi
+    
+    # 由于 Alpine 运行多以 root 权限监听53端口，默认优化权限归 root
+    chown -R root:root "$MOSDNS_CONFIG_DIR"
+    chown -R root:root "$MOSDNS_LOG_DIR"
+    chmod 755 "$MOSDNS_CONFIG_DIR"
+    chmod 755 "$MOSDNS_LOG_DIR"
     
     log_success "用户和目录设置完成"
 }
@@ -307,100 +278,46 @@ servers:
         protocol: tcp
 EOF
 
-    # 设置权限
-    if [[ $EUID -eq 0 ]]; then
-        # root用户运行，文件归root所有
-        chown root:root "$MOSDNS_CONFIG_FILE"
-    else
-        # 非root用户运行，文件归mosdns用户所有
-        chown "$MOSDNS_USER:$MOSDNS_GROUP" "$MOSDNS_CONFIG_FILE"
-    fi
+    chown root:root "$MOSDNS_CONFIG_FILE"
     chmod 644 "$MOSDNS_CONFIG_FILE"
     
     log_success "配置文件创建完成"
 }
 
-# 创建systemd服务
+# 创建 OpenRC 服务脚本 (Alpine 专属修改替换 systemd)
 create_systemd_service() {
-    log_info "创建systemd服务..."
+    log_info "创建 Alpine OpenRC 服务脚本..."
     
-    # 检查是否为root用户运行
-    if [[ $EUID -eq 0 ]]; then
-        # root用户运行，使用root权限以访问端口53
-        cat > "$MOSDNS_SERVICE_FILE" << EOF
-[Unit]
-Description=A DNS forwarder
-Documentation=https://github.com/pmkol/mosdns-x
-After=network.target
+    cat > "$MOSDNS_SERVICE_FILE" << EOF
+#!/sbin/openrc-run
 
-[Service]
-Type=simple
-User=root
-Group=root
-ExecStart=$MOSDNS_BINARY start --as-service -d /usr/local/bin -c $MOSDNS_CONFIG_FILE
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=mosdns
+description="Mosdns-x DNS forwarder"
+supervisor="supervise-daemon"
+command="$MOSDNS_BINARY"
+command_args="start -d /usr/local/bin -c $MOSDNS_CONFIG_FILE"
+# 默认使用 root 权限运行以监听 53 低位端口
+command_user="root:root"
 
-# 安全设置（root用户运行时的安全配置）
-NoNewPrivileges=false
-PrivateTmp=true
-ProtectSystem=false
-ProtectHome=false
-ReadWritePaths=$MOSDNS_LOG_DIR $MOSDNS_CONFIG_DIR
+depend() {
+    need net
+    after firewall
+}
 
-[Install]
-WantedBy=multi-user.target
+start_pre() {
+    checkpath -d -m 0755 -o root:root "$MOSDNS_LOG_DIR"
+    checkpath -d -m 0755 -o root:root "$MOSDNS_CONFIG_DIR"
+}
 EOF
-        log_info "使用root权限运行服务（需要访问端口53）"
-    else
-        # 非root用户运行，使用专用用户
-        cat > "$MOSDNS_SERVICE_FILE" << EOF
-[Unit]
-Description=A DNS forwarder
-Documentation=https://github.com/pmkol/mosdns-x
-After=network.target
 
-[Service]
-Type=simple
-User=$MOSDNS_USER
-Group=$MOSDNS_GROUP
-ExecStart=$MOSDNS_BINARY start --as-service -d /usr/local/bin -c $MOSDNS_CONFIG_FILE
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=mosdns
-
-# 安全设置
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=$MOSDNS_LOG_DIR
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        log_warning "非root用户运行，可能需要额外配置才能访问端口53"
-    fi
-
-    # 重新加载systemd
-    systemctl daemon-reload
-    
-    log_success "systemd服务创建完成"
+    chmod 755 "$MOSDNS_SERVICE_FILE"
+    log_success "OpenRC 服务脚本创建完成"
 }
 
 # 创建日志轮转配置
 create_logrotate() {
     log_info "创建日志轮转配置..."
     
-    # 根据运行用户设置日志轮转权限
-    if [[ $EUID -eq 0 ]]; then
-        # root用户运行
-        cat > "$MOSDNS_LOGROTATE_FILE" << EOF
+    cat > "$MOSDNS_LOGROTATE_FILE" << EOF
 $MOSDNS_LOG_FILE {
     daily
     missingok
@@ -410,114 +327,89 @@ $MOSDNS_LOG_FILE {
     notifempty
     create 644 root root
     postrotate
-        systemctl reload mosdns > /dev/null 2>&1 || true
+        rc-service mosdns restart > /dev/null 2>&1 || true
     endscript
 }
 EOF
-    else
-        # 非root用户运行
-        cat > "$MOSDNS_LOGROTATE_FILE" << EOF
-$MOSDNS_LOG_FILE {
-    daily
-    missingok
-    rotate 7
-    compress
-    delaycompress
-    notifempty
-    create 644 $MOSDNS_USER $MOSDNS_GROUP
-    postrotate
-        systemctl reload mosdns > /dev/null 2>&1 || true
-    endscript
-}
-EOF
-    fi
-
     log_success "日志轮转配置创建完成"
 }
-
 
 # 配置系统DNS
 configure_system_dns() {
     log_info "配置系统DNS..."
     
-    # 备份原始resolv.conf
     if [[ -f "/etc/resolv.conf" && ! -f "$RESOLV_CONF_BACKUP" ]]; then
         cp /etc/resolv.conf "$RESOLV_CONF_BACKUP"
         log_info "已备份原始DNS配置到: $RESOLV_CONF_BACKUP"
     fi
     
-    # 检查是否已经配置了mosdns
     if grep -q "nameserver 127.0.0.1" /etc/resolv.conf 2>/dev/null; then
         log_info "系统DNS已配置为使用Mosdns-x"
         return 0
     fi
     
-    # 移除chattr保护（如果存在）
-    if [[ -f "/etc/resolv.conf" ]]; then
+    # Alpine 默认没有 chattr 命令，如果需要锁定，先检查并尝试装 e2fsprogs-extra
+    if ! command -v chattr &> /dev/null; then
+        apk add --no-cache e2fsprogs-extra >/dev/null 2>&1 || true
+    fi
+
+    if [[ -f "/etc/resolv.conf" ]] && command -v chattr &> /dev/null; then
         chattr -i /etc/resolv.conf 2>/dev/null || true
     fi
     
-    # 配置DNS为127.0.0.1
     echo -e "nameserver 127.0.0.1\n" > /etc/resolv.conf
     
-    # 添加保护（默认锁定）
     echo
-    log_warning "即将对 /etc/resolv.conf 设置 chattr +i 锁定保护。"
-    log_warning "锁定后，其他系统网络服务（如 NetworkManager、DHCP）将无法修改此文件。"
-    read -p "是否确认锁定以防止DNS被覆盖? (Y/n): " -n 1 -r
-    echo
-    # 如果用户直接回车(空值) 或者 输入了 Y/y，则执行锁定
-    if [[ -z "$REPLY" || $REPLY =~ ^[Yy]$ ]]; then
-        chattr +i /etc/resolv.conf
-        log_success "系统DNS已配置并锁定为 Mosdns-x (127.0.0.1)"
+    if command -v chattr &> /dev/null; then
+        log_warning "即将对 /etc/resolv.conf 设置 chattr +i 锁定保护。"
+        log_warning "锁定后，其他网络服务（如 udhcpc）将无法修改此文件。"
+        read -p "是否确认锁定以防止DNS被覆盖? (Y/n): " -n 1 -r
+        echo
+        if [[ -z "$REPLY" || $REPLY =~ ^[Yy]$ ]]; then
+            chattr +i /etc/resolv.conf
+            log_success "系统DNS已配置并锁定为 Mosdns-x (127.0.0.1)"
+        else
+            log_info "已跳过 chattr 锁定，DNS 已修改但可能在重启后被系统覆盖。"
+        fi
     else
-        log_info "已跳过 chattr 锁定，DNS 已修改但可能在重启或网络重连后被系统覆盖。"
+        log_warning "未找到 chattr 命令，跳过锁定保护。DNS 已修改但可能在重启或网络重连后被覆盖。"
     fi
 }
+
 # 恢复系统DNS
 restore_system_dns() {
     log_info "恢复系统DNS配置..."
     
-    # 移除chattr保护
-    if [[ -f "/etc/resolv.conf" ]]; then
+    if [[ -f "/etc/resolv.conf" ]] && command -v chattr &> /dev/null; then
         chattr -i /etc/resolv.conf 2>/dev/null || true
     fi
     
-    # 恢复原始配置
     if [[ -f "$RESOLV_CONF_BACKUP" ]]; then
         cp "$RESOLV_CONF_BACKUP" /etc/resolv.conf
         rm -f "$RESOLV_CONF_BACKUP"
         log_success "已恢复原始DNS配置"
     else
-        # 如果没有备份，使用默认配置
         cat > /etc/resolv.conf << EOF
-# Generated by NetworkManager
 nameserver 8.8.8.8
-nameserver 8.8.4.4
+nameserver 1.1.1.1
 EOF
         log_success "已设置默认DNS配置"
     fi
 }
 
-# 启动并启用服务
+# 启动并启用服务 (Alpine OpenRC 专属修改)
 start_service() {
     log_info "启动并启用服务..."
     
-    # 启动服务
-    systemctl start mosdns
+    rc-service mosdns start
+    rc-update add mosdns default
     
-    # 启用开机自启动
-    systemctl enable mosdns
+    sleep 2
     
-    # 等待服务启动
-    sleep 3
-    
-    # 检查服务状态
-    if systemctl is-active --quiet mosdns; then
+    if rc-service mosdns status | grep -q "started"; then
         log_success "服务启动成功"
     else
         log_error "服务启动失败"
-        systemctl status mosdns
         exit 1
     fi
 }
@@ -526,31 +418,26 @@ start_service() {
 verify_installation() {
     log_info "验证安装..."
     
-    # 检查二进制文件
     if [[ ! -f "$MOSDNS_BINARY" ]]; then
         log_error "二进制文件不存在: $MOSDNS_BINARY"
         return 1
     fi
     
-    # 检查配置文件
     if [[ ! -f "$MOSDNS_CONFIG_FILE" ]]; then
         log_error "配置文件不存在: $MOSDNS_CONFIG_FILE"
         return 1
     fi
     
-    # 检查服务状态
-    if ! systemctl is-active --quiet mosdns; then
+    if ! rc-service mosdns status | grep -q "started"; then
         log_error "服务未运行"
         return 1
     fi
     
-    # 检查端口监听
-    if ! ss -tuln | grep -q ":53 "; then
+    if ! (ss -tuln 2>/dev/null | grep -q ":53 " || netstat -tuln 2>/dev/null | grep -q ":53 "); then
         log_error "端口53未监听"
         return 1
     fi
     
-    # 测试DNS解析
     if ! nslookup google.com 127.0.0.1 >/dev/null 2>&1; then
         log_error "DNS解析测试失败"
         return 1
@@ -572,14 +459,13 @@ edit_config() {
             return 1
         fi
         log_info "正在重启服务以使配置生效..."
-        systemctl restart mosdns && log_success "配置已重载且服务已重启" || log_error "服务重启失败，请检查配置格式"
+        rc-service mosdns restart && log_success "配置已重载且服务已重启" || log_error "服务重启失败，请检查配置格式"
     else
         log_error "配置文件不存在，请先安装"
     fi
 }
 
-
-# 更新Mosdns-x
+# 更新Mosdns-x (Alpine 专属修改)
 update_mosdns_x() {
     local latest_version=$(get_latest_version)
     local current_version=$(get_current_version)
@@ -596,59 +482,46 @@ update_mosdns_x() {
     
     log_info "更新 Mosdns-x: $current_version -> $latest_version"
     
-    # 【核心修复】为了防止停止服务后网络断开，先临时恢复系统DNS
     log_info "正在临时恢复系统公共 DNS 以确保下载期间网络畅通..."
-    if [[ -f "/etc/resolv.conf" ]]; then
+    if [[ -f "/etc/resolv.conf" ]] && command -v chattr &> /dev/null; then
         chattr -i /etc/resolv.conf 2>/dev/null || true
-        # 临时写入公共 DNS，保证能解析 github.com
-        echo -e "nameserver 8.8.8.8\nameserver 1.1.1.1\n" > /etc/resolv.conf
     fi
+    echo -e "nameserver 8.8.8.8\nameserver 1.1.1.1\n" > /etc/resolv.conf
     
-    # 停止服务
     log_info "正在停止旧版服务..."
-    systemctl stop mosdns
+    rc-service mosdns stop || true
     
-    # 安装新版本（此时系统DNS是通的，可以正常下载）
     install_mosdns_x "$latest_version"
     
-    # 启动服务
     log_info "正在启动新版服务..."
-    systemctl start mosdns
+    rc-service mosdns start
     
-    # 【核心恢复】新版启动成功后，重新把系统 DNS 劫持回本地
     log_info "正在重新配置系统 DNS 指向 Mosdns-x..."
     configure_system_dns
     
     log_success "更新完成"
 }
 
-# 卸载Mosdns-x
+# 卸载 Mosdns-x (Alpine 专属修改)
 uninstall_mosdns_x() {
     log_info "卸载 Mosdns-x..."
     
-    # 停止并禁用服务
-    systemctl stop mosdns 2>/dev/null || true
-    systemctl disable mosdns 2>/dev/null || true
+    rc-service mosdns stop 2>/dev/null || true
+    rc-update del mosdns default 2>/dev/null || true
     
-    # 恢复系统DNS配置
     restore_system_dns
     
-    # 删除文件
     rm -f "$MOSDNS_BINARY"
     rm -f "$MOSDNS_SERVICE_FILE"
     rm -f "$MOSDNS_LOGROTATE_FILE"
     
-    # 删除目录（可选）
     read -p "是否删除配置目录和日志目录? (y/N): " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         rm -rf "$MOSDNS_CONFIG_DIR"
         rm -rf "$MOSDNS_LOG_DIR"
-        userdel "$MOSDNS_USER" 2>/dev/null || true
+        deluser "$MOSDNS_USER" 2>/dev/null || true
     fi
-    
-    # 重新加载systemd
-    systemctl daemon-reload
     
     log_success "卸载完成"
 }
@@ -656,7 +529,6 @@ uninstall_mosdns_x() {
 # 测试DNS解析
 test_dns() {
     log_info "测试DNS解析..."
-    
     local test_domains=("google.com" "baidu.com" "github.com" "cloudflare.com")
     
     for domain in "${test_domains[@]}"; do
@@ -669,36 +541,38 @@ test_dns() {
     done
 }
 
-# 查看日志
+# 查看日志 (Alpine 专属修改，读取文本日志)
 show_logs() {
-    log_info "显示最近的日志 (按 Q 退出)..."
-    journalctl -u mosdns -n 30 --no-pager
+    if [[ -f "$MOSDNS_LOG_FILE" ]]; then
+        log_info "显示最近 30 行日志 (输入 Q 或 Ctrl+C 退出)..."
+        tail -n 30 "$MOSDNS_LOG_FILE"
+    else
+        log_error "日志文件不存在: $MOSDNS_LOG_FILE"
+    fi
 }
-
 
 main() {
     check_root
     
     while true; do
-        # 1. 动态获取状态信息
         local version=$(get_current_version)
         
         local status
-        if systemctl is-active --quiet mosdns 2>/dev/null; then
+        if rc-service mosdns status 2>/dev/null | grep -q "started"; then
             status="${GREEN}运行中${RESET}"
         else
             status="${RED}未运行${RESET}"
         fi
         
         local port_show
-        if ss -tuln | grep -q ":53 "; then
+        if ss -tuln 2>/dev/null | grep -q ":53 " || netstat -tuln 2>/dev/null | grep -q ":53 "; then
             port_show="53 (已监听)"
         else
             port_show="无监听"
         fi
 
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}       Mosdns-x 管理面板        ${RESET}"
+        echo -e "${GREEN}        Mosdns-x  管理面板      ${RESET}"
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN}状态   :${RESET} $status"
         echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
@@ -744,15 +618,15 @@ main() {
                 edit_config
                 ;;
             5)
-                systemctl start mosdns
+                rc-service mosdns start
                 log_success "服务已启动"
                 ;;
             6)
-                systemctl stop mosdns
+                rc-service mosdns stop
                 log_success "服务已停止"
                 ;;
             7)
-                systemctl restart mosdns
+                rc-service mosdns restart
                 log_success "服务已重启"
                 ;;
             8)

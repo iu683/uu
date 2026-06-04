@@ -73,7 +73,6 @@ save_rules() {
     mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules4 2>/dev/null || true
     ip6tables-save > /etc/iptables/rules6 2>/dev/null || true
-    # 注意：在 Alpine 中，直接使用命令保存，不要乱调用服务保存防止覆盖
 }
 
 save_and_enable_autoload() {
@@ -83,7 +82,7 @@ save_and_enable_autoload() {
     rc-service iptables restart >/dev/null 2>&1 || true
     rc-service ip6tables restart >/dev/null 2>&1 || true
     echo -e "${GREEN}✅ 规则已保存，并设置为开机自动加载 (OpenRC)${RESET}"
-    read -p "按回车继续..." ack
+    read -r -p "按回车继续..." ack
 }
 
 init_rules() {
@@ -98,7 +97,6 @@ init_rules() {
         $proto -A INPUT -p tcp --dport 80 -j ACCEPT
         $proto -A INPUT -p tcp --dport 443 -j ACCEPT
         
-        # 默认允许 ICMP
         if [ "$proto" = "iptables" ]; then
             $proto -A INPUT -p icmp -j ACCEPT
         else
@@ -118,14 +116,15 @@ init_rules() {
 }
 
 check_installed() {
+    # 只做纯粹的环境检查与缺失组件补全，不破坏、不重置现有防火墙规则
     if command -v iptables >/dev/null 2>&1 && command -v ip6tables >/dev/null 2>&1; then
         if [ ! -f /etc/init.d/iptables ] || [ ! -f /etc/init.d/ip6tables ]; then
             echo -e "${YELLOW}检测到防火墙组件已安装，正在修复 OpenRC 服务脚本...${RESET}"
             apk add iptables-openrc >/dev/null 2>&1 || true
         fi
-        return 0
+        return 0 # 已安装
     else
-        return 1
+        return 1 # 未安装
     fi
 }
 
@@ -133,10 +132,13 @@ install_firewall() {
     echo -e "${YELLOW}正在安装防火墙组件 (Alpine 专属)，请稍候...${RESET}"
     apk update
     apk add iptables ip6tables iptables-openrc curl
+    
+    echo -e "${YELLOW}由于是首次安装，正在为您初始化默认安全策略...${RESET}"
     init_rules
-    echo -e "${GREEN}✅ 防火墙安装完成，默认放行 SSH/80/443 以及 PING${RESET}"
+    
+    echo -e "${GREEN}✅ 防火墙安装完成，默认放行本机的 SSH ($(get_ssh_port))/80/443 以及 PING${RESET}"
     echo -e "${GREEN}✅ 已通过 OpenRC 设置开机自动加载规则${RESET}"
-    read -p "按回车继续..." ack
+    read -r -p "按回车继续..." ack
 }
 
 clear_firewall() {
@@ -156,7 +158,7 @@ clear_firewall() {
     rc-update del iptables default >/dev/null 2>&1 || true
     rc-update del ip6tables default >/dev/null 2>&1 || true
     echo -e "${GREEN}✅ 防火墙入站限制已清空，宿主机流量已全放行（未损坏 Docker 链）${RESET}"
-    read -p "按回车继续..." ack
+    read -r -p "按回车继续..." ack
 }
 
 restore_default_rules() {
@@ -166,7 +168,7 @@ restore_default_rules() {
     echo -e "${GREEN}检测到 SSH 端口: $ssh_port${RESET}"
     init_rules
     echo -e "${GREEN}✅ 默认规则已恢复${RESET}"
-    read -p "按回车继续..." ack
+    read -r -p "按回车继续..." ack
 }
 
 open_all_ports() {
@@ -178,7 +180,7 @@ open_all_ports() {
     done
     save_rules
     echo -e "${GREEN}✅ 宿主机所有端口已放行（全开放）${RESET}"
-    read -p "按回车继续..." ack
+    read -r -p "按回车继续..." ack
 }
 
 ip_action() {
@@ -219,44 +221,37 @@ ping_action() {
     local action=$1
     echo -e "${YELLOW}正在应用 PING 规则修改...${RESET}"
 
+    # 1. 彻底清除旧的 ICMP 规则（包含各种可能写入的形式），防止规则堆叠混乱
+    while iptables -D INPUT -p icmp -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D INPUT -p icmp -j DROP 2>/dev/null; do :; done
+    while iptables -D INPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null; do :; done
+    
+    while ip6tables -D INPUT -p icmpv6 -j ACCEPT 2>/dev/null; do :; done
+    while ip6tables -D INPUT -p icmpv6 -j DROP 2>/dev/null; do :; done
+    while ip6tables -D INPUT -p icmpv6 --icmpv6-type echo-request -j DROP 2>/dev/null; do :; done
+
+    # 2. 根据用户指令，显式往内核第一行注入绝对生效规则
     if [ "$action" = "allow" ]; then
-        # 允许 PING：清理掉所有可能存在的阻断规则
-        while iptables -D INPUT -p icmp -j DROP 2>/dev/null; do :; done
-        while iptables -D INPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null; do :; done
-        while ip6tables -D INPUT -p icmpv6 -j DROP 2>/dev/null; do :; done
-        while ip6tables -D INPUT -p icmpv6 --icmpv6-type echo-request -j DROP 2>/dev/null; do :; done
-        
-        # 在第一行明确放行
-        if ! iptables -C INPUT -p icmp -j ACCEPT 2>/dev/null; then
-            iptables -I INPUT 1 -p icmp -j ACCEPT
-        fi
-        if ! ip6tables -C INPUT -p icmpv6 -j ACCEPT 2>/dev/null; then
-            ip6tables -I INPUT 1 -p icmpv6 -j ACCEPT
-        fi
-        echo -e "${GREEN}✅ 允许 PING 规则已成功应用！${RESET}"
+        # 允许 PING
+        iptables -I INPUT 1 -p icmp -j ACCEPT
+        ip6tables -I INPUT 1 -p icmpv6 -j ACCEPT
+        echo -e "${GREEN}✅ 双栈允许 PING 规则已成功应用到内核最高优先级${RESET}"
     else
-        # 禁用 PING：清理掉放行规则，直接在最前面拦截
-        while iptables -D INPUT -p icmp -j ACCEPT 2>/dev/null; do :; done
-        while ip6tables -D INPUT -p icmpv6 -j ACCEPT 2>/dev/null; do :; done
-        
-        # 终极高兼容性拦截：直接 DROP 整个协议（针对 INPUT 链，不影响自己 ping 别人）
-        if ! iptables -C INPUT -p icmp -j DROP 2>/dev/null; then
-            iptables -I INPUT 1 -p icmp -j DROP
-        fi
-        if ! ip6tables -C INPUT -p icmpv6 -j DROP 2>/dev/null; then
-            ip6tables -I INPUT 1 -p icmpv6 -j DROP
-        fi
-        echo -e "${RED}❌ 禁用 PING 规则已成功拦截！${RESET}"
+        # 禁用 PING（在 legacy 下，IPv6 拦截需通过指定 ipv6-icmp 配合类型，或直接封锁整段入站请求包）
+        iptables -I INPUT 1 -p icmp --icmp-type echo-request -j DROP
+        # 兼容 Alpine legacy 专属的 IPv6 icmpv6 类型 DROP 写法
+        ip6tables -I INPUT 1 -p icmpv6 --icmpv6-type echo-request -j DROP 2>/dev/null || ip6tables -I INPUT 1 -p icmpv6 -j DROP
+        echo -e "${RED}❌ 双栈禁用 PING 规则已成功应用到内核最高优先级${RESET}"
     fi
 }
 
 uninstall_firewall() {
     clear
     echo -e "${RED}⚠️ 警告：该操作将清空所有宿主机入站规则并卸载防火墙组件，恢复网络全放行状态！${RESET}"
-    read -p "确定要彻底卸载吗？(y/n): " confirm
+    read -r -p "确定要彻底卸载吗？(y/n): " confirm
     if ! echo "$confirm" | grep -qE '^[Yy]$'; then
         echo "已取消卸载。"
-        read -p "按回车继续..." ack
+        read -r -p "按回车继续..." ack
         return
     fi
 
@@ -379,9 +374,9 @@ menu() {
         echo -e "${GREEN}  7. 删除指定 IP 规则${RESET}"
         echo -e "${GREEN}  8. 允许 PING (ICMP)${RESET}"
         echo -e "${GREEN}  9. 禁用 PING (ICMP)${RESET}"
-        echo -e "${GREEN} 10. 查看当前防火墙详细规则${RESET}"
-        echo -e "${GREEN} 11. 保存规则并设置开机自启${RESET}"
-        echo -e "${GREEN} 12. 卸载防火墙${RESET}"
+        echo -e " 10. 查看当前防火墙详细规则${RESET}"
+        echo -e " 11. 保存规则并设置开机自启${RESET}"
+        echo -e " 12. 卸载防火墙${RESET}"
         echo -e "${GREEN}  0. 退出${RESET}"
         echo -e "${GREEN}===============================${RESET}"
         echo -ne "${GREEN} 请选择: ${RESET}"
@@ -389,10 +384,10 @@ menu() {
 
         case $choice in
             1)
-                read -p "请输入要开放的端口号: " PORT
+                read -r -p "请输入要开放的端口号: " PORT
                 if ! echo "$PORT" | grep -qE '^[0-9]+$' || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ] 2>/dev/null; then
                     echo -e "${RED}❌ 错误：请输入 1-65535 之间的有效端口号${RESET}"
-                    read -p "按回车返回菜单..." ack
+                    read -r -p "按回车返回菜单..." ack
                     continue
                 fi
                 for proto in iptables ip6tables; do
@@ -407,19 +402,19 @@ menu() {
                 done
                 save_rules
                 echo -e "${GREEN}✅ 已开放端口 $PORT${RESET}"
-                read -p "按回车继续..." ack
+                read -r -p "按回车继续..." ack
                 ;;
             2)
-                read -p "请输入要关闭的端口号: " PORT
+                read -r -p "请输入要关闭的端口号: " PORT
                 if ! echo "$PORT" | grep -qE '^[0-9]+$' || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ] 2>/dev/null; then
                     echo -e "${RED}❌ 错误：请输入 1-65535 之间的有效端口号${RESET}"
-                    read -p "按回车返回菜单..." ack
+                    read -r -p "按回车返回菜单..." ack
                     continue
                 fi
                 
                 if [ "$PORT" -eq "$PORT_SHOW" ] 2>/dev/null; then
                     echo -e "${RED}⚠️ 拒绝操作：当前端口为 SSH 端口！${RESET}"
-                    read -p "按回车返回菜单..." ack
+                    read -r -p "按回车返回菜单..." ack
                     continue
                 fi
                 
@@ -435,40 +430,40 @@ menu() {
                 done
                 save_rules
                 echo -e "${GREEN}✅ 已关闭宿主机端口 $PORT${RESET}"
-                read -p "按回车继续..." ack
+                read -r -p "按回车继续..." ack
                 ;;
             3) open_all_ports ;;
             4) restore_default_rules ;;
             5)
-                read -p "请输入要放行的IP: " IP
+                read -r -p "请输入要放行的IP: " IP
                 ip_action accept "$IP"
                 save_rules
                 echo -e "${GREEN}✅ IP $IP 已放行${RESET}"
-                read -p "按回车继续..." ack
+                read -r -p "按回车继续..." ack
                 ;;
             6)
-                read -p "请输入要封禁的IP: " IP
+                read -r -p "请输入要封禁的IP: " IP
                 ip_action drop "$IP"
                 save_rules
                 echo -e "${GREEN}✅ IP $IP 已封禁${RESET}"
-                read -p "按回车继续..." ack
+                read -r -p "按回车继续..." ack
                 ;;
             7)
-                read -p "请输入要删除的IP: " IP
+                read -r -p "请输入要删除的IP: " IP
                 ip_action delete "$IP"
                 save_rules
                 echo -e "${GREEN}✅ IP $IP 规则已删除${RESET}"
-                read -p "按回车继续..." ack
+                read -r -p "按回车继续..." ack
                 ;;
             8)
                 ping_action allow
                 save_rules
-                read -p "按回车继续..." ack
+                read -r -p "按回车继续..." ack
                 ;;
             9)
                 ping_action deny
                 save_rules
-                read -p "按回车继续..." ack
+                read -r -p "按回车继续..." ack
                 ;;
             10) view_visual_rules ;;
             11) save_and_enable_autoload ;;
@@ -487,6 +482,9 @@ if [ "$(id -u)" -ne 0 ]; then
    exit 1
 fi
 
+# 核心安全逻辑控制：
+# 只有当环境完全缺失（未安装过 iptables 组建）时，才会触发环境安装并执行默认初始化 init_rules。
+# 如果系统已经有防火墙环境，执行本脚本将绝对安全，直接读取并显示用户目前的防火墙设置。
 if ! check_installed; then
     install_firewall
 fi

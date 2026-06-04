@@ -1,10 +1,8 @@
 #!/bin/sh
-# 注意：Alpine 默认使用 busybox sh，已移除 bash 特性以确保完美兼容性
+# =================================================================
+# 防火墙管理脚本（Alpine Linux 双栈 IPv4/IPv6 - 状态精准检测版）
+# =================================================================
 set -e
-
-# ===============================
-# 防火墙管理脚本（Alpine 双栈 IPv4/IPv6 - Docker 完美兼容版）
-# ===============================
 
 GREEN="\033[32m"
 RED="\033[31m"
@@ -15,28 +13,35 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 # ===============================
-# 动态信息获取函数
+# 1. 动态信息获取函数
 # ===============================
 
 get_ssh_port() {
-    local port
+    local port=""
     if [ -f /etc/ssh/sshd_config ]; then
         port=$(grep -E '^ *Port ' /etc/ssh/sshd_config | awk '{print $2}' | head -n 1)
     fi
-    # 如果没找到或不是数字，默认 Alpine 的 SSH 端口
-    [ -z "$port" ] || ! echo "$port" | grep -qE '^[0-9]+$' && port=22
+    if [ -z "$port" ] || ! echo "$port" | grep -qE '^[0-9]+$'; then
+        port=22
+    fi
     echo "$port"
 }
 
+# 🛠️ 核心修复：直接通过内核策略(Policy)精准判定防火墙状态
 get_firewall_status() {
-    if rc-service iptables status 2>/dev/null | grep -q "started"; then
-        echo -e "${GREEN}● 运行中 (开机自启)${RESET}"
-    else
-        if iptables -P INPUT 2>/dev/null | grep -q "DROP"; then
-            echo -e "${YELLOW}● 运行中 (未设自启)${RESET}"
+    local policy=""
+    if command -v iptables >/dev/null 2>&1; then
+        policy=$(iptables -P INPUT 2>/dev/null | awk '{print $2}')
+    fi
+    
+    if [ "$policy" = "DROP" ]; then
+        if rc-service iptables status 2>/dev/null | grep -q "started"; then
+            echo -e "${GREEN}● 运行中 (开机自启)${RESET}"
         else
-            echo -e "${RED}○ 已关闭 (全放行)${RESET}"
+            echo -e "${YELLOW}● 运行中 (仅内生效/未设自启)${RESET}"
         fi
+    else
+        echo -e "${RED}○ 已关闭 (全放行)${RESET}"
     fi
 }
 
@@ -65,11 +70,10 @@ get_banned_ip_count() {
 }
 
 # ===============================
-# 防火墙核心逻辑函数
+# 2. 防火墙核心控制函数
 # ===============================
 
 save_rules() {
-    # Alpine 存储机制：通过 OpenRC 服务调用保存
     rc-service iptables save >/dev/null 2>&1 || true
     rc-service ip6tables save >/dev/null 2>&1 || true
 }
@@ -88,15 +92,11 @@ init_rules() {
     local ssh_port
     ssh_port=$(get_ssh_port)
     for proto in iptables ip6tables; do
-        # 【Docker 兼容改造 1】：绝对不执行全局清开，只精准清空和管理 INPUT 链
         $proto -F INPUT
-        
-        # 核心策略：入站拦截，转发和出站保持 ACCEPT（Docker 严重依赖 FORWARD）
         $proto -P INPUT DROP
         $proto -P FORWARD ACCEPT
         $proto -P OUTPUT ACCEPT
         
-        # 基础放行规则
         $proto -A INPUT -i lo -j ACCEPT
         $proto -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
         $proto -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
@@ -104,22 +104,22 @@ init_rules() {
         $proto -A INPUT -p tcp --dport 443 -j ACCEPT
     done
     save_rules
-    rc-update add iptables default >/dev/null 2>&1 || true
-    rc-update add ip6tables default >/dev/null 2>&1 || true
 }
 
 check_installed() {
-    # 检查 iptables 核心文件与 OpenRC 脚本是否存在
     [ -f /etc/init.d/iptables ] && [ -f /etc/init.d/ip6tables ]
 }
 
 install_firewall() {
-    echo -e "${YELLOW}正在 Alpine 上安装并初始化防火墙，请稍候...${RESET}"
+    echo -e "${YELLOW}正在 Alpine 上安装并初始化防火墙组件...${RESET}"
     apk update
-    apk add iptables ip6tables curl
+    apk add iptables ip6tables curl iproute2 xtables-addons 2>/dev/null || apk add iptables ip6tables curl
+    
+    # 加载连接追踪内核模块，防止状态匹配失效
+    modprobe ip_conntrack 2>/dev/null || modprobe nf_conntrack 2>/dev/null || true
+    
     init_rules
     echo -e "${GREEN}✅ 防火墙安装完成，默认放行 SSH/80/443${RESET}"
-    echo -e "${GREEN}✅ 已通过 OpenRC 设置开机自动加载规则${RESET}"
     printf "按回车继续..." && read -r _
 }
 
@@ -137,7 +137,7 @@ clear_firewall() {
     save_rules
     rc-update del iptables default >/dev/null 2>&1 || true
     rc-update del ip6tables default >/dev/null 2>&1 || true
-    echo -e "${GREEN}✅ 防火墙入站限制已清空，宿主机流量已全放行（未损坏 Docker 链）${RESET}"
+    echo -e "${GREEN}✅ 防火墙入站限制已清空，流量已全放行${RESET}"
     printf "按回车继续..." && read -r _
 }
 
@@ -163,6 +163,10 @@ open_all_ports() {
     printf "按回车继续..." && read -r _
 }
 
+# ===============================
+# 3. 策略名单管理操作函数
+# ===============================
+
 ip_action() {
     local action=$1 ip=$2 proto
     if echo "$ip" | grep -q ":"; then
@@ -171,52 +175,57 @@ ip_action() {
         proto="iptables"
     fi
 
+    # 临时关闭 set -e 防止 BusyBox 的 iptables -C 查不到规则时直接崩溃
+    set +e
+    if [ "$proto" = "iptables" ]; then
+        while iptables -C INPUT -s "$ip" -j ACCEPT 2>/dev/null; do iptables -D INPUT -s "$ip" -j ACCEPT; done
+        while iptables -C INPUT -s "$ip" -j DROP 2>/dev/null; do iptables -D INPUT -s "$ip" -j DROP; done
+        if iptables -L DOCKER-USER -n >/dev/null 2>&1; then
+            while iptables -C DOCKER-USER -s "$ip" -j DROP 2>/dev/null; do iptables -D DOCKER-USER -s "$ip" -j DROP; done
+        fi
+    else
+        while ip6tables -C INPUT -s "$ip" -j ACCEPT 2>/dev/null; do ip6tables -D INPUT -s "$ip" -j ACCEPT; done
+        while ip6tables -C INPUT -s "$ip" -j DROP 2>/dev/null; do ip6tables -D INPUT -s "$ip" -j DROP; done
+    fi
+    set -e
+
     case $action in
         accept) 
             $proto -I INPUT -s "$ip" -j ACCEPT 
             ;;
         drop)   
             $proto -I INPUT -s "$ip" -j DROP 
-            # 【Docker 兼容改造 2】：如果存在 DOCKER-USER 链，将黑名单同步封禁在 Docker 顶端
-            if [ "$proto" = "iptables" ] && iptables -L DOCKER-USER -n >/dev/null 2>&1; then
-                if ! iptables -C DOCKER-USER -s "$ip" -j DROP 2>/dev/null; then
+            # 兼容 Docker 用户自定义链
+            if [ "$proto" = "iptables" ]; then
+                set +e
+                iptables -L DOCKER-USER -n >/dev/null 2>&1
+                local has_docker=$?
+                set -e
+                if [ $has_docker -eq 0 ]; then
                     iptables -I DOCKER-USER -s "$ip" -j DROP
                 fi
             fi
             ;;
         delete)
-            while $proto -C INPUT -s "$ip" -j ACCEPT 2>/dev/null; do $proto -D INPUT -s "$ip" -j ACCEPT; done
-            while $proto -C INPUT -s "$ip" -j DROP 2>/dev/null; do $proto -D INPUT -s "$ip" -j DROP; done
-            if [ "$proto" = "iptables" ] && iptables -L DOCKER-USER -n >/dev/null 2>&1; then
-                while iptables -C DOCKER-USER -s "$ip" -j DROP 2>/dev/null; do iptables -D DOCKER-USER -s "$ip" -j DROP; done
-            fi
             ;;
     esac
 }
 
 ping_action() {
     local action=$1
-    
+    set +e
     while iptables -C INPUT -p icmp -j DROP 2>/dev/null; do iptables -D INPUT -p icmp -j DROP; done
-    while iptables -C OUTPUT -p icmp -j DROP 2>/dev/null; do iptables -D OUTPUT -p icmp -j DROP; done
     while iptables -C INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null; do iptables -D INPUT -p icmp --icmp-type echo-request -j ACCEPT; done
-    while iptables -C OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT 2>/dev/null; do iptables -D OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT; done
-    
     while ip6tables -C INPUT -p icmpv6 -j DROP 2>/dev/null; do ip6tables -D INPUT -p icmpv6 -j DROP; done
-    while ip6tables -C OUTPUT -p icmpv6 -j DROP 2>/dev/null; do ip6tables -D OUTPUT -p icmpv6 -j DROP; done
     while ip6tables -C INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT 2>/dev/null; do ip6tables -D INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT; done
-    while ip6tables -C OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT 2>/dev/null; do ip6tables -D OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT; done
+    set -e
 
     if [ "$action" = "allow" ]; then
         iptables -I INPUT -p icmp --icmp-type echo-request -j ACCEPT
-        iptables -I OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT
         ip6tables -I INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT
-        ip6tables -I OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT
     else
         iptables -I INPUT -p icmp --icmp-type echo-request -j DROP
-        iptables -I OUTPUT -p icmp --icmp-type echo-reply -j DROP
         ip6tables -I INPUT -p icmpv6 --icmpv6-type echo-request -j DROP
-        ip6tables -I OUTPUT -p icmpv6 --icmpv6-type echo-reply -j DROP
     fi
 }
 
@@ -230,7 +239,7 @@ uninstall_firewall() {
         return
     fi
 
-    echo -e "${YELLOW}正在清理宿主机规则...${RESET}"
+    echo -e "${YELLOW}正在清理宿主机及 Docker 联动规则...${RESET}"
     for proto in iptables ip6tables; do
         $proto -F INPUT
         $proto -P INPUT ACCEPT
@@ -247,19 +256,25 @@ uninstall_firewall() {
     rc-update del iptables default >/dev/null 2>&1 || true
     rc-update del ip6tables default >/dev/null 2>&1 || true
     
-    echo -e "${YELLOW}正在卸载包...${RESET}"
-    apk del iptables ip6tables
+    echo -e "${YELLOW}正在彻底移出持久化规则文件...${RESET}"
+    rm -f /etc/iptables/rules4 /etc/iptables/rules6 /var/lib/iptables/rules-save 2>/dev/null || true
 
-    echo -e "${GREEN}✅ 防火墙已彻底卸载，Docker 链与网络已安全释放。${RESET}"
+    echo -e "${YELLOW}正在尝试卸载底层软件包...${RESET}"
+    apk del iptables ip6tables || echo -e "${YELLOW}提示: 部分组件正被 Docker 使用，已安全保留二进制程序但规则已被全部清空。${RESET}"
+
+    echo -e "${GREEN}✅ 防火墙已彻底卸载，系统网络已安全释放。${RESET}"
     exit 0
 }
+
+# ===============================
+# 4. 可视化面板查看
+# ===============================
 
 view_visual_rules() {
     clear
     local ports_tcp ports_udp ping_status_v4 ping_status_v6
     local policy_v4 policy_v6
 
-    # 针对 Alpine 砍掉 grep -P 的兼容写法，使用 awk 提取 policy
     policy_v4=$(iptables -L INPUT -n 2>/dev/null | head -n 1 | awk '{print $4}' | tr -d ')')
     policy_v6=$(ip6tables -L INPUT -n 2>/dev/null | head -n 1 | awk '{print $4}' | tr -d ')')
     [ -z "$policy_v4" ] && policy_v4="UNKNOWN"
@@ -320,8 +335,9 @@ view_visual_rules() {
 }
 
 # ===============================
-# 管理菜单
+# 5. 主菜单循环
 # ===============================
+
 menu() {
     while true; do
         STATUS=$(get_firewall_status)
@@ -331,7 +347,7 @@ menu() {
 
         clear
         echo -e "${GREEN}===============================${RESET}"
-        echo -e "${GREEN}     ◈  双栈防火墙控制台 ◈     ${RESET}"
+        echo -e "${GREEN}    ◈  Alpine 双栈防火墙控制台 ◈      ${RESET}"
         echo -e "${GREEN}===============================${RESET}"
         echo -e "${GREEN} 状态  : ${STATUS}"
         echo -e "${GREEN} 内核  : ${YELLOW}${TYPE_SHOW}${RESET}"
@@ -363,16 +379,14 @@ menu() {
                     printf "按回车返回菜单..." && read -r _
                     continue
                 fi
+                set +e
                 for proto in iptables ip6tables; do
                     while $proto -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null; do $proto -D INPUT -p tcp --dport "$PORT" -j DROP; done
                     while $proto -C INPUT -p udp --dport "$PORT" -j DROP 2>/dev/null; do $proto -D INPUT -p udp --dport "$PORT" -j DROP; done
-                    if ! $proto -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; then
-                        $proto -I INPUT -p tcp --dport "$PORT" -j ACCEPT
-                    fi
-                    if ! $proto -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; then
-                        $proto -I INPUT -p udp --dport "$PORT" -j ACCEPT
-                    fi
+                    if ! $proto -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; then $proto -I INPUT -p tcp --dport "$PORT" -j ACCEPT; fi
+                    if ! $proto -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; then $proto -I INPUT -p udp --dport "$PORT" -j ACCEPT; fi
                 done
+                set -e
                 save_rules
                 echo -e "${GREEN}✅ 已开放端口 $PORT${RESET}"
                 printf "按回车继续..." && read -r _
@@ -389,18 +403,16 @@ menu() {
                     printf "按回车返回菜单..." && read -r _
                     continue
                 fi
+                set +e
                 for proto in iptables ip6tables; do
                     while $proto -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; do $proto -D INPUT -p tcp --dport "$PORT" -j ACCEPT; done
                     while $proto -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; do $proto -D INPUT -p udp --dport "$PORT" -j ACCEPT; done
-                    if ! $proto -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null; then
-                        $proto -I INPUT -p tcp --dport "$PORT" -j DROP
-                    fi
-                    if ! $proto -C INPUT -p udp --dport "$PORT" -j DROP 2>/dev/null; then
-                        $proto -I INPUT -p udp --dport "$PORT" -j DROP
-                    fi
+                    if ! $proto -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null; then $proto -I INPUT -p tcp --dport "$PORT" -j DROP; fi
+                    if ! $proto -C INPUT -p udp --dport "$PORT" -j DROP 2>/dev/null; then $proto -I INPUT -p udp --dport "$PORT" -j DROP; fi
                 done
+                set -e
                 save_rules
-                echo -e "${GREEN}✅ 已关闭宿主机端口 $PORT (注:若该端口由Docker映射，可在容器配置中管理)${RESET}"
+                echo -e "${GREEN}✅ 已关闭宿主机端口 $PORT${RESET}"
                 printf "按回车继续..." && read -r _
                 ;;
             3) open_all_ports ;;
@@ -416,7 +428,7 @@ menu() {
                 printf "请输入要封禁的IP: " && read -r IP
                 ip_action drop "$IP"
                 save_rules
-                echo -e "${GREEN}✅ IP $IP 已封禁（已同步应用至宿主机与Docker容器）${RESET}"
+                echo -e "${GREEN}✅ IP $IP 已封禁（已同步至 Docker 链）${RESET}"
                 printf "按回车继续..." && read -r _
                 ;;
             7)
@@ -448,8 +460,9 @@ menu() {
 }
 
 # ===============================
-# 脚本入口
+# 6. 脚本执行入口
 # ===============================
+
 if [ "$(id -u)" -ne 0 ]; then
    echo -e "${RED}❌ 错误: 请使用 root 权限运行此脚本！${RESET}"
    exit 1

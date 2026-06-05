@@ -1,36 +1,20 @@
 #!/bin/bash
-# ========================================
-# ShellCrash 一键安装脚本
-# 自动刷新环境变量
-# ========================================
 
+# 颜色定义
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-clear
+# 代理前缀
+PROXY="https://v6.gh-proxy.org/"
 
-echo -e "${GREEN}========================================${RESET}"
-echo -e "${GREEN}       ShellCrash 开始安装${RESET}"
-echo -e "${GREEN}========================================${RESET}"
-
-# 检查 curl
-if ! command -v curl &>/dev/null; then
-    echo -e "${YELLOW}未检测到 curl，正在安装...${RESET}"
-
-    if command -v apt &>/dev/null; then
-        apt update -y && apt install -y curl
-    elif command -v yum &>/dev/null; then
-        yum install -y curl
-    elif command -v dnf &>/dev/null; then
-        dnf install -y curl
-    elif command -v apk &>/dev/null; then
-        apk add curl
-    else
-        echo -e "${RED}无法自动安装 curl，请手动安装${RESET}"
-        exit 1
-    fi
+# 获取操作系统 ID
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS=$ID
+else
+    OS="unknown"
 fi
 
 # 核心下载与执行函数（含自动容灾代理）
@@ -45,10 +29,18 @@ fetch_and_run() {
     }
 }
 
-# 下载并执行安装
-
-fetch_and_run "https://raw.githubusercontent.com/juewuy/ShellCrash/master/install.sh"
-
-
-echo -e "${YELLOW}如果命令未立即生效，请执行：${RESET}"
-echo -e "${YELLOW}source /etc/profile${RESET}"
+# 安装逻辑判断
+case "$OS" in
+    alpine)
+        # 执行 Alpine 适配版脚本
+        fetch_and_run "https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/APAnyRealityS.sh"
+        ;;
+    debian|ubuntu|centos|rocky|almalinux|fedora)
+        # 执行原版脚本
+        fetch_and_run "https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/AnyRealityS.sh"
+        ;;
+    *)  
+        # 未能识别或暂不支持您的系统
+        fetch_and_run "https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/AnyRealityS.sh"
+        ;;
+esac

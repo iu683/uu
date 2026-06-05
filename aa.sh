@@ -2,7 +2,7 @@
 set -e
 
 # ==========================================================
-# Alpine Linux 专属全能一键优化脚本
+# Alpine Linux 专属全能一键优化脚本 (自动密钥+Swap加强版)
 # ==========================================================
 
 # 1. 颜色与基础变量
@@ -16,8 +16,8 @@ RESET="\033[0m"
 LOG_FILE="/var/log/alpine_setup.log"
 non_interactive=${NON_INTERACTIVE:-false}
 
-# 适配 Alpine 的精简依赖包 (移除了 glibc 依赖项，换用 musl 兼容工具)
-deps="curl wget git net-tools lsof tar unzip rsync pv sudo openbsd-netcat openssh-client jq openssl ca-certificates"
+# 适配 Alpine 的精简依赖包 (加入 openssh 用于生成密钥)
+deps="curl wget git net-tools lsof tar unzip rsync pv sudo netcat-openbsd openssh openssh-client jq openssl ca-certificates"
 
 log() {
     echo -e "$1"
@@ -40,7 +40,7 @@ detect_environment() {
     else
         VIRT_TYPE="独立虚拟机/物理机 (KVM/XEN/VMware)"
     fi
-    log "${blue}[INFO] 当前运行环境: ${VIRT_TYPE}${RESET}"
+    log "${BLUE}[INFO] 当前运行环境: ${VIRT_TYPE}${RESET}"
 }
 
 # 2. 系统更新与依赖安装
@@ -71,7 +71,7 @@ configure_hostname() {
     fi
     
     # 更新 /etc/hosts
-    if grep -q "127.0.0.1" /etc/hosts; then
+    if [ -f /etc/hosts ]; then
         sed -i "s/127.0.0.1.*/127.0.0.1\t$new_hn localhost/" /etc/hosts
     fi
     log "${GREEN}✅ 主机名配置完成${RESET}"
@@ -80,7 +80,6 @@ configure_hostname() {
 # 4. 语言与区域环境 (Locale)
 configure_locale() {
     log "\n${YELLOW}=============== 3. 语言环境设置 ===============${RESET}"
-    # Alpine 默认使用 musl-libc，通过安装 musl-locales 提供基础支持
     apk add musl-locales musl-locales-lang ttf-dejavu >/dev/null 2>&1
     
     export LANG=en_US.UTF-8
@@ -97,7 +96,6 @@ configure_locale() {
 configure_firewall() {
     log "\n${YELLOW}=============== 4. 防火墙完全放行 ===============${RESET}"
     
-    # Alpine 常见防火墙为 awall 或 iptables
     if command -v iptables >/dev/null 2>&1; then
         log "${BLUE}[INFO] 正在清理 iptables 规则...${RESET}"
         iptables -F 2>/dev/null || true
@@ -114,7 +112,7 @@ configure_firewall() {
     log "${GREEN}✅ 防火墙限制已全面解除${RESET}"
 }
 
-# 6. BBR 与内核网络调优 (自动识别环境)
+# 6. BBR 与内核网络调优
 configure_bbr() {
     log "\n${YELLOW}=============== 5. BBR 与网络网络调优 ===============${RESET}"
     
@@ -154,7 +152,6 @@ configure_dns() {
     log "\n${YELLOW}=============== 6. DNS 配置 ===============${RESET}"
     log "${BLUE}正在修改 /etc/resolv.conf...${RESET}"
     
-    # 解锁文件（防止被某些脚本锁死）
     chattr -i /etc/resolv.conf 2>/dev/null || true
     
     cat > /etc/resolv.conf << EOF
@@ -166,57 +163,119 @@ EOF
     log "${GREEN}✅ DNS 优化完毕 (8.8.8.8 / 1.1.1.1)${RESET}"
 }
 
-# 8. Swap 虚拟内存配置 (1GB)
+# 8. Swap 虚拟内存配置 (全新强力修复版)
 configure_swap() {
     log "\n${YELLOW}=============== 7. Swap 虚拟内存配置 ===============${RESET}"
     
     if [ "$IS_CONTAINER" = true ]; then
-        log "${YELLOW}[SKIP] 容器环境无法独立挂载物理 Swap，跳过。${RESET}"
+        log "${YELLOW}[SKIP] 容器环境无法挂载物理 Swap，跳过。${RESET}"
         return 0
     fi
     
-    if swapon -s | grep -q 'partition\|file'; then
-        log "${BLUE}系统已有可用 Swap，跳过创建${RESET}"
+    if swapon -s | grep -q 'partition\|file' || free | grep -q 'Swap:[[:space:]]*[1-9]'; then
+        log "${GREEN}✅ 系统已有可用 Swap，跳过创建${RESET}"
         return 0
     fi
     
     local free_space=$(df -m / | awk 'NR==2 {print $4}')
-    if [ "$free_space" -lt 5120 ]; then
-        log "${YELLOW}磁盘剩余空间小于 5GB，不建议创建 Swap，跳过。${RESET}"
+    if [ "$free_space" -lt 3000 ]; then
+        log "${YELLOW}[SKIP] 磁盘剩余空间过小，跳过创建 Swap。${RESET}"
         return 0
     fi
     
-    log "${BLUE}正在使用 dd 创建 1GB Swap 镜像文件...${RESET}"
-    dd if=/dev/zero of=/swapfile bs=1M count=1024 status=progress
+    log "${BLUE}正在为 Alpine 激活并挂载 1GB 兼容性 Swap...${RESET}"
+    
+    # 彻底卸载可能残留的坏文件
+    swapoff /swapfile 2>/dev/null || true
+    rm -f /swapfile
+    
+    # 使用 dd 并加入 conv=notrunc,fsync 确保 Alpine 文件系统彻底写入
+    dd if=/dev/zero of=/swapfile bs=1M count=1024 status=progress conv=notrunc,fsync
+    
     chmod 600 /swapfile
     mkswap /swapfile
-    swapon /swapfile
     
-    grep -q "/swapfile" /etc/fstab || echo "/swapfile none swap sw 0 0" >> /etc/fstab
-    log "${GREEN}✅ 1GB 虚拟内存 Swap 配置完毕${RESET}"
+    # 核心修复：针对精简内核，尝试挂载为回环设备以提高 swapon 成功率
+    if ! swapon /swapfile 2>/dev/null; then
+        log "${YELLOW}[WARN] 直接挂载失败，正在尝试通过 loop 环回设备挂载 Swap...${RESET}"
+        if [ ! -b /dev/loop0 ]; then
+            mknod /dev/loop0 b 7 0 2>/dev/null || true
+        fi
+        local loop_dev=$(losetup -f 2>/dev/null || echo "/dev/loop0")
+        losetup "$loop_dev" /swapfile 2>/dev/null || true
+        swapon "$loop_dev" 2>/dev/null || true
+    fi
+    
+    # 验证是否成功
+    if free | grep -q 'Swap:[[:space:]]*[1-9]'; then
+        sed -i '/swapfile/d' /etc/fstab || true
+        echo "/swapfile none swap sw 0 0" >> /etc/fstab
+        log "${GREEN}✅ 1GB 虚拟内存 Swap 配置并激活成功！${RESET}"
+    else
+        log "${RED}❌ 警告: 该系统内核锁定了外部 Swap 挂载，虚拟内存未生效（可忽略）。${RESET}"
+    fi
 }
 
-# 9. SSH 端口与安全加固 (兼容 OpenRC / 纯容器模式)
+# 9. SSH 端口、密码与自动化公钥生成
 configure_ssh() {
-    log "\n${YELLOW}=============== 8. SSH 基础配置 ===============${RESET}"
+    log "\n${YELLOW}=============== 8. SSH 端口、密码与自动化密钥生成 ===============${RESET}"
     
-    # 交互输入新端口
+    # 交互询问端口
     if [ -z "$NEW_SSH_PORT" ] && [ "$non_interactive" = false ]; then
         echo -n "请输入新的 SSH 端口号 (直接回车跳过不变): "
         read -r NEW_SSH_PORT
     fi
     
+    # 交互询问密码
+    if [ -z "$NEW_SSH_PASSWORD" ] && [ "$non_interactive" = false ]; then
+        echo -n "请输入新的 root 用户密码 (直接回车跳过不修改): "
+        read -r NEW_SSH_PASSWORD
+    fi
+    
     local ssh_conf="/etc/ssh/sshd_config"
-    if [ -f "$ssh_conf" ] && [ -n "$NEW_SSH_PORT" ]; then
-        sed -i "s/^#\?Port.*/Port $NEW_SSH_PORT/g" "$ssh_conf"
-        log "${GREEN}✅ SSH 端口已设为: ${NEW_SSH_PORT}${RESET}"
-        
-        # 尝试重启服务（若存在 init 系统的独立 VM）
-        if [ -f /etc/init.d/sshd ]; then
-            rc-service sshd restart 2>/dev/null || true
+    if [ -f "$ssh_conf" ]; then
+        if [ -n "$NEW_SSH_PORT" ]; then
+            sed -i "s/^#\?Port.*/Port $NEW_SSH_PORT/g" "$ssh_conf"
+            log "${GREEN}✅ SSH 端口已设为: ${NEW_SSH_PORT}${RESET}"
+        else
+            log "${BLUE}SSH 端口未作变更${RESET}"
         fi
+
+        # 开启公钥登录支持
+        sed -i "s/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/g" "$ssh_conf"
+        sed -i "s/^#\?AuthorizedKeysFile.*/AuthorizedKeysFile .ssh\/authorized_keys/g" "$ssh_conf"
+        
+        # 自动化生成全新 Ed25519 密钥对
+        mkdir -p /root/.ssh
+        chmod 700 /root/.ssh
+        
+        log "${BLUE}正在为当前服务器自动生成专属 SSH 登录密钥对...${RESET}"
+        local key_file="/root/.ssh/id_ed25519"
+        rm -f "$key_file" "${key_file}.pub"
+        
+        # 免交互生成密钥
+        ssh-keygen -t ed25519 -N "" -f "$key_file" >/dev/null
+        
+        # 将生成的公钥写入授权列表
+        cat "${key_file}.pub" >> /root/.ssh/authorized_keys
+        chmod 600 /root/.ssh/authorized_keys
+        
+        # 暂存私钥内容，用于最后展示
+        PRIVATE_KEY_CONTENT=$(cat "$key_file")
+        log "${GREEN}✅ 登录公钥已成功自动填入系统列表中${RESET}"
     else
-        log "${BLUE}SSH 端口未作变更${RESET}"
+        log "${RED}❌ 未检测到 /etc/ssh/sshd_config，跳过 SSH 内部配置${RESET}"
+    fi
+    
+    # 应用密码修改
+    if [ -n "$NEW_SSH_PASSWORD" ]; then
+        echo "root:${NEW_SSH_PASSWORD}" | chpasswd
+        log "${GREEN}✅ root 密码已成功更新${RESET}"
+    fi
+    
+    # 重启 SSH 服务
+    if [ -f /etc/init.d/sshd ]; then
+        rc-service sshd restart >/dev/null 2>&1 || true
     fi
 }
 
@@ -257,28 +316,29 @@ EOF
 install_tools() {
     log "\n${YELLOW}=============== 10. 实用工具集安装 ===============${RESET}"
     
-    # Cronie 定时任务安装
-    log "${BLUE}配置 cronie 计划任务服务...${RESET}"
-    apk add cronie >/dev/null
+    log "${BLUE}配置 Alpine 原生 dcron 计划任务服务...${RESET}"
     if [ -f /etc/init.d/crond ]; then
-        rc-update add crond default 2>/dev/null || true
-        rc-service crond start 2>/dev/null || true
+        rc-update add crond default >/dev/null 2>&1 || true
+        rc-service crond start >/dev/null 2>&1 || true
+        log "${GREEN}✅ 定时任务服务已就绪${RESET}"
     fi
     
-    # 安装 NextTrace (底层依赖 libc 兼容包 gcompat)
     log "${BLUE}下载并配置路由追踪工具 NextTrace...${RESET}"
     apk add gcompat libc6-compat >/dev/null 2>&1 || true
     curl -sL https://nxtrace.org/nt | bash || true
     
-    # 配置时区为上海
     log "${BLUE}修正系统时区为 Asia/Shanghai...${RESET}"
     apk add tzdata >/dev/null
-    cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
-    echo "Asia/Shanghai" > /etc/timezone
+    if [ -f /usr/share/zoneinfo/Asia/Shanghai ]; then
+        rm -f /etc/localtime
+        cp -f /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+        echo "Asia/Shanghai" > /etc/timezone
+    fi
     apk del tzdata >/dev/null
+    log "${GREEN}✅ 常用工具及 Asia/Shanghai 时区配置完成${RESET}"
 }
 
-# 12. Docker 安装 (针对独立架构环境)
+# 12. Docker 安装
 docker_install() {
     log "\n${CYAN}============ 11. Docker 容器引擎安装 ============${RESET}"
     
@@ -319,7 +379,7 @@ clean_system() {
 main() {
     clear
     echo -e "${CYAN}======================================================${RESET}"
-    echo -e "${GREEN}            Alpine Linux 专属全能优化                 ${RESET}"
+    echo -e "${GREEN}       欢迎使用 Alpine Linux 专属全能优化脚本${RESET}"
     echo -e "${CYAN}======================================================${RESET}"
     
     root_check
@@ -349,12 +409,22 @@ main() {
     
     log "${GREEN}✨ 针对 Alpine Linux 的所有优化项目已全部处理完毕！${RESET}"
     
-    # 容器环境不执行 reboot 退出，独立 VM 询问或直接执行
+    # 如果生成了密钥，在重启前强行展示并等待用户确认
+    if [ -n "$PRIVATE_KEY_CONTENT" ]; then
+        echo -e "\n${CYAN}======================================================${RESET}"
+        echo -e "${YELLOW}🔑请【务必】复制保存下方私钥，用于你本地客户端连接：${RESET}"
+        echo -e "${CYAN}======================================================${RESET}"
+        echo -e "${GREEN}${PRIVATE_KEY_CONTENT}${RESET}"
+        echo -e "${CYAN}======================================================${RESET}"
+        echo -e "${RED}⚠️ 复制完成后，请按任意键确认以允许系统重启生效...${RESET}"
+        read -r _
+    fi
+
     if [ "$IS_CONTAINER" = true ]; then
         log "${YELLOW}容器环境无需重启，优化立即生效。${RESET}"
     else
-        log "${YELLOW}系统将在 3 秒后安全重启以使内核及服务生效...${RESET}"
-        sleep 3
+        log "${YELLOW}系统即将安全重启以使内核及服务生效...${RESET}"
+        sleep 2
         reboot
     fi
 }

@@ -2,7 +2,7 @@
 set -e
 
 # ==========================================================
-# Alpine Linux 专属全能一键优化脚本 (自动密钥+Swap加强版)
+# Alpine Linux 专属全能一键优化脚本 
 # ==========================================================
 
 # 1. 颜色与基础变量
@@ -12,11 +12,12 @@ YELLOW="\033[33m"
 BLUE="\033[34m"
 CYAN="\033[36m"
 RESET="\033[0m"
+NC="\033[0m" # 兼容部分NC变量
 
 LOG_FILE="/var/log/alpine_setup.log"
 non_interactive=${NON_INTERACTIVE:-false}
 
-# 适配 Alpine 的精简依赖包 (加入 openssh 用于生成密钥)
+# 适配 Alpine 的精简依赖包 
 deps="curl wget git net-tools lsof tar unzip rsync pv sudo netcat-openbsd openssh openssh-client jq openssl ca-certificates"
 
 log() {
@@ -40,7 +41,9 @@ detect_environment() {
     else
         VIRT_TYPE="独立虚拟机/物理机 (KVM/XEN/VMware)"
     fi
-    log "${BLUE}[INFO] 当前运行环境: ${VIRT_TYPE}${RESET}"
+    log "${RED}[INFO] 当前运行环境: ${VIRT_TYPE}${RESET}"
+    log "${YELLOW}[INFO] 由于容器环境共享宿主机内核，无法进行 BBR 调优、Swap 分配等底层操作。${RESET}"
+    log "${YELLOW}[INFO] 请在 KVM/VMware/XEN 等全虚拟化架构或物理机上运行此脚本。${RESET}"
 }
 
 # 2. 系统更新与依赖安装
@@ -160,7 +163,7 @@ nameserver 8.8.8.8
 nameserver 1.1.1.1
 nameserver 2606:4700:4700::1111
 EOF
-    log "${GREEN}✅ DNS 优化完毕 (8.8.8.8 / 1.1.1.1)${RESET}"
+    log "${GREEN}✅ DNS 优化完毕 (8.8.8.8 / 1.1.1.1,2606:4700:4700::1111)${RESET}"
 }
 
 # 8. Swap 虚拟内存配置 (全新强力修复版)
@@ -216,6 +219,7 @@ configure_swap() {
     fi
 }
 
+
 # 9. SSH 端口、密码与自动化公钥生成
 configure_ssh() {
     log "\n${YELLOW}=============== 8. SSH 端口、密码与自动化密钥生成 ===============${RESET}"
@@ -249,25 +253,53 @@ configure_ssh() {
         mkdir -p /root/.ssh
         chmod 700 /root/.ssh
         
-        log "${BLUE}正在为当前服务器自动生成专属 SSH 登录密钥对...${RESET}"
         local key_file="/root/.ssh/id_ed25519"
-        rm -f "$key_file" "${key_file}.pub"
-        
-        # 免交互生成密钥
-        ssh-keygen -t ed25519 -N "" -f "$key_file" >/dev/null
-        
-        # 将生成的公钥写入授权列表
-        cat "${key_file}.pub" >> /root/.ssh/authorized_keys
-        chmod 600 /root/.ssh/authorized_keys
-        
-        # 暂存私钥内容，用于最后展示
-        PRIVATE_KEY_CONTENT=$(cat "$key_file")
-        log "${GREEN}✅ 登录公钥已成功自动填入系统列表中${RESET}"
+        local skip_key=false
+
+        # 交互模式下，先征求用户同意
+        if [ "$non_interactive" = false ]; then
+            if [ -f "$key_file" ]; then
+                echo -e "${RED}⚠️ 警告: 检测到系统已存在 SSH 私钥 ($key_file)${RESET}"
+                echo -n "是否覆盖并重新生成专属 SSH 密钥对？[y/N]: "
+            else
+                echo -n "是否为当前服务器自动生成专属 SSH 登录密钥对？[y/N]: "
+            fi
+            
+            read -r CONFIRM_KEY
+            if [ "$CONFIRM_KEY" != "y" ] && [ "$CONFIRM_KEY" != "Y" ]; then
+                log "${BLUE}已取消，跳过密钥对生成。${RESET}"
+                skip_key=true
+            fi
+        fi
+
+        # 如果没有被跳过，则执行删除和生成，并自动关闭密码登录
+        if [ "$skip_key" = false ]; then
+            log "${BLUE}正在为当前服务器自动生成专属 SSH 登录密钥对...${RESET}"
+            rm -f "$key_file" "${key_file}.pub"
+            
+            # 免交互生成密钥
+            ssh-keygen -t ed25519 -N "" -f "$key_file" >/dev/null
+            
+            # 将生成的公钥写入授权列表
+            cat "${key_file}.pub" >> /root/.ssh/authorized_keys
+            chmod 600 /root/.ssh/authorized_keys
+            
+            # 暂存私钥内容，用于最后展示
+            PRIVATE_KEY_CONTENT=$(cat "$key_file")
+            log "${GREEN}✅ 登录公钥已成功自动填入系统列表中${RESET}"
+
+            # 【新增：安全强化】自动禁用密码登录和交互式认证
+            log "${YELLOW}🔒 已成功生成密钥，正在自动禁用密码登录以强化安全...${RESET}"
+            sed -i "s/^#\?PasswordAuthentication.*/PasswordAuthentication no/g" "$ssh_conf"
+            sed -i "s/^#\?ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/g" "$ssh_conf"
+            sed -i "s/^#\?KbdInteractiveAuthentication.*/KbdInteractiveAuthentication no/g" "$ssh_conf"
+            log "${GREEN}✅ SSH 密码登录已禁用，后续仅允许密钥认证${RESET}"
+        fi
     else
         log "${RED}❌ 未检测到 /etc/ssh/sshd_config，跳过 SSH 内部配置${RESET}"
     fi
     
-    # 应用密码修改
+    # 应用密码修改（虽然禁用了远程密码登录，但本地或 VNC 登录依然有效）
     if [ -n "$NEW_SSH_PASSWORD" ]; then
         echo "root:${NEW_SSH_PASSWORD}" | chpasswd
         log "${GREEN}✅ root 密码已成功更新${RESET}"
@@ -375,11 +407,71 @@ clean_system() {
     log "${GREEN}✅ 清理工作已顺利完成${RESET}"
 }
 
+# 14. 显示 VPS 信息 (针对 Alpine OpenRC 优化版)
+show_vps_info() {
+    # 获取实际Swap大小
+    local swap_kb=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
+    local swap_display="$((swap_kb/1024))MB"
+
+    # SSH端口检测 (改用 awk 替代 grep -P 以完全匹配 POSIX sh)
+    local ssh_display
+    if [ -n "$NEW_SSH_PORT" ]; then
+        ssh_display="$NEW_SSH_PORT"
+    elif [ -f /etc/ssh/sshd_config ]; then
+        ssh_display=$(awk '/^[ \t]*Port/ {print $2}' /etc/ssh/sshd_config | tail -n1)
+        ssh_display="${ssh_display:-22}"
+    else
+        ssh_display="22"
+    fi
+
+    # Fail2ban状态 (改用 OpenRC 的 rc-service 状态检测)
+    local fail2ban_display="未安装"
+    if [ -f /etc/init.d/fail2ban ]; then
+        if rc-service fail2ban status 2>/dev/null | grep -q "started"; then
+            fail2ban_display="已启用"
+        else
+            fail2ban_display="未运行"
+        fi
+    fi
+
+    # BBR状态检测
+    local bbr_display="未启用"
+    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q 'bbr'; then
+        bbr_display="已启用"
+    fi
+    
+    # Docker状态检测 (使用 OpenRC 兼容方式)
+    local docker_display="未安装"
+    if command -v docker >/dev/null 2>&1; then
+        if [ -f /etc/init.d/docker ] && rc-service docker status 2>/dev/null | grep -q "started"; then
+            docker_display="已启用"
+        else
+            docker_display="已安装但未运行"
+        fi
+    fi
+
+    local hostname_display="${NEW_HOSTNAME:-$(hostname)}"
+    local dns_v4_display="${PRIMARY_DNS_V4:-8.8.8.8}, ${SECONDARY_DNS_V4:-1.1.1.1}"
+    local dns_v6_display="${PRIMARY_DNS_V6:-2606:4700:4700::1111}"
+
+    echo -e "${CYAN}================== VPS优化后状态 ==================${RESET}"
+    echo -e "${YELLOW}主机名:     ${hostname_display}${RESET}"
+    echo -e "${YELLOW}时区:       ${TIMEZONE:-Asia/Shanghai}${RESET}"
+    echo -e "${YELLOW}Swap 虚拟:  ${swap_display}${RESET}"
+    echo -e "${YELLOW}BBR 加速:   ${bbr_display}${RESET}"
+    echo -e "${YELLOW}DNS (IPv4): ${dns_v4_display}${RESET}"
+    echo -e "${YELLOW}DNS (IPv6): ${dns_v6_display}${RESET}"
+    echo -e "${YELLOW}Fail2ban:   ${fail2ban_display}${RESET}"
+    echo -e "${YELLOW}Docker:     ${docker_display}${RESET}"
+    echo -e "${YELLOW}SSH端口:    ${ssh_display}${RESET}"
+    echo -e "${CYAN}===================================================${RESET}"
+}
+
 # 主流程控制
 main() {
     clear
     echo -e "${CYAN}======================================================${RESET}"
-    echo -e "${GREEN}       欢迎使用 Alpine Linux 专属全能优化脚本${RESET}"
+    echo -e "${GREEN}      欢迎使用 Alpine Linux 专属全能优化${RESET}"
     echo -e "${CYAN}======================================================${RESET}"
     
     root_check
@@ -389,7 +481,6 @@ main() {
         echo -n "是否立刻开始执行一键优化？ [Y/n]: "
         read -r CONFIRM
         if [ "$CONFIRM" = "n" ] || [ "$CONFIRM" = "N" ]; then
-            echo -e "${BLUE}已主动退出。${RESET}"
             exit 0
         fi
     fi
@@ -409,10 +500,13 @@ main() {
     
     log "${GREEN}✨ 针对 Alpine Linux 的所有优化项目已全部处理完毕！${RESET}"
     
+    # 打印 VPS 信息快照
+    show_vps_info
+
     # 如果生成了密钥，在重启前强行展示并等待用户确认
     if [ -n "$PRIVATE_KEY_CONTENT" ]; then
         echo -e "\n${CYAN}======================================================${RESET}"
-        echo -e "${YELLOW}🔑请【务必】复制保存下方私钥，用于你本地客户端连接：${RESET}"
+        echo -e "${YELLOW}🔑 请【务必】复制保存下方私钥，用于你本地客户端连接：${RESET}"
         echo -e "${CYAN}======================================================${RESET}"
         echo -e "${GREEN}${PRIVATE_KEY_CONTENT}${RESET}"
         echo -e "${CYAN}======================================================${RESET}"

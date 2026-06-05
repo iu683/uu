@@ -1,817 +1,555 @@
 #!/bin/bash
-# ========================================
-# 🐳 一键 VPS Docker 管理工具
-# ========================================
+# VPS Toolbox
+# 功能：
+# - 一级菜单加 ▶ 标识，字体绿色
+# - 二级菜单简洁显示，输入 1~99 都可执行
+# - 快捷指令 m / M 自动创建
+# - 系统信息面板
+# - 彩色菜单和动态彩虹标题
+# - 完整安装/卸载
 
-# -----------------------------
+INSTALL_PATH="$HOME/vps-toolbox.sh"
+SHORTCUT_PATH="/usr/local/bin/m"
+SHORTCUT_PATH_UPPER="/usr/local/bin/M"
+
 # 颜色
-# -----------------------------
-RED="\033[31m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-BOLD="\033[1m"
-RESET="\033[0m"
+green="\033[32m"
+reset="\033[0m"
+yellow="\033[33m"
+red="\033[31m"
+cyan="\033[36m"
 BLUE="\033[34m"
-# -----------------------------
-# 检查 root
-# -----------------------------
-root_use() {
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}请使用 root 用户运行脚本${RESET}"
-        exit 1
-    fi
-}
-
-# -----------------------------
-# 重启 Docker 并恢复容器端口映射
-# -----------------------------
-restart_docker() {
-    root_use
-    echo -e "${YELLOW}正在重启 Docker...${RESET}"
-
-    if systemctl list-unit-files | grep -q "^docker.service"; then
-        systemctl restart docker
-    else
-        pkill dockerd 2>/dev/null
-        nohup dockerd >/dev/null 2>&1 &
-        sleep 5
-    fi
-
-    if docker info &>/dev/null; then
-        echo -e "${GREEN}✅ Docker 已成功重启${RESET}"
-        containers=$(docker ps -a -q)
-        if [ -n "$containers" ]; then
-            echo -e "${CYAN}正在重启所有容器以恢复端口映射...${RESET}"
-            docker restart $containers
-            echo -e "${GREEN}✅ 所有容器已重启并恢复端口映射${RESET}"
-        else
-            echo -e "${YELLOW}没有容器需要重启${RESET}"
-        fi
-    else
-        echo -e "${RED}❌ Docker 重启失败，请检查日志${RESET}"
-    fi
-}
-
-# -----------------------------
-# 检测 Docker 是否安装并运行
-# -----------------------------
-check_docker_running() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${RED}❌ Docker 未安装，请先安装 Docker${RESET}"
-        return 1
-    fi
-    if ! docker info &>/dev/null; then
-        echo -e "${YELLOW} Docker 未运行，尝试启动...${RESET}"
-        if systemctl list-unit-files | grep -q "^docker.service"; then
-            systemctl start docker
-        else
-            nohup dockerd >/dev/null 2>&1 &
-            sleep 5
-        fi
-    fi
-    if ! docker info &>/dev/null; then
-        echo -e "${RED}❌ Docker 启动失败，请检查日志${RESET}"
-        return 1
-    fi
-    return 0
-}
-
-# -----------------------------
-# 自动检测国内/国外
-# -----------------------------
-detect_country() {
-    local country=$(curl -s --max-time 5 ipinfo.io/country)
-    if [[ "$country" == "CN" ]]; then
-        echo "CN"
-    else
-        echo "OTHER"
-    fi
-}
-
-# -----------------------------
-# 安装/更新 Docker
-# -----------------------------
-docker_install() {
-    root_use
-    local country=$(detect_country)
-    echo -e "${CYAN}检测到国家: $country${RESET}"
-    if [ "$country" = "CN" ]; then
-        echo -e "${YELLOW}使用国内源安装 Docker...${RESET}"
-        curl -fsSL https://get.docker.com -o get-docker.sh
-        sh get-docker.sh
-        mkdir -p /etc/docker
-        cat > /etc/docker/daemon.json << EOF
-{
-  "registry-mirrors": [
-    "https://docker.0.unsee.tech",
-    "https://docker.1panel.live",
-    "https://registry.dockermirror.com",
-    "https://docker.m.daocloud.io"
-  ]
-}
-EOF
-    else
-        echo -e "${YELLOW}使用官方源安装 Docker...${RESET}"
-        curl -fsSL https://get.docker.com | sh
-    fi
-    systemctl enable docker
-    systemctl start docker
-    echo -e "${GREEN}Docker 安装完成并已启动（已设置开机自启）${RESET}"
-}
-
-docker_update() {
-    root_use
-    echo -e "${YELLOW}正在更新 Docker...${RESET}"
-    curl -fsSL https://get.docker.com -o get-docker.sh
-    sh get-docker.sh
-    systemctl enable docker
-    systemctl restart docker
-    echo -e "${GREEN}Docker 更新完成并已启动（已设置开机自启）${RESET}"
-}
-
-docker_install_update() {
-    root_use
-    if command -v docker &>/dev/null; then
-        docker_update
-    else
-        docker_install
-    fi
-}
-
-# -----------------------------
-# 卸载 Docker
-# -----------------------------
-docker_uninstall() {
-    root_use
-    echo -e "${RED}正在卸载 Docker 和 Docker Compose...${RESET}"
-    systemctl stop docker 2>/dev/null
-    systemctl disable docker 2>/dev/null
-    pkill dockerd 2>/dev/null
-
-    if command -v apt &>/dev/null; then
-        apt remove -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli containerd.io docker-compose-plugin || true
-        apt purge -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli containerd.io docker-compose-plugin || true
-        apt autoremove -y
-    elif command -v yum &>/dev/null; then
-        yum remove -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli containerd.io docker-compose-plugin || true
-    fi
-
-    rm -rf /var/lib/docker /etc/docker /var/lib/containerd /var/run/docker.sock /usr/local/bin/docker-compose
-    echo -e "${GREEN}Docker 和 Docker Compose 已卸载干净${RESET}"
-}
-
-# -----------------------------
-# Docker Compose 安装/更新
-# -----------------------------
-docker_compose_install_update() {
-    root_use
-    echo -e "${CYAN}正在安装/更新 Docker Compose...${RESET}"
-    if ! command -v jq &>/dev/null; then
-        if command -v apt &>/dev/null; then
-            apt update -y && apt install -y jq
-        elif command -v yum &>/dev/null; then
-            yum install -y jq
-        fi
-    fi
-    local latest=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
-    latest=${latest:-"v2.30.0"}
-    curl -L "https://github.com/docker/compose/releases/download/$latest/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-    chmod +x /usr/local/bin/docker-compose
-    echo -e "${GREEN}Docker Compose 已安装/更新到版本 $latest${RESET}"
-}
-
-# -----------------------------
-# Docker IPv6
-# -----------------------------
-docker_ipv6_on() {
-    root_use
-    mkdir -p /etc/docker
-    if [ -f /etc/docker/daemon.json ]; then
-        jq '. + {ipv6:true,"fixed-cidr-v6":"fd00::/64"}' /etc/docker/daemon.json 2>/dev/null \
-            >/etc/docker/daemon.json.tmp || \
-            echo '{"ipv6":true,"fixed-cidr-v6":"fd00::/64"}' > /etc/docker/daemon.json.tmp
-    else
-        echo '{"ipv6":true,"fixed-cidr-v6":"fd00::/64"}' > /etc/docker/daemon.json.tmp
-    fi
-    mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
-    restart_docker
-    docker ps -a -q | xargs -r docker start
-    echo -e "${GREEN}✅ Docker IPv6 已开启，所有容器已恢复${RESET}"
-}
-
-docker_ipv6_off() {
-    root_use
-    if [ -f /etc/docker/daemon.json ]; then
-        jq 'del(.ipv6) | del(.["fixed-cidr-v6"])' /etc/docker/daemon.json \
-            >/etc/docker/daemon.json.tmp 2>/dev/null || \
-            cp /etc/docker/daemon.json /etc/docker/daemon.json.tmp
-        mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
-        restart_docker
-        docker ps -a -q | xargs -r docker start
-        echo -e "${GREEN}✅ Docker IPv6 已关闭，所有容器已恢复${RESET}"
-    else
-        echo -e "${YELLOW} Docker 配置文件不存在，无法关闭 IPv6${RESET}"
-    fi
-}
-
-# -----------------------------
-# 开放所有端口（IPv4 + IPv6 + nftables）
-# -----------------------------
-open_all_ports() {
-    root_use
-    read -p "确认要开放所有端口吗？(Y/N): " confirm
-    [[ $confirm =~ [Yy] ]] || { echo -e "${YELLOW}操作已取消${RESET}"; return; }
-    echo -e "${YELLOW}正在检测可用防火墙工具...${RESET}"
-
-    if command -v iptables &>/dev/null; then
-        iptables -P INPUT ACCEPT
-        iptables -P FORWARD ACCEPT
-        iptables -P OUTPUT ACCEPT
-        iptables -F
-    fi
-    if command -v ip6tables &>/dev/null; then
-        ip6tables -P INPUT ACCEPT
-        ip6tables -P FORWARD ACCEPT
-        ip6tables -P OUTPUT ACCEPT
-        ip6tables -F
-    fi
-    if command -v nft &>/dev/null; then
-        nft flush ruleset 2>/dev/null || true
-    fi
-    echo -e "${GREEN}✅ 已开放所有端口${RESET}"
-    restart_docker
-}
-
-# -----------------------------
-# iptables 切换
-# -----------------------------
-switch_iptables_legacy() {
-    root_use
-    if [ -x /usr/sbin/iptables-legacy ] && [ -x /usr/sbin/ip6tables-legacy ]; then
-        iptables-save > /tmp/iptables_backup_$(date +%F_%H%M%S).v4
-        ip6tables-save > /tmp/ip6tables_backup_$(date +%F_%H%M%S).v6
-        update-alternatives --set iptables /usr/sbin/iptables-legacy
-        update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
-        restart_docker
-        iptables-restore < /tmp/iptables_backup_$(ls /tmp | grep iptables_backup_ | sort | tail -n1)
-        ip6tables-restore < /tmp/ip6tables_backup_$(ls /tmp | grep ip6tables_backup_ | sort | tail -n1)
-        echo -e "${GREEN}✅ 已切换到 iptables-legacy 并恢复规则${RESET}"
-    else
-        echo -e "${RED}系统未安装 iptables-legacy，无法切换${RESET}"
-    fi
-}
-
-switch_iptables_nft() {
-    root_use
-    if [ -x /usr/sbin/iptables-nft ] && [ -x /usr/sbin/ip6tables-nft ]; then
-        iptables-save > /tmp/iptables_backup_$(date +%F_%H%M%S).v4
-        ip6tables-save > /tmp/ip6tables_backup_$(date +%F_%H%M%S).v6
-        update-alternatives --set iptables /usr/sbin/iptables-nft
-        update-alternatives --set ip6tables /usr/sbin/ip6tables-nft
-        restart_docker
-        iptables-restore < /tmp/iptables_backup_$(ls /tmp | grep iptables_backup_ | sort | tail -n1)
-        ip6tables-restore < /tmp/ip6tables_backup_$(ls /tmp | grep ip6tables_backup_ | sort | tail -n1)
-        echo -e "${GREEN}✅ 已切换到 iptables-nft 并恢复规则${RESET}"
-    else
-        echo -e "${RED}系统未安装 iptables-nft，无法切换${RESET}"
-    fi
-}
-
-# -----------------------------
-# Docker 状态
-# -----------------------------
-docker_status() {
-    if docker info &>/dev/null; then
-        echo "运行中"
-    else
-        echo "未运行"
-    fi
-}
-
-current_iptables() {
-    ipt=$(update-alternatives --query iptables 2>/dev/null | grep 'Value:' | awk '{print $2}')
-    if [[ $ipt == *legacy ]]; then
-        echo "legacy"
-    else
-        echo "nft"
-    fi
-}
-
-docker_container_info() {
-    total=$(docker ps -a -q | wc -l)
-    running=$(docker ps -q | wc -l)
-    echo "总容器: $total | 运行中: $running"
-}
+ORANGE='\033[38;5;208m'
 
 
-# -----------------------------
-# Docker 容器管理
-# -----------------------------
-docker_ps() {
-    if ! check_docker_running; then return; fi
-    while true; do
-        clear
-        echo -e "${BOLD}${CYAN}===== Docker 容器管理 =====${RESET}"
-        docker ps -a --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}"
-        echo -e "${GREEN}01. 创建新容器${RESET}"
-        echo -e "${GREEN}02. 启动容器${RESET}"
-        echo -e "${GREEN}03. 停止容器${RESET}"
-        echo -e "${GREEN}04. 删除容器${RESET}"
-        echo -e "${GREEN}05. 重启容器${RESET}"
-        echo -e "${GREEN}06. 启动所有容器${RESET}"
-        echo -e "${GREEN}07. 停止所有容器${RESET}"
-        echo -e "${GREEN}08. 删除所有容器${RESET}"
-        echo -e "${GREEN}09. 重启所有容器${RESET}"
-        echo -e "${GREEN}10. 进入容器${RESET}"
-        echo -e "${GREEN}11. 查看日志${RESET}"
-        echo -e "${GREEN} 0. 返回主菜单${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case $choice in
-            01|1) read -p "请输入创建命令: " cmd; $cmd ;;
-            02|2) read -p "请输入容器名: " name; docker start $name ;;
-            03|3) read -p "请输入容器名: " name; docker stop $name ;;
-            04|4) read -p "请输入容器名: " name; docker rm -f $name ;;
-            05|5) read -p "请输入容器名: " name; docker restart $name ;;
-            06|6) containers=$(docker ps -a -q); [ -n "$containers" ] && docker start $containers || echo "无容器可启动" ;;
-            07|7) containers=$(docker ps -q); [ -n "$containers" ] && docker stop $containers || echo "无容器正在运行" ;;
-            08|8) read -p "确定删除所有容器? (Y/N): " c; [[ $c =~ [Yy] ]] && docker rm -f $(docker ps -a -q) ;;
-            09|9) containers=$(docker ps -q); [ -n "$containers" ] && docker restart $containers || echo "无容器正在运行" ;;
-            10) read -p "请输入容器名: " name; docker exec -it $name /bin/bash ;;
-            11) read -p "请输入容器名: " name; docker logs -f $name ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+# ===============================
+# 国家/地区判断与代理
+# ===============================
+PROXY_PREFIX=""
+# 通过API 检测是否为中国大陆 IP
+CN_CHECK=$(curl -s --max-time 5 ipinfo.io/country/)
+
+if [[ "$CN_CHECK" == "CN" ]]; then
+    PROXY_PREFIX="https://v6.gh-proxy.org/"
+else
+    :
+fi
+
+# 彩虹标题
+rainbow_animate() {
+    local text="$1"
+    local colors=(31 33 32 36 34 35)
+    local len=${#text}
+    for ((i=0; i<len; i++)); do
+        printf "\033[%sm%s" "${colors[$((i % ${#colors[@]}))]}" "${text:$i:1}"
+        sleep 0.002
     done
+    printf "${reset}\n"
 }
 
+# 系统资源显示
+show_system_usage() {
+    local width=36
+    local content_indent="    "
 
-# -----------------------------
-# Docker 镜像管理
-# -----------------------------
-docker_image() {
-    if ! check_docker_running; then return; fi
-    while true; do
-        clear
-        echo -e "${BOLD}${CYAN}===== Docker 镜像管理 =====${RESET}"
-        docker image ls
-        echo -e "${GREEN}01. 拉取镜像${RESET}"
-        echo -e "${GREEN}02. 更新镜像${RESET}"
-        echo -e "${GREEN}03. 删除镜像${RESET}"
-        echo -e "${GREEN}04. 删除所有镜像${RESET}"
-        echo -e "${GREEN} 0. 返回主菜单${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case $choice in
-            01|1) read -p "请输入镜像名: " imgs; for img in $imgs; do docker pull $img; done ;;
-            02|2) read -p "请输入镜像名: " imgs; for img in $imgs; do docker pull $img; done ;;
-            03|3) read -p "请输入镜像名: " imgs; for img in $imgs; do docker rmi -f $img; done ;;
-            04|4) read -p "确定删除所有镜像? (Y/N): " c; [[ $c =~ [Yy] ]] && docker rmi -f $(docker images -q) ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-    done
-}
-
-# -----------------------------
-# Docker 卷管理
-# -----------------------------
-docker_volume() {
-    if ! check_docker_running; then return; fi
-    while true; do
-        clear
-        echo -e "${BOLD}${CYAN}===== Docker 卷管理 =====${RESET}"
-        docker volume ls
-        echo -e "${GREEN}1. 创建卷${RESET}"
-        echo -e "${GREEN}2. 删除卷${RESET}"
-        echo -e "${GREEN}3. 删除所有无用卷${RESET}"
-        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case $choice in
-            1) read -p "请输入卷名: " v; docker volume create $v ;;
-            2) read -p "请输入卷名: " v; docker volume rm $v ;;
-            3) docker volume prune -f ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-    done
-}
-
-# -----------------------------
-# 清理所有未使用资源
-# -----------------------------
-docker_cleanup() {
-    root_use
-    echo -e "${YELLOW}清理所有未使用容器、镜像、卷...${RESET}"
-    docker system prune -af --volumes
-    echo -e "${GREEN}清理完成${RESET}"
-}
-
-# -----------------------------
-# Docker 网络管理
-# -----------------------------
-docker_network() {
-    if ! check_docker_running; then return; fi
-    while true; do
-        clear
-        echo -e "${BOLD}${CYAN}===== Docker 网络管理 =====${RESET}"
-        docker network ls
-        echo -e "${GREEN}1. 创建网络${RESET}"
-        echo -e "${GREEN}2. 加入网络${RESET}"
-        echo -e "${GREEN}3. 退出网络${RESET}"
-        echo -e "${GREEN}4. 删除网络${RESET}"
-        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " sub_choice
-        case $sub_choice in
-            1) read -p "设置新网络名: " dockernetwork; docker network create $dockernetwork ;;
-            2) read -p "加入网络名: " dockernetwork; read -p "容器名: " dockername; docker network connect $dockernetwork $dockername ;;
-            3) read -p "退出网络名: " dockernetwork; read -p "容器名: " dockername; docker network disconnect $dockernetwork $dockername ;;
-            4) read -p "请输入要删除的网络名: " dockernetwork; docker network rm $dockernetwork || echo -e "${RED}删除失败，网络可能被容器占用${RESET}" ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-    done
-}
-
-# -----------------------------
-# Docker 备份/恢复菜单
-# -----------------------------
-# -----------------------------
-# Docker 备份/恢复菜单（增强版）
-# -----------------------------
-docker_backup_menu() {
-    root_use
-
-    BACKUP_DIR="/opt/docker_backups"
-    LOG_FILE="$BACKUP_DIR/backup.log"
-    mkdir -p "$BACKUP_DIR"
-
-    # -----------------------------
-    # 检查 jq
-    # -----------------------------
-    if ! command -v jq &>/dev/null; then
-        echo -e "${YELLOW}未检测到 jq，正在安装...${RESET}"
-        if command -v apt &>/dev/null; then
-            apt update -y && apt install -y jq
-        elif command -v yum &>/dev/null; then
-            yum install -y epel-release && yum install -y jq
-        elif command -v dnf &>/dev/null; then
-            dnf install -y jq
+    # ================== 格式化函数 ==================
+    format_size() {
+        local size_mb=${1:-0}  # 防止为空
+        if [ "$size_mb" -lt 1024 ]; then
+            echo "${size_mb}M"
         else
-            echo -e "${RED}无法检测到包管理器，请手动安装 jq${RESET}"
-            read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-            return
+            awk "BEGIN{printf \"%.1fG\", $size_mb/1024}"
         fi
-    fi
+    }
 
-    # -----------------------------
-    # 检查 Docker
-    # -----------------------------
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        if command -v apt &>/dev/null; then
-            apt update -y && apt install -y docker.io
-        elif command -v yum &>/dev/null; then
-            yum install -y docker
-        elif command -v dnf &>/dev/null; then
-            dnf install -y docker
-        else
-            echo -e "${RED}无法检测到包管理器，请手动安装 Docker${RESET}"
-            read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-            return
-        fi
-    fi
+    # ================== 获取数据 ==================
+    # 内存
+    read mem_total mem_used <<< $(LANG=C free -m | awk 'NR==2{print $2, $3}')
+    mem_total=${mem_total:-0}
+    mem_used=${mem_used:-0}
+    mem_total_fmt=$(format_size "$mem_total")
+    mem_used_fmt=$(format_size "$mem_used")
+    mem_percent=$(awk "BEGIN{if($mem_total>0){printf \"%.0f\", $mem_used*100/$mem_total}else{print 0}}")
+    mem_percent="${mem_percent}%"  # 加回百分号显示
 
-    # -----------------------------
-    # 检查 Docker 服务
-    # -----------------------------
-    if ! pgrep -x dockerd &>/dev/null; then
-        echo -e "${YELLOW}Docker 服务未运行，正在启动...${RESET}"
-        if command -v systemctl &>/dev/null; then
-            systemctl start docker
-            systemctl enable docker
-        else
-            service docker start
-        fi
-        sleep 2
-        if ! pgrep -x dockerd &>/dev/null; then
-            echo -e "${RED}Docker 启动失败，请手动检查服务${RESET}"
-            read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-            return
-        fi
-    fi
+    # 磁盘
+    read disk_total_h disk_used_h disk_used_percent <<< $(df -m / | awk 'NR==2{print $2, $3, $5}')
+    disk_total_h=${disk_total_h:-0}
+    disk_used_h=${disk_used_h:-0}
+    disk_used_percent=${disk_used_percent:-0%}
+    disk_total_fmt=$(format_size "$disk_total_h")
+    disk_used_fmt=$(format_size "$disk_used_h")
 
-    # -----------------------------
-    # 检查磁盘空间
-    # -----------------------------
-    avail_space=$(df --output=avail "$BACKUP_DIR" | tail -1)
-    if (( avail_space < 1048576 )); then
-        echo -e "${RED}磁盘剩余空间不足 1GB，无法执行备份！${RESET}"
-        read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-        return
-    fi
+    # CPU
+    # 读取 /proc/stat 第一行，计算 CPU 使用率（防止空值）
+    cpu_usage=$(awk 'NR==1{usage=($2+$4)*100/($2+$4+$5); if(usage!=""){printf "%.1f", usage}else{print 0}}' /proc/stat)
+    cpu_usage="${cpu_usage}%"  # 加回百分号显示
 
-    while true; do
-        clear
-        echo -e "${BOLD}${CYAN}===== Docker Run备份与恢复 =====${RESET}"
-        echo -e "${GREEN}1. 备份 Docker${RESET}"
-        echo -e "${GREEN}2. 恢复 Docker${RESET}"
-        echo -e "${GREEN}3. 删除备份文件${RESET}"
-        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case $choice in
-            1)
-                # -----------------------------
-                # 备份逻辑
-                # -----------------------------
-                while true; do
-                    echo -e "${YELLOW}选择备份类型:${RESET}"
-                    echo -e "${GREEN}1. 容器${RESET}"
-                    echo -e "${GREEN}2. 镜像${RESET}"
-                    echo -e "${GREEN}3. 卷${RESET}"
-                    echo -e "${GREEN}4. 全量${RESET}"
-                    echo -e "${GREEN}0. 返回上一级${RESET}"
-                    read -p "$(echo -e ${GREEN}请选择:${RESET}) " btype
-                    [[ "$btype" == "0" ]] && break
+    # ================== 系统状态 ==================
+    mem_num=${mem_percent%\%}        # 去掉百分号
+    disk_num=${disk_used_percent%\%} # 去掉百分号
+    cpu_num=${cpu_usage%\%}          # 去掉百分号
 
-                    read -p "请输入备份文件名（默认 docker_backup_$(date +%F).tar.gz）: " backup_name
-                    backup_name=${backup_name:-docker_backup_$(date +%F).tar.gz}
-                    backup_path="$BACKUP_DIR/$backup_name"
-
-                    TMP_BACKUP_DIR=$(mktemp -d /tmp/docker_backup_XXXX)
-
-                    # --- 容器备份 ---
-                    if [[ "$btype" == "1" || "$btype" == "4" ]]; then
-                        echo "可用容器列表："
-                        docker ps -a --format "{{.Names}}"
-                        read -p "请输入要备份的容器名（多个用空格，留空则全部）: " selected_containers
-                        [[ -z "$selected_containers" ]] && selected_containers=$(docker ps -a --format "{{.Names}}")
-                        for cname in $selected_containers; do
-                            cid=$(docker ps -a -q -f name="^${cname}$")
-                            [[ -z "$cid" ]] && echo "容器 $cname 不存在，跳过" && continue
-                            docker inspect $cid > "$TMP_BACKUP_DIR/container_${cname}.json"
-                            docker export "$cid" -o "$TMP_BACKUP_DIR/container_${cname}.tar"
-                            echo "$(date '+%F %T') 备份容器 $cname 完成" >> "$LOG_FILE"
-                        done
-                    fi
-
-                    # --- 镜像备份 ---
-                    if [[ "$btype" == "2" || "$btype" == "4" ]]; then
-                        echo "可用镜像列表："
-                        docker images --format "{{.Repository}}:{{.Tag}}"
-                        read -p "请输入要备份的镜像（多个用空格，留空则全部）: " selected_images
-                        [[ -z "$selected_images" ]] && selected_images=$(docker images --format "{{.Repository}}:{{.Tag}}")
-                        for iname in $selected_images; do
-                            [[ "$iname" == "<none>:<none>" ]] && continue
-                            safe_name=$(echo "$iname" | tr '/:' '_')
-                            docker save "$iname" -o "$TMP_BACKUP_DIR/image_${safe_name}.tar"
-                            echo "$(date '+%F %T') 备份镜像 $iname 完成" >> "$LOG_FILE"
-                        done
-                    fi
-
-                    # --- 卷备份 ---
-                    if [[ "$btype" == "3" || "$btype" == "4" ]]; then
-                        echo "可用卷列表："
-                        docker volume ls -q
-                        read -p "请输入要备份的卷名（多个用空格，留空则全部）: " selected_volumes
-                        [[ -z "$selected_volumes" ]] && selected_volumes=$(docker volume ls -q)
-                        for vol in $selected_volumes; do
-                            [[ ! -d /var/lib/docker/volumes/"$vol"/_data ]] && echo "卷 $vol 不存在，跳过" && continue
-                            read -p "请确保卷 $vol 未被容器使用，按回车继续..."
-                            tar -czf "$TMP_BACKUP_DIR/volume_${vol}.tar.gz" -C /var/lib/docker/volumes/"$vol"/_data .
-                            echo "$(date '+%F %T') 备份卷 $vol 完成" >> "$LOG_FILE"
-                        done
-                    fi
-
-                    tar -czf "$backup_path" -C "$TMP_BACKUP_DIR" .
-                    rm -rf "$TMP_BACKUP_DIR"
-                    echo -e "${GREEN}备份完成: $backup_path${RESET}"
-                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-                    break
-                done
-                ;;
-            2)
-                # -----------------------------
-                # 恢复逻辑（保持原有选择逻辑）并增强安全
-                # -----------------------------
-                while true; do
-                    echo -e "${YELLOW}选择恢复类型:${RESET}"
-                    echo -e "${GREEN}1. 容器${RESET}"
-                    echo -e "${GREEN}2. 镜像${RESET}"
-                    echo -e "${GREEN}3. 卷${RESET}"
-                    echo -e "${GREEN}4. 全量${RESET}"
-                    echo -e "${GREEN}0. 返回上一级${RESET}"
-                    read -p "$(echo -e ${GREEN}请选择:${RESET}) " rtype
-                    [[ "$rtype" == "0" ]] && break
-
-                    read -p "请输入备份文件路径: " backup_file
-                    [[ ! -f "$backup_file" ]] && echo -e "${RED}备份文件不存在${RESET}" && read -p "按回车继续..." && continue
-
-                    TMP_RESTORE_DIR=$(mktemp -d /tmp/docker_restore_XXXX)
-                    tar -xzf "$backup_file" -C "$TMP_RESTORE_DIR"
-
-                    # --- 容器恢复 ---
-                    if [[ "$rtype" == "1" || "$rtype" == "4" ]]; then
-                        for cjson in "$TMP_RESTORE_DIR"/container_*.json; do
-                            [[ ! -f "$cjson" ]] && continue
-                            cname=$(basename "$cjson" | sed 's/container_\(.*\).json/\1/')
-                            image=$(jq -r '.[0].Config.Image' "$cjson")
-                            envs=$(jq -r '.[0].Config.Env | join(" -e ")' "$cjson")
-                            [[ -n "$envs" ]] && envs="-e $envs"
-                            ports=$(jq -r '.[0].HostConfig.PortBindings | to_entries | map("\(.value[0].HostPort):\(.key)") | join(" -p ")' "$cjson")
-                            [[ -n "$ports" ]] && ports="-p $ports"
-                            mounts=$(jq -r '.[0].Mounts | map("-v \(.Source):\(.Destination)") | join(" ")' "$cjson")
-                            network=$(jq -r '.[0].HostConfig.NetworkMode' "$cjson")
-                            echo "注意：如果端口已被占用，容器 $cname 启动可能失败"
-
-                            # 如果镜像不存在，尝试从备份加载
-                            safe_image_name=$(echo "$image" | tr '/:' '_')
-                            img_tar="$TMP_RESTORE_DIR/image_${safe_image_name}.tar"
-                            [[ -f "$img_tar" ]] && docker load -i "$img_tar"
-
-                            docker run -d --name "$cname" $envs $ports $mounts --network "$network" "$image"
-                            echo "$(date '+%F %T') 恢复容器 $cname 完成" >> "$LOG_FILE"
-                        done
-                    fi
-
-                    # --- 镜像恢复 ---
-                    if [[ "$rtype" == "2" || "$rtype" == "4" ]]; then
-                        for img_file in "$TMP_RESTORE_DIR"/image_*.tar; do
-                            [[ -f "$img_file" ]] && docker load -i "$img_file"
-                        done
-                    fi
-
-                    # --- 卷恢复 ---
-                    if [[ "$rtype" == "3" || "$rtype" == "4" ]]; then
-                        for vol_file in "$TMP_RESTORE_DIR"/volume_*.tar.gz; do
-                            vol_name=$(basename "$vol_file" | sed 's/volume_\(.*\).tar.gz/\1/')
-                            if docker volume inspect "$vol_name" &>/dev/null; then
-                                read -p "卷 $vol_name 已存在，是否覆盖? (y/N): " confirm
-                                [[ "$confirm" != "y" ]] && continue
-                            fi
-                            docker volume create "$vol_name" >/dev/null 2>&1
-                            tar -xzf "$vol_file" -C /var/lib/docker/volumes/"$vol_name"/_data
-                            echo "$(date '+%F %T') 恢复卷 $vol_name 完成" >> "$LOG_FILE"
-                        done
-                    fi
-
-                    rm -rf "$TMP_RESTORE_DIR"
-                    echo -e "${GREEN}恢复完成${RESET}"
-                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-                    break
-                done
-                ;;
-            3)
-                # -----------------------------
-                # 删除备份文件（支持多选或通配符）
-                # -----------------------------
-                while true; do
-                    echo "当前备份目录：$BACKUP_DIR"
-                    ls "$BACKUP_DIR"
-                    read -p "请输入要删除的备份文件名（支持空格或*通配符，输入0返回）: " del_files
-                    [[ "$del_files" == "0" ]] && break
-                    rm -f $BACKUP_DIR/$del_files
-                    echo -e "${GREEN}删除完成${RESET}"
-                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-                    break
-                done
-                ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择${RESET}"; read -p "$(echo -e ${GREEN}按回车继续...${RESET})" ;;
-        esac
+    max_level=0
+    for n in $mem_num $disk_num $cpu_num; do
+        if (( $(awk "BEGIN{print ($n>80)?1:0}") )); then max_level=2; fi
+        if (( $(awk "BEGIN{print ($n>60 && $n<=80)?1:0}") )) && [ "$max_level" -lt 2 ]; then max_level=1; fi
     done
+
+    if [ "$max_level" -eq 0 ]; then
+        system_status="${green}系统状态：正常 ✔${reset}"
+    elif [ "$max_level" -eq 1 ]; then
+        system_status="${yellow}系统状态：警告 ⚡${reset}"
+    else
+        system_status="${red}系统状态：危险 🔥${reset}"
+    fi
+
+    # ================== 输出 ==================
+    pad_string() {
+        local str="$1"
+        printf "%-${width}s" "${content_indent}${str}"
+    }
+
+    echo -e "${green}┌$(printf '─%.0s' $(seq 1 $width))┐${reset}"
+    echo -e "$(pad_string "${system_status}")"
+    echo -e "$(pad_string "${yellow}📊 内存：${mem_used_fmt}/${mem_total_fmt} (${mem_percent})${reset}")"
+    echo -e "$(pad_string "${yellow}💽 磁盘：${disk_used_fmt}/${disk_total_fmt} (${disk_used_percent})${reset}")"
+    echo -e "$(pad_string "${yellow} ⚙ CPU ：${cpu_usage}${reset}")"
+    echo -e "${green}└$(printf '─%.0s' $(seq 1 $width))┘${reset}"
 }
 
-monitor_docker_containers() {
+# ================== 系统信息 ==================
+
+# 判断是否容器
+if [ -f /proc/1/cgroup ] && grep -qE '(docker|lxc|kubepods)' /proc/1/cgroup; then
+    container_flag=" (Container)"
+else
+    container_flag=""
+fi
+
+# 系统名称
+if [ -f /etc/os-release ]; then
+    system_name=$(grep -E '^PRETTY_NAME=' /etc/os-release | cut -d= -f2 | tr -d '"')
+else
+    system_name=$(uname -s)
+fi
+system_name="${system_name}${container_flag}"
+
+
+
+# ===============================
+# 获取当前时区（跨系统兼容）
+# ===============================
+get_timezone() {
+    # 1️⃣ systemd 环境，屏蔽错误
+    if command -v timedatectl &>/dev/null; then
+        tz=$(timedatectl show -p Timezone --value 2>/dev/null)
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 2️⃣ /etc/timezone 文件（Debian）
+    if [[ -f /etc/timezone ]]; then
+        tz=$(cat /etc/timezone)
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 3️⃣ /etc/localtime 符号链接（RedHat / CentOS）
+    if [[ -L /etc/localtime ]]; then
+        tz=$(readlink /etc/localtime | sed 's#.*/zoneinfo/##')
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 4️⃣ /etc/localtime 文件内容匹配（minimal / docker / chroot）
+    if [[ -f /etc/localtime ]]; then
+        tz=$(strings /etc/localtime 2>/dev/null | grep -E '^[A-Z][a-z]+/[A-Z][a-zA-Z_]+$' | head -n1)
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 5️⃣ 兜底
+    echo "未知"
+}
+
+timezone=$(get_timezone)
+
+# 架构
+
+cpu_arch=$(uname -m)
+
+# 获取 CPU 型号
+cpu_model=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2)
+[ -z "$cpu_model" ] && cpu_model=$(grep -m1 "Hardware" /proc/cpuinfo 2>/dev/null | cut -d: -f2)
+[ -z "$cpu_model" ] && cpu_model=$(lscpu 2>/dev/null | grep "Model name" | cut -d: -f2)
+
+# 清理不需要的部分
+cpu_model=$(echo "$cpu_model" | sed -E \
+    -e 's/@.*GHz//g' \
+    -e 's/CPU//g' \
+    -e 's/Processor//g' \
+    -e 's/[0-9]+-Core//g' \
+	-e 's/\bv[1-9]\b//g' \
+    -e 's/\s+/ /g' \
+    | xargs)
+
+cpu="${cpu_model:-Unknown CPU} (${cpu_arch})"
+
+
+# 当前时间
+datetime=$(date "+%Y-%m-%d %H:%M:%S")
+
+# VPS 运行时间
+if [ -f /proc/uptime ]; then
+    uptime_seconds=$(cut -d' ' -f1 /proc/uptime | cut -d. -f1)
+    days=$((uptime_seconds/86400))
+    hours=$(( (uptime_seconds%86400)/3600 ))
+    minutes=$(( (uptime_seconds%3600)/60 ))
+    if [ "$days" -gt 0 ]; then
+        vps_uptime="${days}天${hours}小时${minutes}分钟"
+    elif [ "$hours" -gt 0 ]; then
+        vps_uptime="${hours}小时${minutes}分钟"
+    else
+        vps_uptime="${minutes}分钟"
+    fi
+else
+    vps_uptime=$(uptime -p 2>/dev/null | tr -d ' ' || echo "未知")
+fi
+
+
+
+# 一级菜单
+MAIN_MENU=(
+    "系统设置"
+    "网络代理"
+    "网络检测"
+    "Docker管理"
+    "应用商店"
+    "证书管理"
+    "系统管理"
+    "工具箱合集"
+    "玩具熊ʕ•ᴥ•ʔ"
+    "监控通知"
+    "备份恢复"
+    "更新卸载"
+)
+
+# 二级菜单（编号去掉前导零，显示时格式化为两位数）
+SUB_MENU[1]="1 更新系统|2 系统信息|3 修改root密码|4 root登录管理|5 修改SSH端口|6 修改时区|7 时间同步|8 切换v4V6|9 开放所有端口|10 更换系统源|11 DDdebian13|12 DDwindows10|13 NAT鸡重装系统|14 DD飞牛|15 修改语言|16 修改主机名|17 DNS优化|18 一键优化✨|19 VPS重启"
+SUB_MENU[2]="20 代理工具箱|21 FRP管理|22 BBRv3|23 CFWARP|24 BBR+TCP智能调参|25 Reality|26 Snell|27 Shadowsocks|28 自定义DNS解锁|29 DDNS动态域名|30 Hysteria2|31 3X-UI|32 Realm|33 SS-Xray-2go|34 vless-all-in-one✨|35 哆啦A梦转发面板|36 ShellCrash|37 easytier组网"
+SUB_MENU[3]="38 NodeQuality|39 融合怪测试|40 YABS测试|41 网络质量体检|42 IP质量体检|43 硬盘质量体检|44 三网延迟检测|45 简单回程测试|46 完整路由检测|47 流媒体解锁|48 三网测速|49 网络PING/DNS检测|50 检查25端口开放|51 网络工具箱"
+SUB_MENU[4]="52 Docker管理|53 DockerCompose管理|54 DockerCompose备份恢复|55 DockerCompose自动更新"
+SUB_MENU[5]="56 应用管理|57 面板管理|58 监控管理|59 宝塔面板|60 1Panel面板|61 独角数卡|62 小雅全家桶|63 qbittorrent"
+SUB_MENU[6]="64 NGINXV4反代✨|65 NGINXV6反代|66 Caddy反代|67 NginxProxyManager面板|68 acme申请证书|69 Lucky反代|70 证书备份与恢复"
+SUB_MENU[7]="71 系统清理|72 重装系统|73 系统组件|74 开发环境|75 添加SWAP|76 DNS管理|78 工作区管理|79 系统监控|80 防火墙管理|81 Fail2ban|82 定时任务"
+SUB_MENU[8]="83 科技lion工具箱|84 老王工具箱|85 酷雪云工具箱|86 甲骨文工具箱|87 开小鸡工具箱"
+SUB_MENU[9]="89 HermesAgent|90 OpenClaw|91 Akile优选DNS|92 自动机场签到|93 1panelapps管理|94 关闭哪吒监控SSH|95 AI检测|96 状态检测|97 卸载探针"
+SUB_MENU[10]="100 VPS信息通知|101 流量狗|102 VPS遥控器|103 TrafficCop流量监控|104 流量日报"
+SUB_MENU[11]="105 系统快照恢复|106 本地备份|107 Rsync同步|108 远程文件目录备份|109 Rclone备份|110 Croc文件传输|111 压缩文件|112 解压文件|113 删除文件"
+SUB_MENU[12]="77 自动更新|88 更新脚本|99 卸载脚本"
+
+# 显示一级菜单
+show_main_menu() {
     clear
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}          🐳 Docker 容器监控${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
+    # 上边框保留彩虹效果
+    rainbow_animate "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    # 获取并处理数据 (按内存排序)
-    docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" | sort -k3 -hr | while IFS=$'\t' read -r name cpu mem net; do
-        
-        # 1. 获取运行时间并深度汉化
-        local raw_status
-        raw_status=$(docker ps -a --filter "name=^/${name}$" --format "{{.Status}}")
-        
-        # 汉化引擎：包含时间、单位、状态
-        local uptime
-        uptime=$(echo "$raw_status" | \
-            sed 's/Up /运行 /' | \
-            sed 's/Exited/已停止/' | \
-            sed 's/(healthy)/(健康)/' | \
-            sed 's/(unhealthy)/(非健康)/' | \
-            sed 's/(starting)/(启动中)/' | \
-            sed 's/seconds/秒/' | \
-            sed 's/second/秒/' | \
-            sed 's/minutes/分钟/' | \
-            sed 's/minute/分钟/' | \
-            sed 's/hours/小时/' | \
-            sed 's/hour/小时/' | \
-            sed 's/days/天/' | \
-            sed 's/day/天/' | \
-            sed 's/weeks/周/' | \
-            sed 's/week/周/' | \
-            sed 's/months/月/' | \
-            sed 's/month/月/' | \
-            sed 's/about //' | \
-            sed 's/ago/前/')
-        
-        # 2. 新增：获取并格式化端口信息
-        local ports
-        ports=$(docker ps -a --filter "name=^/${name}$" --format "{{.Ports}}")
-        
-        # 如果端口为空，显示“无端口映射”；否则去掉 0.0.0.0: 或 ::: 以便手机端美观显示
-        if [ -z "$ports" ]; then
-            ports="无端口映射"
+    # 标题文字改为纯黄色
+    echo -e "${yellow}📦 VPS Toolbox工具箱${reset}${ORANGE}(快捷指令:M/m)${reset} ${yellow}📦${reset}"
+
+    # 下边框保留彩虹效果
+    rainbow_animate "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # 系统信息
+    show_system_usage
+
+
+    # 当前日期时间显示在框下、菜单上
+
+    # 终端宽度（可用不用）
+    term_width=$(tput cols 2>/dev/null || echo 80)
+
+    label_w=8  # 左侧标签宽度
+
+    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "💻" $label_w "系统" "$system_name"
+    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "🌍" $label_w "时区" "$timezone"
+    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "🧩" $label_w "架构" "$cpu"
+    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "🕒" $label_w "时间" "$datetime"
+    printf "${ORANGE}%s %-*s:${ORANGE} %s${re}\n" "🚀" $label_w "在线" "$vps_uptime"
+
+    # 绿色下划线
+    echo -e "${green}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${re}"
+
+    # 显示菜单
+    for i in "${!MAIN_MENU[@]}"; do
+        if [[ $i -eq 8 ]]; then  # 第9项（索引从0开始）
+            # 符号红色，数字和点绿色，文字黄色
+            printf "${red}▶${reset} ${green}%02d.${reset} ${yellow}%s${reset}\n" "$((i+1))" "${MAIN_MENU[i]}"
         else
-            # 将 "0.0.0.0:8080->80/tcp, :::8080->80/tcp" 简化为 "8080->80/tcp" 这样的干净格式
-            ports=$(echo "$ports" | sed 's/0.0.0.0://g' | sed 's/::://g' | sed 's/, /\n        │     /g')
+            # 其他项保持原来的颜色（符号红色，数字绿色，文字绿色）
+            printf "${red}▶${reset} ${green}%02d. %s${reset}\n" "$((i+1))" "${MAIN_MENU[i]}"
         fi
-
-        # 3. 手机端纵向块状输出
-        echo -e "${YELLOW}◈ 容器: ${RESET}${YELLOW}${name}${RESET}"
-        echo -e "  ├─ ${YELLOW}CPU 占用: ${RESET}${CPU_COLOR}${cpu}${RESET}"
-        echo -e "  ├─ ${YELLOW}内存使用: ${RESET}${mem}"
-        echo -e "  ├─ ${YELLOW}网络 I/O: ${RESET}${net}"
-        echo -e "  ├─ ${YELLOW}端口映射: ${RESET}${CYAN}${ports}${RESET}"
-        echo -e "  └─ ${YELLOW}运行状态: ${RESET}${YELLOW}${uptime}${RESET}"
-        echo -e "${YELLOW}----------------------------------------${RESET}"
     done
 }
 
-# -----------------------------
-# 主菜单显示状态
-# -----------------------------
-main_menu() {
-    root_use
+
+# 显示二级菜单并选择
+show_sub_menu() {
+    local idx="$1"
     while true; do
-        clear
-        echo -e "\033[36m"
-        echo "  ____             _             "
-        echo " |  _ \  ___   ___| | _____ _ __ "
-        echo " | | |/ _ \ / __| |/ / _ \ '__|"
-        echo " | |_| | (_) | (__|   <  __/ |   "
-        echo " |____/ \___/ \___|_|\_\___|_|   "
-        # 检测 Docker 状态
-        if command -v docker &>/dev/null; then
-            docker_status=$(docker info &>/dev/null && echo "运行中" || echo "未运行")
-            total=$(docker ps -a -q 2>/dev/null | wc -l)
-            running=$(docker ps -q 2>/dev/null | wc -l)
-            echo -e "${YELLOW}🐳| Docker: $docker_status | 总容器: $total | 运行中: $running${RESET}"
-        else
-            # Docker 未安装时只显示 iptables 状态
-            echo -e "${YELLOW}🐳 iptables: $(current_iptables)${RESET}"
+        IFS='|' read -ra options <<< "${SUB_MENU[idx]}"
+        local map=()
+        echo
+        for opt in "${options[@]}"; do
+            local num="${opt%% *}"
+            local name="${opt#* }"
+            printf "${red}▶${reset} ${yellow}%02d %s${reset}\n" "$num" "$name"
+            map+=("$num")
+        done
+        echo -ne "${red}请输入要执行的编号${ORANGE}(0返回/X退出)${ORANGE}:${reset}"
+        read -r choice
+
+        # X/x 直接退出脚本
+        if [[ "$choice" =~ ^[xX]$ ]]; then
+            exit 0
         fi
 
-        echo -e "${GREEN}01. 安装/更新 Docker${RESET}"
-        echo -e "${GREEN}02. 安装/更新 Docker Compose${RESET}"
-        echo -e "${GREEN}03. 卸载 Docker & Compose${RESET}"
-        echo -e "${GREEN}04. 容器管理${RESET}"
-        echo -e "${GREEN}05. 镜像管理${RESET}"
-        echo -e "${GREEN}06. 开启 IPv6${RESET}"
-        echo -e "${GREEN}07. 关闭 IPv6${RESET}"
-        echo -e "${GREEN}08. 开放所有端口${RESET}"
-        echo -e "${GREEN}09. 网络管理${RESET}"
-        echo -e "${GREEN}10. 切换 iptables-legacy${RESET}"
-        echo -e "${GREEN}11. 切换 iptables-nft${RESET}"
-        echo -e "${GREEN}12. Docker 备份/恢复${RESET}"
-        echo -e "${GREEN}13. 卷管理 ${RESET}"
-        echo -e "${GREEN}14.${RESET} ${YELLOW}一键清理所有未使用容器/镜像/卷${RESET}"
-        echo -e "${GREEN}15. 重启 Docker${RESET}"
-        echo -e "${GREEN}16. Docker监控${RESET}"
-        echo -e "${GREEN} 0. 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case $choice in
-            01|1) docker_install_update ;;
-            02|2) docker_compose_install_update ;;
-            03|3) docker_uninstall ;;
-            04|4) check_docker_running && docker_ps ;;
-            05|5) check_docker_running && docker_image ;;
-            06|6) check_docker_running && docker_ipv6_on ;;
-            07|7) check_docker_running && docker_ipv6_off ;;
-            08|8) open_all_ports ;;
-            09|9) check_docker_running && docker_network ;;
-            10) switch_iptables_legacy ;;
-            11) switch_iptables_nft ;;
-            12) check_docker_running && docker_backup_menu ;;
-            13|13) check_docker_running && docker_volume ;;
-            14|14) check_docker_running && docker_cleanup ;;
-            15|15) check_docker_running && restart_docker ;;
-            16|16) monitor_docker_containers ;;
-             00|0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+        # 按回车直接刷新菜单
+        if [[ -z "$choice" ]]; then
+            clear
+            continue
+        fi
+
+        # 输入 0 或 00 返回一级菜单
+        if [[ "$choice" == "0" || "$choice" == "00" ]]; then
+            return
+        fi
+
+        # 只允许数字输入
+        if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+            echo -e "${red}无效选项，请输入数字！${reset}"
+            sleep 1
+            clear
+            continue
+        fi
+
+        # 判断是否为有效选项
+        if [[ ! " ${map[*]} " =~ (^|[[:space:]])$choice($|[[:space:]]) ]]; then
+            echo -e "${red}无效选项${reset}"
+            sleep 1
+            clear
+            continue
+        fi
+
+        # 执行选项
+        execute_choice "$choice"
+
+        # 只有 0/99 才退出二级菜单，否则按回车刷新二级菜单
+        if [[ "$choice" != "0" && "$choice" != "99" ]]; then
+            read -rp $'\e[31m按回车刷新二级菜单...\e[0m' tmp
+            clear
+        else
+            break
+        fi
     done
 }
 
 
 
 
-# 启动脚本
-main_menu
+# 删除快捷指令
+remove_shortcut() {
+    if [[ $EUID -eq 0 ]]; then
+        rm -f "$SHORTCUT_PATH" "$SHORTCUT_PATH_UPPER"
+    else
+        sudo rm -f "$SHORTCUT_PATH" "$SHORTCUT_PATH_UPPER"
+    fi
+}
+
+# 执行菜单选项
+execute_choice() {
+    case "$1" in
+        1) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/update.sh) ;;
+        2) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/vpsinfo.sh) ;;
+        3) sudo passwd root ;;
+        4) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/SSHDLGL.sh) ;;
+        5) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/sshdk.sh) ;;
+        6) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/time.sh) ;;
+        7) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/systemdtimesyncd.sh) ;;
+        8) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/qhwl.sh) ;;
+        9) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/UFWFX.sh) ;;
+        10) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/huanyuan.sh) ;;
+        11) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Debian13.sh) ;;
+        12) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/window.sh) ;;
+        13) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/DDnat.sh) ;;
+        14) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/ddfnos.sh) ;;
+        15) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/xgyu.sh) ;;
+        16) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/home.sh) ;;
+        17) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Mosdnsxos.sh) ;;
+        18) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/vpsup.sh) ;;
+        19) sudo reboot ;;
+        20) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/proxy.sh) ;;
+        21) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/nuro-hia/nuro-frp/main/install.sh) ;;
+        22) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/BBRos.sh) ;;
+        23) wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh ;;
+        24) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/BBR.sh) ;;
+        25) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/VlessRealityos.sh) ;;
+        26) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Snellos.sh) ;;
+        27) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/SSRustos.sh) ;;
+        28) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/unlockdns.sh) ;;
+        29) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/DDNS.sh) ;;
+        30) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Hy2os.sh) ;;
+        31) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/3xuios.sh) ;;
+        32) wget -qO-${PROXY_PREFIX}https://raw.githubusercontent.com/zywe03/realm-xwPF/main/xwPF.sh | sudo bash -s install ;;
+        33) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh) ;;
+        34) wget -O vless-server.sh https://raw.githubusercontent.com/Zyx0rx/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh ;;
+        35) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/dlam.sh);;
+        36) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/ShellCrashx.sh);;
+        37) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/ceocok/c.cococ/refs/heads/main/easytier.sh) ;;
+        38) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/NodeQuality.sh) ;;
+        39) curl -L https://gitlab.com/spiritysdx/za/-/raw/main/ecs.sh -o ecs.sh && chmod +x ecs.sh && bash ecs.sh ;;
+        40) curl -sL https://yabs.sh | bash ;;
+        41) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/NetQuality.sh) ;;
+        42) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/IPQuality.sh) ;;
+        43) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/HardwareQuality.sh) ;;
+        44) bash <(curl -Ls https://Net.Check.Place) -P ;;
+        45) curl https://raw.githubusercontent.com/ludashi2020/backtrace/main/install.sh -sSf | sh ;;
+        46) bash <(curl -Ls https://Net.Check.Place) -R ;;
+        47) bash <(curl -L -s https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh) ;;
+        48) bash <(wget -qO- --no-check-certificate ${PROXY_PREFIX}/https://raw.githubusercontent.com/spiritLHLS/ecsspeed/main/script/ecsspeed-net.sh) ;;
+        49) bash <(wget -qO- https://raw.githubusercontent.com/Cd1s/network-latency-tester/main/latency.sh) ;;
+        50) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Telnet.sh) ;;
+        51) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Networktool.sh) ;; 
+        52) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Dockeros.sh) ;;
+        53) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/dockercompose.sh) ;;
+        54) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/Dockcompbauck.sh) ;;
+        55) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/dockerupdate.sh) ;;
+        56) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/Store.sh) ;;
+        57) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/panel.sh) ;;
+        58) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/jkgl.sh) ;;
+        59) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Baotax.sh) ;;
+        60) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/1Panelx.sh) ;;
+        61) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/dujiao-next/community-projects/main/scripts/langge-dujiao-next-install/dujiao-next-install.sh) ;;
+        62) bash -c "$(curl --insecure -fsSL https://ddsrem.com/xiaoya_install.sh)" ;;
+        63) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/qbittorrent.sh) ;;
+        64) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Nginxos.sh) ;;
+        65) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Nginx6os.sh) ;;
+        66) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Caddyos.sh) ;;
+        67) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/NginxProxy.sh) ;;
+        68) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Acmeos.sh) ;;
+        69) wget -O  /tmp/install.sh "http://release.66666.host/install.sh" && sh /tmp/install.sh ;;
+        70) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/SSLbackupos.sh) ;;
+        71) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/clearos.sh) ;;
+        72) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/reinstall.sh) ;;
+        73) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/package.sh) ;;
+        74) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/exploitation.sh) ;;
+        75) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/WARP.sh) ;;
+        76) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/DNSos.sh) ;;
+        78) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/tmux.sh) ;;
+        79) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/System.sh) ;;
+        80) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/firewallos.sh) ;;
+        81) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Fail2banos.sh) ;;
+        82) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/crontab.sh) ;;
+        83) bash <(curl -sL kejilion.sh) ;;
+        84) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/sshtool.sh) ;;
+        85) bash <(curl -sL https://cdn.kxy.ovh/kxy.sh) ;;
+        86) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/Oracle/oracle.sh) ;;
+        87) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/NAT.sh) ;;
+        89) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/kejilion/sh/main/hermes_manager.sh) ;;
+        90) bash <(curl -sL kejilion.sh) app openclaw ;;
+        91) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/AkileDNS.sh) ;;
+        92) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/JCQD.sh) ;;
+        93) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/1panelapps.sh) ;;
+        94) sed -i 's/disable_command_execute: false/disable_command_execute: true/' /opt/nezha/agent/config.yml && systemctl restart nezha-agent ;;
+		95) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/AI/AIcheck.sh) ;;
+        96) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/test.sh) ;;
+        97) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/unagent.sh) ;;
+        100) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/vpstg.sh) ;;
+        101) wget -O port-traffic-dog.sh ${PROXY_PREFIX}https://raw.githubusercontent.com/zywe03/realm-xwPF/main/port-traffic-dog.sh && chmod +x port-traffic-dog.sh && ./port-traffic-dog.sh ;;
+        102) curl -fsSL https://raw.githubusercontent.com/MEILOI/VPS_BOT_X/main/vps_bot-x/install.sh -o install.sh && chmod +x install.sh && bash install.sh ;;
+        103) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/traffic.sh) ;;
+        104) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/restore.sh) ;;
+        105) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/restore.sh) ;;
+        106) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/beifen.sh) ;;
+        107) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/Rrsync.sh) ;;
+        108) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/Filebackup.sh) ;;
+        109) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/rclone.sh) ;;
+        110) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Croc.sh) ;;
+        111) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/yasuo.sh) ;;
+        112) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/tarzip.sh) ;;
+        113) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/rmdocument.sh) ;;
+
+        #  自动更新脚本
+        77) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/tool/update.sh) ;; 
+        88)
+            echo -e "${yellow}正在更新脚本...${reset}"
+            # 下载最新版本覆盖本地脚本
+            curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/tool/vps-toolbox.sh -o "$INSTALL_PATH"
+            if [[ $? -ne 0 ]]; then
+                echo -e "${red}更新失败，请检查网络或GitHub地址${reset}"
+                return 1
+            fi
+            chmod +x "$INSTALL_PATH"
+            echo -e "${green}脚本已更新完成！${reset}"
+            # 重新执行最新脚本
+            exec bash "$INSTALL_PATH"
+            ;;
+
+        99) 
+            echo -e "${yellow}正在卸载工具箱...${reset}"
+
+            # 删除快捷指令
+            remove_shortcut
+ 
+            # 删除工具箱脚本
+            if [[ -f "$INSTALL_PATH" ]]; then
+            rm -f "$INSTALL_PATH"
+            echo -e "${green}工具箱脚本已删除${reset}"
+            fi
+            # 删除首次运行标记文件
+            MARK_FILE="$HOME/.vpstoolbox"
+            if [[ -f "$MARK_FILE" ]]; then
+            rm -f "$MARK_FILE"
+            fi
+           echo -e "${red}卸载完成！${reset}"
+           exit 0
+           ;;
+        0) exit 0 ;;
+        *) echo -e "${red}无效选项${reset}"; return 1 ;;
+    esac
+}
+
+
+# 主循环
+while true; do
+    show_main_menu
+    echo -ne "${red}请输入要执行的编号${ORANGE}(0退出)${ORANGE}:${reset} "
+    read -r main_choice
+
+    # X/x 直接退出脚本
+    if [[ "$main_choice" =~ ^[xX]$ ]]; then
+        exit 0
+    fi
+
+    # 按回车刷新菜单
+    if [[ -z "$main_choice" ]]; then
+        continue
+    fi
+
+    # 输入 0 退出
+    if [[ "$main_choice" == "0" ]]; then
+        exit 0
+    fi
+
+    # 只允许数字输入
+    if ! [[ "$main_choice" =~ ^[0-9]+$ ]]; then
+        echo -e "${red}无效选项，请输入数字！${reset}"
+        sleep 1
+        continue
+    fi
+
+    # 判断范围
+    if (( main_choice >= 1 && main_choice <= ${#MAIN_MENU[@]} )); then
+        show_sub_menu "$main_choice"
+    else
+        echo -e "${red}无效选项${reset}"
+        sleep 1
+    fi
+done

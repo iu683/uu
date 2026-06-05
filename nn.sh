@@ -1,274 +1,48 @@
 #!/bin/bash
-# ========================================
-# 哆啦A梦转发面板一键管理脚本 
-# ========================================
 
+# 颜色定义
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
+BLUE="\033[34m"
 RESET="\033[0m"
 
-APP_NAME="flux-panel"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+# 默认设置为国外
+IS_CN=false
 
-# 默认启用 IPv6
-ENABLE_IPV6=true
+# 尝试多接口获取国家代码 (CN)，限时 3 秒防止卡死
+COUNTRY=$(curl -s --max-time 3 https://ip.sb/country_code 2>/dev/null || \
+          curl -s --max-time 3 https://ipapi.co/country 2>/dev/null || \
+          curl -s --max-time 3 http://ip-api.com/json/ | grep -o '"countryCode":"[^"]*' | cut -d'"' -f4)
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
-}
-
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
-
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
-}
-
-
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}=== 哆啦A梦转发面板 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
-install_app() {
-    check_docker
-    mkdir -p "$APP_DIR"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-
-    read -p "请输入 MySQL 数据库名 [默认:gost]: " input_db
-    DB_NAME=${input_db:-gost}
-
-    read -p "请输入 MySQL 用户名 [默认:gost]: " input_user
-    DB_USER=${input_user:-gost}
-
-    read -p "请输入 MySQL 密码 [默认:123456]: " input_pass
-    DB_PASSWORD=${input_pass:-123456}
-
-    read -p "请输入后端端口 [默认:6365]: " input_backend
-    BACKEND_PORT=${input_backend:-6365}
-    check_port "$BACKEND_PORT" || return
-
-    read -p "请输入前端端口 [默认:6366]: " input_front
-    FRONTEND_PORT=${input_front:-6366}
-    check_port "$FRONTEND_PORT" || return
-
-    read -p "请输入 JWT 密钥 [随机生成可直接回车]: " input_jwt
-    JWT_SECRET=${input_jwt:-$(openssl rand -hex 16)}
-
-    # IPv6 设置
-    read -p "是否启用 Docker IPv6 网络? [Y/n] (默认开启): " ipv6_input
-    if [[ "$ipv6_input" =~ ^[Nn]$ ]]; then
-        ENABLE_IPV6=false
-    fi
-
-    # 生成 docker-compose.yml
-    cat > "$COMPOSE_FILE" <<EOF
-
-services:
-  mysql:
-    image: mysql:5.7
-    container_name: gost-mysql
-    restart: unless-stopped
-    environment:
-      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
-      MYSQL_DATABASE: ${DB_NAME}
-      MYSQL_USER: ${DB_USER}
-      MYSQL_PASSWORD: ${DB_PASSWORD}
-      TZ: Asia/Shanghai
-    volumes:
-      - mysql_data:/var/lib/mysql
-      - ./gost.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    command: >
-      --default-authentication-plugin=mysql_native_password
-      --character-set-server=utf8mb4
-      --collation-server=utf8mb4_unicode_ci
-      --max_connections=1000
-      --innodb_buffer_pool_size=256M
-    networks:
-      - gost-network
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      timeout: 10s
-      retries: 10
-
-  backend:
-    image: bqlpfy/springboot-backend:1.4.3
-    container_name: springboot-backend
-    restart: unless-stopped
-    environment:
-      DB_HOST: mysql
-      DB_NAME: ${DB_NAME}
-      DB_USER: ${DB_USER}
-      DB_PASSWORD: ${DB_PASSWORD}
-      JWT_SECRET: ${JWT_SECRET}
-      LOG_DIR: /app/logs
-      JAVA_OPTS: "-Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai"
-    ports:
-      - "${BACKEND_PORT}:6365"
-    volumes:
-      - backend_logs:/app/logs
-    depends_on:
-      mysql:
-        condition: service_healthy
-    networks:
-      - gost-network
-    healthcheck:
-      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:6365/flow/test || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 90s
-
-  frontend:
-    image: bqlpfy/vite-frontend:1.4.3
-    container_name: vite-frontend
-    restart: unless-stopped
-    ports:
-      - "${FRONTEND_PORT}:80"
-    depends_on:
-      backend:
-        condition: service_healthy
-    networks:
-      - gost-network
-
-volumes:
-  mysql_data:
-    name: mysql_data
-    driver: local
-  backend_logs:
-    name: backend_logs
-    driver: local
-EOF
-
-# 添加 IPv6 网络
-if [ "$ENABLE_IPV6" = true ]; then
-cat >> "$COMPOSE_FILE" <<EOF
-
-networks:
-  gost-network:
-    name: gost-network
-    driver: bridge
-    enable_ipv6: true
-    ipam:
-      config:
-        - subnet: 172.20.0.0/16
-        - subnet: fd00:dead:beef::/48
-EOF
-else
-cat >> "$COMPOSE_FILE" <<EOF
-
-networks:
-  gost-network:
-    name: gost-network
-    driver: bridge
-EOF
+if [ "$COUNTRY" = "CN" ]; then
+    IS_CN=true
 fi
 
-    cd "$APP_DIR" || exit
-    docker compose up -d
+# 根据地理位置执行对应的安装命令
+if [ "$IS_CN" = true ]; then
+    echo -e "${YELLOW}[CN] 检测到当前服务器位于中国大陆，正在使用国内加速源...${RESET}"
+    
+    # 确保系统安装了 wget
+    if ! command -v wget &> /dev/null; then
+        if command -v apk &> /dev/null; then apk add wget >/dev/null
+        elif command -v apt-get &> /dev/null; then apt-get update && apt-get install -y wget >/dev/null
+        elif command -v yum &> /dev/null; then yum install -y wget >/dev/null
+        fi
+    fi
 
-    SERVER_IP=$(get_public_ip)
+    # 执行国内加速安装
+    wget -N https://gitlab.com/dabao/nodequality-proxy/-/raw/main/nodequality-proxy.sh && bash nodequality-proxy.sh ghproxy
+else
+    echo -e "${GREEN}[GLOBAL] 检测到海外服务器${RESET}"
+    
+    # 确保系统安装了 curl
+    if ! command -v curl &> /dev/null; then
+        if command -v apk &> /dev/null; then apk add curl >/dev/null
+        elif command -v apt-get &> /dev/null; then apt-get update && apt-get install -y curl >/dev/null
+        elif command -v yum &> /dev/null; then yum install -y curl >/dev/null
+        fi
+    fi
 
-    echo
-    echo -e "${GREEN}✅ 哆啦A梦转发面板 已启动${RESET}"
-    echo -e "${YELLOW}🌐 后端访问: http://${SERVER_IP}:${BACKEND_PORT}${RESET}"
-    echo -e "${YELLOW}🌐 前端访问: http://${SERVER_IP}:${FRONTEND_PORT}${RESET}"
-    echo -e "${YELLOW}🌐 默认账号: admin_user${RESET}"
-    echo -e "${YELLOW}🌐 默认密码: admin_user${RESET}"
-    echo -e "${GREEN}🌐 IPv6 已启用: $ENABLE_IPV6${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ 哆啦A梦转发面板 更新完成${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-restart_app() {
-    docker restart gost-mysql springboot-backend vite-frontend
-    echo -e "${GREEN}✅ 哆啦A梦转发面板 已重启${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-    echo -e "${GREEN}选择容器查看日志:${RESET}"
-    echo "1) MySQL"
-    echo "2) Backend"
-    echo "3) Frontend"
-    read -p "选择: " c
-    case $c in
-        1) docker logs -f gost-mysql ;;
-        2) docker logs -f springboot-backend ;;
-        3) docker logs -f vite-frontend ;;
-        *) echo -e "${RED}无效选择${RESET}" ;;
-    esac
-}
-
-check_status() {
-    docker ps | grep -E "gost-mysql|springboot-backend|vite-frontend"
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅  哆啦A梦转发面板 已彻底卸载${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-menu
+    # 执行官方安装
+    bash <(curl -sL https://run.NodeQuality.com)
+fi

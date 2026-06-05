@@ -1,191 +1,254 @@
 #!/bin/sh
-# OpenRC 自启动服务管理脚本 (Alpine Linux 专属适配版)
-# 支持关键词过滤，停止/禁用后自动刷新，输入 r 手动刷新，状态查看可回车返回，分页显示
+set -e
 
-# ================== 颜色定义 ==================
-RED="\033[31m"
 GREEN="\033[32m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-BOLD="\033[1m"
+RED="\033[31m"
 RESET="\033[0m"
+YELLOW="\033[33m"
 
-# ================== 配置 ==================
-PAGE_SIZE=20   # 每页显示多少条
-CURRENT_PAGE=1
-TMP_MATRIX="/tmp/openrc_matrix.$$"
+# =========================================================
+# 动态获取 Fail2Ban 的状态、版本、监听端口与拦截数据
+# =========================================================
+get_fail2ban_status() {
+    # 1. 检查运行状态 (Alpine OpenRC)
+    if rc-service fail2ban status 2>/dev/null | grep -q "started"; then
+        STATUS="${YELLOW}已运行${RESET}"
+    else
+        STATUS="${RED}未运行${RESET}"
+    fi
+    
+    # 2. 获取版本号
+    if command -v fail2ban-client >/dev/null 2>&1; then
+        VERSION_SHOW=$(fail2ban-client --version | head -n 1 | awk '{print $2}')
+    else
+        VERSION_SHOW="未安装"
+    fi
+    
+    # 3. 动态获取 SSH 监听端口（支持多端口，如 22,2222）
+    if [ -f /etc/fail2ban/jail.d/sshd.local ]; then
+        # 提取 port = 后的所有内容，去掉空格和可能存在的注释
+        local port_check=$(sed -n 's/^[[:space:]]*port[[:space:]]*=[[:space:]]*\([^#]*\)/\1/p' /etc/fail2ban/jail.d/sshd.local | head -n 1 | tr -d '[:space:]')
+        PORT_SHOW=${port_check:-22}
+    else
+        PORT_SHOW="未知"
+    fi
+    
+    # 4. 统计当前拦截的 IP 总数
+    if rc-service fail2ban status 2>/dev/null | grep -q "started" && command -v fail2ban-client >/dev/null 2>&1; then
+        local jails=$(fail2ban-client status | grep "Jail list:" | sed 's/.*Jail list://' | tr ',' ' ')
+        local total_banned=0
+        for jail in $jails; do
+            local count=$(fail2ban-client status "$jail" | grep "Currently banned:" | awk '{print $4}')
+            total_banned=$((total_banned + count))
+        done
+        SITE_COUNT=$total_banned
+    else
+        SITE_COUNT=0
+    fi
+}
 
-# ================== 权限自动侦测 ==================
-SUDO=""
-if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
-    SUDO="sudo"
-fi
+# =========================================================
+# Fail2Ban 功能核心函数 (Alpine 适配)
+# =========================================================
+check_fail2ban() {
+    if ! rc-service fail2ban status 2>/dev/null | grep -q "started"; then
+        echo -e "${GREEN}Fail2Ban 未运行，正在启动...${RESET}"
+        rc-update add fail2ban default
+        rc-service fail2ban start
+        sleep 1
+    fi
+}
 
-# ================== 用户输入关键词 ==================
-printf "${GREEN}请输入关键词过滤（默认显示所有服务）: ${RESET}"
-read -r KEYWORD
+install_fail2ban() {
+    echo -e "${GREEN}正在 Alpine 上安装 Fail2Ban...${RESET}"
+    apk update
+    # 确保防火墙和基础组件就绪
+    apk add fail2ban curl wget iptables ip6tables
+    
+    rc-update add fail2ban default
+    rc-service fail2ban start
+    sleep 1
+}
 
-# ================== 生成完整服务列表 (OpenRC 适配) ==================
-generate_full_list() {
-    rm -f "$TMP_MATRIX"
-    idx=1
+update_fail2ban() {
+    if ! command -v fail2ban-client >/dev/null 2>&1; then
+        echo -e "${RED}Fail2Ban 未安装，无法更新，请先选择选项 1 进行安装${RESET}"
+        return
+    fi
+    
+    echo -e "${GREEN}正在更新 Fail2Ban...${RESET}"
+    apk update
+    apk add --upgrade fail2ban
+    
+    rc-service fail2ban restart
+    echo -e "${GREEN}Fail2Ban 更新并重启完成${RESET}"
+}
 
-    # 1. 获取所有可用的服务名
-    # 2. 交叉匹配 rc-update 查看其自启动级别 (boot, default, sysinit 等)
-    # 3. 交叉匹配 rc-status 查看当前运行状态 (started, stopped)
-    for service_path in /etc/init.d/*; do
-        [ ! -f "$service_path" ] && continue
-        service=$(basename "$service_path")
+# 核心修改：为 Alpine Linux 专门定制生成的防御配置
+configure_ssh() {
+    # Alpine 的标准日志路径
+    LOG_PATH="/var/log/messages"
+
+    echo -ne "${GREEN}请输入 SSH 端口（默认22）: ${RESET}"
+    read -r SSH_PORT
+    SSH_PORT=${SSH_PORT:-22}
+
+    echo -ne "${GREEN}请输入最大失败尝试次数 maxretry（默认5）: ${RESET}"
+    read -r MAX_RETRY
+    MAX_RETRY=${MAX_RETRY:-5}
+
+    echo -ne "${GREEN}请输入封禁时间 bantime(秒，默认600) : ${RESET}"
+    read -r BAN_TIME
+    BAN_TIME=${BAN_TIME:-600}
+
+    # 创建专属配置目录
+    mkdir -p /etc/fail2ban/jail.d
+
+    # 专门为 Alpine 优化的本地配置
+    # 1. 明确使用 iptables 动作（Alpine 经典后端）
+    # 2. 指定 logpath 为 Alpine 的通用消息日志
+    # 3. 针对 Alpine 的 OpenSSH / Dropbear 后端设置基础检测
+    cat > /etc/fail2ban/jail.d/sshd.local <<EOF
+[sshd]
+enabled = true
+port = $SSH_PORT
+filter = sshd
+backend = polling
+logpath = $LOG_PATH
+maxretry = $MAX_RETRY
+bantime  = $BAN_TIME
+banaction = iptables-multiport
+purpleaction = 
+EOF
+
+    echo -e "${GREEN}正在应用专属配置并重启服务...${RESET}"
+    rc-service fail2ban restart
+    sleep 1
+    echo -e "${GREEN}Alpine 专属 SSH 防暴力破解配置完成！${RESET}"
+}
+
+uninstall_fail2ban() {
+    echo -e "${GREEN}正在卸载 Fail2Ban...${RESET}"
+    rc-service fail2ban stop || true
+    rc-update del fail2ban default || true
+    rm -f /etc/fail2ban/jail.d/sshd.local
+    apk del fail2ban
+    echo -e "${GREEN}Fail2Ban 已从系统完全卸载${RESET}"
+}
+
+# =========================================================
+# Fail2Ban 管理面板 (Alpine 专属风格)
+# =========================================================
+fail2ban_menu() {
+    while true; do
+        get_fail2ban_status
+
+        clear
+        echo -e "${GREEN}===============================${RESET}"
+        echo -e "${GREEN} ◈   SSH 防暴力破解管理面板  ◈ ${RESET}"
+        echo -e "${GREEN}===============================${RESET}"
+        echo -e "${GREEN} 状态  : ${STATUS}"
+        echo -e "${GREEN} 版本  : ${YELLOW}${VERSION_SHOW}${RESET}"
+        echo -e "${GREEN} 端口  : ${YELLOW}${PORT_SHOW}${RESET}"
+        echo -e "${GREEN} 封禁  : ${YELLOW}${SITE_COUNT} 个 IP${RESET}"
+        echo -e "${GREEN}===============================${RESET}"
+        echo -e "${GREEN}  1. 安装开启SSH防护${RESET}"
+        echo -e "${GREEN}  2. 关闭SSH防护功能${RESET}"
+        echo -e "${GREEN}  3. 配置SSH防护参数${RESET}"
+        echo -e "${GREEN}  4. 查看SSH拦截记录${RESET}"
+        echo -e "${GREEN}  5. 查看当前防御规则列表${RESET}"
+        echo -e "${GREEN}  6. 查看日志实时监控${RESET}"
+        echo -e "${GREEN}  7. 卸载 Fail2Ban${RESET}"
+        echo -e "${GREEN}  8. 更新 Fail2Ban${RESET}"
+        echo -e "${GREEN}  0. 退出面板${RESET}"
+        echo -e "${GREEN}===============================${RESET}"
+        echo -ne "${GREEN} 请选择: ${RESET}"
         
-        # 排除系统内置函数引导项
-        [ "$service" = "functions.sh" ] && continue
+        read -r choice </dev/tty
 
-        # 获取简短描述 (提取 OpenRC 脚本中的 description 变量)
-        desc=$(grep -E '^[[:space:]]*description=' "$service_path" | cut -d'"' -f2 | cut -d"'" -f2 | head -n 1)
-        [ -z "$desc" ] && desc="无描述信息"
-
-        # 关键词双向过滤
-        if [ -n "$KEYWORD" ]; then
-            if ! echo "$service" | grep -q "$KEYWORD" && ! echo "$desc" | grep -q "$KEYWORD"; then
-                continue
-            fi
-        fi
-
-        # 判定自启动状态 (Enabled / Disabled)
-        # 如果在 rc-update 的任何运行级别里能抓到，则视为启用了自启动
-        if rc-update show 2>/dev/null | grep -Eq "^[[:space:]]*$service[[:space:]]*\|"; then
-            run_levels=$(rc-update show 2>/dev/null | grep "^[[:space:]]*$service[[:space:]]*|" | awk -F'|' '{print $2}' | xargs)
-            state="enabled(${run_levels})"
-            state_color="${GREEN}${state}${RESET}"
-        else
-            state="disabled"
-            state_color="${YELLOW}${state}${RESET}"
-        fi
-
-        # 判定当前活跃状态 (Started / Stopped)
-        if rc-service "$service" status 2>/dev/null | grep -q "status: started"; then
-            act_status="started"
-            act_color="${GREEN}started${RESET}"
-        else
-            act_status="stopped"
-            act_color="${RED}stopped${RESET}"
-        fi
-
-        # 格式化写入纯文本持久化矩阵
-        echo "${idx}:${service}:${state_color}:${act_color}:${desc}:${state}:${act_status}" >> "$TMP_MATRIX"
-        idx=$((idx + 1))
+        case $choice in
+            1)
+                if ! command -v fail2ban-client >/dev/null 2>&1; then
+                    install_fail2ban
+                else
+                    rc-update add fail2ban default
+                    rc-service fail2ban start
+                fi
+                configure_ssh
+                ;;
+            2)
+                check_fail2ban
+                if [ -f /etc/fail2ban/jail.d/sshd.local ]; then
+                    sed -i '/enabled/s/true/false/' /etc/fail2ban/jail.d/sshd.local
+                    rc-service fail2ban restart
+                    sleep 1
+                    echo -e "${GREEN}SSH 防暴力破解已关闭${RESET}"
+                else
+                    echo -e "${RED}SSH 配置文件不存在，请先安装并开启 SSH 防护${RESET}"
+                fi
+                echo -ne "${GREEN}按回车返回菜单...${RESET}"; read -r
+                ;;
+            3)
+                check_fail2ban
+                if [ -f /etc/fail2ban/jail.d/sshd.local ]; then
+                    configure_ssh
+                else
+                    echo -e "${RED}SSH 配置文件不存在，请先安装并开启 SSH 防护${RESET}"
+                fi
+                echo -ne "${GREEN}按回车返回菜单...${RESET}"; read -r
+                ;;
+            4)
+                check_fail2ban
+                echo -e "${GREEN}当前被封禁的 IP 列表:${RESET}"
+                BANNED=$(fail2ban-client status sshd | grep 'Banned IP list' | cut -d: -f2)
+                if [ -z "$BANNED" ]; then
+                    echo -e "${GREEN}无${RESET}"
+                else
+                    echo -e "${GREEN}$BANNED${RESET}"
+                fi
+                echo -e "${GREEN}✅ 状态显示完成${RESET}"
+                echo -ne "${GREEN}按回车返回菜单...${RESET}"; read -r
+                ;;
+            5)
+                check_fail2ban
+                echo -e "${GREEN}当前防御规则列表:${RESET}"
+                JAILS=$(fail2ban-client status | grep 'Jail list' | cut -d: -f2)
+                if [ -z "$JAILS" ]; then
+                    echo -e "${GREEN}无${RESET}"
+                else
+                    echo -e "${GREEN}$JAILS${RESET}"
+                fi
+                echo -e "${GREEN}✅ 状态显示完成${RESET}"
+                echo -ne "${GREEN}按回车返回菜单...${RESET}"; read -r
+                ;;
+            6)
+                check_fail2ban
+                echo -e "${GREEN}进入日志实时监控，按 Ctrl+C 返回菜单${RESET}"
+                trap 'echo -e "\n${GREEN}已退出日志监控，返回菜单${RESET}"' INT
+                tail -n 20 -f /var/log/fail2ban.log || true
+                trap - INT
+                echo -ne "${GREEN}按回车继续...${RESET}"; read -r
+                ;;
+            7)
+                uninstall_fail2ban
+                break
+                ;;
+            11)
+                update_fail2ban
+                echo -ne "${GREEN}按回车返回菜单...${RESET}"; read -r
+                ;;
+            0)
+                break
+                ;;
+            *)
+                echo -e "${RED}无效的选择，请重新输入${RESET}"
+                sleep 1
+                ;;
+        esac
     done
 }
 
-# ================== 刷新并显示某一页 ==================
-refresh_list() {
-    clear
-    if [ ! -s "$TMP_MATRIX" ]; then
-        TOTAL_COUNT=0
-        TOTAL_PAGES=1
-    else
-        TOTAL_COUNT=$(wc -l < "$TMP_MATRIX")
-        TOTAL_PAGES=$(( (TOTAL_COUNT + PAGE_SIZE - 1) / PAGE_SIZE ))
-    fi
-
-    echo -e "${BOLD}${CYAN}=== OpenRC 服务列表（第 $CURRENT_PAGE 页 / 共 ${TOTAL_PAGES} 页，总计 ${TOTAL_COUNT} 个服务） ===${RESET}"
-    printf "${BOLD}%-5s %-25s %-22s %-18s %s${RESET}\n" "No." "SERVICE" "AUTO-START" "STATUS" "DESCRIPTION"
-    echo "--------------------------------------------------------------------------------------------------------"
-
-    if [ "$TOTAL_COUNT" -gt 0 ]; then
-        start_line=$(( (CURRENT_PAGE - 1) * PAGE_SIZE + 1 ))
-        end_line=$(( CURRENT_PAGE * PAGE_SIZE ))
-
-        # 极其精准安全的流式分页截取
-        sed -n "${start_line},${end_line}p" "$TMP_MATRIX" | awk -F':' '
-        {
-            printf "%-5s %-25s %-32s %-28s %s\n", $1, $2, $3, $4, $5
-        }'
-    else
-        echo -e "       ${YELLOW}没有找到匹配的服务${RESET}"
-    fi
-}
-
-# ================== 初始化 ==================
-generate_full_list
-refresh_list
-
-# ================== 用户选择操作 ==================
-while true; do
-    echo
-    printf "${GREEN}输入序号看详情，s 序号停用+禁用，r 刷新，n 下一页，p 上一页，0 退出: ${RESET}"
-    read -r INPUT
-
-    if [ "$INPUT" = "0" ] || [ -z "$INPUT" ]; then
-        break
-
-    elif [ "$INPUT" = "r" ]; then
-        generate_full_list
-        refresh_list
-
-    elif [ "$INPUT" = "n" ]; then
-        TOTAL_COUNT=$(wc -l < "$TMP_MATRIX" 2>/dev/null || echo 0)
-        max_page=$(( (TOTAL_COUNT + PAGE_SIZE - 1) / PAGE_SIZE ))
-        if [ "$CURRENT_PAGE" -lt "$max_page" ]; then
-            CURRENT_PAGE=$((CURRENT_PAGE + 1))
-        fi
-        refresh_list
-
-    elif [ "$INPUT" = "p" ]; then
-        if [ "$CURRENT_PAGE" -gt 1 ]; then
-            CURRENT_PAGE=$((CURRENT_PAGE - 1))
-        fi
-        refresh_list
-
-    # 匹配输入形式如 "s 3" 或 "s 3 4 5" 停止并禁用
-    elif echo "$INPUT" | grep -Eq "^s[[:space:]]*[0-9 ]+$"; then
-        NUMS=$(echo "$INPUT" | sed 's/^s[[:space:]]*//')
-        for num in $NUMS; do
-            line_data=$(grep -E "^${num}:" "$TMP_MATRIX" 2>/dev/null)
-            if [ -n "$line_data" ]; then
-                service=$(echo "$line_data" | cut -d':' -f2)
-                
-                echo -e "\n${CYAN}正在处理服务: $service ...${RESET}"
-                # 1. 停止服务
-                $SUDO rc-service "$service" stop
-                
-                # 2. 禁用自启动 (从所有级别中移除)
-                # OpenRC 移除自启动用 rc-update del 服务名
-                if rc-update show | grep -q "$service"; then
-                    if $SUDO rc-update del "$service" >/dev/null 2>&1; then
-                        echo -e "${RED}[已禁用自启] $service${RESET}"
-                    else
-                        echo -e "${YELLOW}[禁用自启失败] $service${RESET}"
-                    fi
-                fi
-            else
-                echo -e "${YELLOW}无效序号: $num${RESET}"
-            fi
-        done
-        # 操作完成后自动重新装载刷新
-        generate_full_list
-        refresh_list
-
-    # 纯数字：查看服务状态详情
-    elif echo "$INPUT" | grep -Eq "^[0-9]+$"; then
-        line_data=$(grep -E "^${INPUT}:" "$TMP_MATRIX" 2>/dev/null)
-        if [ -n "$line_data" ]; then
-            service=$(echo "$line_data" | cut -d':' -f2)
-            echo -e "\n${CYAN}=== $service 详细运行状态 ===${RESET}"
-            
-            # OpenRC 查看详细状态
-            rc-service "$service" status
-            
-            echo -e "\n${YELLOW}按回车返回菜单...${RESET}"
-            read -r _
-            refresh_list
-        else
-            echo -e "${YELLOW}无效序号: $INPUT${RESET}"
-        fi
-    else
-        echo -e "${YELLOW}无效输入，请重新输入${RESET}"
-    fi
-done
-
-# 清理痕迹
-rm -f "$TMP_MATRIX"
+# =========================================================
+# 执行主逻辑
+# =========================================================
+fail2ban_menu

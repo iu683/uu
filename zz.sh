@@ -1,365 +1,402 @@
 #!/bin/bash
-# ==================================================
-# VPS Geo Firewall (IPv4+IPv6)
-# Debian / Ubuntu / Alpine Linux (完美适配)
-# 独立链 / 端口控制 / 自动更新 / 白名单 / 卸载
-# ==================================================
-
-CONF="/opt/geoip/geo.conf"
-UPDATE_SCRIPT="/opt/geoip/update_geo.sh"
-SCRIPT_PATH="/usr/local/bin/geofirewall"
-SCRIPT_URL=" https://raw.githubusercontent.com/iu683/uu/main/zz.sh"
 
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
-BLUE="\033[34m"
 RESET="\033[0m"
 
-green(){ echo -e "${GREEN}$1${RESET}"; }
-red(){ echo -e "${RED}$1${RESET}"; }
+CONFIG="/etc/ssh/sshd_config"
+BACKUP="/etc/ssh/sshd_config.bak"
 
-[[ $(id -u) != 0 ]] && red "请使用 root 运行" && exit 1
-
-# 检测系统类型
+# 判断是否为 Alpine 系统
+IS_ALPINE=false
 if [ -f /etc/alpine-release ]; then
-    SYS_TYPE="alpine"
-else
-    SYS_TYPE="debian"
+    IS_ALPINE=true
 fi
 
-# ================== 初始化环境 ==================
-init_env(){
-    mkdir -p /opt/geoip
-    touch $CONF
+#################################
+#安全修改 SSH 配置
+#################################
+modify_ssh_config() {
+    local key=$1
+    local value=$2
 
-    if [[ ! -f /opt/geoip/.deps_installed ]]; then
-        if [ "$SYS_TYPE" = "alpine" ]; then
-            apk update
-            apk add ipset iptables ip6tables curl bash ipset-openrc iptables-openrc
-            rc-update add iptables default 2>/dev/null
-            rc-update add ip6tables default 2>/dev/null
-            rc-service iptables start 2>/dev/null
-            rc-service ip6tables start 2>/dev/null
-        else
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update
-            apt-get install -y ipset iptables curl iptables-persistent netfilter-persistent
-        fi
-        touch /opt/geoip/.deps_installed
-        green "依赖安装完成"
-    fi
-}
+    # 1. 备份主配置
+    [ -f "$CONFIG" ] && [ ! -f "$BACKUP" ] && cp "$CONFIG" "$BACKUP"
 
-# ================== 下载或更新脚本 ==================
-download_script(){
-    mkdir -p "$(dirname "$SCRIPT_PATH")"
-    curl -sSL "$SCRIPT_URL" -o "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
-    green "已更新"
-}
-
-# ================== 获取信息 (兼容 Alpine) ==================
-get_my_ip(){ 
-    ip route get 1.1.1.1 2>/dev/null | awk '{print $7}' | head -n1
-}
-
-get_ssh_port(){
-    grep -i "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1
-}
-
-# ================== 规则持久化保存函数 ==================
-save_rules(){
-    if [ "$SYS_TYPE" = "alpine" ]; then
-        /etc/init.d/iptables save >/dev/null 2>&1
-        /etc/init.d/ip6tables save >/dev/null 2>&1
+    # 2. 修改主配置文件
+    if grep -q -i "^[# ]*${key}" "$CONFIG"; then
+        sed -i "s|^[# ]*${key}.*|${key} ${value}|g" "$CONFIG"
     else
-        netfilter-persistent save >/dev/null 2>&1
+        echo "${key} ${value}" >> "$CONFIG"
+    fi
+
+    # 3. 注释掉子配置文件（sshd_config.d/*.conf）中的冲突项，确保主配置绝对生效
+    if [ -d "/etc/ssh/sshd_config.d" ]; then
+        for sub_conf in /etc/ssh/sshd_config.d/*.conf; do
+            if [ -f "$sub_conf" ]; then
+                sed -i "s|^[ ]*${key}|#&|g" "$sub_conf" 2>/dev/null
+            fi
+        done
     fi
 }
 
-# ================== 自动更新IP库 ==================
-install_auto_update(){
-cat > $UPDATE_SCRIPT <<EOF
-#!/bin/bash
-CONF="/opt/geoip/geo.conf"
-source \$CONF 2>/dev/null
-[[ -z "\$COUNTRY" ]] && exit 0
-CC_L=\$(echo \$COUNTRY | tr A-Z a-z)
-curl -s -o /opt/geoip/\${CC_L}.zone https://www.ipdeny.com/ipblocks/data/countries/\${CC_L}.zone
-curl -s -o /opt/geoip/\${CC_L}.ipv6.zone https://www.ipdeny.com/ipv6/ipaddresses/aggregated/\${CC_L}-aggregated.zone
-EOF
-
-    chmod +x $UPDATE_SCRIPT
-    (crontab -l 2>/dev/null | grep -v update_geo.sh; echo "0 3 * * * /bin/bash $UPDATE_SCRIPT") | crontab -
-    green "每日 03:00 自动更新IP库"
-}
-
-# ================== 原子更新 ipset ==================
-update_ipset(){
-    local SET_NAME=$1
-    local FILE=$2
-    local FAMILY=$3
-
-    [[ ! -s "$FILE" ]] && { red "IP库文件为空 $SET_NAME"; return 1; }
-
-    ipset create $SET_NAME hash:net family $FAMILY -exist
-    ipset create ${SET_NAME}_tmp hash:net family $FAMILY -exist
-    ipset flush ${SET_NAME}_tmp
-
-    while read -r ip; do
-        [[ -n "$ip" ]] && ipset add ${SET_NAME}_tmp "$ip" 2>/dev/null
-    done < "$FILE"
-
-    ipset swap ${SET_NAME}_tmp $SET_NAME
-    ipset destroy ${SET_NAME}_tmp
-    return 0
-}
-
-# ================== 应用规则 ==================
-apply_rules(){
-    source $CONF 2>/dev/null
-    [[ -z "$COUNTRY" ]] && { red "未配置规则"; return; }
-
-    SSH_PORT=$(get_ssh_port)
-    [[ -z "$SSH_PORT" ]] && SSH_PORT=22
-    green "默认放行SSH端口: $SSH_PORT"
-
-    # 创建 GEO_CHAIN 链
-    iptables -N GEO_CHAIN 2>/dev/null
-    ip6tables -N GEO_CHAIN 2>/dev/null
-    iptables -F GEO_CHAIN
-    ip6tables -F GEO_CHAIN
-
-    # INPUT 链跳转
-    iptables -C INPUT -j GEO_CHAIN 2>/dev/null || iptables -I INPUT -j GEO_CHAIN
-    ip6tables -C INPUT -j GEO_CHAIN 2>/dev/null || ip6tables -I INPUT -j GEO_CHAIN
-
-    # 基础规则
-    iptables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    ip6tables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-    MYIP=$(get_my_ip)
-    [[ -n "$MYIP" ]] && iptables -A GEO_CHAIN -s $MYIP -j ACCEPT
-
-    iptables -A GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
-    ip6tables -A GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
-
-    # 白名单
-    for ip in $WHITELIST; do
-        [[ -n "$ip" ]] && {
-            iptables -I GEO_CHAIN 2 -s $ip -j ACCEPT
-            ip6tables -I GEO_CHAIN 2 -s $ip -j ACCEPT
-        }
-    done
-
-    CC_L=$(echo $COUNTRY | tr A-Z a-z)
-    V4FILE="/opt/geoip/${CC_L}.zone"
-    V6FILE="/opt/geoip/${CC_L}.ipv6.zone"
-
-    curl -s -o $V4FILE https://www.ipdeny.com/ipblocks/data/countries/$CC_L.zone
-    curl -s -o $V6FILE https://www.ipdeny.com/ipv6/ipaddresses/aggregated/$CC_L-aggregated.zone
-
-    update_ipset geo_v4 $V4FILE inet
-    update_ipset geo_v6 $V6FILE inet6
-
-    # 封锁/允许规则
-    for proto in tcp udp; do
-        if [[ "$MODE" == "block" ]]; then
-            if [[ "$PORTS" == "all" ]]; then
-                iptables -A GEO_CHAIN -p $proto -m set --match-set geo_v4 src -j DROP
-                ip6tables -A GEO_CHAIN -p $proto -m set --match-set geo_v6 src -j DROP
-            else
-                for p in $PORTS; do
-                    iptables -A GEO_CHAIN -p $proto --dport $p -m set --match-set geo_v4 src -j DROP
-                    ip6tables -A GEO_CHAIN -p $proto --dport $p -m set --match-set geo_v6 src -j DROP
-                done
-            fi
+#################################
+# SSH 服务重启与备份
+#################################
+restart_ssh() {
+    if [ "$IS_ALPINE" = true ]; then
+        rc-service sshd restart 2>/dev/null
+    else
+        if command -v systemctl &>/dev/null; then
+            systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
         else
-            if [[ "$PORTS" == "all" ]]; then
-                iptables -A GEO_CHAIN -p $proto -m set ! --match-set geo_v4 src -j DROP
-                ip6tables -A GEO_CHAIN -p $proto -m set ! --match-set geo_v6 src -j DROP
-            else
-                for p in $PORTS; do
-                    iptables -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set geo_v4 src -j DROP
-                    ip6tables -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set geo_v6 src -j DROP
-                done
+            service ssh restart 2>/dev/null || service sshd restart 2>/dev/null
+        fi
+    fi
+    echo -e "${GREEN}✔ SSH 已重启生效${RESET}"
+}
+
+backup_config() {
+    cp "$CONFIG" "$BACKUP" 2>/dev/null
+    echo -e "${YELLOW}已备份 → $BACKUP${RESET}"
+}
+
+#################################
+# 分离获取 3 个核心状态
+#################################
+get_each_ssh_status() {
+    # ---- 1. 检测公钥文件状态 ----
+    if [ -f "/root/.ssh/authorized_keys" ] && [ -s "/root/.ssh/authorized_keys" ]; then
+        local count=$(wc -l < /root/.ssh/authorized_keys)
+        STATUS_FILE="${YELLOW}[正常](${count}个公钥)${RESET}"
+    else
+        STATUS_FILE="${RED}[未设置]${RESET}"
+    fi
+
+    # 获取 SSH 实际生效配置
+    local sshd_vars=$(sshd -T 2>/dev/null)
+    if [ -z "$sshd_vars" ]; then
+        sshd_vars=$(cat /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null)
+    fi
+
+    local pubkey_status=$(echo "$sshd_vars" | grep -i "^pubkeyauthentication" | awk '{print $2}' | tr 'A-Z' 'a-z' | head -n 1)
+    local root_login_status=$(echo "$sshd_vars" | grep -i "^permitrootlogin" | awk '{print $2}' | tr 'A-Z' 'a-z' | head -n 1)
+    local pass_status=$(echo "$sshd_vars" | grep -i "^passwordauthentication" | awk '{print $2}' | tr 'A-Z' 'a-z' | head -n 1)
+
+    # ---- 2. 检测公钥总开关状态 ----
+    if [[ "$pubkey_status" == "no" ]]; then
+        STATUS_PUBKEY="${RED}[已禁用]${RESET}"
+    else
+        STATUS_PUBKEY="${YELLOW}[已开启]${RESET}"
+    fi
+
+    # ---- 3. 检测 Root 登录及密码登录状态 ----
+    local root_str=""
+    if [[ "$root_login_status" == "no" || "$root_login_status" == "forced-commands-only" ]]; then
+        root_str="${RED}Root已禁${RESET}"
+    else
+        root_str="${YELLOW}Root允许${RESET}"
+    fi
+
+    local pass_str=""
+    if [[ "$pass_status" == "no" ]]; then
+        pass_str="${RED}[已禁用]${RESET}"
+    else
+        pass_str="${YELLOW}[已开启]${RESET}"
+    fi
+    
+    STATUS_ROOT="${pass_str}"
+}
+
+#################################
+# 选项 2 的管理公钥登录（子菜单）
+#################################
+manage_key_menu() {
+    while true; do
+        clear
+
+        get_each_ssh_status
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}       管理公钥登录配置         ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}当前状态 :${RESET} ${STATUS_FILE}"
+        echo -e "${GREEN}公钥登录 :${RESET} ${STATUS_PUBKEY}"
+        echo -e "${GREEN}密码登录 :${RESET} ${STATUS_ROOT}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN} 1) 开启公钥+密码登录(推荐)${RESET}"
+        echo -e "${GREEN} 2) 切换密码登录(关闭公钥)${RESET}"
+        echo -e "${GREEN} 0) 返回主菜单${RESET}"
+        read -p $'\033[32m 请选择: \033[0m' sub_choice
+
+        case $sub_choice in
+            1)
+                modify_ssh_config "PubkeyAuthentication" "yes"
+                modify_ssh_config "PasswordAuthentication" "yes"
+                echo -e "${GREEN}✔ 公钥 + 密码登录已开启${RESET}"
+                restart_ssh
+                pause
+                ;;
+            2)
+                modify_ssh_config "PubkeyAuthentication" "no"
+                modify_ssh_config "PasswordAuthentication" "yes"
+                echo -e "${YELLOW}✔ 已关闭公钥，仅密码登录${RESET}"
+                restart_ssh
+                pause
+                ;;
+            0)
+                return
+                ;;
+            *)
+                echo -e "${RED}输入错误，请重新选择${RESET}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+#################################
+# 一键清除 SSH 密钥
+#################################
+clear_all_ssh_keys() {
+    echo -e "${RED}警告：此操作将删除所有用户 SSH 密钥！${RESET}"
+    read -p $'\033[33m确认清除请输入(y): \033[0m' confirm
+
+    if [[ "$confirm" != "y" ]]; then
+        echo -e "${GREEN}已取消操作${RESET}"
+        sleep 1
+        return
+    fi
+
+    echo -e "${GREEN}正在清理 SSH 密钥...${RESET}"
+    rm -rf /root/.ssh /home/*/.ssh 2>/dev/null
+    restart_ssh
+    echo -e "${GREEN}SSH 密钥已全部清理完成${RESET}"
+    pause
+}
+
+#################################
+# 本地生成并配置密钥登录（修复密码设置与路径报错）
+#################################
+setup_local_ssh_key() {
+    echo -e "${YELLOW}开始生成 SSH 密钥并配置公钥登录...${RESET}"
+    
+    if [ "$IS_ALPINE" = true ]; then
+        apk add --no-cache openssh-client openssh-server >/dev/null 2>&1
+    fi
+
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
+
+    read -p "请输入密钥保存路径（默认 /root/.ssh/id_ed25519）: " input_path
+    
+    local keypath="${input_path}"
+    if [ -z "$keypath" ]; then
+        keypath="/root/.ssh/id_ed25519"
+    fi
+
+    # 避免重复生成导致覆盖
+    if [ -f "$keypath" ]; then
+        read -p "密钥已存在，是否覆盖？(y/n): " overwrite
+        if [[ "$overwrite" != "y" ]]; then
+            echo -e "${YELLOW}已取消生成，使用原有密钥配置...${RESET}"
+        else
+            # 修复点：移除了原本错误的 -f "" 串行，保留正常交互，用户可直接设置公钥密码短语
+            ssh-keygen -t ed25519 -f "$keypath"
+        fi
+    else
+        # 修复点：移除了原本错误的 -f ""
+        ssh-keygen -t ed25519 -f "$keypath"
+    fi
+
+    if [ -f "${keypath}.pub" ]; then
+        cat "${keypath}.pub" >> /root/.ssh/authorized_keys
+        chmod 600 /root/.ssh/authorized_keys
+        
+        modify_ssh_config "PubkeyAuthentication" "yes"
+        
+        echo -e "${GREEN}✔ 密钥登录配置完成${RESET}"
+        echo "公钥路径: ${keypath}.pub"
+        echo "私钥路径: ${keypath}"
+        echo -e "\n${GREEN}================== 您的私钥内容 ==================${RESET}"
+        cat "$keypath"
+        echo -e "${GREEN}==================================================${RESET}"
+        echo -e "${YELLOW}请务必复制上方私钥并妥善保存！${RESET}"
+        echo -e "${YELLOW}提示：如果您刚才设置了密码（Passphrase），请在连接时一并输入。${RESET}"
+    else
+        echo -e "${RED}错误：密钥生成失败！${RESET}"
+    fi
+    restart_ssh
+    pause
+}
+
+#################################
+# 禁用 root 密码登录（极致安全加固）
+#################################
+disable_root_password() {
+    # 安全检查：如果没有设置公钥，警告用户
+    if [ ! -f "/root/.ssh/authorized_keys" ] || [ ! -s "/root/.ssh/authorized_keys" ]; then
+        echo -e "${RED}严重警告：检测到您还未设置任何公钥！${RESET}"
+        echo -e "${RED}此时禁用密码登录将导致您完全无法通过 SSH 连上这台服务器！${RESET}"
+        read -p $'\033[33m确定要继续吗？请输入(y): \033[0m' extreme_confirm
+        if [[ "$extreme_confirm" != "y" ]]; then
+            echo -e "${GREEN}已紧急取消操作，建议先设置公钥。${RESET}"
+            sleep 2
+            return
+        fi
+    fi
+
+    echo -e "${YELLOW}正在安全加固：禁用密码登录...${RESET}"
+    
+    # 使用强效修改机制，防止云厂商子配置文件覆盖
+    modify_ssh_config "PermitRootLogin" "prohibit-password"
+    modify_ssh_config "PasswordAuthentication" "no"
+
+    echo -e "${GREEN}✔ 密码登录已禁用，现在仅允许公钥登录${RESET}"
+    restart_ssh
+    pause
+}
+
+#################################
+# 管理 Root 登录策略（子菜单）
+#################################
+manage_root_menu() {
+    while true; do
+        clear
+        get_each_ssh_status
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}       管理密码 登录策略        ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}当前状态 :${RESET} ${STATUS_FILE}"
+        echo -e "${GREEN}公钥登录 :${RESET} ${STATUS_PUBKEY}"
+        echo -e "${GREEN}密码登录 :${RESET} ${STATUS_ROOT}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN} 1) 禁用 root 密码（仅允许公钥登录）${RESET}"
+        echo -e "${GREEN} 2) 允许 root 密码登录（恢复默认）${RESET}"
+        echo -e "${GREEN} 0) 返回主菜单${RESET}"
+        read -p $'\033[32m 请选择: \033[0m' root_choice
+
+        case $root_choice in
+            1)
+                if [ ! -f "/root/.ssh/authorized_keys" ] || [ ! -s "/root/.ssh/authorized_keys" ]; then
+                    echo -e "${RED}严重警告：检测到您还未设置任何公钥！${RESET}"
+                    echo -e "${RED}此时禁用密码登录将导致您完全无法通过 SSH 连上这台服务器！${RESET}"
+                    read -p $'\033[33m确定要继续吗？请输入(y): \033[0m' extreme_confirm
+                    if [[ "$extreme_confirm" != "y" ]]; then
+                        echo -e "${GREEN}已紧急取消操作，建议先设置公钥。${RESET}"
+                        sleep 2
+                        continue
+                    fi
+                fi
+
+                echo -e "${YELLOW}正在安全加固：禁用 root 密码登录...${RESET}"
+                backup_config
+                modify_ssh_config "PermitRootLogin" "prohibit-password"
+                modify_ssh_config "PasswordAuthentication" "no"
+                echo -e "${GREEN}✔ root 已禁止密码登录（仅允许公钥）${RESET}"
+                restart_ssh
+                pause
+                ;;
+            2)
+                echo -e "${YELLOW}正在恢复配置：允许 root 密码登录...${RESET}"
+                backup_config
+                modify_ssh_config "PermitRootLogin" "yes"
+                modify_ssh_config "PasswordAuthentication" "yes"
+                echo -e "${GREEN}✔ root 已允许密码登录${RESET}"
+                restart_ssh
+                pause
+                ;;
+            0)
+                return
+                ;;
+            *)
+                echo -e "${RED}输入错误，请重新选择${RESET}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+#################################
+# 设置/修改密码登录
+#################################
+set_root_password() {
+    echo -e "${YELLOW}提示：接下来将为您设置/修改当前的 root 系统密码。${RESET}"
+    echo -e "${YELLOW}请输入您的新密码并按回车（输入时屏幕不显示密码属于正常现象）：${RESET}"
+    
+    # 直接调用系统passwd修改root账户密码
+    if passwd root; then
+        echo -e "${GREEN}✔ root 用户密码修改成功！${RESET}"
+        
+        # 联动检查：如果当前密码登录是关闭状态，贴心地询问用户是否需要顺便开启它
+        local sshd_vars=$(sshd -T 2>/dev/null)
+        local pass_status=$(echo "$sshd_vars" | grep -i "^passwordauthentication" | awk '{print $2}' | tr 'A-Z' 'a-z' | head -n 1)
+        
+        if [[ "$pass_status" == "no" ]]; then
+            echo
+            read -p "检测到您当前 SSH 策略关闭了密码登录，是否顺便开启？(y/n): " open_pass
+            if [[ "$open_pass" == "y" ]]; then
+                modify_ssh_config "PasswordAuthentication" "yes"
+                # 如果Root登录也是禁用或限制的，一并放开以确保密码能登
+                local root_status=$(echo "$sshd_vars" | grep -i "^permitrootlogin" | awk '{print $2}' | tr 'A-Z' 'a-z' | head -n 1)
+                if [[ "$root_status" == "no" || "$root_status" == "prohibit-password" ]]; then
+                    modify_ssh_config "PermitRootLogin" "yes"
+                fi
+                restart_ssh
             fi
         fi
-    done
-
-    save_rules
-    green "规则已成功应用并持久化保存"
+    else
+        echo -e "${RED}❌ 密码修改失败，请重试${RESET}"
+    fi
+    pause
 }
 
-# ================== 添加规则 ==================
-add_rule(){
-    echo -e "${GREEN}选择模式:${RESET}"
-    echo -e "${GREEN}1 封锁某国某端口${RESET}"
-    echo -e "${GREEN}2 封锁某国所有端口${RESET}"
-    echo -e "${GREEN}3 只允许某国某端口${RESET}"
-    echo -e "${GREEN}4 只允许某国访问整个服务器${RESET}"
-    read -p $'\033[32m选择模式(1-4): \033[0m' choice
+#################################
+# 暂停提示
+#################################
+pause() {
+    read -p $'\033[32m按回车继续...\033[0m'
+}
 
-    case "$choice" in
-        1)
-            MODE="block"
-            read -p $'\033[32m国家代码(例如 cn us jp): \033[0m' COUNTRY
-            read -p $'\033[32m端口 (多个空格): \033[0m' PORTS
-            ;;
-        2)
-            MODE="block"
-            read -p $'\033[32m国家代码(例如 cn us jp): \033[0m' COUNTRY
-            PORTS="all"
-            ;;
-        3)
-            MODE="allow"
-            read -p $'\033[32m国家代码(例如 cn us jp): \033[0m' COUNTRY
-            read -p $'\033[32m端口(例如 443 80 多个空格): \033[0m' PORTS
-            ;;
-        4)
-            MODE="allow"
-            read -p $'\033[32m国家代码(例如 cn us jp): \033[0m' COUNTRY
-            PORTS="all"
+#################################
+# 主循环菜单
+#################################
+while true; do
+    clear
+    get_each_ssh_status
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    ◈  root登录 管理面板  ◈     ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}当前状态 :${RESET} ${STATUS_FILE}"
+    echo -e "${GREEN}公钥登录 :${RESET} ${STATUS_PUBKEY}"
+    echo -e "${GREEN}密码登录 :${RESET} ${STATUS_ROOT}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN} 1) 设置公钥登录${RESET}"
+    echo -e "${GREEN} 2) 管理公钥登录${RESET}"
+    echo -e "${GREEN}--------------------------------${RESET}"
+    echo -e "${GREEN} 3) 设置密码登录${RESET}"
+    echo -e "${GREEN} 4) 管理密码登录${RESET}"
+    echo -e "${GREEN}--------------------------------${RESET}"
+    echo -e "${GREEN} 5) 禁用密码登录${RESET}"
+    echo -e "${GREEN} 6) 清除SSH公钥${RESET}"
+    echo -e "${GREEN} 0) 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    read -p $'\033[32m 请选择: \033[0m' choice
+
+    case $choice in
+        1) setup_local_ssh_key ;; 
+        2) manage_key_menu ;; 
+        3) set_root_password ;;
+        4) manage_root_menu ;; 
+        5) disable_root_password ;; 
+        6) clear_all_ssh_keys ;;
+        0) 
+            exit 0 
             ;;
         *)
-            red "无效选择"
-            return
+            echo -e "${RED}输入错误，请重新选择${RESET}"
+            sleep 1
             ;;
     esac
-
-    echo "MODE=\"$MODE\"" > $CONF
-    echo "COUNTRY=\"$COUNTRY\"" >> $CONF
-    echo "PORTS=\"$PORTS\"" >> $CONF
-    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
-
-    install_auto_update
-    apply_rules
-}
-
-# ================== 白名单 ==================
-add_whitelist(){
-    read -p $'\033[32m输入白名单 IP (多个空格): \033[0m' ips
-    source $CONF 2>/dev/null
-    WHITELIST="$WHITELIST $ips"
-    echo "MODE=\"$MODE\"" > $CONF
-    echo "COUNTRY=\"$COUNTRY\"" >> $CONF
-    echo "PORTS=\"$PORTS\"" >> $CONF
-    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
-    apply_rules
-}
-
-delete_whitelist(){
-    read -p $'\033[32m输入要删除的白名单 IP (多个空格): \033[0m' ips
-    source $CONF 2>/dev/null
-    for ip in $ips; do
-        WHITELIST=$(echo $WHITELIST | sed "s/\b$ip\b//g")
-    done
-    echo "MODE=\"$MODE\"" > $CONF
-    echo "COUNTRY=\"$COUNTRY\"" >> $CONF
-    echo "PORTS=\"$PORTS\"" >> $CONF
-    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
-    apply_rules
-}
-
-# ================== 删除端口规则 ==================
-delete_rules(){
-    source $CONF 2>/dev/null
-    [[ -z "$PORTS" ]] && { red "未检测到配置"; return; }
-    read -p $'\033[32m输入要删除的端口 (多个空格): \033[0m' DEL_PORTS
-    [[ -z "$DEL_PORTS" ]] && { red "未输入端口"; return; }
-    for p in $DEL_PORTS; do
-        for proto in tcp udp; do
-            iptables -L GEO_CHAIN --line-numbers -n | grep "$proto" | grep "dpt:$p" | awk '{print $1}' | sort -rn | while read num; do
-                iptables -D GEO_CHAIN $num
-            done
-            ip6tables -L GEO_CHAIN --line-numbers -n | grep "$proto" | grep "dpt:$p" | awk '{print $1}' | sort -rn | while read num; do
-                ip6tables -D GEO_CHAIN $num
-            done
-        done
-        green "端口 $p 规则已删除"
-    done
-    save_rules
-}
-
-# ================== 查看规则 ==================
-view_rules(){
-    clear
-    green "========= 当前配置 ========="
-    cat $CONF 2>/dev/null
-    echo
-    iptables -L GEO_CHAIN -n --line-numbers 2>/dev/null
-    echo
-    ip6tables -L GEO_CHAIN -n --line-numbers 2>/dev/null
-    echo
-    ipset list | grep "^Name:"
-}
-
-# ================== 卸载 ==================
-uninstall_all(){
-    green "正在卸载"
-    iptables -D INPUT -j GEO_CHAIN 2>/dev/null
-    ip6tables -D INPUT -j GEO_CHAIN 2>/dev/null
-    iptables -F GEO_CHAIN 2>/dev/null
-    ip6tables -F GEO_CHAIN 2>/dev/null
-    iptables -X GEO_CHAIN 2>/dev/null
-    ip6tables -X GEO_CHAIN 2>/dev/null
-    ipset list | grep "^Name: geo_" | awk '{print $2}' | xargs -r -I {} ipset destroy {}
-    rm -rf /opt/geoip
-    crontab -l 2>/dev/null | grep -v update_geo.sh | crontab -
-    rm -f $SCRIPT_PATH
-    save_rules
-    green "已彻底卸载完成"
-    exit 0
-}
-
-# ================== 菜单 (已加入动态配置显示) ==================
-menu(){
-    clear
-    # 读取最新配置
-    local v_mode="未配置"
-    local v_country="无"
-    local v_ports="无"
-    if [ -f "$CONF" ]; then
-        source $CONF 2>/dev/null
-        [ "$MODE" == "block" ] && v_mode="${RED}仅封锁${RESET}"
-        [ "$MODE" == "allow" ] && v_mode="${GREEN}仅放行${RESET}"
-        [ -n "$COUNTRY" ] && v_country=$(echo "$COUNTRY" | tr 'a-z' 'A-Z')
-        [ -n "$PORTS" ] && v_ports="$PORTS"
-    fi
-
-    echo -e "${GREEN}=========================${RESET}"
-    echo -e "${GREEN}  ◈   VPS国家防火墙   ◈  ${RESET}"
-    echo -e "${GREEN}=========================${RESET}"
-    echo -e "${GREEN}当前模式: ${v_mode}"
-    echo -e "${GREEN}目标国家: ${YELLOW}${v_country}${RESET}"
-    echo -e "${GREEN}受控端口: ${YELLOW}${v_ports}${RESET}"
-    echo -e "${GREEN}=========================${RESET}"
-    echo -e "${GREEN}1 添加规则${RESET}"
-    echo -e "${GREEN}2 删除端口规则${RESET}"
-    echo -e "${GREEN}3 查看规则详情${RESET}"
-    echo -e "${GREEN}4 添加白名单${RESET}"
-    echo -e "${GREEN}5 删除白名单${RESET}"
-    echo -e "${GREEN}6 更新${RESET}"
-    echo -e "${GREEN}7 卸载${RESET}"
-    echo -e "${GREEN}0 退出${RESET}"
-    echo -e "${GREEN}=========================${RESET}"
-    read -r -p $'\033[32m请选择: \033[0m' num
-    case $num in
-        1) add_rule ;;
-        2) delete_rules ;;
-        3) view_rules ;;
-        4) add_whitelist ;;
-        5) delete_whitelist ;;
-        6) download_script ;;
-        7) uninstall_all ;;
-        0) exit ;;
-    esac
-}
-
-# ================== 主循环 ==================
-init_env
-while true; do
-    menu
-    read -r -p $'\033[32m按回车继续...\033[0m'
 done

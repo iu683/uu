@@ -1,336 +1,736 @@
-#!/bin/sh
+#!/bin/bash
+# ========================================
+# 🐳 Alpine Linux 专用 VPS Docker 管理工具
+# ========================================
 
-# =================================================================
-# 名称: 流量统计 & VPS/Docker 状态 TG日报管理工具 (Alpine 专属版)
-# =================================================================
-
+# -----------------------------
+# 颜色
+# -----------------------------
+RED="\033[31m"
 GREEN="\033[32m"
-NC="\033[0m" # 清除颜色
+YELLOW="\033[33m"
+CYAN="\033[36m"
+BOLD="\033[1m"
+RESET="\033[0m"
+BLUE="\033[34m"
 
-CONFIG_FILE="/etc/vnstat_tg.conf"  # 配置文件路径
-BIN_PATH="/usr/local/bin/vnstat_tg_report.sh"  # 报告脚本路径
+# -----------------------------
+# 检查 root
+# -----------------------------
+root_use() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}请使用 root 用户运行脚本${RESET}"
+        exit 1
+    fi
+}
 
-# --- 1. 环境准备 ---
-prepare_env() {
-    echo "🔍 正在检查 Alpine 系统环境..."
+# -----------------------------
+# 重启 Docker 并恢复容器端口映射
+# -----------------------------
+restart_docker() {
+    root_use
+    echo -e "${YELLOW}正在重启 Docker...${RESET}"
 
-    # 1. 检查并安装 apk 基础依赖 (去掉了会冲突的 cronie)
-    local deps="vnstat bc curl sed awk coreutils procps"
-    
-    echo "📥 更新 apk 软件源并安装依赖..."
-    apk update
-    for dep in $deps; do
-        if ! command -v "$dep" >/dev/null 2>&1; then
-            echo "📥 安装依赖: $dep"
-            apk add "$dep"
-        fi
-    done
-
-    # 2. OpenRC 服务管理 (Alpine 专属优化)
-    # Alpine 默认自带 dcron (服务名为 crond)，直接检查并启动即可
-    if ! rc-service crond status >/dev/null 2>&1; then
-        echo "📥 启动 Cron 服务..."
-        rc-update add crond default >/dev/null 2>&1
-        rc-service crond start
+    if [ -f /etc/init.d/docker ]; then
+        rc-service docker restart
+    else
+        pkill dockerd 2>/dev/null
+        nohup dockerd >/dev/null 2>&1 &
+        sleep 5
     fi
 
-    # 探测 vnstat 在 Alpine 里的真实服务名 (可能是 vnstat 或 vnstatd)
-    local vnstat_service="vnstat"
-    if [ ! -f "/etc/init.d/vnstat" ] && [ -f "/etc/init.d/vnstatd" ]; then
-        vnstat_service="vnstatd"
-    fi
-
-    # 启动并开机自启 vnstat 服务
-    if [ -f "/etc/init.d/$vnstat_service" ]; then
-        if ! rc-service "$vnstat_service" status >/dev/null 2>&1; then
-            echo "📥 启动 $vnstat_service 服务..."
-            rc-update add "$vnstat_service" default >/dev/null 2>&1
-            rc-service "$vnstat_service" start
+    if docker info &>/dev/null; then
+        echo -e "${GREEN}✅ Docker 已成功重启${RESET}"
+        containers=$(docker ps -a -q)
+        if [ -n "$containers" ]; then
+            echo -e "${CYAN}正在重启所有容器以恢复端口映射...${RESET}"
+            docker restart $containers
+            echo -e "${GREEN}✅ 所有容器已重启并恢复端口映射${RESET}"
+        else
+            echo -e "${YELLOW}没有容器需要重启${RESET}"
         fi
     else
-        echo "⚠️ 未找到 vnstat 的系统服务脚本，尝试后台直接启动守护进程..."
-        if ! pgrep vnstatd >/dev/null 2>&1; then
-            vnstatd -d
+        echo -e "${RED}❌ Docker 重启失败，请检查日志${RESET}"
+    fi
+}
+
+# -----------------------------
+# 检测 Docker 是否安装并运行
+# -----------------------------
+check_docker_running() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${RED}❌ Docker 未安装，请先安装 Docker${RESET}"
+        return 1
+    fi
+    if ! docker info &>/dev/null; then
+        echo -e "${YELLOW} Docker 未运行，尝试启动...${RESET}"
+        if [ -f /etc/init.d/docker ]; then
+            rc-service docker start
+        else
+            nohup dockerd >/dev/null 2>&1 &
+            sleep 5
         fi
     fi
-    
-    # 初始化 vnstat 数据库
-    vnstat -u >/dev/null 2>&1  
-    echo "✅ 环境就绪。"
-}
-# --- 2. 核心报表逻辑生成 ---
-generate_report_logic() {
-    local BC_P=$(which bc)
-    local VN_P=$(which vnstat)
-    local CL_P=$(which curl)
-    local DATE_P=$(which date) # 确保使用的是 GNU date
-
-    # 动态写入逻辑脚本
-    cat <<EOF > $BIN_PATH
-#!/bin/sh
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-[ -f "/etc/vnstat_tg.conf" ] && . "/etc/vnstat_tg.conf" || exit 1
-
-BC="$BC_P"
-VN="$VN_P"
-CL="$CL_P"
-GDATE="$DATE_P"
-
-# 修复数字前面的零
-fix_zero() {
-    case "\$1" in
-        .*) echo "0\$1" ;;
-        *)  echo "\$1" ;;
-    esac
-}
-
-# 将流量值转化为 MB
-val_to_mb() {
-    local raw=\$(echo "\$1" | tr -d ' ' | tr '[:lower:]' '[:upper:]')
-    local num=\$(echo "\$raw" | grep -oE '[0-9.]+' | head -n1)
-    [ -z "\$num" ] && num=0
-    case "\$raw" in
-        *T*) echo "scale=2; \$num * 1048576" | \$BC ;;
-        *G*) echo "scale=2; \$num * 1024" | \$BC ;;
-        *K*) echo "scale=2; \$num / 1024" | \$BC ;;
-        *)   echo "\$num" ;;
-    esac
-}
-
-# 提取流量数据中的接收和发送流量
-get_traffic() {
-    echo "\$1" | cut -c13- | grep -oE '[0-9.]+[[:space:]]*[a-zA-Z/]+' | sed -n "\${2}p" | xargs
-}
-
-# 生成流量使用进度条
-gen_bar() {
-    local p=\$1; local b=""; [ "\$p" -gt 100 ] && p=100
-    local c="🟩"; [ "\$p" -ge 50 ] && c="🟧"; [ "\$p" -ge 80 ] && c="🟥"
-    
-    # 用 while 循环替代 bash 的 for (i=0; i<p/10; i++)
-    local i=0
-    local limit=\$((p / 10))
-    while [ \$i -lt \$limit ]; do
-        b="\$b\$c"
-        i=\$((i + 1))
-    done
-    while [ \$i -lt 10 ]; do
-        b="\$b⬜"
-        i=\$((i + 1))
-    done
-    echo "\$b"
-}
-
-# 1. 流量数据统计
-\$VN -i \$INTERFACE --update >/dev/null 2>&1
-
-# 获取公网 IP
-SERVER_IP=\$(\$CL -s --connect-timeout 5 https://ipinfo.io/ip || \$CL -s --connect-timeout 5 https://icanhazip.com || echo "获取失败")
-
-Y_D=\$(\$GDATE -d "yesterday" "+%Y-%m-%d")
-Y_A1=\$(\$GDATE -d "yesterday" "+%m/%d/%y")
-Y_A2=\$(\$GDATE -d "yesterday" "+%d.%m.%y")
-Y_A3=\$(\$GDATE -d "yesterday" "+%m/%d/%Y")
-RAW_LINE=\$(\$VN -d | grep -Ei "yesterday|\$Y_D|\$Y_A1|\$Y_A2|\$Y_A3")
-
-if [ -n "\$RAW_LINE" ]; then
-    RX_STR=\$(get_traffic "\$RAW_LINE" 1)
-    TX_STR=\$(get_traffic "\$RAW_LINE" 2)
-    RX_MB=\$(val_to_mb "\$RX_STR")
-    TX_MB=\$(val_to_mb "\$TX_STR")
-    TOTAL_YEST_GB=\$(fix_zero \$(echo "scale=2; (\$RX_MB + \$TX_MB) / 1024" | \$BC))
-    DISP_RX=\$(echo "\$RX_STR" | sed 's/GiB/GB/'); DISP_TX=\$(echo "\$TX_STR" | sed 's/GiB/GB/')
-else
-    DISP_RX="0.00 GB"; DISP_TX="0.00 GB"; TOTAL_YEST_GB="0.00"
-fi
-
-TODAY_D=\$(\$GDATE +%d | sed 's/^0//')
-THIS_Y=\$(\$GDATE +%Y); THIS_M=\$(\$GDATE +%m)
-if [ "\$TODAY_D" -lt "\$RESET_DAY" ]; then
-    START_DATE=\$(\$GDATE -d "\${THIS_Y}-\${THIS_M}-\${RESET_DAY} -1 month" +%Y-%m-%d)
-    END_DATE=\$(\$GDATE -d "\${THIS_Y}-\${THIS_M}-\${RESET_DAY} -1 day" +%Y-%m-%d)
-else
-    START_DATE=\$(\$GDATE -d "\${THIS_Y}-\${THIS_M}-\${RESET_DAY}" +%Y-%m-%d)
-    END_DATE=\$(\$GDATE -d "\${THIS_Y}-\${THIS_M}-\${RESET_DAY} +1 month -1 day" +%Y-%m-%d)
-fi
-
-TOTAL_PERIOD_MB=0
-CUR_TS=\$(\$GDATE -d "\$START_DATE" +%s)
-YEST_TS=\$(\$GDATE -d "yesterday" +%s)
-while [ "\$CUR_TS" -le "\$YEST_TS" ]; do
-    D_M1=\$(\$GDATE -d "@\$CUR_TS" "+%Y-%m-%d")
-    D_M2=\$(\$GDATE -d "@\$CUR_TS" "+%m/%d/%y")
-    D_M3=\$(\$GDATE -d "@\$CUR_TS" "+%d.%m.%y")
-    D_M4=\$(\$GDATE -d "@\$CUR_TS" "+%m/%d/%Y")
-    D_LINE=\$(\$VN -d | grep -E "\$D_M1|\$D_M2|\$D_M3|\$D_M4")
-    if [ -n "\$D_LINE" ]; then
-        D_RX_S=\$(get_traffic "\$D_LINE" 1)
-        D_TX_S=\$(get_traffic "\$D_LINE" 2)
-        TOTAL_PERIOD_MB=\$(echo "\$TOTAL_PERIOD_MB + \$(val_to_mb "\$D_RX_S") + \$(val_to_mb "\$D_TX_S")" | \$BC)
+    if ! docker info &>/dev/null; then
+        echo -e "${RED}❌ Docker 启动失败，请检查日志${RESET}"
+        return 1
     fi
-    CUR_TS=\$((\$CUR_TS + 86400))
-done
+    return 0
+}
 
-USED_GB=\$(fix_zero \$(echo "scale=2; \$TOTAL_PERIOD_MB / 1024" | \$BC))
-PCT=\$(echo "scale=0; \$USED_GB * 100 / \$MAX_GB" | \$BC 2>/dev/null)
-[ -z "\$PCT" ] && PCT=0
-BAR=\$(gen_bar \$PCT)
-NOW=\$(\$GDATE "+%Y-%m-%d %H:%M")
-
-# 2. VPS 基础状态获取 & 运行时间汉化
-UPTIME_RAW=\$(uptime | awk -F'up ' '{print \$2}' | awk -F, '{print \$1}' | xargs)
-UPTIME_CN=\$(echo "\$UPTIME_RAW" | sed -E 's/ years?/ 年/g; s/ weeks?/ 周/g; s/ days?/ 天/g; s/ hours?/ 小时/g; s/ minutes?/ 分钟/g')
-
-CPU_LOAD=\$(uptime | awk -F'load average:' '{print \$2}' | awk -F, '{print \$1}' | xargs)
-MEM_INFO=\$(free -m | awk '/Mem:/ {printf "%.1f/%.1f GB (%.0f%%)", \$3/1024, \$2/1024, \$3*100/\$2}')
-DISK_INFO=\$(df -h / | awk 'NR==2 {printf "%s/%s (%s)", \$3, \$2, \$5}')
-
-# 3. 网卡实时速率统计 (1秒采样)
-RX_BEFORE=\$(cat /sys/class/net/\$INTERFACE/statistics/rx_bytes)
-TX_BEFORE=\$(cat /sys/class/net/\$INTERFACE/statistics/tx_bytes)
-sleep 1
-RX_AFTER=\$(cat /sys/class/net/\$INTERFACE/statistics/rx_bytes)
-TX_AFTER=\$(cat /sys/class/net/\$INTERFACE/statistics/tx_bytes)
-SPEED_RX_KB=\$(echo "(\$RX_AFTER - \$RX_BEFORE) / 1024" | \$BC)
-SPEED_TX_KB=\$(echo "(\$TX_AFTER - \$TX_BEFORE) / 1024" | \$BC)
-
-if [ "\$SPEED_RX_KB" -gt 1024 ]; then
-    SPEED_RX="\$(echo "scale=1; \$SPEED_RX_KB / 1024" | \$BC) Mbps"
-else
-    SPEED_RX="\${SPEED_RX_KB} Kbps"
-fi
-if [ "$SPEED_TX_KB" -gt 1024 ]; then
-    SPEED_TX="\$(echo "scale=1; \$SPEED_TX_KB / 1024" | \$BC) Mbps"
-else
-    SPEED_TX="\${SPEED_TX_KB} Kbps"
-fi
-
-# 4. Docker 运行状态监控 (Alpine 兼容)
-DOCKER_BLOCK=""
-if command -v docker >/dev/null 2>&1 && rc-service docker status >/dev/null 2>&1; then
-    DOCKER_TOTAL=\$(docker ps -a --format '{{.Names}}' | wc -l)
-    DOCKER_RUNNING=\$(docker ps --format '{{.Names}}' | wc -l)
-    DOCKER_STATUS="🟢 运行中 (\$DOCKER_RUNNING/\$DOCKER_TOTAL)"
-    
-    DOCKER_EXC=\$(docker ps -a --filter "status=exited" --format '{{.Names}} ({{.Status}})' | grep -v 'Exited (0)' | head -n 3)
-    if [ -n "\$DOCKER_EXC" ]; then
-        DOCKER_STATUS="\$DOCKER_STATUS\n⚠️ *异常容器*:\n\\\`\$(echo "\$DOCKER_EXC" | sed 's/^/  • /')\\\`"
+# -----------------------------
+# 自动检测国内/国外
+# -----------------------------
+detect_country() {
+    local country=$(curl -s --max-time 5 ipinfo.io/country)
+    if [[ "$country" == "CN" ]]; then
+        echo "CN"
+    else
+        echo "OTHER"
     fi
-    
-    DOCKER_BLOCK="
-🐳 *Docker 运行状态*
-\$DOCKER_STATUS"
-fi
-
-# --- 报表样式定制 ---
-MSG="📊 *【\$HOST_ALIAS】服务器日报*
-🕙 时间: \\\`\$NOW\\\`
-
-🖥️ *VPS 基础性能监控*
-├─ 🌍 公网IP: \\\`\$SERVER_IP\\\`
-├─ ⚡ 负载 (1m): \\\`\$CPU_LOAD\\\`
-├─ 🧠 内存: \\\`\$MEM_INFO\\\`
-└─ 💾 硬盘: \\\`\$DISK_INFO\\\`
-
-🌐 *网卡实时与历史统计*
-├─ 🚀 实时下载: \\\`\$SPEED_RX\\\`
-├─ 🚀 实时上传: \\\`\$SPEED_TX\\\`
-├─ ⬇️ 昨日下载: \\\`\$DISP_RX\\\`
-├─ ⬆️ 昨日上传: \\\`\$DISP_TX\\\`
-└─ 🧮 昨日合计: \\\`\$TOTAL_YEST_GB GB\\\`
-
-📅 *流量周期统计*
-├─ 📅 周期开始: \\\`\$START_DATE\\\`
-├─ 📅 周期结束: \\\`\$END_DATE\\\`
-├─ 🔄 重置日: 每月 \\\`\$RESET_DAY\\\` 号
-├─ ⏳ 累计: \\\`\$USED_GB / \$MAX_GB GB\\\`
-└─ 🎯 进度: \$BAR \\\`\$PCT%\\\`\$DOCKER_BLOCK"
-
-# 发送到 Telegram
-\$CL --connect-timeout 10 --retry 3 -s -X POST "https://api.telegram.org/bot\$TG_TOKEN/sendMessage" \\
--d "chat_id=\$TG_CHAT_ID" \\
--d "text=\$MSG" \\
--d "parse_mode=Markdown" \\
--d "disable_notification=true" > /dev/null
-EOF
-
-    chmod +x $BIN_PATH  # 设置执行权限
 }
 
-# --- 3. 配置与自定义通知时间录入 ---
-collect_config() {
-    [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
-    echo "--- 请输入配置参数 ---"
+# -----------------------------
+# 安装/更新 Docker (Alpine 专用)
+# -----------------------------
+docker_install_update() {
+    root_use
+    echo -e "${CYAN}正在为 Alpine Linux 安装/更新 Docker...${RESET}"
     
-    printf "👤 主机别名 [%s]: " "${HOST_ALIAS:-My-VPS}"; read input_val; HOST_ALIAS=${input_val:-${HOST_ALIAS:-My-VPS}}
-    printf "🤖 Bot Token [%s]: " "${TG_TOKEN}"; read input_val; TG_TOKEN=${input_val:-$TG_TOKEN}
-    printf "🆔 Chat ID [%s]: " "${TG_CHAT_ID}"; read input_val; TG_CHAT_ID=${input_val:-$TG_CHAT_ID}
-    printf "📅 重置日 (1-31) [%s]: " "${RESET_DAY:-1}"; read input_val; RESET_DAY=${input_val:-${RESET_DAY:-1}}
-    printf "📊 限额 (GB) [%s]: " "${MAX_GB:-1000}"; read input_val; MAX_GB=${input_val:-${MAX_GB:-1000}}
+    # 确保启用 community 仓库（Docker 在该仓库中）
+    if ! grep -q "community" /etc/apk/repositories; then
+        local alpine_ver=$(cut -d. -f1,2 /etc/alpine-release)
+        echo "http://dl-cdn.alpinelinux.org/alpine/v${alpine_ver}/community" >> /etc/apk/repositories
+    fi
 
-    # 自动获取默认网卡
-    IF_DEF=$(ip route | grep '^default' | awk '{print $5}' | head -n1)
-    printf "🌐 网卡 [%s]: " "${INTERFACE:-$IF_DEF}"; read input_val; INTERFACE=${input_val:-${INTERFACE:-$IF_DEF}}
+    apk update
+    # Alpine 下的 docker 需要同时安装 docker-cli
+    apk add docker docker-cli docker-cli-compose bash curl jq grep
 
-    # 自定义通知时间
-    printf "⏰ 通知时间 (HH:MM) [%s]: " "${RUN_TIME:-08:00}"; read input_val; RUN_TIME=${input_val:-${RUN_TIME:-08:00}}
-
-    # 保存配置到文件
-    cat <<EOF > "$CONFIG_FILE"
-HOST_ALIAS="$HOST_ALIAS"
-TG_TOKEN="$TG_TOKEN"
-TG_CHAT_ID="$TG_CHAT_ID"
-RESET_DAY=$RESET_DAY
-MAX_GB=$MAX_GB
-INTERFACE="$INTERFACE"
-RUN_TIME="$RUN_TIME"
+    local country=$(detect_country)
+    echo -e "${CYAN}检测到国家: $country${RESET}"
+    if [ "$country" = "CN" ]; then
+        echo -e "${YELLOW}配置国内加速镜像源...${RESET}"
+        mkdir -p /etc/docker
+        cat > /etc/docker/daemon.json << EOF
+{
+  "registry-mirrors": [
+    "https://docker.0.unsee.tech",
+    "https://docker.1panel.live",
+    "https://registry.dockermirror.com",
+    "https://docker.m.daocloud.io"
+  ]
+}
 EOF
+    fi
 
-    # 生成报告脚本
-    generate_report_logic  
-    
-    # 巧妙转换 Cron 时间，过滤掉前导0
-    local H=$(echo $RUN_TIME | cut -d: -f1 | sed 's/^0//'); [ -z "$H" ] && H=0
-    local M=$(echo $RUN_TIME | cut -d: -f2 | sed 's/^0//'); [ -z "$M" ] && M=0
-    
-    # Alpine crontab 兼容写入
-    (crontab -l 2>/dev/null | grep -v "$BIN_PATH"; echo "$M $H * * * /bin/sh $BIN_PATH") | crontab -
-    echo "⏰ 定时发送任务已设定为每日 $RUN_TIME"
+    # 注册 OpenRC 开机自启
+    rc-update add docker default
+    rc-service docker start
+    echo -e "${GREEN}Docker 安装/更新完成并已启动（已设置开机自启）${RESET}"
 }
 
-# --- 4. 交互菜单 (绿色矩阵风) ---
-while true; do
+# -----------------------------
+# 卸载 Docker
+# -----------------------------
+docker_uninstall() {
+    root_use
+    echo -e "${RED}正在卸载 Docker 和 Docker Compose...${RESET}"
+    
+    rc-service docker stop 2>/dev/null
+    rc-update del docker default 2>/dev/null
+    pkill dockerd 2>/dev/null
+
+    apk del docker docker-cli docker-compose 2>/dev/null || true
+    rm -f /usr/local/bin/docker-compose
+
+    rm -rf /var/lib/docker /etc/docker /var/run/docker.sock
+    echo -e "${GREEN}Docker 和 Docker Compose 已卸载干净${RESET}"
+}
+
+# -----------------------------
+# Docker Compose 安装/更新
+# -----------------------------
+docker_compose_install_update() {
+    root_use
+    echo -e "${CYAN}正在安装/更新 Docker Compose...${RESET}"
+    
+    # 优先尝试通过 apk 安装官方最新的 docker-compose 插件/包
+    if ! grep -q "community" /etc/apk/repositories; then
+        local alpine_ver=$(cut -d. -f1,2 /etc/alpine-release)
+        echo "http://dl-cdn.alpinelinux.org/alpine/v${alpine_ver}/community" >> /etc/apk/repositories
+        apk update
+    fi
+    apk add jq curl
+    
+    local latest=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
+    latest=${latest:-"v2.30.0"}
+    
+    # 转换为 Alpine (musl) 兼容的架构名
+    local arch=$(uname -m)
+    curl -L "https://github.com/docker/compose/releases/download/$latest/docker-compose-$(uname -s)-$arch" -o /usr/local/bin/docker-compose
+    chmod +x /usr/local/bin/docker-compose
+    
+    echo -e "${GREEN}Docker Compose 已安装/更新到版本 $latest${RESET}"
+}
+
+# -----------------------------
+# Docker IPv6
+# -----------------------------
+docker_ipv6_on() {
+    root_use
+    mkdir -p /etc/docker
+    if [ -f /etc/docker/daemon.json ]; then
+        jq '. + {ipv6:true,"fixed-cidr-v6":"fd00::/64"}' /etc/docker/daemon.json 2>/dev/null \
+            >/etc/docker/daemon.json.tmp || \
+            echo '{"ipv6":true,"fixed-cidr-v6":"fd00::/64"}' > /etc/docker/daemon.json.tmp
+    else
+        echo '{"ipv6":true,"fixed-cidr-v6":"fd00::/64"}' > /etc/docker/daemon.json.tmp
+    fi
+    mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+    restart_docker
+    echo -e "${GREEN}✅ Docker IPv6 已开启${RESET}"
+}
+
+docker_ipv6_off() {
+    root_use
+    if [ -f /etc/docker/daemon.json ]; then
+        jq 'del(.ipv6) | del(.["fixed-cidr-v6"])' /etc/docker/daemon.json \
+            >/etc/docker/daemon.json.tmp 2>/dev/null || \
+            cp /etc/docker/daemon.json /etc/docker/daemon.json.tmp
+        mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+        restart_docker
+        echo -e "${GREEN}✅ Docker IPv6 已关闭${RESET}"
+    else
+        echo -e "${YELLOW} Docker 配置文件不存在，无法关闭 IPv6${RESET}"
+    fi
+}
+
+# -----------------------------
+# 开放所有端口（支持 Alpine iptables/nftables）
+# -----------------------------
+open_all_ports() {
+    root_use
+    read -p "确认要开放所有端口吗？(Y/N): " confirm
+    [[ $confirm =~ [Yy] ]] || { echo -e "${YELLOW}操作已取消${RESET}"; return; }
+    echo -e "${YELLOW}正在清理防火墙规则...${RESET}"
+
+    if command -v iptables &>/dev/null; then
+        iptables -P INPUT ACCEPT 2>/dev/null
+        iptables -P FORWARD ACCEPT 2>/dev/null
+        iptables -P OUTPUT ACCEPT 2>/dev/null
+        iptables -F 2>/dev/null
+    fi
+    if command -v ip6tables &>/dev/null; then
+        ip6tables -P INPUT ACCEPT 2>/dev/null
+        ip6tables -P FORWARD ACCEPT 2>/dev/null
+        ip6tables -P OUTPUT ACCEPT 2>/dev/null
+        ip6tables -F 2>/dev/null
+    fi
+    if command -v nft &>/dev/null; then
+        nft flush ruleset 2>/dev/null || true
+    fi
+    # 如果装了 Alpine ufw 或 awall
+    rc-service ufw stop 2>/dev/null
+    rc-service ip tables stop 2>/dev/null
+    
+    echo -e "${GREEN}✅ 已关闭可能冲突的独立防火墙服务并开放基本端口${RESET}"
+    restart_docker
+}
+
+# -----------------------------
+# Alpine iptables 软链接切换逻辑
+# -----------------------------
+switch_iptables_legacy() {
+    root_use
+    if [ -f /sbin/iptables-legacy ] || [ -f /usr/sbin/iptables-legacy ]; then
+        # 备份规则
+        command -v iptables-save &>/dev/null && iptables-save > /tmp/iptables_v4.bak
+        
+        # Alpine 修改软链接
+        ln -sf /sbin/iptables-legacy /sbin/iptables 2>/dev/null || ln -sf /usr/sbin/iptables-legacy /usr/sbin/iptables
+        ln -sf /sbin/ip6tables-legacy /sbin/ip6tables 2>/dev/null || ln -sf /usr/sbin/ip6tables-legacy /usr/sbin/ip6tables
+        
+        restart_docker
+        [ -f /tmp/iptables_v4.bak ] && command -v iptables-restore &>/dev/null && iptables-restore < /tmp/iptables_v4.bak
+        echo -e "${GREEN}✅ Alpine 已成功切换到 iptables-legacy${RESET}"
+    else
+        # 如果未安装，帮用户安装
+        echo -e "${YELLOW}未检测到 legacy 组件，正在安装 iptables 传统包...${RESET}"
+        apk add iptables
+        switch_iptables_legacy
+    fi
+}
+
+switch_iptables_nft() {
+    root_use
+    if [ -f /sbin/iptables-nft ] || [ -f /usr/sbin/iptables-nft ]; then
+        command -v iptables-save &>/dev/null && iptables-save > /tmp/iptables_v4.bak
+        
+        ln -sf /sbin/iptables-nft /sbin/iptables 2>/dev/null || ln -sf /usr/sbin/iptables-nft /usr/sbin/iptables
+        ln -sf /sbin/ip6tables-nft /sbin/ip6tables 2>/dev/null || ln -sf /usr/sbin/ip6tables-nft /usr/sbin/ip6tables
+        
+        restart_docker
+        [ -f /tmp/iptables_v4.bak ] && command -v iptables-restore &>/dev/null && iptables-restore < /tmp/iptables_v4.bak
+        echo -e "${GREEN}✅ Alpine 已成功切换到 iptables-nft${RESET}"
+    else
+        echo -e "${YELLOW}未检测到 nft 组件，正在安装 nftables 包...${RESET}"
+        apk add nftables iptables-nft
+        switch_iptables_nft
+    fi
+}
+
+# -----------------------------
+# 状态查询
+# -----------------------------
+docker_status() {
+    if docker info &>/dev/null; then
+        echo "运行中"
+    else
+        echo "未运行"
+    fi
+}
+
+current_iptables() {
+    if [ -L /sbin/iptables ]; then
+        local link=$(readlink /sbin/iptables)
+        if [[ $link == *legacy* ]]; then
+            echo "legacy"
+        else
+            echo "nft"
+        fi
+    else
+        echo "未知 (未设置软链接)"
+    fi
+}
+
+# -----------------------------
+# Docker 容器管理
+# -----------------------------
+docker_ps() {
+    if ! check_docker_running; then return; fi
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker 容器管理 =====${RESET}"
+        docker ps -a --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}"
+        echo -e "${GREEN}01. 创建新容器${RESET}"
+        echo -e "${GREEN}02. 启动容器${RESET}"
+        echo -e "${GREEN}03. 停止容器${RESET}"
+        echo -e "${GREEN}04. 删除容器${RESET}"
+        echo -e "${GREEN}05. 重启容器${RESET}"
+        echo -e "${GREEN}06. 启动所有容器${RESET}"
+        echo -e "${GREEN}07. 停止所有容器${RESET}"
+        echo -e "${GREEN}08. 删除所有容器${RESET}"
+        echo -e "${GREEN}09. 重启所有容器${RESET}"
+        echo -e "${GREEN}10. 进入容器${RESET}"
+        echo -e "${GREEN}11. 查看日志${RESET}"
+        echo -e "${GREEN} 0. 返回主菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            01|1) read -p "请输入创建命令: " cmd; $cmd ;;
+            02|2) read -p "请输入容器名: " name; docker start $name ;;
+            03|3) read -p "请输入容器名: " name; docker stop $name ;;
+            04|4) read -p "请输入容器名: " name; docker rm -f $name ;;
+            05|5) read -p "请输入容器名: " name; docker restart $name ;;
+            06|6) containers=$(docker ps -a -q); [ -n "$containers" ] && docker start $containers || echo "无容器可启动" ;;
+            07|7) containers=$(docker ps -q); [ -n "$containers" ] && docker stop $containers || echo "无容器正在运行" ;;
+            08|8) read -p "确定删除所有容器? (Y/N): " c; [[ $c =~ [Yy] ]] && docker rm -f $(docker ps -a -q) ;;
+            09|9) containers=$(docker ps -q); [ -n "$containers" ] && docker restart $containers || echo "无容器正在运行" ;;
+            10) read -p "请输入容器名: " name; docker exec -it $name /bin/sh ;; # Alpine环境多用sh
+            11) read -p "请输入容器名: " name; docker logs -f $name ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+# -----------------------------
+# Docker 镜像管理
+# -----------------------------
+docker_image() {
+    if ! check_docker_running; then return; fi
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker 镜像管理 =====${RESET}"
+        docker image ls
+        echo -e "${GREEN}01. 拉取镜像${RESET}"
+        echo -e "${GREEN}02. 更新镜像${RESET}"
+        echo -e "${GREEN}03. 删除镜像${RESET}"
+        echo -e "${GREEN}04. 删除所有镜像${RESET}"
+        echo -e "${GREEN} 0. 返回主菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            01|1) read -p "请输入镜像名: " imgs; for img in $imgs; do docker pull $img; done ;;
+            02|2) read -p "请输入镜像名: " imgs; for img in $imgs; do docker pull $img; done ;;
+            03|3) read -p "请输入镜像名: " imgs; for img in $imgs; do docker rmi -f $img; done ;;
+            04|4) read -p "确定删除所有镜像? (Y/N): " c; [[ $c =~ [Yy] ]] && docker rmi -f $(docker images -q) ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+# -----------------------------
+# Docker 卷管理
+# -----------------------------
+docker_volume() {
+    if ! check_docker_running; then return; fi
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker 卷管理 =====${RESET}"
+        docker volume ls
+        echo -e "${GREEN}1. 创建卷${RESET}"
+        echo -e "${GREEN}2. 删除卷${RESET}"
+        echo -e "${GREEN}3. 删除所有无用卷${RESET}"
+        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            1) read -p "请输入卷名: " v; docker volume create $v ;;
+            2) read -p "请输入卷名: " v; docker volume rm $v ;;
+            3) docker volume prune -f ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+# -----------------------------
+# 清理所有未使用资源
+# -----------------------------
+docker_cleanup() {
+    root_use
+    echo -e "${YELLOW}清理所有未使用容器、镜像、卷...${RESET}"
+    docker system prune -af --volumes
+    echo -e "${GREEN}清理完成${RESET}"
+}
+
+# -----------------------------
+# Docker 网络管理
+# -----------------------------
+docker_network() {
+    if ! check_docker_running; then return; fi
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker 网络管理 =====${RESET}"
+        docker network ls
+        echo -e "${GREEN}1. 创建网络${RESET}"
+        echo -e "${GREEN}2. 加入网络${RESET}"
+        echo -e "${GREEN}3. 退出网络${RESET}"
+        echo -e "${GREEN}4. 删除网络${RESET}"
+        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " sub_choice
+        case $sub_choice in
+            1) read -p "设置新网络名: " dockernetwork; docker network create $dockernetwork ;;
+            2) read -p "加入网络名: " dockernetwork; read -p "容器名: " dockername; docker network connect $dockernetwork $dockername ;;
+            3) read -p "退出网络名: " dockernetwork; read -p "容器名: " dockername; docker network disconnect $dockernetwork $dockername ;;
+            4) read -p "请输入要删除的网络名: " dockernetwork; docker network rm $dockernetwork || echo -e "${RED}删除失败，网络可能被容器占用${RESET}" ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+# -----------------------------
+# Docker 备份/恢复菜单 (Alpine 优化版)
+# -----------------------------
+docker_backup_menu() {
+    root_use
+
+    BACKUP_DIR="/opt/docker_backups"
+    LOG_FILE="$BACKUP_DIR/backup.log"
+    mkdir -p "$BACKUP_DIR"
+
+    # 用 apk 检查依赖
+    if ! command -v jq &>/dev/null || ! command -v tar &>/dev/null; then
+        echo -e "${YELLOW}正在 Alpine 下配置基础依赖 (jq, tar)...${RESET}"
+        apk add jq tar gzip curl
+    fi
+
+    # 检查空间 (Alpine BusyBox 的 df 不支持 --output)
+    local avail_space=$(df -k "$BACKUP_DIR" | tail -1 | awk '{print $4}')
+    if (( avail_space < 1048576 )); then
+        echo -e "${RED}磁盘剩余空间不足 1GB，无法执行备份！${RESET}"
+        read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+        return
+    fi
+
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker Run备份与恢复 =====${RESET}"
+        echo -e "${GREEN}1. 备份 Docker${RESET}"
+        echo -e "${GREEN}2. 恢复 Docker${RESET}"
+        echo -e "${GREEN}3. 删除备份文件${RESET}"
+        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            1)
+                while true; do
+                    echo -e "${YELLOW}选择备份类型:${RESET}"
+                    echo -e "${GREEN}1. 容器${RESET}"
+                    echo -e "${GREEN}2. 镜像${RESET}"
+                    echo -e "${GREEN}3. 卷${RESET}"
+                    echo -e "${GREEN}4. 全量${RESET}"
+                    echo -e "${GREEN}0. 返回上一级${RESET}"
+                    read -p "$(echo -e ${GREEN}请选择:${RESET}) " btype
+                    [[ "$btype" == "0" ]] && break
+
+                    read -p "请输入备份文件名（默认 docker_backup_$(date +%F).tar.gz）: " backup_name
+                    backup_name=${backup_name:-docker_backup_$(date +%F).tar.gz}
+                    backup_path="$BACKUP_DIR/$backup_name"
+
+                    TMP_BACKUP_DIR=$(mktemp -d /tmp/docker_backup_XXXX)
+
+                    # --- 容器备份 ---
+                    if [[ "$btype" == "1" || "$btype" == "4" ]]; then
+                        echo "可用容器列表："
+                        docker ps -a --format "{{.Names}}"
+                        read -p "请输入要备份的容器名（多个用空格，留空则全部）: " selected_containers
+                        [[ -z "$selected_containers" ]] && selected_containers=$(docker ps -a --format "{{.Names}}")
+                        for cname in $selected_containers; do
+                            cid=$(docker ps -a -q -f name="^${cname}$")
+                            [[ -z "$cid" ]] && echo "容器 $cname 不存在，跳过" && continue
+                            docker inspect $cid > "$TMP_BACKUP_DIR/container_${cname}.json"
+                            docker export "$cid" -o "$TMP_BACKUP_DIR/container_${cname}.tar"
+                            echo "$(date '+%F %T') 备份容器 $cname 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    # --- 镜像备份 ---
+                    if [[ "$btype" == "2" || "$btype" == "4" ]]; then
+                        echo "可用镜像列表："
+                        docker images --format "{{.Repository}}:{{.Tag}}"
+                        read -p "请输入要备份的镜像（多个用空格，留空则全部）: " selected_images
+                        [[ -z "$selected_images" ]] && selected_images=$(docker images --format "{{.Repository}}:{{.Tag}}")
+                        for iname in $selected_images; do
+                            [[ "$iname" == "<none>:<none>" ]] && continue
+                            safe_name=$(echo "$iname" | tr '/:' '_')
+                            docker save "$iname" -o "$TMP_BACKUP_DIR/image_${safe_name}.tar"
+                            echo "$(date '+%F %T') 备份镜像 $iname 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    # --- 卷备份 ---
+                    if [[ "$btype" == "3" || "$btype" == "4" ]]; then
+                        echo "可用卷列表："
+                        docker volume ls -q
+                        read -p "请输入要备份的卷名（多个用空格，留空则全部）: " selected_volumes
+                        [[ -z "$selected_volumes" ]] && selected_volumes=$(docker volume ls -q)
+                        for vol in $selected_volumes; do
+                            [[ ! -d /var/lib/docker/volumes/"$vol"/_data ]] && echo "卷 $vol 不存在，跳过" && continue
+                            tar -czf "$TMP_BACKUP_DIR/volume_${vol}.tar.gz" -C /var/lib/docker/volumes/"$vol"/_data .
+                            echo "$(date '+%F %T') 备份卷 $vol 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    tar -czf "$backup_path" -C "$TMP_BACKUP_DIR" .
+                    rm -rf "$TMP_BACKUP_DIR"
+                    echo -e "${GREEN}备份完成: $backup_path${RESET}"
+                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+                    break
+                done
+                ;;
+            2)
+                while true; do
+                    echo -e "${YELLOW}选择恢复类型:${RESET}"
+                    echo -e "${GREEN}1. 容器${RESET}"
+                    echo -e "${GREEN}2. 镜像${RESET}"
+                    echo -e "${GREEN}3. 卷${RESET}"
+                    echo -e "${GREEN}4. 全量${RESET}"
+                    echo -e "${GREEN}0. 返回上一级${RESET}"
+                    read -p "$(echo -e ${GREEN}请选择:${RESET}) " rtype
+                    [[ "$rtype" == "0" ]] && break
+
+                    read -p "请输入备份文件路径: " backup_file
+                    [[ ! -f "$backup_file" ]] && echo -e "${RED}备份文件不存在${RESET}" && read -p "按回车继续..." && continue
+
+                    TMP_RESTORE_DIR=$(mktemp -d /tmp/docker_restore_XXXX)
+                    tar -xzf "$backup_file" -C "$TMP_RESTORE_DIR"
+
+                    # --- 容器恢复 ---
+                    if [[ "$rtype" == "1" || "$rtype" == "4" ]]; then
+                        for cjson in "$TMP_RESTORE_DIR"/container_*.json; do
+                            [ ! -f "$cjson" ] && continue
+                            cname=$(basename "$cjson" | sed 's/container_\(.*\).json/\1/')
+                            image=$(jq -r '.[0].Config.Image' "$cjson")
+                            envs=$(jq -r '.[0].Config.Env | join(" -e ")' "$cjson")
+                            [[ -n "$envs" ]] && envs="-e $envs"
+                            ports=$(jq -r '.[0].HostConfig.PortBindings | to_entries | map("\(.value[0].HostPort):\(.key)") | join(" -p ")' "$cjson")
+                            [[ -n "$ports" ]] && ports="-p $ports"
+                            mounts=$(jq -r '.[0].Mounts | map("-v \(.Source):\(.Destination)") | join(" ")' "$cjson")
+                            network=$(jq -r '.[0].HostConfig.NetworkMode' "$cjson")
+
+                            # 如果镜像不存在，尝试从备份加载
+                            safe_image_name=$(echo "$image" | tr '/:' '_')
+                            img_tar="$TMP_RESTORE_DIR/image_${safe_image_name}.tar"
+                            [[ -f "$img_tar" ]] && docker load -i "$img_tar"
+
+                            docker run -d --name "$cname" $envs $ports $mounts --network "$network" "$image"
+                            echo "$(date '+%F %T') 恢复容器 $cname 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    # --- 镜像恢复 ---
+                    if [[ "$rtype" == "2" || "$rtype" == "4" ]]; then
+                        for img_file in "$TMP_RESTORE_DIR"/image_*.tar; do
+                            [[ -f "$img_file" ]] && docker load -i "$img_file"
+                        done
+                    fi
+
+                    # --- 卷恢复 ---
+                    if [[ "$rtype" == "3" || "$rtype" == "4" ]]; then
+                        for vol_file in "$TMP_RESTORE_DIR"/volume_*.tar.gz; do
+                            [ ! -f "$vol_file" ] && continue
+                            vol_name=$(basename "$vol_file" | sed 's/volume_\(.*\).tar.gz/\1/')
+                            if docker volume inspect "$vol_name" &>/dev/null; then
+                                read -p "卷 $vol_name 已存在，是否覆盖? (y/N): " confirm
+                                [[ "$confirm" != "y" ]] && continue
+                            fi
+                            docker volume create "$vol_name" >/dev/null 2>&1
+                            tar -xzf "$vol_file" -C /var/lib/docker/volumes/"$vol_name"/_data
+                            echo "$(date '+%F %T') 恢复卷 $vol_name 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    rm -rf "$TMP_RESTORE_DIR"
+                    echo -e "${GREEN}恢复完成${RESET}"
+                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+                    break
+                done
+                ;;
+            3)
+                while true; do
+                    echo "当前备份目录：$BACKUP_DIR"
+                    ls "$BACKUP_DIR"
+                    read -p "请输入要删除的备份文件名（支持空格或*通配符，输入0返回）: " del_files
+                    [[ "$del_files" == "0" ]] && break
+                    cd "$BACKUP_DIR" && rm -f $del_files
+                    echo -e "${GREEN}删除完成${RESET}"
+                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+                    break
+                done
+                ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}"; read -p "$(echo -e ${GREEN}按回车继续...${RESET})" ;;
+        esac
+    done
+}
+
+# -----------------------------
+# 容器监控 (兼容 Alpine BusyBox)
+# -----------------------------
+monitor_docker_containers() {
     clear
-    echo -e "${GREEN}==========================${NC}"
-    echo -e "${GREEN}     流量日报 TG通知工具   ${NC}"
-    echo -e "${GREEN}==========================${NC}"
-    echo -e "${GREEN} 1. 安装${NC}"
-    echo -e "${GREEN} 2. 修改配置${NC}"
-    echo -e "${GREEN} 3. 发送测试${NC}"
-    echo -e "${GREEN} 4. 更新${NC}"
-    echo -e "${GREEN} 5. 卸载${NC}"
-    echo -e "${GREEN} 0. 退出${NC}"
-    echo -e "${GREEN}==========================${NC}"
+    echo -e "${YELLOW}========================================${RESET}"
+    echo -e "${YELLOW}         🐳 Docker 容器监控${RESET}"
+    echo -e "${YELLOW}========================================${RESET}"
 
-    printf "${GREEN} 请选择: ${NC}"
-    read choice
-    case $choice in
-        1) prepare_env; collect_config; echo "✅ 安装完成！"; sleep 2 ;;
-        2) collect_config; echo "✅ 配置与通知时间更新成功！"; sleep 2 ;;
-        3) 
-            if [ -f "$BIN_PATH" ]; then
-                /bin/sh "$BIN_PATH" && echo "✅ 日报已触发发送！" || echo "❌ 发送失败，请检查配置或网络。"; 
-            else
-                echo "❌ 报告脚本尚未生成，请先执行全新安装或修改配置。";
-            fi
-            sleep 3 ;;
-        4) generate_report_logic; echo "✅ 已更新！"; sleep 1 ;;
-        5) 
-            (crontab -l 2>/dev/null | grep -v "$BIN_PATH") | crontab -; 
-            rm -f "$BIN_PATH" "$CONFIG_FILE"; 
-            echo "✅ 卸载成功，已清理配置文件及 Cron 定时任务。"; 
-            sleep 2 ;;
-        0) exit 0 ;;
-        *) echo "❌ 无效选项"; sleep 1 ;;
-    esac
-done
+    if ! check_docker_running; then return; fi
+
+    docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" | sort -k3 -hr | while IFS=$'\t' read -r name cpu mem net; do
+        local raw_status
+        raw_status=$(docker ps -a --filter "name=^/${name}$" --format "{{.Status}}")
+        
+        # 汉化引擎 (BusyBox 兼容)
+        local uptime
+        uptime=$(echo "$raw_status" | \
+            sed 's/Up /运行 /; s/Exited/已停止/; s/(healthy)/(健康)/; s/(unhealthy)/(非健康)/; s/(starting)/(启动中)/; s/seconds/秒/; s/second/秒/; s/minutes/分钟/; s/minute/分钟/; s/hours/小时/; s/hour/小时/; s/days/天/; s/day/天/; s/weeks/周/; s/week/周/; s/months/月/; s/month/月/; s/about //; s/ago/前/')
+
+        # 获取端口原始数据
+        local raw_ports
+        raw_ports=$(docker ps -a --filter "name=^/${name}$" --format "{{.Ports}}")
+
+        echo -e "${YELLOW}◈ 容器: ${RESET}${YELLOW}${name}${RESET}"
+        echo -e "  ├─ ${YELLOW}CPU 占用: ${RESET}${cpu}"
+        echo -e "  ├─ ${YELLOW}内存使用: ${RESET}${mem}"
+        echo -e "  ├─ ${YELLOW}网络 I/O: ${RESET}${net}"
+        echo -e "  ├─ ${YELLOW}运行状态: ${RESET}${YELLOW}${uptime}${RESET}"
+        
+        # 兼容 BusyBox 的端口格式化输出
+        if [ -z "$raw_ports" ]; then
+            echo -e "  └─ ${YELLOW}端口映射: ${RESET}${CYAN}无端口映射${RESET}"
+        else
+            echo -e "  └─ ${YELLOW}端口映射: ${RESET}"
+            # 1. 过滤掉无用的 0.0.0.0: 和 :::
+            # 2. 用 tr 把逗号空格变成换行
+            # 3. 用 while 循环加上美化的缩进线条
+            echo "$raw_ports" | sed 's/0.0.0.0://g; s/::://g' | tr ',' '\n' | while read -r port; do
+                # 去除两端可能存在的空格
+                port=$(echo "$port" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                [ -n "$port" ] && echo -e "        ${YELLOW}│${RESET}  ${CYAN}${port}${RESET}"
+            done
+        fi
+        echo -e "${YELLOW}----------------------------------------${RESET}"
+    done
+}
+
+# -----------------------------
+# 主菜单
+# -----------------------------
+main_menu() {
+    root_use
+    while true; do
+        clear
+        echo -e "\033[36m"
+        echo "  ____                                "
+        echo " |  _ \  ___   ___| | _____ _ __ "
+        echo " | | |/ _ \ / __| |/ / _ \ '__|"
+        echo " | |_| | (_) | (__|   <  __/ |   "
+        echo " |____/ \___/ \___|_|\_\___|_|   "
+        
+        if command -v docker &>/dev/null; then
+            local d_status=$(docker info &>/dev/null && echo "运行中" || echo "未运行")
+            local total=$(docker ps -a -q 2>/dev/null | wc -l)
+            local running=$(docker ps -q 2>/dev/null | wc -l)
+            echo -e "${YELLOW}🐳| Docker: $d_status | 总容器: $total | 运行中: $running${RESET}"
+        else
+            echo -e "${YELLOW}🐳| Docker: 未安装 | 防火墙驱动: $(current_iptables)${RESET}"
+        fi
+
+        echo -e "${GREEN}01. 安装/更新 Docker${RESET}"
+        echo -e "${GREEN}02. 安装/更新 Docker Compose${RESET}"
+        echo -e "${GREEN}03. 卸载 Docker & Compose${RESET}"
+        echo -e "${GREEN}04. 容器管理${RESET}"
+        echo -e "${GREEN}05. 镜像管理${RESET}"
+        echo -e "${GREEN}06. 开启 IPv6${RESET}"
+        echo -e "${GREEN}07. 关闭 IPv6${RESET}"
+        echo -e "${GREEN}08. 开放所有端口${RESET}"
+        echo -e "${GREEN}09. 网络管理${RESET}"
+        echo -e "${GREEN}10. 切换至 iptables-legacy${RESET}"
+        echo -e "${GREEN}11. 切换至 iptables-nft${RESET}"
+        echo -e "${GREEN}12. Docker备份/恢复${RESET}"
+        echo -e "${GREEN}13. 卷管理${RESET}"
+        echo -e "${YELLOW}14. 一键清理所有未使用容器/镜像/卷${RESET}"
+        echo -e "${GREEN}15. 重启Docker服务${RESET}"
+        echo -e "${GREEN}16. Docker容器实时监控${RESET}"
+        echo -e "${GREEN} 0. 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            01|1) docker_install_update ;;
+            02|2) docker_compose_install_update ;;
+            03|3) docker_uninstall ;;
+            04|4) check_docker_running && docker_ps ;;
+            05|5) check_docker_running && docker_image ;;
+            06|6) check_docker_running && docker_ipv6_on ;;
+            07|7) check_docker_running && docker_ipv6_off ;;
+            08|8) open_all_ports ;;
+            09|9) check_docker_running && docker_network ;;
+            10) switch_iptables_legacy ;;
+            11) switch_iptables_nft ;;
+            12) check_docker_running && docker_backup_menu ;;
+            13) check_docker_running && docker_volume ;;
+            14) check_docker_running && docker_cleanup ;;
+            15) check_docker_running && restart_docker ;;
+            16) monitor_docker_containers ;;
+             0) exit 0 ;;
+             *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+# 启动
+main_menu

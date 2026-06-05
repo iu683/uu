@@ -322,8 +322,10 @@ configure_fail2ban() {
     
     log "${BLUE}正在安装 Fail2ban...${RESET}"
     apk add fail2ban >/dev/null
+
+    mkdir -p /etc/fail2ban/jail.d
     
-    cat > /etc/fail2ban/jail.local << EOF
+    cat > /etc/fail2ban/jail.d/sshd.local << EOF
 [DEFAULT]
 bantime = 86400
 findtime = 300

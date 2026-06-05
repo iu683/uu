@@ -18,7 +18,7 @@ LOG_FILE="/var/log/alpine_setup.log"
 non_interactive=${NON_INTERACTIVE:-false}
 
 # 适配 Alpine 的精简依赖包 
-deps="curl wget git net-tools lsof tar unzip rsync pv sudo netcat-openbsd openssh openssh-client jq openssl ca-certificates"
+deps="curl wget git net-tools bash lsof tar unzip rsync pv sudo netcat-openbsd openssh openssh-client jq openssl ca-certificates"
 
 log() {
     echo -e "$1"
@@ -44,6 +44,7 @@ detect_environment() {
     log "${YELLOW}[INFO] 当前运行环境: ${VIRT_TYPE}${RESET}"
     log "${YELLOW}[INFO] 由于容器环境共享宿主机内核，无法进行 BBR 调优、Swap 分配等底层操作。${RESET}"
     log "${YELLOW}[INFO] 请在 KVM/VMware/XEN 等全虚拟化架构或物理机上运行此脚本。${RESET}"
+    log "${YELLOW}[INFO] 注意：运行结束后会自动重启服务器。${RESET}"
 }
 
 # 2. 系统更新与依赖安装
@@ -262,7 +263,7 @@ configure_ssh() {
         # 交互模式下，先征求用户同意
         if [ "$non_interactive" = false ]; then
             if [ -f "$key_file" ]; then
-                echo -e "${RED}⚠️ 警告: 检测到系统已存在 SSH 私钥 ($key_file)${RESET}"
+                echo -e "${RED}警告: 检测到系统已存在 SSH 私钥 ($key_file)${RESET}"
                 echo -n "是否覆盖并重新生成专属 SSH 密钥对？[y/N]: "
             else
                 echo -n "是否为当前服务器自动生成专属 SSH 登录密钥对？[y/N]: "
@@ -394,8 +395,39 @@ docker_install() {
     fi
     
     log "${BLUE}开始安装 Docker 引擎与 Docker-Compose...${RESET}"
-    apk add docker docker-cli-compose >/dev/null
+    apk add docker docker-cli docker-cli-compose >/dev/null
     
+    # ==================== 新增：智能判断国家并配置加速 ====================
+    log "${BLUE}正在检测服务器地理位置...${RESET}"
+    IS_CN=false
+    
+    # 尝试多接口获取国家代码 (CN)
+    COUNTRY=$(curl -s --max-time 3 https://ip.sb/country_code 2>/dev/null || \
+              curl -s --max-time 3 https://ipapi.co/country 2>/dev/null || \
+              curl -s --max-time 3 http://ip-api.com/json/ | grep -o '"countryCode":"[^"]*' | cut -d'"' -f4)
+
+    if [ "$COUNTRY" = "CN" ]; then
+        IS_CN=true
+    fi
+
+    if [ "$IS_CN" = true ]; then
+        log "${YELLOW}[CN] 检测到当前服务器位于中国大陆，正在配置国内加速镜像...${RESET}"
+        mkdir -p /etc/docker
+        cat <<EOF > /etc/docker/daemon.json
+{
+  "registry-mirrors": [
+    "https://docker.xuanyuan.me",
+    "https://docker.1ms.run",
+    "https://docker.m.daocloud.io",
+    "https://docker.unsee.tech"
+  ]
+}
+EOF
+    else
+        log "${GREEN}[GLOBAL] 检测到海外服务器，使用 Docker Hub 官方源直连，无需加速。${RESET}"
+    fi
+    # ==============================================================
+
     if [ -f /etc/init.d/docker ]; then
         rc-update add docker default >/dev/null 2>&1
         rc-service docker start >/dev/null 2>&1
@@ -475,15 +507,15 @@ show_vps_info() {
 # 主流程控制
 main() {
     clear
-    echo -e "${CYAN}======================================================${RESET}"
-    echo -e "${GREEN}      欢迎使用 Alpine Linux 专属全能优化${RESET}"
-    echo -e "${CYAN}======================================================${RESET}"
+    echo -e "${GREEN}======================================================${RESET}"
+    echo -e "${GREEN}          欢迎使用 Alpine Linux 全能优化               ${RESET}"
+    echo -e "${GREEN}======================================================${RESET}"
     
     root_check
     detect_environment
     
     if [ "$non_interactive" = false ]; then
-        echo -n "是否立刻开始执行一键优化？ [Y/n]: "
+        echo -n "是否立刻开始执行一键优化？ [y/n]: "
         read -r CONFIRM
         if [ "$CONFIRM" = "n" ] || [ "$CONFIRM" = "N" ]; then
             exit 0
@@ -515,7 +547,7 @@ main() {
         echo -e "${CYAN}======================================================${RESET}"
         echo -e "${GREEN}${PRIVATE_KEY_CONTENT}${RESET}"
         echo -e "${CYAN}======================================================${RESET}"
-        echo -e "${RED}⚠️ 复制完成后，请按任意键确认以允许系统重启生效...${RESET}"
+        echo -e "${YELLOW}复制完成后，请按任意键确认以允许系统重启生效...${RESET}"
         read -r _
     fi
 

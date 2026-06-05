@@ -1,572 +1,383 @@
 #!/bin/bash
-set -e
-export DEBIAN_FRONTEND=noninteractive
 
-# ==========================================
-# 系统更新 & 常用依赖安装 & 修复 APT 源
-# ==========================================
+# =================================================================
+# 名称: 流量统计 & VPS/Docker 状态 TG日报管理工具
+# =================================================================
 
-# 颜色定义
-RED="\033[31m"
 GREEN="\033[32m"
+RED="\033[31m"
 YELLOW="\033[33m"
-RESET="\033[0m"
-
-# 检查是否 root
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}❌ 请使用 root 用户运行此脚本${RESET}"
-    exit 1
-fi
+GRAY="\033[90m"
+NC="\033[0m" # 清除颜色
 
 
-# ========================================
-# Alpine 路径
-# ========================================
-if [ -f /etc/os-release ]; then
-    . /etc/os-release
-fi
+CONFIG_FILE="/etc/vnstat_tg.conf"  # 配置文件路径
+BIN_PATH="/usr/local/bin/vnstat_tg_report.sh"  # 报告脚本路径
 
-if [ "$ID" = "alpine" ]; then
-    echo -e "${YELLOW}🚀 Alpine更新与环境配置...${RESET}"
+# --- 1. 环境准备 ---
+prepare_env() {
+    echo "🔍 正在检查系统环境..."
 
-    # -------------------------
-    # 环境变量与检测
-    # -------------------------
-    IS_CONTAINER=0
-    
-    # 1. 检测 Docker
-    if [ -f /.dockerenv ] || grep -qi docker /proc/1/cgroup 2>/dev/null; then
-        IS_CONTAINER=1
-        echo -e "${YELLOW}🐳 检测到当前运行在 Docker 容器环境${RESET}"
-    # 2. 检测 LXC
-    elif grep -qi lxc /proc/1/environ 2>/dev/null || grep -qi lxc /proc/self/cgroup 2>/dev/null; then
-        IS_CONTAINER=1
-        echo -e "${YELLOW}📦 检测到当前运行在 LXC 容器环境 (将跳过内核网络优化)${RESET}"
-    fi
-    # 更新索引并安装基础工具 + cron
-    # 如果是容器，就不安装后面可能用到的 openntpd 等硬件工具
-    apk update && apk upgrade
-    
-    # 基础装机必备组件
-    APK_PACKAGES="bash curl wget vim tar sudo git gzip openssl bind-tools openssh ca-certificates tzdata dcron jq gcompat"
-    
-    # 只有非容器环境（物理机/VM）才安装时间同步服务
-    if [ "$IS_CONTAINER" -eq 0 ]; then
-        APK_PACKAGES="$APK_PACKAGES openntpd"
-    fi
-    
-    apk add --no-cache $APK_PACKAGES
+    # 基础依赖包
+    local deps=("vnstat" "bc" "curl" "cron" "sed" "awk")
 
-    # -------------------------
-    # 时区设置
-    # -------------------------
-    TZ=${TZ:-Asia/Shanghai}
-    echo -e "${YELLOW}🌏 配置时区为: $TZ ...${RESET}"
-
-    if [ -f "/usr/share/zoneinfo/$TZ" ]; then
-        ln -sf "/usr/share/zoneinfo/$TZ" /etc/localtime
-        echo "$TZ" > /etc/timezone
-        echo -e "${GREEN}✔ 时区设置完成${RESET}"
-    else
-        echo -e "${RED}❌ 时区不存在: $TZ${RESET}"
-    fi
-
-    # -------------------------
-    # 时间同步 (容器内跳过)
-    # -------------------------
-    if [ "$IS_CONTAINER" -eq 0 ]; then
-        echo -e "${YELLOW}⏰ 正在配置时间同步 (NTP)...${RESET}"
-        # 允许 openntpd 强制步进同步时间（防止时间偏差过大）
-        sed -i 's/#constraints/constraints/g' /etc/ntpd.conf 2>/dev/null
-        
-        if [ -f /run/openrc/softlevel ]; then
-            rc-update add openntpd default
-            rc-service openntpd restart
-            echo -e "${GREEN}✔ OpenNTPD 服务已启动并设为自启${RESET}"
-        else
-            # 备用方案：直接使用 busybox 自带的 ntpd 进行单次强制同步
-            ntpd -n -q -p pool.ntp.org >/dev/null 2>&1 &
-            echo -e "${GREEN}✔ 已在后台触发 ntp 单次同步${RESET}"
-        fi
-    else
-        echo -e "${BLUE}ℹ 容器环境：跳过硬件时间同步，共享宿主机时间${RESET}"
-    fi
-
-    # -------------------------
-    # 开启 BBR + FQ (容器内跳过)
-    # -------------------------
-    if [ "$IS_CONTAINER" -eq 0 ]; then
-        echo -e "${YELLOW}🚀 正在配置网络优化 (BBR + FQ)...${RESET}"
-        
-        # 检查当前内核是否已加载或支持 tcp_bbr
-        if modprobe tcp_bbr 2>/dev/null || sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
-            # 写入 sysctl 配置文件
-            cat > /etc/sysctl.d/99-bbr.conf << EOF
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-EOF
-            # 尝试立即刷新内核参数
-            sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1
-            
-            # 验证结果
-            CURRENT_CC=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')
-            CURRENT_QDISC=$(sysctl net.core.default_qdisc | awk '{print $3}')
-            
-            if [ "$CURRENT_CC" = "bbr" ]; then
-                echo -e "${GREEN}✔ BBR 拥塞控制算法激活成功！(当前 qdisc: $CURRENT_QDISC)${RESET}"
-            else
-                echo -e "${YELLOW}⚠ 内核参数已写入，可能需要重启系统以完全生效${RESET}"
-            fi
-        else
-            echo -e "${RED}❌ 当前系统内核似乎不支持 BBR，已跳过配置${RESET}"
-        fi
-    else
-        echo -e "${BLUE}ℹ 容器环境：无内核修改权限，跳过 BBR 配置${RESET}"
-    fi
-
-    # -------------------------
-    # 安装 NextTrace (容器内跳过)
-    # -------------------------
-    if [ "$IS_CONTAINER" -eq 0 ]; then
-        echo -e "${YELLOW}📡 正在安装 NextTrace 路由追踪工具...${RESET}"
-        # 使用官方一键脚本安装
-        if curl -splJf https://nxtrace.org/nt | bash; then
-            echo -e "${GREEN}✔ NextTrace 安装成功！(可直接运行 nexttrace 或 nt)${RESET}"
-        else
-            echo -e "${RED}❌ NextTrace 安装失败，请检查网络连接${RESET}"
-        fi
-    else
-        echo -e "${BLUE}ℹ 容器环境：通常不需要网络诊断工具，跳过 NextTrace 安装${RESET}"
-    fi
-
-    # -------------------------
-    # Cron 服务配置
-    # -------------------------
-    echo -e "${YELLOW}⏰ 正在启动 Cron 服务...${RESET}"
-    mkdir -p /var/spool/cron/crontabs
-
-    if [ -f /run/openrc/softlevel ]; then
-        # 针对普通 Alpine 系统 (OpenRC)
-        rc-update add dcron default
-        rc-service dcron start 2>/dev/null || rc-service dcron restart
-    else
-        # 针对 Docker 容器环境
-        # 先杀掉已有的，防止重复启动报错
-        pkill -9 crond 2>/dev/null
-        crond -b -L /var/log/cron.log
-    fi
-    echo -e "${GREEN}✔ Cron 服务配置就绪${RESET}"
-
-    # -------------------------
-    # 🧹 清理缓存
-    # -------------------------
-    echo -e "${YELLOW}🧹 清理 APK 缓存...${RESET}"
-    rm -rf /var/cache/apk/*
-
-    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-    echo -e "${GREEN}🎉 系统更新与优化工作已全部完成！${RESET}"
-    echo -e "${YELLOW}📅 完成时间: $(date +'%Y-%m-%d %H:%M:%S')${RESET}"
-    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-
-    exit 0
-fi
-# -------------------------
-# 常用依赖
-# -------------------------
-deps=(curl wget git net-tools lsof tar unzip rsync pv sudo iperf3 mtr jq openssl)
-
-# -------------------------
-# 检查并安装依赖（兼容不同系统）
-# -------------------------
-check_and_install() {
-    local check_cmd="$1"
-    local install_cmd="$2"
-    local missing=()
-    for pkg in "${deps[@]}"; do
-        if ! eval "$check_cmd \"$pkg\"" &>/dev/null; then
-            missing+=("$pkg")
-        else
-            echo -e "${GREEN}✔ 已安装: $pkg${RESET}"
-        fi
-    done
-
-    if [ ${#missing[@]} -gt 0 ]; then
-        echo -e "${YELLOW}👉 安装缺失依赖: ${missing[*]}${RESET}"
-        # Debian 系统处理 netcat
-        if [ "$OS_TYPE" = "debian" ]; then
-            # 让 iperf3 安装时自动选择 No（不启动 daemon）
-            echo "iperf3 iperf3/start_daemon boolean false" | debconf-set-selections
-            for pkg in "${missing[@]}"; do
-                if [ "$pkg" = "nc" ]; then
-                    apt install -y netcat-openbsd
-                else
-                    apt install -y "$pkg"
-                fi
-            done
-        else
-            eval "$install_cmd \"\${missing[@]}\""
-        fi
-    fi
-}
-
-# -------------------------
-# 清理重复 Docker 源
-# -------------------------
-fix_duplicate_docker_sources() {
-    echo -e "${YELLOW}🔍 检查重复 Docker APT 源...${RESET}"
-    local docker_sources
-    docker_sources=$(grep -rl "download.docker.com" /etc/apt/sources.list.d/ 2>/dev/null || true)
-    if [ "$(echo "$docker_sources" | grep -c .)" -gt 1 ]; then
-        echo -e "${RED}⚠️ 检测到重复 Docker 源:${RESET}"
-        echo "$docker_sources"
-        for f in $docker_sources; do
-            if [[ "$f" == *"archive_uri"* ]]; then
-                rm -f "$f"
-                echo -e "${GREEN}✔ 删除多余源: $f${RESET}"
-            fi
-        done
-    else
-        echo -e "${GREEN}✔ Docker 源正常${RESET}"
-    fi
-}
-
-# -------------------------
-# 修复 sources.list（兼容 Bullseye / Bookworm）
-# -------------------------
-fix_sources_for_version() {
-    echo -e "${YELLOW}🔍 修复 sources.list 兼容性...${RESET}"
-    local version="$1"
-    local files
-    files=$(grep -rl "deb" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true)
-    for f in $files; do
-        if [[ "$version" == "bullseye" ]]; then
-            sed -i -r 's/\bnon-free(-firmware){0,3}\b/non-free/g' "$f"
-            sed -i '/deb .*bullseye-backports/s/^/##/' "$f"
-        elif [[ "$version" == "bookworm" ]]; then
-            # Bookworm 保留 non-free-firmware，但去掉重复 non-free
-            sed -i -r 's/\bnon-free non-free\b/non-free/g' "$f"
-        fi
-    done
-    echo -e "${GREEN}✔ sources.list 已优化${RESET}"
-}
-
-# -------------------------
-# 系统更新函数
-# -------------------------
-update_system() {
-    echo -e "${GREEN}🔄 检测系统发行版并更新...${RESET}"
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        echo -e "${YELLOW}👉 当前系统: $PRETTY_NAME${RESET}"
-
-        # 系统类型
-        if [[ "$ID" =~ debian|ubuntu ]]; then
-            OS_TYPE="debian"
-            fix_duplicate_docker_sources
-            if [[ "$ID" == "debian" ]]; then
-                fix_sources_for_version "$VERSION_CODENAME"
-            fi
-            apt update && apt upgrade -y
-            check_and_install "dpkg -s" "apt install -y"
-        elif [[ "$ID" =~ fedora ]]; then
-            OS_TYPE="rhel"
-            dnf check-update || true
-            dnf upgrade -y
-            check_and_install "rpm -q" "dnf install -y"
-        elif [[ "$ID" =~ centos|rhel ]]; then
-            OS_TYPE="rhel"
-            yum check-update || true
-            yum upgrade -y
-            check_and_install "rpm -q" "yum install -y"
-        elif [[ "$ID" =~ alpine ]]; then
-            OS_TYPE="alpine"
-            apk update && apk upgrade
-            check_and_install "apk info -e" "apk add"
-        else
-            echo -e "${RED}❌ 暂不支持的 Linux 发行版: $ID${RESET}"
-            return 1
-        fi
-    else
-        echo -e "${RED}❌ 无法检测系统发行版 (/etc/os-release 不存在)${RESET}"
-        return 1
-    fi
-
-    echo -e "${GREEN}✅ 系统更新和依赖安装完成！${RESET}"
-}
-
-
-install_netcat() {
-    echo -e "${YELLOW}🔍 检查 netcat...${RESET}"
-
-    if command -v nc >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ nc 已安装${RESET}"
-        return
-    fi
-
-    echo -e "${YELLOW}👉 安装 netcat-openbsd...${RESET}"
-
-    if [ "$OS_TYPE" = "debian" ]; then
-        apt install -y netcat-openbsd
-    elif [ "$OS_TYPE" = "rhel" ]; then
-        yum install -y nc 2>/dev/null || dnf install -y nc
-    elif [ "$OS_TYPE" = "alpine" ]; then
-        apk add netcat-openbsd
-    else
-        echo -e "${RED}❌ 未知系统，无法安装 nc${RESET}"
-        return 1
-    fi
-
-    if command -v nc >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ nc 安装成功${RESET}"
-    else
-        echo -e "${RED}❌ nc 安装失败${RESET}"
-    fi
-}
-
-install_dnsutils() {
-    echo -e "${YELLOW}🔍 检查 DNS 工具(dnsutils)...${RESET}"
-
-    if command -v dig >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ DNS 工具已安装${RESET}"
-        return
-    fi
-
-    echo -e "${YELLOW}👉 安装 DNS 工具...${RESET}"
-
-    if [ "$OS_TYPE" = "debian" ]; then
-        apt install -y bind9-dnsutils
-    elif [ "$OS_TYPE" = "rhel" ]; then
-        yum install -y bind-utils 2>/dev/null || dnf install -y bind-utils
-    elif [ "$OS_TYPE" = "alpine" ]; then
-        apk add bind-tools
-    else
-        echo -e "${RED}❌ 未知系统，无法安装 DNS 工具${RESET}"
-        return 1
-    fi
-
-    if command -v dig >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ DNS 工具安装成功${RESET}"
-    else
-        echo -e "${RED}❌ DNS 工具安装失败${RESET}"
-    fi
-}
-# -------------------------
-# 安装并启动 cron
-# -------------------------
-install_cron() {
-    echo -e "${YELLOW}⏰ 检查并安装 cron 定时任务服务...${RESET}"
-
-    case "$OS_TYPE" in
-        debian)
-            if ! dpkg -s cron >/dev/null 2>&1; then
-                echo -e "${YELLOW}📦 安装 cron...${RESET}"
-                apt update
-                apt install -y cron
-            else
-                echo -e "${GREEN}✔ cron 已安装${RESET}"
-            fi
-            systemctl enable --now cron
-            ;;
-        rhel)
-            if ! rpm -q cronie >/dev/null 2>&1; then
-                echo -e "${YELLOW}📦 安装 cronie...${RESET}"
-                yum install -y cronie 2>/dev/null || dnf install -y cronie
-            else
-                echo -e "${GREEN}✔ cronie 已安装${RESET}"
-            fi
-            systemctl enable --now crond
-            ;;
-        alpine)
-            if ! apk info -e cronie >/dev/null 2>&1; then
-                echo -e "${YELLOW}📦 安装 cronie...${RESET}"
-                apk add cronie
-            else
-                echo -e "${GREEN}✔ cronie 已安装${RESET}"
-            fi
-            rc-update add crond
-            service crond start
-            ;;
-        *)
-            echo -e "${RED}❌ 未知系统类型，无法安装 cron${RESET}"
-            return 1
-            ;;
-    esac
-
-    # 状态检测
-    if systemctl is-active --quiet cron 2>/dev/null || systemctl is-active --quiet crond 2>/dev/null; then
-        echo -e "${GREEN}✔ cron 服务已运行${RESET}"
-    else
-        echo -e "${RED}❌ cron 服务未启动，请手动检查${RESET}"
-    fi
-}
-
-# -------------------------
-# 安装 NextTrace（网络路由追踪工具）
-# -------------------------
-install_nexttrace() {
-    echo -e "${YELLOW}🌐 检查并安装 NextTrace...${RESET}"
-
-    # 确保 curl 存在
-    if ! command -v curl >/dev/null 2>&1; then
-        echo -e "${RED}❌ curl 未安装，无法安装 NextTrace${RESET}"
-        return 1
-    fi
-
-    # 检测是否已安装
-    if command -v nexttrace >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ NextTrace 已安装${RESET}"
-        return 0
-    fi
-
-    echo -e "${YELLOW}👉 开始安装 NextTrace...${RESET}"
-    # 解决 Debian 11 证书过旧的问题
+    # 判断操作系统类型
     if [ -f /etc/debian_version ]; then
-        apt install -y curl ca-certificates
-    fi
-
-    curl -sL https://nxtrace.org/nt | bash
-
-    # 验证
-    if command -v nexttrace >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ NextTrace 安装成功${RESET}"
+        PACKAGE_MANAGER="apt-get"
+    elif [ -f /etc/redhat-release ]; then
+        PACKAGE_MANAGER="yum"
     else
-        echo -e "${RED}❌ NextTrace 安装失败${RESET}"
+        echo "❌ 未知操作系统，请手动安装依赖。"
+        exit 1
     fi
+
+    # 更新源并安装基础依赖
+    if [ "$PACKAGE_MANAGER" == "apt-get" ]; then
+        sudo apt-get update -y
+    fi
+
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &>/dev/null; then
+            echo "📥 安装依赖: $dep"
+            if [ "$PACKAGE_MANAGER" == "apt-get" ]; then
+                sudo apt-get install -y "$dep"
+            elif [ "$PACKAGE_MANAGER" == "yum" ]; then
+                sudo yum install -y "$dep"
+            fi
+        fi
+    done
+
+    # 特殊处理 cron 服务的包名
+    if ! command -v cron &>/dev/null && ! command -v crond &>/dev/null; then
+        echo "📥 安装 Cron 服务..."
+        if [ "$PACKAGE_MANAGER" == "apt-get" ]; then
+            sudo apt-get install -y cron
+            sudo systemctl enable cron --now
+        elif [ "$PACKAGE_MANAGER" == "yum" ]; then
+            sudo yum install -y cronie
+            sudo systemctl enable cronie --now
+        fi
+    fi
+
+    # 安装和启动 vnstat 服务
+    if ! systemctl is-active --quiet vnstat; then
+        sudo systemctl enable vnstat --now
+    fi
+    sudo vnstat -u >/dev/null 2>&1  # 初始化 vnstat 数据库
+    echo "✅ 环境就绪。"
 }
 
-# -------------------------
-# 开启 BBR（安全版）
-# -------------------------
-enable_bbr() {
-    echo -e "${YELLOW}🚀 检查并配置 TCP BBR...${RESET}"
+# --- 2. 核心报表逻辑生成 ---
+generate_report_logic() {
+    local BC_P=$(which bc)
+    local VN_P=$(which vnstat)
+    local CL_P=$(which curl)
 
-    # 1️⃣ 尝试加载 BBR 模块
-    if ! modprobe tcp_bbr 2>/dev/null; then
-        echo -e "${RED}❌ 当前内核未编译 BBR 或不支持(OpenVZ/LXC 虚拟化不支持)${RESET}"
-        return 0
+    # 动态写入 logic 脚本
+    cat <<'EOF' > $BIN_PATH
+#!/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+[ -f "/etc/vnstat_tg.conf" ] && source "/etc/vnstat_tg.conf" || exit 1
+
+# 修复数字前面的零
+fix_zero() {
+    [[ $1 == .* ]] && echo "0$1" || echo "$1"
+}
+
+# 将流量值转化为 MB
+val_to_mb() {
+    local raw=$(echo "$1" | tr -d ' ' | tr '[:lower:]' '[:upper:]')
+    local num=$(echo "$raw" | grep -oE '[0-9.]+' | head -n1)
+    [ -z "$num" ] && num=0
+    case "$raw" in
+        *T*) echo "scale=2; $num * 1048576" | $BC ;;
+        *G*) echo "scale=2; $num * 1024" | $BC ;;
+        *K*) echo "scale=2; $num / 1024" | $BC ;;
+        *)   echo "$num" ;;
+    esac
+}
+
+# 提取流量数据中的接收和发送流量
+get_traffic() {
+    echo "$1" | cut -c13- | grep -oE '[0-9.]+[[:space:]]*[a-zA-Z/]+' | sed -n "${2}p" | xargs
+}
+
+# 生成流量使用进度条
+gen_bar() {
+    local p=$1; local b=""; [ "$p" -gt 100 ] && p=100
+    local c="🟩"; [ "$p" -ge 50 ] && c="🟧"; [ "$p" -ge 80 ] && c="🟥"
+    for ((i=0; i<p/10; i++)); do b+="$c"; done
+    for ((i=p/10; i<10; i++)); do b+="⬜"; done
+    echo "$b"
+}
+
+# 1. 流量数据统计
+$VN -i $INTERFACE --update >/dev/null 2>&1
+
+# 获取公网 IP
+SERVER_IP=$(curl -s --connect-timeout 5 https://ipinfo.io/ip || curl -s --connect-timeout 5 https://icanhazip.com || echo "获取失败")
+
+Y_D=$(date -d "yesterday" "+%Y-%m-%d")
+Y_A1=$(date -d "yesterday" "+%m/%d/%y")
+Y_A2=$(date -d "yesterday" "+%d.%m.%y")
+Y_A3=$(date -d "yesterday" "+%m/%d/%Y")
+RAW_LINE=$($VN -d | grep -Ei "yesterday|$Y_D|$Y_A1|$Y_A2|$Y_A3")
+
+if [ -n "$RAW_LINE" ]; then
+    RX_STR=$(get_traffic "$RAW_LINE" 1)
+    TX_STR=$(get_traffic "$RAW_LINE" 2)
+    RX_MB=$(val_to_mb "$RX_STR")
+    TX_MB=$(val_to_mb "$TX_STR")
+    TOTAL_YEST_GB=$(fix_zero $(echo "scale=2; ($RX_MB + $TX_MB) / 1024" | $BC))
+    DISP_RX="${RX_STR/GiB/GB}"; DISP_TX="${TX_STR/GiB/GB}"
+else
+    DISP_RX="0.00 GB"; DISP_TX="0.00 GB"; TOTAL_YEST_GB="0.00"
+fi
+
+TODAY_D=$(date +%d | sed 's/^0//')
+THIS_Y=$(date +%Y); THIS_M=$(date +%m)
+if [ "$TODAY_D" -lt "$RESET_DAY" ]; then
+    START_DATE=$(date -d "${THIS_Y}-${THIS_M}-${RESET_DAY} -1 month" +%Y-%m-%d)
+    END_DATE=$(date -d "${THIS_Y}-${THIS_M}-${RESET_DAY} -1 day" +%Y-%m-%d)
+else
+    START_DATE=$(date -d "${THIS_Y}-${THIS_M}-${RESET_DAY}" +%Y-%m-%d)
+    END_DATE=$(date -d "${THIS_Y}-${THIS_M}-${RESET_DAY} +1 month -1 day" +%Y-%m-%d)
+fi
+
+TOTAL_PERIOD_MB=0
+CUR_TS=$(date -d "$START_DATE" +%s)
+YEST_TS=$(date -d "yesterday" +%s)
+while [ "$CUR_TS" -le "$YEST_TS" ]; do
+    D_M1=$(date -d "@$CUR_TS" "+%Y-%m-%d")
+    D_M2=$(date -d "@$CUR_TS" "+%m/%d/%y")
+    D_M3=$(date -d "@$CUR_TS" "+%d.%m.%y")
+    D_M4=$(date -d "@$CUR_TS" "+%m/%d/%Y")
+    D_LINE=$($VN -d | grep -E "$D_M1|$D_M2|$D_M3|$D_M4")
+    if [ -n "$D_LINE" ]; then
+        D_RX_S=$(get_traffic "$D_LINE" 1)
+        D_TX_S=$(get_traffic "$D_LINE" 2)
+        TOTAL_PERIOD_MB=$(echo "$TOTAL_PERIOD_MB + $(val_to_mb "$D_RX_S") + $(val_to_mb "$D_TX_S")" | $BC)
     fi
+    CUR_TS=$((CUR_TS + 86400))
+done
 
-    # 2️⃣ 写入模块自动加载（避免重复）
-    mkdir -p /etc/modules-load.d
-    if ! grep -qxF "tcp_bbr" /etc/modules-load.d/bbr.conf 2>/dev/null; then
-        echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
+USED_GB=$(fix_zero $(echo "scale=2; $TOTAL_PERIOD_MB / 1024" | $BC))
+PCT=$(echo "scale=0; $USED_GB * 100 / $MAX_GB" | $BC 2>/dev/null)
+[ -z "$PCT" ] && PCT=0
+BAR=$(gen_bar $PCT)
+NOW=$(date "+%Y-%m-%d %H:%M")
+
+# 2. VPS 基础状态获取 & 运行时间汉化
+UPTIME_RAW=$(uptime -p | sed 's/up //')
+UPTIME_CN=$(echo "$UPTIME_RAW" | sed -E 's/ years?/ 年/g; s/ weeks?/ 周/g; s/ days?/ 天/g; s/ hours?/ 小时/g; s/ minutes?/ 分钟/g')
+
+CPU_LOAD=$(uptime | awk -F'load average:' '{print $2}' | awk -F, '{print $1}' | xargs)
+MEM_INFO=$(free -m | awk '/Mem:/ {printf "%.1f/%.1f GB (%.0f%%)", $3/1024, $2/1024, $3*100/$2}')
+DISK_INFO=$(df -h / | awk 'NR==2 {printf "%s/%s (%s)", $3, $2, $5}')
+
+# 3. 网卡实时速率统计 (1秒采样)
+RX_BEFORE=$(cat /sys/class/net/$INTERFACE/statistics/rx_bytes)
+TX_BEFORE=$(cat /sys/class/net/$INTERFACE/statistics/tx_bytes)
+sleep 1
+RX_AFTER=$(cat /sys/class/net/$INTERFACE/statistics/rx_bytes)
+TX_AFTER=$(cat /sys/class/net/$INTERFACE/statistics/tx_bytes)
+SPEED_RX_KB=$(echo "($RX_AFTER - $RX_BEFORE) / 1024" | $BC)
+SPEED_TX_KB=$(echo "($TX_AFTER - $TX_BEFORE) / 1024" | $BC)
+
+if [ "$SPEED_RX_KB" -gt 1024 ]; then
+    SPEED_RX=$(echo "scale=1; $SPEED_RX_KB / 1024" | $BC) Mbps
+else
+    SPEED_RX="${SPEED_RX_KB} Kbps"
+fi
+if [ "$SPEED_TX_KB" -gt 1024 ]; then
+    SPEED_TX=$(echo "scale=1; $SPEED_TX_KB / 1024" | $BC) Mbps
+else
+    SPEED_TX="${SPEED_TX_KB} Kbps"
+fi
+
+# 4. Docker 运行状态监控（优化：未安装或未运行则完全隐藏该板块）
+DOCKER_BLOCK=""
+if command -v docker &>/dev/null && systemctl is-active --quiet docker; then
+    DOCKER_TOTAL=$(docker ps -a --format '{{.Names}}' | wc -l)
+    DOCKER_RUNNING=$(docker ps --format '{{.Names}}' | wc -l)
+    DOCKER_STATUS="🟢 运行中 ($DOCKER_RUNNING/$DOCKER_TOTAL)"
+    
+    # 异常容器检测
+    DOCKER_EXC=$(docker ps -a --filter "status=exited" --format '{{.Names}} ({{.Status}})' | grep -v 'Exited (0)' | head -n 3)
+    if [ -n "$DOCKER_EXC" ]; then
+        DOCKER_STATUS+="\n⚠️ *异常容器*:\n\`$(echo "$DOCKER_EXC" | sed 's/^/  • /')\`"
     fi
+    
+    # 构建 Docker 消息文本块
+    read -r -d '' DOCKER_BLOCK << DOCK_MSG
 
-    # 3️⃣ 检查是否已经启用
-    if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
-        echo -e "${GREEN}✔ BBR 已经开启，无需修改${RESET}"
-        return 0
-    fi
+🐳 *Docker 运行状态*
+$DOCKER_STATUS
+DOCK_MSG
+fi
 
-    echo -e "${YELLOW}👉 BBR 未开启，开始配置...${RESET}"
+# --- 报表样式定制（分开显示周期） ---
+read -r -d '' MSG << END_OF_MESSAGE
+📊 *【$HOST_ALIAS】服务器日报*
+🕙 时间: \`$NOW\`
+🔋 运行: \`$UPTIME_CN\`
 
-    # 4️⃣ 写入独立 sysctl 配置文件（更规范）
-    cat >/etc/sysctl.d/99-bbr.conf <<EOF
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
+🖥️ *VPS 基础性能监控*
+├─ 🌍 公网IP: \`$SERVER_IP\`
+├─ ⚡ 负载 (1m): \`$CPU_LOAD\`
+├─ 🧠 内存: \`$MEM_INFO\`
+└─ 💾 硬盘: \`$DISK_INFO\`
+
+🌐 *网卡实时与历史统计 ($INTERFACE)*
+├─ 🚀 实时下载: \`$SPEED_RX\`
+├─ 🚀 实时上传: \`$SPEED_TX\`
+├─ ⬇️ 昨日下载: \`$DISP_RX\`
+├─ ⬆️ 昨日上传: \`$DISP_TX\`
+└─ 🧮 昨日合计: \`$TOTAL_YEST_GB GB\`
+
+📅 *流量周期统计*
+├─ 📅 周期开始: \`$START_DATE\`
+├─ 📅 周期结束: \`$END_DATE\`
+├─ 🔄 重置日: 每月 \`$RESET_DAY\` 号
+├─ ⏳ 累计: \`$USED_GB / $MAX_GB GB\`
+└─ 🎯 进度: $BAR \`$PCT%\`$DOCKER_BLOCK
+END_OF_MESSAGE
+
+# 发送到 Telegram
+$CL --connect-timeout 10 --retry 3 -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+-d "chat_id=$TG_CHAT_ID" \
+-d "text=$MSG" \
+-d "parse_mode=Markdown" \
+-d "disable_notification=true" > /dev/null
 EOF
 
-    # 5️⃣ 应用配置
-    sysctl --system >/dev/null
-
-    # 6️⃣ 再次验证
-    if [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = "bbr" ]; then
-        echo -e "${GREEN}✔ BBR 已成功开启${RESET}"
-    else
-        echo -e "${RED}❌ BBR 开启失败，请检查内核配置${RESET}"
-    fi
-
-    return 0
+    # 更新报告脚本中的命令路径
+    sed -i "4i BC=\"$BC_P\"\nVN=\"$VN_P\"\nCL=\"$CL_P\"" $BIN_PATH
+    chmod +x $BIN_PATH  # 设置执行权限
 }
 
-# -------------------------
-# 时间同步 & 设置上海时区（Debian / Ubuntu 专用）
-# -------------------------
-enable_time_sync() {
-    echo -e "${YELLOW}⏰ 配置 systemd-timesyncd 时间同步& 设置上海时区...${RESET}"
+# --- 3. 配置与自定义通知时间录入 ---
+collect_config() {
+    [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+    echo "--- 请输入配置参数 ---"
+    
+    read -p "👤 主机别名 [${HOST_ALIAS:-My-VPS}]: " input_val; HOST_ALIAS=${input_val:-${HOST_ALIAS:-My-VPS}}
+    read -p "🤖 Bot Token [${TG_TOKEN}]: " input_val; TG_TOKEN=${input_val:-$TG_TOKEN}
+    read -p "🆔 Chat ID [${TG_CHAT_ID}]: " input_val; TG_CHAT_ID=${input_val:-$TG_CHAT_ID}
+    read -p "📅 重置日 (1-31) [${RESET_DAY:-1}]: " input_val; RESET_DAY=${input_val:-${RESET_DAY:-1}}
+    read -p "📊 限额 (GB) [${MAX_GB:-1000}]: " input_val; MAX_GB=${input_val:-${MAX_GB:-1000}}
 
-    if [ ! -f /etc/os-release ]; then
-        echo -e "${RED}❌ 无法识别系统类型${RESET}"
-        return 1
-    fi
+    # 自动获取默认网卡
+    IF_DEF=$(ip route | grep '^default' | awk '{print $5}' | head -n1)
+    read -p "🌐 网卡 [${INTERFACE:-$IF_DEF}]: " input_val; INTERFACE=${input_val:-${INTERFACE:-$IF_DEF}}
 
-    . /etc/os-release
+    # 自定义通知时间
+    read -p "⏰ 通知时间 (HH:MM) [${RUN_TIME:-08:00}]: " input_val; RUN_TIME=${input_val:-${RUN_TIME:-08:00}}
 
-    if [[ "$ID" != "ubuntu" && "$ID" != "debian" ]]; then
-        echo -e "${RED}❌ 当前系统不是 Debian/Ubuntu，跳过时间同步配置${RESET}"
-        return 0
-    fi
+    # 保存配置到文件
+    cat <<EOF > "$CONFIG_FILE"
+HOST_ALIAS="$HOST_ALIAS"
+TG_TOKEN="$TG_TOKEN"
+TG_CHAT_ID="$TG_CHAT_ID"
+RESET_DAY=$RESET_DAY
+MAX_GB=$MAX_GB
+INTERFACE="$INTERFACE"
+RUN_TIME="$RUN_TIME"
+EOF
 
-    echo -e "${GREEN}✔ 系统检测通过：$PRETTY_NAME${RESET}"
-
-    # 安装 systemd-timesyncd（极简系统可能没装）
-    if ! dpkg -s systemd-timesyncd >/dev/null 2>&1; then
-        echo -e "${YELLOW}📦 安装 systemd-timesyncd...${RESET}"
-        apt update
-        apt install -y systemd-timesyncd
-    else
-        echo -e "${GREEN}✔ systemd-timesyncd 已安装${RESET}"
-    fi
-
-    # 启用服务
-    systemctl unmask systemd-timesyncd || true
-    systemctl enable --now systemd-timesyncd
-
-    # 启用 NTP
-    timedatectl set-ntp true
-    systemctl restart systemd-timesyncd
-
-     # 设置上海时区
-    timedatectl set-timezone Asia/Shanghai
-    echo -e "${GREEN}✔ 时区已设置为上海 (Asia/Shanghai)${RESET}"
-
-    # 状态检查
-    if systemctl is-active --quiet systemd-timesyncd; then
-        echo -e "${GREEN}✔ 时间同步服务已成功启动${RESET}"
-    else
-        echo -e "${RED}❌ 时间同步服务启动失败(OpenVZ/LXC 虚拟化不支持)${RESET}"
-    fi
+    # 生成报告脚本
+    generate_report_logic  
+    
+    # 巧妙转换 Cron 时间，过滤掉前导0
+    local H=$(echo $RUN_TIME | cut -d: -f1 | sed 's/^0//'); [ -z "$H" ] && H=0
+    local M=$(echo $RUN_TIME | cut -d: -f2 | sed 's/^0//'); [ -z "$M" ] && M=0
+    
+    # 写入定时任务
+    (crontab -l 2>/dev/null | grep -Fv "$BIN_PATH"; echo "$M $H * * * /bin/bash $BIN_PATH") | crontab -
+    echo "⏰ 定时发送任务已设定为每日 $RUN_TIME"
 }
 
-# -------------------------
-# 清理函数
-# -------------------------
-cleanup() {
-    echo -e "${YELLOW}🧹 正在清理系统冗余缓存...${RESET}"
-    case "$OS_TYPE" in
-        debian)
-            apt-get autoremove -y >/dev/null 2>&1
-            apt-get clean >/dev/null 2>&1
+# --- 4. 交互菜单 (带有状态与定时任务检测功能) ---
+
+while true; do
+    clear
+    echo -e "${GREEN}=======================================${NC}"
+    echo -e "${GREEN}       流量日报 TG通知管理工具         ${NC}"
+    echo -e "${GREEN}=======================================${NC}"
+    
+    # --- 动态状态看板模块 ---
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+        echo -e " 👤 主机别名: ${YELLOW}$HOST_ALIAS${NC} | 网卡: ${YELLOW}$INTERFACE${NC}"
+        echo -e " 📅 流量配置: 每月 ${YELLOW}$RESET_DAY${NC} 号重置 | 限额: ${YELLOW}$MAX_GB GB${NC}"
+        
+        # 检查 crontab 中是否有该定时任务
+        if crontab -l 2>/dev/null | grep -Fq "$BIN_PATH"; then
+            echo -e " ⏰ 定时任务: ${GREEN}已开启 (每日 $RUN_TIME)${NC}"
+        else
+            echo -e " ⏰ 定时任务: ${RED}未开启 (无定时任务)${NC}"
+        fi
+    else
+        echo -e " 📊 当前状态: ${GRAY}未检测到有效配置文件，请先执行安装${NC}"
+    fi
+    echo -e "${GREEN}=======================================${NC}"
+
+    # --- 菜单选项 ---
+    echo -e "${GREEN} 1. 全新安装环境与配置${NC}"
+    echo -e "${GREEN} 2. 修改现有配置 / 调整通知时间${NC}"
+    echo -e "${GREEN} 3. 立即手动触发测试 (发送日报)${NC}"
+    echo -e "${GREEN} 4. 重新构建报表核心逻辑 (更新)${NC}"
+    echo -e "${GREEN} 5. 完全卸载 (清理配置与定时任务)${NC}"
+    echo -e "${GREEN} 0. 退出${NC}"
+    echo -e "${GREEN}=======================================${NC}"
+
+    echo -ne "${GREEN} 请选择操作 [0-5]: ${NC}"
+    read choice
+    case $choice in
+        1) 
+            prepare_env
+            collect_config
+            echo -e "\n✅ 安装完成！"; sleep 2 
             ;;
-        rhel)
-            dnf autoremove -y >/dev/null 2>&1
-            dnf clean all >/dev/null 2>&1
+        2) 
+            collect_config
+            echo -e "\n✅ 配置与通知时间更新成功！"; sleep 2 
             ;;
-        alpine)
-            rm -rf /var/cache/apk/*
+        3) 
+            echo "📡 正在尝试发送日报，请稍候..."
+            if [ -f "$BIN_PATH" ]; then
+                if /bin/bash "$BIN_PATH"; then
+                    echo -e "✅ ${GREEN}日报已成功触发并向 Telegram 发送！${NC}"
+                else
+                    echo -e "❌ ${RED}发送失败，请检查您的 Token/ChatID 设定、网络状况或 API 连通性。${NC}"
+                fi
+            else
+                echo -e "❌ ${RED}错误：核心报告脚本尚未生成，请先执行选项 1 安装。${NC}"
+            fi
+            sleep 3 
+            ;;
+        4) 
+            if [ -f "$CONFIG_FILE" ]; then
+                generate_report_logic
+                echo -e "✅ ${GREEN}核心逻辑脚本已更新重构！${NC}"
+            else
+                echo -e "❌ ${RED}更新失败：配置文件未找到，请先安装。${NC}"
+            fi
+            sleep 1.5 
+            ;;
+        5) 
+            echo "🔄 正在卸载工具并清理残留..."
+            (crontab -l 2>/dev/null | grep -v "$BIN_PATH") | crontab -
+            rm -f "$BIN_PATH" "$CONFIG_FILE"
+            echo -e "✅ ${GREEN}卸载成功！已彻底清理配置文件、脚本以及 Cron 定时任务。${NC}"
+            sleep 2 
+            ;;
+        0) 
+            exit 0 
+            ;;
+        *) 
+            echo -e "❌ ${RED}无效选项，请输入 0 到 5 之间的数字${NC}"
+            sleep 1 
             ;;
     esac
-    echo -e "${GREEN}✔ 清理完成${RESET}"
-}
-
-# ==========================================
-# 脚本执行入口
-# ==========================================
-
-clear
-update_system
-install_netcat
-install_dnsutils
-install_cron
-install_nexttrace
-enable_bbr
-enable_time_sync
-
-# 最后执行清理
-cleanup
-
-# 最终展示
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-echo -e "${GREEN}🎉 系统更新工作已全部完成！${RESET}"
-echo -e "${YELLOW}📅 完成时间: $(date +'%Y-%m-%d %H:%M:%S')${RESET}"
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+done

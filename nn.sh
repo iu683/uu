@@ -2,47 +2,77 @@
 
 # 颜色定义
 GREEN="\033[32m"
+RED="\033[31m"
 YELLOW="\033[33m"
-BLUE="\033[34m"
 RESET="\033[0m"
 
-# 默认设置为国外
-IS_CN=false
+# 代理前缀
+PROXY="https://v6.gh-proxy.org/"
 
-# 尝试多接口获取国家代码 (CN)，限时 3 秒防止卡死
-COUNTRY=$(curl -s --max-time 3 https://ip.sb/country_code 2>/dev/null || \
-          curl -s --max-time 3 https://ipapi.co/country 2>/dev/null || \
-          curl -s --max-time 3 http://ip-api.com/json/ | grep -o '"countryCode":"[^"]*' | cut -d'"' -f4)
+# 核心下载与执行函数（含自动容灾代理）
+fetch_and_run() {
+    local script_url="$1"
+    
+    
+    # 优先直连，失败则走代理，都失败则报错
+    bash <(curl -fsSL "$script_url") || \
+    bash <(curl -fsSL "${PROXY}${script_url}") || {
+        echo -e "${RED}错误：直连与代理均失败，请检查网络设置。${RESET}"
+    }
+}
 
-if [ "$COUNTRY" = "CN" ]; then
-    IS_CN=true
-fi
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== 网络工具菜单 ===${RESET}"
+        echo -e "${GREEN}1) 网络测速 speedtest${RESET}"
+        echo -e "${GREEN}2) 路由追踪 nexttrace${RESET}"
+        echo -e "${GREEN}3) 网络性能测试 iperf3${RESET}"
+        echo -e "${GREEN}4) 网络诊断工具 MTR${RESET}"
+        echo -e "${GREEN}5) 大小包诊断工具${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        
+        read -p $'\033[32m请选择操作: \033[0m' choice
+        case $choice in
+            1)
+                echo -e "${GREEN}正在运行 speedtest 网络测速...${RESET}"
+                fetch_and_run "https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Speedtest.sh"
+                pause
+                ;;
+            2)
+                echo -e "${GREEN}正在运行 nexttrace 路由追踪...${RESET}"
+                fetch_and_run "https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/NextTrace.sh"
+                pause
+                ;;
+            3)
+                echo -e "${GREEN}正在运行 网络性能测试 iperf3...${RESET}"
+                fetch_and_run "https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/iperf3.sh"
+                pause
+                ;;
+            4)
+                echo -e "${GREEN}正在运行 网络诊断工具 MTR...${RESET}"
+                fetch_and_run "https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/mtr.sh"
+                pause
+                ;;
+            5)
+                echo -e "${GREEN}正在运行 大小包诊断工具...${RESET}"
+                fetch_and_run "https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/DXbao.sh"
+                pause
+                ;;
+            0)
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}无效选择，请重新输入${RESET}"
+                sleep 1
+                ;;
+        esac
+    done
+}
 
-# 根据地理位置执行对应的安装命令
-if [ "$IS_CN" = true ]; then
-    echo -e "${YELLOW}[CN] 检测到当前服务器位于中国大陆，正在使用国内加速源...${RESET}"
-    
-    # 确保系统安装了 wget
-    if ! command -v wget &> /dev/null; then
-        if command -v apk &> /dev/null; then apk add wget >/dev/null
-        elif command -v apt-get &> /dev/null; then apt-get update && apt-get install -y wget >/dev/null
-        elif command -v yum &> /dev/null; then yum install -y wget >/dev/null
-        fi
-    fi
+pause() {
+    read -p $'\033[32m按回车键返回菜单...\033[0m'
+}
 
-    # 执行国内加速安装
-    wget -N https://gitlab.com/dabao/nodequality-proxy/-/raw/main/nodequality-proxy.sh && bash nodequality-proxy.sh ghproxy
-else
-    echo -e "${GREEN}[GLOBAL] 检测到海外服务器${RESET}"
-    
-    # 确保系统安装了 curl
-    if ! command -v curl &> /dev/null; then
-        if command -v apk &> /dev/null; then apk add curl >/dev/null
-        elif command -v apt-get &> /dev/null; then apt-get update && apt-get install -y curl >/dev/null
-        elif command -v yum &> /dev/null; then yum install -y curl >/dev/null
-        fi
-    fi
-
-    # 执行官方安装
-    bash <(curl -sL https://run.NodeQuality.com)
-fi
+# 启动菜单
+menu

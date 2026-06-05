@@ -1,48 +1,54 @@
 #!/bin/bash
+# ========================================
+# ShellCrash 一键安装脚本
+# 自动刷新环境变量
+# ========================================
 
-# 颜色定义
 GREEN="\033[32m"
 YELLOW="\033[33m"
-BLUE="\033[34m"
+RED="\033[31m"
 RESET="\033[0m"
 
-# 默认设置为国外
-IS_CN=false
+clear
 
-# 尝试多接口获取国家代码 (CN)，限时 3 秒防止卡死
-COUNTRY=$(curl -s --max-time 3 https://ip.sb/country_code 2>/dev/null || \
-          curl -s --max-time 3 https://ipapi.co/country 2>/dev/null || \
-          curl -s --max-time 3 http://ip-api.com/json/ | grep -o '"countryCode":"[^"]*' | cut -d'"' -f4)
+echo -e "${GREEN}========================================${RESET}"
+echo -e "${GREEN}       ShellCrash 开始安装${RESET}"
+echo -e "${GREEN}========================================${RESET}"
 
-if [ "$COUNTRY" = "CN" ]; then
-    IS_CN=true
+# 检查 curl
+if ! command -v curl &>/dev/null; then
+    echo -e "${YELLOW}未检测到 curl，正在安装...${RESET}"
+
+    if command -v apt &>/dev/null; then
+        apt update -y && apt install -y curl
+    elif command -v yum &>/dev/null; then
+        yum install -y curl
+    elif command -v dnf &>/dev/null; then
+        dnf install -y curl
+    elif command -v apk &>/dev/null; then
+        apk add curl
+    else
+        echo -e "${RED}无法自动安装 curl，请手动安装${RESET}"
+        exit 1
+    fi
 fi
 
-# 根据地理位置执行对应的安装命令
-if [ "$IS_CN" = true ]; then
-    echo -e "${YELLOW}[CN] 检测到当前服务器位于中国大陆，正在使用国内加速源...${RESET}"
+# 核心下载与执行函数（含自动容灾代理）
+fetch_and_run() {
+    local script_url="$1"
     
-    # 确保系统安装了 wget
-    if ! command -v wget &> /dev/null; then
-        if command -v apk &> /dev/null; then apk add wget >/dev/null
-        elif command -v apt-get &> /dev/null; then apt-get update && apt-get install -y wget >/dev/null
-        elif command -v yum &> /dev/null; then yum install -y wget >/dev/null
-        fi
-    fi
+    # 尝试直连，如果失败（返回非0状态码）则通过代理重试，若再失败则报错退出
+    bash <(curl -fsSL "$script_url") || \
+    bash <(curl -fsSL "${PROXY}${script_url}") || {
+        echo -e "${RED}错误：直连与代理均失败，请检查网络设置。${RESET}"
+        exit 1
+    }
+}
 
-    # 执行国内加速安装
-    bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/CN/CN1Panel.sh)
-else
-    echo -e "${GREEN}[GLOBAL] 检测到海外服务器${RESET}"
-    
-    # 确保系统安装了 curl
-    if ! command -v curl &> /dev/null; then
-        if command -v apk &> /dev/null; then apk add curl >/dev/null
-        elif command -v apt-get &> /dev/null; then apt-get update && apt-get install -y curl >/dev/null
-        elif command -v yum &> /dev/null; then yum install -y curl >/dev/null
-        fi
-    fi
+# 下载并执行安装
 
-    # 执行官方安装
-    bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/panel.sh)
-fi
+fetch_and_run "https://raw.githubusercontent.com/juewuy/ShellCrash/master/install.sh"
+
+
+echo -e "${YELLOW}如果命令未立即生效，请执行：${RESET}"
+echo -e "${YELLOW}source /etc/profile${RESET}"

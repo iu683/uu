@@ -5,6 +5,8 @@
 
 GREEN="\033[32m"
 RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
 RESET="\033[0m"
 
 PROJECTS_DIR="/opt"
@@ -31,7 +33,34 @@ function action_done() {
 }
 
 # ---------------------------
-# 查看所有项目容器运行状态（带 ✅） 
+# 状态汉化核心引擎
+# ---------------------------
+function translate_status() {
+    local raw_status="$1"
+    echo "$raw_status" | \
+        sed 's/Up /运行 /' | \
+        sed 's/Exited/已停止/' | \
+        sed 's/(healthy)/(健康)/' | \
+        sed 's/(unhealthy)/(非健康)/' | \
+        sed 's/(starting)/(启动中)/' | \
+        sed 's/seconds/秒/' | \
+        sed 's/second/秒/' | \
+        sed 's/minutes/分钟/' | \
+        sed 's/minute/分钟/' | \
+        sed 's/hours/小时/' | \
+        sed 's/hour/小时/' | \
+        sed 's/days/天/' | \
+        sed 's/day/天/' | \
+        sed 's/weeks/周/' | \
+        sed 's/week/周/' | \
+        sed 's/months/月/' | \
+        sed 's/month/月/' | \
+        sed 's/about //' | \
+        sed 's/ago/前/'
+}
+
+# ---------------------------
+# 查看所有项目容器运行状态（主菜单功能） 
 # ---------------------------
 monitor_docker_containers() {
     clear
@@ -39,97 +68,59 @@ monitor_docker_containers() {
     echo -e "${GREEN}      🐳 Docker 项目容器状态监控        ${RESET}"
     echo -e "${GREEN}========================================${RESET}"
 
-    # 查找所有包含 docker-compose.yml 的项目
     projects=($(find "$PROJECTS_DIR" -maxdepth 1 -type d -exec test -f '{}/docker-compose.yml' \; -print | sort))
     
     if [ ${#projects[@]} -eq 0 ]; then
         echo -e "${RED}未找到任何含 docker-compose.yml 的项目${RESET}"
     else
+        local all_stats
+        all_stats=$(docker stats --no-stream --format "{{.ID}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" 2>/dev/null)
+
         for proj in "${projects[@]}"; do
-            project_name=$(basename "$proj")
-            echo -e "${BLUE}📁 项目群组: $project_name${RESET}"
-            echo -e "${BLUE}----------------------------------------${RESET}"
+            local project_name=$(basename "$proj")
+            echo -e "${YELLOW}📁 项目群组: $project_name${RESET}"
+            echo -e "${YELLOW}----------------------------------------${RESET}"
             
-            COMPOSE_FILE="$proj/docker-compose.yml"
-            # 获取该项目下的所有服务名称
-            services=$(docker compose -f "$COMPOSE_FILE" ps --services)
+            local l_compose="$proj/docker-compose.yml"
+            local services=$(docker compose -f "$l_compose" ps --services 2>/dev/null)
             
-            # 临时存储该项目下所有服务的监控数据，以便后续按内存排序
-            # 格式：服务名|CPU|内存|网络
-            stats_list=()
-            
+            if [ -z "$services" ]; then
+                echo -e "  ${YELLOW}暂无服务配置${RESET}"
+                echo -e "${YELLOW}----------------------------------------${RESET}"
+                continue
+            fi
+
+            local stats_list=()
             for service in $services; do
-                # 获取具体的容器名称/ID (针对 compose 项目)
-                container_id=$(docker compose -f "$COMPOSE_FILE" ps -q "$service")
-                
+                local container_id=$(docker compose -f "$l_compose" ps -q "$service" 2>/dev/null)
+                local cpu="0.00%" mem="0B / 0B" net="0B / 0B" ports="无端口映射"
+                local raw_status="Exited (0) 0 seconds ago"
+
                 if [ -n "$container_id" ]; then
-                    # 抓取 stats 数据 (如果容器没运行，这里抓出来会是空的或0)
-                    stats_data=$(docker stats --no-stream --format "{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" "$container_id" 2>/dev/null)
-                    if [ -n "$stats_data" ]; then
-                        cpu=$(echo "$stats_data" | cut -f1)
-                        mem=$(echo "$stats_data" | cut -f2)
-                        net=$(echo "$stats_data" | cut -f3)
-                    else
-                        cpu="0.00%"
-                        mem="0B / 0B"
-                        net="0B / 0B"
+                    local match_stats=$(echo "$all_stats" | grep "^${container_id:0:12}")
+                    if [ -n "$match_stats" ]; then
+                        cpu=$(echo "$match_stats" | cut -f2)
+                        mem=$(echo "$match_stats" | cut -f3)
+                        net=$(echo "$match_stats" | cut -f4)
                     fi
-                else
-                    cpu="0.00%"
-                    mem="0B / 0B"
-                    net="0B / 0B"
+                    raw_status=$(docker ps -a --filter "id=$container_id" --format "{{.Status}}")
+                    local port_info=$(docker ps -a --filter "id=$container_id" --format "{{.Ports}}")
+                    [ -n "$port_info" ] && ports=$port_info
                 fi
-                
-                # 将数据塞入数组，用一个很大的前缀或数字来辅助后面排序（这里直接存入，后续用 sort 处理）
-                stats_list+=("$service\t$cpu\t$mem\t$net")
+                stats_list+=("$service	$cpu	$mem	$net	$ports	$raw_status")
             done
             
-            # 按内存大小逆序排序并输出 (借用你原脚本的 sort -k3 -hr 逻辑)
-            printf "%b\n" "${stats_list[@]}" | sort -k3 -hr | while IFS=$'\t' read -r service cpu mem net; do
-                
-                # 1. 获取运行时间并深度汉化
-                local raw_status
-                if [ -n "$container_id" ]; then
-                    raw_status=$(docker ps -a --filter "id=$container_id" --format "{{.Status}}")
-                else
-                    raw_status="Exited (0) 0 seconds ago" # 兜底未启动状态
-                fi
-                
-                # 汉化引擎：包含时间、单位、状态
-                local uptime
-                uptime=$(echo "$raw_status" | \
-                    sed 's/Up /运行 /' | \
-                    sed 's/Exited/已停止/' | \
-                    sed 's/(healthy)/(健康)/' | \
-                    sed 's/(unhealthy)/(非健康)/' | \
-                    sed 's/(starting)/(启动中)/' | \
-                    sed 's/seconds/秒/' | \
-                    sed 's/second/秒/' | \
-                    sed 's/minutes/分钟/' | \
-                    sed 's/minute/分钟/' | \
-                    sed 's/hours/小时/' | \
-                    sed 's/hour/小时/' | \
-                    sed 's/days/天/' | \
-                    sed 's/day/天/' | \
-                    sed 's/weeks/周/' | \
-                    sed 's/week/周/' | \
-                    sed 's/months/月/' | \
-                    sed 's/month/月/' | \
-                    sed 's/about //' | \
-                    sed 's/ago/前/')
-                
-                # 状态图标判定
+            printf "%s\n" "${stats_list[@]}" | sort -k3 -hr | while IFS=$'\t' read -r service cpu mem net ports raw_status; do
+                local uptime=$(translate_status "$raw_status")
                 local status_icon="${RED}❌${RESET}"
-                if [[ "$raw_status" == *"Up"* ]]; then
-                    status_icon="${GREEN}✅${RESET}"
-                fi
+                [[ "$raw_status" == *"Up"* ]] && status_icon="${GREEN}✅${RESET}"
 
-                # 2. 手机端纵向块状输出
                 echo -e "${YELLOW}◈ 服务: ${RESET}${YELLOW}${service}${RESET} ${status_icon}"
-                echo -e "  ├─ ${YELLOW}CPU 占用: ${RESET}${CPU_COLOR:-${GREEN}}${cpu}${RESET}"
+                echo -e "  ├─ ${YELLOW}运行状态: ${RESET}${uptime}"
+                echo -e "  ├─ ${YELLOW}端口映射: ${RESET}${GREEN}${ports}${RESET}"
+                echo -e "  ├─ ${YELLOW}CPU 占用: ${RESET}${cpu}"
                 echo -e "  ├─ ${YELLOW}内存使用: ${RESET}${mem}"
-                echo -e "  ├─ ${YELLOW}网络 I/O: ${RESET}${net}"
-                echo -e "  └─ ${YELLOW}运行状态: ${RESET}${YELLOW}${uptime}${RESET}"
+                echo -e "  └─ ${YELLOW}网络 I/O: ${RESET}${net}"
                 echo -e "${YELLOW}----------------------------------------${RESET}"
             done
             echo
@@ -148,7 +139,7 @@ function select_project() {
     if [ ${#projects[@]} -eq 0 ]; then
         echo -e "${RED}未找到任何含 docker-compose.yml 的项目${RESET}"
         sleep 1
-        main_menu
+        return
     fi
     for i in "${!projects[@]}"; do
         project_name=$(basename "${projects[$i]}")
@@ -158,7 +149,7 @@ function select_project() {
 
     read -p "$(echo -e ${GREEN}请输入编号: ${RESET})" choice
     if [[ "$choice" == "0" ]]; then
-        main_menu
+        return
     elif [[ "$choice" =~ ^[0-9]+$ && $choice -ge 1 && $choice -le ${#projects[@]} ]]; then
         PROJECT_DIR=${projects[$((choice-1))]}
         COMPOSE_FILE="$PROJECT_DIR/docker-compose.yml"
@@ -174,7 +165,7 @@ function select_project() {
 # 进入容器
 # ---------------------------
 function select_container() {
-    containers=$(docker compose -f "$COMPOSE_FILE" ps --services)
+    local containers=$(docker compose -f "$COMPOSE_FILE" ps --services)
     if [ -z "$containers" ]; then
         echo -e "${RED}没有正在运行的容器${RESET}"
         sleep 1
@@ -202,7 +193,7 @@ function delete_project() {
         rm -rf "$PROJECT_DIR"
         echo -e "${GREEN}项目已删除${RESET}"
         sleep 1
-        main_menu
+        return
     fi
 }
 
@@ -232,14 +223,14 @@ function delete_multiple_projects() {
 
     for c in $choices; do
         if [[ "$c" =~ ^[0-9]+$ && $c -ge 1 && $c -le ${#projects[@]} ]]; then
-            proj="${projects[$((c-1))]}"
-            COMPOSE_FILE="$proj/docker-compose.yml"
-            project_name=$(basename "$proj")
-            echo -e "${RED}准备删除项目: $project_name${RESET}"
+            local proj="${projects[$((c-1))]}"
+            local l_compose="$proj/docker-compose.yml"
+            local p_name=$(basename "$proj")
+            echo -e "${RED}准备删除项目: $p_name${RESET}"
             if confirm_action; then
-                docker compose -f "$COMPOSE_FILE" down --rmi all -v
+                docker compose -f "$l_compose" down --rmi all -v
                 rm -rf "$proj"
-                echo -e "${GREEN}已删除 $project_name${RESET}"
+                echo -e "${GREEN}已删除 $p_name${RESET}"
             fi
         else
             echo -e "${RED}无效编号: $c${RESET}"
@@ -261,27 +252,30 @@ function delete_all_stopped_projects() {
         return
     fi
 
-    deleted_any=false
-
+    local deleted_any=false
     for proj in "${projects[@]}"; do
-        COMPOSE_FILE="$proj/docker-compose.yml"
-        services=$(docker compose -f "$COMPOSE_FILE" ps --services)
-        all_stopped=true
+        local l_compose="$proj/docker-compose.yml"
+        local services=$(docker compose -f "$l_compose" ps --services 2>/dev/null)
+        local all_stopped=true
+        
         for service in $services; do
-            status=$(docker compose -f "$COMPOSE_FILE" ps -q "$service" | xargs docker inspect -f '{{.State.Running}}')
-            if [[ "$status" == "true" ]]; then
-                all_stopped=false
-                break
+            local cid=$(docker compose -f "$l_compose" ps -q "$service" 2>/dev/null)
+            if [ -n "$cid" ]; then
+                local status=$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)
+                if [[ "$status" == "true" ]]; then
+                    all_stopped=false
+                    break
+                fi
             fi
         done
 
-        if $all_stopped; then
-            project_name=$(basename "$proj")
-            echo -e "${RED}准备删除未运行的项目: $project_name${RESET}"
+        if [ -n "$services" ] && $all_stopped; then
+            local p_name=$(basename "$proj")
+            echo -e "${RED}准备删除未运行的项目: $p_name${RESET}"
             if confirm_action; then
-                docker compose -f "$COMPOSE_FILE" down --rmi all -v
+                docker compose -f "$l_compose" down --rmi all -v
                 rm -rf "$proj"
-                echo -e "${GREEN}已删除 $project_name${RESET}"
+                echo -e "${GREEN}已删除 $p_name${RESET}"
                 deleted_any=true
             fi
         fi
@@ -294,19 +288,49 @@ function delete_all_stopped_projects() {
 }
 
 # ---------------------------
-# 项目管理菜单
+# 项目管理菜单（已集成置顶状态与端口显示）
 # ---------------------------
 function project_menu() {
     while true; do
         clear
-        project_name=$(basename "$PROJECT_DIR")
+        local project_name=$(basename "$PROJECT_DIR")
         echo -e "${GREEN}=== 管理项目: $project_name ===${RESET}"
+        
+        # ----------- 新增：动态显示当前项目的容器状态与端口 -----------
+        echo -e "${YELLOW}[ 当前容器实时状态 ]${RESET}"
+        local services=$(docker compose -f "$COMPOSE_FILE" ps --services 2>/dev/null)
+        if [ -z "$services" ]; then
+            echo -e "  ${YELLOW}暂无服务配置${RESET}"
+        else
+            for service in $services; do
+                local container_id=$(docker compose -f "$COMPOSE_FILE" ps -q "$service" 2>/dev/null)
+                local ports="无端口映射"
+                local raw_status="Exited (0) 0 seconds ago"
+                
+                if [ -n "$container_id" ]; then
+                    raw_status=$(docker ps -a --filter "id=$container_id" --format "{{.Status}}")
+                    local port_info=$(docker ps -a --filter "id=$container_id" --format "{{.Ports}}")
+                    [ -n "$port_info" ] && ports=$port_info
+                fi
+                
+                local uptime=$(translate_status "$raw_status")
+                local status_icon="${RED}❌${RESET}"
+                [[ "$raw_status" == *"Up"* ]] && status_icon="${GREEN}✅${RESET}"
+                
+                # 紧凑单行/双行输出，适合菜单顶部预览
+                echo -e "  ${YELLOW}◈ $service${RESET} $status_icon -> $uptime"
+                echo -e "    ${YELLOW}└─ 端口:${RESET} ${GREEN}$ports${RESET}"
+            done
+        fi
+        echo -e "${YELLOW}----------------------------------------${RESET}"
+        # -----------------------------------------------------------
+
         echo -e "${GREEN} 1) 启动服务${RESET}"
         echo -e "${GREEN} 2) 停止服务${RESET}"
         echo -e "${GREEN} 3) 重启服务${RESET}"
         echo -e "${GREEN} 4) 查看日志${RESET}"
         echo -e "${GREEN} 5) 查看容器状态${RESET}"
-        echo -e "${GREEN} 6) 更新容器${RESET}"
+        echo -e "${GREEN} 6) 更新容器(pull & up)${RESET}"
         echo -e "${GREEN} 7) 进入容器${RESET}"
         echo -e "${GREEN} 8) 删除容器(含数据卷)${RESET}"
         echo -e "${GREEN} 9) 删除容器+镜像+数据卷${RESET}"
@@ -332,14 +356,13 @@ function project_menu() {
                     docker compose -f "$COMPOSE_FILE" down --rmi all -v && action_done
                 fi
                 ;;
-            10) delete_project ;;
-            11) select_project ;;
-            0) main_menu ;;
+            10) delete_project; return ;;
+            11) select_project; return ;;
+            0) return ;;
             *) echo -e "${RED}无效选择${RESET}" && sleep 1 ;;
         esac
     done
 }
-
 
 # ---------------------------
 # Docker 网络管理
@@ -439,7 +462,6 @@ function network_menu() {
     done
 }
 
-
 # ---------------------------
 # 主菜单
 # ---------------------------
@@ -449,15 +471,15 @@ function main_menu() {
         echo -e "${GREEN}=== Docker Compose 管理 ===${RESET}"
         echo -e "${GREEN}1) 管理项目${RESET}"
         echo -e "${GREEN}2) 网络管理${RESET}"
-        echo -e "${GREEN}3) 一键查看所有项目容器运行状态${RESET}"
-        echo -e "${GREEN}4) 多选删除项目（含容器、镜像、数据卷、文件）${RESET}"
-        echo -e "${GREEN}5) 一键删除所有未运行的项目${RESET}"
+        echo -e "${GREEN}3) 查看容器运行状态${RESET}"
+        echo -e "${GREEN}4) 多选删除项目${RESET}"
+        echo -e "${GREEN}5) 删除所有未运行的项目${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
         case "$choice" in
             1) select_project ;;
             2) network_menu ;;
-            3) show_all_projects_status ;;
+            3) monitor_docker_containers ;;
             4) delete_multiple_projects ;;
             5) delete_all_stopped_projects ;;
             0) exit 0 ;;
@@ -466,7 +488,5 @@ function main_menu() {
     done
 }
 
-# ---------------------------
 # 启动
-# ---------------------------
 main_menu

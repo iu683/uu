@@ -1,378 +1,123 @@
-#!/bin/sh
-set -e
+#!/bin/bash
 
-# ==========================================================
-# Alpine Linux 专属全能一键优化脚本 (终极稳定版)
-# ==========================================================
-
-# 1. 颜色与基础变量
-RED="\033[31m"
+# 颜色定义
 GREEN="\033[32m"
+RED="\033[31m"
 YELLOW="\033[33m"
-BLUE="\033[34m"
-CYAN="\033[36m"
 RESET="\033[0m"
 
-LOG_FILE="/var/log/alpine_setup.log"
-non_interactive=${NON_INTERACTIVE:-false}
+# 代理前缀
+PROXY="https://v6.gh-proxy.org/"
+# 脚本基础路径
+BASE_URL="https://raw.githubusercontent.com/sistarry/toolbox/main/VPS"
 
-# 适配 Alpine 的精简依赖包 (已修复为 netcat-openbsd)
-deps="curl wget git net-tools lsof tar unzip rsync pv sudo netcat-openbsd openssh-client jq openssl ca-certificates"
-
-log() {
-    echo -e "$1"
-    echo -e "$1" | sed 's/\\033\[[0-9;]*m//g' >> "$LOG_FILE"
+# 基础工具函数：暂停等待
+pause() {
+    echo ""
+    read -r -p $'\033[32m  按回车键返回菜单...\033[0m'
 }
 
-root_check() {
-    if [ "$(id -u)" -ne 0 ]; then
-        echo -e "${RED}❌ 请使用 root 用户运行此脚本${RESET}"
-        exit 1
-    fi
-}
-
-# 环境侦测：判断是独立虚拟机还是容器
-detect_environment() {
-    IS_CONTAINER=false
-    if [ -f /.dockerenv ] || [ -f /run/.containerenv ] || grep -qaE "(container|docker|lxc)" /proc/1/environ /proc/1/cgroup 2>/dev/null; then
-        IS_CONTAINER=true
-        VIRT_TYPE="容器环境 (Docker/LXC)"
-    else
-        VIRT_TYPE="独立虚拟机/物理机 (KVM/XEN/VMware)"
-    fi
-    log "${BLUE}[INFO] 当前运行环境: ${VIRT_TYPE}${RESET}"
-}
-
-# 2. 系统更新与依赖安装
-update_system() {
-    log "\n${YELLOW}=============== 1. 系统更新与依赖 ===============${RESET}"
-    log "${BLUE}正在更新 apk 软件源...${RESET}"
-    apk update && apk upgrade
+# 核心下载与无痕执行函数（完美支持进程替换的容灾切换）
+fetch_and_run() {
+    local script_name="$1"
+    local full_url="${BASE_URL}/${script_name}"
+    local script_content=""
     
-    log "${BLUE}正在安装基础依赖工具...${RESET}"
-    for pkg in $deps; do
-        if ! apk info -e "$pkg" >/dev/null 2>&1; then
-            apk add "$pkg"
-        fi
+    # 抓取并验证内容是否为空
+    if script_content=$(curl -fsSL "$full_url") && [ -n "$script_content" ]; then
+        bash <(echo "$script_content")
+        return 0
+    fi
+    
+    if script_content=$(curl -fsSL "${PROXY}${full_url}") && [ -n "$script_content" ]; then
+        bash <(echo "$script_content")
+        return 0
+    fi
+    
+    echo -e "${RED}错误：直连与代理均失败，请检查网络设置。${RESET}"
+    return 1
+}
+
+# 主菜单函数
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== 系统监控管理菜单 ===${RESET}"
+        echo -e "${GREEN} 1) 查看端口${RESET}"
+        echo -e "${GREEN} 2) 释放端口${RESET}"
+        echo -e "${GREEN} 3) 查看进程${RESET}"
+        echo -e "${GREEN} 4) 删除进程${RESET}"
+        echo -e "${GREEN} 5) 查看自启动服务${RESET}"
+        echo -e "${GREEN} 6) 自启动服务管理${RESET}"
+        echo -e "${GREEN} 7) 国家IP屏蔽${RESET}"
+        echo -e "${GREEN} 8) 磁盘占用${RESET}"
+        echo -e "${GREEN} 9) 挂载磁盘${RESET}"
+        echo -e "${GREEN}10) 安全扫描${RESET}"
+        echo -e "${GREEN} 0) 退出${RESET}"
+        echo -e "${GREEN}========================${RESET}"
+        
+        read -r -p $'\033[32m 请选择操作: \033[0m' choice
+        case $choice in
+            1)
+                echo -e "${GREEN}\n正在查看端口...${RESET}"
+                fetch_and_run "port.sh"
+                pause
+                ;;
+            2)
+                echo -e "${GREEN}\n正在释放端口...${RESET}"
+                fetch_and_run "killport.sh"
+                pause
+                ;;
+            3)
+                echo -e "${GREEN}\n正在查看进程...${RESET}"
+                fetch_and_run "psaux.sh"
+                pause
+                ;;
+            4)
+                echo -e "${GREEN}\n正在删除进程...${RESET}"
+                fetch_and_run "killprocess.sh"
+                pause
+                ;;
+            5)
+                echo -e "${GREEN}\n正在查看自启动服务...${RESET}"
+                fetch_and_run "service.sh"
+                pause
+                ;;
+            6)
+                echo -e "${GREEN}\n正在管理自启动服务...${RESET}"
+                fetch_and_run "killservice.sh"
+                pause
+                ;;
+            7)
+                echo -e "${GREEN}\n正在国家IP屏蔽...${RESET}"
+                fetch_and_run "GeoFirewall.sh"
+                pause
+                ;;
+            8)
+                echo -e "${GREEN}\n正在查看磁盘占用...${RESET}"
+                fetch_and_run "DHGL.sh"
+                pause
+                ;;
+            9)
+                echo -e "${GREEN}\n正在挂载磁盘...${RESET}"
+                fetch_and_run "DISKGL.sh"
+                pause
+                ;;
+            10)
+                echo -e "${GREEN}\n正在安全扫描...${RESET}"
+                fetch_and_run "Security.sh"
+                pause
+                ;;
+            0)
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}无效选择，请重新输入...${RESET}"
+                sleep 1
+                ;;
+        esac
     done
-    log "${GREEN}✅ 基础依赖安装完成${RESET}"
 }
 
-# 3. 设置主机名
-configure_hostname() {
-    log "\n${YELLOW}=============== 2. 主机名配置 ===============${RESET}"
-    local new_hn="localhost"
-    
-    if [ "$IS_CONTAINER" = false ] && [ -f /etc/hostname ]; then
-        echo "$new_hn" > /etc/hostname
-        if command -v hostname >/dev/null 2>&1; then
-            hostname "$new_hn"
-        fi
-    fi
-    
-    # 更新 /etc/hosts
-    if [ -f /etc/hosts ]; then
-        sed -i "s/127.0.0.1.*/127.0.0.1\t$new_hn localhost/" /etc/hosts
-    fi
-    log "${GREEN}✅ 主机名配置完成${RESET}"
-}
-
-# 4. 语言与区域环境 (Locale)
-configure_locale() {
-    log "\n${YELLOW}=============== 3. 语言环境设置 ===============${RESET}"
-    apk add musl-locales musl-locales-lang ttf-dejavu >/dev/null 2>&1
-    
-    export LANG=en_US.UTF-8
-    export LC_ALL=en_US.UTF-8
-    
-    # 写入全局环境变量
-    if [ -f /etc/profile ]; then
-        grep -q "en_US.UTF-8" /etc/profile || echo -e "\nexport LANG=en_US.UTF-8\nexport LC_ALL=en_US.UTF-8" >> /etc/profile
-    fi
-    log "${GREEN}✅ 语言环境设为 en_US.UTF-8${RESET}"
-}
-
-# 5. 防火墙完全放行
-configure_firewall() {
-    log "\n${YELLOW}=============== 4. 防火墙完全放行 ===============${RESET}"
-    
-    if command -v iptables >/dev/null 2>&1; then
-        log "${BLUE}[INFO] 正在清理 iptables 规则...${RESET}"
-        iptables -F 2>/dev/null || true
-        iptables -X 2>/dev/null || true
-        iptables -P INPUT ACCEPT 2>/dev/null || true
-        iptables -P FORWARD ACCEPT 2>/dev/null || true
-        iptables -P OUTPUT ACCEPT 2>/dev/null || true
-    fi
-    
-    if [ -d /etc/init.d ] && [ -f /etc/init.d/iptables ]; then
-        rc-service iptables stop 2>/dev/null || true
-        rc-update del iptables default 2>/dev/null || true
-    fi
-    log "${GREEN}✅ 防火墙限制已全面解除${RESET}"
-}
-
-# 6. BBR 与内核网络调优
-configure_bbr() {
-    log "\n${YELLOW}=============== 5. BBR 与网络网络调优 ===============${RESET}"
-    
-    if [ "$IS_CONTAINER" = true ]; then
-        log "${YELLOW}[SKIP] 当前为容器环境，共享宿主机内核，跳过内核参数修改。${RESET}"
-        return 0
-    fi
-    
-    log "${BLUE}正在配置优化级内核参数...${RESET}"
-    local config_file="/etc/sysctl.d/99-bbr.conf"
-    
-    cat > "$config_file" << EOF
-# 核心网络及 BBR 开启
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_fastopen = 3
-
-# 缓冲区深度适配
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-
-# 队列与连接复用
-net.core.somaxconn = 16384
-net.ipv4.tcp_max_syn_backlog = 16384
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-EOF
-    sysctl -p "$config_file" >/dev/null 2>&1 || true
-    log "${GREEN}✅ BBR 及网络队列调优成功${RESET}"
-}
-
-# 7. 传统 DNS 配置
-configure_dns() {
-    log "\n${YELLOW}=============== 6. DNS 配置 ===============${RESET}"
-    log "${BLUE}正在修改 /etc/resolv.conf...${RESET}"
-    
-    chattr -i /etc/resolv.conf 2>/dev/null || true
-    
-    cat > /etc/resolv.conf << EOF
-# Generated by Alpine Setup Script
-nameserver 8.8.8.8
-nameserver 1.1.1.1
-nameserver 2606:4700:4700::1111
-EOF
-    log "${GREEN}✅ DNS 优化完毕 (8.8.8.8 / 1.1.1.1)${RESET}"
-}
-
-# 8. Swap 虚拟内存配置 (1GB)
-configure_swap() {
-    log "\n${YELLOW}=============== 7. Swap 虚拟内存配置 ===============${RESET}"
-    
-    if [ "$IS_CONTAINER" = true ]; then
-        log "${YELLOW}[SKIP] 容器环境无法独立挂载物理 Swap，跳过。${RESET}"
-        return 0
-    fi
-    
-    if swapon -s | grep -q 'partition\|file'; then
-        log "${BLUE}系统已有可用 Swap，跳过创建${RESET}"
-        return 0
-    fi
-    
-    local free_space=$(df -m / | awk 'NR==2 {print $4}')
-    if [ "$free_space" -lt 5120 ]; then
-        log "${YELLOW}磁盘剩余空间小于 5GB，不建议创建 Swap，跳过。${RESET}"
-        return 0
-    fi
-    
-    log "${BLUE}正在使用 dd 创建 1GB Swap 镜像文件...${RESET}"
-    dd if=/dev/zero of=/swapfile bs=1M count=1024 status=progress
-    chmod 600 /swapfile
-    mkswap /swapfile
-    swapon /swapfile
-    
-    grep -q "/swapfile" /etc/fstab || echo "/swapfile none swap sw 0 0" >> /etc/fstab
-    log "${GREEN}✅ 1GB 虚拟内存 Swap 配置完毕${RESET}"
-}
-
-# 9. SSH 端口与密码配置
-configure_ssh() {
-    log "\n${YELLOW}=============== 8. SSH 端口与密码配置 ===============${RESET}"
-    
-    # 交互询问端口
-    if [ -z "$NEW_SSH_PORT" ] && [ "$non_interactive" = false ]; then
-        echo -n "请输入新的 SSH 端口号 (直接回车跳过不变): "
-        read -r NEW_SSH_PORT
-    fi
-    
-    # 交互询问密码
-    if [ -z "$NEW_SSH_PASSWORD" ] && [ "$non_interactive" = false ]; then
-        echo -n "请输入新的 root 用户密码 (直接回车跳过不修改): "
-        read -r NEW_SSH_PASSWORD
-    fi
-    
-    # 应用端口修改
-    if [ -n "$NEW_SSH_PORT" ]; then
-        if [ -f /etc/ssh/sshd_config ]; then
-            sed -i "s/^#\?Port.*/Port $NEW_SSH_PORT/g" /etc/ssh/sshd_config
-            log "${GREEN}✅ SSH 端口已设为: ${NEW_SSH_PORT}${RESET}"
-        else
-            log "${RED}❌ 未检测到 /etc/ssh/sshd_config，跳过端口修改${RESET}"
-        fi
-    else
-        log "${BLUE}SSH 端口未作变更${RESET}"
-    fi
-    
-    # 应用密码修改
-    if [ -n "$NEW_SSH_PASSWORD" ]; then
-        echo "root:${NEW_SSH_PASSWORD}" | chpasswd
-        log "${GREEN}✅ root 密码已成功更新${RESET}"
-    fi
-    
-    # 重启 SSH 服务
-    if [ -f /etc/init.d/sshd ]; then
-        rc-service sshd restart >/dev/null 2>&1 || true
-    fi
-}
-
-# 10. Fail2ban 安装与适配
-configure_fail2ban() {
-    log "\n${YELLOW}=============== 9. Fail2ban 暴破防护 ===============${RESET}"
-    
-    if [ "$IS_CONTAINER" = true ]; then
-        log "${YELLOW}[SKIP] 容器环境由于缺少底层内核审计模块，跳过 Fail2ban 的安装。${RESET}"
-        return 0
-    fi
-    
-    log "${BLUE}正在安装 Fail2ban...${RESET}"
-    apk add fail2ban >/dev/null
-    
-    cat > /etc/fail2ban/jail.local << EOF
-[DEFAULT]
-bantime = 86400
-findtime = 300
-maxretry = 5
-ignoreip = 127.0.0.1/8
-
-[sshd]
-enabled = true
-port = ${NEW_SSH_PORT:-22}
-filter = sshd
-logpath = /var/log/messages
-EOF
-
-    if [ -f /etc/init.d/fail2ban ]; then
-        rc-update add fail2ban default 2>/dev/null || true
-        rc-service fail2ban start 2>/dev/null || true
-    fi
-    log "${GREEN}✅ Fail2ban 暴破拦截配置完毕${RESET}"
-}
-
-# 11. 定时任务与网络追踪工具 (已修复：原生 dcron 适配 & cp 降噪)
-install_tools() {
-    log "\n${YELLOW}=============== 10. 实用工具集安装 ===============${RESET}"
-    
-    # 配置并启动 Alpine 自带的 dcron
-    log "${BLUE}配置 Alpine 原生 dcron 计划任务服务...${RESET}"
-    if [ -f /etc/init.d/crond ]; then
-        rc-update add crond default >/dev/null 2>&1 || true
-        rc-service crond start >/dev/null 2>&1 || true
-        log "${GREEN}✅ 定时任务服务已就绪${RESET}"
-    fi
-    
-    # 安装 NextTrace
-    log "${BLUE}下载并配置路由追踪工具 NextTrace...${RESET}"
-    apk add gcompat libc6-compat >/dev/null 2>&1 || true
-    curl -sL https://nxtrace.org/nt | bash || true
-    
-    # 配置时区为上海 (已修复：使用 -f 并清理潜在硬链接冲突)
-    log "${BLUE}修正系统时区为 Asia/Shanghai...${RESET}"
-    apk add tzdata >/dev/null
-    if [ -f /usr/share/zoneinfo/Asia/Shanghai ]; then
-        rm -f /etc/localtime
-        cp -f /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
-        echo "Asia/Shanghai" > /etc/timezone
-    fi
-    apk del tzdata >/dev/null
-    log "${GREEN}✅ 常用工具及 Asia/Shanghai 时区配置完成${RESET}"
-}
-
-# 12. Docker 安装
-docker_install() {
-    log "\n${CYAN}============ 11. Docker 容器引擎安装 ============${RESET}"
-    
-    if [ "$IS_CONTAINER" = true ]; then
-        log "${YELLOW}[SKIP] 当前已是容器环境，无法进行嵌套 Docker 安装，跳过。${RESET}"
-        return 0
-    fi
-    
-    if [ "$non_interactive" = false ]; then
-        echo -n "是否在当前 Alpine 主机上安装 Docker？[y/N]: "
-        read -r INSTALL_DOCKER
-        if [ "$INSTALL_DOCKER" != "y" ] && [ "$INSTALL_DOCKER" != "Y" ]; then
-            log "${BLUE}已取消 Docker 安装${RESET}"
-            return 0
-        fi
-    fi
-    
-    log "${BLUE}开始安装 Docker 引擎与 Docker-Compose...${RESET}"
-    apk add docker docker-cli-compose >/dev/null
-    
-    if [ -f /etc/init.d/docker ]; then
-        rc-update add docker default >/dev/null 2>&1
-        rc-service docker start >/dev/null 2>&1
-    fi
-    log "${GREEN}✅ Docker 环境配置成功${RESET}"
-}
-
-# 13. 系统垃圾清理
-clean_system() {
-    log "\n${YELLOW}=============== 12. 极简系统瘦身清理 ============${RESET}"
-    log "${BLUE}正在深度剔除 Alpine 缓存包...${RESET}"
-    rm -rf /var/cache/apk/*
-    rm -rf /tmp/* /var/tmp/*
-    log "${GREEN}✅ 清理工作已顺利完成${RESET}"
-}
-
-# 主流程控制
-main() {
-    clear
-    echo -e "${CYAN}======================================================${RESET}"
-    echo -e "${GREEN}       欢迎使用 Alpine Linux 专属全能优化脚本${RESET}"
-    echo -e "${CYAN}======================================================${RESET}"
-    
-    root_check
-    detect_environment
-    
-    if [ "$non_interactive" = false ]; then
-        echo -n "是否立刻开始执行一键优化？ [Y/n]: "
-        read -r CONFIRM
-        if [ "$CONFIRM" = "n" ] || [ "$CONFIRM" = "N" ]; then
-            echo -e "${BLUE}已主动退出。${RESET}"
-            exit 0
-        fi
-    fi
-    
-    update_system
-    configure_hostname
-    configure_locale
-    configure_firewall
-    configure_bbr
-    configure_dns
-    configure_swap
-    configure_ssh
-    configure_fail2ban
-    install_tools
-    docker_install
-    clean_system
-    
-    log "${GREEN}✨ 针对 Alpine Linux 的所有优化项目已全部处理完毕！${RESET}"
-    
-    if [ "$IS_CONTAINER" = true ]; then
-        log "${YELLOW}容器环境无需重启，优化立即生效。${RESET}"
-    else
-        log "${YELLOW}系统将在 3 秒后安全重启以使内核及服务生效...${RESET}"
-        sleep 3
-        reboot
-    fi
-}
-
-main "$@"
+# 启动菜单
+menu

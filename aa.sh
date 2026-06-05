@@ -1,131 +1,92 @@
 #!/bin/bash
-# ==========================================
-# 一键开放 VPS 所有端口
-# ⚠️ 警告：非常不安全，仅用于测试环境
-# ==========================================
+# ========================================
+# 安全版 Debian 重装执行器
+# 功能: 下载远程重装脚本，执行前安全确认
+# ========================================
+
+BASE_URL="https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
+SCRIPT_NAME="reinstall.sh"
 
 # 颜色
-RED="\033[31m"
 GREEN="\033[32m"
+RED="\033[31m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-# --------------------------
-# 检查 Root 权限
-# --------------------------
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}❌ 请使用 root 权限或 sudo 运行此脚本！${RESET}"
+echo -e "${GREEN}警告: 此操作将会完全重装系统，磁盘上所有数据将丢失！${RESET}"
+echo -e "${GREEN}请确保已备份重要数据！${RESET}"
+
+# 用户确认
+read -p $'\033[31m你确定要继续吗？(y/n): \033[0m' CONFIRM
+if [[ "$CONFIRM" != "y" ]]; then
+    echo -e "${RED}已取消操作${RESET}"
     exit 1
 fi
 
-echo -e "${YELLOW}检测防火墙类型...${RESET}"
-
-# --------------------------
-# 自动安装函数
-# --------------------------
-install_package() {
-    local pkg="$1"
-    if [[ -f /etc/alpine-release ]]; then
-        echo -e "${YELLOW}检测到 Alpine，尝试安装 $pkg ...${RESET}"
-        apk update && apk add "$pkg"
-    elif [[ -f /etc/debian_version ]]; then
-        echo -e "${YELLOW}检测到 Debian/Ubuntu，尝试安装 $pkg ...${RESET}"
-        apt-get update && apt-get install -y "$pkg"
-    elif [[ -f /etc/redhat-release ]]; then
-        echo -e "${YELLOW}检测到 CentOS/RHEL/Fedora，尝试安装 $pkg ...${RESET}"
-        if command -v dnf >/dev/null 2>&1; then
-            dnf install -y "$pkg"
-        else
-            yum install -y "$pkg"
-        fi
-    else
-        echo -e "${RED}❌ 未知系统，请手动安装 $pkg${RESET}"
-        exit 1
-    fi
-}
-
-# --------------------------
-# 检测防火墙类型
-# --------------------------
-# 优先检测已经运行或安装的防火墙
-if command -v ufw >/dev/null 2>&1; then
-    FW_TYPE="ufw"
-elif command -v iptables >/dev/null 2>&1; then
-    FW_TYPE="iptables"
-elif command -v nft >/dev/null 2>&1; then
-    FW_TYPE="nftables"
+# 代理设置（仅用于下载本脚本）
+read -p "是否启用 GitHub镜像代理(y/N, 默认直连): " USE_PROXY
+if [[ "$USE_PROXY" == "y" || "$USE_PROXY" == "Y" ]]; then
+    REINSTALL_URL="https://cnb.cool/${BASE_URL}"
+    echo -e "${GREEN}已启用代理下载。${RESET}"
 else
-    # 未检测到任何防火墙时，根据系统按需安装
-    if [[ -f /etc/alpine-release ]]; then
-        install_package nftables
-        FW_TYPE="nftables"
-        # 写入一个基础的全放通规则防止启动失败
-        echo 'flush ruleset; table inet filter { chain input { type filter hook input priority 0; policy accept; }; }' > /etc/nftables.nft
-        rc-update add nftables >/dev/null 2>&1
-        service nftables start >/dev/null 2>&1
-    elif [[ -f /etc/debian_version ]]; then
-        install_package ufw
-        FW_TYPE="ufw"
-    elif [[ -f /etc/redhat-release ]]; then
-        install_package iptables
-        FW_TYPE="iptables"
-    else
-        echo -e "${RED}❌ 未知系统，无法判断/安装防火墙${RESET}"
-        exit 1
-    fi
+    REINSTALL_URL="$BASE_URL"
 fi
 
-# --------------------------
-# 开放所有端口逻辑
-# --------------------------
-echo -e "${GREEN}检测到系统防火墙组件: $FW_TYPE，开始清空规则...${RESET}"
+# 用户名（默认 root）
+read -p "请输入用户名 (默认 root): " USERNAME
+USERNAME=${USERNAME:-root}
 
-if [[ "$FW_TYPE" == "ufw" ]]; then
-    # 既然是要开放所有端口，最稳妥的做法是直接禁用 UFW
-    ufw disable >/dev/null 2>&1
-    ufw --force reset >/dev/null 2>&1
-    echo -e "${GREEN}✓ UFW 已禁用并重置（默认放行所有流量）${RESET}"
+# SSH 公钥输入
+read -p "请输入 SSH 登录公钥 (留空则使用密码登录): " SSH_KEY
 
-elif [[ "$FW_TYPE" == "iptables" ]]; then
-    # 清空所有规则并设置默认策略为 ACCEPT
-    iptables -P INPUT ACCEPT
-    iptables -P FORWARD ACCEPT
-    iptables -P OUTPUT ACCEPT
-    iptables -F
-    iptables -X
-    iptables -t nat -F
-    iptables -t nat -X
-    iptables -t mangle -F
-    iptables -t mangle -X
-    iptables -t raw -F
-    iptables -t raw -X
-    
-    # 如果存在 ip6tables（IPv6），同步放通
-    if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -P INPUT ACCEPT
-        ip6tables -P FORWARD ACCEPT
-        ip6tables -P OUTPUT ACCEPT
-        ip6tables -F
-        ip6tables -X
+# 密码输入与随机生成逻辑
+ROOT_PASS=""
+if [[ -z "$SSH_KEY" ]]; then
+    read -p "请输入 ${USERNAME} 密码 (留空则自动生成随机密码): " ROOT_PASS
+    if [[ -z "$ROOT_PASS" ]]; then
+        # 生成 16 位随机密码（包含大小写字母、数字）
+        ROOT_PASS=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16)
+        echo -e "${YELLOW}==================================================${RESET}"
+        echo -e "${YELLOW}🔑 未输入密码，已自动为您生成随机强密码：${RESET}"
+        echo -e "${RED}${ROOT_PASS}${RESET}"
+        echo -e "${YELLOW}请务必复制并妥善保存此密码！${RESET}"
+        echo -e "${YELLOW}==================================================${RESET}"
+        read -p "请按 Enter 键确认已保存密码并继续..."
     fi
-    echo -e "${GREEN}✓ iptables 规则已清空，默认策略已设为 ACCEPT (IPv4/IPv6)${RESET}"
-
-elif [[ "$FW_TYPE" == "nftables" ]]; then
-    # 彻底刷新 nftables 规则集
-    nft flush ruleset
-    nft add table inet filter
-    nft add chain inet filter input '{ type filter hook input priority 0; policy accept; }'
-    nft add chain inet filter forward '{ type filter hook forward priority 0; policy accept; }'
-    nft add chain inet filter output '{ type filter hook output priority 0; policy accept; }'
-    echo -e "${GREEN}✓ nftables 规则集已重置为全放行 (ACCEPT)${RESET}"
+else
+    echo -e "${GREEN}检测到已提供 SSH 公钥，将跳过密码设置。${RESET}"
 fi
 
-# --------------------------
-# 提示与警告
-# --------------------------
-echo -e "\n${RED}==================================================${RESET}"
-echo -e "${YELLOW}警告：VPS 本地防火墙已完全关闭/放通！${RESET}"
-echo -e "${YELLOW}提示：如果依然无法访问，请务必检查：${RESET}"
-echo -e "${YELLOW}1. 云服务商控制台（阿里云/腾讯云/AWS等）的「安全组/防火墙」是否放行。${RESET}"
-echo -e "${YELLOW}2. 部分服务商（如 Oracle Cloud）可能存在底层厂商定制规则。${RESET}"
-echo -e "${RED}==================================================${RESET}"
+# SSH 端口
+read -p "请输入 SSH 端口 (默认 22): " SSH_PORT
+SSH_PORT=${SSH_PORT:-22}
+
+# 下载脚本
+echo -e "${GREEN}正在下载重装...${RESET}"
+if ! wget -q "$REINSTALL_URL" -O "$SCRIPT_NAME"; then
+    echo -e "${RED}❌ 下载失败，请检查网络或代理配置。${RESET}"
+    exit 1
+fi
+
+chmod +x "$SCRIPT_NAME"
+
+# 组装执行参数
+CMD=("./$SCRIPT_NAME" "debian" "13" --username "$USERNAME" --ssh-port "$SSH_PORT")
+
+# 根据输入动态添加密码或密钥
+if [[ -n "$SSH_KEY" ]]; then
+    CMD+=(--ssh-key "$SSH_KEY")
+else
+    CMD+=(--password "$ROOT_PASS")
+fi
+
+# 执行重装脚本
+echo -e "${GREEN}🔧 正在执行重装...${RESET}"
+"${CMD[@]}"
+
+# 绿色重启提示
+echo -e "${GREEN}✔ 系统将在完成后重启。${RESET}"
+read -p "按 Enter 确认重启..." dummy
+
+echo -e "${GREEN}>>> 正在重启系统...${RESET}"
+reboot

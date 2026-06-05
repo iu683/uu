@@ -1,568 +1,367 @@
 #!/bin/bash
-set -e
-export DEBIAN_FRONTEND=noninteractive
+# ========================================
+# flux-panel 一键管理脚本
+# ========================================
 
-# ==========================================
-# 系统更新 & 常用依赖安装 & 修复 APT 源
-# ==========================================
-
-# 颜色定义
-RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-# 检查是否 root
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}❌ 请使用 root 用户运行此脚本${RESET}"
-    exit 1
-fi
+# 定义 GitHub 代理前缀
+PROXY="https://v6.gh-proxy.org/"
 
+APP_NAME="flux-panel"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+# 这里只写原始的 GitHub URL，由下载函数动态决定是否加代理
+GOST_SQL_URL="https://github.com/bqlpfy/flux-panel/releases/download/1.4.3/gost.sql"
+
+DOCKER_CMD="docker compose"
 
 # ========================================
-# Alpine 路径
+# 核心改动：支持代理失败自动直连的下载函数
 # ========================================
-if [ -f /etc/os-release ]; then
-    . /etc/os-release
-fi
-
-if [ "$ID" = "alpine" ]; then
-    echo -e "${YELLOW}🚀 Alpine更新与环境配置...${RESET}"
-
-    # -------------------------
-    # 环境变量与检测
-    # -------------------------
-    # 检测是否在 Docker 容器中 (通过 .dockerenv 或 cgroup 判断)
-    IS_CONTAINER=0
-    if [ -f /.dockerenv ] || grep -qi docker /proc/1/cgroup 2>/dev/null; then
-        IS_CONTAINER=1
-        echo -e "${YELLOW}🐳 检测到当前运行在 Docker 容器环境${RESET}"
-    fi
-
-    # 更新索引并安装基础工具 + cron
-    # 如果是容器，就不安装后面可能用到的 openntpd 等硬件工具
-    apk update && apk upgrade
+download_file() {
+    local output_file="$1"
+    local raw_url="$2"
     
-    # 基础装机必备组件
-    APK_PACKAGES="bash curl wget vim tar sudo git gzip openssl bind-tools openssh ca-certificates tzdata dcron jq gcompat"
-    
-    # 只有非容器环境（物理机/VM）才安装时间同步服务
-    if [ "$IS_CONTAINER" -eq 0 ]; then
-        APK_PACKAGES="$APK_PACKAGES openntpd"
-    fi
-    
-    apk add --no-cache $APK_PACKAGES
-
-    # -------------------------
-    # 时区设置
-    # -------------------------
-    TZ=${TZ:-Asia/Shanghai}
-    echo -e "${YELLOW}🌏 配置时区为: $TZ ...${RESET}"
-
-    if [ -f "/usr/share/zoneinfo/$TZ" ]; then
-        ln -sf "/usr/share/zoneinfo/$TZ" /etc/localtime
-        echo "$TZ" > /etc/timezone
-        echo -e "${GREEN}✔ 时区设置完成${RESET}"
-    else
-        echo -e "${RED}❌ 时区不存在: $TZ${RESET}"
-    fi
-
-    # -------------------------
-    # 时间同步 (容器内跳过)
-    # -------------------------
-    if [ "$IS_CONTAINER" -eq 0 ]; then
-        echo -e "${YELLOW}⏰ 正在配置时间同步 (NTP)...${RESET}"
-        # 允许 openntpd 强制步进同步时间（防止时间偏差过大）
-        sed -i 's/#constraints/constraints/g' /etc/ntpd.conf 2>/dev/null
-        
-        if [ -f /run/openrc/softlevel ]; then
-            rc-update add openntpd default
-            rc-service openntpd restart
-            echo -e "${GREEN}✔ OpenNTPD 服务已启动并设为自启${RESET}"
-        else
-            # 备用方案：直接使用 busybox 自带的 ntpd 进行单次强制同步
-            ntpd -n -q -p pool.ntp.org >/dev/null 2>&1 &
-            echo -e "${GREEN}✔ 已在后台触发 ntp 单次同步${RESET}"
+    # 尝试使用代理下载
+    if curl -L --connect-timeout 10 --max-time 60 -o "$output_file" "${PROXY}${raw_url}"; then
+        # 检查文件是否下载成功且不为空
+        if [ -s "$output_file" ]; then
+            return 0
         fi
-    else
-        echo -e "${BLUE}ℹ 容器环境：跳过硬件时间同步，共享宿主机时间${RESET}"
     fi
 
-    # -------------------------
-    # 开启 BBR + FQ (容器内跳过)
-    # -------------------------
-    if [ "$IS_CONTAINER" -eq 0 ]; then
-        echo -e "${YELLOW}🚀 正在配置网络优化 (BBR + FQ)...${RESET}"
-        
-        # 检查当前内核是否已加载或支持 tcp_bbr
-        if modprobe tcp_bbr 2>/dev/null || sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
-            # 写入 sysctl 配置文件
-            cat > /etc/sysctl.d/99-bbr.conf << EOF
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-EOF
-            # 尝试立即刷新内核参数
-            sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1
-            
-            # 验证结果
-            CURRENT_CC=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')
-            CURRENT_QDISC=$(sysctl net.core.default_qdisc | awk '{print $3}')
-            
-            if [ "$CURRENT_CC" = "bbr" ]; then
-                echo -e "${GREEN}✔ BBR 拥塞控制算法激活成功！(当前 qdisc: $CURRENT_QDISC)${RESET}"
-            else
-                echo -e "${YELLOW}⚠ 内核参数已写入，可能需要重启系统以完全生效${RESET}"
-            fi
-        else
-            echo -e "${RED}❌ 当前系统内核似乎不支持 BBR，已跳过配置${RESET}"
+    # 代理失败，移除代理前缀，直接下载
+    if curl -L --connect-timeout 15 --max-time 120 -o "$output_file" "${raw_url}"; then
+        if [ -s "$output_file" ]; then
+            return 0
         fi
-    else
-        echo -e "${BLUE}ℹ 容器环境：无内核修改权限，跳过 BBR 配置${RESET}"
     fi
 
-    # -------------------------
-    # 安装 NextTrace (容器内跳过)
-    # -------------------------
-    if [ "$IS_CONTAINER" -eq 0 ]; then
-        echo -e "${YELLOW}📡 正在安装 NextTrace 路由追踪工具...${RESET}"
-        # 使用官方一键脚本安装
-        if curl -splJf https://nxtrace.org/nt | bash; then
-            echo -e "${GREEN}✔ NextTrace 安装成功！(可直接运行 nexttrace 或 nt)${RESET}"
-        else
-            echo -e "${RED}❌ NextTrace 安装失败，请检查网络连接${RESET}"
-        fi
-    else
-        echo -e "${BLUE}ℹ 容器环境：通常不需要网络诊断工具，跳过 NextTrace 安装${RESET}"
+    echo -e "${RED}❌ 下载完全失败（代理和直连均不可用），请检查网络！${RESET}"
+    return 1
+}
+
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
     fi
 
-    # -------------------------
-    # Cron 服务配置
-    # -------------------------
-    echo -e "${YELLOW}⏰ 正在启动 Cron 服务...${RESET}"
-    mkdir -p /var/spool/cron/crontabs
-
-    if [ -f /run/openrc/softlevel ]; then
-        # 针对普通 Alpine 系统 (OpenRC)
-        rc-update add dcron default
-        rc-service dcron start 2>/dev/null || rc-service dcron restart
-    else
-        # 针对 Docker 容器环境
-        # 先杀掉已有的，防止重复启动报错
-        pkill -9 crond 2>/dev/null
-        crond -b -L /var/log/cron.log
-    fi
-    echo -e "${GREEN}✔ Cron 服务配置就绪${RESET}"
-
-    # -------------------------
-    # 🧹 清理缓存
-    # -------------------------
-    echo -e "${YELLOW}🧹 清理 APK 缓存...${RESET}"
-    rm -rf /var/cache/apk/*
-
-    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-    echo -e "${GREEN}🎉 系统更新与优化工作已全部完成！${RESET}"
-    echo -e "${YELLOW}📅 完成时间: $(date +'%Y-%m-%d %H:%M:%S')${RESET}"
-    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-
-    exit 0
-fi
-# -------------------------
-# 常用依赖
-# -------------------------
-deps=(curl wget git net-tools lsof tar unzip rsync pv sudo iperf3 mtr jq openssl)
-
-# -------------------------
-# 检查并安装依赖（兼容不同系统）
-# -------------------------
-check_and_install() {
-    local check_cmd="$1"
-    local install_cmd="$2"
-    local missing=()
-    for pkg in "${deps[@]}"; do
-        if ! eval "$check_cmd \"$pkg\"" &>/dev/null; then
-            missing+=("$pkg")
-        else
-            echo -e "${GREEN}✔ 已安装: $pkg${RESET}"
-        fi
-    done
-
-    if [ ${#missing[@]} -gt 0 ]; then
-        echo -e "${YELLOW}👉 安装缺失依赖: ${missing[*]}${RESET}"
-        # Debian 系统处理 netcat
-        if [ "$OS_TYPE" = "debian" ]; then
-            # 让 iperf3 安装时自动选择 No（不启动 daemon）
-            echo "iperf3 iperf3/start_daemon boolean false" | debconf-set-selections
-            for pkg in "${missing[@]}"; do
-                if [ "$pkg" = "nc" ]; then
-                    apt install -y netcat-openbsd
-                else
-                    apt install -y "$pkg"
-                fi
-            done
-        else
-            eval "$install_cmd \"\${missing[@]}\""
-        fi
+    if ! $DOCKER_CMD version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
     fi
 }
 
-# -------------------------
-# 清理重复 Docker 源
-# -------------------------
-fix_duplicate_docker_sources() {
-    echo -e "${YELLOW}🔍 检查重复 Docker APT 源...${RESET}"
-    local docker_sources
-    docker_sources=$(grep -rl "download.docker.com" /etc/apt/sources.list.d/ 2>/dev/null || true)
-    if [ "$(echo "$docker_sources" | grep -c .)" -gt 1 ]; then
-        echo -e "${RED}⚠️ 检测到重复 Docker 源:${RESET}"
-        echo "$docker_sources"
-        for f in $docker_sources; do
-            if [[ "$f" == *"archive_uri"* ]]; then
-                rm -f "$f"
-                echo -e "${GREEN}✔ 删除多余源: $f${RESET}"
-            fi
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
+
+check_ipv6_support() {
+    if ping6 -c 1 ::1 &>/dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
-    else
-        echo -e "${GREEN}✔ Docker 源正常${RESET}"
-    fi
-}
-
-# -------------------------
-# 修复 sources.list（兼容 Bullseye / Bookworm）
-# -------------------------
-fix_sources_for_version() {
-    echo -e "${YELLOW}🔍 修复 sources.list 兼容性...${RESET}"
-    local version="$1"
-    local files
-    files=$(grep -rl "deb" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true)
-    for f in $files; do
-        if [[ "$version" == "bullseye" ]]; then
-            sed -i -r 's/\bnon-free(-firmware){0,3}\b/non-free/g' "$f"
-            sed -i '/deb .*bullseye-backports/s/^/##/' "$f"
-        elif [[ "$version" == "bookworm" ]]; then
-            # Bookworm 保留 non-free-firmware，但去掉重复 non-free
-            sed -i -r 's/\bnon-free non-free\b/non-free/g' "$f"
-        fi
     done
-    echo -e "${GREEN}✔ sources.list 已优化${RESET}"
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
 }
 
-# -------------------------
-# 系统更新函数
-# -------------------------
-update_system() {
-    echo -e "${GREEN}🔄 检测系统发行版并更新...${RESET}"
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        echo -e "${YELLOW}👉 当前系统: $PRETTY_NAME${RESET}"
+configure_docker_ipv6() {
+    if [ ! -f /etc/docker/daemon.json ]; then
+        echo '{}' > /etc/docker/daemon.json
+    fi
 
-        # 系统类型
-        if [[ "$ID" =~ debian|ubuntu ]]; then
-            OS_TYPE="debian"
-            fix_duplicate_docker_sources
-            if [[ "$ID" == "debian" ]]; then
-                fix_sources_for_version "$VERSION_CODENAME"
-            fi
-            apt update && apt upgrade -y
-            check_and_install "dpkg -s" "apt install -y"
-        elif [[ "$ID" =~ fedora ]]; then
-            OS_TYPE="rhel"
-            dnf check-update || true
-            dnf upgrade -y
-            check_and_install "rpm -q" "dnf install -y"
-        elif [[ "$ID" =~ centos|rhel ]]; then
-            OS_TYPE="rhel"
-            yum check-update || true
-            yum upgrade -y
-            check_and_install "rpm -q" "yum install -y"
-        elif [[ "$ID" =~ alpine ]]; then
-            OS_TYPE="alpine"
-            apk update && apk upgrade
-            check_and_install "apk info -e" "apk add"
-        else
-            echo -e "${RED}❌ 暂不支持的 Linux 发行版: $ID${RESET}"
-            return 1
+    # 修复 jq 未安装导致脚本报错的问题
+    if ! command -v jq &>/dev/null; then
+        echo -e "${YELLOW}未检测到 jq 命令，正在尝试安装...${RESET}"
+        apt-get update && apt-get install -y jq || yum install -y jq
+    fi
+
+    # 检查是否已经启用 IPv6
+    local IPV6_ENABLED
+    if IPV6_ENABLED=$(jq '.ipv6 // false' /etc/docker/daemon.json 2>/dev/null); then
+        if [ "$IPV6_ENABLED" = "true" ]; then
+            echo -e "${GREEN}✅ Docker 已启用 IPv6，无需重复配置${RESET}"
+            return
         fi
-    else
-        echo -e "${RED}❌ 无法检测系统发行版 (/etc/os-release 不存在)${RESET}"
-        return 1
     fi
 
-    echo -e "${GREEN}✅ 系统更新和依赖安装完成！${RESET}"
+    # 配置 IPv6
+    jq '. + {ipv6:true, "fixed-cidr-v6":"fd00:dead:beef::/48"}' /etc/docker/daemon.json > /tmp/daemon.json.tmp
+    mv /tmp/daemon.json.tmp /etc/docker/daemon.json
+
+    systemctl restart docker
+    echo -e "${GREEN}✅ Docker IPv6 已启用${RESET}"
 }
 
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== 哆啦A梦转发面板 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重举${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}7) 节点管理${RESET}"
+        echo -e "${0}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
-install_netcat() {
-    echo -e "${YELLOW}🔍 检查 netcat...${RESET}"
-
-    if command -v nc >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ nc 已安装${RESET}"
-        return
-    fi
-
-    echo -e "${YELLOW}👉 安装 netcat-openbsd...${RESET}"
-
-    if [ "$OS_TYPE" = "debian" ]; then
-        apt install -y netcat-openbsd
-    elif [ "$OS_TYPE" = "rhel" ]; then
-        yum install -y nc 2>/dev/null || dnf install -y nc
-    elif [ "$OS_TYPE" = "alpine" ]; then
-        apk add netcat-openbsd
-    else
-        echo -e "${RED}❌ 未知系统，无法安装 nc${RESET}"
-        return 1
-    fi
-
-    if command -v nc >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ nc 安装成功${RESET}"
-    else
-        echo -e "${RED}❌ nc 安装失败${RESET}"
-    fi
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            7) 
+                # 针对菜单 7 的动态下载升级
+                local node_script_url="https://raw.githubusercontent.com/bqlpfy/flux-panel/refs/heads/main/install.sh"
+                if download_file "install.sh" "$node_script_url"; then
+                    chmod +x install.sh && ./install.sh
+                fi
+                ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
 }
 
-install_dnsutils() {
-    echo -e "${YELLOW}🔍 检查 DNS 工具(dnsutils)...${RESET}"
+install_app() {
+    check_docker
+    mkdir -p "$APP_DIR"
+    cd "$APP_DIR" || exit
 
-    if command -v dig >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ DNS 工具已安装${RESET}"
-        return
+    # 下载数据库初始化文件（调用新的下载函数）
+    if [ ! -f gost.sql ] || [ ! -s gost.sql ]; then
+        if ! download_file "gost.sql" "$GOST_SQL_URL"; then
+            return
+        fi
     fi
+    echo -e "${GREEN}✅ 数据库文件准备完成${RESET}"
 
-    echo -e "${YELLOW}👉 安装 DNS 工具...${RESET}"
+    # 设置端口
+    read -p "请输入前端端口 [默认:6366]: " input_front
+    FRONTEND_PORT=${input_front:-6366}
+    check_port "$FRONTEND_PORT" || return
 
-    if [ "$OS_TYPE" = "debian" ]; then
-        apt install -y bind9-dnsutils
-    elif [ "$OS_TYPE" = "rhel" ]; then
-        yum install -y bind-utils 2>/dev/null || dnf install -y bind-utils
-    elif [ "$OS_TYPE" = "alpine" ]; then
-        apk add bind-tools
+    read -p "请输入后端端口 [默认:6365]: " input_back
+    BACKEND_PORT=${input_back:-6365}
+    check_port "$BACKEND_PORT" || return
+
+    # 设置数据库账户
+    read -p "请输入数据库用户名 [默认:gost]: " input_user
+    DB_USER=${input_user:-gost}
+    read -p "请输入数据库名 [默认:gost]: " input_db
+    DB_NAME=${input_db:-gost}
+    read -p "请输入数据库密码 [默认:123456]: " input_pass
+    DB_PASSWORD=${input_pass:-123456}
+
+    JWT_SECRET=$(openssl rand -hex 16)
+
+    # 检测 IPv6
+    if check_ipv6_support; then
+        echo -e "${GREEN}🚀 系统支持 IPv6，自动启用 IPv6 配置...${RESET}"
+        configure_docker_ipv6
     else
-        echo -e "${RED}❌ 未知系统，无法安装 DNS 工具${RESET}"
-        return 1
+        echo -e "${YELLOW}⚠️ 系统不支持 IPv6，跳过配置${RESET}"
     fi
 
-    if command -v dig >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ DNS 工具安装成功${RESET}"
-    else
-        echo -e "${RED}❌ DNS 工具安装失败${RESET}"
-    fi
-}
-# -------------------------
-# 安装并启动 cron
-# -------------------------
-install_cron() {
-    echo -e "${YELLOW}⏰ 检查并安装 cron 定时任务服务...${RESET}"
+    # 生成 .env
+    cat > .env <<EOF
+DB_NAME=$DB_NAME
+DB_USER=$DB_USER
+DB_PASSWORD=$DB_PASSWORD
+JWT_SECRET=$JWT_SECRET
+FRONTEND_PORT=$FRONTEND_PORT
+BACKEND_PORT=$BACKEND_PORT
+EOF
+    echo -e "${GREEN}✅ .env 文件生成完成${RESET}"
 
-    case "$OS_TYPE" in
-        debian)
-            if ! dpkg -s cron >/dev/null 2>&1; then
-                echo -e "${YELLOW}📦 安装 cron...${RESET}"
-                apt update
-                apt install -y cron
-            else
-                echo -e "${GREEN}✔ cron 已安装${RESET}"
-            fi
-            systemctl enable --now cron
-            ;;
-        rhel)
-            if ! rpm -q cronie >/dev/null 2>&1; then
-                echo -e "${YELLOW}📦 安装 cronie...${RESET}"
-                yum install -y cronie 2>/dev/null || dnf install -y cronie
-            else
-                echo -e "${GREEN}✔ cronie 已安装${RESET}"
-            fi
-            systemctl enable --now crond
-            ;;
-        alpine)
-            if ! apk info -e cronie >/dev/null 2>&1; then
-                echo -e "${YELLOW}📦 安装 cronie...${RESET}"
-                apk add cronie
-            else
-                echo -e "${GREEN}✔ cronie 已安装${RESET}"
-            fi
-            rc-update add crond
-            service crond start
-            ;;
-        *)
-            echo -e "${RED}❌ 未知系统类型，无法安装 cron${RESET}"
-            return 1
-            ;;
-    esac
-
-    # 状态检测
-    if systemctl is-active --quiet cron 2>/dev/null || systemctl is-active --quiet crond 2>/dev/null; then
-        echo -e "${GREEN}✔ cron 服务已运行${RESET}"
-    else
-        echo -e "${RED}❌ cron 服务未启动，请手动检查${RESET}"
-    fi
-}
-
-# -------------------------
-# 安装 NextTrace（网络路由追踪工具）
-# -------------------------
-install_nexttrace() {
-    echo -e "${YELLOW}🌐 检查并安装 NextTrace...${RESET}"
-
-    # 确保 curl 存在
-    if ! command -v curl >/dev/null 2>&1; then
-        echo -e "${RED}❌ curl 未安装，无法安装 NextTrace${RESET}"
-        return 1
+    # IPv6 设置
+    ENABLE_IPV6=true
+    read -p "是否启用 Docker IPv6 网络? [Y/n] (默认开启): " ipv6_input
+    if [[ "$ipv6_input" =~ ^[Nn]$ ]]; then
+        ENABLE_IPV6=false
     fi
 
-    # 检测是否已安装
-    if command -v nexttrace >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ NextTrace 已安装${RESET}"
-        return 0
-    fi
+    # 生成 docker-compose.yml
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  mysql:
+    image: mysql:5.7
+    container_name: gost-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      TZ: Asia/Shanghai
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./gost.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --max_connections=1000
+      --innodb_buffer_pool_size=256M
+    networks:
+      - gost-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 10s
+      retries: 10
 
-    echo -e "${YELLOW}👉 开始安装 NextTrace...${RESET}"
-    # 解决 Debian 11 证书过旧的问题
-    if [ -f /etc/debian_version ]; then
-        apt install -y curl ca-certificates
-    fi
+  backend:
+    image: bqlpfy/springboot-backend:1.4.3
+    container_name: springboot-backend
+    restart: unless-stopped
+    environment:
+      DB_HOST: mysql
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      LOG_DIR: /app/logs
+      JAVA_OPTS: "-Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai"
+    ports:
+      - "${BACKEND_PORT}:6365"
+    volumes:
+      - backend_logs:/app/logs
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - gost-network
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:6365/flow/test || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
 
-    curl -sL https://nxtrace.org/nt | bash
+  frontend:
+    image: bqlpfy/vite-frontend:1.4.3
+    container_name: vite-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - gost-network
 
-    # 验证
-    if command -v nexttrace >/dev/null 2>&1; then
-        echo -e "${GREEN}✔ NextTrace 安装成功${RESET}"
-    else
-        echo -e "${RED}❌ NextTrace 安装失败${RESET}"
-    fi
-}
-
-# -------------------------
-# 开启 BBR（安全版）
-# -------------------------
-enable_bbr() {
-    echo -e "${YELLOW}🚀 检查并配置 TCP BBR...${RESET}"
-
-    # 1️⃣ 尝试加载 BBR 模块
-    if ! modprobe tcp_bbr 2>/dev/null; then
-        echo -e "${RED}❌ 当前内核未编译 BBR 或不支持(OpenVZ/LXC 虚拟化不支持)${RESET}"
-        return 0
-    fi
-
-    # 2️⃣ 写入模块自动加载（避免重复）
-    mkdir -p /etc/modules-load.d
-    if ! grep -qxF "tcp_bbr" /etc/modules-load.d/bbr.conf 2>/dev/null; then
-        echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
-    fi
-
-    # 3️⃣ 检查是否已经启用
-    if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
-        echo -e "${GREEN}✔ BBR 已经开启，无需修改${RESET}"
-        return 0
-    fi
-
-    echo -e "${YELLOW}👉 BBR 未开启，开始配置...${RESET}"
-
-    # 4️⃣ 写入独立 sysctl 配置文件（更规范）
-    cat >/etc/sysctl.d/99-bbr.conf <<EOF
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
+volumes:
+  mysql_data:
+    name: mysql_data
+    driver: local
+  backend_logs:
+    name: backend_logs
+    driver: local
 EOF
 
-    # 5️⃣ 应用配置
-    sysctl --system >/dev/null
+    # 添加 IPv6 网络
+    if [ "$ENABLE_IPV6" = true ]; then
+cat >> "$COMPOSE_FILE" <<EOF
 
-    # 6️⃣ 再次验证
-    if [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = "bbr" ]; then
-        echo -e "${GREEN}✔ BBR 已成功开启${RESET}"
+networks:
+  gost-network:
+    name: gost-network
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+        - subnet: fd00:dead:beef::/48
+EOF
     else
-        echo -e "${RED}❌ BBR 开启失败，请检查内核配置${RESET}"
+cat >> "$COMPOSE_FILE" <<EOF
+
+networks:
+  gost-network:
+    name: gost-network
+    driver: bridge
+EOF
     fi
 
-    return 0
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    SERVER_IP=$(get_public_ip)
+
+    echo -e "${GREEN}✅ 哆啦A梦转发面板 已启动${RESET}"
+    echo -e "${YELLOW}🌐 前端访问: http://${SERVER_IP}:${FRONTEND_PORT}${RESET}"
+    echo -e "${YELLOW}🌐 后端访问: http://${SERVER_IP}:${BACKEND_PORT}${RESET}"
+    echo -e "${YELLOW}🌐 默认账号: admin_user${RESET}"
+    echo -e "${YELLOW}🌐 默认密码: admin_user${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-# -------------------------
-# 时间同步 & 设置上海时区（Debian / Ubuntu 专用）
-# -------------------------
-enable_time_sync() {
-    echo -e "${YELLOW}⏰ 配置 systemd-timesyncd 时间同步& 设置上海时区...${RESET}"
-
-    if [ ! -f /etc/os-release ]; then
-        echo -e "${RED}❌ 无法识别系统类型${RESET}"
-        return 1
-    fi
-
-    . /etc/os-release
-
-    if [[ "$ID" != "ubuntu" && "$ID" != "debian" ]]; then
-        echo -e "${RED}❌ 当前系统不是 Debian/Ubuntu，跳过时间同步配置${RESET}"
-        return 0
-    fi
-
-    echo -e "${GREEN}✔ 系统检测通过：$PRETTY_NAME${RESET}"
-
-    # 安装 systemd-timesyncd（极简系统可能没装）
-    if ! dpkg -s systemd-timesyncd >/dev/null 2>&1; then
-        echo -e "${YELLOW}📦 安装 systemd-timesyncd...${RESET}"
-        apt update
-        apt install -y systemd-timesyncd
-    else
-        echo -e "${GREEN}✔ systemd-timesyncd 已安装${RESET}"
-    fi
-
-    # 启用服务
-    systemctl unmask systemd-timesyncd || true
-    systemctl enable --now systemd-timesyncd
-
-    # 启用 NTP
-    timedatectl set-ntp true
-    systemctl restart systemd-timesyncd
-
-     # 设置上海时区
-    timedatectl set-timezone Asia/Shanghai
-    echo -e "${GREEN}✔ 时区已设置为上海 (Asia/Shanghai)${RESET}"
-
-    # 状态检查
-    if systemctl is-active --quiet systemd-timesyncd; then
-        echo -e "${GREEN}✔ 时间同步服务已成功启动${RESET}"
-    else
-        echo -e "${RED}❌ 时间同步服务启动失败(OpenVZ/LXC 虚拟化不支持)${RESET}"
-    fi
+update_app() {
+    cd "$APP_DIR" || return
+    $DOCKER_CMD pull
+    $DOCKER_CMD up -d
+    echo -e "${GREEN}✅ 哆啦A梦转发面板 更新完成${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-# -------------------------
-# 清理函数
-# -------------------------
-cleanup() {
-    echo -e "${YELLOW}🧹 正在清理系统冗余缓存...${RESET}"
-    case "$OS_TYPE" in
-        debian)
-            apt-get autoremove -y >/dev/null 2>&1
-            apt-get clean >/dev/null 2>&1
-            ;;
-        rhel)
-            dnf autoremove -y >/dev/null 2>&1
-            dnf clean all >/dev/null 2>&1
-            ;;
-        alpine)
-            rm -rf /var/cache/apk/*
-            ;;
+restart_app() {
+    docker restart gost-mysql springboot-backend vite-frontend
+    echo -e "${GREEN}✅ 哆啦A梦转发面板 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+view_logs() {
+    echo -e "${GREEN}选择容器查看日志:${RESET}"
+    echo "1) MySQL"
+    echo "2) Backend"
+    echo "3) Frontend"
+    read -p "选择: " c
+    case $c in
+        1) docker logs -f gost-mysql ;;
+        2) docker logs -f springboot-backend ;;
+        3) docker logs -f vite-frontend ;;
+        *) echo -e "${RED}无效选择${RESET}" ;;
     esac
-    echo -e "${GREEN}✔ 清理完成${RESET}"
 }
 
-# ==========================================
-# 脚本执行入口
-# ==========================================
+check_status() {
+    docker ps | grep -E "gost-mysql|springboot-backend|vite-frontend"
+    read -p "按回车返回菜单..."
+}
 
-clear
-update_system
-install_netcat
-install_dnsutils
-install_cron
-install_nexttrace
-enable_bbr
-enable_time_sync
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅  哆啦A梦转发面板 已彻底卸载${RESET}"
+    read -p "按回车返回菜单..."
+}
 
-# 最后执行清理
-cleanup
-
-# 最终展示
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-echo -e "${GREEN}🎉 系统更新工作已全部完成！${RESET}"
-echo -e "${YELLOW}📅 完成时间: $(date +'%Y-%m-%d %H:%M:%S')${RESET}"
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+menu

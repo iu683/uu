@@ -1,563 +1,274 @@
-#!/bin/sh
-set -e
+#!/bin/bash
+# ========================================
+# 哆啦A梦转发面板一键管理脚本 
+# ========================================
 
-# ==========================================================
-# Alpine Linux 专属全能一键优化脚本 
-# ==========================================================
-
-# 1. 颜色与基础变量
-RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-BLUE="\033[34m"
-CYAN="\033[36m"
+RED="\033[31m"
 RESET="\033[0m"
-NC="\033[0m" # 兼容部分NC变量
 
-LOG_FILE="/var/log/alpine_setup.log"
-non_interactive=${NON_INTERACTIVE:-false}
+APP_NAME="flux-panel"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-# 适配 Alpine 的精简依赖包 
-deps="curl wget git net-tools bash lsof tar unzip rsync pv sudo netcat-openbsd openssh openssh-client jq openssl ca-certificates"
+# 默认启用 IPv6
+ENABLE_IPV6=true
 
-log() {
-    echo -e "$1"
-    echo -e "$1" | sed 's/\\033\[[0-9;]*m//g' >> "$LOG_FILE"
-}
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
 
-root_check() {
-    if [ "$(id -u)" -ne 0 ]; then
-        echo -e "${RED}❌ 请使用 root 用户运行此脚本${RESET}"
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
         exit 1
     fi
 }
 
-# 环境侦测：判断是独立虚拟机还是容器
-detect_environment() {
-    IS_CONTAINER=false
-    if [ -f /.dockerenv ] || [ -f /run/.containerenv ] || grep -qaE "(container|docker|lxc)" /proc/1/environ /proc/1/cgroup 2>/dev/null; then
-        IS_CONTAINER=true
-        VIRT_TYPE="容器环境 (Docker/LXC)"
-    else
-        VIRT_TYPE="独立虚拟机/物理机 (KVM/XEN/VMware)"
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
     fi
-    log "${YELLOW}[INFO] 当前运行环境: ${VIRT_TYPE}${RESET}"
-    log "${YELLOW}[INFO] 由于容器环境共享宿主机内核，无法进行 BBR 调优、Swap 分配等底层操作。${RESET}"
-    log "${YELLOW}[INFO] 请在 KVM/VMware/XEN 等全虚拟化架构或物理机上运行此脚本。${RESET}"
-    log "${YELLOW}[INFO] 注意：运行结束后会自动重启服务器。${RESET}"
 }
 
-# 2. 系统更新与依赖安装
-update_system() {
-    log "\n${YELLOW}=============== 1. 系统更新与依赖 ===============${RESET}"
-    log "${BLUE}正在更新 apk 软件源...${RESET}"
-    apk update && apk upgrade
-    
-    log "${BLUE}正在安装基础依赖工具...${RESET}"
-    for pkg in $deps; do
-        if ! apk info -e "$pkg" >/dev/null 2>&1; then
-            apk add "$pkg"
-        fi
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
     done
-    log "${GREEN}✅ 基础依赖安装完成${RESET}"
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
 }
 
-# 3. 设置主机名
-configure_hostname() {
-    log "\n${YELLOW}=============== 2. 主机名配置 ===============${RESET}"
-    local new_hn="localhost"
-    
-    if [ "$IS_CONTAINER" = false ] && [ -f /etc/hostname ]; then
-        echo "$new_hn" > /etc/hostname
-        if command -v hostname >/dev/null 2>&1; then
-            hostname "$new_hn"
-        fi
-    fi
-    
-    # 更新 /etc/hosts
-    if [ -f /etc/hosts ]; then
-        sed -i "s/127.0.0.1.*/127.0.0.1\t$new_hn localhost/" /etc/hosts
-    fi
-    log "${GREEN}✅ 主机名配置完成${RESET}"
+
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== 哆啦A梦转发面板 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
 }
 
-# 4. 语言与区域环境 (Locale)
-configure_locale() {
-    log "\n${YELLOW}=============== 3. 语言环境设置 ===============${RESET}"
-    apk add musl-locales musl-locales-lang ttf-dejavu >/dev/null 2>&1
-    
-    export LANG=en_US.UTF-8
-    export LC_ALL=en_US.UTF-8
-    
-    # 写入全局环境变量
-    if [ -f /etc/profile ]; then
-        grep -q "en_US.UTF-8" /etc/profile || echo -e "\nexport LANG=en_US.UTF-8\nexport LC_ALL=en_US.UTF-8" >> /etc/profile
-    fi
-    log "${GREEN}✅ 语言环境设为 en_US.UTF-8${RESET}"
-}
+install_app() {
+    check_docker
+    mkdir -p "$APP_DIR"
 
-# 5. 防火墙完全放行
-configure_firewall() {
-    log "\n${YELLOW}=============== 4. 防火墙完全放行 ===============${RESET}"
-    
-    if command -v iptables >/dev/null 2>&1; then
-        log "${BLUE}[INFO] 正在清理 iptables 规则...${RESET}"
-        iptables -F 2>/dev/null || true
-        iptables -X 2>/dev/null || true
-        iptables -P INPUT ACCEPT 2>/dev/null || true
-        iptables -P FORWARD ACCEPT 2>/dev/null || true
-        iptables -P OUTPUT ACCEPT 2>/dev/null || true
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
     fi
-    
-    if [ -d /etc/init.d ] && [ -f /etc/init.d/iptables ]; then
-        rc-service iptables stop 2>/dev/null || true
-        rc-update del iptables default 2>/dev/null || true
-    fi
-    log "${GREEN}✅ 防火墙限制已全面解除${RESET}"
-}
 
-# 6. BBR 与内核网络调优
-configure_bbr() {
-    log "\n${YELLOW}=============== 5. BBR 与网络网络调优 ===============${RESET}"
-    
-    if [ "$IS_CONTAINER" = true ]; then
-        log "${YELLOW}[SKIP] 当前为容器环境，共享宿主机内核，跳过内核参数修改。${RESET}"
-        return 0
-    fi
-    
-    log "${BLUE}正在配置优化级内核参数...${RESET}"
-    local config_file="/etc/sysctl.d/99-bbr.conf"
-    
-    cat > "$config_file" << EOF
-# 核心网络及 BBR 开启
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_fastopen = 3
+    read -p "请输入 MySQL 数据库名 [默认:gost]: " input_db
+    DB_NAME=${input_db:-gost}
 
-# 缓冲区深度适配
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
+    read -p "请输入 MySQL 用户名 [默认:gost]: " input_user
+    DB_USER=${input_user:-gost}
 
-# 队列与连接复用
-net.core.somaxconn = 16384
-net.ipv4.tcp_max_syn_backlog = 16384
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-EOF
-    sysctl -p "$config_file" >/dev/null 2>&1 || true
-    log "${GREEN}✅ BBR 及网络队列调优成功${RESET}"
-}
+    read -p "请输入 MySQL 密码 [默认:123456]: " input_pass
+    DB_PASSWORD=${input_pass:-123456}
 
-# 7. 传统 DNS 配置
-configure_dns() {
-    log "\n${YELLOW}=============== 6. DNS 配置 ===============${RESET}"
-    log "${BLUE}正在修改 /etc/resolv.conf...${RESET}"
-    
-    chattr -i /etc/resolv.conf 2>/dev/null || true
-    
-    cat > /etc/resolv.conf << EOF
-# Generated by Alpine Setup Script
-nameserver 8.8.8.8
-nameserver 1.1.1.1
-nameserver 2606:4700:4700::1111
-EOF
-    log "${GREEN}✅ DNS 优化完毕 (8.8.8.8 / 1.1.1.1,2606:4700:4700::1111)${RESET}"
-}
+    read -p "请输入后端端口 [默认:6365]: " input_backend
+    BACKEND_PORT=${input_backend:-6365}
+    check_port "$BACKEND_PORT" || return
 
-# 8. Swap 虚拟内存配置 (全新强力修复版)
-configure_swap() {
-    log "\n${YELLOW}=============== 7. Swap 虚拟内存配置 ===============${RESET}"
-    
-    if [ "$IS_CONTAINER" = true ]; then
-        log "${YELLOW}[SKIP] 容器环境无法挂载物理 Swap，跳过。${RESET}"
-        return 0
-    fi
-    
-    if swapon -s | grep -q 'partition\|file' || free | grep -q 'Swap:[[:space:]]*[1-9]'; then
-        log "${GREEN}✅ 系统已有可用 Swap，跳过创建${RESET}"
-        return 0
-    fi
-    
-    local free_space=$(df -m / | awk 'NR==2 {print $4}')
-    if [ "$free_space" -lt 3000 ]; then
-        log "${YELLOW}[SKIP] 磁盘剩余空间过小，跳过创建 Swap。${RESET}"
-        return 0
-    fi
-    
-    log "${BLUE}正在为 Alpine 激活并挂载 1GB 兼容性 Swap...${RESET}"
-    
-    # 彻底卸载可能残留的坏文件
-    swapoff /swapfile 2>/dev/null || true
-    rm -f /swapfile
-    
-    # 使用 dd 并加入 conv=notrunc,fsync 确保 Alpine 文件系统彻底写入
-    dd if=/dev/zero of=/swapfile bs=1M count=1024 status=progress conv=notrunc,fsync
-    
-    chmod 600 /swapfile
-    mkswap /swapfile
-    
-    # 核心修复：针对精简内核，尝试挂载为回环设备以提高 swapon 成功率
-    if ! swapon /swapfile 2>/dev/null; then
-        log "${YELLOW}[WARN] 直接挂载失败，正在尝试通过 loop 环回设备挂载 Swap...${RESET}"
-        if [ ! -b /dev/loop0 ]; then
-            mknod /dev/loop0 b 7 0 2>/dev/null || true
-        fi
-        local loop_dev=$(losetup -f 2>/dev/null || echo "/dev/loop0")
-        losetup "$loop_dev" /swapfile 2>/dev/null || true
-        swapon "$loop_dev" 2>/dev/null || true
-    fi
-    
-    # 验证是否成功
-    if free | grep -q 'Swap:[[:space:]]*[1-9]'; then
-        sed -i '/swapfile/d' /etc/fstab || true
-        echo "/swapfile none swap sw 0 0" >> /etc/fstab
-        
-        # 🌟 【核心修复】让 OpenRC 引导时自动挂载 fstab 中的 swap
-        rc-update add swap boot >/dev/null 2>&1 || true
-        
-        log "${GREEN}✅ 1GB 虚拟内存 Swap 配置并激活成功！（已加入开机自启）${RESET}"
-    else
-        log "${RED}❌ 警告: 该系统内核锁定了外部 Swap 挂载，虚拟内存未生效（可忽略）。${RESET}"
-    fi
-}
+    read -p "请输入前端端口 [默认:6366]: " input_front
+    FRONTEND_PORT=${input_front:-6366}
+    check_port "$FRONTEND_PORT" || return
 
-# 9. SSH 端口、密码与自动化公钥生成
-configure_ssh() {
-    log "\n${YELLOW}=============== 8. SSH 端口、密码与自动化密钥生成 ===============${RESET}"
-    
-    # 交互询问端口
-    if [ -z "$NEW_SSH_PORT" ] && [ "$non_interactive" = false ]; then
-        echo -n "请输入新的 SSH 端口号 (直接回车跳过不变): "
-        read -r NEW_SSH_PORT
+    read -p "请输入 JWT 密钥 [随机生成可直接回车]: " input_jwt
+    JWT_SECRET=${input_jwt:-$(openssl rand -hex 16)}
+
+    # IPv6 设置
+    read -p "是否启用 Docker IPv6 网络? [Y/n] (默认开启): " ipv6_input
+    if [[ "$ipv6_input" =~ ^[Nn]$ ]]; then
+        ENABLE_IPV6=false
     fi
-    
-    # 交互询问密码
-    if [ -z "$NEW_SSH_PASSWORD" ] && [ "$non_interactive" = false ]; then
-        echo -n "请输入新的 root 用户密码 (直接回车跳过不修改): "
-        read -r NEW_SSH_PASSWORD
-    fi
-    
-    local ssh_conf="/etc/ssh/sshd_config"
-    if [ -f "$ssh_conf" ]; then
-        if [ -n "$NEW_SSH_PORT" ]; then
-            sed -i "s/^#\?Port.*/Port $NEW_SSH_PORT/g" "$ssh_conf"
-            log "${GREEN}✅ SSH 端口已设为: ${NEW_SSH_PORT}${RESET}"
-        else
-            log "${BLUE}SSH 端口未作变更${RESET}"
-        fi
 
-        # 开启公钥登录支持
-        sed -i "s/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/g" "$ssh_conf"
-        sed -i "s/^#\?AuthorizedKeysFile.*/AuthorizedKeysFile .ssh\/authorized_keys/g" "$ssh_conf"
-        
-        # 自动化生成全新 Ed25519 密钥对
-        mkdir -p /root/.ssh
-        chmod 700 /root/.ssh
-        
-        local key_file="/root/.ssh/id_ed25519"
-        local skip_key=false
+    # 生成 docker-compose.yml
+    cat > "$COMPOSE_FILE" <<EOF
 
-        # 交互模式下，先征求用户同意
-        if [ "$non_interactive" = false ]; then
-            if [ -f "$key_file" ]; then
-                echo -e "${RED}警告: 检测到系统已存在 SSH 私钥 ($key_file)${RESET}"
-                echo -n "是否覆盖并重新生成专属 SSH 密钥对？[y/N]: "
-            else
-                echo -n "是否为当前服务器自动生成专属 SSH 登录密钥对？[y/N]: "
-            fi
-            
-            read -r CONFIRM_KEY
-            if [ "$CONFIRM_KEY" != "y" ] && [ "$CONFIRM_KEY" != "Y" ]; then
-                log "${BLUE}已取消，跳过密钥对生成。${RESET}"
-                skip_key=true
-            fi
-        fi
+services:
+  mysql:
+    image: mysql:5.7
+    container_name: gost-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      TZ: Asia/Shanghai
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./gost.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --max_connections=1000
+      --innodb_buffer_pool_size=256M
+    networks:
+      - gost-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 10s
+      retries: 10
 
-        # 如果没有被跳过，则执行删除和生成，并自动关闭密码登录
-        if [ "$skip_key" = false ]; then
-            log "${BLUE}正在为当前服务器自动生成专属 SSH 登录密钥对...${RESET}"
-            rm -f "$key_file" "${key_file}.pub"
-            
-            # 免交互生成密钥
-            ssh-keygen -t ed25519 -N "" -f "$key_file" >/dev/null
-            
-            # 将生成的公钥写入授权列表
-            cat "${key_file}.pub" >> /root/.ssh/authorized_keys
-            chmod 600 /root/.ssh/authorized_keys
-            
-            # 暂存私钥内容，用于最后展示
-            PRIVATE_KEY_CONTENT=$(cat "$key_file")
-            log "${GREEN}✅ 登录公钥已成功自动填入系统列表中${RESET}"
+  backend:
+    image: bqlpfy/springboot-backend:1.4.3
+    container_name: springboot-backend
+    restart: unless-stopped
+    environment:
+      DB_HOST: mysql
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      LOG_DIR: /app/logs
+      JAVA_OPTS: "-Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai"
+    ports:
+      - "${BACKEND_PORT}:6365"
+    volumes:
+      - backend_logs:/app/logs
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - gost-network
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:6365/flow/test || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
 
-            # 【新增：安全强化】自动禁用密码登录和交互式认证
-            log "${YELLOW}🔒 已成功生成密钥，正在自动禁用密码登录以强化安全...${RESET}"
-            sed -i "s/^#\?PasswordAuthentication.*/PasswordAuthentication no/g" "$ssh_conf"
-            sed -i "s/^#\?ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/g" "$ssh_conf"
-            sed -i "s/^#\?KbdInteractiveAuthentication.*/KbdInteractiveAuthentication no/g" "$ssh_conf"
-            log "${GREEN}✅ SSH 密码登录已禁用，后续仅允许密钥认证${RESET}"
-        fi
-    else
-        log "${RED}❌ 未检测到 /etc/ssh/sshd_config，跳过 SSH 内部配置${RESET}"
-    fi
-    
-    # 应用密码修改（虽然禁用了远程密码登录，但本地或 VNC 登录依然有效）
-    if [ -n "$NEW_SSH_PASSWORD" ]; then
-        echo "root:${NEW_SSH_PASSWORD}" | chpasswd
-        log "${GREEN}✅ root 密码已成功更新${RESET}"
-    fi
-    
-    # 重启 SSH 服务
-    if [ -f /etc/init.d/sshd ]; then
-        rc-service sshd restart >/dev/null 2>&1 || true
-    fi
-}
+  frontend:
+    image: bqlpfy/vite-frontend:1.4.3
+    container_name: vite-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - gost-network
 
-# 10. Fail2ban 安装与适配
-configure_fail2ban() {
-    log "\n${YELLOW}=============== 9. Fail2ban 暴破防护 ===============${RESET}"
-    
-    if [ "$IS_CONTAINER" = true ]; then
-        log "${YELLOW}[SKIP] 容器环境由于缺少底层内核审计模块，跳过 Fail2ban 的安装。${RESET}"
-        return 0
-    fi
-    
-    log "${BLUE}正在安装 Fail2ban...${RESET}"
-    apk add fail2ban >/dev/null
-
-    mkdir -p /etc/fail2ban/jail.d
-    
-    cat > /etc/fail2ban/jail.d/sshd.local << EOF
-[DEFAULT]
-bantime = 86400
-findtime = 300
-maxretry = 5
-ignoreip = 127.0.0.1/8
-
-[sshd]
-enabled = true
-port = ${NEW_SSH_PORT:-22}
-filter = sshd
-logpath = /var/log/messages
+volumes:
+  mysql_data:
+    name: mysql_data
+    driver: local
+  backend_logs:
+    name: backend_logs
+    driver: local
 EOF
 
-    if [ -f /etc/init.d/fail2ban ]; then
-        rc-update add fail2ban default 2>/dev/null || true
-        rc-service fail2ban start 2>/dev/null || true
-    fi
-    log "${GREEN}✅ Fail2ban 暴破拦截配置完毕${RESET}"
-}
+# 添加 IPv6 网络
+if [ "$ENABLE_IPV6" = true ]; then
+cat >> "$COMPOSE_FILE" <<EOF
 
-# 11. 定时任务与网络追踪工具
-install_tools() {
-    log "\n${YELLOW}=============== 10. 实用工具集安装 ===============${RESET}"
-    
-    log "${BLUE}配置 Alpine 原生 dcron 计划任务服务...${RESET}"
-    if [ -f /etc/init.d/crond ]; then
-        rc-update add crond default >/dev/null 2>&1 || true
-        rc-service crond start >/dev/null 2>&1 || true
-        log "${GREEN}✅ 定时任务服务已就绪${RESET}"
-    fi
-    
-    log "${BLUE}下载并配置路由追踪工具 NextTrace...${RESET}"
-    apk add gcompat libc6-compat >/dev/null 2>&1 || true
-    curl -sL https://nxtrace.org/nt | bash || true
-    
-    log "${BLUE}修正系统时区为 Asia/Shanghai...${RESET}"
-    apk add tzdata >/dev/null
-    if [ -f /usr/share/zoneinfo/Asia/Shanghai ]; then
-        rm -f /etc/localtime
-        cp -f /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
-        echo "Asia/Shanghai" > /etc/timezone
-    fi
-    apk del tzdata >/dev/null
-    log "${GREEN}✅ 常用工具及 Asia/Shanghai 时区配置完成${RESET}"
-}
-
-# 12. Docker 安装
-docker_install() {
-    log "\n${CYAN}============ 11. Docker 容器引擎安装 ============${RESET}"
-    
-    if [ "$IS_CONTAINER" = true ]; then
-        log "${YELLOW}[SKIP] 当前已是容器环境，无法进行嵌套 Docker 安装，跳过。${RESET}"
-        return 0
-    fi
-    
-    if [ "$non_interactive" = false ]; then
-        echo -n "是否在当前 Alpine 主机上安装 Docker？[y/N]: "
-        read -r INSTALL_DOCKER
-        if [ "$INSTALL_DOCKER" != "y" ] && [ "$INSTALL_DOCKER" != "Y" ]; then
-            log "${BLUE}已取消 Docker 安装${RESET}"
-            return 0
-        fi
-    fi
-    
-    log "${BLUE}开始安装 Docker 引擎与 Docker-Compose...${RESET}"
-    apk add docker docker-cli docker-cli-compose >/dev/null
-    
-    # ==================== 新增：智能判断国家并配置加速 ====================
-    log "${BLUE}正在检测服务器地理位置...${RESET}"
-    IS_CN=false
-    
-    # 尝试多接口获取国家代码 (CN)
-    COUNTRY=$(curl -s --max-time 3 https://ip.sb/country_code 2>/dev/null || \
-              curl -s --max-time 3 https://ipapi.co/country 2>/dev/null || \
-              curl -s --max-time 3 http://ip-api.com/json/ | grep -o '"countryCode":"[^"]*' | cut -d'"' -f4)
-
-    if [ "$COUNTRY" = "CN" ]; then
-        IS_CN=true
-    fi
-
-    if [ "$IS_CN" = true ]; then
-        log "${YELLOW}[CN] 检测到当前服务器位于中国大陆，正在配置国内加速镜像...${RESET}"
-        mkdir -p /etc/docker
-        cat <<EOF > /etc/docker/daemon.json
-{
-  "registry-mirrors": [
-    "https://docker.xuanyuan.me",
-    "https://docker.1ms.run",
-    "https://docker.m.daocloud.io",
-    "https://docker.unsee.tech"
-  ]
-}
+networks:
+  gost-network:
+    name: gost-network
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+        - subnet: fd00:dead:beef::/48
 EOF
-    else
-        log "${GREEN}[GLOBAL] 检测到海外服务器，使用 Docker Hub 官方源直连，无需加速。${RESET}"
-    fi
-    # ==============================================================
+else
+cat >> "$COMPOSE_FILE" <<EOF
 
-    if [ -f /etc/init.d/docker ]; then
-        rc-update add docker default >/dev/null 2>&1
-        rc-service docker start >/dev/null 2>&1
-    fi
-    log "${GREEN}✅ Docker 环境配置成功${RESET}"
+networks:
+  gost-network:
+    name: gost-network
+    driver: bridge
+EOF
+fi
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    SERVER_IP=$(get_public_ip)
+
+    echo
+    echo -e "${GREEN}✅ 哆啦A梦转发面板 已启动${RESET}"
+    echo -e "${YELLOW}🌐 后端访问: http://${SERVER_IP}:${BACKEND_PORT}${RESET}"
+    echo -e "${YELLOW}🌐 前端访问: http://${SERVER_IP}:${FRONTEND_PORT}${RESET}"
+    echo -e "${YELLOW}🌐 默认账号: admin_user${RESET}"
+    echo -e "${YELLOW}🌐 默认密码: admin_user${RESET}"
+    echo -e "${GREEN}🌐 IPv6 已启用: $ENABLE_IPV6${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-# 13. 系统垃圾清理
-clean_system() {
-    log "\n${YELLOW}=============== 12. 系统瘦身清理 ============${RESET}"
-    log "${BLUE}正在深度剔除 Alpine 缓存包...${RESET}"
-    rm -rf /var/cache/apk/*
-    rm -rf /tmp/* /var/tmp/*
-    log "${GREEN}✅ 清理工作已顺利完成${RESET}"
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ 哆啦A梦转发面板 更新完成${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-# 14. 显示 VPS 信息 (针对 Alpine OpenRC 优化版)
-show_vps_info() {
-    # 获取实际Swap大小
-    local swap_kb=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
-    local swap_display="$((swap_kb/1024))MB"
-
-    # SSH端口检测 (改用 awk 替代 grep -P 以完全匹配 POSIX sh)
-    local ssh_display
-    if [ -n "$NEW_SSH_PORT" ]; then
-        ssh_display="$NEW_SSH_PORT"
-    elif [ -f /etc/ssh/sshd_config ]; then
-        ssh_display=$(awk '/^[ \t]*Port/ {print $2}' /etc/ssh/sshd_config | tail -n1)
-        ssh_display="${ssh_display:-22}"
-    else
-        ssh_display="22"
-    fi
-
-    # Fail2ban状态 (改用 OpenRC 的 rc-service 状态检测)
-    local fail2ban_display="未安装"
-    if [ -f /etc/init.d/fail2ban ]; then
-        if rc-service fail2ban status 2>/dev/null | grep -q "started"; then
-            fail2ban_display="已启用"
-        else
-            fail2ban_display="未运行"
-        fi
-    fi
-
-    # BBR状态检测
-    local bbr_display="未启用"
-    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q 'bbr'; then
-        bbr_display="已启用"
-    fi
-    
-    # Docker状态检测 (使用 OpenRC 兼容方式)
-    local docker_display="未安装"
-    if command -v docker >/dev/null 2>&1; then
-        if [ -f /etc/init.d/docker ] && rc-service docker status 2>/dev/null | grep -q "started"; then
-            docker_display="已启用"
-        else
-            docker_display="已安装但未运行"
-        fi
-    fi
-
-    local hostname_display="${NEW_HOSTNAME:-$(hostname)}"
-    local dns_v4_display="${PRIMARY_DNS_V4:-8.8.8.8}, ${SECONDARY_DNS_V4:-1.1.1.1}"
-    local dns_v6_display="${PRIMARY_DNS_V6:-2606:4700:4700::1111}"
-
-    echo -e "${CYAN}================== VPS优化后状态 ==================${RESET}"
-    echo -e "${YELLOW}主机名:     ${hostname_display}${RESET}"
-    echo -e "${YELLOW}时区:       ${TIMEZONE:-Asia/Shanghai}${RESET}"
-    echo -e "${YELLOW}Swap 虚拟:  ${swap_display}${RESET}"
-    echo -e "${YELLOW}BBR 加速:   ${bbr_display}${RESET}"
-    echo -e "${YELLOW}DNS (IPv4): ${dns_v4_display}${RESET}"
-    echo -e "${YELLOW}DNS (IPv6): ${dns_v6_display}${RESET}"
-    echo -e "${YELLOW}Fail2ban:   ${fail2ban_display}${RESET}"
-    echo -e "${YELLOW}Docker:     ${docker_display}${RESET}"
-    echo -e "${YELLOW}SSH端口:    ${ssh_display}${RESET}"
-    echo -e "${CYAN}===================================================${RESET}"
+restart_app() {
+    docker restart gost-mysql springboot-backend vite-frontend
+    echo -e "${GREEN}✅ 哆啦A梦转发面板 已重启${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-# 主流程控制
-main() {
-    clear
-    echo -e "${GREEN}======================================================${RESET}"
-    echo -e "${GREEN}          欢迎使用 Alpine Linux 全能优化               ${RESET}"
-    echo -e "${GREEN}======================================================${RESET}"
-    
-    root_check
-    detect_environment
-    
-    if [ "$non_interactive" = false ]; then
-        echo -n "是否立刻开始执行一键优化？ [y/n]: "
-        read -r CONFIRM
-        if [ "$CONFIRM" = "n" ] || [ "$CONFIRM" = "N" ]; then
-            exit 0
-        fi
-    fi
-    
-    update_system
-    configure_hostname
-    configure_locale
-    configure_firewall
-    configure_bbr
-    configure_dns
-    configure_swap
-    configure_ssh
-    configure_fail2ban
-    install_tools
-    docker_install
-    clean_system
-    
-    log "${GREEN}✨ 针对 Alpine Linux 的所有优化项目已全部处理完毕！${RESET}"
-    
-    # 打印 VPS 信息快照
-    show_vps_info
-
-    # 如果生成了密钥，在重启前强行展示并等待用户确认
-    if [ -n "$PRIVATE_KEY_CONTENT" ]; then
-        echo -e "\n${CYAN}======================================================${RESET}"
-        echo -e "${YELLOW}🔑 请【务必】复制保存下方私钥，用于你本地客户端连接：${RESET}"
-        echo -e "${CYAN}======================================================${RESET}"
-        echo -e "${GREEN}${PRIVATE_KEY_CONTENT}${RESET}"
-        echo -e "${CYAN}======================================================${RESET}"
-        echo -e "${YELLOW}复制完成后，请按任意键确认以允许系统重启生效...${RESET}"
-        read -r _
-    fi
-
-    if [ "$IS_CONTAINER" = true ]; then
-        log "${YELLOW}容器环境无需重启，优化立即生效。${RESET}"
-    else
-        log "${YELLOW}系统即将安全重启以使内核及服务生效...${RESET}"
-        sleep 2
-        reboot
-    fi
+view_logs() {
+    echo -e "${GREEN}选择容器查看日志:${RESET}"
+    echo "1) MySQL"
+    echo "2) Backend"
+    echo "3) Frontend"
+    read -p "选择: " c
+    case $c in
+        1) docker logs -f gost-mysql ;;
+        2) docker logs -f springboot-backend ;;
+        3) docker logs -f vite-frontend ;;
+        *) echo -e "${RED}无效选择${RESET}" ;;
+    esac
 }
 
-main "$@"
+check_status() {
+    docker ps | grep -E "gost-mysql|springboot-backend|vite-frontend"
+    read -p "按回车返回菜单..."
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅  哆啦A梦转发面板 已彻底卸载${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+menu

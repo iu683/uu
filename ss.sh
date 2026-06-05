@@ -1,752 +1,378 @@
-#!/bin/bash
-
-# Mosdns-x 自动化管理脚本
-# 功能：安装、更新、配置、守护进程管理
-
+#!/bin/sh
 set -e
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' 
-RESET='\033[0m'
+# ==========================================================
+# Alpine Linux 专属全能一键优化脚本 (终极稳定版)
+# ==========================================================
 
-# 配置变量
-MOSDNS_VERSION=""
-MOSDNS_BINARY="/usr/local/bin/mosdns-x"
-MOSDNS_CONFIG_DIR="/etc/mosdns-x"
-MOSDNS_CONFIG_FILE="/etc/mosdns-x/config.yaml"
-MOSDNS_LOG_DIR="/var/log/mosdns-x"
-MOSDNS_LOG_FILE="/var/log/mosdns-x/mosdns-x.log"
-MOSDNS_SERVICE_FILE="/etc/systemd/system/mosdns.service"
-MOSDNS_LOGROTATE_FILE="/etc/logrotate.d/mosdns-x"
-MOSDNS_USER="mosdns"
-MOSDNS_GROUP="mosdns"
-RESOLV_CONF_BACKUP="/etc/resolv.conf.mosdns-backup"
+# 1. 颜色与基础变量
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+CYAN="\033[36m"
+RESET="\033[0m"
 
-# GitHub 配置
-GITHUB_REPO="pmkol/mosdns-x"
-GITHUB_API_URL="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
-GITHUB_RELEASES_URL="https://github.com/${GITHUB_REPO}/releases"
+LOG_FILE="/var/log/alpine_setup.log"
+non_interactive=${NON_INTERACTIVE:-false}
 
-# 日志函数
-log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+# 适配 Alpine 的精简依赖包 (已修复为 netcat-openbsd)
+deps="curl wget git net-tools lsof tar unzip rsync pv sudo netcat-openbsd openssh-client jq openssl ca-certificates"
+
+log() {
+    echo -e "$1"
+    echo -e "$1" | sed 's/\\033\[[0-9;]*m//g' >> "$LOG_FILE"
 }
 
-log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
-}
-
-log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-# 检查系统架构
-get_architecture() {
-    local arch=$(uname -m)
-    case $arch in
-        x86_64) echo "amd64" ;;
-        aarch64) echo "arm64" ;;
-        armv7l) echo "arm" ;;
-        *) echo "unsupported" ;;
-    esac
-}
-
-# 检查是否为root用户
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        log_error "此脚本需要root权限运行"
-        log_error "请使用: sudo $0 $@"
+root_check() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "${RED}❌ 请使用 root 用户运行此脚本${RESET}"
         exit 1
     fi
 }
 
-# 检查权限和端口可用性
-check_permissions() {
-    log_info "检查权限和端口可用性..."
+# 环境侦测：判断是独立虚拟机还是容器
+detect_environment() {
+    IS_CONTAINER=false
+    if [ -f /.dockerenv ] || [ -f /run/.containerenv ] || grep -qaE "(container|docker|lxc)" /proc/1/environ /proc/1/cgroup 2>/dev/null; then
+        IS_CONTAINER=true
+        VIRT_TYPE="容器环境 (Docker/LXC)"
+    else
+        VIRT_TYPE="独立虚拟机/物理机 (KVM/XEN/VMware)"
+    fi
+    log "${BLUE}[INFO] 当前运行环境: ${VIRT_TYPE}${RESET}"
+}
+
+# 2. 系统更新与依赖安装
+update_system() {
+    log "\n${YELLOW}=============== 1. 系统更新与依赖 ===============${RESET}"
+    log "${BLUE}正在更新 apk 软件源...${RESET}"
+    apk update && apk upgrade
     
-    # 检查端口53是否被占用
-    if ss -tuln | grep -q ":53 "; then
-        local port_process=$(ss -tuln | grep ":53 " | head -1)
-        log_warning "端口53已被占用: $port_process"
-        log_warning "Mosdns-x需要端口53，请确保没有其他DNS服务运行"
-        
-        # 询问是否继续
-        read -p "是否继续安装? (y/N): " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            log_info "安装已取消"
+    log "${BLUE}正在安装基础依赖工具...${RESET}"
+    for pkg in $deps; do
+        if ! apk info -e "$pkg" >/dev/null 2>&1; then
+            apk add "$pkg"
+        fi
+    done
+    log "${GREEN}✅ 基础依赖安装完成${RESET}"
+}
+
+# 3. 设置主机名
+configure_hostname() {
+    log "\n${YELLOW}=============== 2. 主机名配置 ===============${RESET}"
+    local new_hn="localhost"
+    
+    if [ "$IS_CONTAINER" = false ] && [ -f /etc/hostname ]; then
+        echo "$new_hn" > /etc/hostname
+        if command -v hostname >/dev/null 2>&1; then
+            hostname "$new_hn"
+        fi
+    fi
+    
+    # 更新 /etc/hosts
+    if [ -f /etc/hosts ]; then
+        sed -i "s/127.0.0.1.*/127.0.0.1\t$new_hn localhost/" /etc/hosts
+    fi
+    log "${GREEN}✅ 主机名配置完成${RESET}"
+}
+
+# 4. 语言与区域环境 (Locale)
+configure_locale() {
+    log "\n${YELLOW}=============== 3. 语言环境设置 ===============${RESET}"
+    apk add musl-locales musl-locales-lang ttf-dejavu >/dev/null 2>&1
+    
+    export LANG=en_US.UTF-8
+    export LC_ALL=en_US.UTF-8
+    
+    # 写入全局环境变量
+    if [ -f /etc/profile ]; then
+        grep -q "en_US.UTF-8" /etc/profile || echo -e "\nexport LANG=en_US.UTF-8\nexport LC_ALL=en_US.UTF-8" >> /etc/profile
+    fi
+    log "${GREEN}✅ 语言环境设为 en_US.UTF-8${RESET}"
+}
+
+# 5. 防火墙完全放行
+configure_firewall() {
+    log "\n${YELLOW}=============== 4. 防火墙完全放行 ===============${RESET}"
+    
+    if command -v iptables >/dev/null 2>&1; then
+        log "${BLUE}[INFO] 正在清理 iptables 规则...${RESET}"
+        iptables -F 2>/dev/null || true
+        iptables -X 2>/dev/null || true
+        iptables -P INPUT ACCEPT 2>/dev/null || true
+        iptables -P FORWARD ACCEPT 2>/dev/null || true
+        iptables -P OUTPUT ACCEPT 2>/dev/null || true
+    fi
+    
+    if [ -d /etc/init.d ] && [ -f /etc/init.d/iptables ]; then
+        rc-service iptables stop 2>/dev/null || true
+        rc-update del iptables default 2>/dev/null || true
+    fi
+    log "${GREEN}✅ 防火墙限制已全面解除${RESET}"
+}
+
+# 6. BBR 与内核网络调优
+configure_bbr() {
+    log "\n${YELLOW}=============== 5. BBR 与网络网络调优 ===============${RESET}"
+    
+    if [ "$IS_CONTAINER" = true ]; then
+        log "${YELLOW}[SKIP] 当前为容器环境，共享宿主机内核，跳过内核参数修改。${RESET}"
+        return 0
+    fi
+    
+    log "${BLUE}正在配置优化级内核参数...${RESET}"
+    local config_file="/etc/sysctl.d/99-bbr.conf"
+    
+    cat > "$config_file" << EOF
+# 核心网络及 BBR 开启
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+
+# 缓冲区深度适配
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+
+# 队列与连接复用
+net.core.somaxconn = 16384
+net.ipv4.tcp_max_syn_backlog = 16384
+net.ipv4.tcp_fin_timeout = 30
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+EOF
+    sysctl -p "$config_file" >/dev/null 2>&1 || true
+    log "${GREEN}✅ BBR 及网络队列调优成功${RESET}"
+}
+
+# 7. 传统 DNS 配置
+configure_dns() {
+    log "\n${YELLOW}=============== 6. DNS 配置 ===============${RESET}"
+    log "${BLUE}正在修改 /etc/resolv.conf...${RESET}"
+    
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+    
+    cat > /etc/resolv.conf << EOF
+# Generated by Alpine Setup Script
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+nameserver 2606:4700:4700::1111
+EOF
+    log "${GREEN}✅ DNS 优化完毕 (8.8.8.8 / 1.1.1.1)${RESET}"
+}
+
+# 8. Swap 虚拟内存配置 (1GB)
+configure_swap() {
+    log "\n${YELLOW}=============== 7. Swap 虚拟内存配置 ===============${RESET}"
+    
+    if [ "$IS_CONTAINER" = true ]; then
+        log "${YELLOW}[SKIP] 容器环境无法独立挂载物理 Swap，跳过。${RESET}"
+        return 0
+    fi
+    
+    if swapon -s | grep -q 'partition\|file'; then
+        log "${BLUE}系统已有可用 Swap，跳过创建${RESET}"
+        return 0
+    fi
+    
+    local free_space=$(df -m / | awk 'NR==2 {print $4}')
+    if [ "$free_space" -lt 5120 ]; then
+        log "${YELLOW}磁盘剩余空间小于 5GB，不建议创建 Swap，跳过。${RESET}"
+        return 0
+    fi
+    
+    log "${BLUE}正在使用 dd 创建 1GB Swap 镜像文件...${RESET}"
+    dd if=/dev/zero of=/swapfile bs=1M count=1024 status=progress
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+    
+    grep -q "/swapfile" /etc/fstab || echo "/swapfile none swap sw 0 0" >> /etc/fstab
+    log "${GREEN}✅ 1GB 虚拟内存 Swap 配置完毕${RESET}"
+}
+
+# 9. SSH 端口与密码配置
+configure_ssh() {
+    log "\n${YELLOW}=============== 8. SSH 端口与密码配置 ===============${RESET}"
+    
+    # 交互询问端口
+    if [ -z "$NEW_SSH_PORT" ] && [ "$non_interactive" = false ]; then
+        echo -n "请输入新的 SSH 端口号 (直接回车跳过不变): "
+        read -r NEW_SSH_PORT
+    fi
+    
+    # 交互询问密码
+    if [ -z "$NEW_SSH_PASSWORD" ] && [ "$non_interactive" = false ]; then
+        echo -n "请输入新的 root 用户密码 (直接回车跳过不修改): "
+        read -r NEW_SSH_PASSWORD
+    fi
+    
+    # 应用端口修改
+    if [ -n "$NEW_SSH_PORT" ]; then
+        if [ -f /etc/ssh/sshd_config ]; then
+            sed -i "s/^#\?Port.*/Port $NEW_SSH_PORT/g" /etc/ssh/sshd_config
+            log "${GREEN}✅ SSH 端口已设为: ${NEW_SSH_PORT}${RESET}"
+        else
+            log "${RED}❌ 未检测到 /etc/ssh/sshd_config，跳过端口修改${RESET}"
+        fi
+    else
+        log "${BLUE}SSH 端口未作变更${RESET}"
+    fi
+    
+    # 应用密码修改
+    if [ -n "$NEW_SSH_PASSWORD" ]; then
+        echo "root:${NEW_SSH_PASSWORD}" | chpasswd
+        log "${GREEN}✅ root 密码已成功更新${RESET}"
+    fi
+    
+    # 重启 SSH 服务
+    if [ -f /etc/init.d/sshd ]; then
+        rc-service sshd restart >/dev/null 2>&1 || true
+    fi
+}
+
+# 10. Fail2ban 安装与适配
+configure_fail2ban() {
+    log "\n${YELLOW}=============== 9. Fail2ban 暴破防护 ===============${RESET}"
+    
+    if [ "$IS_CONTAINER" = true ]; then
+        log "${YELLOW}[SKIP] 容器环境由于缺少底层内核审计模块，跳过 Fail2ban 的安装。${RESET}"
+        return 0
+    fi
+    
+    log "${BLUE}正在安装 Fail2ban...${RESET}"
+    apk add fail2ban >/dev/null
+    
+    cat > /etc/fail2ban/jail.local << EOF
+[DEFAULT]
+bantime = 86400
+findtime = 300
+maxretry = 5
+ignoreip = 127.0.0.1/8
+
+[sshd]
+enabled = true
+port = ${NEW_SSH_PORT:-22}
+filter = sshd
+logpath = /var/log/messages
+EOF
+
+    if [ -f /etc/init.d/fail2ban ]; then
+        rc-update add fail2ban default 2>/dev/null || true
+        rc-service fail2ban start 2>/dev/null || true
+    fi
+    log "${GREEN}✅ Fail2ban 暴破拦截配置完毕${RESET}"
+}
+
+# 11. 定时任务与网络追踪工具 (已修复：原生 dcron 适配 & cp 降噪)
+install_tools() {
+    log "\n${YELLOW}=============== 10. 实用工具集安装 ===============${RESET}"
+    
+    # 配置并启动 Alpine 自带的 dcron
+    log "${BLUE}配置 Alpine 原生 dcron 计划任务服务...${RESET}"
+    if [ -f /etc/init.d/crond ]; then
+        rc-update add crond default >/dev/null 2>&1 || true
+        rc-service crond start >/dev/null 2>&1 || true
+        log "${GREEN}✅ 定时任务服务已就绪${RESET}"
+    fi
+    
+    # 安装 NextTrace
+    log "${BLUE}下载并配置路由追踪工具 NextTrace...${RESET}"
+    apk add gcompat libc6-compat >/dev/null 2>&1 || true
+    curl -sL https://nxtrace.org/nt | bash || true
+    
+    # 配置时区为上海 (已修复：使用 -f 并清理潜在硬链接冲突)
+    log "${BLUE}修正系统时区为 Asia/Shanghai...${RESET}"
+    apk add tzdata >/dev/null
+    if [ -f /usr/share/zoneinfo/Asia/Shanghai ]; then
+        rm -f /etc/localtime
+        cp -f /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+        echo "Asia/Shanghai" > /etc/timezone
+    fi
+    apk del tzdata >/dev/null
+    log "${GREEN}✅ 常用工具及 Asia/Shanghai 时区配置完成${RESET}"
+}
+
+# 12. Docker 安装
+docker_install() {
+    log "\n${CYAN}============ 11. Docker 容器引擎安装 ============${RESET}"
+    
+    if [ "$IS_CONTAINER" = true ]; then
+        log "${YELLOW}[SKIP] 当前已是容器环境，无法进行嵌套 Docker 安装，跳过。${RESET}"
+        return 0
+    fi
+    
+    if [ "$non_interactive" = false ]; then
+        echo -n "是否在当前 Alpine 主机上安装 Docker？[y/N]: "
+        read -r INSTALL_DOCKER
+        if [ "$INSTALL_DOCKER" != "y" ] && [ "$INSTALL_DOCKER" != "Y" ]; then
+            log "${BLUE}已取消 Docker 安装${RESET}"
+            return 0
+        fi
+    fi
+    
+    log "${BLUE}开始安装 Docker 引擎与 Docker-Compose...${RESET}"
+    apk add docker docker-cli-compose >/dev/null
+    
+    if [ -f /etc/init.d/docker ]; then
+        rc-update add docker default >/dev/null 2>&1
+        rc-service docker start >/dev/null 2>&1
+    fi
+    log "${GREEN}✅ Docker 环境配置成功${RESET}"
+}
+
+# 13. 系统垃圾清理
+clean_system() {
+    log "\n${YELLOW}=============== 12. 极简系统瘦身清理 ============${RESET}"
+    log "${BLUE}正在深度剔除 Alpine 缓存包...${RESET}"
+    rm -rf /var/cache/apk/*
+    rm -rf /tmp/* /var/tmp/*
+    log "${GREEN}✅ 清理工作已顺利完成${RESET}"
+}
+
+# 主流程控制
+main() {
+    clear
+    echo -e "${CYAN}======================================================${RESET}"
+    echo -e "${GREEN}       欢迎使用 Alpine Linux 专属全能优化脚本${RESET}"
+    echo -e "${CYAN}======================================================${RESET}"
+    
+    root_check
+    detect_environment
+    
+    if [ "$non_interactive" = false ]; then
+        echo -n "是否立刻开始执行一键优化？ [Y/n]: "
+        read -r CONFIRM
+        if [ "$CONFIRM" = "n" ] || [ "$CONFIRM" = "N" ]; then
+            echo -e "${BLUE}已主动退出。${RESET}"
             exit 0
         fi
     fi
     
-    # 检查是否有权限访问端口53
-    if ! ss -tuln | grep -q ":53 " && ! timeout 1 bash -c "</dev/tcp/127.0.0.1/53" 2>/dev/null; then
-        log_info "端口53可用"
-    fi
+    update_system
+    configure_hostname
+    configure_locale
+    configure_firewall
+    configure_bbr
+    configure_dns
+    configure_swap
+    configure_ssh
+    configure_fail2ban
+    install_tools
+    docker_install
+    clean_system
     
-    log_success "权限检查完成"
-}
-
-# 检查系统依赖
-check_dependencies() {
-    log_info "检查系统依赖..."
+    log "${GREEN}✨ 针对 Alpine Linux 的所有优化项目已全部处理完毕！${RESET}"
     
-    local missing_deps=()
-    
-    # 检查必需的命令
-    for cmd in curl wget unzip systemctl dnsutils; do
-        if ! command -v $cmd &> /dev/null; then
-            missing_deps+=($cmd)
-        fi
-    done
-    
-    if [[ ${#missing_deps[@]} -gt 0 ]]; then
-        log_info "安装缺失的依赖: ${missing_deps[*]}"
-        apt-get update
-        apt-get install -y ${missing_deps[@]}
-    fi
-    
-    log_success "系统依赖检查完成"
-}
-
-# 获取最新版本
-get_latest_version() {
-    # 尝试从GitHub API获取
-    local version=$(curl -s "$GITHUB_API_URL" | grep -o '"tag_name": "[^"]*' | grep -o '[^"]*$' 2>/dev/null || echo "")
-    
-    if [[ -z "$version" ]]; then
-        # 备用方案：解析releases页面
-        version=$(curl -s "$GITHUB_RELEASES_URL" | grep -o 'tag/[^"]*' | head -1 | cut -d'/' -f2 2>/dev/null || echo "")
-    fi
-    
-    if [[ -z "$version" ]]; then
-        version="v25.10.08"
-    fi
-    
-    echo "$version"
-}
-
-# 检查当前版本
-get_current_version() {
-    if [[ -f "$MOSDNS_BINARY" ]]; then
-        $MOSDNS_BINARY version 2>/dev/null | grep -o 'v[0-9.]*' | head -1 || echo "unknown"
+    if [ "$IS_CONTAINER" = true ]; then
+        log "${YELLOW}容器环境无需重启，优化立即生效。${RESET}"
     else
-        echo "未安装"
+        log "${YELLOW}系统将在 3 秒后安全重启以使内核及服务生效...${RESET}"
+        sleep 3
+        reboot
     fi
 }
 
-# 下载并安装Mosdns-x
-install_mosdns_x() {
-    local version=$1
-    local arch=$(get_architecture)
-    
-    if [[ "$arch" == "unsupported" ]]; then
-        log_error "不支持的架构: $(uname -m)"
-        exit 1
-    fi
-    
-    log_info "下载 Mosdns-x $version (架构: $arch)..."
-    
-    local download_url="https://github.com/${GITHUB_REPO}/releases/download/${version}/mosdns-linux-${arch}.zip"
-    local temp_dir=$(mktemp -d)
-    local zip_file="$temp_dir/mosdns-linux-${arch}.zip"
-    
-    # 下载文件
-    if ! wget -q --show-progress -O "$zip_file" "$download_url"; then
-        log_error "下载失败: $download_url"
-        rm -rf "$temp_dir"
-        exit 1
-    fi
-    
-    # 解压并安装
-    log_info "解压并安装..."
-    cd "$temp_dir"
-    unzip -q "$zip_file"
-    
-    # 安装二进制文件
-    install -m 755 mosdns "$MOSDNS_BINARY"
-    
-    # 清理临时文件
-    rm -rf "$temp_dir"
-    
-    log_success "Mosdns-x $version 安装完成"
-}
-
-# 创建用户和目录
-setup_user_and_dirs() {
-    log_info "创建用户和目录..."
-    
-    # 创建配置目录
-    mkdir -p "$MOSDNS_CONFIG_DIR"
-    mkdir -p "$MOSDNS_LOG_DIR"
-    
-    # 检查是否为root用户运行
-    if [[ $EUID -eq 0 ]]; then
-        # root用户运行，创建专用用户但服务以root运行
-        if ! id "$MOSDNS_USER" &>/dev/null; then
-            useradd -r -s /bin/false -d "$MOSDNS_CONFIG_DIR" "$MOSDNS_USER"
-            log_info "创建用户: $MOSDNS_USER（用于文件权限管理）"
-        fi
-        
-        # 设置目录权限（root拥有，mosdns用户可读）
-        chown -R root:root "$MOSDNS_CONFIG_DIR"
-        chown -R root:root "$MOSDNS_LOG_DIR"
-        chmod 755 "$MOSDNS_CONFIG_DIR"
-        chmod 755 "$MOSDNS_LOG_DIR"
-        
-        log_info "使用root权限运行，目录权限已优化"
-    else
-        # 非root用户运行，使用专用用户
-        if ! id "$MOSDNS_USER" &>/dev/null; then
-            useradd -r -s /bin/false -d "$MOSDNS_CONFIG_DIR" "$MOSDNS_USER"
-            log_info "创建用户: $MOSDNS_USER"
-        fi
-        
-        # 设置权限
-        chown -R "$MOSDNS_USER:$MOSDNS_GROUP" "$MOSDNS_CONFIG_DIR"
-        chown -R "$MOSDNS_USER:$MOSDNS_GROUP" "$MOSDNS_LOG_DIR"
-        
-        log_warning "非root用户运行，可能需要额外权限配置"
-    fi
-    
-    log_success "用户和目录设置完成"
-}
-
-# 创建配置文件
-create_config() {
-    log_info "创建配置文件..."
-    
-    cat > "$MOSDNS_CONFIG_FILE" << 'EOF'
-# mosdns-x 并发查询（无分流）配置
-
-log:
-  level: info
-  file: /var/log/mosdns-x/mosdns-x.log
-
-plugins:
-  # 缓存插件
-  - tag: cache
-    type: cache
-    args:
-      size: 1024
-      lazy_cache_ttl: 1800
-
-  # 并发上游：取最先返回的可用答案
-  - tag: forward_all
-    type: fast_forward
-    args:
-      upstream:
-        # 阿里
-        - addr: "udp://223.5.5.5"
-        - addr: "tls://dns.alidns.com"
-
-        # DNSPod / doh.pub
-        - addr: "udp://119.29.29.29"
-        - addr: "tls://dot.pub"
-
-        # Cloudflare
-        - addr: "udp://1.1.1.1"
-        - addr: "tls://cloudflare-dns.com"
-
-        # Google
-        - addr: "udp://8.8.8.8"
-        - addr: "tls://dns.google"
-
-  # 主主流线：小缓存 → 并发优选
-  - tag: main
-    type: sequence
-    args:
-      exec:
-        - cache
-        - forward_all
-
-# 监听（双栈 UDP/TCP 53）
-servers:
-  - exec: main
-    listeners:
-      - addr: :53
-        protocol: udp
-      - addr: :53
-        protocol: tcp
-EOF
-
-    # 设置权限
-    if [[ $EUID -eq 0 ]]; then
-        # root用户运行，文件归root所有
-        chown root:root "$MOSDNS_CONFIG_FILE"
-    else
-        # 非root用户运行，文件归mosdns用户所有
-        chown "$MOSDNS_USER:$MOSDNS_GROUP" "$MOSDNS_CONFIG_FILE"
-    fi
-    chmod 644 "$MOSDNS_CONFIG_FILE"
-    
-    log_success "配置文件创建完成"
-}
-
-# 创建systemd服务
-create_systemd_service() {
-    log_info "创建systemd服务..."
-    
-    # 检查是否为root用户运行
-    if [[ $EUID -eq 0 ]]; then
-        # root用户运行，使用root权限以访问端口53
-        cat > "$MOSDNS_SERVICE_FILE" << EOF
-[Unit]
-Description=A DNS forwarder
-Documentation=https://github.com/pmkol/mosdns-x
-After=network.target
-
-[Service]
-Type=simple
-User=root
-Group=root
-ExecStart=$MOSDNS_BINARY start --as-service -d /usr/local/bin -c $MOSDNS_CONFIG_FILE
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=mosdns
-
-# 安全设置（root用户运行时的安全配置）
-NoNewPrivileges=false
-PrivateTmp=true
-ProtectSystem=false
-ProtectHome=false
-ReadWritePaths=$MOSDNS_LOG_DIR $MOSDNS_CONFIG_DIR
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        log_info "使用root权限运行服务（需要访问端口53）"
-    else
-        # 非root用户运行，使用专用用户
-        cat > "$MOSDNS_SERVICE_FILE" << EOF
-[Unit]
-Description=A DNS forwarder
-Documentation=https://github.com/pmkol/mosdns-x
-After=network.target
-
-[Service]
-Type=simple
-User=$MOSDNS_USER
-Group=$MOSDNS_GROUP
-ExecStart=$MOSDNS_BINARY start --as-service -d /usr/local/bin -c $MOSDNS_CONFIG_FILE
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=mosdns
-
-# 安全设置
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=$MOSDNS_LOG_DIR
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        log_warning "非root用户运行，可能需要额外配置才能访问端口53"
-    fi
-
-    # 重新加载systemd
-    systemctl daemon-reload
-    
-    log_success "systemd服务创建完成"
-}
-
-# 创建日志轮转配置
-create_logrotate() {
-    log_info "创建日志轮转配置..."
-    
-    # 根据运行用户设置日志轮转权限
-    if [[ $EUID -eq 0 ]]; then
-        # root用户运行
-        cat > "$MOSDNS_LOGROTATE_FILE" << EOF
-$MOSDNS_LOG_FILE {
-    daily
-    missingok
-    rotate 7
-    compress
-    delaycompress
-    notifempty
-    create 644 root root
-    postrotate
-        systemctl reload mosdns > /dev/null 2>&1 || true
-    endscript
-}
-EOF
-    else
-        # 非root用户运行
-        cat > "$MOSDNS_LOGROTATE_FILE" << EOF
-$MOSDNS_LOG_FILE {
-    daily
-    missingok
-    rotate 7
-    compress
-    delaycompress
-    notifempty
-    create 644 $MOSDNS_USER $MOSDNS_GROUP
-    postrotate
-        systemctl reload mosdns > /dev/null 2>&1 || true
-    endscript
-}
-EOF
-    fi
-
-    log_success "日志轮转配置创建完成"
-}
-
-
-# 配置系统DNS
-configure_system_dns() {
-    log_info "配置系统DNS..."
-    
-    # 备份原始resolv.conf
-    if [[ -f "/etc/resolv.conf" && ! -f "$RESOLV_CONF_BACKUP" ]]; then
-        cp /etc/resolv.conf "$RESOLV_CONF_BACKUP"
-        log_info "已备份原始DNS配置到: $RESOLV_CONF_BACKUP"
-    fi
-    
-    # 检查是否已经配置了mosdns
-    if grep -q "nameserver 127.0.0.1" /etc/resolv.conf 2>/dev/null; then
-        log_info "系统DNS已配置为使用Mosdns-x"
-        return 0
-    fi
-    
-    # 移除chattr保护（如果存在）
-    if [[ -f "/etc/resolv.conf" ]]; then
-        chattr -i /etc/resolv.conf 2>/dev/null || true
-    fi
-    
-    # 配置DNS为127.0.0.1
-    echo -e "nameserver 127.0.0.1\n" > /etc/resolv.conf
-    
-    # 添加保护（增加用户确认）
-    echo
-    log_warning "即将对 /etc/resolv.conf 设置 chattr +i 锁定保护。"
-    log_warning "锁定后，其他系统网络服务（如 NetworkManager、DHCP）将无法修改此文件。"
-    read -p "是否确认锁定以防止DNS被覆盖? (y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        chattr +i /etc/resolv.conf
-        log_success "系统DNS已配置并锁定为 Mosdns-x (127.0.0.1)"
-    else
-        log_info "已跳过 chattr 锁定，DNS 已修改但可能在重启或网络重连后被系统覆盖。"
-    fi
-}
-
-# 恢复系统DNS
-restore_system_dns() {
-    log_info "恢复系统DNS配置..."
-    
-    # 移除chattr保护
-    if [[ -f "/etc/resolv.conf" ]]; then
-        chattr -i /etc/resolv.conf 2>/dev/null || true
-    fi
-    
-    # 恢复原始配置
-    if [[ -f "$RESOLV_CONF_BACKUP" ]]; then
-        cp "$RESOLV_CONF_BACKUP" /etc/resolv.conf
-        rm -f "$RESOLV_CONF_BACKUP"
-        log_success "已恢复原始DNS配置"
-    else
-        # 如果没有备份，使用默认配置
-        cat > /etc/resolv.conf << EOF
-# Generated by NetworkManager
-nameserver 8.8.8.8
-nameserver 8.8.4.4
-EOF
-        log_success "已设置默认DNS配置"
-    fi
-}
-
-# 启动并启用服务
-start_service() {
-    log_info "启动并启用服务..."
-    
-    # 启动服务
-    systemctl start mosdns
-    
-    # 启用开机自启动
-    systemctl enable mosdns
-    
-    # 等待服务启动
-    sleep 3
-    
-    # 检查服务状态
-    if systemctl is-active --quiet mosdns; then
-        log_success "服务启动成功"
-    else
-        log_error "服务启动失败"
-        systemctl status mosdns
-        exit 1
-    fi
-}
-
-# 验证安装
-verify_installation() {
-    log_info "验证安装..."
-    
-    # 检查二进制文件
-    if [[ ! -f "$MOSDNS_BINARY" ]]; then
-        log_error "二进制文件不存在: $MOSDNS_BINARY"
-        return 1
-    fi
-    
-    # 检查配置文件
-    if [[ ! -f "$MOSDNS_CONFIG_FILE" ]]; then
-        log_error "配置文件不存在: $MOSDNS_CONFIG_FILE"
-        return 1
-    fi
-    
-    # 检查服务状态
-    if ! systemctl is-active --quiet mosdns; then
-        log_error "服务未运行"
-        return 1
-    fi
-    
-    # 检查端口监听
-    if ! ss -tuln | grep -q ":53 "; then
-        log_error "端口53未监听"
-        return 1
-    fi
-    
-    # 测试DNS解析
-    if ! nslookup google.com 127.0.0.1 >/dev/null 2>&1; then
-        log_error "DNS解析测试失败"
-        return 1
-    fi
-    
-    log_success "安装验证通过"
-    return 0
-}
-
-# 修改配置文件的快捷函数
-edit_config() {
-    if [[ -f "$MOSDNS_CONFIG_FILE" ]]; then
-        if command -v nano &> /dev/null; then
-            nano "$MOSDNS_CONFIG_FILE"
-        elif command -v vi &> /dev/null; then
-            vi "$MOSDNS_CONFIG_FILE"
-        else
-            log_error "未找到编辑器 (nano/vi)，请手动编辑: $MOSDNS_CONFIG_FILE"
-            return 1
-        fi
-        log_info "正在重启服务以使配置生效..."
-        systemctl restart mosdns && log_success "配置已重载且服务已重启" || log_error "服务重启失败，请检查配置格式"
-    else
-        log_error "配置文件不存在，请先安装"
-    fi
-}
-
-
-# 更新Mosdns-x
-update_mosdns_x() {
-    local latest_version=$(get_latest_version)
-    local current_version=$(get_current_version)
-    
-    if [[ "$current_version" == "未安装" ]]; then
-        log_error "Mosdns-x 未安装，请先运行安装"
-        exit 1
-    fi
-    
-    if [[ "$current_version" == "$latest_version" ]]; then
-        log_info "已是最新版本: $current_version"
-        return 0
-    fi
-    
-    log_info "更新 Mosdns-x: $current_version -> $latest_version"
-    
-    # 【核心修复】为了防止停止服务后网络断开，先临时恢复系统DNS
-    log_info "正在临时恢复系统公共 DNS 以确保下载期间网络畅通..."
-    if [[ -f "/etc/resolv.conf" ]]; then
-        chattr -i /etc/resolv.conf 2>/dev/null || true
-        # 临时写入公共 DNS，保证能解析 github.com
-        echo -e "nameserver 8.8.8.8\nameserver 1.1.1.1\n" > /etc/resolv.conf
-    fi
-    
-    # 停止服务
-    log_info "正在停止旧版服务..."
-    systemctl stop mosdns
-    
-    # 安装新版本（此时系统DNS是通的，可以正常下载）
-    install_mosdns_x "$latest_version"
-    
-    # 启动服务
-    log_info "正在启动新版服务..."
-    systemctl start mosdns
-    
-    # 【核心恢复】新版启动成功后，重新把系统 DNS 劫持回本地
-    log_info "正在重新配置系统 DNS 指向 Mosdns-x..."
-    configure_system_dns
-    
-    log_success "更新完成"
-}
-
-# 卸载Mosdns-x
-uninstall_mosdns_x() {
-    log_info "卸载 Mosdns-x..."
-    
-    # 停止并禁用服务
-    systemctl stop mosdns 2>/dev/null || true
-    systemctl disable mosdns 2>/dev/null || true
-    
-    # 恢复系统DNS配置
-    restore_system_dns
-    
-    # 删除文件
-    rm -f "$MOSDNS_BINARY"
-    rm -f "$MOSDNS_SERVICE_FILE"
-    rm -f "$MOSDNS_LOGROTATE_FILE"
-    
-    # 删除目录（可选）
-    read -p "是否删除配置目录和日志目录? (y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        rm -rf "$MOSDNS_CONFIG_DIR"
-        rm -rf "$MOSDNS_LOG_DIR"
-        userdel "$MOSDNS_USER" 2>/dev/null || true
-    fi
-    
-    # 重新加载systemd
-    systemctl daemon-reload
-    
-    log_success "卸载完成"
-}
-
-# 测试DNS解析
-test_dns() {
-    log_info "测试DNS解析..."
-    
-    local test_domains=("google.com" "baidu.com" "github.com" "cloudflare.com")
-    
-    for domain in "${test_domains[@]}"; do
-        echo -n "测试 $domain: "
-        if nslookup "$domain" 127.0.0.1 >/dev/null 2>&1; then
-            echo -e "${GREEN}成功${NC}"
-        else
-            echo -e "${RED}失败${NC}"
-        fi
-    done
-}
-
-# 查看日志
-show_logs() {
-    log_info "显示最近的日志 (按 Q 退出)..."
-    journalctl -u mosdns -n 30 --no-pager
-}
-
-
-main() {
-    check_root
-    
-    while true; do
-        # 1. 动态获取状态信息
-        local version=$(get_current_version)
-        
-        local status
-        if systemctl is-active --quiet mosdns 2>/dev/null; then
-            status="${GREEN}运行中${RESET}"
-        else
-            status="${RED}未运行${RESET}"
-        fi
-        
-        local port_show
-        if ss -tuln | grep -q ":53 "; then
-            port_show="53 (已监听)"
-        else
-            port_show="无监听"
-        fi
-
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}       Mosdns-x 管理面板        ${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}状态   :${RESET} $status"
-        echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-        echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} 1. 安装 Mosdns-x${RESET}"
-        echo -e "${GREEN} 2. 更新 Mosdns-x${RESET}"
-        echo -e "${GREEN} 3. 卸载 Mosdns-x${RESET}"
-        echo -e "${GREEN} 4. 修改配置${RESET}"
-        echo -e "${GREEN} 5. 启动 Mosdns-x${RESET}"
-        echo -e "${GREEN} 6. 停止 Mosdns-x${RESET}"
-        echo -e "${GREEN} 7. 重启 Mosdns-x${RESET}"
-        echo -e "${GREEN} 8. 查看日志${RESET}"
-        echo -e "${GREEN} 9. 测试DNS解析${RESET}"
-        echo -e "${GREEN}10. 还原系统DNS${RESET}"
-        echo -e "${GREEN} 0. 退出${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        
-        read -p $'\e[32m请输入数字: \e[0m' num
-        case "$num" in
-            1)
-                log_info "开始安装 Mosdns-x..."
-                check_dependencies
-                check_permissions
-                setup_user_and_dirs
-                local latest_version=$(get_latest_version)
-                install_mosdns_x "$latest_version"
-                create_config
-                create_systemd_service
-                create_logrotate
-                start_service
-                configure_system_dns
-                verify_installation
-                log_success "安装完成！"
-                ;;
-            2)
-                update_mosdns_x
-                ;;
-            3)
-                uninstall_mosdns_x
-                ;;
-            4)
-                edit_config
-                ;;
-            5)
-                systemctl start mosdns
-                log_success "服务已启动"
-                ;;
-            6)
-                systemctl stop mosdns
-                log_success "服务已停止"
-                ;;
-            7)
-                systemctl restart mosdns
-                log_success "服务已重启"
-                ;;
-            8)
-                show_logs
-                ;;
-            9)
-                test_dns
-                ;;
-            10)
-                restore_system_dns
-                ;;
-            0)
-                exit 0
-                ;;
-            *)
-                log_error "请输入正确的数字 [0-10]"
-                ;;
-        esac
-        echo
-        read -p "按回车键返回主菜单..."
-        clear
-    done
-}
-
-# 运行主函数
 main "$@"

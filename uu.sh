@@ -1,7 +1,7 @@
 #!/bin/bash
 # ======================================
-# Ookla Speedtest 官方二进制免源通用脚本
-# 完美适配 Ubuntu 24.04 / Debian / Alpine
+# Ookla / Open-Source Speedtest 一键安装脚本
+# Debian / Ubuntu / Alpine 全系统完美适配版
 # ======================================
 
 set -e
@@ -11,61 +11,71 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-echo -e "${GREEN}🚀 开始安装 Speedtest CLI (二进制独立版)...${RESET}"
+echo -e "${GREEN}🚀 开始安装 Speedtest CLI...${RESET}"
 
-# 1. 必须 root 权限
+# 必须 root
 if [ "$(id -u)" -ne 0 ]; then
     echo -e "${RED}❌ 请使用 root 或 sudo 运行！${RESET}"
     exit 1
 fi
 
-# 2. 清理之前可能残留的错误 APT 源
-if [ -f /etc/apt/sources.list.d/speedtest.list ]; then
-    rm -f /etc/apt/sources.list.d/speedtest.list
-    echo -e "${YELLOW}🧹 已清理残留的错误软件源配置。${RESET}"
-fi
-
-# 3. 自动判断系统架构
-ARCH=$(uname -m)
-case "$ARCH" in
-    x86_64)       URL_ARCH="x86_64" ;;
-    aarch64)      URL_ARCH="aarch64" ;;
-    armhf|armv7l) URL_ARCH="armhf" ;;
-    i386|i686)    URL_ARCH="i386" ;;
-    *) echo -e "${RED}❌ 暂不支持的架构: $ARCH${RESET}"; exit 1 ;;
-esac
-
-# 4. 检查并安装基础依赖
-echo -e "${YELLOW}📦 正在检查并安装必要依赖 (curl/tar)...${RESET}"
+# ======================================
+# 智能分流安装引擎
+# ======================================
 if [ -f /etc/alpine-release ]; then
-    apk add --no-cache curl tar ca-certificates
+    # ---------------- Alpine Linux 部署分支 ----------------
+    echo -e "${YELLOW}📦 检测到 Alpine 系统，正在通过 apk 官方源安装...${RESET}"
+    
+    # 1. 直接一行命令安装官方源的 speedtest-cli
+    apk add --no-cache speedtest-cli
+    
+    # 2. 创建软链接，确保全局命令与商业版 speedtest 兼容，防止后续脚本卡死
+    if [ ! -f /usr/local/bin/speedtest ] && [ ! -f /usr/bin/speedtest ]; then
+        ln -sf $(command -v speedtest-cli) /usr/bin/speedtest
+    fi
+
 else
-    apt-get update -y && apt-get install -y curl tar
+    # ---------------- Debian / Ubuntu 部署分支 ----------------
+    
+    # 1. 强力清理残留的各种官方故障/旧版 APT 源（防止 noble 无源导致 apt 锁死）
+    echo -e "${YELLOW}🧹 正在清理可能残留的故障软件源配置...${RESET}"
+    rm -f /etc/apt/sources.list.d/speedtest.list
+    rm -f /etc/apt/sources.list.d/ookla_speedtest-cli.list
+    if [ -d /etc/apt/sources.list.d ]; then
+        grep -l "packagecloud.io/ookla" /etc/apt/sources.list.d/* 2>/dev/null | xargs rm -f || true
+    fi
+
+    # 2. 安装基础依赖 curl
+    if ! command -v curl >/dev/null 2>&1; then
+        echo -e "${YELLOW}📦 安装 curl...${RESET}"
+        apt-get update -y && apt-get install -y curl
+    fi
+
+    # 3. 添加 Ookla 仓库（针对 Ubuntu 24.04 进行智能降级伪装）
+    echo -e "${YELLOW}📦 正在配置 Ookla 官方原生 APT 仓库...${RESET}"
+    
+    # 获取当前系统代号
+    CODENAME=$(lsb_release -c 2>/dev/null | awk '{print $2}' || grep "VERSION_CODENAME=" /etc/os-release | cut -d= -f2 || echo "unknown")
+
+    if [ "$CODENAME" = "noble" ]; then
+        # 抓取官方脚本，通过 sed 强制将 noble 替换为稳定有源的 jammy
+        curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | \
+        sed 's/os="${dist}"/os="ubuntu"/' | \
+        sed 's/dist="${dist}"/dist="jammy"/' | bash
+    else
+        # 其他系统（如 Ubuntu 22.04、Debian 等）直接走官方标准脚本
+        curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash
+    fi
+
+    # 4. 完美安装官方包
+    echo -e "${YELLOW}📦 正在通过 APT 安装官方原生 Speedtest...${RESET}"
+    apt-get update -y && apt-get install -y speedtest
 fi
 
-# 5. 下载官方原生程序 (修复了 404 伪成功和死链问题)
-echo -e "${YELLOW}📥 正在从 Ookla 官网下载 ${URL_ARCH} 版本...${RESET}"
-
-cd /tmp
-# 强制清理可能存在的历史坏文件
-rm -f speedtest.tgz speedtest
-
-# -f 参数确保 404 时直接报错跳出，--retry 确保网络抖动时可重试
-if ! curl -L -f --connect-timeout 10 --retry 3 -o speedtest.tgz "https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-${URL_ARCH}-linux.tgz"; then
-    echo -e "${RED}❌ 下载失败，请检查网络是否能访问 install.speedtest.net${RESET}"
-    exit 1
-fi
-
-# 6. 解压与权限修复
-echo -e "${YELLOW}⚙️ 正在解压并配置环境变量...${RESET}"
-tar -zxf speedtest.tgz speedtest
-chmod +x speedtest
-mv speedtest /usr/local/bin/
-rm -f speedtest.tgz
-
-# 刷新指令哈希
+# 确保命令哈希表刷新
 hash -r 2>/dev/null
-echo -e "${GREEN}✅ 官方原生 Speedtest 安装成功！${RESET}"
+
+echo -e "${GREEN}✅ 安装完成！${RESET}"
 
 # ======================================
 # 自动测速
@@ -74,8 +84,12 @@ echo ""
 echo -e "${GREEN}🚀 开始测速...${RESET}"
 echo "-------------------------------------"
 
-# 运行测速并自动同意隐私协议
-speedtest --accept-license --accept-gdpr
+# 智能判断：开源版 speedtest-cli 不需要也不支持这两个商业隐私参数
+if speedtest --help 2>&1 | grep -q "accept-license"; then
+    speedtest --accept-license --accept-gdpr
+else
+    speedtest
+fi
 
 echo "-------------------------------------"
-echo -e "${GREEN}🎉 完成！以后在任意地方输入 speedtest 即可测速。${RESET}"
+echo -e "${GREEN}🎉 完成！以后直接运行： speedtest${RESET}"

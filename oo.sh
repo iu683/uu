@@ -1,384 +1,454 @@
 #!/bin/bash
+set -e
 
-# =================================================================
-# 名称: 流量统计 & VPS/Docker 状态 TG日报管理工具
-# =================================================================
+# ===============================
+# 防火墙管理（Debian/Ubuntu 双栈 IPv4/IPv6）
+# ===============================
 
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
-GRAY="\033[90m"
-NC="\033[0m" # 清除颜色
+BLUE="\033[34m"
+PURPLE="\033[35m"
+CYAN="\033[36m"
+RESET="\033[0m"
 
+# ===============================
+# 动态信息获取函数
+# ===============================
 
-CONFIG_FILE="/etc/vnstat_tg.conf"  # 配置文件路径
-BIN_PATH="/usr/local/bin/vnstat_tg_report.sh"  # 报告脚本路径
+get_ssh_port() {
+    local port
+    port=$(grep -E '^ *Port ' /etc/ssh/sshd_config | awk '{print $2}' | head -n 1)
+    [[ -z "$port" || ! "$port" =~ ^[0-9]+$ ]] && port=22
+    echo "$port"
+}
 
-# --- 1. 环境准备 ---
-prepare_env() {
-    echo "🔍 正在检查系统环境..."
-
-    # 基础依赖包
-    local deps=("vnstat" "bc" "curl" "cron" "sed" "awk")
-
-    # 判断操作系统类型
-    if [ -f /etc/debian_version ]; then
-        PACKAGE_MANAGER="apt-get"
-    elif [ -f /etc/redhat-release ]; then
-        PACKAGE_MANAGER="yum"
+get_firewall_status() {
+    if systemctl is-active --quiet netfilter-persistent 2>/dev/null; then
+        echo -e "${YELLOW}● 已开启(开机自启)${RESET}"
     else
-        echo "❌ 未知操作系统，请手动安装依赖。"
-        exit 1
-    fi
-
-    # 更新源并安装基础依赖
-    if [ "$PACKAGE_MANAGER" == "apt-get" ]; then
-        sudo apt-get update -y
-    fi
-
-    for dep in "${deps[@]}"; do
-        if ! command -v "$dep" &>/dev/null; then
-            echo "📥 安装依赖: $dep"
-            if [ "$PACKAGE_MANAGER" == "apt-get" ]; then
-                sudo apt-get install -y "$dep"
-            elif [ "$PACKAGE_MANAGER" == "yum" ]; then
-                sudo yum install -y "$dep"
-            fi
-        fi
-    done
-
-    # 特殊处理 cron 服务的包名
-    if ! command -v cron &>/dev/null && ! command -v crond &>/dev/null; then
-        echo "📥 安装 Cron 服务..."
-        if [ "$PACKAGE_MANAGER" == "apt-get" ]; then
-            sudo apt-get install -y cron
-            sudo systemctl enable cron --now
-        elif [ "$PACKAGE_MANAGER" == "yum" ]; then
-            sudo yum install -y cronie
-            sudo systemctl enable cronie --now
-        fi
-    fi
-
-    # 安装和启动 vnstat 服务
-    if ! systemctl is-active --quiet vnstat; then
-        sudo systemctl enable vnstat --now
-    fi
-    sudo vnstat -u >/dev/null 2>&1  # 初始化 vnstat 数据库
-    echo "✅ 环境就绪。"
-}
-
-# --- 2. 核心报表逻辑生成 ---
-generate_report_logic() {
-    local BC_P=$(which bc)
-    local VN_P=$(which vnstat)
-    local CL_P=$(which curl)
-
-    # 动态写入 logic 脚本
-    cat <<'EOF' > $BIN_PATH
-#!/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-[ -f "/etc/vnstat_tg.conf" ] && source "/etc/vnstat_tg.conf" || exit 1
-
-# 修复数字前面的零
-fix_zero() {
-    [[ $1 == .* ]] && echo "0$1" || echo "$1"
-}
-
-# 将流量值转化为 MB
-val_to_mb() {
-    local raw=$(echo "$1" | tr -d ' ' | tr '[:lower:]' '[:upper:]')
-    local num=$(echo "$raw" | grep -oE '[0-9.]+' | head -n1)
-    [ -z "$num" ] && num=0
-    case "$raw" in
-        *T*) echo "scale=2; $num * 1048576" | $BC ;;
-        *G*) echo "scale=2; $num * 1024" | $BC ;;
-        *K*) echo "scale=2; $num / 1024" | $BC ;;
-        *)   echo "$num" ;;
-    esac
-}
-
-# 提取流量数据中的接收和发送流量
-get_traffic() {
-    echo "$1" | cut -c13- | grep -oE '[0-9.]+[[:space:]]*[a-zA-Z/]+' | sed -n "${2}p" | xargs
-}
-
-# 生成流量使用进度条
-gen_bar() {
-    local p=$1; local b=""; [ "$p" -gt 100 ] && p=100
-    local c="🟩"; [ "$p" -ge 50 ] && c="🟧"; [ "$p" -ge 80 ] && c="🟥"
-    for ((i=0; i<p/10; i++)); do b+="$c"; done
-    for ((i=p/10; i<10; i++)); do b+="⬜"; done
-    echo "$b"
-}
-
-# 1. 流量数据统计
-$VN -i $INTERFACE --update >/dev/null 2>&1
-
-# 获取公网 IP
-SERVER_IP=$(curl -s --connect-timeout 5 https://ipinfo.io/ip || curl -s --connect-timeout 5 https://icanhazip.com || echo "获取失败")
-
-Y_D=$(date -d "yesterday" "+%Y-%m-%d")
-Y_A1=$(date -d "yesterday" "+%m/%d/%y")
-Y_A2=$(date -d "yesterday" "+%d.%m.%y")
-Y_A3=$(date -d "yesterday" "+%m/%d/%Y")
-RAW_LINE=$($VN -d | grep -Ei "yesterday|$Y_D|$Y_A1|$Y_A2|$Y_A3")
-
-if [ -n "$RAW_LINE" ]; then
-    RX_STR=$(get_traffic "$RAW_LINE" 1)
-    TX_STR=$(get_traffic "$RAW_LINE" 2)
-    RX_MB=$(val_to_mb "$RX_STR")
-    TX_MB=$(val_to_mb "$TX_STR")
-    TOTAL_YEST_GB=$(fix_zero $(echo "scale=2; ($RX_MB + $TX_MB) / 1024" | $BC))
-    DISP_RX="${RX_STR/GiB/GB}"; DISP_TX="${TX_STR/GiB/GB}"
-else
-    DISP_RX="0.00 GB"; DISP_TX="0.00 GB"; TOTAL_YEST_GB="0.00"
-fi
-
-TODAY_D=$(date +%d | sed 's/^0//')
-THIS_Y=$(date +%Y); THIS_M=$(date +%m)
-if [ "$TODAY_D" -lt "$RESET_DAY" ]; then
-    START_DATE=$(date -d "${THIS_Y}-${THIS_M}-${RESET_DAY} -1 month" +%Y-%m-%d)
-    END_DATE=$(date -d "${THIS_Y}-${THIS_M}-${RESET_DAY} -1 day" +%Y-%m-%d)
-else
-    START_DATE=$(date -d "${THIS_Y}-${THIS_M}-${RESET_DAY}" +%Y-%m-%d)
-    END_DATE=$(date -d "${THIS_Y}-${THIS_M}-${RESET_DAY} +1 month -1 day" +%Y-%m-%d)
-fi
-
-TOTAL_PERIOD_MB=0
-CUR_TS=$(date -d "$START_DATE" +%s)
-YEST_TS=$(date -d "yesterday" +%s)
-while [ "$CUR_TS" -le "$YEST_TS" ]; do
-    D_M1=$(date -d "@$CUR_TS" "+%Y-%m-%d")
-    D_M2=$(date -d "@$CUR_TS" "+%m/%d/%y")
-    D_M3=$(date -d "@$CUR_TS" "+%d.%m.%y")
-    D_M4=$(date -d "@$CUR_TS" "+%m/%d/%Y")
-    D_LINE=$($VN -d | grep -E "$D_M1|$D_M2|$D_M3|$D_M4")
-    if [ -n "$D_LINE" ]; then
-        D_RX_S=$(get_traffic "$D_LINE" 1)
-        D_TX_S=$(get_traffic "$D_LINE" 2)
-        TOTAL_PERIOD_MB=$(echo "$TOTAL_PERIOD_MB + $(val_to_mb "$D_RX_S") + $(val_to_mb "$D_TX_S")" | $BC)
-    fi
-    CUR_TS=$((CUR_TS + 86400))
-done
-
-USED_GB=$(fix_zero $(echo "scale=2; $TOTAL_PERIOD_MB / 1024" | $BC))
-PCT=$(echo "scale=0; $USED_GB * 100 / $MAX_GB" | $BC 2>/dev/null)
-[ -z "$PCT" ] && PCT=0
-BAR=$(gen_bar $PCT)
-NOW=$(date "+%Y-%m-%d %H:%M")
-
-# 2. VPS 基础状态获取 & 运行时间汉化
-UPTIME_RAW=$(uptime -p | sed 's/up //')
-UPTIME_CN=$(echo "$UPTIME_RAW" | sed -E 's/ years?/ 年/g; s/ weeks?/ 周/g; s/ days?/ 天/g; s/ hours?/ 小时/g; s/ minutes?/ 分钟/g')
-
-CPU_LOAD=$(uptime | awk -F'load average:' '{print $2}' | awk -F, '{print $1}' | xargs)
-MEM_INFO=$(free -m | awk '/Mem:/ {printf "%.1f/%.1f GB (%.0f%%)", $3/1024, $2/1024, $3*100/$2}')
-DISK_INFO=$(df -h / | awk 'NR==2 {printf "%s/%s (%s)", $3, $2, $5}')
-
-# 3. 网卡实时速率统计 (1秒采样)
-RX_BEFORE=$(cat /sys/class/net/$INTERFACE/statistics/rx_bytes)
-TX_BEFORE=$(cat /sys/class/net/$INTERFACE/statistics/tx_bytes)
-sleep 1
-RX_AFTER=$(cat /sys/class/net/$INTERFACE/statistics/rx_bytes)
-TX_AFTER=$(cat /sys/class/net/$INTERFACE/statistics/tx_bytes)
-SPEED_RX_KB=$(echo "($RX_AFTER - $RX_BEFORE) / 1024" | $BC)
-SPEED_TX_KB=$(echo "($TX_AFTER - $TX_BEFORE) / 1024" | $BC)
-
-if [ "$SPEED_RX_KB" -gt 1024 ]; then
-    SPEED_RX=$(echo "scale=1; $SPEED_RX_KB / 1024" | $BC) Mbps
-else
-    SPEED_RX="${SPEED_RX_KB} Kbps"
-fi
-if [ "$SPEED_TX_KB" -gt 1024 ]; then
-    SPEED_TX=$(echo "scale=1; $SPEED_TX_KB / 1024" | $BC) Mbps
-else
-    SPEED_TX="${SPEED_TX_KB} Kbps"
-fi
-
-# 4. Docker 运行状态监控（优化：未安装或未运行则完全隐藏该板块）
-DOCKER_BLOCK=""
-if command -v docker &>/dev/null && systemctl is-active --quiet docker; then
-    DOCKER_TOTAL=$(docker ps -a --format '{{.Names}}' | wc -l)
-    DOCKER_RUNNING=$(docker ps --format '{{.Names}}' | wc -l)
-    DOCKER_STATUS="🟢 运行中 ($DOCKER_RUNNING/$DOCKER_TOTAL)"
-    
-    # 异常容器检测
-    DOCKER_EXC=$(docker ps -a --filter "status=exited" --format '{{.Names}} ({{.Status}})' | grep -v 'Exited (0)' | head -n 3)
-    if [ -n "$DOCKER_EXC" ]; then
-        DOCKER_STATUS+="\n⚠️ *异常容器*:\n\`$(echo "$DOCKER_EXC" | sed 's/^/  • /')\`"
-    fi
-    
-    # 构建 Docker 消息文本块
-    read -r -d '' DOCKER_BLOCK << DOCK_MSG
-
-🐳 *Docker 运行状态*
-$DOCKER_STATUS
-DOCK_MSG
-fi
-
-# --- 报表样式定制（分开显示周期） ---
-read -r -d '' MSG << END_OF_MESSAGE
-📊 *【$HOST_ALIAS】服务器日报*
-🕙 时间: \`$NOW\`
-🔋 运行: \`$UPTIME_CN\`
-
-🖥️ *VPS 基础性能监控*
-├─ 🌍 公网IP: \`$SERVER_IP\`
-├─ ⚡ 负载 (1m): \`$CPU_LOAD\`
-├─ 🧠 内存: \`$MEM_INFO\`
-└─ 💾 硬盘: \`$DISK_INFO\`
-
-🌐 *网卡实时与历史统计 ($INTERFACE)*
-├─ 🚀 实时下载: \`$SPEED_RX\`
-├─ 🚀 实时上传: \`$SPEED_TX\`
-├─ ⬇️ 昨日下载: \`$DISP_RX\`
-├─ ⬆️ 昨日上传: \`$DISP_TX\`
-└─ 🧮 昨日合计: \`$TOTAL_YEST_GB GB\`
-
-📅 *流量周期统计*
-├─ 📅 周期开始: \`$START_DATE\`
-├─ 📅 周期结束: \`$END_DATE\`
-├─ 🔄 重置日: 每月 \`$RESET_DAY\` 号
-├─ ⏳ 累计: \`$USED_GB / $MAX_GB GB\`
-└─ 🎯 进度: $BAR \`$PCT%\`
-$DOCKER_BLOCK
-END_OF_MESSAGE
-
-# 发送到 Telegram
-$CL --connect-timeout 10 --retry 3 -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
--d "chat_id=$TG_CHAT_ID" \
--d "text=$MSG" \
--d "parse_mode=Markdown" \
--d "disable_notification=true" > /dev/null
-EOF
-
-    # 更新报告脚本中的命令路径
-    sed -i "4i BC=\"$BC_P\"\nVN=\"$VN_P\"\nCL=\"$CL_P\"" $BIN_PATH
-    chmod +x $BIN_PATH  # 设置执行权限
-}
-
-# --- 3. 配置与自定义通知时间录入 ---
-collect_config() {
-    [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
-    echo "--- 请输入配置参数 ---"
-    
-    read -p "👤 主机别名 [${HOST_ALIAS:-My-VPS}]: " input_val; HOST_ALIAS=${input_val:-${HOST_ALIAS:-My-VPS}}
-    read -p "🤖 Bot Token [${TG_TOKEN}]: " input_val; TG_TOKEN=${input_val:-$TG_TOKEN}
-    read -p "🆔 Chat ID [${TG_CHAT_ID}]: " input_val; TG_CHAT_ID=${input_val:-$TG_CHAT_ID}
-    read -p "📅 重置日 (1-31) [${RESET_DAY:-1}]: " input_val; RESET_DAY=${input_val:-${RESET_DAY:-1}}
-    read -p "📊 限额 (GB) [${MAX_GB:-1000}]: " input_val; MAX_GB=${input_val:-${MAX_GB:-1000}}
-
-    # 自动获取默认网卡
-    IF_DEF=$(ip route | grep '^default' | awk '{print $5}' | head -n1)
-    read -p "🌐 网卡 [${INTERFACE:-$IF_DEF}]: " input_val; INTERFACE=${input_val:-${INTERFACE:-$IF_DEF}}
-
-    # 自定义通知时间
-    read -p "⏰ 通知时间 (HH:MM) [${RUN_TIME:-08:00}]: " input_val; RUN_TIME=${input_val:-${RUN_TIME:-08:00}}
-
-    # 保存配置到文件
-    cat <<EOF > "$CONFIG_FILE"
-HOST_ALIAS="$HOST_ALIAS"
-TG_TOKEN="$TG_TOKEN"
-TG_CHAT_ID="$TG_CHAT_ID"
-RESET_DAY=$RESET_DAY
-MAX_GB=$MAX_GB
-INTERFACE="$INTERFACE"
-RUN_TIME="$RUN_TIME"
-EOF
-
-    # 生成报告脚本
-    generate_report_logic  
-    
-    # 巧妙转换 Cron 时间，过滤掉前导0
-    local H=$(echo $RUN_TIME | cut -d: -f1 | sed 's/^0//'); [ -z "$H" ] && H=0
-    local M=$(echo $RUN_TIME | cut -d: -f2 | sed 's/^0//'); [ -z "$M" ] && M=0
-    
-    # 写入定时任务
-    (crontab -l 2>/dev/null | grep -Fv "$BIN_PATH"; echo "$M $H * * * /bin/bash $BIN_PATH") | crontab -
-    echo "⏰ 定时发送任务已设定为每日 $RUN_TIME"
-}
-
-# --- 4. 交互菜单 (带有状态与定时任务检测功能) ---
-
-while true; do
-    clear
-    echo -e "${GREEN}=======================================${NC}"
-    echo -e "${GREEN}       流量日报 TG通知管理工具         ${NC}"
-    echo -e "${GREEN}=======================================${NC}"
-    
-    # --- 动态状态看板模块 ---
-    if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
-        echo -e "${GREEN} 👤 主机别名:${NC} ${YELLOW}$HOST_ALIAS${NC} ${GREEN}| 网卡:${NC} ${YELLOW}$INTERFACE${NC}"
-        echo -e "${GREEN} 📅 流量配置:${NC} ${YELLOW}每月 $RESET_DAY 号重置${NC} ${GREEN}| 限额:${NC} ${YELLOW}$MAX_GB GB${NC}"
-        
-        # 检查 crontab 中是否有该定时任务
-        if crontab -l 2>/dev/null | grep -Fq "$BIN_PATH"; then
-            echo -e "${GREEN}  ⏰ 定时任务:${NC} ${YELLOW}已开启(每日$RUN_TIME)${NC}"
+        if iptables -P INPUT 2>/dev/null | grep -q "DROP"; then
+            echo -e "${YELLOW}● 运行中(未设自启)${RESET}"
         else
-            echo -e "${GREEN}  ⏰ 定时任务:${NC} ${RED}未开启(无定时任务)${NC}"
+            echo -e "${RED}○ 已关闭 (全放行)${RESET}"
+        fi
+    fi
+}
+
+get_firewall_type() {
+    if command -v iptables &>/dev/null; then
+        if iptables --version | grep -qi "nftables"; then
+            echo "iptables (nftables)"
+        else
+            echo "iptables (legacy)"
         fi
     else
-        echo -e "${GREEN} 📊 当前状态:${NC} ${YELLOW}未检测到有效配置文件${NC}"
+        echo "未安装"
     fi
-    echo -e "${GREEN}=======================================${NC}"
+}
 
-    # --- 菜单选项 ---
-    echo -e "${GREEN} 1. 全新安装环境与配置${NC}"
-    echo -e "${GREEN} 2. 修改现有配置/调整通知时间${NC}"
-    echo -e "${GREEN} 3. 立即手动触发测试 (发送日报)${NC}"
-    echo -e "${GREEN} 4. 重新构建报表核心逻辑 (更新)${NC}"
-    echo -e "${GREEN} 5. 完全卸载 (清理配置与定时任务)${NC}"
-    echo -e "${GREEN} 0. 退出${NC}"
-    echo -e "${GREEN}=======================================${NC}"
+get_banned_ip_count() {
+    local count4 count6 total
+    count4=$(iptables -S INPUT 2>/dev/null | grep " -j DROP" | grep -vE "dport|sport" | wc -l || echo 0)
+    count6=$(ip6tables -S INPUT 2>/dev/null | grep " -j DROP" | grep -vE "dport|sport" | wc -l || echo 0)
+    total=$((count4 + count6))
+    echo "$total"
+}
 
-    echo -ne "${GREEN} 请选择操作: ${NC}"
-    read choice
-    case $choice in
-        1) 
-            prepare_env
-            collect_config
-            echo -e "\n✅ 安装完成！"; sleep 2 
+# ===============================
+# 防火墙核心逻辑函数
+# ===============================
+
+save_rules() {
+    netfilter-persistent save 2>/dev/null || true
+}
+
+save_and_enable_autoload() {
+    save_rules
+    systemctl enable netfilter-persistent 2>/dev/null || true
+    systemctl start netfilter-persistent 2>/dev/null || true
+    echo -e "${GREEN}✅ 规则已保存，并设置为开机自动加载${RESET}"
+    read -p "按回车继续..."
+}
+
+init_rules() {
+    local ssh_port
+    ssh_port=$(get_ssh_port)
+    for proto in iptables ip6tables; do
+        $proto -F INPUT
+        
+        $proto -P INPUT DROP
+        $proto -P FORWARD ACCEPT
+        $proto -P OUTPUT ACCEPT
+        
+        $proto -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+        $proto -A INPUT -i lo -j ACCEPT
+        $proto -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
+        $proto -A INPUT -p tcp --dport 80 -j ACCEPT
+        $proto -A INPUT -p tcp --dport 443 -j ACCEPT
+    done
+    save_rules
+    systemctl enable netfilter-persistent 2>/dev/null || true
+    systemctl start netfilter-persistent 2>/dev/null || true
+}
+
+check_installed() {
+    dpkg -l | grep -q iptables-persistent
+}
+
+install_firewall() {
+    echo -e "${YELLOW}正在安装防火墙，请稍候...${RESET}"
+    apt update -y
+    apt remove -y ufw iptables-persistent || true
+    apt install -y iptables-persistent curl || true
+    init_rules
+    echo -e "${GREEN}✅ 防火墙安装完成，默认放行 SSH/80/443${RESET}"
+    echo -e "${GREEN}✅ 已设置开机自动加载规则${RESET}"
+    read -p "按回车继续..."
+}
+
+clear_firewall() {
+    echo -e "${YELLOW}正在恢复宿主机默认策略并放行所有流量...${RESET}"
+    for proto in iptables ip6tables; do
+        $proto -F INPUT
+        $proto -P INPUT ACCEPT
+        $proto -P FORWARD ACCEPT
+        $proto -P OUTPUT ACCEPT
+    done
+    if iptables -L DOCKER-USER -n &>/dev/null; then
+        iptables -F DOCKER-USER
+    fi
+    save_rules
+    systemctl disable netfilter-persistent 2>/dev/null || true
+    echo -e "${GREEN}✅ 防火墙入站限制已清空，宿主机流量已全放行（未损坏 Docker 链）${RESET}"
+    read -p "按回车继续..."
+}
+
+restore_default_rules() {
+    echo -e "${YELLOW}正在恢复默认防火墙规则 (仅放行 SSH/80/443)...${RESET}"
+    local ssh_port
+    ssh_port=$(get_ssh_port)
+    echo -e "${GREEN}检测到 SSH 端口: $ssh_port${RESET}"
+    init_rules
+    echo -e "${GREEN}✅ 默认规则已恢复${RESET}"
+    read -p "按回车继续..."
+}
+
+open_all_ports() {
+    echo -e "${YELLOW}正在放行所有宿主机端口（IPv4/IPv6）...${RESET}"
+    for proto in iptables ip6tables; do
+        $proto -F INPUT
+        $proto -P INPUT ACCEPT
+        $proto -P FORWARD ACCEPT
+    done
+    save_rules
+    echo -e "${GREEN}✅ 宿主机所有端口已放行（全开放）${RESET}"
+    read -p "按回车继续..."
+}
+
+ip_action() {
+    local action=$1 ip=$2 proto
+    if [[ $ip =~ : ]]; then
+        proto="ip6tables"
+    else
+        proto="iptables"
+    fi
+
+    case $action in
+        accept) 
+            if ! $proto -C INPUT -s "$ip" -j ACCEPT 2>/dev/null; then
+                $proto -I INPUT 1 -s "$ip" -j ACCEPT 
+            fi
             ;;
-        2) 
-            collect_config
-            echo -e "\n✅ 配置与通知时间更新成功！"; sleep 2 
-            ;;
-        3) 
-            echo "📡 正在尝试发送日报，请稍候..."
-            if [ -f "$BIN_PATH" ]; then
-                if /bin/bash "$BIN_PATH"; then
-                    echo -e "✅ ${GREEN}日报已成功触发并向 Telegram 发送！${NC}"
-                else
-                    echo -e "❌ ${RED}发送失败，请检查您的 Token/ChatID 设定、网络状况或 API 连通性。${NC}"
+        drop)   
+            if ! $proto -C INPUT -s "$ip" -j DROP 2>/dev/null; then
+                $proto -I INPUT 1 -s "$ip" -j DROP 
+            fi
+            if [ "$proto" = "iptables" ] && iptables -L DOCKER-USER -n &>/dev/null; then
+                if ! iptables -C DOCKER-USER -s "$ip" -j DROP 2>/dev/null; then
+                    iptables -I DOCKER-USER 1 -s "$ip" -j DROP
                 fi
-            else
-                echo -e "❌ ${RED}错误：核心报告尚未生成，请先执行选项 1 安装。${NC}"
             fi
-            sleep 3 
             ;;
-        4) 
-            if [ -f "$CONFIG_FILE" ]; then
-                generate_report_logic
-                echo -e "✅ ${GREEN}核心逻辑已更新重构！${NC}"
-            else
-                echo -e "❌ ${RED}更新失败：配置文件未找到，请先安装。${NC}"
+        delete)
+            while $proto -C INPUT -s "$ip" -j ACCEPT 2>/dev/null; do $proto -D INPUT -s "$ip" -j ACCEPT; done
+            while $proto -C INPUT -s "$ip" -j DROP 2>/dev/null; do $proto -D INPUT -s "$ip" -j DROP; done
+            if [ "$proto" = "iptables" ] && iptables -L DOCKER-USER -n &>/dev/null; then
+                while iptables -C DOCKER-USER -s "$ip" -j DROP 2>/dev/null; do iptables -D DOCKER-USER -s "$ip" -j DROP; done
             fi
-            sleep 1.5 
-            ;;
-        5) 
-            echo "🔄 正在卸载工具并清理残留..."
-            (crontab -l 2>/dev/null | grep -v "$BIN_PATH") | crontab -
-            rm -f "$BIN_PATH" "$CONFIG_FILE"
-            echo -e "✅ ${GREEN}卸载成功！已彻底清理配置文件以及 Cron 定时任务。${NC}"
-            sleep 2 
-            ;;
-        0) 
-            exit 0 
-            ;;
-        *) 
-            echo -e "❌ ${RED}无效选项，请输入 0 到 5 之间的数字${NC}"
-            sleep 1 
             ;;
     esac
-done
+}
+
+# ==================================================
+# 核心修复：重写 PING 管理函数，采用精准清理机制
+# ==================================================
+ping_action() {
+    local action=$1
+    
+    # 彻底清理旧的 IPv4 ICMP 相关规则（无论当初是以 ACCEPT 还是 DROP 方式插入）
+    while iptables -C INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null; do iptables -D INPUT -p icmp --icmp-type echo-request -j ACCEPT; done
+    while iptables -C OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT 2>/dev/null; do iptables -D OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT; done
+    while iptables -C INPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null; do iptables -D INPUT -p icmp --icmp-type echo-request -j DROP; done
+    while iptables -C OUTPUT -p icmp --icmp-type echo-reply -j DROP 2>/dev/null; do iptables -D OUTPUT -p icmp --icmp-type echo-reply -j DROP; done
+    while iptables -C INPUT -p icmp -j DROP 2>/dev/null; do iptables -D INPUT -p icmp -j DROP; done
+    while iptables -C OUTPUT -p icmp -j DROP 2>/dev/null; do iptables -D OUTPUT -p icmp -j DROP; done
+
+    # 彻底清理旧的 IPv6 ICMP 相关规则
+    while ip6tables -C INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT 2>/dev/null; do ip6tables -D INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT; done
+    while ip6tables -C OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT 2>/dev/null; do ip6tables -D OUTPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT; done
+    while ip6tables -C INPUT -p icmpv6 --icmpv6-type echo-request -j DROP 2>/dev/null; do ip6tables -D INPUT -p icmpv6 --icmpv6-type echo-request -j DROP; done
+    while ip6tables -C OUTPUT -p icmpv6 --icmpv6-type echo-reply -j DROP 2>/dev/null; do ip6tables -D OUTPUT -p icmpv6 --icmpv6-type echo-reply -j DROP; done
+    while ip6tables -C INPUT -p icmpv6 -j DROP 2>/dev/null; do ip6tables -D INPUT -p icmpv6 -j DROP; done
+    while ip6tables -C OUTPUT -p icmpv6 -j DROP 2>/dev/null; do ip6tables -D OUTPUT -p icmpv6 -j DROP; done
+
+    # 根据传入参数置顶插入新规则
+    if [ "$action" = "allow" ]; then
+        iptables -I INPUT 1 -p icmp --icmp-type echo-request -j ACCEPT
+        iptables -I OUTPUT 1 -p icmp --icmp-type echo-reply -j ACCEPT
+        ip6tables -I INPUT 1 -p icmpv6 --icmpv6-type echo-request -j ACCEPT
+        ip6tables -I OUTPUT 1 -p icmpv6 --icmpv6-type echo-reply -j ACCEPT
+    else
+        iptables -I INPUT 1 -p icmp --icmp-type echo-request -j DROP
+        iptables -I OUTPUT 1 -p icmp --icmp-type echo-reply -j DROP
+        ip6tables -I INPUT 1 -p icmpv6 --icmpv6-type echo-request -j DROP
+        ip6tables -I OUTPUT 1 -p icmpv6 --icmpv6-type echo-reply -j DROP
+    fi
+}
+
+view_visual_rules() {
+    clear
+    local ports_tcp ports_udp ping_status_v4 ping_status_v6
+    local policy_v4 policy_v6
+
+    policy_v4=$(iptables -L INPUT -n 2>/dev/null | head -n 1 | grep -oP "policy \K[A-Z]+")
+    policy_v6=$(ip6tables -L INPUT -n 2>/dev/null | head -n 1 | grep -oP "policy \K[A-Z]+")
+    [[ -z "$policy_v4" ]] && policy_v4="UNKNOWN"
+    [[ -z "$policy_v6" ]] && policy_v6="UNKNOWN"
+
+    ports_tcp=$( (iptables -S INPUT 2>/dev/null; ip6tables -S INPUT 2>/dev/null) | grep " -j ACCEPT" | grep "dport " | grep -E "tcp" | grep -oP "dport \K[0-9:]+" | sort -nu | tr '\n' ' ')
+    ports_udp=$( (iptables -S INPUT 2>/dev/null; ip6tables -S INPUT 2>/dev/null) | grep " -j ACCEPT" | grep "dport " | grep -E "udp" | grep -oP "dport \K[0-9:]+" | sort -nu | tr '\n' ' ')
+    [[ -z "$ports_tcp" ]] && ports_tcp="无"
+    [[ -z "$ports_udp" ]] && ports_udp="无"
+
+    if iptables -S INPUT 2>/dev/null | grep "icmp" | grep -q "DROP"; then ping_status_v4="${RED}禁打(DROP)${RESET}"; else ping_status_v4="${GREEN}允许(ACCEPT)${RESET}"; fi
+    if ip6tables -S INPUT 2>/dev/null | grep "icmpv6" | grep -q "DROP"; then ping_status_v6="${RED}禁打(DROP)${RESET}"; else ping_status_v6="${GREEN}允许(ACCEPT)${RESET}"; fi
+
+    echo -e "${CYAN}==================================================${RESET}"
+    echo -e "${CYAN}         📊 核心网络数据及规则总览看板              ${RESET}"
+    echo -e "${CYAN}==================================================${RESET}"
+    echo -e " 🛡️  ${CYAN}宿主机默认入站策略 (Default Policy):${RESET}"
+    echo -e "    - IPv4 INPUT 链 : $policy_v4"
+    echo -e "    - IPv6 INPUT 链 : $policy_v6"
+    echo -e " 🌐 ${CYAN}ICMP 响应状态 (PING):${RESET}"
+    echo -e "    - IPv4 Ping 回应: $ping_status_v4"
+    echo -e "    - IPv6 Ping 回应: $ping_status_v6"
+    echo -e "${CYAN}--------------------------------------------------${RESET}"
+
+    echo -e " 🔓 ${GREEN}当前对宿主机公网开放的端口列表：${RESET}"
+    echo -e "    +----------+--------------------------------------+"
+    echo -e "    | ${YELLOW}协议类型${RESET} | ${YELLOW}开放的端口号${RESET}                      |"
+    echo -e "    +----------+--------------------------------------+"
+    printf "    |  %-6s  | %-36s |\n" "TCP" "$ports_tcp"
+    printf "    |  %-6s  | %-36s |\n" "UDP" "$ports_udp"
+    echo -e "    +----------+--------------------------------------+"
+    echo -e "${CYAN}--------------------------------------------------${RESET}"
+
+    echo -e " ⚪ ${BLUE}IP 白名单规则 (放行特定源 IP)：${RESET}"
+    local whitelist=$(iptables -S INPUT 2>/dev/null | grep " -j ACCEPT" | grep -E " -s [0-9]" | grep -vE "dport|sport|lo|state" | grep -oP " -s \K[^ ]+" || true)
+    local whitelist6=$(ip6tables -S INPUT 2>/dev/null | grep " -j ACCEPT" | grep -E " -s [0-9a-fA-F:]" | grep -vE "dport|sport|lo|state" | grep -oP " -s \K[^ ]+" || true)
+    
+    if [[ -n "$whitelist" || -n "$whitelist6" ]]; then
+        for ip in $whitelist; do echo -e "    ⚡ [IPv4] -> $ip"; done
+        for ip in $whitelist6; do echo -e "    ⚡ [IPv6] -> $ip"; done
+    else
+        echo -e "    (当前无特定 IP 白名单规则)"
+    fi
+
+    echo -e "\n ⚫ ${RED}IP 黑名单规则 (已同步阻断宿主机与 Docker)：${RESET}"
+    local blacklist=$(iptables -S INPUT 2>/dev/null | grep " -j DROP" | grep -E " -s [0-9]" | grep -vE "dport|sport" | grep -oP " -s \K[^ ]+" || true)
+    local blacklist6=$(ip6tables -S INPUT 2>/dev/null | grep " -j DROP" | grep -E " -s [0-9a-fA-F:]" | grep -vE "dport|sport" | grep -oP " -s \K[^ ]+" || true)
+    
+    if [[ -n "$blacklist" || -n "$blacklist6" ]]; then
+        for ip in $blacklist; do echo -e "    ❌ [IPv4] -> $ip"; done
+        for ip in $blacklist6; do echo -e "    ❌ [IPv6] -> $ip"; done
+    else
+        echo -e "    (当前无特定 IP 黑名单规则)"
+    fi
+
+    echo -e "${CYAN}==================================================${RESET}"
+    read -r -p "按回车返回主菜单..." || true
+}
+
+uninstall_firewall() {
+    clear
+    echo -e "${YELLOW}警告：该操作将清空所有宿主机入站规则并卸载防火墙组件，恢复网络全放行状态！${RESET}"
+    read -p "确定要彻底卸载吗？(y/n): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "已取消卸载。"
+        read -p "按回车继续..."
+        return
+    fi
+
+    echo -e "${YELLOW}正在清理宿主机 INPUT 规则并修改策略...${RESET}"
+    for proto in iptables ip6tables; do
+        $proto -F INPUT
+        $proto -P INPUT ACCEPT
+        $proto -P FORWARD ACCEPT
+        $proto -P OUTPUT ACCEPT
+    done
+    if iptables -L DOCKER-USER -n &>/dev/null; then
+        iptables -F DOCKER-USER
+    fi
+
+    echo -e "${YELLOW}正在停止并卸载守护服务...${RESET}"
+    systemctl stop netfilter-persistent 2>/dev/null || true
+    systemctl disable netfilter-persistent 2>/dev/null || true
+    apt purge -y iptables-persistent netfilter-persistent || true
+    apt autoremove -y
+
+    echo -e "${GREEN}✅ 防火墙已彻底卸载，Docker 及系统核心流量未受干扰。${RESET}"
+    exit 0
+}
+
+menu() {
+    while true; do
+        STATUS=$(get_firewall_status)
+        TYPE_SHOW=$(get_firewall_type)
+        PORT_SHOW=$(get_ssh_port)
+        SITE_COUNT=$(get_banned_ip_count)
+
+        clear
+        echo -e "${GREEN}===============================${RESET}"
+        echo -e "${GREEN}    ◈  双栈防火墙控制台 ◈      ${RESET}"
+        echo -e "${GREEN}===============================${RESET}"
+        echo -e "${GREEN} 状态  : ${STATUS}"
+        echo -e "${GREEN} 内核  : ${YELLOW}${TYPE_SHOW}${RESET}"
+        echo -e "${GREEN} 端口  : ${YELLOW}${PORT_SHOW}${RESET}"
+        echo -e "${GREEN} 封禁  : ${YELLOW}${SITE_COUNT} 个 IP${RESET}"
+        echo -e "${GREEN}===============================${RESET}"
+        echo -e "${GREEN}  1. 开放指定端口 (TCP/UDP)${RESET}"
+        echo -e "${GREEN}  2. 关闭指定端口 (TCP/UDP)${RESET}"
+        echo -e "${GREEN}  3. 开放所有端口 (全放行)${RESET}"
+        echo -e "${GREEN}  4. 恢复默认安全规则 (放行SSH/80/443)${RESET}"
+        echo -e "${GREEN}  5. 添加 IP 白名单 (放行)${RESET}"
+        echo -e "${GREEN}  6. 添加 IP 黑名单 (封禁)${RESET}"
+        echo -e "${GREEN}  7. 删除指定 IP 规则${RESET}"
+        echo -e "${GREEN}  8. 允许 PING (ICMP)${RESET}"
+        echo -e "${GREEN}  9. 禁用 PING (ICMP)${RESET}"
+        echo -e "${GREEN} 10. 查看当前防火墙详细规则${RESET}"
+        echo -e "${GREEN} 11. 保存规则并设置开机自启${RESET}"
+        echo -e "${GREEN} 12. 卸载防火墙${RESET}"
+        echo -e "${GREEN}  0. 退出${RESET}"
+        echo -e "${GREEN}===============================${RESET}"
+        echo -ne "${GREEN} 请选择: ${RESET}"
+        read -r choice
+
+        case $choice in
+            1)
+                read -p "请输入要开放的端口号: " PORT
+                if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+                    echo -e "${RED}❌ 错误：请输入 1-65535 之间的有效端口号${RESET}"
+                    read -p "按回车返回菜单..."
+                    continue
+                fi
+                for proto in iptables ip6tables; do
+                    while $proto -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null; do $proto -D INPUT -p tcp --dport "$PORT" -j DROP; done
+                    while $proto -C INPUT -p udp --dport "$PORT" -j DROP 2>/dev/null; do $proto -D INPUT -p udp --dport "$PORT" -j DROP; done
+                    if ! $proto -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; then
+                        $proto -I INPUT -p tcp --dport "$PORT" -j ACCEPT
+                    fi
+                    if ! $proto -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; then
+                        $proto -I INPUT -p udp --dport "$PORT" -j ACCEPT
+                    fi
+                done
+                save_rules
+                echo -e "${GREEN}✅ 已开放端口 $PORT${RESET}"
+                read -p "按回车继续..."
+                ;;
+            2)
+                read -p "请输入要关闭的端口号: " PORT
+                if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+                    echo -e "${RED}❌ 错误：请输入 1-65535 之间的有效端口号${RESET}"
+                    read -p "按回车返回菜单..."
+                    continue
+                fi
+                
+                if [ "$PORT" -eq "$PORT_SHOW" ]; then
+                    echo -e "${RED}⚠️ 拒绝操作：当前端口为 SSH 端口！${RESET}"
+                    read -p "按回车返回菜单..."
+                    continue
+                fi
+                
+                for proto in iptables ip6tables; do
+                    while $proto -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; do $proto -D INPUT -p tcp --dport "$PORT" -j ACCEPT; done
+                    while $proto -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; do $proto -D INPUT -p udp --dport "$PORT" -j ACCEPT; done
+                    if ! $proto -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null; then
+                        $proto -I INPUT -p tcp --dport "$PORT" -j DROP
+                    fi
+                    if ! $proto -C INPUT -p udp --dport "$PORT" -j DROP 2>/dev/null; then
+                        $proto -I INPUT -p udp --dport "$PORT" -j DROP
+                    fi
+                done
+                save_rules
+                echo -e "${GREEN}✅ 已关闭宿主机端口 $PORT (注:若该端口由Docker映射，可在容器配置中管理)${RESET}"
+                read -p "按回车继续..."
+                ;;
+            3) open_all_ports ;;
+            4) restore_default_rules ;;
+            5)
+                read -p "请输入要放行的IP: " IP
+                ip_action accept "$IP"
+                save_rules
+                echo -e "${GREEN}✅ IP $IP 已放行${RESET}"
+                read -p "按回车继续..."
+                ;;
+            6)
+                read -p "请输入要封禁的IP: " IP
+                ip_action drop "$IP"
+                save_rules
+                echo -e "${GREEN}✅ IP $IP 已封禁（已同步应用至宿主机与Docker容器）${RESET}"
+                read -p "按回车继续..."
+                ;;
+            7)
+                read -p "请输入要删除的IP: " IP
+                ip_action delete "$IP"
+                save_rules
+                echo -e "${GREEN}✅ IP $IP 规则已删除${RESET}"
+                read -p "按回车继续..."
+                ;;
+            8)
+                ping_action allow
+                save_rules
+                echo -e "${GREEN}✅ 已允许 PING（ICMP）${RESET}"
+                read -p "按回车继续..."
+                ;;
+            9)
+                ping_action deny
+                save_rules
+                echo -e "${GREEN}✅ 已禁用 PING（ICMP）${RESET}"
+                read -p "按回车继续..."
+                ;;
+            10) view_visual_rules ;;
+            11) save_and_enable_autoload ;;
+            12) uninstall_firewall ;;
+            0) clear; break ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ===============================
+# 脚本入口
+# ===============================
+if [ "$EUID" -ne 0 ]; then
+   echo -e "${RED}❌ 错误: 请使用 root 权限运行此脚本！${RESET}"
+   exit 1
+fi
+
+if ! check_installed; then
+    install_firewall
+fi
+
+menu

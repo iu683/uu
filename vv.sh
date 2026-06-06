@@ -1,267 +1,363 @@
-#!/bin/bash
-# =========================================================================
-# IPv4 / IPv6 管理面板 
-# =========================================================================
+#!/usr/bin/env bash
 
-if [ "$EUID" -ne 0 ]; then
-    echo -e "\033[31m❌ 错误：请使用 root 权限运行此脚本！\033[0m"
-    exit 1
-fi
+# ==============================================================================
+# Linux TCP/IP & BBR & TFO 智能综合优化
+# ==============================================================================
 
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+set -euo pipefail
 
-has_cmd() { command -v "$1" >/dev/null 2>&1; }
+# --- 颜色定义 ---
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
 
-get_os_type() {
+# --- 配置文件路径 ---
+CONF_FILE="/etc/sysctl.d/99-bbr.conf"
+
+# --- 权限检查 ---
+check_root() {
+    if [[ $(id -u) -ne 0 ]]; then
+        echo -e "${RED}❌ 错误: 必须以 root 权限运行此脚本。${NC}"
+        exit 1
+    fi
+}
+
+# --- BBR 与 架构兼容性硬检测 ---
+check_bbr_support() {
+    
+    # 1. 检测容器虚拟化架构 (OpenVZ / LXC / 容器判定)
+    local virt_type="unknown"
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        virt_type=$(systemd-detect-virt)
+    else
+        # 针对 Alpine 等无 systemd 系统或特殊环境的兜底检测
+        if [ -f /proc/user_beancounters ]; then
+            virt_type="openvz"
+        elif grep -qi "lxc" /proc/1/environ 2>/dev/null || [ -f /run/container_type ]; then
+            virt_type="lxc"
+        fi
+    fi
+
+    if [[ "$virt_type" == "openvz" || "$virt_type" == "lxc" ]]; then
+        echo -e "${RED}❌ 错误: 当前 VPS 架构为 [${virt_type^^}] 容器/NAT小鸡。${NC}"
+        echo -e "${YELLOW}💡 原因: 该架构与宿主机共享内核，非独立内核，无法自主应用 BBR 拥塞控制与 FQ 队列。${NC}"
+        exit 1
+    fi
+
+    # 2. 内核版本前置过滤
+    local kernel_version major minor
+    kernel_version=$(uname -r | cut -d. -f1,2)
+    major=$(echo "$kernel_version" | cut -d. -f1)
+    minor=$(echo "$kernel_version" | cut -d. -f2)
+    
+    local has_bbr_mod=0
+    if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q "bbr"; then
+        has_bbr_mod=1
+    elif modprobe -n tcp_bbr >/dev/null 2>&1; then
+        has_bbr_mod=1
+    fi
+
+    # 允许在 4.9 以下但有反向 backport BBR 模块的特殊内核通过
+    if [ "$major" -lt 4 ] || { [ "$major" -eq 4 ] && [ "$minor" -lt 9 ]; }; then
+        if [ "$has_bbr_mod" -ne 1 ]; then
+            echo -e "${RED}❌ 错误: 当前系统内核版本为 $(uname -r)，低于官方要求的 4.9 最低限制，且无可用 BBR 模块。${NC}"
+            exit 1
+        fi
+    fi
+
+    # 3. 核心参数修改权限沙箱预检 (终极防线)
+    if ! sysctl -w net.ipv4.tcp_congestion_control="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 'cubic')" >/dev/null 2>&1; then
+        echo -e "${RED}❌ 错误: 检测到系统内核网络参数文件为 [只读] 状态或无修改权限。${NC}"
+        echo -e "${YELLOW}💡 原因: 这通常发生在某些受限的环境（如部分 NAT 共享小鸡或特殊安全策略容器中）。${NC}"
+        exit 1
+    fi
+}
+
+# --- 获取系统信息与动态参数 (针对小内存 UDP 深度调优) ---
+get_system_info() {
+    # 兼容没有 free 命令的精简系统（如未装 full box 的 Alpine）
+    if command -v free >/dev/null 2>&1; then
+        TOTAL_MEM=$(free -m | awk '/^Mem:/{print $2}' | tr -d '\r')
+    else
+        TOTAL_MEM=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+    fi
+    
+    if [ -z "$TOTAL_MEM" ] || [ "$TOTAL_MEM" -le 0 ]; then
+        TOTAL_MEM=1024 # 无法获取时默认按 1G 计算安全值
+    fi
+
+    if [ "$TOTAL_MEM" -le 512 ]; then
+        VM_TIER="入门微型小鸡(≤512MB RAM)"
+        RMEM_MAX="16777216"   
+        WMEM_MAX="16777216"
+        TCP_MEM_MAX="16777216"
+        SOMAXCONN="2048"       
+        FILE_MAX="65535"
+        CONNTRACK_MAX="32768"
+        UDP_MEM_CONF="1152 1536 2304"
+    elif [ "$TOTAL_MEM" -le 1024 ]; then
+        VM_TIER="基础级(1GB)"
+        RMEM_MAX="33554432"   
+        WMEM_MAX="33554432"
+        TCP_MEM_MAX="33554432"
+        SOMAXCONN="16384"
+        FILE_MAX="524288"
+        CONNTRACK_MAX="262144"
+        UDP_MEM_CONF="16384 32768 65536"
+    elif [ "$TOTAL_MEM" -le 4096 ]; then
+        VM_TIER="进阶级(2GB-4GB)"
+        RMEM_MAX="67108864"   
+        WMEM_MAX="67108864"
+        TCP_MEM_MAX="67108864"
+        SOMAXCONN="32768"
+        FILE_MAX="1048576"
+        CONNTRACK_MAX="524288"
+        UDP_MEM_CONF="65536 131072 262144"
+    else
+        VM_TIER="专业级(>4GB)"
+        RMEM_MAX="134217728"  
+        WMEM_MAX="134217728"
+        TCP_MEM_MAX="134217728"
+        SOMAXCONN="65535"
+        FILE_MAX="2097152"
+        CONNTRACK_MAX="1048576"
+        UDP_MEM_CONF="262144 524288 1048576"
+    fi
+}
+
+# --- 写入配置辅助 ---
+add_conf() {
+    local key="$1"
+    local value="$2"
+    local comment="$3"
+    echo "# $comment" >> "$CONF_FILE"
+    echo "$key = $value" >> "$CONF_FILE"
+    echo "" >> "$CONF_FILE"
+}
+
+# --- 备份管理 ---
+manage_backups() {
+    if [ -f "$CONF_FILE" ]; then
+        cp "$CONF_FILE" "$CONF_FILE.bak_$(date +%F_%H-%M-%S)"
+        # 仅保留最近3次备份
+        ls -t "${CONF_FILE}.bak_"* 2>/dev/null | tail -n +4 | xargs -r rm -f 2>/dev/null || true
+    fi
+}
+
+# --- 看板状态获取 ---
+get_status_text() {
+    local cc fq_check bbr_status fq_status
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null | tr -d '[:space:]' || echo "未知")
+    fq_check=$(sysctl -n net.core.default_qdisc 2>/dev/null | tr -d '[:space:]' || echo "未知")
+
+    # 1. 验证 BBR 状态及版本
+    if [ "$cc" == "bbr" ]; then
+        # 尝试获取 BBR 的具体版本号
+        bbr_version=$(modinfo tcp_bbr 2>/dev/null | grep -i 'version:' | awk '{print $2}' | tr -d '[:space:]')
+    
+        # 如果 modinfo 没查到，尝试从内核日志获取
+        if [ -z "$bbr_version" ]; then
+            bbr_version=$(dmesg 2>/dev/null | grep -i 'BBR' | grep -oE 'v[0-9](\.[0-9]+)*' | head -n 1)
+        fi
+    
+        # 如果还是空，默认显示为 v1 (大部分原生内核情况)
+        if [ -z "$bbr_version" ]; then
+            bbr_version="1"
+        fi
+
+        BBR_STATUS="${YELLOW}已启用${NC}"
+    else
+        BBR_STATUS="${RED}未启用${NC}"
+    fi
+    # 2. 验证 FQ 状态
+    if [ "$fq_check" == "fq" ] || [ "$fq_check" == "fq_pie" ] || [ "$fq_check" == "fq_codel" ]; then
+        FQ_STATUS="${YELLOW}已启用${NC}"
+    else
+        FQ_STATUS="${RED}未启用${NC}"
+    fi
+
+    # 2. 验证配置文件是否【真正由本脚本应用】
+    # 判断文件存在，且内容里包含专属的头部备注
+    if [ -f "$CONF_FILE" ] && grep -q "Linux Network Tuning (Proxy/Forwarding Optimized)" "$CONF_FILE"; then
+        CONF_STATUS="${YELLOW}已应用${NC}"
+    elif [ -f "$CONF_FILE" ]; then
+        CONF_STATUS="${RED}未应用${NC}"
+    else
+        CONF_STATUS="${RED}未应用${NC}"
+    fi
+}
+
+# --- 检测并处理 Alpine 发行版特殊逻辑 ---
+handle_alpine_special() {
     if [ -f /etc/os-release ]; then
+        # 通过 source 引入系统变量
+        # shellcheck disable=SC1091
         . /etc/os-release
-        echo "$ID"
-    else
-        echo "unknown"
+        if [ "${ID:-}" = "alpine" ]; then
+            echo -e "${CYAN}ℹ️ 检测到当前系统为 Alpine Linux，注入模块持久化配置...${NC}"
+            if ! grep -q "tcp_bbr" /etc/modules 2>/dev/null; then
+                echo "tcp_bbr" >> /etc/modules 2>/dev/null || true
+            fi
+        fi
     fi
 }
 
-install_pkg() {
-    local pkg="$1"
-    local os=$(get_os_type)
-    if has_cmd "$pkg"; then return; fi
+# --- 功能 1：一键安装优化 ---
+apply_optimizations() {
+    echo -e "\n${CYAN}>>> 正在分析系统硬件并生成最佳配置方案...${NC}"
+    get_system_info
+    manage_backups
     
-    echo -e "${YELLOW}🔧 正在补全系统依赖: $pkg ...${RESET}"
-    case "$os" in
-        ubuntu|debian)
-            apt-get update -y >/dev/null 2>&1
-            apt-get install -y "$pkg" >/dev/null 2>&1
-            ;;
-        alpine)
-            apk add --no-cache "$pkg" >/dev/null 2>&1
-            ;;
-        centos|rhel|rocky|almalinux)
-            yum install -y "$pkg" >/dev/null 2>&1 || dnf install -y "$pkg" >/dev/null 2>&1
-            ;;
-    esac
+    # 尝试加载内核模块（静默处理）
+    modprobe nf_conntrack >/dev/null 2>&1 || true
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+
+    mkdir -p "$(dirname "$CONF_FILE")"
+    > "$CONF_FILE"
+    cat >> "$CONF_FILE" << EOF
+# ==========================================================
+# Linux Network Tuning (Proxy/Forwarding Optimized)
+# 生成时间: $(date)
+# 硬件适配: ${TOTAL_MEM}MB RAM (${VM_TIER})
+# ==========================================================
+EOF
+
+    # 1. BBR 与 队列算法
+    add_conf "net.core.default_qdisc" "fq" "FQ 队列算法"
+    add_conf "net.ipv4.tcp_congestion_control" "bbr" "开启 BBR 拥塞控制"
+    add_conf "net.ipv4.tcp_slow_start_after_idle" "0" "关闭空闲慢启动"
+
+    # 2. TCP Fast Open (双向开启)
+    add_conf "net.ipv4.tcp_fastopen" "3" "开启 TCP Fast Open"
+
+    # 3. 缓冲区优化
+    add_conf "net.core.rmem_max" "$RMEM_MAX" "系统最大接收缓存"
+    add_conf "net.core.wmem_max" "$WMEM_MAX" "系统最大发送缓存"
+    add_conf "net.core.rmem_default" "262144" "默认接收缓存" 
+    add_conf "net.core.wmem_default" "262144" "默认发送缓存"
+    add_conf "net.ipv4.tcp_rmem" "4096 87380 $TCP_MEM_MAX" "TCP 读缓存"
+    add_conf "net.ipv4.tcp_wmem" "4096 65536 $TCP_MEM_MAX" "TCP 写缓存"
+    add_conf "net.ipv4.udp_rmem_min" "16384" "UDP 读缓存下限"
+    add_conf "net.ipv4.udp_wmem_min" "16384" "UDP 写缓存下限"
+    add_conf "net.ipv4.udp_mem" "$UDP_MEM_CONF" "系统 UDP 内存页全局限制"
+
+    # 4. 连接与队列上限
+    add_conf "net.core.somaxconn" "$SOMAXCONN" "最大监听队列"
+    add_conf "net.core.netdev_max_backlog" "$SOMAXCONN" "网卡积压队列"
+    add_conf "net.ipv4.tcp_max_syn_backlog" "$SOMAXCONN" "SYN 半连接队列"
+    add_conf "net.ipv4.tcp_notsent_lowat" "16384" "降低缓冲区未发送数据阈值"
+
+    # 5. TIME_WAIT 与 端口复用
+    add_conf "net.ipv4.tcp_tw_reuse" "1" "开启 TIME_WAIT 复用"
+    add_conf "net.ipv4.tcp_timestamps" "1" "开启时间戳"
+    add_conf "net.ipv4.tcp_fin_timeout" "30" "缩短 FIN_WAIT 时间"
+    add_conf "net.ipv4.ip_local_port_range" "10000 65535" "扩大本地端口范围"
+    add_conf "net.ipv4.tcp_max_tw_buckets" "500000" "允许更多 TIME_WAIT socket"
+
+    # 6. TCP Keepalive
+    add_conf "net.ipv4.tcp_keepalive_time" "600" "TCP 保活时间"
+    add_conf "net.ipv4.tcp_keepalive_intvl" "15" "探测间隔"
+    add_conf "net.ipv4.tcp_keepalive_probes" "3" "探测次数"
+
+    # 7. 连接跟踪 (Conntrack)
+    if lsmod | grep -q "nf_conntrack" || [ -d /proc/sys/net/netfilter ]; then
+        add_conf "net.netfilter.nf_conntrack_max" "$CONNTRACK_MAX" "最大连接跟踪数"
+        add_conf "net.netfilter.nf_conntrack_tcp_timeout_established" "7200" "连接跟踪超时"
+        add_conf "net.netfilter.nf_conntrack_tcp_timeout_time_wait" "120" "减少 TIME_WAIT 跟踪时间"
+    fi
+
+    # 8. 其他安全与链路调优
+    add_conf "fs.file-max" "$FILE_MAX" "最大文件句柄"
+    add_conf "vm.swappiness" "10" "减少 Swap 使用"
+    add_conf "net.ipv4.tcp_mtu_probing" "1" "开启 MTU 探测"
+    add_conf "net.ipv4.tcp_syncookies" "1" "防 SYN Flood"
+    add_conf "net.ipv4.tcp_ecn" "1" "开启 ECN"
+
+    echo -e "${CYAN}>>> 正在将参数注入内核控制流...${NC}"
+    
+    # 针对不同发行版采用兼容的 sysctl 生效命令
+    sysctl --system >/dev/null 2>&1 || sysctl -p "$CONF_FILE" >/dev/null 2>&1 || true
+
+    # 针对 Alpine Linux 的持久化补充
+    handle_alpine_special
+
+    # 最终复核
+    if sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then
+        echo -e "${GREEN}✅ 高级网络优化配置应用成功！BBR 已成功加速。${NC}\n"
+    else
+        echo -e "${RED}❌ 警告: 配置已写入，但检测到内核当前仍未成功切换至 BBR。${NC}"
+        echo -e "${YELLOW}💡 提示: 如果是 Alpine，可能由于缺少内核模块包。可尝试运行 'apk add linux-lts' 升级或重启。${NC}\n"
+    fi
+    
+    echo -ne "${GREEN}"
+    read -r -p "按回车键返回主菜单..." _
+    echo -ne "${NC}"
 }
 
-check_deps() {
-    local deps=(curl ip ping sysctl awk grep sed)
-    for cmd in "${deps[@]}"; do install_pkg "$cmd"; done
+# --- 功能 2：卸载优化恢复默认 ---
+uninstall_optimizations() {
+    echo -e "\n${YELLOW}>>> 正在准备卸载优化配置...${NC}"
+    if [ -f "$CONF_FILE" ]; then
+        rm -f "$CONF_FILE"
+        echo -e "${GREEN}✅ 已删除优化配置文件: ${CONF_FILE}${NC}"
+        echo -e "${CYAN}>>> 重新校准并加载系统默认网络参数...${NC}"
+        sysctl --system >/dev/null 2>&1 || true
+        echo -e "${GREEN}✅ 卸载完成，系统控制流已恢复至全局默认状态。${NC}\n"
+    else
+        echo -e "${YELLOW}💡 提示: 未检测到生成的配置文件，无需卸载。${NC}\n"
+    fi
+    
+    echo -ne "${GREEN}"
+    read -r -p "按回车键返回主菜单..." _
+    echo -ne "${NC}"
 }
 
-detect_iface() {
-    ip -o link show | awk -F': ' '{print $2}' | grep -vE 'lo|docker|veth|br-' | head -n1
-}
-
-get_public_ip() {
-    local mode="$1"
-    local ip_res=""
-    local apis=("https://api.ip.sb/ip" "https://icanhazip.com" "https://v4.ident.me")
-    [ "$mode" = "-6" ] && apis=("https://api-ipv6.ip.sb/ip" "https://ipv6.icanhazip.com" "https://v6.ident.me")
-
-    for url in "${apis[@]}"; do
-        ip_res=$(curl "$mode" -sL -A "Mozilla/5.0" --connect-timeout 3 "$url" 2>/dev/null | tr -d '\r\n[:space:]')
-        if [ -n "$ip_res" ] && [[ ! "$ip_res" == *"<"* && ! "$ip_res" == *"html"* ]]; then
-            echo "$ip_res"
-            return 0
-        fi
+# --- 交互菜单 ---
+menu() {
+    while true; do
+        clear
+        get_status_text
+        
+        echo -e "${GREEN}====================================${NC}"
+        echo -e "${GREEN}      BBR+TCP智能调参综合优化        ${NC}"
+        echo -e "${GREEN}====================================${NC}"
+        echo -e "${GREEN}  BBR  : ${BBR_STATUS}"
+        echo -e "${GREEN}  FQ   : ${FQ_STATUS}"
+        echo -e "${GREEN}  配置 : ${CONF_STATUS}"
+        echo -e "${GREEN}====================================${NC}"
+        echo -e "${GREEN}  1. 网络优化${NC}"
+        echo -e "${GREEN}  2. 卸载优化${NC}"
+        echo -e "${GREEN}  0. 退出${NC}"
+        echo -e "${GREEN}====================================${NC}"
+        
+        echo -ne "${GREEN} 请输入选项: ${NC}"
+        read -r choice
+        
+        case "$choice" in
+            1)
+                apply_optimizations
+                ;;
+            2)
+                uninstall_optimizations
+                ;;
+            0)
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}❌ 输入错误${NC}"
+                sleep 1
+                ;;
+        esac
     done
-    echo "未获取到公网IP"
-    return 1
 }
 
-get_menu_status() {
-    local iface="$1"
-    local v4_addr=$(ip -4 addr show dev "$iface" 2>/dev/null | grep "inet" | awk '{print $2}' | head -n1)
-    V4_STATUS=$( [ -z "$v4_addr" ] && echo -e "${RED}未启用${RESET}" || echo -e "${GREEN}已启用${RESET}" )
-
-    local is_all_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
-    local is_iface_disabled=$(sysctl -n net.ipv6.conf.${iface}.disable_ipv6 2>/dev/null)
-    
-    if [ "$is_all_disabled" = "1" ] && [ "$is_iface_disabled" = "1" ]; then
-        V6_STATUS="${RED}已禁用${RESET}"
-    elif [ "$is_all_disabled" = "1" ] && [ "$is_iface_disabled" = "0" ]; then
-        V6_STATUS="${YELLOW}已禁用(网卡冲突/残留)${RESET}"
-    else
-        local v6_addr=$(ip -6 addr show dev "$iface" 2>/dev/null | grep "inet6" | grep -v "fe80" | awk '{print $2}' | head -n1)
-        V6_STATUS=$( [ -z "$v6_addr" ] && echo -e "${YELLOW}已开启(无公网IP)${RESET}" || echo -e "${GREEN}已启用${RESET}" )
-    fi
+# --- 主入口 ---
+main() {
+    check_root
+    check_bbr_support
+    menu
 }
 
-# 🛠️ 治本核心：修复 Ubuntu Netplan 配置文件
-fix_ubuntu_netplan() {
-    local iface="$1"
-    local action="$2" # "disable" 或 "enable"
-    
-    # 寻找主要的 netplan yaml 文件
-    local plan_file=$(ls /etc/netplan/*.yaml 2>/dev/null | head -n1)
-    [ -z "$plan_file" ] && return
-    
-    if [ "$action" = "disable" ]; then
-        # 治本：关闭 dhcp6，并显式禁用 accept-ra（接受路由通告）
-        if grep -q "$iface:" "$plan_file"; then
-            # 备份原配置
-            cp "$plan_file" "${plan_file}.bak"
-            
-            # 使用 sed 优雅地在网卡配置下插入或修改 dhcp6 和 accept-ra
-            # 寻找网卡所在行，并在其下方安全处理
-            sed -i "/$iface:/,/^[[:space:]]*[a-zA-Z0-9_-]\+:/ {
-                s/[[:space:]]*dhcp6:.*/      dhcp6: false/
-                s/[[:space:]]*accept-ra:.*/      accept-ra: false/
-            }" "$plan_file"
-            
-            # 如果原本没有 dhcp6 行，则手动补齐
-            if ! grep -A 5 "$iface:" "$plan_file" | grep -q "dhcp6:"; then
-                sed -i "/$iface:/a \            dhcp6: false" "$plan_file"
-            fi
-        fi
-    else
-        # 恢复：恢复 dhcp6 允许
-        if [ -f "${plan_file}.bak" ]; then
-            mv "${plan_file}.bak" "$plan_file"
-        else
-            sed -i "/$iface:/,/^[[:space:]]*[a-zA-Z0-9_-]\+:/ {
-                s/[[:space:]]*dhcp6:.*/      dhcp6: true/
-            }" "$plan_file"
-        fi
-    fi
-}
-
-check_deps
-os_type=$(get_os_type)
-
-while true; do
-    clear
-    iface=$(detect_iface)
-    [ -z "$iface" ] && iface="未检测到网卡"
-    get_menu_status "$iface"
-
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}     ◈  IPv4 / IPv6 管理面板  ◈       ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN} 当前系统  : ${YELLOW}${os_type}${RESET}"
-    echo -e "${GREEN} 活跃网卡  : ${YELLOW}${iface}${RESET}"
-    echo -e "${GREEN} IPv4 状态 : ${V4_STATUS}"
-    echo -e "${GREEN} IPv6 状态 : ${V6_STATUS}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}  1) 禁用 IPv6 ${RESET}"
-    echo -e "${GREEN}  2) 开启 IPv6 ${RESET}"
-    echo -e "${GREEN}  3) 查看网卡IP${RESET}"
-    echo -e "${GREEN}  0) 退出${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    
-    echo -ne "${GREEN} 请选择操作编号: ${RESET}"
-    read choice
-
-    case "$choice" in
-        1)
-            # 1. 立即通过内核断开当前和全局的 IPv6
-            sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1
-            sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1
-            sysctl -w net.ipv6.conf.${iface}.disable_ipv6=1 >/dev/null 2>&1
-            
-            echo -e "${YELLOW}------ 💾 持久化配置选项 ------${RESET}"
-            echo -e "${GREEN}  1) 仅临时禁用（重启服务器后恢复 IPv6）${RESET}"
-            echo -e "${GREEN}  2) 永久禁用${RESET}"
-            echo -ne "${YELLOW} 请选择禁用模式 [默认 1]: ${RESET}"
-            read perm_choice
-            
-            if [ "$perm_choice" = "2" ]; then
-                # 写入 sysctl 配置文件
-                if [ -f /etc/sysctl.conf ]; then
-                    sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
-                    echo "net.ipv6.conf.all.disable_ipv6 = 1" >> /etc/sysctl.conf
-                    echo "net.ipv6.conf.default.disable_ipv6 = 1" >> /etc/sysctl.conf
-                    echo "net.ipv6.conf.${iface}.disable_ipv6 = 1" >> /etc/sysctl.conf
-                fi
-                
-                # 【治本核心】针对 Ubuntu 处理 Netplan
-                if [ "$os_type" = "ubuntu" ] && has_cmd netplan; then
-                    echo -e "${YELLOW}⏳ 检测到 Ubuntu 系统，正在重构 Netplan 配置文件防反弹...${RESET}"
-                    fix_ubuntu_netplan "$iface" "disable"
-                    netplan apply >/dev/null 2>&1
-                    # 再次强刷内核，防止 netplan apply 期间把网卡弹回 0
-                    sysctl -w net.ipv6.conf.${iface}.disable_ipv6=1 >/dev/null 2>&1
-                fi
-                echo -e "\n${GREEN}✅ 已成功【永久锁定】禁用 IPv6，Netplan 刷新或重启绝不失效！${RESET}"
-            else
-                if [ -f /etc/sysctl.conf ]; then
-                    sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
-                fi
-                echo -e "\n${GREEN}✅ 已成功【临时禁用】IPv6（重启服务器后将自动恢复）。${RESET}"
-            fi
-            read -rp "按回车键返回菜单..."
-            ;;
-        2)
-            # 1. 恢复内核参数
-            sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
-            sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
-            sysctl -w net.ipv6.conf.${iface}.disable_ipv6=0 >/dev/null 2>&1
-            
-            if [ -f /etc/sysctl.conf ]; then
-                sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
-            fi
-            
-            # 2. 联动恢复 Netplan
-            if [ "$os_type" = "ubuntu" ]; then
-                if has_cmd netplan; then
-                    echo -e "${YELLOW}⏳ 检测到 Ubuntu 系统，正在通过 Netplan 恢复网络...${RESET}"
-                    fix_ubuntu_netplan "$iface" "enable"
-                    netplan apply >/dev/null 2>&1
-                    sleep 2
-                fi
-                echo -e "${GREEN}✅ 内核 IPv6 模块已平滑激活。${RESET}"
-                echo -e "${YELLOW}提示：Ubuntu 系统无需重启。如果仍未获取到 IPv6，请尝试断开重连或重启。${RESET}"
-                read -rp "按回车键返回菜单..."
-            else
-                echo -e "${GREEN}✅ 内核 IPv6 模块已激活。${RESET}"
-                echo -e "${YELLOW}当前系统为 [${os_type}]，通常需要重启系统才能正确获取公网 IPv6 地址。${RESET}"
-                read -rp "按回车键 [立即重启] 系统，或按 Ctrl+C 取消..."
-                reboot
-            fi
-            ;;
-        3)
-            echo -e "${GREEN}🌐 [1/3] 内核 IPv6 状态：${RESET}"
-            is_all_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
-            is_iface_disabled=$(sysctl -n net.ipv6.conf.${iface}.disable_ipv6 2>/dev/null)
-            
-            if [ "$is_all_disabled" = "1" ] && [ "$is_iface_disabled" = "1" ]; then
-                echo -e "${RED}❌ 内核与活跃网卡已完全禁用 IPv6${RESET}"
-            elif [ "$is_all_disabled" = "1" ] && [ "$is_iface_disabled" = "0" ]; then
-                echo -e "${YELLOW}⚠️  警告：内核全局已禁，但活跃网卡 [${iface}] 被 Netplan 强行拉起！${RESET}"
-            else
-                echo -e "${GREEN}✅ 内核及网卡已正常启用 IPv6${RESET}"
-            fi
-
-            echo -e "\n${GREEN}📌 [2/3] 本地网卡 IP 地址分配情况：${RESET}"
-            echo -ne "${YELLOW}  IPv4 地址: ${RESET}"
-            ip -4 addr show dev "$iface" 2>/dev/null | grep "inet" | awk '{print $2}' || echo "${RED}未检测到 IPv4${RESET}"
-            echo -ne "${YELLOW}  IPv6 地址: ${RESET}"
-            # 排除由于禁用残留但未释放的 fe80 链路本地地址，让显示更直观
-            ip -6 addr show dev "$iface" 2>/dev/null | grep "inet6" | awk '{print $2}' || echo "${RED}未检测到 IPv6${RESET}"
-
-            echo -e "\n${GREEN}🔎 [3/3] 公网双栈连通性及公网 IP 测试：${RESET}"
-            if has_cmd ping; then
-                ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 && echo -e "${GREEN}✅ IPv4 路由连通正常${RESET}" || echo -e "${RED}❌ IPv4 路由无法访问公网${RESET}"
-            fi
-            echo -n "    └─ 本机公网 IPv4: "
-            get_public_ip "-4"
-
-            has_v6=false
-            if has_cmd ping6; then ping6 -c 2 -W 3 240c::6666 >/dev/null 2>&1 && has_v6=true
-            elif has_cmd ping; then ping -6 -c 2 -W 3 240c::6666 >/dev/null 2>&1 && has_v6=true; fi
-
-            if [ "$has_v6" = "true" ] && [ "$is_iface_disabled" = "0" ]; then
-                echo -e "${GREEN}✅ IPv6 路由连通正常${RESET}"
-                echo -n "    └─ 本机公网 IPv6: "
-                get_public_ip "-6"
-            else
-                echo -e "${RED}❌ IPv6 无法访问外部网络 (内核已死锁或网络环境不支持)${RESET}"
-            fi
-            echo
-            read -rp "按回车键返回菜单..."
-            ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}❌ 输入错误，无此选项${RESET}"; sleep 1 ;;
-    esac
-done
+main "$@"

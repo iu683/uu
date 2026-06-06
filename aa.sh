@@ -1,183 +1,76 @@
 #!/bin/bash
-# ========================================
-# OmePic 一键管理脚本
-# ========================================
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-RESET="\033[0m"
+# 自动清理远程重复公钥 + 写入公钥 + 权限修复 + SSH 登录提示
 
-APP_NAME="omepic"
-APP_DIR="/opt/$APP_NAME"
-REPO_URL="https://github.com/OuOumm/OmePic.git"
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
-generate_secret() {
-    openssl rand -hex 32
-}
+# 读取用户输入
+read -p "$(echo -e ${GREEN}请输入远程用户名:${NC} ) " username
+read -p "$(echo -e ${GREEN}请输入远程服务器IP:${NC} ) " ip_address
+read -p "$(echo -e ${GREEN}请输入SSH端口（默认22）:${NC} ) " port
+port=${port:-22}
 
-generate_aes_key() {
-    openssl rand -hex 16
-}
-
-check_docker() {
-
-    if ! command -v docker >/dev/null 2>&1; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-
-    if ! docker compose version >/dev/null 2>&1; then
-        echo -e "${RED}未检测到 Docker Compose v2${RESET}"
+# 检查并生成本地公钥
+LOCAL_KEY="$HOME/.ssh/id_rsa.pub"
+if [ ! -f "$LOCAL_KEY" ]; then
+    echo -e "${YELLOW}未检测到本地公钥，正在生成新的 SSH 密钥对...${NC}"
+    mkdir -p ~/.ssh
+    ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa -N "" -q
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 密钥生成失败，请检查 ssh-keygen 是否可用${NC}"
         exit 1
     fi
-}
+    echo -e "${GREEN}✅ SSH 密钥生成完成: $LOCAL_KEY${NC}"
+else
+    echo -e "${GREEN}✅ 已检测到本地公钥: $LOCAL_KEY${NC}"
+fi
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
-}
+PUBKEY_CONTENT=$(cat "$LOCAL_KEY")
 
-menu() {
+echo -e "${YELLOW}⚠️ 第一次连接需要输入远程密码进行操作${NC}"
 
-    while true; do
+# 一次性远程执行：创建目录 -> 追加入公钥 -> 全局去重 -> 修复权限
+ssh -p $port $username@$ip_address "bash -s" <<EOF
+    # 创建并保护 .ssh 目录
+    mkdir -p ~/.ssh
+    chmod 700 ~/.ssh
+    touch ~/.ssh/authorized_keys
+    
+    # 备份原始文件
+    cp ~/.ssh/authorized_keys ~/.ssh/authorized_keys.bak
 
-        clear
-
-        echo -e "${GREEN}=== OmePic 管理菜单 ===${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
-        esac
-    done
-}
-
-install_app() {
-
-    check_docker
-
-    if [ -d "$APP_DIR" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-        rm -rf "$APP_DIR"
+    # 先将新公钥追加到备份文件中（如果不存在的话）
+    if ! grep -Fxq "$PUBKEY_CONTENT" ~/.ssh/authorized_keys.bak; then
+        echo "$PUBKEY_CONTENT" >> ~/.ssh/authorized_keys.bak
     fi
 
-    echo
+    # 利用 awk 对包含新公钥的文件进行全局去重，并写回正式文件
+    awk '!seen[\$0]++' ~/.ssh/authorized_keys.bak > ~/.ssh/authorized_keys
+    rm -f ~/.ssh/authorized_keys.bak
 
-    read -p "请输入端口 [默认8080]: " input_port
-    APP_PORT=${input_port:-8080}
-
-    read -p "请输入管理员密码: " ADMIN_PASSWORD
-    read -p "请输入公网域名(如 https://img.xxx.com): " PUBLIC_BASE_URL
-
-    JWT_SECRET=$(generate_secret)
-    UID_ENCRYPTION_KEY=$(generate_secret)
-    SECRET_ENCRYPTION_KEY=$(generate_aes_key)
-
-    cd /opt || exit
-
-    git clone "$REPO_URL" "$APP_NAME"
-
-    cd "$APP_DIR" || exit
-
-    cat > .env <<EOF
-ADMIN_PASSWORD=${ADMIN_PASSWORD}
-JWT_SECRET=${JWT_SECRET}
-UID_ENCRYPTION_KEY=${UID_ENCRYPTION_KEY}
-SECRET_ENCRYPTION_KEY=${SECRET_ENCRYPTION_KEY}
-
-HTTP_ADDR=:8080
-DATABASE_PATH=data/omepic.db
-REDIS_URL=redis://redis:6379/0
-PUBLIC_BASE_URL=${PUBLIC_BASE_URL}
-UID_PREFIX=omeo_
-APP_ENV=production
+    # 严格修复权限
+    chmod 600 ~/.ssh/authorized_keys
+    chown \$(whoami):\$(id -gn) ~/.ssh ~/.ssh/authorized_keys
+    
+    echo "远程配置完成。"
 EOF
-    docker compose up -d 
 
-    echo
-    echo -e "${GREEN}✅ OmePic 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://${SERVER_IP}:${APP_PORT}/admin${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://${PUBLIC_BASE_URL}/admin${RESET}"
-    echo -e "${YELLOW}🔑 密码: ${ADMIN_PASSWORD}${RESET}"
-    echo -e "${YELLOW}🔑 JWT_SECRET: ${JWT_SECRET}${RESET}"
-    echo -e "${YELLOW}📂 安装目录: ${APP_DIR}${RESET}"
+if [ $? -ne 0 ]; then
+    echo -e "${RED}❌ 远程操作失败，请检查网络连接、密码或端口是否正确。${NC}"
+    exit 1
+fi
 
-    read -p "按回车返回菜单..."
-}
+---
 
-update_app() {
+# 显示远程 authorized_keys 供确认（此时应该已经是免密读取了）
+echo -e "\n${YELLOW}📂 远程服务器上的 authorized_keys 现状:${NC}"
+ssh -p $port $username@$ip_address "cat ~/.ssh/authorized_keys"
 
-    cd "$APP_DIR" || return
-
-    git pull
-    docker compose up -d 
-
-    echo -e "${GREEN}✅ 更新完成${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-restart_app() {
-
-    cd "$APP_DIR" || return
-    docker compose restart
-
-    echo -e "${GREEN}✅ 已重启${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-
-    cd "$APP_DIR" || return
-    docker compose logs -f
-}
-
-check_status() {
-
-    cd "$APP_DIR" || return
-    docker compose ps
-
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-
-    echo -e "${RED}✅ 已彻底卸载${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-menu
+# 最后提示 SSH 登录命令
+echo -e "\n${GREEN}✅ 操作完成！公钥已成功写入并去重。${NC}"
+echo -e "${YELLOW}➡️ 你现在可以使用以下命令免密登录远程服务器:${NC}"
+echo -e "${GREEN}ssh -p $port $username@$ip_address${NC}"

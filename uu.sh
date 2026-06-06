@@ -1,208 +1,210 @@
 #!/bin/bash
-# =========================================================================
-# IPv4 / IPv6 管理面板
-# =========================================================================
+# =========================================================
+# 系统清理工具（全面适配 Alpine / Ubuntu / Debian / CentOS）
+# =========================================================
 
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
+
+# =========================================================
+# root 检测
+# =========================================================
 if [ "$EUID" -ne 0 ]; then
-    echo -e "\033[31m❌ 错误：请使用 root 权限运行此脚本！\033[0m"
+    echo -e "${RED}错误: 请使用 root 权限运行此脚本${RESET}"
     exit 1
 fi
 
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
-
-has_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-get_os_type() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        echo "$ID"
-    else
-        echo "unknown"
-    fi
-}
-
-install_pkg() {
-    local pkg="$1"
-    local os=$(get_os_type)
-    if has_cmd "$pkg"; then return; fi
-    
-    echo -e "${YELLOW}🔧 正在补全系统依赖: $pkg ...${RESET}"
-    case "$os" in
-        ubuntu|debian)
-            apt-get update -y >/dev/null 2>&1
-            apt-get install -y "$pkg" >/dev/null 2>&1
-            ;;
-        alpine)
-            apk add --no-cache "$pkg" >/dev/null 2>&1
-            ;;
-        centos|rhel|rocky|almalinux)
-            yum install -y "$pkg" >/dev/null 2>&1 || dnf install -y "$pkg" >/dev/null 2>&1
-            ;;
-    esac
-}
-
-check_deps() {
-    local deps=(curl ip ping sysctl awk grep)
-    for cmd in "${deps[@]}"; do install_pkg "$cmd"; done
-}
-
-detect_iface() {
-    ip -o link show | awk -F': ' '{print $2}' | grep -vE 'lo|docker|veth|br-' | head -n1
-}
-
-get_public_ip() {
-    local mode="$1"
-    local ip_res=""
-    local apis=("https://api.ip.sb/ip" "https://icanhazip.com" "https://v4.ident.me")
-    [ "$mode" = "-6" ] && apis=("https://api-ipv6.ip.sb/ip" "https://ipv6.icanhazip.com" "https://v6.ident.me")
-
-    for url in "${apis[@]}"; do
-        ip_res=$(curl "$mode" -sL -A "Mozilla/5.0" --connect-timeout 3 "$url" 2>/dev/null | tr -d '\r\n[:space:]')
-        if [ -n "$ip_res" ] && [[ ! "$ip_res" == *"<"* && ! "$ip_res" == *"html"* ]]; then
-            echo "$ip_res"
-            return 0
+# =========================================================
+# 健壮性容器检测 (兼容 Alpine / 传统系统)
+# =========================================================
+check_container() {
+    IS_CONTAINER=0
+    if [ -f /.dockerenv ] || [ -f /run/.containerenv ]; then
+        IS_CONTAINER=1
+    elif [ -f /proc/1/cgroup ] && grep -qaE '(docker|lxc|kubepods)' /proc/1/cgroup; then
+        IS_CONTAINER=1
+    elif command -v systemd-detect-virt >/dev/null 2>&1; then
+        if systemd-detect-virt --quiet; then
+            IS_CONTAINER=1
         fi
-    done
-    echo "未获取到公网IP"
-    return 1
-}
-
-get_menu_status() {
-    local iface="$1"
-    local v4_addr=$(ip -4 addr show dev "$iface" 2>/dev/null | grep "inet" | awk '{print $2}' | head -n1)
-    V4_STATUS=$( [ -z "$v4_addr" ] && echo -e "${RED}未启用${RESET}" || echo -e "${GREEN}已启用${RESET}" )
-
-    local is_v6_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
-    if [ "$is_v6_disabled" = "1" ]; then
-        V6_STATUS="${RED}已禁用${RESET}"
-    else
-        local v6_addr=$(ip -6 addr show dev "$iface" 2>/dev/null | grep "inet6" | grep -v "fe80" | awk '{print $2}' | head -n1)
-        V6_STATUS=$( [ -z "$v6_addr" ] && echo -e "${YELLOW}已开启(无公网IP)${RESET}" || echo -e "${GREEN}已启用${RESET}" )
     fi
 }
 
-check_deps
-os_type=$(get_os_type)
+# =========================================================
+# 动态获取当前系统状态
+# =========================================================
+get_system_status() {
 
-while true; do
-    clear
-    iface=$(detect_iface)
-    [ -z "$iface" ] && iface="未检测到网卡"
-    get_menu_status "$iface"
+    # 2. 检测包管理器
+    if command -v apk >/dev/null 2>&1; then
+        PM_STATUS="APK (Alpine)"
+    elif command -v apt >/dev/null 2>&1; then
+        PM_STATUS="APT (Debian/Ubuntu)"
+    elif command -v dnf >/dev/null 2>&1; then
+        PM_STATUS="DNF (RHEL/Fedora)"
+    elif command -v yum >/dev/null 2>&1; then
+        PM_STATUS="YUM (CentOS)"
+    else
+        PM_STATUS="${RED}未知/不支持${RESET}"
+    fi
 
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}      ◈  IPv4 / IPv6 管理面板  ◈      ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN} 当前系统  : ${YELLOW}${os_type}${RESET}"
-    echo -e "${GREEN} 活跃网卡  : ${YELLOW}${iface}${RESET}"
-    echo -e "${GREEN} IPv4 状态 : ${V4_STATUS}"
-    echo -e "${GREEN} IPv6 状态 : ${V6_STATUS}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}  1) 禁用 IPv6 (支持临时/永久)${RESET}"
-    echo -e "${GREEN}  2) 开启 IPv6 ${RESET}"
-    echo -e "${GREEN}  3) 查看IP状态&公网连通性测试${RESET}"
-    echo -e "${GREEN}  0) 退出${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
+    # 3. 获取根分区磁盘占用情况 (兼容 BusyBox df)
+    local use_percent=$(df -h / | awk 'NR==2 {print $5}' | sed 's/%//')
+    # 备用兼容方案：如果有些系统输出在第3行
+    [ -z "$use_percent" ] && use_percent=$(df -h / | awk 'END{print $5}' | sed 's/%//')
     
-    echo -ne "${GREEN} 请选择操作编号: ${RESET}"
-    read choice
+    if [ -z "$use_percent" ]; then
+        DISK_STATUS="获取失败"
+    elif [ "$use_percent" -lt 60 ]; then
+        DISK_STATUS="${GREEN}${use_percent}%已用${RESET}"
+    elif [ "$use_percent" -lt 80 ]; then
+        DISK_STATUS="${YELLOW}${use_percent}%已用 (建议清理)${RESET}"
+    else
+        DISK_STATUS="${RED}${use_percent}%已用 (极度紧张!)${RESET}"
+    fi
+}
 
-    case "$choice" in
-        1)
-            sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1
-            sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1
-            sysctl -w net.ipv6.conf.${iface}.disable_ipv6=1 >/dev/null 2>&1
-            
-            echo -e "${YELLOW}------ 💾 持久化配置选项 ------${RESET}"
-            echo -e "${GREEN}  1) 仅临时禁用（重启服务器后恢复 IPv6）${RESET}"
-            echo -e "${GREEN}  2) 永久禁用（锁入系统文件，重启不失效）${RESET}"
-            echo -ne "${YELLOW} 请选择禁用模式 [默认 1]: ${RESET}"
-            read perm_choice
-            
-            if [ "$perm_choice" = "2" ]; then
-                if [ -f /etc/sysctl.conf ]; then
-                    sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
-                    echo "net.ipv6.conf.all.disable_ipv6 = 1" >> /etc/sysctl.conf
-                    echo "net.ipv6.conf.default.disable_ipv6 = 1" >> /etc/sysctl.conf
-                    echo "net.ipv6.conf.${iface}.disable_ipv6 = 1" >> /etc/sysctl.conf
+# =========================================================
+# 等待包管理器锁 (防止脚本冲突)
+# =========================================================
+wait_for_lock() {
+    local cmd=$1
+    local lock_file=$2
+    if command -v fuser >/dev/null 2>&1; then
+        while fuser "$lock_file" >/dev/null 2>&1; do
+            echo -e "${YELLOW}等待其他 $cmd 进程释放锁...${RESET}"
+            sleep 2
+        done
+    fi
+}
+
+# =========================================================
+# 执行系统垃圾清理
+# =========================================================
+clean_system() {
+    echo -e "${YELLOW}正在开始系统垃圾清理...${RESET}"
+    export DEBIAN_FRONTEND=noninteractive
+
+    if command -v apk >/dev/null 2>&1; then
+        echo -e "${GREEN}[1/2] 正在清理 APK 缓存...${RESET}"
+        apk cache clean
+        rm -rf /var/cache/apk/*
+    elif command -v apt >/dev/null 2>&1; then
+        echo -e "${GREEN}[1/2] 正在清理 APT 缓存与孤立包...${RESET}"
+        wait_for_lock "APT" /var/lib/dpkg/lock-frontend
+        apt update -y
+        wait_for_lock "APT" /var/lib/dpkg/lock-frontend
+        apt autoremove --purge -y
+        apt clean
+        apt autoclean
+        dpkg -l | awk '/^rc/ {print $2}' | xargs -r apt purge -y
+        if [ "$IS_CONTAINER" -eq 0 ]; then
+            CURRENT_KERNEL=$(uname -r)
+            dpkg --list | awk '/linux-image-[0-9]/ {print $2}' | grep -v "$CURRENT_KERNEL" | xargs -r apt purge -y
+        fi
+    elif command -v dnf >/dev/null 2>&1; then
+        echo -e "${GREEN}[1/2] 正在清理 DNF 垃圾...${RESET}"
+        wait_for_lock "DNF" /var/run/dnf.pid
+        dnf autoremove -y
+        dnf clean all
+        if [ "$IS_CONTAINER" -eq 0 ]; then
+            dnf remove $(dnf repoquery --installonly --latest-limit=-2 -q) -y 2>/dev/null || true
+        fi
+    elif command -v yum >/dev/null 2>&1; then
+        echo -e "${GREEN}[1/2] 正在清理 YUM 垃圾...${RESET}"
+        wait_for_lock "YUM" /var/run/yum.pid
+        yum autoremove -y
+        yum clean all
+        if [ "$IS_CONTAINER" -eq 0 ] && command -v package-cleanup >/dev/null 2>&1; then
+            package-cleanup --oldkernels --count=2 -y
+        fi
+    fi
+
+    # 清理日志
+    echo -e "${GREEN}[2/2] 正在清理系统日志...${RESET}"
+    if command -v journalctl >/dev/null 2>&1; then
+        journalctl --vacuum-time=7d
+    else
+        # 兼容 Alpine 等无 journalctl 的系统
+        find /var/log -type f -name "*.log" -exec truncate -s 0 {} \;
+        echo -e "${YELLOW}提示: 当前系统未使用 systemd-journald，已对 /var/log/*.log 进行截断清空${RESET}"
+    fi
+
+    echo -e "${GREEN}系统垃圾清理完成！${RESET}"
+}
+
+# =========================================================
+# 执行 Docker 垃圾清理
+# =========================================================
+clean_docker() {
+    if command -v docker >/dev/null 2>&1; then
+        echo -e "${YELLOW}正在清理 Docker 未使用的镜像、容器与卷...${RESET}"
+        docker system prune -af --volumes
+        echo -e "${GREEN}Docker 数据清理完成！${RESET}"
+    else
+        echo -e "${YELLOW}未检测到 Docker 环境，跳过清理${RESET}"
+    fi
+}
+
+# =========================================================
+# 主视觉面板菜单
+# =========================================================
+system_clean_menu() {
+    while true; do
+        # 每次循环动态读取系统状态
+        get_system_status
+
+        clear
+        echo -e "${GREEN}=======================================${RESET}"
+        echo -e "${GREEN}     ◈    Linux 系统清理面板    ◈     ${RESET}"
+        echo -e "${GREEN}=======================================${RESET}"
+        echo -e "${GREEN} 包管理器   : ${YELLOW}${PM_STATUS}${RESET}"
+        echo -e "${GREEN} 磁盘状态   : ${YELLOW}${DISK_STATUS}${RESET}"
+        echo -e "${GREEN}=======================================${RESET}"
+        echo -e "${GREEN}  1. 清理系统垃圾 (缓存/日志/旧包)${RESET}"
+        echo -e "${GREEN}  2. 全面清理 (系统垃圾 + Docker)${RESET}"
+        echo -e "${GREEN}  3. 安装运行定时自动清理任务${RESET}"
+        echo -e "${GREEN}  0. 退出${RESET}"
+        echo -e "${GREEN}=======================================${RESET}"
+        echo -ne "${GREEN} 请选择操作: ${RESET}"
+        
+        read -r choice
+
+        case $choice in
+            1)
+                clean_system
+                ;;
+            2)
+                clean_system
+                clean_docker
+                ;;
+            3)
+                # 使用 --connect-timeout 限制直连等待时间为 5 秒
+                if bash <(curl -fsSL --connect-timeout 5 https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/clean-server.sh) 2>/dev/null; then
+                    echo
+                else
+                    echo -e "${YELLOW}直连超时或失败，正在通过代理获取...${RESET}"
+                    bash <(curl -fsSL https://v6.gh-proxy.org/https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/clean-server.sh) || {
+                        echo -e "${RED}错误: 通过代理获取脚本也失败了，请检查网络连接。${RESET}"
+                    }
                 fi
-                if [ "$os_type" = "ubuntu" ] && has_cmd netplan; then
-                    netplan apply >/dev/null 2>&1
-                fi
-                echo -e "\n${GREEN}✅ 已成功【永久禁用】IPv6，重启不会失效！${RESET}"
-            else
-                if [ -f /etc/sysctl.conf ]; then
-                    sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
-                fi
-                echo -e "\n${GREEN}✅ 已成功【临时禁用】IPv6（重启服务器后将自动恢复）。${RESET}"
-            fi
-            read -rp "按回车键返回菜单..."
-            ;;
-        2)
-            # 1. 恢复内核参数
-            sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
-            sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
-            sysctl -w net.ipv6.conf.${iface}.disable_ipv6=0 >/dev/null 2>&1
-            
-            if [ -f /etc/sysctl.conf ]; then
-                sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
-            fi
-            
-            # 2. 核心分支判断：根据不同系统执行不同生效策略
-            if [ "$os_type" = "ubuntu" ]; then
-                if has_cmd netplan; then
-                    echo -e "${YELLOW}⏳ 检测到 Ubuntu 系统，正在通过 Netplan 安全刷新网络...${RESET}"
-                    netplan apply >/dev/null 2>&1
-                    sleep 2
-                fi
-                echo -e "${GREEN}✅ 内核 IPv6 模块已平滑激活。${RESET}"
-                echo -e "${YELLOW}提示：Ubuntu 系统无需重启。如果仍未获取到 IPv6，请重启系统。${RESET}"
-                read -rp "按回车键返回菜单..."
-            else
-                # 非 Ubuntu 系统（CentOS/Alpine等），执行原版的重启逻辑
-                echo -e "${GREEN}✅ 内核 IPv6 模块已激活。${RESET}"
-                echo -e "${YELLOW}当前系统为 [${os_type}]，通常需要重启系统才能正确获取公网 IPv6 地址。${RESET}"
-                read -rp "按回车键 [立即重启] 系统，或按 Ctrl+C 取消..."
-                reboot
-            fi
-            ;;
-        3)
-            echo -e "${GREEN}🌐 [1/3] 内核 IPv6 状态：${RESET}"
-            is_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
-            [ "$is_disabled" = "1" ] && echo -e "${RED}❌ 内核已禁用 IPv6${RESET}" || echo -e "${GREEN}✅ 内核已启用 IPv6${RESET}"
+                ;;
+            0)
+                break
+                ;;
+            *)
+                echo -e "${RED}无效选择，请重新输入...${RESET}"
+                sleep 1
+                continue
+                ;;
+        esac
 
-            echo -e "\n${GREEN}📌 [2/3] 本地网卡 IP 地址分配情况：${RESET}"
-            # 此处已升级：完美分行、带颜色标记过滤本地双栈 IP 
-            echo -ne "${YELLOW}  IPv4 地址: ${RESET}"
-            ip -4 addr show dev "$iface" 2>/dev/null | grep "inet" | awk '{print $2}' || echo "${RED}未检测到 IPv4${RESET}"
-            echo -ne "${YELLOW}  IPv6 地址: ${RESET}"
-            ip -6 addr show dev "$iface" 2>/dev/null | grep "inet6" | awk '{print $2}' || echo "${RED}未检测到 IPv6${RESET}"
+        echo -ne "\n${GREEN}按回车返回面板...${RESET}"
+        read -r
+    done
+}
 
-            echo -e "\n${GREEN}🔎 [3/3] 公网双栈连通性及公网 IP 测试：${RESET}"
-            if has_cmd ping; then
-                ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 && echo -e "${GREEN}✅ IPv4 路由连通正常${RESET}" || echo -e "${RED}❌ IPv4 路由无法访问公网${RESET}"
-            fi
-            echo -n "   └─ 本机公网 IPv4: "
-            get_public_ip "-4"
-
-            has_v6=false
-            if has_cmd ping6; then ping6 -c 2 -W 3 240c::6666 >/dev/null 2>&1 && has_v6=true
-            elif has_cmd ping; then ping -6 -c 2 -W 3 240c::6666 >/dev/null 2>&1 && has_v6=true; fi
-
-            if [ "$has_v6" = true ]; then
-                echo -e "${GREEN}✅ IPv6 路由连通正常${RESET}"
-                echo -n "   └─ 本机公网 IPv6: "
-                get_public_ip "-6"
-            else
-                echo -e "${RED}❌ IPv6 无法访问外部网络 (或网卡尚未被分配公网IPv6)${RESET}"
-            fi
-            echo
-            read -rp "按回车键返回菜单..."
-            ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}❌ 输入错误，无此选项${RESET}"; sleep 1 ;;
-    esac
-done
+# 启动菜单
+system_clean_menu

@@ -1,123 +1,115 @@
 #!/bin/bash
-# ==========================================
-# Windows ARM/一键重装系统高级脚本
-# ==========================================
 
-green="\033[32m"
-red="\033[31m"
-yellow="\033[33m"
-purple="\033[1;35m"
-re="\033[0m"
+# 颜色定义
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+RESET="\033[0m"
 
-# 定义核心源与代理源
-BASE_URL="https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
-PROXY_URL="https://v6.gh-proxy.org/https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
-FINAL_URL=""
+# 代理前缀
+PROXY="https://v6.gh-proxy.org/"
 
-# 网络检查函数：默认直连，失败自动切换代理
-check_network() {
+# --------------------------
+# 架构检测函数
+# --------------------------
+check_virt() {
     
-    # 1. 尝试直连 (5秒超时)
-    if curl -s --connect-timeout 5 --head "$BASE_URL" | head -n 1 | grep -qE "200|301|302"; then
-        FINAL_URL="$BASE_URL"
-    # 2. 直连失败，尝试代理
+    # 尝试使用 systemd-detect-virt (如果系统支持)
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        VIRT=$(systemd-detect-virt)
     else
-        echo -e "${yellow}直连超时，正在尝试通过代理节点加载...${re}"
-        if curl -s --connect-timeout 5 --head "$PROXY_URL" | head -n 1 | grep -qE "200|301|302"; then
-            FINAL_URL="$PROXY_URL"
+        # 针对 Alpine 等无 systemd 系统，通过常见特征检测
+        if [ -f /proc/user_beancounters ]; then
+            VIRT="openvz"
+        elif grep -q "lxc" /proc/1/environ 2>/dev/null || [ -f /run/container_type ]; then
+            VIRT="lxc"
         else
-            echo -e "${red}错误：直连与代理均无法访问，请检查网络设置。${re}"
+            VIRT="kvm_or_other"
+        fi
+    fi
+
+    if [ "$VIRT" == "lxc" ] || [ "$VIRT" == "openvz" ]; then
+        echo -e "${YELLOW}❌ 警告: 您的系统处于 $VIRT 容器环境下。${RESET}"
+        echo -e "${YELLOW}容器环境无法自主修改内核模块，请联系宿主机提供商在母鸡开启 BBR。${RESET}"
+        exit 1
+    fi
+}
+
+# --------------------------
+# Alpine 开启 BBR 逻辑
+# --------------------------
+enable_bbr_alpine() {
+
+    # 尝试加载模块（静默处理，防止报错）
+    modprobe tcp_bbr 2>/dev/null || true
+    
+    mkdir -p /etc/sysctl.d/
+    cat > /etc/sysctl.d/bbr.conf <<EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+
+    # 尝试使其生效
+    sysctl -p /etc/sysctl.d/bbr.conf 2>/dev/null || true
+
+    if sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then
+        echo "tcp_bbr" >> /etc/modules 2>/dev/null || true
+        echo -e "${YELLOW}================================${RESET}"
+        echo -e "${YELLOW}        BBR+FQ 已成功开启！      ${RESET}"
+        echo -e "${YELLOW}================================${RESET}"
+    else
+        echo -e "${YELLOW}❌ BBR 开启失败。可能原因：内核版本过低或缺少内核模块包。${RESET}"
+        echo -e "${YELLOW}提示: 尝试运行 'apk add linux-lts' 升级内核后重启再试。${RESET}"
+    fi
+}
+
+# --------------------------
+# 主逻辑
+# --------------------------
+
+# 1. 先查架构
+check_virt
+
+# 2. 再查发行版
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS=$ID
+else
+    OS="unknown"
+fi
+
+# 核心下载与执行函数（含自动容灾代理）
+fetch_and_run() {
+    local script_url="$1"
+    local tmp_script="/tmp/bbrv3_loader.sh"
+    
+    
+    # 尝试直连下载，失败则用代理下载
+    if ! curl -fsSL "$script_url" -o "$tmp_script"; then
+        echo -e "${YELLOW}直连失败，尝试使用代理下载...${RESET}"
+        if ! curl -fsSL "${PROXY}${script_url}" -o "$tmp_script"; then
+            echo -e "${RED}错误：直连与代理下载均失败，请检查网络设置。${RESET}"
             exit 1
         fi
     fi
-}
 
-# 统一下载重装核心脚本
-download_script() {
-    check_network
-    echo -e "${yellow}正在下载重装核心...${re}"
-    curl -so reinstall.sh "$FINAL_URL"
+    # 赋予执行权限并真正运行
+    chmod +x "$tmp_script"
+    bash "$tmp_script"
     
-    if [ $? -ne 0 ] || [ ! -s reinstall.sh ]; then
-        echo -e "${red}下载失败，尝试使用 wget 备用下载...${re}"
-        wget -qO reinstall.sh "$FINAL_URL"
-    fi
-
-    if [ ! -s reinstall.sh ]; then
-        echo -e "${red}错误：无法下载 reinstall.sh，请检查权限或网络！${re}"
-        exit 1
-    fi
-    chmod +x reinstall.sh
+    # 运行完清理临时文件
+    rm -f "$tmp_script"
 }
 
-# 方案 1：ISO 方式
-install_via_iso() {
-    clear
-    echo -e "${purple}==========================================${re}"
-    echo -e "${yellow} 正在执行：方案 1 - ISO 方式重装 Windows 11${re}"
-    echo -e "${purple}==========================================${re}"
-    echo -e "${green}提示：大概 1-2 分钟后提示 reboot，届时请转移到 cloudshell 观察。${re}"
-    echo -e "${green}系统登录信息 -> 用户名: administrator  密码: 123@@@${re}"
-    echo "------------------------------------------"
-    
-    read -p "确认要开始吗？(y/n): " confirm
-    if [[ $confirm =~ ^[Yy]$ ]]; then
-        download_script
-        bash reinstall.sh windows \
-          --image-name='Windows 11 enterprise ltsc 2024' \
-          --iso 'https://drive.massgrave.dev/X23-81950_26100.1742.240906-0331.ge_release_svc_refresh_CLIENT_ENTERPRISES_OEM_A64FRE_en-us.iso'
-    else
-        main_menu
-    fi
-}
+case "$OS" in
+    alpine)
+        enable_bbr_alpine
+        ;;
+    debian|ubuntu|centos|rocky|almalinux|fedora)
 
-# 方案 2：DD 包方式
-install_via_dd() {
-    clear
-    echo -e "${purple}==========================================${re}"
-    echo -e "${yellow} 正在执行：方案 2 - DD 包方式重装 (推荐)${re}"
-    echo -e "${purple}==========================================${re}"
-    echo -e "${green}提示：大概 1-2 分钟后提示 reboot，届时请转移到 cloudshell 观察。${re}"
-    echo -e "${green}系统登录信息 -> 用户名: administrator  密码: 123@@@${re}"
-    echo "------------------------------------------"
-    
-    read -p "确认要开始吗？(y/n): " confirm
-    if [[ $confirm =~ ^[Yy]$ ]]; then
-        download_script
-        bash reinstall.sh dd --img https://r2.hotdog.eu.org/win11-arm-with-pagefile-15g.xz
-    else
-        main_menu
-    fi
-}
-
-# 主菜单
-main_menu() {
-    clear
-    echo -e "${green}==========================================${re}"
-    echo -e "${green}          Windows11 重装系统菜单          ${re}"
-    echo -e "${green}==========================================${re}"
-    echo -e "${green}1. ISO方式(Windows 11 Enterprise LTSC 2024)${re}"
-    echo -e "${green}2. DD包方式(Win11 ARM 15G)${re} ${purple}[推荐]${re}"
-    echo -e "${green}0. 退出${re}"
-
-    read -p $'\033[32m请选择操作: \033[0m' choice
-    case $choice in
-        1)
-            install_via_iso
-            ;;
-        2)
-            install_via_dd
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            echo -e "${red}无效输入，请重新选择！${re}"
-            sleep 15
-            main_menu
-            ;;
-    esac
-}
-
-# 启动菜单
-main_menu
+        fetch_and_run "https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/BBRV3.sh"
+        ;;
+    *)
+        fetch_and_run "https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/BBRV3.sh"
+        ;;
+esac

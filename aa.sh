@@ -1,93 +1,75 @@
 #!/bin/bash
-# ======================================
-# Ookla / Open-Source Speedtest 一键安装脚本
-# Debian / Ubuntu / Alpine 全系统完美适配版（Ubuntu采用二进制加速版）
-# ======================================
+# ========================================
+# 安全版 fNOS 重装执行器
+# 功能: 下载远程重装脚本，一键重装为 fNOS
+# ========================================
 
-set -e
+GITHUB_URL="https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
+CNB_URL="https://cnb.cool/bin456789/reinstall/-/git/raw/main/reinstall.sh"
+SCRIPT_NAME="reinstall.sh"
 
+# 颜色
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-echo -e "${GREEN}🚀 开始安装 Speedtest CLI...${RESET}"
+echo -e "${YELLOW}警告: 此操作将会完全重装系统为 fnos，磁盘上所有数据将丢失！${RESET}"
+echo -e "${YELLOW}请确保已备份重要数据！${RESET}"
 
-# 必须 root
-if [ "$(id -u)" -ne 0 ]; then
-  echo -e "${RED}❌ 请使用 root 或 sudo 运行！${RESET}"
-  exit 1
+# 用户确认
+read -p $'\033[31m你确定要继续吗？(y/n): \033[0m' CONFIRM
+if [[ "$CONFIRM" != "y" ]]; then
+    exit 1
 fi
 
-# ======================================
-# 智能分流安装引擎
-# ======================================
-if [ -f /etc/alpine-release ]; then
-    # ---------------- Alpine Linux 部署分支 ----------------
-    echo -e "${YELLOW}📦 检测到 Alpine 系统，正在通过 apk 官方源安装...${RESET}"
-    
-    # 1. 直接一行命令安装官方源的 speedtest-cli
-    apk add --no-cache speedtest-cli
-    
-    # 2. 创建软链接，确保全局命令与商业版 speedtest 兼容，防止后续脚本卡死
-    if [ ! -f /usr/local/bin/speedtest ] && [ ! -f /usr/bin/speedtest ]; then
-        ln -sf $(command -v speedtest-cli) /usr/bin/speedtest
-    fi
+# 线路选择
+echo -e "  ${YELLOW}--------------------------------------${RESET}"
+echo -e "  ${GREEN}1) 国内机专用镜像${RESET}"
+echo -e "  ${GREEN}2) GitHub 镜像代理${RESET}"
+echo -e "  ${GREEN}3) GitHub 直连(默认)${RESET}"
+echo -e "${YELLOW}--------------------------------------${RESET}"
+read -p $'\033[36m👉 请输入编号: \033[0m' LINE_CHOICE
+LINE_CHOICE=${LINE_CHOICE:-3}
 
-else
-    # ---------------- Debian / Ubuntu 部署分支 ----------------
-    echo -e "${YELLOW}📦 检测到 Debian/Ubuntu 系统，正在通过二进制包快速安装...${RESET}"
-    
-    # 1. 确保有 wget 或 curl 以及 tar
-    if ! command -v tar >/dev/null 2>&1; then
-      apt-get update -y && apt-get install -y tar wget
-    elif ! command -v wget >/dev/null 2>&1; then
-      apt-get update -y && apt-get install -y wget
-    fi
+# 根据选择下载脚本
+echo -e "${GREEN}正在下载重装...${RESET}"
+DOWNLOAD_SUCCESS=1
 
-    # 2. 架构检测并匹配下载链接
-    local cpu_arch=$(uname -m)
-    local download_url
-    case "$cpu_arch" in
-        x86_64)
-            download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz"
-            ;;
-        aarch64)
-            download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz"
-            ;;
-        *)
-            echo -e "${RED}❌ 错误: 不支持的架构 ${cpu_arch}${RESET}" >&2
-            exit 1
-            ;;
-    esac
-    
-    # 3. 下载并解压到系统目录
-    echo "📥 正在下载官方商业版二进制文件..."
-    cd /tmp
-    wget -q "$download_url" -O speedtest.tgz && \
-    tar -xzf speedtest.tgz && \
-    mv speedtest /usr/local/bin/ && \
-    rm -f speedtest.tgz speedtest.5 speedtest.md LICENSE.md # 清理垃圾
+case "$LINE_CHOICE" in
+    1)
+        echo -e "${GREEN}使用国内 CNB 镜像源下载...${RESET}"
+        curl -fsSL -o "$SCRIPT_NAME" "$CNB_URL" || wget -O "$SCRIPT_NAME" "$CNB_URL"
+        [ $? -eq 0 ] && DOWNLOAD_SUCCESS=0
+        ;;
+    2)
+        echo -e "${GREEN}使用 GitHub 代理下载...${RESET}"
+        wget -q "https://v6.gh-proxy.org/${GITHUB_URL}" -O "$SCRIPT_NAME" && DOWNLOAD_SUCCESS=0
+        ;;
+    3)
+        echo -e "${GREEN}使用 GitHub 直连下载...${RESET}"
+        wget -q "$GITHUB_URL" -O "$SCRIPT_NAME" && DOWNLOAD_SUCCESS=0
+        ;;
+    *)
+        echo -e "${RED}输入错误，默认使用 GitHub 直连...${RESET}"
+        wget -q "$GITHUB_URL" -O "$SCRIPT_NAME" && DOWNLOAD_SUCCESS=0
+        ;;
+esac
+
+if [ $DOWNLOAD_SUCCESS -ne 0 ]; then
+    echo -e "${RED}❌ 下载失败，请检查网络或更换线路。${RESET}"
+    exit 1
 fi
 
-# 确保命令哈希表刷新
-hash -r 2>/dev/null
+chmod +x "$SCRIPT_NAME"
 
-echo -e "${GREEN}✅ 安装完成！${RESET}"
+# 执行重装脚本 (不再传递任何额外参数，仅指定系统为 fnos)
+echo -e "${GREEN}🔧 正在执行 fNOS 重装配置...${RESET}"
+./"$SCRIPT_NAME" fnos
 
-# ======================================
-# 自动测速
-# ======================================
-echo ""
-echo -e "${GREEN}🚀 开始测速...${RESET}"
-echo "-------------------------------------"
+# 绿色重启提示
+echo -e "${GREEN}✔ 重装环境已配置完成。${RESET}"
+read -p "按 Enter 确认重启并开始重装进程..." dummy
 
-# 智能判断：开源版 speedtest-cli 不需要也不支持这两个商业隐私参数
-if speedtest --help 2>&1 | grep -q "accept-license"; then
-    speedtest --accept-license --accept-gdpr
-else
-    speedtest
-fi
-
-echo "-------------------------------------"
-echo -e "${GREEN}🎉 完成！以后直接运行： speedtest${RESET}"
+echo -e "${GREEN}>>> 正在重启系统，请稍后通过浏览器访问 fNOS 后台进行初始化...${RESET}"
+reboot

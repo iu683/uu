@@ -13,7 +13,17 @@ NC='\033[0m' # 无颜色
 GH_PROXY="https://v6.gh-proxy.org/"
 INSTALL_DIR="$HOME/gproxy-tool"
 CONFIG_FILE="$HOME/.config/gproxy/config.env"
-TUNNEL_SCRIPT="/usr/lib/gproxy/lib/tunnel.sh"
+
+# 动态获取 tunnel.sh 路径（优先系统路径，其次克隆路径）
+get_tunnel_path() {
+    if [ -f "/usr/lib/gproxy/lib/tunnel.sh" ]; then
+        echo "/usr/lib/gproxy/lib/tunnel.sh"
+    elif [ -f "$INSTALL_DIR/lib/tunnel.sh" ]; then
+        echo "$INSTALL_DIR/lib/tunnel.sh"
+    else
+        echo ""
+    fi
+}
 
 # 检查是否安装了 gproxy
 check_status() {
@@ -26,25 +36,23 @@ check_status() {
 
 # 获取当前本地端口
 get_current_port() {
-    if [ -f "$TUNNEL_SCRIPT" ]; then
-        grep -E '^LOCAL_PORT=' "$TUNNEL_SCRIPT" | cut -d'=' -f2
+    local tunnel_path=$(get_tunnel_path)
+    if [ -n "$tunnel_path" ] && [ -f "$tunnel_path" ]; then
+        grep -E '^LOCAL_PORT=' "$tunnel_path" | cut -d'=' -f2
     else
-        echo "19527"
+        echo "19527 (默认)"
     fi
 }
 
 # 菜单头部
 show_header() {
     clear
-    echo -e "${GREEN}==================================================${NC}"
-    echo -e "${GREEN}          GProxy 一键运维管理菜单                 ${NC}"
-    echo -e "${GREEN}==================================================${NC}"
-    echo -e "当前状态: $(check_status)"
-    echo -e "本地代理端口: ${YELLOW}$(get_current_port)${NC}"
-    if [ -f "$CONFIG_FILE" ]; then
-        echo -e "当前配置 VPS: ${BLUE}$(grep 'VPS_IP' $CONFIG_FILE 2>/dev/null | cut -d'=' -f2 || echo '已配置')${NC}"
-    fi
-    echo -e "${GREEN}==================================================${NC}"
+    echo -e " ${GREEN}===============================${NC}"
+    echo -e " ${GREEN}  GProxy -SSH 隧道网络加速工具  ${NC}"
+    echo -e " ${GREEN}===============================${NC}"
+    echo -e " ${GREEN}当前状态:${NC} $(check_status)"
+    echo -e " ${GREEN}代理端口:${NC} ${YELLOW}$(get_current_port)${NC}"
+    echo -e " ${GREEN}===============================${NC}"
 }
 
 # 安装准备（生成并配置 SSH 密钥）
@@ -81,17 +89,32 @@ prepare_ssh_key() {
 
 # 1. 下载并安装 (已集成 gh-proxy 代理)
 install_gproxy() {
+
+    # 自动检测并安装 Git 依赖（完美兼容 apk）
+    if ! command -v git &> /dev/null; then
+        echo -e "${YELLOW}检测到系统未安装 Git，正在尝试自动安装...${NC}"
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get update && sudo apt-get install -y git
+        elif command -v yum &> /dev/null; then
+            sudo yum install -y git
+        elif command -v apk &> /dev/null; then
+            sudo apk add git
+        else
+            echo -e "${RED}错误: 未找到系统包管理器，请手动安装 git 后再运行此选项。${NC}"
+            read -p "按回车键返回主菜单..." dummy
+            return 1
+        fi
+    fi
+
     echo -e "${YELLOW}[1/3] 正在通过 gh-proxy 代理克隆仓库...${NC}"
     echo -e "${BLUE}代理节点: ${GH_PROXY}${NC}"
     
     if [ -d "$INSTALL_DIR" ]; then
         echo -e "${YELLOW}目录 $INSTALL_DIR 已存在，正在尝试更新...${NC}"
         cd "$INSTALL_DIR" || exit
-        # 移除可能存在的旧代理，并重新设置代理源更新
         git remote set-url origin "${GH_PROXY}https://github.com/xtianowner/gproxy-tool.git"
         git pull
     else
-        # 使用 gh-proxy 代理前缀进行克隆
         git clone "${GH_PROXY}https://github.com/xtianowner/gproxy-tool.git" "$INSTALL_DIR"
     fi
 
@@ -114,7 +137,7 @@ install_gproxy() {
         fi
     fi
 
-    echo -e "\n${YELLOW}[3/3] 开始安装（需要 sudo 权限）...${NC}"
+    echo -e "\n${YELLOW}[3/3] 开始安装...${NC}"
     sudo sh install.sh
     
     echo -e "${GREEN}安装程序执行完毕！${NC}"
@@ -144,14 +167,20 @@ reconfig_vps() {
 
 # 4. 修改本地代理端口
 change_port() {
-    if [ ! -f "$TUNNEL_SCRIPT" ]; then
-        echo -e "${RED}错误: 未找到 $TUNNEL_SCRIPT，请确认是否成功安装。${NC}"
+    local tunnel_path=$(get_tunnel_path)
+    if [ -z "$tunnel_path" ]; then
+        echo -e "${RED}错误: 未找到 tunnel.sh 脚本！请确保已执行选项 1 克隆或安装。${NC}"
     else
         current_port=$(get_current_port)
+        echo -e "${YELLOW}目标文件: $tunnel_path${NC}"
         echo -e "${YELLOW}当前本地代理端口为: ${GREEN}$current_port${NC}"
         read -p "请输入新的端口号 (1024-65353): " new_port
         if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1024 ] && [ "$new_port" -le 65353 ]; then
-            sudo sed -i "s/^LOCAL_PORT=.*/LOCAL_PORT=$new_port/" "$TUNNEL_SCRIPT"
+            if [ -w "$tunnel_path" ]; then
+                sed -i "s/^LOCAL_PORT=.*/LOCAL_PORT=$new_port/" "$tunnel_path"
+            else
+                sudo sed -i "s/^LOCAL_PORT=.*/LOCAL_PORT=$new_port/" "$tunnel_path"
+            fi
             echo -e "${GREEN}端口已成功修改为 $new_port !${NC}"
         else
             echo -e "${RED}输入无效，未做任何修改。${NC}"
@@ -166,7 +195,7 @@ edit_config() {
         echo -e "${YELLOW}即将打开 $CONFIG_FILE ...${NC}"
         nano "$CONFIG_FILE" || vim "$CONFIG_FILE" || vi "$CONFIG_FILE"
     else
-        echo -e "${RED}配置文件不存在，请先运行一次配置。${NC}"
+        echo -e "${RED}配置文件不存在，请先运行一次配置（选项 2）。${NC}"
     fi
     read -p "按回车键返回主菜单..." dummy
 }
@@ -188,18 +217,32 @@ show_usage() {
     read -p "按回车键返回主菜单..." dummy
 }
 
-# 7. 卸载
+# 7. 卸载 (增强兼容性与源码清理)
 uninstall_gproxy() {
     echo -e "${RED}警告: 您确定要卸载 GProxy 吗？(y/n)${NC}"
     read -p "> " confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -d "$INSTALL_DIR" ]; then
+        # 1. 优先调用克隆目录中的卸载脚本
+        if [ -f "$INSTALL_DIR/uninstall.sh" ]; then
+            echo -e "${YELLOW}正在执行源码目录中的卸载程序...${NC}"
             sudo sh "$INSTALL_DIR/uninstall.sh"
+        # 2. 其次调用系统目录中的卸载脚本
         elif [ -f "/usr/lib/gproxy/uninstall.sh" ]; then
+            echo -e "${YELLOW}正在执行系统目录中的卸载程序...${NC}"
             sudo sh /usr/lib/gproxy/uninstall.sh
         else
-            sh /path/to/gproxy-tool/uninstall.sh 2>/dev/null || echo -e "${RED}未找到卸载脚本，请手动执行卸载。${NC}"
+            echo -e "${YELLOW}未检测到标准的卸载脚本，尝试直接清理核心命令...${NC}"
+            sudo rm -f /usr/local/bin/gproxy /usr/bin/gproxy 2>/dev/null
         fi
+
+        # 3. 卸载完后，连带清理 /root/gproxy-tool 源码目录
+        if [ -d "$INSTALL_DIR" ]; then
+            echo -e "${YELLOW}正在清理克隆目录: $INSTALL_DIR ...${NC}"
+            rm -rf "$INSTALL_DIR"
+            echo -e "${GREEN}源码目录清理完毕！${NC}"
+        fi
+        
+        echo -e "${GREEN}卸载流程执行完毕！${NC}"
     else
         echo -e "${GREEN}已取消卸载。${NC}"
     fi
@@ -209,7 +252,7 @@ uninstall_gproxy() {
 # 主循环
 while true; do
     show_header
-    echo -e " ${GREEN}1. 安装准备生成SSH密钥并打通免密${NC}"
+    echo -e " ${GREEN}1. 生成SSH密钥并打通免密(可选)${NC}"
     echo -e " ${GREEN}2. 安装GProxy${NC}"
     echo -e " ${GREEN}3. 首次配置/测试Google连通性${NC}"
     echo -e " ${GREEN}4. 重新配置服务器信息${NC}"
@@ -218,8 +261,8 @@ while true; do
     echo -e " ${GREEN}7. 查看常用命令使用示例"
     echo -e " ${GREEN}8. 卸载 GProxy${NC}"
     echo -e " ${GREEN}0. 退出${NC}"
-    echo -e " ${GREEN}==================================================${NC}"
-    read -p "请输入数字选择操作: " choice
+    echo -e " ${GREEN}===============================${NC}"
+    read -p "$(echo -e "${GREEN}请输入数字选择操作: ${NC}")" choice
 
     case $choice in
         1) prepare_ssh_key ;;

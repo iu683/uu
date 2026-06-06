@@ -1,99 +1,116 @@
 #!/bin/bash
-# ======================================
-# Ookla Speedtest 官方二进制免源通用脚本
-# 完美适配 Ubuntu 24.04 / Debian / Alpine
-# ======================================
+# ========================================
+# 安全版 Debian 重装执行器 (优化修正版)
+# 功能: 下载远程重装脚本，执行前安全确认
+# ========================================
 
-set -e
+GITHUB_URL="https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
+CNB_URL="https://cnb.cool/bin456789/reinstall/-/git/raw/main/reinstall.sh"
+SCRIPT_NAME="reinstall.sh"
 
+# 颜色
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-echo -e "${GREEN}🚀 开始安装 Speedtest CLI (二进制独立版)...${RESET}"
+# 清理历史残留
+rm -f "$SCRIPT_NAME"
 
-# 1. 必须 root 权限
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}❌ 请使用 root 或 sudo 运行！${RESET}"
+echo -e "${YELLOW}警告: 此操作将会完全重装系统，磁盘上所有数据将丢失！${RESET}"
+echo -e "${YELLOW}请确保已备份重要数据！${RESET}"
+
+# 用户确认
+read -p $'\033[31m你确定要继续吗？(y/n): \033[0m' CONFIRM
+if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+    echo -e "${RED}已取消操作${RESET}"
     exit 1
 fi
 
-# 2. 强力清理残留的各种官方故障/旧版 APT 源（彻底解决 Ubuntu 24.04 因为 noble 无源导致的 apt 报错）
-echo -e "${YELLOW}🧹 正在强力清理残留的官方故障软件源...${RESET}"
-rm -f /etc/apt/sources.list.d/speedtest.list
-rm -f /etc/apt/sources.list.d/ookla_speedtest-cli.list
-if [ -d /etc/apt/sources.list.d ]; then
-    grep -l "packagecloud.io/ookla" /etc/apt/sources.list.d/* 2>/dev/null | xargs rm -f || true
+# 线路选择
+echo -e "  ${YELLOW}--------------------------------------${RESET}"
+echo -e "  ${GREEN}1) 国内机专用镜像 (CNB)${RESET}"
+echo -e "  ${GREEN}2) GitHub 镜像代理${RESET}"
+echo -e "  ${GREEN}3) GitHub 直连 (默认)${RESET}"
+echo -e "  ${YELLOW}--------------------------------------${RESET}"
+read -p $'\033[36m👉 请输入编号: \033[0m' LINE_CHOICE
+LINE_CHOICE=${LINE_CHOICE:-3}
+
+# 用户名（默认 root）
+read -p "请输入用户名 (默认 root): " USERNAME
+USERNAME=${USERNAME:-root}
+
+# SSH 公钥输入
+read -p "请输入 SSH 登录公钥 (留空则使用密码登录): " SSH_KEY
+
+# 密码输入与随机生成逻辑
+ROOT_PASS=""
+if [[ -z "$SSH_KEY" ]]; then
+    read -p "请输入 ${USERNAME} 密码 (留空则自动生成随机密码): " ROOT_PASS
+    if [[ -z "$ROOT_PASS" ]]; then
+        # 生成 16 位随机密码（包含大小写字母、数字）
+        ROOT_PASS=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16)
+        echo -e "${YELLOW}==================================================${RESET}"
+        echo -e "${YELLOW}🔑 未输入密码，已自动为您生成随机强密码：${RESET}"
+        echo -e "${RED}${ROOT_PASS}${RESET}"
+        echo -e "${YELLOW}请务必复制并妥善保存此密码！${RESET}"
+        echo -e "${YELLOW}==================================================${RESET}"
+        read -p "请按 Enter 键确认已保存密码并继续..."
+    fi
+else
+    echo -e "${GREEN}检测到已提供 SSH 公钥，将跳过密码设置。${RESET}"
 fi
 
-# 3. 自动判断系统架构，并匹配官方准确的下载 URL (纠正了架构与 linux 字段颠倒的 Bug)
-ARCH=$(uname -m)
-case "$ARCH" in
-    x86_64)
-        DOWNLOAD_URL="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-x86_64-linux.tgz"
+# SSH 端口
+read -p "请输入 SSH 端口 (默认 22): " SSH_PORT
+SSH_PORT=${SSH_PORT:-22}
+
+# 根据选择下载脚本 (统一采用 curl/wget 双重容错)
+echo -e "${GREEN}正在下载重装...${RESET}"
+DOWNLOAD_SUCCESS=1
+
+case "$LINE_CHOICE" in
+    1)
+        echo -e "${GREEN}使用国内 CNB 镜像源下载...${RESET}"
+        curl -fsSL -o "$SCRIPT_NAME" "$CNB_URL" || wget --no-check-certificate -O "$SCRIPT_NAME" "$CNB_URL"
+        [ $? -eq 0 ] && DOWNLOAD_SUCCESS=0
         ;;
-    aarch64)
-        DOWNLOAD_URL="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-aarch64-linux.tgz"
+    2)
+        echo -e "${GREEN}使用 GitHub 代理下载...${RESET}"
+        PROXY_URL="https://v6.gh-proxy.org/${GITHUB_URL}"
+        curl -fsSL -o "$SCRIPT_NAME" "$PROXY_URL" || wget --no-check-certificate -O "$SCRIPT_NAME" "$PROXY_URL"
+        [ $? -eq 0 ] && DOWNLOAD_SUCCESS=0
         ;;
-    armhf|armv7l)
-        DOWNLOAD_URL="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-armhf-linux.tgz"
-        ;;
-    i386|i686)
-        DOWNLOAD_URL="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-i386-linux.tgz"
+    3)
+        echo -e "${GREEN}使用 GitHub 直连下载...${RESET}"
+        curl -fsSL -o "$SCRIPT_NAME" "$GITHUB_URL" || wget --no-check-certificate -O "$SCRIPT_NAME" "$GITHUB_URL"
+        [ $? -eq 0 ] && DOWNLOAD_SUCCESS=0
         ;;
     *)
-        echo -e "${RED}❌ 暂不支持的架构: $ARCH${RESET}"
-        exit 1
+        # 修正原版此处提示直连却去下载CNB的错误
+        echo -e "${RED}输入错误，默认使用 GitHub 直连...${RESET}"
+        curl -fsSL -o "$SCRIPT_NAME" "$GITHUB_URL" || wget --no-check-certificate -O "$SCRIPT_NAME" "$GITHUB_URL"
+        [ $? -eq 0 ] && DOWNLOAD_SUCCESS=0
         ;;
 esac
 
-# 4. 检查并安装基础依赖
-echo -e "${YELLOW}📦 正在检查并安装必要依赖 (curl/tar)...${RESET}"
-if [ -f /etc/alpine-release ]; then
-    # Alpine 额外补上 ca-certificates 防止明文/证书链报错
-    apk add --no-cache curl tar ca-certificates
-else
-    # Debian/Ubuntu 强制清理可能坏掉的缓存并更新
-    apt-get clean
-    apt-get update -y && apt-get install -y curl tar
-fi
-
-# 5. 下载官方原生程序 (引入 UA 伪装，绕过 Cloudflare 防火墙 403 拦截)
-echo -e "${YELLOW}📥 正在从 Ookla 官网下载原生二进制程序...${RESET}"
-
-cd /tmp
-# 提前清理历史坏文件残留，防止脏数据影响解压
-rm -f speedtest.tgz speedtest
-
-# 模拟 Chrome 浏览器 User-Agent，规避机房 IP 被 403 封锁
-UA_TEXT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-if ! curl -L -f -A "$UA_TEXT" --connect-timeout 10 --retry 3 -o speedtest.tgz "$DOWNLOAD_URL"; then
-    echo -e "${RED}❌ 下载失败！服务器拒绝了请求(403)或网络超时。${RESET}"
+if [ $DOWNLOAD_SUCCESS -ne 0 ]; then
+    echo -e "${RED}❌ 下载失败，请检查网络、DNS 设置或更换线路。${RESET}"
     exit 1
 fi
 
-# 6. 解压与环境变量配置
-echo -e "${YELLOW}⚙️ 正在解压并配置环境变量...${RESET}"
-tar -zxf speedtest.tgz speedtest
-chmod +x speedtest
-mv speedtest /usr/local/bin/
-rm -f speedtest.tgz
+chmod +x "$SCRIPT_NAME"
 
-# 刷新指令哈希缓存
-hash -r 2>/dev/null
-echo -e "${GREEN}✅ 官方原生 Speedtest 安装成功！${RESET}"
+# 组装执行参数 (Debian 13 现已发布，配置正确)
+CMD=("./$SCRIPT_NAME" "debian" "13" --username "$USERNAME" --ssh-port "$SSH_PORT")
 
-# ======================================
-# 自动测速
-# ======================================
-echo ""
-echo -e "${GREEN}🚀 开始测速...${RESET}"
-echo "-------------------------------------"
+# 根据输入动态添加密码或密钥
+if [[ -n "$SSH_KEY" ]]; then
+    CMD+=(--ssh-key "$SSH_KEY")
+else
+    CMD+=(--password "$ROOT_PASS")
+fi
 
-# 运行测速并自动同意隐私协议
-speedtest --accept-license --accept-gdpr
-
-echo "-------------------------------------"
-echo -e "${GREEN}🎉 完成！以后在任意地方输入 speedtest 即可测速。${RESET}"
+# 执行重装脚本
+echo -e "${GREEN}🔧 正在执行重装命令，系统开始重装...${RESET}"
+"${CMD[@]}"

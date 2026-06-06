@@ -29,15 +29,17 @@ install_pkg() {
     local os=$(get_os_type)
     if has_cmd "$pkg"; then return; fi
     
-    echo -e "${YELLOW}🔧 正在补全依赖: $pkg ...${RESET}"
+    echo -e "${YELLOW}🔧 正在补全系统依赖: $pkg ...${RESET}"
     case "$os" in
         ubuntu|debian)
             apt-get update -y >/dev/null 2>&1
             apt-get install -y "$pkg" >/dev/null 2>&1
             ;;
-        *)
-            # 其他系统的安装逻辑保持原样
-            yum install -y "$pkg" >/dev/null 2>&1 || dnf install -y "$pkg" >/dev/null 2>&1 || apk add --no-cache "$pkg" >/dev/null 2>&1
+        alpine)
+            apk add --no-cache "$pkg" >/dev/null 2>&1
+            ;;
+        centos|rhel|rocky|almalinux)
+            yum install -y "$pkg" >/dev/null 2>&1 || dnf install -y "$pkg" >/dev/null 2>&1
             ;;
     esac
 }
@@ -92,15 +94,16 @@ while true; do
     get_menu_status "$iface"
 
     echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}       ◈  IPv4 / IPv6 管理面板  ◈      ${RESET}"
+    echo -e "${GREEN}      ◈  IPv4 / IPv6 管理面板  ◈      ${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN} 活跃网卡 : ${YELLOW}${iface}${RESET}"
+    echo -e "${GREEN} 当前系统  : ${YELLOW}${os_type}${RESET}"
+    echo -e "${GREEN} 活跃网卡  : ${YELLOW}${iface}${RESET}"
     echo -e "${GREEN} IPv4 状态 : ${V4_STATUS}"
     echo -e "${GREEN} IPv6 状态 : ${V6_STATUS}"
     echo -e "${GREEN}=======================================${RESET}"
     echo -e "${GREEN}  1) 禁用 IPv6 (支持临时/永久)${RESET}"
     echo -e "${GREEN}  2) 开启 IPv6 ${RESET}"
-    echo -e "${GREEN}  3) 查看IP状态&公网连通性测试${RESET}"
+    echo -e "${GREEN}  3) 查看网卡IP${RESET}"
     echo -e "${GREEN}  0) 退出${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
     
@@ -114,8 +117,8 @@ while true; do
             sysctl -w net.ipv6.conf.${iface}.disable_ipv6=1 >/dev/null 2>&1
             
             echo -e "${YELLOW}------ 💾 持久化配置选项 ------${RESET}"
-            echo -e "${GREEN}  1) 仅临时禁用（重启后恢复）${RESET}"
-            echo -e "${GREEN}  2) 永久禁用（锁定系统文件）${RESET}"
+            echo -e "${GREEN}  1) 仅临时禁用（重启服务器后恢复 IPv6）${RESET}"
+            echo -e "${GREEN}  2) 永久禁用（锁入系统文件，重启不失效）${RESET}"
             echo -ne "${YELLOW} 请选择禁用模式 [默认 1]: ${RESET}"
             read perm_choice
             
@@ -126,18 +129,17 @@ while true; do
                     echo "net.ipv6.conf.default.disable_ipv6 = 1" >> /etc/sysctl.conf
                     echo "net.ipv6.conf.${iface}.disable_ipv6 = 1" >> /etc/sysctl.conf
                 fi
-                # Ubuntu 特有网络管理器适配
                 if [ "$os_type" = "ubuntu" ] && has_cmd netplan; then
                     netplan apply >/dev/null 2>&1
                 fi
-                echo -e "\n${GREEN}✅ 已成功【永久禁用】IPv6！${RESET}"
+                echo -e "\n${GREEN}✅ 已成功【永久禁用】IPv6，重启不会失效！${RESET}"
             else
                 if [ -f /etc/sysctl.conf ]; then
                     sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
                 fi
-                echo -e "\n${GREEN}✅ 已成功【临时禁用】IPv6。${RESET}"
+                echo -e "\n${GREEN}✅ 已成功【临时禁用】IPv6（重启服务器后将自动恢复）。${RESET}"
             fi
-            read -rp "按回车键返回..."
+            read -rp "按回车键返回菜单..."
             ;;
         2)
             # 1. 恢复内核参数
@@ -149,28 +151,48 @@ while true; do
                 sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
             fi
             
-            # 2. Ubuntu 特有应用逻辑（用 netplan 刷新，不强制 reboot）
-            if [ "$os_type" = "ubuntu" ] && has_cmd netplan; then
-                echo -e "${YELLOW}⏳ 检测到 Ubuntu 系统，正在平滑应用网络配置...${RESET}"
-                netplan apply >/dev/null 2>&1
-                sleep 2
+            # 2. 核心分支判断：根据不同系统执行不同生效策略
+            if [ "$os_type" = "ubuntu" ]; then
+                if has_cmd netplan; then
+                    echo -e "${YELLOW}⏳ 检测到 Ubuntu 系统，正在通过 Netplan 安全刷新网络...${RESET}"
+                    netplan apply >/dev/null 2>&1
+                    sleep 2
+                fi
+                echo -e "${GREEN}✅ 内核 IPv6 模块已平滑激活。${RESET}"
+                echo -e "${YELLOW}提示：Ubuntu 系统无需重启。如果仍未获取到 IPv6，请重启系统。${RESET}"
+                read -rp "按回车键返回菜单..."
+            else
+                # 非 Ubuntu 系统（CentOS/Alpine等），执行原版的重启逻辑
+                echo -e "${GREEN}✅ 内核 IPv6 模块已激活。${RESET}"
+                echo -e "${YELLOW}当前系统为 [${os_type}]，通常需要重启系统才能正确获取公网 IPv6 地址。${RESET}"
+                read -rp "按回车键 [立即重启] 系统，或按 Ctrl+C 取消..."
+                reboot
             fi
-            
-            echo -e "${GREEN}✅ 内核 IPv6 模块已平滑激活。${RESET}"
-            echo -e "${YELLOW}提示：如果仍未获取到公网 IPv6，请检查您的服务商控制台是否开启了 IPv6 开关。${RESET}"
-            read -rp "按回车键返回菜单..."
             ;;
         3)
             echo -e "${GREEN}🌐 [1/3] 内核 IPv6 状态：${RESET}"
             is_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
             [ "$is_disabled" = "1" ] && echo -e "${RED}❌ 内核已禁用 IPv6${RESET}" || echo -e "${GREEN}✅ 内核已启用 IPv6${RESET}"
 
-            echo -e "\n${GREEN}📌 [2/3] 本地网卡地址情况：${RESET}"
-            ip addr show dev "$iface" | grep -E "inet |inet6 " || echo "❌ 未检测到有效 IP"
+            echo -e "\n${GREEN}📌 [2/3] 活跃网卡硬件及双栈本地 IP 分配：${RESET}"
+            # 强化部分：提取网卡底层状态
+            local link_info=$(ip link show dev "$iface" 2>/dev/null)
+            local mtu_val=$(echo "$link_info" | awk '{print $5}')
+            local state_val=$(echo "$link_info" | awk '{print $9}')
+            
+            echo -e "  ${YELLOW}网卡名称:${RESET} $iface"
+            echo -e "  ${YELLOW}物理地址(MAC):${RESET} $(get_mac_address "$iface")"
+            echo -e "  ${YELLOW}最大传输单元(MTU):${RESET} $mtu_val"
+            echo -e "  ${YELLOW}网卡链路状态:${RESET} $state_val"
+            
+            echo -ne "  ${YELLOW}本地 IPv4 地址:${RESET} "
+            ip -4 addr show dev "$iface" 2>/dev/null | grep "inet" | awk '{print $2}' || echo "${RED}未检测到 IPv4${RESET}"
+            echo -ne "  ${YELLOW}本地 IPv6 地址:${RESET} "
+            ip -6 addr show dev "$iface" 2>/dev/null | grep "inet6" | awk '{print $2}' || echo "${RED}未检测到 IPv6${RESET}"
 
-            echo -e "\n${GREEN}🔎 [3/3] 公网双栈连通性测试：${RESET}"
+            echo -e "\n${GREEN}🔎 [3/3] 公网双栈连通性及公网 IP 测试：${RESET}"
             if has_cmd ping; then
-                ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 && echo -e "${GREEN}✅ IPv4 路由正常${RESET}" || echo -e "${RED}❌ IPv4 路由异常${RESET}"
+                ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 && echo -e "${GREEN}✅ IPv4 路由连通正常${RESET}" || echo -e "${RED}❌ IPv4 路由无法访问公网${RESET}"
             fi
             echo -n "   └─ 本机公网 IPv4: "
             get_public_ip "-4"
@@ -180,16 +202,16 @@ while true; do
             elif has_cmd ping; then ping -6 -c 2 -W 3 240c::6666 >/dev/null 2>&1 && has_v6=true; fi
 
             if [ "$has_v6" = true ]; then
-                echo -e "${GREEN}✅ IPv6 路由正常${RESET}"
+                echo -e "${GREEN}✅ IPv6 路由连通正常${RESET}"
                 echo -n "   └─ 本机公网 IPv6: "
                 get_public_ip "-6"
             else
-                echo -e "${RED}❌ IPv6 无法访问外部网络(或未分配公网IPv6)${RESET}"
+                echo -e "${RED}❌ IPv6 无法访问外部网络 (或网卡尚未被分配公网IPv6)${RESET}"
             fi
             echo
-            read -rp "按回车键返回..."
+            read -rp "按回车键返回菜单..."
             ;;
         0) exit 0 ;;
-        *) echo -e "${RED}❌ 输入错误${RESET}"; sleep 1 ;;
+        *) echo -e "${RED}❌ 输入错误，无此选项${RESET}"; sleep 1 ;;
     esac
 done

@@ -1,41 +1,67 @@
 #!/bin/bash
+# =========================================================
+# 3X-UI 一键部署脚本 (Alpine Linux)
+# =========================================================
 
-# 颜色定义
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+green="\033[32m"
+red="\033[31m"
+yellow="\033[33m"
+plain="\033[0m"
 
-# 代理前缀
-PROXY="https://v6.gh-proxy.org/"
-
-# 获取 CPU 架构
-ARCH=$(uname -m)
-
-# 核心下载与执行函数（含自动容灾代理）
-fetch_and_run() {
-    local script_url="$1"
-    
-    # 尝试直连，如果失败（返回非0状态码）则通过代理重试，若再失败则报错退出
-    bash <(curl -fsSL "$script_url") || \
-    bash <(curl -fsSL "${PROXY}${script_url}") || {
-        echo -e "${RED}错误：直连与代理均失败，请检查网络设置。${RESET}"
-        exit 1
-    }
+show_menu() {
+    clear
+    echo -e "${green}=== 3X-UI管理面板 ===${plain}"
+    echo -e " ${green}1.安装${plain}"
+    echo -e " ${green}2.卸载${plain}"
+    echo -e " ${green}3.启动${plain}"
+    echo -e " ${green}4.停止${plain}"
+    echo -e " ${green}5.重启${plain}"
+    echo -e " ${green}0.退出${plain}"
 }
 
-# 架构逻辑判断
-case "$ARCH" in
-    aarch64|arm64)
-        # 执行 ARM 适配版脚本
-        fetch_and_run "https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/windowarm.sh"
-        ;;
-    x86_64|amd64)
-        # 执行原版脚本
-        fetch_and_run "https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/window.sh"
-        ;;
-    *)  
-        # 未能识别的架构，默认尝试执行原版脚本
-        fetch_and_run "https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/window.sh"
-        ;;
-esac
+install_3xui() {
+    echo -e "${yellow}正在更新依赖并安装 3X-UI...${plain}"
+    apk update && apk add --no-cache curl bash gzip openssl
+    
+    # 执行官方/第三方安装脚本
+    bash <(curl -Ls https://raw.githubusercontent.com/StarVM-OpenSource/3x-ui-Apline/refs/heads/main/install.sh)
+    
+    # ================= 修改部分 =================
+    echo -e "${yellow}检测到安装完成，正在自动重启服务以应用配置...${plain}"
+    sleep 2  # 稍微等待 2 秒确保上一步安装后的进程完全释放
+    restart_3xui
+    echo -e "${green}服务已成功重启，现在可以正常访问了！${plain}"
+    # ============================================
+}
+
+uninstall_3xui() {
+    echo -e "${red}正在卸载 3x-ui...${plain}"
+    x-ui uninstall
+}
+
+start_3xui() {
+    x-ui start
+}
+
+stop_3xui() {
+    x-ui stop
+}
+
+restart_3xui() {
+    x-ui restart
+}
+
+while true; do
+    show_menu
+    read -p "$(echo -e ${green}请选择:${plain}) " choice
+    case "$choice" in
+        1) install_3xui ;;
+        2) uninstall_3xui ;;
+        3) start_3xui ;;
+        4) stop_3xui ;;
+        5) restart_3xui ;;
+        0) exit 0 ;;
+        *) echo -e "${red}无效选择${plain}" ;;
+    esac
+    read -p "$(echo -e ${green}按回车返回菜单...${plain})"
+done

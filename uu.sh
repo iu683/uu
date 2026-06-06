@@ -1,121 +1,106 @@
 #!/bin/bash
 # ========================================
-# Windows 10 DD 安装脚本
+# 智能时间同步脚本（自动识别容器/物理机）
+# 适配：Debian / Ubuntu / Alpine
 # ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
+BLUE="\033[36m"
 RESET="\033[0m"
 
-# 代理前缀
-PROXY="https://v6.gh-proxy.org/"
+echo -e "${GREEN}========================================${RESET}"
+echo -e "${GREEN}         ⏰ 智能时间同步配置            ${RESET}"
+echo -e "${GREEN}========================================${RESET}"
 
-# GitHub 脚本资源地址
-LEITBOGIORO_URL="https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/InstallNET.sh"
-BIN456789_URL="https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
-
-# 检测是否为 root 用户
+# 1. 权限检查
 if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}请使用 root 用户或 sudo 运行此脚本${RESET}"
+    echo -e "${RED}❌ 请使用 root 运行${RESET}"
     exit 1
 fi
 
-# 安装必要工具
-install_tools() {
-    echo -e "${GREEN}正在更新系统并安装必要工具...${RESET}"
-    apt update
-    apt install -y curl wget || { echo -e "${RED}工具安装失败，请检查网络${RESET}"; exit 1; }
-}
+# 2. 系统识别
+if [ -f /etc/alpine-release ]; then
+    OS="Alpine"
+elif [ -f /etc/debian_version ]; then
+    OS="Debian/Ubuntu"
+else
+    echo -e "${RED}❌ 暂不支持此系统${RESET}"
+    exit 1
+fi
 
-# 显示默认账户信息
-show_account_info() {
-    echo -e "${YELLOW}默认账户信息:${RESET}"
-    echo -e "${YELLOW}用户名: Administrator${RESET}"
-    echo -e "${YELLOW}密码: Teddysun.com${RESET}"
-    echo -e "${GREEN}提示:${RESET}"
-    echo -e "${YELLOW}在 Windows 中可以使用快捷键 Windows + R 打开“运行”框，输入 powershell 回车，进入 PowerShell 窗口。${RESET}"
-    echo -e "${YELLOW}输入以下命令：irm https://get.activated.win | iex 激活 ${RESET}"
-    echo -e "${GREEN}请在合适的时候手动输入'reboot'重启系统${RESET}"
-}
+echo -e "${GREEN}✔ 系统检测通过：$OS${RESET}"
 
-# 重启提示
-prompt_reboot() {
-    # 变更为绿色 read 提示
-    read -p $'\033[32m是否立即重启系统？(y/N): \033[0m' answer
-    case $answer in
-        [Yy]*) echo -e "${GREEN}系统即将重启...${RESET}"; reboot ;;
-        *) echo -e "${GREEN}已取消，请稍后手动重启${RESET}" ;;
-    esac
-}
+# 3. 检测虚拟化环境 (容器无需同步)
+IS_CONTAINER=false
+if [ "$OS" == "Alpine" ]; then
+    # Alpine 下简单检测方式
+    if [ -f /.dockerenv ] || grep -qi "docker\|lxc" /proc/1/cgroup 2>/dev/null; then
+        IS_CONTAINER=true
+        VIRT_TYPE="Container"
+    fi
+else
+    # Debian/Ubuntu 使用 systemd-detect-virt
+    VIRT_TYPE=$(systemd-detect-virt)
+    if [[ "$VIRT_TYPE" == "lxc" || "$VIRT_TYPE" == "openvz" || "$VIRT_TYPE" == "docker" ]]; then
+        IS_CONTAINER=true
+    fi
+fi
 
-# V4DD 安装流程
-install_v4dd() {
-    echo -e "${GREEN}开始 V4DD Windows 10 安装流程...${RESET}"
+if [ "$IS_CONTAINER" = true ]; then
+    echo -e "${YELLOW}⚠ 检测到容器环境：$VIRT_TYPE${RESET}"
+    echo -e "${GREEN}✔ 容器时间由宿主机管理，无需配置时间同步${RESET}"
+    date
+    exit 0
+fi
+
+# 4. 执行同步逻辑
+if [ "$OS" == "Alpine" ]; then
+    # ================= Alpine 逻辑 =================
+    echo -e "${YELLOW}🚀 启动时间同步服务...${RESET}"
+    apk add --no-cache chrony
     
-    # 检查下载工具
-    command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || install_tools
-
-    # 优先直连，失败自动切代理
-    bash <(curl -fsSL "$LEITBOGIORO_URL") -windows 10 -lang "cn" || \
-    bash <(curl -fsSL "${PROXY}${LEITBOGIORO_URL}") -windows 10 -lang "cn" || {
-        echo -e "${RED}错误：直连与代理均无法下载核心脚本，请检查网络设置。${RESET}"
-        return
-    }
+    # 强制同步一次
+    rc-update add chronyd default
+    rc-service chronyd stop >/dev/null 2>&1 || true
     
-    show_account_info
-    prompt_reboot
-}
-
-# V6DD 安装流程
-install_v6dd() {
-    echo -e "${GREEN}开始 V6DD Windows 10 安装流程...${RESET}"
-
-    # 检查下载工具
-    command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || install_tools
+    chronyd -q 'server ntp.aliyun.com iburst' || true
     
-    # 优先直连下载，失败切代理下载
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL -o reinstall.sh "$BIN456789_URL" || \
-        curl -fsSL -o reinstall.sh "${PROXY}${BIN456789_URL}" || { echo -e "${RED}下载失败${RESET}"; return; }
+    rc-service chronyd start
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    echo -e "${GREEN}🎉 ✔ 时间同步已成功启动！           ${RESET}"
+    echo -e "${YELLOW}📅 完成时间: $(date +'%Y-%m-%d %H:%M:%S')${RESET}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+
+else
+    # ================= Debian/Ubuntu 逻辑 =================
+    echo -e "${YELLOW}🔄 检查并关闭冲突的 NTP 服务...${RESET}"
+    systemctl stop ntp chrony openntpd 2>/dev/null || true
+    systemctl disable ntp chrony openntpd 2>/dev/null || true
+
+    if ! dpkg -s systemd-timesyncd >/dev/null 2>&1; then
+        echo -e "${YELLOW}📦 安装 systemd-timesyncd...${RESET}"
+        apt update -y && apt install -y systemd-timesyncd
+    fi
+
+    echo -e "${YELLOW}🚀 启动时间同步服务...${RESET}"
+    # 1. 解锁并直接启动服务
+    systemctl unmask systemd-timesyncd >/dev/null 2>&1 || true
+    systemctl enable systemd-timesyncd >/dev/null 2>&1 || true
+    systemctl restart systemd-timesyncd
+
+    # 2. 尝试通知 timedatectl
+    timedatectl set-ntp true >/dev/null 2>&1 || true
+
+    sleep 2
+    if systemctl is-active --quiet systemd-timesyncd; then
+        echo -e "${GREEN}✔ 时间同步已成功启动${RESET}"
     else
-        wget -q "$BIN456789_URL" -O reinstall.sh || \
-        wget -q "${PROXY}${BIN456789_URL}" -O reinstall.sh || { echo -e "${RED}下载失败${RESET}"; return; }
+        echo -e "${RED}❌ 启动失败，请检查日志${RESET}"
     fi
+    echo -e "${BLUE}========== 当前状态 ==========${RESET}"
+    timedatectl status
+fi
 
-    # 确保下载到的文件有效
-    if [ ! -s reinstall.sh ]; then
-        echo -e "${RED}错误：未能成功下载有效的 reinstall.sh 文件${RESET}"
-        return
-    fi
-
-    chmod +x reinstall.sh
-
-    # 使用官方镜像 URL 执行 DD
-    bash reinstall.sh dd --img https://dl.lamp.sh/vhd/zh-cn_windows10_ltsc.xz
-
-    show_account_info
-    prompt_reboot
-}
-
-# 菜单主循环
-while true; do
-    clear
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}           Windows10 DD            ${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}1) V4 DD 安装Windows10${RESET}"
-    echo -e "${GREEN}2) V6 DD 安装Windows10${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
-    
-    read -p $'\033[32m请输入编号: \033[0m' choice
-    case $choice in
-        1) install_v4dd ;;
-        2) install_v6dd ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项，请重新输入${RESET}" ;;
-    esac
-    echo -e "${GREEN}按回车返回菜单...${RESET}"
-    read
-done
+echo -e "${BLUE}==================================${RESET}"

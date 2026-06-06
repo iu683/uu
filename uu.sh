@@ -167,15 +167,15 @@ get_status_text() {
             bbr_version="1"
         fi
 
-        BBR_STATUS="${YELLOW}已启用(v${bbr_version})${NC}"
+        BBR_STATUS="${YELLOW}已启用${NC}"
     else
         BBR_STATUS="${RED}未启用${NC}"
     fi
     # 2. 验证 FQ 状态
     if [ "$fq_check" == "fq" ] || [ "$fq_check" == "fq_pie" ] || [ "$fq_check" == "fq_codel" ]; then
-        FQ_STATUS="${YELLOW}已启用(${fq_check})${NC}"
+        FQ_STATUS="${YELLOW}已启用${NC}"
     else
-        FQ_STATUS="${RED}未启用(${fq_check})${NC}"
+        FQ_STATUS="${RED}未启用${NC}"
     fi
 
     # 2. 验证配置文件是否【真正由本脚本应用】
@@ -346,8 +346,10 @@ menu() {
                 exit 0
                 ;;
             *)
-                echo -e "${RED}❌ 输入错误，3秒后自动返回重试...${NC}"
-                sleep 3
+                echo -e "${RED}❌ 输入错误${NC}"
+                echo -ne "${GREEN}"
+                read -r -p "按回车键返回主菜单..." _
+                echo -ne "${NC}"
                 ;;
         esac
     done

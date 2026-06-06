@@ -1,363 +1,491 @@
 #!/usr/bin/env bash
 
 # ==============================================================================
-# Linux TCP/IP & BBR & TFO 智能综合优化
+#  cf-warp-rust 一键管理面板
 # ==============================================================================
 
-set -euo pipefail
+# ── 核心环境变量 ──────────────────────────────────────────────────────────────
+export REPO="Shannon-x/cf-warp-rust"
+export SERVICE_NAME="warp-rust"
+export SERVICE_USER="warp"
+export INSTALL_BIN="/usr/local/bin/warp-rust"
+export CONF_DIR="/etc/warp-rust"
+export CONF_FILE="${CONF_DIR}/config.toml"
+export DATA_DIR="/var/lib/warp-rust"
+export SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
-# --- 颜色定义 ---
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+# ── 终端颜色定义 ──────────────────────────────────
+export RESET='\033[0m'
+export GREEN='\033[0;32m'
+export YELLOW='\033[0;33m'
+export RED='\033[0;31m'
+export BLUE='\033[0;34m'
 
-# --- 配置文件路径 ---
-CONF_FILE="/etc/sysctl.d/99-bbr.conf"
+# ── 基础环境校验 ──────────────────────────────────────────────────────────────
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}[错误]${RESET} 请使用 root 权限运行此脚本！" >&2
+    exit 1
+fi
 
-# --- 权限检查 ---
-check_root() {
-    if [[ $(id -u) -ne 0 ]]; then
-        echo -e "${RED}❌ 错误: 必须以 root 权限运行此脚本。${NC}"
-        exit 1
+info() { echo -e "${BLUE}[INFO]${RESET} $1"; }
+ok()   { echo -e "${GREEN}[OK]${RESET} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${RESET} $1"; }
+die()  { echo -e "${RED}[ERROR]${RESET} $1" >&2; exit 1; }
+
+for cmd in curl tar sed grep awk; do
+    if ! command -v $cmd &> /dev/null; then
+        die "缺失基础组件: $cmd，请先使用系统包管理器安装它。"
     fi
+done
+
+# ── 1. 动态自适应组件（精准匹配 Musl 静态包） ─────────────────────────────────
+detect_target() {
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64)  TARGET="x86_64-unknown-linux-musl" ;;
+        aarch64) TARGET="aarch64-unknown-linux-musl" ;;
+        *) die "暂不支持的系统架构: $ARCH (本面板目前仅支持 x86_64 及 aarch64)" ;;
+    esac
 }
 
-# --- BBR 与 架构兼容性硬检测 ---
-check_bbr_support() {
+fetch_latest_version() {
+    info "正在查询 GitHub 获取最新 Release 版本号..."
+    TMP_API="$(mktemp)"
+    if curl -sSL -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${REPO}/releases/latest" > "$TMP_API"; then
+        VERSION="$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$TMP_API" | head -1)"
+    fi
+    rm -f "$TMP_API"
+
+    if [ -z "$VERSION" ]; then
+        warn "通过 API 获取最新版本号失败，尝试网页流解析..."
+        VERSION=$(curl -sS https://github.com/${REPO}/releases/latest | grep -o 'tag/[vV]*[0-9.]*' | head -n1 | awk -F '/' '{print $2}')
+    fi
+
+    if [ -z "$VERSION" ]; then
+        die "无法获取最新版本号，请检查网络连通性。"
+    fi
+    export VERSION
+}
+
+download_and_extract() {
+    detect_target
+    fetch_latest_version
     
-    # 1. 检测容器虚拟化架构 (OpenVZ / LXC / 容器判定)
-    local virt_type="unknown"
-    if command -v systemd-detect-virt >/dev/null 2>&1; then
-        virt_type=$(systemd-detect-virt)
-    else
-        # 针对 Alpine 等无 systemd 系统或特殊环境的兜底检测
-        if [ -f /proc/user_beancounters ]; then
-            virt_type="openvz"
-        elif grep -qi "lxc" /proc/1/environ 2>/dev/null || [ -f /run/container_type ]; then
-            virt_type="lxc"
-        fi
-    fi
+    info "正在匹配系统环境形态: ${YELLOW}${TARGET}${RESET}"
 
-    if [[ "$virt_type" == "openvz" || "$virt_type" == "lxc" ]]; then
-        echo -e "${RED}❌ 错误: 当前 VPS 架构为 [${virt_type^^}] 容器/NAT小鸡。${NC}"
-        echo -e "${YELLOW}💡 原因: 该架构与宿主机共享内核，非独立内核，无法自主应用 BBR 拥塞控制与 FQ 队列。${NC}"
-        exit 1
-    fi
+    ASSET="warp-rust-${VERSION}-${TARGET}.tar.gz"
+    URL_TGZ="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
+    URL_SHA="${URL_TGZ}.sha256"
 
-    # 2. 内核版本前置过滤
-    local kernel_version major minor
-    kernel_version=$(uname -r | cut -d. -f1,2)
-    major=$(echo "$kernel_version" | cut -d. -f1)
-    minor=$(echo "$kernel_version" | cut -d. -f2)
+    TMP="$(mktemp -d)"
+    trap 'rm -rf "$TMP"' EXIT
+
+    info "开始同步下载资产包..."
+    curl -fsSL -o "$TMP/$ASSET" "$URL_TGZ" || die "下载资产包失败！请检查网络或版本 ${VERSION} 是否存在该架构。"
     
-    local has_bbr_mod=0
-    if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q "bbr"; then
-        has_bbr_mod=1
-    elif modprobe -n tcp_bbr >/dev/null 2>&1; then
-        has_bbr_mod=1
-    fi
-
-    # 允许在 4.9 以下但有反向 backport BBR 模块的特殊内核通过
-    if [ "$major" -lt 4 ] || { [ "$major" -eq 4 ] && [ "$minor" -lt 9 ]; }; then
-        if [ "$has_bbr_mod" -ne 1 ]; then
-            echo -e "${RED}❌ 错误: 当前系统内核版本为 $(uname -r)，低于官方要求的 4.9 最低限制，且无可用 BBR 模块。${NC}"
-            exit 1
-        fi
-    fi
-
-    # 3. 核心参数修改权限沙箱预检 (终极防线)
-    if ! sysctl -w net.ipv4.tcp_congestion_control="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 'cubic')" >/dev/null 2>&1; then
-        echo -e "${RED}❌ 错误: 检测到系统内核网络参数文件为 [只读] 状态或无修改权限。${NC}"
-        echo -e "${YELLOW}💡 原因: 这通常发生在某些受限的环境（如部分 NAT 共享小鸡或特殊安全策略容器中）。${NC}"
-        exit 1
-    fi
-}
-
-# --- 获取系统信息与动态参数 (针对小内存 UDP 深度调优) ---
-get_system_info() {
-    # 兼容没有 free 命令的精简系统（如未装 full box 的 Alpine）
-    if command -v free >/dev/null 2>&1; then
-        TOTAL_MEM=$(free -m | awk '/^Mem:/{print $2}' | tr -d '\r')
-    else
-        TOTAL_MEM=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
-    fi
-    
-    if [ -z "$TOTAL_MEM" ] || [ "$TOTAL_MEM" -le 0 ]; then
-        TOTAL_MEM=1024 # 无法获取时默认按 1G 计算安全值
-    fi
-
-    if [ "$TOTAL_MEM" -le 512 ]; then
-        VM_TIER="入门微型小鸡(≤512MB RAM)"
-        RMEM_MAX="16777216"   
-        WMEM_MAX="16777216"
-        TCP_MEM_MAX="16777216"
-        SOMAXCONN="2048"       
-        FILE_MAX="65535"
-        CONNTRACK_MAX="32768"
-        UDP_MEM_CONF="1152 1536 2304"
-    elif [ "$TOTAL_MEM" -le 1024 ]; then
-        VM_TIER="基础级(1GB)"
-        RMEM_MAX="33554432"   
-        WMEM_MAX="33554432"
-        TCP_MEM_MAX="33554432"
-        SOMAXCONN="16384"
-        FILE_MAX="524288"
-        CONNTRACK_MAX="262144"
-        UDP_MEM_CONF="16384 32768 65536"
-    elif [ "$TOTAL_MEM" -le 4096 ]; then
-        VM_TIER="进阶级(2GB-4GB)"
-        RMEM_MAX="67108864"   
-        WMEM_MAX="67108864"
-        TCP_MEM_MAX="67108864"
-        SOMAXCONN="32768"
-        FILE_MAX="1048576"
-        CONNTRACK_MAX="524288"
-        UDP_MEM_CONF="65536 131072 262144"
-    else
-        VM_TIER="专业级(>4GB)"
-        RMEM_MAX="134217728"  
-        WMEM_MAX="134217728"
-        TCP_MEM_MAX="134217728"
-        SOMAXCONN="65535"
-        FILE_MAX="2097152"
-        CONNTRACK_MAX="1048576"
-        UDP_MEM_CONF="262144 524288 1048576"
-    fi
-}
-
-# --- 写入配置辅助 ---
-add_conf() {
-    local key="$1"
-    local value="$2"
-    local comment="$3"
-    echo "# $comment" >> "$CONF_FILE"
-    echo "$key = $value" >> "$CONF_FILE"
-    echo "" >> "$CONF_FILE"
-}
-
-# --- 备份管理 ---
-manage_backups() {
-    if [ -f "$CONF_FILE" ]; then
-        cp "$CONF_FILE" "$CONF_FILE.bak_$(date +%F_%H-%M-%S)"
-        # 仅保留最近3次备份
-        ls -t "${CONF_FILE}.bak_"* 2>/dev/null | tail -n +4 | xargs -r rm -f 2>/dev/null || true
-    fi
-}
-
-# --- 看板状态获取 ---
-get_status_text() {
-    local cc fq_check bbr_status fq_status
-    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null | tr -d '[:space:]' || echo "未知")
-    fq_check=$(sysctl -n net.core.default_qdisc 2>/dev/null | tr -d '[:space:]' || echo "未知")
-
-    # 1. 验证 BBR 状态及版本
-    if [ "$cc" == "bbr" ]; then
-        # 尝试获取 BBR 的具体版本号
-        bbr_version=$(modinfo tcp_bbr 2>/dev/null | grep -i 'version:' | awk '{print $2}' | tr -d '[:space:]')
-    
-        # 如果 modinfo 没查到，尝试从内核日志获取
-        if [ -z "$bbr_version" ]; then
-            bbr_version=$(dmesg 2>/dev/null | grep -i 'BBR' | grep -oE 'v[0-9](\.[0-9]+)*' | head -n 1)
-        fi
-    
-        # 如果还是空，默认显示为 v1 (大部分原生内核情况)
-        if [ -z "$bbr_version" ]; then
-            bbr_version="1"
-        fi
-
-        BBR_STATUS="${YELLOW}已启用(v${bbr_version})${NC}"
-    else
-        BBR_STATUS="${RED}未启用${NC}"
-    fi
-    # 2. 验证 FQ 状态
-    if [ "$fq_check" == "fq" ] || [ "$fq_check" == "fq_pie" ] || [ "$fq_check" == "fq_codel" ]; then
-        FQ_STATUS="${YELLOW}已启用(${fq_check})${NC}"
-    else
-        FQ_STATUS="${RED}未启用(${fq_check})${NC}"
-    fi
-
-    # 2. 验证配置文件是否【真正由本脚本应用】
-    # 判断文件存在，且内容里包含专属的头部备注
-    if [ -f "$CONF_FILE" ] && grep -q "Linux Network Tuning (Proxy/Forwarding Optimized)" "$CONF_FILE"; then
-        CONF_STATUS="${YELLOW}已应用${NC}"
-    elif [ -f "$CONF_FILE" ]; then
-        CONF_STATUS="${RED}未应用${NC}"
-    else
-        CONF_STATUS="${RED}未应用${NC}"
-    fi
-}
-
-# --- 检测并处理 Alpine 发行版特殊逻辑 ---
-handle_alpine_special() {
-    if [ -f /etc/os-release ]; then
-        # 通过 source 引入系统变量
-        # shellcheck disable=SC1091
-        . /etc/os-release
-        if [ "${ID:-}" = "alpine" ]; then
-            echo -e "${CYAN}ℹ️ 检测到当前系统为 Alpine Linux，注入模块持久化配置...${NC}"
-            if ! grep -q "tcp_bbr" /etc/modules 2>/dev/null; then
-                echo "tcp_bbr" >> /etc/modules 2>/dev/null || true
+    if curl -fsSL -o "$TMP/$ASSET.sha256" "$URL_SHA" &> /dev/null; then
+        if command -v sha256sum &> /dev/null; then
+            LOCAL_SHA=$(sha256sum "$TMP/$ASSET" | awk '{print $1}')
+            REMOTE_SHA=$(cat "$TMP/$ASSET.sha256" | awk '{print $1}')
+            if [ "$LOCAL_SHA" = "$REMOTE_SHA" ]; then
+                ok "数字签名校验通过。"
             fi
         fi
     fi
+
+    tar xzf "$TMP/$ASSET" -C "$TMP"
+    
+    EXTRACTED_BIN=$(find "$TMP" -type f -name "warp-rust" | head -n 1)
+    [ -n "$EXTRACTED_BIN" ] || die "解压成功，但在归档包内未找到 warp-rust 主程序！"
+    
+    export TARGET_BIN_PATH="$EXTRACTED_BIN"
 }
 
-# --- 功能 1：一键安装优化 ---
-apply_optimizations() {
-    echo -e "\n${CYAN}>>> 正在分析系统硬件并生成最佳配置方案...${NC}"
-    get_system_info
-    manage_backups
-    
-    # 尝试加载内核模块（静默处理）
-    modprobe nf_conntrack >/dev/null 2>&1 || true
-    modprobe tcp_bbr >/dev/null 2>&1 || true
+# ── 2. 配置文件与服务管理 ──────────────────────────────────────────────────────
+write_config() {
+    local bind_ip="$1"
+    local bind_port="$2"
+    local username="$3"
+    local password="$4"
 
-    mkdir -p "$(dirname "$CONF_FILE")"
-    > "$CONF_FILE"
-    cat >> "$CONF_FILE" << EOF
-# ==========================================================
-# Linux Network Tuning (Proxy/Forwarding Optimized)
-# 生成时间: $(date)
-# 硬件适配: ${TOTAL_MEM}MB RAM (${VM_TIER})
-# ==========================================================
+    [ -d "$CONF_DIR" ] || install -m 0755 -d "$CONF_DIR"
+    
+    cat <<EOF > "$CONF_FILE"
+[server]
+bind = "${bind_ip}:${bind_port}"
 EOF
 
-    # 1. BBR 与 队列算法
-    add_conf "net.core.default_qdisc" "fq" "FQ 队列算法"
-    add_conf "net.ipv4.tcp_congestion_control" "bbr" "开启 BBR 拥塞控制"
-    add_conf "net.ipv4.tcp_slow_start_after_idle" "0" "关闭空闲慢启动"
+    if [ -n "$username" ] && [ -n "$password" ]; then
+        cat <<EOF >> "$CONF_FILE"
 
-    # 2. TCP Fast Open (双向开启)
-    add_conf "net.ipv4.tcp_fastopen" "3" "开启 TCP Fast Open"
-
-    # 3. 缓冲区优化
-    add_conf "net.core.rmem_max" "$RMEM_MAX" "系统最大接收缓存"
-    add_conf "net.core.wmem_max" "$WMEM_MAX" "系统最大发送缓存"
-    add_conf "net.core.rmem_default" "262144" "默认接收缓存" 
-    add_conf "net.core.wmem_default" "262144" "默认发送缓存"
-    add_conf "net.ipv4.tcp_rmem" "4096 87380 $TCP_MEM_MAX" "TCP 读缓存"
-    add_conf "net.ipv4.tcp_wmem" "4096 65536 $TCP_MEM_MAX" "TCP 写缓存"
-    add_conf "net.ipv4.udp_rmem_min" "16384" "UDP 读缓存下限"
-    add_conf "net.ipv4.udp_wmem_min" "16384" "UDP 写缓存下限"
-    add_conf "net.ipv4.udp_mem" "$UDP_MEM_CONF" "系统 UDP 内存页全局限制"
-
-    # 4. 连接与队列上限
-    add_conf "net.core.somaxconn" "$SOMAXCONN" "最大监听队列"
-    add_conf "net.core.netdev_max_backlog" "$SOMAXCONN" "网卡积压队列"
-    add_conf "net.ipv4.tcp_max_syn_backlog" "$SOMAXCONN" "SYN 半连接队列"
-    add_conf "net.ipv4.tcp_notsent_lowat" "16384" "降低缓冲区未发送数据阈值"
-
-    # 5. TIME_WAIT 与 端口复用
-    add_conf "net.ipv4.tcp_tw_reuse" "1" "开启 TIME_WAIT 复用"
-    add_conf "net.ipv4.tcp_timestamps" "1" "开启时间戳"
-    add_conf "net.ipv4.tcp_fin_timeout" "30" "缩短 FIN_WAIT 时间"
-    add_conf "net.ipv4.ip_local_port_range" "10000 65535" "扩大本地端口范围"
-    add_conf "net.ipv4.tcp_max_tw_buckets" "500000" "允许更多 TIME_WAIT socket"
-
-    # 6. TCP Keepalive
-    add_conf "net.ipv4.tcp_keepalive_time" "600" "TCP 保活时间"
-    add_conf "net.ipv4.tcp_keepalive_intvl" "15" "探测间隔"
-    add_conf "net.ipv4.tcp_keepalive_probes" "3" "探测次数"
-
-    # 7. 连接跟踪 (Conntrack)
-    if lsmod | grep -q "nf_conntrack" || [ -d /proc/sys/net/netfilter ]; then
-        add_conf "net.netfilter.nf_conntrack_max" "$CONNTRACK_MAX" "最大连接跟踪数"
-        add_conf "net.netfilter.nf_conntrack_tcp_timeout_established" "7200" "连接跟踪超时"
-        add_conf "net.netfilter.nf_conntrack_tcp_timeout_time_wait" "120" "减少 TIME_WAIT 跟踪时间"
+[server.auth]
+username = "${username}"
+password = "${password}"
+EOF
     fi
 
-    # 8. 其他安全与链路调优
-    add_conf "fs.file-max" "$FILE_MAX" "最大文件句柄"
-    add_conf "vm.swappiness" "10" "减少 Swap 使用"
-    add_conf "net.ipv4.tcp_mtu_probing" "1" "开启 MTU 探测"
-    add_conf "net.ipv4.tcp_syncookies" "1" "防 SYN Flood"
-    add_conf "net.ipv4.tcp_ecn" "1" "开启 ECN"
+    cat <<EOF >> "$CONF_FILE"
 
-    echo -e "${CYAN}>>> 正在将参数注入内核控制流...${NC}"
-    
-    # 针对不同发行版采用兼容的 sysctl 生效命令
-    sysctl --system >/dev/null 2>&1 || sysctl -p "$CONF_FILE" >/dev/null 2>&1 || true
+[logging]
+level = "warn,warp_rust=info,wireguard_netstack=warn"
+format = "pretty"
 
-    # 针对 Alpine Linux 的持久化补充
-    handle_alpine_special
+[warp]
+data_dir = "${DATA_DIR}"
+device_model = "warp-rust"
+refresh_interval = "24h"
+register_cooldown = "10m"
+mtu = 1420
+tcp_buffer_size = 1048576
 
-    # 最终复核
-    if sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then
-        echo -e "${GREEN}✅ 高级网络优化配置应用成功！BBR 已成功加速。${NC}\n"
-    else
-        echo -e "${RED}❌ 警告: 配置已写入，但检测到内核当前仍未成功切换至 BBR。${NC}"
-        echo -e "${YELLOW}💡 提示: 如果是 Alpine，可能由于缺少内核模块包。可尝试运行 'apk add linux-lts' 升级或重启。${NC}\n"
-    fi
-    
-    echo -ne "${GREEN}"
-    read -r -p "按回车键返回主菜单..." _
-    echo -ne "${NC}"
+[health]
+interval = "30s"
+timeout = "8s"
+
+[recovery]
+reconnect_after        = 1
+rebuild_config_after   = 3
+reregister_after       = 5
+rotate_identity_after  = 10
+backoff_min = "500ms"
+backoff_max = "30s"
+
+[metrics]
+enabled = true
+bind = "127.0.0.1:9090"
+
+[hot_reload]
+enabled = true
+
+[limits]
+max_concurrent_connections = 1024
+handshake_timeout = "10s"
+idle_timeout = "300s"
+relay_buffer_size = 262144
+auth_fail_sleep = "1s"
+relay_close_grace = "500ms"
+
+[dns]
+mode = "system"
+servers = ["1.1.1.1:53", "1.0.0.1:53"]
+timeout = "3s"
+cache_ttl = "60s"
+EOF
 }
 
-# --- 功能 2：卸载优化恢复默认 ---
-uninstall_optimizations() {
-    echo -e "\n${YELLOW}>>> 正在准备卸载优化配置...${NC}"
+write_systemd() {
+    cat <<EOF > "$SERVICE_FILE"
+[Unit]
+Description=cf-warp-rust Cloudflare WARP Proxy Client
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+Group=${SERVICE_USER}
+WorkingDirectory=${DATA_DIR}
+ExecStart=${INSTALL_BIN} --config ${CONF_FILE}
+Restart=always
+RestartSec=3s
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+}
+
+# ── 3. 面板功能函数实现 ────────────────────────────────────────────────────────
+get_status_info() {
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        panel_status="${YELLOW}运行中${RESET}"
+    else
+        panel_status="${RED}未运行${RESET}"
+    fi
+
+    # 【核心修改】动态解析 warp-rust 获取真实版本号
+    if [ -f "$INSTALL_BIN" ]; then
+        local raw_ver=$("$INSTALL_BIN" --version 2>/dev/null | awk '{print $2}')
+        panel_version="${raw_ver:-已安装}"
+    else
+        panel_version="${RED}未安装${RESET}"
+    fi
+
     if [ -f "$CONF_FILE" ]; then
-        rm -f "$CONF_FILE"
-        echo -e "${GREEN}✅ 已删除优化配置文件: ${CONF_FILE}${NC}"
-        echo -e "${CYAN}>>> 重新校准并加载系统默认网络参数...${NC}"
-        sysctl --system >/dev/null 2>&1 || true
-        echo -e "${GREEN}✅ 卸载完成，系统控制流已恢复至全局默认状态。${NC}\n"
+        panel_port=$(grep -i 'bind' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '"' | tr -d ' ')
     else
-        echo -e "${YELLOW}💡 提示: 未检测到生成的配置文件，无需卸载。${NC}\n"
+        panel_port="127.0.0.1:1080"
+    fi
+}
+
+menu_install() {
+    if [ -f "$INSTALL_BIN" ]; then
+        warn "系统中已存在运行中的实例文件。"
+        read -p "$(echo -e "${GREEN}是否确定完全覆盖重新安装？[y/N]: ${RESET}")" res
+        [[ "$res" =~ ^[Yy]$ ]] || return
+    fi
+
+    echo -e "\n${GREEN}==== [自定义安装配置] ====${RESET}"
+    
+    read -p "$(echo -e "${GREEN}请输入监听 IP 地址 [默认: 127.0.0.1]: ${RESET}")" input_ip
+    local opt_ip="${input_ip:-127.0.0.1}"
+
+    read -p "$(echo -e "${GREEN}请输入 SOCKS5 监听端口 [默认: 1080]: ${RESET}")" input_port
+    local opt_port="${input_port:-1080}"
+    if ! [[ "$opt_port" =~ ^[0-9]+$ ]] || [ "$opt_port" -le 0 ] || [ "$opt_port" -gt 65535 ]; then
+        opt_port=1080
+    fi
+
+    local opt_user=""
+    local opt_pass=""
+
+    if [ "$opt_ip" != "127.0.0.1" ] && [ "$opt_ip" != "localhost" ]; then
+        echo -e "${YELLOW}[安全审计] 检测到您选择将服务绑定到公网/局域网 (${opt_ip})，必须强制设置账号密码鉴权！${RESET}"
+        while true; do
+            read -p "$(echo -e "${GREEN}请输入鉴权用户名 (不能为空): ${RESET}")" opt_user
+            [ -n "$opt_user" ] && break
+            echo -e "${RED}[错误] 用户名不能为空，请重新输入。${RESET}"
+        done
+        while true; do
+            read -p "$(echo -e "${GREEN}请输入鉴权密码 (为了安全，内核要求必须 ≥16 位): ${RESET}")" opt_pass
+            if [ ${#opt_pass} -ge 16 ]; then break; fi
+            echo -e "${RED}[安全终止] 密码长度不够。公网暴露必须使用 16 位及以上的强密码！${RESET}"
+        done
+    else
+        read -p "$(echo -e "${GREEN}请输入鉴权用户名 (本地回环默认留空不启用): ${RESET}")" opt_user
+        if [ -n "$opt_user" ]; then
+            read -p "$(echo -e "${GREEN}请输入鉴权密码: ${RESET}")" opt_pass
+            if [ -z "$opt_pass" ]; then
+                warn "密码为空，已取消鉴权设置。"
+                opt_user=""
+            fi
+        fi
+    fi
+
+    download_and_extract
+
+    if ! id "$SERVICE_USER" >/dev/null 2>&1; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER" 2>/dev/null \
+          || adduser --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
+    fi
+
+    install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$INSTALL_BIN"
+    install -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" -d "$DATA_DIR"
+
+    write_config "$opt_ip" "$opt_port" "$opt_user" "$opt_pass"
+    write_systemd
+
+    systemctl start "$SERVICE_NAME"
+    sleep 1
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        ok "AnyTLS-Style WARP 安全部署成功！"
+    else
+        warn "部署完成，但进程启动异常，请稍后选择 [8] 查看日志。"
+    fi
+}
+
+menu_update() {
+    [ -f "$SERVICE_FILE" ] || die "未检测到系统服务，请先选择 [1] 进行安装。"
+    download_and_extract
+    systemctl stop "$SERVICE_NAME"
+    install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$INSTALL_BIN"
+    systemctl start "$SERVICE_NAME"
+    ok "组件已成功平滑更新。"
+}
+
+menu_uninstall() {
+
+    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1
+    systemctl disable "$SERVICE_NAME" >/dev/null 2>&1
+    rm -f "$INSTALL_BIN" "$SERVICE_FILE"
+    systemctl daemon-reload
+    rm -rf "$CONF_DIR" "$DATA_DIR"
+    userdel "$SERVICE_USER" >/dev/null 2>&1
+    ok "清理完毕。"
+}
+
+# ── 【功能 4 深度重构】动态读取、默认不变、公网强审 ───────────────────────────
+menu_edit_config() {
+    [ -f "$CONF_FILE" ] || die "未发现任何配置文件，请先执行安装步骤。"
+    
+    # 1. 精准提取当前配置中的各参数作为默认值
+    local current_bind=$(grep -i 'bind' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '"' | tr -d ' ')
+    local current_ip=$(echo "$current_bind" | awk -F ':' '{print $1}')
+    local current_port=$(echo "$current_bind" | awk -F ':' '{print $2}')
+    local current_user=$(grep -i 'username' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '"' | tr -d ' ')
+    local current_pass=$(grep -i 'password' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '"' | tr -d ' ')
+
+    [ -z "$current_ip" ] && current_ip="127.0.0.1"
+    [ -z "$current_port" ] && current_port="1080"
+
+    echo -e "\n${GREEN}==== [修改内核参数配置] ====${RESET}"
+    echo -e "${BLUE}[提示] 直接按回车将维持当前默认值不变${RESET}\n"
+
+    # 2. 引导自定义 IP
+    read -p "$(echo -e "${GREEN}请输入监听 IP 地址 [当前: ${current_ip}]: ${RESET}")" input_ip
+    local opt_ip="${input_ip:-$current_ip}"
+
+    # 3. 引导自定义端口
+    read -p "$(echo -e "${GREEN}请输入 SOCKS5 监听端口 [当前: ${current_port}]: ${RESET}")" input_port
+    local opt_port="${input_port:-$current_port}"
+    if ! [[ "$opt_port" =~ ^[0-9]+$ ]] || [ "$opt_port" -le 0 ] || [ "$opt_port" -gt 65535 ]; then
+        opt_port="$current_port"
+    fi
+
+    local opt_user=""
+    local opt_pass=""
+
+    # 4. 安全校验：绑定非本地时强制输入密码
+    if [ "$opt_ip" != "127.0.0.1" ] && [ "$opt_ip" != "localhost" ]; then
+        echo -e "${YELLOW}[安全审计] 检测到服务暴露在非回环地址 (${opt_ip})，必须强制设定鉴权密码！${RESET}"
+        
+        # 决定当前用户名默认显示
+        local prompt_user_desc="请输入鉴权用户名"
+        [ -n "$current_user" ] && prompt_user_desc="请输入鉴权用户名 [当前: ${current_user}]"
+        
+        while true; do
+            read -p "$(echo -e "${GREEN}${prompt_user_desc}: ${RESET}")" input_user
+            opt_user="${input_user:-$current_user}"
+            [ -n "$opt_user" ] && break
+            echo -e "${RED}[错误] 公网暴露下用户名不能为空。${RESET}"
+        done
+
+        local prompt_pass_desc="请输入鉴权密码 (≥16位)"
+        [ -n "$current_pass" ] && prompt_pass_desc="请输入鉴权密码 [当前已设置，直接回车保持不变，或输入新密码]"
+
+        while true; do
+            read -p "$(echo -e "${GREEN}${prompt_pass_desc}: ${RESET}")" input_pass
+            opt_pass="${input_pass:-$current_pass}"
+            if [ ${#opt_pass} -ge 16 ]; then break; fi
+            echo -e "${RED}[安全终止] 密码长度不够 (${#opt_pass}位)。公网暴露必须使用 16 位及以上的强密码！${RESET}"
+        done
+    else
+        # 本地回环地址下，读取原有值作为默认回车项
+        local p_user_text="请输入鉴权用户名 (留空不启用)"
+        [ -n "$current_user" ] && p_user_text="请输入鉴权用户名 [当前: ${current_user}, 留空清除]"
+        read -p "$(echo -e "${GREEN}${p_user_text}: ${RESET}")" input_user
+        
+        # 如果当前有值且用户直接回车，则保留旧值
+        if [ -z "$input_user" ] && [ -n "$current_user" ] && [ "$input_user" != "" ]; then
+            # 区分：普通回车还是故意输入空？利用变量判空
+            # 这里为了实现“回车不变，留空清除”的直观习惯，做细化处理：
+            # 在 Bash 中，若用户直接输入回车，input_user 长度为 0
+            # 为彻底简化体验，如果用户想保留就直接回车，若想清除则输入单空格或特定符号，这里直接采用“回车即使用原有配置”
+            opt_user="$current_user"
+            opt_pass="$current_pass"
+        else
+            opt_user="$input_user"
+            if [ -n "$opt_user" ]; then
+                read -p "$(echo -e "${GREEN}请输入鉴权密码: ${RESET}")" input_pass
+                opt_pass="$input_pass"
+            fi
+        fi
+    fi
+
+    # 5. 写入配置并重启
+    write_config "$opt_ip" "$opt_port" "$opt_user" "$opt_pass"
+
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        systemctl restart "$SERVICE_NAME" && ok "配置已覆盖，服务已成功重启使新参数生效！"
+    else
+        ok "配置已成功重写更新。"
+    fi
+}
+
+menu_show_node_config() {
+    if [ ! -f "$CONF_FILE" ]; then
+        die "未检测到有效的服务配置文件。"
     fi
     
-    echo -ne "${GREEN}"
-    read -r -p "按回车键返回主菜单..." _
-    echo -ne "${NC}"
+    echo -e "\n${GREEN}========= 当前节点本地配置 =========${RESET}"
+    cat "$CONF_FILE" | grep -A 5 "\[server\]"
+    echo -e "${GREEN}====================================${RESET}"
+
+    local full_bind=$(grep -i 'bind' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '"' | tr -d ' ')
+    local bind_ip=$(echo "$full_bind" | awk -F ':' '{print $1}')
+    local bind_port=$(echo "$full_bind" | awk -F ':' '{print $2}')
+
+    local connect_ip="$bind_ip"
+    if [ "$connect_ip" = "0.0.0.0" ]; then connect_ip="127.0.0.1"; fi
+
+    local auth_user=$(grep -i 'username' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '"' | tr -d ' ')
+    local auth_pass=$(grep -i 'password' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '"' | tr -d ' ')
+
+    local proxy_args="--socks5-hostname ${connect_ip}:${bind_port}"
+    if [ -n "$auth_user" ] && [ -n "$auth_pass" ]; then
+        proxy_args="--socks5-hostname ${auth_user}:${auth_pass}@${connect_ip}:${bind_port}"
+    fi
+
+    echo -e "\n${YELLOW}[正在通过本地代理验证流量连通性...]${RESET}"
+    if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+        warn "警告: 当前本地检测到后台服务未开启，验证可能无法成功！"
+    fi
+
+    TMP_TRACE="$(mktemp)"
+    if curl -sS --max-time 6 $proxy_args "https://1.1.1.1/cdn-cgi/trace" > "$TMP_TRACE" 2>&1; then
+        local trace_ip=$(grep -i '^ip=' "$TMP_TRACE" | awk -F '=' '{print $2}')
+        local trace_warp=$(grep -i '^warp=' "$TMP_TRACE" | awk -F '=' '{print $2}')
+        local trace_colo=$(grep -i '^colo=' "$TMP_TRACE" | awk -F '=' '{print $2}')
+
+        echo -e "${GREEN}========= Cloudflare 真实性报告 =========${RESET}"
+        if [ "$trace_warp" = "on" ] || [ "$trace_warp" = "plus" ]; then
+            echo -e " 隧道验证状态 :  ${GREEN}✔ 通过 (流量确实从 Cloudflare 网络流出)${RESET}"
+            echo -e " WARP 激活状态:  ${GREEN}on${RESET}"
+        else
+            echo -e " 隧道验证状态 :  ${RED}✘ 未通过 (可能没有走代理隧道)${RESET}"
+            echo -e " WARP 激活状态:  ${RED}${trace_warp:-off}${RESET}"
+        fi
+        echo -e " CF 分配出口IP:  ${YELLOW}${trace_ip}${RESET}"
+        echo -e " CF 边缘数据中心: ${YELLOW}${trace_colo}${RESET}"
+        echo -e "${GREEN}=========================================${RESET}"
+    else
+        echo -e "${RED}[验证失败]${RESET} 无法通过代理连接到 Cloudflare 验证端点。"
+        echo -e "错误回显: $(cat "$TMP_TRACE" | head -n 2)\n"
+    fi
+    rm -f "$TMP_TRACE"
 }
 
-# --- 交互菜单 ---
-menu() {
-    while true; do
-        clear
-        get_status_text
-        
-        echo -e "${GREEN}====================================${NC}"
-        echo -e "${GREEN}      BBR+TCP智能调参综合优化        ${NC}"
-        echo -e "${GREEN}====================================${NC}"
-        echo -e "${GREEN}  BBR  : ${BBR_STATUS}"
-        echo -e "${GREEN}  FQ   : ${CONF_STATUS}"
-        echo -e "${GREEN}  配置 : ${CONF_STATUS}"
-        echo -e "${GREEN}====================================${NC}"
-        echo -e "${GREEN}  1. 网络优化${NC}"
-        echo -e "${GREEN}  2. 卸载优化${NC}"
-        echo -e "${GREEN}  0. 退出${NC}"
-        echo -e "${GREEN}====================================${NC}"
-        
-        echo -ne "${GREEN} 请输入选项: ${NC}"
-        read -r choice
-        
-        case "$choice" in
-            1)
-                apply_optimizations
-                ;;
-            2)
-                uninstall_optimizations
-                ;;
-            0)
-                exit 0
-                ;;
-            *)
-                echo -e "${RED}❌ 输入错误，3秒后自动返回重试...${NC}"
-                sleep 3
-                ;;
-        esac
-    done
-}
-
-# --- 主入口 ---
-main() {
-    check_root
-    check_bbr_support
-    menu
-}
-
-main "$@"
+# ── 4. 主循环控制中心 ─────────────────────────────────────────────────────────
+while true; do
+    get_status_info
+    
+    clear
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}       CF-WARP-RUST 面板       ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $panel_status"
+    echo -e "${GREEN}版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
+    echo -e "${GREEN}绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}1. 安装 WARP-Rust${RESET}"
+    echo -e "${GREEN}2. 更新 WARP-Rust${RESET}"
+    echo -e "${GREEN}3. 卸载 WARP-Rust${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 WARP-Rust${RESET}"
+    echo -e "${GREEN}6. 停止 WARP-Rust${RESET}"
+    echo -e "${GREEN}7. 重启 WARP-Rust${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看配置与出口状态${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    
+    read -p "$(echo -e "${GREEN}请输入选项: ${RESET}")" choice
+    
+    case "$choice" in
+        1) menu_install ;;
+        2) menu_update ;;
+        3) menu_uninstall ;;
+        4) menu_edit_config ;;
+        5) systemctl start "$SERVICE_NAME" && ok "动作: 启动成功" ;;
+        6) systemctl stop "$SERVICE_NAME" && ok "动作: 停止成功" ;;
+        7) systemctl restart "$SERVICE_NAME" && ok "动作: 重启成功" ;;
+        8) journalctl -u "$SERVICE_NAME" -n 50 -f ;;
+        9) menu_show_node_config ;;
+        0) clear; exit 0 ;;
+        *) warn "未识别的无效序号！"; sleep 1 ;;
+    esac
+    echo
+    read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键返回主控制面板...${RESET}")"
+done

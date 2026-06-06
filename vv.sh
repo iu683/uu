@@ -1,217 +1,265 @@
 #!/bin/bash
-# =========================================================================
-# IPv4 / IPv6 管理面板
-# =========================================================================
 
-if [ "$EUID" -ne 0 ]; then
-    echo -e "\033[31m❌ 错误：请使用 root 权限运行此脚本！\033[0m"
-    exit 1
-fi
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m' # 无颜色
 
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+# 脚本路径与代理定义
+GH_PROXY="https://v6.gh-proxy.org/"
+INSTALL_DIR="$HOME/gproxy-tool"
+CONFIG_FILE="$HOME/.config/gproxy/config.env"
 
-has_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-get_os_type() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        echo "$ID"
+# 动态获取 tunnel.sh 路径（优先系统路径，其次克隆路径）
+get_tunnel_path() {
+    if [ -f "/usr/lib/gproxy/lib/tunnel.sh" ]; then
+        echo "/usr/lib/gproxy/lib/tunnel.sh"
+    elif [ -f "$INSTALL_DIR/lib/tunnel.sh" ]; then
+        echo "$INSTALL_DIR/lib/tunnel.sh"
     else
-        echo "unknown"
+        echo ""
     fi
 }
 
-install_pkg() {
-    local pkg="$1"
-    local os=$(get_os_type)
-    if has_cmd "$pkg"; then return; fi
-    
-    echo -e "${YELLOW}🔧 正在补全系统依赖: $pkg ...${RESET}"
-    case "$os" in
-        ubuntu|debian)
-            apt-get update -y >/dev/null 2>&1
-            apt-get install -y "$pkg" >/dev/null 2>&1
-            ;;
-        alpine)
-            apk add --no-cache "$pkg" >/dev/null 2>&1
-            ;;
-        centos|rhel|rocky|almalinux)
-            yum install -y "$pkg" >/dev/null 2>&1 || dnf install -y "$pkg" >/dev/null 2>&1
-            ;;
-    esac
-}
-
-check_deps() {
-    local deps=(curl ip ping sysctl awk grep)
-    for cmd in "${deps[@]}"; do install_pkg "$cmd"; done
-}
-
-detect_iface() {
-    ip -o link show | awk -F': ' '{print $2}' | grep -vE 'lo|docker|veth|br-' | head -n1
-}
-
-get_public_ip() {
-    local mode="$1"
-    local ip_res=""
-    local apis=("https://api.ip.sb/ip" "https://icanhazip.com" "https://v4.ident.me")
-    [ "$mode" = "-6" ] && apis=("https://api-ipv6.ip.sb/ip" "https://ipv6.icanhazip.com" "https://v6.ident.me")
-
-    for url in "${apis[@]}"; do
-        ip_res=$(curl "$mode" -sL -A "Mozilla/5.0" --connect-timeout 3 "$url" 2>/dev/null | tr -d '\r\n[:space:]')
-        if [ -n "$ip_res" ] && [[ ! "$ip_res" == *"<"* && ! "$ip_res" == *"html"* ]]; then
-            echo "$ip_res"
-            return 0
-        fi
-    done
-    echo "未获取到公网IP"
-    return 1
-}
-
-get_menu_status() {
-    local iface="$1"
-    local v4_addr=$(ip -4 addr show dev "$iface" 2>/dev/null | grep "inet" | awk '{print $2}' | head -n1)
-    V4_STATUS=$( [ -z "$v4_addr" ] && echo -e "${RED}未启用${RESET}" || echo -e "${GREEN}已启用${RESET}" )
-
-    local is_v6_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
-    if [ "$is_v6_disabled" = "1" ]; then
-        V6_STATUS="${RED}已禁用${RESET}"
+# 检查是否安装了 gproxy
+check_status() {
+    if command -v gproxy &> /dev/null; then
+        echo -e "${GREEN}[已安装]${NC}"
     else
-        local v6_addr=$(ip -6 addr show dev "$iface" 2>/dev/null | grep "inet6" | grep -v "fe80" | awk '{print $2}' | head -n1)
-        V6_STATUS=$( [ -z "$v6_addr" ] && echo -e "${YELLOW}已开启(无公网IP)${RESET}" || echo -e "${GREEN}已启用${RESET}" )
+        echo -e "${RED}[未安装]${NC}"
     fi
 }
 
-check_deps
-os_type=$(get_os_type)
+# 获取当前本地端口
+get_current_port() {
+    local tunnel_path=$(get_tunnel_path)
+    if [ -n "$tunnel_path" ] && [ -f "$tunnel_path" ]; then
+        grep -E '^LOCAL_PORT=' "$tunnel_path" | cut -d'=' -f2
+    else
+        echo "19527 (默认)"
+    fi
+}
 
-while true; do
+# 菜单头部
+show_header() {
     clear
-    iface=$(detect_iface)
-    [ -z "$iface" ] && iface="未检测到网卡"
-    get_menu_status "$iface"
+    echo -e " ${GREEN}===============================${NC}"
+    echo -e " ${GREEN}  GProxy -SSH 隧道网络加速工具  ${NC}"
+    echo -e " ${GREEN}===============================${NC}"
+    echo -e " ${GREEN}当前状态:${NC} $(check_status)"
+    echo -e " ${GREEN}代理端口:${NC} ${YELLOW}$(get_current_port)${NC}"
+    if [ -f "$CONFIG_FILE" ]; then
+        echo -e " ${GREEN}当前配置VPS:${NC} ${BLUE}$(grep 'VPS_IP' $CONFIG_FILE 2>/dev/null | cut -d'=' -f2 || echo '已配置')${NC}"
+    fi
+    echo -e " ${GREEN}===============================${NC}"
+}
 
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}      ◈  IPv4 / IPv6 管理面板  ◈      ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN} 当前系统  : ${YELLOW}${os_type}${RESET}"
-    echo -e "${GREEN} 活跃网卡  : ${YELLOW}${iface}${RESET}"
-    echo -e "${GREEN} IPv4 状态 : ${V4_STATUS}"
-    echo -e "${GREEN} IPv6 状态 : ${V6_STATUS}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}  1) 禁用 IPv6 (支持临时/永久)${RESET}"
-    echo -e "${GREEN}  2) 开启 IPv6 ${RESET}"
-    echo -e "${GREEN}  3) 查看网卡IP${RESET}"
-    echo -e "${GREEN}  0) 退出${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
+# 安装准备（生成并配置 SSH 密钥）
+prepare_ssh_key() {
+    echo -e "${YELLOW}[步骤 1/3] 正在国内服务器生成 SSH 密钥对...${NC}"
+    if [ -f "$HOME/.ssh/vps_key" ]; then
+        echo -e "${PURPLE}提示: 发现已存在密钥文件 ~/.ssh/vps_key，跳过生成。${NC}"
+    else
+        ssh-keygen -t rsa -b 4096 -f "$HOME/.ssh/vps_key" -N ""
+        echo -e "${GREEN}成功生成密钥: ~/.ssh/vps_key${NC}"
+    fi
+
+    echo -e "\n${YELLOW}[步骤 2/3] 将公钥复制到海外 VPS (请按提示操作)...${NC}"
+    read -p "请输入海外 VPS 的 IP 地址: " vps_ip
+    read -p "请输入海外 VPS 的 SSH 用户名 (默认 root): " vps_user
+    vps_user=${vps_user:-root}
+    read -p "请输入海外 VPS 的 SSH 端口 (默认 22): " vps_port
+    vps_port=${vps_port:-22}
+
+    echo -e "${BLUE}正在执行 ssh-copy-id，接下来请输入海外 VPS 的密码...${NC}"
+    ssh-copy-id -p "$vps_port" -i "$HOME/.ssh/vps_key.pub" "$vps_user@$vps_ip"
+
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}[OK] 公钥复制成功！${NC}"
+        echo -e "\n${YELLOW}[步骤 3/3] 正在测试免密登录...${NC}"
+        echo -e "${BLUE}尝试不输入密码登录海外 VPS 并执行 'echo 连接成功'：${NC}"
+        ssh -p "$vps_port" -i "$HOME/.ssh/vps_key" -o PasswordAuthentication=no -o StrictHostKeyChecking=no "$vps_user@$vps_ip" "echo '🎉 [OK] 成功连接到海外 VPS，免密配置完美！'"
+    else
+        echo -e "${RED}[ERROR] 公钥复制失败，请检查网络或海外密码是否正确。${NC}"
+    fi
+
+    read -p "按回车键返回主菜单..." dummy
+}
+
+# 1. 下载并安装 (已集成 gh-proxy 代理)
+install_gproxy() {
+    echo -e "${YELLOW}[1/3] 正在通过 gh-proxy 代理克隆仓库...${NC}"
+    echo -e "${BLUE}代理节点: ${GH_PROXY}${NC}"
     
-    echo -ne "${GREEN} 请选择操作编号: ${RESET}"
-    read choice
+    if [ -d "$INSTALL_DIR" ]; then
+        echo -e "${YELLOW}目录 $INSTALL_DIR 已存在，正在尝试更新...${NC}"
+        cd "$INSTALL_DIR" || exit
+        git remote set-url origin "${GH_PROXY}https://github.com/xtianowner/gproxy-tool.git"
+        git pull
+    else
+        git clone "${GH_PROXY}https://github.com/xtianowner/gproxy-tool.git" "$INSTALL_DIR"
+    fi
 
-    case "$choice" in
-        1)
-            sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1
-            sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1
-            sysctl -w net.ipv6.conf.${iface}.disable_ipv6=1 >/dev/null 2>&1
-            
-            echo -e "${YELLOW}------ 💾 持久化配置选项 ------${RESET}"
-            echo -e "${GREEN}  1) 仅临时禁用（重启服务器后恢复 IPv6）${RESET}"
-            echo -e "${GREEN}  2) 永久禁用（锁入系统文件，重启不失效）${RESET}"
-            echo -ne "${YELLOW} 请选择禁用模式 [默认 1]: ${RESET}"
-            read perm_choice
-            
-            if [ "$perm_choice" = "2" ]; then
-                if [ -f /etc/sysctl.conf ]; then
-                    sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
-                    echo "net.ipv6.conf.all.disable_ipv6 = 1" >> /etc/sysctl.conf
-                    echo "net.ipv6.conf.default.disable_ipv6 = 1" >> /etc/sysctl.conf
-                    echo "net.ipv6.conf.${iface}.disable_ipv6 = 1" >> /etc/sysctl.conf
-                fi
-                if [ "$os_type" = "ubuntu" ] && has_cmd netplan; then
-                    netplan apply >/dev/null 2>&1
-                fi
-                echo -e "\n${GREEN}✅ 已成功【永久禁用】IPv6，重启不会失效！${RESET}"
+    cd "$INSTALL_DIR" || exit
+
+    echo -e "\n${YELLOW}[2/3] 正在检查免密私钥...${NC}"
+    key_path="$HOME/.ssh/vps_key"
+    if [ -f "$key_path" ]; then
+        mkdir -p config
+        cp "$key_path" config/
+        echo -e "${GREEN}自动发现并复制私钥 $key_path 到 config/ 目录${NC}"
+    else
+        read -p "未找到默认私钥，请手动输入私钥路径 (直接回车跳过): " custom_key
+        if [ -f "$custom_key" ]; then
+            mkdir -p config
+            cp "$custom_key" config/
+            echo -e "${GREEN}成功复制私钥 $custom_key 到 config/ 目录${NC}"
+        else
+            echo -e "${YELLOW}提示: 未放入私钥，稍后可在交互配置中手动指定。${NC}"
+        fi
+    fi
+
+    echo -e "\n${YELLOW}[3/3] 开始安装（需要 sudo 权限）...${NC}"
+    sudo sh install.sh
+    
+    echo -e "${GREEN}安装程序执行完毕！${NC}"
+    read -p "按回车键返回主菜单..." dummy
+}
+
+# 2. 首次运行 / 测试配置
+test_config() {
+    if ! command -v gproxy &> /dev/null; then
+        echo -e "${RED}错误: GProxy 未安装，请先执行安装！${NC}"
+    else
+        echo -e "${YELLOW}正在触发 GProxy 配置/测试命令...${NC}"
+        gproxy curl -I https://www.google.com
+    fi
+    read -p "按回车键返回主菜单..." dummy
+}
+
+# 3. 重新配置服务器
+reconfig_vps() {
+    if ! command -v gproxy &> /dev/null; then
+        echo -e "${RED}错误: GProxy 未安装！${NC}"
+    else
+        gproxy --config
+    fi
+    read -p "按回车键返回主菜单..." dummy
+}
+
+# 4. 修改本地代理端口
+change_port() {
+    local tunnel_path=$(get_tunnel_path)
+    if [ -z "$tunnel_path" ]; then
+        echo -e "${RED}错误: 未找到 tunnel.sh 脚本！请确保已执行选项 1 克隆或安装。${NC}"
+    else
+        current_port=$(get_current_port)
+        echo -e "${YELLOW}目标文件: $tunnel_path${NC}"
+        echo -e "${YELLOW}当前本地代理端口为: ${GREEN}$current_port${NC}"
+        read -p "请输入新的端口号 (1024-65353): " new_port
+        if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1024 ] && [ "$new_port" -le 65353 ]; then
+            if [ -w "$tunnel_path" ]; then
+                sed -i "s/^LOCAL_PORT=.*/LOCAL_PORT=$new_port/" "$tunnel_path"
             else
-                if [ -f /etc/sysctl.conf ]; then
-                    sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
-                fi
-                echo -e "\n${GREEN}✅ 已成功【临时禁用】IPv6（重启服务器后将自动恢复）。${RESET}"
+                sudo sed -i "s/^LOCAL_PORT=.*/LOCAL_PORT=$new_port/" "$tunnel_path"
             fi
-            read -rp "按回车键返回菜单..."
-            ;;
-        2)
-            # 1. 恢复内核参数
-            sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
-            sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
-            sysctl -w net.ipv6.conf.${iface}.disable_ipv6=0 >/dev/null 2>&1
-            
-            if [ -f /etc/sysctl.conf ]; then
-                sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
-            fi
-            
-            # 2. 核心分支判断：根据不同系统执行不同生效策略
-            if [ "$os_type" = "ubuntu" ]; then
-                if has_cmd netplan; then
-                    echo -e "${YELLOW}⏳ 检测到 Ubuntu 系统，正在通过 Netplan 安全刷新网络...${RESET}"
-                    netplan apply >/dev/null 2>&1
-                    sleep 2
-                fi
-                echo -e "${GREEN}✅ 内核 IPv6 模块已平滑激活。${RESET}"
-                echo -e "${YELLOW}提示：Ubuntu 系统无需重启。如果仍未获取到 IPv6，请重启系统。${RESET}"
-                read -rp "按回车键返回菜单..."
-            else
-                # 非 Ubuntu 系统（CentOS/Alpine等），执行原版的重启逻辑
-                echo -e "${GREEN}✅ 内核 IPv6 模块已激活。${RESET}"
-                echo -e "${YELLOW}当前系统为 [${os_type}]，通常需要重启系统才能正确获取公网 IPv6 地址。${RESET}"
-                read -rp "按回车键 [立即重启] 系统，或按 Ctrl+C 取消..."
-                reboot
-            fi
-            ;;
-        3)
-            echo -e "${GREEN}🌐 [1/3] 内核 IPv6 状态：${RESET}"
-            is_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
-            [ "$is_disabled" = "1" ] && echo -e "${RED}❌ 内核已禁用 IPv6${RESET}" || echo -e "${GREEN}✅ 内核已启用 IPv6${RESET}"
+            echo -e "${GREEN}端口已成功修改为 $new_port !${NC}"
+        else
+            echo -e "${RED}输入无效，未做任何修改。${NC}"
+        fi
+    fi
+    read -p "按回车键返回主菜单..." dummy
+}
 
-            echo -e "\n${GREEN}📌 [2/3] 活跃网卡硬件及双栈本地 IP 分配：${RESET}"
-            # 强化部分：提取网卡底层状态
-            local link_info=$(ip link show dev "$iface" 2>/dev/null)
-            local mtu_val=$(echo "$link_info" | awk '{print $5}')
-            local state_val=$(echo "$link_info" | awk '{print $9}')
-            
-            echo -e "  ${YELLOW}网卡名称:${RESET} $iface"
-            echo -e "  ${YELLOW}物理地址(MAC):${RESET} $(get_mac_address "$iface")"
-            echo -e "  ${YELLOW}最大传输单元(MTU):${RESET} $mtu_val"
-            echo -e "  ${YELLOW}网卡链路状态:${RESET} $state_val"
-            
-            echo -ne "  ${YELLOW}本地 IPv4 地址:${RESET} "
-            ip -4 addr show dev "$iface" 2>/dev/null | grep "inet" | awk '{print $2}' || echo "${RED}未检测到 IPv4${RESET}"
-            echo -ne "  ${YELLOW}本地 IPv6 地址:${RESET} "
-            ip -6 addr show dev "$iface" 2>/dev/null | grep "inet6" | awk '{print $2}' || echo "${RED}未检测到 IPv6${RESET}"
+# 5. 编辑配置文件
+edit_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        echo -e "${YELLOW}即将打开 $CONFIG_FILE ...${NC}"
+        nano "$CONFIG_FILE" || vim "$CONFIG_FILE" || vi "$CONFIG_FILE"
+    else
+        echo -e "${RED}配置文件不存在，请先运行一次配置（选项 2）。${NC}"
+    fi
+    read -p "按回车键返回主菜单..." dummy
+}
 
-            echo -e "\n${GREEN}🔎 [3/3] 公网双栈连通性及公网 IP 测试：${RESET}"
-            if has_cmd ping; then
-                ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 && echo -e "${GREEN}✅ IPv4 路由连通正常${RESET}" || echo -e "${RED}❌ IPv4 路由无法访问公网${RESET}"
-            fi
-            echo -n "   └─ 本机公网 IPv4: "
-            get_public_ip "-4"
+# 6. 常用命令快捷查阅
+show_usage() {
+    clear
+    echo -e "${CYAN}==================================================${NC}"
+    echo -e "${GREEN}            GProxy 常用命令速查手册               ${NC}"
+    echo -e "${CYAN}==================================================${NC}"
+    echo -e "${YELLOW}1. Git 加速:${NC}        gproxy git clone https://github.com/... "
+    echo -e "${YELLOW}2. Docker 加速:${NC}     gproxy docker pull alpine:latest"
+    echo -e "${YELLOW}3. Python pip:${NC}     gproxy pip install torch"
+    echo -e "${YELLOW}4. Node.js npm:${NC}    gproxy npm install"
+    echo -e "${YELLOW}5. 系统更新:${NC}        gproxy bash -c \"apt update && apt install -y vim\""
+    echo -e "${YELLOW}6. 下载文件:${NC}        gproxy wget https://... 或 gproxy curl -O ..."
+    echo -e "${YELLOW}7. 复合安装脚本:${NC}    gproxy bash -c \"bash <(curl -sL https://...)\""
+    echo -e "${CYAN}--------------------------------------------------${NC}"
+    read -p "按回车键返回主菜单..." dummy
+}
 
-            has_v6=false
-            if has_cmd ping6; then ping6 -c 2 -W 3 240c::6666 >/dev/null 2>&1 && has_v6=true
-            elif has_cmd ping; then ping -6 -c 2 -W 3 240c::6666 >/dev/null 2>&1 && has_v6=true; fi
+# 7. 卸载 (增强兼容性与源码清理)
+uninstall_gproxy() {
+    echo -e "${RED}警告: 您确定要卸载 GProxy 吗？(y/n)${NC}"
+    read -p "> " confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        # 1. 优先调用克隆目录中的卸载脚本
+        if [ -f "$INSTALL_DIR/uninstall.sh" ]; then
+            echo -e "${YELLOW}正在执行源码目录中的卸载程序...${NC}"
+            sudo sh "$INSTALL_DIR/uninstall.sh"
+        # 2. 其次调用系统目录中的卸载脚本
+        elif [ -f "/usr/lib/gproxy/uninstall.sh" ]; then
+            echo -e "${YELLOW}正在执行系统目录中的卸载程序...${NC}"
+            sudo sh /usr/lib/gproxy/uninstall.sh
+        else
+            echo -e "${YELLOW}未检测到标准的卸载脚本，尝试直接清理核心命令...${NC}"
+            sudo rm -f /usr/local/bin/gproxy /usr/bin/gproxy 2>/dev/null
+        fi
 
-            if [ "$has_v6" = true ]; then
-                echo -e "${GREEN}✅ IPv6 路由连通正常${RESET}"
-                echo -n "   └─ 本机公网 IPv6: "
-                get_public_ip "-6"
-            else
-                echo -e "${RED}❌ IPv6 无法访问外部网络 (或网卡尚未被分配公网IPv6)${RESET}"
-            fi
-            echo
-            read -rp "按回车键返回菜单..."
-            ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}❌ 输入错误，无此选项${RESET}"; sleep 1 ;;
+        # 3. 卸载完后，连带清理 /root/gproxy-tool 源码目录
+        if [ -d "$INSTALL_DIR" ]; then
+            echo -e "${YELLOW}正在清理克隆目录: $INSTALL_DIR ...${NC}"
+            rm -rf "$INSTALL_DIR"
+            echo -e "${GREEN}源码目录清理完毕！${NC}"
+        fi
+        
+        echo -e "${GREEN}卸载流程执行完毕！${NC}"
+    else
+        echo -e "${GREEN}已取消卸载。${NC}"
+    fi
+    read -p "按回车键返回主菜单..." dummy
+}
+
+# 主循环
+while true; do
+    show_header
+    echo -e " ${GREEN}1. 生成SSH密钥并打通免密(可选)${NC}"
+    echo -e " ${GREEN}2. 安装GProxy${NC}"
+    echo -e " ${GREEN}3. 首次配置/测试Google连通性${NC}"
+    echo -e " ${GREEN}4. 重新配置服务器信息${NC}"
+    echo -e " ${GREEN}5. 修改本地代理端口${NC}"
+    echo -e " ${GREEN}6. 手动编辑配置文件(多VPS切换)${NC}"
+    echo -e " ${GREEN}7. 查看常用命令使用示例"
+    echo -e " ${GREEN}8. 卸载 GProxy${NC}"
+    echo -e " ${GREEN}0. 退出${NC}"
+    echo -e " ${GREEN}===============================${NC}"
+    read -p "$(echo -e "${GREEN}请输入数字选择操作: ${NC}")" choice
+
+    case $choice in
+        1) prepare_ssh_key ;;
+        2) install_gproxy ;;
+        3) test_config ;;
+        4) reconfig_vps ;;
+        5) change_port ;;
+        6) edit_config ;;
+        7) show_usage ;;
+        8) uninstall_gproxy ;;
+        0) clear; exit 0 ;;
+        *) echo -e "${RED}无效输入，请重新选择！${NC}"; sleep 1 ;;
     esac
 done

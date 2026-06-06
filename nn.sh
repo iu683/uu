@@ -1,403 +1,554 @@
 #!/bin/bash
-# =========================================================================
-#        ◈ 多语言开发环境通用安装/卸载智控面板（动态版本显示版）◈
-# =========================================================================
+# VPS Toolbox
+# 功能：
+# - 一级菜单加 ▶ 标识，字体绿色
+# - 二级菜单简洁显示，输入 1~99 都可执行
+# - 快捷指令 m / M 自动创建
+# - 系统信息面板
+# - 彩色菜单和动态彩虹标题
+# - 完整安装/卸载
 
-# 权限校验
-if [ "$EUID" -ne 0 ]; then
-    echo -e "\033[31m❌ 错误：请使用 root 权限运行此脚本！\033[0m"
-    exit 1
-fi
+INSTALL_PATH="$HOME/vps-toolbox.sh"
+SHORTCUT_PATH="/usr/local/bin/m"
+SHORTCUT_PATH_UPPER="/usr/local/bin/M"
 
+# 颜色
 green="\033[32m"
+reset="\033[0m"
 yellow="\033[33m"
 red="\033[31m"
-skyblue="\033[36m"
-purple="\033[35m"
-re="\033[0m"
+cyan="\033[36m"
+BLUE="\033[34m"
+ORANGE='\033[38;5;208m'
 
-# ================== 系统动态精准检测 ==================
-detect_os() {
-    if [ -f /etc/os-release ]; then
-        OS=$(grep -o -E "Debian|Ubuntu|CentOS|Alpine|Fedora|Rocky|AlmaLinux|Amazon" /etc/os-release | head -n 1)
-    fi
-    if [ -z "$OS" ]; then
-        echo -e "${red}❌ 不支持的系统架构！${re}"
-        exit 1
-    else
-        echo -e "${green}当前检测到宿主系统：${yellow}${OS}${re}"
-    fi
+
+# ===============================
+# 国家/地区判断与代理
+# ===============================
+PROXY_PREFIX=""
+# 通过API 检测是否为中国大陆 IP
+CN_CHECK=$(curl -s --max-time 5 ipinfo.io/country/)
+
+if [[ "$CN_CHECK" == "CN" ]]; then
+    PROXY_PREFIX="https://v6.gh-proxy.org/"
+else
+    :
+fi
+
+# 彩虹标题
+rainbow_animate() {
+    local text="$1"
+    local colors=(31 33 32 36 34 35)
+    local len=${#text}
+    for ((i=0; i<len; i++)); do
+        printf "\033[%sm%s" "${colors[$((i % ${#colors[@]}))]}" "${text:$i:1}"
+        sleep 0.002
+    done
+    printf "${reset}\n"
 }
 
-# ================== 动态获取环境状态（用于菜单显示） ==================
-get_env_status() {
-    local type="$1"
-    case "$type" in
-        python)
-            if command -v python3 >/dev/null 2>&1; then
-                echo -e "${green}(已安装: $(python3 -V 2>&1 | awk '{print $2}'))${re}"
-            else
-                echo -e "${yellow}(未安装)${re}"
-            fi
-            ;;
-        node)
-            if command -v node >/dev/null 2>&1; then
-                echo -e "${green}(已安装: $(node -v))${re}"
-            else
-                echo -e "${yellow}(未安装)${re}"
-            fi
-            ;;
-        go)
-            if command -v go >/dev/null 2>&1; then
-                local go_v=$(go version | grep -oE 'go[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
-                echo -e "${green}(已安装: ${go_v})${re}"
-            else
-                echo -e "${yellow}(未安装)${re}"
-            fi
-            ;;
-        java)
-            if command -v java >/dev/null 2>&1; then
-                # 提取类似 21.0.2 或 1.8.0 的版本号
-                local java_v=$(java -version 2>&1 | head -n1 | grep -oE '"[^"]+"' | head -n1 | tr -d '"')
-                echo -e "${green}(已安装: ${java_v})${re}"
-            else
-                echo -e "${yellow}(未安装)${re}"
-            fi
-            ;;
-        php)
-            if command -v php >/dev/null 2>&1; then
-                local php_v=$(php -v | head -n1 | awk '{print $2}')
-                echo -e "${green}(已安装: ${php_v})${re}"
-            else
-                echo -e "${yellow}(未安装)${re}"
-            fi
-            ;;
-    esac
-}
+# 系统资源显示
+show_system_usage() {
+    local width=36
+    local content_indent="    "
 
-# ================== 自动化依赖环境补全 ==================
-install_deps() {
-    echo -e "${yellow}⚙️ 正在为您自动同步系统基础依赖包...${re}"
-    case "$OS" in
-        Debian|Ubuntu)
-            apt-get update -y >/dev/null 2>&1
-            apt-get install -y wget tar build-essential libreadline-dev libncursesw5-dev libssl-dev libsqlite3-dev tk-dev libgdbm-dev libc6-dev libbz2-dev libffi-dev zlib1g-dev curl jq software-properties-common ca-certificates gnupg >/dev/null 2>&1
-            ;;
-        CentOS)
-            yum update -y >/dev/null 2>&1
-            yum groupinstall -y "Development Tools" >/dev/null 2>&1
-            yum install -y wget tar openssl-devel bzip2-devel libffi-devel zlib-devel curl jq epel-release yum-utils >/dev/null 2>&1
-            ;;
-        Fedora|Rocky|AlmaLinux|Amazon)
-            dnf update -y >/dev/null 2>&1
-            dnf groupinstall -y "Development Tools" >/dev/null 2>&1
-            dnf install -y wget tar openssl-devel bzip2-devel libffi-devel zlib-devel curl jq epel-release yum-utils >/dev/null 2>&1
-            ;;
-        Alpine)
-            apk update >/dev/null 2>&1
-            apk add wget tar build-base openssl-dev bzip2-dev libffi-dev zlib-dev curl jq >/dev/null 2>&1
-            ;;
-    esac
-}
-
-get_arch() {
-    local arch_raw=$(uname -m)
-    case "$arch_raw" in
-        x86_64|amd64) ARCH="amd64" ;;
-        x86) ARCH="386" ;;
-        arm64|aarch64) ARCH="arm64" ;;
-        *) echo -e "${red}❌ 不支持的硬件架构: $arch_raw${re}"; exit 1 ;;
-    esac
-}
-
-# ================== Python 3.14+ 编译环境 ==================
-install_python() {
-    local latest_version="3.14.3"
-    if command -v python3 >/dev/null 2>&1; then
-        local current_version=$(python3 -V 2>&1 | awk '{print $2}')
-        if [ "$current_version" = "$latest_version" ]; then
-            echo -e "${green}✓ Python 已是指定编译版本: ${yellow}${latest_version}${re}"
-            return
+    # ================== 格式化函数 ==================
+    format_size() {
+        local size_mb=${1:-0}  # 防止为空
+        if [ "$size_mb" -lt 1024 ]; then
+            echo "${size_mb}M"
+        else
+            awk "BEGIN{printf \"%.1fG\", $size_mb/1024}"
         fi
-        echo -ne "${yellow}检测到当前已存在版本 ${current_version}, 是否继续编译安装 Python ${latest_version}？[y/n]: ${re}"
-        read -r confirm
-        if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then return; fi
-    fi
+    }
 
-    install_deps
-    cd /tmp || exit 1
-    echo -e "${yellow}🚀 正在从官网拉取 Python ${latest_version} 源码包...${re}"
-    wget -c "https://www.python.org/ftp/python/${latest_version}/Python-${latest_version}.tar.xz"
+    # ================== 获取数据 ==================
+    # 内存
+    read mem_total mem_used <<< $(LANG=C free -m | awk 'NR==2{print $2, $3}')
+    mem_total=${mem_total:-0}
+    mem_used=${mem_used:-0}
+    mem_total_fmt=$(format_size "$mem_total")
+    mem_used_fmt=$(format_size "$mem_used")
+    mem_percent=$(awk "BEGIN{if($mem_total>0){printf \"%.0f\", $mem_used*100/$mem_total}else{print 0}}")
+    mem_percent="${mem_percent}%"  # 加回百分号显示
 
-    if [ ! -f "Python-${latest_version}.tar.xz" ]; then
-        echo -e "${red}❌ Python 源码下载失败${re}"
-        return
-    fi
+    # 磁盘
+    read disk_total_h disk_used_h disk_used_percent <<< $(df -m / | awk 'NR==2{print $2, $3, $5}')
+    disk_total_h=${disk_total_h:-0}
+    disk_used_h=${disk_used_h:-0}
+    disk_used_percent=${disk_used_percent:-0%}
+    disk_total_fmt=$(format_size "$disk_total_h")
+    disk_used_fmt=$(format_size "$disk_used_h")
 
-    tar -xf "Python-${latest_version}.tar.xz" && cd "Python-${latest_version}" || exit 1
-    echo -e "${yellow}⚙️ 正在为您配置安全编译环境 (Prefix: /usr/local/python3)...${re}"
-    ./configure --prefix=/usr/local/python3 >/dev/null 2>&1
-    
-    echo -e "${yellow}🛠️ 正在多核并行编译中，请耐心等待...${re}"
-    make -j$(nproc 2>/dev/null || echo 2) >/dev/null 2>&1
-    make altinstall >/dev/null 2>&1
+    # CPU
+    # 读取 /proc/stat 第一行，计算 CPU 使用率（防止空值）
+    cpu_usage=$(awk 'NR==1{usage=($2+$4)*100/($2+$4+$5); if(usage!=""){printf "%.1f", usage}else{print 0}}' /proc/stat)
+    cpu_usage="${cpu_usage}%"  # 加回百分号显示
 
-    local PY_BIN=$(find /usr/local/python3/bin -name "python3.*" | sort -V | tail -n1)
-    local PIP_BIN=$(find /usr/local/python3/bin -name "pip3*" | head -n1)
+    # ================== 系统状态 ==================
+    mem_num=${mem_percent%\%}        # 去掉百分号
+    disk_num=${disk_used_percent%\%} # 去掉百分号
+    cpu_num=${cpu_usage%\%}          # 去掉百分号
 
-    ln -sf "$PY_BIN" /usr/local/bin/python3
-    ln -sf "$PIP_BIN" /usr/local/bin/pip3
+    max_level=0
+    for n in $mem_num $disk_num $cpu_num; do
+        if (( $(awk "BEGIN{print ($n>80)?1:0}") )); then max_level=2; fi
+        if (( $(awk "BEGIN{print ($n>60 && $n<=80)?1:0}") )) && [ "$max_level" -lt 2 ]; then max_level=1; fi
+    done
 
-    python3 -m ensurepip --upgrade >/dev/null 2>&1
-    python3 -m pip install --upgrade pip >/dev/null 2>&1
-
-    echo -e "${green}✅ Python ${latest_version} 环境已在全局无缝就绪！${re}"
-    cd /tmp && rm -rf "Python-${latest_version}"*
-}
-
-remove_python() {
-    echo -e "${yellow}⚡ 正在清除自定义编译的 Python 环境...${re}"
-    rm -rf /usr/local/python3
-    rm -f /usr/local/bin/python3* /usr/local/bin/pip3*
-    echo -e "${green}✓ Python 卸载完成${re}"
-}
-
-# ================== Node.js 跨平台全自动适配 ==================
-install_node() {
-    if command -v node >/dev/null 2>&1; then
-        echo -e "${yellow}✓ Node.js 已存在，当前版本: $(node -v)${re}"
-        return
-    fi
-    echo -e "${yellow}🚀 正在为您部署跨平台 Node.js 环境...${re}"
-    
-    case "$OS" in
-        Ubuntu|Debian)
-            curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
-            apt-get install -y nodejs >/dev/null 2>&1
-            ;;
-        CentOS|Fedora|Rocky|AlmaLinux|Amazon)
-            curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
-            dnf install -y nodejs >/dev/null 2>&1 || yum install -y nodejs >/dev/null 2>&1
-            ;;
-        Alpine)
-            apk add --no-cache nodejs npm >/dev/null 2>&1
-            ;;
-    esac
-
-    if command -v node >/dev/null 2>&1; then
-        echo -e "${green}✅ Node.js 安装成功！【Node: $(node -v) | NPM: $(npm -v 2>/dev/null || echo 'N/A')】${re}"
+    if [ "$max_level" -eq 0 ]; then
+        system_status="${green}系统状态：正常 ✔${reset}"
+    elif [ "$max_level" -eq 1 ]; then
+        system_status="${yellow}系统状态：警告 ⚡${reset}"
     else
-        echo -e "${red}❌ Node.js 部署失败，请检查网路！${re}"
+        system_status="${red}系统状态：危险 🔥${reset}"
     fi
+
+    # ================== 输出 ==================
+    pad_string() {
+        local str="$1"
+        printf "%-${width}s" "${content_indent}${str}"
+    }
+
+    echo -e "${green}┌$(printf '─%.0s' $(seq 1 $width))┐${reset}"
+    echo -e "$(pad_string "${system_status}")"
+    echo -e "$(pad_string "${yellow}📊 内存：${mem_used_fmt}/${mem_total_fmt} (${mem_percent})${reset}")"
+    echo -e "$(pad_string "${yellow}💽 磁盘：${disk_used_fmt}/${disk_total_fmt} (${disk_used_percent})${reset}")"
+    echo -e "$(pad_string "${yellow} ⚙ CPU ：${cpu_usage}${reset}")"
+    echo -e "${green}└$(printf '─%.0s' $(seq 1 $width))┘${reset}"
 }
 
-remove_node() {
-    echo -e "${yellow}⚡ 正在卸载 Node.js 环境...${re}"
-    case "$OS" in
-        Ubuntu|Debian) apt-get purge -y nodejs >/dev/null 2>&1 && apt-get autoremove -y >/dev/null 2>&1 ;;
-        CentOS|Fedora|Rocky|AlmaLinux|Amazon) yum remove -y nodejs >/dev/null 2>&1 || dnf remove -y nodejs >/dev/null 2>&1 ;;
-        Alpine) apk del nodejs npm >/dev/null 2>&1 ;;
-    esac
-    echo -e "${green}✓ Node.js 卸载完成${re}"
+# ================== 系统信息 ==================
+
+# 判断是否容器
+if [ -f /proc/1/cgroup ] && grep -qE '(docker|lxc|kubepods)' /proc/1/cgroup; then
+    container_flag=" (Container)"
+else
+    container_flag=""
+fi
+
+# 系统名称
+if [ -f /etc/os-release ]; then
+    system_name=$(grep -E '^PRETTY_NAME=' /etc/os-release | cut -d= -f2 | tr -d '"')
+else
+    system_name=$(uname -s)
+fi
+system_name="${system_name}${container_flag}"
+
+
+
+# ===============================
+# 获取当前时区（跨系统兼容）
+# ===============================
+get_timezone() {
+    # 1️⃣ systemd 环境，屏蔽错误
+    if command -v timedatectl &>/dev/null; then
+        tz=$(timedatectl show -p Timezone --value 2>/dev/null)
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 2️⃣ /etc/timezone 文件（Debian）
+    if [[ -f /etc/timezone ]]; then
+        tz=$(cat /etc/timezone)
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 3️⃣ /etc/localtime 符号链接（RedHat / CentOS）
+    if [[ -L /etc/localtime ]]; then
+        tz=$(readlink /etc/localtime | sed 's#.*/zoneinfo/##')
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 4️⃣ /etc/localtime 文件内容匹配（minimal / docker / chroot）
+    if [[ -f /etc/localtime ]]; then
+        tz=$(strings /etc/localtime 2>/dev/null | grep -E '^[A-Z][a-z]+/[A-Z][a-zA-Z_]+$' | head -n1)
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 5️⃣ 兜底
+    echo "未知"
 }
 
-# ================== Golang 极致通用升级版 ==================
-install_go() {
-    get_arch
-    echo -e "${yellow}🔍 🔍 正在检索 Go 官网最新长期支持版...${re}"
-    local latest_version=$(curl -s https://go.dev/dl/ | grep -oE 'go[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
-    local latest_version_num=${latest_version#go}
+timezone=$(get_timezone)
 
-    if command -v go >/dev/null 2>&1; then
-        local current_version=$(go version | grep -oE 'go[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
-        current_version=${current_version#go}
-        if [ "$current_version" = "$latest_version_num" ]; then
-            echo -e "${green}✓ Go 当前已是最新长期支持版: $current_version${re}"
-            return
+# 架构
+
+cpu_arch=$(uname -m)
+
+# 获取 CPU 型号
+cpu_model=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2)
+[ -z "$cpu_model" ] && cpu_model=$(grep -m1 "Hardware" /proc/cpuinfo 2>/dev/null | cut -d: -f2)
+[ -z "$cpu_model" ] && cpu_model=$(lscpu 2>/dev/null | grep "Model name" | cut -d: -f2)
+
+# 清理不需要的部分
+cpu_model=$(echo "$cpu_model" | sed -E \
+    -e 's/@.*GHz//g' \
+    -e 's/CPU//g' \
+    -e 's/Processor//g' \
+    -e 's/[0-9]+-Core//g' \
+	-e 's/\bv[1-9]\b//g' \
+    -e 's/\s+/ /g' \
+    | xargs)
+
+cpu="${cpu_model:-Unknown CPU} (${cpu_arch})"
+
+
+# 当前时间
+datetime=$(date "+%Y-%m-%d %H:%M:%S")
+
+# VPS 运行时间
+if [ -f /proc/uptime ]; then
+    uptime_seconds=$(cut -d' ' -f1 /proc/uptime | cut -d. -f1)
+    days=$((uptime_seconds/86400))
+    hours=$(( (uptime_seconds%86400)/3600 ))
+    minutes=$(( (uptime_seconds%3600)/60 ))
+    if [ "$days" -gt 0 ]; then
+        vps_uptime="${days}天${hours}小时${minutes}分钟"
+    elif [ "$hours" -gt 0 ]; then
+        vps_uptime="${hours}小时${minutes}分钟"
+    else
+        vps_uptime="${minutes}分钟"
+    fi
+else
+    vps_uptime=$(uptime -p 2>/dev/null | tr -d ' ' || echo "未知")
+fi
+
+
+
+# 一级菜单
+MAIN_MENU=(
+    "系统设置"
+    "网络代理"
+    "网络检测"
+    "Docker管理"
+    "应用商店"
+    "证书管理"
+    "系统管理"
+    "工具箱合集"
+    "玩具熊ʕ•ᴥ•ʔ"
+    "监控通知"
+    "备份恢复"
+    "更新卸载"
+)
+
+# 二级菜单（编号去掉前导零，显示时格式化为两位数）
+SUB_MENU[1]="1 更新系统|2 系统信息|3 修改root密码|4 root登录管理|5 修改SSH端口|6 修改时区|7 时间同步|8 切换v4V6|9 开放所有端口|10 更换系统源|11 DDdebian13|12 DDwindows|13 NAT鸡重装系统|14 DD飞牛|15 修改语言|16 修改主机名|17 DNS优化|18 一键优化✨|19 VPS重启"
+SUB_MENU[2]="20 代理工具箱|21 FRP管理|22 BBRv3|23 CFWARP|24 BBR+TCP智能调参|25 Reality|26 Snell|27 Shadowsocks|28 自定义DNS解锁|29 DDNS动态域名|30 Hysteria2|31 3X-UI|32 Realm|33 SS-Xray-2go|34 vless-all-in-one✨|35 哆啦A梦转发面板|36 ShellCrash|37 easytier组网"
+SUB_MENU[3]="38 NodeQuality|39 融合怪测试|40 YABS测试|41 网络质量体检|42 IP质量体检|43 硬盘质量体检|44 三网延迟检测|45 简单回程测试|46 完整路由检测|47 流媒体解锁|48 三网测速|49 网络PING/DNS检测|50 检查25端口开放|51 网络工具箱"
+SUB_MENU[4]="52 Docker管理|53 DockerCompose管理|54 DockerCompose备份恢复|55 DockerCompose自动更新"
+SUB_MENU[5]="56 应用管理|57 面板管理|58 监控管理|59 宝塔面板|60 1Panel面板|61 独角数卡|62 小雅全家桶|63 qbittorrent"
+SUB_MENU[6]="64 NGINXV4反代✨|65 NGINXV6反代|66 Caddy反代|67 NginxProxyManager面板|68 Acme申请证书|69 Lucky反代|70 证书备份与恢复"
+SUB_MENU[7]="71 系统清理|72 重装系统|73 系统组件|74 开发环境|75 添加SWAP|76 DNS管理|78 工作区管理|79 系统监控|80 防火墙管理|81 Fail2ban|82 定时任务"
+SUB_MENU[8]="83 科技lion工具箱|84 甲骨文工具箱|85 开小鸡工具箱"
+SUB_MENU[9]="89 HermesAgent|90 OpenClaw|91 GProxy加速|92 Akile优选DNS|93 自动机场签到|94 1panelapps管理|95 关闭哪吒监控SSH|96 AI检测|97 状态检测|98 卸载探针"
+SUB_MENU[10]="100 VPS信息通知|101 流量狗|102 VPS遥控器|103 TrafficCop流量监控|104 流量日报"
+SUB_MENU[11]="105 系统快照恢复|106 本地备份|107 Rsync同步|108 远程文件目录备份|109 Rclone备份|110 Croc文件传输|111 压缩文件|112 解压文件|113 删除文件"
+SUB_MENU[12]="77 自动更新|88 更新脚本|99 卸载脚本"
+
+# 显示一级菜单
+show_main_menu() {
+    clear
+    # 上边框保留彩虹效果
+    rainbow_animate "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # 标题文字改为纯黄色
+    echo -e "${yellow}📦 VPS Toolbox工具箱${reset}${ORANGE}(快捷指令:M/m)${reset} ${yellow}📦${reset}"
+
+    # 下边框保留彩虹效果
+    rainbow_animate "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # 系统信息
+    show_system_usage
+
+
+    # 当前日期时间显示在框下、菜单上
+
+    # 终端宽度（可用不用）
+    term_width=$(tput cols 2>/dev/null || echo 80)
+
+    label_w=8  # 左侧标签宽度
+
+    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "💻" $label_w "系统" "$system_name"
+    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "🌍" $label_w "时区" "$timezone"
+    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "🧩" $label_w "架构" "$cpu"
+    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "🕒" $label_w "时间" "$datetime"
+    printf "${ORANGE}%s %-*s:${ORANGE} %s${re}\n" "🚀" $label_w "在线" "$vps_uptime"
+
+    # 绿色下划线
+    echo -e "${green}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${re}"
+
+    # 显示菜单
+    for i in "${!MAIN_MENU[@]}"; do
+        if [[ $i -eq 8 ]]; then  # 第9项（索引从0开始）
+            # 符号红色，数字和点绿色，文字黄色
+            printf "${red}▶${reset} ${green}%02d.${reset} ${yellow}%s${reset}\n" "$((i+1))" "${MAIN_MENU[i]}"
+        else
+            # 其他项保持原来的颜色（符号红色，数字绿色，文字绿色）
+            printf "${red}▶${reset} ${green}%02d. %s${reset}\n" "$((i+1))" "${MAIN_MENU[i]}"
         fi
-        echo -ne "${yellow}当前版本为 $current_version, 是否一键平滑升级至 $latest_version_num？[y/n]: ${re}"
-        read -r confirm
-        if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then return; fi
-        remove_go
-    fi
-
-    echo -e "${yellow}🚀 正在下载 Golang 内核: ${latest_version_num}...${re}"
-    wget -O /tmp/go_latest.tar.gz "https://go.dev/dl/${latest_version}.linux-${ARCH}.tar.gz"
-
-    if [ ! -f /tmp/go_latest.tar.gz ]; then
-        echo -e "${red}❌ Go 二进制包拉取失败${re}"
-        return
-    fi
-
-    rm -rf /usr/local/go
-    tar -C /usr/local -xzf /tmp/go_latest.tar.gz
-    rm -f /tmp/go_latest.tar.gz
-
-    # 环境持久化同步
-    if [ ! -f /etc/profile.d/go.sh ]; then
-        echo "export PATH=/usr/local/go/bin:\$PATH" > /etc/profile.d/go.sh
-    fi
-    
-    export PATH=/usr/local/go/bin:$PATH
-    echo -e "${green}✅ Go 环境部署完成！当前内核: $(/usr/local/go/bin/go version)${re}"
-}
-
-remove_go() {
-    echo -e "${yellow}⚡ 正在清除系统级别 Go 语言环境...${re}"
-    rm -rf /usr/local/go
-    rm -f /etc/profile.d/go.sh
-    echo -e "${green}✓ Go 卸载完成${re}"
-}
-
-# ================== Java LTS 21 生产适配 ==================
-install_java() {
-    if command -v java >/dev/null 2>&1; then
-        echo -e "${yellow}✓ 检查到系统已存在 Java 版本: $(java -version 2>&1 | head -n1)${re}"
-        echo -ne "${yellow}是否执意重置并重新安装 OpenJDK 21？ [y/N]: ${re}"
-        read -r confirm
-        if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then return; fi
-        remove_java
-    fi
-
-    echo -e "${yellow}🚀 正在为您匹配最适合当前系统的 OpenJDK 21...${re}"
-    case "$OS" in
-        Debian|Ubuntu)
-            apt-get update -y >/dev/null 2>&1
-            if grep -qi "bookworm" /etc/os-release; then
-                apt-get install -y wget gpg ca-certificates >/dev/null 2>&1
-                mkdir -p /etc/apt/keyrings
-                wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor -o /etc/apt/keyrings/adoptium.gpg >/dev/null 2>&1
-                echo "deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb bookworm main" > /etc/apt/sources.list.d/adoptium.list
-                apt-get update -y >/dev/null 2>&1
-                apt-get install -y temurin-21-jdk >/dev/null 2>&1
-            else
-                apt-get install -y openjdk-21-jdk >/dev/null 2>&1
-            fi
-            ;;
-        CentOS|Fedora|Rocky|AlmaLinux|Amazon)
-            yum install -y java-21-openjdk java-21-openjdk-devel >/dev/null 2>&1 || dnf install -y java-21-openjdk java-21-openjdk-devel >/dev/null 2>&1
-            ;;
-        Alpine)
-            apk add openjdk21 >/dev/null 2>&1
-            ;;
-    esac
-
-    if command -v java >/dev/null 2>&1; then
-        echo -e "${green}✅ Java 21 安装成功！环境快照：${re}"
-        java -version
-    else
-        echo -e "${red}❌ Java 安装因环境原因遭遇阻碍${re}"
-    fi
-}
-
-remove_java() {
-    echo -e "${yellow}⚡ 正在清除 OpenJDK / Temurin 系统组件...${re}"
-    case "$OS" in
-        Debian|Ubuntu)
-            apt-get remove -y 'openjdk-*' 'temurin-*' >/dev/null 2>&1
-            apt-get autoremove -y >/dev/null 2>&1
-            rm -f /etc/apt/sources.list.d/adoptium.list /etc/apt/keyrings/adoptium.gpg
-            ;;
-        CentOS|Fedora|Rocky|AlmaLinux|Amazon)
-            yum remove -y java-21-openjdk* >/dev/null 2>&1 || dnf remove -y java-21-openjdk* >/dev/null 2>&1
-            ;;
-        Alpine)
-            apk del openjdk21 >/dev/null 2>&1
-            ;;
-    esac
-    rm -rf /usr/lib/jvm /usr/local/java
-    echo -e "${green}✓ Java 环境卸载成功${re}"
-}
-
-# ================== PHP 安全稳定运行版 ==================
-install_php() {
-    echo -e "${yellow}🚀 正在为您接入并拉取适用于 ${OS} 的 PHP 环境...${re}"
-    case "$OS" in
-        Ubuntu)
-            apt-get install -y software-properties-common >/dev/null 2>&1
-            add-apt-repository -y ppa:ondrej/php >/dev/null 2>&1
-            apt-get update -y >/dev/null 2>&1
-            apt-get install -y php php-cli php-fpm php-mysql php-xml php-curl php-mbstring php-zip >/dev/null 2>&1
-            ;;
-        Debian)
-            apt-get update -y >/dev/null 2>&1
-            apt-get install -y php php-cli php-fpm php-mysql php-xml php-curl php-mbstring php-zip >/dev/null 2>&1
-            ;;
-        CentOS|Fedora|Rocky|AlmaLinux|Amazon)
-            dnf install -y php php-cli php-fpm php-mysqlnd php-xml php-mbstring php-curl php-zip >/dev/null 2>&1 || \
-            yum install -y php php-cli php-fpm php-mysqlnd php-xml php-mbstring php-curl php-zip >/dev/null 2>&1
-            ;;
-        Alpine)
-            apk add --no-cache php php-cli php-fpm php-mysqli php-curl php-xml php-mbstring php-zip >/dev/null 2>&1
-            ;;
-    esac
-    
-    if command -v php >/dev/null 2>&1; then
-        echo -e "${green}✅ PHP 部署完成！版本快照: $(php -v | head -n1)${re}"
-    else
-        echo -e "${red}❌ PHP 环境安装失败，请检查源配置${re}"
-    fi
-}
-
-remove_php() {
-    echo -e "${yellow}⚡ 正在清除 PHP 组件及相关扩展依赖...${re}"
-    case "$OS" in
-        Debian|Ubuntu) apt-get purge -y php* >/dev/null 2>&1 && apt-get autoremove -y >/dev/null 2>&1 ;;
-        CentOS|Fedora|Rocky|AlmaLinux|Amazon) yum remove -y php* >/dev/null 2>&1 || dnf remove -y php* >/dev/null 2>&1 ;;
-        Alpine) apk del php php-cli php-fpm php-mysqli php-curl php-xml php-mbstring php-zip >/dev/null 2>&1 ;;
-    esac
-    echo -e "${green}✓ PHP 全线环境卸载完成${re}"
-}
-
-# ================== 核心可交互式大面板 ==================
-main_menu() {
-    detect_os
-    while true; do
-        clear
-        echo -e "${green}=======================================${re}"
-        echo -e "${green}         ◈ 开发语言环境面板 ◈          ${re}"
-        echo -e "${green}=======================================${re}"
-        echo -e "${green} 系统架构 :${re} ${yellow}$(uname -m)${re}" 
-        echo -e "${green} 宿主系统 :${re} ${yellow}${OS}${re}"
-        echo -e "${green}=======================================${re}"
-        echo -e "${green}  1) 安装 Python 3.14+ $(get_env_status python)${re}"
-        echo -e "${green}  2) 安装 Node.js LTS  $(get_env_status node)${re}"
-        echo -e "${green}  3) 安装 Golang 最新版 $(get_env_status go)${re}"
-        echo -e "${green}  4) 安装 Java LTS 21   $(get_env_status java)${re}"
-        echo -e "${green}  5) 安装 PHP 服务环境 $(get_env_status php)${re}"
-        echo -e "${green}---------------------------------------${re}"
-        echo -e "${red}  6) 卸载 Python 环境${re}"
-        echo -e "${red}  7) 卸载 Node.js 环境${re}"
-        echo -e "${red}  8) 卸载 Golang 环境${re}"
-        echo -e "${red}  9) 卸载 Java 运行环境${re}"
-        echo -e "${red} 10) 卸载 PHP 服务环境${re}"
-        echo -e "${green}---------------------------------------${re}"
-        echo -e "${yellow}  0) 退出"
-        echo -e "${green}=======================================${re}"
-        
-        echo -ne "${green}请输入操作指令编号: ${re}"
-        read -r choice
-
-        case "$choice" in
-            1) install_python ;;
-            2) install_node ;;
-            3) install_go ;;
-            4) install_java ;;  
-            5) install_php ;;
-            6) remove_python ;;
-            7) remove_node ;;
-            8) remove_go ;;
-            9) remove_java ;;
-            10) remove_php ;;
-            0) exit 0 ;;
-            *) echo -e "${red}❌ 输入无效，请重新选择！${re}"; sleep 1; continue ;;
-        esac
-        
-        echo ""
-        echo -ne "${skyblue}👉 操作已执行完毕，按 [回车键] 重回主菜单...${re}"
-        read -r dummy
     done
 }
 
-# 启动面板入口
-main_menu
+
+# 显示二级菜单并选择
+show_sub_menu() {
+    local idx="$1"
+    while true; do
+        IFS='|' read -ra options <<< "${SUB_MENU[idx]}"
+        local map=()
+        echo
+        for opt in "${options[@]}"; do
+            local num="${opt%% *}"
+            local name="${opt#* }"
+            printf "${red}▶${reset} ${yellow}%02d %s${reset}\n" "$num" "$name"
+            map+=("$num")
+        done
+        echo -ne "${red}请输入要执行的编号${ORANGE}(0返回/X退出)${ORANGE}:${reset}"
+        read -r choice
+
+        # X/x 直接退出脚本
+        if [[ "$choice" =~ ^[xX]$ ]]; then
+            exit 0
+        fi
+
+        # 按回车直接刷新菜单
+        if [[ -z "$choice" ]]; then
+            clear
+            continue
+        fi
+
+        # 输入 0 或 00 返回一级菜单
+        if [[ "$choice" == "0" || "$choice" == "00" ]]; then
+            return
+        fi
+
+        # 只允许数字输入
+        if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+            echo -e "${red}无效选项，请输入数字！${reset}"
+            sleep 1
+            clear
+            continue
+        fi
+
+        # 判断是否为有效选项
+        if [[ ! " ${map[*]} " =~ (^|[[:space:]])$choice($|[[:space:]]) ]]; then
+            echo -e "${red}无效选项${reset}"
+            sleep 1
+            clear
+            continue
+        fi
+
+        # 执行选项
+        execute_choice "$choice"
+
+        # 只有 0/99 才退出二级菜单，否则按回车刷新二级菜单
+        if [[ "$choice" != "0" && "$choice" != "99" ]]; then
+            read -rp $'\e[31m按回车刷新二级菜单...\e[0m' tmp
+            clear
+        else
+            break
+        fi
+    done
+}
+
+
+
+
+# 删除快捷指令
+remove_shortcut() {
+    if [[ $EUID -eq 0 ]]; then
+        rm -f "$SHORTCUT_PATH" "$SHORTCUT_PATH_UPPER"
+    else
+        sudo rm -f "$SHORTCUT_PATH" "$SHORTCUT_PATH_UPPER"
+    fi
+}
+
+# 执行菜单选项
+execute_choice() {
+    case "$1" in
+        1) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/update.sh) ;;
+        2) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/vpsinfo.sh) ;;
+        3) sudo passwd root ;;
+        4) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/SSHDLGL.sh) ;;
+        5) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/sshdk.sh) ;;
+        6) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/time.sh) ;;
+        7) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/systemdtimesyncd.sh) ;;
+        8) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/qhwl.sh) ;;
+        9) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/UFWFX.sh) ;;
+        10) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/huanyuan.sh) ;;
+        11) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Debian13.sh) ;;
+        12) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/windowos.sh) ;;
+        13) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/DDnat.sh) ;;
+        14) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/ddfnos.sh) ;;
+        15) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/xgyu.sh) ;;
+        16) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/home.sh) ;;
+        17) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Mosdnsxos.sh) ;;
+        18) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/vpsupos.sh) ;;
+        19) sudo reboot ;;
+        20) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/proxy.sh) ;;
+        21) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/nuro-hia/nuro-frp/main/install.sh) ;;
+        22) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/BBRos.sh) ;;
+        23) wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh ;;
+        24) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/BBR.sh) ;;
+        25) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/VlessRealityos.sh) ;;
+        26) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Snellos.sh) ;;
+        27) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/SSRustos.sh) ;;
+        28) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/unlockdns.sh) ;;
+        29) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/DDNS.sh) ;;
+        30) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Hy2os.sh) ;;
+        31) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/3xuios.sh) ;;
+        32) wget -qO-${PROXY_PREFIX}https://raw.githubusercontent.com/zywe03/realm-xwPF/main/xwPF.sh | sudo bash -s install ;;
+        33) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh) ;;
+        34) wget -O vless-server.sh https://raw.githubusercontent.com/Zyx0rx/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh ;;
+        35) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/dlam.sh);;
+        36) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/ShellCrashx.sh);;
+        37) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/ceocok/c.cococ/refs/heads/main/easytier.sh) ;;
+        38) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/NodeQuality.sh) ;;
+        39) curl -L https://gitlab.com/spiritysdx/za/-/raw/main/ecs.sh -o ecs.sh && chmod +x ecs.sh && bash ecs.sh ;;
+        40) curl -sL https://yabs.sh | bash ;;
+        41) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/NetQuality.sh) ;;
+        42) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/IPQuality.sh) ;;
+        43) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/HardwareQuality.sh) ;;
+        44) bash <(curl -Ls https://Net.Check.Place) -P ;;
+        45) curl https://raw.githubusercontent.com/ludashi2020/backtrace/main/install.sh -sSf | sh ;;
+        46) bash <(curl -Ls https://Net.Check.Place) -R ;;
+        47) bash <(curl -L -s https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh) ;;
+        48) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/ecsspeed.sh) ;;
+        49) bash <(wget -qO- https://raw.githubusercontent.com/Cd1s/network-latency-tester/main/latency.sh) ;;
+        50) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Telnet.sh) ;;
+        51) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Networktool.sh) ;; 
+        52) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Dockersos.sh) ;;
+        53) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/dockercompose.sh) ;;
+        54) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/Dockcompbauck.sh) ;;
+        55) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/dockerupdate.sh) ;;
+        56) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/Store.sh) ;;
+        57) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/panel.sh) ;;
+        58) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/jkgl.sh) ;;
+        59) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Baotax.sh) ;;
+        60) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/1Panelx.sh) ;;
+        61) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/dujiao-next/community-projects/main/scripts/langge-dujiao-next-install/dujiao-next-install.sh) ;;
+        62) bash -c "$(curl --insecure -fsSL https://ddsrem.com/xiaoya_install.sh)" ;;
+        63) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/qbittorrent.sh) ;;
+        64) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Nginxos.sh) ;;
+        65) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Nginx6os.sh) ;;
+        66) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Caddyos.sh) ;;
+        67) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/NginxProxy.sh) ;;
+        68) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Acmeos.sh) ;;
+        69) wget -O  /tmp/install.sh "http://release.66666.host/install.sh" && sh /tmp/install.sh ;;
+        70) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/SSLbackupos.sh) ;;
+        71) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/clear.sh) ;;
+        72) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/reinstall.sh) ;;
+        73) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/package.sh) ;;
+        74) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/exploitation.sh) ;;
+        75) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/WARP.sh) ;;
+        76) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/DNSos.sh) ;;
+        78) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/tmux.sh) ;;
+        79) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/System.sh) ;;
+        80) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/firewallos.sh) ;;
+        81) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Fail2banos.sh) ;;
+        82) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/crontab.sh) ;;
+        83) bash <(curl -sL kejilion.sh) ;;
+        84) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/Oracle/oracle.sh) ;;
+        85) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/NAT.sh) ;;
+        89) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/kejilion/sh/main/hermes_manager.sh) ;;
+        90) bash <(curl -sL kejilion.sh) app openclaw ;;
+        91) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/CN/CNGProxy.sh) ;;
+        92) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/AkileDNS.sh) ;;
+        93) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/JCQD.sh) ;;
+        94) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/1panelapps.sh) ;;
+        95) sed -i 's/disable_command_execute: false/disable_command_execute: true/' /opt/nezha/agent/config.yml && systemctl restart nezha-agent ;;
+		96) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/AI/AIcheck.sh) ;;
+        97) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/test.sh) ;;
+        98) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/unagent.sh) ;;
+        100) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/vpstg.sh) ;;
+        101) wget -O port-traffic-dog.sh ${PROXY_PREFIX}https://raw.githubusercontent.com/zywe03/realm-xwPF/main/port-traffic-dog.sh && chmod +x port-traffic-dog.sh && ./port-traffic-dog.sh ;;
+        102) curl -fsSL https://raw.githubusercontent.com/MEILOI/VPS_BOT_X/main/vps_bot-x/install.sh -o install.sh && chmod +x install.sh && bash install.sh ;;
+        103) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/traffic.sh) ;;
+        104) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/OS/vnstattgos.sh) ;;
+        105) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/restore.sh) ;;
+        106) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/beifen.sh) ;;
+        107) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/Rrsync.sh) ;;
+        108) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/toy/Filebackup.sh) ;;
+        109) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/rclone.sh) ;;
+        110) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Croc.sh) ;;
+        111) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/yasuo.sh) ;;
+        112) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/tarzip.sh) ;;
+        113) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/rmdocument.sh) ;;
+
+        #  自动更新脚本
+        77) bash <(curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/tool/update.sh) ;; 
+        88)
+            echo -e "${yellow}正在更新脚本...${reset}"
+            # 下载最新版本覆盖本地脚本
+            curl -fsSL ${PROXY_PREFIX}https://raw.githubusercontent.com/sistarry/toolbox/main/tool/vps-toolbox.sh -o "$INSTALL_PATH"
+            if [[ $? -ne 0 ]]; then
+                echo -e "${red}更新失败，请检查网络或GitHub地址${reset}"
+                return 1
+            fi
+            chmod +x "$INSTALL_PATH"
+            echo -e "${green}脚本已更新完成！${reset}"
+            # 重新执行最新脚本
+            exec bash "$INSTALL_PATH"
+            ;;
+
+        99) 
+            echo -e "${yellow}正在卸载工具箱...${reset}"
+
+            # 删除快捷指令
+            remove_shortcut
+ 
+            # 删除工具箱脚本
+            if [[ -f "$INSTALL_PATH" ]]; then
+            rm -f "$INSTALL_PATH"
+            echo -e "${green}工具箱脚本已删除${reset}"
+            fi
+            # 删除首次运行标记文件
+            MARK_FILE="$HOME/.vpstoolbox"
+            if [[ -f "$MARK_FILE" ]]; then
+            rm -f "$MARK_FILE"
+            fi
+           echo -e "${red}卸载完成！${reset}"
+           exit 0
+           ;;
+        0) exit 0 ;;
+        *) echo -e "${red}无效选项${reset}"; return 1 ;;
+    esac
+}
+
+
+# 主循环
+while true; do
+    show_main_menu
+    echo -ne "${red}请输入要执行的编号${ORANGE}(0退出)${ORANGE}:${reset} "
+    read -r main_choice
+
+    # X/x 直接退出脚本
+    if [[ "$main_choice" =~ ^[xX]$ ]]; then
+        exit 0
+    fi
+
+    # 按回车刷新菜单
+    if [[ -z "$main_choice" ]]; then
+        continue
+    fi
+
+    # 输入 0 退出
+    if [[ "$main_choice" == "0" ]]; then
+        exit 0
+    fi
+
+    # 只允许数字输入
+    if ! [[ "$main_choice" =~ ^[0-9]+$ ]]; then
+        echo -e "${red}无效选项，请输入数字！${reset}"
+        sleep 1
+        continue
+    fi
+
+    # 判断范围
+    if (( main_choice >= 1 && main_choice <= ${#MAIN_MENU[@]} )); then
+        show_sub_menu "$main_choice"
+    else
+        echo -e "${red}无效选项${reset}"
+        sleep 1
+    fi
+done

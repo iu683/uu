@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ========================================
-# Croc 文件传输一键安装与使用脚本（全功能配置版）
+# Croc 文件传输一键安装与使用脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -10,8 +10,8 @@ RED="\033[31m"
 RESET="\033[0m"
 
 # 初始化本地配置文件路径
-CONF_FILE="/opt/vpsbackup/.croc_env.conf"
-mkdir -p /opt/vpsbackup 2>/dev/null
+CONF_FILE="/opt/Croc/.croc_env.conf"
+mkdir -p /opt/Croc 2>/dev/null
 
 # 默认下载/输出目录
 DEFAULT_OUT_DIR="."
@@ -31,6 +31,19 @@ OUT_DIR="$OUT_DIR"
 EOF
 }
 
+# 联网动态获取 GitHub 官方最新 Tag 版本的函数
+fetch_latest_version_tag() {
+    local lat_ver
+    # 通过 API 获取最新 tag_name，加入超时与重试保障直连稳定性
+    lat_ver=$(curl -fsSL --connect-timeout 8 --retry 3 https://api.github.com/repos/schollz/croc/releases/latest 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    
+    # 如果由于网络极端原因获取失败，则采用最新已知的稳定版作为兜底
+    if [ -z "$lat_ver" ]; then
+        lat_ver="v10.4.4"
+    fi
+    echo "$lat_ver"
+}
+
 # 获取系统与Croc状态信息
 get_system_env() {
     load_config
@@ -43,25 +56,26 @@ get_system_env() {
 
     if command -v croc &>/dev/null; then
         CURRENT_VERSION=$(croc --version 2>/dev/null | awk '{print $3}')
-        CROC_STATUS="${GREEN}已安装 (${RESET}${CURRENT_VERSION}${GREEN})${RESET}"
+        CROC_STATUS="${GREEN}已安装${RESET} ${YELLOW}(${CURRENT_VERSION})${RESET}"
     else
         CROC_STATUS="${RED}未安装${RESET}"
     fi
 }
 
-# 核心下载与提取逻辑 (加入官方直连抗重试机制)
-download_and_extract() {
-    local target_version="$1"
+# 1) 快速全新安装 (动态获取最新版本)
+install_croc() {
+    echo -e "${YELLOW}➔ 正在检测并配置系统安装环境...${RESET}"
     
+    # 【Alpine 分支】：执行依赖安装与官方一键托管脚本流（其内部自动拉取最新）
     if [ -f /etc/alpine-release ]; then
-        echo -e "${YELLOW}➔ 检测到 Alpine Linux，自动安装基础组件...${RESET}"
-        apk update && apk add curl tar coreutils >/dev/null 2>&1
-    elif [ -f /etc/debian_version ]; then
-        echo -e "${YELLOW}➔ 检测到 Ubuntu/Debian/Debian系，确保 curl 和 tar 正常...${RESET}"
-        apt-get update && apt-get install -y curl tar >/dev/null 2>&1
-    fi
+        echo -e "${YELLOW}➔ 检测到 Alpine Linux，正在安装官方必要依赖 (bash / coreutils)...${RESET}"
+        apk update && apk add bash coreutils wget >/dev/null 2>&1
+        
+        echo -e "${GREEN}➔ 正在通过官方一键流获取并安装最新版 Croc...${RESET}"
+        wget -qO- https://getcroc.schollz.com | bash
 
-    if [[ "$OSTYPE" == "linux-gnu"* ]] || [ -f /etc/alpine-release ] || [[ "$OSTYPE" == "freebsd"* ]]; then
+    # 【其他系统分支】：动态抓取最新版本号，直连下载静态二进制包
+    elif [[ "$OSTYPE" == "linux-gnu"* ]] || [ -f /etc/debian_version ] || [[ "$OSTYPE" == "freebsd"* ]]; then
         ARCH=$(uname -m)
         SYS_TYPE="Linux"
         [[ "$OSTYPE" == "freebsd"* ]] && SYS_TYPE="FreeBSD"
@@ -76,14 +90,21 @@ download_and_extract() {
             *)            ARCH_TAG="64bit" ;;
         esac
 
-        echo -e "${YELLOW}➔ 正在直连 GitHub 下载静态编译包 [${SYS_TYPE} ${ARCH_TAG}]...${RESET}"
+        echo -e "${YELLOW}➔ 确保依赖正常...${RESET}"
+        [ -f /etc/debian_version ] && (apt-get update && apt-get install -y curl tar >/dev/null 2>&1)
+
+        # 核心改动：动态获取云端最新版本
+        echo -e "${YELLOW}➔ 正在检索 GitHub 官方最新 Release 版本号...${RESET}"
+        LATEST_VERSION=$(fetch_latest_version_tag)
+        echo -e "${GREEN}➔ 检测到当前官方最新版本为: ${YELLOW}${LATEST_VERSION}${RESET}"
+
+        echo -e "${YELLOW}➔ 正在下载静态编译包 [${SYS_TYPE} ${ARCH_TAG}]...${RESET}"
         
         TMP_DIR=$(mktemp -d)
         cd "$TMP_DIR" || return
         
-        DOWNLOAD_URL="https://github.com/schollz/croc/releases/download/${target_version}/croc_${target_version}_${SYS_TYPE}-${ARCH_TAG}.tar.gz"
+        DOWNLOAD_URL="https://github.com/schollz/croc/releases/download/${LATEST_VERSION}/croc_${LATEST_VERSION}_${SYS_TYPE}-${ARCH_TAG}.tar.gz"
         
-        # 【核心修复】：追加 --retry, --retry-delay, --connect-timeout 完美抗网络抖动和 504 错误
         curl -fsSL --connect-timeout 15 --retry 5 --retry-delay 3 "$DOWNLOAD_URL" -o croc.tar.gz
         
         if [ $? -eq 0 ] && [ -s croc.tar.gz ]; then
@@ -91,50 +112,24 @@ download_and_extract() {
             if [ -f croc ]; then
                 chmod +x croc
                 mv -f croc /usr/local/bin/
-                DOWNLOAD_SUCCESS=0
-            else
-                DOWNLOAD_SUCCESS=1
             fi
-        else
-            DOWNLOAD_SUCCESS=1
         fi
-        
         cd - >/dev/null && rm -rf "$TMP_DIR"
-        return $DOWNLOAD_SUCCESS
-
-    elif [[ "$OSTYPE" == "darwin"* ]]; then
-        if command -v brew &>/dev/null; then
-            brew install croc
-            return 0
-        else
-            echo -e "${RED}❌ 未检测到 Homebrew，请先安装 Homebrew 再重试。${RESET}"
-            return 1
-        fi
     else
-        echo -e "${RED}❌ 不支持的系统架构: $OSTYPE${RESET}"
-        return 1
-    fi
-}
-
-# 1) 纯净全新安装
-install_croc() {
-    echo -e "${YELLOW}➔ 正在启动全新安装程序...${RESET}"
-    if command -v croc &>/dev/null; then
-        echo -e "${YELLOW}⚠️  系统已存在 Croc 组件，继续操作将覆盖现有版本。${RESET}"
+        echo -e "${RED}❌ 暂不支持的系统架构。${RESET}"
+        read -r -p "按回车返回..." ; return
     fi
 
-    LATEST_VERSION="v10.4.4"
-    download_and_extract "$LATEST_VERSION"
-    
-    if [ $? -eq 0 ] && (command -v /usr/local/bin/croc &>/dev/null || command -v croc &>/dev/null); then
-        echo -e "${GREEN}🟢 Croc 核心传输组件全新安装成功！${RESET}"
+    # 最终验证
+    if command -v croc &>/dev/null || [ -f /usr/local/bin/croc ]; then
+        echo -e "${GREEN}🟢 Croc 核心传输组件最新版安装/覆盖成功！${RESET}"
     else
-        echo -e "${RED}🔴 Croc 安装失败，即使触发重试仍遭遇官方超时，请稍后再次尝试。${RESET}"
+        echo -e "${RED}🔴 Croc 安装失败，请检查网络直连环境。${RESET}"
     fi
     read -r -p "按回车返回主菜单..."
 }
 
-# 5) 独立在线检查更新
+# 5) 独立在线检查并安全更新
 update_croc() {
     echo -e "${YELLOW}➔ 正在向 GitHub 发起版本合规性检查...${RESET}"
     if ! command -v croc &>/dev/null; then
@@ -142,12 +137,8 @@ update_croc() {
         read -r -p "按回车返回..." ; return
     fi
 
-    CLOUD_VERSION=$(curl -fsSL --connect-timeout 10 --retry 3 https://api.github.com/repos/schollz/croc/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    if [ -z "$CLOUD_VERSION" ]; then
-        echo -e "${YELLOW}⚠️  在线获取最新版本超时，尝试强制拉取同步 v10.4.4 稳定版...${RESET}"
-        CLOUD_VERSION="v10.4.4"
-    fi
-
+    # 动态抓取云端最新版本
+    CLOUD_VERSION=$(fetch_latest_version_tag)
     LOCAL_VERSION=$(croc --version 2>/dev/null | awk '{print $3}')
     
     echo -e "${GREEN}➔ 当前本地版本: ${YELLOW}${LOCAL_VERSION}${RESET}"
@@ -157,13 +148,30 @@ update_croc() {
     if [ "$LOCAL_VERSION" = "$CLOUD_VERSION" ]; then
         echo -e "${GREEN}🟢 检测完毕：您当前已是官方最新版本，无需更新。${RESET}"
     else
-        echo -e "${YELLOW}➔ 发现新版本！准备为您在线升级...${RESET}"
-        download_and_extract "$CLOUD_VERSION"
-        if [ $? -eq 0 ]; then
-            echo -e "${GREEN}🟢 Croc 成功升级至最新版本: ${YELLOW}${CLOUD_VERSION}${RESET}"
+        echo -e "${YELLOW}➔ 发现新版本！准备为您在线无缝升级组件...${RESET}"
+        if [ -f /etc/alpine-release ]; then
+            # Alpine 继续走官方最新流
+            wget -qO- https://getcroc.schollz.com | bash
         else
-            echo -e "${RED}🔴 升级失败，请检查网络直连环境。${RESET}"
+            # 其它系统继续走纯二进制直连覆盖（精准套用动态云端版本）
+            ARCH=$(uname -m)
+            SYS_TYPE="Linux"
+            [[ "$OSTYPE" == "freebsd"* ]] && SYS_TYPE="FreeBSD"
+            case "$ARCH" in
+                x86_64) ARCH_TAG="64bit" ;; aarch64|arm64) ARCH_TAG="ARM64" ;; *) ARCH_TAG="64bit" ;;
+            esac
+            
+            TMP_DIR=$(mktemp -d)
+            cd "$TMP_DIR" || return
+            DOWNLOAD_URL="https://github.com/schollz/croc/releases/download/${CLOUD_VERSION}/croc_${CLOUD_VERSION}_${SYS_TYPE}-${ARCH_TAG}.tar.gz"
+            curl -fsSL --connect-timeout 15 --retry 3 "$DOWNLOAD_URL" -o croc.tar.gz
+            if [ -f croc.tar.gz ]; then
+                tar -xzf croc.tar.gz croc 2>/dev/null
+                [ -f croc ] && chmod +x croc && mv -f croc /usr/local/bin/
+            fi
+            cd - >/dev/null && rm -rf "$TMP_DIR"
         fi
+        echo -e "${GREEN}🟢 Croc 组件更新程序执行完毕。${RESET}"
     fi
     read -r -p "按回车返回主菜单..."
 }
@@ -192,31 +200,24 @@ set_output_dir() {
     read -r -p "按回车返回主菜单..."
 }
 
-# 卸载 Croc
+# 2) 从当前系统深度卸载 Croc
 uninstall_croc() {
     echo -e "${YELLOW}➔ 正在卸载 Croc...${RESET}"
-    if [[ "$OSTYPE" == "linux-gnu"* ]] || [ -f /etc/alpine-release ]; then
-        if command -v croc &>/dev/null || [ -f /usr/local/bin/croc ]; then
-            rm -f /usr/local/bin/croc 2>/dev/null
-            local croc_path
-            croc_path=$(command -v croc 2>/dev/null)
-            [ -n "$croc_path" ] && rm -f "$croc_path"
-            echo -e "${GREEN}🟢 Croc 已从系统成功卸载。${RESET}"
-        else
-            echo -e "${YELLOW}⚠️  系统中未发现已安装的 Croc。${RESET}"
-        fi
-    elif [[ "$OSTYPE" == "darwin"* ]]; then
-        brew uninstall croc 2>/dev/null
-        echo -e "${GREEN}🟢 Croc 已从 macOS 卸载。${RESET}"
+    if command -v croc &>/dev/null || [ -f /usr/local/bin/croc ] || [ -f /usr/bin/croc ]; then
+        rm -f /usr/local/bin/croc /usr/bin/croc 2>/dev/null
+        local croc_path
+        croc_path=$(command -v croc 2>/dev/null)
+        [ -n "$croc_path" ] && rm -f "$croc_path"
+        echo -e "${GREEN}🟢 Croc 已从当前系统成功卸载。${RESET}"
     else
-        echo -e "${RED}❌ 不支持的系统架构: $OSTYPE${RESET}"
+        echo -e "${YELLOW}⚠️  系统中未发现已安装的 Croc。${RESET}"
     fi
     read -r -p "按回车返回主菜单..."
 }
 
-# 发送文件/目录
+# 3) 安全发送本地文件/目录 (完美适配新版 CROC_SECRET 规范)
 send_file() {
-    if ! command -v croc &>/dev/null && [ ! -f /usr/local/bin/croc ]; then
+    if ! command -v croc &>/dev/null; then
         echo -e "${RED}❌ 错误：请先选择选项 1 安装 Croc 核心传输组件。${RESET}"
         read -r -p "按回车返回..." ; return
     fi
@@ -252,7 +253,8 @@ send_file() {
         croc send "${valid_paths[@]}"
     else
         echo -e "${YELLOW}➔ 正在建立加密信道，使用自定义代码: ${YELLOW}$code${RESET}"
-        croc send --code "$code" "${valid_paths[@]}"
+        # 【核心修正】：完美适配新版本规范，通过注入环境变量传递密码，移除了被禁用的 --code 参数
+        CROC_SECRET="$code" croc send "${valid_paths[@]}"
     fi
 
     if [ $? -eq 0 ]; then
@@ -263,9 +265,9 @@ send_file() {
     read -r -p "按回车返回主菜单..."
 }
 
-# 接收文件/目录
+# 4) 📥 接收远端文件/目录
 receive_file() {
-    if ! command -v croc &>/dev/null && [ ! -f /usr/local/bin/croc ]; then
+    if ! command -v croc &>/dev/null; then
         echo -e "${RED}❌ 错误：请先选择选项 1 安装 Croc 核心传输组件。${RESET}"
         read -r -p "按回车返回..." ; return
     fi
@@ -295,23 +297,23 @@ while true; do
     get_system_env
     
     echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}        ◈  Croc 点对点安全传输面板  ◈      ${RESET}"
+    echo -e "${GREEN}     ◈  Croc 点对点安全传输面板  ◈      ${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
     echo -e "${GREEN} 当前系统环境 : ${YELLOW}${OS}${RESET}"
     echo -e "${GREEN} 传输组件状态 : ${CROC_STATUS}${RESET}"
     echo -e "${GREEN} 当前接收目录 : ${YELLOW}${OUT_DIR}${RESET}"
     echo -e "${GREEN} 加密传输协议 : ${YELLOW}PAKE (端到端全密文)${RESET}"
     echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  1) 快速全新安装 Croc 传输组件${RESET}"
-    echo -e "${GREEN}  2) 从当前系统深度卸载 Croc${RESET}"
+    echo -e "${GREEN}  1) 安装 Croc${RESET}"
+    echo -e "${GREEN}  2) 更新 Croc${RESET}"
+    echo -e "${GREEN}  3) 卸载 Croc${RESET}"
     echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  3) 🚀 安全发送本地文件/目录 (多选)${RESET}"
-    echo -e "${GREEN}  4) 📥 接收远端文件/目录 (凭码提取)${RESET}"
+    echo -e "${GREEN}  4) 安全发送本地文件/目录 (多选)${RESET}"
+    echo -e "${GREEN}  5) 接收远端文件/目录 (凭码提取)${RESET}"
     echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  5) 🔄 在线检查并升级组件至最新版${RESET}"
-    echo -e "${GREEN}  7) ⚙️  自定义设置文件输出/下载文件夹${RESET}"
+    echo -e "${GREEN}  6) 设置文下载文件夹${RESET}"
     echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  0) 退出面板${RESET}"
+    echo -e "${GREEN}  0) 退出${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
 
     echo -ne "${GREEN} 请选择操作编号: ${RESET}"
@@ -319,12 +321,12 @@ while true; do
 
     case $choice in
         1) install_croc ;;
-        2) uninstall_croc ;;
-        3) send_file ;;
-        4) receive_file ;;
-        5) update_croc ;;
-        7) set_output_dir ;;
-        0) echo -e "${YELLOW}正在退出系统...${RESET}" ; exit 0 ;;
+        2) update_croc ;;
+        3) uninstall_croc ;;
+        4) send_file ;;
+        5) receive_file ;;
+        6) set_output_dir ;;
+        0) exit 0 ;;
         *) echo -e "${RED}❌ 无效选项，请输入正确的编号！${RESET}" ; read -r -p "按回车继续..." ;;
     esac
 done

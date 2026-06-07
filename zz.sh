@@ -1,282 +1,246 @@
 #!/bin/bash
 
-# 全局高优先环境变量配置
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# ========================================
+# Croc 文件传输一键安装与使用脚本（高级面板版）
+# ========================================
 
-# 颜色控制
-GREEN='\033[0;32m'
-LIGHT_GREEN='\033[1;32m'
-RED='\033[0;31m'
-NC='\033[0m'
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-CONFIG_FILE="/etc/snapshot_config.conf"
-LOG_FILE="/var/log/snapshot_info.log"
-
-if [ "$EUID" -ne 0 ]; then 
-    echo -e "${RED}错误: 请使用 root 权限运行此脚本。${NC}"
-    exit 1
-fi
-
-log_action() { echo "$(date '+%F %T') [RESTORE] $1" >> "$LOG_FILE"; }
-
-draw_header() {
-    clear
-    echo -e "${GREEN}==============================${NC}"
-    echo -e "${GREEN}     Linux 系统快照恢复工具    ${NC}"
-    echo -e "${GREEN}==============================${NC}"
-}
-# ==============================================================================
-# 核心解压与网络控制逻辑
-# ==============================================================================
-execute_untar_restore() {
-    local target_archive="$1"
-    
-    echo -e "\n${RED}======================= !!! 警告 !!! =======================${NC}"
-    echo -e "${RED} 您即刻将开始执行系统快照还原。该操作会覆盖当前系统的核心文件！${NC}"
-    echo -e "${RED}============================================================${NC}"
-    
-    # ==========================================
-    # 【功能升级：选择是否恢复网络配置】
-    # ==========================================
-    echo -e "关于网络配置恢复，请做出选择："
-    echo -e "  [1] ${GREEN}安全守护模式 (推荐)${NC}: 暂存并保留当前正在通网的网卡/IP配置，防止重启后失联。"
-    echo -e "  [2] ${RED}完全还原模式${NC}: 强行使用快照内的旧网络配置覆盖当前机器（仅适用于原机同硬件环境回滚）。"
-    
-    read -p "请选择网络恢复模式 [1/2, 默认: 1]: " net_choice
-    net_choice=${net_choice:-1}
-
-    # 统一变量格式，方便后续的 if 条件判断
-    if [ "$net_choice" == "1" ]; then
-        net_choice="n"
-    elif [ "$net_choice" == "2" ]; then
-        net_choice="y"
+# 获取系统与Croc状态信息 (完美兼容 Alpine 和 Ubuntu)
+get_system_env() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$NAME
     else
-        echo -e "${RED}输入错误，自动降级为安全守护模式 (1)。${NC}"
-        net_choice="n"
+        OS=$(uname -s)
     fi
 
-    # 二次确认
-    read -p "请输入 'y' 确认执行最终系统恢复，输入其他任意键取消: " confirm
-    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then 
-        echo -e "${GREEN}操作已取消。${NC}"
-        read -p "按任意键返回..." -n 1
-        return
-    fi
-    # ==========================================
-
-    log_action "开始执行系统恢复，网络恢复模式: $net_choice，快照源: $target_archive"
-    
-    # 如果选择安全模式，提前暂存当前网络底座
-    if [ "$net_choice" != "y" ] && [ "$net_choice" != "Y" ]; then
-        echo -e "${GREEN}正在暂存当前有效的网卡与网络底座配置...${NC}"
-        rm -rf /tmp/net_backup && mkdir -p /tmp/net_backup/sysconfig
-        [ -f "/etc/fstab" ] && cp /etc/fstab /tmp/net_backup/fstab
-        [ -f "/etc/resolv.conf" ] && cp /etc/resolv.conf /tmp/net_backup/resolv.conf
-        [ -f "/etc/network/interfaces" ] && cp /etc/network/interfaces /tmp/net_backup/interfaces
-        if [ -d "/etc/sysconfig/network-scripts" ]; then
-            cp -r /etc/sysconfig/network-scripts/* /tmp/net_backup/sysconfig/ 2>/dev/null
-        fi
-    fi
-
-    echo -e "\n${GREEN}🚀 正在全面解压并重构系统文件，请耐心等待...${NC}"
-    tar -xzf "$target_archive" -C / 2>/dev/null
-
-    # 如果选择安全模式，解压后瞬间回填
-    if [ "$net_choice" != "y" ] && [ "$net_choice" != "Y" ]; then
-        echo -e "${GREEN}正在回填暂存的网卡配置，防止网络死锁失联...${NC}"
-        [ -f "/tmp/net_backup/fstab" ] && cp /tmp/net_backup/fstab /etc/fstab
-        [ -f "/tmp/net_backup/resolv.conf" ] && cp /tmp/net_backup/resolv.conf /etc/resolv.conf
-        [ -f "/tmp/net_backup/interfaces" ] && cp /tmp/net_backup/interfaces /etc/interfaces
-        if [ "$(ls -A /tmp/net_backup/sysconfig/ 2>/dev/null)" ]; then
-            mkdir -p /etc/sysconfig/network-scripts
-            cp -r /tmp/net_backup/sysconfig/* /etc/sysconfig/network-scripts/ 2>/dev/null
-        fi
-        rm -rf /tmp/net_backup
-    fi
-
-    if [ $? -eq 0 ] || [ -s "/etc/fstab" ]; then
-        log_action "系统文件重构解压成功！"
-        echo -e "\n${GREEN}============================================================${NC}"
-        echo -e "${LIGHT_GREEN}✅ 系统快照恢复解压已圆满完成！${NC}"
-        if [ "$net_choice" == "y" ] || [ "$net_choice" == "Y" ]; then
-            echo -e "${RED} 警告：网络配置已完全被快照覆盖，如果网卡或硬件不兼容可能导致重启后失联！${NC}"
-        else
-            echo -e "${GREEN} 守护：已自动保留您当前的网卡、IP及网关配置，100%确保重启后不会失联。${NC}"
-        fi
-        echo -e "${RED} 为了使所有内核服务和系统引导完全生效，系统必须立刻重启。${NC}"
-        echo -e "${GREEN}============================================================${NC}"
-        read -p "是否现在立刻重启服务器？[y/n]: " reboot_choice
-        if [ "$reboot_choice" == "y" ] || [ "$reboot_choice" == "Y" ]; then
-            log_action "用户触发恢复后自动重启"
-            reboot
-        fi
+    if command -v croc &>/dev/null; then
+        CROC_STATUS="${GREEN}已安装 (${RESET}$(croc --version 2>/dev/null | awk '{print $3}')${GREEN})${RESET}"
     else
-        log_action "错误：解压阶段出现异常中断！"
-        echo -e "${RED}❌ 恢复过程中出现异常，请查看本地日志流明细：$LOG_FILE${NC}"
-        read -p "按任意键返回..." -n 1
+        CROC_STATUS="${RED}未安装${RESET}"
     fi
 }
 
-# ==============================================================================
-# 模式一：本地快照还原（支持自定义目录）
-# ==============================================================================
-restore_from_local() {
-    draw_header
-    echo -e "${GREEN}[ 模式：从本地快照目录还原 ]${NC}"
+# 彻底修复 Ubuntu 卡死的核心安装逻辑
+install_croc() {
+    echo -e "${YELLOW}➔ 正在检测并配置系统安装环境...${RESET}"
     
-    # 读取备份工具默认路径作为备选默认值
-    local default_dir="/backups"
-    if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
-        default_dir="${BACKUP_DIR:-/backups}"
+    # 1. 确保基础依赖完整
+    if [ -f /etc/alpine-release ]; then
+        echo -e "${YELLOW}➔ 检测到 Alpine Linux，自动安装组件...${RESET}"
+        apk update && apk add curl tar coreutils >/dev/null 2>&1
+    elif [ -f /etc/debian_version ]; then
+        echo -e "${YELLOW}➔ 检测到 Ubuntu/Debian，确保 curl 和 tar 正常...${RESET}"
+        apt-get update && apt-get install -y curl tar >/dev/null 2>&1
     fi
 
-    read -p "$(echo -e "请输入本地快照绝对路径 [默认/当前: ${GREEN}${default_dir}${NC}]: ")" scan_dir
-    scan_dir=${scan_dir:-$default_dir}
-
-    if [ ! -d "$scan_dir" ]; then
-        echo -e "${RED}错误: 指定的本地目录 [ $scan_dir ] 不存在！${NC}"
-        read -p "按任意键返回..." -n 1
-        return
-    fi
-
-    local files=($(find "$scan_dir" -maxdepth 1 -type f -name "system_snapshot_*.tar.gz" | sort -r))
-    local count=${#files[@]}
-
-    if [ $count -eq 0 ]; then
-        echo -e "${RED}未在指定目录中检索到任何 system_snapshot_*.tar.gz 快照文件。${NC}"
-        read -p "按任意键返回..." -n 1
-        return
-    fi
-
-    echo -e "\n检索到以下可用本地历史快照，请选择编号："
-    for ((i=0; i<count; i++)); do
-        local file_size=$(du -h "${files[i]}" | awk '{print $1}')
-        echo -e "  [ $((i+1)) ] 📦 $(basename "${files[i]}") (大小: $file_size)"
-    done
-    echo -e "  [ 0 ] 返回上级主菜单"
-    echo -e "------------------------------------------------------------"
+    echo -e "${GREEN}➔ 开始获取官方最新版 Croc 二进制组件...${RESET}"
     
-    read -p "请选择需要恢复的快照编号: " num
-    if [[ "$num" -eq 0 ]] 2>/dev/null || [ -z "$num" ]; then return; fi
-    
-    if [[ "$num" -gt 0 && "$num" -le "$count" ]] 2>/dev/null; then
-        execute_untar_restore "${files[$((num-1))]}"
-    else
-        echo -e "${RED}无效的选择！${NC}"
-        sleep 1
-    fi
-}
-
-# ==============================================================================
-# 模式二：远程服务器拉取还原（全动态自定义输入）
-# ==============================================================================
-restore_from_remote() {
-    draw_header
-    echo -e "${GREEN}[ 模式：从远程备份服务器拉取并还原 ]${NC}"
-    
-    # 尝试加载当前已有的默认值，方便回车跳过
-    local d_ip="" local d_user="root" local d_port="22" local d_dir=""
-    if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
-        d_ip="$TARGET_IP" && d_user="$TARGET_USER" && d_port="$SSH_PORT"
-        d_dir="$TARGET_BASE_DIR/$REMOTE_DIR_NAME/system_snapshots"
-    fi
-
-    # 【功能升级：接收用户完全动态的自定义输入】
-    if [ -n "$d_ip" ]; then
-        read -p "$(echo -e "请输入远程服务器IP [当前值: ${GREEN}${d_ip}${NC}]: ")" REMOTE_IP
-        REMOTE_IP=${REMOTE_IP:-$d_ip}
-    else
-        read -p "请输入远程服务器IP: " REMOTE_IP
-        while [ -z "$REMOTE_IP" ]; do read -p "IP不能为空，请重新输入: " REMOTE_IP; done
-    fi
-
-    read -p "$(echo -e "请输入远程服务器用户名 [当前值: ${GREEN}${d_user}${NC}]: ")" REMOTE_USER
-    REMOTE_USER=${REMOTE_USER:-$d_user}
-
-    read -p "$(echo -e "请输入SSH端口 [当前值: ${GREEN}${d_port}${NC}]: ")" SSH_PORT
-    SSH_PORT=${SSH_PORT:-$d_port}
-
-    if [ -n "$d_dir" ]; then
-        read -p "$(echo -e "请输入远程备份绝对目录\n[默认当前: ${GREEN}${d_dir}${NC}]:\n")" REMOTE_BACKUP_DIR
-        REMOTE_BACKUP_DIR=${REMOTE_BACKUP_DIR:-$d_dir}
-    else
-        read -p "请输入远程备份绝对目录(例如 /root/remote_backup/localhost/system_snapshots): " REMOTE_BACKUP_DIR
-        while [ -z "$REMOTE_BACKUP_DIR" ]; do read -p "路径不能为空，请重新输入: " REMOTE_BACKUP_DIR; done
-    fi
-
-    echo -e "\n------------------------------------------------------------"
-    echo -e "远程存储目标: ${GREEN}$REMOTE_USER@$REMOTE_IP:$SSH_PORT${NC}"
-    echo -e "远程快照路径: ${GREEN}$REMOTE_BACKUP_DIR${NC}"
-    echo -e "------------------------------------------------------------"
-    echo -e "${GREEN}正在建立安全连接，读取远端服务器快照列表中... (如果未配置免密，此处需要输入密码)${NC}"
-    
-    # 获取动态指定的远程快照清单
-    local remote_list=$(ssh -p "$SSH_PORT" -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_IP" "find \"$REMOTE_BACKUP_DIR\" -maxdepth 1 -type f -name 'system_snapshot_*.tar.gz' 2>/dev/null | sort -r" 2>/dev/null)
-    
-    if [ -z "$remote_list" ]; then
-        echo -e "${RED}❌ 无法读取远程备份列表。请检查您输入的IP、端口、路径是否正确，或者密码是否有误。${NC}"
-        read -p "按任意键返回..." -n 1
-        return
-    fi
-
-    local files=($remote_list)
-    local count=${#files[@]}
-
-    echo -e "\n成功检索到远端历史快照，请选择需要拉回本机的编号："
-    for ((i=0; i<count; i++)); do
-        echo -e "  [ $((i+1)) ] ☁️  $(basename "${files[i]}")"
-    done
-    echo -e "  [ 0 ] 返回上级主菜单"
-    echo -e "------------------------------------------------------------"
-
-    read -p "请选择需要提取的远程快照编号: " num
-    if [[ "$num" -eq 0 ]] 2>/dev/null || [ -z "$num" ]; then return; fi
-
-    if [[ "$num" -gt 0 && "$num" -le "$count" ]] 2>/dev/null; then
-        local remote_target_path="${files[$((num-1))]}"
-        local filename=$(basename "$remote_target_path")
-        
-        # 本地落盘暂存目录采用动态载入或固定 /backups
-        local local_save_dir="${BACKUP_DIR:-/backups}"
-        local local_tmp_target="$local_save_dir/$filename"
-        mkdir -p "$local_save_dir"
-
-        echo -e "\n${GREEN}正在从远端服务器拉取快照到本地 [ $local_tmp_target ]（实时同步进度）：${NC}"
-        rsync -avz --progress -e "ssh -p $SSH_PORT -o StrictHostKeyChecking=no" "$REMOTE_USER@$REMOTE_IP:$remote_target_path" "$local_tmp_target"
-        
-        if [ $? -eq 0 ] && [ -s "$local_tmp_target" ]; then
-            echo -e "${GREEN}✓ 远程快照下载成功。${NC}"
-            execute_untar_restore "$local_tmp_target"
-        else
-            echo -e "${RED}❌ 远程文件同步中断，拉取失败。${NC}"
-            read -p "按任意键返回..." -n 1
-        fi
-    else
-        echo -e "${RED}无效的选择！${NC}"
-        sleep 1
-    fi
-}
-
-# ==============================================================================
-# 控制台主循环菜单
-# ==============================================================================
-menu_loop() {
-    while true; do
-        draw_header
-        echo -e "${GREEN}  [1] 本地备份还原${NC}"
-        echo -e "${GREEN}  [2] 远程备份还原${NC}"
-        echo -e "${GREEN}  [0] 退出${NC}"
-        echo -e "${GREEN}==============================${NC}"
-        read -p $'\033[32m请选择操作编号: \033[0m' choice
-        case $choice in
-            1) restore_from_local ;;
-            2) restore_from_remote ;;
-            0) exit 0 ;;
-            *) sleep 0.5 ;;
+    if [[ "$OSTYPE" == "linux-gnu"* ]] || [ -f /etc/alpine-release ]; then
+        # 获取系统架构 (x86_64 / aarch64 等)
+        ARCH=$(uname -m)
+        case "$ARCH" in
+            x86_64)  ARCH_TAG="64bit" ;;
+            i386|i686) ARCH_TAG="32bit" ;;
+            aarch64|arm64) ARCH_TAG="ARM64" ;;
+            arm*)    ARCH_TAG="ARM" ;;
+            *)       ARCH_TAG="64bit" ;;
         esac
-    done
+
+        # 剥离官方容易卡死的脚本，直接去官方最新 Release 抓取对应架构的压缩包
+        echo -e "${YELLOW}➔ 正在通过高速通道下载静态编译包 [Linux ${ARCH_TAG}]...${RESET}"
+        
+        # 建立临时目录防止污染
+        TMP_DIR=$(mktemp -d)
+        cd "$TMP_DIR" || return
+        
+        # 获取最新版本号
+        LATEST_VERSION=$(curl -s https://api.github.com/repos/schollz/croc/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        if [ -z "$LATEST_VERSION" ]; then
+            # 如果解析 GitHub API 失败（限流），则降级使用固定稳健版本
+            LATEST_VERSION="v10.2.1"
+        fi
+        
+        # 去除 v 字头用于拼接文件名
+        VER_NUM="${LATEST_VERSION#v}"
+        DOWNLOAD_URL="https://github.com/schollz/croc/releases/download/${LATEST_VERSION}/croc_${VER_NUM}_Linux-${ARCH_TAG}.tar.gz"
+        
+        # 开始下载
+        curl -fsSL "$DOWNLOAD_URL" -o croc.tar.gz
+        if [ $? -ne 0 ]; then
+            # 针对国内网络：如果 GitHub 主站下载失败，切换到官方全量静态代理镜像加速
+            echo -e "${YELLOW}➔ 正在尝试备用加速镜像源下载...${RESET}"
+            curl -fsSL "https://ghproxy.com/$DOWNLOAD_URL" -o croc.tar.gz 2>/dev/null || \
+            curl -fsSL "https://mirror.ghproxy.com/$DOWNLOAD_URL" -o croc.tar.gz
+        fi
+
+        # 解压并分发到系统环境变量路径下
+        if [ -f croc.tar.gz ]; then
+            tar -xzf croc.tar.gz croc 2>/dev/null
+            if [ -f croc ]; then
+                chmod +x croc
+                mv -f croc /usr/local/bin/
+            fi
+        fi
+        
+        # 清理临时文件
+        cd - >/dev/null && rm -rf "$TMP_DIR"
+
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+        if command -v brew &>/dev/null; then
+            brew install croc
+        else
+            echo -e "${RED}❌ 未检测到 Homebrew，请先安装 Homebrew 再重试。${RESET}"
+            read -r -p "按回车返回..." ; return
+        fi
+    else
+        echo -e "${RED}❌ 不支持的系统架构: $OSTYPE${RESET}"
+        read -r -p "按回车返回..." ; return
+    fi
+
+    # 最终验证安装状态
+    if command -v /usr/local/bin/croc &>/dev/null || command -v croc &>/dev/null; then
+        echo -e "${GREEN}🟢 Croc 核心传输组件安装成功！${RESET}"
+    else
+        echo -e "${RED}🔴 Croc 安装失败，请检查网络是否能够顺畅访问 GitHub。${RESET}"
+    fi
+    read -r -p "按回车返回主菜单..."
 }
 
-menu_loop
+# 卸载 Croc
+uninstall_croc() {
+    echo -e "${YELLOW}➔ 正在卸载 Croc...${RESET}"
+    if [[ "$OSTYPE" == "linux-gnu"* ]] || [ -f /etc/alpine-release ]; then
+        if command -v croc &>/dev/null || [ -f /usr/local/bin/croc ]; then
+            rm -f /usr/local/bin/croc 2>/dev/null
+            local croc_path
+            croc_path=$(command -v croc 2>/dev/null)
+            [ -n "$croc_path" ] && rm -f "$croc_path"
+            echo -e "${GREEN}🟢 Croc 已从系统成功卸载。${RESET}"
+        else
+            echo -e "${YELLOW}⚠️  系统中未发现已安装的 Croc。${RESET}"
+        fi
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+        brew uninstall croc 2>/dev/null
+        echo -e "${GREEN}🟢 Croc 已从 macOS 卸载。${RESET}"
+    else
+        echo -e "${RED}❌ 不支持的系统架构: $OSTYPE${RESET}"
+    fi
+    read -r -p "按回车返回主菜单..."
+}
+
+# 发送文件/目录（支持多路径）
+send_file() {
+    if ! command -v croc &>/dev/null && [ ! -f /usr/local/bin/croc ]; then
+        echo -e "${RED}❌ 错误：请先选择选项 1 安装 Croc 核心传输组件。${RESET}"
+        read -r -p "按回车返回..." ; return
+    fi
+
+    echo -e "${YELLOW}请输入要发送的文件或目录路径 (多个路径请用 空格 分隔):${RESET}"
+    read -r -a paths
+    
+    if [ ${#paths[@]} -eq 0 ]; then
+        echo -e "${YELLOW}操作已取消。${RESET}"
+        read -r -p "按回车返回主菜单..." ; return
+    fi
+
+    valid_paths=()
+    for p in "${paths[@]}"; do
+        if [[ -e "$p" ]]; then
+            valid_paths+=("$p")
+        else
+            echo -e "${RED}❌ 路径不存在，已自动忽略: $p${RESET}"
+        fi
+    done
+
+    if [[ ${#valid_paths[@]} -eq 0 ]]; then
+        echo -e "${RED}🔴 没有找到任何有效路径，返回主菜单。${RESET}"
+        read -r -p "按回车返回..." ; return
+    fi
+
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    read -r -p "请输入自定义接收代码 (直接回车则随机生成): " code
+    echo -e "${GREEN}---------------------------------------${RESET}"
+
+    if [[ -z "$code" ]]; then
+        echo -e "${YELLOW}➔ 正在建立加密信道并自动生成代码...${RESET}"
+        croc send "${valid_paths[@]}"
+    else
+        echo -e "${YELLOW}➔ 正在建立加密信道，使用自定义代码: ${YELLOW}$code${RESET}"
+        croc send --code "$code" "${valid_paths[@]}"
+    fi
+
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}🟢 文件/目录传输任务执行完毕。${RESET}"
+    else
+        echo -e "${RED}🔴 传输中断或发送失败。${RESET}"
+    fi
+    read -r -p "按回车返回主菜单..."
+}
+
+# 接收文件/目录（完美适配新版 CROC_SECRET 安全拦截机制）
+receive_file() {
+    if ! command -v croc &>/dev/null && [ ! -f /usr/local/bin/croc ]; then
+        echo -e "${RED}❌ 错误：请先选择选项 1 安装 Croc 核心传输组件. ${RESET}"
+        read -r -p "按回车返回..." ; return
+    fi
+
+    read -r -p "请输入接收连接代码 (Code): " code
+    if [[ -z "$code" ]]; then
+        echo -e "${RED}❌ 接收连接代码不能为空！${RESET}"
+        read -r -p "按回车返回主菜单..." ; return
+    fi
+
+    echo -e "${YELLOW}➔ 正在通过安全通道连接远端传输中继...${RESET}"
+    
+    # 临时环境变量注入接收
+    CROC_SECRET="$code" croc
+
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}🟢 文件/目录安全接收完成！${RESET}"
+    else
+        echo -e "${RED}🔴 接收失败：连接超时、代码错误或信道断开。${RESET}"
+    fi
+    read -r -p "按回车返回主菜单..."
+}
+
+# 主菜单循环
+while true; do
+    clear
+    get_system_env
+    
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}        ◈  Croc 点对点安全传输面板  ◈      ${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN} 当前系统环境 : ${YELLOW}${OS}${RESET}"
+    echo -e "${GREEN} 传输组件状态 : ${CROC_STATUS}${RESET}"
+    echo -e "${GREEN} 加密传输协议 : ${YELLOW}PAKE (端到端全密文)${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN} 📋 快捷操作指南：${RESET}"
+    echo -e "   • 发送端和接收端都可以是任何跨平台服务器/PC"
+    echo -e "   • 传输大文件或多目录时会自动进行并发提速"
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN}  1) 快速安装/更新 Croc 传输组件${RESET}"
+    echo -e "${GREEN}  2) 从当前系统深度卸载 Croc${RESET}"
+    echo -e "${GREEN}  3) 🚀 安全发送本地文件/目录 (多选)${RESET}"
+    echo -e "${GREEN}  4) 📥 接收远端文件/目录 (凭码提取)${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN}  0) 退出面板${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+
+    echo -ne "${GREEN} 请选择操作编号: ${RESET}"
+    read -r choice
+
+    case $choice in
+        1) install_croc ;;
+        2) uninstall_croc ;;
+        3) send_file ;;
+        4) receive_file ;;
+        0) echo -e "${YELLOW}正在退出系统...${RESET}" ; exit 0 ;;
+        *) echo -e "${RED}❌ 无效选项，请输入正确的编号！${RESET}" ; read -r -p "按回车继续..." ;;
+    esac
+done

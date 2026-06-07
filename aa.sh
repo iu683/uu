@@ -5,7 +5,7 @@ set -o pipefail
 # 环境变量 & 配置
 #################################
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export HOME=/root   # ⭐ 确保 cron 下 ~ 指向 root
+export HOME=/root   
 
 GREEN="\033[32m"
 RED="\033[31m"
@@ -20,11 +20,12 @@ LOG_DIR="$BASE_DIR/logs"
 CONFIG_FILE="$BASE_DIR/rsync_tasks.conf"
 TG_CONFIG="$BASE_DIR/.tg.conf"
 BIN_LINK_DIR="/usr/local/bin"
+DEP_LOCK="$BASE_DIR/.dep_installed"  
 
 mkdir -p "$BASE_DIR" "$KEY_DIR" "$LOG_DIR"
 touch "$CONFIG_FILE"
 
-# 动态精准识别系统环境 (完美兼容 Alpine)
+# 动态精准识别系统环境
 if [ -f /etc/alpine-release ]; then
     OS="Alpine Linux $(cat /etc/alpine-release)"
 elif [ -f /etc/os-release ]; then
@@ -48,30 +49,38 @@ cron_count() {
 }
 
 #################################
-# 安装依赖
+# 优化依赖安装
 #################################
 install_dep() {
-    local pkgs="rsync openssh sshpass curl tar"
+    if [ -f "$DEP_LOCK" ]; then
+        return 0
+    fi
+
+    local need_install=0
     if [ -f /etc/alpine-release ]; then
-        pkgs="rsync openssh-client sshpass curl tar bash"
-        for p in $pkgs; do
-            if ! command -v ${p%-*} &>/dev/null; then
-                apk update -q && apk add -q $p >/dev/null 2>&1
-            fi
+        for p in rsync ssh sshpass curl tar bash; do
+            if ! command -v $p &>/dev/null; then need_install=1; break; fi
         done
+        if [ $need_install -eq 1 ]; then
+            echo -e "${YELLOW}正在为 Alpine 补充必要依赖...${RESET}"
+            apk update -q && apk add -q rsync openssh-client sshpass curl tar bash >/dev/null 2>&1
+        fi
     else
         for p in rsync ssh sshpass curl tar; do
-            if ! command -v $p &>/dev/null; then
-                DEBIAN_FRONTEND=noninteractive apt-get update -qq
-                DEBIAN_FRONTEND=noninteractive apt-get install -y $p >/dev/null 2>&1
-            fi
+            if ! command -v $p &>/dev/null; then need_install=1; break; fi
         done
+        if [ $need_install -eq 1 ]; then
+            echo -e "${YELLOW}首次运行，正在为您安装基础环境依赖，请稍候...${RESET}"
+            DEBIAN_FRONTEND=noninteractive apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y rsync ssh sshpass curl tar >/dev/null 2>&1
+        fi
     fi
+    touch "$DEP_LOCK"
 }
 install_dep
 
 #################################
-# Telegram
+# Telegram 通知
 #################################
 send_tg() {
     [[ -f "$TG_CONFIG" ]] || return
@@ -96,38 +105,44 @@ EOF
 }
 
 #################################
-# SSH 密钥管理
+# SSH 密钥自动化生成与全静默分发
 #################################
 generate_and_setup_ssh() {
-    local remote="$1"
-    local port="$2"
+    local remote="$1"     
+    local port="$2"       
+    local password="$3"   
 
     KEY_FILE="$KEY_DIR/id_rsa_rsync"
     PUB_FILE="$KEY_FILE.pub"
 
     if [[ ! -f "$KEY_FILE" ]]; then
+        echo -e "${YELLOW}未检测到本地专用密钥对，正在自动创建...${RESET}"
         ssh-keygen -t rsa -b 4096 -f "$KEY_FILE" -N "" -q
+        chmod 600 "$KEY_FILE"
+        echo -e "${GREEN}✅ 本地安全密钥对已成功生成。${RESET}"
     fi
 
-    PUBKEY_CONTENT=$(cat "$PUB_FILE")
-    echo -e "${YELLOW}第一次连接需要输入远程密码进行握手认证...${RESET}"
+    local pubkey_content
+    pubkey_content=$(cat "$PUB_FILE")
 
-    set +e
+    echo -e "${YELLOW}正在尝试自动化建立远程密钥授信通道...${RESET}"
+
     ssh-keygen -f "$HOME/.ssh/known_hosts" -R "${remote#*@}" >/dev/null 2>&1
 
-    # 握手时注入 LogLevel=ERROR 过滤杂音
-    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p "$port" "$remote" "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
-    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p "$port" "$remote" "touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
-    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p "$port" "$remote" "grep -Fxq '$PUBKEY_CONTENT' ~/.ssh/authorized_keys || echo '$PUBKEY_CONTENT' >> ~/.ssh/authorized_keys"
+    set +e
+    sshpass -p "$password" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p "$port" "$remote" "mkdir -p ~/.ssh && chmod 700 ~/.ssh" >/dev/null 2>&1
+    sshpass -p "$password" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p "$port" "$remote" "touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && grep -Fxq '$pubkey_content' ~/.ssh/authorized_keys || echo '$pubkey_content' >> ~/.ssh/authorized_keys" >/dev/null 2>&1
 
-    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i "$KEY_FILE" -p "$port" "$remote" "echo ok" >/dev/null 2>&1
-    ok=$?
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p "$port" "$remote" "echo ok" >/dev/null 2>&1
+    local ok=$?
     set -e
 
     if [[ $ok -eq 0 ]]; then
-        echo -e "${GREEN}✅ 公钥写入成功，可免密码登录 $remote${RESET}"
+        echo -e "${GREEN}✅ 密钥自动化分发成功！已成功与远程 VPS 建立免密信任。${RESET}"
+        return 0
     else
-        echo -e "${RED}❌ 公钥写入失败，请检查 SSH 或密码是否正确${RESET}"
+        echo -e "${RED}❌ 密钥自动化分发失败。请检查你输入的密码、端口、或远程 VPS 是否允许 root 登录。${RESET}"
+        return 1
     fi
 }
 
@@ -150,28 +165,34 @@ list_tasks() {
 }
 
 add_task() {
-    read -p "任务名称: " name
-    read -p "本地目录: " local
-    read -p "远程目录: " remote_path
+    read -p "任务名称(例如: Rsync): " name
+    read -p "本地目录(例如: /opt): " local
+    read -p "远程目录(例如: /opt): " remote_path
     read -p "远程用户名 (默认 root): " user
     user=${user:-root}
     read -p "远程服务器 IP: " ip
     read -p "端口 (默认 22): " port
     port=${port:-22}
 
-    echo -e "${GREEN}选择远端认证方式: 1) 密码验证  2) 密钥对验证${RESET}"
+    echo -e "${GREEN}选择远端认证方式: 1) 密码验证  2) 密钥对验证 (全自动铺设)${RESET}"
     read -p "请选择 [1-2]: " c
     if [[ $c == 1 ]]; then
         read -s -p "请输入远程服务器密码: " secret; echo
         auth="password"
     else
-        generate_and_setup_ssh "${user}@${ip}" "$port"
-        secret="$KEY_DIR/id_rsa_rsync"
-        auth="key"
+        read -s -p "请输入远程服务器密码 (仅用于首次自动拷贝密钥): " temp_pwd; echo
+        if generate_and_setup_ssh "${user}@${ip}" "$port" "$temp_pwd"; then
+            secret="$KEY_DIR/id_rsa_rsync"
+            auth="key"
+        else
+            echo -e "${RED}由于密钥无法送达，任务放弃添加。${RESET}"
+            return 1
+        fi
     fi
 
     echo "$name|$local|$user|$ip|$port|$auth|$secret|$remote_path" >> "$CONFIG_FILE"
     echo -e "${GREEN}✅ 同步传输链路添加成功！${RESET}"
+    return 1
 }
 
 delete_task() {
@@ -185,7 +206,7 @@ delete_task() {
 }
 
 #################################
-# 压缩同步 (【彻底净化】：通过 -o LogLevel=ERROR 强力抹除指纹提示噪音)
+# 压缩同步 
 #################################
 run_task() {
     local direction="$1"
@@ -226,32 +247,26 @@ run_task() {
 
     echo -e "${YELLOW}正在开始执行同步任务 [$name] ...${RESET}"
 
-    # ⭐ 核心加固：注入 -o LogLevel=ERROR 阻断 Warning 杂音输出
-    local common_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p $port"
-
     if [[ "$direction" == "push" ]]; then
-        # 1. 打包本地目录
         tar -czf "$archive" -C "$(dirname "$local_dir")" "$(basename "$local_dir")"
         if [ $? -ne 0 ]; then
             echo -e "${RED}❌ [$name] 本地打包失败。${RESET}"
             return 1
         fi
 
-        # 2. 远端创建目录并同步推流
         local sync_ok=1
         if [[ "$auth" == "password" ]]; then
-            sshpass -p "$secret" ssh $common_opts "$remote" "mkdir -p $remote_path" && \
-            sshpass -p "$secret" rsync -az -e "ssh $common_opts" "$archive" "$remote:$remote_path/"
+            sshpass -p "$secret" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p "$port" "$remote" "mkdir -p $remote_path" && \
+            sshpass -p "$secret" rsync -az -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p $port" "$archive" "$remote:$remote_path/"
             sync_ok=$?
         else
-            ssh -i "$secret" $common_opts "$remote" "mkdir -p $remote_path" && \
-            rsync -az -e "ssh -i $secret $common_opts" "$archive" "$remote:$remote_path/"
+            ssh -i "$secret" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p "$port" "$remote" "mkdir -p $remote_path" && \
+            rsync -az -e "ssh -i $secret -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p $port" "$archive" "$remote:$remote_path/"
             sync_ok=$?
         fi
         
         rm -f "$archive"
 
-        # 3. 严格判定同步返回值
         if [ $sync_ok -eq 0 ]; then
             echo -e "${GREEN}✅ [$name] 推送完成${RESET}"
             send_tg "$name 推送完成 ✅"
@@ -262,13 +277,12 @@ run_task() {
             return 1
         fi
     else
-        # 接收模式拉取
         local sync_ok=1
         if [[ "$auth" == "password" ]]; then
-            sshpass -p "$secret" rsync -az -e "ssh $common_opts" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
+            sshpass -p "$secret" rsync -az -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p $port" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
             sync_ok=$?
         else
-            rsync -az -e "ssh -i $secret $common_opts" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
+            rsync -az -e "ssh -i $secret -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p $port" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
             sync_ok=$?
         fi
 
@@ -307,7 +321,7 @@ batch_run() {
 }
 
 #################################
-# 定时任务管理
+# 定时任务管理 (⭐ 彻底修复 all 导致的多任务编号粘连 Bug)
 #################################
 schedule_task() {
     echo -e "${GREEN}定时任务频率模板:${RESET}"
@@ -325,9 +339,12 @@ schedule_task() {
     esac
 
     read -p "请输入要绑定的任务编号(多个用逗号隔开，或输入 all): " nums
+    
+    # ⭐ 核心修复：如果是 all，改用逗号进行绝对格式隔离，防止换行符挤压粘连
     if [[ "$nums" == "all" ]]; then
+        local count
         count=$(task_count)
-        nums=$(seq 1 $count)
+        nums=$(seq 1 $count | tr '\n' ',' | sed 's/,$//')
     fi
 
     OLDIFS=$IFS
@@ -366,7 +383,7 @@ delete_schedule() {
 update_self() {
     curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
     chmod +x "$SCRIPT_PATH"
-    echo -e "${GREEN}管理面板已成功自我更新！${RESET}"
+    echo -e "${GREEN}管理面板已成功更新！${RESET}"
 }
 
 if [[ "$1" == "auto" ]]; then
@@ -382,12 +399,13 @@ uninstall_self() {
     exit
 }
 
+# 首次安装配置快捷命令
 if [ ! -f "$SCRIPT_PATH" ]; then
     curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
     chmod +x "$SCRIPT_PATH"
     ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/s"
     ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/S"
-    echo -e "${GREEN}✅ 安装完成${RESET}"
+    echo -e "${GREEN}✅ 快捷键已添加：s 或 S 可快速启动面板${RESET}"
 fi
 
 #################################
@@ -413,15 +431,16 @@ while true; do
     echo -e "${GREEN}---------------------------------------${RESET}"
     echo -e "${GREEN}  1) 添加同步传输任务${RESET}"
     echo -e "${GREEN}  2) 移除同步传输任务${RESET}"
-    echo -e "${GREEN}  3) 执行单点推送远端(Push)${RESET}"
-    echo -e "${GREEN}  4) 执行单点拉回本地(Pull)${RESET}"
-    echo -e "${GREEN}  5) 批量同步推送远端(Push)${RESET}"
-    echo -e "${GREEN}  6) 批量同步拉回本地(Pull)${RESET}"
+    echo -e "${GREEN}  3) 执行推送远端(Push)${RESET}"
+    echo -e "${GREEN}  4) 执行拉回本地(Pull)${RESET}"
+    echo -e "${GREEN}  5) 批量推送远端(Push)${RESET}"
+    echo -e "${GREEN}  6) 批量拉回本地(Pull)${RESET}"
     echo -e "${GREEN}  7) 设置定时任务${RESET}"
     echo -e "${GREEN}  8) 删除定时任务${RESET}"
     echo -e "${GREEN}  9) 配置Telegram通知${RESET}"
     echo -e "${GREEN} 10) 更新${RESET}"
     echo -e "${GREEN} 11) 卸载${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
     echo -e "${GREEN}  0) 退出${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
     
@@ -443,6 +462,6 @@ while true; do
         *) echo -e "${RED}❌ 无效选项${RESET}" ;;
     esac
     echo
-    echo -ne "${GREEN}按回车键刷新控制台数据矩阵... ${RESET}"
+    echo -ne "${GREEN}按回车键返回菜单... ${RESET}"
     read -r
 done

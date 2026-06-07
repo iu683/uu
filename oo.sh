@@ -1,317 +1,542 @@
 #!/bin/bash
-
 # ========================================
-# Croc 文件传输一键安装与使用脚本（精准分流版）
+# Rclone 管理脚本 (智能挂载自启动一体版 + 资产清单)
 # ========================================
 
+# ================== 颜色 ==================
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-# 初始化本地配置文件路径
-CONF_FILE="/opt/vpsbackup/.croc_env.conf"
-mkdir -p /opt/vpsbackup 2>/dev/null
+# ================== 全局变量 & 目录配置 ==================
+BASE_DIR="/opt/rclone_manager"
+LOG_DIR="$BASE_DIR/log"
+SCRIPT_DIR="$BASE_DIR/scripts"
+CONFIG_FILE="$BASE_DIR/config.env"
+CRON_PREFIX="# rclone_sync_task:"
 
-# 默认下载/输出目录
-DEFAULT_OUT_DIR="."
+mkdir -p "$LOG_DIR" "$SCRIPT_DIR"
 
-# 读取持久化配置
-load_config() {
-    if [ -f "$CONF_FILE" ]; then
-        source "$CONF_FILE"
-    fi
-    OUT_DIR="${OUT_DIR:-$DEFAULT_OUT_DIR}"
-}
+# 获取系统环境名称
+if [ -f /etc/os-release ]; then
+    OS=$(awk -F= '/^NAME/{print $2}' /etc/os-release | tr -d '"')
+else
+    OS=$(uname -s)
+fi
 
-# 保存持久化配置
-save_config() {
-cat > "$CONF_FILE" <<EOF
-OUT_DIR="$OUT_DIR"
+# ================== 载入或初始化配置文件 ==================
+init_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        cat > "$CONFIG_FILE" <<EOF
+TG_TOKEN="填入你的默认BotToken"
+TG_CHAT_ID="填入你的默认ChatID"
+VPS_NAME="未命名VPS"
 EOF
-}
-
-# 获取系统与Croc状态信息
-get_system_env() {
-    load_config
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS=$NAME
-    else
-        OS=$(uname -s)
     fi
-
-    if command -v croc &>/dev/null; then
-        CURRENT_VERSION=$(croc --version 2>/dev/null | awk '{print $3}')
-        CROC_STATUS="${GREEN}已安装 (${RESET}${CURRENT_VERSION}${GREEN})${RESET}"
-    else
-        CROC_STATUS="${RED}未安装${RESET}"
-    fi
+    source "$CONFIG_FILE"
 }
+init_config
 
-# 1) 快速全新安装 (Alpine 使用官方管道流，其他继续使用纯净二进制)
-install_croc() {
-    echo -e "${YELLOW}➔ 正在检测并配置系统安装环境...${RESET}"
+# ================== 动态状态获取 ==================
+get_system_status() {
+    echo -e "${GREEN}=========== 系统实时状态面板 ==========${RESET}"
     
-    # 【Alpine 分支】：执行依赖安装与官方一键托管脚本流
-    if [ -f /etc/alpine-release ]; then
-        echo -e "${YELLOW}➔ 检测到 Alpine Linux，正在安装官方必要依赖 (bash / coreutils)...${RESET}"
-        apk update && apk add bash coreutils wget >/dev/null 2>&1
-        
-        echo -e "${GREEN}➔ 正在通过官方一键流获取并安装最新版 Croc...${RESET}"
-        wget -qO- https://getcroc.schollz.com | bash
-
-    # 【其他系统分支】：坚持纯净二进制包直连提取
-    elif [[ "$OSTYPE" == "linux-gnu"* ]] || [ -f /etc/debian_version ] || [[ "$OSTYPE" == "freebsd"* ]]; then
-        ARCH=$(uname -m)
-        SYS_TYPE="Linux"
-        [[ "$OSTYPE" == "freebsd"* ]] && SYS_TYPE="FreeBSD"
-
-        case "$ARCH" in
-            x86_64)       ARCH_TAG="64bit" ;;
-            i386|i686)    ARCH_TAG="32bit" ;;
-            aarch64|arm64) ARCH_TAG="ARM64" ;;
-            armv5*)       ARCH_TAG="ARMv5" ;;
-            arm*)         ARCH_TAG="ARM" ;;
-            riscv64)      ARCH_TAG="RISCV64" ;;
-            *)            ARCH_TAG="64bit" ;;
-        esac
-
-        echo -e "${YELLOW}➔ 确保依赖正常...${RESET}"
-        [ -f /etc/debian_version ] && (apt-get update && apt-get install -y curl tar >/dev/null 2>&1)
-
-        echo -e "${YELLOW}➔ 正在直连 GitHub 下载静态编译包 [${SYS_TYPE} ${ARCH_TAG}]...${RESET}"
-        
-        TMP_DIR=$(mktemp -d)
-        cd "$TMP_DIR" || return
-        
-        LATEST_VERSION="v10.4.4"
-        DOWNLOAD_URL="https://github.com/schollz/croc/releases/download/${LATEST_VERSION}/croc_${LATEST_VERSION}_${SYS_TYPE}-${ARCH_TAG}.tar.gz"
-        
-        curl -fsSL --connect-timeout 15 --retry 5 --retry-delay 3 "$DOWNLOAD_URL" -o croc.tar.gz
-        
-        if [ $? -eq 0 ] && [ -s croc.tar.gz ]; then
-            tar -xzf croc.tar.gz croc 2>/dev/null
-            if [ -f croc ]; then
-                chmod +x croc
-                mv -f croc /usr/local/bin/
-            fi
-        fi
-        cd - >/dev/null && rm -rf "$TMP_DIR"
+    if command -v rclone &> /dev/null; then
+        local rclone_ver=$(rclone version | head -n 1 | awk '{print $2}')
+        echo -e "Rclone 状态: ${GREEN}已安装 (${rclone_ver})${RESET}"
     else
-        echo -e "${RED}❌ 暂不支持的系统架构。${RESET}"
-        read -r -p "按回车返回..." ; return
+        echo -e "Rclone 状态: ${RED}未安装${RESET}"
     fi
 
-    # 最终验证
-    if command -v croc &>/dev/null || [ -f /usr/local/bin/croc ]; then
-        echo -e "${GREEN}🟢 Croc 核心传输组件安装/覆盖成功！${RESET}"
+    if command -v rclone &> /dev/null; then
+        local remote_count=$(rclone listremotes 2>/dev/null | wc -l)
+        echo -e "已配置网盘: ${CYAN}${remote_count} 个${RESET}"
     else
-        echo -e "${RED}🔴 Croc 安装失败，请检查网络直连环境。${RESET}"
+        echo -e "已配置网盘: ${YELLOW}----${RESET}"
     fi
-    read -r -p "按回车返回主菜单..."
+
+    local active_mounts=$(mount | grep -i "rclone" | awk '{print $3}')
+    if [ -n "$active_mounts" ]; then
+        echo -e "活跃挂载点: "
+        echo "$active_mounts" | while read -r mnt; do
+            echo -e "  ${GREEN}●${RESET} $mnt (已开启开机自启)"
+        done
+    else
+        echo -e "活跃挂载点: ${YELLOW}暂无活跃挂载${RESET}"
+    fi
+
+    local cron_count=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX" | wc -l)
+    echo -e "同步定时任务: ${CYAN}${cron_count} 个活跃任务${RESET}"
+
+    if [[ "$TG_TOKEN" == "填入你的默认BotToken" || -z "$TG_TOKEN" ]]; then
+        echo -e "TG 通知状态: ${YELLOW}未配置 (部分功能将缺乏推送)${RESET}"
+    else
+        echo -e "TG 通知状态: ${GREEN}已启用 (${VPS_NAME})${RESET}"
+    fi
+    echo -e "${GREEN}======================================${RESET}"
 }
 
-# 5) 独立在线检查更新 (同步上述克制的分流逻辑)
-update_croc() {
-    echo -e "${YELLOW}➔ 正在向 GitHub 发起版本合规性检查...${RESET}"
-    if ! command -v croc &>/dev/null; then
-        echo -e "${RED}❌ 错误：检测到系统尚未安装 Croc，请先选择选项 1 进行全新安装。${RESET}"
-        read -r -p "按回车返回..." ; return
-    fi
-
-    CLOUD_VERSION=$(curl -fsSL --connect-timeout 10 https://api.github.com/repos/schollz/croc/releases/latest 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    [ -z "$CLOUD_VERSION" ] && CLOUD_VERSION="最新版"
-
-    LOCAL_VERSION=$(croc --version 2>/dev/null | awk '{print $3}')
-    
-    echo -e "${GREEN}➔ 当前本地版本: ${YELLOW}${LOCAL_VERSION}${RESET}"
-    echo -e "${GREEN}➔ 官方云端版本: ${YELLOW}${CLOUD_VERSION}${RESET}"
-    echo -e "${GREEN}---------------------------------------${RESET}"
-
-    if [ "$LOCAL_VERSION" = "$CLOUD_VERSION" ] && [ "$CLOUD_VERSION" != "最新版" ]; then
-        echo -e "${GREEN}🟢 检测完毕：您当前已是官方最新版本，无需更新。${RESET}"
-    else
-        echo -e "${YELLOW}➔ 准备为您在线升级/覆盖组件...${RESET}"
-        if [ -f /etc/alpine-release ]; then
-            # Alpine 继续走官方流
-            wget -qO- https://getcroc.schollz.com | bash
-        else
-            # 其它系统继续走纯二进制直连覆盖（锁定最新云端版本）
-            [ "$CLOUD_VERSION" = "最新版" ] && CLOUD_VERSION="v10.4.4"
-            
-            ARCH=$(uname -m)
-            SYS_TYPE="Linux"
-            [[ "$OSTYPE" == "freebsd"* ]] && SYS_TYPE="FreeBSD"
-            case "$ARCH" in
-                x86_64) ARCH_TAG="64bit" ;; aarch64|arm64) ARCH_TAG="ARM64" ;; *) ARCH_TAG="64bit" ;;
-            esac
-            
-            TMP_DIR=$(mktemp -d)
-            cd "$TMP_DIR" || return
-            DOWNLOAD_URL="https://github.com/schollz/croc/releases/download/${CLOUD_VERSION}/croc_${CLOUD_VERSION}_${SYS_TYPE}-${ARCH_TAG}.tar.gz"
-            curl -fsSL --connect-timeout 15 --retry 3 "$DOWNLOAD_URL" -o croc.tar.gz
-            if [ -f croc.tar.gz ]; then
-                tar -xzf croc.tar.gz croc 2>/dev/null
-                [ -f croc ] && chmod +x croc && mv -f croc /usr/local/bin/
-            fi
-            cd - >/dev/null && rm -rf "$TMP_DIR"
-        fi
-        echo -e "${GREEN}🟢 Croc 组件更新程序执行完毕。${RESET}"
-    fi
-    read -r -p "按回车返回主菜单..."
-}
-
-# 7) 自定义设置输出文件夹
-set_output_dir() {
-    echo -e "${GREEN}当前设定的文件下载保存目录为: ${YELLOW}${OUT_DIR}${RESET}"
-    read -r -p "请输入新的保存路径 (支持绝对路径或 ~，留空回车取消修改): " input_path
-    
-    if [ -n "$input_path" ]; then
-        eval expanded_path="$input_path"
-        if [ "$expanded_path" != "." ]; then
-            mkdir -p "$expanded_path" 2>/dev/null
-            if [ $? -ne 0 ]; then
-                echo -e "${RED}❌ 路径创建失败：请检查权限或路径输入是否正确！${RESET}"
-                read -r -p "按回车返回..." ; return
-            fi
-        fi
-        
-        OUT_DIR="$input_path"
-        save_config
-        echo -e "${GREEN}🟢 成功！文件接收保存路径已修改为: ${YELLOW}${OUT_DIR}${RESET}"
-    else
-        echo -e "${YELLOW}未做任何修改。${RESET}"
-    fi
-    read -r -p "按回车返回主菜单..."
-}
-
-# 2) 从当前系统深度卸载 Croc
-uninstall_croc() {
-    echo -e "${YELLOW}➔ 正在卸载 Croc...${RESET}"
-    if command -v croc &>/dev/null || [ -f /usr/local/bin/croc ] || [ -f /usr/bin/croc ]; then
-        rm -f /usr/local/bin/croc /usr/bin/croc 2>/dev/null
-        local croc_path
-        croc_path=$(command -v croc 2>/dev/null)
-        [ -n "$croc_path" ] && rm -f "$croc_path"
-        echo -e "${GREEN}🟢 Croc 已从当前系统成功卸载。${RESET}"
-    else
-        echo -e "${YELLOW}⚠️  系统中未发现已安装的 Croc。${RESET}"
-    fi
-    read -r -p "按回车返回主菜单..."
-}
-
-# 3) 安全发送本地文件/目录
-send_file() {
-    if ! command -v croc &>/dev/null; then
-        echo -e "${RED}❌ 错误：请先选择选项 1 安装 Croc 核心传输组件。${RESET}"
-        read -r -p "按回车返回..." ; return
-    fi
-
-    echo -e "${YELLOW}请输入要发送的文件或目录路径 (多个路径请用 空格 分隔):${RESET}"
-    read -r -a paths
-    
-    if [ ${#paths[@]} -eq 0 ]; then
-        echo -e "${YELLOW}操作已取消。${RESET}"
-        read -r -p "按回车返回主菜单..." ; return
-    fi
-
-    valid_paths=()
-    for p in "${paths[@]}"; do
-        if [[ -e "$p" ]]; then
-            valid_paths+=("$p")
-        else
-            echo -e "${RED}❌ 路径不存在，已自动忽略: $p${RESET}"
-        fi
-    done
-
-    if [[ ${#valid_paths[@]} -eq 0 ]]; then
-        echo -e "${RED}🔴 没有找到任何有效路径，返回主菜单。${RESET}"
-        read -r -p "按回车返回..." ; return
-    fi
-
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    read -r -p "请输入自定义接收代码 (直接回车则随机生成): " code
-    echo -e "${GREEN}---------------------------------------${RESET}"
-
-    if [[ -z "$code" ]]; then
-        echo -e "${YELLOW}➔ 正在建立加密信道并自动生成代码...${RESET}"
-        croc send "${valid_paths[@]}"
-    else
-        echo -e "${YELLOW}➔ 正在建立加密信道，使用自定义代码: ${YELLOW}$code${RESET}"
-        croc send --code "$code" "${valid_paths[@]}"
-    fi
-
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}🟢 文件/目录传输任务执行完毕。${RESET}"
-    else
-        echo -e "${RED}🔴 传输中断或发送失败。${RESET}"
-    fi
-    read -r -p "按回车返回主菜单..."
-}
-
-# 4) 📥 接收远端文件/目录 (带自定义下载路径)
-receive_file() {
-    if ! command -v croc &>/dev/null; then
-        echo -e "${RED}❌ 错误：请先选择选项 1 安装 Croc 核心传输组件。${RESET}"
-        read -r -p "按回车返回..." ; return
-    fi
-
-    read -r -p "请输入接收连接代码 (Code): " code
-    if [[ -z "$code" ]]; then
-        echo -e "${RED}❌ 接收连接代码不能为空！${RESET}"
-        read -r -p "按回车返回主菜单..." ; return
-    fi
-
-    echo -e "${YELLOW}➔ 正在通过安全通道连接远端传输中继...${RESET}"
-    echo -e "${YELLOW}➔ 文件将被安全保存至: ${OUT_DIR}${RESET}"
-    
-    CROC_SECRET="$code" croc --out "$OUT_DIR"
-
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}🟢 文件/目录安全接收完成！${RESET}"
-    else
-        echo -e "${RED}🔴 接收失败：连接超时、代码错误或信道断开。${RESET}"
-    fi
-    read -r -p "按回车返回主菜单..."
-}
-
-# 主菜单循环
-while true; do
+# ================== 菜单 ==================
+show_menu() {
     clear
-    get_system_env
+    get_system_status
     
+    echo -e "${GREEN}=========== Rclone 管理菜单 ==========${RESET}"
+    echo -e "${CYAN} 1)${RESET} 安装 Rclone          ${CYAN} 2)${RESET} 更新 Rclone"
+    echo -e "${CYAN} 3)${RESET} 配置 Rclone (config) ${CYAN} 4)${RESET} 查看远程存储列表"
+    echo -e "${CYAN} 5)${RESET} 查看远程存储文件"
+    echo -e "----------------------------------------"
+    echo -e "${GREEN} [ 挂载管理 (自动配置开机自启) ]${RESET}"
+    echo -e "${CYAN} 6)${RESET} 挂载远程存储到本地   ${CYAN} 7)${RESET} 查看已创建的资产清单"
+    echo -e "${CYAN} 8)${RESET} 卸载指定挂载点       ${CYAN} 9)${RESET} 卸载所有挂载点"
+    echo -e "${CYAN}10)${RESET} 查看挂载运行状态     ${CYAN}11)${RESET} 查看挂载实时日志"
+    echo -e "----------------------------------------"
+    echo -e "${GREEN} [ 数据同步与任务 ]${RESET}"
+    echo -e "${CYAN}12)${RESET} 手动同步 本地 → 远程 ${CYAN}13)${RESET} 手动同步 远程 → 本地"
+    echo -e "${CYAN}14)${RESET} 定时任务管理 (Cron)"
+    echo -e "----------------------------------------"
+    echo -e "${GREEN} [ 全局设置与常规 ]${RESET}"
+    echo -e "${CYAN}15)${RESET} 修改 TG 通知参数     ${CYAN}16)${RESET} 彻底卸载 Rclone"
+    echo -e "${CYAN} 0)${RESET} 退出脚本"
+    echo -e "${GREEN}======================================${RESET}"
+}
+
+# ================== 基础操作 ==================
+install_rclone() {
+    echo -e "${YELLOW}正在安装 Rclone...${RESET}"
+    curl https://rclone.org/install.sh | sudo bash
+    echo -e "${GREEN}Rclone 安装完成！${RESET}"
+}
+
+update_rclone() {
+    echo -e "${YELLOW}正在更新 Rclone...${RESET}"
+    curl https://rclone.org/install.sh | sudo bash
+    echo -e "${GREEN}Rclone 已更新完成！${RESET}"
+    rclone version
+}
+
+config_rclone() { rclone config; }
+list_remotes() { rclone listremotes; }
+
+list_files_remote() {
+    read -p "请输入远程名称: " remote
+    [ -z "$remote" ] && { echo -e "${RED}远程名称不能为空${RESET}"; return; }
+    read -p "请输入远程目录(默认 /): " remote_dir
+    remote_dir=${remote_dir:-/}
+    rclone ls "${remote}:${remote_dir}" || echo -e "${RED}访问失败，请检查名称或权限${RESET}"
+}
+
+# ================== TG 参数持久化 ==================
+modify_tg() {
+    read -p "请输入 TG Bot Token (当前: $TG_TOKEN): " input_token
+    read -p "请输入 TG Chat ID (当前: $TG_CHAT_ID): " input_id
+    read -p "请输入 VPS 名称 (当前: $VPS_NAME): " input_name
+
+    TG_TOKEN=${input_token:-$TG_TOKEN}
+    TG_CHAT_ID=${input_id:-$TG_CHAT_ID}
+    VPS_NAME=${input_name:-$VPS_NAME}
+
+    cat > "$CONFIG_FILE" <<EOF
+TG_TOKEN="$TG_TOKEN"
+TG_CHAT_ID="$TG_CHAT_ID"
+VPS_NAME="$VPS_NAME"
+EOF
+    echo -e "${GREEN}TG 参数已成功保存到本地配置文件！${RESET}"
+}
+
+send_tg() {
+    local msg="$1"
+    source "$CONFIG_FILE"
+    if [[ "$TG_TOKEN" != "填入你的默认BotToken" ]]; then
+        curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT_ID}" -d text="[$VPS_NAME] $msg" >/dev/null
+    fi
+}
+
+# ================== 智能挂载自启动一体化 (基于 Systemd 底层) ==================
+# ================== 智能挂载自启动一体化 (支持网盘子目录版) ==================
+mount_remote() {
+    read -p "请输入远程名称 (如 CF): " remote
+    [ -z "$remote" ] && return
+    
+    read -p "请输入网盘内的子目录/存储桶 (如 sss/mm，直接回车代表根目录): " remote_dir
+    
+    default_path="/mnt/${remote}"
+    read -p "请输入VPS本地挂载路径 (默认 $default_path): " input_path
+    path=${input_path:-$default_path}
+    
+    # 拼接 Rclone 挂载源
+    if [ -z "$remote_dir" ]; then
+        local mount_source="${remote}:"
+    else
+        # 移除用户可能误输入的开头的斜杠
+        remote_dir=$(echo "$remote_dir" | sed 's/^\///')
+        local mount_source="${remote}:${remote_dir}"
+    fi
+    
+    # 1. 检查防冲突
+    if mount | grep -q "on $path type"; then
+        echo -e "${YELLOW}该本地路径 $path 已经被挂载。正在执行热刷新升级...${RESET}"
+        sudo fusermount -u "$path" 2>/dev/null || sudo umount -l "$path" 2>/dev/null
+    fi
+
+    [ -f "/var/run/rclone_${remote}.pid" ] && rm -f "/var/run/rclone_${remote}.pid"
+
+    mkdir -p "$path"
+    service_file="/etc/systemd/system/rclone-mount@${remote}.service"
+    
+    # 2. 写入 Systemd
+    sudo tee "$service_file" >/dev/null <<EOF
+[Unit]
+Description=Rclone Mount ${remote}
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/rclone mount ${mount_source} $path --allow-other --vfs-cache-mode writes --dir-cache-time 1000h
+ExecStop=/bin/fusermount -u $path
+Restart=always
+RestartSec=10
+StandardOutput=append:$LOG_DIR/rclone_${remote}_sys.log
+StandardError=append:$LOG_DIR/rclone_${remote}_sys.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable rclone-mount@${remote}
+    sudo systemctl start rclone-mount@${remote}
+    
+    sleep 1.5
+    if systemctl is-active --quiet "rclone-mount@${remote}"; then
+        echo -e "${GREEN}✅ 已成功将网盘 [${mount_source}] 挂载到本地 [${path}]！${RESET}"
+        echo -e "${GREEN}开机自启动守护已妥善配置。${RESET}"
+    else
+        echo -e "${RED}❌ 挂载启动失败，请检查报错日志: $LOG_DIR/rclone_${remote}_sys.log${RESET}"
+    fi
+}
+unmount_remote_by_name() {
+    read -p "请输入想要卸载的远程网盘名称: " remote
+    [ -z "$remote" ] && return
+    
+    local svc="rclone-mount@${remote}"
+    
+    if [ -f "/etc/systemd/system/${svc}.service" ] || systemctl list-unit-files | grep -q "^${svc}"; then
+        echo -e "${YELLOW}正在停止并移除 [${remote}] 的开机自启动守护服务...${RESET}"
+        sudo systemctl stop "$svc" 2>/dev/null
+        sudo systemctl disable "$svc" 2>/dev/null
+        sudo rm -f "/etc/systemd/system/${svc}.service"
+        sudo systemctl daemon-reload
+    fi
+
+    sudo fusermount -u "/mnt/$remote" 2>/dev/null || sudo umount -l "/mnt/$remote" 2>/dev/null
+    [ -f "/var/run/rclone_${remote}.pid" ] && rm -f "/var/run/rclone_${remote}.pid"
+
+    echo -e "${GREEN}✅ 远程存储 ${remote} 卸载完成，且开机自启动已同步移除！${RESET}"
+}
+
+unmount_all() {
+    echo -e "${YELLOW}正在全面清空并移除所有网盘挂载与开机自启动...${RESET}"
+    
+    local sys_services=$(systemctl list-units --type=service --plains --all | grep "rclone-mount@" | awk '{print $1}')
+    if [ -n "$sys_services" ]; then
+        for svc in $sys_services; do
+            echo -e "${CYAN} ➜ 正在清理服务: $svc${RESET}"
+            sudo systemctl stop "$svc" 2>/dev/null
+            sudo systemctl disable "$svc" 2>/dev/null
+            sudo rm -f "/etc/systemd/system/$svc"
+        done
+        sudo systemctl daemon-reload
+    fi
+
+    rm -f /var/run/rclone_*.pid
+
+    local active_mounts=$(mount | grep -i "rclone" | awk '{print $3}')
+    if [ -n "$active_mounts" ]; then
+        echo "$active_mounts" | while read -r mnt; do
+            sudo fusermount -u "$mnt" 2>/dev/null || sudo umount -l "$mnt" 2>/dev/null
+        done
+    fi
+    echo -e "${GREEN}✅ 系统内所有 Rclone 挂载及相关自启服务已全部清洗完毕。${RESET}"
+}
+
+# ================== 资产清单综合查看面板 ==================
+show_assets_manifest() {
     echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}        ◈  Croc 点对点安全传输面板  ◈      ${RESET}"
+    echo -e "${GREEN}       📁 Rclone 已创资产名称清单      ${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    
+    # 1. 扫描已生成的自启动挂载服务
+    echo -e "${CYAN}[1] 已创建的自启动挂载服务名字信息：${RESET}"
+    local service_files=$(ls /etc/systemd/system/rclone-mount@*.service 2>/dev/null)
+    if [ -n "$service_files" ]; then
+        echo "$service_files" | while read -r file; do
+            # 提取网盘名称
+            local r_name=$(basename "$file" | sed 's/rclone-mount@//;s/\.service//')
+            # 提取挂载路径
+            local m_path=$(grep -E '^ExecStart=' "$file" | awk '{print $4}')
+            # 检查当前是否在运行
+            if systemctl is-active --quiet "rclone-mount@${r_name}"; then
+                local r_status="${GREEN}● 正在运行${RESET}"
+            else
+                local r_status="${RED}○ 已停止${RESET}"
+            fi
+            echo -e "  网盘名称: ${YELLOW}${r_name}${RESET}  |  挂载路径: ${YELLOW}${m_path}${RESET}  [${r_status}]"
+        done
+    else
+        echo -e "  ${YELLOW}(暂无通过本脚本创建的挂载服务)${RESET}"
+    fi
+
+    echo -e "---------------------------------------"
+
+    # 2. 扫描本脚本生成的 Cron 定时同步任务
+    echo -e "${CYAN}[2] 已创建的定时任务(Cron)名字信息：${RESET}"
+    local cron_tasks=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX")
+    if [ -n "$cron_tasks" ]; then
+        echo "$cron_tasks" | while read -r line; do
+            # 提取任务唯一标识名
+            local task_id=$(echo "$line" | awk -F "$CRON_PREFIX" '{print $2}')
+            # 提取运行周期表达式
+            local cron_time=$(echo "$line" | awk -F "/opt/rclone_manager" '{print $1}')
+            echo -e "  任务名字: ${YELLOW}${task_id}${RESET}  |  执行周期: ${YELLOW}${cron_time}${RESET}"
+        done
+    else
+        echo -e "  ${YELLOW}(暂无通过本脚本创建的定时同步任务)${RESET}"
+    fi
+    echo -e "${GREEN}=======================================${RESET}"
+}
+
+# ================== 状态和日志查看 ==================
+view_mount_status() {
+    read -p "请输入想要查看状态的远程网盘名称: " remote
+    [ -z "$remote" ] && return
+    local svc="rclone-mount@${remote}"
+    
+    if systemctl list-unit-files | grep -q "^${svc}"; then
+        echo -e "${CYAN}--- Systemd 状态服务信息 ---${RESET}"
+        sudo systemctl status "$svc"
+    else
+        echo -e "${RED}未找到该网盘 [${remote}] 对应的挂载守护服务，请确认名称是否正确。${RESET}"
+    fi
+}
+
+view_mount_logs() {
+    read -p "请输入想要查看实时日志的远程网盘名称: " remote
+    [ -z "$remote" ] && return
+    local log_file="$LOG_DIR/rclone_${remote}_sys.log"
+    
+    if [ -f "$log_file" ]; then
+        echo -e "${CYAN}--- 正在读取实时日志 (按 Ctrl+C 退出日志查看模式) ---${RESET}"
+        tail -n 50 -f "$log_file"
+    else
+        echo -e "${RED}未找到对应的日志文件: ${log_file}${RESET}"
+    fi
+}
+
+# ================== 高级定时任务管理面板 ==================
+show_cron_panel() {
+    TASK_COUNT=$(crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]' | wc -l)
+
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}        ◈  Cron 定时任务管理面板  ◈      ${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
     echo -e "${GREEN} 当前系统环境 : ${YELLOW}${OS}${RESET}"
-    echo -e "${GREEN} 传输组件状态 : ${CROC_STATUS}${RESET}"
-    echo -e "${GREEN} 当前接收目录 : ${YELLOW}${OUT_DIR}${RESET}"
-    echo -e "${GREEN} 加密传输协议 : ${YELLOW}PAKE (端到端全密文)${RESET}"
+    echo -e "${GREEN} 活跃任务总数 : ${YELLOW}${TASK_COUNT} 条${RESET}"
     echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  1) 快速全新安装 Croc 传输组件${RESET}"
-    echo -e "${GREEN}  2) 从当前系统深度卸载 Croc${RESET}"
+    echo -e "${GREEN} 📋 当前系统定时任务快照：${RESET}"
+    
+    if [ "$TASK_COUNT" -gt 0 ]; then
+        crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]' | awk -v cyan="$CYAN" -v reset="$RESET" '{print "   " cyan "•" reset " " $0}'
+    else
+        echo -e "   ${YELLOW}(暂无用户自定义的定时任务)${RESET}"
+    fi
+    
     echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  3) 🚀 安全发送本地文件/目录 (多选)${RESET}"
-    echo -e "${GREEN}  4) 📥 接收远端文件/目录 (凭码提取)${RESET}"
+    echo -e "${GREEN}  1) 快速添加定时任务(引导式)${RESET}"
+    echo -e "${GREEN}  2) 精准删除定时任务(按名称删除)${RESET}"
+    echo -e "${GREEN}  3) 深度手动编辑任务(打开编辑器)${RESET}"
     echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  5) 🔄 在线检查并升级组件至最新版${RESET}"
-    echo -e "${GREEN}  7) ⚙️  自定义设置文件输出/下载文件夹${RESET}"
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  0) 退出面板${RESET}"
+    echo -e "${GREEN}  0) 返回主菜单${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
+}
 
-    echo -ne "${GREEN} 请选择操作编号: ${RESET}"
-    read -r choice
+schedule_add() {
+    echo -e "${YELLOW}--- 引导式添加 Rclone 同步任务 ---${RESET}"
+    read -p "任务唯一标识名 (英文字母): " TASK_NAME
+    [ -z "$TASK_NAME" ] && return
+    read -p "本地同步目录 (多个用空格隔开): " LOCAL_DIR
+    read -p "远程存储名称: " REMOTE_NAME
+    read -p "远程目标目录 (默认 backup): " REMOTE_DIR
+    REMOTE_DIR=${REMOTE_DIR:-backup}
 
-    case $choice in
-        1) install_croc ;;
-        2) uninstall_croc ;;
-        3) send_file ;;
-        4) receive_file ;;
-        5) update_croc ;;
-        7) set_output_dir ;;
-        0) echo -e "${YELLOW}正在退出系统...${RESET}" ; exit 0 ;;
-        *) echo -e "${RED}❌ 无效选项，请输入正确的编号！${RESET}" ; read -r -p "按回车继续..." ;;
+    echo -e "${GREEN}选择执行周期:\n 1. 每天0点\n 2. 每周一0点\n 3. 每月1号0点\n 4. 自定义 Cron 表达式${RESET}"
+    read -p "请选择: " t
+    case $t in
+        1) cron_expr="0 0 * * *" ;;
+        2) cron_expr="0 0 * * 1" ;;
+        3) cron_expr="0 0 1 * *" ;;
+        4) read -p "请输入标准 5 位 Cron 表达式: " cron_expr ;;
+        *) echo -e "${RED}❌ 无效选择${RESET}"; return ;;
     esac
+
+    SCRIPT_PATH="$SCRIPT_DIR/rclone_sync_${TASK_NAME}.sh"
+    cat > "$SCRIPT_PATH" << 'EOF'
+#!/bin/bash
+CONFIG_FILE="/opt/rclone_manager/config.env"
+if [ -f "$CONFIG_FILE" ]; then source "$CONFIG_FILE"; fi
+EOF
+
+    cat >> "$SCRIPT_PATH" << EOF
+LOG_FILE="$LOG_DIR/rclone_sync_${TASK_NAME}.log"
+send_tg() {
+    if [[ "\$TG_TOKEN" != "填入你的默认BotToken" ]]; then
+        curl -s -X POST "https://api.telegram.org/bot\${TG_TOKEN}/sendMessage" \
+        -d chat_id="\${TG_CHAT_ID}" -d text="[\${VPS_NAME}] \$1" >/dev/null
+    fi
+}
+for d in $LOCAL_DIR; do
+    [ ! -d "\$d" ] && continue
+    name=\$(basename "\$d")
+    target="${REMOTE_NAME}:${REMOTE_DIR}/\$name"
+    rclone sync "\$d" "\$target" -v >> "\$LOG_FILE" 2>&1
+    if [ \$? -eq 0 ]; then
+        echo "[\$(date '+%F %T')] \$d 同步完成 ✅" >> "\$LOG_FILE"
+        send_tg "定时任务 [${TASK_NAME}] 同步成功: \$d ✅"
+    else
+        echo "[\$(date '+%F %T')] \$d 同步失败 ❌" >> "\$LOG_FILE"
+        send_tg "⚠️ 定时任务 [${TASK_NAME}] 同步失败: \$d ❌"
+    fi
+done
+EOF
+
+    chmod +x "$SCRIPT_PATH"
+    (crontab -l 2>/dev/null | grep -v "$CRON_PREFIX$TASK_NAME"; echo "$cron_expr $SCRIPT_PATH $CRON_PREFIX$TASK_NAME") | crontab -
+    echo -e "${GREEN}任务 $TASK_NAME 已成功添加并注入 Crontab！${RESET}"
+}
+
+schedule_del_one() {
+    echo -e "${YELLOW}--- 正在检索本脚本生成的任务... ---${RESET}"
+    local count=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX" | wc -l)
+    if [ "$count" -eq 0 ]; then
+        echo -e "${YELLOW}未发现通过本脚本创建的 Rclone 定时任务。${RESET}"
+        return
+    fi
+
+    crontab -l 2>/dev/null | grep "$CRON_PREFIX" | awk -F "$CRON_PREFIX" '{print "● 可删除任务名: " $2}'
+    echo "---------------------------------------"
+    read -p "请输入你想精确删除的任务名称: " TASK_NAME
+    [ -z "$TASK_NAME" ] && return
+
+    crontab -l 2>/dev/null | grep -v "$CRON_PREFIX$TASK_NAME" | crontab -
+    rm -f "$SCRIPT_DIR/rclone_sync_${TASK_NAME}.sh"
+    echo -e "${GREEN}已成功移除任务: $TASK_NAME${RESET}"
+}
+
+cron_task_menu() {
+    while true; do
+        clear
+        show_cron_panel
+        read -ne choice_cron
+        echo ""
+        case $choice_cron in
+            1) schedule_add ;;
+            2) schedule_del_one ;;
+            3) 
+                echo -e "${YELLOW}即将调用系统默认编辑器打开全局 Crontab。${RESET}"
+                read -p "按回车键开始编辑..."
+                crontab -e 
+                ;;
+            0) break ;;
+            *) echo -e "${RED}❌ 输入错误！${RESET}" ;;
+        esac
+        read -p "按回车键继续..."
+    done
+}
+
+# ================== 手动同步功能 ==================
+sync_local_to_remote_multi() {
+    read -p "请输入本地目录路径（多个用空格分隔）: " local_dirs
+    [ -z "$local_dirs" ] && return
+    read -p "请输入远程存储名称: " remote
+    [ -z "$remote" ] && return
+    read -p "请输入远程目标目录(默认 backup): " remote_dir
+    remote_dir=${remote_dir:-backup}
+
+    for d in $local_dirs; do
+        if [ ! -d "$d" ]; then
+            echo -e "${RED}目录不存在，跳过: $d${RESET}"
+            continue
+        fi
+        name=$(basename "$d")
+        target="${remote}:${remote_dir}/${name}"
+        LOG_FILE="$LOG_DIR/rclone_sync_${name}.log"
+
+        echo -e "${YELLOW}正在同步: $d → $target ...${RESET}"
+        rclone sync "$d" "$target" -v -P 2>&1 | tee -a "$LOG_FILE"
+
+        if [ ${PIPESTATUS[0]} -eq 0 ]; then
+            echo "[ $(date '+%F %T') ] 同步完成 ✅" >> "$LOG_FILE"
+            send_tg "Rclone 同步完成: $d → $target ✅"
+        else
+            echo "[ $(date '+%F %T') ] 同步失败 ❌" >> "$LOG_FILE"
+            send_tg "⚠️ Rclone 同步失败: $d → $target ❌"
+        fi
+    done
+}
+
+sync_remote_to_local() {
+    read -p "请输入远程名称: " remote
+    [ -z "$remote" ] && return
+    read -p "请输入远程备份目录 (例如 backup): " remote_dir
+    read -p "请输入本地恢复目标目录: " local_dir
+    [ -z "$local_dir" ] && return
+    
+    mkdir -p "$local_dir"
+    rclone sync "${remote}:${remote_dir}" "$local_dir" -v -P
+}
+
+# ================== 卸载全面清理 ==================
+uninstall_rclone() {
+    read -p "确定要彻底卸载 Rclone 及所有管理配置吗？(y/N): " SECURE_CONFIRM
+    [ "$SECURE_CONFIRM" != "y" ] && return
+
+    echo -e "${YELLOW}正在全面清理 Rclone 环境与组件...${RESET}"
+    unmount_all
+    sudo rm -f /usr/bin/rclone /usr/local/bin/rclone
+    sudo rm -rf ~/.config/rclone
+    sudo rm -rf "$BASE_DIR"
+
+    echo -e "${GREEN}卸载完成！所有组件、挂载点及系统残留已清理。${RESET}"
+    exit 0
+}
+
+# ================== 主循环入口 ==================
+while true; do
+    show_menu
+    read -p "$(echo -e ${GREEN}请输入选项数字: ${RESET})" choice
+    case $choice in
+        1) install_rclone ;;
+        2) update_rclone ;;
+        3) config_rclone ;;
+        4) list_remotes ;;
+        5) list_files_remote ;;
+        6) mount_remote ;;
+        7) show_assets_manifest ;;
+        8) unmount_remote_by_name ;;
+        9) unmount_all ;;
+        10) view_mount_status ;;
+        11) view_mount_logs ;;
+        12) sync_local_to_remote_multi ;;
+        13) sync_remote_to_local ;;
+        14) cron_task_menu ;;
+        15) modify_tg ;;
+        16) uninstall_rclone ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}输入错误，请输入菜单中的有效数字！${RESET}" ;;
+    esac
+    read -r -p "按回车键继续..."
 done

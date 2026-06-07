@@ -89,7 +89,7 @@ show_menu() {
     echo -e "${CYAN} 5)${RESET} 查看远程存储文件"
     echo -e "----------------------------------------"
     echo -e "${GREEN} [ 挂载管理 (自动配置开机自启) ]${RESET}"
-    echo -e "${CYAN} 6)${RESET} 挂载远程存储到本地   ${CYAN} 7)${RESET} 查看已创建的资产清单"
+    echo -e "${CYAN} 6)${RESET} 挂载网盘            ${CYAN}  7)${RESET} 查看已创建的资产清单"
     echo -e "${CYAN} 8)${RESET} 卸载指定挂载点       ${CYAN} 9)${RESET} 卸载所有挂载点"
     echo -e "${CYAN}10)${RESET} 查看挂载运行状态     ${CYAN}11)${RESET} 查看挂载实时日志"
     echo -e "----------------------------------------"
@@ -98,16 +98,42 @@ show_menu() {
     echo -e "${CYAN}14)${RESET} 定时任务管理 (Cron)"
     echo -e "----------------------------------------"
     echo -e "${GREEN} [ 全局设置与常规 ]${RESET}"
-    echo -e "${CYAN}15)${RESET} 修改 TG 通知参数     ${CYAN}16)${RESET} 彻底卸载 Rclone"
-    echo -e "${CYAN} 0)${RESET} 退出脚本"
+    echo -e "${CYAN}15)${RESET} 修改 TG 通知参数     ${CYAN}16)${RESET} 卸载 Rclone"
+    echo -e "${CYAN} 0)${RESET} 退出"
     echo -e "${GREEN}======================================${RESET}"
 }
 
 # ================== 基础操作 ==================
 install_rclone() {
-    echo -e "${YELLOW}正在安装 Rclone...${RESET}"
-    curl https://rclone.org/install.sh | sudo bash
-    echo -e "${GREEN}Rclone 安装完成！${RESET}"
+    echo -e "${YELLOW}正在检测并安装 FUSE 挂载依赖组件...${RESET}"
+    
+    # 1. 智能识别包管理器并安装 FUSE
+    if command -v apt-get &> /dev/null; then
+        sudo apt-get update -y
+        # 优先安装 fuse3，如果失败则尝试安装 fuse
+        sudo apt-get install -y fuse3 || sudo apt-get install -y fuse
+    elif command -v dnf &> /dev/null; then
+        sudo dnf install -y fuse3 || sudo dnf install -y fuse
+    elif command -v yum &> /dev/null; then
+        sudo yum install -y fuse3 || sudo yum install -y fuse
+    else
+        echo -e "${YELLOW}未检测到主流包管理器，请手动确保系统已安装 fuse / fuse3，否则挂载功能可能无法使用。${RESET}"
+    fi
+
+    # 2. 验证 FUSE 是否安装成功
+    if command -v fusermount3 &> /dev/null || command -v fusermount &> /dev/null; then
+        echo -e "${GREEN}FUSE 依赖组件安装/检查成功！${RESET}"
+    else
+        echo -e "${RED}⚠️ FUSE 依赖安装可能失败，后续网盘挂载功能（Option 6）可能会报错。${RESET}"
+    fi
+
+    # 3. 安装 Rclone 本体
+    echo -e "${YELLOW}正在安装 Rclone 本体...${RESET}"
+    if curl https://rclone.org/install.sh | sudo bash; then
+        echo -e "${GREEN}Rclone 安装完成！${RESET}"
+    else
+        echo -e "${RED}❌ Rclone 本体安装失败，请检查网络连接。${RESET}"
+    fi
 }
 
 update_rclone() {
@@ -156,26 +182,44 @@ send_tg() {
 }
 
 
-# ================== 智能挂载自启动一体化 (基于 Systemd 底层) ==================
+# ================== 智能挂载自启动一体化 ==================
 mount_remote() {
-    read -p "请输入Rclone创建的网盘名称 " remote
+
+
+    read -p "请输入Rclone创建的网盘名称: " remote
     [ -z "$remote" ] && return
-    default_path="/mnt/$remote"
-    read -p "请输入挂载路径(默认 $default_path): " input_path
+    
+    read -p "请输入网盘内的存储桶/子目录 (如 sss): " remote_dir
+    
+    # 如果用户输入了桶名，自动去掉前后的斜杠
+    remote_dir=$(echo "$remote_dir" | sed 's/^\///;s/\/$//')
+    
+    # 智能生成默认本地路径
+    if [ -z "$remote_dir" ]; then
+        default_path="/mnt/${remote}"
+        local mount_source="${remote}:"
+    else
+        # 如果有桶名，本地目录名变成 /mnt/CF_sss，更直观
+        default_path="/mnt/${remote}_${remote_dir}"
+        local mount_source="${remote}:${remote_dir}"
+    fi
+    
+    read -p "请输入VPS本地挂载路径 (默认 $default_path): " input_path
     path=${input_path:-$default_path}
     
-    # 1. 检查防冲突
+    # 1. 检查防冲突与强行清理僵尸挂载
     if mount | grep -q "on $path type"; then
-        echo -e "${YELLOW}该路径 $path 已经被挂载。正在执行热刷新升级...${RESET}"
-        sudo fusermount -u "$path" 2>/dev/null || sudo umount -l "$path" 2>/dev/null
+        echo -e "${YELLOW}该本地路径 $path 已经被挂载。正在执行热刷新升级...${RESET}"
+        sudo umount -l "$path" 2>/dev/null
     fi
 
+    # 清理可能残留的 PID（新版 Rclone 推荐靠 systemd 管理进程）
     [ -f "/var/run/rclone_${remote}.pid" ] && rm -f "/var/run/rclone_${remote}.pid"
 
-    mkdir -p "$path"
+    sudo mkdir -p "$path"
     service_file="/etc/systemd/system/rclone-mount@${remote}.service"
     
-    # 2. 直接一步到位写入 Systemd 实现守护与开机自启
+    # 2. 写入 Systemd (完美适配 R2 特性参数)
     sudo tee "$service_file" >/dev/null <<EOF
 [Unit]
 Description=Rclone Mount ${remote}
@@ -184,8 +228,17 @@ After=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/rclone mount ${remote}: $path --allow-other --vfs-cache-mode writes --dir-cache-time 1000h
-ExecStop=/bin/fusermount -u $path
+# 核心参数优化：加入了权限允许、写入缓存
+ExecStart=/usr/bin/rclone mount ${mount_source} $path \\
+    --allow-other \\
+    --vfs-cache-mode full \\
+    --vfs-cache-max-age 24h \\
+    --vfs-cache-max-size 10G \\
+    --buffer-size 64M \\
+    --dir-cache-time 1h \\
+    --drive-chunk-size 64M
+# 使用更强壮的 lazy umount 停止服务，防止卸载时卡死
+ExecStop=/usr/bin/umount -l $path
 Restart=always
 RestartSec=10
 StandardOutput=append:$LOG_DIR/rclone_${remote}_sys.log
@@ -195,45 +248,74 @@ StandardError=append:$LOG_DIR/rclone_${remote}_sys.log
 WantedBy=multi-user.target
 EOF
 
+    # 3. 启动服务
     sudo systemctl daemon-reload
     sudo systemctl enable rclone-mount@${remote}
-    sudo systemctl start rclone-mount@${remote}
+    sudo systemctl restart rclone-mount@${remote} # 用 restart 确保应用新配置
     
-    sleep 1.5
+    echo "正在等待挂载启动..."
+    sleep 3
+    
+    # 4. 验证挂载状态
     if systemctl is-active --quiet "rclone-mount@${remote}"; then
-        echo -e "${GREEN}✅ $remote 已成功挂载到 $path，且已妥善配置守护及开机自启动！${RESET}"
+        echo -e "${GREEN}✅ 已成功将网盘 [${mount_source}] 挂载到本地 [${path}]！${RESET}"
+        echo -e "${GREEN}ℹ️ 缓存刷新时间设为 1 小时，新文件会在 1 小时内自动同步。${RESET}"
+        echo -e "${GREEN}⚙️ 开机自启动守护已妥善配置。可以使用 'df -h' 查看状态。${RESET}"
     else
-        echo -e "${RED}❌ 挂载启动失败，请检查报错日志: $LOG_DIR/rclone_${remote}_sys.log${RESET}"
+        echo -e "${RED}❌ 挂载启动失败！${RESET}"
+        echo -e "${RED}请运行以下命令查看具体报错日志:${RESET}"
+        echo -e "${YELLOW}tail -n 20 $LOG_DIR/rclone_${remote}_sys.log${RESET}"
     fi
 }
 
+
 unmount_remote_by_name() {
-    read -p "请输入想要卸载的Rclone创建的网盘名称: " remote
+    read -p "请输入想要卸载的Rclone创建的网盘名称 (如 CF): " remote
     [ -z "$remote" ] && return
     
     local svc="rclone-mount@${remote}"
+    local service_file="/etc/systemd/system/${svc}.service"
+    local path=""
+
+    # 核心改进：从现有的 systemd 服务文件中提取真正的本地挂载路径
+    if [ -f "$service_file" ]; then
+        # 匹配 ExecStart 中最后一个以 / 开头的路径参数
+        path=$(grep "ExecStart=" "$service_file" | awk '{print $NF}')
+    fi
     
-    if [ -f "/etc/systemd/system/${svc}.service" ] || systemctl list-unit-files | grep -q "^${svc}"; then
+    # 如果没找到服务文件，则降级使用默认猜测路径
+    if [ -z "$path" ]; then
+        path="/mnt/${remote}"
+    fi
+    
+    # 1. 停止并移除 Systemd 自启守护服务
+    if [ -f "$service_file" ] || systemctl list-unit-files | grep -q "^${svc}"; then
         echo -e "${YELLOW}正在停止并移除 [${remote}] 的开机自启动守护服务...${RESET}"
         sudo systemctl stop "$svc" 2>/dev/null
         sudo systemctl disable "$svc" 2>/dev/null
-        sudo rm -f "/etc/systemd/system/${svc}.service"
+        sudo rm -f "$service_file"
         sudo systemctl daemon-reload
     fi
 
-    sudo fusermount -u "/mnt/$remote" 2>/dev/null || sudo umount -l "/mnt/$remote" 2>/dev/null
+    # 2. 强行解除本地挂载（优先使用通用的 umount -l，防止死锁）
+    echo -e "${YELLOW}正在解除路径 [${path}] 的网络挂载...${RESET}"
+    sudo umount -l "$path" 2>/dev/null || sudo fusermount -u "$path" 2>/dev/null
+    
+    # 3. 清理残留
     [ -f "/var/run/rclone_${remote}.pid" ] && rm -f "/var/run/rclone_${remote}.pid"
 
-    echo -e "${GREEN}✅ 远程存储 ${remote} 卸载完成，且开机自启动已同步移除！${RESET}"
+    echo -e "${GREEN}✅ 远程存储 ${remote} 卸载完成，本地目录 [${path}] 已释放，自启同步移除！${RESET}"
 }
 
 unmount_all() {
     echo -e "${YELLOW}正在全面清空并移除所有网盘挂载与开机自启动...${RESET}"
     
-    local sys_services=$(systemctl list-units --type=service --plains --all | grep "rclone-mount@" | awk '{print $1}')
+    # 核心改进：直接从配置目录扫描所有 rclone-mount@ 开头的服务文件，不管它当前是运行还是停止
+    local sys_services=$(find /etc/systemd/system/ -name "rclone-mount@*.service" -exec basename {} \;)
+    
     if [ -n "$sys_services" ]; then
         for svc in $sys_services; do
-            echo -e "${CYAN} ➜ 正在清理服务: $svc${RESET}"
+            echo -e "${CYAN} ➜ 正在彻底清理服务: $svc${RESET}"
             sudo systemctl stop "$svc" 2>/dev/null
             sudo systemctl disable "$svc" 2>/dev/null
             sudo rm -f "/etc/systemd/system/$svc"
@@ -241,17 +323,19 @@ unmount_all() {
         sudo systemctl daemon-reload
     fi
 
+    # 清理所有相关的 PID 文件
     rm -f /var/run/rclone_*.pid
 
+    # 强行拆除所有处于 rclone 类型的挂载点（通过 mount 动态抓取，绝不漏网）
     local active_mounts=$(mount | grep -i "rclone" | awk '{print $3}')
     if [ -n "$active_mounts" ]; then
         echo "$active_mounts" | while read -r mnt; do
-            sudo fusermount -u "$mnt" 2>/dev/null || sudo umount -l "$mnt" 2>/dev/null
+            echo -e "${CYAN} ➜ 正在强制卸载僵尸目录: $mnt${RESET}"
+            sudo umount -l "$mnt" 2>/dev/null || sudo fusermount -u "$mnt" 2>/dev/null
         done
     fi
     echo -e "${GREEN}✅ 系统内所有 Rclone 挂载及相关自启服务已全部清洗完毕。${RESET}"
 }
-
 # ================== 资产清单综合查看面板 ==================
 show_assets_manifest() {
     echo -e "${GREEN}=======================================${RESET}"

@@ -1,268 +1,265 @@
-!/bin/bash
+#!/bin/bash
 
-# 修正了 ANSI 颜色兼容性的最终版脚本
-RED='\033[0;31m'
+# 全局高优先环境变量配置
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# 颜色控制
 GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
+LIGHT_GREEN='\033[1;32m'
+RED='\033[0;31m'
 NC='\033[0m'
 
 CONFIG_FILE="/etc/snapshot_config.conf"
-BACKUP_SCRIPT="/usr/local/bin/system_snapshot.sh"
-ADMIN_SCRIPT="/usr/local/bin/snapshot_admin.sh"
-SERVICE_NAME="system-snapshot"
+LOG_FILE="/var/log/snapshot_info.log"
 
 if [ "$EUID" -ne 0 ]; then 
     echo -e "${RED}错误: 请使用 root 权限运行此脚本。${NC}"
     exit 1
 fi
 
-read_with_default() {
-    local prompt="$1" local default_value="$2" local var_name="$3" local input_value
-    if [ -n "$default_value" ]; then
-        read -p "$(echo -e "${prompt} [当前值/默认: ${GREEN}${default_value}${NC}]: ")" input_value
-        if [ -z "$input_value" ]; then eval "$var_name=\"\$default_value\""; else eval "$var_name=\"\$input_value\""; fi
-    else
-        read -p "$(echo -e "${prompt}: ")" input_value
-        while [ -z "$input_value" ]; do
-            echo -e "${RED}该项不能为空，请输入有效值${NC}"
-            read -p "$(echo -e "${prompt}: ")" input_value
-        done
-        eval "$var_name=\"\$input_value\""
-    fi
-}
-
-load_config() { if [ -f "$CONFIG_FILE" ]; then source "$CONFIG_FILE"; fi; }
+log_action() { echo "$(date '+%F %T') [RESTORE] $1" >> "$LOG_FILE"; }
 
 draw_header() {
     clear
-    echo -e "${BLUE}============================================================${NC}"
-    echo -e "${CYAN}          📸  Linux 系统快照备份工具 - 一体化控制台${NC}"
-    echo -e "${BLUE}============================================================${NC}"
-}
+    echo -e "${GREEN}==============================${NC}"
+    echo -e "${GREEN}     Linux 系统快照恢复工具    ${NC}"
+    echo -e "${GREEN}==============================${NC}"
 
-show_status_and_info() {
-    load_config
-    if [ ! -f "$CONFIG_FILE" ] || [ ! -f "$BACKUP_SCRIPT" ]; then
-        echo -e "${YELLOW} 当前工具状态: 系统快照工具 [ 尚未安装 ] 或者是配置不完整。${NC}"
-        echo -e "------------------------------------------------------------"
-        return 1
-    fi
-    local timer_active="未激活" local timer_color=$RED
-    if systemctl is-active "${SERVICE_NAME}.timer" &>/dev/null; then timer_active="运行中 (Active)"; timer_color=$GREEN; fi
-    local last_run="无记录" local next_run="未安排"
-    if [ "$timer_color" == "$GREEN" ]; then
-        last_run=$(systemctl list-timers "${SERVICE_NAME}.timer" 2>/dev/null | grep "${SERVICE_NAME}" | awk '{print $1" "$2}')
-        next_run=$(systemctl list-timers "${SERVICE_NAME}.timer" 2>/dev/null | grep "${SERVICE_NAME}" | awk '{print $3" "$4}')
-    fi
-    local local_usage="0 MB" local local_count=0
-    if [ -d "$BACKUP_DIR" ]; then
-        local_count=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name "system_snapshot_*.tar.gz" | wc -l)
-        local_usage=$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
-    fi
-    echo -e "${PURPLE}[ 自动化运行状态 ]${NC}"
-    echo -e " 📅 定时任务状态: ${timer_color}${timer_active}${NC}"
-    echo -e " ⏱️ 上次执行时间: ${YELLOW}${last_run:-'暂无数据'}${NC}"
-    echo -e " 🚀 下次预计执行: ${GREEN}${next_run:-'暂无数据'}${NC}"
-    echo -e " ⏰ 备份间隔天数: 每 ${BACKUP_INTERVAL_DAYS:-'5'} 天自动触发一次"
-    echo -e "------------------------------------------------------------"
-    echo -e "${PURPLE}[ 核心配置与数据信息 ]${NC}"
-    echo -e " 🖥️ 本机标识名称: ${CYAN}${REMOTE_DIR_NAME:-'未配置'}${NC}"
-    echo -e " 🌐 远程存储目标: ${CYAN}${TARGET_USER:-'N/A'}@${TARGET_IP:-'N/A'}:${SSH_PORT:-'22'}${NC}"
-    echo -e " 📂 远程基础路径: ${CYAN}${TARGET_BASE_DIR:-'未配置'}${NC}"
-    echo -e " 💾 本地备份目录: ${CYAN}${BACKUP_DIR:-'/backups'} ${NC}(共 ${GREEN}${local_count}${NC} 个快照, 占用 ${GREEN}${local_usage}${NC})"
-    echo -e " 🗄️ 轮转策略留存: 本地 ${YELLOW}${LOCAL_SNAPSHOT_KEEP:-'2'}${NC} 个 | 远程 ${YELLOW}${REMOTE_SNAPSHOT_DAYS:-'15'}${NC} 天"
-    echo -e "${BLUE}============================================================${NC}"
-    return 0
-}
-
-check_requirements() {
-    for cmd in curl ssh rsync tar hostname ssh-copy-id sshpass; do
-        if ! command -v $cmd &> /dev/null; then
-            if command -v apt-get &> /dev/null; then apt-get update && apt-get install -y $cmd &>/dev/null
-            elif command -v dnf &> /dev/null; then dnf install -y $cmd &>/dev/null
-            elif command -v yum &> /dev/null; then yum install -y $cmd &>/dev/null
-            fi
-        fi
-    done
-}
-
-auto_copy_ssh_key() {
-    local ip="$1" local user="$2" local port="$3"
-    if [ ! -f "/root/.ssh/id_rsa" ]; then
-        mkdir -p /root/.ssh && chmod 700 /root/.ssh
-        ssh-keygen -t rsa -b 4096 -N "" -f /root/.ssh/id_rsa -q
-    fi
-    echo -e "\n${YELLOW}🔑 正在进行远程服务器 SSH 免密密钥授信...${NC}"
-    ssh -p "$port" -o ConnectTimeout=3 -o PasswordAuthentication=no -o StrictHostKeyChecking=no "$user@$ip" "echo 'OK'" &>/dev/null
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}✓ 检测到当前机器与远程服务器已处于免密互信状态，跳过密钥传输。${NC}"
-        return 0
-    fi
-    echo -e "${CYAN}提示: 接下来需要输入一次远程服务器 [ $user@$ip ] 的 SSH 登录密码以完成密钥复制。${NC}"
-    read -s -p "请输入远程服务器密码: " REMOTE_PWD
-    echo ""
-    if [ -z "$REMOTE_PWD" ]; then return 1; fi
-    export SSHPASS="$REMOTE_PWD"
-    sshpass -e ssh-copy-id -p "$port" -o StrictHostKeyChecking=no "$user@$ip" &>/dev/null
-    local copy_status=$?
-    unset SSHPASS
-    return $copy_status
-}
-
-configure_project() {
-    load_config
-    check_requirements
-    local is_update=0
-    if [ -f "$CONFIG_FILE" ]; then is_update=1; echo -e "${YELLOW}💡 检测到当前已存在配置，进入【修改配置模式】。回车直接保留原当前值：${NC}\n"
-    else echo -e "${YELLOW}🚀 进入【首次安装配置向导】。请输入以下参数：${NC}\n"; fi
-
-    read_with_default "请输入 Telegram Bot Token" "$BOT_TOKEN" NEW_BOT_TOKEN
-    read_with_default "请输入 Telegram Chat ID" "$CHAT_ID" NEW_CHAT_ID
-    echo
-    read_with_default "请输入远程服务器 IP 地址" "$TARGET_IP" NEW_TARGET_IP
-    read_with_default "请输入远程服务器用户名" "$TARGET_USER" NEW_TARGET_USER
-    read_with_default "请输入 SSH 连接端口" "${SSH_PORT:-22}" NEW_SSH_PORT
-    echo
-    auto_copy_ssh_key "$NEW_TARGET_IP" "$NEW_TARGET_USER" "$NEW_SSH_PORT"
-    echo
-    read_with_default "请输入远程基础备份目录" "${TARGET_BASE_DIR:-/root/remote_backup}" NEW_TARGET_BASE_DIR
-    local current_hostname=$(hostname)
-    read_with_default "请输入本机在远程的子目录名" "${REMOTE_DIR_NAME:-$current_hostname}" NEW_REMOTE_DIR_NAME
-    echo
-    read_with_default "请输入本地快照落盘目录" "${BACKUP_DIR:-/backups}" NEW_BACKUP_DIR
-    echo
-    read_with_default "请输入本地最大保留快照数量(个)" "${LOCAL_SNAPSHOT_KEEP:-2}" NEW_LOCAL_SNAPSHOT_KEEP
-    read_with_default "请输入远程快照过期删除时间(天)" "${REMOTE_SNAPSHOT_DAYS:-15}" NEW_REMOTE_SNAPSHOT_DAYS
-    echo
-    read_with_default "请输入备份执行间隔天数(1-30天)" "${BACKUP_INTERVAL_DAYS:-5}" NEW_BACKUP_INTERVAL_DAYS
+# ==============================================================================
+# 核心解压与网络控制逻辑
+# ==============================================================================
+execute_untar_restore() {
+    local target_archive="$1"
     
-    mkdir -p "$NEW_BACKUP_DIR"
-    cat > "$CONFIG_FILE" << EOF
-#!/bin/bash
-BOT_TOKEN="$NEW_BOT_TOKEN"
-CHAT_ID="$NEW_CHAT_ID"
-TARGET_IP="$NEW_TARGET_IP"
-TARGET_USER="$NEW_TARGET_USER"
-SSH_PORT="$NEW_SSH_PORT"
-TARGET_BASE_DIR="$NEW_TARGET_BASE_DIR"
-REMOTE_DIR_NAME="$NEW_REMOTE_DIR_NAME"
-BACKUP_DIR="$NEW_BACKUP_DIR"
-LOCAL_SNAPSHOT_KEEP=$NEW_LOCAL_SNAPSHOT_KEEP
-REMOTE_SNAPSHOT_DAYS=$NEW_REMOTE_SNAPSHOT_DAYS
-BACKUP_INTERVAL_DAYS=$NEW_BACKUP_INTERVAL_DAYS
-LOG_FILE="/var/log/snapshot_info.log"
-DEBUG_LOG="/var/log/snapshot_debug.log"
-EOF
-    chmod 600 "$CONFIG_FILE"
+    echo -e "\n${RED}======================= !!! 警告 !!! =======================${NC}"
+    echo -e "${RED} 您即刻将开始执行系统快照还原。该操作会覆盖当前系统的核心文件！${NC}"
+    echo -e "${RED}============================================================${NC}"
+    
+    # 【功能升级：选择是否恢复网络配置】
+    echo -e "关于网络配置恢复，请做出选择："
+    echo -e "  [n] ${GREEN}安全守护模式 (推荐)${NC}: 暂存并保留当前正在通网的网卡/IP配置，防止重启后失联。"
+    echo -e "  [y] ${RED}完全还原模式${NC}: 强行使用快照内的旧网络配置覆盖当前机器（仅适用于原机同硬件环境回滚）。"
+    read -p "是否需要完全还原快照内的网络配置？[y/n, 默认: n]: " net_choice
+    net_choice=${net_choice:-n}
 
-    cat > "$BACKUP_SCRIPT" << 'EOF'
-#!/bin/bash
-if [ -f "/etc/snapshot_config.conf" ]; then source /etc/snapshot_config.conf; else exit 1; fi
-TIMESTAMP=$(date +"%Y%m%d%H%M%S")
-mkdir -p "$BACKUP_DIR"
-SNAPSHOT_FILE="$BACKUP_DIR/system_snapshot_${TIMESTAMP}.tar.gz"
-FULL_REMOTE_PATH="$TARGET_BASE_DIR/$REMOTE_DIR_NAME"
-setup_systemd_timer() {
-    cat > "/etc/systemd/system/system-snapshot.service" << EOFSERVICE
-[Unit]
-Description=System Snapshot Backup Service
-After=network.target
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/system_snapshot.sh
-Environment="SYSTEMD_TIMER=1"
-WorkingDirectory=/tmp
-EOFSERVICE
-    cat > "/etc/systemd/system/system-snapshot.timer" << EOFTIMER
-[Unit]
-Description=Run System Snapshot Every ${BACKUP_INTERVAL_DAYS} Days
-[Timer]
-OnCalendar=*-*-1/${BACKUP_INTERVAL_DAYS} 00:00:00
-RandomizedDelaySec=12h
-Persistent=true
-[Install]
-WantedBy=timers.target
-EOFTIMER
-    chmod 644 /etc/systemd/system/system-snapshot.*
-    systemctl daemon-reload
-    systemctl enable "system-snapshot.timer" &>/dev/null
-    systemctl restart "system-snapshot.timer" &>/dev/null
-}
-if [ -z "$SYSTEMD_TIMER" ]; then setup_systemd_timer; fi
-curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" -d chat_id="$CHAT_ID" -d text="🔄 开始创建快照 | $REMOTE_DIR_NAME" &>/dev/null
-tar -czf "$SNAPSHOT_FILE" --exclude="/dev/*" --exclude="/proc/*" --exclude="/sys/*" --exclude="/tmp/*" --exclude="/run/*" --exclude="/mnt/*" --exclude="/media/*" --exclude="/lost+found" --exclude="/var/cache/*" --exclude="/var/tmp/*" --exclude="/var/log/*" --exclude="/var/lib/apt/lists/*" --exclude="${BACKUP_DIR}/*" /boot /etc /usr /var /root /home /opt /bin /sbin /lib /lib64 > /dev/null 2>&1
-if [ $? -eq 0 ] || [ -s "$SNAPSHOT_FILE" ]; then
-    SNAPSHOT_SIZE=$(du -h "$SNAPSHOT_FILE" | cut -f1)
-    ssh -p "$SSH_PORT" -o ConnectTimeout=10 "$TARGET_USER@$TARGET_IP" "mkdir -p $FULL_REMOTE_PATH/system_snapshots" &>/dev/null
-    rsync -avz --inplace -e "ssh -p $SSH_PORT" "$SNAPSHOT_FILE" "$TARGET_USER@$TARGET_IP:$FULL_REMOTE_PATH/system_snapshots/" &>/dev/null
-    ssh -p "$SSH_PORT" "$TARGET_USER@$TARGET_IP" "find $FULL_REMOTE_PATH/system_snapshots -type f -name '*.tar.gz' -mtime +$REMOTE_SNAPSHOT_DAYS -delete" &>/dev/null
-    find "$BACKUP_DIR" -maxdepth 1 -type f -name "system_snapshot_*.tar.gz" | sort -r | tail -n +$((LOCAL_SNAPSHOT_KEEP+1)) | xargs -r rm -f
-    curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" -d chat_id="$CHAT_ID" -d text="📸 快照成功: $SNAPSHOT_SIZE | $REMOTE_DIR_NAME" &>/dev/null
-fi
-EOF
-    chmod +x "$BACKUP_SCRIPT"
-    if [ -f "/etc/systemd/system/system-snapshot.timer" ]; then bash "$BACKUP_SCRIPT"; fi
-    echo -e "\n${GREEN}✓ 配置成功，定时任务已同步刷新生效！${NC}"
-    read -p "按任意键返回主菜单..." -n 1
-}
-
-action_manual_backup() {
-    if [ ! -f "$BACKUP_SCRIPT" ]; then echo -e "${RED}错误: 请先进行配置再执行此操作。${NC}"; else
-        echo -e "\n${YELLOW}正在触发快照打包与远程传输进程，请稍候...${NC}"
-        bash "$BACKUP_SCRIPT"
-        echo -e "${GREEN}✓ 手动执行完结。${NC}"
+    read -p "请输入 'y' 确认执行最终系统恢复，输入其他任意键取消: " confirm
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then 
+        echo -e "${GREEN}操作已取消。${NC}"
+        read -p "按任意键返回..." -n 1
+        return
     fi
-    read -p "按任意键返回主菜单..." -n 1
+
+    log_action "开始执行系统恢复，网络恢复模式: $net_choice，快照源: $target_archive"
+    
+    # 如果选择安全模式，提前暂存当前网络底座
+    if [ "$net_choice" != "y" ] && [ "$net_choice" != "Y" ]; then
+        echo -e "${GREEN}正在暂存当前有效的网卡与网络底座配置...${NC}"
+        rm -rf /tmp/net_backup && mkdir -p /tmp/net_backup/sysconfig
+        [ -f "/etc/fstab" ] && cp /etc/fstab /tmp/net_backup/fstab
+        [ -f "/etc/resolv.conf" ] && cp /etc/resolv.conf /tmp/net_backup/resolv.conf
+        [ -f "/etc/network/interfaces" ] && cp /etc/network/interfaces /tmp/net_backup/interfaces
+        if [ -d "/etc/sysconfig/network-scripts" ]; then
+            cp -r /etc/sysconfig/network-scripts/* /tmp/net_backup/sysconfig/ 2>/dev/null
+        fi
+    fi
+
+    echo -e "\n${GREEN}🚀 正在全面解压并重构系统文件，请耐心等待...${NC}"
+    tar -xzf "$target_archive" -C / 2>/dev/null
+
+    # 如果选择安全模式，解压后瞬间回填
+    if [ "$net_choice" != "y" ] && [ "$net_choice" != "Y" ]; then
+        echo -e "${GREEN}正在回填暂存的网卡配置，防止网络死锁失联...${NC}"
+        [ -f "/tmp/net_backup/fstab" ] && cp /tmp/net_backup/fstab /etc/fstab
+        [ -f "/tmp/net_backup/resolv.conf" ] && cp /tmp/net_backup/resolv.conf /etc/resolv.conf
+        [ -f "/tmp/net_backup/interfaces" ] && cp /tmp/net_backup/interfaces /etc/interfaces
+        if [ "$(ls -A /tmp/net_backup/sysconfig/ 2>/dev/null)" ]; then
+            mkdir -p /etc/sysconfig/network-scripts
+            cp -r /tmp/net_backup/sysconfig/* /etc/sysconfig/network-scripts/ 2>/dev/null
+        fi
+        rm -rf /tmp/net_backup
+    fi
+
+    if [ $? -eq 0 ] || [ -s "/etc/fstab" ]; then
+        log_action "系统文件重构解压成功！"
+        echo -e "\n${GREEN}============================================================${NC}"
+        echo -e "${LIGHT_GREEN}✅ 系统快照恢复解压已圆满完成！${NC}"
+        if [ "$net_choice" == "y" ] || [ "$net_choice" == "Y" ]; then
+            echo -e "${RED} 警告：网络配置已完全被快照覆盖，如果网卡或硬件不兼容可能导致重启后失联！${NC}"
+        else
+            echo -e "${GREEN} 守护：已自动保留您当前的网卡、IP及网关配置，100%确保重启后不会失联。${NC}"
+        fi
+        echo -e "${RED} 为了使所有内核服务和系统引导完全生效，系统必须立刻重启。${NC}"
+        echo -e "${GREEN}============================================================${NC}"
+        read -p "是否现在立刻重启服务器？[y/n]: " reboot_choice
+        if [ "$reboot_choice" == "y" ] || [ "$reboot_choice" == "Y" ]; then
+            log_action "用户触发恢复后自动重启"
+            reboot
+        fi
+    else
+        log_action "错误：解压阶段出现异常中断！"
+        echo -e "${RED}❌ 恢复过程中出现异常，请查看本地日志流明细：$LOG_FILE${NC}"
+        read -p "按任意键返回..." -n 1
+    fi
 }
 
-action_view_logs() {
-    if [ -f "/var/log/snapshot_info.log" ]; then tail -n 15 /var/log/snapshot_info.log
-    else echo -e "${YELLOW}暂无备份任务的日志流产生。${NC}"; fi
-    read -p "按任意键返回主菜单..." -n 1
+# ==============================================================================
+# 模式一：本地快照还原（支持自定义目录）
+# ==============================================================================
+restore_from_local() {
+    draw_header
+    echo -e "${GREEN}[ 模式：从本地快照目录还原 ]${NC}"
+    
+    # 读取备份工具默认路径作为备选默认值
+    local default_dir="/backups"
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+        default_dir="${BACKUP_DIR:-/backups}"
+    fi
+
+    read -p "$(echo -e "请输入本地快照绝对路径 [默认/当前: ${GREEN}${default_dir}${NC}]: ")" scan_dir
+    scan_dir=${scan_dir:-$default_dir}
+
+    if [ ! -d "$scan_dir" ]; then
+        echo -e "${RED}错误: 指定的本地目录 [ $scan_dir ] 不存在！${NC}"
+        read -p "按任意键返回..." -n 1
+        return
+    fi
+
+    local files=($(find "$scan_dir" -maxdepth 1 -type f -name "system_snapshot_*.tar.gz" | sort -r))
+    local count=${#files[@]}
+
+    if [ $count -eq 0 ]; then
+        echo -e "${RED}未在指定目录中检索到任何 system_snapshot_*.tar.gz 快照文件。${NC}"
+        read -p "按任意键返回..." -n 1
+        return
+    fi
+
+    echo -e "\n检索到以下可用本地历史快照，请选择编号："
+    for ((i=0; i<count; i++)); do
+        local file_size=$(du -h "${files[i]}" | awk '{print $1}')
+        echo -e "  [ $((i+1)) ] 📦 $(basename "${files[i]}") (大小: $file_size)"
+    done
+    echo -e "  [ 0 ] 返回上级主菜单"
+    echo -e "------------------------------------------------------------"
+    
+    read -p "请选择需要恢复的快照编号: " num
+    if [[ "$num" -eq 0 ]] 2>/dev/null || [ -z "$num" ]; then return; fi
+    
+    if [[ "$num" -gt 0 && "$num" -le "$count" ]] 2>/dev/null; then
+        execute_untar_restore "${files[$((num-1))]}"
+    else
+        echo -e "${RED}无效的选择！${NC}"
+        sleep 1
+    fi
 }
 
-uninstall_project() {
-    systemctl stop system-snapshot.timer 2>/dev/null
-    systemctl disable system-snapshot.timer 2>/dev/null
-    rm -f /etc/systemd/system/system-snapshot.*
-    systemctl daemon-reload
-    rm -f "$CONFIG_FILE" "$BACKUP_SCRIPT" /usr/bin/bf
-    echo -e "${GREEN}✓ 工具已成功彻底卸载。${NC}"
-    exit 0
+# ==============================================================================
+# 模式二：远程服务器拉取还原（全动态自定义输入）
+# ==============================================================================
+restore_from_remote() {
+    draw_header
+    echo -e "${GREEN}[ 模式：从远程备份服务器拉取并还原 ]${NC}"
+    
+    # 尝试加载当前已有的默认值，方便回车跳过
+    local d_ip="" local d_user="root" local d_port="22" local d_dir=""
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+        d_ip="$TARGET_IP" && d_user="$TARGET_USER" && d_port="$SSH_PORT"
+        d_dir="$TARGET_BASE_DIR/$REMOTE_DIR_NAME/system_snapshots"
+    fi
+
+    # 【功能升级：接收用户完全动态的自定义输入】
+    if [ -n "$d_ip" ]; then
+        read -p "$(echo -e "请输入远程服务器IP [当前值: ${GREEN}${d_ip}${NC}]: ")" REMOTE_IP
+        REMOTE_IP=${REMOTE_IP:-$d_ip}
+    else
+        read -p "请输入远程服务器IP: " REMOTE_IP
+        while [ -z "$REMOTE_IP" ]; do read -p "IP不能为空，请重新输入: " REMOTE_IP; done
+    fi
+
+    read -p "$(echo -e "请输入远程服务器用户名 [当前值: ${GREEN}${d_user}${NC}]: ")" REMOTE_USER
+    REMOTE_USER=${REMOTE_USER:-$d_user}
+
+    read -p "$(echo -e "请输入SSH端口 [当前值: ${GREEN}${d_port}${NC}]: ")" SSH_PORT
+    SSH_PORT=${SSH_PORT:-$d_port}
+
+    if [ -n "$d_dir" ]; then
+        read -p "$(echo -e "请输入远程备份绝对目录\n[默认当前: ${GREEN}${d_dir}${NC}]:\n")" REMOTE_BACKUP_DIR
+        REMOTE_BACKUP_DIR=${REMOTE_BACKUP_DIR:-$d_dir}
+    else
+        read -p "请输入远程备份绝对目录(例如 /root/remote_backup/localhost/system_snapshots): " REMOTE_BACKUP_DIR
+        while [ -z "$REMOTE_BACKUP_DIR" ]; do read -p "路径不能为空，请重新输入: " REMOTE_BACKUP_DIR; done
+    fi
+
+    echo -e "\n------------------------------------------------------------"
+    echo -e "远程存储目标: ${GREEN}$REMOTE_USER@$REMOTE_IP:$SSH_PORT${NC}"
+    echo -e "远程快照路径: ${GREEN}$REMOTE_BACKUP_DIR${NC}"
+    echo -e "------------------------------------------------------------"
+    echo -e "${GREEN}正在建立安全连接，读取远端服务器快照列表中... (如果未配置免密，此处需要输入密码)${NC}"
+    
+    # 获取动态指定的远程快照清单
+    local remote_list=$(ssh -p "$SSH_PORT" -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_IP" "find \"$REMOTE_BACKUP_DIR\" -maxdepth 1 -type f -name 'system_snapshot_*.tar.gz' 2>/dev/null | sort -r" 2>/dev/null)
+    
+    if [ -z "$remote_list" ]; then
+        echo -e "${RED}❌ 无法读取远程备份列表。请检查您输入的IP、端口、路径是否正确，或者密码是否有误。${NC}"
+        read -p "按任意键返回..." -n 1
+        return
+    fi
+
+    local files=($remote_list)
+    local count=${#files[@]}
+
+    echo -e "\n成功检索到远端历史快照，请选择需要拉回本机的编号："
+    for ((i=0; i<count; i++)); do
+        echo -e "  [ $((i+1)) ] ☁️  $(basename "${files[i]}")"
+    done
+    echo -e "  [ 0 ] 返回上级主菜单"
+    echo -e "------------------------------------------------------------"
+
+    read -p "请选择需要提取的远程快照编号: " num
+    if [[ "$num" -eq 0 ]] 2>/dev/null || [ -z "$num" ]; then return; fi
+
+    if [[ "$num" -gt 0 && "$num" -le "$count" ]] 2>/dev/null; then
+        local remote_target_path="${files[$((num-1))]}"
+        local filename=$(basename "$remote_target_path")
+        
+        # 本地落盘暂存目录采用动态载入或固定 /backups
+        local local_save_dir="${BACKUP_DIR:-/backups}"
+        local local_tmp_target="$local_save_dir/$filename"
+        mkdir -p "$local_save_dir"
+
+        echo -e "\n${GREEN}正在从远端服务器拉取快照到本地 [ $local_tmp_target ]（实时同步进度）：${NC}"
+        rsync -avz --progress -e "ssh -p $SSH_PORT -o StrictHostKeyChecking=no" "$REMOTE_USER@$REMOTE_IP:$remote_target_path" "$local_tmp_target"
+        
+        if [ $? -eq 0 ] && [ -s "$local_tmp_target" ]; then
+            echo -e "${GREEN}✓ 远程快照下载成功。${NC}"
+            execute_untar_restore "$local_tmp_target"
+        else
+            echo -e "${RED}❌ 远程文件同步中断，拉取失败。${NC}"
+            read -p "按任意键返回..." -n 1
+        fi
+    else
+        echo -e "${RED}无效的选择！${NC}"
+        sleep 1
+    fi
 }
 
-ensure_admin_symlink() {
-    if [ ! -L "/usr/bin/bf" ]; then ln -sf "$ADMIN_SCRIPT" /usr/bin/bf 2>/dev/null; fi
-}
-
+# ==============================================================================
+# 控制台主循环菜单
+# ==============================================================================
 menu_loop() {
-    ensure_admin_symlink
     while true; do
         draw_header
-        show_status_and_info
-        local is_installed=$?
-        if [ $is_installed -eq 1 ]; then
-            echo -e "  [1] 📥 ${GREEN}首次安装并配置系统快照工具${NC}"
-            echo -e "  [5] ❌ 退出管理控制台"
-            read -p " 请选择操作编号 [1/5]: " choice
-        else
-            echo -e "  [1] ⚙️  ${YELLOW}修改核心参数配置 (回车不变)${NC}"
-            echo -e "  [2] 🚀 立即手动触发执行一次系统快照${NC}"
-            echo -e "  [3] 📝 查看系统备份日志流明细${NC}"
-            echo -e "  [4] 🗑️  ${RED}从本机彻底卸载该备份工具${NC}"
-            echo -e "  [5] ❌ 退出管理控制台"
-            read -p " 请选择操作编号 [1-5]: " choice
-        fi
+        echo -e "${GREEN}  [1] 本地备份还原${NC}"
+        echo -e "${GREEN}  [2] 远程备份还原${NC}"
+        echo -e "${GREEN}  [0] 退出${NC}"
+        echo -e "${GREEN}==============================${NC}"
+        read -r -p $'\033[1;36m 请选择还原方式: \033[0m' choice
         case $choice in
-            1) configure_project ;;
-            2) if [ $is_installed -eq 0 ]; then action_manual_backup; fi ;;
-            3) if [ $is_installed -eq 0 ]; then action_view_logs; fi ;;
-            4) if [ $is_installed -eq 0 ]; then uninstall_project; fi ;;
-            5) exit 0 ;;
-            *) sleep 1 ;;
+            1) restore_from_local ;;
+            2) restore_from_remote ;;
+            0) exit 0 ;;
+            *) sleep 0.5 ;;
         esac
     done
 }

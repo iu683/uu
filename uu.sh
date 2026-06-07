@@ -29,7 +29,7 @@ fi
 if [[ "$0" == *"/dev/fd/"* ]] || [ ! -f "$0" ] || [ "$0" != "$ADMIN_SCRIPT" ]; then
     echo -e "${YELLOW}📥 检测到远程首次运行，正在为您无感固化并安装到本地路径...${NC}"
     # 从您的专属 GitHub 管道强行下载最新版覆盖本地
-    curl -sL https://raw.githubusercontent.com/iu683/uu/main/aa.sh > "$ADMIN_SCRIPT"
+    curl -sL https://raw.githubusercontent.com/iu683/uu/main/uu.sh > "$ADMIN_SCRIPT"
     if [ $? -eq 0 ] && [ -s "$ADMIN_SCRIPT" ]; then
         chmod +x "$ADMIN_SCRIPT"
         hash -r

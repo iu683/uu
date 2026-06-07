@@ -42,19 +42,23 @@ get_status_info() {
     fi
 }
 
+
+
 # 从日志中自动提取临时密码
-
 get_qb_password() {
-    local log_pass
-    # 关键词改为匹配 "password" 和 "session:" 或 "is:"，并精准提取最后一串字符
-    log_pass=$(sudo journalctl -u "$SERVICE_NAME" --no-pager | grep -E "password.*session:|temporary password is:" | tail -n 1 | awk -F ': ' '{print $2}' | tr -d ' ')
+    local log_line log_pass
+    # 1. 抓取包含密码的核心日志行
+    log_line=$(sudo journalctl -u "$SERVICE_NAME" --no-pager | grep -E "temporary password is:|password.*session:" | tail -n 1)
     
-    # 如果上面那种格式没切出来，尝试直接拿整行的最后一个单词
-    if [[ -z "$log_pass" ]]; then
-        log_pass=$(sudo journalctl -u "$SERVICE_NAME" --no-pager | grep -E "password.*session:|temporary password is:" | tail -n 1 | awk '{print $NF}')
+    if [[ -n "$log_line" ]]; then
+        # 2. 精准提取这行的最后一个单词（即密码本身）
+        log_pass=$(echo "$log_line" | awk '{print $NF}')
+        
+        # 3. 过滤掉末尾可能存在的标点符号（如句号）
+        log_pass=$(echo "$log_pass" | tr -d '.')
     fi
-
-    if [[ -n "$log_pass" && "$log_pass" != "preferences." ]]; then
+    
+    if [[ -n "$log_pass" ]]; then
         echo -e "${GREEN}${log_pass}${RESET}"
     else
         echo -e "${RED}未找到临时密码（可能已在WebUI中修改或日志已清空）${RESET}"
@@ -136,7 +140,7 @@ update_qbittorrent() {
     echo -e "${YELLOW}正在检查并更新 qBittorrent-Nox...${RESET}"
     sudo apt update && sudo apt --only-upgrade install -y qbittorrent-nox
     sudo systemctl restart qbittorrent
-    echo -e "${GREEN}更新尝试完成${RESET}"
+    echo -e "${GREEN}更新完成${RESET}"
 }
 
 # 3. 卸载服务
@@ -145,13 +149,7 @@ uninstall_qbittorrent() {
     sudo systemctl disable ${SERVICE_NAME} 2>/dev/null
     sudo rm -f "$SERVICE_FILE"
     sudo systemctl daemon-reload
-    
-    echo -e "${YELLOW}是否删除配置和下载数据？[y/N]${RESET}"
-    read -r del
-    if [[ "$del" == "y" || "$del" == "Y" ]]; then
-        rm -rf "$APP_DIR"
-        echo -e "${RED}配置和下载目录已删除${RESET}"
-    fi
+    rm -rf "$APP_DIR"
     echo -e "${GREEN}qBittorrent 已卸载${RESET}"
 }
 
@@ -226,7 +224,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     qBittorrent-Nox 管理面板     ${RESET}"
+    echo -e "${GREEN}    qBittorrent-Nox 管理面板    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
@@ -260,9 +258,9 @@ menu() {
     esac
 }
 
-# 循环菜单
+
 while true; do
     menu
-    echo -e "${YELLOW}按回车键继续...${RESET}"
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
     read -r
 done

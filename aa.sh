@@ -252,13 +252,13 @@ menu_loop() {
         draw_header
         echo -e "${GREEN}  [1] 本地备份还原${NC}"
         echo -e "${GREEN}  [2] 远程备份还原${NC}"
-        echo -e "${GREEN}  [3] 退出${NC}"
+        echo -e "${GREEN}  [0] 退出${NC}"
         echo -e "${GREEN}==============================${NC}"
         read -p $'\033[32m请选择操作编号: \033[0m' choice
         case $choice in
             1) restore_from_local ;;
             2) restore_from_remote ;;
-            3) exit 0 ;;
+            0) exit 0 ;;
             *) sleep 0.5 ;;
         esac
     done

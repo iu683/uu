@@ -1,518 +1,481 @@
 #!/bin/bash
 
-# 全局高优先环境变量配置
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+#################################
+# 颜色
+#################################
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+RESET="\033[0m"
 
-# 颜色控制 - 统一调整为绿色系列
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-LIGHT_GREEN='\033[1;32m'
-NC='\033[0m'
+#################################
+# 首次运行安装（下载到 /opt）
+#################################
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/oo.sh"
+SCRIPT_PATH="/opt/vpsbackup/vpsbackup.sh"
 
-CONFIG_FILE="/etc/snapshot_config.conf"
-SERVICE_NAME="system-snapshot"
-LOG_FILE="/var/log/snapshot_info.log"
-
-# 完全固定本地路径与脚本名称
-ADMIN_SCRIPT="/usr/bin/snapshot.sh"
-
-if [ "$EUID" -ne 0 ]; then 
-    echo -e "${GREEN}错误: 请使用 root 权限运行此脚本。${NC}"
-    exit 1
-fi
-
-# ==============================================================================
-# 绝对首次运行下载逻辑：只要本地有文件，瞬间截断并直接本地运行，绝不重复下载
-# ==============================================================================
-if [ -f "$ADMIN_SCRIPT" ]; then
-    if [ "$(readlink -f "$0" 2>/dev/null)" != "$ADMIN_SCRIPT" ]; then
-        exec "$ADMIN_SCRIPT" "$@"
-    fi
-else
-    curl -sL https://raw.githubusercontent.com/iu683/uu/main/oo.sh > "$ADMIN_SCRIPT"
-    if [ $? -eq 0 ] && [ -s "$ADMIN_SCRIPT" ]; then
-        chmod +x "$ADMIN_SCRIPT"
-        hash -r
-        exec "$ADMIN_SCRIPT" "$@"
-    else
-        echo -e "${GREEN}警告: 自动下载失败，请检查网络是否能正常访问 GitHub。...${NC}"
-    fi
-fi
-
-# TG 消息 Markdown 专用转义函数
-escape_markdown() {
-    echo -ne "$1" | sed 's/\([\._\*\[\]()~`#>+\-=|{}!]\)/\\\1/g'
-}
-
-# 发送美化版 Telegram 通知的核心公共函数
-send_tg_notification() {
-    local token="$1" local chat="$2" local md_text="$3"
-    if [ -n "$token" ] && [ -n "$chat" ]; then
-        curl -s -X POST "https://api.telegram.org/bot$token/sendMessage" \
-            -d chat_id="$chat" \
-            -d text="$md_text" \
-            -d parse_mode="MarkdownV2" &>/dev/null
-    fi
-}
-
-# ==============================================================================
-# 模块一：后端静默备份与远程传输逻辑
-# ==============================================================================
-run_backend_backup() {
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo "错误: 配置文件不存在，请先运行脚本进行安装与配置。"
+if [ ! -f "$SCRIPT_PATH" ]; then
+    mkdir -p /opt/vpsbackup
+    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL" || {
+        echo -e "${RED}❌ 下载失败${RESET}"
         exit 1
-    fi
-    source "$CONFIG_FILE"
-    
-    # 建立前端运行与后台静默的展示区分
-    local is_interactive=0
-    if [ "$2" == "--interactive" ]; then is_interactive=1; fi
-
-    TIMESTAMP=$(date +"%Y%m%d%H%M%S")
-    mkdir -p "$BACKUP_DIR"
-    SNAPSHOT_FILE="$BACKUP_DIR/system_snapshot_${TIMESTAMP}.tar.gz"
-    FULL_REMOTE_PATH="$TARGET_BASE_DIR/$REMOTE_DIR_NAME"
-
-    touch "$LOG_FILE"
-    log_info() { echo "$(date '+%F %T') [INFO] $1" >> "$LOG_FILE"; }
-    log_error() { echo "$(date '+%F %T') [ERROR] $1" >> "$LOG_FILE"; }
-
-    log_info "========== 开始执行系统快照备份任务 =========="
-    
-    # 转义通知
-    local t_name=$(escape_markdown "${REMOTE_DIR_NAME:-未配置}")
-    local t_path=$(escape_markdown "${FULL_REMOTE_PATH:-未配置}")
-    local t_time=$(escape_markdown "$(date '+%Y-%m-%d %H:%M:%S')")
-    
-    local start_msg="🚀 *系统快照备份任务启动*
-
-🖥️ *本机名称*: \`$t_name\`  
-🌐 *远程路径*: \`$t_path\`
-⏱️ *开始时间*: \`$t_time\`"
-    send_tg_notification "$BOT_TOKEN" "$CHAT_ID" "$start_msg"
-
-    if [ $is_interactive -eq 1 ]; then
-        echo -e "${GREEN}正在打包本地核心系统文件，请稍候...${NC}"
-    fi
-
-    # 系统核心打包 (屏蔽无关动态目录及快照自身)
-    tar -czf "$SNAPSHOT_FILE" \
-      --exclude="/dev/*" --exclude="/proc/*" --exclude="/sys/*" --exclude="/tmp/*" --exclude="/run/*" \
-      --exclude="/mnt/*" --exclude="/media/*" --exclude="/lost+found" --exclude="/var/cache/*" \
-      --exclude="/var/tmp/*" --exclude="/var/log/*" --exclude="/var/lib/apt/lists/*" \
-      --exclude="${BACKUP_DIR}/*" \
-      /boot /etc /usr /var /root /home /opt /bin /sbin /lib /lib64 > /dev/null 2>&1
-
-    if [ $? -eq 0 ] || [ -s "$SNAPSHOT_FILE" ]; then
-        SNAPSHOT_SIZE=$(du -h "$SNAPSHOT_FILE" | cut -f1)
-        log_info "本地快照创建成功，大小: $SNAPSHOT_SIZE"
-        
-        log_info "正在通过 SSH 自动创建远程多级备份目录结构..."
-        ssh -p "$SSH_PORT" -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$TARGET_USER@$TARGET_IP" "mkdir -p \"$FULL_REMOTE_PATH/system_snapshots\"" &>/dev/null
-        
-        log_info "正在通过 rsync 安全传输快照至远程服务器..."
-        
-        if [ $is_interactive -eq 1 ]; then
-            echo -e "${GREEN}正在同步快照至远程服务器（展示实时进度）：${NC}"
-            # 交互式运行时展示原生进度条
-            rsync -avz --progress --inplace --rsync-path="mkdir -p $FULL_REMOTE_PATH/system_snapshots && rsync" -e "ssh -p $SSH_PORT -o StrictHostKeyChecking=no" "$SNAPSHOT_FILE" "$TARGET_USER@$TARGET_IP:$FULL_REMOTE_PATH/system_snapshots/"
-            local sync_res=$?
-        else
-            # 定时任务静默运行
-            rsync -avz --inplace --rsync-path="mkdir -p $FULL_REMOTE_PATH/system_snapshots && rsync" -e "ssh -p $SSH_PORT -o StrictHostKeyChecking=no" "$SNAPSHOT_FILE" "$TARGET_USER@$TARGET_IP:$FULL_REMOTE_PATH/system_snapshots/" &>/dev/null
-            local sync_res=$?
-        fi
-        
-        if [ $sync_res -eq 0 ]; then
-            log_info "远程同步成功！文件已安全留存远端。"
-            ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no "$TARGET_USER@$TARGET_IP" "find \"$FULL_REMOTE_PATH/system_snapshots\" -type f -name '*.tar.gz' -mtime +$REMOTE_SNAPSHOT_DAYS -delete" &>/dev/null
-            
-            # 定时清理本地过期快照
-            find "$BACKUP_DIR" -maxdepth 1 -type f -name "system_snapshot_*.tar.gz" | sort -r | tail -n +$((LOCAL_SNAPSHOT_KEEP+1)) | xargs -r rm -f
-            log_info "过期快照轮转清理完毕。"
-
-            local local_count=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name "system_snapshot_*.tar.gz" | wc -l)
-            
-            # 组装成功的美化 TG 消息
-            local e_size=$(escape_markdown "$SNAPSHOT_SIZE")
-            local e_count=$(escape_markdown "$local_count")
-            local e_days=$(escape_markdown "$REMOTE_SNAPSHOT_DAYS")
-            local e_ldir=$(escape_markdown "$BACKUP_DIR")
-            local e_endtime=$(escape_markdown "$(date '+%Y-%m-%d %H:%M:%S')")
-
-            local success_msg="✅ *系统快照备份任务已圆满完成*
-
-🖥️ *本机名称*: \`$t_name\`
-💾 *快照大小*: \`$e_size\`
-⏱️ *完成时间*: \`$e_endtime\`
-📂 *本地快照*: \`$e_count个\`
-☁️ *远程保留*: \`$e_days天\`
-💾 *本地路径*: \`$e_ldir\`
-📁 *远程路径*: \`$t_path\`"
-            send_tg_notification "$BOT_TOKEN" "$CHAT_ID" "$success_msg"
-            log_info "========== 快照备份任务顺利结束 =========="
-        else
-            log_error "远程传输失败！原因：无法连接或没有免密授权"
-            local fail_msg="❌ *系统快照远程传输失败*
-
-🖥️ *本机名称*: \`$t_name\`
-⏱️ *发生时间*: \`$t_time\`
-⚠️ *错误原因*: 远程同步网络中断或 SSH 密钥授信失效，快照仅暂存于本地落盘目录。"
-            send_tg_notification "$BOT_TOKEN" "$CHAT_ID" "$fail_msg"
-        fi
-    else
-        log_error "快照打包失败！"
-    fi
-    if [ $is_interactive -eq 0 ]; then exit 0; fi
-}
-
-# 检测由 systemd 定时器直接触发的后端运行
-if [ "$1" == "--backend-run" ]; then
-    run_backend_backup "$@"
+    }
+    chmod +x "$SCRIPT_PATH"
+    exec bash "$SCRIPT_PATH" "$@"
 fi
 
-# ==============================================================================
-# 模块二：前端交互式菜单与控制台逻辑
-# ==============================================================================
-read_with_default() {
-    local prompt="$1" local default_value="$2" local var_name="$3" local input_value
-    if [ -n "$default_value" ]; then
-        read -p "$(echo -e "${prompt} [当前值/默认: ${GREEN}${default_value}${NC}]: ")" input_value
-        if [ -z "$input_value" ]; then eval "$var_name=\"\$default_value\""; else eval "$var_name=\"\$input_value\""; fi
+#################################
+# 安装目录 & 基础路径初始化
+#################################
+BASE_DIR="/opt/vpsbackup"
+INSTALL_PATH="$BASE_DIR/vpsbackup.sh"
+TG_CONF="$BASE_DIR/.tg.conf"
+CONF_FILE="$BASE_DIR/.backup.conf"
+
+#################################
+# 默认配置
+#################################
+COMPRESS="tar"
+KEEP_DAYS=7
+SERVER_NAME=$(hostname)
+BACKUP_LIST="/opt"
+BACKUP_DIR="$BASE_DIR/backups" # 默认本地备份存放目录
+
+#################################
+# 读取/保存配置
+#################################
+load_conf(){
+    [ -f "$CONF_FILE" ] && source "$CONF_FILE"
+    [ -f "$TG_CONF" ] && source "$TG_CONF"
+    mkdir -p "$BACKUP_DIR"
+    IFS=' ' read -r -a BACKUP_ARRAY <<< "${BACKUP_LIST:-/opt}"
+}
+
+save_conf(){
+cat > "$CONF_FILE" <<EOF
+COMPRESS="$COMPRESS"
+KEEP_DAYS=$KEEP_DAYS
+SERVER_NAME="$SERVER_NAME"
+BACKUP_LIST="$BACKUP_LIST"
+BACKUP_DIR="$BACKUP_DIR"
+EOF
+}
+
+#################################
+# Telegram通知
+#################################
+tg_send(){
+    [ -z "$BOT_TOKEN" ] && return
+
+    curl -s -X POST \
+    "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+    -d chat_id="$CHAT_ID" \
+    -d text="$1" >/dev/null 2>&1
+}
+
+#################################
+# 日志
+#################################
+log(){
+    echo "$(date '+%F %T') $1" >> "$BASE_DIR/backup.log"
+}
+
+#################################
+# 清理旧备份
+#################################
+clean_old(){
+    if [ "$COMPRESS" = "tar" ]; then
+        find "$BACKUP_DIR" -name "*.tar.gz" -mtime +$KEEP_DAYS -delete 2>/dev/null
     else
-        read -p "$(echo -e "${prompt}: ")" input_value
-        if [ -z "$input_value" ] && [ "$var_name" == "NEW_TARGET_USER" ]; then
-            eval "$var_name=\"root\""
+        find "$BACKUP_DIR" -name "*.zip" -mtime +$KEEP_DAYS -delete 2>/dev/null
+    fi
+}
+
+#################################
+# 备份核心（支持批量目录）
+#################################
+backup_dirs(){
+    load_conf
+    TS=$(date +%Y%m%d%H%M%S)
+
+    dirs=("$@")
+    [ ${#dirs[@]} -eq 0 ] && dirs=("${BACKUP_ARRAY[@]}")
+
+    echo -e "${YELLOW}➔ 开始执行备份任务...${RESET}"
+    for p in "${dirs[@]}"; do
+        [ ! -d "$p" ] && { echo -e "${RED}❌ 目录不存在: $p${RESET}"; continue; }
+        name=$(basename "$p")
+        rel="${p#/}"
+
+        if [ "$COMPRESS" = "tar" ]; then
+            file="${name}_${TS}.tar.gz"
+            tar -czf "$BACKUP_DIR/$file" -C / "$rel"
         else
-            while [ -z "$input_value" ]; do
-                echo -e "${GREEN}该项不能为空，请输入有效值${NC}"
-                read -p "$(echo -e "${prompt}: ")" input_value
-            done
-            eval "$var_name=\"\$input_value\""
-        fi
-    fi
-}
-
-load_config() { if [ -f "$CONFIG_FILE" ]; then source "$CONFIG_FILE"; fi; }
-
-draw_header() {
-    clear
-    echo -e "${GREEN}=================================${NC}"
-    echo -e "${GREEN}     Linux 系统快照备份工具       ${NC}"
-    echo -e "${GREEN}=================================${NC}"
-}
-
-# 时间纯汉化解析提取器
-parse_systemd_time() {
-    local raw_time="$1"
-    if [ -z "$raw_time" ] || [[ "$raw_time" == "n/a" ]] || [[ "$raw_time" == "N/A" ]]; then
-        echo "暂无记录"
-        return
-    fi
-    # 提取 YYYY-MM-DD HH:MM:SS 核心数据
-    local formatted=$(echo "$raw_time" | awk '{
-        for(i=1;i<=NF;i++) {
-            if($i ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/) {
-                print $i " " $(i+1)
-                exit
-            }
-        }
-    }')
-    if [ -n "$formatted" ]; then
-        echo "$formatted"
-    else
-        echo "$raw_time"
-    fi
-}
-
-show_status_and_info() {
-    load_config
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${GREEN}当前工具状态: [未安装]${NC}"
-        echo -e "${GREEN}=================================${NC}"
-        return 1
-    fi
-    
-    local timer_active="未激活"
-    if systemctl is-active "${SERVICE_NAME}.timer" &>/dev/null; then timer_active="运行中 (Active)"; fi
-    
-    local last_run="无记录" local next_run="未安排"
-    if [ "$timer_active" == "运行中" ]; then
-        # 1. 直接获取下一次执行的绝对时间
-        local raw_next=$(systemctl show "${SERVICE_NAME}.timer" --property=NextElapsUSecRealtime --value 2>/dev/null)
-        if [ -n "$raw_next" ] && [ "$raw_next" != "0" ]; then
-            next_run=$(date -d "@$((${raw_next} / 1000000))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+            file="${name}_${TS}.zip"
+            (cd / && zip -rq "$BACKUP_DIR/$file" "$rel")
         fi
 
-        # 2. 直接获取上一次触发的绝对时间
-        local raw_last=$(systemctl show "${SERVICE_NAME}.timer" --property=LastTriggerUSecRealtime --value 2>/dev/null)
-        if [ -n "$raw_last" ] && [ "$raw_last" != "0" ]; then
-            last_run=$(date -d "@$((${raw_last} / 1000000))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
-        fi
-    fi
-    
-    local local_usage="0 MB" local local_count=0
-    if [ -d "$BACKUP_DIR" ]; then
-        local_count=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name "system_snapshot_*.tar.gz" | wc -l)
-        local_usage=$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
-    fi
-    echo -e "${YELLOW}[ 自动化运行状态 ]${NC}"
-    echo -e "${GREEN} 定时任务状态:${NC} ${YELLOW}${timer_active}${NC}"
-    echo -e "${GREEN} 上次执行时间:${NC} ${YELLOW}${last_run}${NC}"
-    echo -e "${GREEN} 下次预计执行:${NC} ${YELLOW}${next_run}${NC}"
-    echo -e "${GREEN} 备份间隔天数:${NC} 每 ${BACKUP_INTERVAL_DAYS:-'5'} 天自动触发一次"
-    echo -e "${GREEN}=================================${NC}"
-    echo -e "${YELLOW}[ 核心配置与数据信息 ]${NC}"
-    echo -e "${GREEN} 本机标识名称:${NC} ${YELLOW}${REMOTE_DIR_NAME:-'未配置'}${NC}"
-    echo -e "${GREEN} 远程存储目标:${NC} ${YELLOW}${TARGET_USER:-'N/A'}@${TARGET_IP:-'N/A'}:${SSH_PORT:-'22'}${NC}"
-    echo -e "${GREEN} 远程基础路径:${NC} ${YELLOW}${TARGET_BASE_DIR:-'未配置'}${NC}"
-    echo -e "${GREEN} 本地备份目录:${NC} ${YELLOW}${BACKUP_DIR:-'/backups'} ${NC}(共 ${GREEN}${local_count}${NC} 个快照, 占用 ${YELLOW}${local_usage}${NC})"
-    echo -e "${GREEN} 轮转策略留存:${NC} 本地 ${YELLOW}${LOCAL_SNAPSHOT_KEEP:-'2'}${NC} 个 | 远程 ${YELLOW}${REMOTE_SNAPSHOT_DAYS:-'15'}${NC} 天"
-    echo -e "${GREEN}=================================${NC}"
-    return 0
-}
-
-check_requirements() {
-    for cmd in curl ssh rsync tar hostname; do
-        if ! command -v $cmd &> /dev/null; then
-            if command -v apt-get &> /dev/null; then apt-get update && apt-get install -y $cmd &>/dev/null
-            elif command -v dnf &> /dev/null; then dnf install -y $cmd &>/dev/null
-            elif command -v yum &> /dev/null; then yum install -y $cmd &>/dev/null
-            fi
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}🟢 备份成功: $file${RESET}"
+            log "备份成功: $file"
+            tg_send "🟢 备份成功
+服务器: $SERVER_NAME
+目录: $p
+文件: $file"
+        else
+            echo -e "${RED}🔴 备份失败: $p${RESET}"
+            log "备份失败: $file"
+            tg_send "🔴 备份失败
+服务器: $SERVER_NAME
+目录: $p"
         fi
     done
+
+    clean_old
 }
 
-auto_copy_ssh_key() {
-    local ip="$1" local user="$2" local port="$3"
-    local LOCAL_KEY="/root/.ssh/id_rsa.pub"
-
-    if [ ! -f "$LOCAL_KEY" ]; then
-        echo -e "${GREEN}未检测到本地公钥，正在生成新的 SSH 密钥对...${NC}"
-        mkdir -p /root/.ssh && chmod 700 /root/.ssh
-        ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -N "" -q
-        if [ $? -ne 0 ]; then
-            echo -e "${GREEN}❌ 密钥生成失败，请检查 ssh-keygen 是否可用${NC}"
-            return 1
-        fi
-        echo -e "${GREEN}✅ SSH 密钥生成完成: $LOCAL_KEY${NC}"
+#################################
+# 创建备份
+#################################
+create_backup(){
+    read -p "输入要备份的目录(多个用空格分隔，直接回车使用默认配置): " input
+    if [ -z "$input" ]; then
+        backup_dirs
     else
-        echo -e "${GREEN}✅ 已检测到本地公钥: $LOCAL_KEY${NC}"
+        IFS=' ' read -r -a arr <<< "$input"
+        backup_dirs "${arr[@]}"
     fi
+}
 
-    local PUBKEY_CONTENT=$(cat "$LOCAL_KEY")
+#################################
+# 批量恢复（增加明确提示）
+#################################
+restore_backup(){
+    shopt -s nullglob
+    files=($(ls -1t "$BACKUP_DIR"/*.{tar.gz,zip} 2>/dev/null))
+    [ ${#files[@]} -eq 0 ] && { echo -e "${YELLOW}❌ 没有找到可恢复的备份文件。${RESET}"; return; }
 
-    echo -e "${GREEN}⚠️ 第一次连接需要手动输入远程服务器密码进行鉴权操作${NC}"
+    echo -e "${YELLOW}请选择要恢复的备份文件编号：${RESET}"
+    for i in "${!files[@]}"; do
+        echo "$i) $(basename "${files[$i]}")"
+    done
 
-    ssh -p "$port" -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$user@$ip" "bash -s" <<EOF
-        mkdir -p ~/.ssh
-        chmod 700 ~/.ssh
-        touch ~/.ssh/authorized_keys
-        cp ~/.ssh/authorized_keys ~/.ssh/authorized_keys.bak
-        if ! grep -Fxq "$PUBKEY_CONTENT" ~/.ssh/authorized_keys.bak; then
-            echo "$PUBKEY_CONTENT" >> ~/.ssh/authorized_keys.bak
+    read -p "选择编号(空格分隔多个): " input
+    [ -z "$input" ] && { echo -e "${YELLOW}操作已取消。${RESET}"; return; }
+    IFS=' ' read -r -a choose <<< "$input"
+
+    for idx in "${choose[@]}"; do
+        # 检查输入的索引是否有效
+        if [ -z "${files[$idx]}" ]; then
+            echo -e "${RED}❌ 编号 [$idx] 无效，跳过。${RESET}"
+            continue
         fi
-        awk '!seen[\$0]++' ~/.ssh/authorized_keys.bak > ~/.ssh/authorized_keys
-        rm -f ~/.ssh/authorized_keys.bak
-        chmod 600 ~/.ssh/authorized_keys
-        chown \$(whoami):\$(id -gn) ~/.ssh ~/.ssh/authorized_keys
-EOF
-
-    if [ $? -ne 0 ]; then
-        echo -e "${GREEN}❌ 远程操作失败，请检查网络连接、密码或端口是否正确。${NC}"
-        return 1
-    fi
-
-    echo -e "\n${GREEN}📂 正在验证远程免密读取通道状态...${NC}"
-    local verify_check=$(ssh -p "$port" -o ConnectTimeout=5 -o PasswordAuthentication=no -o StrictHostKeyChecking=no "$user@$ip" "cat ~/.ssh/authorized_keys" 2>/dev/null)
-    
-    if [ -n "$verify_check" ]; then
-        echo -e "${GREEN}✅ 密钥同步结果最终验证通过！免密安全互信已成功建立。${NC}"
-        return 0
-    else
-        echo -e "${GREEN}❌ 强校验错误: 密钥虽已传输，但当前机器仍无法进行免密登录。${NC}"
-        return 1
-    fi
-}
-
-setup_systemd_timer() {
-cat > "/etc/systemd/system/system-snapshot.service" << EOFSERVICE
-[Unit]
-Description=System Snapshot Backup Service
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=$ADMIN_SCRIPT --backend-run
-WorkingDirectory=/tmp
-EOFSERVICE
-
-cat > "/etc/systemd/system/system-snapshot.timer" << EOFTIMER
-[Unit]
-Description=Run System Snapshot Every ${NEW_BACKUP_INTERVAL_DAYS} Days
-
-[Timer]
-OnCalendar=*-*-1/${NEW_BACKUP_INTERVAL_DAYS} 00:00:00
-RandomizedDelaySec=4h
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOFTIMER
-
-    chmod 644 /etc/systemd/system/system-snapshot.*
-    systemctl daemon-reload
-    systemctl enable "system-snapshot.timer" &>/dev/null
-    systemctl restart "system-snapshot.timer" &>/dev/null
-}
-
-configure_project() {
-    load_config
-    check_requirements
-    if [ -f "$CONFIG_FILE" ]; then echo -e "${GREEN}进入修改配置模式。回车直接保留原当前值：${NC}\n"
-    else echo -e "${GREEN}进入首次安装配置向导。请输入以下参数：${NC}\n"; fi
-
-    read_with_default "请输入 Telegram Bot Token" "$BOT_TOKEN" NEW_BOT_TOKEN
-    read_with_default "请输入 Telegram Chat ID" "$CHAT_ID" NEW_CHAT_ID
-    echo
-    read_with_default "请输入远程服务器 IP 地址" "$TARGET_IP" NEW_TARGET_IP
-    read_with_default "请输入远程服务器用户名 (默认: root)" "${TARGET_USER:-root}" NEW_TARGET_USER
-    read_with_default "请输入 SSH 连接端口" "${SSH_PORT:-22}" NEW_SSH_PORT
-    echo
-    
-    auto_copy_ssh_key "$NEW_TARGET_IP" "$NEW_TARGET_USER" "$NEW_SSH_PORT"
-    if [ $? -ne 0 ]; then
-        echo -e "\n${GREEN}由于免密授权未真正生效，配置流程已强行中断，未写入任何更改。${NC}"
-        read -p "按任意键返回主菜单..." -n 1
-        return 1
-    fi
-    echo
-    
-    read_with_default "请输入远程基础备份目录" "${TARGET_BASE_DIR:-/root/remote_backup}" NEW_TARGET_BASE_DIR
-    local current_hostname=$(hostname)
-    read_with_default "请输入本机在远程的子目录名" "${REMOTE_DIR_NAME:-$current_hostname}" NEW_REMOTE_DIR_NAME
-    echo
-    read_with_default "请输入本地快照落盘目录" "${BACKUP_DIR:-/backups}" NEW_BACKUP_DIR
-    echo
-    read_with_default "请输入本地最大保留快照数量(个)" "${LOCAL_SNAPSHOT_KEEP:-2}" NEW_LOCAL_SNAPSHOT_KEEP
-    read_with_default "请输入远程快照过期删除时间(天)" "${REMOTE_SNAPSHOT_DAYS:-15}" NEW_REMOTE_SNAPSHOT_DAYS
-    echo
-    read_with_default "请输入备份执行间隔天数(1-30天)" "${BACKUP_INTERVAL_DAYS:-5}" NEW_BACKUP_INTERVAL_DAYS
-    
-    mkdir -p "$NEW_BACKUP_DIR"
-    cat > "$CONFIG_FILE" << EOF
-#!/bin/bash
-BOT_TOKEN="$NEW_BOT_TOKEN"
-CHAT_ID="$NEW_CHAT_ID"
-TARGET_IP="$NEW_TARGET_IP"
-TARGET_USER="$NEW_TARGET_USER"
-SSH_PORT="$NEW_SSH_PORT"
-TARGET_BASE_DIR="$NEW_TARGET_BASE_DIR"
-REMOTE_DIR_NAME="$NEW_REMOTE_DIR_NAME"
-BACKUP_DIR="$NEW_BACKUP_DIR"
-LOCAL_SNAPSHOT_KEEP=$NEW_LOCAL_SNAPSHOT_KEEP
-REMOTE_SNAPSHOT_DAYS=$NEW_REMOTE_SNAPSHOT_DAYS
-BACKUP_INTERVAL_DAYS=$NEW_BACKUP_INTERVAL_DAYS
-EOF
-    chmod 600 "$CONFIG_FILE"
-    
-    setup_systemd_timer
-    
-    echo -e "\n${GREEN}✓ 全新配置和 Systemd 自动化定时任务已同步刷新并生效！${NC}"
-    read -p "按任意键返回主菜单..." -n 1
-}
-
-action_manual_backup() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${GREEN}错误: 请先进行配置再执行此操作。${NC}"; else
-        echo -e "\n${GREEN}正在手动同步触发核心流程...${NC}"
-        # --interactive 参数用于向函数声明当前展示进度条
-        $ADMIN_SCRIPT --backend-run --interactive
-        echo -e "${GREEN}✓ 手动打包传输完整。${NC}"
-    fi
-    read -p "按任意键返回主菜单..." -n 1
-}
-
-test_telegram() {
-    if [ ! -f "$CONFIG_FILE" ]; then 
-        echo -e "${GREEN}错误: 请先进行配置后再执行测试。${NC}"
-        read -p "按任意键返回主菜单..." -n 1
-        return 1
-    fi
-    source "$CONFIG_FILE"
-    echo -e "\n${GREEN}正在发送 Telegram 控制台连通性测试消息...${NC}"
-    
-    local FULL_REMOTE_PATH="$TARGET_BASE_DIR/$REMOTE_DIR_NAME"
-    
-    # 消息转义处理
-    local t_name=$(escape_markdown "${REMOTE_DIR_NAME:-未配置}")
-    local t_path=$(escape_markdown "${FULL_REMOTE_PATH:-未配置}")
-    local t_days=$(escape_markdown "${BACKUP_INTERVAL_DAYS:-5}")
-    local t_time=$(escape_markdown "$(date '+%Y-%m-%d %H:%M:%S')")
-
-    local test_msg="🚀 *系统快照备份工具安装测试*
-
-📱 如果您看到此消息，说明Telegram配置成功！
-🖥️ *本机名称*: \`$t_name\`  
-🌐 *远程路径*: \`$t_path\`
-⏰ *执行频率*: 每${t_days}天一次
-⏱️ *时间*: \`$t_time\`"
-
-    # 执行带有响应捕获的发送
-    local response=$(curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
-        -d chat_id="$CHAT_ID" \
-        -d text="$test_msg" \
-        -d parse_mode="MarkdownV2")
         
-    if [[ $response == *"\"ok\":true"* ]]; then
-        echo -e "${GREEN}✓ Telegram 通知测试联通成功！请检查您的手机电报频道。${NC}\n"
-    else
-        echo -e "${GREEN}❌ 电报消息投递失败，请检查 Token / Chat ID 或者是机器出海网络代理。${NC}\n"
-    fi
-    read -p "按任意键返回主菜单..." -n 1
-}
-
-action_view_logs() {
-    if [ -f "$LOG_FILE" ]; then 
-        echo -e "\n${GREEN}正在加载最近的 15 条备份流日志：${NC}"
-        tail -n 15 "$LOG_FILE"
-    else echo -e "${GREEN}暂无备份任务的日志流产生。${NC}"; fi
-    read -p "按任意键返回主菜单..." -n 1
-}
-
-uninstall_project() {
-    systemctl stop system-snapshot.timer 2>/dev/null
-    systemctl disable system-snapshot.timer 2>/dev/null
-    rm -f /etc/systemd/system/system-snapshot.*
-    systemctl daemon-reload
-    rm -f "$CONFIG_FILE" "$ADMIN_SCRIPT"
-    echo -e "${GREEN}✓ 快照工具及定时任务已从本机完全干净卸载。${NC}"
-    exit 0
-}
-
-menu_loop() {
-    while true; do
-        draw_header
-        show_status_and_info
-        echo -e "${GREEN}  [1] 安装/修改配置${NC}"
-        echo -e "${GREEN}  [2] 手动执行系统快照${NC}"
-        echo -e "${GREEN}  [3] 测试Telegram连通性${NC}"
-        echo -e "${GREEN}  [4] 查看系统备份日志${NC}"
-        echo -e "${GREEN}  [5] 卸载备份工具${NC}"
-        echo -e "${GREEN}  [0] 退出${NC}"
-        echo -e "${GREEN}=================================${NC}"
-
-        read -p $'\033[32m请选择操作编号: \033[0m' choice
-        case $choice in
-            1) configure_project ;;
-            2) action_manual_backup ;;
-            3) test_telegram ;;
-            4) action_view_logs ;;
-            5) uninstall_project ;;
-            0) exit 0 ;;
-            *) sleep 1 ;;
-        esac
+        f="${files[$idx]}"
+        filename=$(basename "$f")
+        echo -e "${YELLOW}➔ 正在恢复: $filename ...${RESET}"
+        
+        if [[ "$f" == *.tar.gz ]]; then
+            tar -xzf "$f" -C /
+        else
+            unzip -oq "$f" -d /
+        fi
+        
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}🟢 成功恢复备份: $filename 到 / 目录${RESET}"
+        else
+            echo -e "${RED}🔴 恢复失败: $filename${RESET}"
+        fi
     done
 }
 
-menu_loop
+#################################
+# Telegram设置
+#################################
+set_tg(){
+    read -p "BOT_TOKEN: " BOT_TOKEN
+    read -p "CHAT_ID: " CHAT_ID
+    read -p "服务器名称: " SERVER_NAME
+
+cat > "$TG_CONF" <<EOF
+BOT_TOKEN="$BOT_TOKEN"
+CHAT_ID="$CHAT_ID"
+SERVER_NAME="$SERVER_NAME"
+EOF
+
+    save_conf
+    echo -e "${GREEN}🟢 Telegram 通知配置已成功保存！${RESET}"
+}
+
+#################################
+# 配置修改函数（均增加明确提示）
+#################################
+set_compress(){
+    echo -e "请选择备份压缩格式："
+    echo "1) tar.gz (推荐，保留权限更好)"
+    echo "2) zip"
+    read -p "请选择 [1-2]: " c
+    if [ "$c" = "2" ]; then
+        COMPRESS="zip"
+    else
+        COMPRESS="tar"
+    fi
+    save_conf
+    echo -e "${GREEN}🟢 压缩格式已修改为: ${YELLOW}${COMPRESS}${RESET}"
+}
+
+set_keep(){
+    read -p "请输入历史备份保留天数 (当前: ${KEEP_DAYS}天): " input
+    if [[ "$input" =~ ^[0-9]+$ ]]; then
+        KEEP_DAYS=$input
+        save_conf
+        echo -e "${GREEN}🟢 历史备份保留天数已修改为: ${YELLOW}${KEEP_DAYS} 天${RESET}"
+    else
+        echo -e "${RED}❌ 输入无效，请输入纯数字！${RESET}"
+    fi
+}
+
+set_local_backup_dir(){
+    echo -e "当前本地备份保持目录为: ${YELLOW}${BACKUP_DIR}${RESET}"
+    read -p "请输入新的绝对路径 (直接回车保持不变): " input
+    if [ -n "$input" ]; then
+        # 确保是绝对路径
+        if [[ "$input" == /* ]]; then
+            BACKUP_DIR="$input"
+            mkdir -p "$BACKUP_DIR"
+            save_conf
+            echo -e "${GREEN}🟢 本地备份保持目录已成功修改为: ${YELLOW}${BACKUP_DIR}${RESET}"
+        else
+            echo -e "${RED}❌ 修改失败：必须输入以 / 开头的绝对路径！${RESET}"
+        fi
+    else
+        echo -e "${YELLOW}未做任何修改。${RESET}"
+    fi
+}
+
+#################################
+# 系统环境与定时任务快照 (兼容 Alpine)
+#################################
+CRON_TAG="# VPSBACKUP_AUTO"
+
+get_os_info() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$NAME
+    else
+        OS=$(uname -s)
+    fi
+}
+
+get_task_count() {
+    TASK_COUNT=$(crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep -c '[^\s]')
+}
+
+list_cron_snapshot() {
+    if [ "$TASK_COUNT" -gt 0 ]; then
+        crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]' | awk '{print "   • " $0}'
+    else
+        echo -e "   ${YELLOW}(暂无用户自定义的定时任务)${RESET}"
+    fi
+}
+
+get_script_tasks() {
+    lines=()
+    while read -r line; do
+        [ -n "$line" ] && lines+=("$line")
+    done < <(crontab -l 2>/dev/null | grep "$CRON_TAG")
+}
+
+get_backup_stats() {
+    FILE_COUNT=$(ls -1 "$BACKUP_DIR" 2>/dev/null | grep -E '\.(tar\.gz|zip)$' | wc -l)
+    if [ -d "$BACKUP_DIR" ]; then
+        DISK_USAGE=$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
+    else
+        DISK_USAGE="0B"
+    fi
+}
+
+list_backup_snapshot() {
+    if [ "$FILE_COUNT" -gt 0 ]; then
+        ls -1t "$BACKUP_DIR" 2>/dev/null | grep -E '\.(tar\.gz|zip)$' | head -n 3 | awk '{print "   • " $0}'
+        if [ "$FILE_COUNT" -gt 3 ]; then
+            echo -e "   ${YELLOW}... 还有 $((FILE_COUNT - 3)) 个备份文件未列出${RESET}"
+        fi
+    else
+        echo -e "   ${YELLOW}(暂无本地备份文件)${RESET}"
+    fi
+}
+
+#################################
+# 定时任务二级菜单
+#################################
+schedule_add(){
+    echo -e "${GREEN}1 每天0点${RESET}"
+    echo -e "${GREEN}2 每周一0点${RESET}"
+    echo -e "${GREEN}3 每月1号${RESET}"
+    echo -e "${GREEN}4 自定义cron${RESET}"
+
+    read -p "选择: " t
+    case $t in
+        1) cron="0 0 * * *" ;;
+        2) cron="0 0 * * 1" ;;
+        3) cron="0 0 1 * *" ;;
+        4) read -p "cron表达式: " cron ;;
+        *) return ;;
+    esac
+
+    read -p "备份目录(空格分隔, 留空使用默认): " dirs
+    if [ -n "$dirs" ]; then
+        (crontab -l 2>/dev/null; \
+         echo "$cron $INSTALL_PATH auto \"$dirs\" >> $BASE_DIR/cron.log 2>&1 $CRON_TAG") | crontab -
+    else
+        (crontab -l 2>/dev/null; \
+         echo "$cron $INSTALL_PATH auto >> $BASE_DIR/cron.log 2>&1 $CRON_TAG") | crontab -
+    fi
+
+    echo -e "${GREEN}🟢 定时任务添加成功，cron日志指向: $BASE_DIR/cron.log${RESET}"
+}
+
+schedule_del_one(){
+    get_script_tasks
+    [ ${#lines[@]} -eq 0 ] && { echo -e "${YELLOW}❌ 没有找到通过本工具创建的定时任务。${RESET}"; return; }
+    
+    echo -e "${YELLOW}通过本工具创建的任务列表：${RESET}"
+    for i in "${!lines[@]}"; do
+        cron=$(echo "${lines[$i]}" | sed "s|$INSTALL_PATH auto.*||")
+        echo "$i) $cron"
+    done
+
+    read -p "输入要删除的编号(空格分隔多个): " input
+    [ -z "$input" ] && { echo -e "${YELLOW}操作已取消。${RESET}"; return; }
+    IFS=' ' read -r -a choose <<< "$input"
+    
+    for idx in "${choose[@]}"; do
+        unset 'lines[idx]'
+    done
+    
+    (crontab -l 2>/dev/null | grep -v "$CRON_TAG"; for l in "${lines[@]}"; do echo "$l"; done) | crontab
+    echo -e "${GREEN}🟢 选择的定时任务已成功删除！${RESET}"
+}
+
+schedule_edit_manual(){
+    echo -e "${YELLOW}提示: 即将打开系统默认编辑器编辑 crontab 配置文件。${RESET}"
+    echo -e "${YELLOW}Alpine 默认使用 vi，保存退出后将自动生效。${RESET}"
+    read -p "按回车打开编辑器..."
+    crontab -e
+    echo -e "${GREEN}🟢 手动编辑已结束。${RESET}"
+}
+
+schedule_menu(){
+    while true; do
+        clear
+        get_os_info
+        get_task_count
+        
+        echo -e "${GREEN}=======================================${RESET}"
+        echo -e "${GREEN}        ◈  Cron 定时任务管理面板  ◈      ${RESET}"
+        echo -e "${GREEN}=======================================${RESET}"
+        echo -e "${GREEN} 当前系统环境 : ${YELLOW}${OS}${RESET}"
+        echo -e "${GREEN} 活跃任务总数 : ${YELLOW}${TASK_COUNT} 条${RESET}"
+        echo -e "${GREEN}---------------------------------------${RESET}"
+        echo -e "${GREEN} 📋 当前系统定时任务快照：${RESET}"
+        
+        list_cron_snapshot
+        
+        echo -e "${GREEN}---------------------------------------${RESET}"
+        echo -e "${GREEN}  1) 快速添加定时任务(引导式)${RESET}"
+        echo -e "${GREEN}  2) 精准删除定时任务(支持多选)${RESET}"
+        echo -e "${GREEN}  3) 深度手动编辑任务(打开编辑器)${RESET}"
+        echo -e "${GREEN}---------------------------------------${RESET}"
+        echo -e "${GREEN}  0) 返回主菜单${RESET}"
+        echo -e "${GREEN}=======================================${RESET}"
+        
+        echo -ne "${GREEN} 请选择操作编号: ${RESET}"
+        read c
+        case $c in
+            1) schedule_add ;;
+            2) schedule_del_one ;;
+            3) schedule_edit_manual ;;
+            0) break ;;
+        esac
+        read -p "回车继续..."
+    done
+}
+
+#################################
+# 卸载
+#################################
+uninstall(){
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+    rm -rf "$BASE_DIR"
+    rm -f /usr/local/bin/vpsbackup
+    echo -e "${GREEN}🟢 已成功完全卸载本工具及相关定时任务。${RESET}"
+    exit
+}
+
+#################################
+# auto模式（cron专用）
+#################################
+if [ "$1" = "auto" ]; then
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    export HOME=/root
+    load_conf
+
+    if [ "$2" ]; then
+        IFS=' ' read -r -a dirs <<< "$2"
+        backup_dirs "${dirs[@]}" >> "$BASE_DIR/cron.log" 2>&1
+    else
+        backup_dirs >> "$BASE_DIR/cron.log" 2>&1
+    fi
+    exit
+fi
+
+#################################
+# 主菜单
+#################################
+while true; do
+    clear
+    load_conf
+    get_os_info
+    get_backup_stats
+    
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}       ◈  VPS 自动化备份管理系统  ◈    ${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN} 当前系统环境 : ${YELLOW}${OS}${RESET}"
+    echo -e "${GREEN} 备份文件总数 : ${YELLOW}${FILE_COUNT} 个 (${DISK_USAGE})${RESET}"
+    echo -e "${GREEN} 当前备份策略 : ${YELLOW}格式:${COMPRESS} | 保留:${KEEP_DAYS}天${RESET}"
+    echo -e "${GREEN} 保持目录路径 : ${YELLOW}${BACKUP_DIR}${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN} 📦 当前本地历史备份快照(最新3条)：${RESET}"
+    
+    list_backup_snapshot
+    
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN}  1) 立即创建系统备份(支持多目录)${RESET}"
+    echo -e "${GREEN}  2) 批量恢复历史备份(引导式解压)${RESET}"
+    echo -e "${GREEN}  3) 配置Telegram机器人即时通知${RESET}"
+    echo -e "${GREEN}  4) 进入Cron定时任务管理面板${RESET}"
+    echo -e "${GREEN}  5) 修改备份压缩格式 (tar.gz/zip)${RESET}"
+    echo -e "${GREEN}  6) 修改历史备份保留天数${RESET}"
+    echo -e "${GREEN}  7) 自定义本地备份保持目录${RESET}"
+    echo -e "${GREEN}  8) 彻底卸载本工具及定时任务${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN}  0) 退出系统${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+
+    echo -ne "${GREEN} 请选择操作编号: ${RESET}"
+    read choice
+    case $choice in
+        1) create_backup ;;
+        2) restore_backup ;;
+        3) set_tg ;;
+        4) schedule_menu ;;
+        5) set_compress ;;
+        6) set_keep ;;
+        7) set_local_backup_dir ;;
+        8) uninstall ;;
+        0) exit ;;
+    esac
+    read -p "回车继续..."
+done

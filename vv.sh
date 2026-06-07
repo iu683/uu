@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # ==============================================================================
-#  cf-warp-rust 一键管理面板（集成 Google 透明代理专属菜单版）
+#  cf-warp-rust 一键管理面板（高级透明代理·终极完美版）
 # ==============================================================================
 
 # ── 核心环境变量 ──────────────────────────────────────────────────────────────
@@ -18,6 +18,7 @@ export SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 export REDSOCKS_CONF="/etc/redsocks.conf"
 export PROXY_SERVICE_NAME="warp-google-proxy"
 export PROXY_SERVICE_FILE="/etc/systemd/system/${PROXY_SERVICE_NAME}.service"
+export PROXY_RULES_SCRIPT="${DATA_DIR}/warp-google-iptables.sh"
 
 # ── 终端颜色定义 ──────────────────────────────────
 export RESET='\033[0m'
@@ -274,12 +275,20 @@ start_transparent_proxy() {
         die "redsocks 组件安装失败，请检查系统网络或源仓库。"
     fi
 
+    # 关闭并禁用自带的 redsocks 默认服务，防止抢占 12345 端口
+    if systemctl is-enabled redsocks >/dev/null 2>&1 || systemctl is-active redsocks >/dev/null 2>&1; then
+        info "检测到系统自带的默认 redsocks 服务，正在将其解绑卸载以防端口冲突..."
+        systemctl stop redsocks >/dev/null 2>&1
+        systemctl disable redsocks >/dev/null 2>&1
+    fi
+
     info "阻断并优化系统的 Google IPv6 路由解析..."
     ip -6 route add blackhole 2607:f8b0::/32 2>/dev/null || true
     if ! grep -q "precedence ::ffff:0:0/96  100" /etc/gai.conf 2>/dev/null; then
         echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
     fi
 
+    # 生成 redsocks 配置
     cat <<EOF > "$REDSOCKS_CONF"
 base {
     log_debug = off;
@@ -297,29 +306,64 @@ redsocks {
 }
 EOF
 
-    local iptables_rules_start=""
-    for ip in $GOOGLE_IPS; do
-        iptables_rules_start="${iptables_rules_start}ExecStartPost=/sbin/iptables -t nat -A WARP_GOOGLE -d $ip -p tcp -j REDIRECT --to-ports 12345\n"
-    done
+    # 封装独立的高性能防火墙控制脚本
+    [ -d "$DATA_DIR" ] || mkdir -p "$DATA_DIR"
+    cat <<'EOF' > "$PROXY_RULES_SCRIPT"
+#!/bin/bash
+ACTION=$1
+GOOGLE_IPS="
+8.8.4.0/24
+8.8.8.0/24
+34.0.0.0/9
+35.184.0.0/13
+35.192.0.0/12
+35.224.0.0/12
+35.240.0.0/13
+64.233.160.0/19
+66.102.0.0/20
+66.249.64.0/19
+72.14.192.0/18
+74.125.0.0/16
+104.132.0.0/14
+108.177.0.0/17
+142.250.0.0/15
+172.217.0.0/16
+172.253.0.0/16
+173.194.0.0/16
+209.85.128.0/17
+216.58.192.0/19
+216.239.32.0/19
+"
 
+if [ "$ACTION" = "start" ]; then
+    /sbin/iptables -t nat -N WARP_GOOGLE 2>/dev/null
+    /sbin/iptables -t nat -F WARP_GOOGLE
+    for ip in $GOOGLE_IPS; do
+        /sbin/iptables -t nat -A WARP_GOOGLE -d $ip -p tcp -j REDIRECT --to-ports 12345
+    done
+    /sbin/iptables -t nat -C OUTPUT -j WARP_GOOGLE 2>/dev/null || /sbin/iptables -t nat -A OUTPUT -j WARP_GOOGLE
+elif [ "$ACTION" = "stop" ]; then
+    /sbin/iptables -t nat -D OUTPUT -j WARP_GOOGLE 2>/dev/null
+    /sbin/iptables -t nat -F WARP_GOOGLE 2>/dev/null
+    /sbin/iptables -t nat -X WARP_GOOGLE 2>/dev/null
+fi
+EOF
+    chmod +x "$PROXY_RULES_SCRIPT"
+
+    # 设计守护式 Systemd 服务
     cat <<EOF > "$PROXY_SERVICE_FILE"
 [Unit]
-Description=Cloudflare WARP Google Transparent Proxy (Redsocks)
+Description=Cloudflare WARP Google Transparent Proxy (Redsocks Engine)
 After=network.target ${SERVICE_NAME}.service
 Requires=${SERVICE_NAME}.service
 
 [Service]
 Type=simple
-ExecStartPre=-/sbin/iptables -t nat -N WARP_GOOGLE
-ExecStartPre=-/sbin/iptables -t nat -F WARP_GOOGLE
 ExecStart=/usr/sbin/redsocks -c ${REDSOCKS_CONF}
-${iptables_rules_start}
-ExecStartPost=/sbin/iptables -t nat -A OUTPUT -j WARP_GOOGLE
-
-ExecStop=/sbin/iptables -t nat -D OUTPUT -j WARP_GOOGLE
-ExecStop=/sbin/iptables -t nat -F WARP_GOOGLE
-ExecStop=/sbin/iptables -t nat -X WARP_GOOGLE
+ExecStartPost=${PROXY_RULES_SCRIPT} start
+ExecStop=${PROXY_RULES_SCRIPT} stop
 Restart=always
+RestartSec=2s
 
 [Install]
 WantedBy=multi-user.target
@@ -327,13 +371,16 @@ EOF
 
     systemctl daemon-reload
     systemctl enable "$PROXY_SERVICE_NAME" >/dev/null 2>&1
+    
+    info "正在拉起透明代理引擎..."
     systemctl start "$PROXY_SERVICE_NAME"
     
-    sleep 1
+    sleep 1.5
     if systemctl is-active --quiet "$PROXY_SERVICE_NAME"; then
-        ok "Google 透明分流代理启动成功！"
+        ok "Google 透明分流代理已彻底成功启动并挂载！"
     else
-        warn "透明代理拉起异常，请运行 'journalctl -u $PROXY_SERVICE_NAME' 排查原因。"
+        warn "透明代理拉起异常，正在为你输出实时崩溃错误日志："
+        journalctl -u "$PROXY_SERVICE_NAME" -n 15 --no-pager
     fi
 }
 
@@ -350,7 +397,7 @@ stop_transparent_proxy() {
 verify_transparent_proxy() {
     echo -e "\n${CYAN}========= 透明代理链路深度验证 =========${RESET}"
     
-    info "1. 正在检索系统 iptables 劫持规则状态..."
+    info "1. 正在检索系统 iptables 劫持规则 status..."
     if iptables -t nat -L OUTPUT -n | grep -q "WARP_GOOGLE"; then
         echo -e "   iptables 拦截链: ${GREEN}✔ 正常挂载 (已接管系统 OUTPUT 流量)${RESET}"
     else
@@ -364,7 +411,6 @@ verify_transparent_proxy() {
     if [ "$http_status" -eq 200 ] || [ "$http_status" -eq 301 ] || [ "$http_status" -eq 302 ]; then
         echo -e "   联通性测试结果: ${GREEN}✔ 成功连接 (HTTP 状态码: ${http_status})${RESET}"
         
-        # 顺便测个延迟
         local total_time
         total_time=$(curl -o /dev/null -s -w "%{time_total}" --max-time 5 "https://www.google.com")
         echo -e "   透明代理端延迟: ${YELLOW}${total_time} 秒${RESET}"
@@ -380,21 +426,21 @@ menu_transparent_proxy_center() {
         clear
         local proxy_status="${RED}未运行${RESET}"
         if systemctl is-active --quiet "$PROXY_SERVICE_NAME"; then
-            proxy_status="${GREEN}运行中 (已自动接管 Google IP 流量)${RESET}"
+            proxy_status="${YELLOW}运行中 (已自动接管 Google IP 流量)${RESET}"
         fi
 
-        echo -e "${CYAN}=====================================${RESET}"
-        echo -e "${CYAN}      Google 透明代理管理控制子菜单       ${RESET}"
-        echo -e "${CYAN}=====================================${RESET}"
-        echo -e "${CYAN}当前状态 :${RESET} $proxy_status"
-        echo -e "${CYAN}=====================================${RESET}"
+        echo -e "${GREEN}=====================================${RESET}"
+        echo -e "${GREEN}      Google 透明代理管理控制菜单       ${RESET}"
+        echo -e "${GREEN}=====================================${RESET}"
+        echo -e "${GREEN}当前状态 :${RESET} $proxy_status"
+        echo -e "${GREEN}=====================================${RESET}"
         echo -e "${GREEN}1. 开启透明代理${RESET}"
-        echo -e "${RED}2. 关闭透明代理${RESET}"
-        echo -e "${YELLOW}3. 查看并验证代理连通性${RESET}"
+        echo -e "${GREEN}2. 关闭透明代理${RESET}"
+        echo -e "${GREEN}3. 查看并验证代理连通性${RESET}"
         echo -e "${GREEN}0. 返回主菜单${RESET}"
-        echo -e "${CYAN}=====================================${RESET}"
+        echo -e "${GREEN}=====================================${RESET}"
         
-        read -r -p "$(echo -e "${CYAN}请输入子选项: ${RESET}")" sub_choice
+        read -r -p "$(echo -e "${GREEN}请输入子选项: ${RESET}")" sub_choice
         case "$sub_choice" in
             1) start_transparent_proxy ;;
             2) stop_transparent_proxy ;;
@@ -414,9 +460,9 @@ get_status_info() {
     fi
 
     if systemctl is-active --quiet "$PROXY_SERVICE_NAME"; then
-        panel_status="${panel_status} | 透明分流:${GREEN}已开启${RESET}"
+        panel_status="${panel_status} ${GREEN}| 透明分流:已开启${RESET}"
     else
-        panel_status="${panel_status} | 透明分流:${YELLOW}未开启${RESET}"
+        panel_status="${panel_status} ${GREEN}| 透明分流:未开启${RESET}"
     fi
 
     if [ -f "$INSTALL_BIN" ]; then
@@ -509,7 +555,7 @@ menu_update() {
 menu_uninstall() {
     systemctl stop "$PROXY_SERVICE_NAME" >/dev/null 2>&1
     systemctl disable "$PROXY_SERVICE_NAME" >/dev/null 2>&1
-    rm -f "$PROXY_SERVICE_FILE" "$REDSOCKS_CONF"
+    rm -f "$PROXY_SERVICE_FILE" "$REDSOCKS_CONF" "$PROXY_RULES_SCRIPT"
 
     systemctl stop "$SERVICE_NAME" >/dev/null 2>&1
     systemctl disable "$SERVICE_NAME" >/dev/null 2>&1
@@ -639,7 +685,7 @@ while true; do
     get_status_info
     clear
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}      CF-WARP 面板 (高级透明代理版)   ${RESET}"
+    echo -e "${GREEN}         CF-WARP 面板         ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $panel_status"
     echo -e "${GREEN}版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
@@ -647,14 +693,14 @@ while true; do
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}1. 安装 WARP-Rust${RESET}"
     echo -e "${GREEN}2. 更新 WARP-Rust${RESET}"
-    echo -e "${GREEN}3. 卸载全套组件 (含透明代理)${RESET}"
-    echo -e "${GREEN}4. 修改配置 (自动联动端口)${RESET}"
+    echo -e "${GREEN}3. 卸载全套组件${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
     echo -e "${GREEN}5. 启动 WARP-Rust${RESET}"
     echo -e "${GREEN}6. 停止 WARP-Rust${RESET}"
     echo -e "${GREEN}7. 重启 WARP-Rust${RESET}"
     echo -e "${GREEN}8. 查看内核日志${RESET}"
     echo -e "${GREEN}9. 查看配置与出口状态${RESET}"
-    echo -e "${YELLOW}10. 进入 Google 透明代理管理菜单${RESET}"
+    echo -e "${YELLOW}10. 谷歌WARP分流${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     

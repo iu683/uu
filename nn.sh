@@ -229,7 +229,7 @@ parse_systemd_time() {
 show_status_and_info() {
     load_config
     if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${GREEN}当前工具状态: 系统快照工具 [ 尚未安装 ] 或者是配置不完整。${NC}"
+        echo -e "${GREEN}当前工具状态: [未安装]${NC}"
         echo -e "${GREEN}=================================${NC}"
         return 1
     fi
@@ -238,7 +238,7 @@ show_status_and_info() {
     if systemctl is-active "${SERVICE_NAME}.timer" &>/dev/null; then timer_active="运行中 (Active)"; fi
     
     local last_run="无记录" local next_run="未安排"
-    if [ "$timer_active" == "运行中 (Active)" ]; then
+    if [ "$timer_active" == "运行中" ]; then
         local raw_last=$(systemctl show "${SERVICE_NAME}.timer" --property=LastTriggerUSecMonotonic --value 2>/dev/null)
         # 换用可靠的 systemctl list-timers 文本过滤清洗
         local raw_line=$(systemctl list-timers "${SERVICE_NAME}.timer" 2>/dev/null | grep "${SERVICE_NAME}.timer")
@@ -262,7 +262,7 @@ show_status_and_info() {
     echo -e "${GREEN} 上次执行时间:${NC} ${YELLOW}${last_run}${NC}"
     echo -e "${GREEN} 下次预计执行:${NC} ${YELLOW}${next_run}${NC}"
     echo -e "${GREEN} 备份间隔天数:${NC} 每 ${BACKUP_INTERVAL_DAYS:-'5'} 天自动触发一次"
-    echo -e "${YELLOW}=================================${NC}"
+    echo -e "${GREEN}=================================${NC}"
     echo -e "${YELLOW}[ 核心配置与数据信息 ]${NC}"
     echo -e "${GREEN} 本机标识名称:${NC} ${YELLOW}${REMOTE_DIR_NAME:-'未配置'}${NC}"
     echo -e "${GREEN} 远程存储目标:${NC} ${YELLOW}${TARGET_USER:-'N/A'}@${TARGET_IP:-'N/A'}:${SSH_PORT:-'22'}${NC}"
@@ -501,7 +501,8 @@ menu_loop() {
         echo -e "${GREEN}  [5] 卸载备份工具${NC}"
         echo -e "${GREEN}  [0] 退出${NC}"
         echo -e "${GREEN}=================================${NC}"
-        read -p " 请选择操作编号: " choice
+
+        read -p $'\033[32m请选择操作编号: \033[0m' choice
         case $choice in
             1) configure_project ;;
             2) action_manual_backup ;;

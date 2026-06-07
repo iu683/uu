@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # ==============================================================================
-#  cf-warp-rust 一键管理面板（高级透明代理·终极完美版）
+#  cf-warp-rust 一键管理面板
 # ==============================================================================
 
 # ── 核心环境变量 ──────────────────────────────────────────────────────────────
@@ -53,7 +53,7 @@ GOOGLE_IPS="
 216.239.32.0/19
 "
 
-# ── 基础环境校验 ──────────────────────────────────────────────────────────────
+# ── 基础环境校验（仅保留主程序必要工具） ──────────────────────────────────────────
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}[错误]${RESET} 请使用 root 权限运行此脚本！" >&2
     exit 1
@@ -75,11 +75,41 @@ detect_os() {
 }
 detect_os
 
-for cmd in curl tar sed grep awk iptables; do
+# 仅检查主程序运行和下载解压所需的基础工具（去除了 iptables）
+REQUIRED_CMDS="curl tar sed grep awk"
+MISSING_CMDS=""
+
+for cmd in $REQUIRED_CMDS; do
     if ! command -v "$cmd" &> /dev/null; then
-        die "缺失基础组件: $cmd，请先使用系统包管理器安装它。"
+        MISSING_CMDS="$MISSING_CMDS $cmd"
     fi
 done
+
+if [ -n "$MISSING_CMDS" ]; then
+    info "检测到系统缺失下载/解压必要组件:${YELLOW}$MISSING_CMDS${RESET}，正在自动修复..."
+    case "$OS" in
+        ubuntu|debian)
+            apt-get update -qy && apt-get install -y $MISSING_CMDS >/dev/null 2>&1
+            ;;
+        centos|rhel|rocky|almalinux|fedora)
+            if command -v dnf &>/dev/null; then
+                dnf install -y $MISSING_CMDS >/dev/null 2>&1
+            else
+                yum install -y $MISSING_CMDS >/dev/null 2>&1
+            fi
+            ;;
+        *)
+            die "未知的操作系统，请手动安装基础组件: $MISSING_CMDS"
+            ;;
+    esac
+
+    for cmd in $MISSING_CMDS; do
+        if ! command -v "$cmd" &> /dev/null; then
+            die "自动安装组件 [ $cmd ] 失败，请检查网络或系统源。"
+        fi
+    done
+    ok "主程序基础依赖补全成功！"
+fi
 
 # ── 1. 核心下载与组件解压 ───────────────────────────────────────────────────
 detect_target() {
@@ -231,7 +261,7 @@ EOF
     systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
 }
 
-# ── 3. 透明代理二级专属菜单控制中心 ───────────────────────────────────────────
+# ── 3. 透明代理二级专属菜单控制中心（谷歌代理专项依赖在此安装） ───────────────────
 start_transparent_proxy() {
     if systemctl is-active --quiet "$PROXY_SERVICE_NAME"; then
         warn "Google 透明分流代理已经处于启动运行状态，无需重复启动。"
@@ -257,22 +287,30 @@ start_transparent_proxy() {
         return
     fi
 
-    info "正在安装/检查透明代理核心组件 (redsocks / iptables)..."
-    case $OS in
-        ubuntu|debian)
-            apt-get update -qy && apt-get install -y redsocks iptables >/dev/null 2>&1
-            ;;
-        centos|rhel|rocky|almalinux|fedora)
-            if command -v dnf &>/dev/null; then
-                dnf install -y redsocks iptables >/dev/null 2>&1
-            else
-                yum install -y redsocks iptables >/dev/null 2>&1
-            fi
-            ;;
-    esac
+    # 【核心改动】只有开启谷歌分流时，才动态校验并拉取 redsocks 和 iptables
+    info "正在检查并安装透明代理核心组件 (redsocks / iptables)..."
+    local proxy_missing=""
+    if ! command -v redsocks &>/dev/null; then proxy_missing="$proxy_missing redsocks"; fi
+    if ! command -v iptables &>/dev/null; then proxy_missing="$proxy_missing iptables"; fi
 
-    if ! command -v redsocks &>/dev/null; then
-        die "redsocks 组件安装失败，请检查系统网络或源仓库。"
+    if [ -n "$proxy_missing" ]; then
+        info "正在为系统补齐透明分流组件群:${YELLOW}$proxy_missing${RESET}..."
+        case $OS in
+            ubuntu|debian)
+                apt-get update -qy && apt-get install -y $proxy_missing >/dev/null 2>&1
+                ;;
+            centos|rhel|rocky|almalinux|fedora)
+                if command -v dnf &>/dev/null; then
+                    dnf install -y $proxy_missing >/dev/null 2>&1
+                else
+                    yum install -y $proxy_missing >/dev/null 2>&1
+                fi
+                ;;
+        esac
+    fi
+
+    if ! command -v redsocks &>/dev/null || ! command -v iptables &>/dev/null; then
+        die "透明代理所需核心网络组件安装失败，请检查你的系统源网络环境。"
     fi
 
     # 关闭并禁用自带的 redsocks 默认服务，防止抢占 12345 端口
@@ -398,7 +436,7 @@ verify_transparent_proxy() {
     echo -e "\n${CYAN}========= 透明代理链路深度验证 =========${RESET}"
     
     info "1. 正在检索系统 iptables 劫持规则 status..."
-    if iptables -t nat -L OUTPUT -n | grep -q "WARP_GOOGLE"; then
+    if command -v iptables &>/dev/null && iptables -t nat -L OUTPUT -n | grep -q "WARP_GOOGLE"; then
         echo -e "   iptables 拦截链: ${GREEN}✔ 正常挂载 (已接管系统 OUTPUT 流量)${RESET}"
     else
         echo -e "   iptables 拦截链: ${RED}✘ 未挂载 (Google 流量目前处于直连状态)${RESET}"
@@ -691,17 +729,17 @@ while true; do
     echo -e "${GREEN}版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
     echo -e "${GREEN}绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}1. 安装 WARP-Rust${RESET}"
-    echo -e "${GREEN}2. 更新 WARP-Rust${RESET}"
-    echo -e "${GREEN}3. 卸载全套组件${RESET}"
-    echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 WARP-Rust${RESET}"
-    echo -e "${GREEN}6. 停止 WARP-Rust${RESET}"
-    echo -e "${GREEN}7. 重启 WARP-Rust${RESET}"
-    echo -e "${GREEN}8. 查看内核日志${RESET}"
-    echo -e "${GREEN}9. 查看配置与出口状态${RESET}"
+    echo -e "${GREEN} 1. 安装 WARP-Rust${RESET}"
+    echo -e "${GREEN} 2. 更新 WARP-Rust${RESET}"
+    echo -e "${GREEN} 3. 卸载全套组件${RESET}"
+    echo -e "${GREEN} 4. 修改配置${RESET}"
+    echo -e "${GREEN} 5. 启动 WARP-Rust${RESET}"
+    echo -e "${GREEN} 6. 停止 WARP-Rust${RESET}"
+    echo -e "${GREEN} 7. 重启 WARP-Rust${RESET}"
+    echo -e "${GREEN} 8. 查看内核日志${RESET}"
+    echo -e "${GREEN} 9. 查看配置与出口状态${RESET}"
     echo -e "${YELLOW}10. 谷歌WARP分流${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     
     read -r -p "$(echo -e "${GREEN}请输入选项: ${RESET}")" choice

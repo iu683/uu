@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Rclone 管理脚本 (智能挂载自启动一体版 + 资产清单)
+# Rclone 管理脚本 (Alpine Linux OpenRC 专属版)
 # ========================================
 
 # ================== 颜色 ==================
@@ -19,12 +19,7 @@ CRON_PREFIX="# rclone_sync_task:"
 
 mkdir -p "$LOG_DIR" "$SCRIPT_DIR"
 
-# 获取系统环境名称
-if [ -f /etc/os-release ]; then
-    OS=$(awk -F= '/^NAME/{print $2}' /etc/os-release | tr -d '"')
-else
-    OS=$(uname -s)
-fi
+OS="Alpine Linux"
 
 # ================== 载入或初始化配置文件 ==================
 init_config() {
@@ -88,8 +83,8 @@ show_menu() {
     echo -e "${CYAN} 3)${RESET} 配置 Rclone (config) ${CYAN} 4)${RESET} 查看远程存储列表"
     echo -e "${CYAN} 5)${RESET} 查看远程存储文件"
     echo -e "----------------------------------------"
-    echo -e "${GREEN} [ 挂载管理 (自动配置开机自启) ]${RESET}"
-    echo -e "${CYAN} 6)${RESET} 挂载远程存储到本地   ${CYAN} 7)${RESET} 查看已创建的资产清单"
+    echo -e "${GREEN} [ 挂载管理 (自动配置开机自启 - OpenRC) ]${RESET}"
+    echo -e "${CYAN} 6)${RESET} 挂载网盘            ${CYAN}  7)${RESET} 查看已创建的资产清单"
     echo -e "${CYAN} 8)${RESET} 卸载指定挂载点       ${CYAN} 9)${RESET} 卸载所有挂载点"
     echo -e "${CYAN}10)${RESET} 查看挂载运行状态     ${CYAN}11)${RESET} 查看挂载实时日志"
     echo -e "----------------------------------------"
@@ -99,15 +94,46 @@ show_menu() {
     echo -e "----------------------------------------"
     echo -e "${GREEN} [ 全局设置与常规 ]${RESET}"
     echo -e "${CYAN}15)${RESET} 修改 TG 通知参数     ${CYAN}16)${RESET} 彻底卸载 Rclone"
-    echo -e "${CYAN} 0)${RESET} 退出脚本"
+    echo -e "${CYAN} 0)${RESET} 退出"
     echo -e "${GREEN}======================================${RESET}"
 }
 
 # ================== 基础操作 ==================
 install_rclone() {
-    echo -e "${YELLOW}正在安装 Rclone...${RESET}"
-    curl https://rclone.org/install.sh | sudo bash
-    echo -e "${GREEN}Rclone 安装完成！${RESET}"
+    echo -e "${YELLOW}正在 Alpine Linux 中安装 FUSE 挂载依赖组件...${RESET}"
+    
+    # 1. 刷新软件源并安装 fuse3 及其核心工具
+    sudo apk update
+    sudo apk add fuse3 curl bash
+    
+    # 2. 确保配置允许其他用户挂载（对应 --allow-other 参数）
+    if [ -f /etc/fuse.conf ]; then
+        sudo sed -i 's/#\s*user_allow_other/user_allow_other/g' /etc/fuse.conf
+    else
+        echo "user_allow_other" | sudo tee /etc/fuse.conf > /dev/null
+    fi
+
+    # 3. 强制在 Alpine 中将 fuse 模块写入开机自动加载
+    if [ -d /etc/modules-load.d ]; then
+        echo "fuse" | sudo tee /etc/modules-load.d/fuse.conf > /dev/null
+    else
+        echo "fuse" | sudo tee -a /etc/modules > /dev/null
+    fi
+    sudo modprobe fuse 2>/dev/null
+
+    if command -v fusermount3 &> /dev/null; then
+        echo -e "${GREEN}Alpine FUSE3 依赖组件及内核模块配置成功！${RESET}"
+    else
+        echo -e "${RED}⚠️ FUSE3 安装可能失败，请检查 Alpine 社区源是否开启。${RESET}"
+    fi
+
+    # 4. 安装 Rclone 本体
+    echo -e "${YELLOW}正在安装 Rclone 本体...${RESET}"
+    if curl https://rclone.org/install.sh | sudo bash; then
+        echo -e "${GREEN}Rclone 在 Alpine 上安装完成！${RESET}"
+    else
+        echo -e "${RED}❌ Rclone 本体安装失败。${RESET}"
+    fi
 }
 
 update_rclone() {
@@ -121,7 +147,7 @@ config_rclone() { rclone config; }
 list_remotes() { rclone listremotes; }
 
 list_files_remote() {
-    read -p "请输入远程名称: " remote
+    read -p "请输入Rclone创建的网盘名称: " remote
     [ -z "$remote" ] && { echo -e "${RED}远程名称不能为空${RESET}"; return; }
     read -p "请输入远程目录(默认 /): " remote_dir
     remote_dir=${remote_dir:-/}
@@ -155,97 +181,126 @@ send_tg() {
     fi
 }
 
-# ================== 智能挂载自启动一体化 (基于 Systemd 底层) ==================
+# ================== 智能挂载自启动一体化 (OpenRC 重构) ==================
 mount_remote() {
-    read -p "请输入远程名称: " remote
+    read -p "请输入Rclone创建的网盘名称: " remote
     [ -z "$remote" ] && return
-    default_path="/mnt/$remote"
-    read -p "请输入挂载路径(默认 $default_path): " input_path
+    
+    read -p "请输入网盘内的存储桶/子目录 (如 sss): " remote_dir
+    remote_dir=$(echo "$remote_dir" | sed 's/^\///;s/\/$//')
+    
+    if [ -z "$remote_dir" ]; then
+        default_path="/mnt/${remote}"
+        local mount_source="${remote}:"
+    else
+        default_path="/mnt/${remote}_${remote_dir}"
+        local mount_source="${remote}:${remote_dir}"
+    fi
+    
+    read -p "请输入VPS本地挂载路径 (默认 $default_path): " input_path
     path=${input_path:-$default_path}
     
-    # 1. 检查防冲突
+    # 检查防冲突
     if mount | grep -q "on $path type"; then
-        echo -e "${YELLOW}该路径 $path 已经被挂载。正在执行热刷新升级...${RESET}"
-        sudo fusermount -u "$path" 2>/dev/null || sudo umount -l "$path" 2>/dev/null
+        echo -e "${YELLOW}该本地路径 $path 已经被挂载。正在执行强行清理...${RESET}"
+        sudo umount -l "$path" 2>/dev/null
     fi
 
-    [ -f "/var/run/rclone_${remote}.pid" ] && rm -f "/var/run/rclone_${remote}.pid"
-
-    mkdir -p "$path"
-    service_file="/etc/systemd/system/rclone-mount@${remote}.service"
+    sudo mkdir -p "$path"
     
-    # 2. 直接一步到位写入 Systemd 实现守护与开机自启
+    # OpenRC 服务脚本路径
+    local service_file="/etc/init.d/rclone-mount.${remote}"
+    
+    # 写入 OpenRC 服务兼容脚本 (完美适配 Alpine)
     sudo tee "$service_file" >/dev/null <<EOF
-[Unit]
-Description=Rclone Mount ${remote}
-After=network-online.target
+#!/sbin/openrc-run
 
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/bin/rclone mount ${remote}: $path --allow-other --vfs-cache-mode writes --dir-cache-time 1000h
-ExecStop=/bin/fusermount -u $path
-Restart=always
-RestartSec=10
-StandardOutput=append:$LOG_DIR/rclone_${remote}_sys.log
-StandardError=append:$LOG_DIR/rclone_${remote}_sys.log
+description="Rclone Mount Service for ${remote}"
 
-[Install]
-WantedBy=multi-user.target
+command="/usr/bin/rclone"
+command_args="mount ${mount_source} ${path} --allow-other --vfs-cache-mode full --vfs-cache-max-age 24h --vfs-cache-max-size 10G --buffer-size 64M --dir-cache-time 1h --drive-chunk-size 64M"
+command_background="true"
+
+pidfile="/run/rclone-mount.${remote}.pid"
+output_log="${LOG_DIR}/rclone_${remote}_sys.log"
+error_log="${LOG_DIR}/rclone_${remote}_sys.log"
+
+depend() {
+    need net
+    after firewall
+}
+
+stop() {
+    ebegin "Stopping rclone mount ${remote}"
+    /bin/umount -l ${path} 2>/dev/null || /usr/bin/fusermount3 -u ${path} 2>/dev/null
+    start-stop-daemon --stop --pidfile "\$pidfile"
+    eend \$?
+}
 EOF
 
-    sudo systemctl daemon-reload
-    sudo systemctl enable rclone-mount@${remote}
-    sudo systemctl start rclone-mount@${remote}
+    sudo chmod +x "$service_file"
     
-    sleep 1.5
-    if systemctl is-active --quiet "rclone-mount@${remote}"; then
-        echo -e "${GREEN}✅ $remote 已成功挂载到 $path，且已妥善配置守护及开机自启动！${RESET}"
+    # 启动并配置开机自启
+    sudo rc-update add rclone-mount.${remote} default
+    sudo rc-service rclone-mount.${remote} restart
+    
+    echo "正在等待挂载启动..."
+    sleep 3
+    
+    # 验证运行状态
+    if sudo rc-service rclone-mount.${remote} status | grep -q "started"; then
+        echo -e "${GREEN}✅ 已成功将网盘 [${mount_source}] 挂载到本地 [${path}]！${RESET}"
+        echo -e "${GREEN}⚙️ Alpine OpenRC 开机自启动守护已妥善配置。可以使用 'df -h' 查看状态。${RESET}"
     else
-        echo -e "${RED}❌ 挂载启动失败，请检查报错日志: $LOG_DIR/rclone_${remote}_sys.log${RESET}"
+        echo -e "${RED}❌ 挂载启动失败！${RESET}"
+        echo -e "${RED}请运行以下命令查看具体报错日志:${RESET}"
+        echo -e "${YELLOW}tail -n 20 $LOG_DIR/rclone_${remote}_sys.log${RESET}"
     fi
 }
 
 unmount_remote_by_name() {
-    read -p "请输入想要卸载的远程网盘名称: " remote
+    read -p "请输入想要卸载的Rclone创建的网盘名称 (如 CF): " remote
     [ -z "$remote" ] && return
     
-    local svc="rclone-mount@${remote}"
-    
-    if [ -f "/etc/systemd/system/${svc}.service" ] || systemctl list-unit-files | grep -q "^${svc}"; then
-        echo -e "${YELLOW}正在停止并移除 [${remote}] 的开机自启动守护服务...${RESET}"
-        sudo systemctl stop "$svc" 2>/dev/null
-        sudo systemctl disable "$svc" 2>/dev/null
-        sudo rm -f "/etc/systemd/system/${svc}.service"
-        sudo systemctl daemon-reload
+    local service_file="/etc/init.d/rclone-mount.${remote}"
+    local path="/mnt/${remote}"
+
+    # 停止并移除 OpenRC 自启服务
+    if [ -f "$service_file" ]; then
+        echo -e "${YELLOW}正在停止并移除 [${remote}] 的开机自启动 OpenRC 守护服务...${RESET}"
+        sudo rc-service rclone-mount.${remote} stop 2>/dev/null
+        sudo rc-update del rclone-mount.${remote} default 2>/dev/null
+        sudo rm -f "$service_file"
     fi
 
-    sudo fusermount -u "/mnt/$remote" 2>/dev/null || sudo umount -l "/mnt/$remote" 2>/dev/null
-    [ -f "/var/run/rclone_${remote}.pid" ] && rm -f "/var/run/rclone_${remote}.pid"
-
-    echo -e "${GREEN}✅ 远程存储 ${remote} 卸载完成，且开机自启动已同步移除！${RESET}"
+    # 强行解除可能残留的网络挂载
+    echo -e "${YELLOW}正在解除潜在路径的网络挂载...${RESET}"
+    sudo umount -l "$path" 2>/dev/null || sudo umount -l "/mnt/${remote}"* 2>/dev/null
+    
+    echo -e "${GREEN}✅ 远程存储 ${remote} 卸载完成，自启同步移除！${RESET}"
 }
 
 unmount_all() {
     echo -e "${YELLOW}正在全面清空并移除所有网盘挂载与开机自启动...${RESET}"
     
-    local sys_services=$(systemctl list-units --type=service --plains --all | grep "rclone-mount@" | awk '{print $1}')
-    if [ -n "$sys_services" ]; then
-        for svc in $sys_services; do
-            echo -e "${CYAN} ➜ 正在清理服务: $svc${RESET}"
-            sudo systemctl stop "$svc" 2>/dev/null
-            sudo systemctl disable "$svc" 2>/dev/null
-            sudo rm -f "/etc/systemd/system/$svc"
+    # 扫描所有相关的 OpenRC 服务
+    local alpine_services=$(ls /etc/init.d/rclone-mount.* 2>/dev/null)
+    if [ -n "$alpine_services" ]; then
+        for svc_path in $alpine_services; do
+            local svc=$(basename "$svc_path")
+            echo -e "${CYAN} ➜ 正在彻底清理 OpenRC 服务: $svc${RESET}"
+            sudo rc-service "$svc" stop 2>/dev/null
+            sudo rc-update del "$svc" default 2>/dev/null
+            sudo rm -f "$svc_path"
         done
-        sudo systemctl daemon-reload
     fi
 
-    rm -f /var/run/rclone_*.pid
-
+    # 强行拆除所有挂载点
     local active_mounts=$(mount | grep -i "rclone" | awk '{print $3}')
     if [ -n "$active_mounts" ]; then
         echo "$active_mounts" | while read -r mnt; do
-            sudo fusermount -u "$mnt" 2>/dev/null || sudo umount -l "$mnt" 2>/dev/null
+            echo -e "${CYAN} ➜ 正在强制卸载网络目录: $mnt${RESET}"
+            sudo umount -l "$mnt" 2>/dev/null
         done
     fi
     echo -e "${GREEN}✅ 系统内所有 Rclone 挂载及相关自启服务已全部清洗完毕。${RESET}"
@@ -254,25 +309,21 @@ unmount_all() {
 # ================== 资产清单综合查看面板 ==================
 show_assets_manifest() {
     echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}       📁 Rclone 已创资产名称清单      ${RESET}"
+    echo -e "${GREEN}      📁 Rclone 已创资产名称清单      ${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
     
     # 1. 扫描已生成的自启动挂载服务
     echo -e "${CYAN}[1] 已创建的自启动挂载服务名字信息：${RESET}"
-    local service_files=$(ls /etc/systemd/system/rclone-mount@*.service 2>/dev/null)
+    local service_files=$(ls /etc/init.d/rclone-mount.* 2>/dev/null)
     if [ -n "$service_files" ]; then
-        echo "$service_files" | while read -r file; do
-            # 提取网盘名称
-            local r_name=$(basename "$file" | sed 's/rclone-mount@//;s/\.service//')
-            # 提取挂载路径
-            local m_path=$(grep -E '^ExecStart=' "$file" | awk '{print $4}')
-            # 检查当前是否在运行
-            if systemctl is-active --quiet "rclone-mount@${r_name}"; then
+        for file in $service_files; do
+            local r_name=$(basename "$file" | sed 's/rclone-mount.//')
+            if sudo rc-service "rclone-mount.${r_name}" status | grep -q "started"; then
                 local r_status="${GREEN}● 正在运行${RESET}"
             else
                 local r_status="${RED}○ 已停止${RESET}"
             fi
-            echo -e "  网盘名称: ${YELLOW}${r_name}${RESET}  |  挂载路径: ${YELLOW}${m_path}${RESET}  [${r_status}]"
+            echo -e "  网盘名称: ${YELLOW}${r_name}${RESET}  [${r_status}]"
         done
     else
         echo -e "  ${YELLOW}(暂无通过本脚本创建的挂载服务)${RESET}"
@@ -285,9 +336,7 @@ show_assets_manifest() {
     local cron_tasks=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX")
     if [ -n "$cron_tasks" ]; then
         echo "$cron_tasks" | while read -r line; do
-            # 提取任务唯一标识名
             local task_id=$(echo "$line" | awk -F "$CRON_PREFIX" '{print $2}')
-            # 提取运行周期表达式
             local cron_time=$(echo "$line" | awk -F "/opt/rclone_manager" '{print $1}')
             echo -e "  任务名字: ${YELLOW}${task_id}${RESET}  |  执行周期: ${YELLOW}${cron_time}${RESET}"
         done
@@ -299,20 +348,20 @@ show_assets_manifest() {
 
 # ================== 状态和日志查看 ==================
 view_mount_status() {
-    read -p "请输入想要查看状态的远程网盘名称: " remote
+    read -p "请输入想要查看状态的Rclone创建网盘名称: " remote
     [ -z "$remote" ] && return
-    local svc="rclone-mount@${remote}"
+    local svc="rclone-mount.${remote}"
     
-    if systemctl list-unit-files | grep -q "^${svc}"; then
-        echo -e "${CYAN}--- Systemd 状态服务信息 ---${RESET}"
-        sudo systemctl status "$svc"
+    if [ -f "/etc/init.d/${svc}" ]; then
+        echo -e "${CYAN}--- OpenRC 状态服务信息 ---${RESET}"
+        sudo rc-service "$svc" status
     else
-        echo -e "${RED}未找到该网盘 [${remote}] 对应的挂载守护服务，请确认名称是否正确。${RESET}"
+        echo -e "${RED}未找到该网盘 [${remote}] 对应的挂载守护服务。${RESET}"
     fi
 }
 
 view_mount_logs() {
-    read -p "请输入想要查看实时日志的远程网盘名称: " remote
+    read -p "想要查看实时日志，请输入Rclone创建的网盘名称: " remote
     [ -z "$remote" ] && return
     local log_file="$LOG_DIR/rclone_${remote}_sys.log"
     
@@ -326,7 +375,7 @@ view_mount_logs() {
 
 # ================== 高级定时任务管理面板 ==================
 show_cron_panel() {
-    TASK_COUNT=$(crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]' | wc -l)
+    local TASK_COUNT=$(crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep '[^\s]' | wc -l)
 
     echo -e "${GREEN}=======================================${RESET}"
     echo -e "${GREEN}        ◈  Cron 定时任务管理面板  ◈      ${RESET}"
@@ -337,9 +386,9 @@ show_cron_panel() {
     echo -e "${GREEN} 📋 当前系统定时任务快照：${RESET}"
     
     if [ "$TASK_COUNT" -gt 0 ]; then
-        crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]' | awk -v cyan="$CYAN" -v reset="$RESET" '{print "   " cyan "•" reset " " $0}'
+        crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep '[^\s]' | awk -v cyan="$CYAN" -v reset="$RESET" '{print "   " cyan "•" reset " " $0}'
     else
-        echo -e "   ${YELLOW}(暂无用户自定义的定时任务)${RESET}"
+        echo -e "    ${YELLOW}(暂无用户自定义的定时任务)${RESET}"
     fi
     
     echo -e "${GREEN}---------------------------------------${RESET}"
@@ -356,7 +405,7 @@ schedule_add() {
     read -p "任务唯一标识名 (英文字母): " TASK_NAME
     [ -z "$TASK_NAME" ] && return
     read -p "本地同步目录 (多个用空格隔开): " LOCAL_DIR
-    read -p "远程存储名称: " REMOTE_NAME
+    read -p "请输入Rclone创建的网盘名称: " REMOTE_NAME
     read -p "远程目标目录 (默认 backup): " REMOTE_DIR
     REMOTE_DIR=${REMOTE_DIR:-backup}
 
@@ -427,13 +476,13 @@ cron_task_menu() {
     while true; do
         clear
         show_cron_panel
-        read -ne choice_cron
+        read -p "$(echo -e ${GREEN}请输入定时任务选项数字: ${RESET})" choice_cron
         echo ""
         case $choice_cron in
             1) schedule_add ;;
             2) schedule_del_one ;;
             3) 
-                echo -e "${YELLOW}即将调用系统默认编辑器打开全局 Crontab。${RESET}"
+                echo -e "${YELLOW}即将打开全局 Crontab。${RESET}"
                 read -p "按回车键开始编辑..."
                 crontab -e 
                 ;;
@@ -448,7 +497,7 @@ cron_task_menu() {
 sync_local_to_remote_multi() {
     read -p "请输入本地目录路径（多个用空格分隔）: " local_dirs
     [ -z "$local_dirs" ] && return
-    read -p "请输入远程存储名称: " remote
+    read -p "请输入Rclone创建的网盘名称: " remote
     [ -z "$remote" ] && return
     read -p "请输入远程目标目录(默认 backup): " remote_dir
     remote_dir=${remote_dir:-backup}
@@ -476,7 +525,7 @@ sync_local_to_remote_multi() {
 }
 
 sync_remote_to_local() {
-    read -p "请输入远程名称: " remote
+    read -p "请输入Rclone创建的网盘名称: " remote
     [ -z "$remote" ] && return
     read -p "请输入远程备份目录 (例如 backup): " remote_dir
     read -p "请输入本地恢复目标目录: " local_dir

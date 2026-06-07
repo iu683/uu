@@ -1,430 +1,409 @@
 #!/bin/bash
+set -o pipefail
 
 #################################
-# 颜色
+# 环境变量 & 配置
 #################################
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root   # ⭐ 确保 cron 下 ~ 指向 root
+
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-#################################
-# 首次运行安装（下载到 /opt）
-#################################
+BASE_DIR="/opt/rsync_task"
 SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
-SCRIPT_PATH="/opt/vpsbackup/vpsbackup.sh"
+SCRIPT_PATH="$BASE_DIR/rsync_manager.sh"
+KEY_DIR="$BASE_DIR/keys"
+LOG_DIR="$BASE_DIR/logs"
+CONFIG_FILE="$BASE_DIR/rsync_tasks.conf"
+TG_CONFIG="$BASE_DIR/.tg.conf"
+BIN_LINK_DIR="/usr/local/bin"
 
-if [ ! -f "$SCRIPT_PATH" ]; then
-    mkdir -p /opt/vpsbackup
-    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL" || {
-        echo -e "${RED}下载失败${RESET}"
-        exit 1
-    }
-    chmod +x "$SCRIPT_PATH"
-    exec bash "$SCRIPT_PATH" "$@"
+mkdir -p "$BASE_DIR" "$KEY_DIR" "$LOG_DIR"
+touch "$CONFIG_FILE"
+
+# 动态精准识别系统环境 (完美兼容 Alpine)
+if [ -f /etc/alpine-release ]; then
+    OS="Alpine Linux $(cat /etc/alpine-release)"
+elif [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS="$NAME"
+else
+    OS=$(uname -s)
 fi
 
 #################################
-# 安装目录 & 备份目录
+# 稳定统计任务数量
 #################################
-BASE_DIR="/opt/vpsbackup"
-INSTALL_PATH="$BASE_DIR/vpsbackup.sh"
-BACKUP_DIR="$BASE_DIR/backups"
-TG_CONF="$BASE_DIR/.tg.conf"
-CONF_FILE="$BASE_DIR/.backup.conf"
-mkdir -p "$BACKUP_DIR"
-
-#################################
-# 默认配置
-#################################
-COMPRESS="tar"
-KEEP_DAYS=7
-SERVER_NAME=$(hostname)
-BACKUP_LIST="/opt"
-
-#################################
-# 读取/保存配置
-#################################
-load_conf(){
-    [ -f "$CONF_FILE" ] && source "$CONF_FILE"
-    [ -f "$TG_CONF" ] && source "$TG_CONF"
-    IFS=' ' read -r -a BACKUP_ARRAY <<< "${BACKUP_LIST:-/opt}"
+task_count() {
+    awk 'NF{c++} END{print c+0}' "$CONFIG_FILE"
 }
 
-save_conf(){
-cat > "$CONF_FILE" <<EOF
-COMPRESS="$COMPRESS"
-KEEP_DAYS=$KEEP_DAYS
-SERVER_NAME="$SERVER_NAME"
-BACKUP_LIST="$BACKUP_LIST"
-EOF
+cron_count() {
+    crontab -l 2>/dev/null | grep -c "# rsync_" || echo 0
 }
 
 #################################
-# Telegram通知
+# 安装依赖 (Alpine / Debian 双生态适配)
 #################################
-tg_send(){
-    [ -z "$BOT_TOKEN" ] && return
-
-    curl -s -X POST \
-    "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
-    -d chat_id="$CHAT_ID" \
-    -d text="$1" >/dev/null 2>&1
-}
-
-#################################
-# 日志
-#################################
-log(){
-    echo "$(date '+%F %T') $1" >> "$BASE_DIR/backup.log"
-}
-
-#################################
-# 清理旧备份
-#################################
-clean_old(){
-    if [ "$COMPRESS" = "tar" ]; then
-        find "$BACKUP_DIR" -name "*.tar.gz" -mtime +$KEEP_DAYS -delete 2>/dev/null
+install_dep() {
+    local pkgs="rsync openssh sshpass curl tar"
+    
+    if [ -f /etc/alpine-release ]; then
+        # Alpine 环境依赖精准注入
+        pkgs="rsync openssh-client sshpass curl tar bash"
+        for p in $pkgs; do
+            if ! command -v ${p%-*} &>/dev/null; then
+                echo -e "${YELLOW}正在为 Alpine 补充必要依赖: $p${RESET}"
+                apk update -q && apk add -q $p >/dev/null 2>&1
+            fi
+        done
     else
-        find "$BACKUP_DIR" -name "*.zip" -mtime +$KEEP_DAYS -delete 2>/dev/null
+        # Debian/Ubuntu 传统分支依赖注入
+        for p in rsync ssh sshpass curl tar; do
+            if ! command -v $p &>/dev/null; then
+                echo -e "${YELLOW}正在安装依赖: $p${RESET}"
+                DEBIAN_FRONTEND=noninteractive apt-get update -qq
+                DEBIAN_FRONTEND=noninteractive apt-get install -y $p >/dev/null 2>&1
+            fi
+        done
     fi
 }
+install_dep
 
 #################################
-# 备份核心（支持批量目录）
+# Telegram
 #################################
-backup_dirs(){
-    load_conf
-    TS=$(date +%Y%m%d%H%M%S)
-
-    dirs=("$@")
-    [ ${#dirs[@]} -eq 0 ] && dirs=("${BACKUP_ARRAY[@]}")
-
-    for p in "${dirs[@]}"; do
-        [ ! -d "$p" ] && continue
-        name=$(basename "$p")
-        rel="${p#/}"
-
-        if [ "$COMPRESS" = "tar" ]; then
-            file="${name}_${TS}.tar.gz"
-            tar -czf "$BACKUP_DIR/$file" -C / "$rel"
-        else
-            file="${name}_${TS}.zip"
-            (cd / && zip -rq "$BACKUP_DIR/$file" "$rel")
-        fi
-
-        if [ $? -eq 0 ]; then
-            echo -e "${GREEN}完成: $file${RESET}"
-            log "备份成功: $file"
-            tg_send "🟢 备份成功
-服务器: $SERVER_NAME
-目录: $p
-文件: $file"
-        else
-            log "备份失败: $file"
-            tg_send "🔴 备份失败
-服务器: $SERVER_NAME
-目录: $p"
-        fi
-    done
-
-    clean_old
+send_tg() {
+    [[ -f "$TG_CONFIG" ]] || return
+    . "$TG_CONFIG"   
+    msg="$1"
+    curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        -d chat_id="$CHAT_ID" \
+        -d text="[$VPS_NAME] $msg" >/dev/null 2>&1
 }
 
-#################################
-# 创建备份
-#################################
-create_backup(){
-    read -p "目录(空格分隔，回车使用默认): " input
-    if [ -z "$input" ]; then
-        backup_dirs
-    else
-        IFS=' ' read -r -a arr <<< "$input"
-        backup_dirs "${arr[@]}"
-    fi
-}
-
-#################################
-# 批量恢复
-#################################
-restore_backup(){
-    shopt -s nullglob
-    files=($(ls -1t "$BACKUP_DIR"/*.{tar.gz,zip} 2>/dev/null))
-    [ ${#files[@]} -eq 0 ] && { echo -e "${YELLOW}没有找到可恢复的备份文件。${RESET}"; return; }
-
-    for i in "${!files[@]}"; do
-        echo "$i) $(basename "${files[$i]}")"
-    done
-
-    read -p "选择编号(空格分隔多个): " input
-    IFS=' ' read -r -a choose <<< "$input"
-
-    for idx in "${choose[@]}"; do
-        f="${files[$idx]}"
-        if [[ "$f" == *.tar.gz ]]; then
-            tar -xzf "$f" -C /
-        else
-            unzip -oq "$f" -d /
-        fi
-    done
-}
-
-#################################
-# Telegram设置
-#################################
-set_tg(){
-    read -p "BOT_TOKEN: " BOT_TOKEN
-    read -p "CHAT_ID: " CHAT_ID
-    read -p "服务器名称: " SERVER_NAME
-
-cat > "$TG_CONF" <<EOF
+setup_tg() {
+    read -p "VPS名称: " VPS_NAME
+    read -p "Bot Token: " BOT_TOKEN
+    read -p "Chat ID: " CHAT_ID
+    cat > "$TG_CONFIG" <<EOF
+VPS_NAME="$VPS_NAME"
 BOT_TOKEN="$BOT_TOKEN"
 CHAT_ID="$CHAT_ID"
-SERVER_NAME="$SERVER_NAME"
 EOF
-
-    save_conf
+    chmod 600 "$TG_CONFIG"
+    echo -e "${GREEN}TG配置已保存${RESET}"
 }
 
 #################################
-# 压缩格式/保留天数
+# SSH 密钥管理
 #################################
-set_compress(){
-    echo "1 tar.gz"
-    echo "2 zip"
+generate_and_setup_ssh() {
+    local remote="$1"
+    local port="$2"
+
+    KEY_FILE="$KEY_DIR/id_rsa_rsync"
+    PUB_FILE="$KEY_FILE.pub"
+
+    if [[ ! -f "$KEY_FILE" ]]; then
+        echo -e "${YELLOW}未检测到本地 SSH 密钥，正在生成...${RESET}"
+        ssh-keygen -t rsa -b 4096 -f "$KEY_FILE" -N "" -q
+        echo -e "${GREEN}✅ 本地 SSH 密钥生成完成${RESET}"
+    fi
+
+    PUBKEY_CONTENT=$(cat "$PUB_FILE")
+
+    echo -e "${YELLOW}第一次连接需要输入远程密码${RESET}"
+
+    set +e
+    ssh-keygen -f "$HOME/.ssh/known_hosts" -R "${remote#*@}" >/dev/null 2>&1
+
+    # 首次连接自动接受 host key
+    ssh -o StrictHostKeyChecking=no -p "$port" "$remote" "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
+    ssh -o StrictHostKeyChecking=no -p "$port" "$remote" "touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+    ssh -o StrictHostKeyChecking=no -p "$port" "$remote" "grep -Fxq '$PUBKEY_CONTENT' ~/.ssh/authorized_keys || echo '$PUBKEY_CONTENT' >> ~/.ssh/authorized_keys"
+
+    # 测试免密
+    ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" -p "$port" "$remote" "echo ok" >/dev/null 2>&1
+    ok=$?
+    set -e
+
+    if [[ $ok -eq 0 ]]; then
+        echo -e "${GREEN}✅ 公钥写入成功，可免密码登录 $remote${RESET}"
+    else
+        echo -e "${RED}❌ 公钥写入失败，请检查 SSH 或密码是否正确${RESET}"
+    fi
+}
+
+#################################
+# 任务管理与快照预览
+#################################
+list_tasks() {
+    [[ ! -s "$CONFIG_FILE" ]] && { echo -e "${YELLOW}暂无任何同步任务${RESET}"; return; }
+    # 完美匹配快照预览输出
+    awk -F'|' -v YELLOW="$YELLOW" -v RESET="$RESET" -v GREEN="$GREEN" \
+    '{printf " " GREEN "•" RESET " " YELLOW "%-2d)" RESET " %-12s | 本地:%-15s -> 远端:%-15s [%s]\n", NR, $1, $2, $3, $5}' "$CONFIG_FILE"
+}
+
+add_task() {
+    read -p "任务名称: " name
+    read -p "本地目录: " local
+    read -p "远程目录: " remote_path
+    read -p "远程用户@IP: " remote
+    read -p "端口(默认22): " port
+    port=${port:-22}
+
+    echo "认证方式: 1密码 2密钥"
     read -p "选择: " c
-    [ "$c" = 2 ] && COMPRESS="zip" || COMPRESS="tar"
-    save_conf
+    if [[ $c == 1 ]]; then
+        read -s -p "密码: " secret; echo
+        auth="password"
+    else
+        generate_and_setup_ssh "$remote" "$port"
+        secret="$KEY_DIR/id_rsa_rsync"
+        auth="key"
+    fi
+
+    echo "$name|$local|$remote|$remote_path|$port|$auth|$secret" >> "$CONFIG_FILE"
+    echo -e "${GREEN}任务添加成功！${RESET}"
 }
 
-set_keep(){
-    read -p "保留天数: " KEEP_DAYS
-    save_conf
+delete_task() {
+    read -p "请输入要删除的任务编号: " n
+    if sed -n "${n}p" "$CONFIG_FILE" | grep -q '.*'; then
+        sed -i "${n}d" "$CONFIG_FILE"
+        echo -e "${GREEN}任务已删除。${RESET}"
+    else
+        echo -e "${RED}编号不存在。${RESET}"
+    fi
 }
 
 #################################
-# 获取系统与主菜单快照信息 (兼容 Alpine)
+# 压缩同步
 #################################
-CRON_TAG="# VPSBACKUP_AUTO"
+run_task() {
+    direction="$1"
+    num="$2"
 
-get_os_info() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS=$NAME
-    else
-        OS=$(uname -s)
+    if [[ -z "$num" ]]; then
+        read -p "请输入要执行的任务编号: " num
     fi
-}
 
-get_task_count() {
-    TASK_COUNT=$(crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep -c '[^\s]')
-}
+    task=$(sed -n "${num}p" "$CONFIG_FILE" | tr -d '\r\n')
 
-list_cron_snapshot() {
-    if [ "$TASK_COUNT" -gt 0 ]; then
-        crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]' | awk '{print "   • " $0}'
-    else
-        echo -e "   ${YELLOW}(暂无用户自定义的定时任务)${RESET}"
+    if [[ -z "$task" ]]; then
+        echo "任务编号 $num 不存在" >> "$LOG_DIR/error.log"
+        send_tg "同步失败：任务 $num 不存在 ❌"
+        return 1
     fi
-}
 
-get_script_tasks() {
-    lines=()
-    while read -r line; do
-        [ -n "$line" ] && lines+=("$line")
-    done < <(crontab -l 2>/dev/null | grep "$CRON_TAG")
-}
+    IFS='|' read -r name local remote remote_path port auth secret <<< "$task"
+    archive="/tmp/sync_task_${name}.tar.gz"
 
-# 专门为主菜单获取备份统计信息
-get_backup_stats() {
-    FILE_COUNT=$(ls -1 "$BACKUP_DIR" 2>/dev/null | grep -E '\.(tar\.gz|zip)$' | wc -l)
-    if [ -d "$BACKUP_DIR" ]; then
-        # Alpine 的 du -sh 语法兼容
-        DISK_USAGE=$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
-    else
-        DISK_USAGE="0B"
-    fi
-}
+    echo -e "${YELLOW}正在开始执行同步任务 [$name] ...${RESET}"
 
-# 专门为主菜单打印最新的 3 条备份文件快照
-list_backup_snapshot() {
-    if [ "$FILE_COUNT" -gt 0 ]; then
-        ls -1t "$BACKUP_DIR" 2>/dev/null | grep -E '\.(tar\.gz|zip)$' | head -n 3 | awk '{print "   • " $0}'
-        if [ "$FILE_COUNT" -gt 3 ]; then
-            echo -e "   ${YELLOW}... 还有 $((FILE_COUNT - 3)) 个备份文件未列出${RESET}"
+    if [[ "$direction" == "push" ]]; then
+        tar -czf "$archive" -C "$(dirname "$local")" "$(basename "$local")" || return 1
+
+        if [[ "$auth" == "password" ]]; then
+            sshpass -p "$secret" ssh -p $port $remote "mkdir -p $remote_path"
+            sshpass -p "$secret" rsync -az -e "ssh -p $port" "$archive" "$remote:$remote_path/"
+        else
+            ssh -i "$secret" -p $port $remote "mkdir -p $remote_path"
+            rsync -az -e "ssh -i $secret -p $port" "$archive" "$remote:$remote_path/"
         fi
+        
+        rm -f "$archive"
+        echo -e "${GREEN}✅ [$name] 推送完成${RESET}"
+        send_tg "$name 推送完成 ✅"
+        return 0
     else
-        echo -e "   ${YELLOW}(暂无本地备份文件)${RESET}"
+        if [[ "$auth" == "password" ]]; then
+            sshpass -p "$secret" rsync -az -e "ssh -p $port" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
+        else
+            rsync -az -e "ssh -i $secret -p $port" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
+        fi
+
+        if [ -f "/tmp/$(basename "$archive")" ]; then
+            rm -rf "$local"
+            mkdir -p "$local"
+            tar -xzf "/tmp/$(basename "$archive")" -C "$(dirname "$local")"
+            rm -f "/tmp/$(basename "$archive")"
+            echo -e "${GREEN}✅ [$name] 拉取同步恢复完成${RESET}"
+            send_tg "$name 拉取完成 ✅"
+        else
+            echo -e "${RED}❌ 拉取失败，远端未发现对应的压缩备份文件。${RESET}"
+            return 1
+        fi
     fi
+    return 0
+}
+
+batch_run() {
+    read -p "批量任务编号(多个逗号隔开，或输入 all): " nums
+    if [[ "$nums" == "all" ]]; then
+        count=$(task_count)
+        nums=$(seq 1 $count)
+    fi
+    OLDIFS=$IFS
+    IFS=','
+
+    for n in $nums; do
+        n=$(echo "$n" | tr -d '\r\n ')
+        [[ -n "$n" ]] && run_task "$1" "$n"
+    done
+
+    IFS=$OLDIFS
 }
 
 #################################
-# 定时任务二级菜单
+# 定时任务管理
 #################################
-schedule_add(){
-    echo -e "${GREEN}1 每天0点${RESET}"
-    echo -e "${GREEN}2 每周一0点${RESET}"
-    echo -e "${GREEN}3 每月1号${RESET}"
-    echo -e "${GREEN}4 自定义cron${RESET}"
-
-    read -p "选择: " t
-    case $t in
+schedule_task() {
+    echo -e "${GREEN}定时任务频率模板:${RESET}"
+    echo -e "  1) 每天0点"
+    echo -e "  2) 每周一0点"
+    echo -e "  3) 每月1号0点"
+    echo -e "  4) 自定义cron表达式"
+    read -p "选择模板: " tmpl
+    case $tmpl in
         1) cron="0 0 * * *" ;;
         2) cron="0 0 * * 1" ;;
         3) cron="0 0 1 * *" ;;
-        4) read -p "cron表达式: " cron ;;
-        *) return ;;
+        4) read -p "请输入标准cron表达式: " cron ;;
+        *) echo -e "${RED}无效选择${RESET}"; return ;;
     esac
 
-    read -p "备份目录(空格分隔, 留空使用默认): " dirs
-    if [ -n "$dirs" ]; then
-        (crontab -l 2>/dev/null; \
-         echo "$cron $INSTALL_PATH auto \"$dirs\" >> $BASE_DIR/cron.log 2>&1 $CRON_TAG") | crontab -
-    else
-        (crontab -l 2>/dev/null; \
-         echo "$cron $INSTALL_PATH auto >> $BASE_DIR/cron.log 2>&1 $CRON_TAG") | crontab -
+    read -p "请输入要绑定的任务编号(多个用逗号隔开，或输入 all): " nums
+    if [[ "$nums" == "all" ]]; then
+        count=$(task_count)
+        nums=$(seq 1 $count)
     fi
 
-    echo -e "${GREEN}添加成功，cron日志: $BASE_DIR/cron.log${RESET}"
+    OLDIFS=$IFS
+    IFS=','
+    for n in $nums; do
+        n=$(echo "$n" | tr -d '\r\n ')
+        [[ -z "$n" ]] && continue
+        job="$cron /bin/bash $SCRIPT_PATH auto push $n >> $LOG_DIR/cron_$n.log 2>&1 # rsync_$n"
+        crontab -l 2>/dev/null | grep -v "# rsync_$n" | { cat; echo "$job"; } | crontab -
+        echo -e "${GREEN}✅ 任务 $n 已成功挂载定时自动化守护${RESET}"
+    done
+    IFS=$OLDIFS
 }
 
-schedule_del_one(){
-    get_script_tasks
-    [ ${#lines[@]} -eq 0 ] && { echo -e "${YELLOW}没有找到通过本工具创建的定时任务。${RESET}"; return; }
-    
-    echo -e "${YELLOW}通过本工具创建的任务列表：${RESET}"
-    for i in "${!lines[@]}"; do
-        cron=$(echo "${lines[$i]}" | sed "s|$INSTALL_PATH auto.*||")
-        echo "$i) $cron"
+delete_schedule() {
+    read -p "请输入要取消定时的任务编号(多个用逗号隔开，或输入 all): " nums
+    if [[ "$nums" == "all" ]]; then
+        crontab -l 2>/dev/null | grep -v "# rsync_" | crontab -
+        echo -e "${YELLOW}✅ 已清空全部定时同步任务${RESET}"
+        return
+    fi
+    OLDIFS=$IFS
+    IFS=','
+    for n in $nums; do
+        n=$(echo "$n" | tr -d '\r\n ')
+        [[ -z "$n" ]] && continue
+        crontab -l 2>/dev/null | grep -v "# rsync_$n" | crontab -
+        echo -e "${YELLOW}✅ 任务 $n 的定时任务已成功卸载${RESET}"
     done
-
-    read -p "输入要删除的编号(空格分隔多个): " input
-    IFS=' ' read -r -a choose <<< "$input"
-    
-    for idx in "${choose[@]}"; do
-        unset 'lines[idx]'
-    done
-    
-    (crontab -l 2>/dev/null | grep -v "$CRON_TAG"; for l in "${lines[@]}"; do echo "$l"; done) | crontab
-    echo -e "${GREEN}选择的任务已成功删除${RESET}"
-}
-
-schedule_edit_manual(){
-    echo -e "${YELLOW}提示: 即将打开系统默认编辑器编辑 crontab 配置文件。${RESET}"
-    echo -e "${YELLOW}Alpine 默认使用 vi，保存退出后将自动生效。${RESET}"
-    read -p "按回车打开编辑器..."
-    crontab -e
-}
-
-schedule_menu(){
-    while true; do
-        clear
-        get_os_info
-        get_task_count
-        
-        echo -e "${GREEN}=======================================${RESET}"
-        echo -e "${GREEN}        ◈  Cron 定时任务管理面板  ◈      ${RESET}"
-        echo -e "${GREEN}=======================================${RESET}"
-        echo -e "${GREEN} 当前系统环境 : ${YELLOW}${OS}${RESET}"
-        echo -e "${GREEN} 活跃任务总数 : ${YELLOW}${TASK_COUNT} 条${RESET}"
-        echo -e "${GREEN}---------------------------------------${RESET}"
-        echo -e "${GREEN} 📋 当前系统定时任务快照：${RESET}"
-        
-        list_cron_snapshot
-        
-        echo -e "${GREEN}---------------------------------------${RESET}"
-        echo -e "${GREEN}  1) 快速添加定时任务(引导式)${RESET}"
-        echo -e "${GREEN}  2) 精准删除定时任务(支持多选)${RESET}"
-        echo -e "${GREEN}  3) 深度手动编辑任务(打开编辑器)${RESET}"
-        echo -e "${GREEN}---------------------------------------${RESET}"
-        echo -e "${GREEN}  0) 返回主菜单${RESET}"
-        echo -e "${GREEN}=======================================${RESET}"
-        
-        echo -ne "${GREEN} 请选择操作编号: ${RESET}"
-        read c
-        case $c in
-            1) schedule_add ;;
-            2) schedule_del_one ;;
-            3) schedule_edit_manual ;;
-            0) break ;;
-        esac
-        read -p "按回车继续..."
-    done
+    IFS=$OLDIFS
 }
 
 #################################
-# 卸载
+# 更新 & 卸载
 #################################
-uninstall(){
-    crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+update_self() {
+    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
+    chmod +x "$SCRIPT_PATH"
+    echo -e "${GREEN}管理面板已成功自我更新！${RESET}"
+}
+
+uninstall_self() {
+    crontab -l 2>/dev/null | grep -v "rsync_" | crontab - || true
     rm -rf "$BASE_DIR"
-    rm -f /usr/local/bin/vpsbackup
-    echo -e "${GREEN}已完全卸载${RESET}"
+    rm -f "$BIN_LINK_DIR/s" "$BIN_LINK_DIR/S"
+    echo -e "${RED}本同步工具及定时计划已彻底从当前系统卸载。${RESET}"
     exit
 }
 
 #################################
-# auto模式（cron专用）
+# Cron 自动运行
 #################################
-if [ "$1" = "auto" ]; then
-    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-    export HOME=/root
-    mkdir -p "$BACKUP_DIR"
-    load_conf
-
-    if [ "$2" ]; then
-        IFS=' ' read -r -a dirs <<< "$2"
-        backup_dirs "${dirs[@]}" >> "$BASE_DIR/cron.log" 2>&1
-    else
-        backup_dirs >> "$BASE_DIR/cron.log" 2>&1
-    fi
+if [[ "$1" == "auto" ]]; then
+    run_task "$2" "$3"
     exit
 fi
 
 #################################
-# 主菜单
+# 首次运行安装快捷命令
+#################################
+if [ ! -f "$SCRIPT_PATH" ]; then
+    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
+    chmod +x "$SCRIPT_PATH"
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/s"
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/S"
+    echo -e "${GREEN}✅ 安装完成${RESET}"
+    echo -e "${GREEN}✅ 快捷键已添加：s 或 S 可快速启动面板${RESET}"
+fi
+
+#################################
+# 主菜单循环 (完美套用高密度经典信息看板)
 #################################
 while true; do
     clear
-    load_conf
-    get_os_info
-    get_backup_stats
+    FILE_COUNT=$(task_count)
+    CRON_ACTIVE=$(cron_count)
     
-    # 修改后的主菜单：采用相同的拟真科技面板UI
     echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}        ◈  VPS 自动化备份管理系统  ◈      ${RESET}"
+    echo -e "${GREEN}       ◈  VPS 增量同步管理系统  ◈      ${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
     echo -e "${GREEN} 当前系统环境 : ${YELLOW}${OS}${RESET}"
-    echo -e "${GREEN} 备份文件总数 : ${YELLOW}${FILE_COUNT} 个 (${DISK_USAGE})${RESET}"
-    echo -e "${GREEN} 当前备份策略 : ${YELLOW}格式:${COMPRESS} | 保留:${KEEP_DAYS}天${RESET}"
+    echo -e "${GREEN} 活跃任务总数 : ${YELLOW}${FILE_COUNT} 个${RESET}"
+    echo -e "${GREEN} 守护时空计划 : ${YELLOW}${CRON_ACTIVE} 个定时任务正在运行${RESET}"
+    echo -e "${GREEN} 配置数据路径 : ${YELLOW}${BASE_DIR}${RESET}"
     echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN} 📦 当前本地历史备份快照(最新3条)：${RESET}"
+    echo -e "${GREEN} 📦 当前活动的同步任务通道快照预览：${RESET}"
     
-    list_backup_snapshot
+    list_tasks
     
     echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  1) 立即创建系统备份(支持多目录)${RESET}"
-    echo -e "${GREEN}  2) 批量恢复历史备份(引导式解压)${RESET}"
-    echo -e "${GREEN}  3) 配置 Telegram 机器人即时通知${RESET}"
-    echo -e "${GREEN}  4) 进入 Cron 定时任务管理面板${RESET}"
-    echo -e "${GREEN}  5) 修改备份压缩格式 (tar.gz/zip)${RESET}"
-    echo -e "${GREEN}  6) 修改历史备份保留天数${RESET}"
-    echo -e "${GREEN}  7) 彻底卸载本工具及定时任务${RESET}"
+    echo -e "${GREEN}  1) 添加全新远程同步传输任务${RESET}"
+    echo -e "${GREEN}  2) 移除既定的数据同步任务${RESET}"
+    echo -e "${GREEN}  3) 立即执行单点数据推流 (Push)${RESET}"
+    echo -e "${GREEN}  4) 立即执行单点镜像回拉 (Pull)${RESET}"
+    echo -e "${GREEN}  5) 批量触发多通道强力推流 (Batch)${RESET}"
+    echo -e "${GREEN}  6) 批量触发多通道同步拉回 (Batch)${RESET}"
+    echo -e "${GREEN}  7) 部署挂载 Cron 定时自动化任务${RESET}"
+    echo -e "${GREEN}  8) 卸载/剥离计划任务守护进程${RESET}"
+    echo -e "${GREEN}  9) 配置 Telegram 机器人即时通知${RESET}"
+    echo -e "${GREEN} 10) 在线获取重构并更新当前面板${RESET}"
+    echo -e "${GREEN} 11) 卸载本工具及注销全部系统环境${RESET}"
     echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  0) 退出系统${RESET}"
+    echo -e "${GREEN}  0) 退出面板${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
-
-    echo -ne "${GREEN} 请选择操作编号: ${RESET}"
-    read choice
+    
+    echo -ne "${GREEN}请选择操作编号 [0-11]: ${RESET}"
+    read -r choice
     case $choice in
-        1) create_backup ;;
-        2) restore_backup ;;
-        3) set_tg ;;
-        4) schedule_menu ;;
-        5) set_compress ;;
-        6) set_keep ;;
-        7) uninstall ;;
-        0) exit ;;
+        1) add_task ;;
+        2) delete_task ;;
+        3) run_task push ;;
+        4) run_task pull ;;
+        5) batch_run push ;;
+        6) batch_run pull ;;
+        7) schedule_task ;;
+        8) delete_schedule ;;
+        9) setup_tg ;;
+        10) update_self ;;
+        11) uninstall_self ;;
+        0)  exit 0 ;;
+        *) echo -e "${RED}❌ 无效选项，请输入正确的编号！${RESET}" ;;
     esac
-    read -p "回车继续..."
+    echo
+    echo -ne "${GREEN}按回车键刷新控制台数据矩阵... ${RESET}"
+    read -r
 done

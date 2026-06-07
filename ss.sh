@@ -1,167 +1,334 @@
 #!/bin/bash
-# ==========================================
-# 服务器一键重装系统工具
-# ==========================================
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-RESET="\033[0m"
+# 全局高优先环境变量配置
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-SCRIPT_URL="https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
+# 颜色控制
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m'
 
-clear
+CONFIG_FILE="/etc/snapshot_config.conf"
+ADMIN_SCRIPT="/usr/local/bin/bf_admin.sh"
+SERVICE_NAME="system-snapshot"
+LOG_FILE="/var/log/snapshot_info.log"
 
-echo -e "${GREEN}"
-echo "======================================"
-echo "         一键重装系统工具"
-echo "======================================"
-echo " 1. Windows 11 Enterprise LTSC 2024"
-echo " 2. Windows 10 Enterprise LTSC 2021"
-echo " 3. Windows Server 2022"
-echo " 4. Debian 11"
-echo " 5. Debian 12"
-echo " 6. Debian 13"
-echo " 7. Ubuntu 22.04"
-echo " 8. Ubuntu 24.04"
-echo " 9. Ubuntu 26.04"
-echo "10. Alpine 3.23"
-echo " 0. 退出"
-echo "======================================"
-echo -e "${RESET}"
-
-read -r -p $'\033[32m请选择系统 [0-10]: \033[0m' SYS_CHOICE
-
-if [[ "$SYS_CHOICE" == "0" ]]; then
-
-    exit 0
-fi
-
-# 基础配置输入
-read -p "请输入系统密码 (若使用SSH公钥登录，此处可直接回车): " SYS_PASS
-read -p "请输入自定义用户名 (默认root): " CUSTOM_USER
-read -p "请输入 SSH 公钥 (留空则不配置): " SSH_KEY
-
-# 核心逻辑：密码与公钥二选一校验
-if [[ -z "$SYS_PASS" && -z "$SSH_KEY" ]]; then
-    echo -e "${RED}错误：密码 和 SSH公钥 不能同时为空！${RESET}"
+if [ "$EUID" -ne 0 ]; then 
+    echo -e "${RED}错误: 请使用 root 权限运行此脚本。${NC}"
     exit 1
 fi
 
-read -p "请输入 SSH 端口 (默认 22): " SSH_PORT
-SSH_PORT=${SSH_PORT:-22}
+# ==============================================================================
+# 模块一：后端静默备份与远程传输逻辑
+# ==============================================================================
+run_backend_backup() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "错误: 配置文件不存在，请先进行安装与配置。"
+        exit 1
+    fi
+    source "$CONFIG_FILE"
+    TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+    mkdir -p "$BACKUP_DIR"
+    SNAPSHOT_FILE="$BACKUP_DIR/system_snapshot_${TIMESTAMP}.tar.gz"
+    FULL_REMOTE_PATH="$TARGET_BASE_DIR/$REMOTE_DIR_NAME"
 
-read -p "请输入 RDP 端口 (默认 3389): " RDP_PORT
-RDP_PORT=${RDP_PORT:-3389}
+    touch "$LOG_FILE"
+    log_info() { echo "$(date '+%F %T') [INFO] $1" >> "$LOG_FILE"; }
+    log_error() { echo "$(date '+%F %T') [ERROR] $1" >> "$LOG_FILE"; }
 
-# 动态构建 Linux 的附加参数
-EXTRA_ARGS=""
-if [[ -n "$CUSTOM_USER" ]]; then
-    EXTRA_ARGS="$EXTRA_ARGS --username $CUSTOM_USER"
-fi
-if [[ -n "$SSH_KEY" ]]; then
-    EXTRA_ARGS="$EXTRA_ARGS --ssh-key '$SSH_KEY'"
-fi
-if [[ -n "$SYS_PASS" ]]; then
-    EXTRA_ARGS="$EXTRA_ARGS --password $SYS_PASS"
-fi
+    log_info "========== 开始执行系统快照备份任务 =========="
+    curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" -d chat_id="$CHAT_ID" -d text="🔄 开始创建快照 | $REMOTE_DIR_NAME" &>/dev/null
 
-echo
-echo -e "${YELLOW}安装配置确认:${RESET}"
-if [[ "$SYS_CHOICE" =~ ^[1-3]$ ]]; then
-    echo "系统类型: Windows"
-    echo "用户名: Administrator"
-    echo "系统密码: ${SYS_PASS:-（未设置，请确保原镜像有默认密码）}"
-    echo "RDP 端口: $RDP_PORT"
-else
-    echo "系统类型: Linux / Alpine"
-    echo "用户名: ${CUSTOM_USER:-root}"
-    echo "系统密码: ${SYS_PASS:-（未设置，将使用公钥登录）}"
-    echo "SSH 端口: $SSH_PORT"
-    echo "SSH 公钥: ${SSH_KEY:0:30}...（截取显示）"
-fi
-echo
+    # 系统核心打包打包 (屏蔽无关动态目录及快照自身)
+    tar -czf "$SNAPSHOT_FILE" \
+      --exclude="/dev/*" --exclude="/proc/*" --exclude="/sys/*" --exclude="/tmp/*" --exclude="/run/*" \
+      --exclude="/mnt/*" --exclude="/media/*" --exclude="/lost+found" --exclude="/var/cache/*" \
+      --exclude="/var/tmp/*" --exclude="/var/log/*" --exclude="/var/lib/apt/lists/*" \
+      --exclude="${BACKUP_DIR}/*" \
+      /boot /etc /usr /var /root /home /opt /bin /sbin /lib /lib64 > /dev/null 2>&1
 
-read -p "确认开始重装系统？(y/N): " CONFIRM
-
-if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-    echo -e "${RED}操作已取消${RESET}"
+    if [ $? -eq 0 ] || [ -s "$SNAPSHOT_FILE" ]; then
+        SNAPSHOT_SIZE=$(du -h "$SNAPSHOT_FILE" | cut -f1)
+        log_info "本地快照创建成功，大小: $SNAPSHOT_SIZE"
+        
+        # 强制强行自动在远程创建多级目录
+        log_info "正在通过 SSH 自动创建远程多级备份目录结构..."
+        ssh -p "$SSH_PORT" -o ConnectTimeout=10 "$TARGET_USER@$TARGET_IP" "mkdir -p \"$FULL_REMOTE_PATH/system_snapshots\"" &>/dev/null
+        
+        # 使用高级 rsync 自动注入路径保障传输
+        log_info "正在通过 rsync 增量安全传输快照至远程服务器..."
+        rsync -avz --inplace --rsync-path="mkdir -p $FULL_REMOTE_PATH/system_snapshots && rsync" -e "ssh -p $SSH_PORT" "$SNAPSHOT_FILE" "$TARGET_USER@$TARGET_IP:$FULL_REMOTE_PATH/system_snapshots/" &>/dev/null
+        
+        if [ $? -eq 0 ]; then
+            log_info "远程同步成功！文件已安全留存远端。"
+            # 远端过期快照轮转清理
+            ssh -p "$SSH_PORT" "$TARGET_USER@$TARGET_IP" "find \"$FULL_REMOTE_PATH/system_snapshots\" -type f -name '*.tar.gz' -mtime +$REMOTE_SNAPSHOT_DAYS -delete" &>/dev/null
+        else
+            log_error "远程传输失败！请检查远程服务器剩余空间或网络。"
+        fi
+        
+        # 本地快照留存数量清理
+        find "$BACKUP_DIR" -maxdepth 1 -type f -name "system_snapshot_*.tar.gz" | sort -r | tail -n +$((LOCAL_SNAPSHOT_KEEP+1)) | xargs -r rm -f
+        log_info "过期快照轮转清理完毕。"
+        
+        curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" -d chat_id="$CHAT_ID" -d text="📸 快照成功: $SNAPSHOT_SIZE | $REMOTE_DIR_NAME" &>/dev/null
+        log_info "========== 快照备份任务顺利结束 =========="
+    else
+        log_error "快照打包失败！请检查本地落盘磁盘剩余空间！"
+    fi
     exit 0
+}
+
+# 检测通过参数调用触发后端（给 systemd 定时任务和后台触发调用）
+if [ "$1" == "--backend-run" ]; then
+    run_backend_backup
 fi
 
-echo -e "${GREEN}下载重装...${RESET}"
-wget -qO reinstall.sh "$SCRIPT_URL"
+# ==============================================================================
+# 模块二：前端交互式菜单与控制台逻辑
+# ==============================================================================
+read_with_default() {
+    local prompt="$1" local default_value="$2" local var_name="$3" local input_value
+    if [ -n "$default_value" ]; then
+        read -p "$(echo -e "${prompt} [当前值/默认: ${GREEN}${default_value}${NC}]: ")" input_value
+        if [ -z "$input_value" ]; then eval "$var_name=\"\$default_value\""; else eval "$var_name=\"\$input_value\""; fi
+    else
+        read -p "$(echo -e "${prompt}: ")" input_value
+        if [ -z "$input_value" ] && [ "$var_name" == "NEW_TARGET_USER" ]; then
+            eval "$var_name=\"root\""
+        else
+            while [ -z "$input_value" ]; do
+                echo -e "${RED}该项不能为空，请输入有效值${NC}"
+                read -p "$(echo -e "${prompt}: ")" input_value
+            done
+            eval "$var_name=\"\$input_value\""
+        fi
+    fi
+}
 
-if [[ ! -f reinstall.sh ]]; then
-    echo -e "${RED}下载失败，请检查网络或 URL 是否有效${RESET}"
-    exit 1
-fi
+load_config() { if [ -f "$CONFIG_FILE" ]; then source "$CONFIG_FILE"; fi; }
 
-chmod +x reinstall.sh
+draw_header() {
+    clear
+    echo -e "${BLUE}============================================================${NC}"
+    echo -e "${CYAN}            📸  Linux 系统快照备份工具     ${NC}"
+    echo -e "${BLUE}============================================================${NC}"
+}
 
-# 执行重装逻辑
-case $SYS_CHOICE in
+show_status_and_info() {
+    load_config
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${YELLOW} 当前工具状态: 系统快照工具 [ 尚未安装 ] 或者是配置不完整。${NC}"
+        echo -e "------------------------------------------------------------"
+        return 1
+    fi
+    local timer_active="未激活" local timer_color=$RED
+    if systemctl is-active "${SERVICE_NAME}.timer" &>/dev/null; then timer_active="运行中 (Active)"; timer_color=$GREEN; fi
+    local last_run="无记录" local next_run="未安排"
+    if [ "$timer_color" == "$GREEN" ]; then
+        last_run=$(systemctl list-timers "${SERVICE_NAME}.timer" 2>/dev/null | grep "${SERVICE_NAME}" | awk '{print $1" "$2}')
+        next_run=$(systemctl list-timers "${SERVICE_NAME}.timer" 2>/dev/null | grep "${SERVICE_NAME}" | awk '{print $3" "$4}')
+    fi
+    local local_usage="0 MB" local local_count=0
+    if [ -d "$BACKUP_DIR" ]; then
+        local_count=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name "system_snapshot_*.tar.gz" | wc -l)
+        local_usage=$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
+    fi
+    echo -e "${PURPLE}[ 自动化运行状态 ]${NC}"
+    echo -e " 📅 定时任务状态: ${timer_color}${timer_active}${NC}"
+    echo -e " ⏱️ 上次执行时间: ${YELLOW}${last_run:-'暂无数据'}${NC}"
+    echo -e " 🚀 下次预计执行: ${GREEN}${next_run:-'暂无数据'}${NC}"
+    echo -e " ⏰ 备份间隔天数: 每 ${BACKUP_INTERVAL_DAYS:-'5'} 天自动触发一次"
+    echo -e "------------------------------------------------------------"
+    echo -e "${PURPLE}[ 核心配置与数据信息 ]${NC}"
+    echo -e " 🖥️ 本机标识名称: ${CYAN}${REMOTE_DIR_NAME:-'未配置'}${NC}"
+    echo -e " 🌐 远程存储目标: ${CYAN}${TARGET_USER:-'N/A'}@${TARGET_IP:-'N/A'}:${SSH_PORT:-'22'}${NC}"
+    echo -e " 📂 远程基础路径: ${CYAN}${TARGET_BASE_DIR:-'未配置'}${NC}"
+    echo -e " 💾 本地备份目录: ${CYAN}${BACKUP_DIR:-'/backups'} ${NC}(共 ${GREEN}${local_count}${NC} 个快照, 占用 ${GREEN}${local_usage}${NC})"
+    echo -e " 🗄️ 轮转策略留存: 本地 ${YELLOW}${LOCAL_SNAPSHOT_KEEP:-'2'}${NC} 个 | 远程 ${YELLOW}${REMOTE_SNAPSHOT_DAYS:-'15'}${NC} 天"
+    echo -e "${BLUE}============================================================${NC}"
+    return 0
+}
 
-1)
-bash reinstall.sh windows \
---image-name "Windows 11 Enterprise LTSC 2024" \
---lang zh-cn \
---password "$SYS_PASS" \
---rdp-port "$RDP_PORT"
-;;
+check_requirements() {
+    for cmd in curl ssh rsync tar hostname ssh-copy-id sshpass; do
+        if ! command -v $cmd &> /dev/null; then
+            if command -v apt-get &> /dev/null; then apt-get update && apt-get install -y $cmd &>/dev/null
+            elif command -v dnf &> /dev/null; then dnf install -y $cmd &>/dev/null
+            elif command -v yum &> /dev/null; then yum install -y $cmd &>/dev/null
+            fi
+        fi
+    done
+}
 
-2)
-bash reinstall.sh windows \
---image-name "Windows 10 Enterprise LTSC 2021" \
---lang zh-cn \
---password "$SYS_PASS" \
---rdp-port "$RDP_PORT"
-;;
+auto_copy_ssh_key() {
+    local ip="$1" local user="$2" local port="$3"
+    if [ ! -f "/root/.ssh/id_rsa" ]; then
+        mkdir -p /root/.ssh && chmod 700 /root/.ssh
+        ssh-keygen -t rsa -b 4096 -N "" -f /root/.ssh/id_rsa -q
+    fi
+    echo -e "\n${YELLOW}🔑 正在进行远程服务器 SSH 免密密钥授信...${NC}"
+    ssh -p "$port" -o ConnectTimeout=3 -o PasswordAuthentication=no -o StrictHostKeyChecking=no "$user@$ip" "echo 'OK'" &>/dev/null
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✓ 检测到当前机器与远程服务器已处于免密互信状态，跳过密钥传输。${NC}"
+        return 0
+    fi
+    echo -e "${CYAN}提示: 接下来需要输入一次远程服务器 [ $user@$ip ] 的 SSH 登录密码以完成密钥复制。${NC}"
+    read -s -p "请输入远程服务器密码: " REMOTE_PWD
+    echo ""
+    if [ -z "$REMOTE_PWD" ]; then return 1; fi
+    export SSHPASS="$REMOTE_PWD"
+    sshpass -e ssh-copy-id -p "$port" -o StrictHostKeyChecking=no "$user@$ip" &>/dev/null
+    local copy_status=$?
+    unset SSHPASS
+    return $copy_status
+}
 
-3)
-bash reinstall.sh windows \
---image-name "Windows Server 2022" \
---lang zh-cn \
---password "$SYS_PASS" \
---rdp-port "$RDP_PORT"
-;;
+setup_systemd_timer() {
+    cat > "/etc/systemd/system/system-snapshot.service" << EOFSERVICE
+[Unit]
+Description=System Snapshot Backup Service
+After=network.target
+[Service]
+Type=oneshot
+ExecStart=$ADMIN_SCRIPT --backend-run
+WorkingDirectory=/tmp
+EOFSERVICE
 
-4)
-bash reinstall.sh debian 11 --ssh-port "$SSH_PORT" $EXTRA_ARGS
-;;
+    cat > "/etc/systemd/system/system-snapshot.timer" << EOFTIMER
+[Unit]
+Description=Run System Snapshot Every ${NEW_BACKUP_INTERVAL_DAYS} Days
+[Timer]
+OnCalendar=*-*-1/${NEW_BACKUP_INTERVAL_DAYS} 00:00:00
+RandomizedDelaySec=4h
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOFTIMER
 
-5)
-bash reinstall.sh debian 12 --ssh-port "$SSH_PORT" $EXTRA_ARGS
-;;
+    chmod 644 /etc/systemd/system/system-snapshot.*
+    systemctl daemon-reload
+    systemctl enable "system-snapshot.timer" &>/dev/null
+    systemctl restart "system-snapshot.timer" &>/dev/null
+}
 
-6)
-bash reinstall.sh debian 13 --ssh-port "$SSH_PORT" $EXTRA_ARGS
-;;
+configure_project() {
+    load_config
+    check_requirements
+    if [ -f "$CONFIG_FILE" ]; then echo -e "${YELLOW}💡 进入【修改配置模式】。回车直接保留原当前值：${NC}\n"
+    else echo -e "${YELLOW}🚀 进入【首次安装配置向导】。请输入以下参数：${NC}\n"; fi
 
-7)
-bash reinstall.sh ubuntu 22.04 --ssh-port "$SSH_PORT" $EXTRA_ARGS
-;;
+    read_with_default "请输入 Telegram Bot Token" "$BOT_TOKEN" NEW_BOT_TOKEN
+    read_with_default "请输入 Telegram Chat ID" "$CHAT_ID" NEW_CHAT_ID
+    echo
+    read_with_default "请输入远程服务器 IP 地址" "$TARGET_IP" NEW_TARGET_IP
+    read_with_default "请输入远程服务器用户名 (默认: root)" "${TARGET_USER:-root}" NEW_TARGET_USER
+    read_with_default "请输入 SSH 连接端口" "${SSH_PORT:-22}" NEW_SSH_PORT
+    echo
+    auto_copy_ssh_key "$NEW_TARGET_IP" "$NEW_TARGET_USER" "$NEW_SSH_PORT"
+    echo
+    read_with_default "请输入远程基础备份目录" "${TARGET_BASE_DIR:-/root/remote_backup}" NEW_TARGET_BASE_DIR
+    local current_hostname=$(hostname)
+    read_with_default "请输入本机在远程的子目录名" "${REMOTE_DIR_NAME:-$current_hostname}" NEW_REMOTE_DIR_NAME
+    echo
+    read_with_default "请输入本地快照落盘目录" "${BACKUP_DIR:-/backups}" NEW_BACKUP_DIR
+    echo
+    read_with_default "请输入本地最大保留快照数量(个)" "${LOCAL_SNAPSHOT_KEEP:-2}" NEW_LOCAL_SNAPSHOT_KEEP
+    read_with_default "请输入远程快照过期删除时间(天)" "${REMOTE_SNAPSHOT_DAYS:-15}" NEW_REMOTE_SNAPSHOT_DAYS
+    echo
+    read_with_default "请输入备份执行间隔天数(1-30天)" "${BACKUP_INTERVAL_DAYS:-5}" NEW_BACKUP_INTERVAL_DAYS
+    
+    mkdir -p "$NEW_BACKUP_DIR"
+    cat > "$CONFIG_FILE" << EOF
+#!/bin/bash
+BOT_TOKEN="$NEW_BOT_TOKEN"
+CHAT_ID="$NEW_CHAT_ID"
+TARGET_IP="$NEW_TARGET_IP"
+TARGET_USER="$NEW_TARGET_USER"
+SSH_PORT="$NEW_SSH_PORT"
+TARGET_BASE_DIR="$NEW_TARGET_BASE_DIR"
+REMOTE_DIR_NAME="$NEW_REMOTE_DIR_NAME"
+BACKUP_DIR="$NEW_BACKUP_DIR"
+LOCAL_SNAPSHOT_KEEP=$NEW_LOCAL_SNAPSHOT_KEEP
+REMOTE_SNAPSHOT_DAYS=$NEW_REMOTE_SNAPSHOT_DAYS
+BACKUP_INTERVAL_DAYS=$NEW_BACKUP_INTERVAL_DAYS
+EOF
+    chmod 600 "$CONFIG_FILE"
+    
+    # 刷新并建立自动化定时器
+    setup_systemd_timer
+    
+    echo -e "\n${GREEN}✓ 全新配置和 Systemd 自动化定时任务已同步刷新并生效！${NC}"
+    read -p "按任意键返回主菜单..." -n 1
+}
 
-8)
-bash reinstall.sh ubuntu 24.04 --ssh-port "$SSH_PORT" $EXTRA_ARGS
-;;
+action_manual_backup() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}错误: 请先进行配置再执行此操作。${NC}"; else
+        echo -e "\n${YELLOW}正在触发后端快照打包与多级远程传输进程，请稍候...${NC}"
+        $ADMIN_SCRIPT --backend-run
+        echo -e "${GREEN}✓ 手动执行完结。${NC}"
+    fi
+    read -p "按任意键返回主菜单..." -n 1
+}
 
-9)
-bash reinstall.sh ubuntu 26.04 --ssh-port "$SSH_PORT" $EXTRA_ARGS
-;;
+action_view_logs() {
+    if [ -f "$LOG_FILE" ]; then 
+        echo -e "\n${YELLOW}正在加载最近的 15 条备份流日志：${NC}"
+        tail -n 15 "$LOG_FILE"
+    else echo -e "${YELLOW}暂无备份任务的日志流产生。${NC}"; fi
+    read -p "按任意键返回主菜单..." -n 1
+}
 
-10)
-bash reinstall.sh alpine 3.23 --ssh-port "$SSH_PORT" $EXTRA_ARGS
-;;
+uninstall_project() {
+    systemctl stop system-snapshot.timer 2>/dev/null
+    systemctl disable system-snapshot.timer 2>/dev/null
+    rm -f /etc/systemd/system/system-snapshot.*
+    systemctl daemon-reload
+    rm -f "$CONFIG_FILE" /usr/bin/bf /usr/local/bin/bf "$ADMIN_SCRIPT"
+    echo -e "${GREEN}✓ 快照工具及其快捷指令已从本机完全干净卸载。${NC}"
+    exit 0
+}
 
-*)
-echo -e "${RED}无效选项${RESET}"
-exit 1
-;;
+ensure_admin_symlink() {
+    # 强制在全域可执行目录下维持快捷方式 bf 链接
+    if [ ! -L "/usr/bin/bf" ] || [ ! -L "/usr/local/bin/bf" ]; then
+        rm -f /usr/bin/bf /usr/local/bin/bf
+        ln -sf "$ADMIN_SCRIPT" /usr/bin/bf 2>/dev/null
+        ln -sf "$ADMIN_SCRIPT" /usr/local/bin/bf 2>/dev/null
+    fi
+}
 
-esac
+menu_loop() {
+    ensure_admin_symlink
+    while true; do
+        draw_header
+        show_status_and_info
+        local is_installed=$?
+        if [ $is_installed -eq 1 ]; then
+            echo -e "  [1] 📥 ${GREEN}首次安装并配置系统快照工具${NC}"
+            echo -e "  [5] ❌ 退出管理控制台"
+            read -p " 请选择操作编号 [1/5]: " choice
+        else
+            echo -e "  [1] ⚙️  ${YELLOW}修改核心参数配置${NC}"
+            echo -e "  [2] 🚀 立即手动触发执行一次系统快照${NC}"
+            echo -e "  [3] 📝 查看系统备份日志流明细${NC}"
+            echo -e "  [4] 🗑️  ${RED}从本机彻底卸载该备份工具${NC}"
+            echo -e "  [5] ❌ 退出管理控制台"
+            read -p " 请选择操作编号 [1-5]: " choice
+        fi
+        case $choice in
+            1) configure_project ;;
+            2) action_manual_backup ;;
+            3) action_view_logs ;;
+            4) uninstall_project ;;
+            5) exit 0 ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
 
-echo
-echo -e "${GREEN}系统安装命令已执行，5秒后自动重启...${RESET}"
-sleep 5
-reboot
+menu_loop

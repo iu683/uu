@@ -1,335 +1,409 @@
 #!/bin/bash
+set -o pipefail
 
-# ========================================
-# Croc 文件传输一键安装与使用脚本
-# ========================================
+#################################
+# 环境变量 & 配置
+#################################
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root   # ⭐ 确保 cron 下 ~ 指向 root
 
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-# 初始化本地配置文件路径
-CONF_FILE="/opt/vpsbackup/.croc_env.conf"
-mkdir -p /opt/vpsbackup
+BASE_DIR="/opt/rsync_task"
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/nn.sh"
+SCRIPT_PATH="$BASE_DIR/rsync_manager.sh"
+KEY_DIR="$BASE_DIR/keys"
+LOG_DIR="$BASE_DIR/logs"
+CONFIG_FILE="$BASE_DIR/rsync_tasks.conf"
+TG_CONFIG="$BASE_DIR/.tg.conf"
+BIN_LINK_DIR="/usr/local/bin"
 
-# 默认下载/输出目录（如果配置文件不存在则采用当前目录）
-DEFAULT_OUT_DIR="."
+mkdir -p "$BASE_DIR" "$KEY_DIR" "$LOG_DIR"
+touch "$CONFIG_FILE"
 
-# 读取持久化配置
-load_config() {
-    if [ -f "$CONF_FILE" ]; then
-        source "$CONF_FILE"
-    fi
-    # 确保变量有默认值
-    OUT_DIR="${OUT_DIR:-$DEFAULT_OUT_DIR}"
+# 动态精准识别系统环境 (完美兼容 Alpine)
+if [ -f /etc/alpine-release ]; then
+    OS="Alpine Linux $(cat /etc/alpine-release)"
+elif [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS="$NAME"
+else
+    OS=$(uname -s)
+fi
+
+#################################
+# 稳定统计任务数量
+#################################
+task_count() {
+    awk 'NF{c++} END{print c+0}' "$CONFIG_FILE"
 }
 
-# 保存持久化配置
-save_config() {
-cat > "$CONF_FILE" <<EOF
-OUT_DIR="$OUT_DIR"
-EOF
+cron_count() {
+    crontab -l 2>/dev/null | grep -c "# rsync_" || echo 0
 }
 
-# 获取系统与Croc状态信息
-get_system_env() {
-    load_config
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS=$NAME
-    else
-        OS=$(uname -s)
-    fi
-
-    if command -v croc &>/dev/null; then
-        CURRENT_VERSION=$(croc --version 2>/dev/null | awk '{print $3}')
-        CROC_STATUS="${GREEN}已安装 (${RESET}${CURRENT_VERSION}${GREEN})${RESET}"
-    else
-        CROC_STATUS="${RED}未安装${RESET}"
-    fi
-}
-
-# 核心下载与提取逻辑 (内部复用)
-download_and_extract() {
-    local target_version="$1"
+#################################
+# 安装依赖 (Alpine / Debian 双生态适配)
+#################################
+install_dep() {
+    local pkgs="rsync openssh sshpass curl tar"
     
     if [ -f /etc/alpine-release ]; then
-        echo -e "${YELLOW}➔ 检测到 Alpine Linux，自动安装基础组件...${RESET}"
-        apk update && apk add curl tar coreutils >/dev/null 2>&1
-    elif [ -f /etc/debian_version ]; then
-        echo -e "${YELLOW}➔ 检测到 Ubuntu/Debian/Debian系，确保 curl 和 tar 正常...${RESET}"
-        apt-get update && apt-get install -y curl tar >/dev/null 2>&1
+        # Alpine 环境依赖精准注入
+        pkgs="rsync openssh-client sshpass curl tar bash"
+        for p in $pkgs; do
+            if ! command -v ${p%-*} &>/dev/null; then
+                echo -e "${YELLOW}正在为 Alpine 补充必要依赖: $p${RESET}"
+                apk update -q && apk add -q $p >/dev/null 2>&1
+            fi
+        done
+    else
+        # Debian/Ubuntu 传统分支依赖注入
+        for p in rsync ssh sshpass curl tar; do
+            if ! command -v $p &>/dev/null; then
+                echo -e "${YELLOW}正在安装依赖: $p${RESET}"
+                DEBIAN_FRONTEND=noninteractive apt-get update -qq
+                DEBIAN_FRONTEND=noninteractive apt-get install -y $p >/dev/null 2>&1
+            fi
+        done
+    fi
+}
+install_dep
+
+#################################
+# Telegram
+#################################
+send_tg() {
+    [[ -f "$TG_CONFIG" ]] || return
+    . "$TG_CONFIG"   
+    msg="$1"
+    curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        -d chat_id="$CHAT_ID" \
+        -d text="[$VPS_NAME] $msg" >/dev/null 2>&1
+}
+
+setup_tg() {
+    read -p "VPS名称: " VPS_NAME
+    read -p "Bot Token: " BOT_TOKEN
+    read -p "Chat ID: " CHAT_ID
+    cat > "$TG_CONFIG" <<EOF
+VPS_NAME="$VPS_NAME"
+BOT_TOKEN="$BOT_TOKEN"
+CHAT_ID="$CHAT_ID"
+EOF
+    chmod 600 "$TG_CONFIG"
+    echo -e "${GREEN}TG配置已保存${RESET}"
+}
+
+#################################
+# SSH 密钥管理
+#################################
+generate_and_setup_ssh() {
+    local remote="$1"
+    local port="$2"
+
+    KEY_FILE="$KEY_DIR/id_rsa_rsync"
+    PUB_FILE="$KEY_FILE.pub"
+
+    if [[ ! -f "$KEY_FILE" ]]; then
+        echo -e "${YELLOW}未检测到本地 SSH 密钥，正在生成...${RESET}"
+        ssh-keygen -t rsa -b 4096 -f "$KEY_FILE" -N "" -q
+        echo -e "${GREEN}✅ 本地 SSH 密钥生成完成${RESET}"
     fi
 
-    if [[ "$OSTYPE" == "linux-gnu"* ]] || [ -f /etc/alpine-release ] || [[ "$OSTYPE" == "freebsd"* ]]; then
-        ARCH=$(uname -m)
-        SYS_TYPE="Linux"
-        [[ "$OSTYPE" == "freebsd"* ]] && SYS_TYPE="FreeBSD"
+    PUBKEY_CONTENT=$(cat "$PUB_FILE")
 
-        case "$ARCH" in
-            x86_64)       ARCH_TAG="64bit" ;;
-            i386|i686)    ARCH_TAG="32bit" ;;
-            aarch64|arm64) ARCH_TAG="ARM64" ;;
-            armv5*)       ARCH_TAG="ARMv5" ;;
-            arm*)         ARCH_TAG="ARM" ;;
-            riscv64)      ARCH_TAG="RISCV64" ;;
-            *)            ARCH_TAG="64bit" ;;
-        esac
+    echo -e "${YELLOW}第一次连接需要输入远程密码${RESET}"
 
-        echo -e "${YELLOW}➔ 正在直连 GitHub 下载静态编译包 [${SYS_TYPE} ${ARCH_TAG}]...${RESET}"
-        
-        TMP_DIR=$(mktemp -d)
-        cd "$TMP_DIR" || return
-        
-        DOWNLOAD_URL="https://github.com/schollz/croc/releases/download/${target_version}/croc_${target_version}_${SYS_TYPE}-${ARCH_TAG}.tar.gz"
-        curl -fsSL "$DOWNLOAD_URL" -o croc.tar.gz
-        
-        if [ $? -eq 0 ] && [ -s croc.tar.gz ]; then
-            tar -xzf croc.tar.gz croc 2>/dev/null
-            if [ -f croc ]; then
-                chmod +x croc
-                mv -f croc /usr/local/bin/
-                DOWNLOAD_SUCCESS=0
-            else
-                DOWNLOAD_SUCCESS=1
-            fi
-        else
-            DOWNLOAD_SUCCESS=1
-        fi
-        
-        cd - >/dev/null && rm -rf "$TMP_DIR"
-        return $DOWNLOAD_SUCCESS
+    set +e
+    ssh-keygen -f "$HOME/.ssh/known_hosts" -R "${remote#*@}" >/dev/null 2>&1
 
-    elif [[ "$OSTYPE" == "darwin"* ]]; then
-        if command -v brew &>/dev/null; then
-            brew install croc
-            return 0
-        else
-            echo -e "${RED}❌ 未检测到 Homebrew，请先安装 Homebrew 再重试。${RESET}"
-            return 1
-        fi
+    # 首次连接自动接受 host key
+    ssh -o StrictHostKeyChecking=no -p "$port" "$remote" "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
+    ssh -o StrictHostKeyChecking=no -p "$port" "$remote" "touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+    ssh -o StrictHostKeyChecking=no -p "$port" "$remote" "grep -Fxq '$PUBKEY_CONTENT' ~/.ssh/authorized_keys || echo '$PUBKEY_CONTENT' >> ~/.ssh/authorized_keys"
+
+    # 测试免密
+    ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" -p "$port" "$remote" "echo ok" >/dev/null 2>&1
+    ok=$?
+    set -e
+
+    if [[ $ok -eq 0 ]]; then
+        echo -e "${GREEN}✅ 公钥写入成功，可免密码登录 $remote${RESET}"
     else
-        echo -e "${RED}❌ 不支持的系统架构: $OSTYPE${RESET}"
+        echo -e "${RED}❌ 公钥写入失败，请检查 SSH 或密码是否正确${RESET}"
+    fi
+}
+
+#################################
+# 任务管理与快照预览
+#################################
+list_tasks() {
+    [[ ! -s "$CONFIG_FILE" ]] && { echo -e "${YELLOW}暂无任何同步任务${RESET}"; return; }
+    # 完美匹配快照预览输出
+    awk -F'|' -v YELLOW="$YELLOW" -v RESET="$RESET" -v GREEN="$GREEN" \
+    '{printf " " GREEN "•" RESET " " YELLOW "%-2d)" RESET " %-12s | 本地:%-15s -> 远端:%-15s [%s]\n", NR, $1, $2, $3, $5}' "$CONFIG_FILE"
+}
+
+add_task() {
+    read -p "任务名称: " name
+    read -p "本地目录: " local
+    read -p "远程目录: " remote_path
+    read -p "远程用户@IP: " remote
+    read -p "端口(默认22): " port
+    port=${port:-22}
+
+    echo "认证方式: 1密码 2密钥"
+    read -p "选择: " c
+    if [[ $c == 1 ]]; then
+        read -s -p "密码: " secret; echo
+        auth="password"
+    else
+        generate_and_setup_ssh "$remote" "$port"
+        secret="$KEY_DIR/id_rsa_rsync"
+        auth="key"
+    fi
+
+    echo "$name|$local|$remote|$remote_path|$port|$auth|$secret" >> "$CONFIG_FILE"
+    echo -e "${GREEN}任务添加成功！${RESET}"
+}
+
+delete_task() {
+    read -p "请输入要删除的任务编号: " n
+    if sed -n "${n}p" "$CONFIG_FILE" | grep -q '.*'; then
+        sed -i "${n}d" "$CONFIG_FILE"
+        echo -e "${GREEN}任务已删除。${RESET}"
+    else
+        echo -e "${RED}编号不存在。${RESET}"
+    fi
+}
+
+#################################
+# 压缩同步
+#################################
+run_task() {
+    direction="$1"
+    num="$2"
+
+    if [[ -z "$num" ]]; then
+        read -p "请输入要执行的任务编号: " num
+    fi
+
+    task=$(sed -n "${num}p" "$CONFIG_FILE" | tr -d '\r\n')
+
+    if [[ -z "$task" ]]; then
+        echo "任务编号 $num 不存在" >> "$LOG_DIR/error.log"
+        send_tg "同步失败：任务 $num 不存在 ❌"
         return 1
     fi
-}
 
-# 1) 纯净全新安装
-install_croc() {
-    echo -e "${YELLOW}➔ 正在启动全新安装程序...${RESET}"
-    if command -v croc &>/dev/null; then
-        echo -e "${YELLOW}⚠️  系统已存在 Croc 组件，继续操作将覆盖现有版本。${RESET}"
-    fi
+    IFS='|' read -r name local remote remote_path port auth secret <<< "$task"
+    archive="/tmp/sync_task_${name}.tar.gz"
 
-    # 锁定当前已知稳定版
-    LATEST_VERSION="v10.4.4"
-    download_and_extract "$LATEST_VERSION"
-    
-    if [ $? -eq 0 ] && (command -v /usr/local/bin/croc &>/dev/null || command -v croc &>/dev/null); then
-        echo -e "${GREEN}🟢 Croc 核心传输组件全新安装成功！${RESET}"
-    else
-        echo -e "${RED}🔴 Croc 安装失败，请检查网络是否能正常直连 github.com。${RESET}"
-    fi
-    read -r -p "按回车返回主菜单..."
-}
+    echo -e "${YELLOW}正在开始执行同步任务 [$name] ...${RESET}"
 
-# 5) 独立在线检查更新
-update_croc() {
-    echo -e "${YELLOW}➔ 正在向 GitHub 发起版本合规性检查...${RESET}"
-    if ! command -v croc &>/dev/null; then
-        echo -e "${RED}❌ 错误：检测到系统尚未安装 Croc，请先选择选项 1 进行全新安装。${RESET}"
-        read -r -p "按回车返回..." ; return
-    fi
+    if [[ "$direction" == "push" ]]; then
+        tar -czf "$archive" -C "$(dirname "$local")" "$(basename "$local")" || return 1
 
-    # 获取云端最新 Tag
-    CLOUD_VERSION=$(curl -s https://api.github.com/repos/schollz/croc/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    if [ -z "$CLOUD_VERSION" ]; then
-        echo -e "${YELLOW}⚠️  在线获取最新版本失败，尝试强制拉取同步 v10.4.4 稳定版...${RESET}"
-        CLOUD_VERSION="v10.4.4"
-    fi
-
-    LOCAL_VERSION=$(croc --version 2>/dev/null | awk '{print $3}')
-    
-    echo -e "${GREEN}➔ 当前本地版本: ${YELLOW}${LOCAL_VERSION}${RESET}"
-    echo -e "${GREEN}➔ 官方云端版本: ${YELLOW}${CLOUD_VERSION}${RESET}"
-    echo -e "${GREEN}---------------------------------------${RESET}"
-
-    if [ "$LOCAL_VERSION" = "$CLOUD_VERSION" ]; then
-        echo -e "${GREEN}🟢 检测完毕：您当前已是官方最新版本，无需更新。${RESET}"
-    else
-        echo -e "${YELLOW}➔ 发现新版本！准备为您在线无感升级...${RESET}"
-        download_and_extract "$CLOUD_VERSION"
-        if [ $? -eq 0 ]; then
-            echo -e "${GREEN}🟢 Croc 成功升级至最新版本: ${YELLOW}${CLOUD_VERSION}${RESET}"
+        if [[ "$auth" == "password" ]]; then
+            sshpass -p "$secret" ssh -p $port $remote "mkdir -p $remote_path"
+            sshpass -p "$secret" rsync -az -e "ssh -p $port" "$archive" "$remote:$remote_path/"
         else
-            echo -e "${RED}🔴 升级失败，请检查网络直连环境。${RESET}"
-        fi
-    fi
-    read -r -p "按回车返回主菜单..."
-}
-
-# 7) 自定义设置输出文件夹
-set_output_dir() {
-    echo -e "${GREEN}当前设定的文件下载保存目录为: ${YELLOW}${OUT_DIR}${RESET}"
-    read -r -p "请输入新的保存路径 (支持绝对路径或 ~，留空回车取消修改): " input_path
-    
-    if [ -n "$input_path" ]; then
-        # 解析波浪号 ~ 为当前用户真实的家目录路径
-        eval expanded_path="$input_path"
-        
-        # 尝试创建该目录（如果是相对路径 `.` 或当前目录则无需处理）
-        if [ "$expanded_path" != "." ]; then
-            mkdir -p "$expanded_path" 2>/dev/null
-            if [ $? -ne 0 ]; then
-                echo -e "${RED}❌ 路径创建失败：请检查权限或路径输入是否正确！${RESET}"
-                read -r -p "按回车返回..." ; return
-            fi
+            ssh -i "$secret" -p $port $remote "mkdir -p $remote_path"
+            rsync -az -e "ssh -i $secret -p $port" "$archive" "$remote:$remote_path/"
         fi
         
-        OUT_DIR="$input_path"
-        save_config
-        echo -e "${GREEN}🟢 成功！文件接收保存路径已修改为: ${YELLOW}${OUT_DIR}${RESET}"
+        rm -f "$archive"
+        echo -e "${GREEN}✅ [$name] 推送完成${RESET}"
+        send_tg "$name 推送完成 ✅"
+        return 0
     else
-        echo -e "${YELLOW}未做任何修改。${RESET}"
+        if [[ "$auth" == "password" ]]; then
+            sshpass -p "$secret" rsync -az -e "ssh -p $port" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
+        else
+            rsync -az -e "ssh -i $secret -p $port" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
+        fi
+
+        if [ -f "/tmp/$(basename "$archive")" ]; then
+            rm -rf "$local"
+            mkdir -p "$local"
+            tar -xzf "/tmp/$(basename "$archive")" -C "$(dirname "$local")"
+            rm -f "/tmp/$(basename "$archive")"
+            echo -e "${GREEN}✅ [$name] 拉取同步恢复完成${RESET}"
+            send_tg "$name 拉取完成 ✅"
+        else
+            echo -e "${RED}❌ 拉取失败，远端未发现对应的压缩备份文件。${RESET}"
+            return 1
+        fi
     fi
-    read -r -p "按回车返回主菜单..."
+    return 0
 }
 
-# 卸载 Croc
-uninstall_croc() {
-    echo -e "${YELLOW}➔ 正在卸载 Croc...${RESET}"
-    if [[ "$OSTYPE" == "linux-gnu"* ]] || [ -f /etc/alpine-release ]; then
-        if command -v croc &>/dev/null || [ -f /usr/local/bin/croc ]; then
-            rm -f /usr/local/bin/croc 2>/dev/null
-            local croc_path
-            croc_path=$(command -v croc 2>/dev/null)
-            [ -n "$croc_path" ] && rm -f "$croc_path"
-            echo -e "${GREEN}🟢 Croc 已从系统成功卸载。${RESET}"
-        else
-            echo -e "${YELLOW}⚠️  系统中未发现已安装的 Croc。${RESET}"
-        fi
-    elif [[ "$OSTYPE" == "darwin"* ]]; then
-        brew uninstall croc 2>/dev/null
-        echo -e "${GREEN}🟢 Croc 已从 macOS 卸载。${RESET}"
-    else
-        echo -e "${RED}❌ 不支持的系统架构: $OSTYPE${RESET}"
+batch_run() {
+    read -p "批量任务编号(多个逗号隔开，或输入 all): " nums
+    if [[ "$nums" == "all" ]]; then
+        count=$(task_count)
+        nums=$(seq 1 $count)
     fi
-    read -r -p "按回车返回主菜单..."
-}
+    OLDIFS=$IFS
+    IFS=','
 
-# 发送文件/目录
-send_file() {
-    if ! command -v croc &>/dev/null && [ ! -f /usr/local/bin/croc ]; then
-        echo -e "${RED}❌ 错误：请先选择选项 1 安装 Croc 核心传输组件。${RESET}"
-        read -r -p "按回车返回..." ; return
-    fi
-
-    echo -e "${YELLOW}请输入要发送的文件或目录路径 (多个路径请用 空格 分隔):${RESET}"
-    read -r -a paths
-    
-    if [ ${#paths[@]} -eq 0 ]; then
-        echo -e "${YELLOW}操作已取消。${RESET}"
-        read -r -p "按回车返回主菜单..." ; return
-    fi
-
-    valid_paths=()
-    for p in "${paths[@]}"; do
-        if [[ -e "$p" ]]; then
-            valid_paths+=("$p")
-        else
-            echo -e "${RED}❌ 路径不存在，已自动忽略: $p${RESET}"
-        fi
+    for n in $nums; do
+        n=$(echo "$n" | tr -d '\r\n ')
+        [[ -n "$n" ]] && run_task "$1" "$n"
     done
 
-    if [[ ${#valid_paths[@]} -eq 0 ]]; then
-        echo -e "${RED}🔴 没有找到任何有效路径，返回主菜单。${RESET}"
-        read -r -p "按回车返回..." ; return
-    fi
-
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    read -r -p "请输入自定义接收代码 (直接回车则随机生成): " code
-    echo -e "${GREEN}---------------------------------------${RESET}"
-
-    if [[ -z "$code" ]]; then
-        echo -e "${YELLOW}➔ 正在建立加密信道并自动生成代码...${RESET}"
-        croc send "${valid_paths[@]}"
-    else
-        echo -e "${YELLOW}➔ 正在建立加密信道，使用自定义代码: ${YELLOW}$code${RESET}"
-        croc send --code "$code" "${valid_paths[@]}"
-    fi
-
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}🟢 文件/目录传输任务执行完毕。${RESET}"
-    else
-        echo -e "${RED}🔴 传输中断或发送失败。${RESET}"
-    fi
-    read -r -p "按回车返回主菜单..."
+    IFS=$OLDIFS
 }
 
-# 接收文件/目录 (核心级完美集成 --out 输出路径)
-receive_file() {
-    if ! command -v croc &>/dev/null && [ ! -f /usr/local/bin/croc ]; then
-        echo -e "${RED}❌ 错误：请先选择选项 1 安装 Croc 核心传输组件。${RESET}"
-        read -r -p "按回车返回..." ; return
+#################################
+# 定时任务管理
+#################################
+schedule_task() {
+    echo -e "${GREEN}定时任务频率模板:${RESET}"
+    echo -e "  1) 每天0点"
+    echo -e "  2) 每周一0点"
+    echo -e "  3) 每月1号0点"
+    echo -e "  4) 自定义cron表达式"
+    read -p "选择模板: " tmpl
+    case $tmpl in
+        1) cron="0 0 * * *" ;;
+        2) cron="0 0 * * 1" ;;
+        3) cron="0 0 1 * *" ;;
+        4) read -p "请输入标准cron表达式: " cron ;;
+        *) echo -e "${RED}无效选择${RESET}"; return ;;
+    esac
+
+    read -p "请输入要绑定的任务编号(多个用逗号隔开，或输入 all): " nums
+    if [[ "$nums" == "all" ]]; then
+        count=$(task_count)
+        nums=$(seq 1 $count)
     fi
 
-    read -r -p "请输入接收连接代码 (Code): " code
-    if [[ -z "$code" ]]; then
-        echo -e "${RED}❌ 接收连接代码不能为空！${RESET}"
-        read -r -p "按回车返回主菜单..." ; return
-    fi
-
-    echo -e "${YELLOW}➔ 正在通过安全通道连接远端传输中继...${RESET}"
-    echo -e "${YELLOW}➔ 文件将被安全保存至: ${OUT_DIR}${RESET}"
-    
-    # 注入临时环境变量运行，并携带高度自定义的 --out 变量路径
-    CROC_SECRET="$code" croc --out "$OUT_DIR"
-
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}🟢 文件/目录安全接收完成！${RESET}"
-    else
-        echo -e "${RED}🔴 接收失败：连接超时、代码错误或信道断开。${RESET}"
-    fi
-    read -r -p "按回车返回主菜单..."
+    OLDIFS=$IFS
+    IFS=','
+    for n in $nums; do
+        n=$(echo "$n" | tr -d '\r\n ')
+        [[ -z "$n" ]] && continue
+        job="$cron /bin/bash $SCRIPT_PATH auto push $n >> $LOG_DIR/cron_$n.log 2>&1 # rsync_$n"
+        crontab -l 2>/dev/null | grep -v "# rsync_$n" | { cat; echo "$job"; } | crontab -
+        echo -e "${GREEN}✅ 任务 $n 已成功挂载定时自动化守护${RESET}"
+    done
+    IFS=$OLDIFS
 }
 
-# 主菜单循环
+delete_schedule() {
+    read -p "请输入要取消定时的任务编号(多个用逗号隔开，或输入 all): " nums
+    if [[ "$nums" == "all" ]]; then
+        crontab -l 2>/dev/null | grep -v "# rsync_" | crontab -
+        echo -e "${YELLOW}✅ 已清空全部定时同步任务${RESET}"
+        return
+    fi
+    OLDIFS=$IFS
+    IFS=','
+    for n in $nums; do
+        n=$(echo "$n" | tr -d '\r\n ')
+        [[ -z "$n" ]] && continue
+        crontab -l 2>/dev/null | grep -v "# rsync_$n" | crontab -
+        echo -e "${YELLOW}✅ 任务 $n 的定时任务已成功卸载${RESET}"
+    done
+    IFS=$OLDIFS
+}
+
+#################################
+# 更新 & 卸载
+#################################
+update_self() {
+    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
+    chmod +x "$SCRIPT_PATH"
+    echo -e "${GREEN}管理面板已成功自我更新！${RESET}"
+}
+
+uninstall_self() {
+    crontab -l 2>/dev/null | grep -v "rsync_" | crontab - || true
+    rm -rf "$BASE_DIR"
+    rm -f "$BIN_LINK_DIR/s" "$BIN_LINK_DIR/S"
+    echo -e "${RED}本同步工具及定时计划已彻底从当前系统卸载。${RESET}"
+    exit
+}
+
+#################################
+# Cron 自动运行
+#################################
+if [[ "$1" == "auto" ]]; then
+    run_task "$2" "$3"
+    exit
+fi
+
+#################################
+# 首次运行安装快捷命令
+#################################
+if [ ! -f "$SCRIPT_PATH" ]; then
+    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
+    chmod +x "$SCRIPT_PATH"
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/s"
+    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/S"
+    echo -e "${GREEN}✅ 安装完成${RESET}"
+    echo -e "${GREEN}✅ 快捷键已添加：s 或 S 可快速启动面板${RESET}"
+fi
+
+#################################
+# 主菜单循环 (完美套用高密度经典信息看板)
+#################################
 while true; do
     clear
-    get_system_env
+    FILE_COUNT=$(task_count)
+    CRON_ACTIVE=$(cron_count)
     
     echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}      ◈  Croc 点对点安全传输面板  ◈      ${RESET}"
+    echo -e "${GREEN}       ◈  VPS 增量同步管理系统  ◈      ${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
     echo -e "${GREEN} 当前系统环境 : ${YELLOW}${OS}${RESET}"
-    echo -e "${GREEN} 传输组件状态 : ${CROC_STATUS}${RESET}"
-    echo -e "${GREEN} 当前接收目录 : ${YELLOW}${OUT_DIR}${RESET}"
-    echo -e "${GREEN} 加密传输协议 : ${YELLOW}PAKE (端到端全密文)${RESET}"
+    echo -e "${GREEN} 活跃任务总数 : ${YELLOW}${FILE_COUNT} 个${RESET}"
+    echo -e "${GREEN} 守护时空计划 : ${YELLOW}${CRON_ACTIVE} 个定时任务正在运行${RESET}"
+    echo -e "${GREEN} 配置数据路径 : ${YELLOW}${BASE_DIR}${RESET}"
     echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  1) 安装 Croc${RESET}"
-    echo -e "${GREEN}  2) 卸载 Croc${RESET}"
+    echo -e "${GREEN} 📦 当前活动的同步任务通道快照预览：${RESET}"
+    
+    list_tasks
+    
     echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  3) 安全发送本地文件/目录 (多选)${RESET}"
-    echo -e "${GREEN}  4) 接收远端文件/目录 (凭码提取)${RESET}"
+    echo -e "${GREEN}  1) 添加全新远程同步传输任务${RESET}"
+    echo -e "${GREEN}  2) 移除既定的数据同步任务${RESET}"
+    echo -e "${GREEN}  3) 立即执行单点数据推流 (Push)${RESET}"
+    echo -e "${GREEN}  4) 立即执行单点镜像回拉 (Pull)${RESET}"
+    echo -e "${GREEN}  5) 批量触发多通道强力推流 (Batch)${RESET}"
+    echo -e "${GREEN}  6) 批量触发多通道同步拉回 (Batch)${RESET}"
+    echo -e "${GREEN}  7) 部署挂载 Cron 定时自动化任务${RESET}"
+    echo -e "${GREEN}  8) 卸载/剥离计划任务守护进程${RESET}"
+    echo -e "${GREEN}  9) 配置 Telegram 机器人即时通知${RESET}"
+    echo -e "${GREEN} 10) 在线获取重构并更新当前面板${RESET}"
+    echo -e "${GREEN} 11) 卸载本工具及注销全部系统环境${RESET}"
     echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  5) 升级至最新版${RESET}"
-    echo -e "${GREEN}  7) 自定义设置下载文件夹${RESET}"
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  0) 退出${RESET}"
+    echo -e "${GREEN}  0) 退出面板${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
-
-    echo -ne "${GREEN} 请选择操作编号: ${RESET}"
+    
+    echo -ne "${GREEN}请选择操作编号 [0-11]: ${RESET}"
     read -r choice
-
     case $choice in
-        1) install_croc ;;
-        2) uninstall_croc ;;
-        3) send_file ;;
-        4) receive_file ;;
-        5) update_croc ;;
-        7) set_output_dir ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}❌ 无效选项，请输入正确的编号！${RESET}" ; read -r -p "按回车继续..." ;;
+        1) add_task ;;
+        2) delete_task ;;
+        3) run_task push ;;
+        4) run_task pull ;;
+        5) batch_run push ;;
+        6) batch_run pull ;;
+        7) schedule_task ;;
+        8) delete_schedule ;;
+        9) setup_tg ;;
+        10) update_self ;;
+        11) uninstall_self ;;
+        0)  exit 0 ;;
+        *) echo -e "${RED}❌ 无效选项，请输入正确的编号！${RESET}" ;;
     esac
+    echo
+    echo -ne "${GREEN}按回车键刷新控制台数据矩阵... ${RESET}"
+    read -r
 done

@@ -1,272 +1,363 @@
-#!/bin/bash
-# ========================================
-# qBittorrent-Nox 一键管理脚本 
-# ========================================
+#!/usr/bin/env bash
 
-# 颜色
-RED="\033[31m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-RESET="\033[0m"
+# ==============================================================================
+# Linux TCP/IP & BBR & TFO 智能综合优化
+# ==============================================================================
 
-SERVICE_NAME="qbittorrent"
-APP_DIR="/opt/qbittorrent"
-CONFIG_DIR="$APP_DIR/config"
-DOWNLOAD_DIR="$APP_DIR/downloads"
-SERVICE_FILE="/etc/systemd/system/qbittorrent.service"
+set -euo pipefail
 
-# 动态获取状态、版本和端口
-get_status_info() {
-    # 1. 检测运行状态
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        status="${GREEN}已启动 (Running)${RESET}"
-    else
-        status="${RED}未运行 (Stopped)${RESET}"
-    fi
+# --- 颜色定义 ---
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
 
-    # 2. 检测版本号
-    if command -v qbittorrent-nox &> /dev/null; then
-        version=$(qbittorrent-nox --version 2>/dev/null | awk '{print $2}')
-        [[ -z "$version" ]] && version="已安装"
-    else
-        version="${RED}未安装${RESET}"
-    fi
+# --- 配置文件路径 ---
+CONF_FILE="/etc/sysctl.d/99-bbr.conf"
 
-    # 3. 检测 WebUI 端口
-    if [[ -f "$SERVICE_FILE" ]]; then
-        port_show=$(grep -oE -- '--webui-port=[0-9]+' "$SERVICE_FILE" | cut -d= -f2)
-        [[ -z "$port_show" ]] && port_show="8080"
-    else
-        port_show="N/A"
+# --- 权限检查 ---
+check_root() {
+    if [[ $(id -u) -ne 0 ]]; then
+        echo -e "${RED}❌ 错误: 必须以 root 权限运行此脚本。${NC}"
+        exit 1
     fi
 }
 
-
-
-# 从日志中自动提取临时密码
-get_qb_password() {
-    local log_line log_pass
-    # 1. 抓取包含密码的核心日志行
-    log_line=$(sudo journalctl -u "$SERVICE_NAME" --no-pager | grep -E "temporary password is:|password.*session:" | tail -n 1)
+# --- BBR 与 架构兼容性硬检测 ---
+check_bbr_support() {
     
-    if [[ -n "$log_line" ]]; then
-        # 2. 精准提取这行的最后一个单词（即密码本身）
-        log_pass=$(echo "$log_line" | awk '{print $NF}')
-        
-        # 3. 过滤掉末尾可能存在的标点符号（如句号）
-        log_pass=$(echo "$log_pass" | tr -d '.')
+    # 1. 检测容器虚拟化架构 (OpenVZ / LXC / 容器判定)
+    local virt_type="unknown"
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        virt_type=$(systemd-detect-virt)
+    else
+        # 针对 Alpine 等无 systemd 系统或特殊环境的兜底检测
+        if [ -f /proc/user_beancounters ]; then
+            virt_type="openvz"
+        elif grep -qi "lxc" /proc/1/environ 2>/dev/null || [ -f /run/container_type ]; then
+            virt_type="lxc"
+        fi
+    fi
+
+    if [[ "$virt_type" == "openvz" || "$virt_type" == "lxc" ]]; then
+        echo -e "${RED}❌ 错误: 当前 VPS 架构为 [${virt_type^^}] 容器/NAT小鸡。${NC}"
+        echo -e "${YELLOW}💡 原因: 该架构与宿主机共享内核，非独立内核，无法自主应用 BBR 拥塞控制与 FQ 队列。${NC}"
+        exit 1
+    fi
+
+    # 2. 内核版本前置过滤
+    local kernel_version major minor
+    kernel_version=$(uname -r | cut -d. -f1,2)
+    major=$(echo "$kernel_version" | cut -d. -f1)
+    minor=$(echo "$kernel_version" | cut -d. -f2)
+    
+    local has_bbr_mod=0
+    if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q "bbr"; then
+        has_bbr_mod=1
+    elif modprobe -n tcp_bbr >/dev/null 2>&1; then
+        has_bbr_mod=1
+    fi
+
+    # 允许在 4.9 以下但有反向 backport BBR 模块的特殊内核通过
+    if [ "$major" -lt 4 ] || { [ "$major" -eq 4 ] && [ "$minor" -lt 9 ]; }; then
+        if [ "$has_bbr_mod" -ne 1 ]; then
+            echo -e "${RED}❌ 错误: 当前系统内核版本为 $(uname -r)，低于官方要求的 4.9 最低限制，且无可用 BBR 模块。${NC}"
+            exit 1
+        fi
+    fi
+
+    # 3. 核心参数修改权限沙箱预检 (终极防线)
+    if ! sysctl -w net.ipv4.tcp_congestion_control="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 'cubic')" >/dev/null 2>&1; then
+        echo -e "${RED}❌ 错误: 检测到系统内核网络参数文件为 [只读] 状态或无修改权限。${NC}"
+        echo -e "${YELLOW}💡 原因: 这通常发生在某些受限的环境（如部分 NAT 共享小鸡或特殊安全策略容器中）。${NC}"
+        exit 1
+    fi
+}
+
+# --- 获取系统信息与动态参数 (针对小内存 UDP 深度调优) ---
+get_system_info() {
+    # 兼容没有 free 命令的精简系统（如未装 full box 的 Alpine）
+    if command -v free >/dev/null 2>&1; then
+        TOTAL_MEM=$(free -m | awk '/^Mem:/{print $2}' | tr -d '\r')
+    else
+        TOTAL_MEM=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
     fi
     
-    if [[ -n "$log_pass" ]]; then
-        echo -e "${GREEN}${log_pass}${RESET}"
+    if [ -z "$TOTAL_MEM" ] || [ "$TOTAL_MEM" -le 0 ]; then
+        TOTAL_MEM=1024 # 无法获取时默认按 1G 计算安全值
+    fi
+
+    if [ "$TOTAL_MEM" -le 512 ]; then
+        VM_TIER="入门微型小鸡(≤512MB RAM)"
+        RMEM_MAX="16777216"   
+        WMEM_MAX="16777216"
+        TCP_MEM_MAX="16777216"
+        SOMAXCONN="2048"       
+        FILE_MAX="65535"
+        CONNTRACK_MAX="32768"
+        UDP_MEM_CONF="1152 1536 2304"
+    elif [ "$TOTAL_MEM" -le 1024 ]; then
+        VM_TIER="基础级(1GB)"
+        RMEM_MAX="33554432"   
+        WMEM_MAX="33554432"
+        TCP_MEM_MAX="33554432"
+        SOMAXCONN="16384"
+        FILE_MAX="524288"
+        CONNTRACK_MAX="262144"
+        UDP_MEM_CONF="16384 32768 65536"
+    elif [ "$TOTAL_MEM" -le 4096 ]; then
+        VM_TIER="进阶级(2GB-4GB)"
+        RMEM_MAX="67108864"   
+        WMEM_MAX="67108864"
+        TCP_MEM_MAX="67108864"
+        SOMAXCONN="32768"
+        FILE_MAX="1048576"
+        CONNTRACK_MAX="524288"
+        UDP_MEM_CONF="65536 131072 262144"
     else
-        echo -e "${RED}未找到临时密码（可能已在WebUI中修改或日志已清空）${RESET}"
+        VM_TIER="专业级(>4GB)"
+        RMEM_MAX="134217728"  
+        WMEM_MAX="134217728"
+        TCP_MEM_MAX="134217728"
+        SOMAXCONN="65535"
+        FILE_MAX="2097152"
+        CONNTRACK_MAX="1048576"
+        UDP_MEM_CONF="262144 524288 1048576"
     fi
 }
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。"
+# --- 写入配置辅助 ---
+add_conf() {
+    local key="$1"
+    local value="$2"
+    local comment="$3"
+    echo "# $comment" >> "$CONF_FILE"
+    echo "$key = $value" >> "$CONF_FILE"
+    echo "" >> "$CONF_FILE"
 }
 
-# 检查并创建目录
-mkdir -p "$CONFIG_DIR" "$DOWNLOAD_DIR"
-chown -R $(whoami):$(whoami) "$APP_DIR"
-chmod -R 755 "$APP_DIR"
+# --- 备份管理 ---
+manage_backups() {
+    if [ -f "$CONF_FILE" ]; then
+        cp "$CONF_FILE" "$CONF_FILE.bak_$(date +%F_%H-%M-%S)"
+        # 仅保留最近3次备份
+        ls -t "${CONF_FILE}.bak_"* 2>/dev/null | tail -n +4 | xargs -r rm -f 2>/dev/null || true
+    fi
+}
 
-# 1. 部署 qBittorrent-Nox (支持自定义端口)
-install_qbittorrent() {
-    echo -ne "${YELLOW}请输入你想要设置的 WebUI 端口号 [默认: 8080]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
+# --- 看板状态获取 ---
+get_status_text() {
+    local cc fq_check bbr_status fq_status
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null | tr -d '[:space:]' || echo "未知")
+    fq_check=$(sysctl -n net.core.default_qdisc 2>/dev/null | tr -d '[:space:]' || echo "未知")
 
-    # 简单校验是否为纯数字
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
+    # 1. 验证 BBR 状态及版本
+    if [ "$cc" == "bbr" ]; then
+        BBR_STATUS="${YELLOW}已启用${NC}"
+    else
+        BBR_STATUS="${RED}未启用${NC}"
+    fi
+    # 2. 验证 FQ 状态
+    if [ "$fq_check" == "fq" ] || [ "$fq_check" == "fq_pie" ] || [ "$fq_check" == "fq_codel" ]; then
+        FQ_STATUS="${YELLOW}已启用${NC}"
+    else
+        FQ_STATUS="${RED}未启用${NC}"
     fi
 
-    echo -e "${YELLOW}更新软件包列表...${RESET}"
-    sudo apt update
-    echo -e "${YELLOW}安装 qBittorrent-Nox...${RESET}"
-    sudo apt install -y qbittorrent-nox
+    # 2. 验证配置文件是否【真正由本脚本应用】
+    # 判断文件存在，且内容里包含专属的头部备注
+    if [ -f "$CONF_FILE" ] && grep -q "Linux Network Tuning (Proxy/Forwarding Optimized)" "$CONF_FILE"; then
+        CONF_STATUS="${YELLOW}已应用${NC}"
+    elif [ -f "$CONF_FILE" ]; then
+        CONF_STATUS="${RED}未应用${NC}"
+    else
+        CONF_STATUS="${RED}未应用${NC}"
+    fi
+}
 
-    echo -e "${YELLOW}创建 systemd 服务文件 (端口: ${custom_port})...${RESET}"
-    sudo tee "$SERVICE_FILE" > /dev/null <<EOF
-[Unit]
-Description=qBittorrent Command Line Client
-After=network.target
+# --- 检测并处理 Alpine 发行版特殊逻辑 ---
+handle_alpine_special() {
+    if [ -f /etc/os-release ]; then
+        # 通过 source 引入系统变量
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        if [ "${ID:-}" = "alpine" ]; then
+            echo -e "${CYAN}ℹ️ 检测到当前系统为 Alpine Linux，注入模块持久化配置...${NC}"
+            if ! grep -q "tcp_bbr" /etc/modules 2>/dev/null; then
+                echo "tcp_bbr" >> /etc/modules 2>/dev/null || true
+            fi
+        fi
+    fi
+}
 
-[Service]
-ExecStart=/usr/bin/qbittorrent-nox --webui-port=${custom_port} --profile=$CONFIG_DIR
-User=$(whoami)
-Restart=on-failure
-WorkingDirectory=$DOWNLOAD_DIR
+# --- 功能 1：一键安装优化 ---
+apply_optimizations() {
+    echo -e "\n${CYAN}>>> 正在分析系统硬件并生成最佳配置方案...${NC}"
+    get_system_info
+    manage_backups
+    
+    # 尝试加载内核模块（静默处理）
+    modprobe nf_conntrack >/dev/null 2>&1 || true
+    modprobe tcp_bbr >/dev/null 2>&1 || true
 
-[Install]
-WantedBy=multi-user.target
+    mkdir -p "$(dirname "$CONF_FILE")"
+    > "$CONF_FILE"
+    cat >> "$CONF_FILE" << EOF
+# ==========================================================
+# Linux Network Tuning (Proxy/Forwarding Optimized)
+# 生成时间: $(date)
+# 硬件适配: ${TOTAL_MEM}MB RAM (${VM_TIER})
+# ==========================================================
 EOF
 
-    sudo systemctl daemon-reload
-    sudo systemctl start qbittorrent
-    sudo systemctl enable qbittorrent
+    # 1. BBR 与 队列算法
+    add_conf "net.core.default_qdisc" "fq" "FQ 队列算法"
+    add_conf "net.ipv4.tcp_congestion_control" "bbr" "开启 BBR 拥塞控制"
+    add_conf "net.ipv4.tcp_slow_start_after_idle" "0" "关闭空闲慢启动"
 
-    echo -e "${YELLOW}等待服务启动并生成密码...${RESET}"
-    sleep 3
+    # 2. TCP Fast Open (双向开启)
+    add_conf "net.ipv4.tcp_fastopen" "3" "开启 TCP Fast Open"
 
-    SERVER_IP=$(get_public_ip)
-    echo -e "${GREEN}qBittorrent-Nox 安装完成并已启动!${RESET}"
-    echo -e "${YELLOW}WebUI 访问地址: http://${SERVER_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}默认用户名: admin${RESET}"
-    echo -ne "${YELLOW}自动提取初始密码: ${RESET}"
-    get_qb_password
-    echo -e "${GREEN}配置目录: $CONFIG_DIR${RESET}"
-    echo -e "${GREEN}下载目录: $DOWNLOAD_DIR${RESET}"
-}
+    # 3. 缓冲区优化
+    add_conf "net.core.rmem_max" "$RMEM_MAX" "系统最大接收缓存"
+    add_conf "net.core.wmem_max" "$WMEM_MAX" "系统最大发送缓存"
+    add_conf "net.core.rmem_default" "262144" "默认接收缓存" 
+    add_conf "net.core.wmem_default" "262144" "默认发送缓存"
+    add_conf "net.ipv4.tcp_rmem" "4096 87380 $TCP_MEM_MAX" "TCP 读缓存"
+    add_conf "net.ipv4.tcp_wmem" "4096 65536 $TCP_MEM_MAX" "TCP 写缓存"
+    add_conf "net.ipv4.udp_rmem_min" "16384" "UDP 读缓存下限"
+    add_conf "net.ipv4.udp_wmem_min" "16384" "UDP 写缓存下限"
+    add_conf "net.ipv4.udp_mem" "$UDP_MEM_CONF" "系统 UDP 内存页全局限制"
 
-# 2. 更新功能
-update_qbittorrent() {
-    echo -e "${YELLOW}正在检查并更新 qBittorrent-Nox...${RESET}"
-    sudo apt update && sudo apt --only-upgrade install -y qbittorrent-nox
-    sudo systemctl restart qbittorrent
-    echo -e "${GREEN}更新尝试完成${RESET}"
-}
+    # 4. 连接与队列上限
+    add_conf "net.core.somaxconn" "$SOMAXCONN" "最大监听队列"
+    add_conf "net.core.netdev_max_backlog" "$SOMAXCONN" "网卡积压队列"
+    add_conf "net.ipv4.tcp_max_syn_backlog" "$SOMAXCONN" "SYN 半连接队列"
+    add_conf "net.ipv4.tcp_notsent_lowat" "16384" "降低缓冲区未发送数据阈值"
 
-# 3. 卸载服务
-uninstall_qbittorrent() {
-    sudo systemctl stop ${SERVICE_NAME} 2>/dev/null
-    sudo systemctl disable ${SERVICE_NAME} 2>/dev/null
-    sudo rm -f "$SERVICE_FILE"
-    sudo systemctl daemon-reload
-    
-    echo -e "${YELLOW}是否删除配置和下载数据？[y/N]${RESET}"
-    read -r del
-    if [[ "$del" == "y" || "$del" == "Y" ]]; then
-        rm -rf "$APP_DIR"
-        echo -e "${RED}配置和下载目录已删除${RESET}"
-    fi
-    echo -e "${GREEN}qBittorrent 已卸载${RESET}"
-}
+    # 5. TIME_WAIT 与 端口复用
+    add_conf "net.ipv4.tcp_tw_reuse" "1" "开启 TIME_WAIT 复用"
+    add_conf "net.ipv4.tcp_timestamps" "1" "开启时间戳"
+    add_conf "net.ipv4.tcp_fin_timeout" "30" "缩短 FIN_WAIT 时间"
+    add_conf "net.ipv4.ip_local_port_range" "10000 65535" "扩大本地端口范围"
+    add_conf "net.ipv4.tcp_max_tw_buckets" "500000" "允许更多 TIME_WAIT socket"
 
-# 4. 修改端口配置
-edit_config() {
-    if [[ ! -f "$SERVICE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到服务文件，请先安装 qBittorrent！${RESET}"
-        return
+    # 6. TCP Keepalive
+    add_conf "net.ipv4.tcp_keepalive_time" "600" "TCP 保活时间"
+    add_conf "net.ipv4.tcp_keepalive_intvl" "15" "探测间隔"
+    add_conf "net.ipv4.tcp_keepalive_probes" "3" "探测次数"
+
+    # 7. 连接跟踪 (Conntrack)
+    if lsmod | grep -q "nf_conntrack" || [ -d /proc/sys/net/netfilter ]; then
+        add_conf "net.netfilter.nf_conntrack_max" "$CONNTRACK_MAX" "最大连接跟踪数"
+        add_conf "net.netfilter.nf_conntrack_tcp_timeout_established" "7200" "连接跟踪超时"
+        add_conf "net.netfilter.nf_conntrack_tcp_timeout_time_wait" "120" "减少 TIME_WAIT 跟踪时间"
     fi
 
-    get_status_info
-    echo -e "${CYAN}当前 WebUI 端口为: ${port_show}${RESET}"
-    echo -ne "${YELLOW}请输入新的 WebUI 端口号: ${RESET}"
-    read -r new_port
+    # 8. 其他安全与链路调优
+    add_conf "fs.file-max" "$FILE_MAX" "最大文件句柄"
+    add_conf "vm.swappiness" "10" "减少 Swap 使用"
+    add_conf "net.ipv4.tcp_mtu_probing" "1" "开启 MTU 探测"
+    add_conf "net.ipv4.tcp_syncookies" "1" "防 SYN Flood"
+    add_conf "net.ipv4.tcp_ecn" "1" "开启 ECN"
 
-    if [[ -z "$new_port" ]] || ! [[ "$new_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}操作取消或输入错误：端口必须是纯数字！${RESET}"
-        return
+    echo -e "${CYAN}>>> 正在将参数注入内核控制流...${NC}"
+    
+    # 针对不同发行版采用兼容的 sysctl 生效命令
+    sysctl --system >/dev/null 2>&1 || sysctl -p "$CONF_FILE" >/dev/null 2>&1 || true
+
+    # 针对 Alpine Linux 的持久化补充
+    handle_alpine_special
+
+    # 最终复核
+    if sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then
+        echo -e "${GREEN}✅ 高级网络优化配置应用成功！BBR 已成功加速。${NC}\n"
+    else
+        echo -e "${RED}❌ 警告: 配置已写入，但检测到内核当前仍未成功切换至 BBR。${NC}"
+        echo -e "${YELLOW}💡 提示: 如果是 Alpine，可能由于缺少内核模块包。可尝试运行 'apk add linux-lts' 升级或重启。${NC}\n"
     fi
-
-    echo -e "${YELLOW}正在修改端口为 ${new_port}...${RESET}"
-    # 使用 sed 替换服务文件里的端口
-    sudo sed -i "s/--webui-port=[0-9]*/--webui-port=${new_port}/g" "$SERVICE_FILE"
     
-    echo -e "${YELLOW}正在重载系统配置并重启服务...${RESET}"
-    sudo systemctl daemon-reload
-    sudo systemctl restart "$SERVICE_NAME"
+    echo -ne "${GREEN}"
+    read -r -p "按回车键返回主菜单..." _
+    echo -ne "${NC}"
+}
+
+# --- 功能 2：卸载优化恢复默认 ---
+# --- 功能 2：卸载高级优化，恢复至基础 BBR 配置 ---
+uninstall_optimizations() {
+    echo -e "\n${YELLOW}>>> 正在剥离高级调优参数，将其重置为基础规范 BBR 配置...${NC}"
     
-    echo -e "${GREEN}端口修改成功！当前新端口为: ${new_port}${RESET}"
+    manage_backups
+    mkdir -p "$(dirname "$CONF_FILE")"
+
+    # 关键修改：卸载时不删文件，而是覆盖重写为用户指定的原生 FQ + BBR 配置
+    cat > "$CONF_FILE" << EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+
+    echo -e "${GREEN}✅ 配置文件已精简还原: ${CONF_FILE}${NC}"
+    echo -e "${CYAN}>>> 正在重载系统控制流并清空其他高级参数缓存...${NC}"
+    
+    # 1. 刷新系统内核加载树（使其他被删除的参数回滚到系统全局默认）
+    sysctl --system >/dev/null 2>&1 || true
+    
+    # 2. 手动强制刷新一次核心参数，确保实时生效
+    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+    
+    echo -e "${GREEN}✅ 卸载恢复成功！其余优化已清除，基础 BBR + FQ 仍保持在底层稳健运行。${NC}\n"
+    
+    echo -ne "${GREEN}"
+    read -r -p "按回车键返回主菜单..." _
+    echo -ne "${NC}"
 }
 
-# 5. 启动服务
-start_qbittorrent() {
-    sudo systemctl start ${SERVICE_NAME}
-    echo -e "${GREEN}qBittorrent 已启动${RESET}"
-}
-
-# 6. 停止服务
-stop_qbittorrent() {
-    sudo systemctl stop ${SERVICE_NAME}
-    echo -e "${YELLOW}qBittorrent 已停止${RESET}"
-}
-
-# 7. 重启服务
-restart_qbittorrent() {
-    sudo systemctl restart ${SERVICE_NAME}
-    echo -e "${GREEN}qBittorrent 已重启${RESET}"
-}
-
-# 8. 查看日志
-logs_qbittorrent() {
-    echo -e "${CYAN}正在实时查看日志 (按 Ctrl+C 退出)...${RESET}"
-    sudo journalctl -u ${SERVICE_NAME} -n 50 -f
-}
-
-# 9. 查看节点配置
-show_node_info() {
-    SERVER_IP=$(get_public_ip)
-    get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     qBittorrent 访问与配置信息    ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${CYAN}WebUI 地址 : http://${SERVER_IP}:${port_show}${RESET}"
-    echo -e "${CYAN}默认用户名 : admin${RESET}"
-    echo -ne "${CYAN}初始密码   : ${RESET}"
-    get_qb_password
-    echo -e "${GREEN}================================${RESET}"
-}
-
-# 菜单
+# --- 交互菜单 ---
 menu() {
-    clear
-    get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     qBittorrent-Nox 管理面板     ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $status"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 qBittorrent${RESET}"
-    echo -e "${GREEN}2. 更新 qBittorrent${RESET}"
-    echo -e "${GREEN}3. 卸载 qBittorrent${RESET}"
-    echo -e "${GREEN}4. 修改端口配置${RESET}"
-    echo -e "${GREEN}5. 启动 qBittorrent${RESET}"
-    echo -e "${GREEN}6. 停止 qBittorrent${RESET}"
-    echo -e "${GREEN}7. 重启 qBittorrent${RESET}"
-    echo -e "${GREEN}8. 查看日志${RESET}"
-    echo -e "${GREEN}9. 查看配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read -r choice
-    case "$choice" in
-        1) install_qbittorrent ;;
-        2) update_qbittorrent ;;
-        3) uninstall_qbittorrent ;;
-        4) edit_config ;;
-        5) start_qbittorrent ;;
-        6) stop_qbittorrent ;;
-        7) restart_qbittorrent ;;
-        8) logs_qbittorrent ;;
-        9) show_node_info ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
-    esac
+    while true; do
+        clear
+        get_status_text
+        
+        echo -e "${GREEN}====================================${NC}"
+        echo -e "${GREEN}      BBR+TCP智能调参综合优化        ${NC}"
+        echo -e "${GREEN}====================================${NC}"
+        echo -e "${GREEN}  BBR  : ${BBR_STATUS}"
+        echo -e "${GREEN}  FQ   : ${FQ_STATUS}"
+        echo -e "${GREEN}  配置 : ${CONF_STATUS}"
+        echo -e "${GREEN}====================================${NC}"
+        echo -e "${GREEN}  1. 网络优化${NC}"
+        echo -e "${GREEN}  2. 卸载优化${NC}"
+        echo -e "${GREEN}  0. 退出${NC}"
+        echo -e "${GREEN}====================================${NC}"
+        
+        echo -ne "${GREEN} 请输入选项: ${NC}"
+        read -r choice
+        
+        case "$choice" in
+            1)
+                apply_optimizations
+                ;;
+            2)
+                uninstall_optimizations
+                ;;
+            0)
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}❌ 输入错误${NC}"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
-# 循环菜单
-while true; do
+# --- 主入口 ---
+main() {
+    check_root
+    check_bbr_support
     menu
-    echo -e "${YELLOW}按回车键继续...${RESET}"
-    read -r
-done
+}
+
+main "$@"

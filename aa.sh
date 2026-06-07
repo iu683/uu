@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/bin/sh
 # ========================================
-# qBittorrent-Nox 一键管理脚本 
+# qBittorrent-Nox 一键管理脚本 (Alpine 完美修复版)
 # ========================================
 
 # 颜色
@@ -10,33 +10,33 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-SERVICE_NAME="qbittorrent"
+SERVICE_NAME="qbittorrent-nox"
+INIT_FILE="/etc/init.d/qbittorrent-nox"
+CONF_FILE="/etc/conf.d/qbittorrent-nox"
+LOG_FILE="/var/log/qbittorrent-nox.log"
+
 APP_DIR="/opt/qbittorrent"
 CONFIG_DIR="$APP_DIR/config"
 DOWNLOAD_DIR="$APP_DIR/downloads"
-SERVICE_FILE="/etc/systemd/system/qbittorrent.service"
 
 # 动态获取状态、版本和端口
 get_status_info() {
-    # 1. 检测运行状态
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        status="${GREEN}已启动 (Running)${RESET}"
+    if rc-service "$SERVICE_NAME" status 2>/dev/null | grep -q "started"; then
+        status="${GREEN}已启动${RESET}"
     else
-        status="${RED}未运行 (Stopped)${RESET}"
+        status="${RED}未运行${RESET}"
     fi
 
-    # 2. 检测版本号
-    if command -v qbittorrent-nox &> /dev/null; then
+    if command -v qbittorrent-nox > /dev/null 2>&1; then
         version=$(qbittorrent-nox --version 2>/dev/null | awk '{print $2}')
-        [[ -z "$version" ]] && version="已安装"
+        [ -z "$version" ] && version="已安装"
     else
         version="${RED}未安装${RESET}"
     fi
 
-    # 3. 检测 WebUI 端口
-    if [[ -f "$SERVICE_FILE" ]]; then
-        port_show=$(grep -oE -- '--webui-port=[0-9]+' "$SERVICE_FILE" | cut -d= -f2)
-        [[ -z "$port_show" ]] && port_show="8080"
+    if [ -f "$CONF_FILE" ]; then
+        port_show=$(grep -oE 'webui-port=[0-9]+' "$CONF_FILE" | cut -d= -f2)
+        [ -z "$port_show" ] && port_show="8080"
     else
         port_show="N/A"
     fi
@@ -45,113 +45,118 @@ get_status_info() {
 # 从日志中自动提取临时密码
 get_qb_password() {
     local log_pass
-    log_pass=$(sudo journalctl -u "$SERVICE_NAME" --no-pager | grep "temporary password is:" | tail -n 1 | awk -F ': ' '{print $2}' | tr -d ' ')
+    if [ -f "$LOG_FILE" ]; then
+        log_pass=$(grep -E "temporary password is:|password.*session:" "$LOG_FILE" | tail -n 1 | awk '{print $NF}' | tr -d '.')
+    fi
     
-    if [[ -n "$log_pass" ]]; then
+    if [ -n "$log_pass" ]; then
         echo -e "${GREEN}${log_pass}${RESET}"
     else
-        echo -e "${RED}未找到临时密码（可能已在WebUI中修改或日志已清空）${RESET}"
+        echo -e "${RED}未找到临时密码（可能已在WebUI中修改、日志未刷新或已被清空）${RESET}"
     fi
 }
 
+# 获取公网 IP
 get_public_ip() {
     local ip
     for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
         for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+            ip=$($cmd "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return
         done
     done
     for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
         for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+            ip=$($cmd "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return
         done
     done
-    echo "无法获取公网 IP 地址。"
+    echo "无法获取公网 IP 地址"
 }
 
-# 检查并创建目录
-mkdir -p "$CONFIG_DIR" "$DOWNLOAD_DIR"
-chown -R $(whoami):$(whoami) "$APP_DIR"
-chmod -R 755 "$APP_DIR"
-
-# 1. 部署 qBittorrent-Nox (支持自定义端口)
+# 1. 部署 qBittorrent-Nox
 install_qbittorrent() {
     echo -ne "${YELLOW}请输入你想要设置的 WebUI 端口号 [默认: 8080]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
+    [ -z "$custom_port" ] && custom_port="8080"
 
-    # 简单校验是否为纯数字
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+    if ! echo "$custom_port" | grep -qE '^[0-9]+$'; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    echo -e "${YELLOW}更新软件包列表...${RESET}"
-    sudo apt update
-    echo -e "${YELLOW}安装 qBittorrent-Nox...${RESET}"
-    sudo apt install -y qbittorrent-nox
+    echo -e "${YELLOW}更新软件包列表并安装 qBittorrent-Nox...${RESET}"
+    apk update
+    apk add qbittorrent-nox qbittorrent-nox-openrc
 
-    echo -e "${YELLOW}创建 systemd 服务文件 (端口: ${custom_port})...${RESET}"
-    sudo tee "$SERVICE_FILE" > /dev/null <<EOF
-[Unit]
-Description=qBittorrent Command Line Client
-After=network.target
+    echo -e "${YELLOW}创建并配置下载目录...${RESET}"
+    mkdir -p "$CONFIG_DIR" "$DOWNLOAD_DIR"
+    chown -R qbittorrent:qbittorrent "$APP_DIR"
+    chmod -R 755 "$APP_DIR"
 
-[Service]
-ExecStart=/usr/bin/qbittorrent-nox --webui-port=${custom_port} --profile=$CONFIG_DIR
-User=$(whoami)
-Restart=on-failure
-WorkingDirectory=$DOWNLOAD_DIR
-
-[Install]
-WantedBy=multi-user.target
+    echo -e "${YELLOW}注入官方 OpenRC 配置参数...${RESET}"
+    cat <<EOF > "$CONF_FILE"
+# qBittorrent-Nox 官方 OpenRC 变量配置
+QB_OPTS="--webui-port=${custom_port} --profile=${CONFIG_DIR}"
 EOF
 
-    sudo systemctl daemon-reload
-    sudo systemctl start qbittorrent
-    sudo systemctl enable qbittorrent
+    echo -e "${YELLOW}正在热补丁修复官方 OpenRC 脚本缺陷...${RESET}"
+    # 1. 注入 pidfile 路径定义
+    if ! grep -q "pidfile=" "$INIT_FILE"; then
+        sed -i '/command=/i pidfile="/run/qbittorrent-nox.pid"' "$INIT_FILE"
+    fi
+    # 2. 注入日志重定向输出
+    if ! grep -q "output_log=" "$INIT_FILE"; then
+        sed -i '/command=/i output_log="/var/log/qbittorrent-nox.log"\nerror_log="/var/log/qbittorrent-nox.log"' "$INIT_FILE"
+    fi
+
+    echo -e "${YELLOW}正在清理旧日志并启动服务...${RESET}"
+    rc-service "$SERVICE_NAME" stop >/dev/null 2>&1
+    rm -f "$LOG_FILE"
+    
+    # 创建日志文件并赋予权限，否则 qbittorrent 用户无法写入
+    touch "$LOG_FILE"
+    chown qbittorrent:qbittorrent "$LOG_FILE"
+
+    rc-update add "$SERVICE_NAME" default
+    rc-service "$SERVICE_NAME" start
 
     echo -e "${YELLOW}等待服务启动并生成密码...${RESET}"
-    sleep 3
+    sleep 5
 
     SERVER_IP=$(get_public_ip)
     echo -e "${GREEN}qBittorrent-Nox 安装完成并已启动!${RESET}"
     echo -e "${YELLOW}WebUI 访问地址: http://${SERVER_IP}:${custom_port}${RESET}"
     echo -e "${YELLOW}默认用户名: admin${RESET}"
-    echo -ne "${YELLOW}自动提取初始密码: ${RESET}"
+    echo -ne "${YELLOW}初始密码: ${RESET}"
     get_qb_password
-    echo -e "${GREEN}配置目录: $CONFIG_DIR${RESET}"
-    echo -e "${GREEN}下载目录: $DOWNLOAD_DIR${RESET}"
+    echo -e "${YELLOW}配置目录: $CONFIG_DIR${RESET}"
+    echo -e "${YELLOW}下载目录: $DOWNLOAD_DIR${RESET}"
 }
 
 # 2. 更新功能
 update_qbittorrent() {
     echo -e "${YELLOW}正在检查并更新 qBittorrent-Nox...${RESET}"
-    sudo apt update && sudo apt --only-upgrade install -y qbittorrent-nox
-    sudo systemctl restart qbittorrent
-    echo -e "${GREEN}更新尝试完成${RESET}"
+    apk update && apk add --upgrade qbittorrent-nox qbittorrent-nox-openrc
+    # 更新后重新应用补丁
+    sed -i '/command=/i pidfile="/run/qbittorrent-nox.pid"' "$INIT_FILE" 2>/dev/null
+    sed -i '/command=/i output_log="/var/log/qbittorrent-nox.log"\nerror_log="/var/log/qbittorrent-nox.log"' "$INIT_FILE" 2>/dev/null
+    rc-service "$SERVICE_NAME" restart
+    echo -e "${GREEN}更新完成${RESET}"
 }
 
 # 3. 卸载服务
 uninstall_qbittorrent() {
-    sudo systemctl stop ${SERVICE_NAME} 2>/dev/null
-    sudo systemctl disable ${SERVICE_NAME} 2>/dev/null
-    sudo rm -f "$SERVICE_FILE"
-    sudo systemctl daemon-reload
-    
-    echo -e "${YELLOW}是否删除配置和下载数据？[y/N]${RESET}"
-    read -r del
-    if [[ "$del" == "y" || "$del" == "Y" ]]; then
-        rm -rf "$APP_DIR"
-        echo -e "${RED}配置和下载目录已删除${RESET}"
-    fi
-    echo -e "${GREEN}qBittorrent 已卸载${RESET}"
+    echo -e "${YELLOW}正在停止并清理 qBittorrent 服务...${RESET}"
+    rc-service "$SERVICE_NAME" stop 2>/dev/null
+    rc-update del "$SERVICE_NAME" default 2>/dev/null
+    rm -f "$CONF_FILE" "$LOG_FILE"
+    rm -rf "$APP_DIR"
+    echo -e "${GREEN}qBittorrent 已彻底卸载并清理目录${RESET}"
 }
 
 # 4. 修改端口配置
 edit_config() {
-    if [[ ! -f "$SERVICE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到服务文件，请先安装 qBittorrent！${RESET}"
+    if [ ! -f "$CONF_FILE" ]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先安装 qBittorrent！${RESET}"
         return
     fi
 
@@ -160,44 +165,46 @@ edit_config() {
     echo -ne "${YELLOW}请输入新的 WebUI 端口号: ${RESET}"
     read -r new_port
 
-    if [[ -z "$new_port" ]] || ! [[ "$new_port" =~ ^[0-9]+$ ]]; then
+    if [ -z "$new_port" ] || ! echo "$new_port" | grep -qE '^[0-9]+$'; then
         echo -e "${RED}操作取消或输入错误：端口必须是纯数字！${RESET}"
         return
     fi
 
     echo -e "${YELLOW}正在修改端口为 ${new_port}...${RESET}"
-    # 使用 sed 替换服务文件里的端口
-    sudo sed -i "s/--webui-port=[0-9]*/--webui-port=${new_port}/g" "$SERVICE_FILE"
+    sed -i "s/webui-port=[0-9]*/webui-port=${new_port}/g" "$CONF_FILE"
     
-    echo -e "${YELLOW}正在重载系统配置并重启服务...${RESET}"
-    sudo systemctl daemon-reload
-    sudo systemctl restart "$SERVICE_NAME"
+    echo -e "${YELLOW}正在重启服务...${RESET}"
+    rc-service "$SERVICE_NAME" restart
     
     echo -e "${GREEN}端口修改成功！当前新端口为: ${new_port}${RESET}"
 }
 
 # 5. 启动服务
 start_qbittorrent() {
-    sudo systemctl start ${SERVICE_NAME}
+    rc-service "$SERVICE_NAME" start
     echo -e "${GREEN}qBittorrent 已启动${RESET}"
 }
 
 # 6. 停止服务
 stop_qbittorrent() {
-    sudo systemctl stop ${SERVICE_NAME}
+    rc-service "$SERVICE_NAME" stop
     echo -e "${YELLOW}qBittorrent 已停止${RESET}"
 }
 
 # 7. 重启服务
 restart_qbittorrent() {
-    sudo systemctl restart ${SERVICE_NAME}
+    rc-service "$SERVICE_NAME" restart
     echo -e "${GREEN}qBittorrent 已重启${RESET}"
 }
 
 # 8. 查看日志
 logs_qbittorrent() {
+    if [ ! -f "$LOG_FILE" ]; then
+        echo -e "${RED}错误: 日志文件还未生成或不存在！${RESET}"
+        return
+    fi
     echo -e "${CYAN}正在实时查看日志 (按 Ctrl+C 退出)...${RESET}"
-    sudo journalctl -u ${SERVICE_NAME} -n 50 -f
+    tail -n 50 -f "$LOG_FILE"
 }
 
 # 9. 查看节点配置
@@ -205,21 +212,21 @@ show_node_info() {
     SERVER_IP=$(get_public_ip)
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     qBittorrent 访问与配置信息    ${RESET}"
+    echo -e "${GREEN}   qBittorrent 访问与配置信息    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${CYAN}WebUI 地址 : http://${SERVER_IP}:${port_show}${RESET}"
-    echo -e "${CYAN}默认用户名 : admin${RESET}"
-    echo -ne "${CYAN}初始密码   : ${RESET}"
+    echo -e "${YELLOW}WebUI 地址 : http://${SERVER_IP}:${port_show}${RESET}"
+    echo -e "${YELLOW}默认用户名 : admin${RESET}"
+    echo -ne "${YELLOW}初始密码   : ${RESET}"
     get_qb_password
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 菜单
+# 菜单面板
 menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     qBittorrent-Nox 管理面板     ${RESET}"
+    echo -e "${GREEN}   qBittorrent-Nox 管理面板 (Alpine) ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态   :${RESET} $status"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
@@ -253,9 +260,9 @@ menu() {
     esac
 }
 
-# 循环菜单
+# 主循环
 while true; do
     menu
-    echo -e "${YELLOW}按回车键继续...${RESET}"
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
     read -r
 done

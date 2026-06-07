@@ -1,470 +1,530 @@
 #!/bin/bash
-set -o pipefail
+# ========================================
+# Rclone 管理脚本 
+# ========================================
 
-#################################
-# 环境变量 & 配置
-#################################
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export HOME=/root   # ⭐ 确保 cron 下 ~ 指向 root
-
+# ================== 颜色 ==================
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
+RED="\033[31m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/rsync_task"
-SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/vv.sh"
-SCRIPT_PATH="$BASE_DIR/rsync_manager.sh"
-KEY_DIR="$BASE_DIR/keys"
-LOG_DIR="$BASE_DIR/logs"
-CONFIG_FILE="$BASE_DIR/rsync_tasks.conf"
-TG_CONFIG="$BASE_DIR/.tg.conf"
-BIN_LINK_DIR="/usr/local/bin"
+# ================== 全局变量 & 目录配置 ==================
+BASE_DIR="/opt/rclone_manager"
+LOG_DIR="$BASE_DIR/log"
+SCRIPT_DIR="$BASE_DIR/scripts"
+CONFIG_FILE="$BASE_DIR/config.env"
+CRON_PREFIX="# rclone_sync_task:"
 
-mkdir -p "$BASE_DIR" "$KEY_DIR" "$LOG_DIR"
-touch "$CONFIG_FILE"
+mkdir -p "$LOG_DIR" "$SCRIPT_DIR"
 
-# 动态精准识别系统环境
-if [ -f /etc/alpine-release ]; then
-    OS="Alpine Linux $(cat /etc/alpine-release)"
-elif [ -f /etc/os-release ]; then
-    . /etc/os-release
-    OS="$NAME"
+# 获取系统环境名称
+if [ -f /etc/os-release ]; then
+    OS=$(awk -F= '/^NAME/{print $2}' /etc/os-release | tr -d '"')
 else
     OS=$(uname -s)
 fi
 
-#################################
-# 稳定统计任务数量
-#################################
-task_count() {
-    awk 'NF{c++} END{print c+0}' "$CONFIG_FILE"
-}
-
-cron_count() {
-    local count
-    count=$(crontab -l 2>/dev/null | grep -c "# rsync_" || true)
-    echo $((count + 0))
-}
-
-#################################
-# 安装依赖
-#################################
-install_dep() {
-    local pkgs="rsync openssh sshpass curl tar"
-    if [ -f /etc/alpine-release ]; then
-        pkgs="rsync openssh-client sshpass curl tar bash"
-        for p in $pkgs; do
-            if ! command -v ${p%-*} &>/dev/null; then
-                apk update -q && apk add -q $p >/dev/null 2>&1
-            fi
-        done
-    else
-        for p in rsync ssh sshpass curl tar; do
-            if ! command -v $p &>/dev/null; then
-                DEBIAN_FRONTEND=noninteractive apt-get update -qq
-                DEBIAN_FRONTEND=noninteractive apt-get install -y $p >/dev/null 2>&1
-            fi
-        done
-    fi
-}
-install_dep
-
-#################################
-# Telegram 通知
-#################################
-send_tg() {
-    [[ -f "$TG_CONFIG" ]] || return
-    . "$TG_CONFIG"   
-    msg="$1"
-    curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-        -d chat_id="$CHAT_ID" \
-        -d text="[$VPS_NAME] $msg" >/dev/null 2>&1
-}
-
-setup_tg() {
-    read -p "VPS名称: " VPS_NAME
-    read -p "Bot Token: " BOT_TOKEN
-    read -p "Chat ID: " CHAT_ID
-    cat > "$TG_CONFIG" <<EOF
-VPS_NAME="$VPS_NAME"
-BOT_TOKEN="$BOT_TOKEN"
-CHAT_ID="$CHAT_ID"
+# ================== 载入或初始化配置文件 ==================
+init_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        cat > "$CONFIG_FILE" <<EOF
+TG_TOKEN="填入你的默认BotToken"
+TG_CHAT_ID="填入你的默认ChatID"
+VPS_NAME="未命名VPS"
 EOF
-    chmod 600 "$TG_CONFIG"
-    echo -e "${GREEN}TG配置已保存${RESET}"
-}
-
-#################################
-# ⭐ SSH 密钥自动化生成与全静默分发
-#################################
-generate_and_setup_ssh() {
-    local remote="$1"     # 格式: user@ip
-    local port="$2"       # 端口
-    local password="$3"   # 用于自动化分发的临时密码
-
-    KEY_FILE="$KEY_DIR/id_rsa_rsync"
-    PUB_FILE="$KEY_FILE.pub"
-
-    # 1. 如果本地没有密钥对，自动在后台静默生成 (不设密码)
-    if [[ ! -f "$KEY_FILE" ]]; then
-        echo -e "${YELLOW}未检测到本地专用密钥对，正在自动创建...${RESET}"
-        ssh-keygen -t rsa -b 4096 -f "$KEY_FILE" -N "" -q
-        chmod 600 "$KEY_FILE"
-        echo -e "${GREEN}✅ 本地安全密钥对已成功生成。${RESET}"
     fi
+    source "$CONFIG_FILE"
+}
+init_config
 
-    local pubkey_content
-    pubkey_content=$(cat "$PUB_FILE")
-
-    echo -e "${YELLOW}正在尝试自动化建立远程密钥授信通道...${RESET}"
-
-    # 清理可能存在的旧指纹冲突冲突
-    ssh-keygen -f "$HOME/.ssh/known_hosts" -R "${remote#*@}" >/dev/null 2>&1
-
-    # 2. 全自动后门对齐：强制静默接受指纹，注入公钥并规整权限
-    local ssh_cmd="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p $port"
+# ================== 动态状态获取 ==================
+get_system_status() {
+    echo -e "${GREEN}=========== 系统实时状态面板 ==========${RESET}"
     
-    set +e
-    # 远端建立 .ssh 文件夹
-    sshpass -p "$password" $ssh_cmd "$remote" "mkdir -p ~/.ssh && chmod 700 ~/.ssh" >/dev/null 2>&1
-    # 远端写入公钥并设置 600 权限 (使用 grep 防止重复写入)
-    sshpass -p "$password" $ssh_cmd "$remote" "touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && grep -Fxq '$pubkey_content' ~/.ssh/authorized_keys || echo '$pubkey_content' >> ~/.ssh/authorized_keys" >/dev/null 2>&1
-
-    # 3. 严格闭环验证：使用刚刚生成的密钥进行免密连接测试
-    ssh -i "$KEY_FILE" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p "$port" "$remote" "echo ok" >/dev/null 2>&1
-    local ok=$?
-    set -e
-
-    if [[ $ok -eq 0 ]]; then
-        echo -e "${GREEN}✅ 密钥自动化分发成功！已成功与远程 VPS 建立免密信任。${RESET}"
-        return 0
+    if command -v rclone &> /dev/null; then
+        local rclone_ver=$(rclone version | head -n 1 | awk '{print $2}')
+        echo -e "Rclone 状态: ${GREEN}已安装 (${rclone_ver})${RESET}"
     else
-        echo -e "${RED}❌ 密钥自动化分发失败。请检查你输入的密码、端口、或远程 VPS 是否允许 root 登录。${RESET}"
-        return 1
+        echo -e "Rclone 状态: ${RED}未安装${RESET}"
     fi
-}
 
-#################################
-# 任务管理与快照预览
-#################################
-list_tasks() {
-    [[ ! -s "$CONFIG_FILE" ]] && { echo -e "${YELLOW}暂无任何同步任务${RESET}"; return; }
-    awk -F'|' -v YELLOW="$YELLOW" -v RESET="$RESET" -v GREEN="$GREEN" \
-    '{
-        if (NF == 7) {
-            name=$1; local_path=$2; user="root"; ip=$3; port=$5; auth=$6;
-            if(ip ~ /@/) { split(ip, arr, "@"); user=arr[1]; ip=arr[2]; }
-        } else {
-            name=$1; local_path=$2; user=$3; ip=$4; port=$5; auth=$6;
-        }
-        auth_zh = (auth == "password") ? "密码" : "密钥";
-        printf " " GREEN "•" RESET " " YELLOW "%-2d)" RESET " %-12s | 本地:%-16s -> 远端:%s@%s [%s|端口:%s]\n", NR, name, local_path, user, ip, auth_zh, port
-    }' "$CONFIG_FILE"
-}
-
-add_task() {
-    read -p "任务名称: " name
-    read -p "本地目录: " local
-    read -p "远程目录: " remote_path
-    read -p "远程用户名 (默认 root): " user
-    user=${user:-root}
-    read -p "远程服务器 IP: " ip
-    read -p "端口 (默认 22): " port
-    port=${port:-22}
-
-    echo -e "${GREEN}选择远端认证方式: 1) 密码验证  2) 密钥对验证 (全自动铺设)${RESET}"
-    read -p "请选择 [1-2]: " c
-    if [[ $c == 1 ]]; then
-        read -s -p "请输入远程服务器密码: " secret; echo
-        auth="password"
+    if command -v rclone &> /dev/null; then
+        local remote_count=$(rclone listremotes 2>/dev/null | wc -l)
+        echo -e "已配置网盘: ${CYAN}${remote_count} 个${RESET}"
     else
-        # 选密钥时，向用户索要一次性密码用于后台传输公钥
-        read -s -p "请输入远程服务器密码 (仅用于首次自动拷贝密钥): " temp_pwd; echo
-        
-        # 调用自动密钥生成与分发函数
-        if generate_and_setup_ssh "${user}@${ip}" "$port" "$temp_pwd"; then
-            secret="$KEY_DIR/id_rsa_rsync"
-            auth="key"
-        else
-            echo -e "${RED}由于密钥无法送达，任务放弃添加。${RESET}"
-            return 1
-        fi
+        echo -e "已配置网盘: ${YELLOW}----${RESET}"
     fi
 
-    echo "$name|$local|$user|$ip|$port|$auth|$secret|$remote_path" >> "$CONFIG_FILE"
-    echo -e "${GREEN}✅ 同步传输链路添加成功！${RESET}"
-}
-
-delete_task() {
-    read -p "请输入要删除的任务编号: " n
-    if sed -n "${n}p" "$CONFIG_FILE" | grep -q '.*'; then
-        sed -i "${n}d" "$CONFIG_FILE"
-        echo -e "${GREEN}任务已删除。${RESET}"
+    local active_mounts=$(mount | grep -i "rclone" | awk '{print $3}')
+    if [ -n "$active_mounts" ]; then
+        echo -e "活跃挂载点: "
+        echo "$active_mounts" | while read -r mnt; do
+            echo -e "  ${GREEN}●${RESET} $mnt (已开启开机自启)"
+        done
     else
-        echo -e "${RED}编号不存在。${RESET}"
-    fi
-}
-
-#################################
-# 压缩同步
-#################################
-run_task() {
-    local direction="$1"
-    local num="$2"
-
-    if [[ -z "$num" ]]; then
-        read -p "请输入要执行的任务编号: " num
+        echo -e "活跃挂载点: ${YELLOW}暂无活跃挂载${RESET}"
     fi
 
-    local task
-    task=$(sed -n "${num}p" "$CONFIG_FILE" | tr -d '\r\n')
+    local cron_count=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX" | wc -l)
+    echo -e "同步定时任务: ${CYAN}${cron_count} 个活跃任务${RESET}"
 
-    if [[ -z "$task" ]]; then
-        echo "任务编号 $num 不存在" >> "$LOG_DIR/error.log"
-        send_tg "同步失败：任务 $num 不存在 ❌"
-        return 1
-    fi
-
-    local name local_dir user ip port auth secret remote_path
-    local field_count
-    field_count=$(echo "$task" | awk -F'|' '{print NF}')
-
-    if [ "$field_count" -eq 7 ]; then
-        IFS='|' read -r name local_dir ip remote_path port auth secret <<< "$task"
-        user="root"
-        if [[ "$ip" == *@* ]]; then
-            user="${ip%%@*}"
-            ip="${ip##*@}"
-        fi
+    if [[ "$TG_TOKEN" == "填入你的默认BotToken" || -z "$TG_TOKEN" ]]; then
+        echo -e "TG 通知状态: ${YELLOW}未配置 (部分功能将缺乏推送)${RESET}"
     else
-        IFS='|' read -r name local_dir user ip port auth secret remote_path <<< "$task"
+        echo -e "TG 通知状态: ${GREEN}已启用 (${VPS_NAME})${RESET}"
     fi
-    
-    local safe_name
-    safe_name=$(echo "$name" | tr '/' '_')
-    local archive="/tmp/sync_task_${safe_name}.tar.gz"
-    local remote="${user}@${ip}"
-
-    echo -e "${YELLOW}正在开始执行同步任务 [$name] ...${RESET}"
-
-    # 纯净静默安全传输参数
-    local common_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p $port"
-
-    if [[ "$direction" == "push" ]]; then
-        # 1. 打包本地目录
-        tar -czf "$archive" -C "$(dirname "$local_dir")" "$(basename "$local_dir")"
-        if [ $? -ne 0 ]; then
-            echo -e "${RED}❌ [$name] 本地打包失败。${RESET}"
-            return 1
-        fi
-
-        # 2. 远端创建目录并同步推流
-        local sync_ok=1
-        if [[ "$auth" == "password" ]]; then
-            sshpass -p "$secret" ssh $common_opts "$remote" "mkdir -p $remote_path" && \
-            sshpass -p "$secret" rsync -az -e "ssh $common_opts" "$archive" "$remote:$remote_path/"
-            sync_ok=$?
-        else
-            ssh -i "$secret" $common_opts "$remote" "mkdir -p $remote_path" && \
-            rsync -az -e "ssh -i $secret $common_opts" "$archive" "$remote:$remote_path/"
-            sync_ok=$?
-        fi
-        
-        rm -f "$archive"
-
-        # 3. 严格判定同步返回值
-        if [ $sync_ok -eq 0 ]; then
-            echo -e "${GREEN}✅ [$name] 推送完成${RESET}"
-            send_tg "$name 推送完成 ✅"
-            return 0
-        else
-            echo -e "${RED}❌ [$name] 同步推流期间发生严重错误 (代码: $sync_ok)。${RESET}"
-            send_tg "$name 推送发生错误 ❌"
-            return 1
-        fi
-    else
-        # 接收模式拉取
-        local sync_ok=1
-        if [[ "$auth" == "password" ]]; then
-            sshpass -p "$secret" rsync -az -e "ssh $common_opts" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
-            sync_ok=$?
-        else
-            rsync -az -e "ssh -i $secret $common_opts" "$remote:$remote_path/$(basename "$archive")" "/tmp/"
-            sync_ok=$?
-        fi
-
-        if [ $sync_ok -eq 0 ] && [ -f "$archive" ]; then
-            rm -rf "$local_dir"
-            mkdir -p "$local_dir"
-            tar -xzf "$archive" -C "$(dirname "$local_dir")"
-            rm -f "$archive"
-            echo -e "${GREEN}✅ [$name] 拉取同步恢复完成${RESET}"
-            send_tg "$name 拉取完成 ✅"
-            return 0
-        else
-            echo -e "${RED}❌ [$name] 拉取同步流错误或未发现远端压缩文件。${RESET}"
-            send_tg "$name 拉取失败 ❌"
-            rm -f "$archive"
-            return 1
-        fi
-    fi
+    echo -e "${GREEN}======================================${RESET}"
 }
 
-batch_run() {
-    read -p "批量任务编号(多个逗号隔开，或输入 all): " nums
-    if [[ "$nums" == "all" ]]; then
-        local count
-        count=$(task_count)
-        nums=$(seq 1 $count | tr '\n' ',' | sed 's/,$//')
-    fi
-    
-    OLDIFS=$IFS
-    IFS=','
-    for n in $nums; do
-        n=$(echo "$n" | tr -d '\r\n ')
-        [[ -n "$n" ]] && run_task "$1" "$n"
-    done
-    IFS=$OLDIFS
-}
-
-#################################
-# 定时任务管理
-#################################
-schedule_task() {
-    echo -e "${GREEN}定时任务频率模板:${RESET}"
-    echo -e "  1) 每天0点"
-    echo -e "  2) 每周一0点"
-    echo -e "  3) 每月1号0点"
-    echo -e "  4) 自定义cron表达式"
-    read -p "选择模板: " tmpl
-    case $tmpl in
-        1) cron="0 0 * * *" ;;
-        2) cron="0 0 * * 1" ;;
-        3) cron="0 0 1 * *" ;;
-        4) read -p "请输入标准cron表达式: " cron ;;
-        *) echo -e "${RED}无效选择${RESET}"; return ;;
-    esac
-
-    read -p "请输入要绑定的任务编号(多个用逗号隔开，或输入 all): " nums
-    if [[ "$nums" == "all" ]]; then
-        count=$(task_count)
-        nums=$(seq 1 $count)
-    fi
-
-    OLDIFS=$IFS
-    IFS=','
-    for n in $nums; do
-        n=$(echo "$n" | tr -d '\r\n ')
-        [[ -z "$n" ]] && continue
-        job="$cron /bin/bash $SCRIPT_PATH auto push $n >> $LOG_DIR/cron_$n.log 2>&1 # rsync_$n"
-        crontab -l 2>/dev/null | grep -v "# rsync_$n" | { cat; echo "$job"; } | crontab -
-        echo -e "${GREEN}✅ 任务 $n 已成功挂载定时自动化守护${RESET}"
-    done
-    IFS=$OLDIFS
-}
-
-delete_schedule() {
-    read -p "请输入要取消定时的任务编号(多个用逗号隔开，或输入 all): " nums
-    if [[ "$nums" == "all" ]]; then
-        crontab -l 2>/dev/null | grep -v "# rsync_" | crontab -
-        echo -e "${YELLOW}✅ 已清空全部定时同步任务${RESET}"
-        return
-    fi
-    OLDIFS=$IFS
-    IFS=','
-    for n in $nums; do
-        n=$(echo "$n" | tr -d '\r\n ')
-        [[ -z "$n" ]] && continue
-        crontab -l 2>/dev/null | grep -v "# rsync_$n" | crontab -
-        echo -e "${YELLOW}✅ 任务 $n 的定时任务已成功卸载${RESET}"
-    done
-    IFS=$OLDIFS
-}
-
-#################################
-# 更新 & 卸载
-#################################
-update_self() {
-    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
-    chmod +x "$SCRIPT_PATH"
-    echo -e "${GREEN}管理面板已成功自我更新！${RESET}"
-}
-
-if [[ "$1" == "auto" ]]; then
-    run_task "$2" "$3"
-    exit
-fi
-
-uninstall_self() {
-    crontab -l 2>/dev/null | grep -v "rsync_" | crontab - || true
-    rm -rf "$BASE_DIR"
-    rm -f "$BIN_LINK_DIR/s" "$BIN_LINK_DIR/S"
-    echo -e "${RED}本同步工具已彻底从当前系统卸载。${RESET}"
-    exit
-}
-
-if [ ! -f "$SCRIPT_PATH" ]; then
-    curl -fsSL -o "$SCRIPT_PATH" "$SCRIPT_URL"
-    chmod +x "$SCRIPT_PATH"
-    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/s"
-    ln -sf "$SCRIPT_PATH" "$BIN_LINK_DIR/S"
-    echo -e "${GREEN}✅ 安装完成${RESET}"
-fi
-
-#################################
-# 主菜单循环
-#################################
-while true; do
+# ================== 菜单 ==================
+show_menu() {
     clear
-    FILE_COUNT=$(task_count)
-    CRON_ACTIVE=$(cron_count)
+    get_system_status
     
+    echo -e "${GREEN}=========== Rclone 管理菜单 ==========${RESET}"
+    echo -e "${CYAN} 1)${RESET} 安装 Rclone          ${CYAN} 2)${RESET} 更新 Rclone"
+    echo -e "${CYAN} 3)${RESET} 配置 Rclone (config) ${CYAN} 4)${RESET} 查看远程存储列表"
+    echo -e "${CYAN} 5)${RESET} 查看远程存储文件"
+    echo -e "----------------------------------------"
+    echo -e "${GREEN} [ 挂载管理 (自动配置开机自启) ]${RESET}"
+    echo -e "${CYAN} 6)${RESET} 挂载远程存储到本地   ${CYAN} 7)${RESET} 查看已创建的资产清单"
+    echo -e "${CYAN} 8)${RESET} 卸载指定挂载点       ${CYAN} 9)${RESET} 卸载所有挂载点"
+    echo -e "${CYAN}10)${RESET} 查看挂载运行状态     ${CYAN}11)${RESET} 查看挂载实时日志"
+    echo -e "----------------------------------------"
+    echo -e "${GREEN} [ 数据同步与任务 ]${RESET}"
+    echo -e "${CYAN}12)${RESET} 手动同步 本地 → 远程 ${CYAN}13)${RESET} 手动同步 远程 → 本地"
+    echo -e "${CYAN}14)${RESET} 定时任务管理 (Cron)"
+    echo -e "----------------------------------------"
+    echo -e "${GREEN} [ 全局设置与常规 ]${RESET}"
+    echo -e "${CYAN}15)${RESET} 修改 TG 通知参数     ${CYAN}16)${RESET} 彻底卸载 Rclone"
+    echo -e "${CYAN} 0)${RESET} 退出脚本"
+    echo -e "${GREEN}======================================${RESET}"
+}
+
+# ================== 基础操作 ==================
+install_rclone() {
+    echo -e "${YELLOW}正在安装 Rclone...${RESET}"
+    curl https://rclone.org/install.sh | sudo bash
+    echo -e "${GREEN}Rclone 安装完成！${RESET}"
+}
+
+update_rclone() {
+    echo -e "${YELLOW}正在更新 Rclone...${RESET}"
+    curl https://rclone.org/install.sh | sudo bash
+    echo -e "${GREEN}Rclone 已更新完成！${RESET}"
+    rclone version
+}
+
+config_rclone() { rclone config; }
+list_remotes() { rclone listremotes; }
+
+list_files_remote() {
+    read -p "请输入Rclone创建的网盘名称: " remote
+    [ -z "$remote" ] && { echo -e "${RED}远程名称不能为空${RESET}"; return; }
+    read -p "请输入远程目录(默认 /): " remote_dir
+    remote_dir=${remote_dir:-/}
+    rclone ls "${remote}:${remote_dir}" || echo -e "${RED}访问失败，请检查名称或权限${RESET}"
+}
+
+# ================== TG 参数持久化 ==================
+modify_tg() {
+    read -p "请输入 TG Bot Token (当前: $TG_TOKEN): " input_token
+    read -p "请输入 TG Chat ID (当前: $TG_CHAT_ID): " input_id
+    read -p "请输入 VPS 名称 (当前: $VPS_NAME): " input_name
+
+    TG_TOKEN=${input_token:-$TG_TOKEN}
+    TG_CHAT_ID=${input_id:-$TG_CHAT_ID}
+    VPS_NAME=${input_name:-$VPS_NAME}
+
+    cat > "$CONFIG_FILE" <<EOF
+TG_TOKEN="$TG_TOKEN"
+TG_CHAT_ID="$TG_CHAT_ID"
+VPS_NAME="$VPS_NAME"
+EOF
+    echo -e "${GREEN}TG 参数已成功保存到本地配置文件！${RESET}"
+}
+
+send_tg() {
+    local msg="$1"
+    source "$CONFIG_FILE"
+    if [[ "$TG_TOKEN" != "填入你的默认BotToken" ]]; then
+        curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT_ID}" -d text="[$VPS_NAME] $msg" >/dev/null
+    fi
+}
+
+
+# ================== 智能挂载自启动一体化 (基于 Systemd 底层) ==================
+mount_remote() {
+    read -p "请输入Rclone创建的网盘名称 " remote
+    [ -z "$remote" ] && return
+    default_path="/mnt/$remote"
+    read -p "请输入挂载路径(默认 $default_path): " input_path
+    path=${input_path:-$default_path}
+    
+    # 1. 检查防冲突
+    if mount | grep -q "on $path type"; then
+        echo -e "${YELLOW}该路径 $path 已经被挂载。正在执行热刷新升级...${RESET}"
+        sudo fusermount -u "$path" 2>/dev/null || sudo umount -l "$path" 2>/dev/null
+    fi
+
+    [ -f "/var/run/rclone_${remote}.pid" ] && rm -f "/var/run/rclone_${remote}.pid"
+
+    mkdir -p "$path"
+    service_file="/etc/systemd/system/rclone-mount@${remote}.service"
+    
+    # 2. 直接一步到位写入 Systemd 实现守护与开机自启
+    sudo tee "$service_file" >/dev/null <<EOF
+[Unit]
+Description=Rclone Mount ${remote}
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/rclone mount ${remote}: $path --allow-other --vfs-cache-mode writes --dir-cache-time 1000h
+ExecStop=/bin/fusermount -u $path
+Restart=always
+RestartSec=10
+StandardOutput=append:$LOG_DIR/rclone_${remote}_sys.log
+StandardError=append:$LOG_DIR/rclone_${remote}_sys.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable rclone-mount@${remote}
+    sudo systemctl start rclone-mount@${remote}
+    
+    sleep 1.5
+    if systemctl is-active --quiet "rclone-mount@${remote}"; then
+        echo -e "${GREEN}✅ $remote 已成功挂载到 $path，且已妥善配置守护及开机自启动！${RESET}"
+    else
+        echo -e "${RED}❌ 挂载启动失败，请检查报错日志: $LOG_DIR/rclone_${remote}_sys.log${RESET}"
+    fi
+}
+
+unmount_remote_by_name() {
+    read -p "请输入想要卸载的Rclone创建的网盘名称: " remote
+    [ -z "$remote" ] && return
+    
+    local svc="rclone-mount@${remote}"
+    
+    if [ -f "/etc/systemd/system/${svc}.service" ] || systemctl list-unit-files | grep -q "^${svc}"; then
+        echo -e "${YELLOW}正在停止并移除 [${remote}] 的开机自启动守护服务...${RESET}"
+        sudo systemctl stop "$svc" 2>/dev/null
+        sudo systemctl disable "$svc" 2>/dev/null
+        sudo rm -f "/etc/systemd/system/${svc}.service"
+        sudo systemctl daemon-reload
+    fi
+
+    sudo fusermount -u "/mnt/$remote" 2>/dev/null || sudo umount -l "/mnt/$remote" 2>/dev/null
+    [ -f "/var/run/rclone_${remote}.pid" ] && rm -f "/var/run/rclone_${remote}.pid"
+
+    echo -e "${GREEN}✅ 远程存储 ${remote} 卸载完成，且开机自启动已同步移除！${RESET}"
+}
+
+unmount_all() {
+    echo -e "${YELLOW}正在全面清空并移除所有网盘挂载与开机自启动...${RESET}"
+    
+    local sys_services=$(systemctl list-units --type=service --plains --all | grep "rclone-mount@" | awk '{print $1}')
+    if [ -n "$sys_services" ]; then
+        for svc in $sys_services; do
+            echo -e "${CYAN} ➜ 正在清理服务: $svc${RESET}"
+            sudo systemctl stop "$svc" 2>/dev/null
+            sudo systemctl disable "$svc" 2>/dev/null
+            sudo rm -f "/etc/systemd/system/$svc"
+        done
+        sudo systemctl daemon-reload
+    fi
+
+    rm -f /var/run/rclone_*.pid
+
+    local active_mounts=$(mount | grep -i "rclone" | awk '{print $3}')
+    if [ -n "$active_mounts" ]; then
+        echo "$active_mounts" | while read -r mnt; do
+            sudo fusermount -u "$mnt" 2>/dev/null || sudo umount -l "$mnt" 2>/dev/null
+        done
+    fi
+    echo -e "${GREEN}✅ 系统内所有 Rclone 挂载及相关自启服务已全部清洗完毕。${RESET}"
+}
+
+# ================== 资产清单综合查看面板 ==================
+show_assets_manifest() {
     echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}      ◈  VPS Rsync同步管理系统  ◈      ${RESET}"
+    echo -e "${GREEN}       📁 Rclone 已创资产名称清单      ${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    
+    # 1. 扫描已生成的自启动挂载服务
+    echo -e "${CYAN}[1] 已创建的自启动挂载服务名字信息：${RESET}"
+    local service_files=$(ls /etc/systemd/system/rclone-mount@*.service 2>/dev/null)
+    if [ -n "$service_files" ]; then
+        echo "$service_files" | while read -r file; do
+            # 提取网盘名称
+            local r_name=$(basename "$file" | sed 's/rclone-mount@//;s/\.service//')
+            # 提取挂载路径
+            local m_path=$(grep -E '^ExecStart=' "$file" | awk '{print $4}')
+            # 检查当前是否在运行
+            if systemctl is-active --quiet "rclone-mount@${r_name}"; then
+                local r_status="${GREEN}● 正在运行${RESET}"
+            else
+                local r_status="${RED}○ 已停止${RESET}"
+            fi
+            echo -e "  网盘名称: ${YELLOW}${r_name}${RESET}  |  挂载路径: ${YELLOW}${m_path}${RESET}  [${r_status}]"
+        done
+    else
+        echo -e "  ${YELLOW}(暂无通过本脚本创建的挂载服务)${RESET}"
+    fi
+
+    echo -e "---------------------------------------"
+
+    # 2. 扫描本脚本生成的 Cron 定时同步任务
+    echo -e "${CYAN}[2] 已创建的定时任务(Cron)名字信息：${RESET}"
+    local cron_tasks=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX")
+    if [ -n "$cron_tasks" ]; then
+        echo "$cron_tasks" | while read -r line; do
+            # 提取任务唯一标识名
+            local task_id=$(echo "$line" | awk -F "$CRON_PREFIX" '{print $2}')
+            # 提取运行周期表达式
+            local cron_time=$(echo "$line" | awk -F "/opt/rclone_manager" '{print $1}')
+            echo -e "  任务名字: ${YELLOW}${task_id}${RESET}  |  执行周期: ${YELLOW}${cron_time}${RESET}"
+        done
+    else
+        echo -e "  ${YELLOW}(暂无通过本脚本创建的定时同步任务)${RESET}"
+    fi
+    echo -e "${GREEN}=======================================${RESET}"
+}
+
+# ================== 状态和日志查看 ==================
+view_mount_status() {
+    read -p "请输入想要查看状态的Rclone创建网盘名称: " remote
+    [ -z "$remote" ] && return
+    local svc="rclone-mount@${remote}"
+    
+    if systemctl list-unit-files | grep -q "^${svc}"; then
+        echo -e "${CYAN}--- Systemd 状态服务信息 ---${RESET}"
+        sudo systemctl status "$svc"
+    else
+        echo -e "${RED}未找到该网盘 [${remote}] 对应的挂载守护服务，请确认名称是否正确。${RESET}"
+    fi
+}
+
+view_mount_logs() {
+    read -p "想要查看实时日志，请输入Rclone创建的网盘名称: " remote
+    [ -z "$remote" ] && return
+    local log_file="$LOG_DIR/rclone_${remote}_sys.log"
+    
+    if [ -f "$log_file" ]; then
+        echo -e "${CYAN}--- 正在读取实时日志 (按 Ctrl+C 退出日志查看模式) ---${RESET}"
+        tail -n 50 -f "$log_file"
+    else
+        echo -e "${RED}未找到对应的日志文件: ${log_file}${RESET}"
+    fi
+}
+
+# ================== 高级定时任务管理面板 ==================
+show_cron_panel() {
+    local TASK_COUNT=$(crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]' | wc -l)
+
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}        ◈  Cron 定时任务管理面板  ◈      ${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
     echo -e "${GREEN} 当前系统环境 : ${YELLOW}${OS}${RESET}"
-    echo -e "${GREEN} 活跃任务总数 : ${YELLOW}${FILE_COUNT} 个${RESET}"
-    echo -e "${GREEN} 守护时空计划 : ${YELLOW}${CRON_ACTIVE} 个定时任务正在运行${RESET}"
-    echo -e "${GREEN} 配置数据路径 : ${YELLOW}${BASE_DIR}${RESET}"
+    echo -e "${GREEN} 活跃任务总数 : ${YELLOW}${TASK_COUNT} 条${RESET}"
     echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN} 📦 当前活动的同步任务通道快照预览：${RESET}"
+    echo -e "${GREEN} 📋 当前系统定时任务快照：${RESET}"
     
-    list_tasks
+    if [ "$TASK_COUNT" -gt 0 ]; then
+        crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]' | awk -v cyan="$CYAN" -v reset="$RESET" '{print "   " cyan "•" reset " " $0}'
+    else
+        echo -e "   ${YELLOW}(暂无用户自定义的定时任务)${RESET}"
+    fi
     
     echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  1) 添加同步传输任务${RESET}"
-    echo -e "${GREEN}  2) 移除同步传输任务${RESET}"
-    echo -e "${GREEN}  3) 执行单点推送远端(Push)${RESET}"
-    echo -e "${GREEN}  4) 执行单点拉回本地(Pull)${RESET}"
-    echo -e "${GREEN}  5) 批量同步推送远端(Push)${RESET}"
-    echo -e "${GREEN}  6) 批量同步拉回本地(Pull)${RESET}"
-    echo -e "${GREEN}  7) 设置定时任务${RESET}"
-    echo -e "${GREEN}  8) 删除定时任务${RESET}"
-    echo -e "${GREEN}  9) 配置Telegram通知${RESET}"
-    echo -e "${GREEN} 10) 更新${RESET}"
-    echo -e "${GREEN} 11) 卸载${RESET}"
-    echo -e "${GREEN}  0) 退出${RESET}"
+    echo -e "${GREEN}  1) 快速添加定时任务(引导式)${RESET}"
+    echo -e "${GREEN}  2) 精准删除定时任务(按名称删除)${RESET}"
+    echo -e "${GREEN}  3) 深度手动编辑任务(打开编辑器)${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN}  0) 返回主菜单${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
-    
-    echo -ne "${GREEN}请选择操作编号: ${RESET}"
-    read -r choice
-    case $choice in
-        1) add_task ;;
-        2) delete_task ;;
-        3) run_task push ;;
-        4) run_task pull ;;
-        5) batch_run push ;;
-        6) batch_run pull ;;
-        7) schedule_task ;;
-        8) delete_schedule ;;
-        9) setup_tg ;;
-        10) update_self ;;
-        11) uninstall_self ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}❌ 无效选项${RESET}" ;;
+}
+
+schedule_add() {
+    echo -e "${YELLOW}--- 引导式添加 Rclone 同步任务 ---${RESET}"
+    read -p "任务唯一标识名 (英文字母): " TASK_NAME
+    [ -z "$TASK_NAME" ] && return
+    read -p "本地同步目录 (多个用空格隔开): " LOCAL_DIR
+    read -p "请输入Rclone创建的网盘名称: " REMOTE_NAME
+    read -p "远程目标目录 (默认 backup): " REMOTE_DIR
+    REMOTE_DIR=${REMOTE_DIR:-backup}
+
+    echo -e "${GREEN}选择执行周期:\n 1. 每天0点\n 2. 每周一0点\n 3. 每月1号0点\n 4. 自定义 Cron 表达式${RESET}"
+    read -p "请选择: " t
+    case $t in
+        1) cron_expr="0 0 * * *" ;;
+        2) cron_expr="0 0 * * 1" ;;
+        3) cron_expr="0 0 1 * *" ;;
+        4) read -p "请输入标准 5 位 Cron 表达式: " cron_expr ;;
+        *) echo -e "${RED}❌ 无效选择${RESET}"; return ;;
     esac
-    echo
-    echo -ne "${GREEN}按回车键刷新控制台数据矩阵... ${RESET}"
-    read -r
+
+    SCRIPT_PATH="$SCRIPT_DIR/rclone_sync_${TASK_NAME}.sh"
+    cat > "$SCRIPT_PATH" << 'EOF'
+#!/bin/bash
+CONFIG_FILE="/opt/rclone_manager/config.env"
+if [ -f "$CONFIG_FILE" ]; then source "$CONFIG_FILE"; fi
+EOF
+
+    cat >> "$SCRIPT_PATH" << EOF
+LOG_FILE="$LOG_DIR/rclone_sync_${TASK_NAME}.log"
+send_tg() {
+    if [[ "\$TG_TOKEN" != "填入你的默认BotToken" ]]; then
+        curl -s -X POST "https://api.telegram.org/bot\${TG_TOKEN}/sendMessage" \
+        -d chat_id="\${TG_CHAT_ID}" -d text="[\${VPS_NAME}] \$1" >/dev/null
+    fi
+}
+for d in $LOCAL_DIR; do
+    [ ! -d "\$d" ] && continue
+    name=\$(basename "\$d")
+    target="${REMOTE_NAME}:${REMOTE_DIR}/\$name"
+    rclone sync "\$d" "\$target" -v >> "\$LOG_FILE" 2>&1
+    if [ \$? -eq 0 ]; then
+        echo "[\$(date '+%F %T')] \$d 同步完成 ✅" >> "\$LOG_FILE"
+        send_tg "定时任务 [${TASK_NAME}] 同步成功: \$d ✅"
+    else
+        echo "[\$(date '+%F %T')] \$d 同步失败 ❌" >> "\$LOG_FILE"
+        send_tg "⚠️ 定时任务 [${TASK_NAME}] 同步失败: \$d ❌"
+    fi
+done
+EOF
+
+    chmod +x "$SCRIPT_PATH"
+    (crontab -l 2>/dev/null | grep -v "$CRON_PREFIX$TASK_NAME"; echo "$cron_expr $SCRIPT_PATH $CRON_PREFIX$TASK_NAME") | crontab -
+    echo -e "${GREEN}任务 $TASK_NAME 已成功添加并注入 Crontab！${RESET}"
+}
+
+schedule_del_one() {
+    echo -e "${YELLOW}--- 正在检索本脚本生成的任务... ---${RESET}"
+    local count=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX" | wc -l)
+    if [ "$count" -eq 0 ]; then
+        echo -e "${YELLOW}未发现通过本脚本创建的 Rclone 定时任务。${RESET}"
+        return
+    fi
+
+    crontab -l 2>/dev/null | grep "$CRON_PREFIX" | awk -F "$CRON_PREFIX" '{print "● 可删除任务名: " $2}'
+    echo "---------------------------------------"
+    read -p "请输入你想精确删除的任务名称: " TASK_NAME
+    [ -z "$TASK_NAME" ] && return
+
+    crontab -l 2>/dev/null | grep -v "$CRON_PREFIX$TASK_NAME" | crontab -
+    rm -f "$SCRIPT_DIR/rclone_sync_${TASK_NAME}.sh"
+    echo -e "${GREEN}已成功移除任务: $TASK_NAME${RESET}"
+}
+
+cron_task_menu() {
+    while true; do
+        clear
+        show_cron_panel
+        read -p "$(echo -e ${GREEN}请输入定时任务选项数字: ${RESET})" choice_cron
+        echo ""
+        case $choice_cron in
+            1) schedule_add ;;
+            2) schedule_del_one ;;
+            3) 
+                echo -e "${YELLOW}即将调用系统默认编辑器打开全局 Crontab。${RESET}"
+                read -p "按回车键开始编辑..."
+                crontab -e 
+                ;;
+            0) break ;;
+            *) echo -e "${RED}❌ 输入错误！${RESET}" ;;
+        esac
+        read -p "按回车键继续..."
+    done
+}
+
+# ================== 手动同步功能 ==================
+sync_local_to_remote_multi() {
+    read -p "请输入本地目录路径（多个用空格分隔）: " local_dirs
+    [ -z "$local_dirs" ] && return
+    read -p "请输入Rclone创建的网盘名称: " remote
+    [ -z "$remote" ] && return
+    read -p "请输入远程目标目录(默认 backup): " remote_dir
+    remote_dir=${remote_dir:-backup}
+
+    for d in $local_dirs; do
+        if [ ! -d "$d" ]; then
+            echo -e "${RED}目录不存在，跳过: $d${RESET}"
+            continue
+        fi
+        name=$(basename "$d")
+        target="${remote}:${remote_dir}/${name}"
+        LOG_FILE="$LOG_DIR/rclone_sync_${name}.log"
+
+        echo -e "${YELLOW}正在同步: $d → $target ...${RESET}"
+        rclone sync "$d" "$target" -v -P 2>&1 | tee -a "$LOG_FILE"
+
+        if [ ${PIPESTATUS[0]} -eq 0 ]; then
+            echo "[ $(date '+%F %T') ] 同步完成 ✅" >> "$LOG_FILE"
+            send_tg "Rclone 同步完成: $d → $target ✅"
+        else
+            echo "[ $(date '+%F %T') ] 同步失败 ❌" >> "$LOG_FILE"
+            send_tg "⚠️ Rclone 同步失败: $d → $target ❌"
+        fi
+    done
+}
+
+sync_remote_to_local() {
+    read -p "请输入Rclone创建的网盘名称: " remote
+    [ -z "$remote" ] && return
+    read -p "请输入远程备份目录 (例如 backup): " remote_dir
+    read -p "请输入本地恢复目标目录: " local_dir
+    [ -z "$local_dir" ] && return
+    
+    mkdir -p "$local_dir"
+    rclone sync "${remote}:${remote_dir}" "$local_dir" -v -P
+}
+
+# ================== 卸载全面清理 ==================
+uninstall_rclone() {
+    read -p "确定要彻底卸载 Rclone 及所有管理配置吗？(y/N): " SECURE_CONFIRM
+    [ "$SECURE_CONFIRM" != "y" ] && return
+
+    echo -e "${YELLOW}正在全面清理 Rclone 环境与组件...${RESET}"
+    unmount_all
+    sudo rm -f /usr/bin/rclone /usr/local/bin/rclone
+    sudo rm -rf ~/.config/rclone
+    sudo rm -rf "$BASE_DIR"
+
+    echo -e "${GREEN}卸载完成！所有组件、挂载点及系统残留已清理。${RESET}"
+    exit 0
+}
+
+# ================== 主循环入口 ==================
+while true; do
+    show_menu
+    read -p "$(echo -e ${GREEN}请输入选项数字: ${RESET})" choice
+    case $choice in
+        1) install_rclone ;;
+        2) update_rclone ;;
+        3) config_rclone ;;
+        4) list_remotes ;;
+        5) list_files_remote ;;
+        6) mount_remote ;;
+        7) show_assets_manifest ;;
+        8) unmount_remote_by_name ;;
+        9) unmount_all ;;
+        10) view_mount_status ;;
+        11) view_mount_logs ;;
+        12) sync_local_to_remote_multi ;;
+        13) sync_remote_to_local ;;
+        14) cron_task_menu ;;
+        15) modify_tg ;;
+        16) uninstall_rclone ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}输入错误，请输入菜单中的有效数字！${RESET}" ;;
+    esac
+    read -r -p "按回车键继续..."
 done

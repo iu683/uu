@@ -1,16 +1,13 @@
 #!/bin/bash
 
-# 取消全局 set -e，改用手工逻辑控制，防止流式输入时意外闪退
+# 基础路径设定
 CFT_INSTALL_DIR="/opt/cloudflared"
 CFT_BIN="/usr/local/bin/cloudflared"
-CONF_FILE="$CFT_INSTALL_DIR/config.yml"
-CRED_FILE="$CFT_INSTALL_DIR/tunnel_cred.json"
-INIT_FLAG="$CFT_INSTALL_DIR/.cft_inited"
+TOKEN_FILE="$CFT_INSTALL_DIR/.token"
 IS_OPENWRT=0
 
 G_STATUS=""
 G_VERSION=""
-G_TUNNEL_ID=""
 
 # GitHub 轮询节点列表（用于加速下载 cloudflared 二进制文件）
 GITHUB_PROXY=(
@@ -21,7 +18,6 @@ GITHUB_PROXY=(
     'https://hub.glowp.xyz/'
     '' 
 )
-
 DEFAULT_BACKUP_VER="2026.5.0"
 
 # 标准颜色
@@ -31,6 +27,7 @@ YELLOW="\e[33m"
 RED="\e[31m"
 RESET="\e[0m"
 
+# 检查运行环境与架构
 is_openwrt() { [ -f /etc/openwrt_release ] && IS_OPENWRT=1 || IS_OPENWRT=0; }
 is_openwrt
 
@@ -43,272 +40,166 @@ get_arch() {
     esac
 }
 
+# 自动获取 GitHub 最新版本号
 get_auto_version() {
     local fetched_ver=""
     echo -e "${YELLOW}正在尝试获取 GitHub 远端最新 cloudflared 版本号...${RESET}" >&2
-
     for proxy in "${GITHUB_PROXY[@]}"; do
-        if [ -z "$proxy" ]; then
-            echo -e "${YELLOW} -> 正在尝试[直连]获取 GitHub API...${RESET}" >&2
-        else
-            echo -e "${YELLOW} -> 正在尝试通过节点 [ ${proxy} ] 获取 GitHub API...${RESET}" >&2
-        fi
-
         fetched_ver=$(curl -sL -m 4 "${proxy}https://api.github.com/repos/cloudflare/cloudflared/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | sed 's/"tag_name": *//;s/"//g')
-        
         if [ -n "$fetched_ver" ]; then
-            echo -e "${GREEN}[成功] 成功获取到最新版本号: ${fetched_ver}${RESET}" >&2
             echo "$fetched_ver"
             return 0
         fi
-        echo -e "${RED}    失败，尝试下一个渠道...${RESET}" >&2
     done
-
-    echo -e "${YELLOW}[提示] 无法获取远端版本，激活保底机制，采用预设版本: ${DEFAULT_BACKUP_VER}${RESET}" >&2
     echo "$DEFAULT_BACKUP_VER"
 }
 
+# 下载组件核心逻辑
 download_package_loop() {
     local version=$1
     local arch=$2
-    # cloudflared 官方命名的本地文件名格式：cloudflared-linux-amd64
     local remote_filename="cloudflared-linux-${arch}"
     local success=0
 
     echo -e "${YELLOW}开始下载 cloudflared 二进制文件 ${version} (${arch})...${RESET}"
-
     for proxy in "${GITHUB_PROXY[@]}"; do
-        if [ -z "$proxy" ]; then
-            echo -e "${YELLOW} -> 正在尝试[直连] GitHub 下载...${RESET}"
-        else
-            echo -e "${YELLOW} -> 正在尝试通过节点 [ ${proxy} ] 下载...${RESET}"
-        fi
-
         local url="${proxy}https://github.com/cloudflare/cloudflared/releases/download/${version}/${remote_filename}"
-        
-        if wget -T 10 -O "cloudflared" "$url"; then
+        if wget -T 10 -O "cloudflared_tmp" "$url"; then
             echo -e "${GREEN}[成功] 下载完成！${RESET}"
             success=1
             break
         else
-            echo -e "${RED}    该节点下载失败或超时，自动切换下一个...${RESET}"
-            rm -f "cloudflared"
+            rm -f "cloudflared_tmp"
         fi
     done
-
-    if [ $success -eq 0 ]; then
-        echo -e "${RED}[严重错误] 所有加速节点及直连下载均已尝试，全部失败！${RESET}"
-        return 1
-    fi
-    return 0
+    [ $success -eq 1 ] && return 0 || return 1
 }
 
-is_inited() { [ -f "$INIT_FLAG" ]; }
+# 安装/更新主程序功能
+install_or_update_bin() {
+    local CFT_VER=$(get_auto_version)
+    local ARCH=$(get_arch)
+    
+    mkdir -p "$CFT_INSTALL_DIR"
+    cd "$CFT_INSTALL_DIR" || exit 1
 
+    if download_package_loop "$CFT_VER" "$ARCH"; then
+        stop_service 2>/dev/null || true
+        mv -f "cloudflared_tmp" "$CFT_BIN"
+        chmod +x "$CFT_BIN"
+        echo -e "${GREEN}[成功] cloudflared 主程序已就位/更新成功！${RESET}"
+        [ -f "$TOKEN_FILE" ] && restart_service
+    else
+        echo -e "${RED}[严重错误] 下载失败，请检查网络或重试！${RESET}"
+    fi
+    read -p "按回车返回菜单..." </dev/tty
+}
+
+# 更新隧道运行状态
 update_status_variables() {
-    G_VERSION="未安装"
+    G_VERSION="未检测到组件"
     G_STATUS="${RED}已停止${RESET}"
-    G_TUNNEL_ID="无"
 
     if [ -f "$CFT_BIN" ]; then
         G_VERSION=$($CFT_BIN --version 2>/dev/null | awk '{print $3}' || echo "未知")
-        
         if [ "$IS_OPENWRT" = "1" ]; then
             (ps | grep -v grep | grep -q "[c]loudflared") && G_STATUS="${GREEN}已启动${RESET}"
         else
             (systemctl is-active --quiet cloudflared 2>/dev/null) && G_STATUS="${GREEN}已启动${RESET}"
         fi
     fi
-
-    if [ -f "$CONF_FILE" ]; then
-        G_TUNNEL_ID=$(awk '/tunnel:/{gsub(/[ "]/,"",$2); print $2}' "$CONF_FILE" 2>/dev/null)
-        G_TUNNEL_ID=${G_TUNNEL_ID:-"未配置"}
-    fi
 }
 
-config_after_install() {
-    echo -e "\n${YELLOW}========================================${RESET}"
-    echo -e "${GREEN}cloudflared 安装成功！正在自动进入配置引导...${RESET}"
-    echo -e "${YELLOW}========================================${RESET}\n"
-    sleep 1
-    init_tunnel_config
-}
-
-install_cloudflared() {
-    if [ -f "$CFT_BIN" ]; then
-        echo -e "${RED}[提示] 检测到系统已安装 cloudflared，如需修改配置请使用菜单对应功能${RESET}"
-        read -p "按回车返回菜单..." </dev/tty
-        return
-    fi
-
-    local CFT_VER=$(get_auto_version)
-    local ARCH=$(get_arch)
-    
-    mkdir -p "$CFT_INSTALL_DIR"
-    cd "$CFT_INSTALL_DIR"
-
-    if ! download_package_loop "$CFT_VER" "$ARCH"; then
-        read -p "按回车返回菜单..." </dev/tty
-        return
-    fi
-    
-    cp -f "cloudflared" "$CFT_BIN"
-    chmod +x "$CFT_BIN"
-    rm -f "cloudflared"
-    
-    config_after_install
-}
-
+# 写入 OpenWrt 守护服务
 write_initd_service() {
-cat > /etc/init.d/cloudflared <<'EOF'
+    local token
+    token=$(cat "$TOKEN_FILE" 2>/dev/null)
+    if [ -z "$token" ]; then return 1; fi
+    
+    cat > /etc/init.d/cloudflared <<EOF
 #!/bin/sh /etc/rc.common
 START=99
 USE_PROCD=1
-PROG=/usr/local/bin/cloudflared
-CFG=/opt/cloudflared/config.yml
+PROG=$CFT_BIN
 start_service() {
     procd_open_instance
-    procd_set_param command $PROG --config $CFG tunnel run
+    procd_set_param command \$PROG tunnel run --token "$token"
     procd_set_param respawn
     procd_close_instance
 }
 EOF
-chmod +x /etc/init.d/cloudflared
-/etc/init.d/cloudflared enable
+    chmod +x /etc/init.d/cloudflared
+    /etc/init.d/cloudflared enable
 }
 
+# 写入标准 Linux Systemd 守护服务
 write_systemd_service() {
-cat > /etc/systemd/system/cloudflared.service <<EOF
+    local token
+    token=$(cat "$TOKEN_FILE" 2>/dev/null)
+    if [ -z "$token" ]; then return 1; fi
+
+    cat > /etc/systemd/system/cloudflared.service <<EOF
 [Unit]
-Description=Cloudflare Tunnel
+Description=Cloudflare Tunnel (Token Mode)
 After=network.target
+
 [Service]
 Type=simple
-ExecStart=$CFT_BIN --config $CONF_FILE tunnel run
+ExecStart=$CFT_BIN tunnel run --token $token
 Restart=always
+RestartSec=5
+
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload
+    systemctl daemon-reload
 }
 
-init_tunnel_config() {
-    echo "=== 设定 Cloudflare Tunnel 基础参数 ==="
+# 绑定 Token
+bind_token() {
+    if [ ! -f "$CFT_BIN" ]; then
+        echo -e "${RED}错误：本地没有主程序，请先执行选项 1 安装主程序！${RESET}"
+        sleep 2
+        return
+    fi
+
+    echo "=== 绑定 Cloudflare Tunnel Token ==="
+    echo -e "${YELLOW}请输入你在 Cloudflare 网页端获取的官方一键 Token (eyJhIjoi...):${RESET}"
+    read -p "Token: " input_token </dev/tty
+    
+    if [ -z "$input_token" ]; then
+        echo -e "${RED}Token 不能为空，放弃操作。${RESET}"
+        sleep 1.5
+        return
+    fi
+
     mkdir -p "$CFT_INSTALL_DIR"
-
-    echo -e "${YELLOW}提示：本地配置模式需要您提供在 Cloudflare 创立的 Tunnel ID 以及对应的 Credentials JSON 内容。${RESET}"
-    echo -e "${YELLOW}如果不清楚，建议直接使用 Cloudflare 控制台的【Dashboard 远程管理模式】，直接将生成的官方一键安装服务指令拿来运行即可。${RESET}\n"
+    # 彻底清理可能影响的残留本地模式文件
+    rm -f "$CFT_INSTALL_DIR/config.yml" "$CFT_INSTALL_DIR/tunnel_cred.json" "$CFT_INSTALL_DIR/.cft_inited"
     
-    read -p "请输入你的 Tunnel ID (UUID格式): " TUNNEL_UUID </dev/tty
-    while [[ -z "$TUNNEL_UUID" ]]; do
-        read -p "${RED}Tunnel ID 不能为空，请重新输入: ${RESET}" TUNNEL_UUID </dev/tty
-    done
-
-    echo -e "\n请粘入该 Tunnel 的 Credentials JSON 完整内容 (按下 Enter 后，按 Ctrl+D 结束输入):"
-    local JSON_CONTENT=$(cat)
+    # 写入文件
+    echo "$input_token" | tr -d '\r\n ' > "$TOKEN_FILE"
+    echo -e "${GREEN}Token 记录成功！正在配置并尝试拉起服务...${RESET}"
     
-    if [ -z "$JSON_CONTENT" ]; then
-        echo -e "${RED}输入内容为空，放弃配置。${RESET}"
-        read -p "按回车返回菜单..." </dev/tty
-        return
-    fi
-
-    # 保存凭证文件
-    echo "$JSON_CONTENT" > "$CRED_FILE"
-
-    # 生成初始的基础配置文件 (默认自带一条 404 兜底规则)
-    cat > "$CONF_FILE" <<EOF
-tunnel: $TUNNEL_UUID
-credentials-file: $CRED_FILE
-
-ingress:
-  - service: http_status:404
-EOF
-
-    touch "$INIT_FLAG"
-    restart_service
-    echo -e "${GREEN}基础配置文件已生成并尝试启动服务！${RESET}"
-    read -p "按回车返回菜单..." </dev/tty
-}
-
-add_tunnel_rule() {
-    is_inited || { echo -e "${RED}请先初始化 Tunnel 基础参数！${RESET}"; sleep 2; return; }
-    echo "=== 添加域名映射规则 ==="
-    
-    read -p "完整的公网自定义域名 (如: nas.yourdomain.com): " INGRESS_HOST </dev/tty
-    while [[ -z "$INGRESS_HOST" ]]; do
-        read -p "${RED}域名不能为空: ${RESET}" INGRESS_HOST </dev/tty
-    done
-
-    if grep -q "hostname: $INGRESS_HOST" "$CONF_FILE"; then
-        echo -e "${RED}错误：该域名 [$INGRESS_HOST] 转发规则已存在！${RESET}"
-        sleep 2
-        return
-    fi
-
-    read -p "本地转发的目标服务 (如: http://127.0.0.1:5000 或 tcp://127.0.0.1:22): " LOCAL_SERVICE </dev/tty
-    while [[ -z "$LOCAL_SERVICE" ]]; do
-        read -p "${RED}本地目标服务不能为空: ${RESET}" LOCAL_SERVICE </dev/tty
-    done
-
-    # 临时移除尾部的 404 兜底规则，追加新规则后再补回
-    sed -i '/- service: http_status:404/d' "$CONF_FILE"
-    
-    cat >> "$CONF_FILE" <<EOF
-  - hostname: $INGRESS_HOST
-    service: $LOCAL_SERVICE
-  - service: http_status:404
-EOF
-
-    echo -e "${GREEN}成功添加规则 [$INGRESS_HOST -> $LOCAL_SERVICE]${RESET}"
-    restart_service
-    sleep 1.5
-}
-
-delete_tunnel_rule() {
-    is_inited || { echo -e "${RED}请先初始化 Tunnel 基础参数！${RESET}"; sleep 2; return; }
-    echo -e "\n${CYAN}[当前规则列表]${RESET}"
-    grep "hostname:" "$CONF_FILE" || { echo "暂无任何转发规则"; sleep 1.5; return; }
-    echo
-    read -p "输入要删除的公网域名: " DEL_HOST </dev/tty
-    
-    if ! grep -q "hostname: $DEL_HOST" "$CONF_FILE"; then
-        echo -e "${RED}未找到域名 [$DEL_HOST] 的规则！${RESET}"
-        sleep 2
-        return
-    fi
-
-    # 利用 awk 精确删除对应的 hostname 和紧随其后的 service 行
-    awk -v host="hostname: $DEL_HOST" '
-    $0 ~ host { getline; next }
-    { print $0 }
-    ' "$CONF_FILE" > "${CONF_FILE}.tmp"
-    
-    mv "${CONF_FILE}.tmp" "$CONF_FILE"
-    echo -e "${GREEN}已成功删除域名 [$DEL_HOST] 的映射规则${RESET}"
-    restart_service
-    sleep 1.5
-}
-
-print_tunnel_rules() {
-    if [ -f "$CONF_FILE" ]; then
-        echo -e "${CYAN} 公网域名                    | 本地目标服务${RESET}"
-        echo -e "${CYAN}------------------------------------------------${RESET}"
-        awk '
-        /hostname:/ { host=$3 }
-        /service:/ && !/http_status:404/ { service=$2; printf "  %-26s | %-20s\n", host, service; host="" }
-        ' "$CONF_FILE" | while read -r line; do
-            echo -e "${YELLOW}$line${RESET}"
-        done
-        if ! grep -q "hostname:" "$CONF_FILE"; then
-            echo -e "   ${RED}(暂无本地规则，如已采用网页面板模式请忽略此列表)${RESET}"
-        fi
+    # 重写并重新运行服务
+    if [ "$IS_OPENWRT" = "1" ]; then
+        write_initd_service && /etc/init.d/cloudflared start
     else
-        echo -e "   ${RED}配置文件未生成${RESET}"
+        write_systemd_service && systemctl restart cloudflared 2>/dev/null || systemctl start cloudflared
+        systemctl enable cloudflared 2>/dev/null || true
     fi
+    sleep 1.5
 }
 
+# 启动服务
 start_service() {
+    if [ ! -f "$CFT_BIN" ]; then
+        echo -e "${RED}错误：未安装主程序！${RESET}"; sleep 2; return
+    fi
+    if [ ! -f "$TOKEN_FILE" ]; then
+        echo -e "${RED}错误：请先选择选项 2 绑定你的 Token！${RESET}"; sleep 2; return
+    fi
+
     if [ "$IS_OPENWRT" = "1" ]; then
         write_initd_service
         /etc/init.d/cloudflared start
@@ -317,50 +208,64 @@ start_service() {
         systemctl start cloudflared
         systemctl enable cloudflared 2>/dev/null || true
     fi
-    echo "cloudflared 已启动"; sleep 1;
+    echo "隧道服务已启动"; sleep 1;
 }
 
+# 停止服务
 stop_service() {
-    [ "$IS_OPENWRT" = "1" ] && /etc/init.d/cloudflared stop || systemctl stop cloudflared
-    echo "cloudflared 已停止"; sleep 1;
+    if [ "$IS_OPENWRT" = "1" ]; then
+        /etc/init.d/cloudflared stop
+    else
+        systemctl stop cloudflared
+    fi
+    echo "隧道服务已停止"; sleep 1;
 }
 
+# 重启服务
 restart_service() {
+    if [ ! -f "$CFT_BIN" ] || [ ! -f "$TOKEN_FILE" ]; then
+        echo -e "${RED}错误：未安装主程序或未绑定 Token！${RESET}"; sleep 2; return
+    fi
+
     if [ "$IS_OPENWRT" = "1" ]; then
         write_initd_service
         /etc/init.d/cloudflared restart
     else
         write_systemd_service
         systemctl restart cloudflared
-        systemctl enable cloudflared 2>/dev/null || true
     fi
-    echo "cloudflared 已重启"; sleep 1;
+    echo "隧道服务已重启"; sleep 1;
 }
 
+# 查看运行日志
 log_service() {
+    echo -e "${CYAN}=== 正在获取最近的 30 行隧道运行日志 ===${RESET}"
     if [ "$IS_OPENWRT" = "1" ]; then 
         logread | grep cloudflared | tail -n 30 || echo "暂无日志"
     else 
-        journalctl -u cloudflared -n 40 --no-pager
+        journalctl -u cloudflared -n 30 --no-pager 2>/dev/null || tail -n 30 /var/log/messages 2>/dev/null
     fi
     read -p "按回车返回菜单..." </dev/tty
 }
 
-uninstall_all() {
-    echo "正在卸载 Cloudflare Tunnel..."
-    if [ "$IS_OPENWRT" = "1" ]; then
-        /etc/init.d/cloudflared stop 2>/dev/null || true
-        rm -f /etc/init.d/cloudflared
-    else
-        systemctl stop cloudflared 2>/dev/null || true
-        systemctl disable cloudflared 2>/dev/null || true
-        rm -f /etc/systemd/system/cloudflared.service
-        systemctl daemon-reload
+# 彻底卸载
+uninstall_service() {
+    echo -e "${RED}确定要彻底卸载本地服务及清除所有配置吗？(y/n)${RESET}"
+    read -p "请输入: " confirm </dev/tty
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        stop_service 2>/dev/null || true
+        if [ "$IS_OPENWRT" = "1" ]; then
+            /etc/init.d/cloudflared disable 2>/dev/null || true
+            rm -f /etc/init.d/cloudflared
+        else
+            systemctl disable cloudflared 2>/dev/null || true
+            rm -f /etc/systemd/system/cloudflared.service
+            systemctl daemon-reload
+        fi
+        rm -rf "$CFT_INSTALL_DIR" "$CFT_BIN"
+        echo -e "${GREEN}Cloudflare Tunnel 已完全卸载干净。${RESET}"
+        sleep 2
     fi
-    rm -rf "$CFT_INSTALL_DIR" "$CFT_BIN"
-    echo "Cloudflare Tunnel 已彻底从本机移除。"
-    sleep 2
-    exit 0
 }
 
 # ---------- 主菜单界面 ----------
@@ -369,39 +274,33 @@ main_menu() {
         update_status_variables
         clear
         echo -e "${CYAN}================================${RESET}"
-        echo -e "${CYAN}   Cloudflare Tunnel 管理面板   ${RESET}"
+        echo -e "${CYAN}   Cloudflare 远端控制管理面板    ${RESET}"
+        echo -e "${CYAN}   (Dashboard 模式/无需本地配置)  ${RESET}"
         echo -e "${CYAN}================================${RESET}"
-        echo -e "${CYAN}状态     :${RESET} $G_STATUS"
-        echo -e "${CYAN}版本     :${RESET} ${YELLOW}${G_VERSION}${RESET}"
-        echo -e "${CYAN}TunnelID :${RESET} ${YELLOW}${G_TUNNEL_ID}${RESET}"
+        [ ! -f "$CFT_BIN" ] && echo -e "${RED}[警告] 未找到执行文件，请先执行选项 1 安装！${RESET}"
+        echo -e "${CYAN}当前状态 :${RESET} $G_STATUS"
+        echo -e "${CYAN}主程序版 :${RESET} ${YELLOW}${G_VERSION}${RESET}"
+        echo -e "${CYAN}管理提示 : 规则增删请直接在网页面板操作${RESET}"
         echo -e "${CYAN}================================${RESET}"
-        
-        print_tunnel_rules
-        echo -e "${CYAN}================================${RESET}"
-        
-        echo -e "${CYAN} 1. 安装 cloudflared${RESET}"
-        echo -e "${CYAN} 2. 修改参数${RESET}"
-        echo -e "${CYAN} 3. 新增域名转发规则${RESET}"
-        echo -e "${CYAN} 4. 删除域名转发规则${RESET}"
-        echo -e "${CYAN} 5. 启动隧道服务${RESET}"
-        echo -e "${CYAN} 6. 停止隧道服务${RESET}"
-        echo -e "${CYAN} 7. 重启隧道服务${RESET}"
-        echo -e "${CYAN} 8. 查看运行日志${RESET}"
-        echo -e "${CYAN} 9. 卸载服务${RESET}"
+        echo -e "${CYAN} 1. 安装 / 更新本地 cloudflared 主程序${RESET}"
+        echo -e "${CYAN} 2. 绑定 / 修改云端 Token${RESET}"
+        echo -e "${CYAN} 3. 启动隧道服务${RESET}"
+        echo -e "${CYAN} 4. 停止隧道服务${RESET}"
+        echo -e "${CYAN} 5. 重启隧道服务${RESET}"
+        echo -e "${CYAN} 6. 查看本地运行日志${RESET}"
+        echo -e "${CYAN} 7. 彻底卸载服务与清除残留${RESET}"
         echo -e "${CYAN} 0. 退出${RESET}"
         echo -e "${CYAN}================================${RESET}"
         echo -ne "${CYAN}请输入选项: ${RESET}"
         read choice </dev/tty
         case $choice in
-            1) install_cloudflared ;;
-            2) init_tunnel_config ;;
-            3) add_tunnel_rule ;;
-            4) delete_tunnel_rule ;;
-            5) start_service ;;
-            6) stop_service ;;
-            7) restart_service ;;
-            8) log_service ;;
-            9) uninstall_all ;;
+            1) install_or_update_bin ;;
+            2) bind_token ;;
+            3) start_service ;;
+            4) stop_service ;;
+            5) restart_service ;;
+            6) log_service ;;
+            7) uninstall_service ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效选项！${RESET}" && sleep 1 ;;
         esac

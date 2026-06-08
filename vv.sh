@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # ==============================================================================
-#   Usque (MASQUE-WARP) 面板 
+#   Usque (MASQUE-WARP) 面板
 # ==============================================================================
 
 export REPO="Diniboy1123/usque"
@@ -11,364 +11,226 @@ export INSTALL_BIN="/usr/local/bin/usque"
 export CONF_DIR="/etc/usque"
 export CONF_FILE="${CONF_DIR}/config.json"
 export SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+export META_FILE="${CONF_DIR}/.panel_meta"
 
-# 精准还原你要求的配色方案
+# 配色方案 (保持你的原版)
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 RESET='\033[0m'
 
-GITHUB_PROXY=(
-    'https://v6.gh-proxy.org/'
-    'https://gh-proxy.com/'
-    'https://hub.glowp.xyz/'
-    'https://proxy.vvvv.ee/'
-    'https://ghproxy.lvedong.eu.org/'
-    '' 
-)
+GITHUB_PROXY=('https://v6.gh-proxy.org/' 'https://gh-proxy.com/' 'https://hub.glowp.xyz/' 'https://proxy.vvvv.ee/' 'https://ghproxy.lvedong.eu.org/' '')
 
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${GREEN}[错误]${RESET} 请使用 root 权限运行此脚本！" >&2
-    exit 1
-fi
+[[ "$EUID" -ne 0 ]] && echo -e "${GREEN}[错误]${RESET} 请使用 root 权限运行！" && exit 1
 
 info() { echo -e "${GREEN}[INFO]${RESET} $1"; }
 ok()   { echo -e "${GREEN}[OK]${RESET} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${RESET} $1"; }
 die()  { echo -e "${GREEN}[ERROR]${RESET} $1" >&2; exit 1; }
 
-detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS=$ID
-    else
-        die "无法识别当前操作系统类型。"
-    fi
-}
-detect_os
-
-REQUIRED_CMDS="curl grep awk unzip"
-MISSING_CMDS=""
-for cmd in $REQUIRED_CMDS; do
-    if ! command -v "$cmd" &> /dev/null; then MISSING_CMDS="$MISSING_CMDS $cmd"; fi
-done
-
-if [ -n "$MISSING_CMDS" ]; then
-    info "正在自动安装缺失的系统组件: $MISSING_CMDS..."
-    case "$OS" in
-        ubuntu|debian) apt-get update -qy && apt-get install -y $MISSING_CMDS >/dev/null 2>&1 ;;
-        centos|rhel|rocky|almalinux|fedora)
-            if command -v dnf &>/dev/null; then dnf install -y $MISSING_CMDS >/dev/null 2>&1; else yum install -y $MISSING_CMDS >/dev/null 2>&1; fi ;;
-    esac
-    ok "依赖补全成功！"
-fi
-
-# ── 1. 动态获取最新版本并下载 ──────────────────────────────────────────────
+# --- 1. 下载模块 ---
 download_bin() {
     ARCH=$(uname -m)
     case "$ARCH" in
-        x86_64)  TARGET="linux_amd64" ;;
+        x86_64) TARGET="linux_amd64" ;;
         aarch64) TARGET="linux_arm64" ;;
-        *) die "暂不支持的系统架构: $ARCH" ;;
+        *) die "不支持的架构: $ARCH" ;;
     esac
 
-    info "正在自动检索 GitHub 最新 Release 版本..."
+    info "检索最新版本..."
     local latest_tag=""
     for proxy in "${GITHUB_PROXY[@]}"; do
         latest_tag=$(curl -fsSL --max-time 6 "${proxy}https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         [ -n "$latest_tag" ] && break
     done
 
-    if [ -z "$latest_tag" ]; then
-        latest_tag=$(curl -fsSL --max-time 10 "https://github.com/${REPO}/releases/latest" 2>/dev/null | grep -o 'tag/[vV]*[0-9.]*' | awk -F '/' 'NR==1 {print $2}')
-    fi
-
     [ -z "$latest_tag" ] && latest_tag="v3.0.0"
     local pure_ver="${latest_tag#v}"
-    info "锁定最新版本号: v${pure_ver}"
+    info "下载版本: v${pure_ver}"
 
     local zip_name="usque_${pure_ver}_${TARGET}.zip"
     local tmp_dir=$(mktemp -d)
-    trap 'rm -rf "$tmp_dir"' EXIT
-
-    local download_success=0
+    local success=0
     for proxy in "${GITHUB_PROXY[@]}"; do
-        local url="https://github.com/${REPO}/releases/download/${latest_tag}/${zip_name}"
-        [ -n "$proxy" ] && url="${proxy}${url}"
-        
-        info "自动切入下载源 [${proxy:-官方直连}]..."
-        if curl -fsSL -L --max-time 35 -o "$tmp_dir/$zip_name" "$url"; then
-            download_success=1
-            break
+        if curl -fsSL -L -o "$tmp_dir/zip" "${proxy}https://github.com/${REPO}/releases/download/${latest_tag}/${zip_name}"; then
+            success=1; break
         fi
     done
 
-    if [ "$download_success" -ne 1 ]; then
-        warn "触发 DNS64 管道防御突围..."
-        if [ -f /etc/resolv.conf ]; then cp -f /etc/resolv.conf /etc/resolv.conf.bak; fi
-        echo -e "nameserver 2a01:4f8:c2c:123f::1\nnameserver 2001:4860:4860::8888" > /etc/resolv.conf
-        if curl -fsSL -L --max-time 45 -o "$tmp_dir/$zip_name" "https://github.com/${REPO}/releases/download/${latest_tag}/${zip_name}"; then
-            download_success=1
-        fi
-        [ -f /etc/resolv.conf.bak ] && mv -f /etc/resolv.conf.bak /etc/resolv.conf
-    fi
-
-    [ "$download_success" -ne 1 ] && die "全局下载失败，请检查网络。"
-
-    unzip -q -o "$tmp_dir/$zip_name" -d "$tmp_dir"
-    if [ -f "$tmp_dir/usque" ]; then
-        [ -d "$CONF_DIR" ] || mkdir -p "$CONF_DIR"
-        cp -f "$tmp_dir/usque" "$INSTALL_BIN"
-        chmod +x "$INSTALL_BIN"
-        ok "Usque 内核程序成功升级/部署至 v${pure_ver}。"
-    else
-        die "解压文件异常，未找到内核。"
-    fi
+    [ "$success" -ne 1 ] && die "下载失败。"
+    unzip -q -o "$tmp_dir/zip" -d "$tmp_dir"
+    cp -f "$tmp_dir/usque" "$INSTALL_BIN"
+    chmod +x "$INSTALL_BIN"
+    rm -rf "$tmp_dir"
 }
 
-# ── 2. 全自动云端注册与克隆清洗 (环境自适应) ──────────────────────────────────
+# --- 2. 本地注册 (已融合你的 v6 修正逻辑) ---
 register_usque() {
     local has_v4=0
-    if curl -4sSk --max-time 4 https://www.cloudflare.com/cdn-cgi/trace | grep -q "ip=" 2>/dev/null; then
+    # 增加 -q 并在报错时保持静默，确保脚本继续执行
+    if curl -4sSk --max-time 2 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "ip="; then
         has_v4=1
     fi
 
-    local cp_resolv=0
-    if [ "$has_v4" -ne 1 ]; then
-        info "检测到当前环境为纯 IPv6 独享机，正在配置临时 DNS64 管道..."
-        if [ -f /etc/resolv.conf ]; then cp -f /etc/resolv.conf /etc/resolv.conf.bak; cp_resolv=1; fi
-        echo "nameserver 2a01:4f8:c2c:123f::1" > /etc/resolv.conf
-    else
-        info "检测到当前环境具备常规 IPv4 链路，保持原生配置直连..."
-    fi
-
+    [ -d "$CONF_DIR" ] || mkdir -p "$CONF_DIR"
     cd "$CONF_DIR" || exit 1
     
-    info "云端自动申请 Team Token (JWT) [免交互传递]..."
-    local jwt_token=""
-    jwt_token=$(curl -fsSL --max-time 15 "https://web--public--warp-team-api--coia-mfs4.code.run/" 2>/dev/null)
-    
-    if [[ "$jwt_token" =~ ^ey[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
-        ok "拦截并应用云端 JWT 凭证成功！"
-        local reg_cmd=("${INSTALL_BIN}" "register" "--jwt" "${jwt_token}")
-    else
-        warn "云端 Token 获取受阻，自动降级为匿名无感注册..."
-        local reg_cmd=("${INSTALL_BIN}" "register")
-    fi
-
-    if "${reg_cmd[@]}"; then
-        ok "Cloudflare 凭据注册完成。"
+    info "正在执行本地匿名注册..."
+    # 纯 v6 环境下，如果 register 失败，尝试强制指定 v6 地址（如果程序支持）
+    if "${INSTALL_BIN}" register; then
+        ok "Cloudflare 本地注册成功。"
         
-        # 自适应：只有纯 v6 机才改写配置文件，拥有 v4 则绝对不动
-        if [ -f "$CONF_FILE" ]; then
-            if [ "$has_v4" -ne 1 ]; then
-                info "正在对纯 IPv6 环境进行核心配置文件欺骗清洗..."
-                local real_v6=$(grep -o '"endpoint_v6": *"[^"]*"' "$CONF_FILE" | awk -F '"' '{print $4}')
-                if [ -n "$real_v6" ]; then
-                    sed -i "s/\"endpoint_v4\": *\"[^\"]*\"/\"endpoint_v4\": \"${real_v6}\"/g" "$CONF_FILE"
-                    ok "清洗成功：[endpoint_v4] 已重定向至 -> ${real_v6}"
-                else
-                    warn "未检测到 endpoint_v6，跳过自动清洗。"
-                fi
-            else
-                ok "双栈/V4 环境验证通过，保留官方原生 endpoint_v4 配置，未做任何修改。"
+        # 你的 v6 修正核心逻辑
+        if [ "$has_v4" -ne 1 ] && [ -f "$CONF_FILE" ]; then
+            info "检测到纯 IPv6 环境，正在修正配置文件..."
+            # 提取 v6 节点地址
+            local v6_ep=$(grep -o '"endpoint_v6": *"[^"]*"' "$CONF_FILE" | awk -F '"' '{print $4}')
+            if [ -z "$v6_ep" ]; then
+                # 如果没抓到，给一个手动兜底的 CF IPv6 节点
+                v6_ep="[2606:4700:d0::a25c:bc2e]:2408"
             fi
+            sed -i "s/\"endpoint_v4\": *\"[^\"]*\"/\"endpoint_v4\": \"${v6_ep}\"/g" "$CONF_FILE"
+            ok "IPv6 修正已完成 (Endpoint: $v6_ep)。"
         fi
     else
-        [ "$cp_resolv" -eq 1 ] && mv -f /etc/resolv.conf.bak /etc/resolv.conf
-        die "设备注册失败，请检查机器的外部出站路由。"
+        die "注册失败。提示：请确保你的 VPS 已开启 IPv6 外部访问能力。"
     fi
-    [ "$cp_resolv" -eq 1 ] && mv -f /etc/resolv.conf.bak /etc/resolv.conf
 }
 
-# ── 3. Systemd 生成器 (修复了配置修改后的记录保存) ──────────────────────────────
+# --- 3. 写入服务 ---
 write_systemd() {
-    local bind_ip="$1" local bind_port="$2" local username="$3" local password="$4"
-    local exec_args="socks -b ${bind_ip} -p ${bind_port}"
-    if [ -n "$username" ] && [ -n "$password" ]; then exec_args="${exec_args} -u ${username} -w ${password}"; fi
+    local mode="$1" ip="$2" port="$3" user="$4" pass="$5"
+    local cmd="socks"
+    [[ "$mode" == "HTTP" ]] && cmd="http-proxy"
+
+    local args="${cmd} -b ${ip} -p ${port}"
+    [[ -n "$user" ]] && args="${args} -u ${user} -w ${pass}"
 
     cat <<EOF > "$SERVICE_FILE"
 [Unit]
-Description=Cloudflare WARP MASQUE Proxy Client (Usque Engine)
-After=network.target network-online.target
-Wants=network-online.target
+Description=Usque WARP SOCKS5/HTTP
+After=network.target
 
 [Service]
 Type=simple
 User=${SERVICE_USER}
 WorkingDirectory=${CONF_DIR}
-ExecStart=${INSTALL_BIN} --config ${CONF_FILE} ${exec_args}
+ExecStart=${INSTALL_BIN} --config ${CONF_FILE} ${args}
 Restart=always
-RestartSec=4s
-LimitNOFILE=65535
+RestartSec=3s
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
-    # 修复点：强制更新元数据文件，确保菜单和验证能读到最新配置
-    echo "${bind_ip}:${bind_port}|${username}|${password}" > "${CONF_DIR}/.panel_meta"
+    echo "${mode}|${ip}|${port}|${user}|${pass}" > "$META_FILE"
 }
 
-# ── 4. 状态与配置管理模块 (修复了版本解析指令) ──────────────────────────────────
+# --- 4. 状态获取 ---
 get_status_info() {
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        panel_status="运行中"
-    else
-        panel_status="未运行"
-    fi
-    
+    systemctl is-active --quiet "$SERVICE_NAME" && panel_status="运行中" || panel_status="未运行"
     if [ -f "$INSTALL_BIN" ]; then
-        local check_ver
-        # 修复点：将 -v 改为 version 指令
-        check_ver=$("$INSTALL_BIN" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-        if [ -n "$check_ver" ]; then
-            panel_version="v${check_ver}"
-        else
-            panel_version="已安装"
-        fi
+        local ver=$("$INSTALL_BIN" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+        panel_version="v${ver:-已安装}"
     else
         panel_version="未安装"
     fi
-
-    if [ -f "${CONF_DIR}/.panel_meta" ]; then
-        local meta=$(cat "${CONF_DIR}/.panel_meta"); panel_port="${meta%%|*}"
-    else 
-        panel_port="127.0.0.1:1080"
-    fi
-}
-
-menu_install() {
-    if [ -f "$INSTALL_BIN" ]; then
-        warn "检测到旧实例，正自动执行全覆盖升级安装..."
-    fi
-
-    local opt_ip="127.0.0.1"
-    local opt_port="1080"
-    local opt_user=""
-    local opt_pass=""
-
-    download_bin
-    register_usque
-    write_systemd "$opt_ip" "$opt_port" "$opt_user" "$opt_pass"
-
-    info "拉起后台系统服务..."
-    systemctl restart "$SERVICE_NAME"
-    sleep 2
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        ok "Usque 全自动部署成功！"
+    if [ -f "$META_FILE" ]; then
+        IFS='|' read -r m_mode m_ip m_port m_user m_pass < "$META_FILE"
+        panel_port="${m_mode}://$m_ip:$m_port"
     else
-        warn "初始化中，请选择选项 [8] 追查日志。"
+        panel_port="未配置"
     fi
 }
 
-menu_update() {
-    [ -f "$SERVICE_FILE" ] || die "服务未安装，请先选择 [1] 一键自动安装。"
-    info "正在检测并自动获取上游最新版本..."
-    systemctl stop "$SERVICE_NAME"
-    download_bin
-    systemctl start "$SERVICE_NAME"
-    ok "核心组件已无缝热升级至最新版本！"
-}
-
-menu_uninstall() {
-    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1
-    systemctl disable "$SERVICE_NAME" >/dev/null 2>&1
-    rm -f "$INSTALL_BIN" "$SERVICE_FILE"
-    systemctl daemon-reload; rm -rf "$CONF_DIR"
-    ok "全套组件及环境快照清理完毕。"
-}
-
+# --- 5. 修改配置 (回车保持，输入 read 清空) ---
 menu_edit_config() {
-    [ -f "${CONF_DIR}/.panel_meta" ] || die "未发现运行记录，请先执行安装步骤。"
-    local meta=$(cat "${CONF_DIR}/.panel_meta"); local ip_port="${meta%%|*}"
-    local current_ip="${ip_port%%:*}" current_port="${ip_port##*:}"
-    local remain="${meta#*|}" current_user="${remain%%|*}" current_pass="${remain##*|}"
+    [ -f "$META_FILE" ] || die "未发现配置。"
+    IFS='|' read -r o_mode o_ip o_port o_user o_pass < "$META_FILE"
 
-    echo ""
-    echo "==== [自定义修改监听配置] ===="
-    read -r -p "请输入监听 IP 地址 [当前: ${current_ip}]: " input_ip
-    local opt_ip="${input_ip:-$current_ip}"
-    read -r -p "请输入 SOCKS5 监听端口 [当前: ${current_port}]: " input_port
-    local opt_port="${input_port:-$current_port}"
-    if ! [[ "$opt_port" =~ ^[0-9]+$ ]] || [ "$opt_port" -le 0 ] || [ "$opt_port" -gt 65535 ]; then opt_port="$current_port"; fi
-
-    local opt_user="" local opt_pass=""
-    if [ "$opt_ip" != "127.0.0.1" ] && [ "$opt_ip" != "localhost" ]; then
-        echo "[安全审计] 公网暴露下必须强制设定鉴权密码！"
-        while true; do read -r -p "请输入用户名 [当前: ${current_user}]: " input_user; opt_user="${input_user:-$current_user}"; [ -n "$opt_user" ] && break; done
-        while true; do read -r -p "请输入鉴权密码 (>=8位): " input_pass; opt_pass="${input_pass:-$current_pass}"; if [ ${#opt_pass} -ge 8 ]; then break; fi; warn "密码建议大于8位！"; done
-    else
-        if [ -n "$current_user" ]; then
-            read -r -p "请输入用户名 [当前: ${current_user}，回车不变，输入 none 清除鉴权]: " input_user
-            if [ -z "$input_user" ]; then opt_user="$current_user" opt_pass="$current_pass"
-            elif [ "$input_user" = "none" ]; then opt_user="" opt_pass=""
-            else opt_user="$input_user"; read -r -p "请输入新密码: " opt_pass; fi
-        else
-            read -r -p "请输入鉴权用户名 (留空默认不启用): " opt_user
-            if [ -n "$opt_user" ]; then read -r -p "请输入鉴权密码: " opt_pass; fi
-        fi
-    fi
-
-    write_systemd "$opt_ip" "$opt_port" "$opt_user" "$opt_pass"
-    if systemctl is-active --quiet "$SERVICE_NAME"; then systemctl restart "$SERVICE_NAME" && ok "服务同步重启生效！"; else ok "参数重写成功。"; fi
-}
-
-menu_show_node_config() {
-    if [ ! -f "${CONF_DIR}/.panel_meta" ] ; then die "未检测到有效的面板运行记录。"; fi
-    local meta=$(cat "${CONF_DIR}/.panel_meta"); local ip_port="${meta%%|*}"
-    local bind_ip="${ip_port%%:*}" bind_port="${ip_port##*:}"
-    local remain="${meta#*|}" auth_user="${remain%%|*}" auth_pass="${remain##*|}"
-
-    echo ""
-    echo "========= 当前 Usque SOCKS5 服务端详情 ========="
-    echo " 监听地址 : ${bind_ip}"
-    echo " 监听端口 : ${bind_port}"
-    if [ -n "$auth_user" ]; then
-        echo " 鉴权用户 : ${auth_user}"
-        echo " 鉴权密码 : ${auth_pass}"
-        # 修复点：修正验证时的代理 URL 拼装格式
-        local proxy_url="socks5h://${auth_user}:${auth_pass}@127.0.0.1:${bind_port}"
-    else
-        echo " 鉴权状态 : 未开启（无密本地回环模式）"
-        local proxy_url="socks5h://127.0.0.1:${bind_port}"
-    fi
-    echo "==============================================="
-
-    echo ""
-    info "正在通过本地 SOCKS5 管道验证 MASQUE 出口链路连通性..."
+    echo -e "\n==== [修改监听配置] ===="
+    echo -e "${YELLOW}说明：直接回车保持不变，输入 read 则清空该项${RESET}"
     
-    # 修复点：改用更稳健的 curl 代理参数验证
-    TMP_TRACE="$(mktemp)"
-    if curl -sS --max-time 10 --proxy "$proxy_url" "https://www.cloudflare.com/cdn-cgi/trace" > "$TMP_TRACE" 2>&1; then
-        local trace_ip=$(grep -i '^ip=' "$TMP_TRACE" | awk -F '=' '{print $2}')
-        local trace_warp=$(grep -i '^warp=' "$TMP_TRACE" | awk -F '=' '{print $2}')
-        local trace_colo=$(grep -i '^colo=' "$TMP_TRACE" | awk -F '=' '{print $2}')
+    # 1. 模式修改
+    echo "1. SOCKS5 模式"
+    echo "2. HTTP 模式"
+    read -r -p "选择模式 [当前: $o_mode]: " m_choice
+    case "$m_choice" in
+        1) n_mode="SOCKS5" ;;
+        2) n_mode="HTTP" ;;
+        *) n_mode="$o_mode" ;;
+    esac
 
-        echo ""
-        echo "========= Cloudflare 真实性验证报告 ========="
-        if [ "$trace_warp" = "on" ] || [ "$trace_warp" = "plus" ]; then
-            echo -e " 隧道验证状态 :  ${GREEN}✔ 成功连接${RESET} (MASQUE 隧道已完成握手分流)"
-            echo -e " WARP 激活状态:  ${trace_warp}"
-        else
-            echo " 隧道验证状态 :  ✘ 未成功流出 (可能未走隧道网络)"
-            echo " WARP 激活状态:  ${trace_warp:-off}"
-        fi
-        echo " MASQUE 隧道出口IP:  ${trace_ip}"
-        echo " 接入边缘数据中心 : ${trace_colo}"
-        echo "============================================="
+    # 2. IP 修改
+    read -r -p "监听 IP [当前: $o_ip]: " n_ip
+    n_ip="${n_ip:-$o_ip}"
+
+    # 3. 端口修改
+    read -r -p "监听端口 [当前: $o_port]: " n_port
+    n_port="${n_port:-$o_port}"
+    
+    # 4. 用户名修改
+    read -r -p "用户名 [当前: ${o_user:-空}]: " i_user
+    if [ -z "$i_user" ]; then
+        n_user="$o_user"          # 直接回车，保持原样
+    elif [ "$i_user" = "read" ]; then
+        n_user=""                 # 输入 read，设为空
     else
-        warn "无法通过本地代理通道与 Cloudflare 通信，请选择选项 [8] 排查。"
+        n_user="$i_user"          # 输入其他，设为新值
     fi
-    rm -f "$TMP_TRACE"
+
+    # 5. 密码修改
+    read -r -p "密码 [当前: ${o_pass:-空}]: " i_pass
+    if [ -z "$i_pass" ]; then
+        n_pass="$o_pass"          # 直接回车，保持原样
+    elif [ "$i_pass" = "read" ]; then
+        n_pass=""                 # 输入 read，设为空
+    else
+        n_pass="$i_pass"          # 输入其他，设为新值
+    fi
+
+    write_systemd "$n_mode" "$n_ip" "$n_port" "$n_user" "$n_pass"
+    systemctl restart "$SERVICE_NAME" && ok "配置已更新并重启服务。"
+}
+# --- 6. 验证逻辑 ---
+menu_show_node_config() {
+    [ -f "$META_FILE" ] || die "记录不存在。"
+    IFS='|' read -r b_mode b_ip b_port b_user b_pass < "$META_FILE"
+
+    local p_url="socks5://"
+    [[ "$b_mode" == "HTTP" ]] && p_url="http://"
+    [[ -n "$b_user" ]] && p_url="${p_url}${b_user}:${b_pass}@"
+    p_url="${p_url}127.0.0.1:${b_port}"
+
+    info "正在请求 Cloudflare 边缘节点进行验证..."
+    local trace_data=$(curl -6 -sS --max-time 10 -x "$p_url" "https://www.cloudflare.com/cdn-cgi/trace")
+    
+    if [ -n "$trace_data" ]; then
+        local trace_ip=$(echo "$trace_data" | grep "ip=" | cut -d= -f2)
+        local trace_warp=$(echo "$trace_data" | grep "warp=" | cut -d= -f2)
+        local trace_colo=$(echo "$trace_data" | grep "colo=" | cut -d= -f2)
+
+        echo -e "\n${GREEN}========= Cloudflare 真实性报告 =========${RESET}"
+        if [ "$trace_warp" = "on" ] || [ "$trace_warp" = "plus" ]; then
+            echo -e " 隧道验证状态 :  ${GREEN}✔ 通过 (流量确实从 Cloudflare 网络流出)${RESET}"
+            echo -e " WARP 激活状态:  ${GREEN}${trace_warp}${RESET}"
+        else
+            echo -e " 隧道验证状态 :  ${RED}✘ 未通过 (可能没有走代理隧道)${RESET}"
+            echo -e " WARP 激活状态:  ${RED}${trace_warp:-off}${RESET}"
+        fi
+        echo -e " CF 分配出口IP:  ${YELLOW}${trace_ip}${RESET}"
+        echo -e " CF 边缘数据中心: ${YELLOW}${trace_colo}${RESET}"
+        echo -e "${GREEN}=========================================${RESET}"
+    else
+        echo -e "${RED}[验证失败]${RESET} 无法通过代理连接至验证端点。"
+    fi
 }
 
-
+# --- 主循环 ---
 while true; do
     get_status_info; clear
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}          CF-WARP 面板         ${RESET}"
+    echo -e "${GREEN}           CF-WARP 面板          ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}状态 :${RESET} ${YELLOW}$panel_status${RESET}"
     echo -e "${GREEN}版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
@@ -386,20 +248,18 @@ while true; do
     echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
-     read -r choice
+    read -r choice
     case "$choice" in
-        1) menu_install ;;
-        2) menu_update ;;
-        3) menu_uninstall ;;
+        1) download_bin; register_usque; write_systemd "SOCKS5" "127.0.0.1" "1080" "" ""; systemctl restart "$SERVICE_NAME"; ok "安装完成。" ;;
+        2) systemctl stop "$SERVICE_NAME"; download_bin; systemctl start "$SERVICE_NAME"; ok "更新完成。" ;;
+        3) systemctl stop "$SERVICE_NAME"; rm -f "$INSTALL_BIN" "$SERVICE_FILE" "$META_FILE"; rm -rf "$CONF_DIR"; ok "已卸载。" ;;
         4) menu_edit_config ;;
-        5) systemctl start "$SERVICE_NAME" && ok "动作: 引擎启动成功" ;;
-        6) systemctl stop "$SERVICE_NAME" && ok "动作: 引擎停止成功" ;;
-        7) systemctl restart "$SERVICE_NAME" && ok "动作: 引擎重启成功" ;;
-        8) (trap 'echo ""' INT; journalctl -u "$SERVICE_NAME" -n 50 -f) ;;
+        5) systemctl start "$SERVICE_NAME" ;;
+        6) systemctl stop "$SERVICE_NAME" ;;
+        7) systemctl restart "$SERVICE_NAME" ;;
+        8) journalctl -u "$SERVICE_NAME" -n 50 -f ;;
         9) menu_show_node_config ;;
         0) exit 0 ;;
-        *) warn "未识别的无效序号！"; sleep 1 ;;
     esac
-
-    read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键返回主控制面板...${RESET}")"
+    read -n 1 -s -r -p "按任意键返回..."
 done

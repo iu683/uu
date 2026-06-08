@@ -1,494 +1,432 @@
-#!/usr/bin/env bash
+#!/bin/bash
+set -e
 
-# ==============================================================================
-#  next-socks5 一键管理面板
-# ==============================================================================
+#================================================================================
+# 常量和全局变量定义
+#================================================================================
+REDSOCKS_CONF="/etc/redsocks.conf"
+IPTABLES_RULES="/etc/redsocks.rules"
 
-# ── 核心环境变量 ──────────────────────────────────────────────────────────────
-export REPO="ZingerLittleBee/next-socks5"
-export SERVICE_NAME="next-socks5"
-export SERVICE_USER="socks5"
-export INSTALL_BIN="/usr/local/bin/next-socks5"
-export CONF_DIR="/etc/next-socks5"
-export CONF_FILE="${CONF_DIR}/config.toml"
-export DATA_DIR="/var/lib/next-socks5"
-export SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+# 颜色高亮定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+RESET='\033[0m'
 
-# ── 终端颜色定义 ──────────────────────────────────
-export RESET='\033[0m'
-export GREEN='\033[0;32m'
-export YELLOW='\033[0;33m'
-export RED='\033[0;31m'
-export BLUE='\033[0;34m'
-export CYAN='\033[0;36m'
+info() { echo -e "${BLUE}[信息]${NC} $1"; }
+success() { echo -e "${GREEN}[成功]${NC} $1"; }
+warning() { echo -e "${YELLOW}[警告]${NC} $1"; }
+error() { echo -e "${RED}[错误]${NC} $1"; }
+step() { echo -e "${PURPLE}[步骤]${NC} $1"; }
 
-# ── 基础环境校验 ──────────────────────────────────────────────────────────
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}[错误]${RESET} 请使用 root 权限运行此脚本！" >&2
-    exit 1
-fi
-
-info() { echo -e "${BLUE}[INFO]${RESET} $1"; }
-ok()   { echo -e "${GREEN}[OK]${RESET} $1"; }
-warn() { echo -e "${YELLOW}[WARN]${RESET} $1"; }
-die()  { echo -e "${RED}[ERROR]${RESET} $1" >&2; exit 1; }
-
-detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS=$ID
-    else
-        die "无法识别当前操作系统类型。"
+require_root() {
+    if [ "$EUID" -ne 0 ]; then
+        error "请使用 root 权限运行此脚本，例如: sudo $0"
+        exit 1
     fi
 }
-detect_os
 
-REQUIRED_CMDS="curl tar sed grep awk openssl"
-MISSING_CMDS=""
-
-for cmd in $REQUIRED_CMDS; do
-    if ! command -v "$cmd" &> /dev/null; then
-        MISSING_CMDS="$MISSING_CMDS $cmd"
+#================================================================================
+# Iptables 规则洗净与恢复
+#================================================================================
+cleanup_iptables() {
+    step "正在清理 redsocks 残留的 iptables 规则..."
+    
+    if iptables -t nat -S OUTPUT 2>/dev/null | grep -q "REDSOCKS"; then
+        iptables -t nat -D OUTPUT -p tcp -j REDSOCKS 2>/dev/null || true
     fi
-done
+    
+    iptables -t nat -F REDSOCKS 2>/dev/null || true
+    iptables -t nat -X REDSOCKS 2>/dev/null || true
+    
+    success "iptables 代理规则全面洗净，原网已恢复。"
+}
 
-if [ -n "$MISSING_CMDS" ]; then
-    info "检测到系统缺失必要组件:${YELLOW}$MISSING_CMDS${RESET}，正在自动修复..."
-    case "$OS" in
-        ubuntu|debian)
-            apt-get update -qy && apt-get install -y $MISSING_CMDS >/dev/null 2>&1
-            ;;
-        centos|rhel|rocky|almalinux|fedora)
-            if command -v dnf &>/dev/null; then
-                dnf install -y $MISSING_CMDS >/dev/null 2>&1
-            else
-                yum install -y $MISSING_CMDS >/dev/null 2>&1
-            fi
-            ;;
-        *)
-            die "未知系统，请手动安装组件: $MISSING_CMDS"
-            ;;
-    esac
+#================================================================================
+# 核心配置交互与文件写入（支持自定义Redsocks本地端口 + 优化防死循环规则）
+#================================================================================
+write_config_file() {
+    local current_local_port="12345"
+    local current_addr="" current_port="" current_user="" current_pass=""
+    
+    if [ -f "$REDSOCKS_CONF" ]; then
+        current_local_port=$(grep -E '^[[:space:]]*local_port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
+        current_addr=$(grep -E '^[[:space:]]*ip[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
+        current_port=$(grep -E '^[[:space:]]*port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
+        current_user=$(grep -E '^[[:space:]]*login[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
+        current_pass=$(grep -E '^[[:space:]]*password[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
+    fi
 
-    for cmd in $MISSING_CMDS; do
-        if ! command -v "$cmd" &> /dev/null; then
-            die "自动安装 [ $cmd ] 失败，请检查网络源。"
+    [ -z "$current_local_port" ] && current_local_port="12345"
+
+    echo -e "${CYAN}请输入您的代理节点及本地转发参数：${RESET}"
+    echo "--------------------------------------------------------"
+
+    # 1. 自定义 Redsocks 本地监听端口
+    local input_local_port
+    while true; do
+        read -r -p "请输入 Redsocks 本地监听端口 [$current_local_port]: " input_local_port
+        [ -z "$input_local_port" ] && input_local_port=$current_local_port
+        if [[ "$input_local_port" =~ ^[0-9]+$ ]] && [ "$input_local_port" -ge 1 ] && [ "$input_local_port" -le 65535 ]; then
+            break
+        else
+            error "无效的端口号，请输入 1 到 65535 之间的数字。"
         fi
     done
-    ok "基础依赖补全成功！"
-fi
 
-# ── 1. 核心下载与组件解压 ───────────────────────────────────────────────────
-detect_target() {
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64)  TARGET="x86_64-unknown-linux-musl" ;;
-        aarch64) TARGET="aarch64-unknown-linux-musl" ;;
-        *) die "暂不支持的系统架构: $ARCH (面板目前仅支持 x86_64 及 aarch64)" ;;
-    esac
-}
+    # 2. 远端 Socks5 节点地址
+    local input_addr
+    while true; do
+        if [ -n "$current_addr" ]; then
+            read -r -p "请输入 Socks5 服务器地址 [$current_addr]: " input_addr
+            [ -z "$input_addr" ] && input_addr=$current_addr
+        else
+            read -r -p "请输入 Socks5 服务器地址 (建议使用纯IP): " input_addr
+        fi
+        if [ -n "$input_addr" ]; then break; else error "服务器地址不能为空。"; fi
+    done
 
-fetch_latest_version() {
-    info "正在查询 GitHub 获取最新 Release 版本号..."
-    TMP_API="$(mktemp)"
-    if curl -sSL -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${REPO}/releases/latest" > "$TMP_API"; then
-        VERSION="$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$TMP_API" | head -n 1)"
-    fi
-    rm -f "$TMP_API"
+    # 3. 远端 Socks5 节点端口
+    local input_port
+    while true; do
+        if [ -n "$current_port" ]; then
+            read -r -p "请输入 Socks5 服务器端口 [$current_port]: " input_port
+            [ -z "$input_port" ] && input_port=$current_port
+        else
+            read -r -p "请输入 Socks5 服务器端口 (1-65535): " input_port
+        fi
+        if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
+            break
+        else
+            error "无效的端口号，请输入 1 到 65535 之间的数字。"
+        fi
+    done
 
-    if [ -z "$VERSION" ]; then
-        warn "API 获取失败，尝试网页流解析..."
-        VERSION=$(curl -sS "https://github.com/${REPO}/releases/latest" 2>/dev/null | grep -o 'tag/[vV]*[0-9.]*' | awk -F '/' 'NR==1 {print $2}')
-    fi
-
-    if [ -z "$VERSION" ]; then
-        VERSION="v0.1.3"
-    fi
-    export VERSION
-    
-    [ -d "$CONF_DIR" ] || install -m 0755 -d "$CONF_DIR"
-    echo "$VERSION" > "${CONF_DIR}/.version" 2>/dev/null
-}
-
-download_and_extract() {
-    detect_target
-    fetch_latest_version
-    info "正在匹配系统环境形态: ${YELLOW}${TARGET}${RESET}"
-
-    ASSET="next-socks5-${TARGET}.tar.gz"
-    URL_TGZ="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
-
-    TMP="$(mktemp -d)"
-    trap 'rm -rf "$TMP"' EXIT
-
-    info "开始同步下载资产包..."
-    curl -fsSL -o "$TMP/$ASSET" "$URL_TGZ" || die "下载资产包失败！"
-
-    tar xzf "$TMP/$ASSET" -C "$TMP"
-    EXTRACTED_BIN=$(find "$TMP" -type f -name "next-socks5" | head -n 1)
-    [ -n "$EXTRACTED_BIN" ] || die "解压成功，但在归档包内未找到 next-socks5 主程序！"
-    export TARGET_BIN_PATH="$EXTRACTED_BIN"
-}
-
-# ── 2. TOML 配置文件生成器 ──────────────────────────────────────────────────
-write_config() {
-    local bind_ip="$1" local bind_port="$2" local username="$3" local password="$4"
-    [ -d "$CONF_DIR" ] || install -m 0755 -d "$CONF_DIR"
-    
-    cat <<EOF > "$CONF_FILE"
-listen = "${bind_ip}:${bind_port}"
-
-[auth]
-EOF
-
-    if [ -n "$username" ] && [ -n "$password" ]; then
-        cat <<EOF >> "$CONF_FILE"
-method = "password"
-[[auth.users]]
-username = "${username}"
-password = "${password}"
-EOF
+    # 4. 用户名
+    local input_user
+    if [ -n "$current_user" ]; then
+        read -r -p "请输入用户名 (回车保持现状, 彻底清空请输入 none) [$current_user]: " input_user
+        [ -z "$input_user" ] && input_user=$current_user
+        [ "$input_user" = "none" ] && input_user=""
     else
-        cat <<EOF >> "$CONF_FILE"
-method = "none"
-EOF
+        read -r -p "请输入用户名 (可选，无验证直接留空回车): " input_user
     fi
 
-    cat <<EOF >> "$CONF_FILE"
+    # 5. 密码
+    local input_pass
+    if [ -n "$input_user" ]; then
+        if [ -n "$current_pass" ]; then
+            read -r -p "请输入密码 (回车保持现状, 彻底清空请输入 none) [$current_pass]: " input_pass
+            [ -z "$input_pass" ] && input_pass=$current_pass
+            [ "$input_pass" = "none" ] && input_pass=""
+        else
+            read -r -p "请输入密码 (可选，无验证直接留空回车): " input_pass
+        fi
+    else
+        input_pass=""
+    fi
 
-[timeouts]
-connect_ms = 10000
-tcp_idle_ms = 300000
-udp_idle_ms = 60000
+    input_local_port=$(echo "$input_local_port" | tr -d '\r')
+    input_addr=$(echo "$input_addr" | tr -d '\r')
+    input_port=$(echo "$input_port" | tr -d '\r')
+    input_user=$(echo "$input_user" | tr -d '\r')
+    input_pass=$(echo "$input_pass" | tr -d '\r')
 
-[udp]
-# port_range = "40000-40100"      # bind UDP relay sockets to this range
-# advertise = "YOUR_PUBLIC_IP"    # advertised BND IP for clients behind NAT
+    step "正在渲染生成配置文件 $REDSOCKS_CONF ..."
+    cat > "$REDSOCKS_CONF" <<EOF
+base {
+    log_debug = off;
+    log_info = on;
+    log = "syslog:daemon";
+    daemon = on;
+    redirector = iptables;
+}
+
+redsocks {
+    local_ip = 127.0.0.1;
+    local_port = $input_local_port;
+
+    ip = $input_addr;
+    port = $input_port;
+    type = socks5;
+EOF
+
+    if [ -n "$input_user" ]; then
+        echo "    login = \"$input_user\";" >> "$REDSOCKS_CONF"
+    fi
+    if [ -n "$input_pass" ]; then
+        echo "    password = \"$input_pass\";" >> "$REDSOCKS_CONF"
+    fi
+
+    echo "}" >> "$REDSOCKS_CONF"
+
+    step "正在动态渲染防死循环的 iptables 规则 (本地目标端口: $input_local_port) ..."
+    cat > "$IPTABLES_RULES" <<EOF
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+:REDSOCKS - [0:0]
+
+# 【防断网策略】确保系统的 SSH 22 端口双向流量绝对直连
+-A OUTPUT -p tcp --dport 22 -j RETURN
+-A OUTPUT -p tcp --sport 22 -j RETURN
+
+# 【终极防环路】核心关键：凡是 redsocks 进程本身发出的流量，直接返回（放行）
+-A OUTPUT -p tcp -m owner --uid-owner redsocks -j RETURN
+
+# 让所有本地发出的其他 TCP 流量优先经过 REDSOCKS 链判定
+-A OUTPUT -p tcp -j REDSOCKS
+
+# 豁免代理服务器本尊的 IP 
+-A REDSOCKS -d $input_addr -j RETURN
+
+# 绕过保留地址、本地局域网和组播地址
+-A REDSOCKS -d 0.0.0.0/8 -j RETURN
+-A REDSOCKS -d 10.0.0.0/8 -j RETURN
+-A REDSOCKS -d 127.0.0.0/8 -j RETURN
+-A REDSOCKS -d 169.254.0.0/16 -j RETURN
+-A REDSOCKS -d 172.16.0.0/12 -j RETURN
+-A REDSOCKS -d 192.168.0.0/16 -j RETURN
+-A REDSOCKS -d 224.0.0.0/4 -j RETURN
+-A REDSOCKS -d 240.0.0.0/4 -j RETURN
+
+# 将其余一切公网 TCP 流量重定向到 Redsocks 本地转发端口
+-A REDSOCKS -p tcp -j REDIRECT --to-ports $input_local_port
+COMMIT
 EOF
 }
 
-write_systemd() {
-    cat <<EOF > "$SERVICE_FILE"
+#================================================================================
+# 流程 1：一键安装流程（包含完整的依赖安装、配置录入、启动拉起全套工作）
+#================================================================================
+install_redsocks_env() {
+    cleanup_iptables
+
+    step "[1/4] 从软件源检查并安装 redsocks 核心组件..."
+    if ! command -v redsocks &>/dev/null; then
+        apt-get update && apt-get install -y redsocks iptables curl || {
+            error "安装 redsocks 基础包失败，请检查系统网络或 apt 源！"
+            return 1
+        }
+    fi
+
+    # 确保系统创建了独立的 redsocks 运行用户，用于 uid-owner 防环路策略
+    if ! id -u redsocks &>/dev/null; then
+        useradd -r -M -s /usr/sbin/nologin redsocks || true
+    fi
+
+    systemctl stop redsocks 2>/dev/null || true
+    systemctl disable redsocks 2>/dev/null || true
+
+    step "[2/4] 进入节点配置录入阶段..."
+    write_config_file
+
+    step "[3/4] 正在向系统注册自定义服务，并强绑定 redsocks 独立用户..."
+    local SERVICE_FILE="/etc/systemd/system/redsocks.service"
+    cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=next-socks5 - Fast and Lightweight SOCKS5 Server
-After=network.target network-online.target
-Wants=network-online.target
+Description=Redsocks Transparent Proxy Service
+After=network.target
 
 [Service]
-Type=simple
-User=${SERVICE_USER}
-Group=${SERVICE_USER}
-WorkingDirectory=${DATA_DIR}
-ExecStart=${INSTALL_BIN} serve --config ${CONF_FILE} --no-tui
-Restart=always
-RestartSec=3s
-LimitNOFILE=65535
+Type=forking
+PIDFile=/run/redsocks.pid
+User=redsocks
+Group=redsocks
+ExecStartPre=-/bin/rm -f /run/redsocks.pid
+ExecStart=/usr/sbin/redsocks -c $REDSOCKS_CONF -p /run/redsocks.pid
+ExecStartPost=/sbin/iptables-restore $IPTABLES_RULES
+ExecStopPost=/bin/sh -c 'iptables -t nat -D OUTPUT -p tcp -j REDSOCKS 2>/dev/null || true; iptables -t nat -F REDSOCKS 2>/dev/null || true; iptables -t nat -X REDSOCKS 2>/dev/null || true'
+TimeoutStartSec=4
+Restart=on-failure
+LimitNOFILE=524288
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+    # 赋予 redsocks 用户读取配置和写入 PID 的权限
+    chown -R redsocks:redsocks "$REDSOCKS_CONF" 2>/dev/null || true
+    touch /run/redsocks.pid && chown redsocks:redsocks /run/redsocks.pid || true
+
     systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+    systemctl enable redsocks.service 2>/dev/null
+    
+    step "[4/4] 正在自动激活服务并开启全局透明代理..."
+    systemctl start redsocks.service && iptables-restore < "$IPTABLES_RULES" || {
+        error "自动启动代理失败，请检查配置参数。"
+        return 1
+    }
+
+    success "Redsocks 全套环境安装、配置并成功拉起运行！"
 }
 
-# ── 节点配置总结报告 ──────────────────────────────────────────────────────────
-print_node_summary() {
-    if [ ! -f "$CONF_FILE" ]; then return; fi
-
-    # 🛠 修复点：改用严格的 awk 状态机精准提取 TOML 中的 listen 端口
-    local bind_port
-    bind_port=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); split($2, a, ":"); print a[length(a)]}' "$CONF_FILE")
-    [ -z "$bind_port" ] && bind_port="16216"
+#================================================================================
+# 流程 4：修改/初始化 Socks5 及本地端口配置（完全独立）
+#================================================================================
+change_config() {
+    info "开始单独修改全局代理配置："
+    write_config_file
+    chown -R redsocks:redsocks "$REDSOCKS_CONF" 2>/dev/null || true
+    success "节点配置文件与 Iptables 联动规则更新成功！"
     
-    # 🛠 修复点：精准判定鉴权模式
-    local auth_method
-    auth_method=$(awk -F '=' '/^[[:space:]]*method[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
-    
-    local auth_user="" local auth_pass=""
-    if [ "$auth_method" = "password" ]; then
-        # 🛠 修复点：通过强大的 awk 块匹配，完美剥离外部双引号，精准提取账号密码
-        auth_user=$(awk -F '=' '/^[[:space:]]*username[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
-        auth_pass=$(awk -F '=' '/^[[:space:]]*password[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
-    fi
-
-    local public_ip
-    public_ip=$(curl -s --max-time 5 ipinfo.io/ip || curl -s --max-time 5 api.ipify.org || echo "你的公网IP")
-
-    echo -e "\n${GREEN}====== 当前配置详情 ======${RESET}"
-    echo -e "${GREEN}IP地址       :${RESET} ${public_ip}"
-    echo -e "${GREEN}端口         :${RESET} ${bind_port}"
-    if [ -n "$auth_user" ]; then
-        echo -e "${GREEN}用户名       :${RESET} ${auth_user}"
-        echo -e "${GREEN}密码         :${RESET} ${auth_pass}"
+    if systemctl is-active --quiet redsocks.service; then
+        step "检测到服务正在后台运行，正在自动重启服务以应用新配置与端口..."
+        systemctl restart redsocks.service
+        iptables-restore < "$IPTABLES_RULES"
+        success "新端口和新配置已无缝生效。"
     else
-        echo -e "${GREEN}鉴权模式     :${RESET} ${YELLOW}无密码 (免密模式)${RESET}"
+        info "提示：配置已就绪，当前服务处于停止状态。请在主菜单选择【选项 5】手动启动。"
     fi
-    echo -e "${GREEN}分享存放路径 :${RESET} ${CONF_FILE}"
-    echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
-    
-    echo -e "${GREEN}====== 👉 通用客户端 Socks5 链接 ======${RESET}"
-    if [ -n "$auth_user" ]; then
-        echo -e "${YELLOW}socks://${auth_user}:${auth_pass}@${public_ip}:${bind_port}#uu-socks5${RESET}"
-    else
-        echo -e "${YELLOW}socks://${public_ip}:${bind_port}#uu-socks5${RESET}"
-    fi
-    
-    echo -e "${GREEN}====== 🚀 Telegram 内置一键代理链接 ======${RESET}"
-    if [ -n "$auth_user" ]; then
-        echo -e "${YELLOW}https://t.me/socks?server=${public_ip}&port=${bind_port}&user=${auth_user}&pass=${auth_pass}${RESET}"
-    else
-        echo -e "${YELLOW}https://t.me/socks?server=${public_ip}&port=${bind_port}${RESET}"
-    fi
-    echo ""
-
 }
 
-# ── 3. 面板核心数据抓取 ───────────────────────────────────────────────────────
-get_status_info() {
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        panel_status="${GREEN}运行中${RESET}"
+uninstall_redsocks_env() {
+    cleanup_iptables
+    local SERVICE_FILE="/etc/systemd/system/redsocks.service"
+
+    step "正在停止并彻底禁用后台 redsocks 服务..."
+    systemctl stop redsocks.service 2>/dev/null || true
+    systemctl disable redsocks.service 2>/dev/null || true
+
+    step "正在清理系统残留组件文件..."
+    [ -f "$SERVICE_FILE" ] && rm -f "$SERVICE_FILE"
+    [ -f "$REDSOCKS_CONF" ] && rm -f "$REDSOCKS_CONF"
+    [ -f "$IPTABLES_RULES" ] && rm -f "$IPTABLES_RULES"
+    
+    systemctl daemon-reload
+    success "Redsocks 透明代理环境已彻底从系统卸载干净。"
+}
+
+get_status() {
+    if systemctl is-active --quiet redsocks.service; then
+        status_show="${GREEN}已启动 (运行中)${RESET}"
     else
-        panel_status="${RED}未运行${RESET}"
+        status_show="${RED}已停止 (未运行)${RESET}"
     fi
 
-    if [ -f "$INSTALL_BIN" ]; then
-        if [ -f "${CONF_DIR}/.version" ]; then
-            panel_version=$(cat "${CONF_DIR}/.version")
+    if command -v redsocks &>/dev/null; then
+        local version_raw
+        version_raw=$(redsocks -v 2>&1 | grep -oE '[0-9]+\.[0-9.]+' | head -n1)
+        if [ -n "$version_raw" ]; then
+            version_show="${YELLOW}v${version_raw}${RESET}"
         else
-            local raw_ver
-            raw_ver=$("$INSTALL_BIN" --version 2>/dev/null | grep -oE '[vV]?[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
-            if [ -n "$raw_ver" ]; then
-                panel_version="$raw_ver"
-                echo "$raw_ver" > "${CONF_DIR}/.version" 2>/dev/null
-            else
-                panel_version="v0.1.3"
-            fi
+            version_show="${YELLOW}已安装${RESET}"
         fi
     else
-        panel_version="${RED}未安装${RESET}"
+        version_show="${RED}未安装${RESET}"
     fi
 
-    if [ -f "$CONF_FILE" ]; then
-        panel_port=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
+    if [ -f "$REDSOCKS_CONF" ]; then
+        local port addr local_port
+        local_port=$(grep -E '^[[:space:]]*local_port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
+        addr=$(grep -E '^[[:space:]]*ip[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
+        port=$(grep -E '^[[:space:]]*port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
+        port_show="${YELLOW}${addr}:${port} ${NC}->${CYAN} 本地监听:${local_port}${RESET}"
     else
-        panel_port="0.0.0.0:未设定"
+        port_show="${RED}无配置${RESET}"
     fi
 }
 
-menu_install() {
-    if [ -f "$INSTALL_BIN" ]; then
-        warn "系统中已存在安装好的实例文件。"
-        read -r -p "$(echo -e "${GREEN}是否确定完全覆盖重新安装？[y/N]: ${RESET}")" res
-        [[ "$res" =~ ^[Yy]$ ]] || return
-    fi
-
-    echo -e "\n${GREEN}==== [自定义安装配置] ====${RESET}"
-    read -r -p "$(echo -e "${GREEN}请输入监听 IP 地址 [默认 ::]: ${RESET}")" input_ip
-    local opt_ip="${input_ip:-::}"
-
-    local rand_port=$((RANDOM % 50001 + 10000))
-    read -r -p "$(echo -e "${GREEN}请输入 SOCKS5 监听端口 [回车默认随机端口: ${rand_port}]: ${RESET}")" input_port
-    local opt_port="${input_port:-$rand_port}"
-    if ! [[ "$opt_port" =~ ^[0-9]+$ ]] || [ "$opt_port" -le 0 ] || [ "$opt_port" -gt 65535 ]; then
-        opt_port=$rand_port
-    fi
-
-    local rand_user="user_$(openssl rand -hex 4)"
-    local rand_pass="$(openssl rand -hex 10)"
-    local opt_user="" local opt_pass=""
-
-    read -r -p "$(echo -e "${GREEN}请输入自定义用户名 [回车默认随机: ${YELLOW}${rand_user}${GREEN}, 输入 ${RED}none${GREEN} 选免密]: ${RESET}")" input_user
-    if [ -z "$input_user" ]; then
-        opt_user="$rand_user"
-        read -r -p "$(echo -e "${GREEN}请输入自定义密码 [回车默认随机: ${YELLOW}${rand_pass}${GREEN}]: ${RESET}")" input_pass
-        opt_pass="${input_pass:-$rand_pass}"
-    elif [ "$input_user" = "none" ]; then
-        opt_user=""
-        opt_pass=""
-    else
-        opt_user="$input_user"
-        read -r -p "$(echo -e "${GREEN}请输入自定义密码 [回车默认随机: ${YELLOW}${rand_pass}${GREEN}]: ${RESET}")" input_pass
-        opt_pass="${input_pass:-$rand_pass}"
-    fi
-
-    download_and_extract
-
-    if ! id "$SERVICE_USER" >/dev/null 2>&1; then
-        useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER" 2>/dev/null \
-          || adduser --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
-    fi
-
-    install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$INSTALL_BIN"
-    install -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" -d "$DATA_DIR"
-    write_config "$opt_ip" "$opt_port" "$opt_user" "$opt_pass"
-    write_systemd
-
-    info "正在拉起后台服务..."
-    systemctl start "$SERVICE_NAME"
+test_exit_ip() {
+    step "正在通过全局 iptables 转发层查询落地出口 IP..."
     
-    local is_ok=1
-    for i in {1..5}; do
-        if systemctl is-active --quiet "$SERVICE_NAME"; then is_ok=0; break; fi
-        sleep 1
+    local ip_info=""
+    local test_urls=(
+        "https://api.ipify.org?format=json"
+        "https://ipinfo.io/json"
+        "https://ifconfig.me/all.json"
+    )
+
+    for url in "${test_urls[@]}"; do
+        info "正在尝试请求: $url ..."
+        ip_info=$(curl -s -m 6 "$url" 2>/dev/null || echo "")
+        if [ -n "$ip_info" ]; then
+            break
+        fi
     done
 
-    if [ "$is_ok" -eq 0 ]; then
-        ok "next-socks5 代理服务部署成功！"
-        print_node_summary
-    else
-        warn "部署完成，但初始化响应异常，请稍后选择 [8] 查看实时日志。"
-    fi
-}
-
-menu_update() {
-    [ -f "$SERVICE_FILE" ] || die "未检测到系统服务，请先选择 [1] 进行完整安装。"
-    download_and_extract
-    systemctl stop "$SERVICE_NAME"
-    install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$INSTALL_BIN"
-    systemctl start "$SERVICE_NAME"
-    ok "next-socks5 核心主程序已完成平滑更新。"
-}
-
-menu_uninstall() {
-    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1
-    systemctl disable "$SERVICE_NAME" >/dev/null 2>&1
-    rm -f "$INSTALL_BIN" "$SERVICE_FILE"
-    systemctl daemon-reload
-    rm -rf "$CONF_DIR" "$DATA_DIR"
-    userdel "$SERVICE_USER" >/dev/null 2>&1
-    ok "next-socks5 核心组件及配置文件已全部安全卸载收回。"
-}
-
-menu_edit_config() {
-    [ -f "$CONF_FILE" ] || die "未发现任何配置文件，请先执行安装步骤。"
-    
-    local current_bind
-    current_bind=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
-    local current_ip="${current_bind%%:*}" local current_port="${current_bind##*:}"
-    
-    local current_method
-    current_method=$(awk -F '=' '/^[[:space:]]*method[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
-    
-    local current_user="" local current_pass=""
-    if [ "$current_method" = "password" ]; then
-        current_user=$(awk -F '=' '/^[[:space:]]*username[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
-        current_pass=$(awk -F '=' '/^[[:space:]]*password[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
-    fi
-
-    [ -z "$current_ip" ] && current_ip="::"
-    [ -z "$current_port" ] && current_port="1080"
-
-    echo -e "\n${GREEN}==== [修改内核参数配置] ====${RESET}"
-    read -r -p "$(echo -e "${GREEN}请输入监听 IP 地址 [当前: ${current_ip}]: ${RESET}")" input_ip
-    local opt_ip="${input_ip:-$current_ip}"
-
-    local rand_port=$((RANDOM % 50001 + 10000))
-    read -r -p "$(echo -e "${GREEN}请输入 SOCKS5 监听端口 [当前: ${current_port}, 回车保持原样, 输入 ${YELLOW}rand${GREEN} 随机重置]: ${RESET}")" input_port
-    local opt_port="$current_port"
-    if [ "$input_port" = "rand" ]; then
-        opt_port="$rand_port"
-    elif [ -n "$input_port" ]; then
-        if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -gt 0 ] && [ "$input_port" -le 65535 ]; then
-            opt_port="$input_port"
-        fi
-    fi
-
-    local rand_user="user_$(openssl rand -hex 4)"
-    local rand_pass="$(openssl rand -hex 10)"
-    local opt_user="" local opt_pass=""
-
-    read -r -p "$(echo -e "${GREEN}请输入用户名 [当前: ${current_user:-无密码}, 输入 ${RED}none${GREEN} 切换为无密码, 回车默认随机]: ${RESET}")" input_user
-    if [ -z "$input_user" ]; then
-        if [ -n "$current_user" ]; then
-            opt_user="$current_user" opt_pass="$current_pass"
+    if [ -n "$ip_info" ]; then
+        echo -e "${GREEN}----------------------------------------${RESET}"
+        if echo "$ip_info" | grep -q "{"; then
+            echo "$ip_info" | sed 's/["{}]//g' | sed 's/,/\n/g' | sed 's/^ *//'
         else
-            opt_user="$rand_user" opt_pass="$rand_pass"
+            echo -e "当前落地出口 IP: ${YELLOW}$ip_info${RESET}"
         fi
-    elif [ "$input_user" = "none" ]; then
-        opt_user="" opt_pass=""
+        echo -e "${GREEN}----------------------------------------${RESET}"
+        success "测试成功！流量已跳出死循环，全局透明代理正常。"
     else
-        opt_user="$input_user"
-        read -r -p "$(echo -e "${GREEN}请输入新密码 [回车默认随机]: ${RESET}")" input_pass
-        opt_pass="${input_pass:-$rand_pass}"
-    fi
-
-    write_config "$opt_ip" "$opt_port" "$opt_user" "$opt_pass"
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        systemctl restart "$SERVICE_NAME"
-        ok "配置已覆盖，全套代理服务已同步重启生效！"
-        print_node_summary
-    else
-        ok "配置已成功重写更新。"
+        error "获取失败。请执行选项 8 查看运行日志。"
     fi
 }
 
-menu_show_node_config() {
-    if [ ! -f "$CONF_FILE" ]; then 
-        die "未检测到有效的服务配置文件，请先执行选择 [1] 进行完整安装。"
-    fi
-
-    print_node_summary
-
-    local full_bind
-    full_bind=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
-    local bind_ip="${full_bind%%:*}" local bind_port="${full_bind##*:}"
-    local connect_ip="$bind_ip"
-    if [ "$connect_ip" = "0.0.0.0" ]; then connect_ip="127.0.0.1"; fi
-
-    local auth_method
-    auth_method=$(awk -F '=' '/^[[:space:]]*method[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
-    
-    local auth_user="" local auth_pass=""
-    if [ "$auth_method" = "password" ]; then
-        auth_user=$(awk -F '=' '/^[[:space:]]*username[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
-        auth_pass=$(awk -F '=' '/^[[:space:]]*password[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
-    fi
-
-    local proxy_args="--socks5-hostname ${connect_ip}:${bind_port}"
-    if [ -n "$auth_user" ] && [ -n "$auth_pass" ]; then
-        proxy_args="--socks5-hostname ${auth_user}:${auth_pass}@${connect_ip}:${bind_port}"
-    fi
-
+#================================================================================
+# 面板主循环菜单
+#================================================================================
+panel_menu() {
+    require_root
+    while true; do
+        get_status
+        clear
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}    Redsocks + Iptables 面板    ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}状态   :${RESET} $status_show"
+        echo -e "${GREEN}版本   :${RESET} $version_show"
+        echo -e "${GREEN}代理   :${RESET} $port_show"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN} 1. 一键安装 Redsocks 全套环境 (含配置并自动启动)${RESET}"
+        echo -e "${GREEN} 2. 占位 (Redsocks 使用系统自带源无需升级)${RESET}"
+        echo -e "${GREEN} 3. 卸载 Redsocks 环境${RESET}"
+        echo -e "${GREEN} 4. 修改/初始化 Socks5 及本地配置 (独立控制)${RESET}"
+        echo -e "${GREEN} 5. 启动全局代理 (应用规则)${RESET}"
+        echo -e "${GREEN} 6. 停止全局代理 (清空规则)${RESET}"
+        echo -e "${GREEN} 7. 重启 Redsocks 服务${RESET}"
+        echo -e "${GREEN} 8. 查看系统日志${RESET}"
+        echo -e "${GREEN} 9. 测试当前出口IP${RESET}"
+        echo -e "${GREEN} 0. 退出${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        
+        read -p $'\e[32m请输入数字: \e[0m' num
+        case "$num" in
+            1) install_redsocks_env ;;
+            2) warning "Redsocks 基于系统软件包管理，无需脚本手动更新。" ;;
+            3) uninstall_redsocks_env ;;
+            4) change_config ;;
+            5)
+                step "正在唤醒后台代理并加载 iptables NAT 转发规则..."
+                if [ ! -f "$REDSOCKS_CONF" ] || [ ! -f "$IPTABLES_RULES" ]; then
+                    error "未发现有效配置，请先执行【选项 1】或【选项 4】！"
+                else
+                    systemctl start redsocks.service && iptables-restore < "$IPTABLES_RULES" && success "全局代理已全力运转。" || error "启动失败。"
+                fi
+                ;;
+            6)
+                step "正在关闭后台服务并清空劫持规则，物理网络复原中..."
+                systemctl stop redsocks.service && cleanup_iptables && success "代理已安全关闭，网络已彻底复原。" || error "停用失败。"
+                ;;
+            7)
+                step "正在强制重启 Redsocks 进程并刷新规则..."
+                systemctl restart redsocks.service && success "重启并应用成功。" || error "重启失败。"
+                ;;
+            8)
+                step "加载最近 30 行代理运行日志："
+                echo "--------------------------------------------------------"
+                journalctl -u redsocks.service -n 30 --no-pager || tail -n 30 /var/log/syslog
+                ;;
+            9) test_exit_ip ;;
+            0) exit 0 ;;
+            *) error "非法数字，请输入菜单内提供的值！" ;;
+        esac
+        echo -ne "${YELLOW}按任意键返回主菜单...${RESET}"
+        read -r
+    done
 }
 
-# ── 4. 主循环控制中心 ─────────────────────────────────────────────────────────
-while true; do
-    get_status_info
-    clear
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}        next-socks5 面板       ${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $panel_status"
-    echo -e "${GREEN}版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
-    echo -e "${GREEN}绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN} 1. 安装 next-socks5${RESET}"
-    echo -e "${GREEN} 2. 更新 next-socks5${RESET}"
-    echo -e "${GREEN} 3. 卸载 next-socks5${RESET}"
-    echo -e "${GREEN} 4. 修改配置${RESET}"
-    echo -e "${GREEN} 5. 启动 next-socks5${RESET}"
-    echo -e "${GREEN} 6. 停止 next-socks5${RESET}"
-    echo -e "${GREEN} 7. 重启 next-socks5${RESET}"
-    echo -e "${GREEN} 8. 查看日志${RESET}"
-    echo -e "${GREEN} 9. 查看配置${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    
-    read -r -p "$(echo -e "${GREEN}请输入选项: ${RESET}")" choice
-    
-    case "$choice" in
-        1) menu_install ;;
-        2) menu_update ;;
-        3) menu_uninstall ;;
-        4) menu_edit_config ;;
-        5) systemctl start "$SERVICE_NAME" && ok "动作: 核心启动成功" ;;
-        6) systemctl stop "$SERVICE_NAME" && ok "动作: 核心停止成功" ;;
-        7) systemctl restart "$SERVICE_NAME" && ok "动作: 核心重启成功" ;;
-        8) (trap 'echo -e "\n"' INT; journalctl -u "$SERVICE_NAME" -n 50 -f) ;;
-        9) menu_show_node_config ;;
-        0) clear; exit 0 ;;
-        *) warn "未识别的无效序号！"; sleep 1 ;;
-    esac
-    
-    read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键返回主控制面板...${RESET}")"
-done
+# 正式拉起主控制台
+panel_menu

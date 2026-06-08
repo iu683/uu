@@ -1,501 +1,575 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# 全局高优先环境变量配置
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# ==============================================================================
+#  cf-warp-rust 终极全能面板 (IPv6-Only 优化、支持谷歌分流与真·全局出站)
+# ==============================================================================
 
-# 颜色控制 - 统一调整为绿色系列
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-LIGHT_GREEN='\033[1;32m'
-NC='\033[0m'
+# ── 核心环境变量 ──────────────────────────────────────────────────────────────
+export REPO="Shannon-x/cf-warp-rust"
+export SERVICE_NAME="warp-rust"
+export SERVICE_USER="root" 
+export INSTALL_BIN="/usr/local/bin/warp-rust"
+export CONF_DIR="/etc/warp-rust"
+export CONF_FILE="${CONF_DIR}/config.toml"
+export DATA_DIR="/var/lib/warp-rust"
+export SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
-CONFIG_FILE="/etc/snapshot_config.conf"
-SERVICE_NAME="system-snapshot"
-LOG_FILE="/var/log/snapshot_info.log"
+# 【保留 10】谷歌透明代理相关变量
+export REDSOCKS_CONF="/etc/redsocks.conf"
+export PROXY_SERVICE_NAME="warp-google-proxy"
+export PROXY_SERVICE_FILE="/etc/systemd/system/${PROXY_SERVICE_NAME}.service"
+export PROXY_RULES_SCRIPT="${DATA_DIR}/warp-google-iptables.sh"
 
-# 完全固定本地路径与脚本名称
-ADMIN_SCRIPT="/usr/bin/snapshot.sh"
+# 【新增 11】全局透明代理组件相关变量
+export TUN2SOCKS_BIN="/usr/local/bin/tun2socks"
+export TUN_DEV_NAME="tun_global"
 
-if [ "$EUID" -ne 0 ]; then 
-    echo -e "${GREEN}错误: 请使用 root 权限运行此脚本。${NC}"
+# ── IPv6 友好型 GitHub 反代加速节点池 ──────────────────────────────────────────
+# 经过严格筛选，这些节点均支持双栈或纯 IPv6 解析，非常适合 IPv6-Only VPS
+GITHUB_PROXIES=(
+    "https://v6.gh-proxy.org/"
+    "https://proxy.vvvv.ee/"
+    "https://gh-proxy.com/"
+    "https://ghproxy.net/"
+    "https://hub.glowp.xyz/"
+    "https://ghproxy.lvedong.eu.org/"
+)
+
+# ── 终端颜色定义 ──────────────────────────────────
+export RESET='\033[0m'
+export GREEN='\033[0;32m'
+export YELLOW='\033[0;33m'
+export RED='\033[0;31m'
+export BLUE='\033[0;34m'
+export CYAN='\033[0;36m'
+
+# Google IP 段定义（用于 iptables 劫持分流）
+GOOGLE_IPS="
+8.8.4.0/24
+8.8.8.0/24
+34.0.0.0/9
+35.184.0.0/13
+35.192.0.0/12
+35.224.0.0/12
+35.240.0.0/13
+64.233.160.0/19
+66.102.0.0/20
+66.249.64.0/19
+72.14.192.0/18
+74.125.0.0/16
+104.132.0.0/14
+108.177.0.0/17
+142.250.0.0/15
+172.217.0.0/16
+172.253.0.0/16
+173.194.0.0/16
+209.85.128.0/17
+216.58.192.0/19
+216.239.32.0/19
+"
+
+# ── 基础环境校验 ──────────────────────────────────────────────────────────
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}[错误]${RESET} 请使用 root 权限运行此脚本！" >&2
     exit 1
 fi
 
-# ==============================================================================
-# Alpine 专属：绝对首次运行下载逻辑
-# ==============================================================================
-if [ -f "$ADMIN_SCRIPT" ]; then
-    if [ "$(readlink -f "$0" 2>/dev/null)" != "$ADMIN_SCRIPT" ]; then
-        exec "$ADMIN_SCRIPT" "$@"
-    fi
-else
-    # 针对 Alpine 优化，首次运行时强制先安装最基础的 curl 确保能拉取脚本
-    if ! command -v curl &>/dev/null; then
-        apk update && apk add curl &>/dev/null
-    fi
-    curl -sL https://raw.githubusercontent.com/iu683/uu/main/ss.sh > "$ADMIN_SCRIPT"
-    if [ $? -eq 0 ] && [ -s "$ADMIN_SCRIPT" ]; then
-        chmod +x "$ADMIN_SCRIPT"
-        hash -r
-        exec "$ADMIN_SCRIPT" "$@"
+info() { echo -e "${BLUE}[INFO]${RESET} $1"; }
+ok()   { echo -e "${GREEN}[OK]${RESET} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${RESET} $1"; }
+die()  { echo -e "${RED}[ERROR]${RESET} $1" >&2; exit 1; }
+
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
     else
-        echo -e "${GREEN}警告: 自动下载失败，请检查网络是否能正常访问 GitHub。...${NC}"
+        die "无法识别当前操作系统类型。"
     fi
+}
+detect_os
+
+# 基础组件检查 (针对 IPv6-only 环境优化)
+REQUIRED_CMDS="curl tar sed grep awk ip pkill"
+MISSING_CMDS=""
+for cmd in $REQUIRED_CMDS; do
+    if ! command -v "$cmd" &> /dev/null; then MISSING_CMDS="$MISSING_CMDS $cmd"; fi
+done
+
+if [ -n "$MISSING_CMDS" ]; then
+    info "正在自动修复系统缺失组件:${YELLOW}$MISSING_CMDS${RESET}..."
+    case "$OS" in
+        ubuntu|debian) apt-get update -qy && apt-get install -y $MISSING_CMDS >/dev/null 2>&1 ;;
+        centos|rhel|rocky|almalinux|fedora)
+            if command -v dnf &>/dev/null; then dnf install -y $MISSING_CMDS >/dev/null 2>&1
+            else yum install -y $MISSING_CMDS >/dev/null 2>&1; fi ;;
+        *) die "请手动安装基础组件: $MISSING_CMDS" ;;
+    esac
 fi
 
-# TG 消息 Markdown 专用转义函数
-escape_markdown() {
-    echo -ne "$1" | sed 's/\([\._\*\[\]()~`#>+\-=|{}!]\)/\\\1/g'
-}
-
-# 发送美化版 Telegram 通知的核心公共函数
-send_tg_notification() {
-    local token="$1" local chat="$2" local md_text="$3"
-    if [ -n "$token" ] && [ -n "$chat" ]; then
-        curl -s -X POST "https://api.telegram.org/bot$token/sendMessage" \
-            -d chat_id="$chat" \
-            -d text="$md_text" \
-            -d parse_mode="MarkdownV2" &>/dev/null
-    fi
-}
-
-# ==============================================================================
-# 模块一：后端静默备份与远程传输逻辑
-# ==============================================================================
-run_backend_backup() {
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo "错误: 配置文件不存在，请先运行脚本进行安装与配置。"
-        exit 1
-    fi
-    source "$CONFIG_FILE"
+# ── 动态优选支持 IPv6 的 GitHub 代理节点 ────────────────────────────────────
+select_best_proxy() {
+    info "正在为您动态优选适合 IPv6 环境的 GitHub 加速节点..."
+    local best_proxy=""
+    local min_time=9999
     
-    # 建立前端运行与后台静默的展示区分
-    local is_interactive=0
-    if [ "$2" == "--interactive" ]; then is_interactive=1; fi
-
-    TIMESTAMP=$(date +"%Y%m%d%H%M%S")
-    mkdir -p "$BACKUP_DIR"
-    SNAPSHOT_FILE="$BACKUP_DIR/system_snapshot_${TIMESTAMP}.tar.gz"
-    FULL_REMOTE_PATH="$TARGET_BASE_DIR/$REMOTE_DIR_NAME"
-
-    touch "$LOG_FILE"
-    log_info() { echo "$(date '+%F %T') [INFO] $1" >> "$LOG_FILE"; }
-    log_error() { echo "$(date '+%F %T') [ERROR] $1" >> "$LOG_FILE"; }
-
-    log_info "========== 开始执行系统快照备份任务 =========="
-    
-    # 转义通知
-    local t_name=$(escape_markdown "${REMOTE_DIR_NAME:-未配置}")
-    local t_path=$(escape_markdown "${FULL_REMOTE_PATH:-未配置}")
-    local t_time=$(escape_markdown "$(date '+%Y-%m-%d %H:%M:%S')")
-    
-    local start_msg="🚀 *系统快照备份任务启动*
-
-🖥️ *本机名称*: \`$t_name\`  
-🌐 *远程路径*: \`$t_path\`
-⏱️ *开始时间*: \`$t_time\`"
-    send_tg_notification "$BOT_TOKEN" "$CHAT_ID" "$start_msg"
-
-    if [ $is_interactive -eq 1 ]; then
-        echo -e "${GREEN}正在打包本地核心系统文件，请稍候...${NC}"
-    fi
-
-    # 系统核心打包 (使用 GNU tar 屏蔽无关动态目录及快照自身)
-    tar -czf "$SNAPSHOT_FILE" \
-      --exclude="/dev/*" --exclude="/proc/*" --exclude="/sys/*" --exclude="/tmp/*" --exclude="/run/*" \
-      --exclude="/mnt/*" --exclude="/media/*" --exclude="/lost+found" --exclude="/var/cache/*" \
-      --exclude="/var/tmp/*" --exclude="/var/log/*" \
-      --exclude="${BACKUP_DIR}/*" \
-      /boot /etc /usr /var /root /home /opt /bin /sbin /lib /lib64 > /dev/null 2>&1
-
-    if [ $? -eq 0 ] || [ -s "$SNAPSHOT_FILE" ]; then
-        SNAPSHOT_SIZE=$(du -h "$SNAPSHOT_FILE" | cut -f1)
-        log_info "本地快照创建成功，大小: $SNAPSHOT_SIZE"
-        
-        log_info "正在通过 SSH 自动创建远程多级备份目录结构..."
-        ssh -p "$SSH_PORT" -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$TARGET_USER@$TARGET_IP" "mkdir -p \"$FULL_REMOTE_PATH/system_snapshots\"" &>/dev/null
-        
-        log_info "正在通过 rsync 安全传输快照至远程服务器..."
-        
-        if [ $is_interactive -eq 1 ]; then
-            echo -e "${GREEN}正在同步快照至远程服务器（展示实时进度）：${NC}"
-            rsync -avz --progress --inplace --rsync-path="mkdir -p $FULL_REMOTE_PATH/system_snapshots && rsync" -e "ssh -p $SSH_PORT -o StrictHostKeyChecking=no" "$SNAPSHOT_FILE" "$TARGET_USER@$TARGET_IP:$FULL_REMOTE_PATH/system_snapshots/"
-            local sync_res=$?
-        else
-            rsync -avz --inplace --rsync-path="mkdir -p $FULL_REMOTE_PATH/system_snapshots && rsync" -e "ssh -p $SSH_PORT -o StrictHostKeyChecking=no" "$SNAPSHOT_FILE" "$TARGET_USER@$TARGET_IP:$FULL_REMOTE_PATH/system_snapshots/" &>/dev/null
-            local sync_res=$?
-        fi
-        
-        if [ $sync_res -eq 0 ]; then
-            log_info "远程同步成功！文件已安全留存远端。"
-            ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no "$TARGET_USER@$TARGET_IP" "find \"$FULL_REMOTE_PATH/system_snapshots\" -type f -name '*.tar.gz' -mtime +$REMOTE_SNAPSHOT_DAYS -delete" &>/dev/null
+    # 只检测前几个节点以节省脚本启动时间
+    for proxy in "${GITHUB_PROXIES[@]}"; do
+        # 强制使用 -6 (IPv6) 进行毫秒级连接测试
+        local start_time
+        start_time=$(date +%s%N)
+        if curl -6 -sIL --connect-timeout 2 --max-time 3 "${proxy}" > /dev/null 2>&1; then
+            local end_time
+            end_time=$(date +%s%N)
+            local duration=$(( (end_time - start_time) / 1000000 )) # 转换为毫秒
             
-            # 定时清理本地过期快照 (使用 GNU findutils 确保 maxdepth 兼容)
-            find "$BACKUP_DIR" -maxdepth 1 -type f -name "system_snapshot_*.tar.gz" | sort -r | tail -n +$((LOCAL_SNAPSHOT_KEEP+1)) | xargs -r rm -f
-            log_info "过期快照轮转清理完毕。"
-
-            local local_count=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name "system_snapshot_*.tar.gz" | wc -l)
-            
-            # 组装成功的美化 TG 消息
-            local e_size=$(escape_markdown "$SNAPSHOT_SIZE")
-            local e_count=$(escape_markdown "$local_count")
-            local e_days=$(escape_markdown "$REMOTE_SNAPSHOT_DAYS")
-            local e_ldir=$(escape_markdown "$BACKUP_DIR")
-            local e_endtime=$(escape_markdown "$(date '+%Y-%m-%d %H:%M:%S')")
-
-            local success_msg="✅ *系统快照备份任务已圆满完成*
-
-🖥️ *本机名称*: \`$t_name\`
-💾 *快照大小*: \`$e_size\`
-⏱️ *完成时间*: \`$e_endtime\`
-📂 *本地快照*: \`$e_count个\`
-☁️ *远程保留*: \`$e_days天\`
-💾 *本地路径*: \`$e_ldir\`
-📁 *远程路径*: \`$t_path\`"
-            send_tg_notification "$BOT_TOKEN" "$CHAT_ID" "$success_msg"
-            log_info "========== 快照备份任务顺利结束 =========="
-        else
-            log_error "远程传输失败！原因：无法连接或没有免密授权"
-            local fail_msg="❌ *系统快照远程传输失败*
-
-🖥️ *本机名称*: \`$t_name\`
-⏱️ *发生时间*: \`$t_time\`
-⚠️ *错误原因*: 远程同步网络中断或 SSH 密钥授信失效，快照仅暂存于本地落盘目录。"
-            send_tg_notification "$BOT_TOKEN" "$CHAT_ID" "$fail_msg"
-        fi
-    else
-        log_error "快照打包失败！"
-    fi
-    if [ $is_interactive -eq 0 ]; then exit 0; fi
-}
-
-# 检测由 OpenRC/Cron 后端运行触发
-if [ "$1" == "--backend-run" ]; then
-    run_backend_backup "$@"
-fi
-
-# ==============================================================================
-# 模块二：前端交互式菜单与控制台逻辑
-# ==============================================================================
-read_with_default() {
-    local prompt="$1" local default_value="$2" local var_name="$3" local input_value
-    if [ -n "$default_value" ]; then
-        read -p "$(echo -e "${prompt} [当前值/默认: ${GREEN}${default_value}${NC}]: ")" input_value
-        if [ -z "$input_value" ]; then eval "$var_name=\"\$default_value\""; else eval "$var_name=\"\$input_value\""; fi
-    else
-        read -p "$(echo -e "${prompt}: ")" input_value
-        if [ -z "$input_value" ] && [ "$var_name" == "NEW_TARGET_USER" ]; then
-            eval "$var_name=\"root\""
-        else
-            while [ -z "$input_value" ]; do
-                echo -e "${GREEN}该项不能为空，请输入有效值${NC}"
-                read -p "$(echo -e "${prompt}: ")" input_value
-            done
-            eval "$var_name=\"\$input_value\""
-        fi
-    fi
-}
-
-load_config() { if [ -f "$CONFIG_FILE" ]; then source "$CONFIG_FILE"; fi; }
-
-draw_header() {
-    clear
-    echo -e "${GREEN}=================================${NC}"
-    echo -e "${GREEN}         系统快照备份工具         ${NC}"
-    echo -e "${GREEN}=================================${NC}"
-}
-
-show_status_and_info() {
-    load_config
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${GREEN}当前工具状态:${NC} ${YELLOW}[未安装]${NC}"
-        echo -e "${GREEN}=================================${NC}"
-        return 1
-    fi
-    
-    # 【修复】关键匹配词对齐，在 crontabs 中精准匹配实际脚本名称 snapshot.sh
-    local cron_active="未激活"
-    if [ -f "/etc/periodic/daily/system-snapshot" ] || grep -q "snapshot.sh" /etc/crontabs/root 2>/dev/null; then
-        if rc-service crond status &>/dev/null || rc-service dcron status &>/dev/null; then
-            cron_active="运行中 (Cron)"
-        else
-            cron_active="已配置 (Cron服务未启动)"
-        fi
-    fi
-    
-    local last_run="无记录" local next_run="按周期自动触发"
-    if [ -f "$LOG_FILE" ]; then
-        local log_time=$(grep "快照备份任务顺利结束" "$LOG_FILE" | tail -n 1 | awk '{print $1,$2}')
-        if [ -n "$log_time" ]; then
-            last_run="$log_time"
-            # 【终极修复】采用秒级时间戳加减，100% 解决 Alpine 极简 BusyBox 环境下 date 的日期加减灵异 Bug
-            next_run=$(date -d "@$(($(date -d "$log_time" +"%s" 2>/dev/null || gdate -d "$log_time" +"%s") + ${BACKUP_INTERVAL_DAYS:-5} * 86400))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
-        fi
-    fi
-    
-    local local_usage="0 MB" local local_count=0
-    if [ -d "$BACKUP_DIR" ]; then
-        local_count=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name "system_snapshot_*.tar.gz" | wc -l)
-        local_usage=$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
-    fi
-    echo -e "${YELLOW}[ 自动化运行状态 ]${NC}"
-    echo -e "${GREEN} 定时任务状态:${NC} ${YELLOW}${cron_active}${NC}"
-    echo -e "${GREEN} 上次执行时间:${NC} ${YELLOW}${last_run}${NC}"
-    echo -e "${GREEN} 下次预计执行:${NC} ${YELLOW}${next_run}${NC}"
-    echo -e "${GREEN} 备份间隔天数:${NC} 每 ${YELLOW}${BACKUP_INTERVAL_DAYS:-'5'}${NC} 天自动触发一次"
-    echo -e "${GREEN}=================================${NC}"
-    echo -e "${YELLOW}[ 核心配置与数据信息 ]${NC}"
-    echo -e "${GREEN} 本机标识名称:${NC} ${YELLOW}${REMOTE_DIR_NAME:-'未配置'}${NC}"
-    echo -e "${GREEN} 远程存储目标:${NC} ${YELLOW}${TARGET_USER:-'N/A'}@${TARGET_IP:-'N/A'}:${SSH_PORT:-'22'}${NC}"
-    echo -e "${GREEN} 远程基础路径:${NC} ${YELLOW}${TARGET_BASE_DIR:-'未配置'}${NC}"
-    echo -e "${GREEN} 本地备份目录:${NC} ${YELLOW}${BACKUP_DIR:-'/backups'} ${NC}(共 ${YELLOW}${local_count}${NC} 个快照, 占用 ${YELLOW}${local_usage}${NC})"
-    echo -e "${GREEN} 轮转策略留存:${NC} 本地 ${YELLOW}${LOCAL_SNAPSHOT_KEEP:-'2'}${NC} 个 | 远程 ${YELLOW}${REMOTE_SNAPSHOT_DAYS:-'15'}${NC} 天"
-    echo -e "${GREEN}=================================${NC}"
-    return 0
-}
-
-# Alpine 专属环境依赖补齐
-check_requirements() {
-    local missing_pkgs=""
-    for pkg in curl openssh-client rsync tar gawk coreutils findutils; do
-        if ! apk info -e $pkg &>/dev/null; then
-            missing_pkgs="$missing_pkgs $pkg"
+            if [ $duration -lt $min_time ]; then
+                min_time=$duration
+                best_proxy=$proxy
+            fi
         fi
     done
-    
-    if [ -n "$missing_pkgs" ]; then
-        echo -e "${GREEN}正在为 Alpine 补齐完整 GNU 核心工具链环境...${NC}"
-        apk update && apk add $missing_pkgs &>/dev/null
+
+    if [ -n "$best_proxy" ]; then
+        ok "成功匹配 IPv6 最优加速源: ${GREEN}${best_proxy}${RESET} (延迟: ${min_time}ms)"
+        AVAILABLE_PROXY=$best_proxy
+    else
+        warn "未检测到原生支持纯 IPv6 的反代节点，将尝试直接连接 GitHub..."
+        AVAILABLE_PROXY=""
     fi
 }
 
-auto_copy_ssh_key() {
-    local ip="$1" local user="$2" local port="$3"
-    local LOCAL_KEY="/root/.ssh/id_rsa.pub"
+# ── 1. 核心下载与组件解压 (全面适配 IPv6 代理) ───────────────────────────────────
+detect_target() {
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64)  TARGET="x86_64-unknown-linux-musl"; T2S_ARCH="amd64" ;;
+        aarch64) TARGET="aarch64-unknown-linux-musl"; T2S_ARCH="arm64" ;;
+        *) die "暂不支持的系统架构: $ARCH" ;;
+    esac
+}
 
-    if [ ! -f "$LOCAL_KEY" ]; then
-        echo -e "${GREEN}未检测到本地公钥，正在生成新的 SSH 密钥对...${NC}"
-        mkdir -p /root/.ssh && chmod 700 /root/.ssh
-        ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -N "" -q
-        if [ $? -ne 0 ]; then
-            echo -e "${GREEN}❌ 密钥生成失败，请检查 ssh-keygen 是否可用${NC}"
-            return 1
-        fi
-        echo -e "${GREEN}✅ SSH 密钥生成完成: $LOCAL_KEY${NC}"
-    else
-        echo -e "${GREEN}✅ 已检测到本地公钥: $LOCAL_KEY${NC}"
+fetch_latest_version() {
+    select_best_proxy
+    info "正在查询 GitHub 获取最新 Release 版本号..."
+    
+    local api_url="https://api.github.com/repos/${REPO}/releases/latest"
+    # 如果找到了可用的反代站，走反代站请求 API
+    if [ -n "$AVAILABLE_PROXY" ]; then
+        api_url="${AVAILABLE_PROXY}${api_url}"
     fi
 
-    local PUBKEY_CONTENT=$(cat "$LOCAL_KEY")
-    echo -e "${GREEN}⚠️ 第一次连接需要手动输入远程服务器密码进行鉴权操作${NC}"
+    TMP_API="$(mktemp)"
+    # 强制 IPv6 兼容请求
+    if curl -6 -sSL -H "Accept: application/vnd.github+json" --connect-timeout 5 "$api_url" > "$TMP_API"; then
+        VERSION="$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$TMP_API" | head -n 1)"
+    fi
+    rm -f "$TMP_API"
+    
+    if [ -z "$VERSION" ]; then
+        local fallback_url="https://github.com/${REPO}/releases/latest"
+        if [ -n "$AVAILABLE_PROXY" ]; then fallback_url="${AVAILABLE_PROXY}${fallback_url}"; fi
+        VERSION=$(curl -6 -sS --connect-timeout 5 "$fallback_url" 2>/dev/null | grep -o 'tag/[vV]*[0-9.]*' | awk -F '/' 'NR==1 {print $2}')
+    fi
+    
+    [ -z "$VERSION" ] && die "无法获取最新版本号，请检查本地 IPv6 网络连通性或代理节点状态。"
+    export VERSION
+}
 
-    ssh -p "$port" -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$user@$ip" "bash -s" <<EOF
-        mkdir -p ~/.ssh
-        chmod 700 ~/.ssh
-        touch ~/.ssh/authorized_keys
-        cp ~/.ssh/authorized_keys ~/.ssh/authorized_keys.bak
-        if ! grep -Fxq "$PUBKEY_CONTENT" ~/.ssh/authorized_keys.bak; then
-            echo "$PUBKEY_CONTENT" >> ~/.ssh/authorized_keys.bak
-        fi
-        awk '!seen[\$0]++' ~/.ssh/authorized_keys.bak > ~/.ssh/authorized_keys
-        rm -f ~/.ssh/authorized_keys.bak
-        chmod 600 ~/.ssh/authorized_keys
-        chown \$(whoami):\$(id -gn) ~/.ssh ~/.ssh/authorized_keys
+download_and_extract() {
+    detect_target
+    fetch_latest_version
+    info "正在匹配系统环境形态: ${YELLOW}${TARGET}${RESET}"
+
+    ASSET="warp-rust-${VERSION}-${TARGET}.tar.gz"
+    local url_tgz="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
+    
+    # 注入反代链
+    if [ -n "$AVAILABLE_PROXY" ]; then
+        url_tgz="${AVAILABLE_PROXY}${url_tgz}"
+    fi
+
+    TMP="$(mktemp -d)"
+    trap 'rm -rf "$TMP"' EXIT
+
+    info "开始同步下载资产包..."
+    curl -6 -fsSL --connect-timeout 10 -o "$TMP/$ASSET" "$url_tgz" || die "下载资产包失败！"
+
+    tar xzf "$TMP/$ASSET" -C "$TMP"
+    EXTRACTED_BIN=$(find "$TMP" -type f -name "warp-rust" | head -n 1)
+    [ -n "$EXTRACTED_BIN" ] || die "在归档包内未找到 warp-rust 主程序！"
+    export TARGET_BIN_PATH="$EXTRACTED_BIN"
+}
+
+# ── 2. 配置文件与纯正策略路由 Systemd 生成 ──────────────────────────────────
+write_config() {
+    local bind_ip="$1" local bind_port="$2" local username="$3" local password="$4"
+    [ -d "$CONF_DIR" ] || install -m 0755 -d "$CONF_DIR"
+    
+    cat <<EOF > "$CONF_FILE"
+[server]
+bind = "${bind_ip}:${bind_port}"
+EOF
+    if [ -n "$username" ] && [ -n "$password" ]; then
+        cat <<EOF >> "$CONF_FILE"
+
+[server.auth]
+username = "${username}"
+password = "${password}"
+EOF
+    fi
+    cat <<EOF >> "$CONF_FILE"
+
+[logging]
+level = "warn,warp_rust=info,wireguard_netstack=warn"
+format = "pretty"
+
+[warp]
+data_dir = "${DATA_DIR}"
+device_model = "warp-rust"
+refresh_interval = "24h"
+register_cooldown = "10m"
+mtu = 1420
+tcp_buffer_size = 1048576
+
+[health]
+interval = "30s"
+timeout = "8s"
+
+[recovery]
+reconnect_after         = 1
+rebuild_config_after   = 3
+reregister_after       = 5
+rotate_identity_after  = 10
+backoff_min = "500ms"
+backoff_max = "30s"
+
+[metrics]
+enabled = true
+bind = "127.0.0.1:9090"
+
+[hot_reload]
+enabled = true
+
+[limits]
+max_concurrent_connections = 1024
+handshake_timeout = "10s"
+idle_timeout = "300s"
+relay_buffer_size = 262144
+auth_fail_sleep = "1s"
+relay_close_grace = "500ms"
+
+[dns]
+mode = "system"
+servers = ["2606:4700:4700::1111", "1.1.1.1:53"] # 加入了 IPv6 DNS 优先
+timeout = "3s"
+cache_ttl = "60s"
+EOF
+}
+
+write_systemd() {
+    local use_global_tun="$1"
+    
+    cat <<EOF > "$SERVICE_FILE"
+[Unit]
+Description=cf-warp-rust Cloudflare WARP Proxy Client
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${DATA_DIR}
+ExecStart=${INSTALL_BIN} --config ${CONF_FILE}
+Restart=always
+RestartSec=3s
+LimitNOFILE=65535
 EOF
 
-    if [ $? -ne 0 ]; then
-        echo -e "${GREEN}❌ 远程操作失败，请检查网络连接、密码或端口是否正确。${NC}"
-        return 1
-    fi
+    # 如果开启了【11】选项的全局路由劫持模式，强行缝合 tun2socks 与双栈策略路由命令
+    if [ "$use_global_tun" = "true" ]; then
+        local current_bind
+        current_bind=$(grep -i 'bind' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+        local warp_port="${current_bind##*:}"
+        [ -z "$warp_port" ] && warp_port="1080"
 
-    echo -e "\n${GREEN}📂 正在验证远程免密读取通道状态...${NC}"
-    local verify_check=$(ssh -p "$port" -o ConnectTimeout=5 -o PasswordAuthentication=no -o StrictHostKeyChecking=no "$user@$ip" "cat ~/.ssh/authorized_keys" 2>/dev/null)
-    
-    if [ -n "$verify_check" ]; then
-        echo -e "${GREEN}✅ 密钥同步结果最终验证通过！免密安全互信已成功建立。${NC}"
-        return 0
-    else
-        echo -e "${GREEN}❌ 强校验错误: 密钥虽已传输，但当前机器仍无法进行免密登录。${NC}"
-        return 1
-    fi
-}
+        cat <<EOF >> "$SERVICE_FILE"
+# ─── 策略路由网络层全局劫持 (IPv4 + IPv6 双栈全面托管) ───
+ExecStartPost=/bin/sleep 2
+ExecStartPost=/usr/bin/bash -c "${TUN2SOCKS_BIN} -device ${TUN_DEV_NAME} -proxy socks5://127.0.0.1:${warp_port} > /dev/null 2>&1 &"
+ExecStartPost=/bin/sleep 1
+ExecStartPost=/sbin/ip link set dev ${TUN_DEV_NAME} up
+# IPv4 路由表
+ExecStartPost=/sbin/ip route add default dev ${TUN_DEV_NAME} table 20
+ExecStartPost=/sbin/ip rule add lookup 20 pref 20
+ExecStartPost=/sbin/ip rule add to 127.0.0.0/8 lookup main pref 16
+ExecStartPost=/sbin/ip rule add to 10.0.0.0/8 lookup main pref 16
+ExecStartPost=/sbin/ip rule add to 172.16.0.0/12 lookup main pref 16
+ExecStartPost=/sbin/ip rule add to 192.168.0.0/16 lookup main pref 16
+# IPv6 路由表 (解决 IPv6-only VPS 的全局托管需求)
+ExecStartPost=/sbin/ip -6 route add default dev ${TUN_DEV_NAME} table 20
+ExecStartPost=/sbin/ip -6 rule add lookup 20 pref 20
+ExecStartPost=/sbin/ip -6 rule add to ::1 lookup main pref 16
+ExecStartPost=/sbin/ip -6 rule add to fe80::/10 lookup main pref 16
 
-# Alpine 专属：使用 OpenRC 服务守护以及标准的 Crontab 触发器
-setup_alpine_cron() {
-    # 1. 编写 OpenRC 行程服务 (供手动或临时管理接口调用)
-    cat > "/etc/init.d/system-snapshot" << 'EOFSERVICE'
-#!/sbin/openrc-run
-description="System Snapshot Backup Service"
-command="/usr/bin/snapshot.sh"
-command_args="--backend-run"
-
-depend() {
-    need net
-}
-EOFSERVICE
-    chmod +x /etc/init.d/system-snapshot
-
-    # 2. 注入系统的 Crontab 定时器结构中
-    # 清理历史可能存在的同名旧配置
-    sed -i "/$SERVICE_NAME/d" /etc/crontabs/root 2>/dev/null
-    sed -i "/snapshot.sh/d" /etc/crontabs/root 2>/dev/null
-    
-    # 生成随机执行小时数（0-4点）和分钟数（0-59），模拟原 Systemd 的 RandomizedDelaySec 削峰机制
-    local rand_min=$((RANDOM % 60))
-    local rand_hour=$((RANDOM % 5))
-    
-    # 写入 Alpine 的 crontabs 主配置 (每 X 天运行一次)
-    echo "$rand_min $rand_hour */${NEW_BACKUP_INTERVAL_DAYS} * * $ADMIN_SCRIPT --backend-run >/dev/null 2>&1" >> /etc/crontabs/root
-    
-    # 重启并启动 Alpine 的 crond 调度服务
-    rc-update add crond default &>/dev/null
-    rc-service crond restart &>/dev/null
-}
-
-configure_project() {
-    load_config
-    check_requirements
-    if [ -f "$CONFIG_FILE" ]; then echo -e "${GREEN}进入修改配置模式。回车直接保留原当前值：${NC}\n"
-    else echo -e "${GREEN}进入首次安装配置向导。请输入以下参数：${NC}\n"; fi
-
-    read_with_default "请输入 Telegram Bot Token" "$BOT_TOKEN" NEW_BOT_TOKEN
-    read_with_default "请输入 Telegram Chat ID" "$CHAT_ID" NEW_CHAT_ID
-    echo
-    read_with_default "请输入远程服务器 IP 地址" "$TARGET_IP" NEW_TARGET_IP
-    read_with_default "请输入远程服务器用户名 (默认: root)" "${TARGET_USER:-root}" NEW_TARGET_USER
-    read_with_default "请输入 SSH 连接端口" "${SSH_PORT:-22}" NEW_SSH_PORT
-    echo
-    
-    auto_copy_ssh_key "$NEW_TARGET_IP" "$NEW_TARGET_USER" "$NEW_SSH_PORT"
-    if [ $? -ne 0 ]; then
-        echo -e "\n${GREEN}由于免密授权未真正生效，配置流程已强行中断，未写入任何更改。${NC}"
-        read -p "按任意键返回主菜单..." -n 1
-        return 1
-    fi
-    echo
-    
-    read_with_default "请输入远程基础备份目录" "${TARGET_BASE_DIR:-/root/remote_backup}" NEW_TARGET_BASE_DIR
-    local current_hostname=$(hostname)
-    read_with_default "请输入本机在远程的子目录名" "${REMOTE_DIR_NAME:-$current_hostname}" NEW_REMOTE_DIR_NAME
-    echo
-    read_with_default "请输入本地快照落盘目录" "${BACKUP_DIR:-/backups}" NEW_BACKUP_DIR
-    echo
-    read_with_default "请输入本地最大保留快照数量(个)" "${LOCAL_SNAPSHOT_KEEP:-2}" NEW_LOCAL_SNAPSHOT_KEEP
-    read_with_default "请输入远程快照过期删除时间(天)" "${REMOTE_SNAPSHOT_DAYS:-15}" NEW_REMOTE_SNAPSHOT_DAYS
-    echo
-    read_with_default "请输入备份执行间隔天数(1-30天)" "${BACKUP_INTERVAL_DAYS:-5}" NEW_BACKUP_INTERVAL_DAYS
-    
-    mkdir -p "$NEW_BACKUP_DIR"
-    cat > "$CONFIG_FILE" << EOF
-#!/bin/bash
-BOT_TOKEN="$NEW_BOT_TOKEN"
-CHAT_ID="$NEW_CHAT_ID"
-TARGET_IP="$NEW_TARGET_IP"
-TARGET_USER="$NEW_TARGET_USER"
-SSH_PORT="$NEW_SSH_PORT"
-TARGET_BASE_DIR="$NEW_TARGET_BASE_DIR"
-REMOTE_DIR_NAME="$NEW_REMOTE_DIR_NAME"
-BACKUP_DIR="$NEW_BACKUP_DIR"
-LOCAL_SNAPSHOT_KEEP=$NEW_LOCAL_SNAPSHOT_KEEP
-REMOTE_SNAPSHOT_DAYS=$NEW_REMOTE_SNAPSHOT_DAYS
-BACKUP_INTERVAL_DAYS=$NEW_BACKUP_INTERVAL_DAYS
+# ─── 善后卸载还原（防止 VPS 彻底断网） ───
+ExecStop=/sbin/ip rule del lookup 20 pref 20 2>/dev/null || true
+ExecStop=/sbin/ip route del default dev ${TUN_DEV_NAME} table 20 2>/dev/null || true
+ExecStop=/sbin/ip rule del to 127.0.0.0/8 lookup main pref 16 2>/dev/null || true
+ExecStop=/sbin/ip rule del to 10.0.0.0/8 lookup main pref 16 2>/dev/null || true
+ExecStop=/sbin/ip rule del to 172.16.0.0/12 lookup main pref 16 2>/dev/null || true
+ExecStop=/sbin/ip rule del to 192.168.0.0/16 lookup main pref 16 2>/dev/null || true
+ExecStop=/sbin/ip -6 rule del lookup 20 pref 20 2>/dev/null || true
+ExecStop=/sbin/ip -6 route del default dev ${TUN_DEV_NAME} table 20 2>/dev/null || true
+ExecStop=/sbin/ip -6 rule del to ::1 lookup main pref 16 2>/dev/null || true
+ExecStop=/sbin/ip -6 rule del to fe80::/10 lookup main pref 16 2>/dev/null || true
+ExecStopPost=/usr/bin/pkill -f tun2socks
 EOF
-    chmod 600 "$CONFIG_FILE"
-    
-    setup_alpine_cron
-    
-    echo -e "\n${GREEN}✓ 全新配置和 Alpine Cron 自动化定时任务已同步刷新并生效！${NC}"
-    read -p "按任意键返回主菜单..." -n 1
-}
-
-action_manual_backup() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${GREEN}错误: 请先进行配置再执行此操作。${NC}"; else
-        echo -e "\n${GREEN}正在手动同步触发核心流程...${NC}"
-        $ADMIN_SCRIPT --backend-run --interactive
-        echo -e "${GREEN}✓ 手动打包传输完整。${NC}"
     fi
-    read -p "按任意键返回主菜单..." -n 1
+
+    cat <<EOF >> "$SERVICE_FILE"
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
 }
 
-test_telegram() {
-    if [ ! -f "$CONFIG_FILE" ]; then 
-        echo -e "${GREEN}错误: 请先进行配置后再执行测试。${NC}"
-        read -p "按任意键返回主菜单..." -n 1
-        return 1
+# ── 3. 保留功能：谷歌透明代理控制中心 (原本的菜单10) ───────────────────────────
+start_transparent_proxy() {
+    if systemctl is-active --quiet "$PROXY_SERVICE_NAME"; then
+        warn "Google 透明分流代理已经处于运行状态，无需重复启动。"
+        return
     fi
-    source "$CONFIG_FILE"
-    echo -e "\n${GREEN}正在发送 Telegram 控制台连通性测试消息...${NC}"
-    
-    local FULL_REMOTE_PATH="$TARGET_BASE_DIR/$REMOTE_DIR_NAME"
-    
-    local t_name=$(escape_markdown "${REMOTE_DIR_NAME:-未配置}")
-    local t_path=$(escape_markdown "${FULL_REMOTE_PATH:-未配置}")
-    local t_days=$(escape_markdown "${BACKUP_INTERVAL_DAYS:-5}")
-    local t_time=$(escape_markdown "$(date '+%Y-%m-%d %H:%M:%S')")
-
-    local test_msg="🚀 *系统快照备份工具 Alpine 安装测试*
-
-📱 如果您看到此消息，说明Telegram配置成功！
-🖥️ *本机名称*: \`$t_name\`  
-🌐 *远程路径*: \`$t_path\`
-⏰ *执行频率*: 每${t_days}天一次
-⏱️ *时间*: \`$t_time\`"
-
-    local response=$(curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
-        -d chat_id="$CHAT_ID" \
-        -d text="$test_msg" \
-        -d parse_mode="MarkdownV2")
-        
-    if [[ $response == *"\"ok\":true"* ]]; then
-        echo -e "${GREEN}✓ Telegram 通知测试联通成功！请检查您的手机电报频道。${NC}\n"
-    else
-        echo -e "${GREEN}❌ 电报消息投递失败，请检查 Token / Chat ID 或者是机器出海网络代理。${NC}\n"
+    if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+        warn "核心 WARP-Rust 未在后台运行！请先开启主服务。"
+        return
     fi
-    read -p "按任意键返回主菜单..." -n 1
-}
+    if [ -f "$SERVICE_FILE" ] && grep -q "tun2socks" "$SERVICE_FILE"; then
+        warn "检测到当前已开启 [11.全局出站代理]，无需且不能与谷歌分流同时开启！"
+        return
+    fi
 
-action_view_logs() {
-    if [ -f "$LOG_FILE" ]; then 
-        echo -e "\n${GREEN}正在加载最近的 15 条备份流日志：${NC}"
-        tail -n 15 "$LOG_FILE"
-    else echo -e "${GREEN}暂无备份任务的日志流产生。${NC}"; fi
-    read -p "按任意键返回主菜单..." -n 1
-}
+    local current_bind
+    current_bind=$(grep -i 'bind' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    local warp_ip="${current_bind%%:*}" local warp_port="${current_bind##*:}"
+    [ -z "$warp_port" ] && warp_port="1080"
+    [ -z "$warp_ip" ] && warp_ip="127.0.0.1"
 
-uninstall_project() {
-    sed -i "/$SERVICE_NAME/d" /etc/crontabs/root 2>/dev/null
-    sed -i "/snapshot.sh/d" /etc/crontabs/root 2>/dev/null
-    rc-service crond restart &>/dev/null
-    rm -f /etc/init.d/system-snapshot
-    rm -f "$CONFIG_FILE" "$ADMIN_SCRIPT"
-    echo -e "${GREEN}✓ 快照工具及 Alpine 定时任务已从本机完全干净卸载。${NC}"
-    exit 0
-}
+    info "正在检查并安装透明代理核心组件 (redsocks / iptables)..."
+    local proxy_missing=""
+    if ! command -v redsocks &>/dev/null; then proxy_missing="$proxy_missing redsocks"; fi
+    if ! command -v iptables &>/dev/null; then proxy_missing="$proxy_missing iptables"; fi
 
-menu_loop() {
-    while true; do
-        draw_header
-        show_status_and_info
-        echo -e "${GREEN}  [1] 安装/修改配置${NC}"
-        echo -e "${GREEN}  [2] 手动执行系统快照${NC}"
-        echo -e "${GREEN}  [3] 测试Telegram连通性${NC}"
-        echo -e "${GREEN}  [4] 查看系统备份日志${NC}"
-        echo -e "${GREEN}  [5] 卸载备份工具${NC}"
-        echo -e "${GREEN}  [0] 退出${NC}"
-        echo -e "${GREEN}=================================${NC}"
-
-        read -p $'\033[32m请选择操作编号: \033[0m' choice
-        case $choice in
-            1) configure_project ;;
-            2) action_manual_backup ;;
-            3) test_telegram ;;
-            4) action_view_logs ;;
-            5) uninstall_project ;;
-            0) exit 0 ;;
-            *) sleep 1 ;;
+    if [ -n "$proxy_missing" ]; then
+        info "正在为系统补齐透明分流组件群:${YELLOW}$proxy_missing${RESET}..."
+        case $OS in
+            ubuntu|debian) apt-get update -qy && apt-get install -y $proxy_missing >/dev/null 2>&1 ;;
+            centos|rhel|rocky|almalinux|fedora)
+                if command -v dnf &>/dev/null; then dnf install -y $proxy_missing >/dev/null 2>&1
+                else yum install -y $proxy_missing >/dev/null 2>&1; fi ;;
         esac
+    fi
+
+    cat <<EOF > "$REDSOCKS_CONF"
+base {
+    log_debug = off; log_info = on; log = "syslog:daemon"; daemon = off; redirector = iptables;
+}
+redsocks {
+    local_ip = 127.0.0.1; local_port = 12345; ip = 127.0.0.1; port = ${warp_port}; type = socks5;
+}
+EOF
+
+    [ -d "$DATA_DIR" ] || mkdir -p "$DATA_DIR"
+    cat <<'EOF' > "$PROXY_RULES_SCRIPT"
+#!/bin/bash
+ACTION=$1
+GOOGLE_IPS="8.8.4.0/24 8.8.8.0/24 34.0.0.0/9 35.184.0.0/13 35.192.0.0/12 35.224.0.0/12 35.240.0.0/13 64.233.160.0/19 66.102.0.0/20 66.249.64.0/19 72.14.192.0/18 74.125.0.0/16 104.132.0.0/14 108.177.0.0/17 142.250.0.0/15 172.217.0.0/16 172.253.0.0/16 173.194.0.0/16 209.85.128.0/17 216.58.192.0/19 216.239.32.0/19"
+if [ "$ACTION" = "start" ]; then
+    /sbin/iptables -t nat -N WARP_GOOGLE 2>/dev/null
+    /sbin/iptables -t nat -F WARP_GOOGLE
+    for ip in $GOOGLE_IPS; do
+        /sbin/iptables -t nat -A WARP_GOOGLE -d $ip -p tcp -j REDIRECT --to-ports 12345
+    done
+    /sbin/iptables -t nat -C OUTPUT -j WARP_GOOGLE 2>/dev/null || /sbin/iptables -t nat -A OUTPUT -j WARP_GOOGLE
+elif [ "$ACTION" = "stop" ]; then
+    /sbin/iptables -t nat -D OUTPUT -j WARP_GOOGLE 2>/dev/null
+    /sbin/iptables -t nat -F WARP_GOOGLE 2>/dev/null
+    /sbin/iptables -t nat -X WARP_GOOGLE 2>/dev/null
+fi
+EOF
+    chmod +x "$PROXY_RULES_SCRIPT"
+
+    cat <<EOF > "$PROXY_SERVICE_FILE"
+[Unit]
+Description=Cloudflare WARP Google Transparent Proxy
+After=network.target ${SERVICE_NAME}.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/redsocks -c ${REDSOCKS_CONF}
+ExecStartPost=${PROXY_RULES_SCRIPT} start
+ExecStop=${PROXY_RULES_SCRIPT} stop
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl start "$PROXY_SERVICE_NAME"
+    ok "Google 透明分流代理已挂载！"
+}
+
+stop_transparent_proxy() {
+    systemctl stop "$PROXY_SERVICE_NAME" >/dev/null 2>&1
+    systemctl disable "$PROXY_SERVICE_NAME" >/dev/null 2>&1
+    ok "Google 透明代理已关闭。"
+}
+
+verify_transparent_proxy() {
+    echo -e "\n${CYAN}========= 谷歌分流链路深度验证 =========${RESET}"
+    if iptables -t nat -L OUTPUT -n | grep -q "WARP_GOOGLE"; then
+        echo -e "   iptables 拦截链: ${GREEN}✔ 正常挂载${RESET}"
+    else
+        echo -e "   iptables 拦截链: ${RED}✘ 未挂载${RESET}"
+    fi
+    echo -e "${CYAN}========================================${RESET}"
+}
+
+menu_transparent_proxy_center() {
+    while true; do
+        clear
+        local proxy_status="${RED}未运行${RESET}"
+        if systemctl is-active --quiet "$PROXY_SERVICE_NAME"; then proxy_status="${YELLOW}运行中${RESET}"; fi
+        echo -e "${GREEN}10. 谷歌WARP分流管理 (原iptables方案)${RESET}\n状态: $proxy_status\n1. 开启\n2. 关闭\n3. 验证\n0. 返回"
+        read -r -p "选择: " sub_choice
+        case "$sub_choice" in
+            1) start_transparent_proxy ;;
+            2) stop_transparent_proxy ;;
+            3) verify_transparent_proxy ;;
+            *) return ;;
+        esac
+        read -n 1 -s -r -p "按任意键继续..."
     done
 }
 
-# 启动菜单主循环
-menu_loop
+# ── 4. 新增功能：真实全局透明代理控制中心 (全新菜单11 - 支持 IPv6 依赖下载) ───────────────────────
+start_global_tun_proxy() {
+    if [ -f "$SERVICE_FILE" ] && grep -q "tun2socks" "$SERVICE_FILE"; then
+        warn "全局透明出站已处于配置激活状态。"
+        return
+    fi
+    if systemctl is-active --quiet "$PROXY_SERVICE_NAME"; then
+        warn "请先去菜单10关闭谷歌分流！"
+        return
+    fi
+
+    if [ ! -f "$TUN2SOCKS_BIN" ]; then
+        info "正在通过选定的 IPv6 友好源下载网卡接管组件 tun2socks..."
+        select_best_proxy
+        detect_target
+        local t2s_url="https://github.com/xjasonlyu/tun2socks/releases/latest/download/tun2socks-linux-${T2S_ARCH}"
+        if [ -n "$AVAILABLE_PROXY" ]; then t2s_url="${AVAILABLE_PROXY}${t2s_url}"; fi
+        
+        curl -6 -fsSL --connect-timeout 10 -o "$TUN2SOCKS_BIN" "$t2s_url" || die "下载 tun2socks 失败，请检查 IPv6 网络！"
+        chmod +x "$TUN2SOCKS_BIN"
+        ok "tun2socks 组件部署成功。"
+    fi
+
+    info "正在重构 Systemd 全局接管路由系统..."
+    write_config "127.0.0.1" "1080" "" ""
+    write_systemd "true"
+
+    systemctl restart "$SERVICE_NAME"
+    sleep 3
+    ok "真·双栈全局出站透明代理已彻底成功挂载！"
+}
+
+stop_global_tun_proxy() {
+    if [ ! -f "$SERVICE_FILE" ] || ! grep -q "tun2socks" "$SERVICE_FILE"; then return; fi
+    write_systemd "false"
+    systemctl restart "$SERVICE_NAME"
+    ok "全局透明出站安全卸载完毕。"
+}
+
+verify_global_tun_proxy() {
+    echo -e "\n${CYAN}========= 全局网络链路深度验证 =========${RESET}"
+    if ip rule show | grep -q "lookup 20" || ip -6 rule show | grep -q "lookup 20"; then
+        echo -e "   策略路由双栈全局链: ${GREEN}✔ 正常挂载 (已接管 IPv4+IPv6 全流量)${RESET}"
+    else
+        echo -e "   策略路由双栈全局链: ${RED}✘ 未挂载${RESET}"
+    fi
+    echo -e "${CYAN}========================================${RESET}"
+}
+
+menu_global_proxy_center() {
+    while true; do
+        clear
+        local proxy_status="${RED}未激活${RESET}"
+        if [ -f "$SERVICE_FILE" ] && grep -q "tun2socks" "$SERVICE_FILE"; then proxy_status="${YELLOW}全面激活中${RESET}"; fi
+        echo -e "${CYAN}11. 真实全局出站管理 (新tun2socks双栈方案)${RESET}\n状态: $proxy_status\n1. 一键开启全局透明出站\n2. 关闭全局透明出站\n3. 验证链路状态\n0. 返回"
+        read -r -p "选择: " sub_choice
+        case "$sub_choice" in
+            1) start_global_tun_proxy ;;
+            2) stop_global_tun_proxy ;;
+            3) verify_global_tun_proxy ;;
+            *) return ;;
+        esac
+        read -n 1 -s -r -p "按任意键继续..."
+    done
+}
+
+# ── 5. 面板常规功能模块 ──────────────────────────────────────────────────────
+get_status_info() {
+    if systemctl is-active --quiet "$SERVICE_NAME"; then panel_status="${GREEN}运行中${RESET}"; else panel_status="${RED}未运行${RESET}"; fi
+    if [ -f "$SERVICE_FILE" ] && grep -q "tun2socks" "$SERVICE_FILE"; then panel_status="${panel_status} ${GREEN}| 真·全局开启${RESET}"
+    elif systemctl is-active --quiet "$PROXY_SERVICE_NAME"; then panel_status="${panel_status} ${GREEN}| 谷歌分流开启${RESET}"
+    else panel_status="${panel_status} ${YELLOW}| 常规代理模式${RESET}"; fi
+    if [ -f "$INSTALL_BIN" ]; then panel_version=$("$INSTALL_BIN" --version 2>/dev/null | awk '{print $2}'); else panel_version="${RED}未安装${RESET}"; fi
+}
+
+menu_install() {
+    write_config "127.0.0.1" "1080" "" ""
+    download_and_extract
+    install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$INSTALL_BIN"
+    install -m 0750 -o root -g root -d "$DATA_DIR"
+    write_systemd "false"
+    systemctl start "$SERVICE_NAME"
+    ok "CF-WARP-Rust 安全部署成功！"
+}
+
+# ── 6. 主循环控制中心 ─────────────────────────────────────────────────────────
+while true; do
+    get_status_info
+    clear
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}   CF-WARP-RUST IPv6 终极面板   ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $panel_status"
+    echo -e "${GREEN}版本 :${RESET} ${YELLOW}${panel_version:-0.3.2}${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN} 1. 安装 WARP-Rust${RESET}"
+    echo -e "${GREEN} 2. 更新 WARP-Rust${RESET}"
+    echo -e "${GREEN} 3. 卸载全套组件${RESET}"
+    echo -e "${GREEN} 4. 启动 / 5. 停止 / 6. 重启${RESET}"
+    echo -e "${YELLOW}10. 谷歌WARP分流管理 (原iptables方案)${RESET}"
+    echo -e "${CYAN}11. 真实全局出站管理 (新tun2socks双栈方案)${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    read -r -p "请输入选项: " choice
+    case "$choice" in
+        1) menu_install ;;
+        2) download_and_extract && systemctl stop "$SERVICE_NAME" && install -m 0755 "$TARGET_BIN_PATH" "$INSTALL_BIN" && systemctl start "$SERVICE_NAME" ;;
+        3) systemctl stop "$PROXY_SERVICE_NAME" "$SERVICE_NAME" 2>/dev/null; rm -f "$INSTALL_BIN" "$SERVICE_FILE" "$TUN2SOCKS_BIN"; systemctl daemon-reload; ok "完全卸载" ;;
+        4) systemctl start "$SERVICE_NAME" ;;
+        5) systemctl stop "$SERVICE_NAME" ;;
+        6) systemctl restart "$SERVICE_NAME" ;;
+        10) menu_transparent_proxy_center ;;
+        11) menu_global_proxy_center ;;
+        0) exit 0 ;;
+    esac
+    read -n 1 -s -r -p "按任意键返回主面板..."
+done

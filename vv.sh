@@ -55,7 +55,7 @@ test_dns64_server() {
 
 test_github_access() {
     step "正在测试GitHub访问..."
-    if curl -s -m 10 https://github.com >/dev/null; then
+    if curl -s -I -m 10 https://github.com >/dev/null; then
         success "GitHub访问测试成功。"
         return 0
     else
@@ -206,20 +206,26 @@ write_config_file() {
         input_pass=""
     fi
 
-    # 正式渲染 YAML
+    # 过滤掉回车符并对可能存在在输入中的单引号进行转义，规避 YAML 解析崩溃
+    input_addr=$(echo "$input_addr" | tr -d '\r' | sed "s/'/''/g")
+    input_port=$(echo "$input_port" | tr -d '\r')
+    input_user=$(echo "$input_user" | tr -d '\r' | sed "s/'/''/g")
+    input_pass=$(echo "$input_pass" | tr -d '\r' | sed "s/'/''/g")
+
+    # 正式渲染 YAML (已修正特殊空白导致的缩进故障)
     cat > "$CONFIG_FILE" <<EOF
 tunnel:
   name: tun0
-  mtu: 8500
+  mtu: 1500
   multi-queue: true
   ipv4: 198.18.0.1
 
 socks5:
-  port: $(echo "$input_port" | tr -d '\r')
-  address: '$(echo "$input_addr" | tr -d '\r')'
+  port: $input_port
+  address: '$input_addr'
   udp: 'udp'
-$( [ -n "$input_user" ] && echo "  username: '$(echo "$input_user" | tr -d '\r')'" )
-$( [ -n "$input_pass" ] && echo "  password: '$(echo "$input_pass" | tr -d '\r')'" )
+$( [ -n "$input_user" ] && echo "  username: '$input_user'" )
+$( [ -n "$input_pass" ] && echo "  password: '$input_pass'" )
   mark: 438
 EOF
 }
@@ -237,7 +243,7 @@ change_config() {
 }
 
 #================================================================================
-# 选项 2：全自动升级核心（去除了手动确认，发现新版本直接更新）
+# 选项 2：全自动升级核心
 #================================================================================
 update_core_binary() {
     if [ ! -f "/usr/local/bin/tun2socks" ]; then
@@ -255,7 +261,6 @@ update_core_binary() {
         return 1
     fi
 
-    # 【已同步修改】使用与面板一致的精准抓取逻辑，去除开头的字母 v 以便和 GitHub 的纯数字比对
     local local_version="未知"
     if [ -f "/usr/local/bin/tun2socks" ]; then
         local_version=$(/usr/local/bin/tun2socks --version 2>&1 | grep "Version:" | awk '{print $2}')
@@ -270,7 +275,6 @@ update_core_binary() {
         return 0
     fi
 
-    # 更改处：删除用户 read 选择交互，直接进入静默强制升级
     warning "检测到新版本核心程序 ($latest_version)，开始全自动无缝升级..."
 
     local RESOLV_CONF="/etc/resolv.conf"
@@ -395,6 +399,9 @@ Type=simple
 ExecStart=$BINARY_PATH $CONFIG_DIR/config.yaml
 ExecStartPost=/bin/sleep 1
 
+# 注入高并发限制解除，防止大流量高并发时直接主程序崩溃崩溃
+LimitNOFILE=524288
+
 # 【防断网策略】确保 SSH 22 端口流量直连原生主网卡，绝不进入虚拟网卡
 ExecStartPost=-/sbin/ip rule add to 0.0.0.0/0 dport 22 lookup main pref 5
 ExecStartPost=-/sbin/ip rule add to 0.0.0.0/0 sport 22 lookup main pref 5
@@ -473,10 +480,8 @@ get_status() {
         status_show="${RED}已停止 (未运行)${RESET}"
     fi
 
-    # 针对 hev-socks5-tunnel 专门优化的版本抓取逻辑
     if [ -f "/usr/local/bin/tun2socks" ]; then
         local version_raw=""
-        # 强制使用 --version 参数，并用 grep 和 awk 精准提取数字部分
         version_raw=$(/usr/local/bin/tun2socks --version 2>&1 | grep "Version:" | awk '{print $2}')
         
         if [ -n "$version_raw" ]; then
@@ -499,19 +504,37 @@ get_status() {
 
 test_exit_ip() {
     step "正在通过全局代理隧道查询落地出口 IP..."
+    
     local ip_info=""
-    ip_info=$(curl -s -m 8 --interface tun0 ipinfo.io 2>/dev/null || echo "")
-    if [ -z "$ip_info" ]; then
-        ip_info=$(curl -s -m 8 --interface tun0 https://ifconfig.me/all.json 2>/dev/null || echo "")
-    fi
+    # 国际主流 IP 探测接口
+    local test_urls=(
+        "https://api.ipify.org?format=json"
+        "https://ipinfo.io/json"
+        "https://ifconfig.me/all.json"
+    )
+
+    for url in "${test_urls[@]}"; do
+        info "正在尝试请求: $url ..."
+        # --noproxy "*" 用于强行跳过应用层可能存在的其他本地代理，直接测试内核核心路由
+        ip_info=$(curl --noproxy "*" -s -m 6 "$url" 2>/dev/null || echo "")
+        if [ -n "$ip_info" ]; then
+            break
+        fi
+    done
 
     if [ -n "$ip_info" ]; then
         echo -e "${GREEN}----------------------------------------${RESET}"
-        echo "$ip_info"
+        if echo "$ip_info" | grep -q "{"; then
+            echo "$ip_info" | sed 's/["{}]//g' | sed 's/,/\n/g' | sed 's/^ *//'
+        else
+            echo -e "当前落地出口 IP: ${YELLOW}$ip_info${RESET}"
+        fi
         echo -e "${GREEN}----------------------------------------${RESET}"
         success "测试成功！隧道网络双向畅通。"
     else
-        error "获取失败，可能自定义节点暂时不可用、账密有误或节点不支持 UDP 转发。"
+        error "获取失败。但在日志中看到节点握手成功。"
+        warning "这通常是因为：1. 节点拒绝了当前测试网站的访问；2. 脚本 curl 命令触发了内核反向路由流过滤(rp_filter)。"
+        info "建议：您可以直接在终端尝试：curl https://myip.ipip.net 看看是否能正常网页通信。"
     fi
 }
 
@@ -524,7 +547,7 @@ panel_menu() {
         get_status
         clear
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}    Tun2Socks 全局代理管理面板   ${RESET}"
+        echo -e "${GREEN}    Tun2Socks   全局代理管理面板   ${RESET}"
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN}状态   :${RESET} $status_show"
         echo -e "${GREEN}版本   :${RESET} $version_show"

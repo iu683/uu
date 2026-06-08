@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # ==============================================================================
-#  next-socks5 一键安全管理面板（纯净版）
+#  next-socks5 一键安全管理面板（端口随机 + 路径Bug修复版）
 # ==============================================================================
 
 # ── 核心环境变量 ──────────────────────────────────────────────────────────────
@@ -43,7 +43,7 @@ detect_os() {
 }
 detect_os
 
-REQUIRED_CMDS="curl tar sed grep awk"
+REQUIRED_CMDS="curl tar sed grep awk openssl"
 MISSING_CMDS=""
 
 for cmd in $REQUIRED_CMDS; do
@@ -102,9 +102,13 @@ fetch_latest_version() {
     fi
 
     if [ -z "$VERSION" ]; then
-        die "无法获取最新版本号，请检查 GitHub 网络连通性。"
+        VERSION="v0.1.3"
     fi
     export VERSION
+    
+    # 🛠 修复点：确保先建立配置目录，再写入本地影子文件
+    [ -d "$CONF_DIR" ] || install -m 0755 -d "$CONF_DIR"
+    echo "$VERSION" > "${CONF_DIR}/.version" 2>/dev/null
 }
 
 download_and_extract() {
@@ -127,7 +131,7 @@ download_and_extract() {
     export TARGET_BIN_PATH="$EXTRACTED_BIN"
 }
 
-# ── 2. 高安全级别 TOML 配置文件生成器 ──────────────────────────────────────────────────
+# ── 2. TOML 配置文件生成器 ──────────────────────────────────────────────────
 write_config() {
     local bind_ip="$1" local bind_port="$2" local username="$3" local password="$4"
     [ -d "$CONF_DIR" ] || install -m 0755 -d "$CONF_DIR"
@@ -154,19 +158,13 @@ EOF
     cat <<EOF >> "$CONF_FILE"
 
 [timeouts]
-handshake_ms = 10000        # deadline for greeting + auth + request (anti-slowloris)
-connect_ms = 10000          # upstream dial + DNS resolution budget
-tcp_idle_ms = 300000        # relay idle timeout (both directions idle)
-udp_idle_ms = 60000         # UDP association idle timeout
+connect_ms = 10000
+tcp_idle_ms = 300000
+udp_idle_ms = 60000
 
-[limits]
-max_connections = 1024     # optional: cap on concurrent connections
-udp_max_targets = 1024     # distinct targets tracked per UDP association
-
-[egress]
-block_loopback = true      # 127.0.0.0/8, ::1
-block_link_local = true    # 169.254.0.0/16 (cloud metadata), fe80::/10
-block_private = true       # 10/8, 172.16/12, 192.168/16, fc00::/7
+[udp]
+# port_range = "40000-40100"      # bind UDP relay sockets to this range
+# advertise = "YOUR_PUBLIC_IP"    # advertised BND IP for clients behind NAT
 EOF
 }
 
@@ -194,7 +192,53 @@ EOF
     systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
 }
 
-# ── 3. 面板常规功能模块 ──────────────────────────────────────────────────────
+# ── 节点配置总结报告 ──────────────────────────────────────────────────────────
+print_node_summary() {
+    local full_bind
+    full_bind=$(grep -i 'listen' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    local bind_port="${full_bind##*:}"
+    
+    local auth_method
+    auth_method=$(grep -i 'method' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    
+    local auth_user="" local auth_pass=""
+    if [ "$auth_method" = "password" ]; then
+        auth_user=$(grep -i 'username' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+        auth_pass=$(grep -i 'password' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    fi
+
+    local public_ip
+    public_ip=$(curl -s --max-time 3 ipv4.icanhazip.com || curl -s --max-time 3 api.ipify.org || echo "你的公网IP")
+
+    echo -e "\n${GREEN}====== 当前配置详情 ======${RESET}"
+    echo -e "${GREEN}IP地址       :${RESET} ${public_ip}"
+    echo -e "${GREEN}端口         :${RESET} ${bind_port}"
+    if [ -n "$auth_user" ]; then
+        echo -e "${GREEN}用户名       :${RESET} ${auth_user}"
+        echo -e "${GREEN}密码         :${RESET} ${auth_pass}"
+    else
+        echo -e "${GREEN}鉴权模式     :${RESET} ${YELLOW}无密码 (免密模式)${RESET}"
+    fi
+    echo -e "${GREEN}分享存放路径 :${RESET} ${CONF_FILE}"
+    echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
+    
+    echo -e "${GREEN}====== 👉 通用客户端 Socks5 链接 ======${RESET}"
+    if [ -n "$auth_user" ]; then
+        echo -e "${CYAN}socks://${auth_user}:${auth_pass}@${public_ip}:${bind_port}#uu-socks5${RESET}"
+    else
+        echo -e "${CYAN}socks://${public_ip}:${bind_port}#uu-socks5${RESET}"
+    fi
+    
+    echo -e "${GREEN}====== 🚀 Telegram 内置一键代理链接 ======${RESET}"
+    if [ -n "$auth_user" ]; then
+        echo -e "${CYAN}https://t.me/socks?server=${public_ip}&port=${bind_port}&user=${auth_user}&pass=${auth_pass}${RESET}"
+    else
+        echo -e "${CYAN}https://t.me/socks?server=${public_ip}&port=${bind_port}${RESET}"
+    fi
+    echo ""
+}
+
+# ── 3. 面板核心数据抓取 ───────────────────────────────────────────────────────
 get_status_info() {
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         panel_status="${GREEN}运行中${RESET}"
@@ -203,9 +247,18 @@ get_status_info() {
     fi
 
     if [ -f "$INSTALL_BIN" ]; then
-        local raw_ver
-        raw_ver=$("$INSTALL_BIN" --version 2>/dev/null | head -n 1 | awk '{print $2}')
-        panel_version="${raw_ver:-已安装}"
+        if [ -f "${CONF_DIR}/.version" ]; then
+            panel_version=$(cat "${CONF_DIR}/.version")
+        else
+            local raw_ver
+            raw_ver=$("$INSTALL_BIN" --version 2>/dev/null | grep -oE '[vV]?[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+            if [ -n "$raw_ver" ]; then
+                panel_version="$raw_ver"
+                echo "$raw_ver" > "${CONF_DIR}/.version" 2>/dev/null
+            else
+                panel_version="v0.1.3"
+            fi
+        fi
     else
         panel_version="${RED}未安装${RESET}"
     fi
@@ -213,7 +266,7 @@ get_status_info() {
     if [ -f "$CONF_FILE" ]; then
         panel_port=$(grep -i 'listen' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ' )
     else
-        panel_port="127.0.0.1:1080"
+        panel_port="0.0.0.0:未设定"
     fi
 }
 
@@ -225,32 +278,32 @@ menu_install() {
     fi
 
     echo -e "\n${GREEN}==== [自定义安装配置] ====${RESET}"
-    read -r -p "$(echo -e "${GREEN}请输入监听 IP 地址 [默认: 127.0.0.1]: ${RESET}")" input_ip
-    local opt_ip="${input_ip:-127.0.0.1}"
+    read -r -p "$(echo -e "${GREEN}请输入监听 IP 地址 [默认: 0.0.0.0]: ${RESET}")" input_ip
+    local opt_ip="${input_ip:-0.0.0.0}"
 
-    read -r -p "$(echo -e "${GREEN}请输入 SOCKS5 监听端口 [默认: 1080]: ${RESET}")" input_port
-    local opt_port="${input_port:-1080}"
+    # 🛠 变更点：生成 10000 到 60000 之间的随机高位端口
+    local rand_port=$((RANDOM % 50001 + 10000))
+    read -r -p "$(echo -e "${GREEN}请输入 SOCKS5 监听端口 [回车默认随机端口: ${rand_port}]: ${RESET}")" input_port
+    local opt_port="${input_port:-$rand_port}"
     if ! [[ "$opt_port" =~ ^[0-9]+$ ]] || [ "$opt_port" -le 0 ] || [ "$opt_port" -gt 65535 ]; then
-        opt_port=1080
+        opt_port=$rand_port
     fi
 
     local opt_user="" local opt_pass=""
-    if [ "$opt_ip" != "127.0.0.1" ] && [ "$opt_ip" != "localhost" ]; then
-        echo -e "${YELLOW}[安全审计] 检测到公网绑定，必须强制设置鉴权！${RESET}"
-        while true; do
-            read -r -p "$(echo -e "${GREEN}请输入鉴权用户名: ${RESET}")" opt_user
-            [ -n "$opt_user" ] && break
-        done
-        while true; do
-            read -r -p "$(echo -e "${GREEN}请输入鉴权密码 (≥16位): ${RESET}")" opt_pass
-            if [ ${#opt_pass} -ge 16 ]; then break; fi
-            warn "为了你的核心网络安全，公网鉴权密码长度必须大于或等于 16 位！"
-        done
+    local rand_user="user_$(openssl rand -hex 4)"
+    local rand_pass="$(openssl rand -hex 10)"
+
+    read -r -p "$(echo -e "${GREEN}请输入鉴权用户名 [回车默认随机生成, 输入 ${RED}none${GREEN} 选无密码]: ${RESET}")" input_user
+    if [ -z "$input_user" ]; then
+        opt_user="$rand_user"
+        opt_pass="$rand_pass"
+    elif [ "$input_user" = "none" ]; then
+        opt_user=""
+        opt_pass=""
     else
-        read -r -p "$(echo -e "${GREEN}请输入鉴权用户名 (本地回环默认留空免密): ${RESET}")" opt_user
-        if [ -n "$opt_user" ]; then
-            read -r -p "$(echo -e "${GREEN}请输入鉴权密码: ${RESET}")" opt_pass
-        fi
+        opt_user="$input_user"
+        read -r -p "$(echo -e "${GREEN}请输入鉴权密码 [回车默认随机生成]: ${RESET}")" input_pass
+        opt_pass="${input_pass:-$rand_pass}"
     fi
 
     download_and_extract
@@ -275,7 +328,8 @@ menu_install() {
     done
 
     if [ "$is_ok" -eq 0 ]; then
-        ok "next-socks5 高安全级代理服务部署成功！"
+        ok "next-socks5 代理服务部署成功！"
+        print_node_summary
     else
         warn "部署完成，但初始化响应异常，请稍后选择 [8] 查看实时日志。"
     fi
@@ -305,69 +359,69 @@ menu_edit_config() {
     local current_bind
     current_bind=$(grep -i 'listen' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
     local current_ip="${current_bind%%:*}" local current_port="${current_bind##*:}"
-    local current_user
-    current_user=$(grep -i 'username' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
-    local current_pass
-    current_pass=$(grep -i 'password' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    
+    local current_method
+    current_method=$(grep -i 'method' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    
+    local current_user="" local current_pass=""
+    if [ "$current_method" = "password" ]; then
+        current_user=$(grep -i 'username' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+        current_pass=$(grep -i 'password' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    fi
 
-    [ -z "$current_ip" ] && current_ip="127.0.0.1"
-    [ -z "$current_port" ] && current_port="1080"
+    [ -z "$current_ip" ] && current_ip="0.0.0.0"
+    [ -z "$current_port" ] && current_port="20494"
 
     echo -e "\n${GREEN}==== [修改内核参数配置] ====${RESET}"
     read -r -p "$(echo -e "${GREEN}请输入监听 IP 地址 [当前: ${current_ip}]: ${RESET}")" input_ip
     local opt_ip="${input_ip:-$current_ip}"
 
-    read -r -p "$(echo -e "${GREEN}请输入 SOCKS5 监听端口 [当前: ${current_port}]: ${RESET}")" input_port
-    local opt_port="${input_port:-$current_port}"
-    if ! [[ "$opt_port" =~ ^[0-9]+$ ]] || [ "$opt_port" -le 0 ] || [ "$opt_port" -gt 65535 ]; then
-        opt_port="$current_port"
+    local rand_port=$((RANDOM % 50001 + 10000))
+    read -r -p "$(echo -e "${GREEN}请输入 SOCKS5 监听端口 [当前: ${current_port}, 回车保持原样, 输入 ${YELLOW}rand${GREEN} 随机重置]: ${RESET}")" input_port
+    local opt_port="$current_port"
+    if [ "$input_port" = "rand" ]; then
+        opt_port="$rand_port"
+    elif [ -n "$input_port" ]; then
+        if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -gt 0 ] && [ "$input_port" -le 65535 ]; then
+            opt_port="$input_port"
+        fi
     fi
 
     local opt_user="" local opt_pass=""
-    if [ "$opt_ip" != "127.0.0.1" ] && [ "$opt_ip" != "localhost" ]; then
-        echo -e "${YELLOW}[安全审计] 公网暴露下必须强制设定鉴权密码！${RESET}"
-        while true; do
-            read -r -p "$(echo -e "${GREEN}请输入用户名 [当前: ${current_user}]: ${RESET}")" input_user
-            opt_user="${input_user:-$current_user}"
-            [ -n "$opt_user" ] && break
-        done
-        while true; do
-            read -r -p "$(echo -e "${GREEN}请输入鉴权密码 [直接回车保持原样]: ${RESET}")" input_pass
-            opt_pass="${input_pass:-$current_pass}"
-            if [ ${#opt_pass} -ge 16 ]; then break; fi
-            warn "密码必须长度 ≥16 位！"
-        done
-    else
+    local rand_user="user_$(openssl rand -hex 4)"
+    local rand_pass="$(openssl rand -hex 10)"
+
+    read -r -p "$(echo -e "${GREEN}请输入用户名 [当前: ${current_user:-无密码}, 输入 ${RED}none${GREEN} 切换为无密码, 回车随机生成]: ${RESET}")" input_user
+    if [ -z "$input_user" ]; then
         if [ -n "$current_user" ]; then
-            read -r -p "$(echo -e "${GREEN}请输入用户名 [当前: ${current_user}，回车不变，输入 ${RED}none${GREEN} 清除鉴权]: ${RESET}")" input_user
-            if [ -z "$input_user" ]; then
-                opt_user="$current_user" opt_pass="$current_pass"
-            elif [ "$input_user" = "none" ]; then
-                opt_user="" opt_pass=""
-            else
-                opt_user="$input_user"
-                read -r -p "$(echo -e "${GREEN}请输入新密码: ${RESET}")" opt_pass
-            fi
+            opt_user="$current_user" opt_pass="$current_pass"
         else
-            read -r -p "$(echo -e "${GREEN}请输入鉴权用户名 (留空默认不启用): ${RESET}")" opt_user
-            if [ -n "$opt_user" ]; then read -r -p "$(echo -e "${GREEN}请输入鉴权密码: ${RESET}")" opt_pass; fi
+            opt_user="$rand_user" opt_pass="$rand_pass"
         fi
+    elif [ "$input_user" = "none" ]; then
+        opt_user="" opt_pass=""
+    else
+        opt_user="$input_user"
+        read -r -p "$(echo -e "${GREEN}请输入新密码 [回车默认随机生成]: ${RESET}")" input_pass
+        opt_pass="${input_pass:-$rand_pass}"
     fi
 
     write_config "$opt_ip" "$opt_port" "$opt_user" "$opt_pass"
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         systemctl restart "$SERVICE_NAME"
         ok "配置已覆盖，全套代理服务已同步重启生效！"
+        print_node_summary
     else
         ok "配置已成功重写更新。"
     fi
 }
 
 menu_show_node_config() {
-    if [ ! -f "$CONF_FILE" ]; then die "未检测到有效的服务配置文件。"; fi
-    echo -e "\n${GREEN}========= 当前节点本地配置 =========${RESET}"
-    cat "$CONF_FILE"
-    echo -e "${GREEN}====================================${RESET}"
+    if [ ! -f "$CONF_FILE" ]; then 
+        die "未检测到有效的服务配置文件，请先执行选择 [1] 进行完整安装。"
+    fi
+
+    print_node_summary
 
     local full_bind
     full_bind=$(grep -i 'listen' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
@@ -375,23 +429,28 @@ menu_show_node_config() {
     local connect_ip="$bind_ip"
     if [ "$connect_ip" = "0.0.0.0" ]; then connect_ip="127.0.0.1"; fi
 
-    local auth_user
-    auth_user=$(grep -i 'username' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
-    local auth_pass
-    auth_pass=$(grep -i 'password' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    local auth_method
+    auth_method=$(grep -i 'method' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    
+    local auth_user="" local auth_pass=""
+    if [ "$auth_method" = "password" ]; then
+        auth_user=$(grep -i 'username' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+        auth_pass=$(grep -i 'password' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    fi
 
     local proxy_args="--socks5-hostname ${connect_ip}:${bind_port}"
     if [ -n "$auth_user" ] && [ -n "$auth_pass" ]; then
         proxy_args="--socks5-hostname ${auth_user}:${auth_pass}@${connect_ip}:${bind_port}"
     fi
 
-    echo -e "\n${YELLOW}[正在通过本地 SOCKS5 实例验证链路基本连通性...]${RESET}"
-    if curl -sI --max-time 6 $proxy_args "https://www.baidu.com" > /dev/null; then
-        echo -e " 代理链路状态 :   ${GREEN}✔ 通过 (实例成功承载并转发网络流量)${RESET}"
+    echo -e "${YELLOW}[正在进行本地链路连通性自检...]${RESET}"
+    if curl -sI --max-time 5 $proxy_args "https://github.com" > /dev/null; then
+        echo -e "代理连通状态 :   ${GREEN}✔ 正常运行 (流量转发通畅)${RESET}"
     else
-        echo -e " 代理链路状态 :   ${RED}✘ 未通过 (无法通过新建的 SOCKS5 端口触达外部互联网)${RESET}"
-        warn "安全审计提示: 请检查本地出网防火墙策略，或检查上方配置中的 egress 网络拦截策略。"
+        echo -e "代理连通状态 :   ${RED}✘ 异常/未检测到公网响应${RESET}"
+        warn "提示: 如果服务已运行但检测失败，请确保云服务器后台安全组/防火墙已放行对应端口。"
     fi
+    echo ""
 }
 
 # ── 4. 主循环控制中心 ─────────────────────────────────────────────────────────
@@ -407,13 +466,13 @@ while true; do
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN} 1. 安装 next-socks5${RESET}"
     echo -e "${GREEN} 2. 更新 next-socks5${RESET}"
-    echo -e "${GREEN} 3. 卸载全套组件${RESET}"
+    echo -e "${GREEN} 3. 卸载 next-socks5${RESET}"
     echo -e "${GREEN} 4. 修改配置${RESET}"
     echo -e "${GREEN} 5. 启动 next-socks5${RESET}"
     echo -e "${GREEN} 6. 停止 next-socks5${RESET}"
     echo -e "${GREEN} 7. 重启 next-socks5${RESET}"
-    echo -e "${GREEN} 8. 查看内核日志${RESET}"
-    echo -e "${GREEN} 9. 查看配置与连通状态${RESET}"
+    echo -e "${GREEN} 8. 查看日志${RESET}"
+    echo -e "${GREEN} 9. 查看配置${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     

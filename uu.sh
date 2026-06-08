@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # ==============================================================================
-#   Usque (MASQUE-WARP) 面板 - 经典原版菜单样式 & 全自动免交互版
+#   Usque (MASQUE-WARP) 面板 
 # ==============================================================================
 
 export REPO="Diniboy1123/usque"
@@ -213,23 +213,26 @@ EOF
 # ── 4. 状态与配置管理模块 ──────────────────────────────────────────────────────
 get_status_info() {
     if systemctl is-active --quiet "$SERVICE_NAME"; then
-        panel_status="运行中 (MASQUE 已接通)"
+        panel_status="运行中"
     else
         panel_status="未运行"
     fi
     
     if [ -f "$INSTALL_BIN" ]; then
+        # 增加 2>&1 确保捕获所有输出，并优化正则匹配
         local check_ver
-        check_ver=$("$INSTALL_BIN" -v 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+        check_ver=$("$INSTALL_BIN" -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
         if [ -n "$check_ver" ]; then
             panel_version="v${check_ver}"
         else
-            panel_version="已安装"
+            # 如果正则没匹配到，尝试直接输出前几个字符
+            panel_version="已安装(解析失败)"
         fi
     else
         panel_version="未安装"
     fi
 
+    # ... 其余部分保持不变 ...
     if [ -f "${CONF_DIR}/.panel_meta" ]; then
         local meta=$(cat "${CONF_DIR}/.panel_meta"); panel_port="${meta%%|*}"
     else 
@@ -362,28 +365,29 @@ menu_show_node_config() {
     rm -f "$TMP_TRACE"
 }
 
-# ── 5. 主控制循环（完美还原指定的原生绿黄配色） ───────────────────────────────
+
 while true; do
     get_status_info; clear
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}        CF-WARP 面板         ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $panel_status"
+    echo -e "${GREEN}状态 :${RESET} ${YELLOW}$panel_status${RESET}"
     echo -e "${GREEN}版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
     echo -e "${GREEN}绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN} 1. 安装 WARP-Rust${RESET}"
-    echo -e "${GREEN} 2. 更新 WARP-Rust${RESET}"
-    echo -e "${GREEN} 3. 卸载全套组件${RESET}"
+    echo -e "${GREEN} 1. 安装 WARP${RESET}"
+    echo -e "${GREEN} 2. 更新 WARP${RESET}"
+    echo -e "${GREEN} 3. 卸载 WARP${RESET}"
     echo -e "${GREEN} 4. 修改配置${RESET}"
-    echo -e "${GREEN} 5. 启动 WARP-Rust${RESET}"
-    echo -e "${GREEN} 6. 停止 WARP-Rust${RESET}"
-    echo -e "${GREEN} 7. 重启 WARP-Rust${RESET}"
-    echo -e "${GREEN} 8. 查看内核日志${RESET}"
+    echo -e "${GREEN} 5. 启动 WARP${RESET}"
+    echo -e "${GREEN} 6. 停止 WARP${RESET}"
+    echo -e "${GREEN} 7. 重启 WARP${RESET}"
+    echo -e "${GREEN} 8. 查看日志${RESET}"
     echo -e "${GREEN} 9. 查看配置与出口状态${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}==============================${RESET}"
-    read -r -p "请输入选项: " choice
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+     read -r choice
     case "$choice" in
         1) menu_install ;;
         2) menu_update ;;
@@ -394,9 +398,9 @@ while true; do
         7) systemctl restart "$SERVICE_NAME" && ok "动作: 引擎重启成功" ;;
         8) (trap 'echo ""' INT; journalctl -u "$SERVICE_NAME" -n 50 -f) ;;
         9) menu_show_node_config ;;
-        0) clear; exit 0 ;;
+        0) exit 0 ;;
         *) warn "未识别的无效序号！"; sleep 1 ;;
     esac
-    echo "按任意键返回主控制面板..."
-    read -n 1 -s -r
+
+    read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键返回主控制面板...${RESET}")"
 done

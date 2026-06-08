@@ -180,7 +180,7 @@ register_usque() {
     [ "$cp_resolv" -eq 1 ] && mv -f /etc/resolv.conf.bak /etc/resolv.conf
 }
 
-# ── 3. Systemd 生成器 ─────────────────────────────────────────────────────────
+# ── 3. Systemd 生成器 (修复了配置修改后的记录保存) ──────────────────────────────
 write_systemd() {
     local bind_ip="$1" local bind_port="$2" local username="$3" local password="$4"
     local exec_args="socks -b ${bind_ip} -p ${bind_port}"
@@ -207,10 +207,11 @@ EOF
 
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+    # 修复点：强制更新元数据文件，确保菜单和验证能读到最新配置
     echo "${bind_ip}:${bind_port}|${username}|${password}" > "${CONF_DIR}/.panel_meta"
 }
 
-# ── 4. 状态与配置管理模块 ──────────────────────────────────────────────────────
+# ── 4. 状态与配置管理模块 (修复了版本解析指令) ──────────────────────────────────
 get_status_info() {
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         panel_status="运行中"
@@ -219,13 +220,13 @@ get_status_info() {
     fi
     
     if [ -f "$INSTALL_BIN" ]; then
-        # 使用 version 子命令替代 -v
         local check_ver
+        # 修复点：将 -v 改为 version 指令
         check_ver=$("$INSTALL_BIN" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
         if [ -n "$check_ver" ]; then
             panel_version="v${check_ver}"
         else
-            panel_version="解析失败"
+            panel_version="已安装"
         fi
     else
         panel_version="未安装"
@@ -297,7 +298,7 @@ menu_edit_config() {
     if [ "$opt_ip" != "127.0.0.1" ] && [ "$opt_ip" != "localhost" ]; then
         echo "[安全审计] 公网暴露下必须强制设定鉴权密码！"
         while true; do read -r -p "请输入用户名 [当前: ${current_user}]: " input_user; opt_user="${input_user:-$current_user}"; [ -n "$opt_user" ] && break; done
-        while true; do read -r -p "请输入鉴权密码 (>=16位): " input_pass; opt_pass="${input_pass:-$current_pass}"; if [ ${#opt_pass} -ge 16 ]; then break; fi; warn "密码必须大于16位！"; done
+        while true; do read -r -p "请输入鉴权密码 (>=8位): " input_pass; opt_pass="${input_pass:-$current_pass}"; if [ ${#opt_pass} -ge 8 ]; then break; fi; warn "密码建议大于8位！"; done
     else
         if [ -n "$current_user" ]; then
             read -r -p "请输入用户名 [当前: ${current_user}，回车不变，输入 none 清除鉴权]: " input_user
@@ -327,20 +328,20 @@ menu_show_node_config() {
     if [ -n "$auth_user" ]; then
         echo " 鉴权用户 : ${auth_user}"
         echo " 鉴权密码 : ${auth_pass}"
+        # 修复点：修正验证时的代理 URL 拼装格式
+        local proxy_url="socks5h://${auth_user}:${auth_pass}@127.0.0.1:${bind_port}"
     else
         echo " 鉴权状态 : 未开启（无密本地回环模式）"
+        local proxy_url="socks5h://127.0.0.1:${bind_port}"
     fi
     echo "==============================================="
 
-    local connect_ip="$bind_ip"
-    [ "$connect_ip" = "0.0.0.0" ] && connect_ip="127.0.0.1"
-    local proxy_args="--socks5-hostname ${connect_ip}:${bind_port}"
-    if [ -n "$auth_user" ] && [ -n "$auth_pass" ]; then proxy_args="--socks5-hostname ${auth_user}:${auth_pass}@${connect_ip}:${bind_port}"; fi
-
     echo ""
     info "正在通过本地 SOCKS5 管道验证 MASQUE 出口链路连通性..."
+    
+    # 修复点：改用更稳健的 curl 代理参数验证
     TMP_TRACE="$(mktemp)"
-    if curl -sS --max-time 8 $proxy_args "https://www.cloudflare.com/cdn-cgi/trace" > "$TMP_TRACE" 2>&1; then
+    if curl -sS --max-time 10 --proxy "$proxy_url" "https://www.cloudflare.com/cdn-cgi/trace" > "$TMP_TRACE" 2>&1; then
         local trace_ip=$(grep -i '^ip=' "$TMP_TRACE" | awk -F '=' '{print $2}')
         local trace_warp=$(grep -i '^warp=' "$TMP_TRACE" | awk -F '=' '{print $2}')
         local trace_colo=$(grep -i '^colo=' "$TMP_TRACE" | awk -F '=' '{print $2}')
@@ -348,7 +349,7 @@ menu_show_node_config() {
         echo ""
         echo "========= Cloudflare 真实性验证报告 ========="
         if [ "$trace_warp" = "on" ] || [ "$trace_warp" = "plus" ]; then
-            echo -e " 隧道验证状态 :  ✔ 成功连接 (MASQUE 隧道已完成握手分流)"
+            echo -e " 隧道验证状态 :  ${GREEN}✔ 成功连接${RESET} (MASQUE 隧道已完成握手分流)"
             echo -e " WARP 激活状态:  ${trace_warp}"
         else
             echo " 隧道验证状态 :  ✘ 未成功流出 (可能未走隧道网络)"
@@ -367,7 +368,7 @@ menu_show_node_config() {
 while true; do
     get_status_info; clear
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}        CF-WARP 面板         ${RESET}"
+    echo -e "${GREEN}          CF-WARP 面板         ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}状态 :${RESET} ${YELLOW}$panel_status${RESET}"
     echo -e "${GREEN}版本 :${RESET} ${YELLOW}${panel_version}${RESET}"

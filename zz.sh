@@ -1,255 +1,381 @@
-#!/usr/bin/env bash
+#!/bin/bash
+set -e
 
-# ==============================================================================
-#   Usque (MASQUE-WARP) 面板
-# ==============================================================================
+FRP_INSTALL_DIR="/opt/frp"
+FRPS_BIN="/usr/local/bin/frps"
+FRPC_BIN="/usr/local/bin/frpc"
+ROLE_FILE="$FRP_INSTALL_DIR/.frp_role"
+INIT_FLAG="$FRP_INSTALL_DIR/.frp_inited"
+IS_OPENWRT=0
 
-export REPO="Diniboy1123/usque"
-export SERVICE_NAME="usque"
-export SERVICE_USER="root"
-export INSTALL_BIN="/usr/local/bin/usque"
-export CONF_DIR="/etc/usque"
-export CONF_FILE="${CONF_DIR}/config.json"
-export SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-export META_FILE="${CONF_DIR}/.panel_meta"
+GITHUB_PROXY=(
+    'https://gh-proxy.com/'
+    'https://v6.gh-proxy.org/'
+    'https://ghproxy.lvedong.eu.org/'
+    'https://proxy.vvvv.ee/'
+    'https://hub.glowp.xyz/'
+    '' 
+)
 
-# 配色方案 (保持你的原版)
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-RESET='\033[0m'
+DEFAULT_BACKUP_VER="0.69.1"
 
-GITHUB_PROXY=('https://v6.gh-proxy.org/' 'https://gh-proxy.com/' 'https://hub.glowp.xyz/' 'https://proxy.vvvv.ee/' 'https://ghproxy.lvedong.eu.org/' '')
+GREEN="\e[32m"
+YELLOW="\e[33m"
+CYAN="\e[36m"
+RED="\e[31m"
+RESET="\e[0m"
 
-[[ "$EUID" -ne 0 ]] && echo -e "${GREEN}[错误]${RESET} 请使用 root 权限运行！" && exit 1
+is_openwrt() { [ -f /etc/openwrt_release ] && IS_OPENWRT=1 || IS_OPENWRT=0; }
+is_openwrt
 
-info() { echo -e "${GREEN}[INFO]${RESET} $1"; }
-ok()   { echo -e "${GREEN}[OK]${RESET} $1"; }
-warn() { echo -e "${YELLOW}[WARN]${RESET} $1"; }
-die()  { echo -e "${GREEN}[ERROR]${RESET} $1" >&2; exit 1; }
-
-# --- 1. 下载模块 ---
-download_bin() {
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64) TARGET="linux_amd64" ;;
-        aarch64) TARGET="linux_arm64" ;;
-        *) die "不支持的架构: $ARCH" ;;
-    esac
-
-    info "检索最新版本..."
-    local latest_tag=""
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        latest_tag=$(curl -fsSL --max-time 6 "${proxy}https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-        [ -n "$latest_tag" ] && break
-    done
-
-    [ -z "$latest_tag" ] && latest_tag="v3.0.0"
-    local pure_ver="${latest_tag#v}"
-    info "下载版本: v${pure_ver}"
-
-    local zip_name="usque_${pure_ver}_${TARGET}.zip"
-    local tmp_dir=$(mktemp -d)
-    local success=0
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        if curl -fsSL -L -o "$tmp_dir/zip" "${proxy}https://github.com/${REPO}/releases/download/${latest_tag}/${zip_name}"; then
-            success=1; break
-        fi
-    done
-
-    [ "$success" -ne 1 ] && die "下载失败。"
-    unzip -q -o "$tmp_dir/zip" -d "$tmp_dir"
-    cp -f "$tmp_dir/usque" "$INSTALL_BIN"
-    chmod +x "$INSTALL_BIN"
-    rm -rf "$tmp_dir"
-}
-
-# --- 2. 本地注册 (已融合你的 v6 修正逻辑) ---
-register_usque() {
-    local has_v4=0
-    # 增加 -q 并在报错时保持静默，确保脚本继续执行
-    if curl -4sSk --max-time 2 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "ip="; then
-        has_v4=1
-    fi
-
-    [ -d "$CONF_DIR" ] || mkdir -p "$CONF_DIR"
-    cd "$CONF_DIR" || exit 1
-    
-    info "正在执行本地匿名注册..."
-    # 纯 v6 环境下，如果 register 失败，尝试强制指定 v6 地址（如果程序支持）
-    if "${INSTALL_BIN}" register; then
-        ok "Cloudflare 本地注册成功。"
-        
-        # 你的 v6 修正核心逻辑
-        if [ "$has_v4" -ne 1 ] && [ -f "$CONF_FILE" ]; then
-            info "检测到纯 IPv6 环境，正在修正配置文件..."
-            # 提取 v6 节点地址
-            local v6_ep=$(grep -o '"endpoint_v6": *"[^"]*"' "$CONF_FILE" | awk -F '"' '{print $4}')
-            if [ -z "$v6_ep" ]; then
-                # 如果没抓到，给一个手动兜底的 CF IPv6 节点
-                v6_ep="[2606:4700:d0::a25c:bc2e]:2408"
-            fi
-            sed -i "s/\"endpoint_v4\": *\"[^\"]*\"/\"endpoint_v4\": \"${v6_ep}\"/g" "$CONF_FILE"
-            ok "IPv6 修正已完成 (Endpoint: $v6_ep)。"
+create_shortcut() {
+    local script_path=$(readlink -f "$0" 2>/dev/null || echo "$(cd "$(dirname "$0")"; pwd)/$(basename "$0")")
+    if [ "$IS_OPENWRT" = "1" ]; then
+        if ! grep -q "alias p=" /etc/profile; then
+            echo "alias p='$script_path'" >> /etc/profile
         fi
     else
-        die "注册失败。提示：请确保你的 VPS 已开启 IPv6 外部访问能力。"
+        for rc_file in "$HOME/.bashrc" "$HOME/.zshrc"; do
+            if [ -f "$rc_file" ] && ! grep -q "alias p=" "$rc_file"; then
+                echo "alias p='sudo $script_path'" >> "$rc_file"
+            fi
+        done
     fi
 }
 
-# --- 3. 写入服务 ---
-write_systemd() {
-    local mode="$1" ip="$2" port="$3" user="$4" pass="$5"
-    local cmd="socks"
-    [[ "$mode" == "HTTP" ]] && cmd="http-proxy"
+get_arch() {
+    case "$(uname -m)" in
+        x86_64) echo "amd64";;
+        aarch64) echo "arm64";;
+        armv7*|armv6*) echo "arm";;
+        mipsel) echo "mipsle";;
+        mips) echo "mips";;
+        *) echo "amd64";;
+    esac
+}
 
-    local args="${cmd} -b ${ip} -p ${port}"
-    [[ -n "$user" ]] && args="${args} -u ${user} -w ${pass}"
+get_auto_version() {
+    local fetched_ver=""
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        fetched_ver=$(curl -sL -m 4 "${proxy}https://api.github.com/repos/fatedier/frp/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | sed 's/"tag_name": *//;s/"//g;s/v//' || echo "")
+        if [ -n "$fetched_ver" ]; then
+            echo "$fetched_ver"
+            return 0
+        fi
+    done
+    echo "$DEFAULT_BACKUP_VER"
+}
 
-    cat <<EOF > "$SERVICE_FILE"
+download_package_loop() {
+    local version=$1
+    local arch=$2
+    local filename="frp_${version}_linux_${arch}.tar.gz"
+    local success=0
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local url="${proxy}https://github.com/fatedier/frp/releases/download/v${version}/${filename}"
+        if wget -T 8 -O "$filename" "$url"; then
+            success=1
+            break
+        else
+            rm -f "$filename"
+        fi
+    done
+    [ $success -eq 1 ] && return 0 || return 1
+}
+
+detect_role() {
+    [ -f "$ROLE_FILE" ] && cat "$ROLE_FILE" || echo "unknown"
+}
+
+is_inited() { [ -f "$INIT_FLAG" ]; }
+
+get_status_info() {
+    local role=$(detect_role)
+    local current_bin_ver="未安装"
+    
+    if [ "$role" = "server" ] && [ -f "$FRPS_BIN" ]; then
+        current_bin_ver=$($FRPS_BIN -v 2>/dev/null || echo "未知")
+    elif [ "$role" = "client" ] && [ -f "$FRPC_BIN" ]; then
+        current_bin_ver=$($FRPC_BIN -v 2>/dev/null || echo "未知")
+    fi
+
+    if [ "$role" = "server" ]; then
+        # 增强版进程探测：双重保障检测机制
+        if [ "$IS_OPENWRT" = "1" ]; then
+            (ps | grep -v grep | grep -q "[f]rps") && status="${GREEN}已启动${RESET}" || status="${RED}已停止${RESET}"
+        else
+            if systemctl is-active frps >/dev/null 2>&1 || pgrep -x "frps" >/dev/null; then
+                status="${GREEN}已启动${RESET}"
+            else
+                status="${RED}已停止${RESET}"
+            fi
+        fi
+        
+        # 提取端口显示
+        if [ -f "$FRP_INSTALL_DIR/frps.toml" ]; then
+            PORT_SHOW=$(awk -F'=' '/webServer.port/{gsub(/[ "]/,"",$2); print $2}' "$FRP_INSTALL_DIR/frps.toml")
+            [ -z "$PORT_SHOW" ] && PORT_SHOW=$(awk -F'=' '/bindPort/{gsub(/[ "]/,"",$2); print $2}' "$FRP_INSTALL_DIR/frps.toml")
+            PORT_SHOW=${PORT_SHOW:-"7500"}
+        else
+            PORT_SHOW="无"
+        fi
+    elif [ "$role" = "client" ]; then
+        if [ "$IS_OPENWRT" = "1" ]; then
+            (ps | grep -v grep | grep -q "[f]rpc") && status="${GREEN}已启动${RESET}" || status="${RED}已停止${RESET}"
+        else
+            if systemctl is-active frpc >/dev/null 2>&1 || pgrep -x "frpc" >/dev/null; then
+                status="${GREEN}已启动${RESET}"
+            else
+                status="${RED}已停止${RESET}"
+            fi
+        fi
+        if [ -f "$FRP_INSTALL_DIR/frpc.toml" ]; then
+            PORT_SHOW=$(awk -F'=' '/serverPort/{gsub(/[ "]/,"",$2); print $2}' "$FRP_INSTALL_DIR/frpc.toml")
+            PORT_SHOW=${PORT_SHOW:-"7000"}
+        else
+            PORT_SHOW="无"
+        fi
+    else
+        status="${RED}未初始化${RESET}"
+        PORT_SHOW="无"
+    fi
+    echo "$current_bin_ver" > /dev/null
+    echo "$current_bin_ver"
+}
+
+select_role() {
+    clear
+    echo -e "${YELLOW}[自动检测] 当前本机未检测到已初始化的 FRP 服务端或客户端。${RESET}"
+    echo "请选择本机角色："
+    echo "1) FRPS 服务端 (用于公网VPS)"
+    echo "2) FRPC 客户端 (用于内网/被穿透设备)"
+    read -p "输入 1 或 2 并回车: " role
+    mkdir -p "$FRP_INSTALL_DIR"
+    case $role in
+        1) echo "server" > "$ROLE_FILE" ;;
+        2) echo "client" > "$ROLE_FILE" ;;
+        *) echo "输入无效，重新运行脚本"; exit 1 ;;
+    esac
+}
+
+install_frp() {
+    local role=$(detect_role)
+    if [ "$role" = "server" ] && [ -f "$FRPS_BIN" ]; then
+        echo -e "${RED}[提示] 检测到系统已安装 FRPS${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    elif [ "$role" = "client" ] && [ -f "$FRPC_BIN" ]; then
+        echo -e "${RED}[提示] 检测到系统已安装 FRPC${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    fi
+
+    local FRP_VER=$(get_auto_version)
+    local ARCH=$(get_arch)
+    local FRP_NAME="frp_${FRP_VER}_linux_${ARCH}"
+    
+    mkdir -p "$FRP_INSTALL_DIR"
+    cd "$FRP_INSTALL_DIR"
+
+    if ! download_package_loop "$FRP_VER" "$ARCH"; then
+        read -p "按回车返回菜单..."
+        return
+    fi
+    
+    tar -xzvf "${FRP_NAME}.tar.gz"
+    cp -f "${FRP_NAME}/frps" "$FRPS_BIN"
+    cp -f "${FRP_NAME}/frpc" "$FRPC_BIN"
+    chmod +x "$FRPS_BIN" "$FRPC_BIN"
+    rm -rf "${FRP_NAME}" "${FRP_NAME}.tar.gz"
+    
+    echo -e "${GREEN}FRP 二进制文件安装成功。${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+update_frp() {
+    local role=$(detect_role)
+    local LATEST_VER=$(get_auto_version)
+    local CURRENT_VER=""
+    
+    if [ "$role" = "server" ]; then CURRENT_VER=$($FRPS_BIN -v 2>/dev/null || echo "0"); else CURRENT_VER=$($FRPC_BIN -v 2>/dev/null || echo "0"); fi
+    if [ "$CURRENT_VER" = "$LATEST_VER" ]; then
+        echo -e "${GREEN}[提示] 当前已是最新版本 v${CURRENT_VER}${RESET}"
+        read -p "按回车返回菜单..."
+        return
+    fi
+
+    if [ "$role" = "server" ]; then
+        [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frps stop 2>/dev/null || systemctl stop frps 2>/dev/null
+    else
+        [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frpc stop 2>/dev/null || systemctl stop frpc 2>/dev/null
+    fi
+
+    cd "$FRP_INSTALL_DIR"
+    local ARCH=$(get_arch)
+    local FRP_NAME="frp_${LATEST_VER}_linux_${ARCH}"
+    
+    if ! download_package_loop "$LATEST_VER" "$ARCH"; then
+        if [ "$role" = "server" ]; then
+            [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frps start || systemctl start frps
+        else
+            [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frpc start || systemctl start frpc
+        fi
+        read -p "按回车返回菜单..."
+        return
+    fi
+    
+    tar -xzvf "${FRP_NAME}.tar.gz"
+    cp -f "${FRP_NAME}/frps" "$FRPS_BIN"
+    cp -f "${FRP_NAME}/frpc" "$FRPC_BIN"
+    chmod +x "$FRPS_BIN" "$FRPC_BIN"
+    rm -rf "${FRP_NAME}" "${FRP_NAME}.tar.gz"
+
+    if [ "$role" = "server" ]; then
+        [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frps restart || systemctl restart frps
+    else
+        [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frpc restart || systemctl restart frpc
+    fi
+    read -p "按回车返回菜单..."
+}
+
+write_initd_frps() {
+cat > /etc/init.d/frps <<'EOF'
+#!/bin/sh /etc/rc.common
+START=99
+USE_PROCD=1
+PROG=/usr/local/bin/frps
+CFG=/opt/frp/frps.toml
+start_service() {
+    procd_open_instance
+    procd_set_param command $PROG -c $CFG
+    procd_set_param respawn
+    procd_close_instance
+}
+EOF
+chmod +x /etc/init.d/frps
+/etc/init.d/frps enable
+}
+
+write_systemd_frps() {
+cat > /etc/systemd/system/frps.service <<EOF
 [Unit]
-Description=Usque WARP SOCKS5/HTTP
+Description=frps server
 After=network.target
-
 [Service]
 Type=simple
-User=${SERVICE_USER}
-WorkingDirectory=${CONF_DIR}
-ExecStart=${INSTALL_BIN} --config ${CONF_FILE} ${args}
+ExecStart=$FRPS_BIN -c $FRP_INSTALL_DIR/frps.toml
 Restart=always
-RestartSec=3s
-
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
-    echo "${mode}|${ip}|${port}|${user}|${pass}" > "$META_FILE"
+systemctl daemon-reload
 }
 
-# --- 4. 状态获取 ---
-get_status_info() {
-    systemctl is-active --quiet "$SERVICE_NAME" && panel_status="运行中" || panel_status="未运行"
-    if [ -f "$INSTALL_BIN" ]; then
-        local ver=$("$INSTALL_BIN" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-        panel_version="v${ver:-已安装}"
+uninstall_frp() {
+    if [ "$IS_OPENWRT" = "1" ]; then
+        /etc/init.d/frps stop 2>/dev/null || true
+        /etc/init.d/frpc stop 2>/dev/null || true
+        rm -f /etc/init.d/frps /etc/init.d/frpc
     else
-        panel_version="未安装"
+        systemctl stop frps frpc 2>/dev/null || true
+        systemctl disable frps frpc 2>/dev/null || true
+        rm -f /etc/systemd/system/frps.service /etc/systemd/system/frpc.service
+        systemctl daemon-reload
     fi
-    if [ -f "$META_FILE" ]; then
-        IFS='|' read -r m_mode m_ip m_port m_user m_pass < "$META_FILE"
-        panel_port="${m_mode}://$m_ip:$m_port"
-    else
-        panel_port="未配置"
-    fi
+    rm -rf "$FRP_INSTALL_DIR" "$FRPS_BIN" "$FRPC_BIN"
+    sleep 1
+    exit 0
 }
 
-# --- 5. 修改配置 (回车保持，输入 read 清空) ---
-menu_edit_config() {
-    [ -f "$META_FILE" ] || die "未发现配置。"
-    IFS='|' read -r o_mode o_ip o_port o_user o_pass < "$META_FILE"
+init_frps_and_start() {
+    echo "=== 初始化 FRPS 配置 (TOML) ==="
+    read -p "监听端口 [默认7000]: " BIND_PORT
+    BIND_PORT=${BIND_PORT:-7000}
+    read -p "面板端口 [默认7500]: " DASH_PORT
+    DASH_PORT=${DASH_PORT:-7500}
+    read -p "面板用户名 [默认admin]: " DASH_USER
+    DASH_USER=${DASH_USER:-admin}
+    read -p "面板密码 [默认admin123]: " DASH_PWD
+    DASH_PWD=${DASH_PWD:-admin123}
+    read -p "Token（防蹭用，建议填写）: " FRP_TOKEN
 
-    echo -e "\n==== [修改监听配置] ===="
-    echo -e "${YELLOW}说明：直接回车保持不变，输入 read 则清空该项${RESET}"
-    
-    # 1. 模式修改
-    echo "1. SOCKS5 模式"
-    echo "2. HTTP 模式"
-    read -r -p "选择模式 [当前: $o_mode]: " m_choice
-    case "$m_choice" in
-        1) n_mode="SOCKS5" ;;
-        2) n_mode="HTTP" ;;
-        *) n_mode="$o_mode" ;;
-    esac
+    # 🛠️ 核心修正：显式指定 webServer.addr 为 0.0.0.0 允许全网外网访问
+    cat > "$FRP_INSTALL_DIR/frps.toml" <<EOF
+bindPort = $BIND_PORT
+webServer.addr = "0.0.0.0"
+webServer.port = $DASH_PORT
+webServer.user = "$DASH_USER"
+webServer.password = "$DASH_PWD"
+EOF
+    [[ -n "$FRP_TOKEN" ]] && echo "auth.token = \"$FRP_TOKEN\"" >> "$FRP_INSTALL_DIR/frps.toml"
 
-    # 2. IP 修改
-    read -r -p "监听 IP [当前: $o_ip]: " n_ip
-    n_ip="${n_ip:-$o_ip}"
-
-    # 3. 端口修改
-    read -r -p "监听端口 [当前: $o_port]: " n_port
-    n_port="${n_port:-$o_port}"
-    
-    # 4. 用户名修改
-    read -r -p "用户名 [当前: ${o_user:-空}]: " i_user
-    if [ -z "$i_user" ]; then
-        n_user="$o_user"          # 直接回车，保持原样
-    elif [ "$i_user" = "read" ]; then
-        n_user=""                 # 输入 read，设为空
+    if [ "$IS_OPENWRT" = "1" ]; then
+        write_initd_frps
+        /etc/init.d/frps restart
     else
-        n_user="$i_user"          # 输入其他，设为新值
+        write_systemd_frps
+        systemctl restart frps
+        systemctl enable frps
     fi
-
-    # 5. 密码修改
-    read -r -p "密码 [当前: ${o_pass:-空}]: " i_pass
-    if [ -z "$i_pass" ]; then
-        n_pass="$o_pass"          # 直接回车，保持原样
-    elif [ "$i_pass" = "read" ]; then
-        n_pass=""                 # 输入 read，设为空
-    else
-        n_pass="$i_pass"          # 输入其他，设为新值
-    fi
-
-    write_systemd "$n_mode" "$n_ip" "$n_port" "$n_user" "$n_pass"
-    systemctl restart "$SERVICE_NAME" && ok "配置已更新并重启服务。"
-}
-# --- 6. 验证逻辑 ---
-menu_show_node_config() {
-    [ -f "$META_FILE" ] || die "记录不存在。"
-    IFS='|' read -r b_mode b_ip b_port b_user b_pass < "$META_FILE"
-
-    echo -e "\n========= 当前服务详情 ========="
-    echo " 代理模式 : ${b_mode}"
-    echo " 监听地址 : ${b_ip}:${b_port}"
-    [[ -n "$b_user" ]] && echo " 鉴权信息 : ${b_user}:${b_pass}" || echo " 鉴权状态 : 未开启"
-    echo "================================"
-
-    local p_url="socks5://"
-    [[ "$b_mode" == "HTTP" ]] && p_url="http://"
-    [[ -n "$b_user" ]] && p_url="${p_url}${b_user}:${b_pass}@"
-    p_url="${p_url}127.0.0.1:${b_port}"
-
-    info "正在验证出口状态..."
-    if curl -sS --max-time 10 -x "$p_url" "https://www.cloudflare.com/cdn-cgi/trace" | grep -q "warp=on"; then
-        ok "验证成功！WARP 已开启。"
-    else
-        warn "验证失败，请检查端口、鉴权或端口是否受阻。"
-    fi
+    echo "server" > "$ROLE_FILE"
+    touch "$INIT_FLAG"
+    sleep 1
 }
 
-# --- 主循环 ---
-while true; do
-    get_status_info; clear
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}           CF-WARP 面板          ${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} ${YELLOW}$panel_status${RESET}"
-    echo -e "${GREEN}版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
-    echo -e "${GREEN}绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN} 1. 安装 WARP${RESET}"
-    echo -e "${GREEN} 2. 更新 WARP${RESET}"
-    echo -e "${GREEN} 3. 卸载 WARP${RESET}"
-    echo -e "${GREEN} 4. 修改配置${RESET}"
-    echo -e "${GREEN} 5. 启动 WARP${RESET}"
-    echo -e "${GREEN} 6. 停止 WARP${RESET}"
-    echo -e "${GREEN} 7. 重启 WARP${RESET}"
-    echo -e "${GREEN} 8. 查看日志${RESET}"
-    echo -e "${GREEN} 9. 查看配置与出口状态${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read -r choice
-    case "$choice" in
-        1) download_bin; register_usque; write_systemd "SOCKS5" "127.0.0.1" "1080" "" ""; systemctl restart "$SERVICE_NAME"; ok "安装完成。" ;;
-        2) systemctl stop "$SERVICE_NAME"; download_bin; systemctl start "$SERVICE_NAME"; ok "更新完成。" ;;
-        3) systemctl stop "$SERVICE_NAME"; rm -f "$INSTALL_BIN" "$SERVICE_FILE" "$META_FILE"; rm -rf "$CONF_DIR"; ok "已卸载。" ;;
-        4) menu_edit_config ;;
-        5) systemctl start "$SERVICE_NAME" ;;
-        6) systemctl stop "$SERVICE_NAME" ;;
-        7) systemctl restart "$SERVICE_NAME" ;;
-        8) journalctl -u "$SERVICE_NAME" -n 50 -f ;;
-        9) menu_show_node_config ;;
-        0) exit 0 ;;
-    esac
-    read -n 1 -s -r -p "按任意键返回..."
-done
+start_frps() { [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frps start || systemctl start frps; sleep 0.5; }
+stop_frps()  { [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frps stop  || systemctl stop frps;  sleep 0.5; }
+restart_frps() { [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frps restart || systemctl restart frps; sleep 0.5; }
+
+log_frps() { [ "$IS_OPENWRT" = "1" ] && logread | grep frps | tail -n 30 || journalctl -u frps -n 40 --no-pager; read -p "按回车返回..."; }
+
+show_frps_dashboard_info() {
+    clear
+    if [ -f "$FRP_INSTALL_DIR/frps.toml" ]; then
+        local D_PORT=$(awk -F'=' '/webServer.port/{gsub(/[ "]/,"",$2);print $2}' "$FRP_INSTALL_DIR/frps.toml")
+        echo -e "${GREEN}面板登录地址 :${RESET} ${CYAN}http://$(hostname -I | awk '{print $1}'):${D_PORT:-7500}${RESET}"
+    fi
+    read -p "按回车返回..."
+}
+
+server_menu() {
+    while true; do
+        clear
+        local version_now=$(get_status_info)
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}       FRPS 服务端管理面板      ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}状态   :${RESET} $status"
+        echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version_now}${RESET}"
+        echo -e "${GREEN}面板端口:${RESET} ${YELLOW}${PORT_SHOW}${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo "1. 安装 FRPS"
+        echo "2. 更新/同步版本"
+        echo "3. 初始化配置并启动"
+        echo "4. 启动 FRPS 服务"
+        echo "5. 停止 FRPS 服务"
+        echo "6. 重启 FRPS 服务"
+        echo "7. 查看面板信息"
+        echo "8. 查看运行日志"
+        echo "9. 卸载 FRPS 服务"
+        echo "0. 退出"
+        echo -e "${GREEN}================================${RESET}"
+        echo -ne "请输入选项: "
+        read choice
+        case $choice in
+            1) install_frp ;;
+            2) update_frp ;;
+            3) init_frps_and_start ;;
+            4) start_frps ;;
+            5) stop_frps ;;
+            6) restart_frps ;;
+            7) show_frps_dashboard_info ;;
+            8) log_frps ;;
+            9) uninstall_frp ;;
+            0) exit 0 ;;
+        esac
+    done
+}
+
+create_shortcut
+role="$(detect_role)"
+server_menu

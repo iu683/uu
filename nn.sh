@@ -1,23 +1,22 @@
-#!/usr/bin/env bash
+#!/bin/sh
 
 # ==============================================================================
-#  cf-warp-rust 一键管理面板
+#  cf-warp-rust 一键管理面板 (Alpine Linux OpenRC 专属版)
 # ==============================================================================
 
 # ── 核心环境变量 ──────────────────────────────────────────────────────────────
 export REPO="Shannon-x/cf-warp-rust"
 export SERVICE_NAME="warp-rust"
-export SERVICE_USER="warp"
 export INSTALL_BIN="/usr/local/bin/warp-rust"
 export CONF_DIR="/etc/warp-rust"
 export CONF_FILE="${CONF_DIR}/config.toml"
 export DATA_DIR="/var/lib/warp-rust"
-export SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+export INIT_FILE="/etc/init.d/${SERVICE_NAME}"
 
 # 透明代理相关变量
 export REDSOCKS_CONF="/etc/redsocks.conf"
 export PROXY_SERVICE_NAME="warp-google-proxy"
-export PROXY_SERVICE_FILE="/etc/systemd/system/${PROXY_SERVICE_NAME}.service"
+export PROXY_INIT_FILE="/etc/init.d/${PROXY_SERVICE_NAME}"
 export PROXY_RULES_SCRIPT="${DATA_DIR}/warp-google-iptables.sh"
 
 # ── 终端颜色定义 ──────────────────────────────────
@@ -53,9 +52,14 @@ GOOGLE_IPS="
 216.239.32.0/19
 "
 
-# ── 基础环境校验（仅保留主程序必要工具） ──────────────────────────────────────────
-if [ "$EUID" -ne 0 ]; then
+# ── 基础环境校验 ──────────────────────────────────────────────────────────
+if [ "$(id -u)" -ne 0 ]; then
     echo -e "${RED}[错误]${RESET} 请使用 root 权限运行此脚本！" >&2
+    exit 1
+fi
+
+if [ ! -f /etc/alpine-release ]; then
+    echo -e "${RED}[错误]${RESET} 本脚本为 Alpine Linux 专属定制，检测到当前系统不匹配！" >&2
     exit 1
 fi
 
@@ -64,50 +68,23 @@ ok()   { echo -e "${GREEN}[OK]${RESET} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${RESET} $1"; }
 die()  { echo -e "${RED}[ERROR]${RESET} $1" >&2; exit 1; }
 
-# 动态识别操作系统包管理器
-detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS=$ID
-    else
-        die "无法识别当前操作系统类型。"
-    fi
-}
-detect_os
-
-# 仅检查主程序运行和下载解压所需的基础工具（去除了 iptables）
+# 检查并使用 apk 补齐基础依赖
 REQUIRED_CMDS="curl tar sed grep awk"
-MISSING_CMDS=""
+MISSING_PKGS=""
 
 for cmd in $REQUIRED_CMDS; do
-    if ! command -v "$cmd" &> /dev/null; then
-        MISSING_CMDS="$MISSING_CMDS $cmd"
+    if ! command -v "$cmd" > /dev/null 2>&1; then
+        # 映射命令到 alpine 软件包
+        case "$cmd" in
+            curl) MISSING_PKGS="$MISSING_PKGS curl" ;;
+            tar) MISSING_PKGS="$MISSING_PKGS tar" ;;
+        esac
     fi
 done
 
-if [ -n "$MISSING_CMDS" ]; then
-    info "检测到系统缺失下载/解压必要组件:${YELLOW}$MISSING_CMDS${RESET}，正在自动修复..."
-    case "$OS" in
-        ubuntu|debian)
-            apt-get update -qy && apt-get install -y $MISSING_CMDS >/dev/null 2>&1
-            ;;
-        centos|rhel|rocky|almalinux|fedora)
-            if command -v dnf &>/dev/null; then
-                dnf install -y $MISSING_CMDS >/dev/null 2>&1
-            else
-                yum install -y $MISSING_CMDS >/dev/null 2>&1
-            fi
-            ;;
-        *)
-            die "未知的操作系统，请手动安装基础组件: $MISSING_CMDS"
-            ;;
-    esac
-
-    for cmd in $MISSING_CMDS; do
-        if ! command -v "$cmd" &> /dev/null; then
-            die "自动安装组件 [ $cmd ] 失败，请检查网络或系统源。"
-        fi
-    done
+if [ -n "$MISSING_PKGS" ]; then
+    info "检测到系统缺失必要组件:${YELLOW}$MISSING_PKGS${RESET}，正在通过 apk 自动修复..."
+    apk update -q && apk add --no-cache $MISSING_PKGS >/dev/null 2>&1
     ok "主程序基础依赖补全成功！"
 fi
 
@@ -125,7 +102,7 @@ fetch_latest_version() {
     info "正在查询 GitHub 获取最新 Release 版本号..."
     TMP_API="$(mktemp)"
     if curl -sSL -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${REPO}/releases/latest" > "$TMP_API"; then
-        VERSION="$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$TMP_API" | head -n 1)"
+        VERSION="$(grep -o '"tag_name": *"[^"]*"' "$TMP_API" | head -n 1 | cut -d'"' -f4)"
     fi
     rm -f "$TMP_API"
 
@@ -146,7 +123,7 @@ download_and_extract() {
     info "正在匹配系统环境形态: ${YELLOW}${TARGET}${RESET}"
 
     ASSET="warp-rust-${VERSION}-${TARGET}.tar.gz"
-    URL_TGZ="https://v6.gh-proxy.org/https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
+    URL_TGZ="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
     URL_SHA="${URL_TGZ}.sha256"
 
     TMP="$(mktemp -d)"
@@ -155,8 +132,8 @@ download_and_extract() {
     info "开始同步下载资产包..."
     curl -fsSL -o "$TMP/$ASSET" "$URL_TGZ" || die "下载资产包失败！请检查网络或版本 ${VERSION} 是否存在该架构。"
     
-    if curl -fsSL -o "$TMP/$ASSET.sha256" "$URL_SHA" &> /dev/null; then
-        if command -v sha256sum &> /dev/null; then
+    if curl -fsSL -o "$TMP/$ASSET.sha256" "$URL_SHA" > /dev/null 2>&1; then
+        if command -v sha256sum > /dev/null 2>&1; then
             LOCAL_SHA=$(sha256sum "$TMP/$ASSET" | awk '{print $1}')
             REMOTE_SHA=$(awk '{print $1}' "$TMP/$ASSET.sha256")
             if [ "$LOCAL_SHA" = "$REMOTE_SHA" ]; then
@@ -237,38 +214,39 @@ cache_ttl = "60s"
 EOF
 }
 
-write_systemd() {
-    cat <<EOF > "$SERVICE_FILE"
-[Unit]
-Description=cf-warp-rust Cloudflare WARP Proxy Client
-After=network.target network-online.target
-Wants=network-online.target
+write_openrc() {
+    cat <<'EOF' > "$INIT_FILE"
+#!/sbin/openrc-run
 
-[Service]
-Type=simple
-User=${SERVICE_USER}
-Group=${SERVICE_USER}
-WorkingDirectory=${DATA_DIR}
-ExecStart=${INSTALL_BIN} --config ${CONF_FILE}
-Restart=always
-RestartSec=3s
-LimitNOFILE=65535
+description="cf-warp-rust Cloudflare WARP Proxy Client"
+supervisor="supervisord" # 借用 openrc 自带的轻量级监管机制
+command="/usr/local/bin/warp-rust"
+command_args="--config /etc/warp-rust/config.toml"
+command_background="yes"
+directory="/var/lib/warp-rust"
+pidfile="/run/warp-rust.pid"
 
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+depend() {
+    need net
+    after firewall
 }
 
-# ── 3. 透明代理二级专属菜单控制中心（谷歌代理专项依赖在此安装） ───────────────────
+start_pre() {
+    checkpath -d -m 0750 -o warp:warp /var/lib/warp-rust
+}
+EOF
+    chmod +x "$INIT_FILE"
+    rc-update add "$SERVICE_NAME" default >/dev/null 2>&1
+}
+
+# ── 3. 透明代理二级专属菜单控制中心 ──────────────────────────────────────────────
 start_transparent_proxy() {
-    if systemctl is-active --quiet "$PROXY_SERVICE_NAME"; then
+    if rc-service "$PROXY_SERVICE_NAME" status >/dev/null 2>&1; then
         warn "Google 透明分流代理已经处于启动运行状态，无需重复启动。"
         return
     fi
 
-    if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+    if ! rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
         warn "核心 WARP-Rust 未在后台运行！透明代理依赖底层代理通道，请先开启主服务。"
         return
     fi
@@ -287,43 +265,32 @@ start_transparent_proxy() {
         return
     fi
 
-    # 【核心改动】只有开启谷歌分流时，才动态校验并拉取 redsocks 和 iptables
-    info "正在检查并安装透明代理核心组件 (redsocks / iptables)..."
+    info "正在检查并安装 Alpine 透明代理核心组件 (redsocks / iptables)..."
     local proxy_missing=""
-    if ! command -v redsocks &>/dev/null; then proxy_missing="$proxy_missing redsocks"; fi
-    if ! command -v iptables &>/dev/null; then proxy_missing="$proxy_missing iptables"; fi
+    if ! command -v redsocks >/dev/null 2>&1; then proxy_missing="$proxy_missing redsocks"; fi
+    if ! command -v iptables >/dev/null 2>&1; then proxy_missing="$proxy_missing iptables"; fi
 
     if [ -n "$proxy_missing" ]; then
-        info "正在为系统补齐透明分流组件群:${YELLOW}$proxy_missing${RESET}..."
-        case $OS in
-            ubuntu|debian)
-                apt-get update -qy && apt-get install -y $proxy_missing >/dev/null 2>&1
-                ;;
-            centos|rhel|rocky|almalinux|fedora)
-                if command -v dnf &>/dev/null; then
-                    dnf install -y $proxy_missing >/dev/null 2>&1
-                else
-                    yum install -y $proxy_missing >/dev/null 2>&1
-                fi
-                ;;
-        esac
+        info "正在为 Alpine 系统补齐透明分流组件群:${YELLOW}$proxy_missing${RESET}..."
+        apk add --no-cache $proxy_missing >/dev/null 2>&1
     fi
 
-    if ! command -v redsocks &>/dev/null || ! command -v iptables &>/dev/null; then
-        die "透明代理所需核心网络组件安装失败，请检查你的系统源网络环境。"
+    if ! command -v redsocks >/dev/null 2>&1 || ! command -v iptables >/dev/null 2>&1; then
+        die "透明代理所需核心网络组件安装失败，请检查 Alpine 镜像源网络环境。"
     fi
 
-    # 关闭并禁用自带的 redsocks 默认服务，防止抢占 12345 端口
-    if systemctl is-enabled redsocks >/dev/null 2>&1 || systemctl is-active redsocks >/dev/null 2>&1; then
-        info "检测到系统自带的默认 redsocks 服务，正在将其解绑卸载以防端口冲突..."
-        systemctl stop redsocks >/dev/null 2>&1
-        systemctl disable redsocks >/dev/null 2>&1
+    # 清理自带的 redsocks 默认服务
+    if rc-service redsocks status >/dev/null 2>&1; then
+        rc-service redsocks stop >/dev/null 2>&1
+        rc-update del redsocks default >/dev/null 2>&1
     fi
 
     info "阻断并优化系统的 Google IPv6 路由解析..."
     ip -6 route add blackhole 2607:f8b0::/32 2>/dev/null || true
-    if ! grep -q "precedence ::ffff:0:0/96  100" /etc/gai.conf 2>/dev/null; then
-        echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
+    if [ -f /etc/gai.conf ]; then
+        if ! grep -q "precedence ::ffff:0:0/96  100" /etc/gai.conf; then
+            echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
+        fi
     fi
 
     # 生成 redsocks 配置
@@ -347,7 +314,7 @@ EOF
     # 封装独立的高性能防火墙控制脚本
     [ -d "$DATA_DIR" ] || mkdir -p "$DATA_DIR"
     cat <<'EOF' > "$PROXY_RULES_SCRIPT"
-#!/bin/bash
+#!/bin/sh
 ACTION=$1
 GOOGLE_IPS="
 8.8.4.0/24
@@ -388,47 +355,50 @@ fi
 EOF
     chmod +x "$PROXY_RULES_SCRIPT"
 
-    # 设计守护式 Systemd 服务
-    cat <<EOF > "$PROXY_SERVICE_FILE"
-[Unit]
-Description=Cloudflare WARP Google Transparent Proxy (Redsocks Engine)
-After=network.target ${SERVICE_NAME}.service
-Requires=${SERVICE_NAME}.service
+    # 设计 OpenRC 专属守护服务
+    cat <<'EOF' > "$PROXY_INIT_FILE"
+#!/sbin/openrc-run
 
-[Service]
-Type=simple
-ExecStart=/usr/sbin/redsocks -c ${REDSOCKS_CONF}
-ExecStartPost=${PROXY_RULES_SCRIPT} start
-ExecStop=${PROXY_RULES_SCRIPT} stop
-Restart=always
-RestartSec=2s
+description="Cloudflare WARP Google Transparent Proxy (Redsocks Engine)"
+supervisor="supervisord"
+command="/usr/sbin/redsocks"
+command_args="-c /etc/redsocks.conf"
+command_background="yes"
+pidfile="/run/warp-google-proxy.pid"
 
-[Install]
-WantedBy=multi-user.target
+depend() {
+    need net warp-rust
+}
+
+start_post() {
+    /var/lib/warp-rust/warp-google-iptables.sh start
+}
+
+stop_post() {
+    /var/lib/warp-rust/warp-google-iptables.sh stop
+}
 EOF
-
-    systemctl daemon-reload
-    systemctl enable "$PROXY_SERVICE_NAME" >/dev/null 2>&1
+    chmod +x "$PROXY_INIT_FILE"
+    rc-update add "$PROXY_SERVICE_NAME" default >/dev/null 2>&1
     
     info "正在拉起透明代理引擎..."
-    systemctl start "$PROXY_SERVICE_NAME"
+    rc-service "$PROXY_SERVICE_NAME" start
     
     sleep 1.5
-    if systemctl is-active --quiet "$PROXY_SERVICE_NAME"; then
+    if rc-service "$PROXY_SERVICE_NAME" status >/dev/null 2>&1; then
         ok "Google 透明分流代理已彻底成功启动并挂载！"
     else
-        warn "透明代理拉起异常，正在为你输出实时崩溃错误日志："
-        journalctl -u "$PROXY_SERVICE_NAME" -n 15 --no-pager
+        warn "透明代理拉起异常，请检查系统 syslog 查看错误日志。"
     fi
 }
 
 stop_transparent_proxy() {
-    if ! systemctl is-active --quiet "$PROXY_SERVICE_NAME"; then
+    if ! rc-service "$PROXY_SERVICE_NAME" status >/dev/null 2>&1; then
         warn "Google 透明代理本来就处于关闭状态。"
         return
     fi
-    systemctl stop "$PROXY_SERVICE_NAME"
-    systemctl disable "$PROXY_SERVICE_NAME" >/dev/null 2>&1
+    rc-service "$PROXY_SERVICE_NAME" stop
+    rc-update del "$PROXY_SERVICE_NAME" default >/dev/null 2>&1
     ok "Google 透明代理已被安全停止，系统 NetFilter 劫持链已完全卸载。"
 }
 
@@ -436,7 +406,7 @@ verify_transparent_proxy() {
     echo -e "\n${CYAN}========= 透明代理链路深度验证 =========${RESET}"
     
     info "1. 正在检索系统 iptables 劫持规则 status..."
-    if command -v iptables &>/dev/null && iptables -t nat -L OUTPUT -n | grep -q "WARP_GOOGLE"; then
+    if command -v iptables >/dev/null 2>&1 && iptables -t nat -L OUTPUT -n | grep -q "WARP_GOOGLE"; then
         echo -e "   iptables 拦截链: ${GREEN}✔ 正常挂载 (已接管系统 OUTPUT 流量)${RESET}"
     else
         echo -e "   iptables 拦截链: ${RED}✘ 未挂载 (Google 流量目前处于直连状态)${RESET}"
@@ -448,7 +418,6 @@ verify_transparent_proxy() {
 
     if [ "$http_status" -eq 200 ] || [ "$http_status" -eq 301 ] || [ "$http_status" -eq 302 ]; then
         echo -e "   联通性测试结果: ${GREEN}✔ 成功连接 (HTTP 状态码: ${http_status})${RESET}"
-        
         local total_time
         total_time=$(curl -o /dev/null -s -w "%{time_total}" --max-time 5 "https://www.google.com")
         echo -e "   透明代理端延迟: ${YELLOW}${total_time} 秒${RESET}"
@@ -463,7 +432,7 @@ menu_transparent_proxy_center() {
     while true; do
         clear
         local proxy_status="${RED}未运行${RESET}"
-        if systemctl is-active --quiet "$PROXY_SERVICE_NAME"; then
+        if rc-service "$PROXY_SERVICE_NAME" status >/dev/null 2>&1; then
             proxy_status="${YELLOW}运行中 (已自动接管 Google IP 流量)${RESET}"
         fi
 
@@ -485,19 +454,19 @@ menu_transparent_proxy_center() {
             3) verify_transparent_proxy ;;
             0|*) return ;;
         esac
-        read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键继续...${RESET}")"
+        read -p "$(echo -e "${GREEN}按任意键继续...${RESET}")" -n 1 -r
     done
 }
 
 # ── 4. 面板常规功能模块 ──────────────────────────────────────────────────────
 get_status_info() {
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
+    if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
         panel_status="${GREEN}运行中${RESET}"
     else
         panel_status="${RED}未运行${RESET}"
     fi
 
-    if systemctl is-active --quiet "$PROXY_SERVICE_NAME"; then
+    if rc-service "$PROXY_SERVICE_NAME" status >/dev/null 2>&1; then
         panel_status="${panel_status} ${GREEN}| 透明分流:已开启${RESET}"
     else
         panel_status="${panel_status} ${GREEN}| 透明分流:未开启${RESET}"
@@ -544,7 +513,7 @@ menu_install() {
         done
         while true; do
             read -r -p "$(echo -e "${GREEN}请输入鉴权密码 (≥16位): ${RESET}")" opt_pass
-            if [ ${#opt_pass} -ge 16 ]; then break; fi
+            if [ "${#opt_pass}" -ge 16 ]; then break; fi
         done
     else
         read -r -p "$(echo -e "${GREEN}请输入鉴权用户名 (本地回环默认留空免密): ${RESET}")" opt_user
@@ -555,52 +524,52 @@ menu_install() {
 
     download_and_extract
 
-    if ! id "$SERVICE_USER" >/dev/null 2>&1; then
-        useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER" 2>/dev/null \
-          || adduser --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
+    # Alpine 创建系统用户机制
+    if ! id "$export SERVICE_USER" >/dev/null 2>&1; then
+        adduser -S -H -s /sbin/nologin "$SERVICE_USER" 2>/dev/null || true
     fi
 
     install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$INSTALL_BIN"
     install -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" -d "$DATA_DIR"
     write_config "$opt_ip" "$opt_port" "$opt_user" "$opt_pass"
-    write_systemd
+    write_openrc
 
     info "正在拉起后台服务..."
-    systemctl start "$SERVICE_NAME"
+    rc-service "$SERVICE_NAME" start
     
     local is_ok=1
-    for i in {1..5}; do
-        if systemctl is-active --quiet "$SERVICE_NAME"; then is_ok=0; break; fi
+    for i in 1 2 3 4 5; do
+        if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then is_ok=0; break; fi
         sleep 1
     done
 
     if [ "$is_ok" -eq 0 ]; then
         ok "CF-WARP-Rust 安全部署成功！"
     else
-        warn "部署完成，但初始化较慢，请稍后选择 [8] 查看日志。"
+        warn "部署完成，但初始化较慢，请稍后选择 [8] 查看控制台输出。"
     fi
 }
 
 menu_update() {
-    [ -f "$SERVICE_FILE" ] || die "未检测到系统服务，请先选择 [1] 进行安装。"
+    [ -f "$INIT_FILE" ] || die "未检测到系统服务，请先选择 [1] 进行安装。"
     download_and_extract
-    systemctl stop "$SERVICE_NAME"
+    rc-service "$SERVICE_NAME" stop
     install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$INSTALL_BIN"
-    systemctl start "$SERVICE_NAME"
+    rc-service "$SERVICE_NAME" start
     ok "组件已成功平滑更新。"
 }
 
 menu_uninstall() {
-    systemctl stop "$PROXY_SERVICE_NAME" >/dev/null 2>&1
-    systemctl disable "$PROXY_SERVICE_NAME" >/dev/null 2>&1
-    rm -f "$PROXY_SERVICE_FILE" "$REDSOCKS_CONF" "$PROXY_RULES_SCRIPT"
+    rc-service "$PROXY_SERVICE_NAME" stop >/dev/null 2>&1
+    rc-update del "$PROXY_SERVICE_NAME" default >/dev/null 2>&1
+    rm -f "$PROXY_INIT_FILE" "$REDSOCKS_CONF" "$PROXY_RULES_SCRIPT"
 
-    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1
-    systemctl disable "$SERVICE_NAME" >/dev/null 2>&1
-    rm -f "$INSTALL_BIN" "$SERVICE_FILE"
-    systemctl daemon-reload
+    rc-service "$SERVICE_NAME" stop >/dev/null 2>&1
+    rc-update del "$SERVICE_NAME" default >/dev/null 2>&1
+    rm -f "$INSTALL_BIN" "$INIT_FILE"
+    
     rm -rf "$CONF_DIR" "$DATA_DIR"
-    userdel "$SERVICE_USER" >/dev/null 2>&1
+    deluser "$SERVICE_USER" >/dev/null 2>&1
     ok "主程序与透明代理规则已全部清理卸载完毕。"
 }
 
@@ -638,7 +607,7 @@ menu_edit_config() {
         while true; do
             read -r -p "$(echo -e "${GREEN}请输入鉴权密码 [直接回车保持原样]: ${RESET}")" input_pass
             opt_pass="${input_pass:-$current_pass}"
-            if [ ${#opt_pass} -ge 16 ]; then break; fi
+            if [ "${#opt_pass}" -ge 16 ]; then break; fi
         done
     else
         if [ -n "$current_user" ]; then
@@ -658,12 +627,12 @@ menu_edit_config() {
     fi
 
     write_config "$opt_ip" "$opt_port" "$opt_user" "$opt_pass"
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        systemctl restart "$SERVICE_NAME"
-        if systemctl is-active --quiet "$PROXY_SERVICE_NAME"; then
-            systemctl restart "$PROXY_SERVICE_NAME"
+    if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
+        rc-service "$SERVICE_NAME" restart
+        if rc-service "$PROXY_SERVICE_NAME" status >/dev/null 2>&1; then
+            rc-service "$PROXY_SERVICE_NAME" restart
         fi
-        ok "配置已覆盖，全套服务已同步重启生效！"
+        ok "配置已覆盖，全套服务已同步 OpenRC 重启生效！"
     else
         ok "配置已成功重写更新。"
     fi
@@ -723,7 +692,7 @@ while true; do
     get_status_info
     clear
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}         CF-WARP 面板         ${RESET}"
+    echo -e "${GREEN}     CF-WARP 面板 (Alpine)    ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $panel_status"
     echo -e "${GREEN}版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
@@ -736,7 +705,7 @@ while true; do
     echo -e "${GREEN} 5. 启动 WARP-Rust${RESET}"
     echo -e "${GREEN} 6. 停止 WARP-Rust${RESET}"
     echo -e "${GREEN} 7. 重启 WARP-Rust${RESET}"
-    echo -e "${GREEN} 8. 查看内核日志${RESET}"
+    echo -e "${GREEN} 8. 查看服务运行状态${RESET}"
     echo -e "${GREEN} 9. 查看配置与出口状态${RESET}"
     echo -e "${YELLOW}10. 谷歌WARP分流${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
@@ -749,15 +718,15 @@ while true; do
         2) menu_update ;;
         3) menu_uninstall ;;
         4) menu_edit_config ;;
-        5) systemctl start "$SERVICE_NAME" && ok "动作: 核心启动成功" ;;
-        6) systemctl stop "$SERVICE_NAME" && ok "动作: 核心停止成功" ;;
-        7) systemctl restart "$SERVICE_NAME" && ok "动作: 核心重启成功" ;;
-        8) (trap 'echo -e "\n"' INT; journalctl -u "$SERVICE_NAME" -n 50 -f) ;;
+        5) rc-service "$SERVICE_NAME" start && ok "动作: 核心启动成功" ;;
+        6) rc-service "$SERVICE_NAME" stop && ok "动作: 核心停止成功" ;;
+        7) rc-service "$SERVICE_NAME" restart && ok "动作: 核心重启成功" ;;
+        8) rc-service "$SERVICE_NAME" status ;;
         9) menu_show_node_config ;;
         10) menu_transparent_proxy_center ;;
         0) clear; exit 0 ;;
         *) warn "未识别的无效序号！"; sleep 1 ;;
     esac
     
-    read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键返回主控制面板...${RESET}")"
+    read -p "$(echo -e "${GREEN}按任意键返回主控制面板...${RESET}")" -n 1 -r
 done

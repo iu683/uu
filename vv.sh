@@ -1,16 +1,14 @@
 #!/bin/bash
-set -e
 
-FRP_INSTALL_DIR="/opt/frp"
-FRPS_BIN="/usr/local/bin/frps"
-FRPC_BIN="/usr/local/bin/frpc"
-ROLE_FILE="$FRP_INSTALL_DIR/.frp_role"
-INIT_FLAG="$FRP_INSTALL_DIR/.frp_inited"
+# 基础路径设定
+CFT_INSTALL_DIR="/opt/cloudflared"
+CFT_BIN="/usr/local/bin/cloudflared"
+TOKEN_FILE="$CFT_INSTALL_DIR/.token"
 IS_OPENWRT=0
+IS_ALPINE=0
 
 G_STATUS=""
 G_VERSION=""
-G_PORT=""
 
 # GitHub 轮询节点列表
 GITHUB_PROXY=(
@@ -21,612 +19,345 @@ GITHUB_PROXY=(
     'https://hub.glowp.xyz/'
     '' 
 )
-
-DEFAULT_BACKUP_VER="0.69.1"
+DEFAULT_BACKUP_VER="2026.5.0"
 
 # 标准颜色
+CYAN="\e[36m"
 GREEN="\e[32m"
 YELLOW="\e[33m"
-CYAN="\e[36m"
 RED="\e[31m"
 RESET="\e[0m"
 
-is_openwrt() { [ -f /etc/openwrt_release ] && IS_OPENWRT=1 || IS_OPENWRT=0; }
-is_openwrt
+# 检查运行环境与架构
+check_env() {
+    if [ -f /etc/openwrt_release ]; then
+        IS_OPENWRT=1
+    elif [ -f /etc/alpine-release ]; then
+        IS_ALPINE=1
+    fi
+}
+check_env
 
 get_arch() {
+    local arch_name=""
     case "$(uname -m)" in
-        x86_64) echo "amd64";;
-        aarch64) echo "arm64";;
-        armv7*|armv6*) echo "arm";;
-        mipsel) echo "mipsle";;
-        mips) echo "mips";;
-        *) echo "amd64";;
+        x86_64) arch_name="amd64";;
+        aarch64) arch_name="arm64";;
+        armv7*|armv6*) arch_name="arm";;
+        *) arch_name="amd64";;
     esac
+
+    # 针对 Alpine (musl) 拼接官方特定的专属包后缀
+    if [ "$IS_ALPINE" = "1" ]; then
+        echo "${arch_name}-musl"
+    else
+        echo "$arch_name"
+    fi
 }
 
+# 自动获取 GitHub 最新版本号
 get_auto_version() {
     local fetched_ver=""
-    echo -e "${YELLOW}正在尝试获取 GitHub 远端最新 FRP 版本号...${RESET}" >&2
-
+    echo -e "${YELLOW}正在尝试获取 GitHub 远端最新 cloudflared 版本号...${RESET}" >&2
     for proxy in "${GITHUB_PROXY[@]}"; do
-        if [ -z "$proxy" ]; then
-            echo -e "${YELLOW} -> 正在尝试[直连]获取 GitHub API...${RESET}" >&2
-        else
-            echo -e "${YELLOW} -> 正在尝试通过节点 [ ${proxy} ] 获取 GitHub API...${RESET}" >&2
-        fi
-
-        fetched_ver=$(curl -sL -m 4 "${proxy}https://api.github.com/repos/fatedier/frp/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | sed 's/"tag_name": *//;s/"//g;s/v//' || echo "")
-        
+        fetched_ver=$(curl -sL -m 4 "${proxy}https://api.github.com/repos/cloudflare/cloudflared/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | sed 's/"tag_name": *//;s/"//g')
         if [ -n "$fetched_ver" ]; then
-            echo -e "${GREEN}[成功] 成功获取到最新版本号: v${fetched_ver}${RESET}" >&2
             echo "$fetched_ver"
             return 0
         fi
-        echo -e "${RED}    失败，尝试下一个渠道...${RESET}" >&2
     done
-
-    echo -e "${YELLOW}[提示] 无法获取远端版本，激活保底机制，采用预设版本: v${DEFAULT_BACKUP_VER}${RESET}" >&2
     echo "$DEFAULT_BACKUP_VER"
 }
 
+# 下载组件核心逻辑
 download_package_loop() {
     local version=$1
     local arch=$2
-    local filename="frp_${version}_linux_${arch}.tar.gz"
+    local remote_filename="cloudflared-linux-${arch}"
     local success=0
 
-    echo -e "${YELLOW}开始下载 FRP 安装包 v${version} (${arch})...${RESET}"
-
+    echo -e "${YELLOW}开始下载 cloudflared 二进制文件 ${version} (${arch})...${RESET}"
     for proxy in "${GITHUB_PROXY[@]}"; do
-        if [ -z "$proxy" ]; then
-            echo -e "${YELLOW} -> 正在尝试[直连] GitHub 下载...${RESET}"
-        else
-            echo -e "${YELLOW} -> 正在尝试通过节点 [ ${proxy} ] 下载...${RESET}"
-        fi
-
-        local url="${proxy}https://github.com/fatedier/frp/releases/download/v${version}/${filename}"
-        
-        if wget -T 8 -O "$filename" "$url"; then
-            echo -e "${GREEN}[成功] 安装包下载完成！${RESET}"
+        local url="${proxy}https://github.com/cloudflare/cloudflared/releases/download/${version}/${remote_filename}"
+        if wget -T 10 -O "cloudflared_tmp" "$url"; then
+            echo -e "${GREEN}[成功] 下载完成！${RESET}"
             success=1
             break
         else
-            echo -e "${RED}    该节点下载失败或超时，自动切换下一个...${RESET}"
-            rm -f "$filename"
+            rm -f "cloudflared_tmp"
         fi
     done
+    [ $success -eq 1 ] && return 0 || return 1
+}
 
-    if [ $success -eq 0 ]; then
-        echo -e "${RED}[严重错误] 所有加速节点及直连下载均已尝试，全部失败！${RESET}"
-        return 1
+# 安装/更新主程序功能
+install_or_update_bin() {
+    local CFT_VER=$(get_auto_version)
+    local ARCH=$(get_arch)
+    
+    mkdir -p "$CFT_INSTALL_DIR"
+    cd "$CFT_INSTALL_DIR" || exit 1
+
+    if download_package_loop "$CFT_VER" "$ARCH"; then
+        stop_service 2>/dev/null || true
+        mv -f "cloudflared_tmp" "$CFT_BIN"
+        chmod +x "$CFT_BIN"
+        echo -e "${GREEN}[成功] cloudflared 主程序已就位/更新成功！${RESET}"
+        [ -f "$TOKEN_FILE" ] && restart_service
+    else
+        echo -e "${RED}[严重错误] 下载失败，请检查网络或重试！${RESET}"
     fi
-    return 0
+    read -p "按回车返回菜单..." </dev/tty
 }
 
-detect_role() {
-    [ -f "$ROLE_FILE" ] && cat "$ROLE_FILE" || echo "unknown"
-}
-
-is_inited() { [ -f "$INIT_FLAG" ]; }
-
+# 更新隧道运行状态
 update_status_variables() {
-    local role=$(detect_role)
-    G_VERSION="未安装"
+    G_VERSION="未检测到组件"
     G_STATUS="${RED}已停止${RESET}"
-    G_PORT="无"
 
-    if [ "$role" = "server" ]; then
-        if [ -f "$FRPS_BIN" ]; then
-            G_VERSION=$($FRPS_BIN -v 2>/dev/null || echo "未知")
-        fi
+    if [ -f "$CFT_BIN" ]; then
+        G_VERSION=$($CFT_BIN --version 2>/dev/null | awk '{print $3}' || echo "未知")
         if [ "$IS_OPENWRT" = "1" ]; then
-            (ps | grep -v grep | grep -q "[f]rps") && G_STATUS="${GREEN}已启动${RESET}"
+            (ps | grep -v grep | grep -q "[c]loudflared") && G_STATUS="${GREEN}已启动${RESET}"
+        elif [ "$IS_ALPINE" = "1" ]; then
+            (rc-service cloudflared status 2>/dev/null | grep -q "started") && G_STATUS="${GREEN}已启动${RESET}"
         else
-            (systemctl is-active --quiet frps 2>/dev/null) && G_STATUS="${GREEN}已启动${RESET}"
+            (systemctl is-active --quiet cloudflared 2>/dev/null) && G_STATUS="${GREEN}已启动${RESET}"
         fi
-        G_PORT=$(awk -F'=' '/webServer\.port/{gsub(/[ "]/,"",$2); print $2}' "$FRP_INSTALL_DIR/frps.toml" 2>/dev/null)
-        [ -z "$G_PORT" ] && G_PORT=$(awk -F'=' '/bindPort/{gsub(/[ "]/,"",$2); print $2}' "$FRP_INSTALL_DIR/frps.toml" 2>/dev/null)
-        G_PORT=${G_PORT:-"7000"}
-
-    elif [ "$role" = "client" ]; then
-        if [ -f "$FRPC_BIN" ]; then
-            G_VERSION=$($FRPC_BIN -v 2>/dev/null || echo "未知")
-        fi
-        if [ "$IS_OPENWRT" = "1" ]; then
-            (ps | grep -v grep | grep -q "[f]rpc") && G_STATUS="${GREEN}已启动${RESET}"
-        else
-            (systemctl is-active --quiet frpc 2>/dev/null) && G_STATUS="${GREEN}已启动${RESET}"
-        fi
-        G_PORT=$(awk -F'=' '/serverPort/{gsub(/[ "]/,"",$2); print $2}' "$FRP_INSTALL_DIR/frpc.toml" 2>/dev/null)
-        G_PORT=${G_PORT:-"7000"}
-    else
-        G_STATUS="${RED}未初始化${RESET}"
     fi
 }
 
-select_role() {
-    clear
-    echo -e "${YELLOW}[自动检测] 当前本机未检测到已初始化的 FRP 服务端或客户端。${RESET}"
-    echo "请选择本机角色："
-    echo "1) FRPS 服务端 (用于公网VPS)"
-    echo "2) FRPC 客户端 (用于内网/被穿透设备)"
-    read -p "输入 1 或 2 并回车: " role
-    mkdir -p "$FRP_INSTALL_DIR"
-    case $role in
-        1) echo "server" > "$ROLE_FILE" ;;
-        2) echo "client" > "$ROLE_FILE" ;;
-        *) echo "输入无效，重新运行脚本"; exit 1 ;;
-    esac
-}
-
-install_frp() {
-    local role=$(detect_role)
-    if [ "$role" = "server" ] && [ -f "$FRPS_BIN" ]; then
-        echo -e "${RED}[提示] 检测到系统已安装 FRPS，如需更新请使用功能 [2]${RESET}"
-        read -p "按回车返回菜单..."
-        return
-    elif [ "$role" = "client" ] && [ -f "$FRPC_BIN" ]; then
-        echo -e "${RED}[提示] 检测到系统已安装 FRPC，如需更新请使用功能 [2]${RESET}"
-        read -p "按回车返回菜单..."
-        return
-    fi
-
-    local FRP_VER=$(get_auto_version)
-    local ARCH=$(get_arch)
-    local FRP_NAME="frp_${FRP_VER}_linux_${ARCH}"
+# 写入 OpenWrt 守护服务
+write_initd_service() {
+    local token=$(cat "$TOKEN_FILE" 2>/dev/null)
+    [ -z "$token" ] && return 1
     
-    mkdir -p "$FRP_INSTALL_DIR"
-    cd "$FRP_INSTALL_DIR"
-
-    if ! download_package_loop "$FRP_VER" "$ARCH"; then
-        read -p "按回车返回菜单..."
-        return
-    fi
-    
-    tar -xzvf "${FRP_NAME}.tar.gz"
-    cp -f "${FRP_NAME}/frps" "$FRPS_BIN"
-    cp -f "${FRP_NAME}/frpc" "$FRPC_BIN"
-    chmod +x "$FRPS_BIN" "$FRPC_BIN"
-    rm -rf "${FRP_NAME}" "${FRP_NAME}.tar.gz"
-    
-    echo -e "${GREEN}FRP 二进制文件安装成功。${RESET}"
-    echo -e "${YELLOW}请务必选择选项 [3. 初始化配置并启动] 激活服务！${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-update_frp() {
-    local role=$(detect_role)
-    local BIN_PATH="$FRPC_BIN"
-    local SYS_NAME="frpc"
-    [ "$role" = "server" ] && BIN_PATH="$FRPS_BIN" && SYS_NAME="frps"
-
-    if [ ! -f "$BIN_PATH" ]; then
-        echo -e "${RED}[错误] 未检测到已安装的组件，请先使用功能 [1. 安装]${RESET}"
-        read -p "按回车返回菜单..."
-        return
-    fi
-
-    local LATEST_VER=$(get_auto_version)
-    local CURRENT_VER=$($BIN_PATH -v 2>/dev/null || echo "0")
-
-    if [ "$CURRENT_VER" = "$LATEST_VER" ]; then
-        echo -e "${GREEN}[提示] 当前已是最新/目标版本 v${CURRENT_VER}，无需更新。${RESET}"
-        read -p "按回车返回菜单..."
-        return
-    fi
-
-    echo -e "${YELLOW}准备版本变更: v${CURRENT_VER} -> v${LATEST_VER}...${RESET}"
-    
-    if [ "$IS_OPENWRT" = "1" ]; then
-        /etc/init.d/$SYS_NAME stop 2>/dev/null || true
-    else
-        systemctl stop $SYS_NAME 2>/dev/null || true
-    fi
-
-    cd "$FRP_INSTALL_DIR"
-    local ARCH=$(get_arch)
-    local FRP_NAME="frp_${LATEST_VER}_linux_${ARCH}"
-    
-    if ! download_package_loop "$LATEST_VER" "$ARCH"; then
-        [ "$IS_OPENWRT" = "1" ] && /etc/init.d/$SYS_NAME start || systemctl start $SYS_NAME
-        read -p "按回车返回菜单..."
-        return
-    fi
-    
-    tar -xzvf "${FRP_NAME}.tar.gz"
-    cp -f "${FRP_NAME}/frps" "$FRPS_BIN"
-    cp -f "${FRP_NAME}/frpc" "$FRPC_BIN"
-    chmod +x "$FRPS_BIN" "$FRPC_BIN"
-    rm -rf "${FRP_NAME}" "${FRP_NAME}.tar.gz"
-
-    if [ "$IS_OPENWRT" = "1" ]; then
-        /etc/init.d/$SYS_NAME restart
-    else
-        systemctl restart $SYS_NAME
-    fi
-
-    echo -e "${GREEN}FRP 成功变更至 v${LATEST_VER}，配置已完美保留并重启服务！${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-write_initd_frps() {
-cat > /etc/init.d/frps <<'EOF'
+    cat > /etc/init.d/cloudflared <<EOF
 #!/bin/sh /etc/rc.common
 START=99
 USE_PROCD=1
-PROG=/usr/local/bin/frps
-CFG=/opt/frp/frps.toml
+PROG=$CFT_BIN
 start_service() {
     procd_open_instance
-    procd_set_param command $PROG -c $CFG
+    procd_set_param command \$PROG tunnel run --token "$token"
     procd_set_param respawn
     procd_close_instance
 }
 EOF
-chmod +x /etc/init.d/frps
-/etc/init.d/frps enable
+    chmod +x /etc/init.d/cloudflared
+    /etc/init.d/cloudflared enable
 }
 
-write_systemd_frps() {
-cat > /etc/systemd/system/frps.service <<EOF
+# 写入 Alpine (OpenRC) 守护服务
+write_openrc_service() {
+    local token=$(cat "$TOKEN_FILE" 2>/dev/null)
+    [ -z "$token" ] && return 1
+
+    cat > /etc/init.d/cloudflared <<EOF
+#!/sbin/openrc-run
+description="Cloudflare Tunnel (Token Mode)"
+supervisor="supervise-daemon"
+command="$CFT_BIN"
+command_args="tunnel run --token $token"
+command_background="yes"
+pidfile="/run/\${RC_SVCNAME}.pid"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+    chmod +x /etc/init.d/cloudflared
+    rc-update add cloudflared default >/dev/null 2>&1
+}
+
+# 写入标准 Linux Systemd 守护服务
+write_systemd_service() {
+    local token=$(cat "$TOKEN_FILE" 2>/dev/null)
+    [ -z "$token" ] && return 1
+
+    cat > /etc/systemd/system/cloudflared.service <<EOF
 [Unit]
-Description=frps server
+Description=Cloudflare Tunnel (Token Mode)
 After=network.target
+
 [Service]
 Type=simple
-ExecStart=$FRPS_BIN -c $FRP_INSTALL_DIR/frps.toml
+ExecStart=$CFT_BIN tunnel run --token $token
 Restart=always
+RestartSec=5
+
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload
+    systemctl daemon-reload
 }
 
-write_initd_frpc() {
-cat > /etc/init.d/frpc <<'EOF'
-#!/bin/sh /etc/rc.common
-START=99
-USE_PROCD=1
-PROG=/usr/local/bin/frpc
-CFG=/opt/frp/frpc.toml
-start_service() {
-    procd_open_instance
-    procd_set_param command $PROG -c $CFG
-    procd_set_param respawn
-    procd_close_instance
-}
-EOF
-chmod +x /etc/init.d/frpc
-/etc/init.d/frpc enable
-}
-
-write_systemd_frpc() {
-cat > /etc/systemd/system/frpc.service <<EOF
-[Unit]
-Description=frpc client
-After=network.target
-[Service]
-Type=simple
-ExecStart=$FRPC_BIN -c $FRP_INSTALL_DIR/frpc.toml
-Restart=always
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl daemon-reload
-}
-
-uninstall_frp() {
-    echo "正在卸载 FRP..."
+# 统合写入守护服务路由
+deploy_service_config() {
     if [ "$IS_OPENWRT" = "1" ]; then
-        /etc/init.d/frps stop 2>/dev/null || true
-        /etc/init.d/frpc stop 2>/dev/null || true
-        rm -f /etc/init.d/frps /etc/init.d/frpc
+        write_initd_service
+    elif [ "$IS_ALPINE" = "1" ]; then
+        write_openrc_service
     else
-        systemctl stop frps frpc 2>/dev/null || true
-        systemctl disable frps frpc 2>/dev/null || true
-        rm -f /etc/systemd/system/frps.service /etc/systemd/system/frpc.service
-        systemctl daemon-reload
+        write_systemd_service
     fi
-    rm -rf "$FRP_INSTALL_DIR" "$FRPS_BIN" "$FRPC_BIN"
-    echo "FRP 已彻底卸载。"
-    sleep 2
-    exit 0
 }
 
-init_frps_and_start() {
-    echo "=== 初始化 FRPS 配置 (TOML) ==="
-    read -p "监听端口 [默认7000]: " BIND_PORT
-    BIND_PORT=${BIND_PORT:-7000}
-    read -p "面板端口 [默认7500]: " DASH_PORT
-    DASH_PORT=${DASH_PORT:-7500}
-    read -p "面板用户名 [默认admin]: " DASH_USER
-    DASH_USER=${DASH_USER:-admin}
-    read -p "面板密码 [默认admin123]: " DASH_PWD
-    DASH_PWD=${DASH_PWD:-admin123}
-    read -p "Token（防蹭用，建议填写）: " FRP_TOKEN
-
-    cat > "$FRP_INSTALL_DIR/frps.toml" <<EOF
-bindPort = $BIND_PORT
-webServer.port = $DASH_PORT
-webServer.user = "$DASH_USER"
-webServer.password = "$DASH_PWD"
-EOF
-    [[ -n "$FRP_TOKEN" ]] && echo "auth.token = \"$FRP_TOKEN\"" >> "$FRP_INSTALL_DIR/frps.toml"
-
-    if [ "$IS_OPENWRT" = "1" ]; then
-        write_initd_frps
-        /etc/init.d/frps restart
-    else
-        write_systemd_frps
-        systemctl restart frps
-        systemctl enable frps
-    fi
-    echo "server" > "$ROLE_FILE"
-    touch "$INIT_FLAG"
-    echo -e "${GREEN}初始化成功并已尝试启动！${RESET}"
-    sleep 1.5
-}
-
-init_frpc_and_start() {
-    echo "=== 初始化 FRPC 公共参数 (TOML) ==="
-    read -p "frps 服务器公网IP: " SERVER_IP
-    while [[ -z "$SERVER_IP" ]]; do
-        read -p "IP不能为空，请重新输入: " SERVER_IP
-    done
-    read -p "frps 端口 [默认7000]: " SERVER_PORT
-    SERVER_PORT=${SERVER_PORT:-7000}
-    read -p "Token（保持与服务端一致）: " FRP_TOKEN
-
-    cat > "$FRP_INSTALL_DIR/frpc.toml" <<EOF
-serverAddr = "$SERVER_IP"
-serverPort = $SERVER_PORT
-EOF
-    [[ -n "$FRP_TOKEN" ]] && echo "auth.token = \"$FRP_TOKEN\"" >> "$FRP_INSTALL_DIR/frpc.toml"
-    echo "" >> "$FRP_INSTALL_DIR/frpc.toml"
-
-    if [ "$IS_OPENWRT" = "1" ]; then
-        write_initd_frpc
-        /etc/init.d/frpc restart
-    else
-        write_systemd_frpc
-        systemctl restart frpc
-        systemctl enable frpc
-    fi
-    echo "client" > "$ROLE_FILE"
-    touch "$INIT_FLAG"
-    echo -e "${GREEN}公共参数初始化成功！${RESET}"
-    sleep 1.5
-}
-
-add_frpc_rule() {
-    is_inited || { echo -e "${RED}请先初始化配置并启动 FRPC！${RESET}"; sleep 2; return; }
-    echo "=== 添加 FRPC 端口规则 ==="
-    while true; do
-        read -p "规则唯一名称（如 nas, ssh, web）: " RULE_NAME
-        if grep -q "name = \"$RULE_NAME\"" "$FRP_INSTALL_DIR/frpc.toml"; then
-            echo -e "${RED}错误：规则名称 [$RULE_NAME] 已存在，请更换！${RESET}"
-            continue
-        fi
-
-        while true; do
-            echo "请选择协议类型："
-            echo "1) tcp"
-            echo "2) udp"
-            read -p "请选择 [1-2]（默认1）: " TYPESEL
-            case "$TYPESEL" in
-                1|"") TYPE="tcp"; break ;;
-                2) TYPE="udp"; break ;;
-                *) echo "输入错误，只能输入 1 或 2" ;;
-            esac
-        done
-
-        read -p "本地内网IP [默认 127.0.0.1]: " LOCAL_IP
-        LOCAL_IP=${LOCAL_IP:-127.0.0.1}
-        read -p "本地端口 (如局域网端口): " LOCAL_PORT
-        read -p "外网映射VPS端口: " REMOTE_PORT
-
-        cat >> "$FRP_INSTALL_DIR/frpc.toml" <<EOF
-[[proxies]]
-name = "$RULE_NAME"
-type = "$TYPE"
-localIp = "$LOCAL_IP"
-localPort = $LOCAL_PORT
-remotePort = $REMOTE_PORT
-
-EOF
-        echo -e "${GREEN}已成功添加规则 [$RULE_NAME]。${RESET}"
-        read -p "是否继续添加规则？(y/n) [n]: " MORE
-        [[ "$MORE" == "y" || "$MORE" == "Y" ]] || break
-    done
-    restart_frpc
-}
-
-delete_frpc_rule() {
-    is_inited || { echo -e "${RED}请先初始化配置并启动 FRPC！${RESET}"; sleep 2; return; }
-    echo -e "\n${CYAN}[当前规则列表]${RESET}"
-    grep "name =" "$FRP_INSTALL_DIR/frpc.toml" || { echo "暂无任何转发规则"; sleep 1.5; return; }
-    echo
-    read -p "输入要删除的规则名称: " RULE
-    
-    if ! grep -q "name = \"$RULE\"" "$FRP_INSTALL_DIR/frpc.toml"; then
-        echo -e "${RED}规则 [$RULE] 不存在！${RESET}"
+# 绑定 Token
+bind_token() {
+    if [ ! -f "$CFT_BIN" ]; then
+        echo -e "${RED}错误：本地没有主程序，请先执行选项 1 安装主程序！${RESET}"
         sleep 2
         return
     fi
 
-    awk -v name="name = \"$RULE\"" '
-    BEGIN {RS="\n\n"; FS="\n"}
-    $0 ~ name {next}
-    {print $0"\n"}
-    ' "$FRP_INSTALL_DIR/frpc.toml" | sed '${/^$/d;}' > "$FRP_INSTALL_DIR/frpc.toml.tmp"
+    echo "=== 绑定 Cloudflare Tunnel Token ==="
+    echo -e "${YELLOW}请输入你在 Cloudflare 网页端获取的官方一键 Token (eyJhIjoi...):${RESET}"
+    read -p "Token: " input_token </dev/tty
     
-    mv "$FRP_INSTALL_DIR/frpc.toml.tmp" "$FRP_INSTALL_DIR/frpc.toml"
-    echo -e "${GREEN}已成功删除规则 [$RULE]${RESET}"
-    restart_frpc
+    if [ -z "$input_token" ]; then
+        echo -e "${RED}Token 不能为空，放弃操作。${RESET}"
+        sleep 1.5
+        return
+    fi
+
+    mkdir -p "$CFT_INSTALL_DIR"
+    rm -f "$CFT_INSTALL_DIR/config.yml" "$CFT_INSTALL_DIR/tunnel_cred.json" "$CFT_INSTALL_DIR/.cft_inited"
+    
+    echo "$input_token" | tr -d '\r\n ' > "$TOKEN_FILE"
+    echo -e "${GREEN}Token 记录成功！正在配置并尝试拉起服务...${RESET}"
+    
+    deploy_service_config
+    start_service
     sleep 1.5
-} 
+}
 
-print_embedded_rules() {
-    if [ -f "$FRP_INSTALL_DIR/frpc.toml" ]; then
-        echo -e "${CYAN} 规则名称     | 协议  | 内网端口   | 外网映射端口${RESET}"
-        echo -e "${CYAN}------------------------------------------------${RESET}"
-        awk -F'=' '
-        BEGIN { name=""; type=""; lport=""; rport="" }
-        /\[\[proxies\]\]/ {
-            if(name!="") printf "  %-11s | %-5s | %-10s | %-10s\n", name, type, lport, rport;
-            name=""; type=""; lport=""; rport=""
-        }
-        $1 ~ /name/      { gsub(/[ "]/, "", $2); name=$2 }
-        $1 ~ /type/      { gsub(/[ "]/, "", $2); type=$2 }
-        $1 ~ /localPort/ { gsub(/[ "]/, "", $2); lport=$2 }
-        $1 ~ /remotePort/{ gsub(/[ "]/, "", $2); rport=$2 }
-        END { if(name!="") printf "  %-11s | %-5s | %-10s | %-10s\n", name, type, lport, rport }
-        ' "$FRP_INSTALL_DIR/frpc.toml" | while read -r line; do
-            echo -e "${YELLOW}$line${RESET}"
-        done
-        if ! grep -q "\[\[proxies\]\]" "$FRP_INSTALL_DIR/frpc.toml"; then
-            echo -e "   ${RED}(暂无转发规则，请选择 4 添加)${RESET}"
+# 启动服务
+start_service() {
+    if [ ! -f "$CFT_BIN" ] || [ ! -f "$TOKEN_FILE" ]; then
+        echo -e "${RED}错误：未安装主程序或未绑定 Token！${RESET}"; sleep 2; return
+    fi
+
+    deploy_service_config
+    if [ "$IS_OPENWRT" = "1" ]; then
+        /etc/init.d/cloudflared start
+    elif [ "$IS_ALPINE" = "1" ]; then
+        rc-service cloudflared start
+    else
+        systemctl start cloudflared
+        systemctl enable cloudflared 2>/dev/null || true
+    fi
+    echo "隧道服务已启动"; sleep 1;
+}
+
+# 停止服务
+stop_service() {
+    if [ "$IS_OPENWRT" = "1" ]; then
+        /etc/init.d/cloudflared stop
+    elif [ "$IS_ALPINE" = "1" ]; then
+        rc-service cloudflared stop 2>/dev/null || true
+    else
+        systemctl stop cloudflared
+    fi
+    echo "隧道服务已停止"; sleep 1;
+}
+
+# 重启服务
+restart_service() {
+    if [ ! -f "$CFT_BIN" ] || [ ! -f "$TOKEN_FILE" ]; then
+        echo -e "${RED}错误：未安装主程序或未绑定 Token！${RESET}"; sleep 2; return
+    fi
+
+    deploy_service_config
+    if [ "$IS_OPENWRT" = "1" ]; then
+        /etc/init.d/cloudflared restart
+    elif [ "$IS_ALPINE" = "1" ]; then
+        rc-service cloudflared restart
+    else
+        systemctl restart cloudflared
+    fi
+    echo "隧道服务已重启"; sleep 1;
+}
+
+# 查看运行日志
+log_service() {
+    echo -e "${CYAN}=== 正在获取最近的 30 行隧道运行日志 ===${RESET}"
+    if [ "$IS_OPENWRT" = "1" ]; then 
+        logread | grep cloudflared | tail -n 30 || echo "暂无日志"
+    elif [ "$IS_ALPINE" = "1" ]; then
+        if [ -f /var/log/messages ]; then
+            tail -n 100 /var/log/messages | grep cloudflared | tail -n 30
+        else
+            echo -e "${YELLOW}Alpine 默认输出至 syslog，请确保已安装 busybox-initscripts 或 syslog-ng${RESET}"
+            rc-service cloudflared status
         fi
-    else
-        echo -e "   ${RED}配置文件未生成${RESET}"
+    else 
+        journalctl -u cloudflared -n 30 --no-pager 2>/dev/null || tail -n 30 /var/log/messages 2>/dev/null
+    fi
+    read -p "按回车返回菜单..." </dev/tty
+}
+
+# 彻底卸载
+uninstall_service() {
+    echo -e "${RED}确定要彻底卸载本地服务及清除所有配置吗？(y/n)${RESET}"
+    read -p "请输入: " confirm </dev/tty
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        stop_service 2>/dev/null || true
+        if [ "$IS_OPENWRT" = "1" ]; then
+            /etc/init.d/cloudflared disable 2>/dev/null || true
+            rm -f /etc/init.d/cloudflared
+        elif [ "$IS_ALPINE" = "1" ]; then
+            rc-update del cloudflared default >/dev/null 2>&1 || true
+            rm -f /etc/init.d/cloudflared
+        else
+            systemctl disable cloudflared 2>/dev/null || true
+            rm -f /etc/systemd/system/cloudflared.service
+            systemctl daemon-reload
+        fi
+        rm -rf "$CFT_INSTALL_DIR" "$CFT_BIN"
+        echo -e "${GREEN}Cloudflare Tunnel 已完全卸载干净。${RESET}"
+        sleep 2
     fi
 }
 
-start_frps() { [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frps start || systemctl start frps; echo "frps 已启动"; sleep 1; }
-stop_frps()  { [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frps stop  || systemctl stop frps;  echo "frps 已停止"; sleep 1; }
-restart_frps() { [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frps restart || systemctl restart frps; echo "frps 已重启"; sleep 1; }
-
-start_frpc() { [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frpc start || systemctl start frpc; echo "frpc 已启动"; sleep 1; }
-stop_frpc()  { [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frpc stop  || systemctl stop frpc;  echo "frpc 已停止"; sleep 1; }
-restart_frpc() { [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frpc restart || systemctl restart frpc; echo "frpc 已重启"; sleep 1; }
-
-log_frps() {
-    if [ "$IS_OPENWRT" = "1" ]; then logread | grep frps | tail -n 30 || echo "暂无日志"; else journalctl -u frps -n 40 --no-pager; fi
-    read -p "按回车返回菜单..."
-}
-log_frpc() {
-    if [ "$IS_OPENWRT" = "1" ]; then logread | grep frpc | tail -n 30 || echo "暂无日志"; else journalctl -u frpc -n 40 --no-pager; fi
-    read -p "按回车返回菜单..."
-}
-
-show_frps_dashboard_info() {
-    clear
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       FRPS 面板认证详情        ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    if [ -f "$FRP_INSTALL_DIR/frps.toml" ]; then
-        local DASH_PORT=$(awk -F'=' '/webServer\.port/{gsub(/[ "]/,"",$2);print $2}' "$FRP_INSTALL_DIR/frps.toml")
-        local DASH_USER=$(awk -F'=' '/webServer\.user/{gsub(/[ "]/,"",$2);print $2}' "$FRP_INSTALL_DIR/frps.toml")
-        local DASH_PWD=$(awk -F'=' '/webServer\.password/{gsub(/[ "]/,"",$2);print $2}' "$FRP_INSTALL_DIR/frps.toml")
-        local DASH_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
-        
-        echo -e "${GREEN}地址   :${RESET} ${CYAN}http://$DASH_IP:${DASH_PORT:-7500}${RESET}"
-        echo -e "${GREEN}用户名 :${RESET} ${YELLOW}${DASH_USER:-admin}${RESET}"
-        echo -e "${GREEN}密码   :${RESET} ${YELLOW}${DASH_PWD:-admin123}${RESET}"
-    else
-        echo -e "${RED}未找到配置文件${RESET}"
-    fi
-    echo -e "${GREEN}================================${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-server_menu() {
+# ---------- 主菜单界面 ----------
+main_menu() {
     while true; do
         update_status_variables
         clear
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}       FRPS 服务端管理面板      ${RESET}"
+        echo -e "${GREEN}   Cloudflare 远端控制管理面板    ${RESET}"
+        echo -e "${GREEN}   (Dashboard 模式/无需本地配置)  ${RESET}"
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}状态   :${RESET} $G_STATUS"
-        echo -e "${GREEN}版本   :${RESET} ${YELLOW}${G_VERSION}${RESET}"
-        echo -e "${GREEN}面板端口:${RESET} ${YELLOW}${G_PORT}${RESET}"
+        [ ! -f "$CFT_BIN" ] && echo -e "${RED}[警告] 未找到执行文件，请先执行选项 1 安装！${RESET}"
+        echo -e "${GREEN}当前状态 :${RESET} $G_STATUS"
+        echo -e "${GREEN}主程序版 :${RESET} ${YELLOW}${G_VERSION}${RESET}"
+        echo -e "${GREEN}管理提示 : 规则增删请直接在网页面板操作${RESET}"
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}1. 安装 FRPS${RESET}"
-        echo -e "${GREEN}2. 更新/同步版本${RESET}"
-        echo -e "${GREEN}3. 初始化配置并启动${RESET}"
-        echo -e "${GREEN}4. 启动 FRPS 服务${RESET}"
-        echo -e "${GREEN}5. 停止 FRPS 服务${RESET}"
-        echo -e "${GREEN}6. 重启 FRPS 服务${RESET}"
-        echo -e "${GREEN}7. 查看面板信息${RESET}"
-        echo -e "${GREEN}8. 查看运行日志${RESET}"
-        echo -e "${GREEN}9. 卸载 FRPS 服务${RESET}"
-        echo -e "${GREEN}0. 退出${RESET}"
+        echo -e "${GREEN} 1. 安装 / 更新 cloudflared${RESET}"
+        echo -e "${GREEN} 2. 绑定 / 修改 Token${RESET}"
+        echo -e "${GREEN} 3. 启动隧道服务${RESET}"
+        echo -e "${GREEN} 4. 停止隧道服务${RESET}"
+        echo -e "${GREEN} 5. 重启隧道服务${RESET}"
+        echo -e "${GREEN} 6. 查看运行日志${RESET}"
+        echo -e "${GREEN} 7. 卸载服务${RESET}"
+        echo -e "${GREEN} 0. 退出${RESET}"
         echo -e "${GREEN}================================${RESET}"
         echo -ne "${GREEN}请输入选项: ${RESET}"
-        read choice
+        read choice </dev/tty
         case $choice in
-            1) install_frp ;;
-            2) update_frp ;;
-            3) init_frps_and_start ;;
-            4) start_frps ;;
-            5) stop_frps ;;
-            6) restart_frps ;;
-            7) show_frps_dashboard_info ;;
-            8) log_frps ;;
-            9) uninstall_frp ;;
+            1) install_or_update_bin ;;
+            2) bind_token ;;
+            3) start_service ;;
+            4) stop_service ;;
+            5) restart_service ;;
+            6) log_service ;;
+            7) uninstall_service ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效选项！${RESET}" && sleep 1 ;;
         esac
     done
 }
 
-client_menu() {
-    while true; do
-        update_status_variables
-        clear
-        echo -e "${CYAN}================================${RESET}"
-        echo -e "${CYAN}       FRPC 客户端管理面板      ${RESET}"
-        echo -e "${CYAN}================================${RESET}"
-        echo -e "${CYAN}状态   :${RESET} $G_STATUS"
-        echo -e "${CYAN}version:${RESET} ${YELLOW}${G_VERSION}${RESET}"
-        echo -e "${CYAN}连接端口:${RESET} ${YELLOW}${G_PORT}${RESET}"
-        echo -e "${CYAN}================================${RESET}"
-        
-        print_embedded_rules
-        echo -e "${CYAN}================================${RESET}"
-        
-        echo -e "${CYAN}1. 安装 FRPC${RESET}"
-        echo -e "${CYAN}2. 更新/同步版本${RESET}"
-        echo -e "${CYAN}3. 初始化公共参数并启动${RESET}"
-        echo -e "${CYAN}4. 新增本地端口转发规则${RESET}"
-        echo -e "${CYAN}5. 删除本地端口转发规则${RESET}"
-        echo -e "${CYAN}6. 启动 FRPC 服务${RESET}"
-        echo -e "${CYAN}7. 停止 FRPC 服务${RESET}"
-        echo -e "${CYAN}8. 重启 FRPC 服务${RESET}"
-        echo -e "${CYAN}9. 查看运行日志${RESET}"
-        echo -e "${CYAN}10. 卸载 FRPC 服务${RESET}"
-        echo -e "${CYAN}0. 退出${RESET}"
-        echo -e "${CYAN}================================${RESET}"
-        echo -ne "${CYAN}请输入选项: ${RESET}"
-        read choice
-        case $choice in
-            1) install_frp ;;
-            2) update_frp ;;
-            3) init_frpc_and_start ;;
-            4) add_frpc_rule ;;
-            5) delete_frpc_rule ;;
-            6) start_frpc ;;
-            7) stop_frpc ;;
-            8) restart_frpc ;;
-            9) log_frpc ;;
-            10) uninstall_frp ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选项！${RESET}" && sleep 1 ;;
-        esac
-    done
-}
-
-# ---------- 启动主入口 ----------
-
-role="$(detect_role)"
-case "$role" in
-    server) server_menu ;;
-    client) client_menu ;;
-    *)
-        select_role
-        role2="$(detect_role)"
-        [ "$role2" = "server" ] && server_menu
-        [ "$role2" = "client" ] && client_menu
-        ;;
-esac
+main_menu

@@ -4,6 +4,7 @@ set -e
 #================================================================================
 # 常量和全局变量
 #================================================================================
+VERSION="1.2.7"
 REPO="heiher/hev-socks5-tunnel"
 
 # 颜色定义
@@ -421,7 +422,7 @@ main_menu() {
         echo -e "${GREEN}      Tun2Socks 管理面板        ${NC}"
         echo -e "${GREEN}================================${NC}"
         echo -e "${GREEN}状态   :${NC} $status"
-        echo -e "${GREEN}版本   :${NC} ${YELLOW}${core_version}${NC}"
+        echo -e "${GREEN}核心版本:${NC} ${YELLOW}${core_version}${NC}"
         echo -e "${GREEN}端口   :${NC} ${port_show}"
         echo -e "${GREEN}================================${NC}"
         echo -e "${GREEN} 1. 安装 Tun2Socks 核心与配置${NC}"

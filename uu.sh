@@ -1,6 +1,6 @@
 #!/bin/bash
-set -e
 
+# 取消全局 set -e，改用手工逻辑控制，防止流式输入时意外闪退
 FRP_INSTALL_DIR="/opt/frp"
 FRPS_BIN="/usr/local/bin/frps"
 FRPC_BIN="/usr/local/bin/frpc"
@@ -8,12 +8,11 @@ ROLE_FILE="$FRP_INSTALL_DIR/.frp_role"
 INIT_FLAG="$FRP_INSTALL_DIR/.frp_inited"
 IS_OPENWRT=0
 
-# 全局状态变量（由主循环显式维护）
 G_STATUS=""
 G_VERSION=""
 G_PORT=""
 
-# GitHub 轮询节点列表（最后一个为空代表直连）
+# GitHub 轮询节点列表
 GITHUB_PROXY=(
     'https://gh-proxy.com/'
     'https://v6.gh-proxy.org/'
@@ -23,7 +22,6 @@ GITHUB_PROXY=(
     '' 
 )
 
-# 终极保底硬编码版本
 DEFAULT_BACKUP_VER="0.69.1"
 
 # 标准颜色
@@ -35,30 +33,6 @@ RESET="\e[0m"
 
 is_openwrt() { [ -f /etc/openwrt_release ] && IS_OPENWRT=1 || IS_OPENWRT=0; }
 is_openwrt
-
-create_shortcut() {
-    local script_path=$(readlink -f "$0" 2>/dev/null || echo "$(cd "$(dirname "$0")"; pwd)/$(basename "$0")")
-    
-    # 终极方案：直接创建系统软链接到 /usr/bin/p，免去别名不生效的烦恼
-    if [ -w /usr/bin ]; then
-        ln -sf "$script_path" /usr/bin/p 2>/dev/null && return 0
-    fi
-
-    # 备用方案：别名注入
-    if [ "$IS_OPENWRT" = "1" ]; then
-        if ! grep -q "alias p=" /etc/profile; then
-            echo "alias p='$script_path'" >> /etc/profile
-            echo -e "${GREEN}[快捷键] 已为 OpenWrt 尝试写入 profile。建议输入 'p' 或 'sudo p' 测试。${RESET}"
-        fi
-    else
-        for rc_file in "$HOME/.bashrc" "$HOME/.zshrc"; do
-            if [ -f "$rc_file" ] && ! grep -q "alias p=" "$rc_file"; then
-                echo "alias p='sudo $script_path'" >> "$rc_file"
-                echo -e "${GREEN}[快捷键] 已在 $rc_file 中创建快捷键 'p' (重新登录或执行 source $rc_file 生效)。${RESET}"
-            fi
-        done
-    fi
-}
 
 get_arch() {
     case "$(uname -m)" in
@@ -136,7 +110,6 @@ detect_role() {
 
 is_inited() { [ -f "$INIT_FLAG" ]; }
 
-# 核心修复：直接修改全局变量，杜绝子 Shell 管道丢失数据问题
 update_status_variables() {
     local role=$(detect_role)
     G_VERSION="未安装"
@@ -152,7 +125,6 @@ update_status_variables() {
         else
             (systemctl is-active --quiet frps 2>/dev/null) && G_STATUS="${GREEN}已启动${RESET}"
         fi
-        # 精准匹配 TOML，无视空格
         G_PORT=$(awk -F'=' '/webServer\.port/{gsub(/[ "]/,"",$2); print $2}' "$FRP_INSTALL_DIR/frps.toml" 2>/dev/null)
         [ -z "$G_PORT" ] && G_PORT=$(awk -F'=' '/bindPort/{gsub(/[ "]/,"",$2); print $2}' "$FRP_INSTALL_DIR/frps.toml" 2>/dev/null)
         G_PORT=${G_PORT:-"7000"}
@@ -179,12 +151,23 @@ select_role() {
     echo "请选择本机角色："
     echo "1) FRPS 服务端 (用于公网VPS)"
     echo "2) FRPC 客户端 (用于内网/被穿透设备)"
-    read -p "输入 1 或 2 并回车: " role
+    
+    read -p "输入 1 或 2 并回车: " role </dev/tty
+    
     mkdir -p "$FRP_INSTALL_DIR"
     case $role in
-        1) echo "server" > "$ROLE_FILE" ;;
-        2) echo "client" > "$ROLE_FILE" ;;
-        *) echo "输入无效，重新运行脚本"; exit 1 ;;
+        1) 
+            echo "server" > "$ROLE_FILE" 
+            server_menu
+            ;;
+        2) 
+            echo "client" > "$ROLE_FILE" 
+            client_menu
+            ;;
+        *) 
+            echo "输入无效，脚本退出。"
+            exit 1 
+            ;;
     esac
 }
 
@@ -192,11 +175,11 @@ install_frp() {
     local role=$(detect_role)
     if [ "$role" = "server" ] && [ -f "$FRPS_BIN" ]; then
         echo -e "${RED}[提示] 检测到系统已安装 FRPS，如需更新请使用功能 [2]${RESET}"
-        read -p "按回车返回菜单..."
+        read -p "按回车返回菜单..." </dev/tty
         return
     elif [ "$role" = "client" ] && [ -f "$FRPC_BIN" ]; then
         echo -e "${RED}[提示] 检测到系统已安装 FRPC，如需更新请使用功能 [2]${RESET}"
-        read -p "按回车返回菜单..."
+        read -p "按回车返回菜单..." </dev/tty
         return
     fi
 
@@ -208,7 +191,7 @@ install_frp() {
     cd "$FRP_INSTALL_DIR"
 
     if ! download_package_loop "$FRP_VER" "$ARCH"; then
-        read -p "按回车返回菜单..."
+        read -p "按回车返回菜单..." </dev/tty
         return
     fi
     
@@ -219,8 +202,8 @@ install_frp() {
     rm -rf "${FRP_NAME}" "${FRP_NAME}.tar.gz"
     
     echo -e "${GREEN}FRP 二进制文件安装成功。${RESET}"
-    echo -e "${YELLOW}请务必选择选项 [3. 初始化配置并启动] 激活服务！${RESET}"
-    read -p "按回车返回菜单..."
+    echo -e "${YELLOW}请务必选择选项 [3. 修改配置] 激活并启动服务！${RESET}"
+    read -p "按回车返回菜单..." </dev/tty
 }
 
 update_frp() {
@@ -231,7 +214,7 @@ update_frp() {
 
     if [ ! -f "$BIN_PATH" ]; then
         echo -e "${RED}[错误] 未检测到已安装的组件，请先使用功能 [1. 安装]${RESET}"
-        read -p "按回车返回菜单..."
+        read -p "按回车返回菜单..." </dev/tty
         return
     fi
 
@@ -240,7 +223,7 @@ update_frp() {
 
     if [ "$CURRENT_VER" = "$LATEST_VER" ]; then
         echo -e "${GREEN}[提示] 当前已是最新/目标版本 v${CURRENT_VER}，无需更新。${RESET}"
-        read -p "按回车返回菜单..."
+        read -p "按回车返回菜单..." </dev/tty
         return
     fi
 
@@ -257,9 +240,8 @@ update_frp() {
     local FRP_NAME="frp_${LATEST_VER}_linux_${ARCH}"
     
     if ! download_package_loop "$LATEST_VER" "$ARCH"; then
-        # 失败则恢复旧服务
         [ "$IS_OPENWRT" = "1" ] && /etc/init.d/$SYS_NAME start || systemctl start $SYS_NAME
-        read -p "按回车返回菜单..."
+        read -p "按回车返回菜单..." </dev/tty
         return
     fi
     
@@ -276,7 +258,7 @@ update_frp() {
     fi
 
     echo -e "${GREEN}FRP 成功变更至 v${LATEST_VER}，配置已完美保留并重启服务！${RESET}"
-    read -p "按回车返回菜单..."
+    read -p "按回车返回菜单..." </dev/tty
 }
 
 write_initd_frps() {
@@ -357,32 +339,65 @@ uninstall_frp() {
         rm -f /etc/systemd/system/frps.service /etc/systemd/system/frpc.service
         systemctl daemon-reload
     fi
-    rm -f /usr/bin/p 2>/dev/null || true
     rm -rf "$FRP_INSTALL_DIR" "$FRPS_BIN" "$FRPC_BIN"
     echo "FRP 已彻底卸载。"
     sleep 2
     exit 0
 }
 
+# 【改造核心】修改/覆盖 FRPS 配置文件，增加面板地址绑定选项
 init_frps_and_start() {
-    echo "=== 初始化 FRPS 配置 (TOML) ==="
-    read -p "监听端口 [默认7000]: " BIND_PORT
-    BIND_PORT=${BIND_PORT:-7000}
-    read -p "面板端口 [默认7500]: " DASH_PORT
-    DASH_PORT=${DASH_PORT:-7500}
-    read -p "面板用户名 [默认admin]: " DASH_USER
-    DASH_USER=${DASH_USER:-admin}
-    read -p "面板密码 [默认admin123]: " DASH_PWD
-    DASH_PWD=${DASH_PWD:-admin123}
-    read -p "Token（防蹭用，建议填写）: " FRP_TOKEN
+    echo "=== 修改 FRPS 配置 (TOML) ==="
+    mkdir -p "$FRP_INSTALL_DIR"
+    local CONF_FILE="$FRP_INSTALL_DIR/frps.toml"
 
-    cat > "$FRP_INSTALL_DIR/frps.toml" <<EOF
+    # 读取旧值作默认提示
+    local OLD_BIND=$(awk -F'=' '/bindPort/{gsub(/[ "]/,"",$2); print $2}' "$CONF_FILE" 2>/dev/null)
+    local OLD_HOST=$(awk -F'=' '/webServer\.addr/{gsub(/[ "]/,"",$2); print $2}' "$CONF_FILE" 2>/dev/null)
+    local OLD_PORT=$(awk -F'=' '/webServer\.port/{gsub(/[ "]/,"",$2); print $2}' "$CONF_FILE" 2>/dev/null)
+    local OLD_USER=$(awk -F'=' '/webServer\.user/{gsub(/[ "]/,"",$2); print $2}' "$CONF_FILE" 2>/dev/null)
+    local OLD_PWD=$(awk -F'=' '/webServer\.password/{gsub(/[ "]/,"",$2); print $2}' "$CONF_FILE" 2>/dev/null)
+    local OLD_TOKEN=$(awk -F'=' '/auth\.token/{gsub(/[ "]/,"",$2); print $2}' "$CONF_FILE" 2>/dev/null)
+
+    # 1. 监听端口
+    read -p "核心绑定端口 [当前: ${OLD_BIND:-7000}]: " BIND_PORT </dev/tty
+    BIND_PORT=${BIND_PORT:-${OLD_BIND:-7000}}
+
+    # 2. 面板绑定地址选择
+    local DASH_HOST=""
+    while true; do
+        echo -e "\n请选择控制面板绑定的 IP 地址:"
+        echo -e "  1) 0.0.0.0   (公网可直连外网访问面板)"
+        echo -e "  2) 127.0.0.1 (仅限本机本地访问，适合配合 Nginx/Caddy 等安全反代) [当前: ${OLD_HOST:-0.0.0.0}]"
+        read -p "请输入 [1-2]（直接回车维持当前/默认）: " HOST_SEL </dev/tty
+        case "$HOST_SEL" in
+            1) DASH_HOST="0.0.0.0"; break ;;
+            2) DASH_HOST="127.0.0.1"; break ;;
+            "") DASH_HOST=${OLD_HOST:-"0.0.0.0"}; break ;;
+            *) echo -e "${RED}输入错误，请输入 1 或 2${RESET}" ;;
+        esac
+    done
+
+    # 3. 面板其它参数
+    read -p "面板端口 [当前: ${OLD_PORT:-7500}]: " DASH_PORT </dev/tty
+    DASH_PORT=${DASH_PORT:-${OLD_PORT:-7500}}
+    read -p "面板用户名 [当前: ${OLD_USER:-admin}]: " DASH_USER </dev/tty
+    DASH_USER=${DASH_USER:-${OLD_USER:-admin}}
+    read -p "面板密码 [当前: ${OLD_PWD:-admin123}]: " DASH_PWD </dev/tty
+    DASH_PWD=${DASH_PWD:-${OLD_PWD:-admin123}}
+    read -p "Token (安全认证令牌) [当前: ${OLD_TOKEN:-无}]: " FRP_TOKEN </dev/tty
+    if [[ "$FRP_TOKEN" == "无" ]]; then FRP_TOKEN=""; fi
+    FRP_TOKEN=${FRP_TOKEN:-$OLD_TOKEN}
+
+    # 写入新配置文件
+    cat > "$CONF_FILE" <<EOF
 bindPort = $BIND_PORT
+webServer.addr = "$DASH_HOST"
 webServer.port = $DASH_PORT
 webServer.user = "$DASH_USER"
 webServer.password = "$DASH_PWD"
 EOF
-    [[ -n "$FRP_TOKEN" ]] && echo "auth.token = \"$FRP_TOKEN\"" >> "$FRP_INSTALL_DIR/frps.toml"
+    [[ -n "$FRP_TOKEN" ]] && echo "auth.token = \"$FRP_TOKEN\"" >> "$CONF_FILE"
 
     if [ "$IS_OPENWRT" = "1" ]; then
         write_initd_frps
@@ -390,30 +405,58 @@ EOF
     else
         write_systemd_frps
         systemctl restart frps
-        systemctl enable frps
+        systemctl enable frps 2>/dev/null || true
     fi
     echo "server" > "$ROLE_FILE"
     touch "$INIT_FLAG"
-    echo -e "${GREEN}初始化成功并已尝试启动！${RESET}"
+    echo -e "${GREEN}配置已保存并完成服务重启！${RESET}"
     sleep 1.5
 }
 
+# 【改造核心】修改/覆盖 FRPC 客户端公共配置
 init_frpc_and_start() {
-    echo "=== 初始化 FRPC 公共参数 (TOML) ==="
-    read -p "frps 服务器公网IP: " SERVER_IP
-    while [[ -z "$SERVER_IP" ]]; do
-        read -p "IP不能为空，请重新输入: " SERVER_IP
-    done
-    read -p "frps 端口 [默认7000]: " SERVER_PORT
-    SERVER_PORT=${SERVER_PORT:-7000}
-    read -p "Token（保持与服务端一致）: " FRP_TOKEN
+    echo "=== 修改 FRPC 公共参数 (TOML) ==="
+    mkdir -p "$FRP_INSTALL_DIR"
+    local CONF_FILE="$FRP_INSTALL_DIR/frpc.toml"
 
-    cat > "$FRP_INSTALL_DIR/frpc.toml" <<EOF
+    local OLD_ADDR=$(awk -F'=' '/serverAddr/{gsub(/[ "]/,"",$2); print $2}' "$CONF_FILE" 2>/dev/null)
+    local OLD_PORT=$(awk -F'=' '/serverPort/{gsub(/[ "]/,"",$2); print $2}' "$CONF_FILE" 2>/dev/null)
+    local OLD_TOKEN=$(awk -F'=' '/auth\.token/{gsub(/[ "]/,"",$2); print $2}' "$CONF_FILE" 2>/dev/null)
+
+    read -p "FRPS 服务器公网IP [当前: ${OLD_ADDR:-未配置}]: " SERVER_IP </dev/tty
+    SERVER_IP=${SERVER_IP:-$OLD_ADDR}
+    while [[ -z "$SERVER_IP" ]]; do
+        read -p "${RED}IP 不能为空，请重新输入: ${RESET}" SERVER_IP </dev/tty
+    done
+
+    read -p "FRPS 核心端口 [当前: ${OLD_PORT:-7000}]: " SERVER_PORT </dev/tty
+    SERVER_PORT=${SERVER_PORT:-${OLD_PORT:-7000}}
+    
+    read -p "Token (与服务端保持一致) [当前: ${OLD_TOKEN:-无}]: " FRP_TOKEN </dev/tty
+    if [[ "$FRP_TOKEN" == "无" ]]; then FRP_TOKEN=""; fi
+    FRP_TOKEN=${FRP_TOKEN:-$OLD_TOKEN}
+
+    # 提取并临时备份旧文件中的自定义转发规则（Proxies 节点部分）
+    local TMP_RULES="/tmp/frpc_rules.bak"
+    rm -f "$TMP_RULES"
+    if [ -f "$CONF_FILE" ]; then
+        # 抓取自 [[proxies]] 标签开始的所有剩余内容
+        sed -n '/\[\[proxies\]\]/,$p' "$CONF_FILE" > "$TMP_RULES" 2>/dev/null || true
+    fi
+
+    # 重构写入基础公共配置
+    cat > "$CONF_FILE" <<EOF
 serverAddr = "$SERVER_IP"
 serverPort = $SERVER_PORT
 EOF
-    [[ -n "$FRP_TOKEN" ]] && echo "auth.token = \"$FRP_TOKEN\"" >> "$FRP_INSTALL_DIR/frpc.toml"
-    echo "" >> "$FRP_INSTALL_DIR/frpc.toml"
+    [[ -n "$FRP_TOKEN" ]] && echo "auth.token = \"$FRP_TOKEN\"" >> "$CONF_FILE"
+    echo "" >> "$CONF_FILE"
+
+    # 将提取出的老转发规则完整追加回去，防止被覆盖清空
+    if [ -s "$TMP_RULES" ]; then
+        cat "$TMP_RULES" >> "$CONF_FILE"
+    fi
+    rm -f "$TMP_RULES"
 
     if [ "$IS_OPENWRT" = "1" ]; then
         write_initd_frpc
@@ -421,19 +464,19 @@ EOF
     else
         write_systemd_frpc
         systemctl restart frpc
-        systemctl enable frpc
+        systemctl enable frpc 2>/dev/null || true
     fi
     echo "client" > "$ROLE_FILE"
     touch "$INIT_FLAG"
-    echo -e "${GREEN}公共参数初始化成功！${RESET}"
+    echo -e "${GREEN}公共参数修改完毕并已应用重启！${RESET}"
     sleep 1.5
 }
 
 add_frpc_rule() {
-    is_inited || { echo -e "${RED}请先初始化配置并启动 FRPC！${RESET}"; sleep 2; return; }
+    is_inited || { echo -e "${RED}请先初始化公共参数配置！${RESET}"; sleep 2; return; }
     echo "=== 添加 FRPC 端口规则 ==="
     while true; do
-        read -p "规则唯一名称（如 nas, ssh, web）: " RULE_NAME
+        read -p "规则唯一名称（如 nas, ssh, web）: " RULE_NAME </dev/tty
         if grep -q "name = \"$RULE_NAME\"" "$FRP_INSTALL_DIR/frpc.toml"; then
             echo -e "${RED}错误：规则名称 [$RULE_NAME] 已存在，请更换！${RESET}"
             continue
@@ -443,7 +486,7 @@ add_frpc_rule() {
             echo "请选择协议类型："
             echo "1) tcp"
             echo "2) udp"
-            read -p "请选择 [1-2]（默认1）: " TYPESEL
+            read -p "请选择 [1-2]（默认1）: " TYPESEL </dev/tty
             case "$TYPESEL" in
                 1|"") TYPE="tcp"; break ;;
                 2) TYPE="udp"; break ;;
@@ -451,10 +494,18 @@ add_frpc_rule() {
             esac
         done
 
-        read -p "本地内网IP [默认 127.0.0.1]: " LOCAL_IP
+        read -p "本地内网IP [默认 127.0.0.1]: " LOCAL_IP </dev/tty
         LOCAL_IP=${LOCAL_IP:-127.0.0.1}
-        read -p "本地端口 (如局域网端口): " LOCAL_PORT
-        read -p "外网映射VPS端口: " REMOTE_PORT
+        
+        while true; do
+            read -p "本地端口 (如局域网内设备端口): " LOCAL_PORT </dev/tty
+            if [[ "$LOCAL_PORT" =~ ^[0-9]+$ ]]; then break; else echo -e "${RED}输入有误，端口必须是纯数字！${RESET}"; fi
+        done
+
+        while true; do
+            read -p "外网映射VPS端口: " REMOTE_PORT </dev/tty
+            if [[ "$REMOTE_PORT" =~ ^[0-9]+$ ]]; then break; else echo -e "${RED}输入有误，端口必须是纯数字！${RESET}"; fi
+        done
 
         cat >> "$FRP_INSTALL_DIR/frpc.toml" <<EOF
 [[proxies]]
@@ -466,18 +517,18 @@ remotePort = $REMOTE_PORT
 
 EOF
         echo -e "${GREEN}已成功添加规则 [$RULE_NAME]。${RESET}"
-        read -p "是否继续添加规则？(y/n) [n]: " MORE
+        read -p "是否继续添加规则？(y/n) [n]: " MORE </dev/tty
         [[ "$MORE" == "y" || "$MORE" == "Y" ]] || break
     done
     restart_frpc
 }
 
 delete_frpc_rule() {
-    is_inited || { echo -e "${RED}请先初始化配置并启动 FRPC！${RESET}"; sleep 2; return; }
+    is_inited || { echo -e "${RED}请先初始化公共参数配置！${RESET}"; sleep 2; return; }
     echo -e "\n${CYAN}[当前规则列表]${RESET}"
     grep "name =" "$FRP_INSTALL_DIR/frpc.toml" || { echo "暂无任何转发规则"; sleep 1.5; return; }
     echo
-    read -p "输入要删除的规则名称: " RULE
+    read -p "输入要删除的规则名称: " RULE </dev/tty
     
     if ! grep -q "name = \"$RULE\"" "$FRP_INSTALL_DIR/frpc.toml"; then
         echo -e "${RED}规则 [$RULE] 不存在！${RESET}"
@@ -497,7 +548,6 @@ delete_frpc_rule() {
     sleep 1.5
 } 
 
-# 核心修复：重写基于 FS="=" 的高精度 TOML 块解析器
 print_embedded_rules() {
     if [ -f "$FRP_INSTALL_DIR/frpc.toml" ]; then
         echo -e "${CYAN} 规则名称     | 协议  | 内网端口   | 外网映射端口${RESET}"
@@ -534,11 +584,11 @@ restart_frpc() { [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frpc restart || systemct
 
 log_frps() {
     if [ "$IS_OPENWRT" = "1" ]; then logread | grep frps | tail -n 30 || echo "暂无日志"; else journalctl -u frps -n 40 --no-pager; fi
-    read -p "按回车返回菜单..."
+    read -p "按回车返回菜单..." </dev/tty
 }
 log_frpc() {
     if [ "$IS_OPENWRT" = "1" ]; then logread | grep frpc | tail -n 30 || echo "暂无日志"; else journalctl -u frpc -n 40 --no-pager; fi
-    read -p "按回车返回菜单..."
+    read -p "按回车返回菜单..." </dev/tty
 }
 
 show_frps_dashboard_info() {
@@ -547,24 +597,30 @@ show_frps_dashboard_info() {
     echo -e "${GREEN}       FRPS 面板认证详情        ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     if [ -f "$FRP_INSTALL_DIR/frps.toml" ]; then
+        local DASH_HOST=$(awk -F'=' '/webServer\.addr/{gsub(/[ "]/,"",$2);print $2}' "$FRP_INSTALL_DIR/frps.toml")
         local DASH_PORT=$(awk -F'=' '/webServer\.port/{gsub(/[ "]/,"",$2);print $2}' "$FRP_INSTALL_DIR/frps.toml")
         local DASH_USER=$(awk -F'=' '/webServer\.user/{gsub(/[ "]/,"",$2);print $2}' "$FRP_INSTALL_DIR/frps.toml")
         local DASH_PWD=$(awk -F'=' '/webServer\.password/{gsub(/[ "]/,"",$2);print $2}' "$FRP_INSTALL_DIR/frps.toml")
-        local DASH_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
         
-        echo -e "${GREEN}地址   :${RESET} ${CYAN}http://$DASH_IP:${DASH_PORT:-7500}${RESET}"
-        echo -e "${GREEN}用户名 :${RESET} ${YELLOW}${DASH_USER:-admin}${RESET}"
-        echo -e "${GREEN}密码   :${RESET} ${YELLOW}${DASH_PWD:-admin123}${RESET}"
+        DASH_HOST=${DASH_HOST:-"0.0.0.0"}
+        local DISPLAY_IP=$DASH_HOST
+        if [[ "$DASH_HOST" == "0.0.0.0" ]]; then
+            DISPLAY_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "你的VPS公网IP")
+        fi
+        
+        echo -e "${GREEN}绑定地址 :${RESET} ${CYAN}$DASH_HOST${RESET}"
+        echo -e "${GREEN}访问链接 :${RESET} ${CYAN}http://$DISPLAY_IP:${DASH_PORT:-7500}${RESET}"
+        echo -e "${GREEN}用户名   :${RESET} ${YELLOW}${DASH_USER:-admin}${RESET}"
+        echo -e "${GREEN}密码     :${RESET} ${YELLOW}${DASH_PWD:-admin123}${RESET}"
     else
         echo -e "${RED}未找到配置文件${RESET}"
     fi
     echo -e "${GREEN}================================${RESET}"
-    read -p "按回车返回菜单..."
+    read -p "按回车返回菜单..." </dev/tty
 }
 
 server_menu() {
     while true; do
-        # 每次循环更新一次状态全局变量
         update_status_variables
         clear
         echo -e "${GREEN}================================${RESET}"
@@ -572,11 +628,11 @@ server_menu() {
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN}状态   :${RESET} $G_STATUS"
         echo -e "${GREEN}版本   :${RESET} ${YELLOW}${G_VERSION}${RESET}"
-        echo -e "${GREEN}面板端口:${RESET} ${YELLOW}${G_PORT}${RESET}"
+        echo -e "${GREEN}端口   :${RESET} ${YELLOW}${G_PORT}${RESET}"
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN}1. 安装 FRPS${RESET}"
-        echo -e "${GREEN}2. 更新/同步版本${RESET}"
-        echo -e "${GREEN}3. 初始化配置并启动${RESET}"
+        echo -e "${GREEN}2. 更新 FRPS${RESET}"
+        echo -e "${GREEN}3. 修改配置并重启服务${RESET}"
         echo -e "${GREEN}4. 启动 FRPS 服务${RESET}"
         echo -e "${GREEN}5. 停止 FRPS 服务${RESET}"
         echo -e "${GREEN}6. 重启 FRPS 服务${RESET}"
@@ -586,7 +642,7 @@ server_menu() {
         echo -e "${GREEN}0. 退出${RESET}"
         echo -e "${GREEN}================================${RESET}"
         echo -ne "${GREEN}请输入选项: ${RESET}"
-        read choice
+        read choice </dev/tty
         case $choice in
             1) install_frp ;;
             2) update_frp ;;
@@ -611,27 +667,27 @@ client_menu() {
         echo -e "${CYAN}       FRPC 客户端管理面板      ${RESET}"
         echo -e "${CYAN}================================${RESET}"
         echo -e "${CYAN}状态   :${RESET} $G_STATUS"
-        echo -e "${CYAN}version:${RESET} ${YELLOW}${G_VERSION}${RESET}"
-        echo -e "${CYAN}连接端口:${RESET} ${YELLOW}${G_PORT}${RESET}"
+        echo -e "${CYAN}版本   :${RESET} ${YELLOW}${G_VERSION}${RESET}"
+        echo -e "${CYAN}端口   :${RESET} ${YELLOW}${G_PORT}${RESET}"
         echo -e "${CYAN}================================${RESET}"
         
         print_embedded_rules
         echo -e "${CYAN}================================${RESET}"
         
-        echo -e "${CYAN}1. 安装 FRPC${RESET}"
-        echo -e "${CYAN}2. 更新/同步版本${RESET}"
-        echo -e "${CYAN}3. 初始化公共参数并启动${RESET}"
-        echo -e "${CYAN}4. 新增本地端口转发规则${RESET}"
-        echo -e "${CYAN}5. 删除本地端口转发规则${RESET}"
-        echo -e "${CYAN}6. 启动 FRPC 服务${RESET}"
-        echo -e "${CYAN}7. 停止 FRPC 服务${RESET}"
-        echo -e "${CYAN}8. 重启 FRPC 服务${RESET}"
-        echo -e "${CYAN}9. 查看运行日志${RESET}"
+        echo -e "${CYAN} 1. 安装 FRPC${RESET}"
+        echo -e "${CYAN} 2. 更新 FRPC${RESET}"
+        echo -e "${CYAN} 3. 修改配置${RESET}"
+        echo -e "${CYAN} 4. 新增本地端口转发规则${RESET}"
+        echo -e "${CYAN} 5. 删除本地端口转发规则${RESET}"
+        echo -e "${CYAN} 6. 启动 FRPC 服务${RESET}"
+        echo -e "${CYAN} 7. 停止 FRPC 服务${RESET}"
+        echo -e "${CYAN} 8. 重启 FRPC 服务${RESET}"
+        echo -e "${CYAN} 9. 查看运行日志${RESET}"
         echo -e "${CYAN}10. 卸载 FRPC 服务${RESET}"
-        echo -e "${CYAN}0. 退出${RESET}"
+        echo -e "${CYAN} 0. 退出${RESET}"
         echo -e "${CYAN}================================${RESET}"
         echo -ne "${CYAN}请输入选项: ${RESET}"
-        read choice
+        read choice </dev/tty
         case $choice in
             1) install_frp ;;
             2) update_frp ;;
@@ -650,7 +706,6 @@ client_menu() {
 }
 
 # ---------- 启动主入口 ----------
-create_shortcut
 
 role="$(detect_role)"
 case "$role" in
@@ -658,8 +713,5 @@ case "$role" in
     client) client_menu ;;
     *)
         select_role
-        role2="$(detect_role)"
-        [ "$role2" = "server" ] && server_menu
-        [ "$role2" = "client" ] && client_menu
         ;;
 esac

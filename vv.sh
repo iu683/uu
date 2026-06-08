@@ -1,24 +1,18 @@
-#!/bin/sh
+#!/usr/bin/env bash
 
 # ==============================================================================
-#  cf-warp-rust 一键管理面板 (Alpine Linux OpenRC 专属精简版)
+#  next-socks5 一键管理面板
 # ==============================================================================
 
 # ── 核心环境变量 ──────────────────────────────────────────────────────────────
-export REPO="Shannon-x/cf-warp-rust"
-export SERVICE_NAME="warp-rust"
-export SERVICE_USER="warp"
-export INSTALL_BIN="/usr/local/bin/warp-rust"
-export CONF_DIR="/etc/warp-rust"
+export REPO="ZingerLittleBee/next-socks5"
+export SERVICE_NAME="next-socks5"
+export SERVICE_USER="socks5"
+export INSTALL_BIN="/usr/local/bin/next-socks5"
+export CONF_DIR="/etc/next-socks5"
 export CONF_FILE="${CONF_DIR}/config.toml"
-export DATA_DIR="/var/lib/warp-rust"
-export INIT_FILE="/etc/init.d/${SERVICE_NAME}"
-
-# 透明代理相关变量
-export REDSOCKS_CONF="/etc/redsocks.conf"
-export PROXY_SERVICE_NAME="warp-google-proxy"
-export PROXY_INIT_FILE="/etc/init.d/${PROXY_SERVICE_NAME}"
-export PROXY_RULES_SCRIPT="${DATA_DIR}/warp-google-iptables.sh"
+export DATA_DIR="/var/lib/next-socks5"
+export SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 # ── 终端颜色定义 ──────────────────────────────────
 export RESET='\033[0m'
@@ -28,39 +22,9 @@ export RED='\033[0;31m'
 export BLUE='\033[0;34m'
 export CYAN='\033[0;36m'
 
-# Google IP 段定义（用于 iptables 劫持分流）
-GOOGLE_IPS="
-8.8.4.0/24
-8.8.8.0/24
-34.0.0.0/9
-35.184.0.0/13
-35.192.0.0/12
-35.224.0.0/12
-35.240.0.0/13
-64.233.160.0/19
-66.102.0.0/20
-66.249.64.0/19
-72.14.192.0/18
-74.125.0.0/16
-104.132.0.0/14
-108.177.0.0/17
-142.250.0.0/15
-172.217.0.0/16
-172.253.0.0/16
-173.194.0.0/16
-209.85.128.0/17
-216.58.192.0/19
-216.239.32.0/19
-"
-
 # ── 基础环境校验 ──────────────────────────────────────────────────────────
-if [ "$(id -u)" -ne 0 ]; then
+if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}[错误]${RESET} 请使用 root 权限运行此脚本！" >&2
-    exit 1
-fi
-
-if [ ! -f /etc/alpine-release ]; then
-    echo -e "${RED}[错误]${RESET} 本脚本为 Alpine Linux 专属定制，检测到当前系统不匹配！" >&2
     exit 1
 fi
 
@@ -69,23 +33,49 @@ ok()   { echo -e "${GREEN}[OK]${RESET} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${RESET} $1"; }
 die()  { echo -e "${RED}[ERROR]${RESET} $1" >&2; exit 1; }
 
-# 检查并使用 apk 补齐基础依赖
-REQUIRED_CMDS="curl tar sed grep awk"
-MISSING_PKGS=""
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+    else
+        die "无法识别当前操作系统类型。"
+    fi
+}
+detect_os
+
+REQUIRED_CMDS="curl tar sed grep awk openssl"
+MISSING_CMDS=""
 
 for cmd in $REQUIRED_CMDS; do
-    if ! command -v "$cmd" > /dev/null 2>&1; then
-        case "$cmd" in
-            curl) MISSING_PKGS="$MISSING_PKGS curl" ;;
-            tar) MISSING_PKGS="$MISSING_PKGS tar" ;;
-        esac
+    if ! command -v "$cmd" &> /dev/null; then
+        MISSING_CMDS="$MISSING_CMDS $cmd"
     fi
 done
 
-if [ -n "$MISSING_PKGS" ]; then
-    info "检测到系统缺失必要组件:${YELLOW}$MISSING_PKGS${RESET}，正在通过 apk 自动修复..."
-    apk update -q && apk add --no-cache $MISSING_PKGS >/dev/null 2>&1
-    ok "主程序基础依赖补全成功！"
+if [ -n "$MISSING_CMDS" ]; then
+    info "检测到系统缺失必要组件:${YELLOW}$MISSING_CMDS${RESET}，正在自动修复..."
+    case "$OS" in
+        ubuntu|debian)
+            apt-get update -qy && apt-get install -y $MISSING_CMDS >/dev/null 2>&1
+            ;;
+        centos|rhel|rocky|almalinux|fedora)
+            if command -v dnf &>/dev/null; then
+                dnf install -y $MISSING_CMDS >/dev/null 2>&1
+            else
+                yum install -y $MISSING_CMDS >/dev/null 2>&1
+            fi
+            ;;
+        *)
+            die "未知系统，请手动安装组件: $MISSING_CMDS"
+            ;;
+    esac
+
+    for cmd in $MISSING_CMDS; do
+        if ! command -v "$cmd" &> /dev/null; then
+            die "自动安装 [ $cmd ] 失败，请检查网络源。"
+        fi
+    done
+    ok "基础依赖补全成功！"
 fi
 
 # ── 1. 核心下载与组件解压 ───────────────────────────────────────────────────
@@ -94,7 +84,7 @@ detect_target() {
     case "$ARCH" in
         x86_64)  TARGET="x86_64-unknown-linux-musl" ;;
         aarch64) TARGET="aarch64-unknown-linux-musl" ;;
-        *) die "暂不支持的系统架构: $ARCH (本面板目前仅支持 x86_64 及 aarch64)" ;;
+        *) die "暂不支持的系统架构: $ARCH (面板目前仅支持 x86_64 及 aarch64)" ;;
     esac
 }
 
@@ -102,19 +92,22 @@ fetch_latest_version() {
     info "正在查询 GitHub 获取最新 Release 版本号..."
     TMP_API="$(mktemp)"
     if curl -sSL -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${REPO}/releases/latest" > "$TMP_API"; then
-        VERSION="$(grep -o '"tag_name": *"[^"]*"' "$TMP_API" | head -n 1 | cut -d'"' -f4)"
+        VERSION="$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$TMP_API" | head -n 1)"
     fi
     rm -f "$TMP_API"
 
     if [ -z "$VERSION" ]; then
-        warn "通过 API 获取最新版本号失败，尝试网页流解析..."
+        warn "API 获取失败，尝试网页流解析..."
         VERSION=$(curl -sS "https://github.com/${REPO}/releases/latest" 2>/dev/null | grep -o 'tag/[vV]*[0-9.]*' | awk -F '/' 'NR==1 {print $2}')
     fi
 
     if [ -z "$VERSION" ]; then
-        die "无法获取最新版本号，请检查 network 连通性。"
+        VERSION="v0.1.3"
     fi
     export VERSION
+    
+    [ -d "$CONF_DIR" ] || install -m 0755 -d "$CONF_DIR"
+    echo "$VERSION" > "${CONF_DIR}/.version" 2>/dev/null
 }
 
 download_and_extract() {
@@ -122,623 +115,370 @@ download_and_extract() {
     fetch_latest_version
     info "正在匹配系统环境形态: ${YELLOW}${TARGET}${RESET}"
 
-    ASSET="warp-rust-${VERSION}-${TARGET}.tar.gz"
+    ASSET="next-socks5-${TARGET}.tar.gz"
     URL_TGZ="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
-    URL_SHA="${URL_TGZ}.sha256"
 
     TMP="$(mktemp -d)"
     trap 'rm -rf "$TMP"' EXIT
 
     info "开始同步下载资产包..."
-    curl -fsSL -o "$TMP/$ASSET" "$URL_TGZ" || die "下载资产包失败！请检查 network 或版本 ${VERSION} 是否存在该架构。"
-    
-    if curl -fsSL -o "$TMP/$ASSET.sha256" "$URL_SHA" > /dev/null 2>&1; then
-        if command -v sha256sum > /dev/null 2>&1; then
-            LOCAL_SHA=$(sha256sum "$TMP/$ASSET" | awk '{print $1}')
-            REMOTE_SHA=$(awk '{print $1}' "$TMP/$ASSET.sha256")
-            if [ "$LOCAL_SHA" = "$REMOTE_SHA" ]; then
-                ok "数字签名校验通过。"
-            fi
-        fi
-    fi
+    curl -fsSL -o "$TMP/$ASSET" "$URL_TGZ" || die "下载资产包失败！"
 
     tar xzf "$TMP/$ASSET" -C "$TMP"
-    EXTRACTED_BIN=$(find "$TMP" -type f -name "warp-rust" | head -n 1)
-    [ -n "$EXTRACTED_BIN" ] || die "解压成功，但在归档包内未找到 warp-rust 主程序！"
+    EXTRACTED_BIN=$(find "$TMP" -type f -name "next-socks5" | head -n 1)
+    [ -n "$EXTRACTED_BIN" ] || die "解压成功，但在归档包内未找到 next-socks5 主程序！"
     export TARGET_BIN_PATH="$EXTRACTED_BIN"
 }
 
-# ── 2. 配置文件生成器 ─────────────────────────────────────────────────────────
+# ── 2. TOML 配置文件生成器 ──────────────────────────────────────────────────
 write_config() {
     local bind_ip="$1" local bind_port="$2" local username="$3" local password="$4"
     [ -d "$CONF_DIR" ] || install -m 0755 -d "$CONF_DIR"
     
     cat <<EOF > "$CONF_FILE"
-[server]
-bind = "${bind_ip}:${bind_port}"
+listen = "${bind_ip}:${bind_port}"
+
+[auth]
 EOF
+
     if [ -n "$username" ] && [ -n "$password" ]; then
         cat <<EOF >> "$CONF_FILE"
-
-[server.auth]
+method = "password"
+[[auth.users]]
 username = "${username}"
 password = "${password}"
 EOF
+    else
+        cat <<EOF >> "$CONF_FILE"
+method = "none"
+EOF
     fi
+
     cat <<EOF >> "$CONF_FILE"
 
-[logging]
-level = "warn,warp_rust=info,wireguard_netstack=warn"
-format = "pretty"
+[timeouts]
+connect_ms = 10000
+tcp_idle_ms = 300000
+udp_idle_ms = 60000
 
-[warp]
-data_dir = "${DATA_DIR}"
-device_model = "warp-rust"
-refresh_interval = "24h"
-register_cooldown = "10m"
-mtu = 1420
-tcp_buffer_size = 1048576
-
-[health]
-interval = "30s"
-timeout = "8s"
-
-[recovery]
-reconnect_after        = 1
-rebuild_config_after   = 3
-reregister_after       = 5
-rotate_identity_after  = 10
-backoff_min = "500ms"
-backoff_max = "30s"
-
-[metrics]
-enabled = true
-bind = "127.0.0.1:9090"
-
-[hot_reload]
-enabled = true
-
-[limits]
-max_concurrent_connections = 1024
-handshake_timeout = "10s"
-idle_timeout = "300s"
-relay_buffer_size = 262144
-auth_fail_sleep = "1s"
-relay_close_grace = "500ms"
-
-[dns]
-mode = "system"
-servers = ["1.1.1.1:53", "1.0.0.1:53"]
-timeout = "3s"
-cache_ttl = "60s"
+[udp]
+# port_range = "40000-40100"      # bind UDP relay sockets to this range
+# advertise = "YOUR_PUBLIC_IP"    # advertised BND IP for clients behind NAT
 EOF
 }
 
-write_openrc() {
-    cat <<'EOF' > "$INIT_FILE"
-#!/sbin/openrc-run
+write_systemd() {
+    cat <<EOF > "$SERVICE_FILE"
+[Unit]
+Description=next-socks5 - Fast and Lightweight SOCKS5 Server
+After=network.target network-online.target
+Wants=network-online.target
 
-description="cf-warp-rust Cloudflare WARP Proxy Client"
-command="/usr/local/bin/warp-rust"
-command_args="--config /etc/warp-rust/config.toml"
-command_background="yes"
-directory="/var/lib/warp-rust"
-pidfile="/run/warp-rust.pid"
+[Service]
+Type=simple
+User=${SERVICE_USER}
+Group=${SERVICE_USER}
+WorkingDirectory=${DATA_DIR}
+ExecStart=${INSTALL_BIN} serve --config ${CONF_FILE} --no-tui
+Restart=always
+RestartSec=3s
+LimitNOFILE=65535
 
-# Alpine 专属：指定将 warp-rust 的标准/错误输出全部重定向输出到独立日志文件
-output_log="/var/log/warp-rust.log"
-error_log="/var/log/warp-rust.log"
-
-depend() {
-    need net
-    after firewall
-}
-
-start_pre() {
-    checkpath -d -m 0750 -o warp:warp /var/lib/warp-rust
-    checkpath -f -m 0640 -o warp:warp /var/log/warp-rust.log
-}
+[Install]
+WantedBy=multi-user.target
 EOF
-    chmod +x "$INIT_FILE"
-    rc-update add "$SERVICE_NAME" default >/dev/null 2>&1
+    systemctl daemon-reload
+    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
 }
 
-# ── 3. 透明代理二级专属菜单控制中心 ──────────────────────────────────────────────
-start_transparent_proxy() {
-    if rc-service "$PROXY_SERVICE_NAME" status >/dev/null 2>&1; then
-        warn "Google 透明分流代理已经处于启动运行状态，无需重复启动。"
-        return
-    fi
+# ── 节点配置总结报告 ──────────────────────────────────────────────────────────
+print_node_summary() {
+    if [ ! -f "$CONF_FILE" ]; then return; fi
 
-    if ! rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
-        warn "核心 WARP-Rust 未在后台运行！透明代理依赖底层代理通道，请先开启主服务。"
-        return
-    fi
-
-    local current_bind
-    current_bind=$(grep -i 'bind' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
-    local warp_ip="${current_bind%%:*}" local warp_port="${current_bind##*:}"
-    [ -z "$warp_port" ] && warp_port="1080"
-    [ -z "$warp_ip" ] && warp_ip="127.0.0.1"
-
-    local has_auth
-    has_auth=$(grep -i 'username' "$CONF_FILE" | head -n 1)
-    if [ -n "$has_auth" ] && [ "$warp_ip" != "127.0.0.1" ] && [ "$warp_ip" != "localhost" ]; then
-        warn "当前 WARP 节点开启了账号密码鉴权。透明分流暂不支持有密公网代理。"
-        warn "建议在主菜单 [4.修改配置] 中将监听 IP 切换回 127.0.0.1 并不设置密码后再试。"
-        return
-    fi
-
-    info "正在检查并安装 Alpine 透明代理核心组件 (redsocks / iptables)..."
-    local proxy_missing=""
-    if ! command -v redsocks >/dev/null 2>&1; then proxy_missing="$proxy_missing redsocks"; fi
-    if ! command -v iptables >/dev/null 2>&1; then proxy_missing="$proxy_missing iptables"; fi
-
-    if [ -n "$proxy_missing" ]; then
-        info "正在为 Alpine 系统补齐透明分流组件群:${YELLOW}$proxy_missing${RESET}..."
-        apk add --no-cache $proxy_missing >/dev/null 2>&1
-    fi
-
-    local system_iptables
-    system_iptables=$(command -v iptables)
-    if [ -z "$system_iptables" ]; then
-        die "透明代理所需核心网络组件安装失败，请检查 Alpine 镜像源网络环境。"
-    fi
-
-    if rc-service redsocks status >/dev/null 2>&1; then
-        rc-service redsocks stop >/dev/null 2>&1
-        rc-update del redsocks default >/dev/null 2>&1
-    fi
-
-    # 全面清理残留的独立守护进程与锁文件，防止 start-stop-daemon 冲突
-    if command -v killall >/dev/null 2>&1; then
-        killall -9 redsocks >/dev/null 2>&1
-    else
-        pkill -9 redsocks >/dev/null 2>&1
-    fi
-    rm -f /run/warp-google-proxy.pid
-
-    info "阻断并优化系统的 Google IPv6 路由解析..."
-    ip -6 route add blackhole 2607:f8b0::/32 2>/dev/null || true
-    if [ -f /etc/gai.conf ]; then
-        if ! grep -q "precedence ::ffff:0:0/96  100" /etc/gai.conf; then
-            echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
-        fi
-    fi
-
-    # 生成 redsocks 配置
-    cat <<EOF > "$REDSOCKS_CONF"
-base {
-    log_debug = off;
-    log_info = on;
-    log = "syslog:daemon";
-    daemon = off;
-    redirector = iptables;
-}
-redsocks {
-    local_ip = 127.0.0.1;
-    local_port = 12345;
-    ip = 127.0.0.1;
-    port = ${warp_port};
-    type = socks5;
-}
-EOF
-
-    # 封装独立的高性能防火墙控制脚本
-    [ -d "$DATA_DIR" ] || mkdir -p "$DATA_DIR"
-    cat <<EOF > "$PROXY_RULES_SCRIPT"
-#!/bin/sh
-ACTION=\$1
-IPT_BIN="${system_iptables}"
-GOOGLE_IPS="
-8.8.4.0/24
-8.8.8.0/24
-34.0.0.0/9
-35.184.0.0/13
-35.192.0.0/12
-35.224.0.0/12
-35.240.0.0/13
-64.233.160.0/19
-66.102.0.0/20
-66.249.64.0/19
-72.14.192.0/18
-74.125.0.0/16
-104.132.0.0/14
-108.177.0.0/17
-142.250.0.0/15
-172.217.0.0/16
-172.253.0.0/16
-173.194.0.0/16
-209.85.128.0/17
-216.58.192.0/19
-216.239.32.0/19
-"
-
-if [ "\$ACTION" = "start" ]; then
-    \$IPT_BIN -t nat -N WARP_GOOGLE 2>/dev/null
-    \$IPT_BIN -t nat -F WARP_GOOGLE
-    for ip in \$GOOGLE_IPS; do
-        \$IPT_BIN -t nat -A WARP_GOOGLE -d \$ip -p tcp -j REDIRECT --to-ports 12345
-    done
-    \$IPT_BIN -t nat -C OUTPUT -j WARP_GOOGLE 2>/dev/null || \$IPT_BIN -t nat -A OUTPUT -j WARP_GOOGLE
-elif [ "\$ACTION" = "stop" ]; then
-    \$IPT_BIN -t nat -D OUTPUT -j WARP_GOOGLE 2>/dev/null
-    \$IPT_BIN -t nat -F WARP_GOOGLE 2>/dev/null
-    \$IPT_BIN -t nat -X WARP_GOOGLE 2>/dev/null
-fi
-EOF
-    chmod +x "$PROXY_RULES_SCRIPT"
-
-    # 动态捕获真正的 redsocks 可执行程序路径
-    local real_redsocks
-    real_redsocks=$(command -v redsocks)
-    [ -z "$real_redsocks" ] && real_redsocks="/usr/bin/redsocks"
-
-    cat <<EOF > "$PROXY_INIT_FILE"
-#!/sbin/openrc-run
-
-description="Cloudflare WARP Google Transparent Proxy (Redsocks Engine)"
-command="${real_redsocks}"
-command_args="-c /etc/redsocks.conf"
-command_background="yes"
-pidfile="/run/warp-google-proxy.pid"
-
-depend() {
-    need net warp-rust
-}
-
-start_post() {
-    /var/lib/warp-rust/warp-google-iptables.sh start
-}
-
-stop_post() {
-    /var/lib/warp-rust/warp-google-iptables.sh stop
-}
-EOF
-    chmod +x "$PROXY_INIT_FILE"
-    rc-update add "$PROXY_SERVICE_NAME" default >/dev/null 2>&1
+    # 🛠 修复点：改用严格的 awk 状态机精准提取 TOML 中的 listen 端口
+    local bind_port
+    bind_port=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); split($2, a, ":"); print a[length(a)]}' "$CONF_FILE")
+    [ -z "$bind_port" ] && bind_port="16216"
     
-    info "正在拉起透明代理引擎..."
-    rc-service "$PROXY_SERVICE_NAME" restart
+    # 🛠 修复点：精准判定鉴权模式
+    local auth_method
+    auth_method=$(awk -F '=' '/^[[:space:]]*method[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
     
-    sleep 1.5
-    if rc-service "$PROXY_SERVICE_NAME" status >/dev/null 2>&1; then
-        ok "Google 透明分流代理已彻底成功启动并挂载！"
+    local auth_user="" local auth_pass=""
+    if [ "$auth_method" = "password" ]; then
+        # 🛠 修复点：通过强大的 awk 块匹配，完美剥离外部双引号，精准提取账号密码
+        auth_user=$(awk -F '=' '/^[[:space:]]*username[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
+        auth_pass=$(awk -F '=' '/^[[:space:]]*password[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
+    fi
+
+    local public_ip
+    public_ip=$(curl -s --max-time 5 ipinfo.io/ip || curl -s --max-time 5 api.ipify.org || echo "你的公网IP")
+
+    echo -e "\n${GREEN}====== 当前配置详情 ======${RESET}"
+    echo -e "${GREEN}IP地址       :${RESET} ${public_ip}"
+    echo -e "${GREEN}端口         :${RESET} ${bind_port}"
+    if [ -n "$auth_user" ]; then
+        echo -e "${GREEN}用户名       :${RESET} ${auth_user}"
+        echo -e "${GREEN}密码         :${RESET} ${auth_pass}"
     else
-        warn "透明代理拉起异常，请检查系统 syslog 查看错误日志。"
+        echo -e "${GREEN}鉴权模式     :${RESET} ${YELLOW}无密码 (免密模式)${RESET}"
     fi
-}
-
-stop_transparent_proxy() {
-    if ! rc-service "$PROXY_SERVICE_NAME" status >/dev/null 2>&1; then
-        warn "Google 透明代理本来就处于关闭状态。"
-        return
-    fi
-    rc-service "$PROXY_SERVICE_NAME" stop
-    rc-update del "$PROXY_SERVICE_NAME" default >/dev/null 2>&1
-    ok "Google 透明代理已被安全停止，系统 NetFilter 劫持链已完全卸载。"
-}
-
-verify_transparent_proxy() {
-    echo -e "\n${CYAN}========= 透明代理链路深度验证 =========${RESET}"
+    echo -e "${GREEN}分享存放路径 :${RESET} ${CONF_FILE}"
+    echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
     
-    info "1. 正在检索系统 iptables 劫持规则 status..."
-    local system_iptables
-    system_iptables=$(command -v iptables)
-    if [ -n "$system_iptables" ] && "$system_iptables" -t nat -L OUTPUT -n | grep -q "WARP_GOOGLE"; then
-        echo -e "   iptables 拦截链: ${GREEN}✔ 正常挂载 (已接管系统 OUTPUT 流量)${RESET}"
+    echo -e "${GREEN}====== 👉 通用客户端 Socks5 链接 ======${RESET}"
+    if [ -n "$auth_user" ]; then
+        echo -e "${YELLOW}socks://${auth_user}:${auth_pass}@${public_ip}:${bind_port}#uu-socks5${RESET}"
     else
-        echo -e "   iptables 拦截链: ${RED}✘ 未挂载 (Google 流量目前处于直连状态)${RESET}"
+        echo -e "${YELLOW}socks://${public_ip}:${bind_port}#uu-socks5${RESET}"
     fi
-
-    info "2. 正在通过链路层测试 Google 真实连通性 (直接请求)..."
-    local http_status
-    http_status=$(curl -o /dev/null -s -w "%{http_code}" --max-time 5 "https://www.google.com")
-
-    if [ "$http_status" -eq 200 ] || [ "$http_status" -eq 301 ] || [ "$http_status" -eq 302 ]; then
-        echo -e "   联通性测试结果: ${GREEN}✔ 成功连接 (HTTP 状态码: ${http_status})${RESET}"
-        local total_time
-        total_time=$(curl -o /dev/null -s -w "%{time_total}" --max-time 5 "https://www.google.com")
-        echo -e "   透明代理端延迟: ${YELLOW}${total_time} 秒${RESET}"
+    
+    echo -e "${GREEN}====== 🚀 Telegram 内置一键代理链接 ======${RESET}"
+    if [ -n "$auth_user" ]; then
+        echo -e "${YELLOW}https://t.me/socks?server=${public_ip}&port=${bind_port}&user=${auth_user}&pass=${auth_pass}${RESET}"
     else
-        echo -e "   联通性测试结果: ${RED}✘ 失败 (无法连接 Google，状态码: ${http_status:-超时/断流})${RESET}"
-        warn "提示: 请检查主核心 WARP 账户是否有效，或主服务是否真的获取到了 Cloudflare 的网络分配。"
+        echo -e "${YELLOW}https://t.me/socks?server=${public_ip}&port=${bind_port}${RESET}"
     fi
-    echo -e "${CYAN}========================================${RESET}"
+    echo ""
+
 }
 
-menu_transparent_proxy_center() {
-    while true; do
-        clear
-        local proxy_status="${RED}未运行${RESET}"
-        if rc-service "$PROXY_SERVICE_NAME" status >/dev/null 2>&1; then
-            proxy_status="${YELLOW}运行中 (已自动接管 Google IP 流量)${RESET}"
-        fi
-
-        echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN}      Google 透明代理管理控制菜单       ${RESET}"
-        echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN}当前状态 :${RESET} $proxy_status"
-        echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN}1. 开启透明代理${RESET}"
-        echo -e "${GREEN}2. 关闭透明代理${RESET}"
-        echo -e "${GREEN}3. 查看并验证代理连通性${RESET}"
-        echo -e "${GREEN}0. 返回主菜单${RESET}"
-        echo -e "${GREEN}=====================================${RESET}"
-        
-        read -r -p "$(echo -e "${GREEN}请输入子选项: ${RESET}")" sub_choice
-        case "$sub_choice" in
-            1) start_transparent_proxy ;;
-            2) stop_transparent_proxy ;;
-            3) verify_transparent_proxy ;;
-            0|*) return ;;
-        esac
-        read -p "$(echo -e "${GREEN}按任意键继续...${RESET}")" -n 1 -r
-    done
-}
-
-# ── 4. 面板常规功能模块 ──────────────────────────────────────────────────────
+# ── 3. 面板核心数据抓取 ───────────────────────────────────────────────────────
 get_status_info() {
-    if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
         panel_status="${GREEN}运行中${RESET}"
     else
         panel_status="${RED}未运行${RESET}"
     fi
 
-    if rc-service "$PROXY_SERVICE_NAME" status >/dev/null 2>&1; then
-        panel_status="${panel_status} ${GREEN}| 透明分流:已开启${RESET}"
-    else
-        panel_status="${panel_status} ${GREEN}| 透明分流:未开启${RESET}"
-    fi
-
     if [ -f "$INSTALL_BIN" ]; then
-        local raw_ver
-        raw_ver=$("$INSTALL_BIN" --version 2>/dev/null | awk '{print $2}')
-        panel_version="${raw_ver:-已安装}"
+        if [ -f "${CONF_DIR}/.version" ]; then
+            panel_version=$(cat "${CONF_DIR}/.version")
+        else
+            local raw_ver
+            raw_ver=$("$INSTALL_BIN" --version 2>/dev/null | grep -oE '[vV]?[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+            if [ -n "$raw_ver" ]; then
+                panel_version="$raw_ver"
+                echo "$raw_ver" > "${CONF_DIR}/.version" 2>/dev/null
+            else
+                panel_version="v0.1.3"
+            fi
+        fi
     else
         panel_version="${RED}未安装${RESET}"
     fi
 
     if [ -f "$CONF_FILE" ]; then
-        panel_port=$(grep -i 'bind' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ' )
+        panel_port=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
     else
-        panel_port="127.0.0.1:1080"
+        panel_port="0.0.0.0:未设定"
     fi
 }
 
 menu_install() {
     if [ -f "$INSTALL_BIN" ]; then
-        warn "系统中已存在运行中的实例文件。"
+        warn "系统中已存在安装好的实例文件。"
         read -r -p "$(echo -e "${GREEN}是否确定完全覆盖重新安装？[y/N]: ${RESET}")" res
         [[ "$res" =~ ^[Yy]$ ]] || return
     fi
 
     echo -e "\n${GREEN}==== [自定义安装配置] ====${RESET}"
-    read -r -p "$(echo -e "${GREEN}请输入监听 IP 地址 [默认: 127.0.0.1]: ${RESET}")" input_ip
-    local opt_ip="${input_ip:-127.0.0.1}"
+    read -r -p "$(echo -e "${GREEN}请输入监听 IP 地址 [默认 ::]: ${RESET}")" input_ip
+    local opt_ip="${input_ip:-::}"
 
-    read -r -p "$(echo -e "${GREEN}请输入 SOCKS5 监听端口 [默认: 1080]: ${RESET}")" input_port
-    local opt_port="${input_port:-1080}"
+    local rand_port=$((RANDOM % 50001 + 10000))
+    read -r -p "$(echo -e "${GREEN}请输入 SOCKS5 监听端口 [回车默认随机端口: ${rand_port}]: ${RESET}")" input_port
+    local opt_port="${input_port:-$rand_port}"
     if ! [[ "$opt_port" =~ ^[0-9]+$ ]] || [ "$opt_port" -le 0 ] || [ "$opt_port" -gt 65535 ]; then
-        opt_port=1080
+        opt_port=$rand_port
     fi
 
+    local rand_user="user_$(openssl rand -hex 4)"
+    local rand_pass="$(openssl rand -hex 10)"
     local opt_user="" local opt_pass=""
-    if [ "$opt_ip" != "127.0.0.1" ] && [ "$opt_ip" != "localhost" ]; then
-        echo -e "${YELLOW}[安全审计] 检测到公网绑定，必须强制设置鉴权！${RESET}"
-        while true; do
-            read -r -p "$(echo -e "${GREEN}请输入鉴权用户名: ${RESET}")" opt_user
-            [ -n "$opt_user" ] && break
-        done
-        while true; do
-            read -r -p "$(echo -e "${GREEN}请输入鉴权密码 (≥16位): ${RESET}")" opt_pass
-            if [ "${#opt_pass}" -ge 16 ]; then break; fi
-        done
+
+    read -r -p "$(echo -e "${GREEN}请输入自定义用户名 [回车默认随机: ${YELLOW}${rand_user}${GREEN}, 输入 ${RED}none${GREEN} 选免密]: ${RESET}")" input_user
+    if [ -z "$input_user" ]; then
+        opt_user="$rand_user"
+        read -r -p "$(echo -e "${GREEN}请输入自定义密码 [回车默认随机: ${YELLOW}${rand_pass}${GREEN}]: ${RESET}")" input_pass
+        opt_pass="${input_pass:-$rand_pass}"
+    elif [ "$input_user" = "none" ]; then
+        opt_user=""
+        opt_pass=""
     else
-        read -r -p "$(echo -e "${GREEN}请输入鉴权用户名 (本地回环默认留空免密): ${RESET}")" opt_user
-        if [ -n "$opt_user" ]; then
-            read -r -p "$(echo -e "${GREEN}请输入鉴权密码: ${RESET}")" opt_pass
-        fi
+        opt_user="$input_user"
+        read -r -p "$(echo -e "${GREEN}请输入自定义密码 [回车默认随机: ${YELLOW}${rand_pass}${GREEN}]: ${RESET}")" input_pass
+        opt_pass="${input_pass:-$rand_pass}"
     fi
 
     download_and_extract
 
     if ! id "$SERVICE_USER" >/dev/null 2>&1; then
-        addgroup -S "$SERVICE_USER" 2>/dev/null || true
-        adduser -S -G "$SERVICE_USER" -H -s /sbin/nologin "$SERVICE_USER" 2>/dev/null || true
+        useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER" 2>/dev/null \
+          || adduser --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
     fi
 
     install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$INSTALL_BIN"
     install -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" -d "$DATA_DIR"
     write_config "$opt_ip" "$opt_port" "$opt_user" "$opt_pass"
-    write_openrc
+    write_systemd
 
     info "正在拉起后台服务..."
-    rc-service "$SERVICE_NAME" restart
+    systemctl start "$SERVICE_NAME"
     
     local is_ok=1
-    for i in 1 2 3 4 5; do
-        if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then is_ok=0; break; fi
+    for i in {1..5}; do
+        if systemctl is-active --quiet "$SERVICE_NAME"; then is_ok=0; break; fi
         sleep 1
     done
 
     if [ "$is_ok" -eq 0 ]; then
-        ok "CF-WARP-Rust 安全部署成功！"
+        ok "next-socks5 代理服务部署成功！"
+        print_node_summary
     else
-        warn "部署完成，但初始化较慢，请稍后选择 [8] 查看控制台输出。"
+        warn "部署完成，但初始化响应异常，请稍后选择 [8] 查看实时日志。"
     fi
 }
 
 menu_update() {
-    [ -f "$INIT_FILE" ] || die "未检测到系统服务，请先选择 [1] 进行安装。"
+    [ -f "$SERVICE_FILE" ] || die "未检测到系统服务，请先选择 [1] 进行完整安装。"
     download_and_extract
-    rc-service "$SERVICE_NAME" stop
+    systemctl stop "$SERVICE_NAME"
     install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$INSTALL_BIN"
-    rc-service "$SERVICE_NAME" start
-    ok "组件已成功平滑更新。"
+    systemctl start "$SERVICE_NAME"
+    ok "next-socks5 核心主程序已完成平滑更新。"
 }
 
 menu_uninstall() {
-    rc-service "$PROXY_SERVICE_NAME" stop >/dev/null 2>&1
-    rc-update del "$PROXY_SERVICE_NAME" default >/dev/null 2>&1
-    rm -f "$PROXY_INIT_FILE" "$REDSOCKS_CONF" "$PROXY_RULES_SCRIPT"
-
-    rc-service "$SERVICE_NAME" stop >/dev/null 2>&1
-    rc-update del "$SERVICE_NAME" default >/dev/null 2>&1
-    rm -f "$INSTALL_BIN" "$INIT_FILE"
-    rm -f /var/log/warp-rust.log
-    
+    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1
+    systemctl disable "$SERVICE_NAME" >/dev/null 2>&1
+    rm -f "$INSTALL_BIN" "$SERVICE_FILE"
+    systemctl daemon-reload
     rm -rf "$CONF_DIR" "$DATA_DIR"
-    deluser "$SERVICE_USER" >/dev/null 2>&1
-    ok "主程序与透明代理规则已全部清理卸载完毕。"
+    userdel "$SERVICE_USER" >/dev/null 2>&1
+    ok "next-socks5 核心组件及配置文件已全部安全卸载收回。"
 }
 
 menu_edit_config() {
     [ -f "$CONF_FILE" ] || die "未发现任何配置文件，请先执行安装步骤。"
+    
     local current_bind
-    current_bind=$(grep -i 'bind' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    current_bind=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
     local current_ip="${current_bind%%:*}" local current_port="${current_bind##*:}"
-    local current_user
-    current_user=$(grep -i 'username' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
-    local current_pass
-    current_pass=$(grep -i 'password' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    
+    local current_method
+    current_method=$(awk -F '=' '/^[[:space:]]*method[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
+    
+    local current_user="" local current_pass=""
+    if [ "$current_method" = "password" ]; then
+        current_user=$(awk -F '=' '/^[[:space:]]*username[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
+        current_pass=$(awk -F '=' '/^[[:space:]]*password[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
+    fi
 
-    [ -z "$current_ip" ] && current_ip="127.0.0.1"
+    [ -z "$current_ip" ] && current_ip="::"
     [ -z "$current_port" ] && current_port="1080"
 
     echo -e "\n${GREEN}==== [修改内核参数配置] ====${RESET}"
     read -r -p "$(echo -e "${GREEN}请输入监听 IP 地址 [当前: ${current_ip}]: ${RESET}")" input_ip
     local opt_ip="${input_ip:-$current_ip}"
 
-    read -r -p "$(echo -e "${GREEN}请输入 SOCKS5 监听端口 [当前: ${current_port}]: ${RESET}")" input_port
-    local opt_port="${input_port:-$current_port}"
-    if ! [[ "$opt_port" =~ ^[0-9]+$ ]] || [ "$opt_port" -le 0 ] || [ "$opt_port" -gt 65535 ]; then
-        opt_port="$current_port"
+    local rand_port=$((RANDOM % 50001 + 10000))
+    read -r -p "$(echo -e "${GREEN}请输入 SOCKS5 监听端口 [当前: ${current_port}, 回车保持原样, 输入 ${YELLOW}rand${GREEN} 随机重置]: ${RESET}")" input_port
+    local opt_port="$current_port"
+    if [ "$input_port" = "rand" ]; then
+        opt_port="$rand_port"
+    elif [ -n "$input_port" ]; then
+        if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -gt 0 ] && [ "$input_port" -le 65535 ]; then
+            opt_port="$input_port"
+        fi
     fi
 
+    local rand_user="user_$(openssl rand -hex 4)"
+    local rand_pass="$(openssl rand -hex 10)"
     local opt_user="" local opt_pass=""
-    if [ "$opt_ip" != "127.0.0.1" ] && [ "$opt_ip" != "localhost" ]; then
-        echo -e "${YELLOW}[安全审计] 公网暴露下必须强制设定鉴权密码！${RESET}"
-        while true; do
-            read -r -p "$(echo -e "${GREEN}请输入用户名 [当前: ${current_user}]: ${RESET}")" input_user
-            opt_user="${input_user:-$current_user}"
-            [ -n "$opt_user" ] && break
-        done
-        while true; do
-            read -r -p "$(echo -e "${GREEN}请输入鉴权密码 [直接回车保持原样]: ${RESET}")" input_pass
-            opt_pass="${input_pass:-$current_pass}"
-            if [ "${#opt_pass}" -ge 16 ]; then break; fi
-        done
-    else
+
+    read -r -p "$(echo -e "${GREEN}请输入用户名 [当前: ${current_user:-无密码}, 输入 ${RED}none${GREEN} 切换为无密码, 回车默认随机]: ${RESET}")" input_user
+    if [ -z "$input_user" ]; then
         if [ -n "$current_user" ]; then
-            read -r -p "$(echo -e "${GREEN}请输入用户名 [当前: ${current_user}，回车不变，输入 ${RED}none${GREEN} 清除鉴权]: ${RESET}")" input_user
-            if [ -z "$input_user" ]; then
-                opt_user="$current_user" opt_pass="$current_pass"
-            elif [ "$input_user" = "none" ]; then
-                opt_user="" opt_pass=""
-            else
-                opt_user="$input_user"
-                read -r -p "$(echo -e "${GREEN}请输入新密码: ${RESET}")" opt_pass
-            fi
+            opt_user="$current_user" opt_pass="$current_pass"
         else
-            read -r -p "$(echo -e "${GREEN}请输入鉴权用户名 (留空默认不启用): ${RESET}")" opt_user
-            if [ -n "$opt_user" ]; then read -r -p "$(echo -e "${GREEN}请输入鉴权密码: ${RESET}")" opt_pass; fi
+            opt_user="$rand_user" opt_pass="$rand_pass"
         fi
+    elif [ "$input_user" = "none" ]; then
+        opt_user="" opt_pass=""
+    else
+        opt_user="$input_user"
+        read -r -p "$(echo -e "${GREEN}请输入新密码 [回车默认随机]: ${RESET}")" input_pass
+        opt_pass="${input_pass:-$rand_pass}"
     fi
 
     write_config "$opt_ip" "$opt_port" "$opt_user" "$opt_pass"
-    if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
-        rc-service "$SERVICE_NAME" restart
-        if rc-service "$PROXY_SERVICE_NAME" status >/dev/null 2>&1; then
-            rc-service "$PROXY_SERVICE_NAME" restart
-        fi
-        ok "配置已覆盖，全套服务已同步 OpenRC 重启生效！"
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        systemctl restart "$SERVICE_NAME"
+        ok "配置已覆盖，全套代理服务已同步重启生效！"
+        print_node_summary
     else
         ok "配置已成功重写更新。"
     fi
 }
 
-menu_show_logs() {
-    local log_file="/var/log/warp-rust.log"
-    echo -e "\n${YELLOW}[正在读取服务实时日志输出，按 Ctrl+C 退出查看...]${RESET}\n"
-    if [ -f "$log_file" ]; then
-        # 显示最后50行并实时追加滚动
-        tail -n 50 -f "$log_file"
-    else
-        warn "未检测到日志文件，请确认服务是否成功启动过。"
-    fi
-}
-
 menu_show_node_config() {
-    if [ ! -f "$CONF_FILE" ]; then die "未检测到有效的服务配置文件。"; fi
-    echo -e "\n${GREEN}========= 当前节点本地配置 =========${RESET}"
-    grep -A 5 "\[server\]" "$CONF_FILE"
-    echo -e "${GREEN}====================================${RESET}"
+    if [ ! -f "$CONF_FILE" ]; then 
+        die "未检测到有效的服务配置文件，请先执行选择 [1] 进行完整安装。"
+    fi
+
+    print_node_summary
 
     local full_bind
-    full_bind=$(grep -i 'bind' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    full_bind=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
     local bind_ip="${full_bind%%:*}" local bind_port="${full_bind##*:}"
     local connect_ip="$bind_ip"
     if [ "$connect_ip" = "0.0.0.0" ]; then connect_ip="127.0.0.1"; fi
 
-    local auth_user
-    auth_user=$(grep -i 'username' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
-    local auth_pass
-    auth_pass=$(grep -i 'password' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    local auth_method
+    auth_method=$(awk -F '=' '/^[[:space:]]*method[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
+    
+    local auth_user="" local auth_pass=""
+    if [ "$auth_method" = "password" ]; then
+        auth_user=$(awk -F '=' '/^[[:space:]]*username[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
+        auth_pass=$(awk -F '=' '/^[[:space:]]*password[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
+    fi
 
     local proxy_args="--socks5-hostname ${connect_ip}:${bind_port}"
     if [ -n "$auth_user" ] && [ -n "$auth_pass" ]; then
         proxy_args="--socks5-hostname ${auth_user}:${auth_pass}@${connect_ip}:${bind_port}"
     fi
 
-    echo -e "\n${YELLOW}[正在通过本地代理验证流量连通性...]${RESET}"
-    TMP_TRACE="$(mktemp)"
-    if curl -sS --max-time 6 $proxy_args "https://1.1.1.1/cdn-cgi/trace" > "$TMP_TRACE" 2>&1; then
-        local trace_ip
-        trace_ip=$(grep -i '^ip=' "$TMP_TRACE" | awk -F '=' '{print $2}')
-        local trace_warp
-        trace_warp=$(grep -i '^warp=' "$TMP_TRACE" | awk -F '=' '{print $2}')
-        local trace_colo
-        trace_colo=$(grep -i '^colo=' "$TMP_TRACE" | awk -F '=' '{print $2}')
-
-        echo -e "\n${GREEN}========= Cloudflare 真实性报告 =========${RESET}"
-        if [ "$trace_warp" = "on" ] || [ "$trace_warp" = "plus" ]; then
-            echo -e " 隧道验证状态 :  ${GREEN}✔ 通过 (流量确实从 Cloudflare 网络流出)${RESET}"
-            echo -e " WARP 激活状态:  ${GREEN}${trace_warp}${RESET}"
-        else
-            echo -e " 隧道验证状态 :  ${RED}✘ 未通过 (可能没有走代理隧道)${RESET}"
-            echo -e " WARP 激活状态:  ${RED}${trace_warp:-off}${RESET}"
-        fi
-        echo -e " CF 分配出口IP:  ${YELLOW}${trace_ip}${RESET}"
-        echo -e " CF 边缘数据中心: ${YELLOW}${trace_colo}${RESET}"
-        echo -e "${GREEN}=========================================${RESET}"
+    echo -e "${YELLOW}[正在进行本地链路连通性自检...]${RESET}"
+    if curl -sI --max-time 5 $proxy_args "https://github.com" > /dev/null; then
+        echo -e "代理连通状态 :   ${GREEN}✔ 正常运行 (流量转发通畅)${RESET}"
     else
-        echo -e "${RED}[验证失败]${RESET} 无法通过代理连接至验证端点。"
+        echo -e "代理连通状态 :   ${RED}✘ 异常/未检测到公网响应${RESET}"
+        warn "提示: 如果服务已运行但检测失败，请确保云服务器后台安全组/防火墙已放行对应端口。"
     fi
-    rm -f "$TMP_TRACE"
+    echo ""
 }
 
-# ── 5. 主循环控制中心 ─────────────────────────────────────────────────────────
+# ── 4. 主循环控制中心 ─────────────────────────────────────────────────────────
 while true; do
     get_status_info
     clear
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}         CF-WARP 面板         ${RESET}"
+    echo -e "${GREEN}        next-socks5 面板       ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $panel_status"
     echo -e "${GREEN}版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
     echo -e "${GREEN}绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN} 1. 安装 WARP-Rust${RESET}"
-    echo -e "${GREEN} 2. 更新 WARP-Rust${RESET}"
-    echo -e "${GREEN} 3. 卸载全套组件${RESET}"
+    echo -e "${GREEN} 1. 安装 next-socks5${RESET}"
+    echo -e "${GREEN} 2. 更新 next-socks5${RESET}"
+    echo -e "${GREEN} 3. 卸载 next-socks5${RESET}"
     echo -e "${GREEN} 4. 修改配置${RESET}"
-    echo -e "${GREEN} 5. 启动 WARP-Rust${RESET}"
-    echo -e "${GREEN} 6. 停止 WARP-Rust${RESET}"
-    echo -e "${GREEN} 7. 重启 WARP-Rust${RESET}"
-    echo -e "${GREEN} 8. 查看日志输出${RESET}"
-    echo -e "${GREEN} 9. 查看配置与出口状态${RESET}"
-    echo -e "${YELLOW}10. 谷歌WARP分流${RESET}"
+    echo -e "${GREEN} 5. 启动 next-socks5${RESET}"
+    echo -e "${GREEN} 6. 停止 next-socks5${RESET}"
+    echo -e "${GREEN} 7. 重启 next-socks5${RESET}"
+    echo -e "${GREEN} 8. 查看日志${RESET}"
+    echo -e "${GREEN} 9. 查看配置${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     
@@ -749,15 +489,14 @@ while true; do
         2) menu_update ;;
         3) menu_uninstall ;;
         4) menu_edit_config ;;
-        5) rc-service "$SERVICE_NAME" start && ok "动作: 核心启动成功" ;;
-        6) rc-service "$SERVICE_NAME" stop && ok "动作: 核心停止成功" ;;
-        7) rc-service "$SERVICE_NAME" restart && ok "动作: 核心重启成功" ;;
-        8) menu_show_logs ;;
+        5) systemctl start "$SERVICE_NAME" && ok "动作: 核心启动成功" ;;
+        6) systemctl stop "$SERVICE_NAME" && ok "动作: 核心停止成功" ;;
+        7) systemctl restart "$SERVICE_NAME" && ok "动作: 核心重启成功" ;;
+        8) (trap 'echo -e "\n"' INT; journalctl -u "$SERVICE_NAME" -n 50 -f) ;;
         9) menu_show_node_config ;;
-        10) menu_transparent_proxy_center ;;
         0) clear; exit 0 ;;
         *) warn "未识别的无效序号！"; sleep 1 ;;
     esac
     
-    read -p "$(echo -e "${GREEN}按任意键返回主控制面板...${RESET}")" -n 1 -r
+    read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键返回主控制面板...${RESET}")"
 done

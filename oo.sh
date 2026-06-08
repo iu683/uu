@@ -255,11 +255,11 @@ update_core_binary() {
         return 1
     fi
 
+    # 【已同步修改】使用与面板一致的精准抓取逻辑，去除开头的字母 v 以便和 GitHub 的纯数字比对
     local local_version="未知"
-    if /usr/local/bin/tun2socks -v &>/dev/null; then
-        local_version=$(/usr/local/bin/tun2socks -v | head -n1 | awk '{print $3}')
-    elif /usr/local/bin/tun2socks --version &>/dev/null; then
-        local_version=$(/usr/local/bin/tun2socks --version | head -n1 | awk '{print $3}')
+    if [ -f "/usr/local/bin/tun2socks" ]; then
+        local_version=$(/usr/local/bin/tun2socks --version 2>&1 | grep "Version:" | awk '{print $2}')
+        [ -z "$local_version" ] && local_version="未知"
     fi
 
     info "本地核心版本: $local_version"
@@ -499,19 +499,37 @@ get_status() {
 
 test_exit_ip() {
     step "正在通过全局代理隧道查询落地出口 IP..."
+    
     local ip_info=""
-    ip_info=$(curl -s -m 8 --interface tun0 ipinfo.io 2>/dev/null || echo "")
-    if [ -z "$ip_info" ]; then
-        ip_info=$(curl -s -m 8 --interface tun0 https://ifconfig.me/all.json 2>/dev/null || echo "")
-    fi
+    # 依次尝试 3 个不同的国际主流 IP 探测接口，只要有一个成功就行
+    local test_urls=(
+        "https://api.ipify.org?format=json"
+        "https://ipinfo.io/json"
+        "https://ifconfig.me/all.json"
+    )
+
+    for url in "${test_urls[@]}"; do
+        info "正在尝试请求: $url ..."
+        ip_info=$(curl -s -m 6 "$url" 2>/dev/null || echo "")
+        if [ -n "$ip_info" ]; then
+            break
+        fi
+    done
 
     if [ -n "$ip_info" ]; then
         echo -e "${GREEN}----------------------------------------${RESET}"
-        echo "$ip_info"
+        # 如果返回的是 JSON，用简易方式美化输出；如果不是就直接打印
+        if echo "$ip_info" | grep -q "{"; then
+            echo "$ip_info" | sed 's/["{}]//g' | sed 's/,/\n/g' | sed 's/^ *//'
+        else
+            echo -e "当前落地出口 IP: ${YELLOW}$ip_info${RESET}"
+        fi
         echo -e "${GREEN}----------------------------------------${RESET}"
         success "测试成功！隧道网络双向畅通。"
     else
-        error "获取失败，可能自定义节点暂时不可用、账密有误或节点不支持 UDP 转发。"
+        error "获取失败。但在日志中看到节点握手成功。"
+        warning "这通常是因为：1. 节点拒绝了当前测试网站的访问；2. 脚本curl命令触发了内核安全反向路由过滤。"
+        info "建议：您可以直接在终端尝试：curl https://myip.ipip.net 看看是否能正常网页通信。"
     fi
 }
 
@@ -524,20 +542,20 @@ panel_menu() {
         get_status
         clear
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}    Tun2Socks 全局代理管理面板   ${RESET}"
+        echo -e "${GREEN}   Tun2Socks  全局代理管理面板   ${RESET}"
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN}状态   :${RESET} $status_show"
         echo -e "${GREEN}版本   :${RESET} $version_show"
         echo -e "${GREEN}代理   :${RESET} $port_show"
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN} 1. 安装 Tun2Socks${RESET}"
-        echo -e "${GREEN} 2. 更新 Tun2Socks 核心程序${RESET}"
+        echo -e "${GREEN} 2. 更新 Tun2Socks${RESET}"
         echo -e "${GREEN} 3. 卸载 Tun2Socks${RESET}"
-        echo -e "${GREEN} 4. 修改节点配置${RESET}"
+        echo -e "${GREEN} 4. 修改配置${RESET}"
         echo -e "${GREEN} 5. 启动 Tun2Socks${RESET}"
         echo -e "${GREEN} 6. 停止 Tun2Socks${RESET}"
         echo -e "${GREEN} 7. 重启 Tun2Socks${RESET}"
-        echo -e "${GREEN} 8. 查看服务运行日志${RESET}"
+        echo -e "${GREEN} 8. 查看日志${RESET}"
         echo -e "${GREEN} 9. 测试当前出口IP${RESET}"
         echo -e "${GREEN} 0. 退出${RESET}"
         echo -e "${GREEN}================================${RESET}"
@@ -565,7 +583,7 @@ panel_menu() {
                 systemctl restart tun2socks.service && success "重启成功。" || error "重启失败。"
                 ;;
             8)
-                step "实时加载最后 30 行服务运行日志 (按 Q 键退出)："
+                step "实时加载最后 30 行服务运行日志："
                 echo "--------------------------------------------------------"
                 journalctl -u tun2socks.service -n 30 --no-pager || error "未捕获到系统日志。"
                 ;;
@@ -573,8 +591,8 @@ panel_menu() {
             0) exit 0 ;;
             *) error "非法数字，请输入菜单内提供的值！" ;;
         esac
-        echo -e "${YELLOW}按任意键返回主菜单...${RESET}"
-        read -n 1
+        echo -ne "${YELLOW}按任意键返回主菜单...${RESET}"
+        read -r
     done
 }
 

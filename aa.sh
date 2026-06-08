@@ -4,20 +4,30 @@ set -e
 #================================================================================
 # 常量和全局变量定义
 #================================================================================
-REPO="heiher/hev-socks5-tunnel" # 保留作为 GitHub 测试，但核心更换为 redsocks
-REDSOCKS_CONF="/etc/redsocks.conf"
-IPTABLES_RULES="/etc/redsocks.rules"
+REPO="heiher/hev-socks5-tunnel"
 
 # 颜色高亮定义
-RED='\033;31m'
-GREEN='\033;32m'
-YELLOW='\033;33m'
-BLUE='\033;34m'
-PURPLE='\033;35m'
-CYAN='\033;36m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 RESET='\033[0m'
 
+# 备用 DNS64 服务器（专门解决纯 IPv6/机房环境下载问题）
+ALTERNATE_DNS64_SERVERS=(
+    "2a00:1098:2b::1"
+    "2a01:4f8:c2c:123f::1"
+    "2a01:4f9:c010:3f02::1"
+    "2001:67c:2b0::4"
+    "2001:67c:2b0::6"
+)
+
+#================================================================================
+# 日志和底层工具函数
+#================================================================================
 info() { echo -e "${BLUE}[信息]${NC} $1"; }
 success() { echo -e "${GREEN}[成功]${NC} $1"; }
 warning() { echo -e "${YELLOW}[警告]${NC} $1"; }
@@ -31,47 +41,117 @@ require_root() {
     fi
 }
 
-test_github_access() {
-    step "正在测试基础网络访问..."
-    if curl -s -I -m 10 https://github.com >/dev/null; then
-        success "网络访问测试成功。"
+test_dns64_server() {
+    local dns_server=$1
+    step "正在测试DNS64服务器 $dns_server 的连通性..."
+    if ping6 -c 3 -W 2 "$dns_server" &>/dev/null; then
+        info "DNS64服务器 $dns_server 可达。"
         return 0
     else
-        warning "网络访问测试失败，请检查基础网络。"
+        warning "DNS64服务器 $dns_server 不可达。"
         return 1
     fi
 }
 
-#================================================================================
-# Iptables 规则洗净与恢复
-#================================================================================
-cleanup_iptables() {
-    step "正在清理 redsocks 残留的 iptables 规则..."
+test_github_access() {
+    step "正在测试GitHub访问..."
+    if curl -s -I -m 10 https://github.com >/dev/null; then
+        success "GitHub访问测试成功。"
+        return 0
+    else
+        warning "GitHub访问测试失败。"
+        return 1
+    fi
+}
+
+restore_dns_config() {
+    local resolv_conf=$1
+    local resolv_conf_bak=$2
+    local was_immutable=$3
+
+    step "恢复原始 DNS 配置..."
+    if [ -f "$resolv_conf_bak" ]; then
+        mv "$resolv_conf_bak" "$resolv_conf"
+        success "DNS 配置已恢复。"
+        if [ "$was_immutable" = true ]; then
+            info "重新锁定 /etc/resolv.conf..."
+            chattr +i "$resolv_conf" || warning "无法重新锁定 /etc/resolv.conf。"
+            success "锁定完成。"
+        fi
+    else
+        warning "未找到 DNS 备份文件 ($resolv_conf_bak)，无法自动恢复。"
+        if [ "$was_immutable" = true ]; then
+             warning "尝试锁定当前的 /etc/resolv.conf..."
+             chattr +i "$resolv_conf" || warning "无法锁定 /etc/resolv.conf。"
+        fi
+    fi
+}
+
+set_dns64_servers() {
+    local resolv_conf=$1
+    local was_immutable=$2
+    local resolv_conf_bak=$3
     
-    # 检查 OUTPUT 链中是否存在引用的 REDSOCKS
-    if iptables -t nat -S OUTPUT 2>/dev/null | grep -q "REDSOCKS"; then
-        iptables -t nat -D OUTPUT -p tcp -j REDSOCKS 2>/dev/null || true
+    step "设置 DNS64 服务器（用于无缝下载核心程序）..."
+    cat > "$resolv_conf" <<EOF
+nameserver 2602:fc59:b0:9e::64
+EOF
+    
+    if test_github_access; then
+        return 0
     fi
     
-    # 冲刷并删除自定义链
-    iptables -t nat -F REDSOCKS 2>/dev/null || true
-    iptables -t nat -X REDSOCKS 2>/dev/null || true
+    warning "主DNS64服务器访问GitHub失败，尝试备选DNS64服务器..."
+    for dns_server in "${ALTERNATE_DNS64_SERVERS[@]}"; do
+        if test_dns64_server "$dns_server"; then
+            step "使用备选DNS64服务器: $dns_server"
+            cat > "$resolv_conf" <<EOF
+nameserver $dns_server
+EOF
+            if test_github_access; then
+                success "使用备选DNS64服务器 $dns_server 成功访问GitHub。"
+                return 0
+            fi
+        fi
+    done
     
-    success "iptables 代理规则全面洗净，原网已恢复。"
+    error "所有DNS64服务器测试失败，无法访问GitHub。"
+    restore_dns_config "$resolv_conf" "$resolv_conf_bak" "$was_immutable"
+    return 1
+}
+
+cleanup_ip_rules() {
+    step "正在强行清理底层残留的 IP 规则和旧路由..."
+    ip rule del fwmark 438 lookup main pref 10 2>/dev/null || true
+    ip -6 rule del fwmark 438 lookup main pref 10 2>/dev/null || true
+    ip route del default dev tun0 table 20 2>/dev/null || true
+    ip rule del lookup 20 pref 20 2>/dev/null || true
+    ip rule del to 127.0.0.0/8 lookup main pref 16 2>/dev/null || true
+    ip rule del to 10.0.0.0/8 lookup main pref 16 2>/dev/null || true
+    ip rule del to 172.16.0.0/12 lookup main pref 16 2>/dev/null || true
+    ip rule del to 192.168.0.0/16 lookup main pref 16 2>/dev/null || true
+
+    while ip rule del pref 15 2>/dev/null; do true; done
+    while ip -6 rule del pref 15 2>/dev/null; do true; done
+    while ip rule del pref 5 2>/dev/null; do true; done
+    while ip -6 rule del pref 5 2>/dev/null; do true; done
+
+    success "IP 基础路由规则全面洗净。"
 }
 
 #================================================================================
-# 配置核心读取与写入逻辑 (Redsocks 格式)
+# 配置核心读取与写入逻辑
 #================================================================================
 write_config_file() {
+    local CONFIG_FILE="/etc/tun2socks/config.yaml"
+    mkdir -p "/etc/tun2socks"
+
     local current_addr="" current_port="" current_user="" current_pass=""
-    
-    # 解析现有的 redsocks.conf 提取配置（如果存在）
-    if [ -f "$REDSOCKS_CONF" ]; then
-        current_addr=$(grep -E '^[[:space:]]*ip[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
-        current_port=$(grep -E '^[[:space:]]*port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
-        current_user=$(grep -E '^[[:space:]]*login[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
-        current_pass=$(grep -E '^[[:space:]]*password[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
+    if [ -f "$CONFIG_FILE" ]; then
+        current_addr=$(grep -E '^[[:space:]]*address:' "$CONFIG_FILE" | head -n1 | awk '{print $2}' | tr -d "'\"")
+        current_port=$(grep -E '^[[:space:]]*port:' "$CONFIG_FILE" | head -n1 | awk '{print $2}' | tr -d "'\"")
+        current_user=$(grep -E '^[[:space:]]*username:' "$CONFIG_FILE" | head -n1 | awk '{print $2}' | tr -d "'\"")
+        current_pass=$(grep -E '^[[:space:]]*password:' "$CONFIG_FILE" | head -n1 | awk '{print $2}' | tr -d "'\"")
     fi
 
     # 1. 节点地址
@@ -81,7 +161,7 @@ write_config_file() {
             read -r -p "请输入Socks5服务器地址 [$current_addr]: " input_addr
             [ -z "$input_addr" ] && input_addr=$current_addr
         else
-            read -r -p "请输入Socks5服务器地址 (建议使用纯IP): " input_addr
+            read -r -p "请输入Socks5服务器地址 (建议使用纯IP，例如 8.220.163.172): " input_addr
         fi
         if [ -n "$input_addr" ]; then break; else error "服务器地址不能为空。"; fi
     done
@@ -126,183 +206,307 @@ write_config_file() {
         input_pass=""
     fi
 
-    input_addr=$(echo "$input_addr" | tr -d '\r')
+    # 过滤掉回车符并对可能存在在输入中的单引号进行转义，规避 YAML 解析崩溃
+    input_addr=$(echo "$input_addr" | tr -d '\r' | sed "s/'/''/g")
     input_port=$(echo "$input_port" | tr -d '\r')
-    input_user=$(echo "$input_user" | tr -d '\r')
-    input_pass=$(echo "$input_pass" | tr -d '\r')
+    input_user=$(echo "$input_user" | tr -d '\r' | sed "s/'/''/g")
+    input_pass=$(echo "$input_pass" | tr -d '\r' | sed "s/'/''/g")
 
-    # 生成 redsocks 官方标准的完整配置文件
-    step "正在渲染生成 $REDSOCKS_CONF ..."
-    cat > "$REDSOCKS_CONF" <<EOF
-base {
-    log_debug = off;
-    log_info = on;
-    log = "syslog:daemon";
-    daemon = on;
-    redirector = iptables;
-}
+    # 正式渲染 YAML (已修正特殊空白导致的缩进故障)
+    cat > "$CONFIG_FILE" <<EOF
+tunnel:
+  name: tun0
+  mtu: 1500
+  multi-queue: true
+  ipv4: 198.18.0.1
 
-redsocks {
-    local_ip = 127.0.0.1;
-    local_port = 12345;
-
-    ip = $input_addr;
-    port = $input_port;
-    type = socks5;
-EOF
-
-    if [ -n "$input_user" ]; then
-        echo "    login = \"$input_user\";" >> "$REDSOCKS_CONF"
-    fi
-    if [ -n "$input_pass" ]; then
-        echo "    password = \"$input_pass\";" >> "$REDSOCKS_CONF"
-    fi
-
-    echo "}" >> "$REDSOCKS_CONF"
-
-    # 动态渲染本地生产的 iptables.rules 规则文件 (包含强悍的 SSH 防断网及防死循环逻辑)
-    step "正在动态渲染生成防火墙隔离规则 $IPTABLES_RULES ..."
-    cat > "$IPTABLES_RULES" <<EOF
-*nat
-:PREROUTING ACCEPT [0:0]
-:INPUT ACCEPT [0:0]
-:OUTPUT ACCEPT [0:0]
-:POSTROUTING ACCEPT [0:0]
-:REDSOCKS - [0:0]
-
-# 【防断网策略】确保系统的 SSH 22 端口双向流量绝对直连，不进代理
--A OUTPUT -p tcp --dport 22 -j RETURN
--A OUTPUT -p tcp --sport 22 -j RETURN
-
-# 让所有本地发出的 TCP 流量优先经过 REDSOCKS 链判定
--A OUTPUT -p tcp -j REDSOCKS
-
-# 豁免代理服务器本尊的 IP（防止产生内核死循环环路）
--A REDSOCKS -d $input_addr -j RETURN
-
-# 绕过保留地址、本地局域网和组播地址
--A REDSOCKS -d 0.0.0.0/8 -j RETURN
--A REDSOCKS -d 10.0.0.0/8 -j RETURN
--A REDSOCKS -d 127.0.0.0/8 -j RETURN
--A REDSOCKS -d 169.254.0.0/16 -j RETURN
--A REDSOCKS -d 172.16.0.0/12 -j RETURN
--A REDSOCKS -d 192.168.0.0/16 -j RETURN
--A REDSOCKS -d 224.0.0.0/4 -j RETURN
--A REDSOCKS -d 240.0.0.0/4 -j RETURN
-
-# 将其余一切公网 TCP 流量重定向到 Redsocks 本地转发端口 12345
--A REDSOCKS -p tcp -j REDIRECT --to-ports 12345
-COMMIT
+socks5:
+  port: $input_port
+  address: '$input_addr'
+  udp: 'udp'
+$( [ -n "$input_user" ] && echo "  username: '$input_user'" )
+$( [ -n "$input_pass" ] && echo "  password: '$input_pass'" )
+  mark: 438
 EOF
 }
 
 change_config() {
-    info "开始修改 Redsocks 节点配置："
+    info "开始修改 Socks5 节点配置（直接回车则保持现状不变）："
     echo "--------------------------------------------------------"
     write_config_file
     success "节点配置文件更新成功！"
     
-    if systemctl is-active --quiet redsocks.service; then
-        step "检测到服务正在后台运行，正在重载防火墙与服务..."
-        systemctl restart redsocks.service
-        iptables-restore < "$IPTABLES_RULES"
-        success "新配置已无缝生效。"
+    if systemctl is-active --quiet tun2socks.service; then
+        step "检测到服务正在后台运行，正在自动重启以应用新配置..."
+        systemctl restart tun2socks.service && success "重启成功，新节点配置已生效。" || error "重启失败，请检查服务状态。"
     fi
 }
 
 #================================================================================
-# Redsocks 安装与环境初始化
+# 选项 2：全自动升级核心
 #================================================================================
-install_tun2socks() {
-    cleanup_iptables
-
-    step "检查并安装 redsocks 依赖软件..."
-    if ! command -v redsocks &>/dev/null; then
-        apt-get update && apt-get install -y redsocks iptables curl || {
-            error "安装 redsocks 失败，请检查系统 apt 源！"
-            return 1
-        }
+update_core_binary() {
+    if [ ! -f "/usr/local/bin/tun2socks" ]; then
+        error "检测到您尚未安装 Tun2Socks 环境，请先使用选项 1 进行初始化安装！"
+        return 1
     fi
 
-    # 停止系统可能默认启动的自带旧 redsocks
-    systemctl stop redsocks 2>/dev/null || true
-    systemctl disable redsocks 2>/dev/null || true
+    step "正在连接 GitHub 检查最新 Release Version..."
+    local latest_release_json=$(curl -s https://api.github.com/repos/$REPO/releases/latest)
+    local latest_version=$(echo "$latest_release_json" | grep '"tag_name":' | cut -d '"' -f 4)
+    local download_url=$(echo "$latest_release_json" | grep "browser_download_url" | grep "linux-x86_64" | cut -d '"' -f 4)
 
-    step "初始化配置参数..."
+    if [ -z "$latest_version" ] || [ -z "$download_url" ]; then
+        error "无法从 GitHub 获取版本信息，网络可能受到干扰。"
+        return 1
+    fi
+
+    local local_version="未知"
+    if [ -f "/usr/local/bin/tun2socks" ]; then
+        local_version=$(/usr/local/bin/tun2socks --version 2>&1 | grep "Version:" | awk '{print $2}')
+        [ -z "$local_version" ] && local_version="未知"
+    fi
+
+    info "本地核心版本: $local_version"
+    info "GitHub最新版本: $latest_version"
+
+    if [ "$local_version" = "$latest_version" ]; then
+        success "当前核心程序已是官方最新发布版，无需重复升级。"
+        return 0
+    fi
+
+    warning "检测到新版本核心程序 ($latest_version)，开始全自动无缝升级..."
+
+    local RESOLV_CONF="/etc/resolv.conf"
+    local RESOLV_CONF_BAK="/etc/resolv.conf.bak"
+    local was_immutable=false
+
+    if lsattr -d "$RESOLV_CONF" 2>/dev/null | grep -q -- '-i-'; then
+        chattr -i "$RESOLV_CONF" || true
+        was_immutable=true
+    fi
+    cp "$RESOLV_CONF" "$RESOLV_CONF_BAK" || true
+
+    if ! set_dns64_servers "$RESOLV_CONF" "$was_immutable" "$RESOLV_CONF_BAK"; then
+        return 1
+    fi
+
+    local is_running=false
+    if systemctl is-active --quiet tun2socks.service; then
+        is_running=true
+        step "正在暂停全局代理以准备替换核心二进制..."
+        systemctl stop tun2socks.service || true
+    fi
+
+    step "正在下载官方最新编译核心..."
+    if curl -L -o "/usr/local/bin/tun2socks" "$download_url"; then
+        chmod +x "/usr/local/bin/tun2socks"
+        success "核心程序成功升级至 $latest_version ！"
+    else
+        error "下载核心程序失败，请检查网络。"
+    fi
+
+    restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$was_immutable"
+
+    if [ "$is_running" = true ]; then
+        step "正在恢复并重新启动全局代理..."
+        systemctl start tun2socks.service && success "隧道已成功恢复运行！" || error "重启失败。"
+    fi
+}
+
+install_tun2socks() {
+    cleanup_ip_rules
+
+    step "检查 tun2socks 服务当前状态..."
+    if systemctl is-active --quiet tun2socks.service; then
+        info "检测到 tun2socks 旧进程正在运行，正在将其安全终止..."
+        systemctl stop tun2socks.service || true
+    fi
+
+    RESOLV_CONF="/etc/resolv.conf"
+    RESOLV_CONF_BAK="/etc/resolv.conf.bak"
+    WAS_IMMUTABLE=false
+
+    step "检查 /etc/resolv.conf 文件属性状态..."
+    if lsattr -d "$RESOLV_CONF" 2>/dev/null | grep -q -- '-i-'; then
+        info "/etc/resolv.conf 文件当前被系统锁定，正在临时解除..."
+        chattr -i "$RESOLV_CONF" || { error "临时解锁 /etc/resolv.conf 失败"; exit 1; }
+        WAS_IMMUTABLE=true
+    fi
+
+    step "备份系统当前 DNS 配置..."
+    cp "$RESOLV_CONF" "$RESOLV_CONF_BAK" || true
+
+    if ! set_dns64_servers "$RESOLV_CONF" "$WAS_IMMUTABLE" "$RESOLV_CONF_BAK"; then
+        return 1
+    fi
+
+    INSTALL_DIR="/usr/local/bin"
+    CONFIG_DIR="/etc/tun2socks"
+    SERVICE_FILE="/etc/systemd/system/tun2socks.service"
+    BINARY_PATH="$INSTALL_DIR/tun2socks"
+
+    step "从 GitHub 获取最新 Release 核心下载地址..."
+    DOWNLOAD_URL=$(curl -s https://api.github.com/repos/$REPO/releases/latest | grep "browser_download_url" | grep "linux-x86_64" | cut -d '"' -f 4)
+
+    if [ -z "$DOWNLOAD_URL" ]; then
+        error "未找到适用于 linux-x86_64 的核心下载链接，请检查网络。"
+        restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
+        return 1
+    fi
+
+    step "正在下载 GitHub 最新发布版官方核心程序..."
+    cleanup_on_fail() {
+        trap - INT TERM EXIT
+        restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
+        return 1
+    }
+    trap cleanup_on_fail INT TERM EXIT
+    curl -L -o "$BINARY_PATH" "$DOWNLOAD_URL"
+    trap - INT TERM EXIT
+
+    restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
+    chmod +x "$BINARY_PATH"
+
+    step "正在初始化全局出口节点配置信息："
     write_config_file
 
-    step "正在动态接管并重构系统守护服务 (redsocks.service)..."
-    local SERVICE_FILE="/etc/systemd/system/redsocks.service"
-    
+    step "正在动态计算并生成底层守护服务 (tun2socks.service)..."
+    RULE_ADD_FROM_MAIN_IP=""
+    RULE_DEL_FROM_MAIN_IP=""
+    RULE_ADD_FROM_MAIN_IP6=""
+    RULE_DEL_FROM_MAIN_IP6=""
+
+    # 动态获取用户当前输入的 Socks5 端口，用于防回环策略
+    WARP_PORT=$(grep -E '^[[:space:]]*port:' "$CONFIG_FILE" | head -n1 | awk '{print $2}' | tr -d "'\"")
+
+    MAIN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
+    MAIN_IP6=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
+
+    if [ -n "$MAIN_IP" ]; then
+        RULE_ADD_FROM_MAIN_IP="ExecStartPost=-/sbin/ip rule add from $MAIN_IP lookup main pref 15"
+        RULE_DEL_FROM_MAIN_IP="ExecStop=-/sbin/ip rule del from $MAIN_IP lookup main pref 15"
+    fi
+    if [ -n "$MAIN_IP6" ]; then
+        RULE_ADD_FROM_MAIN_IP6="ExecStartPost=-/sbin/ip -6 rule add from $MAIN_IP6 lookup main pref 15"
+        RULE_DEL_FROM_MAIN_IP6="ExecStop=-/sbin/ip -6 rule del from $MAIN_IP6 lookup main pref 15"
+    fi
+
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=Redsocks Transparent Proxy Service
+Description=Tun2Socks Tunnel Service
 After=network.target
 
 [Service]
-Type=forking
-PIDFile=/run/redsocks.pid
-ExecStartPre=-/bin/rm -f /run/redsocks.pid
-# 直接强制读取我们在 /etc 下接管的全新配置文件
-ExecStart=/usr/sbin/redsocks -c $REDSOCKS_CONF -p /run/redsocks.pid
-ExecStartPost=/sbin/iptables-restore $IPTABLES_RULES
-ExecStopPost=/bin/sh -c 'iptables -t nat -D OUTPUT -p tcp -j REDSOCKS 2>/dev/null || true; iptables -t nat -F REDSOCKS 2>/dev/null || true; iptables -t nat -X REDSOCKS 2>/dev/null || true'
-TimeoutStartSec=4
-Restart=on-failure
+Type=simple
+ExecStart=$BINARY_PATH $CONFIG_DIR/config.yaml
+ExecStartPost=/bin/sleep 1
+
+# 注入高并发限制解除，防止大流量高并发时直接主程序崩溃崩溃
 LimitNOFILE=524288
+
+# 【防断网策略】确保 SSH 22 端口流量直连原生主网卡，绝不进入虚拟网卡
+ExecStartPost=-/sbin/ip rule add to 0.0.0.0/0 dport 22 lookup main pref 5
+ExecStartPost=-/sbin/ip rule add to 0.0.0.0/0 sport 22 lookup main pref 5
+ExecStartPost=-/sbin/ip -6 rule add to ::/0 dport 22 lookup main pref 5
+ExecStartPost=-/sbin/ip -6 rule add to ::/0 sport 22 lookup main pref 5
+
+# 【针对本地 WARP 的防回环动态策略】
+ExecStartPost=-/sbin/ip rule add to 127.0.0.1 lookup main pref 4
+ExecStartPost=-/sbin/ip -6 rule add to ::1 lookup main pref 4
+ExecStartPost=-/sbin/ip rule add to 127.0.0.1 dport ${WARP_PORT} lookup main pref 4
+
+ExecStartPost=-/sbin/ip rule add fwmark 438 lookup main pref 10
+ExecStartPost=-/sbin/ip -6 rule add fwmark 438 lookup main pref 10
+ExecStartPost=-/sbin/ip route add default dev tun0 table 20
+ExecStartPost=-/sbin/ip rule add lookup 20 pref 20
+${RULE_ADD_FROM_MAIN_IP}
+${RULE_ADD_FROM_MAIN_IP6}
+ExecStartPost=-/sbin/ip rule add to 127.0.0.0/8 lookup main pref 16
+ExecStartPost=-/sbin/ip rule add to 10.0.0.0/8 lookup main pref 16
+ExecStartPost=-/sbin/ip rule add to 172.16.0.0/12 lookup main pref 16
+ExecStartPost=-/sbin/ip rule add to 192.168.0.0/16 lookup main pref 16
+
+ExecStop=-/sbin/ip rule del to 0.0.0.0/0 dport 22 lookup main pref 5
+ExecStop=-/sbin/ip rule del to 0.0.0.0/0 sport 22 lookup main pref 5
+ExecStop=-/sbin/ip -6 rule del to ::/0 dport 22 lookup main pref 5
+ExecStop=-/sbin/ip -6 rule del to ::/0 sport 22 lookup main pref 5
+ExecStop=-/sbin/ip rule del to 127.0.0.1 lookup main pref 4
+ExecStop=-/sbin/ip -6 rule del to ::1 lookup main pref 4
+ExecStop=-/sbin/ip rule del to 127.0.0.1 dport ${WARP_PORT} lookup main pref 4
+ExecStop=-/sbin/ip rule del fwmark 438 lookup main pref 10
+ExecStop=-/sbin/ip -6 rule del fwmark 438 lookup main pref 10
+ExecStop=-/sbin/ip route del default dev tun0 table 20
+ExecStop=-/sbin/ip rule del lookup 20 pref 20
+${RULE_DEL_FROM_MAIN_IP}
+${RULE_DEL_FROM_MAIN_IP6}
+ExecStop=-/sbin/ip rule del to 127.0.0.0/8 lookup main pref 16
+ExecStop=-/sbin/ip rule del to 10.0.0.0/8 lookup main pref 16
+ExecStop=-/sbin/ip rule del to 172.16.0.0/12 lookup main pref 16
+ExecStop=-/sbin/ip rule del to 192.168.0.0/16 lookup main pref 16
+
+Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable redsocks.service 2>/dev/null
+    systemctl enable tun2socks.service 2>/dev/null
     
-    step "正在自动拉起 Redsocks 全局网络内核代理..."
-    systemctl start redsocks.service || { 
-        error "自动启动隧道服务失败！请执行 journalctl -u redsocks.service 排查原因。"
+    step "正在自动拉起全局网络代理隧道..."
+    systemctl start tun2socks.service || { 
+        error "自动启动隧道服务失败！请查看日志排查原因。"
         return 1
     }
     
-    success "Redsocks + iptables 透明代理环境配置完毕！"
+    success "Tun2Socks 环境配置完毕！"
 }
 
 uninstall_tun2socks() {
-    cleanup_iptables
-    local SERVICE_FILE="/etc/systemd/system/redsocks.service"
+    cleanup_ip_rules
+    SERVICE_FILE="/etc/systemd/system/tun2socks.service"
+    CONFIG_DIR="/etc/tun2socks"
+    BINARY_PATH="/usr/local/bin/tun2socks"
 
-    step "正在停止并彻底禁用后台 redsocks 服务..."
-    systemctl stop redsocks.service 2>/dev/null || true
-    systemctl disable redsocks.service 2>/dev/null || true
+    step "正在停止并彻底禁用后台 tun2socks 服务..."
+    if systemctl is-active --quiet tun2socks.service; then
+        systemctl stop tun2socks.service
+    fi
+    systemctl disable tun2socks.service 2>/dev/null || true
 
     step "正在清理系统残留组件文件..."
     [ -f "$SERVICE_FILE" ] && rm -f "$SERVICE_FILE"
-    [ -f "$REDSOCKS_CONF" ] && rm -f "$REDSOCKS_CONF"
-    [ -f "$IPTABLES_RULES" ] && rm -f "$IPTABLES_RULES"
+    [ -d "$CONFIG_DIR" ] && rm -rf "$CONFIG_DIR"
+    [ -f "$BINARY_PATH" ] && rm -f "$BINARY_PATH"
     
     systemctl daemon-reload
-    success "Redsocks 环境已彻底从系统卸载干净。"
+    success "Tun2Socks 环境已彻底从系统卸载干净。"
 }
 
 get_status() {
-    if systemctl is-active --quiet redsocks.service; then
+    if systemctl is-active --quiet tun2socks.service; then
         status_show="${GREEN}已启动 (运行中)${RESET}"
     else
         status_show="${RED}已停止 (未运行)${RESET}"
     fi
 
-    if command -v redsocks &>/dev/null; then
-        local version_raw
-        version_raw=$(redsocks -v 2>&1 | awk '{print $2}')
-        version_show="${YELLOW}${version_raw:-已安装}${RESET}"
+    if [ -f "/usr/local/bin/tun2socks" ]; then
+        local version_raw=""
+        version_raw=$(/usr/local/bin/tun2socks --version 2>&1 | grep "Version:" | awk '{print $2}')
+        
+        if [ -n "$version_raw" ]; then
+            version_show="${YELLOW}v${version_raw}${RESET}"
+        else
+            version_show="${YELLOW}已安装${RESET}"
+        fi
     else
         version_show="${RED}未安装${RESET}"
     fi
 
-    if [ -f "$REDSOCKS_CONF" ]; then
-        local port addr
-        addr=$(grep -E '^[[:space:]]*ip[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
-        port=$(grep -E '^[[:space:]]*port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
+    if [ -f "/etc/tun2socks/config.yaml" ]; then
+        local port=$(grep -E '^[[:space:]]*port:' /etc/tun2socks/config.yaml | head -n1 | awk '{print $2}' | tr -d "'\"")
+        local addr=$(grep -E '^[[:space:]]*address:' /etc/tun2socks/config.yaml | head -n1 | awk '{print $2}' | tr -d "'\"")
         port_show="${YELLOW}${addr}:${port}${RESET}"
     else
         port_show="${RED}无配置${RESET}"
@@ -310,9 +514,10 @@ get_status() {
 }
 
 test_exit_ip() {
-    step "正在通过全局 iptables 转发层查询落地出口 IP..."
+    step "正在通过全局代理隧道查询落地出口 IP..."
     
     local ip_info=""
+    # 国际主流 IP 探测接口
     local test_urls=(
         "https://api.ipify.org?format=json"
         "https://ipinfo.io/json"
@@ -321,8 +526,8 @@ test_exit_ip() {
 
     for url in "${test_urls[@]}"; do
         info "正在尝试请求: $url ..."
-        # 注意：由于 iptables 作用于整个内核全局，此处不需要再加 --noproxy
-        ip_info=$(curl -s -m 6 "$url" 2>/dev/null || echo "")
+        # --noproxy "*" 用于强行跳过应用层可能存在的其他本地代理，直接测试内核核心路由
+        ip_info=$(curl --noproxy "*" -s -m 6 "$url" 2>/dev/null || echo "")
         if [ -n "$ip_info" ]; then
             break
         fi
@@ -336,10 +541,11 @@ test_exit_ip() {
             echo -e "当前落地出口 IP: ${YELLOW}$ip_info${RESET}"
         fi
         echo -e "${GREEN}----------------------------------------${RESET}"
-        success "测试成功！Netfilter NAT 转发网络畅通。"
+        success "测试成功！隧道网络双向畅通。"
     else
-        error "获取失败。请检查 Redsocks 服务端握手日志。"
-        warning "这通常是因为：1. 您的 Socks5 节点本身不支持 HTTPS 代理；2. 远端外部端口未正常放行。"
+        error "获取失败。但在日志中看到节点握手成功。"
+        warning "这通常是因为：1. 节点拒绝了当前测试网站的访问；2. 脚本 curl 命令触发了内核反向路由流过滤(rp_filter)。"
+        info "建议：您可以直接在终端尝试：curl https://myip.ipip.net 看看是否能正常网页通信。"
     fi
 }
 
@@ -352,20 +558,20 @@ panel_menu() {
         get_status
         clear
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}    Redsocks + Iptables 面板    ${RESET}"
+        echo -e "${GREEN}    Tun2Socks   全局代理管理面板   ${RESET}"
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN}状态   :${RESET} $status_show"
         echo -e "${GREEN}版本   :${RESET} $version_show"
         echo -e "${GREEN}代理   :${RESET} $port_show"
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} 1. 安装 Redsocks 环境${RESET}"
-        echo -e "${GREEN} 2. 占位 (Redsocks 使用系统自带源无需升级)${RESET}"
-        echo -e "${GREEN} 3. 卸载 Redsocks 环境${RESET}"
-        echo -e "${GREEN} 4. 修改 Socks5 配置${RESET}"
-        echo -e "${GREEN} 5. 启动全局代理 (应用规则)${RESET}"
-        echo -e "${GREEN} 6. 停止全局代理 (清空规则)${RESET}"
-        echo -e "${GREEN} 7. 重启 Redsocks 服务${RESET}"
-        echo -e "${GREEN} 8. 查看系统日志${RESET}"
+        echo -e "${GREEN} 1. 安装 Tun2Socks${RESET}"
+        echo -e "${GREEN} 2. 更新 Tun2Socks${RESET}"
+        echo -e "${GREEN} 3. 卸载 Tun2Socks${RESET}"
+        echo -e "${GREEN} 4. 修改配置${RESET}"
+        echo -e "${GREEN} 5. 启动 Tun2Socks${RESET}"
+        echo -e "${GREEN} 6. 停止 Tun2Socks${RESET}"
+        echo -e "${GREEN} 7. 重启 Tun2Socks${RESET}"
+        echo -e "${GREEN} 8. 查看日志${RESET}"
         echo -e "${GREEN} 9. 测试当前出口IP${RESET}"
         echo -e "${GREEN} 0. 退出${RESET}"
         echo -e "${GREEN}================================${RESET}"
@@ -373,29 +579,29 @@ panel_menu() {
         read -p $'\e[32m请输入数字: \e[0m' num
         case "$num" in
             1) install_tun2socks ;;
-            2) warning "Redsocks 基于系统软件包管理，无需脚本手动更新。" ;;
+            2) update_core_binary ;;
             3) uninstall_tun2socks ;;
             4) change_config ;;
             5)
-                step "正在启动服务并加载 iptables NAT 劫持逻辑..."
-                if [ ! -f "$REDSOCKS_CONF" ]; then
-                    error "未发现任何节点配置，请先执行选项 1 或 4 ！"
+                step "正在唤醒全局代理网络..."
+                if [ ! -f "/etc/tun2socks/config.yaml" ]; then
+                    error "未发现任何节点配置，请先执行选项 1 或 4 进行配置！"
                 else
-                    systemctl start redsocks.service && iptables-restore < "$IPTABLES_RULES" && success "代理已全力运转。" || error "启动失败。"
+                    systemctl start tun2socks.service && success "启动成功。" || error "启动失败。"
                 fi
                 ;;
             6)
-                step "正在安全卸载防火墙劫持链，恢复物理原生网络..."
-                systemctl stop redsocks.service && cleanup_iptables && success "代理已关闭，网络已复原。" || error "停用失败。"
+                step "正在关闭全局代理，物理网络正在复原..."
+                systemctl stop tun2socks.service && success "代理已停用，原网已恢复。" || error "停用失败。"
                 ;;
             7)
-                step "正在重启后台守护进程..."
-                systemctl restart redsocks.service && success "重启成功。" || error "重启失败。"
+                step "正在重启核心隧道服务..."
+                systemctl restart tun2socks.service && success "重启成功。" || error "重启失败。"
                 ;;
             8)
-                step "加载最近 30 行代理运行日志："
+                step "实时加载最后 30 行服务运行日志："
                 echo "--------------------------------------------------------"
-                journalctl -u redsocks.service -n 30 --no-pager || tail -n 30 /var/log/syslog
+                journalctl -u tun2socks.service -n 30 --no-pager || error "未捕获到系统日志。"
                 ;;
             9) test_exit_ip ;;
             0) exit 0 ;;

@@ -1,460 +1,489 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
 
-#================================================================================
-# 常量和全局变量
-#================================================================================
-VERSION="1.2.9"
-REPO="heiher/hev-socks5-tunnel"
+# ==============================================================================
+#  next-socks5 一键安全管理面板
+# ==============================================================================
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+# ── 核心环境变量 ──────────────────────────────────────────────────────────────
+export REPO="ZingerLittleBee/next-socks5"
+export SERVICE_NAME="next-socks5"
+export SERVICE_USER="socks5"
+export INSTALL_BIN="/usr/local/bin/next-socks5"
+export CONF_DIR="/etc/next-socks5"
+export CONF_FILE="${CONF_DIR}/config.toml"
+export DATA_DIR="/var/lib/next-socks5"
+export SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
-# 备用 DNS64 服务器
-ALTERNATE_DNS64_SERVERS=(
-    "2a00:1098:2b::1"
-    "2a01:4f8:c2c:123f::1"
-    "2a01:4f9:c010:3f02::1"
-    "2001:67c:2b0::4"
-    "2001:67c:2b0::6"
-)
+# ── 终端颜色定义 ──────────────────────────────────
+export RESET='\033[0m'
+export GREEN='\033[0;32m'
+export YELLOW='\033[0;33m'
+export RED='\033[0;31m'
+export BLUE='\033[0;34m'
+export CYAN='\033[0;36m'
 
-RESOLV_CONF="/etc/resolv.conf"
-RESOLV_CONF_BAK="/etc/resolv.conf.bak"
-WAS_IMMUTABLE=false
-BINARY_PATH="/usr/local/bin/tun2socks"
-CONFIG_DIR="/etc/tun2socks"
-CONFIG_FILE="$CONFIG_DIR/config.yaml"
+# ── 基础环境校验 ──────────────────────────────────────────────────────────
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}[错误]${RESET} 请使用 root 权限运行此脚本！" >&2
+    exit 1
+fi
 
-#================================================================================
-# 日志和工具函数
-#================================================================================
-info() { echo -e "${BLUE}[信息]${NC} $1"; }
-success() { echo -e "${GREEN}[成功]${NC} $1"; }
-warning() { echo -e "${YELLOW}[警告]${NC} $1"; }
-error() { echo -e "${RED}[错误]${NC} $1"; }
-step() { echo -e "${PURPLE}[步骤]${NC} $1"; }
+info() { echo -e "${BLUE}[INFO]${RESET} $1"; }
+ok()   { echo -e "${GREEN}[OK]${RESET} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${RESET} $1"; }
+die()  { echo -e "${RED}[ERROR]${RESET} $1" >&2; exit 1; }
 
-require_root() {
-    if [ "$EUID" -ne 0 ]; then
-        error "请使用 root 权限运行此脚本，例如: sudo $0"
-        exit 1
-    fi
-}
-
-test_dns64_server() {
-    local dns_server=$1
-    step "正在测试DNS64服务器 $dns_server 的连通性..."
-    if ping6 -c 3 -W 2 "$dns_server" &>/dev/null; then
-        info "DNS64服务器 $dns_server 可达。"
-        return 0
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
     else
-        warning "DNS64服务器 $dns_server 不可达。"
-        return 1
+        die "无法识别当前操作系统类型。"
     fi
 }
+detect_os
 
-test_github_access() {
-    step "正在测试GitHub访问..."
-    if curl -s -m 10 https://github.com >/dev/null; then
-        success "GitHub访问测试成功。"
-        return 0
-    else
-        warning "GitHub访问测试失败。"
-        return 1
+REQUIRED_CMDS="curl tar sed grep awk openssl"
+MISSING_CMDS=""
+
+for cmd in $REQUIRED_CMDS; do
+    if ! command -v "$cmd" &> /dev/null; then
+        MISSING_CMDS="$MISSING_CMDS $cmd"
     fi
-}
+done
 
-unlock_resolv_conf() {
-    if lsattr -d "$RESOLV_CONF" 2>/dev/null | grep -q -- '-i-'; then
-        info "/etc/resolv.conf 当前被锁定 (immutable)，正在尝试解锁..."
-        chattr -i "$RESOLV_CONF" || { error "无法解锁 /etc/resolv.conf"; exit 1; }
-        WAS_IMMUTABLE=true
-        success "解锁成功。"
-    fi
-}
+if [ -n "$MISSING_CMDS" ]; then
+    info "检测到系统缺失必要组件:${YELLOW}$MISSING_CMDS${RESET}，正在自动修复..."
+    case "$OS" in
+        ubuntu|debian)
+            apt-get update -qy && apt-get install -y $MISSING_CMDS >/dev/null 2>&1
+            ;;
+        centos|rhel|rocky|almalinux|fedora)
+            if command -v dnf &>/dev/null; then
+                dnf install -y $MISSING_CMDS >/dev/null 2>&1
+            else
+                yum install -y $MISSING_CMDS >/dev/null 2>&1
+            fi
+            ;;
+        *)
+            die "未知系统，请手动安装组件: $MISSING_CMDS"
+            ;;
+    esac
 
-lock_resolv_conf() {
-    if [ "$WAS_IMMUTABLE" = true ]; then
-        info "重新锁定 /etc/resolv.conf..."
-        chattr +i "$RESOLV_CONF" || warning "无法重新锁定 /etc/resolv.conf。"
-        success "锁定完成。"
-    fi
-}
-
-restore_dns_config() {
-    unlock_resolv_conf
-    if [ -f "$RESOLV_CONF_BAK" ]; then
-        mv "$RESOLV_CONF_BAK" "$RESOLV_CONF"
-        success "DNS 配置已恢复原状。"
-        lock_resolv_conf
-    fi
-}
-
-set_dns64_servers() {
-    unlock_resolv_conf
-    if [ ! -f "$RESOLV_CONF_BAK" ] && [ -f "$RESOLV_CONF" ]; then
-        cp "$RESOLV_CONF" "$RESOLV_CONF_BAK"
-    fi
-
-    cat > "$RESOLV_CONF" <<EOF
-nameserver 2602:fc59:b0:9e::64
-EOF
-    
-    if test_github_access; then return 0; fi
-    
-    for dns_server in "${ALTERNATE_DNS64_SERVERS[@]}"; do
-        if test_dns64_server "$dns_server"; then
-            cat > "$RESOLV_CONF" <<EOF
-nameserver $dns_server
-EOF
-            if test_github_access; then return 0; fi
+    for cmd in $MISSING_CMDS; do
+        if ! command -v "$cmd" &> /dev/null; then
+            die "自动安装 [ $cmd ] 失败，请检查网络源。"
         fi
     done
-    
-    error "所有 DNS64 服务器均无法访问 GitHub。"
-    restore_dns_config
-    return 1
+    ok "基础依赖补全成功！"
+fi
+
+# ── 1. 核心下载与组件解压 ───────────────────────────────────────────────────
+detect_target() {
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64)  TARGET="x86_64-unknown-linux-musl" ;;
+        aarch64) TARGET="aarch64-unknown-linux-musl" ;;
+        *) die "暂不支持的系统架构: $ARCH (面板目前仅支持 x86_64 及 aarch64)" ;;
+    esac
 }
 
-get_custom_server_config() {
-    local default_address="" default_port="" default_user="" default_pass=""
-    
-    if [ -f "$CONFIG_FILE" ]; then
-        default_address=$(grep -oP "address:\s*'\K[^']+" "$CONFIG_FILE" || grep -oP "address:\s*\K[^\s]+" "$CONFIG_FILE" || echo "")
-        default_port=$(grep -oP "port:\s*\K[0-9]+" "$CONFIG_FILE" | tail -n 1 || echo "")
-        default_user=$(grep -oP "username:\s*'\K[^']+" "$CONFIG_FILE" || grep -oP "username:\s*\K[^\s]+" "$CONFIG_FILE" || echo "")
-        default_pass=$(grep -oP "password:\s*'\K[^']+" "$CONFIG_FILE" || grep -oP "password:\s*\K[^\s]+" "$CONFIG_FILE" || echo "")
+fetch_latest_version() {
+    info "正在查询 GitHub 获取最新 Release 版本号..."
+    TMP_API="$(mktemp)"
+    if curl -sSL -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${REPO}/releases/latest" > "$TMP_API"; then
+        VERSION="$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$TMP_API" | head -n 1)"
+    fi
+    rm -f "$TMP_API"
+
+    if [ -z "$VERSION" ]; then
+        warn "API 获取失败，尝试网页流解析..."
+        VERSION=$(curl -sS "https://github.com/${REPO}/releases/latest" 2>/dev/null | grep -o 'tag/[vV]*[0-9.]*' | awk -F '/' 'NR==1 {print $2}')
     fi
 
-    local address port username password
-    echo -e "${YELLOW}--- Socks5 出口配置（回车默认不修改） ---${NC}"
-    
-    while true; do
-        if [ -n "$default_address" ]; then
-            read -r -p "请输入Socks5服务器地址 [$default_address]: " address
-            [ -z "$address" ] && address="$default_address"
-        else
-            read -r -p "请输入Socks5服务器地址 (例如 127.0.0.1): " address
-        fi
-        [ -n "$address" ] && break || error "服务器地址不能为空。"
-    done
-
-    while true; do
-        if [ -n "$default_port" ]; then
-            read -r -p "请输入Socks5服务器端口 [$default_port]: " port
-            [ -z "$port" ] && port="$default_port"
-        else
-            read -r -p "请输入Socks5服务器端口: " port
-        fi
-        if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then break;
-        else error "请输入 1 到 65535 之间的有效数字。"; fi
-    done
-
-    if [ -n "$default_user" ]; then
-        read -r -p "请输入用户名 (输入 clear 清空) [$default_user]: " username
-        if [ -z "$username" ]; then
-            username="$default_user"
-        elif [ "$username" = "clear" ]; then
-            username=""
-        fi
-    else
-        read -r -p "请输入用户名 (可选，无账号直接回车): " username
+    if [ -z "$VERSION" ]; then
+        VERSION="v0.1.3"
     fi
-
-    if [ -n "$username" ]; then
-        if [ -n "$default_pass" ]; then
-            read -r -p "请输入密码 (留空保持原样) [$default_pass]: " password
-            [ -z "$password" ] && password="$default_pass"
-        else
-            read -r -p "请输入密码: " password
-        fi
-    else
-        password=""
-    fi
-
-    echo "$address|$port|$username|$password"
+    export VERSION
+    echo "$VERSION" > "${CONF_DIR}/.version" 2>/dev/null
 }
 
-cleanup_ip_rules() {
-    step "正在清理残留的 IP 规则和路由..."
-    ip rule del fwmark 438 lookup main pref 10 2>/dev/null || true
-    ip -6 rule del fwmark 438 lookup main pref 10 2>/dev/null || true
-    ip route del default dev tun0 table 20 2>/dev/null || true
-    ip rule del lookup 20 pref 20 2>/dev/null || true
-    ip rule del to 127.0.0.0/8 lookup main pref 16 2>/dev/null || true
-    ip rule del to 10.0.0.0/8 lookup main pref 16 2>/dev/null || true
-    ip rule del to 172.16.0.0/12 lookup main pref 16 2>/dev/null || true
-    ip rule del to 192.168.0.0/16 lookup main pref 16 2>/dev/null || true
+download_and_extract() {
+    detect_target
+    fetch_latest_version
+    info "正在匹配系统环境形态: ${YELLOW}${TARGET}${RESET}"
 
-    while ip rule del pref 15 2>/dev/null; do :; done
-    while ip -6 rule del pref 15 2>/dev/null; do :; done
-    success "路由规则清理完成。"
+    ASSET="next-socks5-${TARGET}.tar.gz"
+    URL_TGZ="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
+
+    TMP="$(mktemp -d)"
+    trap 'rm -rf "$TMP"' EXIT
+
+    info "开始同步下载资产包..."
+    curl -fsSL -o "$TMP/$ASSET" "$URL_TGZ" || die "下载资产包失败！"
+
+    tar xzf "$TMP/$ASSET" -C "$TMP"
+    EXTRACTED_BIN=$(find "$TMP" -type f -name "next-socks5" | head -n 1)
+    [ -n "$EXTRACTED_BIN" ] || die "解压成功，但在归档包内未找到 next-socks5 主程序！"
+    export TARGET_BIN_PATH="$EXTRACTED_BIN"
 }
 
-# 格式安全的 YAML 写入函数
-write_config_file() {
-    local addr=$1 port=$2 user=$3 pass=$4
-    mkdir -p "$CONFIG_DIR"
+# ── 2. TOML 配置文件生成器 ──────────────────────────────────────────────────
+write_config() {
+    local bind_ip="$1" local bind_port="$2" local username="$3" local password="$4"
+    [ -d "$CONF_DIR" ] || install -m 0755 -d "$CONF_DIR"
     
-    cat > "$CONFIG_FILE" <<EOF
-tunnel:
-  name: tun0
-  mtu: 8500
-  multi-queue: true
-  ipv4: 198.18.0.1
+    cat <<EOF > "$CONF_FILE"
+listen = "${bind_ip}:${bind_port}"
 
-socks5:
-  port: $port
-  address: '$addr'
-  udp: 'udp'
-  mark: 438
+[auth]
 EOF
 
-    # 仅当用户名不为空时，才安全地追加字段
-    if [ -n "$user" ]; then
-        sed -i "/udp: 'udp'/a \  username: '$user'" "$CONFIG_FILE"
-        if [ -n "$pass" ]; then
-            sed -i "/username: '$user'/a \  password: '$pass'" "$CONFIG_FILE"
-        fi
+    if [ -n "$username" ] && [ -n "$password" ]; then
+        cat <<EOF >> "$CONF_FILE"
+method = "password"
+[[auth.users]]
+username = "${username}"
+password = "${password}"
+EOF
+    else
+        cat <<EOF >> "$CONF_FILE"
+method = "none"
+EOF
     fi
+
+    cat <<EOF >> "$CONF_FILE"
+
+[timeouts]
+connect_ms = 10000
+tcp_idle_ms = 300000
+udp_idle_ms = 60000
+
+[udp]
+# port_range = "40000-40100"      # bind UDP relay sockets to this range
+# advertise = "YOUR_PUBLIC_IP"    # advertised BND IP for clients behind NAT
+EOF
 }
 
-#================================================================================
-# 核心动作
-#================================================================================
-
-download_core() {
-    set_dns64_servers || { error "网络初始化失败，无法连接外网下载核心"; return 1; }
-    
-    step "从 GitHub 获取最新的 tun2socks 核心下载链接..."
-    local url
-    url=$(curl -s https://api.github.com/repos/$REPO/releases/latest | grep "browser_download_url" | grep "linux-x86_64" | cut -d '"' -f 4)
-    
-    if [ -z "$url" ]; then
-        error "未能获取下载链接，请检查网络。"
-        restore_dns_config
-        return 1
-    fi
-
-    step "正在下载最新核心程序..."
-    if ! curl -L -o "$BINARY_PATH" "$url"; then
-        error "核心程序下载失败。"
-        restore_dns_config
-        return 1
-    fi
-
-    chmod +x "$BINARY_PATH"
-    restore_dns_config
-    return 0
-}
-
-install_tun2socks() {
-    cleanup_ip_rules
-    if systemctl is-active --quiet tun2socks.service; then
-        systemctl stop tun2socks.service
-    fi
-
-    download_core || return
-
-    SERVICE_FILE="/etc/systemd/system/tun2socks.service"
-
-    local config_data
-    config_data=$(get_custom_server_config)
-    IFS='|' read -r SOCKS_ADDRESS SOCKS_PORT SOCKS_USERNAME SOCKS_PASSWORD <<< "$config_data"
-
-    write_config_file "$SOCKS_ADDRESS" "$SOCKS_PORT" "$SOCKS_USERNAME" "$SOCKS_PASSWORD"
-
-    MAIN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}') || ""
-    MAIN_IP6=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}') || ""
-
-    RULE_ADD_4=""; RULE_DEL_4=""
-    RULE_ADD_6=""; RULE_DEL_6=""
-    [ -n "$MAIN_IP" ] && RULE_ADD_4="ExecStartPost=/sbin/ip rule add from $MAIN_IP lookup main pref 15" && RULE_DEL_4="ExecStop=/sbin/ip rule del from $MAIN_IP lookup main pref 15"
-    [ -n "$MAIN_IP6" ] && RULE_ADD_6="ExecStartPost=/sbin/ip -6 rule add from $MAIN_IP6 lookup main pref 15" && RULE_DEL_6="ExecStop=/sbin/ip -6 rule del from $MAIN_IP6 lookup main pref 15"
-
-    cat > "$SERVICE_FILE" <<EOF
+write_systemd() {
+    cat <<EOF > "$SERVICE_FILE"
 [Unit]
-Description=Tun2Socks Tunnel Service
-After=network.target
+Description=next-socks5 - Fast and Lightweight SOCKS5 Server
+After=network.target network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$BINARY_PATH $CONFIG_FILE
-ExecStartPost=/bin/sleep 1
-ExecStartPost=/sbin/ip rule add fwmark 438 lookup main pref 10
-ExecStartPost=/sbin/ip -6 rule add fwmark 438 lookup main pref 10
-ExecStartPost=/sbin/ip route add default dev tun0 table 20
-ExecStartPost=/sbin/ip rule add lookup 20 pref 20
-$RULE_ADD_4
-$RULE_ADD_6
-ExecStartPost=/sbin/ip rule add to 127.0.0.0/8 lookup main pref 16
-ExecStartPost=/sbin/ip rule add to 10.0.0.0/8 lookup main pref 16
-ExecStartPost=/sbin/ip rule add to 172.16.0.0/12 lookup main pref 16
-ExecStartPost=/sbin/ip rule add to 192.168.0.0/16 lookup main pref 16
-
-ExecStop=/sbin/ip rule del fwmark 438 lookup main pref 10
-ExecStop=/sbin/ip -6 rule del fwmark 438 lookup main pref 10
-ExecStop=/sbin/ip route del default dev tun0 table 20
-ExecStop=/sbin/ip rule del lookup 20 pref 20
-$RULE_DEL_4
-$RULE_DEL_6
-ExecStop=/sbin/ip rule del to 127.0.0.0/8 lookup main pref 16
-ExecStop=/sbin/ip rule del to 10.0.0.0/8 lookup main pref 16
-ExecStop=/sbin/ip rule del to 172.16.0.0/12 lookup main pref 16
-ExecStop=/sbin/ip rule del to 192.168.0.0/16 lookup main pref 16
-Restart=on-failure
+User=${SERVICE_USER}
+Group=${SERVICE_USER}
+WorkingDirectory=${DATA_DIR}
+ExecStart=${INSTALL_BIN} serve --config ${CONF_FILE} --no-tui
+Restart=always
+RestartSec=3s
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
     systemctl daemon-reload
-    systemctl enable tun2socks.service 2>/dev/null
-    systemctl start tun2socks.service
-    success "Tun2socks 安装并启动成功！"
+    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
 }
 
-update_core_binary() {
-    if [ ! -f "$BINARY_PATH" ]; then
-        error "未检测到系统已安装 Tun2Socks 核心，请先选择选项 1 进行安装。"
-        return
-    fi
+# ── 节点配置总结报告（全局统一样式） ──────────────────────────────────────────────────
+print_node_summary() {
+    local full_bind
+    full_bind=$(grep -i 'listen' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    local bind_port="${full_bind##*:}"
     
-    local is_running=false
-    if systemctl is-active --quiet tun2socks.service; then
-        is_running=true
-        step "正在暂时停止服务以进行核心升级..."
-        systemctl stop tun2socks.service
-        cleanup_ip_rules
+    local auth_method
+    auth_method=$(grep -i 'method' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    
+    local auth_user="" local auth_pass=""
+    if [ "$auth_method" = "password" ]; then
+        auth_user=$(grep -i 'username' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+        auth_pass=$(grep -i 'password' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
     fi
 
-    if download_core; then
-        success "Tun2Socks 核心二进制文件已成功升级到最新版本！"
+    local public_ip
+    public_ip=$(curl -s --max-time 3 ipv4.icanhazip.com || curl -s --max-time 3 api.ipify.org || echo "你的公网IP")
+
+    echo -e "\n${GREEN}====== 当前配置详情 ======${RESET}"
+    echo -e "${GREEN}IP地址       :${RESET} ${public_ip}"
+    echo -e "${GREEN}端口         :${RESET} ${bind_port}"
+    if [ -n "$auth_user" ]; then
+        echo -e "${GREEN}用户名       :${RESET} ${auth_user}"
+        echo -e "${GREEN}密码         :${RESET} ${auth_pass}"
     else
-        error "核心升级失败。"
+        echo -e "${GREEN}鉴权模式     :${RESET} ${YELLOW}无密码 (免密模式)${RESET}"
     fi
-
-    if [ "$is_running" = true ]; then
-        step "正在重新启动 Tun2Socks 服务..."
-        systemctl start tun2socks.service
-        success "服务已重新拉起。"
-    fi
-}
-
-uninstall_tun2socks() {
-    if systemctl is-active --quiet tun2socks.service; then systemctl stop tun2socks.service; fi
-    cleanup_ip_rules
-    systemctl disable tun2socks.service 2>/dev/null || true
-    rm -f /etc/systemd/system/tun2socks.service
-    rm -rf "$CONFIG_DIR"
-    rm -f "$BINARY_PATH"
-    systemctl daemon-reload
-    success "卸载完成。"
-}
-
-modify_config() {
-    if [ ! -f "$CONFIG_FILE" ]; then
-        error "配置文件不存在，请先选择 1 进行安装。"
-        return
+    echo -e "${GREEN}分享存放路径 :${RESET} ${CONF_FILE}"
+    echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
+    
+    echo -e "${GREEN}====== 👉 通用客户端 Socks5 链接 ======${RESET}"
+    if [ -n "$auth_user" ]; then
+        echo -e "${CYAN}socks://${auth_user}:${auth_pass}@${public_ip}:${bind_port}#uu-socks5${RESET}"
+    else
+        echo -e "${CYAN}socks://${public_ip}:${bind_port}#uu-socks5${RESET}"
     fi
     
-    local config_data
-    config_data=$(get_custom_server_config)
-    IFS='|' read -r SOCKS_ADDRESS SOCKS_PORT SOCKS_USERNAME SOCKS_PASSWORD <<< "$config_data"
-
-    if systemctl is-active --quiet tun2socks.service; then
-        systemctl stop tun2socks.service
+    echo -e "${GREEN}====== 🚀 Telegram 内置一键代理链接 ======${RESET}"
+    if [ -n "$auth_user" ]; then
+        echo -e "${CYAN}https://t.me/socks?server=${public_ip}&port=${bind_port}&user=${auth_user}&pass=${auth_pass}${RESET}"
+    else
+        echo -e "${CYAN}https://t.me/socks?server=${public_ip}&port=${bind_port}${RESET}"
     fi
-    cleanup_ip_rules
+    echo ""
+}
 
-    write_config_file "$SOCKS_ADDRESS" "$SOCKS_PORT" "$SOCKS_USERNAME" "$SOCKS_PASSWORD"
+# ── 3. 面板核心数据抓取 ───────────────────────────────────────────────────────
+get_status_info() {
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        panel_status="${GREEN}运行中${RESET}"
+    else
+        panel_status="${RED}未运行${RESET}"
+    fi
+
+    if [ -f "$INSTALL_BIN" ]; then
+        if [ -f "${CONF_DIR}/.version" ]; then
+            panel_version=$(cat "${CONF_DIR}/.version")
+        else
+            local raw_ver
+            raw_ver=$("$INSTALL_BIN" --version 2>/dev/null | grep -oE '[vV]?[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+            if [ -n "$raw_ver" ]; then
+                panel_version="$raw_ver"
+                echo "$raw_ver" > "${CONF_DIR}/.version" 2>/dev/null
+            else
+                panel_version="v0.1.3 (最新版)"
+            fi
+        fi
+    else
+        panel_version="${RED}未安装${RESET}"
+    fi
+
+    if [ -f "$CONF_FILE" ]; then
+        panel_port=$(grep -i 'listen' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ' )
+    else
+        panel_port="0.0.0.0:20494"
+    fi
+}
+
+menu_install() {
+    if [ -f "$INSTALL_BIN" ]; then
+        warn "系统中已存在安装好的实例文件。"
+        read -r -p "$(echo -e "${GREEN}是否确定完全覆盖重新安装？[y/N]: ${RESET}")" res
+        [[ "$res" =~ ^[Yy]$ ]] || return
+    fi
+
+    echo -e "\n${GREEN}==== [自定义安装配置] ====${RESET}"
+    read -r -p "$(echo -e "${GREEN}请输入监听 IP 地址 [默认: 0.0.0.0]: ${RESET}")" input_ip
+    local opt_ip="${input_ip:-0.0.0.0}"
+
+    read -r -p "$(echo -e "${GREEN}请输入 SOCKS5 监听端口 [默认: 20494]: ${RESET}")" input_port
+    local opt_port="${input_port:-20494}"
+    if ! [[ "$opt_port" =~ ^[0-9]+$ ]] || [ "$opt_port" -le 0 ] || [ "$opt_port" -gt 65535 ]; then
+        opt_port=20494
+    fi
+
+    local opt_user="" local opt_pass=""
+    local rand_user="user_$(openssl rand -hex 4)"
+    local rand_pass="$(openssl rand -hex 10)"
+
+    read -r -p "$(echo -e "${GREEN}请输入鉴权用户名 [回车默认随机生成, 输入 ${RED}none${GREEN} 选无密码]: ${RESET}")" input_user
+    if [ -z "$input_user" ]; then
+        opt_user="$rand_user"
+        opt_pass="$rand_pass"
+    elif [ "$input_user" = "none" ]; then
+        opt_user=""
+        opt_pass=""
+    else
+        opt_user="$input_user"
+        read -r -p "$(echo -e "${GREEN}请输入鉴权密码 [回车默认随机生成]: ${RESET}")" input_pass
+        opt_pass="${input_pass:-$rand_pass}"
+    fi
+
+    download_and_extract
+
+    if ! id "$SERVICE_USER" >/dev/null 2>&1; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER" 2>/dev/null \
+          || adduser --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
+    fi
+
+    install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$INSTALL_BIN"
+    install -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" -d "$DATA_DIR"
+    write_config "$opt_ip" "$opt_port" "$opt_user" "$opt_pass"
+    write_systemd
+
+    info "正在拉起后台服务..."
+    systemctl start "$SERVICE_NAME"
     
-    success "配置修改成功。"
-    step "正在重启服务以应用新配置..."
-    systemctl daemon-reload
-    systemctl start tun2socks.service
-    success "服务已重启并生效。"
-}
-
-test_dns_resolution() {
-    step "测试全局代理下的双栈 DNS 解析状态..."
-    echo -n "IPv4 解析测试 (www.google.com): "
-    if curl -4s --connect-timeout 5 https://www.google.com >/dev/null; then echo -e "${GREEN}正常${NC}"; else echo -e "${RED}失败${NC}"; fi
-    echo -n "IPv6 解析测试 (www.google.com): "
-    if curl -6s --connect-timeout 5 https://www.google.com >/dev/null; then echo -e "${GREEN}正常${NC}"; else echo -e "${RED}失败${NC}"; fi
-}
-
-#================================================================================
-# 主循环菜单界面
-#================================================================================
-main_menu() {
-    while true; do
-        if systemctl is-active --quiet tun2socks.service; then
-            status="${GREEN}运行中${NC}"
-        else
-            status="${RED}未运行${NC}"
-        fi
-
-        if [ -f "$CONFIG_FILE" ]; then
-            port_show=$(grep -oP 'port:\s*\K[0-9]+' "$CONFIG_FILE" | head -n 1)
-            port_show="${YELLOW}${port_show}${NC}"
-        else
-            port_show="${RED}未配置${NC}"
-        fi
-
-        local core_version="未知"
-        if [ -f "$BINARY_PATH" ]; then
-            core_version=$("$BINARY_PATH" -v 2>&1 | head -n 1 | awk '{print $3}')
-            [ -z "$core_version" ] && core_version="已安装"
-        fi
-
-        echo -e "${GREEN}================================${NC}"
-        echo -e "${GREEN}      Tun2Socks 管理面板        ${NC}"
-        echo -e "${GREEN}================================${NC}"
-        echo -e "${GREEN}状态   :${NC} $status"
-        echo -e "${GREEN}核心版本:${NC} ${YELLOW}${core_version}${NC}"
-        echo -e "${GREEN}端口   :${NC} ${port_show}"
-        echo -e "${GREEN}================================${NC}"
-        echo -e "${GREEN} 1. 安装 Tun2Socks 核心与配置${NC}"
-        echo -e "${GREEN} 2. 更新 Tun2Socks 核心程序${NC}"
-        echo -e "${GREEN} 3. 卸载 Tun2Socks 及其服务${NC}"
-        echo -e "${GREEN} 4. 修改出口 Socks5 配置${NC}"
-        echo -e "${GREEN} 5. 启动 Tun2Socks 服务${NC}"
-        echo -e "${GREEN} 6. 停止 Tun2Socks 服务${NC}"
-        echo -e "${GREEN} 7. 重启 Tun2Socks 服务${NC}"
-        echo -e "${GREEN} 8. 查看服务运行日志${NC}"
-        echo -e "${GREEN} 9. 测试代理与 DNS 连通性${NC}"
-        echo -e "${GREEN} 0. 退出管理面板${NC}"
-        echo -e "${GREEN}================================${NC}"
-        
-        read -p $'\e[32m请输入数字: \e[0m' num
-        case "$num" in
-            1) install_tun2socks ;;
-            2) update_core_binary ;;
-            3) uninstall_tun2socks ;;
-            4) modify_config ;;
-            5) cleanup_ip_rules && systemctl start tun2socks.service && success "服务已启动。" ;;
-            6) systemctl stop tun2socks.service && cleanup_ip_rules && success "服务已停止。" ;;
-            7) systemctl stop tun2socks.service && cleanup_ip_rules && systemctl start tun2socks.service && success "服务已重启。" ;;
-            8) journalctl -u tun2socks.service -n 50 --no-pager ;;
-            9) test_dns_resolution ;;
-            0) exit 0 ;;
-            *) error "无效输入，请输入正确的数字！" ; sleep 1 ;;
-        esac
-        echo
-        read -n 1 -s -r -p "按任意键返回主菜单..."
-        clear
+    local is_ok=1
+    for i in {1..5}; do
+        if systemctl is-active --quiet "$SERVICE_NAME"; then is_ok=0; break; fi
+        sleep 1
     done
+
+    if [ "$is_ok" -eq 0 ]; then
+        ok "next-socks5 代理服务部署成功！"
+        print_node_summary
+    else
+        warn "部署完成，但初始化响应异常，请稍后选择 [8] 查看实时日志。"
+    fi
 }
 
-# 脚本入口
-require_root
-clear
-main_menu
+menu_update() {
+    [ -f "$SERVICE_FILE" ] || die "未检测到系统服务，请先选择 [1] 进行完整安装。"
+    download_and_extract
+    systemctl stop "$SERVICE_NAME"
+    install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$INSTALL_BIN"
+    systemctl start "$SERVICE_NAME"
+    ok "next-socks5 核心主程序已完成平滑更新。"
+}
+
+menu_uninstall() {
+    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1
+    systemctl disable "$SERVICE_NAME" >/dev/null 2>&1
+    rm -f "$INSTALL_BIN" "$SERVICE_FILE"
+    systemctl daemon-reload
+    rm -rf "$CONF_DIR" "$DATA_DIR"
+    userdel "$SERVICE_USER" >/dev/null 2>&1
+    ok "next-socks5 核心组件及配置文件已全部安全卸载收回。"
+}
+
+menu_edit_config() {
+    [ -f "$CONF_FILE" ] || die "未发现任何配置文件，请先执行安装步骤。"
+    local current_bind
+    current_bind=$(grep -i 'listen' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    local current_ip="${current_bind%%:*}" local current_port="${current_bind##*:}"
+    
+    local current_method
+    current_method=$(grep -i 'method' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    
+    local current_user="" local current_pass=""
+    if [ "$current_method" = "password" ]; then
+        current_user=$(grep -i 'username' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+        current_pass=$(grep -i 'password' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    fi
+
+    [ -z "$current_ip" ] && current_ip="0.0.0.0"
+    [ -z "$current_port" ] && current_port="20494"
+
+    echo -e "\n${GREEN}==== [修改内核参数配置] ====${RESET}"
+    read -r -p "$(echo -e "${GREEN}请输入监听 IP 地址 [当前: ${current_ip}]: ${RESET}")" input_ip
+    local opt_ip="${input_ip:-$current_ip}"
+
+    read -r -p "$(echo -e "${GREEN}请输入 SOCKS5 监听端口 [当前: ${current_port}]: ${RESET}")" input_port
+    local opt_port="${input_port:-$current_port}"
+    if ! [[ "$opt_port" =~ ^[0-9]+$ ]] || [ "$opt_port" -le 0 ] || [ "$opt_port" -gt 65535 ]; then
+        opt_port="$current_port"
+    fi
+
+    local opt_user="" local opt_pass=""
+    local rand_user="user_$(openssl rand -hex 4)"
+    local rand_pass="$(openssl rand -hex 10)"
+
+    read -r -p "$(echo -e "${GREEN}请输入用户名 [当前: ${current_user:-无密码}, 输入 ${RED}none${GREEN} 切换为无密码, 回车随机生成]: ${RESET}")" input_user
+    if [ -z "$input_user" ]; then
+        if [ -n "$current_user" ]; then
+            opt_user="$current_user" opt_pass="$current_pass"
+        else
+            opt_user="$rand_user" opt_pass="$rand_pass"
+        fi
+    elif [ "$input_user" = "none" ]; then
+        opt_user="" opt_pass=""
+    else
+        opt_user="$input_user"
+        read -r -p "$(echo -e "${GREEN}请输入新密码 [回车默认随机生成]: ${RESET}")" input_pass
+        opt_pass="${input_pass:-$rand_pass}"
+    fi
+
+    write_config "$opt_ip" "$opt_port" "$opt_user" "$opt_pass"
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        systemctl restart "$SERVICE_NAME"
+        ok "配置已覆盖，全套代理服务已同步重启生效！"
+        print_node_summary
+    else
+        ok "配置已成功重写更新。"
+    fi
+}
+
+# ── 🛠️ 彻底修改：让查看配置与安装一模一样 ───────────────────────────────────────────
+menu_show_node_config() {
+    if [ ! -f "$CONF_FILE" ]; then 
+        die "未检测到有效的服务配置文件，请先执行选择 [1] 进行完整安装。"
+    fi
+
+    # 1. 直接输出对齐安装的经典配置详情与分享链接
+    print_node_summary
+
+    # 2. 附加本地链路健康性测试（不影响排版输出）
+    local full_bind
+    full_bind=$(grep -i 'listen' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    local bind_ip="${full_bind%%:*}" local bind_port="${full_bind##*:}"
+    local connect_ip="$bind_ip"
+    if [ "$connect_ip" = "0.0.0.0" ]; then connect_ip="127.0.0.1"; fi
+
+    local auth_method
+    auth_method=$(grep -i 'method' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    
+    local auth_user="" local auth_pass=""
+    if [ "$auth_method" = "password" ]; then
+        auth_user=$(grep -i 'username' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+        auth_pass=$(grep -i 'password' "$CONF_FILE" | head -n 1 | awk -F '=' '{print $2}' | tr -d '" ')
+    fi
+
+    local proxy_args="--socks5-hostname ${connect_ip}:${bind_port}"
+    if [ -n "$auth_user" ] && [ -n "$auth_pass" ]; then
+        proxy_args="--socks5-hostname ${auth_user}:${auth_pass}@${connect_ip}:${bind_port}"
+    fi
+
+    echo -e "${YELLOW}[正在进行本地链路连通性自检...]${RESET}"
+    if curl -sI --max-time 5 $proxy_args "https://github.com" > /dev/null; then
+        echo -e "代理连通状态 :   ${GREEN}✔ 正常运行 (流量转发通畅)${RESET}"
+    else
+        echo -e "代理连通状态 :   ${RED}✘ 异常/未检测到公网响应${RESET}"
+        warn "提示: 如果服务已运行但检测失败，请确保云服务器后台安全组/防火墙已放行对应端口。"
+    fi
+    echo ""
+}
+
+# ── 4. 主循环控制中心 ─────────────────────────────────────────────────────────
+while true; do
+    get_status_info
+    clear
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}        next-socks5 面板       ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $panel_status"
+    echo -e "${GREEN}版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
+    echo -e "${GREEN}绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN} 1. 安装 next-socks5${RESET}"
+    echo -e "${GREEN} 2. 更新 next-socks5${RESET}"
+    echo -e "${GREEN} 3. 卸载 next-socks5${RESET}"
+    echo -e "${GREEN} 4. 修改配置${RESET}"
+    echo -e "${GREEN} 5. 启动 next-socks5${RESET}"
+    echo -e "${GREEN} 6. 停止 next-socks5${RESET}"
+    echo -e "${GREEN} 7. 重启 next-socks5${RESET}"
+    echo -e "${GREEN} 8. 查看日志${RESET}"
+    echo -e "${GREEN} 9. 查看配置${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    
+    read -r -p "$(echo -e "${GREEN}请输入选项: ${RESET}")" choice
+    
+    case "$choice" in
+        1) menu_install ;;
+        2) menu_update ;;
+        3) menu_uninstall ;;
+        4) menu_edit_config ;;
+        5) systemctl start "$SERVICE_NAME" && ok "动作: 核心启动成功" ;;
+        6) systemctl stop "$SERVICE_NAME" && ok "动作: 核心停止成功" ;;
+        7) systemctl restart "$SERVICE_NAME" && ok "动作: 核心重启成功" ;;
+        8) (trap 'echo -e "\n"' INT; journalctl -u "$SERVICE_NAME" -n 50 -f) ;;
+        9) menu_show_node_config ;;
+        0) clear; exit 0 ;;
+        *) warn "未识别的无效序号！"; sleep 1 ;;
+    esac
+    
+    read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键返回主控制面板...${RESET}")"
+done

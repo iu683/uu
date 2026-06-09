@@ -1,357 +1,318 @@
 #!/bin/bash
+# ========================================================
+# qBittorrent-Nox (userdocs 纯静态-多架构自适应版) 一键脚本
+# ========================================================
 
-# 基础路径设定
-CFT_INSTALL_DIR="/opt/cloudflared"
-CFT_BIN="/usr/local/bin/cloudflared"
-TOKEN_FILE="$CFT_INSTALL_DIR/.token"
-IS_OPENWRT=0
-IS_ALPINE=0
+# 颜色
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+CYAN="\033[36m"
+RESET="\033[0m"
 
-G_STATUS=""
-G_VERSION=""
+SERVICE_NAME="qbittorrent"
+APP_DIR="/opt/qbittorrent"
+BIN_FILE="$APP_DIR/qbittorrent-nox"
+CONFIG_DIR="$APP_DIR/config"
+DOWNLOAD_DIR="$APP_DIR/downloads"
+SERVICE_FILE="/etc/systemd/system/qbittorrent.service"
 
-# GitHub 轮询节点列表
-GITHUB_PROXY=(
-    'https://gh-proxy.com/'
-    'https://v6.gh-proxy.org/'
-    'https://ghproxy.lvedong.eu.org/'
-    'https://proxy.vvvv.ee/'
-    'https://hub.glowp.xyz/'
-    '' 
-)
-DEFAULT_BACKUP_VER="2026.5.0"
-
-# 标准颜色
-CYAN="\e[36m"
-GREEN="\e[32m"
-YELLOW="\e[33m"
-RED="\e[31m"
-RESET="\e[0m"
-
-# 检查运行环境与架构
-check_env() {
-    if [ -f /etc/openwrt_release ]; then
-        IS_OPENWRT=1
-    elif [ -f /etc/alpine-release ]; then
-        IS_ALPINE=1
-    fi
-}
-check_env
-
-get_arch() {
-    # Cloudflare 官方发布包命名中，linux-amd64 已经默认兼容了 Alpine musl 环境
-    # 因此不需要在文件名末尾拼接 "-musl" 字符串
-    case "$(uname -m)" in
-        x86_64) echo "amd64";;
-        aarch64) echo "arm64";;
-        armv7*|armv6*) echo "arm";;
-        *) echo "amd64";;
-    esac
-}
-
-# 自动获取 GitHub 最新版本号
-get_auto_version() {
-    local fetched_ver=""
-    echo -e "${YELLOW}正在尝试获取 GitHub 远端最新 cloudflared 版本号...${RESET}" >&2
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        fetched_ver=$(curl -sL -m 4 "${proxy}https://api.github.com/repos/cloudflare/cloudflared/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | sed 's/"tag_name": *//;s/"//g')
-        if [ -n "$fetched_ver" ]; then
-            echo "$fetched_ver"
-            return 0
-        fi
-    done
-    echo "$DEFAULT_BACKUP_VER"
-}
-
-# 下载组件核心逻辑
-download_package_loop() {
-    local version=$1
-    local arch=$2
-    local remote_filename="cloudflared-linux-${arch}"
-    local success=0
-
-    echo -e "${YELLOW}开始下载 cloudflared 二进制文件 ${version} (${arch})...${RESET}"
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local url="${proxy}https://github.com/cloudflare/cloudflared/releases/download/${version}/${remote_filename}"
-        if wget -T 10 -O "cloudflared_tmp" "$url"; then
-            echo -e "${GREEN}[成功] 下载完成！${RESET}"
-            success=1
-            break
-        else
-            rm -f "cloudflared_tmp"
-        fi
-    done
-    [ $success -eq 1 ] && return 0 || return 1
-}
-
-# 安装/更新主程序功能
-install_or_update_bin() {
-    local CFT_VER=$(get_auto_version)
-    local ARCH=$(get_arch)
-    
-    mkdir -p "$CFT_INSTALL_DIR"
-    cd "$CFT_INSTALL_DIR" || exit 1
-
-    if download_package_loop "$CFT_VER" "$ARCH"; then
-        stop_service 2>/dev/null || true
-        mv -f "cloudflared_tmp" "$CFT_BIN"
-        chmod +x "$CFT_BIN"
-        echo -e "${GREEN}[成功] cloudflared 主程序已就位/更新成功！${RESET}"
-        [ -f "$TOKEN_FILE" ] && restart_service
+# 动态获取状态、本地版本、IP和端口
+get_status_info() {
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        status="${GREEN}已启动${RESET}"
     else
-        echo -e "${RED}[严重错误] 下载失败，请检查网络或重试！${RESET}"
+        status="${RED}未运行${RESET}"
     fi
-    read -p "按回车返回菜单..." </dev/tty
+
+    if [[ -f "$BIN_FILE" ]]; then
+        version=$("$BIN_FILE" --version 2>/dev/null | awk '{print $2}')
+        [[ -z "$version" ]] && version="已安装"
+    else
+        version="${RED}未安装${RESET}"
+    fi
+
+    if [[ -f "$SERVICE_FILE" ]]; then
+        port_show=$(grep -oE -- '--webui-port=[0-9]+' "$SERVICE_FILE" | cut -d= -f2)
+        [[ -z "$port_show" ]] && port_show="8080"
+        
+        ip_show=$(grep -oE -- '--webui-listen-address=[^ ]+' "$SERVICE_FILE" | cut -d= -f2)
+        [[ -z "$ip_show" ]] && ip_show="0.0.0.0 (全部)"
+    else
+        port_show="N/A"
+        ip_show="N/A"
+    fi
 }
 
-# 更新隧道运行状态
-update_status_variables() {
-    G_VERSION="未检测到组件"
-    G_STATUS="${RED}已停止${RESET}"
-
-    if [ -f "$CFT_BIN" ]; then
-        G_VERSION=$($CFT_BIN --version 2>/dev/null | awk '{print $3}' || echo "未知")
-        if [ "$IS_OPENWRT" = "1" ]; then
-            (ps | grep -v grep | grep -q "[c]loudflared") && G_STATUS="${GREEN}已启动${RESET}"
-        elif [ "$IS_ALPINE" = "1" ]; then
-            (rc-service cloudflared status 2>/dev/null | grep -q "started") && G_STATUS="${GREEN}已启动${RESET}"
-        else
-            (systemctl is-active --quiet cloudflared 2>/dev/null) && G_STATUS="${GREEN}已启动${RESET}"
-        fi
-    fi
-}
-
-# 写入 OpenWrt 守护服务
-write_initd_service() {
-    local token=$(cat "$TOKEN_FILE" 2>/dev/null)
-    [ -z "$token" ] && return 1
+# 从 journalctl 日志中自动过滤并精准提取临时密码
+get_qb_password() {
+    local log_line log_pass
+    log_line=$(sudo journalctl -u "$SERVICE_NAME" --no-pager | grep -E "temporary password is:|password.*session:" | tail -n 1)
     
-    cat > /etc/init.d/cloudflared <<EOF
-#!/bin/sh /etc/rc.common
-START=99
-USE_PROCD=1
-PROG=$CFT_BIN
-start_service() {
-    procd_open_instance
-    procd_set_param command \$PROG tunnel run --token "$token"
-    procd_set_param respawn
-    procd_close_instance
-}
-EOF
-    chmod +x /etc/init.d/cloudflared
-    /etc/init.d/cloudflared enable
+    if [[ -n "$log_line" ]]; then
+        log_pass=$(echo "$log_line" | awk '{print $NF}' | tr -d '.')
+    fi
+    
+    if [[ -n "$log_pass" ]]; then
+        echo -e "${GREEN}${log_pass}${RESET}"
+    else
+        echo -e "${RED}未找到临时密码（可能已在WebUI中修改，或日志已被清空）${RESET}"
+    fi
 }
 
-# 写入 Alpine (OpenRC) 守护服务
-write_openrc_service() {
-    local token=$(cat "$TOKEN_FILE" 2>/dev/null)
-    [ -z "$token" ] && return 1
+# 核心：自动识别系统架构，并动态解析对应的最新下载直链
+get_latest_release() {
+    echo -e "${YELLOW}正在检测当前系统架构...${RESET}"
+    
+    # 自动识别架构
+    local arch=$(uname -m)
+    local arch_keyword=""
+    
+    case "$arch" in
+        x86_64)
+            arch_keyword="x86_64-qbittorrent-nox"
+            echo -e "${GREEN}检测到架构: x86_64 (标准PC/服务器)${RESET}"
+            ;;
+        aarch64|arm64)
+            arch_keyword="aarch64-qbittorrent-nox"
+            echo -e "${GREEN}检测到架构: ARM64/AArch64 (如甲骨文ARM、新版树莓派等)${RESET}"
+            ;;
+        armv7l|armhf)
+            arch_keyword="armv7-qbittorrent-nox"
+            echo -e "${GREEN}检测到架构: ARMv7 32位 (如旧版树莓派、玩客云等)${RESET}"
+            ;;
+        *)
+            echo -e "${RED}错误: 暂不支持当前系统架构 ($arch)${RESET}"
+            return 1
+            ;;
+    esac
 
-    cat > /etc/init.d/cloudflared <<EOF
-#!/sbin/openrc-run
-description="Cloudflare Tunnel (Token Mode)"
-supervisor="supervise-daemon"
-command="$CFT_BIN"
-command_args="tunnel run --token $token"
-command_background="yes"
-pidfile="/run/\${RC_SVCNAME}.pid"
+    echo -e "${YELLOW}正在拉取 userdocs 仓库最新发布版数据...${RESET}"
+    local release_json
+    release_json=$(curl -s --max-time 10 https://api.github.com/repos/userdocs/qbittorrent-nox-static/releases/latest)
+    
+    if [[ -z "$release_json" ]] || [[ "$release_json" == *"message"* ]]; then
+        echo -e "${RED}错误: 无法获取 GitHub Release 信息，请检查网络。${RESET}"
+        return 1
+    fi
 
-depend() {
-    need net
-    after firewall
+    # 提取最新 Tag 名字
+    LATEST_TAG=$(echo "$release_json" | grep -m1 '"tag_name":' | sed -E 's/.*"tag_name":[^"]*"([^"]+)".*/\1/')
+    
+    # 动态匹配符合当前架构的静态编译包下载 URL
+    DOWNLOAD_URL=$(echo "$release_json" | grep '"browser_download_url":' | grep "$arch_keyword" | head -n 1 | sed -E 's/.*"browser_download_url":[^"]*"([^"]+)".*/\1/')
+
+    if [[ -z "$DOWNLOAD_URL" || -z "$LATEST_TAG" ]]; then
+        echo -e "${RED}错误: 未能成功解析出适合当前架构 (${arch}) 的静态下载链接！${RESET}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}成功匹配最新稳定版 [${LATEST_TAG}]${RESET}"
+    return 0
 }
-EOF
-    chmod +x /etc/init.d/cloudflared
-    rc-update add cloudflared default >/dev/null 2>&1
+
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "127.0.0.1"
 }
 
-# 写入标准 Linux Systemd 守护服务
-write_systemd_service() {
-    local token=$(cat "$TOKEN_FILE" 2>/dev/null)
-    [ -z "$token" ] && return 1
+# 基础目录环境初始化
+mkdir -p "$APP_DIR" "$CONFIG_DIR" "$DOWNLOAD_DIR"
+chown -R $(whoami):$(whoami) "$APP_DIR"
+chmod -R 755 "$APP_DIR"
 
-    cat > /etc/systemd/system/cloudflared.service <<EOF
+# 1. 部署自适应最新版 qBittorrent-Nox
+install_qbittorrent() {
+    if ! command -v curl &> /dev/null; then
+        echo -e "${YELLOW}正在安装必要依赖 curl...${RESET}"
+        sudo apt update && sudo apt install -y curl
+    fi
+
+    get_latest_release || return
+
+    echo -ne "${YELLOW}请输入你想要绑定的 WebUI IP [默认: 0.0.0.0 (监听所有IP)]: ${RESET}"
+    read -r custom_ip
+    [[ -z "$custom_ip" ]] && custom_ip="0.0.0.0"
+
+    echo -ne "${YELLOW}请输入你想要设置的 WebUI 端口号 [默认: 8080]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="8080"
+
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
+    fi
+
+    echo -e "${YELLOW}正在下载适配当前架构的纯静态二进制包...${RESET}"
+    sudo curl -L -o "$BIN_FILE" "$DOWNLOAD_URL"
+    
+    if [[ $? -ne 0 || ! -s "$BIN_FILE" ]]; then
+        echo -e "${RED}错误: 下载文件失败，请检查网络！${RESET}"
+        return
+    fi
+
+    chmod +x "$BIN_FILE"
+    chown $(whoami):$(whoami) "$BIN_FILE"
+
+    echo -e "${YELLOW}创建 systemd 服务文件...${RESET}"
+    sudo tee "$SERVICE_FILE" > /dev/null <<EOF
 [Unit]
-Description=Cloudflare Tunnel (Token Mode)
+Description=qBittorrent-nox (Multiaarch Static)
 After=network.target
 
 [Service]
-Type=simple
-ExecStart=$CFT_BIN tunnel run --token $token
-Restart=always
-RestartSec=5
+ExecStart=${BIN_FILE} --webui-listen-address=${custom_ip} --webui-port=${custom_port} --profile=$CONFIG_DIR
+User=$(whoami)
+Restart=on-failure
+WorkingDirectory=$DOWNLOAD_DIR
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-}
 
-# 统合写入守护服务路由
-deploy_service_config() {
-    if [ "$IS_OPENWRT" = "1" ]; then
-        write_initd_service
-    elif [ "$IS_ALPINE" = "1" ]; then
-        write_openrc_service
+    sudo systemctl daemon-reload
+    sudo systemctl start qbittorrent
+    sudo systemctl enable qbittorrent
+
+    echo -e "${YELLOW}等待服务拉起并同步日志...${RESET}"
+    sleep 4
+
+    if [[ "$custom_ip" == "0.0.0.0" ]]; then
+        SHOW_IP=$(get_public_ip)
     else
-        write_systemd_service
+        SHOW_IP=$custom_ip
     fi
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}qBittorrent-Nox 静态自适应版安装完成！${RESET}"
+    echo -e "${YELLOW}WebUI 访问地址: http://${SHOW_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}默认用户名: admin${RESET}"
+    echo -ne "${YELLOW}初始随机密码: ${RESET}"
+    get_qb_password
+    echo -e "${YELLOW}配置目录: $CONFIG_DIR${RESET}"
+    echo -e "${YELLOW}下载目录: $DOWNLOAD_DIR${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 绑定 Token
-bind_token() {
-    if [ ! -f "$CFT_BIN" ]; then
-        echo -e "${RED}错误：本地没有主程序，请先执行选项 1 安装主程序！${RESET}"
-        sleep 2
+# 2. 自动更新
+update_qbittorrent() {
+    get_latest_release || return
+    echo -e "${YELLOW}正在停止现有服务...${RESET}"
+    sudo systemctl stop "$SERVICE_NAME"
+    echo -e "${YELLOW}正在下载最新适配架构文件覆盖...${RESET}"
+    sudo curl -L -o "$BIN_FILE" "$DOWNLOAD_URL"
+    chmod +x "$BIN_FILE"
+    echo -e "${YELLOW}正在重新启动服务...${RESET}"
+    sudo systemctl start "$SERVICE_NAME"
+    echo -e "${GREEN}成功自动同步至最新架构包 (${LATEST_TAG})！${RESET}"
+}
+
+# 3. 卸载服务
+uninstall_qbittorrent() {
+    sudo systemctl stop ${SERVICE_NAME} 2>/dev/null
+    sudo systemctl disable ${SERVICE_NAME} 2>/dev/null
+    sudo rm -f "$SERVICE_FILE"
+    sudo systemctl daemon-reload
+    rm -rf "$APP_DIR"
+    echo -e "${GREEN}qBittorrent 已完全卸载${RESET}"
+}
+
+# 4. 修改端口和 IP 配置
+edit_config() {
+    if [[ ! -f "$SERVICE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到服务文件！${RESET}"
         return
     fi
+    get_status_info
+    echo -e "${CYAN}当前绑定的 IP 为: ${ip_show}${RESET}"
+    echo -e "${CYAN}当前 WebUI 端口为: ${port_show}${RESET}"
+    echo -e "${YELLOW}================================${RESET}"
+    echo -ne "${YELLOW}请输入新的绑定 IP (回车保持不变): ${RESET}"
+    read -r new_ip
+    echo -ne "${YELLOW}请输入新的 WebUI 端口号 (回车保持不变): ${RESET}"
+    read -r new_port
 
-    echo "=== 绑定 Cloudflare Tunnel Token ==="
-    echo -e "${YELLOW}请输入你在 Cloudflare 网页端获取的官方一键 Token (eyJhIjoi...):${RESET}"
-    read -p "Token: " input_token </dev/tty
-    
-    if [ -z "$input_token" ]; then
-        echo -e "${RED}Token 不能为空，放弃操作。${RESET}"
-        sleep 1.5
-        return
+    if [[ -n "$new_ip" ]]; then
+        sudo sed -i "s/--webui-listen-address=[^ ]*/--webui-listen-address=${new_ip}/g" "$SERVICE_FILE"
     fi
-
-    mkdir -p "$CFT_INSTALL_DIR"
-    rm -f "$CFT_INSTALL_DIR/config.yml" "$CFT_INSTALL_DIR/tunnel_cred.json" "$CFT_INSTALL_DIR/.cft_inited"
-    
-    echo "$input_token" | tr -d '\r\n ' > "$TOKEN_FILE"
-    echo -e "${GREEN}Token 记录成功！正在配置并尝试拉起服务...${RESET}"
-    
-    deploy_service_config
-    start_service
-    sleep 1.5
-}
-
-# 启动服务
-start_service() {
-    if [ ! -f "$CFT_BIN" ] || [ ! -f "$TOKEN_FILE" ]; then
-        echo -e "${RED}错误：未安装主程序或未绑定 Token！${RESET}"; sleep 2; return
-    fi
-
-    deploy_service_config
-    if [ "$IS_OPENWRT" = "1" ]; then
-        /etc/init.d/cloudflared start
-    elif [ "$IS_ALPINE" = "1" ]; then
-        rc-service cloudflared start
-    else
-        systemctl start cloudflared
-        systemctl enable cloudflared 2>/dev/null || true
-    fi
-    echo "隧道服务已启动"; sleep 1;
-}
-
-# 停止服务
-stop_service() {
-    if [ "$IS_OPENWRT" = "1" ]; then
-        /etc/init.d/cloudflared stop
-    elif [ "$IS_ALPINE" = "1" ]; then
-        rc-service cloudflared stop 2>/dev/null || true
-    else
-        systemctl stop cloudflared
-    fi
-    echo "隧道服务已停止"; sleep 1;
-}
-
-# 重启服务
-restart_service() {
-    if [ ! -f "$CFT_BIN" ] || [ ! -f "$TOKEN_FILE" ]; then
-        echo -e "${RED}错误：未安装主程序或未绑定 Token！${RESET}"; sleep 2; return
-    fi
-
-    deploy_service_config
-    if [ "$IS_OPENWRT" = "1" ]; then
-        /etc/init.d/cloudflared restart
-    elif [ "$IS_ALPINE" = "1" ]; then
-        rc-service cloudflared restart
-    else
-        systemctl restart cloudflared
-    fi
-    echo "隧道服务已重启"; sleep 1;
-}
-
-# 查看运行日志
-log_service() {
-    echo -e "${CYAN}=== 正在获取最近的 30 行隧道运行日志 ===${RESET}"
-    if [ "$IS_OPENWRT" = "1" ]; then 
-        logread | grep cloudflared | tail -n 30 || echo "暂无日志"
-    elif [ "$IS_ALPINE" = "1" ]; then
-        if [ -f /var/log/messages ]; then
-            tail -n 100 /var/log/messages | grep cloudflared | tail -n 30
+    if [[ -n "$new_port" ]]; then
+        if ! [[ "$new_port" =~ ^[0-9]+$ ]]; then
+            echo -e "${RED}错误：端口必须是纯数字！${RESET}"
         else
-            echo -e "${YELLOW}Alpine 默认输出至 syslog，请确保已安装 busybox-initscripts 或 syslog-ng${RESET}"
-            rc-service cloudflared status
+            sudo sed -i "s/--webui-port=[0-9]*/--webui-port=${new_port}/g" "$SERVICE_FILE"
         fi
-    else 
-        journalctl -u cloudflared -n 30 --no-pager 2>/dev/null || tail -n 30 /var/log/messages 2>/dev/null
     fi
-    read -p "按回车返回菜单..." </dev/tty
+    sudo systemctl daemon-reload
+    sudo systemctl restart "$SERVICE_NAME"
+    echo -e "${GREEN}配置已更新并重启生效！${RESET}"
 }
 
-# 彻底卸载
-uninstall_service() {
-    echo -e "${RED}确定要彻底卸载本地服务及清除所有配置吗？(y/n)${RESET}"
-    read -p "请输入: " confirm </dev/tty
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        stop_service 2>/dev/null || true
-        if [ "$IS_OPENWRT" = "1" ]; then
-            /etc/init.d/cloudflared disable 2>/dev/null || true
-            rm -f /etc/init.d/cloudflared
-        elif [ "$IS_ALPINE" = "1" ]; then
-            rc-update del cloudflared default >/dev/null 2>&1 || true
-            rm -f /etc/init.d/cloudflared
-        else
-            systemctl disable cloudflared 2>/dev/null || true
-            rm -f /etc/systemd/system/cloudflared.service
-            systemctl daemon-reload
-        fi
-        rm -rf "$CFT_INSTALL_DIR" "$CFT_BIN"
-        echo -e "${GREEN}Cloudflare Tunnel 已完全卸载干净。${RESET}"
-        sleep 2
-    fi
+start_qbittorrent() { sudo systemctl start ${SERVICE_NAME} && echo -e "${GREEN}qBittorrent 已启动${RESET}"; }
+stop_qbittorrent() { sudo systemctl stop ${SERVICE_NAME} && echo -e "${YELLOW}qBittorrent 已停止${RESET}"; }
+restart_qbittorrent() { sudo systemctl restart ${SERVICE_NAME} && echo -e "${GREEN}qBittorrent 已重启${RESET}"; }
+logs_qbittorrent() { sudo journalctl -u ${SERVICE_NAME} -n 50 -f; }
+
+show_node_info() {
+    get_status_info
+    local current_ip=$(grep -oE -- '--webui-listen-address=[^ ]+' "$SERVICE_FILE" | cut -d= -f2)
+    [[ -z "$current_ip" || "$current_ip" == "0.0.0.0" ]] && current_ip=$(get_public_ip)
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    qBittorrent 访问与配置信息    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}绑定 IP    : ${ip_show}${RESET}"
+    echo -e "${YELLOW}WebUI 地址 : http://${current_ip}:${port_show}${RESET}"
+    echo -e "${YELLOW}默认用户名 : admin${RESET}"
+    echo -ne "${YELLOW}初始随机密码: ${RESET}"
+    get_qb_password
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# ---------- 主菜单界面 ----------
-main_menu() {
-    while true; do
-        update_status_variables
-        clear
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}   Cloudflare 远端控制管理面板    ${RESET}"
-        echo -e "${GREEN}   (Dashboard 模式/无需本地配置)  ${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        [ ! -f "$CFT_BIN" ] && echo -e "${RED}[警告] 未找到执行文件，请先执行选项 1 安装！${RESET}"
-        echo -e "${GREEN}当前状态 :${RESET} $G_STATUS"
-        echo -e "${GREEN}主程序版 :${RESET} ${YELLOW}${G_VERSION}${RESET}"
-        echo -e "${GREEN}管理提示 : 规则增删请直接在网页面板操作${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} 1. 安装/更新cloudflared${RESET}"
-        echo -e "${GREEN} 2. 绑定/修改Token${RESET}"
-        echo -e "${GREEN} 3. 启动隧道服务${RESET}"
-        echo -e "${GREEN} 4. 停止隧道服务${RESET}"
-        echo -e "${GREEN} 5. 重启隧道服务${RESET}"
-        echo -e "${GREEN} 6. 查看运行日志${RESET}"
-        echo -e "${GREEN} 7. 卸载服务${RESET}"
-        echo -e "${GREEN} 0. 退出${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -ne "${GREEN}请输入选项: ${RESET}"
-        read choice </dev/tty
-        case $choice in
-            1) install_or_update_bin ;;
-            2) bind_token ;;
-            3) start_service ;;
-            4) stop_service ;;
-            5) restart_service ;;
-            6) log_service ;;
-            7) uninstall_service ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选项！${RESET}" && sleep 1 ;;
-        esac
-    done
+menu() {
+    clear
+    get_status_info
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}  qBittorrent 全架构自适应面板  ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $status"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -ne "${GREEN}绑定IP :${RESET} ${YELLOW}${ip_show}${RESET}"
+    echo -e "  ${GREEN}端口:${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 自动安装 qBittorrent (支持 x86_64 / ARM)${RESET}"
+    echo -e "${GREEN}2. 自动检查并升级最新版${RESET}"
+    echo -e "${GREEN}3. 卸载 qBittorrent${RESET}"
+    echo -e "${GREEN}4. 修改 IP/端口 配置${RESET}"
+    echo -e "${GREEN}5. 启动 qBittorrent${RESET}"
+    echo -e "${GREEN}6. 停止 qBittorrent${RESET}"
+    echo -e "${GREEN}7. 重启 qBittorrent${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read -r choice
+    case "$choice" in
+        1) install_qbittorrent ;;
+        2) update_qbittorrent ;;
+        3) uninstall_qbittorrent ;;
+        4) edit_config ;;
+        5) start_qbittorrent ;;
+        6) stop_qbittorrent ;;
+        7) restart_qbittorrent ;;
+        8) logs_qbittorrent ;;
+        9) show_node_info ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
+    esac
 }
 
-main_menu
+while true; do
+    menu
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    read -r
+done

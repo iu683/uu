@@ -1,238 +1,613 @@
 #!/bin/bash
-# =================================================================
-# qBittorrent Docker Compose 管理面板 (最终完美修复版)
-# =================================================================
+# ========================================
+# Rclone 管理脚本 
+# ========================================
 
-# 颜色
-RED="\033[31m"
+# ================== 颜色 ==================
 GREEN="\033[32m"
 YELLOW="\033[33m"
+RED="\033[31m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="qbittorrent"
-BASE_DIR="/opt/qbittorrent"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+# ================== 全局变量 & 目录配置 ==================
+BASE_DIR="/opt/rclone_manager"
+LOG_DIR="$BASE_DIR/log"
+SCRIPT_DIR="$BASE_DIR/scripts"
+CONFIG_FILE="$BASE_DIR/config.env"
+CRON_PREFIX="# rclone_sync_task:"
 
-check_dependencies() {
-    if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
-        exit 1
+mkdir -p "$LOG_DIR" "$SCRIPT_DIR"
+
+# 获取系统环境名称
+if [ -f /etc/os-release ]; then
+    OS=$(awk -F= '/^NAME/{print $2}' /etc/os-release | tr -d '"')
+else
+    OS=$(uname -s)
+fi
+
+# ================== 载入或初始化配置文件 ==================
+init_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        cat > "$CONFIG_FILE" <<EOF
+TG_TOKEN="填入你的默认BotToken"
+TG_CHAT_ID="填入你的默认ChatID"
+VPS_NAME="未命名VPS"
+EOF
     fi
+    source "$CONFIG_FILE"
 }
+init_config
 
-get_status_info() {
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${GREEN}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}已停止${RESET}"
-    else
-        status="${RED}未部署${RESET}"
-    fi
-
-    if [[ -f "$COMPOSE_FILE" ]]; then
-        webui_port=$(grep -E "\-[[:space:]]+[0-9]+:8080" "$COMPOSE_FILE" | awk -F ':' '{print $1}' | tr -d ' -')
-        [[ -z "$webui_port" ]] && webui_port="8080"
-
-        torrent_port=$(grep -E "\-[[:space:]]+[0-9]+:6881($|[[:space:]]|\/)" "$COMPOSE_FILE" | head -n 1 | awk -F ':' '{print $1}' | tr -d ' -')
-        [[ -z "$torrent_port" ]] && torrent_port="6881"
-
-        download_dir=$(grep -E -- "- .+/downloads" "$COMPOSE_FILE" | awk -F ':' '{print $1}' | sed 's/- //g' | xargs)
-        [[ -z "$download_dir" ]] && download_dir="/opt/qbittorrent/downloads"
-    else
-        webui_port="N/A"
-        torrent_port="N/A"
-        download_dir="N/A"
-    fi
-}
-
-# 【已修复】强力密码提取函数
-get_qb_password() {
-    if [ ! "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        echo -e "${RED}容器未部署${RESET}"
-        return
-    fi
+# ================== 动态状态获取 ==================
+get_system_status() {
+    echo -e "${GREEN}=========== Rclone 管理菜单 ===========${RESET}"
     
-    local log_pass
-    # 放宽匹配条件，移除干扰字符，精准提取最后一行密码
-    log_pass=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -iE "temporary password|session:" | tail -n 1 | sed 's/\r//g' | awk '{print $NF}' | tr -d '[:space:].')
-    
-    if [[ -n "$log_pass" && ! "$log_pass" =~ "session:" && ! "$log_pass" =~ "password" ]]; then
-        echo -e "${GREEN}${log_pass}${RESET}"
+    if command -v rclone &> /dev/null; then
+        local rclone_ver=$(rclone version | head -n 1 | awk '{print $2}')
+        echo -e "${GREEN}Rclone 状态:${RESET} ${YELLOW}已安装 (${rclone_ver})${RESET}"
     else
-        echo -e "${YELLOW}未探测到初始随机密码（可能已被你修改，或日志已被冲刷）${RESET}"
+        echo -e "${GREEN}Rclone 状态:${RESET} ${RED}未安装${RESET}"
     fi
-}
 
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+    if command -v rclone &> /dev/null; then
+        local remote_count=$(rclone listremotes 2>/dev/null | wc -l)
+        echo -e "${GREEN}已配置网盘:${RESET} ${YELLOW}${remote_count} 个${RESET}"
+    else
+        echo -e "${GREEN}已配置网盘:${RESET} ${YELLOW}----${RESET}"
+    fi
+
+    local active_mounts=$(mount | grep -i "rclone" | awk '{print $3}')
+    if [ -n "$active_mounts" ]; then
+        echo -e "${GREEN}活跃挂载点: ${RESET}"
+        echo "$active_mounts" | while read -r mnt; do
+            echo -e " ${YELLOW}● $mnt (已开启开机自启)${RESET}"
         done
-    done
-    echo "你的服务器IP"
-}
-
-install_qbittorrent() {
-    check_dependencies
-    mkdir -p "$BASE_DIR"
-
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    
-    echo -ne "${YELLOW}请输入 WebUI 访问端口 (宿主机端口) [默认: 8080]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
+    else
+        echo -e "${GREEN}活跃挂载点:${RESET} ${YELLOW}暂无活跃挂载${RESET}"
     fi
 
-    echo -ne "${YELLOW}请输入 Torrent 传输端口 (宿主机端口) [默认: 6881]: ${RESET}"
-    read -r custom_p2p_port
-    [[ -z "$custom_p2p_port" ]] && custom_p2p_port="6881"
+    local cron_count=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX" | wc -l)
+    echo -e "${GREEN}同步定时任务:${RESET} ${YELLOW}${cron_count} 个活跃任务${RESET}"
 
-    echo -ne "${YELLOW}请输入宿主机下载绝对路径 [默认: /opt/qbittorrent/downloads]: ${RESET}"
-    read -r custom_download
-    [[ -z "$custom_download" ]] && custom_download="/opt/qbittorrent/downloads"
+    if [[ "$TG_TOKEN" == "填入你的默认BotToken" || -z "$TG_TOKEN" ]]; then
+        echo -e "${GREEN}TG 通知状态:${RESET} ${RED}未配置${RESET}"
+    else
+        echo -e "${GREEN}TG 通知状态:${RESET} ${YELLOW}已启用 (${VPS_NAME})${RESET}"
+    fi
+}
 
-    mkdir -p "$BASE_DIR/config"
-    mkdir -p "$custom_download"
-    chmod -R 777 "$BASE_DIR/config" "$custom_download"
+# ================== 菜单 ==================
+show_menu() {
+    clear
+    get_system_status
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN} [ Rclone 管理 ]${RESET}"
+    echo -e "${CYAN} 1) 安装 Rclone${RESET}         ${CYAN}2) 更新 Rclone${RESET}"
+    echo -e "${CYAN} 3) 配置 Rclone (config)${RESET}${CYAN}4) 查看远程存储列表${RESET}"
+    echo -e "${CYAN} 5) 查看远程存储文件${RESET}"
+    echo -e "${GREEN}----------------------------------------${RESET}"
+    echo -e "${GREEN} [ 挂载管理 (配置开机自启) ]${RESET}"
+    echo -e "${CYAN} 6) 挂载网盘 ${RESET}           ${CYAN} 7) 查看已创建的资产清单${RESET}"
+    echo -e "${CYAN} 8) 卸载指定挂载点${RESET}      ${CYAN} 9) 卸载所有挂载点${RESET}"
+    echo -e "${CYAN}10) 查看挂载运行状态${RESET}    ${CYAN}11) 查看挂载实时日志${RESET}"
+    echo -e "${GREEN}----------------------------------------${RESET}"
+    echo -e "${GREEN} [ 数据同步与任务 ]${RESET}"
+    echo -e "${CYAN}12) 同步 本地 → 远程${RESET}    ${CYAN}13) 同步 远程 → 本地${RESET}"
+    echo -e "${CYAN}14) 定时任务管理 (Cron)${RESET}"
+    echo -e "${GREEN}----------------------------------------${RESET}"
+    echo -e "${GREEN} [ 全局设置与常规 ]${RESET}"
+    echo -e "${CYAN}15) 修改 TG 通知参数${RESET}    ${CYAN}16) 卸载 Rclone${RESET}"
+    echo -e "${CYAN} 0) 退出${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
+}
 
-    echo -e "${YELLOW}正在生成 docker-compose.yml 配置文件...${RESET}"
+# ================== 基础操作 ==================
+install_rclone() {
+    echo -e "${YELLOW}正在检测并安装 FUSE 挂载依赖组件...${RESET}"
     
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  qbittorrent:
-    image: lscr.io/linuxserver/qbittorrent:latest
-    container_name: ${CONTAINER_NAME}
-    environment:
-      - PUID=$(id -u)
-      - PGID=$(id -g)
-      - TZ=Asia/Shanghai
-      - WEBUI_PORT=8080
-      - TORRENTING_PORT=${custom_p2p_port}
-    volumes:
-      - ${BASE_DIR}/config:/config
-      - ${custom_download}:/downloads
-    ports:
-      - ${custom_port}:8080
-      - ${custom_p2p_port}:${custom_p2p_port}
-      - ${custom_p2p_port}:${custom_p2p_port}/udp
-    stop_grace_period: 10s
-    restart: unless-stopped
+    # 1. 智能识别包管理器并安装 FUSE
+    if command -v apt-get &> /dev/null; then
+        sudo apt-get update -y
+        # 优先安装 fuse3，如果失败则尝试安装 fuse
+        sudo apt-get install -y fuse3 || sudo apt-get install -y fuse
+    elif command -v dnf &> /dev/null; then
+        sudo dnf install -y fuse3 || sudo dnf install -y fuse
+    elif command -v yum &> /dev/null; then
+        sudo yum install -y fuse3 || sudo yum install -y fuse
+    else
+        echo -e "${YELLOW}未检测到主流包管理器，请手动确保系统已安装 fuse / fuse3，否则挂载功能可能无法使用。${RESET}"
+    fi
+
+    # 2. 验证 FUSE 是否安装成功
+    if command -v fusermount3 &> /dev/null || command -v fusermount &> /dev/null; then
+        echo -e "${GREEN}FUSE 依赖组件安装/检查成功！${RESET}"
+    else
+        echo -e "${RED}⚠️ FUSE 依赖安装可能失败，后续网盘挂载功能（Option 6）可能会报错。${RESET}"
+    fi
+
+    # 3. 安装 Rclone 本体
+    echo -e "${YELLOW}正在安装 Rclone 本体...${RESET}"
+    if curl https://rclone.org/install.sh | sudo bash; then
+        echo -e "${GREEN}Rclone 安装完成！${RESET}"
+    else
+        echo -e "${RED}❌ Rclone 本体安装失败，请检查网络连接。${RESET}"
+    fi
+}
+
+update_rclone() {
+    echo -e "${YELLOW}正在更新 Rclone...${RESET}"
+    curl https://rclone.org/install.sh | sudo bash
+    echo -e "${GREEN}Rclone 已更新完成！${RESET}"
+    rclone version
+}
+
+config_rclone() { rclone config; }
+list_remotes() { rclone listremotes; }
+
+list_files_remote() {
+    read -p "请输入Rclone创建的网盘名称: " remote
+    [ -z "$remote" ] && { echo -e "${RED}远程名称不能为空${RESET}"; return; }
+    read -p "请输入远程目录(默认 /): " remote_dir
+    remote_dir=${remote_dir:-/}
+    rclone ls "${remote}:${remote_dir}" || echo -e "${RED}访问失败，请检查名称或权限${RESET}"
+}
+
+# ================== TG 参数持久化 ==================
+modify_tg() {
+    read -p "请输入 TG Bot Token (当前: $TG_TOKEN): " input_token
+    read -p "请输入 TG Chat ID (当前: $TG_CHAT_ID): " input_id
+    read -p "请输入 VPS 名称 (当前: $VPS_NAME): " input_name
+
+    TG_TOKEN=${input_token:-$TG_TOKEN}
+    TG_CHAT_ID=${input_id:-$TG_CHAT_ID}
+    VPS_NAME=${input_name:-$VPS_NAME}
+
+    cat > "$CONFIG_FILE" <<EOF
+TG_TOKEN="$TG_TOKEN"
+TG_CHAT_ID="$TG_CHAT_ID"
+VPS_NAME="$VPS_NAME"
+EOF
+    echo -e "${GREEN}TG 参数已成功保存到本地配置文件！${RESET}"
+}
+
+send_tg() {
+    local msg="$1"
+    source "$CONFIG_FILE"
+    if [[ "$TG_TOKEN" != "填入你的默认BotToken" ]]; then
+        curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT_ID}" -d text="[$VPS_NAME] $msg" >/dev/null
+    fi
+}
+
+
+# ================== 智能挂载自启动一体化 ==================
+mount_remote() {
+
+
+    read -p "请输入Rclone创建的网盘名称: " remote
+    [ -z "$remote" ] && return
+    
+    read -p "请输入网盘内的存储桶/子目录 (如 sss): " remote_dir
+    
+    # 如果用户输入了桶名，自动去掉前后的斜杠
+    remote_dir=$(echo "$remote_dir" | sed 's/^\///;s/\/$//')
+    
+    # 智能生成默认本地路径
+    if [ -z "$remote_dir" ]; then
+        default_path="/mnt/${remote}"
+        local mount_source="${remote}:"
+    else
+        # 如果有桶名，本地目录名变成 /mnt/CF_sss，更直观
+        default_path="/mnt/${remote}_${remote_dir}"
+        local mount_source="${remote}:${remote_dir}"
+    fi
+    
+    read -p "请输入VPS本地挂载路径 (默认 $default_path): " input_path
+    path=${input_path:-$default_path}
+    
+    # 1. 检查防冲突与强行清理僵尸挂载
+    if mount | grep -q "on $path type"; then
+        echo -e "${YELLOW}该本地路径 $path 已经被挂载。正在执行热刷新升级...${RESET}"
+        sudo umount -l "$path" 2>/dev/null
+    fi
+
+    # 清理可能残留的 PID（新版 Rclone 推荐靠 systemd 管理进程）
+    [ -f "/var/run/rclone_${remote}.pid" ] && rm -f "/var/run/rclone_${remote}.pid"
+
+    sudo mkdir -p "$path"
+    service_file="/etc/systemd/system/rclone-mount@${remote}.service"
+    
+    # 2. 写入 Systemd (完美适配 R2 特性参数)
+    sudo tee "$service_file" >/dev/null <<EOF
+[Unit]
+Description=Rclone Mount ${remote}
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+# 核心参数优化：加入了权限允许、写入缓存
+ExecStart=/usr/bin/rclone mount ${mount_source} $path \\
+    --allow-other \\
+    --vfs-cache-mode full \\
+    --vfs-cache-max-age 24h \\
+    --vfs-cache-max-size 10G \\
+    --buffer-size 64M \\
+    --dir-cache-time 1h \\
+    --drive-chunk-size 64M
+# 使用更强壮的 lazy umount 停止服务，防止卸载时卡死
+ExecStop=/usr/bin/umount -l $path
+Restart=always
+RestartSec=10
+StandardOutput=append:$LOG_DIR/rclone_${remote}_sys.log
+StandardError=append:$LOG_DIR/rclone_${remote}_sys.log
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 qBittorrent...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d
-
-    echo -e "${YELLOW}等待容器初始化并同步密码日志 (约10秒)...${RESET}"
-    sleep 10
-
-    SHOW_IP=$(get_public_ip)
-
-    echo -e "${GREEN}==================================================${RESET}"
-    echo -e "${GREEN}       qBittorrent Docker 部署成功！${RESET}"
-    echo -e "${GREEN}==================================================${RESET}"
-    echo -e "${YELLOW}WebUI 访问地址 : http://${SHOW_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}默认用户名     : admin${RESET}"
-    echo -ne "${YELLOW}初始临时密码   : ${RESET}"
-    get_qb_password
-    echo -e "${YELLOW}宿主机配置路径 : $BASE_DIR/config${RESET}"
-    echo -e "${YELLOW}宿主机下载路径 : $custom_download${RESET}"
-    echo -e "${GREEN}==================================================${RESET}"
+    # 3. 启动服务
+    sudo systemctl daemon-reload
+    sudo systemctl enable rclone-mount@${remote}
+    sudo systemctl restart rclone-mount@${remote} # 用 restart 确保应用新配置
+    
+    echo "正在等待挂载启动..."
+    sleep 3
+    
+    # 4. 验证挂载状态
+    if systemctl is-active --quiet "rclone-mount@${remote}"; then
+        echo -e "${GREEN}✅ 已成功将网盘 [${mount_source}] 挂载到本地 [${path}]！${RESET}"
+        echo -e "${GREEN}ℹ️ 缓存刷新时间设为 1 小时，新文件会在 1 小时内自动同步。${RESET}"
+        echo -e "${GREEN}⚙️ 开机自启动守护已妥善配置。可以使用 'df -h' 查看状态。${RESET}"
+    else
+        echo -e "${RED}❌ 挂载启动失败！${RESET}"
+        echo -e "${RED}请运行以下命令查看具体报错日志:${RESET}"
+        echo -e "${YELLOW}tail -n 20 $LOG_DIR/rclone_${remote}_sys.log${RESET}"
+    fi
 }
 
-update_qbittorrent() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+
+unmount_remote_by_name() {
+    read -p "请输入想要卸载的Rclone创建的网盘名称 (如 CF): " remote
+    [ -z "$remote" ] && return
+    
+    local svc="rclone-mount@${remote}"
+    local service_file="/etc/systemd/system/${svc}.service"
+    local path=""
+
+    # 核心改进：从现有的 systemd 服务文件中提取真正的本地挂载路径
+    if [ -f "$service_file" ]; then
+        # 匹配 ExecStart 中最后一个以 / 开头的路径参数
+        path=$(grep "ExecStart=" "$service_file" | awk '{print $NF}')
+    fi
+    
+    # 如果没找到服务文件，则降级使用默认猜测路径
+    if [ -z "$path" ]; then
+        path="/mnt/${remote}"
+    fi
+    
+    # 1. 停止并移除 Systemd 自启守护服务
+    if [ -f "$service_file" ] || systemctl list-unit-files | grep -q "^${svc}"; then
+        echo -e "${YELLOW}正在停止并移除 [${remote}] 的开机自启动守护服务...${RESET}"
+        sudo systemctl stop "$svc" 2>/dev/null
+        sudo systemctl disable "$svc" 2>/dev/null
+        sudo rm -f "$service_file"
+        sudo systemctl daemon-reload
+    fi
+
+    # 2. 强行解除本地挂载（优先使用通用的 umount -l，防止死锁）
+    echo -e "${YELLOW}正在解除路径 [${path}] 的网络挂载...${RESET}"
+    sudo umount -l "$path" 2>/dev/null || sudo fusermount -u "$path" 2>/dev/null
+    
+    # 3. 清理残留
+    [ -f "/var/run/rclone_${remote}.pid" ] && rm -f "/var/run/rclone_${remote}.pid"
+
+    echo -e "${GREEN}✅ 远程存储 ${remote} 卸载完成，本地目录 [${path}] 已释放，自启同步移除！${RESET}"
+}
+
+unmount_all() {
+    echo -e "${YELLOW}正在全面清空并移除所有网盘挂载与开机自启动...${RESET}"
+    
+    # 核心改进：直接从配置目录扫描所有 rclone-mount@ 开头的服务文件，不管它当前是运行还是停止
+    local sys_services=$(find /etc/systemd/system/ -name "rclone-mount@*.service" -exec basename {} \;)
+    
+    if [ -n "$sys_services" ]; then
+        for svc in $sys_services; do
+            echo -e "${CYAN} ➜ 正在彻底清理服务: $svc${RESET}"
+            sudo systemctl stop "$svc" 2>/dev/null
+            sudo systemctl disable "$svc" 2>/dev/null
+            sudo rm -f "/etc/systemd/system/$svc"
+        done
+        sudo systemctl daemon-reload
+    fi
+
+    # 清理所有相关的 PID 文件
+    rm -f /var/run/rclone_*.pid
+
+    # 强行拆除所有处于 rclone 类型的挂载点（通过 mount 动态抓取，绝不漏网）
+    local active_mounts=$(mount | grep -i "rclone" | awk '{print $3}')
+    if [ -n "$active_mounts" ]; then
+        echo "$active_mounts" | while read -r mnt; do
+            echo -e "${CYAN} ➜ 正在强制卸载僵尸目录: $mnt${RESET}"
+            sudo umount -l "$mnt" 2>/dev/null || sudo fusermount -u "$mnt" 2>/dev/null
+        done
+    fi
+    echo -e "${GREEN}✅ 系统内所有 Rclone 挂载及相关自启服务已全部清洗完毕。${RESET}"
+}
+# ================== 资产清单综合查看面板 ==================
+show_assets_manifest() {
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}       📁 Rclone 已创资产名称清单      ${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    
+    # 1. 扫描已生成的自启动挂载服务
+    echo -e "${CYAN}[1] 已创建的自启动挂载服务名字信息：${RESET}"
+    local service_files=$(ls /etc/systemd/system/rclone-mount@*.service 2>/dev/null)
+    if [ -n "$service_files" ]; then
+        echo "$service_files" | while read -r file; do
+            # 提取网盘名称
+            local r_name=$(basename "$file" | sed 's/rclone-mount@//;s/\.service//')
+            # 提取挂载路径
+            local m_path=$(grep -E '^ExecStart=' "$file" | awk '{print $4}')
+            # 检查当前是否在运行
+            if systemctl is-active --quiet "rclone-mount@${r_name}"; then
+                local r_status="${GREEN}● 正在运行${RESET}"
+            else
+                local r_status="${RED}○ 已停止${RESET}"
+            fi
+            echo -e "  网盘名称: ${YELLOW}${r_name}${RESET}  |  挂载路径: ${YELLOW}${m_path}${RESET}  [${r_status}]"
+        done
+    else
+        echo -e "  ${YELLOW}(暂无通过本脚本创建的挂载服务)${RESET}"
+    fi
+
+    echo -e "---------------------------------------"
+
+    # 2. 扫描本脚本生成的 Cron 定时同步任务
+    echo -e "${CYAN}[2] 已创建的定时任务(Cron)名字信息：${RESET}"
+    local cron_tasks=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX")
+    if [ -n "$cron_tasks" ]; then
+        echo "$cron_tasks" | while read -r line; do
+            # 提取任务唯一标识名
+            local task_id=$(echo "$line" | awk -F "$CRON_PREFIX" '{print $2}')
+            # 提取运行周期表达式
+            local cron_time=$(echo "$line" | awk -F "/opt/rclone_manager" '{print $1}')
+            echo -e "  任务名字: ${YELLOW}${task_id}${RESET}  |  执行周期: ${YELLOW}${cron_time}${RESET}"
+        done
+    else
+        echo -e "  ${YELLOW}(暂无通过本脚本创建的定时同步任务)${RESET}"
+    fi
+    echo -e "${GREEN}=======================================${RESET}"
+}
+
+# ================== 状态和日志查看 ==================
+view_mount_status() {
+    read -p "请输入想要查看状态的Rclone创建网盘名称: " remote
+    [ -z "$remote" ] && return
+    local svc="rclone-mount@${remote}"
+    
+    if systemctl list-unit-files | grep -q "^${svc}"; then
+        echo -e "${CYAN}--- Systemd 状态服务信息 ---${RESET}"
+        sudo systemctl status "$svc"
+    else
+        echo -e "${RED}未找到该网盘 [${remote}] 对应的挂载守护服务，请确认名称是否正确。${RESET}"
+    fi
+}
+
+view_mount_logs() {
+    read -p "想要查看实时日志，请输入Rclone创建的网盘名称: " remote
+    [ -z "$remote" ] && return
+    local log_file="$LOG_DIR/rclone_${remote}_sys.log"
+    
+    if [ -f "$log_file" ]; then
+        echo -e "${CYAN}--- 正在读取实时日志 (按 Ctrl+C 退出日志查看模式) ---${RESET}"
+        tail -n 50 -f "$log_file"
+    else
+        echo -e "${RED}未找到对应的日志文件: ${log_file}${RESET}"
+    fi
+}
+
+# ================== 高级定时任务管理面板 ==================
+show_cron_panel() {
+    local TASK_COUNT=$(crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]' | wc -l)
+
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}        ◈  Cron 定时任务管理面板  ◈      ${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN} 当前系统环境 : ${YELLOW}${OS}${RESET}"
+    echo -e "${GREEN} 活跃任务总数 : ${YELLOW}${TASK_COUNT} 条${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN} 📋 当前系统定时任务快照：${RESET}"
+    
+    if [ "$TASK_COUNT" -gt 0 ]; then
+        crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]' | awk -v cyan="$CYAN" -v reset="$RESET" '{print "   " cyan "•" reset " " $0}'
+    else
+        echo -e "   ${YELLOW}(暂无用户自定义的定时任务)${RESET}"
+    fi
+    
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN}  1) 快速添加定时任务(引导式)${RESET}"
+    echo -e "${GREEN}  2) 精准删除定时任务(按名称删除)${RESET}"
+    echo -e "${GREEN}  3) 深度手动编辑任务(打开编辑器)${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN}  0) 返回主菜单${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+}
+
+schedule_add() {
+    echo -e "${YELLOW}--- 引导式添加 Rclone 同步任务 ---${RESET}"
+    read -p "任务唯一标识名 (英文字母): " TASK_NAME
+    [ -z "$TASK_NAME" ] && return
+    read -p "本地同步目录 (多个用空格隔开): " LOCAL_DIR
+    read -p "请输入Rclone创建的网盘名称: " REMOTE_NAME
+    read -p "远程目标目录 (默认 backup): " REMOTE_DIR
+    REMOTE_DIR=${REMOTE_DIR:-backup}
+
+    echo -e "${GREEN}选择执行周期:\n 1. 每天0点\n 2. 每周一0点\n 3. 每月1号0点\n 4. 自定义 Cron 表达式${RESET}"
+    read -p "请选择: " t
+    case $t in
+        1) cron_expr="0 0 * * *" ;;
+        2) cron_expr="0 0 * * 1" ;;
+        3) cron_expr="0 0 1 * *" ;;
+        4) read -p "请输入标准 5 位 Cron 表达式: " cron_expr ;;
+        *) echo -e "${RED}❌ 无效选择${RESET}"; return ;;
+    esac
+
+    SCRIPT_PATH="$SCRIPT_DIR/rclone_sync_${TASK_NAME}.sh"
+    cat > "$SCRIPT_PATH" << 'EOF'
+#!/bin/bash
+CONFIG_FILE="/opt/rclone_manager/config.env"
+if [ -f "$CONFIG_FILE" ]; then source "$CONFIG_FILE"; fi
+EOF
+
+    cat >> "$SCRIPT_PATH" << EOF
+LOG_FILE="$LOG_DIR/rclone_sync_${TASK_NAME}.log"
+send_tg() {
+    if [[ "\$TG_TOKEN" != "填入你的默认BotToken" ]]; then
+        curl -s -X POST "https://api.telegram.org/bot\${TG_TOKEN}/sendMessage" \
+        -d chat_id="\${TG_CHAT_ID}" -d text="[\${VPS_NAME}] \$1" >/dev/null
+    fi
+}
+for d in $LOCAL_DIR; do
+    [ ! -d "\$d" ] && continue
+    name=\$(basename "\$d")
+    target="${REMOTE_NAME}:${REMOTE_DIR}/\$name"
+    rclone sync "\$d" "\$target" -v >> "\$LOG_FILE" 2>&1
+    if [ \$? -eq 0 ]; then
+        echo "[\$(date '+%F %T')] \$d 同步完成 ✅" >> "\$LOG_FILE"
+        send_tg "定时任务 [${TASK_NAME}] 同步成功: \$d ✅"
+    else
+        echo "[\$(date '+%F %T')] \$d 同步失败 ❌" >> "\$LOG_FILE"
+        send_tg "⚠️ 定时任务 [${TASK_NAME}] 同步失败: \$d ❌"
+    fi
+done
+EOF
+
+    chmod +x "$SCRIPT_PATH"
+    (crontab -l 2>/dev/null | grep -v "$CRON_PREFIX$TASK_NAME"; echo "$cron_expr $SCRIPT_PATH $CRON_PREFIX$TASK_NAME") | crontab -
+    echo -e "${GREEN}任务 $TASK_NAME 已成功添加并注入 Crontab！${RESET}"
+}
+
+schedule_del_one() {
+    echo -e "${YELLOW}--- 正在检索本脚本生成的任务... ---${RESET}"
+    local count=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX" | wc -l)
+    if [ "$count" -eq 0 ]; then
+        echo -e "${YELLOW}未发现通过本脚本创建的 Rclone 定时任务。${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 linuxserver 最新镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    
-    echo -e "${YELLOW}正在应用更新并重启容器...${RESET}"
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+
+    crontab -l 2>/dev/null | grep "$CRON_PREFIX" | awk -F "$CRON_PREFIX" '{print "● 可删除任务名: " $2}'
+    echo "---------------------------------------"
+    read -p "请输入你想精确删除的任务名称: " TASK_NAME
+    [ -z "$TASK_NAME" ] && return
+
+    crontab -l 2>/dev/null | grep -v "$CRON_PREFIX$TASK_NAME" | crontab -
+    rm -f "$SCRIPT_DIR/rclone_sync_${TASK_NAME}.sh"
+    echo -e "${GREEN}已成功移除任务: $TASK_NAME${RESET}"
 }
 
-uninstall_qbittorrent() {
-    echo -ne "${RED}确定要卸载并删除 qBittorrent 容器吗？(y/n): ${RESET}"
-    read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有配置文件和下载的数据？(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
-            fi
-        else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+cron_task_menu() {
+    while true; do
+        clear
+        show_cron_panel
+        read -p "$(echo -e ${GREEN}请输入定时任务选项数字: ${RESET})" choice_cron
+        echo ""
+        case $choice_cron in
+            1) schedule_add ;;
+            2) schedule_del_one ;;
+            3) 
+                echo -e "${YELLOW}即将调用系统默认编辑器打开全局 Crontab。${RESET}"
+                read -p "按回车键开始编辑..."
+                crontab -e 
+                ;;
+            0) break ;;
+            *) echo -e "${RED}❌ 输入错误！${RESET}" ;;
+        esac
+        read -p "按回车键继续..."
+    done
+}
+
+# ================== 手动同步功能 ==================
+sync_local_to_remote_multi() {
+    read -p "请输入本地目录路径（多个用空格分隔）: " local_dirs
+    [ -z "$local_dirs" ] && return
+    read -p "请输入Rclone创建的网盘名称: " remote
+    [ -z "$remote" ] && return
+    read -p "请输入远程目标目录(默认 backup): " remote_dir
+    remote_dir=${remote_dir:-backup}
+
+    for d in $local_dirs; do
+        if [ ! -d "$d" ]; then
+            echo -e "${RED}目录不存在，跳过: $d${RESET}"
+            continue
         fi
-        echo -e "${GREEN}卸载完成！${RESET}"
-    fi
+        name=$(basename "$d")
+        target="${remote}:${remote_dir}/${name}"
+        LOG_FILE="$LOG_DIR/rclone_sync_${name}.log"
+
+        echo -e "${YELLOW}正在同步: $d → $target ...${RESET}"
+        rclone sync "$d" "$target" -v -P 2>&1 | tee -a "$LOG_FILE"
+
+        if [ ${PIPESTATUS[0]} -eq 0 ]; then
+            echo "[ $(date '+%F %T') ] 同步完成 ✅" >> "$LOG_FILE"
+            send_tg "Rclone 同步完成: $d → $target ✅"
+        else
+            echo "[ $(date '+%F %T') ] 同步失败 ❌" >> "$LOG_FILE"
+            send_tg "⚠️ Rclone 同步失败: $d → $target ❌"
+        fi
+    done
 }
 
-start_qb() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_qb() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_qb() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_qb() { docker logs -f "$CONTAINER_NAME"; }
-
-show_info() {
-    get_status_info
-    SHOW_IP=$(get_public_ip)
-    echo -e "${GREEN}==================================================${RESET}"
-    echo -e "${YELLOW}当前状态      : $status"
-    echo -e "${YELLOW}WebUI 访问地址 : http://${SHOW_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}P2P 传输端口   : ${torrent_port} (TCP/UDP)${RESET}"
-    echo -e "${YELLOW}宿主机下载路径 : ${download_dir}${RESET}"
-    echo -ne "${YELLOW}初始密码探测   : ${RESET}"
-    get_qb_password
-    echo -e "${GREEN}==================================================${RESET}"
+sync_remote_to_local() {
+    read -p "请输入Rclone创建的网盘名称: " remote
+    [ -z "$remote" ] && return
+    read -p "请输入远程备份目录 (例如 backup): " remote_dir
+    read -p "请输入本地恢复目标目录: " local_dir
+    [ -z "$local_dir" ] && return
+    
+    mkdir -p "$local_dir"
+    rclone sync "${remote}:${remote_dir}" "$local_dir" -v -P
 }
 
-menu() {
-    clear
-    get_status_info
-    echo -e "${GREEN}==================================================${RESET}"
-    echo -e "${GREEN}        qBittorrent Docker Compose 管理面板        ${RESET}"
-    echo -e "${GREEN}==================================================${RESET}"
-    echo -e "${GREEN}容器状态 :${RESET} $status"
-    echo -e "${GREEN}WebUI端口 :${RESET} ${YELLOW}${webui_port}${RESET}   ${GREEN}P2P端口 :${RESET} ${YELLOW}${torrent_port}${RESET}"
-    echo -e "${GREEN}下载目录 :${RESET} ${CYAN}${download_dir}${RESET}"
-    echo -e "${GREEN}==================================================${RESET}"
-    echo -e "${GREEN}1. 部署/重建 qBittorrent (自定义端口与目录)${RESET}"
-    echo -e "${GREEN}2. 启动容器${RESET}"
-    echo -e "${GREEN}3. 停止容器${RESET}"
-    echo -e "${GREEN}4. 重启容器${RESET}"
-    echo -e "${GREEN}5. 查看实时日志${RESET}"
-    echo -e "${GREEN}6. 查看当前配置与密码${RESET}"
-    echo -e "${GREEN}7. 彻底卸载容器${RESET}"
-    echo -e "${YELLOW}8. 一键检查并更新 qBittorrent 镜像${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}==================================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read -r choice
-    case "$choice" in
-        1) install_qbittorrent ;;
-        2) start_qb ;;
-        3) stop_qb ;;
-        4) restart_qb ;;
-        5) logs_qb ;;
-        6) show_info ;;
-        7) uninstall_qbittorrent ;;
-        8) update_qbittorrent ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
-    esac
+# ================== 卸载全面清理 ==================
+uninstall_rclone() {
+    read -p "确定要彻底卸载 Rclone 及所有管理配置吗？(y/N): " SECURE_CONFIRM
+    [ "$SECURE_CONFIRM" != "y" ] && return
+
+    echo -e "${YELLOW}正在全面清理 Rclone 环境与组件...${RESET}"
+    unmount_all
+    sudo rm -f /usr/bin/rclone /usr/local/bin/rclone
+    sudo rm -rf ~/.config/rclone
+    sudo rm -rf "$BASE_DIR"
+
+    echo -e "${GREEN}卸载完成！所有组件、挂载点及系统残留已清理。${RESET}"
+    exit 0
 }
 
+# ================== 主循环入口 ==================
 while true; do
-    menu
-    echo -ne "${YELLOW}按回车键继续...${RESET}"
-    read -r
+    show_menu
+    read -p "$(echo -e ${GREEN}请输入选项数字: ${RESET})" choice
+    case $choice in
+        1) install_rclone ;;
+        2) update_rclone ;;
+        3) config_rclone ;;
+        4) list_remotes ;;
+        5) list_files_remote ;;
+        6) mount_remote ;;
+        7) show_assets_manifest ;;
+        8) unmount_remote_by_name ;;
+        9) unmount_all ;;
+        10) view_mount_status ;;
+        11) view_mount_logs ;;
+        12) sync_local_to_remote_multi ;;
+        13) sync_remote_to_local ;;
+        14) cron_task_menu ;;
+        15) modify_tg ;;
+        16) uninstall_rclone ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}输入错误，请输入菜单中的有效数字！${RESET}" ;;
+    esac
+    read -r -p "按回车键继续..."
 done

@@ -512,8 +512,10 @@ write_tun2socks_config() {
             read -r input_addr
             [ -z "$input_addr" ] && input_addr=$current_addr
         else
-            echo -ne "${GREEN}请输入Socks5服务器地址 (本地 WARP 请输 127.0.0.1): ${RESET}"
+            # 当没有旧配置时，提示默认值并支持直接回车
+            echo -ne "${GREEN}请输入Socks5服务器地址 (直接回车默认 127.0.0.1): ${RESET}"
             read -r input_addr
+            [ -z "$input_addr" ] && input_addr="127.0.0.1"
         fi
         if [ -n "$input_addr" ]; then break; else error "服务器地址不能为空。"; fi
     done
@@ -525,9 +527,12 @@ write_tun2socks_config() {
             read -r input_port
             [ -z "$input_port" ] && input_port=$current_port
         else
-            echo -ne "${GREEN}请输入Socks5服务器端口 (WARP 默认通常为 40000 或 1080): ${RESET}"
+            # 当没有旧配置时，提示默认值并支持直接回车
+            echo -ne "${GREEN}请输入Socks5服务器端口 (直接回车默认 1080): ${RESET}"
             read -r input_port
+            [ -z "$input_port" ] && input_port="1080"
         fi
+        
         if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
             break
         else
@@ -657,59 +662,106 @@ update_tun2socks_core() {
 generate_openrc_script() {
     local SERVICE_FILE="/etc/init.d/tun2socks"
     local TARGET_CONFIG="/etc/tun2socks/config.yaml"
+    
     local WARP_PORT=$(grep -E '^[[:space:]]*port:' "$TARGET_CONFIG" | head -n1 | awk '{print $2}' | tr -d "'\"")
     [ -z "$WARP_PORT" ] && WARP_PORT="1080"
+
+    # 1. 强制重写一遍 /etc/tun2socks/config.yaml，确保里面包含 fwmark 标记！
+    # 这是防止死循环的内核级核心：让 tun2socks 进程自己发出的流量自带 438 护身符
+    cat > "$TARGET_CONFIG" <<EOF
+tunnel:
+  name: tun0
+  address: 10.0.0.1/24
+  gateway: 10.0.0.2
+  mtu: 1500
+
+proxy:
+  type: socks5
+  host: 127.0.0.1
+  port: ${WARP_PORT}
+
+# 核心：必须让 tun2socks 给自己的出站流量打上 438 标记
+fwmark: 438
+EOF
+
     local MAIN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}')
     local MAIN_IP6=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | grep -oE 'src [a-fA-F0-9:]+' | awk '{print $2}')
 
-    cat <<EOF > "$SERVICE_FILE"
+    cat > "$SERVICE_FILE" <<EOF
 #!/sbin/openrc-run
+
 description="Tun2Socks Tunnel Service adapted for CF WARP on Alpine"
 supervisor="supervise-daemon"
 command="/usr/local/bin/tun2socks"
-command_args="/etc/tun2socks/config.yaml"
+command_args="-config /etc/tun2socks/config.yaml"
 output_log="/var/log/tun2socks.log"
 error_log="/var/log/tun2socks.err"
-depend() { need net; after firewall; }
+
+depend() {
+    need net
+    after firewall
+}
+
 start_post() {
     ulimit -n 524288
-    ip rule add to 0.0.0.0/0 dport 22 lookup main pref 5
-    ip rule add to 0.0.0.0/0 sport 22 lookup main pref 5
-    ip -6 rule add to ::/0 dport 22 lookup main pref 5
-    ip -6 rule add to ::/0 sport 22 lookup main pref 5
-    ip rule add to 127.0.0.1 lookup main pref 4
+
+    # 先清理掉刚才由于 uid 产生的所有残留防火墙规则
+    iptables -t mangle -D OUTPUT -m owner --uid-owner 0 -j MARK --set-mark 777 2>/dev/null
+    ip6tables -t mangle -D OUTPUT -m owner --uid-owner 0 -j MARK --set-mark 777 2>/dev/null
+
+    # 1. SSH 防断网路由策略 (最高优先级，保持 22 端口绝对直连)
+    ip rule add to 0.0.0.0/0 dport 22 lookup main pref 2
+    ip rule add to 0.0.0.0/0 sport 22 lookup main pref 2
+    ip -6 rule add to ::/0 dport 22 lookup main pref 2
+    ip -6 rule add to ::/0 sport 22 lookup main pref 2
+
+    # 2. 【无敌放行规则】凡是带 438 标记的流量（Tun2Socks自己发往WARP的流量），一律强制丢回 main 物理网卡直连！
+    ip rule add fwmark 438 lookup main pref 3
+    ip -6 rule add fwmark 438 lookup main pref 3
+
+    # 3. 本地回环与内网保留网段直连放行
+    ip rule add to 127.0.0.0/8 lookup main pref 4
     ip -6 rule add to ::1 lookup main pref 4
-    ip rule add to 127.0.0.1 dport ${WARP_PORT} lookup main pref 4
-    ip rule add fwmark 438 lookup main pref 10
-    ip -6 rule add fwmark 438 lookup main pref 10
-    ip route add default dev tun0 table 20
-    ip rule add lookup 20 pref 20
-    [ -n "${MAIN_IP}" ] && ip rule add from ${MAIN_IP} lookup main pref 15
-    [ -n "${MAIN_IP6}" ] && ip -6 rule add from ${MAIN_IP6} lookup main pref 15
-    ip rule add to 127.0.0.0/8 lookup main pref 16
-    ip rule add to 10.0.0.0/8 lookup main pref 16
-    ip rule add to 172.16.0.0/12 lookup main pref 16
-    ip rule add to 192.168.0.0/16 lookup main pref 16
+    ip rule add to 10.0.0.0/8 lookup main pref 4
+    ip rule add to 172.16.0.0/12 lookup main pref 4
+    ip rule add to 192.168.0.0/16 lookup main pref 4
+
+    # 4. 主网卡原路返回路由
+    [ -n "${MAIN_IP}" ] && ip rule add from ${MAIN_IP} lookup main pref 5
+    [ -n "${MAIN_IP6}" ] && ip -6 rule add from ${MAIN_IP6} lookup main pref 5
+
+    # 5. 全局路由劫持：创建自定义路由表 20，并让默认流量全部进入 tun0 隧道
+    ip route add default dev tun0 table 20 2>/dev/null || ip route replace default dev tun0 table 20
+    
+    # 终极关键：除上述 pref 2/3/4/5 的特权放行流量外，其余所有的普通流量全部押入 table 20 (即 tun0 隧道)
+    ip rule add lookup 20 pref 10
+    ip -6 rule add lookup 20 pref 10
+
     return 0
 }
+
 stop_post() {
-    ip rule del to 0.0.0.0/0 dport 22 lookup main pref 5 2>/dev/null
-    ip rule del to 0.0.0.0/0 sport 22 lookup main pref 5 2>/dev/null
-    ip -6 rule del to ::/0 dport 22 lookup main pref 5 2>/dev/null
-    ip -6 rule del to ::/0 sport 22 lookup main pref 5 2>/dev/null
-    ip rule del to 127.0.0.1 lookup main pref 4 2>/dev/null
+    ip rule del to 0.0.0.0/0 dport 22 lookup main pref 2 2>/dev/null
+    ip rule del to 0.0.0.0/0 sport 22 lookup main pref 2 2>/dev/null
+    ip -6 rule del to ::/0 dport 22 lookup main pref 2 2>/dev/null
+    ip -6 rule del to ::/0 sport 22 lookup main pref 2 2>/dev/null
+
+    ip rule del fwmark 438 lookup main pref 3 2>/dev/null
+    ip -6 rule del fwmark 438 lookup main pref 3 2>/dev/null
+
+    ip rule del to 127.0.0.0/8 lookup main pref 4 2>/dev/null
     ip -6 rule del to ::1 lookup main pref 4 2>/dev/null
-    ip rule del to 127.0.0.1 dport ${WARP_PORT} lookup main pref 4 2>/dev/null
-    ip rule del fwmark 438 lookup main pref 10 2>/dev/null
-    ip -6 rule del fwmark 438 lookup main pref 10 2>/dev/null
+    ip rule del to 10.0.0.0/8 lookup main pref 4 2>/dev/null
+    ip rule del to 172.16.0.0/12 lookup main pref 4 2>/dev/null
+    ip rule del to 192.168.0.0/16 lookup main pref 4 2>/dev/null
+
+    [ -n "${MAIN_IP}" ] && ip rule del from ${MAIN_IP} lookup main pref 5 2>/dev/null
+    [ -n "${MAIN_IP6}" ] && ip -6 rule del from ${MAIN_IP6} lookup main pref 5 2>/dev/null
+
     ip route del default dev tun0 table 20 2>/dev/null
-    ip rule del lookup 20 pref 20 2>/dev/null
-    [ -n "${MAIN_IP}" ] && ip rule del from ${MAIN_IP} lookup main pref 15 2>/dev/null
-    [ -n "${MAIN_IP6}" ] && ip -6 rule del from ${MAIN_IP6} lookup main pref 15 2>/dev/null
-    ip rule del to 127.0.0.0/8 lookup main pref 16 2>/dev/null
-    ip rule del to 10.0.0.0/8 lookup main pref 16 2>/dev/null
-    ip rule del to 172.16.0.0/12 lookup main pref 16 2>/dev/null
-    ip rule del to 192.168.0.0/16 lookup main pref 16 2>/dev/null
+    ip rule del lookup 20 pref 10 2>/dev/null
+    ip -6 rule del lookup 20 pref 10 2>/dev/null
+    
     return 0
 }
 EOF

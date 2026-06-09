@@ -108,12 +108,12 @@ install_qbittorrent() {
     read -r custom_download
     [[ -z "$custom_download" ]] && custom_download="/opt/qbittorrent/downloads"
 
-    mkdir -p "$BASE_DIR/config"
-    mkdir -p "$custom_download"
+    mkdir -p "$BASE_DIR/config" "$custom_download"
     chmod -R 777 "$BASE_DIR/config" "$custom_download"
 
-    echo -e "${YELLOW}正在生成 docker-compose.yml 配置文件...${RESET}"
+    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
     
+    # 【完美重构点】严格遵循官方规范：-p 两侧端口保持一致，并同步下发给环境变量
     cat <<EOF > "$COMPOSE_FILE"
 services:
   qbittorrent:
@@ -123,13 +123,13 @@ services:
       - PUID=$(id -u)
       - PGID=$(id -g)
       - TZ=Asia/Shanghai
-      - WEBUI_PORT=8080
+      - WEBUI_PORT=${custom_port}
       - TORRENTING_PORT=${custom_p2p_port}
     volumes:
       - ${BASE_DIR}/config:/config
       - ${custom_download}:/downloads
     ports:
-      - ${custom_port}:8080
+      - ${custom_port}:${custom_port}
       - ${custom_p2p_port}:${custom_p2p_port}
       - ${custom_p2p_port}:${custom_p2p_port}/udp
     stop_grace_period: 10s
@@ -137,15 +137,13 @@ services:
 EOF
 
     echo -e "${YELLOW}正在通过 Docker Compose 启动 qBittorrent...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化并同步密码日志 (约10秒)...${RESET}"
     sleep 10
 
-    SHOW_IP=$(get_public_ip)
-
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       qBittorrent Docker 部署成功！${RESET}"
+    echo -e "${GREEN}     qBittorrent  部署成功！    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}WebUI 访问地址 : http://${SHOW_IP}:${custom_port}${RESET}"
     echo -e "${YELLOW}默认用户名     : admin${RESET}"
@@ -215,7 +213,7 @@ menu() {
     echo -e "${GREEN}      qBittorrent 管理面板       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}版本 :${RESET} ${CYAN}${img_version}${RESET}"
+    echo -e "${GREEN}版本 :${RESET} ${YELLOW}${img_version}${RESET}"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}   ${GREEN}P2P端口 :${RESET} ${YELLOW}${torrent_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"

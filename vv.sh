@@ -122,7 +122,8 @@ install_warp() {
     fi
     
     local has_v4=0
-    if curl -4sSk --max-time 2 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "ip="; then
+    # 针对纯 IPv6 优化超时限制，使用 -g -6 确保安全
+    if curl -g -6 -sSk --max-time 3 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "ip="; then
         has_v4=1
     fi
 
@@ -130,79 +131,125 @@ install_warp() {
     local TARGET="linux_amd64"
     [[ "$ARCH" == "aarch64" ]] && TARGET="linux_arm64"
 
+    # ====================================================================
+    # 【修正 1】获取最新 Tag（支持代理池轮询，且强制使用 IPv6 友好参数）
+    # ====================================================================
     local latest_tag=""
     for proxy in "${GITHUB_PROXY[@]}"; do
-        latest_tag=$(curl -fsSL --max-time 6 "${proxy}https://api.github.com/repos/${REPO_USQUE}/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        local api_url="${proxy}https://api.github.com/repos/${REPO_USQUE}/releases/latest"
+        echo -e "${BLUE}[信息]${RESET} 正在尝试通过 [ ${proxy:-原生直连} ] 获取版本信息..."
+        latest_tag=$(curl -g -6 -fsSL --max-time 6 "$api_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         [ -n "$latest_tag" ] && break
     done
     [ -z "$latest_tag" ] && latest_tag="v3.0.0"
     local pure_ver="${latest_tag#v}"
+    echo -e "${GREEN}[成功]${RESET} 目标安装版本: ${latest_tag}"
 
+    # ====================================================================
+    # 【修正 2】下载核心（彻底废除 ${GITHUB_PROXY[0]} 死锁，开启全池轮询与原生直连兜底）
+    # ====================================================================
     local tmp_dir=$(mktemp -d)
-    if curl -fsSL -L -o "$tmp_dir/zip" "${GITHUB_PROXY[0]}https://github.com/${REPO_USQUE}/releases/download/${latest_tag}/usque_${pure_ver}_${TARGET}.zip"; then
-        unzip -q -o "$tmp_dir/zip" -d "$tmp_dir"
-        rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
-        cp -f "$tmp_dir/usque" "$INSTALL_BIN"
-        chmod +x "$INSTALL_BIN"
+    local download_success=0
+    local raw_download_url="https://github.com/${REPO_USQUE}/releases/download/${latest_tag}/usque_${pure_ver}_${TARGET}.zip"
+
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local final_download_url="${proxy}${raw_download_url}"
+        echo -e "${BLUE}[信息]${RESET} 正在尝试通过 [ ${proxy:-原生直连} ] 下载核心压缩包..."
+        
+        # 使用 -g -6 强化纯 IPv6 环境下的 curl 稳定性
+        if curl -g -6 -fsSL -L --max-time 45 -o "$tmp_dir/zip" "$final_download_url"; then
+            download_success=1
+            break
+        else
+            echo -e "${YELLOW}[警告]${RESET} 当前下载通道失败，正在尝试切换..."
+            [ -f "$tmp_dir/zip" ] && rm -f "$tmp_dir/zip"
+        fi
+    done
+
+    # 严密拦截：如果所有通道都漏油，直接中断防止套娃报错
+    if [ "$download_success" -ne 1 ]; then
+        echo -e "${RED}[错误]${RESET} 核心组件下载失败，所有 GitHub 代理通道及原生直连均不可达。"
+        rm -rf "$tmp_dir"
+        return 1
     fi
+
+    # 解压并部署组件
+    unzip -q -o "$tmp_dir/zip" -d "$tmp_dir"
+    rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
+    cp -f "$tmp_dir/usque" "$INSTALL_BIN"
+    chmod +x "$INSTALL_BIN"
     rm -rf "$tmp_dir"
 
     [ -d "$CONF_DIR" ] || mkdir -p "$CONF_DIR"
     cd "$CONF_DIR"
     
+    # ====================================================================
+    # 分支 1：如果是覆盖升级模式（绝对不碰配置，换完核心直接原样复活启动）
+    # ====================================================================
     if [ "$is_upgrade" -eq 1 ]; then
+        echo -e "${GREEN}[成功]${RESET} 核心二进制程序替换完成。"
         write_openrc "$o_mode" "$o_ip" "$o_port" "$o_user" "$o_pass"
         rc-service "$SERVICE_NAME" start
-        echo -e "${GREEN}[成功]${RESET} 核心组件已成功无损升级至最新版！"
+        echo -e "${GREEN}[成功]${RESET} WARP 核心组件已成功无损升级并恢复运行！"
         return 0
     fi
 
+    # ====================================================================
+    # 分支 2：如果是全新安装模式（执行匿名注册 ➔ 精准修正 IPv6 ➔ 初始化配置）
+    # ====================================================================
     echo -e "${BLUE}[信息]${RESET} 正在执行本地匿名注册..."
     if "${INSTALL_BIN}" register; then
         echo -e "${GREEN}[成功]${RESET} Cloudflare 本地注册成功。"
-        
-        if [ "$has_v4" -ne 1 ] && [ -f "$CONF_FILE" ]; then
-            echo -e "${BLUE}[信息]${RESET} 检测到纯 IPv6 环境，正在自动修正配置文件..."
-            local v6_ep=$(grep -o '"endpoint_v6": *"[^"]*"' "$CONF_FILE" | awk -F '"' '{print $4}')
-            [ -z "$v6_ep" ] && v6_ep="[2606:4700:d0::a25c:bc2e]:2408"
-            sed -i "s/\"endpoint_v4\": *\"[^\"]*\"/\"endpoint_v4\": \"${v6_ep}\"/g" "$CONF_FILE"
-            echo -e "${GREEN}[成功]${RESET} IPv6 修正已完成 (Endpoint: $v6_ep)。"
-        fi
-        
-        echo -e "\n--- 请配置初始化绑定参数 ---"
-        echo -e "请选择运行模式:"
-        echo -e "  1. SOCKS5 (默认)"
-        echo -e "  2. HTTP"
-        echo -ne "${GREEN}请输入选项 [默认: 1]: ${RESET}"
-        read -r mode_ch
-        local ins_mode="SOCKS5"
-        [[ "$mode_ch" == "2" ]] && ins_mode="HTTP"
-
-        echo -ne "${GREEN}请输入监听 IP [默认: 127.0.0.1]: ${RESET}"
-        read -r ins_ip
-        ins_ip="${ins_ip:-127.0.0.1}"
-
-        echo -ne "${GREEN}请输入监听端口 [默认: 1080]: ${RESET}"
-        read -r ins_port
-        ins_port="${ins_port:-1080}"
-
-        echo -ne "${GREEN}请输入代理用户名 (留空则无验证): ${RESET}"
-        read -r ins_user
-        local ins_pass=""
-        if [ -n "$ins_user" ]; then
-            echo -ne "${GREEN}请输入代理密码: ${RESET}"
-            read -r ins_pass
-        fi
-
-        write_openrc "$ins_mode" "$ins_ip" "$ins_port" "$ins_user" "$ins_pass"
-        rc-service "$SERVICE_NAME" start
-        echo -e "${GREEN}[成功]${RESET} WARP 安装并启动成功！"
     else
         echo -e "${RED}[错误]${RESET} 注册失败。提示：请确保你的 VPS 已开启 IPv6 外部访问能力。"
         return 1
     fi
-}
 
+    # 【全新安装专享】注册完生成默认配置后，立刻对纯 IPv6 环境进行精准重写修正
+    if [ "$has_v4" -ne 1 ] && [ -f "$CONF_FILE" ]; then
+        echo -e "${BLUE}[信息]${RESET} 检测到纯 IPv6 环境，正在为新生成的配置修正 Endpoint 路由指向..."
+        
+        local target_v6_ep="[2606:4700:d0::a25c:bc2e]:2408"
+        
+        # 针对新生成的 Pretty Print JSON 结构进行全行精准覆盖
+        sed -i "s/\"endpoint_v4\": *\"[^\"]*\"/\"endpoint_v4\": \"${target_v6_ep}\"/g" "$CONF_FILE"
+        sed -i "s/\"endpoint_v6\": *\"[^\"]*\"/\"endpoint_v6\": \"${target_v6_ep}\"/g" "$CONF_FILE"
+        sed -i "s/\"endpoint_h2_v4\": *\"[^\"]*\"/\"endpoint_h2_v4\": \"${target_v6_ep}\"/g" "$CONF_FILE"
+        sed -i "s/\"endpoint_h2_v6\": *\"[^\"]*\"/\"endpoint_h2_v6\": \"${target_v6_ep}\"/g" "$CONF_FILE"
+        
+        echo -e "${GREEN}[成功]${RESET} 全新安装下的 IPv6 终极重写已完成。"
+    fi
+    
+    # 引导全新安装的用户配置初始化参数
+    echo -e "\n--- 请配置初始化绑定参数 ---"
+    echo -e "请选择运行模式:"
+    echo -e "  1. SOCKS5 (默认)"
+    echo -e "  2. HTTP"
+    echo -ne "${GREEN}请输入选项 [默认: 1]: ${RESET}"
+    read -r mode_ch
+    local ins_mode="SOCKS5"
+    [[ "$mode_ch" == "2" ]] && ins_mode="HTTP"
+
+    echo -ne "${GREEN}请输入监听 IP [默认: 127.0.0.1]: ${RESET}"
+    read -r ins_ip
+    ins_ip="${ins_ip:-127.0.0.1}"
+
+    echo -ne "${GREEN}请输入监听端口 [默认: 1080]: ${RESET}"
+    read -r ins_port
+    ins_port="${ins_port:-1080}"
+
+    echo -ne "${GREEN}请输入代理用户名 (留空则无验证): ${RESET}"
+    read -r ins_user
+    local ins_pass=""
+    if [ -n "$ins_user" ]; then
+        echo -ne "${GREEN}请输入代理密码: ${RESET}"
+        read -r ins_pass
+    fi
+
+    write_openrc "$ins_mode" "$ins_ip" "$ins_port" "$ins_user" "$ins_pass"
+    rc-service "$SERVICE_NAME" start
+    echo -e "${GREEN}[成功]${RESET} WARP 全新安装并启动成功！"
+}
 write_openrc() {
     local mode="$1" ip="$2" port="$3" user="$4" pass="$5"
     local cmd="socks"
@@ -971,7 +1018,7 @@ while true; do
     echo -e "${GREEN}  8. 查看日志${RESET}"
     echo -e "${GREEN}  9. 查看配置与出口状态${RESET}"
     echo -e "${GREEN} 10.${RESET} ${YELLOW}谷歌分流${RESET}"
-    echo -e "${GREEN} 11.${RESET} ${CYAN}Tun2Socks全局代理${RESET}"
+    echo -e "${GREEN} 11.${RESET} ${YELLOW}Tun2Socks全局代理${RESET}"
     echo -e "${GREEN}  0. 退出${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"

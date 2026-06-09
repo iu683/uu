@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # ==============================================================================
-#   CF-WARP & Tun2Socks 终极双层控制面板 (POSIX / Alpine 专属黄金重构版)
+#   CF-WARP & Tun2Socks 终极双层控制面板 ( Alpine 专属)
 # ==============================================================================
 
 # 预检：由于 Alpine 默认不带高级语法，必须先自动补齐 bash 并切过去
@@ -960,8 +960,6 @@ install_tun2socks() {
     restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
     chmod +x "$BINARY_PATH"
 
-    step "正在初始化全局出口节点配置信息："
-    write_tun2socks_config
     step "正在初始化全局出口节点配置信息："
     write_tun2socks_config
 

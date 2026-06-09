@@ -122,7 +122,8 @@ install_warp() {
     fi
     
     local has_v4=0
-    if curl -4sSk --max-time 2 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "ip="; then
+    # 针对纯 IPv6 优化超时限制，使用 -g -6 确保安全
+    if curl -g -6 -sSk --max-time 3 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "ip="; then
         has_v4=1
     fi
 
@@ -130,46 +131,95 @@ install_warp() {
     local TARGET="linux_amd64"
     [[ "$ARCH" == "aarch64" ]] && TARGET="linux_arm64"
 
+    # ====================================================================
+    # 【修正 1】获取最新 Tag（支持代理池轮询，且强制使用 IPv6 友好参数）
+    # ====================================================================
     local latest_tag=""
     for proxy in "${GITHUB_PROXY[@]}"; do
-        latest_tag=$(curl -fsSL --max-time 6 "${proxy}https://api.github.com/repos/${REPO_USQUE}/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        local api_url="${proxy}https://api.github.com/repos/${REPO_USQUE}/releases/latest"
+        echo -e "${BLUE}[信息]${RESET} 正在尝试通过 [ ${proxy:-原生直连} ] 获取版本信息..."
+        latest_tag=$(curl -g -6 -fsSL --max-time 6 "$api_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         [ -n "$latest_tag" ] && break
     done
     [ -z "$latest_tag" ] && latest_tag="v3.0.0"
     local pure_ver="${latest_tag#v}"
+    echo -e "${GREEN}[成功]${RESET} 目标安装版本: ${latest_tag}"
 
+    # ====================================================================
+    # 【修正 2】下载核心（彻底废除 ${GITHUB_PROXY[0]} 死锁，开启全池轮询与原生直连兜底）
+    # ====================================================================
     local tmp_dir=$(mktemp -d)
-    if curl -fsSL -L -o "$tmp_dir/zip" "${GITHUB_PROXY[0]}https://github.com/${REPO_USQUE}/releases/download/${latest_tag}/usque_${pure_ver}_${TARGET}.zip"; then
-        unzip -q -o "$tmp_dir/zip" -d "$tmp_dir"
-        rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
-        cp -f "$tmp_dir/usque" "$INSTALL_BIN"
-        chmod +x "$INSTALL_BIN"
+    local download_success=0
+    local raw_download_url="https://github.com/${REPO_USQUE}/releases/download/${latest_tag}/usque_${pure_ver}_${TARGET}.zip"
+
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local final_download_url="${proxy}${raw_download_url}"
+        echo -e "${BLUE}[信息]${RESET} 正在尝试通过 [ ${proxy:-原生直连} ] 下载核心压缩包..."
+        
+        # 使用 -g -6 强化纯 IPv6 环境下的 curl 稳定性
+        if curl -g -6 -fsSL -L --max-time 45 -o "$tmp_dir/zip" "$final_download_url"; then
+            download_success=1
+            break
+        else
+            echo -e "${YELLOW}[警告]${RESET} 当前下载通道失败，正在尝试切换..."
+            [ -f "$tmp_dir/zip" ] && rm -f "$tmp_dir/zip"
+        fi
+    done
+
+    # 严密拦截：如果所有通道都漏油，直接中断防止套娃报错
+    if [ "$download_success" -ne 1 ]; then
+        echo -e "${RED}[错误]${RESET} 核心组件下载失败，所有 GitHub 代理通道及原生直连均不可达。"
+        rm -rf "$tmp_dir"
+        return 1
     fi
+
+    # 解压并部署组件
+    unzip -q -o "$tmp_dir/zip" -d "$tmp_dir"
+    rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
+    cp -f "$tmp_dir/usque" "$INSTALL_BIN"
+    chmod +x "$INSTALL_BIN"
     rm -rf "$tmp_dir"
 
     [ -d "$CONF_DIR" ] || mkdir -p "$CONF_DIR"
     cd "$CONF_DIR"
     
+    # 升级模式直接处理
     if [ "$is_upgrade" -eq 1 ]; then
+        # 即使是升级，在纯 IPv6 下也顺手做一次强制修正，确保万无一失
+        if [ "$has_v4" -ne 1 ] && [ -f "$CONF_FILE" ]; then
+            sed -i 's/"endpoint_v4": *"[^"]*"/"endpoint_v4": "[2606:4700:d0::a25c:bc2e]:2408"/g' "$CONF_FILE"
+            sed -i 's/"endpoint_v6": *"[^"]*"/"endpoint_v6": "[2606:4700:d0::a25c:bc2e]:2408"/g' "$CONF_FILE"
+        fi
         write_openrc "$o_mode" "$o_ip" "$o_port" "$o_user" "$o_pass"
         rc-service "$SERVICE_NAME" start
         echo -e "${GREEN}[成功]${RESET} 核心组件已成功无损升级至最新版！"
         return 0
     fi
 
+    # ====================================================================
+    # 【核心调整】全新安装模式：先执行注册，不管注册文件默认写了啥，注册完立即强制修正！
+    # ====================================================================
     echo -e "${BLUE}[信息]${RESET} 正在执行本地匿名注册..."
     if "${INSTALL_BIN}" register; then
         echo -e "${GREEN}[成功]${RESET} Cloudflare 本地注册成功。"
+    else
+        echo -e "${RED}[错误]${RESET} 注册失败。提示：请确保你的 VPS 已开启 IPv6 外部访问能力。"
+        return 1
+    fi
+
+    # 【挪到这里】注册完的第一件事：立刻无条件检查并修正 IPv6 Endpoint 属性，别等启动才后悔
+    if [ "$has_v4" -ne 1 ] && [ -f "$CONF_FILE" ]; then
+        echo -e "${BLUE}[信息]${RESET} 检测到纯 IPv6 环境，正在强制修正 Peer Endpoint 路由指向..."
         
-        if [ "$has_v4" -ne 1 ] && [ -f "$CONF_FILE" ]; then
-            echo -e "${BLUE}[信息]${RESET} 检测到纯 IPv6 环境，正在自动修正配置文件..."
-            local v6_ep=$(grep -o '"endpoint_v6": *"[^"]*"' "$CONF_FILE" | awk -F '"' '{print $4}')
-            [ -z "$v6_ep" ] && v6_ep="[2606:4700:d0::a25c:bc2e]:2408"
-            sed -i "s/\"endpoint_v4\": *\"[^\"]*\"/\"endpoint_v4\": \"${v6_ep}\"/g" "$CONF_FILE"
-            echo -e "${GREEN}[成功]${RESET} IPv6 修正已完成 (Endpoint: $v6_ep)。"
-        fi
+        # 强行把配置里的所有 Endpoint 字段全部清洗为 IPv6 物理节点
+        sed -i 's/"endpoint_v4": *"[^"]*"/"endpoint_v4": "[2606:4700:d0::a25c:bc2e]:2408"/g' "$CONF_FILE"
+        sed -i 's/"endpoint_v6": *"[^"]*"/"endpoint_v6": "[2606:4700:d0::a25c:bc2e]:2408"/g' "$CONF_FILE"
         
-        echo -e "\n--- 请配置初始化绑定参数 ---"
+        echo -e "${GREEN}[成功]${RESET} IPv6 终极修正已完成。 (指定节点: [2606:4700:d0::a25c:bc2e]:2408)"
+    fi
+    # ====================================================================
+        
+        echo -e "\n--- 请配置初始化绑定 parameters ---"
         echo -e "请选择运行模式:"
         echo -e "  1. SOCKS5 (默认)"
         echo -e "  2. HTTP"
@@ -202,7 +252,6 @@ install_warp() {
         return 1
     fi
 }
-
 write_openrc() {
     local mode="$1" ip="$2" port="$3" user="$4" pass="$5"
     local cmd="socks"
@@ -658,7 +707,6 @@ generate_openrc_script() {
     local SERVICE_FILE="/etc/init.d/tun2socks"
     local TARGET_CONFIG="/etc/tun2socks/config.yaml"
     
-    # 从正常的 socks5 字段中精准提取端口
     local WARP_PORT=$(grep -E '^[[:space:]]*port:' "$TARGET_CONFIG" | head -n1 | awk '{print $2}' | tr -d "'\"")
     [ -z "$WARP_PORT" ] && WARP_PORT="1080"
 
@@ -689,22 +737,34 @@ start_post() {
     ip -6 rule add to ::/0 dport 22 lookup main pref 5
     ip -6 rule add to ::/0 sport 22 lookup main pref 5
 
-    # 2. 本地回环与内网保留网段直连放行
+    # 2. CF WARP 本地回环与宿主机直连放行
     ip rule add to 127.0.0.0/8 lookup main pref 4
     ip -6 rule add to ::1 lookup main pref 4
+
+    # 3. 【核心救星】无条件放行 Cloudflare WARP 所有的远程 Endpoint / MASQUE 服务器网段！
+    # 只要目的地是去建立 WARP 隧道的流量，一律走原生网卡直连，不准进 tun0！
+    ip rule add to 162.159.192.0/24 lookup main pref 6
+    ip rule add to 162.159.193.0/24 lookup main pref 6
+    ip rule add to 162.159.195.0/24 lookup main pref 6
+    ip rule add to 162.159.198.0/24 lookup main pref 6
+    ip rule add to 188.114.96.0/24 lookup main pref 6
+    ip rule add to 188.114.97.0/24 lookup main pref 6
+    ip -6 rule add to 2606:4700:d0::/48 lookup main pref 6
+
+    # 4. 代理软件（hev-socks5-tunnel）自身发出的标有 438 的包直连
+    ip rule add fwmark 438 lookup main pref 10
+    ip -6 rule add fwmark 438 lookup main pref 10
+
+    # 5. 主网卡原路返回路由
+    [ -n "${MAIN_IP}" ] && ip rule add from ${MAIN_IP} lookup main pref 15
+    [ -n "${MAIN_IP6}" ] && ip -6 rule add from ${MAIN_IP6} lookup main pref 15
+
+    # 6. 内网保留网段直连放行
     ip rule add to 10.0.0.0/8 lookup main pref 16
     ip rule add to 172.16.0.0/12 lookup main pref 16
     ip rule add to 192.168.0.0/16 lookup main pref 16
 
-    # 3. 核心大招：凡是带有 hev-socks5-tunnel 标记(438)的流量，强制丢回 main 路由表，粉碎死循环
-    ip rule add fwmark 438 lookup main pref 10
-    ip -6 rule add fwmark 438 lookup main pref 10
-
-    # 4. 主网卡原路返回路由
-    [ -n "${MAIN_IP}" ] && ip rule add from ${MAIN_IP} lookup main pref 15
-    [ -n "${MAIN_IP6}" ] && ip -6 rule add from ${MAIN_IP6} lookup main pref 15
-
-    # 5. 核心全局流量重定向（扔进 tun0）
+    # 7. 核心全局流量重定向（将其余流量扔进 tun0）
     ip route add default dev tun0 table 20 2>/dev/null || ip route replace default dev tun0 table 20
     ip rule add lookup 20 pref 20
 
@@ -719,15 +779,25 @@ stop_post() {
 
     ip rule del to 127.0.0.0/8 lookup main pref 4 2>/dev/null
     ip -6 rule del to ::1 lookup main pref 4 2>/dev/null
-    ip rule del to 10.0.0.0/8 lookup main pref 16 2>/dev/null
-    ip rule del to 172.16.0.0/12 lookup main pref 16 2>/dev/null
-    ip rule del to 192.168.0.0/16 lookup main pref 16 2>/dev/null
+
+    # 清理 WARP 远端放行路由
+    ip rule del to 162.159.192.0/24 lookup main pref 6 2>/dev/null
+    ip rule del to 162.159.193.0/24 lookup main pref 6 2>/dev/null
+    ip rule del to 162.159.195.0/24 lookup main pref 6 2>/dev/null
+    ip rule del to 162.159.198.0/24 lookup main pref 6 2>/dev/null
+    ip rule del to 188.114.96.0/24 lookup main pref 6 2>/dev/null
+    ip rule del to 188.114.97.0/24 lookup main pref 6 2>/dev/null
+    ip -6 rule del to 2606:4700:d0::/48 lookup main pref 6 2>/dev/null
 
     ip rule del fwmark 438 lookup main pref 10 2>/dev/null
     ip -6 rule del fwmark 438 lookup main pref 10 2>/dev/null
 
     [ -n "${MAIN_IP}" ] && ip rule del from ${MAIN_IP} lookup main pref 15 2>/dev/null
     [ -n "${MAIN_IP6}" ] && ip -6 rule del from ${MAIN_IP6} lookup main pref 15 2>/dev/null
+
+    ip rule del to 10.0.0.0/8 lookup main pref 16 2>/dev/null
+    ip rule del to 172.16.0.0/12 lookup main pref 16 2>/dev/null
+    ip rule del to 192.168.0.0/16 lookup main pref 16 2>/dev/null
 
     ip route del default dev tun0 table 20 2>/dev/null
     ip rule del lookup 20 pref 20 2>/dev/null
@@ -736,7 +806,6 @@ stop_post() {
 EOF
     chmod +x "$SERVICE_FILE"
 }
-
 install_tun2socks() {
     cleanup_ip_rules
     step "检查 tun2socks 服务当前状态..."
@@ -951,7 +1020,7 @@ while true; do
     echo -e "${GREEN}  8. 查看日志${RESET}"
     echo -e "${GREEN}  9. 查看配置与出口状态${RESET}"
     echo -e "${GREEN} 10.${RESET} ${YELLOW}谷歌分流${RESET}"
-    echo -e "${GREEN} 11.${RESET} ${CYAN}Tun2Socks全局代理${RESET}"
+    echo -e "${GREEN} 11.${RESET} ${YELLOW}Tun2Socks全局代理${RESET}"
     echo -e "${GREEN}  0. 退出${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"

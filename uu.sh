@@ -1,139 +1,357 @@
 #!/bin/bash
-# ========================================
-# 宝塔面板 快捷管理脚本 (顺序优化版)
-# ========================================
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-CYAN="\033[36m"
-RESET="\033[0m"
+# 基础路径设定
+CFT_INSTALL_DIR="/opt/cloudflared"
+CFT_BIN="/usr/local/bin/cloudflared"
+TOKEN_FILE="$CFT_INSTALL_DIR/.token"
+IS_OPENWRT=0
+IS_ALPINE=0
 
-# 检查宝塔命令是否存在
-check_cmd() {
-    if ! command -v bt &>/dev/null; then
-        echo -e "${RED}未检测到 bt 命令，请确认服务器已成功安装宝塔面板！若未安装，请选择选项 18${RESET}"
-        return 1
+G_STATUS=""
+G_VERSION=""
+
+# GitHub 轮询节点列表
+GITHUB_PROXY=(
+    'https://gh-proxy.com/'
+    'https://v6.gh-proxy.org/'
+    'https://ghproxy.lvedong.eu.org/'
+    'https://proxy.vvvv.ee/'
+    'https://hub.glowp.xyz/'
+    '' 
+)
+DEFAULT_BACKUP_VER="2026.5.0"
+
+# 标准颜色
+CYAN="\e[36m"
+GREEN="\e[32m"
+YELLOW="\e[33m"
+RED="\e[31m"
+RESET="\e[0m"
+
+# 检查运行环境与架构
+check_env() {
+    if [ -f /etc/openwrt_release ]; then
+        IS_OPENWRT=1
+    elif [ -f /etc/alpine-release ]; then
+        IS_ALPINE=1
     fi
-    return 0
 }
+check_env
 
-pause(){
-    read -rp "按回车继续..."
-}
-
-menu(){
-clear
-echo -e "${GREEN}======================================${RESET}"
-echo -e "${GREEN}           宝塔面板 管理菜单           ${RESET}"
-echo -e "${GREEN}======================================${RESET}"
-
-# ----- 状态、版本、端口 强行直读 -----
-if command -v bt &>/dev/null; then
-    # 1. 服务状态检测
-    if pgrep -f "BT-Panel" > /dev/null; then
-        echo -e "服务状态: ${GREEN}● 正在运行${RESET}"
-    else
-        echo -e "服务状态: ${RED}○ 已停止${RESET}"
-    fi
-
-    # 2. 三级强读版本号
-    local ver_info=""
-    if [ -f "/www/server/panel/data/version.pl" ]; then
-        ver_info=$(cat /www/server/panel/data/version.pl 2>/dev/null | tr -d ' \r\n')
-    fi
-    # 备用方案：如果全文本没有，去尝试用 bt_main 提取
-    if [ -z "$ver_info" ] && [ -f "/www/server/panel/BT-Panel" ]; then
-        ver_info=$(/www/server/panel/BT-Panel -v 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+")
-    fi
-    
-    # 最终洗白输出
-    if [ -n "$ver_info" ]; then
-        [[ "$ver_info" =~ ^v ]] || ver_info="v$ver_info"
-        echo -e "当前版本: ${YELLOW}${ver_info}${RESET}"
-    else
-        echo -e "当前版本: ${YELLOW}v最新版 (暂未登录初始化)${RESET}"
-    fi
-
-    # 3. 读取端口
-    local port=""
-    if [ -f "/www/server/panel/data/port.pl" ]; then
-        port=$(cat /www/server/panel/data/port.pl 2>/dev/null | tr -d ' \r\n')
-    fi
-    echo -e "面板端口: ${CYAN}${port:-8888}${RESET}"
-else
-    echo -e "核心状态: ${RED}未检测到宝塔环境，请先执行选项 18 进行安装${RESET}"
-fi
-echo -e "${GREEN}======================================${RESET}"
-
-# ----- 菜单选项列表 (按功能逻辑顺序，完全对齐) -----
-echo -e "${CYAN}[服务管理]${RESET}"
-echo -e "${GREEN} 1.重启服务${RESET}           | ${GREEN} 2.停止服务${RESET}"
-echo -e "${GREEN} 3.启动服务${RESET}           | ${GREEN} 4.重载配置${RESET}"
-echo -e "${GREEN}--------------------------------------${RESET}"
-echo -e "${CYAN}[账户与访问设置]${RESET}"
-echo -e "${GREEN} 5.修改面板密码${RESET}       | ${GREEN} 6.修改面板用户名${RESET}"
-echo -e "${GREEN} 7.重置MySQL密码${RESET}       | ${GREEN} 8.修改面板端口${RESET}"
-echo -e "${GREEN}28.修改安全入口${RESET}       | ${GREEN}14.查看默认登录信息${RESET}"
-echo -e "${GREEN}--------------------------------------${RESET}"
-echo -e "${CYAN}[安全与限制解除]${RESET}"
-echo -e "${GREEN}10.清除登录限制${RESET}       | ${GREEN}11.IP+UA双重验证${RESET}"
-echo -e "${GREEN}12.取消域名绑定${RESET}       | ${GREEN}13.取消IP访问限制${RESET}"
-echo -e "${GREEN}24.关闭两步验证${RESET}       | ${GREEN}26.关闭面板SSL(HTTPS)${RESET}"
-echo -e "${GREEN}--------------------------------------${RESET}"
-echo -e "${CYAN}[维护与清理修复]${RESET}"
-echo -e "${YELLOW} 9.清除面板缓存${RESET}       | ${YELLOW}15.清理系统垃圾${RESET}"
-echo -e "${YELLOW}16.修复面板BUG${RESET}        | ${YELLOW}22.查看错误日志${RESET}"
-echo -e "${YELLOW}34.更新面板版本${RESET}       | ${YELLOW}36.磁盘清理工具${RESET}"
-echo -e "${YELLOW}35.btcli命令行管理工具${RESET}"
-echo -e "${GREEN}--------------------------------------${RESET}"
-echo -e "${CYAN}18.安装宝塔面板${RESET}       | ${RED}17.卸载宝塔面板${RESET}"
-echo -e "${GREEN}--------------------------------------${RESET}"
-echo -e "${GREEN} 0.退出${RESET}"
-
-}
-
-while true
-do
-    menu
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read -r num
-
-    case "$num" in
-    1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|22|24|26|28|34|35|36)
-        if check_cmd; then
-            echo -e "${YELLOW}正在执行 bt $num...${RESET}"
-            bt $num
-        fi
-        pause
-        ;;
-    18)
-        if command -v bt &>/dev/null; then
-            echo -e "${YELLOW}检测到系统已安装宝塔面板，无需重复安装！${RESET}"
-        else
-            echo -e "${GREEN}正在安装宝塔面板...${RESET}"
-            if [ -f /usr/bin/curl ]; then
-                curl -sSO https://download.bt.cn/install/install_panel.sh
-            else
-                wget -O install_panel.sh https://download.bt.cn/install/install_panel.sh
-            fi
-            bash install_panel.sh ed8484bec
-        fi
-        pause
-        ;;
-    17)
-        if [ -f "/www/server/panel/bt-uninstall.sh" ] || command -v bt &>/dev/null; then
-            echo -e "${RED}正在卸载宝塔面板...${RESET}"
-            curl -o bt-uninstall.sh http://download.bt.cn/install/bt-uninstall.sh > /dev/null 2>&1
-            chmod +x bt-uninstall.sh
-            ./bt-uninstall.sh
-            rm -f bt-uninstall.sh install_panel.sh
-        else
-            echo -e "${YELLOW}未检测到宝塔面板，无需卸载。${RESET}"
-        fi
-        pause
-        ;;
-    0) exit ;;
-    *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+get_arch() {
+    # Cloudflare 官方发布包命名中，linux-amd64 已经默认兼容了 Alpine musl 环境
+    # 因此不需要在文件名末尾拼接 "-musl" 字符串
+    case "$(uname -m)" in
+        x86_64) echo "amd64";;
+        aarch64) echo "arm64";;
+        armv7*|armv6*) echo "arm";;
+        *) echo "amd64";;
     esac
-done
+}
+
+# 自动获取 GitHub 最新版本号
+get_auto_version() {
+    local fetched_ver=""
+    echo -e "${YELLOW}正在尝试获取 GitHub 远端最新 cloudflared 版本号...${RESET}" >&2
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        fetched_ver=$(curl -sL -m 4 "${proxy}https://api.github.com/repos/cloudflare/cloudflared/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | sed 's/"tag_name": *//;s/"//g')
+        if [ -n "$fetched_ver" ]; then
+            echo "$fetched_ver"
+            return 0
+        fi
+    done
+    echo "$DEFAULT_BACKUP_VER"
+}
+
+# 下载组件核心逻辑
+download_package_loop() {
+    local version=$1
+    local arch=$2
+    local remote_filename="cloudflared-linux-${arch}"
+    local success=0
+
+    echo -e "${YELLOW}开始下载 cloudflared 二进制文件 ${version} (${arch})...${RESET}"
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local url="${proxy}https://github.com/cloudflare/cloudflared/releases/download/${version}/${remote_filename}"
+        if wget -T 10 -O "cloudflared_tmp" "$url"; then
+            echo -e "${GREEN}[成功] 下载完成！${RESET}"
+            success=1
+            break
+        else
+            rm -f "cloudflared_tmp"
+        fi
+    done
+    [ $success -eq 1 ] && return 0 || return 1
+}
+
+# 安装/更新主程序功能
+install_or_update_bin() {
+    local CFT_VER=$(get_auto_version)
+    local ARCH=$(get_arch)
+    
+    mkdir -p "$CFT_INSTALL_DIR"
+    cd "$CFT_INSTALL_DIR" || exit 1
+
+    if download_package_loop "$CFT_VER" "$ARCH"; then
+        stop_service 2>/dev/null || true
+        mv -f "cloudflared_tmp" "$CFT_BIN"
+        chmod +x "$CFT_BIN"
+        echo -e "${GREEN}[成功] cloudflared 主程序已就位/更新成功！${RESET}"
+        [ -f "$TOKEN_FILE" ] && restart_service
+    else
+        echo -e "${RED}[严重错误] 下载失败，请检查网络或重试！${RESET}"
+    fi
+    read -p "按回车返回菜单..." </dev/tty
+}
+
+# 更新隧道运行状态
+update_status_variables() {
+    G_VERSION="未检测到组件"
+    G_STATUS="${RED}已停止${RESET}"
+
+    if [ -f "$CFT_BIN" ]; then
+        G_VERSION=$($CFT_BIN --version 2>/dev/null | awk '{print $3}' || echo "未知")
+        if [ "$IS_OPENWRT" = "1" ]; then
+            (ps | grep -v grep | grep -q "[c]loudflared") && G_STATUS="${GREEN}已启动${RESET}"
+        elif [ "$IS_ALPINE" = "1" ]; then
+            (rc-service cloudflared status 2>/dev/null | grep -q "started") && G_STATUS="${GREEN}已启动${RESET}"
+        else
+            (systemctl is-active --quiet cloudflared 2>/dev/null) && G_STATUS="${GREEN}已启动${RESET}"
+        fi
+    fi
+}
+
+# 写入 OpenWrt 守护服务
+write_initd_service() {
+    local token=$(cat "$TOKEN_FILE" 2>/dev/null)
+    [ -z "$token" ] && return 1
+    
+    cat > /etc/init.d/cloudflared <<EOF
+#!/bin/sh /etc/rc.common
+START=99
+USE_PROCD=1
+PROG=$CFT_BIN
+start_service() {
+    procd_open_instance
+    procd_set_param command \$PROG tunnel run --token "$token"
+    procd_set_param respawn
+    procd_close_instance
+}
+EOF
+    chmod +x /etc/init.d/cloudflared
+    /etc/init.d/cloudflared enable
+}
+
+# 写入 Alpine (OpenRC) 守护服务
+write_openrc_service() {
+    local token=$(cat "$TOKEN_FILE" 2>/dev/null)
+    [ -z "$token" ] && return 1
+
+    cat > /etc/init.d/cloudflared <<EOF
+#!/sbin/openrc-run
+description="Cloudflare Tunnel (Token Mode)"
+supervisor="supervise-daemon"
+command="$CFT_BIN"
+command_args="tunnel run --token $token"
+command_background="yes"
+pidfile="/run/\${RC_SVCNAME}.pid"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+    chmod +x /etc/init.d/cloudflared
+    rc-update add cloudflared default >/dev/null 2>&1
+}
+
+# 写入标准 Linux Systemd 守护服务
+write_systemd_service() {
+    local token=$(cat "$TOKEN_FILE" 2>/dev/null)
+    [ -z "$token" ] && return 1
+
+    cat > /etc/systemd/system/cloudflared.service <<EOF
+[Unit]
+Description=Cloudflare Tunnel (Token Mode)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$CFT_BIN tunnel run --token $token
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+}
+
+# 统合写入守护服务路由
+deploy_service_config() {
+    if [ "$IS_OPENWRT" = "1" ]; then
+        write_initd_service
+    elif [ "$IS_ALPINE" = "1" ]; then
+        write_openrc_service
+    else
+        write_systemd_service
+    fi
+}
+
+# 绑定 Token
+bind_token() {
+    if [ ! -f "$CFT_BIN" ]; then
+        echo -e "${RED}错误：本地没有主程序，请先执行选项 1 安装主程序！${RESET}"
+        sleep 2
+        return
+    fi
+
+    echo "=== 绑定 Cloudflare Tunnel Token ==="
+    echo -e "${YELLOW}请输入你在 Cloudflare 网页端获取的官方一键 Token (eyJhIjoi...):${RESET}"
+    read -p "Token: " input_token </dev/tty
+    
+    if [ -z "$input_token" ]; then
+        echo -e "${RED}Token 不能为空，放弃操作。${RESET}"
+        sleep 1.5
+        return
+    fi
+
+    mkdir -p "$CFT_INSTALL_DIR"
+    rm -f "$CFT_INSTALL_DIR/config.yml" "$CFT_INSTALL_DIR/tunnel_cred.json" "$CFT_INSTALL_DIR/.cft_inited"
+    
+    echo "$input_token" | tr -d '\r\n ' > "$TOKEN_FILE"
+    echo -e "${GREEN}Token 记录成功！正在配置并尝试拉起服务...${RESET}"
+    
+    deploy_service_config
+    start_service
+    sleep 1.5
+}
+
+# 启动服务
+start_service() {
+    if [ ! -f "$CFT_BIN" ] || [ ! -f "$TOKEN_FILE" ]; then
+        echo -e "${RED}错误：未安装主程序或未绑定 Token！${RESET}"; sleep 2; return
+    fi
+
+    deploy_service_config
+    if [ "$IS_OPENWRT" = "1" ]; then
+        /etc/init.d/cloudflared start
+    elif [ "$IS_ALPINE" = "1" ]; then
+        rc-service cloudflared start
+    else
+        systemctl start cloudflared
+        systemctl enable cloudflared 2>/dev/null || true
+    fi
+    echo "隧道服务已启动"; sleep 1;
+}
+
+# 停止服务
+stop_service() {
+    if [ "$IS_OPENWRT" = "1" ]; then
+        /etc/init.d/cloudflared stop
+    elif [ "$IS_ALPINE" = "1" ]; then
+        rc-service cloudflared stop 2>/dev/null || true
+    else
+        systemctl stop cloudflared
+    fi
+    echo "隧道服务已停止"; sleep 1;
+}
+
+# 重启服务
+restart_service() {
+    if [ ! -f "$CFT_BIN" ] || [ ! -f "$TOKEN_FILE" ]; then
+        echo -e "${RED}错误：未安装主程序或未绑定 Token！${RESET}"; sleep 2; return
+    fi
+
+    deploy_service_config
+    if [ "$IS_OPENWRT" = "1" ]; then
+        /etc/init.d/cloudflared restart
+    elif [ "$IS_ALPINE" = "1" ]; then
+        rc-service cloudflared restart
+    else
+        systemctl restart cloudflared
+    fi
+    echo "隧道服务已重启"; sleep 1;
+}
+
+# 查看运行日志
+log_service() {
+    echo -e "${CYAN}=== 正在获取最近的 30 行隧道运行日志 ===${RESET}"
+    if [ "$IS_OPENWRT" = "1" ]; then 
+        logread | grep cloudflared | tail -n 30 || echo "暂无日志"
+    elif [ "$IS_ALPINE" = "1" ]; then
+        if [ -f /var/log/messages ]; then
+            tail -n 100 /var/log/messages | grep cloudflared | tail -n 30
+        else
+            echo -e "${YELLOW}Alpine 默认输出至 syslog，请确保已安装 busybox-initscripts 或 syslog-ng${RESET}"
+            rc-service cloudflared status
+        fi
+    else 
+        journalctl -u cloudflared -n 30 --no-pager 2>/dev/null || tail -n 30 /var/log/messages 2>/dev/null
+    fi
+    read -p "按回车返回菜单..." </dev/tty
+}
+
+# 彻底卸载
+uninstall_service() {
+    echo -e "${RED}确定要彻底卸载本地服务及清除所有配置吗？(y/n)${RESET}"
+    read -p "请输入: " confirm </dev/tty
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        stop_service 2>/dev/null || true
+        if [ "$IS_OPENWRT" = "1" ]; then
+            /etc/init.d/cloudflared disable 2>/dev/null || true
+            rm -f /etc/init.d/cloudflared
+        elif [ "$IS_ALPINE" = "1" ]; then
+            rc-update del cloudflared default >/dev/null 2>&1 || true
+            rm -f /etc/init.d/cloudflared
+        else
+            systemctl disable cloudflared 2>/dev/null || true
+            rm -f /etc/systemd/system/cloudflared.service
+            systemctl daemon-reload
+        fi
+        rm -rf "$CFT_INSTALL_DIR" "$CFT_BIN"
+        echo -e "${GREEN}Cloudflare Tunnel 已完全卸载干净。${RESET}"
+        sleep 2
+    fi
+}
+
+# ---------- 主菜单界面 ----------
+main_menu() {
+    while true; do
+        update_status_variables
+        clear
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}   Cloudflare 远端控制管理面板    ${RESET}"
+        echo -e "${GREEN}   (Dashboard 模式/无需本地配置)  ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        [ ! -f "$CFT_BIN" ] && echo -e "${RED}[警告] 未找到执行文件，请先执行选项 1 安装！${RESET}"
+        echo -e "${GREEN}当前状态 :${RESET} $G_STATUS"
+        echo -e "${GREEN}主程序版 :${RESET} ${YELLOW}${G_VERSION}${RESET}"
+        echo -e "${GREEN}管理提示 : 规则增删请直接在网页面板操作${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN} 1. 安装/更新cloudflared${RESET}"
+        echo -e "${GREEN} 2. 绑定/修改Token${RESET}"
+        echo -e "${GREEN} 3. 启动隧道服务${RESET}"
+        echo -e "${GREEN} 4. 停止隧道服务${RESET}"
+        echo -e "${GREEN} 5. 重启隧道服务${RESET}"
+        echo -e "${GREEN} 6. 查看运行日志${RESET}"
+        echo -e "${GREEN} 7. 卸载服务${RESET}"
+        echo -e "${GREEN} 0. 退出${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -ne "${GREEN}请输入选项: ${RESET}"
+        read choice </dev/tty
+        case $choice in
+            1) install_or_update_bin ;;
+            2) bind_token ;;
+            3) start_service ;;
+            4) stop_service ;;
+            5) restart_service ;;
+            6) log_service ;;
+            7) uninstall_service ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选项！${RESET}" && sleep 1 ;;
+        esac
+    done
+}
+
+main_menu

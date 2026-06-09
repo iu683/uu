@@ -1,498 +1,338 @@
-#!/usr/bin/env bash
-
+#!/usr/bin/env sh
 # ==============================================================================
-#  next-socks5 一键管理面板
+#   CF-WARP Alpine 专属控制面板 (完美缝合纯 IPv6 修正与谷歌分流状态验证)
 # ==============================================================================
 
-# ── 核心环境变量 ──────────────────────────────────────────────────────────────
-export REPO="ZingerLittleBee/next-socks5"
-export SERVICE_NAME="next-socks5"
-export SERVICE_USER="socks5"
-export INSTALL_BIN="/usr/local/bin/next-socks5"
-export CONF_DIR="/etc/next-socks5"
-export CONF_FILE="${CONF_DIR}/config.toml"
-export DATA_DIR="/var/lib/next-socks5"
-export SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-
-# ── 终端颜色定义 ──────────────────────────────────
-export RESET='\033[0m'
-export GREEN='\033[0;32m'
-export YELLOW='\033[0;33m'
-export RED='\033[0;31m'
-export BLUE='\033[0;34m'
-export CYAN='\033[0;36m'
-
-# ── 基础环境校验 ──────────────────────────────────────────────────────────
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}[错误]${RESET} 请使用 root 权限运行此脚本！" >&2
-    exit 1
+# 预检：由于 Alpine 默认不带高级语法，必须先自动补齐 bash 并切过去
+if [ -z "$BASH_VERSION" ]; then
+    if ! command -v bash >/dev/null 2>&1; then
+        apk update -q && apk add -q bash
+    fi
+    exec bash "$0" "$@"
 fi
 
-info() { echo -e "${BLUE}[INFO]${RESET} $1"; }
-ok()   { echo -e "${GREEN}[OK]${RESET} $1"; }
-warn() { echo -e "${YELLOW}[WARN]${RESET} $1"; }
-die()  { echo -e "${RED}[ERROR]${RESET} $1" >&2; exit 1; }
+set -e
 
-detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS=$ID
-    else
-        die "无法识别当前操作系统类型。"
-    fi
-}
-detect_os
+# --- 核心主程序变量 ---
+export REPO_USQUE="Diniboy1123/usque"
+export SERVICE_NAME="usque"
+export INSTALL_BIN="/usr/local/bin/usque"
+export CONF_DIR="/etc/usque"
+export CONF_FILE="${CONF_DIR}/config.json"
+export SERVICE_FILE="/etc/init.d/${SERVICE_NAME}"
+export META_FILE="${CONF_DIR}/.panel_meta"
 
-REQUIRED_CMDS="curl tar sed grep awk openssl"
-MISSING_CMDS=""
+# --- 谷歌分流专属变量 ---
+export PROXY_SERVICE_NAME="usque-google-proxy"
+export DATA_DIR="/var/lib/usque"
+export REDSOCKS_CONF="${CONF_DIR}/redsocks.conf"
+export PROXY_RULES_SCRIPT="${DATA_DIR}/google_rules.sh"
+export PROXY_SERVICE_FILE="/etc/init.d/${PROXY_SERVICE_NAME}"
 
-for cmd in $REQUIRED_CMDS; do
-    if ! command -v "$cmd" &> /dev/null; then
-        MISSING_CMDS="$MISSING_CMDS $cmd"
-    fi
-done
+# 颜色定义
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+RESET='\033[0m'
 
-if [ -n "$MISSING_CMDS" ]; then
-    info "检测到系统缺失必要组件:${YELLOW}$MISSING_CMDS${RESET}，正在自动修复..."
-    case "$OS" in
-        ubuntu|debian)
-            apt-get update -qy && apt-get install -y $MISSING_CMDS >/dev/null 2>&1
-            ;;
-        centos|rhel|rocky|almalinux|fedora)
-            if command -v dnf &>/dev/null; then
-                dnf install -y $MISSING_CMDS >/dev/null 2>&1
-            else
-                yum install -y $MISSING_CMDS >/dev/null 2>&1
-            fi
-            ;;
-        *)
-            die "未知系统，请手动安装组件: $MISSING_CMDS"
-            ;;
-    esac
+GITHUB_PROXY=('https://v6.gh-proxy.org/' 'https://gh-proxy.com/' '')
 
-    for cmd in $MISSING_CMDS; do
-        if ! command -v "$cmd" &> /dev/null; then
-            die "自动安装 [ $cmd ] 失败，请检查网络源。"
-        fi
-    done
-    ok "基础依赖补全成功！"
-fi
+[[ "$EUID" -ne 0 ]] && echo -e "${RED}[错误]${RESET} 请使用 root 权限运行！" && exit 1
 
-# ── 1. 核心下载与组件解压 ───────────────────────────────────────────────────
-detect_target() {
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64)  TARGET="x86_64-unknown-linux-musl" ;;
-        aarch64) TARGET="aarch64-unknown-linux-musl" ;;
-        *) die "暂不支持的系统架构: $ARCH (面板目前仅支持 x86_64 及 aarch64)" ;;
-    esac
-}
-
-fetch_latest_version() {
-    info "正在查询 GitHub 获取最新 Release 版本号..."
-    TMP_API="$(mktemp)"
-    if curl -sSL -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${REPO}/releases/latest" > "$TMP_API"; then
-        VERSION="$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$TMP_API" | head -n 1)"
-    fi
-    rm -f "$TMP_API"
-
-    if [ -z "$VERSION" ]; then
-        warn "API 获取失败，尝试网页流解析..."
-        VERSION=$(curl -sS "https://github.com/${REPO}/releases/latest" 2>/dev/null | grep -o 'tag/[vV]*[0-9.]*' | awk -F '/' 'NR==1 {print $2}')
-    fi
-
-    if [ -z "$VERSION" ]; then
-        VERSION="v0.1.3"
-    fi
-    export VERSION
-    
-    [ -d "$CONF_DIR" ] || install -m 0755 -d "$CONF_DIR"
-    echo "$VERSION" > "${CONF_DIR}/.version" 2>/dev/null
-}
-
-download_and_extract() {
-    detect_target
-    fetch_latest_version
-    info "正在匹配系统环境形态: ${YELLOW}${TARGET}${RESET}"
-
-    ASSET="next-socks5-${TARGET}.tar.gz"
-    URL_TGZ="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
-
-    TMP="$(mktemp -d)"
-    trap 'rm -rf "$TMP"' EXIT
-
-    info "开始同步下载资产包..."
-    curl -fsSL -o "$TMP/$ASSET" "$URL_TGZ" || die "下载资产包失败！"
-
-    tar xzf "$TMP/$ASSET" -C "$TMP"
-    EXTRACTED_BIN=$(find "$TMP" -type f -name "next-socks5" | head -n 1)
-    [ -n "$EXTRACTED_BIN" ] || die "解压成功，但在归档包内未找到 next-socks5 主程序！"
-    export TARGET_BIN_PATH="$EXTRACTED_BIN"
-}
-
-# ── 2. TOML 配置文件生成器 ──────────────────────────────────────────────────
-write_config() {
-    local bind_ip="$1" local bind_port="$2" local username="$3" local password="$4"
-    [ -d "$CONF_DIR" ] || install -m 0755 -d "$CONF_DIR"
-    
-    cat <<EOF > "$CONF_FILE"
-listen = "${bind_ip}:${bind_port}"
-
-[auth]
-EOF
-
-    if [ -n "$username" ] && [ -n "$password" ]; then
-        cat <<EOF >> "$CONF_FILE"
-method = "password"
-[[auth.users]]
-username = "${username}"
-password = "${password}"
-EOF
-    else
-        cat <<EOF >> "$CONF_FILE"
-method = "none"
-EOF
-    fi
-
-    cat <<EOF >> "$CONF_FILE"
-
-[timeouts]
-connect_ms = 10000
-tcp_idle_ms = 300000
-udp_idle_ms = 60000
-
-[udp]
-# port_range = "40000-40100"      # bind UDP relay sockets to this range
-# advertise = "YOUR_PUBLIC_IP"    # advertised BND IP for clients behind NAT
-EOF
-}
-
-write_systemd() {
-    cat <<EOF > "$SERVICE_FILE"
-[Unit]
-Description=next-socks5 - Fast and Lightweight SOCKS5 Server
-After=network.target network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=${SERVICE_USER}
-Group=${SERVICE_USER}
-WorkingDirectory=${DATA_DIR}
-ExecStart=${INSTALL_BIN} serve --config ${CONF_FILE} --no-tui
-Restart=always
-RestartSec=3s
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
-}
-
-# ── 节点配置总结报告 ──────────────────────────────────────────────────────────
-print_node_summary() {
-    if [ ! -f "$CONF_FILE" ]; then return; fi
-
-    # 🛠 修复点：改用严格的 awk 状态机精准提取 TOML 中的 listen 端口
-    local bind_port
-    bind_port=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); split($2, a, ":"); print a[length(a)]}' "$CONF_FILE")
-    [ -z "$bind_port" ] && bind_port="16216"
-    
-    # 🛠 修复点：精准判定鉴权模式
-    local auth_method
-    auth_method=$(awk -F '=' '/^[[:space:]]*method[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
-    
-    local auth_user="" local auth_pass=""
-    if [ "$auth_method" = "password" ]; then
-        # 🛠 修复点：通过强大的 awk 块匹配，完美剥离外部双引号，精准提取账号密码
-        auth_user=$(awk -F '=' '/^[[:space:]]*username[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
-        auth_pass=$(awk -F '=' '/^[[:space:]]*password[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
-    fi
-
-    local public_ip
-    public_ip=$(curl -s --max-time 5 ipinfo.io/ip || curl -s --max-time 5 api.ipify.org || echo "你的公网IP")
-
-    echo -e "\n${GREEN}====== 当前配置详情 ======${RESET}"
-    echo -e "${GREEN}IP地址       :${RESET} ${public_ip}"
-    echo -e "${GREEN}端口         :${RESET} ${bind_port}"
-    if [ -n "$auth_user" ]; then
-        echo -e "${GREEN}用户名       :${RESET} ${auth_user}"
-        echo -e "${GREEN}密码         :${RESET} ${auth_pass}"
-    else
-        echo -e "${GREEN}鉴权模式     :${RESET} ${YELLOW}无密码 (免密模式)${RESET}"
-    fi
-    echo -e "${GREEN}分享存放路径 :${RESET} ${CONF_FILE}"
-    echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
-    
-    echo -e "${GREEN}====== 👉 通用客户端 Socks5 链接 ======${RESET}"
-    if [ -n "$auth_user" ]; then
-        echo -e "${YELLOW}socks://${auth_user}:${auth_pass}@${public_ip}:${bind_port}#uu-socks5${RESET}"
-    else
-        echo -e "${YELLOW}socks://${public_ip}:${bind_port}#uu-socks5${RESET}"
-    fi
-    
-    echo -e "${GREEN}====== 🚀 Telegram 内置一键代理链接 ======${RESET}"
-    if [ -n "$auth_user" ]; then
-        echo -e "${YELLOW}https://t.me/socks?server=${public_ip}&port=${bind_port}&user=${auth_user}&pass=${auth_pass}${RESET}"
-    else
-        echo -e "${YELLOW}https://t.me/socks?server=${public_ip}&port=${bind_port}${RESET}"
-    fi
-    echo ""
-
-}
-
-# ── 3. 面板核心数据抓取 ───────────────────────────────────────────────────────
+# 状态刷新
 get_status_info() {
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
+    if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
         panel_status="${GREEN}运行中${RESET}"
     else
         panel_status="${RED}未运行${RESET}"
     fi
-
+    
     if [ -f "$INSTALL_BIN" ]; then
-        if [ -f "${CONF_DIR}/.version" ]; then
-            panel_version=$(cat "${CONF_DIR}/.version")
-        else
-            local raw_ver
-            raw_ver=$("$INSTALL_BIN" --version 2>/dev/null | grep -oE '[vV]?[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
-            if [ -n "$raw_ver" ]; then
-                panel_version="$raw_ver"
-                echo "$raw_ver" > "${CONF_DIR}/.version" 2>/dev/null
-            else
-                panel_version="v0.1.3"
-            fi
-        fi
+        local ver
+        ver=$("$INSTALL_BIN" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+        panel_version="${YELLOW}v${ver:-已安装}${RESET}"
     else
         panel_version="${RED}未安装${RESET}"
     fi
-
-    if [ -f "$CONF_FILE" ]; then
-        panel_port=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
+    
+    if [ -f "$META_FILE" ]; then
+        IFS='|' read -r m_mode m_ip m_port _ < "$META_FILE"
+        panel_port="${YELLOW}${m_mode}://$m_ip:$m_port${RESET}"
     else
-        panel_port="未设定"
+        panel_port="${RED}未配置${RESET}"
     fi
 }
 
-menu_install() {
-    if [ -f "$INSTALL_BIN" ]; then
-        warn "系统中已存在安装好的实例文件。"
-        read -r -p "$(echo -e "${GREEN}是否确定完全覆盖重新安装？[y/N]: ${RESET}")" res
-        [[ "$res" =~ ^[Yy]$ ]] || return
+# 依赖安装
+check_deps() {
+    local missing=""
+    ! command -v unzip >/dev/null 2>&1 && missing="$missing unzip"
+    ! command -v curl >/dev/null 2>&1 && missing="$missing curl"
+    ! command -v ip >/dev/null 2>&1 && missing="$missing iproute2"
+    if [ -n "$missing" ]; then
+        apk update -q && apk add -q $missing >/dev/null 2>&1
     fi
+}
 
-    echo -e "\n${GREEN}==== [自定义安装配置] ====${RESET}"
-    read -r -p "$(echo -e "${GREEN}请输入监听 IP 地址 [默认 ::]: ${RESET}")" input_ip
-    local opt_ip="${input_ip:-::}"
-
-    local rand_port=$((RANDOM % 50001 + 10000))
-    read -r -p "$(echo -e "${GREEN}请输入 SOCKS5 监听端口 [回车默认随机端口: ${rand_port}]: ${RESET}")" input_port
-    local opt_port="${input_port:-$rand_port}"
-    if ! [[ "$opt_port" =~ ^[0-9]+$ ]] || [ "$opt_port" -le 0 ] || [ "$opt_port" -gt 65535 ]; then
-        opt_port=$rand_port
-    fi
-
-    local rand_user="user_$(openssl rand -hex 4)"
-    local rand_pass="$(openssl rand -hex 10)"
-    local opt_user="" local opt_pass=""
-
-    read -r -p "$(echo -e "${GREEN}请输入自定义用户名 [回车默认随机: ${YELLOW}${rand_user}${GREEN}, 输入 ${RED}none${GREEN} 选免密]: ${RESET}")" input_user
-    if [ -z "$input_user" ]; then
-        opt_user="$rand_user"
-        read -r -p "$(echo -e "${GREEN}请输入自定义密码 [回车默认随机: ${YELLOW}${rand_pass}${GREEN}]: ${RESET}")" input_pass
-        opt_pass="${input_pass:-$rand_pass}"
-    elif [ "$input_user" = "none" ]; then
-        opt_user=""
-        opt_pass=""
-    else
-        opt_user="$input_user"
-        read -r -p "$(echo -e "${GREEN}请输入自定义密码 [回车默认随机: ${YELLOW}${rand_pass}${GREEN}]: ${RESET}")" input_pass
-        opt_pass="${input_pass:-$rand_pass}"
-    fi
-
-    download_and_extract
-
-    if ! id "$SERVICE_USER" >/dev/null 2>&1; then
-        useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER" 2>/dev/null \
-          || adduser --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
-    fi
-
-    install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$INSTALL_BIN"
-    install -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" -d "$DATA_DIR"
-    write_config "$opt_ip" "$opt_port" "$opt_user" "$opt_pass"
-    write_systemd
-
-    info "正在拉起后台服务..."
-    systemctl start "$SERVICE_NAME"
+# 下载与注册 (含纯 IPv6 环境自适应修正)
+install_warp() {
+    echo -e "${BLUE}[信息]${RESET} 正在安装 Usque 核心组件..."
+    check_deps
     
-    local is_ok=1
-    for i in {1..5}; do
-        if systemctl is-active --quiet "$SERVICE_NAME"; then is_ok=0; break; fi
-        sleep 1
+    local has_v4=0
+    if curl -4sSk --max-time 2 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "ip="; then
+        has_v4=1
+    fi
+
+    local ARCH=$(uname -m)
+    local TARGET="linux_amd64"
+    [[ "$ARCH" == "aarch64" ]] && TARGET="linux_arm64"
+
+    local latest_tag=""
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        latest_tag=$(curl -fsSL --max-time 6 "${proxy}https://api.github.com/repos/${REPO_USQUE}/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        [ -n "$latest_tag" ] && break
     done
+    [ -z "$latest_tag" ] && latest_tag="v3.0.0"
+    local pure_ver="${latest_tag#v}"
 
-    if [ "$is_ok" -eq 0 ]; then
-        ok "next-socks5 代理服务部署成功！"
-        print_node_summary
-    else
-        warn "部署完成，但初始化响应异常，请稍后选择 [8] 查看实时日志。"
+    local tmp_dir=$(mktemp -d)
+    if curl -fsSL -L -o "$tmp_dir/zip" "${GITHUB_PROXY[0]}https://github.com/${REPO_USQUE}/releases/download/${latest_tag}/usque_${pure_ver}_${TARGET}.zip"; then
+        unzip -q -o "$tmp_dir/zip" -d "$tmp_dir"
+        cp -f "$tmp_dir/usque" "$INSTALL_BIN"
+        chmod +x "$INSTALL_BIN"
     fi
-}
+    rm -rf "$tmp_dir"
 
-menu_update() {
-    [ -f "$SERVICE_FILE" ] || die "未检测到系统服务，请先选择 [1] 进行完整安装。"
-    download_and_extract
-    systemctl stop "$SERVICE_NAME"
-    install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$INSTALL_BIN"
-    systemctl start "$SERVICE_NAME"
-    ok "next-socks5 核心主程序已完成平滑更新。"
-}
-
-menu_uninstall() {
-    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1
-    systemctl disable "$SERVICE_NAME" >/dev/null 2>&1
-    rm -f "$INSTALL_BIN" "$SERVICE_FILE"
-    systemctl daemon-reload
-    rm -rf "$CONF_DIR" "$DATA_DIR"
-    userdel "$SERVICE_USER" >/dev/null 2>&1
-    ok "next-socks5 核心组件及配置文件已全部安全卸载收回。"
-}
-
-menu_edit_config() {
-    [ -f "$CONF_FILE" ] || die "未发现任何配置文件，请先执行安装步骤。"
+    [ -d "$CONF_DIR" ] || mkdir -p "$CONF_DIR"
+    cd "$CONF_DIR"
     
-    local current_bind
-    current_bind=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
-    local current_ip="${current_bind%%:*}" local current_port="${current_bind##*:}"
-    
-    local current_method
-    current_method=$(awk -F '=' '/^[[:space:]]*method[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
-    
-    local current_user="" local current_pass=""
-    if [ "$current_method" = "password" ]; then
-        current_user=$(awk -F '=' '/^[[:space:]]*username[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
-        current_pass=$(awk -F '=' '/^[[:space:]]*password[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
-    fi
-
-    [ -z "$current_ip" ] && current_ip="::"
-    [ -z "$current_port" ] && current_port="1080"
-
-    echo -e "\n${GREEN}==== [修改内核参数配置] ====${RESET}"
-    read -r -p "$(echo -e "${GREEN}请输入监听 IP 地址 [当前: ${current_ip}]: ${RESET}")" input_ip
-    local opt_ip="${input_ip:-$current_ip}"
-
-    local rand_port=$((RANDOM % 50001 + 10000))
-    read -r -p "$(echo -e "${GREEN}请输入 SOCKS5 监听端口 [当前: ${current_port}, 回车保持原样, 输入 ${YELLOW}rand${GREEN} 随机重置]: ${RESET}")" input_port
-    local opt_port="$current_port"
-    if [ "$input_port" = "rand" ]; then
-        opt_port="$rand_port"
-    elif [ -n "$input_port" ]; then
-        if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -gt 0 ] && [ "$input_port" -le 65535 ]; then
-            opt_port="$input_port"
+    echo -e "${BLUE}[信息]${RESET} 正在执行本地匿名注册..."
+    if "${INSTALL_BIN}" register; then
+        echo -e "${GREEN}[成功]${RESET} Cloudflare 本地注册成功。"
+        
+        # 缝合逻辑：纯 IPv6 修复处理
+        if [ "$has_v4" -ne 1 ] && [ -f "$CONF_FILE" ]; then
+            echo -e "${BLUE}[信息]${RESET} 检测到纯 IPv6 环境，正在自动修正配置文件..."
+            local v6_ep=$(grep -o '"endpoint_v6": *"[^"]*"' "$CONF_FILE" | awk -F '"' '{print $4}')
+            if [ -z "$v6_ep" ]; then
+                v6_ep="[2606:4700:d0::a25c:bc2e]:2408"
+            fi
+            sed -i "s/\"endpoint_v4\": *\"[^\"]*\"/\"endpoint_v4\": \"${v6_ep}\"/g" "$CONF_FILE"
+            echo -e "${GREEN}[成功]${RESET} IPv6 修正已完成 (Endpoint: $v6_ep)。"
         fi
-    fi
-
-    # ================================================================================
-    # 账密逻辑修改处：回车保持原样或留空，移除强制随机生成
-    # ================================================================================
-    local opt_user="" local opt_pass=""
-
-    read -r -p "$(echo -e "${GREEN}请输入用户名 [当前: ${current_user:-无密码}, 输入 ${RED}none${GREEN} 彻底清除密码, 回车默认保持原样/不设置]: ${RESET}")" input_user
-    
-    if [ -z "$input_user" ]; then
-        # 直接回车：保持现状
-        opt_user="$current_user"
-        opt_pass="$current_pass"
-    elif [ "$input_user" = "none" ]; then
-        # 输入 none：彻底关闭认证，保持留空
-        opt_user=""
-        opt_pass=""
+        
+        write_openrc "SOCKS5" "127.0.0.1" "1080" "" ""
+        rc-service "$SERVICE_NAME" start
     else
-        # 输入了新的用户名
-        opt_user="$input_user"
-        read -r -p "$(echo -e "${GREEN}请输入新密码 [当前: ${current_pass:-无密码}, 回车默认保持原样/不设置]: ${RESET}")" input_pass
-        opt_pass="${input_pass:-$current_pass}"
-    fi
-    # ================================================================================
-
-    write_config "$opt_ip" "$opt_port" "$opt_user" "$opt_pass"
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        systemctl restart "$SERVICE_NAME"
-        ok "配置已覆盖，全套代理服务已同步重启生效！"
-        print_node_summary
-    else
-        ok "配置已成功重写更新。"
+        echo -e "${RED}[错误]${RESET} 注册失败。提示：请确保你的 VPS 已开启 IPv6 外部访问能力。"
+        return 1
     fi
 }
 
-menu_show_node_config() {
-    if [ ! -f "$CONF_FILE" ]; then 
-        die "未检测到有效的服务配置文件，请先执行选择 [1] 进行完整安装。"
-    fi
+# 写入 Alpine OpenRC 脚本
+write_openrc() {
+    local mode="$1" ip="$2" port="$3" user="$4" pass="$5"
+    local cmd="socks"
+    [[ "$mode" == "HTTP" ]] && cmd="http-proxy"
+    local args="${cmd} -b ${ip} -p ${port}"
+    [[ -n "$user" ]] && args="${args} -u ${user} -w ${pass}"
 
-    print_node_summary
-
-    local full_bind
-    full_bind=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
-    local bind_ip="${full_bind%%:*}" local bind_port="${full_bind##*:}"
-    local connect_ip="$bind_ip"
-    if [ "$connect_ip" = "0.0.0.0" ]; then connect_ip="127.0.0.1"; fi
-
-    local auth_method
-    auth_method=$(awk -F '=' '/^[[:space:]]*method[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
-    
-    local auth_user="" local auth_pass=""
-    if [ "$auth_method" = "password" ]; then
-        auth_user=$(awk -F '=' '/^[[:space:]]*username[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
-        auth_pass=$(awk -F '=' '/^[[:space:]]*password[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
-    fi
-
-    local proxy_args="--socks5-hostname ${connect_ip}:${bind_port}"
-    if [ -n "$auth_user" ] && [ -n "$auth_pass" ]; then
-        proxy_args="--socks5-hostname ${auth_user}:${auth_pass}@${connect_ip}:${bind_port}"
-    fi
-
+    cat <<EOF > "$SERVICE_FILE"
+#!/sbin/openrc-run
+description="Usque WARP Proxy Server"
+supervisor="supervise-daemon"
+command="${INSTALL_BIN}"
+command_args="--config ${CONF_FILE} ${args}"
+command_background="yes"
+directory="${CONF_DIR}"
+output_log="/var/log/usque.log"
+error_log="/var/log/usque.err"
+depend() { need net; after firewall; }
+EOF
+    chmod +x "$SERVICE_FILE"
+    rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
+    echo "${mode}|${ip}|${port}|${user}|${pass}" > "$META_FILE"
 }
 
-# ── 4. 主循环控制中心 ─────────────────────────────────────────────────────────
+# 修改配置
+edit_config() {
+    if [ ! -f "$META_FILE" ]; then echo -e "${RED}[错误]${RESET} 未发现配置记录"; return; fi
+    IFS='|' read -r o_mode o_ip o_port o_user o_pass < "$META_FILE"
+    echo "--- 修改配置 ---"
+    read -r -p "请选择模式 (1.SOCKS5 2.HTTP) [当前: $o_mode]: " m_ch
+    local n_mode="$o_mode"
+    [[ "$m_ch" == "1" ]] && n_mode="SOCKS5"
+    [[ "$m_ch" == "2" ]] && n_mode="HTTP"
+    read -r -p "监听 IP [当前: $o_ip]: " n_ip; n_ip="${n_ip:-$o_ip}"
+    read -r -p "监听端口 [当前: $o_port]: " n_port; n_port="${n_port:-$o_port}"
+    write_openrc "$n_mode" "$n_ip" "$n_port" "$o_user" "$o_pass"
+    rc-service "$SERVICE_NAME" restart
+}
+
+# 查看配置与出口状态
+show_status() {
+    if [ ! -f "$META_FILE" ]; then echo -e "${RED}[错误]${RESET} 未配置过服务"; return; fi
+    IFS='|' read -r b_mode b_ip b_port b_user b_pass < "$META_FILE"
+    echo -e "\n代理模式: $b_mode | 监听: $b_ip:$b_port"
+    local p_url="socks5://"
+    [[ "$b_mode" == "HTTP" ]] && p_url="http://"
+    [[ "$b_ip" == "0.0.0.0" ]] && b_ip="127.0.0.1"
+    if curl -sS --max-time 6 -x "${p_url}${b_ip}:${b_port}" "https://www.cloudflare.com/cdn-cgi/trace" | grep -q "warp=on"; then
+        echo -e "${GREEN}[成功]${RESET} WARP 网络出口完全正常！"
+    else
+        echo -e "${RED}[错误]${RESET} 代理未成功通过 WARP 出网，请检查日志。"
+    fi
+}
+
+# 谷歌分流二级菜单 (含连通性验证状态查看)
+google_split_menu() {
+    while true; do
+        clear
+        local g_status="${RED}未运行${RESET}"
+        rc-service "$PROXY_SERVICE_NAME" status >/dev/null 2>&1 && g_status="${GREEN}运行中${RESET}"
+        echo -e "${GREEN}==============================${RESET}"
+        echo -e "${GREEN}        谷歌分流管理面板        ${RESET}"
+        echo -e "${GREEN}==============================${RESET}"
+        echo -e "${GREEN}当前状态 :${RESET} $g_status"
+        echo -e "${GREEN}==============================${RESET}"
+        echo -e "${GREEN}  1. 开启谷歌透明分流${RESET}"
+        echo -e "${GREEN}  2. 关闭谷歌透明分流${RESET}"
+        echo -e "${GREEN}  3. 验证谷歌分流连通性${RESET}"
+        echo -e "${GREEN}  0. 返回主菜单${RESET}"
+        echo -e "${GREEN}==============================${RESET}"
+        read -r -p "请输入选项: " sub_ch
+        case "$sub_ch" in
+            1)
+                if ! command -v redsocks &>/dev/null || ! command -v iptables &>/dev/null; then
+                    apk add -q redsocks iptables
+                fi
+                ip -6 route add blackhole 2607:f8b0::/32 2>/dev/null || true
+                
+                # 提取主端口
+                IFS='|' read -r _ _ warp_port _ < "$META_FILE"
+                cat <<EOF > "$REDSOCKS_CONF"
+base { log_debug = off; log_info = on; log = "syslog:daemon"; daemon = off; redirector = iptables; }
+redsocks { local_ip = 127.0.0.1; local_port = 12345; ip = 127.0.0.1; port = ${warp_port:-1080}; type = socks5; }
+EOF
+                [ -d "$DATA_DIR" ] || mkdir -p "$DATA_DIR"
+                cat <<'EOF' > "$PROXY_RULES_SCRIPT"
+#!/bin/bash
+ACTION=$1
+GOOGLE_IPS="
+8.8.4.0/24 8.8.8.0/24 34.0.0.0/9 35.184.0.0/13 35.192.0.0/12
+35.224.0.0/12 35.240.0.0/13 64.233.160.0/19 66.102.0.0/20
+66.249.64.0/19 72.14.192.0/18 74.125.0.0/16 104.132.0.0/14
+108.177.0.0/17 142.250.0.0/15 172.217.0.0/16 172.253.0.0/16
+173.194.0.0/16 209.85.128.0/17 216.58.192.0/19 216.239.32.0/19
+"
+if [ "$ACTION" = "start" ]; then
+    iptables -t nat -N WARP_GOOGLE 2>/dev/null || true
+    iptables -t nat -F WARP_GOOGLE
+    for ip in $GOOGLE_IPS; do iptables -t nat -A WARP_GOOGLE -d $ip -p tcp -j REDIRECT --to-ports 12345; done
+    iptables -t nat -C OUTPUT -j WARP_GOOGLE 2>/dev/null || iptables -t nat -A OUTPUT -j WARP_GOOGLE
+elif [ "$ACTION" = "stop" ]; then
+    iptables -t nat -D OUTPUT -j WARP_GOOGLE 2>/dev/null || true
+    iptables -t nat -F WARP_GOOGLE 2>/dev/null || true
+    iptables -t nat -X WARP_GOOGLE 2>/dev/null || true
+fi
+EOF
+                chmod +x "$PROXY_RULES_SCRIPT"
+                cat <<EOF > "$PROXY_SERVICE_FILE"
+#!/sbin/openrc-run
+supervisor="supervise-daemon"
+command="/usr/sbin/redsocks"
+command_args="-c ${REDSOCKS_CONF}"
+command_background="yes"
+start_post() { ${PROXY_RULES_SCRIPT} start; }
+stop_pre() { ${PROXY_RULES_SCRIPT} stop; }
+EOF
+                chmod +x "$PROXY_SERVICE_FILE"
+                rc-service "$PROXY_SERVICE_NAME" start
+                echo -e "${GREEN}[成功]${RESET} 谷歌分流规则已挂载完成！"
+                ;;
+            2)
+                rc-service "$PROXY_SERVICE_NAME" stop 2>/dev/null || true
+                echo -e "${GREEN}[成功]${RESET} 谷歌分流规则已卸载。"
+                ;;
+            3)
+                echo -e "\n[正在验证谷歌透明拦截链路...]"
+                if iptables -t nat -L OUTPUT -n 2>/dev/null | grep -q "WARP_GOOGLE"; then
+                    echo -e " iptables 劫持链: ${GREEN}✔ 正常挂载${RESET}"
+                else
+                    echo -e " iptables 劫持链: ${RED}✘ 未发现劫持规则 (直连中)${RESET}"
+                fi
+                
+                local code=$(curl -o /dev/null -s -w "%{http_code}" --max-time 5 "https://www.google.com" || echo "000")
+                if [ "$code" -eq 200 ] || [ "$code" -eq 301 ] || [ "$code" -eq 302 ]; then
+                    echo -e " 谷歌直连测试  : ${GREEN}✔ 成功连通 (状态码: $code)${RESET}"
+                else
+                    echo -e " 谷歌直连测试  : ${RED}✘ 连接失败 (状态码: $code)${RESET}"
+                fi
+                ;;
+            0) return ;;
+        esac
+        read -n 1 -s -r -p "按任意键继续..."
+    done
+}
+
+# --- 主循环逻辑 ---
 while true; do
-    get_status_info
     clear
+    get_status_info
+    
+    # 你的原版菜单外观模板，原汁原味，完美对齐
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}        next-socks5 面板       ${RESET}"
+    echo -e "${GREEN}         CF-WARP 面板          ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $panel_status"
-    echo -e "${GREEN}版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
+    echo -e "${GREEN}版本 :${RESET} ${panel_version}"
     echo -e "${GREEN}绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN} 1. 安装 next-socks5${RESET}"
-    echo -e "${GREEN} 2. 更新 next-socks5${RESET}"
-    echo -e "${GREEN} 3. 卸载 next-socks5${RESET}"
-    echo -e "${GREEN} 4. 修改配置${RESET}"
-    echo -e "${GREEN} 5. 启动 next-socks5${RESET}"
-    echo -e "${GREEN} 6. 停止 next-socks5${RESET}"
-    echo -e "${GREEN} 7. 重启 next-socks5${RESET}"
-    echo -e "${GREEN} 8. 查看日志${RESET}"
-    echo -e "${GREEN} 9. 查看配置${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}  1. 安装 WARP${RESET}"
+    echo -e "${GREEN}  2. 更新 WARP${RESET}"
+    echo -e "${GREEN}  3. 卸载 WARP${RESET}"
+    echo -e "${GREEN}  4. 修改配置${RESET}"
+    echo -e "${GREEN}  5. 启动 WARP${RESET}"
+    echo -e "${GREEN}  6. 停止 WARP${RESET}"
+    echo -e "${GREEN}  7. 重启 WARP${RESET}"
+    echo -e "${GREEN}  8. 查看日志${RESET}"
+    echo -e "${GREEN}  9. 查看配置与出口状态${RESET}"
+    echo -e "${GREEN} 10.${RESET} ${YELLOW}谷歌分流${RESET}"
+    echo -e "${GREEN} 11.${RESET} ${RED}[已移除] Tun2Socks全局${RESET}"
+    echo -e "${GREEN}  0. 退出${RESET}"
     echo -e "${GREEN}==============================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
     
-    read -r -p "$(echo -e "${GREEN}请输入选项: ${RESET}")" choice
+    read -r choice
     
     case "$choice" in
-        1) menu_install ;;
-        2) menu_update ;;
-        3) menu_uninstall ;;
-        4) menu_edit_config ;;
-        5) systemctl start "$SERVICE_NAME" && ok "动作: 核心启动成功" ;;
-        6) systemctl stop "$SERVICE_NAME" && ok "动作: 核心停止成功" ;;
-        7) systemctl restart "$SERVICE_NAME" && ok "动作: 核心重启成功" ;;
-        8) (trap 'echo -e "\n"' INT; journalctl -u "$SERVICE_NAME" -n 50 -f) ;;
-        9) menu_show_node_config ;;
+        1) install_warp ;;
+        2) install_warp ;; 
+        3) 
+            rc-service "$PROXY_SERVICE_NAME" stop 2>/dev/null || true
+            rc-service "$SERVICE_NAME" stop 2>/dev/null || true
+            rc-update del "$SERVICE_NAME" default 2>/dev/null || true
+            rm -f "$SERVICE_FILE" "$PROXY_SERVICE_FILE" "$INSTALL_BIN" "$META_FILE"
+            rm -rf "$CONF_DIR" "$DATA_DIR"
+            echo -e "${GREEN}[成功]${RESET} 卸载完成。"
+            ;;
+        4) edit_config ;;
+        5) rc-service "$SERVICE_NAME" start ;;
+        6) rc-service "$SERVICE_NAME" stop ;;
+        7) rc-service "$SERVICE_NAME" restart ;;
+        8)
+            echo "--- 最近 20 行日志 ---"
+            [ -f /var/log/usque.log ] && tail -n 20 /var/log/usque.log || echo "暂无普通日志"
+            [ -f /var/log/usque.err ] && tail -n 20 /var/log/usque.err || echo "暂无错误日志"
+            ;;
+        9) show_status ;;
+        10) google_split_menu ;;
+        11) echo -e "${RED}[提示]${RESET} Alpine 环境下已彻底剔除 Tun2Socks 模块！" ;;
         0) clear; exit 0 ;;
-        *) warn "未识别的无效序号！"; sleep 1 ;;
+        *) echo -e "${RED}无效选项，请重新输入！${RESET}" ;;
     esac
-    
-    read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键返回主控制面板...${RESET}")"
+    read -n 1 -s -r -p "按任意键返回面板..."
 done

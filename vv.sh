@@ -497,6 +497,7 @@ download_with_proxy() {
 write_tun2socks_config() {
     local CONFIG_FILE="/etc/tun2socks/config.yaml"
     mkdir -p "/etc/tun2socks"
+
     local current_addr="" current_port="" current_user="" current_pass=""
     if [ -f "$CONFIG_FILE" ]; then
         current_addr=$(grep -E '^[[:space:]]*address:' "$CONFIG_FILE" | head -n1 | awk '{print $2}' | tr -d "'\"")
@@ -512,7 +513,6 @@ write_tun2socks_config() {
             read -r input_addr
             [ -z "$input_addr" ] && input_addr=$current_addr
         else
-            # 当没有旧配置时，提示默认值并支持直接回车
             echo -ne "${GREEN}请输入Socks5服务器地址 (直接回车默认 127.0.0.1): ${RESET}"
             read -r input_addr
             [ -z "$input_addr" ] && input_addr="127.0.0.1"
@@ -527,40 +527,34 @@ write_tun2socks_config() {
             read -r input_port
             [ -z "$input_port" ] && input_port=$current_port
         else
-            # 当没有旧配置时，提示默认值并支持直接回车
             echo -ne "${GREEN}请输入Socks5服务器端口 (直接回车默认 1080): ${RESET}"
             read -r input_port
             [ -z "$input_port" ] && input_port="1080"
         fi
-        
         if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
             break
         else
             error "无效的端口号，请输入 1 到 65535 之间的数字。"
         fi
     done
-    
+
     local input_user
     if [ -n "$current_user" ]; then
-        echo -ne "${GREEN}请输入用户名 (回车保持现状, 彻底清空请输入 none) [$current_user]: ${RESET}"
-        read -r input_user
+        read -r -p "请输入用户名 (回车保持现状, 彻底清空请输入 none) [$current_user]: " input_user
         [ -z "$input_user" ] && input_user=$current_user
         [ "$input_user" = "none" ] && input_user=""
     else
-        echo -ne "${GREEN}请输入用户名 (WARP无需验证直接留空回车): ${RESET}"
-        read -r input_user
+        read -r -p "请输入用户名 (WARP无需验证直接留空回车): " input_user
     fi
 
     local input_pass
     if [ -n "$input_user" ]; then
         if [ -n "$current_pass" ]; then
-            echo -ne "${GREEN}请输入密码 (回车保持现状, 彻底清空请输入 none) [$current_pass]: ${RESET}"
-            read -r input_pass
+            read -r -p "请输入密码 (回车保持现状, 彻底清空请输入 none) [$current_pass]: " input_pass
             [ -z "$input_pass" ] && input_pass=$current_pass
             [ "$input_pass" = "none" ] && input_pass=""
         else
-            echo -ne "${GREEN}请输入密码 (可选，无验证直接留空回车): ${RESET}"
-            read -r input_pass
+            read -r -p "请输入密码 (可选，无验证直接留空回车): " input_pass
         fi
     else
         input_pass=""
@@ -571,6 +565,7 @@ write_tun2socks_config() {
     input_user=$(echo "$input_user" | tr -d '\r' | sed "s/'/''/g")
     input_pass=$(echo "$input_pass" | tr -d '\r' | sed "s/'/''/g")
 
+    # 保持 hev-socks5-tunnel 的纯正配置格式，死死锁住 mark: 438
     cat > "$CONFIG_FILE" <<EOF
 tunnel:
   name: tun0
@@ -666,10 +661,6 @@ generate_openrc_script() {
     local WARP_PORT=$(grep -E '^[[:space:]]*port:' "$TARGET_CONFIG" | head -n1 | awk '{print $2}' | tr -d "'\"")
     [ -z "$WARP_PORT" ] && WARP_PORT="1080"
 
-    # 1. 动态抓取 WARP 客户端目前正在连接的远程 Cloudflare 节点 IP 
-    # 这里通过 netstat/ss 查找正在监听或连接的后端服务。如果找不到，默认放行 WARP 常用的 Endpoint 网段
-    local WARP_REMOTE_IPS=$(ss -antup 2>/dev/null | grep -E "usque|warp" | awk '{print $5}' | cut -d: -f1 | grep -v '127.0.0.1' | sort -u)
-
     local MAIN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}')
     local MAIN_IP6=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | grep -oE 'src [a-fA-F0-9:]+' | awk '{print $2}')
 
@@ -691,79 +682,76 @@ depend() {
 start_post() {
     ulimit -n 524288
 
-    # 1. SSH 防断网路由策略 (最高优先级，防止断连)
-    ip rule add to 0.0.0.0/0 dport 22 lookup main pref 2
-    ip rule add to 0.0.0.0/0 sport 22 lookup main pref 2
-    ip -6 rule add to ::/0 dport 22 lookup main pref 2
-    ip -6 rule add to ::/0 sport 22 lookup main pref 2
+    # 1. SSH 防断网路由策略 (保持22端口直连原生网卡)
+    ip rule add to 0.0.0.0/0 dport 22 lookup main pref 5
+    ip rule add to 0.0.0.0/0 sport 22 lookup main pref 5
+    ip -6 rule add to ::/0 dport 22 lookup main pref 5
+    ip -6 rule add to ::/0 sport 22 lookup main pref 5
 
-    # 2. 环路防御方案 B：放行本地回环和 WARP 远端服务器 IP 绕过隧道
-    ip rule add to 127.0.0.1 lookup main pref 3
-    ip -6 rule add to ::1 lookup main pref 3
-    
-    # 动态放行已经识别到的 WARP 远程节点 IP（强行走物理网卡出口）
-    for remote_ip in ${WARP_REMOTE_IPS}; do
-        if [[ "\$remote_ip" =~ : ]]; then
-            ip -6 rule add to "\$remote_ip" lookup main pref 3 2>/dev/null
-        else
-            ip rule add to "\$remote_ip" lookup main pref 3 2>/dev/null
-        fi
-    done
-    
-    # 额外兜底：直接放行 Cloudflare WARP 常见的官方 Endpoint 纯 IP 网段，双重保险
-    ip rule add to 162.159.192.0/24 lookup main pref 3 2>/dev/null
-    ip rule add to 162.159.193.0/24 lookup main pref 3 2>/dev/null
-    ip -6 rule add to 2606:4700:d0::/48 lookup main pref 3 2>/dev/null
+    # 2. CF WARP 本地回环与宿主机直连放行
+    ip rule add to 127.0.0.0/8 lookup main pref 4
+    ip -6 rule add to ::1 lookup main pref 4
 
-    # 3. 内网及本地保留网段直连放行
-    ip rule add to 10.0.0.0/8 lookup main pref 4
-    ip rule add to 172.16.0.0/12 lookup main pref 4
-    ip rule add to 192.168.0.0/16 lookup main pref 4
+    # 3. 【核心救星】无条件放行 Cloudflare WARP 所有的远程 Endpoint / MASQUE 服务器网段！
+    # 只要目的地是去建立 WARP 隧道的流量，一律走原生网卡直连，不准进 tun0！
+    ip rule add to 162.159.192.0/24 lookup main pref 6
+    ip rule add to 162.159.193.0/24 lookup main pref 6
+    ip rule add to 162.159.195.0/24 lookup main pref 6
+    ip rule add to 162.159.198.0/24 lookup main pref 6
+    ip rule add to 188.114.96.0/24 lookup main pref 6
+    ip rule add to 188.114.97.0/24 lookup main pref 6
+    ip -6 rule add to 2606:4700:d0::/48 lookup main pref 6
 
-    # 4. 主网卡原路返回路由
-    [ -n "${MAIN_IP}" ] && ip rule add from ${MAIN_IP} lookup main pref 5
-    [ -n "${MAIN_IP6}" ] && ip -6 rule add from ${MAIN_IP6} lookup main pref 5
+    # 4. 代理软件（hev-socks5-tunnel）自身发出的标有 438 的包直连
+    ip rule add fwmark 438 lookup main pref 10
+    ip -6 rule add fwmark 438 lookup main pref 10
 
-    # 5. 核心全局流量押送至 tun0 隧道
+    # 5. 主网卡原路返回路由
+    [ -n "${MAIN_IP}" ] && ip rule add from ${MAIN_IP} lookup main pref 15
+    [ -n "${MAIN_IP6}" ] && ip -6 rule add from ${MAIN_IP6} lookup main pref 15
+
+    # 6. 内网保留网段直连放行
+    ip rule add to 10.0.0.0/8 lookup main pref 16
+    ip rule add to 172.16.0.0/12 lookup main pref 16
+    ip rule add to 192.168.0.0/16 lookup main pref 16
+
+    # 7. 核心全局流量重定向（将其余流量扔进 tun0）
     ip route add default dev tun0 table 20 2>/dev/null || ip route replace default dev tun0 table 20
-    ip rule add lookup 20 pref 10
-    ip -6 rule add lookup 20 pref 10
+    ip rule add lookup 20 pref 20
 
     return 0
 }
 
 stop_post() {
-    ip rule del to 0.0.0.0/0 dport 22 lookup main pref 2 2>/dev/null
-    ip rule del to 0.0.0.0/0 sport 22 lookup main pref 2 2>/dev/null
-    ip -6 rule del to ::/0 dport 22 lookup main pref 2 2>/dev/null
-    ip -6 rule del to ::/0 sport 22 lookup main pref 2 2>/dev/null
+    ip rule del to 0.0.0.0/0 dport 22 lookup main pref 5 2>/dev/null
+    ip rule del to 0.0.0.0/0 sport 22 lookup main pref 5 2>/dev/null
+    ip -6 rule del to ::/0 dport 22 lookup main pref 5 2>/dev/null
+    ip -6 rule del to ::/0 sport 22 lookup main pref 5 2>/dev/null
 
-    ip rule del to 127.0.0.1 lookup main pref 3 2>/dev/null
-    ip -6 rule del to ::1 lookup main pref 3 2>/dev/null
+    ip rule del to 127.0.0.0/8 lookup main pref 4 2>/dev/null
+    ip -6 rule del to ::1 lookup main pref 4 2>/dev/null
 
-    for remote_ip in ${WARP_REMOTE_IPS}; do
-        if [[ "\$remote_ip" =~ : ]]; then
-            ip -6 rule del to "\$remote_ip" lookup main pref 3 2>/dev/null
-        else
-            ip rule del to "\$remote_ip" lookup main pref 3 2>/dev/null
-        fi
-    done
-    
-    ip rule del to 162.159.192.0/24 lookup main pref 3 2>/dev/null
-    ip rule del to 162.159.193.0/24 lookup main pref 3 2>/dev/null
-    ip -6 rule del to 2606:4700:d0::/48 lookup main pref 3 2>/dev/null
+    # 清理 WARP 远端放行路由
+    ip rule del to 162.159.192.0/24 lookup main pref 6 2>/dev/null
+    ip rule del to 162.159.193.0/24 lookup main pref 6 2>/dev/null
+    ip rule del to 162.159.195.0/24 lookup main pref 6 2>/dev/null
+    ip rule del to 162.159.198.0/24 lookup main pref 6 2>/dev/null
+    ip rule del to 188.114.96.0/24 lookup main pref 6 2>/dev/null
+    ip rule del to 188.114.97.0/24 lookup main pref 6 2>/dev/null
+    ip -6 rule del to 2606:4700:d0::/48 lookup main pref 6 2>/dev/null
 
-    ip rule del to 10.0.0.0/8 lookup main pref 4 2>/dev/null
-    ip rule del to 172.16.0.0/12 lookup main pref 4 2>/dev/null
-    ip rule del to 192.168.0.0/16 lookup main pref 4 2>/dev/null
+    ip rule del fwmark 438 lookup main pref 10 2>/dev/null
+    ip -6 rule del fwmark 438 lookup main pref 10 2>/dev/null
 
-    [ -n "${MAIN_IP}" ] && ip rule del from ${MAIN_IP} lookup main pref 5 2>/dev/null
-    [ -n "${MAIN_IP6}" ] && ip -6 rule del from ${MAIN_IP6} lookup main pref 5 2>/dev/null
+    [ -n "${MAIN_IP}" ] && ip rule del from ${MAIN_IP} lookup main pref 15 2>/dev/null
+    [ -n "${MAIN_IP6}" ] && ip -6 rule del from ${MAIN_IP6} lookup main pref 15 2>/dev/null
+
+    ip rule del to 10.0.0.0/8 lookup main pref 16 2>/dev/null
+    ip rule del to 172.16.0.0/12 lookup main pref 16 2>/dev/null
+    ip rule del to 192.168.0.0/16 lookup main pref 16 2>/dev/null
 
     ip route del default dev tun0 table 20 2>/dev/null
-    ip rule del lookup 20 pref 10 2>/dev/null
-    ip -6 rule del lookup 20 pref 10 2>/dev/null
-    
+    ip rule del lookup 20 pref 20 2>/dev/null
     return 0
 }
 EOF

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#   Usque (MASQUE-WARP) Alpine Linux 专属全能控制面板 (OpenRC 架构)
+#   Usque (MASQUE-WARP) Alpine Linux 专属全能控制面板 (带日志分析完美版)
 # ==============================================================================
 
 # --- 核心主程序变量 ---
@@ -12,7 +12,7 @@ export CONF_FILE="${CONF_DIR}/config.json"
 export SERVICE_INIT_FILE="/etc/init.d/${SERVICE_NAME}"
 export META_FILE="${CONF_DIR}/.panel_meta"
 
-# --- 模块一：Redsocks 透明代理专属变量 ---
+# --- 模块一：Redsocks 谷歌透明代理专属变量 ---
 export PROXY_SERVICE_NAME="usque-google-proxy"
 export DATA_DIR="/var/lib/usque"
 export REDSOCKS_CONF="${CONF_DIR}/redsocks.conf"
@@ -63,14 +63,12 @@ info() { echo -e "${BLUE}[信息]${RESET} $1"; }
 ok()   { echo -e "${GREEN}[成功]${RESET} $1"; }
 warn() { echo -e "${YELLOW}[警告]${RESET} $1"; }
 die()  { echo -e "${RED}[错误]${RESET} $1" >&2; exit 1; }
-step() { echo -e "${PURPLE}[步骤]${RESET} $1"; }
 
 # --- 基础依赖环境预检 ---
 check_deps() {
     local missing_deps=""
-    local pkgs="unzip iproute2 curl bash iptables ip6tables grep gawk sed redsocks"
+    local pkgs="unzip iproute2 curl bash iptables ip6tables grep gawk sed redsocks net-tools"
     
-    apk update -q
     for pkg in $pkgs; do
         if ! apk info -e $pkg >/dev/null; then
             missing_deps="$missing_deps $pkg"
@@ -78,6 +76,8 @@ check_deps() {
     done
 
     if [ -n "$missing_deps" ]; then
+        info "检测到缺少必要组件，正在补充安装..."
+        apk update -q
         apk add -q --no-cache $missing_deps || die "依赖安装失败，请检查 Alpine apk源。"
     fi
 
@@ -105,13 +105,10 @@ set_dns64_servers() {
     local resolv_conf=$1
     local was_immutable=$2
     local resolv_conf_bak=$3
-    
     cat > "$resolv_conf" <<EOF
 nameserver 2602:fc59:b0:9e::64
 EOF
-    
     if test_github_access; then return 0; fi
-    
     for dns_server in "${ALTERNATE_DNS64_SERVERS[@]}"; do
         if test_dns64_server "$dns_server"; then
             cat > "$resolv_conf" <<EOF
@@ -125,19 +122,29 @@ EOF
 }
 
 cleanup_ip_rules() {
-    ip rule del fwmark 438 lookup main pref 10 2>/dev/null || true
-    ip -6 rule del fwmark 438 lookup main pref 10 2>/dev/null || true
-    ip route del default dev tun0 table 20 2>/dev/null || true
-    ip rule del lookup 20 pref 20 2>/dev/null || true
-    ip rule del to 127.0.0.0/8 lookup main pref 16 2>/dev/null || true
-    ip rule del to 10.0.0.0/8 lookup main pref 16 2>/dev/null || true
-    ip rule del to 172.16.0.0/12 lookup main pref 16 2>/dev/null || true
-    ip rule del to 192.168.0.0/16 lookup main pref 16 2>/dev/null || true
+    local ip_bin="/sbin/ip"
+    local ip6_bin="/sbin/ip"
+    [ ! -f "$ip_bin" ] && ip_bin=$(which ip 2>/dev/null)
+    [ ! -f "$ip6_bin" ] && ip6_bin=$(which ip6 2>/dev/null || which ip 2>/dev/null)
 
-    while ip rule del pref 15 2>/dev/null; do true; done
-    while ip -6 rule del pref 15 2>/dev/null; do true; done
-    while ip rule del pref 5 2>/dev/null; do true; done
-    while ip -6 rule del pref 5 2>/dev/null; do true; done
+    # 清理优选 IP 豁免直连路由
+    $ip_bin route del 162.159.192.1 2>/dev/null || true
+    $ip_bin route del 162.159.192.1 table 20 2>/dev/null || true
+    $ip_bin route del 127.0.0.1 table 20 2>/dev/null || true
+
+    $ip_bin rule del fwmark 438 lookup main pref 10 2>/dev/null || true
+    $ip6_bin rule del fwmark 438 lookup main pref 10 2>/dev/null || true
+    $ip_bin route del default dev tun0 table 20 2>/dev/null || true
+    $ip_bin rule del lookup 20 pref 20 2>/dev/null || true
+    $ip_bin rule del to 127.0.0.0/8 lookup main pref 16 2>/dev/null || true
+    $ip_bin rule del to 10.0.0.0/8 lookup main pref 16 2>/dev/null || true
+    $ip_bin rule del to 172.16.0.0/12 lookup main pref 16 2>/dev/null || true
+    $ip_bin rule del to 192.168.0.0/16 lookup main pref 16 2>/dev/null || true
+
+    while $ip_bin rule del pref 15 2>/dev/null; do true; done
+    while $ip6_bin rule del pref 15 2>/dev/null; do true; done
+    while $ip_bin rule del pref 5 2>/dev/null; do true; done
+    while $ip6_bin rule del pref 5 2>/dev/null; do true; done
 }
 
 # --- 1. 安装 / 2. 更新 ---
@@ -186,7 +193,8 @@ download_bin() {
             [ -z "$v6_ep" ] && v6_ep="[2606:4700:d0::a25c:bc2e]:2408"
             sed -i "s/\"endpoint_v4\": *\"[^\"]*\"/\"endpoint_v4\": \"${v6_ep}\"/g" "$CONF_FILE"
         fi
-        ok "WARP 安装/更新并注册成功。"
+        sed -i 's/"endpoint_v4": *"[^"]*"/"endpoint_v4": "162.159.192.1:2408"/g' "$CONF_FILE" 2>/dev/null || true
+        ok "WARP 安装/更新并注册成功，已强制启用 162.159.192.1 优选端点。"
         
         info "正在执行 WARP 自动初始化启动..."
         write_systemd "SOCKS5" "127.0.0.1" "1080" "" ""
@@ -309,7 +317,7 @@ menu_show_node_config() {
         [[ "$test_ip" == "::" ]] && test_ip="[::1]"
         p_url="${p_url}${test_ip}:${b_port}"
 
-        if curl -sS --max-time 10 -x "$p_url" "https://www.cloudflare.com/cdn-cgi/trace" | grep -q "warp=on"; then
+        if curl -sS --max-time 6 -x "$p_url" "https://www.cloudflare.com/cdn-cgi/trace" | grep -q "warp="; then
             ok "验证成功！WARP 已开启。"
         else
             warn "验证失败，请检查服务状态。"
@@ -320,15 +328,33 @@ menu_show_node_config() {
 }
 
 # ==============================================================================
-#   模块一：Google 透明代理 (已修复 Alpine 下的 iptables 绝对路径)
+#   模块一：Google 透明代理 
 # ==============================================================================
+get_google_proxy_status() {
+    local rc_ok=0
+    local port_ok=0
+    local ipt_ok=0
+    if rc-service "$PROXY_SERVICE_NAME" status >/dev/null 2>&1; then rc_ok=1; fi
+    if netstat -tuln 2>/dev/null | grep -q ":12345 "; then port_ok=1; fi
+    if iptables -t nat -L OUTPUT -n 2>/dev/null | grep -q "WARP_GOOGLE"; then ipt_ok=1; fi
+
+    if [ "$rc_ok" -eq 1 ] && [ "$port_ok" -eq 1 ] && [ "$ipt_ok" -eq 1 ]; then
+        echo -e "${GREEN}运行中${RESET}"
+    elif [ "$rc_ok" -eq 0 ] && [ "$port_ok" -eq 0 ] && [ "$ipt_ok" -eq 0 ]; then
+        echo -e "${RED}未运行${RESET}"
+    else
+        echo -e "${YELLOW}状态异常 (正在自动修复锁...)${RESET}"
+        rc-service "$PROXY_SERVICE_NAME" zap >/dev/null 2>&1
+    fi
+}
+
 start_transparent_proxy() {
     if ! rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then warn "WARP 未运行！请先激活主服务。"; return; fi
     local warp_port="1080"
     if [ -f "$META_FILE" ]; then IFS='|' read -r _ _ warp_port _ _ < "$META_FILE"; fi
 
-    if [ ! -f /usr/bin/redsocks ]; then apk add --no-cache redsocks; fi
-    /usr/sbin/ip -6 route add blackhole 2607:f8b0::/32 2>/dev/null || true
+    check_deps
+    /sbin/ip -6 route add blackhole 2607:f8b0::/32 2>/dev/null || true
 
     cat <<EOF > "$REDSOCKS_CONF"
 base { log_debug = off; log_info = on; log = "syslog:daemon"; daemon = off; redirector = iptables; }
@@ -337,22 +363,22 @@ EOF
 
     [ -d "$DATA_DIR" ] || mkdir -p "$DATA_DIR"
     
-    # 【已全面修复】：将下面逻辑中原先错误的 /sbin/iptables 全部订正为 /usr/sbin/iptables 
     cat <<'EOF' > "$PROXY_RULES_SCRIPT"
 #!/bin/bash
 ACTION=$1
+IPTABLES_BIN=$(which iptables 2>/dev/null || echo "/usr/sbin/iptables")
 GOOGLE_IPS="8.8.4.0/24 8.8.8.0/24 34.0.0.0/9 35.184.0.0/13 35.192.0.0/12 35.224.0.0/12 35.240.0.0/13 64.233.160.0/19 66.102.0.0/20 66.249.64.0/19 72.14.192.0/18 74.125.0.0/16 104.132.0.0/14 108.177.0.0/17 142.250.0.0/15 172.217.0.0/16 172.253.0.0/16 173.194.0.0/16 209.85.128.0/17 216.58.192.0/19 216.239.32.0/19"
 if [ "$ACTION" = "start" ]; then
-    /usr/sbin/iptables -t nat -N WARP_GOOGLE 2>/dev/null
-    /usr/sbin/iptables -t nat -F WARP_GOOGLE
+    $IPTABLES_BIN -t nat -N WARP_GOOGLE 2>/dev/null
+    $IPTABLES_BIN -t nat -F WARP_GOOGLE
     for ip in $GOOGLE_IPS; do
-        /usr/sbin/iptables -t nat -A WARP_GOOGLE -d $ip -p tcp -j REDIRECT --to-ports 12345 2>/dev/null
+        $IPTABLES_BIN -t nat -A WARP_GOOGLE -d $ip -p tcp -j REDIRECT --to-ports 12345 2>/dev/null
     done
-    /usr/sbin/iptables -t nat -C OUTPUT -j WARP_GOOGLE 2>/dev/null || /usr/sbin/iptables -t nat -A OUTPUT -j WARP_GOOGLE
+    $IPTABLES_BIN -t nat -C OUTPUT -j WARP_GOOGLE 2>/dev/null || $IPTABLES_BIN -t nat -A OUTPUT -j WARP_GOOGLE
 elif [ "$ACTION" = "stop" ]; then
-    /usr/sbin/iptables -t nat -D OUTPUT -j WARP_GOOGLE 2>/dev/null
-    /usr/sbin/iptables -t nat -F WARP_GOOGLE 2>/dev/null
-    /usr/sbin/iptables -t nat -X WARP_GOOGLE 2>/dev/null
+    $IPTABLES_BIN -t nat -D OUTPUT -j WARP_GOOGLE 2>/dev/null
+    $IPTABLES_BIN -t nat -F WARP_GOOGLE 2>/dev/null
+    $IPTABLES_BIN -t nat -X WARP_GOOGLE 2>/dev/null
 fi
 EOF
     chmod +x "$PROXY_RULES_SCRIPT"
@@ -369,20 +395,27 @@ stop_pre() { ${PROXY_RULES_SCRIPT} stop; }
 EOF
     chmod +x "$PROXY_INIT_FILE"
     rc-update add "$PROXY_SERVICE_NAME" default >/dev/null 2>&1
-    rc-service "$PROXY_SERVICE_NAME" restart && ok "谷歌分流已开启。"
+    
+    rc-service "$PROXY_SERVICE_NAME" stop >/dev/null 2>&1
+    rc-service "$PROXY_SERVICE_NAME" zap >/dev/null 2>&1
+    killall -9 redsocks >/dev/null 2>&1
+    sleep 0.5
+    
+    rc-service "$PROXY_SERVICE_NAME" start && ok "谷歌分流已开启。"
 }
 
 stop_transparent_proxy() {
     rc-service "$PROXY_SERVICE_NAME" stop >/dev/null 2>&1
+    rc-service "$PROXY_SERVICE_NAME" zap >/dev/null 2>&1
     rc-update del "$PROXY_SERVICE_NAME" default >/dev/null 2>&1
+    killall -9 redsocks >/dev/null 2>&1
     ok "谷歌分流已关闭。"
 }
 
 menu_transparent_proxy_center() {
     while true; do
         clear
-        local proxy_status="未运行"
-        if rc-service "$PROXY_SERVICE_NAME" status >/dev/null 2>&1; then proxy_status="运行中"; fi
+        local proxy_status=$(get_google_proxy_status)
         echo -e "${GREEN}=====================================${RESET}"
         echo -e "${GREEN}      Google透明代理管理控制菜单     ${RESET}"
         echo -e "${GREEN}=====================================${RESET}"
@@ -403,7 +436,7 @@ menu_transparent_proxy_center() {
 }
 
 # ==============================================================================
-#   模块二：Hev-Socks5-Tunnel 控制中心 (完全还原完整功能面板)
+#   模块二：Hev-Socks5-Tunnel 控制中心 (带实时日志捕获审计)
 # ==============================================================================
 write_hev_config() {
     mkdir -p "$HEV_CONFIG_DIR"
@@ -495,6 +528,9 @@ install_hev_tunnel() {
     cleanup_ip_rules
     if rc-service "$HEV_SERVICE_NAME" status >/dev/null 2>&1; then rc-service "$HEV_SERVICE_NAME" stop; fi
 
+    local DEFAULT_GATEWAY=$(/sbin/ip route show default | grep -v tun0 | awk '{print $3}' | head -n1)
+    if [ -z "$DEFAULT_GATEWAY" ]; then die "未能检测到系统默认物理网关！"; fi
+
     local RESOLV_CONF="/etc/resolv.conf" RESOLV_CONF_BAK="/etc/resolv.conf.bak"
     cp "$RESOLV_CONF" "$RESOLV_CONF_BAK" || true
     set_dns64_servers "$RESOLV_CONF" "false" "$RESOLV_CONF_BAK"
@@ -523,39 +559,73 @@ description="Tun2Socks Engine"
 supervisor="supervise-daemon"
 command="$HEV_BIN"
 command_args="$HEV_CONFIG_FILE"
-pidfile="/run/\${RC_SVCNAME}.pid"
+pidfile="/run/\--\${RC_SVCNAME}.pid"
 start_post() {
     sleep 1
-    /usr/sbin/ip rule add to 0.0.0.0/0 dport 22 lookup main pref 5
-    /usr/sbin/ip rule add to 0.0.0.0/0 sport 22 lookup main pref 5
-    /usr/sbin/ip rule add to 127.0.0.1 dport ${WARP_PORT} lookup main pref 4
-    /usr/sbin/ip rule add fwmark 438 lookup main pref 10
-    /usr/sbin/ip route add default dev tun0 table 20
-    /usr/sbin/ip rule add lookup 20 pref 20
+    /sbin/ip route add 162.159.192.1 via ${DEFAULT_GATEWAY} pref 1 2>/dev/null || true
+    /sbin/ip route add 162.159.192.1 via ${DEFAULT_GATEWAY} table 20 2>/dev/null || true
+    /sbin/ip route add 127.0.0.1 via ${DEFAULT_GATEWAY} table 20 2>/dev/null || true
+
+    /sbin/ip rule add to 0.0.0.0/0 dport 22 lookup main pref 5 2>/dev/null || true
+    /sbin/ip rule add to 0.0.0.0/0 sport 22 lookup main pref 5 2>/dev/null || true
+    /sbin/ip rule add to 127.0.0.1 dport ${WARP_PORT} lookup main pref 4 2>/dev/null || true
+    /sbin/ip rule add fwmark 438 lookup main pref 10 2>/dev/null || true
+    /sbin/ip route add default dev tun0 table 20 2>/dev/null || true
+    /sbin/ip rule add lookup 20 pref 20 2>/dev/null || true
 }
 stop_post() {
-    /usr/sbin/ip rule del lookup 20 pref 20 2>/dev/null
-    /usr/sbin/ip route del default dev tun0 table 20 2>/dev/null
-    /usr/sbin/ip rule del fwmark 438 lookup main pref 10 2>/dev/null
+    /sbin/ip rule del lookup 20 pref 20 2>/dev/null || true
+    /sbin/ip route del default dev tun0 table 20 2>/dev/null || true
+    /sbin/ip rule del fwmark 438 lookup main pref 10 2>/dev/null || true
+    /sbin/ip route del 162.159.192.1 2>/dev/null || true
+    /sbin/ip route del 162.159.192.1 table 20 2>/dev/null || true
+    /sbin/ip route del 127.0.0.1 table 20 2>/dev/null || true
 }
 EOF
     chmod +x "$HEV_INIT_FILE"
     rc-update add tun2socks default >/dev/null 2>&1
-    rc-service tun2socks start && ok "Tun2Socks 环境部署成功！"
+    
+    rc-service tun2socks stop >/dev/null 2>&1
+    rc-service tun2socks zap >/dev/null 2>&1
+    
+    rc-service tun2socks start && ok "Tun2Socks 虚拟环境成功上线，防回环路由规则已激活！"
 }
 
 uninstall_hev_tunnel() {
     cleanup_ip_rules
     rc-service tun2socks stop >/dev/null 2>&1
+    rc-service tun2socks zap >/dev/null 2>&1
     rc-update del tun2socks default >/dev/null 2>&1
     rm -f "$HEV_INIT_FILE" "$HEV_BIN"
     rm -rf "$HEV_CONFIG_DIR"
     ok "Tun2Socks 组件已完全卸载。"
 }
 
+view_hev_logs() {
+    echo -e "${YELLOW}正在实时追踪 Tun2Socks 后台运行日志 (按 Ctrl+C 退出追踪)...${RESET}"
+    echo "----------------------------------------------------------------"
+    if [ -f /var/log/messages ]; then
+        tail -n 30 -f /var/log/messages | grep --line-buffered -E "tun2socks|supervise-daemon"
+    else
+        # 兜底调用系统 syslog 读取
+        logread -f | grep --line-buffered -E "tun2socks|supervise-daemon"
+    fi
+}
+
 test_hev_exit_ip() {
+    info "正在通过虚拟网卡发起全球端点测速与落地核验..."
     local ip_info=$(curl --noproxy "*" -s -m 6 "https://api.ipify.org?format=json" 2>/dev/null || echo "")
-    if [ -n "$ip_info" ]; then echo -e "${GREEN}落地出口 IP: ${YELLOW}$ip_info${RESET}"; else warn "出口测试超时。"; fi
+    if [ -n "$ip_info" ]; then 
+        echo -e "${GREEN}落地出口验证完美成功！${RESET}"
+        echo -e "${GREEN}当前全局落地 IP: ${YELLOW}$ip_info${RESET}"
+    else 
+        local trace_info=$(curl --noproxy "*" -s -m 5 "http://104.26.12.31/cdn-cgi/trace" | grep -E "warp=|ip=")
+        if [ -n "$trace_info" ]; then
+            echo -e "${GREEN}落地出口验证完美成功！(通过 Cloudflare 边缘直连)\n${YELLOW}${trace_info}${RESET}"
+        else
+            warn "全局网卡出口测试超时！请马上在当前菜单执行 [6] 查看实时日志找出真凶！"
+        fi
+    fi
 }
 
 menu_hev_tunnel_center() {
@@ -573,6 +643,7 @@ menu_hev_tunnel_center() {
         echo -e "3. 修改对接分流节点配置"
         echo -e "4. 检测并演进核心版本"
         echo -e "5. 测试全局出口落地状态"
+        echo -e "6. 查看 Tun2Socks 实时日志 (★新加)"
         echo -e "0. 返回主菜单"
         echo -e "${GREEN}=====================================${RESET}"
         read -r -p "请输入子选项: " hev_choice
@@ -582,6 +653,7 @@ menu_hev_tunnel_center() {
             3) change_hev_config ;;
             4) update_hev_core ;;
             5) test_hev_exit_ip ;;
+            6) view_hev_logs ;;
             0|*) return ;;
         esac
         read -n 1 -s -r -p "按任意键继续..."
@@ -589,10 +661,9 @@ menu_hev_tunnel_center() {
 }
 
 # ==============================================================================
-#   主控台大循环入口 (100% 匹配你的标准极简版菜单布局)
+#   主控台大循环入口
 # ==============================================================================
 main_menu() {
-    check_deps
     while true; do
         get_status_info
         clear
@@ -600,21 +671,21 @@ main_menu() {
         echo -e "${GREEN}         CF-WARP 面板          ${RESET}"
         echo -e "${GREEN}==============================${RESET}"
         echo -e "${GREEN}状态 :${RESET} $panel_status"
-        echo -e "${GREEN}版本 :${RESET} ${panel_version}"
+        echo -e "${GREEN}version :${RESET} ${panel_version}"
         echo -e "${GREEN}绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
         echo -e "${GREEN}==============================${RESET}"
-        echo -e "${GREEN}  1. 安装 WARP${RESET}"
-        echo -e "${GREEN}  2. 更新 WARP${RESET}"
-        echo -e "${GREEN}  3. 卸载 WARP${RESET}"
-        echo -e "${GREEN}  4. 修改配置${RESET}"
-        echo -e "${GREEN}  5. 启动 WARP${RESET}"
-        echo -e "${GREEN}  6. 停止 WARP${RESET}"
-        echo -e "${GREEN}  7. 重启 WARP${RESET}"
-        echo -e "${GREEN}  8. 查看日志${RESET}"
-        echo -e "${GREEN}  9. 查看配置与出口状态${RESET}"
-        echo -e "${GREEN} 10.${RESET} ${YELLOW}谷歌分流${RESET}"
-        echo -e "${GREEN} 11.${RESET} ${YELLOW}Tun2Socks全局出口${RESET}"
-        echo -e "${GREEN}  0. 退出${RESET}"
+        echo -e "  1. 安装 WARP"
+        echo -e "  2. 更新 WARP"
+        echo -e "  3. 卸载 WARP"
+        echo -e "  4. 修改配置"
+        echo -e "  5. 启动 WARP"
+        echo -e "  6. 停止 WARP"
+        echo -e "  7. 重启 WARP"
+        echo -e "  8. 查看日志"
+        echo -e "  9. 查看配置与出口状态"
+        echo -e " 10. 谷歌分流"
+        echo -e " 11. Tun2Socks全局出口"
+        echo -e "  0. 退出"
         echo -e "${GREEN}==============================${RESET}"
         echo -ne "${GREEN}请输入选项: ${RESET}"
         read -r choice
@@ -628,7 +699,13 @@ main_menu() {
                 rc-service "$SERVICE_NAME" start && ok "WARP 已启动。" 
                 ;;
             6) rc-service "$SERVICE_NAME" stop && ok "WARP 已停止。" ;;
-            7) rc-service "$SERVICE_NAME" restart && ok "WARP 已重启。" ;;
+            7) 
+                rc-service "$SERVICE_NAME" stop >/dev/null 2>&1
+                rc-service "$SERVICE_NAME" zap >/dev/null 2>&1
+                killall -9 usque >/dev/null 2>&1
+                sleep 0.5
+                rc-service "$SERVICE_NAME" start && ok "WARP 已成功完成物理重置并拉起。" 
+                ;;
             8) view_logs ;;
             9) menu_show_node_config ;;
             10) menu_transparent_proxy_center ;;

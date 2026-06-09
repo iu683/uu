@@ -497,6 +497,7 @@ download_with_proxy() {
 write_tun2socks_config() {
     local CONFIG_FILE="/etc/tun2socks/config.yaml"
     mkdir -p "/etc/tun2socks"
+
     local current_addr="" current_port="" current_user="" current_pass=""
     if [ -f "$CONFIG_FILE" ]; then
         current_addr=$(grep -E '^[[:space:]]*address:' "$CONFIG_FILE" | head -n1 | awk '{print $2}' | tr -d "'\"")
@@ -512,8 +513,9 @@ write_tun2socks_config() {
             read -r input_addr
             [ -z "$input_addr" ] && input_addr=$current_addr
         else
-            echo -ne "${GREEN}请输入Socks5服务器地址 (本地 WARP 请输 127.0.0.1): ${RESET}"
+            echo -ne "${GREEN}请输入Socks5服务器地址 (直接回车默认 127.0.0.1): ${RESET}"
             read -r input_addr
+            [ -z "$input_addr" ] && input_addr="127.0.0.1"
         fi
         if [ -n "$input_addr" ]; then break; else error "服务器地址不能为空。"; fi
     done
@@ -525,8 +527,9 @@ write_tun2socks_config() {
             read -r input_port
             [ -z "$input_port" ] && input_port=$current_port
         else
-            echo -ne "${GREEN}请输入Socks5服务器端口 (WARP 默认通常为 40000 或 1080): ${RESET}"
+            echo -ne "${GREEN}请输入Socks5服务器端口 (直接回车默认 1080): ${RESET}"
             read -r input_port
+            [ -z "$input_port" ] && input_port="1080"
         fi
         if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
             break
@@ -537,25 +540,21 @@ write_tun2socks_config() {
 
     local input_user
     if [ -n "$current_user" ]; then
-        echo -ne "${GREEN}请输入用户名 (回车保持现状, 彻底清空请输入 none) [$current_user]: ${RESET}"
-        read -r input_user
+        read -r -p "请输入用户名 (回车保持现状, 彻底清空请输入 none) [$current_user]: " input_user
         [ -z "$input_user" ] && input_user=$current_user
         [ "$input_user" = "none" ] && input_user=""
     else
-        echo -ne "${GREEN}请输入用户名 (WARP无需验证直接留空回车): ${RESET}"
-        read -r input_user
+        read -r -p "请输入用户名 (WARP无需验证直接留空回车): " input_user
     fi
 
     local input_pass
     if [ -n "$input_user" ]; then
         if [ -n "$current_pass" ]; then
-            echo -ne "${GREEN}请输入密码 (回车保持现状, 彻底清空请输入 none) [$current_pass]: ${RESET}"
-            read -r input_pass
+            read -r -p "请输入密码 (回车保持现状, 彻底清空请输入 none) [$current_pass]: " input_pass
             [ -z "$input_pass" ] && input_pass=$current_pass
             [ "$input_pass" = "none" ] && input_pass=""
         else
-            echo -ne "${GREEN}请输入密码 (可选，无验证直接留空回车): ${RESET}"
-            read -r input_pass
+            read -r -p "请输入密码 (可选，无验证直接留空回车): " input_pass
         fi
     else
         input_pass=""
@@ -566,6 +565,7 @@ write_tun2socks_config() {
     input_user=$(echo "$input_user" | tr -d '\r' | sed "s/'/''/g")
     input_pass=$(echo "$input_pass" | tr -d '\r' | sed "s/'/''/g")
 
+    # 保持 hev-socks5-tunnel 的纯正配置格式，死死锁住 mark: 438
     cat > "$CONFIG_FILE" <<EOF
 tunnel:
   name: tun0
@@ -658,11 +658,10 @@ generate_openrc_script() {
     local SERVICE_FILE="/etc/init.d/tun2socks"
     local TARGET_CONFIG="/etc/tun2socks/config.yaml"
     
+    # 从正常的 socks5 字段中精准提取端口
     local WARP_PORT=$(grep -E '^[[:space:]]*port:' "$TARGET_CONFIG" | head -n1 | awk '{print $2}' | tr -d "'\"")
     [ -z "$WARP_PORT" ] && WARP_PORT="1080"
 
-    # 精准获取当前物理主网卡的默认网关输出接口和主 IP
-    local MAIN_IFace=$(ip route show | grep default | awk '{print $5}' | head -n1)
     local MAIN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}')
     local MAIN_IP6=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | grep -oE 'src [a-fA-F0-9:]+' | awk '{print $2}')
 
@@ -684,63 +683,60 @@ depend() {
 start_post() {
     ulimit -n 524288
 
-    # 1. SSH 防断网路由策略 (最高优先级 pref 2，保持 22 端口绝对直连，防止失联)
-    ip rule add to 0.0.0.0/0 dport 22 lookup main pref 2
-    ip rule add to 0.0.0.0/0 sport 22 lookup main pref 2
-    ip -6 rule add to ::/0 dport 22 lookup main pref 2
-    ip -6 rule add to ::/0 sport 22 lookup main pref 2
+    # 1. SSH 防断网路由策略 (保持22端口直连原生网卡)
+    ip rule add to 0.0.0.0/0 dport 22 lookup main pref 5
+    ip rule add to 0.0.0.0/0 sport 22 lookup main pref 5
+    ip -6 rule add to ::/0 dport 22 lookup main pref 5
+    ip -6 rule add to ::/0 sport 22 lookup main pref 5
 
-    # 2. 核心大招：本地 root 用户进程（WARP/Usque）发出的流量，强制走物理网卡直连远端，彻底粉碎环路套娃
-    ip rule add uid 0 lookup main pref 3
-    ip -6 rule add uid 0 lookup main pref 3
-
-    # 3. 本地回环与内网保留网段直连放行 (pref 4)
+    # 2. 本地回环与内网保留网段直连放行
     ip rule add to 127.0.0.0/8 lookup main pref 4
     ip -6 rule add to ::1 lookup main pref 4
-    ip rule add to 10.0.0.0/8 lookup main pref 4
-    ip rule add to 172.16.0.0/12 lookup main pref 4
-    ip rule add to 192.168.0.0/16 lookup main pref 4
+    ip rule add to 10.0.0.0/8 lookup main pref 16
+    ip rule add to 172.16.0.0/12 lookup main pref 16
+    ip rule add to 192.168.0.0/16 lookup main pref 16
 
-    # 4. 主网卡原路返回路由 (防止多网卡或特定机房断网)
-    [ -n "${MAIN_IP}" ] && ip rule add from ${MAIN_IP} lookup main pref 5
-    [ -n "${MAIN_IP6}" ] && ip -6 rule add from ${MAIN_IP6} lookup main pref 5
+    # 3. 核心大招：凡是带有 hev-socks5-tunnel 标记(438)的流量，强制丢回 main 路由表，粉碎死循环
+    ip rule add fwmark 438 lookup main pref 10
+    ip -6 rule add fwmark 438 lookup main pref 10
 
-    # 5. 核心代理全局流量重定向：将除上述规则外的其余所有系统流量全部押送至 tun0 隧道
+    # 4. 主网卡原路返回路由
+    [ -n "${MAIN_IP}" ] && ip rule add from ${MAIN_IP} lookup main pref 15
+    [ -n "${MAIN_IP6}" ] && ip -6 rule add from ${MAIN_IP6} lookup main pref 15
+
+    # 5. 核心全局流量重定向（扔进 tun0）
     ip route add default dev tun0 table 20 2>/dev/null || ip route replace default dev tun0 table 20
-    ip rule add lookup 20 pref 10
-    ip -6 rule add lookup 20 pref 10
+    ip rule add lookup 20 pref 20
 
     return 0
 }
 
 stop_post() {
-    # 暴力优雅双管齐下：彻底剥离和清洗所有创建的底层路由规则
-    ip rule del to 0.0.0.0/0 dport 22 lookup main pref 2 2>/dev/null
-    ip rule del to 0.0.0.0/0 sport 22 lookup main pref 2 2>/dev/null
-    ip -6 rule del to ::/0 dport 22 lookup main pref 2 2>/dev/null
-    ip -6 rule del to ::/0 sport 22 lookup main pref 2 2>/dev/null
-
-    ip rule del uid 0 lookup main pref 3 2>/dev/null
-    ip -6 rule del uid 0 lookup main pref 3 2>/dev/null
+    ip rule del to 0.0.0.0/0 dport 22 lookup main pref 5 2>/dev/null
+    ip rule del to 0.0.0.0/0 sport 22 lookup main pref 5 2>/dev/null
+    ip -6 rule del to ::/0 dport 22 lookup main pref 5 2>/dev/null
+    ip -6 rule del to ::/0 sport 22 lookup main pref 5 2>/dev/null
 
     ip rule del to 127.0.0.0/8 lookup main pref 4 2>/dev/null
     ip -6 rule del to ::1 lookup main pref 4 2>/dev/null
-    ip rule del to 10.0.0.0/8 lookup main pref 4 2>/dev/null
-    ip rule del to 172.16.0.0/12 lookup main pref 4 2>/dev/null
-    ip rule del to 192.168.0.0/16 lookup main pref 4 2>/dev/null
+    ip rule del to 10.0.0.0/8 lookup main pref 16 2>/dev/null
+    ip rule del to 172.16.0.0/12 lookup main pref 16 2>/dev/null
+    ip rule del to 192.168.0.0/16 lookup main pref 16 2>/dev/null
 
-    [ -n "${MAIN_IP}" ] && ip rule del from ${MAIN_IP} lookup main pref 5 2>/dev/null
-    [ -n "${MAIN_IP6}" ] && ip -6 rule del from ${MAIN_IP6} lookup main pref 5 2>/dev/null
+    ip rule del fwmark 438 lookup main pref 10 2>/dev/null
+    ip -6 rule del fwmark 438 lookup main pref 10 2>/dev/null
+
+    [ -n "${MAIN_IP}" ] && ip rule del from ${MAIN_IP} lookup main pref 15 2>/dev/null
+    [ -n "${MAIN_IP6}" ] && ip -6 rule del from ${MAIN_IP6} lookup main pref 15 2>/dev/null
 
     ip route del default dev tun0 table 20 2>/dev/null
-    ip rule del lookup 20 pref 10 2>/dev/null
-    ip -6 rule del lookup 20 pref 10 2>/dev/null
-    
+    ip rule del lookup 20 pref 20 2>/dev/null
     return 0
 }
 EOF
     chmod +x "$SERVICE_FILE"
 }
+
 install_tun2socks() {
     cleanup_ip_rules
     step "检查 tun2socks 服务当前状态..."

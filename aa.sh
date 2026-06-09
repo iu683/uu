@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# qBittorrent Docker Compose 管理面板 (含实时端口显示与一键更新)
+# qBittorrent Docker Compose 管理面板
 # =================================================================
 
 # 颜色
@@ -22,28 +22,34 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器状态、映射端口和下载目录
+# 动态获取容器状态、镜像版本、映射端口和下载目录
 get_status_info() {
     # 1. 容器运行状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${GREEN}运行中${RESET}"
+        status="${YELLOW}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}已停止${RESET}"
+        status="${RED}已停止${RESET}"
     else
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 实时解析 Compose 文件中的端口和目录映射
+
+    # 2. 【精准匹配修复】完美剥离特定格式，只留纯版本号
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        img_version=$(docker inspect -f '{{ index .Config.Labels "build_version" }}' "$CONTAINER_NAME" 2>/dev/null | sed 's/Linuxserver.io version:- //g' | awk '{print $1}')
+        [[ -z "$img_version" ]] && img_version="已安装"
+    else
+        img_version="${RED}未安装${RESET}"
+    fi
+
+    # 3. 实时解析 Compose 文件中的端口和目录映射
     if [[ -f "$COMPOSE_FILE" ]]; then
-        # 提取 WebUI 宿主机端口 (对应容器内的 8080)
         webui_port=$(grep -E "\-[[:space:]]+[0-9]+:8080" "$COMPOSE_FILE" | awk -F ':' '{print $1}' | tr -d ' -')
         [[ -z "$webui_port" ]] && webui_port="8080"
 
-        # 提取 Torrent P2P 宿主机端口 (对应容器内的 6881)
         torrent_port=$(grep -E "\-[[:space:]]+[0-9]+:6881($|[[:space:]]|\/)" "$COMPOSE_FILE" | head -n 1 | awk -F ':' '{print $1}' | tr -d ' -')
         [[ -z "$torrent_port" ]] && torrent_port="6881"
 
-        # 提取宿主机下载目录
         download_dir=$(grep -E -- "- .+/downloads" "$COMPOSE_FILE" | awk -F ':' '{print $1}' | sed 's/- //g' | xargs)
         [[ -z "$download_dir" ]] && download_dir="/opt/qbittorrent/downloads"
     else
@@ -61,16 +67,15 @@ get_qb_password() {
     fi
     
     local log_pass
-    log_pass=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -E "temporary password is:" | tail -n 1 | awk '{print $NF}')
+    log_pass=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -iE "temporary password|session:" | tail -n 1 | sed 's/\r//g' | awk '{print $NF}' | tr -d '[:space:].')
     
-    if [[ -n "$log_pass" ]]; then
+    if [[ -n "$log_pass" && ! "$log_pass" =~ "session:" && ! "$log_pass" =~ "password" ]]; then
         echo -e "${GREEN}${log_pass}${RESET}"
     else
-        echo -e "${YELLOW}未在日志中找到临时密码（可能已被修改，或日志已清空）${RESET}"
+        echo -e "${YELLOW}未探测到初始随机密码（可能已被你修改，或日志已被冲刷）${RESET}"
     fi
 }
 
-# 获取服务器公网 IP
 get_public_ip() {
     local ip
     for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
@@ -81,7 +86,6 @@ get_public_ip() {
     echo "你的服务器IP"
 }
 
-# 1. 交互式安装与配置
 install_qbittorrent() {
     check_dependencies
     mkdir -p "$BASE_DIR"
@@ -104,7 +108,6 @@ install_qbittorrent() {
     read -r custom_download
     [[ -z "$custom_download" ]] && custom_download="/opt/qbittorrent/downloads"
 
-    # 创建对应目录并全权赋予
     mkdir -p "$BASE_DIR/config"
     mkdir -p "$custom_download"
     chmod -R 777 "$BASE_DIR/config" "$custom_download"
@@ -136,24 +139,23 @@ EOF
     echo -e "${YELLOW}正在通过 Docker Compose 启动 qBittorrent...${RESET}"
     cd "$BASE_DIR" && docker compose up -d
 
-    echo -e "${YELLOW}等待容器初始化并同步密码日志 (约8秒)...${RESET}"
-    sleep 8
+    echo -e "${YELLOW}等待容器初始化并同步密码日志 (约10秒)...${RESET}"
+    sleep 10
 
     SHOW_IP=$(get_public_ip)
 
-    echo -e "${GREEN}==================================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}       qBittorrent Docker 部署成功！${RESET}"
-    echo -e "${GREEN}==================================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}WebUI 访问地址 : http://${SHOW_IP}:${custom_port}${RESET}"
     echo -e "${YELLOW}默认用户名     : admin${RESET}"
     echo -ne "${YELLOW}初始临时密码   : ${RESET}"
     get_qb_password
     echo -e "${YELLOW}宿主机配置路径 : $BASE_DIR/config${RESET}"
     echo -e "${YELLOW}宿主机下载路径 : $custom_download${RESET}"
-    echo -e "${GREEN}==================================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 8. 一键检查并更新镜像
 update_qbittorrent() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
@@ -167,7 +169,6 @@ update_qbittorrent() {
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 彻底卸载
 uninstall_qbittorrent() {
     echo -ne "${RED}确定要卸载并删除 qBittorrent 容器吗？(y/n): ${RESET}"
     read -r confirm
@@ -196,48 +197,48 @@ logs_qb() { docker logs -f "$CONTAINER_NAME"; }
 show_info() {
     get_status_info
     SHOW_IP=$(get_public_ip)
-    echo -e "${GREEN}==================================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态      : $status"
+    echo -e "${YELLOW}镜像版本      : ${img_version}${RESET}"
     echo -e "${YELLOW}WebUI 访问地址 : http://${SHOW_IP}:${webui_port}${RESET}"
     echo -e "${YELLOW}P2P 传输端口   : ${torrent_port} (TCP/UDP)${RESET}"
     echo -e "${YELLOW}宿主机下载路径 : ${download_dir}${RESET}"
     echo -ne "${YELLOW}初始密码探测   : ${RESET}"
     get_qb_password
-    echo -e "${GREEN}==================================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 菜单主循环
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}==================================================${RESET}"
-    echo -e "${GREEN}        qBittorrent Docker Compose 管理面板        ${RESET}"
-    echo -e "${GREEN}==================================================${RESET}"
-    echo -e "${GREEN}容器状态 :${RESET} $status"
-    echo -e "${GREEN}WebUI端口 :${RESET} ${YELLOW}${webui_port}${RESET}   ${GREEN}P2P端口 :${RESET} ${YELLOW}${torrent_port}${RESET}"
-    echo -e "${GREEN}下载目录 :${RESET} ${CYAN}${download_dir}${RESET}"
-    echo -e "${GREEN}==================================================${RESET}"
-    echo -e "${GREEN}1. 部署/重建 qBittorrent (自定义端口与目录)${RESET}"
-    echo -e "${GREEN}2. 启动容器${RESET}"
-    echo -e "${GREEN}3. 停止容器${RESET}"
-    echo -e "${GREEN}4. 重启容器${RESET}"
-    echo -e "${GREEN}5. 查看实时日志${RESET}"
-    echo -e "${GREEN}6. 查看当前配置与密码${RESET}"
-    echo -e "${GREEN}7. 彻底卸载容器${RESET}"
-    echo -e "${YELLOW}8. 一键检查并更新 qBittorrent 镜像${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}      qBittorrent 管理面板       ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}版本 :${RESET} ${CYAN}${img_version}${RESET}"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}   ${GREEN}P2P端口 :${RESET} ${YELLOW}${torrent_port}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}==================================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
         1) install_qbittorrent ;;
-        2) start_qb ;;
-        3) stop_qb ;;
-        4) restart_qb ;;
-        5) logs_qb ;;
-        6) show_info ;;
-        7) uninstall_qbittorrent ;;
-        8) update_qbittorrent ;;
+        2) update_qbittorrent ;;
+        3) uninstall_qbittorrent ;;
+        4) start_qb ;;
+        5) stop_qb ;;
+        6) restart_qb ;;
+        7) logs_qb ;;
+        8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

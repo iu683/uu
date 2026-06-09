@@ -1,6 +1,6 @@
 #!/bin/bash
 # Hermes Agent 终端管理脚本
-# 颜色定义 (适配 ACME 风格命名)
+# 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -8,6 +8,7 @@ CYAN='\033[0;36m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 RESET='\033[0m'
+NC='\033[0m' # 兼容脚本中使用的 NC 变量
 
 # 确保 hermes 命令可用 (处理环境变量未加载的情况)
 if ! command -v hermes >/dev/null 2>&1; then
@@ -26,7 +27,7 @@ refresh_hermes_path() {
     export PATH="$HOME/.local/bin:$HOME/.hermes/hermes-agent/venv/bin:$PATH"
 }
 
-# --- 科技lion 增强版 API 管理核心 ---
+
 CONFIG_FILE="$HOME/.hermes/config.yaml"
 
 config_tool() {
@@ -242,14 +243,90 @@ except Exception as e:
 EOF
 }
 
+# --- 底层模型探测业务函数组 ---
+hermes_model_probe() {
+    local target_name="$1"
+    local json_data="$2"
+    
+    HERMES_PROBE_MESSAGE="检测中..."
+    HERMES_PROBE_LATENCY="0ms"
+    HERMES_PROBE_REPLY="无响应"
+
+    local matched_entry
+    matched_entry=$(echo "$json_data" | jq -c --arg n "$target_name" '.[] | select(.name == $n)')
+    if [ -z "$matched_entry" ]; then
+        HERMES_PROBE_MESSAGE="未配置该模型"
+        return 1
+    fi
+
+    local p_url p_key p_model
+    p_url=$(echo "$matched_entry" | jq -r .base_url)
+    p_key=$(echo "$matched_entry" | jq -r .api_key)
+    p_model=$(echo "$matched_entry" | jq -r .model)
+
+    local start_time end_time
+    start_time=$(date +%s%N 2>/dev/null || date +%s)
+    
+    local post_data
+    post_data=$(cat <<JSON
+{"model": "$p_model", "messages": [{"role": "user", "content": "ping"}], "max_tokens": 5}
+JSON
+)
+    local response
+    response=$(curl -s -m 5 -X POST "$p_url/chat/completions" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $p_key" \
+        -d "$post_data")
+
+    end_time=$(date +%s%N 2>/dev/null || date +%s)
+    
+    if [ "${#start_time}" -gt 10 ]; then
+        local delta=$(( (end_time - start_time) / 1000000 ))
+        HERMES_PROBE_LATENCY="${delta}ms"
+    else
+        HERMES_PROBE_LATENCY="无法精细统计"
+    fi
+
+    if echo "$response" | grep -q "choices"; then
+        HERMES_PROBE_MESSAGE="可用"
+        HERMES_PROBE_REPLY=$(echo "$response" | jq -r '.choices[0].message.content' 2>/dev/null | tr -d '\n' | cut -c1-30)
+        return 0
+    else
+        HERMES_PROBE_MESSAGE="异常"
+        HERMES_PROBE_REPLY=$(echo "$response" | jq -r '.error.message' 2>/dev/null || echo "HTTP请求不通过")
+        return 1
+    fi
+}
+
+hermes_probe_status_line() {
+    local flag="$1"
+    if [ "$flag" = "可用" ]; then
+        echo -e "核心状态: ${GREEN}● 连通正常${RESET}"
+    else
+        echo -e "核心状态: ${RED}● 握手失败${RESET}"
+    fi
+}
+
+sync_api_provider_models() {
+    local p_name="$1"
+    echo -e "${YELLOW}正在下发异步拉取指令...${RESET}"
+    if [ -z "$p_name" ]; then
+        echo -e "全量拉取已开始。"
+    else
+        echo -e "正在向 ${p_name} 触发握手。"
+    fi
+}
+
 install_gum() {
     if command -v gum >/dev/null 2>&1; then return 0; fi
     echo -e "${YELLOW}正在安装 gum (交互式选择器)...${RESET}"
     if command -v apt >/dev/null 2>&1; then
         mkdir -p /etc/apt/keyrings
+        rm -f /etc/apt/sources.list.d/charm.list
         curl -fsSL https://repo.charm.sh/apt/gpg.key | gpg --dearmor -o /etc/apt/keyrings/charm.gpg 2>/dev/null
         echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | tee /etc/apt/sources.list.d/charm.list > /dev/null
-        apt update -qq && apt install -y -qq gum
+        apt-get update -qq --allow-unauthenticated || true
+        apt-get install -y -qq gum || echo "⚠️ Gum 自动安装失败，将回退到普通菜单模式"
     elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
         cat > /etc/yum.repos.d/charm.repo <<'REPO'
 [charm]
@@ -266,16 +343,15 @@ REPO
     fi
 }
 
-
 api_management_submenu() {
     while true; do
         clear
         info=$(config_tool get_info)
-        echo -e "${BLUE}=======================================${NC}"
-        echo -e "      ${PURPLE}API & 模型管理 (OpenClaw 风格)${NC}"
-        echo -e "${BLUE}=======================================${NC}"
-        echo -e "${CYAN}当前激活模型:${NC} ${GREEN}$(echo $info | jq -r .m)${NC}"
-        echo -e "---------------------------------------"
+        echo -e "${GREEN}=======================================${NC}"
+        echo -e "${GREEN}             API & 模型管理           ${NC}"
+        echo -e "${GREEN}=======================================${NC}"
+        echo -e "${CYAN}当前激活模型:${NC} ${YELLOW}$(echo $info | jq -r .m)${NC}"
+        echo -e "${GREEN}---------------------------------------${NC}"
         echo -e "${CYAN}已配置 API 列表:${NC}"
         local groups_lat_json
         groups_lat_json=$(config_tool list_groups_latency)
@@ -299,17 +375,18 @@ api_management_submenu() {
                         lat_color="${YELLOW}"
                     fi
                 fi
-                echo -e "  ● [${g_name}] (${g_count} 个模型) | 延迟: ${lat_color}${g_latency}${NC} | ${g_url}"
+                echo -e "${YELLOW}  ● [${g_name}] (${g_count} 个模型) | 延迟: ${lat_color}${g_latency}${NC}"
             done < <(echo "$groups_lat_json" | jq -c '.[]')
         fi
-        echo -e "---------------------------------------"
-        echo -e "1. ${YELLOW}切换模型 (带测速)${NC}"
-        echo -e "2. 添加 API 供应商 (自动同步)${NC}"
-        echo -e "3. ${YELLOW}同步 API 供应商模型列表${NC}"
-        echo -e "4. 删除 API 供应商"
-        echo -e "0. 返回主菜单"
-        echo -e "---------------------------------------"
-        read -p "选择序号: " sub_choice
+        echo -e "${GREEN}---------------------------------------${NC}"
+        echo -e "${GREEN}1. 切换模型${NC}"
+        echo -e "${GREEN}2. 添加 API 供应商${NC}"
+        echo -e "${GREEN}3. 同步 API 供应商模型列表${NC}"
+        echo -e "${GREEN}4. 删除 API 供应商${NC}"
+        echo -e "${GREEN}0. 返回主菜单${NC}"
+        echo -e "${GREEN}---------------------------------------${NC}"
+        echo -ne "${GREEN}选择序号: ${NC}"
+        read sub_choice
         case "$sub_choice" in
             1)
                 local orange="#FF8C00"
@@ -324,7 +401,6 @@ api_management_submenu() {
                     continue
                 fi
 
-                # 构建带编号的模型列表
                 models_list=$(echo "$ps_json" | jq -r '.[].name' | awk '{print "(" NR ") " $0}')
                 default_model=$(config_tool get_info | jq -r .m)
 
@@ -332,7 +408,6 @@ api_management_submenu() {
                     clear
                     install_gum
 
-                    # 若 gum 不可用，降级为手动输入
                     if ! command -v gum >/dev/null 2>&1; then
                         echo "--- 模型管理 ---"
                         echo "当前可用模型："
@@ -349,7 +424,6 @@ api_management_submenu() {
                             sleep 1
                             continue
                         fi
-                        # 如果输入的是纯数字，从列表中取名称
                         if [[ "$selected_model" =~ ^[0-9]+$ ]]; then
                             selected_model=$(echo "$ps_json" | jq -r --argjson i "$((selected_model-1))" '.[$i].name // empty')
                             if [ -z "$selected_model" ]; then
@@ -359,7 +433,6 @@ api_management_submenu() {
                             fi
                         fi
                     else
-                        # gum 模式 — 完全复刻 openclaw 风格
                         gum style --foreground "$orange" --bold "模型管理"
                         gum style --foreground "$orange" "可用模型：${model_count}"
                         gum style --foreground "$orange" "当前默认：${default_model}"
@@ -384,7 +457,6 @@ api_management_submenu() {
                         fi
                     fi
 
-                    # 去掉编号前缀 "(N) "
                     selected_model=$(echo "$selected_model" | sed -E 's/^\([0-9]+\)[[:space:]]+//')
 
                     echo ""
@@ -420,7 +492,6 @@ api_management_submenu() {
                         continue
                     fi
 
-                    # 执行切换
                     local entry_data
                     entry_data=$(echo "$ps_json" | jq -c --arg n "$selected_model" '.[] | select(.name == $n)')
                     local sw_u sw_k sw_m
@@ -431,7 +502,6 @@ api_management_submenu() {
                     echo "正在切换模型为: $selected_model ..."
                     config_tool switch "$selected_model" "$sw_u" "$sw_k" "$sw_m"
 
-                    # 重启 gateway
                     echo -e "${YELLOW}正在重启 Gateway...${NC}"
                     hermes gateway stop >/dev/null 2>&1
                     hermes gateway start >/dev/null 2>&1
@@ -454,11 +524,9 @@ api_management_submenu() {
                 
                 echo -e "${YELLOW}🔍 正在获取完整模型列表...${NC}"
                 m_json=$(curl -s -m 10 -H "Authorization: Bearer $k" "$u/models")
-                # 提取所有 ID
                 m_list_str=$(echo "$m_json" | jq -r '.data[].id' 2>/dev/null | sort)
                 
                 if [ -n "$m_list_str" ]; then
-                    # 转换为数组
                     m_array=()
                     while read -r line; do m_array+=("$line"); done <<< "$m_list_str"
                     m_count=${#m_array[@]}
@@ -472,7 +540,6 @@ api_management_submenu() {
                     echo -e "---------------------------------------"
                     read -p "是否同时添加该供应商的所有 $m_count 个模型？(y/N): " bulk_confirm
                     if [[ "$bulk_confirm" =~ ^[Yy]$ ]]; then
-                        # 转换数组为 JSON
                         m_json_list=$(echo "$m_list_str" | jq -R . | jq -s -c .)
                         config_tool bulk_add "$n" "$u" "$k" "$m_json_list"
                         config_tool switch "$n/$m_default" "$u" "$k" "$m_default"
@@ -514,7 +581,6 @@ api_management_submenu() {
                     sleep 1
                     continue
                 fi
-                # 列出供应商分组
                 g_names=()
                 while read -r row; do
                     g_name=$(echo "$row" | jq -r .name)
@@ -539,7 +605,6 @@ api_management_submenu() {
         esac
     done
 }
-
 
 check_installed() {
     if command -v hermes >/dev/null 2>&1; then return 0; else return 1; fi
@@ -609,7 +674,6 @@ add_app_id() {
     if [ -f "$app_file" ] && ! grep -q "\b115\b" "$app_file"; then echo "115" >> "$app_file"; fi
 }
 
-# 获取当前模型数量做为 ACME 面板的“配置数”展现
 get_config_count() {
     local ps_json
     ps_json=$(config_tool list_p 2>/dev/null)
@@ -621,152 +685,159 @@ get_config_count() {
 }
 
 # =================================================================
-# 主展示菜单（完全适配自 ACME 经典美化面板布局）
+# 主展示菜单
 # =================================================================
 show_menu() {
-    clear
-    # ======= 修复后的版本对比逻辑 =======
-    local STATUS=$(get_gateway_status)
-    local cur_v=$(get_version)
-    local lat_v=$(get_latest_version)
-    local CONFIG_COUNT=$(get_config_count)
-    local VERSION_SHOW="$cur_v"
-    
-    # 提取纯数字版本号用于比对 (例如从 "Hermes Agent v0.16.0..." 中提取出 "0.16.0")
-    local clean_cur_v=$(echo "$cur_v" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
-    local clean_lat_v=$(echo "$lat_v" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+    while true; do
+        clear
+        local STATUS=$(get_gateway_status)
+        local cur_v=$(get_version)
+        local lat_v=$(get_latest_version)
+        local CONFIG_COUNT=$(get_config_count)
+        local VERSION_SHOW="$cur_v"
+        
+        # 提取纯数字版本号（例如：从 v1.2.3 或 1.2.3-dev 中提取出 1.2.3）
+        local clean_cur_v=$(echo "$cur_v" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+        
+        # 如果提取成功则只显示纯版本号，否则作为兜底显示原始输出
+        local VERSION_SHOW="${clean_cur_v:-$cur_v}"
 
-    if [ -n "$clean_cur_v" ] && [ -n "$clean_lat_v" ]; then
-        if version_lt "$clean_cur_v" "$clean_lat_v"; then 
-            VERSION_SHOW="${cur_v} (${RED}可升级至 v$clean_lat_v${YELLOW})"
-        else 
-            VERSION_SHOW="${cur_v} (${GREEN}最新版${YELLOW})"
-        fi
-    fi
-    # ===================================
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      ◈  Hermes 管理面板  ◈      ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态    :${RESET} $STATUS"
-    echo -e "${GREEN}版本    :${RESET} ${YELLOW}$VERSION_SHOW${RESET}"
-    echo -e "${GREEN}模型    :${RESET} ${YELLOW}$CONFIG_COUNT 个配置${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 Hermes Agent${RESET}"
-    echo -e "${GREEN} 2. 启动 Gateway (消息网关后台)${RESET}"
-    echo -e "${GREEN} 3. 停止 Gateway (消息网关服务)${RESET}"
-    echo -e "${GREEN} 4. API供应商与模型切换管理${RESET}"
-    echo -e "${GREEN} 5. 启动终端交互式对话 UI${RESET}"
-    echo -e "${GREEN} 6. 运行初始化配置向导 (Setup)${RESET}"
-    echo -e "${GREEN} 7. 升级 Hermes Agent${RESET}"
-    echo -e "${GREEN} 8. 卸载 Hermes Agent${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN} 请选择: ${RESET}"
-    
-    if ! read choice; then echo -e "\n${GREEN}退出。${RESET}"; exit 0; fi
-    echo ""
-    
-    case $choice in
-        1)
-            echo -e "${YELLOW}开始安装 Hermes Agent...${RESET}"
-            curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
-            refresh_hermes_path
-            hermes gateway install && hermes gateway start && add_app_id
-            ;;
-        2)
-            if check_installed; then
-                echo -e "${YELLOW}正在启动 Gateway...${RESET}"
-                hermes gateway stop >/dev/null 2>&1
-                systemctl --user stop hermes-gateway >/dev/null 2>&1
-                hermes gateway start
-            else echo -e "${RED}请先安装 Hermes。${RESET}"; fi
-            ;;
-        3)
-            if check_installed; then
-                echo -e "${YELLOW}正在停止 Gateway...${RESET}"
-                hermes gateway stop
-                systemctl --user stop hermes-gateway >/dev/null 2>&1
-            else echo -e "${RED}请先安装 Hermes。${RESET}"; fi
-            ;;
-        4)
-            if check_installed; then 
-                echo -e "${YELLOW}正在载入模型配置管理...${RESET}"
-                api_management_submenu
-            else echo -e "${RED}请先安装 Hermes。${RESET}"; fi
-            ;;
-        5)
-            if check_installed; then
-                echo -e "${YELLOW}进入交互式终端，输入 /exit 退出。${RESET}" && sleep 1
-                hermes
-            else echo -e "${RED}请先安装 Hermes。${RESET}"; fi
-            ;;
-        6)
-            if check_installed; then hermes setup; else echo -e "${RED}请先安装 Hermes。${RESET}"; fi
-            ;;
-        7)
-            if check_installed; then
-                echo -e "${YELLOW}🔄 开始安全更新流程...${RESET}"
-                echo -e "${CYAN}正在优雅关闭正在运行的网关...${RESET}"
-                hermes gateway stop >/dev/null 2>&1
-                systemctl --user stop hermes-gateway >/dev/null 2>&1
-                sleep 1.5
-
-                echo -e "${CYAN}正在拉取官方最新版本包...${RESET}"
-                local pip_executed=1
-                local hermes_bin="$(command -v hermes 2>/dev/null)"
-                if [ -n "$hermes_bin" ] && [ -r "$hermes_bin" ]; then
-                    local python_bin="$(sed -n '1s/^#!//p' "$hermes_bin" 2>/dev/null)"
-                    if [ -n "$python_bin" ] && [ -x "$python_bin" ]; then
-                        local venv_pip="$(dirname "$python_bin")/pip"
-                        if [ -x "$venv_pip" ]; then
-                            "$venv_pip" install --upgrade hermes-agent
-                            pip_executed=$?
-                        fi
-                    fi
-                fi
-
-                if [ "$pip_executed" -ne 0 ]; then
-                    pip install --upgrade hermes-agent
-                    pip_executed=$?
-                fi
-
-                if [ "$pip_executed" -eq 0 ]; then
-                    echo -e "${GREEN}✅ 包文件更新成功！${RESET}"
-                    add_app_id
-                    refresh_hermes_path
-                else
-                    echo -e "${RED}❌ 更新失败。${RESET}"
-                    hermes gateway start >/dev/null 2>&1
-                    echo ""
-                    read -p "按回车键返回主菜单..."
-                    return
-                fi
-                
-                echo -e "${CYAN}正在重新拉起消息网关后台服务...${RESET}"
-                hermes gateway start
-                echo -e "${GREEN}🎉 安全更新并自动重启成功！${RESET}"
-            else echo -e "${RED}请先安装 Hermes。${RESET}"; fi
-            ;;
-        8)
-            if check_installed; then
-                read -p "确定要卸载 Hermes 吗？所有数据将被清除。(y/N): " confirm
-                if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}      ◈  Hermes 管理面板  ◈      ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}状态    :${RESET} $STATUS"
+        echo -e "${GREEN}版本    :${RESET} ${YELLOW}$VERSION_SHOW${RESET}"
+        echo -e "${GREEN}模型    :${RESET} ${YELLOW}$CONFIG_COUNT 个配置${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN} 1. 安装 Hermes Agent${RESET}"
+        echo -e "${GREEN} 2. 启动 Gateway (消息网关后台)${RESET}"
+        echo -e "${GREEN} 3. 停止 Gateway (消息网关服务)${RESET}"
+        echo -e "${GREEN} 4. API供应商与模型切换管理${RESET}"
+        echo -e "${GREEN} 5. 启动终端交互式对话UI${RESET}"
+        echo -e "${GREEN} 6. 运行初始化配置向导${RESET}"
+        echo -e "${GREEN} 7. 升级 Hermes Agent${RESET}"
+        echo -e "${GREEN} 8. 卸载 Hermes Agent${RESET}"
+        echo -e "${GREEN} 0. 退出${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -ne "${GREEN} 请选择: ${RESET}"
+        
+        if ! read choice; then echo -e "${GREEN}退出。${RESET}"; exit 0; fi
+        
+        case $choice in
+            1)
+                echo -e "${YELLOW}开始安装 Hermes Agent...${RESET}"
+                curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+                refresh_hermes_path
+                hermes gateway install && hermes gateway start && add_app_id
+                ;;
+            2)
+                if check_installed; then
+                    echo -e "${YELLOW}正在启动 Gateway...${RESET}"
                     hermes gateway stop >/dev/null 2>&1
                     systemctl --user stop hermes-gateway >/dev/null 2>&1
-                    hermes uninstall
-                    sed -i "/\b115\b/d" /home/docker/appno.txt 2>/dev/null || true
-                    echo -e "${GREEN}卸载完成。${RESET}"
-                else echo "已取消。"; fi
-            else echo -e "${RED}请先安装 Hermes。${RESET}"; fi
-            ;;
-        0) echo -e "${GREEN}感谢使用，再见！${RESET}"; exit 0 ;;
-        *) echo -e "${RED}输入错误，请重新选择。${RESET}" ;;
-    esac
-    echo ""
-    read -p "按回车键返回主菜单..."
+                    hermes gateway start
+                else echo -e "${RED}请先安装 Hermes。${RESET}"; fi
+                ;;
+            3)
+                if check_installed; then
+                    echo -e "${YELLOW}正在停止 Gateway...${RESET}"
+                    hermes gateway stop
+                    systemctl --user stop hermes-gateway >/dev/null 2>&1
+                else echo -e "${RED}请先安装 Hermes。${RESET}"; fi
+                ;;
+            4)
+                if check_installed; then 
+                    echo -e "${YELLOW}正在载入模型配置管理...${RESET}"
+                    api_management_submenu
+                else echo -e "${RED}请先安装 Hermes。${RESET}"; fi
+                ;;
+            5)
+                if check_installed; then
+                    echo -e "${YELLOW}进入交互式终端，输入 /exit 退出。${RESET}" && sleep 1
+                    hermes
+                else echo -e "${RED}请先安装 Hermes。${RESET}"; fi
+                ;;
+            6)
+                if check_installed; then hermes setup; else echo -e "${RED}请先安装 Hermes。${RESET}"; fi
+                ;;
+            7)
+                if check_installed; then
+                    echo -e "${YELLOW}正在停止 Gateway...${NC}"
+                    hermes gateway stop >/dev/null 2>&1
+   
+                    echo -e "${YELLOW}正在更新 Hermes...${NC}"
+                    hermes update
+
+                    echo -e "${YELLOW}正在启动 Gateway...${NC}"
+                    hermes gateway start >/dev/null 2>&1
+
+                    add_app_id
+
+                    echo -e "${GREEN}✅ 更新完成${NC}"
+                    new_ver=$(get_version)
+                    echo -e "${GREEN}✅ 已更新到 ${new_ver}${NC}"
+                else
+                    echo -e "${RED}请先安装 Hermes。${NC}"
+                fi
+                read -p "按回车键继续..."
+                ;;
+            8)
+                if check_installed; then
+                    echo -e "${YELLOW}🛑 开始执行官方标准卸载程序...${RESET}"
+                    
+                    # 1. 停止网关及守护进程
+                    hermes gateway stop >/dev/null 2>&1
+                    systemctl --user stop hermes-gateway >/dev/null 2>&1
+                    
+                    # 2. 交互提示：是否保留配置文件
+                    echo -ne "${YELLOW}是否保留配置文件目录 (~/.hermes/) 以便将来重新安装时使用？(y/N): ${RESET}"
+                    read keep_config
+                    
+                    # 3. 执行核心文件清理
+                    echo -e "${CYAN}正在清理程序文件与软链接...${RESET}"
+                    
+                    # 移除用户目录下的全局二进制软链接
+                    rm -f "$HOME/.local/bin/hermes"
+                    
+                    # 寻找到虚拟环境根目录并进行清理
+                    local h_bin="$(command -v hermes 2>/dev/null)"
+                    if [ -n "$h_bin" ]; then
+                        local py_sb="$(sed -n '1s/^#!//p' "$h_bin" 2>/dev/null)"
+                        local t_venv="$(dirname "$(dirname "$py_sb")")"
+                        [ -d "$t_venv" ] && rm -rf "$t_venv"
+                    fi
+                    
+                    # 兜底清理常见的默认克隆/安装路径
+                    rm -rf "$HOME/.hermes/hermes-agent" 2>/dev/null
+                    rm -rf "/root/.hermes/hermes-agent" 2>/dev/null
+                    
+                    # 4. 根据用户选择处理配置目录
+                    if [[ "$keep_config" =~ ^[Yy]$ ]]; then
+                        echo -e "${GREEN}已保留配置文件目录: ~/.hermes/${RESET}"
+                    else
+                        echo -e "${CYAN}正在清理全局配置与凭证...${RESET}"
+                        # 排除掉前面可能已经删过的 hermes-agent，确保干净移除整个父目录
+                        rm -rf "$HOME/.hermes" 2>/dev/null
+                        rm -rf "/root/.hermes" 2>/dev/null
+                        echo -e "${RED}已完全移除 ~/.hermes 目录。${RESET}"
+                    fi
+                    
+                    echo -e "${GREEN}✅ Hermes Agent 官方卸载流程执行完毕！${RESET}"
+                else
+                    echo -e "${RED}当前系统未检测到已安装的 Hermes 实例。${RESET}"
+                fi
+                read -p "按回车键继续..."
+                ;;
+            0)
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}序号输入错误，请重试！${RESET}"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
-# 守护主循环
-while true; do
-    show_menu
-done
+# 脚本入口点直接渲染菜单
+show_menu

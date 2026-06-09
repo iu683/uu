@@ -652,38 +652,73 @@ update_tun2socks_core() {
         error "检测到您尚未安装 Tun2Socks 环境，请先使用选项 1 进行初始化安装！"
         return 1
     fi
-    step "正在连接 GitHub 检查最新 Release Version..."
-    local latest_release_json=$(curl -s https://api.github.com/repos/$REPO_TUN2SOCKS/releases/latest)
-    local latest_version=$(echo "$latest_release_json" | grep '"tag_name":' | cut -d '"' -f 4)
-    local download_url=$(echo "$latest_release_json" | grep "browser_download_url" | grep "linux-x86_64" | cut -d '"' -f 4)
 
+    # ====================================================================
+    # 【核心修正 1】通过代理池轮询获取 GitHub Release 元数据 (自适应 IPv6)
+    # ====================================================================
+    step "正在连接 GitHub 检查最新 Release Version..."
+    local raw_api_url="https://api.github.com/repos/$REPO_TUN2SOCKS/releases/latest"
+    local latest_release_json=""
+    
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local final_api_url="${proxy}${raw_api_url}"
+        info "正在尝试通过 [ ${proxy:-原生直连} ] 检查版本..."
+        latest_release_json=$(curl -g -6 -s -m 15 "$final_api_url" || echo "")
+        if echo "$latest_release_json" | grep -q "browser_download_url"; then
+            break
+        fi
+    done
+
+    local latest_version=$(echo "$latest_release_json" | grep '"tag_name":' | cut -d '"' -f 4)
+
+    # ====================================================================
+    # 【核心修正 2】动态适配 hef/hev-socks5-tunnel 的各种架构命名规范
+    # ====================================================================
+    local ARCH=$(uname -m)
+    local MATCH_KEY="linux-amd64"
+    if [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
+        MATCH_KEY="linux-arm64"
+    elif [[ "$ARCH" == "386" || "$ARCH" == "i386" ]]; then
+        MATCH_KEY="linux-386"
+    fi
+
+    # 兼容精准抓取
+    local download_url=$(echo "$latest_release_json" | grep "browser_download_url" | grep -E "linux-x86_64|linux-amd64|${MATCH_KEY}" | head -n1 | cut -d '"' -f 4)
+
+    # 严格拦截空值，防止空变量参与后续逻辑对比
     if [ -z "$latest_version" ] || [ -z "$download_url" ]; then
-        error "无法从 GitHub 获取版本信息，网络可能受到干扰。"
+        error "无法从 GitHub 获取有效的版本号或找不到适用当前架构 (${ARCH}) 的核心文件，更新终止。"
         return 1
     fi
+
     local local_version="未知"
     if [ -f "/usr/local/bin/tun2socks" ]; then
-        local_version=$(/usr/local/bin/tun2socks --version 2>&1 | grep "Version:" | awk '{print $2}')
+        # 优化对 Alpine 环境下不规范输出的兼容性抓取
+        local_version=$(/usr/local/bin/tun2socks --version 2>&1 | grep -i "version" | awk '{print $2}')
         [ -z "$local_version" ] && local_version="未知"
     fi
     info "本地核心版本: $local_version"
     info "GitHub最新版本: $latest_version"
 
+    # 如果本地版本能和远程版本精确对上，直接平稳退出
     if [ "$local_version" = "$latest_version" ]; then
         success "当前核心程序已是官方最新发布版，无需重复升级。"
         return 0
     fi
+    
     warning "检测到新版本核心程序 ($latest_version)，开始全自动无缝升级..."
 
+    # 统一使用大写变量，防止调用的公共子函数不兼容小写局部变量
     local RESOLV_CONF="/etc/resolv.conf"
     local RESOLV_CONF_BAK="/etc/resolv.conf.bak"
-    local was_immutable=false
+    local WAS_IMMUTABLE=false
+    
     if lsattr -d "$RESOLV_CONF" 2>/dev/null | grep -q -- '-i-'; then
         chattr -i "$RESOLV_CONF" || true
-        was_immutable=true
+        WAS_IMMUTABLE=true
     fi
     cp "$RESOLV_CONF" "$RESOLV_CONF_BAK" || true
-    if ! set_dns64_servers "$RESOLV_CONF" "$was_immutable" "$RESOLV_CONF_BAK"; then return 1; fi
+    if ! set_dns64_servers "$RESOLV_CONF" "$WAS_IMMUTABLE" "$RESOLV_CONF_BAK"; then return 1; fi
 
     local is_running=false
     if rc-service tun2socks status 2>/dev/null | grep -q "started"; then
@@ -692,21 +727,22 @@ update_tun2socks_core() {
         rc-service tun2socks stop || true
     fi
 
-    step "正在下载官方最新编译核心..."
+    step "正在通过代理池安全下载最新核心..."
     if ! download_with_proxy "/usr/local/bin/tun2socks" "$download_url"; then
-        error "所有下载通道均失败，请检查网络。"
-        restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$was_immutable"
+        error "所有下载通道均失败，更新流产。"
+        restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
         return 1
     fi
     chmod +x "/usr/local/bin/tun2socks"
-    restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$was_immutable"
+    restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
 
     if [ "$is_running" = true ]; then
         step "正在恢复并重新启动全局代理..."
-        rc-service tun2socks start && success "隧道已成功恢复运行！" || error "重启失败。"
+        rc-service tun2socks start && success "隧道已无缝成功恢复最新版运行！" || error "重启隧道失败。"
+    else
+        success "核心已成功更新至最新版！"
     fi
 }
-
 generate_openrc_script() {
     local SERVICE_FILE="/etc/init.d/tun2socks"
     local TARGET_CONFIG="/etc/tun2socks/config.yaml"
@@ -735,18 +771,33 @@ depend() {
 start_post() {
     ulimit -n 524288
 
-    # 1. SSH 防断网路由策略 (保持22端口直连原生网卡)
-    ip rule add to 0.0.0.0/0 dport 22 lookup main pref 5
-    ip rule add to 0.0.0.0/0 sport 22 lookup main pref 5
-    ip -6 rule add to ::/0 dport 22 lookup main pref 5
-    ip -6 rule add to ::/0 sport 22 lookup main pref 5
+    # 【核心防御】死等 tun0 网卡在内核中诞生，最多等待 10 秒
+    local retry=0
+    while ! ip link show dev tun0 >/dev/null 2>&1; do
+        sleep 0.5
+        retry=\$((retry + 1))
+        if [ \$retry -gt 20 ]; then
+            echo "错误: tun0 设备未能在预定时间内由 tun2socks 创建！" >&2
+            return 1
+        fi
+    done
+
+    # 1. 【完美修复】SSH 防断网策略：利用 iptables 给 22 端口打标记，绕过非法的 ip rule dport 限制
+    iptables -t mangle -A PREROUTING -p tcp --dport 22 -j MARK --set-mark 22 2>/dev/null || true
+    iptables -t mangle -A OUTPUT -p tcp --sport 22 -j MARK --set-mark 22 2>/dev/null || true
+    ip rule add fwmark 22 lookup main pref 5 2>/dev/null || true
+
+    if ip -6 route show >/dev/null 2>&1; then
+        ip6tables -t mangle -A PREROUTING -p tcp --dport 22 -j MARK --set-mark 22 2>/dev/null || true
+        ip6tables -t mangle -A OUTPUT -p tcp --sport 22 -j MARK --set-mark 22 2>/dev/null || true
+        ip -6 rule add fwmark 22 lookup main pref 5 2>/dev/null || true
+    fi
 
     # 2. CF WARP 本地回环与宿主机直连放行
     ip rule add to 127.0.0.0/8 lookup main pref 4
     ip -6 rule add to ::1 lookup main pref 4
 
-    # 3. 【核心救星】无条件放行 Cloudflare WARP 所有的远程 Endpoint / MASQUE 服务器网段！
-    # 只要目的地是去建立 WARP 隧道的流量，一律走原生网卡直连，不准进 tun0！
+    # 3. 无条件放行 Cloudflare WARP 所有的远程 Endpoint / MASQUE 服务器网段
     ip rule add to 162.159.192.0/24 lookup main pref 6
     ip rule add to 162.159.193.0/24 lookup main pref 6
     ip rule add to 162.159.195.0/24 lookup main pref 6
@@ -755,7 +806,7 @@ start_post() {
     ip rule add to 188.114.97.0/24 lookup main pref 6
     ip -6 rule add to 2606:4700:d0::/48 lookup main pref 6
 
-    # 4. 代理软件（hev-socks5-tunnel）自身发出的标有 438 的包直连
+    # 4. 代理软件自身发出的流量直连
     ip rule add fwmark 438 lookup main pref 10
     ip -6 rule add fwmark 438 lookup main pref 10
 
@@ -769,18 +820,28 @@ start_post() {
     ip rule add to 192.168.0.0/16 lookup main pref 16
 
     # 7. 核心全局流量重定向（将其余流量扔进 tun0）
-    ip route add default dev tun0 table 20 2>/dev/null || ip route replace default dev tun0 table 20
-    ip rule add lookup 20 pref 20
+    # 【完美分流】采用最安全的 0.0.0.0/1 双段接管法，完美替代 default 覆盖，绝无回环风险
+    ip route add 0.0.0.0/1 dev tun0 table 20 2>/dev/null || ip route replace 0.0.0.0/1 dev tun0 table 20
+    ip route add 128.0.0.0/1 dev tun0 table 20 2>/dev/null || ip route replace 128.0.0.0/1 dev tun0 table 20
+    
+    if [ -n "${MAIN_IP6}" ]; then
+        ip -6 route add ::/1 dev tun0 table 20 2>/dev/null || ip -6 route replace ::/1 dev tun0 table 20
+        ip -6 route add 8000::/1 dev tun0 table 20 2>/dev/null || ip -6 route replace 8000::/1 dev tun0 table 20
+    fi
 
+    ip rule add lookup 20 pref 20
     return 0
 }
 
 stop_post() {
-    ip rule del to 0.0.0.0/0 dport 22 lookup main pref 5 2>/dev/null
-    ip rule del to 0.0.0.0/0 sport 22 lookup main pref 5 2>/dev/null
-    ip -6 rule del to ::/0 dport 22 lookup main pref 5 2>/dev/null
-    ip -6 rule del to ::/0 sport 22 lookup main pref 5 2>/dev/null
+    # 清理 SSH 打标路由与规则
+    iptables -t mangle -D PREROUTING -p tcp --dport 22 -j MARK --set-mark 22 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -p tcp --sport 22 -j MARK --set-mark 22 2>/dev/null || true
+    ip rule del fwmark 22 lookup main pref 5 2>/dev/null || true
 
+    iptables -t mangle -F 2>/dev/null || true
+    ip6tables -t mangle -F 2>/dev/null || true
+    
     ip rule del to 127.0.0.0/8 lookup main pref 4 2>/dev/null
     ip -6 rule del to ::1 lookup main pref 4 2>/dev/null
 
@@ -803,7 +864,11 @@ stop_post() {
     ip rule del to 172.16.0.0/12 lookup main pref 16 2>/dev/null
     ip rule del to 192.168.0.0/16 lookup main pref 16 2>/dev/null
 
-    ip route del default dev tun0 table 20 2>/dev/null
+    ip route del 0.0.0.0/1 dev tun0 table 20 2>/dev/null
+    ip route del 128.0.0.0/1 dev tun0 table 20 2>/dev/null
+    ip -6 route del ::/1 dev tun0 table 20 2>/dev/null
+    ip -6 route del 8000::/1 dev tun0 table 20 2>/dev/null
+
     ip rule del lookup 20 pref 20 2>/dev/null
     return 0
 }
@@ -812,6 +877,9 @@ EOF
 }
 install_tun2socks() {
     cleanup_ip_rules
+    # 【强制补齐 Alpine 核心路由工具链】
+    echo -e "${BLUE}[信息]${RESET} 正在为 Alpine 升级完整版 iproute2 策略路由工具箱..."
+    apk add --no-cache iproute2 iptables >/dev/null 2>&1
     step "检查 tun2socks 服务当前状态..."
     if rc-service tun2socks status 2>/dev/null | grep -q "started"; then
         info "检测到 tun2socks 旧进程正在运行，正在将其安全终止..."
@@ -834,14 +902,44 @@ install_tun2socks() {
     if ! set_dns64_servers "$RESOLV_CONF" "$WAS_IMMUTABLE" "$RESOLV_CONF_BAK"; then return 1; fi
 
     local BINARY_PATH="/usr/local/bin/tun2socks"
-    step "从 GitHub 获取最新 Release 核心下载地址..."
-    local DOWNLOAD_URL=$(curl -s https://api.github.com/repos/$REPO_TUN2SOCKS/releases/latest | grep "browser_download_url" | grep "linux-x86_64" | cut -d '"' -f 4)
+
+    # ====================================================================
+    # 【核心修正 1】通过代理池轮询获取 GitHub API 核心数据
+    # ====================================================================
+    step "从 GitHub 获取最新 Release 核心下载地址 (自适应 IPv6)..."
+    local raw_api_url="https://api.github.com/repos/$REPO_TUN2SOCKS/releases/latest"
+    local latest_release_json=""
+    
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local final_api_url="${proxy}${raw_api_url}"
+        info "正在尝试通过 [ ${proxy:-原生直连} ] 请求 GitHub API..."
+        latest_release_json=$(curl -g -6 -s -m 15 "$final_api_url" || echo "")
+        if echo "$latest_release_json" | grep -q "browser_download_url"; then
+            success "成功获取到 Tun2Socks GitHub Release 元数据！"
+            break
+        fi
+    done
+
+    # ====================================================================
+    # 【核心修正 2】动态判断系统架构并放宽正则匹配（完美兼容 linux-amd64）
+    # ====================================================================
+    local ARCH=$(uname -m)
+    local MATCH_KEY="linux-amd64"
+    if [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
+        MATCH_KEY="linux-arm64"
+    elif [[ "$ARCH" == "386" || "$ARCH" == "i386" ]]; then
+        MATCH_KEY="linux-386"
+    fi
+
+    # 运用扩展正则，通杀 linux-x86_64, linux-amd64 以及动态 MATCH_KEY 
+    local DOWNLOAD_URL=$(echo "$latest_release_json" | grep "browser_download_url" | grep -E "linux-x86_64|linux-amd64|${MATCH_KEY}" | head -n1 | cut -d '"' -f 4)
 
     if [ -z "$DOWNLOAD_URL" ]; then
-        error "未找到适用于 linux-x86_64 的核心下载链接，请检查 network。"
+        error "未能成功匹配到适用于当前架构 (${ARCH}) 的核心下载链接，请检查网络。"
         restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
         return 1
     fi
+    # ====================================================================
 
     step "正在通过代理池下载 GitHub 最新核心程序..."
     cleanup_on_fail() {
@@ -864,6 +962,30 @@ install_tun2socks() {
 
     step "正在初始化全局出口节点配置信息："
     write_tun2socks_config
+    step "正在初始化全局出口节点配置信息："
+    write_tun2socks_config
+
+    # ====================================================================
+    # 【救命代码】强行补齐并激活 Alpine (LXC/OpenVZ) 环境的 TUN 虚拟设备大门
+    # ====================================================================
+    step "正在强行补齐 Alpine 系统的 TUN 核心虚拟设备..."
+    
+    # 1. 创建网卡设备目录
+    mkdir -p /dev/net
+    
+    # 2. 如果设备不存在，强行用 mknod 在主设备号 10、次设备号 200 上创建字符设备
+    if [ ! -c /dev/net/tun ]; then
+        rm -f /dev/net/tun >/dev/null 2>&1  # 防止有死节点残留
+        mknod /dev/net/tun c 10 200
+    fi
+    
+    # 3. 必须赋予 666 读写权限，否则非 root 或守护进程无权调用它
+    chmod 666 /dev/net/tun
+    
+    # 4. 尝试向 Alpine 内核塞入 tun 模块（KVM架构有效，LXC会静默跳过）
+    modprobe tun >/dev/null 2>&1 || true
+    # ====================================================================
+
     step "正在动态计算并生成 Alpine 守护服务 (OpenRC)..."
     generate_openrc_script
     rc-update add tun2socks default 2>/dev/null
@@ -874,7 +996,6 @@ install_tun2socks() {
         return 1
     }
 }
-
 uninstall_tun2socks() {
     cleanup_ip_rules
     step "正在停止并彻底禁用后台 OpenRC tun2socks 服务..."

@@ -25,6 +25,16 @@ ALTERNATE_DNS64_SERVERS=(
     "2001:67c:2b0::6"
 )
 
+# GITHUB 代理加速池（自动循环尝试，最后一个为空代表原生直连兜底）
+GITHUB_PROXY=(
+    'https://v6.gh-proxy.org/'
+    'https://gh-proxy.com/'
+    'https://hub.glowp.xyz/'
+    'https://proxy.vvvv.ee/'
+    'https://ghproxy.lvedong.eu.org/'
+    ''
+)
+
 #================================================================================
 # 日志和底层工具函数
 #================================================================================
@@ -122,7 +132,6 @@ EOF
 
 cleanup_ip_rules() {
     step "正在强行清理底层残留的 IP 规则和旧路由..."
-    # 确保使用完整的 iproute2 工具，规避 Busybox 参数不全问题
     ip rule del fwmark 438 lookup main pref 10 2>/dev/null || true
     ip -6 rule del fwmark 438 lookup main pref 10 2>/dev/null || true
     ip route del default dev tun0 table 20 2>/dev/null || true
@@ -138,7 +147,6 @@ cleanup_ip_rules() {
     ip rule del to 127.0.0.1 lookup main pref 4 2>/dev/null || true
     ip -6 rule del to ::1 lookup main pref 4 2>/dev/null || true
     
-    # 动态清除由端口触发的防回环规则
     local cfg="/etc/tun2socks/config.yaml"
     if [ -f "$cfg" ]; then
         local p=$(grep -E '^[[:space:]]*port:' "$cfg" | head -n1 | awk '{print $2}' | tr -d "'\"")
@@ -151,6 +159,36 @@ cleanup_ip_rules() {
     while ip -6 rule del pref 5 2>/dev/null; do true; done
 
     success "IP 基础路由规则全面洗净。"
+}
+
+#================================================================================
+# 核心下载代理轮询逻辑
+#================================================================================
+download_with_proxy() {
+    local target_path=$1
+    local raw_url=$2
+    local success_flag=1
+
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local final_url="${proxy}${raw_url}"
+        if [ -z "$proxy" ]; then
+            info "正在尝试通过 [ 原生直连 ] 下载..."
+        else
+            info "正在尝试通过加速代理 [ ${proxy} ] 下载..."
+        fi
+
+        # 执行下载，加入超时限制防止卡死
+        if curl -L -m 45 -f -o "$target_path" "$final_url"; then
+            success "文件下载成功！"
+            success_flag=0
+            break
+        else
+            warning "当前下载通道失败，正在尝试下一个..."
+            [ -f "$target_path" ] && rm -f "$target_path"
+        fi
+    done
+
+    return $success_flag
 }
 
 #================================================================================
@@ -168,26 +206,30 @@ write_config_file() {
         current_pass=$(grep -E '^[[:space:]]*password:' "$CONFIG_FILE" | head -n1 | awk '{print $2}' | tr -d "'\"")
     fi
 
-    # 1. 节点地址
     local input_addr
     while true; do
         if [ -n "$current_addr" ]; then
-            read -r -p "请输入Socks5服务器地址 [$current_addr]: " input_addr
+            echo -ne "${GREEN}请输入Socks5服务器地址 [$current_addr]: ${RESET}"
+            read -r input_addr
             [ -z "$input_addr" ] && input_addr=$current_addr
         else
-            read -r -p "请输入Socks5服务器地址 (本地 WARP 请输 127.0.0.1): " input_addr
+            echo -ne "${GREEN}请输入Socks5服务器地址 (直接回车默认 127.0.0.1): ${RESET}"
+            read -r input_addr
+            [ -z "$input_addr" ] && input_addr="127.0.0.1"
         fi
         if [ -n "$input_addr" ]; then break; else error "服务器地址不能为空。"; fi
     done
 
-    # 2. 节点端口
     local input_port
     while true; do
         if [ -n "$current_port" ]; then
-            read -r -p "请输入Socks5服务器端口 [$current_port]: " input_port
+            echo -ne "${GREEN}请输入Socks5服务器端口 [$current_port]: ${RESET}"
+            read -r input_port
             [ -z "$input_port" ] && input_port=$current_port
         else
-            read -r -p "请输入Socks5服务器端口 (WARP 默认通常为 40000 或 1080): " input_port
+            echo -ne "${GREEN}请输入Socks5服务器端口 (直接回车默认 1080): ${RESET}"
+            read -r input_port
+            [ -z "$input_port" ] && input_port="1080"
         fi
         if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
             break
@@ -196,7 +238,6 @@ write_config_file() {
         fi
     done
 
-    # 3. 用户名
     local input_user
     if [ -n "$current_user" ]; then
         read -r -p "请输入用户名 (回车保持现状, 彻底清空请输入 none) [$current_user]: " input_user
@@ -206,7 +247,6 @@ write_config_file() {
         read -r -p "请输入用户名 (WARP无需验证直接留空回车): " input_user
     fi
 
-    # 4. 密码
     local input_pass
     if [ -n "$input_user" ]; then
         if [ -n "$current_pass" ]; then
@@ -220,12 +260,12 @@ write_config_file() {
         input_pass=""
     fi
 
-    # 过滤掉回车符并规范格式
     input_addr=$(echo "$input_addr" | tr -d '\r' | sed "s/'/''/g")
     input_port=$(echo "$input_port" | tr -d '\r')
     input_user=$(echo "$input_user" | tr -d '\r' | sed "s/'/''/g")
     input_pass=$(echo "$input_pass" | tr -d '\r' | sed "s/'/''/g")
 
+    # 保持 hev-socks5-tunnel 的纯正配置格式，死死锁住 mark: 438
     cat > "$CONFIG_FILE" <<EOF
 tunnel:
   name: tun0
@@ -312,12 +352,12 @@ update_core_binary() {
     fi
 
     step "正在下载官方最新编译核心..."
-    if curl -L -o "/usr/local/bin/tun2socks" "$download_url"; then
-        chmod +x "/usr/local/bin/tun2socks"
-        success "核心程序成功升级至 $latest_version ！"
-    else
-        error "下载核心程序失败，请检查网络。"
+    if ! download_with_proxy "/usr/local/bin/tun2socks" "$download_url"; then
+        error "所有下载通道均失败，请检查网络。"
+        restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$was_immutable"
+        return 1
     fi
+    chmod +x "/usr/local/bin/tun2socks"
 
     restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$was_immutable"
 
@@ -328,16 +368,16 @@ update_core_binary() {
 }
 
 #================================================================================
-# OpenRC 动态路由控制逻辑（核心适配部分）
+# OpenRC 动态路由控制逻辑
 #================================================================================
 generate_openrc_script() {
     local SERVICE_FILE="/etc/init.d/tun2socks"
     local TARGET_CONFIG="/etc/tun2socks/config.yaml"
     
+    # 从正常的 socks5 字段中精准提取端口
     local WARP_PORT=$(grep -E '^[[:space:]]*port:' "$TARGET_CONFIG" | head -n1 | awk '{print $2}' | tr -d "'\"")
     [ -z "$WARP_PORT" ] && WARP_PORT="1080"
 
-    # 使用更加健壮的符合 Busybox/GNU 兼容的 ip get 字段解析
     local MAIN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}')
     local MAIN_IP6=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | grep -oE 'src [a-fA-F0-9:]+' | awk '{print $2}')
 
@@ -357,7 +397,6 @@ depend() {
 }
 
 start_post() {
-    # 限制解除
     ulimit -n 524288
 
     # 1. SSH 防断网路由策略 (保持22端口直连原生网卡)
@@ -366,58 +405,53 @@ start_post() {
     ip -6 rule add to ::/0 dport 22 lookup main pref 5
     ip -6 rule add to ::/0 sport 22 lookup main pref 5
 
-    # 2. CF WARP 本地回环防死循环策略
-    ip rule add to 127.0.0.1 lookup main pref 4
+    # 2. 本地回环与内网保留网段直连放行
+    ip rule add to 127.0.0.0/8 lookup main pref 4
     ip -6 rule add to ::1 lookup main pref 4
-    ip rule add to 127.0.0.1 dport ${WARP_PORT} lookup main pref 4
+    ip rule add to 10.0.0.0/8 lookup main pref 16
+    ip rule add to 172.16.0.0/12 lookup main pref 16
+    ip rule add to 192.168.0.0/16 lookup main pref 16
 
-    # 3. 核心代理全局流量重定向
+    # 3. 核心大招：凡是带有 hev-socks5-tunnel 标记(438)的流量，强制丢回 main 路由表，粉碎死循环
     ip rule add fwmark 438 lookup main pref 10
     ip -6 rule add fwmark 438 lookup main pref 10
-    ip route add default dev tun0 table 20
-    ip rule add lookup 20 pref 20
 
     # 4. 主网卡原路返回路由
     [ -n "${MAIN_IP}" ] && ip rule add from ${MAIN_IP} lookup main pref 15
     [ -n "${MAIN_IP6}" ] && ip -6 rule add from ${MAIN_IP6} lookup main pref 15
 
-    # 5. 内网保留网段直连放行
-    ip rule add to 127.0.0.0/8 lookup main pref 16
-    ip rule add to 10.0.0.0/8 lookup main pref 16
-    ip rule add to 172.16.0.0/12 lookup main pref 16
-    ip rule add to 192.168.0.0/16 lookup main pref 16
+    # 5. 核心全局流量重定向（扔进 tun0）
+    ip route add default dev tun0 table 20 2>/dev/null || ip route replace default dev tun0 table 20
+    ip rule add lookup 20 pref 20
+
     return 0
 }
 
 stop_post() {
-    # 清理所有底层路由规则
     ip rule del to 0.0.0.0/0 dport 22 lookup main pref 5 2>/dev/null
     ip rule del to 0.0.0.0/0 sport 22 lookup main pref 5 2>/dev/null
     ip -6 rule del to ::/0 dport 22 lookup main pref 5 2>/dev/null
     ip -6 rule del to ::/0 sport 22 lookup main pref 5 2>/dev/null
 
-    ip rule del to 127.0.0.1 lookup main pref 4 2>/dev/null
+    ip rule del to 127.0.0.0/8 lookup main pref 4 2>/dev/null
     ip -6 rule del to ::1 lookup main pref 4 2>/dev/null
-    ip rule del to 127.0.0.1 dport ${WARP_PORT} lookup main pref 4 2>/dev/null
+    ip rule del to 10.0.0.0/8 lookup main pref 16 2>/dev/null
+    ip rule del to 172.16.0.0/12 lookup main pref 16 2>/dev/null
+    ip rule del to 192.168.0.0/16 lookup main pref 16 2>/dev/null
 
     ip rule del fwmark 438 lookup main pref 10 2>/dev/null
     ip -6 rule del fwmark 438 lookup main pref 10 2>/dev/null
-    ip route del default dev tun0 table 20 2>/dev/null
-    ip rule del lookup 20 pref 20 2>/dev/null
 
     [ -n "${MAIN_IP}" ] && ip rule del from ${MAIN_IP} lookup main pref 15 2>/dev/null
     [ -n "${MAIN_IP6}" ] && ip -6 rule del from ${MAIN_IP6} lookup main pref 15 2>/dev/null
 
-    ip rule del to 127.0.0.0/8 lookup main pref 16 2>/dev/null
-    ip rule del to 10.0.0.0/8 lookup main pref 16 2>/dev/null
-    ip rule del to 172.16.0.0/12 lookup main pref 16 2>/dev/null
-    ip rule del to 192.168.0.0/16 lookup main pref 16 2>/dev/null
+    ip route del default dev tun0 table 20 2>/dev/null
+    ip rule del lookup 20 pref 20 2>/dev/null
     return 0
 }
 EOF
     chmod +x "$SERVICE_FILE"
 }
-
 install_tun2socks() {
     cleanup_ip_rules
 
@@ -457,14 +491,22 @@ install_tun2socks() {
         return 1
     fi
 
-    step "正在下载 GitHub 最新发布版官方核心程序..."
+    step "正在通过代理池下载 GitHub 最新核心程序..."
     cleanup_on_fail() {
         trap - INT TERM EXIT
         restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
         return 1
     }
     trap cleanup_on_fail INT TERM EXIT
-    curl -L -o "$BINARY_PATH" "$DOWNLOAD_URL"
+    
+    # 调用代理链轮询下载
+    if ! download_with_proxy "$BINARY_PATH" "$DOWNLOAD_URL"; then
+        error "所有代理通道下载失败。"
+        trap - INT TERM EXIT
+        restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
+        return 1
+    fi
+    
     trap - INT TERM EXIT
 
     restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
@@ -479,7 +521,7 @@ install_tun2socks() {
     rc-update add tun2socks default 2>/dev/null
     
     step "正在自动拉起全局 network 代理隧道..."
-    rc-service tun2socks start && success "Tun2Socks 环境配置完毕！已完美兼容本地 CF WARP 节点。" || {
+    rc-service tun2socks start && success "Tun2Socks 环境配置完毕！" || {
         error "自动启动隧道服务失败！请查看 /var/log/tun2socks.err 排查原因。"
         return 1
     }
@@ -561,7 +603,6 @@ test_exit_ip() {
         success "测试成功！隧道网络双向畅通。"
     else
         error "获取失败。请检查后台服务状态或 WARP 运行日志。"
-        info "提示：本地可能触发了内核反向路由过滤(rp_filter)，建议尝试运行：curl https://myip.ipip.net 测试。"
     fi
 }
 
@@ -574,7 +615,7 @@ panel_menu() {
         get_status
         clear
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}  Alpine OpenRC 代理管理面板   ${RESET}"
+        echo -e "${GREEN}       Tun2Socks 管理面板       ${RESET}"
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN}状态   :${RESET} $status_show"
         echo -e "${GREEN}版本   :${RESET} $version_show"

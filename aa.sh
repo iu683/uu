@@ -1,816 +1,637 @@
 #!/bin/bash
-# Hermes Agent 终端管理脚本
-# 颜色定义 (适配 ACME 风格命名)
+set -e
+
+#================================================================================
+# 常量和全局变量定义
+#================================================================================
+REPO="heiher/hev-socks5-tunnel"
+
+# 颜色高亮定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m'
 RESET='\033[0m'
-NC='\033[0m' # 兼容脚本中使用的 NC 变量
 
-# 确保 hermes 命令可用 (处理环境变量未加载的情况)
-if ! command -v hermes >/dev/null 2>&1; then
-    if [ -d "$HOME/.hermes/hermes-agent/venv/bin" ]; then
-        export PATH="$HOME/.hermes/hermes-agent/venv/bin:$PATH"
-    fi
-fi
+# 备用 DNS64 服务器（专门解决纯 IPv6/机房环境下载问题）
+ALTERNATE_DNS64_SERVERS=(
+    "2a00:1098:2b::1"
+    "2a01:4f8:c2c:123f::1"
+    "2a01:4f9:c010:3f02::1"
+    "2001:67c:2b0::4"
+    "2001:67c:2b0::6"
+)
 
-# 环境路径刷新函数
-refresh_hermes_path() {
-    if [ -f "$HOME/.bashrc" ]; then
-        source "$HOME/.bashrc"
-    elif [ -f "$HOME/.zshrc" ]; then
-        source "$HOME/.zshrc"
+#================================================================================
+# 日志和底层工具函数
+#================================================================================
+info() { echo -e "${BLUE}[信息]${NC} $1"; }
+success() { echo -e "${GREEN}[成功]${NC} $1"; }
+warning() { echo -e "${YELLOW}[警告]${NC} $1"; }
+error() { echo -e "${RED}[错误]${NC} $1"; }
+step() { echo -e "${PURPLE}[步骤]${NC} $1"; }
+
+require_root() {
+    if [ "$EUID" -ne 0 ]; then
+        error "请使用 root 权限运行此脚本，例如: sudo $0"
+        exit 1
     fi
-    export PATH="$HOME/.local/bin:$HOME/.hermes/hermes-agent/venv/bin:$PATH"
 }
 
-# --- 科技lion 增强版 API 管理核心 ---
-CONFIG_FILE="$HOME/.hermes/config.yaml"
-
-config_tool() {
-    # 自动适配 CONFIG_FILE 路径
-    if [ ! -f "$CONFIG_FILE" ]; then
-        local p
-        for p in "/root/.hermes/config.yaml" /home/*/.hermes/config.yaml; do
-            if [ -f "$p" ]; then
-                CONFIG_FILE="$p"
-                break
-            fi
-        done
+test_dns64_server() {
+    local dns_server=$1
+    step "正在测试DNS64服务器 $dns_server 的连通性..."
+    if ping6 -c 3 -W 2 "$dns_server" &>/dev/null; then
+        info "DNS64服务器 $dns_server 可达。"
+        return 0
+    else
+        warning "DNS64服务器 $dns_server 不可达。"
+        return 1
     fi
+}
 
-    # 寻找可用的 Python 解释器，优先使用带有 pyyaml (yaml) 的环境
-    local python_bin=""
+test_github_access() {
+    step "正在测试GitHub访问..."
+    if curl -s -I -m 10 https://github.com >/dev/null; then
+        success "GitHub访问测试成功。"
+        return 0
+    else
+        warning "GitHub访问测试失败。"
+        return 1
+    fi
+}
 
-    # 1. 尝试从 command -v hermes 指向的文件的 shebang/内容中提取 python 路径
-    local hermes_cmd
-    hermes_cmd=$(command -v hermes)
-    if [ -n "$hermes_cmd" ] && [ -f "$hermes_cmd" ]; then
-        # A. 检查第一行是否是 shebang
-        local shebang
-        shebang=$(head -n 1 "$hermes_cmd" 2>/dev/null)
-        if [[ "$shebang" =~ ^#\! ]]; then
-            local potential_py="${shebang#\#!}"
-            if [ -f "$potential_py" ]; then
-                if "$potential_py" -c "import yaml" >/dev/null 2>&1; then
-                    python_bin="$potential_py"
-                fi
-            fi
+restore_dns_config() {
+    local resolv_conf=$1
+    local resolv_conf_bak=$2
+    local was_immutable=$3
+
+    step "恢复原始 DNS 配置..."
+    if [ -f "$resolv_conf_bak" ]; then
+        mv "$resolv_conf_bak" "$resolv_conf"
+        success "DNS 配置已恢复。"
+        if [ "$was_immutable" = true ]; then
+            info "重新锁定 /etc/resolv.conf..."
+            chattr +i "$resolv_conf" || warning "无法重新锁定 /etc/resolv.conf。"
+            success "锁定完成。"
         fi
-        # B. 检查是否是 Bash wrapper，追踪其实际指向的 bin 并提取 python3
-        if [ -z "$python_bin" ]; then
-            local wrapped_bin
-            wrapped_bin=$(grep -Eo '"/[^"]+/venv/bin/hermes"' "$hermes_cmd" | tr -d '"' | head -n 1)
-            if [ -z "$wrapped_bin" ]; then
-                wrapped_bin=$(grep -Eo '/[a-zA-Z0-9_\.\-]+/hermes-agent/venv/bin/hermes' "$hermes_cmd" | head -n 1)
-            fi
-            if [ -n "$wrapped_bin" ] && [ -f "$wrapped_bin" ]; then
-                local wrapped_shebang
-                wrapped_shebang=$(head -n 1 "$wrapped_bin" 2>/dev/null)
-                if [[ "$wrapped_shebang" =~ ^#\! ]]; then
-                    local potential_py="${wrapped_shebang#\#!}"
-                    if [ -f "$potential_py" ] && "$potential_py" -c "import yaml" >/dev/null 2>&1; then
-                        python_bin="$potential_py"
-                    fi
-                fi
-                if [ -z "$python_bin" ]; then
-                    local potential_py="${wrapped_bin%/hermes}/python3"
-                    if [ -f "$potential_py" ] && "$potential_py" -c "import yaml" >/dev/null 2>&1; then
-                        python_bin="$potential_py"
-                    fi
-                fi
-            fi
+    else
+        warning "未找到 DNS 备份文件 ($resolv_conf_bak)，无法自动恢复。"
+        if [ "$was_immutable" = true ]; then
+             warning "尝试锁定当前的 /etc/resolv.conf..."
+             chattr +i "$resolv_conf" || warning "无法锁定 /etc/resolv.conf。"
         fi
     fi
+}
 
-    # 2. 尝试从常见绝对路径查找
-    if [ -z "$python_bin" ]; then
-        local paths=(
-            "$HOME/.hermes/hermes-agent/venv/bin/python3"
-            "$HOME/.hermes/hermes-agent/venv/bin/python"
-            "/root/.hermes/hermes-agent/venv/bin/python3"
-            "/root/.hermes/hermes-agent/venv/bin/python"
-            "/usr/local/lib/hermes-agent/venv/bin/python3"
-            "/usr/local/lib/hermes-agent/venv/bin/python"
-            "/usr/lib/hermes-agent/venv/bin/python3"
-            "/usr/lib/hermes-agent/venv/bin/python"
-            "$HOME/.hermes/hermes-agent/.venv/bin/python3"
-            "/root/.hermes/hermes-agent/.venv/bin/python3"
-            "/usr/local/lib/hermes-agent/.venv/bin/python3"
-            "/usr/lib/hermes-agent/.venv/bin/python3"
-            /home/*/.hermes/hermes-agent/venv/bin/python3
-            /home/*/.hermes/hermes-agent/venv/bin/python
-            /home/*/.hermes/hermes-agent/.venv/bin/python3
-        )
-        local p
-        for p in "${paths[@]}"; do
-            if [ -f "$p" ]; then
-                if "$p" -c "import yaml" >/dev/null 2>&1; then
-                    python_bin="$p"
-                    break
-                fi
+set_dns64_servers() {
+    local resolv_conf=$1
+    local was_immutable=$2
+    local resolv_conf_bak=$3
+    
+    step "设置 DNS64 服务器（用于无缝下载核心程序）..."
+    cat > "$resolv_conf" <<EOF
+nameserver 2602:fc59:b0:9e::64
+EOF
+    
+    if test_github_access; then
+        return 0
+    fi
+    
+    warning "主DNS64服务器访问GitHub失败，尝试备选DNS64服务器..."
+    for dns_server in "${ALTERNATE_DNS64_SERVERS[@]}"; do
+        if test_dns64_server "$dns_server"; then
+            step "使用备选DNS64服务器: $dns_server"
+            cat > "$resolv_conf" <<EOF
+nameserver $dns_server
+EOF
+            if test_github_access; then
+                success "使用备选DNS64服务器 $dns_server 成功访问GitHub。"
+                return 0
             fi
-        done
+        fi
+    done
+    
+    error "所有DNS64服务器测试失败，无法访问GitHub。"
+    restore_dns_config "$resolv_conf" "$resolv_conf_bak" "$was_immutable"
+    return 1
+}
+
+cleanup_ip_rules() {
+    step "正在强行清理底层残留的 IP 规则和旧路由..."
+    # 确保使用完整的 iproute2 工具，规避 Busybox 参数不全问题
+    ip rule del fwmark 438 lookup main pref 10 2>/dev/null || true
+    ip -6 rule del fwmark 438 lookup main pref 10 2>/dev/null || true
+    ip route del default dev tun0 table 20 2>/dev/null || true
+    ip rule del lookup 20 pref 20 2>/dev/null || true
+    ip rule del to 127.0.0.0/8 lookup main pref 16 2>/dev/null || true
+    ip rule del to 10.0.0.0/8 lookup main pref 16 2>/dev/null || true
+    ip rule del to 172.16.0.0/12 lookup main pref 16 2>/dev/null || true
+    ip rule del to 192.168.0.0/16 lookup main pref 16 2>/dev/null || true
+    ip rule del to 0.0.0.0/0 dport 22 lookup main pref 5 2>/dev/null || true
+    ip rule del to 0.0.0.0/0 sport 22 lookup main pref 5 2>/dev/null || true
+    ip -6 rule del to ::/0 dport 22 lookup main pref 5 2>/dev/null || true
+    ip -6 rule del to ::/0 sport 22 lookup main pref 5 2>/dev/null || true
+    ip rule del to 127.0.0.1 lookup main pref 4 2>/dev/null || true
+    ip -6 rule del to ::1 lookup main pref 4 2>/dev/null || true
+    
+    # 动态清除由端口触发的防回环规则
+    local cfg="/etc/tun2socks/config.yaml"
+    if [ -f "$cfg" ]; then
+        local p=$(grep -E '^[[:space:]]*port:' "$cfg" | head -n1 | awk '{print $2}' | tr -d "'\"")
+        [ -n "$p" ] && ip rule del to 127.0.0.1 dport "$p" lookup main pref 4 2>/dev/null || true
     fi
 
-    # 3. 兜底退回到系统全局 python3 或 python
-    if [ -z "$python_bin" ]; then
-        if command -v python3 >/dev/null 2>&1; then
-            python_bin="python3"
+    while ip rule del pref 15 2>/dev/null; do true; done
+    while ip -6 rule del pref 15 2>/dev/null; do true; done
+    while ip rule del pref 5 2>/dev/null; do true; done
+    while ip -6 rule del pref 5 2>/dev/null; do true; done
+
+    success "IP 基础路由规则全面洗净。"
+}
+
+#================================================================================
+# 配置核心读取与写入逻辑
+#================================================================================
+write_config_file() {
+    local CONFIG_FILE="/etc/tun2socks/config.yaml"
+    mkdir -p "/etc/tun2socks"
+
+    local current_addr="" current_port="" current_user="" current_pass=""
+    if [ -f "$CONFIG_FILE" ]; then
+        current_addr=$(grep -E '^[[:space:]]*address:' "$CONFIG_FILE" | head -n1 | awk '{print $2}' | tr -d "'\"")
+        current_port=$(grep -E '^[[:space:]]*port:' "$CONFIG_FILE" | head -n1 | awk '{print $2}' | tr -d "'\"")
+        current_user=$(grep -E '^[[:space:]]*username:' "$CONFIG_FILE" | head -n1 | awk '{print $2}' | tr -d "'\"")
+        current_pass=$(grep -E '^[[:space:]]*password:' "$CONFIG_FILE" | head -n1 | awk '{print $2}' | tr -d "'\"")
+    fi
+
+    # 1. 节点地址
+    local input_addr
+    while true; do
+        if [ -n "$current_addr" ]; then
+            read -r -p "请输入Socks5服务器地址 [$current_addr]: " input_addr
+            [ -z "$input_addr" ] && input_addr=$current_addr
         else
-            python_bin="python"
+            read -r -p "请输入Socks5服务器地址 (本地 WARP 请输 127.0.0.1): " input_addr
         fi
+        if [ -n "$input_addr" ]; then break; else error "服务器地址不能为空。"; fi
+    done
+
+    # 2. 节点端口
+    local input_port
+    while true; do
+        if [ -n "$current_port" ]; then
+            read -r -p "请输入Socks5服务器端口 [$current_port]: " input_port
+            [ -z "$input_port" ] && input_port=$current_port
+        else
+            read -r -p "请输入Socks5服务器端口 (WARP 默认通常为 40000 或 1080): " input_port
+        fi
+        if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
+            break
+        else
+            error "无效的端口号，请输入 1 到 65535 之间的数字。"
+        fi
+    done
+
+    # 3. 用户名
+    local input_user
+    if [ -n "$current_user" ]; then
+        read -r -p "请输入用户名 (回车保持现状, 彻底清空请输入 none) [$current_user]: " input_user
+        [ -z "$input_user" ] && input_user=$current_user
+        [ "$input_user" = "none" ] && input_user=""
+    else
+        read -r -p "请输入用户名 (WARP无需验证直接留空回车): " input_user
     fi
 
-    $python_bin - "$CONFIG_FILE" "$@" <<'EOF'
-import sys, yaml, json, os
+    # 4. 密码
+    local input_pass
+    if [ -n "$input_user" ]; then
+        if [ -n "$current_pass" ]; then
+            read -r -p "请输入密码 (回车保持现状, 彻底清空请输入 none) [$current_pass]: " input_pass
+            [ -z "$input_pass" ] && input_pass=$current_pass
+            [ "$input_pass" = "none" ] && input_pass=""
+        else
+            read -r -p "请输入密码 (可选，无验证直接留空回车): " input_pass
+        fi
+    else
+        input_pass=""
+    fi
 
-path = sys.argv[1]
-action = sys.argv[2]
+    # 过滤掉回车符并规范格式
+    input_addr=$(echo "$input_addr" | tr -d '\r' | sed "s/'/''/g")
+    input_port=$(echo "$input_port" | tr -d '\r')
+    input_user=$(echo "$input_user" | tr -d '\r' | sed "s/'/''/g")
+    input_pass=$(echo "$input_pass" | tr -d '\r' | sed "s/'/''/g")
 
-def load():
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            return yaml.safe_load(f) or {}
-    except:
-        return {}
+    cat > "$CONFIG_FILE" <<EOF
+tunnel:
+  name: tun0
+  mtu: 1500
+  multi-queue: true
+  ipv4: 198.18.0.1
 
-def save(d):
-    with open(path, 'w', encoding='utf-8') as f:
-        yaml.dump(d, f, sort_keys=False, allow_unicode=True)
-
-try:
-    data = load()
-    if action == "get_info":
-        m = data.get('model', {})
-        res = {"m": m.get('default', '-'), "p": m.get('provider', '-'), "u": m.get('base_url', '-')}
-        print(json.dumps(res))
-    
-    elif action == "list_p":
-        print(json.dumps(data.get('custom_providers', [])))
-    
-    elif action == "add_p":
-        n, u, k, m = sys.argv[3:7]
-        ps = data.get('custom_providers', [])
-        if not isinstance(ps, list): ps = []
-        ps = [p for p in ps if p.get('name') != n]
-        ps.append({"name": n, "base_url": u, "api_key": k, "model": m})
-        data['custom_providers'] = ps
-        save(data)
-    
-    elif action == "bulk_add":
-        n_base, u, k, models_json = sys.argv[3:7]
-        new_m_ids = json.loads(models_json)
-        ps = data.get('custom_providers', [])
-        if not isinstance(ps, list): ps = []
-        ps = [p for p in ps if not (isinstance(p, dict) and p.get('name', '').startswith(n_base + "/"))]
-        ps = [p for p in ps if p.get('name') != n_base]
-        for m_id in new_m_ids:
-            ps.append({"name": f"{n_base}/{m_id}", "base_url": u, "api_key": k, "model": m_id})
-        data['custom_providers'] = ps
-        save(data)
-    
-    elif action == "del_p":
-        n = sys.argv[3]
-        ps = data.get('custom_providers', [])
-        if isinstance(ps, list):
-            data['custom_providers'] = [p for p in ps if p.get('name') != n and not p.get('name', '').startswith(n + "/")]
-            save(data)
-
-    elif action == "list_groups":
-        ps = data.get('custom_providers', [])
-        groups = []
-        seen = set()
-        for p in (ps if isinstance(ps, list) else []):
-            name = p.get('name', '')
-            g = name.split('/')[0] if '/' in name else name
-            if g and g not in seen:
-                seen.add(g)
-                cnt = sum(1 for x in ps if x.get('name', '') == g or x.get('name', '').startswith(g + '/'))
-                groups.append({"name": g, "count": cnt})
-        print(json.dumps(groups))
-    
-    elif action == "list_groups_latency":
-        import threading, urllib.request, time
-        ps = data.get('custom_providers', [])
-        groups = {}
-        for p in (ps if isinstance(ps, list) else []):
-            name = p.get('name', '')
-            g = name.split('/')[0] if '/' in name else name
-            if g not in groups:
-                groups[g] = {'name': g, 'base_url': p.get('base_url', ''), 'api_key': p.get('api_key', ''), 'count': 0}
-            groups[g]['count'] += 1
-        results = {}
-        def worker(g, url, key):
-            if not url or not (url.startswith('http://') or url.startswith('https://')):
-                results[g] = "N/A"
-                return
-            start = time.time()
-            try:
-                url = url.rstrip('/') + '/models'
-                req = urllib.request.Request(url, headers={'Authorization': f'Bearer {key}'} if key else {})
-                with urllib.request.urlopen(req, timeout=1.5) as r:
-                    r.read()
-                results[g] = f"{int((time.time() - start) * 1000)}ms"
-            except urllib.error.HTTPError:
-                results[g] = f"{int((time.time() - start) * 1000)}ms"
-            except Exception:
-                results[g] = "timeout"
-        threads = []
-        for g, info in groups.items():
-            t = threading.Thread(target=worker, args=(g, info['base_url'], info['api_key']))
-            t.start()
-            threads.append(t)
-        for t in threads:
-            t.join()
-        out = []
-        for g, info in groups.items():
-            out.append({'name': g, 'base_url': info['base_url'], 'count': info['count'], 'latency': results.get(g, 'N/A')})
-        print(json.dumps(out))
-    elif action == "switch":
-        n, u, k, m = sys.argv[3:7]
-        data['model'] = {"default": m, "provider": "custom", "base_url": u, "api_key": k}
-        save(data)
-
-except Exception as e:
-    print(json.dumps([]))
-    sys.exit(1)
+socks5:
+  port: $input_port
+  address: '$input_addr'
+  udp: 'udp'
+$( [ -n "$input_user" ] && echo "  username: '$input_user'" )
+$( [ -n "$input_pass" ] && echo "  password: '$input_pass'" )
+  mark: 438
 EOF
 }
 
-# --- 底层模型探测业务函数组 ---
-hermes_model_probe() {
-    local target_name="$1"
-    local json_data="$2"
+change_config() {
+    info "开始修改 Socks5 节点配置（直接回车则保持现状不变）："
+    echo "--------------------------------------------------------"
+    write_config_file
+    success "节点配置文件更新成功！"
     
-    HERMES_PROBE_MESSAGE="检测中..."
-    HERMES_PROBE_LATENCY="0ms"
-    HERMES_PROBE_REPLY="无响应"
+    if rc-service tun2socks status 2>/dev/null | grep -q "started"; then
+        step "检测到服务正在后台运行，正在自动重启以应用新配置..."
+        rc-service tun2socks restart && success "重启成功，新节点配置已生效。" || error "重启失败，请检查服务状态。"
+    fi
+}
 
-    local matched_entry
-    matched_entry=$(echo "$json_data" | jq -c --arg n "$target_name" '.[] | select(.name == $n)')
-    if [ -z "$matched_entry" ]; then
-        HERMES_PROBE_MESSAGE="未配置该模型"
+#================================================================================
+# 选项 2：全自动升级核心
+#================================================================================
+update_core_binary() {
+    if [ ! -f "/usr/local/bin/tun2socks" ]; then
+        error "检测到您尚未安装 Tun2Socks 环境，请先使用选项 1 进行初始化安装！"
         return 1
     fi
 
-    local p_url p_key p_model
-    p_url=$(echo "$matched_entry" | jq -r .base_url)
-    p_key=$(echo "$matched_entry" | jq -r .api_key)
-    p_model=$(echo "$matched_entry" | jq -r .model)
+    step "正在连接 GitHub 检查最新 Release Version..."
+    local latest_release_json=$(curl -s https://api.github.com/repos/$REPO/releases/latest)
+    local latest_version=$(echo "$latest_release_json" | grep '"tag_name":' | cut -d '"' -f 4)
+    local download_url=$(echo "$latest_release_json" | grep "browser_download_url" | grep "linux-x86_64" | cut -d '"' -f 4)
 
-    local start_time end_time
-    start_time=$(date +%s%N 2>/dev/null || date +%s)
-    
-    local post_data
-    post_data=$(cat <<JSON
-{"model": "$p_model", "messages": [{"role": "user", "content": "ping"}], "max_tokens": 5}
-JSON
-)
-    local response
-    response=$(curl -s -m 5 -X POST "$p_url/chat/completions" \
-        -H "Content-Type: application/json" \
-        -H "Authorization: Bearer $p_key" \
-        -d "$post_data")
-
-    end_time=$(date +%s%N 2>/dev/null || date +%s)
-    
-    if [ "${#start_time}" -gt 10 ]; then
-        local delta=$(( (end_time - start_time) / 1000000 ))
-        HERMES_PROBE_LATENCY="${delta}ms"
-    else
-        HERMES_PROBE_LATENCY="无法精细统计"
+    if [ -z "$latest_version" ] || [ -z "$download_url" ]; then
+        error "无法从 GitHub 获取版本信息，网络可能受到干扰。"
+        return 1
     fi
 
-    if echo "$response" | grep -q "choices"; then
-        HERMES_PROBE_MESSAGE="可用"
-        HERMES_PROBE_REPLY=$(echo "$response" | jq -r '.choices[0].message.content' 2>/dev/null | tr -d '\n' | cut -c1-30)
+    local local_version="未知"
+    if [ -f "/usr/local/bin/tun2socks" ]; then
+        local_version=$(/usr/local/bin/tun2socks --version 2>&1 | grep "Version:" | awk '{print $2}')
+        [ -z "$local_version" ] && local_version="未知"
+    fi
+
+    info "本地核心版本: $local_version"
+    info "GitHub最新版本: $latest_version"
+
+    if [ "$local_version" = "$latest_version" ]; then
+        success "当前核心程序已是官方最新发布版，无需重复升级。"
         return 0
-    else
-        HERMES_PROBE_MESSAGE="异常"
-        HERMES_PROBE_REPLY=$(echo "$response" | jq -r '.error.message' 2>/dev/null || echo "HTTP请求不通过")
+    fi
+
+    warning "检测到新版本核心程序 ($latest_version)，开始全自动无缝升级..."
+
+    local RESOLV_CONF="/etc/resolv.conf"
+    local RESOLV_CONF_BAK="/etc/resolv.conf.bak"
+    local was_immutable=false
+
+    if lsattr -d "$RESOLV_CONF" 2>/dev/null | grep -q -- '-i-'; then
+        chattr -i "$RESOLV_CONF" || true
+        was_immutable=true
+    fi
+    cp "$RESOLV_CONF" "$RESOLV_CONF_BAK" || true
+
+    if ! set_dns64_servers "$RESOLV_CONF" "$was_immutable" "$RESOLV_CONF_BAK"; then
         return 1
     fi
-}
 
-hermes_probe_status_line() {
-    local flag="$1"
-    if [ "$flag" = "可用" ]; then
-        echo -e "核心状态: ${GREEN}● 连通正常${RESET}"
+    local is_running=false
+    if rc-service tun2socks status 2>/dev/null | grep -q "started"; then
+        is_running=true
+        step "正在暂停全局代理以准备替换核心二进制..."
+        rc-service tun2socks stop || true
+    fi
+
+    step "正在下载官方最新编译核心..."
+    if curl -L -o "/usr/local/bin/tun2socks" "$download_url"; then
+        chmod +x "/usr/local/bin/tun2socks"
+        success "核心程序成功升级至 $latest_version ！"
     else
-        echo -e "核心状态: ${RED}● 握手失败${RESET}"
+        error "下载核心程序失败，请检查网络。"
+    fi
+
+    restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$was_immutable"
+
+    if [ "$is_running" = true ]; then
+        step "正在恢复并重新启动全局代理..."
+        rc-service tun2socks start && success "隧道已成功恢复运行！" || error "重启失败。"
     fi
 }
 
-sync_api_provider_models() {
-    local p_name="$1"
-    echo -e "${YELLOW}正在下发异步拉取指令...${RESET}"
-    if [ -z "$p_name" ]; then
-        echo -e "全量拉取已开始。"
+#================================================================================
+# OpenRC 动态路由控制逻辑（核心适配部分）
+#================================================================================
+generate_openrc_script() {
+    local SERVICE_FILE="/etc/init.d/tun2socks"
+    local TARGET_CONFIG="/etc/tun2socks/config.yaml"
+    
+    local WARP_PORT=$(grep -E '^[[:space:]]*port:' "$TARGET_CONFIG" | head -n1 | awk '{print $2}' | tr -d "'\"")
+    [ -z "$WARP_PORT" ] && WARP_PORT="1080"
+
+    # 使用更加健壮的符合 Busybox/GNU 兼容的 ip get 字段解析
+    local MAIN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}')
+    local MAIN_IP6=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | grep -oE 'src [a-fA-F0-9:]+' | awk '{print $2}')
+
+    cat > "$SERVICE_FILE" <<EOF
+#!/sbin/openrc-run
+
+description="Tun2Socks Tunnel Service adapted for CF WARP on Alpine"
+supervisor="supervise-daemon"
+command="/usr/local/bin/tun2socks"
+command_args="/etc/tun2socks/config.yaml"
+output_log="/var/log/tun2socks.log"
+error_log="/var/log/tun2socks.err"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_post() {
+    # 限制解除
+    ulimit -n 524288
+
+    # 1. SSH 防断网路由策略 (保持22端口直连原生网卡)
+    ip rule add to 0.0.0.0/0 dport 22 lookup main pref 5
+    ip rule add to 0.0.0.0/0 sport 22 lookup main pref 5
+    ip -6 rule add to ::/0 dport 22 lookup main pref 5
+    ip -6 rule add to ::/0 sport 22 lookup main pref 5
+
+    # 2. CF WARP 本地回环防死循环策略
+    ip rule add to 127.0.0.1 lookup main pref 4
+    ip -6 rule add to ::1 lookup main pref 4
+    ip rule add to 127.0.0.1 dport ${WARP_PORT} lookup main pref 4
+
+    # 3. 核心代理全局流量重定向
+    ip rule add fwmark 438 lookup main pref 10
+    ip -6 rule add fwmark 438 lookup main pref 10
+    ip route add default dev tun0 table 20
+    ip rule add lookup 20 pref 20
+
+    # 4. 主网卡原路返回路由
+    [ -n "${MAIN_IP}" ] && ip rule add from ${MAIN_IP} lookup main pref 15
+    [ -n "${MAIN_IP6}" ] && ip -6 rule add from ${MAIN_IP6} lookup main pref 15
+
+    # 5. 内网保留网段直连放行
+    ip rule add to 127.0.0.0/8 lookup main pref 16
+    ip rule add to 10.0.0.0/8 lookup main pref 16
+    ip rule add to 172.16.0.0/12 lookup main pref 16
+    ip rule add to 192.168.0.0/16 lookup main pref 16
+    return 0
+}
+
+stop_post() {
+    # 清理所有底层路由规则
+    ip rule del to 0.0.0.0/0 dport 22 lookup main pref 5 2>/dev/null
+    ip rule del to 0.0.0.0/0 sport 22 lookup main pref 5 2>/dev/null
+    ip -6 rule del to ::/0 dport 22 lookup main pref 5 2>/dev/null
+    ip -6 rule del to ::/0 sport 22 lookup main pref 5 2>/dev/null
+
+    ip rule del to 127.0.0.1 lookup main pref 4 2>/dev/null
+    ip -6 rule del to ::1 lookup main pref 4 2>/dev/null
+    ip rule del to 127.0.0.1 dport ${WARP_PORT} lookup main pref 4 2>/dev/null
+
+    ip rule del fwmark 438 lookup main pref 10 2>/dev/null
+    ip -6 rule del fwmark 438 lookup main pref 10 2>/dev/null
+    ip route del default dev tun0 table 20 2>/dev/null
+    ip rule del lookup 20 pref 20 2>/dev/null
+
+    [ -n "${MAIN_IP}" ] && ip rule del from ${MAIN_IP} lookup main pref 15 2>/dev/null
+    [ -n "${MAIN_IP6}" ] && ip -6 rule del from ${MAIN_IP6} lookup main pref 15 2>/dev/null
+
+    ip rule del to 127.0.0.0/8 lookup main pref 16 2>/dev/null
+    ip rule del to 10.0.0.0/8 lookup main pref 16 2>/dev/null
+    ip rule del to 172.16.0.0/12 lookup main pref 16 2>/dev/null
+    ip rule del to 192.168.0.0/16 lookup main pref 16 2>/dev/null
+    return 0
+}
+EOF
+    chmod +x "$SERVICE_FILE"
+}
+
+install_tun2socks() {
+    cleanup_ip_rules
+
+    step "检查 tun2socks 服务当前状态..."
+    if rc-service tun2socks status 2>/dev/null | grep -q "started"; then
+        info "检测到 tun2socks 旧进程正在运行，正在将其安全终止..."
+        rc-service tun2socks stop || true
+    fi
+
+    RESOLV_CONF="/etc/resolv.conf"
+    RESOLV_CONF_BAK="/etc/resolv.conf.bak"
+    WAS_IMMUTABLE=false
+
+    step "检查 /etc/resolv.conf 文件属性状态..."
+    if lsattr -d "$RESOLV_CONF" 2>/dev/null | grep -q -- '-i-'; then
+        info "/etc/resolv.conf 文件当前被系统锁定，正在临时解除..."
+        chattr -i "$RESOLV_CONF" || { error "临时解锁 /etc/resolv.conf 失败"; exit 1; }
+        WAS_IMMUTABLE=true
+    fi
+
+    step "备份系统当前 DNS 配置..."
+    cp "$RESOLV_CONF" "$RESOLV_CONF_BAK" || true
+
+    if ! set_dns64_servers "$RESOLV_CONF" "$WAS_IMMUTABLE" "$RESOLV_CONF_BAK"; then
+        return 1
+    fi
+
+    INSTALL_DIR="/usr/local/bin"
+    BINARY_PATH="$INSTALL_DIR/tun2socks"
+
+    step "从 GitHub 获取最新 Release 核心下载地址..."
+    DOWNLOAD_URL=$(curl -s https://api.github.com/repos/$REPO/releases/latest | grep "browser_download_url" | grep "linux-x86_64" | cut -d '"' -f 4)
+
+    if [ -z "$DOWNLOAD_URL" ]; then
+        error "未找到适用于 linux-x86_64 的核心下载链接，请检查网络。"
+        restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
+        return 1
+    fi
+
+    step "正在下载 GitHub 最新发布版官方核心程序..."
+    cleanup_on_fail() {
+        trap - INT TERM EXIT
+        restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
+        return 1
+    }
+    trap cleanup_on_fail INT TERM EXIT
+    curl -L -o "$BINARY_PATH" "$DOWNLOAD_URL"
+    trap - INT TERM EXIT
+
+    restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
+    chmod +x "$BINARY_PATH"
+
+    step "正在初始化全局出口节点配置信息："
+    write_config_file
+
+    step "正在动态计算并生成 Alpine 守护服务 (OpenRC)..."
+    generate_openrc_script
+
+    rc-update add tun2socks default 2>/dev/null
+    
+    step "正在自动拉起全局 network 代理隧道..."
+    rc-service tun2socks start && success "Tun2Socks 环境配置完毕！已完美兼容本地 CF WARP 节点。" || {
+        error "自动启动隧道服务失败！请查看 /var/log/tun2socks.err 排查原因。"
+        return 1
+    }
+}
+
+uninstall_tun2socks() {
+    cleanup_ip_rules
+    local SERVICE_FILE="/etc/init.d/tun2socks"
+    local CONFIG_DIR="/etc/tun2socks"
+    local BINARY_PATH="/usr/local/bin/tun2socks"
+
+    step "正在停止并彻底禁用后台 OpenRC tun2socks 服务..."
+    if rc-service tun2socks status 2>/dev/null | grep -q "started"; then
+        rc-service tun2socks stop
+    fi
+    rc-update del tun2socks default 2>/dev/null || true
+
+    step "正在清理系统残留组件文件..."
+    [ -f "$SERVICE_FILE" ] && rm -f "$SERVICE_FILE"
+    [ -d "$CONFIG_DIR" ] && rm -rf "$CONFIG_DIR"
+    [ -f "$BINARY_PATH" ] && rm -f "$BINARY_PATH"
+    
+    success "Tun2Socks 环境已彻底从系统卸载干净。"
+}
+
+get_status() {
+    if rc-service tun2socks status 2>/dev/null | grep -q "started"; then
+        status_show="${GREEN}已启动 (运行中)${RESET}"
     else
-        echo -e "正在向 ${p_name} 触发握手。"
+        status_show="${RED}已停止 (未运行)${RESET}"
     fi
-}
 
-install_gum() {
-    if command -v gum >/dev/null 2>&1; then return 0; fi
-    echo -e "${YELLOW}正在安装 gum (交互式选择器)...${RESET}"
-    if command -v apt >/dev/null 2>&1; then
-        mkdir -p /etc/apt/keyrings
-        rm -f /etc/apt/sources.list.d/charm.list
-        curl -fsSL https://repo.charm.sh/apt/gpg.key | gpg --dearmor -o /etc/apt/keyrings/charm.gpg 2>/dev/null
-        echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | tee /etc/apt/sources.list.d/charm.list > /dev/null
-        apt-get update -qq --allow-unauthenticated || true
-        apt-get install -y -qq gum || echo "⚠️ Gum 自动安装失败，将回退到普通菜单模式"
-    elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
-        cat > /etc/yum.repos.d/charm.repo <<'REPO'
-[charm]
-name=Charm
-baseurl=https://repo.charm.sh/yum/
-enabled=1
-gpgcheck=1
-gpgkey=https://repo.charm.sh/yum/gpg.key
-REPO
-        rpm --import https://repo.charm.sh/yum/gpg.key
-        if command -v dnf >/dev/null 2>&1; then dnf install -y gum; else yum install -y gum; fi
-    elif command -v zypper >/dev/null 2>&1; then
-        zypper --non-interactive install gum
-    fi
-}
-
-api_management_submenu() {
-    while true; do
-        clear
-        info=$(config_tool get_info)
-        echo -e "${BLUE}=======================================${NC}"
-        echo -e "      ${PURPLE}API & 模型管理 (OpenClaw 风格)${NC}"
-        echo -e "${BLUE}=======================================${NC}"
-        echo -e "${CYAN}当前激活模型:${NC} ${GREEN}$(echo $info | jq -r .m)${NC}"
-        echo -e "---------------------------------------"
-        echo -e "${CYAN}已配置 API 列表:${NC}"
-        local groups_lat_json
-        groups_lat_json=$(config_tool list_groups_latency)
-        if [ "$(echo "$groups_lat_json" | jq '. | length' 2>/dev/null)" -eq 0 ] 2>/dev/null || [ -z "$groups_lat_json" ]; then
-            echo -e "  ${YELLOW}(暂无配置)${NC}"
+    if [ -f "/usr/local/bin/tun2socks" ]; then
+        local version_raw=""
+        version_raw=$(/usr/local/bin/tun2socks --version 2>&1 | grep "Version:" | awk '{print $2}')
+        if [ -n "$version_raw" ]; then
+            version_show="${YELLOW}v${version_raw}${RESET}"
         else
-            while read -r row; do
-                local g_name g_url g_count g_latency lat_color lat_num
-                g_name=$(echo "$row" | jq -r .name)
-                g_url=$(echo "$row" | jq -r .base_url)
-                g_count=$(echo "$row" | jq -r .count)
-                g_latency=$(echo "$row" | jq -r .latency)
-                lat_color="${GREEN}"
-                if [ "$g_latency" = "timeout" ] || [ "$g_latency" = "N/A" ]; then
-                    lat_color="${RED}"
-                elif [[ "$g_latency" =~ ^[0-9]+ms$ ]]; then
-                    lat_num=$(echo "$g_latency" | tr -d 'ms')
-                    if [ "$lat_num" -gt 800 ]; then
-                        lat_color="${RED}"
-                    elif [ "$lat_num" -gt 300 ]; then
-                        lat_color="${YELLOW}"
-                    fi
-                fi
-                echo -e "  ● [${g_name}] (${g_count} 个模型) | 延迟: ${lat_color}${g_latency}${NC} | ${g_url}"
-            done < <(echo "$groups_lat_json" | jq -c '.[]')
+            version_show="${YELLOW}已安装${RESET}"
         fi
-        echo -e "---------------------------------------"
-        echo -e "1. ${YELLOW}切换模型 (带测速)${NC}"
-        echo -e "2. 添加 API 供应商 (自动同步)${NC}"
-        echo -e "3. ${YELLOW}同步 API 供应商模型列表${NC}"
-        echo -e "4. 删除 API 供应商"
-        echo -e "0. 返回主菜单"
-        echo -e "---------------------------------------"
-        read -p "选择序号: " sub_choice
-        case "$sub_choice" in
-            1)
-                local orange="#FF8C00"
-                local ps_json models_list model_count default_model selected_model confirm_switch
+    else
+        version_show="${RED}未安装${RESET}"
+    fi
 
-                ps_json=$(config_tool list_p)
-                model_count=$(echo "$ps_json" | jq '. | length')
+    if [ -f "/etc/tun2socks/config.yaml" ]; then
+        local port=$(grep -E '^[[:space:]]*port:' /etc/tun2socks/config.yaml | head -n1 | awk '{print $2}' | tr -d "'\"")
+        local addr=$(grep -E '^[[:space:]]*address:' /etc/tun2socks/config.yaml | head -n1 | awk '{print $2}' | tr -d "'\"")
+        port_show="${YELLOW}${addr}:${port}${RESET}"
+    else
+        port_show="${RED}无配置${RESET}"
+    fi
+}
 
-                if [ "$model_count" -eq 0 ] 2>/dev/null || [ -z "$model_count" ]; then
-                    echo -e "${RED}无 API 配置! 请先添加供应商。${NC}"
-                    sleep 1
-                    continue
-                fi
+test_exit_ip() {
+    step "正在通过全局代理隧道查询落地出口 IP..."
+    local ip_info=""
+    local test_urls=(
+        "https://api.ipify.org?format=json"
+        "https://ipinfo.io/json"
+        "https://ifconfig.me/all.json"
+    )
 
-                models_list=$(echo "$ps_json" | jq -r '.[].name' | awk '{print "(" NR ") " $0}')
-                default_model=$(config_tool get_info | jq -r .m)
-
-                while true; do
-                    clear
-                    install_gum
-
-                    if ! command -v gum >/dev/null 2>&1; then
-                        echo "--- 模型管理 ---"
-                        echo "当前可用模型："
-                        echo "$models_list"
-                        echo "当前默认：${default_model}"
-                        echo "----------------"
-                        read -e -p "请输入模型编号或名称 (输入 0 退出): " selected_model
-
-                        if [ "$selected_model" = "0" ]; then
-                            break
-                        fi
-                        if [ -z "$selected_model" ]; then
-                            echo "错误：不能为空，请重试。"
-                            sleep 1
-                            continue
-                        fi
-                        if [[ "$selected_model" =~ ^[0-9]+$ ]]; then
-                            selected_model=$(echo "$ps_json" | jq -r --argjson i "$((selected_model-1))" '.[$i].name // empty')
-                            if [ -z "$selected_model" ]; then
-                                echo "序号无效，请重试。"
-                                sleep 1
-                                continue
-                            fi
-                        fi
-                    else
-                        gum style --foreground "$orange" --bold "模型管理"
-                        gum style --foreground "$orange" "可用模型：${model_count}"
-                        gum style --foreground "$orange" "当前默认：${default_model}"
-                        echo ""
-                        gum style --faint "↑↓ 选择 / 输入搜索 / Enter 测试 / Esc 退出"
-                        echo ""
-
-                        selected_model=$(echo "$models_list" | gum filter \
-                            --placeholder "搜索模型（如 cli-api/gpt-4o）" \
-                            --prompt "选择模型 > " \
-                            --indicator "➜ " \
-                            --prompt.foreground "$orange" \
-                            --indicator.foreground "$orange" \
-                            --cursor-text.foreground "$orange" \
-                            --match.foreground "$orange" \
-                            --header "" \
-                            --height 35)
-
-                        if [ -z "$selected_model" ] || echo "$selected_model" | head -n 1 | grep -iqE '^(error|usage|gum:)'; then
-                            echo "操作已取消，正在退出..."
-                            break
-                        fi
-                    fi
-
-                    selected_model=$(echo "$selected_model" | sed -E 's/^\([0-9]+\)[[:space:]]+//')
-
-                    echo ""
-                    echo "正在检测模型: $selected_model"
-                    if hermes_model_probe "$selected_model" "$ps_json"; then
-                        hermes_probe_status_line "可用"
-                    else
-                        hermes_probe_status_line "不可用"
-                    fi
-                    echo "状态：$HERMES_PROBE_MESSAGE"
-                    echo "延迟：$HERMES_PROBE_LATENCY"
-                    echo "摘要：$HERMES_PROBE_REPLY"
-                    echo ""
-
-                    printf "是否切换到该模型？[y/N，Esc 返回列表]: "
-                    IFS= read -rsn1 confirm_switch
-                    echo ""
-                    if [ "$confirm_switch" = $'\x1b' ]; then
-                        confirm_switch="no"
-                    else
-                        case "$confirm_switch" in
-                            [yY])
-                                IFS= read -rsn1 -t 5 _enter_key
-                                confirm_switch="yes"
-                                ;;
-                            *) confirm_switch="no" ;;
-                        esac
-                    fi
-
-                    if [ "$confirm_switch" != "yes" ]; then
-                        echo "已返回模型选择列表。"
-                        sleep 1
-                        continue
-                    fi
-
-                    local entry_data
-                    entry_data=$(echo "$ps_json" | jq -c --arg n "$selected_model" '.[] | select(.name == $n)')
-                    local sw_u sw_k sw_m
-                    sw_u=$(echo "$entry_data" | jq -r .base_url)
-                    sw_k=$(echo "$entry_data" | jq -r .api_key)
-                    sw_m=$(echo "$entry_data" | jq -r .model)
-
-                    echo "正在切换模型为: $selected_model ..."
-                    config_tool switch "$selected_model" "$sw_u" "$sw_k" "$sw_m"
-
-                    echo -e "${YELLOW}正在重启 Gateway...${NC}"
-                    hermes gateway stop >/dev/null 2>&1
-                    hermes gateway start >/dev/null 2>&1
-                    echo -e "${GREEN}✅ 模型已切换为: $sw_m${NC}"
-                    sleep 2
-                    break
-                done
-                ;;
-            2)
-                echo -e "${CYAN}--- 添加新 API 供应商 ---${NC}"
-                read -p "请输入供应商名称 (如: DeepSeek): " n
-                [ -z "$n" ] && continue
-                read -p "请输入 Base URL (如: https://api.deepseek.com/v1): " u
-                [ -z "$u" ] && continue
-                u="${u%/}"
-                echo -ne "${YELLOW}请输入 API Key (输入隐藏): ${NC}"
-                read -s k
-                echo ""
-                [ -z "$k" ] && continue
-                
-                echo -e "${YELLOW}🔍 正在获取完整模型列表...${NC}"
-                m_json=$(curl -s -m 10 -H "Authorization: Bearer $k" "$u/models")
-                m_list_str=$(echo "$m_json" | jq -r '.data[].id' 2>/dev/null | sort)
-                
-                if [ -n "$m_list_str" ]; then
-                    m_array=()
-                    while read -r line; do m_array+=("$line"); done <<< "$m_list_str"
-                    m_count=${#m_array[@]}
-                    
-                    echo -e "${GREEN}✅ 发现 $m_count 个模型。请选择一个作为当前默认：${NC}"
-                    PS3="请输入序号: "
-                    select m_default in "${m_array[@]}"; do
-                        [ -n "$m_default" ] && break
-                    done
-                    
-                    echo -e "---------------------------------------"
-                    read -p "是否同时添加该供应商的所有 $m_count 个模型？(y/N): " bulk_confirm
-                    if [[ "$bulk_confirm" =~ ^[Yy]$ ]]; then
-                        m_json_list=$(echo "$m_list_str" | jq -R . | jq -s -c .)
-                        config_tool bulk_add "$n" "$u" "$k" "$m_json_list"
-                        config_tool switch "$n/$m_default" "$u" "$k" "$m_default"
-                        echo -e "${GREEN}✅ 已全量导入 $m_count 个模型。${NC}"
-                    else
-                        config_tool add_p "$n" "$u" "$k" "$m_default"
-                        echo -e "${GREEN}✅ 已添加单个模型: $m_default${NC}"
-                    fi
-                else
-                    echo -e "${RED}❌ 无法获取列表。${NC}"
-                    read -p "请手动输入模型 ID: " m_manual
-                    [ -n "$m_manual" ] && config_tool add_p "$n" "$u" "$k" "$m_manual"
-                fi
-                sleep 2
-                ;;
-            3)
-                echo -e "${CYAN}--- 同步 API 供应商模型列表 ---${NC}"
-                echo -e "${CYAN}已配置的供应商分组:${NC}"
-                groups_json=$(config_tool list_groups)
-                g_count=$(echo "$groups_json" | jq '. | length' 2>/dev/null)
-                if [ "$g_count" -eq 0 ] 2>/dev/null || [ -z "$g_count" ]; then
-                    echo -e "  ${YELLOW}(暂无配置)${NC}"
-                    sleep 1
-                    continue
-                fi
-                echo "$groups_json" | jq -r '.[] | "  ● \(.name) (\(.count) 个模型)"'
-                echo ""
-                read -p "请输入要同步的 API 名称(provider)，直接回车同步全部: " sync_provider
-                sync_api_provider_models "$sync_provider"
-                echo ""
-                read -p "按回车键继续..."
-                ;;
-            4)
-                echo -e "${CYAN}已配置的供应商分组:${NC}"
-                groups_json=$(config_tool list_groups)
-                g_count=$(echo "$groups_json" | jq '. | length')
-                if [ "$g_count" -eq 0 ]; then
-                    echo -e "  ${YELLOW}(暂无配置)${NC}"
-                    sleep 1
-                    continue
-                fi
-                g_names=()
-                while read -r row; do
-                    g_name=$(echo "$row" | jq -r .name)
-                    g_cnt=$(echo "$row" | jq -r .count)
-                    g_names+=("$g_name")
-                    echo -e "  ${GREEN}${#g_names[@]}.${NC} $g_name (${g_cnt} 个模型)"
-                done < <(echo "$groups_json" | jq -c '.[]')
-                echo -e "  ${GREEN}0.${NC} 取消"
-                read -p "选择要删除的供应商序号: " d_idx
-                if [ "$d_idx" == "0" ] || [ -z "$d_idx" ]; then continue; fi
-                d_name="${g_names[$((d_idx-1))]}"
-                if [ -n "$d_name" ]; then
-                    read -p "确认删除 [$d_name] 及其所有模型? (y/N): " del_confirm
-                    if [[ "$del_confirm" =~ ^[Yy]$ ]]; then
-                        config_tool del_p "$d_name"
-                        echo -e "${RED}🗑️ 已删除 $d_name${NC}"
-                        sleep 1
-                    fi
-                fi
-                ;;
-            0) break ;;
-        esac
+    for url in "${test_urls[@]}"; do
+        info "正在尝试请求: $url ..."
+        ip_info=$(curl --noproxy "*" -s -m 6 "$url" 2>/dev/null || echo "")
+        if [ -n "$ip_info" ]; then
+            break
+        fi
     done
-}
 
-check_installed() {
-    if command -v hermes >/dev/null 2>&1; then return 0; else return 1; fi
-}
-
-get_gateway_status() {
-    if ! check_installed; then echo -e "${RED}未安装${RESET}"; return; fi
-    if systemctl --user is-active hermes-gateway >/dev/null 2>&1; then
-        echo -e "${GREEN}运行中 (systemd)${RESET}"
-    elif ps aux | grep -v grep | grep -q "hermes gateway"; then
-        echo -e "${GREEN}运行中 (进程)${RESET}"
-    else
-        echo -e "${RED}已停止${RESET}"
-    fi
-}
-
-get_version() {
-    if ! check_installed; then echo "未安装"; return; fi
-    local hermes_bin="$(command -v hermes 2>/dev/null)"
-    if [ -n "$hermes_bin" ] && [ -r "$hermes_bin" ]; then
-        local python_bin="$(sed -n '1s/^#!//p' "$hermes_bin" 2>/dev/null)"
-        if [ -n "$python_bin" ] && [ -x "$python_bin" ]; then
-            local venv_dir="$(dirname "$(dirname "$python_bin")")"
-            for metadata in "$venv_dir"/lib/python*/site-packages/hermes_agent-*.dist-info/METADATA; do
-                [ -r "$metadata" ] || continue
-                local version="$(sed -n 's/^Version: //p' "$metadata" 2>/dev/null | head -n 1)"
-                if [ -n "$version" ]; then echo "${version#v}"; return; fi
-            done
+    if [ -n "$ip_info" ]; then
+        echo -e "${GREEN}----------------------------------------${RESET}"
+        if echo "$ip_info" | grep -q "{"; then
+            echo "$ip_info" | sed 's/["{}]//g' | sed 's/,/\n/g' | sed 's/^ *//'
+        else
+            echo -e "当前落地出口 IP: ${YELLOW}$ip_info${RESET}"
         fi
-    fi
-    hermes --version 2>/dev/null | head -n 1
-}
-
-extract_semver() { echo "$1" | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -n 1; }
-
-version_lt() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" != "$2" ] && [ "$1" != "$2" ]; }
-
-get_latest_version() {
-    local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/hermes-manager"
-    local cache_file="$cache_dir/hermes-agent-latest-version"
-    local lock_dir="$cache_dir/hermes-agent-latest-version.lock"
-    local ttl=21600 now="$(date +%s 2>/dev/null || echo 0)"
-    mkdir -p "$cache_dir" 2>/dev/null || true
-
-    if [ -r "$cache_file" ]; then
-        local cache_mtime="$(stat -c %Y "$cache_file" 2>/dev/null || echo 0)"
-        if [ $((now - cache_mtime)) -lt "$ttl" ]; then
-            sed -n '1p' "$cache_file" && return
-        fi
-    fi
-
-    if mkdir "$lock_dir" 2>/dev/null; then
-        (
-            local latest=$(curl -s "https://pypi.org/pypi/hermes-agent/json" | jq -r '.info.version' 2>/dev/null)
-            if [ -n "$latest" ] && [ "$latest" != "null" ]; then
-                echo "$latest" > "$cache_file"
-            fi
-            rm -rf "$lock_dir"
-        ) &
-    fi
-
-    if [ -r "$cache_file" ]; then sed -n '1p' "$cache_file"; else echo "检测中..."; fi
-}
-
-add_app_id() {
-    local app_file="/home/docker/appno.txt"
-    if [ -f "$app_file" ] && ! grep -q "\b115\b" "$app_file"; then echo "115" >> "$app_file"; fi
-}
-
-get_config_count() {
-    local ps_json
-    ps_json=$(config_tool list_p 2>/dev/null)
-    if [ -z "$ps_json" ] || [ "$ps_json" = "[]" ]; then
-        echo "0"
+        echo -e "${GREEN}----------------------------------------${RESET}"
+        success "测试成功！隧道网络双向畅通。"
     else
-        echo "$ps_json" | jq '. | length' 2>/dev/null || echo "0"
+        error "获取失败。请检查后台服务状态或 WARP 运行日志。"
+        info "提示：本地可能触发了内核反向路由过滤(rp_filter)，建议尝试运行：curl https://myip.ipip.net 测试。"
     fi
 }
 
-# =================================================================
-# 主展示菜单
-# =================================================================
-show_menu() {
+#================================================================================
+# 面板主循环菜单
+#================================================================================
+panel_menu() {
+    require_root
     while true; do
+        get_status
         clear
-        local STATUS=$(get_gateway_status)
-        local cur_v=$(get_version)
-        local lat_v=$(get_latest_version)
-        local CONFIG_COUNT=$(get_config_count)
-        local VERSION_SHOW="$cur_v"
-        
-        # 提取纯数字版本号（例如：从 v1.2.3 或 1.2.3-dev 中提取出 1.2.3）
-        local clean_cur_v=$(echo "$cur_v" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
-        
-        # 如果提取成功则只显示纯版本号，否则作为兜底显示原始输出
-        local VERSION_SHOW="${clean_cur_v:-$cur_v}"
-
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}      ◈  Hermes 管理面板  ◈      ${RESET}"
+        echo -e "${GREEN}  Alpine OpenRC 代理管理面板   ${RESET}"
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}状态    :${RESET} $STATUS"
-        echo -e "${GREEN}版本    :${RESET} ${YELLOW}$VERSION_SHOW${RESET}"
-        echo -e "${GREEN}模型    :${RESET} ${YELLOW}$CONFIG_COUNT 个配置${RESET}"
+        echo -e "${GREEN}状态   :${RESET} $status_show"
+        echo -e "${GREEN}版本   :${RESET} $version_show"
+        echo -e "${GREEN}代理   :${RESET} $port_show"
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} 1. 安装 Hermes Agent${RESET}"
-        echo -e "${GREEN} 2. 启动 Gateway (消息网关后台)${RESET}"
-        echo -e "${GREEN} 3. 停止 Gateway (消息网关服务)${RESET}"
-        echo -e "${GREEN} 4. API供应商与 model 切换管理${RESET}"
-        echo -e "${GREEN} 5. 启动终端交互式对话 UI${RESET}"
-        echo -e "${GREEN} 6. 运行初始化配置向导 (Setup)${RESET}"
-        echo -e "${GREEN} 7. 升级 Hermes Agent${RESET}"
-        echo -e "${GREEN} 8. 卸载 Hermes Agent${RESET}"
+        echo -e "${GREEN} 1. 安装 Tun2Socks${RESET}"
+        echo -e "${GREEN} 2. 更新 Tun2Socks${RESET}"
+        echo -e "${GREEN} 3. 卸载 Tun2Socks${RESET}"
+        echo -e "${GREEN} 4. 修改配置${RESET}"
+        echo -e "${GREEN} 5. 启动 Tun2Socks${RESET}"
+        echo -e "${GREEN} 6. 停止 Tun2Socks${RESET}"
+        echo -e "${GREEN} 7. 重启 Tun2Socks${RESET}"
+        echo -e "${GREEN} 8. 查看日志${RESET}"
+        echo -e "${GREEN} 9. 测试当前出口IP${RESET}"
         echo -e "${GREEN} 0. 退出${RESET}"
         echo -e "${GREEN}================================${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
         
-        if ! read choice; then echo -e "${GREEN}退出。${RESET}"; exit 0; fi
-        echo ""
-        
-        case $choice in
-            1)
-                echo -e "${YELLOW}开始安装 Hermes Agent...${RESET}"
-                curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
-                refresh_hermes_path
-                hermes gateway install && hermes gateway start && add_app_id
-                ;;
-            2)
-                if check_installed; then
-                    echo -e "${YELLOW}正在启动 Gateway...${RESET}"
-                    hermes gateway stop >/dev/null 2>&1
-                    systemctl --user stop hermes-gateway >/dev/null 2>&1
-                    hermes gateway start
-                else echo -e "${RED}请先安装 Hermes。${RESET}"; fi
-                ;;
-            3)
-                if check_installed; then
-                    echo -e "${YELLOW}正在停止 Gateway...${RESET}"
-                    hermes gateway stop
-                    systemctl --user stop hermes-gateway >/dev/null 2>&1
-                else echo -e "${RED}请先安装 Hermes。${RESET}"; fi
-                ;;
-            4)
-                if check_installed; then 
-                    echo -e "${YELLOW}正在载入模型配置管理...${RESET}"
-                    api_management_submenu
-                else echo -e "${RED}请先安装 Hermes。${RESET}"; fi
-                ;;
+        read -p $'\e[32m请输入数字: \e[0m' num
+        case "$num" in
+            1) install_tun2socks ;;
+            2) update_core_binary ;;
+            3) uninstall_tun2socks ;;
+            4) change_config ;;
             5)
-                if check_installed; then
-                    echo -e "${YELLOW}进入交互式终端，输入 /exit 退出。${RESET}" && sleep 1
-                    hermes
-                else echo -e "${RED}请先安装 Hermes。${RESET}"; fi
+                step "正在唤醒全局代理网络..."
+                if [ ! -f "/etc/tun2socks/config.yaml" ]; then
+                    error "未发现任何节点配置，请先执行选项 1 或 4 进行配置！"
+                else
+                    rc-service tun2socks start && success "启动成功。" || error "启动失败。"
+                fi
                 ;;
             6)
-                if check_installed; then hermes setup; else echo -e "${RED}请先安装 Hermes。${RESET}"; fi
+                step "正在关闭全局代理，物理网络正在复原..."
+                rc-service tun2socks stop && success "代理已停用，原网已恢复。" || error "停用失败。"
                 ;;
             7)
-                if check_installed; then
-                    echo -e "${YELLOW}正在停止 Gateway...${NC}"
-                    hermes gateway stop >/dev/null 2>&1
-   
-                    echo -e "${YELLOW}正在更新 Hermes...${NC}"
-                    hermes update
-
-                    echo -e "${YELLOW}正在启动 Gateway...${NC}"
-                    hermes gateway start >/dev/null 2>&1
-
-                    add_app_id
-
-                    echo -e "${GREEN}✅ 更新完成${NC}"
-                else
-                    echo -e "${RED}请先安装 Hermes。${NC}"
-                fi
+                step "正在重启核心隧道服务..."
+                rc-service tun2socks restart && success "重启成功。" || error "重启失败。"
                 ;;
             8)
-                if check_installed; then
-                    read -p "🛑 确认卸载 Hermes Agent 吗？配置将保留 (y/N): " un_confirm
-                    if [[ "$un_confirm" =~ ^[Yy]$ ]]; then
-                        echo -e "${YELLOW}正在清理相关运行实例...${RESET}"
-                        hermes gateway stop >/dev/null 2>&1
-                        systemctl --user stop hermes-gateway >/dev/null 2>&1
-                        
-                        local h_bin="$(command -v hermes 2>/dev/null)"
-                        if [ -n "$h_bin" ]; then
-                            local py_sb="$(sed -n '1s/^#!//p' "$h_bin" 2>/dev/null)"
-                            local t_venv="$(dirname "$(dirname "$py_sb")")"
-                            [ -d "$t_venv" ] && rm -rf "$t_venv" && echo -e "${RED}已移除虚拟隔离区。${RESET}"
-                        fi
-                        
-                        pip uninstall -y hermes-agent >/dev/null 2>&1
-                        echo -e "${GREEN}✅ 卸载流程执行完毕。${RESET}"
-                    fi
+                step "正在查看服务运行日志尾部状态："
+                echo "--------------------------------------------------------"
+                if [ -f "/var/log/tun2socks.log" ]; then
+                    tail -n 30 "/var/log/tun2socks.log"
                 else
-                    echo -e "${RED}未检测到可用环境，无需卸载。${RESET}"
+                    warning "未捕获到主标准日志，尝试读取错误日志："
+                    [ -f "/var/log/tun2socks.err" ] && tail -n 30 "/var/log/tun2socks.err" || error "日志文件尚未生成。"
                 fi
-                read -p "按回车键继续..."
                 ;;
-            0)
-                exit 0
-                ;;
-            *)
-                echo -e "${RED}序号输入错误，请重试！${RESET}"
-                sleep 1
-                ;;
+            9) test_exit_ip ;;
+            0) exit 0 ;;
+            *) error "非法数字，请输入菜单内提供的值！" ;;
         esac
+        echo -ne "${YELLOW}按任意键返回主菜单...${RESET}"
+        read -r
     done
 }
 
-# 脚本入口点直接渲染菜单
-show_menu
+# 正式拉起主控制台
+panel_menu

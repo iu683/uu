@@ -42,15 +42,25 @@ get_status_info() {
         img_version="${RED}未安装${RESET}"
     fi
 
-    # 3. 实时解析 Compose 文件中的端口和目录映射
+    # 3. 【精准修复】自适应解析 Compose 文件中的官方环境变量与目录映射
     if [[ -f "$COMPOSE_FILE" ]]; then
-        webui_port=$(grep -E "\-[[:space:]]+[0-9]+:8080" "$COMPOSE_FILE" | awk -F ':' '{print $1}' | tr -d ' -')
+        # 直接抓取官方环境变量 WEBUI_PORT=xxxx
+        webui_port=$(grep -E "WEBUI_PORT=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
+        # 如果由于某种原因没抓到环境变量，则降级兼容原有的端口映射格式抓取
+        if [[ -z "$webui_port" ]]; then
+            webui_port=$(grep -E "\-[[:space:]]+[0-9]+:[0-9]+" "$COMPOSE_FILE" | head -n 1 | awk -F ':' '{print $1}' | tr -d ' -')
+        fi
         [[ -z "$webui_port" ]] && webui_port="8080"
 
-        torrent_port=$(grep -E "\-[[:space:]]+[0-9]+:6881($|[[:space:]]|\/)" "$COMPOSE_FILE" | head -n 1 | awk -F ':' '{print $1}' | tr -d ' -')
+        # 直接抓取官方环境变量 TORRENTING_PORT=xxxx
+        torrent_port=$(grep -E "TORRENTING_PORT=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
+        if [[ -z "$torrent_port" ]]; then
+            torrent_port=$(grep -E "\-[[:space:]]+[0-9]+:[0-9]+" "$COMPOSE_FILE" | tail -n 1 | awk -F ':' '{print $1}' | tr -d ' -')
+        fi
         [[ -z "$torrent_port" ]] && torrent_port="6881"
 
-        download_dir=$(grep -E -- "- .+/downloads" "$COMPOSE_FILE" | awk -F ':' '{print $1}' | sed 's/- //g' | xargs)
+        # 优化下载目录抓取，支持去掉可能存在的双引号或空格
+        download_dir=$(grep -E -- "- .+/downloads" "$COMPOSE_FILE" | awk -F ':' '{print $1}' | sed 's/- //g' | tr -d '"' | xargs)
         [[ -z "$download_dir" ]] && download_dir="/opt/qbittorrent/downloads"
     else
         webui_port="N/A"
@@ -111,8 +121,9 @@ install_qbittorrent() {
     mkdir -p "$BASE_DIR/config" "$custom_download"
     chmod -R 777 "$BASE_DIR/config" "$custom_download"
 
-    echo -e "${YELLOW}正在生成 docker-compose.yml 配置文件...${RESET}"
+    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
     
+    # 【完美重构点】严格遵循官方规范：-p 两侧端口保持一致，并同步下发给环境变量
     cat <<EOF > "$COMPOSE_FILE"
 services:
   qbittorrent:
@@ -122,13 +133,13 @@ services:
       - PUID=$(id -u)
       - PGID=$(id -g)
       - TZ=Asia/Shanghai
-      - WEBUI_PORT=8080
+      - WEBUI_PORT=${custom_port}
       - TORRENTING_PORT=${custom_p2p_port}
     volumes:
       - ${BASE_DIR}/config:/config
       - ${custom_download}:/downloads
     ports:
-      - ${custom_port}:8080
+      - ${custom_port}:${custom_port}
       - ${custom_p2p_port}:${custom_p2p_port}
       - ${custom_p2p_port}:${custom_p2p_port}/udp
     stop_grace_period: 10s
@@ -136,28 +147,10 @@ services:
 EOF
 
     echo -e "${YELLOW}正在通过 Docker Compose 启动 qBittorrent...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    # 【攻坚修正点】不管端口是不是 8080，直接等容器跑起来，然后进入内部完成底层配置注入
-    echo -e "${YELLOW}正在等待容器完全拉起 (约 5 秒)...${RESET}"
-    sleep 5
-
-    INSIDE_CONF="/config/qBittorrent/qBittorrent.conf"
-    
-    echo -e "${YELLOW}正在穿透容器内部强制改写验证规则...${RESET}"
-    # 1. 确保Preferences节点存在
-    docker exec "$CONTAINER_NAME" sh -c "grep -q '\[Preferences\]' '$INSIDE_CONF' || echo '[Preferences]' >> '$INSIDE_CONF'"
-    # 2. 移除可能存在的旧 Host 验证行
-    docker exec "$CONTAINER_NAME" sh -c "sed -i '/HostHeaderValidation/d' '$INSIDE_CONF'"
-    # 3. 强行插入关闭验证和关闭 CSRF 保护的终极命令
-    docker exec "$CONTAINER_NAME" sh -c "sed -i '/\[Preferences\]/a WebUI\\\\HostHeaderValidation=false\nWebUI\\\\CSRFProtection=false' '$INSIDE_CONF'"
-    
-    # 4. 强制重启
-    echo -e "${YELLOW}正在强力重启容器以刷新缓存...${RESET}"
-    docker restart "$CONTAINER_NAME" >/dev/null
-
-    echo -e "${YELLOW}正在同步密码日志 (约 5 秒)...${RESET}"
-    sleep 5
+    echo -e "${YELLOW}等待容器初始化并同步密码日志 (约10秒)...${RESET}"
+    sleep 10
 
     SHOW_IP=$(get_public_ip)
 
@@ -215,8 +208,8 @@ show_info() {
     get_status_info
     SHOW_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态      : $status"
-    echo -e "${YELLOW}镜像版本      : ${img_version}${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}镜像版本       : ${img_version}${RESET}"
     echo -e "${YELLOW}WebUI 访问地址 : http://${SHOW_IP}:${webui_port}${RESET}"
     echo -e "${YELLOW}P2P 传输端口   : ${torrent_port} (TCP/UDP)${RESET}"
     echo -e "${YELLOW}宿主机下载路径 : ${download_dir}${RESET}"

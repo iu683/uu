@@ -121,11 +121,19 @@ install_warp() {
         echo -e "${BLUE}[信息]${RESET} 正在全新安装 Usque 核心组件..."
     fi
     
+    # ====================================================================
+    # 【终极修正】不再盲信 curl -4！直接透视 Linux 内核路由表判定双栈状态
+    # ====================================================================
     local has_v4=0
-    # 针对纯 IPv6 优化超时限制，使用 -g -6 确保安全
-    if curl -g -6 -sSk --max-time 3 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "ip="; then
+    # 检查 IPv4 路由表里有没有默认网关出口 (0.0.0.0/0)
+    if ip -4 route show | grep -q "default"; then
         has_v4=1
+        echo -e "${BLUE}[检测]${RESET} 环境判定：原生 IPv4/双栈 网络环境"
+    else
+        has_v4=0
+        echo -e "${YELLOW}[检测]${RESET} 环境判定：确定为纯 IPv6(IPv6-Only)"
     fi
+    # ====================================================================
 
     local ARCH=$(uname -m)
     local TARGET="linux_amd64"
@@ -183,21 +191,19 @@ install_warp() {
     [ -d "$CONF_DIR" ] || mkdir -p "$CONF_DIR"
     cd "$CONF_DIR"
     
-    # 升级模式直接处理
+    # ====================================================================
+    # 分支 1：如果是覆盖升级模式（绝对不碰配置，换完核心直接原样复活启动）
+    # ====================================================================
     if [ "$is_upgrade" -eq 1 ]; then
-        # 即使是升级，在纯 IPv6 下也顺手做一次强制修正，确保万无一失
-        if [ "$has_v4" -ne 1 ] && [ -f "$CONF_FILE" ]; then
-            sed -i 's/"endpoint_v4": *"[^"]*"/"endpoint_v4": "[2606:4700:d0::a25c:bc2e]:2408"/g' "$CONF_FILE"
-            sed -i 's/"endpoint_v6": *"[^"]*"/"endpoint_v6": "[2606:4700:d0::a25c:bc2e]:2408"/g' "$CONF_FILE"
-        fi
+        echo -e "${GREEN}[成功]${RESET} 核心二进制程序替换完成。"
         write_openrc "$o_mode" "$o_ip" "$o_port" "$o_user" "$o_pass"
         rc-service "$SERVICE_NAME" start
-        echo -e "${GREEN}[成功]${RESET} 核心组件已成功无损升级至最新版！"
+        echo -e "${GREEN}[成功]${RESET} WARP 核心组件已成功无损升级并恢复运行！"
         return 0
     fi
 
     # ====================================================================
-    # 【核心调整】全新安装模式：先执行注册，不管注册文件默认写了啥，注册完立即强制修正！
+    # 分支 2：如果是全新安装模式（执行匿名注册 ➔ 精准修正 IPv6 ➔ 初始化配置）
     # ====================================================================
     echo -e "${BLUE}[信息]${RESET} 正在执行本地匿名注册..."
     if "${INSTALL_BIN}" register; then
@@ -207,50 +213,48 @@ install_warp() {
         return 1
     fi
 
-    # 【挪到这里】注册完的第一件事：立刻无条件检查并修正 IPv6 Endpoint 属性，别等启动才后悔
-    if [ "$has_v4" -ne 1 ] && [ -f "$CONF_FILE" ]; then
-        echo -e "${BLUE}[信息]${RESET} 检测到纯 IPv6 环境，正在强制修正 Peer Endpoint 路由指向..."
+    # 【全新安装专享】只有当上面内核明确判定 has_v4=0 时，才无死角执行清洗
+    if [ "$has_v4" -eq 0 ] && [ -f "$CONF_FILE" ]; then
+        echo -e "${BLUE}[信息]${RESET} 纯 IPv6 判定通过，正在强制改写新生成的配置..."
         
-        # 强行把配置里的所有 Endpoint 字段全部清洗为 IPv6 物理节点
-        sed -i 's/"endpoint_v4": *"[^"]*"/"endpoint_v4": "[2606:4700:d0::a25c:bc2e]:2408"/g' "$CONF_FILE"
-        sed -i 's/"endpoint_v6": *"[^"]*"/"endpoint_v6": "[2606:4700:d0::a25c:bc2e]:2408"/g' "$CONF_FILE"
+        # 顺着它的毛摸，精准换掉 IP（不加端口和方括号，完全贴合原生 JSON）
+        sed -i 's/"endpoint_v4": *"[^"]*"/"endpoint_v4": "2606:4700:103::2"/g' "$CONF_FILE"
+        sed -i 's/"endpoint_v6": *"[^"]*"/"endpoint_v6": "2606:4700:103::2"/g' "$CONF_FILE"
+        sed -i 's/"endpoint_h2_v4": *"[^"]*"/"endpoint_h2_v4": "2606:4700:103::2"/g' "$CONF_FILE"
+        sed -i 's/"endpoint_h2_v6": *"[^"]*"/"endpoint_h2_v6": "2606:4700:103::2"/g' "$CONF_FILE"
         
-        echo -e "${GREEN}[成功]${RESET} IPv6 终极修正已完成。 (指定节点: [2606:4700:d0::a25c:bc2e]:2408)"
+        echo -e "${GREEN}[成功]${RESET} IPv6 Endpoint 强制注入成功！"
     fi
-    # ====================================================================
-        
-        echo -e "\n--- 请配置初始化绑定 parameters ---"
-        echo -e "请选择运行模式:"
-        echo -e "  1. SOCKS5 (默认)"
-        echo -e "  2. HTTP"
-        echo -ne "${GREEN}请输入选项 [默认: 1]: ${RESET}"
-        read -r mode_ch
-        local ins_mode="SOCKS5"
-        [[ "$mode_ch" == "2" ]] && ins_mode="HTTP"
+    
+    # 引导全新安装的用户配置初始化参数
+    echo -e "\n--- 请配置初始化绑定参数 ---"
+    echo -e "请选择运行模式:"
+    echo -e "  1. SOCKS5 (默认)"
+    echo -e "  2. HTTP"
+    echo -ne "${GREEN}请输入选项 [默认: 1]: ${RESET}"
+    read -r mode_ch
+    local ins_mode="SOCKS5"
+    [[ "$mode_ch" == "2" ]] && ins_mode="HTTP"
 
-        echo -ne "${GREEN}请输入监听 IP [默认: 127.0.0.1]: ${RESET}"
-        read -r ins_ip
-        ins_ip="${ins_ip:-127.0.0.1}"
+    echo -ne "${GREEN}请输入监听 IP [默认: 127.0.0.1]: ${RESET}"
+    read -r ins_ip
+    ins_ip="${ins_ip:-127.0.0.1}"
 
-        echo -ne "${GREEN}请输入监听端口 [默认: 1080]: ${RESET}"
-        read -r ins_port
-        ins_port="${ins_port:-1080}"
+    echo -ne "${GREEN}请输入监听端口 [默认: 1080]: ${RESET}"
+    read -r ins_port
+    ins_port="${ins_port:-1080}"
 
-        echo -ne "${GREEN}请输入代理用户名 (留空则无验证): ${RESET}"
-        read -r ins_user
-        local ins_pass=""
-        if [ -n "$ins_user" ]; then
-            echo -ne "${GREEN}请输入代理密码: ${RESET}"
-            read -r ins_pass
-        fi
-
-        write_openrc "$ins_mode" "$ins_ip" "$ins_port" "$ins_user" "$ins_pass"
-        rc-service "$SERVICE_NAME" start
-        echo -e "${GREEN}[成功]${RESET} WARP 安装并启动成功！"
-    else
-        echo -e "${RED}[错误]${RESET} 注册失败。提示：请确保你的 VPS 已开启 IPv6 外部访问能力。"
-        return 1
+    echo -ne "${GREEN}请输入代理用户名 (留空则无验证): ${RESET}"
+    read -r ins_user
+    local ins_pass=""
+    if [ -n "$ins_user" ]; then
+        echo -ne "${GREEN}请输入代理密码: ${RESET}"
+        read -r ins_pass
     fi
+
+    write_openrc "$ins_mode" "$ins_ip" "$ins_port" "$ins_user" "$ins_pass"
+    rc-service "$SERVICE_NAME" start
+    echo -e "${GREEN}[成功]${RESET} WARP 全新安装并启动成功！"
 }
 write_openrc() {
     local mode="$1" ip="$2" port="$3" user="$4" pass="$5"

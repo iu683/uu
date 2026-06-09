@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # ==============================================================================
-#   CF-WARP Alpine 专属控制面板 (完美缝合纯 IPv6 修正与谷歌分流状态验证)
+#   CF-WARP Alpine 专属控制面板 (更新自动保留原配置，安装支持自定义绑定参数)
 # ==============================================================================
 
 # 预检：由于 Alpine 默认不带高级语法，必须先自动补齐 bash 并切过去
@@ -28,6 +28,7 @@ export DATA_DIR="/var/lib/usque"
 export REDSOCKS_CONF="${CONF_DIR}/redsocks.conf"
 export PROXY_RULES_SCRIPT="${DATA_DIR}/google_rules.sh"
 export PROXY_SERVICE_FILE="/etc/init.d/${PROXY_SERVICE_NAME}"
+export REDSOCKS_PID="/run/usque-google-proxy.pid"
 
 # 颜色定义
 GREEN='\033[0;32m'
@@ -76,10 +77,23 @@ check_deps() {
     fi
 }
 
-# 下载与注册 (含纯 IPv6 环境自适应修正)
+# 下载与更新/安装逻辑 (完美支持升级时自动提取并保留原有默认配置)
 install_warp() {
-    echo -e "${BLUE}[信息]${RESET} 正在安装 Usque 核心组件..."
     check_deps
+    
+    local is_upgrade=0
+    local o_mode="SOCKS5" o_ip="127.0.0.1" o_port="1080" o_user="" o_pass=""
+    
+    # 检查是否已经是已安装状态，如果是升级，先提取老配置参数
+    if [ -f "$CONF_FILE" ] && [ -f "$INSTALL_BIN" ]; then
+        is_upgrade=1
+        echo -e "${BLUE}[信息]${RESET} 检测到已有配置，正在进行无损覆盖升级..."
+        if [ -f "$META_FILE" ]; then
+            IFS='|' read -r o_mode o_ip o_port o_user o_pass < "$META_FILE"
+        fi
+    else
+        echo -e "${BLUE}[信息]${RESET} 正在全新安装 Usque 核心组件..."
+    fi
     
     local has_v4=0
     if curl -4sSk --max-time 2 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "ip="; then
@@ -101,6 +115,7 @@ install_warp() {
     local tmp_dir=$(mktemp -d)
     if curl -fsSL -L -o "$tmp_dir/zip" "${GITHUB_PROXY[0]}https://github.com/${REPO_USQUE}/releases/download/${latest_tag}/usque_${pure_ver}_${TARGET}.zip"; then
         unzip -q -o "$tmp_dir/zip" -d "$tmp_dir"
+        rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
         cp -f "$tmp_dir/usque" "$INSTALL_BIN"
         chmod +x "$INSTALL_BIN"
     fi
@@ -109,11 +124,19 @@ install_warp() {
     [ -d "$CONF_DIR" ] || mkdir -p "$CONF_DIR"
     cd "$CONF_DIR"
     
+    # 【核心修复】：如果是升级，自动沿用提取出来的旧参数重新生成 OpenRC 脚本并启动，不触发任何交互和重新注册
+    if [ "$is_upgrade" -eq 1 ]; then
+        write_openrc "$o_mode" "$o_ip" "$o_port" "$o_user" "$o_pass"
+        rc-service "$SERVICE_NAME" start
+        echo -e "${GREEN}[成功]${RESET} 核心组件已成功无损升级至最新版！(已完美保留原默认配置)"
+        return 0
+    fi
+
+    # 只有全新安装才走注册和自定义配置流程
     echo -e "${BLUE}[信息]${RESET} 正在执行本地匿名注册..."
     if "${INSTALL_BIN}" register; then
         echo -e "${GREEN}[成功]${RESET} Cloudflare 本地注册成功。"
         
-        # 缝合逻辑：纯 IPv6 修复处理
         if [ "$has_v4" -ne 1 ] && [ -f "$CONF_FILE" ]; then
             echo -e "${BLUE}[信息]${RESET} 检测到纯 IPv6 环境，正在自动修正配置文件..."
             local v6_ep=$(grep -o '"endpoint_v6": *"[^"]*"' "$CONF_FILE" | awk -F '"' '{print $4}')
@@ -124,8 +147,34 @@ install_warp() {
             echo -e "${GREEN}[成功]${RESET} IPv6 修正已完成 (Endpoint: $v6_ep)。"
         fi
         
-        write_openrc "SOCKS5" "127.0.0.1" "1080" "" ""
+        echo -e "\n--- 请配置初始化绑定参数 ---"
+        echo -e "请选择运行模式:"
+        echo -e "  1. SOCKS5 (默认)"
+        echo -e "  2. HTTP"
+        echo -ne "${GREEN}请输入选项 [默认: 1]: ${RESET}"
+        read -r mode_ch
+        local ins_mode="SOCKS5"
+        [[ "$mode_ch" == "2" ]] && ins_mode="HTTP"
+
+        echo -ne "${GREEN}请输入监听 IP [默认: 127.0.0.1]: ${RESET}"
+        read -r ins_ip
+        ins_ip="${ins_ip:-127.0.0.1}"
+
+        echo -ne "${GREEN}请输入监听端口 [默认: 1080]: ${RESET}"
+        read -r ins_port
+        ins_port="${ins_port:-1080}"
+
+        echo -ne "${GREEN}请输入代理用户名 (留空则无验证): ${RESET}"
+        read -r ins_user
+        local ins_pass=""
+        if [ -n "$ins_user" ]; then
+            echo -ne "${GREEN}请输入代理密码: ${RESET}"
+            read -r ins_pass
+        fi
+
+        write_openrc "$ins_mode" "$ins_ip" "$ins_port" "$ins_user" "$ins_pass"
         rc-service "$SERVICE_NAME" start
+        echo -e "${GREEN}[成功]${RESET} WARP 安装并启动成功！"
     else
         echo -e "${RED}[错误]${RESET} 注册失败。提示：请确保你的 VPS 已开启 IPv6 外部访问能力。"
         return 1
@@ -168,7 +217,17 @@ edit_config() {
     [[ "$m_ch" == "2" ]] && n_mode="HTTP"
     read -r -p "监听 IP [当前: $o_ip]: " n_ip; n_ip="${n_ip:-$o_ip}"
     read -r -p "监听端口 [当前: $o_port]: " n_port; n_port="${n_port:-$o_port}"
-    write_openrc "$n_mode" "$n_ip" "$n_port" "$o_user" "$o_pass"
+    
+    read -r -p "请输入用户名 [当前: ${o_user:-无}]: " n_user
+    n_user="${n_user:-$o_user}"
+    local n_pass="$o_pass"
+    if [ -n "$n_user" ]; then
+        read -r -p "请输入新密码: " n_pass
+    else
+        n_pass=""
+    fi
+
+    write_openrc "$n_mode" "$n_ip" "$n_port" "$n_user" "$n_pass"
     rc-service "$SERVICE_NAME" restart
 }
 
@@ -203,15 +262,25 @@ google_split_menu() {
         echo -e "${GREEN}  3. 验证谷歌分流连通性${RESET}"
         echo -e "${GREEN}  0. 返回主菜单${RESET}"
         echo -e "${GREEN}==============================${RESET}"
-        read -r -p "请输入选项: " sub_ch
+        echo -ne "${GREEN}请输入选项: ${RESET}"
+        read -r sub_ch
         case "$sub_ch" in
             1)
                 if ! command -v redsocks &>/dev/null || ! command -v iptables &>/dev/null; then
-                    apk add -q redsocks iptables
+                    echo -e "${BLUE}[信息]${RESET} 正在安装分流依赖组件..."
+                    apk add -q redsocks iptables --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community/ || apk add -q redsocks iptables
                 fi
+                
+                local REDSOCKS_BIN="/usr/bin/redsocks"
+                [ ! -f "$REDSOCKS_BIN" ] && REDSOCKS_BIN=$(command -v redsocks 2>/dev/null || echo "/usr/sbin/redsocks")
+
+                rc-service "$PROXY_SERVICE_NAME" stop >/dev/null 2>&1 || true
+                pkill -9 -f redsocks >/dev/null 2>&1 || true
+                rc-service "$PROXY_SERVICE_NAME" zap >/dev/null 2>&1 || true
+                rm -f "$REDSOCKS_PID"
+                
                 ip -6 route add blackhole 2607:f8b0::/32 2>/dev/null || true
                 
-                # 提取主端口
                 IFS='|' read -r _ _ warp_port _ < "$META_FILE"
                 cat <<EOF > "$REDSOCKS_CONF"
 base { log_debug = off; log_info = on; log = "syslog:daemon"; daemon = off; redirector = iptables; }
@@ -240,21 +309,27 @@ elif [ "$ACTION" = "stop" ]; then
 fi
 EOF
                 chmod +x "$PROXY_RULES_SCRIPT"
+                
                 cat <<EOF > "$PROXY_SERVICE_FILE"
 #!/sbin/openrc-run
 supervisor="supervise-daemon"
-command="/usr/sbin/redsocks"
+command="${REDSOCKS_BIN}"
 command_args="-c ${REDSOCKS_CONF}"
 command_background="yes"
+pidfile="${REDSOCKS_PID}"
 start_post() { ${PROXY_RULES_SCRIPT} start; }
 stop_pre() { ${PROXY_RULES_SCRIPT} stop; }
 EOF
                 chmod +x "$PROXY_SERVICE_FILE"
+                
                 rc-service "$PROXY_SERVICE_NAME" start
                 echo -e "${GREEN}[成功]${RESET} 谷歌分流规则已挂载完成！"
                 ;;
             2)
                 rc-service "$PROXY_SERVICE_NAME" stop 2>/dev/null || true
+                pkill -9 -f redsocks >/dev/null 2>&1 || true
+                rc-service "$PROXY_SERVICE_NAME" zap >/dev/null 2>&1 || true
+                rm -f "$REDSOCKS_PID"
                 echo -e "${GREEN}[成功]${RESET} 谷歌分流规则已卸载。"
                 ;;
             3)
@@ -313,9 +388,10 @@ while true; do
         2) install_warp ;; 
         3) 
             rc-service "$PROXY_SERVICE_NAME" stop 2>/dev/null || true
+            pkill -9 -f redsocks >/dev/null 2>&1 || true
             rc-service "$SERVICE_NAME" stop 2>/dev/null || true
             rc-update del "$SERVICE_NAME" default 2>/dev/null || true
-            rm -f "$SERVICE_FILE" "$PROXY_SERVICE_FILE" "$INSTALL_BIN" "$META_FILE"
+            rm -f "$SERVICE_FILE" "$PROXY_SERVICE_FILE" "$INSTALL_BIN" "$META_FILE" "$REDSOCKS_PID"
             rm -rf "$CONF_DIR" "$DATA_DIR"
             echo -e "${GREEN}[成功]${RESET} 卸载完成。"
             ;;

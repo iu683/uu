@@ -121,88 +121,141 @@ install_warp() {
         echo -e "${BLUE}[信息]${RESET} 正在全新安装 Usque 核心组件..."
     fi
     
+    # ====================================================================
+    # 【终极修正】不再盲信 curl -4！直接透视 Linux 内核路由表判定双栈状态
+    # ====================================================================
     local has_v4=0
-    if curl -4sSk --max-time 2 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "ip="; then
+    # 检查 IPv4 路由表里有没有默认网关出口 (0.0.0.0/0)
+    if ip -4 route show | grep -q "default"; then
         has_v4=1
+        echo -e "${BLUE}[检测]${RESET} 环境判定：原生 IPv4/双栈 网络环境"
+    else
+        has_v4=0
+        echo -e "${YELLOW}[检测]${RESET} 环境判定：确定为纯 IPv6(IPv6-Only)"
     fi
+    # ====================================================================
 
     local ARCH=$(uname -m)
     local TARGET="linux_amd64"
     [[ "$ARCH" == "aarch64" ]] && TARGET="linux_arm64"
 
+    # ====================================================================
+    # 【修正 1】获取最新 Tag（支持代理池轮询，且强制使用 IPv6 友好参数）
+    # ====================================================================
     local latest_tag=""
     for proxy in "${GITHUB_PROXY[@]}"; do
-        latest_tag=$(curl -fsSL --max-time 6 "${proxy}https://api.github.com/repos/${REPO_USQUE}/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        local api_url="${proxy}https://api.github.com/repos/${REPO_USQUE}/releases/latest"
+        echo -e "${BLUE}[信息]${RESET} 正在尝试通过 [ ${proxy:-原生直连} ] 获取版本信息..."
+        latest_tag=$(curl -g -6 -fsSL --max-time 6 "$api_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         [ -n "$latest_tag" ] && break
     done
     [ -z "$latest_tag" ] && latest_tag="v3.0.0"
     local pure_ver="${latest_tag#v}"
+    echo -e "${GREEN}[成功]${RESET} 目标安装版本: ${latest_tag}"
 
+    # ====================================================================
+    # 【修正 2】下载核心（彻底废除 ${GITHUB_PROXY[0]} 死锁，开启全池轮询与原生直连兜底）
+    # ====================================================================
     local tmp_dir=$(mktemp -d)
-    if curl -fsSL -L -o "$tmp_dir/zip" "${GITHUB_PROXY[0]}https://github.com/${REPO_USQUE}/releases/download/${latest_tag}/usque_${pure_ver}_${TARGET}.zip"; then
-        unzip -q -o "$tmp_dir/zip" -d "$tmp_dir"
-        rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
-        cp -f "$tmp_dir/usque" "$INSTALL_BIN"
-        chmod +x "$INSTALL_BIN"
+    local download_success=0
+    local raw_download_url="https://github.com/${REPO_USQUE}/releases/download/${latest_tag}/usque_${pure_ver}_${TARGET}.zip"
+
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local final_download_url="${proxy}${raw_download_url}"
+        echo -e "${BLUE}[信息]${RESET} 正在尝试通过 [ ${proxy:-原生直连} ] 下载核心压缩包..."
+        
+        # 使用 -g -6 强化纯 IPv6 环境下的 curl 稳定性
+        if curl -g -6 -fsSL -L --max-time 45 -o "$tmp_dir/zip" "$final_download_url"; then
+            download_success=1
+            break
+        else
+            echo -e "${YELLOW}[警告]${RESET} 当前下载通道失败，正在尝试切换..."
+            [ -f "$tmp_dir/zip" ] && rm -f "$tmp_dir/zip"
+        fi
+    done
+
+    # 严密拦截：如果所有通道都漏油，直接中断防止套娃报错
+    if [ "$download_success" -ne 1 ]; then
+        echo -e "${RED}[错误]${RESET} 核心组件下载失败，所有 GitHub 代理通道及原生直连均不可达。"
+        rm -rf "$tmp_dir"
+        return 1
     fi
+
+    # 解压并部署组件
+    unzip -q -o "$tmp_dir/zip" -d "$tmp_dir"
+    rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
+    cp -f "$tmp_dir/usque" "$INSTALL_BIN"
+    chmod +x "$INSTALL_BIN"
     rm -rf "$tmp_dir"
 
     [ -d "$CONF_DIR" ] || mkdir -p "$CONF_DIR"
     cd "$CONF_DIR"
     
+    # ====================================================================
+    # 分支 1：如果是覆盖升级模式（绝对不碰配置，换完核心直接原样复活启动）
+    # ====================================================================
     if [ "$is_upgrade" -eq 1 ]; then
+        echo -e "${GREEN}[成功]${RESET} 核心二进制程序替换完成。"
         write_openrc "$o_mode" "$o_ip" "$o_port" "$o_user" "$o_pass"
         rc-service "$SERVICE_NAME" start
-        echo -e "${GREEN}[成功]${RESET} 核心组件已成功无损升级至最新版！"
+        echo -e "${GREEN}[成功]${RESET} WARP 核心组件已成功无损升级并恢复运行！"
         return 0
     fi
 
+    # ====================================================================
+    # 分支 2：如果是全新安装模式（执行匿名注册 ➔ 精准修正 IPv6 ➔ 初始化配置）
+    # ====================================================================
     echo -e "${BLUE}[信息]${RESET} 正在执行本地匿名注册..."
     if "${INSTALL_BIN}" register; then
         echo -e "${GREEN}[成功]${RESET} Cloudflare 本地注册成功。"
-        
-        if [ "$has_v4" -ne 1 ] && [ -f "$CONF_FILE" ]; then
-            echo -e "${BLUE}[信息]${RESET} 检测到纯 IPv6 环境，正在自动修正配置文件..."
-            local v6_ep=$(grep -o '"endpoint_v6": *"[^"]*"' "$CONF_FILE" | awk -F '"' '{print $4}')
-            [ -z "$v6_ep" ] && v6_ep="[2606:4700:d0::a25c:bc2e]:2408"
-            sed -i "s/\"endpoint_v4\": *\"[^\"]*\"/\"endpoint_v4\": \"${v6_ep}\"/g" "$CONF_FILE"
-            echo -e "${GREEN}[成功]${RESET} IPv6 修正已完成 (Endpoint: $v6_ep)。"
-        fi
-        
-        echo -e "\n--- 请配置初始化绑定参数 ---"
-        echo -e "请选择运行模式:"
-        echo -e "  1. SOCKS5 (默认)"
-        echo -e "  2. HTTP"
-        echo -ne "${GREEN}请输入选项 [默认: 1]: ${RESET}"
-        read -r mode_ch
-        local ins_mode="SOCKS5"
-        [[ "$mode_ch" == "2" ]] && ins_mode="HTTP"
-
-        echo -ne "${GREEN}请输入监听 IP [默认: 127.0.0.1]: ${RESET}"
-        read -r ins_ip
-        ins_ip="${ins_ip:-127.0.0.1}"
-
-        echo -ne "${GREEN}请输入监听端口 [默认: 1080]: ${RESET}"
-        read -r ins_port
-        ins_port="${ins_port:-1080}"
-
-        echo -ne "${GREEN}请输入代理用户名 (留空则无验证): ${RESET}"
-        read -r ins_user
-        local ins_pass=""
-        if [ -n "$ins_user" ]; then
-            echo -ne "${GREEN}请输入代理密码: ${RESET}"
-            read -r ins_pass
-        fi
-
-        write_openrc "$ins_mode" "$ins_ip" "$ins_port" "$ins_user" "$ins_pass"
-        rc-service "$SERVICE_NAME" start
-        echo -e "${GREEN}[成功]${RESET} WARP 安装并启动成功！"
     else
         echo -e "${RED}[错误]${RESET} 注册失败。提示：请确保你的 VPS 已开启 IPv6 外部访问能力。"
         return 1
     fi
-}
 
+    # 【全新安装专享】只有当上面内核明确判定 has_v4=0 时，才无死角执行清洗
+    if [ "$has_v4" -eq 0 ] && [ -f "$CONF_FILE" ]; then
+        echo -e "${BLUE}[信息]${RESET} 纯 IPv6 判定通过，正在强制改写新生成的配置..."
+        
+        # 顺着它的毛摸，精准换掉 IP（不加端口和方括号，完全贴合原生 JSON）
+        sed -i 's/"endpoint_v4": *"[^"]*"/"endpoint_v4": "2606:4700:103::2"/g' "$CONF_FILE"
+        sed -i 's/"endpoint_v6": *"[^"]*"/"endpoint_v6": "2606:4700:103::2"/g' "$CONF_FILE"
+        sed -i 's/"endpoint_h2_v4": *"[^"]*"/"endpoint_h2_v4": "2606:4700:103::2"/g' "$CONF_FILE"
+        sed -i 's/"endpoint_h2_v6": *"[^"]*"/"endpoint_h2_v6": "2606:4700:103::2"/g' "$CONF_FILE"
+        
+        echo -e "${GREEN}[成功]${RESET} IPv6 Endpoint 强制注入成功！"
+    fi
+    
+    # 引导全新安装的用户配置初始化参数
+    echo -e "\n--- 请配置初始化绑定参数 ---"
+    echo -e "请选择运行模式:"
+    echo -e "  1. SOCKS5 (默认)"
+    echo -e "  2. HTTP"
+    echo -ne "${GREEN}请输入选项 [默认: 1]: ${RESET}"
+    read -r mode_ch
+    local ins_mode="SOCKS5"
+    [[ "$mode_ch" == "2" ]] && ins_mode="HTTP"
+
+    echo -ne "${GREEN}请输入监听 IP [默认: 127.0.0.1]: ${RESET}"
+    read -r ins_ip
+    ins_ip="${ins_ip:-127.0.0.1}"
+
+    echo -ne "${GREEN}请输入监听端口 [默认: 1080]: ${RESET}"
+    read -r ins_port
+    ins_port="${ins_port:-1080}"
+
+    echo -ne "${GREEN}请输入代理用户名 (留空则无验证): ${RESET}"
+    read -r ins_user
+    local ins_pass=""
+    if [ -n "$ins_user" ]; then
+        echo -ne "${GREEN}请输入代理密码: ${RESET}"
+        read -r ins_pass
+    fi
+
+    write_openrc "$ins_mode" "$ins_ip" "$ins_port" "$ins_user" "$ins_pass"
+    rc-service "$SERVICE_NAME" start
+    echo -e "${GREEN}[成功]${RESET} WARP 全新安装并启动成功！"
+}
 write_openrc() {
     local mode="$1" ip="$2" port="$3" user="$4" pass="$5"
     local cmd="socks"
@@ -497,6 +550,7 @@ download_with_proxy() {
 write_tun2socks_config() {
     local CONFIG_FILE="/etc/tun2socks/config.yaml"
     mkdir -p "/etc/tun2socks"
+
     local current_addr="" current_port="" current_user="" current_pass=""
     if [ -f "$CONFIG_FILE" ]; then
         current_addr=$(grep -E '^[[:space:]]*address:' "$CONFIG_FILE" | head -n1 | awk '{print $2}' | tr -d "'\"")
@@ -512,7 +566,6 @@ write_tun2socks_config() {
             read -r input_addr
             [ -z "$input_addr" ] && input_addr=$current_addr
         else
-            # 当没有旧配置时，提示默认值并支持直接回车
             echo -ne "${GREEN}请输入Socks5服务器地址 (直接回车默认 127.0.0.1): ${RESET}"
             read -r input_addr
             [ -z "$input_addr" ] && input_addr="127.0.0.1"
@@ -527,12 +580,10 @@ write_tun2socks_config() {
             read -r input_port
             [ -z "$input_port" ] && input_port=$current_port
         else
-            # 当没有旧配置时，提示默认值并支持直接回车
             echo -ne "${GREEN}请输入Socks5服务器端口 (直接回车默认 1080): ${RESET}"
             read -r input_port
             [ -z "$input_port" ] && input_port="1080"
         fi
-        
         if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
             break
         else
@@ -542,25 +593,21 @@ write_tun2socks_config() {
 
     local input_user
     if [ -n "$current_user" ]; then
-        echo -ne "${GREEN}请输入用户名 (回车保持现状, 彻底清空请输入 none) [$current_user]: ${RESET}"
-        read -r input_user
+        read -r -p "请输入用户名 (回车保持现状, 彻底清空请输入 none) [$current_user]: " input_user
         [ -z "$input_user" ] && input_user=$current_user
         [ "$input_user" = "none" ] && input_user=""
     else
-        echo -ne "${GREEN}请输入用户名 (WARP无需验证直接留空回车): ${RESET}"
-        read -r input_user
+        read -r -p "请输入用户名 (WARP无需验证直接留空回车): " input_user
     fi
 
     local input_pass
     if [ -n "$input_user" ]; then
         if [ -n "$current_pass" ]; then
-            echo -ne "${GREEN}请输入密码 (回车保持现状, 彻底清空请输入 none) [$current_pass]: ${RESET}"
-            read -r input_pass
+            read -r -p "请输入密码 (回车保持现状, 彻底清空请输入 none) [$current_pass]: " input_pass
             [ -z "$input_pass" ] && input_pass=$current_pass
             [ "$input_pass" = "none" ] && input_pass=""
         else
-            echo -ne "${GREEN}请输入密码 (可选，无验证直接留空回车): ${RESET}"
-            read -r input_pass
+            read -r -p "请输入密码 (可选，无验证直接留空回车): " input_pass
         fi
     else
         input_pass=""
@@ -571,6 +618,7 @@ write_tun2socks_config() {
     input_user=$(echo "$input_user" | tr -d '\r' | sed "s/'/''/g")
     input_pass=$(echo "$input_pass" | tr -d '\r' | sed "s/'/''/g")
 
+    # 保持 hev-socks5-tunnel 的纯正配置格式，死死锁住 mark: 438
     cat > "$CONFIG_FILE" <<EOF
 tunnel:
   name: tun0
@@ -604,38 +652,73 @@ update_tun2socks_core() {
         error "检测到您尚未安装 Tun2Socks 环境，请先使用选项 1 进行初始化安装！"
         return 1
     fi
-    step "正在连接 GitHub 检查最新 Release Version..."
-    local latest_release_json=$(curl -s https://api.github.com/repos/$REPO_TUN2SOCKS/releases/latest)
-    local latest_version=$(echo "$latest_release_json" | grep '"tag_name":' | cut -d '"' -f 4)
-    local download_url=$(echo "$latest_release_json" | grep "browser_download_url" | grep "linux-x86_64" | cut -d '"' -f 4)
 
+    # ====================================================================
+    # 【核心修正 1】通过代理池轮询获取 GitHub Release 元数据 (自适应 IPv6)
+    # ====================================================================
+    step "正在连接 GitHub 检查最新 Release Version..."
+    local raw_api_url="https://api.github.com/repos/$REPO_TUN2SOCKS/releases/latest"
+    local latest_release_json=""
+    
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local final_api_url="${proxy}${raw_api_url}"
+        info "正在尝试通过 [ ${proxy:-原生直连} ] 检查版本..."
+        latest_release_json=$(curl -g -6 -s -m 15 "$final_api_url" || echo "")
+        if echo "$latest_release_json" | grep -q "browser_download_url"; then
+            break
+        fi
+    done
+
+    local latest_version=$(echo "$latest_release_json" | grep '"tag_name":' | cut -d '"' -f 4)
+
+    # ====================================================================
+    # 【核心修正 2】动态适配 hef/hev-socks5-tunnel 的各种架构命名规范
+    # ====================================================================
+    local ARCH=$(uname -m)
+    local MATCH_KEY="linux-amd64"
+    if [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
+        MATCH_KEY="linux-arm64"
+    elif [[ "$ARCH" == "386" || "$ARCH" == "i386" ]]; then
+        MATCH_KEY="linux-386"
+    fi
+
+    # 兼容精准抓取
+    local download_url=$(echo "$latest_release_json" | grep "browser_download_url" | grep -E "linux-x86_64|linux-amd64|${MATCH_KEY}" | head -n1 | cut -d '"' -f 4)
+
+    # 严格拦截空值，防止空变量参与后续逻辑对比
     if [ -z "$latest_version" ] || [ -z "$download_url" ]; then
-        error "无法从 GitHub 获取版本信息，网络可能受到干扰。"
+        error "无法从 GitHub 获取有效的版本号或找不到适用当前架构 (${ARCH}) 的核心文件，更新终止。"
         return 1
     fi
+
     local local_version="未知"
     if [ -f "/usr/local/bin/tun2socks" ]; then
-        local_version=$(/usr/local/bin/tun2socks --version 2>&1 | grep "Version:" | awk '{print $2}')
+        # 优化对 Alpine 环境下不规范输出的兼容性抓取
+        local_version=$(/usr/local/bin/tun2socks --version 2>&1 | grep -i "version" | awk '{print $2}')
         [ -z "$local_version" ] && local_version="未知"
     fi
     info "本地核心版本: $local_version"
     info "GitHub最新版本: $latest_version"
 
+    # 如果本地版本能和远程版本精确对上，直接平稳退出
     if [ "$local_version" = "$latest_version" ]; then
         success "当前核心程序已是官方最新发布版，无需重复升级。"
         return 0
     fi
+    
     warning "检测到新版本核心程序 ($latest_version)，开始全自动无缝升级..."
 
+    # 统一使用大写变量，防止调用的公共子函数不兼容小写局部变量
     local RESOLV_CONF="/etc/resolv.conf"
     local RESOLV_CONF_BAK="/etc/resolv.conf.bak"
-    local was_immutable=false
+    local WAS_IMMUTABLE=false
+    
     if lsattr -d "$RESOLV_CONF" 2>/dev/null | grep -q -- '-i-'; then
         chattr -i "$RESOLV_CONF" || true
-        was_immutable=true
+        WAS_IMMUTABLE=true
     fi
     cp "$RESOLV_CONF" "$RESOLV_CONF_BAK" || true
-    if ! set_dns64_servers "$RESOLV_CONF" "$was_immutable" "$RESOLV_CONF_BAK"; then return 1; fi
+    if ! set_dns64_servers "$RESOLV_CONF" "$WAS_IMMUTABLE" "$RESOLV_CONF_BAK"; then return 1; fi
 
     local is_running=false
     if rc-service tun2socks status 2>/dev/null | grep -q "started"; then
@@ -644,21 +727,22 @@ update_tun2socks_core() {
         rc-service tun2socks stop || true
     fi
 
-    step "正在下载官方最新编译核心..."
+    step "正在通过代理池安全下载最新核心..."
     if ! download_with_proxy "/usr/local/bin/tun2socks" "$download_url"; then
-        error "所有下载通道均失败，请检查网络。"
-        restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$was_immutable"
+        error "所有下载通道均失败，更新流产。"
+        restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
         return 1
     fi
     chmod +x "/usr/local/bin/tun2socks"
-    restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$was_immutable"
+    restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
 
     if [ "$is_running" = true ]; then
         step "正在恢复并重新启动全局代理..."
-        rc-service tun2socks start && success "隧道已成功恢复运行！" || error "重启失败。"
+        rc-service tun2socks start && success "隧道已无缝成功恢复最新版运行！" || error "重启隧道失败。"
+    else
+        success "核心已成功更新至最新版！"
     fi
 }
-
 generate_openrc_script() {
     local SERVICE_FILE="/etc/init.d/tun2socks"
     local TARGET_CONFIG="/etc/tun2socks/config.yaml"
@@ -687,76 +771,81 @@ depend() {
 start_post() {
     ulimit -n 524288
 
-    # 1. 确保系统安装了 iptables 核心支持
-    apk add iptables ip6tables 2>/dev/null
+    # 1. SSH 防断网路由策略 (保持22端口直连原生网卡)
+    ip rule add to 0.0.0.0/0 dport 22 lookup main pref 5
+    ip rule add to 0.0.0.0/0 sport 22 lookup main pref 5
+    ip -6 rule add to ::/0 dport 22 lookup main pref 5
+    ip -6 rule add to ::/0 sport 22 lookup main pref 5
 
-    # 2. SSH 防断网路由策略 (最高优先级，保持 22 端口绝对直连)
-    ip rule add to 0.0.0.0/0 dport 22 lookup main pref 2
-    ip rule add to 0.0.0.0/0 sport 22 lookup main pref 2
-    ip -6 rule add to ::/0 dport 22 lookup main pref 2
-    ip -6 rule add to ::/0 sport 22 lookup main pref 2
-
-    # 3. 【核心救星】利用 iptables 标记 root 用户（WARP 进程）发出的所有外网流量
-    # 给它们打上 fwmark 777，并强制它们走 main 路由表直连物理网卡，彻底免疫任何 Anycast IP 变化
-    iptables -t mangle -A OUTPUT -m owner --uid-owner 0 -j MARK --set-mark 777
-    ip6tables -t mangle -A OUTPUT -m owner --uid-owner 0 -j MARK --set-mark 777
-    
-    # 强制放行被标记的 WARP 流量
-    ip rule add fwmark 777 lookup main pref 3
-    ip -6 rule add fwmark 777 lookup main pref 3
-
-    # 4. 本地回环与内网保留网段直连放行
+    # 2. CF WARP 本地回环与宿主机直连放行
     ip rule add to 127.0.0.0/8 lookup main pref 4
     ip -6 rule add to ::1 lookup main pref 4
-    ip rule add to 10.0.0.0/8 lookup main pref 4
-    ip rule add to 172.16.0.0/12 lookup main pref 4
-    ip rule add to 192.168.0.0/16 lookup main pref 4
+
+    # 3. 【核心救星】无条件放行 Cloudflare WARP 所有的远程 Endpoint / MASQUE 服务器网段！
+    # 只要目的地是去建立 WARP 隧道的流量，一律走原生网卡直连，不准进 tun0！
+    ip rule add to 162.159.192.0/24 lookup main pref 6
+    ip rule add to 162.159.193.0/24 lookup main pref 6
+    ip rule add to 162.159.195.0/24 lookup main pref 6
+    ip rule add to 162.159.198.0/24 lookup main pref 6
+    ip rule add to 188.114.96.0/24 lookup main pref 6
+    ip rule add to 188.114.97.0/24 lookup main pref 6
+    ip -6 rule add to 2606:4700:d0::/48 lookup main pref 6
+
+    # 4. 代理软件（hev-socks5-tunnel）自身发出的标有 438 的包直连
+    ip rule add fwmark 438 lookup main pref 10
+    ip -6 rule add fwmark 438 lookup main pref 10
 
     # 5. 主网卡原路返回路由
-    [ -n "${MAIN_IP}" ] && ip rule add from ${MAIN_IP} lookup main pref 5
-    [ -n "${MAIN_IP6}" ] && ip -6 rule add from ${MAIN_IP6} lookup main pref 5
+    [ -n "${MAIN_IP}" ] && ip rule add from ${MAIN_IP} lookup main pref 15
+    [ -n "${MAIN_IP6}" ] && ip -6 rule add from ${MAIN_IP6} lookup main pref 15
 
-    # 6. 将其余所有普通系统流量押送至 tun0 隧道
+    # 6. 内网保留网段直连放行
+    ip rule add to 10.0.0.0/8 lookup main pref 16
+    ip rule add to 172.16.0.0/12 lookup main pref 16
+    ip rule add to 192.168.0.0/16 lookup main pref 16
+
+    # 7. 核心全局流量重定向（将其余流量扔进 tun0）
     ip route add default dev tun0 table 20 2>/dev/null || ip route replace default dev tun0 table 20
-    ip rule add lookup 20 pref 10
-    ip -6 rule add lookup 20 pref 10
+    ip rule add lookup 20 pref 20
 
     return 0
 }
 
 stop_post() {
-    # 清洗 iptables 防火墙规则
-    iptables -t mangle -D OUTPUT -m owner --uid-owner 0 -j MARK --set-mark 777 2>/dev/null
-    ip6tables -t mangle -D OUTPUT -m owner --uid-owner 0 -j MARK --set-mark 777 2>/dev/null
-
-    # 清洗路由策略
-    ip rule del to 0.0.0.0/0 dport 22 lookup main pref 2 2>/dev/null
-    ip rule del to 0.0.0.0/0 sport 22 lookup main pref 2 2>/dev/null
-    ip -6 rule del to ::/0 dport 22 lookup main pref 2 2>/dev/null
-    ip -6 rule del to ::/0 sport 22 lookup main pref 2 2>/dev/null
-
-    ip rule del fwmark 777 lookup main pref 3 2>/dev/null
-    ip -6 rule del fwmark 777 lookup main pref 3 2>/dev/null
+    ip rule del to 0.0.0.0/0 dport 22 lookup main pref 5 2>/dev/null
+    ip rule del to 0.0.0.0/0 sport 22 lookup main pref 5 2>/dev/null
+    ip -6 rule del to ::/0 dport 22 lookup main pref 5 2>/dev/null
+    ip -6 rule del to ::/0 sport 22 lookup main pref 5 2>/dev/null
 
     ip rule del to 127.0.0.0/8 lookup main pref 4 2>/dev/null
     ip -6 rule del to ::1 lookup main pref 4 2>/dev/null
-    ip rule del to 10.0.0.0/8 lookup main pref 4 2>/dev/null
-    ip rule del to 172.16.0.0/12 lookup main pref 4 2>/dev/null
-    ip rule del to 192.168.0.0/16 lookup main pref 4 2>/dev/null
 
-    [ -n "${MAIN_IP}" ] && ip rule del from ${MAIN_IP} lookup main pref 5 2>/dev/null
-    [ -n "${MAIN_IP6}" ] && ip -6 rule del from ${MAIN_IP6} lookup main pref 5 2>/dev/null
+    # 清理 WARP 远端放行路由
+    ip rule del to 162.159.192.0/24 lookup main pref 6 2>/dev/null
+    ip rule del to 162.159.193.0/24 lookup main pref 6 2>/dev/null
+    ip rule del to 162.159.195.0/24 lookup main pref 6 2>/dev/null
+    ip rule del to 162.159.198.0/24 lookup main pref 6 2>/dev/null
+    ip rule del to 188.114.96.0/24 lookup main pref 6 2>/dev/null
+    ip rule del to 188.114.97.0/24 lookup main pref 6 2>/dev/null
+    ip -6 rule del to 2606:4700:d0::/48 lookup main pref 6 2>/dev/null
+
+    ip rule del fwmark 438 lookup main pref 10 2>/dev/null
+    ip -6 rule del fwmark 438 lookup main pref 10 2>/dev/null
+
+    [ -n "${MAIN_IP}" ] && ip rule del from ${MAIN_IP} lookup main pref 15 2>/dev/null
+    [ -n "${MAIN_IP6}" ] && ip -6 rule del from ${MAIN_IP6} lookup main pref 15 2>/dev/null
+
+    ip rule del to 10.0.0.0/8 lookup main pref 16 2>/dev/null
+    ip rule del to 172.16.0.0/12 lookup main pref 16 2>/dev/null
+    ip rule del to 192.168.0.0/16 lookup main pref 16 2>/dev/null
 
     ip route del default dev tun0 table 20 2>/dev/null
-    ip rule del lookup 20 pref 10 2>/dev/null
-    ip -6 rule del lookup 20 pref 10 2>/dev/null
-    
+    ip rule del lookup 20 pref 20 2>/dev/null
     return 0
 }
 EOF
     chmod +x "$SERVICE_FILE"
 }
-
 install_tun2socks() {
     cleanup_ip_rules
     step "检查 tun2socks 服务当前状态..."
@@ -781,14 +870,44 @@ install_tun2socks() {
     if ! set_dns64_servers "$RESOLV_CONF" "$WAS_IMMUTABLE" "$RESOLV_CONF_BAK"; then return 1; fi
 
     local BINARY_PATH="/usr/local/bin/tun2socks"
-    step "从 GitHub 获取最新 Release 核心下载地址..."
-    local DOWNLOAD_URL=$(curl -s https://api.github.com/repos/$REPO_TUN2SOCKS/releases/latest | grep "browser_download_url" | grep "linux-x86_64" | cut -d '"' -f 4)
+
+    # ====================================================================
+    # 【核心修正 1】通过代理池轮询获取 GitHub API 核心数据
+    # ====================================================================
+    step "从 GitHub 获取最新 Release 核心下载地址 (自适应 IPv6)..."
+    local raw_api_url="https://api.github.com/repos/$REPO_TUN2SOCKS/releases/latest"
+    local latest_release_json=""
+    
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local final_api_url="${proxy}${raw_api_url}"
+        info "正在尝试通过 [ ${proxy:-原生直连} ] 请求 GitHub API..."
+        latest_release_json=$(curl -g -6 -s -m 15 "$final_api_url" || echo "")
+        if echo "$latest_release_json" | grep -q "browser_download_url"; then
+            success "成功获取到 Tun2Socks GitHub Release 元数据！"
+            break
+        fi
+    done
+
+    # ====================================================================
+    # 【核心修正 2】动态判断系统架构并放宽正则匹配（完美兼容 linux-amd64）
+    # ====================================================================
+    local ARCH=$(uname -m)
+    local MATCH_KEY="linux-amd64"
+    if [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
+        MATCH_KEY="linux-arm64"
+    elif [[ "$ARCH" == "386" || "$ARCH" == "i386" ]]; then
+        MATCH_KEY="linux-386"
+    fi
+
+    # 运用扩展正则，通杀 linux-x86_64, linux-amd64 以及动态 MATCH_KEY 
+    local DOWNLOAD_URL=$(echo "$latest_release_json" | grep "browser_download_url" | grep -E "linux-x86_64|linux-amd64|${MATCH_KEY}" | head -n1 | cut -d '"' -f 4)
 
     if [ -z "$DOWNLOAD_URL" ]; then
-        error "未找到适用于 linux-x86_64 的核心下载链接，请检查 network。"
+        error "未能成功匹配到适用于当前架构 (${ARCH}) 的核心下载链接，请检查网络。"
         restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
         return 1
     fi
+    # ====================================================================
 
     step "正在通过代理池下载 GitHub 最新核心程序..."
     cleanup_on_fail() {
@@ -821,7 +940,6 @@ install_tun2socks() {
         return 1
     }
 }
-
 uninstall_tun2socks() {
     cleanup_ip_rules
     step "正在停止并彻底禁用后台 OpenRC tun2socks 服务..."
@@ -971,7 +1089,7 @@ while true; do
     echo -e "${GREEN}  8. 查看日志${RESET}"
     echo -e "${GREEN}  9. 查看配置与出口状态${RESET}"
     echo -e "${GREEN} 10.${RESET} ${YELLOW}谷歌分流${RESET}"
-    echo -e "${GREEN} 11.${RESET} ${CYAN}Tun2Socks全局代理${RESET}"
+    echo -e "${GREEN} 11.${RESET} ${YELLOW}Tun2Socks全局代理${RESET}"
     echo -e "${GREEN}  0. 退出${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"

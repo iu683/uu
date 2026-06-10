@@ -1,57 +1,35 @@
-#!/usr/bin/env sh
-# ==============================================================================
-#   CF-WARP & Tun2Socks 终极双层控制面板 ( Alpine 专属)
-# ==============================================================================
+#!/usr/bin/env bash
+#
+# sing-box Hysteria 2 [Alpine专属]
+# SPDX-License-Identifier: MIT
+#
+set -Eop pipefail
+export LANG=en_US.UTF-8
 
-# 预检：由于 Alpine 默认不带高级语法，必须先自动补齐 bash 并切过去
-if [ -z "$BASH_VERSION" ]; then
-    if ! command -v bash >/dev/null 2>&1; then
-        apk update -q && apk add -q bash
-    fi
-    exec bash "$0" "$@"
-fi
+# =========================================================
+# 1. 核心控制与全局环境初始化
+# =========================================================
+readonly BINARY_PATH="/usr/local/bin/sing-box-hy2"
+readonly HY2_CONFIG="/etc/sing-box-hy2/config.json"
+readonly HY2_DIR="/root/proxynode/hy2"
+CONFIG_DIR="/etc/sing-box-hy2"
+OPENRC_SERVICE_PATH="/etc/init.d/sing-box-hy2"
+LOG_FILE="/var/log/sing-box-hy2.log"
+RUN_USER="singbox-hy2"
 
-set -e
+# 修复：补充 GitHub API 全局变量
+API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
 
-# ==============================================================================
-#   全局变量与常量定义
-# ==============================================================================
-export REPO_USQUE="Diniboy1123/usque"
-export REPO_TUN2SOCKS="heiher/hev-socks5-tunnel"
+TMP_DIR=$(mktemp -d -t sb-hy2.XXXXXX)
 
-export SERVICE_NAME="usque"
-export INSTALL_BIN="/usr/local/bin/usque"
-export CONF_DIR="/etc/usque"
-export CONF_FILE="${CONF_DIR}/config.json"
-export SERVICE_FILE="/etc/init.d/${SERVICE_NAME}"
-export META_FILE="${CONF_DIR}/.panel_meta"
+# 颜色标准规范
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+RESET="\033[0m"
 
-export PROXY_SERVICE_NAME="usque-google-proxy"
-export DATA_DIR="/var/lib/usque"
-export REDSOCKS_CONF="${CONF_DIR}/redsocks.conf"
-export PROXY_RULES_SCRIPT="${DATA_DIR}/google_rules.sh"
-export PROXY_SERVICE_FILE="/etc/init.d/${PROXY_SERVICE_NAME}"
-export REDSOCKS_PID="/run/usque-google-proxy.pid"
-
-# 颜色定义
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-NC='\033[0m'
-RESET='\033[0m'
-
-# 备用 DNS64 服务器
-ALTERNATE_DNS64_SERVERS=(
-    "2a00:1098:2b::1"
-    "2a01:4f8:c2c:123f::1"
-    "2a01:4f9:c010:3f02::1"
-    "2001:67c:2b0::4"
-    "2001:67c:2b0::6"
-)
-
-# GITHUB 代理加速池
+# GITHUB 代理列表
 GITHUB_PROXY=(
     ''
     'https://v6.gh-proxy.org/'
@@ -61,1121 +39,761 @@ GITHUB_PROXY=(
     'https://ghproxy.lvedong.eu.org/'
 )
 
-[[ "$EUID" -ne 0 ]] && echo -e "${RED}[错误]${RESET} 请使用 root 权限运行！" && exit 1
+info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
+error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
+pause() { echo; read -n 1 -s -r -p "$(echo -e ${GREEN}"按任意键返回菜单..."${RESET})" || true; echo; }
 
-# --- 底层日志函数 ---
-info() { echo -e "${BLUE}[信息]${RESET} $1"; }
-success() { echo -e "${GREEN}[成功]${RESET} $1"; }
-warning() { echo -e "${YELLOW}[警告]${RESET} $1"; }
-error() { echo -e "${RED}[错误]${RESET} $1"; }
-step() { echo -e "${PURPLE}[步骤]${RESET} $1"; }
+cleanup() {
+    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT INT TERM
 
-# ==============================================================================
-#   CF-WARP 核心逻辑
-# ==============================================================================
-get_status_info() {
-    if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
-        panel_status="${GREEN}运行中${RESET}"
-    else
-        panel_status="${RED}未运行${RESET}"
-    fi
+generate_random_password() {
+    dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
+}
+
+is_alpine() {
+    [[ -f /etc/alpine-release ]]
+}
+
+install_packages() {
+    info "正在刷新 Alpine 仓库并安装核心依赖..."
+    apk update
+    apk add --no-cache bash curl wget tar openssl openrc iproute2 jq grep sed coreutils bind-tools iptables ip6tables gcompat socat python3
     
-    if [ -f "$INSTALL_BIN" ]; then
-        local ver
-        ver=$("$INSTALL_BIN" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-        panel_version="${YELLOW}v${ver:-已安装}${RESET}"
-    else
-        panel_version="${RED}未安装${RESET}"
+    if [[ -f /etc/init.d/iptables ]]; then
+        rc-update add iptables default >/dev/null 2>&1 || true
+        rc-service iptables start >/dev/null 2>&1 || true
     fi
-    
-    if [ -f "$META_FILE" ]; then
-        IFS='|' read -r m_mode m_ip m_port _ < "$META_FILE"
-        panel_port="${YELLOW}${m_mode}://$m_ip:$m_port${RESET}"
-    else
-        panel_port="${RED}未配置${RESET}"
+    if [[ -f /etc/init.d/ip6tables ]]; then
+        rc-update add ip6tables default >/dev/null 2>&1 || true
+        rc-service ip6tables start >/dev/null 2>&1 || true
     fi
 }
 
-check_deps() {
-    local missing=""
-    ! command -v unzip >/dev/null 2>&1 && missing="$missing unzip"
-    ! command -v curl >/dev/null 2>&1 && missing="$missing curl"
-    ! command -v ip >/dev/null 2>&1 && missing="$missing iproute2"
-    if [ -n "$missing" ]; then
-        apk update -q && apk add -q $missing >/dev/null 2>&1
+create_user() {
+    getent group "$RUN_USER" &>/dev/null || addgroup -S "$RUN_USER"
+    id "$RUN_USER" &>/dev/null || adduser -S -D -H -G "$RUN_USER" -s /sbin/nologin "$RUN_USER"
+}
+
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        armv7l|armv7) echo "armv7" ;;
+        *) error "不支持当前架构: $(uname -m)"; exit 8 ;;
+    esac
+}
+
+check_environment() {
+    if ! is_alpine; then
+        error "本脚本仅支持 Alpine Linux 系统。"
+        exit 95
+    fi
+    install_packages
+    create_user
+}
+
+get_installed_version() {
+    if [[ -f "$BINARY_PATH" ]]; then
+        "$BINARY_PATH" version 2>/dev/null | head -n1 | awk '{print $3}' || echo "未知版本"
+    else
+        echo "未安装"
     fi
 }
 
-install_warp() {
-    check_deps
-    local is_upgrade=0
-    local o_mode="SOCKS5" o_ip="127.0.0.1" o_port="1080" o_user="" o_pass=""
-    
-    if [ -f "$CONF_FILE" ] && [ -f "$INSTALL_BIN" ]; then
-        is_upgrade=1
-        echo -e "${BLUE}[信息]${RESET} 检测到已有配置，正在进行无损覆盖升级..."
-        if [ -f "$META_FILE" ]; then
-            IFS='|' read -r o_mode o_ip o_port o_user o_pass < "$META_FILE"
-        fi
-    else
-        echo -e "${BLUE}[信息]${RESET} 正在全新安装 Usque 核心组件..."
-    fi
-    
-    # ====================================================================
-    # 【终极修正】不再盲信 curl -4！直接透视 Linux 内核路由表判定双栈状态
-    # ====================================================================
-    local has_v4=0
-    # 检查 IPv4 路由表里有没有默认网关出口 (0.0.0.0/0)
-    if ip -4 route show | grep -q "default"; then
-        has_v4=1
-        echo -e "${BLUE}[检测]${RESET} 环境判定：原生 IPv4/双栈 网络环境"
-    else
-        has_v4=0
-        echo -e "${YELLOW}[检测]${RESET} 环境判定：确定为纯 IPv6(IPv6-Only)"
-    fi
-    # ====================================================================
-
-    local ARCH=$(uname -m)
-    local TARGET="linux_amd64"
-    [[ "$ARCH" == "aarch64" ]] && TARGET="linux_arm64"
-
-    # ====================================================================
-    # 【修正 1】获取最新 Tag（支持代理池轮询，且强制使用 IPv6 友好参数）
-    # ====================================================================
-    local latest_tag=""
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local api_url="${proxy}https://api.github.com/repos/${REPO_USQUE}/releases/latest"
-        echo -e "${BLUE}[信息]${RESET} 正在尝试通过 [ ${proxy:-原生直连} ] 获取版本信息..."
-        latest_tag=$(curl -g -6 -fsSL --max-time 6 "$api_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-        [ -n "$latest_tag" ] && break
-    done
-    [ -z "$latest_tag" ] && latest_tag="v3.0.0"
-    local pure_ver="${latest_tag#v}"
-    echo -e "${GREEN}[成功]${RESET} 目标安装版本: ${latest_tag}"
-
-    # ====================================================================
-    # 【修正 2】下载核心（彻底废除 ${GITHUB_PROXY[0]} 死锁，开启全池轮询与原生直连兜底）
-    # ====================================================================
-    local tmp_dir=$(mktemp -d)
-    local download_success=0
-    local raw_download_url="https://github.com/${REPO_USQUE}/releases/download/${latest_tag}/usque_${pure_ver}_${TARGET}.zip"
+get_latest_version() {
+    local _tmpfile
+    _tmpfile=$(mktemp)
+    local _success=1
+    local _tag_name=""
 
     for proxy in "${GITHUB_PROXY[@]}"; do
-        local final_download_url="${proxy}${raw_download_url}"
-        echo -e "${BLUE}[信息]${RESET} 正在尝试通过 [ ${proxy:-原生直连} ] 下载核心压缩包..."
-        
-        # 使用 -g -6 强化纯 IPv6 环境下的 curl 稳定性
-        if curl -g -6 -fsSL -L --max-time 45 -o "$tmp_dir/zip" "$final_download_url"; then
-            download_success=1
-            break
-        else
-            echo -e "${YELLOW}[警告]${RESET} 当前下载通道失败，正在尝试切换..."
-            [ -f "$tmp_dir/zip" ] && rm -f "$tmp_dir/zip"
-        fi
-    done
+        local _url="${proxy}${API_BASE_URL}/releases/latest"
 
-    # 严密拦截：如果所有通道都漏油，直接中断防止套娃报错
-    if [ "$download_success" -ne 1 ]; then
-        echo -e "${RED}[错误]${RESET} 核心组件下载失败，所有 GitHub 代理通道及原生直连均不可达。"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
+        info "正在通过代理 [${proxy:-直连}] 获取最新版本..."
 
-    # 解压并部署组件
-    unzip -q -o "$tmp_dir/zip" -d "$tmp_dir"
-    rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
-    cp -f "$tmp_dir/usque" "$INSTALL_BIN"
-    chmod +x "$INSTALL_BIN"
-    rm -rf "$tmp_dir"
+        if wget -q --no-check-certificate -O "$_tmpfile" \
+            --header="Accept: application/vnd.github.v3+json" \
+            "$_url"; then
 
-    [ -d "$CONF_DIR" ] || mkdir -p "$CONF_DIR"
-    cd "$CONF_DIR"
-    
-    # ====================================================================
-    # 分支 1：如果是覆盖升级模式（绝对不碰配置，换完核心直接原样复活启动）
-    # ====================================================================
-    if [ "$is_upgrade" -eq 1 ]; then
-        echo -e "${GREEN}[成功]${RESET} 核心二进制程序替换完成。"
-        write_openrc "$o_mode" "$o_ip" "$o_port" "$o_user" "$o_pass"
-        rc-service "$SERVICE_NAME" start
-        echo -e "${GREEN}[成功]${RESET} WARP 核心组件已成功无损升级并恢复运行！"
-        return 0
-    fi
-
-    # ====================================================================
-    # 分支 2：如果是全新安装模式（执行匿名注册 ➔ 精准修正 IPv6 ➔ 初始化配置）
-    # ====================================================================
-    echo -e "${BLUE}[信息]${RESET} 正在执行本地匿名注册..."
-    if "${INSTALL_BIN}" register; then
-        echo -e "${GREEN}[成功]${RESET} Cloudflare 本地注册成功。"
-    else
-        echo -e "${RED}[错误]${RESET} 注册失败。提示：请确保你的 VPS 已开启 IPv6 外部访问能力。"
-        return 1
-    fi
-
-    # 【全新安装专享】只有当上面内核明确判定 has_v4=0 时，才无死角执行清洗
-    if [ "$has_v4" -eq 0 ] && [ -f "$CONF_FILE" ]; then
-        echo -e "${BLUE}[信息]${RESET} 纯 IPv6 判定通过，正在强制改写新生成的配置..."
-        
-        # 顺着它的毛摸，精准换掉 IP（不加端口和方括号，完全贴合原生 JSON）
-        sed -i 's/"endpoint_v4": *"[^"]*"/"endpoint_v4": "2606:4700:103::2"/g' "$CONF_FILE"
-        sed -i 's/"endpoint_v6": *"[^"]*"/"endpoint_v6": "2606:4700:103::2"/g' "$CONF_FILE"
-        sed -i 's/"endpoint_h2_v4": *"[^"]*"/"endpoint_h2_v4": "2606:4700:103::2"/g' "$CONF_FILE"
-        sed -i 's/"endpoint_h2_v6": *"[^"]*"/"endpoint_h2_v6": "2606:4700:103::2"/g' "$CONF_FILE"
-        
-        echo -e "${GREEN}[成功]${RESET} IPv6 Endpoint 强制注入成功！"
-    fi
-    
-    # 引导全新安装的用户配置初始化参数
-    echo -e "\n--- 请配置初始化绑定参数 ---"
-    echo -e "请选择运行模式:"
-    echo -e "  1. SOCKS5 (默认)"
-    echo -e "  2. HTTP"
-    echo -ne "${GREEN}请输入选项 [默认: 1]: ${RESET}"
-    read -r mode_ch
-    local ins_mode="SOCKS5"
-    [[ "$mode_ch" == "2" ]] && ins_mode="HTTP"
-
-    echo -ne "${GREEN}请输入监听 IP [默认: 127.0.0.1]: ${RESET}"
-    read -r ins_ip
-    ins_ip="${ins_ip:-127.0.0.1}"
-
-    echo -ne "${GREEN}请输入监听端口 [默认: 1080]: ${RESET}"
-    read -r ins_port
-    ins_port="${ins_port:-1080}"
-
-    echo -ne "${GREEN}请输入代理用户名 (留空则无验证): ${RESET}"
-    read -r ins_user
-    local ins_pass=""
-    if [ -n "$ins_user" ]; then
-        echo -ne "${GREEN}请输入代理密码: ${RESET}"
-        read -r ins_pass
-    fi
-
-    write_openrc "$ins_mode" "$ins_ip" "$ins_port" "$ins_user" "$ins_pass"
-    rc-service "$SERVICE_NAME" start
-    echo -e "${GREEN}[成功]${RESET} WARP 全新安装并启动成功！"
-}
-write_openrc() {
-    local mode="$1" ip="$2" port="$3" user="$4" pass="$5"
-    local cmd="socks"
-    [[ "$mode" == "HTTP" ]] && cmd="http-proxy"
-    local args="${cmd} -b ${ip} -p ${port}"
-    [[ -n "$user" ]] && args="${args} -u ${user} -w ${pass}"
-
-    cat <<EOF > "$SERVICE_FILE"
-#!/sbin/openrc-run
-description="Usque WARP Proxy Server"
-supervisor="supervise-daemon"
-command="${INSTALL_BIN}"
-command_args="--config ${CONF_FILE} ${args}"
-command_background="yes"
-directory="${CONF_DIR}"
-output_log="/var/log/usque.log"
-error_log="/var/log/usque.err"
-depend() { need net; after firewall; }
-EOF
-    chmod +x "$SERVICE_FILE"
-    rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
-    echo "${mode}|${ip}|${port}|${user}|${pass}" > "$META_FILE"
-}
-
-edit_config() {
-    if [ ! -f "$META_FILE" ]; then echo -e "${RED}[错误]${RESET} 未发现配置记录"; return; fi
-    IFS='|' read -r o_mode o_ip o_port o_user o_pass < "$META_FILE"
-    echo "--- 修改配置 ---"
-    read -r -p "请选择模式 (1.SOCKS5 2.HTTP) [当前: $o_mode]: " m_ch
-    local n_mode="$o_mode"
-    [[ "$m_ch" == "1" ]] && n_mode="SOCKS5"
-    [[ "$m_ch" == "2" ]] && n_mode="HTTP"
-    read -r -p "监听 IP [当前: $o_ip]: " n_ip; n_ip="${n_ip:-$o_ip}"
-    read -r -p "监听端口 [当前: $o_port]: " n_port; n_port="${n_port:-$o_port}"
-    
-    read -r -p "请输入用户名 [当前: ${o_user:-无}]: " n_user
-    n_user="${n_user:-$o_user}"
-    local n_pass="$o_pass"
-    if [ -n "$n_user" ]; then
-        read -r -p "请输入新密码: " n_pass
-    else
-        n_pass=""
-    fi
-
-    write_openrc "$n_mode" "$n_ip" "$n_port" "$n_user" "$n_pass"
-    rc-service "$SERVICE_NAME" restart
-}
-
-show_status() {
-    if [ ! -f "$META_FILE" ]; then echo -e "${RED}[错误]${RESET} 未配置过服务"; return; fi
-    IFS='|' read -r b_mode b_ip b_port b_user b_pass < "$META_FILE"
-    echo -e "\n代理模式: $b_mode | 监听: $b_ip:$b_port"
-    local p_url="socks5://"
-    [[ "$b_mode" == "HTTP" ]] && p_url="http://"
-    [[ "$b_ip" == "0.0.0.0" ]] && b_ip="127.0.0.1"
-    if curl -sS --max-time 6 -x "${p_url}${b_ip}:${b_port}" "https://www.cloudflare.com/cdn-cgi/trace" | grep -q "warp=on"; then
-        success "WARP 网络出口完全正常！"
-    else
-        error "代理未成功通过 WARP 出网，请检查日志。"
-    fi
-}
-
-# ==============================================================================
-#   谷歌分流二级菜单
-# ==============================================================================
-google_split_menu() {
-    while true; do
-        clear
-        local g_status="${RED}未运行${RESET}"
-        rc-service "$PROXY_SERVICE_NAME" status >/dev/null 2>&1 && g_status="${YELLOW}运行中${RESET}"
-        echo -e "${GREEN}==============================${RESET}"
-        echo -e "${GREEN}        谷歌分流管理面板        ${RESET}"
-        echo -e "${GREEN}==============================${RESET}"
-        echo -e "${GREEN}当前状态 :${RESET} $g_status"
-        echo -e "${GREEN}==============================${RESET}"
-        echo -e "${GREEN}  1. 开启谷歌透明分流${RESET}"
-        echo -e "${GREEN}  2. 关闭谷歌透明分流${RESET}"
-        echo -e "${GREEN}  3. 验证谷歌分流连通性${RESET}"
-        echo -e "${GREEN}  0. 返回主菜单${RESET}"
-        echo -e "${GREEN}==============================${RESET}"
-        echo -ne "${GREEN}请输入选项: ${RESET}"
-        read -r sub_ch
-        case "$sub_ch" in
-            1)
-                if ! command -v redsocks &>/dev/null || ! command -v iptables &>/dev/null; then
-                    echo -e "${BLUE}[信息]${RESET} 正在安装分流依赖组件..."
-                    apk add -q redsocks iptables --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community/ || apk add -q redsocks iptables
-                fi
-                local REDSOCKS_BIN="/usr/bin/redsocks"
-                [ ! -f "$REDSOCKS_BIN" ] && REDSOCKS_BIN=$(command -v redsocks 2>/dev/null || echo "/usr/sbin/redsocks")
-                rc-service "$PROXY_SERVICE_NAME" stop >/dev/null 2>&1 || true
-                pkill -9 -f redsocks >/dev/null 2>&1 || true
-                rc-service "$PROXY_SERVICE_NAME" zap >/dev/null 2>&1 || true
-                rm -f "$REDSOCKS_PID"
-                ip -6 route add blackhole 2607:f8b0::/32 2>/dev/null || true
-                IFS='|' read -r _ _ warp_port _ < "$META_FILE"
-                cat <<EOF > "$REDSOCKS_CONF"
-base { log_debug = off; log_info = on; log = "syslog:daemon"; daemon = off; redirector = iptables; }
-redsocks { local_ip = 127.0.0.1; local_port = 12345; ip = 127.0.0.1; port = ${warp_port:-1080}; type = socks5; }
-EOF
-                [ -d "$DATA_DIR" ] || mkdir -p "$DATA_DIR"
-                cat <<'EOF' > "$PROXY_RULES_SCRIPT"
-#!/bin/bash
-ACTION=$1
-GOOGLE_IPS="
-8.8.4.0/24 8.8.8.0/24 34.0.0.0/9 35.184.0.0/13 35.192.0.0/12
-35.224.0.0/12 35.240.0.0/13 64.233.160.0/19 66.102.0.0/20
-66.249.64.0/19 72.14.192.0/18 74.125.0.0/16 104.132.0.0/14
-108.177.0.0/17 142.250.0.0/15 172.217.0.0/16 172.253.0.0/16
-173.194.0.0/16 209.85.128.0/17 216.58.192.0/19 216.239.32.0/19
-"
-if [ "$ACTION" = "start" ]; then
-    iptables -t nat -N WARP_GOOGLE 2>/dev/null || true
-    iptables -t nat -F WARP_GOOGLE
-    for ip in $GOOGLE_IPS; do iptables -t nat -A WARP_GOOGLE -d $ip -p tcp -j REDIRECT --to-ports 12345; done
-    iptables -t nat -C OUTPUT -j WARP_GOOGLE 2>/dev/null || iptables -t nat -A OUTPUT -j WARP_GOOGLE
-elif [ "$ACTION" = "stop" ]; then
-    iptables -t nat -D OUTPUT -j WARP_GOOGLE 2>/dev/null || true
-    iptables -t nat -F WARP_GOOGLE 2>/dev/null || true
-    iptables -t nat -X WARP_GOOGLE 2>/dev/null || true
-fi
-EOF
-                chmod +x "$PROXY_RULES_SCRIPT"
-                cat <<EOF > "$PROXY_SERVICE_FILE"
-#!/sbin/openrc-run
-supervisor="supervise-daemon"
-command="${REDSOCKS_BIN}"
-command_args="-c ${REDSOCKS_CONF}"
-command_background="yes"
-pidfile="${REDSOCKS_PID}"
-start_post() { ${PROXY_RULES_SCRIPT} start; }
-stop_pre() { ${PROXY_RULES_SCRIPT} stop; }
-EOF
-                chmod +x "$PROXY_SERVICE_FILE"
-                rc-service "$PROXY_SERVICE_NAME" start
-                success "谷歌分流规则已挂载完成！"
-                ;;
-            2)
-                rc-service "$PROXY_SERVICE_NAME" stop 2>/dev/null || true
-                pkill -9 -f redsocks >/dev/null 2>&1 || true
-                rc-service "$PROXY_SERVICE_NAME" zap >/dev/null 2>&1 || true
-                rm -f "$REDSOCKS_PID"
-                success "谷歌分流规则已卸载。"
-                ;;
-            3)
-                echo -e "\n[正在验证谷歌透明拦截链路...]"
-                if iptables -t nat -L OUTPUT -n 2>/dev/null | grep -q "WARP_GOOGLE"; then
-                    echo -e " iptables 劫持链: ${GREEN}✔ 正常挂载${RESET}"
-                else
-                    echo -e " iptables 劫持链: ${RED}✘ 未发现劫持规则 (直连中)${RESET}"
-                fi
-                local code=$(curl -o /dev/null -s -w "%{http_code}" --max-time 5 "https://www.google.com" || echo "000")
-                if [ "$code" -eq 200 ] || [ "$code" -eq 301 ] || [ "$code" -eq 302 ]; then
-                    echo -e " 谷歌直连测试  : ${GREEN}✔ 成功连通 (状态码: $code)${RESET}"
-                else
-                    echo -e " 谷歌直连测试  : ${RED}✘ 连接失败 (状态码: $code)${RESET}"
-                fi
-                ;;
-            0) return ;;
-        esac
-        read -n 1 -s -r -p "按任意键继续..."
-    done
-}
-
-# ==============================================================================
-#   Tun2Socks 核心分流与全局代理逻辑
-# ==============================================================================
-test_dns64_server() {
-    local dns_server=$1
-    step "正在测试DNS64服务器 $dns_server 的连通性..."
-    if ping6 -c 3 -W 2 "$dns_server" &>/dev/null; then
-        info "DNS64服务器 $dns_server 可达。"
-        return 0
-    else
-        warning "DNS64服务器 $dns_server 不可达。"
-        return 1
-    fi
-}
-
-test_github_access() {
-    step "正在测试GitHub访问..."
-    if curl -s -I -m 10 https://github.com >/dev/null; then
-        success "GitHub访问测试成功。"
-        return 0
-    else
-        warning "GitHub访问测试失败。"
-        return 1
-    fi
-}
-
-restore_dns_config() {
-    local resolv_conf=$1
-    local resolv_conf_bak=$2
-    local was_immutable=$3
-    step "恢复原始 DNS 配置..."
-    if [ -f "$resolv_conf_bak" ]; then
-        mv "$resolv_conf_bak" "$resolv_conf"
-        success "DNS 配置已恢复。"
-        if [ "$was_immutable" = true ]; then
-            info "重新锁定 /etc/resolv.conf..."
-            chattr +i "$resolv_conf" || warning "无法重新锁定 /etc/resolv.conf。"
-            success "锁定完成。"
-        fi
-    else
-        warning "未找到 DNS 备份文件 ($resolv_conf_bak)，无法自动恢复。"
-        if [ "$was_immutable" = true ]; then
-             warning "尝试锁定当前的 /etc/resolv.conf..."
-             chattr +i "$resolv_conf" || warning "无法锁定 /etc/resolv.conf。"
-        fi
-    fi
-}
-
-set_dns64_servers() {
-    local resolv_conf=$1
-    local was_immutable=$2
-    local resolv_conf_bak=$3
-    step "设置 DNS64 服务器（用于无缝下载核心程序）..."
-    cat > "$resolv_conf" <<EOF
-nameserver 2602:fc59:b0:9e::64
-EOF
-    if test_github_access; then return 0; fi
-    warning "主DNS64服务器访问GitHub失败，尝试备选DNS64服务器..."
-    for dns_server in "${ALTERNATE_DNS64_SERVERS[@]}"; do
-        if test_dns64_server "$dns_server"; then
-            step "使用备选DNS64服务器: $dns_server"
-            cat > "$resolv_conf" <<EOF
-nameserver $dns_server
-EOF
-            if test_github_access; then
-                success "使用备选DNS64服务器 $dns_server 成功访问GitHub。"
-                return 0
+            _tag_name=$(jq -r '.tag_name' "$_tmpfile" 2>/dev/null || echo "")
+            if [[ -n "$_tag_name" && "$_tag_name" != "null" ]]; then
+                _success=0
+                break
             fi
         fi
     done
-    error "所有DNS64服务器测试失败，无法访问GitHub。"
-    restore_dns_config "$resolv_conf" "$resolv_conf_bak" "$was_immutable"
-    return 1
+
+    rm -f "$_tmpfile"
+
+    if [[ $_success -eq 0 ]]; then
+        echo "${_tag_name##*\/}"
+    else
+        echo ""
+    fi
 }
 
-cleanup_ip_rules() {
-    step "正在强行清理底层残留的 IP 规则和旧路由..."
-    ip rule del fwmark 438 lookup main pref 10 2>/dev/null || true
-    ip -6 rule del fwmark 438 lookup main pref 10 2>/dev/null || true
-    ip route del default dev tun0 table 20 2>/dev/null || true
-    ip rule del lookup 20 pref 20 2>/dev/null || true
-    ip rule del to 127.0.0.0/8 lookup main pref 16 2>/dev/null || true
-    ip rule del to 10.0.0.0/8 lookup main pref 16 2>/dev/null || true
-    ip rule del to 172.16.0.0/12 lookup main pref 16 2>/dev/null || true
-    ip rule del to 192.168.0.0/16 lookup main pref 16 2>/dev/null || true
-    ip rule del to 0.0.0.0/0 dport 22 lookup main pref 5 2>/dev/null || true
-    ip rule del to 0.0.0.0/0 sport 22 lookup main pref 5 2>/dev/null || true
-    ip -6 rule del to ::/0 dport 22 lookup main pref 5 2>/dev/null || true
-    ip -6 rule del to ::/0 sport 22 lookup main pref 5 2>/dev/null || true
-    ip rule del to 127.0.0.1 lookup main pref 4 2>/dev/null || true
-    ip -6 rule del to ::1 lookup main pref 4 2>/dev/null || true
+clear_old_iptables() {
+    if [[ -f "${CONFIG_DIR}/hopping.txt" && -f "${CONFIG_DIR}/main_port.txt" ]]; then
+        local old_hop
+        old_hop=$(cat "${CONFIG_DIR}/hopping.txt")
+        local old_port
+        old_port=$(cat "${CONFIG_DIR}/main_port.txt")
+        local old_start="${old_hop%-*}"
+        local old_end="${old_hop#*-}"
+
+        if [[ -n "$old_start" && -n "$old_end" && -n "$old_port" ]]; then
+            info "正在清洁防火墙残留规则..."
+            iptables -t nat -D PREROUTING -p udp -m multiport --dports "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+            ip6tables -t nat -D PREROUTING -p udp -m multiport --dports "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+            iptables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+            ip6tables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+        fi
+    fi
+}
+
+apply_new_iptables() {
+    clear_old_iptables
+    if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
+        local hop_val
+        hop_val=$(cat "${CONFIG_DIR}/hopping.txt")
+        local start_p="${hop_val%-*}"
+        local end_p="${hop_val#*-}"
+        
+        info "正在应用 iptables 转发规则: UDP $start_p-$end_p => 主端口 $port"
+        if iptables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port"; then
+            ip6tables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+        else
+            iptables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port"
+            ip6tables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+        fi
+        
+        echo "$port" > "${CONFIG_DIR}/main_port.txt"
+        
+        if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
+        if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
+        info "防火墙端口跳跃规则已固化。"
+    fi
+}
+
+# =========================================================
+# 4. 网络诊断与配置管理辅助
+# =========================================================
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网IP"
+}
+
+check_port() {
+    local port="$1"
+    if ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
+        return 1
+    fi
+    return 0
+}
+
+is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
+
+get_random_port() {
+    local rand_port
+    while true; do
+        rand_port=$(shuf -i 2000-65535 -n 1)
+        if check_port "$rand_port"; then
+            echo "$rand_port" && return 0
+        fi
+    done
+}
+
+get_hy2_status() {
+    if rc-service sing-box-hy2 status 2>/dev/null | grep -q "started"; then
+        echo "RUNNING"
+    else
+        echo "STOPPED"
+    fi
+}
+
+get_current_port_display() {
+    if [[ -f "$HY2_CONFIG" ]]; then
+        local main_port jump_range="无"
+        main_port=$(jq -r '.inbounds[0].listen_port // empty' "$HY2_CONFIG" 2>/dev/null)
+        [[ -f "${CONFIG_DIR}/hopping.txt" ]] && jump_range=$(cat "${CONFIG_DIR}/hopping.txt")
+        
+        if [[ "$jump_range" != "无" ]]; then
+            echo "${main_port} [${jump_range}]"
+        else
+            echo "${main_port:- -}"
+        fi
+    else echo "-"; fi
+}
+
+# =========================================================
+# 5. 面板节点配置生成核心逻辑 (Hysteria 2)
+# =========================================================
+fix_external_cert_permission() {
+    local cert="$1"
+    local key="$2"
     
-    local cfg="/etc/tun2socks/config.yaml"
-    if [ -f "$cfg" ]; then
-        local p=$(grep -E '^[[:space:]]*port:' "$cfg" | head -n1 | awk '{print $2}' | tr -d "'\"")
-        [ -n "$p" ] && ip rule del to 127.0.0.1 dport "$p" lookup main pref 4 2>/dev/null || true
-    fi
-    while ip rule del pref 15 2>/dev/null; do true; done
-    while ip -6 rule del pref 15 2>/dev/null; do true; done
-    while ip rule del pref 5 2>/dev/null; do true; done
-    while ip -6 rule del pref 5 2>/dev/null; do true; done
-    success "IP 基础路由规则全面洗净。"
-}
-
-download_with_proxy() {
-    local target_path=$1
-    local raw_url=$2
-    local success_flag=1
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local final_url="${proxy}${raw_url}"
-        if [ -z "$proxy" ]; then
-            info "正在尝试通过 [ 原生直连 ] 下载..."
-        else
-            info "正在尝试通过加速代理 [ ${proxy} ] 下载..."
-        fi
-        if curl -L -m 45 -f -o "$target_path" "$final_url"; then
-            success "文件下载成功！"
-            success_flag=0
-            break
-        else
-            warning "当前下载通道失败，正在尝试下一个..."
-            [ -f "$target_path" ] && rm -f "$target_path"
-        fi
-    done
-    return $success_flag
-}
-
-write_tun2socks_config() {
-    local CONFIG_FILE="/etc/tun2socks/config.yaml"
-    mkdir -p "/etc/tun2socks"
-
-    local current_addr="" current_port="" current_user="" current_pass=""
-    if [ -f "$CONFIG_FILE" ]; then
-        current_addr=$(grep -E '^[[:space:]]*address:' "$CONFIG_FILE" | head -n1 | awk '{print $2}' | tr -d "'\"")
-        current_port=$(grep -E '^[[:space:]]*port:' "$CONFIG_FILE" | head -n1 | awk '{print $2}' | tr -d "'\"")
-        current_user=$(grep -E '^[[:space:]]*username:' "$CONFIG_FILE" | head -n1 | awk '{print $2}' | tr -d "'\"")
-        current_pass=$(grep -E '^[[:space:]]*password:' "$CONFIG_FILE" | head -n1 | awk '{print $2}' | tr -d "'\"")
-    fi
-
-    local input_addr
-    while true; do
-        if [ -n "$current_addr" ]; then
-            echo -ne "${GREEN}请输入Socks5服务器地址 [$current_addr]: ${RESET}"
-            read -r input_addr
-            [ -z "$input_addr" ] && input_addr=$current_addr
-        else
-            echo -ne "${GREEN}请输入Socks5服务器地址 (直接回车默认 127.0.0.1): ${RESET}"
-            read -r input_addr
-            [ -z "$input_addr" ] && input_addr="127.0.0.1"
-        fi
-        if [ -n "$input_addr" ]; then break; else error "服务器地址不能为空。"; fi
-    done
-
-    local input_port
-    while true; do
-        if [ -n "$current_port" ]; then
-            echo -ne "${GREEN}请输入Socks5服务器端口 [$current_port]: ${RESET}"
-            read -r input_port
-            [ -z "$input_port" ] && input_port=$current_port
-        else
-            echo -ne "${GREEN}请输入Socks5服务器端口 (直接回车默认 1080): ${RESET}"
-            read -r input_port
-            [ -z "$input_port" ] && input_port="1080"
-        fi
-        if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
-            break
-        else
-            error "无效的端口号，请输入 1 到 65535 之间的数字。"
-        fi
-    done
-
-    local input_user
-    if [ -n "$current_user" ]; then
-        read -r -p "请输入用户名 (回车保持现状, 彻底清空请输入 none) [$current_user]: " input_user
-        [ -z "$input_user" ] && input_user=$current_user
-        [ "$input_user" = "none" ] && input_user=""
-    else
-        read -r -p "请输入用户名 (WARP无需验证直接留空回车): " input_user
-    fi
-
-    local input_pass
-    if [ -n "$input_user" ]; then
-        if [ -n "$current_pass" ]; then
-            read -r -p "请输入密码 (回车保持现状, 彻底清空请输入 none) [$current_pass]: " input_pass
-            [ -z "$input_pass" ] && input_pass=$current_pass
-            [ "$input_pass" = "none" ] && input_pass=""
-        else
-            read -r -p "请输入密码 (可选，无验证直接留空回车): " input_pass
-        fi
-    else
-        input_pass=""
-    fi
-
-    input_addr=$(echo "$input_addr" | tr -d '\r' | sed "s/'/''/g")
-    input_port=$(echo "$input_port" | tr -d '\r')
-    input_user=$(echo "$input_user" | tr -d '\r' | sed "s/'/''/g")
-    input_pass=$(echo "$input_pass" | tr -d '\r' | sed "s/'/''/g")
-
-    # 保持 hev-socks5-tunnel 的纯正配置格式，死死锁住 mark: 438
-    cat > "$CONFIG_FILE" <<EOF
-tunnel:
-  name: tun0
-  mtu: 1500
-  multi-queue: true
-  ipv4: 198.18.0.1
-
-socks5:
-  port: $input_port
-  address: '$input_addr'
-  udp: 'udp'
-$( [ -n "$input_user" ] && echo "  username: '$input_user'" )
-$( [ -n "$input_pass" ] && echo "  password: '$input_pass'" )
-  mark: 438
-EOF
-}
-
-change_tun2socks_config() {
-    info "开始修改 Socks5 节点配置（直接回车则保持现状不变）："
-    echo "--------------------------------------------------------"
-    write_tun2socks_config
-    success "节点配置文件更新成功！"
-    if rc-service tun2socks status 2>/dev/null | grep -q "started"; then
-        step "检测到服务正在后台运行，正在自动重启以应用新配置..."
-        rc-service tun2socks restart && success "重启成功，新节点配置已生效。" || error "重启失败，请检查服务状态。"
-    fi
-}
-
-update_tun2socks_core() {
-    if [ ! -f "/usr/local/bin/tun2socks" ]; then
-        error "检测到您尚未安装 Tun2Socks 环境，请先使用选项 1 进行初始化安装！"
+    if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
+        error "致命拒绝: 检测到您的证书位于 /root/ 目录下！"
+        warn "原因分析: /root 目录权限极为严苛(700)，任何非 root 用户(包括 singbox-hy2)均无权穿透。"
+        warn "         即使强行赋予文件 644 权限，内核也会因路径阻塞拒绝读取。"
+        info "权威推荐: 请在 acme.sh 命令中加上 --install-cert 指令，将证书自动分发到公共目录"
+        info "         (例如: /etc/sing-box-hy2/certs/ 或 /etc/ssl/ 文件夹下) 再试。"
         return 1
     fi
 
-    # ====================================================================
-    # 【核心修正 1】通过代理池轮询获取 GitHub Release 元数据 (自适应 IPv6)
-    # ====================================================================
-    step "正在连接 GitHub 检查最新 Release Version..."
-    local raw_api_url="https://api.github.com/repos/$REPO_TUN2SOCKS/releases/latest"
-    local latest_release_json=""
+    info "正在为外部证书路径逐级赋予检索穿透权限 (+x) ..."
+    local dir
+    for file in "$cert" "$key"; do
+        dir=$(dirname "$file")
+        while [[ "$dir" != "/" && -n "$dir" ]]; do
+            chmod o+x "$dir" 2>/dev/null || true
+            if command -v setfacl >/dev/null 2>&1; then
+                setfacl -m u:"$RUN_USER":rx "$dir" 2>/dev/null || true
+            fi
+            dir=$(dirname "$dir")
+        done
+    done
     
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local final_api_url="${proxy}${raw_api_url}"
-        info "正在尝试通过 [ ${proxy:-原生直连} ] 检查版本..."
-        latest_release_json=$(curl -g -6 -s -m 15 "$final_api_url" || echo "")
-        if echo "$latest_release_json" | grep -q "browser_download_url"; then
-            break
+    info "正在规范化外部证书与私钥文件的读取权限 ..."
+    chmod 644 "$cert" 2>/dev/null || true
+    chmod 644 "$key" 2>/dev/null || true
+    
+    if command -v setfacl >/dev/null 2>&1; then
+        setfacl -m u:"$RUN_USER":r "$cert" "$key" 2>/dev/null || true
+    fi
+    return 0
+}
+
+inst_cert() {
+    mkdir -p "$CONFIG_DIR/certs"
+
+    echo "---------------------------------------------"
+    echo -e "Hysteria 2 协议证书申请方式如下："
+    echo -e " 1) 必应自签证书${YELLOW}（默认）${RESET} "
+    echo -e " 2) Acme自动申请(需放行80端口)"
+    echo -e " 3) 自定义证书路径"
+    echo "---------------------------------------------"
+    local certInput
+    read -rp "请输入选项 [1-3] (直接回车默认自签证书): " certInput
+    certInput=${certInput:-1}
+
+    cert_path="$CONFIG_DIR/certs/cert.pem"
+    key_path="$CONFIG_DIR/certs/key.pem"
+
+    if [[ $certInput == 2 ]]; then
+        if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
+            warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。"
         fi
+
+        if [[ -f "$cert_path" && -f "$key_path" && -s "$cert_path" && -s "$key_path" && -f "$CONFIG_DIR/certs/ca.log" ]]; then
+            hy2_domain=$(cat "$CONFIG_DIR/certs/ca.log")
+            info "检测到已有域名 [${hy2_domain}] 的安全区证书，正在复用..."
+        else
+            read -rp "请输入需要申请证书的域名: " domain
+            [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
+            
+            info "正在检查并安装 Acme.sh 依赖..."
+            local acme_cmd="/root/.acme.sh/acme.sh"
+            if [[ ! -f "$acme_cmd" ]]; then
+                curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
+            fi
+            
+            "$acme_cmd" --set-default-ca --server letsencrypt
+            
+            info "正在向 Let's Encrypt 申请证书..."
+            if [[ "$(get_public_ip)" =~ ":" ]]; then
+                "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
+            else
+                "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
+            fi
+            
+            local reload_cmd="[ -f /etc/sing-box-hy2/config.json ] && /sbin/rc-service sing-box-hy2 restart || echo '[信息] 初次部署，跳过服务同步'"
+            
+            if "$acme_cmd" --install-cert -d "${domain}" \
+                --key-file "$key_path" \
+                --fullchain-file "$cert_path" \
+                --ecc \
+                --reloadcmd "$reload_cmd"; then
+                echo "$domain" > "$CONFIG_DIR/certs/ca.log"
+                hy2_domain=$domain
+                info "Acme 证书申请并成功分发！"
+            else
+                error "Acme 证书申请失败，自动切换回自签模式。"
+                certInput=1
+            fi
+        fi
+    elif [[ $certInput == 3 ]]; then
+        while true; do
+            local user_cert user_key
+            read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
+            read -rp "请输入密钥文件 (privkey.pem/key) 的路径: " user_key
+            read -rp "请输入证书对应的域名: " hy2_domain
+            
+            if [[ -f "$user_cert" && -f "$user_key" ]]; then
+                rm -f "$cert_path" "$key_path"
+                
+                if fix_external_cert_permission "$user_cert" "$user_key"; then
+                    ln -sf "$user_cert" "$cert_path"
+                    ln -sf "$user_key" "$key_path"
+                    info "自定义外部证书已通过安全软链接无缝同步。"
+                    break
+                else
+                    return 1
+                fi
+            else
+                error "找不到输入的证书文件，请重新确认路径。"
+                echo "---------------------------------------------"
+            fi
+        done
+    fi
+
+    if [[ $certInput == 1 ]]; then
+        info "将使用必应自签证书作为 Hysteria 2 外壳的节点证书"
+        rm -f "$cert_path" "$key_path"
+        openssl ecparam -genkey -name prime256v1 -out "$key_path"
+        openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
+        hy2_domain="www.bing.com"
+        
+        chmod 644 "$cert_path" || true
+        chmod 600 "$key_path" || true
+    fi
+
+    chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
+    chown -h ${RUN_USER}:${RUN_USER} "$cert_path" "$key_path" 2>/dev/null || true
+}
+
+inst_port() {
+    local default_port=""
+    if [[ -f "$HY2_CONFIG" ]]; then
+        default_port=$(jq -r '.inbounds[0].listen_port // empty' "$HY2_CONFIG" 2>/dev/null)
+    fi
+
+    local prompt_msg="设置 Hysteria 2 服务端监听主端口 [1-65535] (回车随机分配): "
+    [[ -n "$default_port" ]] && prompt_msg="设置 Hysteria 2 服务端监听主端口 [当前: ${default_port}, 回车不修改]: "
+
+    while true; do
+        read -rp "$prompt_msg" port
+        if [[ -z "$port" ]]; then
+            if [[ -n "$default_port" ]]; then port="$default_port" && break
+            else
+                port=$(get_random_port)
+                info "已为您随机分配未被占用端口: $port" && break
+            fi
+        elif is_valid_port "$port"; then
+            if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
+                error "端口 ${port} 已被其它程序占用，请更换。" && continue
+            fi
+            break
+        else error "请输入有效的端口数字 (1-65535)"; fi
     done
 
-    local latest_version=$(echo "$latest_release_json" | grep '"tag_name":' | cut -d '"' -f 4)
-
-    # ====================================================================
-    # 【核心修正 2】动态适配 hef/hev-socks5-tunnel 的各种架构命名规范
-    # ====================================================================
-    local ARCH=$(uname -m)
-    local MATCH_KEY="linux-amd64"
-    if [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
-        MATCH_KEY="linux-arm64"
-    elif [[ "$ARCH" == "386" || "$ARCH" == "i386" ]]; then
-        MATCH_KEY="linux-386"
+    local default_hop=""
+    if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
+        default_hop=$(cat "${CONFIG_DIR}/hopping.txt")
     fi
 
-    # 兼容精准抓取
-    local download_url=$(echo "$latest_release_json" | grep "browser_download_url" | grep -E "linux-x86_64|linux-amd64|${MATCH_KEY}" | head -n1 | cut -d '"' -f 4)
-
-    # 严格拦截空值，防止空变量参与后续逻辑对比
-    if [ -z "$latest_version" ] || [ -z "$download_url" ]; then
-        error "无法从 GitHub 获取有效的版本号或找不到适用当前架构 (${ARCH}) 的核心文件，更新终止。"
-        return 1
+    echo "---------------------------------------------"
+    if [[ -n "$default_hop" ]]; then
+        echo -e "Hysteria 2 端口群使用模式 [当前已启用跳跃: ${default_hop}]："
+    else
+        echo -e "Hysteria 2 端口群使用模式 ："
     fi
-
-    local local_version="未知"
-    if [ -f "/usr/local/bin/tun2socks" ]; then
-        # 优化对 Alpine 环境下不规范输出的兼容性抓取
-        local_version=$(/usr/local/bin/tun2socks --version 2>&1 | grep -i "version" | awk '{print $2}')
-        [ -z "$local_version" ] && local_version="未知"
-    fi
-    info "本地核心版本: $local_version"
-    info "GitHub最新版本: $latest_version"
-
-    # 如果本地版本能和远程版本精确对上，直接平稳退出
-    if [ "$local_version" = "$latest_version" ]; then
-        success "当前核心程序已是官方最新发布版，无需重复升级。"
+    echo -e " 1) 单端口模式"
+    echo -e " 2) 端口跳跃模式 ${YELLOW}（默认)${RESET}"
+    echo "---------------------------------------------"
+    
+    local jumpInput
+    read -rp "请选择端口模式 [1-2] (直接回车默认不变或选择默认项): " jumpInput
+    
+    if [[ -z "$jumpInput" && -n "$default_hop" ]]; then
+        info "检测到回车确认，将 100% 保持原有端口跳跃配置 [${default_hop}] 保持不变。"
+        echo "$port" > "${CONFIG_DIR}/main_port.txt"
         return 0
     fi
-    
-    warning "检测到新版本核心程序 ($latest_version)，开始全自动无缝升级..."
 
-    # 统一使用大写变量，防止调用的公共子函数不兼容小写局部变量
-    local RESOLV_CONF="/etc/resolv.conf"
-    local RESOLV_CONF_BAK="/etc/resolv.conf.bak"
-    local WAS_IMMUTABLE=false
-    
-    if lsattr -d "$RESOLV_CONF" 2>/dev/null | grep -q -- '-i-'; then
-        chattr -i "$RESOLV_CONF" || true
-        WAS_IMMUTABLE=true
-    fi
-    cp "$RESOLV_CONF" "$RESOLV_CONF_BAK" || true
-    if ! set_dns64_servers "$RESOLV_CONF" "$WAS_IMMUTABLE" "$RESOLV_CONF_BAK"; then return 1; fi
+    jumpInput=${jumpInput:-2}
+    clear_old_iptables
 
-    local is_running=false
-    if rc-service tun2socks status 2>/dev/null | grep -q "started"; then
-        is_running=true
-        step "正在暂停全局代理以准备替换核心二进制..."
-        rc-service tun2socks stop || true
-    fi
+    if [[ $jumpInput == 2 ]]; then
+        local old_start="" old_end=""
+        if [[ -n "$default_hop" ]]; then
+            old_start="${default_hop%-*}"
+            old_end="${default_hop#*-}"
+        fi
 
-    step "正在通过代理池安全下载最新核心..."
-    if ! download_with_proxy "/usr/local/bin/tun2socks" "$download_url"; then
-        error "所有下载通道均失败，更新流产。"
-        restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
-        return 1
-    fi
-    chmod +x "/usr/local/bin/tun2socks"
-    restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
+        while true; do
+            local start_prompt="设置外部跳跃起始端口 (建议10000-65535)"
+            [[ -n "$old_start" ]] && start_prompt="设置外部跳跃起始端口 [当前: ${old_start}, 回车不修改]"
+            read -rp "${start_prompt}: " firstport
+            firstport=${firstport:-$old_start}
 
-    if [ "$is_running" = true ]; then
-        step "正在恢复并重新启动全局代理..."
-        rc-service tun2socks start && success "隧道已无缝成功恢复最新版运行！" || error "重启隧道失败。"
+            local end_prompt="设置外部跳跃末尾端口 (必须大于起始端口)"
+            [[ -n "$old_end" ]] && end_prompt="设置外部跳跃末尾端口 [当前: ${old_end}, 回车不修改]"
+            read -rp "${end_prompt}: " endport
+            endport=${endport:-$old_end}
+
+            if is_valid_port "$firstport" && is_valid_port "$endport" && [[ $firstport -lt $endport ]]; then 
+                break
+            else 
+                error "输入无效！起始端口必须小于末尾端口，且范围在 1-65535 之间，请重新输入。"; 
+            fi
+        done
+        echo "$firstport-$endport" > "${CONFIG_DIR}/hopping.txt"
     else
-        success "核心已成功更新至最新版！"
+        rm -f "${CONFIG_DIR}/hopping.txt" "${CONFIG_DIR}/main_port.txt"
+        info "已成功切换回单端口纯净模式"
+        if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
+        if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
     fi
 }
-generate_openrc_script() {
-    local SERVICE_FILE="/etc/init.d/tun2socks"
-    local TARGET_CONFIG="/etc/tun2socks/config.yaml"
+
+write_and_show_config() {
+    local HOSTNAME
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+    local vps_ip
+    vps_ip=$(get_public_ip)
+    local last_ip="$vps_ip"
+    [[ "$vps_ip" =~ ":" ]] && last_ip="[$vps_ip]"
+
+    local is_insecure="0"
+    if [[ "$hy2_domain" == "www.bing.com" ]]; then
+        is_insecure="1"
+    fi
+
+    cat << EOF > "$HY2_CONFIG"
+{
+  "log": {
+    "level": "info",
+    "output": "$LOG_FILE",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "hysteria2",
+      "tag": "hy2-in",
+      "listen": "::",
+      "listen_port": $port,
+      "users": [
+        {
+          "password": "$auth_pwd"
+        }
+      ],
+      "ignore_client_bandwidth": true,
+      "tls": {
+        "enabled": true,
+        "server_name": "$hy2_domain",
+        "certificate_path": "$cert_path",
+        "key_path": "$key_path"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}
+EOF
+
+    chmod 640 "$HY2_CONFIG"
+    chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
+
+    apply_new_iptables
+    mkdir -p "$HY2_DIR"
     
-    local WARP_PORT=$(grep -E '^[[:space:]]*port:' "$TARGET_CONFIG" | head -n1 | awk '{print $2}' | tr -d "'\"")
-    [ -z "$WARP_PORT" ] && WARP_PORT="1080"
+    local final_port="$port"
+    if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
+        final_port=$(cat "${CONFIG_DIR}/hopping.txt")
+    fi
 
-    local MAIN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}')
-    local MAIN_IP6=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | grep -oE 'src [a-fA-F0-9:]+' | awk '{print $2}')
+    cat << EOF > "$HY2_DIR/url.txt"
+V6VPS 请自行替换 IP 地址为 V6
+V2rayN 链接:
+hysteria2://$auth_pwd@$last_ip:$port?sni=$hy2_domain&insecure=${is_insecure}#$HOSTNAME-hy2
 
-    cat > "$SERVICE_FILE" <<EOF
+Surge 配置:
+$HOSTNAME-hy2 = hysteria2, $last_ip, $port, password=$auth_pwd, skip-cert-verify=true, sni=$hy2_domain
+EOF
+
+    rc-service sing-box-hy2 restart
+    if rc-service sing-box-hy2 status | grep -q "started"; then
+        info "sing-box Hysteria 2 服务配置并启动成功！"
+    else
+        error "sing-box-hy2 启动失败，可在菜单中按 8 查看详细的闪退日志。"
+    fi
+    showconf
+}
+
+# =========================================================
+# 6. 安装、更新与卸载核心流控
+# =========================================================
+write_openrc_script() {
+    cat << 'EOF' > "$OPENRC_SERVICE_PATH"
 #!/sbin/openrc-run
 
-description="Tun2Socks Tunnel Service adapted for CF WARP on Alpine"
-supervisor="supervise-daemon"
-command="/usr/local/bin/tun2socks"
-command_args="/etc/tun2socks/config.yaml"
-output_log="/var/log/tun2socks.log"
-error_log="/var/log/tun2socks.err"
+name="sing-box-hy2"
+description="sing-box Hysteria 2 OpenRC Isolated Service"
+cfgfile="/etc/sing-box-hy2/config.json"
+logfile="/var/log/sing-box-hy2.log"
+command="/usr/local/bin/sing-box-hy2"
+command_args="run -c /etc/sing-box-hy2/config.json"
 
 depend() {
     need net
-    after firewall
+    after iptables ip6tables firewall
 }
 
-start_post() {
-    ulimit -n 524288
-
-    # 【核心防御】死等 tun0 网卡在内核中诞生，最多等待 10 秒
-    local retry=0
-    while ! ip link show dev tun0 >/dev/null 2>&1; do
-        sleep 0.5
-        retry=\$((retry + 1))
-        if [ \$retry -gt 20 ]; then
-            echo "错误: tun0 设备未能在预定时间内由 tun2socks 创建！" >&2
-            return 1
-        fi
-    done
-
-    # 1. 【完美修复】SSH 防断网策略：利用 iptables 给 22 端口打标记，绕过非法的 ip rule dport 限制
-    iptables -t mangle -A PREROUTING -p tcp --dport 22 -j MARK --set-mark 22 2>/dev/null || true
-    iptables -t mangle -A OUTPUT -p tcp --sport 22 -j MARK --set-mark 22 2>/dev/null || true
-    ip rule add fwmark 22 lookup main pref 5 2>/dev/null || true
-
-    if ip -6 route show >/dev/null 2>&1; then
-        ip6tables -t mangle -A PREROUTING -p tcp --dport 22 -j MARK --set-mark 22 2>/dev/null || true
-        ip6tables -t mangle -A OUTPUT -p tcp --sport 22 -j MARK --set-mark 22 2>/dev/null || true
-        ip -6 rule add fwmark 22 lookup main pref 5 2>/dev/null || true
+start_pre() {
+    if [ ! -f "$cfgfile" ]; then
+        eerror "Configuration file $cfgfile missing!"
+        return 1
     fi
-
-    # 2. CF WARP 本地回环与宿主机直连放行
-    ip rule add to 127.0.0.0/8 lookup main pref 4
-    ip -6 rule add to ::1 lookup main pref 4
-
-    # 3. 无条件放行 Cloudflare WARP 所有的远程 Endpoint / MASQUE 服务器网段
-    ip rule add to 162.159.192.0/24 lookup main pref 6
-    ip rule add to 162.159.193.0/24 lookup main pref 6
-    ip rule add to 162.159.195.0/24 lookup main pref 6
-    ip rule add to 162.159.198.0/24 lookup main pref 6
-    ip rule add to 188.114.96.0/24 lookup main pref 6
-    ip rule add to 188.114.97.0/24 lookup main pref 6
-    ip -6 rule add to 2606:4700:d0::/48 lookup main pref 6
-
-    # 4. 代理软件自身发出的流量直连
-    ip rule add fwmark 438 lookup main pref 10
-    ip -6 rule add fwmark 438 lookup main pref 10
-
-    # 5. 主网卡原路返回路由
-    [ -n "${MAIN_IP}" ] && ip rule add from ${MAIN_IP} lookup main pref 15
-    [ -n "${MAIN_IP6}" ] && ip -6 rule add from ${MAIN_IP6} lookup main pref 15
-
-    # 6. 内网保留网段直连放行
-    ip rule add to 10.0.0.0/8 lookup main pref 16
-    ip rule add to 172.16.0.0/12 lookup main pref 16
-    ip rule add to 192.168.0.0/16 lookup main pref 16
-
-    # 7. 核心全局流量重定向（将其余流量扔进 tun0）
-    # 【完美分流】采用最安全的 0.0.0.0/1 双段接管法，完美替代 default 覆盖，绝无回环风险
-    ip route add 0.0.0.0/1 dev tun0 table 20 2>/dev/null || ip route replace 0.0.0.0/1 dev tun0 table 20
-    ip route add 128.0.0.0/1 dev tun0 table 20 2>/dev/null || ip route replace 128.0.0.0/1 dev tun0 table 20
     
-    if [ -n "${MAIN_IP6}" ]; then
-        ip -6 route add ::/1 dev tun0 table 20 2>/dev/null || ip -6 route replace ::/1 dev tun0 table 20
-        ip -6 route add 8000::/1 dev tun0 table 20 2>/dev/null || ip -6 route replace 8000::/1 dev tun0 table 20
+    touch "$logfile"
+    chown singbox-hy2:singbox-hy2 "$logfile"
+    chmod 644 "$logfile"
+    
+    command_background="yes"
+    pidfile="/run/${RC_SVCNAME}.pid"
+    
+    output_log="$logfile"
+    error_log="$logfile"
+    
+    local port
+    port=$(jq -r '.inbounds[0].listen_port // 0' "$cfgfile" 2>/dev/null)
+    if [ "$port" -lt 1024 ] && [ "$port" -ne 0 ]; then
+        command_user="root:root"
+    else
+        command_user="singbox-hy2:singbox-hy2"
     fi
-
-    ip rule add lookup 20 pref 20
-    return 0
-}
-
-stop_post() {
-    # 清理 SSH 打标路由与规则
-    iptables -t mangle -D PREROUTING -p tcp --dport 22 -j MARK --set-mark 22 2>/dev/null || true
-    iptables -t mangle -D OUTPUT -p tcp --sport 22 -j MARK --set-mark 22 2>/dev/null || true
-    ip rule del fwmark 22 lookup main pref 5 2>/dev/null || true
-
-    iptables -t mangle -F 2>/dev/null || true
-    ip6tables -t mangle -F 2>/dev/null || true
-    
-    ip rule del to 127.0.0.0/8 lookup main pref 4 2>/dev/null
-    ip -6 rule del to ::1 lookup main pref 4 2>/dev/null
-
-    # 清理 WARP 远端放行路由
-    ip rule del to 162.159.192.0/24 lookup main pref 6 2>/dev/null
-    ip rule del to 162.159.193.0/24 lookup main pref 6 2>/dev/null
-    ip rule del to 162.159.195.0/24 lookup main pref 6 2>/dev/null
-    ip rule del to 162.159.198.0/24 lookup main pref 6 2>/dev/null
-    ip rule del to 188.114.96.0/24 lookup main pref 6 2>/dev/null
-    ip rule del to 188.114.97.0/24 lookup main pref 6 2>/dev/null
-    ip -6 rule del to 2606:4700:d0::/48 lookup main pref 6 2>/dev/null
-
-    ip rule del fwmark 438 lookup main pref 10 2>/dev/null
-    ip -6 rule del fwmark 438 lookup main pref 10 2>/dev/null
-
-    [ -n "${MAIN_IP}" ] && ip rule del from ${MAIN_IP} lookup main pref 15 2>/dev/null
-    [ -n "${MAIN_IP6}" ] && ip -6 rule del from ${MAIN_IP6} lookup main pref 15 2>/dev/null
-
-    ip rule del to 10.0.0.0/8 lookup main pref 16 2>/dev/null
-    ip rule del to 172.16.0.0/12 lookup main pref 16 2>/dev/null
-    ip rule del to 192.168.0.0/16 lookup main pref 16 2>/dev/null
-
-    ip route del 0.0.0.0/1 dev tun0 table 20 2>/dev/null
-    ip route del 128.0.0.0/1 dev tun0 table 20 2>/dev/null
-    ip -6 route del ::/1 dev tun0 table 20 2>/dev/null
-    ip -6 route del 8000::/1 dev tun0 table 20 2>/dev/null
-
-    ip rule del lookup 20 pref 20 2>/dev/null
-    return 0
 }
 EOF
-    chmod +x "$SERVICE_FILE"
+    chmod +x "$OPENRC_SERVICE_PATH"
+    rc-update add sing-box-hy2 default >/dev/null 2>&1 || true
 }
-install_tun2socks() {
-    cleanup_ip_rules
-    # 【强制补齐 Alpine 核心路由工具链】
-    echo -e "${BLUE}[信息]${RESET} 正在为 Alpine 升级完整版 iproute2 策略路由工具箱..."
-    apk add --no-cache iproute2 iptables >/dev/null 2>&1
-    step "检查 tun2socks 服务当前状态..."
-    if rc-service tun2socks status 2>/dev/null | grep -q "started"; then
-        info "检测到 tun2socks 旧进程正在运行，正在将其安全终止..."
-        rc-service tun2socks stop || true
+
+# 修复：重构核心下载和释放逻辑
+download_core() {
+    local _version
+    _version=$(get_latest_version)
+    if [[ -z "$_version" ]]; then
+        error "无法获取 sing-box 最新版本号。"
+        return 1
     fi
+    info "获取到最新版本: $_version"
 
-    local RESOLV_CONF="/etc/resolv.conf"
-    local RESOLV_CONF_BAK="/etc/resolv.conf.bak"
-    local WAS_IMMUTABLE=false
-
-    step "检查 /etc/resolv.conf 文件属性状态..."
-    if lsattr -d "$RESOLV_CONF" 2>/dev/null | grep -q -- '-i-'; then
-        info "/etc/resolv.conf 文件当前被系统锁定，正在临时解除..."
-        chattr -i "$RESOLV_CONF" || { error "临时解锁 /etc/resolv.conf 失败"; exit 1; }
-        WAS_IMMUTABLE=true
-    fi
-
-    step "备份系统当前 DNS 配置..."
-    cp "$RESOLV_CONF" "$RESOLV_CONF_BAK" || true
-    if ! set_dns64_servers "$RESOLV_CONF" "$WAS_IMMUTABLE" "$RESOLV_CONF_BAK"; then return 1; fi
-
-    local BINARY_PATH="/usr/local/bin/tun2socks"
-
-    # ====================================================================
-    # 【核心修正 1】通过代理池轮询获取 GitHub API 核心数据
-    # ====================================================================
-    step "从 GitHub 获取最新 Release 核心下载地址 (自适应 IPv6)..."
-    local raw_api_url="https://api.github.com/repos/$REPO_TUN2SOCKS/releases/latest"
-    local latest_release_json=""
+    local _arch
+    _arch=$(detect_arch)
     
+    # 拼接 sing-box 官方标准打包命名格式 (例如: sing-box-1.8.4-linux-amd64.tar.gz)
+    local package_name="sing-box-${_version#v}-linux-${_arch}"
+    local tar_file="${TMP_DIR}/sing-box.tar.gz"
+    local _download_success=1
+
     for proxy in "${GITHUB_PROXY[@]}"; do
-        local final_api_url="${proxy}${raw_api_url}"
-        info "正在尝试通过 [ ${proxy:-原生直连} ] 请求 GitHub API..."
-        latest_release_json=$(curl -g -6 -s -m 15 "$final_api_url" || echo "")
-        if echo "$latest_release_json" | grep -q "browser_download_url"; then
-            success "成功获取到 Tun2Socks GitHub Release 元数据！"
+        local _download_url="${proxy}https://github.com/SagerNet/sing-box/releases/download/${_version}/${package_name}.tar.gz"
+        info "正在通过代理 [${proxy:-直连}] 下载 sing-box 核心..."
+
+        if wget -q --show-progress --no-check-certificate -O "$tar_file" "$_download_url"; then
+            _download_success=0
             break
         fi
     done
 
-    # ====================================================================
-    # 【核心修正 2】动态判断系统架构并放宽正则匹配（完美兼容 linux-amd64）
-    # ====================================================================
-    local ARCH=$(uname -m)
-    local MATCH_KEY="linux-amd64"
-    if [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
-        MATCH_KEY="linux-arm64"
-    elif [[ "$ARCH" == "386" || "$ARCH" == "i386" ]]; then
-        MATCH_KEY="linux-386"
+    if [[ $_download_success -ne 0 ]]; then
+        error "核心下载失败！所有代理及直连均无法访问，请检查网络。"
+        return 11
     fi
 
-    # 运用扩展正则，通杀 linux-x86_64, linux-amd64 以及动态 MATCH_KEY 
-    local DOWNLOAD_URL=$(echo "$latest_release_json" | grep "browser_download_url" | grep -E "linux-x86_64|linux-amd64|${MATCH_KEY}" | head -n1 | cut -d '"' -f 4)
+    # 正确执行解压与移动
+    info "正在解压并部署核心二进制文件..."
+    tar -xzf "$tar_file" -C "$TMP_DIR"
+    local extracted
+    extracted=$(find "$TMP_DIR" -type f -name sing-box | head -n 1)
+    
+    [[ -n "$extracted" ]] || { error "解压目标核心错误，未找到 sing-box 执行文件"; return 1; }
+    
+    rc-service sing-box-hy2 stop >/dev/null 2>&1 || true
+    install -m 755 "$extracted" "$BINARY_PATH"
+    info "sing-box-hy2 核心释放完毕。"
+    return 0
+}
 
-    if [ -z "$DOWNLOAD_URL" ]; then
-        error "未能成功匹配到适用于当前架构 (${ARCH}) 的核心下载链接，请检查网络。"
-        restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
+install_hy2() {
+    echo -e "${GREEN}[信息] 开始在 Alpine 下部署专属隔离的 sing-box Hysteria 2 ...${RESET}"
+    check_environment
+    mkdir -p "$CONFIG_DIR" "$HY2_DIR"
+
+    if ! download_core; then return 1; fi
+
+    write_openrc_script
+
+    inst_cert || return 1
+    inst_port
+    
+    read -rp "设置 Hysteria 2 验证密码 (回车自动分配随机高强密码): " auth_pwd
+    auth_pwd=${auth_pwd:-$(generate_random_password)}
+
+    write_and_show_config
+}
+
+update_hy2() {
+    if [[ ! -f "$BINARY_PATH" ]]; then
+        error "当前系统未检测到核心，无法执行覆盖升级。"
         return 1
     fi
-    # ====================================================================
+    info "检测到已有环境，正在执行纯净原地覆盖核心升级..."
+    if download_core; then
+        rc-service sing-box-hy2 start
+        info "sing-box-hy2 核心纯净升级覆盖成功，服务已安全启动！"
+    else
+        error "核心升级遭遇未预期中断。"
+    fi
+}
 
-    step "正在通过代理池下载 GitHub 最新核心程序..."
-    cleanup_on_fail() {
-        trap - INT TERM EXIT
-        restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
+unsthy2() {
+    warn "即将执行全面清洁卸载..."
+    
+    clear_old_iptables
+    if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
+    if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
+
+    rc-service sing-box-hy2 stop || true
+    rc-update del sing-box-hy2 default >/dev/null 2>&1 || true
+    
+    rm -f "$BINARY_PATH" "$OPENRC_SERVICE_PATH" "$LOG_FILE"
+    rm -rf "$CONFIG_DIR" "$HY2_DIR"
+    
+    info "Hysteria 2 专属服务、节点配置及防火墙跳跃链条已彻底清除！"
+}
+
+changeconf() {
+    if [[ ! -f "$HY2_CONFIG" ]]; then
+        error "配置文件不存在，请先选择选项 1 安装"
         return 1
-    }
-    trap cleanup_on_fail INT TERM EXIT
-    
-    if ! download_with_proxy "$BINARY_PATH" "$DOWNLOAD_URL"; then
-        error "所有代理通道下载失败。"
-        trap - INT TERM EXIT
-        restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
-        return 1
-    fi
-    trap - INT TERM EXIT
-
-    restore_dns_config "$RESOLV_CONF" "$RESOLV_CONF_BAK" "$WAS_IMMUTABLE"
-    chmod +x "$BINARY_PATH"
-
-    step "正在初始化全局出口节点配置信息："
-    write_tun2socks_config
-
-    # ====================================================================
-    # 【救命代码】强行补齐并激活 Alpine (LXC/OpenVZ) 环境的 TUN 虚拟设备大门
-    # ====================================================================
-    step "正在强行补齐 Alpine 系统的 TUN 核心虚拟设备..."
-    
-    # 1. 创建网卡设备目录
-    mkdir -p /dev/net
-    
-    # 2. 如果设备不存在，强行用 mknod 在主设备号 10、次设备号 200 上创建字符设备
-    if [ ! -c /dev/net/tun ]; then
-        rm -f /dev/net/tun >/dev/null 2>&1  # 防止有死节点残留
-        mknod /dev/net/tun c 10 200
-    fi
-    
-    # 3. 必须赋予 666 读写权限，否则非 root 或守护进程无权调用它
-    chmod 666 /dev/net/tun
-    
-    # 4. 尝试向 Alpine 内核塞入 tun 模块（KVM架构有效，LXC会静默跳过）
-    modprobe tun >/dev/null 2>&1 || true
-    # ====================================================================
-
-    step "正在动态计算并生成 Alpine 守护服务 (OpenRC)..."
-    generate_openrc_script
-    rc-update add tun2socks default 2>/dev/null
-    
-    step "正在自动拉起全局 network 代理隧道..."
-    rc-service tun2socks start && success "Tun2Socks 环境配置完毕！" || {
-        error "自动启动隧道服务失败！请查看 /var/log/tun2socks.err 排查原因。"
-        return 1
-    }
-}
-uninstall_tun2socks() {
-    cleanup_ip_rules
-    step "正在停止并彻底禁用后台 OpenRC tun2socks 服务..."
-    if rc-service tun2socks status 2>/dev/null | grep -q "started"; then
-        rc-service tun2socks stop
-    fi
-    rc-update del tun2socks default 2>/dev/null || true
-    step "正在清理系统残留组件文件..."
-    rm -f "/etc/init.d/tun2socks" "/usr/local/bin/tun2socks"
-    rm -rf "/etc/tun2socks"
-    success "Tun2Socks 环境已彻底从系统卸载干净。"
-}
-
-get_tun2socks_status() {
-    if rc-service tun2socks status 2>/dev/null | grep -q "started"; then
-        t_status_show="${GREEN}已启动 (运行中)${RESET}"
-    else
-        t_status_show="${RED}已停止 (未运行)${RESET}"
     fi
 
-    if [ -f "/usr/local/bin/tun2socks" ]; then
-        local v_raw=$(/usr/local/bin/tun2socks --version 2>&1 | grep "Version:" | awk '{print $2}')
-        t_version_show="${YELLOW}v${v_raw:-已安装}${RESET}"
-    else
-        t_version_show="${RED}未安装${RESET}"
-    fi
+    local old_pwd old_cert old_key old_sni
+    old_pwd=$(jq -r '.inbounds[0].users[0].password // empty' "$HY2_CONFIG")
+    old_cert=$(jq -r '.inbounds[0].tls.certificate_path // empty' "$HY2_CONFIG")
+    old_key=$(jq -r '.inbounds[0].tls.key_path // empty' "$HY2_CONFIG")
+    old_sni=$(jq -r '.inbounds[0].tls.server_name // "www.bing.com"' "$HY2_CONFIG")
 
-    if [ -f "/etc/tun2socks/config.yaml" ]; then
-        local port=$(grep -E '^[[:space:]]*port:' /etc/tun2socks/config.yaml | head -n1 | awk '{print $2}' | tr -d "'\"")
-        local addr=$(grep -E '^[[:space:]]*address:' /etc/tun2socks/config.yaml | head -n1 | awk '{print $2}' | tr -d "'\"")
-        t_port_show="${YELLOW}${addr}:${port}${RESET}"
-    else
-        t_port_show="${RED}无配置${RESET}"
-    fi
-}
-
-test_exit_ip() {
-    step "正在通过全局代理隧道查询落地出口 IP..."
-    local ip_info=""
-    local test_urls=("https://api.ipify.org?format=json" "https://ipinfo.io/json" "https://ifconfig.me/all.json")
-    for url in "${test_urls[@]}"; do
-        info "正在尝试请求: $url ..."
-        ip_info=$(curl --noproxy "*" -s -m 6 "$url" 2>/dev/null || echo "")
-        [ -n "$ip_info" ] && break
-    done
-
-    if [ -n "$ip_info" ]; then
-        echo -e "${GREEN}----------------------------------------${RESET}"
-        if echo "$ip_info" | grep -q "{"; then
-            echo "$ip_info" | sed 's/["{}]//g' | sed 's/,/\n/g' | sed 's/^ *//'
-        else
-            echo -e "当前落地出口 IP: ${YELLOW}$ip_info${RESET}"
-        fi
-        echo -e "${GREEN}----------------------------------------${RESET}"
-        success "测试成功！隧道网络双向畅通。"
-    else
-        error "获取失败。请检查后台服务状态或运行日志。"
-    fi
-}
-
-# --- Tun2Socks 融合版二级管理面板 ---
-tun2socks_menu() {
-    while true; do
-        get_tun2socks_status
-        clear
-        echo -e "${GREEN}==============================${RESET}"
-        echo -e "${GREEN}      Tun2Socks 管理面板       ${RESET}"
-        echo -e "${GREEN}==============================${RESET}"
-        echo -e "${GREEN}状态 :${RESET} $t_status_show"
-        echo -e "${GREEN}版本 :${RESET} $t_version_show"
-        echo -e "${GREEN}代理 :${RESET} $t_port_show"
-        echo -e "${GREEN}==============================${RESET}"
-        echo -e "${GREEN}  1. 安装 Tun2Socks${RESET}"
-        echo -e "${GREEN}  2. 更新 Tun2Socks${RESET}"
-        echo -e "${GREEN}  3. 卸载 Tun2Socks${RESET}"
-        echo -e "${GREEN}  4. 修改配置${RESET}"
-        echo -e "${GREEN}  5. 启动 Tun2Socks${RESET}"
-        echo -e "${GREEN}  6. 停止 Tun2Socks${RESET}"
-        echo -e "${GREEN}  7. 重启 Tun2Socks${RESET}"
-        echo -e "${GREEN}  8. 查看日志${RESET}"
-        echo -e "${GREEN}  9. 测试当前出口IP${RESET}"
-        echo -e "${GREEN}  0. 返回主菜单${RESET}"
-        echo -e "${GREEN}==============================${RESET}"
-        echo -ne "${GREEN}请输入选项: ${RESET}"
-        read -r num
-        case "$num" in
-            1) install_tun2socks ;;
-            2) update_tun2socks_core ;;
-            3) uninstall_tun2socks ;;
-            4) change_tun2socks_config ;;
-            5)
-                step "正在唤醒全局代理网络..."
-                if [ ! -f "/etc/tun2socks/config.yaml" ]; then
-                    error "未发现任何节点配置，请先执行选项 1 或 4 进行配置！"
-                else
-                    rc-service tun2socks start && success "启动成功。" || error "启动失败。"
-                fi
-                ;;
-            6)
-                step "正在关闭全局代理，物理网络正在复原..."
-                rc-service tun2socks stop && success "代理已停用，原网已恢复。" || error "停用失败。"
-                ;;
-            7)
-                step "正在重启核心隧道服务..."
-                rc-service tun2socks restart && success "重启成功。" || error "重启失败。"
-                ;;
-            8)
-                step "正在查看服务运行日志尾部状态："
-                echo "--------------------------------------------------------"
-                if [ -f "/var/log/tun2socks.log" ]; then
-                    tail -n 30 "/var/log/tun2socks.log"
-                else
-                    warning "未捕获到主标准日志，尝试读取错误日志："
-                    [ -f "/var/log/tun2socks.err" ] && tail -n 30 "/var/log/tun2socks.err" || error "日志文件尚未生成。"
-                fi
-                ;;
-            9) test_exit_ip ;;
-            0) return ;;
-            *) error "非法选项，请重新输入！" ;;
-        esac
-        echo -ne "${YELLOW}按任意键继续...${RESET}"
-        read -r
-    done
-}
-
-# ==============================================================================
-#   主循环菜单
-# ==============================================================================
-while true; do
     clear
-    get_status_info
+    echo -e "${GREEN}====== 修改 sing-box Hysteria 2 配置 ======${RESET}"
+    echo "提示：直接敲回车将保持原有配置不变"
+    echo "---------------------------------------------"
     
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}         CF-WARP 面板          ${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $panel_status"
-    echo -e "${GREEN}版本 :${RESET} ${panel_version}"
-    echo -e "${GREEN}绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}  1. 安装 WARP${RESET}"
-    echo -e "${GREEN}  2. 更新 WARP${RESET}"
-    echo -e "${GREEN}  3. 卸载 WARP${RESET}"
-    echo -e "${GREEN}  4. 修改配置${RESET}"
-    echo -e "${GREEN}  5. 启动 WARP${RESET}"
-    echo -e "${GREEN}  6. 停止 WARP${RESET}"
-    echo -e "${GREEN}  7. 重启 WARP${RESET}"
-    echo -e "${GREEN}  8. 查看日志${RESET}"
-    echo -e "${GREEN}  9. 查看配置与出口状态${RESET}"
-    echo -e "${GREEN} 10.${RESET} ${YELLOW}谷歌分流${RESET}"
-    echo -e "${GREEN} 11.${RESET} ${YELLOW}Tun2Socks全局代理${RESET}"
-    echo -e "${GREEN}  0. 退出${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    
-    read -r choice
-    
-    case "$choice" in
-        1) install_warp ;;
-        2) install_warp ;; 
-        3) 
-            rc-service "$PROXY_SERVICE_NAME" stop 2>/dev/null || true
-            pkill -9 -f redsocks >/dev/null 2>&1 || true
-            rc-service "$SERVICE_NAME" stop 2>/dev/null || true
-            rc-update del "$SERVICE_NAME" default 2>/dev/null || true
-            rm -f "$SERVICE_FILE" "$PROXY_SERVICE_FILE" "$INSTALL_BIN" "$META_FILE" "$REDSOCKS_PID"
-            rm -rf "$CONF_DIR" "$DATA_DIR"
-            success "WARP 卸载完成。"
-            ;;
-        4) edit_config ;;
-        5) rc-service "$SERVICE_NAME" start ;;
-        6) rc-service "$SERVICE_NAME" stop ;;
-        7) rc-service "$SERVICE_NAME" restart ;;
-        8)
-            echo "--- 最近 20 行日志 ---"
-            [ -f /var/log/usque.log ] && tail -n 20 /var/log/usque.log || echo "暂无普通日志"
-            [ -f /var/log/usque.err ] && tail -n 20 /var/log/usque.err || echo "暂无错误日志"
-            ;;
-        9) show_status ;;
-        10) google_split_menu ;;
-        11) tun2socks_menu ;;
-        0) clear; exit 0 ;;
-        *) echo -e "${RED}无效选项，请重新输入！${RESET}" ;;
-    esac
-    read -n 1 -s -r -p "按任意键返回面板..."
-done
+    inst_port 
+
+    local auth_pwd
+    read -rp "设置 Hysteria 2 验证密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
+    auth_pwd=${auth_pwd:-$old_pwd}
+
+    local cert_path key_path hy2_domain
+    echo "---------------------------------------------"
+    read -rp "是否需要修改证书？[y/N] (直接回车默认不修改): " change_cert_flag
+    if [[ "$change_cert_flag" == "y" || "$change_cert_flag" == "Y" ]]; then
+        inst_cert || return 1
+    else
+        cert_path="$old_cert"
+        key_path="$old_key"
+        hy2_domain="$old_sni"
+    fi
+
+    write_and_show_config
+    info "配置与转发链条刷新修改成功！"
+}
+
+showconf() {
+    if [[ ! -d "$HY2_DIR" ]]; then
+        error "未找到分享配置文件。"
+        return
+    fi
+    echo -e "${GREEN}====== Hysteria 2 节点分享与配置信息 ======${RESET}"
+    cat "$HY2_DIR/url.txt"
+    echo
+}
+
+# =========================================================
+# 7. 面板交互菜单 
+# =========================================================
+menu() {
+    while true; do
+        clear
+        local raw_status
+        raw_status=$(get_hy2_status)
+        local status=""
+        if [[ "$raw_status" == "RUNNING" ]]; then
+            status="${YELLOW}● 运行中${RESET}"
+        else
+            status="${RED}● 未运行${RESET}"
+        fi
+
+        local version
+        version=$(get_installed_version)
+        local port_show
+        port_show=$(get_current_port_display)
+
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}    Sing-box Hysteria2 面板     ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}状态   :${RESET} ${status}"
+        echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+        echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}1. 安装 Sing-box Hysteria2${RESET}"
+        echo -e "${GREEN}2. 更新 Sing-box${RESET}"
+        echo -e "${GREEN}3. 卸载 Sing-box${RESET}"
+        echo -e "${GREEN}4. 修改配置${RESET}"
+        echo -e "${GREEN}5. 启动 Sing-box${RESET}"
+        echo -e "${GREEN}6. 停止 Sing-box${RESET}"
+        echo -e "${GREEN}7. 重启 Sing-box${RESET}"
+        echo -e "${GREEN}8. 查看日志${RESET}"
+        echo -e "${GREEN}9. 查看节点配置${RESET}"
+        echo -e "${GREEN}0. 退出${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+
+        local choice=""
+        read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+        [[ -z "$choice" ]] && continue
+
+        case "$choice" in
+            1) install_hy2; pause ;;
+            2) update_hy2; pause ;;
+            3) unsthy2; pause ;;
+            4) changeconf; pause ;;
+            5) rc-service sing-box-hy2 start && info "服务已成功启动！"; pause ;;
+            6) rc-service sing-box-hy2 stop && info "服务已成功停止！"; pause ;;
+            7) rc-service sing-box-hy2 restart && info "服务已成功重启！"; pause ;;
+            8) if [[ -f "$LOG_FILE" ]]; then tail -n 50 "$LOG_FILE"; else warn "未发现运行日志文件。"; fi; pause ;;
+            9) showconf; pause ;;
+            0) exit 0 ;;
+            *) error "无效输入，请重新选择。"; sleep 1 ;;
+        esac
+    done
+}
+
+if [[ ${EUID} -ne 0 ]]; then
+    error "请切换至 root 用户运行此面板脚本。"
+    exit 1
+fi
+
+menu "$@"

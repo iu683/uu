@@ -161,7 +161,9 @@ download_and_extract() {
 
     info "开始同步下载资产包..."
     info "下载地址: ${CYAN}${URL_TGZ}${RESET}"
-    curl -fsSL --connect-timeout 10 -o "$TMP/$ASSET" "$URL_TGZ" || die "下载资产包失败！"
+    
+    # 替换为 wget，加入超时、重试以及跳过证书校验（防干扰）
+    wget --timeout=15 --tries=3 --no-check-certificate -O "$TMP/$ASSET" "$URL_TGZ" || die "下载资产包失败！"
 
     tar xzf "$TMP/$ASSET" -C "$TMP"
     EXTRACTED_BIN=$(find "$TMP" -type f -name "next-socks5" | head -n 1)

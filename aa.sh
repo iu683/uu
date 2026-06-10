@@ -1,447 +1,595 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-#================================================================================
-# 常量和全局变量定义
-#================================================================================
-REDSOCKS_CONF="/etc/redsocks.conf"
-IPTABLES_RULES="/etc/redsocks.rules"
-IP6TABLES_RULES="/etc/redsocks6.rules"
-SERVICE_FILE="/etc/systemd/system/redsocks.service"
+# =========================================================
+# Shadowsocks-Rust 管理脚本
+# 加密方式: 2022-blake3-aes-256-gcm
+# =========================================================
 
-# 颜色高亮定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-RESET='\033[0m'
+# ================== 颜色 ==================
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+RESET="\033[0m"
 
-info() { echo -e "${BLUE}[信息]${NC} $1"; }
-success() { echo -e "${GREEN}[成功]${NC} $1"; }
-warning() { echo -e "${YELLOW}[警告]${NC} $1"; }
-error() { echo -e "${RED}[错误]${NC} $1"; }
-step() { echo -e "${PURPLE}[步骤]${NC} $1"; }
+# ================== 基础变量 ==================
+SS_DIR="/etc/ss-rust"
+SS_CONFIG="${SS_DIR}/config.json"
+SS_SERVICE="/etc/systemd/system/ss-rust.service"
+BINARY_PATH="/usr/local/bin/ssserver"
+LOG_FILE="/var/log/ss-rust-manager.log"
+RUN_USER="ss-rust"
+METHOD="2022-blake3-aes-256-gcm"
+KEY_BYTES=32
+TMP_DIR=$(mktemp -d -t ss-rust.XXXXXX)
 
-require_root() {
-    if [ "$EUID" -ne 0 ]; then
-        error "请使用 root 权限运行此脚本，例如: sudo $0"
-        exit 1
+# ================== GITHUB 代理 ==================
+GITHUB_PROXY=(
+    'https://v6.gh-proxy.org/'
+    'https://gh-proxy.com/'
+    'https://hub.glowp.xyz/'
+    'https://proxy.vvvv.ee/'
+    'https://ghproxy.lvedong.eu.org/'
+    ''
+)
+
+# ================== cleanup ==================
+cleanup() {
+    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT INT TERM
+
+# ================== 日志 ==================
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+pause() {
+    read -n 1 -s -r -p "按任意键返回菜单..."
+    echo
+}
+
+# ================== 创建用户 ==================
+create_user() {
+    id -u "$RUN_USER" &>/dev/null || \
+        useradd -r -s /usr/sbin/nologin "$RUN_USER"
+}
+
+# ================== 获取公网IP ==================
+get_public_ip() {
+    local mode=${1:-"v4"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        # 强制获取 IPv4
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        # 强制获取 IPv6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+
+    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
+    echo "127.0.0.1" && return 0
+}
+# ================== 检查依赖 ==================
+check_deps() {
+    echo -e "${GREEN}[信息] 检查系统依赖...${RESET}"
+    install_pkg() {
+        if command -v apt >/dev/null 2>&1; then
+            apt update -y
+            apt install -y "$@"
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y "$@"
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y "$@"
+        fi
+    }
+
+    command -v curl >/dev/null 2>&1 || install_pkg curl
+    command -v wget >/dev/null 2>&1 || install_pkg wget
+    command -v tar  >/dev/null 2>&1 || install_pkg tar
+
+    if ! command -v xz >/dev/null 2>&1; then
+        if command -v apt >/dev/null 2>&1; then
+            install_pkg xz-utils
+        else
+            install_pkg xz
+        fi
+    fi
+
+    command -v ss >/dev/null 2>&1 || {
+        if command -v apt >/dev/null 2>&1; then
+            install_pkg iproute2
+        else
+            install_pkg iproute
+        fi
+    }
+    command -v openssl >/dev/null 2>&1 || install_pkg openssl
+    echo -e "${GREEN}[完成] 依赖检查完成${RESET}"
+}
+
+# ================== 检查端口 ==================
+check_port() {
+    if ss -tulnH "( sport = :$1 )" | grep -q .; then
+        echo -e "${RED}端口 $1 已被占用${RESET}"
+        return 1
     fi
 }
 
-#================================================================================
-# Iptables 规则洗净与恢复 (双栈清理)
-#================================================================================
-cleanup_iptables() {
-    step "正在清理 redsocks 残留的 IPv4/IPv6 iptables 规则..."
-    
-    # 清理 IPv4
-    if iptables -t nat -S OUTPUT 2>/dev/null | grep -q "REDSOCKS"; then
-        iptables -t nat -D OUTPUT -p tcp -j REDSOCKS 2>/dev/null || true
-    fi
-    iptables -t nat -F REDSOCKS 2>/dev/null || true
-    iptables -t nat -X REDSOCKS 2>/dev/null || true
-
-    # 清理 IPv6
-    if ip6tables -t nat -S OUTPUT 2>/dev/null | grep -q "REDSOCKS6"; then
-        ip6tables -t nat -D OUTPUT -p tcp -j REDSOCKS6 2>/dev/null || true
-    fi
-    ip6tables -t nat -F REDSOCKS6 2>/dev/null || true
-    ip6tables -t nat -X REDSOCKS6 2>/dev/null || true
-    
-    success "双栈 iptables 代理规则全面洗净，原网已恢复。"
+# ================== 随机密码 ==================
+random_key() {
+    openssl rand -base64 "$KEY_BYTES" | tr -d '\n'
 }
 
-#================================================================================
-# 核心配置交互与文件写入（全面兼容 IPv4 / IPv6 节点）
-#================================================================================
-write_config_file() {
-    local current_local_port="12345"
-    local current_addr="" current_port="" current_user="" current_pass=""
-    
-    if [ -f "$REDSOCKS_CONF" ]; then
-        current_local_port=$(grep -E '^[[:space:]]*local_port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
-        current_addr=$(grep -E '^[[:space:]]*ip[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
-        current_port=$(grep -E '^[[:space:]]*port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
-        current_user=$(grep -E '^[[:space:]]*login[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
-        current_pass=$(grep -E '^[[:space:]]*password[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
+# ================== 随机端口 ==================
+random_port() {
+    shuf -i 2000-65000 -n 1
+}
+
+# ================== 获取系统DNS ==================
+get_system_dns() {
+    grep -E '^nameserver' /etc/resolv.conf \
+        | awk '{print $2}' \
+        | paste -sd "," -
+}
+
+# ================== 验证密码 ==================
+validate_password() {
+    local password="$1"
+    if ! echo "$password" | base64 -d >/dev/null 2>&1; then
+        echo -e "${RED}密码不是合法 Base64${RESET}"
+        return 1
     fi
+    local decoded_len
+    decoded_len=$(echo "$password" | base64 -d 2>/dev/null | wc -c)
+    if [[ "$decoded_len" -ne "$KEY_BYTES" ]]; then
+        echo -e "${RED}密码必须为 ${KEY_BYTES} 字节${RESET}"
+        return 1
+    fi
+}
 
-    [ -z "$current_local_port" ] && current_local_port="12345"
+# ================== 检测架构 ==================
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64)   echo "x86_64-unknown-linux-gnu" ;;
+        aarch64)  echo "aarch64-unknown-linux-gnu" ;;
+        armv7l)   echo "armv7-unknown-linux-gnueabihf" ;;
+        *)
+            echo -e "${RED}不支持架构: $(uname -m)${RESET}"
+            exit 1
+            ;;
+    esac
+}
 
-    echo -e "${CYAN}请输入您的代理节点（支持IPv4/IPv6/Warp）及本地转发参数：${RESET}"
-    echo "--------------------------------------------------------"
+# ================== 获取最新版本 ==================
+get_latest_version() {
+    local version=""
+    # 同样尝试使用代理去请求 GitHub API，API 无法直接拼接 proxy 的有些代理站支持，这里优先直接请求，失败时尝试代理
+    version=$(curl -fsSL --max-time 5 "https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest" 2>/dev/null | grep tag_name | cut -d '"' -f4 | sed 's/v//')
+    
+    if [[ -z "$version" ]]; then
+        for proxy in "${GITHUB_PROXY[@]}"; do
+            version=$(curl -fsSL --max-time 5 "${proxy}https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest" 2>/dev/null | grep tag_name | cut -d '"' -f4 | sed 's/v//')
+            [[ -n "$version" ]] && break
+        done
+    fi
+    echo "$version"
+}
 
-    # 1. 自定义 Redsocks 本地监听端口
-    local input_local_port
+# ================== 代理下载核心逻辑 ==================
+download_file() {
+    local url_path="$1"
+    local output_file="$2"
+    local success=1
+
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        echo -e "${BLUE}[信息] 尝试使用代理下载: ${proxy:-直连}${RESET}"
+        if wget -T 15 -t 2 -O "$output_file" "${proxy}${url_path}"; then
+            success=0
+            break
+        fi
+    done
+    return $success
+}
+
+# ================== 写配置 ==================
+write_config() {
+    local port="$1"
+    local password="$2"
+    local dns="$3"
+
+    mkdir -p "$SS_DIR"
+    DNS_JSON=$(echo "$dns" | awk -F',' '{
+        for(i=1;i<=NF;i++){
+            gsub(/^[ \t]+|[ \t]+$/, "", $i)
+            printf "%s\"%s\"", (i>1?",":""), $i
+        }
+    }')
+
+    cat > "$SS_CONFIG" <<EOF
+{
+    "server": "::",
+    "server_port": $port,
+    "password": "$password",
+    "method": "$METHOD",
+    "fast_open": true,
+    "mode": "tcp_and_udp",
+    "timeout": 300,
+    "no_delay": true,
+    "ipv6_first": false,
+    "nameserver": [
+        $DNS_JSON
+    ]
+}
+EOF
+    chmod 600 "$SS_CONFIG"
+    chown -R ${RUN_USER}:${RUN_USER} "$SS_DIR"
+}
+
+# ================== 生成链接 ==================
+generate_links() {
+    local port="$1"
+    local password="$2"
+    IP=$(get_public_ip)
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+    ENCODED=$(echo -n "${METHOD}:${password}" | base64 -w 0)
+
+    cat > "${SS_DIR}/ss.txt" <<EOF
+ss://${ENCODED}@${IP}:${port}#${HOSTNAME}-SS2022
+EOF
+
+    cat > "${SS_DIR}/surge.txt" <<EOF
+${HOSTNAME}-SS2022 = ss, ${IP}, ${port}, encrypt-method=${METHOD}, password=${password}, tfo=true, udp-relay=true, ecn=true
+EOF
+}
+
+# ================== 安装配置 ==================
+configure_ss() {
+    echo -e "${GREEN}[信息] 开始配置 Shadowsocks-Rust...${RESET}"
     while true; do
-        read -r -p "请输入 Redsocks 本地监听端口 [$current_local_port]: " input_local_port
-        [ -z "$input_local_port" ] && input_local_port=$current_local_port
-        if [[ "$input_local_port" =~ ^[0-9]+$ ]] && [ "$input_local_port" -ge 1 ] && [ "$input_local_port" -le 65535 ]; then
+        read -p "请输入端口 (默认:随机生成): " input_port
+        if [[ -z "$input_port" ]]; then
+            port=$(random_port)
+        else
+            port="$input_port"
+        fi
+
+        if [[ "$port" =~ ^[0-9]+$ ]] && [[ "$port" -ge 1 ]] && [[ "$port" -le 65535 ]]; then
+            check_port "$port" || continue
             break
         else
-            error "无效的端口号，请输入 1 到 65535 之间的数字。"
+            echo -e "${RED}端口无效${RESET}"
         fi
     done
 
-    # === 设置默认值 ===
-    [ -z "$current_addr" ] && current_addr="127.0.0.1"
-    [ -z "$current_port" ] && current_port="1080"
+    read -p "请输入密码 (默认:随机生成): " input_password
+    if [[ -z "$input_password" ]]; then
+        password=$(random_key)
+    else
+        validate_password "$input_password" || return
+        password="$input_password"
+    fi
 
-    # 2. 远端 Socks5 节点地址 (自动检测 v4 或 v6)
-    local input_addr is_v6=0
+    default_dns=$(get_system_dns)
+    [[ -z "$default_dns" ]] && default_dns="1.1.1.1,8.8.8.8"
+
+    read -p "请输入 DNS (默认:$default_dns): " dns
+    dns=${dns:-$default_dns}
+
+    write_config "$port" "$password" "$dns"
+    generate_links "$port" "$password"
+    IP=$(get_public_ip)
+
+    echo -e "${GREEN}[完成] 配置已保存${RESET}"
+    echo -e "${GREEN}====== Shadowsocks 配置 ======${RESET}"
+    echo -e "${YELLOW} IP地址        : ${IP}${RESET}"
+    echo -e "${YELLOW} 端口          : ${port}${RESET}"
+    echo -e "${YELLOW} 密码          : ${password}${RESET}"
+    echo -e "${YELLOW} 加密          : ${METHOD}${RESET}"
+    echo -e "${YELLOW} DNS           : ${dns}${RESET}"
+    echo -e "${YELLOW}---------------------------------${RESET}"
+    echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
+    echo -e "${YELLOW}[信息] SS链接：${RESET}"
+    cat "${SS_DIR}/ss.txt"
+    echo
+    echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
+    cat "${SS_DIR}/surge.txt"
+    echo -e "${YELLOW}---------------------------------${RESET}"
+}
+
+# ================== 修改配置 ==================
+modify_ss() {
+    echo -e "${GREEN}[信息] 开始修改 Shadowsocks 配置...${RESET}"
+    if [[ ! -f "$SS_CONFIG" ]]; then
+        echo -e "${RED}配置文件不存在${RESET}"
+        return
+    fi
+
+    old_port=$(grep server_port "$SS_CONFIG" | grep -o '[0-9]\+')
+    old_password=$(grep password "$SS_CONFIG" | cut -d '"' -f4)
+    old_dns=$(awk '/"nameserver"/ {flag=1; next} flag && /\]/ {flag=0} flag {gsub(/[",[:space:]]/, ""); if(length) print}' "$SS_CONFIG" | paste -sd "," -)
+
+    echo -e "${YELLOW}当前端口 : ${old_port}${RESET}"
+    echo -e "${YELLOW}当前密码 : ${old_password}${RESET}"
+    echo
+
     while true; do
-        if [ -n "$current_addr" ]; then
-            read -r -p "请输入 Socks5 服务器地址/IP [$current_addr]: " input_addr
-            [ -z "$input_addr" ] && input_addr=$current_addr
-        else
-            read -r -p "请输入 Socks5 服务器地址/IP (支持IPv6如 2001:db8::1): " input_addr
-        fi
-        if [ -n "$input_addr" ]; then 
-            if [[ "$input_addr" == *":"* ]]; then
-                is_v6=1
+        read -p "请输入新端口 [当前:${old_port}]: " input_port
+        port=${input_port:-$old_port}
+        if [[ "$port" =~ ^[0-9]+$ ]] && [[ "$port" -ge 1 ]] && [[ "$port" -le 65535 ]]; then
+            if [[ "$port" != "$old_port" ]]; then
+                check_port "$port" || continue
             fi
             break
-        else 
-            error "服务器地址不能为空。"; 
+        else
+            echo -e "${RED}端口无效${RESET}"
         fi
     done
 
-    # 3. 远端 Socks5 节点端口
-    local input_port
-    while true; do
-        if [ -n "$current_port" ]; then
-            read -r -p "请输入 Socks5 服务器端口 [$current_port]: " input_port
-            [ -z "$input_port" ] && input_port=$current_port
-        else
-            read -r -p "请输入 Socks5 服务器端口 (1-65535): " input_port
-        fi
-        if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
-            break
-        else
-            error "无效的端口号，请输入 1 到 65535 之间的数字。"
-        fi
-    done
+    echo
+    echo "1. 保持当前密码"
+    echo "2. 手动输入密码"
+    echo "3. 自动生成密码"
+    read -p "请选择 [默认:1]: " pwd_mode
 
-    # 4. 用户名
-    local input_user
-    if [ -n "$current_user" ]; then
-        read -r -p "请输入用户名 (回车保持现状, 彻底清空请输入 none) [$current_user]: " input_user
-        [ -z "$input_user" ] && input_user=$current_user
-        [ "$input_user" = "none" ] && input_user=""
-    else
-        read -r -p "请输入用户名 (可选，无验证直接留空回车): " input_user
-    fi
+    case $pwd_mode in
+        2)
+            while true; do
+                read -p "请输入 Base64 密码: " input_password
+                validate_password "$input_password" && break
+            done
+            password="$input_password"
+            ;;
+        3)
+            password=$(random_key)
+            echo -e "${GREEN}已生成新密码${RESET}"
+            ;;
+        *)
+            password="$old_password"
+            ;;
+    esac
 
-    # 5. 密码
-    local input_pass
-    if [ -n "$input_user" ]; then
-        if [ -n "$current_pass" ]; then
-            read -r -p "请输入密码 (回车保持现状, 彻底清空请输入 none) [$current_pass]: " input_pass
-            [ -z "$input_pass" ] && input_pass=$current_pass
-            [ "$input_pass" = "none" ] && input_pass=""
-        else
-            read -r -p "请输入密码 (可选，无验证直接留空回车): " input_pass
-        fi
-    else
-        input_pass=""
-    fi
+    default_dns=$(get_system_dns)
+    [[ -z "$default_dns" ]] && default_dns="1.1.1.1,8.8.8.8"
+    default_dns=${old_dns:-$default_dns}
 
-    # 清洗可能存在的 Windows 换行符
-    input_local_port=$(echo "$input_local_port" | tr -d '\r')
-    input_addr=$(echo "$input_addr" | tr -d '\r')
-    input_port=$(echo "$input_port" | tr -d '\r')
-    input_user=$(echo "$input_user" | tr -d '\r')
-    input_pass=$(echo "$input_pass" | tr -d '\r')
+    echo
+    read -p "请输入 DNS [当前:$default_dns]: " dns
+    dns=${dns:-$default_dns}
 
-    step "正在渲染生成双栈配置文件 $REDSOCKS_CONF ..."
-    cat > "$REDSOCKS_CONF" <<EOF
-base {
-    log_debug = off;
-    log_info = on;
-    log = "syslog:daemon";
-    daemon = on;
-    redirector = iptables;
+    cp "$SS_CONFIG" "${SS_CONFIG}.bak.$(date +%s)"
+    write_config "$port" "$password" "$dns"
+    generate_links "$port" "$password"
+    systemctl restart ss-rust
+    IP=$(get_public_ip)
+
+    echo -e "${GREEN}[完成] 配置修改成功${RESET}"
+    echo
+    echo -e "${GREEN}====== Shadowsocks 配置 ======${RESET}"
+    echo -e "${YELLOW} IP地址        : ${IP}${RESET}"
+    echo -e "${YELLOW} 端口          : ${port}${RESET}"
+    echo -e "${YELLOW} 密码          : ${password}${RESET}"
+    echo -e "${YELLOW} 加密          : ${METHOD}${RESET}"
+    echo -e "${YELLOW} DNS           : ${dns}${RESET}"
+    echo
+    echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
+    echo -e "${YELLOW}[信息] SS链接：${RESET}"
+    cat "${SS_DIR}/ss.txt"
+    echo
+    echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
+    cat "${SS_DIR}/surge.txt"
+    echo
+    log "Shadowsocks 配置已修改"
 }
 
-redsocks {
-    local_ip = 127.0.0.1;
-    local_port = $input_local_port;
+# ================== 安装 ==================
+install_ss() {
+    echo -e "${GREEN}[信息] 开始安装 Shadowsocks-Rust...${RESET}"
+    check_deps
+    create_user
+    mkdir -p "$SS_DIR"
+    cd "$TMP_DIR"
 
-    ip = "$input_addr";
-    port = $input_port;
-    type = socks5;
-EOF
-
-    if [ -n "$input_user" ]; then
-        echo "    login = \"$input_user\";" >> "$REDSOCKS_CONF"
+    VERSION=$(get_latest_version)
+    if [[ -z "$VERSION" ]]; then
+        echo -e "${RED}[错误] 无法获取 GitHub 最新版本，请检查网络或稍后再试。${RESET}"
+        return
     fi
-    if [ -n "$input_pass" ]; then
-        echo "    password = \"$input_pass\";" >> "$REDSOCKS_CONF"
-    fi
+    
+    ARCH=$(detect_arch)
+    URL_PATH="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${VERSION}/shadowsocks-v${VERSION}.${ARCH}.tar.xz"
 
-    echo "}" >> "$REDSOCKS_CONF"
-
-    # 生成 IPv4 防火墙劫持规则
-    step "正在渲染 IPv4 防护 Iptables 规则 ..."
-    cat > "$IPTABLES_RULES" <<EOF
-*nat
-:PREROUTING ACCEPT [0:0]
-:INPUT ACCEPT [0:0]
-:OUTPUT ACCEPT [0:0]
-:POSTROUTING ACCEPT [0:0]
-:REDSOCKS - [0:0]
--A OUTPUT -p tcp --dport 22 -j RETURN
--A OUTPUT -p tcp --sport 22 -j RETURN
--A OUTPUT -p tcp --dport $input_port -j RETURN
--A OUTPUT -p tcp -j REDSOCKS
-EOF
-
-    if [ $is_v6 -eq 0 ]; then
-        echo "-A REDSOCKS -d $input_addr -j RETURN" >> "$IPTABLES_RULES"
+    if ! download_file "$URL_PATH" "ss.tar.xz"; then
+        echo -e "${RED}[错误] 所有 GitHub 代理均下载失败！${RESET}"
+        return
     fi
 
-    cat >> "$IPTABLES_RULES" <<EOF
--A REDSOCKS -d 0.0.0.0/8 -j RETURN
--A REDSOCKS -d 10.0.0.0/8 -j RETURN
--A REDSOCKS -d 127.0.0.0/8 -j RETURN
--A REDSOCKS -d 169.254.0.0/16 -j RETURN
--A REDSOCKS -d 172.16.0.0/12 -j RETURN
--A REDSOCKS -d 192.168.0.0/16 -j RETURN
--A REDSOCKS -d 224.0.0.0/4 -j RETURN
--A REDSOCKS -d 240.0.0.0/4 -j RETURN
--A REDSOCKS -p tcp -j REDIRECT --to-ports $input_local_port
-COMMIT
-EOF
+    tar -xf ss.tar.xz
+    install -m 755 ssserver "$BINARY_PATH"
+    echo "$VERSION" > "${SS_DIR}/version.txt"
 
-    # 生成 IPv6 防火墙劫持规则
-    step "正在渲染 IPv6 防护 Ip6tables 规则 ..."
-    cat > "$IP6TABLES_RULES" <<EOF
-*nat
-:PREROUTING ACCEPT [0:0]
-:INPUT ACCEPT [0:0]
-:OUTPUT ACCEPT [0:0]
-:POSTROUTING ACCEPT [0:0]
-:REDSOCKS6 - [0:0]
--A OUTPUT -p tcp --dport 22 -j RETURN
--A OUTPUT -p tcp --sport 22 -j RETURN
--A OUTPUT -p tcp --dport $input_port -j RETURN
--A OUTPUT -p tcp -j REDSOCKS6
-EOF
+    configure_ss
 
-    if [ $is_v6 -eq 1 ]; then
-        echo "-A REDSOCKS6 -d $input_addr -j RETURN" >> "$IP6TABLES_RULES"
-    fi
-
-    cat >> "$IP6TABLES_RULES" <<EOF
--A REDSOCKS6 -d ::1/128 -j RETURN
--A REDSOCKS6 -d fe80::/10 -j RETURN
--A REDSOCKS6 -p tcp -j REDIRECT --to-ports $input_local_port
-COMMIT
-EOF
-}
-
-#================================================================================
-# 服务管理块
-#================================================================================
-install_redsocks_env() {
-    cleanup_iptables
-
-    step "[1/4] 从软件源检查并安装 redsocks 双栈核心组件..."
-    if ! command -v redsocks &>/dev/null; then
-        # 修改后（去掉了 ip6tables，增加了 iptables-nft 兼容层确保双栈兼容性）
-        apt-get update && apt-get install -y redsocks iptables curl || {
-            error "安装基础包失败，请检查系统网络或 apt 源！"
-            return 1
-        }
-    fi
-
-    systemctl stop redsocks 2>/dev/null || true
-    systemctl disable redsocks 2>/dev/null || true
-
-    step "[2/4] 进入节点配置录入阶段..."
-    write_config_file
-
-    step "[3/4] 正在向系统注册自定义双栈劫持服务 (redsocks.service)..."
-    cat > "$SERVICE_FILE" <<EOF
+    # ===== systemd =====
+    cat > "$SS_SERVICE" <<EOF
 [Unit]
-Description=Redsocks Transparent Proxy Service (IPv4+IPv6)
-After=network.target
+Description=Shadowsocks Rust Server
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-Type=forking
-PIDFile=/run/redsocks.pid
-ExecStartPre=-/bin/rm -f /run/redsocks.pid
-ExecStart=/usr/sbin/redsocks -c $REDSOCKS_CONF -p /run/redsocks.pid
-ExecStartPost=/bin/sh -c '/sbin/iptables-restore < $IPTABLES_RULES && /sbin/ip6tables-restore < $IP6TABLES_RULES'
-ExecStopPost=/bin/sh -c 'iptables -t nat -D OUTPUT -p tcp -j REDSOCKS 2>/dev/null || true; iptables -t nat -F REDSOCKS 2>/dev/null || true; iptables -t nat -X REDSOCKS 2>/dev/null || true; ip6tables -t nat -D OUTPUT -p tcp -j REDSOCKS6 2>/dev/null || true; ip6tables -t nat -F REDSOCKS6 2>/dev/null || true; ip6tables -t nat -X REDSOCKS6 2>/dev/null || true'
-TimeoutStartSec=5
+Type=simple
+User=${RUN_USER}
+Group=${RUN_USER}
+ExecStart=${BINARY_PATH} -c ${SS_CONFIG}
 Restart=on-failure
-LimitNOFILE=524288
+RestartSec=3
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    chown root:root "$REDSOCKS_CONF" 2>/dev/null || true
-    chmod 644 "$REDSOCKS_CONF" 2>/dev/null || true
-
     systemctl daemon-reload
-    systemctl enable redsocks.service 2>/dev/null
-    
-    step "[4/4] 正在自动激活服务并开启双栈全局透明代理..."
-    systemctl start redsocks.service || {
-        error "自动启动代理失败，请检查配置或运行日志。"
-        return 1
-    }
+    systemctl enable ss-rust
+    systemctl restart ss-rust
 
-    success "Redsocks 双栈全套环境已完美拉起运行！支持 Warp 与 IPv6 节点！"
+    echo -e "${GREEN}[完成] Shadowsocks-Rust 已安装并启动${RESET}"
+    log "Shadowsocks-Rust 已安装"
 }
 
-change_config() {
-    info "开始单独修改全局代理配置："
-    write_config_file
-    chown root:root "$REDSOCKS_CONF" 2>/dev/null || true
-    success "双栈配置文件与 Iptables 联动规则更新成功！"
-    
-    if systemctl is-active --quiet redsocks.service; then
-        step "检测到服务正在后台运行，正在自动重启服务以应用新配置与端口..."
-        systemctl restart redsocks.service
-        success "新配置已无缝双栈生效。"
-    else
-        info "提示：配置已就绪，当前服务处于停止状态。请在主菜单选择【选项 4】手动启动。"
+# ================== 更新 ==================
+update_ss() {
+    echo -e "${GREEN}[信息] 更新 Shadowsocks-Rust...${RESET}"
+    if [[ ! -f "$SS_CONFIG" ]]; then
+        echo -e "${RED}未找到配置文件${RESET}"
+        return
     fi
+
+    cd "$TMP_DIR"
+    VERSION=$(get_latest_version)
+    if [[ -z "$VERSION" ]]; then
+        echo -e "${RED}[错误] 无法获取 GitHub 最新版本。${RESET}"
+        return
+    fi
+    
+    ARCH=$(detect_arch)
+    URL_PATH="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${VERSION}/shadowsocks-v${VERSION}.${ARCH}.tar.xz"
+
+    if ! download_file "$URL_PATH" "ss.tar.xz"; then
+        echo -e "${RED}[错误] 所有 GitHub 代理均下载失败！${RESET}"
+        return
+    fi
+
+    systemctl stop ss-rust || true
+    tar -xf ss.tar.xz
+    install -m 755 ssserver "$BINARY_PATH"
+    echo "$VERSION" > "${SS_DIR}/version.txt"
+    systemctl restart ss-rust
+
+    echo -e "${GREEN}[完成] Shadowsocks-Rust 已更新${RESET}"
+    log "Shadowsocks-Rust 已更新"
 }
 
-uninstall_redsocks_env() {
-    step "正在停止并彻底禁用后台 redsocks 服务并安全恢复网络..."
-    systemctl stop redsocks.service 2>/dev/null || true
-    systemctl disable redsocks.service 2>/dev/null || true
-    cleanup_iptables
-
-    step "正在清理系统残留组件文件..."
-    [ -f "$SERVICE_FILE" ] && rm -f "$SERVICE_FILE"
-    [ -f "$REDSOCKS_CONF" ] && rm -f "$REDSOCKS_CONF"
-    [ -f "$IPTABLES_RULES" ] && rm -f "$IPTABLES_RULES"
-    [ -f "$IP6TABLES_RULES" ] && rm -f "$IP6TABLES_RULES"
-    
+# ================== 卸载 ==================
+uninstall_ss() {
+    echo -e "${RED}[警告] 卸载 Shadowsocks-Rust...${RESET}"
+    systemctl stop ss-rust || true
+    systemctl disable ss-rust || true
+    rm -f "$SS_SERVICE"
+    rm -rf "$SS_DIR"
+    rm -f "$BINARY_PATH"
     systemctl daemon-reload
-    success "环境已彻底从系统卸载干净。"
+    echo -e "${GREEN}[完成] Shadowsocks-Rust 已卸载${RESET}"
+    log "Shadowsocks-Rust 已卸载"
 }
 
-get_status() {
-    if systemctl is-active --quiet redsocks.service; then
-        status_show="${GREEN}已启动 (运行中)${RESET}"
+# ================== 菜单 ==================
+show_menu() {
+    clear
+    if systemctl is-active --quiet ss-rust; then
+        STATUS="${GREEN}● 运行中${RESET}"
     else
-        status_show="${RED}已停止 (未运行)${RESET}"
+        STATUS="${RED}● 未运行${RESET}"
     fi
 
-    if command -v redsocks &>/dev/null; then
-        local version_raw
-        version_raw=$(redsocks -v 2>&1 | grep -oE '[0-9]+\.[0-9.]+' | head -n1)
-        if [ -n "$version_raw" ]; then
-            version_show="${YELLOW}v${version_raw}${RESET}"
-        else
-            version_show="${YELLOW}已安装${RESET}"
-        fi
-    else
-        version_show="${RED}未安装${RESET}"
+    VERSION_SHOW="未安装"
+    if [[ -f "${SS_DIR}/version.txt" ]]; then
+        VERSION_SHOW="v$(cat "${SS_DIR}/version.txt")"
     fi
 
-    if [ -f "$REDSOCKS_CONF" ]; then
-        local port addr local_port
-        local_port=$(grep -E '^[[:space:]]*local_port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
-        addr=$(grep -E '^[[:space:]]*ip[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
-        port=$(grep -E '^[[:space:]]*port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
-        port_show="${YELLOW}${addr}:${port} ${NC}->${CYAN} 本地监听:${local_port}${RESET}"
-    else
-        port_show="${RED}无配置${RESET}"
+    PORT_SHOW="-"
+    if [[ -f "$SS_CONFIG" ]]; then
+        PORT_SHOW=$(grep server_port "$SS_CONFIG" | grep -o '[0-9]\+')
     fi
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   Shadowsocks-Rust 管理面板        ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $STATUS"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${VERSION_SHOW}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${PORT_SHOW}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}2. 更新 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}3. 卸载 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}6. 停止 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}7. 重启 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-test_exit_ip() {
-    step "正在通过全局双栈 iptables 转发层查询落地出口 IP..."
-    local ip_info=""
-    local test_urls=("https://api.ipify.org?format=json" "https://ipinfo.io/json")
-
-    for url in "${test_urls[@]}"; do
-        info "正在尝试请求: $url ..."
-        ip_info=$(curl -s -m 6 "$url" 2>/dev/null || echo "")
-        if [ -n "$ip_info" ]; then break; fi
-    done
-
-    if [ -n "$ip_info" ]; then
-        echo -e "${GREEN}----------------------------------------${RESET}"
-        if echo "$ip_info" | grep -q "{"; then
-            echo "$ip_info" | sed 's/["{}]//g' | sed 's/,/\n/g' | sed 's/^ *//'
-        else
-            echo -e "当前落地出口 IP: ${YELLOW}$ip_info${RESET}"
-        fi
-        echo -e "${GREEN}----------------------------------------${RESET}"
-        success "测试成功！流量转发全局畅通。"
-    else
-        error "获取失败。请执行选项 7 查看运行日志。"
-    fi
-}
-
-panel_menu() {
-    require_root
-    while true; do
-        get_status
-        clear
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}             Redsocks           ${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}状态   :${RESET} $status_show"
-        echo -e "${GREEN}版本   :${RESET} $version_show"
-        echo -e "${GREEN}代理   :${RESET} $port_show"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} 1. 安装 Redsocks${RESET}"
-        echo -e "${GREEN} 2. 卸载 Redsocks${RESET}"
-        echo -e "${GREEN} 3. 修改配置${RESET}"
-        echo -e "${GREEN} 4. 启动 Redsocks${RESET}"
-        echo -e "${GREEN} 5. 停止 Redsocks${RESET}"
-        echo -e "${GREEN} 6. 重启 Redsocks 服务${RESET}"
-        echo -e "${GREEN} 7. 查看系统日志${RESET}"
-        echo -e "${GREEN} 8. 测试当前出口IP${RESET}"
-        echo -e "${GREEN} 0. 退出${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        
-        # 修复 read 语法，避免特定环境下终端高亮断色
-        echo -ne "${GREEN}请输入数字: ${RESET}"
-        read -r num
-        case "$num" in
-            1) install_redsocks_env ;;
-            2) uninstall_redsocks_env ;;
-            3) change_config ;;
-            4)
-                step "正在启动服务并加载双栈劫持规则..."
-                if [ ! -f "$REDSOCKS_CONF" ]; then
-                    error "未发现有效配置！"
-                else
-                    systemctl start redsocks.service && success "双栈代理全力运转。" || error "启动失败。"
-                fi
-                ;;
-            5)
-                step "正在安全关闭双栈代理并恢复原网..."
-                systemctl stop redsocks.service && success "网络彻底复原。" || error "停用失败。"
-                ;;
-            6)
-                systemctl restart redsocks.service && success "重启成功。" || error "重启失败。"
-                ;;
-            7)
-                journalctl -u redsocks.service -n 30 --no-pager || tail -n 30 /var/log/syslog
-                ;;
-            8) test_exit_ip ;;
-            0) exit 0 ;;
-            *) error "非法数字！" ;;
-        esac
-        echo -ne "${YELLOW}按任意键返回主菜单...${RESET}"
-        read -r
-    done
-}
-
-panel_menu
+# ================== 主循环 ==================
+while true; do
+    show_menu
+    read -r -p $'\033[32m请输入选项: \033[0m' choice
+    case $choice in
+        1) install_ss; pause ;;
+        2) update_ss; pause ;;
+        3) uninstall_ss; pause ;;
+        4) modify_ss; pause ;;
+        5)
+            systemctl start ss-rust
+            echo -e "${GREEN}[完成] Shadowsocks 已启动${RESET}"
+            log "Shadowsocks 启动"
+            pause
+            ;;
+        6)
+            systemctl stop ss-rust
+            echo -e "${GREEN}[完成] Shadowsocks 已停止${RESET}"
+            log "Shadowsocks 停止"
+            pause
+            ;;
+        7)
+            systemctl restart ss-rust
+            echo -e "${GREEN}[完成] Shadowsocks 已重启${RESET}"
+            log "Shadowsocks 重启"
+            pause
+            ;;
+        8) journalctl -u ss-rust -e --no-pager; pause ;;
+        9)
+            if [[ -f "$SS_CONFIG" ]]; then
+                echo -e "${GREEN}====== 当前配置 ======${RESET}"
+                cat "$SS_CONFIG"
+                echo
+                echo -e "${GREEN}====== SS链接 ======${RESET}"
+                cat "${SS_DIR}/ss.txt"
+                echo
+                echo -e "${GREEN}====== Surge 配置 ======${RESET}"
+                cat "${SS_DIR}/surge.txt"
+            else
+                echo -e "${RED}配置文件不存在${RESET}"
+            fi
+            pause
+            ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效输入${RESET}"; pause ;;
+    esac
+done

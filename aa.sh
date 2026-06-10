@@ -1,470 +1,460 @@
 #!/bin/bash
 
-# =========================================================
-# Xray VLESS-HTTPUpgrade 管理脚本(Alpine Linux) 
-# =========================================================
-
-set -Eeuo pipefail
-
-# ================== 颜色定义 ==================
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-BLUE="\033[34m"
-RESET="\033[0m"
-
-# ================== GITHUB 代理加速池 ==================
-readonly GITHUB_PROXY=(
+# --- 脚本配置 ---
+# GITHUB 代理加速池（按顺序逐个尝试，空字符串代表直连）
+GITHUB_PROXY=(
     'https://v6.gh-proxy.org/'
     'https://gh-proxy.com/'
     'https://hub.glowp.xyz/'
     'https://proxy.vvvv.ee/'
     'https://ghproxy.lvedong.eu.org/'
-    '' # 留空代表直连，作为兜底保底
+    ''
 )
 
-# ================== 🚀 服务自定义重命名 ==================
-readonly SERV_NAME="xray-httpupgrade"
+# 颜色定义
+GREEN="\033[1;32m"
+RED="\033[1;31m"
+YELLOW="\033[1;33m"
+BLUE="\033;34m"
+NC="\033[0m"
+RESET="\033[0m"
 
-# ================== 📂 自定义分享链接存放路径 ==================
-readonly X_LINK_DIR="/root/proxynode/vlesshttpupgrade"
+# --- 平台无关路径和文件名 ---
+INSTALL_DIR="/usr/local/bin"
+CONFIG_DIR="/etc/easytier"
+CONFIG_FILE="${CONFIG_DIR}/easytier.toml"
+CORE_BINARY_NAME="easytier-core"
+CLI_BINARY_NAME="easytier-cli"
+ALIAS_PATH="/usr/local/bin/et"
 
-# ================== 路径与日志 (自动联动) ==================
-readonly X_DIR="/etc/${SERV_NAME}"
-readonly X_CONFIG="${X_DIR}/config.json"
-readonly X_BIN="/usr/local/bin/${SERV_NAME}"
-readonly X_LINK="${X_LINK_DIR}/${SERV_NAME}_vless.txt"
-readonly X_LOG="/var/log/${SERV_NAME}.log"
-readonly INIT_FILE="/etc/init.d/${SERV_NAME}"
+# --- 平台特定变量 (将在 main 函数中设置) ---
+OS_TYPE=""
+SERVICE_FILE=""
+SERVICE_LABEL="com.easytier.core"
+SERVICE_NAME="easytier"
+LOG_FILE="/var/log/easytier.log"
 
-# ================== 核心工具 ==================
-info() { echo -e "${GREEN}[信息] $*${RESET}"; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}"; }
-error() { echo -e "${RED}[错误] $*${RESET}"; }
-pause() { echo; echo -ne "${GREEN}按任意键返回菜单...${RESET}"; read -n 1 -s; echo; }
+# 原始下载地址
+GITHUB_API_URL="https://api.github.com/repos/EasyTier/EasyTier/releases/latest"
 
-is_valid_port() {
-    local port=$1
-    if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
-        return 0
-    else
-        return 1
-    fi
+# --- 辅助函数 ---
+check_root() {
+	if [ "$(id -u)" -ne 0 ]; then
+		echo -e "${RED}错误: 此脚本必须以 root 或 sudo 权限运行。${NC}"; exit 1
+	fi
 }
 
-restart_xray() {
-    rc-service "$SERV_NAME" restart >/dev/null 2>&1 || true
-    sleep 1
-    if rc-service "$SERV_NAME" status 2>/dev/null | grep -q "started"; then
-        return 0
-    else
-        return 1
-    fi
+check_dependencies() {
+	local missing_deps=()
+	for cmd in curl jq unzip; do
+		if ! command -v "$cmd" &> /dev/null; then missing_deps+=("$cmd"); fi
+	done
+	if [ ${#missing_deps[@]} -gt 0 ]; then
+		echo -e "${YELLOW}检测到缺失的依赖: ${missing_deps[*]}${NC}"
+		if [[ "$OS_TYPE" == "linux" || "$OS_TYPE" == "alpine"  ]]; then
+			read -p "是否尝试自动安装? (y/n): " choice
+			if [[ "$choice" != "y" && "$choice" != "Y" ]]; then echo -e "${RED}操作中止。${NC}"; exit 1; fi
+			if [[ "$OS_TYPE" == "linux" ]]; then
+				if command -v apt-get &>/dev/null; then apt-get update && apt-get install -y "${missing_deps[@]}";
+				elif command -v yum &>/dev/null; then yum install -y "${missing_deps[@]}";
+				elif command -v dnf &>/dev/null; then dnf install -y "${missing_deps[@]}";
+				else echo -e "${RED}无法确定包管理器。请手动安装。${NC}"; exit 1; fi
+			elif [[ "$OS_TYPE" == "alpine" ]]; then apk add --no-cache "${missing_deps[@]}"; fi
+		elif [[ "$OS_TYPE" == "macos" ]]; then
+			echo -e "${YELLOW}请使用 Homebrew 手动安装: brew install ${missing_deps[*]}${NC}"; exit 1
+		fi
+		for cmd in "${missing_deps[@]}"; do
+			 if ! command -v "$cmd" &> /dev/null; then
+				echo -e "${RED}依赖 '$cmd' 安装失败。请手动安装后重试。${NC}"; exit 1
+			 fi
+		done
+	fi
 }
 
-get_xray_status() {
-    if rc-service "$SERV_NAME" status 2>/dev/null | grep -q "started"; then
-        echo -e "${GREEN}● 运行中 ${RESET}"
-    else 
-        echo -e "${RED}● 未运行 ${RESET}"
-    fi
+get_arch() {
+	case "$(uname -m)" in
+		x86_64|amd64) echo "x86_64" ;; aarch64|arm64) echo "aarch64" ;;
+		*) echo -e "${RED}错误: 不支持的架构: $(uname -m)${NC}"; exit 1 ;;
+	esac
 }
 
-get_xray_version() {
-    if [[ -x "$X_BIN" ]]; then
-        "$X_BIN" version 2>/dev/null | head -n 1 | awk '{print $2}'
-    else
-        echo "未安装"
-    fi
+check_installed() {
+	if [ ! -f "${INSTALL_DIR}/${CORE_BINARY_NAME}" ]; then
+		echo -e "${YELLOW}EasyTier 尚未安装。请先选择选项 1。${NC}"; return 1
+	fi; return 0
 }
 
-get_public_ip() {
-    local mode=${1:-"v4"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        # 强制获取 IPv4
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        # 强制获取 IPv6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
+get_runtime_status() {
+	if [ ! -f "${INSTALL_DIR}/${CORE_BINARY_NAME}" ]; then
+		echo -e "${RED}未安装${RESET}"
+	elif [[ "$OS_TYPE" == "linux" ]]; then
+		if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then echo -e "${GREEN}运行中 (systemd)${RESET}"; else echo -e "${RED}已停止${RESET}"; fi
+	elif [[ "$OS_TYPE" == "alpine" ]]; then
+		if rc-service "${SERVICE_NAME}" status 2>/dev/null | grep -q "started"; then echo -e "${GREEN}运行中 (openrc)${RESET}"; else echo -e "${RED}已停止${RESET}"; fi
+	elif [[ "$OS_TYPE" == "macos" ]]; then
+		if launchctl list | grep -q "${SERVICE_LABEL}"; then echo -e "${GREEN}运行中 (launchd)${RESET}"; else echo -e "${RED}已停止${RESET}"; fi
+	else
+		echo -e "${RED}未知${RESET}"
+	fi
+}
 
-    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
-    echo "127.0.0.1" && return 0
+get_version() {
+	if [ -f "${INSTALL_DIR}/${CORE_BINARY_NAME}" ]; then
+		"${INSTALL_DIR}/${CORE_BINARY_NAME}" --version 2>/dev/null | awk '{print $2}' || echo "未知"
+	else
+		echo "无"
+	fi
+}
+
+get_network_name() {
+	if [ -f "$CONFIG_FILE" ]; then
+		local name
+		name=$(grep -E "^network_name\s*=" "$CONFIG_FILE" | head -n 1 | cut -d'"' -f2)
+		echo "${name:-未配置}"
+	else
+		echo "无"
+	fi
 }
 
 
-HOSTNAME=$(hostname -s | sed 's/ /_/g')
+# --- 平台相关的服务管理功能 ---
 
-# ================== 配置写入 ==================
-write_config() {
-    local port=$1 uuid=$2 path=$3 host_name=$4
-    local outbound=${5:-'{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}'}
-    mkdir -p "$X_DIR" && chmod 755 "$X_DIR"
-    
-    cat > "$X_CONFIG" <<EOF
-{
-    "log": { "loglevel": "warning" },
-    "inbounds": [{
-        "listen": "::"
-        "port": $port,
-        "protocol": "vless",
-        "settings": {
-            "clients": [{"id": "$uuid"}],
-            "decryption": "none"
-        },
-        "streamSettings": {
-            "network": "httpupgrade",
-            "security": "none",
-            "httpupgradeSettings": {
-                "path": "$path",
-                "host": "$host_name"
-            }
-        },
-        "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
-    }],
-    "outbounds": [$outbound]
-}
-EOF
-}
-
-# ================== 出口模式配置 ==================
-configure_custom_socks5_outbound() {
-    if [[ ! -f "$X_CONFIG" ]]; then 
-        error "错误: Xray 未安装，无法配置出口模式。"
-        return
+create_service_file() {
+    if [[ "$OS_TYPE" == "macos" || "$OS_TYPE" == "alpine" ]]; then
+        touch "$LOG_FILE"
+        chown root:root "$LOG_FILE" &>/dev/null
+        chmod 644 "$LOG_FILE"
     fi
 
-    local mode current_protocol tmp_file
-    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$X_CONFIG" 2>/dev/null || echo "freedom")
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        cat > "${SERVICE_FILE}" << EOL
+[Unit]
+Description=EasyTier Service
+After=network.target
 
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请选择出口模式：${RESET}"
-    [[ "$current_protocol" == "socks" ]] && echo -e "${YELLOW} (当前: Socks5)${RESET}" || echo -e "${GREEN} (当前: 直连)${RESET}"
-    echo -e "${GREEN}1) 直连出口${RESET}"
-    echo -e "${GREEN}2) Socks5出口${RESET}"
-    echo -e "${GREEN}0) 取消${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+[Service]
+Type=simple
+User=root
+ExecStart=${INSTALL_DIR}/${CORE_BINARY_NAME} -c ${CONFIG_FILE}
+Restart=always
+RestartSec=5s
 
-    echo -ne "${GREEN}请输入选项 [0-2]: ${RESET}"; read mode
-    case "$mode" in
-        1)
-            tmp_file=$(mktemp)
-            jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$X_CONFIG" > "$tmp_file"
-            cp "$X_CONFIG" "${X_CONFIG}.bak.$(date +%s)"
-            mv "$tmp_file" "$X_CONFIG"
-            restart_xray && info "已成功切换为直连出口！" || error "切换失败。"
-            return ;;
-        2) ;;
-        *) info "已取消配置"; return ;;
-    esac
-
-    info "配置自定义 Socks5 出口代理..."
-    local s_host s_port s_user s_pass
-    echo -ne "${GREEN}请输入 Socks5 服务器地址/IP: ${RESET}"; read s_host
-    [[ -z "$s_host" ]] && return
-
-    while true; do
-        echo -ne "${GREEN}请输入 Socks5 端口 (默认: 1080): ${RESET}"; read s_port
-        [[ -z "$s_port" ]] && s_port=1080
-        is_valid_port "$s_port" && break || error "端口无效，请输入 1-65535 之间的数字。"
-    done
-
-    echo -ne "${GREEN}请输入 Socks5 用户名 (无则回车): ${RESET}"; read s_user
-    if [[ -n "$s_user" ]]; then
-        echo -ne "${GREEN}请输入 Socks5 密码: ${RESET}"; read -s s_pass; echo
-    else
-        s_pass=""
-    fi
-
-    tmp_file=$(mktemp)
-    if [[ -n "$s_user" ]]; then
-        jq --arg host "$s_host" --argjson port "$s_port" --arg user "$s_user" --arg pass "$s_pass" \
-            '.outbounds = [{"protocol": "socks", "tag": "custom-out", "settings": {"servers": [{"address": $host, "port": $port, "users": [{"user": $user, "pass": $pass}]}]}}]' \
-            "$X_CONFIG" > "$tmp_file"
-    else
-        jq --arg host "$s_host" --argjson port "$s_port" \
-            '.outbounds = [{"protocol": "socks", "tag": "custom-out", "settings": {"servers": [{"address": $host, "port": $port}]}}]' \
-            "$X_CONFIG" > "$tmp_file"
-    fi
-
-    cp "$X_CONFIG" "${X_CONFIG}.bak.$(date +%s)"
-    mv "$tmp_file" "$X_CONFIG"
-    restart_xray && info "已成功切换为 Socks5 出口！" || error "重启失败，请检查 Socks5 信息。"
-}
-
-# 修改配置
-modify_config() {
-    if [[ ! -f "$X_CONFIG" ]]; then error "请先安装 Xray"; return; fi
-    
-    local curr_port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
-    local curr_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
-    local curr_path=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.path // "/"' "$X_CONFIG")
-    local curr_host=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.host // ""' "$X_CONFIG")
-    local curr_outbound=$(jq -c '.outbounds[0]' "$X_CONFIG")
-
-    # 1. 修改端口
-    local n_port
-    while true; do
-        read -p "请输入新端口 (回车保持 $curr_port): " n_port
-        n_port=${n_port:-$curr_port}
-        is_valid_port "$n_port" && break || error "端口无效，请输入 1-65535 之间的数字。"
-    done
-
-    # 2. 修改 UUID
-    local n_uuid
-    while true; do
-        read -p "请输入新 UUID (回车保持 $curr_uuid): " n_uuid
-        n_uuid=${n_uuid:-$curr_uuid}
-        if [[ "$n_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-            break
-        else
-            error "UUID 格式不正确，请重新输入。"
-        fi
-    done
-
-    # 3. 修改 Path
-    read -p "请输入新 HTTPUpgrade Path (回车保持 $curr_path): " n_path
-    n_path=${n_path:-$curr_path}
-    [[ "$n_path" != /* ]] && n_path="/${n_path}"
-
-    # 4. 修改 Host
-    read -p "请输入新伪装 Host/域名 (如果没有直接回车，保持 '$curr_host'): " n_host
-    n_host=${n_host:-$curr_host}
-
-    write_config "$n_port" "$n_uuid" "$n_path" "$n_host" "$curr_outbound"
-    rc-service "$SERV_NAME" restart
-    
-    # 重新生成链接
-    local ip=$(get_public_ip || echo "127.0.0.1")
-    local host_addr=$ip
-    [[ -n "$n_host" ]] && host_addr=$n_host
-    
-    mkdir -p "$X_LINK_DIR"
-    echo "vless://$n_uuid@$host_addr:$n_port?encryption=none&type=httpupgrade&security=none&host=$(echo "$n_host" | jq -sRr @uri)&path=$(echo "$n_path" | jq -sRr @uri)#$HOSTNAME-${SERV_NAME}" > "$X_LINK"
-    info "配置已更新并成功重启服务！"
-}
-
-# ================== 安装与管理 ==================
-install_xray() {
-    info "正在安装依赖与内核..."
-    apk add curl unzip jq uuidgen gcompat libc6-compat bc > /dev/null 2>&1
-    mkdir -p "$X_DIR" && sync
-    
-    local arch=$(uname -m | sed 's/x86_64/64/;s/aarch64/arm64-v8a/')
-    local ver=""
-
-    info "正在检索 Xray-core 官方最新发布版本..."
-    # ✨ 完美升级：用 wget 轮询你的代理池去抓取版本号，防止纯 v6 环境或网络封锁导致卡死
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local api_url="${proxy}https://api.github.com/repos/XTLS/Xray-core/releases/latest"
-        ver=$(wget -qO- --timeout=5 --tries=1 --no-check-certificate "$api_url" | jq -r .tag_name 2>/dev/null || echo "")
-        if [[ -n "$ver" && "$ver" != "null" ]]; then
-            break
-        fi
-    done
-
-    # 🚨 终极保底：如果所有代理和直连都拿不到版本号，绝不允许它为空！强制给一个稳定的现代版本
-    if [[ -z "$ver" || "$ver" == "null" ]]; then
-        ver="v26.3.27"
-        warn "通过 API 获取版本号超时，已激活保底机制，将为您安装高稳定版本: $ver"
-    fi
-
-    info "下载 Xray $ver ($arch)..."
-    
-    local download_success=false
-    # ✨ 完美升级：文件下载同样引入代理池轮询，死磕到下载成功为止
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local dl_url="${proxy}https://github.com/XTLS/Xray-core/releases/download/$ver/Xray-linux-$arch.zip"
-        
-        # -O 正确保存到文件，--timeout=15 防止在死节点上挂起
-        if wget --no-check-certificate --timeout=15 --tries=1 -q -O /tmp/xray.zip "$dl_url" 2>/dev/null; then
-            # -s 确保文件大小大于 0 字节，防止下到空文件
-            if [ -s /tmp/xray.zip ]; then
-                download_success=true
-                break
-            fi
-        fi
-        warn "当前下载节点响应失败，正在为您自动切换下一个 GitHub 代理..."
-    done
-
-    if [ "$download_success" = false ]; then
-        error "严重错误：所有代理节点及直连模式均下载失败，请检查 VPS 的 DNS 设置！"
-        return 1
-    fi
-
-    # 解压与部署
-    unzip -o /tmp/xray.zip -d /tmp/xray_tmp > /dev/null
-    mv -f /tmp/xray_tmp/xray "$X_BIN" && chmod +x "$X_BIN"
-    rm -rf /tmp/xray*
-    
-    if [[ ! -f "$X_CONFIG" ]]; then
-        echo -ne "${GREEN}请输入入站端口 (回车随机): ${RESET}"; read port; [[ -z "$port" ]] && port=$((RANDOM % 45535 + 10000))
-        
-        # 1. 自定义 UUID
-        local uuid
-        while true; do
-            echo -ne "${GREEN}请输入自定义 UUID (回车随机生成): ${RESET}"; read input_uuid
-            if [[ -z "$input_uuid" ]]; then
-                uuid=$(uuidgen)
-                break
-            else
-                if [[ "$input_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-                    uuid="$input_uuid"
-                    break
-                else
-                    error "UUID 格式不正确，请重新输入。"
-                fi
-            fi
-        done
-
-        # 2. 自定义 HTTPUpgrade Path
-        local path
-        echo -ne "${GREEN}请输入自定义 httpupgrade Path (回车默认随机生成): ${RESET}"; read path
-        if [[ -z "$path" ]]; then
-            path="/$(openssl rand -hex 4)"
-            info "👉 采用随机 Path: $path"
-        else
-            [[ "$path" != /* ]] && path="/${path}"
-        fi
-        
-        # 3. 配置伪装 Host
-        echo -ne "${GREEN}请输入可选的伪装 Host 域名 (没有直接回车): ${RESET}"; read host_name
-        
-        write_config "$port" "$uuid" "$path" "$host_name"
-        
-        # 写入 OpenRC 服务脚本
-        cat << EOF > "$INIT_FILE"
+[Install]
+WantedBy=multi-user.target
+EOL
+    elif [[ "$OS_TYPE" == "alpine" ]]; then
+        cat > "${SERVICE_FILE}" << EOL
 #!/sbin/openrc-run
-command="${X_BIN}"
-command_args="run -c ${X_CONFIG}"
-command_background="yes"
-pidfile="/run/${SERV_NAME}.pid"
-output_log="$X_LOG"
-error_log="$X_LOG"
+description="EasyTier Service with Supervisor"
+supervisor=supervise-daemon
+command="${INSTALL_DIR}/${CORE_BINARY_NAME}"
+command_args="-c ${CONFIG_FILE}"
+command_user="root"
+pidfile="/var/run/${SERVICE_NAME}.pid"
+output_log="${LOG_FILE}"
+error_log="${LOG_FILE}"
+depend() {
+	need net
+	after net
+}
+EOL
+        chmod +x "${SERVICE_FILE}";
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        cat > "${SERVICE_FILE}" << EOL
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${SERVICE_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${INSTALL_DIR}/${CORE_BINARY_NAME}</string>
+        <string>-c</string>
+        <string>${CONFIG_FILE}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${LOG_FILE}</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_FILE}</string>
+</dict>
+</plist>
+EOL
+    fi
+}
+
+reload_service_daemon() { if [[ "$OS_TYPE" == "linux" ]]; then systemctl daemon-reload; fi; }
+start_service() { if [[ "$OS_TYPE" == "linux" ]]; then systemctl start "${SERVICE_NAME}"; elif [[ "$OS_TYPE" == "alpine" ]]; then rc-service "${SERVICE_NAME}" start; elif [[ "$OS_TYPE" == "macos" ]]; then launchctl load "${SERVICE_FILE}" &>/dev/null; fi; }
+stop_service() { if [[ "$OS_TYPE" == "linux" ]]; then systemctl stop "${SERVICE_NAME}"; elif [[ "$OS_TYPE" == "alpine" ]]; then rc-service "${SERVICE_NAME}" stop; elif [[ "$OS_TYPE" == "macos" ]]; then launchctl unload "${SERVICE_FILE}" &>/dev/null; fi; }
+restart_service() { if [[ "$OS_TYPE" == "linux" ]]; then systemctl restart "${SERVICE_NAME}"; elif [[ "$OS_TYPE" == "alpine" ]]; then rc-service "${SERVICE_NAME}" restart; elif [[ "$OS_TYPE" == "macos" ]]; then stop_service; sleep 1; start_service; fi; }
+enable_service() { if [[ "$OS_TYPE" == "linux" ]]; then systemctl enable "${SERVICE_NAME}" &>/dev/null; elif [[ "$OS_TYPE" == "alpine" ]]; then rc-update add "${SERVICE_NAME}" default &>/dev/null; elif [[ "$OS_TYPE" == "macos" ]]; then start_service; fi; }
+disable_service() { if [[ "$OS_TYPE" == "linux" ]]; then systemctl disable "${SERVICE_NAME}" &>/dev/null; elif [[ "$OS_TYPE" == "alpine" ]]; then rc-update del "${SERVICE_NAME}" default &>/dev/null; elif [[ "$OS_TYPE" == "macos" ]]; then stop_service; fi; }
+status_service() { if [[ "$OS_TYPE" == "linux" ]]; then systemctl status "${SERVICE_NAME}" --no-pager -l; elif [[ "$OS_TYPE" == "alpine" ]]; then rc-service "${SERVICE_NAME}" status; elif [[ "$OS_TYPE" == "macos" ]]; then if launchctl list | grep -q "${SERVICE_LABEL}"; then echo -e "${GREEN}EasyTier 服务 (${SERVICE_LABEL}) 正在运行。${NC}"; ps aux | grep "${CORE_BINARY_NAME}" | grep -v grep; else echo -e "${YELLOW}EasyTier 服务 (${SERVICE_LABEL}) 已停止。${NC}"; fi; fi; }
+log_service() { if [[ "$OS_TYPE" == "linux" ]]; then journalctl -u "${SERVICE_NAME}" -f --no-pager; elif [[ "$OS_TYPE" == "alpine" || "$OS_TYPE" == "macos" ]]; then echo "正在显示日志文件: ${LOG_FILE}"; tail -f "${LOG_FILE}"; fi; }
+
+# --- 主功能函数 ---
+create_shortcut() {
+	local SCRIPT_PATH; SCRIPT_PATH=$(realpath "$0" 2>/dev/null || (cd "$(dirname "$0")" && echo "$(pwd)/$(basename "$0")"))
+	if [ -L "${ALIAS_PATH}" ] && [ "$(readlink "${ALIAS_PATH}")" = "${SCRIPT_PATH}" ]; then return 0; fi
+	echo -e "${YELLOW}正在创建“et”快捷命令...${NC}"
+	chmod +x "${SCRIPT_PATH}"
+	ln -sf "${SCRIPT_PATH}" "${ALIAS_PATH}"
+}
+
+remove_shortcut() {
+	if [ -L "${ALIAS_PATH}" ]; then rm -f "${ALIAS_PATH}" &>/dev/null; fi
+}
+
+install_easytier() {
+	echo -e "${GREEN}--- 开始安装或更新 EasyTier ---${NC}"
+	local os_identifier="linux"; if [[ "$OS_TYPE" == "macos" ]]; then os_identifier="macos"; fi
+	local arch; arch=$(get_arch)
+
+	local latest_info=""
+	local chosen_proxy=""
+
+	echo "1. 正在获取最新版本信息 (顺序轮询代理池)..."
+	for proxy in "${GITHUB_PROXY[@]}"; do
+		local api_url="$GITHUB_API_URL"
+		if [ -n "$proxy" ]; then
+			api_url="${proxy%/}/${GITHUB_API_URL}"
+			echo -e " -> 正在尝试代理: ${YELLOW}${proxy}${NC} ..."
+		else
+			echo -e " -> 正在尝试: ${BLUE}直连 GitHub${NC} ..."
+		fi
+
+		latest_info=$(curl -sL --connect-timeout 5 "$api_url")
+		
+		if [ -n "$latest_info" ] && echo "$latest_info" | jq . >/dev/null 2>&1; then
+			chosen_proxy="$proxy"
+			if [ -n "$chosen_proxy" ]; then
+				echo -e "${GREEN} ✔ 代理 ${chosen_proxy} 连接成功!${NC}"
+			else
+				echo -e "${GREEN} ✔ 直连 GitHub 成功!${NC}"
+			fi
+			break
+		else
+			echo -e "${RED} ✘ 失败或超时，尝试下一个...${NC}"
+		fi
+	done
+
+	if [ -z "$latest_info" ]; then
+		echo -e "${RED}错误: 代理池中所有节点及直连均无法获取版本信息，请检查网络后重试。${NC}"
+		return 1
+	fi
+	
+	local search_prefix="easytier-${os_identifier}-${arch}"
+	local asset_json; asset_json=$(echo "$latest_info" | jq ".assets[] | select(.name | startswith(\"${search_prefix}\") and endswith(\".zip\"))")
+	if [ -z "$asset_json" ]; then echo -e "${RED}错误: 未能找到适用于 ${OS_TYPE}(${arch}) 的包。${NC}"; return 1; fi
+	
+	local raw_download_url; raw_download_url=$(echo "$asset_json" | jq -r '.browser_download_url')
+	local actual_filename; actual_filename=$(echo "$asset_json" | jq -r '.name')
+	local version; version=$(echo "$latest_info" | jq -r ".tag_name")
+	echo "检测到版本: ${version}, 架构: ${arch}, 文件: ${actual_filename}"
+	
+	local final_download_url="$raw_download_url"
+	if [ -n "$chosen_proxy" ]; then
+		if [[ "$chosen_proxy" == */ ]]; then
+			final_download_url="${chosen_proxy}${raw_download_url}"
+		else
+			final_download_url="${chosen_proxy}/${raw_download_url}"
+		fi
+		echo -e "${YELLOW}2. 使用就绪代理下载: ${final_download_url}${NC}"
+	else
+		echo "2. 直接从 GitHub 下载: ${final_download_url}"
+	fi
+
+	local temp_file; temp_file=$(mktemp)
+	curl -L --progress-bar --connect-timeout 10 -o "$temp_file" "$final_download_url" || { echo -e "${RED}下载失败!${NC}"; rm -f "$temp_file"; return 1; }
+	echo "3. 解压并安装..."
+	local unzip_dir_name="easytier-${os_identifier}-${arch}"
+	unzip -o "$temp_file" -d /tmp/ > /dev/null || { echo -e "${RED}解压失败!${NC}"; rm -f "$temp_file"; return 1; }
+	local extracted_core="/tmp/${unzip_dir_name}/${CORE_BINARY_NAME}"; local extracted_cli="/tmp/${unzip_dir_name}/${CLI_BINARY_NAME}"
+	if [ ! -f "$extracted_core" ] || [ ! -f "$extracted_cli" ]; then echo -e "${RED}错误: 在解压目录中未找到核心文件。${NC}"; rm -f "$temp_file"; rm -rf "/tmp/${unzip_dir_name}"; return 1; fi
+	mkdir -p "$INSTALL_DIR"
+	mv -f "$extracted_core" "${INSTALL_DIR}/${CORE_BINARY_NAME}"; mv -f "$extracted_cli" "${INSTALL_DIR}/${CLI_BINARY_NAME}"
+	chmod +x "${INSTALL_DIR}/${CORE_BINARY_NAME}" "${INSTALL_DIR}/${CLI_BINARY_NAME}"
+	rm -f "$temp_file"; rm -rf "/tmp/${unzip_dir_name}"
+	
+	echo -e "${GREEN}--- EasyTier ${version} 安装/更新成功! ---${NC}"
+	create_shortcut
+	
+	if [ -f "$SERVICE_FILE" ]; then
+		echo -e "${YELLOW}检测到现有服务，正在静默重启服务...${NC}"
+		enable_service
+		restart_service
+	fi
+}
+
+create_default_config() { mkdir -p "$CONFIG_DIR"; cat > "$CONFIG_FILE" << 'EOF'
+ipv4 = ""
+dhcp = false
+listeners = ["udp://0.0.0.0:11010", "tcp://0.0.0.0:11010", "wg://0.0.0.0:11011", "ws://0.0.0.0:11011/", "wss://0.0.0.0:11012/", "tcp://[::]:11010", "udp://[::]:11010"]
+[network_identity]
+network_name = ""
+network_secret = ""
+[flags]
+default_protocol = "udp"
+dev_name = ""
+enable_encryption = true
+enable_ipv6 = true
+mtu = 1380
+latency_first = true
+enable_exit_node = false
+no_tun = false
+use_smoltcp = false
+foreign_network_whitelist = "*"
+disable_p2p = false
+relay_all_peer_rpc = false
+disable_udp_hole_punching = false
+enableKcp_Proxy = true
 EOF
-        chmod +x "$INIT_FILE"
-        touch "$X_LOG"
-        rc-update add "$SERV_NAME" default >/dev/null 2>&1
-    fi
+	if [ $? -eq 0 ]; then return 0; else return 1; fi; }
 
-    rc-service "$SERV_NAME" restart
-    
-    # 读取配置生成分享链接
-    local ip=$(get_public_ip || echo "127.0.0.1")
-    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
-    local port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
-    local path=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.path // "/"' "$X_CONFIG")
-    local host_name=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.host // ""' "$X_CONFIG")
-    
-    local host_addr=$ip
-    [[ -n "$host_name" ]] && host_addr=$host_name
-    
-    local link="vless://$uuid@$host_addr:$port?encryption=none&type=httpupgrade&security=none&host=$(echo "$host_name" | jq -sRr @uri)&path=$(echo "$path" | jq -sRr @uri)#$HOSTNAME-vless-httpupgrade"
-    
-    mkdir -p "$X_LINK_DIR"
-    echo "$link" > "$X_LINK"
+deploy_new_network() { 
+	check_installed || return 1
+	read -p "请输入网络名称: " network_name
+	read -p "请输入网络密钥: " network_secret
+	read -p "请输入此虚拟IP (回车则启用DHCP): " virtual_ip
+	
+	create_default_config || return 1
+	set_toml_value "network_name" "\"$network_name\"" "$CONFIG_FILE"
+	set_toml_value "network_secret" "\"$network_secret\"" "$CONFIG_FILE"
+	
+	if [ -z "$virtual_ip" ]; then
+		echo -e "${YELLOW}未输入IP，将启用 DHCP 自动获取地址。${NC}"
+		set_toml_value "dhcp" "true" "$CONFIG_FILE"
+		set_toml_value "ipv4" "\"\"" "$CONFIG_FILE"
+	else
+		echo -e "${GREEN}已设置静态IP: ${virtual_ip}${NC}"
+		set_toml_value "dhcp" "false" "$CONFIG_FILE"
+		set_toml_value "ipv4" "\"$virtual_ip\"" "$CONFIG_FILE"
+	fi
 
-    show_current_config
+	# [静默自动化改造]
+	create_service_file
+	reload_service_daemon
+	enable_service
+	restart_service
+	echo -e "${GREEN}--- 网络已部署完成，开机自启已自动设置并激活运行！ ---${NC}"
 }
 
-# ================== 显示配置 ==================
-show_current_config() {
-    if [[ ! -f "$X_CONFIG" ]]; then
-        error "配置文件不存在"
-        return
-    fi
+join_existing_network() { 
+	check_installed || return 1
+	read -p "请输入网络名称: " network_name
+	read -p "请输入网络密钥: " network_secret
+	read -p "请输入此节点虚拟IP (留空则启用DHCP): " virtual_ip
+	read -p "请输入一个对端节点地址 (回车默认为 tcp://public.easytier.top:11010): " peer_address
+	if [ -z "$peer_address" ]; then
+		peer_address="tcp://public.easytier.top:11010"
+		echo -e "${YELLOW}使用默认对端节点: ${peer_address}${NC}"
+	fi
 
-    local ip uuid port host_name path outbound_mode
-    ip=$(get_public_ip || echo "未知")
-    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG" 2>/dev/null || echo "未知")
-    port=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "未知")
-    path=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.path // "/"' "$X_CONFIG" 2>/dev/null || echo "/")
-    host_name=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.host // "无"' "$X_CONFIG" 2>/dev/null || echo "无")
-    
-    local current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$X_CONFIG" 2>/dev/null || echo "freedom")
-    [[ "$current_protocol" == "socks" ]] && outbound_mode="Socks5 链式代理" || outbound_mode="直连 (Freedom)"
+	create_default_config || return 1
+	set_toml_value "network_name" "\"$network_name\"" "$CONFIG_FILE"
+	set_toml_value "network_secret" "\"$network_secret\"" "$CONFIG_FILE"
+	echo -e "\n[[peer]]\nuri = \"${peer_address}\"" >> "$CONFIG_FILE"
 
-    echo -e "\n${GREEN}====== 当前配置详情 ======${RESET}"
-    echo -e "${YELLOW}安全传输    : none ${RESET}"
-    echo -e "${YELLOW}IP地址      : ${ip}${RESET}"
-    echo -e "${YELLOW}端口        : ${port}${RESET}"
-    echo -e "${YELLOW}UUID        : ${uuid}${RESET}"
-    echo -e "${YELLOW}Host 伪装   : ${host_name}${RESET}"
-    echo -e "${YELLOW}HTTPUpgrade Path : ${path}${RESET}"
-    echo -e "${YELLOW}出口模式    : ${outbound_mode}${RESET}"
-    echo -e "${YELLOW}分享存放路径: ${X_LINK}${RESET}"
-    echo -e "${YELLOW}📄 V6VPS 请自行替换分享链接中的 IP 地址为 V6 ★${RESET}"
-    
-    if [[ -f "$X_LINK" ]]; then
-        echo -e "${GREEN}====== 👉 v2rayN 分享链接 ======${RESET}"
-        cat "$X_LINK"
-    fi
+	if [ -z "$virtual_ip" ]; then
+		echo -e "${YELLOW}未输入IP，将启用 DHCP 自动获取地址。${NC}"
+		set_toml_value "dhcp" "true" "$CONFIG_FILE"
+		set_toml_value "ipv4" "\"\"" "$CONFIG_FILE"
+	else
+		echo -e "${GREEN}已设置静态IP: ${virtual_ip}${NC}"
+		set_toml_value "dhcp" "false" "$CONFIG_FILE"
+		set_toml_value "ipv4" "\"$virtual_ip\"" "$CONFIG_FILE"
+	fi
+
+	# [静默自动化改造]
+	create_service_file
+	reload_service_daemon
+	enable_service
+	restart_service
+	echo -e "${GREEN}--- 成功加入网络，开机自启已自动设置并激活运行！ ---${NC}"
 }
 
-# ================== 菜单 ==================
-show_menu() {
-    clear
-    local status=$(get_xray_status)
-    local version=$(get_xray_version)
-    local port_show="-"
-    [[ -f "$X_CONFIG" ]] && port_show=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "-")
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}  Xray Vless-httpupgrade 面板  ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $status"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 Xray Vless-httpupgrade${RESET}"
-    echo -e "${GREEN} 2. 更新 Xray${RESET}"
-    echo -e "${GREEN} 3. 卸载 Xray${RESET}"
-    echo -e "${GREEN} 4. 修改配置${RESET}"
-    echo -e "${GREEN} 5. 启动 Xray${RESET}"
-    echo -e "${GREEN} 6. 停止 Xray${RESET}"
-    echo -e "${GREEN} 7. 重启 Xray${RESET}"
-    echo -e "${GREEN} 8. 查看日志${RESET}"
-    echo -e "${GREEN} 9. 查看节点配置${RESET}"
-    echo -e "${GREEN}10. 配置Socks5出口${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+uninstall_easytier() { 
+	read -p "警告: 此操作将停止服务并删除所有相关文件。确定要卸载吗? (y/n): " confirm; 
+	if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then echo "操作已取消。"; return; fi; 
+	echo "正在停止并禁用服务..."; stop_service &> /dev/null; disable_service &> /dev/null; 
+	echo "正在删除文件..."; rm -f "${SERVICE_FILE}" "${INSTALL_DIR}/${CORE_BINARY_NAME}" "${INSTALL_DIR}/${CLI_BINARY_NAME}"; 
+	rm -rf "${CONFIG_DIR}"; remove_shortcut; 
+	if [[ "$OS_TYPE" == "linux" ]]; then systemctl daemon-reload; fi; 
+	if [[ "$OS_TYPE" == "macos" || "$OS_TYPE" == "alpine" ]]; then rm -f "$LOG_FILE"; fi; 
+	echo -e "${GREEN}EasyTier 已成功卸载。${NC}"; 
 }
 
-while true; do
-    show_menu
-    echo -ne "${GREEN}请输入选项: ${RESET}"; read choice
-    case $choice in
-        1|2) install_xray; pause ;;
-        3) 
-            rc-service "$SERV_NAME" stop 2>/dev/null || true
-            rc-update del "$SERV_NAME" default 2>/dev/null || true
-            rm -rf "$X_DIR" "$X_BIN" "$INIT_FILE" "$X_LINK" "$X_LOG" "$X_LINK_DIR"
-            info "卸载完成"
-            pause 
-            ;;
-        4) modify_config; pause ;;
-        5) rc-service "$SERV_NAME" start; pause ;;
-        6) rc-service "$SERV_NAME" stop; pause ;;
-        7) rc-service "$SERV_NAME" restart; pause ;;
-        8) [[ -f "$X_LOG" ]] && tail -f "$X_LOG" || error "暂无日志"; pause ;;
-        9) show_current_config || error "无配置"; pause ;;
-        10) configure_custom_socks5_outbound; pause ;;
-        0) exit 0 ;;
-        *) error "无效选项"; sleep 1 ;;
-    esac
-done
+# --- 主菜单 ---
+main() {
+	# 优化 sed 兼容性，避免在精简 Linux/Alpine 上报错
+	set_toml_value() {
+		sed -i "s|^#* *${1} *=.*|${1} = ${2}|" "$3"
+	}
+
+	case "$(uname)" in
+		Linux) if [ -f /etc/alpine-release ]; then OS_TYPE="alpine"; SERVICE_FILE="/etc/init.d/${SERVICE_NAME}"; else OS_TYPE="linux"; SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"; fi ;;
+		Darwin) OS_TYPE="macos"; SERVICE_FILE="/Library/LaunchDaemons/${SERVICE_LABEL}.plist"; ;;
+		*) echo -e "${RED}错误: 不支持的操作系统: $(uname)${NC}"; exit 1 ;;
+	esac
+	check_root; check_dependencies
+	
+	while true; do
+		clear
+		
+		# 提取面板需要的状态参数
+		G_STATUS=$(get_runtime_status)
+		G_VERSION=$(get_version)
+		G_NETNAME=$(get_network_name)
+
+		echo -e "${GREEN}================================${RESET}"
+		echo -e "${GREEN}        EasyTier 管理面板        ${RESET}"
+		echo -e "${GREEN}================================${RESET}"
+		echo -e "${GREEN}状态   :${RESET} $G_STATUS"
+		echo -e "${GREEN}版本   :${RESET} ${YELLOW}${G_VERSION}${RESET}"
+		echo -e "${GREEN}网络组 :${RESET} ${YELLOW}${G_NETNAME}${RESET}"
+		echo -e "${GREEN}================================${RESET}"
+		echo -e "${GREEN} 1. 安装 EasyTier${RESET}"
+		echo -e "${GREEN} 2. 更新 EasyTier${RESET}"
+		echo -e "${GREEN} 3. 卸载 EasyTier${RESET}"
+		echo -e "${GREEN} 4. 部署新网络 (首个节点)${RESET}"
+		echo -e "${GREEN} 5. 加入组网网络${RESET}"
+		echo -e "${GREEN} 6. 查看配置文件${RESET}"
+		echo -e "${GREEN} 7. 查看网络节点${RESET}"
+		echo -e "${GREEN} 8. 启动 EasyTier 服务${RESET}"
+		echo -e "${GREEN} 9. 停止 EasyTier 服务${RESET}"
+		echo -e "${GREEN}10. 重启 EasyTier 服务${RESET}"
+		echo -e "${GREEN}11. 查看运行日志${RESET}"
+		echo -e "${GREEN}12. 详细查看服务底层状态${RESET}"
+		echo -e "${GREEN} 0. 退出${RESET}"
+		echo -e "${GREEN}================================${RESET}"
+		echo -ne "${GREEN}请输入选项: ${RESET}"
+		read -r choice
+		
+		echo
+		
+		case $choice in
+			1) install_easytier ;;
+			2) install_easytier ;;
+			3) uninstall_easytier ;;
+			4) deploy_new_network ;;
+			5) join_existing_network ;;
+			6) if check_installed && [ -f "$CONFIG_FILE" ]; then cat "$CONFIG_FILE"; else echo -e "${YELLOW}配置文件不存在或未安装。${NC}"; fi ;;
+			7) if check_installed; then "${INSTALL_DIR}/${CLI_BINARY_NAME}" peer; fi ;;
+			8) start_service && echo -e "${GREEN}服务已激活。${NC}" ;;
+			9) stop_service && echo -e "${GREEN}服务已关闭。${NC}" ;;
+			10) restart_service && echo -e "${GREEN}服务已重新启动。${NC}" ;;
+			11) log_service ;;
+			12) status_service ;;
+			0) exit 0 ;;
+			*) echo -e "${RED}无效输入${NC}" ;;
+		esac
+		echo
+		printf "${YELLOW}按回车键返回主菜单...${NC}" && read -r _
+	done
+}
+
+main "$@"

@@ -56,7 +56,7 @@ cleanup_iptables() {
 }
 
 #================================================================================
-# 核心配置交互与文件写入（全面兼容 兼容 BusyBox 语法）
+# 核心配置交互与文件写入（防回环升级版）
 #================================================================================
 write_config_file() {
     local current_local_port="12345"
@@ -195,7 +195,7 @@ EOF
 
     echo "}" >> "$REDSOCKS_CONF"
 
-    # 生成 IPv4 防火墙劫持规则
+    # 生成 IPv4 防火墙劫持规则（引入防套娃回环逻辑）
     step "正在渲染 IPv4 防护 Iptables 规则 ..."
     cat > "$IPTABLES_RULES" <<EOF
 *nat
@@ -204,6 +204,14 @@ EOF
 :OUTPUT ACCEPT [0:0]
 :POSTROUTING ACCEPT [0:0]
 :REDSOCKS - [0:0]
+EOF
+
+    # 如果是本地上游代理，在 OUTPUT 链最前端直接切断回环可能性
+    if [ "$input_addr" = "127.0.0.1" ] || echo "$input_addr" | grep -q "^127\."; then
+        echo "-A OUTPUT -d 127.0.0.0/8 -j RETURN" >> "$IPTABLES_RULES"
+    fi
+
+    cat >> "$IPTABLES_RULES" <<EOF
 -A OUTPUT -p tcp --dport 22 -j RETURN
 -A OUTPUT -p tcp --sport 22 -j RETURN
 -A OUTPUT -p tcp --dport $input_port -j RETURN
@@ -236,6 +244,13 @@ EOF
 :OUTPUT ACCEPT [0:0]
 :POSTROUTING ACCEPT [0:0]
 :REDSOCKS6 - [0:0]
+EOF
+
+    if [ "$input_addr" = "::1" ]; then
+        echo "-A OUTPUT -d ::1/128 -j RETURN" >> "$IP6TABLES_RULES"
+    fi
+
+    cat >> "$IP6TABLES_RULES" <<EOF
 -A OUTPUT -p tcp --dport 22 -j RETURN
 -A OUTPUT -p tcp --sport 22 -j RETURN
 -A OUTPUT -p tcp --dport $input_port -j RETURN
@@ -261,11 +276,10 @@ install_redsocks_env() {
     cleanup_iptables
 
     step "[1/4] 从 Alpine apk 软件源检查并安装必备组件..."
-    # 确保安装了 iptables, ip6tables 和 curl
     apk update
     apk add redsocks iptables ip6tables curl
 
-    # 停止原有的 Redsocks 默认服务
+    # 停止并删除原有的默认关联
     rc-service redsocks stop 2>/dev/null || true
     rc-update del redsocks default 2>/dev/null || true
 
@@ -335,7 +349,7 @@ change_config() {
     chown root:root "$REDSOCKS_CONF" 2>/dev/null || true
     success "双栈配置文件与 Iptables 联动规则更新成功！"
     
-    if rc-service redsocks status 2>/dev/null | grep -q "started"; then
+    if rc-service redsocks status >/dev/null 2>&1; then
         step "检测到服务正在后台运行，正在自动重启服务以应用新配置..."
         rc-service redsocks restart
         success "新配置已无缝双栈生效。"
@@ -360,16 +374,13 @@ uninstall_redsocks_env() {
 }
 
 get_status() {
-    # 1. 优化状态判断：直接利用 OpenRC 的退出码更严谨
     if rc-service redsocks status >/dev/null 2>&1; then
         status_show="${GREEN}已启动 (运行中)${RESET}"
     else
         status_show="${RED}已停止 (未运行)${RESET}"
     fi
 
-    # 2. 优化版本显示：从 "已安装" 升级为显示具体版本号
     if command -v redsocks &>/dev/null; then
-        # Alpine 的 redsocks -v 会把版本输出到 stderr
         local version_raw
         version_raw=$(redsocks -v 2>&1 | grep -oE '[0-9]+\.[0-9.]+' | head -n1)
         if [ -n "$version_raw" ]; then
@@ -381,7 +392,6 @@ get_status() {
         version_show="${RED}未安装${RESET}"
     fi
 
-    # 3. 配置提取（保持你精简后的 BusyBox 兼容写法，非常棒）
     if [ -f "$REDSOCKS_CONF" ]; then
         local port addr local_port
         local_port=$(grep -E '^[[:space:]]*local_port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | cut -d'=' -f2 | tr -d " ';\" ")

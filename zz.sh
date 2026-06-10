@@ -98,9 +98,11 @@ get_runtime_status() {
     fi
 }
 
+# 优化项 1：只显示纯净的版本号
 get_version() {
     if [ -f "${INSTALL_DIR}/${CORE_BINARY_NAME}" ]; then
-        "${INSTALL_DIR}/${CORE_BINARY_NAME}" --version 2>/dev/null | awk '{print $2}' || echo "未知"
+        local raw_ver; raw_ver=$("${INSTALL_DIR}/${CORE_BINARY_NAME}" --version 2>/dev/null | awk '{print $2}')
+        echo "${raw_ver%%-*}" # 使用内置通配符切掉第一个 - 及其后面的所有内容
     else
         echo "无"
     fi
@@ -116,6 +118,29 @@ get_network_name() {
     fi
 }
 
+# 优化项 2：动态获取并展示当前节点的虚拟 IP
+get_runtime_ip() {
+    if [ ! -f "${INSTALL_DIR}/${CLI_BINARY_NAME}" ] || [ ! -f "$CONFIG_FILE" ]; then
+        echo "无"
+        return
+    fi
+    
+    # 先看服务有没有运行，如果没运行，直接读配置文件里的静态 IP
+    local status_str; status_str=$(get_runtime_status)
+    if [[ "$status_str" != *"运行中"* ]]; then
+        local cfg_ip; cfg_ip=$(grep -E "^ipv4\s*=" "$CONFIG_FILE" | head -n 1 | cut -d'"' -f2)
+        if [ -n "$cfg_ip" ]; then echo "$cfg_ip (未激活)"; else echo "DHCP模式 (未启动)"; fi
+        return
+    fi
+
+    # 【精准修复】只抓取属于本机 Local 且是第一行的有效虚拟 IP，防止多行叠加撑爆面板
+    local live_ip; live_ip=$("${INSTALL_DIR}/${CLI_BINARY_NAME}" peer 2>/dev/null | grep -i "Local" | awk '{print $2}' | head -n 1)
+    if [ -n "$live_ip" ]; then
+        echo "$live_ip"
+    else
+        echo "获取中/未分配"
+    fi
+}
 # --- 平台相关的服务管理功能 ---
 create_service_file() {
     if [[ "$OS_TYPE" == "macos" || "$OS_TYPE" == "alpine" ]]; then
@@ -350,21 +375,16 @@ modify_existing_config() {
 
     echo -e "${BLUE}--- 修改 EasyTier 配置文件 (直接回车保持当前值不变) ---${NC}"
 
-    # 1. 读取当前的配置值
     local current_ipv4; current_ipv4=$(grep -E "^ipv4\s*=" "$CONFIG_FILE" | head -n 1 | cut -d'"' -f2)
     local current_dhcp; current_dhcp=$(grep -E "^dhcp\s*=" "$CONFIG_FILE" | head -n 1 | awk -F'=' '{print $2}' | tr -d '[:space:]')
     local current_name; current_name=$(grep -E "^network_name\s*=" "$CONFIG_FILE" | head -n 1 | cut -d'"' -f2)
     local current_secret; current_secret=$(grep -E "^network_secret\s*=" "$CONFIG_FILE" | head -n 1 | cut -d'"' -f2)
-    # 提取当前的第一个 peer uri
     local current_peer; current_peer=$(grep -E "^\s*uri\s*=" "$CONFIG_FILE" | head -n 1 | cut -d'"' -f2)
 
-    # 格式化当前的展示状态
     local ip_display="$current_ipv4"
     if [ "$current_dhcp" = "true" ] || [ -z "$current_ipv4" ]; then ip_display="DHCP自动获取"; fi
     if [ -z "$current_peer" ]; then current_peer="未配置"; fi
 
-    # 2. 交互式输入（回车默认沿用旧值）
-    # --- 虚拟网络 IP 修改 ---
     echo -e "${YELLOW}当前 IP 状态: [ ${ip_display} ]${NC}"
     read -p "请输入新的虚拟IP (留空或输入 dhcp 启用自动获取, 直接回车保持不变): " virtual_ip
     if [ -n "$virtual_ip" ]; then
@@ -382,7 +402,6 @@ modify_existing_config() {
     fi
     echo
 
-    # --- 网络组名称修改 ---
     echo -e "${YELLOW}当前网络组名称: [ ${current_name:-未配置} ]${NC}"
     read -p "请输入新的网络组名称 (直接回车保持不变): " net_name
     if [ -n "$net_name" ]; then
@@ -393,7 +412,6 @@ modify_existing_config() {
     fi
     echo
 
-    # --- 网络组密钥修改 ---
     echo -e "${YELLOW}当前网络组密钥: [ ${current_secret:-未配置} ]${NC}"
     read -p "请输入新的网络组密钥 (直接回车保持不变): " net_secret
     if [ -n "$net_secret" ]; then
@@ -404,11 +422,9 @@ modify_existing_config() {
     fi
     echo
 
-    # --- Peer 节点修改 ---
     echo -e "${YELLOW}当前对端 Peer: [ ${current_peer} ]${NC}"
     read -p "请输入新的对端中转节点连接串 (直接回车保持不变): " peer_uri
     if [ -n "$peer_uri" ]; then
-        # 清除旧的 [[peer]] 块及之后的所有内容重新写入（防止无限追加）
         sed -i '/\[\[peer\]\]/,$d' "$CONFIG_FILE"
         echo -e "\n[[peer]]\nuri = \"${peer_uri}\"" >> "$CONFIG_FILE"
         echo -e " -> 已变更为: $peer_uri"
@@ -417,12 +433,9 @@ modify_existing_config() {
     fi
     echo
 
-    # 3. 自动应用变更
     echo -e "${YELLOW}正在使配置生效...${NC}"
     if [ ! -f "$SERVICE_FILE" ]; then create_service_file; fi
-    reload_service_daemon
-    enable_service
-    restart_service
+    reload_service_daemon; enable_service; restart_service
     echo -e "${GREEN}✔ 所有修改处理完毕，EasyTier 服务已静默重启并成功重载！${NC}"
 }
 
@@ -480,6 +493,7 @@ main() {
         G_STATUS=$(get_runtime_status)
         G_VERSION=$(get_version)
         G_NETNAME=$(get_network_name)
+        G_RUNIP=$(get_runtime_ip) 
 
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN}        EasyTier 管理面板        ${RESET}"
@@ -487,11 +501,12 @@ main() {
         echo -e "${GREEN}状态   :${RESET} $G_STATUS"
         echo -e "${GREEN}版本   :${RESET} ${YELLOW}${G_VERSION}${RESET}"
         echo -e "${GREEN}网络组 :${RESET} ${YELLOW}${G_NETNAME}${RESET}"
+        echo -e "${GREEN}虚拟IP :${RESET} ${YELLOW}${G_RUNIP}${RESET}" 
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN} 1. 安装 EasyTier${RESET}"
         echo -e "${GREEN} 2. 更新 EasyTier${RESET}"
         echo -e "${GREEN} 3. 卸载 EasyTier${RESET}"
-        echo -e "${GREEN} 4. 修改配置文件(IP/网络组/Peer)${RESET}"
+        echo -e "${GREEN} 4. 修改配置文件 (IP/网络组/Peer)${RESET}"
         echo -e "${GREEN} 5. 加入组网网络${RESET}"
         echo -e "${GREEN} 6. 查看配置文件${RESET}"
         echo -e "${GREEN} 7. 查看网络节点${RESET}"
@@ -514,7 +529,7 @@ main() {
             6) if check_installed && [ -f "$CONFIG_FILE" ]; then cat "$CONFIG_FILE"; else echo -e "${YELLOW}配置文件不存在或未安装。${NC}"; fi ;;
             7) if check_installed; then "${INSTALL_DIR}/${CLI_BINARY_NAME}" peer; fi ;;
             8) start_service && echo -e "${GREEN}服务已激活。${NC}" ;;
-            9) stop_service && echo -e "${GREEN}服务已关闭。${NC}" ;;
+            9) stop_service && echo -e "${GREEN}服务已关闭. ${NC}" ;;
             10) restart_service && echo -e "${GREEN}服务已重新启动。${NC}" ;;
             11) log_service ;;
             0) exit 0 ;;

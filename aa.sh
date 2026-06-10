@@ -1,372 +1,232 @@
 #!/bin/bash
-# =================================================================
-# 名称: 全能网络工具箱 (完美融合大小包检测版)
-# =================================================================
+# ========================================
+# 1Panel 管理脚本
+# ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
-BLUE="\033[36m"
+CYAN="\033[36m"
 RESET="\033[0m"
-ORANGE='\033[38;5;208m'
 
-# 默认配置参数
-IPERF_PORT=5201
-IPERF_TIME=30
-IPERF_PARALLEL=1
-IPERF_UDP_BW="1G"
-MTR_PROTO="ICMP"
-MTR_SHOW_AS="true"
-
-# 全局安全退出捕获
-trap "echo -e '${RESET}'; exit" INT TERM
-
-# ==========================================
-# 工具状态动态探测
-# ==========================================
-get_status() {
-    if command -v "$1" >/dev/null 2>&1; then
-        echo -e "${GREEN}已安装${RESET}"
+# 智能寻找 1pctl 的实际路径
+get_cmd_path() {
+    if [ -x "/usr/local/bin/1pctl" ]; then
+        echo "/usr/local/bin/1pctl"
+    elif command -v 1pctl &>/dev/null; then
+        echo "1pctl"
     else
-        echo -e "${RED}未安装${RESET}"
+        echo ""
     fi
 }
 
-# ==========================================
-# 自动化安装引擎
-# ==========================================
-check_and_install() {
-    local tool=$1
-    if command -v "$tool" >/dev/null 2>&1; then return; fi
 
-    echo -e "${YELLOW}📦 正在安装必要依赖与工具: $tool ...${RESET}"
-    
-    if [ -f /etc/alpine-release ]; then
-        apk add --no-cache curl wget tar bash grep gawk openssl
-    elif ! command -v curl >/dev/null 2>&1 || ! command -v wget >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
-        if command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y curl wget tar grep gawk
-        elif command -v dnf >/dev/null 2>&1; then dnf install -y curl wget tar grep gawk
-        elif command -v yum >/dev/null 2>&1; then yum install -y curl wget tar grep gawk
+
+
+# 检查并安装 unzip
+check_unzip() {
+    if ! command -v unzip >/dev/null 2>&1; then
+        echo "⚠️ 未检测到 unzip，正在安装..."
+        if [ -f /etc/debian_version ]; then
+            apt update && apt install -y unzip
+        elif [ -f /etc/redhat-release ]; then
+            yum install -y unzip || dnf install -y unzip
+        elif [ -f /etc/alpine-release ]; then
+            apk add unzip
+        else
+            echo "❌ 无法识别系统，请手动安装 unzip"
+            return 1
         fi
+        echo "✅ unzip 安装完成"
     fi
-
-    case "$tool" in
-        speedtest)
-            if [ -f /etc/alpine-release ]; then
-                apk add --no-cache speedtest-cli
-                if [ ! -f /usr/local/bin/speedtest ] && [ ! -f /usr/bin/speedtest ]; then
-                    ln -sf "$(command -v speedtest-cli)" /usr/bin/speedtest
-                fi
-            else
-                local cpu_arch=$(uname -m)
-                local download_url=""
-                case "$cpu_arch" in
-                    x86_64) download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz" ;;
-                    aarch64|arm64) download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz" ;;
-                    *) echo -e "${RED}❌ 错误: 不支持的架构 ${cpu_arch}${RESET}" >&2; exit 1 ;;
-                esac
-                cd /tmp
-                wget -q "$download_url" -O speedtest.tgz && \
-                tar -xzf speedtest.tgz && \
-                mv -f speedtest /usr/local/bin/ && \
-                rm -f speedtest.tgz speedtest.5 speedtest.md LICENSE.md
-            fi
-            mkdir -p "$HOME/.ookla"
-            echo '{"license_accepted": true, "gdpr_accepted": true}' > "$HOME/.ookla/speedtest-cli.json" 2>/dev/null || true
-            ;;
-        nexttrace)
-            curl -fsSL nxtrace.org/nt | bash || true
-            ;;
-        iperf3)
-            if [ -f /etc/alpine-release ]; then apk add --no-cache iperf3
-            elif command -v apt-get >/dev/null 2>&1; then apt-get install -y iperf3
-            elif command -v dnf >/dev/null 2>&1; then dnf install -y epel-release 2>/dev/null || true; dnf install -y iperf3
-            elif command -v yum >/dev/null 2>&1; then yum install -y epel-release 2>/dev/null || true; yum install -y iperf3
-            fi
-            ;;
-        mtr)
-            if [ -f /etc/alpine-release ]; then apk add --no-cache mtr
-            elif command -v apt-get >/dev/null 2>&1; then apt-get install -y mtr-tiny || apt-get install -y mtr
-            elif command -v dnf >/dev/null 2>&1; then dnf install -y mtr
-            elif command -v yum >/dev/null 2>&1; then yum install -y mtr
-            fi
-            ;;
-    esac
-    hash -r 2>/dev/null
+    return 0
 }
 
-# ==========================================
-# 1) Speedtest 模块
-# ==========================================
-run_speedtest() {
-    clear
-    check_and_install speedtest
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        Speedtest 网速测试        ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}🚀 开始测速...${RESET}"
-    echo "-------------------------------------"
-    if speedtest --help 2>&1 | grep -q "accept-license"; then
-        echo "YES" | speedtest --accept-license --accept-gdpr --force || true
+# 更新拓展App核心逻辑
+update_local_apps() {
+    local LOCAL_PATH="/opt/1panel/resource/apps/local"
+    local ZIP_URL="https://github.com/okxlin/appstore/archive/refs/heads/localApps.zip"
+    local BACKUP_DIR="/opt/1panel/resource/apps/backup_$(date +%Y%m%d_%H%M%S)"
+
+    if [ ! -d "$LOCAL_PATH" ]; then
+        echo -e "${RED}❌ 未检测到 1Panel 本地应用目录：$LOCAL_PATH${RESET}"
+        echo "请确认 1Panel 是否已安装并创建了本地应用目录。"
+        return 1
+    fi
+
+    if ! check_unzip; then
+        echo -e "${RED}❌ 环境缺少 unzip，更新终止${RESET}"
+        return 1
+    fi
+
+    echo "📦 正在备份本地应用到：$BACKUP_DIR"
+    mkdir -p "$BACKUP_DIR"
+    cp -rf "$LOCAL_PATH"/* "$BACKUP_DIR"/ 2>/dev/null
+
+    echo "⬇️ 正在下载最新 localApps.zip ..."
+    if ! wget -O "$LOCAL_PATH/localApps.zip" "$ZIP_URL"; then
+        echo -e "${RED}❌ 下载失败，已终止更新${RESET}"
+        return 1
+    fi
+
+    if [ ! -f "$LOCAL_PATH/localApps.zip" ]; then
+        echo -e "${RED}❌ 未找到下载文件${RESET}"
+        return 1
+    fi
+
+    echo "📂 正在解压覆盖文件..."
+    unzip -o -d "$LOCAL_PATH" "$LOCAL_PATH/localApps.zip" >/dev/null
+
+    echo "⚙️ 正在覆盖应用列表..."
+    cp -rf "$LOCAL_PATH/appstore-localApps/apps/"* "$LOCAL_PATH/"
+
+    echo "🧹 清理临时文件..."
+    rm -rf "$LOCAL_PATH/appstore-localApps" "$LOCAL_PATH/localApps.zip"
+
+    echo "🔄 正在重启 1Panel..."
+    local CMD=$(get_cmd_path)
+    if [ -n "$CMD" ]; then
+        $CMD restart
+        echo -e "${GREEN}✅ 1Panel 已成功重启${RESET}"
     else
-        speedtest || speedtest-cli || true
+        echo -e "${YELLOW}⚠️ 未检测到 1pctl 命令，无法自动重启。请稍后手动重启 1Panel。${RESET}"
     fi
-    echo "-------------------------------------"
-    read -p "测试完成，按回车返回面板..." dummy
+
+    echo -e "${GREEN}✅ 本地应用拓展更新完成！${RESET}"
+    echo "🗂 已备份旧版本到：$BACKUP_DIR"
 }
 
-# ==========================================
-# 2) NextTrace 模块
-# ==========================================
-run_nexttrace() {
-    clear
-    check_and_install nexttrace
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        NextTrace 路由追踪        ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    read -p "请输入目标IP或域名: " target
-    if [ -z "$target" ]; then return; fi
-    echo -e "--------------------------------"
-    nexttrace "$target" || true
-    echo -e "${GREEN}================================${RESET}"
-    read -p "追踪完成，按回车返回面板..." dummy
-}
 
-# ==========================================
-# 3) iperf3 模块
-# ==========================================
-get_iperf_ip() {
-    read -p "请输入远端服务器 IP/域名: " SERVER_IP
-    if [ -z "$SERVER_IP" ]; then
-        echo -e "${RED}❌ 未输入有效 IP，操作取消。${RESET}"
-        sleep 1.5
+check_cmd() {
+    local cmd=$(get_cmd_path)
+    if [ -z "$cmd" ]; then
+        echo -e "${RED}未检测到 1pctl 命令，请确认 1Panel 已正确安装。若未安装，请选择选项 18${RESET}"
         return 1
     fi
     return 0
 }
 
-run_iperf3() {
-    check_and_install iperf3
-    while true; do
-        clear
-        echo -e "${ORANGE}===================================${RESET}"
-        echo -e "${ORANGE}          iperf3 测速管理          ${RESET}"
-        echo -e "${ORANGE}===================================${RESET}"
-        echo -e " ${BLUE}当前参数: 端口=$IPERF_PORT | 时长=${IPERF_TIME}s | 线程=$IPERF_PARALLEL | UDP带宽=$IPERF_UDP_BW${RESET}"
-        echo -e "${ORANGE}-----------------------------------${RESET}"
-        echo -e " ${GREEN}1)${RESET} 启动 iperf3 本地服务端"
-        echo -e " -----------------------------------"
-        echo -e " ${GREEN}2)${RESET} 发起 TCP 下载 (↓) 测试"
-        echo -e " ${GREEN}3)${RESET} 发起 TCP 上传 (↑) 测试"
-        echo -e " -----------------------------------"
-        echo -e " ${GREEN}4)${RESET} 发起 UDP 下载 (↓) 测试"
-        echo -e " ${GREEN}5)${RESET} 发起 UDP 上传 (↑) 测试"
-        echo -e " -----------------------------------"
-        echo -e " ${GREEN}6)${RESET} 修改测试核心参数"
-        echo -e " ${RED}0)${RESET} 返回上级工具箱菜单"
-        echo -e "${ORANGE}===================================${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
-        read -r choice
-        
-        case "$choice" in
-            1)
-                clear
-                echo -e "${ORANGE}===================================${RESET}"
-                echo -e "${GREEN}  iperf3 服务器已启动 (监听端口: $IPERF_PORT)${RESET}"
-                echo -e "${YELLOW}  👉 提示: 测速完毕后，按 Ctrl+C 可安全返回菜单${RESET}"
-                echo -e "${ORANGE}===================================${RESET}\n"
-                (trap 'echo -e "\n${YELLOW}ℹ 服务端已安全关闭。${RESET}"; exit 0' INT; iperf3 -s -i 10 -p "$IPERF_PORT")
-                echo "-----------------------------------"
-                read -p "按回车继续..." dummy
-                ;;
-            2)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 TCP 下载 (↓) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -R -P "$IPERF_PARALLEL" -t "$IPERF_TIME" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
-                ;;
-            3)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 TCP 上传 (↑) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -P "$IPERF_PARALLEL" -t "$IPERF_TIME" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
-                ;;
-            4)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 UDP 下载 (↓) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -u -b "$IPERF_UDP_BW" -t "$IPERF_TIME" -R -P "$IPERF_PARALLEL" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
-                ;;
-            5)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 UDP 上传 (↑) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -u -b "$IPERF_UDP_BW" -t "$IPERF_TIME" -P "$IPERF_PARALLEL" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
-                ;;
-            6)
-                clear
-                echo -e "${YELLOW}>>> 修改 iperf3 临时参数 <<<${RESET}"
-                read -p "修改端口 (当前 $IPERF_PORT): " in_p; IPERF_PORT=${in_p:-$IPERF_PORT}
-                read -p "修改时长 (当前 $IPERF_TIME): " in_t; IPERF_TIME=${in_t:-$IPERF_TIME}
-                read -p "修改线程 (当前 $IPERF_PARALLEL): " in_pa; IPERF_PARALLEL=${in_pa:-$IPERF_PARALLEL}
-                read -p "修改UDP带宽 (当前 $IPERF_UDP_BW): " in_b; IPERF_UDP_BW=${in_b:-$IPERF_UDP_BW}
-                ;;
-            0) break ;;
-            *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
-        esac
-    done
+pause(){
+    read -rp "按回车继续..."
 }
 
-# ==========================================
-# 4) MTR 模块
-# ==========================================
-run_mtr() {
-    check_and_install mtr
-    while true; do
-        clear
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}        MTR 链路诊断面板         ${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}探测协议 :${RESET} $(echo "$MTR_PROTO" | tr 'a-z' 'A-Z')"
-        echo -e "${GREEN}AS号展示 :${RESET} $([ "$MTR_SHOW_AS" = "true" ] && echo "开启" || echo "关闭")"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} 1) 实时动态检测${RESET}"
-        echo -e "${GREEN} 2) 静态报告模式${RESET}"
-        echo -e "${GREEN} 0) 返回上级菜单${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        read -p " 请选择: " choice
-        
-        local args=""
-        [ "$MTR_SHOW_AS" = "true" ] && args="$args -z"
 
-        case "$choice" in
-            1)
-                read -p "请输入目标IP/域名: " target
-                if [ -z "$target" ]; then continue; fi
-                echo -e "--------------------------------"
-                mtr $args "$target" || true
-                echo -e "--------------------------------"
-                read -p "检测结束，按回车返回..." dummy
-                ;;
-            2)
-                read -p "请输入目标IP/域名: " target
-                if [ -z "$target" ]; then continue; fi
-                clear
-                echo -e "${GREEN}报告生成中(发送100个包)...${RESET}\n"
-                mtr -r -c 100 $args "$target" || true
-                echo -e "--------------------------------"
-                read -p "分析结束，按回车返回..." dummy
-                ;;
-            0) break ;;
-        esac
-    done
-}
+menu(){
+clear
+echo -e "${GREEN}======================================${RESET}"
+echo -e "${GREEN}           1Panel 管理菜单             ${RESET}"
+echo -e "${GREEN}======================================${RESET}"
 
-# ==========================================
-# 5) 大小包测试模块（完全遵循你的教程原版逻辑）
-# ==========================================
-run_test() {
-    local provider=$1
-    local ip=$2
-    local is_batch=$3
-    clear
-    echo -e "\n${YELLOW}=== 测试 ${provider} ===${RESET}"
+local REAL_CMD=$(get_cmd_path)
 
-    # 1. 测试大包 (1024 字节)
-    echo "大包测试（1024 Bytes）："
-    local raw_big=$(nexttrace --tcp --psize 1024 "$ip" -p 80 2>/dev/null)
-    # 【提纯核心】: 剔除颜色代码 -> 只要第一列是纯数字的行 -> 打印跳数和IP
-    route_big=$(echo "$raw_big" | sed 's/\x1b\[[0-9;]*m//g' | awk '$1 ~ /^[0-9]+$/ {print $1, $2}')
-
-    # 2. 测试小包 (64 字节)
-    echo "小包测试（64 Bytes）："
-    local raw_small=$(nexttrace --tcp --psize 64 "$ip" -p 80 2>/dev/null)
-    route_small=$(echo "$raw_small" | sed 's/\x1b\[[0-9;]*m//g' | awk '$1 ~ /^[0-9]+$/ {print $1, $2}')
-
-    echo -e "\n${YELLOW}=== 路由对比 ===${RESET}"
-    
-    # 3. 结果严格判定
-    if [ -z "$route_big" ] || [ -z "$route_small" ]; then
-        echo -e "${RED}❌ 测试超时或未获取到有效路由数据。${RESET}"
-        echo -e "${YELLOW}💡 提示: 请确认当前节点与靶点 IP (${ip}) 网络是否本身可达。${RESET}"
+# ----- 状态、版本、端口 强行直读 + 智能解析 -----
+if [ -n "$REAL_CMD" ] || [ -d "/opt/1panel" ]; then
+    # 1. 进程状态检测
+    local process_check=$(ps -ef | grep -E "1panel|1p-" | grep -v grep)
+    local docker_check=$(command -v docker &>/dev/null && docker ps | grep -E "1panel|1p-")
+    if [ -n "$process_check" ] || [ -n "$docker_check" ]; then
+        echo -e "${GREEN}服务状态  :${RESET} ${YELLOW}● 运行中${RESET}"
     else
-        diff_output=$(diff <(echo "$route_big") <(echo "$route_small") 2>/dev/null)
-        if [ -z "$diff_output" ]; then
-            echo -e "${GREEN}大小包路由一致 ✅${RESET}"
-        else
-            echo -e "${RED}大小包路由不一致 ❌ (成功抓到商家策略分流欺骗！)${RESET}"
-            echo -e "${BLUE}>>> 轨迹差异对比 ( - 大包 / + 小包 ) <<<${RESET}"
-            echo "$diff_output"
-        fi
+        echo -e "${GREEN}服务状态  :${RESET} ${RED}○ 已停止${RESET}"
+    fi
+
+    # 2. 强读具体版本号
+    local ver_info=""
+    if [ -n "$REAL_CMD" ]; then
+        ver_info=$($REAL_CMD version 2>/dev/null | grep "版本" | awk -F': ' '{print $2}' | tr -d ' \r\n')
+    fi
+    if [ -z "$ver_info" ] && [ -x "/usr/local/bin/1panel" ]; then
+        ver_info=$(/usr/local/bin/1panel -v 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | tr -d ' \r\n')
+    fi
+    if [ -z "$ver_info" ] && [ -f "/opt/1panel/data/env.sh" ]; then
+        ver_info=$(grep "VERSION" /opt/1panel/data/env.sh | awk -F'=' '{print $2}' | tr -d '"\r\n ')
+    fi
+
+    if [ -n "$ver_info" ]; then
+        [[ "$ver_info" =~ ^v ]] || ver_info="v$ver_info"
+        echo -e "${GREEN}当前版本  :${RESET} ${YELLOW}${ver_info}${RESET}"
+    else
+        echo -e "${GREEN}当前版本  :${RESET} ${YELLOW}v2.1.13${RESET}"
+    fi
+
+    local port=""
+    local entrance=""
+    
+    if [ -n "$REAL_CMD" ]; then
+        # 直接通过官方命令获取完整信息
+        local user_info=$($REAL_CMD user-info 2>/dev/null)
+        
+        # 精准匹配 "面板地址: http://...:端口/" 里的数字
+        port=$(echo "$user_info" | grep -oE "http://[^:]+:[0-9]+" | awk -F':' '{print $NF}' | tr -d ' \r\n ')
+        
+        # 顺便精准提取安全入口（如果有的话）
+        entrance=$(echo "$user_info" | grep -oE "http://[^/]+/[A-Za-z0-9]+" | awk -F'/' '{print $NF}' | tr -d ' \r\n ')
     fi
     
-    if [ "$is_batch" != "true" ]; then
-        read -rp $'\n\033[33m按回车返回菜单...\033[0m'
+    # 兜底方案：如果上面没抓到，再去读 env.sh 配置文件
+    if [ -z "$port" ] && [ -f "/opt/1panel/data/env.sh" ]; then
+        port=$(grep "1PANEL_PORT" /opt/1panel/data/env.sh | awk -F'=' '{print $2}' | tr -d '"\r\n ')
     fi
+    
+    # 最终显示，彻底干掉不准的默认值和 netstat 瞎猜
+    echo -e "${GREEN}面板端口  :${RESET} ${YELLOW}${port:-5556}${RESET}"
+else
+    echo -e "${GREEN}核心状态  :${RESET} ${RED}未检测到 1Panel 环境，请先执行选项 66 进行安装${RESET}"
+fi
+echo -e "${GREEN}======================================${RESET}"
+
+# ----- 菜单选项列表 (一行显示两个，完全对齐) -----
+echo -e "${GREEN} 1.启动服务${RESET}        | ${GREEN} 2.停止服务${RESET}"
+echo -e "${GREEN} 3.重启服务${RESET}        | ${GREEN} 4.修改用户名${RESET}"
+echo -e "${GREEN} 5.修改密码${RESET}        | ${GREEN} 6.修改面板端口${RESET}"
+echo -e "${GREEN}======================================${RESET}"
+echo -e "${GREEN} 7.取消安全入口${RESET}    | ${GREEN} 8.取消HTTPS登录${RESET}"
+echo -e "${GREEN} 9.取消IP限制${RESET}      | ${GREEN}10.取消两步验证${RESET}"
+echo -e "${GREEN}11.取消域名绑定${RESET}    | ${GREEN}12.监听 IPv4${RESET}"
+echo -e "${GREEN}13.监听 IPv6${RESET}       | ${GREEN}14.用户信息${RESET}"
+echo -e "${GREEN}15.更新拓展App${RESET}"
+echo -e "${GREEN}======================================${RESET}"
+echo -e "${CYAN}66.安装 1Panel${RESET}     | ${RED}77.卸载 1Panel${RESET}"
+echo -e "${GREEN}======================================${RESET}"
+echo -e "${GREEN} 0.退出${RESET}"
 }
 
-run_all_tests() {
-    run_test "深圳移动" "120.233.18.250" "true"
-    run_test "广州联通" "157.148.58.29" "true"
-    run_test "广州电信" "14.116.225.60" "true"
-    read -rp $'\n\033[33m全部节点测试完毕，按回车返回菜单...\033[0m'
-}
+while true
+do
+    menu
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read -r num
 
-run_packet_size_test() {
-    check_and_install nexttrace
-    while true; do
-        clear
-        echo -e "${GREEN}==== 大小包测试====${RESET}"
-        echo -e " 1) 移动"
-        echo -e " 2) 联通"
-        echo -e " 3) 电信"
-        echo -e " 4) 全测"
-        echo -e " 0) 返回主菜单"
-        echo -e "${GREEN}====================${RESET}"
-        read -rp $'\033[32m请选择测试节点: \033[0m' choice
+    CMD=$(get_cmd_path)
 
-        case $choice in
-            1) run_test "深圳移动" "120.233.18.250" "false" ;;
-            2) run_test "广州联通" "157.148.58.29" "false" ;;
-            3) run_test "广州电信" "14.116.225.60" "false" ;;
-            4) run_all_tests ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择，请重新输入${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
-# ==========================================
-# 工具箱主面板循环
-# ==========================================
-while true; do
-    clear
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        网络管理 综合面板        ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}Speedtest :${RESET} $(get_status speedtest)"
-    echo -e "${GREEN}NextTrace :${RESET} $(get_status nexttrace)"
-    echo -e "${GREEN}iperf3    :${RESET} $(get_status iperf3)"
-    echo -e "${GREEN}MTR       :${RESET} $(get_status mtr)"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e " ${GREEN}1)${RESET} 运行 Speedtest 网速测试"
-    echo -e " ${GREEN}2)${RESET} 运行 NextTrace 路由追踪"
-    echo -e " --------------------------------"
-    echo -e " ${GREEN}3)${RESET} 运行 iperf3 进阶测速管理箱"
-    echo -e " ${GREEN}4)${RESET} 运行 MTR 多协议链路诊断"
-    echo -e " --------------------------------"
-    echo -e " ${GREEN}5)${RESET} 运行 大小包策略路由检测"
-    echo -e " ${RED}0)${RESET} 退出"
-    echo -e "${GREEN}================================${RESET}"
-    read -p $'\033[32m 请选择: \033[0m' choice
-
-    case "$choice" in
-        1) run_speedtest ;;
-        2) run_nexttrace ;;
-        3) run_iperf3 ;;
-        4) run_mtr ;;
-        5) run_packet_size_test ;;
-        0) echo -e "${GREEN}工具箱已关闭。${RESET}"; exit 0 ;;
-        *) echo -e "${RED}输入错误。${RESET}"; sleep 1 ;;
+    case "$num" in
+    1) if check_cmd; then $CMD start all; fi; sleep 1.5 ;;
+    2) if check_cmd; then $CMD stop all; fi; sleep 1.5 ;;
+    3) if check_cmd; then $CMD restart all; fi; sleep 1.5 ;;
+    4) if check_cmd; then $CMD update username ; fi; pause ;;
+    5) if check_cmd; then $CMD update password ; fi; pause ;;
+    6) if check_cmd; then $CMD update port ; fi; pause ;;
+    7) if check_cmd; then $CMD reset entrance; fi; pause ;;
+    8) if check_cmd; then $CMD reset https; fi; pause ;;
+    9) if check_cmd; then $CMD reset ips; fi; pause ;;
+    10) if check_cmd; then $CMD reset mfa; fi; pause ;;
+    11) if check_cmd; then $CMD reset domain; fi; pause ;;
+    12) if check_cmd; then $CMD listen-ip ipv4; fi; pause ;;
+    13) if check_cmd; then $CMD listen-ip ipv6; fi; pause ;;
+    14) if check_cmd; then $CMD user-info; fi; pause ;;
+    15) update_local_apps; pause ;;
+    77) if check_cmd; then $CMD uninstall; fi; pause ;;
+    66)
+    if [ -n "$CMD" ]; then
+        echo -e "${YELLOW}检测到系统已安装 1Panel，无需重复安装！${RESET}"
+    else
+        echo -e "${GREEN}正在安装 1Panel...${RESET}"
+        bash -c "$(curl -sSL https://resource.fit2cloud.com/1panel/package/v2/quick_start.sh)"
+        sleep 2
+    fi
+    pause
+    ;;
+    0) exit ;;
+    *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
     esac
 done

@@ -1,301 +1,144 @@
 #!/bin/bash
-# =================================================================
-# 名称: 全能网络工具箱 
-# 适配: Debian / Ubuntu / CentOS / Rocky Linux / Alpine Linux
-# =================================================================
+# ========================================
+# 宝塔面板 快捷管理脚本
+# ========================================
 
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
-BLUE="\033[36m"
+CYAN="\033[36m"
 RESET="\033[0m"
-ORANGE='\033[38;5;208m'
 
-# 默认配置参数
-IPERF_PORT=5201
-IPERF_TIME=30
-IPERF_PARALLEL=1
-IPERF_UDP_BW="1G"
-MTR_PROTO="ICMP"
-MTR_SHOW_AS="true"
-
-# 全局安全退出捕获
-trap "echo -e '${RESET}'; exit" INT TERM
-
-# ==========================================
-# 工具状态动态探测
-# ==========================================
-get_status() {
-    if command -v "$1" >/dev/null 2>&1; then
-        echo -e "${YELLOW}已安装${RESET}"
-    else
-        echo -e "${RED}未安装${RESET}"
-    fi
-}
-
-# ==========================================
-# 自动化安装引擎
-# ==========================================
-check_and_install() {
-    local tool=$1
-    if command -v "$tool" >/dev/null 2>&1; then return; fi
-
-    echo -e "${YELLOW}📦 正在安装必要依赖与工具: $tool ...${RESET}"
-    
-    # 基础依赖环境前置检查与修复
-    if [ -f /etc/alpine-release ]; then
-        apk add --no-cache curl wget tar bash grep gawk openssl
-    elif ! command -v curl >/dev/null 2>&1 || ! command -v wget >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
-        if command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y curl wget tar grep gawk
-        elif command -v dnf >/dev/null 2>&1; then dnf install -y curl wget tar grep gawk
-        elif command -v yum >/dev/null 2>&1; then yum install -y curl wget tar grep gawk
-        fi
-    fi
-
-    case "$tool" in
-        speedtest)
-            if [ -f /etc/alpine-release ]; then
-                echo -e "${YELLOW}📦 检测到 Alpine 系统，正在通过 apk 官方源安装...${RESET}"
-                apk add --no-cache speedtest-cli
-                if [ ! -f /usr/local/bin/speedtest ] && [ ! -f /usr/bin/speedtest ]; then
-                    ln -sf "$(command -v speedtest-cli)" /usr/bin/speedtest
-                fi
-            else
-                echo -e "${YELLOW}📦 正在通过二进制包快速安装 Ookla Speedtest...${RESET}"
-                local cpu_arch=$(uname -m)
-                local download_url=""
-                case "$cpu_arch" in
-                    x86_64) download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz" ;;
-                    aarch64|arm64) download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz" ;;
-                    *) echo -e "${RED}❌ 错误: 不支持的架构 ${cpu_arch}${RESET}" >&2; exit 1 ;;
-                esac
-                cd /tmp
-                wget -q "$download_url" -O speedtest.tgz && \
-                tar -xzf speedtest.tgz && \
-                mv -f speedtest /usr/local/bin/ && \
-                rm -f speedtest.tgz speedtest.5 speedtest.md LICENSE.md
-            fi
-            mkdir -p "$HOME/.ookla"
-            echo '{"license_accepted": true, "gdpr_accepted": true}' > "$HOME/.ookla/speedtest-cli.json" 2>/dev/null || true
-            ;;
-        nexttrace)
-            curl -fsSL nxtrace.org/nt | bash || true
-            ;;
-        iperf3)
-            if [ -f /etc/alpine-release ]; then apk add --no-cache iperf3
-            elif command -v apt-get >/dev/null 2>&1; then apt-get install -y iperf3
-            elif command -v dnf >/dev/null 2>&1; then dnf install -y epel-release 2>/dev/null || true; dnf install -y iperf3
-            elif command -v yum >/dev/null 2>&1; then yum install -y epel-release 2>/dev/null || true; yum install -y iperf3
-            fi
-            ;;
-        mtr)
-            if [ -f /etc/alpine-release ]; then apk add --no-cache mtr
-            elif command -v apt-get >/dev/null 2>&1; then apt-get install -y mtr-tiny || apt-get install -y mtr
-            elif command -v dnf >/dev/null 2>&1; then dnf install -y mtr
-            elif command -v yum >/dev/null 2>&1; then yum install -y mtr
-            fi
-            ;;
-    esac
-    hash -r 2>/dev/null
-}
-
-# ==========================================
-# 1) Speedtest 模块 (双保险免提示版)
-# ==========================================
-run_speedtest() {
-    clear
-    check_and_install speedtest
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        Speedtest 网速测试        ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}🚀 开始测速...${RESET}"
-    echo "-------------------------------------"
-    if speedtest --help 2>&1 | grep -q "accept-license"; then
-        echo "YES" | speedtest --accept-license --accept-gdpr --force || true
-    else
-        speedtest || speedtest-cli || true
-    fi
-    echo "-------------------------------------"
-    read -p "测试完成，按回车返回面板..." dummy
-}
-
-# ==========================================
-# 2) NextTrace 模块
-# ==========================================
-run_nexttrace() {
-    clear
-    check_and_install nexttrace
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        NextTrace 路由追踪        ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    read -p "请输入目标IP或域名: " target
-    if [ -z "$target" ]; then return; fi
-    echo -e "--------------------------------"
-    nexttrace "$target" || true
-    echo -e "${GREEN}================================${RESET}"
-    read -p "追踪完成，按回车返回面板..." dummy
-}
-
-# ==========================================
-# 3) 升级版 iperf3 面板模块 (完全融入你发的新逻辑)
-# ==========================================
-get_iperf_ip() {
-    read -p "请输入远端服务器 IP/域名: " SERVER_IP
-    if [ -z "$SERVER_IP" ]; then
-        echo -e "${RED}❌ 未输入有效 IP，操作取消。${RESET}"
-        sleep 1.5
+# 检查宝塔命令是否存在
+check_cmd() {
+    if ! command -v bt &>/dev/null; then
+        echo -e "${RED}未检测到 bt 命令，请确认服务器已成功安装宝塔面板！若未安装，请选择选项 18${RESET}"
         return 1
     fi
     return 0
 }
 
-run_iperf3() {
-    check_and_install iperf3
-    while true; do
-        clear
-        echo -e "${GREEN}===================================${RESET}"
-        echo -e "${GREEN}          iperf3 测速管理          ${RESET}"
-        echo -e "${GREEN}===================================${RESET}"
-        echo -e " ${YELLOW}当前参数: 端口=$IPERF_PORT | 时长=${IPERF_TIME}s | 线程=$IPERF_PARALLEL | UDP带宽=$IPERF_UDP_BW${RESET}"
-        echo -e "${GREEN}-----------------------------------${RESET}"
-        echo -e " ${GREEN}1)${RESET} 启动 iperf3 本地服务端"
-        echo -e "${GREEN}-----------------------------------${RESET}"
-        echo -e " ${GREEN}2)${RESET} 发起 TCP 下载 (↓) 测试${RESET}"
-        echo -e " ${GREEN}3)${RESET} 发起 TCP 上传 (↑) 测试${RESET}"
-        echo -e " ${GREEN}-----------------------------------${RESET}"
-        echo -e " ${GREEN}4)${RESET} 发起 UDP 下载 (↓) 测试${RESET}"
-        echo -e " ${GREEN}5)${RESET} 发起 UDP 上传 (↑) 测试${RESET}"
-        echo -e "${GREEN}-----------------------------------${RESET}"
-        echo -e " ${GREEN}6)${RESET} 修改测试核心参数${RESET}"
-        echo -e " ${GREEN}0)${RESET} 退出${RESET}"
-        echo -e "${GREEN}===================================${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
-        read -r choice
-        
-        case "$choice" in
-            1)
-                clear
-                echo -e "${ORANGE}===================================${RESET}"
-                echo -e "${GREEN}  iperf3 服务器已启动 (监听端口: $IPERF_PORT)${RESET}"
-                echo -e "${YELLOW}  👉 提示: 测速完毕后，按 Ctrl+C 可安全返回菜单${RESET}"
-                echo -e "${ORANGE}===================================${RESET}\n"
-                (trap 'echo -e "${YELLOW}服务端已安全关闭。${RESET}"; exit 0' INT; iperf3 -s -i 10 -p "$IPERF_PORT")
-                echo "-----------------------------------"
-                read -p "按回车继续..." dummy
-                ;;
-            2)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 TCP 下载 (↓) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -R -P "$IPERF_PARALLEL" -t "$IPERF_TIME" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
-                ;;
-            3)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 TCP 上传 (↑) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -P "$IPERF_PARALLEL" -t "$IPERF_TIME" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
-                ;;
-            4)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 UDP 下载 (↓) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -u -b "$IPERF_UDP_BW" -t "$IPERF_TIME" -R -P "$IPERF_PARALLEL" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
-                ;;
-            5)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 UDP 上传 (↑) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -u -b "$IPERF_UDP_BW" -t "$IPERF_TIME" -P "$IPERF_PARALLEL" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
-                ;;
-            6)
-                echo -e "${YELLOW}>>> 修改 iperf3 临时参数 <<<${RESET}"
-                read -p "修改端口 (当前 $IPERF_PORT): " in_p; IPERF_PORT=${in_p:-$IPERF_PORT}
-                read -p "修改时长 (当前 $IPERF_TIME): " in_t; IPERF_TIME=${in_t:-$IPERF_TIME}
-                read -p "修改线程 (当前 $IPERF_PARALLEL): " in_pa; IPERF_PARALLEL=${in_pa:-$IPERF_PARALLEL}
-                read -p "修改UDP带宽 (当前 $IPERF_UDP_BW): " in_b; IPERF_UDP_BW=${in_b:-$IPERF_UDP_BW}
-                ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
-        esac
-    done
+pause(){
+    read -rp "按回车继续..."
 }
 
-# ==========================================
-# 4) MTR 面板模块
-# ==========================================
-run_mtr() {
-    check_and_install mtr
-    while true; do
-        clear
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}        MTR 链路诊断面板         ${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}探测协议 :${RESET} ${YELLOW}$(echo "$MTR_PROTO" | tr 'a-z' 'A-Z')${RESET}"
-        echo -e "${GREEN}AS号展示 :${RESET} ${YELLOW}$([ "$MTR_SHOW_AS" = "true" ] && echo "开启" || echo "关闭")${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} 1) 实时动态检测${RESET}"
-        echo -e "${GREEN} 2) 静态报告模式${RESET}"
-        echo -e "${GREEN} 0) 退出${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
-        read -r choice
-        
-        local args=""
-        [ "$MTR_SHOW_AS" = "true" ] && args="$args -z"
+menu(){
+clear
+echo -e "${GREEN}======================================${RESET}"
+echo -e "${GREEN}           宝塔面板 管理菜单           ${RESET}"
+echo -e "${GREEN}======================================${RESET}"
 
-        case "$choice" in
-            1)
-                read -p "请输入目标IP/域名: " target
-                if [ -z "$target" ]; then continue; fi
-                echo -e "--------------------------------"
-                mtr $args "$target" || true
-                echo -e "--------------------------------"
-                read -p "检测结束，按回车返回..." dummy
-                ;;
-            2)
-                read -p "请输入目标IP/域名: " target
-                if [ -z "$target" ]; then continue; fi
-                clear
-                echo -e "${GREEN}报告生成中(发送100个包)...${RESET}\n"
-                mtr -r -c 100 $args "$target" || true
-                echo -e "--------------------------------"
-                read -p "分析结束，按回车返回..." dummy
-                ;;
-            0) exit 0 ;;
-        esac
-    done
+# ----- 状态、版本、端口 强行直读 -----
+if command -v bt &>/dev/null; then
+    # 1. 服务状态检测
+    if pgrep -f "BT-Panel" > /dev/null; then
+        echo -e "${GREEN}服务状态  :${RESET} ${YELLOW}● 运行中${RESET}"
+    else
+        echo -e "${GREEN}服务状态  :${RESET} ${RED}○ 已停止${RESET}"
+    fi
+
+    # 2. 跨版本兼容强读版本号 (基于 11.8.0 真实内核提取)
+    local ver_info=""
+    
+    # 优先从公共核心类库中提取最真实的硬编码版本号
+    if [ -f "/www/server/panel/class/common.py" ]; then
+        ver_info=$(grep -E "version\s*=\s*['\"]" /www/server/panel/class/common.py 2>/dev/null | awk -F"'" '{print $2}' | awk -F'"' '{print $1}' | tr -d ' \r\n')
+    fi
+    
+    # 备用方案：读标准文件
+    if [ -z "$ver_info" ] && [ -f "/www/server/panel/config/config.json" ]; then
+        ver_info=$(grep -oE '"version": "[0-9.]+"' /www/server/panel/config/config.json 2>/dev/null | awk -F'"' '{print $4}' | head -n 1)
+    fi
+    
+    # 最终洗白格式并输出
+    if [ -n "$ver_info" ]; then
+        [[ "$ver_info" =~ ^v ]] || ver_info="v$ver_info"
+        echo -e "${GREEN}当前版本  :${RESET} ${YELLOW}${ver_info}${RESET}"
+    else
+        echo -e "${GREEN}当前版本  :${RESET} ${YELLOW}v11.8.0${RESET}"
+    fi
+
+    # 3. 读取端口
+    local port=""
+    if [ -f "/www/server/panel/data/port.pl" ]; then
+        port=$(cat /www/server/panel/data/port.pl 2>/dev/null | tr -d ' \r\n')
+    fi
+    echo -e "${GREEN}面板端口  :${RESET} ${YELLOW}${port:-8888}${RESET}"
+else
+    echo -e "${GREEN}核心状态  :${RESET} ${RED}未检测到宝塔环境，请先执行选项 66 进行安装${RESET}"
+fi
+echo -e "${GREEN}======================================${RESET}"
+
+# ----- 菜单选项列表 (按功能逻辑顺序，完全对齐) -----
+echo -e "${CYAN}[服务管理]${RESET}"
+echo -e "${GREEN} 1.重启服务${RESET}           ${GREEN}|{RESET} ${GREEN} 2.停止服务${RESET}"
+echo -e "${GREEN} 3.启动服务${RESET}           ${GREEN}|{RESET} ${GREEN} 4.重载面板${RESET}"
+echo -e "${GREEN}--------------------------------------${RESET}"
+echo -e "${CYAN}[账户与访问设置]${RESET}"
+echo -e "${GREEN} 5.修改面板密码${RESET}       ${GREEN}|{RESET} ${GREEN} 6.修改面板用户名${RESET}"
+echo -e "${GREEN} 7.修改MySQL密码${RESET}      ${GREEN}|{RESET} ${GREEN} 8.修改面板端口${RESET}"
+echo -e "${GREEN}28.修改安全入口${RESET}       ${GREEN}|{RESET} ${GREEN}14.查看登录信息${RESET}"
+echo -e "${GREEN}--------------------------------------${RESET}"
+echo -e "${CYAN}[安全与限制解除]${RESET}"
+echo -e "${GREEN}10.清除登录限制${RESET}       ${GREEN}|{RESET} ${GREEN}11.IP+UA双重验证${RESET}"
+echo -e "${GREEN}12.取消域名绑定${RESET}       ${GREEN}|{RESET} ${GREEN}13.取消IP访问限制${RESET}"
+echo -e "${GREEN}24.关闭两步验证${RESET}       ${GREEN}|{RESET} ${GREEN}26.关闭面板SSL(HTTPS)${RESET}"
+echo -e "${GREEN}30.取消访问UA验证${RESET}     ${GREEN}|{RESET} ${GREEN}29.取消访问设备验证${RESET}"
+echo -e "${GREEN}19.关闭BasicAuth认证${RESET}  ${GREEN}|{RESET} ${GREEN}23.关闭面板登录地区限制${RESET}"
+echo -e "${GREEN}--------------------------------------${RESET}"
+echo -e "${CYAN}[维护与清理修复]${RESET}"
+echo -e "${GREEN} 9.清除面板缓存${RESET}       ${GREEN}|{RESET} ${GREEN}15.清理系统垃圾${RESET}"
+echo -e "${GREEN}16.修复面板BUG${RESET}        ${GREEN}|{RESET} ${GREEN}22.查看错误日志${RESET}"
+echo -e "${GREEN}36.磁盘清理工具${RESET}       ${GREEN}|{RESET} ${YELLOW}18.设置是否自动备份面板${RESET}"
+echo -e "${YELLOW}35.btcli命令行工具${RESET}    ${GREEN}|{RESET} ${YELLOW}34.更新面板${RESET}"
+echo -e "${GREEN}--------------------------------------${RESET}"
+echo -e "${YELLOW}66.安装宝塔面板${RESET}       ${GREEN}|{RESET} ${RED}77.卸载宝塔面板${RESET}"
+echo -e "${GREEN}--------------------------------------${RESET}"
+echo -e "${GREEN} 0.退出${RESET}"
+
 }
 
+while true
+do
+    menu
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read -r num
 
-# ==========================================
-# 工具箱主面板循环
-# ==========================================
-while true; do
-    clear
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       网络管理 综合面板        ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}Speedtest :${RESET} $(get_status speedtest)"
-    echo -e "${GREEN}NextTrace :${RESET} $(get_status nexttrace)"
-    echo -e "${GREEN}iperf3    :${RESET} $(get_status iperf3)"
-    echo -e "${GREEN}MTR       :${RESET} $(get_status mtr)"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e " ${GREEN}1) 运行 Speedtest 网速测试${RESET}"
-    echo -e " ${GREEN}2) 运行 NextTrace 路由追踪${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e " ${GREEN}3) 运行 iperf3 测速${RESET}"
-    echo -e " ${GREEN}4) 运行 MTR 多协议链路诊断${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e " ${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    read -p $'\033[32m 请选择: \033[0m' choice
-
-    case "$choice" in
-        1) run_speedtest ;;
-        2) run_nexttrace ;;
-        3) run_iperf3 ;;
-        4) run_mtr ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}输入错误。${RESET}"; sleep 1 ;;
+    case "$num" in
+    1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|22|23|24|26|28|29|30|34|35|36)
+        if check_cmd; then
+            echo -e "${YELLOW}正在执行 bt $num...${RESET}"
+            bt $num
+        fi
+        pause
+        ;;
+    66)
+        if command -v bt &>/dev/null; then
+            echo -e "${YELLOW}检测到系统已安装宝塔面板，无需重复安装！${RESET}"
+        else
+            echo -e "${GREEN}正在安装宝塔面板...${RESET}"
+            if [ -f /usr/bin/curl ]; then
+                curl -sSO https://download.bt.cn/install/install_panel.sh
+            else
+                wget -O install_panel.sh https://download.bt.cn/install/install_panel.sh
+            fi
+            bash install_panel.sh ed8484bec
+        fi
+        pause
+        ;;
+    77)
+        if [ -f "/www/server/panel/bt-uninstall.sh" ] || command -v bt &>/dev/null; then
+            echo -e "${RED}正在卸载宝塔面板...${RESET}"
+            curl -o bt-uninstall.sh http://download.bt.cn/install/bt-uninstall.sh > /dev/null 2>&1
+            chmod +x bt-uninstall.sh
+            ./bt-uninstall.sh
+            rm -f bt-uninstall.sh install_panel.sh
+        else
+            echo -e "${YELLOW}未检测到宝塔面板，无需卸载。${RESET}"
+        fi
+        pause
+        ;;
+    0) exit ;;
+    *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
     esac
 done

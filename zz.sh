@@ -1,6 +1,7 @@
 #!/bin/bash
 # =================================================================
-# 名称: 全能网络工具箱 (完美融合大小包检测版)
+# 名称: 全能网络工具箱 
+# 适配: Debian / Ubuntu / CentOS / Rocky Linux / Alpine Linux
 # =================================================================
 
 GREEN="\033[32m"
@@ -26,7 +27,7 @@ trap "echo -e '${RESET}'; exit" INT TERM
 # ==========================================
 get_status() {
     if command -v "$1" >/dev/null 2>&1; then
-        echo -e "${GREEN}已安装${RESET}"
+        echo -e "${YELLOW}已安装${RESET}"
     else
         echo -e "${RED}未安装${RESET}"
     fi
@@ -41,6 +42,7 @@ check_and_install() {
 
     echo -e "${YELLOW}📦 正在安装必要依赖与工具: $tool ...${RESET}"
     
+    # 基础依赖环境前置检查与修复
     if [ -f /etc/alpine-release ]; then
         apk add --no-cache curl wget tar bash grep gawk openssl
     elif ! command -v curl >/dev/null 2>&1 || ! command -v wget >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
@@ -53,11 +55,13 @@ check_and_install() {
     case "$tool" in
         speedtest)
             if [ -f /etc/alpine-release ]; then
+                echo -e "${YELLOW}📦 检测到 Alpine 系统，正在通过 apk 官方源安装...${RESET}"
                 apk add --no-cache speedtest-cli
                 if [ ! -f /usr/local/bin/speedtest ] && [ ! -f /usr/bin/speedtest ]; then
                     ln -sf "$(command -v speedtest-cli)" /usr/bin/speedtest
                 fi
             else
+                echo -e "${YELLOW}📦 正在通过二进制包快速安装 Ookla Speedtest...${RESET}"
                 local cpu_arch=$(uname -m)
                 local download_url=""
                 case "$cpu_arch" in
@@ -96,7 +100,7 @@ check_and_install() {
 }
 
 # ==========================================
-# 1) Speedtest 模块
+# 1) Speedtest 模块 (双保险免提示版)
 # ==========================================
 run_speedtest() {
     clear
@@ -133,7 +137,7 @@ run_nexttrace() {
 }
 
 # ==========================================
-# 3) iperf3 模块
+# 3) iperf3 
 # ==========================================
 get_iperf_ip() {
     read -p "请输入远端服务器 IP/域名: " SERVER_IP
@@ -149,22 +153,22 @@ run_iperf3() {
     check_and_install iperf3
     while true; do
         clear
-        echo -e "${ORANGE}===================================${RESET}"
-        echo -e "${ORANGE}          iperf3 测速管理          ${RESET}"
-        echo -e "${ORANGE}===================================${RESET}"
-        echo -e " ${BLUE}当前参数: 端口=$IPERF_PORT | 时长=${IPERF_TIME}s | 线程=$IPERF_PARALLEL | UDP带宽=$IPERF_UDP_BW${RESET}"
-        echo -e "${ORANGE}-----------------------------------${RESET}"
-        echo -e " ${GREEN}1)${RESET} 启动 iperf3 本地服务端"
-        echo -e " -----------------------------------"
-        echo -e " ${GREEN}2)${RESET} 发起 TCP 下载 (↓) 测试"
-        echo -e " ${GREEN}3)${RESET} 发起 TCP 上传 (↑) 测试"
-        echo -e " -----------------------------------"
-        echo -e " ${GREEN}4)${RESET} 发起 UDP 下载 (↓) 测试"
-        echo -e " ${GREEN}5)${RESET} 发起 UDP 上传 (↑) 测试"
-        echo -e " -----------------------------------"
-        echo -e " ${GREEN}6)${RESET} 修改测试核心参数"
-        echo -e " ${RED}0)${RESET} 返回上级工具箱菜单"
-        echo -e "${ORANGE}===================================${RESET}"
+        echo -e "${GREEN}===================================${RESET}"
+        echo -e "${GREEN}          iperf3 测速管理          ${RESET}"
+        echo -e "${GREEN}===================================${RESET}"
+        echo -e " ${YELLOW}当前参数: 端口=$IPERF_PORT | 时长=${IPERF_TIME}s | 线程=$IPERF_PARALLEL | UDP带宽=$IPERF_UDP_BW${RESET}"
+        echo -e "${GREEN}-----------------------------------${RESET}"
+        echo -e " ${GREEN}1) 启动 iperf3 本地服务端"
+        echo -e "${GREEN}-----------------------------------${RESET}"
+        echo -e " ${GREEN}2) 发起 TCP 下载 (↓) 测试${RESET}"
+        echo -e " ${GREEN}3) 发起 TCP 上传 (↑) 测试${RESET}"
+        echo -e " ${GREEN}-----------------------------------${RESET}"
+        echo -e " ${GREEN}4) 发起 UDP 下载 (↓) 测试${RESET}"
+        echo -e " ${GREEN}5) 发起 UDP 上传 (↑) 测试${RESET}"
+        echo -e "${GREEN}-----------------------------------${RESET}"
+        echo -e " ${GREEN}6) 修改测试核心参数${RESET}"
+        echo -e " ${GREEN}0) 退出${RESET}"
+        echo -e "${GREEN}===================================${RESET}"
         echo -ne "${GREEN} 请选择: ${RESET}"
         read -r choice
         
@@ -175,7 +179,7 @@ run_iperf3() {
                 echo -e "${GREEN}  iperf3 服务器已启动 (监听端口: $IPERF_PORT)${RESET}"
                 echo -e "${YELLOW}  👉 提示: 测速完毕后，按 Ctrl+C 可安全返回菜单${RESET}"
                 echo -e "${ORANGE}===================================${RESET}\n"
-                (trap 'echo -e "\n${YELLOW}ℹ 服务端已安全关闭。${RESET}"; exit 0' INT; iperf3 -s -i 10 -p "$IPERF_PORT")
+                (trap 'echo -e "${YELLOW}服务端已安全关闭。${RESET}"; exit 0' INT; iperf3 -s -i 10 -p "$IPERF_PORT")
                 echo "-----------------------------------"
                 read -p "按回车继续..." dummy
                 ;;
@@ -204,21 +208,20 @@ run_iperf3() {
                 read -p "测试完成，按回车继续..." dummy
                 ;;
             6)
-                clear
                 echo -e "${YELLOW}>>> 修改 iperf3 临时参数 <<<${RESET}"
                 read -p "修改端口 (当前 $IPERF_PORT): " in_p; IPERF_PORT=${in_p:-$IPERF_PORT}
                 read -p "修改时长 (当前 $IPERF_TIME): " in_t; IPERF_TIME=${in_t:-$IPERF_TIME}
                 read -p "修改线程 (当前 $IPERF_PARALLEL): " in_pa; IPERF_PARALLEL=${in_pa:-$IPERF_PARALLEL}
                 read -p "修改UDP带宽 (当前 $IPERF_UDP_BW): " in_b; IPERF_UDP_BW=${in_b:-$IPERF_UDP_BW}
                 ;;
-            0) break ;;
+            0) exit 0 ;;
             *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
         esac
     done
 }
 
 # ==========================================
-# 4) MTR 模块
+# 4) MTR 面板模块
 # ==========================================
 run_mtr() {
     check_and_install mtr
@@ -227,14 +230,15 @@ run_mtr() {
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN}        MTR 链路诊断面板         ${RESET}"
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}探测协议 :${RESET} $(echo "$MTR_PROTO" | tr 'a-z' 'A-Z')"
-        echo -e "${GREEN}AS号展示 :${RESET} $([ "$MTR_SHOW_AS" = "true" ] && echo "开启" || echo "关闭")"
+        echo -e "${GREEN}探测协议 :${RESET} ${YELLOW}$(echo "$MTR_PROTO" | tr 'a-z' 'A-Z')${RESET}"
+        echo -e "${GREEN}AS号展示 :${RESET} ${YELLOW}$([ "$MTR_SHOW_AS" = "true" ] && echo "开启" || echo "关闭")${RESET}"
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN} 1) 实时动态检测${RESET}"
         echo -e "${GREEN} 2) 静态报告模式${RESET}"
-        echo -e "${GREEN} 0) 返回上级菜单${RESET}"
+        echo -e "${GREEN} 0) 退出${RESET}"
         echo -e "${GREEN}================================${RESET}"
-        read -p " 请选择: " choice
+        echo -ne "${GREEN} 请选择: ${RESET}"
+        read -r choice
         
         local args=""
         [ "$MTR_SHOW_AS" = "true" ] && args="$args -z"
@@ -257,78 +261,11 @@ run_mtr() {
                 echo -e "--------------------------------"
                 read -p "分析结束，按回车返回..." dummy
                 ;;
-            0) break ;;
+            0) exit 0 ;;
         esac
     done
 }
 
-# ==========================================
-# 5) 大小包测试模块（完全遵循你的教程原版逻辑）
-# ==========================================
-run_test() {
-    local provider=$1
-    local ip=$2
-    local is_batch=$3
-    clear
-    echo -e "\n${YELLOW}=== 测试 ${provider} ===${RESET}"
-
-    # 完美适配新版 NextTrace 规范的真实大小包策略数值
-    echo "大包测试（1450 Bytes）："
-    route_big=$(nexttrace --tcp --psize 1450 "$ip" -p 80 2>/dev/null | awk '/Hop/ {print $0}')
-    
-    echo "小包测试（64 Bytes）："
-    route_small=$(nexttrace --tcp --psize 64 "$ip" -p 80 2>/dev/null | awk '/Hop/ {print $0}')
-
-    echo -e "\n${YELLOW}=== 路由对比 ===${RESET}"
-    
-    if [ -z "$route_big" ] || [ -z "$route_small" ]; then
-        echo -e "${RED}❌ 测试超时或未获取到有效 Hop 数据。${RESET}"
-        echo -e "${YELLOW}💡 提示: 请确保当前是以 root 或 sudo bash 权限运行该脚本！${RESET}"
-    else
-        diff_output=$(diff <(echo "$route_big") <(echo "$route_small") 2>/dev/null)
-        if [ -z "$diff_output" ]; then
-            echo -e "${GREEN}大小包路由一致 ✅${RESET}"
-        else
-            echo -e "${RED}大小包路由不一致 ❌ (检测到商家策略分流欺骗)${RESET}"
-            echo "$diff_output"
-        fi
-    fi
-    
-    if [ "$is_batch" != "true" ]; then
-        read -rp $'\n\033[33m按回车返回菜单...\033[0m'
-    fi
-}
-
-run_all_tests() {
-    run_test "深圳移动" "120.233.18.250" "true"
-    run_test "广州联通" "157.148.58.29" "true"
-    run_test "广州电信" "14.116.225.60" "true"
-    read -rp $'\n\033[33m全部节点测试完毕，按回车返回菜单...\033[0m'
-}
-
-run_packet_size_test() {
-    check_and_install nexttrace
-    while true; do
-        clear
-        echo -e "${GREEN}==== 大小包测试====${RESET}"
-        echo -e " 1) 移动"
-        echo -e " 2) 联通"
-        echo -e " 3) 电信"
-        echo -e " 4) 全测"
-        echo -e " 0) 返回主菜单"
-        echo -e "${GREEN}====================${RESET}"
-        read -rp $'\033[32m请选择测试节点: \033[0m' choice
-
-        case $choice in
-            1) run_test "深圳移动" "120.233.18.250" "false" ;;
-            2) run_test "广州联通" "157.148.58.29" "false" ;;
-            3) run_test "广州电信" "14.116.225.60" "false" ;;
-            4) run_all_tests ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择，请重新输入${RESET}"; sleep 1 ;;
-        esac
-    done
-}
 
 # ==========================================
 # 工具箱主面板循环
@@ -336,21 +273,20 @@ run_packet_size_test() {
 while true; do
     clear
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        网络管理 综合面板        ${RESET}"
+    echo -e "${GREEN}       网络管理 综合面板        ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}Speedtest :${RESET} $(get_status speedtest)"
     echo -e "${GREEN}NextTrace :${RESET} $(get_status nexttrace)"
     echo -e "${GREEN}iperf3    :${RESET} $(get_status iperf3)"
     echo -e "${GREEN}MTR       :${RESET} $(get_status mtr)"
     echo -e "${GREEN}================================${RESET}"
-    echo -e " ${GREEN}1)${RESET} 运行 Speedtest 网速测试"
-    echo -e " ${GREEN}2)${RESET} 运行 NextTrace 路由追踪"
-    echo -e " --------------------------------"
-    echo -e " ${GREEN}3)${RESET} 运行 iperf3 进阶测速管理箱"
-    echo -e " ${GREEN}4)${RESET} 运行 MTR 多协议链路诊断"
-    echo -e " --------------------------------"
-    echo -e " ${GREEN}5)${RESET} 运行 大小包策略路由检测"
-    echo -e " ${RED}0)${RESET} 退出"
+    echo -e " ${GREEN}1) 运行 Speedtest 网速测试${RESET}"
+    echo -e " ${GREEN}2) 运行 NextTrace 路由追踪${RESET}"
+    echo -e "${GREEN}--------------------------------${RESET}"
+    echo -e " ${GREEN}3) 运行 iperf3 测速${RESET}"
+    echo -e " ${GREEN}4) 运行 MTR 多协议链路诊断${RESET}"
+    echo -e "${GREEN}--------------------------------${RESET}"
+    echo -e " ${GREEN}0) 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     read -p $'\033[32m 请选择: \033[0m' choice
 
@@ -359,8 +295,7 @@ while true; do
         2) run_nexttrace ;;
         3) run_iperf3 ;;
         4) run_mtr ;;
-        5) run_packet_size_test ;;
-        0) echo -e "${GREEN}工具箱已关闭。${RESET}"; exit 0 ;;
+        0) exit 0 ;;
         *) echo -e "${RED}输入错误。${RESET}"; sleep 1 ;;
     esac
 done

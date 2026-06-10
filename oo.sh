@@ -1,31 +1,33 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# sing-box Hysteria 2 [Alpine专属]
+# SPDX-License-Identifier: MIT
+#
+set -Eop pipefail
+export LANG=en_US.UTF-8
 
 # =========================================================
-# Xray VLESS-Reality 管理脚本
+# 1. 核心控制与全局环境初始化
 # =========================================================
+readonly BINARY_PATH="/usr/local/bin/sing-box-hy2"
+readonly HY2_CONFIG="/etc/sing-box-hy2/config.json"
+readonly HY2_DIR="/root/proxynode/hy2"
+CONFIG_DIR="/etc/sing-box-hy2"
+OPENRC_SERVICE_PATH="/etc/init.d/sing-box-hy2"
+LOG_FILE="/var/log/sing-box-hy2.log"
+RUN_USER="singbox-hy2"
 
-set -Eeuo pipefail
+TMP_DIR=$(mktemp -d -t sb-hy2.XXXXXX)
 
-# ================== 颜色 ==================
+# 颜色标准规范
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 BLUE="\033[34m"
-CYAN="\033[36m"
 RESET="\033[0m"
 
-# ================== 基础变量 ==================
-readonly SERVICE_NAME="vlessreality"
-readonly XRAY_CONFIG="/usr/local/etc/${SERVICE_NAME}/config.json"
-readonly XRAY_BINARY="/usr/local/bin/${SERVICE_NAME}"
-readonly XRAY_PUBLIC_KEY_FILE="/usr/local/etc/${SERVICE_NAME}/public.key"
 
-# 降级备用版本（当自动获取最新版本失败时使用）
-readonly BACKUP_VERSION="26.3.27"
-
-TMP_DIR=$(mktemp -d -t xray.XXXXXX)
-
-# ================== GITHUB 代理 ==================
+# GITHUB 代理列表
 GITHUB_PROXY=(
     ''
     'https://v6.gh-proxy.org/'
@@ -35,959 +37,787 @@ GITHUB_PROXY=(
     'https://ghproxy.lvedong.eu.org/'
 )
 
-# ================== cleanup ==================
-cleanup() {
-    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
-}
+info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
+error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
+pause() { echo; read -n 1 -s -r -p "$(echo -e ${GREEN}"按任意键返回菜单..."${RESET})" || true; echo; }
 
+cleanup() {
+  [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+}
 trap cleanup EXIT INT TERM
 
-# ================== 日志 ==================
-info() {
-    echo -e "${GREEN}[信息] $*${RESET}" >&2
+generate_random_password() {
+  dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
 }
 
-warn() {
-    echo -e "${YELLOW}[警告] $*${RESET}" >&2
+is_alpine() {
+  [[ -f /etc/alpine-release ]]
 }
 
-error() {
-    echo -e "${RED}[错误] $*${RESET}" >&2
+install_packages() {
+  info "正在刷新 Alpine 仓库并安装核心依赖..."
+  apk update
+  apk add --no-cache bash curl wget tar openssl openrc iproute2 jq grep sed coreutils bind-tools iptables ip6tables gcompat socat python3
+  
+  if [[ -f /etc/init.d/iptables ]]; then
+    rc-update add iptables default >/dev/null 2>&1 || true
+    rc-service iptables start >/dev/null 2>&1 || true
+  fi
+  if [[ -f /etc/init.d/ip6tables ]]; then
+    rc-update add ip6tables default >/dev/null 2>&1 || true
+    rc-service ip6tables start >/dev/null 2>&1 || true
+  fi
 }
 
-pause() {
-    read -n 1 -s -r -p "按任意键返回菜单..." || true
-    echo
+create_user() {
+  getent group "$RUN_USER" &>/dev/null || addgroup -S "$RUN_USER"
+  id "$RUN_USER" &>/dev/null || adduser -S -D -H -G "$RUN_USER" -s /sbin/nologin "$RUN_USER"
 }
 
-# ================== 获取公网IP ==================
-get_public_ip() {
-    local mode=${1:-"v4"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        # 强制获取 IPv4
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        # 强制获取 IPv6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-
-    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
-    echo "127.0.0.1" && return 0
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l|armv7) echo "armv7" ;;
+    *) error "不支持当前架构: $(uname -m)"; exit 8 ;;
+  esac
 }
 
-# ================== 检查端口占用 ==================
-check_port() {
-    local port="$1"
-
-    if ss -tuln | awk '{print $5}' | grep -qE "[:.]${port}$"; then
-        return 1  # 被占用
-    fi
-
-    return 0  # 没用占用
+check_environment() {
+  if ! is_alpine; then
+    error "本脚本仅支持 Alpine Linux 系统。"
+    exit 95
+  fi
+  install_packages
+  create_user
 }
 
-# ================== 验证端口格式 ==================
-is_valid_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] \
-        && [[ "$1" -ge 1 ]] \
-        && [[ "$1" -le 65535 ]]
+get_installed_version() {
+  if [[ -f "$BINARY_PATH" ]]; then
+    "$BINARY_PATH" version 2>/dev/null | head -n1 | awk '{print $3}' || echo "未知版本"
+  else
+    echo "未安装"
+  fi
 }
 
-# ================== 获取可用随机端口 ==================
-get_random_port() {
-    local rand_port
-    while true; do
-        rand_port=$((RANDOM % 55536 + 10000))
-        if check_port "$rand_port"; then
-            echo "$rand_port"
-            return 0
-        fi
-    done
-}
-
-# ================== UUID验证 ==================
-is_valid_uuid() {
-    [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]
-}
-
-# ================== ShortID 验证 ==================
-is_valid_shortid() {
-    local len=${#1}
-    if [[ "$1" =~ ^[0-9a-fA-F]+$ ]] && (( len % 2 == 0 )) && (( len <= 16 )); then
-        return 0
-    fi
-    return 1
-}
-
-# ================== 域名验证 ==================
-is_valid_domain() {
-    [[ "$1" =~ ^([a-zA-Z0-9](-?[a-zA-Z0-9])*\.)+[A-Za-z]{2,}$ ]]
-}
-
-# ================== 架构检测 ==================
-get_arch() {
-    local arch
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64) echo "64" ;;
-        aarch64|arm64) echo "arm64-v8a" ;;
-        armv7l) echo "arm32-v7a" ;;
-        *) error "暂不支持的系统架构: $arch"; return 1 ;;
-    esac
-}
-
-# ================== 自动获取最新版本号 ==================
 get_latest_version() {
-    local latest_version=""
-    info "正在获取 GitHub 最新 Xray 版本号..."
+  info "正在从 GitHub 获取 sing-box 最新版本号..."
+  local latest_v=""
+
+  # 1. 优先尝试原生 API 直连获取
+  latest_v=$(curl -fsSL --connect-timeout 5 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r .tag_name 2>/dev/null | sed 's/^v//')
+  
+  # 2. 如果直连 API 失败，通过代理列表尝试解析 HTML 页面
+  if [[ -z "$latest_v" || "$latest_v" == "null" ]]; then
+    warn "通过 API 获取最新版本失败，尝试通过代理获取备用匹配方案..."
     
-    # 优先尝试直连拉取 API
-    latest_version=$(curl -fsSL --max-time 5 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
-        | jq -r '.tag_name' 2>/dev/null || echo "")
-        
-    # 如果直连获取失败，轮询代理进行 API 拉取
-    if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
-        for proxy in "${GITHUB_PROXY[@]}"; do
-            [[ -z "$proxy" ]] && continue
-            latest_version=$(curl -fsSL --max-time 5 "${proxy}https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
-                | jq -r '.tag_name' 2>/dev/null || echo "")
-            [[ -n "$latest_version" && "$latest_version" != "null" ]] && break
-        done
-    fi
-
-    latest_version="${latest_version#v}"
-
-    if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
-        warn "通过 GitHub 接口获取最新版本失败，将使用内置备用版本: v${BACKUP_VERSION}"
-        echo "$BACKUP_VERSION"
-    else
-        info "成功获取最新版本: v${latest_version}"
-        echo "$latest_version"
-    fi
-}
-
-# ================== 代理下载核心逻辑 ==================
-download_file() {
-    local url_path="$1"
-    local output_file="$2"
-    local success=1
-
     for proxy in "${GITHUB_PROXY[@]}"; do
-        info "尝试使用代理下载: ${proxy:-直连}"
-        if wget -T 15 -t 2 -O "$output_file" "${proxy}${url_path}"; then
-            success=0
-            break
-        fi
+      # 拼接代理页面地址
+      local _page_url="${proxy}https://github.com/SagerNet/sing-box/releases/latest"
+      info "正在尝试通过代理 [${proxy:-直连}] 获取版本页面..."
+      
+      latest_v=$(curl -fsSL --connect-timeout 5 "$_page_url" 2>/dev/null | grep -oE 'releases/tag/v[0-9.]+' | head -n1 | sed 's|releases/tag/v||')
+      
+      if [[ -n "$latest_v" ]]; then
+        break
+      fi
     done
-    return $success
+  fi
+
+  # 3. 最终版本号判定
+  if [[ -n "$latest_v" ]]; then
+    SINGBOX_VERSION="$latest_v"
+    info "成功获取最新版本: v$SINGBOX_VERSION"
+  else
+    SINGBOX_VERSION="1.13.12"
+    warn "无法获取最新版本，将使用保底版本: v$SINGBOX_VERSION"
+  fi
 }
 
-# ================== 从GitHub下载并解压Xray ==================
-download_and_extract_xray() {
-    local arch version
-    arch=$(get_arch) || return 1
-    version=$(get_latest_version)
-    
-    local download_url="https://github.com/XTLS/Xray-core/releases/download/v${version}/Xray-linux-${arch}.zip"
-    local zip_file="$TMP_DIR/xray.zip"
-    
-    info "正在准备从 GitHub 下载 Xray v${version} (${arch})..."
-    if ! download_file "$download_url" "$zip_file"; then
-        error "从 GitHub 下载 Xray 失败，所有代理均已尝试，请检查网络连接。"
-        return 1
+clear_old_iptables() {
+  if [[ -f "${CONFIG_DIR}/hopping.txt" && -f "${CONFIG_DIR}/main_port.txt" ]]; then
+    local old_hop
+    old_hop=$(cat "${CONFIG_DIR}/hopping.txt")
+    local old_port
+    old_port=$(cat "${CONFIG_DIR}/main_port.txt")
+    local old_start="${old_hop%-*}"
+    local old_end="${old_hop#*-}"
+
+    if [[ -n "$old_start" && -n "$old_end" && -n "$old_port" ]]; then
+      info "正在清洁防火墙残留规则..."
+      iptables -t nat -D PREROUTING -p udp -m multiport --dports "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+      ip6tables -t nat -D PREROUTING -p udp -m multiport --dports "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+      iptables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
+      ip6tables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
     fi
-    
-    info "正在解压..."
-    mkdir -p "$TMP_DIR/extracted"
-    if ! unzip -qo "$zip_file" -d "$TMP_DIR/extracted"; then
-        error "解压 Xray 压缩包失败，请确保系统已安装 unzip。"
-        return 1
-    fi
-    
-    # 安装二进制文件
-    mkdir -p "$(dirname "$XRAY_BINARY")"
-    rm -f "$XRAY_BINARY"
-    cp -f "$TMP_DIR/extracted/xray" "$XRAY_BINARY"
-    chmod +x "$XRAY_BINARY"
-    
-    # 安装 GeoData 资源文件
-    mkdir -p "/usr/local/share/${SERVICE_NAME}"
-    cp -f "$TMP_DIR/extracted/geoip.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
-    cp -f "$TMP_DIR/extracted/geosite.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
+  fi
 }
 
-# ================== 配置 Systemd 服务 ==================
-setup_systemd_service() {
-    info "配置 Systemd 服务 [${SERVICE_NAME}]..."
+apply_new_iptables() {
+  clear_old_iptables
+  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
+    local hop_val
+    hop_val=$(cat "${CONFIG_DIR}/hopping.txt")
+    local start_p="${hop_val%-*}"
+    local end_p="${hop_val#*-}"
     
-    cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
-[Unit]
-Description=Xray Vless Reality Service
-Documentation=https://github.com/XTLS/Xray-core
-After=network.target nss-lookup.target
-
-[Service]
-User=root
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ExecStart=${XRAY_BINARY} run -config ${XRAY_CONFIG}
-Restart=on-failure
-RestartPreventExitStatus=23
-LimitNPROC=10000
-LimitNOFILE=1000000
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable "${SERVICE_NAME}" 2>/dev/null || true
-}
-
-# ================== 获取Xray状态 ==================
-get_xray_status() {
-    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
-        echo -e "${GREEN}● 运行中${RESET}"
+    info "正在应用 iptables 转发规则: UDP $start_p-$end_p => 主端口 $port"
+    if iptables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port"; then
+      ip6tables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
     else
-        echo -e "${RED}● 未运行${RESET}"
+      iptables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port"
+      ip6tables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
     fi
+    
+    echo "$port" > "${CONFIG_DIR}/main_port.txt"
+    
+    if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
+    if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
+    info "防火墙端口跳跃规则已固化。"
+  fi
 }
 
-# ================== 获取版本 ==================
-get_xray_version() {
-    if [[ -x "$XRAY_BINARY" ]]; then
-        "$XRAY_BINARY" version 2>/dev/null \
-            | grep -i "Xray" \
-            | head -n 1 \
-            | awk '{print $2}' || echo "未知"
-    else
-        echo "未安装"
-    fi
+# =========================================================
+# 4. 网络诊断与配置管理辅助
+# =========================================================
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网IP"
 }
 
-# ================== 获取监听地址 ==================
-get_listen_ip() {
-    if sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null \
-        | grep -q '= 1'; then
-        echo "0.0.0.0"
-    else
-        echo "::"
-    fi
-}
-
-# ================== 测试配置 ==================
-test_config() {
-    if "$XRAY_BINARY" run -test -config "$XRAY_CONFIG"; then
-        info "Configuration OK"
-        return 0
-    fi
-
-    error "配置测试失败"
+check_port() {
+  local port="$1"
+  if ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
     return 1
+  fi
+  return 0
 }
 
-# ================== 重启服务 ==================
-restart_xray() {
-    systemctl restart "${SERVICE_NAME}" 2>/dev/null || true
-    sleep 1
+is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
 
-    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
-        info "${SERVICE_NAME} 启动成功"
-        return 0
+get_random_port() {
+  local rand_port
+  while true; do
+    rand_port=$(shuf -i 2000-65535 -n 1)
+    if check_port "$rand_port"; then
+      echo "$rand_port" && return 0
     fi
+  done
+}
 
-    error "${SERVICE_NAME} 启动失败"
-    journalctl -u "${SERVICE_NAME}" -n 20 --no-pager || true
+get_hy2_status() {
+  if rc-service sing-box-hy2 status 2>/dev/null | grep -q "started"; then
+    echo "RUNNING"
+  else
+    echo "STOPPED"
+  fi
+}
+
+get_current_port_display() {
+  if [[ -f "$HY2_CONFIG" ]]; then
+    local main_port jump_range="无"
+    main_port=$(jq -r '.inbounds[0].listen_port // empty' "$HY2_CONFIG" 2>/dev/null)
+    [[ -f "${CONFIG_DIR}/hopping.txt" ]] && jump_range=$(cat "${CONFIG_DIR}/hopping.txt")
+    
+    if [[ "$jump_range" != "无" ]]; then
+      echo "${main_port} [${jump_range}]"
+    else
+      echo "${main_port:- -}"
+    fi
+  else echo "-"; fi
+}
+
+# =========================================================
+# 5. 面板节点配置生成核心逻辑 (Hysteria 2)
+# =========================================================
+
+
+# 精准修复外部自定义证书的穿透访问权限，确保非 root 运行的 singbox-hy2 用户有权读取
+fix_external_cert_permission() {
+  local cert="$1"
+  local key="$2"
+  
+  # 针对 /root 目录的致命硬拦截
+  if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
+    error "致命拒绝: 检测到您的证书位于 /root/ 目录下！"
+    warn "原因分析: /root 目录权限极为严苛(700)，任何非 root 用户(包括 singbox-hy2)均无权穿透。"
+    warn "         即使强行赋予文件 644 权限，内核也会因路径阻塞拒绝读取。"
+    info "权威推荐: 请在 acme.sh 命令中加上 --install-cert 指令，将证书自动分发到公共目录"
+    info "         (例如: /etc/sing-box-hy2/certs/ 或 /etc/ssl/ 文件夹下) 再试。"
     return 1
+  fi
+
+  # 1. 自动提取并【逐级向上】放行外部证书的所有上级目录
+  info "正在为外部证书路径逐级赋予检索穿透权限 (+x) ..."
+  local dir
+  for file in "$cert" "$key"; do
+    dir=$(dirname "$file")
+    while [[ "$dir" != "/" && -n "$dir" ]]; do
+      chmod o+x "$dir" 2>/dev/null || true
+      
+      # 如果系统支持 ACL，精准安全地给 sing-box 账号加上特殊通行证
+      if command -v setfacl >/dev/null 2>&1; then
+        setfacl -m u:"$RUN_USER":rx "$dir" 2>/dev/null || true
+      fi
+      dir=$(dirname "$dir")
+    done
+  done
+  
+  # 2. 确保证书和密钥文件本身可读
+  info "正在规范化外部证书与私钥文件的读取权限 ..."
+  chmod 644 "$cert" 2>/dev/null || true
+  chmod 644 "$key" 2>/dev/null || true
+  
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m u:"$RUN_USER":r "$cert" "$key" 2>/dev/null || true
+  fi
+  return 0
 }
 
-# ================== 生成 Reality 密钥 ==================
-generate_reality_keys() {
-    info "正在生成 Reality 密钥..."
-    local key_pair
 
-    if ! key_pair=$(timeout 10 "$XRAY_BINARY" x25519 2>/dev/null); then
-        error "Reality 密钥生成失败"
-        return 1
+inst_cert() {
+  mkdir -p "$CONFIG_DIR/certs"
+
+  echo "---------------------------------------------"
+  echo -e "Hysteria 2 协议证书申请方式如下："
+  echo -e " 1) 必应自签证书${YELLOW}（默认）${RESET} "
+  echo -e " 2) Acme自动申请(需放行80端口)"
+  echo -e " 3) 自定义证书路径"
+  echo "---------------------------------------------"
+  local certInput
+  read -rp "请输入选项 [1-3] (直接回车默认自签证书): " certInput
+  certInput=${certInput:-1}
+
+  cert_path="$CONFIG_DIR/certs/cert.pem"
+  key_path="$CONFIG_DIR/certs/key.pem"
+
+  if [[ $certInput == 2 ]]; then
+    if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
+      warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。"
     fi
 
-    local private_key
-    private_key=$(echo "$key_pair" \
-        | grep -i "Private" \
-        | awk -F ': ' '{print $2}' \
-        | tr -d '\r')
+    if [[ -f "$cert_path" && -f "$key_path" && -s "$cert_path" && -s "$key_path" && -f "$CONFIG_DIR/certs/ca.log" ]]; then
+      hy2_domain=$(cat "$CONFIG_DIR/certs/ca.log")
+      info "检测到已有域名 [${hy2_domain}] 的安全区证书，正在复用..."
+    else
+      read -rp "请输入需要申请证书的域名: " domain
+      [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
+      
+      info "正在检查并安装 Acme.sh 依赖..."
+      local acme_cmd="/root/.acme.sh/acme.sh"
+      if [[ ! -f "$acme_cmd" ]]; then
+        curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
+      fi
+      
+      "$acme_cmd" --set-default-ca --server letsencrypt
+      
+      info "正在向 Let's Encrypt 申请证书..."
+      if [[ "$(get_public_ip)" =~ ":" ]]; then
+        "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
+      else
+        "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
+      fi
+      
+      # 【智能状态探针】纯 OpenRC 架构：有配置(续期)则重启，无配置(初装)则静默
+      local reload_cmd="[ -f /etc/sing-box-hy2/config.json ] && /sbin/rc-service sing-box-hy2 restart || echo '[信息] 初次部署，跳过服务同步'"
+      
+      if "$acme_cmd" --install-cert -d "${domain}" \
+        --key-file "$key_path" \
+        --fullchain-file "$cert_path" \
+        --ecc \
+        --reloadcmd "$reload_cmd"; then
+        echo "$domain" > "$CONFIG_DIR/certs/ca.log"
+        hy2_domain=$domain
+        info "Acme 证书申请并成功分发！"
+      else
+        error "Acme 证书申请失败，自动切换回自签模式。"
+        certInput=1
+      fi
+    fi
+  elif [[ $certInput == 3 ]]; then
+    while true; do
+      local user_cert user_key
+      read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
+      read -rp "请输入密钥文件 (privkey.pem/key) 的路径: " user_key
+      read -rp "请输入证书对应的域名: " hy2_domain
+      
+      if [[ -f "$user_cert" && -f "$user_key" ]]; then
+        rm -f "$cert_path" "$key_path"
+        
+        # 建立软链接或拷贝之前，先穿透修复外部文件和目录的读取权限
+        if fix_external_cert_permission "$user_cert" "$user_key"; then
+          ln -sf "$user_cert" "$cert_path"
+          ln -sf "$user_key" "$key_path"
+          info "自定义外部证书已通过安全软链接无缝同步。"
+          break
+        else
+          return 1
+        fi
+      else
+        error "找不到输入的证书文件，请重新确认路径。"
+        echo "---------------------------------------------"
+      fi
+    done
+  fi
 
-    local public_key
-    public_key=$(echo "$key_pair" \
-        | grep -i "Public" \
-        | awk -F ': ' '{print $2}' \
-        | tr -d '\r')
+  if [[ $certInput == 1 ]]; then
+    info "将使用必应自签证书作为 Hysteria 2 外壳的节点证书"
+    rm -f "$cert_path" "$key_path"
+    openssl ecparam -genkey -name prime256v1 -out "$key_path"
+    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
+    hy2_domain="www.bing.com"
+    
+    chmod 644 "$cert_path" || true
+    chmod 600 "$key_path" || true
+  fi
 
-    if [[ -z "${private_key:-}" || -z "${public_key:-}" ]]; then
-        error "生成的密钥对无效或为空"
-        return 1
+  # 规范所有权：使用 -h 规避穿透修改外部真实证书所有权
+  chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
+  chown -h ${RUN_USER}:${RUN_USER} "$cert_path" "$key_path" 2>/dev/null || true
+}
+
+inst_port() {
+  local default_port=""
+  if [[ -f "$HY2_CONFIG" ]]; then
+    default_port=$(jq -r '.inbounds[0].listen_port // empty' "$HY2_CONFIG" 2>/dev/null)
+  fi
+
+  local prompt_msg="设置 Hysteria 2 服务端监听主端口 [1-65535] (回车随机分配): "
+  [[ -n "$default_port" ]] && prompt_msg="设置 Hysteria 2 服务端监听主端口 [当前: ${default_port}, 回车不修改]: "
+
+  while true; do
+    read -rp "$prompt_msg" port
+    if [[ -z "$port" ]]; then
+      if [[ -n "$default_port" ]]; then port="$default_port" && break
+      else
+        port=$(get_random_port)
+        info "已为您随机分配未被占用端口: $port" && break
+      fi
+    elif is_valid_port "$port"; then
+      if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
+        error "端口 ${port} 已被其它程序占用，请更换。" && continue
+      fi
+      break
+    else error "请输入有效的端口数字 (1-65535)"; fi
+  done
+
+  # =========================================================
+  # 【记忆重构核心】读取并展示现有的端口跳跃配置
+  # =========================================================
+  local default_hop=""
+  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
+    default_hop=$(cat "${CONFIG_DIR}/hopping.txt")
+  fi
+
+  echo "---------------------------------------------"
+  if [[ -n "$default_hop" ]]; then
+    echo -e "Hysteria 2 端口群使用模式 [当前已启用跳跃: ${default_hop}]："
+  else
+    echo -e "Hysteria 2 端口群使用模式 ："
+  fi
+  echo -e " 1) 单端口模式"
+  echo -e " 2) 端口跳跃模式 ${YELLOW}（默认)${RESET}"
+  echo "---------------------------------------------"
+  
+  local jumpInput
+  read -rp "请选择端口模式 [1-2] (直接回车默认不变或选择默认项): " jumpInput
+  
+  # 如果用户直接回车，且以前有跳跃记录，则直接保持现有的 iptables 逻辑并退出函数
+  if [[ -z "$jumpInput" && -n "$default_hop" ]]; then
+    info "检测到回车确认，将 100% 保持原有端口跳跃配置 [${default_hop}] 保持不变。"
+    # 刷新主端口记录，防止主端口变了但跳跃目标没变
+    echo "$port" > "${CONFIG_DIR}/main_port.txt"
+    return 0
+  fi
+
+  # 如果没有旧配置且直接回车，则走向默认选项 2
+  jumpInput=${jumpInput:-2}
+
+  # 只有在用户明确重新选择模式时，才清理旧防火墙规则
+  clear_old_iptables
+
+  if [[ $jumpInput == 2 ]]; then
+    local old_start="" old_end=""
+    if [[ -n "$default_hop" ]]; then
+      old_start="${default_hop%-*}"
+      old_end="${default_hop#*-}"
     fi
 
-    echo "$public_key" > "$XRAY_PUBLIC_KEY_FILE"
-    echo "${private_key}|${public_key}"
+    while true; do
+      local start_prompt="设置外部跳跃起始端口 (建议10000-65535)"
+      [[ -n "$old_start" ]] && start_prompt="设置外部跳跃起始端口 [当前: ${old_start}, 回车不修改]"
+      read -rp "${start_prompt}: " firstport
+      firstport=${firstport:-$old_start}
+
+      local end_prompt="设置外部跳跃末尾端口 (必须大于起始端口)"
+      [[ -n "$old_end" ]] && end_prompt="设置外部跳跃末尾端口 [当前: ${old_end}, 回车不修改]"
+      read -rp "${end_prompt}: " endport
+      endport=${endport:-$old_end}
+
+      if is_valid_port "$firstport" && is_valid_port "$endport" && [[ $firstport -lt $endport ]]; then 
+        break
+      else 
+        error "输入无效！起始端口必须小于末尾端口，且范围在 1-65535 之间，请重新输入。"; 
+      fi
+    done
+    echo "$firstport-$endport" > "${CONFIG_DIR}/hopping.txt"
+  else
+    # 用户明确选择了 1 (单端口模式)，清除记录文件
+    rm -f "${CONFIG_DIR}/hopping.txt" "${CONFIG_DIR}/main_port.txt"
+    info "已成功切换回单端口纯净模式"
+    if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
+    if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
+  fi
 }
 
-# ================== 获取 PublicKey ==================
-get_public_key() {
-    [[ -f "$XRAY_PUBLIC_KEY_FILE" ]] && cat "$XRAY_PUBLIC_KEY_FILE"
-}
+write_and_show_config() {
+  local HOSTNAME
+  HOSTNAME=$(hostname -s | sed 's/ /_/g')
+  local vps_ip
+  vps_ip=$(get_public_ip)
+  local last_ip="$vps_ip"
+  [[ "$vps_ip" =~ ":" ]] && last_ip="[$vps_ip]"
 
-# ================== 写配置 ==================
-write_config() {
-    local port="$1"
-    local uuid="$2"
-    local domain="$3"
-    local private_key="$4"
-    local shortid="$5"
+  local is_insecure="0"
+  local skip_cert="false"
+  if [[ "$hy2_domain" == "www.bing.com" ]]; then
+    is_insecure="1"
+    skip_cert="true"
+  fi
 
-    local listen_ip
-    listen_ip=$(get_listen_ip)
-
-    mkdir -p "$(dirname "$XRAY_CONFIG")"
-
-    cat > "$XRAY_CONFIG" <<EOF
+  # 生成 sing-box 格式的 Hysteria 2 配置文件
+  cat << EOF > "$HY2_CONFIG"
 {
   "log": {
-    "loglevel": "warning"
+    "level": "info",
+    "output": "$LOG_FILE",
+    "timestamp": true
   },
   "inbounds": [
     {
-      "listen": "${listen_ip}",
-      "port": ${port},
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          {
-            "id": "${uuid}",
-            "flow": "xtls-rprx-vision"
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "${domain}:443",
-          "xver": 0,
-          "serverNames": [
-            "${domain}"
-          ],
-          "privateKey": "${private_key}",
-          "shortIds": [
-            "${shortid}"
-          ]
+      "type": "hysteria2",
+      "tag": "hy2-in",
+      "listen": "::",
+      "listen_port": $port,
+      "users": [
+        {
+          "password": "$auth_pwd"
         }
-      },
-      "sniffing": {
+      ],
+      "ignore_client_bandwidth": true,
+      "tls": {
         "enabled": true,
-        "destOverride": [
-          "http",
-          "tls",
-          "quic"
-        ]
+        "server_name": "$hy2_domain",
+        "certificate_path": "$cert_path",
+        "key_path": "$key_path"
       }
     }
   ],
   "outbounds": [
     {
-      "protocol": "freedom",
-      "settings": {
-        "domainStrategy": "UseIPv4v6"
-      }
+      "type": "direct",
+      "tag": "direct"
     }
-  ]
+  ],
+  "route": {
+    "final": "direct"
+  }
 }
 EOF
-}
 
-# ================== 生成订阅 ==================
-generate_link() {
-    local ip
-    if ! ip=$(get_public_ip); then
-        error "获取公网 IP 失败"
-        return 1
-    fi
+  chmod 640 "$HY2_CONFIG"
+  chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
 
-    local uuid port domain shortid public_key
-    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null || echo "error")
-    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "443")
-    domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG" 2>/dev/null || echo "www.amazon.com")
-    shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG" 2>/dev/null || echo "null")
-    public_key=$(get_public_key)
+  apply_new_iptables
+  mkdir -p "$HY2_DIR"
+  
+  local final_port="$port"
+  if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
+    final_port=$(cat "${CONFIG_DIR}/hopping.txt")
+  fi
 
-    local display_ip="$ip"
-    [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
+  # 生成标准的 hysteria2:// 统一分享节点链
+  cat << EOF > "$HY2_DIR/url.txt"
+V6VPS 请自行替换 IP 地址为 V6
+V2rayN 链接:
+hysteria2://$auth_pwd@$last_ip:$port?sni=$hy2_domain&insecure=${is_insecure}#$HOSTNAME-hy2
 
-    local hostname
-    hostname=$(hostname -s 2>/dev/null | tr ' ' '_')
-    [[ -z "$hostname" ]] && hostname="Xray"
-
-    cat > /root/xray_vless_reality.txt <<EOF
-vless://${uuid}@${display_ip}:${port}?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=${domain}&fp=chrome&pbk=${public_key}&sid=${shortid}&spx=%2F#${hostname}-VLESS-Reality
+Surge 配置:
+$HOSTNAME-hy2 = hysteria2, $last_ip, $port, password=$auth_pwd, skip-cert-verify=true, sni=$hy2_domain
 EOF
+
+  rc-service sing-box-hy2 restart
+  if rc-service sing-box-hy2 status | grep -q "started"; then
+    info "sing-box Hysteria 2 服务配置并启动成功！"
+  else
+    error "sing-box-hy2 启动失败，可在菜单中按 8 查看详细的闪退日志。"
+  fi
+  showconf
 }
 
-# ================== 显示配置 ==================
-show_current_config() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then
-        error "配置文件不存在"
-        return
-    fi
+# =========================================================
+# 6. 安装、更新与卸载核心流控
+# =========================================================
+write_openrc_script() {
+  cat << 'EOF' > "$OPENRC_SERVICE_PATH"
+#!/sbin/openrc-run
 
-    local ip uuid port domain shortid public_key outbound_mode
-    ip=$(get_public_ip || echo "未知")
-    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
-    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
-    domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
-    shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
-    public_key=$(get_public_key)
-    
-    local current_protocol
-    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$XRAY_CONFIG" 2>/dev/null || echo "freedom")
-    if [[ "$current_protocol" == "socks" ]]; then
-        outbound_mode="Socks5 链式代理"
-    else
-        outbound_mode="直连 (Freedom)"
-    fi
+name="sing-box-hy2"
+description="sing-box Hysteria 2 OpenRC Isolated Service"
+cfgfile="/etc/sing-box-hy2/config.json"
+logfile="/var/log/sing-box-hy2.log"
+command="/usr/local/bin/sing-box-hy2"
+command_args="run -c /etc/sing-box-hy2/config.json"
 
-    echo -e "${GREEN}====== 当前配置 ======${RESET}"
-    echo -e "${YELLOW}IP地址      : ${ip}${RESET}"
-    echo -e "${YELLOW}端口        : ${port}${RESET}"
-    echo -e "${YELLOW}UUID        : ${uuid}${RESET}"
-    echo -e "${YELLOW}SNI         : ${domain}${RESET}"
-    echo -e "${YELLOW}PublicKey   : ${public_key}${RESET}"
-    echo -e "${YELLOW}ShortID     : ${shortid}${RESET}"
-    echo -e "${YELLOW}出口模式    : ${outbound_mode}${RESET}"
-    echo -e "${YELLOW}📄 V6VPS 请自行替换分享链接中的 IP 地址为 V6 ★${RESET}"
-    echo
-
-    if [[ -f /root/xray_vless_reality.txt ]]; then
-        echo -e "${GREEN}====== 👉 分享链接 ======${RESET}"
-        cat /root/xray_vless_reality.txt
-    fi
+depend() {
+    need net
+    after iptables ip6tables firewall
 }
 
-# ================== 配置 Xray ==================
-configure_xray() {
-    info "开始配置 Reality 节点..."
-    local port uuid domain short_id
-
-    while true; do
-        read -rp "请输入端口 (直接回车随机分配端口): " input_port
-        if [[ -z "$input_port" ]]; then
-            port=$(get_random_port)
-            info "已为您随机分配未被占用端口: $port"
-            break
-        elif is_valid_port "$input_port"; then
-            if ! check_port "$input_port"; then
-                error "端口 ${input_port} 已被占用，请重新输入。"
-                continue
-            fi
-            port="$input_port"
-            break
-        else
-            error "端口无效"
-        fi
-    done
-
-    while true; do
-        read -rp "请输入UUID (默认:自动生成): " input_uuid
-        if [[ -z "${input_uuid:-}" ]]; then
-            uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "7415d2b8-1454-4da8-963b-4663e8322851")
-            break
-        elif is_valid_uuid "$input_uuid"; then
-            uuid="$input_uuid"
-            break
-        else
-            error "UUID 格式无效"
-        fi
-    done
-
-    while true; do
-        read -rp "请输入SNI域名 (默认:www.amazon.com): " input_domain
-        domain=${input_domain:-www.amazon.com}
-        if is_valid_domain "$domain"; then
-            break
-        else
-            error "域名格式无效"
-        fi
-    done
-
-    while true; do
-        read -rp "请输入自定义 ShortID (直接回车自动生成 8 位字符): " input_shortid
-        if [[ -z "$input_shortid" ]]; then
-            short_id=$(openssl rand -hex 4)
-            break
-        elif is_valid_shortid "$input_shortid"; then
-            short_id="$input_shortid"
-            break
-        else
-            error "ShortID 无效！必须为偶数位（最长16位）的十六进制字符（0-9, a-f）。"
-        fi
-    done
-
-    mkdir -p "/usr/local/etc/${SERVICE_NAME}"
-
-    local keys private_key
-    keys=$(generate_reality_keys) || return 1
-    private_key=$(echo "$keys" | cut -d '|' -f1)
-
-    write_config "$port" "$uuid" "$domain" "$private_key" "$short_id"
-    test_config || return 1
-    generate_link
-    restart_xray
-    show_current_config
-}
-
-# ================== 配置自定义Socks5出口 ==================
-configure_custom_socks5_outbound() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then 
-        error "错误: 未安装，无法配置出口模式。"
-        return
-    fi
-
-    local mode current_protocol tmp_file
-    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$XRAY_CONFIG" 2>/dev/null || echo "freedom")
-
-    echo "---------------------------------------------"
-    echo "请选择出口模式："
-    if [[ "$current_protocol" == "socks" ]]; then
-        echo -e "当前模式: ${YELLOW}Socks5${RESET}"
-    else
-        echo -e "当前模式: ${GREEN}直连${RESET}"
-    fi
-    echo "1) 直连出口"
-    echo "2) Socks5 出口"
-    echo "0) 取消"
-    echo "---------------------------------------------"
-
-    read -rp "请输入选项 [0-2]: " mode || true
-    case "$mode" in
-        1)
-            tmp_file=$(mktemp)
-            jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$XRAY_CONFIG" > "$tmp_file"
-            if ! jq empty "$tmp_file" >/dev/null 2>&1; then
-                rm -f "$tmp_file"
-                error "生成的直连配置无效。"
-                return 1
-            fi
-            cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
-            mv "$tmp_file" "$XRAY_CONFIG"
-            chmod 644 "$XRAY_CONFIG" 2>/dev/null || true
-            if ! restart_xray; then
-                error "切换到直连失败。"
-                return 1
-            fi
-            info "已成功切换为直连出口！"
-            return
-            ;;
-        2)
-            ;;
-        0|"")
-            info "已取消配置。"
-            return
-            ;;
-        *)
-            error "无效选项，请输入 0-2 之间的数字。"
-            return 1
-            ;;
-    esac
-
-    info "配置自定义 Socks5 出口代理..."
-
-    local socks_host socks_port socks_user socks_pass
-
-    read -rp "请输入 Socks5 服务器地址/IP: " socks_host || true
-    [[ -z "$socks_host" ]] && info "已取消配置。" && return
-
-    while true; do
-        read -rp "请输入 Socks5 端口 (默认: 1080): " socks_port || true
-        [[ -z "$socks_port" ]] && socks_port=1080
-        if is_valid_port "$socks_port"; then
-            break
-        else
-            error "端口无效，请输入一个1-65535之间的数字。"
-        fi
-    done
-
-    read -rp "请输入 Socks5 用户名 (若无密码认证请直接留空回车): " socks_user || true
-    if [[ -n "$socks_user" ]]; then
-        read -rs -p "请输入 Socks5 密码: " socks_pass || true
-        echo
-    else
-        socks_pass=""
-    fi
-
-    tmp_file=$(mktemp)
-
-    if [[ -n "$socks_user" ]]; then
-        jq \
-            --arg host "$socks_host" \
-            --argjson port "$socks_port" \
-            --arg user "$socks_user" \
-            --arg pass "$socks_pass" \
-            '
-            .outbounds = [
-              {
-                "protocol": "socks",
-                "tag": "custom-socks5-out",
-                "settings": {
-                  "servers": [
-                    {
-                      "address": $host,
-                      "port": $port,
-                      "users": [
-                        {
-                          "user": $user,
-                          "pass": $pass
-                        }
-                      ]
-                    }
-                  ]
-                }
-              }
-            ]
-            ' "$XRAY_CONFIG" > "$tmp_file"
-    else
-        jq \
-            --arg host "$socks_host" \
-            --argjson port "$socks_port" \
-            '
-            .outbounds = [
-              {
-                "protocol": "socks",
-                "tag": "custom-socks5-out",
-                "settings": {
-                  "servers": [
-                    {
-                      "address": $host,
-                      "port": $port
-                    }
-                  ]
-                }
-              }
-            ]
-            ' "$XRAY_CONFIG" > "$tmp_file"
-    fi
-
-    if ! jq empty "$tmp_file" >/dev/null 2>&1; then
-        rm -f "$tmp_file"
-        error "生成的 Socks5 配置无效，请检查输入后重试。"
-        return 1
-    fi
-
-    cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
-    mv "$tmp_file" "$XRAY_CONFIG"
-    chmod 644 "$XRAY_CONFIG" 2>/dev/null || true
-
-    if ! restart_xray; then
-        error "重启服务失败，当前配置可能与 system 境不兼容。"
-        return 1
-    fi
-    info "已成功切换为 Socks5 出口！"
-}
-
-# ================== 安装 ==================
-install_xray() {
-    info "开始解压安装 Xray..."
-    download_and_extract_xray || return 1
-    setup_systemd_service
-    configure_xray
-    info "安装完成并已成功启动服务: ${SERVICE_NAME}"
-}
-
-# ================== 更新 ==================
-update_xray() {
-    info "开始更新 Xray 程序..."
-    
-    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
-        info "检测到服务正在运行，正在停止服务以进行更新..."
-        systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
-    fi
-
-    info "开始拉取最新 Xray 二进制文件..."
-    if ! download_and_extract_xray; then
-        error "下载或安装新版本失败，尝试重新启动原服务..."
-        restart_xray
+start_pre() {
+    if [ ! -f "$cfgfile" ]; then
+        eerror "Configuration file $cfgfile missing!"
         return 1
     fi
     
-    if restart_xray; then
-        info "最新版更新并启动成功！当前版本: $(get_xray_version)"
+    touch "$logfile"
+    chown singbox-hy2:singbox-hy2 "$logfile"
+    chmod 644 "$logfile"
+    
+    command_background="yes"
+    pidfile="/run/${RC_SVCNAME}.pid"
+    
+    output_log="$logfile"
+    error_log="$logfile"
+    
+    local port
+    port=$(jq -r '.inbounds[0].listen_port // 0' "$cfgfile" 2>/dev/null)
+    if [ "$port" -lt 1024 ] && [ "$port" -ne 0 ]; then
+        command_user="root:root"
     else
-        error "更新后服务启动失败，请查看日志。"
-        return 1
+        command_user="singbox-hy2:singbox-hy2"
     fi
 }
+EOF
+  chmod +x "$OPENRC_SERVICE_PATH"
+  rc-update add sing-box-hy2 default >/dev/null 2>&1 || true
+}
 
-# ================== 修改配置 ==================
-modify_config() {
-    if [[ ! -f "$XRAY_CONFIG" ]]; then
-        error "配置文件不存在"
-        return 1
+download_core() {
+  local arch url
+  arch=$(detect_arch)
+  get_latest_version
+  
+  cd "$TMP_DIR" || return 1
+  local _download_success=1
+
+  # 遍历代理列表尝试下载
+  for proxy in "${GITHUB_PROXY[@]}"; do
+    url=$(printf '%shttps://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz' "$proxy" "$SINGBOX_VERSION" "$SINGBOX_VERSION" "$arch")
+    
+    info "正在通过 [${proxy:-直连}] 下载官方核心 sing-box v$SINGBOX_VERSION..."
+    
+    # 尝试使用 wget 下载
+    if wget -O sing-box.tar.gz -q --timeout=10 "$url"; then
+      _download_success=0
+      break
+    # 如果 wget 失败，尝试用 curl 下载
+    elif curl -fsSL --connect-timeout 10 -o sing-box.tar.gz "$url"; then
+      _download_success=0
+      break
     fi
+    
+    warn "当前代理下载失败，尝试下一个..."
+  done
 
-    local old_port old_uuid old_domain private_key old_shortid
-    old_port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "443")
-    old_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null || echo "")
-    old_domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG" 2>/dev/null || echo "")
-    private_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$XRAY_CONFIG" 2>/dev/null || echo "")
-    old_shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG" 2>/dev/null || echo "")
-
-    [[ "$old_shortid" == "null" || -z "$old_shortid" ]] && old_shortid=$(openssl rand -hex 4)
-
-    local port uuid domain shortid
-
-    while true; do
-        read -rp "请输入新端口 [当前:${old_port}, 回车不修改]: " input_port
-        
-        if [[ -z "$input_port" ]]; then
-            port="$old_port"
-            break
-        elif [[ "${input_port,,}" == "rand" ]]; then
-            port=$(get_random_port)
-            info "已为您重分配随机端口: $port"
-            break
-        elif is_valid_port "$input_port"; then
-            if [[ "$input_port" != "$old_port" ]]; then
-                if ! check_port "$input_port"; then
-                    error "端口 ${input_port} 已被占用，请更换。"
-                    continue
-                fi
-            fi
-            port="$input_port"
-            break
-        else
-            error "端口无效，请输入 1-65535 之间的数字。"
-        fi
-    done
-
-    while true; do
-        read -rp "请输入UUID [当前:${old_uuid}]: " input_uuid
-        uuid=${input_uuid:-$old_uuid}
-        if is_valid_uuid "$uuid"; then
-            break
-        else
-            error "UUID 格式无效"
-        fi
-    done
-
-    while true; do
-        read -rp "请输入SNI域名 [当前:${old_domain}]: " input_domain
-        domain=${input_domain:-$old_domain}
-        if is_valid_domain "$domain"; then
-            break
-        else
-            error "域名格式无效"
-        fi
-    done
-
-    while true; do
-        read -rp "请输入ShortID [当前:${old_shortid}, 回车不修改]: " input_shortid
-        shortid=${input_shortid:-$old_shortid}
-        if is_valid_shortid "$shortid"; then
-            break
-        else
-            error "ShortID 无效！必须为偶数位（最长16位）的十六进制字符（0-9, a-f）。"
-        fi
-    done
-
-    cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
-
-    write_config "$port" "$uuid" "$domain" "$private_key" "$shortid"
-    test_config || return 1
-    generate_link
-    restart_xray
-    info "配置修改成功"
+  # 检查最终是否下载成功
+  if [[ $_download_success -ne 0 ]]; then
+    error "下载核心文件失败：所有代理及直连均不可用"
+    return 1
+  fi
+  
+  # 解压与安装逻辑保持不变
+  tar -xzf sing-box.tar.gz -C "$TMP_DIR"
+  local extracted
+  extracted=$(find "$TMP_DIR" -type f -name sing-box | head -n 1)
+  [[ -n "$extracted" ]] || { error "解压目标核心错误"; return 1; }
+  
+  rc-service sing-box-hy2 stop >/dev/null 2>&1 || true
+  install -m 755 "$extracted" "$BINARY_PATH"
+  info "sing-box-hy2 核心释放完毕。"
+  return 0
 }
 
-# ================== 卸载 ==================
-uninstall_xray() {
-    warn "即将卸载 vlessreality 服务..."
+install_hy2() {
+  echo -e "${GREEN}[信息] 开始在 Alpine 下部署专属隔离的 sing-box Hysteria 2 ...${RESET}"
+  check_environment
+  mkdir -p "$CONFIG_DIR" "$HY2_DIR"
 
-    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
-    systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
-    
-    rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
-    systemctl daemon-reload
-    
-    rm -f "$XRAY_BINARY"
-    rm -rf "/usr/local/etc/${SERVICE_NAME}"
-    rm -rf "/usr/local/share/${SERVICE_NAME}"
-    rm -f /root/xray_vless_reality.txt
-    
-    info "服务已完全卸载并清理残留。"
+  if ! download_core; then return 1; fi
+
+  write_openrc_script
+
+  inst_cert || return 1
+  inst_port
+  
+  read -rp "设置 Hysteria 2 验证密码 (回车自动分配随机高强密码): " auth_pwd
+  auth_pwd=${auth_pwd:-$(generate_random_password)}
+
+  write_and_show_config
 }
 
-# ================== SNI 优选 ==================
-select_best_sni() {
-    info "开始优选 SNI 延迟测试"
-
-    local SNIS=(
-        amd.com apps.mzstatic.com aws.com azure.microsoft.com beacon.gtv-pub.com
-        bing.com catalog.gamepass.com cdn.bizibly.com cdn-dynmedia-1.microsoft.com
-        devblogs.microsoft.com fpinit.itunes.apple.com go.microsoft.com
-        gray-config-prod.api.arc-cdn.net gray.video-player.arcpublishing.com
-        images.nvidia.com r.bing.com services.digitaleast.mobi snap.licdn.com
-        statici.icloud.com tag.demandbase.com tag-logger.demandbase.com
-        ts1.tc.mm.bing.net ts2.tc.mm.bing.net vs.aws.amazon.com www.apple.com
-        www.icloud.com www.microsoft.com www.oracle.com www.xbox.com
-        www.xilinx.com xp.apple.com
-    )
-
-    local BEST_SNI=""
-    local BEST_TIME=999999
-
-    for sni in "${SNIS[@]}"; do
-        local start
-        start=$(date +%s%N)
-
-        if timeout 3 openssl s_client -connect "${sni}:443" -servername "${sni}" -brief </dev/null >/dev/null 2>&1; then
-            local end cost
-            end=$(date +%s%N)
-            cost=$(( (end - start) / 1000000 ))
-
-            echo "[SNI] $sni -> ${cost}ms"
-
-            if [ $cost -lt $BEST_TIME ]; then
-                BEST_TIME=$cost
-                BEST_SNI=$sni
-            fi
-        fi
-    done
-
-    if [ -n "$BEST_SNI" ]; then
-        info "最优 SNI: $BEST_SNI (${BEST_TIME}ms)"
-        echo "$BEST_SNI"
-        return 0
-    else
-        warn "未找到可用 SNI"
-        return 1
-    fi
+update_hy2() {
+  if [[ ! -f "$BINARY_PATH" ]]; then
+    error "当前系统未检测到核心，无法执行覆盖升级。"
+    return 1
+  fi
+  info "检测到已有环境，正在执行纯净原地覆盖核心升级..."
+  if download_core; then
+    rc-service sing-box-hy2 start
+    info "sing-box-hy2 核心纯净升级覆盖成功，服务已安全启动！"
+  else
+    error "核心升级遭遇未预期中断。"
+  fi
 }
 
-# ================== 菜单 ==================
-show_menu() {
+unsthy2() {
+  warn "即将执行全面清洁卸载..."
+  
+  # 优先清理防火墙链，避免文件先删掉导致清理不到
+  clear_old_iptables
+  if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
+  if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
+
+  rc-service sing-box-hy2 stop || true
+  rc-update del sing-box-hy2 default >/dev/null 2>&1 || true
+  
+  rm -f "$BINARY_PATH" "$OPENRC_SERVICE_PATH" "$LOG_FILE"
+  rm -rf "$CONFIG_DIR" "$HY2_DIR"
+  
+  info "Hysteria 2 专属服务、节点配置及防火墙跳跃链条已彻底清除！"
+}
+
+changeconf() {
+  if [[ ! -f "$HY2_CONFIG" ]]; then
+    error "配置文件不存在，请先选择选项 1 安装"
+    return 1
+  fi
+
+  local old_pwd old_cert old_key old_sni
+  old_pwd=$(jq -r '.inbounds[0].users[0].password // empty' "$HY2_CONFIG")
+  old_cert=$(jq -r '.inbounds[0].tls.certificate_path // empty' "$HY2_CONFIG")
+  old_key=$(jq -r '.inbounds[0].tls.key_path // empty' "$HY2_CONFIG")
+  old_sni=$(jq -r '.inbounds[0].tls.server_name // "www.bing.com"' "$HY2_CONFIG")
+
+  clear
+  echo -e "${GREEN}====== 修改 sing-box Hysteria 2 配置 ======${RESET}"
+  echo "提示：直接敲回车将保持原有配置不变"
+  echo "---------------------------------------------"
+  
+  inst_port 
+
+  local auth_pwd
+  read -rp "设置 Hysteria 2 验证密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
+  auth_pwd=${auth_pwd:-$old_pwd}
+
+  local cert_path key_path hy2_domain
+  echo "---------------------------------------------"
+  read -rp "是否需要修改证书？[y/N] (直接回车默认不修改): " change_cert_flag
+  if [[ "$change_cert_flag" == "y" || "$change_cert_flag" == "Y" ]]; then
+    inst_cert || return 1
+  else
+    cert_path="$old_cert"
+    key_path="$old_key"
+    hy2_domain="$old_sni"
+  fi
+
+  write_and_show_config
+  info "配置与转发链条刷新修改成功！"
+}
+
+showconf() {
+  if [[ ! -d "$HY2_DIR" ]]; then
+    error "未找到分享配置文件。"
+    return
+  fi
+  echo -e "${GREEN}====== Hysteria 2 节点分享与配置信息 ======${RESET}"
+  cat "$HY2_DIR/url.txt"
+  echo
+}
+
+# =========================================================
+# 7. 面板交互菜单 
+# =========================================================
+menu() {
+  while true; do
     clear
-    local status version port_show
-    status=$(get_xray_status)
-    version=$(get_xray_version)
-    port_show="-"
-
-    if [[ -f "$XRAY_CONFIG" ]]; then
-        port_show=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "-")
+    local raw_status
+    raw_status=$(get_hy2_status)
+    local status=""
+    if [[ "$raw_status" == "RUNNING" ]]; then
+      status="${YELLOW}● 运行中${RESET}"
+    else
+      status="${RED}● 未运行${RESET}"
     fi
 
+    local version
+    version=$(get_installed_version)
+    local port_show
+    port_show=$(get_current_port_display)
+
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      VLESS-Reality 面板       ${RESET}"
+    echo -e "${GREEN}     Sing-box Hysteria2 面板    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $status"
+    echo -e "${GREEN}状态   :${RESET} ${status}"
     echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 VLESS-Reality${RESET}"
-    echo -e "${GREEN} 2. 更新 VLESS-Reality${RESET}"
-    echo -e "${GREEN} 3. 卸载 VLESS-Reality${RESET}"
-    echo -e "${GREEN} 4. 修改配置${RESET}"
-    echo -e "${GREEN} 5. 启动 VLESS-Reality${RESET}"
-    echo -e "${GREEN} 6. 停止 VLESS-Reality${RESET}"
-    echo -e "${GREEN} 7. 重启 VLESS-Reality${RESET}"
-    echo -e "${GREEN} 8. 查看服务日志${RESET}"
-    echo -e "${GREEN} 9. 查看节点配置${RESET}"
-    echo -e "${GREEN}10. 配置Socks5出口${RESET}"
-    echo -e "${GREEN}11. SNI域名优选✨${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}1. 安装 Sing-box Hysteria2${RESET}"
+    echo -e "${GREEN}2. 更新 Sing-box${RESET}"
+    echo -e "${GREEN}3. 卸载 Sing-box${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 Sing-box${RESET}"
+    echo -e "${GREEN}6. 停止 Sing-box${RESET}"
+    echo -e "${GREEN}7. 重启 Sing-box${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
+
+    local choice=""
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+    [[ -z "$choice" ]] && continue
+
+    case "$choice" in
+      1) install_hy2; pause ;;
+      2) update_hy2; pause ;;
+      3) unsthy2; pause ;;
+      4) changeconf; pause ;;
+      5) rc-service sing-box-hy2 start && info "服务已成功启动！"; pause ;;
+      6) rc-service sing-box-hy2 stop && info "服务已成功停止！"; pause ;;
+      7) rc-service sing-box-hy2 restart && info "服务已成功重启！"; pause ;;
+      8) if [[ -f "$LOG_FILE" ]]; then tail -n 50 "$LOG_FILE"; else warn "未发现运行日志文件。"; fi; pause ;;
+      9) showconf; pause ;;
+      0) exit 0 ;;
+      *) error "无效输入，请重新选择。"; sleep 1 ;;
+    esac
+  done
 }
 
-# ================== 安装依赖 ==================
-install_dependencies() {
-    if command -v apt &>/dev/null; then
-        apt update && apt install -y jq curl wget openssl ca-certificates iproute2 coreutils unzip || true
-    elif command -v dnf &>/dev/null; then
-        dnf install -y jq curl wget openssl ca-certificates iproute2 coreutils unzip
-    elif command -v yum &>/dev/null; then
-        yum install -y jq curl wget openssl ca-certificates iproute2 coreutils unzip
-    else
-        error "未知的包管理器，请手动安装所需的依赖: jq, curl, wget, openssl, unzip"
-        exit 1
-    fi
-}
+if [[ ${EUID} -ne 0 ]]; then
+  error "请切换至 root 用户运行此面板脚本。"
+  exit 1
+fi
 
-# ================== 依赖检查 ==================
-pre_check() {
-    if [[ $(id -u) -ne 0 ]]; then
-        error "请使用 root 用户运行"
-        exit 1
-    fi
-
-    local deps=(jq curl wget openssl ss timeout unzip)
-    local missing=0
-
-    for cmd in "${deps[@]}"; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            missing=1
-            break
-        fi
-    done
-
-    if [[ "$missing" -eq 1 ]]; then
-        info "检测到缺失依赖，正在安装..."
-        install_dependencies
-    fi
-}
-
-# ================== 主循环 ==================
-main() {
-    pre_check
-
-    while true; do
-        show_menu
-        
-        local choice=""
-        read -r -p $'\033[32m请输入选项: \033[0m' choice || true
-        
-        [[ -z "$choice" ]] && continue
-
-        case "$choice" in
-            1) install_xray; pause ;;
-            2) update_xray; pause ;;
-            3) uninstall_xray; pause ;;
-            4) modify_config; pause ;;
-            5) systemctl start "${SERVICE_NAME}" &>/dev/null || true; restart_xray; pause ;;
-            6) systemctl stop "${SERVICE_NAME}" &>/dev/null || true; info "服务已停止"; pause ;;
-            7) restart_xray; pause ;;
-            8) journalctl -u "${SERVICE_NAME}" -e --no-pager || true; pause ;;
-            9) show_current_config; pause ;;
-            10) configure_custom_socks5_outbound; pause ;;
-            11) select_best_sni; pause ;;
-            0) exit 0 ;;
-            *) error "无效输入"; pause ;;
-        esac
-    done
-}
-
-main "$@"
+menu "$@"

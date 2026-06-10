@@ -1,799 +1,616 @@
-#!/usr/bin/env bash
-#
-# sing-box Hysteria 2 [Alpine专属]
-# SPDX-License-Identifier: MIT
-#
-set -Eop pipefail
-export LANG=en_US.UTF-8
+#!/bin/bash
+# ========================================
+# Rclone 管理脚本 
+# ========================================
 
-# =========================================================
-# 1. 核心控制与全局环境初始化
-# =========================================================
-readonly BINARY_PATH="/usr/local/bin/sing-box-hy2"
-readonly HY2_CONFIG="/etc/sing-box-hy2/config.json"
-readonly HY2_DIR="/root/proxynode/hy2"
-CONFIG_DIR="/etc/sing-box-hy2"
-OPENRC_SERVICE_PATH="/etc/init.d/sing-box-hy2"
-LOG_FILE="/var/log/sing-box-hy2.log"
-RUN_USER="singbox-hy2"
-
-# 修复：补充 GitHub API 全局变量
-API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
-
-TMP_DIR=$(mktemp -d -t sb-hy2.XXXXXX)
-
-# 颜色标准规范
+# ================== 颜色 ==================
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
-BLUE="\033[34m"
+RED="\033[31m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-# GITHUB 代理列表
-GITHUB_PROXY=(
-    ''
-    'https://v6.gh-proxy.org/'
-    'https://gh-proxy.com/'
-    'https://hub.glowp.xyz/'
-    'https://proxy.vvvv.ee/'
-    'https://ghproxy.lvedong.eu.org/'
-)
-
-info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
-error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
-pause() { echo; read -n 1 -s -r -p "$(echo -e ${GREEN}"按任意键返回菜单..."${RESET})" || true; echo; }
-
-cleanup() {
-    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
-}
-trap cleanup EXIT INT TERM
-
-generate_random_password() {
-    dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
-}
-
-is_alpine() {
-    [[ -f /etc/alpine-release ]]
-}
-
-install_packages() {
-    info "正在刷新 Alpine 仓库并安装核心依赖..."
-    apk update
-    apk add --no-cache bash curl wget tar openssl openrc iproute2 jq grep sed coreutils bind-tools iptables ip6tables gcompat socat python3
-    
-    if [[ -f /etc/init.d/iptables ]]; then
-        rc-update add iptables default >/dev/null 2>&1 || true
-        rc-service iptables start >/dev/null 2>&1 || true
-    fi
-    if [[ -f /etc/init.d/ip6tables ]]; then
-        rc-update add ip6tables default >/dev/null 2>&1 || true
-        rc-service ip6tables start >/dev/null 2>&1 || true
-    fi
-}
-
-create_user() {
-    getent group "$RUN_USER" &>/dev/null || addgroup -S "$RUN_USER"
-    id "$RUN_USER" &>/dev/null || adduser -S -D -H -G "$RUN_USER" -s /sbin/nologin "$RUN_USER"
-}
-
-detect_arch() {
-    case "$(uname -m)" in
-        x86_64|amd64) echo "amd64" ;;
-        aarch64|arm64) echo "arm64" ;;
-        armv7l|armv7) echo "armv7" ;;
-        *) error "不支持当前架构: $(uname -m)"; exit 8 ;;
-    esac
-}
-
-check_environment() {
-    if ! is_alpine; then
-        error "本脚本仅支持 Alpine Linux 系统。"
-        exit 95
-    fi
-    install_packages
-    create_user
-}
-
-get_installed_version() {
-    if [[ -f "$BINARY_PATH" ]]; then
-        "$BINARY_PATH" version 2>/dev/null | head -n1 | awk '{print $3}' || echo "未知版本"
-    else
-        echo "未安装"
-    fi
-}
-
-get_latest_version() {
-    local _tmpfile
-    _tmpfile=$(mktemp)
-    local _success=1
-    local _tag_name=""
-
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local _url="${proxy}${API_BASE_URL}/releases/latest"
-
-        info "正在通过代理 [${proxy:-直连}] 获取最新版本..."
-
-        if wget -q --no-check-certificate -O "$_tmpfile" \
-            --header="Accept: application/vnd.github.v3+json" \
-            "$_url"; then
-
-            _tag_name=$(jq -r '.tag_name' "$_tmpfile" 2>/dev/null || echo "")
-            if [[ -n "$_tag_name" && "$_tag_name" != "null" ]]; then
-                _success=0
-                break
-            fi
-        fi
-    done
-
-    rm -f "$_tmpfile"
-
-    if [[ $_success -eq 0 ]]; then
-        echo "${_tag_name##*\/}"
-    else
-        echo ""
-    fi
-}
-
-clear_old_iptables() {
-    if [[ -f "${CONFIG_DIR}/hopping.txt" && -f "${CONFIG_DIR}/main_port.txt" ]]; then
-        local old_hop
-        old_hop=$(cat "${CONFIG_DIR}/hopping.txt")
-        local old_port
-        old_port=$(cat "${CONFIG_DIR}/main_port.txt")
-        local old_start="${old_hop%-*}"
-        local old_end="${old_hop#*-}"
-
-        if [[ -n "$old_start" && -n "$old_end" && -n "$old_port" ]]; then
-            info "正在清洁防火墙残留规则..."
-            iptables -t nat -D PREROUTING -p udp -m multiport --dports "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
-            ip6tables -t nat -D PREROUTING -p udp -m multiport --dports "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
-            iptables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
-            ip6tables -t nat -D PREROUTING -p udp --dport "$old_start:$old_end" -j REDIRECT --to-ports "$old_port" 2>/dev/null || true
-        fi
-    fi
-}
-
-apply_new_iptables() {
-    clear_old_iptables
-    if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
-        local hop_val
-        hop_val=$(cat "${CONFIG_DIR}/hopping.txt")
-        local start_p="${hop_val%-*}"
-        local end_p="${hop_val#*-}"
-        
-        info "正在应用 iptables 转发规则: UDP $start_p-$end_p => 主端口 $port"
-        if iptables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port"; then
-            ip6tables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
-        else
-            iptables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port"
-            ip6tables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
-        fi
-        
-        echo "$port" > "${CONFIG_DIR}/main_port.txt"
-        
-        if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
-        if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
-        info "防火墙端口跳跃规则已固化。"
-    fi
-}
-
-# =========================================================
-# 4. 网络诊断与配置管理辅助
-# =========================================================
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网IP"
-}
-
-check_port() {
-    local port="$1"
-    if ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
-        return 1
-    fi
-    return 0
-}
-
-is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
-
-get_random_port() {
-    local rand_port
-    while true; do
-        rand_port=$(shuf -i 2000-65535 -n 1)
-        if check_port "$rand_port"; then
-            echo "$rand_port" && return 0
-        fi
-    done
-}
-
-get_hy2_status() {
-    if rc-service sing-box-hy2 status 2>/dev/null | grep -q "started"; then
-        echo "RUNNING"
-    else
-        echo "STOPPED"
-    fi
-}
-
-get_current_port_display() {
-    if [[ -f "$HY2_CONFIG" ]]; then
-        local main_port jump_range="无"
-        main_port=$(jq -r '.inbounds[0].listen_port // empty' "$HY2_CONFIG" 2>/dev/null)
-        [[ -f "${CONFIG_DIR}/hopping.txt" ]] && jump_range=$(cat "${CONFIG_DIR}/hopping.txt")
-        
-        if [[ "$jump_range" != "无" ]]; then
-            echo "${main_port} [${jump_range}]"
-        else
-            echo "${main_port:- -}"
-        fi
-    else echo "-"; fi
-}
-
-# =========================================================
-# 5. 面板节点配置生成核心逻辑 (Hysteria 2)
-# =========================================================
-fix_external_cert_permission() {
-    local cert="$1"
-    local key="$2"
-    
-    if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
-        error "致命拒绝: 检测到您的证书位于 /root/ 目录下！"
-        warn "原因分析: /root 目录权限极为严苛(700)，任何非 root 用户(包括 singbox-hy2)均无权穿透。"
-        warn "         即使强行赋予文件 644 权限，内核也会因路径阻塞拒绝读取。"
-        info "权威推荐: 请在 acme.sh 命令中加上 --install-cert 指令，将证书自动分发到公共目录"
-        info "         (例如: /etc/sing-box-hy2/certs/ 或 /etc/ssl/ 文件夹下) 再试。"
-        return 1
-    fi
-
-    info "正在为外部证书路径逐级赋予检索穿透权限 (+x) ..."
-    local dir
-    for file in "$cert" "$key"; do
-        dir=$(dirname "$file")
-        while [[ "$dir" != "/" && -n "$dir" ]]; do
-            chmod o+x "$dir" 2>/dev/null || true
-            if command -v setfacl >/dev/null 2>&1; then
-                setfacl -m u:"$RUN_USER":rx "$dir" 2>/dev/null || true
-            fi
-            dir=$(dirname "$dir")
-        done
-    done
-    
-    info "正在规范化外部证书与私钥文件的读取权限 ..."
-    chmod 644 "$cert" 2>/dev/null || true
-    chmod 644 "$key" 2>/dev/null || true
-    
-    if command -v setfacl >/dev/null 2>&1; then
-        setfacl -m u:"$RUN_USER":r "$cert" "$key" 2>/dev/null || true
-    fi
-    return 0
-}
-
-inst_cert() {
-    mkdir -p "$CONFIG_DIR/certs"
-
-    echo "---------------------------------------------"
-    echo -e "Hysteria 2 协议证书申请方式如下："
-    echo -e " 1) 必应自签证书${YELLOW}（默认）${RESET} "
-    echo -e " 2) Acme自动申请(需放行80端口)"
-    echo -e " 3) 自定义证书路径"
-    echo "---------------------------------------------"
-    local certInput
-    read -rp "请输入选项 [1-3] (直接回车默认自签证书): " certInput
-    certInput=${certInput:-1}
-
-    cert_path="$CONFIG_DIR/certs/cert.pem"
-    key_path="$CONFIG_DIR/certs/key.pem"
-
-    if [[ $certInput == 2 ]]; then
-        if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
-            warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。"
-        fi
-
-        if [[ -f "$cert_path" && -f "$key_path" && -s "$cert_path" && -s "$key_path" && -f "$CONFIG_DIR/certs/ca.log" ]]; then
-            hy2_domain=$(cat "$CONFIG_DIR/certs/ca.log")
-            info "检测到已有域名 [${hy2_domain}] 的安全区证书，正在复用..."
-        else
-            read -rp "请输入需要申请证书的域名: " domain
-            [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
-            
-            info "正在检查并安装 Acme.sh 依赖..."
-            local acme_cmd="/root/.acme.sh/acme.sh"
-            if [[ ! -f "$acme_cmd" ]]; then
-                curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
-            fi
-            
-            "$acme_cmd" --set-default-ca --server letsencrypt
-            
-            info "正在向 Let's Encrypt 申请证书..."
-            if [[ "$(get_public_ip)" =~ ":" ]]; then
-                "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
-            else
-                "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
-            fi
-            
-            local reload_cmd="[ -f /etc/sing-box-hy2/config.json ] && /sbin/rc-service sing-box-hy2 restart || echo '[信息] 初次部署，跳过服务同步'"
-            
-            if "$acme_cmd" --install-cert -d "${domain}" \
-                --key-file "$key_path" \
-                --fullchain-file "$cert_path" \
-                --ecc \
-                --reloadcmd "$reload_cmd"; then
-                echo "$domain" > "$CONFIG_DIR/certs/ca.log"
-                hy2_domain=$domain
-                info "Acme 证书申请并成功分发！"
-            else
-                error "Acme 证书申请失败，自动切换回自签模式。"
-                certInput=1
-            fi
-        fi
-    elif [[ $certInput == 3 ]]; then
-        while true; do
-            local user_cert user_key
-            read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
-            read -rp "请输入密钥文件 (privkey.pem/key) 的路径: " user_key
-            read -rp "请输入证书对应的域名: " hy2_domain
-            
-            if [[ -f "$user_cert" && -f "$user_key" ]]; then
-                rm -f "$cert_path" "$key_path"
-                
-                if fix_external_cert_permission "$user_cert" "$user_key"; then
-                    ln -sf "$user_cert" "$cert_path"
-                    ln -sf "$user_key" "$key_path"
-                    info "自定义外部证书已通过安全软链接无缝同步。"
-                    break
-                else
-                    return 1
-                fi
-            else
-                error "找不到输入的证书文件，请重新确认路径。"
-                echo "---------------------------------------------"
-            fi
-        done
-    fi
-
-    if [[ $certInput == 1 ]]; then
-        info "将使用必应自签证书作为 Hysteria 2 外壳的节点证书"
-        rm -f "$cert_path" "$key_path"
-        openssl ecparam -genkey -name prime256v1 -out "$key_path"
-        openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
-        hy2_domain="www.bing.com"
-        
-        chmod 644 "$cert_path" || true
-        chmod 600 "$key_path" || true
-    fi
-
-    chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
-    chown -h ${RUN_USER}:${RUN_USER} "$cert_path" "$key_path" 2>/dev/null || true
-}
-
-inst_port() {
-    local default_port=""
-    if [[ -f "$HY2_CONFIG" ]]; then
-        default_port=$(jq -r '.inbounds[0].listen_port // empty' "$HY2_CONFIG" 2>/dev/null)
-    fi
-
-    local prompt_msg="设置 Hysteria 2 服务端监听主端口 [1-65535] (回车随机分配): "
-    [[ -n "$default_port" ]] && prompt_msg="设置 Hysteria 2 服务端监听主端口 [当前: ${default_port}, 回车不修改]: "
-
-    while true; do
-        read -rp "$prompt_msg" port
-        if [[ -z "$port" ]]; then
-            if [[ -n "$default_port" ]]; then port="$default_port" && break
-            else
-                port=$(get_random_port)
-                info "已为您随机分配未被占用端口: $port" && break
-            fi
-        elif is_valid_port "$port"; then
-            if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
-                error "端口 ${port} 已被其它程序占用，请更换。" && continue
-            fi
-            break
-        else error "请输入有效的端口数字 (1-65535)"; fi
-    done
-
-    local default_hop=""
-    if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
-        default_hop=$(cat "${CONFIG_DIR}/hopping.txt")
-    fi
-
-    echo "---------------------------------------------"
-    if [[ -n "$default_hop" ]]; then
-        echo -e "Hysteria 2 端口群使用模式 [当前已启用跳跃: ${default_hop}]："
-    else
-        echo -e "Hysteria 2 端口群使用模式 ："
-    fi
-    echo -e " 1) 单端口模式"
-    echo -e " 2) 端口跳跃模式 ${YELLOW}（默认)${RESET}"
-    echo "---------------------------------------------"
-    
-    local jumpInput
-    read -rp "请选择端口模式 [1-2] (直接回车默认不变或选择默认项): " jumpInput
-    
-    if [[ -z "$jumpInput" && -n "$default_hop" ]]; then
-        info "检测到回车确认，将 100% 保持原有端口跳跃配置 [${default_hop}] 保持不变。"
-        echo "$port" > "${CONFIG_DIR}/main_port.txt"
-        return 0
-    fi
-
-    jumpInput=${jumpInput:-2}
-    clear_old_iptables
-
-    if [[ $jumpInput == 2 ]]; then
-        local old_start="" old_end=""
-        if [[ -n "$default_hop" ]]; then
-            old_start="${default_hop%-*}"
-            old_end="${default_hop#*-}"
-        fi
-
-        while true; do
-            local start_prompt="设置外部跳跃起始端口 (建议10000-65535)"
-            [[ -n "$old_start" ]] && start_prompt="设置外部跳跃起始端口 [当前: ${old_start}, 回车不修改]"
-            read -rp "${start_prompt}: " firstport
-            firstport=${firstport:-$old_start}
-
-            local end_prompt="设置外部跳跃末尾端口 (必须大于起始端口)"
-            [[ -n "$old_end" ]] && end_prompt="设置外部跳跃末尾端口 [当前: ${old_end}, 回车不修改]"
-            read -rp "${end_prompt}: " endport
-            endport=${endport:-$old_end}
-
-            if is_valid_port "$firstport" && is_valid_port "$endport" && [[ $firstport -lt $endport ]]; then 
-                break
-            else 
-                error "输入无效！起始端口必须小于末尾端口，且范围在 1-65535 之间，请重新输入。"; 
-            fi
-        done
-        echo "$firstport-$endport" > "${CONFIG_DIR}/hopping.txt"
-    else
-        rm -f "${CONFIG_DIR}/hopping.txt" "${CONFIG_DIR}/main_port.txt"
-        info "已成功切换回单端口纯净模式"
-        if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
-        if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
-    fi
-}
-
-write_and_show_config() {
-    local HOSTNAME
-    HOSTNAME=$(hostname -s | sed 's/ /_/g')
-    local vps_ip
-    vps_ip=$(get_public_ip)
-    local last_ip="$vps_ip"
-    [[ "$vps_ip" =~ ":" ]] && last_ip="[$vps_ip]"
-
-    local is_insecure="0"
-    if [[ "$hy2_domain" == "www.bing.com" ]]; then
-        is_insecure="1"
-    fi
-
-    cat << EOF > "$HY2_CONFIG"
-{
-  "log": {
-    "level": "info",
-    "output": "$LOG_FILE",
-    "timestamp": true
-  },
-  "inbounds": [
-    {
-      "type": "hysteria2",
-      "tag": "hy2-in",
-      "listen": "::",
-      "listen_port": $port,
-      "users": [
-        {
-          "password": "$auth_pwd"
-        }
-      ],
-      "ignore_client_bandwidth": true,
-      "tls": {
-        "enabled": true,
-        "server_name": "$hy2_domain",
-        "certificate_path": "$cert_path",
-        "key_path": "$key_path"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ],
-  "route": {
-    "final": "direct"
-  }
-}
-EOF
-
-    chmod 640 "$HY2_CONFIG"
-    chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
-
-    apply_new_iptables
-    mkdir -p "$HY2_DIR"
-    
-    local final_port="$port"
-    if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
-        final_port=$(cat "${CONFIG_DIR}/hopping.txt")
-    fi
-
-    cat << EOF > "$HY2_DIR/url.txt"
-V6VPS 请自行替换 IP 地址为 V6
-V2rayN 链接:
-hysteria2://$auth_pwd@$last_ip:$port?sni=$hy2_domain&insecure=${is_insecure}#$HOSTNAME-hy2
-
-Surge 配置:
-$HOSTNAME-hy2 = hysteria2, $last_ip, $port, password=$auth_pwd, skip-cert-verify=true, sni=$hy2_domain
-EOF
-
-    rc-service sing-box-hy2 restart
-    if rc-service sing-box-hy2 status | grep -q "started"; then
-        info "sing-box Hysteria 2 服务配置并启动成功！"
-    else
-        error "sing-box-hy2 启动失败，可在菜单中按 8 查看详细的闪退日志。"
-    fi
-    showconf
-}
-
-# =========================================================
-# 6. 安装、更新与卸载核心流控
-# =========================================================
-write_openrc_script() {
-    cat << 'EOF' > "$OPENRC_SERVICE_PATH"
-#!/sbin/openrc-run
-
-name="sing-box-hy2"
-description="sing-box Hysteria 2 OpenRC Isolated Service"
-cfgfile="/etc/sing-box-hy2/config.json"
-logfile="/var/log/sing-box-hy2.log"
-command="/usr/local/bin/sing-box-hy2"
-command_args="run -c /etc/sing-box-hy2/config.json"
-
-depend() {
-    need net
-    after iptables ip6tables firewall
-}
-
-start_pre() {
-    if [ ! -f "$cfgfile" ]; then
-        eerror "Configuration file $cfgfile missing!"
-        return 1
-    fi
-    
-    touch "$logfile"
-    chown singbox-hy2:singbox-hy2 "$logfile"
-    chmod 644 "$logfile"
-    
-    command_background="yes"
-    pidfile="/run/${RC_SVCNAME}.pid"
-    
-    output_log="$logfile"
-    error_log="$logfile"
-    
-    local port
-    port=$(jq -r '.inbounds[0].listen_port // 0' "$cfgfile" 2>/dev/null)
-    if [ "$port" -lt 1024 ] && [ "$port" -ne 0 ]; then
-        command_user="root:root"
-    else
-        command_user="singbox-hy2:singbox-hy2"
-    fi
-}
-EOF
-    chmod +x "$OPENRC_SERVICE_PATH"
-    rc-update add sing-box-hy2 default >/dev/null 2>&1 || true
-}
-
-# 修复：重构核心下载和释放逻辑
-download_core() {
-    local _version
-    _version=$(get_latest_version)
-    if [[ -z "$_version" ]]; then
-        error "无法获取 sing-box 最新版本号。"
-        return 1
-    fi
-    info "获取到最新版本: $_version"
-
-    local _arch
-    _arch=$(detect_arch)
-    
-    # 拼接 sing-box 官方标准打包命名格式 (例如: sing-box-1.8.4-linux-amd64.tar.gz)
-    local package_name="sing-box-${_version#v}-linux-${_arch}"
-    local tar_file="${TMP_DIR}/sing-box.tar.gz"
-    local _download_success=1
-
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local _download_url="${proxy}https://github.com/SagerNet/sing-box/releases/download/${_version}/${package_name}.tar.gz"
-        info "正在通过代理 [${proxy:-直连}] 下载 sing-box 核心..."
-
-        if wget -q --show-progress --no-check-certificate -O "$tar_file" "$_download_url"; then
-            _download_success=0
-            break
-        fi
-    done
-
-    if [[ $_download_success -ne 0 ]]; then
-        error "核心下载失败！所有代理及直连均无法访问，请检查网络。"
-        return 11
-    fi
-
-    # 正确执行解压与移动
-    info "正在解压并部署核心二进制文件..."
-    tar -xzf "$tar_file" -C "$TMP_DIR"
-    local extracted
-    extracted=$(find "$TMP_DIR" -type f -name sing-box | head -n 1)
-    
-    [[ -n "$extracted" ]] || { error "解压目标核心错误，未找到 sing-box 执行文件"; return 1; }
-    
-    rc-service sing-box-hy2 stop >/dev/null 2>&1 || true
-    install -m 755 "$extracted" "$BINARY_PATH"
-    info "sing-box-hy2 核心释放完毕。"
-    return 0
-}
-
-install_hy2() {
-    echo -e "${GREEN}[信息] 开始在 Alpine 下部署专属隔离的 sing-box Hysteria 2 ...${RESET}"
-    check_environment
-    mkdir -p "$CONFIG_DIR" "$HY2_DIR"
-
-    if ! download_core; then return 1; fi
-
-    write_openrc_script
-
-    inst_cert || return 1
-    inst_port
-    
-    read -rp "设置 Hysteria 2 验证密码 (回车自动分配随机高强密码): " auth_pwd
-    auth_pwd=${auth_pwd:-$(generate_random_password)}
-
-    write_and_show_config
-}
-
-update_hy2() {
-    if [[ ! -f "$BINARY_PATH" ]]; then
-        error "当前系统未检测到核心，无法执行覆盖升级。"
-        return 1
-    fi
-    info "检测到已有环境，正在执行纯净原地覆盖核心升级..."
-    if download_core; then
-        rc-service sing-box-hy2 start
-        info "sing-box-hy2 核心纯净升级覆盖成功，服务已安全启动！"
-    else
-        error "核心升级遭遇未预期中断。"
-    fi
-}
-
-unsthy2() {
-    warn "即将执行全面清洁卸载..."
-    
-    clear_old_iptables
-    if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
-    if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
-
-    rc-service sing-box-hy2 stop || true
-    rc-update del sing-box-hy2 default >/dev/null 2>&1 || true
-    
-    rm -f "$BINARY_PATH" "$OPENRC_SERVICE_PATH" "$LOG_FILE"
-    rm -rf "$CONFIG_DIR" "$HY2_DIR"
-    
-    info "Hysteria 2 专属服务、节点配置及防火墙跳跃链条已彻底清除！"
-}
-
-changeconf() {
-    if [[ ! -f "$HY2_CONFIG" ]]; then
-        error "配置文件不存在，请先选择选项 1 安装"
-        return 1
-    fi
-
-    local old_pwd old_cert old_key old_sni
-    old_pwd=$(jq -r '.inbounds[0].users[0].password // empty' "$HY2_CONFIG")
-    old_cert=$(jq -r '.inbounds[0].tls.certificate_path // empty' "$HY2_CONFIG")
-    old_key=$(jq -r '.inbounds[0].tls.key_path // empty' "$HY2_CONFIG")
-    old_sni=$(jq -r '.inbounds[0].tls.server_name // "www.bing.com"' "$HY2_CONFIG")
-
-    clear
-    echo -e "${GREEN}====== 修改 sing-box Hysteria 2 配置 ======${RESET}"
-    echo "提示：直接敲回车将保持原有配置不变"
-    echo "---------------------------------------------"
-    
-    inst_port 
-
-    local auth_pwd
-    read -rp "设置 Hysteria 2 验证密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
-    auth_pwd=${auth_pwd:-$old_pwd}
-
-    local cert_path key_path hy2_domain
-    echo "---------------------------------------------"
-    read -rp "是否需要修改证书？[y/N] (直接回车默认不修改): " change_cert_flag
-    if [[ "$change_cert_flag" == "y" || "$change_cert_flag" == "Y" ]]; then
-        inst_cert || return 1
-    else
-        cert_path="$old_cert"
-        key_path="$old_key"
-        hy2_domain="$old_sni"
-    fi
-
-    write_and_show_config
-    info "配置与转发链条刷新修改成功！"
-}
-
-showconf() {
-    if [[ ! -d "$HY2_DIR" ]]; then
-        error "未找到分享配置文件。"
-        return
-    fi
-    echo -e "${GREEN}====== Hysteria 2 节点分享与配置信息 ======${RESET}"
-    cat "$HY2_DIR/url.txt"
-    echo
-}
-
-# =========================================================
-# 7. 面板交互菜单 
-# =========================================================
-menu() {
-    while true; do
-        clear
-        local raw_status
-        raw_status=$(get_hy2_status)
-        local status=""
-        if [[ "$raw_status" == "RUNNING" ]]; then
-            status="${YELLOW}● 运行中${RESET}"
-        else
-            status="${RED}● 未运行${RESET}"
-        end
-
-        local version
-        version=$(get_installed_version)
-        local port_show
-        port_show=$(get_current_port_display)
-
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}    Sing-box Hysteria2 面板     ${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}状态   :${RESET} ${status}"
-        echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-        echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}1. 安装 Sing-box Hysteria2${RESET}"
-        echo -e "${GREEN}2. 更新 Sing-box${RESET}"
-        echo -e "${GREEN}3. 卸载 Sing-box${RESET}"
-        echo -e "${GREEN}4. 修改配置${RESET}"
-        echo -e "${GREEN}5. 启动 Sing-box${RESET}"
-        echo -e "${GREEN}6. 停止 Sing-box${RESET}"
-        echo -e "${GREEN}7. 重启 Sing-box${RESET}"
-        echo -e "${GREEN}8. 查看日志${RESET}"
-        echo -e "${GREEN}9. 查看节点配置${RESET}"
-        echo -e "${GREEN}0. 退出${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-
-        local choice=""
-        read -r -p $'\033[32m请输入选项: \033[0m' choice || true
-        [[ -z "$choice" ]] && continue
-
-        case "$choice" in
-            1) install_hy2; pause ;;
-            2) update_hy2; pause ;;
-            3) unsthy2; pause ;;
-            4) changeconf; pause ;;
-            5) rc-service sing-box-hy2 start && info "服务已成功启动！"; pause ;;
-            6) rc-service sing-box-hy2 stop && info "服务已成功停止！"; pause ;;
-            7) rc-service sing-box-hy2 restart && info "服务已成功重启！"; pause ;;
-            8) if [[ -f "$LOG_FILE" ]]; then tail -n 50 "$LOG_FILE"; else warn "未发现运行日志文件。"; fi; pause ;;
-            9) showconf; pause ;;
-            0) exit 0 ;;
-            *) error "无效输入，请重新选择。"; sleep 1 ;;
-        esac
-    done
-}
-
-if [[ ${EUID} -ne 0 ]]; then
-    error "请切换至 root 用户运行此面板脚本。"
-    exit 1
+# ================== 全局变量 & 目录配置 ==================
+BASE_DIR="/opt/rclone_manager"
+LOG_DIR="$BASE_DIR/log"
+SCRIPT_DIR="$BASE_DIR/scripts"
+CONFIG_FILE="$BASE_DIR/config.env"
+CRON_PREFIX="# rclone_sync_task:"
+
+mkdir -p "$LOG_DIR" "$SCRIPT_DIR"
+
+# 获取系统环境名称
+if [ -f /etc/os-release ]; then
+    OS=$(awk -F= '/^NAME/{print $2}' /etc/os-release | tr -d '"')
+else
+    OS=$(uname -s)
 fi
 
-menu "$@"
+# ================== 载入或初始化配置文件 ==================
+init_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        cat > "$CONFIG_FILE" <<EOF
+TG_TOKEN="填入你的默认BotToken"
+TG_CHAT_ID="填入你的默认ChatID"
+VPS_NAME="未命名VPS"
+EOF
+    fi
+    source "$CONFIG_FILE"
+}
+init_config
+
+# ================== 动态状态获取 ==================
+get_system_status() {
+
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}         ◈   Rclone 管理面板   ◈       ${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
+    
+    if command -v rclone &> /dev/null; then
+        local rclone_ver=$(rclone version | head -n 1 | awk '{print $2}')
+        echo -e "${GREEN}Rclone 状态:${RESET} ${YELLOW}已安装 (${rclone_ver})${RESET}"
+    else
+        echo -e "${GREEN}Rclone 状态:${RESET} ${RED}未安装${RESET}"
+    fi
+
+    if command -v rclone &> /dev/null; then
+        local remote_count=$(rclone listremotes 2>/dev/null | wc -l)
+        echo -e "${GREEN}已配置网盘:${RESET} ${YELLOW}${remote_count} 个${RESET}"
+    else
+        echo -e "${GREEN}已配置网盘:${RESET} ${YELLOW}----${RESET}"
+    fi
+
+    local active_mounts=$(mount | grep -i "rclone" | awk '{print $3}')
+    if [ -n "$active_mounts" ]; then
+        echo -e "${GREEN}活跃挂载点: ${RESET}"
+        echo "$active_mounts" | while read -r mnt; do
+            echo -e " ${YELLOW}● $mnt (已开启开机自启)${RESET}"
+        done
+    else
+        echo -e "${GREEN}活跃挂载点:${RESET} ${YELLOW}暂无活跃挂载${RESET}"
+    fi
+
+    local cron_count=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX" | wc -l)
+    echo -e "${GREEN}同步定时任务:${RESET} ${YELLOW}${cron_count} 个活跃任务${RESET}"
+
+    if [[ "$TG_TOKEN" == "填入你的默认BotToken" || -z "$TG_TOKEN" ]]; then
+        echo -e "${GREEN}TG 通知状态:${RESET} ${RED}未配置${RESET}"
+    else
+        echo -e "${GREEN}TG 通知状态:${RESET} ${YELLOW}已启用 (${VPS_NAME})${RESET}"
+    fi
+}
+
+# ================== 菜单 ==================
+show_menu() {
+    clear
+    get_system_status
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${CYAN} [ Rclone 管理 ]${RESET}"
+    echo -e "${GREEN} 1) 安装 Rclone${RESET}       ${GREEN} 2) 更新 Rclone${RESET}"
+    echo -e "${GREEN} 3) 配置 Rclone${RESET}       ${GREEN} 4) 查看远程存储列表${RESET}"
+    echo -e "${GREEN} 5) 查看远程存储文件${RESET}"
+    echo -e "${GREEN}----------------------------------------${RESET}"
+    echo -e "${CYAN} [ 挂载管理 (配置开机自启) ]${RESET}"
+    echo -e "${GREEN} 6) 挂载网盘 ${RESET}         ${GREEN} 7) 查看已创建的资产清单${RESET}"
+    echo -e "${GREEN} 8) 卸载指定挂载点${RESET}    ${GREEN} 9) 卸载所有挂载点${RESET}"
+    echo -e "${GREEN}10) 查看挂载运行状态${RESET}  ${GREEN}11) 查看挂载实时日志${RESET}"
+    echo -e "${GREEN}----------------------------------------${RESET}"
+    echo -e "${CYAN} [ 数据同步与任务 ]${RESET}"
+    echo -e "${GREEN}12) 同步 本地 → 远程${RESET}  ${GREEN}13) 同步 远程 → 本地${RESET}"
+    echo -e "${GREEN}14) 定时任务管理 (Cron)${RESET}"
+    echo -e "${GREEN}----------------------------------------${RESET}"
+    echo -e "${CYAN} [ 全局设置与常规 ]${RESET}"
+    echo -e "${GREEN}15) 修改TG通知参数${RESET}    ${GREEN}16) 卸载 Rclone${RESET}"
+    echo -e "${GREEN} 0) 退出${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
+}
+
+# ================== 基础操作 ==================
+install_rclone() {
+    echo -e "${YELLOW}正在检测并安装 FUSE 挂载依赖组件...${RESET}"
+    
+    # 1. 智能识别包管理器并安装 FUSE
+    if command -v apt-get &> /dev/null; then
+        sudo apt-get update -y
+        # 优先安装 fuse3，如果失败则尝试安装 fuse
+        sudo apt-get install -y fuse3 || sudo apt-get install -y fuse
+    elif command -v dnf &> /dev/null; then
+        sudo dnf install -y fuse3 || sudo dnf install -y fuse
+    elif command -v yum &> /dev/null; then
+        sudo yum install -y fuse3 || sudo yum install -y fuse
+    else
+        echo -e "${YELLOW}未检测到主流包管理器，请手动确保系统已安装 fuse / fuse3，否则挂载功能可能无法使用。${RESET}"
+    fi
+
+    # 2. 验证 FUSE 是否安装成功
+    if command -v fusermount3 &> /dev/null || command -v fusermount &> /dev/null; then
+        echo -e "${GREEN}FUSE 依赖组件安装/检查成功！${RESET}"
+    else
+        echo -e "${RED}⚠️ FUSE 依赖安装可能失败，后续网盘挂载功能（Option 6）可能会报错。${RESET}"
+    fi
+
+    # 3. 安装 Rclone 本体
+    echo -e "${YELLOW}正在安装 Rclone 本体...${RESET}"
+    if curl https://rclone.org/install.sh | sudo bash; then
+        echo -e "${GREEN}Rclone 安装完成！${RESET}"
+    else
+        echo -e "${RED}❌ Rclone 本体安装失败，请检查网络连接。${RESET}"
+    fi
+}
+
+update_rclone() {
+    echo -e "${YELLOW}正在更新 Rclone...${RESET}"
+    curl https://rclone.org/install.sh | sudo bash
+    echo -e "${GREEN}Rclone 已更新完成！${RESET}"
+    rclone version
+}
+
+config_rclone() { rclone config; }
+list_remotes() { rclone listremotes; }
+
+list_files_remote() {
+    read -p "请输入Rclone创建的网盘名称: " remote
+    [ -z "$remote" ] && { echo -e "${RED}远程名称不能为空${RESET}"; return; }
+    read -p "请输入远程目录(默认 /): " remote_dir
+    remote_dir=${remote_dir:-/}
+    rclone ls "${remote}:${remote_dir}" || echo -e "${RED}访问失败，请检查名称或权限${RESET}"
+}
+
+# ================== TG 参数持久化 ==================
+modify_tg() {
+    read -p "请输入 TG Bot Token (当前: $TG_TOKEN): " input_token
+    read -p "请输入 TG Chat ID (当前: $TG_CHAT_ID): " input_id
+    read -p "请输入 VPS 名称 (当前: $VPS_NAME): " input_name
+
+    TG_TOKEN=${input_token:-$TG_TOKEN}
+    TG_CHAT_ID=${input_id:-$TG_CHAT_ID}
+    VPS_NAME=${input_name:-$VPS_NAME}
+
+    cat > "$CONFIG_FILE" <<EOF
+TG_TOKEN="$TG_TOKEN"
+TG_CHAT_ID="$TG_CHAT_ID"
+VPS_NAME="$VPS_NAME"
+EOF
+    echo -e "${GREEN}TG 参数已成功保存到本地配置文件！${RESET}"
+}
+
+send_tg() {
+    local msg="$1"
+    source "$CONFIG_FILE"
+    if [[ "$TG_TOKEN" != "填入你的默认BotToken" ]]; then
+        curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT_ID}" -d text="[$VPS_NAME] $msg" >/dev/null
+    fi
+}
+
+
+# ================== 智能挂载自启动一体化 ==================
+mount_remote() {
+
+
+    read -p "请输入Rclone创建的网盘名称: " remote
+    [ -z "$remote" ] && return
+    
+    read -p "请输入网盘内的存储桶/子目录 (如 sss): " remote_dir
+    
+    # 如果用户输入了桶名，自动去掉前后的斜杠
+    remote_dir=$(echo "$remote_dir" | sed 's/^\///;s/\/$//')
+    
+    # 智能生成默认本地路径
+    if [ -z "$remote_dir" ]; then
+        default_path="/mnt/${remote}"
+        local mount_source="${remote}:"
+    else
+        # 如果有桶名，本地目录名变成 /mnt/CF_sss，更直观
+        default_path="/mnt/${remote}_${remote_dir}"
+        local mount_source="${remote}:${remote_dir}"
+    fi
+    
+    read -p "请输入VPS本地挂载路径 (默认 $default_path): " input_path
+    path=${input_path:-$default_path}
+    
+    # 1. 检查防冲突与强行清理僵尸挂载
+    if mount | grep -q "on $path type"; then
+        echo -e "${YELLOW}该本地路径 $path 已经被挂载。正在执行热刷新升级...${RESET}"
+        sudo umount -l "$path" 2>/dev/null
+    fi
+
+    # 清理可能残留的 PID（新版 Rclone 推荐靠 systemd 管理进程）
+    [ -f "/var/run/rclone_${remote}.pid" ] && rm -f "/var/run/rclone_${remote}.pid"
+
+    sudo mkdir -p "$path"
+    service_file="/etc/systemd/system/rclone-mount@${remote}.service"
+    
+    # 2. 写入 Systemd (完美适配 R2 特性参数)
+    sudo tee "$service_file" >/dev/null <<EOF
+[Unit]
+Description=Rclone Mount ${remote}
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+# 核心参数优化：加入了权限允许、写入缓存
+ExecStart=/usr/bin/rclone mount ${mount_source} $path \\
+    --allow-other \\
+    --vfs-cache-mode full \\
+    --vfs-cache-max-age 24h \\
+    --vfs-cache-max-size 10G \\
+    --buffer-size 64M \\
+    --dir-cache-time 1h \\
+    --drive-chunk-size 64M
+# 使用更强壮的 lazy umount 停止服务，防止卸载时卡死
+ExecStop=/usr/bin/umount -l $path
+Restart=always
+RestartSec=10
+StandardOutput=append:$LOG_DIR/rclone_${remote}_sys.log
+StandardError=append:$LOG_DIR/rclone_${remote}_sys.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # 3. 启动服务
+    sudo systemctl daemon-reload
+    sudo systemctl enable rclone-mount@${remote}
+    sudo systemctl restart rclone-mount@${remote} # 用 restart 确保应用新配置
+    
+    echo "正在等待挂载启动..."
+    sleep 3
+    
+    # 4. 验证挂载状态
+    if systemctl is-active --quiet "rclone-mount@${remote}"; then
+        echo -e "${GREEN}✅ 已成功将网盘 [${mount_source}] 挂载到本地 [${path}]！${RESET}"
+        echo -e "${GREEN}ℹ️ 缓存刷新时间设为 1 小时，新文件会在 1 小时内自动同步。${RESET}"
+        echo -e "${GREEN}⚙️ 开机自启动守护已妥善配置。可以使用 'df -h' 查看状态。${RESET}"
+    else
+        echo -e "${RED}❌ 挂载启动失败！${RESET}"
+        echo -e "${RED}请运行以下命令查看具体报错日志:${RESET}"
+        echo -e "${YELLOW}tail -n 20 $LOG_DIR/rclone_${remote}_sys.log${RESET}"
+    fi
+}
+
+
+unmount_remote_by_name() {
+    read -p "请输入想要卸载的Rclone创建的网盘名称 (如 CF): " remote
+    [ -z "$remote" ] && return
+    
+    local svc="rclone-mount@${remote}"
+    local service_file="/etc/systemd/system/${svc}.service"
+    local path=""
+
+    # 核心改进：从现有的 systemd 服务文件中提取真正的本地挂载路径
+    if [ -f "$service_file" ]; then
+        # 匹配 ExecStart 中最后一个以 / 开头的路径参数
+        path=$(grep "ExecStart=" "$service_file" | awk '{print $NF}')
+    fi
+    
+    # 如果没找到服务文件，则降级使用默认猜测路径
+    if [ -z "$path" ]; then
+        path="/mnt/${remote}"
+    fi
+    
+    # 1. 停止并移除 Systemd 自启守护服务
+    if [ -f "$service_file" ] || systemctl list-unit-files | grep -q "^${svc}"; then
+        echo -e "${YELLOW}正在停止并移除 [${remote}] 的开机自启动守护服务...${RESET}"
+        sudo systemctl stop "$svc" 2>/dev/null
+        sudo systemctl disable "$svc" 2>/dev/null
+        sudo rm -f "$service_file"
+        sudo systemctl daemon-reload
+    fi
+
+    # 2. 强行解除本地挂载（优先使用通用的 umount -l，防止死锁）
+    echo -e "${YELLOW}正在解除路径 [${path}] 的网络挂载...${RESET}"
+    sudo umount -l "$path" 2>/dev/null || sudo fusermount -u "$path" 2>/dev/null
+    
+    # 3. 清理残留
+    [ -f "/var/run/rclone_${remote}.pid" ] && rm -f "/var/run/rclone_${remote}.pid"
+
+    echo -e "${GREEN}✅ 远程存储 ${remote} 卸载完成，本地目录 [${path}] 已释放，自启同步移除！${RESET}"
+}
+
+unmount_all() {
+    echo -e "${YELLOW}正在全面清空并移除所有网盘挂载与开机自启动...${RESET}"
+    
+    # 核心改进：直接从配置目录扫描所有 rclone-mount@ 开头的服务文件，不管它当前是运行还是停止
+    local sys_services=$(find /etc/systemd/system/ -name "rclone-mount@*.service" -exec basename {} \;)
+    
+    if [ -n "$sys_services" ]; then
+        for svc in $sys_services; do
+            echo -e "${CYAN} ➜ 正在彻底清理服务: $svc${RESET}"
+            sudo systemctl stop "$svc" 2>/dev/null
+            sudo systemctl disable "$svc" 2>/dev/null
+            sudo rm -f "/etc/systemd/system/$svc"
+        done
+        sudo systemctl daemon-reload
+    fi
+
+    # 清理所有相关的 PID 文件
+    rm -f /var/run/rclone_*.pid
+
+    # 强行拆除所有处于 rclone 类型的挂载点（通过 mount 动态抓取，绝不漏网）
+    local active_mounts=$(mount | grep -i "rclone" | awk '{print $3}')
+    if [ -n "$active_mounts" ]; then
+        echo "$active_mounts" | while read -r mnt; do
+            echo -e "${CYAN} ➜ 正在强制卸载僵尸目录: $mnt${RESET}"
+            sudo umount -l "$mnt" 2>/dev/null || sudo fusermount -u "$mnt" 2>/dev/null
+        done
+    fi
+    echo -e "${GREEN}✅ 系统内所有 Rclone 挂载及相关自启服务已全部清洗完毕。${RESET}"
+}
+# ================== 资产清单综合查看面板 ==================
+show_assets_manifest() {
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}       📁 Rclone 已创资产名称清单      ${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    
+    # 1. 扫描已生成的自启动挂载服务
+    echo -e "${CYAN}[1] 已创建的自启动挂载服务名字信息：${RESET}"
+    local service_files=$(ls /etc/systemd/system/rclone-mount@*.service 2>/dev/null)
+    if [ -n "$service_files" ]; then
+        echo "$service_files" | while read -r file; do
+            # 提取网盘名称
+            local r_name=$(basename "$file" | sed 's/rclone-mount@//;s/\.service//')
+            # 提取挂载路径
+            local m_path=$(grep -E '^ExecStart=' "$file" | awk '{print $4}')
+            # 检查当前是否在运行
+            if systemctl is-active --quiet "rclone-mount@${r_name}"; then
+                local r_status="${GREEN}● 正在运行${RESET}"
+            else
+                local r_status="${RED}○ 已停止${RESET}"
+            fi
+            echo -e "  网盘名称: ${YELLOW}${r_name}${RESET}  |  挂载路径: ${YELLOW}${m_path}${RESET}  [${r_status}]"
+        done
+    else
+        echo -e "  ${YELLOW}(暂无通过本脚本创建的挂载服务)${RESET}"
+    fi
+
+    echo -e "---------------------------------------"
+
+    # 2. 扫描本脚本生成的 Cron 定时同步任务
+    echo -e "${CYAN}[2] 已创建的定时任务(Cron)名字信息：${RESET}"
+    local cron_tasks=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX")
+    if [ -n "$cron_tasks" ]; then
+        echo "$cron_tasks" | while read -r line; do
+            # 提取任务唯一标识名
+            local task_id=$(echo "$line" | awk -F "$CRON_PREFIX" '{print $2}')
+            # 提取运行周期表达式
+            local cron_time=$(echo "$line" | awk -F "/opt/rclone_manager" '{print $1}')
+            echo -e "  任务名字: ${YELLOW}${task_id}${RESET}  |  执行周期: ${YELLOW}${cron_time}${RESET}"
+        done
+    else
+        echo -e "  ${YELLOW}(暂无通过本脚本创建的定时同步任务)${RESET}"
+    fi
+    echo -e "${GREEN}=======================================${RESET}"
+}
+
+# ================== 状态和日志查看 ==================
+view_mount_status() {
+    read -p "请输入想要查看状态的Rclone创建网盘名称: " remote
+    [ -z "$remote" ] && return
+    local svc="rclone-mount@${remote}"
+    
+    if systemctl list-unit-files | grep -q "^${svc}"; then
+        echo -e "${CYAN}--- Systemd 状态服务信息 ---${RESET}"
+        sudo systemctl status "$svc"
+    else
+        echo -e "${RED}未找到该网盘 [${remote}] 对应的挂载守护服务，请确认名称是否正确。${RESET}"
+    fi
+}
+
+view_mount_logs() {
+    read -p "想要查看实时日志，请输入Rclone创建的网盘名称: " remote
+    [ -z "$remote" ] && return
+    local log_file="$LOG_DIR/rclone_${remote}_sys.log"
+    
+    if [ -f "$log_file" ]; then
+        echo -e "${CYAN}--- 正在读取实时日志 (按 Ctrl+C 退出日志查看模式) ---${RESET}"
+        tail -n 50 -f "$log_file"
+    else
+        echo -e "${RED}未找到对应的日志文件: ${log_file}${RESET}"
+    fi
+}
+
+# ================== 高级定时任务管理面板 ==================
+show_cron_panel() {
+    local TASK_COUNT=$(crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]' | wc -l)
+
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}        ◈  Cron 定时任务管理面板  ◈      ${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN} 当前系统环境 : ${YELLOW}${OS}${RESET}"
+    echo -e "${GREEN} 活跃任务总数 : ${YELLOW}${TASK_COUNT} 条${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN} 📋 当前系统定时任务快照：${RESET}"
+    
+    if [ "$TASK_COUNT" -gt 0 ]; then
+        crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]' | awk -v cyan="$CYAN" -v reset="$RESET" '{print "   " cyan "•" reset " " $0}'
+    else
+        echo -e "   ${YELLOW}(暂无用户自定义的定时任务)${RESET}"
+    fi
+    
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN}  1) 快速添加定时任务(引导式)${RESET}"
+    echo -e "${GREEN}  2) 精准删除定时任务(按名称删除)${RESET}"
+    echo -e "${GREEN}  3) 深度手动编辑任务(打开编辑器)${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN}  0) 返回主菜单${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+}
+
+schedule_add() {
+    echo -e "${YELLOW}--- 引导式添加 Rclone 同步任务 ---${RESET}"
+    read -p "任务唯一标识名 (英文字母): " TASK_NAME
+    [ -z "$TASK_NAME" ] && return
+    read -p "本地同步目录 (多个用空格隔开): " LOCAL_DIR
+    read -p "请输入Rclone创建的网盘名称: " REMOTE_NAME
+    read -p "远程目标目录 (默认 backup): " REMOTE_DIR
+    REMOTE_DIR=${REMOTE_DIR:-backup}
+
+    echo -e "${GREEN}选择执行周期:\n 1. 每天0点\n 2. 每周一0点\n 3. 每月1号0点\n 4. 自定义 Cron 表达式${RESET}"
+    read -p "请选择: " t
+    case $t in
+        1) cron_expr="0 0 * * *" ;;
+        2) cron_expr="0 0 * * 1" ;;
+        3) cron_expr="0 0 1 * *" ;;
+        4) read -p "请输入标准 5 位 Cron 表达式: " cron_expr ;;
+        *) echo -e "${RED}❌ 无效选择${RESET}"; return ;;
+    esac
+
+    SCRIPT_PATH="$SCRIPT_DIR/rclone_sync_${TASK_NAME}.sh"
+    cat > "$SCRIPT_PATH" << 'EOF'
+#!/bin/bash
+CONFIG_FILE="/opt/rclone_manager/config.env"
+if [ -f "$CONFIG_FILE" ]; then source "$CONFIG_FILE"; fi
+EOF
+
+    cat >> "$SCRIPT_PATH" << EOF
+LOG_FILE="$LOG_DIR/rclone_sync_${TASK_NAME}.log"
+send_tg() {
+    if [[ "\$TG_TOKEN" != "填入你的默认BotToken" ]]; then
+        curl -s -X POST "https://api.telegram.org/bot\${TG_TOKEN}/sendMessage" \
+        -d chat_id="\${TG_CHAT_ID}" -d text="[\${VPS_NAME}] \$1" >/dev/null
+    fi
+}
+for d in $LOCAL_DIR; do
+    [ ! -d "\$d" ] && continue
+    name=\$(basename "\$d")
+    target="${REMOTE_NAME}:${REMOTE_DIR}/\$name"
+    rclone sync "\$d" "\$target" -v >> "\$LOG_FILE" 2>&1
+    if [ \$? -eq 0 ]; then
+        echo "[\$(date '+%F %T')] \$d 同步完成 ✅" >> "\$LOG_FILE"
+        send_tg "定时任务 [${TASK_NAME}] 同步成功: \$d ✅"
+    else
+        echo "[\$(date '+%F %T')] \$d 同步失败 ❌" >> "\$LOG_FILE"
+        send_tg "⚠️ 定时任务 [${TASK_NAME}] 同步失败: \$d ❌"
+    fi
+done
+EOF
+
+    chmod +x "$SCRIPT_PATH"
+    (crontab -l 2>/dev/null | grep -v "$CRON_PREFIX$TASK_NAME"; echo "$cron_expr $SCRIPT_PATH $CRON_PREFIX$TASK_NAME") | crontab -
+    echo -e "${GREEN}任务 $TASK_NAME 已成功添加并注入 Crontab！${RESET}"
+}
+
+schedule_del_one() {
+    echo -e "${YELLOW}--- 正在检索本脚本生成的任务... ---${RESET}"
+    local count=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX" | wc -l)
+    if [ "$count" -eq 0 ]; then
+        echo -e "${YELLOW}未发现通过本脚本创建的 Rclone 定时任务。${RESET}"
+        return
+    fi
+
+    crontab -l 2>/dev/null | grep "$CRON_PREFIX" | awk -F "$CRON_PREFIX" '{print "● 可删除任务名: " $2}'
+    echo "---------------------------------------"
+    read -p "请输入你想精确删除的任务名称: " TASK_NAME
+    [ -z "$TASK_NAME" ] && return
+
+    crontab -l 2>/dev/null | grep -v "$CRON_PREFIX$TASK_NAME" | crontab -
+    rm -f "$SCRIPT_DIR/rclone_sync_${TASK_NAME}.sh"
+    echo -e "${GREEN}已成功移除任务: $TASK_NAME${RESET}"
+}
+
+cron_task_menu() {
+    while true; do
+        clear
+        show_cron_panel
+        read -p "$(echo -e ${GREEN}请输入定时任务选项数字: ${RESET})" choice_cron
+        echo ""
+        case $choice_cron in
+            1) schedule_add ;;
+            2) schedule_del_one ;;
+            3) 
+                echo -e "${YELLOW}即将调用系统默认编辑器打开全局 Crontab。${RESET}"
+                read -p "按回车键开始编辑..."
+                crontab -e 
+                ;;
+            0) break ;;
+            *) echo -e "${RED}❌ 输入错误！${RESET}" ;;
+        esac
+        read -p "按回车键继续..."
+    done
+}
+
+# ================== 手动同步功能 ==================
+sync_local_to_remote_multi() {
+    read -p "请输入本地目录路径（多个用空格分隔）: " local_dirs
+    [ -z "$local_dirs" ] && return
+    read -p "请输入Rclone创建的网盘名称: " remote
+    [ -z "$remote" ] && return
+    read -p "请输入远程目标目录(默认 backup): " remote_dir
+    remote_dir=${remote_dir:-backup}
+
+    for d in $local_dirs; do
+        if [ ! -d "$d" ]; then
+            echo -e "${RED}目录不存在，跳过: $d${RESET}"
+            continue
+        fi
+        name=$(basename "$d")
+        target="${remote}:${remote_dir}/${name}"
+        LOG_FILE="$LOG_DIR/rclone_sync_${name}.log"
+
+        echo -e "${YELLOW}正在同步: $d → $target ...${RESET}"
+        rclone sync "$d" "$target" -v -P 2>&1 | tee -a "$LOG_FILE"
+
+        if [ ${PIPESTATUS[0]} -eq 0 ]; then
+            echo "[ $(date '+%F %T') ] 同步完成 ✅" >> "$LOG_FILE"
+            send_tg "Rclone 同步完成: $d → $target ✅"
+        else
+            echo "[ $(date '+%F %T') ] 同步失败 ❌" >> "$LOG_FILE"
+            send_tg "⚠️ Rclone 同步失败: $d → $target ❌"
+        fi
+    done
+}
+
+sync_remote_to_local() {
+    read -p "请输入Rclone创建的网盘名称: " remote
+    [ -z "$remote" ] && return
+    read -p "请输入远程备份目录 (例如 backup): " remote_dir
+    read -p "请输入本地恢复目标目录: " local_dir
+    [ -z "$local_dir" ] && return
+    
+    mkdir -p "$local_dir"
+    rclone sync "${remote}:${remote_dir}" "$local_dir" -v -P
+}
+
+# ================== 卸载全面清理 ==================
+uninstall_rclone() {
+    read -p "确定要彻底卸载 Rclone 及所有管理配置吗？(y/N): " SECURE_CONFIRM
+    [ "$SECURE_CONFIRM" != "y" ] && return
+
+    echo -e "${YELLOW}正在全面清理 Rclone 环境与组件...${RESET}"
+    unmount_all
+    sudo rm -f /usr/bin/rclone /usr/local/bin/rclone
+    sudo rm -rf ~/.config/rclone
+    sudo rm -rf "$BASE_DIR"
+
+    echo -e "${GREEN}卸载完成！所有组件、挂载点及系统残留已清理。${RESET}"
+    exit 0
+}
+
+# ================== 主循环入口 ==================
+while true; do
+    show_menu
+    read -p "$(echo -e ${GREEN}请输入选项数字: ${RESET})" choice
+    case $choice in
+        1) install_rclone ;;
+        2) update_rclone ;;
+        3) config_rclone ;;
+        4) list_remotes ;;
+        5) list_files_remote ;;
+        6) mount_remote ;;
+        7) show_assets_manifest ;;
+        8) unmount_remote_by_name ;;
+        9) unmount_all ;;
+        10) view_mount_status ;;
+        11) view_mount_logs ;;
+        12) sync_local_to_remote_multi ;;
+        13) sync_remote_to_local ;;
+        14) cron_task_menu ;;
+        15) modify_tg ;;
+        16) uninstall_rclone ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}输入错误，请输入菜单中的有效数字！${RESET}" ;;
+    esac
+    read -r -p "按回车键继续..."
+done

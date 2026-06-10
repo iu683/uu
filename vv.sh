@@ -1,578 +1,561 @@
-#!/bin/bash
-# ========================================
-# Rclone 管理脚本 (Alpine Linux OpenRC 专属版)
-# ========================================
+#!/usr/bin/env sh
 
-# ================== 颜色 ==================
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-CYAN="\033[36m"
-RESET="\033[0m"
+# ==============================================================================
+#  next-socks5 一键管理面板 (Alpine Linux OpenRC 专属 )
+# ==============================================================================
 
-# ================== 全局变量 & 目录配置 ==================
-BASE_DIR="/opt/rclone_manager"
-LOG_DIR="$BASE_DIR/log"
-SCRIPT_DIR="$BASE_DIR/scripts"
-CONFIG_FILE="$BASE_DIR/config.env"
-CRON_PREFIX="# rclone_sync_task:"
+# ── 核心环境变量 ──────────────────────────────────────────────────────────────
+export REPO="ZingerLittleBee/next-socks5"
+export SERVICE_NAME="next-socks5"
+export SERVICE_USER="socks5"
+export INSTALL_BIN="/usr/local/bin/next-socks5"
+export CONF_DIR="/etc/next-socks5"
+export CONF_FILE="${CONF_DIR}/config.toml"
+export DATA_DIR="/var/lib/next-socks5"
+export SERVICE_FILE="/etc/init.d/${SERVICE_NAME}"
 
-mkdir -p "$LOG_DIR" "$SCRIPT_DIR"
+# ── 终端颜色定义 ──────────────────────────────────
+export RESET='\033[0m'
+export GREEN='\033[0;32m'
+export YELLOW='\033[0;33m'
+export RED='\033[0;31m'
+export BLUE='\033[0;34m'
+export CYAN='\033[0;36m'
 
-OS="Alpine Linux"
+# ── GITHUB 代理加速源（标准 POSIX 字符串格式，兼容 sh） ───────────────────────
+# 第一个 DIRECT 代表优先尝试直连
+GITHUB_PROXIES="DIRECT https://v6.gh-proxy.org/ https://gh-proxy.com/ https://hub.glowp.xyz/ https://proxy.vvvv.ee/ https://ghproxy.lvedong.eu.org/"
 
-# ================== 载入或初始化配置文件 ==================
-init_config() {
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        cat > "$CONFIG_FILE" <<EOF
-TG_TOKEN="填入你的默认BotToken"
-TG_CHAT_ID="填入你的默认ChatID"
-VPS_NAME="未命名VPS"
-EOF
+# ── 基础环境校验 ──────────────────────────────────────────────────────────
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}[错误]${RESET} 请使用 root 权限运行此脚本！" >&2
+    exit 1
+fi
+
+info() { echo -e "${BLUE}[INFO]${RESET} $1"; }
+ok()   { echo -e "${GREEN}[OK]${RESET} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${RESET} $1"; }
+die()  { echo -e "${RED}[ERROR]${RESET} $1" >&2; exit 1; }
+
+# 验证 Alpine 身份
+if [ ! -f /etc/alpine-release ]; then
+    die "此脚本为 Alpine Linux 专属定制版，检测到当前系统非 Alpine！"
+fi
+
+# Alpine 依赖补全
+REQUIRED_CMDS="curl tar sed gawk grep openssl"
+MISSING_CMDS=""
+
+for cmd in $REQUIRED_CMDS; do
+    if ! command -v "$cmd" > /dev/null 2>&1; then
+        MISSING_CMDS="$MISSING_CMDS $cmd"
     fi
-    source "$CONFIG_FILE"
-}
-init_config
+done
 
-# ================== 动态状态获取 ==================
-get_system_status() {
-    echo -e "${GREEN}=========== Rclone 管理菜单 ===========${RESET}"
+if [ -n "$MISSING_CMDS" ]; then
+    info "检测到系统缺失必要组件:${YELLOW}$MISSING_CMDS${RESET}，正在自动安装..."
+    apk update -q && apk add -q --no-cache $MISSING_CMDS >/dev/null 2>&1
     
-    if command -v rclone &> /dev/null; then
-        local rclone_ver=$(rclone version | head -n 1 | awk '{print $2}')
-        echo -e "${GREEN}Rclone 状态:${RESET} ${YELLOW}已安装 (${rclone_ver})${RESET}"
-    else
-        echo -e "${GREEN}Rclone 状态:${RESET} ${RED}未安装${RESET}"
-    fi
+    for cmd in $REQUIRED_CMDS; do
+        if ! command -v "$cmd" > /dev/null 2>&1; then
+            die "自动安装 [ $cmd ] 失败，请检查 apk 镜像源。"
+        fi
+    done
+    ok "基础依赖补全成功！"
+fi
 
-    if command -v rclone &> /dev/null; then
-        local remote_count=$(rclone listremotes 2>/dev/null | wc -l)
-        echo -e "${GREEN}已配置网盘:${RESET} ${YELLOW}${remote_count} 个${RESET}"
-    else
-        echo -e "${GREEN}已配置网盘:${RESET} ${YELLOW}----${RESET}"
-    fi
-
-    local active_mounts=$(mount | grep -i "rclone" | awk '{print $3}')
-    if [ -n "$active_mounts" ]; then
-        echo -e "${GREEN}活跃挂载点:${RESET} "
-        echo "$active_mounts" | while read -r mnt; do
-            echo -e "  ${YELLOW}● $mnt (已开启开机自启)${RESET}"
+get_public_ip() {
+    local mode=${1:-"v4"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        # 强制获取 IPv4
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        # 强制获取 IPv6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
         done
     else
-        echo -e "${GREEN}活跃挂载点:${RESET} ${YELLOW}暂无活跃挂载${RESET}"
+        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
     fi
 
-    local cron_count=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX" | wc -l)
-    echo -e "${GREEN}同步定时任务:${RESET} ${YELLOW}${cron_count} 个活跃任务${RESET}"
-
-    if [[ "$TG_TOKEN" == "填入你的默认BotToken" || -z "$TG_TOKEN" ]]; then
-        echo -e "${GREEN}TG 通知状态:${RESET} ${YELLOW}未配置${RESET}"
-    else
-        echo -e "${GREEN}TG 通知状态:${RESET} ${YELLOW}已启用(${VPS_NAME})${RESET}"
-    fi
-
+    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
+    echo "127.0.0.1" && return 0
 }
 
-# ================== 菜单 ==================
-show_menu() {
-    clear
-    get_system_status
+# ── 💡 代理轮询核心函数 (POSIX sh 标准实现) ───────────────────────────────────
+fetch_latest_version() {
+    info "正在通过代理列表轮询获取最新 Release 版本号..."
+    VERSION=""
+
+    # 1. 核心轮询逻辑：一个一个代理去撞，直到拿到真实的版本号
+    for proxy in "${GITHUB_PROXIES[@]}"; do
+        local api_url="${proxy}https://api.github.com/repos/${REPO}/releases/latest"
+        
+        # 调试信息，方便看清当前在用哪个代理跑
+        if [ -z "$proxy" ]; then
+            info "尝试直连请求 GitHub API..."
+        else
+            info "尝试使用代理: ${YELLOW}${proxy}${RESET}"
+        fi
+
+        # 使用 wget 获取并通过 sed/awk 解析 tag_name (避免系统没装 jq)
+        local resp
+        resp=$(wget -qO- --timeout=5 --tries=1 --no-check-certificate "$api_url" 2>/dev/null)
+        local tmp_ver
+        tmp_ver=$(echo "$resp" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)
+
+        # 校验获取到的版本号是否合法
+        if [[ -n "$tmp_ver" && "$tmp_ver" != "null" ]]; then
+            VERSION="$tmp_ver"
+            SELECTED_PROXY="$proxy" # 锁定当前好用的代理，供后面下载资产包使用
+            ok "成功通过该源获取到最新版本: ${GREEN}${VERSION}${RESET}"
+            break
+        fi
+    done
+
+    # 2. 兜底逻辑：如果全军覆没，使用稳定的保底版本
+    if [ -z "$VERSION" ]; then
+        VERSION="v0.4.0"
+        SELECTED_PROXY="" # 盲跑直连
+        warn "所有代理均未能获取到实时版本，将降级采用默认稳定版本: ${VERSION}"
+    fi
+
+    export VERSION
+    export SELECTED_PROXY
     
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${CYAN} [ Rclone 管理 ]${RESET}"
-    echo -e "${GREEN} 1) 安装 Rclone${RESET}         ${GREEN} 2) 更新 Rclone${RESET}"
-    echo -e "${GREEN} 3) 配置 Rclone (config)${RESET}${GREEN} 4) 查看远程存储列表${RESET}"
-    echo -e "${GREEN} 5) 查看远程存储文件${RESET}"
-    echo -e "${GREEN}----------------------------------------${RESET}"
-    echo -e "${CYAN} [ 挂载管理 (配置开机自启) ]${RESET}"
-    echo -e "${GREEN} 6) 挂载网盘 ${RESET}           ${GREEN} 7) 查看已创建的资产清单${RESET}"
-    echo -e "${GREEN} 8) 卸载指定挂载点${RESET}      ${GREEN} 9) 卸载所有挂载点${RESET}"
-    echo -e "${GREEN}10) 查看挂载运行状态${RESET}    ${GREEN}11) 查看挂载实时日志${RESET}"
-    echo -e "${GREEN}----------------------------------------${RESET}"
-    echo -e "${CYAN} [ 数据同步与任务 ]${RESET}"
-    echo -e "${GREEN}12) 同步 本地 → 远程${RESET}    ${GREEN}13) 同步 远程 → 本地${RESET}"
-    echo -e "${GREEN}14) 定时任务管理 (Cron)${RESET}"
-    echo -e "${GREEN}----------------------------------------${RESET}"
-    echo -e "${CYAN} [ 全局设置与常规 ]${RESET}"
-    echo -e "${GREEN}15) 修改 TG 通知参数${RESET}    ${GREEN}16) 卸载 Rclone${RESET}"
-    echo -e "${GREEN} 0) 退出${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
+    [ -d "$CONF_DIR" ] || install -m 0755 -d "$CONF_DIR"
+    echo "$VERSION" > "${CONF_DIR}/.version" 2>/dev/null
 }
 
-# ================== 基础操作 ==================
-install_rclone() {
-    echo -e "${YELLOW}正在 Alpine Linux 中安装 FUSE 挂载依赖组件...${RESET}"
+# ── 1. 核心下载与组件解压 ───────────────────────────────────────────────────
+detect_target() {
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64)  TARGET="x86_64-unknown-linux-musl" ;;
+        aarch64) TARGET="aarch64-unknown-linux-musl" ;;
+        *) die "暂不支持的系统架构: $ARCH (面板目前仅支持 x86_64 及 aarch64 的 musl 环境)" ;;
+    esac
+}
+
+fetch_latest_version() {
+    # 动态筛选代理
+    select_available_proxy
+
+    info "正在查询 GitHub 获取最新 Release 版本号..."
+    TMP_API="$(mktemp)"
+    if curl -sSL --connect-timeout 5 -H "Accept: application/vnd.github+json" "${SELECTED_PROXY}https://api.github.com/repos/${REPO}/releases/latest" > "$TMP_API"; then
+        VERSION="$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$TMP_API" | head -n 1)"
+    fi
+    rm -f "$TMP_API"
+
+    if [ -z "$VERSION" ]; then
+        warn "API 获取失败，尝试网页流解析..."
+        VERSION=$(curl -sS --connect-timeout 5 "${SELECTED_PROXY}https://github.com/${REPO}/releases/latest" 2>/dev/null | grep -o 'tag/[vV]*[0-9.]*' | gawk -F '/' 'NR==1 {print $2}')
+    fi
+
+    if [ -z "$VERSION" ]; then
+        VERSION="v0.4.0"
+        warn "未能实时获取最新版本号，将降级采用默认版本: ${VERSION}"
+    else
+        ok "成功获取当前最新版本: ${GREEN}${VERSION}${RESET}"
+    fi
+    export VERSION
     
-    # 1. 刷新软件源并安装 fuse3 及其核心工具
-    sudo sed -i 's/#http/http/g' /etc/apk/repositories
-    sudo apk update
-    sudo apk add fuse3 curl bash unzip
+    [ -d "$CONF_DIR" ] || install -m 0755 -d "$CONF_DIR"
+    echo "$VERSION" > "${CONF_DIR}/.version" 2>/dev/null
+}
+
+download_and_extract() {
+    detect_target
+    fetch_latest_version
+    info "正在匹配系统环境形态: ${YELLOW}${TARGET}${RESET}"
+
+    ASSET="next-socks5-${TARGET}.tar.gz"
+    URL_TGZ="${SELECTED_PROXY}https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
+
+    TMP="$(mktemp -d)"
+    trap 'rm -rf "$TMP"' EXIT
+
+    info "开始同步下载资产包..."
+    info "下载地址: ${CYAN}${URL_TGZ}${RESET}"
+    curl -fsSL --connect-timeout 10 -o "$TMP/$ASSET" "$URL_TGZ" || die "下载资产包失败！"
+
+    tar xzf "$TMP/$ASSET" -C "$TMP"
+    EXTRACTED_BIN=$(find "$TMP" -type f -name "next-socks5" | head -n 1)
+    [ -n "$EXTRACTED_BIN" ] || die "解压成功，但在归档包内未找到 next-socks5 主程序！"
+    export TARGET_BIN_PATH="$EXTRACTED_BIN"
+}
+
+# ── 2. TOML 配置文件生成器 ──────────────────────────────────────────────────
+write_config() {
+    local bind_ip="$1" local bind_port="$2" local username="$3" local password="$4"
+    [ -d "$CONF_DIR" ] || install -m 0755 -d "$CONF_DIR"
     
-    # 2. 确保配置允许其他用户挂载
-    if [ -f /etc/fuse.conf ]; then
-        sudo sed -i 's/#\s*user_allow_other/user_allow_other/g' /etc/fuse.conf
-    else
-        echo "user_allow_other" | sudo tee /etc/fuse.conf > /dev/null
-    fi
+    cat <<EOF > "$CONF_FILE"
+listen = "${bind_ip}:${bind_port}"
 
-    # 3. 强制将 fuse 模块写入开机自动加载
-    if [ -d /etc/modules-load.d ]; then
-        echo "fuse" | sudo tee /etc/modules-load.d/fuse.conf > /dev/null
-    else
-        echo "fuse" | sudo tee -a /etc/modules > /dev/null
-    fi
-    sudo modprobe fuse 2>/dev/null
-
-    # 4. 使用 apk 直接安装 Rclone 本体
-    echo -e "${YELLOW}正在通过 Alpine 软件源安装 Rclone 本体...${RESET}"
-    if sudo apk add rclone; then
-        echo -e "${GREEN}Rclone 在 Alpine 上安装完成！${RESET}"
-    else
-        echo -e "${RED}❌ Rclone 本体安装失败，请检查网络或软件源。${RESET}"
-    fi
-}
-
-update_rclone() {
-    echo -e "${YELLOW}正在更新 Rclone...${RESET}"
-    sudo apk update
-    if sudo apk add --upgrade rclone; then
-        echo -e "${GREEN}Rclone 已更新完成！${RESET}"
-        rclone version
-    else
-        echo -e "${RED}❌ Rclone 更新失败。${RESET}"
-    fi
-}
-
-config_rclone() { rclone config; }
-list_remotes() { rclone listremotes; }
-
-list_files_remote() {
-    read -p "请输入Rclone创建的网盘名称: " remote
-    [ -z "$remote" ] && { echo -e "${RED}远程名称不能为空${RESET}"; return; }
-    read -p "请输入远程目录(默认 /): " remote_dir
-    remote_dir=${remote_dir:-/}
-    rclone ls "${remote}:${remote_dir}" || echo -e "${RED}访问失败，请检查名称或权限${RESET}"
-}
-
-# ================== TG 参数持久化 ==================
-modify_tg() {
-    read -p "请输入 TG Bot Token (当前: $TG_TOKEN): " input_token
-    read -p "请输入 TG Chat ID (当前: $TG_CHAT_ID): " input_id
-    read -p "请输入 VPS 名称 (当前: $VPS_NAME): " input_name
-
-    TG_TOKEN=${input_token:-$TG_TOKEN}
-    TG_CHAT_ID=${input_id:-$TG_CHAT_ID}
-    VPS_NAME=${input_name:-$VPS_NAME}
-
-    cat > "$CONFIG_FILE" <<EOF
-TG_TOKEN="$TG_TOKEN"
-TG_CHAT_ID="$TG_CHAT_ID"
-VPS_NAME="$VPS_NAME"
+[auth]
 EOF
-    echo -e "${GREEN}TG 参数已成功保存到本地配置文件！${RESET}"
-}
 
-send_tg() {
-    local msg="$1"
-    source "$CONFIG_FILE"
-    if [[ "$TG_TOKEN" != "填入你的默认BotToken" ]]; then
-        curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-            -d chat_id="${TG_CHAT_ID}" -d text="[$VPS_NAME] $msg" >/dev/null
-    fi
-}
-
-# ================== 智能挂载自启动一体化 (OpenRC 重构) ==================
-mount_remote() {
-    read -p "请输入Rclone创建的网盘名称: " remote
-    [ -z "$remote" ] && return
-    
-    read -p "请输入网盘内的存储桶/子目录 (如 sss): " remote_dir
-    remote_dir=$(echo "$remote_dir" | sed 's/^\///;s/\/$//')
-    
-    if [ -z "$remote_dir" ]; then
-        default_path="/mnt/${remote}"
-        local mount_source="${remote}:"
+    if [ -n "$username" ] && [ -n "$password" ]; then
+        cat <<EOF >> "$CONF_FILE"
+method = "password"
+[[auth.users]]
+username = "${username}"
+password = "${password}"
+EOF
     else
-        default_path="/mnt/${remote}_${remote_dir}"
-        local mount_source="${remote}:${remote_dir}"
-    fi
-    
-    read -p "请输入VPS本地挂载路径 (默认 $default_path): " input_path
-    path=${input_path:-$default_path}
-    
-    # 检查防冲突
-    if mount | grep -q "on $path type"; then
-        echo -e "${YELLOW}该本地路径 $path 已经被挂载。正在执行强行清理...${RESET}"
-        sudo umount -l "$path" 2>/dev/null
+        cat <<EOF >> "$CONF_FILE"
+method = "none"
+EOF
     fi
 
-    sudo mkdir -p "$path"
-    
-    # OpenRC 服务脚本路径
-    local service_file="/etc/init.d/rclone-mount.${remote}"
-    
-    # 写入 OpenRC 服务兼容脚本 (完美适配 Alpine)
-    sudo tee "$service_file" >/dev/null <<EOF
+    cat <<EOF >> "$CONF_FILE"
+
+[timeouts]
+connect_ms = 10000
+tcp_idle_ms = 300000
+udp_idle_ms = 60000
+
+[udp]
+# port_range = "40000-40100"
+# advertise = "YOUR_PUBLIC_IP"
+EOF
+}
+
+# ── Alpine OpenRC 原生守护服务脚本生成器 ─────────────────────────────────────────
+write_openrc() {
+    cat <<'EOF' > "$SERVICE_FILE"
 #!/sbin/openrc-run
 
-description="Rclone Mount Service for ${remote}"
+description="next-socks5 - Fast and Lightweight SOCKS5 Server"
 
-command="/usr/bin/rclone"
-command_args="mount ${mount_source} ${path} --allow-other --vfs-cache-mode full --vfs-cache-max-age 24h --vfs-cache-max-size 10G --buffer-size 64M --dir-cache-time 1h --drive-chunk-size 64M"
+command="/usr/local/bin/next-socks5"
+command_args="serve --config /etc/next-socks5/config.toml --no-tui"
+command_user="socks5:socks5"
+directory="/var/lib/next-socks5"
+
 command_background="true"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/next-socks5.log"
+error_log="/var/log/next-socks5.err"
 
-pidfile="/run/rclone-mount.${remote}.pid"
-output_log="${LOG_DIR}/rclone_${remote}_sys.log"
-error_log="${LOG_DIR}/rclone_${remote}_sys.log"
+rc_ulimit="-n 65535"
 
 depend() {
     need net
     after firewall
 }
 
-stop() {
-    ebegin "Stopping rclone mount ${remote}"
-    /bin/umount -l ${path} 2>/dev/null || /usr/bin/fusermount3 -u ${path} 2>/dev/null
-    start-stop-daemon --stop --pidfile "\$pidfile"
-    eend \$?
+start_pre() {
+    checkpath -d -m 0750 -o socks5:socks5 /var/lib/next-socks5
+    checkpath -f -m 0640 -o socks5:socks5 /var/log/next-socks5.log /var/log/next-socks5.err
 }
 EOF
+    chmod +x "$SERVICE_FILE"
+    rc-update add "$SERVICE_NAME" default >/dev/null 2>&1
+}
 
-    sudo chmod +x "$service_file"
+# ── 节点配置总结报告 ──────────────────────────────────────────────────────────
+print_node_summary() {
+    if [ ! -f "$CONF_FILE" ]; then return; fi
+
+    local bind_port
+    bind_port=$(gawk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); split($2, a, ":"); print a[length(a)]}' "$CONF_FILE")
+    [ -z "$bind_port" ] && bind_port="16216"
     
-    # 启动并配置开机自启
-    sudo rc-update add rclone-mount.${remote} default
-    sudo rc-service rclone-mount.${remote} restart
+    local auth_method
+    auth_method=$(gawk -F '=' '/^[[:space:]]*method[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
     
-    echo "正在等待挂载启动..."
-    sleep 3
-    
-    # 验证运行状态
-    if sudo rc-service rclone-mount.${remote} status | grep -q "started"; then
-        echo -e "${GREEN}✅ 已成功将网盘 [${mount_source}] 挂载到本地 [${path}]！${RESET}"
-        echo -e "${GREEN}⚙️ Alpine OpenRC 开机自启动守护已妥善配置。可以使用 'df -h' 查看状态。${RESET}"
+    local auth_user="" local auth_pass=""
+    if [ "$auth_method" = "password" ]; then
+        auth_user=$(gawk -F '=' '/^[[:space:]]*username[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
+        auth_pass=$(gawk -F '=' '/^[[:space:]]*password[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
+    fi
+
+    local public_ip
+    public_ip=$(get_public_ip)
+
+    echo -e "\n${GREEN}====== 当前配置详情 ======${RESET}"
+    echo -e "${GREEN}IP地址       :${RESET} ${public_ip}"
+    echo -e "${GREEN}端口         :${RESET} ${bind_port}"
+    if [ -n "$auth_user" ]; then
+        echo -e "${GREEN}用户名       :${RESET} ${auth_user}"
+        echo -e "${GREEN}密码         :${RESET} ${auth_pass}"
     else
-        echo -e "${RED}❌ 挂载启动失败！${RESET}"
-        echo -e "${RED}请运行以下命令查看具体报错日志:${RESET}"
-        echo -e "${YELLOW}tail -n 20 $LOG_DIR/rclone_${remote}_sys.log${RESET}"
+        echo -e "${GREEN}鉴权模式     :${RESET} ${YELLOW}无密码 (免密模式)${RESET}"
     fi
-}
-
-unmount_remote_by_name() {
-    read -p "请输入想要卸载的Rclone创建的网盘名称 (如 CF): " remote
-    [ -z "$remote" ] && return
+    echo -e "${GREEN}分享存放路径 :${RESET} ${CONF_FILE}"
+    echo -e "${YELLOW}📄 V6VPS 请自行替换 IP 地址为 V6 ★${RESET}"
     
-    local service_file="/etc/init.d/rclone-mount.${remote}"
-    local path="/mnt/${remote}"
-
-    # 停止并移除 OpenRC 自启服务
-    if [ -f "$service_file" ]; then
-        echo -e "${YELLOW}正在停止并移除 [${remote}] 的开机自启动 OpenRC 守护服务...${RESET}"
-        sudo rc-service rclone-mount.${remote} stop 2>/dev/null
-        sudo rc-update del rclone-mount.${remote} default 2>/dev/null
-        sudo rm -f "$service_file"
-    fi
-
-    # 强行解除可能残留的网络挂载
-    echo -e "${YELLOW}正在解除潜在路径的网络挂载...${RESET}"
-    sudo umount -l "$path" 2>/dev/null || sudo umount -l "/mnt/${remote}"* 2>/dev/null
-    
-    echo -e "${GREEN}✅ 远程存储 ${remote} 卸载完成，自启同步移除！${RESET}"
-}
-
-unmount_all() {
-    echo -e "${YELLOW}正在全面清空并移除所有网盘挂载与开机自启动...${RESET}"
-    
-    # 扫描所有相关的 OpenRC 服务
-    local alpine_services=$(ls /etc/init.d/rclone-mount.* 2>/dev/null)
-    if [ -n "$alpine_services" ]; then
-        for svc_path in $alpine_services; do
-            local svc=$(basename "$svc_path")
-            echo -e "${CYAN} ➜ 正在彻底清理 OpenRC 服务: $svc${RESET}"
-            sudo rc-service "$svc" stop 2>/dev/null
-            sudo rc-update del "$svc" default 2>/dev/null
-            sudo rm -f "$svc_path"
-        done
-    fi
-
-    # 强行拆除所有挂载点
-    local active_mounts=$(mount | grep -i "rclone" | awk '{print $3}')
-    if [ -n "$active_mounts" ]; then
-        echo "$active_mounts" | while read -r mnt; do
-            echo -e "${CYAN} ➜ 正在强制卸载网络目录: $mnt${RESET}"
-            sudo umount -l "$mnt" 2>/dev/null
-        done
-    fi
-    echo -e "${GREEN}✅ 系统内所有 Rclone 挂载及相关自启服务已全部清洗完毕。${RESET}"
-}
-
-# ================== 资产清单综合查看面板 ==================
-show_assets_manifest() {
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}      📁 Rclone 已创资产名称清单      ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    
-    # 1. 扫描已生成的自启动挂载服务
-    echo -e "${CYAN}[1] 已创建的自启动挂载服务名字信息：${RESET}"
-    local service_files=$(ls /etc/init.d/rclone-mount.* 2>/dev/null)
-    if [ -n "$service_files" ]; then
-        for file in $service_files; do
-            local r_name=$(basename "$file" | sed 's/rclone-mount.//')
-            if sudo rc-service "rclone-mount.${r_name}" status | grep -q "started"; then
-                local r_status="${GREEN}● 正在运行${RESET}"
-            else
-                local r_status="${RED}○ 已停止${RESET}"
-            fi
-            echo -e "  网盘名称: ${YELLOW}${r_name}${RESET}  [${r_status}]"
-        done
+    echo -e "${GREEN}====== 👉 通用客户端 Socks5 链接 ======${RESET}"
+    if [ -n "$auth_user" ]; then
+        echo -e "${YELLOW}socks://${auth_user}:${auth_pass}@${public_ip}:${bind_port}#uu-socks5${RESET}"
     else
-        echo -e "  ${YELLOW}(暂无通过本脚本创建的挂载服务)${RESET}"
-    fi
-
-    echo -e "---------------------------------------"
-
-    # 2. 扫描本脚本生成的 Cron 定时同步任务
-    echo -e "${CYAN}[2] 已创建的定时任务(Cron)名字信息：${RESET}"
-    local cron_tasks=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX")
-    if [ -n "$cron_tasks" ]; then
-        echo "$cron_tasks" | while read -r line; do
-            local task_id=$(echo "$line" | awk -F "$CRON_PREFIX" '{print $2}')
-            local cron_time=$(echo "$line" | awk -F "/opt/rclone_manager" '{print $1}')
-            echo -e "  任务名字: ${YELLOW}${task_id}${RESET}  |  执行周期: ${YELLOW}${cron_time}${RESET}"
-        done
-    else
-        echo -e "  ${YELLOW}(暂无通过本脚本创建的定时同步任务)${RESET}"
-    fi
-    echo -e "${GREEN}=======================================${RESET}"
-}
-
-# ================== 状态和日志查看 ==================
-view_mount_status() {
-    read -p "请输入想要查看状态的Rclone创建网盘名称: " remote
-    [ -z "$remote" ] && return
-    local svc="rclone-mount.${remote}"
-    
-    if [ -f "/etc/init.d/${svc}" ]; then
-        echo -e "${CYAN}--- OpenRC 状态服务信息 ---${RESET}"
-        sudo rc-service "$svc" status
-    else
-        echo -e "${RED}未找到该网盘 [${remote}] 对应的挂载守护服务。${RESET}"
-    fi
-}
-
-view_mount_logs() {
-    read -p "想要查看实时日志，请输入Rclone创建的网盘名称: " remote
-    [ -z "$remote" ] && return
-    local log_file="$LOG_DIR/rclone_${remote}_sys.log"
-    
-    if [ -f "$log_file" ]; then
-        echo -e "${CYAN}--- 正在读取实时日志 (按 Ctrl+C 退出日志查看模式) ---${RESET}"
-        tail -n 50 -f "$log_file"
-    else
-        echo -e "${RED}未找到对应的日志文件: ${log_file}${RESET}"
-    fi
-}
-
-# ================== 高级定时任务管理面板 ==================
-show_cron_panel() {
-    local TASK_COUNT=$(crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep '[^\s]' | wc -l)
-
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}        ◈  Cron 定时任务管理面板  ◈      ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN} 当前系统环境 : ${YELLOW}${OS}${RESET}"
-    echo -e "${GREEN} 活跃任务总数 : ${YELLOW}${TASK_COUNT} 条${RESET}"
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN} 📋 当前系统定时任务快照：${RESET}"
-    
-    if [ "$TASK_COUNT" -gt 0 ]; then
-        crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep '[^\s]' | awk -v cyan="$CYAN" -v reset="$RESET" '{print "   " cyan "•" reset " " $0}'
-    else
-        echo -e "    ${YELLOW}(暂无用户自定义的定时任务)${RESET}"
+        echo -e "${YELLOW}socks://${public_ip}:${bind_port}#uu-socks5${RESET}"
     fi
     
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  1) 快速添加定时任务(引导式)${RESET}"
-    echo -e "${GREEN}  2) 精准删除定时任务(按名称删除)${RESET}"
-    echo -e "${GREEN}  3) 深度手动编辑任务(打开编辑器)${RESET}"
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  0) 返回主菜单${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-}
-
-schedule_add() {
-    echo -e "${YELLOW}--- 引导式添加 Rclone 同步任务 ---${RESET}"
-    read -p "任务唯一标识名 (英文字母): " TASK_NAME
-    [ -z "$TASK_NAME" ] && return
-    read -p "本地同步目录 (多个用空格隔开): " LOCAL_DIR
-    read -p "请输入Rclone创建的网盘名称: " REMOTE_NAME
-    read -p "远程目标目录 (默认 backup): " REMOTE_DIR
-    REMOTE_DIR=${REMOTE_DIR:-backup}
-
-    echo -e "${GREEN}选择执行周期:\n 1. 每天0点\n 2. 每周一0点\n 3. 每月1号0点\n 4. 自定义 Cron 表达式${RESET}"
-    read -p "请选择: " t
-    case $t in
-        1) cron_expr="0 0 * * *" ;;
-        2) cron_expr="0 0 * * 1" ;;
-        3) cron_expr="0 0 1 * *" ;;
-        4) read -p "请输入标准 5 位 Cron 表达式: " cron_expr ;;
-        *) echo -e "${RED}❌ 无效选择${RESET}"; return ;;
-    esac
-
-    SCRIPT_PATH="$SCRIPT_DIR/rclone_sync_${TASK_NAME}.sh"
-    cat > "$SCRIPT_PATH" << 'EOF'
-#!/bin/bash
-CONFIG_FILE="/opt/rclone_manager/config.env"
-if [ -f "$CONFIG_FILE" ]; then source "$CONFIG_FILE"; fi
-EOF
-
-    cat >> "$SCRIPT_PATH" << EOF
-LOG_FILE="$LOG_DIR/rclone_sync_${TASK_NAME}.log"
-send_tg() {
-    if [[ "\$TG_TOKEN" != "填入你的默认BotToken" ]]; then
-        curl -s -X POST "https://api.telegram.org/bot\${TG_TOKEN}/sendMessage" \
-        -d chat_id="\${TG_CHAT_ID}" -d text="[\${VPS_NAME}] \$1" >/dev/null
-    fi
-}
-for d in $LOCAL_DIR; do
-    [ ! -d "\$d" ] && continue
-    name=\$(basename "\$d")
-    target="${REMOTE_NAME}:${REMOTE_DIR}/\$name"
-    rclone sync "\$d" "\$target" -v >> "\$LOG_FILE" 2>&1
-    if [ \$? -eq 0 ]; then
-        echo "[\$(date '+%F %T')] \$d 同步完成 ✅" >> "\$LOG_FILE"
-        send_tg "定时任务 [${TASK_NAME}] 同步成功: \$d ✅"
+    echo -e "${GREEN}====== 🚀 Telegram 内置一键代理链接 ======${RESET}"
+    if [ -n "$auth_user" ]; then
+        echo -e "${YELLOW}https://t.me/socks?server=${public_ip}&port=${bind_port}&user=${auth_user}&pass=${auth_pass}${RESET}"
     else
-        echo "[\$(date '+%F %T')] \$d 同步失败 ❌" >> "\$LOG_FILE"
-        send_tg "⚠️ 定时任务 [${TASK_NAME}] 同步失败: \$d ❌"
+        echo -e "${YELLOW}https://t.me/socks?server=${public_ip}&port=${bind_port}${RESET}"
     fi
-done
-EOF
-
-    chmod +x "$SCRIPT_PATH"
-    (crontab -l 2>/dev/null | grep -v "$CRON_PREFIX$TASK_NAME"; echo "$cron_expr $SCRIPT_PATH $CRON_PREFIX$TASK_NAME") | crontab -
-    echo -e "${GREEN}任务 $TASK_NAME 已成功添加并注入 Crontab！${RESET}"
+    echo ""
 }
 
-schedule_del_one() {
-    echo -e "${YELLOW}--- 正在检索本脚本生成的任务... ---${RESET}"
-    local count=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX" | wc -l)
-    if [ "$count" -eq 0 ]; then
-        echo -e "${YELLOW}未发现通过本脚本创建的 Rclone 定时任务。${RESET}"
-        return
+# ── 3. 面板核心数据抓取 ───────────────────────────────────────────────────────
+get_status_info() {
+    if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
+        panel_status="${GREEN}运行中${RESET}"
+    else
+        panel_status="${RED}未运行${RESET}"
     fi
 
-    crontab -l 2>/dev/null | grep "$CRON_PREFIX" | awk -F "$CRON_PREFIX" '{print "● 可删除任务名: " $2}'
-    echo "---------------------------------------"
-    read -p "请输入你想精确删除的任务名称: " TASK_NAME
-    [ -z "$TASK_NAME" ] && return
-
-    crontab -l 2>/dev/null | grep -v "$CRON_PREFIX$TASK_NAME" | crontab -
-    rm -f "$SCRIPT_DIR/rclone_sync_${TASK_NAME}.sh"
-    echo -e "${GREEN}已成功移除任务: $TASK_NAME${RESET}"
-}
-
-cron_task_menu() {
-    while true; do
-        clear
-        show_cron_panel
-        read -p "$(echo -e ${GREEN}请输入定时任务选项数字: ${RESET})" choice_cron
-        echo ""
-        case $choice_cron in
-            1) schedule_add ;;
-            2) schedule_del_one ;;
-            3) 
-                echo -e "${YELLOW}即将打开全局 Crontab。${RESET}"
-                read -p "按回车键开始编辑..."
-                crontab -e 
-                ;;
-            0) break ;;
-            *) echo -e "${RED}❌ 输入错误！${RESET}" ;;
-        esac
-        read -p "按回车键继续..."
-    done
-}
-
-# ================== 手动同步功能 ==================
-sync_local_to_remote_multi() {
-    read -p "请输入本地目录路径（多个用空格分隔）: " local_dirs
-    [ -z "$local_dirs" ] && return
-    read -p "请输入Rclone创建的网盘名称: " remote
-    [ -z "$remote" ] && return
-    read -p "请输入远程目标目录(默认 backup): " remote_dir
-    remote_dir=${remote_dir:-backup}
-
-    for d in $local_dirs; do
-        if [ ! -d "$d" ]; then
-            echo -e "${RED}目录不存在，跳过: $d${RESET}"
-            continue
-        fi
-        name=$(basename "$d")
-        target="${remote}:${remote_dir}/${name}"
-        LOG_FILE="$LOG_DIR/rclone_sync_${name}.log"
-
-        echo -e "${YELLOW}正在同步: $d → $target ...${RESET}"
-        rclone sync "$d" "$target" -v -P 2>&1 | tee -a "$LOG_FILE"
-
-        if [ ${PIPESTATUS[0]} -eq 0 ]; then
-            echo "[ $(date '+%F %T') ] 同步完成 ✅" >> "$LOG_FILE"
-            send_tg "Rclone 同步完成: $d → $target ✅"
+    if [ -f "$INSTALL_BIN" ]; then
+        if [ -f "${CONF_DIR}/.version" ]; then
+            panel_version=$(cat "${CONF_DIR}/.version")
         else
-            echo "[ $(date '+%F %T') ] 同步失败 ❌" >> "$LOG_FILE"
-            send_tg "⚠️ Rclone 同步失败: $d → $target ❌"
+            local raw_ver
+            raw_ver=$("$INSTALL_BIN" --version 2>/dev/null | grep -oE '[vV]?[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+            if [ -n "$raw_ver" ]; then
+                panel_version="$raw_ver"
+                echo "$raw_ver" > "${CONF_DIR}/.version" 2>/dev/null
+            else
+                panel_version="v0.4.0"
+            fi
         fi
-    done
+    else
+        panel_version="${RED}未安装${RESET}"
+    fi
+
+    if [ -f "$CONF_FILE" ]; then
+        panel_port=$(gawk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
+    else
+        panel_port="未设定"
+    fi
 }
 
-sync_remote_to_local() {
-    read -p "请输入Rclone创建的网盘名称: " remote
-    [ -z "$remote" ] && return
-    read -p "请输入远程备份目录 (例如 backup): " remote_dir
-    read -p "请输入本地恢复目标目录: " local_dir
-    [ -z "$local_dir" ] && return
+menu_install() {
+    if [ -f "$INSTALL_BIN" ]; then
+        warn "系统中已存在安装好的实例文件。"
+        echo -n -e "${GREEN}是否确定完全覆盖重新安装？[y/N]: ${RESET}"
+        read -r res
+        [[ "$res" =~ ^[Yy]$ ]] || return
+    fi
+
+    echo -e "\n${GREEN}==== [自定义安装配置] ====${RESET}"
+    echo -n -e "${GREEN}请输入监听 IP 地址 [默认 ::]: ${RESET}"
+    read -r input_ip
+    local opt_ip="${input_ip:-::}"
+
+    local rand_port=$((RANDOM % 50001 + 10000))
+    echo -n -e "${GREEN}请输入 SOCKS5 监听端口 [回车默认随机端口: ${rand_port}]: ${RESET}"
+    read -r input_port
+    local opt_port="${input_port:-$rand_port}"
+    if ! [[ "$opt_port" =~ ^[0-9]+$ ]] || [ "$opt_port" -le 0 ] || [ "$opt_port" -gt 65535 ]; then
+        opt_port=$rand_port
+    fi
+
+    local rand_user="user_$(openssl rand -hex 4)"
+    local rand_pass="$(openssl rand -hex 10)"
+    local opt_user="" local opt_pass=""
+
+    echo -n -e "${GREEN}请输入自定义用户名 [回车默认随机: ${YELLOW}${rand_user}${GREEN}, 输入 ${RED}none${GREEN} 选免密]: ${RESET}"
+    read -r input_user
+    if [ -z "$input_user" ]; then
+        opt_user="$rand_user"
+        echo -n -e "${GREEN}请输入自定义密码 [回车默认随机: ${YELLOW}${rand_pass}${GREEN}]: ${RESET}"
+        read -r input_pass
+        opt_pass="${input_pass:-$rand_pass}"
+    elif [ "$input_user" = "none" ]; then
+        opt_user=""
+        opt_pass=""
+    else
+        opt_user="$input_user"
+        echo -n -e "${GREEN}请输入自定义密码 [回车默认随机: ${YELLOW}${rand_pass}${GREEN}]: ${RESET}"
+        read -r input_pass
+        opt_pass="${input_pass:-$rand_pass}"
+    fi
+
+    download_and_extract
+
+    if ! getent group "$SERVICE_USER" >/dev/null 2>&1; then
+        addgroup -S "$SERVICE_USER" 2>/dev/null
+    fi
+    if ! id "$SERVICE_USER" >/dev/null 2>&1; then
+        adduser -S -D -H -G "$SERVICE_USER" -h "$DATA_DIR" -s /sbin/nologin "$SERVICE_USER" 2>/dev/null
+    fi
+
+    install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$INSTALL_BIN"
+    install -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" -d "$DATA_DIR"
+    write_config "$opt_ip" "$opt_port" "$opt_user" "$opt_pass"
+    write_openrc
+
+    info "正在拉起后台服务..."
+    rc-service "$SERVICE_NAME" restart
     
-    mkdir -p "$local_dir"
-    rclone sync "${remote}:${remote_dir}" "$local_dir" -v -P
+    local is_ok=1
+    for i in {1..5}; do
+        if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then is_ok=0; break; fi
+        sleep 1
+    done
+
+    if [ "$is_ok" -eq 0 ]; then
+        ok "next-socks5 代理服务部署成功！"
+        print_node_summary
+    else
+        warn "部署完成，但初始化响应异常，请稍后选择 [8] 查看实时日志。"
+    fi
 }
 
-# ================== 卸载全面清理 ==================
-uninstall_rclone() {
-    read -p "确定要彻底卸载 Rclone 及所有管理配置吗？(y/N): " SECURE_CONFIRM
-    [ "$SECURE_CONFIRM" != "y" ] && return
-
-    echo -e "${YELLOW}正在全面清理 Rclone 环境与组件...${RESET}"
-    unmount_all
-    sudo rm -f /usr/bin/rclone /usr/local/bin/rclone
-    sudo rm -rf ~/.config/rclone
-    sudo rm -rf "$BASE_DIR"
-
-    echo -e "${GREEN}卸载完成！所有组件、挂载点及系统残留已清理。${RESET}"
-    exit 0
+menu_update() {
+    [ -f "$SERVICE_FILE" ] || die "未检测到系统服务，请先选择 [1] 进行完整安装。"
+    download_and_extract
+    rc-service "$SERVICE_NAME" stop
+    install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$INSTALL_BIN"
+    rc-service "$SERVICE_NAME" start
+    ok "next-socks5 核心主程序已完成平滑更新。"
 }
 
-# ================== 主循环入口 ==================
+menu_uninstall() {
+    rc-service "$SERVICE_NAME" stop >/dev/null 2>&1
+    rc-update del "$SERVICE_NAME" default >/dev/null 2>&1
+    rm -f "$INSTALL_BIN" "$SERVICE_FILE"
+    rm -rf "$CONF_DIR" "$DATA_DIR"
+    rm -f /var/log/next-socks5.log /var/log/next-socks5.err
+    deluser "$SERVICE_USER" >/dev/null 2>&1
+    ok "next-socks5 核心组件及配置文件已全部安全卸载收回。"
+}
+
+menu_edit_config() {
+    [ -f "$CONF_FILE" ] || die "未发现任何配置文件，请先执行安装步骤。"
+    
+    local current_bind
+    current_bind=$(gawk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
+    local current_ip="${current_bind%%:*}" local current_port="${current_bind##*:}"
+    
+    local current_method
+    current_method=$(gawk -F '=' '/^[[:space:]]*method[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$CONF_FILE")
+    
+    local current_user="" local current_pass=""
+    if [ "$current_method" = "password" ]; then
+        current_user=$(gawk -F '=' '/^[[:space:]]*username[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
+        current_pass=$(gawk -F '=' '/^[[:space:]]*password[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$CONF_FILE")
+    fi
+
+    [ -z "$current_ip" ] && current_ip="::"
+    [ -z "$current_port" ] && current_port="1080"
+
+    echo -e "\n${GREEN}==== [修改内核参数配置] ====${RESET}"
+    echo -n -e "${GREEN}请输入监听 IP 地址 [当前: ${current_ip}]: ${RESET}"
+    read -r input_ip
+    local opt_ip="${input_ip:-$current_ip}"
+
+    local rand_port=$((RANDOM % 50001 + 10000))
+    echo -n -e "${GREEN}请输入 SOCKS5 监听端口 [当前: ${current_port}, 回车保持原样, 输入 ${YELLOW}rand${GREEN} 随机重置]: ${RESET}"
+    read -r input_port
+    local opt_port="$current_port"
+    if [ "$input_port" = "rand" ]; then
+        opt_port="$rand_port"
+    elif [ -n "$input_port" ]; then
+        if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -gt 0 ] && [ "$input_port" -le 65535 ]; then
+            opt_port="$input_port"
+        fi
+    fi
+
+    local opt_user="" local opt_pass=""
+    echo -n -e "${GREEN}请输入用户名 [当前: ${current_user:-无密码}, 输入 ${RED}none${GREEN} 彻底清除密码, 回车默认保持原样/不设置]: ${RESET}"
+    read -r input_user
+    
+    if [ -z "$input_user" ]; then
+        opt_user="$current_user"
+        opt_pass="$current_pass"
+    elif [ "$input_user" = "none" ]; then
+        opt_user=""
+        opt_pass=""
+    else
+        opt_user="$input_user"
+        echo -n -e "${GREEN}请输入新密码 [当前: ${current_pass:-无密码}, 回车默认保持原样/不设置]: ${RESET}"
+        read -r input_pass
+        opt_pass="${input_pass:-$current_pass}"
+    fi
+
+    write_config "$opt_ip" "$opt_port" "$opt_user" "$opt_pass"
+    if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
+        rc-service "$SERVICE_NAME" restart
+        ok "配置已覆盖，全套代理服务已同步重启生效！"
+        print_node_summary
+    else
+        ok "配置已成功重写更新。"
+    fi
+}
+
+menu_show_node_config() {
+    if [ ! -f "$CONF_FILE" ]; then 
+        die "未检测到有效的服务配置文件，请先执行选择 [1] 进行完整安装。"
+    fi
+    print_node_summary
+}
+
+# ── 4. 主循环控制中心 ─────────────────────────────────────────────────────────
 while true; do
-    show_menu
-    read -p "$(echo -e ${GREEN}请输入选项数字: ${RESET})" choice
-    case $choice in
-        1) install_rclone ;;
-        2) update_rclone ;;
-        3) config_rclone ;;
-        4) list_remotes ;;
-        5) list_files_remote ;;
-        6) mount_remote ;;
-        7) show_assets_manifest ;;
-        8) unmount_remote_by_name ;;
-        9) unmount_all ;;
-        10) view_mount_status ;;
-        11) view_mount_logs ;;
-        12) sync_local_to_remote_multi ;;
-        13) sync_remote_to_local ;;
-        14) cron_task_menu ;;
-        15) modify_tg ;;
-        16) uninstall_rclone ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}输入错误，请输入菜单中的有效数字！${RESET}" ;;
+    get_status_info
+    clear
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}       next-socks5 面板       ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $panel_status"
+    echo -e "${GREEN}版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
+    echo -e "${GREEN}绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN} 1. 安装 next-socks5${RESET}"
+    echo -e "${GREEN} 2. 更新 next-socks5${RESET}"
+    echo -e "${GREEN} 3. 卸载 next-socks5${RESET}"
+    echo -e "${GREEN} 4. 修改配置${RESET}"
+    echo -e "${GREEN} 5. 启动 next-socks5${RESET}"
+    echo -e "${GREEN} 6. 停止 next-socks5${RESET}"
+    echo -e "${GREEN} 7. 重启 next-socks5${RESET}"
+    echo -e "${GREEN} 8. 查看日志${RESET}"
+    echo -e "${GREEN} 9. 查看配置${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    
+    echo -n -e "${GREEN}请输入选项: ${RESET}"
+    read -r choice
+    
+    case "$choice" in
+        1) menu_install ;;
+        2) menu_update ;;
+        3) menu_uninstall ;;
+        4) menu_edit_config ;;
+        5) rc-service "$SERVICE_NAME" start && ok "动作: 核心启动成功" ;;
+        6) rc-service "$SERVICE_NAME" stop && ok "动作: 核心停止成功" ;;
+        7) rc-service "$SERVICE_NAME" restart && ok "动作: 核心重启成功" ;;
+        8) 
+            if [ -f /var/log/next-socks5.log ]; then
+                echo -e "${YELLOW}按 Ctrl+C 退出日志查看...${RESET}\n"
+                tail -n 50 -f /var/log/next-socks5.log
+            else
+                warn "暂无日志文件生成，或服务尚未运行。"
+            fi
+            ;;
+        9) menu_show_node_config ;;
+        0) clear; exit 0 ;;
+        *) warn "未识别的无效序号！"; sleep 1 ;;
     esac
-    read -r -p "按回车键继续..."
+    
+    echo -n -e "${GREEN}按回车键返回主控制面板...${RESET}"
+    read -r _
 done

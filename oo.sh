@@ -1,13 +1,13 @@
-#!/bin/bash
+#!/bin/sh
 set -e
 
 #================================================================================
-# 常量和全局变量定义
+# 常量和全局变量定义 (Alpine 专属路径)
 #================================================================================
 REDSOCKS_CONF="/etc/redsocks.conf"
 IPTABLES_RULES="/etc/redsocks.rules"
 IP6TABLES_RULES="/etc/redsocks6.rules"
-SERVICE_FILE="/etc/systemd/system/redsocks.service"
+INIT_FILE="/etc/init.d/redsocks"
 
 # 颜色高亮定义
 RED='\033[0;31m'
@@ -26,7 +26,7 @@ error() { echo -e "${RED}[错误]${NC} $1"; }
 step() { echo -e "${PURPLE}[步骤]${NC} $1"; }
 
 require_root() {
-    if [ "$EUID" -ne 0 ]; then
+    if [ "$(id -u)" -ne 0 ]; then
         error "请使用 root 权限运行此脚本，例如: sudo $0"
         exit 1
     fi
@@ -56,18 +56,19 @@ cleanup_iptables() {
 }
 
 #================================================================================
-# 核心配置交互与文件写入（全面兼容 IPv4 / IPv6 节点）
+# 核心配置交互与文件写入（全面兼容 兼容 BusyBox 语法）
 #================================================================================
 write_config_file() {
     local current_local_port="12345"
     local current_addr="" current_port="" current_user="" current_pass=""
     
     if [ -f "$REDSOCKS_CONF" ]; then
-        current_local_port=$(grep -E '^[[:space:]]*local_port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
-        current_addr=$(grep -E '^[[:space:]]*ip[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
-        current_port=$(grep -E '^[[:space:]]*port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
-        current_user=$(grep -E '^[[:space:]]*login[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
-        current_pass=$(grep -E '^[[:space:]]*password[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
+        # 适配 BusyBox awk/grep 提取逻辑
+        current_local_port=$(grep -E '^[[:space:]]*local_port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | cut -d'=' -f2 | tr -d " ';\" ")
+        current_addr=$(grep -E '^[[:space:]]*ip[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | cut -d'=' -f2 | tr -d " ';\" ")
+        current_port=$(grep -E '^[[:space:]]*port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | cut -d'=' -f2 | tr -d " ';\" ")
+        current_user=$(grep -E '^[[:space:]]*login[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | cut -d'=' -f2 | tr -d " ';\" ")
+        current_pass=$(grep -E '^[[:space:]]*password[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | cut -d'=' -f2 | tr -d " ';\" ")
     fi
 
     [ -z "$current_local_port" ] && current_local_port="12345"
@@ -78,26 +79,33 @@ write_config_file() {
     # 1. 自定义 Redsocks 本地监听端口
     local input_local_port
     while true; do
-        read -r -p "请输入 Redsocks 本地监听端口 [$current_local_port]: " input_local_port
+        echo -n "请输入 Redsocks 本地监听端口 [$current_local_port]: "
+        read -r input_local_port
         [ -z "$input_local_port" ] && input_local_port=$current_local_port
-        if [[ "$input_local_port" =~ ^[0-9]+$ ]] && [ "$input_local_port" -ge 1 ] && [ "$input_local_port" -le 65535 ]; then
+        if echo "$input_local_port" | grep -qE '^[0-9]+$' && [ "$input_local_port" -ge 1 ] && [ "$input_local_port" -le 65535 ]; then
             break
         else
             error "无效的端口号，请输入 1 到 65535 之间的数字。"
         fi
     done
 
-    # 2. 远端 Socks5 节点地址 (自动检测 v4 或 v6)
+    # === 设置默认值 ===
+    [ -z "$current_addr" ] && current_addr="127.0.0.1"
+    [ -z "$current_port" ] && current_port="1080"
+
+    # 2. 远端 Socks5 节点地址
     local input_addr is_v6=0
     while true; do
         if [ -n "$current_addr" ]; then
-            read -r -p "请输入 Socks5 服务器地址/IP [$current_addr]: " input_addr
+            echo -n "请输入 Socks5 服务器地址/IP [$current_addr]: "
+            read -r input_addr
             [ -z "$input_addr" ] && input_addr=$current_addr
         else
-            read -r -p "请输入 Socks5 服务器地址/IP (支持IPv6如 2001:db8::1): " input_addr
+            echo -n "请输入 Socks5 服务器地址/IP (支持IPv6如 2001:db8::1): "
+            read -r input_addr
         fi
         if [ -n "$input_addr" ]; then 
-            if [[ "$input_addr" == *":"* ]]; then
+            if echo "$input_addr" | grep -q ":"; then
                 is_v6=1
             fi
             break
@@ -110,12 +118,14 @@ write_config_file() {
     local input_port
     while true; do
         if [ -n "$current_port" ]; then
-            read -r -p "请输入 Socks5 服务器端口 [$current_port]: " input_port
+            echo -n "请输入 Socks5 服务器端口 [$current_port]: "
+            read -r input_port
             [ -z "$input_port" ] && input_port=$current_port
         else
-            read -r -p "请输入 Socks5 服务器端口 (1-65535): " input_port
+            echo -n "请输入 Socks5 服务器端口 (1-65535): "
+            read -r input_port
         fi
-        if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
+        if echo "$input_port" | grep -qE '^[0-9]+$' && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
             break
         else
             error "无效的端口号，请输入 1 到 65535 之间的数字。"
@@ -125,22 +135,26 @@ write_config_file() {
     # 4. 用户名
     local input_user
     if [ -n "$current_user" ]; then
-        read -r -p "请输入用户名 (回车保持现状, 彻底清空请输入 none) [$current_user]: " input_user
+        echo -n "请输入用户名 (回车保持现状, 彻底清空请输入 none) [$current_user]: "
+        read -r input_user
         [ -z "$input_user" ] && input_user=$current_user
         [ "$input_user" = "none" ] && input_user=""
     else
-        read -r -p "请输入用户名 (可选，无验证直接留空回车): " input_user
+        echo -n "请输入用户名 (可选，无验证直接留空回车): "
+        read -r input_user
     fi
 
     # 5. 密码
     local input_pass
     if [ -n "$input_user" ]; then
         if [ -n "$current_pass" ]; then
-            read -r -p "请输入密码 (回车保持现状, 彻底清空请输入 none) [$current_pass]: " input_pass
+            echo -n "请输入密码 (回车保持现状, 彻底清空请输入 none) [$current_pass]: "
+            read -r input_pass
             [ -z "$input_pass" ] && input_pass=$current_pass
             [ "$input_pass" = "none" ] && input_pass=""
         else
-            read -r -p "请输入密码 (可选，无验证直接留空回车): " input_pass
+            echo -n "请输入密码 (可选，无验证直接留空回车): "
+            read -r input_pass
         fi
     else
         input_pass=""
@@ -241,59 +255,78 @@ EOF
 }
 
 #================================================================================
-# 服务管理块
+# OpenRC 服务管理块 (Alpine 专属)
 #================================================================================
 install_redsocks_env() {
     cleanup_iptables
 
-    step "[1/4] 从软件源检查并安装 redsocks 双栈核心组件..."
-    if ! command -v redsocks &>/dev/null; then
-        apt-get update && apt-get install -y redsocks iptables ip6tables curl || {
-            error "安装基础包失败，请检查系统网络或 apt 源！"
-            return 1
-        }
-    fi
+    step "[1/4] 从 Alpine apk 软件源检查并安装必备组件..."
+    # 确保安装了 iptables, ip6tables 和 curl
+    apk update
+    apk add redsocks iptables ip6tables curl
 
-    systemctl stop redsocks 2>/dev/null || true
-    systemctl disable redsocks 2>/dev/null || true
+    # 停止原有的 Redsocks 默认服务
+    rc-service redsocks stop 2>/dev/null || true
+    rc-update del redsocks default 2>/dev/null || true
 
     step "[2/4] 进入节点配置录入阶段..."
     write_config_file
 
-    step "[3/4] 正在向系统注册自定义双栈劫持服务 (redsocks.service)..."
-    cat > "$SERVICE_FILE" <<EOF
-[Unit]
-Description=Redsocks Transparent Proxy Service (IPv4+IPv6)
-After=network.target
+    step "[3/4] 正在向系统注册 OpenRC 专属劫持服务文件..."
+    cat > "$INIT_FILE" << 'EOF'
+#!/sbin/openrc-run
 
-[Service]
-Type=forking
-PIDFile=/run/redsocks.pid
-ExecStartPre=-/bin/rm -f /run/redsocks.pid
-ExecStart=/usr/sbin/redsocks -c $REDSOCKS_CONF -p /run/redsocks.pid
-ExecStartPost=/bin/sh -c '/sbin/iptables-restore < $IPTABLES_RULES && /sbin/ip6tables-restore < $IP6TABLES_RULES'
-ExecStopPost=/bin/sh -c 'iptables -t nat -D OUTPUT -p tcp -j REDSOCKS 2>/dev/null || true; iptables -t nat -F REDSOCKS 2>/dev/null || true; iptables -t nat -X REDSOCKS 2>/dev/null || true; ip6tables -t nat -D OUTPUT -p tcp -j REDSOCKS6 2>/dev/null || true; ip6tables -t nat -F REDSOCKS6 2>/dev/null || true; ip6tables -t nat -X REDSOCKS6 2>/dev/null || true'
-TimeoutStartSec=5
-Restart=on-failure
-LimitNOFILE=524288
+description="Redsocks Transparent Proxy Service (IPv4+IPv6 for Alpine)"
+pidfile="/run/redsocks.pid"
+command="/usr/sbin/redsocks"
+command_args="-c /etc/redsocks.conf -p $pidfile"
 
-[Install]
-WantedBy=multi-user.target
+depend() {
+    need net
+    after firewall
+}
+
+start_post() {
+    ebegin "Loading IPv4/IPv6 Redsocks rules into iptables"
+    if [ -f "/sbin/iptables-restore" ]; then
+        /sbin/iptables-restore < /etc/redsocks.rules
+    else
+        iptables-restore < /etc/redsocks.rules
+    fi
+    
+    if [ -f "/sbin/ip6tables-restore" ]; then
+        /sbin/ip6tables-restore < /etc/redsocks6.rules
+    else
+        ip6tables-restore < /etc/redsocks6.rules
+    fi
+    eend $?
+}
+
+stop_post() {
+    ebegin "Cleaning up Redsocks iptables rules"
+    iptables -t nat -D OUTPUT -p tcp -j REDSOCKS 2>/dev/null || true
+    iptables -t nat -F REDSOCKS 2>/dev/null || true
+    iptables -t nat -X REDSOCKS 2>/dev/null || true
+    ip6tables -t nat -D OUTPUT -p tcp -j REDSOCKS6 2>/dev/null || true
+    ip6tables -t nat -F REDSOCKS6 2>/dev/null || true
+    ip6tables -t nat -X REDSOCKS6 2>/dev/null || true
+    eend 0
+}
 EOF
 
+    chmod +x "$INIT_FILE"
     chown root:root "$REDSOCKS_CONF" 2>/dev/null || true
     chmod 644 "$REDSOCKS_CONF" 2>/dev/null || true
 
-    systemctl daemon-reload
-    systemctl enable redsocks.service 2>/dev/null
+    rc-update add redsocks default
     
-    step "[4/4] 正在自动激活服务并开启双栈全局透明代理..."
-    systemctl start redsocks.service || {
-        error "自动启动代理失败，请检查配置或运行日志。"
+    step "[4/4] 正在自动激活 OpenRC 服务并开启双栈全局透明代理..."
+    rc-service redsocks start || {
+        error "自动启动代理失败，请检查配置或日志。"
         return 1
     }
 
-    success "Redsocks 双栈全套环境已完美拉起运行！支持 Warp 与 IPv6 节点！"
+    success "Redsocks 双栈全套 Alpine 环境已完美拉起运行！"
 }
 
 change_config() {
@@ -302,9 +335,9 @@ change_config() {
     chown root:root "$REDSOCKS_CONF" 2>/dev/null || true
     success "双栈配置文件与 Iptables 联动规则更新成功！"
     
-    if systemctl is-active --quiet redsocks.service; then
-        step "检测到服务正在后台运行，正在自动重启服务以应用新配置与端口..."
-        systemctl restart redsocks.service
+    if rc-service redsocks status 2>/dev/null | grep -q "started"; then
+        step "检测到服务正在后台运行，正在自动重启服务以应用新配置..."
+        rc-service redsocks restart
         success "新配置已无缝双栈生效。"
     else
         info "提示：配置已就绪，当前服务处于停止状态。请在主菜单选择【选项 4】手动启动。"
@@ -312,45 +345,38 @@ change_config() {
 }
 
 uninstall_redsocks_env() {
-    step "正在停止并彻底禁用后台 redsocks 服务并安全恢复网络..."
-    systemctl stop redsocks.service 2>/dev/null || true
-    systemctl disable redsocks.service 2>/dev/null || true
+    step "正在停止并彻底禁用后台 redsocks 服务..."
+    rc-service redsocks stop 2>/dev/null || true
+    rc-update del redsocks default 2>/dev/null || true
     cleanup_iptables
 
     step "正在清理系统残留组件文件..."
-    [ -f "$SERVICE_FILE" ] && rm -f "$SERVICE_FILE"
+    [ -f "$INIT_FILE" ] && rm -f "$INIT_FILE"
     [ -f "$REDSOCKS_CONF" ] && rm -f "$REDSOCKS_CONF"
     [ -f "$IPTABLES_RULES" ] && rm -f "$IPTABLES_RULES"
     [ -f "$IP6TABLES_RULES" ] && rm -f "$IP6TABLES_RULES"
     
-    systemctl daemon-reload
-    success "环境已彻底从系统卸载干净。"
+    success "Alpine 专属环境已彻底从系统卸载干净。"
 }
 
 get_status() {
-    if systemctl is-active --quiet redsocks.service; then
+    if rc-service redsocks status 2>/dev/null | grep -q "started"; then
         status_show="${GREEN}已启动 (运行中)${RESET}"
     else
         status_show="${RED}已停止 (未运行)${RESET}"
     fi
 
     if command -v redsocks &>/dev/null; then
-        local version_raw
-        version_raw=$(redsocks -v 2>&1 | grep -oE '[0-9]+\.[0-9.]+' | head -n1)
-        if [ -n "$version_raw" ]; then
-            version_show="${YELLOW}v${version_raw}${RESET}"
-        else
-            version_show="${YELLOW}已安装${RESET}"
-        fi
+        version_show="${YELLOW}已安装${RESET}"
     else
         version_show="${RED}未安装${RESET}"
     fi
 
     if [ -f "$REDSOCKS_CONF" ]; then
         local port addr local_port
-        local_port=$(grep -E '^[[:space:]]*local_port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
-        addr=$(grep -E '^[[:space:]]*ip[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
-        port=$(grep -E '^[[:space:]]*port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
+        local_port=$(grep -E '^[[:space:]]*local_port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | cut -d'=' -f2 | tr -d " ';\" ")
+        addr=$(grep -E '^[[:space:]]*ip[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | cut -d'=' -f2 | tr -d " ';\" ")
+        port=$(grep -E '^[[:space:]]*port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | cut -d'=' -f2 | tr -d " ';\" ")
         port_show="${YELLOW}${addr}:${port} ${NC}->${CYAN} 本地监听:${local_port}${RESET}"
     else
         port_show="${RED}无配置${RESET}"
@@ -360,18 +386,15 @@ get_status() {
 test_exit_ip() {
     step "正在通过全局双栈 iptables 转发层查询落地出口 IP..."
     local ip_info=""
-    local test_urls=("https://api.ipify.org?format=json" "https://ipinfo.io/json")
+    local test_urls="https://api.ipify.org?format=json"
 
-    for url in "${test_urls[@]}"; do
-        info "正在尝试请求: $url ..."
-        ip_info=$(curl -s -m 6 "$url" 2>/dev/null || echo "")
-        if [ -n "$ip_info" ]; then break; fi
-    done
+    info "正在尝试请求: $test_urls ..."
+    ip_info=$(curl -s -m 6 "$test_urls" 2>/dev/null || echo "")
 
     if [ -n "$ip_info" ]; then
         echo -e "${GREEN}----------------------------------------${RESET}"
         if echo "$ip_info" | grep -q "{"; then
-            echo "$ip_info" | sed 's/["{}]//g' | sed 's/,/\n/g' | sed 's/^ *//'
+            echo "$ip_info" | tr -d '"{}' | tr ',' '\n' | sed 's/^ *//'
         else
             echo -e "当前落地出口 IP: ${YELLOW}$ip_info${RESET}"
         fi
@@ -388,13 +411,13 @@ panel_menu() {
         get_status
         clear
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}             Redsocks           ${RESET}"
+        echo -e "${GREEN}      Redsocks Menu (Alpine)    ${RESET}"
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN}状态   :${RESET} $status_show"
         echo -e "${GREEN}版本   :${RESET} $version_show"
         echo -e "${GREEN}代理   :${RESET} $port_show"
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} 1. 安装 Redsocks${RESET}"
+        echo -e "${GREEN} 1. 安装 Redsocks (Alpine 专属)${RESET}"
         echo -e "${GREEN} 2. 卸载 Redsocks${RESET}"
         echo -e "${GREEN} 3. 修改配置${RESET}"
         echo -e "${GREEN} 4. 启动 Redsocks${RESET}"
@@ -405,7 +428,6 @@ panel_menu() {
         echo -e "${GREEN} 0. 退出${RESET}"
         echo -e "${GREEN}================================${RESET}"
         
-        # 修复 read 语法，避免特定环境下终端高亮断色
         echo -ne "${GREEN}请输入数字: ${RESET}"
         read -r num
         case "$num" in
@@ -417,26 +439,32 @@ panel_menu() {
                 if [ ! -f "$REDSOCKS_CONF" ]; then
                     error "未发现有效配置！"
                 else
-                    systemctl start redsocks.service && success "双栈代理全力运转。" || error "启动失败。"
+                    rc-service redsocks start && success "双栈代理全力运转。" || error "启动失败。"
                 fi
                 ;;
             5)
                 step "正在安全关闭双栈代理并恢复原网..."
-                systemctl stop redsocks.service && success "网络彻底复原。" || error "停用失败。"
+                rc-service redsocks stop && success "网络彻底复原。" || error "停用失败。"
                 ;;
             6)
-                systemctl restart redsocks.service && success "重启成功。" || error "重启失败。"
+                rc-service redsocks restart && success "重启成功。" || error "重启失败。"
                 ;;
             7)
-                journalctl -u redsocks.service -n 30 --no-pager || tail -n 30 /var/log/syslog
+                if [ -f /var/log/messages ]; then
+                    tail -n 30 /var/log/messages | grep redsocks || tail -n 30 /var/log/messages
+                else
+                    echo "Alpine 默认使用 syslog，如未查到日志请运行：rc-service syslog status"
+                    dmesg | tail -n 30
+                fi
                 ;;
             8) test_exit_ip ;;
             0) exit 0 ;;
             *) error "非法数字！" ;;
         esac
         echo -ne "${YELLOW}按任意键返回主菜单...${RESET}"
-        read -r
+        read -r _
     done
 }
 
+# 运行主菜单
 panel_menu

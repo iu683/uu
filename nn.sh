@@ -1,30 +1,45 @@
-#!/bin/bash
-set -euo pipefail
-
+#!/usr/bin/env bash
+#
+# Hysteria 2 控制面板
+# SPDX-License-Identifier: MIT
+#
 # =========================================================
-# Shadowsocks-Rust 管理脚本
-# 加密方式: 2022-blake3-aes-256-gcm
+# 1. 核心控制与全局环境初始化
 # =========================================================
+set -Eop pipefail
+export LANG=en_US.UTF-8
 
-# ================== 颜色 ==================
+# 基础目录与硬编码配置
+readonly HY_CONFIG="/etc/mo-hy2/config.yaml"
+readonly HY_BINARY="/usr/local/bin/hysteria"
+readonly HY_DIR="/root/proxynode/hy2"
+EXECUTABLE_INSTALL_PATH="/usr/local/bin/hysteria"
+SYSTEMD_SERVICES_DIR="/etc/systemd/system"
+CONFIG_DIR="/etc/mo-hy2"
+REPO_URL="https://github.com/apernet/hysteria"
+API_BASE_URL="https://api.github.com/repos/apernet/hysteria"
+CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
+
+# 自动检测环境变量
+PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
+OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
+ARCHITECTURE="${ARCHITECTURE:-}"
+HYSTERIA_USER="${HYSTERIA_USER:-}"
+HYSTERIA_HOME_DIR="${HYSTERIA_HOME_DIR:-}"
+
+# 终端颜色代码
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 BLUE="\033[34m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-# ================== 基础变量 ==================
-SS_DIR="/etc/ss-rust"
-SS_CONFIG="${SS_DIR}/config.json"
-SS_SERVICE="/etc/systemd/system/ss-rust.service"
-BINARY_PATH="/usr/local/bin/ssserver"
-LOG_FILE="/var/log/ss-rust-manager.log"
-RUN_USER="ss-rust"
-METHOD="2022-blake3-aes-256-gcm"
-KEY_BYTES=32
-TMP_DIR=$(mktemp -d -t ss-rust.XXXXXX)
+# 全局变量占位
+firstport=""
+endport=""
 
-# ================== GITHUB 代理 ==================
+# GITHUB 代理列表（最后一个空字符串代表直连，作为兜底）
 GITHUB_PROXY=(
     ''
     'https://v6.gh-proxy.org/'
@@ -33,563 +48,893 @@ GITHUB_PROXY=(
     'https://proxy.vvvv.ee/'
     'https://ghproxy.lvedong.eu.org/'
 )
-
-# ================== cleanup ==================
-cleanup() {
-    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
-}
-trap cleanup EXIT INT TERM
-
-# ================== 日志 ==================
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+# =========================================================
+# 2. 官方原生底层工具函数
+# =========================================================
+has_command() {
+  local _command=$1
+  type -P "$_command" > /dev/null 2>&1
 }
 
-pause() {
-    read -n 1 -s -r -p "按任意键返回菜单..."
-    echo
+curl() {
+  command curl "${CURL_FLAGS[@]}" "$@"
 }
 
-# ================== 创建用户 ==================
-create_user() {
-    id -u "$RUN_USER" &>/dev/null || \
-        useradd -r -s /usr/sbin/nologin "$RUN_USER"
+mktemp() {
+  command mktemp "$@" "hyservinst.XXXXXXXXXX"
 }
 
-# ================== 获取公网IP ==================
-get_public_ip() {
-    local mode=${1:-"v4"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        # 强制获取 IPv4
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        # 强制获取 IPv6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
+info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
+error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
+pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
+
+generate_random_password() {
+  dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
+}
+
+systemctl() {
+  if ! has_command systemctl; then
+    warn "当前系统不支持 systemd，忽略守护进程操作: systemctl $*"
+    return 0
+  fi
+  command systemctl "$@"
+}
+
+install_content() {
+  local _install_flags="$1"
+  local _content="$2"
+  local _destination="$3"
+  local _overwrite="$4"
+  local _tmpfile="$(mktemp)"
+
+  echo -ne "安装 $_destination ... "
+  echo "$_content" > "$_tmpfile"
+  if [[ -z "$_overwrite" && -e "$_destination" ]]; then
+    echo -e "已存在"
+  elif install "$_install_flags" "$_tmpfile" "$_destination"; then
+    echo -e "完成"
+  fi
+  rm -f "$_tmpfile"
+}
+
+remove_file() {
+  local _target="$1"
+  echo -ne "移除 $_target ... "
+  if rm -f "$_target"; then
+    echo -e "完成"
+  fi
+}
+
+detect_package_manager() {
+  [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
+  has_command apt && PACKAGE_MANAGEMENT_INSTALL='apt -y --no-install-recommends install' && return 0
+  has_command dnf && PACKAGE_MANAGEMENT_INSTALL='dnf -y install' && return 0
+  has_command yum && PACKAGE_MANAGEMENT_INSTALL='yum -y install' && return 0
+  has_command apk && PACKAGE_MANAGEMENT_INSTALL='apk add --no-cache' && return 0
+  return 1
+}
+
+install_software() {
+  local _package_name="$1"
+
+  if ! detect_package_manager; then
+    error "未检测到支持的包管理器，请手动安装 $_package_name"
+    exit 65
+  fi
+
+  echo "正在安装缺失依赖: $_package_name"
+
+  if $PACKAGE_MANAGEMENT_INSTALL $_package_name >/dev/null 2>&1; then
+    echo "依赖安装成功"
+  else
+    error "无法安装 $_package_name"
+    exit 65
+  fi
+}
+
+install_netfilter_persistent() {
+  if has_command apt; then
+    export DEBIAN_FRONTEND=noninteractive
+
+    echo "安装 netfilter-persistent..."
+
+    install_software "iptables-persistent netfilter-persistent"
+
+    systemctl enable netfilter-persistent >/dev/null 2>&1
+    systemctl restart netfilter-persistent >/dev/null 2>&1
+
+    echo "netfilter-persistent 安装完成"
+  else
+    echo "当前系统不支持 netfilter-persistent，跳过"
+  fi
+}
+
+is_user_exists() { id "$1" > /dev/null 2>&1; }
+
+check_environment() {
+  if [[ "x$(uname)" == "xLinux" ]]; then
+    OPERATING_SYSTEM=linux
+  else
+    error "本脚本仅支持 Linux 系统。"
+    exit 95
+  fi
+
+  case "$(uname -m)" in
+    'i386' | 'i686') ARCHITECTURE='386' ;;
+    'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
+    'armv5tel' | 'armv6l' | 'armv7' | 'armv7l') ARCHITECTURE='arm' ;;
+    'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
+    's390x') ARCHITECTURE='s390x' ;;
+    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
+  esac
+
+  has_command curl || install_software curl
+  has_command grep || install_software grep
+  has_command jq || install_software jq
+  has_command openssl || install_software openssl
+  has_command socat || install_software socat
+  has_command python3 || install_software python3
+  
+  if ! has_command iptables; then
+    install_software iptables
+  fi
+}
+
+get_installed_version() {
+  if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
+    local version_out
+    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null || "$EXECUTABLE_INSTALL_PATH" -v 2>/dev/null || echo "")
+    if [[ -n "$version_out" ]]; then
+      echo "$version_out" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "未知格式"
     else
-        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
+      echo "未知版本"
     fi
-
-    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
-    echo "127.0.0.1" && return 0
-}
-# ================== 检查依赖 ==================
-check_deps() {
-    echo -e "${GREEN}[信息] 检查系统依赖...${RESET}"
-    install_pkg() {
-        if command -v apt >/dev/null 2>&1; then
-            apt update -y
-            apt install -y "$@"
-        elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y "$@"
-        elif command -v yum >/dev/null 2>&1; then
-            yum install -y "$@"
-        fi
-    }
-
-    command -v curl >/dev/null 2>&1 || install_pkg curl
-    command -v wget >/dev/null 2>&1 || install_pkg wget
-    command -v tar  >/dev/null 2>&1 || install_pkg tar
-
-    if ! command -v xz >/dev/null 2>&1; then
-        if command -v apt >/dev/null 2>&1; then
-            install_pkg xz-utils
-        else
-            install_pkg xz
-        fi
-    fi
-
-    command -v ss >/dev/null 2>&1 || {
-        if command -v apt >/dev/null 2>&1; then
-            install_pkg iproute2
-        else
-            install_pkg iproute
-        fi
-    }
-    command -v openssl >/dev/null 2>&1 || install_pkg openssl
-    echo -e "${GREEN}[完成] 依赖检查完成${RESET}"
+  else
+    echo "未安装"
+  fi
 }
 
-# ================== 检查端口 ==================
-check_port() {
-    if ss -tulnH "( sport = :$1 )" | grep -q .; then
-        echo -e "${RED}端口 $1 已被占用${RESET}"
-        return 1
-    fi
-}
-
-# ================== 随机密码 ==================
-random_key() {
-    openssl rand -base64 "$KEY_BYTES" | tr -d '\n'
-}
-
-# ================== 随机端口 ==================
-random_port() {
-    shuf -i 2000-65000 -n 1
-}
-
-# ================== 获取系统DNS ==================
-get_system_dns() {
-    grep -E '^nameserver' /etc/resolv.conf \
-        | awk '{print $2}' \
-        | paste -sd "," -
-}
-
-# ================== 验证密码 ==================
-validate_password() {
-    local password="$1"
-    if ! echo "$password" | base64 -d >/dev/null 2>&1; then
-        echo -e "${RED}密码不是合法 Base64${RESET}"
-        return 1
-    fi
-    local decoded_len
-    decoded_len=$(echo "$password" | base64 -d 2>/dev/null | wc -c)
-    if [[ "$decoded_len" -ne "$KEY_BYTES" ]]; then
-        echo -e "${RED}密码必须为 ${KEY_BYTES} 字节${RESET}"
-        return 1
-    fi
-}
-
-# ================== 检测架构 ==================
-detect_arch() {
-    case "$(uname -m)" in
-        x86_64)   echo "x86_64-unknown-linux-gnu" ;;
-        aarch64)  echo "aarch64-unknown-linux-gnu" ;;
-        armv7l)   echo "armv7-unknown-linux-gnueabihf" ;;
-        *)
-            echo -e "${RED}不支持架构: $(uname -m)${RESET}"
-            exit 1
-            ;;
-    esac
-}
-
-# ================== 获取最新版本 ==================
 get_latest_version() {
-    local version=""
-    # 同样尝试使用代理去请求 GitHub API，API 无法直接拼接 proxy 的有些代理站支持，这里优先直接请求，失败时尝试代理
-    version=$(curl -fsSL --max-time 5 "https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest" 2>/dev/null | grep tag_name | cut -d '"' -f4 | sed 's/v//')
+  local _tmpfile=$(mktemp)
+  local _success=1
+  local _tag_name=""
+
+  # 遍历代理尝试获取最新版本号
+  for proxy in "${GITHUB_PROXY[@]}"; do
+    # 拼接代理，如果是 API 请求，部分代理可能需要特殊处理，这里统一假设代理支持标准的 API 转发
+    # 如果代理只支持 releases/download，请确保 API_BASE_URL 本身是可以访问的
+    local _url="${proxy}${API_BASE_URL}/releases/latest"
     
-    if [[ -z "$version" ]]; then
-        for proxy in "${GITHUB_PROXY[@]}"; do
-            version=$(curl -fsSL --max-time 5 "${proxy}https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest" 2>/dev/null | grep tag_name | cut -d '"' -f4 | sed 's/v//')
-            [[ -n "$version" ]] && break
-        done
+    if curl -sS -H 'Accept: application/vnd.github.v3+json' "$_url" -o "$_tmpfile"; then
+      _tag_name=$(jq -r '.tag_name' "$_tmpfile" 2>/dev/null || echo "")
+      if [[ -n "$_tag_name" && "$_tag_name" != "null" ]]; then
+        _success=0
+        break
+      fi
     fi
-    echo "$version"
+  done
+
+  rm -f "$_tmpfile"
+
+  if [[ $_success -eq 0 ]]; then
+    echo "${_tag_name##*\/}"
+  else
+    echo ""
+  fi
 }
 
-# ================== 代理下载核心逻辑 ==================
-download_file() {
-    local url_path="$1"
-    local output_file="$2"
-    local success=1
+download_hysteria() {
+  local _version="$1"
+  local _destination="$2"
+  
+  if [[ ! "$_version" =~ "v" ]]; then
+     _version="v$_version"
+  fi
 
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        echo -e "${BLUE}[信息] 尝试使用代理下载: ${proxy:-直连}${RESET}"
-        if wget -T 15 -t 2 -O "$output_file" "${proxy}${url_path}"; then
-            success=0
-            break
-        fi
-    done
-    return $success
-}
-
-# ================== 写配置 ==================
-write_config() {
-    local port="$1"
-    local password="$2"
-    local dns="$3"
-
-    mkdir -p "$SS_DIR"
-    DNS_JSON=$(echo "$dns" | awk -F',' '{
-        for(i=1;i<=NF;i++){
-            gsub(/^[ \t]+|[ \t]+$/, "", $i)
-            printf "%s\"%s\"", (i>1?",":""), $i
-        }
-    }')
-
-    cat > "$SS_CONFIG" <<EOF
-{
-    "server": "::",
-    "server_port": $port,
-    "password": "$password",
-    "method": "$METHOD",
-    "fast_open": true,
-    "mode": "tcp_and_udp",
-    "timeout": 300,
-    "no_delay": true,
-    "ipv6_first": false,
-    "nameserver": [
-        $DNS_JSON
-    ]
-}
-EOF
-    chmod 600 "$SS_CONFIG"
-    chown -R ${RUN_USER}:${RUN_USER} "$SS_DIR"
-}
-
-# ================== 生成链接 ==================
-generate_links() {
-    local port="$1"
-    local password="$2"
-    IP=$(get_public_ip)
-    HOSTNAME=$(hostname -s | sed 's/ /_/g')
-    ENCODED=$(echo -n "${METHOD}:${password}" | base64 -w 0)
-
-    cat > "${SS_DIR}/ss.txt" <<EOF
-ss://${ENCODED}@${IP}:${port}#${HOSTNAME}-SS2022
-EOF
-
-    cat > "${SS_DIR}/surge.txt" <<EOF
-${HOSTNAME}-SS2022 = ss, ${IP}, ${port}, encrypt-method=${METHOD}, password=${password}, tfo=true, udp-relay=true, ecn=true
-EOF
-}
-
-# ================== 安装配置 ==================
-configure_ss() {
-    echo -e "${GREEN}[信息] 开始配置 Shadowsocks-Rust...${RESET}"
-    while true; do
-        read -p "请输入端口 (默认:随机生成): " input_port
-        if [[ -z "$input_port" ]]; then
-            port=$(random_port)
-        else
-            port="$input_port"
-        fi
-
-        if [[ "$port" =~ ^[0-9]+$ ]] && [[ "$port" -ge 1 ]] && [[ "$port" -le 65535 ]]; then
-            check_port "$port" || continue
-            break
-        else
-            echo -e "${RED}端口无效${RESET}"
-        fi
-    done
-
-    read -p "请输入密码 (默认:随机生成): " input_password
-    if [[ -z "$input_password" ]]; then
-        password=$(random_key)
-    else
-        validate_password "$input_password" || return
-        password="$input_password"
-    fi
-
-    default_dns=$(get_system_dns)
-    [[ -z "$default_dns" ]] && default_dns="1.1.1.1,8.8.8.8"
-
-    read -p "请输入 DNS (默认:$default_dns): " dns
-    dns=${dns:-$default_dns}
-
-    write_config "$port" "$password" "$dns"
-    generate_links "$port" "$password"
-    IP=$(get_public_ip)
-
-    echo -e "${GREEN}[完成] 配置已保存${RESET}"
-    echo -e "${GREEN}====== Shadowsocks 配置 ======${RESET}"
-    echo -e "${YELLOW} IP地址        : ${IP}${RESET}"
-    echo -e "${YELLOW} 端口          : ${port}${RESET}"
-    echo -e "${YELLOW} 密码          : ${password}${RESET}"
-    echo -e "${YELLOW} 加密          : ${METHOD}${RESET}"
-    echo -e "${YELLOW} DNS           : ${dns}${RESET}"
-    echo -e "${YELLOW}---------------------------------${RESET}"
-    echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
-    echo -e "${YELLOW}[信息] SS链接：${RESET}"
-    cat "${SS_DIR}/ss.txt"
-    echo
-    echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
-    cat "${SS_DIR}/surge.txt"
-    echo -e "${YELLOW}---------------------------------${RESET}"
-}
-
-# ================== 修改配置 ==================
-modify_ss() {
-    echo -e "${GREEN}[信息] 开始修改 Shadowsocks 配置...${RESET}"
-    if [[ ! -f "$SS_CONFIG" ]]; then
-        echo -e "${RED}配置文件不存在${RESET}"
-        return
-    fi
-
-    old_port=$(grep server_port "$SS_CONFIG" | grep -o '[0-9]\+')
-    old_password=$(grep password "$SS_CONFIG" | cut -d '"' -f4)
-    old_dns=$(awk '/"nameserver"/ {flag=1; next} flag && /\]/ {flag=0} flag {gsub(/[",[:space:]]/, ""); if(length) print}' "$SS_CONFIG" | paste -sd "," -)
-
-    echo -e "${YELLOW}当前端口 : ${old_port}${RESET}"
-    echo -e "${YELLOW}当前密码 : ${old_password}${RESET}"
-    echo
-
-    while true; do
-        read -p "请输入新端口 [当前:${old_port}]: " input_port
-        port=${input_port:-$old_port}
-        if [[ "$port" =~ ^[0-9]+$ ]] && [[ "$port" -ge 1 ]] && [[ "$port" -le 65535 ]]; then
-            if [[ "$port" != "$old_port" ]]; then
-                check_port "$port" || continue
-            fi
-            break
-        else
-            echo -e "${RED}端口无效${RESET}"
-        fi
-    done
-
-    echo
-    echo "1. 保持当前密码"
-    echo "2. 手动输入密码"
-    echo "3. 自动生成密码"
-    read -p "请选择 [默认:1]: " pwd_mode
-
-    case $pwd_mode in
-        2)
-            while true; do
-                read -p "请输入 Base64 密码: " input_password
-                validate_password "$input_password" && break
-            done
-            password="$input_password"
-            ;;
-        3)
-            password=$(random_key)
-            echo -e "${GREEN}已生成新密码${RESET}"
-            ;;
-        *)
-            password="$old_password"
-            ;;
-    esac
-
-    default_dns=$(get_system_dns)
-    [[ -z "$default_dns" ]] && default_dns="1.1.1.1,8.8.8.8"
-    default_dns=${old_dns:-$default_dns}
-
-    echo
-    read -p "请输入 DNS [当前:$default_dns]: " dns
-    dns=${dns:-$default_dns}
-
-    cp "$SS_CONFIG" "${SS_CONFIG}.bak.$(date +%s)"
-    write_config "$port" "$password" "$dns"
-    generate_links "$port" "$password"
-    systemctl restart ss-rust
-    IP=$(get_public_ip)
-
-    echo -e "${GREEN}[完成] 配置修改成功${RESET}"
-    echo
-    echo -e "${GREEN}====== Shadowsocks 配置 ======${RESET}"
-    echo -e "${YELLOW} IP地址        : ${IP}${RESET}"
-    echo -e "${YELLOW} 端口          : ${port}${RESET}"
-    echo -e "${YELLOW} 密码          : ${password}${RESET}"
-    echo -e "${YELLOW} 加密          : ${METHOD}${RESET}"
-    echo -e "${YELLOW} DNS           : ${dns}${RESET}"
-    echo
-    echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
-    echo -e "${YELLOW}[信息] SS链接：${RESET}"
-    cat "${SS_DIR}/ss.txt"
-    echo
-    echo -e "${YELLOW}[信息] Surge 配置：${RESET}"
-    cat "${SS_DIR}/surge.txt"
-    echo
-    log "Shadowsocks 配置已修改"
-}
-
-# ================== 安装 ==================
-install_ss() {
-    echo -e "${GREEN}[信息] 开始安装 Shadowsocks-Rust...${RESET}"
-    check_deps
-    create_user
-    mkdir -p "$SS_DIR"
-    cd "$TMP_DIR"
-
-    VERSION=$(get_latest_version)
-    if [[ -z "$VERSION" ]]; then
-        echo -e "${RED}[错误] 无法获取 GitHub 最新版本，请检查网络或稍后再试。${RESET}"
-        return
-    fi
+  # 遍历代理尝试下载
+  for proxy in "${GITHUB_PROXY[@]}"; do
+    # 尝试路径 1: app/ 路径
+    local _download_url="${proxy}${REPO_URL}/releases/download/app/$_version/hysteria-$OPERATING_SYSTEM-$ARCHITECTURE"
+    info "正在通过代理 [${proxy:-直连}] 下载官方 Hysteria 核心组件 (尝试1) ..."
     
-    ARCH=$(detect_arch)
-    URL_PATH="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${VERSION}/shadowsocks-v${VERSION}.${ARCH}.tar.xz"
-
-    if ! download_file "$URL_PATH" "ss.tar.xz"; then
-        echo -e "${RED}[错误] 所有 GitHub 代理均下载失败！${RESET}"
-        return
+    if curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
+      return 0
     fi
 
-    tar -xf ss.tar.xz
-    install -m 755 ssserver "$BINARY_PATH"
-    echo "$VERSION" > "${SS_DIR}/version.txt"
+    # 尝试路径 2: 常见直接 releases/download 路径
+    _download_url="${proxy}${REPO_URL}/releases/download/$_version/hysteria-$OPERATING_SYSTEM-$ARCHITECTURE"
+    info "正在通过代理 [${proxy:-直连}] 下载官方 Hysteria 核心组件 (尝试2) ..."
+    
+    if curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
+      return 0
+    fi
+  done
 
-    configure_ss
+  # 如果所有代理和直连都失败了
+  error "核心下载失败！所有代理及直连均无法访问，请检查您的网络连接。"
+  return 11
+}
 
-    # ===== systemd =====
-    cat > "$SS_SERVICE" <<EOF
+tpl_hysteria_server_service_base() {
+  local _config_name="$1"
+  cat << EOF
 [Unit]
-Description=Shadowsocks Rust Server
-After=network-online.target
-Wants=network-online.target
+Description=Hysteria Server Service (${_config_name}.yaml)
+After=network.target
 
 [Service]
 Type=simple
-User=${RUN_USER}
-Group=${RUN_USER}
-ExecStart=${BINARY_PATH} -c ${SS_CONFIG}
-Restart=on-failure
-RestartSec=3
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+ExecStart=$EXECUTABLE_INSTALL_PATH server --config ${CONFIG_DIR}/${_config_name}.yaml
+WorkingDirectory=$HYSTERIA_HOME_DIR
+User=$HYSTERIA_USER
+Group=$HYSTERIA_USER
+Environment=HYSTERIA_LOG_LEVEL=info
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-LimitNOFILE=1048576
+Restart=on-failure
+RestartSec=10s
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    systemctl daemon-reload
-    systemctl enable ss-rust
-    systemctl restart ss-rust
-
-    echo -e "${GREEN}[完成] Shadowsocks-Rust 已安装并启动${RESET}"
-    log "Shadowsocks-Rust 已安装"
 }
 
-# ================== 更新 ==================
-update_ss() {
-    echo -e "${GREEN}[信息] 更新 Shadowsocks-Rust...${RESET}"
-    if [[ ! -f "$SS_CONFIG" ]]; then
-        echo -e "${RED}未找到配置文件${RESET}"
-        return
+# =========================================================
+# 2.5 外部证书自动穿透赋权扩展函数
+# =========================================================
+fix_external_cert_permission() {
+  local cert=$1
+  local key=$2
+  local target_user=${3:-hysteria}
+  
+  if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
+    error "致命拒绝: 检测到您的证书位于 /root/ 目录下！"
+    warn "原因分析: /root 目录权限极为严苛(700)，非root用户无权穿透。即使强行赋予文件权限，内核也会由于路径阻塞拒绝读取。"
+    info "权威推荐: 请重新导出或申请证书到公共目录（如 /etc/ssl/ 或 /etc/certs/ 文件夹下）再试。"
+    return 1
+  fi
+
+  local cert_dir=$(dirname "$cert")
+  info "正在为外部证书目录赋予检索穿透权限 (+x) ..."
+  chmod +x "$cert_dir" 2>/dev/null || true
+  
+  info "正在规范化外部证书与私钥文件的读取权限 (644) ..."
+  chmod 644 "$cert" "$key" 2>/dev/null || true
+  
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m u:"$target_user":rx "$cert_dir" 2>/dev/null || true
+    setfacl -m u:"$target_user":r "$cert" "$key" 2>/dev/null || true
+  fi
+  
+  return 0
+}
+
+# =========================================================
+# 3. 面板辅助网络与配置扩展函数
+# =========================================================
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    error "无法获取公网 IP 地址。" && return 1
+}
+
+check_port() {
+  local port="$1"
+  if ss -tunlp 2>/dev/null | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
+    return 1
+  fi
+  return 0
+}
+
+is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
+
+get_random_port() {
+  local rand_port
+  while true; do
+    rand_port=$(shuf -i 2000-65535 -n 1)
+    if check_port "$rand_port"; then
+      echo "$rand_port" && return 0
+    fi
+  done
+}
+
+get_hy_status() {
+  if has_command systemctl && systemctl is-active --quiet mo-hy2 2>/dev/null; then
+    echo -e "${GREEN}● 运行中${RESET}"
+  else
+    if pgrep -f "$EXECUTABLE_INSTALL_PATH server" >/dev/null 2>&1; then
+      echo -e "${GREEN}● 运行中${RESET}"
+    else
+      echo -e "${RED}● 未运行${RESET}"
+    fi
+  fi
+}
+
+get_current_port_display() {
+  if [[ -f "$HY_CONFIG" ]]; then
+    local main_port jump_range
+    main_port=$(grep -E '^listen:' "$HY_CONFIG" | awk -F ':' '{print $3}' | tr -d ' ')
+    if [[ -f "$HY_DIR/hy-client.yaml" ]]; then
+      jump_range=$(grep -E '^server:' "$HY_DIR/hy-client.yaml" | awk -F ',' '{print $2}' | tr -d ' ')
+      [[ -n "$jump_range" ]] && echo "${main_port} [${jump_range}]" && return
+    fi
+    echo "${main_port:- -}"
+  else echo "-"; fi
+}
+
+# =========================================================
+# 4. 面板核心交互逻辑 (证书 / 端口群)
+# =========================================================
+inst_cert() {
+  mkdir -p /etc/mo-hy2
+  
+  echo "---------------------------------------------"
+  echo -e "Hysteria 2 协议证书申请方式如下："
+  echo -e " 1) 必应自签证书${YELLOW}（默认）${RESET}"
+  echo -e " 2) Acme自动申请 (需放行 80 端口)"
+  echo -e " 3) 自定义证书路径"
+  echo "---------------------------------------------"
+  local certInput
+  read -rp "请输入选项 [1-3] (直接回车默认自签证书): " certInput
+  certInput=${certInput:-1}
+
+  cert_path="/etc/mo-hy2/server.crt"
+  key_path="/etc/mo-hy2/server.key"
+
+  if [[ $certInput == 2 ]]; then
+    if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
+      warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。请确保已暂时关闭 Web 服务。"
     fi
 
-    cd "$TMP_DIR"
-    VERSION=$(get_latest_version)
-    if [[ -z "$VERSION" ]]; then
-        echo -e "${RED}[错误] 无法获取 GitHub 最新版本。${RESET}"
-        return
+    local vps_ip=$(get_public_ip)
+    read -rp "请输入需要申请证书的域名: " domain
+    [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
+    
+    info "正在检查并安装 Acme.sh 依赖..."
+    local acme_cmd="/root/.acme.sh/acme.sh"
+    if [[ ! -f "$acme_cmd" ]]; then
+      curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
     fi
     
-    ARCH=$(detect_arch)
-    URL_PATH="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${VERSION}/shadowsocks-v${VERSION}.${ARCH}.tar.xz"
-
-    if ! download_file "$URL_PATH" "ss.tar.xz"; then
-        echo -e "${RED}[错误] 所有 GitHub 代理均下载失败！${RESET}"
-        return
-    fi
-
-    systemctl stop ss-rust || true
-    tar -xf ss.tar.xz
-    install -m 755 ssserver "$BINARY_PATH"
-    echo "$VERSION" > "${SS_DIR}/version.txt"
-    systemctl restart ss-rust
-
-    echo -e "${GREEN}[完成] Shadowsocks-Rust 已更新${RESET}"
-    log "Shadowsocks-Rust 已更新"
-}
-
-# ================== 卸载 ==================
-uninstall_ss() {
-    echo -e "${RED}[警告] 卸载 Shadowsocks-Rust...${RESET}"
-    systemctl stop ss-rust || true
-    systemctl disable ss-rust || true
-    rm -f "$SS_SERVICE"
-    rm -rf "$SS_DIR"
-    rm -f "$BINARY_PATH"
-    systemctl daemon-reload
-    echo -e "${GREEN}[完成] Shadowsocks-Rust 已卸载${RESET}"
-    log "Shadowsocks-Rust 已卸载"
-}
-
-# ================== 菜单 ==================
-show_menu() {
-    clear
-    if systemctl is-active --quiet ss-rust; then
-        STATUS="${GREEN}● 运行中${RESET}"
+    "$acme_cmd" --set-default-ca --server letsencrypt
+    
+    # 根据底层架构动态装配专属的无缝热重启重载指令
+    local reload_cmd
+    if has_command systemctl; then
+      reload_cmd="systemctl restart mo-hy2"
     else
-        STATUS="${RED}● 未运行${RESET}"
+      reload_cmd="pkill -f '$EXECUTABLE_INSTALL_PATH server' || true; '$EXECUTABLE_INSTALL_PATH' server --config '$HY_CONFIG' >/dev/null 2>&1 &"
     fi
 
-    VERSION_SHOW="未安装"
-    if [[ -f "${SS_DIR}/version.txt" ]]; then
-        VERSION_SHOW="v$(cat "${SS_DIR}/version.txt")"
+    info "正在向 Let's Encrypt 申请证书并配置自动重载规则..."
+    if [[ "$vps_ip" =~ ":" ]]; then
+      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
+    else
+      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
     fi
-
-    PORT_SHOW="-"
-    if [[ -f "$SS_CONFIG" ]]; then
-        PORT_SHOW=$(grep server_port "$SS_CONFIG" | grep -o '[0-9]\+')
+    
+    # =========================================================
+    # 核心修改点：加入 --reloadcmd 联动机制，实现证书长效续期无人值守
+    # =========================================================
+    if "$acme_cmd" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc --reloadcmd "$reload_cmd"; then
+      echo "$domain" > /etc/mo-hy2/ca.log
+      hy_domain=$domain
+      info "Acme 证书申请、部署并成功挂载自动化重载命令！"
+    else
+      error "Acme 证书部署失败，自动切换回自签模式。"
+      certInput=1
     fi
+    
+  elif [[ $certInput == 3 ]]; then
+    while true; do
+      local user_cert user_key
+      read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
+      read -rp "请输入密钥文件 (privkey.pem/key) 的路径: " user_key
+      read -rp "请输入证书对应的域名: " hy_domain
+      
+      if [[ -f "$user_cert" && -f "$user_key" ]]; then
+        rm -f "$cert_path" "$key_path"
+        
+        if ! fix_external_cert_permission "$user_cert" "$user_key" "${HYSTERIA_USER:-hysteria}"; then
+          echo "---------------------------------------------"
+          continue
+        fi
+
+        ln -sf "$user_cert" "$cert_path"
+        ln -sf "$user_key" "$key_path"
+        info "自定义证书已通过软链接无缝接入内部安全区。"
+        break
+      else
+        error "找不到输入的证书文件，请重新输入或按 Ctrl+C 退出。"
+        echo "---------------------------------------------"
+      fi
+    done
+  fi
+
+  if [[ $certInput == 1 ]]; then
+    info "将使用必应自签证书作为 Hysteria 2 的节点证书"
+    rm -f "$cert_path" "$key_path"
+    openssl ecparam -genkey -name prime256v1 -out "$key_path"
+    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
+    hy_domain="www.bing.com"
+  fi
+
+  if is_user_exists "${HYSTERIA_USER:-hysteria}"; then
+    chown "${HYSTERIA_USER:-hysteria}":"${HYSTERIA_USER:-hysteria}" /etc/mo-hy2
+    if [[ ! -L "$cert_path" ]]; then chmod 644 "$cert_path" && chown "${HYSTERIA_USER:-hysteria}":"${HYSTERIA_USER:-hysteria}" "$cert_path"; else chown -h "${HYSTERIA_USER:-hysteria}":"${HYSTERIA_USER:-hysteria}" "$cert_path"; fi
+    if [[ ! -L "$key_path" ]]; then chmod 600 "$key_path" && chown "${HYSTERIA_USER:-hysteria}":"${HYSTERIA_USER:-hysteria}" "$key_path"; else chown -h "${HYSTERIA_USER:-hysteria}":"${HYSTERIA_USER:-hysteria}" "$key_path"; fi
+  else
+    [[ ! -L "$cert_path" ]] && chmod 644 "$cert_path" || true
+    [[ ! -L "$key_path" ]] && chmod 600 "$key_path" || true
+  fi
+}
+
+inst_port() {
+  local default_port=""
+  [[ -f "$HY_CONFIG" ]] && default_port=$(grep -E '^listen:' "$HY_CONFIG" | awk -F ':' '{print $3}' | tr -d ' ')
+
+  local prompt_msg="设置 Hysteria 2 主端口 [1-65535] (回车随机分配): "
+  [[ -n "$default_port" ]] && prompt_msg="设置 Hysteria 2 主端口 [当前: ${default_port}, 回车不修改]: "
+
+  while true; do
+    read -rp "$prompt_msg" port
+    if [[ -z "$port" ]]; then
+      if [[ -n "$default_port" ]]; then port="$default_port" && break
+      else
+        port=$(get_random_port)
+        info "已为您随机分配未被占用端口: $port" && break
+      fi
+    elif is_valid_port "$port"; then
+      if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
+        error "端口 ${port} 已被其它程序占用，请更换。" && continue
+      fi
+      break
+    else error "请输入有效的端口数字 (1-65535)"; fi
+  done
+
+  local default_mode="2"
+  local old_first=""
+  local old_end=""
+  
+  if [[ -f "$HY_DIR/hy-client.yaml" ]]; then
+    local check_hop=$(grep -E '^server:' "$HY_DIR/hy-client.yaml" | awk -F ',' '{print $2}' | tr -d ' ')
+    if [[ -n "$check_hop" && "$check_hop" =~ ^[0-9]+-[0-9]+$ ]]; then
+      old_first=$(echo "$check_hop" | cut -d'-' -f1)
+      old_end=$(echo "$check_hop" | cut -d'-' -f2)
+      default_mode="2"
+    else
+      [[ -n "$default_port" ]] && default_mode="1"
+    fi
+  fi
+
+  echo "---------------------------------------------"
+  echo -e "Hysteria 2 端口群使用模式："
+  echo -e " 1) 单端口模式"
+  echo -e " 2) 端口跳跃模式 [当前默认: $default_mode]"
+  echo "---------------------------------------------"
+  local jumpInput
+  read -rp "请选择端口模式 [1-2] (直接回车保持默认): " jumpInput
+  jumpInput=${jumpInput:-$default_mode}
+
+  iptables -t nat -F PREROUTING >/dev/null 2>&1 || true
+  ip6tables -t nat -F PREROUTING >/dev/null 2>&1 || true
+
+  if [[ $jumpInput == 2 ]]; then
+    local prompt_first="设置起始端口 (建议10000-65535): "
+    local prompt_end="设置末尾端口 (必须大于起始端口): "
+    [[ -n "$old_first" ]] && prompt_first="设置起始端口 [当前: ${old_first}, 回车不修改]: "
+    [[ -n "$old_end" ]] && prompt_end="设置末尾端口 [当前: ${old_end}, 回车不修改]: "
+
+    while true; do
+      read -rp "$prompt_first" input_first
+      input_first=${input_first:-$old_first}
+      
+      read -rp "$prompt_end" input_end
+      input_end=${input_end:-$old_end}
+      
+      if is_valid_port "$input_first" && is_valid_port "$input_end" && [[ $input_first -lt $input_end ]]; then 
+        firstport="$input_first"
+        endport="$input_end"
+        break
+      else 
+        error "输入无效，起始端口必须小于末尾端口，请重新输入。"
+      fi
+    done
+    
+    iptables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port"
+    ip6tables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port"
+    
+    if has_command netfilter-persistent; then
+      netfilter-persistent save >/dev/null 2>&1 || true
+    else
+      warn "缺少 netfilter-persistent 工具，端口跳跃规则可能在重启后失效。"
+    fi
+    info "已成功配置端口跳跃规则: $firstport-$endport -> $port"
+  else
+    firstport=""
+    endport=""
+    info "将继续使用单端口模式"
+  fi
+}
+
+write_and_show_config() {
+  local HOSTNAME=$(hostname -s | sed 's/ /_/g')
+  local vps_ip=$(get_public_ip)
+
+  local is_insecure="0"
+  local skip_cert="false"
+  local yaml_insecure="false"
+
+  if [[ "$hy_domain" == "www.bing.com" ]]; then
+    is_insecure="1"
+    skip_cert="true"
+    yaml_insecure="true"
+  fi
+
+  cat << EOF > /etc/mo-hy2/config.yaml
+listen: :$port
+
+tls:
+  cert: $cert_path
+  key: $key_path
+
+quic:
+  initStreamReceiveWindow: 16777216
+  maxStreamReceiveWindow: 16777216
+  initConnReceiveWindow: 33554432
+  maxConnReceiveWindow: 33554432
+
+auth:
+  type: password
+  password: $auth_pwd
+
+masquerade:
+  type: proxy
+  proxy:
+    url: https://$proxysite
+    rewriteHost: true
+EOF
+
+  local last_port=$port
+  [[ -n "${firstport}" && -n "${endport}" ]] && last_port="$port,$firstport-$endport"
+  
+  local last_ip="$vps_ip"
+  local url_ip="$vps_ip"
+  if [[ "$vps_ip" =~ ":" ]]; then 
+    last_ip="[$vps_ip]"
+  fi
+
+  mkdir -p "$HY_DIR"
+  
+  cat << EOF > "$HY_DIR/hy-client.yaml"
+server: $last_ip:$last_port
+auth: $auth_pwd
+tls:
+  sni: $hy_domain
+  insecure: $yaml_insecure
+quic:
+  initStreamReceiveWindow: 16777216
+  maxStreamReceiveWindow: 16777216
+  initConnReceiveWindow: 33554432
+  maxConnReceiveWindow: 33554432
+fastOpen: true
+socks5:
+  listen: 127.0.0.1:5678
+transport:
+  udp:
+    hopInterval: 30s 
+EOF
+
+  cat << EOF > "$HY_DIR/url.txt"
+V6VPS 请自行替换 IP 地址为 V6
+V2rayN 配置分享链接:
+hysteria2://$auth_pwd@$last_ip:$port?insecure=${is_insecure}&sni=$hy_domain#$HOSTNAME-hy2
+
+Surge  配置格式:
+$HOSTNAME-hy2 = hysteria2, $url_ip, $port, password=$auth_pwd, skip-cert-verify=${skip_cert}, sni=$hy_domain
+EOF
+
+  if is_user_exists "${HYSTERIA_USER:-hysteria}"; then
+    chown "${HYSTERIA_USER:-hysteria}":"${HYSTERIA_USER:-hysteria}" /etc/mo-hy2
+    chown "${HYSTERIA_USER:-hysteria}":"${HYSTERIA_USER:-hysteria}" /etc/mo-hy2/config.yaml 2>/dev/null || true
+    chown -h "${HYSTERIA_USER:-hysteria}":"${HYSTERIA_USER:-hysteria}" "$cert_path" "$key_path" 2>/dev/null || true
+  fi
+
+  if has_command systemctl; then
+    systemctl daemon-reload
+    systemctl enable mo-hy2 >/dev/null 2>&1 || true
+    systemctl restart mo-hy2 >/dev/null 2>&1 || true
+    
+    if systemctl is-active --quiet mo-hy2 2>/dev/null; then
+      info "Hysteria 2 服务配置并启动成功！"
+    else
+      error "Hysteria 2 服务启动失败，请运行 'systemctl status mo-hy2' 查看日志。"
+    fi
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH server" || true
+    "$EXECUTABLE_INSTALL_PATH" server --config $HY_CONFIG >/dev/null 2>&1 &
+    info "非 systemd 环境，程序已挂载至后台 Pid 进程池中运行。"
+  fi
+  showconf
+}
+
+# =========================================================
+# 5. 主流程控制模块与更新功能
+# =========================================================
+insthysteria() {
+  check_environment
+  install_netfilter_persistent
+  
+  info "获取官方最新发布版本中..."
+  local latest_version=$(get_latest_version)
+  if [[ -z "$latest_version" ]]; then
+    error "无法获取最新版本号，请检查网络设置。"
+    return 1
+  fi
+  
+  local _tmpfile=$(mktemp)
+  if ! download_hysteria "$latest_version" "$_tmpfile"; then
+    rm -f "$_tmpfile" && return 1
+  fi
+
+  echo -ne "正在安装二进制可执行文件 ... "
+  if install -Dm755 "$_tmpfile" "$EXECUTABLE_INSTALL_PATH"; then
+    echo "成功"
+  else
+    rm -f "$_tmpfile" && error "安装失败" && return 1
+  fi
+  rm -f "$_tmpfile"
+
+  HYSTERIA_USER="hysteria"
+  HYSTERIA_HOME_DIR="/var/lib/hysteria"
+  if ! is_user_exists "$HYSTERIA_USER"; then
+    echo -ne "正在创建系统独立沙箱运行用户 $HYSTERIA_USER ... "
+    useradd -r -d "$HYSTERIA_HOME_DIR" -m "$HYSTERIA_USER" >/dev/null 2>&1 || true
+    echo "成功"
+  fi
+
+  if has_command systemctl; then
+    install_content -Dm644 "$(tpl_hysteria_server_service_base 'config')" "$SYSTEMD_SERVICES_DIR/mo-hy2.service" "1"
+    install_content -Dm644 "$(tpl_hysteria_server_service_base '%i')" "$SYSTEMD_SERVICES_DIR/hysteria-server@.service" "1"
+  fi
+
+  firstport="" && endport=""
+  inst_cert || return 1
+  inst_port
+  
+  read -rp "设置 Hysteria 2 验证密码 (回车自动分配随机密码): " auth_pwd
+  auth_pwd=${auth_pwd:-$(generate_random_password)}
+  
+  read -rp "请输入 Hysteria 2 的伪装网站地址 (默认: en.snu.ac.kr): " proxysite
+  proxysite=${proxysite:-"en.snu.ac.kr"}
+
+  write_and_show_config
+}
+
+update_hysteria() {
+  if [[ ! -f "$HY_BINARY" ]]; then
+    error "当前系统未安装 Hysteria 2，无法执行更新。"
+    return 1
+  fi
+
+  info "正在检查新版本..."
+  local current_version=$(get_installed_version)
+  local latest_version=$(get_latest_version)
+
+  if [[ -z "$latest_version" ]]; then
+    error "无法连接到 GitHub API 获取最新版本，请稍后再试。"
+    return 1
+  fi
+
+  info "当前安装版本: ${YELLOW}${current_version}${RESET}"
+  info "官方最新版本: ${GREEN}${latest_version}${RESET}"
+
+  if [[ "$current_version" == "$latest_version" ]]; then
+    info "您当前已经是最新版本，无需更新。"
+    return 0
+  fi
+
+  warn "检测到新版本，即将开始平滑更新 (你的配置与端口规则不会改变)..."
+  
+  local _tmpfile=$(mktemp)
+  if ! download_hysteria "$latest_version" "$_tmpfile"; then
+    rm -f "$_tmpfile" && return 1
+  fi
+
+  echo -ne "正在覆盖二进制核心文件 ... "
+  if install -Dm755 "$_tmpfile" "$EXECUTABLE_INSTALL_PATH"; then
+    echo "成功"
+  else
+    rm -f "$_tmpfile" && error "覆盖核心失败" && return 1
+  fi
+  rm -f "$_tmpfile"
+
+  info "正在重启 Hysteria 2 服务以应用更新..."
+  if has_command systemctl; then
+    systemctl daemon-reload
+    systemctl restart mo-hy2 >/dev/null 2>&1 || true
+    if systemctl is-active --quiet mo-hy2 2>/dev/null; then
+      info "Hysteria 2 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
+    else
+      error "核心更新成功，但服务重启失败，请运行 'systemctl status mo-hy2' 检查错误。"
+    fi
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH server" || true
+    "$EXECUTABLE_INSTALL_PATH" server --config "$HY_CONFIG" >/dev/null 2>&1 &
+    info "Hysteria 2 核心已更新并于后台重启运行。"
+  fi
+}
+
+unsthysteria() {
+  warn "即将从当前系统中彻底卸载 Hysteria 2"
+
+  if has_command systemctl; then
+    systemctl stop mo-hy2 >/dev/null 2>&1 || true
+    systemctl disable mo-hy2 >/dev/null 2>&1 || true
+    remove_file "$SYSTEMD_SERVICES_DIR/mo-hy2.service"
+    remove_file "$SYSTEMD_SERVICES_DIR/hysteria-server@.service"
+    systemctl daemon-reload
+  else
+    pkill -f "$EXECUTABLE_INSTALL_PATH server" || true
+  fi
+  
+  remove_file "$EXECUTABLE_INSTALL_PATH"
+  rm -rf /etc/mo-hy2 "$HY_DIR"
+  
+  iptables -t nat -F PREROUTING >/dev/null 2>&1 || true
+  ip6tables -t nat -F PREROUTING >/dev/null 2>&1 || true
+  has_command netfilter-persistent && netfilter-persistent save >/dev/null 2>&1 || true
+
+  info "Hysteria 2 已彻底从您的系统中移除！"
+}
+
+changeconf() {
+  if [[ ! -f "$HY_CONFIG" ]]; then
+    error "配置文件不存在，请先安装 Hysteria 2"
+    return 1
+  fi
+
+  local old_pwd=$(grep -E '^\s*password:' "$HY_CONFIG" | awk '{print $2}' | tr -d '"'\' || true)
+  local old_cert=$(grep -E '^\s*cert:' "$HY_CONFIG" | awk '{print $2}' | tr -d '"'\' || true)
+  local old_key=$(grep -E '^\s*key:' "$HY_CONFIG" | awk '{print $2}' | tr -d '"'\' || true)
+  local old_site=$(grep -E '^\s*url:' "$HY_CONFIG" | awk '{print $2}' | sed 's#https://##' | tr -d '"'\' || true)
+  local old_sni="www.bing.com"
+  [[ -f "$HY_DIR/hy-client.yaml" ]] && old_sni=$(grep -E '^\s*sni:' "$HY_DIR/hy-client.yaml" | awk '{print $2}' | tr -d '"'\' || true)
+
+  clear
+  echo -e "${GREEN}====== 修改 Hysteria 2 配置 ======${RESET}"
+  echo "提示：直接敲回车将保持原有配置不变"
+  echo "---------------------------------------------"
+  
+  firstport="" && endport=""
+  inst_port 
+
+  local auth_pwd
+  read -rp "设置 Hysteria 2 密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
+  auth_pwd=${auth_pwd:-$old_pwd}
+
+  local cert_path key_path hy_domain
+  echo "---------------------------------------------"
+  read -rp "是否需要修改证书？[y/N] (直接回车默认不修改): " change_cert_flag
+  if [[ "$change_cert_flag" == "y" || "$change_cert_flag" == "Y" ]]; then
+    inst_cert || return 1
+  else
+    cert_path="$old_cert"
+    key_path="$old_key"
+    hy_domain="$old_sni"
+  fi
+
+  local proxysite
+  echo "---------------------------------------------"
+  read -rp "请输入新的伪装网站地址 [当前: ${old_site}, 回车不修改]: " proxysite
+  proxysite=${proxysite:-$old_site}
+
+  write_and_show_config
+  info "配置修改并应用成功！"
+}
+
+showconf() {
+  if [[ ! -d "$HY_DIR" ]]; then
+    error "未找到客户端配置文件。"
+    return
+  fi
+  echo -e "${GREEN}====== 客户端 YAML 配置 ======${RESET}"
+  cat "$HY_DIR/hy-client.yaml"
+  echo
+  echo -e "${GREEN}====== 节点分享链接 ======${RESET}"
+  cat "$HY_DIR/url.txt"
+  echo
+}
+
+# =========================================================
+# 6. 面板主菜单
+# =========================================================
+menu() {
+  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
+  check_environment
+
+  while true; do
+    clear
+    local status=$(get_hy_status)
+    local version=$(get_installed_version)
+    local port_show=$(get_current_port_display)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   Shadowsocks-Rust 管理面板        ${RESET}"
+    echo -e "${GREEN}      Hysteria 2 管理面板       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $STATUS"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${VERSION_SHOW}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${PORT_SHOW}${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $status"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Shadowsocks-Rust${RESET}"
-    echo -e "${GREEN}2. 更新 Shadowsocks-Rust${RESET}"
-    echo -e "${GREEN}3. 卸载 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}1. 安装 Hysteria 2${RESET}"
+    echo -e "${GREEN}2. 更新 Hysteria 2${RESET}"
+    echo -e "${GREEN}3. 卸载 Hysteria 2${RESET}"
     echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 Shadowsocks-Rust${RESET}"
-    echo -e "${GREEN}6. 停止 Shadowsocks-Rust${RESET}"
-    echo -e "${GREEN}7. 重启 Shadowsocks-Rust${RESET}"
+    echo -e "${GREEN}5. 启动 Hysteria 2${RESET}"
+    echo -e "${GREEN}6. 停止 Hysteria 2${RESET}"
+    echo -e "${GREEN}7. 重启 Hysteria 2${RESET}"
     echo -e "${GREEN}8. 查看日志${RESET}"
     echo -e "${GREEN}9. 查看节点配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
+
+    local choice=""
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+    [[ -z "$choice" ]] && continue
+
+    case "$choice" in
+      1) insthysteria; pause ;;
+      2) update_hysteria; pause ;;
+      3) unsthysteria; pause ;;
+      4) changeconf; pause ;;
+      5) 
+        if has_command systemctl; then
+          systemctl start mo-hy2 && info "服务已成功启动！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH server" || true
+          "$EXECUTABLE_INSTALL_PATH" server --config "$HY_CONFIG" >/dev/null 2>&1 &
+          info "进程已在后台启动！"
+        fi
+        pause ;;
+      6) 
+        if has_command systemctl; then
+          systemctl stop mo-hy2 && info "服务已成功停止！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH server" && info "后台进程已终止！"
+        fi
+        pause ;;
+      7) 
+        if has_command systemctl; then
+          systemctl restart mo-hy2 && info "服务已成功重启！"
+        else
+          pkill -f "$EXECUTABLE_INSTALL_PATH server" || true
+          "$EXECUTABLE_INSTALL_PATH" server --config "$HY_CONFIG" >/dev/null 2>&1 &
+          info "后台进程已重启！"
+        fi
+        pause ;;
+      8) 
+        if has_command systemctl; then
+          journalctl -u mo-hy2.service -n 50 --no-pager
+        else
+          warn "当前环境不支持 systemd 集中日志管理。"
+        fi
+        pause ;;
+      9) showconf; pause ;;
+      0) exit 0 ;;
+      *) error "无效输入，请重新选择。"; sleep 1 ;;
+    esac
+  done
 }
 
-# ================== 主循环 ==================
-while true; do
-    show_menu
-    read -r -p $'\033[32m请输入选项: \033[0m' choice
-    case $choice in
-        1) install_ss; pause ;;
-        2) update_ss; pause ;;
-        3) uninstall_ss; pause ;;
-        4) modify_ss; pause ;;
-        5)
-            systemctl start ss-rust
-            echo -e "${GREEN}[完成] Shadowsocks 已启动${RESET}"
-            log "Shadowsocks 启动"
-            pause
-            ;;
-        6)
-            systemctl stop ss-rust
-            echo -e "${GREEN}[完成] Shadowsocks 已停止${RESET}"
-            log "Shadowsocks 停止"
-            pause
-            ;;
-        7)
-            systemctl restart ss-rust
-            echo -e "${GREEN}[完成] Shadowsocks 已重启${RESET}"
-            log "Shadowsocks 重启"
-            pause
-            ;;
-        8) journalctl -u ss-rust -e --no-pager; pause ;;
-        9)
-            if [[ -f "$SS_CONFIG" ]]; then
-                echo -e "${GREEN}====== 当前配置 ======${RESET}"
-                cat "$SS_CONFIG"
-                echo
-                echo -e "${GREEN}====== SS链接 ======${RESET}"
-                cat "${SS_DIR}/ss.txt"
-                echo
-                echo -e "${GREEN}====== Surge 配置 ======${RESET}"
-                cat "${SS_DIR}/surge.txt"
-            else
-                echo -e "${RED}配置文件不存在${RESET}"
-            fi
-            pause
-            ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效输入${RESET}"; pause ;;
-    esac
-done
+menu "$@"

@@ -1,468 +1,365 @@
 #!/bin/bash
+# =================================================================
+# 名称: 全能网络工具箱 (纯绿面板极致兼容版)
+# 适配: Debian / Ubuntu / CentOS / Rocky Linux / Alpine Linux
+# =================================================================
 
-# =========================================================
-# Xray VLESS-HTTPUpgrade 管理脚本(Alpine Linux) 
-# =========================================================
-
-set -Eeuo pipefail
-
-# ================== 颜色定义 ==================
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
-BLUE="\033[34m"
+RED="\033[31m"
+BLUE="\033[36m"
 RESET="\033[0m"
+ORANGE='\033[38;5;208m'
 
-# ================== GITHUB 代理加速池 ==================
-readonly GITHUB_PROXY=(
-    'https://v6.gh-proxy.org/'
-    'https://gh-proxy.com/'
-    'https://hub.glowp.xyz/'
-    'https://proxy.vvvv.ee/'
-    'https://ghproxy.lvedong.eu.org/'
-    '' # 留空代表直连，作为兜底保底
-)
+# 默认配置参数
+IPERF_PORT=5201
+IPERF_TIME=30
+IPERF_PARALLEL=1
+IPERF_UDP_BW="1G"
+MTR_PROTO="ICMP"
+MTR_SHOW_AS="true"
 
-# ================== 🚀 服务自定义重命名 ==================
-readonly SERV_NAME="xray-httpupgrade"
+# 全局安全退出捕获
+trap "echo -e '${RESET}'; exit" INT TERM
 
-# ================== 📂 自定义分享链接存放路径 ==================
-readonly X_LINK_DIR="/root/proxynode/vlesshttpupgrade"
-
-# ================== 路径与日志 (自动联动) ==================
-readonly X_DIR="/etc/${SERV_NAME}"
-readonly X_CONFIG="${X_DIR}/config.json"
-readonly X_BIN="/usr/local/bin/${SERV_NAME}"
-readonly X_LINK="${X_LINK_DIR}/${SERV_NAME}_vless.txt"
-readonly X_LOG="/var/log/${SERV_NAME}.log"
-readonly INIT_FILE="/etc/init.d/${SERV_NAME}"
-
-# ================== 核心工具 ==================
-info() { echo -e "${GREEN}[信息] $*${RESET}"; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}"; }
-error() { echo -e "${RED}[错误] $*${RESET}"; }
-pause() { echo; echo -ne "${GREEN}按任意键返回菜单...${RESET}"; read -n 1 -s; echo; }
-
-is_valid_port() {
-    local port=$1
-    if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
-        return 0
+# ==========================================
+# 工具状态动态探测
+# ==========================================
+get_status() {
+    if command -v "$1" >/dev/null 2>&1; then
+        echo -e "${GREEN}已安装${RESET}"
     else
-        return 1
+        echo -e "${RED}未安装${RESET}"
     fi
 }
 
-restart_xray() {
-    rc-service "$SERV_NAME" restart >/dev/null 2>&1 || true
-    sleep 1
-    if rc-service "$SERV_NAME" status 2>/dev/null | grep -q "started"; then
-        return 0
-    else
-        return 1
-    fi
-}
+# ==========================================
+# 自动化安装引擎
+# ==========================================
+check_and_install() {
+    local tool=$1
+    if command -v "$tool" >/dev/null 2>&1; then return; fi
 
-get_xray_status() {
-    if rc-service "$SERV_NAME" status 2>/dev/null | grep -q "started"; then
-        echo -e "${GREEN}● 运行中 ${RESET}"
-    else 
-        echo -e "${RED}● 未运行 ${RESET}"
-    fi
-}
-
-get_xray_version() {
-    if [[ -x "$X_BIN" ]]; then
-        "$X_BIN" version 2>/dev/null | head -n 1 | awk '{print $2}'
-    else
-        echo "未安装"
-    fi
-}
-
-get_public_ip() {
-    local mode=${1:-"v4"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
-    local ip=""
+    echo -e "${YELLOW}📦 正在安装必要依赖与工具: $tool ...${RESET}"
     
-    if [[ "$mode" == "v4" ]]; then
-        # 强制获取 IPv4
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        # 强制获取 IPv6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-
-    error "无法获取公网 IP 地址，请检查网络或 DNS 设置！" && echo "127.0.0.1" && return 1
-}
-
-
-HOSTNAME=$(hostname -s | sed 's/ /_/g')
-
-# ================== 配置写入 ==================
-write_config() {
-    local port=$1 uuid=$2 path=$3 host_name=$4
-    local outbound=${5:-'{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}'}
-    mkdir -p "$X_DIR" && chmod 755 "$X_DIR"
-    
-    cat > "$X_CONFIG" <<EOF
-{
-    "log": { "loglevel": "warning" },
-    "inbounds": [{
-        "port": $port,
-        "protocol": "vless",
-        "settings": {
-            "clients": [{"id": "$uuid"}],
-            "decryption": "none"
-        },
-        "streamSettings": {
-            "network": "httpupgrade",
-            "security": "none",
-            "httpupgradeSettings": {
-                "path": "$path",
-                "host": "$host_name"
-            }
-        },
-        "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
-    }],
-    "outbounds": [$outbound]
-}
-EOF
-}
-
-# ================== 出口模式配置 ==================
-configure_custom_socks5_outbound() {
-    if [[ ! -f "$X_CONFIG" ]]; then 
-        error "错误: Xray 未安装，无法配置出口模式。"
-        return
-    fi
-
-    local mode current_protocol tmp_file
-    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$X_CONFIG" 2>/dev/null || echo "freedom")
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请选择出口模式：${RESET}"
-    [[ "$current_protocol" == "socks" ]] && echo -e "${YELLOW} (当前: Socks5)${RESET}" || echo -e "${GREEN} (当前: 直连)${RESET}"
-    echo -e "${GREEN}1) 直连出口${RESET}"
-    echo -e "${GREEN}2) Socks5出口${RESET}"
-    echo -e "${GREEN}0) 取消${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-
-    echo -ne "${GREEN}请输入选项 [0-2]: ${RESET}"; read mode
-    case "$mode" in
-        1)
-            tmp_file=$(mktemp)
-            jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$X_CONFIG" > "$tmp_file"
-            cp "$X_CONFIG" "${X_CONFIG}.bak.$(date +%s)"
-            mv "$tmp_file" "$X_CONFIG"
-            restart_xray && info "已成功切换为直连出口！" || error "切换失败。"
-            return ;;
-        2) ;;
-        *) info "已取消配置"; return ;;
-    esac
-
-    info "配置自定义 Socks5 出口代理..."
-    local s_host s_port s_user s_pass
-    echo -ne "${GREEN}请输入 Socks5 服务器地址/IP: ${RESET}"; read s_host
-    [[ -z "$s_host" ]] && return
-
-    while true; do
-        echo -ne "${GREEN}请输入 Socks5 端口 (默认: 1080): ${RESET}"; read s_port
-        [[ -z "$s_port" ]] && s_port=1080
-        is_valid_port "$s_port" && break || error "端口无效，请输入 1-65535 之间的数字。"
-    done
-
-    echo -ne "${GREEN}请输入 Socks5 用户名 (无则回车): ${RESET}"; read s_user
-    if [[ -n "$s_user" ]]; then
-        echo -ne "${GREEN}请输入 Socks5 密码: ${RESET}"; read -s s_pass; echo
-    else
-        s_pass=""
-    fi
-
-    tmp_file=$(mktemp)
-    if [[ -n "$s_user" ]]; then
-        jq --arg host "$s_host" --argjson port "$s_port" --arg user "$s_user" --arg pass "$s_pass" \
-            '.outbounds = [{"protocol": "socks", "tag": "custom-out", "settings": {"servers": [{"address": $host, "port": $port, "users": [{"user": $user, "pass": $pass}]}]}}]' \
-            "$X_CONFIG" > "$tmp_file"
-    else
-        jq --arg host "$s_host" --argjson port "$s_port" \
-            '.outbounds = [{"protocol": "socks", "tag": "custom-out", "settings": {"servers": [{"address": $host, "port": $port}]}}]' \
-            "$X_CONFIG" > "$tmp_file"
-    fi
-
-    cp "$X_CONFIG" "${X_CONFIG}.bak.$(date +%s)"
-    mv "$tmp_file" "$X_CONFIG"
-    restart_xray && info "已成功切换为 Socks5 出口！" || error "重启失败，请检查 Socks5 信息。"
-}
-
-# 修改配置
-modify_config() {
-    if [[ ! -f "$X_CONFIG" ]]; then error "请先安装 Xray"; return; fi
-    
-    local curr_port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
-    local curr_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
-    local curr_path=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.path // "/"' "$X_CONFIG")
-    local curr_host=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.host // ""' "$X_CONFIG")
-    local curr_outbound=$(jq -c '.outbounds[0]' "$X_CONFIG")
-
-    # 1. 修改端口
-    local n_port
-    while true; do
-        read -p "请输入新端口 (回车保持 $curr_port): " n_port
-        n_port=${n_port:-$curr_port}
-        is_valid_port "$n_port" && break || error "端口无效，请输入 1-65535 之间的数字。"
-    done
-
-    # 2. 修改 UUID
-    local n_uuid
-    while true; do
-        read -p "请输入新 UUID (回车保持 $curr_uuid): " n_uuid
-        n_uuid=${n_uuid:-$curr_uuid}
-        if [[ "$n_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-            break
-        else
-            error "UUID 格式不正确，请重新输入。"
+    if [ -f /etc/alpine-release ]; then
+        apk add --no-cache curl wget tar bash grep gawk openssl
+    elif ! command -v curl >/dev/null 2>&1 || ! command -v wget >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y curl wget tar grep gawk
+        elif command -v dnf >/dev/null 2>&1; then dnf install -y curl wget tar grep gawk
+        elif command -v yum >/dev/null 2>&1; then yum install -y curl wget tar grep gawk
         fi
-    done
-
-    # 3. 修改 Path
-    read -p "请输入新 HTTPUpgrade Path (回车保持 $curr_path): " n_path
-    n_path=${n_path:-$curr_path}
-    [[ "$n_path" != /* ]] && n_path="/${n_path}"
-
-    # 4. 修改 Host
-    read -p "请输入新伪装 Host/域名 (如果没有直接回车，保持 '$curr_host'): " n_host
-    n_host=${n_host:-$curr_host}
-
-    write_config "$n_port" "$n_uuid" "$n_path" "$n_host" "$curr_outbound"
-    rc-service "$SERV_NAME" restart
-    
-    # 重新生成链接
-    local ip=$(get_public_ip || echo "127.0.0.1")
-    local host_addr=$ip
-    [[ -n "$n_host" ]] && host_addr=$n_host
-    
-    mkdir -p "$X_LINK_DIR"
-    echo "vless://$n_uuid@$host_addr:$n_port?encryption=none&type=httpupgrade&security=none&host=$(echo "$n_host" | jq -sRr @uri)&path=$(echo "$n_path" | jq -sRr @uri)#$HOSTNAME-${SERV_NAME}" > "$X_LINK"
-    info "配置已更新并成功重启服务！"
-}
-
-# ================== 安装与管理 ==================
-install_xray() {
-    info "正在安装依赖与内核..."
-    apk add curl unzip jq uuidgen gcompat libc6-compat bc > /dev/null 2>&1
-    mkdir -p "$X_DIR" && sync
-    
-    local arch=$(uname -m | sed 's/x86_64/64/;s/aarch64/arm64-v8a/')
-    local ver=""
-
-    info "正在检索 Xray-core 官方最新发布版本..."
-    # ✨ 完美升级：用 wget 轮询你的代理池去抓取版本号，防止纯 v6 环境或网络封锁导致卡死
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local api_url="${proxy}https://api.github.com/repos/XTLS/Xray-core/releases/latest"
-        ver=$(wget -qO- --timeout=5 --tries=1 --no-check-certificate "$api_url" | jq -r .tag_name 2>/dev/null || echo "")
-        if [[ -n "$ver" && "$ver" != "null" ]]; then
-            break
-        fi
-    done
-
-    # 🚨 终极保底：如果所有代理和直连都拿不到版本号，绝不允许它为空！强制给一个稳定的现代版本
-    if [[ -z "$ver" || "$ver" == "null" ]]; then
-        ver="v26.3.27"
-        warn "通过 API 获取版本号超时，已激活保底机制，将为您安装高稳定版本: $ver"
     fi
 
-    info "下载 Xray $ver ($arch)..."
-    
-    local download_success=false
-    # ✨ 完美升级：文件下载同样引入代理池轮询，死磕到下载成功为止
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local dl_url="${proxy}https://github.com/XTLS/Xray-core/releases/download/$ver/Xray-linux-$arch.zip"
-        
-        # -O 正确保存到文件，--timeout=15 防止在死节点上挂起
-        if wget --no-check-certificate --timeout=15 --tries=1 -q -O /tmp/xray.zip "$dl_url" 2>/dev/null; then
-            # -s 确保文件大小大于 0 字节，防止下到空文件
-            if [ -s /tmp/xray.zip ]; then
-                download_success=true
-                break
-            fi
-        fi
-        warn "当前下载节点响应失败，正在为您自动切换下一个 GitHub 代理..."
-    done
-
-    if [ "$download_success" = false ]; then
-        error "严重错误：所有代理节点及直连模式均下载失败，请检查 VPS 的 DNS 设置！"
-        return 1
-    fi
-
-    # 解压与部署
-    unzip -o /tmp/xray.zip -d /tmp/xray_tmp > /dev/null
-    mv -f /tmp/xray_tmp/xray "$X_BIN" && chmod +x "$X_BIN"
-    rm -rf /tmp/xray*
-    
-    if [[ ! -f "$X_CONFIG" ]]; then
-        echo -ne "${GREEN}请输入入站端口 (回车随机): ${RESET}"; read port; [[ -z "$port" ]] && port=$((RANDOM % 45535 + 10000))
-        
-        # 1. 自定义 UUID
-        local uuid
-        while true; do
-            echo -ne "${GREEN}请输入自定义 UUID (回车随机生成): ${RESET}"; read input_uuid
-            if [[ -z "$input_uuid" ]]; then
-                uuid=$(uuidgen)
-                break
-            else
-                if [[ "$input_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-                    uuid="$input_uuid"
-                    break
-                else
-                    error "UUID 格式不正确，请重新输入。"
+    case "$tool" in
+        speedtest)
+            if [ -f /etc/alpine-release ]; then
+                echo -e "${YELLOW}📦 检测到 Alpine 系统，正在通过 apk 官方源安装...${RESET}"
+                apk add --no-cache speedtest-cli
+                if [ ! -f /usr/local/bin/speedtest ] && [ ! -f /usr/bin/speedtest ]; then
+                    ln -sf "$(command -v speedtest-cli)" /usr/bin/speedtest
                 fi
+            else
+                echo -e "${YELLOW}📦 正在通过二进制包快速安装 Ookla Speedtest...${RESET}"
+                local cpu_arch=$(uname -m)
+                local download_url=""
+                case "$cpu_arch" in
+                    x86_64) download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz" ;;
+                    aarch64|arm64) download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz" ;;
+                    *) echo -e "${RED}❌ 错误: 不支持的架构 ${cpu_arch}${RESET}" >&2; exit 1 ;;
+                esac
+                cd /tmp
+                wget -q "$download_url" -O speedtest.tgz && \
+                tar -xzf speedtest.tgz && \
+                mv -f speedtest /usr/local/bin/ && \
+                rm -f speedtest.tgz speedtest.5 speedtest.md LICENSE.md
             fi
-        done
-
-        # 2. 自定义 HTTPUpgrade Path
-        local path
-        echo -ne "${GREEN}请输入自定义 httpupgrade Path (回车默认随机生成): ${RESET}"; read path
-        if [[ -z "$path" ]]; then
-            path="/$(openssl rand -hex 4)"
-            info "👉 采用随机 Path: $path"
-        else
-            [[ "$path" != /* ]] && path="/${path}"
-        fi
-        
-        # 3. 配置伪装 Host
-        echo -ne "${GREEN}请输入可选的伪装 Host 域名 (没有直接回车): ${RESET}"; read host_name
-        
-        write_config "$port" "$uuid" "$path" "$host_name"
-        
-        # 写入 OpenRC 服务脚本
-        cat << EOF > "$INIT_FILE"
-#!/sbin/openrc-run
-command="${X_BIN}"
-command_args="run -c ${X_CONFIG}"
-command_background="yes"
-pidfile="/run/${SERV_NAME}.pid"
-output_log="$X_LOG"
-error_log="$X_LOG"
-EOF
-        chmod +x "$INIT_FILE"
-        touch "$X_LOG"
-        rc-update add "$SERV_NAME" default >/dev/null 2>&1
-    fi
-
-    rc-service "$SERV_NAME" restart
-    
-    # 读取配置生成分享链接
-    local ip=$(get_public_ip || echo "127.0.0.1")
-    local uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG")
-    local port=$(jq -r '.inbounds[0].port' "$X_CONFIG")
-    local path=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.path // "/"' "$X_CONFIG")
-    local host_name=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.host // ""' "$X_CONFIG")
-    
-    local host_addr=$ip
-    [[ -n "$host_name" ]] && host_addr=$host_name
-    
-    local link="vless://$uuid@$host_addr:$port?encryption=none&type=httpupgrade&security=none&host=$(echo "$host_name" | jq -sRr @uri)&path=$(echo "$path" | jq -sRr @uri)#$HOSTNAME-vless-httpupgrade"
-    
-    mkdir -p "$X_LINK_DIR"
-    echo "$link" > "$X_LINK"
-
-    show_current_config
-}
-
-# ================== 显示配置 ==================
-show_current_config() {
-    if [[ ! -f "$X_CONFIG" ]]; then
-        error "配置文件不存在"
-        return
-    fi
-
-    local ip uuid port host_name path outbound_mode
-    ip=$(get_public_ip || echo "未知")
-    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$X_CONFIG" 2>/dev/null || echo "未知")
-    port=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "未知")
-    path=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.path // "/"' "$X_CONFIG" 2>/dev/null || echo "/")
-    host_name=$(jq -r '.inbounds[0].streamSettings.httpupgradeSettings.host // "无"' "$X_CONFIG" 2>/dev/null || echo "无")
-    
-    local current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$X_CONFIG" 2>/dev/null || echo "freedom")
-    [[ "$current_protocol" == "socks" ]] && outbound_mode="Socks5 链式代理" || outbound_mode="直连 (Freedom)"
-
-    echo -e "\n${GREEN}====== 当前配置详情 ======${RESET}"
-    echo -e "${YELLOW}安全传输    : none ${RESET}"
-    echo -e "${YELLOW}IP地址      : ${ip}${RESET}"
-    echo -e "${YELLOW}端口        : ${port}${RESET}"
-    echo -e "${YELLOW}UUID        : ${uuid}${RESET}"
-    echo -e "${YELLOW}Host 伪装   : ${host_name}${RESET}"
-    echo -e "${YELLOW}HTTPUpgrade Path : ${path}${RESET}"
-    echo -e "${YELLOW}出口模式    : ${outbound_mode}${RESET}"
-    echo -e "${YELLOW}分享存放路径: ${X_LINK}${RESET}"
-    echo -e "${YELLOW}📄 V6VPS 请自行替换分享链接中的 IP 地址为 V6 ★${RESET}"
-    
-    if [[ -f "$X_LINK" ]]; then
-        echo -e "${GREEN}====== 👉 v2rayN 分享链接 ======${RESET}"
-        cat "$X_LINK"
-    fi
-}
-
-# ================== 菜单 ==================
-show_menu() {
-    clear
-    local status=$(get_xray_status)
-    local version=$(get_xray_version)
-    local port_show="-"
-    [[ -f "$X_CONFIG" ]] && port_show=$(jq -r '.inbounds[0].port' "$X_CONFIG" 2>/dev/null || echo "-")
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}  Xray Vless-httpupgrade 面板  ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $status"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 Xray Vless-httpupgrade${RESET}"
-    echo -e "${GREEN} 2. 更新 Xray${RESET}"
-    echo -e "${GREEN} 3. 卸载 Xray${RESET}"
-    echo -e "${GREEN} 4. 修改配置${RESET}"
-    echo -e "${GREEN} 5. 启动 Xray${RESET}"
-    echo -e "${GREEN} 6. 停止 Xray${RESET}"
-    echo -e "${GREEN} 7. 重启 Xray${RESET}"
-    echo -e "${GREEN} 8. 查看日志${RESET}"
-    echo -e "${GREEN} 9. 查看节点配置${RESET}"
-    echo -e "${GREEN}10. 配置Socks5出口${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-}
-
-while true; do
-    show_menu
-    echo -ne "${GREEN}请输入选项: ${RESET}"; read choice
-    case $choice in
-        1|2) install_xray; pause ;;
-        3) 
-            rc-service "$SERV_NAME" stop 2>/dev/null || true
-            rc-update del "$SERV_NAME" default 2>/dev/null || true
-            rm -rf "$X_DIR" "$X_BIN" "$INIT_FILE" "$X_LINK" "$X_LOG" "$X_LINK_DIR"
-            info "卸载完成"
-            pause 
+            mkdir -p "$HOME/.ookla"
+            echo '{"license_accepted": true, "gdpr_accepted": true}' > "$HOME/.ookla/speedtest-cli.json" 2>/dev/null || true
             ;;
-        4) modify_config; pause ;;
-        5) rc-service "$SERV_NAME" start; pause ;;
-        6) rc-service "$SERV_NAME" stop; pause ;;
-        7) rc-service "$SERV_NAME" restart; pause ;;
-        8) [[ -f "$X_LOG" ]] && tail -f "$X_LOG" || error "暂无日志"; pause ;;
-        9) show_current_config || error "无配置"; pause ;;
-        10) configure_custom_socks5_outbound; pause ;;
-        0) exit 0 ;;
-        *) error "无效选项"; sleep 1 ;;
+        nexttrace)
+            curl -fsSL nxtrace.org/nt | bash || true
+            ;;
+        iperf3)
+            if [ -f /etc/alpine-release ]; then apk add --no-cache iperf3
+            elif command -v apt-get >/dev/null 2>&1; then apt-get install -y iperf3
+            elif command -v dnf >/dev/null 2>&1; then dnf install -y epel-release 2>/dev/null || true; dnf install -y iperf3
+            elif command -v yum >/dev/null 2>&1; then yum install -y epel-release 2>/dev/null || true; yum install -y iperf3
+            fi
+            ;;
+        mtr)
+            if [ -f /etc/alpine-release ]; then apk add --no-cache mtr
+            elif command -v apt-get >/dev/null 2>&1; then apt-get install -y mtr-tiny || apt-get install -y mtr
+            elif command -v dnf >/dev/null 2>&1; then dnf install -y mtr
+            elif command -v yum >/dev/null 2>&1; then yum install -y mtr
+            fi
+            ;;
+    esac
+    hash -r 2>/dev/null
+}
+
+# ==========================================
+# 1) Speedtest 模块
+# ==========================================
+run_speedtest() {
+    clear
+    check_and_install speedtest
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}        Speedtest 网速测试        ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}🚀 开始测速...${RESET}"
+    echo "-------------------------------------"
+    if speedtest --help 2>&1 | grep -q "accept-license"; then
+        echo "YES" | speedtest --accept-license --accept-gdpr --force || true
+    else
+        speedtest || speedtest-cli || true
+    fi
+    echo "-------------------------------------"
+    read -p "测试完成，按回车返回面板..." dummy
+}
+
+# ==========================================
+# 2) NextTrace 模块
+# ==========================================
+run_nexttrace() {
+    clear
+    check_and_install nexttrace
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}        NextTrace 路由追踪        ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    read -p "请输入目标IP或域名: " target
+    if [ -z "$target" ]; then return; fi
+    echo -e "--------------------------------"
+    nexttrace "$target" || true
+    echo -e "${GREEN}================================${RESET}"
+    read -p "追踪完成，按回车返回面板..." dummy
+}
+
+# ==========================================
+# 3) iperf3 模块
+# ==========================================
+get_iperf_ip() {
+    read -p "请输入远端服务器 IP/域名: " SERVER_IP
+    if [ -z "$SERVER_IP" ]; then
+        echo -e "${RED}❌ 未输入有效 IP，操作取消。${RESET}"
+        sleep 1.5
+        return 1
+    fi
+    return 0
+}
+
+run_iperf3() {
+    check_and_install iperf3
+    while true; do
+        clear
+        echo -e "${ORANGE}===================================${RESET}"
+        echo -e "${ORANGE}          iperf3 测速管理          ${RESET}"
+        echo -e "${ORANGE}===================================${RESET}"
+        echo -e " ${BLUE}当前参数: 端口=$IPERF_PORT | 时长=${IPERF_TIME}s | 线程=$IPERF_PARALLEL | UDP带宽=$IPERF_UDP_BW${RESET}"
+        echo -e "${ORANGE}-----------------------------------${RESET}"
+        echo -e " ${GREEN}1)${RESET} 启动 iperf3 本地服务端"
+        echo -e " -----------------------------------"
+        echo -e " ${GREEN}2)${RESET} 发起 TCP 下载 (↓) 测试"
+        echo -e " ${GREEN}3)${RESET} 发起 TCP 上传 (↑) 测试"
+        echo -e " -----------------------------------"
+        echo -e " ${GREEN}4)${RESET} 发起 UDP 下载 (↓) 测试"
+        echo -e " ${GREEN}5)${RESET} 发起 UDP 上传 (↑) 测试"
+        echo -e " -----------------------------------"
+        echo -e " ${GREEN}6)${RESET} 修改测试核心参数"
+        echo -e " ${RED}0)${RESET} 返回上级工具箱菜单"
+        echo -e "${ORANGE}===================================${RESET}"
+        echo -ne "${GREEN} 请选择: ${RESET}"
+        read -r choice
+        
+        case "$choice" in
+            1)
+                clear
+                echo -e "${ORANGE}===================================${RESET}"
+                echo -e "${GREEN}  iperf3 服务器已启动 (监听端口: $IPERF_PORT)${RESET}"
+                echo -e "${YELLOW}  👉 提示: 测速完毕后，按 Ctrl+C 可安全返回菜单${RESET}"
+                echo -e "${ORANGE}===================================${RESET}\n"
+                (trap 'echo -e "\n${YELLOW}ℹ 服务端已安全关闭。${RESET}"; exit 0' INT; iperf3 -s -i 10 -p "$IPERF_PORT")
+                echo "-----------------------------------"
+                read -p "按回车继续..." dummy
+                ;;
+            2)
+                clear; get_iperf_ip || continue
+                echo -e "\n${GREEN}🚀 TCP 下载 (↓) 测试中...${RESET}"
+                iperf3 -c "$SERVER_IP" -R -P "$IPERF_PARALLEL" -t "$IPERF_TIME" -p "$IPERF_PORT" || true
+                read -p "测试完成，按回车继续..." dummy
+                ;;
+            3)
+                clear; get_iperf_ip || continue
+                echo -e "\n${GREEN}🚀 TCP 上传 (↑) 测试中...${RESET}"
+                iperf3 -c "$SERVER_IP" -P "$IPERF_PARALLEL" -t "$IPERF_TIME" -p "$IPERF_PORT" || true
+                read -p "测试完成，按回车继续..." dummy
+                ;;
+            4)
+                clear; get_iperf_ip || continue
+                echo -e "\n${GREEN}🚀 UDP 下载 (↓) 测试中...${RESET}"
+                iperf3 -c "$SERVER_IP" -u -b "$IPERF_UDP_BW" -t "$IPERF_TIME" -R -P "$IPERF_PARALLEL" -p "$IPERF_PORT" || true
+                read -p "测试完成，按回车继续..." dummy
+                ;;
+            5)
+                clear; get_iperf_ip || continue
+                echo -e "\n${GREEN}🚀 UDP 上传 (↑) 测试中...${RESET}"
+                iperf3 -c "$SERVER_IP" -u -b "$IPERF_UDP_BW" -t "$IPERF_TIME" -P "$IPERF_PARALLEL" -p "$IPERF_PORT" || true
+                read -p "测试完成，按回车继续..." dummy
+                ;;
+            6)
+                clear
+                echo -e "${YELLOW}>>> 修改 iperf3 临时参数 <<<${RESET}"
+                read -p "修改端口 (当前 $IPERF_PORT): " in_p; IPERF_PORT=${in_p:-$IPERF_PORT}
+                read -p "修改时长 (当前 $IPERF_TIME): " in_t; IPERF_TIME=${in_t:-$IPERF_TIME}
+                read -p "修改线程 (当前 $IPERF_PARALLEL): " in_pa; IPERF_PARALLEL=${in_pa:-$IPERF_PARALLEL}
+                read -p "修改UDP带宽 (当前 $IPERF_UDP_BW): " in_b; IPERF_UDP_BW=${in_b:-$IPERF_UDP_BW}
+                ;;
+            0) break ;;
+            *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ==========================================
+# 4) MTR 模块
+# ==========================================
+run_mtr() {
+    check_and_install mtr
+    while true; do
+        clear
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}        MTR 链路诊断面板         ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}探测协议 :${RESET} $(echo "$MTR_PROTO" | tr 'a-z' 'A-Z')"
+        echo -e "${GREEN}AS号展示 :${RESET} $([ "$MTR_SHOW_AS" = "true" ] && echo "开启" || echo "关闭")"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN} 1) 实时动态检测${RESET}"
+        echo -e "${GREEN} 2) 静态报告模式${RESET}"
+        echo -e "${GREEN} 0) 返回上级菜单${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        read -p " 请选择: " choice
+        
+        local args=""
+        [ "$MTR_SHOW_AS" = "true" ] && args="$args -z"
+
+        case "$choice" in
+            1)
+                read -p "请输入目标IP/域名: " target
+                if [ -z "$target" ]; then continue; fi
+                echo -e "--------------------------------"
+                mtr $args "$target" || true
+                echo -e "--------------------------------"
+                read -p "检测结束，按回车返回..." dummy
+                ;;
+            2)
+                read -p "请输入目标IP/域名: " target
+                if [ -z "$target" ]; then continue; fi
+                clear
+                echo -e "${GREEN}报告生成中(发送100个包)...${RESET}\n"
+                mtr -r -c 100 $args "$target" || true
+                echo -e "--------------------------------"
+                read -p "分析结束，按回车返回..." dummy
+                ;;
+            0) break ;;
+        esac
+    done
+}
+
+# ==========================================
+# 5) 大小包面板模块（完美集成你的极简纯净排版逻辑）
+# ==========================================
+core_packet_test() {
+    local provider=$1
+    local ip=$2
+    clear
+    echo -e "\n${YELLOW}=== 测试 ${provider} ===${RESET}"
+
+    # 打印前缀不换行，清洗 nexttrace 输出只提取关键 IP/ASN 轨迹
+    echo -ne "大包测试（1450 Bytes）："
+    local raw_big=$(nexttrace --tcp --psize 1450 --backbone --timeout 2s --max-hops 30 "$ip" -p 80 2>/dev/null)
+    # 正确剥离干扰项，精准抓取路由跳数与IP
+    local route_big=$(echo "$raw_big" | grep -E '^[0-9]+' | awk '{print $1,$2,$3}' || true)
+    if [ -n "$route_big" ]; then echo -e "${GREEN}完成${RESET}"; else echo -e "${RED}超时/失败${RESET}"; fi
+    
+    echo -ne "小包测试（64 Bytes）："
+    local raw_small=$(nexttrace --tcp --psize 64 --backbone --timeout 2s --max-hops 30 "$ip" -p 80 2>/dev/null)
+    local route_small=$(echo "$raw_small" | grep -E '^[0-9]+' | awk '{print $1,$2,$3}' || true)
+    if [ -n "$route_small" ]; then echo -e "${GREEN}完成${RESET}"; else echo -e "${RED}超时/失败${RESET}"; fi
+
+    echo -e "\n${YELLOW}=== 路由对比 ===${RESET}"
+    local diff_output=$(diff <(echo "$route_big") <(echo "$route_small") 2>/dev/null || true)
+    
+    if [ -z "$route_big" ] && [ -z "$route_small" ]; then
+        echo -e "${RED}❌ 探测失败：双向节点均响应超时，请检查是否处于 root 权限。${RESET}"
+    elif [ -z "$diff_output" ]; then
+        echo -e "${GREEN}大小包路由一致 ✅${RESET}"
+    else
+        echo -e "${RED}大小包路由不一致 ❌ (检测到策略分流)${RESET}"
+        echo -e "\n${BLUE}>>> 轨迹分流差异对比 (-大包 / +小包) <<<\n${RESET}"
+        echo "$diff_output" | grep -E '^[-+][^-+]' || true
+    fi
+    read -rp $'\n\033[33m按回车返回菜单...\033[0m'
+}
+
+run_packet_size_test() {
+    check_and_install nexttrace
+    while true; do
+        clear
+        echo -e "${GREEN}==== 大小包测试====${RESET}"
+        echo -e " 1) 移动"
+        echo -e " 2) 联通"
+        echo -e " 3) 电信"
+        echo -e " 4) 全测"
+        echo -e " 0) 退出"
+        echo -e "${GREEN}====================${RESET}"
+        read -rp $'\033[32m请选择测试节点: \033[0m' choice
+
+        case $choice in
+            1) core_packet_test "深圳移动" "211.136.192.6" ;;
+            2) core_packet_test "广州联通" "210.21.196.6" ;;
+            3) core_packet_test "广州电信" "202.96.128.86" ;;
+            4)
+                core_packet_test "深圳移动" "211.136.192.6"
+                core_packet_test "广州联通" "210.21.196.6"
+                core_packet_test "广州电信" "202.96.128.86"
+                ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择，请重新输入${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ==========================================
+# 工具箱主面板循环
+# ==========================================
+while true; do
+    clear
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}       网络管理 综合面板        ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}Speedtest :${RESET} $(get_status speedtest)"
+    echo -e "${GREEN}NextTrace :${RESET} $(get_status nexttrace)"
+    echo -e "${GREEN}iperf3    :${RESET} $(get_status iperf3)"
+    echo -e "${GREEN}MTR       :${RESET} $(get_status mtr)"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e " ${GREEN}1)${RESET} 运行 Speedtest 网速测试"
+    echo -e " ${GREEN}2)${RESET} 运行 NextTrace 路由追踪"
+    echo -e " --------------------------------"
+    echo -e " ${GREEN}3)${RESET} 运行 iperf3 进阶测速管理箱 (四分流版)"
+    echo -e " ${GREEN}4)${RESET} 运行 MTR 多协议链路诊断"
+    echo -e " --------------------------------"
+    echo -e " ${GREEN}5)${RESET} 运行 大小包策略路由检测"
+    echo -e " ${RED}0)${RESET} 退出"
+    echo -e "${GREEN}================================${RESET}"
+    read -p $'\033[32m 请选择: \033[0m' choice
+
+    case "$choice" in
+        1) run_speedtest ;;
+        2) run_nexttrace ;;
+        3) run_iperf3 ;;
+        4) run_mtr ;;
+        5) run_packet_size_test ;;
+        0) echo -e "${GREEN}工具箱已关闭。${RESET}"; exit 0 ;;
+        *) echo -e "${RED}输入错误。${RESET}"; sleep 1 ;;
     esac
 done

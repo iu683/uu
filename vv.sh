@@ -13,6 +13,16 @@ YELLOW="\033[33m"
 BLUE="\033[34m"
 RESET="\033[0m"
 
+# ================== GITHUB 代理加速池 ==================
+readonly GITHUB_PROXY=(
+    'https://v6.gh-proxy.org/'
+    'https://gh-proxy.com/'
+    'https://hub.glowp.xyz/'
+    'https://proxy.vvvv.ee/'
+    'https://ghproxy.lvedong.eu.org/'
+    '' # 留空代表直连，作为兜底保底
+)
+
 # ================== 🚀 服务自定义重命名 ==================
 readonly SERV_NAME="xray-httpupgrade"
 
@@ -69,14 +79,33 @@ get_xray_version() {
 }
 
 get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        # 强制获取 IPv4
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
         done
-    done
-    error "无法获取公网 IP 地址。" && return 1
+    elif [[ "$mode" == "v6" ]]; then
+        # 强制获取 IPv6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+
+    error "无法获取公网 IP 地址，请检查网络或 DNS 设置！" && echo "127.0.0.1" && return 1
 }
+
 
 HOSTNAME=$(hostname -s | sed 's/ /_/g')
 
@@ -235,12 +264,48 @@ install_xray() {
     mkdir -p "$X_DIR" && sync
     
     local arch=$(uname -m | sed 's/x86_64/64/;s/aarch64/arm64-v8a/')
-    local ver=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
-    
+    local ver=""
+
+    info "正在检索 Xray-core 官方最新发布版本..."
+    # ✨ 完美升级：用 wget 轮询你的代理池去抓取版本号，防止纯 v6 环境或网络封锁导致卡死
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local api_url="${proxy}https://api.github.com/repos/XTLS/Xray-core/releases/latest"
+        ver=$(wget -qO- --timeout=5 --tries=1 --no-check-certificate "$api_url" | jq -r .tag_name 2>/dev/null || echo "")
+        if [[ -n "$ver" && "$ver" != "null" ]]; then
+            break
+        fi
+    done
+
+    # 🚨 终极保底：如果所有代理和直连都拿不到版本号，绝不允许它为空！强制给一个稳定的现代版本
+    if [[ -z "$ver" || "$ver" == "null" ]]; then
+        ver="v26.3.27"
+        warn "通过 API 获取版本号超时，已激活保底机制，将为您安装高稳定版本: $ver"
+    fi
+
     info "下载 Xray $ver ($arch)..."
-    # ✨ 完美平替：-q 开启静音，--no-check-certificate 忽略证书错误，-O 后面紧跟保存路径
-    wget -q --no-check-certificate -O /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/$ver/Xray-linux-$arch.zip"
     
+    local download_success=false
+    # ✨ 完美升级：文件下载同样引入代理池轮询，死磕到下载成功为止
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local dl_url="${proxy}https://github.com/XTLS/Xray-core/releases/download/$ver/Xray-linux-$arch.zip"
+        
+        # -O 正确保存到文件，--timeout=15 防止在死节点上挂起
+        if wget --no-check-certificate --timeout=15 --tries=1 -q -O /tmp/xray.zip "$dl_url" 2>/dev/null; then
+            # -s 确保文件大小大于 0 字节，防止下到空文件
+            if [ -s /tmp/xray.zip ]; then
+                download_success=true
+                break
+            fi
+        fi
+        warn "当前下载节点响应失败，正在为您自动切换下一个 GitHub 代理..."
+    done
+
+    if [ "$download_success" = false ]; then
+        error "严重错误：所有代理节点及直连模式均下载失败，请检查 VPS 的 DNS 设置！"
+        return 1
+    fi
+
+    # 解压与部署
     unzip -o /tmp/xray.zip -d /tmp/xray_tmp > /dev/null
     mv -f /tmp/xray_tmp/xray "$X_BIN" && chmod +x "$X_BIN"
     rm -rf /tmp/xray*

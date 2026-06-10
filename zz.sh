@@ -129,6 +129,22 @@ get_runtime_proxy() {
     fi
 }
 
+safe_sed_delete_proxy() {
+    if [[ "$OS_TYPE" == "macos" ]]; then
+        sed -i '' '/\[\[proxy_network\]\]/,+1d' "$1"
+    else
+        sed -i '/\[\[proxy_network\]\]/,+1d' "$1"
+    fi
+}
+
+safe_sed_delete_peer() {
+    if [[ "$OS_TYPE" == "macos" ]]; then
+        sed -i '' '/\[\[peer\]\]/,$d' "$1"
+    else
+        sed -i '/\[\[peer\]\]/,$d' "$1"
+    fi
+}
+
 # --- 服务控制管理 ---
 create_service_file() {
     if [[ "$OS_TYPE" == "linux" ]]; then
@@ -196,7 +212,6 @@ create_shortcut() {
     local SCRIPT_PATH
     
     if [[ "$0" == *"pipe"* || "$0" == "bash" || "$0" == "sh" || "$0" == "/dev/fd/"* ]]; then
-        echo -e "${YELLOW}检测到当前为远程首次运行，正在自动固化脚本到本地...${NC}"
         mkdir -p "$CONFIG_DIR"
         local LOCAL_SCRIPT="${CONFIG_DIR}/easytier_menu.sh"
         local SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/zz.sh"
@@ -236,42 +251,77 @@ install_easytier() {
     echo -e "${GREEN}--- 开始安装或更新 EasyTier ---${NC}"
     local os_identifier="linux"; if [[ "$OS_TYPE" == "macos" ]]; then os_identifier="macos"; fi
     local arch; arch=$(get_arch)
-    local latest_info="" ; local chosen_proxy=""
 
+    local latest_info=""
+    local chosen_proxy=""
+
+    echo "1. 正在获取最新版本信息 (顺序轮询代理池)..."
     for proxy in "${GITHUB_PROXY[@]}"; do
         local api_url="$GITHUB_API_URL"
-        if [ -n "$proxy" ]; then api_url="${proxy%/}/${GITHUB_API_URL}"; fi
+        if [ -n "$proxy" ]; then
+            api_url="${proxy%/}/${GITHUB_API_URL}"
+            echo -e " -> 正在尝试代理: ${YELLOW}${proxy}${NC} ..."
+        else
+            echo -e " -> 正在尝试: ${BLUE}直连 GitHub${NC} ..."
+        fi
+
         latest_info=$(curl -sL --connect-timeout 5 "$api_url")
-        if [ -n "$latest_info" ] && echo "$latest_info" | jq -e '.assets' >/dev/null 2>&1; then chosen_proxy="$proxy"; break; fi
+        
+        if [ -n "$latest_info" ] && echo "$latest_info" | jq -e '.assets' >/dev/null 2>&1; then
+            chosen_proxy="$proxy"
+            if [ -n "$chosen_proxy" ]; then
+                echo -e "${GREEN} ✔ 代理 ${chosen_proxy} 连接成功!${NC}"
+            else
+                echo -e "${GREEN} ✔ 直连 GitHub 成功!${NC}"
+            fi
+            break
+        else
+            echo -e "${RED} ✘ 节点连接失败、无有效数据或遭遇 GitHub API 限流，尝试下一个...${NC}"
+            latest_info=""
+        fi
     done
 
-    if [ -z "$latest_info" ]; then echo -e "${RED}错误: 无法获取有效版本信息。${NC}"; return 1; fi
+    if [ -z "$latest_info" ]; then
+        echo -e "${RED}错误: 代理池中所有节点及直连均无法获取有效版本信息，请稍后再试。${NC}"
+        return 1
+    fi
     
     local search_prefix="easytier-${os_identifier}-${arch}"
     local asset_json; asset_json=$(echo "$latest_info" | jq ".assets[] | select(.name | startswith(\"${search_prefix}\") and endswith(\".zip\"))" 2>/dev/null)
-    if [ -z "$asset_json" ]; then echo -e "${RED}错误: 未找到适配架构的安装包。${NC}"; return 1; fi
+    if [ -z "$asset_json" ]; then echo -e "${RED}错误: 未能找到适用于 ${OS_TYPE}(${arch}) 的包。${NC}"; return 1; fi
     
     local raw_download_url; raw_download_url=$(echo "$asset_json" | jq -r '.browser_download_url')
     local actual_filename; actual_filename=$(echo "$asset_json" | jq -r '.name')
     local version; version=$(echo "$latest_info" | jq -r ".tag_name")
+    echo "检测到版本: ${version}, 架构: ${arch}, 文件: ${actual_filename}"
     
     local final_download_url="$raw_download_url"
-    if [ -n "$chosen_proxy" ]; then final_download_url="${chosen_proxy%/}/${raw_download_url}"; fi
+    if [ -n "$chosen_proxy" ]; then
+        if [[ "$chosen_proxy" == */ ]]; then final_download_url="${chosen_proxy}${raw_download_url}"; else final_download_url="${chosen_proxy}/${raw_download_url}"; fi
+        echo -e "${YELLOW}2. 使用就绪代理下载: ${final_download_url}${NC}"
+    else
+        echo "2. 直接从 GitHub 下载: ${final_download_url}"
+    fi
 
     local temp_file; temp_file=$(mktemp)
-    curl -L --progress-bar --connect-timeout 10 -o "$temp_file" "$final_download_url" || { rm -f "$temp_file"; return 1; }
-    
+    curl -L --progress-bar --connect-timeout 10 -o "$temp_file" "$final_download_url" || { echo -e "${RED}下载失败!${NC}"; rm -f "$temp_file"; return 1; }
+    echo "3. 解压并安装..."
     local unzip_dir_name="easytier-${os_identifier}-${arch}"
-    unzip -o "$temp_file" -d /tmp/ > /dev/null
+    unzip -o "$temp_file" -d /tmp/ > /dev/null || { echo -e "${RED}解压失败!${NC}"; rm -f "$temp_file"; return 1; }
+    local extracted_core="/tmp/${unzip_dir_name}/${CORE_BINARY_NAME}"; local extracted_cli="/tmp/${unzip_dir_name}/${CLI_BINARY_NAME}"
+    if [ ! -f "$extracted_core" ] || [ ! -f "$extracted_cli" ]; then echo -e "${RED}错误: 在解压目录中未找到核心文件。${NC}"; rm -f "$temp_file"; rm -rf "/tmp/${unzip_dir_name}"; return 1; fi
     mkdir -p "$INSTALL_DIR"
-    mv -f "/tmp/${unzip_dir_name}/${CORE_BINARY_NAME}" "${INSTALL_DIR}/${CORE_BINARY_NAME}"
-    mv -f "/tmp/${unzip_dir_name}/${CLI_BINARY_NAME}" "${INSTALL_DIR}/${CLI_BINARY_NAME}"
+    mv -f "$extracted_core" "${INSTALL_DIR}/${CORE_BINARY_NAME}"; mv -f "$extracted_cli" "${INSTALL_DIR}/${CLI_BINARY_NAME}"
     chmod +x "${INSTALL_DIR}/${CORE_BINARY_NAME}" "${INSTALL_DIR}/${CLI_BINARY_NAME}"
-    rm -f "$temp_file" && rm -rf "/tmp/${unzip_dir_name}"
+    rm -f "$temp_file"; rm -rf "/tmp/${unzip_dir_name}"
     
-    echo -e "${GREEN}--- EasyTier ${version} 安装成功! ---${NC}"
+    echo -e "${GREEN}--- EasyTier ${version} 安装/更新成功! ---${NC}"
     create_shortcut
-    if [ -f "$SERVICE_FILE" ]; then enable_service; restart_service; fi
+    
+    if [ -f "$SERVICE_FILE" ]; then
+        echo -e "${YELLOW}检测到现有服务，正在静默重启服务...${NC}"
+        enable_service; restart_service
+    fi
 }
 
 create_default_config() { 
@@ -305,14 +355,8 @@ EOF
     return $?
 }
 
-modify_existing_config() {
-    check_installed || return 1
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${YELLOW}未检测到配置文件，正在为您初始化默认模板...${NC}"
-        create_default_config || { echo -e "${RED}创建配置文件失败。${NC}"; return 1; }
-    fi
-
-    echo -e "${BLUE}--- 修改 EasyTier 配置文件 (直接回车保持当前值不变) ---${NC}"
+_core_config_wizard() {
+    local is_interactive_join="$1"
 
     local current_hostname; current_hostname=$(grep -E "^hostname\s*=" "$CONFIG_FILE" | head -n 1 | cut -d'"' -f2)
     local current_ipv4; current_ipv4=$(grep -E "^ipv4\s*=" "$CONFIG_FILE" | head -n 1 | cut -d'"' -f2)
@@ -326,20 +370,31 @@ modify_existing_config() {
     if [ "$current_dhcp" = "true" ] || [ -z "$current_ipv4" ]; then ip_display="DHCP自动获取"; fi
     if [ -z "$current_peer" ]; then current_peer="未配置"; fi
 
-    # 1. 修改主机名
-    echo -e "${YELLOW}当前自定义主机名: [ ${current_hostname:-未配置} ]${NC}"
-    read -p "请输入新的主机名称 (直接回车保持不变): " new_host
+    echo -e "${GREEN}--- 配置向导 (直接回车保持默认/当前值) ---${NC}"
+
+    # 获取系统当前的实际主机名
+    local sys_hostname; sys_hostname=$(hostname)
+    
+    # 获取当前配置文件中的主机名，如果没有或者等于默认值，则触发自动变更逻辑
+    local display_hostname="${current_hostname:-easytier-node}"
+    if [[ "$display_hostname" == "easytier-node" ]]; then
+        display_hostname="$sys_hostname"
+        # 自动在配置文件中更新为系统主机名
+        set_toml_value "hostname" "\"$sys_hostname\"" "$CONFIG_FILE"
+        echo -e "${YELLOW}检测到当前为主机名默认值，已自动同步为系统主机名: [ $sys_hostname ]${NC}"
+    else
+        echo -e "${YELLOW}自定义主机名: [ $display_hostname ]${NC}"
+    fi
+
+    # 提示用户是否需要手动再次修改
+    read -p "请输入主机名称 (回车保持不变): " new_host
     if [ -n "$new_host" ]; then
         set_toml_value "hostname" "\"$new_host\"" "$CONFIG_FILE"
         echo -e " -> 已变更为: $new_host"
-    else
-        echo -e " -> 保持不变"
     fi
-    echo
 
-    # 2. 修改虚拟IP
     echo -e "${YELLOW}当前 IP 状态: [ ${ip_display} ]${NC}"
-    read -p "请输入新的虚拟IP (留空或输入 dhcp 启用自动获取, 直接回车保持不变): " virtual_ip
+    read -p "请输入虚拟IP (输入 dhcp 启用自动获取, 回车保持不变): " virtual_ip
     if [ -n "$virtual_ip" ]; then
         if [[ "$virtual_ip" == "dhcp" || "$virtual_ip" == "DHCP" ]]; then
             set_toml_value "dhcp" "true" "$CONFIG_FILE"
@@ -349,59 +404,54 @@ modify_existing_config() {
             set_toml_value "ipv4" "\"$virtual_ip\"" "$CONFIG_FILE"
         fi
         echo -e " -> IP 配置已更新"
-    else
-        echo -e " -> 保持不变"
     fi
     echo
 
-    # 3. 修改网络组名称
-    echo -e "${YELLOW}当前网络组名称: [ ${current_name:-未配置} ]${NC}"
-    read -p "请输入新的网络组名称 (直接回车保持不变): " net_name
-    if [ -n "$net_name" ]; then
-        set_toml_value "network_name" "\"$net_name\"" "$CONFIG_FILE"
-        echo -e " -> 已变更为: $net_name"
-    else
-        echo -e " -> 保持不变"
-    fi
-    echo
+    if [ "$is_interactive_join" != "true" ]; then
+        echo -e "${YELLOW}当前网络组名称: [ ${current_name:-未配置} ]${NC}"
+        read -p "请输入新的网络组名称 (回车保持不变): " net_name
+        if [ -n "$net_name" ]; then
+            set_toml_value "network_name" "\"$net_name\"" "$CONFIG_FILE"
+            echo -e " -> 已变更为: $net_name"
+        fi
+        echo
 
-    # 4. 修改网络组密钥
-    echo -e "${YELLOW}当前网络组密钥: [ ${current_secret:-未配置} ]${NC}"
-    read -p "请输入新的网络组密钥 (直接回车保持不变): " net_secret
-    if [ -n "$net_secret" ]; then
-        set_toml_value "network_secret" "\"$net_secret\"" "$CONFIG_FILE"
-        echo -e " -> 已变更为: $net_secret"
-    else
-        echo -e " -> 保持不变"
+        echo -e "${YELLOW}当前网络组密钥: [ ${current_secret:-未配置} ]${NC}"
+        read -p "请输入新的网络组密钥 (回车保持不变): " net_secret
+        if [ -n "$net_secret" ]; then
+            set_toml_value "network_secret" "\"$net_secret\"" "$CONFIG_FILE"
+            echo -e " -> 已变更为: $net_secret"
+        fi
+        echo
     fi
-    echo
 
-    # 5. 修改子网代理 (proxy_network)
-    echo -e "${YELLOW}当前绑定的内网子网代理: [ ${current_cidr:-未配置/未开启} ]${NC}"
+    echo -e "${YELLOW}当前绑稳的内网子网代理: [ ${current_cidr:-未配置/未开启} ]${NC}"
     echo -e "${BLUE}提示: 格式如 192.168.1.0/24，开启后网内其他机器就能访问你身后的局域网设备${NC}"
-    read -p "请输入要代理的内网网段 (留空或输入 clear 清除, 直接回车保持不变): " proxy_cidr
+    read -p "请输入要代理的内网网段 (留空不变, 输入 clear 清除): " proxy_cidr
     if [ -n "$proxy_cidr" ]; then
-        sed -i '/\[\[proxy_network\]\]/,+1d' "$CONFIG_FILE"
+        safe_sed_delete_proxy "$CONFIG_FILE"
         if [[ "$proxy_cidr" != "clear" ]]; then
             echo -e "\n[[proxy_network]]\ncidr = \"${proxy_cidr}\"" >> "$CONFIG_FILE"
             echo -e " -> 已成功绑定并代理内网网段: $proxy_cidr"
         else
             echo -e " -> 已成功清除子网代理设置"
         fi
-    else
-        echo -e " -> 保持不变"
     fi
     echo
 
-    # 6. 修改对端 Peer 节点
-    echo -e "${YELLOW}当前对端 Peer: [ ${current_peer} ]${NC}"
-    read -p "请输入新的对端中转节点连接串 (直接回车保持不变): " peer_uri
+    if [ "$is_interactive_join" == "true" ] && [ "$current_peer" = "未配置" ]; then
+        current_peer="tcp://public.easytier.top:11010 (官方默认公网节点)"
+    fi
+    echo -e "${YELLOW}当前对端 Peer 中转地址: [ ${current_peer} ]${NC}"
+    read -p "请输入新的对端中转节点连接串 (回车保持默认): " peer_uri
     if [ -n "$peer_uri" ]; then
-        sed -i '/\[\[peer\]\]/,$d' "$CONFIG_FILE"
+        safe_sed_delete_peer "$CONFIG_FILE"
         echo -e "\n[[peer]]\nuri = \"${peer_uri}\"" >> "$CONFIG_FILE"
         echo -e " -> 已变更为: $peer_uri"
-    else
-        echo -e " -> 保持不变"
+    elif [ "$is_interactive_join" == "true" ] && [ "$current_peer" = "tcp://public.easytier.top:11010 (官方默认公网节点)" ]; then
+        safe_sed_delete_peer "$CONFIG_FILE"
+        echo -e "\n[[peer]]\nuri = \"tcp://public.easytier.top:11010\"" >> "$CONFIG_FILE"
+        echo -e " -> 自动应用默认节点: tcp://public.easytier.top:11010"
     fi
     echo
 
@@ -411,17 +461,36 @@ modify_existing_config() {
     echo -e "${GREEN}✔ 所有修改处理完毕，EasyTier 服务已自动重载生效！${NC}"
 }
 
+modify_existing_config() {
+    check_installed || return 1
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${YELLOW}未检测到配置文件，正在为您初始化默认模板...${NC}"
+        create_default_config || { echo -e "${RED}创建配置文件失败。${NC}"; return 1; }
+    fi
+    _core_config_wizard "false"
+}
+
 join_existing_network() { 
     check_installed || return 1
-    read -p "请输入网络名称: " network_name
-    read -p "请输入网络密钥: " network_secret
+    
+    echo -e "${GREEN}--- 加入 EasyTier 网络组 ---${NC}"
+    read -p "1. 请输入网络组名称 (Network Name): " network_name
+    if [ -z "$network_name" ]; then echo -e "${RED}错误: 网络组名称不能为空。${NC}"; return 1; fi
+    
+    read -p "2. 请输入网络组密钥 (Network Secret): " network_secret
+    if [ -z "$network_secret" ]; then echo -e "${RED}错误: 网络组密钥不能为空。${NC}"; return 1; fi
+    
     create_default_config || return 1
+    
     set_toml_value "network_name" "\"$network_name\"" "$CONFIG_FILE"
     set_toml_value "network_secret" "\"$network_secret\"" "$CONFIG_FILE"
-    set_toml_value "dhcp" "true" "$CONFIG_FILE"
-    echo -e "\n[[peer]]\nuri = \"tcp://public.easytier.top:11010\"" >> "$CONFIG_FILE"
-    create_service_file; reload_service_daemon; enable_service; restart_service
-    echo -e "${GREEN}--- 成功加入网络！ ---${NC}"
+    
+    echo
+    echo -e "${GREEN}基础网络信息已录入！接下来您可以直接配置主机名、自定义 IP 和子网代理：${NC}"
+    echo
+    
+    _core_config_wizard "true"
+    echo -e "${GREEN}--- 成功加入网络 ---${NC}"
 }
 
 uninstall_easytier() { 
@@ -436,7 +505,13 @@ uninstall_easytier() {
 
 # --- 主入口 ---
 main() {
-    set_toml_value() { sed -i "s|^#* *${1} *=.*|${1} = ${2}|" "$3"; }
+    set_toml_value() {
+        if [[ "$OS_TYPE" == "macos" ]]; then
+            sed -i '' "s|^#* *${1} *=.*|${1} = ${2}|" "$3"
+        else
+            sed -i "s|^#* *${1} *=.*|${1} = ${2}|" "$3"
+        fi
+    }
 
     case "$(uname)" in
         Linux) if [ -f /etc/alpine-release ]; then OS_TYPE="alpine"; SERVICE_FILE="/etc/init.d/${SERVICE_NAME}"; else OS_TYPE="linux"; SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"; fi ;;
@@ -445,6 +520,7 @@ main() {
     esac
     check_root; check_dependencies
     
+
     
     while true; do
         clear
@@ -455,18 +531,18 @@ main() {
         G_PROXYCIDR=$(get_runtime_proxy)
 
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}        EasyTier 管理面板        ${RESET}"
+        echo -e "${GREEN}         EasyTier 管理面板        ${RESET}"
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}状态   :${RESET} $G_STATUS"
-        echo -e "${GREEN}版本   :${RESET} ${YELLOW}${G_VERSION}${RESET}"
-        echo -e "${GREEN}网络组 :${RESET} ${YELLOW}${G_NETNAME}${RESET}"
-        echo -e "${GREEN}本机IP :${RESET} ${YELLOW}${G_RUNIP}${RESET}"
+        echo -e "${GREEN}状态    :${RESET} $G_STATUS"
+        echo -e "${GREEN}版本    :${RESET} ${YELLOW}${G_VERSION}${RESET}"
+        echo -e "${GREEN}网络组  :${RESET} ${YELLOW}${G_NETNAME}${RESET}"
+        echo -e "${GREEN}本机IP  :${RESET} ${YELLOW}${G_RUNIP}${RESET}"
         echo -e "${GREEN}子网代理:${RESET} ${YELLOW}${G_PROXYCIDR}${RESET}"
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN} 1. 安装 EasyTier${RESET}"
         echo -e "${GREEN} 2. 更新 EasyTier${RESET}"
         echo -e "${GREEN} 3. 卸载 EasyTier${RESET}"
-        echo -e "${GREEN} 4. 修改配置文件${RESET}"
+        echo -e "${GREEN} 4. 修改组网网络${RESET}"
         echo -e "${GREEN} 5. 加入组网网络${RESET}"
         echo -e "${GREEN} 6. 查看配置文件${RESET}"
         echo -e "${GREEN} 7. 查看网络节点${RESET}"
@@ -480,7 +556,8 @@ main() {
         read -r choice
         echo
         case $choice in
-            1|2) install_easytier ;;
+            1) install_easytier "install" ;; 
+            2) install_easytier "update"  ;; 
             3) uninstall_easytier ;;
             4) modify_existing_config ;;
             5) join_existing_network ;;
@@ -492,7 +569,7 @@ main() {
             11) log_service ;;
             0) exit 0 ;;
         esac
-        echo
+
         printf "${YELLOW}按回车键返回主菜单...${NC}" && read -r _
     done
 }

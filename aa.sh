@@ -1,301 +1,444 @@
 #!/bin/bash
-# =================================================================
-# 名称: 全能网络工具箱 
-# 适配: Debian / Ubuntu / CentOS / Rocky Linux / Alpine Linux
-# =================================================================
+set -e
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-BLUE="\033[36m"
-RESET="\033[0m"
-ORANGE='\033[38;5;208m'
+#================================================================================
+# 常量和全局变量定义
+#================================================================================
+REDSOCKS_CONF="/etc/redsocks.conf"
+IPTABLES_RULES="/etc/redsocks.rules"
+IP6TABLES_RULES="/etc/redsocks6.rules"
 
-# 默认配置参数
-IPERF_PORT=5201
-IPERF_TIME=30
-IPERF_PARALLEL=1
-IPERF_UDP_BW="1G"
-MTR_PROTO="ICMP"
-MTR_SHOW_AS="true"
+# 颜色高亮定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+RESET='\033[0m'
 
-# 全局安全退出捕获
-trap "echo -e '${RESET}'; exit" INT TERM
+info() { echo -e "${BLUE}[信息]${NC} $1"; }
+success() { echo -e "${GREEN}[成功]${NC} $1"; }
+warning() { echo -e "${YELLOW}[警告]${NC} $1"; }
+error() { echo -e "${RED}[错误]${NC} $1"; }
+step() { echo -e "${PURPLE}[步骤]${NC} $1"; }
 
-# ==========================================
-# 工具状态动态探测
-# ==========================================
-get_status() {
-    if command -v "$1" >/dev/null 2>&1; then
-        echo -e "${YELLOW}已安装${RESET}"
-    else
-        echo -e "${RED}未安装${RESET}"
+require_root() {
+    if [ "$EUID" -ne 0 ]; then
+        error "请使用 root 权限运行此脚本，例如: sudo $0"
+        exit 1
     fi
 }
 
-# ==========================================
-# 自动化安装引擎
-# ==========================================
-check_and_install() {
-    local tool=$1
-    if command -v "$tool" >/dev/null 2>&1; then return; fi
-
-    echo -e "${YELLOW}📦 正在安装必要依赖与工具: $tool ...${RESET}"
+#================================================================================
+# Iptables 规则洗净与恢复 (双栈清理)
+#================================================================================
+cleanup_iptables() {
+    step "正在清理 redsocks 残留的 IPv4/IPv6 iptables 规则..."
     
-    # 基础依赖环境前置检查与修复
-    if [ -f /etc/alpine-release ]; then
-        apk add --no-cache curl wget tar bash grep gawk openssl
-    elif ! command -v curl >/dev/null 2>&1 || ! command -v wget >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
-        if command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y curl wget tar grep gawk
-        elif command -v dnf >/dev/null 2>&1; then dnf install -y curl wget tar grep gawk
-        elif command -v yum >/dev/null 2>&1; then yum install -y curl wget tar grep gawk
-        fi
+    # 清理 IPv4
+    if iptables -t nat -S OUTPUT 2>/dev/null | grep -q "REDSOCKS"; then
+        iptables -t nat -D OUTPUT -p tcp -j REDSOCKS 2>/dev/null || true
+    fi
+    iptables -t nat -F REDSOCKS 2>/dev/null || true
+    iptables -t nat -X REDSOCKS 2>/dev/null || true
+
+    # 清理 IPv6
+    if ip6tables -t nat -S OUTPUT 2>/dev/null | grep -q "REDSOCKS6"; then
+        ip6tables -t nat -D OUTPUT -p tcp -j REDSOCKS6 2>/dev/null || true
+    fi
+    ip6tables -t nat -F REDSOCKS6 2>/dev/null || true
+    ip6tables -t nat -X REDSOCKS6 2>/dev/null || true
+    
+    success "双栈 iptables 代理规则全面洗净，原网已恢复。"
+}
+
+#================================================================================
+# 核心配置交互与文件写入（全面兼容 IPv4 / IPv6 节点）
+#================================================================================
+write_config_file() {
+    local current_local_port="12345"
+    local current_addr="" current_port="" current_user="" current_pass=""
+    
+    if [ -f "$REDSOCKS_CONF" ]; then
+        current_local_port=$(grep -E '^[[:space:]]*local_port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
+        current_addr=$(grep -E '^[[:space:]]*ip[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
+        current_port=$(grep -E '^[[:space:]]*port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
+        current_user=$(grep -E '^[[:space:]]*login[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
+        current_pass=$(grep -E '^[[:space:]]*password[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
     fi
 
-    case "$tool" in
-        speedtest)
-            if [ -f /etc/alpine-release ]; then
-                echo -e "${YELLOW}📦 检测到 Alpine 系统，正在通过 apk 官方源安装...${RESET}"
-                apk add --no-cache speedtest-cli
-                if [ ! -f /usr/local/bin/speedtest ] && [ ! -f /usr/bin/speedtest ]; then
-                    ln -sf "$(command -v speedtest-cli)" /usr/bin/speedtest
-                fi
-            else
-                echo -e "${YELLOW}📦 正在通过二进制包快速安装 Ookla Speedtest...${RESET}"
-                local cpu_arch=$(uname -m)
-                local download_url=""
-                case "$cpu_arch" in
-                    x86_64) download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz" ;;
-                    aarch64|arm64) download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz" ;;
-                    *) echo -e "${RED}❌ 错误: 不支持的架构 ${cpu_arch}${RESET}" >&2; exit 1 ;;
-                esac
-                cd /tmp
-                wget -q "$download_url" -O speedtest.tgz && \
-                tar -xzf speedtest.tgz && \
-                mv -f speedtest /usr/local/bin/ && \
-                rm -f speedtest.tgz speedtest.5 speedtest.md LICENSE.md
-            fi
-            mkdir -p "$HOME/.ookla"
-            echo '{"license_accepted": true, "gdpr_accepted": true}' > "$HOME/.ookla/speedtest-cli.json" 2>/dev/null || true
-            ;;
-        nexttrace)
-            curl -fsSL nxtrace.org/nt | bash || true
-            ;;
-        iperf3)
-            if [ -f /etc/alpine-release ]; then apk add --no-cache iperf3
-            elif command -v apt-get >/dev/null 2>&1; then apt-get install -y iperf3
-            elif command -v dnf >/dev/null 2>&1; then dnf install -y epel-release 2>/dev/null || true; dnf install -y iperf3
-            elif command -v yum >/dev/null 2>&1; then yum install -y epel-release 2>/dev/null || true; yum install -y iperf3
-            fi
-            ;;
-        mtr)
-            if [ -f /etc/alpine-release ]; then apk add --no-cache mtr
-            elif command -v apt-get >/dev/null 2>&1; then apt-get install -y mtr-tiny || apt-get install -y mtr
-            elif command -v dnf >/dev/null 2>&1; then dnf install -y mtr
-            elif command -v yum >/dev/null 2>&1; then yum install -y mtr
-            fi
-            ;;
-    esac
-    hash -r 2>/dev/null
-}
+    [ -z "$current_local_port" ] && current_local_port="12345"
 
-# ==========================================
-# 1) Speedtest 模块 (双保险免提示版)
-# ==========================================
-run_speedtest() {
-    clear
-    check_and_install speedtest
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        Speedtest 网速测试        ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}🚀 开始测速...${RESET}"
-    echo "-------------------------------------"
-    if speedtest --help 2>&1 | grep -q "accept-license"; then
-        echo "YES" | speedtest --accept-license --accept-gdpr --force || true
-    else
-        speedtest || speedtest-cli || true
-    fi
-    echo "-------------------------------------"
-    read -p "测试完成，按回车返回面板..." dummy
-}
+    echo -e "${CYAN}请输入您的代理节点（支持IPv4/IPv6/Warp）及本地转发参数：${RESET}"
+    echo "--------------------------------------------------------"
 
-# ==========================================
-# 2) NextTrace 模块
-# ==========================================
-run_nexttrace() {
-    clear
-    check_and_install nexttrace
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        NextTrace 路由追踪        ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    read -p "请输入目标IP或域名: " target
-    if [ -z "$target" ]; then return; fi
-    echo -e "--------------------------------"
-    nexttrace "$target" || true
-    echo -e "${GREEN}================================${RESET}"
-    read -p "追踪完成，按回车返回面板..." dummy
-}
-
-# ==========================================
-# 3) iperf3 
-# ==========================================
-get_iperf_ip() {
-    read -p "请输入远端服务器 IP/域名: " SERVER_IP
-    if [ -z "$SERVER_IP" ]; then
-        echo -e "${RED}❌ 未输入有效 IP，操作取消。${RESET}"
-        sleep 1.5
-        return 1
-    fi
-    return 0
-}
-
-run_iperf3() {
-    check_and_install iperf3
+    # 1. 自定义 Redsocks 本地监听端口
+    local input_local_port
     while true; do
+        read -r -p "请输入 Redsocks 本地监听端口 [$current_local_port]: " input_local_port
+        [ -z "$input_local_port" ] && input_local_port=$current_local_port
+        if [[ "$input_local_port" =~ ^[0-9]+$ ]] && [ "$input_local_port" -ge 1 ] && [ "$input_local_port" -le 65535 ]; then
+            break
+        else
+            error "无效的端口号，请输入 1 到 65535 之间的数字。"
+        fi
+    done
+
+    # 2. 远端 Socks5 节点地址 (自动检测 v4 或 v6)
+    local input_addr is_v6=0
+    while true; do
+        if [ -n "$current_addr" ]; then
+            read -r -p "请输入 Socks5 服务器地址/IP [$current_addr]: " input_addr
+            [ -z "$input_addr" ] && input_addr=$current_addr
+        else
+            read -r -p "请输入 Socks5 服务器地址/IP (支持IPv6如 2001:db8::1): " input_addr
+        fi
+        if [ -n "$input_addr" ]; then 
+            # 简单判断是否包含冒号，包含则视为 IPv6
+            if [[ "$input_addr" == *":"* ]]; then
+                is_v6=1
+            fi
+            break
+        else 
+            error "服务器地址不能为空。"; 
+        fi
+    done
+
+    # 3. 远端 Socks5 节点端口
+    local input_port
+    while true; do
+        if [ -n "$current_port" ]; then
+            read -r -p "请输入 Socks5 服务器端口 [$current_port]: " input_port
+            [ -z "$input_port" ] && input_port=$current_port
+        else
+            read -r -p "请输入 Socks5 服务器端口 (1-65535): " input_port
+        fi
+        if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
+            break
+        else
+            error "无效的端口号，请输入 1 到 65535 之间的数字。"
+        fi
+    done
+
+    # 4. 用户名
+    local input_user
+    if [ -n "$current_user" ]; then
+        read -r -p "请输入用户名 (回车保持现状, 彻底清空请输入 none) [$current_user]: " input_user
+        [ -z "$input_user" ] && input_user=$current_user
+        [ "$input_user" = "none" ] && input_user=""
+    else
+        read -r -p "请输入用户名 (可选，无验证直接留空回车): " input_user
+    fi
+
+    # 5. 密码
+    local input_pass
+    if [ -n "$input_user" ]; then
+        if [ -n "$current_pass" ]; then
+            read -r -p "请输入密码 (回车保持现状, 彻底清空请输入 none) [$current_pass]: " input_pass
+            [ -z "$input_pass" ] && input_pass=$current_pass
+            [ "$input_pass" = "none" ] && input_pass=""
+        else
+            read -r -p "请输入密码 (可选，无验证直接留空回车): " input_pass
+        fi
+    else
+        input_pass=""
+    fi
+
+    input_local_port=$(echo "$input_local_port" | tr -d '\r')
+    input_addr=$(echo "$input_addr" | tr -d '\r')
+    input_port=$(echo "$input_port" | tr -d '\r')
+    input_user=$(echo "$input_user" | tr -d '\r')
+    input_pass=$(echo "$input_pass" | tr -d '\r')
+
+    step "正在渲染生成双栈配置文件 $REDSOCKS_CONF ..."
+    cat > "$REDSOCKS_CONF" <<EOF
+base {
+    log_debug = off;
+    log_info = on;
+    log = "syslog:daemon";
+    daemon = on;
+    redirector = iptables;
+}
+
+redsocks {
+    local_ip = 127.0.0.1;
+    local_port = $input_local_port;
+
+    ip = $input_addr;
+    port = $input_port;
+    type = socks5;
+EOF
+
+    if [ -n "$input_user" ]; then
+        echo "    login = \"$input_user\";" >> "$REDSOCKS_CONF"
+    fi
+    if [ -n "$input_pass" ]; then
+        echo "    password = \"$input_pass\";" >> "$REDSOCKS_CONF"
+    fi
+
+    echo "}" >> "$REDSOCKS_CONF"
+
+    # 生成 IPv4 防火墙劫持规则
+    step "正在渲染 IPv4 防护 Iptables 规则 ..."
+    cat > "$IPTABLES_RULES" <<EOF
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+:REDSOCKS - [0:0]
+-A OUTPUT -p tcp --dport 22 -j RETURN
+-A OUTPUT -p tcp --sport 22 -j RETURN
+-A OUTPUT -p tcp --dport $input_port -j RETURN
+-A OUTPUT -p tcp -j REDSOCKS
+EOF
+
+    if [ $is_v6 -eq 0 ]; then
+        echo "-A REDSOCKS -d $input_addr -j RETURN" >> "$IPTABLES_RULES"
+    fi
+
+    cat >> "$IPTABLES_RULES" <<EOF
+-A REDSOCKS -d 0.0.0.0/8 -j RETURN
+-A REDSOCKS -d 10.0.0.0/8 -j RETURN
+-A REDSOCKS -d 127.0.0.0/8 -j RETURN
+-A REDSOCKS -d 169.254.0.0/16 -j RETURN
+-A REDSOCKS -d 172.16.0.0/12 -j RETURN
+-A REDSOCKS -d 192.168.0.0/16 -j RETURN
+-A REDSOCKS -d 224.0.0.0/4 -j RETURN
+-A REDSOCKS -d 240.0.0.0/4 -j RETURN
+-A REDSOCKS -p tcp -j REDIRECT --to-ports $input_local_port
+COMMIT
+EOF
+
+    # 生成 IPv6 防火墙劫持规则
+    step "正在渲染 IPv6 防护 Ip6tables 规则 ..."
+    cat > "$IP6TABLES_RULES" <<EOF
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+:REDSOCKS6 - [0:0]
+-A OUTPUT -p tcp --dport 22 -j RETURN
+-A OUTPUT -p tcp --sport 22 -j RETURN
+-A OUTPUT -p tcp --dport $input_port -j RETURN
+-A OUTPUT -p tcp -j REDSOCKS6
+EOF
+
+    if [ $is_v6 -eq 1 ]; then
+        echo "-A REDSOCKS6 -d $input_addr -j RETURN" >> "$IP6TABLES_RULES"
+    fi
+
+    cat >> "$IP6TABLES_RULES" <<EOF
+-A REDSOCKS6 -d ::1/128 -j RETURN
+-A REDSOCKS6 -d fe80::/10 -j RETURN
+-A REDSOCKS6 -p tcp -j REDIRECT --to-ports $input_local_port
+COMMIT
+EOF
+}
+
+#================================================================================
+# 服务管理块
+#================================================================================
+install_redsocks_env() {
+    cleanup_iptables
+
+    step "[1/4] 从软件源检查并安装 redsocks 双栈核心组件..."
+    if ! command -v redsocks &>/dev/null; then
+        apt-get update && apt-get install -y redsocks iptables ip6tables curl || {
+            error "安装基础包失败，请检查系统网络或 apt 源！"
+            return 1
+        }
+    fi
+
+    systemctl stop redsocks 2>/dev/null || true
+    systemctl disable redsocks 2>/dev/null || true
+
+    step "[2/4] 进入节点配置录入阶段..."
+    write_config_file
+
+    step "[3/4] 正在向系统注册自定义双栈劫持服务 (redsocks.service)..."
+    local SERVICE_FILE="/etc/systemd/system/redsocks.service"
+    cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Redsocks Transparent Proxy Service (IPv4+IPv6)
+After=network.target
+
+[Service]
+Type=forking
+PIDFile=/run/redsocks.pid
+ExecStartPre=-/bin/rm -f /run/redsocks.pid
+ExecStart=/usr/sbin/redsocks -c $REDSOCKS_CONF -p /run/redsocks.pid
+ExecStartPost=/bin/sh -c '/sbin/iptables-restore < $IPTABLES_RULES && /sbin/ip6tables-restore < $IP6TABLES_RULES'
+ExecStopPost=/bin/sh -c 'iptables -t nat -D OUTPUT -p tcp -j REDSOCKS 2>/dev/null || true; iptables -t nat -F REDSOCKS 2>/dev/null || true; iptables -t nat -X REDSOCKS 2>/dev/null || true; ip6tables -t nat -D OUTPUT -p tcp -j REDSOCKS6 2>/dev/null || true; ip6tables -t nat -F REDSOCKS6 2>/dev/null || true; ip6tables -t nat -X REDSOCKS6 2>/dev/null || true'
+TimeoutStartSec=5
+Restart=on-failure
+LimitNOFILE=524288
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    chown root:root "$REDSOCKS_CONF" 2>/dev/null || true
+    chmod 644 "$REDSOCKS_CONF" 2>/dev/null || true
+
+    systemctl daemon-reload
+    systemctl enable redsocks.service 2>/dev/null
+    
+    step "[4/4] 正在自动激活服务并开启双栈全局透明代理..."
+    systemctl start redsocks.service && iptables-restore < "$IPTABLES_RULES" && ip6tables-restore < "$IP6TABLES_RULES" || {
+        error "自动启动代理失败。"
+        return 1
+    }
+
+    success "Redsocks 双栈全套环境已完美拉起运行！支持 Warp 与 IPv6 节点！"
+}
+
+change_config() {
+    info "开始单独修改全局代理配置："
+    write_config_file
+    chown root:root "$REDSOCKS_CONF" 2>/dev/null || true
+    success "双栈配置文件与 Iptables 联动规则更新成功！"
+    
+    if systemctl is-active --quiet redsocks.service; then
+        step "检测到服务正在后台运行，正在自动重启服务以应用新配置与端口..."
+        systemctl restart redsocks.service
+        iptables-restore < "$IPTABLES_RULES"
+        ip6tables-restore < "$IP6TABLES_RULES"
+        success "新配置已无缝双栈生效。"
+    else
+        info "提示：配置已就绪，当前服务处于停止状态。请在主菜单选择【选项 5】手动启动。"
+    fi
+}
+
+uninstall_redsocks_env() {
+    cleanup_iptables
+    local SERVICE_FILE="/etc/systemd/system/redsocks.service"
+
+    step "正在停止并彻底禁用后台 redsocks 服务..."
+    systemctl stop redsocks.service 2>/dev/null || true
+    systemctl disable redsocks.service 2>/dev/null || true
+
+    step "正在清理系统残留组件文件..."
+    [ -f "$SERVICE_FILE" ] && rm -f "$SERVICE_FILE"
+    [ -f "$REDSOCKS_CONF" ] && rm -f "$REDSOCKS_CONF"
+    [ -f "$IPTABLES_RULES" ] && rm -f "$IPTABLES_RULES"
+    [ -f "$IP6TABLES_RULES" ] && rm -f "$IP6TABLES_RULES"
+    
+    systemctl daemon-reload
+    success "环境已彻底从系统卸载干净。"
+}
+
+get_status() {
+    if systemctl is-active --quiet redsocks.service; then
+        status_show="${GREEN}已启动 (运行中)${RESET}"
+    else
+        status_show="${RED}已停止 (未运行)${RESET}"
+    fi
+
+    if command -v redsocks &>/dev/null; then
+        local version_raw
+        version_raw=$(redsocks -v 2>&1 | grep -oE '[0-9]+\.[0-9.]+' | head -n1)
+        if [ -n "$version_raw" ]; then
+            version_show="${YELLOW}v${version_raw}${RESET}"
+        else
+            version_show="${YELLOW}已安装${RESET}"
+        fi
+    else
+        version_show="${RED}未安装${RESET}"
+    fi
+
+    if [ -f "$REDSOCKS_CONF" ]; then
+        local port addr local_port
+        local_port=$(grep -E '^[[:space:]]*local_port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
+        addr=$(grep -E '^[[:space:]]*ip[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
+        port=$(grep -E '^[[:space:]]*port[[:space:]]*=' "$REDSOCKS_CONF" | head -n1 | awk -F'=' '{print $2}' | tr -d " ';\"")
+        port_show="${YELLOW}${addr}:${port} ${NC}->${CYAN} 本地监听:${local_port}${RESET}"
+    else
+        port_show="${RED}无配置${RESET}"
+    fi
+}
+
+test_exit_ip() {
+    step "正在通过全局双栈 iptables 转发层查询落地出口 IP..."
+    local ip_info=""
+    local test_urls=("https://api.ipify.org?format=json" "https://ipinfo.io/json")
+
+    for url in "${test_urls[@]}"; do
+        info "正在尝试请求: $url ..."
+        ip_info=$(curl -s -m 6 "$url" 2>/dev/null || echo "")
+        if [ -n "$ip_info" ]; then break; fi
+    done
+
+    if [ -n "$ip_info" ]; then
+        echo -e "${GREEN}----------------------------------------${RESET}"
+        if echo "$ip_info" | grep -q "{"; then
+            echo "$ip_info" | sed 's/["{}]//g' | sed 's/,/\n/g' | sed 's/^ *//'
+        else
+            echo -e "当前落地出口 IP: ${YELLOW}$ip_info${RESET}"
+        fi
+        echo -e "${GREEN}----------------------------------------${RESET}"
+        success "测试成功！流量转发全局畅通。"
+    else
+        error "获取失败。请执行选项 8 查看运行日志。"
+    fi
+}
+
+panel_menu() {
+    require_root
+    while true; do
+        get_status
         clear
-        echo -e "${GREEN}===================================${RESET}"
-        echo -e "${GREEN}          iperf3 测速管理          ${RESET}"
-        echo -e "${GREEN}===================================${RESET}"
-        echo -e " ${YELLOW}当前参数: 端口=$IPERF_PORT | 时长=${IPERF_TIME}s | 线程=$IPERF_PARALLEL | UDP带宽=$IPERF_UDP_BW${RESET}"
-        echo -e "${GREEN}-----------------------------------${RESET}"
-        echo -e " ${GREEN}1) 启动 iperf3 本地服务端"
-        echo -e "${GREEN}-----------------------------------${RESET}"
-        echo -e " ${GREEN}2) 发起 TCP 下载 (↓) 测试${RESET}"
-        echo -e " ${GREEN}3) 发起 TCP 上传 (↑) 测试${RESET}"
-        echo -e " ${GREEN}-----------------------------------${RESET}"
-        echo -e " ${GREEN}4) 发起 UDP 下载 (↓) 测试${RESET}"
-        echo -e " ${GREEN}5) 发起 UDP 上传 (↑) 测试${RESET}"
-        echo -e "${GREEN}-----------------------------------${RESET}"
-        echo -e " ${GREEN}6) 修改测试核心参数${RESET}"
-        echo -e " ${GREEN}0) 退出${RESET}"
-        echo -e "${GREEN}===================================${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
-        read -r choice
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}             Redsocks           ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}状态   :${RESET} $status_show"
+        echo -e "${GREEN}版本   :${RESET} $version_show"
+        echo -e "${GREEN}代理   :${RESET} $port_show"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN} 1. 安装 Redsocks${RESET}"
+        echo -e "${GREEN} 2. 卸载 Redsocks${RESET}"
+        echo -e "${GREEN} 3. 修改配置${RESET}"
+        echo -e "${GREEN} 4. 启动 Redsocks${RESET}"
+        echo -e "${GREEN} 5. 停止 Redsocks${RESET}"
+        echo -e "${GREEN} 6. 重启 Redsocks 服务${RESET}"
+        echo -e "${GREEN} 7. 查看系统日志${RESET}"
+        echo -e "${GREEN} 8. 测试当前出口IP${RESET}"
+        echo -e "${GREEN} 0. 退出${RESET}"
+        echo -e "${GREEN}================================${RESET}"
         
-        case "$choice" in
-            1)
-                clear
-                echo -e "${ORANGE}===================================${RESET}"
-                echo -e "${GREEN}  iperf3 服务器已启动 (监听端口: $IPERF_PORT)${RESET}"
-                echo -e "${YELLOW}  👉 提示: 测速完毕后，按 Ctrl+C 可安全返回菜单${RESET}"
-                echo -e "${ORANGE}===================================${RESET}\n"
-                (trap 'echo -e "${YELLOW}服务端已安全关闭。${RESET}"; exit 0' INT; iperf3 -s -i 10 -p "$IPERF_PORT")
-                echo "-----------------------------------"
-                read -p "按回车继续..." dummy
-                ;;
-            2)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 TCP 下载 (↓) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -R -P "$IPERF_PARALLEL" -t "$IPERF_TIME" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
-                ;;
-            3)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 TCP 上传 (↑) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -P "$IPERF_PARALLEL" -t "$IPERF_TIME" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
-                ;;
+        read -p $'\e[32m请输入数字: \e[0m' num
+        case "$num" in
+            1) install_redsocks_env ;;
+            2) uninstall_redsocks_env ;;
+            3) change_config ;;
             4)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 UDP 下载 (↓) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -u -b "$IPERF_UDP_BW" -t "$IPERF_TIME" -R -P "$IPERF_PARALLEL" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
+                step "正在启动服务并加载双栈劫持规则..."
+                if [ ! -f "$REDSOCKS_CONF" ]; then
+                    error "未发现有效配置！"
+                else
+                    systemctl start redsocks.service && iptables-restore < "$IPTABLES_RULES" && ip6tables-restore < "$IP6TABLES_RULES" && success "双栈代理全力运转。" || error "启动失败。"
+                fi
                 ;;
             5)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 UDP 上传 (↑) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -u -b "$IPERF_UDP_BW" -t "$IPERF_TIME" -P "$IPERF_PARALLEL" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
+                step "正在安全关闭双栈代理..."
+                systemctl stop redsocks.service && cleanup_iptables && success "网络彻底复原。" || error "停用失败。"
                 ;;
             6)
-                echo -e "${YELLOW}>>> 修改 iperf3 临时参数 <<<${RESET}"
-                read -p "修改端口 (当前 $IPERF_PORT): " in_p; IPERF_PORT=${in_p:-$IPERF_PORT}
-                read -p "修改时长 (当前 $IPERF_TIME): " in_t; IPERF_TIME=${in_t:-$IPERF_TIME}
-                read -p "修改线程 (当前 $IPERF_PARALLEL): " in_pa; IPERF_PARALLEL=${in_pa:-$IPERF_PARALLEL}
-                read -p "修改UDP带宽 (当前 $IPERF_UDP_BW): " in_b; IPERF_UDP_BW=${in_b:-$IPERF_UDP_BW}
+                systemctl restart redsocks.service && success "重启成功。" || error "重启失败。"
                 ;;
+            7)
+                journalctl -u redsocks.service -n 30 --no-pager || tail -n 30 /var/log/syslog
+                ;;
+            8) test_exit_ip ;;
             0) exit 0 ;;
-            *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+            *) error "非法数字！" ;;
         esac
+        echo -ne "${YELLOW}按任意键返回主菜单...${RESET}"
+        read -r
     done
 }
 
-# ==========================================
-# 4) MTR 面板模块
-# ==========================================
-run_mtr() {
-    check_and_install mtr
-    while true; do
-        clear
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}        MTR 链路诊断面板         ${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}探测协议 :${RESET} ${YELLOW}$(echo "$MTR_PROTO" | tr 'a-z' 'A-Z')${RESET}"
-        echo -e "${GREEN}AS号展示 :${RESET} ${YELLOW}$([ "$MTR_SHOW_AS" = "true" ] && echo "开启" || echo "关闭")${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} 1) 实时动态检测${RESET}"
-        echo -e "${GREEN} 2) 静态报告模式${RESET}"
-        echo -e "${GREEN} 0) 退出${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
-        read -r choice
-        
-        local args=""
-        [ "$MTR_SHOW_AS" = "true" ] && args="$args -z"
-
-        case "$choice" in
-            1)
-                read -p "请输入目标IP/域名: " target
-                if [ -z "$target" ]; then continue; fi
-                echo -e "--------------------------------"
-                mtr $args "$target" || true
-                echo -e "--------------------------------"
-                read -p "检测结束，按回车返回..." dummy
-                ;;
-            2)
-                read -p "请输入目标IP/域名: " target
-                if [ -z "$target" ]; then continue; fi
-                clear
-                echo -e "${GREEN}报告生成中(发送100个包)...${RESET}\n"
-                mtr -r -c 100 $args "$target" || true
-                echo -e "--------------------------------"
-                read -p "分析结束，按回车返回..." dummy
-                ;;
-            0) exit 0 ;;
-        esac
-    done
-}
-
-
-# ==========================================
-# 工具箱主面板循环
-# ==========================================
-while true; do
-    clear
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       网络管理 综合面板        ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}Speedtest :${RESET} $(get_status speedtest)"
-    echo -e "${GREEN}NextTrace :${RESET} $(get_status nexttrace)"
-    echo -e "${GREEN}iperf3    :${RESET} $(get_status iperf3)"
-    echo -e "${GREEN}MTR       :${RESET} $(get_status mtr)"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e " ${GREEN}1) 运行 Speedtest 网速测试${RESET}"
-    echo -e " ${GREEN}2) 运行 NextTrace 路由追踪${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e " ${GREEN}3) 运行 iperf3 测速${RESET}"
-    echo -e " ${GREEN}4) 运行 MTR 多协议链路诊断${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e " ${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    read -p $'\033[32m 请选择: \033[0m' choice
-
-    case "$choice" in
-        1) run_speedtest ;;
-        2) run_nexttrace ;;
-        3) run_iperf3 ;;
-        4) run_mtr ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}输入错误。${RESET}"; sleep 1 ;;
-    esac
-done
+panel_menu

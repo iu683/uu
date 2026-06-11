@@ -16,7 +16,7 @@ NODE_SCRIPT_URL="https://github.com/bqlpfy/flux-panel/raw/main/install.sh"
 
 DOCKER_CMD="docker compose"
 
-# GitHub 代理前缀列表（第一个为空代表直连尝试）
+# GitHub 代理前缀列表
 GITHUB_PROXY=(
     ''
     'https://v6.gh-proxy.org/'
@@ -25,18 +25,6 @@ GITHUB_PROXY=(
     'https://proxy.vvvv.ee/'
     'https://ghproxy.lvedong.eu.org/'
 )
-
-# 依赖检查：确保安装了 jq 和 openssl
-check_dependencies() {
-    if ! command -v jq &>/dev/null; then
-        echo -e "${YELLOW}未检测到 jq，正在尝试安装...${RESET}"
-        apt-get update && apt-get install -y jq || yum install -y jq
-    fi
-    if ! command -v openssl &>/dev/null; then
-        echo -e "${YELLOW}未检测到 openssl，正在尝试安装...${RESET}"
-        apt-get update && apt-get install -y openssl || yum install -y openssl
-    fi
-}
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -85,14 +73,12 @@ configure_docker_ipv6() {
         echo '{}' > /etc/docker/daemon.json
     fi
 
-    # 兼容处理非标准或空白 json
     if ! jq '.' /etc/docker/daemon.json &>/dev/null; then
         echo '{}' > /etc/docker/daemon.json
     fi
 
     local IPV6_ENABLED
-    # 避免 jq 读取 null 报错
-    纯IPV6_ENABLED=$(jq '.ipv6 // false' /etc/docker/daemon.json 2>/dev/null)
+    IPV6_ENABLED=$(jq '.ipv6 // false' /etc/docker/daemon.json 2>/dev/null)
     if [ "$IPV6_ENABLED" = "true" ]; then
         echo -e "${GREEN}✅ Docker 已启用 IPv6，无需重复配置${RESET}"
         return
@@ -137,7 +123,6 @@ download_file() {
 }
 
 install_app() {
-    check_dependencies
     check_docker
     mkdir -p "$APP_DIR"
     cd "$APP_DIR" || exit
@@ -146,7 +131,7 @@ install_app() {
     echo "📡 准备下载数据库初始化文件..."
     if [ ! -f gost.sql ] || [ ! -s gost.sql ]; then
         if ! download_file "$GOST_SQL_URL" "gost.sql"; then
-            echo -e "${RED}❌ 数据库文件所有下载通道均失败，请检查网络或 URL: $GOST_SQL_URL${RESET}"
+            echo -e "${RED}❌ 数据库文件下载失败，请检查网络渠道${RESET}"
             read -p "按回车返回菜单..."
             return
         fi
@@ -173,8 +158,8 @@ install_app() {
     # JWT secret
     JWT_SECRET=$(openssl rand -hex 16)
 
-    # 检测 IPv6
-    ENABLE_IPV6=true # 显式初始化默认值
+    # 检测 IPv6 并初始化开关值
+    ENABLE_IPV6=true
     if check_ipv6_support; then
         echo -e "${GREEN}🚀 系统支持 IPv6，自动启用 IPv6 配置...${RESET}"
         configure_docker_ipv6
@@ -183,8 +168,8 @@ install_app() {
         ENABLE_IPV6=false
     fi
 
-    # 用户手动确认 IPv6 开关
-    read -p "是否启用 Docker 内部容器 IPv6 网络? [Y/n] (默认开启): " ipv6_input
+    # 用户交互确认
+    read -p "是否启用 Docker IPv6 网络? [Y/n] (默认开启): " ipv6_input
     if [[ "$ipv6_input" =~ ^[Nn]$ ]]; then
         ENABLE_IPV6=false
     fi
@@ -200,7 +185,7 @@ BACKEND_PORT=$BACKEND_PORT
 EOF
     echo -e "${GREEN}✅ .env 文件生成完成${RESET}"
 
-    # 生成 docker-compose.yml (注意转义了 \$ 符号，以便正确读取 .env 文件)
+    # 核心修复：这里转义了 \$，以便 Compose 运行时正确从环境加载，而非在写入时被 Shell 提前写死
     cat > "$COMPOSE_FILE" <<EOF
 services:
   mysql:
@@ -278,9 +263,9 @@ volumes:
     driver: local
 EOF
 
-    # 动态追加网络配置
+    # 动态附加官方网络段
     if [ "$ENABLE_IPV6" = true ]; then
-cat >> "$COMPOSE_FILE" <<EOF
+cat >> "$COMPOSE_FILE" <<'EOF'
 
 networks:
   gost-network:
@@ -293,7 +278,7 @@ networks:
         - subnet: fd00:dead:beef::/48
 EOF
     else
-cat >> "$COMPOSE_FILE" <<EOF
+cat >> "$COMPOSE_FILE" <<'EOF'
 
 networks:
   gost-network:
@@ -363,7 +348,7 @@ manage_nodes() {
         ./node_install.sh
         rm -f node_install.sh
     else
-        echo -e "${RED}❌ 无法安装节点管理，请检查网络！${RESET}"
+        echo -e "${RED}❌ 无法下载节点管理，请检查网络！${RESET}"
         read -p "按回车返回菜单..."
     fi
 }
@@ -399,5 +384,4 @@ menu() {
     done
 }
 
-# 启动菜单
 menu

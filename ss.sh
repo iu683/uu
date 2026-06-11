@@ -176,7 +176,7 @@ clear_old_iptables() {
 }
 
 apply_new_iptables() {
-  clear_old_iptables
+  # 【修复】去掉了开头的 clear_old_iptables，防止新写入的 main_port 干扰清理逻辑
   if [[ -f "${CONFIG_DIR}/hopping.txt" ]]; then
     local hop_val
     hop_val=$(cat "${CONFIG_DIR}/hopping.txt")
@@ -184,21 +184,21 @@ apply_new_iptables() {
     local end_p="${hop_val#*-}"
     
     info "正在应用 iptables 转发规则: UDP $start_p-$end_p => 主端口 $port"
-    if iptables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port"; then
-      ip6tables -t nat -A PREROUTING -p udp -m multiport --dports "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
-    else
-      iptables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port"
-      ip6tables -t nat -A PREROUTING -p udp --dport "$start_p:$end_p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
-    fi
     
-    echo "$port" > "${CONFIG_DIR}/main_port.txt"
+    # 采用高兼容性标准的 REDIRECT 或 DNAT 规则
+    if ! iptables -t nat -A PREROUTING -p udp --dport "${start_p}:${end_p}" -j REDIRECT --to-ports "$port" 2>/dev/null; then
+       iptables -t nat -A PREROUTING -p udp --dport "${start_p}-${end_p}" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+    fi
+
+    if [[ -f /etc/init.d/ip6tables ]]; then
+       ip6tables -t nat -A PREROUTING -p udp --dport "${start_p}:${end_p}" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+    fi
     
     if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
     if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
-    info "防火墙端口跳跃规则已固化。"
+    info "防火墙端口跳跃规则已成功固化。"
   fi
 }
-
 # =========================================================
 # 4. 网络诊断与配置管理辅助
 # =========================================================
@@ -422,7 +422,7 @@ inst_port() {
     read -rp "$prompt_msg" port
     if [[ -z "$port" ]]; then
       if [[ -n "$default_port" ]]; then 
-        port="$default_port"   # 【修复】确保回车时，全局变量 port 能够正确拿到旧端口
+        port="$default_port"
         break
       else
         port=$(get_random_port)
@@ -454,12 +454,16 @@ inst_port() {
   local jumpInput
   read -rp "请选择端口模式 [1-2] (直接回车默认不变或选择默认项): " jumpInput
   
-  # 【修复】回车保持原配置的逻辑重构
+  # 【核心修复】回车确认保持原跳跃范围，但主端口换了的逻辑
   if [[ -z "$jumpInput" && -n "$default_hop" ]]; then
     info "检测到回车确认，将保持原有端口跳跃配置 [${default_hop}]。"
+    
+    # 1. 趁着旧的 main_port.txt 还没被覆盖，先把基于老主端口的防火墙规则彻底干净地清理掉！
+    clear_old_iptables
+    
+    # 2. 清理完老规则后，再把新主端口写入文件
     echo "$port" > "${CONFIG_DIR}/main_port.txt"
-    # 【核心修复】不能直接 return 0！
-    # 必须把清理旧规则的动作移到后面，或者在此处直接跳过防火墙重置，直接交给后面的写入流程。
+    echo "$default_hop" > "${CONFIG_DIR}/hopping.txt"
     return 0
   fi
 
@@ -490,11 +494,11 @@ inst_port() {
       fi
     done
     
-    # 【修复】只有当用户真正修改了或者重新确认了，才清除旧规则并写入新规则文件
+    # 【核心修复】手动修改跳跃范围时，也是先清理，再写入
     clear_old_iptables
     echo "$firstport-$endport" > "${CONFIG_DIR}/hopping.txt"
+    echo "$port" > "${CONFIG_DIR}/main_port.txt"
   else
-    # 选择单端口模式，清除跳跃链条
     clear_old_iptables
     rm -f "${CONFIG_DIR}/hopping.txt" "${CONFIG_DIR}/main_port.txt"
     info "已成功切换回单端口纯净模式"

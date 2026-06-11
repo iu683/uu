@@ -1,508 +1,392 @@
-#!/usr/bin/sh
+#!/bin/bash
+# ========================================
+# GOST 一键管理脚本
+# ========================================
 
-# =============================================================================
-#  MicaProxy Alpine 专属多实例管理面板
-# =============================================================================
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-export REPO="judy-gotv/Rust-SOCKS5-HTTP"
-export BIN_PATH="/opt/MicaProxy/MicaProxy"
-export INSTANCE_DIR="/etc/MicaProxy"
-export DATA_DIR="/var/lib/micaproxy"
-export LOG_DIR="/opt/MicaProxy/log"
+APP_NAME="flux-panel"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+GOST_SQL_URL="https://github.com/bqlpfy/flux-panel/releases/download/1.4.3/gost.sql"
+NODE_SCRIPT_URL="https://github.com/bqlpfy/flux-panel/raw/main/install.sh"
 
-# 默认控制的目标实例名称自动改成当前主机名
-CURRENT_INSTANCE="$(hostname)"
+DOCKER_CMD="docker compose"
 
-export RESET='\033[0m'
-export GREEN='\033[0;32m'
-export YELLOW='\033[0;33m'
-export RED='\033[0;31m'
-export BLUE='\033[0;34m'
-export CYAN='\033[0;36m'
 
-GITHUB_PROXIES=(
-    ""
-    "https://gh-proxy.com/"
-    "https://proxy.vvvv.ee/"
-    "https://v6.gh-proxy.org/"
-    "https://ghproxy.lvedong.eu.org/"
-    "https://hub.glowp.xyz/"
+# 代理前缀列表（第一个留空代表直连尝试）
+GITHUB_PROXY=(
+    ''
+    'https://v6.gh-proxy.org/'
+    'https://gh-proxy.com/'
+    'https://hub.glowp.xyz/'
+    'https://proxy.vvvv.ee/'
+    'https://ghproxy.lvedong.eu.org/'
 )
 
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}[错误]${RESET} 请使用 root 权限运行此脚本！" >&2
-    exit 1
-fi
 
-info() { echo -e "${BLUE}[INFO]${RESET} $1"; }
-ok()   { echo -e "${GREEN}[OK]${RESET} $1"; }
-warn() { echo -e "${YELLOW}[WARN]${RESET} $1"; }
-die()  { echo -e "${RED}[ERROR]${RESET} $1" >&2; exit 1; }
-
-# ── ⚡ 优化：按需依赖检查 ─────────────────────────────────────────────────────
-REQUIRED_CMDS="sed grep awk openssl wget"
-MISSING_CMDS=""
-for cmd in $REQUIRED_CMDS; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then 
-        MISSING_CMDS="$MISSING_CMDS $cmd"
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
     fi
-done
 
-if [ -n "$MISSING_CMDS" ]; then
-    info "检测到系统缺失必备组件，正在为您初始化 Alpine 环境..."
-    apk update -q
-    apk add -q openssl wget sed grep gawk
-    ok "环境初始化成功！"
-fi
-
-get_public_ip() {
-    local ip=""
-    for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-        ip=$(wget -qO- --timeout=3 --tries=1 -T 3 --no-check-certificate "$url" 2>/dev/null) && [ -n "$ip" ] && [ -z "$(echo "$ip" | grep ':')" ] && echo "$ip" && return 0
-    done
-    echo "127.0.0.1"
-}
-
-detect_target() {
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64)  TARGET="micaproxy-linux-amd64" ;;
-        aarch64) TARGET="micaproxy-linux-arm64" ;;
-        armv7l)  TARGET="micaproxy-linux-armv7" ;;
-        *) die "暂不支持的系统架构: $ARCH" ;;
-    esac
-}
-
-fetch_latest_version() {
-    info "正在轮询获取 MicaProxy 最新 Release 版本号..."
-    VERSION=""
-    for proxy in "${GITHUB_PROXIES[@]}"; do
-        local api_url="${proxy}https://api.github.com/repos/${REPO}/releases/latest"
-        local resp
-        resp=$(wget -qO- --timeout=5 --tries=1 --no-check-certificate "$api_url" 2>/dev/null)
-        local tmp_ver
-        tmp_ver=$(echo "$resp" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)
-        if [ -n "$tmp_ver" ] && [ "$tmp_ver" != "null" ]; then
-            VERSION="$tmp_ver"
-            ok "成功获取到最新版本: ${GREEN}${VERSION}${RESET}"
-            break
-        fi
-    done
-    if [ -z "$VERSION" ]; then
-        VERSION="v3.0.6"
-        warn "降级采用稳定默认版本: ${VERSION}"
+    if ! $DOCKER_CMD version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
     fi
 }
 
-download_bin() {
-    detect_target
-    fetch_latest_version
-    TMP_DIR="$(mktemp -d)"
-    local download_success=false
-    
-    for proxy in "${GITHUB_PROXIES[@]}"; do
-        local url_bin="${proxy}https://github.com/${REPO}/releases/download/${VERSION}/${TARGET}"
-        info "正在尝试通过镜像源 [ ${CYAN}${proxy:-官方直连}${RESET} ] 下载资产包..."
-        if wget -q --timeout=8 --tries=1 --no-check-certificate -O "$TMP_DIR/MicaProxy" "$url_bin"; then
-            if [ -s "$TMP_DIR/MicaProxy" ]; then
-                download_success=true
-                ok "核心包通过 wget 同步下载完成！"
-                break
-            fi
-        fi
-        warn "当前源下载失败，正在为您自动切换下一个备用源..."
-    done
-
-    if [ "$download_success" = "false" ]; then
-        rm -rf "$TMP_DIR"
-        die "所有 GitHub 镜像代理源及官方通道均尝试失败，请检查网络后重试！"
-    fi
-    export TARGET_BIN_PATH="$TMP_DIR/MicaProxy"
-}
-
-write_openrc_service() {
-    local rc_file="/etc/init.d/micaproxy"
-    cat > "$rc_file" << 'EOF'
-#!/sbin/openrc-run
-
-description="MicaProxy Multi-instance Service"
-INSTANCE="${RC_SVCNAME#micaproxy.}"
-
-if [ "$RC_SVCNAME" = "micaproxy" ]; then
-    INSTANCE="$(hostname)"
-fi
-
-CONF_FILE="/etc/MicaProxy/${INSTANCE}.toml"
-LOG_FILE="/opt/MicaProxy/log/${INSTANCE}.log"
-
-command="/opt/MicaProxy/MicaProxy"
-command_args="-c ${CONF_FILE}"
-command_background="yes"
-pidfile="/run/micaproxy.${INSTANCE}.pid"
-output_log="${LOG_FILE}"
-error_log="${LOG_FILE}"
-
-# 解除 Alpine 默认限制
-rc_ulimit="-n 65535"
-
-depend() {
-    need net
-    after firewall
-}
-
-start_pre() {
-    if [ ! -f "${CONF_FILE}" ]; then
-        eerror "Configuration file ${CONF_FILE} missing!"
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
         return 1
     fi
-    checkpath -d -m 0755 -o root:root /opt/MicaProxy/log
-}
-EOF
-    chmod 0755 "$rc_file"
 }
 
-init_environment() {
-    mkdir -p /opt/MicaProxy
-    mkdir -p "$LOG_DIR"
-    mkdir -p "$INSTANCE_DIR"
-    mkdir -p "$DATA_DIR"
-}
-
-write_config() {
-    local instance="$1" local proto="$2" local bind_ip="$3" local bind_port="$4" local username="$5" local password="$6" local outbound_type="$7"
-    local conf_file="${INSTANCE_DIR}/${instance}.toml"
-    
-    if [ -z "$(echo "$bind_ip" | grep '\[')" ] && [ -n "$(echo "$bind_ip" | grep ':')" ]; then
-        bind_ip="[${bind_ip}]"
-    fi
-
-    [ -z "$outbound_type" ] && outbound_type="default"
-
-    cat <<EOF > "$conf_file"
-[[outbounds]]
-name = "${outbound_type}-outbound"
-type = "${outbound_type}"
-
-[[listeners]]
-name = "${instance}-listener"
-listen = "${bind_ip}:${bind_port}"
-protocol = "${proto}"
-outbound = "${outbound_type}-outbound"
-EOF
-
-    if [ -n "$username" ] && [ -n "$password" ]; then
-        cat <<EOF >> "$conf_file"
-username = "${username}"
-password = "${password}"
-EOF
-    fi
-
-    if [ "$proto" = "socks5" ]; then
-        cat <<EOF >> "$conf_file"
-
-[socks5]
-enabled = true
-udp_enabled = true
-udp_idle_timeout_secs = 120
-udp_buffer_bytes = 8192
-EOF
-    fi
-
-    cat <<EOF >> "$conf_file"
-
-[runtime]
-driver = "epoll"
-EOF
-    chmod 0644 "$conf_file"
-}
-
-print_node_summary() {
-    local instance="$1"
-    local conf_file="${INSTANCE_DIR}/${instance}.toml"
-    if [ ! -f "$conf_file" ]; then return; fi
-
-    local proto
-    proto=$(awk -F '=' '/^[[:space:]]*protocol[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file")
-    [ -z "$proto" ] && proto="socks5"
-
-    local bind_port
-    bind_port=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); split($2, a, ":"); print a[length(a)]}' "$conf_file")
-    
-    local auth_user
-    auth_user=$(awk -F '=' '/^[[:space:]]*username[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file" | tr -d '"')
-    local auth_pass
-    auth_pass=$(awk -F '=' '/^[[:space:]]*password[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file" | tr -d '"')
-
-    local public_ip
-    public_ip=$(get_public_ip)
-
-    echo -e "\n${GREEN}====== MicaProxy 实例 [ ${instance} ] 配置详情 ======${RESET}"
-    echo -e "${GREEN}实例协议     :${RESET} ${CYAN}${proto^^}${RESET}"
-    echo -e "${GREEN}外网绑定 IP  :${RESET} ${public_ip}"
-    echo -e "${GREEN}监听端口     :${RESET} ${bind_port}"
-    if [ -n "$auth_user" ] && [ "$auth_user" != "none" ]; then
-        echo -e "${GREEN}用户名       :${RESET} ${auth_user}"
-        echo -e "${GREEN}密码         :${RESET} ${auth_pass}"
+check_ipv6_support() {
+    if ping6 -c 1 ::1 &>/dev/null; then
+        return 0
     else
-        echo -e "${GREEN}鉴权模式     :${RESET} ${YELLOW}免密模式${RESET}"
+        return 1
     fi
-    echo -e "${GREEN}配置文件路径 :${RESET} ${conf_file}"
-    
-    echo -e "${GREEN}====== 👉 客户端通用格式连接 ======${RESET}"
-    if [ "$proto" = "socks5" ]; then
-        if [ -n "$auth_user" ] && [ "$auth_user" != "none" ]; then
-            echo -e "${YELLOW}socks5://${auth_user}:${auth_pass}@${public_ip}:${bind_port}#${instance}${RESET}"
-            echo -e "\n${GREEN}====== 🚀 Telegram 内置一键代理链接 ======${RESET}"
-            echo -e "${YELLOW}https://t.me/socks?server=${public_ip}&port=${bind_port}&user=${auth_user}&pass=${auth_pass}${RESET}"
+}
+
+# 代理轮询下载通用函数
+download_file() {
+    local url="$1"
+    local output="$2"
+    local success=false
+
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local target_url="${proxy}${url}"
+        if [ -n "$proxy" ]; then
+            echo "📡 正在尝试通过代理下载: ${proxy}"
         else
-            echo -e "${YELLOW}socks5://${public_ip}:${bind_port}#${instance}${RESET}"
-            echo -e "\n${GREEN}====== 🚀 Telegram 内置一键代理链接 ======${RESET}"
-            echo -e "${YELLOW}https://t.me/socks?server=${public_ip}&port=${bind_port}${RESET}"
+            echo "📡 正在尝试直连下载..."
         fi
-    elif [ "$proto" = "http" ]; then
-        if [ -n "$auth_user" ] && [ "$auth_user" != "none" ]; then
-            echo -e "${YELLOW}http://${auth_user}:${auth_pass}@${public_ip}:${bind_port}${RESET}"
+        
+        curl -L -k --max-time 15 -o "$output" "$target_url"
+        
+        if [ -s "$output" ]; then
+            success=true
+            break
         else
-            echo -e "${YELLOW}http://${public_ip}:${bind_port}${RESET}"
+            rm -f "$output"
         fi
-    fi
-    echo ""
-}
-
-get_status_info() {
-    if [ -L "/etc/init.d/micaproxy.${CURRENT_INSTANCE}" ] || [ -f "/etc/init.d/micaproxy.${CURRENT_INSTANCE}" ]; then
-        if rc-service "micaproxy.${CURRENT_INSTANCE}" status 2>/dev/null | grep -q "started"; then
-            panel_status="${GREEN}运行中${RESET}"
-        else
-            panel_status="${RED}未运行${RESET}"
-        fi
-    else
-        panel_status="${RED}未托管服务${RESET}"
-    fi
-
-    if [ -f "$BIN_PATH" ]; then
-        local real_ver=$($BIN_PATH --version 2>/dev/null | head -n 1 | awk '{print $2}')
-        [ -z "$real_ver" ] && real_ver=$($BIN_PATH -v 2>/dev/null | head -n 1)
-        panel_version="${real_ver:-v3.x}"
-    else
-        panel_version="${RED}未下载核心${RESET}"
-    fi
-
-    local conf_file="${INSTANCE_DIR}/${CURRENT_INSTANCE}.toml"
-    if [ -f "$conf_file" ]; then
-        local proto
-        proto=$(awk -F '=' '/^[[:space:]]*protocol[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file")
-        local p_num=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file")
-        panel_port="${p_num} (${proto^^})"
-    else
-        panel_port="未创建配置"
-    fi
-}
-
-parse_existing_config() {
-    local conf_file="${INSTANCE_DIR}/${CURRENT_INSTANCE}.toml"
-    if [ ! -f "$conf_file" ]; then return 1; fi
-
-    OLD_PROTO=$(awk -F '=' '/^[[:space:]]*protocol[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file")
-    [ -z "$OLD_PROTO" ] && OLD_PROTO="socks5"
-
-    local raw_listen
-    raw_listen=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file")
-    OLD_PORT=$(echo "$raw_listen" | awk -F ':' '{print $NF}')
-    OLD_IP=$(echo "$raw_listen" | sed "s/:${OLD_PORT}$//g" | tr -d '[]')
-
-    OLD_USER=$(awk -F '=' '/^[[:space:]]*username[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file" | tr -d '"')
-    OLD_PASS=$(awk -F '=' '/^[[:space:]]*password[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file" | tr -d '"')
-    [ -z "$OLD_USER" ] && OLD_USER="none"
-
-    OLD_OUTBOUND=$(awk -F '=' '/^[[:space:]]*type[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file" | head -n 1)
-    [ -z "$OLD_OUTBOUND" ] && OLD_OUTBOUND="default"
-    return 0
-}
-
-menu_switch_instance() {
-    echo -e "\n${GREEN}==== [多开实例矩阵管理中心] ====${RESET}"
-    echo -e "当前聚焦的操作目标: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-    echo "目前存储于 ${INSTANCE_DIR} 内的独立实例列表:"
-
-    local files="${INSTANCE_DIR}/*.toml"
-    local count=0
-    
-    for f in $files; do
-        [ -e "$f" ] || continue
-        count=$((count + 1))
-        local name=$(basename "$f" .toml)
-        local proto_type=$(awk -F '=' '/^[[:space:]]*protocol[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$f")
-        local status_str="${RED}已挂起${RESET}"
-        rc-service "micaproxy.${name}" status 2>/dev/null | grep -q "started" && status_str="${GREEN}分流中${RESET}"
-        echo -e " [ ${CYAN}${count}${RESET} ] -> ${YELLOW}${name}${RESET} [协议: ${proto_type^^} | 状态: ${status_str}]"
     done
 
-    if [ "$count" -eq 0 ]; then
-        echo " (暂无任何多开实例，请直接输入新名称创建)"
+    if [ "$success" = true ]; then
+        return 0
+    else
+        return 1
     fi
-    echo ""
-    read -r -p "请输入要切换的[现有数字编号]或[直接输入全新英文名]: " input_val
-    if [ -z "$input_val" ]; then return; fi
+}
 
-    if [ "$input_val" -eq "$input_val" ] 2>/dev/null; then
-        local idx=0
-        for f in $files; do
-            [ -e "$f" ] || continue
-            idx=$((idx + 1))
-            if [ "$idx" -eq "$input_val" ]; then
-                CURRENT_INSTANCE=$(basename "$f" .toml)
-                ok "操作焦点已成功切为: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-                return
-            fi
+
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
-        warn "编号不存在，未做任何变更。"
-    else
-        CURRENT_INSTANCE="$input_val"
-        ok "操作焦点锁定新实例名: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-    fi
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
 }
 
-menu_install() {
-    init_environment
-    local is_edit=false
-    if [ "$1" = "edit" ]; then is_edit=true; fi
 
-    if [ "$is_edit" = "true" ]; then
-        if ! parse_existing_config; then
-            die "未检测到实例 [ ${CURRENT_INSTANCE} ] 的旧配置，无法执行微调！"
+configure_docker_ipv6() {
+    # 确保 daemon.json 存在
+    if [ ! -f /etc/docker/daemon.json ]; then
+        echo '{}' > /etc/docker/daemon.json
+    fi
+
+    # 检查是否已经启用 IPv6
+    IPV6_ENABLED=$(jq '.ipv6 // false' /etc/docker/daemon.json)
+    if [ "$IPV6_ENABLED" = "true" ]; then
+        echo -e "${GREEN}✅ Docker 已启用 IPv6，无需重复配置${RESET}"
+        return
+    fi
+
+    # 配置 IPv6
+    jq '. + {ipv6:true, "fixed-cidr-v6":"fd00:dead:beef::/48"}' /etc/docker/daemon.json > /tmp/daemon.json.tmp
+    mv /tmp/daemon.json.tmp /etc/docker/daemon.json
+
+    # 重启 Docker
+    systemctl restart docker
+    echo -e "${GREEN}✅ Docker IPv6 已启用${RESET}"
+}
+
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}============================${RESET}"
+        echo -e "${GREEN}  ◈   哆啦A梦转发面板   ◈   ${RESET}"
+        echo -e "${GREEN}============================${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}7)${RESET} ${YELLOW}节点管理${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        echo -e "${GREEN}============================${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            7) manage_nodes ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+install_app() {
+    check_docker
+    mkdir -p "$APP_DIR"
+
+    cd "$APP_DIR" || exit
+
+    
+    # 下载数据库初始化文件
+    echo "📡 准备下载数据库初始化文件..."
+    if [ ! -f gost.sql ] || [ ! -s gost.sql ]; then
+        if ! download_file "$GOST_SQL_URL" "gost.sql"; then
+            echo -e "${RED}❌ 数据库文件下载失败，请检查网络渠道${RESET}"
+            read -p "按回车返回菜单..."
+            return
         fi
-        echo -e "\n${GREEN}==== [💡 正在微调修改实例: ${CURRENT_INSTANCE} (直接回车保持原样)] ====${RESET}"
+    fi
+    echo -e "${GREEN}✅ 数据库文件准备完成${RESET}"
+
+    # 设置端口
+    read -p "请输入前端端口 [默认:6366]: " input_front
+    FRONTEND_PORT=${input_front:-6366}
+    check_port "$FRONTEND_PORT" || return
+
+    read -p "请输入后端端口 [默认:6365]: " input_back
+    BACKEND_PORT=${input_back:-6365}
+    check_port "$BACKEND_PORT" || return
+
+    # 设置数据库账户
+    read -p "请输入数据库用户名 [默认:gost]: " input_user
+    DB_USER=${input_user:-gost}
+    read -p "请输入数据库名 [默认:gost]: " input_db
+    DB_NAME=${input_db:-gost}
+    read -p "请输入数据库密码 [默认:123456]: " input_pass
+    DB_PASSWORD=${input_pass:-123456}
+
+    # JWT secret
+    JWT_SECRET=$(openssl rand -hex 16)
+
+    # 检测 IPv6
+    if check_ipv6_support; then
+        echo -e "${GREEN}🚀 系统支持 IPv6，自动启用 IPv6 配置...${RESET}"
+        configure_docker_ipv6
     else
-        local conf_file="${INSTANCE_DIR}/${CURRENT_INSTANCE}.toml"
-        if [ -f "$conf_file" ]; then
-            warn "实例 [ ${CURRENT_INSTANCE} ] 已经存在对应配置文件。"
-            read -r -p "$(echo -e "${GREEN}是否确定完全覆盖重写该实例？[y/N]: ${RESET}")" res
-            case "$res" in [Yy]*) ;; *) return ;; esac
-        fi
-        echo -e "\n${GREEN}==== [配置新实例 ${CURRENT_INSTANCE} 参数] ====${RESET}"
-        
-        # ⚡ 纯正 Alpine 原生随机数发生器生成账号密码和可用随机端口
-        local rand_user="user_$(openssl rand -hex 3)"
-        local rand_pass="$(openssl rand -hex 6)"
-        local rand_port="$(( (rand_seed = rand_seed + 1) * 37 % 45000 + 15000 ))"
-
-        OLD_PROTO="socks5" OLD_IP="0.0.0.0" OLD_PORT="$rand_port" OLD_USER="$rand_user" OLD_PASS="$rand_pass" OLD_OUTBOUND="default"
+        echo -e "${YELLOW}⚠️ 系统不支持 IPv6，跳过配置${RESET}"
     fi
 
-    if [ "$is_edit" = "true" ]; then
-        echo -e "当前协议类型: ${CYAN}${OLD_PROTO^^}${RESET} (1. SOCKS5 | 2. HTTP)"
-        read -r -p "请输入新序号 [直接回车不修改]: " proto_choice
-    else
-        echo "1. SOCKS5 代理模式 (默认，附带完整 UDP 转发能力)"
-        echo "2. HTTP 传输代理模式"
-        read -r -p "选择形态序号 [1-2]: " proto_choice
-    fi
-    local opt_proto="$OLD_PROTO"
-    if [ "$proto_choice" = "1" ]; then opt_proto="socks5"; elif [ "$proto_choice" = "2" ]; then opt_proto="http"; fi
+    # 生成 .env
+    cat > .env <<EOF
+DB_NAME=$DB_NAME
+DB_USER=$DB_USER
+DB_PASSWORD=$DB_PASSWORD
+JWT_SECRET=$JWT_SECRET
+FRONTEND_PORT=$FRONTEND_PORT
+BACKEND_PORT=$BACKEND_PORT
+EOF
+    echo -e "${GREEN}✅ .env 文件生成完成${RESET}"
 
-    read -r -p "$(echo -e "${GREEN}请输入监听网卡 IP [当前: ${YELLOW}${OLD_IP}${GREEN} | 回车不改]: ${RESET}")" input_ip
-    local opt_ip="${input_ip:-$OLD_IP}"
-
-    read -r -p "$(echo -e "${GREEN}请输入服务端口 [当前: ${YELLOW}${OLD_PORT}${GREEN} | 回车不改]: ${RESET}")" input_port
-    local opt_port="${input_port:-$OLD_PORT}"
-    
-    local opt_user="" local opt_pass=""
-    # ⚡ 交互升级：中括号显示当前旧值或默认随机生成的账号
-    read -r -p "$(echo -e "${GREEN}配置连接账户 [当前/默认: ${YELLOW}${OLD_USER}${GREEN} | 输入 ${RED}none${GREEN} 开放免密 | 或自主输入]: ${RESET}")" input_user
-    if [ -z "$input_user" ]; then
-        if [ "$OLD_USER" = "none" ]; then opt_user=""; opt_pass=""; else opt_user="$OLD_USER"; opt_pass="$OLD_PASS"; fi
-    elif [ "$input_user" = "none" ]; then
-        opt_user=""; opt_pass=""
-    else
-        opt_user="$input_user"
-        # 如果是新设账户或修改账户，提示输入密码，并提供默认随机/旧密码回车继承
-        read -r -p "$(echo -e "${GREEN}请输入连接密码 [当前/默认: ${YELLOW}${OLD_PASS}${GREEN} | 回车不改]: ${RESET}")" input_pass
-        opt_pass="${input_pass:-$OLD_PASS}"
+        # IPv6 设置
+    read -p "是否启用 Docker IPv6 网络? [Y/n] (默认开启): " ipv6_input
+    if [[ "$ipv6_input" =~ ^[Nn]$ ]]; then
+        ENABLE_IPV6=false
     fi
 
-    echo -e "\n${GREEN}==== [选择出站 Profile 路由路径] ====${RESET}"
-    echo "1. default (系统默认路由，普通混合网络)"
-    echo "2. ipv4    (IPv4-only，强制仅解析A记录/仅走v4)"
-    echo "3. ipv6    (IPv6-only，强制仅解析AAAA记录/仅走v6)"
-    read -r -p "选择出站路径序号 [1-3, 回车不修改]: " outbound_choice
-    local opt_outbound="$OLD_OUTBOUND"
-    if [ "$outbound_choice" = "1" ]; then opt_outbound="default"; elif [ "$outbound_choice" = "2" ]; then opt_outbound="ipv4"; elif [ "$outbound_choice" = "3" ]; then opt_outbound="ipv6"; fi
+    # 生成 docker-compose.yml
+    cat > "$COMPOSE_FILE" <<EOF
 
-    if [ ! -f "$BIN_PATH" ]; then
-        download_bin
-        install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$BIN_PATH"
-        rm -rf "$(dirname "$TARGET_BIN_PATH")"
-    fi
+services:
+  mysql:
+    image: mysql:5.7
+    container_name: gost-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      TZ: Asia/Shanghai
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./gost.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --max_connections=1000
+      --innodb_buffer_pool_size=256M
+    networks:
+      - gost-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 10s
+      retries: 10
 
-    write_config "$CURRENT_INSTANCE" "$opt_proto" "$opt_ip" "$opt_port" "$opt_user" "$opt_pass" "$opt_outbound"
-    write_openrc_service
+  backend:
+    image: bqlpfy/springboot-backend:1.4.3
+    container_name: springboot-backend
+    restart: unless-stopped
+    environment:
+      DB_HOST: mysql
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      LOG_DIR: /app/logs
+      JAVA_OPTS: "-Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai"
+    ports:
+      - "${BACKEND_PORT}:6365"
+    volumes:
+      - backend_logs:/app/logs
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - gost-network
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:6365/flow/test || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
 
-    if [ ! -L "/etc/init.d/micaproxy.${CURRENT_INSTANCE}" ]; then
-        ln -sf /etc/init.d/micaproxy "/etc/init.d/micaproxy.${CURRENT_INSTANCE}"
-    fi
+  frontend:
+    image: bqlpfy/vite-frontend:1.4.3
+    container_name: vite-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - gost-network
 
-    info "正在通过 OpenRC 拉起并解锁内核限制实例: ${CURRENT_INSTANCE} ..."
-    rc-update add "micaproxy.${CURRENT_INSTANCE}" default >/dev/null 2>&1
-    rc-service "micaproxy.${CURRENT_INSTANCE}" restart
-    
-    sleep 1.2
-    ok "MicaProxy OpenRC 实例 [ ${CURRENT_INSTANCE} ] 部署成功！"
-    print_node_summary "$CURRENT_INSTANCE"
+volumes:
+  mysql_data:
+    name: mysql_data
+    driver: local
+  backend_logs:
+    name: backend_logs
+    driver: local
+EOF
+
+# 添加 IPv6 网络
+if [ "$ENABLE_IPV6" = true ]; then
+cat >> "$COMPOSE_FILE" <<EOF
+
+networks:
+  gost-network:
+    name: gost-network
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+        - subnet: fd00:dead:beef::/48
+EOF
+else
+cat >> "$COMPOSE_FILE" <<EOF
+
+networks:
+  gost-network:
+    name: gost-network
+    driver: bridge
+EOF
+fi
+
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    SERVER_IP=$(get_public_ip)
+
+    echo -e "${GREEN}✅ 哆啦A梦转发面板 已启动${RESET}"
+    echo -e "${YELLOW}🌐 前端访问: http://${SERVER_IP}:${FRONTEND_PORT}${RESET}"
+    echo -e "${YELLOW}🌐 后端访问: http://${SERVER_IP}:${BACKEND_PORT}${RESET}"
+    echo -e "${YELLOW}🌐 默认账号: admin_user${RESET}"
+    echo -e "${YELLOW}🌐 默认密码: admin_user${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-menu_uninstall() {
-    warn "该操作将彻底销毁当前选定的 OpenRC 实例。"
-    read -r -p "$(echo -e "${RED}确认抹除实例 [ ${CURRENT_INSTANCE} ] 吗？[y/N]: ${RESET}")" res
-    case "$res" in [Yy]*) ;; *) return ;; esac
-
-    rc-service "micaproxy.${CURRENT_INSTANCE}" stop >/dev/null 2>&1
-    rc-update del "micaproxy.${CURRENT_INSTANCE}" >/dev/null 2>&1
-    rm -f "/etc/init.d/micaproxy.${CURRENT_INSTANCE}"
-    rm -f "${INSTANCE_DIR}/${CURRENT_INSTANCE}.toml"
-    ok "实例 [ ${CURRENT_INSTANCE} ] 已干净销毁。"
+update_app() {
+    cd "$APP_DIR" || return
+    $DOCKER_CMD pull
+    $DOCKER_CMD up -d
+    echo -e "${GREEN}✅ 哆啦A梦转发面板 更新完成${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-rand_seed=17
+restart_app() {
+    docker restart gost-mysql springboot-backend vite-frontend
+    echo -e "${GREEN}✅ 哆啦A梦转发面板 已重启${RESET}"
+    read -p "按回车返回菜单..."
+}
 
-while true; do
-    get_status_info
-    clear
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN} ◈ MicaProxy SOCKS5/HTTP 多实例管理面板 ◈  ${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}当前控制目标 :${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-    echo -e "${GREEN}目标实例绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
-    echo -e "${GREEN}服务活跃状态 :${RESET} $panel_status"
-    echo -e "${GREEN}核心沙箱引擎 :${RESET} ${YELLOW}${panel_version}${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN} 1. 安装 当前控制实例${RESET}"
-    echo -e "${GREEN} 2. 更新 当前控制实例${RESET}"
-    echo -e "${GREEN} 3. 卸载 当前控制实例${RESET}"
-    echo -e "${GREEN} 4. 修改 当前控制实例${RESET}"
-    echo -e "${GREEN} 5. 启动 当前控制实例${RESET}"
-    echo -e "${GREEN} 6. 停止 当前控制实例${RESET}"
-    echo -e "${GREEN} 7. 重启 当前控制实例${RESET}"
-    echo -e "${GREEN} 8. 查看当前实例日志${RESET}"
-    echo -e "${GREEN} 9. 查看当前实例配置${RESET}"
-    echo -e "${YELLOW}10.切换实例名字/多开新建不限数量的代理✨${RESET}"
-    echo -e "${GREEN} 0. 退出控制面板${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
-    
-    read -r -p "$(echo -e "${GREEN}选择操作序号: ${RESET}")" choice
-    case "$choice" in
-        1) menu_install "new" ;;
-        2) download_bin && install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$BIN_PATH" && rm -rf "$(dirname "$TARGET_BIN_PATH")" && ok "核心覆盖成功" ;;
-        3) menu_uninstall ;;
-        4) menu_install "edit" ;;
-        5) rc-service "micaproxy.${CURRENT_INSTANCE}" start && ok "拉起成功" ;;
-        6) rc-service "micaproxy.${CURRENT_INSTANCE}" stop && ok "挂起成功" ;;
-        7) rc-service "micaproxy.${CURRENT_INSTANCE}" restart && ok "重启完毕" ;;
-        8) if [ -f "/opt/MicaProxy/log/${CURRENT_INSTANCE}.log" ]; then tail -n 50 -f "/opt/MicaProxy/log/${CURRENT_INSTANCE}.log"; else warn "暂无运行日志生成"; fi ;;
-        9) print_node_summary "$CURRENT_INSTANCE" ;;
-        10) menu_switch_instance ;;
-        0) exit 0 ;;
-        *) warn "无效输入！"; sleep 1 ;;
+view_logs() {
+    echo -e "${GREEN}选择容器查看日志:${RESET}"
+    echo "1) MySQL"
+    echo "2) Backend"
+    echo "3) Frontend"
+    read -p "选择: " c
+    case $c in
+        1) docker logs -f gost-mysql ;;
+        2) docker logs -f springboot-backend ;;
+        3) docker logs -f vite-frontend ;;
+        *) echo -e "${RED}无效选择${RESET}" ;;
     esac
-    read -r -p "$(echo -e "${GREEN}按任意键重新返回控制台面...${RESET}")" dummy
-done
+}
+
+check_status() {
+    docker ps | grep -E "gost-mysql|springboot-backend|vite-frontend"
+    read -p "按回车返回菜单..."
+}
+
+manage_nodes() {
+    echo "📡 正在获取节点管理..."
+    if download_file "$NODE_SCRIPT_URL" "node_install.sh"; then
+        chmod +x node_install.sh
+        ./node_install.sh
+        rm -f node_install.sh
+    else
+        echo -e "${RED}❌ 无法下载节点管理，请检查网络！${RESET}"
+        read -p "按回车返回菜单..."
+    fi
+}
+
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅  哆啦A梦转发面板 已彻底卸载${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+menu

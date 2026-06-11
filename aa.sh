@@ -1,356 +1,159 @@
 #!/bin/bash
-# ==================================================
-# VPS Geo Firewall (IPv4+IPv6)
-# Alpine Linux 专属版本
-# 独立链 / 端口控制 / 自动更新 / 白名单 / 卸载
-# ==================================================
 
-CONF="/opt/geoip/geo.conf"
-UPDATE_SCRIPT="/opt/geoip/update_geo.sh"
-SCRIPT_PATH="/usr/local/bin/geofirewall"
-SCRIPT_URL=" https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
+# 颜色定义
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+RESET='\033[0m'
 
-GREEN="\033[32m"
-RED="\033[31m"
-RESET="\033[0m"
+# 检查权限
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}错误：请使用 root 权限运行此脚本！${RESET}"
+    exit 1
+fi
 
-green(){ echo -e "${GREEN}$1${RESET}"; }
-red(){ echo -e "${RED}$1${RESET}"; }
+# 检查并安装依赖（如 jq 或 curl）
+if ! command -v curl &> /dev/null; then
+    echo -e "${YELLOW}正在安装必要组件 curl...${RESET}"
+    apt-get update && apt-get install -y curl || yum install -y curl
+fi
 
-[[ $(id -u) != 0 ]] && red "请使用 root 运行" && exit 1
 
-# ================== 初始化环境 ==================
-init_env(){
-    mkdir -p /opt/geoip
-    touch $CONF
-
-    # 仅第一次安装依赖
-    if [[ ! -f /opt/geoip/.deps_installed ]]; then
-        apk update
-        # 安装 ipset, iptables, ip6tables, curl 以及 crontabs
-        apk add ipset iptables ip6tables curl crontabs
-        
-        # 允许 iptables 和 ip6tables 服务开机自启
-        rc-update add iptables default 2>/dev/null
-        rc-update add ip6tables default 2>/dev/null
-        rc-service iptables start 2>/dev/null
-        rc-service ip6tables start 2>/dev/null
-        
-        touch /opt/geoip/.deps_installed
-        green "Alpine 依赖安装完成并已启动防火墙服务"
-    fi
-}
-
-# ================== 下载或更新脚本 ==================
-download_script(){
-    mkdir -p "$(dirname "$SCRIPT_PATH")"
-    curl -sSL "$SCRIPT_URL" -o "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
-    green "已更新"
-}
-
-# ================== 获取信息 ==================
-get_my_ip(){ 
-    # Alpine 下 hostname -I 默认不可用，改为通过 ip route 获取主网卡 IP
-    ip route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}'
-}
-get_ssh_port(){
-    grep -i "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1
-}
-
-# ================== 自动更新IP库 ==================
-install_auto_update(){
-cat > $UPDATE_SCRIPT <<EOF
-#!/bin/bash
-CONF="/opt/geoip/geo.conf"
-source \$CONF 2>/dev/null
-[[ -z "\$COUNTRY" ]] && exit 0
-CC_L=\$(echo \$COUNTRY | tr A-Z a-z)
-curl -s -o /opt/geoip/\${CC_L}.zone https://www.ipdeny.com/ipblocks/data/countries/\${CC_L}.zone
-curl -s -o /opt/geoip/\${CC_L}.ipv6.zone https://www.ipdeny.com/ipv6/ipaddresses/aggregated/\${CC_L}-aggregated.zone
-EOF
-
-chmod +x $UPDATE_SCRIPT
-# Alpine 默认启动 crond 服务
-rc-service crond start 2>/dev/null
-rc-update add crond default 2>/dev/null
-
-(crontab -l 2>/dev/null | grep -v update_geo.sh; echo "0 3 * * * $UPDATE_SCRIPT") | crontab -
-green "每日 03:00 自动更新IP库 (已确保 crond 服务运行)"
-}
-
-# ================== 原子更新 ipset ==================
-update_ipset(){
-    local SET_NAME=$1
-    local FILE=$2
-    local FAMILY=$3
-
-    [[ ! -s "$FILE" ]] && { red "IP库文件为空 $SET_NAME"; return 1; }
-
-    ipset create $SET_NAME hash:net family $FAMILY -exist
-    ipset create ${SET_NAME}_tmp hash:net family $FAMILY -exist
-    ipset flush ${SET_NAME}_tmp
-
-    while read -r ip; do
-        [[ -n "$ip" ]] && ipset add ${SET_NAME}_tmp "$ip" 2>/dev/null
-    done < "$FILE"
-
-    ipset swap ${SET_NAME}_tmp $SET_NAME
-    ipset destroy ${SET_NAME}_tmp
-    return 0
-}
-
-# ================== 保存规则（Alpine 专属） ==================
-save_rules(){
-    rc-service iptables save >/dev/null 2>&1
-    rc-service ip6tables save >/dev/null 2>&1
-}
-
-# ================== 应用规则 ==================
-apply_rules(){
-    source $CONF 2>/dev/null
-    [[ -z "$COUNTRY" ]] && { red "未配置规则"; return; }
-
-    SSH_PORT=$(get_ssh_port)
-    [[ -z "$SSH_PORT" ]] && SSH_PORT=22
-    green "默认放行SSH端口: $SSH_PORT"
-
-    # 创建 GEO_CHAIN 链
-    iptables -N GEO_CHAIN 2>/dev/null
-    ip6tables -N GEO_CHAIN 2>/dev/null
-    iptables -F GEO_CHAIN
-    ip6tables -F GEO_CHAIN
-
-    # INPUT 链跳转
-    iptables -C INPUT -j GEO_CHAIN 2>/dev/null || iptables -I INPUT -j GEO_CHAIN
-    ip6tables -C INPUT -j GEO_CHAIN 2>/dev/null || ip6tables -I INPUT -j GEO_CHAIN
-
-    # 基础规则
-    iptables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    ip6tables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-    MYIP=$(get_my_ip)
-    [[ -n "$MYIP" ]] && iptables -A GEO_CHAIN -s $MYIP -j ACCEPT
-
-    iptables -A GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
-    ip6tables -A GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
-
-    # 白名单
-    for ip in $WHITELIST; do
-        [[ -n "$ip" ]] && {
-            iptables -I GEO_CHAIN 2 -s $ip -j ACCEPT
-            ip6tables -I GEO_CHAIN 2 -s $ip -j ACCEPT
-        }
-    done
-
-    CC_L=$(echo $COUNTRY | tr A-Z a-z)
-    V4FILE="/opt/geoip/${CC_L}.zone"
-    V6FILE="/opt/geoip/${CC_L}.ipv6.zone"
-
-    curl -s -o $V4FILE https://www.ipdeny.com/ipblocks/data/countries/$CC_L.zone
-    curl -s -o $V6FILE https://www.ipdeny.com/ipv6/ipaddresses/aggregated/$CC_L-aggregated.zone
-
-    update_ipset geo_v4 $V4FILE inet
-    update_ipset geo_v6 $V6FILE inet6
-
-    # 封锁/允许规则
-    for proto in tcp udp; do
-        if [[ "$MODE" == "block" ]]; then
-            if [[ "$PORTS" == "all" ]]; then
-                iptables -A GEO_CHAIN -p $proto -m set --match-set geo_v4 src -j DROP
-                ip6tables -A GEO_CHAIN -p $proto -m set --match-set geo_v6 src -j DROP
-            else
-                for p in $PORTS; do
-                    iptables -A GEO_CHAIN -p $proto --dport $p -m set --match-set geo_v4 src -j DROP
-                    ip6tables -A GEO_CHAIN -p $proto --dport $p -m set --match-set geo_v6 src -j DROP
-                done
-            fi
-        else
-            if [[ "$PORTS" == "all" ]]; then
-                iptables -A GEO_CHAIN -p $proto -m set ! --match-set geo_v4 src -j DROP
-                ip6tables -A GEO_CHAIN -p $proto -m set ! --match-set geo_v6 src -j DROP
-            else
-                for p in $PORTS; do
-                    iptables -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set geo_v4 src -j DROP
-                    ip6tables -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set geo_v6 src -j DROP
-                done
-            fi
-        fi
-    done
-
-    save_rules
-    green "规则已成功应用并保存"
-}
-
-# ================== 添加规则 ==================
-add_rule(){
-    echo -e "${GREEN}选择模式:${RESET}"
-    echo -e "${GREEN}1 封锁某国某端口${RESET}"
-    echo -e "${GREEN}2 封锁某国所有端口${RESET}"
-    echo -e "${GREEN}3 只允许某国某端口${RESET}"
-    echo -e "${GREEN}4 只允许某国访问整个服务器${RESET}"
-    read -p $'\033[32m选择模式(1-4): \033[0m' choice
-
-    case "$choice" in
-        1)
-            MODE="block"
-            read -p $'\033[32m国家代码(例如 cn us jp): \033[0m' COUNTRY
-            read -p $'\033[32m端口 (多个空格): \033[0m' PORTS
-            ;;
-        2)
-            MODE="block"
-            read -p $'\033[32m国家代码(例如 cn us jp): \033[0m' COUNTRY
-            PORTS="all"
-            ;;
-        3)
-            MODE="allow"
-            read -p $'\033[32m国家代码(例如 cn us jp): \033[0m' COUNTRY
-            read -p $'\033[32m端口(例如 443 80 多个空格): \033[0m' PORTS
-            ;;
-        4)
-            MODE="allow"
-            read -p $'\033[32m国家代码(例如 cn us jp): \033[0m' COUNTRY
-            PORTS="all"
-            ;;
-        *)
-            red "无效选择"
-            return
-            ;;
-    esac
-
-    echo "MODE=\"$MODE\"" > $CONF
-    echo "COUNTRY=\"$COUNTRY\"" >> $CONF
-    echo "PORTS=\"$PORTS\"" >> $CONF
-    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
-
-    install_auto_update
-    apply_rules
-}
-
-# ================== 白名单 ==================
-add_whitelist(){
-    read -p $'\033[32m输入白名单 IP (多个空格): \033[0m' ips
-    source $CONF 2>/dev/null
-    WHITELIST="$WHITELIST $ips"
-    echo "MODE=\"$MODE\"" > $CONF
-    echo "COUNTRY=\"$COUNTRY\"" >> $CONF
-    echo "PORTS=\"$PORTS\"" >> $CONF
-    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
-    apply_rules
-}
-
-delete_whitelist(){
-    read -p $'\033[32m输入要删除的白名单 IP (多个空格): \033[0m' ips
-    source $CONF 2>/dev/null
-    for ip in $ips; do
-        WHITELIST=$(echo $WHITELIST | sed -E "s/\b$ip\b//g")
-    done
-    echo "MODE=\"$MODE\"" > $CONF
-    echo "COUNTRY=\"$COUNTRY\"" >> $CONF
-    echo "PORTS=\"$PORTS\"" >> $CONF
-    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
-    apply_rules
-}
-
-# ================== 删除端口规则 ==================
-delete_rules(){
-    source $CONF 2>/dev/null
-    [[ -z "$PORTS" ]] && { red "未检测到配置"; return; }
-    read -p $'\033[32m输入要删除的端口 (多个空格): \033[0m' DEL_PORTS
-    [[ -z "$DEL_PORTS" ]] && { red "未输入端口"; return; }
-    for p in $DEL_PORTS; do
-        for proto in tcp udp; do
-            iptables -L GEO_CHAIN --line-numbers -n | grep "$proto" | grep "dpt:$p" | awk '{print $1}' | sort -rn | while read num; do
-                iptables -D GEO_CHAIN $num
-            done
-            ip6tables -L GEO_CHAIN --line-numbers -n | grep "$proto" | grep "dpt:$p" | awk '{print $1}' | sort -rn | while read num; do
-                ip6tables -D GEO_CHAIN $num
-            done
+get_public_ip() {
+    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        # 强制获取 IPv4
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
         done
-        green "端口 $p 规则已删除"
-    done
-    save_rules
-}
-
-# ================== 查看规则 ==================
-view_rules(){
-    clear
-    green "========= 当前配置 ========="
-    cat $CONF 2>/dev/null
-    echo
-    iptables -L GEO_CHAIN -n --line-numbers 2>/dev/null
-    echo
-    ip6tables -L GEO_CHAIN -n --line-numbers 2>/dev/null
-    echo
-    ipset list | grep "^Name:"
-}
-
-# ================== 卸载 ==================
-uninstall_all(){
-    green "正在卸载"
-    iptables -D INPUT -j GEO_CHAIN 2>/dev/null
-    ip6tables -D INPUT -j GEO_CHAIN 2>/dev/null
-    iptables -F GEO_CHAIN 2>/dev/null
-    ip6tables -F GEO_CHAIN 2>/dev/null
-    iptables -X GEO_CHAIN 2>/dev/null
-    ip6tables -X GEO_CHAIN 2>/dev/null
-    ipset list | grep "^Name: geo_" | awk '{print $2}' | xargs -r -I {} ipset destroy {}
-    rm -rf /opt/geoip
-    crontab -l 2>/dev/null | grep -v update_geo.sh | crontab -
-    rm -f $SCRIPT_PATH
-    save_rules
-    green "已彻底卸载完成"
-    exit 0
-}
-
-# ================== 菜单 ==================
-menu(){
-    clear
-
-    # 读取最新配置
-    local v_mode="未配置"
-    local v_country="无"
-    local v_ports="无"
-    if [ -f "$CONF" ]; then
-        source $CONF 2>/dev/null
-        [ "$MODE" == "block" ] && v_mode="${RED}仅封锁${RESET}"
-        [ "$MODE" == "allow" ] && v_mode="${GREEN}仅放行${RESET}"
-        [ -n "$COUNTRY" ] && v_country=$(echo "$COUNTRY" | tr 'a-z' 'A-Z')
-        [ -n "$PORTS" ] && v_ports="$PORTS"
+    elif [[ "$mode" == "v6" ]]; then
+        # 强制获取 IPv6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
     fi
 
-    echo -e "${GREEN}=========================${RESET}"
-    echo -e "${GREEN}   ◈   国家IP防火墙   ◈  ${RESET}"
-    echo -e "${GREEN}=========================${RESET}"
-    echo -e "${GREEN}当前模式: ${v_mode}"
-    echo -e "${GREEN}目标国家: ${v_country}${RESET}"
-    echo -e "${GREEN}受控端口: ${v_ports}${RESET}"
-    echo -e "${GREEN}=========================${RESET}"
-    echo -e "${GREEN}1 添加规则${RESET}"
-    echo -e "${GREEN}2 删除端口规则${RESET}"
-    echo -e "${GREEN}3 查看规则详情${RESET}"
-    echo -e "${GREEN}4 添加白名单${RESET}"
-    echo -e "${GREEN}5 删除白名单${RESET}"
-    echo -e "${GREEN}6 更新${RESET}"
-    echo -e "${GREEN}7 卸载${RESET}"
-    echo -e "${GREEN}0 退出${RESET}"
-    echo -e "${GREEN}=========================${RESET}"
-    read -r -p $'\033[32m请选择: \033[0m' num
-    case $num in
-        1) add_rule ;;
-        2) delete_rules ;;
-        3) view_rules ;;
-        4) add_whitelist ;;
-        5) delete_whitelist ;;
-        6) download_script ;;
-        7) uninstall_all ;;
-        0) exit ;;
-    esac
+    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
+    echo "127.0.0.1" && return 0
 }
 
-# ================== 主循环 ==================
-init_env
-while true; do
-    menu
-    read -r -p $'\033[32m按回车继续...\033[0m'
-done
+
+# 获取状态、版本和端口的函数
+get_info() {
+    # 1. 检测状态
+    if systemctl is-active --quiet clicd; then
+        status="${GREEN}运行中 (Active)${RESET}"
+        
+        # 2. 如果运行中，通过本地 API 动态获取版本号
+        # 使用 grep 和 sed 兼容没有安装 jq 的系统
+        api_res=$(curl -s --max-time 2 http://127.0.0.1:8999/api/version)
+        if [[ $api_res == *"\"success\":true"* ]]; then
+            version=$(echo "$api_res" | grep -o '"version":"[^"]*' | grep -o '[^"]*$')
+        else
+            version="获取失败 (API无响应)"
+        fi
+    else
+        status="${RED}未运行 (Stopped)${RESET}"
+        version="未知 (服务未运行)"
+    fi
+
+    # 3. 默认端口
+    port_show="8999"
+}
+
+# 主菜单
+main_menu() {
+    while true; do
+        clear
+        get_info
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}   ◈  CLICD 轻量虚拟化面板  ◈    ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}状态   :${RESET} $status"
+        echo -e "${GREEN}版本   :${RESET} ${YELLOW}v${version}${RESET}"
+        echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN} 1. 安装 CLICD 面板${RESET}"
+        echo -e "${GREEN} 2. 卸载 CLICD 面板${RESET}"
+        echo -e "${GREEN} 3. 启动 CLICD 服务${RESET}"
+        echo -e "${GREEN} 4. 停止 CLICD 服务${RESET}"
+        echo -e "${GREEN} 5. 重启 CLICD 服务${RESET}"
+        echo -e "${GREEN} 6. 查看服务状态 (Detail)${RESET}"
+        echo -e "${GREEN} 7. 查看运行日志 (100行)${RESET}"
+        echo -e "${GREEN} 0. 退出${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        
+        read -p "请输入选项 [0-7]: " choice
+        case $choice in
+            1)
+                echo -e "${YELLOW}正在安装 CLICD 面板...${RESET}"
+                curl -fsSL https://raw.githubusercontent.com/MengMengCode/CLICD/main/install.sh | sudo sh
+                SERVER_IP=$(get_public_ip)
+                echo -e "${GREEN}安装完成！请尝试访问 http://${SERVER_IP}:8999${RESET}"
+                read -p "按回车键返回菜单..."
+                ;;
+            2)
+                read -p "确定要卸载 CLICD 吗？(y/n): " confirm
+                if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+                    echo -e "${YELLOW}正在卸载 CLICD 面板...${RESET}"
+                    curl -fsSL https://raw.githubusercontent.com/MengMengCode/CLICD/main/install.sh | sudo sh -s -- uninstall
+                    echo -e "${GREEN}卸载完成！${RESET}"
+                else
+                    echo -e "${YELLOW}已取消卸载。${RESET}"
+                fi
+                read -p "按回车键返回菜单..."
+                ;;
+            3)
+                echo -e "${YELLOW}正在启动 CLICD 服务...${RESET}"
+                systemctl start clicd
+                echo -e "${GREEN}启动指令已发送。${RESET}"
+                sleep 1.5
+                ;;
+            4)
+                echo -e "${YELLOW}正在停止 CLICD 服务...${RESET}"
+                systemctl stop clicd
+                echo -e "${GREEN}停止指令已发送。${RESET}"
+                sleep 1
+                ;;
+            5)
+                echo -e "${YELLOW}正在重启 CLICD 服务...${RESET}"
+                systemctl restart clicd
+                echo -e "${GREEN}重启指令已发送。${RESET}"
+                sleep 1.5
+                ;;
+            6)
+                echo -e "${YELLOW}--- 服务详细状态 ---${RESET}"
+                systemctl status clicd
+                echo -e "${YELLOW}--------------------${RESET}"
+                read -p "按回车键返回菜单..."
+                ;;
+            7)
+                echo -e "${YELLOW}--- CLICD 最近100行日志 ---${RESET}"
+                journalctl -u clicd -n 100 --no-pager
+                echo -e "${YELLOW}---------------------------${RESET}"
+                read -p "按回车键返回菜单..."
+                ;;
+            0)
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}无效选项，请重新输入！${RESET}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# 运行主菜单
+main_menu

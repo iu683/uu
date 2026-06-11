@@ -8,7 +8,7 @@
 CONF="/opt/geoip/geo.conf"
 UPDATE_SCRIPT="/opt/geoip/update_geo.sh"
 SCRIPT_PATH="/usr/local/bin/geofirewall"
-SCRIPT_URL="https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/GeoFirewall.sh"
+SCRIPT_URL=" https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
 
 GREEN="\033[32m"
 RED="\033[31m"

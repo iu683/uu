@@ -1,7 +1,7 @@
 #!/usr/bin/sh
 
 # =============================================================================
-#  MicaProxy Alpine 专属多实例管理面板 (秒开缓存/OpenRC/TG分享链接)
+#  MicaProxy Alpine 专属多实例管理面板 
 # =============================================================================
 
 export REPO="judy-gotv/Rust-SOCKS5-HTTP"
@@ -21,12 +21,12 @@ export BLUE='\033[0;34m'
 export CYAN='\033[0;36m'
 
 GITHUB_PROXIES=(
+    ""
     "https://gh-proxy.com/"
     "https://proxy.vvvv.ee/"
     "https://v6.gh-proxy.org/"
     "https://ghproxy.lvedong.eu.org/"
     "https://hub.glowp.xyz/"
-    ""
 )
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -39,7 +39,7 @@ ok()   { echo -e "${GREEN}[OK]${RESET} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${RESET} $1"; }
 die()  { echo -e "${RED}[ERROR]${RESET} $1" >&2; exit 1; }
 
-# ── ⚡ 优化：按需依赖检查（齐备时完全跳过，不再每次触发 apk） ───────────────────
+# ── ⚡ Alpine 专属深度依赖检查 ─────────────────────────────────────────────────
 REQUIRED_CMDS="sed grep awk openssl wget"
 MISSING_CMDS=""
 for cmd in $REQUIRED_CMDS; do
@@ -48,12 +48,11 @@ for cmd in $REQUIRED_CMDS; do
     fi
 done
 
-# 只有当核心命令确实不存在时，才执行一次性环境补全
-if [ -n "$MISSING_CMDS" ]; then
-    info "检测到系统缺失必备组件，正在为您初始化 Alpine 环境..."
+if [ -n "$MISSING_CMDS" ] || ! apk info -e gcompat >/dev/null 2>&1; then
+    info "检测到系统缺失必备或 glibc 兼容组件，正在为您初始化 Alpine 环境..."
     apk update -q
-    apk add -q openssl wget sed grep gawk
-    ok "环境初始化成功！"
+    apk add -q openssl wget sed grep gawk gcompat
+    ok "环境初始化与 glibc 兼容层部署成功！"
 fi
 
 get_public_ip() {
@@ -238,7 +237,7 @@ print_node_summary() {
     public_ip=$(get_public_ip)
 
     echo -e "\n${GREEN}====== MicaProxy 实例 [ ${instance} ] 配置详情 ======${RESET}"
-    echo -e "${GREEN}实例协议     :${RESET} ${CYAN}${proto^^}${RESET}"
+    echo -e "${GREEN}实例协议     :${RESET} ${YELLOW}${proto^^}${RESET}"
     echo -e "${GREEN}外网绑定 IP  :${RESET} ${public_ip}"
     echo -e "${GREEN}监听端口     :${RESET} ${bind_port}"
     if [ -n "$auth_user" ] && [ "$auth_user" != "none" ]; then
@@ -254,11 +253,11 @@ print_node_summary() {
         if [ -n "$auth_user" ] && [ "$auth_user" != "none" ]; then
             echo -e "${YELLOW}socks5://${auth_user}:${auth_pass}@${public_ip}:${bind_port}#${instance}${RESET}"
             echo -e "\n${GREEN}====== 🚀 Telegram 内置一键代理链接 ======${RESET}"
-            echo -e "${CYAN}https://t.me/socks?server=${public_ip}&port=${bind_port}&user=${auth_user}&pass=${auth_pass}${RESET}"
+            echo -e "$YELLOW}https://t.me/socks?server=${public_ip}&port=${bind_port}&user=${auth_user}&pass=${auth_pass}${RESET}"
         else
             echo -e "${YELLOW}socks5://${public_ip}:${bind_port}#${instance}${RESET}"
             echo -e "\n${GREEN}====== 🚀 Telegram 内置一键代理链接 ======${RESET}"
-            echo -e "${CYAN}https://t.me/socks?server=${public_ip}&port=${bind_port}${RESET}"
+            echo -e "${YELLOW}https://t.me/socks?server=${public_ip}&port=${bind_port}${RESET}"
         fi
     elif [ "$proto" = "http" ]; then
         if [ -n "$auth_user" ] && [ "$auth_user" != "none" ]; then
@@ -275,7 +274,7 @@ get_status_info() {
         if rc-service "micaproxy.${CURRENT_INSTANCE}" status 2>/dev/null | grep -q "started"; then
             panel_status="${GREEN}活跃中 (Running via OpenRC)${RESET}"
         else
-            panel_status="${RED}未运行 (Stopped)${RESET}"
+            panel_status="${RED}运行挂起 (Stopped/Error)${RESET}"
         fi
     else
         panel_status="${RED}未托管服务${RESET}"
@@ -382,7 +381,13 @@ menu_install() {
             case "$res" in [Yy]*) ;; *) return ;; esac
         fi
         echo -e "\n${GREEN}==== [配置新实例 ${CURRENT_INSTANCE} 参数] ====${RESET}"
-        OLD_PROTO="socks5" OLD_IP="0.0.0.0" OLD_PORT="$(( (rand_seed = rand_seed + 1) * 31 % 50001 + 10000 ))" OLD_USER="mica_open" OLD_PASS="mica_pass" OLD_OUTBOUND="default"
+        
+        # ⚡ 升级：采用原生系统熵生成万号以上高质量随机高隐蔽端口
+        local rand_user="user_$(openssl rand -hex 3)"
+        local rand_pass="$(openssl rand -hex 6)"
+        local rand_port="$(( 15000 + $(openssl rand -int 2>/dev/null || echo "$(( (rand_seed = rand_seed + 1) * 2307 ))") % 45000 ))"
+
+        OLD_PROTO="socks5" OLD_IP="0.0.0.0" OLD_PORT="$rand_port" OLD_USER="$rand_user" OLD_PASS="$rand_pass" OLD_OUTBOUND="default"
     fi
 
     if [ "$is_edit" = "true" ]; then
@@ -399,18 +404,19 @@ menu_install() {
     read -r -p "$(echo -e "${GREEN}请输入监听网卡 IP [当前: ${YELLOW}${OLD_IP}${GREEN} | 回车不改]: ${RESET}")" input_ip
     local opt_ip="${input_ip:-$OLD_IP}"
 
-    read -r -p "$(echo -e "${GREEN}请输入服务端口 [当前: ${YELLOW}${OLD_PORT}${GREEN} | 回车不改]: ${RESET}")" input_port
+    # ⚡ 优化：新创建时提示中括号显示当前的随机预设端口，直接回车即用！
+    read -r -p "$(echo -e "${GREEN}请输入服务端口 [当前/默认随机: ${YELLOW}${OLD_PORT}${GREEN} | 可自主输入]: ${RESET}")" input_port
     local opt_port="${input_port:-$OLD_PORT}"
     
     local opt_user="" local opt_pass=""
-    read -r -p "$(echo -e "${GREEN}配置连接账户 [当前: ${YELLOW}${OLD_USER}${GREEN} | 输入 none 免密 | 回车不改]: ${RESET}")" input_user
+    read -r -p "$(echo -e "${GREEN}配置连接账户 [当前/默认随机: ${YELLOW}${OLD_USER}${GREEN} | 输入 ${RED}none${GREEN} 开放免密 | 或自主输入]: ${RESET}")" input_user
     if [ -z "$input_user" ]; then
         if [ "$OLD_USER" = "none" ]; then opt_user=""; opt_pass=""; else opt_user="$OLD_USER"; opt_pass="$OLD_PASS"; fi
     elif [ "$input_user" = "none" ]; then
         opt_user=""; opt_pass=""
     else
         opt_user="$input_user"
-        read -r -p "$(echo -e "${GREEN}请输入新密码 [当前: ${YELLOW}${OLD_PASS}${GREEN}]: ${RESET}")" input_pass
+        read -r -p "$(echo -e "${GREEN}请输入连接密码 [当前/默认随机: ${YELLOW}${OLD_PASS}${GREEN} | 回车不改]: ${RESET}")" input_pass
         opt_pass="${input_pass:-$OLD_PASS}"
     fi
 
@@ -456,29 +462,29 @@ menu_uninstall() {
     ok "实例 [ ${CURRENT_INSTANCE} ] 已干净销毁。"
 }
 
-rand_seed=11
+rand_seed=31
 
 while true; do
     get_status_info
     clear
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}    MicaProxy Alpine 专属多实例管理面板    ${RESET}"
+    echo -e "${GREEN} ◈ MicaProxy SOCKS5/HTTP 多实例管理面板 ◈  ${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}当前控制目标 :${RESET} ${CYAN}${CURRENT_INSTANCE}${RESET}"
+    echo -e "${GREEN}当前控制目标 :${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
     echo -e "${GREEN}目标实例绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
     echo -e "${GREEN}服务活跃状态 :${RESET} $panel_status"
     echo -e "${GREEN}核心沙箱引擎 :${RESET} ${YELLOW}${panel_version}${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN} 1. 全新一键部署当前控制实例${RESET}"
-    echo -e "${GREEN} 2. 检查更新/重下载底层二进制核心 (wget)${RESET}"
-    echo -e "${GREEN} 3. 彻底销毁当前选中的实例${RESET}"
-    echo -e "${YELLOW} 4. 修改当前实例配置 (回车读取旧值/微调)${RESET}"
-    echo -e "${GREEN} 5. 瞬间启动当前实例${RESET}"
-    echo -e "${GREEN} 6. 暂停挂起当前实例${RESET}"
-    echo -e "${GREEN} 7. OpenRC 热重启当前实例${RESET}"
-    echo -e "${GREEN} 8. 实时查看当前实例滚动运行日志${RESET}"
-    echo -e "${GREEN} 9. 重新打印/导出当前实例的连接密匙${RESET}"
-    echo -e "${YELLOW} 10. ⚡ 切换实例名字/多开新建不限数量的代理${RESET}"
+    echo -e "${GREEN} 1. 安装 当前控制实例${RESET}"
+    echo -e "${GREEN} 2. 更新 当前控制实例${RESET}"
+    echo -e "${GREEN} 3. 卸载 当前控制实例${RESET}"
+    echo -e "${GREEN} 4. 修改 当前控制实例${RESET}"
+    echo -e "${GREEN} 5. 启动 当前控制实例${RESET}"
+    echo -e "${GREEN} 6. 停止 当前控制实例${RESET}"
+    echo -e "${GREEN} 7. 重启 当前控制实例${RESET}"
+    echo -e "${GREEN} 8. 查看当前实例日志${RESET}"
+    echo -e "${GREEN} 9. 查看当前实例配置${RESET}"
+    echo -e "${YELLOW}10. 切换实例名字/多开新建不限数量的代理✨${RESET}"
     echo -e "${GREEN} 0. 退出控制面板${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     

@@ -1,360 +1,403 @@
 #!/bin/bash
-# ==================================================
-# VPS Geo Firewall (IPv4+IPv6)
-# Alpine Linux 专属优化版 (高稳定性/生产可用)
-# ==================================================
-
-CONF="/opt/geoip/geo.conf"
-UPDATE_SCRIPT="/opt/geoip/update_geo.sh"
-SCRIPT_PATH="/usr/local/bin/geofirewall"
-SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/nn.sh"
+# ========================================
+# GOST 一键管理脚本 (哆啦A梦转发面板)
+# ========================================
 
 GREEN="\033[32m"
+YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-green(){ echo -e "${GREEN}$1${RESET}"; }
-red(){ echo -e "${RED}$1${RESET}"; }
+APP_NAME="flux-panel"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+GOST_SQL_URL="https://github.com/bqlpfy/flux-panel/releases/download/1.4.3/gost.sql"
+NODE_SCRIPT_URL="https://github.com/bqlpfy/flux-panel/raw/main/install.sh"
 
-[[ $(id -u) != 0 ]] && red "请使用 root 运行" && exit 1
+DOCKER_CMD="docker compose"
 
-# ================== 初始化环境 ==================
-init_env(){
-    mkdir -p /opt/geoip
-    touch $CONF
+# GitHub 代理前缀列表（第一个为空代表直连尝试）
+GITHUB_PROXY=(
+    ''
+    'https://v6.gh-proxy.org/'
+    'https://gh-proxy.com/'
+    'https://hub.glowp.xyz/'
+    'https://proxy.vvvv.ee/'
+    'https://ghproxy.lvedong.eu.org/'
+)
 
-    if [[ ! -f /opt/geoip/.deps_installed ]]; then
-        # 必须确保先换源或更新，并确保安装 bash 本身
-        apk update
-        apk add ipset iptables ip6tables curl crontabs bash sed awk
-
-        rc-update add iptables default 2>/dev/null
-        rc-update add ip6tables default 2>/dev/null
-        rc-service iptables start 2>/dev/null
-        rc-service ip6tables start 2>/dev/null
-        
-        touch /opt/geoip/.deps_installed
-        green "Alpine 依赖环境（含极简 Bash）初始化成功！"
+# 依赖检查：确保安装了 jq 和 openssl
+check_dependencies() {
+    if ! command -v jq &>/dev/null; then
+        echo -e "${YELLOW}未检测到 jq，正在尝试安装...${RESET}"
+        apt-get update && apt-get install -y jq || yum install -y jq
+    fi
+    if ! command -v openssl &>/dev/null; then
+        echo -e "${YELLOW}未检测到 openssl，正在尝试安装...${RESET}"
+        apt-get update && apt-get install -y openssl || yum install -y openssl
     fi
 }
 
-download_script(){
-    mkdir -p "$(dirname "$SCRIPT_PATH")"
-    curl -sSL "$SCRIPT_URL" -o "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
-    green "脚本已更新完成。"
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
+
+    if ! $DOCKER_CMD version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
+    fi
 }
 
-get_my_ip(){ 
-    ip route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}'
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
 }
 
-get_ssh_port(){
-    local port=$(grep -i "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1)
-    echo "${port:-22}"
+check_ipv6_support() {
+    if ping6 -c 1 ::1 &>/dev/null; then
+        return 0
+    else
+        return 1
+    fi
 }
 
-# ================== 自动更新IP库 ==================
-install_auto_update(){
-cat > $UPDATE_SCRIPT <<EOF
-#!/bin/bash
-CONF="/opt/geoip/geo.conf"
-source \$CONF 2>/dev/null
-[[ -z "\$COUNTRY" ]] && exit 0
-CC_L=\$(echo \$COUNTRY | tr A-Z a-z)
-curl -s -o /opt/geoip/\${CC_L}.zone https://www.ipdeny.com/ipblocks/data/countries/\${CC_L}.zone
-curl -s -o /opt/geoip/\${CC_L}.ipv6.zone https://www.ipdeny.com/ipv6/ipaddresses/aggregated/\${CC_L}-aggregated.zone
-# 重新加载规则以应用新IP库
-$SCRIPT_PATH apply_backend
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP 地址。" && return
+}
+
+configure_docker_ipv6() {
+    if [ ! -f /etc/docker/daemon.json ]; then
+        echo '{}' > /etc/docker/daemon.json
+    fi
+
+    # 兼容处理非标准或空白 json
+    if ! jq '.' /etc/docker/daemon.json &>/dev/null; then
+        echo '{}' > /etc/docker/daemon.json
+    fi
+
+    local IPV6_ENABLED
+    # 避免 jq 读取 null 报错（这里已删掉错别字）
+    IPV6_ENABLED=$(jq '.ipv6 // false' /etc/docker/daemon.json 2>/dev/null)
+    if [ "$IPV6_ENABLED" = "true" ]; then
+        echo -e "${GREEN}✅ Docker 已启用 IPv6，无需重复配置${RESET}"
+        return
+    fi
+
+    jq '. + {ipv6:true, "fixed-cidr-v6":"fd00:dead:beef::/48"}' /etc/docker/daemon.json > /tmp/daemon.json.tmp
+    mv /tmp/daemon.json.tmp /etc/docker/daemon.json
+
+    systemctl restart docker
+    echo -e "${GREEN}✅ Docker IPv6 已启用并重启服务${RESET}"
+}
+
+# 代理轮询下载通用函数
+download_file() {
+    local url="$1"
+    local output="$2"
+    local success=false
+
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local target_url="${proxy}${url}"
+        if [ -n "$proxy" ]; then
+            echo "📡 正在尝试通过代理下载: ${proxy}"
+        else
+            echo "📡 正在尝试直连下载..."
+        fi
+        
+        curl -L -k --max-time 15 -o "$output" "$target_url"
+        
+        if [ -s "$output" ]; then
+            success=true
+            break
+        else
+            rm -f "$output"
+        fi
+    done
+
+    if [ "$success" = true ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+install_app() {
+    check_dependencies
+    check_docker
+    mkdir -p "$APP_DIR"
+    cd "$APP_DIR" || exit
+
+    # 下载数据库初始化文件
+    echo "📡 准备下载数据库初始化文件..."
+    if [ ! -f gost.sql ] || [ ! -s gost.sql ]; then
+        if ! download_file "$GOST_SQL_URL" "gost.sql"; then
+            echo -e "${RED}❌ 数据库文件所有下载通道均失败，请检查网络或 URL: $GOST_SQL_URL${RESET}"
+            read -p "按回车返回菜单..."
+            return
+        fi
+    fi
+    echo -e "${GREEN}✅ 数据库文件准备完成${RESET}"
+
+    # 设置端口
+    read -p "请输入前端端口 [默认:6366]: " input_front
+    FRONTEND_PORT=${input_front:-6366}
+    check_port "$FRONTEND_PORT" || return
+
+    read -p "请输入后端端口 [默认:6365]: " input_back
+    BACKEND_PORT=${input_back:-6365}
+    check_port "$BACKEND_PORT" || return
+
+    # 设置数据库账户
+    read -p "请输入数据库用户名 [默认:gost]: " input_user
+    DB_USER=${input_user:-gost}
+    read -p "请输入数据库名 [默认:gost]: " input_db
+    DB_NAME=${input_db:-gost}
+    read -p "请输入数据库密码 [默认:123456]: " input_pass
+    DB_PASSWORD=${input_pass:-123456}
+
+    # JWT secret
+    JWT_SECRET=$(openssl rand -hex 16)
+
+    # 检测 IPv6
+    ENABLE_IPV6=true # 显式初始化默认值
+    if check_ipv6_support; then
+        echo -e "${GREEN}🚀 系统支持 IPv6，自动启用 IPv6 配置...${RESET}"
+        configure_docker_ipv6
+    else
+        echo -e "${YELLOW}⚠️ 系统不支持 IPv6，跳过配置${RESET}"
+        ENABLE_IPV6=false
+    fi
+
+    # 用户手动确认 IPv6 开关
+    read -p "是否启用 Docker 内部容器 IPv6 网络? [Y/n] (默认开启): " ipv6_input
+    if [[ "$ipv6_input" =~ ^[Nn]$ ]]; then
+        ENABLE_IPV6=false
+    fi
+
+    # 生成 .env
+    cat > .env <<EOF
+DB_NAME=$DB_NAME
+DB_USER=$DB_USER
+DB_PASSWORD=$DB_PASSWORD
+JWT_SECRET=$JWT_SECRET
+FRONTEND_PORT=$FRONTEND_PORT
+BACKEND_PORT=$BACKEND_PORT
+EOF
+    echo -e "${GREEN}✅ .env 文件生成完成${RESET}"
+
+    # 生成 docker-compose.yml (注意转义了 \$ 符号，以便正确读取 .env 文件)
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  mysql:
+    image: mysql:5.7
+    container_name: gost-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: \${DB_PASSWORD}
+      MYSQL_DATABASE: \${DB_NAME}
+      MYSQL_USER: \${DB_USER}
+      MYSQL_PASSWORD: \${DB_PASSWORD}
+      TZ: Asia/Shanghai
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./gost.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --max_connections=1000
+      --innodb_buffer_pool_size=256M
+    networks:
+      - gost-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 10s
+      retries: 10
+
+  backend:
+    image: bqlpfy/springboot-backend:1.4.3
+    container_name: springboot-backend
+    restart: unless-stopped
+    environment:
+      DB_HOST: mysql
+      DB_NAME: \${DB_NAME}
+      DB_USER: \${DB_USER}
+      DB_PASSWORD: \${DB_PASSWORD}
+      JWT_SECRET: \${JWT_SECRET}
+      LOG_DIR: /app/logs
+      JAVA_OPTS: "-Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai"
+    ports:
+      - "\${BACKEND_PORT}:6365"
+    volumes:
+      - backend_logs:/app/logs
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - gost-network
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:6365/flow/test || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  frontend:
+    image: bqlpfy/vite-frontend:1.4.3
+    container_name: vite-frontend
+    restart: unless-stopped
+    ports:
+      - "\${FRONTEND_PORT}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - gost-network
+
+volumes:
+  mysql_data:
+    name: mysql_data
+    driver: local
+  backend_logs:
+    name: backend_logs
+    driver: local
 EOF
 
-chmod +x $UPDATE_SCRIPT
-rc-service crond start 2>/dev/null
-rc-update add crond default 2>/dev/null
+    # 动态追加网络配置
+    if [ "$ENABLE_IPV6" = true ]; then
+cat >> "$COMPOSE_FILE" <<EOF
 
-(crontab -l 2>/dev/null | grep -v update_geo.sh; echo "0 3 * * * $UPDATE_SCRIPT") | crontab -
-green "每日 03:00 自动动态更新 IP 库"
-}
+networks:
+  gost-network:
+    name: gost-network
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+        - subnet: fd00:dead:beef::/48
+EOF
+    else
+cat >> "$COMPOSE_FILE" <<EOF
 
-# ================== 原子更新 ipset ==================
-update_ipset(){
-    local SET_NAME=$1
-    local FILE=$2
-    local FAMILY=$3
-
-    [[ ! -s "$FILE" ]] && { red "错误: IP库文件为空或下载失败: $FILE"; return 1; }
-
-    ipset create $SET_NAME hash:net family $FAMILY -exist
-    ipset create ${SET_NAME}_tmp hash:net family $FAMILY -exist
-    ipset flush ${SET_NAME}_tmp
-
-    # 规范化读取，去除 Windows 回车符等干扰
-    while read -r ip || [[ -n "$ip" ]]; do
-        ip=$(echo "$ip" | tr -d '\r' | xargs)
-        [[ -n "$ip" && ! "$ip" =~ ^# ]] && ipset add ${SET_NAME}_tmp "$ip" 2>/dev/null
-    done < "$FILE"
-
-    ipset swap ${SET_NAME}_tmp $SET_NAME
-    ipset destroy ${SET_NAME}_tmp
-    return 0
-}
-
-save_rules(){
-    rc-service iptables save >/dev/null 2>&1
-    rc-service ip6tables save >/dev/null 2>&1
-}
-
-# ================== 应用规则核心 ==================
-apply_rules(){
-    source $CONF 2>/dev/null
-    [[ -z "$COUNTRY" ]] && { red "未检测到有效配置"; return; }
-
-    SSH_PORT=$(get_ssh_port)
-    green "自动保护并放行本服务器 SSH 端口: $SSH_PORT"
-
-    # 重置独立链
-    iptables -X GEO_CHAIN 2>/dev/null
-    ip6tables -X GEO_CHAIN 2>/dev/null
-    iptables -N GEO_CHAIN 2>/dev/null
-    ip6tables -N GEO_CHAIN 2>/dev/null
-
-    # 确保 INPUT 链第一级拦截跳转
-    iptables -C INPUT -j GEO_CHAIN 2>/dev/null || iptables -I INPUT 1 -j GEO_CHAIN
-    ip6tables -C INPUT -j GEO_CHAIN 2>/dev/null || ip6tables -I INPUT 1 -j GEO_CHAIN
-
-    # 1. 基础放行规则（状态防火墙）
-    iptables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    ip6tables -A GEO_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    iptables -A GEO_CHAIN -i lo -j ACCEPT
-    ip6tables -A GEO_CHAIN -i lo -j ACCEPT
-
-    # 2. 强力白名单放行（放在最前，防止被误杀）
-    MYIP=$(get_my_ip)
-    [[ -n "$MYIP" ]] && iptables -A GEO_CHAIN -s $MYIP -j ACCEPT
-    for ip in $WHITELIST; do
-        if [[ "$ip" =~ : ]]; then
-            ip6tables -A GEO_CHAIN -s $ip -j ACCEPT
-        else
-            iptables -A GEO_CHAIN -s $ip -j ACCEPT
-        fi
-    done
-
-    # 3. 下载并装载 ipset
-    CC_L=$(echo $COUNTRY | tr A-Z a-z)
-    V4FILE="/opt/geoip/${CC_L}.zone"
-    V6FILE="/opt/geoip/${CC_L}.ipv6.zone"
-
-    mkdir -p /opt/geoip
-    [[ ! -f $V4FILE || ! -s $V4FILE ]] && curl -s -o $V4FILE https://www.ipdeny.com/ipblocks/data/countries/$CC_L.zone
-    [[ ! -f $V6FILE || ! -s $V6FILE ]] && curl -s -o $V6FILE https://www.ipdeny.com/ipv6/ipaddresses/aggregated/$CC_L-aggregated.zone
-
-    update_ipset geo_v4 $V4FILE inet
-    update_ipset geo_v6 $V6FILE inet6
-
-    # 4. 根据模式应用策略
-    # 如果是放行特定国家，但是全端口放行，为了防止把自己锁在外面，默认对全球放行 SSH
-    if [[ "$MODE" == "allow" && "$PORTS" == "all" ]]; then
-        iptables -A GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
-        ip6tables -A GEO_CHAIN -p tcp --dport $SSH_PORT -j ACCEPT
+networks:
+  gost-network:
+    name: gost-network
+    driver: bridge
+EOF
     fi
 
-    for proto in tcp udp; do
-        if [[ "$MODE" == "block" ]]; then
-            if [[ "$PORTS" == "all" ]]; then
-                iptables -A GEO_CHAIN -p $proto -m set --match-set geo_v4 src -j DROP
-                ip6tables -A GEO_CHAIN -p $proto -m set --match-set geo_v6 src -j DROP
-            else
-                for p in $PORTS; do
-                    iptables -A GEO_CHAIN -p $proto --dport $p -m set --match-set geo_v4 src -j DROP
-                    ip6tables -A GEO_CHAIN -p $proto --dport $p -m set --match-set geo_v6 src -j DROP
-                done
-            fi
-        else
-            # allow 模式下特定端口控制
-            if [[ "$PORTS" == "all" ]]; then
-                iptables -A GEO_CHAIN -p $proto -m set ! --match-set geo_v4 src -j DROP
-                ip6tables -A GEO_CHAIN -p $proto -m set ! --match-set geo_v6 src -j DROP
-            else
-                for p in $PORTS; do
-                    iptables -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set geo_v4 src -j DROP
-                    ip6tables -A GEO_CHAIN -p $proto --dport $p -m set ! --match-set geo_v6 src -j DROP
-                done
-            fi
-        fi
-    done
+    $DOCKER_CMD up -d
 
-    save_rules
-    green "Geo 防火墙策略已成功矩阵化应用！"
+    SERVER_IP=$(get_public_ip)
+
+    echo -e "${GREEN}✅ 哆啦A梦转发面板 已启动${RESET}"
+    echo -e "${YELLOW}🌐 前端访问: http://${SERVER_IP}:${FRONTEND_PORT}${RESET}"
+    echo -e "${YELLOW}🌐 后端访问: http://${SERVER_IP}:${BACKEND_PORT}${RESET}"
+    echo -e "${YELLOW}🌐 默认账号: admin_user${RESET}"
+    echo -e "${YELLOW}🌐 默认密码: admin_user${RESET}"
+    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-write_config(){
-    echo "MODE=\"$MODE\"" > $CONF
-    echo "COUNTRY=\"$COUNTRY\"" >> $CONF
-    echo "PORTS=\"$PORTS\"" >> $CONF
-    echo "WHITELIST=\"$WHITELIST\"" >> $CONF
+update_app() {
+    cd "$APP_DIR" || return
+    $DOCKER_CMD pull
+    $DOCKER_CMD up -d
+    echo -e "${GREEN}✅ 哆啦A梦转发面板 更新完成${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-# ================== 菜单交互 ==================
-add_rule(){
-    echo -e "${GREEN}选择模式:${RESET}"
-    echo -e "${GREEN}1 封锁某国某端口${RESET}"
-    echo -e "${GREEN}2 封锁某国所有端口${RESET}"
-    echo -e "${GREEN}3 只允许某国某端口${RESET}"
-    echo -e "${GREEN}4 只允许某国访问整个服务器 (非该国IP将无法连接除SSH外的其余端口)${RESET}"
-    read -p "选择模式(1-4): " choice
-
-    case "$choice" in
-        1)
-            MODE="block"
-            read -p "国家代码(小写，如 cn, us, jp): " COUNTRY
-            read -p "端口 (多个用空格隔开): " PORTS
-            ;;
-        2)
-            MODE="block"
-            read -p "国家代码(小写，如 cn, us, jp): " COUNTRY
-            PORTS="all"
-            ;;
-        3)
-            MODE="allow"
-            read -p "国家代码(小写，如 cn, us, jp): " COUNTRY
-            read -p "端口 (多个用空格隔开): " PORTS
-            ;;
-        4)
-            MODE="allow"
-            read -p "国家代码(小写，如 cn, us, jp): " COUNTRY
-            PORTS="all"
-            ;;
-        *)
-            red "无效选择"
-            return
-            ;;
-    esac
-
-    write_config
-    install_auto_update
-    apply_rules
+restart_app() {
+    docker restart gost-mysql springboot-backend vite-frontend
+    echo -e "${GREEN}✅ 哆啦A梦转发面板 已重启${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-add_whitelist(){
-    read -p "输入要添加的白名单 IP (多个用空格隔开): " ips
-    source $CONF 2>/dev/null
-    WHITELIST="$WHITELIST $ips"
-    write_config
-    apply_rules
-}
-
-delete_whitelist(){
-    read -p "输入要删除的白名单 IP (多个用空格隔开): " ips
-    source $CONF 2>/dev/null
-    for ip in $ips; do
-        WHITELIST=$(echo $WHITELIST | sed -E "s/\b$ip\b//g")
-    done
-    write_config
-    apply_rules
-}
-
-delete_rules(){
-    source $CONF 2>/dev/null
-    [[ -z "$PORTS" ]] && { red "当前未配置任何受控端口"; return; }
-    echo -e "当前受控端口为: ${GREEN}$PORTS${RESET}"
-    read -p "输入要移除受控的端口 (多个用空格隔开): " DEL_PORTS
-    [[ -z "$DEL_PORTS" ]] && { red "未输入任何端口"; return; }
-    
-    for p in $DEL_PORTS; do
-        PORTS=$(echo $PORTS | sed -E "s/\b$p\b//g")
-    done
-    # 如果过滤后端口为空，切回 all 或者清空
-    [[ -z $(echo $PORTS | xargs) ]] && PORTS="all"
-    
-    write_config
-    apply_rules
-    green "选定端口已移出监控配置。"
-}
-
-view_rules(){
-    clear
-    green "========= 核心配置文件 ========="
-    cat $CONF 2>/dev/null
-    echo
-    green "========= IPv4 规则链 (GEO_CHAIN) ========="
-    iptables -L GEO_CHAIN -n --line-numbers 2>/dev/null
-    echo
-    green "========= IPv6 规则链 (GEO_CHAIN) ========="
-    ip6tables -L GEO_CHAIN -n --line-numbers 2>/dev/null
-    echo
-    green "========= 活性 IPSet 集合 ========="
-    ipset list | grep -E "^Name:|^Type:|^Elements:"
-}
-
-uninstall_all(){
-    green "正在完全卸载防火墙并清理环境..."
-    iptables -D INPUT -j GEO_CHAIN 2>/dev/null
-    ip6tables -D INPUT -j GEO_CHAIN 2>/dev/null
-    iptables -F GEO_CHAIN 2>/dev/null
-    ip6tables -F GEO_CHAIN 2>/dev/null
-    iptables -X GEO_CHAIN 2>/dev/null
-    ip6tables -X GEO_CHAIN 2>/dev/null
-    ipset destroy geo_v4 2>/dev/null
-    ipset destroy geo_v6 2>/dev/null
-    rm -rf /opt/geoip
-    crontab -l 2>/dev/null | grep -v update_geo.sh | crontab -
-    rm -f $SCRIPT_PATH
-    save_rules
-    green "卸载完成，系统防火墙已恢复默认状态。"
-    exit 0
-}
-
-menu(){
-    clear
-    local v_mode="未配置"
-    local v_country="无"
-    local v_ports="无"
-    if [ -f "$CONF" ]; then
-        source $CONF 2>/dev/null
-        [ "$MODE" == "block" ] && v_mode="${RED}仅封锁(Blacklist)${RESET}"
-        [ "$MODE" == "allow" ] && v_mode="${GREEN}仅放行(Whitelist)${RESET}"
-        [ -n "$COUNTRY" ] && v_country=$(echo "$COUNTRY" | tr 'a-z' 'A-Z')
-        [ -n "$PORTS" ] && v_ports="$PORTS"
-    fi
-
-    echo -e "${GREEN}=========================${RESET}"
-    echo -e "${GREEN}   ◈   国家IP防火墙   ◈  ${RESET}"
-    echo -e "${GREEN}=========================${RESET}"
-    echo -e "${GREEN}当前模式: ${v_mode}"
-    echo -e "${GREEN}目标国家: ${v_country}${RESET}"
-    echo -e "${GREEN}受控端口: ${v_ports}${RESET}"
-    echo -e "${GREEN}=========================${RESET}"
-    echo -e "${GREEN}1 添加规则${RESET}"
-    echo -e "${GREEN}2 删除端口规则${RESET}"
-    echo -e "${GREEN}3 查看规则详情${RESET}"
-    echo -e "${GREEN}4 添加白名单${RESET}"
-    echo -e "${GREEN}5 删除白名单${RESET}"
-    echo -e "${GREEN}6 更新${RESET}"
-    echo -e "${GREEN}7 卸载${RESET}"
-    echo -e "${GREEN}0 退出${RESET}"
-    echo -e "${GREEN}=========================${RESET}"
-    read -r -p $'\033[32m请选择: \033[0m' num
-    case $num in
-        1) add_rule ;;
-        2) delete_rules ;;
-        3) view_rules ;;
-        4) add_whitelist ;;
-        5) delete_whitelist ;;
-        6) download_script ;;
-        7) uninstall_all ;;
-        0) exit ;;
+view_logs() {
+    echo -e "${GREEN}选择容器查看日志:${RESET}"
+    echo "1) MySQL"
+    echo "2) Backend"
+    echo "3) Frontend"
+    read -p "选择: " c
+    case $c in
+        1) docker logs -f gost-mysql ;;
+        2) docker logs -f springboot-backend ;;
+        3) docker logs -f vite-frontend ;;
+        *) echo -e "${RED}无效选择${RESET}" ;;
     esac
 }
 
-# 后台静默调用入口（防止 crontab 执行时弹出菜单）
-if [[ "$1" == "apply_backend" ]]; then
-    apply_rules
-    exit 0
-fi
+check_status() {
+    docker ps | grep -E "gost-mysql|springboot-backend|vite-frontend"
+    read -p "按回车返回菜单..."
+}
 
-# ================== 主循环 ==================
-init_env
-while true; do
-    menu
-    read -r -p "按回车键继续..."
-done
+uninstall_app() {
+    cd "$APP_DIR" || return
+    $DOCKER_CMD down -v
+    cd /opt && rm -rf "$APP_DIR"
+    echo -e "${RED}✅ 哆啦A梦转发面板 已彻底卸载${RESET}"
+    read -p "按回车返回菜单..."
+}
+
+manage_nodes() {
+    echo "📡 正在获取节点管理..."
+    if download_file "$NODE_SCRIPT_URL" "node_install.sh"; then
+        chmod +x node_install.sh
+        ./node_install.sh
+        rm -f node_install.sh
+    else
+        echo -e "${RED}❌ 无法安装节点管理，请检查网络！${RESET}"
+        read -p "按回车返回菜单..."
+    fi
+}
+
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}============================${RESET}"
+        echo -e "${GREEN}  ◈   哆啦A梦转发面板   ◈   ${RESET}"
+        echo -e "${GREEN}============================${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${YELLOW}7) 节点管理${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        echo -e "${GREEN}============================${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            7) manage_nodes ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+# 启动菜单
+menu

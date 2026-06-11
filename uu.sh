@@ -1,616 +1,367 @@
 #!/bin/bash
-# ========================================
-# Rclone 管理脚本 
-# ========================================
 
-# ================== 颜色 ==================
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-CYAN="\033[36m"
-RESET="\033[0m"
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m' # 无颜色
 
-# ================== 全局变量 & 目录配置 ==================
-BASE_DIR="/opt/rclone_manager"
-LOG_DIR="$BASE_DIR/log"
-SCRIPT_DIR="$BASE_DIR/scripts"
-CONFIG_FILE="$BASE_DIR/config.env"
-CRON_PREFIX="# rclone_sync_task:"
+# 脚本路径定义
+INSTALL_DIR="$HOME/gproxy-tool"
+CONFIG_FILE="$HOME/.config/gproxy/config.env"
 
-mkdir -p "$LOG_DIR" "$SCRIPT_DIR"
+# GITHUB 代理自动轮询列表（最后一个为空代表直连）
+GITHUB_PROXY=(
+    'https://v6.gh-proxy.org/'
+    'https://gh-proxy.com/'
+    'https://hub.glowp.xyz/'
+    'https://proxy.vvvv.ee/'
+    'https://ghproxy.lvedong.eu.org/'
+    ''
+)
 
-# 获取系统环境名称
-if [ -f /etc/os-release ]; then
-    OS=$(awk -F= '/^NAME/{print $2}' /etc/os-release | tr -d '"')
-else
-    OS=$(uname -s)
-fi
-
-# ================== 载入或初始化配置文件 ==================
-init_config() {
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        cat > "$CONFIG_FILE" <<EOF
-TG_TOKEN="填入你的默认BotToken"
-TG_CHAT_ID="填入你的默认ChatID"
-VPS_NAME="未命名VPS"
-EOF
-    fi
-    source "$CONFIG_FILE"
-}
-init_config
-
-# ================== 动态状态获取 ==================
-get_system_status() {
-
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}         ◈   Rclone 管理面板   ◈       ${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
-    
-    if command -v rclone &> /dev/null; then
-        local rclone_ver=$(rclone version | head -n 1 | awk '{print $2}')
-        echo -e "${GREEN}Rclone 状态:${RESET} ${YELLOW}已安装 (${rclone_ver})${RESET}"
+# 动态获取 tunnel.sh 路径
+get_tunnel_path() {
+    if [ -f "/usr/lib/gproxy/lib/tunnel.sh" ]; then
+        echo "/usr/lib/gproxy/lib/tunnel.sh"
+    elif [ -f "$INSTALL_DIR/lib/tunnel.sh" ]; then
+        echo "$INSTALL_DIR/lib/tunnel.sh"
     else
-        echo -e "${GREEN}Rclone 状态:${RESET} ${RED}未安装${RESET}"
-    fi
-
-    if command -v rclone &> /dev/null; then
-        local remote_count=$(rclone listremotes 2>/dev/null | wc -l)
-        echo -e "${GREEN}已配置网盘:${RESET} ${YELLOW}${remote_count} 个${RESET}"
-    else
-        echo -e "${GREEN}已配置网盘:${RESET} ${YELLOW}----${RESET}"
-    fi
-
-    local active_mounts=$(mount | grep -i "rclone" | awk '{print $3}')
-    if [ -n "$active_mounts" ]; then
-        echo -e "${GREEN}活跃挂载点: ${RESET}"
-        echo "$active_mounts" | while read -r mnt; do
-            echo -e " ${YELLOW}● $mnt (已开启开机自启)${RESET}"
-        done
-    else
-        echo -e "${GREEN}活跃挂载点:${RESET} ${YELLOW}暂无活跃挂载${RESET}"
-    fi
-
-    local cron_count=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX" | wc -l)
-    echo -e "${GREEN}同步定时任务:${RESET} ${YELLOW}${cron_count} 个活跃任务${RESET}"
-
-    if [[ "$TG_TOKEN" == "填入你的默认BotToken" || -z "$TG_TOKEN" ]]; then
-        echo -e "${GREEN}TG 通知状态:${RESET} ${RED}未配置${RESET}"
-    else
-        echo -e "${GREEN}TG 通知状态:${RESET} ${YELLOW}已启用 (${VPS_NAME})${RESET}"
-    fi
-}
-
-# ================== 菜单 ==================
-show_menu() {
-    clear
-    get_system_status
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${CYAN} [ Rclone 管理 ]${RESET}"
-    echo -e "${GREEN} 1) 安装 Rclone${RESET}       ${GREEN} 2) 更新 Rclone${RESET}"
-    echo -e "${GREEN} 3) 配置 Rclone${RESET}       ${GREEN} 4) 查看远程存储列表${RESET}"
-    echo -e "${GREEN} 5) 查看远程存储文件${RESET}"
-    echo -e "${GREEN}----------------------------------------${RESET}"
-    echo -e "${CYAN} [ 挂载管理 (配置开机自启) ]${RESET}"
-    echo -e "${GREEN} 6) 挂载网盘 ${RESET}         ${GREEN} 7) 查看已创建的资产清单${RESET}"
-    echo -e "${GREEN} 8) 卸载指定挂载点${RESET}    ${GREEN} 9) 卸载所有挂载点${RESET}"
-    echo -e "${GREEN}10) 查看挂载运行状态${RESET}  ${GREEN}11) 查看挂载实时日志${RESET}"
-    echo -e "${GREEN}----------------------------------------${RESET}"
-    echo -e "${CYAN} [ 数据同步与任务 ]${RESET}"
-    echo -e "${GREEN}12) 同步 本地 → 远程${RESET}  ${GREEN}13) 同步 远程 → 本地${RESET}"
-    echo -e "${GREEN}14) 定时任务管理 (Cron)${RESET}"
-    echo -e "${GREEN}----------------------------------------${RESET}"
-    echo -e "${CYAN} [ 全局设置与常规 ]${RESET}"
-    echo -e "${GREEN}15) 修改TG通知参数${RESET}    ${GREEN}16) 卸载 Rclone${RESET}"
-    echo -e "${GREEN} 0) 退出${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
-}
-
-# ================== 基础操作 ==================
-install_rclone() {
-    echo -e "${YELLOW}正在检测并安装 FUSE 挂载依赖组件...${RESET}"
-    
-    # 1. 智能识别包管理器并安装 FUSE
-    if command -v apt-get &> /dev/null; then
-        sudo apt-get update -y
-        # 优先安装 fuse3，如果失败则尝试安装 fuse
-        sudo apt-get install -y fuse3 || sudo apt-get install -y fuse
-    elif command -v dnf &> /dev/null; then
-        sudo dnf install -y fuse3 || sudo dnf install -y fuse
-    elif command -v yum &> /dev/null; then
-        sudo yum install -y fuse3 || sudo yum install -y fuse
-    else
-        echo -e "${YELLOW}未检测到主流包管理器，请手动确保系统已安装 fuse / fuse3，否则挂载功能可能无法使用。${RESET}"
-    fi
-
-    # 2. 验证 FUSE 是否安装成功
-    if command -v fusermount3 &> /dev/null || command -v fusermount &> /dev/null; then
-        echo -e "${GREEN}FUSE 依赖组件安装/检查成功！${RESET}"
-    else
-        echo -e "${RED}⚠️ FUSE 依赖安装可能失败，后续网盘挂载功能（Option 6）可能会报错。${RESET}"
-    fi
-
-    # 3. 安装 Rclone 本体
-    echo -e "${YELLOW}正在安装 Rclone 本体...${RESET}"
-    if curl https://rclone.org/install.sh | sudo bash; then
-        echo -e "${GREEN}Rclone 安装完成！${RESET}"
-    else
-        echo -e "${RED}❌ Rclone 本体安装失败，请检查网络连接。${RESET}"
-    fi
-}
-
-update_rclone() {
-    echo -e "${YELLOW}正在更新 Rclone...${RESET}"
-    curl https://rclone.org/install.sh | sudo bash
-    echo -e "${GREEN}Rclone 已更新完成！${RESET}"
-    rclone version
-}
-
-config_rclone() { rclone config; }
-list_remotes() { rclone listremotes; }
-
-list_files_remote() {
-    read -p "请输入Rclone创建的网盘名称: " remote
-    [ -z "$remote" ] && { echo -e "${RED}远程名称不能为空${RESET}"; return; }
-    read -p "请输入远程目录(默认 /): " remote_dir
-    remote_dir=${remote_dir:-/}
-    rclone ls "${remote}:${remote_dir}" || echo -e "${RED}访问失败，请检查名称或权限${RESET}"
-}
-
-# ================== TG 参数持久化 ==================
-modify_tg() {
-    read -p "请输入 TG Bot Token (当前: $TG_TOKEN): " input_token
-    read -p "请输入 TG Chat ID (当前: $TG_CHAT_ID): " input_id
-    read -p "请输入 VPS 名称 (当前: $VPS_NAME): " input_name
-
-    TG_TOKEN=${input_token:-$TG_TOKEN}
-    TG_CHAT_ID=${input_id:-$TG_CHAT_ID}
-    VPS_NAME=${input_name:-$VPS_NAME}
-
-    cat > "$CONFIG_FILE" <<EOF
-TG_TOKEN="$TG_TOKEN"
-TG_CHAT_ID="$TG_CHAT_ID"
-VPS_NAME="$VPS_NAME"
-EOF
-    echo -e "${GREEN}TG 参数已成功保存到本地配置文件！${RESET}"
-}
-
-send_tg() {
-    local msg="$1"
-    source "$CONFIG_FILE"
-    if [[ "$TG_TOKEN" != "填入你的默认BotToken" ]]; then
-        curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-            -d chat_id="${TG_CHAT_ID}" -d text="[$VPS_NAME] $msg" >/dev/null
-    fi
-}
-
-
-# ================== 智能挂载自启动一体化 ==================
-mount_remote() {
-
-
-    read -p "请输入Rclone创建的网盘名称: " remote
-    [ -z "$remote" ] && return
-    
-    read -p "请输入网盘内的存储桶/子目录 (如 sss): " remote_dir
-    
-    # 如果用户输入了桶名，自动去掉前后的斜杠
-    remote_dir=$(echo "$remote_dir" | sed 's/^\///;s/\/$//')
-    
-    # 智能生成默认本地路径
-    if [ -z "$remote_dir" ]; then
-        default_path="/mnt/${remote}"
-        local mount_source="${remote}:"
-    else
-        # 如果有桶名，本地目录名变成 /mnt/CF_sss，更直观
-        default_path="/mnt/${remote}_${remote_dir}"
-        local mount_source="${remote}:${remote_dir}"
-    fi
-    
-    read -p "请输入VPS本地挂载路径 (默认 $default_path): " input_path
-    path=${input_path:-$default_path}
-    
-    # 1. 检查防冲突与强行清理僵尸挂载
-    if mount | grep -q "on $path type"; then
-        echo -e "${YELLOW}该本地路径 $path 已经被挂载。正在执行热刷新升级...${RESET}"
-        sudo umount -l "$path" 2>/dev/null
-    fi
-
-    # 清理可能残留的 PID（新版 Rclone 推荐靠 systemd 管理进程）
-    [ -f "/var/run/rclone_${remote}.pid" ] && rm -f "/var/run/rclone_${remote}.pid"
-
-    sudo mkdir -p "$path"
-    service_file="/etc/systemd/system/rclone-mount@${remote}.service"
-    
-    # 2. 写入 Systemd (完美适配 R2 特性参数)
-    sudo tee "$service_file" >/dev/null <<EOF
-[Unit]
-Description=Rclone Mount ${remote}
-After=network-online.target
-
-[Service]
-Type=simple
-User=root
-# 核心参数优化：加入了权限允许、写入缓存
-ExecStart=/usr/bin/rclone mount ${mount_source} $path \\
-    --allow-other \\
-    --vfs-cache-mode full \\
-    --vfs-cache-max-age 24h \\
-    --vfs-cache-max-size 10G \\
-    --buffer-size 64M \\
-    --dir-cache-time 1h \\
-    --drive-chunk-size 64M
-# 使用更强壮的 lazy umount 停止服务，防止卸载时卡死
-ExecStop=/usr/bin/umount -l $path
-Restart=always
-RestartSec=10
-StandardOutput=append:$LOG_DIR/rclone_${remote}_sys.log
-StandardError=append:$LOG_DIR/rclone_${remote}_sys.log
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    # 3. 启动服务
-    sudo systemctl daemon-reload
-    sudo systemctl enable rclone-mount@${remote}
-    sudo systemctl restart rclone-mount@${remote} # 用 restart 确保应用新配置
-    
-    echo "正在等待挂载启动..."
-    sleep 3
-    
-    # 4. 验证挂载状态
-    if systemctl is-active --quiet "rclone-mount@${remote}"; then
-        echo -e "${GREEN}✅ 已成功将网盘 [${mount_source}] 挂载到本地 [${path}]！${RESET}"
-        echo -e "${GREEN}ℹ️ 缓存刷新时间设为 1 小时，新文件会在 1 小时内自动同步。${RESET}"
-        echo -e "${GREEN}⚙️ 开机自启动守护已妥善配置。可以使用 'df -h' 查看状态。${RESET}"
-    else
-        echo -e "${RED}❌ 挂载启动失败！${RESET}"
-        echo -e "${RED}请运行以下命令查看具体报错日志:${RESET}"
-        echo -e "${YELLOW}tail -n 20 $LOG_DIR/rclone_${remote}_sys.log${RESET}"
-    fi
-}
-
-
-unmount_remote_by_name() {
-    read -p "请输入想要卸载的Rclone创建的网盘名称 (如 CF): " remote
-    [ -z "$remote" ] && return
-    
-    local svc="rclone-mount@${remote}"
-    local service_file="/etc/systemd/system/${svc}.service"
-    local path=""
-
-    # 核心改进：从现有的 systemd 服务文件中提取真正的本地挂载路径
-    if [ -f "$service_file" ]; then
-        # 匹配 ExecStart 中最后一个以 / 开头的路径参数
-        path=$(grep "ExecStart=" "$service_file" | awk '{print $NF}')
-    fi
-    
-    # 如果没找到服务文件，则降级使用默认猜测路径
-    if [ -z "$path" ]; then
-        path="/mnt/${remote}"
-    fi
-    
-    # 1. 停止并移除 Systemd 自启守护服务
-    if [ -f "$service_file" ] || systemctl list-unit-files | grep -q "^${svc}"; then
-        echo -e "${YELLOW}正在停止并移除 [${remote}] 的开机自启动守护服务...${RESET}"
-        sudo systemctl stop "$svc" 2>/dev/null
-        sudo systemctl disable "$svc" 2>/dev/null
-        sudo rm -f "$service_file"
-        sudo systemctl daemon-reload
-    fi
-
-    # 2. 强行解除本地挂载（优先使用通用的 umount -l，防止死锁）
-    echo -e "${YELLOW}正在解除路径 [${path}] 的网络挂载...${RESET}"
-    sudo umount -l "$path" 2>/dev/null || sudo fusermount -u "$path" 2>/dev/null
-    
-    # 3. 清理残留
-    [ -f "/var/run/rclone_${remote}.pid" ] && rm -f "/var/run/rclone_${remote}.pid"
-
-    echo -e "${GREEN}✅ 远程存储 ${remote} 卸载完成，本地目录 [${path}] 已释放，自启同步移除！${RESET}"
-}
-
-unmount_all() {
-    echo -e "${YELLOW}正在全面清空并移除所有网盘挂载与开机自启动...${RESET}"
-    
-    # 核心改进：直接从配置目录扫描所有 rclone-mount@ 开头的服务文件，不管它当前是运行还是停止
-    local sys_services=$(find /etc/systemd/system/ -name "rclone-mount@*.service" -exec basename {} \;)
-    
-    if [ -n "$sys_services" ]; then
-        for svc in $sys_services; do
-            echo -e "${CYAN} ➜ 正在彻底清理服务: $svc${RESET}"
-            sudo systemctl stop "$svc" 2>/dev/null
-            sudo systemctl disable "$svc" 2>/dev/null
-            sudo rm -f "/etc/systemd/system/$svc"
-        done
-        sudo systemctl daemon-reload
-    fi
-
-    # 清理所有相关的 PID 文件
-    rm -f /var/run/rclone_*.pid
-
-    # 强行拆除所有处于 rclone 类型的挂载点（通过 mount 动态抓取，绝不漏网）
-    local active_mounts=$(mount | grep -i "rclone" | awk '{print $3}')
-    if [ -n "$active_mounts" ]; then
-        echo "$active_mounts" | while read -r mnt; do
-            echo -e "${CYAN} ➜ 正在强制卸载僵尸目录: $mnt${RESET}"
-            sudo umount -l "$mnt" 2>/dev/null || sudo fusermount -u "$mnt" 2>/dev/null
-        done
-    fi
-    echo -e "${GREEN}✅ 系统内所有 Rclone 挂载及相关自启服务已全部清洗完毕。${RESET}"
-}
-# ================== 资产清单综合查看面板 ==================
-show_assets_manifest() {
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}       📁 Rclone 已创资产名称清单      ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    
-    # 1. 扫描已生成的自启动挂载服务
-    echo -e "${CYAN}[1] 已创建的自启动挂载服务名字信息：${RESET}"
-    local service_files=$(ls /etc/systemd/system/rclone-mount@*.service 2>/dev/null)
-    if [ -n "$service_files" ]; then
-        echo "$service_files" | while read -r file; do
-            # 提取网盘名称
-            local r_name=$(basename "$file" | sed 's/rclone-mount@//;s/\.service//')
-            # 提取挂载路径
-            local m_path=$(grep -E '^ExecStart=' "$file" | awk '{print $4}')
-            # 检查当前是否在运行
-            if systemctl is-active --quiet "rclone-mount@${r_name}"; then
-                local r_status="${GREEN}● 正在运行${RESET}"
-            else
-                local r_status="${RED}○ 已停止${RESET}"
-            fi
-            echo -e "  网盘名称: ${YELLOW}${r_name}${RESET}  |  挂载路径: ${YELLOW}${m_path}${RESET}  [${r_status}]"
-        done
-    else
-        echo -e "  ${YELLOW}(暂无通过本脚本创建的挂载服务)${RESET}"
-    fi
-
-    echo -e "---------------------------------------"
-
-    # 2. 扫描本脚本生成的 Cron 定时同步任务
-    echo -e "${CYAN}[2] 已创建的定时任务(Cron)名字信息：${RESET}"
-    local cron_tasks=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX")
-    if [ -n "$cron_tasks" ]; then
-        echo "$cron_tasks" | while read -r line; do
-            # 提取任务唯一标识名
-            local task_id=$(echo "$line" | awk -F "$CRON_PREFIX" '{print $2}')
-            # 提取运行周期表达式
-            local cron_time=$(echo "$line" | awk -F "/opt/rclone_manager" '{print $1}')
-            echo -e "  任务名字: ${YELLOW}${task_id}${RESET}  |  执行周期: ${YELLOW}${cron_time}${RESET}"
-        done
-    else
-        echo -e "  ${YELLOW}(暂无通过本脚本创建的定时同步任务)${RESET}"
-    fi
-    echo -e "${GREEN}=======================================${RESET}"
-}
-
-# ================== 状态和日志查看 ==================
-view_mount_status() {
-    read -p "请输入想要查看状态的Rclone创建网盘名称: " remote
-    [ -z "$remote" ] && return
-    local svc="rclone-mount@${remote}"
-    
-    if systemctl list-unit-files | grep -q "^${svc}"; then
-        echo -e "${CYAN}--- Systemd 状态服务信息 ---${RESET}"
-        sudo systemctl status "$svc"
-    else
-        echo -e "${RED}未找到该网盘 [${remote}] 对应的挂载守护服务，请确认名称是否正确。${RESET}"
-    fi
-}
-
-view_mount_logs() {
-    read -p "想要查看实时日志，请输入Rclone创建的网盘名称: " remote
-    [ -z "$remote" ] && return
-    local log_file="$LOG_DIR/rclone_${remote}_sys.log"
-    
-    if [ -f "$log_file" ]; then
-        echo -e "${CYAN}--- 正在读取实时日志 (按 Ctrl+C 退出日志查看模式) ---${RESET}"
-        tail -n 50 -f "$log_file"
-    else
-        echo -e "${RED}未找到对应的日志文件: ${log_file}${RESET}"
-    fi
-}
-
-# ================== 高级定时任务管理面板 ==================
-show_cron_panel() {
-    local TASK_COUNT=$(crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]' | wc -l)
-
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}        ◈  Cron 定时任务管理面板  ◈      ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN} 当前系统环境 : ${YELLOW}${OS}${RESET}"
-    echo -e "${GREEN} 活跃任务总数 : ${YELLOW}${TASK_COUNT} 条${RESET}"
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN} 📋 当前系统定时任务快照：${RESET}"
-    
-    if [ "$TASK_COUNT" -gt 0 ]; then
-        crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]' | awk -v cyan="$CYAN" -v reset="$RESET" '{print "   " cyan "•" reset " " $0}'
-    else
-        echo -e "   ${YELLOW}(暂无用户自定义的定时任务)${RESET}"
-    fi
-    
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  1) 快速添加定时任务(引导式)${RESET}"
-    echo -e "${GREEN}  2) 精准删除定时任务(按名称删除)${RESET}"
-    echo -e "${GREEN}  3) 深度手动编辑任务(打开编辑器)${RESET}"
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  0) 返回主菜单${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-}
-
-schedule_add() {
-    echo -e "${YELLOW}--- 引导式添加 Rclone 同步任务 ---${RESET}"
-    read -p "任务唯一标识名 (英文字母): " TASK_NAME
-    [ -z "$TASK_NAME" ] && return
-    read -p "本地同步目录 (多个用空格隔开): " LOCAL_DIR
-    read -p "请输入Rclone创建的网盘名称: " REMOTE_NAME
-    read -p "远程目标目录 (默认 backup): " REMOTE_DIR
-    REMOTE_DIR=${REMOTE_DIR:-backup}
-
-    echo -e "${GREEN}选择执行周期:\n 1. 每天0点\n 2. 每周一0点\n 3. 每月1号0点\n 4. 自定义 Cron 表达式${RESET}"
-    read -p "请选择: " t
-    case $t in
-        1) cron_expr="0 0 * * *" ;;
-        2) cron_expr="0 0 * * 1" ;;
-        3) cron_expr="0 0 1 * *" ;;
-        4) read -p "请输入标准 5 位 Cron 表达式: " cron_expr ;;
-        *) echo -e "${RED}❌ 无效选择${RESET}"; return ;;
-    esac
-
-    SCRIPT_PATH="$SCRIPT_DIR/rclone_sync_${TASK_NAME}.sh"
-    cat > "$SCRIPT_PATH" << 'EOF'
-#!/bin/bash
-CONFIG_FILE="/opt/rclone_manager/config.env"
-if [ -f "$CONFIG_FILE" ]; then source "$CONFIG_FILE"; fi
-EOF
-
-    cat >> "$SCRIPT_PATH" << EOF
-LOG_FILE="$LOG_DIR/rclone_sync_${TASK_NAME}.log"
-send_tg() {
-    if [[ "\$TG_TOKEN" != "填入你的默认BotToken" ]]; then
-        curl -s -X POST "https://api.telegram.org/bot\${TG_TOKEN}/sendMessage" \
-        -d chat_id="\${TG_CHAT_ID}" -d text="[\${VPS_NAME}] \$1" >/dev/null
-    fi
-}
-for d in $LOCAL_DIR; do
-    [ ! -d "\$d" ] && continue
-    name=\$(basename "\$d")
-    target="${REMOTE_NAME}:${REMOTE_DIR}/\$name"
-    rclone sync "\$d" "\$target" -v >> "\$LOG_FILE" 2>&1
-    if [ \$? -eq 0 ]; then
-        echo "[\$(date '+%F %T')] \$d 同步完成 ✅" >> "\$LOG_FILE"
-        send_tg "定时任务 [${TASK_NAME}] 同步成功: \$d ✅"
-    else
-        echo "[\$(date '+%F %T')] \$d 同步失败 ❌" >> "\$LOG_FILE"
-        send_tg "⚠️ 定时任务 [${TASK_NAME}] 同步失败: \$d ❌"
-    fi
-done
-EOF
-
-    chmod +x "$SCRIPT_PATH"
-    (crontab -l 2>/dev/null | grep -v "$CRON_PREFIX$TASK_NAME"; echo "$cron_expr $SCRIPT_PATH $CRON_PREFIX$TASK_NAME") | crontab -
-    echo -e "${GREEN}任务 $TASK_NAME 已成功添加并注入 Crontab！${RESET}"
-}
-
-schedule_del_one() {
-    echo -e "${YELLOW}--- 正在检索本脚本生成的任务... ---${RESET}"
-    local count=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX" | wc -l)
-    if [ "$count" -eq 0 ]; then
-        echo -e "${YELLOW}未发现通过本脚本创建的 Rclone 定时任务。${RESET}"
-        return
-    fi
-
-    crontab -l 2>/dev/null | grep "$CRON_PREFIX" | awk -F "$CRON_PREFIX" '{print "● 可删除任务名: " $2}'
-    echo "---------------------------------------"
-    read -p "请输入你想精确删除的任务名称: " TASK_NAME
-    [ -z "$TASK_NAME" ] && return
-
-    crontab -l 2>/dev/null | grep -v "$CRON_PREFIX$TASK_NAME" | crontab -
-    rm -f "$SCRIPT_DIR/rclone_sync_${TASK_NAME}.sh"
-    echo -e "${GREEN}已成功移除任务: $TASK_NAME${RESET}"
-}
-
-cron_task_menu() {
-    while true; do
-        clear
-        show_cron_panel
-        read -p "$(echo -e ${GREEN}请输入定时任务选项数字: ${RESET})" choice_cron
         echo ""
-        case $choice_cron in
-            1) schedule_add ;;
-            2) schedule_del_one ;;
-            3) 
-                echo -e "${YELLOW}即将调用系统默认编辑器打开全局 Crontab。${RESET}"
-                read -p "按回车键开始编辑..."
-                crontab -e 
-                ;;
-            0) break ;;
-            *) echo -e "${RED}❌ 输入错误！${RESET}" ;;
-        esac
-        read -p "按回车键继续..."
-    done
+    fi
 }
 
-# ================== 手动同步功能 ==================
-sync_local_to_remote_multi() {
-    read -p "请输入本地目录路径（多个用空格分隔）: " local_dirs
-    [ -z "$local_dirs" ] && return
-    read -p "请输入Rclone创建的网盘名称: " remote
-    [ -z "$remote" ] && return
-    read -p "请输入远程目标目录(默认 backup): " remote_dir
-    remote_dir=${remote_dir:-backup}
+# 检查是否安装了 gproxy
+check_status() {
+    if command -v gproxy &> /dev/null; then
+        echo -e "${GREEN}[已安装]${NC}"
+    else
+        echo -e "${RED}[未安装]${NC}"
+    fi
+}
 
-    for d in $local_dirs; do
-        if [ ! -d "$d" ]; then
-            echo -e "${RED}目录不存在，跳过: $d${RESET}"
-            continue
-        fi
-        name=$(basename "$d")
-        target="${remote}:${remote_dir}/${name}"
-        LOG_FILE="$LOG_DIR/rclone_sync_${name}.log"
+# 获取当前本地端口
+get_current_port() {
+    local tunnel_path=$(get_tunnel_path)
+    if [ -n "$tunnel_path" ] && [ -f "$tunnel_path" ]; then
+        grep -E '^LOCAL_PORT=' "$tunnel_path" | cut -d'=' -f2
+    else
+        echo "19527"
+    fi
+}
 
-        echo -e "${YELLOW}正在同步: $d → $target ...${RESET}"
-        rclone sync "$d" "$target" -v -P 2>&1 | tee -a "$LOG_FILE"
-
-        if [ ${PIPESTATUS[0]} -eq 0 ]; then
-            echo "[ $(date '+%F %T') ] 同步完成 ✅" >> "$LOG_FILE"
-            send_tg "Rclone 同步完成: $d → $target ✅"
+# 检查并自动安装 Git 依赖
+check_git_dependency() {
+    if ! command -v git &> /dev/null; then
+        echo -e "${YELLOW}检测到系统未安装 Git，正在尝试自动安装...${NC}"
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get update && sudo apt-get install -y git
+        elif command -v yum &> /dev/null; then
+            sudo yum install -y git
+        elif command -v apk &> /dev/null; then
+            sudo apk add git
         else
-            echo "[ $(date '+%F %T') ] 同步失败 ❌" >> "$LOG_FILE"
-            send_tg "⚠️ Rclone 同步失败: $d → $target ❌"
+            echo -e "${RED}错误: 未找到系统包管理器，请手动安装 git 后再运行。${NC}"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# 检查并导入私钥
+handle_ssh_key_import() {
+    echo -e "\n${YELLOW}正在检查免密私钥...${NC}"
+    local key_path="$HOME/.ssh/vps_key"
+    if [ -f "$key_path" ]; then
+        mkdir -p config
+        cp "$key_path" config/
+        echo -e "${GREEN}自动发现并复制私钥 $key_path 到 config/ 目录${NC}"
+    else
+        read -p "未找到默认私钥，请手动输入私钥路径 (直接回车跳过): " custom_key
+        if [ -f "$custom_key" ]; then
+            mkdir -p config
+            cp "$custom_key" config/
+            echo -e "${GREEN}成功复制私钥 $custom_key 到 config/ 目录${NC}"
+        else
+            echo -e "${YELLOW}提示: 未放入私钥，稍后可在交互配置中手动指定。${NC}"
+        fi
+    fi
+}
+
+# 菜单头部
+show_header() {
+    clear
+    echo -e " ${GREEN}=======================================${NC}"
+    echo -e " ${GREEN}  ◈ GProxy - SSH 隧道网络加速工具 ◈    ${NC}"
+    echo -e " ${GREEN}=======================================${NC}"
+    echo -e " ${GREEN}当前状态:${NC} $(check_status)"
+    echo -e " ${GREEN}代理端口:${NC} ${YELLOW}($(get_current_port))${NC}"
+    echo -e " ${GREEN}=======================================${NC}"
+}
+
+# 1. 生成SSH密钥并打通免密
+prepare_ssh_key() {
+    echo -e "${YELLOW}[步骤 1/3] 正在国内服务器生成 SSH 密钥对...${NC}"
+    if [ -f "$HOME/.ssh/vps_key" ]; then
+        echo -e "${PURPLE}提示: 发现已存在密钥文件 ~/.ssh/vps_key，跳过生成。${NC}"
+    else
+        ssh-keygen -t rsa -b 4096 -f "$HOME/.ssh/vps_key" -N ""
+        echo -e "${GREEN}成功生成密钥: ~/.ssh/vps_key${NC}"
+    fi
+
+    echo -e "\n${YELLOW}[步骤 2/3] 将公钥复制到海外 VPS (请按提示操作)...${NC}"
+    read -p "请输入海外 VPS 的 IP 地址: " vps_ip
+    read -p "请输入海外 VPS 的 SSH 用户名 (默认 root): " vps_user
+    vps_user=${vps_user:-root}
+    read -p "请输入海外 VPS 的 SSH 端口 (默认 22): " vps_port
+    vps_port=${vps_port:-22}
+
+    echo -e "${BLUE}正在执行 ssh-copy-id，接下来请输入海外 VPS 的密码...${NC}"
+    ssh-copy-id -p "$vps_port" -i "$HOME/.ssh/vps_key.pub" "$vps_user@$vps_ip"
+
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}[OK] 公钥复制成功！${NC}"
+        echo -e "${YELLOW}[OK] 私钥文件路径:/root/.ssh/vps_key${NC}"
+        echo -e "\n${YELLOW}[步骤 3/3] 正在测试免密登录...${NC}"
+        echo -e "${GREEN}尝试不输入密码登录海外 VPS 并执行 'echo 连接成功'：${NC}"
+        ssh -p "$vps_port" -i "$HOME/.ssh/vps_key" -o PasswordAuthentication=no -o StrictHostKeyChecking=no "$vps_user@$vps_ip" "echo '🎉 [OK] 成功连接到海外 VPS，免密配置完美！'"
+    else
+        echo -e "${RED}[ERROR] 公钥复制失败，请检查网络或海外密码是否正确。${NC}"
+    fi
+
+    read -p "按回车键返回主菜单..." dummy
+}
+
+# 2. 全新下载并安装 (核心：多代理逐个尝试)
+install_gproxy() {
+    check_git_dependency || { read -p "按回车键返回主菜单..." dummy; return 1; }
+
+    if [ -d "$INSTALL_DIR" ]; then
+        echo -e "${RED}提示: 检测到目录 $INSTALL_DIR 已存在。${NC}"
+        echo -e "${YELLOW}全新安装需要清空该目录。如果您想保留配置并更新，请选择菜单中的 [更新] 选项。${NC}"
+        read -p "确定要清空该目录并重新安装吗？(y/n): " clean_confirm
+        if [[ "$clean_confirm" =~ ^[Yy]$ ]]; then
+            rm -rf "$INSTALL_DIR"
+        else
+            echo -e "${GREEN}已取消安装。${NC}"
+            read -p "按回车键返回主菜单..." dummy
+            return 0
+        fi
+    fi
+
+    local success=false
+    for url in "${GITHUB_PROXY[@]}"; do
+        if [ -z "$url" ]; then
+            echo -e "${YELLOW}正在尝试以 [直连模式] 克隆仓库...${NC}"
+        else
+            echo -e "${YELLOW}正在尝试通过代理 [ ${url} ] 克隆仓库...${NC}"
+        fi
+
+        if git clone "${url}https://github.com/xtianowner/gproxy-tool.git" "$INSTALL_DIR"; then
+            success=true
+            echo -e "${GREEN}✅ 克隆成功！${NC}"
+            break
+        else
+            echo -e "${RED}❌ 当前节点连接失败，正在尝试下一个...${NC}"
+            rm -rf "$INSTALL_DIR" 2>/dev/null
         fi
     done
-}
 
-sync_remote_to_local() {
-    read -p "请输入Rclone创建的网盘名称: " remote
-    [ -z "$remote" ] && return
-    read -p "请输入远程备份目录 (例如 backup): " remote_dir
-    read -p "请输入本地恢复目标目录: " local_dir
-    [ -z "$local_dir" ] && return
+    if [ "$success" = false ]; then
+        echo -e "${RED}❌ 抱歉，尝试了所有 GitHub 代理节点以及直连，均无法连接服务器。请检查您的网络设置！${NC}"
+        read -p "按回车键返回主菜单..." dummy
+        return 1
+    fi
+
+    cd "$INSTALL_DIR" || exit
+    handle_ssh_key_import
+
+    echo -e "\n${YELLOW}开始执行安装程序...${NC}"
+    sudo sh install.sh
     
-    mkdir -p "$local_dir"
-    rclone sync "${remote}:${remote_dir}" "$local_dir" -v -P
+    echo -e "${GREEN}🎉 GProxy 安装程序执行完毕！${NC}"
+    echo -e "${GREEN}🎉 首次运行请选择 4 配置${NC}"
+    read -p "按回车键返回主菜单..." dummy
 }
 
-# ================== 卸载全面清理 ==================
-uninstall_rclone() {
-    read -p "确定要彻底卸载 Rclone 及所有管理配置吗？(y/N): " SECURE_CONFIRM
-    [ "$SECURE_CONFIRM" != "y" ] && return
+# 3. 独立更新函数 (核心：多代理逐个尝试)
+update_gproxy() {
+    check_git_dependency || { read -p "按回车键返回主菜单..." dummy; return 1; }
 
-    echo -e "${YELLOW}正在全面清理 Rclone 环境与组件...${RESET}"
-    unmount_all
-    sudo rm -f /usr/bin/rclone /usr/local/bin/rclone
-    sudo rm -rf ~/.config/rclone
-    sudo rm -rf "$BASE_DIR"
+    if [ ! -d "$INSTALL_DIR" ]; then
+        echo -e "${RED}错误: 未找到克隆目录 $INSTALL_DIR，无法进行更新，请先执行全新安装！${NC}"
+        read -p "按回车键返回主菜单..." dummy
+        return 1
+    fi
 
-    echo -e "${GREEN}卸载完成！所有组件、挂载点及系统残留已清理。${RESET}"
-    exit 0
+    cd "$INSTALL_DIR" || exit
+    local success=false
+
+    for url in "${GITHUB_PROXY[@]}"; do
+        if [ -z "$url" ]; then
+            echo -e "${YELLOW}正在尝试以 [直连模式] 获取更新...${NC}"
+        else
+            echo -e "${YELLOW}正在尝试通过代理 [ ${url} ] 获取更新...${NC}"
+        fi
+
+        # 动态修改远程仓库地址，防止旧节点卡死
+        git remote set-url origin "${url}https://github.com/xtianowner/gproxy-tool.git"
+        
+        # 尝试拉取更新（设置15秒超时防止原生 git pull 无限挂起）
+        if git pull; then
+            success=true
+            echo -e "${GREEN}✅ 成功同步最新源码！${NC}"
+            break
+        else
+            echo -e "${RED}❌ 当前节点更新失败，正在尝试下一个...${NC}"
+        fi
+    done
+
+    if [ "$success" = false ]; then
+        echo -e "${RED}❌ 抱歉，所有代理节点更新失败，请稍后再试。${NC}"
+        read -p "按回车键返回主菜单..." dummy
+        return 1
+    fi
+
+    echo -e "\n${YELLOW}正在重新执行安装脚本以应用更新...${NC}"
+    sudo sh install.sh
+    
+    echo -e "${GREEN}🎉 GProxy 更新覆盖完毕！${NC}"
+    read -p "按回车键返回主菜单..." dummy
 }
 
-# ================== 主循环入口 ==================
+# 4. 首次运行 / 测试配置
+test_config() {
+    if ! command -v gproxy &> /dev/null; then
+        echo -e "${RED}错误: GProxy 未安装，请先执行安装！${NC}"
+    else
+        echo -e "${YELLOW}正在触发 GProxy 配置/测试命令...${NC}"
+        gproxy curl -I https://www.google.com
+    fi
+    read -p "按回车键返回主菜单..." dummy
+}
+
+# 5. 重新配置服务器
+reconfig_vps() {
+    if ! command -v gproxy &> /dev/null; then
+        echo -e "${RED}错误: GProxy 未安装！${NC}"
+    else
+        gproxy --config
+    fi
+    read -p "按回车键返回主菜单..." dummy
+}
+
+# 6. 修改本地代理端口
+change_port() {
+    local tunnel_path=$(get_tunnel_path)
+    if [ -z "$tunnel_path" ]; then
+        echo -e "${RED}错误: 未找到 tunnel.sh 脚本！请确保已执行安装。${NC}"
+    else
+        current_port=$(get_current_port)
+        echo -e "${YELLOW}目标文件: $tunnel_path${NC}"
+        echo -e "${YELLOW}当前本地代理端口为: ${GREEN}$current_port${NC}"
+        read -p "请输入新的端口号 (1024-65353): " new_port
+        if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1024 ] && [ "$new_port" -le 65353 ]; then
+            if [ -w "$tunnel_path" ]; then
+                sed -i "s/^LOCAL_PORT=.*/LOCAL_PORT=$new_port/" "$tunnel_path"
+            else
+                sudo sed -i "s/^LOCAL_PORT=.*/LOCAL_PORT=$new_port/" "$tunnel_path"
+            fi
+            echo -e "${GREEN}端口已成功修改为 $new_port !${NC}"
+        else
+            echo -e "${RED}输入无效，未做任何修改。${NC}"
+        fi
+    fi
+    read -p "按回车键返回主菜单..." dummy
+}
+
+# 7. 编辑配置文件
+edit_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        echo -e "${YELLOW}即将打开 $CONFIG_FILE ...${NC}"
+        nano "$CONFIG_FILE" || vim "$CONFIG_FILE" || vi "$CONFIG_FILE"
+    else
+        echo -e "${RED}配置文件不存在，请先运行一次配置。${NC}"
+    fi
+    read -p "按回车键返回主菜单..." dummy
+}
+
+# 8. 常用命令快捷查阅
+show_usage() {
+    clear
+    echo -e "${CYAN}==============================================${NC}"
+    echo -e "${GREEN}            GProxy 常用命令速查手册            ${NC}"
+    echo -e "${CYAN}==============================================${NC}"
+    echo -e "${YELLOW}1.Git加速:${NC}gproxy git clone https://github.com/... "
+    echo -e "${YELLOW}2.Docker加速:${NC}gproxy docker pull alpine:latest"
+    echo -e "${YELLOW}3.Python pip:${NC}gproxy pip install torch"
+    echo -e "${YELLOW}4.Node.js npm:${NC}gproxy npm install"
+    echo -e "${YELLOW}5.系统更新:${NC}gproxy bash -c \"apt update && apt install -y vim\""
+    echo -e "${YELLOW}6.下载文件:${NC}gproxy wget https://... 或 gproxy curl -O ..."
+    echo -e "${YELLOW}7.安装脚本:${NC}gproxy bash -c \"bash <(curl -sL https://...)\""
+    echo -e "${CYAN}==============================================${NC}"
+    read -p "按回车键返回主菜单..." dummy
+}
+
+# 9. 卸载
+uninstall_gproxy() {
+    echo -e "${RED}警告: 您确定要卸载 GProxy 吗？(y/n)${NC}"
+    read -p "> " confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        if [ -f "$INSTALL_DIR/uninstall.sh" ]; then
+            echo -e "${YELLOW}正在执行源码目录中的卸载程序...${NC}"
+            sudo sh "$INSTALL_DIR/uninstall.sh"
+        elif [ -f "/usr/lib/gproxy/uninstall.sh" ]; then
+            echo -e "${YELLOW}正在执行系统目录中的卸载程序...${NC}"
+            sudo sh /usr/lib/gproxy/uninstall.sh
+        else
+            echo -e "${YELLOW}未检测到标准的卸载脚本，尝试直接清理核心命令...${NC}"
+            sudo rm -f /usr/local/bin/gproxy /usr/bin/gproxy 2>/dev/null
+        fi
+
+        if [ -d "$INSTALL_DIR" ]; then
+            echo -e "${YELLOW}正在清理克隆目录: $INSTALL_DIR ...${NC}"
+            rm -rf "$INSTALL_DIR"
+            echo -e "${GREEN}源码目录清理完毕！${NC}"
+        fi
+        
+        echo -e "${GREEN}卸载流程执行完毕！${NC}"
+    else
+        echo -e "${GREEN}已取消卸载。${NC}"
+    fi
+    read -p "按回车键返回主菜单..." dummy
+}
+
+# 主循环
 while true; do
-    show_menu
-    read -p "$(echo -e ${GREEN}请输入选项数字: ${RESET})" choice
+    show_header
+    echo -e " ${GREEN}1. 生成SSH密钥并打通免密(可选)${NC}"
+    echo -e " ${GREEN}2. 全新安装GProxy${NC}"
+    echo -e " ${GREEN}3. 检查并同步更新GProxy${NC}"
+    echo -e " ${GREEN}4. 首次配置/测试Google连通性${NC}"
+    echo -e " ${GREEN}5. 重新配置服务器信息${NC}"
+    echo -e " ${GREEN}6. 修改本地代理端口${NC}"
+    echo -e " ${GREEN}7. 手动编辑配置文件(多VPS切换)${NC}"
+    echo -e " ${GREEN}8. 查看常用命令使用示例${NC}"
+    echo -e " ${GREEN}9. 卸载 GProxy${NC}"
+    echo -e " ${GREEN}0. 退出${NC}"
+    echo -e " ${GREEN}=======================================${NC}"
+    read -p "$(echo -e "${GREEN}请输入数字选择操作: ${NC}")" choice
+
     case $choice in
-        1) install_rclone ;;
-        2) update_rclone ;;
-        3) config_rclone ;;
-        4) list_remotes ;;
-        5) list_files_remote ;;
-        6) mount_remote ;;
-        7) show_assets_manifest ;;
-        8) unmount_remote_by_name ;;
-        9) unmount_all ;;
-        10) view_mount_status ;;
-        11) view_mount_logs ;;
-        12) sync_local_to_remote_multi ;;
-        13) sync_remote_to_local ;;
-        14) cron_task_menu ;;
-        15) modify_tg ;;
-        16) uninstall_rclone ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}输入错误，请输入菜单中的有效数字！${RESET}" ;;
+        1) prepare_ssh_key ;;
+        2) install_gproxy ;;
+        3) update_gproxy ;;
+        4) test_config ;;
+        5) reconfig_vps ;;
+        6) change_port ;;
+        7) edit_config ;;
+        8) show_usage ;;
+        9) uninstall_gproxy ;;
+        0) clear; exit 0 ;;
+        *) echo -e "${RED}无效输入，请重新选择！${NC}"; sleep 1 ;;
     esac
-    read -r -p "按回车键继续..."
 done

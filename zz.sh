@@ -1,279 +1,423 @@
 #!/bin/bash
+# ========================================
+# Docker 自动更新管理器
+# 功能：
+#   ✅ 运行即安装到 /root/dockerupdate.sh 并赋权限
+#   ✅ 定时任务调用固定脚本路径 /root/dockerupdate.sh
+#   ✅ 日志 /var/log/docker-update.log
+#   ✅ Telegram 成功/失败通知
+#   ✅ 手动更新、一键更新、自定义文件夹更新
+#   ✅ 添加/删除普通项目和自定义文件夹定时任务
+#   ✅ 卸载管理器（删除脚本+定时任务）
+# 使用：
+#   手动执行管理器: ./dockerupdate.sh
+#   定时任务: /root/dockerupdate.sh /项目路径 项目名称
+# ========================================
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-NC='\033[0m' # 无颜色
+SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/zz.sh"
+SCRIPT_PATH="/root/dockerupdate.sh"
+CRON_TAG="# docker-project-update"
 
-# 脚本路径与代理定义
-GH_PROXY="https://v6.gh-proxy.org/"
-INSTALL_DIR="$HOME/gproxy-tool"
-CONFIG_FILE="$HOME/.config/gproxy/config.env"
+GREEN="\033[32m"
+RED="\033[31m"
+RESET="\033[0m"
 
-# 动态获取 tunnel.sh 路径（优先系统路径，其次克隆路径）
-get_tunnel_path() {
-    if [ -f "/usr/lib/gproxy/lib/tunnel.sh" ]; then
-        echo "/usr/lib/gproxy/lib/tunnel.sh"
-    elif [ -f "$INSTALL_DIR/lib/tunnel.sh" ]; then
-        echo "$INSTALL_DIR/lib/tunnel.sh"
+PROJECTS_DIR="/opt"
+CONF_FILE="/etc/docker-update.conf"
+LOG_FILE="/var/log/docker-update.log"
+
+# ========================================
+# 自动下载安装管理器
+# ========================================
+if [ ! -f "$SCRIPT_PATH" ]; then
+    curl -sL "$SCRIPT_URL" -o "$SCRIPT_PATH"
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 安装失败，请检查网络或 URL${RESET}"
+        exit 1
+    fi
+    chmod +x "$SCRIPT_PATH"
+fi
+
+# ========================================
+# 卸载管理器函数
+# ========================================
+uninstall_manager() {
+    echo -e "${RED}正在卸载管理器...${RESET}"
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+    echo -e "${GREEN}✅ 已删除所有 Docker 定时任务${RESET}"
+    [ -f "$SCRIPT_PATH" ] && rm -f "$SCRIPT_PATH" && echo -e "${GREEN}✅ 已删除管理器脚本${RESET}"
+    echo -e "${GREEN}卸载完成${RESET}"
+    exit 0
+}
+
+# ========================================
+# 配置与 Telegram 功能
+# ========================================
+init_conf() {
+    [ -f "$CONF_FILE" ] && return
+cat > "$CONF_FILE" <<EOF
+BOT_TOKEN=""
+CHAT_ID=""
+SERVER_NAME=""
+ONLY_RUNNING=true
+EOF
+}
+
+load_conf() {
+    [ -f "$CONF_FILE" ] && source "$CONF_FILE"
+    [ -z "$SERVER_NAME" ] && SERVER_NAME=$(hostname)
+}
+
+tg_send() {
+    load_conf
+    [ -z "$BOT_TOKEN" ] && return
+    [ -z "$CHAT_ID" ] && return
+    curl -s \
+        "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        -d chat_id="$CHAT_ID" \
+        -d text="$1" \
+        -d parse_mode="HTML" >/dev/null 2>&1
+}
+
+set_tg() {
+    read -p "BOT_TOKEN: " token
+    read -p "CHAT_ID: " chat
+    read -p "服务器名称(可留空用hostname): " server
+cat > "$CONF_FILE" <<EOF
+BOT_TOKEN="$token"
+CHAT_ID="$chat"
+SERVER_NAME="$server"
+ONLY_RUNNING=true
+EOF
+    echo -e "${GREEN}保存成功${RESET}"
+    read
+}
+
+# ========================================
+# 定时任务执行逻辑
+# ========================================
+run_update() {
+    PROJECT_DIR="$1"
+    PROJECT_NAME="$2"
+    load_conf
+    SERVER=${SERVER_NAME:-$(hostname)}
+
+    [ ! -d "$PROJECT_DIR" ] && echo "$(date '+%F %T') $PROJECT_NAME 目录不存在" | tee -a "$LOG_FILE" && return
+    [ ! -f "$PROJECT_DIR/docker-compose.yml" ] && echo "$(date '+%F %T') $PROJECT_NAME docker-compose.yml 不存在" | tee -a "$LOG_FILE" && return
+
+    cd "$PROJECT_DIR" || return
+    [ ! -f "$LOG_FILE" ] && touch "$LOG_FILE"
+
+    running=$(docker compose ps -q)
+    if [ "$running" != "" ]; then
+        echo -e "${GREEN}🚀 开始更新 $PROJECT_NAME ...${RESET}"
+        if docker compose pull 2>&1 | tee -a "$LOG_FILE" && docker compose up -d 2>&1 | tee -a "$LOG_FILE"; then
+            tg_send "🚀 <b>Docker 自动更新</b>%0A服务器: $SERVER%0A项目: $PROJECT_NAME%0A时间: $(date '+%F %T')%0A状态: ✅ 成功"
+            echo "$(date '+%F %T') $PROJECT_NAME 更新成功" | tee -a "$LOG_FILE"
+        else
+            tg_send "🚀 <b>Docker 自动更新</b>%0A服务器: $SERVER%0A项目: $PROJECT_NAME%0A时间: $(date '+%F %T')%0A状态: ❌ 失败"
+            echo "$(date '+%F %T') $PROJECT_NAME 更新失败" | tee -a "$LOG_FILE"
+        fi
+        echo -e "${GREEN}✅ $PROJECT_NAME 更新完成${RESET}"
     else
-        echo ""
+        echo "$(date '+%F %T') $PROJECT_NAME 未运行" | tee -a "$LOG_FILE"
     fi
 }
 
-# 检查是否安装了 gproxy
-check_status() {
-    if command -v gproxy &> /dev/null; then
-        echo -e "${GREEN}[已安装]${NC}"
-    else
-        echo -e "${RED}[未安装]${NC}"
-    fi
+
+# ========================================
+# 定时任务模式
+# ========================================
+if [ -n "$1" ] && [ -n "$2" ]; then
+    run_update "$1" "$2"
+    exit 0
+fi
+
+# ========================================
+# 项目扫描与选择
+# ========================================
+scan_projects() {
+    mapfile -t PROJECTS < <(
+        find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -type f -name docker-compose.yml \
+        -exec dirname {} \; | sort
+    )
 }
 
-# 获取当前本地端口
-get_current_port() {
-    local tunnel_path=$(get_tunnel_path)
-    if [ -n "$tunnel_path" ] && [ -f "$tunnel_path" ]; then
-        grep -E '^LOCAL_PORT=' "$tunnel_path" | cut -d'=' -f2
-    else
-        echo "19527"
+choose_project() {
+    scan_projects
+    if [ ${#PROJECTS[@]} -eq 0 ]; then
+        echo -e "${RED}未找到 docker-compose 项目${RESET}"
+        sleep 2
+        return 1
     fi
-}
-
-# 菜单头部
-show_header() {
     clear
-    echo -e " ${GREEN}===============================${NC}"
-    echo -e " ${GREEN}◈GProxy -SSH 隧道网络加速工具◈ ${NC}"
-    echo -e " ${GREEN}===============================${NC}"
-    echo -e " ${GREEN}当前状态:${NC} $(check_status)"
-    echo -e " ${GREEN}代理端口:${NC} ${YELLOW}$(get_current_port)${NC}"
-    echo -e " ${GREEN}===============================${NC}"
+    echo -e "${GREEN}=== 请选择项目 ===${RESET}"
+    for i in "${!PROJECTS[@]}"; do
+        echo -e "${GREEN}$((i+1))) $(basename "${PROJECTS[$i]}")${RESET}"
+    done
+    echo -e "${GREEN}0) 返回${RESET}"
+    read -p "$(echo -e ${GREEN}请输入编号:${RESET}) " n
+    [[ "$n" == "0" ]] && return 1
+    PROJECT_DIR="${PROJECTS[$((n-1))]}"
+    PROJECT_NAME=$(basename "$PROJECT_DIR")
 }
 
-# 安装准备（生成并配置 SSH 密钥）
-prepare_ssh_key() {
-    echo -e "${YELLOW}[步骤 1/3] 正在国内服务器生成 SSH 密钥对...${NC}"
-    if [ -f "$HOME/.ssh/vps_key" ]; then
-        echo -e "${PURPLE}提示: 发现已存在密钥文件 ~/.ssh/vps_key，跳过生成。${NC}"
+choose_time() {
+    echo
+    echo -e "${GREEN}1) 每日更新${RESET}"
+    echo -e "${GREEN}2) 每周更新${RESET}"
+    echo -e "${GREEN}3) 自定义 cron${RESET}"
+    read -p "$(echo -e ${GREEN}选择:${RESET}) " mode
+    if [ "$mode" = "1" ]; then
+        read -p "几点执行(默认0): " hour
+        hour=${hour:-0}
+        CRON_EXP="0 $hour * * *"
+    elif [ "$mode" = "2" ]; then
+        read -p "几点执行(默认0): " hour
+        hour=${hour:-0}
+        echo "0=周日 1=周一 ... 6=周六"
+        read -p "星期(默认1): " week
+        week=${week:-1}
+        CRON_EXP="0 $hour * * $week"
     else
-        ssh-keygen -t rsa -b 4096 -f "$HOME/.ssh/vps_key" -N ""
-        echo -e "${GREEN}成功生成密钥: ~/.ssh/vps_key${NC}"
+        echo "示例: */30 * * * *"
+        read -p "请输入完整 cron: " CRON_EXP
     fi
-
-    echo -e "\n${YELLOW}[步骤 2/3] 将公钥复制到海外 VPS (请按提示操作)...${NC}"
-    read -p "请输入海外 VPS 的 IP 地址: " vps_ip
-    read -p "请输入海外 VPS 的 SSH 用户名 (默认 root): " vps_user
-    vps_user=${vps_user:-root}
-    read -p "请输入海外 VPS 的 SSH 端口 (默认 22): " vps_port
-    vps_port=${vps_port:-22}
-
-    echo -e "${BLUE}正在执行 ssh-copy-id，接下来请输入海外 VPS 的密码...${NC}"
-    ssh-copy-id -p "$vps_port" -i "$HOME/.ssh/vps_key.pub" "$vps_user@$vps_ip"
-
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}[OK] 公钥复制成功！${NC}"
-        echo -e "\n${YELLOW}[步骤 3/3] 正在测试免密登录...${NC}"
-        echo -e "${BLUE}尝试不输入密码登录海外 VPS 并执行 'echo 连接成功'：${NC}"
-        ssh -p "$vps_port" -i "$HOME/.ssh/vps_key" -o PasswordAuthentication=no -o StrictHostKeyChecking=no "$vps_user@$vps_ip" "echo '🎉 [OK] 成功连接到海外 VPS，免密配置完美！'"
-    else
-        echo -e "${RED}[ERROR] 公钥复制失败，请检查网络或海外密码是否正确。${NC}"
-    fi
-
-    read -p "按回车键返回主菜单..." dummy
 }
 
-# 1. 下载并安装 (已集成 gh-proxy 代理)
-install_gproxy() {
-
-    # 自动检测并安装 Git 依赖（完美兼容 apk）
-    if ! command -v git &> /dev/null; then
-        echo -e "${YELLOW}检测到系统未安装 Git，正在尝试自动安装...${NC}"
-        if command -v apt-get &> /dev/null; then
-            sudo apt-get update && sudo apt-get install -y git
-        elif command -v yum &> /dev/null; then
-            sudo yum install -y git
-        elif command -v apk &> /dev/null; then
-            sudo apk add git
-        else
-            echo -e "${RED}错误: 未找到系统包管理器，请手动安装 git 后再运行此选项。${NC}"
-            read -p "按回车键返回主菜单..." dummy
-            return 1
-        fi
-    fi
-
-    echo -e "${YELLOW}[1/3] 正在通过 gh-proxy 代理克隆仓库...${NC}"
-    echo -e "${BLUE}代理节点: ${GH_PROXY}${NC}"
-    
-    if [ -d "$INSTALL_DIR" ]; then
-        echo -e "${YELLOW}目录 $INSTALL_DIR 已存在，正在尝试更新...${NC}"
-        cd "$INSTALL_DIR" || exit
-        git remote set-url origin "${GH_PROXY}https://github.com/xtianowner/gproxy-tool.git"
-        git pull
-    else
-        git clone "${GH_PROXY}https://github.com/xtianowner/gproxy-tool.git" "$INSTALL_DIR"
-    fi
-
-    cd "$INSTALL_DIR" || exit
-
-    echo -e "\n${YELLOW}[2/3] 正在检查免密私钥...${NC}"
-    key_path="$HOME/.ssh/vps_key"
-    if [ -f "$key_path" ]; then
-        mkdir -p config
-        cp "$key_path" config/
-        echo -e "${GREEN}自动发现并复制私钥 $key_path 到 config/ 目录${NC}"
-    else
-        read -p "未找到默认私钥，请手动输入私钥路径 (直接回车跳过): " custom_key
-        if [ -f "$custom_key" ]; then
-            mkdir -p config
-            cp "$custom_key" config/
-            echo -e "${GREEN}成功复制私钥 $custom_key 到 config/ 目录${NC}"
-        else
-            echo -e "${YELLOW}提示: 未放入私钥，稍后可在交互配置中手动指定。${NC}"
-        fi
-    fi
-
-    echo -e "\n${YELLOW}[3/3] 开始安装...${NC}"
-    sudo sh install.sh
-    
-    echo -e "${GREEN}安装程序执行完毕！${NC}"
-    read -p "按回车键返回主菜单..." dummy
+# ========================================
+# 定时任务添加/删除
+# ========================================
+add_update() {
+    choose_project || return
+    choose_time
+    (crontab -l 2>/dev/null | grep -v "$CRON_TAG-$PROJECT_NAME";
+     echo "$CRON_EXP $SCRIPT_PATH $PROJECT_DIR $PROJECT_NAME $CRON_TAG-$PROJECT_NAME") | crontab -
+    echo -e "${GREEN}✅ 已添加 $PROJECT_NAME 定时更新 ($CRON_EXP)${RESET}"
+    read
 }
 
-# 2. 首次运行 / 测试配置
-test_config() {
-    if ! command -v gproxy &> /dev/null; then
-        echo -e "${RED}错误: GProxy 未安装，请先执行安装！${NC}"
-    else
-        echo -e "${YELLOW}正在触发 GProxy 配置/测试命令...${NC}"
-        gproxy curl -I https://www.google.com
-    fi
-    read -p "按回车键返回主菜单..." dummy
+remove_update() {
+    choose_project || return
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG-$PROJECT_NAME" | crontab -
+    echo -e "${RED}已删除 $PROJECT_NAME 定时更新${RESET}"
+    read
 }
 
-# 3. 重新配置服务器
-reconfig_vps() {
-    if ! command -v gproxy &> /dev/null; then
-        echo -e "${RED}错误: GProxy 未安装！${NC}"
-    else
-        gproxy --config
-    fi
-    read -p "按回车键返回主菜单..." dummy
-}
-
-# 4. 修改本地代理端口
-change_port() {
-    local tunnel_path=$(get_tunnel_path)
-    if [ -z "$tunnel_path" ]; then
-        echo -e "${RED}错误: 未找到 tunnel.sh 脚本！请确保已执行选项 1 克隆或安装。${NC}"
-    else
-        current_port=$(get_current_port)
-        echo -e "${YELLOW}目标文件: $tunnel_path${NC}"
-        echo -e "${YELLOW}当前本地代理端口为: ${GREEN}$current_port${NC}"
-        read -p "请输入新的端口号 (1024-65353): " new_port
-        if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1024 ] && [ "$new_port" -le 65353 ]; then
-            if [ -w "$tunnel_path" ]; then
-                sed -i "s/^LOCAL_PORT=.*/LOCAL_PORT=$new_port/" "$tunnel_path"
-            else
-                sudo sed -i "s/^LOCAL_PORT=.*/LOCAL_PORT=$new_port/" "$tunnel_path"
-            fi
-            echo -e "${GREEN}端口已成功修改为 $new_port !${NC}"
-        else
-            echo -e "${RED}输入无效，未做任何修改。${NC}"
-        fi
-    fi
-    read -p "按回车键返回主菜单..." dummy
-}
-
-# 5. 编辑配置文件
-edit_config() {
-    if [ -f "$CONFIG_FILE" ]; then
-        echo -e "${YELLOW}即将打开 $CONFIG_FILE ...${NC}"
-        nano "$CONFIG_FILE" || vim "$CONFIG_FILE" || vi "$CONFIG_FILE"
-    else
-        echo -e "${RED}配置文件不存在，请先运行一次配置（选项 2）。${NC}"
-    fi
-    read -p "按回车键返回主菜单..." dummy
-}
-
-# 6. 常用命令快捷查阅
-show_usage() {
+list_update() {
     clear
-    echo -e "${CYAN}==============================================${NC}"
-    echo -e "${GREEN}            GProxy 常用命令速查手册          ${NC}"
-    echo -e "${CYAN}==============================================${NC}"
-    echo -e "${YELLOW}1.Git加速:${NC}    gproxy git clone https://github.com/... "
-    echo -e "${YELLOW}2.Docker加速:${NC} gproxy docker pull alpine:latest"
-    echo -e "${YELLOW}3.Python pip:${NC} gproxy pip install torch"
-    echo -e "${YELLOW}4.Node.js npm:${NC}gproxy npm install"
-    echo -e "${YELLOW}5.系统更新:${NC}  gproxy bash -c \"apt update && apt install -y vim\""
-    echo -e "${YELLOW}6.下载文件:${NC}  gproxy wget https://... 或 gproxy curl -O ..."
-    echo -e "${YELLOW}7.复合安装脚本:${NC}gproxy bash -c \"bash <(curl -sL https://...)\""
-    echo -e "${CYAN}==============================================${NC}"
-    read -p "按回车键返回主菜单..." dummy
-}
-
-# 7. 卸载 (增强兼容性与源码清理)
-uninstall_gproxy() {
-    echo -e "${RED}警告: 您确定要卸载 GProxy 吗？(y/n)${NC}"
-    read -p "> " confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        # 1. 优先调用克隆目录中的卸载脚本
-        if [ -f "$INSTALL_DIR/uninstall.sh" ]; then
-            echo -e "${YELLOW}正在执行源码目录中的卸载程序...${NC}"
-            sudo sh "$INSTALL_DIR/uninstall.sh"
-        # 2. 其次调用系统目录中的卸载脚本
-        elif [ -f "/usr/lib/gproxy/uninstall.sh" ]; then
-            echo -e "${YELLOW}正在执行系统目录中的卸载程序...${NC}"
-            sudo sh /usr/lib/gproxy/uninstall.sh
-        else
-            echo -e "${YELLOW}未检测到标准的卸载脚本，尝试直接清理核心命令...${NC}"
-            sudo rm -f /usr/local/bin/gproxy /usr/bin/gproxy 2>/dev/null
-        fi
-
-        # 3. 卸载完后，连带清理 /root/gproxy-tool 源码目录
-        if [ -d "$INSTALL_DIR" ]; then
-            echo -e "${YELLOW}正在清理克隆目录: $INSTALL_DIR ...${NC}"
-            rm -rf "$INSTALL_DIR"
-            echo -e "${GREEN}源码目录清理完毕！${NC}"
-        fi
+    echo -e "${GREEN}==================================================${RESET}"
+    echo -e "${GREEN}             📂 当前生效的 Docker 定时更新任务      ${RESET}"
+    echo -e "${GREEN}==================================================${RESET}"
+    
+    # 获取属于管理器的 crontab 任务
+    cron_items=$(crontab -l 2>/dev/null | grep "$CRON_TAG")
+    
+    if [ -z "$cron_items" ]; then
+        echo -e "${RED}❌ 暂无任何自动更新任务。${RESET}"
+    else
+        echo -e " 状态   | 运行周期 (Cron)      | 项目名称 --> 路径"
+        echo -e "--------------------------------------------------"
         
-        echo -e "${GREEN}卸载流程执行完毕！${NC}"
-    else
-        echo -e "${GREEN}已取消卸载。${NC}"
+        # 逐行解析并高亮打印
+        echo "$cron_items" | while read -r line; do
+            # 提取 cron 表达式（前5个字段）
+            cron_exp=$(echo "$line" | awk '{print $1,$2,$3,$4,$5}')
+            # 提取项目路径和名称
+            p_path=$(echo "$line" | awk '{print $7}')
+            p_name=$(echo "$line" | awk '{print $8}')
+            
+            # 美化输出
+            printf " [${GREEN}启用${RESET}]  | %-20s | ${GREEN}%-12s${RESET} --> %s\n" "$cron_exp" "$p_name" "$p_path"
+        done
+        
+        echo -e "--------------------------------------------------"
+        echo -e "💡 ${GREEN}提示格式：分 时 日 月 周 | 脚本路径 项目路径 项目名${RESET}"
     fi
-    read -p "按回车键返回主菜单..." dummy
+    
+    echo -e "${GREEN}==================================================${RESET}"
+    echo
+    
+    # 顺便展示最后 3 条日志，方便一眼看出最近有没有正常跑
+    if [ -f "$LOG_FILE" ] && [ -s "$LOG_FILE" ]; then
+        echo -e "${GREEN}📋 最近 3 条更新日志记录：${RESET}"
+        tail -n 3 "$LOG_FILE"
+        echo
+    fi
+    
+    read -p "按回车键返回主菜单..."
 }
 
-# 主循环
-while true; do
-    show_header
-    echo -e " ${GREEN}1. 生成SSH密钥并打通免密(可选)${NC}"
-    echo -e " ${GREEN}2. 安装GProxy${NC}"
-    echo -e " ${GREEN}3. 首次配置/测试Google连通性${NC}"
-    echo -e " ${GREEN}4. 重新配置服务器信息${NC}"
-    echo -e " ${GREEN}5. 修改本地代理端口${NC}"
-    echo -e " ${GREEN}6. 手动编辑配置文件(多VPS切换)${NC}"
-    echo -e " ${GREEN}7. 查看常用命令使用示例"
-    echo -e " ${GREEN}8. 卸载 GProxy${NC}"
-    echo -e " ${GREEN}0. 退出${NC}"
-    echo -e " ${GREEN}===============================${NC}"
-    read -p "$(echo -e "${GREEN}请输入数字选择操作: ${NC}")" choice
+# 用于在主菜单内渲染任务看板的函数
+show_menu_cron_board() {
+    cron_items=$(crontab -l 2>/dev/null | grep "$CRON_TAG")
+    echo -e "${GREEN}📅 [当前生效的定时更新任务]${RESET}"
+    if [ -z "$cron_items" ]; then
+        echo -e "   暂无任何定时任务"
+    else
+        echo "$cron_items" | while read -r line; do
+            cron_exp=$(echo "$line" | awk '{print $1,$2,$3,$4,$5}')
+            p_name=$(echo "$line" | awk '{print $8}')
+            printf "   🔹 %-12s | 周期: %-15s\n" "$p_name" "$cron_exp"
+        done
+    fi
+}
 
+run_now() {
+    choose_project || return
+    run_update "$PROJECT_DIR" "$PROJECT_NAME"
+    read -p "$(echo -e ${GREEN}回车继续...${RESET})"
+}
+
+update_all() {
+    scan_projects
+    for dir in "${PROJECTS[@]}"; do
+        name=$(basename "$dir")
+        run_update "$dir" "$name"
+    done
+    read -p "$(echo -e ${GREEN}回车继续...${RESET})"
+}
+
+
+custom_folder_update() {
+    read -p "$(echo -e ${GREEN}请输入要更新的文件夹路径: ${RESET})" CUSTOM_DIR
+    [ ! -d "$CUSTOM_DIR" ] && { echo -e "${RED}❌ 文件夹不存在${RESET}"; read; return; }
+    [ ! -f "$CUSTOM_DIR/docker-compose.yml" ] && { echo -e "${RED}❌ docker-compose.yml 不存在${RESET}"; read; return; }
+    PROJECT_NAME=$(basename "$CUSTOM_DIR")
+    run_update "$CUSTOM_DIR" "$PROJECT_NAME"
+    read -p "$(echo -e ${GREEN}回车继续...${RESET})"
+}
+
+
+add_custom_update() {
+    read -p "$(echo -e ${GREEN}请输入要添加定时更新的文件夹路径: ${RESET})" CUSTOM_DIR
+    [ ! -d "$CUSTOM_DIR" ] && { echo -e "${RED}❌ 文件夹不存在${RESET}"; read; return; }
+    [ ! -f "$CUSTOM_DIR/docker-compose.yml" ] && { echo -e "${RED}❌ docker-compose.yml 不存在${RESET}"; read; return; }
+    PROJECT_NAME=$(basename "$CUSTOM_DIR")
+    choose_time
+    (crontab -l 2>/dev/null | grep -v "$CRON_TAG-$PROJECT_NAME";
+     echo "$CRON_EXP $SCRIPT_PATH $CUSTOM_DIR $PROJECT_NAME $CRON_TAG-$PROJECT_NAME") | crontab -
+    echo -e "${GREEN}✅ 已添加 $PROJECT_NAME 自定义文件夹定时更新 ($CRON_EXP)${RESET}"
+    read
+}
+
+remove_custom_update() {
+    read -p "$(echo -e ${GREEN}请输入要删除定时更新的文件夹路径: ${RESET})" CUSTOM_DIR
+    [ ! -d "$CUSTOM_DIR" ] && { echo -e "${RED}❌ 文件夹不存在${RESET}"; read; return; }
+    PROJECT_NAME=$(basename "$CUSTOM_DIR")
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG-$PROJECT_NAME" | crontab -
+    echo -e "${RED}已删除 $PROJECT_NAME 自定义文件夹定时更新${RESET}"
+    read
+}
+
+delete_log() {
+    [ -f "$LOG_FILE" ] && rm -f "$LOG_FILE"
+    echo -e "${RED}✅ 日志已删除${RESET}"
+    read
+}
+
+add_all_updates() {
+    scan_projects
+    if [ ${#PROJECTS[@]} -eq 0 ]; then
+        echo -e "${RED}未找到 docker-compose 项目${RESET}"
+        read
+        return
+    fi
+
+    echo -e "${GREEN}=== 扫描到项目列表 ===${RESET}"
+    for dir in "${PROJECTS[@]}"; do
+        echo "- $(basename "$dir")"
+    done
+
+    choose_time  # 统一选择 cron 时间
+
+    for dir in "${PROJECTS[@]}"; do
+        name=$(basename "$dir")
+        # 添加到 crontab
+        (crontab -l 2>/dev/null | grep -v "$CRON_TAG-$name";
+         echo "$CRON_EXP $SCRIPT_PATH $dir $name $CRON_TAG-$name") | crontab -
+        echo -e "${GREEN}✅ 已添加 $name 定时更新 ($CRON_EXP)${RESET}"
+    done
+    read -p "$(echo -e ${GREEN}回车继续...${RESET})"
+}
+
+remove_all_updates() {
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+    echo -e "${RED}✅ 已删除所有 Docker 定时任务${RESET}"
+    read -p "$(echo -e ${GREEN}回车继续...${RESET})"
+}
+
+# ========================================
+# 管理器自更新（极简覆盖版）
+# ========================================
+self_update() {
+    load_conf
+    SERVER=${SERVER_NAME:-$(hostname)}
+
+    echo -e "${GREEN}🚀 正在更新管理器...${RESET}"
+
+    TMP=$(mktemp)
+
+    if ! curl -fsSL "$SCRIPT_URL" -o "$TMP"; then
+        echo -e "${RED}❌ 下载失败${RESET}"
+        return
+    fi
+
+    chmod +x "$TMP"
+    mv -f "$TMP" "$SCRIPT_PATH"
+
+    tg_send "🚀 <b>Docker 管理器已更新</b>%0A服务器: $SERVER%0A时间: $(date '+%F %T')"
+
+    echo -e "${GREEN}✅ 更新完成，重新启动...${RESET}"
+
+    exec "$SCRIPT_PATH"
+}
+
+# ========================================
+# 主菜单
+# ========================================
+init_conf
+while true; do
+    clear
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}  ◈    Docker 自动更新管理器    ◈   ${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    show_menu_cron_board
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN} 1) 添加项目自动更新${RESET}"
+    echo -e "${GREEN} 2) 删除项目更新任务${RESET}"
+    echo -e "${GREEN} 3) 查看所有更新任务${RESET}"
+    echo -e "${GREEN} 4) 立即更新单个项目${RESET}"
+    echo -e "${GREEN} 5) 设置 Telegram & 服务器名称(可选)${RESET}"
+    echo -e "${GREEN} 6) 一键更新全部项目${RESET}"
+    echo -e "${GREEN} 7) 自定义文件夹手动更新${RESET}"
+    echo -e "${GREEN} 8) 自定义文件夹定时更新${RESET}"
+    echo -e "${GREEN} 9) 删除自定义文件夹定时更新${RESET}"
+    echo -e "${GREEN}10) 全部添加定时任务${RESET}"
+    echo -e "${GREEN}11) 全部删除定时任务${RESET}"
+    echo -e "${GREEN}12) 删除日志文件${RESET}"
+    echo -e "${GREEN}13) 更新管理器${RESET}"
+    echo -e "${GREEN}14) 卸载管理器${RESET}"
+    echo -e "${GREEN} 0) 退出${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
     case $choice in
-        1) prepare_ssh_key ;;
-        2) install_gproxy ;;
-        3) test_config ;;
-        4) reconfig_vps ;;
-        5) change_port ;;
-        6) edit_config ;;
-        7) show_usage ;;
-        8) uninstall_gproxy ;;
-        0) clear; exit 0 ;;
-        *) echo -e "${RED}无效输入，请重新选择！${NC}"; sleep 1 ;;
+        1) add_update ;;
+        2) remove_update ;;
+        3) list_update ;;
+        4) run_now ;;
+        5) set_tg ;;
+        6) update_all ;;
+        7) custom_folder_update ;;
+        8) add_custom_update ;;
+        9) remove_custom_update ;;
+        10) add_all_updates ;;
+        11) remove_all_updates ;;
+        12) delete_log ;;
+        13) self_update ;;
+        14) uninstall_manager ;;
+    
+        0) exit 0 ;;
     esac
 done

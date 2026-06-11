@@ -1,502 +1,442 @@
-#!/usr/bin/sh
+#!/bin/sh
+set -e
 
-# =============================================================================
-#  MicaProxy Alpine Linux 专属多实例管理面板 (OpenRC + wget 专属版)
-# =============================================================================
+# ================== 颜色与输出函数 ==================
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+RESET="\033[0m"
 
-# ── 核心路径与环境变量 ────────────────────────────────────────────────────────
-export REPO="judy-gotv/Rust-SOCKS5-HTTP"
-export BIN_PATH="/opt/MicaProxy/MicaProxy"
-export INSTANCE_DIR="/etc/MicaProxy"
-export DATA_DIR="/var/lib/micaproxy"
-export LOG_DIR="/opt/MicaProxy/log"
+_ok()   { echo -e "${GREEN}[OK] $1${RESET}"; }
+_warn() { echo -e "${YELLOW}[WARN] $1${RESET}"; }
+_err()  { echo -e "${RED}[ERROR] $1${RESET}"; return 1; }
+_info() { echo -e "${GREEN}[INFO] $1${RESET}"; }
 
-# 默认控制的目标实例名称自动改成当前主机名
-CURRENT_INSTANCE="$(hostname)"
+# ================== 变量 ==================
+SNELL_DIR="/etc/snell"
+SNELL_CONFIG="$SNELL_DIR/snell-server.conf"
+SNELL_RC_SERVICE="/etc/init.d/snell"
+SNELL_LOG="/var/log/snell.log"
+LOG_FILE="/var/log/snell_manager.log"
+SNELL_DEFAULT_VERSION="5.0.1"
 
-# ── 终端颜色定义 ─────────────────────────────────────
-export RESET='\033[0m'
-export GREEN='\033[0;32m'
-export YELLOW='\033[0;33m'
-export RED='\033[0;31m'
-export BLUE='\033[0;34m'
-export CYAN='\033[0;36m'
-
-GITHUB_PROXIES=(
-    ""
-    "https://gh-proxy.com/"
-    "https://proxy.vvvv.ee/"
-    "https://v6.gh-proxy.org/"
-    "https://ghproxy.lvedong.eu.org/"
-    "https://hub.glowp.xyz/"
-)
-
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}[错误]${RESET} 请使用 root 权限运行此脚本！" >&2
-    exit 1
-fi
-
-info() { echo -e "${BLUE}[INFO]${RESET} $1"; }
-ok()   { echo -e "${GREEN}[OK]${RESET} $1"; }
-warn() { echo -e "${YELLOW}[WARN]${RESET} $1"; }
-die()  { echo -e "${RED}[ERROR]${RESET} $1" >&2; exit 1; }
-
-# ── Alpine 专属依赖检查与补全 ─────────────────────────────────────────────────
-REQUIRED_CMDS="sed grep awk openssl wget"
-MISSING_CMDS=""
-for cmd in $REQUIRED_CMDS; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then MISSING_CMDS="$MISSING_CMDS $cmd"; fi
-done
-
-if [ -n "$MISSING_CMDS" ] || ! apk info -e greyhound >/dev/null 2>&1; then
-    info "检测到 Alpine 环境缺失必要组件，正在通过 apk 自动补全..."
-    apk update -q
-    # 确保安装了完整的 openssl 和 wget（Alpine自带的busybox wget可能不完整）
-    apk add -q openssl wget sed grep gawk
-    ok "Alpine 依赖环境补全成功！"
-fi
+# ================== 工具函数 ==================
+create_user() {
+    id -u snell >/dev/null 2>&1 || adduser -S -D -H -s /sbin/nologin snell 2>/dev/null || true
+}
 
 get_public_ip() {
-    local ip=""
-    for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-        ip=$(wget -qO- --timeout=3 --tries=1 -T 3 --no-check-certificate "$url" 2>/dev/null) && [ -n "$ip" ] && [ -z "$(echo "$ip" | grep ':')" ] && echo "$ip" && return 0
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return
+        done
     done
     echo "127.0.0.1"
 }
 
-detect_target() {
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64)  TARGET="micaproxy-linux-amd64" ;;
-        aarch64) TARGET="micaproxy-linux-arm64" ;;
-        armv7l)  TARGET="micaproxy-linux-armv7" ;;
-        *) die "暂不支持的系统架构: $ARCH" ;;
+check_port() {
+    if netstat -tln | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
+
+random_key() {
+    cat /dev/urandom | tr -dc A-Za-z0-9 | head -c 16
+}
+
+random_port() {
+    awk 'BEGIN{srand();print int(rand()*(65000-2000+1))+2000}'
+}
+
+get_system_dns() {
+    grep -E "^nameserver" /etc/resolv.conf | awk '{print $2}' | paste -sd "," -
+}
+
+pause() {
+    echo -n "按任意键返回菜单..."
+    read -r -n 1 arg
+    echo
+}
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+_map_arch() {
+    local raw_arch=$(uname -m)
+    case "$raw_arch" in
+        x86_64|amd64) echo "amd64" ;;
+        aarch64|arm64) echo "aarch64" ;;
+        armv7l|armhf) echo "armv7l" ;;
+        *) return 1 ;;
     esac
 }
 
-fetch_latest_version() {
-    info "正在轮询获取 MicaProxy 最新 Release 版本号..."
-    VERSION=""
-    for proxy in "${GITHUB_PROXIES[@]}"; do
-        local api_url="${proxy}https://api.github.com/repos/${REPO}/releases/latest"
-        local resp
-        resp=$(wget -qO- --timeout=5 --tries=1 --no-check-certificate "$api_url" 2>/dev/null)
-        local tmp_ver
-        tmp_ver=$(echo "$resp" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)
-        if [ -n "$tmp_ver" ] && [ "$tmp_ver" != "null" ]; then
-            VERSION="$tmp_ver"
-            ok "成功获取到最新版本: ${GREEN}${VERSION}${RESET}"
-            break
-        fi
-    done
-    if [ -z "$VERSION" ]; then
-        VERSION="v3.0.6"
-        warn "降级采用稳定默认版本: ${VERSION}"
-    fi
-}
-
-# ── 100% 纯 wget 下载逻辑 ─────────────────────────────────────────────────────
-download_bin() {
-    detect_target
-    fetch_latest_version
-    TMP_DIR="$(mktemp -d)"
-    local download_success=false
+_get_snell_latest_version() {
+    local latest_version
+    # 1. 尝试获取网页内容，设置 5 秒超时，避免卡死
+    latest_version=$(curl -sL -m 5 -A "Mozilla/5.0" "https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell" 2>/dev/null | grep -oE 'v5\.[0-9]+\.[0-9]+' | head -n 1 || echo "")
     
-    for proxy in "${GITHUB_PROXIES[@]}"; do
-        local url_bin="${proxy}https://github.com/${REPO}/releases/download/${VERSION}/${TARGET}"
-        info "正在尝试通过镜像源 [ ${CYAN}${proxy:-官方直连}${RESET} ] 下载资产包..."
-        if wget -q --timeout=8 --tries=1 --no-check-certificate -O "$TMP_DIR/MicaProxy" "$url_bin"; then
-            if [ -s "$TMP_DIR/MicaProxy" ]; then
-                download_success=true
-                ok "核心包通过 wget 同步下载完成！"
-                break
-            fi
-        fi
-        warn "当前源下载失败，正在为您自动切换下一个备用源..."
-    done
-
-    if [ "$download_success" = "false" ]; then
-        rm -rf "$TMP_DIR"
-        die "所有 GitHub 镜像代理源及官方通道均尝试失败，请检查网络后重试！"
+    # 2. 如果抓取到了版本号，去掉开头的 'v'
+    if [ -n "$latest_version" ]; then
+        echo "${latest_version#v}"
+    else
+        # 3. 抓取失败或超时，直接输出兜底版本，并记录日志/提示
+        _warn "无法获取官方最新版本，将使用兜底版本: $SNELL_DEFAULT_VERSION" >&2
+        echo "$SNELL_DEFAULT_VERSION"
     fi
-    export TARGET_BIN_PATH="$TMP_DIR/MicaProxy"
 }
 
-# ── 🛠️ Alpine 专属：编写 OpenRC 初始化脚本 ──────────────────────────────────────
-write_openrc_service() {
-    local rc_file="/etc/init.d/micaproxy"
-    cat > "$rc_file" << 'EOF'
+# 从配置文件中安全提取现有配置项的函数
+_get_conf_value() {
+    local key="$1"
+    if [ -f "$SNELL_CONFIG" ]; then
+        grep "^${key}" "$SNELL_CONFIG" | awk -F'=' '{print $2}' | sed 's/ //g'
+    fi
+}
+
+# ================== 配置 Snell (支持读取现有值，回车不变) ==================
+configure_snell() {
+    mkdir -p "$SNELL_DIR"
+    echo -e "${GREEN}[信息] 开始配置 Snell...${RESET}"
+
+    # 读取旧配置（若存在）
+    local old_listen=$(_get_conf_value "listen")
+    local old_port=""
+    [ -n "$old_listen" ] && old_port=$(echo "$old_listen" | awk -F: '{print $NF}')
+    local old_key=$(_get_conf_value "psk")
+    local old_obfs=$(_get_conf_value "obfs")
+    local old_ipv6=$(_get_conf_value "ipv6")
+    local old_tfo=$(_get_conf_value "tfo")
+    local old_dns=$(_get_conf_value "dns")
+
+    # 1. 端口
+    local default_port="${old_port:-$(random_port)}"
+    echo -n "请输入端口 (当前/默认: $default_port): "
+    read -r input_port
+    port=${input_port:-$default_port}
+    if [ "$port" != "$old_port" ]; then
+        check_port "$port" || return 1
+    fi
+
+    # 2. 密钥
+    local default_key="${old_key:-$(random_key)}"
+    echo -n "请输入 Snell 密钥 (当前/默认: $default_key): "
+    read -r input_key
+    key=${input_key:-$default_key}
+
+    # 3. OBFS
+    local current_obfs_str="${old_obfs:-off}"
+    echo -e "${YELLOW}配置 OBFS (当前配置: $current_obfs_str)：[注意] 无特殊作用不建议启用${RESET}"
+    echo "1. TLS   2. HTTP   3. 关闭"
+    echo -n "请选择 (直接回车保持当前不变): "
+    read -r obfs_choice
+    case $obfs_choice in
+        1) obfs="tls" ;;
+        2) obfs="http" ;;
+        3) obfs="off" ;;
+        *) obfs="$current_obfs_str" ;;
+    esac
+
+    # 4. IPv6
+    local current_ipv6_str="关闭"
+    [ "$old_ipv6" = "1" ] && current_ipv6_str="开启"
+    echo -e "${YELLOW}是否开启 IPv6 支持？(当前配置: $current_ipv6_str)${RESET}"
+    echo "1. 开启   2. 关闭"
+    echo -n "请选择 (直接回车保持当前不变): "
+    read -r ipv6_choice
+    case $ipv6_choice in
+        1) ipv6="1" ;;
+        2) ipv6="0" ;;
+        *) ipv6="${old_ipv6:-0}" ;;
+    esac
+
+    # 5. TFO
+    local current_tfo_str="开启"
+    [ "$old_tfo" = "0" ] && current_tfo_str="关闭"
+    echo -e "${YELLOW}是否开启 TCP Fast Open (TFO)？(当前配置: $current_tfo_str)${RESET}"
+    echo "1. 开启   2. 关闭"
+    echo -n "请选择 (直接回车保持当前不变): "
+    read -r tfo_choice
+    case $tfo_choice in
+        1) tfo="1" ;;
+        2) tfo="0" ;;
+        *) tfo="${old_tfo:-1}" ;;
+    esac
+
+    # 6. DNS
+    local system_dns=$(get_system_dns)
+    local default_dns="${old_dns:-${system_dns:-1.1.1.1,8.8.8.8}}"
+    echo -n "请输入 DNS (当前/默认: $default_dns): "
+    read -r input_dns
+    dns=${input_dns:-$default_dns}
+
+    # 组合监听地址
+    if [ "$ipv6" = "1" ]; then LISTEN="::0:$port"; else LISTEN="0.0.0.0:$port"; fi
+
+    # 写入配置
+    cat > "$SNELL_CONFIG" <<EOF
+[snell-server]
+listen = $LISTEN
+psk = $key
+obfs = $obfs
+ipv6 = $ipv6
+tfo = $tfo
+dns = $dns
+EOF
+
+    IP=$(get_public_ip)
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+    surge_tfo="false"; [ "$tfo" = "1" ] && surge_tfo="true"
+
+    cat <<EOF > "$SNELL_DIR/config.txt"
+$HOSTNAME-Snell = snell, $IP, $port, psk=$key, version=5, tfo=$surge_tfo, reuse=true, ecn=true
+EOF
+
+    _ok "配置已成功写入 $SNELL_CONFIG"
+    log "Snell 配置已成功更新。"
+}
+
+# ================== 核心 Alpine 部署逻辑 ==================
+# 仅下载并覆盖二进制文件，不重装/不覆盖原有配置
+_download_and_install_binary() {
+    local sarch=$( _map_arch ) || { _err "不支持的架构"; return 1; }
+    
+    _info "正在安装 Alpine 必要系统依赖 (upx, unzip, curl,gcompat)..."
+    apk add --no-cache upx unzip curl gcompat >/dev/null 2>&1
+
+    _info "正在获取官方最新稳定版版本号..."
+    local version=$( _get_snell_latest_version )
+    version="${version#v}"
+
+    local tmp=$(mktemp -d)
+    local download_url="https://dl.nssurge.com/snell/snell-server-v${version}-linux-${sarch}.zip"
+
+    _info "正在下载 Snell v$version (架构: $sarch)..."
+    if curl -sLo "$tmp/snell.zip" --connect-timeout 60 "$download_url"; then
+        if unzip -oq "$tmp/snell.zip" -d "$tmp/"; then
+            _info "检测到 Alpine 环境，正在进行 UPX 壳解压兼容处理..."
+            if command -v upx >/dev/null 2>&1; then
+                upx -d "$tmp/snell-server" >/dev/null 2>&1 || _warn "UPX 脱壳失败或无需脱壳"
+            else
+                _err "UPX 工具不可用，无法完成解压"
+                rm -rf "$tmp"; return 1
+            fi
+
+            install -m 755 "$tmp/snell-server" /usr/local/bin/snell-server-v5
+            rm -rf "$tmp"
+            echo "$version"
+            return 0
+        else
+            _err "解压失败"
+        fi
+    else
+        _err "下载失败: $download_url"
+    fi
+    rm -rf "$tmp"
+    return 1
+}
+
+# 部署 OpenRC 脚本管理
+_deploy_openrc_service() {
+    _info "正在写入 Alpine OpenRC 服务管理配置..."
+    cat > "$SNELL_RC_SERVICE" <<'EOF'
 #!/sbin/openrc-run
 
-description="MicaProxy Multi-instance Service"
-# 动态根据软链接或服务名获取实例ID
-INSTANCE="${RC_SVCNAME#micaproxy.}"
-
-# 如果直接运行主脚本且无后缀，则默认为 hostname
-if [ "$RC_SVCNAME" = "micaproxy" ]; then
-    INSTANCE="$(hostname)"
-fi
-
-CONF_FILE="/etc/MicaProxy/${INSTANCE}.toml"
-LOG_FILE="/opt/MicaProxy/log/${INSTANCE}.log"
-
-command="/opt/MicaProxy/MicaProxy"
-command_args="-c ${CONF_FILE}"
+description="Snell Server v5"
+command="/usr/local/bin/snell-server-v5"
+command_args="-c /etc/snell/snell-server.conf"
 command_background="yes"
-pidfile="/run/micaproxy.${INSTANCE}.pid"
-output_log="${LOG_FILE}"
-error_log="${LOG_FILE}"
+pidfile="/run/snell.pid"
+output_log="/var/log/snell.log"
+error_log="/var/log/snell.log"
 
 depend() {
     need net
     after firewall
 }
-
-start_pre() {
-    if [ ! -f "${CONF_FILE}" ]; then
-        eerror "Configuration file ${CONF_FILE} missing!"
-        return 1
-    fi
-    checkpath -d -m 0755 -o root:root /opt/MicaProxy/log
-}
 EOF
-    chmod 0755 "$rc_file"
+    chmod +x "$SNELL_RC_SERVICE"
+    rc-update add snell default >/dev/null 2>&1 || true
 }
 
-init_environment() {
-    mkdir -p /opt/MicaProxy
-    mkdir -p "$LOG_DIR"
-    mkdir -p "$INSTANCE_DIR"
-    mkdir -p "$DATA_DIR"
-}
+# 选项 1：全新安装
+install_snell_v5() {
+    if [ -x /usr/local/bin/snell-server-v5 ]; then
+        _ok "Snell 已安装，如需更新请使用选项 2，修改配置请用选项 4。"; return 0
+    fi
 
-write_config() {
-    local instance="$1" local proto="$2" local bind_ip="$3" local bind_port="$4" local username="$5" local password="$6" local outbound_type="$7"
-    local conf_file="${INSTANCE_DIR}/${instance}.toml"
+    local ver=$(_download_and_install_binary)
+    [ -z "$ver" ] && return 1
+
+    create_user
+    configure_snell || return 1
+    _deploy_openrc_service
     
-    if [ -z "$(echo "$bind_ip" | grep '\[')" ] && [ -n "$(echo "$bind_ip" | grep ':')" ]; then
-        bind_ip="[${bind_ip}]"
+    rc-service snell restart >/dev/null 2>&1 || true
+    _ok "Snell 已在 Alpine Linux 上成功部署并运行！"
+    log "Alpine Snell 安装成功"
+
+    # ================== 新增：安装完直接显示节点配置 ==================
+    echo
+    echo -e "${GREEN}===============================================${RESET}"
+    echo -e "${GREEN}               🎉 Snell 安装成功 🎉            ${RESET}"
+    echo -e "${GREEN}===============================================${RESET}"
+    echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
+    echo -e "${GREEN}👉 请复制以下配置到你的 Surge 配置文件中：${RESET}"
+    echo
+    if [ -f "$SNELL_DIR/config.txt" ]; then
+        echo -e "${YELLOW}$(cat "$SNELL_DIR/config.txt")${RESET}"
+    else
+        _warn "未找到节点配置文件文本。"
     fi
-
-    [ -z "$outbound_type" ] && outbound_type="default"
-
-    cat <<EOF > "$conf_file"
-[[outbounds]]
-name = "${outbound_type}-outbound"
-type = "${outbound_type}"
-
-[[listeners]]
-name = "${instance}-listener"
-listen = "${bind_ip}:${bind_port}"
-protocol = "${proto}"
-outbound = "${outbound_type}-outbound"
-EOF
-
-    if [ -n "$username" ] && [ -n "$password" ]; then
-        cat <<EOF >> "$conf_file"
-username = "${username}"
-password = "${password}"
-EOF
-    fi
-
-    if [ "$proto" = "socks5" ]; then
-        cat <<EOF >> "$conf_file"
-
-[socks5]
-enabled = true
-udp_enabled = true
-udp_idle_timeout_secs = 120
-udp_buffer_bytes = 8192
-EOF
-    fi
-
-    cat <<EOF >> "$conf_file"
-
-[runtime]
-driver = "epoll"
-EOF
-    chmod 0644 "$conf_file"
+    echo -e "${GREEN}===============================================${RESET}"
+    echo
 }
 
-print_node_summary() {
-    local instance="$1"
-    local conf_file="${INSTANCE_DIR}/${instance}.toml"
-    if [ ! -f "$conf_file" ]; then return; fi
-
-    local proto
-    proto=$(awk -F '=' '/^[[:space:]]*protocol[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file")
-    [ -z "$proto" ] && proto="socks5"
-
-    local bind_port
-    bind_port=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); split($2, a, ":"); print a[length(a)]}' "$conf_file")
-    
-    local auth_user
-    auth_user=$(awk -F '=' '/^[[:space:]]*username[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file" | tr -d '"')
-    local auth_pass
-    auth_pass=$(awk -F '=' '/^[[:space:]]*password[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file" | tr -d '"')
-
-    local public_ip
-    public_ip=$(get_public_ip)
-
-    echo -e "\n${GREEN}====== MicaProxy 实例 [ ${instance} ] 配置详情 ======${RESET}"
-    echo -e "${GREEN}实例协议     :${RESET} ${CYAN}${proto^^}${RESET}"
-    echo -e "${GREEN}外网绑定 IP  :${RESET} ${public_ip}"
-    echo -e "${GREEN}监听端口     :${RESET} ${bind_port}"
-    if [ -n "$auth_user" ] && [ "$auth_user" != "none" ]; then
-        echo -e "${GREEN}用户名       :${RESET} ${auth_user}"
-        echo -e "${GREEN}密码         :${RESET} ${auth_pass}"
-    else
-        echo -e "${GREEN}鉴权模式     :${RESET} ${YELLOW}免密模式${RESET}"
+# 选项 2：纯净更新（不覆盖、不重装配置）
+update_snell_v5() {
+    if [ ! -x /usr/local/bin/snell-server-v5 ]; then
+        _err "检测到系统未安装 Snell，请先选择选项 1 进行安装！"; return 1
     fi
-    echo -e "${GREEN}配置文件路径 :${RESET} ${conf_file}"
-    
-    echo -e "${GREEN}====== 👉 客户端通用格式连接 ======${RESET}"
-    if [ "$proto" = "socks5" ]; then
-        if [ -n "$auth_user" ] && [ "$auth_user" != "none" ]; then
-            echo -e "${YELLOW}socks5://${auth_user}:${auth_pass}@${public_ip}:${bind_port}#${instance}${RESET}"
-        else
-            echo -e "${YELLOW}socks5://${public_ip}:${bind_port}#${instance}${RESET}"
-        fi
-    elif [ "$proto" = "http" ]; then
-        if [ -n "$auth_user" ] && [ "$auth_user" != "none" ]; then
-            echo -e "${YELLOW}http://${auth_user}:${auth_pass}@${public_ip}:${bind_port}${RESET}"
-        else
-            echo -e "${YELLOW}http://${public_ip}:${bind_port}${RESET}"
-        fi
-    fi
-    echo ""
+
+    _info "开始检查并更新 Snell 二进制程序（保留当前所有配置不变）..."
+    local ver=$(_download_and_install_binary)
+    [ -z "$ver" ] && return 1
+
+    _deploy_openrc_service
+    _restart_snell_process
+    _ok "Snell 已成功更新，且当前配置已完好保留并重启完毕！"
+    log "Alpine Snell 成功更新"
 }
 
-# ── Alpine 专属 OpenRC 状态嗅探 ────────────────────────────────────────────────
-get_status_info() {
-    if [ -L "/etc/init.d/micaproxy.${CURRENT_INSTANCE}" ] || [ -f "/etc/init.d/micaproxy.${CURRENT_INSTANCE}" ]; then
-        if rc-service "micaproxy.${CURRENT_INSTANCE}" status 2>/dev/null | grep -q "started"; then
-            panel_status="${GREEN}活跃中 (Running via OpenRC)${RESET}"
-        else
-            panel_status="${RED}未运行 (Stopped)${RESET}"
-        fi
-    else
-        panel_status="${RED}未托管服务${RESET}"
-    fi
-
-    if [ -f "$BIN_PATH" ]; then
-        local real_ver=$($BIN_PATH --version 2>/dev/null | head -n 1 | awk '{print $2}')
-        [ -z "$real_ver" ] && real_ver=$($BIN_PATH -v 2>/dev/null | head -n 1)
-        panel_version="${real_ver:-v3.x} (Alpine 精简架构)"
-    else
-        panel_version="${RED}未下载核心${RESET}"
-    fi
-
-    local conf_file="${INSTANCE_DIR}/${CURRENT_INSTANCE}.toml"
-    if [ -f "$conf_file" ]; then
-        local proto
-        proto=$(awk -F '=' '/^[[:space:]]*protocol[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file")
-        local p_num=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file")
-        panel_port="${p_num} (${proto^^})"
-    else
-        panel_port="未创建配置"
-    fi
+uninstall_snell() {
+    echo -e "${RED}[警告] 正在彻底从 Alpine 卸载 Snell 服务...${RESET}"
+    rc-service snell stop >/dev/null 2>&1 || true
+    rc-update del snell >/dev/null 2>&1 || true
+    pkill -f snell-server-v5 || true
+    rm -f "$SNELL_RC_SERVICE"
+    rm -f /usr/local/bin/snell-server-v5
+    rm -rf "$SNELL_DIR"
+    rm -f "$SNELL_LOG"
+    _ok "Alpine Snell 服务已完全卸载。"
 }
 
-parse_existing_config() {
-    local conf_file="${INSTANCE_DIR}/${CURRENT_INSTANCE}.toml"
-    if [ ! -f "$conf_file" ]; then return 1; fi
-
-    OLD_PROTO=$(awk -F '=' '/^[[:space:]]*protocol[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file")
-    [ -z "$OLD_PROTO" ] && OLD_PROTO="socks5"
-
-    local raw_listen
-    raw_listen=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file")
-    OLD_PORT=$(echo "$raw_listen" | awk -F ':' '{print $NF}')
-    OLD_IP=$(echo "$raw_listen" | sed "s/:${OLD_PORT}$//g" | tr -d '[]')
-
-    OLD_USER=$(awk -F '=' '/^[[:space:]]*username[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file" | tr -d '"')
-    OLD_PASS=$(awk -F '=' '/^[[:space:]]*password[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file" | tr -d '"')
-    [ -z "$OLD_USER" ] && OLD_USER="none"
-
-    OLD_OUTBOUND=$(awk -F '=' '/^[[:space:]]*type[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file" | head -n 1)
-    [ -z "$OLD_OUTBOUND" ] && OLD_OUTBOUND="default"
-    return 0
+# 统一的启动/重启底层逻辑（确保日志正确重定向）
+_restart_snell_process() {
+    rc-service snell restart >/dev/null 2>&1 || {
+        pkill -f snell-server-v5 || true
+        touch "$SNELL_LOG"
+        nohup /usr/local/bin/snell-server-v5 -c "$SNELL_CONFIG" >> "$SNELL_LOG" 2>&1 &
+    }
 }
 
-menu_switch_instance() {
-    echo -e "\n${GREEN}==== [多开实例矩阵管理中心] ====${RESET}"
-    echo -e "当前聚焦的操作目标: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-    echo "目前存储于 ${INSTANCE_DIR} 内的独立实例列表:"
-
-    local files="${INSTANCE_DIR}/*.toml"
-    local count=0
-    
-    for f in $files; do
-        [ -e "$f" ] || continue
-        count=$((count + 1))
-        local name=$(basename "$f" .toml)
-        local proto_type=$(awk -F '=' '/^[[:space:]]*protocol[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$f")
-        local status_str="${RED}已挂起${RESET}"
-        rc-service "micaproxy.${name}" status 2>/dev/null | grep -q "started" && status_str="${GREEN}分流中${RESET}"
-        echo -e " [ ${CYAN}${count}${RESET} ] -> ${YELLOW}${name}${RESET} [协议: ${proto_type^^} | 状态: ${status_str}]"
-    done
-
-    if [ "$count" -eq 0 ]; then
-        echo " (暂无任何多开实例，请直接输入新名称创建)"
-    fi
-    echo ""
-    read -r -p "请输入要切换的[现有数字编号]或[直接输入全新英文名]: " input_val
-    if [ -z "$input_val" ]; then return; fi
-
-    # 简易 Alpine sh 兼容编号处理
-    if [ "$input_val" -eq "$input_val" ] 2>/dev/null; then
-        local idx=0
-        for f in $files; do
-            [ -e "$f" ] || continue
-            idx=$((idx + 1))
-            if [ "$idx" -eq "$input_val" ]; then
-                CURRENT_INSTANCE=$(basename "$f" .toml)
-                ok "操作焦点已成功切为: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-                return
-            fi
-        done
-        warn "编号不存在，未做任何变更。"
-    else
-        CURRENT_INSTANCE="$input_val"
-        ok "操作焦点锁定新实例名: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-    fi
-}
-
-menu_install() {
-    init_environment
-    local is_edit=false
-    if [ "$1" = "edit" ]; then is_edit=true; fi
-
-    if [ "$is_edit" = "true" ]; then
-        if ! parse_existing_config; then
-            die "未检测到实例 [ ${CURRENT_INSTANCE} ] 的旧配置，无法执行微调！"
-        fi
-        echo -e "\n${GREEN}==== [💡 正在微调修改实例: ${CURRENT_INSTANCE} (直接回车保持原样)] ====${RESET}"
-    else
-        local conf_file="${INSTANCE_DIR}/${CURRENT_INSTANCE}.toml"
-        if [ -f "$conf_file" ]; then
-            warn "实例 [ ${CURRENT_INSTANCE} ] 已经存在对应配置文件。"
-            read -r -p "$(echo -e "${GREEN}是否确定完全覆盖重写该实例？[y/N]: ${RESET}")" res
-            case "$res" in [Yy]*) ;; *) return ;; esac
-        fi
-        echo -e "\n${GREEN}==== [配置新实例 ${CURRENT_INSTANCE} 参数] ====${RESET}"
-        OLD_PROTO="socks5" OLD_IP="0.0.0.0" OLD_PORT="$(( (rand_seed = rand_seed + 1) * 31 % 50001 + 10000 ))" OLD_USER="mica_open" OLD_PASS="mica_pass" OLD_OUTBOUND="default"
-    fi
-
-    if [ "$is_edit" = "true" ]; then
-        echo -e "当前协议类型: ${CYAN}${OLD_PROTO^^}${RESET} (1. SOCKS5 | 2. HTTP)"
-        read -r -p "请输入新序号 [直接回车不修改]: " proto_choice
-    else
-        echo "1. SOCKS5 代理模式 (默认，附带完整 UDP 转发能力)"
-        echo "2. HTTP 传输代理模式"
-        read -r -p "选择形态序号 [1-2]: " proto_choice
-    fi
-    local opt_proto="$OLD_PROTO"
-    if [ "$proto_choice" = "1" ]; then opt_proto="socks5"; elif [ "$proto_choice" = "2" ]; then opt_proto="http"; fi
-
-    read -r -p "$(echo -e "${GREEN}请输入监听网卡 IP [当前: ${YELLOW}${OLD_IP}${GREEN} | 回车不改]: ${RESET}")" input_ip
-    local opt_ip="${input_ip:-$OLD_IP}"
-
-    read -r -p "$(echo -e "${GREEN}请输入服务端口 [当前: ${YELLOW}${OLD_PORT}${GREEN} | 回车不改]: ${RESET}")" input_port
-    local opt_port="${input_port:-$OLD_PORT}"
-    
-    local opt_user="" local opt_pass=""
-    read -r -p "$(echo -e "${GREEN}配置连接账户 [当前: ${YELLOW}${OLD_USER}${GREEN} | 输入 none 免密 | 回车不改]: ${RESET}")" input_user
-    if [ -z "$input_user" ]; then
-        if [ "$OLD_USER" = "none" ]; then opt_user=""; opt_pass=""; else opt_user="$OLD_USER"; opt_pass="$OLD_PASS"; fi
-    elif [ "$input_user" = "none" ]; then
-        opt_user=""; opt_pass=""
-    else
-        opt_user="$input_user"
-        read -r -p "$(echo -e "${GREEN}请输入新密码 [当前: ${YELLOW}${OLD_PASS}${GREEN}]: ${RESET}")" input_pass
-        opt_pass="${input_pass:-$OLD_PASS}"
-    fi
-
-    echo -e "\n${GREEN}==== [选择出站 Profile 路由路径] ====${RESET}"
-    echo "1. default (系统默认路由，普通混合网络)"
-    echo "2. ipv4    (IPv4-only，强制仅解析A记录/仅走v4)"
-    echo "3. ipv6    (IPv6-only，强制仅解析AAAA记录/仅走v6)"
-    read -r -p "选择出站路径序号 [1-3, 回车不修改]: " outbound_choice
-    local opt_outbound="$OLD_OUTBOUND"
-    if [ "$outbound_choice" = "1" ]; then opt_outbound="default"; elif [ "$outbound_choice" = "2" ]; then opt_outbound="ipv4"; elif [ "$outbound_choice" = "3" ]; then opt_outbound="ipv6"; fi
-
-    if [ ! -f "$BIN_PATH" ]; then
-        download_bin
-        install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$BIN_PATH"
-        rm -rf "$(dirname "$TARGET_BIN_PATH")"
-    fi
-
-    write_config "$CURRENT_INSTANCE" "$opt_proto" "$opt_ip" "$opt_port" "$opt_user" "$opt_pass" "$opt_outbound"
-    write_openrc_service
-
-    # Alpine OpenRC 动态多实例软链接绑定机制
-    if [ ! -L "/etc/init.d/micaproxy.${CURRENT_INSTANCE}" ]; then
-        ln -sf /etc/init.d/micaproxy "/etc/init.d/micaproxy.${CURRENT_INSTANCE}"
-    fi
-
-    info "正在通过 OpenRC 拉起实例: ${CURRENT_INSTANCE} ..."
-    rc-update add "micaproxy.${CURRENT_INSTANCE}" default >/dev/null 2>&1
-    rc-service "micaproxy.${CURRENT_INSTANCE}" restart
-    
-    sleep 1.2
-    ok "MicaProxy OpenRC 实例 [ ${CURRENT_INSTANCE} ] 部署成功！"
-    print_node_summary "$CURRENT_INSTANCE"
-}
-
-menu_uninstall() {
-    warn "该操作将彻底销毁当前选定的 OpenRC 实例。"
-    read -r -p "$(echo -e "${RED}确认抹除实例 [ ${CURRENT_INSTANCE} ] 吗？[y/N]: ${RESET}")" res
-    case "$res" in [Yy]*) ;; *) return ;; esac
-
-    rc-service "micaproxy.${CURRENT_INSTANCE}" stop >/dev/null 2>&1
-    rc-update del "micaproxy.${CURRENT_INSTANCE}" >/dev/null 2>&1
-    rm -f "/etc/init.d/micaproxy.${CURRENT_INSTANCE}"
-    rm -f "${INSTANCE_DIR}/${CURRENT_INSTANCE}.toml"
-    ok "实例 [ ${CURRENT_INSTANCE} ] 已干净销毁。"
-}
-
-# 伪随机种子初值
-rand_seed=11
-
-while true; do
-    get_status_info
+# ================== 菜单 ==================
+show_menu() {
     clear
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}    MicaProxy Alpine 专属多实例管理面板    ${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}当前控制目标 :${RESET} ${CYAN}${CURRENT_INSTANCE}${RESET}"
-    echo -e "${GREEN}目标实例绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
-    echo -e "${GREEN}服务活跃状态 :${RESET} $panel_status"
-    echo -e "${GREEN}核心沙箱引擎 :${RESET} ${YELLOW}${panel_version}${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN} 1. 全新一键部署当前控制实例${RESET}"
-    echo -e "${GREEN} 2. 检查更新/重下载底层二进制核心 (wget)${RESET}"
-    echo -e "${GREEN} 3. 彻底销毁当前选中的实例${RESET}"
-    echo -e "${YELLOW} 4. 修改当前实例配置 (回车读取旧值/微调)${RESET}"
-    echo -e "${GREEN} 5. 瞬间启动当前实例${RESET}"
-    echo -e "${GREEN} 6. 暂停挂起当前实例${RESET}"
-    echo -e "${GREEN} 7. OpenRC 热重启当前实例${RESET}"
-    echo -e "${GREEN} 8. 实时查看当前实例滚动运行日志${RESET}"
-    echo -e "${GREEN} 9. 重新打印/导出当前实例的连接密匙${RESET}"
-    echo -e "${YELLOW} 10. ⚡ 切换实例名字/多开新建不限数量的代理${RESET}"
-    echo -e "${GREEN} 0. 退出控制面板${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
-    
-    read -r -p "$(echo -e "${GREEN}选择操作序号: ${RESET}")" choice
-    case "$choice" in
-        1) menu_install "new" ;;
-        2) download_bin && install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$BIN_PATH" && rm -rf "$(dirname "$TARGET_BIN_PATH")" && ok "核心覆盖成功" ;;
-        3) menu_uninstall ;;
-        4) menu_install "edit" ;;
-        5) rc-service "micaproxy.${CURRENT_INSTANCE}" start && ok "拉起成功" ;;
-        6) rc-service "micaproxy.${CURRENT_INSTANCE}" stop && ok "挂起成功" ;;
-        7) rc-service "micaproxy.${CURRENT_INSTANCE}" restart && ok "重启完毕" ;;
-        8) if [ -f "/opt/MicaProxy/log/${CURRENT_INSTANCE}.log" ]; then tail -n 50 -f "/opt/MicaProxy/log/${CURRENT_INSTANCE}.log"; else warn "暂无运行日志生成"; fi ;;
-        9) print_node_summary "$CURRENT_INSTANCE" ;;
-        10) menu_switch_instance ;;
-        0;q;exit) clear; exit 0 ;;
-        *) warn "无效输入！"; sleep 1 ;;
+    if rc-service snell status 2>&1 | grep -q "started" || pgrep -x "snell-server-v5" >/dev/null; then
+        STATUS="${GREEN}● 运行中${RESET}"
+    else
+        STATUS="${RED}● 未运行${RESET}"
+    fi
+
+    VERSION_SHOW="未安装"
+    if [ -x /usr/local/bin/snell-server-v5 ]; then
+        VERSION_SHOW=$(/usr/local/bin/snell-server-v5 -v 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || echo "v5.x")
+    fi
+
+    PORT_SHOW="-"
+    if [ -f "$SNELL_CONFIG" ]; then
+        PORT_SHOW=$(grep '^listen' "$SNELL_CONFIG" | awk -F: '{print $NF}')
+    fi
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}        Snell  管理面板         ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $STATUS"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}$VERSION_SHOW${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}$PORT_SHOW${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装 Snell${RESET}"
+    echo -e "${GREEN}2. 更新 Snell${RESET}"
+    echo -e "${GREEN}3. 卸载 Snell${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 Snell${RESET}"
+    echo -e "${GREEN}6. 停止 Snell${RESET}"
+    echo -e "${GREEN}7. 重启 Snell${RESET}"
+    echo -e "${GREEN}8. 查看运行日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+}
+
+# ================== 主循环 ==================
+while true; do
+    show_menu
+    echo -e -n "${GREEN}请输入选项: ${RESET}"
+    read -r choice
+    case $choice in
+        1) install_snell_v5; pause ;;
+        2) update_snell_v5; pause ;;
+        3) uninstall_snell; pause ;;
+        4) 
+            if [ ! -f "$SNELL_CONFIG" ]; then 
+                _err "未找到配置文件，请先安装！"
+            else
+                configure_snell
+                _restart_snell_process
+                _ok "配置已重载，Snell 服务已平滑重启！"
+                # 重载后同样显示最新节点信息
+                echo -e "\n${GREEN}👉  Surge 节点配置：${RESET}"
+                echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
+                [ -f "$SNELL_DIR/config.txt" ] && echo -e "${YELLOW}$(cat "$SNELL_DIR/config.txt")${RESET}\n"
+            fi
+            pause ;;
+        5) 
+            rc-service snell start >/dev/null 2>&1 || { 
+                if ! pgrep -x "snell-server-v5" >/dev/null; then
+                    touch "$SNELL_LOG"
+                    nohup /usr/local/bin/snell-server-v5 -c "$SNELL_CONFIG" >> "$SNELL_LOG" 2>&1 &
+                fi
+            }
+            _ok "Snell 已成功启动"
+            pause ;;
+        6) 
+            rc-service snell stop >/dev/null 2>&1 || pkill -f snell-server-v5 || true
+            _ok "Snell 已停止"
+            pause ;;
+        7) 
+            _restart_snell_process
+            _ok "Snell 已重启"
+            pause ;;
+        8)
+            echo -e "${GREEN}--- Snell 核心运行日志 (最新50行) ---${RESET}"
+            if [ -f "$SNELL_LOG" ] && [ -s "$SNELL_LOG" ]; then
+                tail -n 50 "$SNELL_LOG"
+                echo -e "${YELLOW}------------------------------------------------${RESET}"
+                echo -n "是否需要实时追踪新日志输出？(y/n, 默认 n): "
+                read -r watch_choice
+                if [ "$watch_choice" = "y" ] || [ "$watch_choice" = "Y" ]; then
+                    echo -e "${YELLOW}提示: 按 Ctrl+C 即可退出日志实时追踪并返回菜单${RESET}"
+                    tail -f "$SNELL_LOG"
+                fi
+            else
+                _warn "暂无 Snell 运行日志或日志文件为空。 (请确保服务已正常启动并产生流量)"
+            fi
+            pause ;;
+        9)
+            if [ -f "$SNELL_CONFIG" ]; then
+                echo -e "${GREEN}====== 当前 Snell 内部配置 ======${RESET}"
+                cat "$SNELL_CONFIG"
+                echo -e "${GREEN}====== Surge 专属配置 ======${RESET}"
+                [ -f "$SNELL_DIR/config.txt" ] && cat "$SNELL_DIR/config.txt" || echo "暂无配置文本"
+            else
+                echo -e "${RED}配置文件不存在，请先安装！${RESET}"
+            fi
+            pause ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效输入${RESET}"; pause ;;
     esac
-    read -r -p "$(echo -e "${GREEN}按任意键重新返回控制台面...${RESET}")" dummy
 done

@@ -1,39 +1,12 @@
 #!/bin/bash
-# ========================================
-# ShellCrash 一键安装脚本 (带 GitHub 代理重试)
-# 自动刷新环境变量
-# ========================================
 
+# 颜色定义
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-clear
-
-echo -e "${GREEN}========================================${RESET}"
-echo -e "${GREEN}       ShellCrash 开始安装${RESET}"
-echo -e "${GREEN}========================================${RESET}"
-
-# 1. 检查并安装 curl
-if ! command -v curl &>/dev/null; then
-    echo -e "${YELLOW}未检测到 curl，正在安装...${RESET}"
-
-    if command -v apt &>/dev/null; then
-        apt update -y && apt install -y curl
-    elif command -v yum &>/dev/null; then
-        yum install -y curl
-    elif command -v dnf &>/dev/null; then
-        dnf install -y curl
-    elif command -v apk &>/dev/null; then
-        apk add curl
-    else
-        echo -e "${RED}无法自动安装 curl，请手动安装${RESET}"
-        exit 1
-    fi
-fi
-
-# 2. 定义代理数组
+# 代理前缀列表（第一个留空代表直连尝试）
 GITHUB_PROXY=(
     ''
     'https://v6.gh-proxy.org/'
@@ -43,32 +16,53 @@ GITHUB_PROXY=(
     'https://ghproxy.lvedong.eu.org/'
 )
 
-BASE_URL="raw.githubusercontent.com/juewuy/ShellCrash/master/install.sh"
-SUCCESS=false
-
-# 3. 循环遍历代理进行下载安装
-for proxy in "${GITHUB_PROXY[@]}"; do
-    INSTALL_URL="${proxy}${BASE_URL}"
-    echo -e "${YELLOW}正在尝试通过代理下载: ${INSTALL_URL:-直连}${RESET}"
-    
-    # 尝试下载并执行 (设置 10 秒超时防止卡死)
-    if bash -c "$(curl -fsSL --connect-timeout 10 "$INSTALL_URL")"; then
-        SUCCESS=true
-        break
-    else
-        echo -e "${RED}当前节点连接失败，尝试下一个...${RESET}"
-    fi
-done
-
-# 4. 判断最终安装状态
-if [ "$SUCCESS" = false ]; then
-    echo -e "${RED}========================================${RESET}"
-    echo -e "${RED}错误: 所有代理节点及直连均尝试失败，请检查网络！${RESET}"
-    echo -e "${RED}========================================${RESET}"
-    exit 1
+# 获取操作系统 ID
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS=$ID
+else
+    OS="unknown"
 fi
 
-echo -e "${GREEN}========================================${RESET}"
-echo -e "${YELLOW}如果 crash 命令未立即生效，请执行：${RESET}"
-echo -e "${GREEN}source /etc/profile${RESET}"
-echo -e "${GREEN}========================================${RESET}"
+# 核心下载与执行函数（多代理自动轮询容灾）
+fetch_and_run() {
+    local script_url="$1"
+    local success=1 # 默认失败状态
+
+    # 遍历代理数组
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local full_url="${proxy}${script_url}"
+        
+        # 提示当前正在尝试的链接
+        if [ -z "$proxy" ]; then
+            echo
+        else
+            echo
+        fi
+
+        # 执行下载与运行
+        if bash <(curl -fsSL --connect-timeout 5 "$full_url"); then
+            echo
+            success=0
+            break # 成功后跳出循环
+        fi
+    done
+
+    # 如果所有代理都失败了
+    if [ $success -ne 0 ]; then
+        echo -e "${RED}错误：所有代理通道均已失败，请检查网络连接。${RESET}"
+        exit 1
+    fi
+}
+
+# 安装逻辑判断
+case "$OS" in
+    alpine)
+        # 执行 Alpine 适配版脚本
+        fetch_and_run "https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/APAcme.sh"
+        ;;
+    debian|ubuntu|centos|rocky|almalinux|fedora|*)
+        # 执行原版脚本
+        fetch_and_run "https://raw.githubusercontent.com/sistarry/toolbox/main/toy/ACMESSL.sh"
+        ;;
+esac

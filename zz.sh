@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 
 # =============================================================================
-#  MicaProxy 智能编号多实例管理面板 (多源抗抖动下载高可用版)
+#  MicaProxy 智能编号多实例管理面板 
 # =============================================================================
 
 # ── 核心路径与环境变量 ────────────────────────────────────────────────────────
 export REPO="judy-gotv/Rust-SOCKS5-HTTP"
 export TEMPLATE_NAME="micaproxy"
 export BIN_PATH="/opt/MicaProxy/MicaProxy"
-export INSTANCE_DIR="/etc/MicaProxy"         # 配置文件直接存放在 /etc/MicaProxy 下
+export INSTANCE_DIR="/etc/MicaProxy"
 export DATA_DIR="/var/lib/micaproxy"
 export LOG_DIR="/opt/MicaProxy/log"
 export SERVICE_FILE="/etc/systemd/system/${TEMPLATE_NAME}@.service"
 
-# 当前控制的目标实例名称
-CURRENT_INSTANCE="default"
+# 默认控制的目标实例名称自动改成当前主机名
+CURRENT_INSTANCE="$(hostname)"
 
 # ── 终端颜色定义 ─────────────────────────────────────
 export RESET='\033[0m'
@@ -24,17 +24,15 @@ export RED='\033[0;31m'
 export BLUE='\033[0;34m'
 export CYAN='\033[0;36m'
 
-# GITHUB 代理加速源列表 (扩大备用源矩阵，提高抗风险能力)
 GITHUB_PROXIES=(
+    ""
     "https://gh-proxy.com/"
     "https://proxy.vvvv.ee/"
     "https://v6.gh-proxy.org/"
     "https://ghproxy.lvedong.eu.org/"
     "https://hub.glowp.xyz/"
-    ""
 )
 
-# ── 基础环境校验 ─────────────────────────────────────────────────────────────
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}[错误]${RESET} 请使用 root 权限运行此脚本！" >&2
     exit 1
@@ -45,7 +43,6 @@ ok()   { echo -e "${GREEN}[OK]${RESET} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${RESET} $1"; }
 die()  { echo -e "${RED}[ERROR]${RESET} $1" >&2; exit 1; }
 
-# 依赖检查与自动补全
 REQUIRED_CMDS="curl tar sed grep awk openssl wget"
 MISSING_CMDS=""
 for cmd in $REQUIRED_CMDS; do
@@ -75,7 +72,6 @@ get_public_ip() {
     echo "127.0.0.1"
 }
 
-# ── 1. 核心编译资产下载 ────────────────────────────────────────────────────────
 detect_target() {
     ARCH=$(uname -m)
     case "$ARCH" in
@@ -107,22 +103,15 @@ fetch_latest_version() {
     fi
 }
 
-# ── 🛠️ 核心突变修复点：多源抗灾轮询下载引擎 ─────────────────────────────────────
 download_bin() {
     detect_target
     fetch_latest_version
-    
     TMP_DIR="$(mktemp -d)"
-    # 注意：不要在退出脚本时由于进程被卡住误删 TMP_DIR，由局部逻辑接管
-    
     local download_success=false
     
-    # 轮询所有可用的镜像源，遇到 503/404/超时 自动跳到下一个
     for proxy in "${GITHUB_PROXIES[@]}"; do
         local url_bin="${proxy}https://github.com/${REPO}/releases/download/${VERSION}/${TARGET}"
         info "正在尝试通过镜像源 [ ${CYAN}${proxy:-官方直连}${RESET} ] 下载资产包..."
-        
-        # 使用 -f 让 curl 在 HTTP 报错(如503)时直接返回非0状态码
         if curl -fsSL --connect-timeout 8 --max-time 60 -o "$TMP_DIR/MicaProxy" "$url_bin"; then
             if [ -s "$TMP_DIR/MicaProxy" ]; then
                 download_success=true
@@ -137,11 +126,9 @@ download_bin() {
         rm -rf "$TMP_DIR"
         die "所有 GitHub 镜像代理源及官方通道均尝试失败，请检查网络后重试！"
     fi
-    
     export TARGET_BIN_PATH="$TMP_DIR/MicaProxy"
 }
 
-# ── 2. 核心 Systemd 模板写入 ──────────────────────────────────────────────────
 write_template_service() {
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -180,7 +167,6 @@ EOF
     systemctl daemon-reload
 }
 
-# ── 3. 配置生成与环境初始化 ──────────────────────────────────────────────────
 init_environment() {
     install -m 0755 -d /opt/MicaProxy
     install -m 0755 -d "$LOG_DIR"
@@ -189,19 +175,25 @@ init_environment() {
 }
 
 write_config() {
-    local instance="$1" local proto="$2" local bind_ip="$3" local bind_port="$4" local username="$5" local password="$6"
+    local instance="$1" local proto="$2" local bind_ip="$3" local bind_port="$4" local username="$5" local password="$6" local outbound_type="$7"
     local conf_file="${INSTANCE_DIR}/${instance}.toml"
     
+    if [[ "$bind_ip" == *":"* ]] && [[ "$bind_ip" != *"["* ]]; then
+        bind_ip="[${bind_ip}]"
+    fi
+
+    [ -z "$outbound_type" ] && outbound_type="default"
+
     cat <<EOF > "$conf_file"
 [[outbounds]]
-name = "default"
-type = "default"
+name = "${outbound_type}-outbound"
+type = "${outbound_type}"
 
 [[listeners]]
 name = "${instance}-listener"
 listen = "${bind_ip}:${bind_port}"
 protocol = "${proto}"
-outbound = "default"
+outbound = "${outbound_type}-outbound"
 EOF
 
     if [ -n "$username" ] && [ -n "$password" ]; then
@@ -251,7 +243,7 @@ print_node_summary() {
     public_ip=$(get_public_ip)
 
     echo -e "\n${GREEN}====== MicaProxy 实例 [ ${instance} ] 配置详情 ======${RESET}"
-    echo -e "${GREEN}实例协议     :${RESET} ${CYAN}${proto^^}${RESET}"
+    echo -e "${GREEN}实例协议     :${RESET} ${YELLOW}${proto^^}${RESET}"
     echo -e "${GREEN}外网绑定 IP  :${RESET} ${public_ip}"
     echo -e "${GREEN}监听端口     :${RESET} ${bind_port}"
     if [ -n "$auth_user" ]; then
@@ -267,11 +259,11 @@ print_node_summary() {
         if [ -n "$auth_user" ]; then
             echo -e "${YELLOW}socks5://${auth_user}:${auth_pass}@${public_ip}:${bind_port}#${instance}${RESET}"
             echo -e "\n${GREEN}====== 🚀 Telegram 内置一键代理链接 ======${RESET}"
-            echo -e "${CYAN}https://t.me/socks?server=${public_ip}&port=${bind_port}&user=${auth_user}&pass=${auth_pass}${RESET}"
+            echo -e "${YELLOW}https://t.me/socks?server=${public_ip}&port=${bind_port}&user=${auth_user}&pass=${auth_pass}${RESET}"
         else
             echo -e "${YELLOW}socks5://${public_ip}:${bind_port}#${instance}${RESET}"
             echo -e "\n${GREEN}====== 🚀 Telegram 内置一键代理链接 ======${RESET}"
-            echo -e "${CYAN}https://t.me/socks?server=${public_ip}&port=${bind_port}${RESET}"
+            echo -e "${YELLOW}https://t.me/socks?server=${public_ip}&port=${bind_port}${RESET}"
         fi
     elif [ "$proto" = "http" ]; then
         if [ -n "$auth_user" ]; then
@@ -285,13 +277,15 @@ print_node_summary() {
 
 get_status_info() {
     if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"; then
-        panel_status="${GREEN}活跃中 (Running)${RESET}"
+        panel_status="${GREEN}运行中${RESET}"
     else
-        panel_status="${RED}未运行 (Stopped)${RESET}"
+        panel_status="${RED}未运行${RESET}"
     fi
 
     if [ -f "$BIN_PATH" ]; then
-        panel_version="已就绪 (沙箱防御生效中)"
+        local real_ver=$($BIN_PATH --version 2>/dev/null | head -n 1 | awk '{print $2}')
+        [ -z "$real_ver" ] && real_ver=$($BIN_PATH -v 2>/dev/null | head -n 1)
+        panel_version="${real_ver:-v3.x} (沙箱防御生效中)"
     else
         panel_version="${RED}未下载核心${RESET}"
     fi
@@ -305,6 +299,30 @@ get_status_info() {
     else
         panel_port="未创建配置"
     fi
+}
+
+# ── 🛠️ 深度解析现有配置函数 (用于修改时回显) ──────────────────────────────────────────
+parse_existing_config() {
+    local conf_file="${INSTANCE_DIR}/${CURRENT_INSTANCE}.toml"
+    if [ ! -f "$conf_file" ]; then return 1; fi
+
+    OLD_PROTO=$(awk -F '=' '/^[[:space:]]*protocol[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file")
+    [ -z "$OLD_PROTO" ] && OLD_PROTO="socks5"
+
+    local raw_listen
+    raw_listen=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file")
+    # 提取端口号 (最后一个冒号后面)
+    OLD_PORT=$(echo "$raw_listen" | awk -F ':' '{print $NF}')
+    # 提取IP并去掉两边的方括号
+    OLD_IP=$(echo "$raw_listen" | sed "s/:${OLD_PORT}$//g" | tr -d '[]')
+
+    OLD_USER=$(awk -F '=' '/^[[:space:]]*username[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$conf_file")
+    OLD_PASS=$(awk -F '=' '/^[[:space:]]*password[[:space:]]*=/ {match($2, /"[^"]*"/); if(RSTART){print substr($2, RSTART+1, RLENGTH-2)}else{gsub(/[ [:space:]]/,"",$2);print $2}}' "$conf_file")
+    [ -z "$OLD_USER" ] && OLD_USER="none"
+
+    OLD_OUTBOUND=$(awk -F '=' '/^[[:space:]]*type[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file" | head -n 1)
+    [ -z "$OLD_OUTBOUND" ] && OLD_OUTBOUND="default"
+    return 0
 }
 
 menu_switch_instance() {
@@ -336,9 +354,7 @@ menu_switch_instance() {
     echo -e "👉 ${GREEN}或者直接输入一个【全新的英文名字】来新建多开实例${RESET}"
     read -r -p "请输入选择或名字: " input_val
 
-    if [ -z "$input_val" ]; then
-        return
-    fi
+    if [ -z "$input_val" ]; then return; fi
 
     if [[ "$input_val" =~ ^[0-9]+$ ]]; then
         if [ "$input_val" -gt 0 ] && [ "$input_val" -le "$count" ]; then
@@ -356,63 +372,89 @@ menu_switch_instance() {
 
 menu_install() {
     init_environment
-    local conf_file="${INSTANCE_DIR}/${CURRENT_INSTANCE}.toml"
-    if [ -f "$conf_file" ]; then
-        warn "实例 [ ${CURRENT_INSTANCE} ] 已经存在对应配置文件。"
-        read -r -p "$(echo -e "${GREEN}是否确定完全覆盖重写该实例？[y/N]: ${RESET}")" res
-        [[ "$res" =~ ^[Yy]$ ]] || return
+    local is_edit=false
+    if [ "$1" = "edit" ]; then is_edit=true; fi
+
+    if [ "$is_edit" = "true" ]; then
+        if ! parse_existing_config; then
+            die "未检测到实例 [ ${CURRENT_INSTANCE} ] 的旧配置，无法执行微调，请先按 1 进行全新部署！"
+        fi
+        echo -e "\n${GREEN}==== [💡 正在微调修改实例: ${CURRENT_INSTANCE} (直接回车保持原样)] ====${RESET}"
+    else
+        local conf_file="${INSTANCE_DIR}/${CURRENT_INSTANCE}.toml"
+        if [ -f "$conf_file" ]; then
+            warn "实例 [ ${CURRENT_INSTANCE} ] 已经存在对应配置文件。"
+            read -r -p "$(echo -e "${GREEN}是否确定完全覆盖重写该实例？[y/N]: ${RESET}")" res
+            [[ "$res" =~ ^[Yy]$ ]] || return
+        fi
+        echo -e "\n${GREEN}==== [配置新实例 ${CURRENT_INSTANCE} 参数] ====${RESET}"
+        OLD_PROTO="socks5" OLD_IP="0.0.0.0" OLD_PORT="$((RANDOM % 50001 + 10000))" OLD_USER="mica_$(openssl rand -hex 3)" OLD_PASS="$(openssl rand -hex 8)" OLD_OUTBOUND="default"
     fi
 
-    echo -e "\n${GREEN}==== [配置新实例 ${CURRENT_INSTANCE} 参数] ====${RESET}"
-    echo "1. SOCKS5 代理模式 (默认，附带完整 UDP 转发能力)"
-    echo "2. HTTP 传输代理模式"
-    read -r -p "选择形态序号 [1-2]: " proto_choice
-    local opt_proto="socks5"
-    if [ "$proto_choice" = "2" ]; then opt_proto="http"; fi
+    # 1. 协议选择
+    if [ "$is_edit" = "true" ]; then
+        echo -e "当前协议类型: ${CYAN}${OLD_PROTO^^}${RESET} (1. SOCKS5 | 2. HTTP)"
+        read -r -p "请输入新序号 [直接回车不修改]: " proto_choice
+    else
+        echo "1. SOCKS5 代理模式 (默认，附带完整 UDP 转发能力)"
+        echo "2. HTTP 传输代理模式"
+        read -r -p "选择形态序号 [1-2]: " proto_choice
+    fi
+    local opt_proto="$OLD_PROTO"
+    if [ "$proto_choice" = "1" ]; then opt_proto="socks5"; elif [ "$proto_choice" = "2" ]; then opt_proto="http"; fi
 
-    read -r -p "$(echo -e "${GREEN}请输入监听网卡 IP [回车默认 0.0.0.0]: ${RESET}")" input_ip
-    local opt_ip="${input_ip:-0.0.0.0}"
+    # 2. IP 绑定
+    read -r -p "$(echo -e "${GREEN}请输入监听网卡 IP [当前: ${YELLOW}${OLD_IP}${GREEN} | 回车不改]: ${RESET}")" input_ip
+    local opt_ip="${input_ip:-$OLD_IP}"
 
-    local rand_port=$((RANDOM % 50001 + 10000))
-    read -r -p "$(echo -e "${GREEN}请输入服务端口 [回车分配随机端口 ${rand_port}]: ${RESET}")" input_port
-    local opt_port="${input_port:-$rand_port}"
+    # 3. 端口绑定
+    read -r -p "$(echo -e "${GREEN}请输入服务端口 [当前: ${YELLOW}${OLD_PORT}${GREEN} | 回车不改]: ${RESET}")" input_port
+    local opt_port="${input_port:-$OLD_PORT}"
     
-    local rand_user="mica_$(openssl rand -hex 3)"
-    local rand_pass="$(openssl rand -hex 8)"
+    # 4. 账号密码鉴权
     local opt_user="" local opt_pass=""
-
-    read -r -p "$(echo -e "${GREEN}配置连接账户 [回车默认随机，输入 ${RED}none${GREEN} 选免密开放]: ${RESET}")" input_user
+    read -r -p "$(echo -e "${GREEN}配置连接账户 [当前: ${YELLOW}${OLD_USER}${GREEN} | 输入 ${RED}none${GREEN} 开放免密 | 回车不改]: ${RESET}")" input_user
     if [ -z "$input_user" ]; then
-        opt_user="$rand_user"
-        read -r -p "$(echo -e "${GREEN}配置专属密码 [回车分配随机: ${YELLOW}${rand_pass}${GREEN}]: ${RESET}")" input_pass
-        opt_pass="${input_pass:-$rand_pass}"
+        if [ "$OLD_USER" = "none" ]; then opt_user=""; opt_pass=""; else opt_user="$OLD_USER"; opt_pass="$OLD_PASS"; fi
     elif [ "$input_user" = "none" ]; then
-        opt_user="" ; opt_pass=""
+        opt_user=""; opt_pass=""
     else
         opt_user="$input_user"
-        read -r -p "$(echo -e "${GREEN}请输入指定密码: ${RESET}")" input_pass
-        opt_pass="${input_pass:-$rand_pass}"
+        read -r -p "$(echo -e "${GREEN}请输入新密码 [当前: ${YELLOW}${OLD_PASS}${GREEN}]: ${RESET}")" input_pass
+        opt_pass="${input_pass:-$OLD_PASS}"
     fi
+
+    # 5. 出站 Profile 路由类型
+    echo -e "\n${GREEN}==== [选择出站 Profile 路由路径] ====${RESET}"
+    if [ "$is_edit" = "true" ]; then
+        echo -e "当前出站路径: ${CYAN}${OLD_OUTBOUND}${RESET}"
+    fi
+    echo "1. default (系统默认路由，普通混合网络)"
+    echo "2. ipv4    (IPv4-only，强制仅解析A记录/仅走v4)"
+    echo "3. ipv6    (IPv6-only，强制仅解析AAAA记录/仅走v6)"
+    read -r -p "选择出站路径序号 [1-3, 回车不修改]: " outbound_choice
+    local opt_outbound="$OLD_OUTBOUND"
+    if [ "$outbound_choice" = "1" ]; then opt_outbound="default"; elif [ "$outbound_choice" = "2" ]; then opt_outbound="ipv4"; elif [ "$outbound_choice" = "3" ]; then opt_outbound="ipv6"; fi
 
     if [ ! -f "$BIN_PATH" ]; then
         download_bin
         install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$BIN_PATH"
-        rm -rf "$(dirname "$TARGET_BIN_PATH")"  # 转移资产后安全回收临时文件夹
+        rm -rf "$(dirname "$TARGET_BIN_PATH")"
     fi
 
-    write_config "$CURRENT_INSTANCE" "$opt_proto" "$opt_ip" "$opt_port" "$opt_user" "$opt_pass"
+    write_config "$CURRENT_INSTANCE" "$opt_proto" "$opt_ip" "$opt_port" "$opt_user" "$opt_pass" "$opt_outbound"
     write_template_service
 
-    info "正在拉起沙箱隔离实例: ${CURRENT_INSTANCE} ..."
+    info "正在加载新配置并重启沙箱实例: ${CURRENT_INSTANCE} ..."
     systemctl enable "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" >/dev/null 2>&1
     systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"
     
     sleep 1.5
     if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"; then
-        ok "MicaProxy 多实例矩阵 [ ${CURRENT_INSTANCE} ] 成功拉起且未触碰沙箱警报！"
+        ok "MicaProxy 实例 [ ${CURRENT_INSTANCE} ] 运行参数已完美更新！"
         print_node_summary "$CURRENT_INSTANCE"
     else
-        warn "实例成功部署，但触发了本地未知阻断，请按 [8] 抓取内核滚动日志。"
+        warn "实例重启成功，但检测到异常挂起，请按 [8] 抓取滚动日志。"
     fi
 }
 
@@ -434,11 +476,10 @@ menu_uninstall() {
         rm -rf "/opt/MicaProxy" "$DATA_DIR"
         systemctl daemon-reload
         ok "全局所有核心组件、沙箱配置已彻底卸载！"
-        CURRENT_INSTANCE="default"
+        CURRENT_INSTANCE="$(hostname)"
     fi
 }
 
-# ── 4. 控制中心核心无限循环 ──────────────────────────────────────────────────
 while true; do
     get_status_info
     clear
@@ -453,6 +494,7 @@ while true; do
     echo -e "${GREEN} 1. 安装 当前控制实例${RESET}"
     echo -e "${GREEN} 2. 更新 当前控制实例${RESET}"
     echo -e "${GREEN} 3. 卸载 当前控制实例${RESET}"
+    echo -e "${GREEN} 4. 修改 当前控制实例${RESET}"
     echo -e "${GREEN} 5. 启动 当前控制实例${RESET}"
     echo -e "${GREEN} 6. 停止 当前控制实例${RESET}"
     echo -e "${GREEN} 7. 重启 当前控制实例${RESET}"
@@ -464,16 +506,17 @@ while true; do
     
     read -r -p "$(echo -e "${GREEN}选择操作序号: ${RESET}")" choice
     case "$choice" in
-        1) menu_install ;;
+        1) menu_install "new" ;;
         2) download_bin && install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$BIN_PATH" && rm -rf "$(dirname "$TARGET_BIN_PATH")" && ok "核心覆盖成功" ;;
         3) menu_uninstall ;;
+        4) menu_install "edit" ;;
         5) systemctl start "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && ok "拉起成功" ;;
         6) systemctl stop "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && ok "挂起成功" ;;
         7) systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && ok "重启完毕" ;;
         8) (trap 'echo -e "\n"' INT; journalctl -u "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" -n 50 -f) ;;
         9) print_node_summary "$CURRENT_INSTANCE" ;;
         10) menu_switch_instance ;;
-        0) clear; exit 0 ;;
+        10) exit 0 ;;
         *) warn "无效输入！"; sleep 1 ;;
     esac
     read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键重新返回控制台面...${RESET}")"

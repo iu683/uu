@@ -1,367 +1,511 @@
 #!/bin/bash
+# ========================================
+# 多项目 Docker Compose 管理脚本
+# ========================================
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-NC='\033[0m' # 无颜色
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+RESET="\033[0m"
 
-# 脚本路径定义
-INSTALL_DIR="$HOME/gproxy-tool"
-CONFIG_FILE="$HOME/.config/gproxy/config.env"
+PROJECTS_DIR="/opt"
 
-# GITHUB 代理自动轮询列表（最后一个为空代表直连）
-GITHUB_PROXY=(
-    'https://v6.gh-proxy.org/'
-    'https://gh-proxy.com/'
-    'https://hub.glowp.xyz/'
-    'https://proxy.vvvv.ee/'
-    'https://ghproxy.lvedong.eu.org/'
-    ''
-)
-
-# 动态获取 tunnel.sh 路径
-get_tunnel_path() {
-    if [ -f "/usr/lib/gproxy/lib/tunnel.sh" ]; then
-        echo "/usr/lib/gproxy/lib/tunnel.sh"
-    elif [ -f "$INSTALL_DIR/lib/tunnel.sh" ]; then
-        echo "$INSTALL_DIR/lib/tunnel.sh"
+# ---------------------------
+# 确认操作
+# ---------------------------
+function confirm_action() {
+    read -p "确认执行此操作吗？(y/N): " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        return 0
     else
-        echo ""
+        echo -e "${RED}操作已取消${RESET}"
+        sleep 1
+        return 1
     fi
 }
 
-# 检查是否安装了 gproxy
-check_status() {
-    if command -v gproxy &> /dev/null; then
-        echo -e "${GREEN}[已安装]${NC}"
-    else
-        echo -e "${RED}[未安装]${NC}"
-    fi
+# ---------------------------
+# 操作完成提示
+# ---------------------------
+function action_done() {
+    read -p "$(echo -e ${GREEN}操作完成！按回车返回菜单...${RESET})" temp
 }
 
-# 获取当前本地端口
-get_current_port() {
-    local tunnel_path=$(get_tunnel_path)
-    if [ -n "$tunnel_path" ] && [ -f "$tunnel_path" ]; then
-        grep -E '^LOCAL_PORT=' "$tunnel_path" | cut -d'=' -f2
-    else
-        echo "19527"
-    fi
+# ---------------------------
+# 状态汉化核心引擎
+# ---------------------------
+function translate_status() {
+    local raw_status="$1"
+    echo "$raw_status" | \
+        sed 's/Up /运行 /' | \
+        sed 's/Exited/已停止/' | \
+        sed 's/(healthy)/(健康)/' | \
+        sed 's/(unhealthy)/(非健康)/' | \
+        sed 's/(starting)/(启动中)/' | \
+        sed 's/seconds/秒/' | \
+        sed 's/second/秒/' | \
+        sed 's/minutes/分钟/' | \
+        sed 's/minute/分钟/' | \
+        sed 's/hours/小时/' | \
+        sed 's/hour/小时/' | \
+        sed 's/days/天/' | \
+        sed 's/day/天/' | \
+        sed 's/weeks/周/' | \
+        sed 's/week/周/' | \
+        sed 's/months/月/' | \
+        sed 's/month/月/' | \
+        sed 's/about //' | \
+        sed 's/ago/前/'
 }
 
-# 检查并自动安装 Git 依赖
-check_git_dependency() {
-    if ! command -v git &> /dev/null; then
-        echo -e "${YELLOW}检测到系统未安装 Git，正在尝试自动安装...${NC}"
-        if command -v apt-get &> /dev/null; then
-            sudo apt-get update && sudo apt-get install -y git
-        elif command -v yum &> /dev/null; then
-            sudo yum install -y git
-        elif command -v apk &> /dev/null; then
-            sudo apk add git
-        else
-            echo -e "${RED}错误: 未找到系统包管理器，请手动安装 git 后再运行。${NC}"
-            return 1
-        fi
-    fi
-    return 0
-}
-
-# 检查并导入私钥
-handle_ssh_key_import() {
-    echo -e "\n${YELLOW}正在检查免密私钥...${NC}"
-    local key_path="$HOME/.ssh/vps_key"
-    if [ -f "$key_path" ]; then
-        mkdir -p config
-        cp "$key_path" config/
-        echo -e "${GREEN}自动发现并复制私钥 $key_path 到 config/ 目录${NC}"
-    else
-        read -p "未找到默认私钥，请手动输入私钥路径 (直接回车跳过): " custom_key
-        if [ -f "$custom_key" ]; then
-            mkdir -p config
-            cp "$custom_key" config/
-            echo -e "${GREEN}成功复制私钥 $custom_key 到 config/ 目录${NC}"
-        else
-            echo -e "${YELLOW}提示: 未放入私钥，稍后可在交互配置中手动指定。${NC}"
-        fi
-    fi
-}
-
-# 菜单头部
-show_header() {
+# ---------------------------
+# 查看所有项目容器运行状态（主菜单功能） 
+# ---------------------------
+monitor_docker_containers() {
     clear
-    echo -e " ${GREEN}=======================================${NC}"
-    echo -e " ${GREEN}  ◈ GProxy - SSH 隧道网络加速工具 ◈    ${NC}"
-    echo -e " ${GREEN}=======================================${NC}"
-    echo -e " ${GREEN}当前状态:${NC} $(check_status)"
-    echo -e " ${GREEN}代理端口:${NC} ${YELLOW}($(get_current_port))${NC}"
-    echo -e " ${GREEN}=======================================${NC}"
-}
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}      🐳 Docker 项目容器状态监控        ${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
 
-# 1. 生成SSH密钥并打通免密
-prepare_ssh_key() {
-    echo -e "${YELLOW}[步骤 1/3] 正在国内服务器生成 SSH 密钥对...${NC}"
-    if [ -f "$HOME/.ssh/vps_key" ]; then
-        echo -e "${PURPLE}提示: 发现已存在密钥文件 ~/.ssh/vps_key，跳过生成。${NC}"
-    else
-        ssh-keygen -t rsa -b 4096 -f "$HOME/.ssh/vps_key" -N ""
-        echo -e "${GREEN}成功生成密钥: ~/.ssh/vps_key${NC}"
-    fi
-
-    echo -e "\n${YELLOW}[步骤 2/3] 将公钥复制到海外 VPS (请按提示操作)...${NC}"
-    read -p "请输入海外 VPS 的 IP 地址: " vps_ip
-    read -p "请输入海外 VPS 的 SSH 用户名 (默认 root): " vps_user
-    vps_user=${vps_user:-root}
-    read -p "请输入海外 VPS 的 SSH 端口 (默认 22): " vps_port
-    vps_port=${vps_port:-22}
-
-    echo -e "${BLUE}正在执行 ssh-copy-id，接下来请输入海外 VPS 的密码...${NC}"
-    ssh-copy-id -p "$vps_port" -i "$HOME/.ssh/vps_key.pub" "$vps_user@$vps_ip"
-
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}[OK] 公钥复制成功！${NC}"
-        echo -e "${YELLOW}[OK] 私钥文件路径:/root/.ssh/vps_key${NC}"
-        echo -e "\n${YELLOW}[步骤 3/3] 正在测试免密登录...${NC}"
-        echo -e "${GREEN}尝试不输入密码登录海外 VPS 并执行 'echo 连接成功'：${NC}"
-        ssh -p "$vps_port" -i "$HOME/.ssh/vps_key" -o PasswordAuthentication=no -o StrictHostKeyChecking=no "$vps_user@$vps_ip" "echo '🎉 [OK] 成功连接到海外 VPS，免密配置完美！'"
-    else
-        echo -e "${RED}[ERROR] 公钥复制失败，请检查网络或海外密码是否正确。${NC}"
-    fi
-
-    read -p "按回车键返回主菜单..." dummy
-}
-
-# 2. 全新下载并安装 (核心：多代理逐个尝试)
-install_gproxy() {
-    check_git_dependency || { read -p "按回车键返回主菜单..." dummy; return 1; }
-
-    if [ -d "$INSTALL_DIR" ]; then
-        echo -e "${RED}提示: 检测到目录 $INSTALL_DIR 已存在。${NC}"
-        echo -e "${YELLOW}全新安装需要清空该目录。如果您想保留配置并更新，请选择菜单中的 [更新] 选项。${NC}"
-        read -p "确定要清空该目录并重新安装吗？(y/n): " clean_confirm
-        if [[ "$clean_confirm" =~ ^[Yy]$ ]]; then
-            rm -rf "$INSTALL_DIR"
-        else
-            echo -e "${GREEN}已取消安装。${NC}"
-            read -p "按回车键返回主菜单..." dummy
-            return 0
-        fi
-    fi
-
-    local success=false
-    for url in "${GITHUB_PROXY[@]}"; do
-        if [ -z "$url" ]; then
-            echo -e "${YELLOW}正在尝试以 [直连模式] 克隆仓库...${NC}"
-        else
-            echo -e "${YELLOW}正在尝试通过代理 [ ${url} ] 克隆仓库...${NC}"
-        fi
-
-        if git clone "${url}https://github.com/xtianowner/gproxy-tool.git" "$INSTALL_DIR"; then
-            success=true
-            echo -e "${GREEN}✅ 克隆成功！${NC}"
-            break
-        else
-            echo -e "${RED}❌ 当前节点连接失败，正在尝试下一个...${NC}"
-            rm -rf "$INSTALL_DIR" 2>/dev/null
-        fi
-    done
-
-    if [ "$success" = false ]; then
-        echo -e "${RED}❌ 抱歉，尝试了所有 GitHub 代理节点以及直连，均无法连接服务器。请检查您的网络设置！${NC}"
-        read -p "按回车键返回主菜单..." dummy
-        return 1
-    fi
-
-    cd "$INSTALL_DIR" || exit
-    handle_ssh_key_import
-
-    echo -e "\n${YELLOW}开始执行安装程序...${NC}"
-    sudo sh install.sh
+    projects=($(find "$PROJECTS_DIR" -maxdepth 1 -type d -exec test -f '{}/docker-compose.yml' \; -print | sort))
     
-    echo -e "${GREEN}🎉 GProxy 安装程序执行完毕！${NC}"
-    echo -e "${GREEN}🎉 首次运行请选择 4 配置${NC}"
-    read -p "按回车键返回主菜单..." dummy
-}
-
-# 3. 独立更新函数 (核心：多代理逐个尝试)
-update_gproxy() {
-    check_git_dependency || { read -p "按回车键返回主菜单..." dummy; return 1; }
-
-    if [ ! -d "$INSTALL_DIR" ]; then
-        echo -e "${RED}错误: 未找到克隆目录 $INSTALL_DIR，无法进行更新，请先执行全新安装！${NC}"
-        read -p "按回车键返回主菜单..." dummy
-        return 1
-    fi
-
-    cd "$INSTALL_DIR" || exit
-    local success=false
-
-    for url in "${GITHUB_PROXY[@]}"; do
-        if [ -z "$url" ]; then
-            echo -e "${YELLOW}正在尝试以 [直连模式] 获取更新...${NC}"
-        else
-            echo -e "${YELLOW}正在尝试通过代理 [ ${url} ] 获取更新...${NC}"
-        fi
-
-        # 动态修改远程仓库地址，防止旧节点卡死
-        git remote set-url origin "${url}https://github.com/xtianowner/gproxy-tool.git"
-        
-        # 尝试拉取更新（设置15秒超时防止原生 git pull 无限挂起）
-        if git pull; then
-            success=true
-            echo -e "${GREEN}✅ 成功同步最新源码！${NC}"
-            break
-        else
-            echo -e "${RED}❌ 当前节点更新失败，正在尝试下一个...${NC}"
-        fi
-    done
-
-    if [ "$success" = false ]; then
-        echo -e "${RED}❌ 抱歉，所有代理节点更新失败，请稍后再试。${NC}"
-        read -p "按回车键返回主菜单..." dummy
-        return 1
-    fi
-
-    echo -e "\n${YELLOW}正在重新执行安装脚本以应用更新...${NC}"
-    sudo sh install.sh
-    
-    echo -e "${GREEN}🎉 GProxy 更新覆盖完毕！${NC}"
-    read -p "按回车键返回主菜单..." dummy
-}
-
-# 4. 首次运行 / 测试配置
-test_config() {
-    if ! command -v gproxy &> /dev/null; then
-        echo -e "${RED}错误: GProxy 未安装，请先执行安装！${NC}"
+    if [ ${#projects[@]} -eq 0 ]; then
+        echo -e "${RED}未找到任何含 docker-compose.yml 的项目${RESET}"
     else
-        echo -e "${YELLOW}正在触发 GProxy 配置/测试命令...${NC}"
-        gproxy curl -I https://www.google.com
-    fi
-    read -p "按回车键返回主菜单..." dummy
-}
+        local all_stats
+        all_stats=$(docker stats --no-stream --format "{{.ID}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" 2>/dev/null)
 
-# 5. 重新配置服务器
-reconfig_vps() {
-    if ! command -v gproxy &> /dev/null; then
-        echo -e "${RED}错误: GProxy 未安装！${NC}"
-    else
-        gproxy --config
-    fi
-    read -p "按回车键返回主菜单..." dummy
-}
-
-# 6. 修改本地代理端口
-change_port() {
-    local tunnel_path=$(get_tunnel_path)
-    if [ -z "$tunnel_path" ]; then
-        echo -e "${RED}错误: 未找到 tunnel.sh 脚本！请确保已执行安装。${NC}"
-    else
-        current_port=$(get_current_port)
-        echo -e "${YELLOW}目标文件: $tunnel_path${NC}"
-        echo -e "${YELLOW}当前本地代理端口为: ${GREEN}$current_port${NC}"
-        read -p "请输入新的端口号 (1024-65353): " new_port
-        if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1024 ] && [ "$new_port" -le 65353 ]; then
-            if [ -w "$tunnel_path" ]; then
-                sed -i "s/^LOCAL_PORT=.*/LOCAL_PORT=$new_port/" "$tunnel_path"
-            else
-                sudo sed -i "s/^LOCAL_PORT=.*/LOCAL_PORT=$new_port/" "$tunnel_path"
+        for proj in "${projects[@]}"; do
+            local project_name=$(basename "$proj")
+            echo -e "${YELLOW}📁 项目群组: $project_name${RESET}"
+            echo -e "${YELLOW}----------------------------------------${RESET}"
+            
+            local l_compose="$proj/docker-compose.yml"
+            local services=$(docker compose -f "$l_compose" ps --services 2>/dev/null)
+            
+            if [ -z "$services" ]; then
+                echo -e "  ${YELLOW}暂无服务配置${RESET}"
+                echo -e "${YELLOW}----------------------------------------${RESET}"
+                continue
             fi
-            echo -e "${GREEN}端口已成功修改为 $new_port !${NC}"
-        else
-            echo -e "${RED}输入无效，未做任何修改。${NC}"
-        fi
+
+            local stats_list=()
+            for service in $services; do
+                local container_id=$(docker compose -f "$l_compose" ps -q "$service" 2>/dev/null)
+                local cpu="0.00%" mem="0B / 0B" net="0B / 0B" ports="无端口映射"
+                local raw_status="Exited (0) 0 seconds ago"
+
+                if [ -n "$container_id" ]; then
+                    local match_stats=$(echo "$all_stats" | grep "^${container_id:0:12}")
+                    if [ -n "$match_stats" ]; then
+                        cpu=$(echo "$match_stats" | cut -f2)
+                        mem=$(echo "$match_stats" | cut -f3)
+                        net=$(echo "$match_stats" | cut -f4)
+                    fi
+                    raw_status=$(docker ps -a --filter "id=$container_id" --format "{{.Status}}")
+                    local port_info=$(docker ps -a --filter "id=$container_id" --format "{{.Ports}}")
+                    [ -n "$port_info" ] && ports=$port_info
+                fi
+                stats_list+=("$service	$cpu	$mem	$net	$ports	$raw_status")
+            done
+            
+            printf "%s\n" "${stats_list[@]}" | sort -k3 -hr | while IFS=$'\t' read -r service cpu mem net ports raw_status; do
+                local uptime=$(translate_status "$raw_status")
+                local status_icon="${RED}❌${RESET}"
+                [[ "$raw_status" == *"Up"* ]] && status_icon="${GREEN}✅${RESET}"
+
+                echo -e "${YELLOW}◈ 服务: ${RESET}${YELLOW}${service}${RESET} ${status_icon}"
+                echo -e "  ├─ ${YELLOW}运行状态: ${RESET}${uptime}"
+                echo -e "  ├─ ${YELLOW}端口映射: ${RESET}${GREEN}${ports}${RESET}"
+                echo -e "  ├─ ${YELLOW}CPU 占用: ${RESET}${cpu}"
+                echo -e "  ├─ ${YELLOW}内存使用: ${RESET}${mem}"
+                echo -e "  └─ ${YELLOW}网络 I/O: ${RESET}${net}"
+                echo -e "${YELLOW}----------------------------------------${RESET}"
+            done
+            echo
+        done
     fi
-    read -p "按回车键返回主菜单..." dummy
+    read -p "按回车返回主菜单..." temp
 }
 
-# 7. 编辑配置文件
-edit_config() {
-    if [ -f "$CONFIG_FILE" ]; then
-        echo -e "${YELLOW}即将打开 $CONFIG_FILE ...${NC}"
-        nano "$CONFIG_FILE" || vim "$CONFIG_FILE" || vi "$CONFIG_FILE"
-    else
-        echo -e "${RED}配置文件不存在，请先运行一次配置。${NC}"
-    fi
-    read -p "按回车键返回主菜单..." dummy
-}
-
-# 8. 常用命令快捷查阅
-show_usage() {
+# ---------------------------
+# 选择项目
+# ---------------------------
+function select_project() {
     clear
-    echo -e "${CYAN}==============================================${NC}"
-    echo -e "${GREEN}            GProxy 常用命令速查手册            ${NC}"
-    echo -e "${CYAN}==============================================${NC}"
-    echo -e "${YELLOW}1.Git加速:${NC}gproxy git clone https://github.com/... "
-    echo -e "${YELLOW}2.Docker加速:${NC}gproxy docker pull alpine:latest"
-    echo -e "${YELLOW}3.Python pip:${NC}gproxy pip install torch"
-    echo -e "${YELLOW}4.Node.js npm:${NC}gproxy npm install"
-    echo -e "${YELLOW}5.系统更新:${NC}gproxy bash -c \"apt update && apt install -y vim\""
-    echo -e "${YELLOW}6.下载文件:${NC}gproxy wget https://... 或 gproxy curl -O ..."
-    echo -e "${YELLOW}7.安装脚本:${NC}gproxy bash -c \"bash <(curl -sL https://...)\""
-    echo -e "${CYAN}==============================================${NC}"
-    read -p "按回车键返回主菜单..." dummy
-}
-
-# 9. 卸载
-uninstall_gproxy() {
-    echo -e "${RED}警告: 您确定要卸载 GProxy 吗？(y/n)${NC}"
-    read -p "> " confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$INSTALL_DIR/uninstall.sh" ]; then
-            echo -e "${YELLOW}正在执行源码目录中的卸载程序...${NC}"
-            sudo sh "$INSTALL_DIR/uninstall.sh"
-        elif [ -f "/usr/lib/gproxy/uninstall.sh" ]; then
-            echo -e "${YELLOW}正在执行系统目录中的卸载程序...${NC}"
-            sudo sh /usr/lib/gproxy/uninstall.sh
-        else
-            echo -e "${YELLOW}未检测到标准的卸载脚本，尝试直接清理核心命令...${NC}"
-            sudo rm -f /usr/local/bin/gproxy /usr/bin/gproxy 2>/dev/null
-        fi
-
-        if [ -d "$INSTALL_DIR" ]; then
-            echo -e "${YELLOW}正在清理克隆目录: $INSTALL_DIR ...${NC}"
-            rm -rf "$INSTALL_DIR"
-            echo -e "${GREEN}源码目录清理完毕！${NC}"
-        fi
-        
-        echo -e "${GREEN}卸载流程执行完毕！${NC}"
-    else
-        echo -e "${GREEN}已取消卸载。${NC}"
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}       ◈    请选择要管理的项目    ◈     ${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
+    projects=($(find "$PROJECTS_DIR" -maxdepth 1 -type d -exec test -f '{}/docker-compose.yml' \; -print | sort))
+    if [ ${#projects[@]} -eq 0 ]; then
+        echo -e "${RED}未找到任何含 docker-compose.yml 的项目${RESET}"
+        sleep 1
+        return
     fi
-    read -p "按回车键返回主菜单..." dummy
+    for i in "${!projects[@]}"; do
+        project_name=$(basename "${projects[$i]}")
+        echo -e "${GREEN}$((i+1))) $project_name${RESET}"
+    done
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}0) 返回主菜单${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
+    read -p "$(echo -e ${GREEN}请输入编号: ${RESET})" choice
+    if [[ "$choice" == "0" ]]; then
+        return
+    elif [[ "$choice" =~ ^[0-9]+$ && $choice -ge 1 && $choice -le ${#projects[@]} ]]; then
+        PROJECT_DIR=${projects[$((choice-1))]}
+        COMPOSE_FILE="$PROJECT_DIR/docker-compose.yml"
+        project_menu
+    else
+        echo -e "${RED}无效选择${RESET}"
+        sleep 1
+        select_project
+    fi
 }
 
-# 主循环
-while true; do
-    show_header
-    echo -e " ${GREEN}1. 生成SSH密钥并打通免密(可选)${NC}"
-    echo -e " ${GREEN}2. 全新安装GProxy${NC}"
-    echo -e " ${GREEN}3. 检查并同步更新GProxy${NC}"
-    echo -e " ${GREEN}4. 首次配置/测试Google连通性${NC}"
-    echo -e " ${GREEN}5. 重新配置服务器信息${NC}"
-    echo -e " ${GREEN}6. 修改本地代理端口${NC}"
-    echo -e " ${GREEN}7. 手动编辑配置文件(多VPS切换)${NC}"
-    echo -e " ${GREEN}8. 查看常用命令使用示例${NC}"
-    echo -e " ${GREEN}9. 卸载 GProxy${NC}"
-    echo -e " ${GREEN}0. 退出${NC}"
-    echo -e " ${GREEN}=======================================${NC}"
-    read -p "$(echo -e "${GREEN}请输入数字选择操作: ${NC}")" choice
+# ---------------------------
+# 进入容器
+# ---------------------------
+function select_container() {
+    local containers=$(docker compose -f "$COMPOSE_FILE" ps --services)
+    if [ -z "$containers" ]; then
+        echo -e "${RED}没有正在运行的容器${RESET}"
+        sleep 1
+        return
+    fi
+    echo -e "${GREEN}可进入的容器：${RESET}"
+    echo -e "${GREEN}$containers${RESET}"
+    read -p "请输入容器名: " cname
+    if [[ "$containers" == *"$cname"* ]]; then
+        docker compose -f "$COMPOSE_FILE" exec "$cname" /bin/sh || docker compose -f "$COMPOSE_FILE" exec "$cname" /bin/bash
+        action_done
+    else
+        echo -e "${RED}容器不存在${RESET}"
+        sleep 1
+    fi
+}
 
-    case $choice in
-        1) prepare_ssh_key ;;
-        2) install_gproxy ;;
-        3) update_gproxy ;;
-        4) test_config ;;
-        5) reconfig_vps ;;
-        6) change_port ;;
-        7) edit_config ;;
-        8) show_usage ;;
-        9) uninstall_gproxy ;;
-        0) clear; exit 0 ;;
-        *) echo -e "${RED}无效输入，请重新选择！${NC}"; sleep 1 ;;
-    esac
-done
+# ---------------------------
+# 删除整个项目
+# ---------------------------
+function delete_project() {
+    echo -e "${RED}注意！这将删除整个项目，包括容器、镜像、数据卷和项目文件夹${RESET}"
+    if confirm_action; then
+        docker compose -f "$COMPOSE_FILE" down --rmi all -v
+        rm -rf "$PROJECT_DIR"
+        echo -e "${GREEN}项目已删除${RESET}"
+        sleep 1
+        return
+    fi
+}
+
+# ---------------------------
+# 多选删除项目（主菜单）
+# ---------------------------
+function delete_multiple_projects() {
+    clear
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}       ◈     多选删除项目     ◈         ${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
+    projects=($(find "$PROJECTS_DIR" -maxdepth 1 -type d -exec test -f '{}/docker-compose.yml' \; -print | sort))
+    if [ ${#projects[@]} -eq 0 ]; then
+        echo -e "${RED}未找到任何项目${RESET}"
+        sleep 1
+        return
+    fi
+
+    for i in "${!projects[@]}"; do
+        project_name=$(basename "${projects[$i]}")
+        echo -e "${GREEN}$((i+1))) $project_name${RESET}"
+    done
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}输入要删除的项目编号，用空格分隔（例如: 1 3 5），0 返回主菜单${RESET}"
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choices
+
+    if [[ "$choices" == "0" ]]; then
+        return
+    fi
+
+    for c in $choices; do
+        if [[ "$c" =~ ^[0-9]+$ && $c -ge 1 && $c -le ${#projects[@]} ]]; then
+            local proj="${projects[$((c-1))]}"
+            local l_compose="$proj/docker-compose.yml"
+            local p_name=$(basename "$proj")
+            echo -e "${RED}准备删除项目: $p_name${RESET}"
+            if confirm_action; then
+                docker compose -f "$l_compose" down --rmi all -v
+                rm -rf "$proj"
+                echo -e "${GREEN}已删除 $p_name${RESET}"
+            fi
+        else
+            echo -e "${RED}无效编号: $c${RESET}"
+        fi
+    done
+    action_done
+}
+
+# ---------------------------
+# 一键删除所有未运行的项目（主菜单）
+# ---------------------------
+function delete_all_stopped_projects() {
+    clear
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}   ◈    一键删除所有未运行项目    ◈     ${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
+    projects=($(find "$PROJECTS_DIR" -maxdepth 1 -type d -exec test -f '{}/docker-compose.yml' \; -print | sort))
+    if [ ${#projects[@]} -eq 0 ]; then
+        echo -e "${RED}未找到任何项目${RESET}"
+        sleep 1
+        return
+    fi
+
+    local deleted_any=false
+    for proj in "${projects[@]}"; do
+        local l_compose="$proj/docker-compose.yml"
+        local services=$(docker compose -f "$l_compose" ps --services 2>/dev/null)
+        local all_stopped=true
+        
+        for service in $services; do
+            local cid=$(docker compose -f "$l_compose" ps -q "$service" 2>/dev/null)
+            if [ -n "$cid" ]; then
+                local status=$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)
+                if [[ "$status" == "true" ]]; then
+                    all_stopped=false
+                    break
+                fi
+            fi
+        done
+
+        if [ -n "$services" ] && $all_stopped; then
+            local p_name=$(basename "$proj")
+            echo -e "${RED}准备删除未运行的项目: $p_name${RESET}"
+            if confirm_action; then
+                docker compose -f "$l_compose" down --rmi all -v
+                rm -rf "$proj"
+                echo -e "${GREEN}已删除 $p_name${RESET}"
+                deleted_any=true
+            fi
+        fi
+    done
+
+    if ! $deleted_any; then
+        echo -e "${GREEN}没有未运行的项目需要删除${RESET}"
+    fi
+    action_done
+}
+
+# ---------------------------
+# 项目管理菜单（已集成置顶状态与端口显示）
+# ---------------------------
+function project_menu() {
+    while true; do
+        clear
+        local project_name=$(basename "$PROJECT_DIR")
+        echo -e "${GREEN}========================================${RESET}"
+        echo -e "${GREEN}    ◈   管理项目: ${YELLOW}$project_name${RESET}   ◈     ${RESET}"
+        echo -e "${GREEN}========================================${RESET}"
+
+        
+        # ----------- 新增：动态显示当前项目的容器状态与端口 -----------
+        echo -e "${YELLOW}[ 当前容器实时状态 ]${RESET}"
+        local services=$(docker compose -f "$COMPOSE_FILE" ps --services 2>/dev/null)
+        if [ -z "$services" ]; then
+            echo -e "  ${YELLOW}暂无服务配置${RESET}"
+        else
+            for service in $services; do
+                local container_id=$(docker compose -f "$COMPOSE_FILE" ps -q "$service" 2>/dev/null)
+                local ports="无端口映射"
+                local raw_status="Exited (0) 0 seconds ago"
+                
+                if [ -n "$container_id" ]; then
+                    raw_status=$(docker ps -a --filter "id=$container_id" --format "{{.Status}}")
+                    local port_info=$(docker ps -a --filter "id=$container_id" --format "{{.Ports}}")
+                    [ -n "$port_info" ] && ports=$port_info
+                fi
+                
+                local uptime=$(translate_status "$raw_status")
+                local status_icon="${RED}❌${RESET}"
+                [[ "$raw_status" == *"Up"* ]] && status_icon="${GREEN}✅${RESET}"
+                
+                # 紧凑单行/双行输出，适合菜单顶部预览
+                echo -e "  ${YELLOW}◈ $service${RESET} $status_icon -> $uptime"
+                echo -e "    ${YELLOW}└─ 端口:${RESET} ${GREEN}$ports${RESET}"
+            done
+        fi
+        echo -e "${YELLOW}----------------------------------------${RESET}"
+        # -----------------------------------------------------------
+
+        echo -e "${GREEN} 1) 启动服务${RESET}"
+        echo -e "${GREEN} 2) 停止服务${RESET}"
+        echo -e "${GREEN} 3) 重启服务${RESET}"
+        echo -e "${GREEN} 4) 查看日志${RESET}"
+        echo -e "${GREEN} 5) 查看容器状态${RESET}"
+        echo -e "${GREEN} 6) 更新容器(pull&up)${RESET}"
+        echo -e "${GREEN} 7) 进入容器${RESET}"
+        echo -e "${GREEN} 8) 删除容器(含数据卷)${RESET}"
+        echo -e "${GREEN} 9) 删除容器+镜像+数据卷${RESET}"
+        echo -e "${GREEN}10) 删除整个项目(含文件）${RESET}"
+        echo -e "${GREEN}========================================${RESET}"
+        echo -e "${GREEN}11) 切换项目${RESET}"
+        echo -e "${GREEN} 0) 返回主菜单${RESET}"
+        echo -e "${GREEN}========================================${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case "$choice" in
+            1) docker compose -f "$COMPOSE_FILE" up -d && action_done ;;
+            2) docker compose -f "$COMPOSE_FILE" stop && action_done ;;
+            3) docker compose -f "$COMPOSE_FILE" down && docker compose -f "$COMPOSE_FILE" up -d && action_done ;;
+            4) docker compose -f "$COMPOSE_FILE" logs -f ; action_done ;;
+            5) docker compose -f "$COMPOSE_FILE" ps ; action_done ;;
+            6) docker compose -f "$COMPOSE_FILE" pull && docker compose -f "$COMPOSE_FILE" up -d && action_done ;;
+            7) select_container ;;
+            8) 
+                if confirm_action; then
+                    docker compose -f "$COMPOSE_FILE" down -v && action_done
+                fi
+                ;;
+            9) 
+                if confirm_action; then
+                    docker compose -f "$COMPOSE_FILE" down --rmi all -v && action_done
+                fi
+                ;;
+            10) delete_project; return ;;
+            11) select_project; return ;;
+            0) return ;;
+            *) echo -e "${RED}无效选择${RESET}" && sleep 1 ;;
+        esac
+    done
+}
+
+# ---------------------------
+# Docker 网络管理
+# ---------------------------
+function network_menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}   ◈    Docker 网络管理    ◈   ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}1) 查看所有网络${RESET}"
+        echo -e "${GREEN}2) 创建网络${RESET}"
+        echo -e "${GREEN}3) 删除网络${RESET}"
+        echo -e "${GREEN}4) 将容器加入网络（支持多选）${RESET}"
+        echo -e "${GREEN}5) 将容器退出网络（支持多选）${RESET}"
+        echo -e "${GREEN}0) 返回主菜单${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case "$choice" in
+            1)
+                docker network ls
+                read -p "按回车返回网络菜单..." temp
+                ;;
+            2)
+                read -p "请输入网络名称: " netname
+                read -p "请输入驱动 (bridge/overlay/macvlan，默认 bridge): " netdriver
+                netdriver=${netdriver:-bridge}
+                docker network create -d "$netdriver" "$netname" && echo -e "${GREEN}网络 $netname 创建成功${RESET}"
+                read -p "按回车返回网络菜单..." temp
+                ;;
+            3)
+                docker network ls --format "{{.Name}}" | nl
+                read -p "请输入要删除的网络编号: " num
+                netname=$(docker network ls --format "{{.Name}}" | sed -n "${num}p")
+                if [ -n "$netname" ]; then
+                    docker network rm "$netname" && echo -e "${GREEN}网络 $netname 删除成功${RESET}"
+                else
+                    echo -e "${RED}无效编号${RESET}"
+                fi
+                read -p "按回车返回网络菜单..." temp
+                ;;
+            4)
+                echo -e "${GREEN}可用网络：${RESET}"
+                docker network ls --format "{{.Name}}" | nl
+                read -p "请输入要加入的网络编号: " netnum
+                netname=$(docker network ls --format "{{.Name}}" | sed -n "${netnum}p")
+                if [ -z "$netname" ]; then
+                    echo -e "${RED}无效网络编号${RESET}"
+                    read -p "按回车返回网络菜单..." temp
+                    continue
+                fi
+
+                echo -e "${GREEN}正在运行的容器：${RESET}"
+                docker ps --format "{{.Names}}" | nl
+                read -p "请输入要加入网络的容器编号（支持多选，用空格分隔）: " cnumbers
+
+                for cnum in $cnumbers; do
+                    cname=$(docker ps --format "{{.Names}}" | sed -n "${cnum}p")
+                    if [ -n "$cname" ]; then
+                        docker network connect "$netname" "$cname" && echo -e "${GREEN}容器 $cname 已加入网络 $netname${RESET}"
+                    else
+                        echo -e "${RED}无效容器编号: $cnum${RESET}"
+                    fi
+                done
+                read -p "按回车返回网络菜单..." temp
+                ;;
+            5)
+                echo -e "${GREEN}可用网络：${RESET}"
+                docker network ls --format "{{.Name}}" | nl
+                read -p "请输入要退出的网络编号: " netnum
+                netname=$(docker network ls --format "{{.Name}}" | sed -n "${netnum}p")
+                if [ -z "$netname" ]; then
+                    echo -e "${RED}无效网络编号${RESET}"
+                    read -p "按回车返回网络菜单..." temp
+                    continue
+                fi
+
+                echo -e "${GREEN}已连接到 $netname 的容器：${RESET}"
+                docker network inspect "$netname" --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n' | nl
+                read -p "请输入要退出网络的容器编号（支持多选，用空格分隔）: " cnumbers
+
+                containers=($(docker network inspect "$netname" --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n'))
+                for cnum in $cnumbers; do
+                    cname=${containers[$((cnum-1))]}
+                    if [ -n "$cname" ]; then
+                        docker network disconnect "$netname" "$cname" && echo -e "${GREEN}容器 $cname 已退出网络 $netname${RESET}"
+                    else
+                        echo -e "${RED}无效容器编号: $cnum${RESET}"
+                    fi
+                done
+                read -p "按回车返回网络菜单..." temp
+                ;;
+            0)
+                return
+                ;;
+            *)
+                echo -e "${RED}无效选择${RESET}" && sleep 1
+                ;;
+        esac
+    done
+}
+
+# ---------------------------
+# 主菜单
+# ---------------------------
+function main_menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN} ◈  Docker Compose 项目管理  ◈ ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}1) 管理项目${RESET}"
+        echo -e "${GREEN}2) 网络管理${RESET}"
+        echo -e "${GREEN}3) 查看容器运行状态${RESET}"
+        echo -e "${GREEN}4) 多选删除项目${RESET}"
+        echo -e "${GREEN}5) 删除未运行的项目${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case "$choice" in
+            1) select_project ;;
+            2) network_menu ;;
+            3) monitor_docker_containers ;;
+            4) delete_multiple_projects ;;
+            5) delete_all_stopped_projects ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}" && sleep 1 ;;
+        esac
+    done
+}
+
+# 启动
+main_menu

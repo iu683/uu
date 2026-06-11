@@ -16,6 +16,7 @@ GITHUB_PROXY=(
     'https://ghproxy.lvedong.eu.org/'
 )
 
+
 # 获取操作系统 ID
 if [ -f /etc/os-release ]; then
     . /etc/os-release
@@ -59,10 +60,14 @@ fetch_and_run() {
 case "$OS" in
     alpine)
         # 执行 Alpine 适配版脚本
-        fetch_and_run "https://raw.githubusercontent.com/sistarry/toolbox/main/APAnyRealityS.sh"
+        fetch_and_run "https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/ShellCrash.sh"
         ;;
-    debian|ubuntu|centos|rocky|almalinux|fedora|*)
+    debian|ubuntu|centos|rocky|almalinux|fedora)
         # 执行原版脚本
-        fetch_and_run "https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/AnyRealityS.sh"
+        fetch_and_run "https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/ShellCrash.sh"
+        ;;
+    *)  
+        # 未能识别或暂不支持您的系统
+        fetch_and_run "https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh"
         ;;
 esac

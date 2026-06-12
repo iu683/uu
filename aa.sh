@@ -1,617 +1,771 @@
 #!/bin/bash
-# ========================================
-# Rclone 管理脚本 
-# ========================================
 
-# ================== 颜色 ==================
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-CYAN="\033[36m"
-RESET="\033[0m"
+FRP_INSTALL_DIR="/opt/frp"
+FRPS_BIN="/usr/local/bin/frps"
+FRPC_BIN="/usr/local/bin/frpc"
+ROLE_FILE="$FRP_INSTALL_DIR/.frp_role"
+INIT_FLAG="$FRP_INSTALL_DIR/.frp_inited"
+IS_OPENWRT=0
 
-# ================== 全局变量 & 目录配置 ==================
-BASE_DIR="/opt/rclone_manager"
-LOG_DIR="$BASE_DIR/log"
-SCRIPT_DIR="$BASE_DIR/scripts"
-CONFIG_FILE="$BASE_DIR/config.env"
-CRON_PREFIX="# rclone_sync_task:"
+G_STATUS=""
+G_VERSION=""
+G_PORT=""
+G_DASH_BIND=""  
 
-mkdir -p "$LOG_DIR" "$SCRIPT_DIR"
+# GitHub 轮询节点列表
+GITHUB_PROXY=(
+    'https://gh-proxy.com/'
+    'https://v6.gh-proxy.org/'
+    'https://ghproxy.lvedong.eu.org/'
+    'https://proxy.vvvv.ee/'
+    'https://hub.glowp.xyz/'
+    '' 
+)
 
-# 获取系统环境名称
-if [ -f /etc/os-release ]; then
-    OS=$(awk -F= '/^NAME/{print $2}' /etc/os-release | tr -d '"')
-else
-    OS=$(uname -s)
-fi
+DEFAULT_BACKUP_VER="0.69.1"
 
-# ================== 载入或初始化配置文件 ==================
-init_config() {
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        cat > "$CONFIG_FILE" <<EOF
-TG_TOKEN="填入你的默认BotToken"
-TG_CHAT_ID="填入你的默认ChatID"
-VPS_NAME="未命名VPS"
-EOF
-    fi
-    source "$CONFIG_FILE"
-}
-init_config
+# 标准颜色
+GREEN="\e[32m"
+YELLOW="\e[33m"
+CYAN="\e[36m"
+RED="\e[31m"
+RESET="\e[0m"
 
-# ================== 动态状态获取 ==================
-get_system_status() {
+is_openwrt() { [ -f /etc/openwrt_release ] && IS_OPENWRT=1 || IS_OPENWRT=0; }
+is_openwrt
 
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}         ◈   Rclone 管理面板   ◈       ${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
+
+# 获取公网 IP
+get_public_ip() {
+    # 修复：默认改为 auto 自动识别，纯 v6 机器也能正常获取 v6 IP
+    local mode=${1:-"auto"} 
+    local ip=""
     
-    if command -v rclone &> /dev/null; then
-        local rclone_ver=$(rclone version | head -n 1 | awk '{print $2}')
-        echo -e "${GREEN}Rclone 状态:${RESET} ${YELLOW}已安装 (${rclone_ver})${RESET}"
-    else
-        echo -e "${GREEN}Rclone 状态:${RESET} ${RED}未安装${RESET}"
-    fi
-
-    if command -v rclone &> /dev/null; then
-        local remote_count=$(rclone listremotes 2>/dev/null | wc -l)
-        echo -e "${GREEN}已配置网盘:${RESET} ${YELLOW}${remote_count} 个${RESET}"
-    else
-        echo -e "${GREEN}已配置网盘:${RESET} ${YELLOW}----${RESET}"
-    fi
-
-    local active_mounts=$(mount | grep -i "rclone" | awk '{print $3}')
-    if [ -n "$active_mounts" ]; then
-        echo -e "${GREEN}活跃挂载点: ${RESET}"
-        echo "$active_mounts" | while read -r mnt; do
-            echo -e " ${YELLOW}● $mnt (已开启开机自启)${RESET}"
+    if [[ "$mode" == "v4" ]]; then
+        # 强制获取 IPv4
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        # 强制获取 IPv6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
         done
     else
-        echo -e "${GREEN}活跃挂载点:${RESET} ${YELLOW}暂无活跃挂载${RESET}"
-    fi
-
-    local cron_count=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX" | wc -l)
-    echo -e "${GREEN}同步定时任务:${RESET} ${YELLOW}${cron_count} 个活跃任务${RESET}"
-
-    if [[ "$TG_TOKEN" == "填入你的默认BotToken" || -z "$TG_TOKEN" ]]; then
-        echo -e "${GREEN}TG 通知状态:${RESET} ${RED}未配置${RESET}"
-    else
-        echo -e "${GREEN}TG 通知状态:${RESET} ${YELLOW}已启用 (${VPS_NAME})${RESET}"
-    fi
-}
-
-# ================== 菜单 ==================
-show_menu() {
-    clear
-    get_system_status
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${CYAN} [ Rclone 管理 ]${RESET}"
-    echo -e "${GREEN} 1. 安装 Rclone${RESET}       ${GREEN} 2. 更新 Rclone${RESET}"
-    echo -e "${GREEN} 3. 配置 Rclone${RESET}       ${GREEN} 4. 查看远程存储列表${RESET}"
-    echo -e "${GREEN} 5. 查看远程存储文件${RESET}"
-    echo -e "${GREEN}----------------------------------------${RESET}"
-    echo -e "${CYAN} [ 挂载管理 (配置开机自启) ]${RESET}"
-    echo -e "${GREEN} 6. 挂载网盘 ${RESET}         ${GREEN} 7. 查看已创建的资产清单${RESET}"
-    echo -e "${GREEN} 8. 卸载指定挂载点${RESET}    ${GREEN} 9. 卸载所有挂载点${RESET}"
-    echo -e "${GREEN}10. 查看挂载运行状态${RESET}  ${GREEN}11. 查看挂载实时日志${RESET}"
-    echo -e "${GREEN}----------------------------------------${RESET}"
-    echo -e "${CYAN} [ 数据同步与任务 ]${RESET}"
-    echo -e "${GREEN}12. 同步 本地 → 远程${RESET}  ${GREEN}13. 同步 远程 → 本地${RESET}"
-    echo -e "${GREEN}14. 定时任务管理${RESET}"
-    echo -e "${GREEN}----------------------------------------${RESET}"
-    echo -e "${CYAN} [ 全局设置与常规 ]${RESET}"
-    echo -e "${GREEN}15. 修改TG通知参数${RESET}    ${GREEN}16. 卸载 Rclone${RESET}"
-    echo -e "${GREEN}----------------------------------------${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
-}
-
-# ================== 基础操作 ==================
-install_rclone() {
-    echo -e "${YELLOW}正在检测并安装 FUSE 挂载依赖组件...${RESET}"
-    
-    # 1. 智能识别包管理器并安装 FUSE
-    if command -v apt-get &> /dev/null; then
-        sudo apt-get update -y
-        # 优先安装 fuse3，如果失败则尝试安装 fuse
-        sudo apt-get install -y fuse3 || sudo apt-get install -y fuse
-    elif command -v dnf &> /dev/null; then
-        sudo dnf install -y fuse3 || sudo dnf install -y fuse
-    elif command -v yum &> /dev/null; then
-        sudo yum install -y fuse3 || sudo yum install -y fuse
-    else
-        echo -e "${YELLOW}未检测到主流包管理器，请手动确保系统已安装 fuse / fuse3，否则挂载功能可能无法使用。${RESET}"
-    fi
-
-    # 2. 验证 FUSE 是否安装成功
-    if command -v fusermount3 &> /dev/null || command -v fusermount &> /dev/null; then
-        echo -e "${GREEN}FUSE 依赖组件安装/检查成功！${RESET}"
-    else
-        echo -e "${RED}⚠️ FUSE 依赖安装可能失败，后续网盘挂载功能（Option 6）可能会报错。${RESET}"
-    fi
-
-    # 3. 安装 Rclone 本体
-    echo -e "${YELLOW}正在安装 Rclone 本体...${RESET}"
-    if curl https://rclone.org/install.sh | sudo bash; then
-        echo -e "${GREEN}Rclone 安装完成！${RESET}"
-    else
-        echo -e "${RED}❌ Rclone 本体安装失败，请检查网络连接。${RESET}"
-    fi
-}
-
-update_rclone() {
-    echo -e "${YELLOW}正在更新 Rclone...${RESET}"
-    curl https://rclone.org/install.sh | sudo bash
-    echo -e "${GREEN}Rclone 已更新完成！${RESET}"
-    rclone version
-}
-
-config_rclone() { rclone config; }
-list_remotes() { rclone listremotes; }
-
-list_files_remote() {
-    read -p "请输入Rclone创建的网盘名称: " remote
-    [ -z "$remote" ] && { echo -e "${RED}远程名称不能为空${RESET}"; return; }
-    read -p "请输入远程目录(默认 /): " remote_dir
-    remote_dir=${remote_dir:-/}
-    rclone ls "${remote}:${remote_dir}" || echo -e "${RED}访问失败，请检查名称或权限${RESET}"
-}
-
-# ================== TG 参数持久化 ==================
-modify_tg() {
-    read -p "请输入 TG Bot Token (当前: $TG_TOKEN): " input_token
-    read -p "请输入 TG Chat ID (当前: $TG_CHAT_ID): " input_id
-    read -p "请输入 VPS 名称 (当前: $VPS_NAME): " input_name
-
-    TG_TOKEN=${input_token:-$TG_TOKEN}
-    TG_CHAT_ID=${input_id:-$TG_CHAT_ID}
-    VPS_NAME=${input_name:-$VPS_NAME}
-
-    cat > "$CONFIG_FILE" <<EOF
-TG_TOKEN="$TG_TOKEN"
-TG_CHAT_ID="$TG_CHAT_ID"
-VPS_NAME="$VPS_NAME"
-EOF
-    echo -e "${GREEN}TG 参数已成功保存到本地配置文件！${RESET}"
-}
-
-send_tg() {
-    local msg="$1"
-    source "$CONFIG_FILE"
-    if [[ "$TG_TOKEN" != "填入你的默认BotToken" ]]; then
-        curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-            -d chat_id="${TG_CHAT_ID}" -d text="[$VPS_NAME] $msg" >/dev/null
-    fi
-}
-
-
-# ================== 智能挂载自启动一体化 ==================
-mount_remote() {
-
-
-    read -p "请输入Rclone创建的网盘名称: " remote
-    [ -z "$remote" ] && return
-    
-    read -p "请输入网盘内的存储桶/子目录 (如 sss): " remote_dir
-    
-    # 如果用户输入了桶名，自动去掉前后的斜杠
-    remote_dir=$(echo "$remote_dir" | sed 's/^\///;s/\/$//')
-    
-    # 智能生成默认本地路径
-    if [ -z "$remote_dir" ]; then
-        default_path="/mnt/${remote}"
-        local mount_source="${remote}:"
-    else
-        # 如果有桶名，本地目录名变成 /mnt/CF_sss，更直观
-        default_path="/mnt/${remote}_${remote_dir}"
-        local mount_source="${remote}:${remote_dir}"
-    fi
-    
-    read -p "请输入VPS本地挂载路径 (默认 $default_path): " input_path
-    path=${input_path:-$default_path}
-    
-    # 1. 检查防冲突与强行清理僵尸挂载
-    if mount | grep -q "on $path type"; then
-        echo -e "${YELLOW}该本地路径 $path 已经被挂载。正在执行热刷新升级...${RESET}"
-        sudo umount -l "$path" 2>/dev/null
-    fi
-
-    # 清理可能残留的 PID（新版 Rclone 推荐靠 systemd 管理进程）
-    [ -f "/var/run/rclone_${remote}.pid" ] && rm -f "/var/run/rclone_${remote}.pid"
-
-    sudo mkdir -p "$path"
-    service_file="/etc/systemd/system/rclone-mount@${remote}.service"
-    
-    # 2. 写入 Systemd (完美适配 R2 特性参数)
-    sudo tee "$service_file" >/dev/null <<EOF
-[Unit]
-Description=Rclone Mount ${remote}
-After=network-online.target
-
-[Service]
-Type=simple
-User=root
-# 核心参数优化：加入了权限允许、写入缓存
-ExecStart=/usr/bin/rclone mount ${mount_source} $path \\
-    --allow-other \\
-    --vfs-cache-mode full \\
-    --vfs-cache-max-age 24h \\
-    --vfs-cache-max-size 10G \\
-    --buffer-size 64M \\
-    --dir-cache-time 1h \\
-    --drive-chunk-size 64M
-# 使用更强壮的 lazy umount 停止服务，防止卸载时卡死
-ExecStop=/usr/bin/umount -l $path
-Restart=always
-RestartSec=10
-StandardOutput=append:$LOG_DIR/rclone_${remote}_sys.log
-StandardError=append:$LOG_DIR/rclone_${remote}_sys.log
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    # 3. 启动服务
-    sudo systemctl daemon-reload
-    sudo systemctl enable rclone-mount@${remote}
-    sudo systemctl restart rclone-mount@${remote} # 用 restart 确保应用新配置
-    
-    echo "正在等待挂载启动..."
-    sleep 3
-    
-    # 4. 验证挂载状态
-    if systemctl is-active --quiet "rclone-mount@${remote}"; then
-        echo -e "${GREEN}✅ 已成功将网盘 [${mount_source}] 挂载到本地 [${path}]！${RESET}"
-        echo -e "${GREEN}ℹ️ 缓存刷新时间设为 1 小时，新文件会在 1 小时内自动同步。${RESET}"
-        echo -e "${GREEN}⚙️ 开机自启动守护已妥善配置。可以使用 'df -h' 查看状态。${RESET}"
-    else
-        echo -e "${RED}❌ 挂载启动失败！${RESET}"
-        echo -e "${RED}请运行以下命令查看具体报错日志:${RESET}"
-        echo -e "${YELLOW}tail -n 20 $LOG_DIR/rclone_${remote}_sys.log${RESET}"
-    fi
-}
-
-
-unmount_remote_by_name() {
-    read -p "请输入想要卸载的Rclone创建的网盘名称 (如 CF): " remote
-    [ -z "$remote" ] && return
-    
-    local svc="rclone-mount@${remote}"
-    local service_file="/etc/systemd/system/${svc}.service"
-    local path=""
-
-    # 核心改进：从现有的 systemd 服务文件中提取真正的本地挂载路径
-    if [ -f "$service_file" ]; then
-        # 匹配 ExecStart 中最后一个以 / 开头的路径参数
-        path=$(grep "ExecStart=" "$service_file" | awk '{print $NF}')
-    fi
-    
-    # 如果没找到服务文件，则降级使用默认猜测路径
-    if [ -z "$path" ]; then
-        path="/mnt/${remote}"
-    fi
-    
-    # 1. 停止并移除 Systemd 自启守护服务
-    if [ -f "$service_file" ] || systemctl list-unit-files | grep -q "^${svc}"; then
-        echo -e "${YELLOW}正在停止并移除 [${remote}] 的开机自启动守护服务...${RESET}"
-        sudo systemctl stop "$svc" 2>/dev/null
-        sudo systemctl disable "$svc" 2>/dev/null
-        sudo rm -f "$service_file"
-        sudo systemctl daemon-reload
-    fi
-
-    # 2. 强行解除本地挂载（优先使用通用的 umount -l，防止死锁）
-    echo -e "${YELLOW}正在解除路径 [${path}] 的网络挂载...${RESET}"
-    sudo umount -l "$path" 2>/dev/null || sudo fusermount -u "$path" 2>/dev/null
-    
-    # 3. 清理残留
-    [ -f "/var/run/rclone_${remote}.pid" ] && rm -f "/var/run/rclone_${remote}.pid"
-
-    echo -e "${GREEN}✅ 远程存储 ${remote} 卸载完成，本地目录 [${path}] 已释放，自启同步移除！${RESET}"
-}
-
-unmount_all() {
-    echo -e "${YELLOW}正在全面清空并移除所有网盘挂载与开机自启动...${RESET}"
-    
-    # 核心改进：直接从配置目录扫描所有 rclone-mount@ 开头的服务文件，不管它当前是运行还是停止
-    local sys_services=$(find /etc/systemd/system/ -name "rclone-mount@*.service" -exec basename {} \;)
-    
-    if [ -n "$sys_services" ]; then
-        for svc in $sys_services; do
-            echo -e "${CYAN} ➜ 正在彻底清理服务: $svc${RESET}"
-            sudo systemctl stop "$svc" 2>/dev/null
-            sudo systemctl disable "$svc" 2>/dev/null
-            sudo rm -f "/etc/systemd/system/$svc"
+        # auto 模式：双栈环境优先获取 IPv4，纯 v6 环境自动 fallback 到 v6
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
         done
-        sudo systemctl daemon-reload
-    fi
-
-    # 清理所有相关的 PID 文件
-    rm -f /var/run/rclone_*.pid
-
-    # 强行拆除所有处于 rclone 类型的挂载点（通过 mount 动态抓取，绝不漏网）
-    local active_mounts=$(mount | grep -i "rclone" | awk '{print $3}')
-    if [ -n "$active_mounts" ]; then
-        echo "$active_mounts" | while read -r mnt; do
-            echo -e "${CYAN} ➜ 正在强制卸载僵尸目录: $mnt${RESET}"
-            sudo umount -l "$mnt" 2>/dev/null || sudo fusermount -u "$mnt" 2>/dev/null
+        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
         done
     fi
-    echo -e "${GREEN}✅ 系统内所有 Rclone 挂载及相关自启服务已全部清洗完毕。${RESET}"
-}
-# ================== 资产清单综合查看面板 ==================
-show_assets_manifest() {
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}       📁 Rclone 已创资产名称清单      ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    
-    # 1. 扫描已生成的自启动挂载服务
-    echo -e "${CYAN}[1] 已创建的自启动挂载服务名字信息：${RESET}"
-    local service_files=$(ls /etc/systemd/system/rclone-mount@*.service 2>/dev/null)
-    if [ -n "$service_files" ]; then
-        echo "$service_files" | while read -r file; do
-            # 提取网盘名称
-            local r_name=$(basename "$file" | sed 's/rclone-mount@//;s/\.service//')
-            # 提取挂载路径
-            local m_path=$(grep -E '^ExecStart=' "$file" | awk '{print $4}')
-            # 检查当前是否在运行
-            if systemctl is-active --quiet "rclone-mount@${r_name}"; then
-                local r_status="${GREEN}● 正在运行${RESET}"
-            else
-                local r_status="${RED}○ 已停止${RESET}"
-            fi
-            echo -e "  网盘名称: ${YELLOW}${r_name}${RESET}  |  挂载路径: ${YELLOW}${m_path}${RESET}  [${r_status}]"
-        done
-    else
-        echo -e "  ${YELLOW}(暂无通过本脚本创建的挂载服务)${RESET}"
-    fi
 
-    echo -e "---------------------------------------"
-
-    # 2. 扫描本脚本生成的 Cron 定时同步任务
-    echo -e "${CYAN}[2] 已创建的定时任务(Cron)名字信息：${RESET}"
-    local cron_tasks=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX")
-    if [ -n "$cron_tasks" ]; then
-        echo "$cron_tasks" | while read -r line; do
-            # 提取任务唯一标识名
-            local task_id=$(echo "$line" | awk -F "$CRON_PREFIX" '{print $2}')
-            # 提取运行周期表达式
-            local cron_time=$(echo "$line" | awk -F "/opt/rclone_manager" '{print $1}')
-            echo -e "  任务名字: ${YELLOW}${task_id}${RESET}  |  执行周期: ${YELLOW}${cron_time}${RESET}"
-        done
-    else
-        echo -e "  ${YELLOW}(暂无通过本脚本创建的定时同步任务)${RESET}"
-    fi
-    echo -e "${GREEN}=======================================${RESET}"
+    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
+    echo "127.0.0.1" && return 0
 }
 
-# ================== 状态和日志查看 ==================
-view_mount_status() {
-    read -p "请输入想要查看状态的Rclone创建网盘名称: " remote
-    [ -z "$remote" ] && return
-    local svc="rclone-mount@${remote}"
-    
-    if systemctl list-unit-files | grep -q "^${svc}"; then
-        echo -e "${CYAN}--- Systemd 状态服务信息 ---${RESET}"
-        sudo systemctl status "$svc"
-    else
-        echo -e "${RED}未找到该网盘 [${remote}] 对应的挂载守护服务，请确认名称是否正确。${RESET}"
-    fi
-}
-
-view_mount_logs() {
-    read -p "想要查看实时日志，请输入Rclone创建的网盘名称: " remote
-    [ -z "$remote" ] && return
-    local log_file="$LOG_DIR/rclone_${remote}_sys.log"
-    
-    if [ -f "$log_file" ]; then
-        echo -e "${CYAN}--- 正在读取实时日志 (按 Ctrl+C 退出日志查看模式) ---${RESET}"
-        tail -n 50 -f "$log_file"
-    else
-        echo -e "${RED}未找到对应的日志文件: ${log_file}${RESET}"
-    fi
-}
-
-# ================== 高级定时任务管理面板 ==================
-show_cron_panel() {
-    local TASK_COUNT=$(crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]' | wc -l)
-
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}        ◈  Cron 定时任务管理面板  ◈      ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN} 当前系统环境 : ${YELLOW}${OS}${RESET}"
-    echo -e "${GREEN} 活跃任务总数 : ${YELLOW}${TASK_COUNT} 条${RESET}"
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN} 📋 当前系统定时任务快照：${RESET}"
-    
-    if [ "$TASK_COUNT" -gt 0 ]; then
-        crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^(LANG|LC_ALL|LANGUAGE)=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]' | awk -v cyan="$CYAN" -v reset="$RESET" '{print "   " cyan "•" reset " " $0}'
-    else
-        echo -e "   ${YELLOW}(暂无用户自定义的定时任务)${RESET}"
-    fi
-    
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  1) 快速添加定时任务(引导式)${RESET}"
-    echo -e "${GREEN}  2) 精准删除定时任务(按名称删除)${RESET}"
-    echo -e "${GREEN}  3) 深度手动编辑任务(打开编辑器)${RESET}"
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  0) 返回主菜单${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-}
-
-schedule_add() {
-    echo -e "${YELLOW}--- 引导式添加 Rclone 同步任务 ---${RESET}"
-    read -p "任务唯一标识名 (英文字母): " TASK_NAME
-    [ -z "$TASK_NAME" ] && return
-    read -p "本地同步目录 (多个用空格隔开): " LOCAL_DIR
-    read -p "请输入Rclone创建的网盘名称: " REMOTE_NAME
-    read -p "远程目标目录 (默认 backup): " REMOTE_DIR
-    REMOTE_DIR=${REMOTE_DIR:-backup}
-
-    echo -e "${GREEN}选择执行周期:\n 1. 每天0点\n 2. 每周一0点\n 3. 每月1号0点\n 4. 自定义 Cron 表达式${RESET}"
-    read -p "请选择: " t
-    case $t in
-        1) cron_expr="0 0 * * *" ;;
-        2) cron_expr="0 0 * * 1" ;;
-        3) cron_expr="0 0 1 * *" ;;
-        4) read -p "请输入标准 5 位 Cron 表达式: " cron_expr ;;
-        *) echo -e "${RED}❌ 无效选择${RESET}"; return ;;
+get_arch() {
+    case "$(uname -m)" in
+        x86_64) echo "amd64";;
+        aarch64) echo "arm64";;
+        armv7*|armv6*) echo "arm";;
+        mipsel) echo "mipsle";;
+        mips) echo "mips";;
+        *) echo "amd64";;
     esac
-
-    SCRIPT_PATH="$SCRIPT_DIR/rclone_sync_${TASK_NAME}.sh"
-    cat > "$SCRIPT_PATH" << 'EOF'
-#!/bin/bash
-CONFIG_FILE="/opt/rclone_manager/config.env"
-if [ -f "$CONFIG_FILE" ]; then source "$CONFIG_FILE"; fi
-EOF
-
-    cat >> "$SCRIPT_PATH" << EOF
-LOG_FILE="$LOG_DIR/rclone_sync_${TASK_NAME}.log"
-send_tg() {
-    if [[ "\$TG_TOKEN" != "填入你的默认BotToken" ]]; then
-        curl -s -X POST "https://api.telegram.org/bot\${TG_TOKEN}/sendMessage" \
-        -d chat_id="\${TG_CHAT_ID}" -d text="[\${VPS_NAME}] \$1" >/dev/null
-    fi
 }
-for d in $LOCAL_DIR; do
-    [ ! -d "\$d" ] && continue
-    name=\$(basename "\$d")
-    target="${REMOTE_NAME}:${REMOTE_DIR}/\$name"
-    rclone sync "\$d" "\$target" -v >> "\$LOG_FILE" 2>&1
-    if [ \$? -eq 0 ]; then
-        echo "[\$(date '+%F %T')] \$d 同步完成 ✅" >> "\$LOG_FILE"
-        send_tg "定时任务 [${TASK_NAME}] 同步成功: \$d ✅"
+
+
+get_auto_version() {
+    local fetched_ver=""
+    echo -e "${YELLOW}正在尝试获取 GitHub 远端最新 FRP 版本号...${RESET}" >&2
+
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        if [ -z "$proxy" ]; then
+            echo -e "${YELLOW} -> 正在尝试[直连]获取 GitHub API...${RESET}" >&2
+        else
+            echo -e "${YELLOW} -> 正在尝试通过节点 [ ${proxy} ] 获取 GitHub API...${RESET}" >&2
+        fi
+
+        fetched_ver=$(curl -sL -m 4 "${proxy}https://api.github.com/repos/fatedier/frp/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | sed 's/"tag_name": *//;s/"//g;s/v//' || echo "")
+        
+        if [ -n "$fetched_ver" ]; then
+            echo -e "${GREEN}[成功] 成功获取到最新版本号: v${fetched_ver}${RESET}" >&2
+            echo "$fetched_ver"
+            return 0
+        fi
+        echo -e "${RED}    失败，尝试下一个渠道...${RESET}" >&2
+    done
+
+    echo -e "${YELLOW}[提示] 无法获取远端版本，激活保底机制，采用预设版本: v${DEFAULT_BACKUP_VER}${RESET}" >&2
+    echo "$DEFAULT_BACKUP_VER"
+}
+
+download_package_loop() {
+    local version=$1
+    local arch=$2
+    local filename="frp_${version}_linux_${arch}.tar.gz"
+    local success=0
+
+    echo -e "${YELLOW}开始下载 FRP 安装包 v${version} (${arch})...${RESET}"
+
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        if [ -z "$proxy" ]; then
+            echo -e "${YELLOW} -> 正在尝试[直连] GitHub 下载...${RESET}"
+        else
+            echo -e "${YELLOW} -> 正在尝试通过节点 [ ${proxy} ] 下载...${RESET}"
+        fi
+
+        local url="${proxy}https://github.com/fatedier/frp/releases/download/v${version}/${filename}"
+        
+        if wget -T 8 -O "$filename" "$url"; then
+            echo -e "${GREEN}[成功] 安装包下载完成！${RESET}"
+            success=1
+            break
+        else
+            echo -e "${RED}    该节点下载失败或超时，自动切换下一个...${RESET}"
+            rm -f "$filename"
+        fi
+    done
+
+    if [ $success -eq 0 ]; then
+        echo -e "${RED}[严重错误] 所有加速节点及直连下载均已尝试，全部失败！${RESET}"
+        return 1
+    fi
+    return 0
+}
+
+detect_role() {
+    [ -f "$ROLE_FILE" ] && cat "$ROLE_FILE" || echo "unknown"
+}
+
+is_inited() { [ -f "$INIT_FLAG" ]; }
+
+update_status_variables() {
+    local role=$(detect_role)
+    G_VERSION="未安装"
+    G_STATUS="${RED}已停止${RESET}"
+    G_PORT="无"
+    G_DASH_BIND="无"
+
+    if [ "$role" = "server" ]; then
+        if [ -f "$FRPS_BIN" ]; then
+            G_VERSION=$($FRPS_BIN -v 2>/dev/null || echo "未知")
+        fi
+        if [ "$IS_OPENWRT" = "1" ]; then
+            (ps | grep -v grep | grep -q "[f]rps") && G_STATUS="${GREEN}已启动${RESET}"
+        else
+            (systemctl is-active --quiet frps 2>/dev/null) && G_STATUS="${GREEN}已启动${RESET}"
+        fi
+        
+        # 提取核心绑定端口
+        G_PORT=$(awk -F'=' '/bindPort/{gsub(/[ "]/,"",$2); print $2}' "$FRP_INSTALL_DIR/frps.toml" 2>/dev/null)
+        G_PORT=${G_PORT:-"7000"}
+
+        # 提取并拼装面板绑定 IP:端口
+        if [ -f "$FRP_INSTALL_DIR/frps.toml" ]; then
+            local d_addr=$(awk -F'=' '/webServer\.addr/{gsub(/[ "]/,"",$2); print $2}' "$FRP_INSTALL_DIR/frps.toml" 2>/dev/null)
+            local d_port=$(awk -F'=' '/webServer\.port/{gsub(/[ "]/,"",$2); print $2}' "$FRP_INSTALL_DIR/frps.toml" 2>/dev/null)
+            d_addr=${d_addr:-"0.0.0.0"}
+            d_port=${d_port:-"7500"}
+            G_DASH_BIND="${d_addr}:${d_port}"
+        fi
+
+    elif [ "$role" = "client" ]; then
+        if [ -f "$FRPC_BIN" ]; then
+            G_VERSION=$($FRPC_BIN -v 2>/dev/null || echo "未知")
+        fi
+        if [ "$IS_OPENWRT" = "1" ]; then
+            (ps | grep -v grep | grep -q "[f]rpc") && G_STATUS="${GREEN}已启动${RESET}"
+        else
+            (systemctl is-active --quiet frpc 2>/dev/null) && G_STATUS="${GREEN}已启动${RESET}"
+        fi
+        G_PORT=$(awk -F'=' '/serverPort/{gsub(/[ "]/,"",$2); print $2}' "$FRP_INSTALL_DIR/frpc.toml" 2>/dev/null)
+        G_PORT=${G_PORT:-"7000"}
     else
-        echo "[\$(date '+%F %T')] \$d 同步失败 ❌" >> "\$LOG_FILE"
-        send_tg "⚠️ 定时任务 [${TASK_NAME}] 同步失败: \$d ❌"
+        G_STATUS="${RED}未初始化${RESET}"
     fi
-done
-EOF
-
-    chmod +x "$SCRIPT_PATH"
-    (crontab -l 2>/dev/null | grep -v "$CRON_PREFIX$TASK_NAME"; echo "$cron_expr $SCRIPT_PATH $CRON_PREFIX$TASK_NAME") | crontab -
-    echo -e "${GREEN}任务 $TASK_NAME 已成功添加并注入 Crontab！${RESET}"
 }
 
-schedule_del_one() {
-    echo -e "${YELLOW}--- 正在检索本脚本生成的任务... ---${RESET}"
-    local count=$(crontab -l 2>/dev/null | grep "$CRON_PREFIX" | wc -l)
-    if [ "$count" -eq 0 ]; then
-        echo -e "${YELLOW}未发现通过本脚本创建的 Rclone 定时任务。${RESET}"
+select_role() {
+    echo -e "${YELLOW}提示：当前本机未检测到已初始化的 FRP 服务端或客户端。${RESET}"
+    echo -e "${GREEN}请选择本机角色："
+    echo -e "${GREEN}1) FRPS 服务端 (用于公网VPS)${RESET}"
+    echo -e "${GREEN}2) FRPC 客户端 (用于内网/被穿透设备)${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    
+    read -p "请选择: " role </dev/tty
+    
+    mkdir -p "$FRP_INSTALL_DIR"
+    case $role in
+        1) 
+            echo "server" > "$ROLE_FILE" 
+            server_menu
+            ;;
+        2) 
+            echo "client" > "$ROLE_FILE" 
+            client_menu
+            ;;
+        0) 
+            exit 1 
+            ;;
+    esac
+}
+
+config_after_install() {
+    local role=$(detect_role)
+    echo -e "\n${YELLOW}========================================${RESET}"
+    echo -e "${GREEN}FRP 二进制文件安装成功！正在自动进入配置流程...${RESET}"
+    echo -e "${YELLOW}========================================${RESET}\n"
+    sleep 1
+    if [ "$role" = "server" ]; then
+        init_frps_and_start
+    elif [ "$role" = "client" ]; then
+        init_frpc_and_start
+    fi
+}
+
+install_frp() {
+    local role=$(detect_role)
+    if [ "$role" = "server" ] && [ -f "$FRPS_BIN" ]; then
+        echo -e "${RED}[提示] 检测到系统已安装 FRPS，如需更新或修改配置请使用菜单对应功能${RESET}"
+        read -p "按回车返回菜单..." </dev/tty
+        return
+    elif [ "$role" = "client" ] && [ -f "$FRPC_BIN" ]; then
+        echo -e "${RED}[提示] 检测到系统已安装 FRPC，如需更新或修改配置请使用菜单对应功能${RESET}"
+        read -p "按回车返回菜单..." </dev/tty
         return
     fi
 
-    crontab -l 2>/dev/null | grep "$CRON_PREFIX" | awk -F "$CRON_PREFIX" '{print "● 可删除任务名: " $2}'
-    echo "---------------------------------------"
-    read -p "请输入你想精确删除的任务名称: " TASK_NAME
-    [ -z "$TASK_NAME" ] && return
-
-    crontab -l 2>/dev/null | grep -v "$CRON_PREFIX$TASK_NAME" | crontab -
-    rm -f "$SCRIPT_DIR/rclone_sync_${TASK_NAME}.sh"
-    echo -e "${GREEN}已成功移除任务: $TASK_NAME${RESET}"
-}
-
-cron_task_menu() {
-    while true; do
-        clear
-        show_cron_panel
-        read -p "$(echo -e ${GREEN}请输入定时任务选项数字: ${RESET})" choice_cron
-        echo ""
-        case $choice_cron in
-            1) schedule_add ;;
-            2) schedule_del_one ;;
-            3) 
-                echo -e "${YELLOW}即将调用系统默认编辑器打开全局 Crontab。${RESET}"
-                read -p "按回车键开始编辑..."
-                crontab -e 
-                ;;
-            0) break ;;
-            *) echo -e "${RED}❌ 输入错误！${RESET}" ;;
-        esac
-        read -p "按回车键继续..."
-    done
-}
-
-# ================== 手动同步功能 ==================
-sync_local_to_remote_multi() {
-    read -p "请输入本地目录路径（多个用空格分隔）: " local_dirs
-    [ -z "$local_dirs" ] && return
-    read -p "请输入Rclone创建的网盘名称: " remote
-    [ -z "$remote" ] && return
-    read -p "请输入远程目标目录(默认 backup): " remote_dir
-    remote_dir=${remote_dir:-backup}
-
-    for d in $local_dirs; do
-        if [ ! -d "$d" ]; then
-            echo -e "${RED}目录不存在，跳过: $d${RESET}"
-            continue
-        fi
-        name=$(basename "$d")
-        target="${remote}:${remote_dir}/${name}"
-        LOG_FILE="$LOG_DIR/rclone_sync_${name}.log"
-
-        echo -e "${YELLOW}正在同步: $d → $target ...${RESET}"
-        rclone sync "$d" "$target" -v -P 2>&1 | tee -a "$LOG_FILE"
-
-        if [ ${PIPESTATUS[0]} -eq 0 ]; then
-            echo "[ $(date '+%F %T') ] 同步完成 ✅" >> "$LOG_FILE"
-            send_tg "Rclone 同步完成: $d → $target ✅"
-        else
-            echo "[ $(date '+%F %T') ] 同步失败 ❌" >> "$LOG_FILE"
-            send_tg "⚠️ Rclone 同步失败: $d → $target ❌"
-        fi
-    done
-}
-
-sync_remote_to_local() {
-    read -p "请输入Rclone创建的网盘名称: " remote
-    [ -z "$remote" ] && return
-    read -p "请输入远程备份目录 (例如 backup): " remote_dir
-    read -p "请输入本地恢复目标目录: " local_dir
-    [ -z "$local_dir" ] && return
+    local FRP_VER=$(get_auto_version)
+    local ARCH=$(get_arch)
+    local FRP_NAME="frp_${FRP_VER}_linux_${ARCH}"
     
-    mkdir -p "$local_dir"
-    rclone sync "${remote}:${remote_dir}" "$local_dir" -v -P
+    mkdir -p "$FRP_INSTALL_DIR"
+    cd "$FRP_INSTALL_DIR"
+
+    if ! download_package_loop "$FRP_VER" "$ARCH"; then
+        read -p "按回车返回菜单..." </dev/tty
+        return
+    fi
+    
+    tar -xzvf "${FRP_NAME}.tar.gz"
+    cp -f "${FRP_NAME}/frps" "$FRPS_BIN"
+    cp -f "${FRP_NAME}/frpc" "$FRPC_BIN"
+    chmod +x "$FRPS_BIN" "$FRPC_BIN"
+    rm -rf "${FRP_NAME}" "${FRP_NAME}.tar.gz"
+    
+    config_after_install
 }
 
-# ================== 卸载全面清理 ==================
-uninstall_rclone() {
-    read -p "确定要彻底卸载 Rclone 及所有管理配置吗？(y/N): " SECURE_CONFIRM
-    [ "$SECURE_CONFIRM" != "y" ] && return
+update_frp() {
+    local role=$(detect_role)
+    local BIN_PATH="$FRPC_BIN"
+    local SYS_NAME="frpc"
+    [ "$role" = "server" ] && BIN_PATH="$FRPS_BIN" && SYS_NAME="frps"
 
-    echo -e "${YELLOW}正在全面清理 Rclone 环境与组件...${RESET}"
-    unmount_all
-    sudo rm -f /usr/bin/rclone /usr/local/bin/rclone
-    sudo rm -rf ~/.config/rclone
-    sudo rm -rf "$BASE_DIR"
+    if [ ! -f "$BIN_PATH" ]; then
+        echo -e "${RED}[错误] 未检测到已安装的组件，请先使用功能 [1. 安装]${RESET}"
+        read -p "按回车返回菜单..." </dev/tty
+        return
+    fi
 
-    echo -e "${GREEN}卸载完成！所有组件、挂载点及系统残留已清理。${RESET}"
+    local LATEST_VER=$(get_auto_version)
+    local CURRENT_VER=$($BIN_PATH -v 2>/dev/null || echo "0")
+
+    if [ "$CURRENT_VER" = "$LATEST_VER" ]; then
+        echo -e "${GREEN}[提示] 当前已是最新/目标版本 v${CURRENT_VER}，无需更新。${RESET}"
+        read -p "按回车返回菜单..." </dev/tty
+        return
+    fi
+
+    echo -e "${YELLOW}准备版本变更: v${CURRENT_VER} -> v${LATEST_VER}...${RESET}"
+    
+    if [ "$IS_OPENWRT" = "1" ]; then
+        /etc/init.d/$SYS_NAME stop 2>/dev/null || true
+    else
+        systemctl stop $SYS_NAME 2>/dev/null || true
+    fi
+
+    cd "$FRP_INSTALL_DIR"
+    local ARCH=$(get_arch)
+    local FRP_NAME="frp_${LATEST_VER}_linux_${ARCH}"
+    
+    if ! download_package_loop "$LATEST_VER" "$ARCH"; then
+        [ "$IS_OPENWRT" = "1" ] && /etc/init.d/$SYS_NAME start || systemctl start $SYS_NAME
+        read -p "按回车返回菜单..." </dev/tty
+        return
+    fi
+    
+    tar -xzvf "${FRP_NAME}.tar.gz"
+    cp -f "${FRP_NAME}/frps" "$FRPS_BIN"
+    cp -f "${FRP_NAME}/frpc" "$FRPC_BIN"
+    chmod +x "$FRPS_BIN" "$FRPC_BIN"
+    rm -rf "${FRP_NAME}" "${FRP_NAME}.tar.gz"
+
+    if [ "$IS_OPENWRT" = "1" ]; then
+        /etc/init.d/$SYS_NAME restart
+    else
+        systemctl restart $SYS_NAME
+    fi
+
+    echo -e "${GREEN}FRP 成功变更至 v${LATEST_VER}，配置已保留并重启服务！${RESET}"
+    read -p "按回车返回菜单..." </dev/tty
+}
+
+write_initd_frps() {
+cat > /etc/init.d/frps <<'EOF'
+#!/bin/sh /etc/rc.common
+START=99
+USE_PROCD=1
+PROG=/usr/local/bin/frps
+CFG=/opt/frp/frps.toml
+start_service() {
+    procd_open_instance
+    procd_set_param command $PROG -c $CFG
+    procd_set_param respawn
+    procd_close_instance
+}
+EOF
+chmod +x /etc/init.d/frps
+/etc/init.d/frps enable
+}
+
+write_systemd_frps() {
+cat > /etc/systemd/system/frps.service <<EOF
+[Unit]
+Description=frps server
+After=network.target
+[Service]
+Type=simple
+ExecStart=$FRPS_BIN -c $FRP_INSTALL_DIR/frps.toml
+Restart=always
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+}
+
+write_initd_frpc() {
+cat > /etc/init.d/frpc <<'EOF'
+#!/bin/sh /etc/rc.common
+START=99
+USE_PROCD=1
+PROG=/usr/local/bin/frpc
+CFG=/opt/frp/frpc.toml
+start_service() {
+    procd_open_instance
+    procd_set_param command $PROG -c $CFG
+    procd_set_param respawn
+    procd_close_instance
+}
+EOF
+chmod +x /etc/init.d/frpc
+/etc/init.d/frpc enable
+}
+
+write_systemd_frpc() {
+cat > /etc/systemd/system/frpc.service <<EOF
+[Unit]
+Description=frpc client
+After=network.target
+[Service]
+Type=simple
+ExecStart=$FRPC_BIN -c $FRP_INSTALL_DIR/frpc.toml
+Restart=always
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+}
+
+uninstall_frp() {
+    echo "正在卸载 FRP..."
+    if [ "$IS_OPENWRT" = "1" ]; then
+        /etc/init.d/frps stop 2>/dev/null || true
+        /etc/init.d/frpc stop 2>/dev/null || true
+        rm -f /etc/init.d/frps /etc/init.d/frpc
+    else
+        systemctl stop frps frpc 2>/dev/null || true
+        systemctl disable frps frpc 2>/dev/null || true
+        rm -f /etc/systemd/system/frps.service /etc/systemd/system/frpc.service
+        systemctl daemon-reload
+    fi
+    rm -rf "$FRP_INSTALL_DIR" "$FRPS_BIN" "$FRPC_BIN"
+    echo "FRP 已彻底卸载。"
+    sleep 2
     exit 0
 }
 
-# ================== 主循环入口 ==================
-while true; do
-    show_menu
-    read -p "$(echo -e ${GREEN}请输入选项数字: ${RESET})" choice
-    case $choice in
-        1) install_rclone ;;
-        2) update_rclone ;;
-        3) config_rclone ;;
-        4) list_remotes ;;
-        5) list_files_remote ;;
-        6) mount_remote ;;
-        7) show_assets_manifest ;;
-        8) unmount_remote_by_name ;;
-        9) unmount_all ;;
-        10) view_mount_status ;;
-        11) view_mount_logs ;;
-        12) sync_local_to_remote_multi ;;
-        13) sync_remote_to_local ;;
-        14) cron_task_menu ;;
-        15) modify_tg ;;
-        16) uninstall_rclone ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}输入错误，请输入菜单中的有效数字！${RESET}" ;;
-    esac
-    read -r -p "按回车键继续..."
-done
+init_frps_and_start() {
+    echo "=== 设定 FRPS 配置 (TOML) ==="
+    mkdir -p "$FRP_INSTALL_DIR"
+    local CONF_FILE="$FRP_INSTALL_DIR/frps.toml"
+
+    # 读取旧值作默认提示
+    local OLD_BIND=$(awk -F'=' '/bindPort/{gsub(/[ "]/,"",$2); print $2}' "$CONF_FILE" 2>/dev/null)
+    local OLD_HOST=$(awk -F'=' '/webServer\.addr/{gsub(/[ "]/,"",$2); print $2}' "$CONF_FILE" 2>/dev/null)
+    local OLD_PORT=$(awk -F'=' '/webServer\.port/{gsub(/[ "]/,"",$2); print $2}' "$CONF_FILE" 2>/dev/null)
+    local OLD_USER=$(awk -F'=' '/webServer\.user/{gsub(/[ "]/,"",$2); print $2}' "$CONF_FILE" 2>/dev/null)
+    local OLD_PWD=$(awk -F'=' '/webServer\.password/{gsub(/[ "]/,"",$2); print $2}' "$CONF_FILE" 2>/dev/null)
+    local OLD_TOKEN=$(awk -F'=' '/auth\.token/{gsub(/[ "]/,"",$2); print $2}' "$CONF_FILE" 2>/dev/null)
+
+    # 1. 监听端口
+    read -p "核心绑定端口 [当前/默认: ${OLD_BIND:-7000}]: " BIND_PORT </dev/tty
+    BIND_PORT=${BIND_PORT:-${OLD_BIND:-7000}}
+
+    # 2. 面板绑定地址选择
+    local DASH_HOST=""
+    while true; do
+        echo -e "\n请选择控制面板绑定的 IP 地址:"
+        echo -e "  1) 0.0.0.0   (公网可直连外网访问面板)"
+        echo -e "  2) 127.0.0.1 (仅限本机本地访问，适合配合 Nginx/Caddy 等安全反代) [当前/默认: ${OLD_HOST:-0.0.0.0}]"
+        read -p "请输入 [1-2]（直接回车维持默认）: " HOST_SEL </dev/tty
+        case "$HOST_SEL" in
+            1) DASH_HOST="0.0.0.0"; break ;;
+            2) DASH_HOST="127.0.0.1"; break ;;
+            "") DASH_HOST=${OLD_HOST:-"0.0.0.0"}; break ;;
+            *) echo -e "${RED}输入错误，请输入 1 或 2${RESET}" ;;
+        esac
+    done
+
+    # 3. 面板其它参数
+    read -p "面板端口 [当前/默认: ${OLD_PORT:-7500}]: " DASH_PORT </dev/tty
+    DASH_PORT=${DASH_PORT:-${OLD_PORT:-7500}}
+    read -p "面板用户名 [当前/默认: ${OLD_USER:-admin}]: " DASH_USER </dev/tty
+    DASH_USER=${DASH_USER:-${OLD_USER:-admin}}
+    read -p "面板密码 [当前/默认: ${OLD_PWD:-admin123}]: " DASH_PWD </dev/tty
+    DASH_PWD=${DASH_PWD:-${OLD_PWD:-admin123}}
+    read -p "Token (安全认证令牌) [当前: ${OLD_TOKEN:-无}]: " FRP_TOKEN </dev/tty
+    if [[ "$FRP_TOKEN" == "无" ]]; then FRP_TOKEN=""; fi
+    FRP_TOKEN=${FRP_TOKEN:-$OLD_TOKEN}
+
+    # 写入新配置文件
+    cat > "$CONF_FILE" <<EOF
+bindPort = $BIND_PORT
+webServer.addr = "$DASH_HOST"
+webServer.port = $DASH_PORT
+webServer.user = "$DASH_USER"
+webServer.password = "$DASH_PWD"
+EOF
+    [[ -n "$FRP_TOKEN" ]] && echo "auth.token = \"$FRP_TOKEN\"" >> "$CONF_FILE"
+
+    if [ "$IS_OPENWRT" = "1" ]; then
+        write_initd_frps
+        /etc/init.d/frps restart
+    else
+        write_systemd_frps
+        systemctl restart frps
+        systemctl enable frps 2>/dev/null || true
+    fi
+    echo "server" > "$ROLE_FILE"
+    touch "$INIT_FLAG"
+    echo -e "${GREEN}配置已保存并完成服务启动！${RESET}"
+    read -p "按回车返回菜单..." </dev/tty
+}
+
+init_frpc_and_start() {
+    echo "=== 设定 FRPC 参数 (TOML) ==="
+    mkdir -p "$FRP_INSTALL_DIR"
+    local CONF_FILE="$FRP_INSTALL_DIR/frpc.toml"
+
+    local OLD_ADDR=$(awk -F'=' '/serverAddr/{gsub(/[ "]/,"",$2); print $2}' "$CONF_FILE" 2>/dev/null)
+    local OLD_PORT=$(awk -F'=' '/serverPort/{gsub(/[ "]/,"",$2); print $2}' "$CONF_FILE" 2>/dev/null)
+    local OLD_TOKEN=$(awk -F'=' '/auth\.token/{gsub(/[ "]/,"",$2); print $2}' "$CONF_FILE" 2>/dev/null)
+
+    read -p "FRPS 服务器公网IP [当前: ${OLD_ADDR:-未配置}]: " SERVER_IP </dev/tty
+    SERVER_IP=${SERVER_IP:-$OLD_ADDR}
+    while [[ -z "$SERVER_IP" ]]; do
+        read -p "${RED}IP 不能为空，请重新输入: ${RESET}" SERVER_IP </dev/tty
+    done
+
+    read -p "FRPS 核心端口 [当前/默认: ${OLD_PORT:-7000}]: " SERVER_PORT </dev/tty
+    SERVER_PORT=${SERVER_PORT:-${OLD_PORT:-7000}}
+    
+    read -p "Token (与服务端保持一致) [当前: ${OLD_TOKEN:-无}]: " FRP_TOKEN </dev/tty
+    if [[ "$FRP_TOKEN" == "无" ]]; then FRP_TOKEN=""; fi
+    FRP_TOKEN=${FRP_TOKEN:-$OLD_TOKEN}
+
+    # 提取并临时备份旧文件中的自定义转发规则
+    local TMP_RULES="/tmp/frpc_rules.bak"
+    rm -f "$TMP_RULES"
+    if [ -f "$CONF_FILE" ]; then
+        sed -n '/\[\[proxies\]\]/,$p' "$CONF_FILE" > "$TMP_RULES" 2>/dev/null || true
+    fi
+
+    # 重构写入基础公共配置
+    cat > "$CONF_FILE" <<EOF
+serverAddr = "$SERVER_IP"
+serverPort = $SERVER_PORT
+EOF
+    [[ -n "$FRP_TOKEN" ]] && echo "auth.token = \"$FRP_TOKEN\"" >> "$CONF_FILE"
+    echo "" >> "$CONF_FILE"
+
+    # 将提取出的老转发规则完整追加回去
+    if [ -s "$TMP_RULES" ]; then
+        cat "$TMP_RULES" >> "$CONF_FILE"
+    fi
+    rm -f "$TMP_RULES"
+
+    if [ "$IS_OPENWRT" = "1" ]; then
+        write_initd_frpc
+        /etc/init.d/frpc restart
+    else
+        write_systemd_frpc
+        systemctl restart frpc
+        systemctl enable frpc 2>/dev/null || true
+    fi
+    echo "client" > "$ROLE_FILE"
+    touch "$INIT_FLAG"
+    echo -e "${GREEN}修改完毕并已激活启动！${RESET}"
+    read -p "按回车返回菜单..." </dev/tty
+}
+
+add_frpc_rule() {
+    is_inited || { echo -e "${RED}请先修改参数配置！${RESET}"; sleep 2; return; }
+    echo "=== 添加 FRPC 端口规则 ==="
+    while true; do
+        read -p "规则唯一名称（如 nas, ssh, web）: " RULE_NAME </dev/tty
+        if grep -q "name = \"$RULE_NAME\"" "$FRP_INSTALL_DIR/frpc.toml"; then
+            echo -e "${RED}错误：规则名称 [$RULE_NAME] 已存在，请更换！${RESET}"
+            continue
+        fi
+
+        while true; do
+            echo "请选择协议类型："
+            echo "1) tcp"
+            echo "2) udp"
+            read -p "请选择 [1-2]（默认1）: " TYPESEL </dev/tty
+            case "$TYPESEL" in
+                1|"") TYPE="tcp"; break ;;
+                2) TYPE="udp"; break ;;
+                *) echo "输入错误，只能输入 1 或 2" ;;
+            esac
+        done
+
+        read -p "本地内网IP [默认 127.0.0.1]: " LOCAL_IP </dev/tty
+        LOCAL_IP=${LOCAL_IP:-127.0.0.1}
+        
+        while true; do
+            read -p "本地端口 (如局域网内设备端口): " LOCAL_PORT </dev/tty
+            if [[ "$LOCAL_PORT" =~ ^[0-9]+$ ]]; then break; else echo -e "${RED}输入有误，端口必须是纯数字！${RESET}"; fi
+        done
+
+        while true; do
+            read -p "外网映射VPS端口: " REMOTE_PORT </dev/tty
+            if [[ "$REMOTE_PORT" =~ ^[0-9]+$ ]]; then break; else echo -e "${RED}输入有误，端口必须是纯数字！${RESET}"; fi
+        done
+
+        cat >> "$FRP_INSTALL_DIR/frpc.toml" <<EOF
+[[proxies]]
+name = "$RULE_NAME"
+type = "$TYPE"
+localIp = "$LOCAL_IP"
+localPort = $LOCAL_PORT
+remotePort = $REMOTE_PORT
+
+EOF
+        echo -e "${GREEN}已成功添加规则 [$RULE_NAME]。${RESET}"
+        read -p "是否继续添加规则？(y/n) [n]: " MORE </dev/tty
+        [[ "$MORE" == "y" || "$MORE" == "Y" ]] || break
+    done
+    restart_frpc
+}
+
+delete_frpc_rule() {
+    is_inited || { echo -e "${RED}请先修改参数配置！${RESET}"; sleep 2; return; }
+    echo -e "\n${CYAN}[当前规则列表]${RESET}"
+    grep "name =" "$FRP_INSTALL_DIR/frpc.toml" || { echo "暂无任何转发规则"; sleep 1.5; return; }
+    echo
+    read -p "输入要删除的规则名称: " RULE </dev/tty
+    
+    if ! grep -q "name = \"$RULE\"" "$FRP_INSTALL_DIR/frpc.toml"; then
+        echo -e "${RED}规则 [$RULE] 不存在！${RESET}"
+        sleep 2
+        return
+    fi
+
+    awk -v name="name = \"$RULE\"" '
+    BEGIN {RS="\n\n"; FS="\n"}
+    $0 ~ name {next}
+    {print $0"\n"}
+    ' "$FRP_INSTALL_DIR/frpc.toml" | sed '${/^$/d;}' > "$FRP_INSTALL_DIR/frpc.toml.tmp"
+    
+    mv "$FRP_INSTALL_DIR/frpc.toml.tmp" "$FRP_INSTALL_DIR/frpc.toml"
+    echo -e "${GREEN}已成功删除规则 [$RULE]${RESET}"
+    restart_frpc
+    sleep 1.5
+} 
+
+print_embedded_rules() {
+    if [ -f "$FRP_INSTALL_DIR/frpc.toml" ]; then
+        echo -e "${CYAN} 规则名称     | 协议  | 内网端口   | 外网映射端口${RESET}"
+        echo -e "${CYAN}------------------------------------------------${RESET}"
+        awk -F'=' '
+        BEGIN { name=""; type=""; lport=""; rport="" }
+        /\[\[proxies\]\]/ {
+            if(name!="") printf "  %-11s | %-5s | %-10s | %-10s\n", name, type, lport, rport;
+            name=""; type=""; lport=""; rport=""
+        }
+        $1 ~ /name/      { gsub(/[ "]/, "", $2); name=$2 }
+        $1 ~ /type/      { gsub(/[ "]/, "", $2); type=$2 }
+        $1 ~ /localPort/ { gsub(/[ "]/, "", $2); lport=$2 }
+        $1 ~ /remotePort/{ gsub(/[ "]/, "", $2); rport=$2 }
+        END { if(name!="") printf "  %-11s | %-5s | %-10s | %-10s\n", name, type, lport, rport }
+        ' "$FRP_INSTALL_DIR/frpc.toml" | while read -r line; do
+            echo -e "${YELLOW}$line${RESET}"
+        done
+        if ! grep -q "\[\[proxies\]\]" "$FRP_INSTALL_DIR/frpc.toml"; then
+            echo -e "   ${RED}(暂无转发规则，请选择 4 添加)${RESET}"
+        fi
+    else
+        echo -e "   ${RED}配置文件未生成${RESET}"
+    fi
+}
+
+start_frps() { [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frps start || systemctl start frps; echo "frps 已启动"; sleep 1; }
+stop_frps()  { [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frps stop  || systemctl stop frps;  echo "frps 已停止"; sleep 1; }
+restart_frps() { [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frps restart || systemctl restart frps; echo "frps 已重启"; sleep 1; }
+
+start_frpc() { [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frpc start || systemctl start frpc; echo "frpc 已启动"; sleep 1; }
+stop_frpc()  { [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frpc stop  || systemctl stop frpc;  echo "frpc 已停止"; sleep 1; }
+restart_frpc() { [ "$IS_OPENWRT" = "1" ] && /etc/init.d/frpc restart || systemctl restart frpc; echo "frpc 已重启"; sleep 1; }
+
+log_frps() {
+    if [ "$IS_OPENWRT" = "1" ]; then logread | grep frps | tail -n 30 || echo "暂无日志"; else journalctl -u frps -n 40 --no-pager; fi
+    read -p "按回车返回菜单..." </dev/tty
+}
+log_frpc() {
+    if [ "$IS_OPENWRT" = "1" ]; then logread | grep frpc | tail -n 30 || echo "暂无日志"; else journalctl -u frpc -n 40 --no-pager; fi
+    read -p "按回车返回菜单..." </dev/tty
+}
+
+show_frps_dashboard_info() {
+    clear
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}       FRPS 面板详情        ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    if [ -f "$FRP_INSTALL_DIR/frps.toml" ]; then
+        local DASH_HOST=$(awk -F'=' '/webServer\.addr/{gsub(/[ "]/,"",$2);print $2}' "$FRP_INSTALL_DIR/frps.toml")
+        local DASH_PORT=$(awk -F'=' '/webServer\.port/{gsub(/[ "]/,"",$2);print $2}' "$FRP_INSTALL_DIR/frps.toml")
+        local DASH_USER=$(awk -F'=' '/webServer\.user/{gsub(/[ "]/,"",$2);print $2}' "$FRP_INSTALL_DIR/frps.toml")
+        local DASH_PWD=$(awk -F'=' '/webServer\.password/{gsub(/[ "]/,"",$2);print $2}' "$FRP_INSTALL_DIR/frps.toml")
+        
+        DASH_HOST=${DASH_HOST:-"0.0.0.0"}
+        local DISPLAY_IP=$DASH_HOST
+        if [[ "$DASH_HOST" == "0.0.0.0" ]]; then
+            DISPLAY_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "你的VPS公网IP")
+        fi
+        
+        SERVER_IP=$(get_public_ip)
+
+        echo -e "${GREEN}绑定地址 :${RESET} ${YELLOW}$DASH_HOST ${RESET}"
+        echo -e "${GREEN}访问链接 :${RESET} ${YELLOW}http://$SERVER_IP:${DASH_PORT:-7500}${RESET}"
+        echo -e "${GREEN}用户名   :${RESET} ${YELLOW}${DASH_USER:-admin}${RESET}"
+        echo -e "${GREEN}密码     :${RESET} ${YELLOW}${DASH_PWD:-admin123}${RESET}"
+    else
+        echo -e "${RED}未找到配置文件${RESET}"
+    fi
+    echo -e "${GREEN}================================${RESET}"
+    read -p "按回车返回菜单..." </dev/tty
+}
+
+server_menu() {
+    while true; do
+        update_status_variables
+        clear
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}       FRPS 服务端管理面板      ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}状态   :${RESET} $G_STATUS"
+        echo -e "${GREEN}版本   :${RESET} ${YELLOW}${G_VERSION}${RESET}"
+        echo -e "${GREEN}端口   :${RESET} ${YELLOW}${G_PORT}${RESET}"
+        echo -e "${GREEN}面板   :${RESET} ${YELLOW}${G_DASH_BIND}${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}1. 安装 FRPS${RESET}"
+        echo -e "${GREEN}2. 更新 FRPS${RESET}"
+        echo -e "${GREEN}3. 卸载 FRPS ${RESET}"
+        echo -e "${GREEN}4. 修改配置${RESET}"
+        echo -e "${GREEN}5. 启动 FRPS${RESET}"
+        echo -e "${GREEN}6. 停止 FRPS${RESET}"
+        echo -e "${GREEN}7. 重启 FRPS${RESET}"
+        echo -e "${GREEN}8. 查看面板信息${RESET}"
+        echo -e "${GREEN}9. 查看运行日志${RESET}"
+        echo -e "${GREEN}0. 退出${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -ne "${GREEN}请输入选项: ${RESET}"
+        read choice </dev/tty
+        case $choice in
+            1) install_frp ;;
+            2) update_frp ;;
+            3) uninstall_frp ;;
+            4) init_frps_and_start ;;
+            5) start_frps ;;
+            6) stop_frps ;;
+            7) restart_frps ;;
+            8) show_frps_dashboard_info ;;
+            9) log_frps ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选项！${RESET}" && sleep 1 ;;
+        esac
+    done
+}
+
+client_menu() {
+    while true; do
+        update_status_variables
+        clear
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}       FRPC 客户端管理面板      ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}状态   :${RESET} $G_STATUS"
+        echo -e "${GREEN}版本   :${RESET} ${YELLOW}${G_VERSION}${RESET}"
+        echo -e "${GREEN}端口   :${RESET} ${YELLOW}${G_PORT}${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        
+        print_embedded_rules
+        echo -e "${GREEN}================================${RESET}"
+        
+        echo -e "${GREEN} 1. 安装 FRPC${RESET}"
+        echo -e "${GREEN} 2. 更新 FRPC${RESET}"
+        echo -e "${GREEN} 3. 卸载 FRPC${RESET}"
+        echo -e "${GREEN} 4. 修改配置${RESET}"
+        echo -e "${GREEN} 5. 新增本地端口转发规则${RESET}"
+        echo -e "${GREEN} 6. 删除本地端口转发规则${RESET}"
+        echo -e "${GREEN} 7. 启动 FRPC${RESET}"
+        echo -e "${GREEN} 8. 停止 FRPC${RESET}"
+        echo -e "${GREEN} 9. 重启 FRPC${RESET}"
+        echo -e "${GREEN}10. 查看日志${RESET}"
+        echo -e "${GREEN} 0. 退出${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -ne "${GREEN}请输入选项: ${RESET}"
+        read choice </dev/tty
+        case $choice in
+            1) install_frp ;;
+            2) update_frp ;;
+            3) uninstall_frp ;;
+            4) init_frpc_and_start ;;
+            5) add_frpc_rule ;;
+            6) delete_frpc_rule ;;
+            7) start_frpc ;;
+            8) stop_frpc ;;
+            9) restart_frpc ;;
+            10) log_frpc ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选项！${RESET}" && sleep 1 ;;
+        esac
+    done
+}
+
+# ---------- 启动主入口 ----------
+
+role="$(detect_role)"
+case "$role" in
+    server) server_menu ;;
+    client) client_menu ;;
+    *)
+        select_role
+        ;;
+esac

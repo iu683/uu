@@ -1,1089 +1,322 @@
 #!/bin/bash
-set +e
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
 
+#################################################
+# caadybackup - 自动安装 + 自动更新增强版 (Caddy + 网站)
+#################################################
+
+#################################
+# 远程自动安装逻辑
+#################################
+
+INSTALL_DIR="/opt/caadybackup"
+LOCAL_SCRIPT="$INSTALL_DIR/caadybackup.sh"
+REMOTE_URL="https://raw.githubusercontent.com/iu683/uu/main/vv.sh"
+
+if [[ "$0" != "$LOCAL_SCRIPT" ]]; then
+    mkdir -p "$INSTALL_DIR"
+
+    curl -fsSL -o "$LOCAL_SCRIPT.tmp" "$REMOTE_URL" || {
+        echo "安装失败"
+        exit 1
+    }
+
+    if [[ ! -f "$LOCAL_SCRIPT" ]] || ! cmp -s "$LOCAL_SCRIPT.tmp" "$LOCAL_SCRIPT"; then
+        mv "$LOCAL_SCRIPT.tmp" "$LOCAL_SCRIPT"
+        chmod +x "$LOCAL_SCRIPT"
+    else
+        rm -f "$LOCAL_SCRIPT.tmp"
+    fi
+
+    exec bash "$LOCAL_SCRIPT" "$@"
+fi
+
+#################################
+# 颜色
+#################################
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+CYAN="\033[36m"
+YELLOW="\033[33m"
 RESET="\033[0m"
 
-red() { echo -e "${RED}$1${RESET}"; }
-green() { echo -e "${GREEN}$1${RESET}"; }
-yellow() { echo -e "${YELLOW}$1${RESET}"; }
+#################################
+# 基础路径
+#################################
+CONFIG_FILE="$INSTALL_DIR/config.sh"
+LOG_FILE="$INSTALL_DIR/backup.log"
+CRON_TAG="#caadybackup_cron"
 
-# 默认自定义证书存放归档目录
-CUSTOM_SSL_BASE="/etc/nginx/custom_ssl"
-mkdir -p "$CUSTOM_SSL_BASE"
+DATA_DIR_DEFAULT="$INSTALL_DIR/data"
+RETAIN_DAYS_DEFAULT=7
+SERVICE_NAME_DEFAULT="$(hostname)"
 
-# ------------------------------
-# 顶层看板动态数据获取
-# ------------------------------
-get_nginx_status() {
-    if ! command -v nginx >/dev/null 2>&1; then
-        STATUS="${RED}未安装${RESET}"
-    elif systemctl is-active nginx >/dev/null 2>&1; then
-        STATUS="${YELLOW}运行中${RESET}"
-    else
-        STATUS="${RED}已停止${RESET}"
-    fi
+mkdir -p "$INSTALL_DIR"
+
+#################################
+# Caddy 配置/数据
+#################################
+CADDYFILE="/etc/caddy/Caddyfile"
+CADDY_DATA="/var/lib/caddy/.local/share/caddy"
+WWW_DIR="/var/www"
+
+#################################
+# 卸载
+#################################
+if [[ "$1" == "--uninstall" ]]; then
+    echo -e "${YELLOW}正在卸载...${RESET}"
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+    rm -rf "$INSTALL_DIR"
+    echo -e "${GREEN}卸载完成${RESET}"
+    exit 0
+fi
+
+#################################
+# 加载配置
+#################################
+load_config() {
+    [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+    DATA_DIR=${DATA_DIR:-$DATA_DIR_DEFAULT}
+    RETAIN_DAYS=${RETAIN_DAYS:-$RETAIN_DAYS_DEFAULT}
+    SERVICE_NAME=${SERVICE_NAME:-$SERVICE_NAME_DEFAULT}
 }
+load_config
+mkdir -p "$DATA_DIR"
 
-get_nginx_version() {
-    if command -v nginx >/dev/null 2>&1; then
-        # 将输出赋值给局部变量，避免污染全局变量
-        local nginx_out
-        nginx_out=$(nginx -v 2>&1)
-        
-        # 使用 Bash 内置的正向匹配获取版本号（形如 1.24.0）
-        if [[ $nginx_out =~ /([0-9.]+) ]]; then
-            VERSION_SHOW="${BASH_REMATCH[1]}"
-        else
-            VERSION_SHOW="未知"
-        fi
-    else
-        VERSION_SHOW="无"
-    fi
-}
-
-get_site_count() {
-    CONFIG_DIR="/etc/nginx/sites-available"
-    if [ -d "$CONFIG_DIR" ]; then
-        # 过滤掉默认的 default server
-        SITE_COUNT=$(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | wc -l | tr -d ' ')
-    else
-        SITE_COUNT="0"
-    fi
-}
-
-# ------------------------------
-# 本核心功能函数
-# ------------------------------
-generate_random_email() {
-    RAND_STR=$(tr -dc a-z0-9 </dev/urandom | head -c 10)
-    echo "${RAND_STR}@gmail.com"
-}
-
-validate_email() {
-    [[ "$1" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
-}
-
-pause() {
-    echo -ne "${YELLOW}按回车返回菜单...${RESET}"
-    read
-}
-
-configure_firewall() {
-    for PORT in 80 443; do
-        if command -v ufw >/dev/null 2>&1; then
-            ufw allow $PORT || true
-        elif command -v firewall-cmd >/dev/null 2>&1; then
-            firewall-cmd --permanent --add-port=$PORT/tcp || true
-            firewall-cmd --reload || true
-        fi
-    done
-}
-
-remove_default_server() {
-    echo -e "${YELLOW}清理系统自带的 default server 配置...${RESET}"
-    rm -f /etc/nginx/sites-enabled/default
-    rm -f /etc/nginx/sites-available/default
-}
-
-ensure_nginx_conf() {
-    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/modules-enabled
-    if [ ! -f /etc/nginx/nginx.conf ]; then
-        cat > /etc/nginx/nginx.conf <<'EOF'
-user www-data;
-worker_processes auto;
-pid /run/nginx.pid;
-include /etc/nginx/modules-enabled/*.conf;
-
-events {
-    worker_connections 768;
-}
-
-http {
-    sendfile on;
-    tcp_nopush on;
-    types_hash_max_size 2048;
-    include /etc/nginx/mime.types;
-    default_type application/octet-stream;
-
-    access_log /var/log/nginx/access.log;
-    error_log /var/log/nginx/error.log;
-
-    gzip on;
-    include /etc/nginx/conf.d/*.conf;
-    include /etc/nginx/sites-enabled/*;
-}
+#################################
+# 保存配置
+#################################
+save_config() {
+cat > "$CONFIG_FILE" <<EOF
+DATA_DIR="$DATA_DIR"
+RETAIN_DAYS="$RETAIN_DAYS"
+SERVICE_NAME="$SERVICE_NAME"
+TG_TOKEN="$TG_TOKEN"
+TG_CHAT_ID="$TG_CHAT_ID"
 EOF
-    fi
-
-    if [ ! -f /etc/nginx/mime.types ]; then
-        cat > /etc/nginx/mime.types <<'EOF'
-types {
-    text/html  html htm shtml;
-    text/css   css;
-    text/xml   xml;
-    image/gif  gif;
-    image/jpeg jpeg jpg;
-    application/javascript js;
-    application/atom+xml atom;
-    application/rss+xml rss;
-}
-EOF
-    fi
 }
 
-create_default_server() {
-    DEFAULT_PATH="/etc/nginx/sites-available/default_server_block"
-    [ ! -f "$DEFAULT_PATH" ] && cat > "$DEFAULT_PATH" <<EOF
-server {
-    listen 80 default_server;
-    server_name _;
-    return 403;
+#################################
+# Telegram 通知
+#################################
+send_tg() {
+    [[ -z "$TG_TOKEN" || -z "$TG_CHAT_ID" ]] && return
+    MESSAGE="[$SERVICE_NAME] $1"
+    curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+        -d chat_id="$TG_CHAT_ID" \
+        -d text="$MESSAGE" >/dev/null 2>&1
 }
-EOF
-    ln -sf "$DEFAULT_PATH" /etc/nginx/sites-enabled/default_server_block
-}
 
-generate_server_config() {
-    DOMAIN=$1
-    TARGET=$2
-    IS_WS=$3
-    MAX_SIZE=$4
-    CERT_PATH=$5    
-    KEY_PATH=$6       
-    CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
+#################################
+# 备份 Caddy 配置 + 证书 + 可执行文件
+#################################
+backup() {
+    TIMESTAMP=$(date +%F_%H-%M-%S)
+    FILE="$DATA_DIR/caddy_backup_$TIMESTAMP.tar.gz"
 
-    MAX_SIZE=${MAX_SIZE:-200M}
-    CERT_PATH=${CERT_PATH:-"/etc/letsencrypt/live/$DOMAIN/fullchain.pem"}
-    KEY_PATH=${KEY_PATH:-"/etc/letsencrypt/live/$DOMAIN/privkey.pem"}
+    echo -e "${CYAN}开始备份 Caddy 配置、证书...${RESET}"
 
-    if [ "$IS_WS" == "y" ]; then
-        WS_HEADERS="proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \"Upgrade\";"
+    # 检查文件和目录
+    [[ ! -f "/usr/bin/caddy" ]] && echo -e "${RED}未找到 Caddy 可执行文件${RESET}" && return
+    [[ ! -f "$CADDYFILE" ]] && echo -e "${RED}未找到 Caddyfile${RESET}" && return
+    [[ ! -d "$CADDY_DATA" ]] && echo -e "${RED}未找到 Caddy 数据目录${RESET}" && return
+
+    tar czf "$FILE" \
+        /usr/bin/caddy \
+        "$CADDYFILE" \
+        "$CADDY_DATA" >> "$LOG_FILE" 2>&1
+
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}备份成功：$FILE${RESET}"
+        send_tg "✅ Caddy备份成功: $TIMESTAMP"
     else
-        WS_HEADERS=""
+        echo -e "${RED}备份失败${RESET}"
+        send_tg "❌ Caddy备份失败"
     fi
 
-    cat > "$CONFIG_PATH" <<EOF
-server {
-    listen 80;
-    server_name $DOMAIN;
-    return 301 https://\$host\$request_uri;
+    # 清理旧备份
+    find "$DATA_DIR" -type f -name "*.tar.gz" -mtime +"$RETAIN_DAYS" -delete
 }
 
-server {
-    listen 443 ssl;
-    server_name $DOMAIN;
+restore() {
+    shopt -s nullglob
+    FILE_LIST=("$DATA_DIR"/*.tar.gz)
+    [[ ${#FILE_LIST[@]} -eq 0 ]] && echo -e "${RED}没有备份文件${RESET}" && return
 
-    ssl_certificate $CERT_PATH;
-    ssl_certificate_key $KEY_PATH;
-
-    location / {
-        client_max_body_size $MAX_SIZE;
-
-        proxy_pass $TARGET;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        $WS_HEADERS
-    }
-}
-EOF
-    ln -sf "$CONFIG_PATH" "/etc/nginx/sites-enabled/$DOMAIN"
-}
-
-check_domain_resolution() {
-    DOMAIN=$1
-    if [[ "$DOMAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        return 0
-    fi
-    VPS_IP=$(curl -s https://ipinfo.io/ip)
-    DOMAIN_IP=$(dig +short "$DOMAIN" | tail -n1)
-    if [ -z "$DOMAIN_IP" ] || [ "$DOMAIN_IP" != "$VPS_IP" ]; then
-        echo -e "${RED}警告: 域名 $DOMAIN 解析为 $DOMAIN_IP, VPS IP 为 $VPS_IP${RESET}"
-    else
-        echo -e "${GREEN}域名解析正常${RESET}"
-    fi
-}
-
-install_nginx() {
-
-    if command -v nginx >/dev/null 2>&1 && command -v certbot >/dev/null 2>&1; then
-        echo -e "${YELLOW}提示: 检测到系统已安装 Nginx 与 Certbot，自动跳过安装。${RESET}"
-        pause
-        return
-    fi
-    
-    ensure_nginx_conf
-    remove_default_server
-
-    DEBIAN_FRONTEND=noninteractive apt update
-    DEBIAN_FRONTEND=noninteractive apt upgrade -y \
-        -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confold"
-
-    DEBIAN_FRONTEND=noninteractive apt install -y curl dnsutils \
-        -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confold"
-
-    echo -e "${GREEN}开始安装 Nginx 和 Certbot...${RESET}"
-    if ! DEBIAN_FRONTEND=noninteractive apt install -y \
-        -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confold" \
-        nginx certbot python3-certbot-nginx; then
-        echo -e "${RED}安装失败，尝试自动修复...${RESET}"
-        uninstall_nginx
-        echo -e "${YELLOW}重新尝试安装...${RESET}"
-        DEBIAN_FRONTEND=noninteractive apt install -y \
-            -o Dpkg::Options::="--force-confdef" \
-            -o Dpkg::Options::="--force-confold" \
-            nginx certbot python3-certbot-nginx || {
-            echo -e "${RED}修复后安装仍然失败，请手动检查系统环境！${RESET}"
-            pause
-            return
-        }
-    fi
-
-    remove_default_server
-    create_default_server
-    configure_firewall
-    systemctl daemon-reload
-    systemctl enable --now nginx
-    echo
-    echo -ne "${YELLOW}是否现在配置反向代理并申请证书？(y/n,默认y): ${RESET}"
-    read CONFIRM
-
-    CONFIRM=${CONFIRM:-y}
-    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-        echo -e "${RED}已取消配置退出${RESET}"
-        exit 0
-    fi
-
-    EMAIL_FILE="/etc/nginx/.cert_emails"
-    if [ -f "$EMAIL_FILE" ] && [ -s "$EMAIL_FILE" ]; then
-        DEFAULT_EMAIL=$(head -n1 "$EMAIL_FILE")
-    else
-        DEFAULT_EMAIL=$(generate_random_email)
-    fi
-
-    echo -ne "${GREEN}请输入邮箱地址 (回车自动生成: ${DEFAULT_EMAIL}): ${RESET}"
-    read EMAIL
-    EMAIL=${EMAIL:-$DEFAULT_EMAIL}
-
-    if ! validate_email "$EMAIL"; then
-        echo -e "${RED}邮箱格式不正确${RESET}"
-        pause
-        return
-    fi
-
-    echo -e "${GREEN}使用邮箱: ${EMAIL}${RESET}"
-    echo "$EMAIL" >> "$EMAIL_FILE"
-    sort -u "$EMAIL_FILE" -o "$EMAIL_FILE"
-    echo -ne "${GREEN}请输入域名(例如:example.com): ${RESET}"; read DOMAIN
-    check_domain_resolution "$DOMAIN"
-    echo -ne "${GREEN}请输入反代目标(例如:http://127.0.0.1:5788): ${RESET}"; read TARGET
-    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n，默认 y): ${RESET}"; read IS_WS
-    IS_WS=${IS_WS:-y}
-
-    echo -ne "${GREEN}请输入最大上传大小 (默认 200M): ${RESET}"
-    read MAX_SIZE
-    MAX_SIZE=${MAX_SIZE:-200M}
-
-    certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-    generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE"
-    nginx -t && systemctl reload nginx
-    systemctl enable --now certbot.timer
-    echo -e "${GREEN}安装完成！访问: https://$DOMAIN${RESET}"
-    pause
-}
-
-add_config() {
-    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-
-    echo -ne "${GREEN}请输入域名(例如:example.com): ${RESET}"
-    read DOMAIN
-    check_domain_resolution "$DOMAIN"
-
-    echo -ne "${GREEN}请输入反代目标(例如:http://127.0.0.1:5788): ${RESET}"
-    read TARGET
-
-    EMAIL_FILE="/etc/nginx/.cert_emails"
-    if [ -f "$EMAIL_FILE" ] && [ -s "$EMAIL_FILE" ]; then
-        DEFAULT_EMAIL=$(head -n1 "$EMAIL_FILE")
-    else
-        DEFAULT_EMAIL=$(generate_random_email)
-    fi
-
-    echo -ne "${GREEN}请输入邮箱地址 (回车自动生成: ${DEFAULT_EMAIL}): ${RESET}"
-    read EMAIL
-    EMAIL=${EMAIL:-$DEFAULT_EMAIL}
-
-    if ! validate_email "$EMAIL"; then
-        echo -e "${RED}邮箱格式不正确${RESET}"
-        pause
-        return
-    fi
-
-    echo "$EMAIL" >> "$EMAIL_FILE"
-    sort -u "$EMAIL_FILE" -o "$EMAIL_FILE"
-
-    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n，回车默认 y): ${RESET}"
-    read IS_WS
-    IS_WS=${IS_WS:-y}
-
-    echo -ne "${GREEN}请输入最大上传大小 (默认 200M): ${RESET}"
-    read MAX_SIZE
-    MAX_SIZE=${MAX_SIZE:-200M}
-
-    if [ -f "/etc/nginx/sites-available/$DOMAIN" ]; then
-        echo -e "${YELLOW}配置已存在${RESET}"
-        pause
-        return
-    fi
-
-    certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-    generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE"
-    create_default_server
-    nginx -t && systemctl reload nginx
-    echo -e "${GREEN}添加完成！访问: https://$DOMAIN${RESET}"
-    pause
-}
-
-modify_config() {
-    CONFIG_DIR="/etc/nginx/sites-available"
-    [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}还没有任何配置文件！${RESET}" && pause && return
-
-    DOMAINS=($(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort))
-    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有域名配置！${RESET}" && pause && return
-
-    echo -e "${GREEN}现有配置的域名/IP:${RESET}"
-    for i in "${!DOMAINS[@]}"; do
-        echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"
+    echo -e "${CYAN}备份列表:${RESET}"
+    for i in "${!FILE_LIST[@]}"; do
+        echo -e "${GREEN}$((i+1)). $(basename "${FILE_LIST[$i]}")${RESET}"
     done
 
-    echo -ne "${GREEN}请输入编号 (0 返回): ${RESET}"
-    read choice
-    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ ]]; then
-        echo -e "${YELLOW}已取消${RESET}"; return
-    fi
-    if [ "$choice" -eq 0 ]; then return; fi
-    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效选择${RESET}"; pause; return
-    fi
+    read -p "输入恢复序号: " num
+    [[ ! $num =~ ^[0-9]+$ ]] && return
+    FILE="${FILE_LIST[$((num-1))]}"
+    [[ -z "$FILE" ]] && return
 
-    DOMAIN="${DOMAINS[$((choice-1))]}"
-    CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
-    echo -ne "${GREEN}请输入新反代目标(例如:http://127.0.0.1:5788): ${RESET}"; read TARGET
-    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n，回车默认 y): ${RESET}"; read IS_WS
-    IS_WS=${IS_WS:-y}
-    echo -ne "${GREEN}请输入最大上传大小 (默认 200M): ${RESET}"
-    read MAX_SIZE
-    MAX_SIZE=${MAX_SIZE:-200M}
+    echo -e "${YELLOW}确认恢复？将覆盖 Caddy 配置、证书 (y/n)${RESET}"
+    read confirm
+    [[ "$confirm" != "y" ]] && return
 
-    if grep -q "$CUSTOM_SSL_BASE" "$CONFIG_PATH"; then
-        local current_cert=$(grep "ssl_certificate " "$CONFIG_PATH" | awk '{print $2}' | tr -d ';')
-        local current_key=$(grep "ssl_certificate_key " "$CONFIG_PATH" | awk '{print $2}' | tr -d ';')
-        generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE" "$current_cert" "$current_key"
-    else
-        echo -ne "${GREEN}是否更新邮箱? (y/n，回车默认 n): ${RESET}"
-        read c
-        c=${c:-n}
-        if [[ "$c" == "y" ]]; then
-            DEFAULT_EMAIL=$(generate_random_email)
-            echo -ne "${GREEN}请输入新邮箱 (回车默认: ${DEFAULT_EMAIL}): ${RESET}"
-            read EMAIL
-            EMAIL=${EMAIL:-$DEFAULT_EMAIL}
-            if ! validate_email "$EMAIL"; then
-                echo -e "${RED}邮箱格式不正确${RESET}"; pause; return
-            fi
-            certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-        fi
-        generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE"
-    fi
+    # 直接恢复文件
+    tar xzf "$FILE" -C /
 
-    create_default_server
-    nginx -t && systemctl reload nginx
-    echo -e "${GREEN}修改完成！访问: https://$DOMAIN${RESET}"
-    pause
-}
+    echo -e "${GREEN}恢复完成${RESET}"
+    send_tg "🔄 Caddy 已恢复: $(basename "$FILE")"
 
-delete_config() {
-    CONFIG_DIR="/etc/nginx/sites-available"
-    [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}没有配置文件！${RESET}" && pause && return
+    # 自动重启 Caddy
+        echo -e "${CYAN}正在重启 Caddy (systemd)...${RESET}"
 
-    DOMAINS=($(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort))
-    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有域名配置！${RESET}" && pause && return
-
-    echo -e "${GREEN}可删除的域名/IP:${RESET}"
-    for i in "${!DOMAINS[@]}"; do
-        echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"
-    done
-
-    echo -ne "${GREEN}请选择编号 (0 返回): ${RESET}"
-    read choice
-    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ ]]; then
-        echo -e "${YELLOW}已取消${RESET}"; return
-    fi
-    if [ "$choice" -eq 0 ]; then return; fi
-    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then
-        echo -e "${RED}无效选择${RESET}"; pause; return
-    fi
-
-    DOMAIN="${DOMAINS[$((choice-1))]}"
-    CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
-
-    if grep -q "$CUSTOM_SSL_BASE" "$CONFIG_PATH"; then
-        rm -f "/etc/nginx/sites-available/$DOMAIN" "/etc/nginx/sites-enabled/$DOMAIN"
-        echo -ne "${YELLOW}是否同时删除自定义证书源文件？(y/N): ${RESET}"
-        read del_cust
-        if [[ "$del_cust" =~ ^[Yy]$ ]]; then
-            rm -rf "$CUSTOM_SSL_BASE/$DOMAIN"
-            echo -e "${GREEN}自定义证书源文件已删除${RESET}"
-        fi
-    else
-        rm -f "/etc/nginx/sites-available/$DOMAIN" "/etc/nginx/sites-enabled/$DOMAIN"
-        echo -ne "${YELLOW}是否同时删除托管的 Certbot 证书 $DOMAIN ? (y/N): ${RESET}"
-        read del_cert
-        if [[ "$del_cert" =~ ^[Yy]$ ]]; then
-            certbot delete --cert-name "$DOMAIN" || true
-            echo -e "${GREEN}Certbot 证书已删除${RESET}"
-        else
-            echo -e "${YELLOW}证书保留${RESET}"
-        fi
-    fi
-
-    if nginx -t; then
-        systemctl reload nginx
-        echo -e "${GREEN}站点 $DOMAIN 已完全删除${RESET}"
-    else
-        echo -e "${RED}Nginx 配置测试失败，请检查！${RESET}"
-    fi
-    pause
-}
-
-test_renew() {
-    CONFIG_DIR="/etc/nginx/sites-available"
-    [ ! -d "$CONFIG_DIR" ] && echo -e "${YELLOW}没有配置文件${RESET}" && pause && return
-
-    DOMAINS=($(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort))
-    [ ${#DOMAINS[@]} -eq 0 ] && echo -e "${YELLOW}没有域名配置！${RESET}" && pause && return
-
-    local valid_count=0
-    for d in "${DOMAINS[@]}"; do
-        if ! grep -q "$CUSTOM_SSL_BASE" "/etc/nginx/sites-available/$d"; then
-            valid_count=$((valid_count+1))
-        fi
-    done
-
-    if [ $valid_count -eq 0 ]; then
-        echo -e "${YELLOW}当前全部站点均为自定义证书，无需通过 Certbot 续期。${RESET}"
-        pause && return
-    fi
-
-    echo -e "${GREEN}以下为可执行 Certbot 续期测试的托管站点:${RESET}"
-    local idx=1
-    local mapped_domains=()
-    for d in "${DOMAINS[@]}"; do
-        if ! grep -q "$CUSTOM_SSL_BASE" "/etc/nginx/sites-available/$d"; then
-            echo -e "${GREEN}${idx}) $d${RESET}"
-            mapped_domains+=("$d")
-            idx=$((idx+1))
-        fi
-    done
-
-    echo -ne "${GREEN}选择编号 (0 返回): ${RESET}"
-    read choice
-    if [[ -z "$choice" || ! "$choice" =~ ^[0-9]+$ || "$choice" -eq 0 ]]; then return; fi
-    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#mapped_domains[@]} ]; then
-        echo -e "${RED}无效选择${RESET}"; pause; return
-    fi
-
-    DOMAIN="${mapped_domains[$((choice-1))]}"
-    echo -e "${GREEN}正在测试 $DOMAIN 的证书续期...${RESET}"
-    certbot renew --dry-run --cert-name "$DOMAIN"
-    pause
-}
-
-check_cert() {
-    echo -e "${GREEN}1) 查看Certbot托管证书${RESET}"
-    echo -e "${GREEN}2) 查看自定义证书${RESET}"
-    echo -ne "${GREEN}请选择 [1-2]: ${RESET}"
-    read c_choice
-    if [ "$c_choice" == "1" ]; then
-        Bronze_DIR="/etc/letsencrypt/live"
-        [ ! -d "$Bronze_DIR" ] && echo -e "${GREEN}没有托管证书${RESET}" && pause && return
-        DOMAINS=()
-        for DOMAIN in $(ls "$Bronze_DIR"); do
-            [ -f "$Bronze_DIR/$DOMAIN/fullchain.pem" ] && DOMAINS+=("$DOMAIN")
-        done
-        if [ ${#DOMAINS[@]} -eq 0 ]; then echo -e "${GREEN}没有有效托管证书${RESET}"; pause; return; fi
-        for i in "${!DOMAINS[@]}"; do echo -e "${GREEN}$((i+1))) ${DOMAINS[$i]}${RESET}"; done
-        echo -ne "${GREEN}请选择编号 (0 返回): ${RESET}"; read choice
-        if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -eq 0 ] || [ "$choice" -gt ${#DOMAINS[@]} ]; then return; fi
-        certbot certificates --cert-name "${DOMAINS[$((choice-1))]}"
-    elif [ "$c_choice" == "2" ]; then
-        if [ -d "$CUSTOM_SSL_BASE" ]; then
-            ls -lR "$CUSTOM_SSL_BASE"
-        fi
-    fi
-    pause
-}
-
-check_domains_status() {
-    clear
-    echo -e "${YELLOW}========================================${RESET}"
-    echo -e "${YELLOW}        ◈ 域名证书状态实时监控 ◈        ${RESET}"
-    echo -e "${YELLOW}========================================${RESET}"
-
-    CONFIG_DIR="/etc/nginx/sites-available"
-    local has_site=0
-
-    if [ -d "$CONFIG_DIR" ]; then
-        for DOMAIN in $(ls "$CONFIG_DIR" | grep -vE 'default|default_server_block' | sort); do
-            CONFIG_PATH="$CONFIG_DIR/$DOMAIN"
-            CERT_PATH=$(grep "ssl_certificate " "$CONFIG_PATH" | awk '{print $2}' | tr -d ';')
-            
-            if [ -f "$CERT_PATH" ]; then
-                has_site=1
-                TYPE="托管 (Certbot)"
-                [[ "$CERT_PATH" =~ "$CUSTOM_SSL_BASE" ]] && TYPE="自定义证书"
-
-                END_DATE=$(openssl x509 -enddate -noout -in "$CERT_PATH" | cut -d= -f2)
-                END_TS=$(date -d "$END_DATE" +%s)
-                NOW_TS=$(date +%s)
-                DAYS_LEFT=$(( (END_TS - NOW_TS) / 86400 ))
-
-                if [ $DAYS_LEFT -ge 30 ]; then
-                    STATUS_COLOR="${GREEN}"
-                    STATUS_TEXT="正常有效"
-                elif [ $DAYS_LEFT -ge 0 ]; then
-                    STATUS_COLOR="${YELLOW}"
-                    STATUS_TEXT="即将过期 (请注意)"
-                else
-                    STATUS_COLOR="${RED}"
-                    STATUS_TEXT="已过期 (请立即更新)"
-                fi
-
-                echo -e "${YELLOW}◈ 域名: ${RESET}${YELLOW}${DOMAIN}${RESET}"
-                echo -e "  ├─ ${YELLOW}证书类型: ${RESET}${TYPE}"
-                echo -e "  ├─ ${YELLOW}到期时间: ${RESET}$(date -d "$END_DATE" +"%Y-%m-%d")"
-                echo -e "  ├─ ${YELLOW}剩余天数: ${RESET}${STATUS_COLOR}${DAYS_LEFT} 天${RESET}"
-                echo -e "  └─ ${YELLOW}运行状态: ${RESET}${STATUS_COLOR}${STATUS_TEXT}${RESET}"
-                echo -e "${YELLOW}----------------------------------------${RESET}"
-            fi
-        done
-    fi
-
-    if [ $has_site -eq 0 ]; then
-        echo -e "${RED} ❌ 当前系统未检测到任何反代站点配置。${RESET}"
-        echo -e "${YELLOW}----------------------------------------${RESET}"
-    fi
-    pause
-}
-
-uninstall_nginx() {
-    # 提示用户确认
-    echo -e "${YELLOW}警告: 此操作将卸载 Nginx 并删除所有相关配置文件和证书！${RESET}"
-    read -r -p "你确定要卸载 Nginx 吗？(y/N): " confirm
-    
-    # 判断用户输入，只有输入 y 或 Y 才会继续
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo -e "${YELLOW}操作已取消。${RESET}"
-        pause
-        return 0
-    fi
-
-    # 真正开始卸载逻辑
-    echo -e "${YELLOW}正在卸载 Nginx...${RESET}"
-    systemctl stop nginx || true
-    apt purge -y nginx nginx-common nginx-core certbot python3-certbot-nginx || true
-    apt autoremove -y
-    rm -rf /etc/nginx /etc/letsencrypt "$CUSTOM_SSL_BASE"
-    remove_default_server
-    echo -e "${GREEN}已成功卸载${RESET}"
-    pause
-}
-
-
-# 辅助检查与授权函数：防止外部 ACME 路径导致的权限阻塞（适配 Nginx）
-fix_external_cert_permission() {
-    local cert=$1
-    local key=$2
-    
-    # 针对 root 目录的致命硬拦截
-    if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
-        echo -e "${RED}❌ 致命拒绝: 检测到您的证书源文件位于 /root/ 目录下！${RESET}"
-        echo -e "${YELLOW}原因分析: /root 目录权限极为严苛(700)，任何非root用户(包括 Nginx 的 www-data 组)均无权穿透。${RESET}"
-        echo -e "${YELLOW}         即使这里使用了软链接，Nginx 依然无法越权读取源文件！${RESET}"
-        echo -e "${GREEN}💡 权威推荐: 请在 acme.sh 脚本命令中加上安装指令(--install-cert)，将证书自动导出到公共目录（如 /etc/ssl/ 或 /etc/certs/ 文件夹下）再试。${RESET}"
-        return 1
-    fi
-
-    # 针对其他公共目录，自动修复其上级路径及文件自身的读取权限
-    local cert_dir=$(dirname "$cert")
-    
-    # 确保 Nginx 运行用户（通常为 www-data）有进入该目录的权限 (+x)
-    chmod +x "$cert_dir" 2>/dev/null || true
-    # 确保源文件可读
-    chmod 644 "$cert" "$key" 2>/dev/null || true
-    
-    # 如果系统安装了 acl，则使用更高级的 ACL 策略精准赋权给 www-data
-    if command -v setfacl >/dev/null 2>&1; then
-        setfacl -m u:www-data:rx "$cert_dir" 2>/dev/null || true
-        setfacl -m u:www-data:r "$cert" "$key" 2>/dev/null || true
-    fi
-    return 0
-}
-
-
-add_custom_cert_config() {
-    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-    echo -ne "${GREEN}请输入您的自定义域名或公网IP(例如:example.com): ${RESET}"; read DOMAIN
-    [ -z "$DOMAIN" ] && return
-
-    echo -ne "${GREEN}请输入反代目标(例如：http://127.0.0.1:5788): ${RESET}"; read TARGET
-    echo -ne "${GREEN}是否为 WebSocket 反代? (y/n, 默认y): ${RESET}"; read IS_WS
-    IS_WS=${IS_WS:-y}
-    echo -ne "${GREEN}请输入最大上传大小 (默认 200M): ${RESET}"; read MAX_SIZE
-    MAX_SIZE=${MAX_SIZE:-200M}
-
-    local DIR_PATH="$CUSTOM_SSL_BASE/$DOMAIN"
-    mkdir -p "$DIR_PATH"
-
-    echo -e "${YELLOW}---------------------------------------------${RESET}"
-    echo -e "${YELLOW}请提供您的自定义 SSL 证书文件绝对路径。${RESET}"
-    echo -e "${YELLOW}---------------------------------------------${RESET}"
-    
-    echo -ne "${GREEN}请输入 证书公钥(fullchain/crt) 文件的路径: ${RESET}"; read USER_CERT
-    echo -ne "${GREEN}请输入 证书私钥(privkey/key) 文件的路径: ${RESET}"; read USER_KEY
-
-    # 转化为绝对路径，防止用户输入相对路径导致软链接断开
-    local ABS_CERT=$(readlink -f "$USER_CERT" 2>/dev/null || realpath "$USER_CERT" 2>/dev/null || echo "$USER_CERT")
-    local ABS_KEY=$(readlink -f "$USER_KEY" 2>/dev/null || realpath "$USER_KEY" 2>/dev/null || echo "$USER_KEY")
-
-    if [ ! -f "$ABS_CERT" ] || [ ! -f "$ABS_KEY" ]; then
-        red "错误: 您输入的证书文件路径不存在，请核实后再试！"
-        rm -rf "$DIR_PATH"
-        pause && return
-    fi
-
-    # === 引入你的权限拦截与自动修复逻辑 ===
-    if ! fix_external_cert_permission "$ABS_CERT" "$ABS_KEY"; then
-        rm -rf "$DIR_PATH"
-        pause && return
-    fi
-
-    # 核心修改：改为创建软链接，不再使用 cp -f
-    rm -f "$DIR_PATH/fullchain.pem" "$DIR_PATH/privkey.pem"
-    ln -sf "$ABS_CERT" "$DIR_PATH/fullchain.pem"
-    ln -sf "$ABS_KEY" "$DIR_PATH/privkey.pem"
-
-    generate_server_config "$DOMAIN" "$TARGET" "$IS_WS" "$MAX_SIZE" "$DIR_PATH/fullchain.pem" "$DIR_PATH/privkey.pem"
-    create_default_server
-    
-    if nginx -t; then
-        systemctl reload nginx
-        echo -e "${GREEN}✅ 自定义证书反代站点 https://$DOMAIN 添加成功！${RESET}"
-    else
-        echo -e "${RED}❌ Nginx 配置语法错误，已自动撤销，请检查证书有效性。${RESET}"
-        rm -f "/etc/nginx/sites-enabled/$DOMAIN"
-        rm -rf "$DIR_PATH"
-    fi
-    pause
-}
-
-# ------------------------------------------------------------
-# 优化重构：适配全新新版 Nginx (HTTP/2 改为标准 http2 on 指令)
-# ------------------------------------------------------------
-generate_emby_normal_conf() {
-    local DOMAIN=$1
-    local TARGET=$2
-    local CERT_PATH=$3
-    local KEY_PATH=$4
-    local LISTEN_PORT=$5  # 新增：外部监听端口参数
-    local CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
-    local TARGET_HOST=$(echo $TARGET | awk -F[/:] '{print $4}')
-
-    CERT_PATH=${CERT_PATH:-"/etc/letsencrypt/live/$DOMAIN/fullchain.pem"}
-    KEY_PATH=${KEY_PATH:-"/etc/letsencrypt/live/$DOMAIN/privkey.pem"}
-    LISTEN_PORT=${LISTEN_PORT:-443} # 默认 443
-
-    cat > "$CONFIG_PATH" <<EOF
-# 已完全移除 listen 80 模块，避免 NAT 环境下无 80 端口报错
-
-server {
-    listen $LISTEN_PORT ssl;
-    http2 on;
-    server_name $DOMAIN;
-
-    ssl_certificate $CERT_PATH;
-    ssl_certificate_key $KEY_PATH;
-
-    client_max_body_size 5000M;
-
-    location / {
-        add_header 'Access-Control-Allow-Origin' '*' always;
-        add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS, DELETE, PUT' always;
-        add_header 'Access-Control-Allow-Headers' 'X-Emby-Authorization, Content-Type, Authorization, X-Requested-With' always;
-        if (\$request_method = 'OPTIONS') { return 204; }
-
-        proxy_pass $TARGET;
-        proxy_ssl_server_name on;
-        proxy_set_header Host $TARGET_HOST;
-        proxy_pass_request_headers on;
-
-        proxy_set_header X-Real-IP "";
-        proxy_set_header X-Forwarded-For "";
-        proxy_set_header CF-Connecting-IP "";
-        proxy_set_header X-Forwarded-Proto https;
-
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_max_temp_file_size 0;
-
-        proxy_read_timeout 86400;
-        proxy_send_timeout 86400;
-    }
-}
-EOF
-    ln -sf "$CONFIG_PATH" "/etc/nginx/sites-enabled/$DOMAIN"
-}
-
-generate_emby_stream_conf() {
-    local DOMAIN=$1
-    local T_MAIN=$2
-    local T_STREAM=$3
-    local CERT_PATH=$4
-    local KEY_PATH=$5
-    local LISTEN_PORT=$6  # 新增：外部监听端口参数
-    local CONFIG_PATH="/etc/nginx/sites-available/$DOMAIN"
-    local MAIN_HOST=$(echo $T_MAIN | awk -F[/:] '{print $4}')
-    local STREAM_HOST=$(echo $T_STREAM | awk -F[/:] '{print $4}')
-
-    CERT_PATH=${CERT_PATH:-"/etc/letsencrypt/live/$DOMAIN/fullchain.pem"}
-    KEY_PATH=${KEY_PATH:-"/etc/letsencrypt/live/$DOMAIN/privkey.pem"}
-    LISTEN_PORT=${LISTEN_PORT:-443} # 默认 443
-
-    cat > "$CONFIG_PATH" <<EOF
-# 已完全移除 listen 80 模块，避免 NAT 环境下无 80 端口报错
-
-server {
-    listen $LISTEN_PORT ssl;
-    http2 on;
-    server_name $DOMAIN;
-
-    ssl_certificate $CERT_PATH;
-    ssl_certificate_key $KEY_PATH;
-
-    client_max_body_size 5000M;
-
-    location / {
-        proxy_pass $T_MAIN;
-        proxy_ssl_server_name on;
-        proxy_set_header Host $MAIN_HOST;
-        proxy_pass_request_headers on;
-
-        proxy_set_header X-Real-IP "";
-        proxy_set_header X-Forwarded-For "";
-        proxy_set_header CF-Connecting-IP "";
-        proxy_set_header X-Forwarded-Proto https;
-
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_max_temp_file_size 0;
-
-        proxy_read_timeout 86400;
-        proxy_send_timeout 86400;
-
-        # 动态处理带非标准端口的重定向劫持
-        proxy_redirect $T_STREAM/ https://\$host:${LISTEN_PORT}/s1/;
-        proxy_redirect $T_STREAM https://\$host:${LISTEN_PORT}/s1/;
-    }
-
-    location /s1/ {
-        rewrite ^/s1(/.*)$ \$1 break;
-        proxy_pass $T_STREAM;
-        proxy_ssl_server_name on;
-        proxy_set_header Host $STREAM_HOST;
-        proxy_pass_request_headers on;
-
-        proxy_set_header X-Real-IP "";
-        proxy_set_header X-Forwarded-For "";
-        proxy_set_header CF-Connecting-IP "";
-        proxy_set_header X-Forwarded-Proto https;
-
-        proxy_http_version 1.1;
-        proxy_set_header Connection "";
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_max_temp_file_size 0;
-
-        proxy_set_header Range \$http_range;
-        proxy_set_header If-Range \$http_if_range;
-
-        proxy_read_timeout 86400;
-        proxy_send_timeout 86400;
-    }
-}
-EOF
-    ln -sf "$CONFIG_PATH" "/etc/nginx/sites-enabled/$DOMAIN"
-}
-
-emby_menu() {
-    clear
-    echo -e "${GREEN}===== Emby 反向代理配置 =====${RESET}"
-    echo -e "${GREEN}1.普通反代(80申请证书)${RESET}"
-    echo -e "${GREEN}2.主站+推流路径重定向(80申请证书)${RESET}"
-    echo -e "${GREEN}3.普通反代(自定义证书)${RESET}"
-    echo -e "${GREEN}0.返回主菜单${RESET}"
-    echo -ne "${GREEN}请选择 [0-3]: ${RESET}"
-    read emby_choice
-
-    case $emby_choice in
-        1)
-            echo -ne "${GREEN}请输入您的域名: ${RESET}"; read DOMAIN
-            check_domain_resolution "$DOMAIN"
-            echo -ne "${GREEN}请输入 Nginx 外部监听端口 (直接回车默认 443): ${RESET}"; read LISTEN_PORT
-            LISTEN_PORT=${LISTEN_PORT:-443}
-            echo -ne "${GREEN}请输入Emby地址(例如: https://emby.com): ${RESET}"; read TARGET
-            EMAIL=$(generate_random_email)
-            certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-            generate_emby_normal_conf "$DOMAIN" "$TARGET" "" "" "$LISTEN_PORT"
-            nginx -t && systemctl reload nginx
-            echo -e "${GREEN}========================================${RESET}"
-            echo -e "${GREEN}✅ 普通模式配置成功!${RESET}"
-            echo -e "${GREEN}🌐 访问地址: https://$DOMAIN:$LISTEN_PORT${RESET}"
-            echo -e "${GREEN}========================================${RESET}"
-            pause ;;
-        2)
-            echo -ne "${GREEN}请输入您的域名: ${RESET}"; read DOMAIN
-            check_domain_resolution "$DOMAIN"
-            echo -ne "${GREEN}请输入 Nginx 外部监听端口 (直接回车默认 443): ${RESET}"; read LISTEN_PORT
-            LISTEN_PORT=${LISTEN_PORT:-443}
-            echo -ne "${GREEN}请输入Emby主站地址(例如: https://emby1.com): ${RESET}"; read T_MAIN
-            echo -ne "${GREEN}请输入推流后端地址(例如: https://emby2.com): ${RESET}"; read T_STREAM
-            EMAIL=$(generate_random_email)
-            certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-            generate_emby_stream_conf "$DOMAIN" "$T_MAIN" "$T_STREAM" "" "" "$LISTEN_PORT"
-            nginx -t && systemctl reload nginx
-            echo -e "${GREEN}========================================${RESET}"
-            echo -e "${GREEN}✅ 分流重定向模式配置成功!${RESET}"
-            echo -e "${GREEN}🌐 主站访问地址: https://$DOMAIN:$LISTEN_PORT${RESET}"
-            echo -e "${GREEN}🚀 推流重定向路径: https://$DOMAIN:$LISTEN_PORT/s1/${RESET}"
-            echo -e "${YELLOW}提示: 所有发往 $T_STREAM 的请求已自动劫持至 /s1/${RESET}"
-            echo -e "${GREEN}========================================${RESET}"
-            pause ;;
-        3)
-            echo -ne "${GREEN}请输入您的域名: ${RESET}"; read DOMAIN
-            check_domain_resolution "$DOMAIN"
-            echo -ne "${GREEN}请输入 Nginx 外部监听端口 (直接回车默认 443): ${RESET}"; read LISTEN_PORT
-            LISTEN_PORT=${LISTEN_PORT:-443}
-            echo -ne "${GREEN}请输入Emby地址(例如: https://emby.com): ${RESET}"; read TARGET
-            local DIR_PATH="$CUSTOM_SSL_BASE/$DOMAIN"
-            mkdir -p "$DIR_PATH"
-           
-            echo -e "${YELLOW}---------------------------------------------${RESET}"
-            echo -e "${YELLOW}请提供您的自定义 SSL 证书文件绝对路径。${RESET}"
-            echo -e "${YELLOW}---------------------------------------------${RESET}"
-
-            echo -ne "${GREEN}请输入 证书公钥(fullchain/crt) 文件的绝对路径: ${RESET}"; read USER_CERT
-            echo -ne "${GREEN}请输入 证书私钥(privkey/key) 文件的绝对路径: ${RESET}"; read USER_KEY
-
-            local ABS_CERT=$(readlink -f "$USER_CERT" 2>/dev/null || realpath "$USER_CERT" 2>/dev/null || echo "$USER_CERT")
-            local ABS_KEY=$(readlink -f "$USER_KEY" 2>/dev/null || realpath "$USER_KEY" 2>/dev/null || echo "$USER_KEY")
-
-            if [ ! -f "$ABS_CERT" ] || [ ! -f "$ABS_KEY" ]; then red "文件不存在"; rm -rf "$DIR_PATH"; pause; return; fi
-            
-            if ! fix_external_cert_permission "$ABS_CERT" "$ABS_KEY"; then rm -rf "$DIR_PATH"; pause; return; fi
-
-            rm -f "$DIR_PATH/fullchain.pem" "$DIR_PATH/privkey.pem"
-            ln -sf "$ABS_CERT" "$DIR_PATH/fullchain.pem"
-            ln -sf "$ABS_KEY" "$DIR_PATH/privkey.pem"
-
-            generate_emby_normal_conf "$DOMAIN" "$TARGET" "$DIR_PATH/fullchain.pem" "$DIR_PATH/privkey.pem" "$LISTEN_PORT"
-            nginx -t && systemctl reload nginx
-            echo -e "${GREEN}========================================${RESET}"
-            echo -e "${GREEN}✅ 普通模式配置成功!${RESET}"
-            echo -e "${GREEN}🌐 访问地址: https://$DOMAIN:$LISTEN_PORT${RESET}"
-            echo -e "${GREEN}========================================${RESET}"
-            pause ;;
-        0) return ;;
-        *) echo -e "${RED}无效输入!${RESET}", sleep 1; emby_menu ;;
-    esac
-}
-
-
-update_nginx_software() {
-    clear
-    echo -e "${YELLOW}========================================${RESET}"
-    echo -e "${YELLOW}     ◈ 正在执行 Nginx 软件版本升级 ◈    ${RESET}"
-    echo -e "${YELLOW}========================================${RESET}"
-
-    if ! command -v nginx >/dev/null 2>&1; then
-        echo -e "${RED}❌ 系统未安装 Nginx，无法更新。请先使用选项 1 安装。${RESET}"
-        pause && return
-    fi
-    local CURRENT_VER=$(nginx -v 2>&1 | awk -F/ '{print $2}')
-    echo -e "${GREEN}◈ 当前 Nginx 版本: ${RESET}${YELLOW}${CURRENT_VER}${RESET}"
-    echo -e "${YELLOW}----------------------------------------${RESET}"
-
-    echo -ne "${YELLOW}是否开始检查更新并平滑升级？(y/N,默认N): ${RESET}"
-    read up_choice
-    if [[ ! "$up_choice" =~ ^[Yy]$ ]]; then
-        echo -e "${YELLOW}⏭ 已取消升级。${RESET}"
-        pause && return
-    fi
-
-    echo -e "${GREEN}  ├─ [1/3] 正在安全备份现有的反代配置与证书...${RESET}"
-    local BACKUP_DIR="/etc/nginxbackup/nginx_backup_$(date +%Y%m%d%H%M%S)"
-    mkdir -p "$BACKUP_DIR"
-    [ -d "/etc/nginx/sites-available" ] && cp -r /etc/nginx/sites-available "$BACKUP_DIR/" || true
-    [ -d "$CUSTOM_SSL_BASE" ] && cp -r "$CUSTOM_SSL_BASE" "$BACKUP_DIR/" || true
-    echo -e "${GREEN}  ├─ 备份成功，备份路径: ${BACKUP_DIR}${RESET}"
-
-    echo -e "${GREEN}  ├─ [2/3] 正在从系统源拉取最新 Nginx 软件包...${RESET}"
-    export DEBIAN_FRONTEND=noninteractive
-    apt update -y
-    
-    if apt install --only-upgrade -y \
-        -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confold" \
-        nginx nginx-common nginx-core; then
-        
-        echo -e "${GREEN}  ├─ [3/3] 正在还原配置并验证新版本服务...${RESET}"
-        [ -d "$BACKUP_DIR/sites-available" ] && cp -r "$BACKUP_DIR/sites-available"/* /etc/nginx/sites-available/ || true
-        [ -d "$BACKUP_DIR/custom_ssl" ] && cp -r "$BACKUP_DIR/custom_ssl"/* "$CUSTOM_SSL_BASE/" || true
-        
+    if systemctl list-unit-files | grep -q '^caddy.service'; then
         systemctl daemon-reload
-        systemctl restart nginx || systemctl start nginx
-        
-        local NEW_VER=$(nginx -v 2>&1 | awk -F/ '{print $2}')
-        echo -e "${YELLOW}----------------------------------------${RESET}"
-        echo -e "${GREEN}✅ Nginx 软件升级完成！${RESET}"
-        echo -e "${GREEN}◈ 升级后版本: ${RESET}${GREEN}${NEW_VER}${RESET}"
-    else
-        echo -e "${RED}❌ 软件升级期间出现错误，正在尝试重启原服务...${RESET}"
-        systemctl start nginx || true
-    fi
-    echo -e "${YELLOW}========================================${RESET}"
-    pause
-}
+        systemctl restart caddy
 
-# ============================================================
-# 新增：GitHub 代理下载核心函数
-# ============================================================
-run_backup_restore() {
-    clear
-    # 用户提供的代理前缀列表
-    local GITHUB_PROXY=(
-        ''
-        'https://v6.gh-proxy.org/'
-        'https://gh-proxy.com/'
-        'https://hub.glowp.xyz/'
-        'https://proxy.vvvv.ee/'
-        'https://ghproxy.lvedong.eu.org/'
-    )
-    
-    local RAW_URL="https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/nginxbackup.sh"
-    local TEMP_SCRIPT="/tmp/nginx_backup_restore_temp.sh"
-    local success=false
-
-
-    # 循环轮询代理列表
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local target_url="${proxy}${RAW_URL}"
-        if [ -n "$proxy" ]; then
-            echo
+        if systemctl is-active --quiet caddy; then
+            echo -e "${GREEN}Caddy 重启成功${RESET}"
+            send_tg "⚡ Caddy 已通过 systemd 重启"
         else
-            echo
+            echo -e "${RED}Caddy 启动失败，请检查日志${RESET}"
+            send_tg "❌ Caddy 重启失败"
         fi
-
-        # 使用 curl 下载，设置 8 秒超时
-        if curl -fsSL --connect-timeout 8 "$target_url" -o "$TEMP_SCRIPT"; then
-            success=true
-            break
-        fi
-        echo -e "${RED}❌ 当前连接失败，正在切换下一个节点...${RESET}"
-    done
-
-    # 判断是否下载成功并执行
-    if [ "$success" = true ] && [ -f "$TEMP_SCRIPT" ]; then
-        echo
-        chmod +x "$TEMP_SCRIPT"
-        
-        # 真正执行备份恢复脚本
-        bash "$TEMP_SCRIPT"
-        
-        # 执行完毕后清理临时文件
-        rm -f "$TEMP_SCRIPT"
     else
-        echo -e "${RED}❌ 致命错误：所有 GitHub 代理节点均无法连接，请检查您的 VPS 网络！${RESET}"
+        echo -e "${RED}未检测到 caddy.service，无法使用 systemd 启动${RESET}"
+        send_tg "❌ 未找到 systemd 版本 Caddy"
     fi
-    pause
 }
 
-# ------------------------------
-# 主菜单循环
-# ------------------------------
-while true; do
-    # 动态刷新看板数据
-    get_nginx_status
-    get_nginx_version
-    get_site_count
+#################################
+# 设置 TG
+#################################
+set_tg() {
+    read -p "服务名称: " SERVICE_NAME
+    read -p "TG BOT TOKEN: " TG_TOKEN
+    read -p "TG CHAT ID: " TG_CHAT_ID
+    save_config
+    echo -e "${GREEN}TG 已启用${RESET}"
+    send_tg "✅ TG 测试成功"
+}
 
-    clear
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈ Nginx 反向代理管理面板 ◈   ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $STATUS"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}$VERSION_SHOW${RESET}"
-    echo -e "${GREEN}站点   :${RESET} ${YELLOW}$SITE_COUNT 个${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 Nginx${RESET}"
-    echo -e "${GREEN} 2. 添加配置(80申请证书)${RESET}"
-    echo -e "${GREEN} 3. 添加配置(自定义证书)${RESET}"
-    echo -e "${GREEN} 4. 修改配置${RESET}"
-    echo -e "${GREEN} 5. 删除配置${RESET}"
-    echo -e "${GREEN} 6. 测试证书续期${RESET}"
-    echo -e "${GREEN} 7. 查看证书信息${RESET}"
-    echo -e "${GREEN} 8. 查看证书状态${RESET}"
-    echo -e "${GREEN} 9. Emby反代配置${RESET}"
-    echo -e "${GREEN}10. 重载配置${RESET}"
-    echo -e "${GREEN}11. 更新 Nginx${RESET}"
-    echo -e "${GREEN}12. 卸载 Nginx${RESET}"
-    echo -e "${GREEN}13. 备份恢复${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN} 请选择:${RESET}"
-    read choice
+#################################
+# 设置定时任务（稳定版）
+#################################
+add_cron() {
+    echo -e "${CYAN}1 每天0点${RESET}"
+    echo -e "${CYAN}2 每周一0点${RESET}"
+    echo -e "${CYAN}3 每月1号${RESET}"
+    echo -e "${CYAN}4 自定义${RESET}"
 
-    case $choice in
-        1) install_nginx ;;
-        2) add_config ;;
-        3) add_custom_cert_config ;; 
-        4) modify_config ;;
-        5) delete_config ;;
-        6) test_renew ;;
-        7) check_cert ;;
-        8) check_domains_status ;;
-        9) emby_menu ;;
-        10) nginx -t && systemctl reload nginx && echo -e "${GREEN}Nginx 配置已重载成功${RESET}" || echo -e "${RED}配置检查失败，请修复后重试${RESET}"; pause ;;
-        11) update_nginx_software ;;
-        12) uninstall_nginx ;;
-        13) run_backup_restore ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ; pause ;;
+    read -p "选择: " t
+    case $t in
+        1) cron="0 0 * * *" ;;
+        2) cron="0 0 * * 1" ;;
+        3) cron="0 0 1 * *" ;;
+        4) read -p "cron表达式: " cron ;;
+        *) return ;;
     esac
+
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/caadybackup_cron 2>/dev/null
+    echo "$cron /usr/bin/env bash $INSTALL_DIR/caadybackup.sh auto >> $INSTALL_DIR/cron.log 2>&1 $CRON_TAG" >> /tmp/caadybackup_cron
+    crontab /tmp/caadybackup_cron
+    rm -f /tmp/caadybackup_cron
+    echo -e "${GREEN}定时任务已设置${RESET}"
+}
+
+#################################
+# 删除定时任务
+#################################
+remove_cron() {
+    if crontab -l 2>/dev/null | grep -q "$CRON_TAG"; then
+        crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/caadybackup_cron 2>/dev/null
+        crontab /tmp/caadybackup_cron
+        rm -f /tmp/caadybackup_cron
+        echo -e "${GREEN}定时任务已删除${RESET}"
+    else
+        echo -e "${YELLOW}未发现定时任务${RESET}"
+    fi
+}
+
+#################################
+# auto模式
+#################################
+if [[ "$1" == "auto" ]]; then
+    backup
+    exit 0
+fi
+
+#################################
+# 菜单
+#################################
+#################################
+# 菜单
+#################################
+while true; do
+    clear
+    
+    # ---- 动态获取定时任务状态 ----
+    if crontab -l 2>/dev/null | grep -q "$CRON_TAG"; then
+        CRON_STATUS="${YELLOW}已开启${RESET}"
+    else
+        CRON_STATUS="${RED}已关闭${RESET}"
+    fi
+
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}       ◈  Caddy 备份系统  ◈        ${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN} 📂 当前备份目录: ${YELLOW}$DATA_DIR${RESET}"
+    echo -e "${GREEN} ⏳  备份保留天数: ${YELLOW}$RETAIN_DAYS 天${RESET}"
+    echo -e "${GREEN} ⏰  定时任务状态: $CRON_STATUS${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}1. 立即备份${RESET}"
+    echo -e "${GREEN}2. 恢复备份${RESET}"
+    echo -e "${GREEN}3. 设置定时任务${RESET}"
+    echo -e "${GREEN}4. 删除定时任务${RESET}"
+    echo -e "${GREEN}5. 设置备份目录${RESET}"
+    echo -e "${GREEN}6. 设置保留天数${RESET}"
+    echo -e "${GREEN}7. 设置Telegram通知${RESET}"
+    echo -e "${GREEN}8. 卸载${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+
+    read -p "$(echo -e ${GREEN}选择: ${RESET})" c
+
+    case $c in
+        1) backup ;;
+        2) restore ;;
+        3) add_cron ;;
+        4) remove_cron ;;
+        5) 
+            read -p "新目录: " input_dir
+            if [[ -n "$input_dir" ]]; then
+                DATA_DIR="$input_dir"
+                mkdir -p "$DATA_DIR"
+                save_config
+                echo -e "${GREEN}✅ 备份目录已更新${RESET}"
+            else
+                echo -e "${YELLOW}未输入有效目录，保持原样${RESET}"
+            fi
+            ;;
+        6) 
+            read -p "保留天数: " input_days
+            if [[ "$input_days" =~ ^[0-9]+$ ]]; then
+                RETAIN_DAYS="$input_days"
+                save_config
+                echo -e "${GREEN}✅ 保留天数已更新${RESET}"
+            else
+                echo -e "${RED}❌ 输入无效，请输入纯数字${RESET}"
+            fi
+            ;;
+        7) set_tg ;;
+        8)
+            echo -e "${YELLOW}正在卸载...${RESET}"
+            crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+            rm -rf "$INSTALL_DIR"
+            echo -e "${GREEN}卸载完成${RESET}"
+            exit 0
+            ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}❌ 无效选择${RESET}" ;;
+    esac
+
+    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
 done

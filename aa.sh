@@ -12,7 +12,7 @@ export HOME=/root
 
 INSTALL_DIR="/opt/nginxbackup"
 LOCAL_SCRIPT="$INSTALL_DIR/nginxbackup.sh"
-REMOTE_URL=" https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
+REMOTE_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
 
 if [[ "$0" != "$LOCAL_SCRIPT" ]]; then
     mkdir -p "$INSTALL_DIR"
@@ -225,7 +225,7 @@ add_cron() {
     rm -f /tmp/nginxbackup_cron
 
     echo -e "${GREEN}定时任务已设置${RESET}"
-    read -p "$(echo -e ${GREEN}回车继续....${RESET})"
+     
 }
 #################################
 # 删除定时任务（稳定版）
@@ -242,7 +242,7 @@ remove_cron() {
     else
         echo -e "${YELLOW}未发现定时任务${RESET}"
     fi
-    read -p "$(echo -e ${GREEN}回车继续....${RESET})"
+
 }
 
 
